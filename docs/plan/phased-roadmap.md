@@ -12,16 +12,17 @@
 
 ## 2. 当前基线：Python v0
 
-当前正在形成的 v0 是运行语义原型：
+当前 v0 已形成可执行的运行语义原型，并已加入显式 Tesseract OCR provider 与只读三端能力探针：
 
 - JSON/YAML 归一到 `apiVersion: ai-auto-desktop.dev/v1alpha1`、`kind: Workflow` 与 `metadata.name`，再严格编译和冻结；step ID 在全部分支、handler、`finally` 中全局唯一。
 - 只读白名单 AST 表达式，不使用 `eval/exec`，禁止所有函数和方法调用。
 - `action/set/block/fail/return/script`、`if/switch/foreach/while`、声明式 error handler 与 `finally`；循环有显式上限。
 - 结构化 `AutomationError`；当前 run 状态是 `succeeded/failed/timed_out/unknown_effect`，`cancelled/skipped` 仍需在 M0 补齐。
-- stdio NDJSON 长驻 process plugin 和确定性 fixture，用于成功、retryable error、永久失败、睡眠、mock OCR 与 mock desktop invoke。
+- stdio NDJSON 长驻 process plugin 和确定性 fixture，用于成功、retryable error、永久失败、睡眠、mock OCR 与 mock desktop invoke；另有真实 Tesseract process provider，只接受调用方显式提供的图片。
+- `probe` 命令只读检查 Windows UIA、macOS Accessibility/Screen Capture 和 Linux AT-SPI/X11/Wayland/portal/libei/uinput 前置条件，不请求权限、不截图、不注入输入。
 - script 默认拒绝；`--allow-scripts` 显式启用后仅在具备 bubblewrap + `prlimit` 的 Linux 上运行，其他平台返回 `SCRIPT.SANDBOX_UNAVAILABLE`。
 
-尚未实现或尚未证明：真实 UIA/AX/AT-SPI；可靠的 Windows 后代进程树终止；完整 wire 协议版本协商；single-writer session manager；持久 journal；系统 secret store；签名插件；真实截图/OCR；taint tracking、确认 token 与完整 policy enforcement；安装器和权限引导。M0 已具备 manifest/action contract 与基础 action risk policy 校验，其任务是继续把 v0 收敛成可验证基线，而不是扩大产品宣称。
+尚未实现或尚未证明：经过真实 Windows 环境资格验证的 UIA driver，以及真实 AX/AT-SPI driver；可靠的 Windows 后代进程树终止；完整 wire 协议版本协商；single-writer session manager；持久 journal；系统 secret store；签名插件；真实截图；taint tracking、确认 token 与完整 policy enforcement；安装器和权限引导。当前 OCR 已能处理显式图片，但尚未接入受控截图/frame provenance，因此不能视为桌面视觉闭环。M0 已具备 manifest/action contract 与基础 action risk policy 校验，其任务是继续把 v0 收敛成可验证基线，而不是扩大产品宣称。
 
 ## 3. M0：冻结 Python Runtime v0 合约
 
@@ -58,7 +59,7 @@
 - Windows UIA/Win32 独立 worker；标准化 node、snapshot revision、bounds/坐标变换、supported actions 与 native provenance。
 - dispatch 前重新 resolve，完整执行 `observe → resolve → precondition → policy → execute → re-observe → postcondition`。
 - Windows Job Object、kill-on-close、driver watchdog、crash restart generation 和 stale node 拒绝。
-- macOS probe 验证 AX trust/TCC、树读取与动作枚举；Linux probe 分别记录 AT-SPI、X11、Wayland portal/libei 可用性。
+- macOS probe 验证 AX trust/TCC；Linux probe 分别记录 AT-SPI、X11、Wayland portal/libei 可用性。Windows 已有首个 UIA 进程驱动纵向切片，覆盖窗口枚举、树快照、精确定位、focus/invoke/set_value；仍需在真实 Windows runner 上完成 fixture app 和权限边界资格测试。
 - 建立 15–30 个目标应用/页面的 ground truth 和 element recall、semantic completeness、action coverage、latency、hang/crash 指标。
 
 ### 退出门槛

@@ -6,6 +6,7 @@ ai-auto-desktop is a Python 3.11 workflow runtime for process-isolated desktop a
 
     python -m ai_auto_desktop validate examples/workflows/ocr-error-response.yaml
     python -m ai_auto_desktop run examples/workflows/ocr-error-response.yaml --plugin fixture=plugins/fixture/run.sh
+    python -m ai_auto_desktop probe
 
 Both commands write exactly one JSON object to stdout. Invalid descriptors and failed runs have a non-zero exit status. Package installation also exposes the ai-auto-desktop command.
 
@@ -18,6 +19,43 @@ The included example deliberately returns `OCR.LOW_CONFIDENCE`; its non-zero
 exit demonstrates structured error propagation. If a workflow declares
 `requires.permissions`, pass each permission explicitly with `--permission NAME`;
 the host never treats a descriptor request as a grant.
+
+`probe` performs conservative, read-only prerequisite checks for UIA on
+Windows, Accessibility and Screen Capture authorization on macOS, and the
+separate AT-SPI/X11/Wayland/portal/libei/uinput surfaces on Linux. An
+unavailable check is reported in JSON and does not make the probe command
+fail. The report is diagnostic evidence, not a claim that UI automation has
+succeeded.
+
+## Optional Tesseract OCR
+
+The process plugin in `plugins/ocr_tesseract` implements
+`vision.ocr.recognize@1`. It only accepts an explicit absolute image/artifact
+path and never captures the screen. It can crop a declared pixel region, run
+Tesseract with selected languages, enforce a minimum confidence, and return
+line bounds plus named literal-text matches. Register it explicitly; the
+workflow must also declare `filesystem.read` under `requires.permissions`:
+
+    python -m ai_auto_desktop run workflow.yaml \
+      --permission filesystem.read \
+      --plugin vision.ocr=plugins/ocr_tesseract/run.sh
+
+Tesseract is an optional system dependency. Pillow is only needed for region
+cropping. Missing dependencies and low confidence are structured `OCR.*`
+errors; OCR output remains untrusted data and only a later explicit `if` or
+`switch` can choose a response action.
+
+## Windows UIA driver
+
+`plugins/windows_uia` is the first real native desktop driver. On Windows it
+uses the optional `comtypes` binding to enumerate windows and normalize a
+bounded UIA Control View. It exposes exact locator lookup plus native
+`SetFocus`, `InvokePattern.Invoke`, and `ValuePattern.SetValue`; every write
+re-snapshots and resolves the target before dispatch. Install with
+`pip install .[windows-uia]` and register `plugins\windows_uia\run.cmd`.
+Workflows declare `desktop.observe`, and write actions additionally declare
+`desktop.input`; both still require explicit host grants. The driver does not
+capture screenshots, run OCR, or inject keyboard/pointer input.
 
 ## Descriptor and runtime
 
@@ -60,4 +98,8 @@ Plugins exchange one JSON object per line over stdin and stdout. Startup support
 
 Script steps are disabled unless `--allow-scripts` or `allow_scripts=True` is explicitly supplied. Version 0.1 runs them only on Linux when bubblewrap and `prlimit` are available: the worker receives JSON on stdin, has no host home or `/etc`, has a private network/PID namespace, and is bounded by wall-clock, CPU, address-space, file-size and output limits. Other platforms fail closed with `SCRIPT.SANDBOX_UNAVAILABLE` until equivalent OS isolation is implemented.
 
-Current scope excludes native UI drivers, persistence and resume, secret storage, concurrent desktop writes, confirmation tokens, and taint enforcement. The v0 host does enforce declared action risk categories/levels and validates process manifests plus action input/output contracts.
+Current scope includes a first Windows UIA vertical slice but excludes qualified
+macOS/Linux native drivers, persistence and resume, secret storage, concurrent
+desktop writes, confirmation tokens, and taint enforcement. The v0 host does
+enforce declared action risk categories/levels and validates process manifests
+plus action input/output contracts.
