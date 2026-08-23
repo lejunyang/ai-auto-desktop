@@ -25,7 +25,7 @@
 | 状态 | 当前 run 结果为 `succeeded/failed/timed_out/unknown_effect` | 补全并统一 `SUCCEEDED/FAILED/TIMED_OUT/CANCELLED/UNKNOWN_EFFECT/SKIPPED` |
 | 执行能力 | 长驻 NDJSON fixture/process plugin，用于 OCR mock、桌面 invoke mock、重试和超时测试 | 真实 UIA/AX/AT-SPI driver、输入后备、截图、应用专用 adapter |
 | IPC | stdio NDJSON v0，便于调试和跨语言实现；已校验 manifest schema/action major，尚无完整 wire version 协商 | 保留语义兼容层，迁移到 Protobuf/CBOR 等 IDL + named pipe/Unix socket |
-| 隔离 | process plugin 使用 POSIX 进程组；script 即使显式开启也因暂无强沙箱而 fail-closed | Windows Job Object/restricted token；macOS 受控 helper；Linux bubblewrap/OCI；资源与 capability 限额 |
+| 隔离 | process plugin 使用 POSIX 进程组；Linux script 使用 bubblewrap + prlimit，其他平台 fail-closed | Windows Job Object/restricted token；macOS 受控 helper；Linux bubblewrap/OCI；资源与 capability 限额 |
 | 安全 | 结构化错误、script fail-closed、action risk policy、manifest 与 action I/O schema 校验；确认 token/taint 等尚未实现 | 签名插件、系统 secret store、确认 token、完整 taint enforcement、审计与更新回滚 |
 | 平台能力 | **尚无真实桌面 driver，不能宣称支持任一 OS 的 UI 自动化** | Windows 首先产品化；macOS 与 Ubuntu GNOME 经过 probe 后分级支持 |
 
@@ -118,7 +118,7 @@ capability、driver、OCR 与 script worker 都是长驻或按步启动的子进
 - Capability worker：对应用业务 API、浏览器 DOM、文件/数据转换等窄能力做进程外适配，只能调用 manifest 声明且经 policy 授权的 action。
 - Driver worker：窗口枚举、snapshot、语义动作、输入与截图；不负责 workflow 控制流。
 - OCR worker：输入由 Host 获取且带 frame/region provenance 的图像，输出文本、bounds、language、confidence；不产生或执行点击。
-- Script worker：v0 默认禁用；即使显式 `--allow-scripts`，在强 OS sandbox 尚未实现时也 fail-closed。目标实现仅从 stdin 接收结构化输入，stdout 返回一个受大小限制的结构化值，并强制文件、网络、环境变量和 secret 的 capability 控制。
+- Script worker：v0 默认禁用；显式 `--allow-scripts` 后仅在具备 bubblewrap 和 `prlimit` 的 Linux 上运行，使用私有网络/PID namespace、空环境、无 host home/`/etc` 挂载及 CPU/内存/输出限制；其他平台 fail-closed。后续增加 Windows restricted token + Job Object 和 macOS 受控 helper。
 
 ### 6.2 平台拆分
 

@@ -27,7 +27,7 @@ KIND = "Workflow"
 MAX_DESCRIPTOR_BYTES = 2 * 1024 * 1024
 
 _STEP_ID = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
-_NAME = re.compile(r"^[a-z][a-z0-9_-]{0,127}$")
+_NAME = re.compile(r"^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$")
 _IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")
 _USES = re.compile(r"^[a-z][a-z0-9_.-]*\.[a-z][a-z0-9_-]*@[1-9][0-9]*$")
 _DURATION = re.compile(r"^(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:ms|s|m|h)$")
@@ -136,7 +136,7 @@ def parse_duration(value: str | None, default: float | None = None) -> float | N
         return default
     if not isinstance(value, str):
         raise ValueError("duration must be a string such as 250ms or 2s")
-    match = re.fullmatch(r"((?:0|[1-9][0-9]*)(?:\.[0-9]+)?)(ms|s|m|h)", value)
+    match = re.fullmatch(r"([1-9][0-9]*)(ms|s|m|h)", value)
     if not match:
         raise ValueError(f"invalid duration: {value!r}")
     return float(match.group(1)) * {"ms": .001, "s": 1, "m": 60, "h": 3600}[match.group(2)]
@@ -349,7 +349,8 @@ class _Compiler:
             if "inputs" in obj:
                 if not isinstance(obj["inputs"], Mapping): self.issue(f"{path}.inputs", "must be an object", "type")
                 self.values(obj["inputs"], f"{path}.inputs")
-            if "output_schema" in obj and not isinstance(obj["output_schema"], Mapping): self.issue(f"{path}.output_schema", "must be an object", "type")
+            if "output_schema" in obj and not isinstance(obj["output_schema"], (Mapping, bool)):
+                self.issue(f"{path}.output_schema", "must be an object or boolean JSON Schema", "type")
             if "capabilities" in obj: self.strings(obj["capabilities"], f"{path}.capabilities")
             if "source" in obj and "$" + "{{" in obj["source"]: self.issue(f"{path}.source", "expressions are forbidden in source", "policy")
             if "sandbox" in obj:
@@ -375,7 +376,8 @@ class _Compiler:
             if not _IDENT.fullmatch(name): self.issue(f"{path}.{name}", "name must be an identifier", "format")
             if item is not None:
                 self.unknown(item, fields, f"{path}.{name}"); self.required(item, required, f"{path}.{name}")
-                if "schema" in item and not isinstance(item["schema"], Mapping): self.issue(f"{path}.{name}.schema", "must be an object", "type")
+                if "schema" in item and not isinstance(item["schema"], (Mapping, bool)):
+                    self.issue(f"{path}.{name}.schema", "must be an object or boolean JSON Schema", "type")
                 for flag in ("required", "sensitive", "mutable"):
                     if flag in item and not isinstance(item[flag], bool): self.issue(f"{path}.{name}.{flag}", "must be a boolean", "type")
                 if kind == "inputs" and item.get("required") is True and "default" in item:

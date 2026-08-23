@@ -15,6 +15,7 @@ from .errors import AutomationError, ensure_automation_error
 from .expression import ExpressionError, evaluate_expression
 from .model import MISSING, CompiledStep, ErrorHandler, RunResult, WorkflowDescriptor, thaw
 from .plugin import PluginError, ProcessPlugin
+from .script import execute_python_script
 
 try:
     import jsonschema
@@ -383,23 +384,29 @@ class WorkflowRunner:
     ) -> None:
         declared = thaw(step.params.get("risk", {}))
         default = thaw(contract.get("risk", {}))
-        risk = declared or default
+        risks = [risk for risk in (default, declared) if risk]
         allowed = thaw(self.descriptor.policy).get("allowed_risk", {})
-        if not allowed or not risk:
+        if not allowed or not risks:
             return
         categories = allowed.get("categories")
-        if categories and risk.get("category") not in categories:
+        denied_categories = [
+            risk.get("category")
+            for risk in risks
+            if categories and risk.get("category") not in categories
+        ]
+        if denied_categories:
             raise AutomationError(
                 "POLICY.DENIED",
-                f"Risk category {risk.get('category')!r} is not allowed",
+                f"Risk category {denied_categories[0]!r} is not allowed",
                 category="policy",
             )
         order = {"low": 0, "medium": 1, "high": 2, "critical": 3, "contextual": 4}
         maximum = allowed.get("max_level")
-        if maximum in order and risk.get("level") in order and order[risk["level"]] > order[maximum]:
+        highest = max(risks, key=lambda risk: order.get(risk.get("level"), 99))
+        if maximum in order and highest.get("level") in order and order[highest["level"]] > order[maximum]:
             raise AutomationError(
                 "POLICY.DENIED",
-                f"Risk level {risk['level']!r} exceeds {maximum!r}",
+                f"Risk level {highest['level']!r} exceeds {maximum!r}",
                 category="policy",
             )
 
@@ -415,11 +422,16 @@ class WorkflowRunner:
 
     def _script(self, step: CompiledStep, timeout: float | None) -> Any:
         if not self.allow_scripts: raise AutomationError("SCRIPT.SANDBOX_DENIED", "Scripts are disabled; pass --allow-scripts", category="script")
-        raise AutomationError(
-            "SCRIPT.SANDBOX_UNAVAILABLE",
-            "This v0 runtime has no production-grade cross-platform script sandbox",
-            category="script",
+        result = execute_python_script(
+            self.descriptor,
+            step,
+            self._evaluate(thaw(step.params.get("inputs", {}))),
+            timeout,
         )
+        self._validate_schema(
+            result, step.params["output_schema"], "SCRIPT.OUTPUT_INVALID", step.id
+        )
+        return result
 
     def _apply_handler(self, handler: ErrorHandler | None, error: AutomationError) -> AutomationError | None:
         if handler is None or not self._handler_matches(handler, error): return error

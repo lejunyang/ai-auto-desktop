@@ -403,6 +403,29 @@ class RuntimeActionTests(unittest.TestCase):
         self.assertEqual(result.status, "failed")
         self.assertEqual(result.error.code, "POLICY.DENIED")
 
+    def test_descriptor_cannot_lower_manifest_risk(self) -> None:
+        raw = workflow(
+            {
+                "id": "invoke",
+                "type": "action",
+                "uses": "fixture.invoke@1",
+                "with": {},
+                "effect": {"class": "idempotent"},
+                "risk": {"category": "observe", "level": "low"},
+            }
+        )
+        raw["policy"] = {
+            "allowed_risk": {"categories": ["observe"], "max_level": "low"}
+        }
+
+        result = run_descriptor(
+            compile_descriptor(raw),
+            plugins={"fixture": [sys.executable, str(FIXTURE_PLUGIN)]},
+        )
+
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(result.error.code, "POLICY.DENIED")
+
     def test_retryable_idempotent_action_retries_until_success(self) -> None:
         raw = workflow(
             {
@@ -525,17 +548,17 @@ class ScriptStepTests(unittest.TestCase):
         self.assertEqual(result.status, "failed")
         self.assertEqual(result.error.code, "SCRIPT.SANDBOX_DENIED")
 
-    def test_script_fails_closed_without_a_strong_os_sandbox(self) -> None:
+    def test_script_runs_only_after_explicit_gate_in_available_sandbox(self) -> None:
         plan = self.script_workflow(
             "import json, sys\npayload = json.load(sys.stdin)\njson.dump({'answer': payload['value'] * 2}, sys.stdout)\n"
         )
 
         result = WorkflowRunner(plan, allow_scripts=True).run()
 
-        self.assertEqual(result.status, "failed")
-        self.assertEqual(result.error.code, "SCRIPT.SANDBOX_UNAVAILABLE")
+        self.assertTrue(result.ok, result.to_dict())
+        self.assertEqual(result.output, {"answer": 42})
 
-    def test_script_is_not_started_even_when_source_would_emit_multiple_values(self) -> None:
+    def test_script_rejects_multiple_json_values(self) -> None:
         plan = self.script_workflow(
             "print('{\"answer\": 1}')\nprint('{\"answer\": 2}')\n"
         )
@@ -543,17 +566,17 @@ class ScriptStepTests(unittest.TestCase):
         result = WorkflowRunner(plan, allow_scripts=True).run()
 
         self.assertEqual(result.status, "failed")
-        self.assertEqual(result.error.code, "SCRIPT.SANDBOX_UNAVAILABLE")
+        self.assertEqual(result.error.code, "SCRIPT.OUTPUT_INVALID")
 
-    def test_script_timeout_source_is_not_started_without_a_sandbox(self) -> None:
+    def test_sandboxed_script_timeout_is_distinct(self) -> None:
         plan = self.script_workflow(
             "import time\ntime.sleep(2)\nprint('{\"answer\": 1}')\n", timeout="20ms"
         )
 
         result = WorkflowRunner(plan, allow_scripts=True).run()
 
-        self.assertEqual(result.status, "failed")
-        self.assertEqual(result.error.code, "SCRIPT.SANDBOX_UNAVAILABLE")
+        self.assertEqual(result.status, "timed_out")
+        self.assertEqual(result.error.code, "SCRIPT.TIMEOUT")
 
 
 if __name__ == "__main__":

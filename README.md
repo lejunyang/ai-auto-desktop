@@ -54,6 +54,6 @@ Plugins exchange one JSON object per line over stdin and stdout. Startup support
 
 ## Scripts and security
 
-Script steps are disabled unless `--allow-scripts` or `allow_scripts=True` is explicitly supplied. Version 0.1 then still fails closed with `SCRIPT.SANDBOX_UNAVAILABLE`: a child process by itself is not a security sandbox. A later platform worker will add Windows Job Object/restricted-token isolation, a signed macOS helper strategy, and Linux bubblewrap/OCI isolation before script execution is enabled.
+Script steps are disabled unless `--allow-scripts` or `allow_scripts=True` is explicitly supplied. Version 0.1 runs them only on Linux when bubblewrap and `prlimit` are available: the worker receives JSON on stdin, has no host home or `/etc`, has a private network/PID namespace, and is bounded by wall-clock, CPU, address-space, file-size and output limits. Other platforms fail closed with `SCRIPT.SANDBOX_UNAVAILABLE` until equivalent OS isolation is implemented.
 
-Current scope excludes native UI drivers, persistence and resume, secret storage, a strong OS sandbox, concurrent desktop writes, confirmation tokens, and taint enforcement. The v0 host does enforce declared action risk categories/levels and validates process manifests plus action input/output contracts.
+Current scope excludes native UI drivers, persistence and resume, secret storage, concurrent desktop writes, confirmation tokens, and taint enforcement. The v0 host does enforce declared action risk categories/levels and validates process manifests plus action input/output contracts.
