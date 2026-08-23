@@ -340,6 +340,35 @@ class RuntimeControlFlowTests(unittest.TestCase):
 
 
 class RuntimeActionTests(unittest.TestCase):
+    def test_required_capability_version_and_actions_are_checked(self) -> None:
+        raw = workflow({"id": "done", "type": "return"})
+        raw["requires"] = {
+            "capabilities": [
+                {"name": "fixture", "version": "^2.0.0", "actions": ["ocr"]}
+            ]
+        }
+
+        result = run_descriptor(
+            compile_descriptor(raw),
+            plugins={"fixture": [sys.executable, str(FIXTURE_PLUGIN)]},
+        )
+
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(result.error.code, "CAPABILITY.VERSION_INCOMPATIBLE")
+
+    def test_required_permission_needs_explicit_host_grant(self) -> None:
+        raw = workflow({"id": "done", "type": "return"})
+        raw["requires"] = {"permissions": ["desktop.observe"]}
+        descriptor = compile_descriptor(raw)
+
+        denied = run_descriptor(descriptor)
+        allowed = run_descriptor(
+            descriptor, granted_permissions=["desktop.observe"]
+        )
+
+        self.assertEqual(denied.error.code, "POLICY.DENIED")
+        self.assertTrue(allowed.ok, allowed.to_dict())
+
     def test_manifest_output_schema_is_enforced(self) -> None:
         raw = workflow(
             {
