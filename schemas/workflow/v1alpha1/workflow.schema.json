@@ -1,0 +1,1391 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.ai-auto-desktop.dev/workflow/v1alpha1/workflow.schema.json",
+  "title": "AI Auto Desktop Workflow Descriptor v1alpha1",
+  "description": "Canonical, transport-independent workflow descriptor. Core fields are closed; action payloads and qualified extensions are explicit open boundaries.",
+  "type": "object",
+  "required": [
+    "apiVersion",
+    "kind",
+    "metadata",
+    "budgets",
+    "steps"
+  ],
+  "properties": {
+    "apiVersion": {
+      "const": "ai-auto-desktop.dev/v1alpha1"
+    },
+    "kind": {
+      "const": "Workflow"
+    },
+    "metadata": {
+      "$ref": "#/$defs/metadata"
+    },
+    "requires": {
+      "$ref": "#/$defs/requires"
+    },
+    "inputs": {
+      "type": "object",
+      "propertyNames": {
+        "$ref": "#/$defs/identifier"
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/inputDefinition"
+      },
+      "default": {}
+    },
+    "variables": {
+      "type": "object",
+      "propertyNames": {
+        "$ref": "#/$defs/identifier"
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/variableDefinition"
+      },
+      "default": {}
+    },
+    "outputs": {
+      "type": "object",
+      "propertyNames": {
+        "$ref": "#/$defs/identifier"
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/outputDefinition"
+      },
+      "default": {}
+    },
+    "defaults": {
+      "$ref": "#/$defs/defaults"
+    },
+    "budgets": {
+      "$ref": "#/$defs/budgets"
+    },
+    "policy": {
+      "$ref": "#/$defs/policy"
+    },
+    "steps": {
+      "$ref": "#/$defs/nonEmptySteps"
+    },
+    "on_error": {
+      "$ref": "#/$defs/errorHandler"
+    },
+    "finally": {
+      "$ref": "#/$defs/nonEmptySteps"
+    },
+    "extensions": {
+      "$ref": "#/$defs/extensions"
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "identifier": {
+      "type": "string",
+      "pattern": "^[A-Za-z_][A-Za-z0-9_]*$",
+      "maxLength": 128
+    },
+    "qualifiedName": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$",
+      "maxLength": 192
+    },
+    "semver": {
+      "type": "string",
+      "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(?:-[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?(?:\\+[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?$"
+    },
+    "duration": {
+      "type": "string",
+      "pattern": "^[1-9][0-9]*(?:ms|s|m|h)$"
+    },
+    "expression": {
+      "type": "string",
+      "pattern": "^\\$\\{\\{[\\s\\S]+\\}\\}$",
+      "maxLength": 8192
+    },
+    "valueOrExpression": true,
+    "jsonSchema": {
+      "oneOf": [
+        {
+          "type": "boolean"
+        },
+        {
+          "type": "object"
+        }
+      ]
+    },
+    "metadata": {
+      "type": "object",
+      "required": [
+        "name"
+      ],
+      "properties": {
+        "name": {
+          "$ref": "#/$defs/qualifiedName"
+        },
+        "version": {
+          "$ref": "#/$defs/semver"
+        },
+        "description": {
+          "type": "string",
+          "maxLength": 4096
+        },
+        "labels": {
+          "$ref": "#/$defs/stringMap"
+        },
+        "annotations": {
+          "$ref": "#/$defs/stringMap"
+        }
+      },
+      "additionalProperties": false
+    },
+    "stringMap": {
+      "type": "object",
+      "propertyNames": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 128
+      },
+      "additionalProperties": {
+        "type": "string",
+        "maxLength": 2048
+      }
+    },
+    "requires": {
+      "type": "object",
+      "properties": {
+        "runtime": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "platforms": {
+          "type": "array",
+          "items": {
+            "enum": [
+              "windows",
+              "macos",
+              "linux"
+            ]
+          },
+          "minItems": 1,
+          "uniqueItems": true
+        },
+        "capabilities": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/capabilityRequirement"
+          },
+          "uniqueItems": true
+        },
+        "permissions": {
+          "$ref": "#/$defs/permissions"
+        }
+      },
+      "additionalProperties": false
+    },
+    "capabilityRequirement": {
+      "type": "object",
+      "required": [
+        "name",
+        "version"
+      ],
+      "properties": {
+        "name": {
+          "$ref": "#/$defs/qualifiedName"
+        },
+        "version": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "optional": {
+          "type": "boolean",
+          "default": false
+        },
+        "actions": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9_]*$"
+          },
+          "minItems": 1,
+          "uniqueItems": true
+        }
+      },
+      "additionalProperties": false
+    },
+    "permissions": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)+$",
+        "maxLength": 192
+      },
+      "uniqueItems": true
+    },
+    "inputDefinition": {
+      "type": "object",
+      "required": [
+        "schema"
+      ],
+      "properties": {
+        "schema": {
+          "$ref": "#/$defs/jsonSchema"
+        },
+        "required": {
+          "type": "boolean",
+          "default": false
+        },
+        "default": true,
+        "sensitive": {
+          "type": "boolean",
+          "default": false
+        },
+        "description": {
+          "type": "string",
+          "maxLength": 2048
+        }
+      },
+      "not": {
+        "required": [
+          "required",
+          "default"
+        ],
+        "properties": {
+          "required": {
+            "const": true
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "variableDefinition": {
+      "type": "object",
+      "required": [
+        "schema",
+        "initial"
+      ],
+      "properties": {
+        "schema": {
+          "$ref": "#/$defs/jsonSchema"
+        },
+        "mutable": {
+          "type": "boolean",
+          "default": false
+        },
+        "initial": {
+          "$ref": "#/$defs/valueOrExpression"
+        },
+        "description": {
+          "type": "string",
+          "maxLength": 2048
+        }
+      },
+      "additionalProperties": false
+    },
+    "outputDefinition": {
+      "type": "object",
+      "required": [
+        "value"
+      ],
+      "properties": {
+        "value": {
+          "$ref": "#/$defs/valueOrExpression"
+        },
+        "schema": {
+          "$ref": "#/$defs/jsonSchema"
+        },
+        "sensitive": {
+          "type": "boolean",
+          "default": false
+        },
+        "description": {
+          "type": "string",
+          "maxLength": 2048
+        }
+      },
+      "additionalProperties": false
+    },
+    "defaults": {
+      "type": "object",
+      "properties": {
+        "timeout": {
+          "$ref": "#/$defs/duration"
+        },
+        "retry": {
+          "$ref": "#/$defs/retry"
+        }
+      },
+      "additionalProperties": false
+    },
+    "budgets": {
+      "type": "object",
+      "required": [
+        "max_duration",
+        "max_executed_steps"
+      ],
+      "properties": {
+        "max_duration": {
+          "$ref": "#/$defs/duration"
+        },
+        "max_executed_steps": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1000000
+        },
+        "cleanup_timeout": {
+          "$ref": "#/$defs/duration"
+        }
+      },
+      "additionalProperties": false
+    },
+    "policy": {
+      "type": "object",
+      "properties": {
+        "allowed_risk": {
+          "type": "object",
+          "properties": {
+            "categories": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/riskCategory"
+              },
+              "minItems": 1,
+              "uniqueItems": true
+            },
+            "max_level": {
+              "$ref": "#/$defs/riskLevel"
+            }
+          },
+          "additionalProperties": false
+        },
+        "confirmation": {
+          "type": "object",
+          "properties": {
+            "required_for": {
+              "type": "object",
+              "properties": {
+                "categories": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/$defs/riskCategory"
+                  },
+                  "minItems": 1,
+                  "uniqueItems": true
+                },
+                "min_level": {
+                  "$ref": "#/$defs/riskLevel"
+                }
+              },
+              "additionalProperties": false
+            },
+            "token_ref": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 2048
+            }
+          },
+          "additionalProperties": false
+        },
+        "untrusted_inputs": {
+          "type": "object",
+          "properties": {
+            "ui_text": {
+              "const": "tainted"
+            },
+            "ocr_text": {
+              "const": "tainted"
+            },
+            "allow_in_control_flow": {
+              "type": "boolean",
+              "default": false
+            }
+          },
+          "additionalProperties": false
+        },
+        "screenshots": {
+          "type": "object",
+          "properties": {
+            "retention": {
+              "enum": [
+                "memory_only",
+                "ephemeral",
+                "persistent"
+              ]
+            },
+            "ttl": {
+              "$ref": "#/$defs/duration"
+            },
+            "cloud_upload": {
+              "enum": [
+                "deny",
+                "confirm",
+                "allow"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        "desktop": {
+          "type": "object",
+          "properties": {
+            "single_writer": {
+              "type": "boolean",
+              "default": true
+            },
+            "pause_on_user_input": {
+              "type": "boolean",
+              "default": true
+            },
+            "allow_secure_desktop": {
+              "type": "boolean",
+              "default": false
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "riskCategory": {
+      "enum": [
+        "observe",
+        "navigate",
+        "input",
+        "modify",
+        "send",
+        "delete",
+        "purchase",
+        "authorize",
+        "install",
+        "execute_script",
+        "capture_screen",
+        "custom"
+      ]
+    },
+    "riskLevel": {
+      "enum": [
+        "low",
+        "medium",
+        "high",
+        "critical",
+        "contextual"
+      ]
+    },
+    "risk": {
+      "type": "object",
+      "required": [
+        "category",
+        "level"
+      ],
+      "properties": {
+        "category": {
+          "$ref": "#/$defs/riskCategory"
+        },
+        "level": {
+          "$ref": "#/$defs/riskLevel"
+        },
+        "custom_name": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)+$",
+          "maxLength": 192
+        }
+      },
+      "additionalProperties": false
+    },
+    "effectClass": {
+      "enum": [
+        "read_only",
+        "idempotent",
+        "non_idempotent",
+        "contextual"
+      ]
+    },
+    "effect": {
+      "type": "object",
+      "required": [
+        "class"
+      ],
+      "properties": {
+        "class": {
+          "$ref": "#/$defs/effectClass"
+        }
+      },
+      "additionalProperties": false
+    },
+    "retry": {
+      "type": "object",
+      "required": [
+        "max_attempts"
+      ],
+      "properties": {
+        "max_attempts": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 100
+        },
+        "backoff": {
+          "type": "object",
+          "required": [
+            "strategy",
+            "initial_delay"
+          ],
+          "properties": {
+            "strategy": {
+              "enum": [
+                "fixed",
+                "exponential"
+              ]
+            },
+            "initial_delay": {
+              "$ref": "#/$defs/duration"
+            },
+            "max_delay": {
+              "$ref": "#/$defs/duration"
+            },
+            "multiplier": {
+              "type": "number",
+              "exclusiveMinimum": 1,
+              "maximum": 100
+            },
+            "jitter": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1
+            }
+          },
+          "additionalProperties": false
+        },
+        "on": {
+          "type": "object",
+          "properties": {
+            "codes": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/errorCodePattern"
+              },
+              "minItems": 1,
+              "uniqueItems": true
+            },
+            "categories": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "pattern": "^[a-z][a-z0-9_]*$"
+              },
+              "minItems": 1,
+              "uniqueItems": true
+            }
+          },
+          "minProperties": 1,
+          "additionalProperties": false
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "max_attempts": {
+                "minimum": 2
+              }
+            },
+            "required": [
+              "max_attempts"
+            ]
+          },
+          "then": {
+            "required": [
+              "on"
+            ]
+          }
+        }
+      ],
+      "additionalProperties": false
+    },
+    "stepBase": {
+      "type": "object",
+      "required": [
+        "id",
+        "type"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "type": {
+          "type": "string"
+        },
+        "description": {
+          "type": "string",
+          "maxLength": 2048
+        },
+        "if": {
+          "$ref": "#/$defs/expression"
+        },
+        "timeout": {
+          "$ref": "#/$defs/duration"
+        },
+        "attempt_timeout": {
+          "$ref": "#/$defs/duration"
+        },
+        "retry": {
+          "$ref": "#/$defs/retry"
+        },
+        "on_error": {
+          "$ref": "#/$defs/errorHandler"
+        },
+        "finally": {
+          "$ref": "#/$defs/nonEmptySteps"
+        },
+        "extensions": {
+          "$ref": "#/$defs/extensions"
+        }
+      }
+    },
+    "step": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/actionStep"
+        },
+        {
+          "$ref": "#/$defs/scriptStep"
+        },
+        {
+          "$ref": "#/$defs/setStep"
+        },
+        {
+          "$ref": "#/$defs/ifStep"
+        },
+        {
+          "$ref": "#/$defs/switchStep"
+        },
+        {
+          "$ref": "#/$defs/foreachStep"
+        },
+        {
+          "$ref": "#/$defs/whileStep"
+        },
+        {
+          "$ref": "#/$defs/blockStep"
+        },
+        {
+          "$ref": "#/$defs/failStep"
+        },
+        {
+          "$ref": "#/$defs/returnStep"
+        }
+      ]
+    },
+    "steps": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/step"
+      }
+    },
+    "nonEmptySteps": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/step"
+      },
+      "minItems": 1
+    },
+    "actionStep": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/stepBase"
+        },
+        {
+          "type": "object",
+          "required": [
+            "uses",
+            "with"
+          ],
+          "properties": {
+            "type": {
+              "const": "action"
+            },
+            "uses": {
+              "type": "string",
+              "pattern": "^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*\\.[a-z][a-z0-9_]*@[1-9][0-9]*$",
+              "maxLength": 256
+            },
+            "with": {
+              "type": "object"
+            },
+            "effect": {
+              "$ref": "#/$defs/effect"
+            },
+            "risk": {
+              "$ref": "#/$defs/risk"
+            },
+            "precondition": {
+              "$ref": "#/$defs/precondition"
+            },
+            "postcondition": {
+              "$ref": "#/$defs/postcondition"
+            }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "precondition": {
+      "type": "object",
+      "required": [
+        "condition"
+      ],
+      "properties": {
+        "condition": {
+          "$ref": "#/$defs/expression"
+        },
+        "message": {
+          "type": "string",
+          "maxLength": 2048
+        }
+      },
+      "additionalProperties": false
+    },
+    "postcondition": {
+      "type": "object",
+      "required": [
+        "condition"
+      ],
+      "properties": {
+        "condition": {
+          "$ref": "#/$defs/expression"
+        },
+        "message": {
+          "type": "string",
+          "maxLength": 2048
+        },
+        "timeout": {
+          "$ref": "#/$defs/duration"
+        },
+        "poll_interval": {
+          "$ref": "#/$defs/duration"
+        }
+      },
+      "additionalProperties": false
+    },
+    "scriptStep": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/stepBase"
+        },
+        {
+          "type": "object",
+          "required": [
+            "runtime",
+            "output_schema"
+          ],
+          "properties": {
+            "type": {
+              "const": "script"
+            },
+            "runtime": {
+              "enum": [
+                "python",
+                "javascript",
+                "shell"
+              ]
+            },
+            "source": {
+              "type": "string",
+              "maxLength": 1048576
+            },
+            "entrypoint": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 4096
+            },
+            "inputs": {
+              "type": "object"
+            },
+            "output_schema": {
+              "$ref": "#/$defs/jsonSchema"
+            },
+            "capabilities": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 192
+              },
+              "uniqueItems": true
+            },
+            "sandbox": {
+              "$ref": "#/$defs/sandbox"
+            }
+          },
+          "oneOf": [
+            {
+              "required": [
+                "source"
+              ],
+              "not": {
+                "required": [
+                  "entrypoint"
+                ]
+              }
+            },
+            {
+              "required": [
+                "entrypoint"
+              ],
+              "not": {
+                "required": [
+                  "source"
+                ]
+              }
+            }
+          ]
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "sandbox": {
+      "type": "object",
+      "properties": {
+        "network": {
+          "type": "object",
+          "required": [
+            "mode"
+          ],
+          "properties": {
+            "mode": {
+              "enum": [
+                "deny",
+                "allowlist"
+              ]
+            },
+            "hosts": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 253
+              },
+              "minItems": 1,
+              "uniqueItems": true
+            }
+          },
+          "if": {
+            "properties": {
+              "mode": {
+                "const": "allowlist"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "hosts"
+            ]
+          },
+          "else": {
+            "not": {
+              "required": [
+                "hosts"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        "filesystem": {
+          "type": "object",
+          "required": [
+            "mode"
+          ],
+          "properties": {
+            "mode": {
+              "enum": [
+                "deny",
+                "read_only",
+                "read_write"
+              ]
+            },
+            "paths": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": [
+                  "path",
+                  "access"
+                ],
+                "properties": {
+                  "path": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 4096
+                  },
+                  "access": {
+                    "enum": [
+                      "read",
+                      "write",
+                      "read_write"
+                    ]
+                  }
+                },
+                "additionalProperties": false
+              },
+              "uniqueItems": true
+            }
+          },
+          "additionalProperties": false
+        },
+        "environment": {
+          "type": "object",
+          "required": [
+            "mode"
+          ],
+          "properties": {
+            "mode": {
+              "enum": [
+                "deny",
+                "allowlist"
+              ]
+            },
+            "names": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+              },
+              "minItems": 1,
+              "uniqueItems": true
+            }
+          },
+          "if": {
+            "properties": {
+              "mode": {
+                "const": "allowlist"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "names"
+            ]
+          },
+          "else": {
+            "not": {
+              "required": [
+                "names"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        "max_output_bytes": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1073741824
+        }
+      },
+      "additionalProperties": false
+    },
+    "setStep": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/stepBase"
+        },
+        {
+          "type": "object",
+          "required": [
+            "assign"
+          ],
+          "properties": {
+            "type": {
+              "const": "set"
+            },
+            "assign": {
+              "type": "object",
+              "propertyNames": {
+                "type": "string",
+                "pattern": "^vars\\.[A-Za-z_][A-Za-z0-9_]*(?:\\.[A-Za-z_][A-Za-z0-9_]*)*$"
+              },
+              "additionalProperties": {
+                "$ref": "#/$defs/valueOrExpression"
+              },
+              "minProperties": 1
+            }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "ifStep": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/stepBase"
+        },
+        {
+          "type": "object",
+          "required": [
+            "condition",
+            "then"
+          ],
+          "properties": {
+            "type": {
+              "const": "if"
+            },
+            "condition": {
+              "$ref": "#/$defs/expression"
+            },
+            "then": {
+              "$ref": "#/$defs/nonEmptySteps"
+            },
+            "else": {
+              "$ref": "#/$defs/nonEmptySteps"
+            }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "switchStep": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/stepBase"
+        },
+        {
+          "type": "object",
+          "required": [
+            "cases"
+          ],
+          "properties": {
+            "type": {
+              "const": "switch"
+            },
+            "cases": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": [
+                  "when",
+                  "steps"
+                ],
+                "properties": {
+                  "when": {
+                    "$ref": "#/$defs/expression"
+                  },
+                  "steps": {
+                    "$ref": "#/$defs/nonEmptySteps"
+                  }
+                },
+                "additionalProperties": false
+              },
+              "minItems": 1
+            },
+            "default": {
+              "$ref": "#/$defs/nonEmptySteps"
+            }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "foreachStep": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/stepBase"
+        },
+        {
+          "type": "object",
+          "required": [
+            "items",
+            "as",
+            "max_items",
+            "steps"
+          ],
+          "properties": {
+            "type": {
+              "const": "foreach"
+            },
+            "items": {
+              "$ref": "#/$defs/expression"
+            },
+            "as": {
+              "$ref": "#/$defs/identifier"
+            },
+            "index_as": {
+              "$ref": "#/$defs/identifier"
+            },
+            "max_items": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 1000000
+            },
+            "concurrency": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 64,
+              "default": 1
+            },
+            "steps": {
+              "$ref": "#/$defs/nonEmptySteps"
+            }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "whileStep": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/stepBase"
+        },
+        {
+          "type": "object",
+          "required": [
+            "condition",
+            "max_iterations",
+            "timeout",
+            "steps"
+          ],
+          "properties": {
+            "type": {
+              "const": "while"
+            },
+            "condition": {
+              "$ref": "#/$defs/expression"
+            },
+            "max_iterations": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 1000000
+            },
+            "steps": {
+              "$ref": "#/$defs/nonEmptySteps"
+            }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "blockStep": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/stepBase"
+        },
+        {
+          "type": "object",
+          "required": [
+            "steps"
+          ],
+          "properties": {
+            "type": {
+              "const": "block"
+            },
+            "steps": {
+              "$ref": "#/$defs/nonEmptySteps"
+            }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "failStep": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/stepBase"
+        },
+        {
+          "type": "object",
+          "required": [
+            "error"
+          ],
+          "properties": {
+            "type": {
+              "const": "fail"
+            },
+            "error": {
+              "$ref": "#/$defs/errorLiteral"
+            }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "returnStep": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/stepBase"
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "return"
+            },
+            "value": {
+              "$ref": "#/$defs/valueOrExpression"
+            }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "errorCode": {
+      "type": "string",
+      "pattern": "^[A-Z][A-Z0-9_]*(?:\\.[A-Z][A-Z0-9_]*)+$",
+      "maxLength": 192
+    },
+    "errorCodePattern": {
+      "type": "string",
+      "pattern": "^(?:[A-Z][A-Z0-9_]*\\.)+(?:[A-Z][A-Z0-9_]*|\\*)$",
+      "maxLength": 192
+    },
+    "errorLiteral": {
+      "type": "object",
+      "required": [
+        "code",
+        "message"
+      ],
+      "properties": {
+        "code": {
+          "$ref": "#/$defs/errorCode"
+        },
+        "message": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 8192
+        },
+        "category": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_]*$"
+        },
+        "retryable": {
+          "type": "boolean"
+        },
+        "effect": {
+          "enum": [
+            "not_applied",
+            "applied",
+            "unknown"
+          ]
+        },
+        "details": {
+          "type": "object"
+        }
+      },
+      "additionalProperties": false
+    },
+    "errorHandler": {
+      "type": "object",
+      "required": [
+        "steps",
+        "outcome"
+      ],
+      "properties": {
+        "match": {
+          "type": "object",
+          "properties": {
+            "codes": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/errorCodePattern"
+              },
+              "minItems": 1,
+              "uniqueItems": true
+            },
+            "categories": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "pattern": "^[a-z][a-z0-9_]*$"
+              },
+              "minItems": 1,
+              "uniqueItems": true
+            },
+            "effects": {
+              "type": "array",
+              "items": {
+                "enum": [
+                  "not_applied",
+                  "applied",
+                  "unknown"
+                ]
+              },
+              "minItems": 1,
+              "uniqueItems": true
+            }
+          },
+          "minProperties": 1,
+          "additionalProperties": false
+        },
+        "as": {
+          "$ref": "#/$defs/identifier"
+        },
+        "steps": {
+          "$ref": "#/$defs/nonEmptySteps"
+        },
+        "outcome": {
+          "type": "object",
+          "required": [
+            "mode"
+          ],
+          "properties": {
+            "mode": {
+              "enum": [
+                "rethrow",
+                "continue",
+                "return"
+              ]
+            },
+            "output": {
+              "$ref": "#/$defs/valueOrExpression"
+            }
+          },
+          "allOf": [
+            {
+              "if": {
+                "properties": {
+                  "mode": {
+                    "const": "continue"
+                  }
+                },
+                "required": [
+                  "mode"
+                ]
+              },
+              "then": {
+                "required": [
+                  "output"
+                ]
+              }
+            },
+            {
+              "if": {
+                "properties": {
+                  "mode": {
+                    "const": "rethrow"
+                  }
+                },
+                "required": [
+                  "mode"
+                ]
+              },
+              "then": {
+                "not": {
+                  "required": [
+                    "output"
+                  ]
+                }
+              }
+            }
+          ],
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "extensions": {
+      "type": "object",
+      "propertyNames": {
+        "type": "string",
+        "pattern": "^[a-z0-9][a-z0-9.-]*/[A-Za-z][A-Za-z0-9_.-]*$",
+        "maxLength": 192
+      },
+      "additionalProperties": true
+    }
+  }
+}

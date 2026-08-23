@@ -1,0 +1,101 @@
+{
+  "apiVersion": "ai-auto-desktop.dev/v1alpha1",
+  "kind": "Workflow",
+  "metadata": {
+    "name": "ocr-error-response",
+    "version": "1.0.0",
+    "description": "Explicit OCR step followed by a deterministic structured low-confidence error."
+  },
+  "requires": {
+    "runtime": ">=0.1.0",
+    "capabilities": [
+      {
+        "name": "fixture",
+        "version": "^1.0.0",
+        "actions": [
+          "ocr",
+          "error"
+        ]
+      }
+    ]
+  },
+  "budgets": {
+    "max_duration": "10s",
+    "max_executed_steps": 2,
+    "cleanup_timeout": "1s"
+  },
+  "policy": {
+    "allowed_risk": {
+      "categories": [
+        "observe",
+        "custom"
+      ],
+      "max_level": "contextual"
+    },
+    "untrusted_inputs": {
+      "ui_text": "tainted",
+      "ocr_text": "tainted",
+      "allow_in_control_flow": false
+    },
+    "screenshots": {
+      "retention": "memory_only",
+      "cloud_upload": "deny"
+    },
+    "desktop": {
+      "single_writer": true,
+      "pause_on_user_input": true,
+      "allow_secure_desktop": false
+    }
+  },
+  "steps": [
+    {
+      "id": "recognize_status",
+      "type": "action",
+      "uses": "fixture.ocr@1",
+      "with": {
+        "text": "Retry",
+        "language": "en",
+        "confidence": 0.41,
+        "blocks": []
+      },
+      "effect": {
+        "class": "read_only"
+      },
+      "risk": {
+        "category": "observe",
+        "level": "low"
+      },
+      "timeout": "2s",
+      "retry": {
+        "max_attempts": 1
+      }
+    },
+    {
+      "id": "report_low_confidence",
+      "type": "action",
+      "uses": "fixture.error@1",
+      "with": {
+        "code": "OCR.LOW_CONFIDENCE",
+        "message": "OCR confidence 0.41 is below the required 0.80",
+        "retryable": false,
+        "data": {
+          "observed_confidence": 0.41,
+          "required_confidence": 0.8,
+          "ocr_step": "recognize_status"
+        }
+      },
+      "effect": {
+        "class": "contextual"
+      },
+      "risk": {
+        "category": "custom",
+        "level": "contextual",
+        "custom_name": "fixture.error"
+      },
+      "timeout": "2s",
+      "retry": {
+        "max_attempts": 1
+      }
+    }
+  ]
+}
