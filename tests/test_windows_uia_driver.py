@@ -391,7 +391,7 @@ class WindowsUIADriverCoreTests(unittest.TestCase):
                 {"target": found["target"], "locator": {"automation_id": "save"}},
                 deadline=deadline(),
             )
-        self.assertEqual(failed.exception.code, "DRIVER.ACTION_FAILED")
+        self.assertEqual(failed.exception.code, "DRIVER.UNKNOWN_EFFECT")
         self.assertEqual(failed.exception.data["effect"], "unknown")
         self.assertFalse(failed.exception.retryable)
 

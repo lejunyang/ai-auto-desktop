@@ -84,8 +84,8 @@ the worker cannot prove the tree is unchanged after the dispatch boundary.
 
 The effects are conservative: `invoke` is non-idempotent; `focus` and
 `set_value` are contextual. Errors keep stable `DRIVER.*` codes with bounded,
-non-sensitive detail. Native failures after entering the pattern call carry an
-unknown-effect marker and must not be replayed blindly.
+non-sensitive detail. Failures before the native call stay `not_applied`; after
+dispatch they become `DRIVER.UNKNOWN_EFFECT` and must not be replayed blindly.
 
 ## Launch and qualification
 

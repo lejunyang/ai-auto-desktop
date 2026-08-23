@@ -124,6 +124,7 @@ LOCATOR_ERRORS = (
 ACTION_ERRORS = (
     ("DRIVER.ACTION_UNSUPPORTED", "The target lacks the required native UIA pattern.", False),
     ("DRIVER.PROTECTED_ELEMENT", "The target exposes protected content.", False),
+    ("DRIVER.UNKNOWN_EFFECT", "The native action may have taken effect.", False),
 )
 
 
@@ -135,7 +136,7 @@ def _error_contracts(
             "code": code,
             "description": description,
             "retryable": retryable,
-            "effect": "unknown" if unknown_effect and code in {"DRIVER.TIMEOUT", "DRIVER.ACTION_FAILED"} else "not_applied",
+            "effect": "unknown" if code == "DRIVER.UNKNOWN_EFFECT" else "not_applied",
             "data_schema": {"type": "object"},
         }
         for code, description, retryable in entries
@@ -921,16 +922,16 @@ class WindowsUIADriver:
                 details.setdefault("action", action)
                 details["effect"] = "unknown"
                 raise DriverError(
-                    exc.code,
-                    exc.message,
+                    "DRIVER.UNKNOWN_EFFECT",
+                    "native action outcome is unknown after dispatch",
                     retryable=False,
                     data=details,
                 ) from exc
             raise
         except Exception as exc:
             raise DriverError(
-                "DRIVER.ACTION_FAILED",
-                f"native {action} failed",
+                "DRIVER.UNKNOWN_EFFECT",
+                f"native {action} outcome is unknown after dispatch",
                 data={
                     "action": action,
                     "effect": "unknown" if dispatched else "not_applied",
