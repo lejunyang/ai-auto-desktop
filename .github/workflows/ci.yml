@@ -24,3 +24,5 @@ jobs:
         run: python -m unittest discover -s tests -v
       - name: Validate canonical example
         run: python -m ai_auto_desktop validate examples/workflows/ocr-error-response.json
+      - name: Smoke capability probe
+        run: python -m ai_auto_desktop probe
