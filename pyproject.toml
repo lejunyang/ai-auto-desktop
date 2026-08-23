@@ -12,6 +12,10 @@ license = { text = "Apache-2.0" }
 authors = [{ name = "ai-auto-desktop contributors" }]
 dependencies = ["PyYAML>=6.0", "jsonschema>=4.18"]
 
+[project.optional-dependencies]
+ocr = ["Pillow>=9.0"]
+windows-uia = ["comtypes>=1.4,<2"]
+
 [project.scripts]
 ai-auto-desktop = "ai_auto_desktop.cli:main"
 
