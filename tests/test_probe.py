@@ -122,6 +122,15 @@ class ProbeTests(unittest.TestCase):
 
         self.assertFalse(session["signals"]["stdin_is_tty"])
 
+    def test_remote_display_is_not_claimed_interactive_from_environment_alone(self) -> None:
+        session = probe._session_info(
+            "linux",
+            {"SSH_CONNECTION": "fixture", "DISPLAY": ":99"},
+        )
+
+        self.assertEqual(session["kind"], "ssh_x11")
+        self.assertIsNone(session["interactive"])
+
     def test_wayland_and_uinput_checks_only_inspect_metadata(self) -> None:
         with mock.patch.object(probe, "_path_state", return_value="socket"):
             wayland = probe._probe_linux_wayland({"WAYLAND_DISPLAY": "wayland-0", "XDG_RUNTIME_DIR": "/run/user/fixture"})

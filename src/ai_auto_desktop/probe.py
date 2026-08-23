@@ -121,6 +121,11 @@ def _session_info(name: str, environ: Mapping[str, str]) -> dict[str, Any]:
             kind, interactive = "service", False
     elif name == "macos" and ssh:
         kind, interactive = "ssh", False
+    if name == "linux" and ssh:
+        kind = f"ssh_{kind}" if kind in {"x11", "wayland"} else "ssh"
+        # Environment variables alone do not prove the forwarded display is
+        # connected or controllable.  Individual checks report that evidence.
+        interactive = None
 
     try:
         stdin_is_tty = bool(sys.stdin is not None and sys.stdin.isatty())
