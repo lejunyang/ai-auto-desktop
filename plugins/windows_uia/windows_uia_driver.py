@@ -111,6 +111,7 @@ TARGET_SCHEMA: dict[str, Any] = {
 COMMON_ERRORS = (
     ("DRIVER.INVALID_REQUEST", "The action arguments are invalid.", False),
     ("DRIVER.UNAVAILABLE", "Windows UI Automation is unavailable.", False),
+    ("DRIVER.ACTION_FAILED", "The native observation operation failed.", False),
     ("DRIVER.TIMEOUT", "The request deadline elapsed.", True),
     ("DRIVER.OUTPUT_TOO_LARGE", "The normalized response exceeds the wire limit.", False),
 )
@@ -123,7 +124,6 @@ LOCATOR_ERRORS = (
 ACTION_ERRORS = (
     ("DRIVER.ACTION_UNSUPPORTED", "The target lacks the required native UIA pattern.", False),
     ("DRIVER.PROTECTED_ELEMENT", "The target exposes protected content.", False),
-    ("DRIVER.ACTION_FAILED", "The native UIA action failed.", False),
 )
 
 
@@ -379,6 +379,8 @@ class UIABackend(Protocol):
 
     def set_value(self, native: Any, value: str, *, deadline: float) -> Any: ...
 
+    def same_element(self, previous: Any, current: Any, *, deadline: float) -> bool: ...
+
 
 @dataclass(slots=True)
 class _SnapshotRecord:
@@ -386,6 +388,8 @@ class _SnapshotRecord:
     handles: dict[str, Any]
     fingerprints: dict[str, str]
     window_selector: dict[str, Any]
+    max_depth: int
+    max_nodes: int
 
 
 def _fail(code: str, message: str, **data: Any) -> NoReturn:
@@ -620,6 +624,8 @@ class WindowsUIADriver:
             handles=handles,
             fingerprints=fingerprints,
             window_selector=copy.deepcopy(dict(window)),
+            max_depth=max_depth,
+            max_nodes=max_nodes,
         )
         self._current = record
         return record
@@ -830,8 +836,8 @@ class WindowsUIADriver:
         _check_deadline(deadline)
         fresh = self._capture(
             record.window_selector,
-            max_depth=DEFAULT_MAX_DEPTH,
-            max_nodes=DEFAULT_MAX_NODES,
+            max_depth=record.max_depth,
+            max_nodes=record.max_nodes,
             deadline=deadline,
         )
         try:
@@ -850,6 +856,26 @@ class WindowsUIADriver:
                 "the pre-dispatch snapshot was truncated",
             )
         fresh_node_id = resolved["node_id"]
+        same_element = getattr(self.backend, "same_element", None)
+        if callable(same_element):
+            if not same_element(
+                record.handles[node_id],
+                fresh.handles[fresh_node_id],
+                deadline=deadline,
+            ):
+                raise DriverError(
+                    "DRIVER.STALE_SNAPSHOT",
+                    "locator resolved to a different native target",
+                )
+        elif (
+            record.public["nodes"][int(node_id[1:])]["provenance"].get("runtime_id")
+            is None
+            or resolved.get("provenance", {}).get("runtime_id") is None
+        ):
+            raise DriverError(
+                "DRIVER.STALE_SNAPSHOT",
+                "native target identity cannot be verified",
+            )
         if fresh.fingerprints[fresh_node_id] != expected_fingerprint:
             raise DriverError(
                 "DRIVER.STALE_SNAPSHOT",
@@ -889,7 +915,17 @@ class WindowsUIADriver:
                 assert value is not None
                 backend_result = self.backend.set_value(native, value, deadline=deadline)
             _check_deadline(deadline, post_dispatch=True)
-        except DriverError:
+        except DriverError as exc:
+            if dispatched and exc.code in {"DRIVER.ACTION_FAILED", "DRIVER.TIMEOUT"}:
+                details = dict(exc.data) if isinstance(exc.data, Mapping) else {}
+                details.setdefault("action", action)
+                details["effect"] = "unknown"
+                raise DriverError(
+                    exc.code,
+                    exc.message,
+                    retryable=False,
+                    data=details,
+                ) from exc
             raise
         except Exception as exc:
             raise DriverError(
@@ -951,6 +987,9 @@ class UnavailableBackend:
         self._raise()
 
     def set_value(self, native: Any, value: str, *, deadline: float) -> Any:
+        self._raise()
+
+    def same_element(self, previous: Any, current: Any, *, deadline: float) -> bool:
         self._raise()
 
 
@@ -1329,7 +1368,7 @@ class ComtypesUIABackend:
                         if self.walker.GetFirstChildElement(element):
                             truncated = True
                     except Exception:
-                        pass
+                        truncated = True
                     continue
                 child = self.walker.GetFirstChildElement(element)
                 while child:
@@ -1386,6 +1425,13 @@ class ComtypesUIABackend:
         except Exception as exc:
             raise self._native_failure("ValuePattern.SetValue", exc) from exc
 
+    def same_element(self, previous: Any, current: Any, *, deadline: float) -> bool:
+        _check_deadline(deadline)
+        try:
+            return bool(self.automation.CompareElements(previous, current))
+        except Exception as exc:
+            raise self._native_failure("CompareElements", exc) from exc
+
 
 def create_default_backend() -> UIABackend:
     if sys.platform != "win32":
@@ -1420,7 +1466,7 @@ def _encode(message: Mapping[str, Any]) -> bytes:
     return (
         json.dumps(
             message,
-            ensure_ascii=False,
+            ensure_ascii=True,
             allow_nan=False,
             separators=(",", ":"),
         )

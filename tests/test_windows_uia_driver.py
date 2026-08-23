@@ -124,6 +124,12 @@ class FakeBackend:
     def set_value(self, native: object, value: str, *, deadline: float) -> object:
         return self._action("set_value", native, value)
 
+    def same_element(
+        self, previous: object, current: object, *, deadline: float
+    ) -> bool:
+        self.calls.append(("same_element", previous, current))
+        return previous == current
+
 
 class WindowsUIADriverCoreTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -297,6 +303,60 @@ class WindowsUIADriverCoreTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, "DRIVER.SNAPSHOT_TRUNCATED")
         self.assertFalse(any(call[0] == "invoke" for call in backend.calls))
 
+    def test_write_reuses_snapshot_bounds_and_requires_native_identity(self) -> None:
+        backend = FakeBackend()
+        driver = uia.WindowsUIADriver(backend)
+        snapshot = driver.execute(
+            "snapshot",
+            {"window": {"handle": 101}, "max_depth": 64, "max_nodes": 2000},
+            deadline=deadline(),
+        )
+        found = driver.execute(
+            "find",
+            {
+                "snapshot_id": snapshot["snapshot_id"],
+                "revision": snapshot["revision"],
+                "locator": {"automation_id": "save"},
+            },
+            deadline=deadline(),
+        )
+        driver.execute(
+            "invoke",
+            {"target": found["target"], "locator": {"automation_id": "save"}},
+            deadline=deadline(),
+        )
+        captures = [call for call in backend.calls if call[0] == "capture"]
+        self.assertEqual(captures[-1][2:], (64, 2000))
+        self.assertIn(("same_element", "save", "save"), backend.calls)
+
+        replacement = default_tree()
+        replacement[1] = node(
+            "new-native", 0, "button", "Save", actions=("focus", "invoke"),
+            automation_id="save",
+        )
+        backend = FakeBackend([default_tree(), replacement])
+        driver = uia.WindowsUIADriver(backend)
+        snapshot = driver.execute(
+            "snapshot", {"window": {"handle": 101}}, deadline=deadline()
+        )
+        found = driver.execute(
+            "find",
+            {
+                "snapshot_id": snapshot["snapshot_id"],
+                "revision": snapshot["revision"],
+                "locator": {"automation_id": "save"},
+            },
+            deadline=deadline(),
+        )
+        with self.assertRaises(uia.DriverError) as raised:
+            driver.execute(
+                "invoke",
+                {"target": found["target"], "locator": {"automation_id": "save"}},
+                deadline=deadline(),
+            )
+        self.assertEqual(raised.exception.code, "DRIVER.STALE_SNAPSHOT")
+        self.assertFalse(any(call[0] == "invoke" for call in backend.calls))
+
     def test_unsupported_action_native_failure_and_deadline_are_structured(self) -> None:
         snapshot = self.snapshot()
         found = self.find(snapshot, {"automation_id": "save"})
@@ -333,6 +393,7 @@ class WindowsUIADriverCoreTests(unittest.TestCase):
             )
         self.assertEqual(failed.exception.code, "DRIVER.ACTION_FAILED")
         self.assertEqual(failed.exception.data["effect"], "unknown")
+        self.assertFalse(failed.exception.retryable)
 
         with self.assertRaises(uia.DriverError) as timed_out:
             self.driver.execute("list_windows", {}, deadline=time.monotonic() - 1)
