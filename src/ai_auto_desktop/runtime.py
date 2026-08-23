@@ -347,15 +347,20 @@ class WorkflowRunner:
                 if attempt_deadline is not None:
                     self._deadline_stack.append(attempt_deadline)
                 try:
+                    contract: Mapping[str, Any] | None = None
                     if step.type == "action":
-                        effect = self._effective_action_effect(step)
+                        contract = self._resolve_action_contract(step)
+                        effect = self._effective_action_effect(
+                            step, contract=contract
+                        )
                     effective_timeout = self._remaining(attempt_deadline)
                     if effective_timeout == 0:
                         raise AutomationError(
                             "STEP.TIMEOUT", f"Step {step.id!r} timed out"
                         )
                     if step.type == "action":
-                        manifest_timeout = self._manifest_action_timeout(step)
+                        assert contract is not None
+                        manifest_timeout = _duration(contract.get("timeout"))
                         if manifest_timeout is not None:
                             manifest_remaining = max(
                                 0.0,
@@ -376,7 +381,9 @@ class WorkflowRunner:
                                 if effective_timeout is not None
                                 else manifest_remaining
                             )
-                    return self._execute(step, effective_timeout)
+                    return self._execute(
+                        step, effective_timeout, action_contract=contract
+                    )
                 finally:
                     if attempt_deadline is not None:
                         self._deadline_stack.pop()
@@ -390,25 +397,28 @@ class WorkflowRunner:
                 if delay: time.sleep(delay)
         raise AssertionError("unreachable")
 
-    def _effective_action_effect(self, step: CompiledStep) -> str:
+    def _resolve_action_contract(
+        self, step: CompiledStep
+    ) -> Mapping[str, Any]:
         uses = step.params["uses"]
         capability = uses.rsplit(".", 1)[0]
         plugin = self.plugins.get(capability)
-        declared = thaw(step.params.get("effect", {})).get("class")
         if plugin is None:
-            return declared or "contextual"
-        contract = self._action_contract(plugin, capability, uses)
+            raise AutomationError(
+                "CAPABILITY.MISSING",
+                f"No plugin registered for {capability!r}",
+                details={"uses": uses},
+            )
+        return self._action_contract(plugin, capability, uses)
+
+    def _effective_action_effect(
+        self, step: CompiledStep, *, contract: Mapping[str, Any] | None = None
+    ) -> str:
+        declared = thaw(step.params.get("effect", {})).get("class")
+        if contract is None:
+            contract = self._resolve_action_contract(step)
         provider = thaw(contract.get("effect", {})).get("default_class")
         return _max_effect(provider, declared)
-
-    def _manifest_action_timeout(self, step: CompiledStep) -> float | None:
-        uses = step.params["uses"]
-        capability = uses.rsplit(".", 1)[0]
-        plugin = self.plugins.get(capability)
-        if plugin is None:
-            return None
-        contract = self._action_contract(plugin, capability, uses)
-        return _duration(contract.get("timeout"))
 
     def _retry_match(self, retry: Mapping[str, Any], error: AutomationError) -> bool:
         if not error.retryable: return False
@@ -422,8 +432,15 @@ class WorkflowRunner:
         maximum = _duration(backoff.get("max_delay")); delay = min(delay, maximum) if maximum is not None else delay
         jitter = float(backoff.get("jitter", 0.0)); return delay * random.uniform(1 - jitter, 1 + jitter) if jitter else delay
 
-    def _execute(self, step: CompiledStep, timeout: float | None) -> Any:
-        if step.type == "action": return self._action(step, timeout)
+    def _execute(
+        self,
+        step: CompiledStep,
+        timeout: float | None,
+        *,
+        action_contract: Mapping[str, Any] | None = None,
+    ) -> Any:
+        if step.type == "action":
+            return self._action(step, timeout, contract=action_contract)
         if step.type == "set":
             snapshot_context = dict(self.context)
             snapshot_context["vars"] = dict(self.variables)
@@ -475,10 +492,17 @@ class WorkflowRunner:
         if old is MISSING: self.context.pop(name, None)
         else: self.context[name] = old
 
-    def _action(self, step: CompiledStep, timeout: float | None) -> Any:
+    def _action(
+        self,
+        step: CompiledStep,
+        timeout: float | None,
+        *,
+        contract: Mapping[str, Any] | None = None,
+    ) -> Any:
         uses = step.params["uses"]; capability = uses.rsplit(".", 1)[0]; plugin = self.plugins.get(capability)
         if plugin is None: raise AutomationError("CAPABILITY.MISSING", f"No plugin registered for {capability!r}", details={"uses": uses})
-        contract = self._action_contract(plugin, capability, uses)
+        if contract is None:
+            contract = self._action_contract(plugin, capability, uses)
         self._enforce_action_policy(step, plugin, contract)
         pre = step.params.get("precondition")
         if pre and not bool(self._evaluate(thaw(pre["condition"]))): raise AutomationError("ACTION.PRECONDITION_FAILED", pre.get("message", "Action precondition failed"), phase="precondition")
