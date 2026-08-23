@@ -530,7 +530,28 @@ class WorkflowRunner:
                     details={"plugin_error": exc.to_dict()},
                     cause=exc,
                 ) from exc
-            raise AutomationError(exc.code, exc.message, category="plugin", retryable=exc.retryable, details=exc.details, cause=exc) from exc
+            declared_error = next(
+                (
+                    item
+                    for item in contract.get("errors", ())
+                    if isinstance(item, Mapping) and item.get("code") == exc.code
+                ),
+                None,
+            )
+            error_effect = (
+                declared_error.get("effect", "none")
+                if isinstance(declared_error, Mapping)
+                else "none"
+            )
+            raise AutomationError(
+                exc.code,
+                exc.message,
+                category="plugin",
+                retryable=exc.retryable,
+                effect=error_effect,
+                details=exc.details,
+                cause=exc,
+            ) from exc
         self._validate_schema(result, contract.get("output_schema"), "ACTION.OUTPUT_INVALID", uses)
         self.context["steps"][step.id] = {"status": "running", "output": result}
         if step.params.get("postcondition"): self._postcondition(step.params["postcondition"])

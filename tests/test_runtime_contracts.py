@@ -258,6 +258,45 @@ class RuntimeSemVerContractTests(unittest.TestCase):
 
 
 class RuntimeFailClosedContractTests(unittest.TestCase):
+    def test_declared_plugin_unknown_effect_reaches_run_status(self) -> None:
+        contract = action_contract(
+            effect={"default_class": "non_idempotent"},
+            errors=[
+                {
+                    "code": "DRIVER.ACTION_FAILED",
+                    "retryable": False,
+                    "effect": "unknown",
+                }
+            ],
+        )
+        plugin = RecordingPlugin(manifest(contract=contract))
+        self.addCleanup(plugin.close)
+
+        def fail(
+            action: str, args: object, timeout: float | None = None
+        ) -> object:
+            plugin.invoke_calls += 1
+            from ai_auto_desktop.plugin import PluginError
+
+            raise PluginError(
+                "DRIVER.ACTION_FAILED",
+                "native action outcome is unknown",
+                details={"dispatched": True},
+            )
+
+        plugin.invoke = fail  # type: ignore[method-assign]
+        raw = workflow(
+            action_step(effect={"class": "non_idempotent"})
+        )
+        result = run_descriptor(
+            compile_descriptor(raw), plugins={"fixture": plugin}
+        )
+
+        self.assertEqual(result.status, "unknown_effect")
+        self.assertEqual(result.error.code, "DRIVER.ACTION_FAILED")
+        self.assertEqual(result.error.effect, "unknown")
+        self.assertEqual(plugin.invoke_calls, 1)
+
     def test_foreach_rejects_unsupported_concurrency_before_body(self) -> None:
         raw = workflow(
             {
