@@ -87,13 +87,24 @@ class ProbeTests(unittest.TestCase):
         )
 
     def test_read_only_commands_use_absolute_paths_and_minimal_environment(self) -> None:
-        completed = mock.Mock(returncode=0, stdout="ok")
+        class Completed:
+            pid = 1
+            returncode = 0
+            stdout = io.BytesIO(b"ok")
+
+            def poll(self) -> int:
+                return 0
+
+            def wait(self, timeout: float | None = None) -> int:
+                return 0
+
+        completed = Completed()
         supplied = {
             "PATH": "/tmp/untrusted",
             "DBUS_SESSION_BUS_ADDRESS": "unix:path=/fixture",
             "SECRET": "must-not-leak",
         }
-        with mock.patch.object(probe.subprocess, "run", return_value=completed) as run:
+        with mock.patch.object(probe.subprocess, "Popen", return_value=completed) as popen:
             result = probe._run_read_only(
                 ("/usr/bin/gdbus", "--version"),
                 environ=supplied,
@@ -101,7 +112,7 @@ class ProbeTests(unittest.TestCase):
             )
 
         self.assertEqual(result.outcome, "ok")
-        child_environment = run.call_args.kwargs["env"]
+        child_environment = popen.call_args.kwargs["env"]
         self.assertEqual(child_environment["PATH"], probe._TRUSTED_COMMAND_PATH)
         self.assertEqual(
             child_environment["DBUS_SESSION_BUS_ADDRESS"],
@@ -110,11 +121,11 @@ class ProbeTests(unittest.TestCase):
         self.assertNotIn("SECRET", child_environment)
 
     def test_read_only_command_rejects_path_lookup(self) -> None:
-        with mock.patch.object(probe.subprocess, "run") as run:
+        with mock.patch.object(probe.subprocess, "Popen") as popen:
             result = probe._run_read_only(("gdbus", "--version"))
 
         self.assertEqual(result.outcome, "error")
-        run.assert_not_called()
+        popen.assert_not_called()
 
     def test_session_probe_tolerates_missing_stdin(self) -> None:
         with mock.patch.object(probe.sys, "stdin", None):

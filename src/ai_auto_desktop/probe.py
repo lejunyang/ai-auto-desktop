@@ -17,6 +17,8 @@ import shutil
 import stat
 import subprocess
 import sys
+import threading
+import time
 from typing import Any, Mapping, Sequence
 import uuid
 
@@ -25,6 +27,7 @@ PROBE_API_VERSION = "ai-auto-desktop.dev/probe/v1alpha1"
 PROBE_KIND = "CapabilityProbe"
 PROBE_STATES = frozenset({"available", "degraded", "unavailable", "unknown"})
 _TRUSTED_COMMAND_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
+_COMMAND_OUTPUT_LIMIT = 64 * 1024
 _SYSTEM_LIBRARY_DIRECTORIES = (
     Path("/lib"),
     Path("/lib64"),
@@ -189,28 +192,82 @@ def _run_read_only(
         value = source_environment.get(name)
         if value:
             child_environment[name] = value
+    output = bytearray()
+    overflow = threading.Event()
+    process: subprocess.Popen[bytes] | None = None
     try:
-        completed = subprocess.run(
+        process = subprocess.Popen(
             list(argv),
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=timeout,
-            check=False,
             env=child_environment,
+            start_new_session=os.name == "posix",
         )
-    except subprocess.TimeoutExpired:
-        return _CommandResult("timeout")
-    except (FileNotFoundError, OSError, UnicodeError):
+    except (FileNotFoundError, OSError, ValueError):
         return _CommandResult("error")
+    assert process.stdout is not None
+
+    def drain() -> None:
+        try:
+            while True:
+                chunk = process.stdout.read(8192)
+                if not chunk:
+                    return
+                remaining = _COMMAND_OUTPUT_LIMIT - len(output)
+                if remaining > 0:
+                    output.extend(chunk[:remaining])
+                if len(chunk) > remaining:
+                    overflow.set()
+                    return
+        except (OSError, ValueError):
+            return
+
+    reader = threading.Thread(target=drain, daemon=True)
+    reader.start()
+    deadline = time.monotonic() + timeout
+    while process.poll() is None and not overflow.is_set():
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        overflow.wait(timeout=min(0.02, remaining))
+    if process.poll() is None and not overflow.is_set():
+        _terminate_probe_process(process)
+        reader.join(timeout=0.2)
+        process.stdout.close()
+        return _CommandResult("timeout")
+    if overflow.is_set():
+        _terminate_probe_process(process)
+        reader.join(timeout=0.2)
+        process.stdout.close()
+        return _CommandResult("error")
+    returncode = process.wait()
+    reader.join(timeout=0.2)
+    process.stdout.close()
     return _CommandResult(
-        "ok" if completed.returncode == 0 else "nonzero",
-        completed.returncode,
-        completed.stdout[:65536],
+        "ok" if returncode == 0 else "nonzero",
+        returncode,
+        bytes(output).decode("utf-8", errors="replace"),
     )
+
+
+def _terminate_probe_process(process: subprocess.Popen[bytes]) -> None:
+    if process.poll() is not None:
+        return
+    try:
+        if os.name == "posix":
+            os.killpg(process.pid, 15)
+        else:
+            process.terminate()
+        process.wait(timeout=0.1)
+    except (OSError, subprocess.TimeoutExpired):
+        try:
+            if os.name == "posix":
+                os.killpg(process.pid, 9)
+            else:
+                process.kill()
+        except OSError:
+            pass
 
 
 def _probe_windows() -> tuple[CapabilityCheck, ...]:
