@@ -739,11 +739,7 @@ class WindowsUIADriver:
             return actual is expected
         if not isinstance(actual, str) or not isinstance(expected, str):
             return actual == expected
-        if mode == "exact":
-            return actual == expected
-        if mode == "casefold":
-            return actual.casefold() == expected.casefold()
-        return expected in actual
+        return actual == expected
 
     def _matches(self, node: Mapping[str, Any], locator: Mapping[str, Any]) -> bool:
         mode = str(locator.get("match", "exact"))
