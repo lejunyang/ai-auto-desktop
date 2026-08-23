@@ -137,7 +137,7 @@ def execute_python_script(
             "--setenv",
             "PYTHONIOENCODING",
             "utf-8",
-            "/usr/bin/prlimit",
+            prlimit,
             f"--fsize={output_limit}",
             "--as=536870912",
             f"--cpu={cpu_limit}",

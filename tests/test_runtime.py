@@ -5,8 +5,10 @@ from __future__ import annotations
 from pathlib import Path
 import sys
 import unittest
+from unittest import mock
 
 from ai_auto_desktop.compiler import compile_descriptor
+from ai_auto_desktop.errors import AutomationError
 from ai_auto_desktop.plugin import PluginError, ProcessPlugin
 from ai_auto_desktop.runtime import WorkflowRunner, run_descriptor
 
@@ -572,37 +574,59 @@ class ScriptStepTests(unittest.TestCase):
             "import json, sys\npayload = json.load(sys.stdin)\njson.dump({'answer': payload['value'] * 2}, sys.stdout)\n"
         )
 
-        result = WorkflowRunner(plan).run()
+        with mock.patch(
+            "ai_auto_desktop.runtime.execute_python_script"
+        ) as execute_python_script:
+            result = WorkflowRunner(plan).run()
 
         self.assertEqual(result.status, "failed")
         self.assertEqual(result.error.code, "SCRIPT.SANDBOX_DENIED")
+        execute_python_script.assert_not_called()
 
-    def test_script_runs_only_after_explicit_gate_in_available_sandbox(self) -> None:
+    def test_script_runs_only_after_explicit_gate(self) -> None:
         plan = self.script_workflow(
             "import json, sys\npayload = json.load(sys.stdin)\njson.dump({'answer': payload['value'] * 2}, sys.stdout)\n"
         )
 
-        result = WorkflowRunner(plan, allow_scripts=True).run()
+        with mock.patch(
+            "ai_auto_desktop.runtime.execute_python_script",
+            return_value={"answer": 42},
+        ) as execute_python_script:
+            result = WorkflowRunner(plan, allow_scripts=True).run()
 
         self.assertTrue(result.ok, result.to_dict())
         self.assertEqual(result.output, {"answer": 42})
+        execute_python_script.assert_called_once()
+        self.assertEqual(execute_python_script.call_args.args[2], {"value": 21})
+        self.assertGreater(execute_python_script.call_args.args[3], 0)
+        self.assertLessEqual(execute_python_script.call_args.args[3], 1.0)
 
-    def test_script_rejects_multiple_json_values(self) -> None:
+    def test_script_validates_executor_output(self) -> None:
         plan = self.script_workflow(
-            "print('{\"answer\": 1}')\nprint('{\"answer\": 2}')\n"
+            "print('{\"answer\": \"wrong\"}')\n"
         )
 
-        result = WorkflowRunner(plan, allow_scripts=True).run()
+        with mock.patch(
+            "ai_auto_desktop.runtime.execute_python_script",
+            return_value={"answer": "wrong"},
+        ):
+            result = WorkflowRunner(plan, allow_scripts=True).run()
 
         self.assertEqual(result.status, "failed")
         self.assertEqual(result.error.code, "SCRIPT.OUTPUT_INVALID")
 
-    def test_sandboxed_script_timeout_is_distinct(self) -> None:
+    def test_script_timeout_maps_to_timed_out_status(self) -> None:
         plan = self.script_workflow(
             "import time\ntime.sleep(2)\nprint('{\"answer\": 1}')\n", timeout="20ms"
         )
 
-        result = WorkflowRunner(plan, allow_scripts=True).run()
+        with mock.patch(
+            "ai_auto_desktop.runtime.execute_python_script",
+            side_effect=AutomationError(
+                "SCRIPT.TIMEOUT", "Script timed out", category="script"
+            ),
+        ):
+            result = WorkflowRunner(plan, allow_scripts=True).run()
 
         self.assertEqual(result.status, "timed_out")
         self.assertEqual(result.error.code, "SCRIPT.TIMEOUT")

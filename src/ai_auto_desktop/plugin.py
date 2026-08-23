@@ -11,6 +11,7 @@ from __future__ import annotations
 from collections import deque
 from collections.abc import Mapping
 from dataclasses import dataclass
+from importlib import resources
 import json
 import math
 import os
@@ -41,6 +42,12 @@ _MAX_STDERR_BYTES = 64 * 1024
 _STDERR_CHUNK_BYTES = 4096
 _MANIFEST_PROBE_SECONDS = 0.10
 _TERMINATE_GRACE_SECONDS = 0.50
+_MANIFEST_SCHEMA_RESOURCE = (
+    "schemas",
+    "capabilities",
+    "v1alpha1",
+    "capability-manifest.schema.json",
+)
 
 
 class PluginError(RuntimeError):
@@ -165,13 +172,19 @@ class ProcessPlugin:
         with self._stderr_lock:
             return "".join(self._stderr_chunks)
 
-    def start(self) -> dict[str, Any]:
-        """Start the plugin, complete its manifest handshake, and return it."""
+    def start(self, timeout: float | None = None) -> dict[str, Any]:
+        """Start the plugin within the optional caller-supplied budget."""
 
+        effective_timeout = (
+            self.timeout
+            if timeout is None
+            else min(self.timeout, _validate_timeout(timeout, "start timeout"))
+        )
+        deadline = time.monotonic() + effective_timeout
         with self._request_lock:
-            return self._start_locked()
+            return self._start_locked(deadline=deadline)
 
-    def _start_locked(self) -> dict[str, Any]:
+    def _start_locked(self, *, deadline: float | None = None) -> dict[str, Any]:
         with self._lifecycle_lock:
             if self._closed:
                 raise PluginError(
@@ -181,6 +194,12 @@ class ProcessPlugin:
                 )
             if self.manifest is not None:
                 return self.manifest
+            if deadline is not None and time.monotonic() >= deadline:
+                raise self._host_error(
+                    "PLUGIN.HOST_TIMEOUT",
+                    f"plugin {self.name!r} did not respond before the deadline",
+                    retryable=True,
+                )
             if self._process is not None:
                 # A process without a manifest can only exist while this method
                 # holds _request_lock, or after a fatal startup failure.
@@ -219,12 +238,17 @@ class ProcessPlugin:
             self._process = process
             self._start_readers(process)
 
-        deadline = time.monotonic() + self.timeout
+        startup_deadline = time.monotonic() + self.timeout
+        if deadline is not None:
+            startup_deadline = min(startup_deadline, deadline)
         # Always reserve most of a short startup timeout for the request-based
         # handshake.  A fixed probe duration would consume the entire budget
         # when callers deliberately configure millisecond-scale timeouts.
-        probe_seconds = min(_MANIFEST_PROBE_SECONDS, self.timeout / 10.0)
-        probe_deadline = min(deadline, time.monotonic() + probe_seconds)
+        startup_remaining = max(0.0, startup_deadline - time.monotonic())
+        probe_seconds = min(_MANIFEST_PROBE_SECONDS, startup_remaining / 10.0)
+        probe_deadline = min(
+            startup_deadline, time.monotonic() + probe_seconds
+        )
         dispatched = False
         try:
             message = self._read_message(probe_deadline, allow_timeout=True)
@@ -234,12 +258,18 @@ class ProcessPlugin:
                 )
                 self.manifest = manifest
                 return manifest
+            if time.monotonic() >= startup_deadline:
+                raise self._host_error(
+                    "PLUGIN.HOST_TIMEOUT",
+                    f"plugin {self.name!r} did not respond before the deadline",
+                    retryable=True,
+                )
 
             request_id = self._new_request_id()
             dispatched = self._write_request(
                 {"type": "manifest", "id": request_id}
             )
-            message = self._read_message(deadline)
+            message = self._read_message(startup_deadline)
             assert message is not None
 
             # A late proactive manifest is valid.  Remember the request id so
@@ -282,14 +312,21 @@ class ProcessPlugin:
             if timeout is None
             else _validate_timeout(timeout, "invoke timeout")
         )
+        deadline = time.monotonic() + effective_timeout
 
         with self._request_lock:
-            self._start_locked()
+            self._start_locked(deadline=deadline)
             request_id = self._new_request_id()
-            deadline = time.monotonic() + effective_timeout
-            deadline_ms = int((time.time() + effective_timeout) * 1000)
             dispatched = False
             try:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise self._host_error(
+                        "PLUGIN.HOST_TIMEOUT",
+                        f"plugin {self.name!r} did not respond before the deadline",
+                        retryable=True,
+                    )
+                deadline_ms = int((time.time() + remaining) * 1000)
                 dispatched = self._write_request(
                     {
                         "type": "invoke",
@@ -558,6 +595,34 @@ class ProcessPlugin:
         return dict(manifest)
 
     def _validate_manifest(self, manifest: dict[str, Any]) -> None:
+        if jsonschema is None:
+            raise self._host_error(
+                "PLUGIN.HOST_PROTOCOL_ERROR",
+                "canonical manifest schema validation requires jsonschema",
+            )
+
+        resource_name = "/".join(_MANIFEST_SCHEMA_RESOURCE)
+        try:
+            resource = resources.files("ai_auto_desktop").joinpath(
+                *_MANIFEST_SCHEMA_RESOURCE
+            )
+            schema = json.loads(resource.read_text(encoding="utf-8"))
+            jsonschema.Draft202012Validator.check_schema(schema)
+        except (OSError, TypeError, ValueError, jsonschema.SchemaError) as exc:
+            raise self._host_error(
+                "PLUGIN.HOST_PROTOCOL_ERROR",
+                f"canonical manifest schema resource {resource_name!r} "
+                "is unavailable or invalid",
+            ) from exc
+
+        try:
+            jsonschema.Draft202012Validator(schema).validate(manifest)
+        except jsonschema.ValidationError as exc:
+            raise self._host_error(
+                "PLUGIN.HOST_PROTOCOL_ERROR",
+                f"plugin manifest does not satisfy its schema: {exc}",
+            ) from exc
+
         if manifest.get("apiVersion") != "ai-auto-desktop.dev/v1alpha1":
             raise self._host_error(
                 "PLUGIN.HOST_PROTOCOL_ERROR",
@@ -580,23 +645,6 @@ class ProcessPlugin:
                 "PLUGIN.HOST_PROTOCOL_ERROR",
                 "plugin manifest must contain an actions object",
             )
-        schema_path = (
-            Path(__file__).resolve().parents[2]
-            / "schemas"
-            / "capabilities"
-            / "v1alpha1"
-            / "capability-manifest.schema.json"
-        )
-        if jsonschema is not None and schema_path.is_file():
-            try:
-                schema = json.loads(schema_path.read_text(encoding="utf-8"))
-                jsonschema.Draft202012Validator(schema).validate(manifest)
-            except Exception as exc:
-                raise self._host_error(
-                    "PLUGIN.HOST_PROTOCOL_ERROR",
-                    f"plugin manifest does not satisfy its schema: {exc}",
-                ) from exc
-
     def _result_from_message(
         self, message: dict[str, Any], expected_id: str, *, dispatched: bool
     ) -> Any:

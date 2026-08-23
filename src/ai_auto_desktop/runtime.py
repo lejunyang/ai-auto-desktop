@@ -55,7 +55,6 @@ class WorkflowRunner:
                 command = [plugin] if isinstance(plugin, str) else list(plugin)
                 self.plugins[name] = ProcessPlugin(command, name=name)
                 self._owned.add(name)
-        self._contracts: dict[str, Mapping[str, Any]] = {}
         self.events: list[dict[str, Any]] = []
         self.step_records: dict[str, dict[str, Any]] = {}
         self.context: dict[str, Any] = {}
@@ -68,6 +67,8 @@ class WorkflowRunner:
         self.events, self.step_records, self._executed = [], {}, 0
         self._deadline_stack = []
         self._handler_output = MISSING
+        budget = _duration(self.descriptor.budgets.get("max_duration"))
+        self._deadline = time.monotonic() + budget if budget else None
         error: AutomationError | None = None
         output: Any = MISSING
         try:
@@ -76,8 +77,6 @@ class WorkflowRunner:
             self.variables = self._prepare_variables()
             self.context["vars"] = self.variables
             self._check_requirements()
-            budget = _duration(self.descriptor.budgets.get("max_duration"))
-            self._deadline = time.monotonic() + budget if budget else None
             try:
                 self._run_steps(self.descriptor.steps)
             except _ReturnFlow as returned:
@@ -206,7 +205,9 @@ class WorkflowRunner:
                     f"Required capability {name!r} is not registered",
                     category="capability",
                 )
-            manifest = self._plugin_manifest(plugin)
+            manifest = self._plugin_manifest(
+                plugin, timeout_code="WORKFLOW.TIMEOUT"
+            )
             if manifest.get("metadata", {}).get("name") != name:
                 raise AutomationError(
                     "CAPABILITY.MISSING",
@@ -324,15 +325,61 @@ class WorkflowRunner:
     def _attempt_step(self, step: CompiledStep, local_deadline: float | None) -> Any:
         retry = thaw(step.params.get("retry", self.descriptor.defaults.get("retry", {"max_attempts": 1})))
         max_attempts = int(retry.get("max_attempts", 1))
-        effect = self._effective_action_effect(step) if step.type == "action" else "idempotent"
+        effect = (
+            thaw(step.params.get("effect", {})).get("class", "contextual")
+            if step.type == "action"
+            else "idempotent"
+        )
         for attempt in range(1, max_attempts + 1):
+            attempt_started = time.monotonic()
             self._check_budget()
             self._executed += 1
             self.step_records[step.id]["attempts"] = attempt; remaining = self._remaining(local_deadline)
             if remaining == 0: raise AutomationError("STEP.TIMEOUT", f"Step {step.id!r} timed out")
             attempt_timeout = _duration(step.params.get("attempt_timeout"), remaining)
             if remaining is not None: attempt_timeout = min(attempt_timeout, remaining) if attempt_timeout is not None else remaining
-            try: return self._execute(step, attempt_timeout)
+            attempt_deadline = (
+                time.monotonic() + attempt_timeout
+                if attempt_timeout is not None
+                else None
+            )
+            try:
+                if attempt_deadline is not None:
+                    self._deadline_stack.append(attempt_deadline)
+                try:
+                    if step.type == "action":
+                        effect = self._effective_action_effect(step)
+                    effective_timeout = self._remaining(attempt_deadline)
+                    if effective_timeout == 0:
+                        raise AutomationError(
+                            "STEP.TIMEOUT", f"Step {step.id!r} timed out"
+                        )
+                    if step.type == "action":
+                        manifest_timeout = self._manifest_action_timeout(step)
+                        if manifest_timeout is not None:
+                            manifest_remaining = max(
+                                0.0,
+                                attempt_started
+                                + manifest_timeout
+                                - time.monotonic(),
+                            )
+                            if manifest_remaining == 0:
+                                raise AutomationError(
+                                    "ACTION.TIMEOUT",
+                                    "Action deadline expired before dispatch",
+                                    category="action",
+                                    retryable=True,
+                                    effect="not_applied",
+                                )
+                            effective_timeout = (
+                                min(effective_timeout, manifest_remaining)
+                                if effective_timeout is not None
+                                else manifest_remaining
+                            )
+                    return self._execute(step, effective_timeout)
+                finally:
+                    if attempt_deadline is not None:
+                        self._deadline_stack.pop()
             except _ReturnFlow: raise
             except AutomationError as error:
                 error.at_step(step.id, step_path=step.path, attempt=attempt, workflow=self.descriptor.name)
@@ -353,6 +400,15 @@ class WorkflowRunner:
         contract = self._action_contract(plugin, capability, uses)
         provider = thaw(contract.get("effect", {})).get("default_class")
         return _max_effect(provider, declared)
+
+    def _manifest_action_timeout(self, step: CompiledStep) -> float | None:
+        uses = step.params["uses"]
+        capability = uses.rsplit(".", 1)[0]
+        plugin = self.plugins.get(capability)
+        if plugin is None:
+            return None
+        contract = self._action_contract(plugin, capability, uses)
+        return _duration(contract.get("timeout"))
 
     def _retry_match(self, retry: Mapping[str, Any], error: AutomationError) -> bool:
         if not error.retryable: return False
@@ -386,6 +442,13 @@ class WorkflowRunner:
                 if bool(self._evaluate(thaw(case.when))): self._run_steps(case.steps); return None
             self._run_steps(step.default_steps); return None
         if step.type == "foreach":
+            if int(step.params.get("concurrency", 1)) != 1:
+                raise AutomationError(
+                    "DESCRIPTOR.UNSUPPORTED_FEATURE",
+                    "Concurrent foreach execution is not supported by this runtime",
+                    category="descriptor",
+                    details={"concurrency": step.params["concurrency"]},
+                )
             items = self._evaluate(thaw(step.params["items"])); limit = int(step.params["max_items"])
             if isinstance(items, (str, bytes, Mapping)) or not isinstance(items, Sequence): raise AutomationError("EXPR.TYPE_MISMATCH", "foreach items must be an array")
             if len(items) > limit: raise AutomationError("LOOP.LIMIT_EXCEEDED", "foreach input exceeds max_items", details={"max_items": limit, "actual": len(items)})
@@ -483,10 +546,46 @@ class WorkflowRunner:
             )
         return contract
 
-    def _plugin_manifest(self, plugin: ProcessPlugin) -> Mapping[str, Any]:
+    def _plugin_manifest(
+        self,
+        plugin: ProcessPlugin,
+        *,
+        timeout_code: str = "ACTION.TIMEOUT",
+    ) -> Mapping[str, Any]:
+        remaining = self._remaining()
+        if remaining == 0:
+            raise AutomationError(
+                timeout_code,
+                "Deadline exceeded during capability handshake",
+                category=(
+                    "action" if timeout_code == "ACTION.TIMEOUT" else "workflow"
+                ),
+                phase="execute",
+                effect=(
+                    "not_applied" if timeout_code == "ACTION.TIMEOUT" else "none"
+                ),
+            )
         try:
-            return plugin.start()
+            return plugin.start(timeout=remaining)
         except PluginError as exc:
+            if exc.code == "PLUGIN.HOST_TIMEOUT" and self._remaining() == 0:
+                raise AutomationError(
+                    timeout_code,
+                    "Deadline exceeded during capability handshake",
+                    category=(
+                        "action"
+                        if timeout_code == "ACTION.TIMEOUT"
+                        else "workflow"
+                    ),
+                    phase="execute",
+                    retryable=exc.retryable,
+                    effect=(
+                        "not_applied"
+                        if timeout_code == "ACTION.TIMEOUT"
+                        else "none"
+                    ),
+                    cause=exc,
+                ) from exc
             raise AutomationError(
                 exc.code,
                 exc.message,
@@ -516,6 +615,19 @@ class WorkflowRunner:
             )
         required_permissions = set(manifest.get("permissions", ()))
         required_permissions.update(contract.get("permissions", ()))
+        declared_permissions = set(
+            thaw(self.descriptor.requires).get("permissions", ())
+        )
+        undeclared_permissions = sorted(
+            required_permissions - declared_permissions
+        )
+        if undeclared_permissions:
+            raise AutomationError(
+                "POLICY.DENIED",
+                "Action permissions were not declared by the workflow",
+                category="policy",
+                details={"undeclared_permissions": undeclared_permissions},
+            )
         missing_permissions = sorted(required_permissions - self.granted_permissions)
         if missing_permissions:
             raise AutomationError(
@@ -524,31 +636,39 @@ class WorkflowRunner:
                 category="policy",
                 details={"missing_permissions": missing_permissions},
             )
-        allowed = thaw(self.descriptor.policy).get("allowed_risk", {})
-        if not allowed or not risks:
+        if not risks:
             return
-        categories = allowed.get("categories")
-        denied_categories = [
-            risk.get("category")
-            for risk in risks
-            if categories and risk.get("category") not in categories
-        ]
-        if denied_categories:
-            raise AutomationError(
-                "POLICY.DENIED",
-                f"Risk category {denied_categories[0]!r} is not allowed",
-                category="policy",
-            )
         order = {"low": 0, "medium": 1, "high": 2, "critical": 3, "contextual": 4}
-        maximum = allowed.get("max_level")
-        highest = max(risks, key=lambda risk: order.get(risk.get("level"), 99))
-        if maximum in order and highest.get("level") in order and order[highest["level"]] > order[maximum]:
-            raise AutomationError(
-                "POLICY.DENIED",
-                f"Risk level {highest['level']!r} exceeds {maximum!r}",
-                category="policy",
+        policy = thaw(self.descriptor.policy)
+        allowed = policy.get("allowed_risk", {})
+        if allowed:
+            categories = allowed.get("categories")
+            denied_categories = [
+                risk.get("category")
+                for risk in risks
+                if categories and risk.get("category") not in categories
+            ]
+            if denied_categories:
+                raise AutomationError(
+                    "POLICY.DENIED",
+                    f"Risk category {denied_categories[0]!r} is not allowed",
+                    category="policy",
+                )
+            maximum = allowed.get("max_level")
+            highest = max(
+                risks, key=lambda risk: order.get(risk.get("level"), 99)
             )
-        confirmation = thaw(self.descriptor.policy).get("confirmation", {})
+            if (
+                maximum in order
+                and highest.get("level") in order
+                and order[highest["level"]] > order[maximum]
+            ):
+                raise AutomationError(
+                    "POLICY.DENIED",
+                    f"Risk level {highest['level']!r} exceeds {maximum!r}",
+                    category="policy",
+                )
+        confirmation = policy.get("confirmation", {})
         required_for = confirmation.get("required_for", {}) if isinstance(confirmation, Mapping) else {}
         categories = set(required_for.get("categories", ()))
         minimum = required_for.get("min_level")
@@ -629,40 +749,109 @@ def _platform_name() -> str:
     return "linux"
 
 
-def _semver(value: str) -> tuple[int, int, int]:
-    match = re.fullmatch(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:[-+].*)?", value)
+def _semver(
+    value: str,
+) -> tuple[int, int, int, tuple[int | str, ...] | None]:
+    if not isinstance(value, str):
+        raise ValueError(f"invalid semantic version: {value!r}")
+    match = re.fullmatch(
+        r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
+        r"(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?"
+        r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?",
+        value,
+    )
     if not match:
         raise ValueError(f"invalid semantic version: {value!r}")
-    return tuple(int(part) for part in match.groups())
+    major, minor, patch, prerelease_text = match.groups()
+    prerelease: tuple[int | str, ...] | None = None
+    if prerelease_text is not None:
+        identifiers: list[int | str] = []
+        for identifier in prerelease_text.split("."):
+            if identifier.isdigit():
+                if len(identifier) > 1 and identifier.startswith("0"):
+                    raise ValueError(
+                        f"invalid semantic version: {value!r}"
+                    )
+                identifiers.append(int(identifier))
+            else:
+                identifiers.append(identifier)
+        prerelease = tuple(identifiers)
+    return int(major), int(minor), int(patch), prerelease
+
+
+def _compare_semver(
+    left: tuple[int, int, int, tuple[int | str, ...] | None],
+    right: tuple[int, int, int, tuple[int | str, ...] | None],
+) -> int:
+    if left[:3] != right[:3]:
+        return -1 if left[:3] < right[:3] else 1
+    left_pre, right_pre = left[3], right[3]
+    if left_pre is None or right_pre is None:
+        if left_pre is right_pre:
+            return 0
+        return 1 if left_pre is None else -1
+    for left_item, right_item in zip(left_pre, right_pre):
+        if left_item == right_item:
+            continue
+        if isinstance(left_item, int) and isinstance(right_item, str):
+            return -1
+        if isinstance(left_item, str) and isinstance(right_item, int):
+            return 1
+        return -1 if left_item < right_item else 1
+    if len(left_pre) == len(right_pre):
+        return 0
+    return -1 if len(left_pre) < len(right_pre) else 1
 
 
 def _version_matches(version: str, constraint: str) -> bool:
     try:
         actual = _semver(version)
         tokens = constraint.split()
+        comparators: list[
+            tuple[
+                str,
+                tuple[int, int, int, tuple[int | str, ...] | None],
+            ]
+        ] = []
         for token in tokens:
             if token.startswith("^"):
                 floor = _semver(token[1:])
-                ceiling = (floor[0] + 1, 0, 0) if floor[0] else (0, floor[1] + 1, 0)
-                if not floor <= actual < ceiling:
-                    return False
+                if floor[0] != 0:
+                    ceiling = (floor[0] + 1, 0, 0, None)
+                elif floor[1] != 0:
+                    ceiling = (0, floor[1] + 1, 0, None)
+                else:
+                    ceiling = (0, 0, floor[2] + 1, None)
+                comparators.extend(((">=", floor), ("<", ceiling)))
                 continue
             match = re.fullmatch(r"(>=|<=|>|<|=)?(.+)", token)
             if not match:
                 return False
             operator, wanted_text = match.groups()
             wanted = _semver(wanted_text)
-            if operator == ">=" and not actual >= wanted:
+            comparators.append((operator or "=", wanted))
+        if not comparators:
+            return False
+        # SemVer ranges do not implicitly opt into prerelease providers.  A
+        # comparator must name a prerelease on the same major/minor/patch.
+        if actual[3] is not None and not any(
+            wanted[3] is not None and wanted[:3] == actual[:3]
+            for _, wanted in comparators
+        ):
+            return False
+        for operator, wanted in comparators:
+            comparison = _compare_semver(actual, wanted)
+            if operator == ">=" and comparison < 0:
                 return False
-            if operator == "<=" and not actual <= wanted:
+            if operator == "<=" and comparison > 0:
                 return False
-            if operator == ">" and not actual > wanted:
+            if operator == ">" and comparison <= 0:
                 return False
-            if operator == "<" and not actual < wanted:
+            if operator == "<" and comparison >= 0:
                 return False
-            if operator in {None, "="} and actual != wanted:
+            if operator == "=" and comparison != 0:
                 return False
-        return bool(tokens)
+        return True
     except (TypeError, ValueError):
         return False
 
