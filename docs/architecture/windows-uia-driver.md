@@ -12,8 +12,9 @@ key, and contract major, for example
 `desktop.windows_uia.snapshot@1`. The manifest declares only `windows` in
 `runtime.platforms`.
 
-The worker reads and writes one UTF-8 JSON object per line. Protocol output is
-the only stdout content; bounded diagnostics go to stderr. Requests are limited
+The worker reads and writes one JSON object per line, escaped to an ASCII-safe
+wire representation so malformed UTF-16 surrogate values cannot terminate the
+process. Protocol output is the only stdout content; bounded diagnostics go to stderr. Requests are limited
 to 1 MiB and responses to less than the host's 8 MiB frame ceiling.
 `deadline_ms` is an absolute Unix epoch time. The worker translates it once to
 a monotonic deadline and checks it during window enumeration, tree traversal,
@@ -48,9 +49,10 @@ Each `snapshot` result has this stable outer shape:
 Nodes are a flat, parent-linked list and contain `node_id`, `parent_id`,
 `role`, `name`, `value`, `states`, `bounds`, `actions`, and `provenance`.
 Bounds use physical screen pixels when supplied by UIA. Password values are not
-read. Native COM elements never cross the process boundary. UIA RuntimeId can
-contribute to the private replacement fingerprint, but it is not exposed as a
-durable or replayable handle.
+read. Native COM elements never cross the process boundary. Before a write, the
+backend uses UIA `CompareElements` to confirm that the newly resolved COM
+element is the original native target; RuntimeId and semantic fields provide
+additional diagnostics, not durable or replayable handles.
 
 `snapshot_id`, `revision`, and node IDs are valid only for the current worker
 revision. Taking another snapshot invalidates earlier node references. A driver
@@ -76,8 +78,9 @@ summaries for multiple matches; it never selects the first candidate.
 
 Every write action requires both this target and the original locator. Before
 dispatch, the worker verifies that the target belongs to the current snapshot,
-captures a fresh UIA tree, resolves the locator again, and compares a semantic
-fingerprint. Missing, newly ambiguous, or replaced targets return
+captures a fresh UIA tree with the original depth/node bounds, resolves the
+locator again, and compares native identity plus a semantic fingerprint.
+Missing, newly ambiguous, truncated, unverifiable, or replaced targets return
 `DRIVER.STALE_SNAPSHOT` without calling the native pattern. A native write
 invalidates the current snapshot even when the backend reports failure, because
 the worker cannot prove the tree is unchanged after the dispatch boundary.
@@ -89,7 +92,8 @@ dispatch they become `DRIVER.UNKNOWN_EFFECT` and must not be replayed blindly.
 
 ## Launch and qualification
 
-On Windows, use `plugins\windows_uia\run.cmd`, or pass Python an explicit argv
+On Windows, install the optional dependency with `pip install .[windows-uia]`,
+then use `plugins\windows_uia\run.cmd`, or pass Python an explicit argv
 containing `windows_uia_driver.py`. `run.sh` exists only for protocol and fake
 contract work on POSIX hosts.
 
