@@ -5,6 +5,7 @@ from __future__ import annotations
 import fnmatch
 import random
 import re
+import sys
 import time
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
@@ -23,6 +24,7 @@ except ImportError:  # pragma: no cover
     jsonschema = None
 
 _TEMPLATE = re.compile(r"\$\{\{(.*?)\}\}", re.DOTALL)
+RUNTIME_VERSION = "0.1.0"
 
 
 class _ReturnFlow(Exception):
@@ -37,10 +39,12 @@ class WorkflowRunner:
         *,
         plugins: Mapping[str, ProcessPlugin | Sequence[str] | str] | None = None,
         allow_scripts: bool = False,
+        granted_permissions: Sequence[str] | None = None,
         event_sink: Callable[[Mapping[str, Any]], None] | None = None,
     ) -> None:
         self.descriptor = descriptor
         self.allow_scripts = allow_scripts
+        self.granted_permissions = frozenset(granted_permissions or ())
         self.event_sink = event_sink
         self.plugins: dict[str, ProcessPlugin] = {}
         self._owned: set[str] = set()
@@ -62,6 +66,8 @@ class WorkflowRunner:
 
     def run(self, inputs: Mapping[str, Any] | None = None) -> RunResult:
         self.events, self.step_records, self._executed = [], {}, 0
+        self._deadline_stack = []
+        self._handler_output = MISSING
         error: AutomationError | None = None
         output: Any = MISSING
         try:
@@ -69,6 +75,7 @@ class WorkflowRunner:
             self.context = {"inputs": actual_inputs, "vars": {}, "steps": {}}
             self.variables = self._prepare_variables()
             self.context["vars"] = self.variables
+            self._check_requirements()
             budget = _duration(self.descriptor.budgets.get("max_duration"))
             self._deadline = time.monotonic() + budget if budget else None
             try:
@@ -161,8 +168,79 @@ class WorkflowRunner:
             result[name] = value
         return result
 
+    def _check_requirements(self) -> None:
+        requirements = thaw(self.descriptor.requires)
+        runtime_range = requirements.get("runtime")
+        if runtime_range and not _version_matches(RUNTIME_VERSION, runtime_range):
+            raise AutomationError(
+                "DESCRIPTOR.VERSION_UNSUPPORTED",
+                f"Runtime {RUNTIME_VERSION} does not satisfy {runtime_range!r}",
+                category="descriptor",
+            )
+        current_platform = _platform_name()
+        allowed_platforms = requirements.get("platforms")
+        if allowed_platforms and current_platform not in allowed_platforms:
+            raise AutomationError(
+                "CAPABILITY.PLATFORM_UNSUPPORTED",
+                f"Workflow does not support platform {current_platform!r}",
+                category="capability",
+            )
+        missing_permissions = sorted(
+            set(requirements.get("permissions", ())) - self.granted_permissions
+        )
+        if missing_permissions:
+            raise AutomationError(
+                "POLICY.DENIED",
+                "Workflow permissions were not granted",
+                category="policy",
+                details={"missing_permissions": missing_permissions},
+            )
+        for required in requirements.get("capabilities", ()):
+            name = required["name"]
+            plugin = self.plugins.get(name)
+            if plugin is None:
+                if required.get("optional", False):
+                    continue
+                raise AutomationError(
+                    "CAPABILITY.MISSING",
+                    f"Required capability {name!r} is not registered",
+                    category="capability",
+                )
+            manifest = self._plugin_manifest(plugin)
+            if manifest.get("metadata", {}).get("name") != name:
+                raise AutomationError(
+                    "CAPABILITY.MISSING",
+                    f"Registered plugin does not provide {name!r}",
+                    category="capability",
+                )
+            version_range = required.get("version")
+            version = manifest.get("metadata", {}).get("version")
+            if version_range and (not isinstance(version, str) or not _version_matches(version, version_range)):
+                raise AutomationError(
+                    "CAPABILITY.VERSION_INCOMPATIBLE",
+                    f"Capability {name!r} version {version!r} does not satisfy {version_range!r}",
+                    category="capability",
+                )
+            missing_actions = sorted(
+                set(required.get("actions", ()))
+                - set(manifest.get("actions", {}))
+            )
+            if missing_actions:
+                raise AutomationError(
+                    "CAPABILITY.MISSING",
+                    f"Capability {name!r} is missing required actions",
+                    category="capability",
+                    details={"actions": missing_actions},
+                )
+
     def _validate_schema(self, value: Any, schema: Any, code: str, name: str) -> None:
-        if schema is None or schema is True or jsonschema is None: return
+        if schema is None or schema is True: return
+        if jsonschema is None:
+            raise AutomationError(
+                "RUNTIME.DEPENDENCY_MISSING",
+                "jsonschema is required to enforce value contracts",
+                category="runtime",
+            )
         try: jsonschema.validate(value, thaw(schema))
         except Exception as exc: raise AutomationError(code, f"{name!r} does not satisfy its schema", details={"validation": str(exc)}) from exc
 
@@ -233,13 +311,12 @@ class WorkflowRunner:
                 raise pending
             result = getattr(self, "_handler_output", None); self.context["steps"][step.id] = {"status": "continued", "output": result}
         finally:
+            if local_deadline is not None:
+                self._deadline_stack.pop()
             try: self._run_steps(step.finally_steps, cleanup)
             except AutomationError as final_error:
                 if pending is not None: pending.add_suppressed(final_error)
                 else: raise AutomationError("WORKFLOW.FINALLY_FAILED", f"Finally for step {step.id!r} failed", cause=final_error) from final_error
-            finally:
-                if local_deadline is not None:
-                    self._deadline_stack.pop()
         elapsed = time.monotonic() - started
         self.step_records[step.id].update(status="succeeded", output=result, duration_ms=round(elapsed * 1000, 3)); self._event("step.succeeded", step_id=step.id)
         return result
@@ -247,7 +324,7 @@ class WorkflowRunner:
     def _attempt_step(self, step: CompiledStep, local_deadline: float | None) -> Any:
         retry = thaw(step.params.get("retry", self.descriptor.defaults.get("retry", {"max_attempts": 1})))
         max_attempts = int(retry.get("max_attempts", 1))
-        effect = thaw(step.params.get("effect", {})).get("class", "contextual") if step.type == "action" else "idempotent"
+        effect = self._effective_action_effect(step) if step.type == "action" else "idempotent"
         for attempt in range(1, max_attempts + 1):
             self._check_budget()
             self._executed += 1
@@ -265,6 +342,17 @@ class WorkflowRunner:
                 self._event("step.retrying", step_id=step.id, attempt=attempt, delay=delay)
                 if delay: time.sleep(delay)
         raise AssertionError("unreachable")
+
+    def _effective_action_effect(self, step: CompiledStep) -> str:
+        uses = step.params["uses"]
+        capability = uses.rsplit(".", 1)[0]
+        plugin = self.plugins.get(capability)
+        declared = thaw(step.params.get("effect", {})).get("class")
+        if plugin is None:
+            return declared or "contextual"
+        contract = self._action_contract(plugin, capability, uses)
+        provider = thaw(contract.get("effect", {})).get("default_class")
+        return _max_effect(provider, declared)
 
     def _retry_match(self, retry: Mapping[str, Any], error: AutomationError) -> bool:
         if not error.retryable: return False
@@ -328,17 +416,33 @@ class WorkflowRunner:
         uses = step.params["uses"]; capability = uses.rsplit(".", 1)[0]; plugin = self.plugins.get(capability)
         if plugin is None: raise AutomationError("CAPABILITY.MISSING", f"No plugin registered for {capability!r}", details={"uses": uses})
         contract = self._action_contract(plugin, capability, uses)
-        self._enforce_action_policy(step, contract)
+        self._enforce_action_policy(step, plugin, contract)
         pre = step.params.get("precondition")
         if pre and not bool(self._evaluate(thaw(pre["condition"]))): raise AutomationError("ACTION.PRECONDITION_FAILED", pre.get("message", "Action precondition failed"), phase="precondition")
         action_input = self._evaluate(thaw(step.params["with"]))
         self._validate_schema(action_input, contract.get("input_schema"), "ACTION.INPUT_INVALID", uses)
         try: result = plugin.invoke(uses, action_input, timeout=timeout)
         except PluginError as exc:
-            effect = thaw(step.params.get("effect", {})).get("class", "contextual")
+            declared_effect = thaw(step.params.get("effect", {})).get("class")
+            provider_effect = thaw(contract.get("effect", {})).get("default_class")
+            effective_effect = _max_effect(provider_effect, declared_effect)
             ambiguous = exc.code in {"PLUGIN.HOST_TIMEOUT", "PLUGIN.HOST_EOF", "PLUGIN.HOST_PROTOCOL_ERROR"}
-            if exc.dispatched and effect in {"non_idempotent", "contextual"} and ambiguous:
+            if exc.dispatched and effective_effect in {"non_idempotent", "contextual"} and ambiguous:
                 raise AutomationError("ACTION.UNKNOWN_EFFECT", "Action outcome is unknown after dispatch", category="action", effect="unknown", details={"plugin_error": exc.to_dict()}, cause=exc) from exc
+            if exc.code == "PLUGIN.HOST_TIMEOUT":
+                raise AutomationError(
+                    "ACTION.TIMEOUT",
+                    "Action did not complete before its deadline",
+                    category="action",
+                    retryable=exc.retryable,
+                    effect=(
+                        "not_applied"
+                        if not exc.dispatched or effective_effect in {"read_only", "idempotent"}
+                        else "unknown"
+                    ),
+                    details={"plugin_error": exc.to_dict()},
+                    cause=exc,
+                ) from exc
             raise AutomationError(exc.code, exc.message, category="plugin", retryable=exc.retryable, details=exc.details, cause=exc) from exc
         self._validate_schema(result, contract.get("output_schema"), "ACTION.OUTPUT_INVALID", uses)
         self.context["steps"][step.id] = {"status": "running", "output": result}
@@ -350,7 +454,7 @@ class WorkflowRunner:
     ) -> Mapping[str, Any]:
         if plugin.manifest is None and type(plugin).invoke is not ProcessPlugin.invoke:
             return {}
-        manifest = plugin.start()
+        manifest = self._plugin_manifest(plugin)
         # Test doubles and trusted in-process adapters may deliberately omit a
         # manifest. Real process plugins are validated by ProcessPlugin.start.
         if not isinstance(manifest, Mapping):
@@ -379,12 +483,47 @@ class WorkflowRunner:
             )
         return contract
 
+    def _plugin_manifest(self, plugin: ProcessPlugin) -> Mapping[str, Any]:
+        try:
+            return plugin.start()
+        except PluginError as exc:
+            raise AutomationError(
+                exc.code,
+                exc.message,
+                category="plugin",
+                retryable=exc.retryable,
+                details=exc.details,
+                cause=exc,
+            ) from exc
+
     def _enforce_action_policy(
-        self, step: CompiledStep, contract: Mapping[str, Any]
+        self,
+        step: CompiledStep,
+        plugin: ProcessPlugin,
+        contract: Mapping[str, Any],
     ) -> None:
         declared = thaw(step.params.get("risk", {}))
         default = thaw(contract.get("risk", {}))
         risks = [risk for risk in (default, declared) if risk]
+        manifest = plugin.manifest if isinstance(plugin.manifest, Mapping) else {}
+        runtime = manifest.get("runtime", {}) if isinstance(manifest, Mapping) else {}
+        supported_platforms = runtime.get("platforms") if isinstance(runtime, Mapping) else None
+        if supported_platforms and _platform_name() not in supported_platforms:
+            raise AutomationError(
+                "CAPABILITY.PLATFORM_UNSUPPORTED",
+                f"Capability is unavailable on platform {_platform_name()!r}",
+                category="capability",
+            )
+        required_permissions = set(manifest.get("permissions", ()))
+        required_permissions.update(contract.get("permissions", ()))
+        missing_permissions = sorted(required_permissions - self.granted_permissions)
+        if missing_permissions:
+            raise AutomationError(
+                "POLICY.DENIED",
+                "Action permissions were not granted",
+                category="policy",
+                details={"missing_permissions": missing_permissions},
+            )
         allowed = thaw(self.descriptor.policy).get("allowed_risk", {})
         if not allowed or not risks:
             return
@@ -407,6 +546,21 @@ class WorkflowRunner:
             raise AutomationError(
                 "POLICY.DENIED",
                 f"Risk level {highest['level']!r} exceeds {maximum!r}",
+                category="policy",
+            )
+        confirmation = thaw(self.descriptor.policy).get("confirmation", {})
+        required_for = confirmation.get("required_for", {}) if isinstance(confirmation, Mapping) else {}
+        categories = set(required_for.get("categories", ()))
+        minimum = required_for.get("min_level")
+        requires_confirmation = any(
+            (categories and risk.get("category") in categories)
+            or (minimum in order and risk.get("level") in order and order[risk["level"]] >= order[minimum])
+            for risk in risks
+        )
+        if requires_confirmation:
+            raise AutomationError(
+                "POLICY.CONFIRMATION_REQUIRED",
+                "This action requires a bound confirmation token, which v0 cannot verify",
                 category="policy",
             )
 
@@ -452,8 +606,65 @@ def _duration(value: Any, default: float | None = None) -> float | None:
     return parse_duration(value, default)
 
 
-def run_descriptor(descriptor: WorkflowDescriptor, *, inputs: Mapping[str, Any] | None = None, plugins: Mapping[str, ProcessPlugin | Sequence[str] | str] | None = None, allow_scripts: bool = False, event_sink: Callable[[Mapping[str, Any]], None] | None = None) -> RunResult:
-    return WorkflowRunner(descriptor, plugins=plugins, allow_scripts=allow_scripts, event_sink=event_sink).run(inputs)
+def _max_effect(provider: Any, declared: Any) -> str:
+    order = {
+        "read_only": 0,
+        "idempotent": 1,
+        "non_idempotent": 2,
+        "contextual": 3,
+    }
+    values = [item for item in (provider, declared) if item in order]
+    return max(values, key=lambda item: order[item]) if values else "contextual"
+
+
+def run_descriptor(descriptor: WorkflowDescriptor, *, inputs: Mapping[str, Any] | None = None, plugins: Mapping[str, ProcessPlugin | Sequence[str] | str] | None = None, allow_scripts: bool = False, granted_permissions: Sequence[str] | None = None, event_sink: Callable[[Mapping[str, Any]], None] | None = None) -> RunResult:
+    return WorkflowRunner(descriptor, plugins=plugins, allow_scripts=allow_scripts, granted_permissions=granted_permissions, event_sink=event_sink).run(inputs)
+
+
+def _platform_name() -> str:
+    if sys.platform.startswith("win"):
+        return "windows"
+    if sys.platform == "darwin":
+        return "macos"
+    return "linux"
+
+
+def _semver(value: str) -> tuple[int, int, int]:
+    match = re.fullmatch(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:[-+].*)?", value)
+    if not match:
+        raise ValueError(f"invalid semantic version: {value!r}")
+    return tuple(int(part) for part in match.groups())
+
+
+def _version_matches(version: str, constraint: str) -> bool:
+    try:
+        actual = _semver(version)
+        tokens = constraint.split()
+        for token in tokens:
+            if token.startswith("^"):
+                floor = _semver(token[1:])
+                ceiling = (floor[0] + 1, 0, 0) if floor[0] else (0, floor[1] + 1, 0)
+                if not floor <= actual < ceiling:
+                    return False
+                continue
+            match = re.fullmatch(r"(>=|<=|>|<|=)?(.+)", token)
+            if not match:
+                return False
+            operator, wanted_text = match.groups()
+            wanted = _semver(wanted_text)
+            if operator == ">=" and not actual >= wanted:
+                return False
+            if operator == "<=" and not actual <= wanted:
+                return False
+            if operator == ">" and not actual > wanted:
+                return False
+            if operator == "<" and not actual < wanted:
+                return False
+            if operator in {None, "="} and actual != wanted:
+                return False
+        return bool(tokens)
+    except (TypeError, ValueError):
+        return False
 
 
 __all__ = ["WorkflowRunner", "run_descriptor", "RunResult"]

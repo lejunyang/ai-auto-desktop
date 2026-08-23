@@ -14,6 +14,8 @@ Inputs and plugins use repeatable assignments:
     python -m ai_auto_desktop run workflow.yaml --input account_id='"123456"' --input retries=2 --plugin fixture='python plugins/fixture/fixture_plugin.py'
 
 Each input value is JSON. Plugin commands are parsed as argv and are never sent through a shell.
+If a workflow declares `requires.permissions`, pass each permission explicitly with
+`--permission NAME`; the host never treats a descriptor request as a grant.
 
 ## Descriptor and runtime
 

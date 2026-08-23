@@ -94,8 +94,8 @@ class RuntimeControlFlowTests(unittest.TestCase):
             plugins={"fixture": [sys.executable, str(FIXTURE_PLUGIN)]},
         )
 
-        self.assertEqual(result.status, "failed")
-        self.assertEqual(result.error.code, "PLUGIN.HOST_TIMEOUT")
+        self.assertEqual(result.status, "timed_out")
+        self.assertIn(result.error.code, {"ACTION.TIMEOUT", "WORKFLOW.TIMEOUT"})
 
     def test_set_is_atomic_and_validates_declared_schema(self) -> None:
         raw = workflow(

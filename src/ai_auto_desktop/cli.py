@@ -38,6 +38,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("file", type=Path)
     run.add_argument("--input", action="append", default=[], metavar="NAME=JSON")
     run.add_argument("--plugin", action="append", default=[], metavar="NAME=COMMAND")
+    run.add_argument("--permission", action="append", default=[])
     run.add_argument("--allow-scripts", action="store_true")
     return parser
 
@@ -86,7 +87,12 @@ def main(argv: list[str] | None = None) -> int:
         if options.command == "validate":
             _emit({"status": "valid", "workflow": descriptor.name, "apiVersion": descriptor.api_version, "steps": len(descriptor.all_steps())})
             return 0
-        result = WorkflowRunner(descriptor, plugins=_plugins(options.plugin), allow_scripts=options.allow_scripts).run(_inputs(options.input))
+        result = WorkflowRunner(
+            descriptor,
+            plugins=_plugins(options.plugin),
+            allow_scripts=options.allow_scripts,
+            granted_permissions=options.permission,
+        ).run(_inputs(options.input))
         _emit(result.to_dict())
         return 0 if result.ok else 1
     except AutomationError as exc:
