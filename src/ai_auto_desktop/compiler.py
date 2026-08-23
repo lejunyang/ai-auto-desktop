@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 import re
+from importlib import resources
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -104,22 +105,44 @@ def load_descriptor(path: str | Path) -> WorkflowDescriptor:
     return compile_descriptor(_parse(text, str(source)), source=source)
 
 
-def _schema_path() -> Path:
-    return Path(__file__).resolve().parents[2] / "schemas" / "workflow" / "v1alpha1" / "workflow.schema.json"
+_WORKFLOW_SCHEMA_RESOURCE = (
+    "schemas",
+    "workflow",
+    "v1alpha1",
+    "workflow.schema.json",
+)
+
+
+def _workflow_schema() -> Any:
+    if jsonschema is None:
+        raise DescriptorError(
+            "Canonical workflow schema validation is unavailable",
+            code="DESCRIPTOR.UNSUPPORTED_FEATURE",
+            details={"dependency": "jsonschema"},
+        )
+
+    resource_name = "/".join(_WORKFLOW_SCHEMA_RESOURCE)
+    try:
+        resource = resources.files("ai_auto_desktop").joinpath(
+            *_WORKFLOW_SCHEMA_RESOURCE
+        )
+        schema = json.loads(resource.read_text(encoding="utf-8"))
+        jsonschema.Draft202012Validator.check_schema(schema)
+    except (OSError, TypeError, ValueError, jsonschema.SchemaError) as exc:
+        raise DescriptorError(
+            "Canonical workflow schema resource is unavailable or invalid",
+            code="DESCRIPTOR.SCHEMA_UNAVAILABLE",
+            details={"resource": resource_name},
+            cause=exc,
+        ) from exc
+    return schema
 
 
 def _schema_issues(descriptor: Any) -> list[DescriptorIssue]:
-    """Validate against the canonical schema before semantic compilation.
+    """Validate against the packaged canonical schema before compilation."""
 
-    Source checkouts have the schema next to ``src``.  Installed wheels may not
-    package it yet, so the handwritten fail-closed validator remains the
-    fallback rather than making validation depend on the current directory.
-    """
-
-    path = _schema_path()
-    if jsonschema is None or not path.is_file():
-        return []
-    schema = json.loads(path.read_text(encoding="utf-8"))
+    schema = _workflow_schema()
+    assert jsonschema is not None
     validator = jsonschema.Draft202012Validator(schema)
     issues: list[DescriptorIssue] = []
     for error in sorted(validator.iter_errors(descriptor), key=lambda item: list(item.absolute_path)):

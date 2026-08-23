@@ -21,3 +21,9 @@ package-dir = {"" = "src"}
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+ai_auto_desktop = [
+    "schemas/workflow/v1alpha1/workflow.schema.json",
+    "schemas/capabilities/v1alpha1/capability-manifest.schema.json",
+]
+

@@ -1,0 +1,419 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.ai-auto-desktop.dev/capabilities/v1alpha1/capability-manifest.schema.json",
+  "title": "AI Auto Desktop Capability Manifest v1alpha1",
+  "description": "Contract advertised by a built-in, process, or WASM capability provider.",
+  "type": "object",
+  "required": [
+    "apiVersion",
+    "kind",
+    "metadata",
+    "actions"
+  ],
+  "properties": {
+    "apiVersion": {
+      "const": "ai-auto-desktop.dev/v1alpha1"
+    },
+    "kind": {
+      "const": "CapabilityManifest"
+    },
+    "metadata": {
+      "$ref": "#/$defs/metadata"
+    },
+    "runtime": {
+      "$ref": "#/$defs/runtime"
+    },
+    "permissions": {
+      "$ref": "#/$defs/permissions"
+    },
+    "actions": {
+      "type": "object",
+      "propertyNames": {
+        "type": "string",
+        "pattern": "^[a-z][a-z0-9_]*$",
+        "maxLength": 128
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/action"
+      },
+      "minProperties": 1
+    },
+    "extensions": {
+      "$ref": "#/$defs/extensions"
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "qualifiedName": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$",
+      "maxLength": 192
+    },
+    "semver": {
+      "type": "string",
+      "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(?:-[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?(?:\\+[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?$"
+    },
+    "duration": {
+      "type": "string",
+      "pattern": "^[1-9][0-9]*(?:ms|s|m|h)$"
+    },
+    "metadata": {
+      "type": "object",
+      "required": [
+        "name",
+        "version"
+      ],
+      "properties": {
+        "name": {
+          "$ref": "#/$defs/qualifiedName"
+        },
+        "version": {
+          "$ref": "#/$defs/semver"
+        },
+        "description": {
+          "type": "string",
+          "maxLength": 4096
+        },
+        "publisher": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "labels": {
+          "$ref": "#/$defs/stringMap"
+        },
+        "annotations": {
+          "$ref": "#/$defs/stringMap"
+        }
+      },
+      "additionalProperties": false
+    },
+    "stringMap": {
+      "type": "object",
+      "propertyNames": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 128
+      },
+      "additionalProperties": {
+        "type": "string",
+        "maxLength": 2048
+      }
+    },
+    "runtime": {
+      "type": "object",
+      "required": [
+        "kind",
+        "protocol"
+      ],
+      "properties": {
+        "kind": {
+          "enum": [
+            "process",
+            "built_in",
+            "wasm_component"
+          ]
+        },
+        "protocol": {
+          "enum": [
+            "ndjson-stdio-v1",
+            "protobuf-ipc-v1",
+            "wasm-component-v1"
+          ]
+        },
+        "entrypoint": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096
+        },
+        "args": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "maxLength": 4096
+          },
+          "maxItems": 128
+        },
+        "platforms": {
+          "type": "array",
+          "items": {
+            "enum": [
+              "windows",
+              "macos",
+              "linux"
+            ]
+          },
+          "minItems": 1,
+          "uniqueItems": true
+        },
+        "min_host_version": {
+          "$ref": "#/$defs/semver"
+        },
+        "shutdown_grace": {
+          "$ref": "#/$defs/duration"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "enum": [
+                  "process",
+                  "wasm_component"
+                ]
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "required": [
+              "entrypoint"
+            ]
+          },
+          "else": {
+            "not": {
+              "required": [
+                "entrypoint"
+              ]
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "process"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "properties": {
+              "protocol": {
+                "enum": [
+                  "ndjson-stdio-v1",
+                  "protobuf-ipc-v1"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "wasm_component"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "properties": {
+              "protocol": {
+                "const": "wasm-component-v1"
+              }
+            }
+          }
+        }
+      ],
+      "additionalProperties": false
+    },
+    "permissions": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)+$",
+        "maxLength": 192
+      },
+      "uniqueItems": true
+    },
+    "effectClass": {
+      "enum": [
+        "read_only",
+        "idempotent",
+        "non_idempotent",
+        "contextual"
+      ]
+    },
+    "riskCategory": {
+      "enum": [
+        "observe",
+        "navigate",
+        "input",
+        "modify",
+        "send",
+        "delete",
+        "purchase",
+        "authorize",
+        "install",
+        "execute_script",
+        "capture_screen",
+        "custom"
+      ]
+    },
+    "riskLevel": {
+      "enum": [
+        "low",
+        "medium",
+        "high",
+        "critical",
+        "contextual"
+      ]
+    },
+    "risk": {
+      "type": "object",
+      "required": [
+        "category",
+        "level"
+      ],
+      "properties": {
+        "category": {
+          "$ref": "#/$defs/riskCategory"
+        },
+        "level": {
+          "$ref": "#/$defs/riskLevel"
+        },
+        "custom_name": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)+$",
+          "maxLength": 192
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "category": {
+                "const": "custom"
+              }
+            },
+            "required": ["category"]
+          },
+          "then": {
+            "required": ["custom_name"]
+          },
+          "else": {
+            "not": {
+              "required": ["custom_name"]
+            }
+          }
+        }
+      ],
+      "additionalProperties": false
+    },
+    "action": {
+      "type": "object",
+      "required": [
+        "contract_major",
+        "effect",
+        "risk",
+        "input_schema",
+        "output_schema"
+      ],
+      "properties": {
+        "contract_major": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "description": {
+          "type": "string",
+          "maxLength": 4096
+        },
+        "permissions": {
+          "$ref": "#/$defs/permissions"
+        },
+        "effect": {
+          "type": "object",
+          "required": [
+            "default_class"
+          ],
+          "properties": {
+            "default_class": {
+              "$ref": "#/$defs/effectClass"
+            }
+          },
+          "additionalProperties": false
+        },
+        "risk": {
+          "$ref": "#/$defs/risk"
+        },
+        "timeout": {
+          "$ref": "#/$defs/duration"
+        },
+        "input_schema": {
+          "$ref": "#/$defs/jsonSchema"
+        },
+        "output_schema": {
+          "$ref": "#/$defs/jsonSchema"
+        },
+        "errors": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/errorContract"
+          },
+          "uniqueItems": true
+        }
+      },
+      "additionalProperties": false
+    },
+    "jsonSchema": {
+      "oneOf": [
+        {
+          "type": "boolean"
+        },
+        {
+          "type": "object"
+        }
+      ]
+    },
+    "errorContract": {
+      "type": "object",
+      "required": [
+        "code",
+        "retryable",
+        "effect"
+      ],
+      "properties": {
+        "code": {
+          "type": "string",
+          "pattern": "^[A-Z][A-Z0-9_]*(?:\\.[A-Z][A-Z0-9_]*)+$",
+          "maxLength": 192
+        },
+        "description": {
+          "type": "string",
+          "maxLength": 4096
+        },
+        "retryable": {
+          "type": "boolean"
+        },
+        "effect": {
+          "enum": [
+            "not_applied",
+            "applied",
+            "unknown"
+          ]
+        },
+        "data_schema": {
+          "$ref": "#/$defs/jsonSchema"
+        }
+      },
+      "additionalProperties": false
+    },
+    "extensions": {
+      "type": "object",
+      "propertyNames": {
+        "type": "string",
+        "pattern": "^[a-z0-9][a-z0-9.-]*/[A-Za-z][A-Za-z0-9_.-]*$",
+        "maxLength": 192
+      },
+      "additionalProperties": true
+    }
+  }
+}
