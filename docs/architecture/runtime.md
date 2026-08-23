@@ -27,9 +27,9 @@
 | IPC | stdio NDJSON v0，便于调试和跨语言实现；已校验 manifest schema/action major，尚无完整 wire version 协商 | 保留语义兼容层，迁移到 Protobuf/CBOR 等 IDL + named pipe/Unix socket |
 | 隔离 | process plugin 使用 POSIX 进程组；Linux script 使用 bubblewrap + prlimit，其他平台 fail-closed | Windows Job Object/restricted token；macOS 受控 helper；Linux bubblewrap/OCI；资源与 capability 限额 |
 | 安全 | 结构化错误、script fail-closed、action risk policy、manifest 与 action I/O schema 校验；确认 token/taint 等尚未实现 | 签名插件、系统 secret store、确认 token、完整 taint enforcement、审计与更新回滚 |
-| 平台能力 | **尚无真实桌面 driver，不能宣称支持任一 OS 的 UI 自动化** | Windows 首先产品化；macOS 与 Ubuntu GNOME 经过 probe 后分级支持 |
+| 平台能力 | 已有只读三端 probe 与首个 Windows UIA process driver 纵向切片；尚未完成 Windows 真机资格验证，不能宣称产品级支持 | Windows 首先产品化；macOS 与 Ubuntu GNOME 经过 probe 后分级支持 |
 
-v0 的价值是锁定运行语义并建立故障测试夹具，而不是以 mock 成功率代替真实桌面成功率。
+v0 的价值是锁定运行语义并建立故障测试夹具。Windows UIA driver 已开始调用真实原生接口，但在真实 Windows runner 的 fixture app、UIPI 与权限矩阵通过前，仍不能把跨平台 contract 测试当作产品成功率。
 
 ## 3. 信任与进程边界
 

@@ -8,7 +8,7 @@ Workflow Descriptor 描述可移植的意图、控制流、预算、权限与失
 
 执行器必须先验证并编译 descriptor，再运行不可变计划。未知核心字段必须 fail-closed；只有 `extensions`、action `with`、script `inputs`、JSON Schema 片段及结构化错误 `details` 是明确开放边界。
 
-OCR 必须是显式 `action`，例如 `fixture.ocr@1` 或正式的 `desktop.ocr.recognize@1`。运行时不得在 locator 失败、语义树为空或 action 失败时偷偷截取全屏并执行 OCR。是否捕获图像、裁剪范围、识别语言和置信度门槛都必须由 workflow/capability contract 显式表达并接受策略检查。
+OCR 必须是显式 `action`，例如 `fixture.ocr@1` 或当前 Tesseract provider 的 `vision.ocr.recognize@1`。运行时不得在 locator 失败、语义树为空或 action 失败时偷偷截取全屏并执行 OCR。是否捕获图像、裁剪范围、识别语言和置信度门槛都必须由 workflow/capability contract 显式表达并接受策略检查。
 
 ## 2. 编码、版本与 YAML 规则
 
@@ -183,14 +183,16 @@ Manifest 使用相同 `apiVersion`，`kind: CapabilityManifest`，并包含：
 | canonical header、metadata、顺序 steps | 支持/优先 | 完整 |
 | `action` + NDJSON process fixture | 支持/优先 | 多 provider、版本解析、schema 校验 |
 | `set`, `if`, `fail`, `return` | 首版子集 | 完整语义 |
-| `switch`, `foreach`, `while`, `block` | 可能未实现 | 必须有界 |
-| `script` | 默认不支持 | 独立进程和 deny-by-default sandbox |
-| retry/on_error/finally | 实现依版本而异 | 本文语义 |
-| budgets、强 policy、journal/reconciliation | 部分或未实现 | 强制 |
-| 真实 UIA/AX/AT-SPI、截图、OCR engine | 未由 fixture 提供 | 平台 capability |
+| `switch`, `foreach`, `while`, `block` | 支持串行有界执行；`foreach.concurrency != 1` 明确拒绝 | 完整且有界 |
+| `script` | 默认关闭；仅 Linux bubblewrap + prlimit 可用时执行 | 三端独立进程和 deny-by-default sandbox |
+| retry/on_error/finally | 支持基础语义、父子 deadline 与 unknown effect | 持久恢复与取消 |
+| budgets、risk/permission/confirmation policy | 支持执行预算与 fail-closed 前置检查 | journal/reconciliation、真实确认 token |
+| Windows UIA | 首个进程 driver：list/snapshot/find/focus/invoke/set_value；待 Windows 真机资格测试 | 完整 driver |
+| macOS AX / Linux AT-SPI | 仅只读 capability probe | 真实平台 driver |
+| OCR engine | 显式 Tesseract 图片 provider；不自行截图 | 受控 frame/capture provenance |
 
 运行时遇到合法但未实现的规范字段必须明确返回 `CAPABILITY.MISSING`、`DESCRIPTOR.VERSION_UNSUPPORTED` 或实现定义的结构化 unsupported 错误；不得静默忽略。
 
 ## 10. 示例
 
-`examples/workflows/ocr-error-response.json` 是 canonical JSON 数据模型，`ocr-error-response.yaml` 是等价 authoring 形式。它显式调用 fixture OCR，再根据 OCR 输出的置信度分支：低于阈值时由 workflow 产生 `OCR.LOW_CONFIDENCE`，达到阈值时才调用声明好的按钮动作。它不代表真实 OCR engine，也没有隐式截图或坐标点击。
+`examples/workflows/ocr-error-response.json` 是 canonical JSON 数据模型，`ocr-error-response.yaml` 是等价 authoring 形式。它显式调用 fixture OCR，再根据 OCR 输出的置信度分支：低于阈值时由 workflow 产生 `OCR.LOW_CONFIDENCE`，达到阈值时才调用声明好的按钮动作。该示例使用 fixture 以保持确定性；真实 `vision.ocr` provider 位于 `plugins/ocr_tesseract`，同样不包含隐式截图或坐标点击。
