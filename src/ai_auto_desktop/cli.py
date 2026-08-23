@@ -11,6 +11,7 @@ from typing import Any
 
 from .compiler import load_descriptor
 from .errors import AutomationError, ensure_automation_error
+from .probe import probe_capabilities
 from .runtime import WorkflowRunner
 
 
@@ -32,6 +33,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = _Parser(prog="ai-auto-desktop")
     parser.add_argument("--version", action="version", version="%(prog)s 0.1.0")
     commands = parser.add_subparsers(dest="command", required=True)
+    commands.add_parser("probe")
     validate = commands.add_parser("validate")
     validate.add_argument("file", type=Path)
     run = commands.add_parser("run")
@@ -83,6 +85,9 @@ def _emit(value: Any) -> None:
 def main(argv: list[str] | None = None) -> int:
     try:
         options = build_parser().parse_args(argv)
+        if options.command == "probe":
+            _emit(probe_capabilities().to_dict())
+            return 0
         descriptor = load_descriptor(options.file)
         if options.command == "validate":
             _emit({"status": "valid", "workflow": descriptor.name, "apiVersion": descriptor.api_version, "steps": len(descriptor.all_steps())})
