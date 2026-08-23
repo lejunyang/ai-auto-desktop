@@ -118,9 +118,11 @@ LOCATOR_ERRORS = (
     ("DRIVER.NOT_FOUND", "The locator matched no node.", False),
     ("DRIVER.AMBIGUOUS", "The locator matched more than one node.", False),
     ("DRIVER.STALE_SNAPSHOT", "The snapshot target is no longer current.", False),
+    ("DRIVER.SNAPSHOT_TRUNCATED", "A bounded snapshot cannot prove uniqueness.", False),
 )
 ACTION_ERRORS = (
     ("DRIVER.ACTION_UNSUPPORTED", "The target lacks the required native UIA pattern.", False),
+    ("DRIVER.PROTECTED_ELEMENT", "The target exposes protected content.", False),
     ("DRIVER.ACTION_FAILED", "The native UIA action failed.", False),
 )
 
@@ -671,6 +673,11 @@ class WindowsUIADriver:
     def _find(self, args: dict[str, Any], deadline: float) -> dict[str, Any]:
         _only_keys(args, {"snapshot_id", "revision", "locator"}, "args")
         record = self._record(args.get("snapshot_id"), args.get("revision"))
+        if record.public.get("truncated"):
+            raise DriverError(
+                "DRIVER.SNAPSHOT_TRUNCATED",
+                "a truncated snapshot cannot prove a unique locator match",
+            )
         locator = self._locator(args.get("locator"))
         node = self._resolve(record, locator, deadline)
         return {
@@ -810,6 +817,11 @@ class WindowsUIADriver:
         if not isinstance(node_id, str) or not node_id:
             _fail("DRIVER.INVALID_REQUEST", "target.node_id must be a non-empty string")
         record = self._record(target.get("snapshot_id"), target.get("revision"))
+        if record.public.get("truncated"):
+            raise DriverError(
+                "DRIVER.SNAPSHOT_TRUNCATED",
+                "a truncated snapshot cannot be used for a write action",
+            )
         locator = self._locator(args["locator"])
         expected = self._resolve(record, locator, deadline)
         if expected["node_id"] != node_id or node_id not in record.handles:
@@ -836,6 +848,11 @@ class WindowsUIADriver:
                     data={"reason": exc.code, **(exc.data if isinstance(exc.data, dict) else {})},
                 ) from exc
             raise
+        if fresh.public.get("truncated"):
+            raise DriverError(
+                "DRIVER.SNAPSHOT_TRUNCATED",
+                "the pre-dispatch snapshot was truncated",
+            )
         fresh_node_id = resolved["node_id"]
         if fresh.fingerprints[fresh_node_id] != expected_fingerprint:
             raise DriverError(
@@ -857,6 +874,12 @@ class WindowsUIADriver:
             if "value" not in args:
                 _fail("DRIVER.INVALID_REQUEST", "value is required for set_value")
             value = _text(args["value"], "value")
+            provenance = resolved.get("provenance", {})
+            if isinstance(provenance, Mapping) and provenance.get("value_redacted") is True:
+                raise DriverError(
+                    "DRIVER.PROTECTED_ELEMENT",
+                    "set_value is disabled for password or protected elements",
+                )
         _check_deadline(deadline)
         native = fresh.handles[fresh_node_id]
         dispatched = False

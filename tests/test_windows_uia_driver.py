@@ -270,6 +270,33 @@ class WindowsUIADriverCoreTests(unittest.TestCase):
             )
         self.assertEqual(stale_revision.exception.code, "DRIVER.STALE_SNAPSHOT")
 
+    def test_truncated_snapshot_cannot_resolve_or_dispatch(self) -> None:
+        backend = FakeBackend()
+        original_capture = backend.capture
+
+        def truncated_capture(*args: object, **kwargs: object) -> object:
+            result = original_capture(*args, **kwargs)
+            result.truncated = True
+            return result
+
+        backend.capture = truncated_capture  # type: ignore[method-assign]
+        driver = uia.WindowsUIADriver(backend)
+        snapshot = driver.execute(
+            "snapshot", {"window": {"handle": 101}}, deadline=deadline()
+        )
+        with self.assertRaises(uia.DriverError) as raised:
+            driver.execute(
+                "find",
+                {
+                    "snapshot_id": snapshot["snapshot_id"],
+                    "revision": snapshot["revision"],
+                    "locator": {"automation_id": "save"},
+                },
+                deadline=deadline(),
+            )
+        self.assertEqual(raised.exception.code, "DRIVER.SNAPSHOT_TRUNCATED")
+        self.assertFalse(any(call[0] == "invoke" for call in backend.calls))
+
     def test_unsupported_action_native_failure_and_deadline_are_structured(self) -> None:
         snapshot = self.snapshot()
         found = self.find(snapshot, {"automation_id": "save"})
