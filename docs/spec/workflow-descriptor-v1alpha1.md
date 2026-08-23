@@ -170,7 +170,7 @@ Manifest 使用相同 `apiVersion`，`kind: CapabilityManifest`，并包含：
 - `metadata.name` 和 `metadata.version`；
 - 可选 `runtime`：`kind`、`protocol`、进程/WASM `entrypoint`、args、platforms、host version 与 shutdown grace；
 - 可选 provider 级 `permissions`；
-- `actions` map，每项含 `contract_major`、默认 `effect`/`risk`、`input_schema`、`output_schema`，并可声明 permissions、timeout 和结构化 `errors`。
+- `actions` map，每项含 `contract_major`、相互独立的默认 `effect` 与 `risk`、`input_schema`、`output_schema`，并可声明 permissions、timeout 和结构化 `errors`。Workflow action 和 Manifest action 都把 `effect`、`risk` 作为同级字段；Manifest 仅将 effect 的字段命名为 `default_class`，表示 provider 默认值。
 
 每项 error contract 的 `effect` 为 `not_applied|applied|unknown`。Manifest 只声明能力，不授予权限；workflow 声明、manifest、provider 动态判断和 trusted host policy 必须全部允许。第三方 native provider 必须进程外运行，不能 import/dlopen 到 trusted host。
 
@@ -193,4 +193,4 @@ Manifest 使用相同 `apiVersion`，`kind: CapabilityManifest`，并包含：
 
 ## 10. 示例
 
-`examples/workflows/ocr-error-response.json` 是 canonical JSON 数据模型，`ocr-error-response.yaml` 是等价 authoring 形式。它显式调用 fixture OCR，再让 fixture 返回 `OCR.LOW_CONFIDENCE`，用于验证结构化错误传播；它不代表真实 OCR engine，也没有隐式截图或坐标点击。
+`examples/workflows/ocr-error-response.json` 是 canonical JSON 数据模型，`ocr-error-response.yaml` 是等价 authoring 形式。它显式调用 fixture OCR，再根据 OCR 输出的置信度分支：低于阈值时由 workflow 产生 `OCR.LOW_CONFIDENCE`，达到阈值时才调用声明好的按钮动作。它不代表真实 OCR engine，也没有隐式截图或坐标点击。

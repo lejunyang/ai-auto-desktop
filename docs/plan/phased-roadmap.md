@@ -19,9 +19,9 @@
 - `action/set/block/fail/return/script`、`if/switch/foreach/while`、声明式 error handler 与 `finally`；循环有显式上限。
 - 结构化 `AutomationError`；当前 run 状态是 `succeeded/failed/timed_out/unknown_effect`，`cancelled/skipped` 仍需在 M0 补齐。
 - stdio NDJSON 长驻 process plugin 和确定性 fixture，用于成功、retryable error、永久失败、睡眠、mock OCR 与 mock desktop invoke。
-- script 默认拒绝；只有 `--allow-scripts` 显式启用后才以独立进程运行，并要求结构化 stdin/stdout 和硬 timeout。
+- script 默认拒绝；即使 `--allow-scripts` 显式启用，当前 v0 也因暂无强 OS sandbox 而返回 `SCRIPT.SANDBOX_UNAVAILABLE`，不能把普通子进程冒充沙箱。
 
-尚未实现或尚未证明：真实 UIA/AX/AT-SPI；可靠的 Windows 后代进程树终止；协议版本协商；single-writer session manager；持久 journal；系统 secret store；签名插件；真实截图/OCR；taint tracking 与完整 policy enforcement；安装器和权限引导。M0 的任务是把这些 v0 代码收敛成可验证基线，而不是扩大产品宣称。
+尚未实现或尚未证明：真实 UIA/AX/AT-SPI；可靠的 Windows 后代进程树终止；完整 wire 协议版本协商；single-writer session manager；持久 journal；系统 secret store；签名插件；真实截图/OCR；taint tracking、确认 token 与完整 policy enforcement；安装器和权限引导。M0 已具备 manifest/action contract 与基础 action risk policy 校验，其任务是继续把 v0 收敛成可验证基线，而不是扩大产品宣称。
 
 ## 3. M0：冻结 Python Runtime v0 合约
 

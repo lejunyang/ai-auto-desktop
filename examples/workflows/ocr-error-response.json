@@ -14,14 +14,14 @@
         "version": "^1.0.0",
         "actions": [
           "ocr",
-          "error"
+          "invoke"
         ]
       }
     ]
   },
   "budgets": {
     "max_duration": "10s",
-    "max_executed_steps": 2,
+    "max_executed_steps": 3,
     "cleanup_timeout": "1s"
   },
   "policy": {
@@ -35,7 +35,7 @@
     "untrusted_inputs": {
       "ui_text": "tainted",
       "ocr_text": "tainted",
-      "allow_in_control_flow": false
+      "allow_in_control_flow": true
     },
     "screenshots": {
       "retention": "memory_only",
@@ -71,31 +71,51 @@
       }
     },
     {
-      "id": "report_low_confidence",
-      "type": "action",
-      "uses": "fixture.error@1",
-      "with": {
-        "code": "OCR.LOW_CONFIDENCE",
-        "message": "OCR confidence 0.41 is below the required 0.80",
-        "retryable": false,
-        "data": {
-          "observed_confidence": 0.41,
-          "required_confidence": 0.8,
-          "ocr_step": "recognize_status"
+      "id": "evaluate_confidence",
+      "type": "if",
+      "condition": "${{ steps.recognize_status.output.confidence < 0.80 }}",
+      "then": [
+        {
+          "id": "report_low_confidence",
+          "type": "fail",
+          "error": {
+            "code": "OCR.LOW_CONFIDENCE",
+            "message": "OCR confidence is below the required threshold",
+            "retryable": false,
+            "effect": "not_applied",
+            "details": {
+              "observed_confidence": "${{ steps.recognize_status.output.confidence }}",
+              "required_confidence": 0.8,
+              "ocr_step": "recognize_status"
+            }
+          }
         }
-      },
-      "effect": {
-        "class": "contextual"
-      },
-      "risk": {
-        "category": "custom",
-        "level": "contextual",
-        "custom_name": "fixture.error"
-      },
-      "timeout": "2s",
-      "retry": {
-        "max_attempts": 1
-      }
+      ],
+      "else": [
+        {
+          "id": "click_retry",
+          "type": "action",
+          "uses": "fixture.invoke@1",
+          "with": {
+            "operation": "click",
+            "target": {
+              "role": "button",
+              "name": "Retry"
+            }
+          },
+          "effect": {
+            "class": "idempotent"
+          },
+          "risk": {
+            "category": "navigate",
+            "level": "low"
+          },
+          "timeout": "2s",
+          "retry": {
+            "max_attempts": 1
+          }
+        }
+      ]
     }
   ]
 }

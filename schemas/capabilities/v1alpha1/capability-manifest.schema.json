@@ -286,6 +286,26 @@
           "maxLength": 192
         }
       },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "category": {
+                "const": "custom"
+              }
+            },
+            "required": ["category"]
+          },
+          "then": {
+            "required": ["custom_name"]
+          },
+          "else": {
+            "not": {
+              "required": ["custom_name"]
+            }
+          }
+        }
+      ],
       "additionalProperties": false
     },
     "action": {
@@ -293,6 +313,7 @@
       "required": [
         "contract_major",
         "effect",
+        "risk",
         "input_schema",
         "output_schema"
       ],
@@ -311,18 +332,17 @@
         "effect": {
           "type": "object",
           "required": [
-            "default_class",
-            "risk"
+            "default_class"
           ],
           "properties": {
             "default_class": {
               "$ref": "#/$defs/effectClass"
-            },
-            "risk": {
-              "$ref": "#/$defs/risk"
             }
           },
           "additionalProperties": false
+        },
+        "risk": {
+          "$ref": "#/$defs/risk"
         },
         "timeout": {
           "$ref": "#/$defs/duration"

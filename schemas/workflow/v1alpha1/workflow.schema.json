@@ -490,6 +490,26 @@
           "maxLength": 192
         }
       },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "category": {
+                "const": "custom"
+              }
+            },
+            "required": ["category"]
+          },
+          "then": {
+            "required": ["custom_name"]
+          },
+          "else": {
+            "not": {
+              "required": ["custom_name"]
+            }
+          }
+        }
+      ],
       "additionalProperties": false
     },
     "effectClass": {

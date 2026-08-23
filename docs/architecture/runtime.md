@@ -24,9 +24,9 @@
 | 步骤与控制流 | `action/set/block/fail/return/script`，以及 `if/switch/foreach/while`、`on_error/finally`；script 默认拒绝 | 可恢复的计划状态机、持久 journal、确定性 reconciliation |
 | 状态 | 当前 run 结果为 `succeeded/failed/timed_out/unknown_effect` | 补全并统一 `SUCCEEDED/FAILED/TIMED_OUT/CANCELLED/UNKNOWN_EFFECT/SKIPPED` |
 | 执行能力 | 长驻 NDJSON fixture/process plugin，用于 OCR mock、桌面 invoke mock、重试和超时测试 | 真实 UIA/AX/AT-SPI driver、输入后备、截图、应用专用 adapter |
-| IPC | stdio NDJSON v0，便于调试和跨语言实现；当前 manifest 尚无 schema/version 协商 | 保留语义兼容层，迁移到 Protobuf/CBOR 等 IDL + named pipe/Unix socket |
-| 隔离 | POSIX 进程组可在超时后整组终止；纯标准库 Windows 实现只能尽力 terminate/kill，不能保证回收任意后代 | Windows Job Object；macOS/Linux 独立 session/process group；资源与 capability 限额 |
-| 安全 | 结构化错误、script 显式开关；policy/capability 目前主要是严格解析与声明，尚无完整强制执行 | 签名插件、系统 secret store、确认 token、完整 policy enforcement、审计与更新回滚 |
+| IPC | stdio NDJSON v0，便于调试和跨语言实现；已校验 manifest schema/action major，尚无完整 wire version 协商 | 保留语义兼容层，迁移到 Protobuf/CBOR 等 IDL + named pipe/Unix socket |
+| 隔离 | process plugin 使用 POSIX 进程组；script 即使显式开启也因暂无强沙箱而 fail-closed | Windows Job Object/restricted token；macOS 受控 helper；Linux bubblewrap/OCI；资源与 capability 限额 |
+| 安全 | 结构化错误、script fail-closed、action risk policy、manifest 与 action I/O schema 校验；确认 token/taint 等尚未实现 | 签名插件、系统 secret store、确认 token、完整 taint enforcement、审计与更新回滚 |
 | 平台能力 | **尚无真实桌面 driver，不能宣称支持任一 OS 的 UI 自动化** | Windows 首先产品化；macOS 与 Ubuntu GNOME 经过 probe 后分级支持 |
 
 v0 的价值是锁定运行语义并建立故障测试夹具，而不是以 mock 成功率代替真实桌面成功率。
@@ -65,7 +65,7 @@ Host 是唯一能签发本地 capability 的主体。worker 只获得完成本�
 - 控制流边和最大迭代/最大步骤预算；
 - policy 与 secret 仅保存引用，不保存运行时明文。
 
-v0 的公共 step 集合为 `action`、`set`、`if`、`switch`、`foreach`、`while`、`block`、`script`、`fail`、`return`；公共控制字段包括 guard、timeout、attempt timeout、retry、`on_error` 与 `finally`。未知字段、未知 step type、非法表达式和非正数迭代上限失败关闭。无法满足的 capability 和不兼容协议版本也必须在目标态失败关闭，但当前 v0 尚未实现 capability/manifest 语义版本协商。编译后的 mapping、sequence 和 step 节点不可被运行期插件或表达式修改；每次 attempt 使用独立的可变 execution context，事件和结果另写 journal。
+v0 的公共 step 集合为 `action`、`set`、`if`、`switch`、`foreach`、`while`、`block`、`script`、`fail`、`return`；公共控制字段包括 guard、timeout、attempt timeout、retry、`on_error` 与 `finally`。未知字段、未知 step type、非法表达式和非正数迭代上限失败关闭。当前 v0 校验 manifest、action contract major 与输入输出 schema；完整的 provider SemVer、平台和权限解析仍在后续阶段。编译后的 mapping、sequence 和 step 节点不可被运行期插件或表达式修改；每次 attempt 使用独立的可变 execution context，事件和结果另写 journal。
 
 ### 4.1 受限表达式
 
@@ -118,7 +118,7 @@ capability、driver、OCR 与 script worker 都是长驻或按步启动的子进
 - Capability worker：对应用业务 API、浏览器 DOM、文件/数据转换等窄能力做进程外适配，只能调用 manifest 声明且经 policy 授权的 action。
 - Driver worker：窗口枚举、snapshot、语义动作、输入与截图；不负责 workflow 控制流。
 - OCR worker：输入由 Host 获取且带 frame/region provenance 的图像，输出文本、bounds、language、confidence；不产生或执行点击。
-- Script worker：v0 默认禁用，只有显式 `--allow-scripts` 才启动独立进程；仅从 stdin 接收结构化输入，stdout 返回一个受大小限制的结构化值。当前进程隔离不是完整 sandbox；文件、网络、环境变量和 secret 的强制 capability 控制属于目标态。
+- Script worker：v0 默认禁用；即使显式 `--allow-scripts`，在强 OS sandbox 尚未实现时也 fail-closed。目标实现仅从 stdin 接收结构化输入，stdout 返回一个受大小限制的结构化值，并强制文件、网络、环境变量和 secret 的 capability 控制。
 
 ### 6.2 平台拆分
 
@@ -145,7 +145,7 @@ v0 使用 stdio 上每行一个 UTF-8 JSON object，协议 stdout 不得混入�
 {"id":"01J...","error":{"code":"DRIVER.NOT_FOUND","message":"...","retryable":false,"details":{}}}
 ```
 
-v0 的 `deadline_ms` 表示 Unix epoch 毫秒绝对时间，不是“从收到消息开始再等 N 毫秒”。每个 request ID 严格对应一个含 `result` 或 `error` 的响应。Host 先短暂探测插件主动输出的 `{type: "manifest"}`；没有主动 manifest 时再发 manifest 请求。当前 v0 接受多种兼容响应形状，但**尚未校验 manifest schema，也尚未协商协议版本**，这两项属于后续门槛。
+v0 的 `deadline_ms` 表示 Unix epoch 毫秒绝对时间，不是“从收到消息开始再等 N 毫秒”。每个 request ID 严格对应一个含 `result` 或 `error` 的响应。Host 先短暂探测插件主动输出的 `{type: "manifest"}`；没有主动 manifest 时再发 manifest 请求。当前 v0 接受多种兼容响应形状并校验 manifest schema 与 action contract major；完整的 wire protocol major/minor 协商仍属于后续门槛。
 
 Host 写入并 flush 请求成功后，将插件错误、timeout、EOF 和协议错误标记为 `details.dispatched=true`；写前失败则为 false 或缺省。当前每个进程只允许一个 in-flight 请求，没有 streaming、请求级 cancel、自动重启或进程池；timeout/EOF/协议错误会 fail-stop 并回收整个插件进程。stderr 只保留有界 tail，stdout 行与内部队列也必须有界。
 

@@ -54,6 +54,6 @@ Plugins exchange one JSON object per line over stdin and stdout. Startup support
 
 ## Scripts and security
 
-Script steps are disabled unless --allow-scripts or allow_scripts=True is explicitly supplied. Python scripts run in a separate process group with isolated mode, a minimal environment, JSON stdin/stdout, an output limit, timeout, and process-group termination. This is process isolation, not a hostile-code sandbox. Version 0.1 refuses requested filesystem, network, environment, or script capabilities that it cannot enforce. Do not run untrusted scripts.
+Script steps are disabled unless `--allow-scripts` or `allow_scripts=True` is explicitly supplied. Version 0.1 then still fails closed with `SCRIPT.SANDBOX_UNAVAILABLE`: a child process by itself is not a security sandbox. A later platform worker will add Windows Job Object/restricted-token isolation, a signed macOS helper strategy, and Linux bubblewrap/OCI isolation before script execution is enabled.
 
-Current scope excludes native UI drivers, persistence and resume, secret storage, a strong OS sandbox, concurrent desktop writes, and full policy or taint enforcement.
+Current scope excludes native UI drivers, persistence and resume, secret storage, a strong OS sandbox, concurrent desktop writes, confirmation tokens, and taint enforcement. The v0 host does enforce declared action risk categories/levels and validates process manifests plus action input/output contracts.
