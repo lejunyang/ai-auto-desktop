@@ -3,6 +3,8 @@ run.sh
 build.sh
 archive.sh
 identity.sh
+# type_text sources: both files below are required for the secure fixture and runner.
+# FixtureApp.swift AXTestRunner.swift
 FixtureApp.swift
 AXTestRunner.swift
 SOURCE_PACKAGE_FILES.txt

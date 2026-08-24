@@ -38,9 +38,20 @@ owner/group，并移除 ACL、file flags、扩展属性与 macOS AppleDouble 元
 
 runner 始终调用 `CGPreflightScreenCaptureAccess()` 记录当前状态，但绝不调用授权请求 API，
 也不执行截图。Accessibility 可用时，它会启动自有 fixture，在最大深度 8、最大节点数
-128 的边界内唯一定位控件，依次验证 focus、set value、press，并在每个动作后重新遍历读取。
+128 的边界内唯一定位控件，依次验证 focus、set value、显式 Unicode keyboard input 和
+press，并在每个动作后重新遍历读取。键盘输入分段覆盖 ASCII、中文和非 BMP emoji；每段都
+重新解析目标、先确认 AX focus 与 fixture 仍在前台，使用 `CGEventKeyboardSetUnicodeString`
+定向提交到 fixture PID，再从 fresh AX snapshot 验证累计值；报告使用 `event_submitted`，不把
+void `postToPid` 描述为已接受。每段首事件前还记录 `IsSecureEventInputEnabled()` 结果并在启用
+时拒绝提交。套件还通过 `NSSecureTextField`
+确认 secure text 在任何键盘事件前被拒绝。
 runner 通过 LaunchServices (`open -n -W`) 启动，使 TCC 对应实际 `.app` 身份；结果由 runner
 原子写入指定文件，外层脚本不把 `open` 的退出码当作测试结论。
+
+这些 case 对齐进程驱动新增的显式 `desktop.macos_ax.type_text@1`，但在真实 Mac 回传
+`passed` 报告之前仍只代表测试实现已就绪。它只需要 Accessibility，不需要 Screen Recording，
+不注入 pointer，也不是 `set_value` 的自动 fallback。fixture、runner 和本 README 均在
+`SOURCE_PACKAGE_FILES.txt` 白名单内；若未来增加文件，必须同步更新该白名单。
 
 如缺少工具，先运行：
 

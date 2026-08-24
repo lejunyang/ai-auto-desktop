@@ -95,7 +95,7 @@ def default_tree() -> list[object]:
             "Title",
             identifier="title",
             value="Draft",
-            actions=("focus", "set_value"),
+            actions=("focus", "set_value", "type_text"),
         ),
     ]
 
@@ -157,6 +157,9 @@ class FakeBackend:
     def set_value(self, native: object, value: str, *, deadline: float) -> object:
         return self._action("set_value", native, value)
 
+    def type_text(self, native: object, text: str, *, deadline: float) -> object:
+        return self._action("type_text", native, text)
+
     def same_element(
         self, previous: object, current: object, *, deadline: float
     ) -> bool:
@@ -182,6 +185,37 @@ class HelperFaultBackend(FakeBackend):
                 "effect": "unknown" if self.request_dispatched else "not_applied",
             },
         )
+
+
+class TypeTextFaultBackend(FakeBackend):
+    def __init__(
+        self, code: str, *, keyboard_dispatch_started: bool,
+        focus_changed: bool = False,
+    ) -> None:
+        super().__init__()
+        self.code = code
+        self.keyboard_dispatch_started = keyboard_dispatch_started
+        self.focus_changed = focus_changed
+        self.terminated = 0
+
+    def type_text(self, native: object, text: str, *, deadline: float) -> object:
+        self.calls.append(("type_text_attempt", native, text))
+        raise ax.DriverError(
+            self.code,
+            "synthetic type_text failure",
+            retryable=self.code == "DRIVER.TIMEOUT",
+            data={
+                "helper_channel_failure": True,
+                "helper_request_dispatched": True,
+                "keyboard_dispatch_started": self.keyboard_dispatch_started,
+                "focus_changed": self.focus_changed,
+                "effect": "unknown" if self.keyboard_dispatch_started
+                else "contextual" if self.focus_changed else "not_applied",
+            },
+        )
+
+    def terminate_after_unknown_effect(self) -> None:
+        self.terminated += 1
 
 
 class IdentityChannelFaultBackend(FakeBackend):
@@ -350,6 +384,7 @@ class MacOSAXCoreTests(unittest.TestCase):
             ("focus", {"identifier": "save"}, {}),
             ("invoke", {"identifier": "save"}, {}),
             ("set_value", {"identifier": "title"}, {"value": "Final"}),
+            ("type_text", {"identifier": "title"}, {"text": "你好, macOS 👋"}),
         )
         for action, locator, extra in cases:
             with self.subTest(action=action):
@@ -384,6 +419,10 @@ class MacOSAXCoreTests(unittest.TestCase):
                 captures = [call for call in backend.calls if call[0] == "capture"]
                 self.assertEqual(captures[-1][2:], (64, 2000))
                 self.assertTrue(any(call[0] == "same_element" for call in backend.calls))
+                action_calls = [call for call in backend.calls if call[0] == action]
+                self.assertEqual(len(action_calls), 1)
+                if action == "type_text":
+                    self.assertEqual(action_calls[0], ("type_text", "title", "你好, macOS 👋"))
                 with self.assertRaises(ax.DriverError) as stale_after_write:
                     driver.execute(
                         "find",
@@ -445,7 +484,7 @@ class MacOSAXCoreTests(unittest.TestCase):
                 "Password",
                 identifier="password",
                 value="secret",
-                actions=("focus", "set_value"),
+                actions=("focus", "set_value", "type_text"),
                 protected=True,
             )
         )
@@ -458,6 +497,7 @@ class MacOSAXCoreTests(unittest.TestCase):
         self.assertIsNone(protected_node["value"])
         self.assertTrue(protected_node["provenance"]["value_redacted"])
         self.assertNotIn("set_value", protected_node["actions"])
+        self.assertNotIn("type_text", protected_node["actions"])
         found = driver.execute(
             "find",
             {
@@ -479,6 +519,184 @@ class MacOSAXCoreTests(unittest.TestCase):
             )
         self.assertEqual(protected.exception.code, "DRIVER.PROTECTED_ELEMENT")
         self.assertFalse(any(call[0] == "set_value" for call in backend.calls))
+
+        fresh_snapshot = driver.execute(
+            "snapshot", {"app": {"process_id": 7}}, deadline=deadline()
+        )
+        found = driver.execute(
+            "find",
+            {
+                "snapshot_id": fresh_snapshot["snapshot_id"],
+                "revision": fresh_snapshot["revision"],
+                "locator": {"identifier": "password"},
+            },
+            deadline=deadline(),
+        )
+        with self.assertRaises(ax.DriverError) as typed:
+            driver.execute(
+                "type_text",
+                {
+                    "target": found["target"],
+                    "locator": {"identifier": "password"},
+                    "text": "not-a-secret",
+                },
+                deadline=deadline(),
+            )
+        self.assertEqual(typed.exception.code, "DRIVER.PROTECTED_ELEMENT")
+        self.assertEqual(typed.exception.data["effect"], "not_applied")
+        self.assertFalse(any(call[0] == "type_text" for call in backend.calls))
+
+    def test_type_text_rejects_empty_control_and_oversized_input_before_capture(self) -> None:
+        snapshot = self.snapshot()
+        found = self.find(snapshot, {"identifier": "title"})
+        invalid_texts = (
+            "",
+            "nul\x00byte",
+            "line\nbreak",
+            "tab\tcharacter",
+            "delete\x7fcharacter",
+            "x" * (ax.MAX_TYPE_TEXT_CHARS + 1),
+            "😀" * (ax.MAX_TYPE_TEXT_UTF16_UNITS // 2 + 1),
+        )
+        for text in invalid_texts:
+            with self.subTest(text=repr(text[:20])), self.assertRaises(
+                ax.DriverError
+            ) as raised:
+                self.driver.execute(
+                    "type_text",
+                    {
+                        "target": found["target"],
+                        "locator": {"identifier": "title"},
+                        "text": text,
+                    },
+                    deadline=deadline(),
+                )
+            self.assertEqual(raised.exception.code, "DRIVER.INVALID_REQUEST")
+            self.assertEqual(raised.exception.data["effect"], "not_applied")
+        self.assertEqual(self.backend.capture_count, 1)
+        self.assertFalse(any(call[0] == "type_text" for call in self.backend.calls))
+
+    def test_set_value_never_falls_back_to_type_text(self) -> None:
+        self.backend.fail = "set_value"
+        snapshot = self.snapshot()
+        found = self.find(snapshot, {"identifier": "title"})
+        with self.assertRaises(ax.DriverError) as raised:
+            self.driver.execute(
+                "set_value",
+                {
+                    "target": found["target"],
+                    "locator": {"identifier": "title"},
+                    "value": "Final",
+                },
+                deadline=deadline(),
+            )
+        self.assertEqual(raised.exception.code, "DRIVER.UNKNOWN_EFFECT")
+        self.assertEqual(
+            [call[0] for call in self.backend.calls if call[0] in ax.WRITE_ACTIONS],
+            ["set_value"],
+        )
+
+    def test_type_text_keyboard_dispatch_failure_is_unknown_and_terminates_backend(self) -> None:
+        for code in (
+            "DRIVER.ACTION_FAILED",
+            "DRIVER.TIMEOUT",
+            "DRIVER.ACTION_UNSUPPORTED",
+        ):
+            with self.subTest(code=code):
+                backend = TypeTextFaultBackend(code, keyboard_dispatch_started=True)
+                driver = ax.MacOSAXDriver(backend)
+                snapshot = driver.execute(
+                    "snapshot", {"app": {"process_id": 7}}, deadline=deadline()
+                )
+                found = driver.execute(
+                    "find",
+                    {
+                        "snapshot_id": snapshot["snapshot_id"],
+                        "revision": snapshot["revision"],
+                        "locator": {"identifier": "title"},
+                    },
+                    deadline=deadline(),
+                )
+                with self.assertRaises(ax.DriverError) as raised:
+                    driver.execute(
+                        "type_text",
+                        {
+                            "target": found["target"],
+                            "locator": {"identifier": "title"},
+                            "text": "hello",
+                        },
+                        deadline=deadline(),
+                    )
+                self.assertEqual(raised.exception.code, "DRIVER.UNKNOWN_EFFECT")
+                self.assertEqual(raised.exception.data["effect"], "unknown")
+                self.assertEqual(backend.terminated, 1)
+                self.assertIsNone(driver._current)
+
+    def test_type_text_pre_dispatch_helper_failure_is_not_applied(self) -> None:
+        backend = TypeTextFaultBackend(
+            "DRIVER.UNAVAILABLE", keyboard_dispatch_started=False
+        )
+        driver = ax.MacOSAXDriver(backend)
+        snapshot = driver.execute(
+            "snapshot", {"app": {"process_id": 7}}, deadline=deadline()
+        )
+        found = driver.execute(
+            "find",
+            {
+                "snapshot_id": snapshot["snapshot_id"],
+                "revision": snapshot["revision"],
+                "locator": {"identifier": "title"},
+            },
+            deadline=deadline(),
+        )
+        with self.assertRaises(ax.DriverError) as raised:
+            driver.execute(
+                "type_text",
+                {
+                    "target": found["target"],
+                    "locator": {"identifier": "title"},
+                    "text": "hello",
+                },
+                deadline=deadline(),
+            )
+        self.assertEqual(raised.exception.code, "DRIVER.UNAVAILABLE")
+        self.assertEqual(raised.exception.data["effect"], "not_applied")
+        self.assertEqual(backend.terminated, 0)
+        self.assertIsNone(driver._current)
+
+    def test_type_text_focus_only_failure_is_contextual_without_text_effect(self) -> None:
+        backend = TypeTextFaultBackend(
+            "DRIVER.ACTION_FAILED", keyboard_dispatch_started=False,
+            focus_changed=True,
+        )
+        driver = ax.MacOSAXDriver(backend)
+        snapshot = driver.execute(
+            "snapshot", {"app": {"process_id": 7}}, deadline=deadline()
+        )
+        found = driver.execute(
+            "find",
+            {
+                "snapshot_id": snapshot["snapshot_id"],
+                "revision": snapshot["revision"],
+                "locator": {"identifier": "title"},
+            },
+            deadline=deadline(),
+        )
+        with self.assertRaises(ax.DriverError) as raised:
+            driver.execute(
+                "type_text",
+                {
+                    "target": found["target"],
+                    "locator": {"identifier": "title"},
+                    "text": "hello",
+                },
+                deadline=deadline(),
+            )
+        self.assertEqual(raised.exception.code, "DRIVER.ACTION_FAILED")
+        self.assertEqual(raised.exception.data["effect"], "contextual")
+        self.assertFalse(raised.exception.data["keyboard_dispatch_started"])
+        self.assertTrue(raised.exception.data["focus_changed"])
+        self.assertEqual(backend.terminated, 0)
 
     def test_post_dispatch_failure_is_unknown_effect_and_deadline_is_retryable(self) -> None:
         backend = FakeBackend()
@@ -613,16 +831,34 @@ class MacOSAXProcessTests(unittest.TestCase):
         self.assertEqual(manifest["runtime"]["entrypoint"], "./run.sh")
         self.assertEqual(
             set(manifest["actions"]),
-            {"list_apps", "snapshot", "find", "focus", "invoke", "set_value"},
+            {
+                "list_apps",
+                "snapshot",
+                "find",
+                "focus",
+                "invoke",
+                "set_value",
+                "type_text",
+            },
         )
         for name in ("list_apps", "snapshot", "find"):
             self.assertEqual(manifest["actions"][name]["permissions"], ["desktop.observe"])
-        for name in ("focus", "invoke", "set_value"):
+        for name in ("focus", "invoke", "set_value", "type_text"):
             self.assertEqual(
                 manifest["actions"][name]["permissions"],
                 ["desktop.observe", "desktop.input"],
             )
         self.assertEqual(manifest["actions"]["invoke"]["effect"]["default_class"], "non_idempotent")
+        type_text = manifest["actions"]["type_text"]
+        self.assertEqual(type_text["effect"]["default_class"], "contextual")
+        self.assertEqual(type_text["risk"], {"category": "input", "level": "high"})
+        self.assertEqual(
+            type_text["input_schema"]["required"], ["target", "locator", "text"]
+        )
+        unknown_effect = next(
+            error for error in type_text["errors"] if error["code"] == "DRIVER.UNKNOWN_EFFECT"
+        )
+        self.assertEqual(unknown_effect["effect"], "unknown")
         for name, contract in manifest["actions"].items():
             self.assertEqual(contract["contract_major"], 1, name)
             self.assertIn(f"desktop.macos_ax.{name}@1", ax.ACTION_NAMES)
@@ -745,6 +981,268 @@ class MacOSAXProcessTests(unittest.TestCase):
                 backend._write_rpc("invoke", {"native_token": "n"}, deadline=deadline())
         self.assertEqual(raised.exception.code, "DRIVER.UNKNOWN_EFFECT")
         self.assertTrue(raised.exception.data["helper_request_dispatched"])
+        self.assertEqual(raised.exception.data["effect"], "unknown")
+        self.assertTrue(backend._closed)
+        self.assertEqual(process.killed, 1)
+
+    def test_type_text_progress_then_timeout_is_unknown_and_kills_helper(self) -> None:
+        backend, process = helper_backend()
+        progress = json.dumps(
+            {
+                "id": "h1",
+                "progress": {
+                    "phase": "keyboard_dispatch",
+                    "keyboard_dispatch_started": True,
+                    "focus_changed": True,
+                },
+            }
+        ).encode()
+        with mock.patch.object(
+            ax.os, "write", side_effect=lambda _fd, data: len(data)
+        ), mock.patch.object(
+            backend, "_readline",
+            side_effect=[
+                progress,
+                ax.DriverError(
+                    "DRIVER.TIMEOUT",
+                    "synthetic timeout",
+                    retryable=True,
+                    data={
+                        "helper_channel_failure": True,
+                        "helper_request_dispatched": True,
+                        "keyboard_dispatch_started": True,
+                        "focus_changed": True,
+                        "effect": "unknown",
+                    },
+                ),
+            ],
+        ):
+            with self.assertRaises(ax.DriverError) as raised:
+                backend.type_text("n", "hello", deadline=deadline())
+        self.assertEqual(raised.exception.code, "DRIVER.UNKNOWN_EFFECT")
+        self.assertTrue(raised.exception.data["keyboard_dispatch_started"])
+        self.assertEqual(raised.exception.data["effect"], "unknown")
+        self.assertTrue(backend._closed)
+        self.assertEqual(process.killed, 1)
+
+    def test_type_text_focus_progress_then_timeout_is_contextual(self) -> None:
+        backend, _process = helper_backend()
+        progress = json.dumps(
+            {
+                "id": "h1",
+                "progress": {
+                    "phase": "focus_changed",
+                    "keyboard_dispatch_started": False,
+                    "focus_changed": True,
+                },
+            }
+        ).encode()
+        with mock.patch.object(
+            ax.os, "write", side_effect=lambda _fd, data: len(data)
+        ), mock.patch.object(
+            backend, "_readline",
+            side_effect=[
+                progress,
+                ax.DriverError(
+                    "DRIVER.TIMEOUT",
+                    "synthetic timeout",
+                    retryable=True,
+                    data={
+                        "helper_channel_failure": True,
+                        "helper_request_dispatched": True,
+                        "keyboard_dispatch_started": False,
+                        "focus_changed": True,
+                        "effect": "contextual",
+                    },
+                ),
+            ],
+        ):
+            with self.assertRaises(ax.DriverError) as raised:
+                backend.type_text("n", "hello", deadline=deadline())
+        self.assertEqual(raised.exception.code, "DRIVER.TIMEOUT")
+        self.assertFalse(raised.exception.data["keyboard_dispatch_started"])
+        self.assertTrue(raised.exception.data["focus_changed"])
+        self.assertEqual(raised.exception.data["effect"], "contextual")
+
+    def test_type_text_timeout_before_progress_is_not_applied(self) -> None:
+        backend, _process = helper_backend()
+        with mock.patch.object(
+            ax.os, "write", side_effect=lambda _fd, data: len(data)
+        ), mock.patch.object(
+            backend, "_readline",
+            side_effect=ax.DriverError(
+                "DRIVER.TIMEOUT",
+                "synthetic timeout",
+                retryable=True,
+                data={
+                    "helper_channel_failure": True,
+                    "helper_request_dispatched": True,
+                    "keyboard_dispatch_started": False,
+                    "focus_changed": False,
+                    "effect": "not_applied",
+                },
+            ),
+        ):
+            with self.assertRaises(ax.DriverError) as raised:
+                backend.type_text("n", "hello", deadline=deadline())
+        self.assertEqual(raised.exception.code, "DRIVER.TIMEOUT")
+        self.assertFalse(raised.exception.data["keyboard_dispatch_started"])
+        self.assertEqual(raised.exception.data["effect"], "not_applied")
+
+    def test_type_text_rpc_parses_preflight_error_as_not_applied(self) -> None:
+        backend, process = helper_backend()
+        response = json.dumps(
+            {
+                "id": "h1",
+                "error": {
+                    "code": "DRIVER.PROTECTED_ELEMENT",
+                    "message": "secure event input enabled",
+                    "retryable": False,
+                    "data": {
+                        "phase": "secure_event_input_preflight",
+                        "keyboard_dispatch_started": False,
+                        "focus_changed": False,
+                    },
+                },
+            }
+        ).encode()
+        with mock.patch.object(
+            ax.os, "write", side_effect=lambda _fd, data: len(data)
+        ), mock.patch.object(backend, "_readline", return_value=response):
+            with self.assertRaises(ax.DriverError) as raised:
+                backend.type_text("n", "hello", deadline=deadline())
+        self.assertEqual(raised.exception.code, "DRIVER.PROTECTED_ELEMENT")
+        self.assertEqual(raised.exception.data["effect"], "not_applied")
+        self.assertFalse(raised.exception.data["keyboard_dispatch_started"])
+        self.assertFalse(backend._closed)
+        self.assertEqual(process.killed, 0)
+
+    def test_type_text_rpc_parses_focus_only_error_as_contextual(self) -> None:
+        backend, process = helper_backend()
+        response = json.dumps(
+            {
+                "id": "h1",
+                "error": {
+                    "code": "DRIVER.ACTION_FAILED",
+                    "message": "target lost focus before keyboard dispatch",
+                    "retryable": False,
+                    "data": {
+                        "phase": "focus_verification",
+                        "keyboard_dispatch_started": False,
+                        "focus_changed": True,
+                    },
+                },
+            }
+        ).encode()
+        with mock.patch.object(
+            ax.os, "write", side_effect=lambda _fd, data: len(data)
+        ), mock.patch.object(backend, "_readline", return_value=response):
+            with self.assertRaises(ax.DriverError) as raised:
+                backend.type_text("n", "hello", deadline=deadline())
+        self.assertEqual(raised.exception.code, "DRIVER.ACTION_FAILED")
+        self.assertEqual(raised.exception.data["effect"], "contextual")
+        self.assertFalse(raised.exception.data["keyboard_dispatch_started"])
+        self.assertTrue(raised.exception.data["focus_changed"])
+        self.assertFalse(backend._closed)
+        self.assertEqual(process.killed, 0)
+
+    def test_type_text_helper_failure_after_keyboard_dispatch_is_unknown_and_kills_helper(self) -> None:
+        for code in (
+            "DRIVER.ACTION_FAILED",
+            "DRIVER.TIMEOUT",
+            "DRIVER.ACTION_UNSUPPORTED",
+            "DRIVER.PROTECTED_ELEMENT",
+        ):
+            with self.subTest(code=code):
+                backend, process = helper_backend()
+                failure = ax.DriverError(
+                    code,
+                    "synthetic native input failure",
+                    retryable=code == "DRIVER.TIMEOUT",
+                    data={
+                        "helper_request_dispatched": True,
+                        "keyboard_dispatch_started": True,
+                        "focus_changed": True,
+                        "effect": "unknown",
+                    },
+                )
+                with mock.patch.object(backend, "_rpc", side_effect=failure):
+                    with self.assertRaises(ax.DriverError) as raised:
+                        backend.type_text("n", "hello", deadline=deadline())
+                self.assertEqual(raised.exception.code, "DRIVER.UNKNOWN_EFFECT")
+                self.assertTrue(raised.exception.data["helper_request_dispatched"])
+                self.assertTrue(raised.exception.data["keyboard_dispatch_started"])
+                self.assertEqual(raised.exception.data["effect"], "unknown")
+                self.assertTrue(raised.exception.data["helper_terminated"])
+                self.assertTrue(backend._closed)
+                self.assertEqual(process.killed, 1)
+
+    def test_type_text_helper_preflight_error_is_not_applied_and_keeps_helper(self) -> None:
+        backend, process = helper_backend()
+        failure = ax.DriverError(
+            "DRIVER.PROTECTED_ELEMENT",
+            "secure event input enabled",
+            data={
+                "helper_request_dispatched": True,
+                "keyboard_dispatch_started": False,
+                "focus_changed": False,
+                "phase": "secure_event_input_preflight",
+                "effect": "not_applied",
+            },
+        )
+        with mock.patch.object(backend, "_rpc", side_effect=failure):
+            with self.assertRaises(ax.DriverError) as raised:
+                backend.type_text("n", "hello", deadline=deadline())
+        self.assertEqual(raised.exception.code, "DRIVER.PROTECTED_ELEMENT")
+        self.assertEqual(raised.exception.data["effect"], "not_applied")
+        self.assertFalse(raised.exception.data["keyboard_dispatch_started"])
+        self.assertFalse(backend._closed)
+        self.assertEqual(process.killed, 0)
+
+    def test_type_text_success_requires_submitted_dispatch_metadata(self) -> None:
+        backend, _process = helper_backend()
+        valid = {
+            "submitted": True,
+            "native_operation": "CGEventKeyboardSetUnicodeString",
+            "keyboard_dispatch_started": True,
+            "focus_changed": True,
+            "phase": "submitted",
+        }
+        with mock.patch.object(backend, "_rpc", return_value=valid):
+            self.assertEqual(
+                backend.type_text("n", "hello", deadline=deadline()), valid
+            )
+        backend, process = helper_backend()
+        with mock.patch.object(
+            backend, "_rpc",
+            return_value={"accepted": True, "native_operation": "CGEvent"},
+        ):
+            with self.assertRaises(ax.DriverError) as raised:
+                backend.type_text("n", "hello", deadline=deadline())
+        self.assertEqual(raised.exception.code, "DRIVER.ACTION_FAILED")
+        self.assertEqual(process.killed, 1)
+
+    def test_type_text_result_cannot_claim_dispatch_without_progress(self) -> None:
+        backend, process = helper_backend()
+        result_without_progress = json.dumps(
+            {
+                "id": "h1",
+                "result": {
+                    "submitted": True,
+                    "native_operation": "CGEventKeyboardSetUnicodeString",
+                    "keyboard_dispatch_started": True,
+                    "focus_changed": True,
+                    "phase": "submitted",
+                },
+            }
+        ).encode()
+        with mock.patch.object(
+            ax.os, "write", side_effect=lambda _fd, data: len(data)
+        ), mock.patch.object(backend, "_readline", return_value=result_without_progress):
+            with self.assertRaises(ax.DriverError) as raised:
+                backend.type_text("n", "hello", deadline=deadline())
+        self.assertEqual(raised.exception.code, "DRIVER.UNKNOWN_EFFECT")
+        self.assertTrue(raised.exception.data["keyboard_dispatch_started"])
         self.assertEqual(raised.exception.data["effect"], "unknown")
         self.assertTrue(backend._closed)
         self.assertEqual(process.killed, 1)
@@ -881,6 +1379,21 @@ class MacOSAXSourceContracts(unittest.TestCase):
             "AXUIElementPerformAction",
             "AXUIElementSetMessagingTimeout",
             "CFEqual(previous, current)",
+            'case "type_text"',
+            "CGEvent(keyboardEventSource: nil",
+            "keyboardSetUnicodeString",
+            "keyDown.postToPid(targetPID)",
+            "keyUp.postToPid(targetPID)",
+            "maximumUnicodeUnitsPerEvent = 20",
+            "CharacterSet.controlCharacters",
+            "NSWorkspace.shared.frontmostApplication",
+            "AX target lost focus during keyboard input",
+            "import Carbon.HIToolbox",
+            "IsSecureEventInputEnabled()",
+            '"keyboard_dispatch_started": progress.keyboardDispatchStarted',
+            '"submitted": true',
+            "emitProgress(",
+            'phase: "focus_changed"',
         ):
             with self.subTest(marker=marker):
                 self.assertIn(marker, source)
@@ -896,6 +1409,23 @@ class MacOSAXSourceContracts(unittest.TestCase):
                 self.assertNotIn(forbidden, source)
         self.assertLess(source.index("isSettable(element, kAXFocusedAttribute"), source.index("AXUIElementSetAttributeValue(\n            element, kAXFocusedAttribute"))
         self.assertLess(source.index("copyActionNames(element).contains(kAXPressAction"), source.index("AXUIElementPerformAction(element"))
+        type_text_source = source[source.index("private func typeText") :]
+        self.assertLess(
+            type_text_source.index("AXUIElementSetAttributeValue("),
+            type_text_source.index("keyDown.postToPid(targetPID)"),
+        )
+        self.assertLess(
+            type_text_source.index("AX target did not become focused"),
+            type_text_source.index("keyDown.postToPid(targetPID)"),
+        )
+        self.assertLess(
+            type_text_source.index("IsSecureEventInputEnabled()"),
+            type_text_source.index("keyDown.postToPid(targetPID)"),
+        )
+        self.assertLess(
+            type_text_source.index("emitProgress("),
+            type_text_source.index("keyDown.postToPid(targetPID)"),
+        )
         for marker in (
             "input.readData(ofLength: 65_536)",
             "buffer.count > maximumInputBytes",
@@ -918,6 +1448,7 @@ class MacOSAXSourceContracts(unittest.TestCase):
             "dev.ai-auto-desktop.macos-ax-helper",
             "codesign --force --sign",
             "codesign --verify --strict",
+            "-framework Carbon",
         ):
             with self.subTest(marker=marker):
                 self.assertIn(marker, source)

@@ -6,7 +6,12 @@
 测试通过系统 `xcrun`/`swiftc` 构建固定 bundle ID、ad-hoc 签名的 AppKit fixture 和
 AX runner。授权可用时，runner 只从 fixture PID 创建 `AXUIElement`，进行有界遍历与唯一
 定位，然后验证 `AXFocused`、`AXValue`、`AXPress`；每个动作的成功都必须由新一次 AX
-读取确认，不能只依赖写 API 的返回码。每个被访问的 AX element 还会设置消息超时，避免
+读取确认，不能只依赖写 API 的返回码。套件也按 `type_text` 的显式 CGEvent 路径分段覆盖
+ASCII、中文和非 BMP emoji；每段输入前重新解析 AX 目标并确认 focus/前台，输入后以 fresh
+snapshot 验证累计值。每段还在首事件前记录 `IsSecureEventInputEnabled()`，启用时 fail closed。
+`NSSecureTextField` 负向 case 在任何事件发布前拒绝 secure text；报告只声明事件已提交，不把
+void `postToPid` 当成接收确认。
+每个被访问的 AX element 还会设置消息超时，避免
 目标进程无响应时无限等待。
 runner 由 LaunchServices 以固定 `.app` 身份启动，并将报告原子写入结果目录；外层脚本
 根据报告中的状态归一退出码，而不把 `open` 的状态误当成 AX 测试结果。
@@ -33,6 +38,10 @@ runner 由 LaunchServices 以固定 `.app` 身份启动，并将报告原子写�
 
 这是一条真机 fixture 验证链路，不等同于对任意第三方应用、锁屏、安全输入、跨用户会话
 或完整 macOS 平台兼容性的资格声明。Linux 机器只能对 shell 和源码结构进行静态检查。
+真机 kit 已实现 `desktop.macos_ax.type_text@1` 对应的 Unicode 和 secure text case；在真实 Mac
+生成 `passed` 报告前，仍不能把它写成已经通过资格验证。该验证只需 Accessibility，不请求
+Screen Recording，不加入 pointer 或 `set_value` 自动 fallback。fixture、runner 与说明均已纳入
+`tests/macos/SOURCE_PACKAGE_FILES.txt` 白名单。
 
 需要把真机套件交给仓库外的 Mac 时，在 `tests/macos/` 执行：
 

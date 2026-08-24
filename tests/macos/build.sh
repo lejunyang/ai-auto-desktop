@@ -101,7 +101,8 @@ build_runner() {
     mkdir -p "$runner_app/Contents/MacOS"
     write_runner_plist "$runner_app/Contents/Info.plist"
     if ! "$swiftc_path" -O -sdk "$sdk_path" -target "$target" \
-        -framework AppKit -framework ApplicationServices -framework CoreGraphics \
+        -framework AppKit -framework ApplicationServices -framework Carbon \
+        -framework CoreGraphics \
         "$script_dir/AXTestRunner.swift" \
         -o "$runner_app/Contents/MacOS/AiAutoDesktopAXRunner"; then
         printf '%s\n' '失败：AX runner 编译失败。' >&2

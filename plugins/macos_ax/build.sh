@@ -45,6 +45,7 @@ mkdir -p "$contents/MacOS"
     -target "$target" \
     -framework AppKit \
     -framework ApplicationServices \
+    -framework Carbon \
     "$script_dir/swift/MacOSAXHelper.swift" \
     -o "$executable"
 

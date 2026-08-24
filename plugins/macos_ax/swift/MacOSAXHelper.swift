@@ -1,12 +1,16 @@
 import AppKit
 import ApplicationServices
+import Carbon.HIToolbox
 import Darwin
 import Foundation
 
-private let protocolVersion = 1
+private let protocolVersion = 2
 private let maximumInputBytes = 1_048_576
 private let maximumOutputBytes = 8 * 1_024 * 1_024 - 1
 private let maximumFieldCharacters = 4_096
+private let maximumTypeTextScalars = 1_024
+private let maximumTypeTextUTF16Units = maximumTypeTextScalars * 2
+private let maximumUnicodeUnitsPerEvent = 20
 private let maximumDepth = 128
 private let maximumNodes = 5_000
 
@@ -26,6 +30,27 @@ private struct HelperFailure: Error {
         self.message = message
         self.retryable = retryable
         self.data = data
+    }
+}
+
+private final class RequestProgress {
+    private(set) var keyboardDispatchStarted = false
+    private(set) var focusChanged = false
+
+    func markFocusChanged() {
+        focusChanged = true
+    }
+
+    func markKeyboardDispatchStarted() {
+        keyboardDispatchStarted = true
+    }
+
+    func metadata(phase: String) -> [String: Any] {
+        [
+            "phase": phase,
+            "keyboard_dispatch_started": keyboardDispatchStarted,
+            "focus_changed": focusChanged,
+        ]
     }
 }
 
@@ -126,7 +151,10 @@ private final class TokenStore {
 private final class AXService {
     private let tokens = TokenStore()
 
-    func execute(operation: String, args: [String: Any], deadlineMS: Double?) throws -> Any {
+    func execute(
+        operation: String, args: [String: Any], deadlineMS: Double?,
+        requestID: String, progress: RequestProgress
+    ) throws -> Any {
         try checkDeadline(deadlineMS)
         switch operation {
         case "status":
@@ -150,6 +178,11 @@ private final class AXService {
             return try invoke(args: Arguments(values: args), deadlineMS: deadlineMS)
         case "set_value":
             return try setValue(args: Arguments(values: args), deadlineMS: deadlineMS)
+        case "type_text":
+            return try typeText(
+                args: Arguments(values: args), deadlineMS: deadlineMS,
+                requestID: requestID, progress: progress
+            )
         default:
             throw HelperFailure(
                 "DRIVER.INVALID_REQUEST",
@@ -335,6 +368,9 @@ private final class AXService {
         if focusSettable && enabled != false { actions.append("focus") }
         if actionNames.contains(kAXPressAction as String) && enabled != false { actions.append("invoke") }
         if valueSettable && !protected && enabled != false { actions.append("set_value") }
+        if isKeyboardTextTarget(role: role) && focusSettable && !protected && enabled != false {
+            actions.append("type_text")
+        }
         var provenance: [String: Any] = [
             "ax_role": role,
             "process_id": app["process_id"] ?? NSNull(),
@@ -457,6 +493,193 @@ private final class AXService {
         )
         try requireSuccess(error, operation: "AXUIElementSetAttributeValue(AXValue)")
         return ["native_operation": "AXValue", "accepted": true]
+    }
+
+    private func typeText(
+        args: Arguments, deadlineMS: Double?, requestID: String,
+        progress: RequestProgress
+    ) throws -> [String: Any] {
+        try args.only(["native_token", "text"])
+        try requireTrusted()
+        let text = try args.string("text")!
+        guard !text.isEmpty, text.unicodeScalars.count <= maximumTypeTextScalars,
+              text.utf16.count <= maximumTypeTextUTF16Units else {
+            throw HelperFailure(
+                "DRIVER.INVALID_REQUEST",
+                "helper args.text exceeds the keyboard input bound"
+            )
+        }
+        guard !text.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) }) else {
+            throw HelperFailure("DRIVER.INVALID_REQUEST", "helper args.text contains a control character")
+        }
+        let element = try tokens.resolve(try args.string("native_token")!)
+        try configureTimeout(element, deadlineMS: deadlineMS)
+        let role = stringAttribute(element, kAXRoleAttribute as CFString)
+        let subrole = stringAttribute(element, kAXSubroleAttribute as CFString)
+        if role == "AXSecureTextField" || subrole == "AXSecureTextField" {
+            throw HelperFailure("DRIVER.PROTECTED_ELEMENT", "keyboard input target is protected")
+        }
+        guard let resolvedRole = role else {
+            throw HelperFailure(
+                "DRIVER.ACTION_UNSUPPORTED",
+                "target is not an eligible text input role",
+                data: ["role": NSNull()]
+            )
+        }
+        guard isKeyboardTextTarget(role: resolvedRole) else {
+            throw HelperFailure(
+                "DRIVER.ACTION_UNSUPPORTED",
+                "target is not an eligible text input role",
+                data: ["role": resolvedRole]
+            )
+        }
+        guard boolAttribute(element, kAXEnabledAttribute as CFString) != false else {
+            throw HelperFailure(
+                "DRIVER.ACTION_UNSUPPORTED", "keyboard input target is disabled",
+                data: progress.metadata(phase: "target_preflight")
+            )
+        }
+        guard IsSecureEventInputEnabled() == 0 else {
+            throw HelperFailure(
+                "DRIVER.PROTECTED_ELEMENT",
+                "macOS Secure Event Input is enabled",
+                data: progress.metadata(phase: "secure_event_input_preflight")
+            )
+        }
+        guard isSettable(element, kAXFocusedAttribute as CFString) else {
+            throw HelperFailure(
+                "DRIVER.ACTION_UNSUPPORTED",
+                "AXFocused is not settable",
+                data: [
+                    "attribute": "AXFocused",
+                    "phase": "focus_preflight",
+                    "keyboard_dispatch_started": false,
+                    "focus_changed": false,
+                    "effect": "not_applied",
+                ]
+            )
+        }
+        var targetPID = pid_t(0)
+        let pidError = AXUIElementGetPid(element, &targetPID)
+        try requireSuccess(pidError, operation: "AXUIElementGetPid")
+        guard targetPID > 0 else {
+            throw HelperFailure("DRIVER.ACTION_FAILED", "keyboard input target has no valid process id")
+        }
+        try requireFrontmost(targetPID)
+
+        try checkDeadline(deadlineMS)
+        // From this marker until AX focus returns, the target's focus may have
+        // changed, but no keyboard event has been submitted.
+        progress.markFocusChanged()
+        emitProgress(
+            id: requestID, phase: "focus_changed",
+            keyboardDispatchStarted: false, focusChanged: true
+        )
+        let focusError = AXUIElementSetAttributeValue(
+            element, kAXFocusedAttribute as CFString, kCFBooleanTrue
+        )
+        try requireSuccess(focusError, operation: "AXUIElementSetAttributeValue(AXFocused)")
+        guard boolAttribute(element, kAXFocusedAttribute as CFString) == true else {
+            throw HelperFailure(
+                "DRIVER.ACTION_FAILED", "AX target did not become focused",
+                data: progress.metadata(phase: "focus_verification")
+            )
+        }
+        try requireFrontmost(targetPID)
+        try checkDeadline(deadlineMS)
+
+        let utf16 = Array(text.utf16)
+        var offset = 0
+        while offset < utf16.count {
+            try requireFrontmost(targetPID)
+            guard IsSecureEventInputEnabled() == 0 else {
+                throw HelperFailure(
+                    "DRIVER.PROTECTED_ELEMENT",
+                    "macOS Secure Event Input became enabled before keyboard dispatch",
+                    data: progress.metadata(phase: "secure_event_input_preflight")
+                )
+            }
+            guard boolAttribute(element, kAXFocusedAttribute as CFString) == true else {
+                throw HelperFailure(
+                    "DRIVER.ACTION_FAILED",
+                    "AX target lost focus during keyboard input"
+                )
+            }
+            try checkDeadline(deadlineMS)
+            var end = min(offset + maximumUnicodeUnitsPerEvent, utf16.count)
+            if end < utf16.count, isHighSurrogate(utf16[end - 1]) { end -= 1 }
+            guard end > offset else {
+                throw HelperFailure("DRIVER.INVALID_REQUEST", "could not form a Unicode keyboard chunk")
+            }
+            let chunk = Array(utf16[offset..<end])
+            try postUnicodeKeyboardChunk(
+                chunk, targetPID: targetPID, requestID: requestID, progress: progress
+            )
+            offset = end
+        }
+        try checkDeadline(deadlineMS)
+        return [
+            "native_operation": "CGEventKeyboardSetUnicodeString",
+            "submitted": true,
+            "keyboard_dispatch_started": progress.keyboardDispatchStarted,
+            "focus_changed": progress.focusChanged,
+            "phase": "submitted",
+        ]
+    }
+
+    private func requireFrontmost(_ targetPID: pid_t) throws {
+        guard NSWorkspace.shared.frontmostApplication?.processIdentifier == targetPID else {
+            throw HelperFailure(
+                "DRIVER.ACTION_FAILED",
+                "keyboard input requires the selected application to remain frontmost",
+                data: ["reason": "target_not_frontmost"]
+            )
+        }
+    }
+
+    private func isKeyboardTextTarget(role: String) -> Bool {
+        ["AXTextField", "AXTextArea", "AXComboBox"].contains(role)
+    }
+
+    private func isHighSurrogate(_ value: UInt16) -> Bool {
+        value >= 0xD800 && value <= 0xDBFF
+    }
+
+    private func postUnicodeKeyboardChunk(
+        _ utf16: [UInt16], targetPID: pid_t, requestID: String,
+        progress: RequestProgress
+    ) throws {
+        guard !utf16.isEmpty, utf16.count <= maximumUnicodeUnitsPerEvent else {
+            throw HelperFailure("DRIVER.INVALID_REQUEST", "Unicode keyboard chunk is outside its bound")
+        }
+        guard let keyDown = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: true),
+              let keyUp = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: false) else {
+            throw HelperFailure("DRIVER.ACTION_FAILED", "could not create Unicode keyboard events")
+        }
+        utf16.withUnsafeBufferPointer { buffer in
+            keyDown.keyboardSetUnicodeString(
+                stringLength: buffer.count, unicodeString: buffer.baseAddress
+            )
+            keyUp.keyboardSetUnicodeString(
+                stringLength: buffer.count, unicodeString: buffer.baseAddress
+            )
+        }
+        guard IsSecureEventInputEnabled() == 0 else {
+            throw HelperFailure(
+                "DRIVER.PROTECTED_ELEMENT",
+                "macOS Secure Event Input became enabled before keyboard dispatch",
+                data: progress.metadata(phase: "secure_event_input_preflight")
+            )
+        }
+        if !progress.keyboardDispatchStarted {
+            progress.markKeyboardDispatchStarted()
+            emitProgress(
+                id: requestID, phase: "keyboard_dispatch",
+                keyboardDispatchStarted: true, focusChanged: progress.focusChanged
+            )
+        }
+        keyDown.postToPid(targetPID)
+        keyUp.postToPid(targetPID)
     }
 
     private func configureTimeout(_ element: AXUIElement, deadlineMS: Double?) throws {
@@ -610,6 +833,19 @@ private func emitFailure(_ failure: HelperFailure, id: Any) {
     emit(["id": id, "error": error])
 }
 
+private func emitProgress(
+    id: String, phase: String, keyboardDispatchStarted: Bool, focusChanged: Bool
+) {
+    emit([
+        "id": id,
+        "progress": [
+            "phase": phase,
+            "keyboard_dispatch_started": keyboardDispatchStarted,
+            "focus_changed": focusChanged,
+        ],
+    ])
+}
+
 private func serve(_ service: AXService) {
     let input = FileHandle.standardInput
     var buffer = Data()
@@ -682,8 +918,36 @@ private func handleFrame(_ data: Data, service: AXService) {
             throw HelperFailure("PROTOCOL.INVALID_REQUEST", "helper deadline_ms must be finite numeric epoch milliseconds")
         }
         let deadlineMS = deadlineNumber.doubleValue
-        let result = try service.execute(operation: operation, args: args, deadlineMS: deadlineMS)
-        emit(["id": identifier, "result": result])
+        let progress = RequestProgress()
+        do {
+            let result = try service.execute(
+                operation: operation, args: args, deadlineMS: deadlineMS,
+                requestID: identifier, progress: progress
+            )
+            emit(["id": identifier, "result": result])
+        } catch let failure as HelperFailure {
+            guard operation == "type_text" else { throw failure }
+            var data = failure.data
+            for (key, value) in progress.metadata(phase: data["phase"] as? String ?? "pre_dispatch")
+                where data[key] == nil {
+                data[key] = value
+            }
+            throw HelperFailure(
+                failure.code, failure.message, retryable: failure.retryable, data: data
+            )
+        } catch {
+            guard operation == "type_text" else { throw error }
+            throw HelperFailure(
+                "DRIVER.ACTION_FAILED",
+                "unexpected native helper failure",
+                data: [
+                    "exception_type": String(describing: type(of: error)),
+                    "phase": progress.keyboardDispatchStarted ? "keyboard_dispatch" : "pre_dispatch",
+                    "keyboard_dispatch_started": progress.keyboardDispatchStarted,
+                    "focus_changed": progress.focusChanged,
+                ]
+            )
+        }
     } catch let failure as HelperFailure {
         emitFailure(failure, id: requestID)
     } catch {

@@ -1,7 +1,8 @@
 # macOS AX 进程驱动
 
 `desktop.macos_ax` 是 macOS 原生 Accessibility API（AX）能力的进程驱动。它提供
-`list_apps`、`snapshot`、`find`、`focus`、`invoke` 和 `set_value` 六个 v1 动作。
+`list_apps`、`snapshot`、`find`、`focus`、`invoke`、`set_value` 和显式键盘输入
+`type_text` 七个 v1 动作。
 
 当前状态必须准确理解为：**跨平台协议核心和 native helper 源码已实现，但尚未在本仓库的
 macOS CI/真机上完成编译及资格验证**。Linux 等非 macOS 主机只运行 fake backend 契约测试；
@@ -72,18 +73,42 @@ helper 始终报告 `helper_security.source=custom_untrusted` 和
 AX 树、重新定位，并通过 helper 内的 `CFEqual` 比较原生对象身份；任一步无法证明一致时都在
 派发前失败。`invoke` 可能非幂等，返回 `DRIVER.UNKNOWN_EFFECT` 时不得自动重试。
 
+`desktop.macos_ax.type_text@1` 必须由调用方显式选择；`set_value` 失败时绝不会自动
+fallback。它接收 `target`、`locator` 和 `text`，只允许 1–1024 个 Unicode 标量且不超过
+2048 个 UTF-16 code units 的
+非控制字符文本。helper 在目标应用保持前台时先设置并确认 `AXFocused`，随后通过
+`CGEventKeyboardSetUnicodeString` 向目标 PID 提交 Unicode 键盘事件。成功仅表示调用已提交，
+不证明应用已经接收或处理文本。示例（`target` 来自当前
+快照的 `find`）：
+
+```json
+{"type":"invoke","id":"t1","action":"desktop.macos_ax.type_text@1","args":{"target":{"snapshot_id":"...","revision":1,"node_id":"n3"},"locator":{"identifier":"title"},"text":"你好 macOS"}}
+```
+
 ## 明确边界
 
 - 不支持模糊、contains 或正则定位；所有字段区分大小写并精确相等。
 - 截断快照不能用于 `find` 或写动作。
-- 密码/secure text 的值不读取、不回传，也不允许 `set_value`。
+- 密码/secure text 的值不读取、不回传，也不允许 `set_value` 或 `type_text`。
 - 不调用 `AXUIElementCreateSystemWide`，每棵树都限定在一个精确选中的 PID。
-- 不请求屏幕录制权限、不截图、不调用 AppleScript、不注入键盘/指针事件。
+- `type_text` 需要 Accessibility 权限，不需要 Screen Recording；目标应用必须保持前台，
+  不会自动激活应用。驱动不截图、不调用 AppleScript、不注入 pointer 事件。
+- `type_text` 只对 `AXTextField`、`AXTextArea`、`AXComboBox` 暴露，拒绝空文本、NUL、
+  C0/C1 控制字符、孤立 surrogate 和超过上限的输入；换行或 Tab 应使用未来单独的按键动作。
+- helper 在首个 `keyDown.postToPid` 前检查系统 `IsSecureEventInputEnabled()`；启用时 fail closed，
+  明确返回 `keyboard_dispatch_started=false` / `not_applied`。
+- 完整 NDJSON 请求本身不代表键盘已派发。helper 仅在首个 key-down 前发出
+  `keyboard_dispatch_started=true` marker；只有越过该边界后的失败或 timeout 才归一为
+  `DRIVER.UNKNOWN_EFFECT` 并 kill helper。焦点已经改变但尚未发键时报告 `focus_changed=true` /
+  `effect=contextual`；helper 在确认焦点后先发送独立进度帧，因此随后 timeout 也不会声称文本
+  可能已输入。
+- `type_text` 不是密码输入、快捷键或粘贴接口：文本会经过进程间 NDJSON，调用方不得把
+  secret 作为普通文本传入。
 - AX API 是同步 API；helper 为每个 element 设置不超过请求剩余时间的 messaging timeout，
   外层进程超时仍是最终硬边界。
 - helper 私有 stdin 和 stdout 都有硬帧上限。响应 timeout、EOF、协议错误或超限会立即
-  kill helper，通道不能复用。写请求完整写入后发生这些错误会归一为
-  `DRIVER.UNKNOWN_EFFECT`；完整帧写入前的 pipe 错误仍是 `not_applied`。
+  kill helper，通道不能复用。一般 AX 写请求完整写入后的通道失败仍可能是 unknown；
+  `type_text` 以独立的 `keyboard_dispatch_started` marker 判断文本效果。
 - 当前源码没有经过 macOS 真机构建、TCC、Intel/Apple Silicon、多显示器或第三方应用验证，
   因此不能据此声明平台资格已完成。
 

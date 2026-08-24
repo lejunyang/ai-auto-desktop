@@ -1,5 +1,6 @@
 import AppKit
 import ApplicationServices
+import Carbon.HIToolbox
 import CoreGraphics
 import Darwin
 import Foundation
@@ -7,7 +8,9 @@ import Foundation
 private let fixtureBundleID = "dev.ai-auto-desktop.testkit.fixture"
 private let runnerBundleID = "dev.ai-auto-desktop.testkit.ax-runner"
 private let testValue = "AX updated value"
-private let expectedStatus = "Status: pressed: AX updated value"
+private let typeTextValue = "ASCII 中文 😀"
+private let expectedStatus = "Status: pressed: \(typeTextValue)"
+private let maximumUnicodeUnitsPerEvent = 20
 private let axMessageTimeout: Float = 1.0
 private var reportIdentityStability = "unknown"
 
@@ -25,6 +28,7 @@ private struct Arguments {
 private struct Node {
     let element: AXUIElement
     let role: String?
+    let subrole: String?
     let title: String?
     let identifier: String?
     let value: String?
@@ -126,6 +130,48 @@ private func actions(_ element: AXUIElement) -> (AXError, [String]) {
     return (.success, result)
 }
 
+private struct TypeTextDispatch {
+    let submitted: Bool
+    let utf16UnitsPosted: Int
+}
+
+private func typeTextTargetIsEligible(_ node: Node) -> Bool {
+    let protected = node.role == "AXSecureTextField" || node.subrole == "AXSecureTextField"
+    return !protected && ["AXTextField", "AXTextArea", "AXComboBox"].contains(node.role ?? "")
+}
+
+private func postUnicodeText(_ text: String, to pid: pid_t) -> TypeTextDispatch {
+    let utf16 = Array(text.utf16)
+    guard !utf16.isEmpty else {
+        return TypeTextDispatch(submitted: false, utf16UnitsPosted: 0)
+    }
+    var offset = 0
+    while offset < utf16.count {
+        var end = min(offset + maximumUnicodeUnitsPerEvent, utf16.count)
+        if end < utf16.count, utf16[end - 1] >= 0xD800, utf16[end - 1] <= 0xDBFF {
+            end -= 1
+        }
+        guard end > offset,
+              let keyDown = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: true),
+              let keyUp = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: false) else {
+            return TypeTextDispatch(submitted: false, utf16UnitsPosted: offset)
+        }
+        let chunk = Array(utf16[offset..<end])
+        chunk.withUnsafeBufferPointer { buffer in
+            keyDown.keyboardSetUnicodeString(
+                stringLength: buffer.count, unicodeString: buffer.baseAddress
+            )
+            keyUp.keyboardSetUnicodeString(
+                stringLength: buffer.count, unicodeString: buffer.baseAddress
+            )
+        }
+        keyDown.postToPid(pid)
+        keyUp.postToPid(pid)
+        offset = end
+    }
+    return TypeTextDispatch(submitted: true, utf16UnitsPosted: offset)
+}
+
 private func attribute<T>(
     _ element: AXUIElement,
     _ name: CFString,
@@ -205,13 +251,23 @@ private func snapshot(_ root: AXUIElement, maxDepth: Int, maxNodes: Int) -> Snap
             continue
         }
         visited.append(element)
+        let role: String? = attribute(
+            element, kAXRoleAttribute as CFString, as: String.self, errors: &axErrors
+        )
+        let subrole: String? = attribute(
+            element, kAXSubroleAttribute as CFString, as: String.self, errors: &axErrors
+        )
+        let protected = role == "AXSecureTextField" || subrole == "AXSecureTextField"
         nodes.append(
             Node(
                 element: element,
-                role: attribute(element, kAXRoleAttribute as CFString, as: String.self, errors: &axErrors),
+                role: role,
+                subrole: subrole,
                 title: attribute(element, kAXTitleAttribute as CFString, as: String.self, errors: &axErrors),
                 identifier: attribute(element, kAXIdentifierAttribute as CFString, as: String.self, errors: &axErrors),
-                value: attribute(element, kAXValueAttribute as CFString, as: String.self, errors: &axErrors),
+                value: protected ? nil : attribute(
+                    element, kAXValueAttribute as CFString, as: String.self, errors: &axErrors
+                ),
                 focused: attribute(element, kAXFocusedAttribute as CFString, as: Bool.self, errors: &axErrors) ?? false
             )
         )
@@ -586,6 +642,7 @@ private func run(arguments parsedArguments: Arguments? = nil) -> Outcome {
     while Date() < launchDeadline {
         let candidate = freshSnapshot()
         if findOne(candidate, identifier: "fixture-input") != nil,
+           findOne(candidate, identifier: "fixture-secure-input") != nil,
            findOne(candidate, identifier: "fixture-apply") != nil,
            findOne(candidate, identifier: "fixture-status") != nil {
             initial = candidate
@@ -597,9 +654,10 @@ private func run(arguments parsedArguments: Arguments? = nil) -> Outcome {
 
     guard let initial,
           let initialInput = findOne(initial, identifier: "fixture-input"),
+          let initialSecureInput = findOne(initial, identifier: "fixture-secure-input"),
           let initialButton = findOne(initial, identifier: "fixture-apply"),
           let initialStatus = findOne(initial, identifier: "fixture-status") else {
-        checks.append(["id": "bounded_discovery", "status": "fail", "message": "未在时限内唯一定位三个 fixture 控件"])
+        checks.append(["id": "bounded_discovery", "status": "fail", "message": "未在时限内唯一定位四个 fixture 控件"])
         return Outcome(
             report: makeReport(
                 status: "failed",
@@ -631,8 +689,11 @@ private func run(arguments parsedArguments: Arguments? = nil) -> Outcome {
             exitCode: 1
         )
     }
+    let secureRoleAccepted = initialSecureInput.role == kAXTextFieldRole as String
+        || initialSecureInput.role == "AXSecureTextField"
     guard initial.axErrors.isEmpty,
           initialInput.role == kAXTextFieldRole as String,
+          secureRoleAccepted,
           initialButton.role == kAXButtonRole as String,
           initialStatus.role == kAXStaticTextRole as String else {
         checks.append([
@@ -686,6 +747,25 @@ private func run(arguments parsedArguments: Arguments? = nil) -> Outcome {
         "id": "roles_and_ambiguity", "status": "pass",
         "message": "角色正确，且可见标题存在两个候选；identifier 可唯一定位",
     ])
+
+    let secureRejected = !typeTextTargetIsEligible(initialSecureInput)
+    checks.append([
+        "id": "type_text_secure_rejected",
+        "status": secureRejected ? "pass" : "fail",
+        "message": "secure text 目标在任何键盘事件前被 role/subrole 检查拒绝",
+        "evidence": [
+            "event_post_attempted": false,
+            "protected": secureRejected,
+            "value_read": false,
+        ],
+    ])
+    guard secureRejected else {
+        return Outcome(report: makeReport(
+            status: "failed", message: "secure text rejection verification failed",
+            promptRequested: args.promptAccessibility, accessibilityTrusted: true,
+            screenCaptureGranted: screenCaptureGranted, checks: checks
+        ), exitCode: 1)
+    }
 
     guard let focusInput = freshNode(
         identifier: "fixture-input", role: kAXTextFieldRole as String
@@ -761,6 +841,113 @@ private func run(arguments parsedArguments: Arguments? = nil) -> Outcome {
                 screenCaptureGranted: screenCaptureGranted, checks: checks
             ), exitCode: 1
         )
+    }
+
+    let typeTextSegments = ["ASCII ", "中文 ", "😀"]
+    var expectedTypedValue = ""
+    var typeTextPassed = true
+    var typeTextEvidence: [[String: Any]] = []
+    for (index, segment) in typeTextSegments.enumerated() {
+        guard let typeInput = freshNode(
+            identifier: "fixture-input", role: kAXTextFieldRole as String
+        ), typeTextTargetIsEligible(typeInput) else {
+            typeTextPassed = false
+            typeTextEvidence.append([
+                "segment_index": index, "fresh_target": false,
+                "value_matches": false,
+            ])
+            break
+        }
+        let (typeValuePreflightError, typeValueSettable) = settable(
+            typeInput.element, kAXValueAttribute as CFString
+        )
+        let (typeFocusPreflightError, typeFocusSettable) = settable(
+            typeInput.element, kAXFocusedAttribute as CFString
+        )
+        guard typeValuePreflightError == .success && typeValueSettable,
+              typeFocusPreflightError == .success && typeFocusSettable else {
+            typeTextPassed = false
+            typeTextEvidence.append([
+                "segment_index": index, "fresh_target": true,
+                "value_settable": typeValueSettable,
+                "value_ax_error": typeValuePreflightError.rawValue,
+                "focus_settable": typeFocusSettable,
+                "focus_ax_error": typeFocusPreflightError.rawValue,
+            ])
+            break
+        }
+        var clearError = AXError.success
+        if index == 0 {
+            clearError = AXUIElementSetAttributeValue(
+                typeInput.element, kAXValueAttribute as CFString, "" as CFString
+            )
+        }
+        let typeFocusError = AXUIElementSetAttributeValue(
+            typeInput.element, kAXFocusedAttribute as CFString, kCFBooleanTrue
+        )
+        Thread.sleep(forTimeInterval: 0.05)
+        let beforeType = freshSnapshot()
+        let focusVerified = !beforeType.truncated
+            && beforeType.axErrors.isEmpty
+            && findOne(beforeType, identifier: "fixture-input")?.focused == true
+        let frontmost = NSWorkspace.shared.frontmostApplication?.processIdentifier == fixturePID
+        let secureEventInputEnabled = IsSecureEventInputEnabled() != 0
+        var dispatch = TypeTextDispatch(submitted: false, utf16UnitsPosted: 0)
+        if clearError == .success && typeFocusError == .success
+            && focusVerified && frontmost && !secureEventInputEnabled {
+            dispatch = postUnicodeText(segment, to: fixturePID)
+        }
+        expectedTypedValue += segment
+        var observedValue: String?
+        var postconditionErrors: [Int] = []
+        let typeDeadline = Date().addingTimeInterval(2)
+        while Date() < typeDeadline {
+            let afterType = freshSnapshot()
+            postconditionErrors = afterType.axErrors
+            observedValue = nil
+            if !afterType.truncated && afterType.axErrors.isEmpty {
+                observedValue = findOne(
+                    afterType, identifier: "fixture-input"
+                )?.value
+            }
+            if observedValue == expectedTypedValue { break }
+            Thread.sleep(forTimeInterval: 0.05)
+        }
+        let segmentPassed = dispatch.submitted && observedValue == expectedTypedValue
+        typeTextEvidence.append([
+            "segment_index": index,
+            "kind": index == 0 ? "ascii" : index == 1 ? "cjk" : "non_bmp",
+            "fresh_target": true,
+            "focus_verified_before_dispatch": focusVerified,
+            "frontmost_before_dispatch": frontmost,
+            "secure_event_input_enabled_before_dispatch": secureEventInputEnabled,
+            "secure_event_input_checked_before_dispatch": true,
+            "event_submitted": dispatch.submitted,
+            "utf16_units_posted": dispatch.utf16UnitsPosted,
+            "value_matches_from_fresh_snapshot": observedValue == expectedTypedValue,
+            "postcondition_ax_errors": postconditionErrors,
+        ])
+        if !segmentPassed {
+            typeTextPassed = false
+            break
+        }
+    }
+    typeTextPassed = typeTextPassed && expectedTypedValue == typeTextValue
+    checks.append([
+        "id": "type_text_unicode_and_reread",
+        "status": typeTextPassed ? "pass" : "fail",
+        "message": "逐段发送 ASCII、中文和非 BMP Unicode，并分别从新快照验证累计值",
+        "evidence": [
+            "cases": typeTextEvidence,
+            "expected_utf16_units": typeTextValue.utf16.count,
+        ],
+    ])
+    guard typeTextPassed else {
+        return Outcome(report: makeReport(
+            status: "failed", message: "type text verification failed",
+            promptRequested: args.promptAccessibility, accessibilityTrusted: true,
+            screenCaptureGranted: screenCaptureGranted, checks: checks
+        ), exitCode: 1)
     }
 
     guard let pressButton = freshNode(

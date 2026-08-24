@@ -206,6 +206,73 @@ class MacOSTestkitSourceContracts(unittest.TestCase):
             with self.subTest(marker=marker):
                 self.assertIn(marker, self.runner)
 
+    def test_type_text_covers_unicode_fresh_snapshots_and_secure_rejection(self) -> None:
+        for marker in (
+            'private let typeTextValue = "ASCII 中文 😀"',
+            'let typeTextSegments = ["ASCII ", "中文 ", "😀"]',
+            'identifier: "fixture-input", role: kAXTextFieldRole as String',
+            "focus_verified_before_dispatch",
+            "value_matches_from_fresh_snapshot",
+            'let afterType = freshSnapshot()',
+            'private func postUnicodeText(_ text: String, to pid: pid_t) -> TypeTextDispatch',
+            "private func typeTextTargetIsEligible(_ node: Node) -> Bool",
+            "keyboardSetUnicodeString",
+            "keyDown.postToPid(pid)",
+            "keyUp.postToPid(pid)",
+            'identifier: "fixture-secure-input"',
+            '"id": "type_text_secure_rejected"',
+            "let secureRejected = !typeTextTargetIsEligible(initialSecureInput)",
+            '"event_post_attempted": false',
+            '"value_read": false',
+            '"utf16_units_posted": dispatch.utf16UnitsPosted',
+            '"event_submitted": dispatch.submitted',
+            "IsSecureEventInputEnabled()",
+            "secure_event_input_enabled_before_dispatch",
+            "secure_event_input_checked_before_dispatch",
+            "let protected = role == \"AXSecureTextField\"",
+        ):
+            with self.subTest(marker=marker):
+                self.assertIn(marker, self.runner)
+        self.assertIn(
+            "secureInput = NSSecureTextField(",
+            self.fixture,
+        )
+        self.assertIn(
+            'secureInput.stringValue = "fixture-secret"',
+            self.fixture,
+        )
+        self.assertIn(
+            "value: protected ? nil : attribute(",
+            self.runner,
+        )
+        self.assertLess(
+            self.runner.index("let protected = role == \"AXSecureTextField\""),
+            self.runner.index("value: protected ? nil : attribute("),
+        )
+        type_text_block = self.runner[
+            self.runner.index("let typeTextSegments") :
+            self.runner.index("guard let pressButton")
+        ]
+        self.assertLess(
+            type_text_block.index("freshNode("),
+            type_text_block.index("dispatch = postUnicodeText(segment, to: fixturePID)"),
+        )
+        self.assertLess(
+            type_text_block.index("let afterType = freshSnapshot()"),
+            type_text_block.index("value_matches_from_fresh_snapshot"),
+        )
+
+    def test_type_text_stays_fixture_scoped_without_screen_or_pointer_input(self) -> None:
+        self.assertNotIn("CGEventPost(", self.native_sources)
+        self.assertNotIn(".post(tap:", self.native_sources)
+        for marker in ("CGEvent(mouseEventSource:", "CGWarpMouseCursorPosition"):
+            with self.subTest(marker=marker):
+                self.assertNotIn(marker, self.native_sources)
+        self.assertIn("NSWorkspace.shared.frontmostApplication", self.runner)
+        self.assertIn("postUnicodeText(segment, to: fixturePID)", self.runner)
+        self.assertIn("import Carbon.HIToolbox", self.runner)
+        self.assertIn("-framework Carbon", self.build)
+
     def test_runner_and_built_apps_use_fixed_bundle_ids(self) -> None:
         self.assertIn(
             f'private let fixtureBundleID = "{FIXTURE_BUNDLE_ID}"',
@@ -301,6 +368,9 @@ class MacOSTestkitSourceContracts(unittest.TestCase):
                 member_path = TESTKIT_ROOT / member
                 self.assertTrue(member_path.is_file())
                 self.assertFalse(member_path.is_symlink())
+        manifest_text = SOURCE_PACKAGE_MANIFEST.read_text(encoding="utf-8")
+        self.assertIn("# type_text sources:", manifest_text)
+        self.assertIn("# FixtureApp.swift AXTestRunner.swift", manifest_text)
 
 
 class NormalizedArchiveContracts(unittest.TestCase):
@@ -642,6 +712,14 @@ class NonMacOSLauncherContracts(unittest.TestCase):
                 check=False,
             )
             self.assertEqual(extraction.returncode, 0, msg=extraction.stderr)
+            self.assertIn(
+                'let typeTextSegments = ["ASCII ", "中文 ", "😀"]',
+                _read(extracted / "AXTestRunner.swift"),
+            )
+            self.assertIn(
+                'secureInput.stringValue = "fixture-secret"',
+                _read(extracted / "FixtureApp.swift"),
+            )
             extracted_run = extracted / "run.sh"
             self.assertTrue(os.access(extracted_run, os.X_OK))
             completed = subprocess.run(

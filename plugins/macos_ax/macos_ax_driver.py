@@ -5,7 +5,8 @@ The public worker speaks the repository's UTF-8 NDJSON protocol.  Snapshot,
 locator, stale-target and effect semantics live in this platform-independent
 module and can be tested with an injected backend on any host.  Production AX
 calls are delegated only to the separately built and code-signed Swift helper;
-there is deliberately no PyObjC, AppleScript, keyboard or pointer fallback.
+there is deliberately no PyObjC, AppleScript, pointer, or implicit keyboard
+fallback.  Keyboard input exists only as the explicit ``type_text`` action.
 """
 
 from __future__ import annotations
@@ -24,6 +25,7 @@ import subprocess
 import sys
 import time
 from typing import Any, NoReturn, Protocol
+import unicodedata
 import uuid
 
 
@@ -33,25 +35,36 @@ MAX_REQUEST_BYTES = 1024 * 1024
 MAX_RESPONSE_BYTES = 8 * 1024 * 1024 - 1
 MAX_HELPER_RESPONSE_BYTES = 8 * 1024 * 1024 - 1
 MAX_FIELD_CHARS = 4096
+MAX_TYPE_TEXT_CHARS = 1024
+MAX_TYPE_TEXT_UTF16_UNITS = MAX_TYPE_TEXT_CHARS * 2
 DEFAULT_REQUEST_SECONDS = 30.0
 DEFAULT_MAX_DEPTH = 32
 DEFAULT_MAX_NODES = 1000
 MAX_DEPTH = 128
 MAX_NODES = 5000
-HELPER_PROTOCOL_VERSION = 1
+HELPER_PROTOCOL_VERSION = 2
 HELPER_BUNDLE_ID = "dev.ai-auto-desktop.macos-ax-helper"
 HELPER_BUNDLE_NAME = "MacOSAXHelper.app"
 HELPER_EXECUTABLE_NAME = "MacOSAXHelper"
 
 ACTION_IDS = {
     name: f"{PLUGIN_NAME}.{name}@1"
-    for name in ("list_apps", "snapshot", "find", "focus", "invoke", "set_value")
+    for name in (
+        "list_apps",
+        "snapshot",
+        "find",
+        "focus",
+        "invoke",
+        "set_value",
+        "type_text",
+    )
 }
 ACTION_NAMES = {full_name: short_name for short_name, full_name in ACTION_IDS.items()}
-WRITE_ACTIONS = frozenset({"focus", "invoke", "set_value"})
+WRITE_ACTIONS = frozenset({"focus", "invoke", "set_value", "type_text"})
 NODE_ACTIONS = WRITE_ACTIONS
 STATE_NAMES = ("enabled", "focused", "focusable", "editable", "protected")
 APP_SELECTOR_FIELDS = frozenset({"process_id", "bundle_id", "name"})
+TYPE_TEXT_ROLES = frozenset({"AXTextField", "AXTextArea", "AXComboBox"})
 
 
 LOCATOR_SCHEMA: dict[str, Any] = {
@@ -295,6 +308,29 @@ ACTION_CONTRACTS: dict[str, dict[str, Any]] = {
         errors=COMMON_ERRORS + LOCATOR_ERRORS + ACTION_ERRORS,
         permissions=("desktop.observe", "desktop.input"),
     ),
+    "type_text": _contract(
+        "重新验证并聚焦非受保护文本目标后，显式发送有界 Unicode 键盘输入。",
+        effect="contextual",
+        risk_category="input",
+        risk_level="high",
+        input_schema={
+            "type": "object",
+            "required": ["target", "locator", "text"],
+            "properties": {
+                "target": TARGET_SCHEMA,
+                "locator": LOCATOR_SCHEMA,
+                "text": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": MAX_TYPE_TEXT_CHARS,
+                },
+            },
+            "additionalProperties": False,
+        },
+        output_schema=WRITE_OUTPUT_SCHEMA,
+        errors=COMMON_ERRORS + LOCATOR_ERRORS + ACTION_ERRORS,
+        permissions=("desktop.observe", "desktop.input"),
+    ),
 }
 
 MANIFEST: dict[str, Any] = {
@@ -372,6 +408,8 @@ class AXBackend(Protocol):
 
     def set_value(self, native: Any, value: str, *, deadline: float) -> Any: ...
 
+    def type_text(self, native: Any, text: str, *, deadline: float) -> Any: ...
+
     def same_element(self, previous: Any, current: Any, *, deadline: float) -> bool: ...
 
 
@@ -446,6 +484,39 @@ def _safe_text(value: Any) -> str | None:
         return None
 
 
+def _keyboard_text(value: Any) -> str:
+    if not isinstance(value, str):
+        _fail("DRIVER.INVALID_REQUEST", "text 必须是字符串")
+    if not value or len(value) > MAX_TYPE_TEXT_CHARS:
+        _fail(
+            "DRIVER.INVALID_REQUEST",
+            f"text 必须包含 1 到 {MAX_TYPE_TEXT_CHARS} 个字符",
+        )
+    text = value
+    for index, character in enumerate(text):
+        codepoint = ord(character)
+        if unicodedata.category(character) == "Cc":
+            _fail(
+                "DRIVER.INVALID_REQUEST",
+                "text 不允许包含 NUL 或控制字符",
+                character_index=index,
+            )
+        if 0xD800 <= codepoint <= 0xDFFF:
+            _fail(
+                "DRIVER.INVALID_REQUEST",
+                "text 必须是有效的 Unicode 标量序列",
+                character_index=index,
+            )
+    utf16_units = len(text.encode("utf-16-le")) // 2
+    if utf16_units > MAX_TYPE_TEXT_UTF16_UNITS:
+        _fail(
+            "DRIVER.INVALID_REQUEST",
+            f"text 的 UTF-16 长度超过 {MAX_TYPE_TEXT_UTF16_UNITS}",
+            limit_utf16_units=MAX_TYPE_TEXT_UTF16_UNITS,
+        )
+    return text
+
+
 def _json_safe(value: Any, *, depth: int = 0) -> Any:
     if depth > 8:
         return None
@@ -499,7 +570,20 @@ class MacOSAXDriver:
         if action == "find":
             return self._find(values, deadline)
         if action in WRITE_ACTIONS:
-            return self._write(action, values, deadline)
+            try:
+                return self._write(action, values, deadline)
+            except DriverError as exc:
+                if action != "type_text" or exc.code == "DRIVER.UNKNOWN_EFFECT":
+                    raise
+                details = dict(exc.data) if isinstance(exc.data, Mapping) else {}
+                details["effect"] = (
+                    "contextual"
+                    if details.get("focus_changed") is True
+                    else "not_applied"
+                )
+                raise DriverError(
+                    exc.code, exc.message, retryable=exc.retryable, data=details
+                ) from exc
         _fail("DRIVER.INVALID_REQUEST", f"未知动作：{action}", action=action)
 
     def _list_apps(self, args: dict[str, Any], deadline: float) -> dict[str, Any]:
@@ -625,8 +709,10 @@ class MacOSAXDriver:
             actions = sorted(
                 {str(item) for item in backend_node.actions if str(item) in NODE_ACTIONS}
             )
-            if protected and "set_value" in actions:
-                actions.remove("set_value")
+            if protected:
+                actions = [
+                    action for action in actions if action not in {"set_value", "type_text"}
+                ]
             provenance = _json_safe(dict(backend_node.provenance or {}))
             if not isinstance(provenance, dict):
                 provenance = {}
@@ -843,15 +929,27 @@ class MacOSAXDriver:
         }
 
     def _write(self, action: str, args: dict[str, Any], deadline: float) -> dict[str, Any]:
-        allowed = {"target", "locator"} | ({"value"} if action == "set_value" else set())
+        payload_field = (
+            "value"
+            if action == "set_value"
+            else "text"
+            if action == "type_text"
+            else None
+        )
+        allowed = {"target", "locator"} | ({payload_field} if payload_field else set())
         _only_keys(args, allowed, "args")
         if "target" not in args or "locator" not in args:
             _fail("DRIVER.INVALID_REQUEST", "target 和 locator 为必填字段")
         value: str | None = None
+        text: str | None = None
         if action == "set_value":
             if "value" not in args:
                 _fail("DRIVER.INVALID_REQUEST", "set_value 必须提供 value")
             value = _text(args["value"], "value")
+        elif action == "type_text":
+            if "text" not in args:
+                _fail("DRIVER.INVALID_REQUEST", "type_text 必须提供 text")
+            text = _keyboard_text(args["text"])
         target = _object(args["target"], "target")
         _only_keys(target, {"snapshot_id", "revision", "node_id"}, "target")
         node_id = target.get("node_id")
@@ -868,8 +966,10 @@ class MacOSAXDriver:
                 "target 与该快照中的定位结果不一致",
                 data={"node_id": node_id, "resolved_node_id": expected["node_id"]},
             )
-        if action == "set_value" and expected["states"].get("protected") is True:
-            raise DriverError("DRIVER.PROTECTED_ELEMENT", "受保护元素不允许 set_value")
+        if action in {"set_value", "type_text"} and expected["states"].get("protected") is True:
+            raise DriverError(
+                "DRIVER.PROTECTED_ELEMENT", f"受保护元素不允许 {action}"
+            )
         expected_fingerprint = record.fingerprints[node_id]
         previous_native = record.handles[node_id]
         _check_deadline(deadline)
@@ -929,14 +1029,25 @@ class MacOSAXDriver:
                     "current_snapshot_id": fresh.public["snapshot_id"],
                 },
             )
+        if action in {"set_value", "type_text"} and resolved["states"].get("protected") is True:
+            raise DriverError(
+                "DRIVER.PROTECTED_ELEMENT", f"受保护元素不允许 {action}"
+            )
+        if action == "type_text" and (
+            resolved.get("role") not in TYPE_TEXT_ROLES
+            or resolved["states"].get("protected") is not False
+        ):
+            raise DriverError(
+                "DRIVER.ACTION_UNSUPPORTED",
+                "type_text 只支持可确认非受保护的文本输入目标",
+                data={"action": action, "role": resolved.get("role")},
+            )
         if action not in resolved["actions"]:
             raise DriverError(
                 "DRIVER.ACTION_UNSUPPORTED",
                 f"目标不支持原生 {action}",
                 data={"action": action, "available_actions": resolved["actions"]},
             )
-        if action == "set_value" and resolved["states"].get("protected") is True:
-            raise DriverError("DRIVER.PROTECTED_ELEMENT", "受保护元素不允许 set_value")
         _check_deadline(deadline)
         native = fresh.handles[fresh_node_id]
         # Generic injected backends cross their dispatch boundary when their
@@ -951,9 +1062,12 @@ class MacOSAXDriver:
                 backend_result = self.backend.focus(native, deadline=deadline)
             elif action == "invoke":
                 backend_result = self.backend.invoke(native, deadline=deadline)
-            else:
+            elif action == "set_value":
                 assert value is not None
                 backend_result = self.backend.set_value(native, value, deadline=deadline)
+            else:
+                assert action == "type_text" and text is not None
+                backend_result = self.backend.type_text(native, text, deadline=deadline)
             _check_deadline(deadline, post_dispatch=True)
         except DriverError as exc:
             details = dict(exc.data) if isinstance(exc.data, Mapping) else {}
@@ -963,7 +1077,31 @@ class MacOSAXDriver:
             channel_failure = details.get("helper_channel_failure") is True
             channel_failed = channel_failure
             if exc.code == "DRIVER.UNKNOWN_EFFECT":
+                if (
+                    action == "type_text"
+                    and details.get("keyboard_dispatch_started") is True
+                ):
+                    self._terminate_backend_after_unknown_effect()
                 raise
+            if action == "type_text":
+                keyboard_started = details.get("keyboard_dispatch_started") is True
+                if keyboard_started:
+                    self._terminate_backend_after_unknown_effect()
+                    details.setdefault("action", action)
+                    details["effect"] = "unknown"
+                    raise DriverError(
+                        "DRIVER.UNKNOWN_EFFECT",
+                        "显式键盘输入派发后的结果未知",
+                        data=details,
+                    ) from exc
+                details["effect"] = (
+                    "contextual"
+                    if details.get("focus_changed") is True
+                    else "not_applied"
+                )
+                raise DriverError(
+                    exc.code, exc.message, retryable=exc.retryable, data=details
+                ) from exc
             if dispatched and (
                 channel_failure or exc.code in {"DRIVER.ACTION_FAILED", "DRIVER.TIMEOUT"}
             ):
@@ -994,6 +1132,11 @@ class MacOSAXDriver:
             "resolved": self._target(fresh, fresh_node_id),
             "backend_result": _json_safe(backend_result),
         }
+
+    def _terminate_backend_after_unknown_effect(self) -> None:
+        terminate = getattr(self.backend, "terminate_after_unknown_effect", None)
+        if callable(terminate):
+            terminate()
 
 
 class UnavailableBackend:
@@ -1032,6 +1175,9 @@ class UnavailableBackend:
         self._raise()
 
     def set_value(self, native: Any, value: str, *, deadline: float) -> Any:
+        self._raise()
+
+    def type_text(self, native: Any, text: str, *, deadline: float) -> Any:
         self._raise()
 
     def same_element(self, previous: Any, current: Any, *, deadline: float) -> bool:
@@ -1254,6 +1400,9 @@ class SwiftHelperBackend:
     def close(self) -> None:
         self._close_process(force=False)
 
+    def terminate_after_unknown_effect(self) -> None:
+        self._close_process(force=True)
+
     def security_info(self) -> Mapping[str, Any]:
         return {
             "source": self.helper_source,
@@ -1279,15 +1428,30 @@ class SwiftHelperBackend:
         self._close_process(force=True)
         return DriverError(code, message, retryable=retryable, data=details)
 
-    def _readline(self, deadline: float) -> bytes:
+    def _readline(
+        self, deadline: float, *, request_dispatched: bool = True,
+        keyboard_dispatch_started: bool = False, focus_changed: bool = False,
+    ) -> bytes:
         process = self._process
         stdout = None if process is None else process.stdout
+        channel_effect = (
+            "unknown"
+            if keyboard_dispatch_started
+            else "contextual"
+            if focus_changed
+            else "not_applied"
+        )
         if stdout is None:
             raise self._channel_error(
                 "DRIVER.UNAVAILABLE",
                 "AX helper stdout 不可用",
-                request_dispatched=True,
-                data={"reason": "helper_stdout_missing"},
+                    request_dispatched=request_dispatched,
+                    data={
+                        "reason": "helper_stdout_missing",
+                        "keyboard_dispatch_started": keyboard_dispatch_started,
+                        "focus_changed": focus_changed,
+                        "effect": channel_effect,
+                    },
             )
         while True:
             # Check the accumulated frame before accepting a newline.  A
@@ -1296,8 +1460,13 @@ class SwiftHelperBackend:
                 raise self._channel_error(
                     "DRIVER.OUTPUT_TOO_LARGE",
                     "AX helper 响应超过限制",
-                    request_dispatched=True,
-                    data={"limit_bytes": MAX_HELPER_RESPONSE_BYTES},
+                    request_dispatched=request_dispatched,
+                    data={
+                        "limit_bytes": MAX_HELPER_RESPONSE_BYTES,
+                        "keyboard_dispatch_started": keyboard_dispatch_started,
+                        "focus_changed": focus_changed,
+                        "effect": channel_effect,
+                    },
                 )
             newline = self._buffer.find(b"\n")
             if newline >= 0:
@@ -1309,9 +1478,14 @@ class SwiftHelperBackend:
                 raise self._channel_error(
                     "DRIVER.TIMEOUT",
                     "等待 AX helper 响应超时",
-                    request_dispatched=True,
+                    request_dispatched=request_dispatched,
                     retryable=True,
-                    data={"phase": "helper_response"},
+                    data={
+                        "phase": "helper_response",
+                        "keyboard_dispatch_started": keyboard_dispatch_started,
+                        "focus_changed": focus_changed,
+                        "effect": channel_effect,
+                    },
                 )
             try:
                 ready, _, _ = select.select([stdout.fileno()], [], [], remaining)
@@ -1319,10 +1493,13 @@ class SwiftHelperBackend:
                 raise self._channel_error(
                     "DRIVER.UNAVAILABLE",
                     "读取 AX helper 响应失败",
-                    request_dispatched=True,
+                    request_dispatched=request_dispatched,
                     data={
                         "reason": "helper_read_failed",
                         "exception_type": type(exc).__name__,
+                        "keyboard_dispatch_started": keyboard_dispatch_started,
+                        "focus_changed": focus_changed,
+                        "effect": channel_effect,
                     },
                 ) from exc
             if not ready:
@@ -1333,24 +1510,36 @@ class SwiftHelperBackend:
                 raise self._channel_error(
                     "DRIVER.UNAVAILABLE",
                     "读取 AX helper 响应失败",
-                    request_dispatched=True,
+                    request_dispatched=request_dispatched,
                     data={
                         "reason": "helper_read_failed",
                         "exception_type": type(exc).__name__,
+                        "keyboard_dispatch_started": keyboard_dispatch_started,
+                        "focus_changed": focus_changed,
+                        "effect": channel_effect,
                     },
                 ) from exc
             if not chunk:
                 raise self._channel_error(
                     "DRIVER.UNAVAILABLE",
                     "AX helper 在响应前退出",
-                    request_dispatched=True,
-                    data={"reason": "helper_eof", "exit_code": process.poll()},
+                    request_dispatched=request_dispatched,
+                    data={
+                        "reason": "helper_eof",
+                        "exit_code": process.poll(),
+                        "keyboard_dispatch_started": keyboard_dispatch_started,
+                        "focus_changed": focus_changed,
+                        "effect": channel_effect,
+                    },
                 )
             self._buffer.extend(chunk)
             # Do not return a newline discovered in this chunk until the next
             # loop iteration has enforced the complete-buffer limit.
 
-    def _rpc(self, operation: str, args: Mapping[str, Any], *, deadline: float) -> Any:
+    def _rpc(
+        self, operation: str, args: Mapping[str, Any], *, deadline: float,
+        require_keyboard_dispatch_state: bool = False,
+    ) -> Any:
         try:
             _check_deadline(deadline)
         except DriverError as exc:
@@ -1424,19 +1613,88 @@ class SwiftHelperBackend:
                     "exception_type": type(exc).__name__,
                 },
             ) from exc
-        line = self._readline(deadline)
-        try:
-            response = json.loads(line.decode("utf-8", errors="strict"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise self._channel_error(
-                "DRIVER.ACTION_FAILED",
-                "AX helper 返回了无效协议帧",
-                request_dispatched=True,
-                data={
-                    "reason": "helper_protocol_error",
-                    "exception_type": type(exc).__name__,
-                },
-            ) from exc
+        keyboard_dispatch_started = False
+        focus_changed = False
+        while True:
+            try:
+                line = self._readline(
+                    deadline,
+                    request_dispatched=True,
+                    keyboard_dispatch_started=keyboard_dispatch_started,
+                    focus_changed=focus_changed,
+                )
+            except DriverError as exc:
+                details = dict(exc.data) if isinstance(exc.data, Mapping) else {}
+                details["keyboard_dispatch_started"] = keyboard_dispatch_started
+                details["focus_changed"] = focus_changed
+                details["effect"] = (
+                    "unknown"
+                    if keyboard_dispatch_started
+                    else "contextual"
+                    if focus_changed
+                    else "not_applied"
+                )
+                raise DriverError(
+                    exc.code, exc.message, retryable=exc.retryable, data=details
+                ) from exc
+            try:
+                response = json.loads(line.decode("utf-8", errors="strict"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise self._channel_error(
+                    "DRIVER.ACTION_FAILED",
+                    "AX helper 返回了无效协议帧",
+                    request_dispatched=True,
+                    data={
+                        "reason": "helper_protocol_error",
+                        "exception_type": type(exc).__name__,
+                        "keyboard_dispatch_started": keyboard_dispatch_started,
+                        "focus_changed": focus_changed,
+                    },
+                ) from exc
+            if (
+                isinstance(response, dict)
+                and response.get("id") == request_id
+                and set(response) == {"id", "progress"}
+            ):
+                progress = response.get("progress")
+                if (
+                    operation != "type_text"
+                    or not isinstance(progress, Mapping)
+                    or not set(progress).issubset(
+                        {"phase", "keyboard_dispatch_started", "focus_changed"}
+                    )
+                    or progress.get("phase")
+                    not in {"focus_changed", "keyboard_dispatch"}
+                    or not isinstance(
+                        progress.get("keyboard_dispatch_started"), bool
+                    )
+                    or not isinstance(progress.get("focus_changed"), bool)
+                    or (
+                        progress.get("phase") == "focus_changed"
+                        and (
+                            progress.get("keyboard_dispatch_started") is not False
+                            or progress.get("focus_changed") is not True
+                        )
+                    )
+                    or (
+                        progress.get("phase") == "keyboard_dispatch"
+                        and progress.get("keyboard_dispatch_started") is not True
+                    )
+                ):
+                    raise self._channel_error(
+                        "DRIVER.ACTION_FAILED",
+                        "AX helper 返回了无效进度帧",
+                        request_dispatched=True,
+                        data={
+                            "reason": "helper_protocol_error",
+                            "keyboard_dispatch_started": keyboard_dispatch_started,
+                            "focus_changed": focus_changed,
+                        },
+                    )
+                keyboard_dispatch_started = progress["keyboard_dispatch_started"]
+                focus_changed = progress["focus_changed"]
+                continue
+            break
         if (
             not isinstance(response, dict)
             or response.get("id") != request_id
@@ -1446,7 +1704,11 @@ class SwiftHelperBackend:
                 "DRIVER.ACTION_FAILED",
                 "AX helper 响应 ID 不匹配",
                 request_dispatched=True,
-                data={"reason": "helper_protocol_error"},
+                data={
+                    "reason": "helper_protocol_error",
+                    "keyboard_dispatch_started": keyboard_dispatch_started,
+                    "focus_changed": focus_changed,
+                },
             )
         has_error = "error" in response
         has_result = "result" in response
@@ -1455,7 +1717,11 @@ class SwiftHelperBackend:
                 "DRIVER.ACTION_FAILED",
                 "AX helper 响应必须且只能包含 result 或 error",
                 request_dispatched=True,
-                data={"reason": "helper_protocol_error"},
+                data={
+                    "reason": "helper_protocol_error",
+                    "keyboard_dispatch_started": keyboard_dispatch_started,
+                    "focus_changed": focus_changed,
+                },
             )
         error = response.get("error")
         if has_error:
@@ -1464,7 +1730,11 @@ class SwiftHelperBackend:
                     "DRIVER.ACTION_FAILED",
                     "AX helper 返回了无效错误帧",
                     request_dispatched=True,
-                    data={"reason": "helper_protocol_error"},
+                    data={
+                        "reason": "helper_protocol_error",
+                        "keyboard_dispatch_started": keyboard_dispatch_started,
+                        "focus_changed": focus_changed,
+                    },
                 )
             code = error.get("code")
             message = error.get("message")
@@ -1485,7 +1755,11 @@ class SwiftHelperBackend:
                     "DRIVER.ACTION_FAILED",
                     "AX helper 返回了无效错误帧",
                     request_dispatched=True,
-                    data={"reason": "helper_protocol_error"},
+                    data={
+                        "reason": "helper_protocol_error",
+                        "keyboard_dispatch_started": keyboard_dispatch_started,
+                        "focus_changed": focus_changed,
+                    },
                 )
             details = _json_safe(raw_data)
             if not isinstance(details, dict):
@@ -1495,7 +1769,60 @@ class SwiftHelperBackend:
             details.pop("helper_channel_failure", None)
             details.pop("helper_request_dispatched", None)
             details.pop("effect", None)
+            declared_keyboard_dispatch = details.get("keyboard_dispatch_started")
+            if declared_keyboard_dispatch is not None and not isinstance(
+                declared_keyboard_dispatch, bool
+            ):
+                raise self._channel_error(
+                    "DRIVER.ACTION_FAILED",
+                    "AX helper 返回了无效派发状态",
+                    request_dispatched=True,
+                    data={
+                        "reason": "helper_protocol_error",
+                        "keyboard_dispatch_started": keyboard_dispatch_started,
+                        "focus_changed": focus_changed,
+                    },
+                )
+            if declared_keyboard_dispatch is not None:
+                keyboard_dispatch_started = declared_keyboard_dispatch
+            declared_focus_changed = details.get("focus_changed")
+            if declared_focus_changed is not None and not isinstance(declared_focus_changed, bool):
+                raise self._channel_error(
+                    "DRIVER.ACTION_FAILED",
+                    "AX helper 返回了无效焦点状态",
+                    request_dispatched=True,
+                    data={
+                        "reason": "helper_protocol_error",
+                        "keyboard_dispatch_started": keyboard_dispatch_started,
+                        "focus_changed": focus_changed,
+                    },
+                )
+            if declared_focus_changed is not None:
+                focus_changed = declared_focus_changed
+            details["keyboard_dispatch_started"] = keyboard_dispatch_started
+            details["focus_changed"] = focus_changed
+            details["effect"] = (
+                "unknown"
+                if keyboard_dispatch_started
+                else "contextual"
+                if focus_changed
+                else "not_applied"
+            )
             details["helper_request_dispatched"] = True
+            if require_keyboard_dispatch_state and declared_keyboard_dispatch is None:
+                # Protocol v2 emits progress before native dispatch.  With no
+                # observed marker, a missing final-state field is a fatal
+                # protocol error but is not evidence that text was submitted.
+                raise self._channel_error(
+                    "DRIVER.ACTION_FAILED",
+                    "AX helper 错误缺少键盘派发状态",
+                    request_dispatched=True,
+                    data={
+                        "reason": "helper_protocol_error",
+                        "keyboard_dispatch_started": keyboard_dispatch_started,
+                        "focus_changed": focus_changed,
+                    },
+                )
             if code.startswith("PROTOCOL."):
                 details["helper_error_code"] = code
                 raise self._channel_error(
@@ -1519,7 +1846,48 @@ class SwiftHelperBackend:
                 retryable=retryable,
                 data=details,
             )
-        return response["result"]
+        result = response["result"]
+        if require_keyboard_dispatch_state:
+            result_keyboard_started = (
+                result.get("keyboard_dispatch_started")
+                if isinstance(result, Mapping)
+                else None
+            )
+            result_focus_changed = (
+                result.get("focus_changed")
+                if isinstance(result, Mapping)
+                else None
+            )
+            if (
+                not isinstance(result_keyboard_started, bool)
+                or not isinstance(result_focus_changed, bool)
+                or result_keyboard_started is not keyboard_dispatch_started
+                or result_focus_changed is not focus_changed
+            ):
+                effective_keyboard_started = (
+                    keyboard_dispatch_started or result_keyboard_started is True
+                )
+                effective_focus_changed = (
+                    focus_changed or result_focus_changed is True
+                )
+                raise self._channel_error(
+                    "DRIVER.ACTION_FAILED",
+                    "AX helper 结果与已观察的派发状态不一致",
+                    request_dispatched=True,
+                    data={
+                        "reason": "helper_protocol_error",
+                        "keyboard_dispatch_started": effective_keyboard_started,
+                        "focus_changed": effective_focus_changed,
+                        "effect": (
+                            "unknown"
+                            if effective_keyboard_started
+                            else "contextual"
+                            if effective_focus_changed
+                            else "not_applied"
+                        ),
+                    },
+                )
+        return result
 
     def list_apps(self, *, deadline: float) -> Mapping[str, Any]:
         result = self._rpc("list_apps", {}, deadline=deadline)
@@ -1678,16 +2046,38 @@ class SwiftHelperBackend:
             "set_value", {"native_token": native, "value": value}, deadline=deadline
         )
 
+    def type_text(self, native: Any, text: str, *, deadline: float) -> Any:
+        return self._write_rpc(
+            "type_text", {"native_token": native, "text": text}, deadline=deadline
+        )
+
     def _write_rpc(
         self, operation: str, args: Mapping[str, Any], *, deadline: float
     ) -> Mapping[str, Any]:
         try:
-            result = self._rpc(operation, args, deadline=deadline)
+            result = self._rpc(
+                operation, args, deadline=deadline,
+                require_keyboard_dispatch_state=operation == "type_text",
+            )
+            expected_flag = "submitted" if operation == "type_text" else "accepted"
+            allowed_result_fields = {expected_flag, "native_operation"}
+            if operation == "type_text":
+                allowed_result_fields.update(
+                    {"keyboard_dispatch_started", "focus_changed", "phase"}
+                )
             if (
                 not isinstance(result, Mapping)
-                or not set(result).issubset({"accepted", "native_operation"})
-                or result.get("accepted") is not True
+                or not set(result).issubset(allowed_result_fields)
+                or result.get(expected_flag) is not True
                 or not isinstance(result.get("native_operation"), str)
+                or (
+                    operation == "type_text"
+                    and (
+                        result.get("keyboard_dispatch_started") is not True
+                        or not isinstance(result.get("focus_changed"), bool)
+                        or result.get("phase") != "submitted"
+                    )
+                )
             ):
                 raise self._channel_error(
                     "DRIVER.ACTION_FAILED",
@@ -1697,6 +2087,29 @@ class SwiftHelperBackend:
                 )
         except DriverError as exc:
             details = dict(exc.data) if isinstance(exc.data, Mapping) else {}
+            if (
+                operation == "type_text"
+                and details.get("keyboard_dispatch_started") is True
+            ):
+                # The helper emits this marker immediately before the first
+                # keyDown post.  Only that native boundary makes text effect
+                # unknown; a complete request frame alone is insufficient.
+                self._close_process(force=True)
+                details["effect"] = "unknown"
+                details["helper_terminated"] = True
+                details.setdefault("operation", operation)
+                raise DriverError(
+                    "DRIVER.UNKNOWN_EFFECT",
+                    "AX helper 键盘输入请求派发后的结果未知",
+                    data=details,
+                ) from exc
+            if operation == "type_text":
+                details["effect"] = (
+                    "contextual" if details.get("focus_changed") is True else "not_applied"
+                )
+                raise DriverError(
+                    exc.code, exc.message, retryable=exc.retryable, data=details
+                ) from exc
             if (
                 details.get("helper_channel_failure") is True
                 and details.get("helper_request_dispatched") is True

@@ -8,8 +8,8 @@
 ## 进程与信任边界
 
 公开能力名是 `desktop.macos_ax`，动作是 `list_apps`、`snapshot`、`find`、`focus`、
-`invoke` 和 `set_value`。manifest 只声明 `runtime.platforms: [macos]`，入口为
-`./run.sh`。观察动作要求 `desktop.observe`；三个写动作还要求 `desktop.input`。
+`invoke`、`set_value` 和 `type_text`。manifest 只声明 `runtime.platforms: [macos]`，入口为
+`./run.sh`。观察动作要求 `desktop.observe`；四个写动作还要求 `desktop.input`。
 
 实现分为两层：
 
@@ -36,7 +36,8 @@ package type。该检查是签名完整性检查，不是来源认证：当前�
 `source_authenticated=false`，部署者必须在本驱动之外建立来源信任。原生 helper 使用
 AppKit 枚举 `NSRunningApplication`，使用
 ApplicationServices 的 `AXUIElementCreateApplication`、属性 API 和动作 API；Python 没有
-PyObjC、AppleScript 或输入注入后备路径。
+PyObjC 或 AppleScript 路径，键盘输入仅存在于显式 `type_text` 动作，不是 `set_value` 的
+自动 fallback。
 
 原生 `AXUIElement` 仅保存在 Swift 进程的短期 token store 中，绝不出现在公开 NDJSON。
 每次 snapshot 开启新 token generation，只保留当前和上一 generation，以便写前重抓后比较
@@ -74,8 +75,9 @@ PyObjC、AppleScript 或输入注入后备路径。
 `description`、`value`、`states`、`bounds`、`actions` 和 `provenance`。bounds 使用 macOS
 全局屏幕 point 坐标，只作为观察信息，不能用于本驱动的输入回退。helper 只把可预检的动作
 声明到 `actions`：`AXFocused` 可写对应 `focus`，`AXPress` 存在对应 `invoke`，`AXValue`
-可写对应 `set_value`。secure text 的值始终是 null，标记 `protected` 和
-`value_redacted`，且不声明 `set_value`。
+可写对应 `set_value`；非受保护、enabled、可聚焦且 role 为 `AXTextField`、`AXTextArea` 或
+`AXComboBox` 的节点对应 `type_text`。secure text 的值始终是 null，标记 `protected` 和
+`value_redacted`，且不声明 `set_value` 或 `type_text`。
 
 ## 精确定位、revision 与 stale
 
@@ -104,15 +106,34 @@ worker 同时只保留一个公开 current revision。再次 snapshot、写前�
 
 `focus` 先用 `AXUIElementIsAttributeSettable` 预检，再写 `AXFocused=true`；`set_value`
 同样预检后写 `AXValue`；`invoke` 先从 `AXUIElementCopyActionNames` 确认 `AXPress`，再调用
-`AXUIElementPerformAction`。helper 不执行坐标点击或键盘模拟。Python 只有在完整的换行终止
+`AXUIElementPerformAction`。`type_text` 是独立显式动作：Python 先拒绝空文本、NUL/C0/C1
+控制字符、孤立 surrogate、超过 1024 Unicode 标量或 2048 UTF-16 code units 的输入；Swift
+重复同一边界校验，
+检查非 secure 文本 role、enabled、AX 可聚焦和目标 PID 为当前前台应用，设置并回读
+`AXFocused=true` 后，才以 `CGEventKeyboardSetUnicodeString` 按最多 20 个 UTF-16 code units
+且不拆 surrogate pair 的块构造 key-down/key-up，并通过 `postToPid` 投递；每块前都再次确认
+目标仍有焦点且应用仍在前台。它不会激活后台应用，不会模拟 pointer，也不会被 `set_value`
+隐式调用。
+`type_text` 只需要 Accessibility，不需要 Screen Recording。Python 只有在完整的换行终止
 helper 请求帧写入 pipe 后才认为跨过派发边界；部分写入或写入失败仍是 `not_applied`。
+该动作不是 secret 输入通道、快捷键或粘贴接口，明文会经过公开和私有 NDJSON 边界；调用方
+不得用它输入密码或其他 secret。
+在改变焦点和发布首个事件前，helper 使用 Carbon/HIToolbox 的
+`IsSecureEventInputEnabled()` 检查系统 Secure Event Input；开启时 fail closed，返回
+`phase=secure_event_input_preflight`、`keyboard_dispatch_started=false`、`effect=not_applied`。
 
-manifest 将 `focus` 和 `set_value` 标为 `contextual`，将 `invoke` 标为
+manifest 将 `focus`、`set_value` 和 `type_text` 标为 `contextual`，将 `invoke` 标为
 `non_idempotent`。写动作的完整换行帧写入 helper pipe 后，Python 才视为已派发：原生
 `DRIVER.ACTION_FAILED`、派发后 timeout 或未预期异常都归一为
 `DRIVER.UNKNOWN_EFFECT(effect=unknown)`，并使 current snapshot 失效。完整写入写请求后的 helper
 timeout、EOF、输出超限或协议错误同样按这一规则归一；这些致命通道错误会立即 kill helper，
-该 backend 不可复用。调用方不得自动重试，
+该 backend 不可复用。`type_text` 不把完整 helper 请求当成键盘派发：helper 只在首个
+`keyDown.postToPid` 前发送进度帧 `keyboard_dispatch_started=true`，Python 观察到该帧后才会把
+失败或 timeout 归一为 `DRIVER.UNKNOWN_EFFECT` 并强制 kill helper。结构化 preflight 错误保持
+`not_applied`；若 AX focus 已改变但未发送按键，则报告 `focus_changed=true` 和
+`effect=contextual`；helper 在确认焦点后先发独立进度帧，所以此阶段的 timeout 也不声称文本
+可能输入。成功结果使用 `submitted=true`，只说明 CGEvent 调用已
+提交，不证明目标应用已经处理。调用方不得自动重试，
 而应获取新快照验证业务后置条件。成功响应只证明原生 API 接受调用，不证明应用已经完成
 预期业务变化。
 
@@ -144,12 +165,13 @@ AX API 仍不能由 Python 安全抢占，因此宿主进程 timeout/回收是�
 ## 已验证与待验证
 
 跨平台 fake backend 测试覆盖 manifest schema、归一化快照、精确/多义/未找到、revision、
-stale identity、truncated fail-closed、protected value、三个写动作、UNKNOWN_EFFECT、deadline、
+stale identity、truncated fail-closed、protected value、四个写动作、输入边界、无自动 fallback、UNKNOWN_EFFECT、deadline、
 非 macOS `DRIVER.UNAVAILABLE` 和 NDJSON 帧恢复。静态测试还检查 helper 源码确实使用 AX API、
 限制到应用 PID、预检写能力且构建脚本执行签名验证。
 
 这些测试不等于真实 AX 资格验证。发布前至少还应在 Intel 与 Apple Silicon、固定 macOS
 版本和交互式登录会话中完成：Swift 编译、ad-hoc/Developer ID 签名、首次授权和重签后的
-TCC 行为、自有 AppKit fixture 的 snapshot/find/focus/set_value/invoke 闭环、应用退出与 PID
+TCC 行为、自有 AppKit fixture 的 snapshot/find/focus/set_value/invoke 闭环，以及真机 kit
+已经实现但尚待在真实 Mac 执行的显式 `type_text` Unicode/前台焦点/secure text 拒绝闭环、应用退出与 PID
 复用、对话框/多窗口、虚拟列表、多显示器、Retina 坐标，以及无响应/拒绝/受保护界面。完成
 这些证据之前，正式状态仍是“严格骨架，未资格验证”。
