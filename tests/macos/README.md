@@ -27,6 +27,14 @@
 也不读取 fixture 之外的应用。
 `identity.txt` 仅保存 bundle 的 designated requirement、Identifier、TeamIdentifier、
 CDHash、Mach-O 架构和可执行文件 SHA-256，不保存绝对路径。
+其中 Swift 版本、identity stability，以及 runner/fixture 各自的 designated requirement、
+Identifier、CDHash、架构、SHA-256 都是必填证明；任何工具失败、字段缺失或空值都会让构建
+失败，不会产生半份 `identity.txt`。
+
+结果归档使用固定的成员顺序、UTC 时间（2000-01-01 00:00:00）、文件权限和 root/0
+owner/group，并移除 ACL、file flags、扩展属性与 macOS AppleDouble 元数据；gzip header 也不
+记录原文件名或时间。脚本分别适配 macOS 系统 bsdtar/libarchive 和 GNU tar；无法识别 tar
+实现或归一化参数不被支持时会拒绝生成归档。
 
 runner 始终调用 `CGPreflightScreenCaptureAccess()` 记录当前状态，但绝不调用授权请求 API，
 也不执行截图。Accessibility 可用时，它会启动自有 fixture，在最大深度 8、最大节点数
@@ -44,4 +52,22 @@ xcode-select --install
 源码未变化时不会重复编译。不要在授权与复测之间删除该目录。固定 bundle ID 加 ad-hoc
 签名的 `identity_stability` 是 `ephemeral`，重编译后可能需要重新授权；长期固定测试节点应
 设置 `MACOS_TEST_CODESIGN_IDENTITY`，始终使用同一 Developer ID 签名。
+
+## 制作可搬运源码包
+
+从仓库中的 `tests/macos/` 运行：
+
+```sh
+./package-source.sh /absolute/path/macos-ax-testkit-source.tar.gz
+```
+
+脚本只打包 `SOURCE_PACKAGE_FILES.txt` 白名单中的源码与脚本，不包含 `.build/`、`results/`
+或仓库其他文件。归档是平铺结构，可复制到仓库外直接执行：
+
+```sh
+mkdir macos-ax-testkit
+tar -xzf macos-ax-testkit-source.tar.gz -C macos-ax-testkit
+cd macos-ax-testkit
+./run.sh
+```
 

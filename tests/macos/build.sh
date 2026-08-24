@@ -2,11 +2,14 @@
 set -eu
 
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
+. "$script_dir/identity.sh"
 build_root=${1:-"$script_dir/.build"}
 signing_identity=${MACOS_TEST_CODESIGN_IDENTITY:--}
 fixture_app="$build_root/AiAutoDesktopAXFixture.app"
 runner_app="$build_root/AiAutoDesktopAXRunner.app"
 signing_marker="$build_root/.codesign-identity"
+attestation="$build_root/identity.txt"
+rm -f "$attestation"
 
 if [ "$(uname -s 2>/dev/null || printf unknown)" != Darwin ]; then
     printf '%s\n' '不支持：此构建脚本必须在 macOS 上运行。' >&2
@@ -128,31 +131,11 @@ if [ ! -x "$runner_app/Contents/MacOS/AiAutoDesktopAXRunner" ] \
 fi
 printf '%s\n' "$signing_identity" >"$signing_marker"
 
-attestation="$build_root/identity.txt"
-attest_app() {
-    label=$1
-    app=$2
-    executable=$3
-    printf '%s\n' "[$label]"
-    codesign -d -r- "$app" 2>&1 | sed -n '/^designated =>/p'
-    codesign -d --verbose=4 "$app" 2>&1 \
-        | sed -n '/^Identifier=/p;/^TeamIdentifier=/p;/^CDHash=/p'
-    /usr/bin/lipo -archs "$executable" 2>/dev/null | sed 's/^/architectures=/'
-    /usr/bin/shasum -a 256 "$executable" | awk '{print "sha256=" $1}'
-}
-{
-    "$swiftc_path" --version | sed -n '1p' | sed 's/^/swift=/'
-    if [ "$signing_identity" = - ]; then
-        printf '%s\n' 'identity_stability=ephemeral'
-    else
-        printf '%s\n' 'identity_stability=stable_identity_requested'
-    fi
-    attest_app runner "$runner_app" \
-        "$runner_app/Contents/MacOS/AiAutoDesktopAXRunner"
-    attest_app fixture "$fixture_app" \
-        "$fixture_app/Contents/MacOS/AiAutoDesktopAXFixture"
-} >"$attestation"
-
+if [ "$signing_identity" = - ]; then
+    identity_stability=ephemeral
+else
+    identity_stability=stable_identity_requested
+fi
 for app in "$fixture_app" "$runner_app"; do
     if ! codesign --verify --strict "$app" >/dev/null 2>&1; then
         printf '%s\n' "失败：签名严格校验失败：$app" >&2
@@ -167,6 +150,23 @@ if [ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$fixture_app/Con
     || [ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$runner_app/Contents/Info.plist")" != "dev.ai-auto-desktop.testkit.ax-runner" ]; then
     printf '%s\n' '失败：构建产物 bundle ID 不符合预期。' >&2
     exit 78
+fi
+if ! write_identity_attestation \
+    "$attestation" \
+    "$swiftc_path" \
+    "$(command -v codesign)" \
+    /usr/bin/lipo \
+    /usr/bin/shasum \
+    "$identity_stability" \
+    "$runner_app" \
+    "$runner_app/Contents/MacOS/AiAutoDesktopAXRunner" \
+    dev.ai-auto-desktop.testkit.ax-runner \
+    "$fixture_app" \
+    "$fixture_app/Contents/MacOS/AiAutoDesktopAXFixture" \
+    dev.ai-auto-desktop.testkit.fixture; then
+    rm -f "$attestation"
+    printf '%s\n' '失败：无法生成完整的 identity attestation。' >&2
+    exit 80
 fi
 
 printf '%s\n' "构建完成：$build_root" >&2

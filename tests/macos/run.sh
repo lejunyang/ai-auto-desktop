@@ -2,6 +2,7 @@
 set -eu
 
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
+. "$script_dir/archive.sh"
 build_root="$script_dir/.build"
 output_root="$script_dir/results"
 prompt_accessibility=false
@@ -195,12 +196,21 @@ else
 fi
 
 if command -v shasum >/dev/null 2>&1; then
-    (cd "$result_dir" && shasum -a 256 report.json README.txt identity.txt) \
-        >"$result_dir/SHA256SUMS"
+    if ! (cd "$result_dir" \
+        && shasum -a 256 report.json README.txt identity.txt \
+            >SHA256SUMS.tmp); then
+        rm -f "$result_dir/SHA256SUMS.tmp"
+        printf '%s\n' '失败：无法计算结果文件 SHA-256。' >&2
+        cat "$report_path"
+        exit 1
+    fi
+    mv "$result_dir/SHA256SUMS.tmp" "$result_dir/SHA256SUMS"
 else
-    printf '%s\n' 'sha256_manifest=unavailable' >"$result_dir/SHA256SUMS"
+    printf '%s\n' '失败：系统 shasum 不可用，拒绝生成无校验清单的归档。' >&2
+    cat "$report_path"
+    exit 1
 fi
-if ! tar -czf "$archive_path" -C "$result_dir" \
+if ! create_normalized_tar_gz "$archive_path" "$result_dir" \
     report.json README.txt identity.txt SHA256SUMS; then
     printf '%s\n' '失败：无法创建结果归档。' >&2
     cat "$report_path"

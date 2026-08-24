@@ -1,8 +1,21 @@
 import AppKit
+import Darwin
 
 private let fixtureWindowTitle = "AI Auto Desktop macOS AX Fixture"
 private let initialValue = "Draft"
 private let initialStatus = "Status: idle"
+
+private func configureLifecycle() -> Bool {
+    let arguments = CommandLine.arguments
+    guard let marker = arguments.firstIndex(of: "--parent-pid"),
+          marker + 1 < arguments.count,
+          let parentPID = Int32(arguments[marker + 1]),
+          parentPID > 1,
+          parentPID == getppid(),
+          setpgid(0, getpgrp()) == 0 || getpgrp() == getpgid(parentPID)
+    else { return false }
+    return true
+}
 
 final class FixtureAppDelegate: NSObject, NSApplicationDelegate {
     private var window: NSWindow!
@@ -73,6 +86,7 @@ final class FixtureAppDelegate: NSObject, NSApplicationDelegate {
 }
 
 let app = NSApplication.shared
+guard configureLifecycle() else { exit(1) }
 let delegate = FixtureAppDelegate()
 app.delegate = delegate
 app.setActivationPolicy(.regular)

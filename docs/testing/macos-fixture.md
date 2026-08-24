@@ -18,6 +18,12 @@ runner 由 LaunchServices 以固定 `.app` 身份启动，并将报告原子写�
 - 调用 `CGPreflightScreenCaptureAccess()` 只读取状态；不请求屏幕录制授权，也不截图。
 - AX 树限定于测试套件自行启动的 fixture 进程，默认最大深度 8、最多 128 个节点。
 - 可回传归档只包含结构化 JSON、签名/架构证明、SHA-256 清单和隐私说明，不含屏幕内容或其他应用数据；签名证明不保存绝对路径。
+- 结果归档会把 owner/group 固定为 root/0、mtime 固定为 2000-01-01 UTC，并把普通文件
+  mode 固定为 `0644`；同时关闭 ACL、file flags、xattr、AppleDouble 和 gzip header 时间/文件名。
+  它只接受已知的 macOS bsdtar/libarchive 或 GNU tar，归一化能力不可用时会 fail closed。
+- `identity.txt` 强制包含 Swift 版本、identity stability，以及 runner/fixture 各自非空的
+  designated requirement、Identifier、CDHash、architectures 和 SHA-256；采集命令失败不会被
+  `sed`/`awk` 等管道末端掩盖，也不会发布半份证明。
 - 缺少 macOS、Command Line Tools 或授权时输出结构化 `unsupported`，不会伪造通过。
 
 固定 bundle ID 与稳定构建路径可以减少 TCC 身份漂移，但 ad-hoc 签名在重编译后不保证
@@ -27,3 +33,12 @@ runner 由 LaunchServices 以固定 `.app` 身份启动，并将报告原子写�
 
 这是一条真机 fixture 验证链路，不等同于对任意第三方应用、锁屏、安全输入、跨用户会话
 或完整 macOS 平台兼容性的资格声明。Linux 机器只能对 shell 和源码结构进行静态检查。
+
+需要把真机套件交给仓库外的 Mac 时，在 `tests/macos/` 执行：
+
+```sh
+./package-source.sh /absolute/path/macos-ax-testkit-source.tar.gz
+```
+
+该命令按 `SOURCE_PACKAGE_FILES.txt` 白名单生成平铺的规范化源码包，不包含构建结果。接收方
+解压到空目录后即可运行 `./run.sh`。最终对外交付归档应由发布负责人从待交付 revision 生成。

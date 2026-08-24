@@ -507,6 +507,7 @@ private func run(arguments parsedArguments: Arguments? = nil) -> Outcome {
 
     let fixture = Process()
     fixture.executableURL = executable
+    fixture.arguments = ["--parent-pid", String(getpid())]
     fixture.standardOutput = FileHandle.nullDevice
     fixture.standardError = FileHandle.nullDevice
     do {
