@@ -12,7 +12,9 @@ import time
 import unittest
 import uuid
 
+from ai_auto_desktop.compiler import compile_descriptor
 from ai_auto_desktop.plugin import PluginError, ProcessPlugin
+from ai_auto_desktop.runtime import run_descriptor
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -24,6 +26,7 @@ ACTION_PREFIX = "desktop.windows_uia"
 INITIAL_STATUS = "Status: idle"
 INVOKED_STATUS = "Status: invoked"
 DUPLICATE_BUTTON_NAME = "Duplicate action"
+RUNTIME_EDIT_VALUE = "Observed through Runtime"
 
 
 def action(name: str) -> str:
@@ -206,6 +209,99 @@ class NativeWindowsUIATests(unittest.TestCase):
         )
         final_edit = self._find(final_snapshot, edit_locator)
         self.assertEqual(final_edit["node"]["value"], "Final")
+
+    def test_runtime_write_postcondition_observes_fresh_native_snapshot(self) -> None:
+        self.plugin.start()
+        window = self._wait_for_window()
+        selector = {
+            "handle": window["handle"],
+            "title": self.title,
+            "process_id": self.fixture.pid,
+        }
+        initial_snapshot = self._snapshot(selector)
+        self.assertFalse(initial_snapshot["truncated"])
+
+        edit_locator = {"role": "edit"}
+        edit = self._find(initial_snapshot, edit_locator)
+        self.assertNotEqual(edit["node"]["value"], RUNTIME_EDIT_VALUE)
+        edit_indexes = [
+            index
+            for index, node in enumerate(initial_snapshot["nodes"])
+            if node.get("node_id") == edit["node"]["node_id"]
+        ]
+        self.assertEqual(len(edit_indexes), 1)
+        edit_index = edit_indexes[0]
+
+        descriptor = compile_descriptor(
+            {
+                "apiVersion": "ai-auto-desktop.dev/v1alpha1",
+                "kind": "Workflow",
+                "metadata": {"name": "native-windows-uia-observation"},
+                "requires": {
+                    "platforms": ["windows"],
+                    "permissions": ["desktop.observe", "desktop.input"],
+                },
+                "budgets": {
+                    "max_duration": "20s",
+                    "max_executed_steps": 1,
+                    "cleanup_timeout": "1s",
+                },
+                "steps": [
+                    {
+                        "id": "set_fixture_value",
+                        "type": "action",
+                        "uses": action("set_value"),
+                        "with": {
+                            "target": edit["target"],
+                            "locator": edit_locator,
+                            "value": RUNTIME_EDIT_VALUE,
+                        },
+                        "effect": {"class": "contextual"},
+                        "risk": {"category": "input", "level": "high"},
+                        "timeout": "15s",
+                        "postcondition": {
+                            "observe": {
+                                "uses": action("snapshot"),
+                                "with": {
+                                    "window": selector,
+                                    "max_depth": 12,
+                                    "max_nodes": 100,
+                                },
+                            },
+                            "condition": (
+                                "${{ observation.truncated == False and "
+                                f"observation.nodes[{edit_index}].node_id == "
+                                f"'{edit['node']['node_id']}' and "
+                                f"observation.nodes[{edit_index}].role == 'edit' and "
+                                f"observation.nodes[{edit_index}].value == "
+                                f"'{RUNTIME_EDIT_VALUE}'"
+                                " }}"
+                            ),
+                            "timeout": "5s",
+                            "poll_interval": "100ms",
+                            "message": (
+                                "fresh UIA snapshot did not contain the new value"
+                            ),
+                        },
+                    }
+                ],
+            }
+        )
+
+        result = run_descriptor(
+            descriptor,
+            plugins={ACTION_PREFIX: self.plugin},
+            granted_permissions=["desktop.observe", "desktop.input"],
+        )
+
+        self.assertTrue(result.ok, result.to_dict())
+        self.assertEqual(result.steps["set_fixture_value"]["attempts"], 1)
+        self.assertEqual(
+            result.steps["set_fixture_value"]["output"]["backend_result"][
+                "native_pattern"
+            ],
+            "ValuePattern",
+        )
 
 
 if __name__ == "__main__":

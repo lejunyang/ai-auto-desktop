@@ -12,6 +12,8 @@
 3. 通过 `ValuePattern`、`SetFocus`、`InvokePattern` 执行 `set_value`、`focus`、`invoke`；
 4. 每次写操作后重新获取 snapshot，验证编辑框值、焦点状态和更新后的 `STATIC` 文本；
 5. 验证两个同名按钮得到 `DRIVER.AMBIGUOUS`，并通过未变化的状态文本证明没有派发原生点击。
+6. 通过 Runtime 执行 `set_value`，再由 `postcondition.observe` 调用真实 `snapshot`，
+   验证动作后的新快照包含目标值，同时确认主动作只派发一次。
 
 该测试类在非 Windows 平台整体跳过。GitHub Actions 的 Windows 矩阵项安装
 `.[windows-uia]` 后随完整 unittest suite 执行一次；Linux 和 macOS 不安装 Windows 可选依赖，
