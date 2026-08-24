@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import json
 import math
 import re
@@ -36,7 +37,7 @@ _USES = re.compile(
 _DURATION = re.compile(r"^(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:ms|s|m|h)$")
 _EXPRESSION = re.compile(r"^\$\{\{(.*?)\}\}$", re.DOTALL)
 _TOP = {"apiVersion", "kind", "metadata", "requires", "inputs", "variables", "outputs", "defaults", "budgets", "policy", "steps", "on_error", "finally", "extensions"}
-_COMMON = {"id", "type", "description", "if", "timeout", "attempt_timeout", "retry", "on_error", "finally", "extensions"}
+_COMMON = {"id", "type", "depends_on", "description", "if", "timeout", "attempt_timeout", "retry", "on_error", "finally", "extensions"}
 _FIELDS = {
     "action": {"uses", "with", "effect", "risk", "precondition", "postcondition"},
     "set": {"assign"}, "if": {"condition", "then", "else"},
@@ -172,6 +173,7 @@ class _Compiler:
         self.raw, self.source = raw, source
         self.issues: list[DescriptorIssue] = []
         self.ids: dict[str, str] = {}
+        self.scopes: list[tuple[str, tuple[CompiledStep, ...]]] = []
 
     def issue(self, path: str, message: str, code: str = "invalid") -> None:
         self.issues.append(DescriptorIssue(path, message, code))
@@ -223,6 +225,109 @@ class _Compiler:
             for key, item in value.items(): self.values(item, f"{path}.{key}")
         elif isinstance(value, (list, tuple)):
             for index, item in enumerate(value): self.values(item, f"{path}[{index}]")
+
+    def step_references(self, value: Any) -> set[str]:
+        """Return statically named ``steps`` references from expression templates."""
+        found: set[str] = set()
+        if isinstance(value, str):
+            for expression_match in re.finditer(r"\$\{\{(.*?)\}\}", value, re.DOTALL):
+                source = expression_match.group(1)
+                try:
+                    tree = ast.parse(source.strip(), mode="eval")
+                except (SyntaxError, ValueError, RecursionError):
+                    continue
+                for node in ast.walk(tree):
+                    if (
+                        isinstance(node, ast.Attribute)
+                        and isinstance(node.value, ast.Name)
+                        and node.value.id == "steps"
+                    ):
+                        found.add(node.attr)
+                    elif (
+                        isinstance(node, ast.Subscript)
+                        and isinstance(node.value, ast.Name)
+                        and node.value.id == "steps"
+                        and isinstance(node.slice, ast.Constant)
+                        and isinstance(node.slice.value, str)
+                    ):
+                        found.add(node.slice.value)
+        elif isinstance(value, Mapping):
+            for item in value.values():
+                found.update(self.step_references(item))
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                found.update(self.step_references(item))
+        return found
+
+    def validate_scopes(self) -> None:
+        for scope_path, steps in self.scopes:
+            by_id = {step.id: step for step in steps}
+            graph = {step.id: step.depends_on for step in steps}
+            for step in steps:
+                for index, dependency in enumerate(step.depends_on):
+                    dependency_path = f"{step.path}.depends_on[{index}]"
+                    if dependency == step.id:
+                        self.issue(dependency_path, "step cannot depend on itself", "self_dependency")
+                    elif dependency not in by_id:
+                        if dependency in self.ids:
+                            self.issue(dependency_path, f"dependency {dependency!r} is outside sibling scope {scope_path}", "cross_scope_dependency")
+                        else:
+                            self.issue(dependency_path, f"unknown sibling dependency {dependency!r}", "unknown_dependency")
+
+            state: dict[str, int] = {}
+            stack: list[str] = []
+            cyclic: set[str] = set()
+
+            def visit(step_id: str) -> None:
+                state[step_id] = 1
+                stack.append(step_id)
+                for dependency in graph.get(step_id, ()):
+                    if dependency not in graph or dependency == step_id:
+                        continue
+                    if state.get(dependency, 0) == 0:
+                        visit(dependency)
+                    elif state.get(dependency) == 1:
+                        cycle_start = stack.index(dependency)
+                        cyclic.update(stack[cycle_start:])
+                stack.pop()
+                state[step_id] = 2
+
+            for step_id in graph:
+                if state.get(step_id, 0) == 0:
+                    visit(step_id)
+            for step in steps:
+                if step.id in cyclic:
+                    self.issue(f"{step.path}.depends_on", "dependency cycle detected in sibling scope", "dependency_cycle")
+
+            ancestors: dict[str, set[str]] = {}
+
+            def dependencies_of(step_id: str, visiting: set[str]) -> set[str]:
+                if step_id in ancestors:
+                    return ancestors[step_id]
+                if step_id in visiting:
+                    return set()
+                covered: set[str] = set()
+                for dependency in graph.get(step_id, ()):
+                    if dependency in graph:
+                        covered.add(dependency)
+                        covered.update(dependencies_of(dependency, visiting | {step_id}))
+                ancestors[step_id] = covered
+                return covered
+
+            for step in steps:
+                covered = dependencies_of(step.id, set())
+                references = self.step_references(step.params)
+                for case in step.cases:
+                    references.update(self.step_references(case.when))
+                if step.on_error is not None:
+                    references.update(self.step_references(step.on_error.output))
+                sibling_references = references & by_id.keys()
+                for reference in sorted(sibling_references - covered - {step.id}):
+                    self.issue(
+                        step.path,
+                        f"steps reference {reference!r} is not covered by depends_on",
+                        "uncovered_step_reference",
+                    )
 
     def retry(self, value: Any, path: str) -> None:
         obj = self.obj(value, path)
@@ -311,13 +416,16 @@ class _Compiler:
     def steps(self, value: Any, path: str) -> tuple[CompiledStep, ...]:
         items = self.arr(value, path)
         if items is None: return ()
-        result = []
+        result: list[CompiledStep] = []
         for index, value in enumerate(items):
-            step = self.step(value, f"{path}[{index}]")
+            implicit = (result[-1].id,) if result else ()
+            step = self.step(value, f"{path}[{index}]", implicit)
             if step is not None: result.append(step)
-        return tuple(result)
+        compiled = tuple(result)
+        self.scopes.append((path, compiled))
+        return compiled
 
-    def step(self, value: Any, path: str) -> CompiledStep | None:
+    def step(self, value: Any, path: str, implicit_dependencies: tuple[str, ...]) -> CompiledStep | None:
         obj = self.obj(value, path)
         if obj is None: return None
         self.required(obj, ["id", "type"], path)
@@ -327,13 +435,30 @@ class _Compiler:
         if not isinstance(step_id, str) or not _STEP_ID.fullmatch(step_id): self.issue(f"{path}.id", "invalid step id", "format"); step_id = f"invalid_{len(self.ids)}"
         elif step_id in self.ids: self.issue(f"{path}.id", f"duplicate step id; first at {self.ids[step_id]}", "duplicate")
         else: self.ids[step_id] = f"{path}.id"
+        dependencies = implicit_dependencies
+        if "depends_on" in obj:
+            raw_dependencies = self.arr(obj["depends_on"], f"{path}.depends_on")
+            dependencies = ()
+            if raw_dependencies is not None:
+                built_dependencies: list[str] = []
+                seen_dependencies: set[str] = set()
+                for index, dependency in enumerate(raw_dependencies):
+                    dependency_path = f"{path}.depends_on[{index}]"
+                    if not isinstance(dependency, str) or not _STEP_ID.fullmatch(dependency):
+                        self.issue(dependency_path, "must be a valid step id", "format")
+                    elif dependency in seen_dependencies:
+                        self.issue(dependency_path, f"duplicate dependency {dependency!r}", "duplicate")
+                    else:
+                        seen_dependencies.add(dependency)
+                        built_dependencies.append(dependency)
+                dependencies = tuple(built_dependencies)
         if "if" in obj: self.expression(obj["if"], f"{path}.if")
         for key in ("timeout", "attempt_timeout"):
             if key in obj: self.duration(obj[key], f"{path}.{key}")
         if "retry" in obj: self.retry(obj["retry"], f"{path}.retry")
         handler = self.handler(obj["on_error"], f"{path}.on_error") if "on_error" in obj else None
         final = self.steps(obj["finally"], f"{path}.finally") if "finally" in obj else ()
-        excluded = {"id", "type", "on_error", "finally", "steps", "then", "else", "cases", "default"}
+        excluded = {"id", "type", "depends_on", "on_error", "finally", "steps", "then", "else", "cases", "default"}
         params = freeze({key: item for key, item in obj.items() if key not in excluded})
         nested = then_steps = else_steps = default_steps = (); cases: tuple[SwitchCase, ...] = ()
         if step_type == "action":
@@ -402,7 +527,7 @@ class _Compiler:
                 if not isinstance(error.get("message"), str): self.issue(f"{path}.error.message", "must be a string", "type")
                 self.values(error, f"{path}.error")
         elif step_type == "return" and "value" in obj: self.values(obj["value"], f"{path}.value")
-        return CompiledStep(id=step_id, type=step_type, path=path, params=params, steps=nested, then_steps=then_steps, else_steps=else_steps, cases=cases, default_steps=default_steps, on_error=handler, finally_steps=final)
+        return CompiledStep(id=step_id, type=step_type, path=path, depends_on=dependencies, params=params, steps=nested, then_steps=then_steps, else_steps=else_steps, cases=cases, default_steps=default_steps, on_error=handler, finally_steps=final)
 
     def named(self, value: Any, path: str, kind: str) -> Mapping[str, Any]:
         obj = self.obj(value, path)
@@ -437,11 +562,14 @@ class _Compiler:
         defaults = self.obj(root["defaults"], "$.defaults") if "defaults" in root else {}; defaults = defaults or {}; self.unknown(defaults, {"timeout", "retry"}, "$.defaults")
         if "timeout" in defaults: self.duration(defaults["timeout"], "$.defaults.timeout")
         if "retry" in defaults: self.retry(defaults["retry"], "$.defaults.retry")
-        budgets = self.obj(root["budgets"], "$.budgets") if "budgets" in root else {}; budgets = budgets or {}; self.unknown(budgets, {"max_duration", "max_executed_steps", "cleanup_timeout"}, "$.budgets")
+        budgets = self.obj(root["budgets"], "$.budgets") if "budgets" in root else {}; budgets = budgets or {}; self.unknown(budgets, {"max_duration", "max_executed_steps", "cleanup_timeout", "max_concurrency"}, "$.budgets")
         if "budgets" in root: self.required(budgets, ["max_duration", "max_executed_steps"], "$.budgets")
         for key in ("max_duration", "cleanup_timeout"):
             if key in budgets: self.duration(budgets[key], f"$.budgets.{key}")
         if "max_executed_steps" in budgets and (not isinstance(budgets["max_executed_steps"], int) or isinstance(budgets["max_executed_steps"], bool) or budgets["max_executed_steps"] < 1): self.issue("$.budgets.max_executed_steps", "must be a positive integer", "range")
+        if "max_concurrency" in budgets and (not isinstance(budgets["max_concurrency"], int) or isinstance(budgets["max_concurrency"], bool) or not 1 <= budgets["max_concurrency"] <= 64): self.issue("$.budgets.max_concurrency", "must be an integer between 1 and 64", "range")
+        normalized_budgets = dict(budgets)
+        normalized_budgets.setdefault("max_concurrency", 1)
         requires = self.obj(root["requires"], "$.requires") if "requires" in root else {}; policy = self.obj(root["policy"], "$.policy") if "policy" in root else {}; extensions = self.obj(root["extensions"], "$.extensions") if "extensions" in root else {}
         requires, policy, extensions = requires or {}, policy or {}, extensions or {}
         self.unknown(requires, {"runtime", "platforms", "capabilities", "permissions"}, "$.requires"); self.unknown(policy, {"allowed_risk", "confirmation", "untrusted_inputs", "screenshots", "desktop"}, "$.policy")
@@ -452,6 +580,7 @@ class _Compiler:
         steps = self.steps(root.get("steps", []), "$.steps")
         if not steps: self.issue("$.steps", "must contain at least one step", "range")
         handler = self.handler(root["on_error"], "$.on_error") if "on_error" in root else None; final = self.steps(root["finally"], "$.finally") if "finally" in root else ()
+        self.validate_scopes()
         mutable = {name for name, definition in variables.items() if isinstance(definition, Mapping) and definition.get("mutable", False)}
         for step in self.walk(steps, handler, final):
             if step.type == "set":
@@ -460,7 +589,7 @@ class _Compiler:
                     if name not in variables: self.issue(f"{step.path}.assign.{target}", "variable is not declared", "reference")
                     elif name not in mutable: self.issue(f"{step.path}.assign.{target}", "variable is immutable", "policy")
         if self.issues: raise DescriptorError(issues=self.issues)
-        return WorkflowDescriptor(api_version=API_VERSION, name=metadata["name"], steps=steps, source=self.source, description=metadata.get("description"), metadata=freeze(metadata), inputs=freeze(inputs), variables=freeze(variables), outputs=freeze(outputs), requires=freeze(requires), defaults=freeze(defaults), budgets=freeze(budgets), policy=freeze(policy), extensions=freeze(extensions), on_error=handler, finally_steps=final, raw=freeze(root))
+        return WorkflowDescriptor(api_version=API_VERSION, name=metadata["name"], steps=steps, source=self.source, description=metadata.get("description"), metadata=freeze(metadata), inputs=freeze(inputs), variables=freeze(variables), outputs=freeze(outputs), requires=freeze(requires), defaults=freeze(defaults), budgets=freeze(normalized_budgets), policy=freeze(policy), extensions=freeze(extensions), on_error=handler, finally_steps=final, raw=freeze(root))
 
     def walk(self, steps: tuple[CompiledStep, ...], handler: ErrorHandler | None, final: tuple[CompiledStep, ...]) -> list[CompiledStep]:
         result: list[CompiledStep] = []

@@ -339,6 +339,12 @@
         },
         "cleanup_timeout": {
           "$ref": "#/$defs/duration"
+        },
+        "max_concurrency": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 64,
+          "default": 1
         }
       },
       "additionalProperties": false
@@ -638,6 +644,13 @@
         },
         "type": {
           "type": "string"
+        },
+        "depends_on": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/identifier"
+          },
+          "uniqueItems": true
         },
         "description": {
           "type": "string",

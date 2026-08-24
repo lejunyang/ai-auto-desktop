@@ -31,9 +31,9 @@ OCR 必须是显式 `action`，例如 `fixture.ocr@1` 或当前 Tesseract provid
 | `variables` | 否 | 名称到 `{schema, mutable=false, initial}` 的映射；`initial` 可为 JSON literal 或表达式。只有 `mutable: true` 的变量可被 `set` 修改。 |
 | `outputs` | 否 | 名称到 `{value, schema?, sensitive=false}` 的映射；workflow 成功时求值并校验。 |
 | `defaults` | 否 | 未在 step 指定时采用的 `timeout` 和 `retry`。 |
-| `budgets` | 是 | 必须含 `max_duration` 和 `max_executed_steps`；可含取消后的 `cleanup_timeout`。 |
+| `budgets` | 是 | 必须含 `max_duration` 和 `max_executed_steps`；可含取消后的 `cleanup_timeout`，以及 1..64 的 `max_concurrency`（默认 1）。 |
 | `policy` | 否 | 风险上限、确认、污点输入、截图和 desktop writer 策略。descriptor 只能收紧宿主策略。 |
-| `steps` | 是 | 非空、按顺序执行的 step 列表。 |
+| `steps` | 是 | 非空的 step DAG；未写依赖时保持旧版串行顺序。 |
 | `on_error` | 否 | workflow 作用域错误处理器。 |
 | `finally` | 否 | 无论成功、失败、取消或超时均执行的清理步骤。 |
 | `extensions` | 否 | 以 `domain/key` 命名的扩展；必需扩展不受支持时必须失败。 |
@@ -46,6 +46,7 @@ Duration 是不含空格的正整数加 `ms`、`s`、`m` 或 `h`。所有 timeou
 
 每个 step 都必须有作用域内唯一的 `id` 和 `type`，并可带：
 
+- `depends_on`：当前 sibling step scope 内的直接依赖 ID 列表；允许引用定义在后面的 sibling，列表元素必须唯一。
 - `description`：人类说明。
 - `if`：布尔表达式；false 时状态为 `SKIPPED`，不执行 retry/handler，但仍执行该 step 的 `finally`。
 - `timeout`：整个 step 的墙钟预算，包含所有 attempts、backoff、嵌套步骤和 postcondition。
@@ -55,6 +56,10 @@ Duration 是不含空格的正整数加 `ms`、`s`、`m` 或 `h`。所有 timeou
 - `extensions`：命名扩展。
 
 step 路径由嵌套 `id` 构成；`foreach` 运行记录还必须带 index。全局 `max_executed_steps` 计算实际进入执行状态的 step attempt，不能通过嵌套控制流绕开。
+
+每一个 step 列表各自形成独立的 DAG scope，包括顶层 `steps`、`block/foreach/while.steps`、`if.then/else`、每个 `switch` case/default、`on_error.steps` 和 `finally`。`depends_on` 只能指向同一个列表中的 sibling；未知、自引用、跨 scope 引用和环都必须在编译期拒绝。省略 `depends_on` 时，编译器把它规范化为对前一个 sibling 的单一依赖；列表中的第一个 step 规范化为无依赖。显式 `depends_on: []` 表示无依赖，并会打断默认串行链。该规则使未声明依赖的旧 descriptor 保持串行兼容，同时允许显式构建并发分支和汇合点。
+
+`budgets.max_concurrency` 限制整个 workflow 同时运行的 step 数，取值 1..64，省略时编译为 1。调度器只有在一个 step 的全部传递依赖均达到允许的终态后才能运行它，并仍须服从 desktop single-writer、风险、deadline 和执行步数预算。表达式中静态可识别的 `steps.<id>` 或 `steps["id"]` sibling 引用应由该 step 的传递依赖覆盖；外层已完成 step 在嵌套 scope 中仍可见。动态 key 无法可靠静态证明时由运行时按可见性和状态校验。
 
 ## 5. 步骤类型
 
@@ -185,7 +190,7 @@ Manifest 使用相同 `apiVersion`，`kind: CapabilityManifest`，并包含：
 
 | 能力 | v0.x | v1alpha1 目标 |
 | --- | --- | --- |
-| canonical header、metadata、顺序 steps | 支持/优先 | 完整 |
+| canonical header、metadata、step DAG | 编译器支持 DAG 规范化与静态校验；当前 runtime 仍按声明顺序串行执行 | 完整依赖调度与有界并发 |
 | `action` + NDJSON process fixture | 支持/优先 | 多 provider、版本解析、schema 校验 |
 | `set`, `if`, `fail`, `return` | 首版子集 | 完整语义 |
 | `switch`, `foreach`, `while`, `block` | 支持串行有界执行；`foreach.concurrency != 1` 明确拒绝 | 完整且有界 |

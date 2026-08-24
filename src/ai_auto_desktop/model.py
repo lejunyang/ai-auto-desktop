@@ -56,6 +56,7 @@ class CompiledStep:
     id: str
     type: str
     path: str
+    depends_on: tuple[str, ...] = ()
     params: Mapping[str, Any] = field(default_factory=lambda: MappingProxyType({}))
     steps: tuple["CompiledStep", ...] = ()
     then_steps: tuple["CompiledStep", ...] = ()
