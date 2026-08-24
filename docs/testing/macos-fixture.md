@@ -51,3 +51,35 @@ Screen Recording，不加入 pointer 或 `set_value` 自动 fallback。fixture�
 
 该命令按 `SOURCE_PACKAGE_FILES.txt` 白名单生成平铺的规范化源码包，不包含构建结果。接收方
 解压到空目录后即可运行 `./run.sh`。最终对外交付归档应由发布负责人从待交付 revision 生成。
+
+## 在本地验真回传归档
+
+收到 `macos-ax-test-result.tar.gz` 后，不要直接解压或据文件名人工判断。请在本仓库执行：
+
+```sh
+tests/macos/verify-result.sh /absolute/path/macos-ax-test-result.tar.gz
+```
+
+验真器不向磁盘提取任何成员，并对压缩输入、解压后的 tar、单个成员和成员总量设置硬上限。
+它只接受 `run.sh` 生成的四个平铺普通文件，先拒绝路径穿越、重复/额外成员、符号链接、
+硬链接、设备文件及其他特殊类型，再校验 `SHA256SUMS`、报告 schema、状态、checks/summary，
+identity 的固定 bundle ID、架构和 hash 字段，以及生成器承诺的 gzip 无名称/零时间和 tar
+mode、uid/gid、uname/gname、mtime 等归一化元数据。
+
+stdout 始终只有一个 JSON 文档。`archive_valid`（兼容别名 `verified_archive`）只表示归档
+结构、内容 hash 和报告格式自洽；`report_passed` 只表示归档内的报告自称通过，两者都不认证
+回传方或真实 Mac 来源。当前 testkit 没有预置签名、公钥或挑战，因此默认调用即使收到自洽
+的 `passed` 报告，也返回 `trusted_archive=false`、`qualified=false` 和非零退出码。
+
+若测试请求方已经通过与归档回传通道独立的可信渠道取得完整归档 SHA-256，可执行：
+
+```sh
+tests/macos/verify-result.sh \
+  --expected-archive-sha256 <independently-trusted-64-hex> \
+  /absolute/path/macos-ax-test-result.tar.gz
+```
+
+只有预期 hash 匹配且报告为 `passed`，才返回 `trusted_archive=true`、`qualified=true` 和退出码
+`0`。把 hash 和归档由同一回传方、同一消息或同一不可信位置一起提供，不能建立信任，禁止
+据此使用该参数。完整的 `failed`/`unsupported` 报告仍会返回 `archive_valid=true`、
+`report_passed=false`、`qualified=false`；结构、hash 或语义失败则 `archive_valid=false`。

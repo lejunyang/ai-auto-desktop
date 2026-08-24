@@ -1,0 +1,561 @@
+"""Synthetic archive tests for the local macOS result verifier."""
+
+from __future__ import annotations
+
+import hashlib
+import gzip
+import io
+import json
+from pathlib import Path
+import subprocess
+import tarfile
+import tempfile
+import unittest
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+VERIFIER = PROJECT_ROOT / "tests" / "macos" / "verify-result.sh"
+EXPECTED_MEMBERS = (
+    "report.json",
+    "README.txt",
+    "identity.txt",
+    "SHA256SUMS",
+)
+REQUIRED_CHECKS = (
+    "screen_capture_preflight",
+    "accessibility_trust",
+    "bounded_discovery",
+    "roles_and_ambiguity",
+    "type_text_secure_rejected",
+    "focus_and_reread",
+    "set_value_and_reread",
+    "type_text_unicode_and_reread",
+    "press_and_reread",
+)
+
+
+def _report(status: str = "passed") -> bytes:
+    if status == "passed":
+        checks = [
+            {"id": check_id, "status": "pass", "message": "ok"}
+            for check_id in REQUIRED_CHECKS
+        ]
+        message = "macOS AX fixture 测试通过"
+    else:
+        checks = [
+            {
+                "id": "fixture_launch",
+                "status": "fail",
+                "message": "failed",
+            }
+        ]
+        message = "fixture launch failed"
+    document = {
+        "schema_version": "1.0",
+        "kind": "macos_ax_fixture_test",
+        "status": status,
+        "message": message,
+        "timestamp_utc": "2026-08-25T12:34:56Z",
+        "platform": {
+            "os": "macos",
+            "architecture": "arm64",
+            "rosetta_translated": False,
+            "version": "macOS 15.6",
+        },
+        "identity": {
+            "runner_bundle_id": "dev.ai-auto-desktop.testkit.ax-runner",
+            "fixture_bundle_id": "dev.ai-auto-desktop.testkit.fixture",
+            "launcher_declared_identity_stability": "ephemeral",
+        },
+        "permissions": {
+            "accessibility": {
+                "trusted": True,
+                "prompt_requested": False,
+            },
+            "screen_capture": {
+                "preflight_granted": False,
+                "request_attempted": False,
+                "capture_attempted": False,
+            },
+        },
+        "limits": {
+            "target_scope": "fixture_process_only",
+            "screen_content_collected": False,
+        },
+        "checks": checks,
+        "summary": {
+            "passed": sum(
+                check["status"] == "pass" for check in checks
+            ),
+            "failed": sum(
+                check["status"] == "fail" for check in checks
+            ),
+            "total": len(checks),
+        },
+    }
+    return (
+        json.dumps(document, ensure_ascii=False, sort_keys=True).encode() + b"\n"
+    )
+
+
+def _identity() -> bytes:
+    return (
+        "swift=Apple Swift version 6.0\n"
+        "identity_stability=ephemeral\n"
+        "[runner]\n"
+        "designated => identifier runner and anchor apple generic\n"
+        "Identifier=dev.ai-auto-desktop.testkit.ax-runner\n"
+        "TeamIdentifier=TESTTEAM\n"
+        "CDHash=0123456789abcdef0123456789abcdef01234567\n"
+        "architectures=arm64\n"
+        f"sha256={'1' * 64}\n"
+        "[fixture]\n"
+        "designated => identifier fixture and anchor apple generic\n"
+        "Identifier=dev.ai-auto-desktop.testkit.fixture\n"
+        "TeamIdentifier=TESTTEAM\n"
+        "CDHash=89abcdef0123456789abcdef0123456789abcdef\n"
+        "architectures=arm64\n"
+        f"sha256={'2' * 64}\n"
+    ).encode()
+
+
+def _files(status: str = "passed") -> dict[str, bytes]:
+    files = {
+        "report.json": _report(status),
+        "README.txt": "仅包含结构化测试结果。\n".encode(),
+        "identity.txt": _identity(),
+    }
+    files["SHA256SUMS"] = "".join(
+        f"{hashlib.sha256(files[name]).hexdigest()}  {name}\n"
+        for name in EXPECTED_MEMBERS[:3]
+    ).encode()
+    return files
+
+
+def _refresh_manifest(files: dict[str, bytes]) -> None:
+    files["SHA256SUMS"] = "".join(
+        f"{hashlib.sha256(files[name]).hexdigest()}  {name}\n"
+        for name in EXPECTED_MEMBERS[:3]
+    ).encode()
+
+
+def _minimal_unsupported_files() -> dict[str, bytes]:
+    report = {
+        "schema_version": "1.0",
+        "kind": "macos_ax_fixture_test",
+        "status": "unsupported",
+        "message": "requires_macos",
+        "platform": {"os": "Linux", "architecture": "unknown"},
+        "permissions": {
+            "accessibility": {"checked": False, "prompt_requested": False},
+            "screen_capture": {
+                "checked": False,
+                "request_attempted": False,
+                "capture_attempted": False,
+            },
+        },
+        "checks": [],
+        "summary": {"passed": 0, "failed": 0, "total": 0},
+    }
+    files = {
+        "report.json": json.dumps(report, sort_keys=True).encode() + b"\n",
+        "README.txt": b"result only\n",
+        "identity.txt": b"identity_attestation=unavailable\n",
+    }
+    _refresh_manifest(files)
+    return files
+
+
+def _regular(name: str, content: bytes) -> tuple[tarfile.TarInfo, bytes]:
+    member = tarfile.TarInfo(name)
+    member.type = tarfile.REGTYPE
+    member.mode = 0o644
+    member.uid = member.gid = 0
+    member.mtime = 946_684_800
+    member.size = len(content)
+    return member, content
+
+
+def _write_archive(
+    path: Path, entries: list[tuple[tarfile.TarInfo, bytes]],
+    *,
+    gzip_mtime: int = 0,
+) -> None:
+    tar_payload = io.BytesIO()
+    with tarfile.open(
+        fileobj=tar_payload, mode="w", format=tarfile.USTAR_FORMAT
+    ) as archive:
+        for member, content in entries:
+            archive.addfile(
+                member, io.BytesIO(content) if member.isreg() else None
+            )
+    with path.open("wb") as output:
+        with gzip.GzipFile(
+            filename="", mode="wb", fileobj=output, mtime=gzip_mtime
+        ) as stream:
+            stream.write(tar_payload.getvalue())
+
+
+def _regular_entries(
+    files: dict[str, bytes],
+) -> list[tuple[tarfile.TarInfo, bytes]]:
+    return [_regular(name, files[name]) for name in EXPECTED_MEMBERS]
+
+
+class MacOSResultVerifierTests(unittest.TestCase):
+    def _run(
+        self, archive: Path, expected_sha256: str | None = None
+    ) -> tuple[subprocess.CompletedProcess[str], dict[str, object]]:
+        arguments = [str(VERIFIER)]
+        if expected_sha256 is not None:
+            arguments.extend(["--expected-archive-sha256", expected_sha256])
+        arguments.append(str(archive))
+        completed = subprocess.run(
+            arguments,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            check=False,
+            timeout=10,
+        )
+        self.assertEqual(completed.stderr, "")
+        stripped = completed.stdout.strip()
+        value, end = json.JSONDecoder().raw_decode(stripped)
+        self.assertEqual(stripped[end:].strip(), "")
+        self.assertIsInstance(value, dict)
+        return completed, value
+
+    def test_self_consistent_passed_archive_is_not_trusted_by_default(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            archive = Path(temporary) / "macos-ax-test-result.tar.gz"
+            _write_archive(archive, _regular_entries(_files()))
+            completed, result = self._run(archive)
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIs(result["archive_valid"], True)
+        self.assertIs(result["verified_archive"], True)
+        self.assertIs(result["report_passed"], True)
+        self.assertIs(result["trusted_archive"], False)
+        self.assertIs(result["qualified"], False)
+        self.assertEqual(result["error"]["code"], "untrusted_archive")
+        self.assertEqual(result["report"]["architecture"], "arm64")
+        self.assertEqual(
+            result["archive"]["members"], list(EXPECTED_MEMBERS)
+        )
+
+    def test_matching_independently_supplied_archive_hash_qualifies(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            archive = Path(temporary) / "macos-ax-test-result.tar.gz"
+            _write_archive(archive, _regular_entries(_files()))
+            expected = hashlib.sha256(archive.read_bytes()).hexdigest()
+            completed, result = self._run(archive, expected)
+        self.assertEqual(completed.returncode, 0)
+        self.assertIs(result["archive_valid"], True)
+        self.assertIs(result["report_passed"], True)
+        self.assertIs(result["trusted_archive"], True)
+        self.assertIs(result["qualified"], True)
+
+    def test_mismatched_expected_archive_hash_does_not_invalidate_archive(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            archive = Path(temporary) / "macos-ax-test-result.tar.gz"
+            _write_archive(archive, _regular_entries(_files()))
+            completed, result = self._run(archive, "f" * 64)
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIs(result["archive_valid"], True)
+        self.assertIs(result["report_passed"], True)
+        self.assertIs(result["trusted_archive"], False)
+        self.assertEqual(
+            result["error"]["code"], "archive_sha256_mismatch"
+        )
+
+    def test_tampered_member_is_rejected_by_sha256(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            files = _files()
+            files["README.txt"] += b"tampered\n"
+            archive = Path(temporary) / "macos-ax-test-result.tar.gz"
+            _write_archive(archive, _regular_entries(files))
+            completed, result = self._run(archive)
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIs(result["archive_valid"], False)
+        self.assertIs(result["verified_archive"], False)
+        self.assertEqual(result["error"]["code"], "hash_mismatch")
+
+    def test_manifest_accepts_reordered_lines_and_one_or_more_spaces(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            files = _files()
+            order = ("identity.txt", "report.json", "README.txt")
+            separators = (" ", "   ", "\t")
+            files["SHA256SUMS"] = "".join(
+                f"{hashlib.sha256(files[name]).hexdigest()}{separator}{name}\n"
+                for name, separator in zip(order, separators, strict=True)
+            ).encode()
+            archive = Path(temporary) / "macos-ax-test-result.tar.gz"
+            _write_archive(archive, _regular_entries(files))
+            expected = hashlib.sha256(archive.read_bytes()).hexdigest()
+            completed, result = self._run(archive, expected)
+        self.assertEqual(completed.returncode, 0)
+        self.assertIs(result["qualified"], True)
+
+    def test_path_traversal_and_extra_member_are_rejected(self) -> None:
+        cases = (
+            ("../escape", "unsafe_member_path"),
+            ("extra.txt", "extra_member"),
+        )
+        for name, expected_code in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory(
+            ) as temporary:
+                entries = _regular_entries(_files())
+                entries.append(_regular(name, b"unexpected\n"))
+                archive = Path(temporary) / "macos-ax-test-result.tar.gz"
+                _write_archive(archive, entries)
+                completed, result = self._run(archive)
+                self.assertNotEqual(completed.returncode, 0)
+                self.assertEqual(
+                    result["error"]["code"], expected_code
+                )
+
+    def test_oversized_member_is_rejected_before_content_validation(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            files = _files()
+            files["report.json"] = b"x" * (512 * 1024 + 1)
+            archive = Path(temporary) / "macos-ax-test-result.tar.gz"
+            _write_archive(archive, _regular_entries(files))
+            completed, result = self._run(archive)
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertEqual(result["error"]["code"], "member_too_large")
+
+    def test_gzip_bomb_and_truncated_archive_are_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            bomb = root / "bomb.tar.gz"
+            with bomb.open("wb") as output:
+                with gzip.GzipFile(
+                    filename="", mode="wb", fileobj=output, mtime=0
+                ) as stream:
+                    stream.write(b"x" * (4 * 1024 * 1024 + 1))
+            completed, result = self._run(bomb)
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertEqual(
+                result["error"]["code"], "tar_payload_too_large"
+            )
+
+            archive = root / "valid.tar.gz"
+            _write_archive(archive, _regular_entries(_files()))
+            truncated = root / "truncated.tar.gz"
+            truncated.write_bytes(archive.read_bytes()[:-8])
+            completed, result = self._run(truncated)
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertEqual(result["error"]["code"], "invalid_gzip")
+
+    def test_non_normalized_gzip_and_tar_metadata_are_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            archive = Path(temporary) / "gzip-mtime.tar.gz"
+            _write_archive(
+                archive, _regular_entries(_files()), gzip_mtime=123
+            )
+            completed, result = self._run(archive)
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertEqual(
+                result["error"]["code"], "non_normalized_gzip"
+            )
+
+        mutations = (
+            ("mode", 0o600),
+            ("uid", 501),
+            ("gid", 20),
+            ("mtime", 1_700_000_000),
+            ("uname", "alice"),
+            ("gname", "staff"),
+        )
+        for field, value in mutations:
+            with self.subTest(field=field), tempfile.TemporaryDirectory(
+            ) as temporary:
+                entries = _regular_entries(_files())
+                setattr(entries[0][0], field, value)
+                archive = Path(temporary) / "metadata.tar.gz"
+                _write_archive(archive, entries)
+                completed, result = self._run(archive)
+                self.assertNotEqual(completed.returncode, 0)
+                self.assertEqual(
+                    result["error"]["code"],
+                    "non_normalized_tar_metadata",
+                )
+
+    def test_links_devices_and_duplicate_members_are_rejected(self) -> None:
+        special_types = (
+            (tarfile.SYMTYPE, "symlink"),
+            (tarfile.LNKTYPE, "hardlink"),
+            (tarfile.CHRTYPE, "character_device"),
+            (tarfile.BLKTYPE, "block_device"),
+        )
+        for member_type, expected_type in special_types:
+            with self.subTest(
+                member_type=expected_type
+            ), tempfile.TemporaryDirectory() as temporary:
+                files = _files()
+                entries = [
+                    _regular(name, files[name])
+                    for name in EXPECTED_MEMBERS
+                    if name != "README.txt"
+                ]
+                member = tarfile.TarInfo("README.txt")
+                member.type = member_type
+                member.linkname = "report.json"
+                member.devmajor = member.devminor = 1
+                entries.append((member, b""))
+                archive = Path(temporary) / "macos-ax-test-result.tar.gz"
+                _write_archive(archive, entries)
+                completed, result = self._run(archive)
+                self.assertNotEqual(completed.returncode, 0)
+                self.assertEqual(
+                    result["error"]["code"], "unsafe_member_type"
+                )
+                self.assertEqual(
+                    result["error"]["details"]["type"],
+                    expected_type,
+                )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            files = _files()
+            entries = _regular_entries(files)
+            entries.append(_regular("report.json", files["report.json"]))
+            archive = Path(temporary) / "macos-ax-test-result.tar.gz"
+            _write_archive(archive, entries)
+            completed, result = self._run(archive)
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertEqual(result["error"]["code"], "duplicate_member")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            files = _files()
+            entries = [
+                _regular(name, files[name])
+                for name in EXPECTED_MEMBERS
+                if name != "README.txt"
+            ]
+            archive = Path(temporary) / "macos-ax-test-result.tar.gz"
+            _write_archive(archive, entries)
+            completed, result = self._run(archive)
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertEqual(result["error"]["code"], "missing_member")
+
+    def test_input_symlink_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            archive = root / "macos-ax-test-result.tar.gz"
+            _write_archive(archive, _regular_entries(_files()))
+            link = root / "returned.tar.gz"
+            link.symlink_to(archive)
+            completed, result = self._run(link)
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertEqual(result["error"]["code"], "input_symlink")
+
+    def test_failed_report_is_verified_but_not_qualified(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            archive = Path(temporary) / "macos-ax-test-result.tar.gz"
+            _write_archive(archive, _regular_entries(_files("failed")))
+            completed, result = self._run(archive)
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIs(result["archive_valid"], True)
+        self.assertIs(result["verified_archive"], True)
+        self.assertIs(result["report_passed"], False)
+        self.assertIs(result["trusted_archive"], False)
+        self.assertIs(result["qualified"], False)
+        self.assertEqual(result["report"]["status"], "failed")
+        self.assertEqual(
+            result["error"]["code"], "report_not_passed"
+        )
+
+    def test_minimal_unsupported_report_is_verified_not_qualified(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            archive = Path(temporary) / "macos-ax-test-result.tar.gz"
+            _write_archive(
+                archive, _regular_entries(_minimal_unsupported_files())
+            )
+            completed, result = self._run(archive)
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIs(result["archive_valid"], True)
+        self.assertIs(result["verified_archive"], True)
+        self.assertIs(result["report_passed"], False)
+        self.assertIs(result["qualified"], False)
+        self.assertIs(result["identity"]["available"], False)
+        self.assertEqual(result["report"]["status"], "unsupported")
+
+    def test_passed_report_rejects_invalid_identity_fields(self) -> None:
+        mutations = (
+            (
+                "architectures=arm64",
+                "architectures=mips",
+                "invalid_identity_architecture",
+            ),
+            (
+                "Identifier=dev.ai-auto-desktop.testkit.fixture",
+                "Identifier=dev.example.fixture",
+                "invalid_bundle_id",
+            ),
+            (f"sha256={'1' * 64}", "sha256=xyz", "invalid_executable_hash"),
+        )
+        for old, new, expected_code in mutations:
+            with self.subTest(
+                expected_code=expected_code
+            ), tempfile.TemporaryDirectory() as temporary:
+                files = _files()
+                files["identity.txt"] = files["identity.txt"].replace(
+                    old.encode(), new.encode(), 1
+                )
+                _refresh_manifest(files)
+                archive = Path(temporary) / "macos-ax-test-result.tar.gz"
+                _write_archive(archive, _regular_entries(files))
+                completed, result = self._run(archive)
+                self.assertNotEqual(completed.returncode, 0)
+                self.assertEqual(
+                    result["error"]["code"], expected_code
+                )
+
+    def test_passed_report_requires_all_checks_and_consistent_summary(
+        self,
+    ) -> None:
+        mutations = (
+            ("missing_required_checks", lambda report: report["checks"].pop()),
+            (
+                "invalid_report_summary",
+                lambda report: report["summary"].__setitem__("total", 99),
+            ),
+        )
+        for expected_code, mutate in mutations:
+            with self.subTest(
+                expected_code=expected_code
+            ), tempfile.TemporaryDirectory() as temporary:
+                files = _files()
+                report = json.loads(files["report.json"])
+                mutate(report)
+                if expected_code == "missing_required_checks":
+                    report["summary"]["passed"] -= 1
+                    report["summary"]["total"] -= 1
+                files["report.json"] = (
+                    json.dumps(report, sort_keys=True).encode() + b"\n"
+                )
+                files["SHA256SUMS"] = "".join(
+                    f"{hashlib.sha256(files[name]).hexdigest()}  {name}\n"
+                    for name in EXPECTED_MEMBERS[:3]
+                ).encode()
+                archive = Path(temporary) / "macos-ax-test-result.tar.gz"
+                _write_archive(archive, _regular_entries(files))
+                completed, result = self._run(archive)
+                self.assertNotEqual(completed.returncode, 0)
+                self.assertEqual(
+                    result["error"]["code"], expected_code
+                )
+
+
+if __name__ == "__main__":
+    unittest.main()
