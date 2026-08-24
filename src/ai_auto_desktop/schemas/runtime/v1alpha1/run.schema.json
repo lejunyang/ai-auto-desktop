@@ -1,0 +1,102 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.ai-auto-desktop.dev/runtime/v1alpha1/run.schema.json",
+  "title": "AI Auto Desktop Durable Run v1alpha1",
+  "description": "Language-independent snapshot of durable workflow lifecycle state.",
+  "type": "object",
+  "required": [
+    "apiVersion",
+    "kind",
+    "runId",
+    "workflow",
+    "status",
+    "desiredState",
+    "inputs",
+    "createdAt",
+    "updatedAt"
+  ],
+  "properties": {
+    "apiVersion": {
+      "const": "ai-auto-desktop.dev/v1alpha1"
+    },
+    "kind": {
+      "const": "Run"
+    },
+    "runId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256
+    },
+    "workflow": {
+      "type": "object",
+      "required": ["name"],
+      "properties": {
+        "name": {"type": "string", "minLength": 1, "maxLength": 192},
+        "version": {"type": "string", "minLength": 1, "maxLength": 128},
+        "planDigest": {"type": "string", "minLength": 1, "maxLength": 256}
+      },
+      "additionalProperties": false
+    },
+    "status": {
+      "enum": [
+        "pending",
+        "running",
+        "paused",
+        "succeeded",
+        "failed",
+        "timed_out",
+        "cancelled",
+        "unknown_effect"
+      ]
+    },
+    "desiredState": {
+      "enum": ["run", "pause", "cancel"]
+    },
+    "inputs": true,
+    "output": true,
+    "error": true,
+    "checkpoint": true,
+    "ownerLease": {
+      "oneOf": [
+        {"type": "null"},
+        {
+          "type": "object",
+          "required": ["ownerId", "expiresAt"],
+          "properties": {
+            "ownerId": {"type": "string", "minLength": 1, "maxLength": 256},
+            "expiresAt": {"type": "number"}
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "createdAt": {"type": "string", "format": "date-time"},
+    "updatedAt": {"type": "string", "format": "date-time"},
+    "finishedAt": {
+      "oneOf": [
+        {"type": "null"},
+        {"type": "string", "format": "date-time"}
+      ]
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "status": {
+            "enum": ["succeeded", "failed", "timed_out", "cancelled", "unknown_effect"]
+          }
+        },
+        "required": ["status"]
+      },
+      "then": {
+        "required": ["finishedAt"],
+        "properties": {"finishedAt": {"type": "string", "format": "date-time"}}
+      },
+      "else": {
+        "properties": {"finishedAt": {"type": "null"}}
+      }
+    }
+  ],
+  "additionalProperties": false
+}

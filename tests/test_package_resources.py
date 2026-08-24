@@ -23,10 +23,27 @@ PACKAGE_PREFIX = "ai_auto_desktop/schemas"
 SCHEMA_PATHS = (
     "workflow/v1alpha1/workflow.schema.json",
     "capabilities/v1alpha1/capability-manifest.schema.json",
+    "runtime/v1alpha1/run.schema.json",
+    "runtime/v1alpha1/event.schema.json",
 )
 
 
 class PackageResourceTests(unittest.TestCase):
+    def test_public_lifecycle_api_imports(self) -> None:
+        from ai_auto_desktop import (
+            DesiredState,
+            DispatchState,
+            JournalStore,
+            RunService,
+            RunStatus,
+        )
+
+        self.assertEqual(DesiredState.PAUSE.value, "pause")
+        self.assertEqual(DispatchState.EFFECT_UNKNOWN.value, "effect_unknown")
+        self.assertEqual(RunStatus.RUNNING.value, "running")
+        self.assertTrue(callable(JournalStore))
+        self.assertTrue(callable(RunService))
+
     @classmethod
     def setUpClass(cls) -> None:
         cls._temporary_directory = tempfile.TemporaryDirectory()

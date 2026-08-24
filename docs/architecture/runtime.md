@@ -21,13 +21,13 @@
 |---|---|---|
 | 描述符 | JSON/YAML 都归一到唯一形状：`apiVersion: ai-auto-desktop.dev/v1alpha1`、`kind: Workflow`、`metadata.name`；严格校验并编译为冻结模型 | 版本化 canonical schema、迁移工具、签名与兼容策略 |
 | 表达式 | 白名单 Python AST 的只读解释器，不使用 `eval/exec`，禁止所有函数和方法调用 | 保持无 I/O、有限成本、跨语言一致的表达式语义与测试向量 |
-| 步骤与控制流 | `action/set/block/fail/return/script`，以及 `if/switch/foreach/while`、`on_error/finally`；script 默认拒绝 | 可恢复的计划状态机、持久 journal、确定性 reconciliation |
+| 步骤与控制流 | `action/set/block/fail/return/script`、`if/switch/foreach/while`、`on_error/finally`；sibling DAG 已支持有界只读并发；script 默认拒绝 | 可恢复的计划状态机与确定性 reconciliation |
 | 状态 | 当前 run 结果为 `succeeded/failed/timed_out/unknown_effect` | 补全并统一 `SUCCEEDED/FAILED/TIMED_OUT/CANCELLED/UNKNOWN_EFFECT/SKIPPED` |
 | 执行能力 | 长驻 NDJSON fixture/process plugin，用于 OCR mock、桌面 invoke mock、重试和超时测试 | 真实 UIA/AX/AT-SPI driver、输入后备、截图、应用专用 adapter |
 | IPC | stdio NDJSON v0，便于调试和跨语言实现；已校验 manifest schema/action major，尚无完整 wire version 协商 | 保留语义兼容层，迁移到 Protobuf/CBOR 等 IDL + named pipe/Unix socket |
 | 隔离 | process plugin 使用 POSIX 进程组；Linux script 使用 bubblewrap + prlimit，其他平台 fail-closed | Windows Job Object/restricted token；macOS 受控 helper；Linux bubblewrap/OCI；资源与 capability 限额 |
 | 安全 | 结构化错误、script fail-closed、action risk policy、manifest 与 action I/O schema 校验；确认 token/taint 等尚未实现 | 签名插件、系统 secret store、确认 token、完整 taint enforcement、审计与更新回滚 |
-| 平台能力 | 已有只读三端 probe、Windows UIA process driver，以及 Linux KDE/X11 AT-SPI 纵向切片；Windows 真机与 Linux Qt 写动作尚未完成资格验证 | Windows 首先产品化；macOS 与各 Linux desktop profile 分别经过真机验证后分级支持 |
+| 平台能力 | 已有只读三端 probe、Windows UIA 与 macOS AX process driver，以及 Linux KDE/X11 AT-SPI 纵向切片；Linux 自有 GTK3/Qt5 fixture 已通过，Windows/macOS 真机结果待回传 | 各平台按真实应用矩阵分级支持 |
 
 v0 的价值是锁定运行语义并建立故障测试夹具。Windows UIA driver 已开始调用真实原生接口，但在真实 Windows runner 的 fixture app、UIPI 与权限矩阵通过前，仍不能把跨平台 contract 测试当作产品成功率。
 
@@ -87,6 +87,10 @@ Host 还应维护全局 `max_steps`、`max_events`、`max_output_bytes` 等防�
 ## 5. 调度、单写者与确定性回退
 
 一个物理 desktop session 同时只发放一个 writer lease。所有可能改变窗口、焦点、键鼠或剪贴板的步骤串行进入 writer；纯 snapshot、OCR 和无副作用计算只有在声明为 read-only 且不会读取不一致前台状态时才可并发。检测到用户键鼠介入、session 切换、锁屏或 driver generation 变化时，暂停新写入并重新观察。
+
+当前 Python v0 调度器已经按每个 sibling scope 的 `depends_on` 拓扑调度，声明顺序只用于稳定选择和确定性合并。省略依赖的 legacy step 在编译期形成链，因此保持串行；显式 `depends_on: []` 才能建立独立分支。首版并发面刻意收窄为经 provider contract 确认为 `read_only`、没有 retry/handler/finally、也不请求 `desktop.input` 的 action。`set`、script、控制流容器、return/fail 及任何非只读 action 都是全局独占屏障，必须等已在途读取完成后才能运行。
+
+并发 action 各自在隔离的 context/variable snapshot 上求值；事件通过线程安全出口按实际发生顺序实时发布，主调度线程在整批结束后再按 descriptor 顺序提交 `steps.<id>` 结果。只读 worker 若改写 variables、非 step context、已有 step 记录或其他 step 的结果，运行时以 `RUNTIME.CONTEXT_CONFLICT` 失败关闭。guard 为 false 的 `SKIPPED` step 只有在自身 `finally` 完成后才满足依赖；`SUCCEEDED` 和 handler `continue` 同样满足依赖。首个未处理失败、return 或取消一旦被观察到，调度器不再启动新 step：尚未派发的 step 记录为 `scope_terminated`；已派发的 peer 保留真实终态和事件，并以 `discarded_due_to_scope_termination` 标明其结果不再对后续步骤可见。运行时等待所有已派发 action 返回后再进入外层 handler/finally。`max_executed_steps` 的 attempt 预留在线程间原子执行，workflow deadline 与每个 worker 的父 deadline snapshot 共同约束并发任务；取消和 deadline unwind 时，step/workflow `finally` 使用独立的 cleanup deadline。
 
 定位与动作的默认顺序固定为：
 
@@ -166,6 +170,14 @@ workflow deadline
 POSIX worker 使用独立 session/process group，先 `SIGTERM`、宽限期后 `SIGKILL`。当前纯标准库 Windows v0 只能创建新 process group 后对直接进程 terminate/kill，**不能保证终止任意 descendant tree**；正式桌面写能力上线前必须由 Job Object 或等价 supervisor 补齐。取消 Python future 或杀掉父 PID 都不足以证明工作已停止。
 
 retry 需要同时满足：错误 `retryable=true`、step 被声明为 `read_only` 或 `idempotent`、deadline 尚有预算。非幂等的 click/invoke/send/delete/pay/install 在 dispatch 后超时、worker EOF 或 driver 崩溃时返回 `UNKNOWN_EFFECT`，禁止自动重放；Host 只能在重新观察并证明未生效后，由明确策略决定后续动作。
+
+### 8.1 持久运行控制与租约
+
+持久 run 把“外部期望”与“runner 已生效状态”分开：控制面调用 pause、resume 或 cancel 时，只以 CAS 更新 `desiredState` 并在同一事务写入请求事件，不直接声称 run 已暂停或取消。重复请求在非终态为幂等读取；`cancel` 是吸收态，不能被 pause 或 resume 覆盖；任意终态都拒绝后续控制。
+
+operator 不持有 runner 的 bearer token，也不应为提交控制意图而取得它。owner lease 只 fencing runner 对 status、event 与 checkpoint 的写入：runner 必须在安全点读取最新 `desiredState`，再用 owner ID、token 和未过期时间完成原子状态转换。`running → paused` 必须与 `run.paused` 事件及 lease 释放同事务提交；resume 只把期望改回 `run`，随后由 runner 重新 claim lease，才能执行 `paused → running`。取消也只在安全点落为 `CANCELLED`；若请求已 dispatch 且副作用仍无法确认，必须落为 `UNKNOWN_EFFECT`，不能伪装成已安全取消。
+
+JournalStore 只执行调用方给出的敏感标记和存储不变量，不通过内容猜测 secret。RunService 是可信持久化入口：它必须按 descriptor 的 input/output `sensitive` 声明显式传递标记并 fail closed。当前机制不是完整 taint tracking；未实现跨变量、插件响应与派生值的自动敏感传播前，不得宣称能自动防止所有 secret 泄漏。
 
 ## 9. 状态与结构化错误
 

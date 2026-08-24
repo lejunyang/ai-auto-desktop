@@ -29,5 +29,7 @@ where = ["src"]
 ai_auto_desktop = [
     "schemas/workflow/v1alpha1/workflow.schema.json",
     "schemas/capabilities/v1alpha1/capability-manifest.schema.json",
+    "schemas/runtime/v1alpha1/run.schema.json",
+    "schemas/runtime/v1alpha1/event.schema.json",
 ]
 

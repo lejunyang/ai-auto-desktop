@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.ai-auto-desktop.dev/runtime/v1alpha1/event.schema.json",
+  "title": "AI Auto Desktop Journal Event v1alpha1",
+  "description": "One immutable event in a per-run, continuously sequenced journal.",
+  "type": "object",
+  "required": [
+    "apiVersion",
+    "kind",
+    "runId",
+    "seq",
+    "type",
+    "payload",
+    "createdAt"
+  ],
+  "properties": {
+    "apiVersion": {"const": "ai-auto-desktop.dev/v1alpha1"},
+    "kind": {"const": "RunEvent"},
+    "runId": {"type": "string", "minLength": 1, "maxLength": 256},
+    "seq": {"type": "integer", "minimum": 1},
+    "type": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$",
+      "maxLength": 192
+    },
+    "payload": true,
+    "createdAt": {"type": "string", "format": "date-time"}
+  },
+  "additionalProperties": false
+}
