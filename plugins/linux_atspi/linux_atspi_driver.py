@@ -16,6 +16,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import sys
 import time
 from typing import Any, NoReturn, Protocol
@@ -33,6 +34,9 @@ DEFAULT_MAX_NODES = 1000
 MAX_DEPTH = 128
 MAX_NODES = 5000
 MAX_CANDIDATE_SUMMARIES = 10
+# D-Bus 在返回 ``a(so)`` 后才交给 Python 解包；该上限不能避免总线已传输的
+# 数据，但会在解包后立即拒绝异常 fan-out，避免继续复制或遍历无界列表。
+MAX_DBUS_CHILDREN_PER_CALL = MAX_NODES
 
 ACTION_IDS = {
     name: f"{PLUGIN_NAME}.{name}@1"
@@ -724,6 +728,7 @@ class LinuxAtspiDriver:
             "name": node.get("name"),
             "bus_name": provenance.get("bus_name"),
             "object_path": provenance.get("object_path"),
+            "accessible_id": provenance.get("accessible_id"),
             "application_name": provenance.get("application_name"),
             "toolkit_name": provenance.get("toolkit_name"),
             "process_id": provenance.get("process_id"),
@@ -946,8 +951,15 @@ class LinuxAtspiDriver:
             same = self.backend.same_element(
                 record.handles[node_id], fresh.handles[fresh_node_id], deadline=deadline
             )
-        except DriverError:
-            raise
+        except DriverError as exc:
+            if exc.code == "DRIVER.TIMEOUT":
+                raise
+            details = dict(exc.data) if isinstance(exc.data, Mapping) else {}
+            raise DriverError(
+                "DRIVER.STALE_SNAPSHOT",
+                "无法验证原生目标身份",
+                data={"reason": exc.code, **details},
+            ) from exc
         except Exception as exc:
             raise DriverError(
                 "DRIVER.STALE_SNAPSHOT",
@@ -982,6 +994,11 @@ class LinuxAtspiDriver:
                 f"目标不支持原生 {action}",
                 data={"action": action, "available_actions": resolved["actions"]},
             )
+        if isinstance(self.backend, GioAtspiBackend):
+            # Gio fallback intentionally has no write surface.  Return the
+            # backend-specific reason even if a synthetic/stale node claimed
+            # an action, and do so before entering the dispatch boundary.
+            self.backend._unsupported(action)
         _check_deadline(deadline)
         native = fresh.handles[fresh_node_id]
         dispatched = False
@@ -996,8 +1013,19 @@ class LinuxAtspiDriver:
                 backend_result = self.backend.set_text(native, text, deadline=deadline)
             _check_deadline(deadline, post_dispatch=True)
         except DriverError as exc:
+            details = dict(exc.data) if isinstance(exc.data, Mapping) else {}
+            if exc.code == "DRIVER.TIMEOUT" and details.get("phase") == "before_dispatch":
+                dispatched = False
+                raise
+            if exc.code in {
+                "DRIVER.ACTION_UNSUPPORTED",
+                "DRIVER.PROTECTED_ELEMENT",
+                "DRIVER.UNAVAILABLE",
+                "DRIVER.INVALID_REQUEST",
+            }:
+                dispatched = False
+                raise
             if dispatched and exc.code in {"DRIVER.ACTION_FAILED", "DRIVER.TIMEOUT"}:
-                details = dict(exc.data) if isinstance(exc.data, Mapping) else {}
                 details.setdefault("action", action)
                 details["effect"] = "unknown"
                 raise DriverError(
@@ -1143,12 +1171,39 @@ class PyGObjectAtspiBackend:
     def session_info(self) -> Mapping[str, Any]:
         return _environment_session_info()
 
-    @staticmethod
-    def _call_default(obj: Any, method: str, default: Any = None, *args: Any) -> Any:
+    def _bound_timeout(self, deadline: float) -> None:
+        """把 libatspi 的单次同步调用限制在请求剩余预算内。"""
+
+        _check_deadline(deadline)
+        remaining_ms = max(1, min(30_000, int(math.ceil((deadline - time.monotonic()) * 1000))))
         try:
-            return getattr(obj, method)(*args)
+            self.Atspi.set_timeout(remaining_ms, remaining_ms)
+        except Exception as exc:
+            raise DriverError(
+                "DRIVER.ACTION_FAILED",
+                "无法设置 AT-SPI 调用截止时间",
+                data={"exception_type": type(exc).__name__},
+            ) from exc
+
+    def _call_default(
+        self,
+        obj: Any,
+        method: str,
+        default: Any = None,
+        *args: Any,
+        deadline: float | None = None,
+    ) -> Any:
+        if deadline is not None:
+            self._bound_timeout(deadline)
+        try:
+            result = getattr(obj, method)(*args)
         except Exception:
+            if deadline is not None:
+                _check_deadline(deadline)
             return default
+        if deadline is not None:
+            _check_deadline(deadline)
+        return result
 
     @staticmethod
     def _property_default(obj: Any, name: str, default: Any = None) -> Any:
@@ -1170,32 +1225,47 @@ class PyGObjectAtspiBackend:
         object_path = self._property_default(accessible, "path")
         return _safe_text(bus_name), _safe_text(object_path)
 
-    def _application_info(self, application: Any) -> dict[str, Any]:
+    def _application_info(
+        self, application: Any, *, deadline: float
+    ) -> dict[str, Any]:
         bus_name, object_path = self._identity(application)
-        process_id = self._call_default(application, "get_process_id")
+        process_id = self._call_default(
+            application, "get_process_id", deadline=deadline
+        )
         if isinstance(process_id, bool) or not isinstance(process_id, int) or process_id < 0:
             process_id = None
         return {
             "bus_name": bus_name,
             "object_path": object_path,
-            "name": _safe_text(self._call_default(application, "get_name")),
+            "name": _safe_text(
+                self._call_default(application, "get_name", deadline=deadline)
+            ),
             "process_id": process_id,
             "toolkit_name": _safe_text(
-                self._call_default(application, "get_toolkit_name")
+                self._call_default(
+                    application, "get_toolkit_name", deadline=deadline
+                )
             ),
             "toolkit_version": _safe_text(
-                self._call_default(application, "get_toolkit_version")
+                self._call_default(
+                    application, "get_toolkit_version", deadline=deadline
+                )
             ),
             "atspi_version": _safe_text(
-                self._call_default(application, "get_atspi_version")
+                self._call_default(
+                    application, "get_atspi_version", deadline=deadline
+                )
             ),
             "locale": _safe_text(
-                self._call_default(application, "get_object_locale")
+                self._call_default(
+                    application, "get_object_locale", deadline=deadline
+                )
             ),
         }
 
     def _applications(self, *, deadline: float) -> list[tuple[Any, dict[str, Any]]]:
         _check_deadline(deadline)
+        self._bound_timeout(deadline)
         try:
             count = int(self.desktop.get_child_count())
         except Exception as exc:
@@ -1207,6 +1277,7 @@ class PyGObjectAtspiBackend:
         result: list[tuple[Any, dict[str, Any]]] = []
         for index in range(count):
             _check_deadline(deadline)
+            self._bound_timeout(deadline)
             try:
                 application = self.desktop.get_child_at_index(index)
             except Exception:
@@ -1214,7 +1285,9 @@ class PyGObjectAtspiBackend:
                 continue
             if application is None:
                 continue
-            result.append((application, self._application_info(application)))
+            result.append(
+                (application, self._application_info(application, deadline=deadline))
+            )
         return result
 
     def list_applications(self, *, deadline: float) -> Sequence[Mapping[str, Any]]:
@@ -1246,41 +1319,68 @@ class PyGObjectAtspiBackend:
         return candidates[0]
 
     def _state(
-        self, state_set: Any, state_name: str
+        self, state_set: Any, state_name: str, *, deadline: float
     ) -> bool | None:
         state = getattr(self.Atspi.StateType, state_name, None)
         if state is None or state_set is None:
             return None
+        self._bound_timeout(deadline)
         try:
-            return bool(state_set.contains(state))
+            result = bool(state_set.contains(state))
         except Exception:
+            _check_deadline(deadline)
             return None
+        _check_deadline(deadline)
+        return result
 
-    def _interface(self, accessible: Any, getter: str) -> Any | None:
-        try:
-            return getattr(accessible, getter)()
-        except Exception:
-            return None
+    def _interface(
+        self, accessible: Any, getter: str, *, deadline: float
+    ) -> Any | None:
+        return self._call_default(
+            accessible, getter, deadline=deadline
+        )
 
-    def _read_text(self, accessible: Any, *, protected: bool) -> str | None:
+    def _read_text(
+        self, accessible: Any, *, protected: bool, deadline: float
+    ) -> str | None:
         if protected:
             return None
-        text_iface = self._interface(accessible, "get_text_iface")
+        text_iface = self._interface(
+            accessible, "get_text_iface", deadline=deadline
+        )
         if text_iface is None:
             return None
+        raw_count = self._call_default(
+            text_iface, "get_character_count", deadline=deadline
+        )
         try:
-            count = max(0, int(text_iface.get_character_count()))
-            # 线路字段本身有字符上限；不为超长文档读取无界文本。
-            return _safe_text(text_iface.get_text(0, min(count, MAX_FIELD_CHARS)))
-        except Exception:
+            count = max(0, int(raw_count))
+        except (TypeError, ValueError, OverflowError):
             return None
+        # 线路字段本身有字符上限；不为超长文档读取无界文本。
+        return _safe_text(
+            self._call_default(
+                text_iface,
+                "get_text",
+                None,
+                0,
+                min(count, MAX_FIELD_CHARS),
+                deadline=deadline,
+            )
+        )
 
-    def _bounds(self, accessible: Any) -> dict[str, int] | None:
-        component = self._interface(accessible, "get_component_iface")
+    def _bounds(
+        self, accessible: Any, *, deadline: float
+    ) -> dict[str, int] | None:
+        component = self._interface(
+            accessible, "get_component_iface", deadline=deadline
+        )
         if component is None:
             return None
+        self._bound_timeout(deadline)
         try:
             rectangle = component.get_extents(self.Atspi.CoordType.SCREEN)
+            _check_deadline(deadline)
             return {
                 "x": int(rectangle.x),
                 "y": int(rectangle.y),
@@ -1288,15 +1388,23 @@ class PyGObjectAtspiBackend:
                 "height": max(0, int(rectangle.height)),
             }
         except Exception:
+            _check_deadline(deadline)
             return None
 
-    def _action_metadata(self, accessible: Any) -> list[dict[str, Any]]:
-        action_iface = self._interface(accessible, "get_action_iface")
+    def _action_metadata(
+        self, accessible: Any, *, deadline: float
+    ) -> list[dict[str, Any]]:
+        action_iface = self._interface(
+            accessible, "get_action_iface", deadline=deadline
+        )
         if action_iface is None:
             return []
+        raw_count = self._call_default(
+            action_iface, "get_n_actions", deadline=deadline
+        )
         try:
-            count = max(0, int(action_iface.get_n_actions()))
-        except Exception:
+            count = max(0, int(raw_count))
+        except (TypeError, ValueError, OverflowError):
             return []
         actions: list[dict[str, Any]] = []
         for index in range(min(count, 64)):
@@ -1304,16 +1412,24 @@ class PyGObjectAtspiBackend:
                 {
                     "index": index,
                     "name": _safe_text(
-                        self._call_default(action_iface, "get_action_name", None, index)
+                        self._call_default(
+                            action_iface, "get_action_name", None, index, deadline=deadline
+                        )
                     ),
                     "localized_name": _safe_text(
-                        self._call_default(action_iface, "get_localized_name", None, index)
+                        self._call_default(
+                            action_iface, "get_localized_name", None, index, deadline=deadline
+                        )
                     ),
                     "description": _safe_text(
-                        self._call_default(action_iface, "get_action_description", None, index)
+                        self._call_default(
+                            action_iface, "get_action_description", None, index, deadline=deadline
+                        )
                     ),
                     "key_binding": _safe_text(
-                        self._call_default(action_iface, "get_key_binding", None, index)
+                        self._call_default(
+                            action_iface, "get_key_binding", None, index, deadline=deadline
+                        )
                     ),
                 }
             )
@@ -1324,21 +1440,31 @@ class PyGObjectAtspiBackend:
         accessible: Any,
         parent_index: int | None,
         application: Mapping[str, Any],
+        *,
+        deadline: float,
     ) -> BackendNode:
-        state_set = self._call_default(accessible, "get_state_set")
-        role_name = _safe_text(self._call_default(accessible, "get_role_name")) or "unknown"
-        role_enum = self._call_default(accessible, "get_role")
+        state_set = self._call_default(
+            accessible, "get_state_set", deadline=deadline
+        )
+        role_name = _safe_text(
+            self._call_default(accessible, "get_role_name", deadline=deadline)
+        ) or "unknown"
+        role_enum = self._call_default(accessible, "get_role", deadline=deadline)
         role_nick = _safe_text(getattr(role_enum, "value_nick", None))
         role = _normalize_role(role_nick or role_name)
-        protected_state = self._state(state_set, "PROTECTED")
+        protected_state = self._state(state_set, "PROTECTED", deadline=deadline)
         protected = True if _is_protected_role(role) else protected_state
-        editable_iface = self._interface(accessible, "get_editable_text_iface")
-        component_iface = self._interface(accessible, "get_component_iface")
-        action_metadata = self._action_metadata(accessible)
-        enabled = self._state(state_set, "ENABLED")
-        sensitive = self._state(state_set, "SENSITIVE")
-        focusable = self._state(state_set, "FOCUSABLE")
-        editable = self._state(state_set, "EDITABLE")
+        editable_iface = self._interface(
+            accessible, "get_editable_text_iface", deadline=deadline
+        )
+        component_iface = self._interface(
+            accessible, "get_component_iface", deadline=deadline
+        )
+        action_metadata = self._action_metadata(accessible, deadline=deadline)
+        enabled = self._state(state_set, "ENABLED", deadline=deadline)
+        sensitive = self._state(state_set, "SENSITIVE", deadline=deadline)
+        focusable = self._state(state_set, "FOCUSABLE", deadline=deadline)
+        editable = self._state(state_set, "EDITABLE", deadline=deadline)
         actionable = enabled is not False and sensitive is not False
         actions: list[str] = []
         if actionable and focusable is not False and component_iface is not None:
@@ -1354,7 +1480,9 @@ class PyGObjectAtspiBackend:
             and protected is not True
         ):
             actions.append("set_text")
-        raw_attributes = self._call_default(accessible, "get_attributes", {})
+        raw_attributes = self._call_default(
+            accessible, "get_attributes", {}, deadline=deadline
+        )
         attributes: dict[str, str] = {}
         if isinstance(raw_attributes, Mapping):
             for key, value in raw_attributes.items():
@@ -1364,29 +1492,40 @@ class PyGObjectAtspiBackend:
                     attributes[safe_key] = safe_value
         bus_name, object_path = self._identity(accessible)
         accessible_id = _safe_text(
-            self._call_default(accessible, "get_accessible_id")
+            self._call_default(
+                accessible, "get_accessible_id", deadline=deadline
+            )
         )
         return BackendNode(
             native=accessible,
             parent_index=parent_index,
             role=role,
-            name=_safe_text(self._call_default(accessible, "get_name")),
-            description=_safe_text(
-                self._call_default(accessible, "get_description")
+            name=_safe_text(
+                self._call_default(accessible, "get_name", deadline=deadline)
             ),
-            value=self._read_text(accessible, protected=protected is True),
+            description=_safe_text(
+                self._call_default(
+                    accessible, "get_description", deadline=deadline
+                )
+            ),
+            # 无法确认 role 时也不读取 Text，避免属性读取失败后泄露密码内容。
+            value=self._read_text(
+                accessible,
+                protected=protected is True or role == "unknown",
+                deadline=deadline,
+            ),
             attributes=attributes,
             states={
                 "enabled": enabled,
-                "visible": self._state(state_set, "VISIBLE"),
-                "showing": self._state(state_set, "SHOWING"),
+                "visible": self._state(state_set, "VISIBLE", deadline=deadline),
+                "showing": self._state(state_set, "SHOWING", deadline=deadline),
                 "focusable": focusable,
-                "focused": self._state(state_set, "FOCUSED"),
+                "focused": self._state(state_set, "FOCUSED", deadline=deadline),
                 "editable": editable,
                 "sensitive": sensitive,
                 "protected": protected,
             },
-            bounds=self._bounds(accessible),
+            bounds=self._bounds(accessible, deadline=deadline),
             actions=actions,
             provenance={
                 "bus_name": bus_name,
@@ -1415,12 +1554,18 @@ class PyGObjectAtspiBackend:
         truncated = False
         while queue:
             _check_deadline(deadline)
+            self._bound_timeout(deadline)
             if len(nodes) >= max_nodes:
                 truncated = True
                 break
             accessible, parent_index, depth = queue.popleft()
             current_index = len(nodes)
-            nodes.append(self._read_node(accessible, parent_index, info))
+            nodes.append(
+                self._read_node(
+                    accessible, parent_index, info, deadline=deadline
+                )
+            )
+            self._bound_timeout(deadline)
             try:
                 child_count = int(accessible.get_child_count())
             except Exception:
@@ -1440,6 +1585,7 @@ class PyGObjectAtspiBackend:
                     truncated = True
                     break
                 try:
+                    self._bound_timeout(deadline)
                     child = accessible.get_child_at_index(child_index)
                 except Exception:
                     truncated = True
@@ -1452,7 +1598,9 @@ class PyGObjectAtspiBackend:
 
     def focus(self, native: Any, *, deadline: float) -> Any:
         _check_deadline(deadline)
-        component = self._interface(native, "get_component_iface")
+        component = self._interface(
+            native, "get_component_iface", deadline=deadline
+        )
         if component is None:
             raise DriverError(
                 "DRIVER.ACTION_UNSUPPORTED", "目标没有 AT-SPI Component 接口"
@@ -1468,10 +1616,12 @@ class PyGObjectAtspiBackend:
 
     def invoke(self, native: Any, *, deadline: float) -> Any:
         _check_deadline(deadline)
-        action_iface = self._interface(native, "get_action_iface")
+        action_iface = self._interface(
+            native, "get_action_iface", deadline=deadline
+        )
         if action_iface is None:
             raise DriverError("DRIVER.ACTION_UNSUPPORTED", "目标没有 AT-SPI Action 接口")
-        metadata = self._action_metadata(native)
+        metadata = self._action_metadata(native, deadline=deadline)
         if len(metadata) != 1:
             raise DriverError(
                 "DRIVER.ACTION_UNSUPPORTED",
@@ -1493,17 +1643,22 @@ class PyGObjectAtspiBackend:
 
     def set_text(self, native: Any, text: str, *, deadline: float) -> Any:
         _check_deadline(deadline)
-        editable = self._interface(native, "get_editable_text_iface")
+        editable = self._interface(
+            native, "get_editable_text_iface", deadline=deadline
+        )
         if editable is None:
             raise DriverError(
                 "DRIVER.ACTION_UNSUPPORTED", "目标没有 AT-SPI EditableText 接口"
             )
-        state_set = self._call_default(native, "get_state_set")
-        protected = self._state(state_set, "PROTECTED")
-        role_enum = self._call_default(native, "get_role")
+        state_set = self._call_default(
+            native, "get_state_set", deadline=deadline
+        )
+        protected = self._state(state_set, "PROTECTED", deadline=deadline)
+        role_enum = self._call_default(native, "get_role", deadline=deadline)
         role_nick = getattr(role_enum, "value_nick", None)
         role = _normalize_role(
-            role_nick or self._call_default(native, "get_role_name")
+            role_nick
+            or self._call_default(native, "get_role_name", deadline=deadline)
         )
         if protected is True or _is_protected_role(role):
             raise DriverError("DRIVER.PROTECTED_ELEMENT", "受保护文本元素禁止 set_text")
@@ -1527,7 +1682,560 @@ class PyGObjectAtspiBackend:
         current_identity = self._identity(current)
         if not all(previous_identity) or not all(current_identity):
             return False
-        return previous_identity == current_identity
+        previous_accessible_id = _safe_text(
+            self._call_default(
+                previous, "get_accessible_id", deadline=deadline
+            )
+        )
+        current_accessible_id = _safe_text(
+            self._call_default(
+                current, "get_accessible_id", deadline=deadline
+            )
+        )
+        # AT-SPI 没有通用的对象 generation；若 toolkit 也没有提供稳定
+        # AccessibleId，仅凭可能复用的 bus/path 不能证明仍是同一实例。
+        if not previous_accessible_id or not current_accessible_id:
+            return False
+        return (
+            previous_identity == current_identity
+            and previous_accessible_id == current_accessible_id
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class GioAccessibleRef:
+    """Gio fallback 使用的当前 accessibility bus 对象引用。"""
+
+    bus_name: str
+    object_path: str
+
+
+class GioAtspiBackend:
+    """无需 Atspi typelib 的只读 Gio D-Bus fallback。
+
+    该后端只连接当前进程的 session bus，并通过 ``org.a11y.Bus.GetAddress``
+    取得 accessibility bus；不会扫描进程或连接其他用户会话。
+    """
+
+    name = "gio_atspi"
+    ACCESSIBLE = "org.a11y.atspi.Accessible"
+    APPLICATION = "org.a11y.atspi.Application"
+    COMPONENT = "org.a11y.atspi.Component"
+    TEXT = "org.a11y.atspi.Text"
+    PROPERTIES = "org.freedesktop.DBus.Properties"
+    DBUS = "org.freedesktop.DBus"
+    REGISTRY = GioAccessibleRef(
+        "org.a11y.atspi.Registry", "/org/a11y/atspi/accessible/root"
+    )
+    STATE_INDEXES = {
+        "editable": 7,
+        "enabled": 8,
+        "focusable": 11,
+        "focused": 12,
+        "sensitive": 24,
+        "showing": 25,
+        "visible": 30,
+        "read_only": 43,
+    }
+
+    def __init__(self) -> None:
+        try:
+            import gi
+
+            gi.require_version("Gio", "2.0")
+            from gi.repository import Gio, GLib
+        except (ImportError, ValueError, OSError) as exc:
+            raise DriverError(
+                "DRIVER.UNAVAILABLE",
+                "PyGObject Gio 2.0 typelib 未安装或无法加载",
+                data={
+                    "reason": "dependency_missing",
+                    "dependency": "PyGObject Gio 2.0",
+                    "exception_type": type(exc).__name__,
+                },
+            ) from exc
+        self.Gio = Gio
+        self.GLib = GLib
+        try:
+            self.session_bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+            address_reply = self.session_bus.call_sync(
+                "org.a11y.Bus",
+                "/org/a11y/bus",
+                "org.a11y.Bus",
+                "GetAddress",
+                None,
+                GLib.VariantType.new("(s)"),
+                Gio.DBusCallFlags.NONE,
+                3000,
+                None,
+            )
+            address = address_reply.unpack()[0]
+            if not isinstance(address, str) or not address:
+                raise RuntimeError("org.a11y.Bus 返回空地址")
+            flags = (
+                Gio.DBusConnectionFlags.AUTHENTICATION_CLIENT
+                | Gio.DBusConnectionFlags.MESSAGE_BUS_CONNECTION
+            )
+            self.connection = Gio.DBusConnection.new_for_address_sync(
+                address, flags, None, None
+            )
+            # 用真实 registry 读取证明该地址确实是可访问的 AT-SPI bus。
+            self._children(self.REGISTRY, deadline=time.monotonic() + 3.0)
+        except DriverError as exc:
+            raise DriverError(
+                "DRIVER.UNAVAILABLE",
+                "当前会话的 AT-SPI accessibility bus 不可用",
+                data={
+                    "reason": "session_or_bus_unavailable",
+                    "cause_code": exc.code,
+                    "cause_data": _json_safe(exc.data),
+                    "session": _environment_session_info(),
+                },
+            ) from exc
+        except Exception as exc:
+            raise DriverError(
+                "DRIVER.UNAVAILABLE",
+                "无法通过当前 session bus 连接 AT-SPI accessibility bus",
+                data={
+                    "reason": "session_or_bus_unavailable",
+                    "exception_type": type(exc).__name__,
+                    "session": _environment_session_info(),
+                },
+            ) from exc
+
+    def session_info(self) -> Mapping[str, Any]:
+        return _environment_session_info()
+
+    def _timeout_ms(self, deadline: float) -> int:
+        _check_deadline(deadline)
+        remaining = deadline - time.monotonic()
+        return max(1, min(30_000, int(math.ceil(remaining * 1000.0))))
+
+    def _variant(self, signature: str, values: tuple[Any, ...]) -> Any:
+        return self.GLib.Variant(signature, values)
+
+    def _call(
+        self,
+        ref: GioAccessibleRef,
+        interface: str,
+        method: str,
+        *,
+        parameters: Any = None,
+        reply_type: str | None = None,
+        deadline: float,
+    ) -> tuple[Any, ...]:
+        _check_deadline(deadline)
+        try:
+            reply = self.connection.call_sync(
+                ref.bus_name,
+                ref.object_path,
+                interface,
+                method,
+                parameters,
+                None if reply_type is None else self.GLib.VariantType.new(reply_type),
+                self.Gio.DBusCallFlags.NONE,
+                self._timeout_ms(deadline),
+                None,
+            )
+            unpacked = reply.unpack()
+        except Exception as exc:
+            if time.monotonic() >= deadline:
+                _check_deadline(deadline)
+            raise DriverError(
+                "DRIVER.ACTION_FAILED",
+                f"AT-SPI D-Bus 调用 {interface}.{method} 失败",
+                data={
+                    "interface": interface,
+                    "method": method,
+                    "bus_name": ref.bus_name,
+                    "object_path": ref.object_path,
+                    "exception_type": type(exc).__name__,
+                },
+            ) from exc
+        _check_deadline(deadline)
+        if not isinstance(unpacked, tuple):
+            raise DriverError("DRIVER.ACTION_FAILED", "AT-SPI D-Bus 返回了无效响应")
+        return unpacked
+
+    def _try_call(
+        self,
+        ref: GioAccessibleRef,
+        interface: str,
+        method: str,
+        *,
+        parameters: Any = None,
+        reply_type: str | None = None,
+        deadline: float,
+    ) -> tuple[Any, ...] | None:
+        try:
+            return self._call(
+                ref,
+                interface,
+                method,
+                parameters=parameters,
+                reply_type=reply_type,
+                deadline=deadline,
+            )
+        except DriverError as exc:
+            if exc.code == "DRIVER.TIMEOUT":
+                raise
+            return None
+
+    def _get_all(self, ref: GioAccessibleRef, *, deadline: float) -> dict[str, Any]:
+        reply = self._call(
+            ref,
+            self.PROPERTIES,
+            "GetAll",
+            parameters=self._variant("(s)", (self.ACCESSIBLE,)),
+            reply_type="(a{sv})",
+            deadline=deadline,
+        )
+        properties = reply[0]
+        if not isinstance(properties, Mapping):
+            raise DriverError("DRIVER.ACTION_FAILED", "Accessible.GetAll 返回无效属性")
+        return dict(properties)
+
+    def _get_property(
+        self, ref: GioAccessibleRef, interface: str, name: str, *, deadline: float
+    ) -> Any:
+        reply = self._try_call(
+            ref,
+            self.PROPERTIES,
+            "Get",
+            parameters=self._variant("(ss)", (interface, name)),
+            reply_type="(v)",
+            deadline=deadline,
+        )
+        return None if reply is None else reply[0]
+
+    @staticmethod
+    def _reference(raw: Any) -> GioAccessibleRef | None:
+        if not isinstance(raw, (tuple, list)) or len(raw) != 2:
+            return None
+        bus_name, object_path = raw
+        if not isinstance(bus_name, str) or not bus_name.startswith(":"):
+            return None
+        if not isinstance(object_path, str) or not object_path.startswith("/"):
+            return None
+        return GioAccessibleRef(bus_name, object_path)
+
+    def _children(self, ref: GioAccessibleRef, *, deadline: float) -> list[GioAccessibleRef]:
+        reply = self._call(
+            ref, self.ACCESSIBLE, "GetChildren", reply_type="(a(so))", deadline=deadline
+        )
+        if not isinstance(reply[0], (list, tuple)):
+            raise DriverError("DRIVER.ACTION_FAILED", "Accessible.GetChildren 返回无效列表")
+        if len(reply[0]) > MAX_DBUS_CHILDREN_PER_CALL:
+            raise DriverError(
+                "DRIVER.OUTPUT_TOO_LARGE",
+                "Accessible.GetChildren 响应超过单次硬上限",
+                data={
+                    "child_count": len(reply[0]),
+                    "limit": MAX_DBUS_CHILDREN_PER_CALL,
+                    "bus_name": ref.bus_name,
+                    "object_path": ref.object_path,
+                },
+            )
+        children: list[GioAccessibleRef] = []
+        for raw in reply[0]:
+            child = self._reference(raw)
+            if child is not None:
+                children.append(child)
+        return children
+
+    def _process_id(self, bus_name: str, *, deadline: float) -> int | None:
+        reply = self._try_call(
+            GioAccessibleRef("org.freedesktop.DBus", "/org/freedesktop/DBus"),
+            self.DBUS,
+            "GetConnectionUnixProcessID",
+            parameters=self._variant("(s)", (bus_name,)),
+            reply_type="(u)",
+            deadline=deadline,
+        )
+        if reply is None or isinstance(reply[0], bool) or not isinstance(reply[0], int):
+            return None
+        return int(reply[0])
+
+    def _application_info(
+        self, ref: GioAccessibleRef, *, deadline: float
+    ) -> dict[str, Any]:
+        properties = self._get_all(ref, deadline=deadline)
+        return {
+            "bus_name": ref.bus_name,
+            "object_path": ref.object_path,
+            "name": _safe_text(properties.get("Name")),
+            "process_id": self._process_id(ref.bus_name, deadline=deadline),
+            "toolkit_name": _safe_text(
+                self._get_property(ref, self.APPLICATION, "ToolkitName", deadline=deadline)
+            ),
+            "toolkit_version": _safe_text(
+                self._get_property(ref, self.APPLICATION, "Version", deadline=deadline)
+            ),
+            "atspi_version": _safe_text(
+                self._get_property(ref, self.APPLICATION, "AtspiVersion", deadline=deadline)
+            ),
+            "application_id": self._get_property(
+                ref, self.APPLICATION, "Id", deadline=deadline
+            ),
+            "locale": _safe_text(properties.get("Locale")),
+        }
+
+    def _applications(
+        self, *, deadline: float
+    ) -> list[tuple[GioAccessibleRef, dict[str, Any]]]:
+        result: list[tuple[GioAccessibleRef, dict[str, Any]]] = []
+        for ref in self._children(self.REGISTRY, deadline=deadline):
+            _check_deadline(deadline)
+            try:
+                result.append((ref, self._application_info(ref, deadline=deadline)))
+            except DriverError as exc:
+                if exc.code == "DRIVER.TIMEOUT":
+                    raise
+                # 应用可能在枚举期间退出；只跳过该失效对象。
+                continue
+        return result
+
+    def list_applications(self, *, deadline: float) -> Sequence[Mapping[str, Any]]:
+        return [info for _ref, info in self._applications(deadline=deadline)]
+
+    def _resolve_application(
+        self, selector: Mapping[str, Any], *, deadline: float
+    ) -> tuple[GioAccessibleRef, dict[str, Any]]:
+        candidates = [
+            (ref, info)
+            for ref, info in self._applications(deadline=deadline)
+            if all(info.get(key) == value for key, value in selector.items())
+        ]
+        if not candidates:
+            raise DriverError(
+                "DRIVER.NOT_FOUND",
+                "应用选择器没有匹配 AT-SPI application",
+                data={"application": dict(selector)},
+            )
+        if len(candidates) > 1:
+            raise DriverError(
+                "DRIVER.AMBIGUOUS",
+                "应用选择器匹配多个 AT-SPI application",
+                data={
+                    "candidate_count": len(candidates),
+                    "candidates": [info for _ref, info in candidates[:MAX_CANDIDATE_SUMMARIES]],
+                },
+            )
+        return candidates[0]
+
+    def _interfaces(self, ref: GioAccessibleRef, *, deadline: float) -> set[str]:
+        reply = self._try_call(
+            ref, self.ACCESSIBLE, "GetInterfaces", reply_type="(as)", deadline=deadline
+        )
+        if reply is None or not isinstance(reply[0], (list, tuple)):
+            return set()
+        return {str(item) for item in reply[0] if isinstance(item, str)}
+
+    def _state_values(self, ref: GioAccessibleRef, *, deadline: float) -> dict[str, bool | None]:
+        reply = self._try_call(
+            ref, self.ACCESSIBLE, "GetState", reply_type="(au)", deadline=deadline
+        )
+        words = None if reply is None else reply[0]
+        if not isinstance(words, (list, tuple)):
+            return {name: None for name in STATE_NAMES}
+
+        def present(index: int) -> bool:
+            word = index // 32
+            return word < len(words) and bool(int(words[word]) & (1 << (index % 32)))
+
+        values = {
+            name: present(index)
+            for name, index in self.STATE_INDEXES.items()
+            if name != "read_only"
+        }
+        values["protected"] = None
+        return values
+
+    def _role(self, ref: GioAccessibleRef, *, deadline: float) -> str:
+        reply = self._call(
+            ref, self.ACCESSIBLE, "GetRoleName", reply_type="(s)", deadline=deadline
+        )
+        return _normalize_role(reply[0])
+
+    def _bounds(
+        self, ref: GioAccessibleRef, interfaces: set[str], *, deadline: float
+    ) -> dict[str, int] | None:
+        if self.COMPONENT not in interfaces:
+            return None
+        reply = self._try_call(
+            ref,
+            self.COMPONENT,
+            "GetExtents",
+            parameters=self._variant("(u)", (0,)),
+            reply_type="((iiii))",
+            deadline=deadline,
+        )
+        if reply is None or not isinstance(reply[0], (tuple, list)) or len(reply[0]) != 4:
+            return None
+        try:
+            x, y, width, height = (int(item) for item in reply[0])
+        except (TypeError, ValueError, OverflowError):
+            return None
+        return {"x": x, "y": y, "width": max(0, width), "height": max(0, height)}
+
+    def _text_value(
+        self,
+        ref: GioAccessibleRef,
+        interfaces: set[str],
+        *,
+        protected: bool,
+        deadline: float,
+    ) -> str | None:
+        if protected or self.TEXT not in interfaces:
+            return None
+        count = self._get_property(ref, self.TEXT, "CharacterCount", deadline=deadline)
+        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+            return None
+        reply = self._try_call(
+            ref,
+            self.TEXT,
+            "GetText",
+            parameters=self._variant("(ii)", (0, min(count, MAX_FIELD_CHARS))),
+            reply_type="(s)",
+            deadline=deadline,
+        )
+        return None if reply is None else _safe_text(reply[0])
+
+    def _read_node(
+        self,
+        ref: GioAccessibleRef,
+        parent_index: int | None,
+        application: Mapping[str, Any],
+        *,
+        deadline: float,
+    ) -> tuple[BackendNode, int | None]:
+        properties = self._get_all(ref, deadline=deadline)
+        role = self._role(ref, deadline=deadline)
+        interfaces = self._interfaces(ref, deadline=deadline)
+        states = self._state_values(ref, deadline=deadline)
+        protected = _is_protected_role(role)
+        states["protected"] = True if protected else None
+        attributes_raw = properties.get("Attributes")
+        attributes = (
+            {str(key): str(value) for key, value in attributes_raw.items()}
+            if isinstance(attributes_raw, Mapping)
+            else {}
+        )
+        child_count = properties.get("ChildCount")
+        if isinstance(child_count, bool) or not isinstance(child_count, int) or child_count < 0:
+            child_count = None
+        return (
+            BackendNode(
+                native=ref,
+                parent_index=parent_index,
+                role=role,
+                name=_safe_text(properties.get("Name")),
+                description=_safe_text(properties.get("Description")),
+                value=self._text_value(
+                    ref,
+                    interfaces,
+                    protected=protected or role == "unknown",
+                    deadline=deadline,
+                ),
+                attributes=attributes,
+                states=states,
+                bounds=self._bounds(ref, interfaces, deadline=deadline),
+                # Gio fallback 刻意只读；不宣称尚未资格验证的写动作。
+                actions=(),
+                provenance={
+                    "bus_name": ref.bus_name,
+                    "object_path": ref.object_path,
+                    "accessible_id": _safe_text(properties.get("AccessibleId")),
+                    "application_name": application.get("name"),
+                    "toolkit_name": application.get("toolkit_name"),
+                    "process_id": application.get("process_id"),
+                    "value_redacted": protected,
+                    "coordinate_space": "screen",
+                    "atspi_interfaces": sorted(interfaces),
+                },
+            ),
+            child_count,
+        )
+
+    def capture(
+        self,
+        application: Mapping[str, Any],
+        *,
+        max_depth: int,
+        max_nodes: int,
+        deadline: float,
+    ) -> BackendSnapshot:
+        root, info = self._resolve_application(application, deadline=deadline)
+        queue: deque[tuple[GioAccessibleRef, int | None, int]] = deque([(root, None, 0)])
+        nodes: list[BackendNode] = []
+        truncated = False
+        while queue:
+            _check_deadline(deadline)
+            if len(nodes) >= max_nodes:
+                truncated = True
+                break
+            ref, parent_index, depth = queue.popleft()
+            try:
+                node, child_count = self._read_node(
+                    ref, parent_index, info, deadline=deadline
+                )
+            except DriverError as exc:
+                if exc.code == "DRIVER.TIMEOUT":
+                    raise
+                # 节点消失后无法证明该子树完整。
+                truncated = True
+                continue
+            current_index = len(nodes)
+            nodes.append(node)
+            if depth >= max_depth:
+                if child_count is None or child_count > 0:
+                    truncated = True
+                continue
+            try:
+                children = self._children(ref, deadline=deadline)
+            except DriverError as exc:
+                if exc.code in {"DRIVER.TIMEOUT", "DRIVER.OUTPUT_TOO_LARGE"}:
+                    raise
+                truncated = True
+                continue
+            if child_count is None or child_count != len(children):
+                truncated = True
+            for child in children:
+                if len(nodes) + len(queue) >= max_nodes:
+                    truncated = True
+                    break
+                queue.append((child, current_index, depth + 1))
+        return BackendSnapshot(application=info, nodes=nodes, truncated=truncated)
+
+    @staticmethod
+    def _unsupported(action: str) -> NoReturn:
+        raise DriverError(
+            "DRIVER.ACTION_UNSUPPORTED",
+            f"Gio AT-SPI fallback 暂不支持 {action} 写动作",
+            data={"backend": "gio_atspi", "action": action},
+        )
+
+    def focus(self, native: Any, *, deadline: float) -> Any:
+        _check_deadline(deadline)
+        self._unsupported("focus")
+
+    def invoke(self, native: Any, *, deadline: float) -> Any:
+        _check_deadline(deadline)
+        self._unsupported("invoke")
+
+    def set_text(self, native: Any, text: str, *, deadline: float) -> Any:
+        _check_deadline(deadline)
+        self._unsupported("set_text")
+
+    def same_element(self, previous: Any, current: Any, *, deadline: float) -> bool:
+        _check_deadline(deadline)
+        return (
+            isinstance(previous, GioAccessibleRef)
+            and isinstance(current, GioAccessibleRef)
+            and bool(previous.bus_name)
+            and bool(previous.object_path)
+            and previous == current
+        )
 
 
 def create_default_backend() -> AtspiBackend:
@@ -1537,23 +2245,45 @@ def create_default_backend() -> AtspiBackend:
         return UnavailableBackend(
             "platform", platform=sys.platform, required_platform="linux"
         )
-    try:
-        return PyGObjectAtspiBackend()
-    except DriverError as exc:
-        cause_data = dict(exc.data) if isinstance(exc.data, Mapping) else {}
-        reason = cause_data.get("reason")
-        if not isinstance(reason, str) or not reason:
-            reason = "initialization"
+    session = _environment_session_info()
+    session_type = str(session.get("session_type") or "").strip().lower()
+    desktop_entries = {
+        item.upper()
+        for item in re.split(r"[:;]", str(session.get("desktop") or ""))
+        if item
+    }
+    if (
+        session_type != "x11"
+        or not session.get("display")
+        or "KDE" not in desktop_entries
+    ):
         return UnavailableBackend(
-            reason,
-            cause_code=exc.code,
-            cause_message=exc.message,
-            cause_data=cause_data,
+            "unsupported_session",
+            required_session_type="x11",
+            required_desktop="KDE",
+            session=session,
         )
-    except Exception as exc:
-        return UnavailableBackend(
-            "initialization", exception_type=type(exc).__name__
-        )
+    failures: list[dict[str, Any]] = []
+    for backend_type in (PyGObjectAtspiBackend, GioAtspiBackend):
+        try:
+            return backend_type()
+        except DriverError as exc:
+            failures.append(
+                {
+                    "backend": backend_type.__name__,
+                    "code": exc.code,
+                    "message": exc.message,
+                    "data": _json_safe(exc.data),
+                }
+            )
+        except Exception as exc:
+            failures.append(
+                {
+                    "backend": backend_type.__name__,
+                    "exception_type": type(exc).__name__,
+                }
+            )
+    return UnavailableBackend("initialization", attempts=failures)
 
 
 def _wire_deadline(value: Any) -> float:

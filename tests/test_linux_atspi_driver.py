@@ -13,7 +13,7 @@ import time
 import unittest
 from unittest import mock
 
-from ai_auto_desktop.plugin import PluginError, ProcessPlugin
+from ai_auto_desktop.plugin import ProcessPlugin
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -169,6 +169,17 @@ class FakeBackend:
     ) -> bool:
         self.calls.append(("same_element", previous, current))
         return previous == current
+
+
+class IdentityFailureBackend(FakeBackend):
+    def same_element(
+        self, previous: object, current: object, *, deadline: float
+    ) -> bool:
+        raise atspi.DriverError(
+            "DRIVER.ACTION_FAILED",
+            "synthetic identity check failure",
+            data={"operation": "same_element"},
+        )
 
 
 class LinuxAtspiDriverCoreTests(unittest.TestCase):
@@ -372,6 +383,36 @@ class LinuxAtspiDriverCoreTests(unittest.TestCase):
             self.find(old, {"attributes": {"id": "save"}})
         self.assertEqual(stale.exception.code, "DRIVER.STALE_SNAPSHOT")
 
+    def test_identity_check_failure_is_normalized_to_stale_without_dispatch(self) -> None:
+        backend = IdentityFailureBackend()
+        driver = atspi.LinuxAtspiDriver(backend)
+        snapshot = driver.execute(
+            "snapshot",
+            {"application": {"name": "Editor"}},
+            deadline=deadline(),
+        )
+        found = driver.execute(
+            "find",
+            {
+                "snapshot_id": snapshot["snapshot_id"],
+                "revision": snapshot["revision"],
+                "locator": {"attributes": {"id": "save"}},
+            },
+            deadline=deadline(),
+        )
+        with self.assertRaises(atspi.DriverError) as raised:
+            driver.execute(
+                "invoke",
+                {
+                    "target": found["target"],
+                    "locator": {"attributes": {"id": "save"}},
+                },
+                deadline=deadline(),
+            )
+        self.assertEqual(raised.exception.code, "DRIVER.STALE_SNAPSHOT")
+        self.assertEqual(raised.exception.data["reason"], "DRIVER.ACTION_FAILED")
+        self.assertFalse(any(call[0] == "invoke" for call in backend.calls))
+
     def test_truncated_snapshot_fails_closed_for_find_and_write(self) -> None:
         backend = FakeBackend()
         backend.truncated = True
@@ -524,17 +565,105 @@ class LinuxAtspiDriverCoreTests(unittest.TestCase):
                 return ""
 
         backend = object.__new__(atspi.PyGObjectAtspiBackend)
-        backend.Atspi = type("Atspi", (), {"StateType": StateType})
+        backend.Atspi = type(
+            "Atspi",
+            (),
+            {"StateType": StateType, "set_timeout": staticmethod(lambda *_: None)},
+        )
         native_node = backend._read_node(
             Accessible(),
             None,
             {"name": "Login", "toolkit_name": "Qt", "process_id": 9},
+            deadline=deadline(),
         )
         self.assertEqual(native_node.role, "password_text")
         self.assertIsNone(native_node.value)
         self.assertTrue(native_node.states["protected"])
         self.assertTrue(native_node.provenance["value_redacted"])
         self.assertNotIn("set_text", native_node.actions)
+
+    def test_pygobject_adapter_methods_receive_deadline_before_native_dispatch(self) -> None:
+        calls: list[tuple[object, ...]] = []
+
+        class StateType:
+            PROTECTED = "protected"
+
+        class StateSet:
+            def contains(self, state: object) -> bool:
+                calls.append(("contains", state))
+                return False
+
+        class Component:
+            def grab_focus(self) -> bool:
+                calls.append(("grab_focus",))
+                return True
+
+        class Action:
+            def get_n_actions(self) -> int:
+                return 1
+
+            def get_action_name(self, index: int) -> str:
+                return "press"
+
+            def get_localized_name(self, index: int) -> str:
+                return "press"
+
+            def get_action_description(self, index: int) -> str:
+                return "press"
+
+            def get_key_binding(self, index: int) -> str:
+                return ""
+
+            def do_action(self, index: int) -> bool:
+                calls.append(("do_action", index))
+                return True
+
+        class EditableText:
+            def set_text_contents(self, text: str) -> bool:
+                calls.append(("set_text_contents", text))
+                return True
+
+        class Accessible:
+            def get_component_iface(self) -> object:
+                return Component()
+
+            def get_action_iface(self) -> object:
+                return Action()
+
+            def get_editable_text_iface(self) -> object:
+                return EditableText()
+
+            def get_state_set(self) -> object:
+                return StateSet()
+
+            def get_role(self) -> object:
+                return type("Role", (), {"value_nick": "entry"})()
+
+        backend = object.__new__(atspi.PyGObjectAtspiBackend)
+        backend.Atspi = type(
+            "Atspi",
+            (),
+            {
+                "StateType": StateType,
+                "set_timeout": staticmethod(
+                    lambda value, startup: calls.append(
+                        ("set_timeout", value, startup)
+                    )
+                ),
+            },
+        )
+        native = Accessible()
+        self.assertTrue(backend.focus(native, deadline=deadline())["accepted"])
+        self.assertTrue(backend.invoke(native, deadline=deadline())["accepted"])
+        self.assertTrue(
+            backend.set_text(native, "Final", deadline=deadline())["accepted"]
+        )
+        self.assertIn(("grab_focus",), calls)
+        self.assertIn(("do_action", 0), calls)
+        self.assertIn(("set_text_contents", "Final"), calls)
+        self.assertGreaterEqual(
+            sum(1 for call in calls if call[0] == "set_timeout"), 6
+        )
 
     def test_unsupported_action_unknown_effect_and_deadline_are_structured(self) -> None:
         snapshot = self.snapshot()
@@ -739,6 +868,118 @@ class LinuxAtspiProcessTests(unittest.TestCase):
             self.skipTest("当前进程不在可资格验证的 X11 图形会话中")
         applications = backend.list_applications(deadline=deadline())
         self.assertIsInstance(applications, list)
+
+    def test_gio_fallback_write_methods_are_explicitly_unsupported(self) -> None:
+        backend = object.__new__(atspi.GioAtspiBackend)
+        native = atspi.GioAccessibleRef(":1.42", "/org/a11y/atspi/accessible/1")
+        calls = (
+            ("focus", (native,)),
+            ("invoke", (native,)),
+            ("set_text", (native, "value")),
+        )
+        for action, args in calls:
+            with self.subTest(action=action), self.assertRaises(
+                atspi.DriverError
+            ) as raised:
+                getattr(backend, action)(*args, deadline=deadline())
+            self.assertEqual(raised.exception.code, "DRIVER.ACTION_UNSUPPORTED")
+            self.assertEqual(raised.exception.data["backend"], "gio_atspi")
+            self.assertEqual(raised.exception.data["action"], action)
+
+    def test_default_backend_requires_explicit_kde_x11_session(self) -> None:
+        cases = (
+            ({}, "missing session metadata"),
+            (
+                {
+                    "XDG_SESSION_TYPE": "wayland",
+                    "XDG_CURRENT_DESKTOP": "KDE",
+                    "DISPLAY": ":1",
+                },
+                "Wayland",
+            ),
+            (
+                {
+                    "XDG_SESSION_TYPE": "x11",
+                    "XDG_CURRENT_DESKTOP": "GNOME",
+                    "DISPLAY": ":1",
+                },
+                "GNOME",
+            ),
+            (
+                {
+                    "XDG_SESSION_TYPE": "x11",
+                    "XDG_CURRENT_DESKTOP": "NOTKDE",
+                    "DISPLAY": ":1",
+                },
+                "desktop token containing KDE",
+            ),
+            (
+                {
+                    "XDG_SESSION_TYPE": "x11",
+                    "XDG_CURRENT_DESKTOP": "KDE",
+                },
+                "missing DISPLAY",
+            ),
+        )
+        for environment, label in cases:
+            with self.subTest(label=label), mock.patch.dict(
+                os.environ, environment, clear=True
+            ), mock.patch.object(atspi, "PyGObjectAtspiBackend") as pygobject, mock.patch.object(
+                atspi, "GioAtspiBackend"
+            ) as gio:
+                backend = atspi.create_default_backend()
+            self.assertIsInstance(backend, atspi.UnavailableBackend)
+            self.assertEqual(backend.reason, "unsupported_session")
+            pygobject.assert_not_called()
+            gio.assert_not_called()
+
+    def test_default_backend_uses_gio_after_atspi_typelib_failure(self) -> None:
+        fallback = object()
+        environment = {
+            "XDG_SESSION_TYPE": "x11",
+            "XDG_CURRENT_DESKTOP": "KDE",
+            "DISPLAY": ":10.0",
+            "DBUS_SESSION_BUS_ADDRESS": "unix:path=/run/user/1001/bus",
+        }
+
+        class MissingAtspi:
+            def __init__(self) -> None:
+                raise atspi.DriverError(
+                    "DRIVER.UNAVAILABLE",
+                    "missing Atspi",
+                    data={"reason": "dependency_missing"},
+                )
+
+        class GioFallback:
+            def __new__(cls) -> object:
+                return fallback
+
+        with mock.patch.dict(os.environ, environment, clear=True), mock.patch.object(
+            atspi, "PyGObjectAtspiBackend", MissingAtspi
+        ), mock.patch.object(
+            atspi, "GioAtspiBackend", GioFallback
+        ):
+            self.assertIs(atspi.create_default_backend(), fallback)
+
+    def test_gio_children_response_has_post_decode_hard_cap(self) -> None:
+        backend = object.__new__(atspi.GioAtspiBackend)
+        too_many = [
+            (":1.42", f"/org/a11y/atspi/accessible/{index}")
+            for index in range(atspi.MAX_DBUS_CHILDREN_PER_CALL + 1)
+        ]
+        backend._call = mock.Mock(return_value=(too_many,))
+        with self.assertRaises(atspi.DriverError) as raised:
+            backend._children(
+                atspi.GioAccessibleRef(
+                    "org.a11y.atspi.Registry",
+                    "/org/a11y/atspi/accessible/root",
+                ),
+                deadline=deadline(),
+            )
+        self.assertEqual(raised.exception.code, "DRIVER.OUTPUT_TOO_LARGE")
+        self.assertEqual(
+            raised.exception.data["limit"], atspi.MAX_DBUS_CHILDREN_PER_CALL
+        )
 
 
 if __name__ == "__main__":

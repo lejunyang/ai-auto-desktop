@@ -29,9 +29,14 @@
 
 ## 会话和后端报告
 
-驱动启动时只选择一个后端。Linux 上会尝试加载可选的 PyGObject `Atspi 2.0`
-typelib；平台不匹配、依赖缺失、无可访问桌面或初始化失败时，能力清单协商仍然
-成功，而真正的动作返回 `DRIVER.UNAVAILABLE`。不可用状态不会静默改用坐标输入。
+驱动启动时只选择一个后端。Linux 上优先加载可选的 PyGObject `Atspi 2.0`
+typelib；该 typelib 缺失或无法初始化时，再使用 PyGObject `Gio 2.0` 直接调用
+AT-SPI D-Bus wire 接口。Gio 后备通过当前进程的 session bus 调用
+`org.a11y.Bus.GetAddress`，只支持应用枚举和只读快照，三个写动作均返回
+`DRIVER.ACTION_UNSUPPORTED`。两种后端都不可用时，能力清单协商仍然成功，而真正的
+动作返回 `DRIVER.UNAVAILABLE`。任何失败都不会静默改用坐标输入。
+默认后端仅在当前进程环境明确给出 KDE 桌面、`XDG_SESSION_TYPE=x11` 和非空
+`DISPLAY` 时启用；环境缺失、Wayland 或其他桌面 profile 均失败关闭。
 
 观察结果会报告实际 backend 和会话证据，包括可获得的
 `XDG_SESSION_TYPE`、`XDG_CURRENT_DESKTOP`、`DISPLAY` 与
@@ -39,8 +44,10 @@ typelib；平台不匹配、依赖缺失、无可访问桌面或初始化失败�
 资格验证的证明。尤其不能把 `DISPLAY` 存在等同于纯 X11 会话，也不能把 XWayland
 窗口宣称为完整的 Wayland 支持。
 
-真实后端当前以 `pygobject_atspi` 标识；跨平台契约测试使用注入的 fake backend。
-后端抽象隔离了原生对象，因此模拟测试不会 import PyGObject，也不会要求图形会话。
+真实后端分别以 `pygobject_atspi` 和 `gio_atspi` 标识；跨平台契约测试使用注入的
+fake backend。后端抽象隔离了原生对象，因此模拟测试不会 import PyGObject，也不会
+要求图形会话。生产代码只读取当前进程环境，不扫描 `/proc`、不猜测其他会话，也不
+连接其他用户的 session bus。
 
 ## 应用枚举与快照
 
@@ -110,6 +117,11 @@ worker 的 stdin/stdout 使用 UTF-8 NDJSON，一行只能包含一个 JSON 对�
 单帧上限；超限会返回结构化错误而不是输出部分 JSON。非法 UTF-8、非法 JSON 和
 超大请求不会破坏随后合法帧的解析。
 
+Gio 的 `Accessible.GetChildren` 在 D-Bus 返回完整 `a(so)` 后才由绑定解包，因此
+`max_nodes` 不能限制单次 wire 响应本身。驱动另设最多 5000 个 child reference 的
+单次硬上限，并在解包后立即以 `DRIVER.OUTPUT_TOO_LARGE` 拒绝超限结果，不再复制或
+遍历；若需要在传输前限制 fan-out，后续版本必须改用可分页的后端接口。
+
 `deadline_ms` 是 Unix epoch 毫秒绝对时间，并在入口转换为单调时钟截止时间。驱动在
 应用枚举、树遍历、定位和每次原生动作派发前检查截止时间。PyGObject 无法可靠抢占
 一项已经阻塞的同步 D-Bus 调用，因此宿主的进程级 timeout 和 worker 回收仍是最终硬
@@ -124,14 +136,18 @@ worker 的 stdin/stdout 使用 UTF-8 NDJSON，一行只能包含一个 JSON 对�
 plugins/linux_atspi/run.sh
 ```
 
-发行版需要提供 Python 3、PyGObject、AT-SPI 2.0 typelib，以及当前用户图形会话可访问
-的 AT-SPI bus。缺少其中任一条件时，应保守返回 `DRIVER.UNAVAILABLE`。当前实现不以
-root 运行，也不连接其他用户的 D-Bus session。
+发行版需要提供 Python 3、PyGObject，以及当前用户图形会话可访问的 session bus 和
+AT-SPI bus。完整语义后端还需要 `Atspi 2.0` typelib；缺少该 typelib 时，Gio 后备
+仍可提供只读能力。必要条件均不可用时，应保守返回 `DRIVER.UNAVAILABLE`。当前实现
+不以 root 运行，也不连接其他用户的 D-Bus session。
 
 跨平台测试通过 fake backend 验证 manifest、会话报告、快照归一化、精确与多义
 定位、revision/stale、截断保护、三种语义写动作、deadline 和 NDJSON 帧限制。Linux
-真机 smoke 仅在依赖与桌面确实可用时枚举应用；无 GUI、无 typelib 或无 AT-SPI bus
-时保守跳过或确认 `DRIVER.UNAVAILABLE`，不会把测试环境缺失误报为驱动成功。
+真机 smoke 仅在依赖与桌面确实可用时枚举应用并抓取有界快照；无 GUI、无 Gio 或无
+AT-SPI bus 时保守跳过或确认 `DRIVER.UNAVAILABLE`，不会把测试环境缺失误报为驱动
+成功。测试辅助可以从当前用户的 `kwin_x11` 进程恢复遗漏的 KDE/X11 环境变量，但这条
+逻辑不进入生产驱动。System Settings 未注册进 AT-SPI registry 时，测试明确报告当前
+Qt AT-SPI bridge 不可用并跳过，不把进程启动成功误作可访问性支持成功。
 
 “KDE/X11 已资格验证”还需要在固定发行版、Plasma、Xorg 与 Qt 版本上，以 Qt Widgets、
 QML、Dolphin、System Settings、Konsole、对话框、多窗口、虚拟列表和多显示器/DPI
