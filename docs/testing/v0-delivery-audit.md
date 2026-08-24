@@ -31,6 +31,7 @@
 | Windows 显式输入 | UIA fresh resolve + protected/focus/前台 HWND/PID + 分批 Unicode SendInput | 契约和原生 fixture 已就绪；真实 Windows 结果待手动 CI |
 | macOS 显式输入 | AX fresh resolve + Secure Event Input + focus/frontmost + CGEvent progress marker | 契约和真机套件已就绪；真实 Mac 结果待回传 |
 | Linux 显式输入 | AT-SPI fresh resolve + PID/focus + 固定路径 XTest helper；fresh snapshot 验证 | GTK3/Qt5 在本机 KDE/X11 和私有 Xvfb 均通过 |
+| KDE 真实应用矩阵 | `tests/linux/kde_app_qualifier.py` 只启动自有进程、按精确 PID 抓取聚合树；`docs/testing/kde-x11-qualification.md` 记录证据 | Konsole 与 System Settings 只读观察通过；未执行写动作 |
 | Windows 测试门禁 | `.github/workflows/ci.yml` 仅在 `workflow_dispatch` 且 `run_windows_native=true` 时运行 Windows job | 已验证；本轮未触发 |
 | 虚拟机可行性 | `docs/testing/virtual-machine-capability.md` | 当前主机无 `/dev/kvm`/嵌套虚拟化；Windows 用远端 runner，macOS 用 Apple 硬件 |
 | Mac 回传包 | `tests/macos/package-source.sh` 与 `run.sh`；结果包含 report、identity、SHA256 和隐私说明 | 已生成并交付；等待真实结果 |
@@ -47,6 +48,8 @@
 | `8e7d90e` | macOS 显式 Unicode 文本输入与真机套件 |
 | `78e398a` | Linux KDE/X11 显式 XTest 文本输入 |
 | `3098015` | 当前能力、测试边界与路线图同步 |
+| `9875ceb` | Konsole 与 System Settings 真实只读 AT-SPI 资格矩阵 |
+| `4f57e5d` | 本交付审计记录 |
 
 每个提交均包含且仅包含一条 `Co-authored-by: TRAE CLI <noreply@bytedance.com>` trailer。后续文档修订的 commit ID 以 `git log` 为准。
 
@@ -56,6 +59,7 @@
 - Linux 本机：Debian 12、KDE Plasma 5.27.5、Qt 5.15.8、X11 `DISPLAY=:10.0`。
 - Linux 自有 fixture：GTK3 和 Qt5 的 snapshot/find/focus/语义写动作通过；显式 XTest UTF-8 输入后由 fresh AT-SPI snapshot 观察通过。
 - Linux 隔离环境：私有 Xvfb + 私有 session/AT-SPI bus 的 GTK3/Qt5 输入用例通过。
+- Linux 真实应用只读矩阵：Konsole 22.12.3 的 352 个节点、System Settings 5.27.5 的 256 个节点均通过精确 PID 选择和未截断快照；写动作派发数为零，详细聚合指标见 `docs/testing/kde-x11-qualification.md`。
 - Windows：跨平台契约与 ctypes ABI 测试通过，Windows-only fixture 在非 Windows 主机跳过；远端 CI 未触发。
 - macOS：driver/testkit 静态与协议测试通过，源码包可复现；当前 Linux 主机无法编译或执行 Apple framework。
 - `python -m compileall -q src plugins tests`、`git diff --check` 和 XTest helper 本机构建通过。
@@ -66,7 +70,7 @@
 
 - Windows：等待用户允许后手动触发 `workflow_dispatch(run_windows_native=true)`，还需记录 runner、系统版本、commit SHA、fixture 结果和 UIPI/secure desktop 边界。
 - macOS：等待真实 Mac 回传 `macos-ax-test-result.tar.gz`，必须核验 `report.json` 为 `passed`，并检查 identity、架构与 SHA-256。
-- Linux：自有 GTK3/Qt5 已通过；Konsole、System Settings、Dolphin/QML 等真实应用仍按独立矩阵记录，不以 fixture 成功外推。
+- Linux：自有 GTK3/Qt5 已通过；Konsole 与 System Settings 已完成初始窗口的只读矩阵，写动作、Dolphin、更多 QML 页面、多窗口和动态页面仍待独立资格验证。
 
 ## 6. 下一阶段
 
