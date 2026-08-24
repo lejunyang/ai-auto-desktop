@@ -190,16 +190,16 @@ Manifest 使用相同 `apiVersion`，`kind: CapabilityManifest`，并包含：
 
 | 能力 | v0.x | v1alpha1 目标 |
 | --- | --- | --- |
-| canonical header、metadata、step DAG | 编译器支持 DAG 规范化与静态校验；当前 runtime 仍按声明顺序串行执行 | 完整依赖调度与有界并发 |
+| canonical header、metadata、step DAG | 编译器支持 DAG 规范化与静态校验；runtime 按 sibling 依赖调度，并在全局 `max_concurrency` 内并发独立的只读 action | 扩展到更多可证明无冲突的纯计算步骤 |
 | `action` + NDJSON process fixture | 支持/优先 | 多 provider、版本解析、schema 校验 |
 | `set`, `if`, `fail`, `return` | 首版子集 | 完整语义 |
 | `switch`, `foreach`, `while`, `block` | 支持串行有界执行；`foreach.concurrency != 1` 明确拒绝 | 完整且有界 |
 | `script` | 默认关闭；仅 Linux bubblewrap + prlimit 可用时执行 | 三端独立进程和 deny-by-default sandbox |
-| retry/on_error/finally | 支持基础语义、父子 deadline 与 unknown effect | 持久恢复与取消 |
+| retry/on_error/finally | 支持基础语义、父子 deadline、合作式取消与 unknown effect | 持久恢复与协议级取消 |
 | budgets、risk/permission/confirmation policy | 支持执行预算与 fail-closed 前置检查 | journal/reconciliation、真实确认 token |
 | Windows UIA | 首个进程 driver：list/snapshot/find/focus/invoke/set_value；待 Windows 真机资格测试 | 完整 driver |
-| macOS AX | 仅只读 capability probe | 签名稳定的真实平台 driver |
-| Linux AT-SPI | KDE/X11 driver；本机 Gio fallback 已验证只读枚举与 snapshot，Qt 写动作待验证 | 按 desktop/session profile 分级的真实 driver |
+| macOS AX | 已实现进程 driver 与自包含真机测试包；真实 Mac TCC 结果待回传 | 签名稳定且经过应用矩阵验证的正式 driver |
+| Linux AT-SPI | KDE/X11 driver；本机 GTK3 与 Qt 5 Widgets 自有 fixture 已验证语义读取和写动作，真实 KDE 应用矩阵待验证 | 按 desktop/session profile 分级的真实 driver |
 | OCR engine | 显式 Tesseract 图片 provider；不自行截图 | 受控 frame/capture provenance |
 
 运行时遇到合法但未实现的规范字段必须明确返回 `CAPABILITY.MISSING`、`DESCRIPTOR.VERSION_UNSUPPORTED` 或实现定义的结构化 unsupported 错误；不得静默忽略。

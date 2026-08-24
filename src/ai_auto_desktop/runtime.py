@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import ast
+from concurrent.futures import Future, ThreadPoolExecutor
 import fnmatch
 import random
 import re
 import sys
+import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
-from pathlib import Path
 from typing import Any
 
 from .compiler import parse_duration
@@ -31,6 +32,68 @@ RUNTIME_VERSION = "0.1.0"
 class _ReturnFlow(Exception):
     def __init__(self, value: Any) -> None:
         self.value = value
+
+
+class _AttemptBudget:
+    """Atomically account for attempts shared by parallel step runners."""
+
+    def __init__(self) -> None:
+        self.executed = 0
+        self._lock = threading.Lock()
+
+    def ensure_available(self, limit: int | None) -> None:
+        if limit is None:
+            return
+        with self._lock:
+            if self.executed >= limit:
+                raise AutomationError(
+                    "WORKFLOW.STEP_LIMIT",
+                    "Workflow step budget exceeded",
+                    details={"max_executed_steps": limit},
+                )
+
+    def reserve(self, limit: int | None) -> None:
+        with self._lock:
+            if limit is not None and self.executed >= limit:
+                raise AutomationError(
+                    "WORKFLOW.STEP_LIMIT",
+                    "Workflow step budget exceeded",
+                    details={"max_executed_steps": limit},
+                )
+            self.executed += 1
+
+    def available(self, limit: int | None) -> int | None:
+        if limit is None:
+            return None
+        with self._lock:
+            return max(0, limit - self.executed)
+
+    def reserve_batch(self, requested: int, limit: int | None) -> int:
+        with self._lock:
+            reserved = (
+                requested
+                if limit is None
+                else min(requested, max(0, limit - self.executed))
+            )
+            self.executed += reserved
+            return reserved
+
+    def release(self, count: int = 1) -> None:
+        with self._lock:
+            self.executed = max(0, self.executed - count)
+
+
+class _StepOutcome:
+    def __init__(
+        self,
+        runner: "WorkflowRunner",
+        *,
+        error: AutomationError | None = None,
+        returned: _ReturnFlow | None = None,
+    ) -> None:
+        self.runner = runner
+        self.error = error
+        self.returned = returned
 
 
 class WorkflowRunner:
@@ -62,11 +125,33 @@ class WorkflowRunner:
         self.variables: dict[str, Any] = {}
         self._deadline: float | None = None
         self._deadline_stack: list[float] = []
+        self._attempt_budget = _AttemptBudget()
+        self._cancelled = threading.Event()
+        self._run_lock = threading.Lock()
+        self._pre_reserved_attempts = 0
         self._executed = 0
 
     def run(self, inputs: Mapping[str, Any] | None = None) -> RunResult:
+        if not self._run_lock.acquire(blocking=False):
+            return RunResult(
+                "failed",
+                error=AutomationError(
+                    "RUNTIME.INVALID_STATE",
+                    "WorkflowRunner is already running",
+                    category="runtime",
+                ),
+            )
+        try:
+            return self._run(inputs)
+        finally:
+            self._cancelled.clear()
+            self._run_lock.release()
+
+    def _run(self, inputs: Mapping[str, Any] | None = None) -> RunResult:
         self.events, self.step_records, self._executed = [], {}, 0
         self._deadline_stack = []
+        self._attempt_budget = _AttemptBudget()
+        self._pre_reserved_attempts = 0
         self._handler_output = MISSING
         budget = _duration(self.descriptor.budgets.get("max_duration"))
         self._deadline = time.monotonic() + budget if budget else None
@@ -109,6 +194,7 @@ class WorkflowRunner:
                 error = AutomationError("WORKFLOW.FINALLY_FAILED", "Workflow cleanup failed", phase="cleanup", cause=cleanup_error)
         finally:
             self._deadline = original_deadline
+            self._executed = self._attempt_budget.executed
             for name in self._owned:
                 self.plugins[name].close()
 
@@ -135,6 +221,14 @@ class WorkflowRunner:
 
     def close(self) -> None:
         for name in self._owned: self.plugins[name].close()
+
+    def cancel(self) -> None:
+        """Request cooperative cancellation and prevent new step dispatch."""
+
+        self._cancelled.set()
+
+    def _new_execution_worker(self) -> "WorkflowRunner":
+        return object.__new__(WorkflowRunner)
 
     def _prepare_inputs(self, supplied: dict[str, Any]) -> dict[str, Any]:
         extras = set(supplied) - set(self.descriptor.inputs)
@@ -271,20 +365,475 @@ class WorkflowRunner:
         ]
         return max(0.0, min(deadlines) - time.monotonic()) if deadlines else None
 
-    def _check_budget(self, cleanup: bool = False) -> None:
+    def _check_control(self, cleanup: bool = False) -> None:
+        if self._cancelled.is_set() and not cleanup:
+            raise AutomationError(
+                "WORKFLOW.CANCELLED",
+                "Workflow execution was cancelled",
+                phase="execute",
+            )
         if self._remaining() == 0: raise AutomationError("WORKFLOW.TIMEOUT", "Workflow deadline exceeded", phase="execute")
-        limit = self.descriptor.budgets.get("max_executed_steps")
-        if limit is not None and self._executed >= limit and not cleanup: raise AutomationError("WORKFLOW.STEP_LIMIT", "Workflow step budget exceeded", details={"max_executed_steps": limit})
+
+    def _check_budget(self, cleanup: bool = False) -> None:
+        self._check_control(cleanup)
+        if not cleanup and not self._pre_reserved_attempts:
+            self._attempt_budget.ensure_available(
+                self.descriptor.budgets.get("max_executed_steps")
+            )
+
+    def _sleep_interruptibly(
+        self,
+        seconds: float,
+        local_deadline: float | None = None,
+        *,
+        cleanup: bool = False,
+    ) -> None:
+        deadline = time.monotonic() + seconds
+        while True:
+            if self._cancelled.is_set() and not cleanup:
+                raise AutomationError(
+                    "WORKFLOW.CANCELLED",
+                    "Workflow execution was cancelled",
+                    phase="execute",
+                )
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            parent_remaining = self._remaining(local_deadline)
+            if parent_remaining == 0:
+                return
+            wait_for = min(remaining, 0.05)
+            if parent_remaining is not None:
+                wait_for = min(wait_for, parent_remaining)
+            self._cancelled.wait(wait_for)
 
     def _event(self, event: str, **fields: Any) -> None:
         record = {"event": event, "time": time.time(), **fields}; self.events.append(record)
         if self.event_sink: self.event_sink(record)
 
     def _run_steps(self, steps: Sequence[CompiledStep], cleanup: bool = False) -> None:
-        for step in steps: self._run_step(step, cleanup)
+        if not steps:
+            return
+        max_concurrency = (
+            1
+            if cleanup
+            else int(self.descriptor.budgets.get("max_concurrency", 1))
+        )
+        pending = {step.id: step for step in steps}
+        completed: set[str] = set()
+        order = {step.id: index for index, step in enumerate(steps)}
 
-    def _run_step(self, step: CompiledStep, cleanup: bool = False) -> Any:
-        self._check_budget(cleanup)
+        while pending:
+            try:
+                self._check_control(cleanup)
+            except AutomationError as control_error:
+                for step in steps:
+                    if step.id in pending:
+                        self._mark_scope_terminated(
+                            step, control_error.code.lower()
+                        )
+                raise
+            ready = [
+                step
+                for step in steps
+                if step.id in pending
+                and all(dependency in completed for dependency in step.depends_on)
+            ]
+            if not ready:
+                raise AutomationError(
+                    "RUNTIME.INVALID_PLAN",
+                    "Sibling step dependencies cannot be scheduled",
+                    category="runtime",
+                )
+
+            first = ready[0]
+            parallel: list[tuple[CompiledStep, Mapping[str, Any]]] = []
+            if max_concurrency > 1 and not cleanup:
+                parallel_plugins: set[int] = set()
+                available = self._attempt_budget.available(
+                    self.descriptor.budgets.get("max_executed_steps")
+                )
+                candidate_limit = (
+                    max_concurrency
+                    if available is None
+                    else min(max_concurrency, available)
+                )
+                for step in ready:
+                    if len(parallel) >= candidate_limit:
+                        break
+                    try:
+                        contract = self._parallel_action_contract(step)
+                    except AutomationError:
+                        parallel = []
+                        break
+                    if contract is None:
+                        parallel = []
+                        break
+                    capability = step.params["uses"].rsplit(".", 1)[0]
+                    plugin_identity = id(self.plugins[capability])
+                    if plugin_identity in parallel_plugins:
+                        break
+                    parallel.append((step, contract))
+                    parallel_plugins.add(plugin_identity)
+
+            if len(parallel) < 2:
+                del pending[first.id]
+                self._run_step(first, cleanup)
+                completed.add(first.id)
+                continue
+
+            for step, _ in parallel:
+                del pending[step.id]
+            outcomes = self._run_parallel_actions(parallel)
+            started_ids = set(outcomes)
+            for step, _ in parallel:
+                if step.id in started_ids:
+                    self.step_records.update(
+                        outcomes[step.id].runner.step_records
+                    )
+            for step, _ in parallel:
+                if step.id not in started_ids:
+                    pending[step.id] = step
+            terminal_order = next(
+                (
+                    (order[step.id], step.id)
+                    for step, _ in parallel
+                    if step.id in started_ids
+                    and (
+                        outcomes[step.id].error is not None
+                        or outcomes[step.id].returned is not None
+                    )
+                ),
+                None,
+            )
+            terminal: _StepOutcome | None = None
+            try:
+                for step, _ in sorted(
+                    (item for item in parallel if item[0].id in started_ids),
+                    key=lambda item: order[item[0].id],
+                ):
+                    outcome = outcomes[step.id]
+                    if (
+                        terminal_order is None
+                        or order[step.id] <= terminal_order[0]
+                    ):
+                        self._merge_parallel_outcome(step, outcome)
+                        completed.add(step.id)
+                    else:
+                        self._record_parallel_terminal_only(step, outcome)
+                    if terminal is None and (
+                        outcome.error is not None
+                        or outcome.returned is not None
+                    ):
+                        terminal = outcome
+            except AutomationError as merge_error:
+                for step, _ in parallel:
+                    if step.id in started_ids and step.id not in completed:
+                        self.step_records[step.id][
+                            "discarded_due_to_context_conflict"
+                        ] = True
+                for step in steps:
+                    if step.id in pending:
+                        self._mark_scope_terminated(step, "context_merge")
+                raise merge_error
+            if terminal is not None:
+                assert terminal_order is not None
+                terminal_step_id = terminal_order[1]
+                pending_ids = set(pending)
+                for step in steps:
+                    if step.id in pending_ids:
+                        self._mark_scope_terminated(step, terminal_step_id)
+                if terminal.returned is not None:
+                    raise terminal.returned
+                assert terminal.error is not None
+                raise terminal.error
+        self._check_control(cleanup)
+
+    def _run_unwind_steps(self, steps: Sequence[CompiledStep]) -> None:
+        if not steps:
+            return
+        cleanup_timeout = (
+            _duration(self.descriptor.budgets.get("cleanup_timeout"), 5.0)
+            or 5.0
+        )
+        previous_deadline = self._deadline
+        previous_stack = self._deadline_stack
+        self._deadline = time.monotonic() + cleanup_timeout
+        self._deadline_stack = []
+        try:
+            self._run_steps(steps, cleanup=True)
+        finally:
+            self._deadline = previous_deadline
+            self._deadline_stack = previous_stack
+
+    def _parallel_action_contract(
+        self, step: CompiledStep
+    ) -> Mapping[str, Any] | None:
+        """Return a contract only when a step is safe for parallel isolation."""
+
+        if (
+            step.type != "action"
+            or step.on_error is not None
+            or step.finally_steps
+            or "if" in step.params
+            or "retry" in step.params
+            or int(
+                thaw(
+                    step.params.get(
+                        "retry",
+                        self.descriptor.defaults.get(
+                            "retry", {"max_attempts": 1}
+                        ),
+                    )
+                ).get("max_attempts", 1)
+            )
+            != 1
+        ):
+            return None
+        contract = self._resolve_action_contract(step)
+        if self._effective_action_effect(step, contract=contract) != "read_only":
+            return None
+        permissions = set(contract.get("permissions", ()))
+        plugin = self.plugins[step.params["uses"].rsplit(".", 1)[0]]
+        if isinstance(plugin.manifest, Mapping):
+            permissions.update(plugin.manifest.get("permissions", ()))
+        uses = step.params["uses"]
+        capability = uses.rsplit(".", 1)[0]
+        if (
+            "desktop.input" in permissions
+            or capability == "desktop"
+            or capability.startswith("desktop.")
+        ):
+            return None
+        return contract
+
+    def _run_parallel_actions(
+        self, steps: Sequence[tuple[CompiledStep, Mapping[str, Any]]]
+    ) -> dict[str, _StepOutcome]:
+        try:
+            base_context = _clone_runtime_value(self.context)
+            base_variables = _clone_runtime_value(self.variables)
+        except Exception as error:
+            raise AutomationError(
+                "RUNTIME.CONTEXT_CONFLICT",
+                "Parallel action context could not be isolated",
+                category="runtime",
+                cause=error,
+            ) from error
+        workers: list[tuple[CompiledStep, WorkflowRunner]] = []
+        limit = self.descriptor.budgets.get("max_executed_steps")
+        available = self._attempt_budget.available(limit)
+        if available is not None:
+            steps = steps[:available]
+        for step, _ in steps:
+            worker = self._parallel_worker(base_context, base_variables)
+            workers.append((step, worker))
+
+        reserved = self._attempt_budget.reserve_batch(len(workers), limit)
+        workers = workers[:reserved]
+        if not workers:
+            self._attempt_budget.ensure_available(limit)
+            raise AssertionError("unreachable")
+
+        futures: dict[str, Future[_StepOutcome]] = {}
+        event_lock = threading.Lock()
+
+        def publish(event: Mapping[str, Any]) -> None:
+            with event_lock:
+                record = dict(event)
+                record["time"] = time.time()
+                self.events.append(record)
+                if self.event_sink:
+                    self.event_sink(record)
+
+        submitted = 0
+        executor: ThreadPoolExecutor | None = None
+        try:
+            executor = ThreadPoolExecutor(max_workers=len(workers))
+            for (step, worker), (_, contract) in zip(workers, steps):
+                worker.event_sink = publish
+                futures[step.id] = executor.submit(
+                    self._parallel_step_outcome, worker, step, contract
+                )
+                submitted += 1
+            return {
+                step.id: futures[step.id].result() for step, _ in workers
+            }
+        finally:
+            if executor is not None:
+                executor.shutdown(wait=True)
+            unused = reserved - submitted
+            if unused:
+                self._attempt_budget.release(unused)
+                for _, worker in workers[submitted:]:
+                    worker._pre_reserved_attempts = 0
+
+    def _parallel_worker(
+        self, context: Mapping[str, Any], variables: Mapping[str, Any]
+    ) -> "WorkflowRunner":
+        try:
+            worker = self._new_execution_worker()
+            worker.descriptor = self.descriptor
+            worker.allow_scripts = self.allow_scripts
+            worker.granted_permissions = self.granted_permissions
+            worker.event_sink = None
+            worker.plugins = self.plugins
+            worker._owned = set()
+            worker.events = []
+            worker.step_records = {}
+            worker.context = _clone_runtime_value(context)
+            worker.variables = _clone_runtime_value(variables)
+        except Exception as error:
+            raise AutomationError(
+                "RUNTIME.CONTEXT_CONFLICT",
+                "Parallel action context could not be isolated",
+                category="runtime",
+                cause=error,
+            ) from error
+        worker.context["vars"] = worker.variables
+        worker._deadline = self._deadline
+        worker._deadline_stack = list(self._deadline_stack)
+        worker._attempt_budget = self._attempt_budget
+        worker._cancelled = self._cancelled
+        worker._pre_reserved_attempts = 1
+        worker._executed = 0
+        worker._handler_output = MISSING
+        return worker
+
+    @staticmethod
+    def _parallel_step_outcome(
+        worker: "WorkflowRunner",
+        step: CompiledStep,
+        contract: Mapping[str, Any],
+    ) -> _StepOutcome:
+        try:
+            worker._run_step(step, action_contract=contract)
+        except _ReturnFlow as returned:
+            return _StepOutcome(worker, returned=returned)
+        except AutomationError as error:
+            return _StepOutcome(worker, error=error)
+        except Exception as error:  # pragma: no cover - defensive boundary
+            return _StepOutcome(worker, error=ensure_automation_error(error))
+        return _StepOutcome(worker)
+
+    def _merge_parallel_outcome(
+        self, step: CompiledStep, outcome: _StepOutcome
+    ) -> None:
+        worker = outcome.runner
+        try:
+            variables_unchanged = _values_equal(
+                worker.variables, self.variables
+            )
+        except Exception as error:
+            raise AutomationError(
+                "RUNTIME.CONTEXT_CONFLICT",
+                f"Read-only step {step.id!r} produced incomparable variables",
+                category="runtime",
+                details={"step_id": step.id},
+                cause=error,
+            ) from error
+        if not variables_unchanged:
+            raise AutomationError(
+                "RUNTIME.CONTEXT_CONFLICT",
+                f"Read-only step {step.id!r} modified workflow variables",
+                category="runtime",
+                details={"step_id": step.id},
+            )
+        original_keys = set(self.context) - {"steps", "vars"}
+        worker_keys = set(worker.context) - {"steps", "vars"}
+        try:
+            context_unchanged = worker_keys == original_keys and all(
+                _values_equal(worker.context[key], self.context[key])
+                for key in original_keys
+            )
+        except Exception as error:
+            raise AutomationError(
+                "RUNTIME.CONTEXT_CONFLICT",
+                f"Read-only step {step.id!r} produced incomparable context",
+                category="runtime",
+                details={"step_id": step.id},
+                cause=error,
+            ) from error
+        if not context_unchanged:
+            raise AutomationError(
+                "RUNTIME.CONTEXT_CONFLICT",
+                f"Read-only step {step.id!r} modified workflow context",
+                category="runtime",
+                details={"step_id": step.id},
+            )
+        for step_id, record in worker.context["steps"].items():
+            if step_id in self.context["steps"]:
+                try:
+                    same_record = _values_equal(
+                        self.context["steps"][step_id], record
+                    )
+                except Exception as error:
+                    raise AutomationError(
+                        "RUNTIME.CONTEXT_CONFLICT",
+                        f"Parallel step {step.id!r} produced incomparable step context",
+                        category="runtime",
+                        details={"step_id": step.id, "conflict": step_id},
+                        cause=error,
+                    ) from error
+                if not same_record:
+                    raise AutomationError(
+                        "RUNTIME.CONTEXT_CONFLICT",
+                        f"Parallel step {step.id!r} rewrote existing step context",
+                        category="runtime",
+                        details={"step_id": step.id, "conflict": step_id},
+                    )
+                continue
+            if step_id != step.id:
+                raise AutomationError(
+                    "RUNTIME.CONTEXT_CONFLICT",
+                    f"Parallel step {step.id!r} wrote another step context",
+                    category="runtime",
+                    details={"step_id": step.id, "conflict": step_id},
+                )
+            self.context["steps"][step_id] = record
+        # Worker events are published live by ``event_sink``; only step state
+        # is merged here, in descriptor order.
+
+    def _record_parallel_terminal_only(
+        self, step: CompiledStep, outcome: _StepOutcome
+    ) -> None:
+        """Keep diagnostics for in-flight peers without publishing outputs."""
+
+        record = dict(
+            outcome.runner.step_records.get(
+                step.id, {"status": "failed", "attempts": 0}
+            )
+        )
+        record["discarded_due_to_scope_termination"] = True
+        self.step_records[step.id] = record
+
+    def _mark_scope_terminated(
+        self, step: CompiledStep, terminal_step_id: str
+    ) -> None:
+        self.step_records[step.id] = {
+            "status": "skipped",
+            "reason": "scope_terminated",
+            "terminated_by": terminal_step_id,
+        }
+        self.context["steps"][step.id] = {
+            "status": "skipped",
+            "output": None,
+        }
+        self._event(
+            "step.skipped",
+            step_id=step.id,
+            reason="scope_terminated",
+            terminated_by=terminal_step_id,
+        )
+
+    def _run_step(
+        self,
+        step: CompiledStep,
+        cleanup: bool = False,
+        *,
+        action_contract: Mapping[str, Any] | None = None,
+    ) -> Any:
+        self._check_control(cleanup)
         if "if" in step.params and not bool(self._evaluate(thaw(step.params["if"]))):
             self.step_records[step.id] = {"status": "skipped"}
             self.context["steps"][step.id] = {"status": "skipped", "output": None}
@@ -299,14 +848,21 @@ class WorkflowRunner:
             self._deadline_stack.append(local_deadline)
         pending: AutomationError | None = None
         result: Any = None
+        returned = False
         try:
-            result = self._attempt_step(step, local_deadline)
+            result = self._attempt_step(
+                step, local_deadline, cleanup, action_contract=action_contract
+            )
             self.context["steps"][step.id] = {"status": "succeeded", "output": result}
         except _ReturnFlow:
-            self.step_records[step.id].update(status="succeeded", duration_ms=round((time.monotonic() - started) * 1000, 3))
+            returned = True
             raise
         except AutomationError as caught:
-            caught.at_step(step.id, step_path=step.path, workflow=self.descriptor.name); pending = self._apply_handler(step.on_error, caught)
+            caught.at_step(step.id, step_path=step.path, workflow=self.descriptor.name)
+            if caught.code in {"WORKFLOW.CANCELLED", "WORKFLOW.TIMEOUT"}:
+                pending = caught
+            else:
+                pending = self._apply_handler(step.on_error, caught)
             if pending is not None:
                 status = "unknown_effect" if pending.effect == "unknown" else "timed_out" if pending.code.endswith(".TIMEOUT") else "failed"
                 self.step_records[step.id].update(status=status, error=pending.to_dict(), duration_ms=round((time.monotonic() - started) * 1000, 3))
@@ -315,15 +871,53 @@ class WorkflowRunner:
         finally:
             if local_deadline is not None:
                 self._deadline_stack.pop()
-            try: self._run_steps(step.finally_steps, cleanup)
+            try:
+                if cleanup:
+                    self._run_steps(step.finally_steps, cleanup=True)
+                elif pending is not None and pending.code in {
+                    "WORKFLOW.CANCELLED",
+                    "WORKFLOW.TIMEOUT",
+                    "STEP.TIMEOUT",
+                    "ACTION.TIMEOUT",
+                    "SCRIPT.TIMEOUT",
+                }:
+                    self._run_unwind_steps(step.finally_steps)
+                else:
+                    self._run_steps(step.finally_steps)
             except AutomationError as final_error:
-                if pending is not None: pending.add_suppressed(final_error)
-                else: raise AutomationError("WORKFLOW.FINALLY_FAILED", f"Finally for step {step.id!r} failed", cause=final_error) from final_error
+                if pending is not None:
+                    pending.add_suppressed(final_error)
+                else:
+                    wrapped = AutomationError(
+                        "WORKFLOW.FINALLY_FAILED",
+                        f"Finally for step {step.id!r} failed",
+                        cause=final_error,
+                    )
+                    self.step_records[step.id].update(
+                        status="failed",
+                        error=wrapped.to_dict(),
+                        duration_ms=round(
+                            (time.monotonic() - started) * 1000, 3
+                        ),
+                    )
+                    raise wrapped from final_error
+            if returned:
+                self.step_records[step.id].update(
+                    status="succeeded",
+                    duration_ms=round((time.monotonic() - started) * 1000, 3),
+                )
         elapsed = time.monotonic() - started
         self.step_records[step.id].update(status="succeeded", output=result, duration_ms=round(elapsed * 1000, 3)); self._event("step.succeeded", step_id=step.id)
         return result
 
-    def _attempt_step(self, step: CompiledStep, local_deadline: float | None) -> Any:
+    def _attempt_step(
+        self,
+        step: CompiledStep,
+        local_deadline: float | None,
+        cleanup: bool = False,
+        *,
+        action_contract: Mapping[str, Any] | None = None,
+    ) -> Any:
         retry = thaw(step.params.get("retry", self.descriptor.defaults.get("retry", {"max_attempts": 1})))
         max_attempts = int(retry.get("max_attempts", 1))
         effect = (
@@ -333,8 +927,17 @@ class WorkflowRunner:
         )
         for attempt in range(1, max_attempts + 1):
             attempt_started = time.monotonic()
-            self._check_budget()
-            self._executed += 1
+            if not cleanup:
+                self._check_budget()
+            if self._pre_reserved_attempts:
+                self._pre_reserved_attempts -= 1
+            else:
+                self._attempt_budget.reserve(
+                    None
+                    if cleanup
+                    else self.descriptor.budgets.get("max_executed_steps")
+                )
+            self._executed = self._attempt_budget.executed
             self.step_records[step.id]["attempts"] = attempt; remaining = self._remaining(local_deadline)
             if remaining == 0: raise AutomationError("STEP.TIMEOUT", f"Step {step.id!r} timed out")
             attempt_timeout = _duration(step.params.get("attempt_timeout"), remaining)
@@ -348,9 +951,10 @@ class WorkflowRunner:
                 if attempt_deadline is not None:
                     self._deadline_stack.append(attempt_deadline)
                 try:
-                    contract: Mapping[str, Any] | None = None
+                    contract = action_contract
                     if step.type == "action":
-                        contract = self._resolve_action_contract(step)
+                        if contract is None:
+                            contract = self._resolve_action_contract(step)
                         effect = self._effective_action_effect(
                             step, contract=contract
                         )
@@ -400,7 +1004,10 @@ class WorkflowRunner:
                 delay = self._retry_delay(retry, attempt); remaining = self._remaining(local_deadline)
                 if remaining is not None and delay >= remaining: raise AutomationError("STEP.TIMEOUT", f"Step {step.id!r} timed out during retry", cause=error) from error
                 self._event("step.retrying", step_id=step.id, attempt=attempt, delay=delay)
-                if delay: time.sleep(delay)
+                if delay:
+                    self._sleep_interruptibly(
+                        delay, local_deadline, cleanup=cleanup
+                    )
         raise AssertionError("unreachable")
 
     def _resolve_action_contract(
@@ -930,7 +1537,7 @@ class WorkflowRunner:
                 if remaining is not None:
                     sleep_for = min(sleep_for, remaining)
                 if sleep_for:
-                    time.sleep(sleep_for)
+                    self._sleep_interruptibly(sleep_for, deadline)
         except AutomationError as error:
             if observe is not None and "last_observation" not in error.details:
                 error.details["last_observation"] = (
@@ -1062,6 +1669,39 @@ class WorkflowRunner:
 
 def _duration(value: Any, default: float | None = None) -> float | None:
     return parse_duration(value, default)
+
+
+def _values_equal(left: Any, right: Any) -> bool:
+    if left is None or isinstance(left, (bool, int, float, str)):
+        return type(left) is type(right) and left == right
+    if isinstance(left, Mapping):
+        return (
+            isinstance(right, Mapping)
+            and set(left) == set(right)
+            and all(_values_equal(left[key], right[key]) for key in left)
+        )
+    if isinstance(left, (list, tuple)):
+        return (
+            isinstance(right, (list, tuple))
+            and len(left) == len(right)
+            and all(
+                _values_equal(left_item, right_item)
+                for left_item, right_item in zip(left, right)
+            )
+        )
+    raise TypeError(f"unsupported runtime value {type(left).__name__!r}")
+
+
+def _clone_runtime_value(value: Any) -> Any:
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, Mapping):
+        if not all(isinstance(key, str) for key in value):
+            raise TypeError("runtime object keys must be strings")
+        return {key: _clone_runtime_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_clone_runtime_value(item) for item in value]
+    raise TypeError(f"unsupported runtime value {type(value).__name__!r}")
 
 
 def _references_current_step(value: Any, step_id: str) -> bool:
