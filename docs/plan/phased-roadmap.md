@@ -22,7 +22,7 @@
 - `probe` 命令只读检查 Windows UIA、macOS Accessibility/Screen Capture 和 Linux AT-SPI/X11/Wayland/portal/libei/uinput 前置条件，不请求权限、不截图、不注入输入。
 - script 默认拒绝；`--allow-scripts` 显式启用后仅在具备 bubblewrap + `prlimit` 的 Linux 上运行，其他平台返回 `SCRIPT.SANDBOX_UNAVAILABLE`。
 
-尚未实现或尚未证明：Windows UIA 真机执行结果、Linux KDE/Qt 写动作资格、macOS AX driver；可靠的 Windows 后代进程树终止；完整 wire 协议版本协商；single-writer session manager；持久 journal；系统 secret store；签名插件；真实截图；taint tracking、确认 token 与完整 policy enforcement；安装器和权限引导。当前已有 Windows Win32 fixture 和真实 Windows CI 测试入口，也已有 Linux KDE/X11 AT-SPI driver；本机因缺少 Atspi typelib 仅通过 Gio/D-Bus 的 registry、进程协议和只读 snapshot smoke。当前 OCR 已能处理显式图片，但尚未接入受控截图/frame provenance，因此不能视为桌面视觉闭环。M0 已具备 manifest/action contract、`postcondition.observe` 和基础 action risk policy 校验，其任务是继续把 v0 收敛成可验证基线，而不是扩大产品宣称。
+尚未实现或尚未证明：Windows UIA 真机执行结果、Linux KDE/Qt 应用资格、macOS AX driver；可靠的 Windows 后代进程树终止；完整 wire 协议版本协商；single-writer session manager；持久 journal；系统 secret store；签名插件；真实截图；taint tracking、确认 token 与完整 policy enforcement；安装器和权限引导。当前已有 Windows Win32 fixture 和真实 Windows CI 测试入口，也已有 Linux KDE/X11 AT-SPI driver；本机默认 Gio/D-Bus 后端通过 registry、进程协议和只读 snapshot smoke，另用显式测试 typelib overlay 让自有 GTK3 fixture 验证 focus 的原生接受结果，以及 set_text/invoke 的动作后重新观察。当前 OCR 已能处理显式图片，但尚未接入受控截图/frame provenance，因此不能视为桌面视觉闭环。M0 已具备 manifest/action contract、`postcondition.observe` 和基础 action risk policy 校验，其任务是继续把 v0 收敛成可验证基线，而不是扩大产品宣称。
 
 ## 3. M0：冻结 Python 运行时 v0 合约
 

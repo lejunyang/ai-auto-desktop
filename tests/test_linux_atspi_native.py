@@ -1,8 +1,9 @@
-"""KDE/X11 会话中的真实 Gio AT-SPI 只读冒烟测试。
+"""KDE/X11 会话中的真实 AT-SPI 原生集成测试。
 
 测试辅助可以从当前用户的 ``kwin_x11`` 进程恢复图形会话环境；生产驱动不得
 扫描 ``/proc`` 或猜测其他会话。缺少 KDE/X11、Gio、AT-SPI bus、System Settings
-或 Qt AT-SPI bridge 时，本测试保守跳过。
+或对应 toolkit bridge 时，本测试保守跳过。自有 GTK3 fixture 还会验证
+PyGObject 后端的 snapshot/find/focus/set_text/invoke 完整链路。
 """
 
 from __future__ import annotations
@@ -11,17 +12,25 @@ from contextlib import contextmanager
 import importlib.util
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
 import time
 import unittest
 
+from ai_auto_desktop.compiler import compile_descriptor
 from ai_auto_desktop.plugin import ProcessPlugin
+from ai_auto_desktop.runtime import run_descriptor
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DRIVER_PATH = PROJECT_ROOT / "plugins" / "linux_atspi" / "linux_atspi_driver.py"
+FIXTURE_PATH = PROJECT_ROOT / "tests" / "linux" / "atspi_fixture_app.py"
+TEST_TYPELIB_ENV = "AI_AUTO_DESKTOP_TEST_ATSPI_TYPELIB_PATH"
+FIXTURE_ENTRY_NAME = "Fixture text entry"
+FIXTURE_BUTTON_NAME = "Invoke fixture button"
+FIXTURE_STATUS_INVOKED = "Fixture status invoked"
 
 SPEC = importlib.util.spec_from_file_location(
     "testable_linux_atspi_native_driver", DRIVER_PATH
@@ -79,12 +88,48 @@ def _kde_x11_test_environment() -> dict[str, str] | None:
             continue
         if (
             values.get("XDG_SESSION_TYPE", "").lower() == "x11"
-            and "KDE" in values.get("XDG_CURRENT_DESKTOP", "").upper()
+            and "KDE"
+            in {
+                item.upper()
+                for item in re.split(
+                    r"[:;]", values.get("XDG_CURRENT_DESKTOP", "")
+                )
+                if item
+            }
             and values.get("DISPLAY")
             and values.get("DBUS_SESSION_BUS_ADDRESS")
         ):
             return values
     return None
+
+
+def _native_subprocess_environment(session: dict[str, str]) -> dict[str, str]:
+    """Build a test-only GTK/typelib environment around the real session."""
+
+    environment = os.environ.copy()
+    environment.update(session)
+    environment["GDK_BACKEND"] = "x11"
+    # The recovered session currently advertises org.a11y.Status.IsEnabled=false.
+    # GTK_A11Y forces only this owned fixture to load its standard ATK bridge.
+    environment["GTK_A11Y"] = "always"
+    environment.pop("NO_AT_BRIDGE", None)
+
+    raw_typelib_path = environment.get(TEST_TYPELIB_ENV)
+    typelib_path = Path(raw_typelib_path) if raw_typelib_path else None
+    if (
+        typelib_path is not None
+        and (typelib_path / "Atspi-2.0.typelib").is_file()
+    ):
+        existing = environment.get("GI_TYPELIB_PATH")
+        paths = [str(typelib_path)]
+        if existing:
+            paths.extend(
+                item
+                for item in existing.split(os.pathsep)
+                if item and item != str(typelib_path)
+            )
+        environment["GI_TYPELIB_PATH"] = os.pathsep.join(paths)
+    return environment
 
 
 @contextmanager
@@ -197,6 +242,260 @@ class NativeKdeX11AtspiInfrastructureTests(unittest.TestCase):
         self.assertIsInstance(backend, atspi.GioAtspiBackend)
         self.assertEqual(backend.name, "gio_atspi")
 
+    def test_owned_gtk_fixture_supports_real_semantic_actions(self) -> None:
+        if not FIXTURE_PATH.is_file():
+            self.fail(f"GTK fixture 不存在：{FIXTURE_PATH}")
+        environment = _native_subprocess_environment(self.session)
+        dependency_probe = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import gi; "
+                    "gi.require_version('Gtk', '3.0'); "
+                    "gi.require_version('Atspi', '2.0'); "
+                    "from gi.repository import Atspi, Gtk"
+                ),
+            ],
+            env=environment,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            timeout=5,
+        )
+        if dependency_probe.returncode != 0:
+            diagnostic = dependency_probe.stderr.decode(
+                "utf-8", errors="replace"
+            )[-1000:]
+            self.skipTest(
+                "完整原生动作需要 Gtk 3 与 Atspi 2.0 typelib："
+                + diagnostic
+            )
+        fixture = subprocess.Popen(
+            [sys.executable, str(FIXTURE_PATH)],
+            env=environment,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+        self.addCleanup(self._stop_process, fixture)
+
+        plugin = ProcessPlugin(
+            [sys.executable, str(DRIVER_PATH)],
+            env=environment,
+            timeout=30,
+            name="desktop.linux_atspi owned GTK fixture",
+        )
+        self.addCleanup(plugin.close)
+        plugin.start()
+
+        applications_result: dict[str, object] | None = None
+        application: dict[str, object] | None = None
+        stop = time.monotonic() + 10
+        while time.monotonic() < stop:
+            if fixture.poll() is not None:
+                stderr = b"" if fixture.stderr is None else fixture.stderr.read()
+                self.fail(
+                    "GTK fixture 在注册 AT-SPI 前退出："
+                    + stderr.decode("utf-8", errors="replace")[-2000:]
+                )
+            applications_result = plugin.invoke(
+                "desktop.linux_atspi.list_applications@1", {}
+            )
+            if applications_result["backend"] != "pygobject_atspi":
+                self.skipTest(
+                    "完整原生动作需要 PyGObject Atspi backend，实际为 "
+                    f"{applications_result['backend']}"
+                )
+            application = next(
+                (
+                    item
+                    for item in applications_result["applications"]
+                    if item.get("process_id") == fixture.pid
+                ),
+                None,
+            )
+            if application is not None:
+                break
+            time.sleep(0.2)
+        if application is None:
+            self.fail("自有 GTK fixture 在 10 秒内未注册到 AT-SPI registry")
+
+        application_selector = {"process_id": fixture.pid}
+
+        def snapshot() -> dict[str, object]:
+            result = plugin.invoke(
+                "desktop.linux_atspi.snapshot@1",
+                {
+                    "application": application_selector,
+                    "max_depth": 8,
+                    "max_nodes": 64,
+                },
+            )
+            self.assertEqual(result["backend"], "pygobject_atspi")
+            self.assertFalse(result["truncated"])
+            return result
+
+        def find(
+            captured: dict[str, object], locator: dict[str, object]
+        ) -> dict[str, object]:
+            return plugin.invoke(
+                "desktop.linux_atspi.find@1",
+                {
+                    "snapshot_id": captured["snapshot_id"],
+                    "revision": captured["revision"],
+                    "locator": locator,
+                },
+            )
+
+        def write(
+            action: str, locator: dict[str, object], **extra: object
+        ) -> dict[str, object]:
+            captured = snapshot()
+            located = find(captured, locator)
+            return plugin.invoke(
+                f"desktop.linux_atspi.{action}@1",
+                {"target": located["target"], "locator": locator, **extra},
+            )
+
+        initial = snapshot()
+        self.assertEqual(initial["application"]["process_id"], fixture.pid)
+        entry_locator = {
+            "role": "text",
+            "name": FIXTURE_ENTRY_NAME,
+            "actions": ["focus", "set_text"],
+        }
+        button_locator = {
+            "role": "push_button",
+            "name": FIXTURE_BUTTON_NAME,
+            "actions": ["invoke"],
+        }
+        entry = find(initial, entry_locator)
+        self.assertEqual(entry["node"]["value"], "Fixture initial text")
+        self.assertEqual(
+            entry["node"]["provenance"]["accessible_id"], "fixture-entry"
+        )
+        focused = write("focus", entry_locator)
+        self.assertEqual(focused["action"], "focus")
+        self.assertTrue(focused["backend_result"]["accepted"])
+        self.assertEqual(
+            focused["backend_result"]["native_interface"],
+            "Component.grab_focus",
+        )
+        changed_text = "Fixture changed through AT-SPI"
+        before_change = snapshot()
+        entry = find(before_change, entry_locator)
+        entry_indexes = [
+            index
+            for index, node in enumerate(before_change["nodes"])
+            if node.get("node_id") == entry["node"]["node_id"]
+        ]
+        self.assertEqual(len(entry_indexes), 1)
+        entry_index = entry_indexes[0]
+        descriptor = compile_descriptor(
+            {
+                "apiVersion": "ai-auto-desktop.dev/v1alpha1",
+                "kind": "Workflow",
+                "metadata": {"name": "native-linux-atspi-observation"},
+                "requires": {
+                    "platforms": ["linux"],
+                    "permissions": ["desktop.observe", "desktop.input"],
+                },
+                "budgets": {
+                    "max_duration": "20s",
+                    "max_executed_steps": 1,
+                    "cleanup_timeout": "1s",
+                },
+                "steps": [
+                    {
+                        "id": "set_fixture_text",
+                        "type": "action",
+                        "uses": "desktop.linux_atspi.set_text@1",
+                        "with": {
+                            "target": entry["target"],
+                            "locator": entry_locator,
+                            "text": changed_text,
+                        },
+                        "effect": {"class": "contextual"},
+                        "risk": {"category": "input", "level": "high"},
+                        "timeout": "15s",
+                        "postcondition": {
+                            "observe": {
+                                "uses": "desktop.linux_atspi.snapshot@1",
+                                "with": {
+                                    "application": application_selector,
+                                    "max_depth": 8,
+                                    "max_nodes": 64,
+                                },
+                            },
+                            "condition": (
+                                "${{ observation.truncated == False and "
+                                f"observation.nodes[{entry_index}].node_id == "
+                                f"'{entry['node']['node_id']}' and "
+                                f"observation.nodes[{entry_index}].value == "
+                                f"'{changed_text}'"
+                                " }}"
+                            ),
+                            "timeout": "5s",
+                            "poll_interval": "100ms",
+                        },
+                    }
+                ],
+            }
+        )
+        changed_run = run_descriptor(
+            descriptor,
+            plugins={"desktop.linux_atspi": plugin},
+            granted_permissions=["desktop.observe", "desktop.input"],
+        )
+        self.assertTrue(changed_run.ok, changed_run.to_dict())
+        self.assertEqual(changed_run.steps["set_fixture_text"]["attempts"], 1)
+        changed = changed_run.steps["set_fixture_text"]["output"]
+        self.assertEqual(changed["action"], "set_text")
+        self.assertEqual(
+            changed["backend_result"]["native_interface"],
+            "EditableText.set_text_contents",
+        )
+        changed_snapshot = snapshot()
+        self.assertEqual(
+            find(
+                changed_snapshot,
+                {
+                    "role": "text",
+                    "name": FIXTURE_ENTRY_NAME,
+                    "value": changed_text,
+                },
+            )["node"]["value"],
+            changed_text,
+        )
+
+        invoked = write("invoke", button_locator)
+        self.assertEqual(invoked["action"], "invoke")
+        self.assertEqual(
+            invoked["backend_result"]["native_interface"], "Action.do_action"
+        )
+        self.assertTrue(invoked["backend_result"]["accepted"])
+        stop = time.monotonic() + 3
+        while True:
+            invoked_snapshot = snapshot()
+            try:
+                status = find(
+                    invoked_snapshot,
+                    {
+                        "role": "label",
+                        "name": FIXTURE_STATUS_INVOKED,
+                        "value": FIXTURE_STATUS_INVOKED,
+                    },
+                )
+            except Exception:
+                if time.monotonic() >= stop:
+                    raise
+                time.sleep(0.1)
+                continue
+            self.assertEqual(status["node"]["value"], FIXTURE_STATUS_INVOKED)
+            break
+
     def test_system_settings_is_observed_when_qt_bridge_is_available(self) -> None:
         executable = shutil.which("systemsettings5") or shutil.which("systemsettings")
         if executable is None:
@@ -268,14 +567,15 @@ class NativeKdeX11AtspiInfrastructureTests(unittest.TestCase):
 
     @staticmethod
     def _stop_process(process: subprocess.Popen[bytes]) -> None:
-        if process.poll() is not None:
-            return
-        process.terminate()
-        try:
-            process.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait(timeout=5)
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=5)
+        if process.stderr is not None:
+            process.stderr.close()
 
 
 if __name__ == "__main__":

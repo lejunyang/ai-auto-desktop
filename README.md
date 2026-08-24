@@ -66,10 +66,11 @@ python -m ai_auto_desktop run workflow.yaml \
   --plugin desktop.linux_atspi=plugins/linux_atspi/run.sh
 ```
 
-本机 KDE Plasma 5.27/X11 已通过真实 AT-SPI registry、进程协议和有界 snapshot smoke。
-当前 Qt System Settings 没有注册到 registry，因此 Qt bridge 和真实写动作仍未通过资格验证；
-这与“Linux 驱动不存在”不同，也不等于“任意 KDE 应用已经支持”。驱动不注入键鼠、不截图、
-不执行 OCR。
+本机 KDE Plasma 5.27/X11 已通过真实 AT-SPI registry、进程协议和有界 snapshot smoke；
+自有 GTK3 fixture 还验证了 focus 的原生接受结果，以及 set_text、invoke 的动作后
+重新观察。当前 Qt System
+Settings 没有注册到 registry，因此 Qt bridge 仍未通过资格验证；这不等于“任意 KDE
+应用已经支持”。驱动不注入键鼠、不截图、不执行 OCR。
 
 ## 描述文件与运行时
 

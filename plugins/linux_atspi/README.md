@@ -36,3 +36,9 @@ accessibility bus。Gio fallback 支持应用枚举和只读快照，暂不支�
 或处于 Wayland/GNOME，会返回 `DRIVER.UNAVAILABLE`，不会扩大本切片的支持声明。
 Gio 的 `GetChildren` 在线路响应解包后立即检查 5000 项硬上限；该上限用于阻止继续
 复制和遍历异常 fan-out，但受 D-Bus API 形状限制，无法在 wire 传输之前截断响应。
+
+本机原生测试使用 `tests/linux/atspi_fixture_app.py` 提供 GTK3 的 entry、button 和
+status label，在完整 PyGObject backend 可用时验证 focus 的原生接受结果，以及 set_text、
+invoke 的动作后重新观察。若只为测试使用解压出的兼容 typelib，可通过
+`AI_AUTO_DESKTOP_TEST_ATSPI_TYPELIB_PATH=/path/to/girepository-1.0` 显式传入；生产运行应
+安装发行版提供的 `gir1.2-atspi-2.0`。

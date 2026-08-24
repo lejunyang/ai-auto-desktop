@@ -148,6 +148,11 @@ AT-SPI bus 时保守跳过或确认 `DRIVER.UNAVAILABLE`，不会把测试环境
 成功。测试辅助可以从当前用户的 `kwin_x11` 进程恢复遗漏的 KDE/X11 环境变量，但这条
 逻辑不进入生产驱动。System Settings 未注册进 AT-SPI registry 时，测试明确报告当前
 Qt AT-SPI bridge 不可用并跳过，不把进程启动成功误作可访问性支持成功。
+仓库还提供自有 GTK3 fixture；当系统安装 `Atspi 2.0` typelib 时，它通过正式进程驱动
+真实验证 `snapshot/find`、`Component.grab_focus`、`EditableText.set_text_contents` 与
+`Action.do_action`；后两项还会重新抓取快照核对文本和状态。当前会话的窗口管理器
+没有通过 AT-SPI 回报 fixture 的焦点状态，所以 focus 仅验证原生调用被接受。测试临时 overlay 可通过
+`AI_AUTO_DESKTOP_TEST_ATSPI_TYPELIB_PATH` 显式传入，不会修改系统安装。
 
 “KDE/X11 已资格验证”还需要在固定发行版、Plasma、Xorg 与 Qt 版本上，以 Qt Widgets、
 QML、Dolphin、System Settings、Konsole、对话框、多窗口、虚拟列表和多显示器/DPI
