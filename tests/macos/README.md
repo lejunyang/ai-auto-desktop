@@ -31,6 +31,16 @@ CDHash、Mach-O 架构和可执行文件 SHA-256，不保存绝对路径。
 Identifier、CDHash、架构、SHA-256 都是必填证明；任何工具失败、字段缺失或空值都会让构建
 失败，不会产生半份 `identity.txt`。
 
+回传时还应在 Mac 本机执行：
+
+```sh
+shasum -a 256 results/*/macos-ax-test-result.tar.gz
+```
+
+请把归档和该命令的完整输出分别发给测试请求方。归档内的 `SHA256SUMS` 只验证成员
+自洽，不能认证回传来源；外层归档 SHA-256 也只有通过独立可信渠道取得时，才可作为
+来源绑定证据。
+
 结果归档使用固定的成员顺序、UTC 时间（2000-01-01 00:00:00）、文件权限和 root/0
 owner/group，并移除 ACL、file flags、扩展属性与 macOS AppleDouble 元数据；gzip header 也不
 记录原文件名或时间。脚本分别适配 macOS 系统 bsdtar/libarchive 和 GNU tar；无法识别 tar
@@ -51,7 +61,8 @@ runner 通过 LaunchServices (`open -n -W`) 启动，使 TCC 对应实际 `.app`
 这些 case 对齐进程驱动新增的显式 `desktop.macos_ax.type_text@1`，但在真实 Mac 回传
 `passed` 报告之前仍只代表测试实现已就绪。它只需要 Accessibility，不需要 Screen Recording，
 不注入 pointer，也不是 `set_value` 的自动 fallback。fixture、runner 和本 README 均在
-`SOURCE_PACKAGE_FILES.txt` 白名单内；若未来增加文件，必须同步更新该白名单。
+`SOURCE_PACKAGE_FILES.txt` 白名单内；本地验真工具由接收方仓库提供，不放入 Mac 执行包。
+若未来增加真机运行所需文件，必须同步更新该白名单。
 
 如缺少工具，先运行：
 
