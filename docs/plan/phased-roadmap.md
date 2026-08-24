@@ -61,7 +61,7 @@
 - dispatch 前重新 resolve，完整执行 `observe → resolve → precondition → policy → execute → re-observe → postcondition`。
 - Windows Job Object、kill-on-close、driver watchdog、crash restart generation 和 stale node 拒绝。
 - macOS probe 验证 AX trust/TCC；Linux probe 分别记录 AT-SPI、X11、Wayland portal/libei 可用性。Windows 已有 UIA 进程驱动和 Win32 fixture，覆盖窗口枚举、树快照、精确定位、focus/invoke/set_value/type_text，以及 Runtime 的动作后重新观察；仍需在真实 Windows runner 上产出执行结果和权限边界资格证据。
-- 建立 15–30 个目标应用/页面的 ground truth 和 element recall、semantic completeness、action coverage、latency、hang/crash 指标。当前本机 Qt 5 Widgets/GTK3 自有 fixture 已通过，真实 KDE 应用矩阵仍待建设。
+- 建立 15–30 个目标应用/页面的 ground truth 和 element recall、semantic completeness、action coverage、latency、hang/crash 指标。当前本机 Qt 5 Widgets/GTK3 自有 fixture 已通过，Konsole 与 System Settings 初始窗口的真实只读矩阵也已通过；后续扩展 Dolphin、更多 QML 页面、多窗口、动态页面和受控写动作。
 
 ### 退出门槛
 

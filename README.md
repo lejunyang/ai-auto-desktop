@@ -70,8 +70,10 @@ python -m ai_auto_desktop run workflow.yaml \
 自有 GTK3 fixture 验证 focus、set_text、invoke、toggle、expand/collapse，自有 Qt 5
 Widgets fixture 也验证 snapshot/find/focus/set_text/invoke；隔离 X11/AT-SPI fixture 还
 验证两套 toolkit 的 `type_text` 经 XTEST 输入 UTF-8 后由 fresh snapshot 观察。
-System Settings 等真实 KDE 应用矩阵仍未完成资格验证；这不等于“任意 KDE 应用已经
-支持”。除显式 `type_text` 外不会注入键鼠；驱动不截图、不执行 OCR。
+Konsole 22.12.3 与 System Settings 5.27.5 的初始窗口已完成只读资格验证，分别取得
+352 与 256 个未截断节点，且写动作派发数为零；这仍不等于“任意 KDE 应用已经支持”。
+Dolphin、更多 QML 页面、多窗口和动态页面仍需单独验证。除显式 `type_text` 外不会注入
+键鼠；驱动不截图、不执行 OCR。
 
 ## macOS 真机自测包
 
