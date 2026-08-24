@@ -53,9 +53,21 @@ jobs:
           cache: pip
       - name: Install project with Windows UIA support
         run: python -m pip install ".[windows-uia]"
-      - name: Run contract and Windows native tests
-        run: python -m unittest discover -s tests -v
+      - name: Run Windows native fixture and write result
+        id: windows-native-fixture
+        shell: pwsh
+        run: ./tests/windows/run-native-fixture.ps1 -OutputPath artifacts/windows-native-fixture-result.json
+      - name: Upload Windows native fixture result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-native-fixture-result-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifacts/windows-native-fixture-result.json
+          if-no-files-found: error
+          retention-days: 30
       - name: Validate canonical example
+        if: steps.windows-native-fixture.outcome == 'success'
         run: python -m ai_auto_desktop validate examples/workflows/ocr-error-response.json
       - name: Smoke capability probe
+        if: steps.windows-native-fixture.outcome == 'success'
         run: python -m ai_auto_desktop probe
