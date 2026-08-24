@@ -22,7 +22,7 @@
 - `probe` 命令只读检查 Windows UIA、macOS Accessibility/Screen Capture 和 Linux AT-SPI/X11/Wayland/portal/libei/uinput 前置条件，不请求权限、不截图、不注入输入。
 - script 默认拒绝；`--allow-scripts` 显式启用后仅在具备 bubblewrap + `prlimit` 的 Linux 上运行，其他平台返回 `SCRIPT.SANDBOX_UNAVAILABLE`。
 
-尚未实现或尚未证明：经过真实 Windows 环境资格验证的 UIA driver，以及真实 AX/AT-SPI driver；可靠的 Windows 后代进程树终止；完整 wire 协议版本协商；single-writer session manager；持久 journal；系统 secret store；签名插件；真实截图；taint tracking、确认 token 与完整 policy enforcement；安装器和权限引导。当前 OCR 已能处理显式图片，但尚未接入受控截图/frame provenance，因此不能视为桌面视觉闭环。M0 已具备 manifest/action contract 与基础 action risk policy 校验，其任务是继续把 v0 收敛成可验证基线，而不是扩大产品宣称。
+尚未实现或尚未证明：Windows UIA 真机执行结果、Linux KDE/Qt 写动作资格、macOS AX driver；可靠的 Windows 后代进程树终止；完整 wire 协议版本协商；single-writer session manager；持久 journal；系统 secret store；签名插件；真实截图；taint tracking、确认 token 与完整 policy enforcement；安装器和权限引导。当前已有 Windows Win32 fixture 和真实 Windows CI 测试入口，也已有 Linux KDE/X11 AT-SPI driver；本机因缺少 Atspi typelib 仅通过 Gio/D-Bus 的 registry、进程协议和只读 snapshot smoke。当前 OCR 已能处理显式图片，但尚未接入受控截图/frame provenance，因此不能视为桌面视觉闭环。M0 已具备 manifest/action contract、`postcondition.observe` 和基础 action risk policy 校验，其任务是继续把 v0 收敛成可验证基线，而不是扩大产品宣称。
 
 ## 3. M0：冻结 Python 运行时 v0 合约
 
@@ -59,7 +59,7 @@
 - Windows UIA/Win32 独立 worker；标准化 node、snapshot revision、bounds/坐标变换、supported actions 与 native provenance。
 - dispatch 前重新 resolve，完整执行 `observe → resolve → precondition → policy → execute → re-observe → postcondition`。
 - Windows Job Object、kill-on-close、driver watchdog、crash restart generation 和 stale node 拒绝。
-- macOS probe 验证 AX trust/TCC；Linux probe 分别记录 AT-SPI、X11、Wayland portal/libei 可用性。Windows 已有首个 UIA 进程驱动纵向切片，覆盖窗口枚举、树快照、精确定位、focus/invoke/set_value；仍需在真实 Windows runner 上完成 fixture app 和权限边界资格测试。
+- macOS probe 验证 AX trust/TCC；Linux probe 分别记录 AT-SPI、X11、Wayland portal/libei 可用性。Windows 已有 UIA 进程驱动和 Win32 fixture，覆盖窗口枚举、树快照、精确定位、focus/invoke/set_value，以及 Runtime 的动作后重新观察；仍需在真实 Windows runner 上产出执行结果和权限边界资格证据。
 - 建立 15–30 个目标应用/页面的 ground truth 和 element recall、semantic completeness、action coverage、latency、hang/crash 指标。
 
 ### 退出门槛
@@ -78,7 +78,7 @@
 ### 范围
 
 - macOS：签名稳定的 Swift/ObjC AX helper，分离 Accessibility 与 Screen Recording 权限；验证 AX action、可写属性、通知与 CGEvent 后备。
-- Linux：先限定 Ubuntu 22.04/24.04 GNOME；AT-SPI 语义 worker，X11 与 Wayland portal/libei 作为不同 capability/profile。
+- Linux：先限定当前已验证基线 KDE Plasma 5.27/X11；继续补齐 AT-SPI typelib 与自有 Qt fixture 的真实写动作测试。GNOME、X11 输入后备与 Wayland portal/libei 均作为不同 capability/profile，必须独立资格验证。
 - 三端加入 single-desktop-writer session manager、用户介入检测、多显示器/DPI/坐标 provenance。
 - screenshot 由 Host/driver 获取并受 policy/audit 控制；OCR 独立进程仅接受显式 frame/region，输出带 confidence 和 bounds 的 perception layer。
 - 固定回退顺序并实现显式 gate：native/app API → accessibility → keyboard → semantic bounds pointer → declared vision → declared OCR。
@@ -104,7 +104,7 @@
 - 版本锁定、SBOM、依赖/模型许可证、artifact hash/signature、可回滚更新通道。
 - Windows x64 首发，按证据增加 ARM64；签名安装器、权限/提权诊断、Job Object 回归和杀软兼容测试。
 - macOS `.app` 内嵌固定 bundle ID 的 helper，完成 hardened runtime、codesign、notarization、staple 与升级后 TCC 回归。
-- Linux 先发布 Ubuntu GNOME `.deb` 与诊断包，明确 X11/Wayland capability；不宣称一包覆盖任意发行版。
+- Linux 先发布经资格验证的 KDE Plasma/X11 `.deb` 与诊断包；GNOME 与 Wayland 达到各自门槛后再增加对应 capability/profile，不宣称一包覆盖任意发行版。
 - Python 使用锁定 wheelhouse/哈希与可复现构建，优先 onedir/内嵌 runtime；原生 helper、OCR 模型和浏览器依赖分层打包。
 - 系统 secret store、确认 UI、policy 管理、审计完整性/保留/导出、截图 TTL 与隐私擦除。
 - 崩溃报告和 telemetry 默认脱敏、可关闭；建立真实应用 qualification matrix、SLO 和回归实验室。

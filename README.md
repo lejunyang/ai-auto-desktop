@@ -50,6 +50,26 @@ python -m ai_auto_desktop run workflow.yaml `
 ```
 
 读取类工作流声明 `desktop.observe`，写操作还要声明 `desktop.input`，两者都需要宿主显式授权。该驱动不截图、不执行 OCR，也不注入键盘或鼠标输入。
+真实 Windows fixture 与 CI 已包含 `set_value → postcondition.observe(snapshot) → condition`
+闭环；在非 Windows 主机上只做契约测试，不能替代真实 UIA runner。
+
+## Linux KDE/X11 AT-SPI 驱动
+
+`plugins/linux_atspi` 提供 `list_applications`、`snapshot`、`find`、`focus`、
+`invoke` 和 `set_text`。当前 v0 仅在进程环境明确为 KDE + X11 时启用；优先使用
+`Atspi 2.0` typelib，缺失时用 Gio/D-Bus fallback 提供只读枚举和快照。Gio fallback
+不会伪装写能力，三个写动作都会返回 `DRIVER.ACTION_UNSUPPORTED`。注册方式：
+
+```bash
+python -m ai_auto_desktop run workflow.yaml \
+  --permission desktop.observe \
+  --plugin desktop.linux_atspi=plugins/linux_atspi/run.sh
+```
+
+本机 KDE Plasma 5.27/X11 已通过真实 AT-SPI registry、进程协议和有界 snapshot smoke。
+当前 Qt System Settings 没有注册到 registry，因此 Qt bridge 和真实写动作仍未通过资格验证；
+这与“Linux 驱动不存在”不同，也不等于“任意 KDE 应用已经支持”。驱动不注入键鼠、不截图、
+不执行 OCR。
 
 ## 描述文件与运行时
 
@@ -96,4 +116,7 @@ print(result.to_dict())
 
 只有显式传入 `--allow-scripts` 或 `allow_scripts=True` 才能执行 `script` 步骤。0.1 版仅在 Linux 且 bubblewrap 与 `prlimit` 可用时执行脚本：工作进程通过标准输入接收 JSON，看不到宿主 home 与 `/etc`，使用独立网络/PID 命名空间，并受到墙钟时间、CPU、地址空间、文件大小和输出上限约束。其他平台在实现等价操作系统隔离前，一律返回 `SCRIPT.SANDBOX_UNAVAILABLE`。
 
-当前范围包含首个 Windows UIA 纵向切片，但尚未完成 Windows 真机应用矩阵的产品级资格验证，也没有 macOS/Linux 原生驱动、持久化与恢复、secret 存储、桌面并发写入、确认 token 或完整污点执行。v0 宿主已经执行声明式风险/权限检查，并校验进程 Manifest 以及 action 输入输出契约。
+当前范围包含 Windows UIA 与 Linux KDE/X11 AT-SPI 纵向切片，但尚未完成 Windows 真机
+应用矩阵、Linux Qt 写动作或 macOS AX 的产品级资格验证；也没有持久化与恢复、secret 存储、
+桌面并发写入、确认 token 或完整污点执行。v0 宿主已经执行声明式风险/权限检查，校验进程
+Manifest 与 action 输入输出契约，并可通过 `postcondition.observe` 在动作后重新获取真实观察。

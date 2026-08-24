@@ -27,7 +27,7 @@
 | IPC | stdio NDJSON v0，便于调试和跨语言实现；已校验 manifest schema/action major，尚无完整 wire version 协商 | 保留语义兼容层，迁移到 Protobuf/CBOR 等 IDL + named pipe/Unix socket |
 | 隔离 | process plugin 使用 POSIX 进程组；Linux script 使用 bubblewrap + prlimit，其他平台 fail-closed | Windows Job Object/restricted token；macOS 受控 helper；Linux bubblewrap/OCI；资源与 capability 限额 |
 | 安全 | 结构化错误、script fail-closed、action risk policy、manifest 与 action I/O schema 校验；确认 token/taint 等尚未实现 | 签名插件、系统 secret store、确认 token、完整 taint enforcement、审计与更新回滚 |
-| 平台能力 | 已有只读三端 probe 与首个 Windows UIA process driver 纵向切片；尚未完成 Windows 真机资格验证，不能宣称产品级支持 | Windows 首先产品化；macOS 与 Ubuntu GNOME 经过 probe 后分级支持 |
+| 平台能力 | 已有只读三端 probe、Windows UIA process driver，以及 Linux KDE/X11 AT-SPI 纵向切片；Windows 真机与 Linux Qt 写动作尚未完成资格验证 | Windows 首先产品化；macOS 与各 Linux desktop profile 分别经过真机验证后分级支持 |
 
 v0 的价值是锁定运行语义并建立故障测试夹具。Windows UIA driver 已开始调用真实原生接口，但在真实 Windows runner 的 fixture app、UIPI 与权限矩阵通过前，仍不能把跨平台 contract 测试当作产品成功率。
 
@@ -126,7 +126,7 @@ capability、driver、OCR 与 script worker 都是长驻或按步启动的子进
 |---|---|---|
 | Windows | UIA/Win32，必要时补 IA2/JAB；`SendInput` 后备 | UIPI、管理员窗口、Session 0、UAC/锁屏；正式取消依赖 Job Object |
 | macOS | 签名稳定的 Swift/ObjC AX helper；CGEvent 后备 | Accessibility 与 Screen Recording 分权；bundle identity/TCC 必须稳定 |
-| Linux | AT-SPI2；X11 XTEST 或 Wayland portal + libei | 首版只资格验证 Ubuntu GNOME；X11、Wayland、compositor 能力分别声明 |
+| Linux | AT-SPI2；X11 XTEST 或 Wayland portal + libei | 当前先资格验证本机 KDE Plasma/X11；Wayland、GNOME 与其他 compositor/profile 分别声明 |
 
 公共 Runtime 不根据 OS 猜能力，只读取 worker manifest/capability。平台特有错误在 driver 内归一化，同时保留脱敏的 native code 供诊断。
 

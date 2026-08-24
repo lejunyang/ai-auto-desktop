@@ -223,7 +223,7 @@ Trusted Local Agent
 - 公共核心：Rust，负责协议、resolver、动作状态机、安全与审计。
 - Windows driver：`windows-rs` + UIA/Win32；以后再增加 IA2 和 Java Access Bridge。
 - macOS helper：Swift/Objective-C，调用 AXUIElement/AXObserver/CGEvent；用稳定 bundle ID 和签名保持 TCC 身份。
-- Linux driver：Rust + zbus/libatspi；MVP 锁定 Ubuntu 22.04/24.04 GNOME，明确测试 X11 与 Wayland。
+- Linux driver：Rust + zbus/libatspi；实现期第一基线已改为本机 KDE Plasma 5.27/X11，后续将 GNOME 与 Wayland 作为独立 profile 验证。
 - IPC：Protobuf；Unix domain socket / Windows named pipe。
 - UI：Tauri 或独立薄壳均可，但不要让 Electron/Node native addon 成为 OS 驱动核心。
 - 浏览器：单独增加 CDP/Playwright adapter，仍输出统一节点/动作 IR。
@@ -287,7 +287,7 @@ observe → resolve → precondition → policy/confirm → execute
 
 1. **M0（1–2 周）**：统一 schema、三端树探针、权限探针、15 个目标应用矩阵。
 2. **M1（3–4 周）**：先打透 Windows：observe/find/invoke/set/select/toggle/scroll/verify。
-3. **M2（4–6 周，并行）**：接 macOS AX 和 Ubuntu GNOME AT-SPI，完成三端相同 fixture 流程。
+3. **M2（4–6 周，并行）**：接 macOS AX，并先完成 KDE/X11 AT-SPI 的同一 fixture 流程；GNOME/Wayland 分 profile 扩展。
 4. **M3（3–4 周）**：输入后备、多显示器/DPI、非 OCR 视觉定位、安全确认、审计、崩溃隔离。
 
 首版建议支持：标准表单、菜单、系统设置、文件选择器、文件管理、浏览器（加 DOM）、文本/表格基础操作、常见 Electron 应用，以及跨应用复制整理。
@@ -308,7 +308,7 @@ observe → resolve → precondition → policy/confirm → execute
 1. 三端各实现 `list_windows`、`snapshot_tree`、`find`、`invoke`、`set_value`、`focus`。
 2. 用官方 inspector 对 15 个应用建立 ground truth：系统设置/文件管理器/浏览器/VS Code/Slack 或飞书/Office 或 LibreOffice/终端/一个 Qt/一个 Java/一个 Canvas 应用。
 3. 逐页面记录 element recall、semantic completeness、semantic action coverage、latency、crash/hang。
-4. 再决定是否先投 Windows+macOS，Linux 暂定 Ubuntu GNOME，还是三端同时做。
+4. 根据 Windows 真机、Apple 硬件和 KDE/X11 实测数据，再决定三端的产品发布顺序与后续 Linux profile。
 
 这一步会把“能识别多少”从猜测变成你自己的、可复现的产品数据。
 

@@ -193,7 +193,8 @@ Manifest 使用相同 `apiVersion`，`kind: CapabilityManifest`，并包含：
 | retry/on_error/finally | 支持基础语义、父子 deadline 与 unknown effect | 持久恢复与取消 |
 | budgets、risk/permission/confirmation policy | 支持执行预算与 fail-closed 前置检查 | journal/reconciliation、真实确认 token |
 | Windows UIA | 首个进程 driver：list/snapshot/find/focus/invoke/set_value；待 Windows 真机资格测试 | 完整 driver |
-| macOS AX / Linux AT-SPI | 仅只读 capability probe | 真实平台 driver |
+| macOS AX | 仅只读 capability probe | 签名稳定的真实平台 driver |
+| Linux AT-SPI | KDE/X11 driver；本机 Gio fallback 已验证只读枚举与 snapshot，Qt 写动作待验证 | 按 desktop/session profile 分级的真实 driver |
 | OCR engine | 显式 Tesseract 图片 provider；不自行截图 | 受控 frame/capture provenance |
 
 运行时遇到合法但未实现的规范字段必须明确返回 `CAPABILITY.MISSING`、`DESCRIPTOR.VERSION_UNSUPPORTED` 或实现定义的结构化 unsupported 错误；不得静默忽略。

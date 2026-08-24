@@ -58,4 +58,7 @@ Apple Silicon macOS 也不适合作为当前 x86_64 主机上的全系统跨架�
 
 - Windows：当前本机不具备高效 VM 条件，应接远程真实 Windows runner；若平台后续开放 `/dev/kvm`，再考虑本地 KVM。
 - macOS：必须接入 Apple 硬件测试节点，不在当前机器上尝试非标准虚拟化。
-- Linux：以当前本机为准，优先 KDE Plasma 5.27 + X11；当前登录会话无 DISPLAY，需要使用受控 X11/KDE 会话或专门的本机测试会话运行真实 AT-SPI smoke。
+- Linux：以当前本机 KDE Plasma 5.27 + X11 为第一目标。虽然启动 shell 没有继承
+  `DISPLAY`，测试辅助已从同 UID 的 `kwin_x11` 恢复受控会话环境，并完成真实 AT-SPI
+  registry、进程协议和有界 snapshot smoke；生产驱动不会扫描 `/proc`。当前默认走 Gio
+  只读 fallback，Qt bridge/真实写动作仍需补齐依赖和自有 fixture 后再资格验证。
