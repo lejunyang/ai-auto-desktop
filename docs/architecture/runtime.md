@@ -21,9 +21,9 @@
 |---|---|---|
 | 描述符 | JSON/YAML 都归一到唯一形状：`apiVersion: ai-auto-desktop.dev/v1alpha1`、`kind: Workflow`、`metadata.name`；严格校验并编译为冻结模型 | 版本化 canonical schema、迁移工具、签名与兼容策略 |
 | 表达式 | 白名单 Python AST 的只读解释器，不使用 `eval/exec`，禁止所有函数和方法调用 | 保持无 I/O、有限成本、跨语言一致的表达式语义与测试向量 |
-| 步骤与控制流 | `action/set/block/fail/return/script`、`if/switch/foreach/while`、`on_error/finally`；sibling DAG 已支持有界只读并发；script 默认拒绝 | 可恢复的计划状态机与确定性 reconciliation |
-| 状态 | 当前 run 结果为 `succeeded/failed/timed_out/unknown_effect` | 补全并统一 `SUCCEEDED/FAILED/TIMED_OUT/CANCELLED/UNKNOWN_EFFECT/SKIPPED` |
-| 执行能力 | 长驻 NDJSON fixture/process plugin，用于 OCR mock、桌面 invoke mock、重试和超时测试 | 真实 UIA/AX/AT-SPI driver、输入后备、截图、应用专用 adapter |
+| 步骤与控制流 | `action/set/block/fail/return/script`、`if/switch/foreach/while`、`on_error/finally`；sibling DAG 已支持有界只读并发；受限串行计划支持顶层安全点恢复；script 默认拒绝 | action/script reconciliation 与更通用的可恢复计划状态机 |
+| 状态 | run 结果为 `succeeded/failed/timed_out/cancelled/unknown_effect`，step 另有 `skipped` | 冻结跨语言状态兼容与迁移规则 |
+| 执行能力 | 已有 Windows UIA、macOS AX、Linux KDE/X11 AT-SPI 进程 driver、三端显式文本输入后备和显式图片 OCR；资格范围分别记录 | 真实应用矩阵、受控截图与应用专用 adapter |
 | IPC | stdio NDJSON v0，便于调试和跨语言实现；已校验 manifest schema/action major，尚无完整 wire version 协商 | 保留语义兼容层，迁移到 Protobuf/CBOR 等 IDL + named pipe/Unix socket |
 | 隔离 | process plugin 使用 POSIX 进程组；Linux script 使用 bubblewrap + prlimit，其他平台 fail-closed | Windows Job Object/restricted token；macOS 受控 helper；Linux bubblewrap/OCI；资源与 capability 限额 |
 | 安全 | 结构化错误、script fail-closed、action risk policy、manifest 与 action I/O schema 校验；确认 token/taint 等尚未实现 | 签名插件、系统 secret store、确认 token、完整 taint enforcement、审计与更新回滚 |

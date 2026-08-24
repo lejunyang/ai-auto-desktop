@@ -21,8 +21,9 @@
 - stdio NDJSON 长驻 process plugin 和确定性 fixture，用于成功、retryable error、永久失败、睡眠、mock OCR 与 mock desktop invoke；另有真实 Tesseract process provider，只接受调用方显式提供的图片。
 - `probe` 命令只读检查 Windows UIA、macOS Accessibility/Screen Capture 和 Linux AT-SPI/X11/Wayland/portal/libei/uinput 前置条件，不请求权限、不截图、不注入输入。
 - script 默认拒绝；`--allow-scripts` 显式启用后仅在具备 bubblewrap + `prlimit` 的 Linux 上运行，其他平台返回 `SCRIPT.SANDBOX_UNAVAILABLE`。
+- SQLite journal、owner lease 和受限 durable executor 已串通：`start/resume/status/list/events/pause/cancel` 使用 JSON-only CLI，只从顶层步骤之间的安全检查点恢复；不安全阶段恢复为 `UNKNOWN_EFFECT`。当前为避免未追踪的敏感插件输出进入 checkpoint，durable v0 拒绝 action/script。
 
-尚未实现或尚未证明：Windows/macOS 真机执行结果与真实应用矩阵、任意 KDE 应用资格；可靠的 Windows 后代进程树终止；完整 wire 协议版本协商；跨进程 single-writer session manager；checkpoint 恢复执行；系统 secret store；签名插件；真实截图；taint tracking、确认 token 与完整 policy enforcement；安装器和权限引导。当前已有 Windows Win32 fixture/CI 入口、macOS AX driver/真机回传包，以及 Linux KDE/X11 AT-SPI driver；本机已用自有 GTK3 和 Qt 5 Widgets fixture 真实验证语义树与写动作。SQLite journal、owner lease fencing 和 operator pause/resume/cancel 控制 API 已实现，但尚未把内存 runtime 串成可恢复执行服务。当前 OCR 已能处理显式图片，但尚未接入受控截图/frame provenance，因此不能视为桌面视觉闭环。M0 已具备 manifest/action contract、`postcondition.observe` 和基础 action risk policy 校验，其任务是继续把 v0 收敛成可验证基线，而不是扩大产品宣称。
+尚未实现或尚未证明：Windows/macOS 真机执行结果与真实应用矩阵、任意 KDE 应用资格；可靠的 Windows 后代进程树终止；完整 wire 协议版本协商；跨进程 single-writer session manager；带 action/script、字段级脱敏与 reconciliation 的通用持久恢复；系统 secret store；签名插件；真实截图；taint tracking、确认 token 与完整 policy enforcement；安装器和权限引导。当前已有 Windows Win32 fixture/手动 CI 入口、macOS AX driver/真机回传包，以及 Linux KDE/X11 AT-SPI driver；本机已用自有 GTK3 和 Qt 5 Widgets fixture 真实验证语义树、语义写动作和显式 XTEST 文本输入。当前 OCR 已能处理显式图片，但尚未接入受控截图/frame provenance，因此不能视为桌面视觉闭环。M0 已具备 manifest/action contract、`postcondition.observe` 和基础 action risk policy 校验，其任务是继续把 v0 收敛成可验证基线，而不是扩大产品宣称。
 
 ## 3. M0：冻结 Python 运行时 v0 合约
 
@@ -56,10 +57,10 @@
 先为三端制作只读 capability/permission probe，再把 Windows 作为第一个真实 driver：
 
 - 公共 `list_windows`、`snapshot_tree`、`find`、`focus`、`invoke`、`set_value`、`select`、`toggle`、`scroll` contract。
-- Windows UIA/Win32 独立 worker；标准化 node、snapshot revision、bounds/坐标变换、supported actions 与 native provenance。
+- Windows UIA/Win32 独立 worker；标准化 node、snapshot revision、bounds/坐标变换、supported actions 与 native provenance，并提供显式 `type_text` SendInput 后备。
 - dispatch 前重新 resolve，完整执行 `observe → resolve → precondition → policy → execute → re-observe → postcondition`。
 - Windows Job Object、kill-on-close、driver watchdog、crash restart generation 和 stale node 拒绝。
-- macOS probe 验证 AX trust/TCC；Linux probe 分别记录 AT-SPI、X11、Wayland portal/libei 可用性。Windows 已有 UIA 进程驱动和 Win32 fixture，覆盖窗口枚举、树快照、精确定位、focus/invoke/set_value，以及 Runtime 的动作后重新观察；仍需在真实 Windows runner 上产出执行结果和权限边界资格证据。
+- macOS probe 验证 AX trust/TCC；Linux probe 分别记录 AT-SPI、X11、Wayland portal/libei 可用性。Windows 已有 UIA 进程驱动和 Win32 fixture，覆盖窗口枚举、树快照、精确定位、focus/invoke/set_value/type_text，以及 Runtime 的动作后重新观察；仍需在真实 Windows runner 上产出执行结果和权限边界资格证据。
 - 建立 15–30 个目标应用/页面的 ground truth 和 element recall、semantic completeness、action coverage、latency、hang/crash 指标。当前本机 Qt 5 Widgets/GTK3 自有 fixture 已通过，真实 KDE 应用矩阵仍待建设。
 
 ### 退出门槛
@@ -77,8 +78,8 @@
 
 ### 范围
 
-- macOS：签名稳定的 Swift/ObjC AX helper，分离 Accessibility 与 Screen Recording 权限；验证 AX action、可写属性、通知与 CGEvent 后备。
-- Linux：先限定当前已验证基线 KDE Plasma 5.27/X11；自有 GTK3/Qt 5 Widgets fixture 已通过，下一步扩展到真实 KDE/Qt 应用矩阵。GNOME、X11 输入后备与 Wayland portal/libei 均作为不同 capability/profile，必须独立资格验证。
+- macOS：已实现 Swift AX helper、显式 CGEvent 文本输入与可回传真机套件；仍需在真实 Mac 验证 TCC、签名身份、AX 动作和输入后置条件。
+- Linux：先限定当前已验证基线 KDE Plasma 5.27/X11；自有 GTK3/Qt 5 Widgets fixture 的语义动作与显式 XTEST 文本输入已通过，下一步扩展到真实 KDE/Qt 应用矩阵。GNOME 与 Wayland portal/libei 作为不同 capability/profile，必须独立资格验证。
 - 三端加入 single-desktop-writer session manager、用户介入检测、多显示器/DPI/坐标 provenance。
 - screenshot 由 Host/driver 获取并受 policy/audit 控制；OCR 独立进程仅接受显式 frame/region，输出带 confidence 和 bounds 的 perception layer。
 - 固定回退顺序并实现显式 gate：native/app API → accessibility → keyboard → semantic bounds pointer → declared vision → declared OCR。

@@ -114,8 +114,9 @@ worker 同时只保留一个公开 current revision。再次 snapshot、写前�
 且不拆 surrogate pair 的块构造 key-down/key-up，并通过 `postToPid` 投递；每块前都再次确认
 目标仍有焦点且应用仍在前台。它不会激活后台应用，不会模拟 pointer，也不会被 `set_value`
 隐式调用。
-`type_text` 只需要 Accessibility，不需要 Screen Recording。Python 只有在完整的换行终止
-helper 请求帧写入 pipe 后才认为跨过派发边界；部分写入或写入失败仍是 `not_applied`。
+`type_text` 只需要 Accessibility，不需要 Screen Recording。完整的换行终止 helper 请求帧
+写入 pipe 只表示跨过请求传输边界，并不表示键盘已经派发；部分写入或写入失败仍是
+`not_applied`。
 该动作不是 secret 输入通道、快捷键或粘贴接口，明文会经过公开和私有 NDJSON 边界；调用方
 不得用它输入密码或其他 secret。
 在改变焦点和发布首个事件前，helper 使用 Carbon/HIToolbox 的
@@ -133,9 +134,7 @@ timeout、EOF、输出超限或协议错误同样按这一规则归一；这些�
 `not_applied`；若 AX focus 已改变但未发送按键，则报告 `focus_changed=true` 和
 `effect=contextual`；helper 在确认焦点后先发独立进度帧，所以此阶段的 timeout 也不声称文本
 可能输入。成功结果使用 `submitted=true`，只说明 CGEvent 调用已
-提交，不证明目标应用已经处理。调用方不得自动重试，
-而应获取新快照验证业务后置条件。成功响应只证明原生 API 接受调用，不证明应用已经完成
-预期业务变化。
+提交，不证明目标应用已经处理。调用方不得自动重试，而应获取新快照验证业务后置条件。
 
 稳定错误码包括：
 

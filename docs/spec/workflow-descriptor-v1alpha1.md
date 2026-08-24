@@ -195,11 +195,12 @@ Manifest 使用相同 `apiVersion`，`kind: CapabilityManifest`，并包含：
 | `set`, `if`, `fail`, `return` | 首版子集 | 完整语义 |
 | `switch`, `foreach`, `while`, `block` | 支持串行有界执行；`foreach.concurrency != 1` 明确拒绝 | 完整且有界 |
 | `script` | 默认关闭；仅 Linux bubblewrap + prlimit 可用时执行 | 三端独立进程和 deny-by-default sandbox |
-| retry/on_error/finally | 支持基础语义、父子 deadline、合作式取消与 unknown effect | 持久恢复与协议级取消 |
-| budgets、risk/permission/confirmation policy | 支持执行预算与 fail-closed 前置检查 | journal/reconciliation、真实确认 token |
-| Windows UIA | 首个进程 driver：list/snapshot/find/focus/invoke/set_value；待 Windows 真机资格测试 | 完整 driver |
-| macOS AX | 已实现进程 driver 与自包含真机测试包；真实 Mac TCC 结果待回传 | 签名稳定且经过应用矩阵验证的正式 driver |
-| Linux AT-SPI | KDE/X11 driver；本机 GTK3 与 Qt 5 Widgets 自有 fixture 已验证语义读取和写动作，真实 KDE 应用矩阵待验证 | 按 desktop/session profile 分级的真实 driver |
+| retry/on_error/finally | 支持基础语义、父子 deadline、合作式取消、unknown effect，以及受限串行计划的顶层安全点恢复 | action/script reconciliation 与协议级取消 |
+| budgets、risk/permission/confirmation policy | 支持执行预算、SQLite journal/lease 与 fail-closed 前置检查 | 跨进程 single-writer、真实确认 token 与完整 taint enforcement |
+| Windows UIA | 进程 driver：list/snapshot/find/focus/invoke/set_value/type_text；待 Windows 真机资格测试 | 完整 driver |
+| macOS AX | 已实现进程 driver、显式 type_text 与自包含真机测试包；真实 Mac TCC 结果待回传 | 签名稳定且经过应用矩阵验证的正式 driver |
+| Linux AT-SPI | KDE/X11 driver；本机 GTK3 与 Qt 5 Widgets 自有 fixture 已验证语义读取、写动作与显式 XTEST type_text，真实 KDE 应用矩阵待验证 | 按 desktop/session profile 分级的真实 driver |
+| durable execution | JSON-only CLI 支持 start/resume/status/list/events/pause/cancel；仅允许串行、无 action/script、无敏感字段的计划，并只从顶层步骤之间恢复 | 带字段级脱敏与动作 reconciliation 的通用恢复 |
 | OCR engine | 显式 Tesseract 图片 provider；不自行截图 | 受控 frame/capture provenance |
 
 运行时遇到合法但未实现的规范字段必须明确返回 `CAPABILITY.MISSING`、`DESCRIPTOR.VERSION_UNSUPPORTED` 或实现定义的结构化 unsupported 错误；不得静默忽略。

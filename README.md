@@ -77,9 +77,11 @@ System Settings 等真实 KDE 应用矩阵仍未完成资格验证；这不等�
 
 `tests/macos` 是可直接复制到 Intel 或 Apple Silicon Mac 的自包含测试套件。它使用
 系统 `xcrun`/`swiftc` 构建固定 bundle ID 的 AppKit fixture 与 AX runner，限定在自有
-fixture PID 内验证有界 AX 遍历、精确 identifier、focus、set value、press 和动作后
-重新观察。默认不弹权限请求；只有显式参数才请求 Accessibility。Screen Recording 仅
-做 preflight，整个测试不截图。运行方式与回传归档格式见
+fixture PID 内验证有界 AX 遍历、精确 identifier、focus、set value、press，以及显式
+`type_text` 的 ASCII、中文和非 BMP Unicode 输入；每个动作后都重新观察。套件还会在
+派发前检查 Secure Event Input，并验证 secure text 目标被拒绝。默认不弹权限请求；只有
+显式参数才请求 Accessibility。Screen Recording 仅做 preflight，整个测试不截图。
+运行方式与回传归档格式见
 `docs/testing/macos-fixture.md`。
 
 ## 描述文件与运行时
@@ -119,7 +121,19 @@ print(result.to_dict())
 
 `RunResult.status` 可能是 `succeeded`、`failed`、`timed_out`、`cancelled` 或 `unknown_effect`。错误对象包含稳定的 `code`、`category`、`retryable`、`effect`、`details`、`cause`、`suppressed` 和位置信息。
 
-需要跨进程查询和控制 run 时，可以使用 SQLite journal 与 `RunService`：
+需要跨进程查询、控制和恢复 run 时，可以使用 SQLite journal、`RunService` 与
+`DurableExecutor`。命令行提供 `start`、`resume`、`status`、`list`、`events`、`pause` 和
+`cancel`，每次只向 stdout 输出一个 JSON 文档：
+
+```bash
+python -m ai_auto_desktop start workflow.yaml --journal runs.sqlite3 --run-id demo
+python -m ai_auto_desktop status demo --journal runs.sqlite3
+python -m ai_auto_desktop pause demo --journal runs.sqlite3
+python -m ai_auto_desktop resume demo workflow.yaml --journal runs.sqlite3
+python -m ai_auto_desktop events demo --journal runs.sqlite3
+```
+
+Python API 示例：
 
 ```python
 from ai_auto_desktop import JournalStore, RunService
@@ -132,8 +146,10 @@ with JournalStore("runs.sqlite3") as journal:
 
 `request_pause`、`request_resume` 和 `request_cancel` 只原子记录 operator 的期望；
 runner 在持有有效 owner lease 的安全点应用状态。暂停会原子释放 lease，恢复后必须重新
-claim。当前 API 尚未直接驱动 `WorkflowRunner` 做 checkpoint 恢复，不能把“控制状态已持久化”
-理解为“任意执行位置可恢复”。
+claim。当前受限 v0 只接受 `max_concurrency=1`、顶层隐式串行链，且保守拒绝 `action`、
+`script` 及敏感输入/输出；它只从 `between_top_level_steps` 检查点恢复。若进程在
+`in_top_level_step` 或 `finalizing` 阶段崩溃，恢复会零派发地终结为 `unknown_effect`，不会重放
+可能产生副作用的步骤。原始绝对 deadline 与已消耗 attempt 数不会因恢复而重置。
 
 ## 进程插件协议
 
@@ -145,8 +161,8 @@ claim。当前 API 尚未直接驱动 `WorkflowRunner` 做 checkpoint 恢复，�
 
 当前范围包含 Windows UIA、macOS AX 与 Linux KDE/X11 AT-SPI 纵向切片，但尚未完成
 Windows/macOS 真机应用矩阵或任意 KDE 应用的产品级资格验证。运行时已有 SQLite run/event
-journal、owner lease fencing，以及查询、pause/resume/cancel 的持久控制 API；当前仍是安全点
-生效的合作式控制，尚未接入完整 checkpoint 恢复执行。DAG runtime 会并发独立的非桌面
+journal、owner lease fencing，以及受限串行计划在顶层安全点的 checkpoint 恢复；控制仍是
+安全点生效的合作式机制，已派发的 OS/插件调用不能被异步强杀。DAG runtime 会并发独立的非桌面
 `read_only` action，其余写动作与控制流保持全局独占。系统 secret store、确认 token、完整
 污点传播和跨进程 single-desktop-writer 仍未实现。v0 宿主已经执行声明式风险/权限检查，
 校验 Manifest 与 action 输入输出契约，并可通过 `postcondition.observe` 获取动作后真实观察。
