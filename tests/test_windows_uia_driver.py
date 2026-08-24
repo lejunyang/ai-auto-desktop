@@ -38,6 +38,7 @@ def node(
     value: str | None = None,
     actions: tuple[str, ...] = (),
     automation_id: str | None = None,
+    protected: bool = False,
 ) -> object:
     return uia.BackendNode(
         native=key,
@@ -60,6 +61,7 @@ def node(
             "framework_id": "Fake",
             "process_id": 7,
             "runtime_id": [42, key],
+            "value_redacted": protected,
         },
     )
 
@@ -68,7 +70,15 @@ def default_tree() -> list[object]:
     return [
         node("root", None, "window", "Editor", actions=("focus",), automation_id="main"),
         node("save", 0, "button", "Save", actions=("focus", "invoke"), automation_id="save"),
-        node("title", 0, "edit", "Title", value="Draft", actions=("focus", "set_value"), automation_id="title"),
+        node(
+            "title",
+            0,
+            "edit",
+            "Title",
+            value="Draft",
+            actions=("focus", "set_value", "type_text"),
+            automation_id="title",
+        ),
     ]
 
 
@@ -123,6 +133,19 @@ class FakeBackend:
 
     def set_value(self, native: object, value: str, *, deadline: float) -> object:
         return self._action("set_value", native, value)
+
+    def type_text(
+        self,
+        native: object,
+        text: str,
+        *,
+        window_handle: int,
+        deadline: float,
+    ) -> object:
+        self.calls.append(("type_text", native, text, window_handle))
+        if self.fail == "type_text":
+            raise RuntimeError("synthetic native failure")
+        return {"native_pattern": "type_text"}
 
     def same_element(
         self, previous: object, current: object, *, deadline: float
@@ -198,6 +221,7 @@ class WindowsUIADriverCoreTests(unittest.TestCase):
             ("focus", {"automation_id": "save"}, {}),
             ("invoke", {"automation_id": "save"}, {}),
             ("set_value", {"automation_id": "title"}, {"value": "Final"}),
+            ("type_text", {"automation_id": "title"}, {"text": "中文 A😀"}),
         )
         for action, locator, extra in cases:
             with self.subTest(action=action):
@@ -227,6 +251,10 @@ class WindowsUIADriverCoreTests(unittest.TestCase):
                 self.assertEqual(len(action_calls), 1)
                 if action == "set_value":
                     self.assertEqual(action_calls[0], ("set_value", "title", "Final"))
+                elif action == "type_text":
+                    self.assertEqual(
+                        action_calls[0], ("type_text", "title", "中文 A😀", 101)
+                    )
 
     def test_stale_snapshot_and_replaced_target_are_rejected_without_write(self) -> None:
         first = default_tree()
@@ -357,6 +385,441 @@ class WindowsUIADriverCoreTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, "DRIVER.STALE_SNAPSHOT")
         self.assertFalse(any(call[0] == "invoke" for call in backend.calls))
 
+    def test_type_text_rejects_invalid_text_before_capture_or_dispatch(self) -> None:
+        snapshot = self.snapshot()
+        found = self.find(snapshot, {"automation_id": "title"})
+        capture_count = self.backend.capture_count
+        cases = (
+            "",
+            "x" * (uia.MAX_TYPE_TEXT_CHARS + 1),
+            "line\nbreak",
+            "tab\tcharacter",
+            "zero-width-\u200bspace",
+            "private-use-\ue000",
+            "bad-surrogate-\ud800",
+        )
+        for text in cases:
+            with self.subTest(text=repr(text)):
+                with self.assertRaises(uia.DriverError) as raised:
+                    self.driver.execute(
+                        "type_text",
+                        {
+                            "target": found["target"],
+                            "locator": {"automation_id": "title"},
+                            "text": text,
+                        },
+                        deadline=deadline(),
+                    )
+                self.assertEqual(raised.exception.code, "DRIVER.INVALID_REQUEST")
+                self.assertEqual(self.backend.capture_count, capture_count)
+                self.assertFalse(any(call[0] == "type_text" for call in self.backend.calls))
+
+    def test_type_text_rejects_protected_and_non_focusable_targets(self) -> None:
+        protected_tree = default_tree()
+        protected_tree[2] = node(
+            "secret",
+            0,
+            "edit",
+            "Password",
+            actions=("focus", "type_text"),
+            automation_id="secret",
+            protected=True,
+        )
+        backend = FakeBackend([protected_tree])
+        driver = uia.WindowsUIADriver(backend)
+        snapshot = driver.execute(
+            "snapshot", {"window": {"handle": 101}}, deadline=deadline()
+        )
+        found = driver.execute(
+            "find",
+            {
+                "snapshot_id": snapshot["snapshot_id"],
+                "revision": snapshot["revision"],
+                "locator": {"automation_id": "secret"},
+            },
+            deadline=deadline(),
+        )
+        with self.assertRaises(uia.DriverError) as protected:
+            driver.execute(
+                "type_text",
+                {
+                    "target": found["target"],
+                    "locator": {"automation_id": "secret"},
+                    "text": "do not send",
+                },
+                deadline=deadline(),
+            )
+        self.assertEqual(protected.exception.code, "DRIVER.PROTECTED_ELEMENT")
+        self.assertEqual(protected.exception.data["phase"], "before_dispatch")
+        self.assertFalse(any(call[0] == "type_text" for call in backend.calls))
+
+        snapshot = self.snapshot()
+        save = self.find(snapshot, {"automation_id": "save"})
+        with self.assertRaises(uia.DriverError) as unsupported:
+            self.driver.execute(
+                "type_text",
+                {
+                    "target": save["target"],
+                    "locator": {"automation_id": "save"},
+                    "text": "ordinary",
+                },
+                deadline=deadline(),
+            )
+        self.assertEqual(unsupported.exception.code, "DRIVER.ACTION_UNSUPPORTED")
+        self.assertFalse(any(call[0] == "type_text" for call in self.backend.calls))
+
+    def test_type_text_requires_fresh_top_level_window_handle(self) -> None:
+        backend = FakeBackend()
+        original_capture = backend.capture
+
+        def capture_without_handle(*args: object, **kwargs: object) -> object:
+            result = original_capture(*args, **kwargs)
+            if backend.capture_count >= 2:
+                result.window = {"title": "Editor", "process_id": 7}
+            return result
+
+        backend.capture = capture_without_handle  # type: ignore[method-assign]
+        driver = uia.WindowsUIADriver(backend)
+        snapshot = driver.execute(
+            "snapshot", {"window": {"handle": 101}}, deadline=deadline()
+        )
+        found = driver.execute(
+            "find",
+            {
+                "snapshot_id": snapshot["snapshot_id"],
+                "revision": snapshot["revision"],
+                "locator": {"automation_id": "title"},
+            },
+            deadline=deadline(),
+        )
+        with self.assertRaises(uia.DriverError) as raised:
+            driver.execute(
+                "type_text",
+                {
+                    "target": found["target"],
+                    "locator": {"automation_id": "title"},
+                    "text": "ordinary",
+                },
+                deadline=deadline(),
+            )
+        self.assertEqual(raised.exception.code, "DRIVER.ACTION_FAILED")
+        self.assertEqual(raised.exception.data["phase"], "before_dispatch")
+        self.assertEqual(raised.exception.data["events_submitted"], 0)
+        self.assertFalse(any(call[0] == "type_text" for call in backend.calls))
+
+    def test_type_text_distinguishes_pre_dispatch_and_unknown_effect(self) -> None:
+        for failure, expected_code, expected_phase, expected_effect in (
+            (
+                uia.DriverError(
+                    "DRIVER.ACTION_FAILED",
+                    "no INPUT submitted",
+                    data={
+                        "phase": "before_dispatch",
+                        "effect": "not_applied",
+                        "events_submitted": 0,
+                    },
+                ),
+                "DRIVER.ACTION_FAILED",
+                "before_dispatch",
+                "not_applied",
+            ),
+            (
+                uia.DriverError(
+                    "DRIVER.UNKNOWN_EFFECT",
+                    "partial INPUT submitted",
+                    data={
+                        "phase": "post_dispatch",
+                        "effect": "unknown",
+                        "events_submitted": 1,
+                    },
+                ),
+                "DRIVER.UNKNOWN_EFFECT",
+                "post_dispatch",
+                "unknown",
+            ),
+        ):
+            with self.subTest(expected_code=expected_code):
+                backend = FakeBackend()
+
+                def fail_type_text(
+                    native: object,
+                    text: str,
+                    *,
+                    window_handle: int,
+                    deadline: float,
+                ) -> object:
+                    backend.calls.append(("type_text", native, text, window_handle))
+                    raise failure
+
+                backend.type_text = fail_type_text  # type: ignore[method-assign]
+                driver = uia.WindowsUIADriver(backend)
+                snapshot = driver.execute(
+                    "snapshot", {"window": {"handle": 101}}, deadline=deadline()
+                )
+                found = driver.execute(
+                    "find",
+                    {
+                        "snapshot_id": snapshot["snapshot_id"],
+                        "revision": snapshot["revision"],
+                        "locator": {"automation_id": "title"},
+                    },
+                    deadline=deadline(),
+                )
+                with self.assertRaises(uia.DriverError) as raised:
+                    driver.execute(
+                        "type_text",
+                        {
+                            "target": found["target"],
+                            "locator": {"automation_id": "title"},
+                            "text": "ordinary",
+                        },
+                        deadline=deadline(),
+                    )
+                self.assertEqual(raised.exception.code, expected_code)
+                self.assertEqual(raised.exception.data["phase"], expected_phase)
+                self.assertEqual(raised.exception.data["effect"], expected_effect)
+                self.assertFalse(raised.exception.retryable)
+                self.assertIsNone(driver._current)
+
+    def test_unicode_send_input_adapter_encodes_surrogate_pairs_and_effect_boundary(
+        self,
+    ) -> None:
+        pointer_size = uia.ctypes.sizeof(uia.ctypes.c_void_p)
+        self.assertIn(pointer_size, {4, 8})
+        self.assertEqual(
+            uia.ctypes.sizeof(uia._KeyboardInput), 16 if pointer_size == 4 else 24
+        )
+        self.assertEqual(
+            uia.ctypes.sizeof(uia._MouseInput), 24 if pointer_size == 4 else 32
+        )
+        self.assertEqual(uia._Input.payload.offset, 4 if pointer_size == 4 else 8)
+        self.assertEqual(
+            uia.ctypes.sizeof(uia._Input), 28 if pointer_size == 4 else 40
+        )
+        captured: list[tuple[int, list[tuple[int, int]], int]] = []
+
+        def accept_all(count: int, events: object, size: int) -> int:
+            captured.append(
+                (
+                    count,
+                    [
+                        (events[index].ki.wScan, events[index].ki.dwFlags)
+                        for index in range(count)
+                    ],
+                    size,
+                )
+            )
+            return count
+
+        adapter = uia.UnicodeSendInputAdapter(accept_all, lambda: 0)
+        checks: list[int] = []
+        result = adapter.send_text(
+            "A😀", before_batch=checks.append, deadline=deadline()
+        )
+        self.assertEqual(result["utf16_units"], 3)
+        self.assertEqual(result["unicode_scalars"], 2)
+        self.assertEqual(result["events_submitted"], 6)
+        self.assertEqual(checks, [0, 2])
+        self.assertEqual([batch[0] for batch in captured], [2, 4])
+        self.assertEqual(
+            captured[0][1] + captured[1][1],
+            [
+                (0x0041, uia.KEYEVENTF_UNICODE),
+                (0x0041, uia.KEYEVENTF_UNICODE | uia.KEYEVENTF_KEYUP),
+                (0xD83D, uia.KEYEVENTF_UNICODE),
+                (0xD83D, uia.KEYEVENTF_UNICODE | uia.KEYEVENTF_KEYUP),
+                (0xDE00, uia.KEYEVENTF_UNICODE),
+                (0xDE00, uia.KEYEVENTF_UNICODE | uia.KEYEVENTF_KEYUP),
+            ],
+        )
+        self.assertTrue(
+            all(batch[2] == uia.ctypes.sizeof(uia._Input) for batch in captured)
+        )
+
+        for sent, expected_code, expected_effect in (
+            (0, "DRIVER.ACTION_FAILED", "not_applied"),
+            (1, "DRIVER.UNKNOWN_EFFECT", "unknown"),
+        ):
+            with self.subTest(sent=sent):
+                failing = uia.UnicodeSendInputAdapter(
+                    lambda count, events, size, sent=sent: sent, lambda: 5
+                )
+                with self.assertRaises(uia.DriverError) as raised:
+                    failing.send_text("A", deadline=deadline())
+                self.assertEqual(raised.exception.code, expected_code)
+                self.assertEqual(raised.exception.data["effect"], expected_effect)
+                self.assertFalse(raised.exception.retryable)
+
+        calls = 0
+
+        def lose_context_after_first_batch(events_submitted: int) -> None:
+            if events_submitted:
+                raise uia.DriverError(
+                    "DRIVER.ACTION_FAILED",
+                    "foreground changed",
+                    data={
+                        "phase": "before_dispatch",
+                        "effect": "not_applied",
+                    },
+                )
+
+        def submit_batch(count: int, events: object, size: int) -> int:
+            nonlocal calls
+            calls += 1
+            return count
+
+        drifting = uia.UnicodeSendInputAdapter(submit_batch, lambda: 0)
+        with self.assertRaises(uia.DriverError) as drifted:
+            drifting.send_text(
+                "AB",
+                before_batch=lose_context_after_first_batch,
+                deadline=deadline(),
+            )
+        self.assertEqual(calls, 1)
+        self.assertEqual(drifted.exception.code, "DRIVER.UNKNOWN_EFFECT")
+        self.assertEqual(drifted.exception.data["events_submitted"], 2)
+        self.assertEqual(drifted.exception.data["effect"], "unknown")
+
+    def test_native_type_text_focuses_before_sendinput_and_focus_failure_is_safe(
+        self,
+    ) -> None:
+        calls: list[tuple[object, ...]] = []
+
+        class Native:
+            CurrentHasKeyboardFocus = True
+            CurrentProcessId = 7
+
+            def SetFocus(self) -> None:
+                calls.append(("focus",))
+
+        class Adapter:
+            def foreground_window_identity(self) -> tuple[int, int]:
+                calls.append(("foreground_window_identity",))
+                return 101, 7
+
+            def send_text(
+                self,
+                text: str,
+                *,
+                before_batch: object,
+                deadline: float,
+            ) -> dict[str, object]:
+                before_batch(0)
+                calls.append(("send_text", text))
+                return {"native_pattern": "SendInput"}
+
+        backend = object.__new__(uia.ComtypesUIABackend)
+        backend.input_adapter = Adapter()
+        result = backend.type_text(
+            Native(), "ordinary", window_handle=101, deadline=deadline()
+        )
+        self.assertEqual(
+            calls,
+            [
+                ("focus",),
+                ("foreground_window_identity",),
+                ("send_text", "ordinary"),
+            ],
+        )
+        self.assertEqual(result["native_pattern"], "SendInput")
+
+        class FailingNative:
+            def SetFocus(self) -> None:
+                calls.append(("failing_focus",))
+                raise RuntimeError("focus denied")
+
+        calls.clear()
+        with self.assertRaises(uia.DriverError) as raised:
+            backend.type_text(
+                FailingNative(), "ordinary", window_handle=101, deadline=deadline()
+            )
+        self.assertEqual(raised.exception.code, "DRIVER.ACTION_FAILED")
+        self.assertEqual(raised.exception.data["phase"], "before_dispatch")
+        self.assertEqual(raised.exception.data["effect"], "not_applied")
+        self.assertEqual(raised.exception.data["events_submitted"], 0)
+        self.assertFalse(raised.exception.retryable)
+        self.assertEqual(calls, [("failing_focus",)])
+
+    def test_native_type_text_rejects_focus_or_foreground_mismatch_before_input(
+        self,
+    ) -> None:
+        calls: list[tuple[object, ...]] = []
+
+        class Native:
+            CurrentProcessId = 7
+
+            def __init__(self, focused: bool) -> None:
+                self.CurrentHasKeyboardFocus = focused
+
+            def SetFocus(self) -> None:
+                calls.append(("focus",))
+
+        class Adapter:
+            def __init__(self, window_handle: int, process_id: int) -> None:
+                self.window_handle = window_handle
+                self.process_id = process_id
+
+            def foreground_window_identity(self) -> tuple[int, int]:
+                calls.append(("foreground_window_identity",))
+                return self.window_handle, self.process_id
+
+            def send_text(
+                self,
+                text: str,
+                *,
+                before_batch: object,
+                deadline: float,
+            ) -> object:
+                before_batch(0)
+                calls.append(("send_text", text))
+                return {}
+
+        backend = object.__new__(uia.ComtypesUIABackend)
+        for focused, foreground_hwnd, foreground_pid in (
+            (False, 101, 7),
+            (True, 102, 7),
+            (True, 101, 8),
+        ):
+            with self.subTest(
+                focused=focused,
+                foreground_hwnd=foreground_hwnd,
+                foreground_pid=foreground_pid,
+            ):
+                calls.clear()
+                backend.input_adapter = Adapter(foreground_hwnd, foreground_pid)
+                with self.assertRaises(uia.DriverError) as raised:
+                    backend.type_text(
+                        Native(focused),
+                        "ordinary",
+                        window_handle=101,
+                        deadline=deadline(),
+                    )
+                self.assertEqual(raised.exception.code, "DRIVER.ACTION_FAILED")
+                self.assertEqual(raised.exception.data["phase"], "before_dispatch")
+                self.assertEqual(raised.exception.data["effect"], "not_applied")
+                self.assertFalse(raised.exception.retryable)
+                self.assertFalse(any(call[0] == "send_text" for call in calls))
+
+    def test_type_text_timeout_is_never_retryable(self) -> None:
+        with self.assertRaises(uia.DriverError) as raised:
+            self.driver.execute(
+                "type_text",
+                {
+                    "target": {
+                        "snapshot_id": "expired:1",
+                        "revision": 1,
+                        "node_id": "n0",
+                    },
+                    "locator": {"role": "edit"},
+                    "text": "ordinary",
+                },
+                deadline=time.monotonic() - 1,
+            )
+        self.assertEqual(raised.exception.code, "DRIVER.TIMEOUT")
+        self.assertEqual(raised.exception.data["phase"], "before_dispatch")
+        self.assertEqual(raised.exception.data["effect"], "not_applied")
+        self.assertFalse(raised.exception.retryable)
+
     def test_unsupported_action_native_failure_and_deadline_are_structured(self) -> None:
         snapshot = self.snapshot()
         found = self.find(snapshot, {"automation_id": "save"})
@@ -371,6 +834,35 @@ class WindowsUIADriverCoreTests(unittest.TestCase):
                 deadline=deadline(),
             )
         self.assertEqual(unsupported.exception.code, "DRIVER.ACTION_UNSUPPORTED")
+        self.assertFalse(any(call[0] == "type_text" for call in self.backend.calls))
+
+        fallback_backend = FakeBackend()
+        fallback_backend.fail = "set_value"
+        fallback_driver = uia.WindowsUIADriver(fallback_backend)
+        fallback_snapshot = fallback_driver.execute(
+            "snapshot", {"window": {"handle": 101}}, deadline=deadline()
+        )
+        fallback_target = fallback_driver.execute(
+            "find",
+            {
+                "snapshot_id": fallback_snapshot["snapshot_id"],
+                "revision": fallback_snapshot["revision"],
+                "locator": {"automation_id": "title"},
+            },
+            deadline=deadline(),
+        )
+        with self.assertRaises(uia.DriverError) as no_fallback:
+            fallback_driver.execute(
+                "set_value",
+                {
+                    "target": fallback_target["target"],
+                    "locator": {"automation_id": "title"},
+                    "value": "x",
+                },
+                deadline=deadline(),
+            )
+        self.assertEqual(no_fallback.exception.code, "DRIVER.UNKNOWN_EFFECT")
+        self.assertFalse(any(call[0] == "type_text" for call in fallback_backend.calls))
 
         backend = FakeBackend()
         backend.fail = "invoke"
@@ -422,9 +914,31 @@ class WindowsUIAProcessTests(unittest.TestCase):
             manifest["actions"]["invoke"]["permissions"],
             ["desktop.observe", "desktop.input"],
         )
+        type_text = manifest["actions"]["type_text"]
+        self.assertEqual(
+            type_text["permissions"], ["desktop.observe", "desktop.input"]
+        )
+        self.assertEqual(type_text["effect"]["default_class"], "contextual")
+        self.assertEqual(type_text["risk"], {"category": "input", "level": "high"})
+        self.assertEqual(
+            type_text["input_schema"]["required"], ["target", "locator", "text"]
+        )
+        self.assertEqual(
+            type_text["input_schema"]["properties"]["text"]["maxLength"],
+            uia.MAX_TYPE_TEXT_CHARS,
+        )
+        self.assertTrue(all(not error["retryable"] for error in type_text["errors"]))
         self.assertEqual(
             set(manifest["actions"]),
-            {"list_windows", "snapshot", "find", "focus", "invoke", "set_value"},
+            {
+                "list_windows",
+                "snapshot",
+                "find",
+                "focus",
+                "invoke",
+                "set_value",
+                "type_text",
+            },
         )
         for name, contract in manifest["actions"].items():
             self.assertEqual(contract["contract_major"], 1, name)
@@ -433,10 +947,26 @@ class WindowsUIAProcessTests(unittest.TestCase):
     @unittest.skipIf(sys.platform == "win32", "non-Windows unavailable smoke")
     def test_non_windows_runtime_is_structured_unavailable(self) -> None:
         plugin = self.make_plugin()
-        with self.assertRaises(PluginError) as raised:
-            plugin.invoke("desktop.windows_uia.list_windows@1", {})
-        self.assertEqual(raised.exception.code, "DRIVER.UNAVAILABLE")
-        self.assertEqual(raised.exception.details["reason"], "platform")
+        for action_name, args in (
+            ("list_windows", {}),
+            (
+                "type_text",
+                {
+                    "target": {
+                        "snapshot_id": "unavailable:1",
+                        "revision": 1,
+                        "node_id": "n0",
+                    },
+                    "locator": {"role": "edit"},
+                    "text": "ordinary",
+                },
+            ),
+        ):
+            with self.subTest(action=action_name):
+                with self.assertRaises(PluginError) as raised:
+                    plugin.invoke(f"desktop.windows_uia.{action_name}@1", args)
+                self.assertEqual(raised.exception.code, "DRIVER.UNAVAILABLE")
+                self.assertEqual(raised.exception.details["reason"], "platform")
 
     def test_expired_deadline_and_unknown_action_are_structured(self) -> None:
         driver = uia.WindowsUIADriver(FakeBackend())
@@ -454,6 +984,31 @@ class WindowsUIAProcessTests(unittest.TestCase):
         )
         response = json.loads(process.stdout)
         self.assertEqual(response["error"]["code"], "PROTOCOL.ACTION_NOT_FOUND")
+
+        expired_type_text = io.BytesIO()
+        original_stdout = sys.stdout
+
+        class BinaryStdout:
+            buffer = expired_type_text
+
+        try:
+            sys.stdout = BinaryStdout()
+            uia.handle_request(
+                {
+                    "type": "invoke",
+                    "id": "expired-type-text",
+                    "action": "desktop.windows_uia.type_text@1",
+                    "deadline_ms": int((time.time() - 1) * 1000),
+                    "args": {},
+                },
+                driver,
+            )
+        finally:
+            sys.stdout = original_stdout
+        response = json.loads(expired_type_text.getvalue())
+        self.assertEqual(response["error"]["code"], "DRIVER.TIMEOUT")
+        self.assertFalse(response["error"]["retryable"])
+        self.assertEqual(response["error"]["data"]["phase"], "before_dispatch")
 
     def test_request_reader_rejects_oversize_and_continues(self) -> None:
         oversized = b"{" + b"x" * uia.MAX_REQUEST_BYTES + b"}\n"

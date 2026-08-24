@@ -5,8 +5,10 @@ The process boundary speaks the repository's UTF-8 NDJSON protocol.  The
 driver core is deliberately independent from COM so its locator, snapshot and
 stale-target rules can be exercised with a fake backend on every platform.
 
-This driver only exposes native accessibility operations.  It never injects
-keyboard or pointer input, captures pixels, or invokes OCR.
+The only input-injection operation is the explicit ``type_text`` action, which
+uses bounded Win32 Unicode keyboard events after UIA target verification.  The
+driver never falls back to it from ``set_value`` and never injects pointer
+input, captures pixels, or invokes OCR.
 """
 
 from __future__ import annotations
@@ -22,7 +24,8 @@ import math
 import os
 import sys
 import time
-from typing import Any, NoReturn, Protocol
+from typing import Any, Callable, NoReturn, Protocol
+import unicodedata
 import uuid
 
 
@@ -31,6 +34,8 @@ PLUGIN_VERSION = "0.1.0"
 MAX_REQUEST_BYTES = 1024 * 1024
 MAX_RESPONSE_BYTES = 8 * 1024 * 1024 - 1
 MAX_FIELD_CHARS = 4096
+MAX_TYPE_TEXT_CHARS = 1024
+MAX_TYPE_TEXT_UTF16_UNITS = MAX_TYPE_TEXT_CHARS * 2
 DEFAULT_REQUEST_SECONDS = 30.0
 DEFAULT_MAX_DEPTH = 32
 DEFAULT_MAX_NODES = 1000
@@ -47,12 +52,61 @@ ACTION_IDS = {
         "focus",
         "invoke",
         "set_value",
+        "type_text",
     )
 }
 ACTION_NAMES = {full_name: short_name for short_name, full_name in ACTION_IDS.items()}
-WRITE_ACTIONS = frozenset({"focus", "invoke", "set_value"})
+WRITE_ACTIONS = frozenset({"focus", "invoke", "set_value", "type_text"})
 NODE_ACTIONS = frozenset(WRITE_ACTIONS)
 STATE_NAMES = ("enabled", "offscreen", "focusable", "focused", "read_only")
+
+INPUT_KEYBOARD = 1
+KEYEVENTF_KEYUP = 0x0002
+KEYEVENTF_UNICODE = 0x0004
+
+
+class _MouseInput(ctypes.Structure):
+    # INPUT is a tagged union; this ABI member is required for correct struct
+    # size/alignment.  The driver never constructs a mouse INPUT.
+    _fields_ = [
+        ("dx", ctypes.c_int32),
+        ("dy", ctypes.c_int32),
+        ("mouseData", ctypes.c_uint32),
+        ("dwFlags", ctypes.c_uint32),
+        ("time", ctypes.c_uint32),
+        ("dwExtraInfo", ctypes.c_size_t),
+    ]
+
+
+class _KeyboardInput(ctypes.Structure):
+    _fields_ = [
+        ("wVk", ctypes.c_uint16),
+        ("wScan", ctypes.c_uint16),
+        ("dwFlags", ctypes.c_uint32),
+        ("time", ctypes.c_uint32),
+        ("dwExtraInfo", ctypes.c_size_t),
+    ]
+
+
+class _HardwareInput(ctypes.Structure):
+    _fields_ = [
+        ("uMsg", ctypes.c_uint32),
+        ("wParamL", ctypes.c_uint16),
+        ("wParamH", ctypes.c_uint16),
+    ]
+
+
+class _InputPayload(ctypes.Union):
+    _fields_ = [
+        ("mi", _MouseInput),
+        ("ki", _KeyboardInput),
+        ("hi", _HardwareInput),
+    ]
+
+
+class _Input(ctypes.Structure):
+    _anonymous_ = ("payload",)
+    _fields_ = [("type", ctypes.c_uint32), ("payload", _InputPayload)]
 
 
 BOUNDS_SCHEMA: dict[str, Any] = {
@@ -122,9 +176,13 @@ LOCATOR_ERRORS = (
     ("DRIVER.SNAPSHOT_TRUNCATED", "A bounded snapshot cannot prove uniqueness.", False),
 )
 ACTION_ERRORS = (
-    ("DRIVER.ACTION_UNSUPPORTED", "The target lacks the required native UIA pattern.", False),
+    ("DRIVER.ACTION_UNSUPPORTED", "The target lacks the required native operation.", False),
     ("DRIVER.PROTECTED_ELEMENT", "The target exposes protected content.", False),
     ("DRIVER.UNKNOWN_EFFECT", "The native action may have taken effect.", False),
+)
+TYPE_TEXT_ERRORS = tuple(
+    (code, description, False)
+    for code, description, _retryable in COMMON_ERRORS + LOCATOR_ERRORS + ACTION_ERRORS
 )
 
 
@@ -300,6 +358,36 @@ ACTION_CONTRACTS: dict[str, dict[str, Any]] = {
         errors=COMMON_ERRORS + LOCATOR_ERRORS + ACTION_ERRORS,
         permissions=("desktop.observe", "desktop.input"),
     ),
+    "type_text": _contract(
+        (
+            "Explicitly focus a freshly re-resolved UIA target and inject bounded "
+            "ordinary text with Win32 SendInput Unicode keyboard events."
+        ),
+        effect="contextual",
+        risk_category="input",
+        risk_level="high",
+        input_schema={
+            "type": "object",
+            "required": ["target", "locator", "text"],
+            "properties": {
+                "target": TARGET_SCHEMA,
+                "locator": LOCATOR_SCHEMA,
+                "text": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": MAX_TYPE_TEXT_CHARS,
+                    "description": (
+                        "Non-empty UTF-16-encodable text without Unicode control "
+                        "or non-character code points."
+                    ),
+                },
+            },
+            "additionalProperties": False,
+        },
+        output_schema=WRITE_OUTPUT_SCHEMA,
+        errors=TYPE_TEXT_ERRORS,
+        permissions=("desktop.observe", "desktop.input"),
+    ),
 }
 
 MANIFEST: dict[str, Any] = {
@@ -380,6 +468,15 @@ class UIABackend(Protocol):
 
     def set_value(self, native: Any, value: str, *, deadline: float) -> Any: ...
 
+    def type_text(
+        self,
+        native: Any,
+        text: str,
+        *,
+        window_handle: int,
+        deadline: float,
+    ) -> Any: ...
+
     def same_element(self, previous: Any, current: Any, *, deadline: float) -> bool: ...
 
 
@@ -445,6 +542,42 @@ def _text(value: Any, name: str, *, nullable: bool = False) -> str | None:
     return value
 
 
+def _type_text(value: Any) -> str:
+    if not isinstance(value, str):
+        _fail("DRIVER.INVALID_REQUEST", "text must be a string")
+    if not value:
+        _fail("DRIVER.INVALID_REQUEST", "text must not be empty")
+    if len(value) > MAX_TYPE_TEXT_CHARS:
+        _fail(
+            "DRIVER.INVALID_REQUEST",
+            f"text exceeds {MAX_TYPE_TEXT_CHARS} characters",
+        )
+    for index, character in enumerate(value):
+        category = unicodedata.category(character)
+        if category.startswith("C"):
+            _fail(
+                "DRIVER.INVALID_REQUEST",
+                "text must not contain Unicode control or non-character code points",
+                index=index,
+                category=category,
+            )
+    try:
+        encoded = value.encode("utf-16-le", errors="strict")
+    except UnicodeEncodeError as exc:
+        _fail(
+            "DRIVER.INVALID_REQUEST",
+            "text must be encodable as well-formed UTF-16",
+            index=exc.start,
+        )
+    units = len(encoded) // 2
+    if units > MAX_TYPE_TEXT_UTF16_UNITS:
+        _fail(
+            "DRIVER.INVALID_REQUEST",
+            f"text exceeds {MAX_TYPE_TEXT_UTF16_UNITS} UTF-16 code units",
+        )
+    return value
+
+
 def _safe_text(value: Any) -> str | None:
     if value is None:
         return None
@@ -485,6 +618,261 @@ def _normalize_bounds(value: Mapping[str, Any] | None) -> dict[str, int] | None:
     return {"x": x, "y": y, "width": width, "height": height}
 
 
+class UnicodeSendInputAdapter:
+    """Bounded Win32 Unicode keyboard injection with an explicit effect boundary."""
+
+    def __init__(self, send_input: Any = None, get_last_error: Any = None) -> None:
+        if send_input is None:
+            if sys.platform != "win32":
+                raise DriverError(
+                    "DRIVER.UNAVAILABLE",
+                    "Win32 SendInput requires Windows",
+                    data={"reason": "platform", "platform": sys.platform},
+                )
+            user32 = ctypes.WinDLL("user32", use_last_error=True)
+            user32.SendInput.argtypes = [
+                ctypes.c_uint,
+                ctypes.POINTER(_Input),
+                ctypes.c_int,
+            ]
+            user32.SendInput.restype = ctypes.c_uint
+            user32.GetForegroundWindow.argtypes = []
+            user32.GetForegroundWindow.restype = ctypes.c_void_p
+            user32.GetWindowThreadProcessId.argtypes = [
+                ctypes.c_void_p,
+                ctypes.POINTER(ctypes.c_uint32),
+            ]
+            user32.GetWindowThreadProcessId.restype = ctypes.c_uint32
+            send_input = user32.SendInput
+            get_last_error = ctypes.get_last_error
+            self._user32 = user32
+        self._send_input = send_input
+        self._get_last_error = get_last_error or (lambda: 0)
+
+    def foreground_window_identity(self) -> tuple[int, int]:
+        user32 = getattr(self, "_user32", None)
+        if user32 is None:
+            raise DriverError(
+                "DRIVER.ACTION_FAILED",
+                "foreground-window verification is unavailable",
+                retryable=False,
+                data={
+                    "operation": "GetForegroundWindow",
+                    "phase": "before_dispatch",
+                    "effect": "not_applied",
+                    "events_submitted": 0,
+                },
+            )
+        try:
+            hwnd = user32.GetForegroundWindow()
+            process_id = ctypes.c_uint32()
+            thread_id = (
+                int(user32.GetWindowThreadProcessId(hwnd, ctypes.byref(process_id)))
+                if hwnd
+                else 0
+            )
+        except Exception as exc:
+            raise DriverError(
+                "DRIVER.ACTION_FAILED",
+                "foreground-window verification failed before SendInput",
+                retryable=False,
+                data={
+                    "operation": "GetForegroundWindow",
+                    "phase": "before_dispatch",
+                    "effect": "not_applied",
+                    "events_submitted": 0,
+                    "exception_type": type(exc).__name__,
+                },
+            ) from exc
+        if not hwnd or thread_id <= 0 or process_id.value <= 0:
+            raise DriverError(
+                "DRIVER.ACTION_FAILED",
+                "Windows did not report a valid foreground window process",
+                retryable=False,
+                data={
+                    "operation": "GetForegroundWindow",
+                    "phase": "before_dispatch",
+                    "effect": "not_applied",
+                    "events_submitted": 0,
+                },
+            )
+        return int(hwnd), int(process_id.value)
+
+    @staticmethod
+    def _utf16_units(text: str) -> list[int]:
+        encoded = text.encode("utf-16-le", errors="strict")
+        return [
+            int.from_bytes(encoded[index : index + 2], "little")
+            for index in range(0, len(encoded), 2)
+        ]
+
+    @staticmethod
+    def _keyboard_event(unit: int, *, key_up: bool) -> _Input:
+        flags = KEYEVENTF_UNICODE | (KEYEVENTF_KEYUP if key_up else 0)
+        return _Input(
+            type=INPUT_KEYBOARD,
+            payload=_InputPayload(
+                ki=_KeyboardInput(
+                    wVk=0,
+                    wScan=unit,
+                    dwFlags=flags,
+                    time=0,
+                    dwExtraInfo=0,
+                )
+            ),
+        )
+
+    def send_text(
+        self,
+        text: str,
+        *,
+        before_batch: Callable[[int], None] | None = None,
+        deadline: float,
+    ) -> dict[str, Any]:
+        try:
+            text = _type_text(text)
+            scalar_units = [self._utf16_units(character) for character in text]
+            event_batches = [
+                [
+                    event
+                    for unit in units
+                    for event in (
+                        self._keyboard_event(unit, key_up=False),
+                        self._keyboard_event(unit, key_up=True),
+                    )
+                ]
+                for units in scalar_units
+            ]
+        except DriverError:
+            raise
+        except Exception as exc:
+            raise DriverError(
+                "DRIVER.ACTION_FAILED",
+                "Unicode INPUT preparation failed before dispatch",
+                retryable=False,
+                data={
+                    "operation": "SendInput",
+                    "phase": "before_dispatch",
+                    "effect": "not_applied",
+                    "events_submitted": 0,
+                    "exception_type": type(exc).__name__,
+                },
+            ) from exc
+        events_requested = sum(len(batch) for batch in event_batches)
+        events_submitted = 0
+        for batch_index, events in enumerate(event_batches):
+            try:
+                _check_deadline(deadline, post_dispatch=events_submitted > 0)
+                if before_batch is not None:
+                    before_batch(events_submitted)
+                event_array = (_Input * len(events))(*events)
+                submitted = int(
+                    self._send_input(
+                        len(events),
+                        event_array,
+                        ctypes.sizeof(_Input),
+                    )
+                )
+            except DriverError as exc:
+                if events_submitted <= 0:
+                    raise
+                details = dict(exc.data) if isinstance(exc.data, Mapping) else {}
+                details.update(
+                    {
+                        "operation": "SendInput",
+                        "phase": "post_dispatch",
+                        "effect": "unknown",
+                        "events_submitted": events_submitted,
+                        "events_requested": events_requested,
+                        "batch_index": batch_index,
+                        "cause_code": exc.code,
+                    }
+                )
+                raise DriverError(
+                    "DRIVER.UNKNOWN_EFFECT",
+                    "keyboard target context changed after INPUT submission",
+                    retryable=False,
+                    data=details,
+                ) from exc
+            except Exception as exc:
+                details = {
+                    "operation": "SendInput",
+                    "events_submitted": events_submitted,
+                    "events_requested": events_requested,
+                    "batch_index": batch_index,
+                    "exception_type": type(exc).__name__,
+                }
+                if events_submitted <= 0:
+                    raise DriverError(
+                        "DRIVER.ACTION_FAILED",
+                        "SendInput failed before any INPUT event was submitted",
+                        retryable=False,
+                        data={
+                            **details,
+                            "phase": "before_dispatch",
+                            "effect": "not_applied",
+                        },
+                    ) from exc
+                raise DriverError(
+                    "DRIVER.UNKNOWN_EFFECT",
+                    "SendInput failed after INPUT events were submitted",
+                    retryable=False,
+                    data={
+                        **details,
+                        "phase": "post_dispatch",
+                        "effect": "unknown",
+                    },
+                ) from exc
+            submitted = max(0, submitted)
+            events_submitted += submitted
+            if submitted != len(events):
+                try:
+                    win32_error = int(self._get_last_error())
+                except Exception:
+                    win32_error = 0
+                details = {
+                    "operation": "SendInput",
+                    "events_submitted": events_submitted,
+                    "events_requested": events_requested,
+                    "batch_events_requested": len(events),
+                    "batch_events_submitted": submitted,
+                    "batch_index": batch_index,
+                    "win32_error": win32_error,
+                }
+                if events_submitted <= 0:
+                    raise DriverError(
+                        "DRIVER.ACTION_FAILED",
+                        (
+                            "SendInput submitted no INPUT events; Windows may have "
+                            "blocked injection at an integrity or desktop boundary"
+                        ),
+                        retryable=False,
+                        data={
+                            **details,
+                            "phase": "before_dispatch",
+                            "effect": "not_applied",
+                        },
+                    )
+                raise DriverError(
+                    "DRIVER.UNKNOWN_EFFECT",
+                    "SendInput submitted only part of a Unicode scalar event batch",
+                    retryable=False,
+                    data={
+                        **details,
+                        "phase": "post_dispatch",
+                        "effect": "unknown",
+                    },
+                )
+        _check_deadline(deadline, post_dispatch=True)
+        return {
+            "native_pattern": "SendInput",
+            "input_mode": "unicode",
+            "unicode_scalars": len(scalar_units),
+            "utf16_units": sum(len(units) for units in scalar_units),
+            "events_submitted": events_submitted,
+        }
+
+
 class WindowsUIADriver:
     """Snapshot-scoped UIA semantics over an injected native backend."""
 
@@ -495,7 +883,14 @@ class WindowsUIADriver:
         self._current: _SnapshotRecord | None = None
 
     def execute(self, action: str, args: Any, *, deadline: float) -> Any:
-        _check_deadline(deadline)
+        try:
+            _check_deadline(deadline)
+        except DriverError as exc:
+            if action == "type_text" and exc.code == "DRIVER.TIMEOUT":
+                exc.retryable = False
+            raise
+        if action == "type_text" and isinstance(self.backend, UnavailableBackend):
+            self.backend._raise()
         values = {} if args is None else _object(args, "args")
         if action == "list_windows":
             return self._list_windows(values, deadline)
@@ -504,7 +899,15 @@ class WindowsUIADriver:
         if action == "find":
             return self._find(values, deadline)
         if action in WRITE_ACTIONS:
-            return self._write(action, values, deadline)
+            try:
+                return self._write(action, values, deadline)
+            except DriverError as exc:
+                # Input injection is never automatically retryable.  A timeout
+                # after a submitted INPUT is already normalized to UNKNOWN_EFFECT;
+                # this covers every remaining pre-dispatch timeout.
+                if action == "type_text" and exc.code == "DRIVER.TIMEOUT":
+                    exc.retryable = False
+                raise
         _fail("DRIVER.INVALID_REQUEST", f"unknown action: {action}", action=action)
 
     def _list_windows(self, args: dict[str, Any], deadline: float) -> dict[str, Any]:
@@ -810,10 +1213,20 @@ class WindowsUIADriver:
         }
 
     def _write(self, action: str, args: dict[str, Any], deadline: float) -> dict[str, Any]:
-        allowed = {"target", "locator"} | ({"value"} if action == "set_value" else set())
+        payload_field = {"set_value": "value", "type_text": "text"}.get(action)
+        allowed = {"target", "locator"} | ({payload_field} if payload_field else set())
         _only_keys(args, allowed, "args")
         if "target" not in args or "locator" not in args:
             _fail("DRIVER.INVALID_REQUEST", "target and locator are required")
+        value: str | None = None
+        if action == "set_value":
+            if "value" not in args:
+                _fail("DRIVER.INVALID_REQUEST", "value is required for set_value")
+            value = _text(args["value"], "value")
+        elif action == "type_text":
+            if "text" not in args:
+                _fail("DRIVER.INVALID_REQUEST", "text is required for type_text")
+            value = _type_text(args["text"])
         target = _object(args["target"], "target")
         _only_keys(target, {"snapshot_id", "revision", "node_id"}, "target")
         node_id = target.get("node_id")
@@ -886,25 +1299,54 @@ class WindowsUIADriver:
                     "current_snapshot_id": fresh.public["snapshot_id"],
                 },
             )
+        provenance = resolved.get("provenance", {})
+        protected = isinstance(provenance, Mapping) and (
+            provenance.get("value_redacted") is True
+        )
+        protection_unknown = action == "type_text" and (
+            not isinstance(provenance, Mapping)
+            or provenance.get("value_redacted") is not False
+        )
+        if action in {"set_value", "type_text"} and (
+            protected or protection_unknown
+        ):
+            raise DriverError(
+                "DRIVER.PROTECTED_ELEMENT",
+                f"{action} is disabled for password or protected elements",
+                data={
+                    "action": action,
+                    "phase": "before_dispatch",
+                    "effect": "not_applied",
+                },
+            )
         if action not in resolved["actions"]:
             raise DriverError(
                 "DRIVER.ACTION_UNSUPPORTED",
                 f"target does not support native {action}",
                 data={"action": action, "available_actions": resolved["actions"]},
             )
-        value: str | None = None
-        if action == "set_value":
-            if "value" not in args:
-                _fail("DRIVER.INVALID_REQUEST", "value is required for set_value")
-            value = _text(args["value"], "value")
-            provenance = resolved.get("provenance", {})
-            if isinstance(provenance, Mapping) and provenance.get("value_redacted") is True:
-                raise DriverError(
-                    "DRIVER.PROTECTED_ELEMENT",
-                    "set_value is disabled for password or protected elements",
-                )
         _check_deadline(deadline)
         native = fresh.handles[fresh_node_id]
+        window_handle: int | None = None
+        if action == "type_text":
+            raw_window_handle = fresh.public["window"].get("handle")
+            if (
+                isinstance(raw_window_handle, bool)
+                or not isinstance(raw_window_handle, int)
+                or raw_window_handle <= 0
+            ):
+                raise DriverError(
+                    "DRIVER.ACTION_FAILED",
+                    "fresh snapshot lacks a valid top-level window handle",
+                    retryable=False,
+                    data={
+                        "action": action,
+                        "phase": "before_dispatch",
+                        "effect": "not_applied",
+                        "events_submitted": 0,
+                    },
+                )
+            window_handle = raw_window_handle
         dispatched = False
         try:
             dispatched = True
@@ -912,14 +1354,40 @@ class WindowsUIADriver:
                 backend_result = self.backend.focus(native, deadline=deadline)
             elif action == "invoke":
                 backend_result = self.backend.invoke(native, deadline=deadline)
-            else:
+            elif action == "set_value":
                 assert value is not None
                 backend_result = self.backend.set_value(native, value, deadline=deadline)
+            else:
+                assert (
+                    action == "type_text"
+                    and value is not None
+                    and window_handle is not None
+                )
+                backend_result = self.backend.type_text(
+                    native,
+                    value,
+                    window_handle=window_handle,
+                    deadline=deadline,
+                )
             _check_deadline(deadline, post_dispatch=True)
         except DriverError as exc:
-            if dispatched and exc.code in {"DRIVER.ACTION_FAILED", "DRIVER.TIMEOUT"}:
-                details = dict(exc.data) if isinstance(exc.data, Mapping) else {}
+            details = dict(exc.data) if isinstance(exc.data, Mapping) else {}
+            if (
+                action == "type_text"
+                and exc.code in {"DRIVER.ACTION_FAILED", "DRIVER.TIMEOUT"}
+                and details.get("phase") == "before_dispatch"
+                and details.get("effect") == "not_applied"
+            ):
                 details.setdefault("action", action)
+                raise DriverError(
+                    exc.code,
+                    exc.message,
+                    retryable=False,
+                    data=details,
+                ) from exc
+            if dispatched and exc.code in {"DRIVER.ACTION_FAILED", "DRIVER.TIMEOUT"}:
+                details.setdefault("action", action)
+                details["phase"] = "post_dispatch"
                 details["effect"] = "unknown"
                 raise DriverError(
                     "DRIVER.UNKNOWN_EFFECT",
@@ -988,6 +1456,16 @@ class UnavailableBackend:
         self._raise()
 
     def set_value(self, native: Any, value: str, *, deadline: float) -> Any:
+        self._raise()
+
+    def type_text(
+        self,
+        native: Any,
+        text: str,
+        *,
+        window_handle: int,
+        deadline: float,
+    ) -> Any:
         self._raise()
 
     def same_element(self, previous: Any, current: Any, *, deadline: float) -> bool:
@@ -1064,6 +1542,7 @@ class ComtypesUIABackend:
             self.UIA = UIA
             self.automation = CreateObject(UIA.CUIAutomation, interface=UIA.IUIAutomation)
             self.walker = self.automation.ControlViewWalker
+            self.input_adapter = UnicodeSendInputAdapter()
         except Exception as exc:
             raise DriverError(
                 "DRIVER.UNAVAILABLE",
@@ -1287,7 +1766,15 @@ class ComtypesUIABackend:
         value_available = self._pattern_available(
             element, "UIA_IsValuePatternAvailablePropertyId"
         )
-        is_password = bool(self._property(element, "CurrentIsPassword", False))
+        password_unknown = object()
+        raw_is_password = self._property(
+            element, "CurrentIsPassword", password_unknown
+        )
+        # Failing to read the protection bit must never enable text writes.
+        password_clear = raw_is_password is False or (
+            isinstance(raw_is_password, int) and raw_is_password == 0
+        )
+        is_password = not password_clear
         value: str | None = None
         read_only: bool | None = None
         if value_available:
@@ -1304,6 +1791,8 @@ class ComtypesUIABackend:
         actions: list[str] = []
         if enabled and focusable:
             actions.append("focus")
+            if not is_password:
+                actions.append("type_text")
         if enabled and invoke_available:
             actions.append("invoke")
         if enabled and value_available and read_only is False:
@@ -1426,6 +1915,95 @@ class ComtypesUIABackend:
         except Exception as exc:
             raise self._native_failure("ValuePattern.SetValue", exc) from exc
 
+    def type_text(
+        self,
+        native: Any,
+        text: str,
+        *,
+        window_handle: int,
+        deadline: float,
+    ) -> Any:
+        text = _type_text(text)
+        if isinstance(window_handle, bool) or not isinstance(window_handle, int) or window_handle <= 0:
+            _fail("DRIVER.INVALID_REQUEST", "window_handle must be a positive integer")
+        _check_deadline(deadline)
+        focus_attempted = False
+        try:
+            focus_attempted = True
+            native.SetFocus()
+        except Exception as exc:
+            failure = self._native_failure("SetFocus before SendInput", exc)
+            details = dict(failure.data) if isinstance(failure.data, Mapping) else {}
+            details.update(
+                {
+                    "phase": "before_dispatch",
+                    "effect": "not_applied",
+                    "events_submitted": 0,
+                    "focus_may_have_changed": focus_attempted,
+                }
+            )
+            raise DriverError(
+                failure.code,
+                failure.message,
+                retryable=False,
+                data=details,
+            ) from exc
+        def verify_target_context(events_submitted: int) -> None:
+            if not bool(self._property(native, "CurrentHasKeyboardFocus", False)):
+                raise DriverError(
+                    "DRIVER.ACTION_FAILED",
+                    "target did not acquire keyboard focus before SendInput",
+                    retryable=False,
+                    data={
+                        "operation": "SetFocus before SendInput",
+                        "phase": "before_dispatch",
+                        "effect": "not_applied",
+                        "events_submitted": events_submitted,
+                    },
+                )
+            target_process_id = self._property(native, "CurrentProcessId")
+            try:
+                target_process_id = int(target_process_id)
+            except (TypeError, ValueError, OverflowError):
+                target_process_id = 0
+            foreground_window_handle, foreground_process_id = (
+                self.input_adapter.foreground_window_identity()
+            )
+            if (
+                target_process_id <= 0
+                or foreground_process_id != target_process_id
+                or foreground_window_handle != window_handle
+            ):
+                raise DriverError(
+                    "DRIVER.ACTION_FAILED",
+                    "focused UIA target is not in the expected foreground window",
+                    retryable=False,
+                    data={
+                        "operation": "foreground target verification",
+                        "phase": "before_dispatch",
+                        "effect": "not_applied",
+                        "events_submitted": events_submitted,
+                        "target_process_id": target_process_id or None,
+                        "foreground_process_id": foreground_process_id,
+                        "expected_window_handle": window_handle,
+                        "foreground_window_handle": foreground_window_handle,
+                    },
+                )
+
+        try:
+            return self.input_adapter.send_text(
+                text, before_batch=verify_target_context, deadline=deadline
+            )
+        except DriverError as exc:
+            details = dict(exc.data) if isinstance(exc.data, Mapping) else {}
+            details.setdefault("focus_may_have_changed", True)
+            raise DriverError(
+                exc.code,
+                exc.message,
+                retryable=exc.retryable,
+                data=details,
+            ) from exc
+
     def same_element(self, previous: Any, current: Any, *, deadline: float) -> bool:
         _check_deadline(deadline)
         try:
@@ -1447,7 +2025,7 @@ def create_default_backend() -> UIABackend:
         )
 
 
-def _wire_deadline(value: Any) -> float:
+def _wire_deadline(value: Any, *, retryable: bool = True) -> float:
     if value is None:
         return time.monotonic() + DEFAULT_REQUEST_SECONDS
     if isinstance(value, bool) or not isinstance(value, (int, float)):
@@ -1457,7 +2035,7 @@ def _wire_deadline(value: Any) -> float:
         raise DriverError(
             "DRIVER.TIMEOUT",
             "request deadline elapsed before dispatch",
-            retryable=True,
+            retryable=retryable,
             data={"phase": "before_dispatch", "effect": "not_applied"},
         )
     return time.monotonic() + remaining
@@ -1528,9 +2106,12 @@ def handle_request(request: Any, driver: WindowsUIADriver) -> None:
                 f"unknown action: {action_id}",
                 data={"action": action_id, "available_actions": list(ACTION_NAMES)},
             )
-        deadline = _wire_deadline(request.get("deadline_ms"))
+        action_name = ACTION_NAMES[action_id]
+        deadline = _wire_deadline(
+            request.get("deadline_ms"), retryable=action_name != "type_text"
+        )
         result = driver.execute(
-            ACTION_NAMES[action_id], request.get("args"), deadline=deadline
+            action_name, request.get("args"), deadline=deadline
         )
         emit({"id": request_id, "result": result})
     except DriverError as exc:

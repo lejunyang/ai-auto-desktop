@@ -6,8 +6,8 @@
 ## 契约与边界
 
 该能力提供方对外声明 `metadata.name: desktop.windows_uia`，并提供以下 v1
-动作：`list_windows`、`snapshot`、`find`、`focus`、`invoke` 和
-`set_value`。工作流中的 `uses` 值由能力清单标识、动作键和契约主版本号
+动作：`list_windows`、`snapshot`、`find`、`focus`、`invoke`、
+`set_value` 和显式键盘后备 `type_text`。工作流中的 `uses` 值由能力清单标识、动作键和契约主版本号
 组成，例如 `desktop.windows_uia.snapshot@1`。能力清单的
 `runtime.platforms` 仅声明 `windows`。
 
@@ -23,9 +23,9 @@ Python 无法安全抢占单次 COM 调用，因此宿主进程的进程超时�
 调用会返回结构化的 `DRIVER.UNAVAILABLE`。这样既能让使用模拟后端的契约测试跨平台
 运行，又不会对该能力的平台适用范围作出不实声明。
 
-当前切片明确不支持键盘或指针注入、截图、OCR、可点击点回退机制，也不会
-隐式改用其他定位器。它只使用原生 `SetFocus`、`InvokePattern.Invoke` 和
-`ValuePattern.SetValue`。
+当前切片仅支持 `type_text` 的有界 Unicode 键盘注入，不支持快捷键、组合键、指针注入、
+截图、OCR 或可点击点回退机制，也不会隐式改用其他定位器。`set_value` 只使用
+`ValuePattern.SetValue`，失败时绝不会自动退化为 `type_text`。
 
 ## 归一化观察结果
 
@@ -84,11 +84,42 @@ states 和所支持动作的结构化谓词。当前 v0 切片只支持区分大
 action-specific postcondition；如需确认界面结果，调用方必须获取新快照。
 
 效果分类采取保守策略：`invoke` 的 `effect.default_class` 为 `non_idempotent`；
-`focus` 和 `set_value` 的 `effect.default_class` 为 `contextual`。错误使用稳定的
+`focus`、`set_value` 和 `type_text` 的 `effect.default_class` 为 `contextual`。错误使用稳定的
 `DRIVER.*` 错误码，并携带有界诊断细节；部分定位失败细节会回显原始定位器或候选节点
 摘要，因此这里不提供通用的 secret-redaction 保证。原生调用前可以确认未生效的失败保持
 `not_applied`；进入后端派发边界后若发生 `DRIVER.ACTION_FAILED`、
 `DRIVER.TIMEOUT` 或未预期异常，则转换为 `DRIVER.UNKNOWN_EFFECT`，不得盲目重放。
+
+### 显式 Unicode 键盘后备
+
+`desktop.windows_uia.type_text@1` 接收 `target`、`locator` 和 `text`，要求
+`desktop.observe` 与 `desktop.input` 权限，风险为 `input/high`。它完整复用上述 fresh capture、
+唯一重解析、`CompareElements` 原生身份、语义指纹和 protected 校验，然后通过 UIA
+`SetFocus` 聚焦目标，并确认目标已获得键盘焦点、目标 PID 与前台窗口 PID 一致，且前台 HWND
+等于 fresh snapshot 记录的顶层 `window.handle`。驱动以单个 Unicode scalar 为一批调用 Win32
+`SendInput(KEYEVENTF_UNICODE)`；每批前重新检查焦点、前台 HWND 和 PID。BMP 字符每批两个
+事件，非 BMP 代理对同批发送四个事件；返回结果仅包含 scalar、code unit 与
+`events_submitted` 计数，不回显文本。
+
+输入仅限 1 到 1024 个合法 Unicode 字符，拒绝未配对代理项以及 Unicode `C*` 类别的
+控制、格式、代理、私用区和未分配码位，所以换行、Tab、ESC 等不会借此动作发送。密码或
+UIA `CurrentIsPassword` 标记的 protected 元素始终在发送前拒绝。此能力是文字输入，不是
+快捷键或 pointer API。
+
+效果边界以 `SendInput` 返回的已提交 `INPUT` 数为准。聚焦失败、截止时间在发送前耗尽、
+异常或返回 0 都是 INPUT pre-dispatch，文本结果为 `effect=not_applied`；此前的 `SetFocus` 是
+准备步骤，仍可能已改变焦点，错误细节会标记 `focus_may_have_changed`。从首个事件被提交开始，
+后续焦点/HWND/PID 漂移、部分提交、超时或结果无法确认都返回不可重试的
+`DRIVER.UNKNOWN_EFFECT`。该 action 的契约
+把所有错误声明为 `retryable=false`，禁止运行时自动重放。成功也只证明事件已入 Windows 输入
+流，并不证明控件最终值，仍须重新观察并验证 postcondition。
+
+`SendInput` 不能跨越 UIPI 完整性级别：普通进程通常无法输入到管理员窗口，也不能用于
+Session 0、UAC secure desktop、登录或锁屏桌面。输入依赖当时的前台/焦点状态，窗口切换或
+用户介入可能改变接收目标。逐 scalar 复检只能缩小 TOCTOU 窗口；焦点查询与 `SendInput`
+并非原子操作，仍无法彻底消除用户恰在两者之间抢走焦点的竞态。`KEYEVENTF_UNICODE` 避免按
+当前键盘布局反查虚拟键，但应用、IME 和控件仍可自行解释或拒绝事件；Windows 对 UIPI 阻止
+也不保证提供可区分的错误码。
 
 ## 启动与资格验证
 
@@ -98,8 +129,8 @@ action-specific postcondition；如需确认界面结果，调用方必须获取
 模拟后端契约测试。
 
 Linux/macOS 测试路径会验证能力清单、不可用状态行为、归一化快照、精确/多义/未找到
-解析、目标替换后的过期检测、通过模拟后端执行的三种写入动作语义、截止时间、
-结构化错误和输入帧上限；模拟后端测试不等同于真实 UIA 调用资格验证。现有 Windows
-条件测试另外只执行一项保守的冒烟测试：依赖缺失时必须返回 `DRIVER.UNAVAILABLE`；后端成功
-初始化时，仅要求其能够枚举可见的顶层窗口。真实应用，以及提权/UIPI 边界的资格验证，
-仍属于后续独立的平台验收工作。
+解析、目标替换后的过期检测、通过模拟后端执行的四种写入动作语义、截止时间、
+结构化错误、Unicode 代理对编码、INPUT 派发边界和输入帧上限；模拟后端测试不等同于真实
+UIA 调用资格验证。Windows-only 原生测试会在自有 Win32 EDIT fixture 上显式执行
+`type_text` 并重新观察文本，但不会在非 Windows 环境或普通 Linux 契约测试中触发。提权/UIPI、
+secure desktop、输入法与前台焦点竞争仍需单独的平台验收，不能由自有 fixture 的通过外推。

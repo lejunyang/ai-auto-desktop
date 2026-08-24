@@ -27,6 +27,7 @@ INITIAL_STATUS = "Status: idle"
 INVOKED_STATUS = "Status: invoked"
 DUPLICATE_BUTTON_NAME = "Duplicate action"
 RUNTIME_EDIT_VALUE = "Observed through Runtime"
+TYPED_TEXT = "Typed by SendInput"
 
 
 def action(name: str) -> str:
@@ -302,6 +303,44 @@ class NativeWindowsUIATests(unittest.TestCase):
             ],
             "ValuePattern",
         )
+
+    def test_type_text_uses_explicit_unicode_send_input(self) -> None:
+        self.plugin.start()
+        window = self._wait_for_window()
+        selector = {
+            "handle": window["handle"],
+            "title": self.title,
+            "process_id": self.fixture.pid,
+        }
+        edit_locator = {"role": "edit"}
+
+        snapshot = self._snapshot(selector)
+        edit = self._find(snapshot, edit_locator)
+        self.assertIn("type_text", edit["node"]["actions"])
+        self.plugin.invoke(
+            action("set_value"),
+            {"target": edit["target"], "locator": edit_locator, "value": ""},
+        )
+
+        snapshot = self._snapshot(selector)
+        edit = self._find(snapshot, edit_locator)
+        result = self.plugin.invoke(
+            action("type_text"),
+            {
+                "target": edit["target"],
+                "locator": edit_locator,
+                "text": TYPED_TEXT,
+            },
+        )
+        self.assertEqual(result["backend_result"]["native_pattern"], "SendInput")
+        self.assertEqual(result["backend_result"]["input_mode"], "unicode")
+        self.assertEqual(
+            result["backend_result"]["events_submitted"], len(TYPED_TEXT) * 2
+        )
+
+        final_snapshot = self._snapshot(selector)
+        final_edit = self._find(final_snapshot, edit_locator)
+        self.assertEqual(final_edit["node"]["value"], TYPED_TEXT)
 
 
 if __name__ == "__main__":

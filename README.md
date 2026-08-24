@@ -39,7 +39,7 @@ Tesseract 是可选的系统依赖；只有区域裁剪需要 Pillow。依赖缺
 
 ## Windows 用户界面自动化驱动（UIA）
 
-`plugins/windows_uia` 是首个真实原生桌面驱动。在 Windows 上，它使用可选的 `comtypes` 绑定枚举窗口并归一化有界的 UIA Control View。驱动支持精确定位，以及原生 `SetFocus`、`InvokePattern.Invoke` 和 `ValuePattern.SetValue`；每次写操作都会在派发前重新抓取快照、解析目标并核对原生元素身份。安装并注册：
+`plugins/windows_uia` 是首个真实原生桌面驱动。在 Windows 上，它使用可选的 `comtypes` 绑定枚举窗口并归一化有界的 UIA Control View。驱动支持精确定位，以及原生 `SetFocus`、`InvokePattern.Invoke`、`ValuePattern.SetValue` 和显式 `type_text` Unicode 键盘后备；每次写操作都会在派发前重新抓取快照、解析目标并核对原生元素身份。安装并注册：
 
 ```powershell
 pip install .[windows-uia]
@@ -49,14 +49,14 @@ python -m ai_auto_desktop run workflow.yaml `
   --plugin "desktop.windows_uia=plugins\windows_uia\run.cmd"
 ```
 
-读取类工作流声明 `desktop.observe`，写操作还要声明 `desktop.input`，两者都需要宿主显式授权。该驱动不截图、不执行 OCR，也不注入键盘或鼠标输入。
+读取类工作流声明 `desktop.observe`，写操作还要声明 `desktop.input`，两者都需要宿主显式授权。`type_text` 不会从 `set_value` 自动启用，只接受有界普通文本并禁止密码/protected 元素；它受 UIPI、完整性级别与前台焦点限制。该驱动不截图、不执行 OCR，也不提供指针输入。
 真实 Windows fixture 与 CI 已包含 `set_value → postcondition.observe(snapshot) → condition`
 闭环；在非 Windows 主机上只做契约测试，不能替代真实 UIA runner。
 
 ## Linux KDE/X11 AT-SPI 驱动
 
 `plugins/linux_atspi` 提供 `list_applications`、`snapshot`、`find`、`focus`、
-`invoke`、`set_text`、`toggle`、`expand` 和 `collapse`。当前 v0 仅在进程环境明确为 KDE + X11 时启用；优先使用
+`invoke`、`set_text`、显式 `type_text`、`toggle`、`expand` 和 `collapse`。当前 v0 仅在进程环境明确为 KDE + X11 时启用；优先使用
 `Atspi 2.0` typelib，缺失时用 Gio/D-Bus fallback 提供只读枚举和快照。Gio fallback
 不会伪装写能力，全部写动作都会返回 `DRIVER.ACTION_UNSUPPORTED`。注册方式：
 
@@ -68,9 +68,10 @@ python -m ai_auto_desktop run workflow.yaml \
 
 本机 KDE Plasma 5.27/X11 已通过真实 AT-SPI registry、进程协议和有界 snapshot smoke；
 自有 GTK3 fixture 验证 focus、set_text、invoke、toggle、expand/collapse，自有 Qt 5
-Widgets fixture 也验证 snapshot/find/focus/set_text/invoke，且均在动作后重新观察。
+Widgets fixture 也验证 snapshot/find/focus/set_text/invoke；隔离 X11/AT-SPI fixture 还
+验证两套 toolkit 的 `type_text` 经 XTEST 输入 UTF-8 后由 fresh snapshot 观察。
 System Settings 等真实 KDE 应用矩阵仍未完成资格验证；这不等于“任意 KDE 应用已经
-支持”。驱动不注入键鼠、不截图、不执行 OCR。
+支持”。除显式 `type_text` 外不会注入键鼠；驱动不截图、不执行 OCR。
 
 ## macOS 真机自测包
 
