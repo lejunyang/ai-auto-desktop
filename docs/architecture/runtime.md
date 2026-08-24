@@ -54,7 +54,7 @@ Host 是唯一能签发本地 capability 的主体。worker 只获得完成本�
 
 进程隔离首先用于故障和取消边界，并不自动等于恶意代码沙箱。若无法提供操作系统级文件、网络、凭据和资源隔离，Host 必须拒绝运行“不可信 script”，而不是把独立子进程宣传成完整沙箱。
 
-## 4. Descriptor 编译为不可变计划
+## 4. 描述文件编译为不可变计划
 
 执行前必须完成 `parse → schema validate → semantic validate → compile → freeze`，任何一步失败都不得产生局部执行。v0 只接受 canonical identity `ai-auto-desktop.dev/v1alpha1 / Workflow / metadata.name`，不会猜测或静默升级其他版本。编译产物是一次 run 的不可变 `ExecutionPlan`，至少固定：
 
@@ -109,9 +109,9 @@ observe → resolve → precondition → policy/confirm → dispatch
 
 节点 ID 只在 snapshot revision 内有效；dispatch 前必须重新解析 locator，不能跨刷新复用平台句柄。
 
-## 6. Worker 与平台 driver
+## 6. 工作进程与平台驱动
 
-### 6.1 公共 worker 契约
+### 6.1 公共工作进程契约
 
 capability、driver、OCR 与 script worker 都是长驻或按步启动的子进程，stdout 仅承载协议帧，诊断只写 stderr。Host 必须持续 drain 两条管道、限制单帧和总输出、检测重复/未知 request ID、处理半帧与非法 JSON，并对崩溃实施熔断，而不是无限重启。
 
@@ -151,7 +151,7 @@ Host 写入并 flush 请求成功后，将插件错误、timeout、EOF 和协议
 
 NDJSON v0 是 bootstrap transport，不是长期 ABI。目标协议要补齐 major/minor 协商、最大帧、显式 cancel、ready/accepted 边界、capability、心跳和敏感字段标记。迁移到 Protobuf/CBOR 等语言无关 IDL 与 Unix domain socket / Windows named pipe 时，应保持 request/result/error/deadline/capability 的领域语义，并用双栈契约测试完成滚动迁移。Python、Rust、Swift 和将来的其他 worker 不共享内存布局，也不暴露语言对象序列化。
 
-## 8. Deadline、取消、重试与效果不确定性
+## 8. 截止时间、取消、重试与效果不确定性
 
 所有 timeout 在进入 run 时转换为单调时钟上的绝对 deadline，并按父子关系只缩短不延长：
 
@@ -182,7 +182,7 @@ Run 和 step 的终态统一使用：
 
 错误对象至少包含稳定 `code`、`category`、`phase`、`message`、`retryable`、`effect`、step/workflow location、attempt、脱敏 details、cause 与 suppressed errors。分支匹配错误码和类别，不匹配自由文本。日志、CLI 和协议共同复用该模型，保证机器可判定。
 
-## 10. Secrets、Policy 与审计
+## 10. 密钥、策略与审计
 
 - Descriptor、plan、event 和 IPC 中只出现 `secret_ref`；Host 在最后使用点向系统凭据库解引用，默认不通过命令行、环境变量、日志或 planner context 传递明文。
 - Policy 绑定可信应用身份（签名、bundle ID、executable）、用户/session、capability、数据范围、effect class 与过期时间，不能只相信窗口标题。

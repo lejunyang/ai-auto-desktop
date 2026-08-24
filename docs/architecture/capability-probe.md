@@ -1,4 +1,4 @@
-# 只读平台 Capability Probe
+# 只读平台能力探针
 
 > 状态：v1alpha1，基线日期 2026-08-24。Probe 只观察当前进程可见的前置条件，不是 UI 自动化成功证明，也不是 Capability Manifest。
 
@@ -8,7 +8,7 @@
 
 探针不执行以下操作：请求系统权限、弹出 TCC 或 portal 对话框、创建 Wayland RemoteDesktop 会话、打开 `/dev/uinput`、注入键鼠、截图、枚举窗口、读取 accessibility tree 或执行 UI action。Linux 辅助命令只从固定系统目录解析，使用最小化环境启动；不会信任调用者的 `PATH`，也不会把无关环境变量传给子进程。
 
-## JSON 合约
+## JSON 数据合约
 
 顶层 `api_version` 固定为 `ai-auto-desktop.dev/probe/v1alpha1`，`kind` 为 `CapabilityProbe`，`status: completed` 只表示探测流程完成。`platform` 记录规范平台名和版本，`session` 仅依据当前进程可见的环境信号分类，原始 DISPLAY、D-Bus 地址及用户路径不会输出。
 
@@ -45,18 +45,18 @@
 
 ## 平台探测边界
 
-### Windows
+### Windows 系统
 
 `windows.uia` 加载系统 UIAutomationCore，初始化当前线程 COM，并创建基础 `IUIAutomation` 对象后立即释放。它不取得 root element、不枚举窗口或节点、不调用 pattern/action。`available` 仅证明 UIA runtime 的基础 COM 激活在当前进程成功；目标进程提权、UIPI、Session 0、secure desktop、控件语义质量和真实动作均未验证。
 
-### macOS
+### macOS 系统
 
 - `macos.accessibility` 只调用 `AXIsProcessTrusted()`，不调用带 prompt option 的 API。
 - `macos.screen_capture` 只调用 `CGPreflightScreenCaptureAccess()`，不调用 `CGRequestScreenCaptureAccess()`，也不采集画面。
 
 授权结果绑定当前可执行文件的 TCC 身份。开发路径、签名或 bundle identity 变化后必须重新探测。Accessibility 与 Screen Capture 独立报告；AX 可用不意味着截图可用，反之亦然。旧系统缺少安全 preflight API 时返回 `unknown`。
 
-### Linux
+### Linux 系统
 
 - `linux.at_spi`：通过 `gdbus` 调用只读 `org.a11y.Bus.GetAddress`；同时记录 AT-SPI 地址、session bus、libatspi 与查询工具是否可见，但不读取 accessibility tree。
 - `linux.x11`：记录 DISPLAY、libX11、`xdpyinfo`，并在可用时做有界元数据查询；不执行 XTEST 或输入注入。

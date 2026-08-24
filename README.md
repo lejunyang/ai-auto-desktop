@@ -1,105 +1,99 @@
-# ai-auto-desktop
+# ai-auto-desktop 桌面自动化运行时
 
-ai-auto-desktop is a Python 3.11 workflow runtime for process-isolated desktop automation plugins. Version 0.1 has a deliberately small trusted core: strict descriptors, a no-calls expression evaluator, bounded control flow, structured failures, and NDJSON plugins.
+ai-auto-desktop 是一个面向进程隔离桌面自动化插件的 Python 3.11 工作流运行时。0.1 版刻意保持较小的可信核心：严格的描述文件、禁止函数调用的表达式求值器、有界控制流、结构化失败以及 NDJSON 进程插件。
 
-## Quick start
+## 快速开始
 
-    python -m ai_auto_desktop validate examples/workflows/ocr-error-response.yaml
-    python -m ai_auto_desktop run examples/workflows/ocr-error-response.yaml --plugin fixture=plugins/fixture/run.sh
-    python -m ai_auto_desktop probe
+```bash
+python -m ai_auto_desktop validate examples/workflows/ocr-error-response.yaml
+python -m ai_auto_desktop run examples/workflows/ocr-error-response.yaml --plugin fixture=plugins/fixture/run.sh
+python -m ai_auto_desktop probe
+```
 
-Both commands write exactly one JSON object to stdout. Invalid descriptors and failed runs have a non-zero exit status. Package installation also exposes the ai-auto-desktop command.
+这些命令都只向标准输出写入一个 JSON 对象。描述文件无效或运行失败时，进程以非零状态退出。安装 Python 包后也可直接使用 `ai-auto-desktop` 命令。
 
-Inputs and plugins use repeatable assignments:
+输入和插件都通过可重复的赋值参数传入：
 
-    python -m ai_auto_desktop run workflow.yaml --input account_id='"123456"' --input retries=2 --plugin fixture='python plugins/fixture/fixture_plugin.py'
+```bash
+python -m ai_auto_desktop run workflow.yaml \
+  --input account_id='"123456"' \
+  --input retries=2 \
+  --plugin fixture='python plugins/fixture/fixture_plugin.py'
+```
 
-Each input value is JSON. Plugin commands are parsed as argv and are never sent through a shell.
-The included example deliberately returns `OCR.LOW_CONFIDENCE`; its non-zero
-exit demonstrates structured error propagation. If a workflow declares
-`requires.permissions`, pass each permission explicitly with `--permission NAME`;
-the host never treats a descriptor request as a grant.
+每个输入值都必须是 JSON。插件命令会被解析为参数数组，不会交给 shell 执行。仓库内示例会故意返回 `OCR.LOW_CONFIDENCE`，其非零退出码用于演示结构化错误传播。若工作流声明了 `requires.permissions`，必须为每项权限显式传入 `--permission NAME`；宿主绝不会把描述文件中的权限申请视为已经授权。
 
-`probe` performs conservative, read-only prerequisite checks for UIA on
-Windows, Accessibility and Screen Capture authorization on macOS, and the
-separate AT-SPI/X11/Wayland/portal/libei/uinput surfaces on Linux. An
-unavailable check is reported in JSON and does not make the probe command
-fail. The report is diagnostic evidence, not a claim that UI automation has
-succeeded.
+`probe` 会保守、只读地检查桌面自动化前置条件：Windows 上检查 UIA，macOS 上检查辅助功能与屏幕录制授权，Linux 上分别检查 AT-SPI、X11、Wayland、RemoteDesktop portal、libei 和 uinput。某项能力不可用只会体现在 JSON 报告中，不会让探针命令失败。探针结果是诊断证据，不代表 UI 自动化已经成功。
 
-## Optional Tesseract OCR
+## 可选 Tesseract OCR
 
-The process plugin in `plugins/ocr_tesseract` implements
-`vision.ocr.recognize@1`. It only accepts an explicit absolute image/artifact
-path and never captures the screen. It can crop a declared pixel region, run
-Tesseract with selected languages, enforce a minimum confidence, and return
-line bounds plus named literal-text matches. Register it explicitly; the
-workflow must also declare `filesystem.read` under `requires.permissions`:
+`plugins/ocr_tesseract` 中的进程插件实现了 `vision.ocr.recognize@1`。它只接受显式传入的绝对图片或 artifact 路径，绝不会自行截图。插件支持裁剪声明的像素区域、指定 Tesseract 语言、设置最低置信度，并返回文本行边界和命名的字面文本匹配。工作流还必须在 `requires.permissions` 中声明 `filesystem.read`，注册示例：
 
-    python -m ai_auto_desktop run workflow.yaml \
-      --permission filesystem.read \
-      --plugin vision.ocr=plugins/ocr_tesseract/run.sh
+```bash
+python -m ai_auto_desktop run workflow.yaml \
+  --permission filesystem.read \
+  --plugin vision.ocr=plugins/ocr_tesseract/run.sh
+```
 
-Tesseract is an optional system dependency. Pillow is only needed for region
-cropping. Missing dependencies and low confidence are structured `OCR.*`
-errors; OCR output remains untrusted data and only a later explicit `if` or
-`switch` can choose a response action.
+Tesseract 是可选的系统依赖；只有区域裁剪需要 Pillow。依赖缺失、低置信度等情况都会返回结构化 `OCR.*` 错误。OCR 输出始终是不可信数据，只有后续显式的 `if` 或 `switch` 才能据此选择响应动作。
 
-## Windows UIA driver
+## Windows 用户界面自动化驱动（UIA）
 
-`plugins/windows_uia` is the first real native desktop driver. On Windows it
-uses the optional `comtypes` binding to enumerate windows and normalize a
-bounded UIA Control View. It exposes exact locator lookup plus native
-`SetFocus`, `InvokePattern.Invoke`, and `ValuePattern.SetValue`; every write
-re-snapshots and resolves the target before dispatch. Install with
-`pip install .[windows-uia]` and register `plugins\windows_uia\run.cmd`.
-Workflows declare `desktop.observe`, and write actions additionally declare
-`desktop.input`; both still require explicit host grants. The driver does not
-capture screenshots, run OCR, or inject keyboard/pointer input.
+`plugins/windows_uia` 是首个真实原生桌面驱动。在 Windows 上，它使用可选的 `comtypes` 绑定枚举窗口并归一化有界的 UIA Control View。驱动支持精确定位，以及原生 `SetFocus`、`InvokePattern.Invoke` 和 `ValuePattern.SetValue`；每次写操作都会在派发前重新抓取快照、解析目标并核对原生元素身份。安装并注册：
 
-## Descriptor and runtime
+```powershell
+pip install .[windows-uia]
+python -m ai_auto_desktop run workflow.yaml `
+  --permission desktop.observe `
+  --permission desktop.input `
+  --plugin "desktop.windows_uia=plugins\windows_uia\run.cmd"
+```
 
-Only the canonical identity is accepted:
+读取类工作流声明 `desktop.observe`，写操作还要声明 `desktop.input`，两者都需要宿主显式授权。该驱动不截图、不执行 OCR，也不注入键盘或鼠标输入。
 
-    apiVersion: ai-auto-desktop.dev/v1alpha1
-    kind: Workflow
-    metadata:
-      name: hello
-    budgets:
-      max_duration: 30s
-      max_executed_steps: 20
-    steps:
-      - id: done
-        type: return
-        value: hello
+## 描述文件与运行时
 
-Core objects reject unknown fields. Step IDs are globally unique, including branches, error handlers, and cleanup. Supported step types are action, set, if, switch, foreach, while, block, script, fail, and return.
+只接受以下规范标识：
 
-Whole expression templates keep their value type; expressions embedded in text are converted to text. Function and method calls are forbidden. Read-only and idempotent actions may retry structured retryable failures. A non-idempotent or contextual action that times out after its request was flushed returns ACTION.UNKNOWN_EFFECT and is never replayed.
+```yaml
+apiVersion: ai-auto-desktop.dev/v1alpha1
+kind: Workflow
+metadata:
+  name: hello
+budgets:
+  max_duration: 30s
+  max_executed_steps: 20
+steps:
+  - id: done
+    type: return
+    value: hello
+```
 
-## Python API
+核心对象拒绝未知字段。步骤 ID 在分支、错误处理器和清理步骤中也必须全局唯一。当前支持 `action`、`set`、`if`、`switch`、`foreach`、`while`、`block`、`script`、`fail` 和 `return`。
 
-    from ai_auto_desktop import WorkflowRunner, load_descriptor
+完整表达式模板会保留结果类型，嵌入普通文本的表达式则转换成字符串。表达式禁止所有函数和方法调用。只读与幂等动作可以重试明确标记为可重试的结构化错误。非幂等或上下文相关动作在请求已经写出后超时，会返回 `ACTION.UNKNOWN_EFFECT`，且绝不会自动重放。
 
-    workflow = load_descriptor("workflow.yaml")
-    result = WorkflowRunner(
-        workflow,
-        plugins={"fixture": ["plugins/fixture/run.sh"]},
-    ).run({"name": "Ada"})
-    print(result.to_dict())
+## Python 编程接口
 
-RunResult.status is succeeded, failed, timed_out, cancelled, or unknown_effect. Errors carry stable code, category, retryable, effect, details, cause, suppressed, and location fields.
+```python
+from ai_auto_desktop import WorkflowRunner, load_descriptor
 
-## Process plugin protocol
+workflow = load_descriptor("workflow.yaml")
+result = WorkflowRunner(
+    workflow,
+    plugins={"fixture": ["plugins/fixture/run.sh"]},
+).run({"name": "Ada"})
+print(result.to_dict())
+```
 
-Plugins exchange one JSON object per line over stdin and stdout. Startup supports either an unsolicited manifest or a manifest request with a request ID. Invocations carry type, id, action, args, and an absolute deadline_ms. Responses contain the matching ID and either result or a structured error. The host bounds output, drains stderr, and terminates the process group after timeout or protocol failure. A runnable fixture is in plugins/fixture.
+`RunResult.status` 可能是 `succeeded`、`failed`、`timed_out`、`cancelled` 或 `unknown_effect`。错误对象包含稳定的 `code`、`category`、`retryable`、`effect`、`details`、`cause`、`suppressed` 和位置信息。
 
-## Scripts and security
+## 进程插件协议
 
-Script steps are disabled unless `--allow-scripts` or `allow_scripts=True` is explicitly supplied. Version 0.1 runs them only on Linux when bubblewrap and `prlimit` are available: the worker receives JSON on stdin, has no host home or `/etc`, has a private network/PID namespace, and is bounded by wall-clock, CPU, address-space, file-size and output limits. Other platforms fail closed with `SCRIPT.SANDBOX_UNAVAILABLE` until equivalent OS isolation is implemented.
+插件通过标准输入和标准输出交换“一行一个 JSON 对象”的 NDJSON。启动时既支持插件主动发送 Manifest，也支持带请求 ID 的 Manifest 请求。调用请求包含 `type`、`id`、`action`、`args` 和绝对时间戳 `deadline_ms`；响应必须带匹配的 ID，并包含 `result` 或结构化 `error`。宿主会限制输出、持续读取标准错误，并在超时或协议错误后终止插件进程组。可运行的确定性测试插件位于 `plugins/fixture`。
 
-Current scope includes a first Windows UIA vertical slice but excludes qualified
-macOS/Linux native drivers, persistence and resume, secret storage, concurrent
-desktop writes, confirmation tokens, and taint enforcement. The v0 host does
-enforce declared action risk categories/levels and validates process manifests
-plus action input/output contracts.
+## 脚本与安全
+
+只有显式传入 `--allow-scripts` 或 `allow_scripts=True` 才能执行 `script` 步骤。0.1 版仅在 Linux 且 bubblewrap 与 `prlimit` 可用时执行脚本：工作进程通过标准输入接收 JSON，看不到宿主 home 与 `/etc`，使用独立网络/PID 命名空间，并受到墙钟时间、CPU、地址空间、文件大小和输出上限约束。其他平台在实现等价操作系统隔离前，一律返回 `SCRIPT.SANDBOX_UNAVAILABLE`。
+
+当前范围包含首个 Windows UIA 纵向切片，但尚未完成 Windows 真机应用矩阵的产品级资格验证，也没有 macOS/Linux 原生驱动、持久化与恢复、secret 存储、桌面并发写入、确认 token 或完整污点执行。v0 宿主已经执行声明式风险/权限检查，并校验进程 Manifest 以及 action 输入输出契约。

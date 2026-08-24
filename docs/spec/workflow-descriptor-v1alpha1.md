@@ -1,4 +1,4 @@
-# Workflow Descriptor v1alpha1
+# 工作流描述文件 v1alpha1
 
 状态：Alpha，2026-08-24。本文中的“必须”“不得”“应当”具有规范含义。规范 JSON Schema 位于 `schemas/workflow/v1alpha1/workflow.schema.json`，Capability Manifest Schema 位于 `schemas/capabilities/v1alpha1/capability-manifest.schema.json`。
 
@@ -42,7 +42,7 @@ Duration 是不含空格的正整数加 `ms`、`s`、`m` 或 `h`。所有 timeou
 
 表达式使用完整字符串 `${{ ... }}`。它是只读、确定性、无副作用 DSL，只能访问 `inputs`、`vars`、`steps`、当前控制流绑定和错误处理器绑定；不得访问文件、网络、环境变量、时钟、随机源或 secret。字符串插值不等于表达式，尤其不得把表达式拼进 script source。
 
-## 4. 通用 step 字段
+## 4. 通用步骤字段
 
 每个 step 都必须有作用域内唯一的 `id` 和 `type`，并可带：
 
@@ -56,7 +56,7 @@ Duration 是不含空格的正整数加 `ms`、`s`、`m` 或 `h`。所有 timeou
 
 step 路径由嵌套 `id` 构成；`foreach` 运行记录还必须带 index。全局 `max_executed_steps` 计算实际进入执行状态的 step attempt，不能通过嵌套控制流绕开。
 
-## 5. Step 类型
+## 5. 步骤类型
 
 ### 5.1 `action`
 
@@ -108,7 +108,7 @@ script 必须运行在独立进程/容器中；Python `eval/exec`、Node `vm`、
 - `fail.error` 至少含稳定 `code` 与人类 `message`，可含 `category`、`retryable`、`effect` 和脱敏 `details`。
 - `return.value` 可省略；它立即终止当前 workflow 并进入各层 `finally`。在 error handler 中应通过 `outcome.mode: return` 返回，而不是依赖嵌套 return 的歧义行为。
 
-## 6. Retry、错误处理与 finally
+## 6. 重试、错误处理与 finally
 
 `retry.max_attempts` 包含第一次执行。大于 1 时必须给出 `on.codes` 和/或 `on.categories`；backoff 可为 fixed 或 exponential，并可设置 jitter。自动重试必须同时满足：
 
@@ -163,7 +163,7 @@ script 必须运行在独立进程/容器中；Python `eval/exec`、Node `vm`、
 
 provider 可以增加自有大写命名空间。`details`、OCR 文本和截图必须经过 schema、大小限制和脱敏；不得包含 secret，默认不得记录完整截图或完整 OCR 文本。
 
-## 8. Capability Manifest
+## 8. 能力清单
 
 Manifest 使用相同 `apiVersion`，`kind: CapabilityManifest`，并包含：
 
@@ -174,7 +174,7 @@ Manifest 使用相同 `apiVersion`，`kind: CapabilityManifest`，并包含：
 
 每项 error contract 的 `effect` 为 `not_applied|applied|unknown`。Manifest 只声明能力，不授予权限；workflow 声明、manifest、provider 动态判断和 trusted host policy 必须全部允许。第三方 native provider 必须进程外运行，不能 import/dlopen 到 trusted host。
 
-## 9. v0.x Python runtime 支持矩阵
+## 9. v0.x Python 运行时支持矩阵
 
 本规范定义目标语义，不表示当前实现已覆盖全部能力。当前 Python-first v0.x 以 mock/fixture 的闭环集成为目标，Rust-ready 指稳定边界使用 JSON、版本化 action contract 和进程协议，不表示已经存在 Rust core。
 

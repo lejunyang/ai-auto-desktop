@@ -1,4 +1,4 @@
-# Python-first / Rust-ready 分阶段路线图
+# Python 优先、Rust 就绪的分阶段路线图
 
 > 基线日期：2026-08-24。路线图以当前 Python v0 纵向切片为起点，不把 fixture、mock OCR 或研究结论记作真实平台能力。里程碑按退出门槛推进，不按日期自动宣告完成。
 
@@ -24,7 +24,7 @@
 
 尚未实现或尚未证明：经过真实 Windows 环境资格验证的 UIA driver，以及真实 AX/AT-SPI driver；可靠的 Windows 后代进程树终止；完整 wire 协议版本协商；single-writer session manager；持久 journal；系统 secret store；签名插件；真实截图；taint tracking、确认 token 与完整 policy enforcement；安装器和权限引导。当前 OCR 已能处理显式图片，但尚未接入受控截图/frame provenance，因此不能视为桌面视觉闭环。M0 已具备 manifest/action contract 与基础 action risk policy 校验，其任务是继续把 v0 收敛成可验证基线，而不是扩大产品宣称。
 
-## 3. M0：冻结 Python Runtime v0 合约
+## 3. M0：冻结 Python 运行时 v0 合约
 
 ### 范围
 
@@ -73,7 +73,7 @@
 
 任意 Windows 应用、无人值守 secure desktop、OCR、视觉自动 fallback、同时控制多个物理桌面。
 
-## 5. M2：macOS / Linux Driver、OCR 与 Script 隔离
+## 5. M2：macOS / Linux 驱动、OCR 与脚本隔离
 
 ### 范围
 
