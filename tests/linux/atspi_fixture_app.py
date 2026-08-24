@@ -14,6 +14,9 @@ ENTRY_NAME = "Fixture text entry"
 BUTTON_NAME = "Invoke fixture button"
 STATUS_INITIAL = "Fixture status idle"
 STATUS_INVOKED = "Fixture status invoked"
+CHECK_NAME = "Toggle fixture check button"
+EXPANDER_NAME = "Expand fixture details"
+EXPANDER_CHILD = "Fixture expanded content"
 
 
 def _set_accessible(widget: Gtk.Widget, name: str, accessible_id: str) -> None:
@@ -49,6 +52,19 @@ def main() -> int:
     status = Gtk.Label(label=STATUS_INITIAL)
     _set_accessible(status, STATUS_INITIAL, "fixture-status")
     layout.pack_start(status, False, False, 0)
+
+    check = Gtk.CheckButton(label="Checked state")
+    check.set_active(False)
+    _set_accessible(check, CHECK_NAME, "fixture-check")
+    layout.pack_start(check, False, False, 0)
+
+    expander = Gtk.Expander(label="Details")
+    expander.set_expanded(False)
+    _set_accessible(expander, EXPANDER_NAME, "fixture-expander")
+    expanded_content = Gtk.Label(label=EXPANDER_CHILD)
+    _set_accessible(expanded_content, EXPANDER_CHILD, "fixture-expanded-content")
+    expander.add(expanded_content)
+    layout.pack_start(expander, False, False, 0)
 
     def on_clicked(_button: Gtk.Button) -> None:
         status.set_text(STATUS_INVOKED)

@@ -40,6 +40,11 @@ def node(
     value: str | None = None,
     actions: tuple[str, ...] = (),
     protected: bool = False,
+    checked: bool | None = None,
+    expandable: bool | None = None,
+    expanded: bool | None = None,
+    selectable: bool | None = None,
+    selected: bool | None = None,
     attributes: dict[str, str] | None = None,
 ) -> object:
     return atspi.BackendNode(
@@ -59,6 +64,11 @@ def node(
             "editable": "set_text" in actions,
             "sensitive": True,
             "protected": protected,
+            "checked": checked,
+            "expandable": expandable,
+            "expanded": expanded,
+            "selectable": selectable,
+            "selected": selected,
         },
         bounds={"x": 10, "y": 20, "width": 120, "height": 30},
         actions=actions,
@@ -95,6 +105,25 @@ def default_tree() -> list[object]:
             value="Draft",
             actions=("focus", "set_text"),
             attributes={"class": "QLineEdit", "id": "title"},
+        ),
+        node(
+            "autosave",
+            1,
+            "check_box",
+            "Autosave",
+            actions=("toggle",),
+            checked=False,
+            attributes={"class": "GtkCheckButton", "id": "autosave"},
+        ),
+        node(
+            "details",
+            1,
+            "toggle_button",
+            "Details",
+            actions=("expand", "collapse"),
+            expandable=True,
+            expanded=False,
+            attributes={"class": "GtkExpander", "id": "details"},
         ),
     ]
 
@@ -164,6 +193,15 @@ class FakeBackend:
     def set_text(self, native: object, text: str, *, deadline: float) -> object:
         return self._action("set_text", native, text)
 
+    def toggle(self, native: object, *, deadline: float) -> object:
+        return self._action("toggle", native)
+
+    def expand(self, native: object, *, deadline: float) -> object:
+        return self._action("expand", native)
+
+    def collapse(self, native: object, *, deadline: float) -> object:
+        return self._action("collapse", native)
+
     def same_element(
         self, previous: object, current: object, *, deadline: float
     ) -> bool:
@@ -229,7 +267,7 @@ class LinuxAtspiDriverCoreTests(unittest.TestCase):
         self.assertFalse(snapshot["truncated"])
         self.assertEqual(
             [item["node_id"] for item in snapshot["nodes"]],
-            ["n0", "n1", "n2", "n3"],
+            ["n0", "n1", "n2", "n3", "n4", "n5"],
         )
         save = snapshot["nodes"][2]
         self.assertEqual(save["parent_id"], "n1")
@@ -237,6 +275,11 @@ class LinuxAtspiDriverCoreTests(unittest.TestCase):
         self.assertEqual(save["actions"], ["focus", "invoke"])
         self.assertEqual(save["attributes"]["class"], "QPushButton")
         self.assertEqual(save["provenance"]["backend"], "fake_linux_atspi")
+        self.assertFalse(snapshot["nodes"][4]["states"]["checked"])
+        self.assertEqual(snapshot["nodes"][4]["actions"], ["toggle"])
+        self.assertTrue(snapshot["nodes"][5]["states"]["expandable"])
+        self.assertFalse(snapshot["nodes"][5]["states"]["expanded"])
+        self.assertEqual(snapshot["nodes"][5]["actions"], ["collapse", "expand"])
 
     def test_locator_is_exact_supports_atspi_fields_and_rejects_ambiguity(self) -> None:
         duplicate = default_tree()
@@ -263,7 +306,7 @@ class LinuxAtspiDriverCoreTests(unittest.TestCase):
         self.assertEqual(ambiguous.exception.data["candidate_count"], 2)
 
         found = self.find(snapshot, {"attributes": {"id": "save2"}})
-        self.assertEqual(found["target"]["node_id"], "n4")
+        self.assertEqual(found["target"]["node_id"], "n6")
         found = self.find(snapshot, {"description": "Save document"})
         self.assertEqual(found["target"]["node_id"], "n2")
         found = self.find(
@@ -271,6 +314,16 @@ class LinuxAtspiDriverCoreTests(unittest.TestCase):
             {"object_path": "/org/a11y/atspi/accessible/save"},
         )
         self.assertEqual(found["target"]["node_id"], "n2")
+        found = self.find(
+            snapshot,
+            {"states": {"checked": False}, "actions": ["toggle"]},
+        )
+        self.assertEqual(found["target"]["node_id"], "n4")
+        found = self.find(
+            snapshot,
+            {"states": {"expandable": True, "expanded": False}},
+        )
+        self.assertEqual(found["target"]["node_id"], "n5")
 
     def test_invalid_locator_shapes_fail_closed(self) -> None:
         snapshot = self.snapshot()
@@ -297,10 +350,29 @@ class LinuxAtspiDriverCoreTests(unittest.TestCase):
             ("focus", {"object_path": "/org/a11y/atspi/accessible/save"}, {}),
             ("invoke", {"attributes": {"id": "save"}}, {}),
             ("set_text", {"attributes": {"id": "title"}}, {"text": "Final"}),
+            ("toggle", {"attributes": {"id": "autosave"}}, {}),
+            ("expand", {"attributes": {"id": "details"}}, {}),
+            (
+                "collapse",
+                {"attributes": {"id": "details"}},
+                {},
+            ),
         )
         for action, locator, extra in cases:
             with self.subTest(action=action):
-                backend = FakeBackend()
+                tree = default_tree()
+                if action == "collapse":
+                    tree[5] = node(
+                        "details",
+                        1,
+                        "toggle_button",
+                        "Details",
+                        actions=("expand", "collapse"),
+                        expandable=True,
+                        expanded=True,
+                        attributes={"class": "GtkExpander", "id": "details"},
+                    )
+                backend = FakeBackend([tree])
                 driver = atspi.LinuxAtspiDriver(backend)
                 snapshot = driver.execute(
                     "snapshot",
@@ -382,6 +454,105 @@ class LinuxAtspiDriverCoreTests(unittest.TestCase):
         with self.assertRaises(atspi.DriverError) as stale:
             self.find(old, {"attributes": {"id": "save"}})
         self.assertEqual(stale.exception.code, "DRIVER.STALE_SNAPSHOT")
+
+    def test_expand_and_collapse_no_op_only_after_fresh_state_observation(self) -> None:
+        for action, expanded in (("expand", True), ("collapse", False)):
+            with self.subTest(action=action):
+                initial = default_tree()
+                fresh = default_tree()
+                fresh[5] = node(
+                    "details",
+                    1,
+                    "toggle_button",
+                    "Details",
+                    actions=("expand", "collapse"),
+                    expandable=True,
+                    expanded=expanded,
+                    attributes={"class": "GtkExpander", "id": "details"},
+                )
+                backend = FakeBackend([initial, fresh])
+                driver = atspi.LinuxAtspiDriver(backend)
+                captured = driver.execute(
+                    "snapshot",
+                    {"application": {"name": "Editor"}},
+                    deadline=deadline(),
+                )
+                located = driver.execute(
+                    "find",
+                    {
+                        "snapshot_id": captured["snapshot_id"],
+                        "revision": captured["revision"],
+                        "locator": {"attributes": {"id": "details"}},
+                    },
+                    deadline=deadline(),
+                )
+                result = driver.execute(
+                    action,
+                    {
+                        "target": located["target"],
+                        "locator": {"attributes": {"id": "details"}},
+                    },
+                    deadline=deadline(),
+                )
+                self.assertTrue(result["backend_result"]["no_op"])
+                self.assertFalse(result["backend_result"]["dispatched"])
+                self.assertEqual(
+                    result["backend_result"]["native_action_name"], "activate"
+                )
+                self.assertFalse(any(call[0] == action for call in backend.calls))
+                # A no-op never enters the dispatch boundary: the fresh snapshot
+                # remains current and can still be used for exact resolution.
+                still_current = driver.execute(
+                    "find",
+                    {
+                        "snapshot_id": result["resolved"]["snapshot_id"],
+                        "revision": result["resolved"]["revision"],
+                        "locator": {"attributes": {"id": "details"}},
+                    },
+                    deadline=deadline(),
+                )
+                self.assertEqual(
+                    still_current["target"]["node_id"],
+                    result["resolved"]["node_id"],
+                )
+
+    def test_toggle_remains_non_idempotent_when_checked(self) -> None:
+        tree = default_tree()
+        tree[4] = node(
+            "autosave",
+            1,
+            "check_box",
+            "Autosave",
+            actions=("toggle",),
+            checked=True,
+            attributes={"class": "GtkCheckButton", "id": "autosave"},
+        )
+        backend = FakeBackend([tree])
+        driver = atspi.LinuxAtspiDriver(backend)
+        captured = driver.execute(
+            "snapshot", {"application": {"name": "Editor"}}, deadline=deadline()
+        )
+        located = driver.execute(
+            "find",
+            {
+                "snapshot_id": captured["snapshot_id"],
+                "revision": captured["revision"],
+                "locator": {"attributes": {"id": "autosave"}},
+            },
+            deadline=deadline(),
+        )
+        driver.execute(
+            "toggle",
+            {
+                "target": located["target"],
+                "locator": {"attributes": {"id": "autosave"}},
+            },
+            deadline=deadline(),
+        )
+        self.assertEqual(
+            [call for call in backend.calls if call[0] == "toggle"],
+            [("toggle", "autosave", None)],
+        )
 
     def test_identity_check_failure_is_normalized_to_stale_without_dispatch(self) -> None:
         backend = IdentityFailureBackend()
@@ -528,7 +699,15 @@ class LinuxAtspiDriverCoreTests(unittest.TestCase):
                 return "never-expose"
 
         class Accessible:
-            app = type("Application", (), {"bus_name": ":1.9"})()
+            app = type(
+                "Application",
+                (),
+                {
+                    "bus_name": ":1.9",
+                    "get_toolkit_name": lambda self: "Qt",
+                    "get_toolkit_version": lambda self: "5.15.8",
+                },
+            )()
             path = "/org/a11y/atspi/accessible/password"
 
             def get_state_set(self) -> object:
@@ -665,6 +844,239 @@ class LinuxAtspiDriverCoreTests(unittest.TestCase):
             sum(1 for call in calls if call[0] == "set_timeout"), 6
         )
 
+    def test_pygobject_named_actions_match_only_exact_gtk3_canonical_names(self) -> None:
+        calls: list[tuple[object, ...]] = []
+
+        class Action:
+            names = ("press", "click", "activate")
+
+            def get_n_actions(self) -> int:
+                return len(self.names)
+
+            def get_action_name(self, index: int) -> str:
+                return self.names[index]
+
+            def get_localized_name(self, index: int) -> str:
+                return "click" if index == 0 else self.names[index].title()
+
+            def get_action_description(self, index: int) -> str:
+                return f"description {self.names[index]}"
+
+            def get_key_binding(self, index: int) -> str:
+                return ""
+
+            def do_action(self, index: int) -> bool:
+                calls.append(("do_action", index))
+                return True
+
+        class Accessible:
+            def get_action_iface(self) -> object:
+                return Action()
+
+        backend = object.__new__(atspi.PyGObjectAtspiBackend)
+        backend.Atspi = type(
+            "Atspi",
+            (),
+            {"set_timeout": staticmethod(lambda *_: None)},
+        )
+        toggle = backend.toggle(Accessible(), deadline=deadline())
+        expanded = backend.expand(Accessible(), deadline=deadline())
+        collapsed = backend.collapse(Accessible(), deadline=deadline())
+        self.assertEqual(toggle["native_action_name"], "click")
+        self.assertEqual(expanded["native_action_name"], "activate")
+        self.assertEqual(collapsed["native_action_name"], "activate")
+        self.assertEqual(calls, [("do_action", 1), ("do_action", 2), ("do_action", 2)])
+
+        Action.names = ("Click", " click ", "Activate")
+        with self.assertRaises(atspi.DriverError) as unsupported:
+            backend.toggle(Accessible(), deadline=deadline())
+        self.assertEqual(unsupported.exception.code, "DRIVER.ACTION_UNSUPPORTED")
+        self.assertEqual(unsupported.exception.data["native_action_name"], "click")
+        Action.names = ("click", "click")
+        with self.assertRaises(atspi.DriverError) as duplicate:
+            backend.toggle(Accessible(), deadline=deadline())
+        self.assertEqual(duplicate.exception.code, "DRIVER.ACTION_UNSUPPORTED")
+
+    def test_pygobject_qt5_invoke_selects_only_exact_press(self) -> None:
+        calls: list[tuple[str, int]] = []
+
+        class Action:
+            names = ("Press", "SetFocus")
+
+            def get_n_actions(self) -> int:
+                return len(self.names)
+
+            def get_action_name(self, index: int) -> str:
+                return self.names[index]
+
+            def get_localized_name(self, index: int) -> str:
+                return self.names[index]
+
+            def get_action_description(self, index: int) -> str:
+                return ""
+
+            def get_key_binding(self, index: int) -> str:
+                return ""
+
+            def do_action(self, index: int) -> bool:
+                calls.append(("do_action", index))
+                return True
+
+        class Accessible:
+            app = type(
+                "Application",
+                (),
+                {
+                    "bus_name": ":1.9",
+                    "get_toolkit_name": lambda self: "Qt",
+                    "get_toolkit_version": lambda self: "5.15.8",
+                },
+            )()
+            path = "/org/a11y/atspi/accessible/button"
+
+            def get_action_iface(self) -> object:
+                return Action()
+
+            def get_role(self) -> object:
+                return type("Role", (), {"value_nick": "push-button"})()
+
+            def get_role_name(self) -> str:
+                return "push button"
+
+        backend = object.__new__(atspi.PyGObjectAtspiBackend)
+        backend.Atspi = type(
+            "Atspi", (), {"set_timeout": staticmethod(lambda *_: None)}
+        )
+        backend._applications = lambda **_: [
+            (object(), {
+                "bus_name": ":1.9",
+                "toolkit_name": "Qt",
+                "toolkit_version": "5.15.8",
+                "process_id": 42,
+            })
+        ]
+        result = backend.invoke(Accessible(), deadline=deadline())
+        self.assertEqual(result["native_action_name"], "Press")
+        self.assertEqual(calls, [("do_action", 0)])
+
+        Action.names = ("press", "SetFocus")
+        with self.assertRaises(atspi.DriverError) as wrong_case:
+            backend.invoke(Accessible(), deadline=deadline())
+        self.assertEqual(wrong_case.exception.code, "DRIVER.ACTION_UNSUPPORTED")
+
+    def test_pygobject_gtk3_state_actions_are_observed_without_guessing(self) -> None:
+        class StateType:
+            ENABLED = "enabled"
+            VISIBLE = "visible"
+            SHOWING = "showing"
+            FOCUSABLE = "focusable"
+            FOCUSED = "focused"
+            EDITABLE = "editable"
+            SENSITIVE = "sensitive"
+            PROTECTED = "protected"
+            CHECKED = "checked"
+            EXPANDABLE = "expandable"
+            EXPANDED = "expanded"
+            SELECTABLE = "selectable"
+            SELECTED = "selected"
+
+        class States:
+            values = {
+                "enabled",
+                "visible",
+                "showing",
+                "sensitive",
+                "checked",
+                "selectable",
+                "selected",
+            }
+
+            def contains(self, state: object) -> bool:
+                return state in self.values
+
+        class Action:
+            def get_n_actions(self) -> int:
+                return 1
+
+            def get_action_name(self, index: int) -> str:
+                return "click"
+
+            def get_localized_name(self, index: int) -> str:
+                return "Toggle"
+
+            def get_action_description(self, index: int) -> str:
+                return ""
+
+            def get_key_binding(self, index: int) -> str:
+                return ""
+
+        class Accessible:
+            app = type("Application", (), {"bus_name": ":1.9"})()
+            path = "/org/a11y/atspi/accessible/check"
+
+            def get_state_set(self) -> object:
+                return States()
+
+            def get_role(self) -> object:
+                return type("Role", (), {"value_nick": "check-box"})()
+
+            def get_role_name(self) -> str:
+                return "check box"
+
+            def get_action_iface(self) -> object:
+                return Action()
+
+            def get_editable_text_iface(self) -> None:
+                return None
+
+            def get_component_iface(self) -> None:
+                return None
+
+            def get_text_iface(self) -> None:
+                return None
+
+            def get_attributes(self) -> dict[str, str]:
+                return {}
+
+            def get_accessible_id(self) -> str:
+                return "fixture-check"
+
+            def get_name(self) -> str:
+                return "Check"
+
+            def get_description(self) -> str:
+                return ""
+
+        backend = object.__new__(atspi.PyGObjectAtspiBackend)
+        backend.Atspi = type(
+            "Atspi",
+            (),
+            {
+                "StateType": StateType,
+                "set_timeout": staticmethod(lambda *_: None),
+            },
+        )
+        native_node = backend._read_node(
+            Accessible(),
+            None,
+            {
+                "name": "Fixture",
+                "toolkit_name": "gtk",
+                "toolkit_version": "3.24.33",
+                "process_id": 9,
+            },
+            deadline=deadline(),
+        )
+        self.assertTrue(native_node.states["checked"])
+        self.assertFalse(native_node.states["expandable"])
+        self.assertTrue(native_node.states["selectable"])
+        self.assertTrue(native_node.states["selected"])
+        self.assertIn("toggle", native_node.actions)
+        self.assertEqual(native_node.provenance["native_action_name"], "click")
+        self.assertEqual(
+            native_node.provenance["native_action_names"], {"toggle": "click"}
+        )
+
     def test_unsupported_action_unknown_effect_and_deadline_are_structured(self) -> None:
         snapshot = self.snapshot()
         found = self.find(snapshot, {"attributes": {"id": "save"}})
@@ -710,6 +1122,34 @@ class LinuxAtspiDriverCoreTests(unittest.TestCase):
         self.assertEqual(failed.exception.data["effect"], "unknown")
         self.assertFalse(failed.exception.retryable)
 
+        backend = FakeBackend()
+        backend.fail = "toggle"
+        driver = atspi.LinuxAtspiDriver(backend)
+        snapshot = driver.execute(
+            "snapshot", {"application": {"name": "Editor"}}, deadline=deadline()
+        )
+        found = driver.execute(
+            "find",
+            {
+                "snapshot_id": snapshot["snapshot_id"],
+                "revision": snapshot["revision"],
+                "locator": {"attributes": {"id": "autosave"}},
+            },
+            deadline=deadline(),
+        )
+        with self.assertRaises(atspi.DriverError) as toggle_failed:
+            driver.execute(
+                "toggle",
+                {
+                    "target": found["target"],
+                    "locator": {"attributes": {"id": "autosave"}},
+                },
+                deadline=deadline(),
+            )
+        self.assertEqual(toggle_failed.exception.code, "DRIVER.UNKNOWN_EFFECT")
+        self.assertEqual(toggle_failed.exception.data["action"], "toggle")
+        self.assertFalse(toggle_failed.exception.retryable)
+
         with self.assertRaises(atspi.DriverError) as timed_out:
             self.driver.execute(
                 "list_applications", {}, deadline=time.monotonic() - 1
@@ -742,6 +1182,9 @@ class LinuxAtspiProcessTests(unittest.TestCase):
                 "focus",
                 "invoke",
                 "set_text",
+                "toggle",
+                "expand",
+                "collapse",
             },
         )
         for name in ("list_applications", "snapshot", "find"):
@@ -749,10 +1192,26 @@ class LinuxAtspiProcessTests(unittest.TestCase):
                 manifest["actions"][name]["permissions"],
                 ["desktop.observe"],
             )
-        for name in ("focus", "invoke", "set_text"):
+        for name in (
+            "focus",
+            "invoke",
+            "set_text",
+            "toggle",
+            "expand",
+            "collapse",
+        ):
             self.assertEqual(
                 manifest["actions"][name]["permissions"],
                 ["desktop.observe", "desktop.input"],
+            )
+        self.assertEqual(
+            manifest["actions"]["toggle"]["effect"]["default_class"],
+            "non_idempotent",
+        )
+        for name in ("expand", "collapse"):
+            self.assertEqual(
+                manifest["actions"][name]["effect"]["default_class"],
+                "idempotent",
             )
         for name, contract in manifest["actions"].items():
             self.assertEqual(contract["contract_major"], 1, name)
@@ -876,6 +1335,9 @@ class LinuxAtspiProcessTests(unittest.TestCase):
             ("focus", (native,)),
             ("invoke", (native,)),
             ("set_text", (native, "value")),
+            ("toggle", (native,)),
+            ("expand", (native,)),
+            ("collapse", (native,)),
         )
         for action, args in calls:
             with self.subTest(action=action), self.assertRaises(
@@ -885,6 +1347,24 @@ class LinuxAtspiProcessTests(unittest.TestCase):
             self.assertEqual(raised.exception.code, "DRIVER.ACTION_UNSUPPORTED")
             self.assertEqual(raised.exception.data["backend"], "gio_atspi")
             self.assertEqual(raised.exception.data["action"], action)
+
+    def test_gio_fallback_observes_new_state_bits_without_writes(self) -> None:
+        backend = object.__new__(atspi.GioAtspiBackend)
+        state_indexes = (4, 9, 10, 22, 23)
+        word = sum(1 << index for index in state_indexes)
+        backend._try_call = mock.Mock(return_value=([word, 0],))
+        states = backend._state_values(
+            atspi.GioAccessibleRef(
+                ":1.42", "/org/a11y/atspi/accessible/1"
+            ),
+            deadline=deadline(),
+        )
+        self.assertTrue(states["checked"])
+        self.assertTrue(states["expandable"])
+        self.assertTrue(states["expanded"])
+        self.assertTrue(states["selectable"])
+        self.assertTrue(states["selected"])
+        self.assertIsNone(states["protected"])
 
     def test_default_backend_requires_explicit_kde_x11_session(self) -> None:
         cases = (

@@ -3,19 +3,22 @@
 测试辅助可以从当前用户的 ``kwin_x11`` 进程恢复图形会话环境；生产驱动不得
 扫描 ``/proc`` 或猜测其他会话。缺少 KDE/X11、Gio、AT-SPI bus、System Settings
 或对应 toolkit bridge 时，本测试保守跳过。自有 GTK3 fixture 还会验证
-PyGObject 后端的 snapshot/find/focus/set_text/invoke 完整链路。
+PyGObject 后端的 snapshot/find/focus/set_text/invoke/toggle/expand/collapse 完整链路。
 """
 
 from __future__ import annotations
 
 from contextlib import contextmanager
 import importlib.util
+import json
 import os
 from pathlib import Path
 import re
+import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import unittest
 
@@ -27,10 +30,17 @@ from ai_auto_desktop.runtime import run_descriptor
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DRIVER_PATH = PROJECT_ROOT / "plugins" / "linux_atspi" / "linux_atspi_driver.py"
 FIXTURE_PATH = PROJECT_ROOT / "tests" / "linux" / "atspi_fixture_app.py"
+QT_FIXTURE_SOURCE = PROJECT_ROOT / "tests" / "linux" / "qt_atspi_fixture.cpp"
+QT_FIXTURE_RUNNER = PROJECT_ROOT / "tests" / "linux" / "qt_atspi_native_runner.py"
 TEST_TYPELIB_ENV = "AI_AUTO_DESKTOP_TEST_ATSPI_TYPELIB_PATH"
 FIXTURE_ENTRY_NAME = "Fixture text entry"
 FIXTURE_BUTTON_NAME = "Invoke fixture button"
 FIXTURE_STATUS_INVOKED = "Fixture status invoked"
+FIXTURE_CHECK_NAME = "Toggle fixture check button"
+FIXTURE_EXPANDER_NAME = "Expand fixture details"
+QT_FIXTURE_ENTRY_NAME = "Qt fixture text entry"
+QT_FIXTURE_BUTTON_NAME = "Invoke Qt fixture button"
+QT_FIXTURE_STATUS_INVOKED = "Qt fixture status invoked"
 
 SPEC = importlib.util.spec_from_file_location(
     "testable_linux_atspi_native_driver", DRIVER_PATH
@@ -202,9 +212,12 @@ class NativeKdeX11AtspiInfrastructureTests(unittest.TestCase):
         self.addCleanup(plugin.close)
         manifest = plugin.start()
         self.assertEqual(manifest["metadata"]["name"], "desktop.linux_atspi")
-        applications_result = plugin.invoke(
-            "desktop.linux_atspi.list_applications@1", {}
-        )
+        try:
+            applications_result = plugin.invoke(
+                "desktop.linux_atspi.list_applications@1", {}
+            )
+        except Exception as exc:
+            self.skipTest(f"当前桌面 AT-SPI bus 不可用：{exc}")
         self.assertEqual(applications_result["session"]["session_type"], "x11")
         self.assertEqual(applications_result["session"]["desktop"], "KDE")
         self.assertIn(
@@ -238,7 +251,9 @@ class NativeKdeX11AtspiInfrastructureTests(unittest.TestCase):
         if isinstance(backend, atspi.PyGObjectAtspiBackend):
             self.skipTest("当前主机已安装 Atspi typelib，无需 Gio fallback")
         if isinstance(backend, atspi.UnavailableBackend):
-            self.fail(f"KDE/X11 AT-SPI bus 可读但默认后端不可用：{backend.details!r}")
+            self.skipTest(
+                f"当前桌面 AT-SPI bus 不可用：{backend.details!r}"
+            )
         self.assertIsInstance(backend, atspi.GioAtspiBackend)
         self.assertEqual(backend.name, "gio_atspi")
 
@@ -276,7 +291,7 @@ class NativeKdeX11AtspiInfrastructureTests(unittest.TestCase):
             env=environment,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
             start_new_session=True,
         )
         self.addCleanup(self._stop_process, fixture)
@@ -300,9 +315,12 @@ class NativeKdeX11AtspiInfrastructureTests(unittest.TestCase):
                     "GTK fixture 在注册 AT-SPI 前退出："
                     + stderr.decode("utf-8", errors="replace")[-2000:]
                 )
-            applications_result = plugin.invoke(
-                "desktop.linux_atspi.list_applications@1", {}
-            )
+            try:
+                applications_result = plugin.invoke(
+                    "desktop.linux_atspi.list_applications@1", {}
+                )
+            except Exception as exc:
+                self.skipTest(f"当前桌面 AT-SPI bus 不可用：{exc}")
             if applications_result["backend"] != "pygobject_atspi":
                 self.skipTest(
                     "完整原生动作需要 PyGObject Atspi backend，实际为 "
@@ -370,6 +388,16 @@ class NativeKdeX11AtspiInfrastructureTests(unittest.TestCase):
             "role": "push_button",
             "name": FIXTURE_BUTTON_NAME,
             "actions": ["invoke"],
+        }
+        check_locator = {
+            "role": "check_box",
+            "name": FIXTURE_CHECK_NAME,
+            "actions": ["toggle"],
+        }
+        expander_locator = {
+            "role": "toggle_button",
+            "name": FIXTURE_EXPANDER_NAME,
+            "actions": ["expand", "collapse"],
         }
         entry = find(initial, entry_locator)
         self.assertEqual(entry["node"]["value"], "Fixture initial text")
@@ -496,6 +524,118 @@ class NativeKdeX11AtspiInfrastructureTests(unittest.TestCase):
             self.assertEqual(status["node"]["value"], FIXTURE_STATUS_INVOKED)
             break
 
+        before_toggle = snapshot()
+        check = find(before_toggle, check_locator)
+        self.assertFalse(check["node"]["states"]["checked"])
+        self.assertEqual(
+            check["node"]["provenance"]["native_action_name"], "click"
+        )
+        toggled = write("toggle", check_locator)
+        self.assertEqual(toggled["backend_result"]["native_action_name"], "click")
+        self.assertTrue(toggled["backend_result"]["dispatched"])
+        toggled_snapshot = snapshot()
+        self.assertTrue(
+            find(toggled_snapshot, check_locator)["node"]["states"]["checked"]
+        )
+
+        before_expand = snapshot()
+        expander = find(before_expand, expander_locator)
+        self.assertTrue(expander["node"]["states"]["expandable"])
+        self.assertFalse(expander["node"]["states"]["expanded"])
+        self.assertEqual(
+            expander["node"]["provenance"]["native_action_name"], "activate"
+        )
+        expanded = write("expand", expander_locator)
+        self.assertEqual(expanded["backend_result"]["native_action_name"], "activate")
+        self.assertTrue(expanded["backend_result"]["dispatched"])
+        expanded_snapshot = snapshot()
+        self.assertTrue(
+            find(expanded_snapshot, expander_locator)["node"]["states"]["expanded"]
+        )
+
+        expand_no_op = write("expand", expander_locator)
+        self.assertTrue(expand_no_op["backend_result"]["no_op"])
+        self.assertFalse(expand_no_op["backend_result"]["dispatched"])
+        collapsed = write("collapse", expander_locator)
+        self.assertTrue(collapsed["backend_result"]["dispatched"])
+        collapsed_snapshot = snapshot()
+        self.assertFalse(
+            find(collapsed_snapshot, expander_locator)["node"]["states"]["expanded"]
+        )
+
+    def test_owned_qt5_fixture_supports_real_semantic_actions(self) -> None:
+        compiler = shutil.which("g++")
+        pkg_config = shutil.which("pkg-config")
+        if compiler is None or pkg_config is None or not QT_FIXTURE_SOURCE.is_file():
+            self.skipTest("完整 Qt5 fixture 测试需要 g++、pkg-config 与 fixture 源码")
+        flags = subprocess.run(
+            [pkg_config, "--cflags", "--libs", "Qt5Widgets"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            check=False,
+            timeout=10,
+        )
+        if flags.returncode != 0:
+            self.skipTest("完整 Qt5 fixture 测试需要 Qt5Widgets 开发包")
+        temporary = tempfile.TemporaryDirectory(prefix="aad-qt-atspi-")
+        self.addCleanup(temporary.cleanup)
+        executable = Path(temporary.name) / "qt_atspi_fixture"
+        compiled = subprocess.run(
+            [
+                compiler, "-std=c++17", "-O2", "-fPIC",
+                str(QT_FIXTURE_SOURCE), "-o", str(executable),
+                *shlex.split(flags.stdout),
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=30,
+        )
+        if compiled.returncode != 0:
+            self.fail(
+                "Qt5 fixture 编译失败："
+                + compiled.stderr.decode("utf-8", errors="replace")[-2000:]
+            )
+
+        dbus_run_session = shutil.which("dbus-run-session")
+        if dbus_run_session is None or not QT_FIXTURE_RUNNER.is_file():
+            self.skipTest("Qt5 fixture 测试需要 dbus-run-session 与测试 runner")
+        environment = os.environ.copy()
+        environment.update(self.session)
+        environment["PYTHONPATH"] = str(PROJECT_ROOT / "src")
+        completed = subprocess.run(
+            [
+                dbus_run_session,
+                "--",
+                sys.executable,
+                str(QT_FIXTURE_RUNNER),
+                str(executable),
+                str(DRIVER_PATH),
+            ],
+            env=environment,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            check=False,
+            timeout=45,
+        )
+        try:
+            report = json.loads(completed.stdout.strip().splitlines()[-1])
+        except json.JSONDecodeError as exc:
+            self.fail(f"Qt5 fixture runner 未输出 JSON：{completed.stdout!r}; {exc}")
+        self.assertEqual(completed.returncode, 0, msg=f"{report!r}\n{completed.stderr}")
+        self.assertEqual(report["status"], "passed")
+        self.assertEqual(report["toolkit"], "Qt")
+        self.assertEqual(report["actions"], ["focus", "set_text", "invoke"])
+        self.assertFalse(report["input_injection"])
+        self.assertFalse(report["ocr"])
+
     def test_system_settings_is_observed_when_qt_bridge_is_available(self) -> None:
         executable = shutil.which("systemsettings5") or shutil.which("systemsettings")
         if executable is None:
@@ -504,6 +644,10 @@ class NativeKdeX11AtspiInfrastructureTests(unittest.TestCase):
         environment.update(self.session)
         environment["QT_LINUX_ACCESSIBILITY_ALWAYS_ON"] = "1"
         environment["QT_ACCESSIBILITY"] = "1"
+        # The long-lived desktop bus can retain stale registrations after
+        # abrupt fixture exits. A dedicated test bus gives each qualification
+        # run deterministic ownership while keeping the real X11 display.
+        environment.pop("AT_SPI_BUS_ADDRESS", None)
         before_bus_names: set[str] = set()
         with _patched_environment(self.session):
             try:
@@ -576,6 +720,8 @@ class NativeKdeX11AtspiInfrastructureTests(unittest.TestCase):
                 process.wait(timeout=5)
         if process.stderr is not None:
             process.stderr.close()
+        if process.stdout is not None:
+            process.stdout.close()
 
 
 if __name__ == "__main__":

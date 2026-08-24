@@ -56,9 +56,9 @@ python -m ai_auto_desktop run workflow.yaml `
 ## Linux KDE/X11 AT-SPI 驱动
 
 `plugins/linux_atspi` 提供 `list_applications`、`snapshot`、`find`、`focus`、
-`invoke` 和 `set_text`。当前 v0 仅在进程环境明确为 KDE + X11 时启用；优先使用
+`invoke`、`set_text`、`toggle`、`expand` 和 `collapse`。当前 v0 仅在进程环境明确为 KDE + X11 时启用；优先使用
 `Atspi 2.0` typelib，缺失时用 Gio/D-Bus fallback 提供只读枚举和快照。Gio fallback
-不会伪装写能力，三个写动作都会返回 `DRIVER.ACTION_UNSUPPORTED`。注册方式：
+不会伪装写能力，全部写动作都会返回 `DRIVER.ACTION_UNSUPPORTED`。注册方式：
 
 ```bash
 python -m ai_auto_desktop run workflow.yaml \
@@ -67,10 +67,10 @@ python -m ai_auto_desktop run workflow.yaml \
 ```
 
 本机 KDE Plasma 5.27/X11 已通过真实 AT-SPI registry、进程协议和有界 snapshot smoke；
-自有 GTK3 fixture 还验证了 focus 的原生接受结果，以及 set_text、invoke 的动作后
-重新观察。当前 Qt System
-Settings 没有注册到 registry，因此 Qt bridge 仍未通过资格验证；这不等于“任意 KDE
-应用已经支持”。驱动不注入键鼠、不截图、不执行 OCR。
+自有 GTK3 fixture 验证 focus、set_text、invoke、toggle、expand/collapse，自有 Qt 5
+Widgets fixture 也验证 snapshot/find/focus/set_text/invoke，且均在动作后重新观察。
+System Settings 等真实 KDE 应用矩阵仍未完成资格验证；这不等于“任意 KDE 应用已经
+支持”。驱动不注入键鼠、不截图、不执行 OCR。
 
 ## macOS 真机自测包
 
@@ -118,6 +118,22 @@ print(result.to_dict())
 
 `RunResult.status` 可能是 `succeeded`、`failed`、`timed_out`、`cancelled` 或 `unknown_effect`。错误对象包含稳定的 `code`、`category`、`retryable`、`effect`、`details`、`cause`、`suppressed` 和位置信息。
 
+需要跨进程查询和控制 run 时，可以使用 SQLite journal 与 `RunService`：
+
+```python
+from ai_auto_desktop import JournalStore, RunService
+
+with JournalStore("runs.sqlite3") as journal:
+    service = RunService(journal)
+    run = service.get("run-id")
+    service.request_pause(run.run_id)
+```
+
+`request_pause`、`request_resume` 和 `request_cancel` 只原子记录 operator 的期望；
+runner 在持有有效 owner lease 的安全点应用状态。暂停会原子释放 lease，恢复后必须重新
+claim。当前 API 尚未直接驱动 `WorkflowRunner` 做 checkpoint 恢复，不能把“控制状态已持久化”
+理解为“任意执行位置可恢复”。
+
 ## 进程插件协议
 
 插件通过标准输入和标准输出交换“一行一个 JSON 对象”的 NDJSON。启动时既支持插件主动发送 Manifest，也支持带请求 ID 的 Manifest 请求。调用请求包含 `type`、`id`、`action`、`args` 和绝对时间戳 `deadline_ms`；响应必须带匹配的 ID，并包含 `result` 或结构化 `error`。宿主会限制输出、持续读取标准错误，并在超时或协议错误后终止插件进程组。可运行的确定性测试插件位于 `plugins/fixture`。
@@ -126,7 +142,10 @@ print(result.to_dict())
 
 只有显式传入 `--allow-scripts` 或 `allow_scripts=True` 才能执行 `script` 步骤。0.1 版仅在 Linux 且 bubblewrap 与 `prlimit` 可用时执行脚本：工作进程通过标准输入接收 JSON，看不到宿主 home 与 `/etc`，使用独立网络/PID 命名空间，并受到墙钟时间、CPU、地址空间、文件大小和输出上限约束。其他平台在实现等价操作系统隔离前，一律返回 `SCRIPT.SANDBOX_UNAVAILABLE`。
 
-当前范围包含 Windows UIA 与 Linux KDE/X11 AT-SPI 纵向切片，但尚未完成 Windows 真机
-应用矩阵、Linux Qt 写动作或 macOS AX 的产品级资格验证；也没有持久化与恢复、secret 存储、
-桌面并发写入、确认 token 或完整污点执行。v0 宿主已经执行声明式风险/权限检查，校验进程
-Manifest 与 action 输入输出契约，并可通过 `postcondition.observe` 在动作后重新获取真实观察。
+当前范围包含 Windows UIA、macOS AX 与 Linux KDE/X11 AT-SPI 纵向切片，但尚未完成
+Windows/macOS 真机应用矩阵或任意 KDE 应用的产品级资格验证。运行时已有 SQLite run/event
+journal、owner lease fencing，以及查询、pause/resume/cancel 的持久控制 API；当前仍是安全点
+生效的合作式控制，尚未接入完整 checkpoint 恢复执行。DAG runtime 会并发独立的非桌面
+`read_only` action，其余写动作与控制流保持全局独占。系统 secret store、确认 token、完整
+污点传播和跨进程 single-desktop-writer 仍未实现。v0 宿主已经执行声明式风险/权限检查，
+校验 Manifest 与 action 输入输出契约，并可通过 `postcondition.observe` 获取动作后真实观察。

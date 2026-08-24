@@ -7,13 +7,14 @@
 ## 契约与支持边界
 
 该能力提供方名为 `desktop.linux_atspi`，提供以下 v1 动作：
-`list_applications`、`snapshot`、`find`、`focus`、`invoke` 和 `set_text`。
+`list_applications`、`snapshot`、`find`、`focus`、`invoke`、`set_text`、`toggle`、
+`expand` 和 `collapse`。
 工作流中的 `uses` 由能力名、动作键和契约主版本号组成，例如
 `desktop.linux_atspi.snapshot@1`。能力清单的 `runtime.platforms` 为 `linux`，
 进程入口为 `./run.sh`。
 
 `list_applications`、`snapshot` 和 `find` 只要求 `desktop.observe`；
-`focus`、`invoke` 和 `set_text` 同时要求 `desktop.observe` 与
+全部六种写动作同时要求 `desktop.observe` 与
 `desktop.input`。这里的 `desktop.input` 表示允许通过 AT-SPI 原生语义接口改变
 应用状态，不表示允许注入键盘或指针事件。
 
@@ -22,6 +23,8 @@
 - `Component.grab_focus` 用于 `focus`；
 - `Action.do_action` 用于 `invoke`；
 - `EditableText.set_text_contents` 用于 `set_text`。
+- GTK3 上，`Action.do_action` 的 exact canonical `click` 用于 `toggle`，exact
+  canonical `activate` 用于 `expand`/`collapse`。
 
 驱动不会调用 XTEST、`xdotool`、`uinput`、键鼠事件注入、截图或 OCR，也不会在
 语义动作不可用时自动退化到坐标点击。AT-SPI 未暴露节点或动作时，结果会明确失败。
@@ -32,9 +35,10 @@
 驱动启动时只选择一个后端。Linux 上优先加载可选的 PyGObject `Atspi 2.0`
 typelib；该 typelib 缺失或无法初始化时，再使用 PyGObject `Gio 2.0` 直接调用
 AT-SPI D-Bus wire 接口。Gio 后备通过当前进程的 session bus 调用
-`org.a11y.Bus.GetAddress`，只支持应用枚举和只读快照，三个写动作均返回
+`org.a11y.Bus.GetAddress`，只支持应用枚举和只读快照，全部写动作均返回
 `DRIVER.ACTION_UNSUPPORTED`。两种后端都不可用时，能力清单协商仍然成功，而真正的
-动作返回 `DRIVER.UNAVAILABLE`。任何失败都不会静默改用坐标输入。
+动作返回 `DRIVER.UNAVAILABLE`。任何失败都不会静默改用坐标输入；Gio 后备也不会
+以 no-op 形式伪装写动作成功。
 默认后端仅在当前进程环境明确给出 KDE 桌面、`XDG_SESSION_TYPE=x11` 和非空
 `DISPLAY` 时启用；环境缺失、Wayland 或其他桌面 profile 均失败关闭。
 
@@ -75,7 +79,16 @@ AT-SPI 身份线索。一个应用可以有多个顶层 frame、dialog 或 windo
 `description`、`value`、`attributes`、`states`、`bounds`、`actions` 和
 `provenance`。`bounds` 只是 AT-SPI `Component` 暴露的观察信息，不能用于本能力的
 输入注入。受保护文本不读取、不回显，`set_text` 对此类节点失败关闭。原生对象不会
-跨越 NDJSON 边界。
+跨越 NDJSON 边界。状态集合还包括 `checked`、`expandable`、`expanded`、
+`selectable` 和 `selected`；无法可靠读取时保留 `null`，不得由 role 或动作名猜测。
+
+`toggle`、`expand` 和 `collapse` 当前只对 PyGObject backend 中的 GTK3 应用公开。
+这是显式白名单而非名称猜测：check/toggle 控件必须同时有可观察的 `checked` 状态和
+`Action.get_action_name(index) == "click"`；expander 必须有 `expandable=true`、
+可观察的 `expanded` 状态和 exact `"activate"`。驱动不使用 localized name 或
+description，不 trim、不改大小写，也不接受别名；exact match 缺失或重复时失败关闭。
+snapshot provenance 与动作结果均记录 `native_action_name`。其他 toolkit 必须独立资格
+验证后才能增加映射。
 
 AT-SPI 对 Qt Widgets、QML、GTK、Electron 和自绘控件所暴露的语义完整度不同。
 树中缺少名称、状态、EditableText 或 Action 接口时，驱动保留未知值或不声明对应
@@ -109,6 +122,10 @@ value、AT-SPI 身份线索、toolkit、attributes、states 与 actions；所有
 驱动一旦进入原生写接口，就使当前公开快照失效。原生接口报错或截止时间在派发后
 耗尽时，驱动返回 `DRIVER.UNKNOWN_EFFECT`，不得自动重放。成功响应只证明 AT-SPI
 调用返回成功，不证明业务后置条件成立；调用方必须获取新快照验证结果。
+`toggle` 是非幂等动作，即使当前 `checked=true` 也会派发并反转状态。`expand` 和
+`collapse` 则在完成相同的重新抓树、精确定位、原生身份与语义指纹验证后检查 fresh
+`expanded`；若已达到目标态，返回 `dispatched=false, no_op=true`，否则才进入相同的
+派发与 `UNKNOWN_EFFECT` 边界。
 
 ## NDJSON、截止时间与资源限制
 
@@ -142,7 +159,7 @@ AT-SPI bus。完整语义后端还需要 `Atspi 2.0` typelib；缺少该 typelib
 不以 root 运行，也不连接其他用户的 D-Bus session。
 
 跨平台测试通过 fake backend 验证 manifest、会话报告、快照归一化、精确与多义
-定位、revision/stale、截断保护、三种语义写动作、deadline 和 NDJSON 帧限制。Linux
+定位、revision/stale、截断保护、六种语义写动作、deadline 和 NDJSON 帧限制。Linux
 真机 smoke 仅在依赖与桌面确实可用时枚举应用并抓取有界快照；无 GUI、无 Gio 或无
 AT-SPI bus 时保守跳过或确认 `DRIVER.UNAVAILABLE`，不会把测试环境缺失误报为驱动
 成功。测试辅助可以从当前用户的 `kwin_x11` 进程恢复遗漏的 KDE/X11 环境变量，但这条
@@ -150,9 +167,21 @@ AT-SPI bus 时保守跳过或确认 `DRIVER.UNAVAILABLE`，不会把测试环境
 Qt AT-SPI bridge 不可用并跳过，不把进程启动成功误作可访问性支持成功。
 仓库还提供自有 GTK3 fixture；当系统安装 `Atspi 2.0` typelib 时，它通过正式进程驱动
 真实验证 `snapshot/find`、`Component.grab_focus`、`EditableText.set_text_contents` 与
-`Action.do_action`；后两项还会重新抓取快照核对文本和状态。当前会话的窗口管理器
-没有通过 AT-SPI 回报 fixture 的焦点状态，所以 focus 仅验证原生调用被接受。测试临时 overlay 可通过
+`Action.do_action`；动作后还会重新抓取快照核对文本、checked 和 expanded 状态。当前
+会话的窗口管理器没有通过 AT-SPI 回报 fixture 的焦点状态，所以 focus 仅验证原生调用
+被接受。测试临时 overlay 可通过
 `AI_AUTO_DESKTOP_TEST_ATSPI_TYPELIB_PATH` 显式传入，不会修改系统安装。
+仓库同时提供自有 Qt 5 Widgets C++ fixture。测试会在本机按需编译它，并显式设置
+`QT_LINUX_ACCESSIBILITY_ALWAYS_ON=1`/`QT_ACCESSIBILITY=1` 后检查是否注册到 AT-SPI。
+本次 Debian 12、Plasma 5.27.5、Qt 5.15.8、X11 环境中，当前长期 AT-SPI registry
+一度无法接收新 Qt application；测试因此改为在同一真实 X11 display 上启动隔离的
+session/accessibility bus，现已真实通过 Qt Widgets 的 snapshot/find/focus/set_text/invoke
+及动作后重新观察。GTK3 的真实语义动作链路同样通过。测试未使用 OCR、XTEST、
+虚拟键盘鼠标或坐标点击。
+代码中为 Qt 5 Widgets 保留了保守的已观测映射：按钮只有在 exact canonical `Press`
+唯一存在时才公开 `invoke`；由于 Qt 5 bridge 不导出 `AccessibleId`，写前身份验证要求
+bus/object path、toolkit/version 与进程 ID 全部一致，并继续比较语义指纹。该映射只有在
+fixture 真正注册后才会执行，也不能替代真实 KDE 应用矩阵的资格验证。
 
 “KDE/X11 已资格验证”还需要在固定发行版、Plasma、Xorg 与 Qt 版本上，以 Qt Widgets、
 QML、Dolphin、System Settings、Konsole、对话框、多窗口、虚拟列表和多显示器/DPI

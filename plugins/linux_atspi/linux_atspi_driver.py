@@ -37,6 +37,14 @@ MAX_CANDIDATE_SUMMARIES = 10
 # D-Bus 在返回 ``a(so)`` 后才交给 Python 解包；该上限不能避免总线已传输的
 # 数据，但会在解包后立即拒绝异常 fan-out，避免继续复制或遍历无界列表。
 MAX_DBUS_CHILDREN_PER_CALL = MAX_NODES
+GTK3_NATIVE_ACTION_NAMES = {
+    "toggle": "click",
+    "expand": "activate",
+    "collapse": "activate",
+}
+QT5_NATIVE_ACTION_NAMES = {
+    "invoke": "Press",
+}
 
 ACTION_IDS = {
     name: f"{PLUGIN_NAME}.{name}@1"
@@ -47,10 +55,15 @@ ACTION_IDS = {
         "focus",
         "invoke",
         "set_text",
+        "toggle",
+        "expand",
+        "collapse",
     )
 }
 ACTION_NAMES = {full_name: short_name for short_name, full_name in ACTION_IDS.items()}
-WRITE_ACTIONS = frozenset({"focus", "invoke", "set_text"})
+WRITE_ACTIONS = frozenset(
+    {"focus", "invoke", "set_text", "toggle", "expand", "collapse"}
+)
 NODE_ACTIONS = WRITE_ACTIONS
 STATE_NAMES = (
     "enabled",
@@ -61,6 +74,11 @@ STATE_NAMES = (
     "editable",
     "sensitive",
     "protected",
+    "checked",
+    "expandable",
+    "expanded",
+    "selectable",
+    "selected",
 )
 APPLICATION_SELECTOR_FIELDS = frozenset(
     {"bus_name", "name", "process_id", "toolkit_name"}
@@ -322,6 +340,36 @@ ACTION_CONTRACTS: dict[str, dict[str, Any]] = {
         errors=COMMON_ERRORS + LOCATOR_ERRORS + ACTION_ERRORS,
         permissions=("desktop.observe", "desktop.input"),
     ),
+    "toggle": _contract(
+        "重新验证 GTK3 目标及 checked 状态后，精确调用名为 click 的 AT-SPI 动作。",
+        effect="non_idempotent",
+        risk_category="modify",
+        risk_level="high",
+        input_schema=COMMON_WRITE_INPUT,
+        output_schema=WRITE_OUTPUT_SCHEMA,
+        errors=COMMON_ERRORS + LOCATOR_ERRORS + ACTION_ERRORS,
+        permissions=("desktop.observe", "desktop.input"),
+    ),
+    "expand": _contract(
+        "重新验证 GTK3 目标后，在需要时精确调用名为 activate 的 AT-SPI 动作以展开。",
+        effect="idempotent",
+        risk_category="modify",
+        risk_level="medium",
+        input_schema=COMMON_WRITE_INPUT,
+        output_schema=WRITE_OUTPUT_SCHEMA,
+        errors=COMMON_ERRORS + LOCATOR_ERRORS + ACTION_ERRORS,
+        permissions=("desktop.observe", "desktop.input"),
+    ),
+    "collapse": _contract(
+        "重新验证 GTK3 目标后，在需要时精确调用名为 activate 的 AT-SPI 动作以折叠。",
+        effect="idempotent",
+        risk_category="modify",
+        risk_level="medium",
+        input_schema=COMMON_WRITE_INPUT,
+        output_schema=WRITE_OUTPUT_SCHEMA,
+        errors=COMMON_ERRORS + LOCATOR_ERRORS + ACTION_ERRORS,
+        permissions=("desktop.observe", "desktop.input"),
+    ),
 }
 
 MANIFEST: dict[str, Any] = {
@@ -404,6 +452,12 @@ class AtspiBackend(Protocol):
     def invoke(self, native: Any, *, deadline: float) -> Any: ...
 
     def set_text(self, native: Any, text: str, *, deadline: float) -> Any: ...
+
+    def toggle(self, native: Any, *, deadline: float) -> Any: ...
+
+    def expand(self, native: Any, *, deadline: float) -> Any: ...
+
+    def collapse(self, native: Any, *, deadline: float) -> Any: ...
 
     def same_element(self, previous: Any, current: Any, *, deadline: float) -> bool: ...
 
@@ -988,17 +1042,53 @@ class LinuxAtspiDriver:
                 isinstance(provenance, Mapping) and provenance.get("value_redacted") is True
             ) or (isinstance(states, Mapping) and states.get("protected") is True):
                 raise DriverError("DRIVER.PROTECTED_ELEMENT", "受保护文本元素禁止 set_text")
+        if isinstance(self.backend, GioAtspiBackend):
+            # Gio fallback intentionally has no write surface, including
+            # state-preserving expand/collapse calls that would otherwise no-op.
+            self.backend._unsupported(action)
         if action not in resolved["actions"]:
             raise DriverError(
                 "DRIVER.ACTION_UNSUPPORTED",
                 f"目标不支持原生 {action}",
                 data={"action": action, "available_actions": resolved["actions"]},
             )
-        if isinstance(self.backend, GioAtspiBackend):
-            # Gio fallback intentionally has no write surface.  Return the
-            # backend-specific reason even if a synthetic/stale node claimed
-            # an action, and do so before entering the dispatch boundary.
-            self.backend._unsupported(action)
+        states = resolved.get("states")
+        if not isinstance(states, Mapping):
+            states = {}
+        if action == "toggle" and not isinstance(states.get("checked"), bool):
+            raise DriverError(
+                "DRIVER.ACTION_UNSUPPORTED",
+                "目标没有可观察的 checked 状态，不能执行 toggle",
+                data={"action": action, "checked": states.get("checked")},
+            )
+        if action in {"expand", "collapse"}:
+            expandable = states.get("expandable")
+            expanded = states.get("expanded")
+            if expandable is not True or not isinstance(expanded, bool):
+                raise DriverError(
+                    "DRIVER.ACTION_UNSUPPORTED",
+                    f"目标没有可验证的展开状态，不能执行 {action}",
+                    data={
+                        "action": action,
+                        "expandable": expandable,
+                        "expanded": expanded,
+                    },
+                )
+            desired = action == "expand"
+            if expanded is desired:
+                _check_deadline(deadline)
+                return {
+                    "ok": True,
+                    "action": action,
+                    "resolved": self._target(fresh, fresh_node_id),
+                    "backend_result": {
+                        "native_interface": "Action.do_action",
+                        "native_action_name": GTK3_NATIVE_ACTION_NAMES[action],
+                        "dispatched": False,
+                        "no_op": True,
+                        "observed_state": {"expanded": expanded},
+                    },
+                }
         _check_deadline(deadline)
         native = fresh.handles[fresh_node_id]
         dispatched = False
@@ -1008,9 +1098,19 @@ class LinuxAtspiDriver:
                 backend_result = self.backend.focus(native, deadline=deadline)
             elif action == "invoke":
                 backend_result = self.backend.invoke(native, deadline=deadline)
-            else:
+            elif action == "set_text":
                 assert text is not None
                 backend_result = self.backend.set_text(native, text, deadline=deadline)
+            elif action == "toggle":
+                backend_result = self.backend.toggle(native, deadline=deadline)
+            elif action == "expand":
+                backend_result = self.backend.expand(native, deadline=deadline)
+            elif action == "collapse":
+                backend_result = self.backend.collapse(native, deadline=deadline)
+            else:  # WRITE_ACTIONS 与派发分支必须同步；意外分歧时失败关闭。
+                raise DriverError(
+                    "DRIVER.INVALID_REQUEST", f"不支持的写动作：{action}"
+                )
             _check_deadline(deadline, post_dispatch=True)
         except DriverError as exc:
             details = dict(exc.data) if isinstance(exc.data, Mapping) else {}
@@ -1102,6 +1202,15 @@ class UnavailableBackend:
         self._raise()
 
     def set_text(self, native: Any, text: str, *, deadline: float) -> Any:
+        self._raise()
+
+    def toggle(self, native: Any, *, deadline: float) -> Any:
+        self._raise()
+
+    def expand(self, native: Any, *, deadline: float) -> Any:
+        self._raise()
+
+    def collapse(self, native: Any, *, deadline: float) -> Any:
         self._raise()
 
     def same_element(self, previous: Any, current: Any, *, deadline: float) -> bool:
@@ -1435,6 +1544,17 @@ class PyGObjectAtspiBackend:
             )
         return actions
 
+    @staticmethod
+    def _exact_native_action(
+        metadata: Sequence[Mapping[str, Any]], native_action_name: str
+    ) -> dict[str, Any] | None:
+        """Return one exact canonical action-name match, never an alias."""
+
+        matches = [
+            dict(item) for item in metadata if item.get("name") == native_action_name
+        ]
+        return matches[0] if len(matches) == 1 else None
+
     def _read_node(
         self,
         accessible: Any,
@@ -1465,13 +1585,33 @@ class PyGObjectAtspiBackend:
         sensitive = self._state(state_set, "SENSITIVE", deadline=deadline)
         focusable = self._state(state_set, "FOCUSABLE", deadline=deadline)
         editable = self._state(state_set, "EDITABLE", deadline=deadline)
+        checked = self._state(state_set, "CHECKED", deadline=deadline)
+        expandable = self._state(state_set, "EXPANDABLE", deadline=deadline)
+        expanded = self._state(state_set, "EXPANDED", deadline=deadline)
+        selectable = self._state(state_set, "SELECTABLE", deadline=deadline)
+        selected = self._state(state_set, "SELECTED", deadline=deadline)
         actionable = enabled is not False and sensitive is not False
+        toolkit_name = _safe_text(application.get("toolkit_name"))
+        toolkit_version = _safe_text(application.get("toolkit_version"))
+        is_qualified_qt5 = (
+            actionable
+            and toolkit_name == "Qt"
+            and (toolkit_version or "").startswith("5.")
+        )
         actions: list[str] = []
         if actionable and focusable is not False and component_iface is not None:
             actions.append("focus")
         # AT-SPI Action 没有统一 default-action 标识。只在恰好一个动作时公开 invoke，
         # 从而避免静默选择一个多义的索引。
-        if actionable and len(action_metadata) == 1:
+        if (
+            is_qualified_qt5
+            and role == "push_button"
+            and self._exact_native_action(
+                action_metadata, QT5_NATIVE_ACTION_NAMES["invoke"]
+            )
+        ):
+            actions.append("invoke")
+        elif actionable and not is_qualified_qt5 and len(action_metadata) == 1:
             actions.append("invoke")
         if (
             actionable
@@ -1480,6 +1620,37 @@ class PyGObjectAtspiBackend:
             and protected is not True
         ):
             actions.append("set_text")
+        native_action_names: dict[str, str] = {}
+        if "invoke" in actions and is_qualified_qt5:
+            native_action_names["invoke"] = QT5_NATIVE_ACTION_NAMES["invoke"]
+        # This mapping is qualified only for GTK3.  Match the canonical AT-SPI
+        # action name byte-for-byte; localized labels and descriptions are not
+        # capability evidence.
+        is_qualified_gtk3 = (
+            actionable
+            and toolkit_name == "gtk"
+            and (toolkit_version or "").startswith("3.")
+        )
+        if is_qualified_gtk3:
+            if (
+                role in {"check_box", "toggle_button"}
+                and checked is not None
+                and self._exact_native_action(
+                    action_metadata, GTK3_NATIVE_ACTION_NAMES["toggle"]
+                )
+            ):
+                actions.append("toggle")
+                native_action_names["toggle"] = GTK3_NATIVE_ACTION_NAMES["toggle"]
+            if (
+                expandable is True
+                and expanded is not None
+                and self._exact_native_action(
+                    action_metadata, GTK3_NATIVE_ACTION_NAMES["expand"]
+                )
+            ):
+                actions.extend(("expand", "collapse"))
+                native_action_names["expand"] = GTK3_NATIVE_ACTION_NAMES["expand"]
+                native_action_names["collapse"] = GTK3_NATIVE_ACTION_NAMES["collapse"]
         raw_attributes = self._call_default(
             accessible, "get_attributes", {}, deadline=deadline
         )
@@ -1524,6 +1695,11 @@ class PyGObjectAtspiBackend:
                 "editable": editable,
                 "sensitive": sensitive,
                 "protected": protected,
+                "checked": checked,
+                "expandable": expandable,
+                "expanded": expanded,
+                "selectable": selectable,
+                "selected": selected,
             },
             bounds=self._bounds(accessible, deadline=deadline),
             actions=actions,
@@ -1533,10 +1709,17 @@ class PyGObjectAtspiBackend:
                 "accessible_id": accessible_id,
                 "application_name": application.get("name"),
                 "toolkit_name": application.get("toolkit_name"),
+                "toolkit_version": application.get("toolkit_version"),
                 "process_id": application.get("process_id"),
                 "value_redacted": protected is True,
                 "coordinate_space": "screen",
                 "atspi_actions": action_metadata,
+                "native_action_name": (
+                    next(iter(set(native_action_names.values())))
+                    if len(set(native_action_names.values())) == 1
+                    else None
+                ),
+                "native_action_names": native_action_names,
             },
         )
 
@@ -1622,15 +1805,53 @@ class PyGObjectAtspiBackend:
         if action_iface is None:
             raise DriverError("DRIVER.ACTION_UNSUPPORTED", "目标没有 AT-SPI Action 接口")
         metadata = self._action_metadata(native, deadline=deadline)
-        if len(metadata) != 1:
+        application = self._property_default(native, "app")
+        toolkit_name = _safe_text(
+            self._call_default(application, "get_toolkit_name", deadline=deadline)
+        )
+        toolkit_version = _safe_text(
+            self._call_default(application, "get_toolkit_version", deadline=deadline)
+        )
+        if (toolkit_name is None or toolkit_version is None) and hasattr(self, "desktop"):
+            bus_name, _object_path = self._identity(native)
+            application_info = next(
+                (
+                    info
+                    for _application, info in self._applications(deadline=deadline)
+                    if info.get("bus_name") == bus_name
+                ),
+                {},
+            )
+            toolkit_name = _safe_text(application_info.get("toolkit_name"))
+            toolkit_version = _safe_text(application_info.get("toolkit_version"))
+        role_enum = self._call_default(native, "get_role", deadline=deadline)
+        role = _normalize_role(
+            getattr(role_enum, "value_nick", None)
+            or self._call_default(native, "get_role_name", deadline=deadline)
+        )
+        selected: dict[str, Any] | None
+        if (
+            toolkit_name == "Qt"
+            and (toolkit_version or "").startswith("5.")
+            and role == "push_button"
+        ):
+            selected = self._exact_native_action(
+                metadata, QT5_NATIVE_ACTION_NAMES["invoke"]
+            )
+        else:
+            selected = dict(metadata[0]) if len(metadata) == 1 else None
+        if selected is None:
             raise DriverError(
                 "DRIVER.ACTION_UNSUPPORTED",
-                "AT-SPI invoke 需要目标恰好暴露一个原生动作",
-                data={"native_action_count": len(metadata)},
+                "AT-SPI invoke 没有唯一且经过资格验证的原生动作",
+                data={
+                    "native_action_count": len(metadata),
+                    "available_native_actions": metadata,
+                },
             )
         _check_deadline(deadline)
         try:
-            accepted = bool(action_iface.do_action(int(metadata[0]["index"])))
+            accepted = bool(action_iface.do_action(int(selected["index"])))
         except Exception as exc:
             raise self._native_failure("Action.do_action", exc) from exc
         if not accepted:
@@ -1638,8 +1859,60 @@ class PyGObjectAtspiBackend:
         return {
             "native_interface": "Action.do_action",
             "accepted": True,
-            "native_action": metadata[0],
+            "native_action_name": selected["name"],
+            "native_action": selected,
         }
+
+    def _do_exact_named_action(
+        self, native: Any, action: str, *, deadline: float
+    ) -> dict[str, Any]:
+        _check_deadline(deadline)
+        native_action_name = GTK3_NATIVE_ACTION_NAMES[action]
+        action_iface = self._interface(
+            native, "get_action_iface", deadline=deadline
+        )
+        if action_iface is None:
+            raise DriverError(
+                "DRIVER.ACTION_UNSUPPORTED", "目标没有 AT-SPI Action 接口"
+            )
+        metadata = self._action_metadata(native, deadline=deadline)
+        selected = self._exact_native_action(metadata, native_action_name)
+        if selected is None:
+            raise DriverError(
+                "DRIVER.ACTION_UNSUPPORTED",
+                f"目标没有唯一的原生 {native_action_name} 动作",
+                data={
+                    "action": action,
+                    "native_action_name": native_action_name,
+                    "available_native_actions": metadata,
+                },
+            )
+        _check_deadline(deadline)
+        try:
+            accepted = bool(action_iface.do_action(int(selected["index"])))
+        except Exception as exc:
+            raise self._native_failure("Action.do_action", exc) from exc
+        if not accepted:
+            raise DriverError(
+                "DRIVER.ACTION_FAILED", "Action.do_action 未接受请求"
+            )
+        return {
+            "native_interface": "Action.do_action",
+            "native_action_name": native_action_name,
+            "native_action": selected,
+            "accepted": True,
+            "dispatched": True,
+            "no_op": False,
+        }
+
+    def toggle(self, native: Any, *, deadline: float) -> Any:
+        return self._do_exact_named_action(native, "toggle", deadline=deadline)
+
+    def expand(self, native: Any, *, deadline: float) -> Any:
+        return self._do_exact_named_action(native, "expand", deadline=deadline)
+
+    def collapse(self, native: Any, *, deadline: float) -> Any:
+        return self._do_exact_named_action(native, "collapse", deadline=deadline)
 
     def set_text(self, native: Any, text: str, *, deadline: float) -> Any:
         _check_deadline(deadline)
@@ -1692,15 +1965,39 @@ class PyGObjectAtspiBackend:
                 current, "get_accessible_id", deadline=deadline
             )
         )
-        # AT-SPI 没有通用的对象 generation；若 toolkit 也没有提供稳定
-        # AccessibleId，仅凭可能复用的 bus/path 不能证明仍是同一实例。
-        if not previous_accessible_id or not current_accessible_id:
-            return False
-        return (
+        if (
+            previous_accessible_id
+            and current_accessible_id
+            and previous_identity == current_identity
+        ):
+            return previous_accessible_id == current_accessible_id
+        # libatspi child proxies do not reliably retain ``app``. Resolve the
+        # bus owner through the desktop root; otherwise a proxy whose ``app``
+        # property exists but is null would erase the qualified identity.
+        applications = {
+            info.get("bus_name"): info
+            for _native, info in self._applications(deadline=deadline)
+        }
+        previous_info = applications.get(previous_identity[0], {})
+        current_info = applications.get(current_identity[0], {})
+        previous_toolkit = _safe_text(previous_info.get("toolkit_name"))
+        current_toolkit = _safe_text(current_info.get("toolkit_name"))
+        previous_version = _safe_text(previous_info.get("toolkit_version"))
+        current_version = _safe_text(current_info.get("toolkit_version"))
+        previous_pid = previous_info.get("process_id")
+        current_pid = current_info.get("process_id")
+        return bool(
             previous_identity == current_identity
-            and previous_accessible_id == current_accessible_id
+            and previous_identity[1]
+            and previous_identity[1] != "/org/a11y/atspi/accessible/root"
+            and previous_toolkit == current_toolkit == "Qt"
+            and (previous_version or "").startswith("5.")
+            and previous_version == current_version
+            and isinstance(previous_pid, int)
+            and not isinstance(previous_pid, bool)
+            and previous_pid > 0
+            and previous_pid == current_pid
         )
-
 
 @dataclass(frozen=True, slots=True)
 class GioAccessibleRef:
@@ -1728,10 +2025,15 @@ class GioAtspiBackend:
         "org.a11y.atspi.Registry", "/org/a11y/atspi/accessible/root"
     )
     STATE_INDEXES = {
+        "checked": 4,
         "editable": 7,
         "enabled": 8,
+        "expandable": 9,
+        "expanded": 10,
         "focusable": 11,
         "focused": 12,
+        "selectable": 22,
+        "selected": 23,
         "sensitive": 24,
         "showing": 25,
         "visible": 30,
@@ -2226,6 +2528,18 @@ class GioAtspiBackend:
     def set_text(self, native: Any, text: str, *, deadline: float) -> Any:
         _check_deadline(deadline)
         self._unsupported("set_text")
+
+    def toggle(self, native: Any, *, deadline: float) -> Any:
+        _check_deadline(deadline)
+        self._unsupported("toggle")
+
+    def expand(self, native: Any, *, deadline: float) -> Any:
+        _check_deadline(deadline)
+        self._unsupported("expand")
+
+    def collapse(self, native: Any, *, deadline: float) -> Any:
+        _check_deadline(deadline)
+        self._unsupported("collapse")
 
     def same_element(self, previous: Any, current: Any, *, deadline: float) -> bool:
         _check_deadline(deadline)
