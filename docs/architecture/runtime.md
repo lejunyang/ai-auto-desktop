@@ -179,6 +179,10 @@ operator 不持有 runner 的 bearer token，也不应为提交控制意图而�
 
 JournalStore 只执行调用方给出的敏感标记和存储不变量，不通过内容猜测 secret。RunService 是可信持久化入口：它必须按 descriptor 的 input/output `sensitive` 声明显式传递标记并 fail closed。当前机制不是完整 taint tracking；未实现跨变量、插件响应与派生值的自动敏感传播前，不得宣称能自动防止所有 secret 泄漏。
 
+当前 durable executor 只接受 `max_concurrency=1` 且顶层未显式声明 `depends_on` 的 legacy 串行计划，其他 DAG 在创建 run 前失败关闭。v0 还保守拒绝包含 action 或 script 的计划，避免把未经完整 taint tracking 的插件/脚本返回值写入 checkpoint；这意味着当前 durable 纵向切片只覆盖由受信任描述符产生的控制流、变量、失败与 return，而不是 OCR 或桌面动作。它复用 WorkflowRunner 的单顶层 segment API；一个顶层控制流节点连同其嵌套步骤、handler 和 finally 是不可拆分的执行段。checkpoint 记录 schema/runtime 版本、canonical descriptor SHA-256、phase、下一顶层索引、已消耗 attempt 数、首次启动时确定的绝对 deadline，以及 variables、表达式可见 step context 和诊断 step records。暂停时间仍消耗该绝对 deadline，resume 不重置预算。
+
+每个顶层段 dispatch 前先原子写入 `in_top_level_step` checkpoint，整个 step 及其 finally 完成后再原子写入 `between_top_level_steps`。进程崩溃后只允许从后者恢复；看到 `in_top_level_step` 或 `finalizing` 时不得重放，必须零 dispatch 地终结为 `UNKNOWN_EFFECT`。进入 workflow finally 前也先写 `finalizing`，避免崩溃后重复 cleanup。lease 目前只在这些持久边界同步 heartbeat；它保证旧 owner 不能继续写 journal，但不等于能异步强杀已经进入插件或 OS 的调用。
+
 ## 9. 状态与结构化错误
 
 Run 和 step 的终态统一使用：

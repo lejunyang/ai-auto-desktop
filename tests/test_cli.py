@@ -74,6 +74,23 @@ class CliTests(unittest.TestCase):
             },
         )
 
+    def test_help_and_version_are_single_json_documents(self) -> None:
+        completed, help_payload = self.invoke("--help")
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(help_payload["status"], "help")
+        self.assertIn("usage: ai-auto-desktop", help_payload["text"])
+
+        completed, version_payload = self.invoke("--version")
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(
+            version_payload,
+            {
+                "program": "ai-auto-desktop",
+                "status": "version",
+                "version": "0.1.0",
+            },
+        )
+
     def test_run_prints_structured_result_and_parses_json_input(self) -> None:
         value = descriptor(
             {
@@ -134,6 +151,72 @@ class CliTests(unittest.TestCase):
 
         self.assertNotEqual(completed.returncode, 0)
         self.assertEqual(payload["error"]["code"], "CLI.INVALID_ARGUMENT")
+
+    def test_durable_start_status_list_and_events_are_one_json_line(self) -> None:
+        path = self.write_descriptor(
+            descriptor(
+                {
+                    "id": "finish",
+                    "type": "return",
+                    "value": {"ok": True},
+                }
+            )
+        )
+        journal = self.directory / "runs.sqlite3"
+        completed, started = self.invoke(
+            "start", str(path), "--journal", str(journal),
+            "--run-id", "cli-run",
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(started["runId"], "cli-run")
+        self.assertEqual(started["status"], "succeeded")
+        self.assertEqual(started["output"], {"ok": True})
+
+        completed, status = self.invoke(
+            "status", "cli-run", "--journal", str(journal)
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(status["status"], "succeeded")
+
+        completed, listing = self.invoke(
+            "list", "--journal", str(journal), "--status", "succeeded"
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual([run["runId"] for run in listing["runs"]], ["cli-run"])
+
+        completed, events = self.invoke(
+            "events", "cli-run", "--journal", str(journal)
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(events["events"][0]["type"], "run.created")
+        self.assertEqual(events["events"][-1]["type"], "run.finished")
+        self.assertEqual(events["nextAfterSeq"], events["events"][-1]["seq"])
+
+    def test_durable_pause_cancel_and_resume_errors_are_structured(self) -> None:
+        path = self.write_descriptor(
+            descriptor({"id": "finish", "type": "return", "value": 1})
+        )
+        journal = self.directory / "runs.sqlite3"
+        completed, _ = self.invoke(
+            "start", str(path), "--journal", str(journal),
+            "--run-id", "terminal",
+        )
+        self.assertEqual(completed.returncode, 0)
+
+        for command in ("pause", "cancel"):
+            with self.subTest(command=command):
+                completed, payload = self.invoke(
+                    command, "terminal", "--journal", str(journal)
+                )
+                self.assertEqual(completed.returncode, 2)
+                self.assertEqual(payload["status"], "error")
+                self.assertEqual(payload["error"]["code"], "RUN.TERMINAL")
+
+        completed, payload = self.invoke(
+            "resume", "missing", str(path), "--journal", str(journal)
+        )
+        self.assertEqual(completed.returncode, 2)
+        self.assertEqual(payload["error"]["code"], "RUN.NOT_FOUND")
 
 
 if __name__ == "__main__":

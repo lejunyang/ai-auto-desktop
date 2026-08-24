@@ -18,7 +18,8 @@ from __future__ import annotations
 
 from enum import StrEnum
 import sqlite3
-from typing import Any, Callable, NoReturn, TypeVar
+from collections.abc import Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Callable, NoReturn, TypeVar
 
 from .errors import AutomationError
 from .journal import (
@@ -36,6 +37,11 @@ from .journal import (
     SensitiveDataError,
     durable_descriptor_eligible,
 )
+
+if TYPE_CHECKING:
+    from .durable import DurableExecutionResult
+    from .model import WorkflowDescriptor
+    from .plugin import ProcessPlugin
 
 
 MAX_CONTROL_CAS_ATTEMPTS = 16
@@ -152,6 +158,77 @@ class RunService:
             lambda: self._journal.list_events(
                 run_id, after_seq=after_seq, limit=limit
             ),
+        )
+
+    def start(
+        self,
+        descriptor: WorkflowDescriptor,
+        *,
+        inputs: Mapping[str, Any] | None = None,
+        run_id: str | None = None,
+        owner_id: str | None = None,
+        lease_ttl_seconds: float = 30.0,
+        plugins: Mapping[str, ProcessPlugin | Sequence[str] | str] | None = None,
+        allow_scripts: bool = False,
+        granted_permissions: Sequence[str] | None = None,
+    ) -> DurableExecutionResult:
+        """Create and execute a durable run through the segment engine."""
+
+        from .durable import DurableExecutor
+
+        return DurableExecutor(
+            self._journal, owner_id=owner_id,
+            lease_ttl_seconds=lease_ttl_seconds,
+        ).start(
+            descriptor, inputs=inputs, run_id=run_id, plugins=plugins,
+            allow_scripts=allow_scripts,
+            granted_permissions=granted_permissions,
+        )
+
+    def execute(
+        self,
+        run_id: str,
+        descriptor: WorkflowDescriptor,
+        *,
+        owner_id: str | None = None,
+        lease_ttl_seconds: float = 30.0,
+        plugins: Mapping[str, ProcessPlugin | Sequence[str] | str] | None = None,
+        allow_scripts: bool = False,
+        granted_permissions: Sequence[str] | None = None,
+    ) -> DurableExecutionResult:
+        """Execute a separately created pending durable run."""
+
+        from .durable import DurableExecutor
+
+        return DurableExecutor(
+            self._journal, owner_id=owner_id,
+            lease_ttl_seconds=lease_ttl_seconds,
+        ).execute(
+            run_id, descriptor, plugins=plugins, allow_scripts=allow_scripts,
+            granted_permissions=granted_permissions,
+        )
+
+    def resume(
+        self,
+        run_id: str,
+        descriptor: WorkflowDescriptor,
+        *,
+        owner_id: str | None = None,
+        lease_ttl_seconds: float = 30.0,
+        plugins: Mapping[str, ProcessPlugin | Sequence[str] | str] | None = None,
+        allow_scripts: bool = False,
+        granted_permissions: Sequence[str] | None = None,
+    ) -> DurableExecutionResult:
+        """Resume a durable run from its last safe checkpoint."""
+
+        from .durable import DurableExecutor
+
+        return DurableExecutor(
+            self._journal, owner_id=owner_id,
+            lease_ttl_seconds=lease_ttl_seconds,
+        ).resume(
+            run_id, descriptor, plugins=plugins, allow_scripts=allow_scripts,
+            granted_permissions=granted_permissions, request_run=True,
         )
 
     def request_pause(self, run_id: str) -> RunRecord:

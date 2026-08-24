@@ -34,6 +34,7 @@ class PackageResourceTests(unittest.TestCase):
             DesiredState,
             DispatchState,
             JournalStore,
+            DurableExecutor,
             RunService,
             RunStatus,
         )
@@ -42,6 +43,7 @@ class PackageResourceTests(unittest.TestCase):
         self.assertEqual(DispatchState.EFFECT_UNKNOWN.value, "effect_unknown")
         self.assertEqual(RunStatus.RUNNING.value, "running")
         self.assertTrue(callable(JournalStore))
+        self.assertTrue(callable(DurableExecutor))
         self.assertTrue(callable(RunService))
 
     @classmethod

@@ -4,13 +4,18 @@ from __future__ import annotations
 
 import ast
 from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import contextmanager
+from dataclasses import dataclass
 import fnmatch
+import hashlib
+import json
+import math
 import random
 import re
 import sys
 import threading
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from typing import Any
 
 from .compiler import parse_duration
@@ -27,6 +32,46 @@ except ImportError:  # pragma: no cover
 
 _TEMPLATE = re.compile(r"\$\{\{(.*?)\}\}", re.DOTALL)
 RUNTIME_VERSION = "0.1.0"
+RUNTIME_STATE_SCHEMA_VERSION = 1
+
+
+@dataclass(frozen=True, slots=True)
+class RuntimeSegmentState:
+    """JSON-compatible runtime state captured at a top-level boundary."""
+
+    schema_version: int
+    runtime_version: str
+    descriptor_digest: str
+    phase: str
+    next_top_level_index: int
+    executed_attempts: int
+    deadline_epoch_ms: int | None
+    variables: dict[str, Any]
+    context_steps: dict[str, Any]
+    step_records: dict[str, Any]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schemaVersion": self.schema_version,
+            "runtimeVersion": self.runtime_version,
+            "descriptorDigest": self.descriptor_digest,
+            "phase": self.phase,
+            "nextTopLevelIndex": self.next_top_level_index,
+            "executedAttempts": self.executed_attempts,
+            "deadlineEpochMs": self.deadline_epoch_ms,
+            "variables": _clone_runtime_value(self.variables),
+            "contextSteps": _clone_runtime_value(self.context_steps),
+            "stepRecords": _clone_runtime_value(self.step_records),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class SegmentResult:
+    """Outcome of executing at most one complete top-level step."""
+
+    step_id: str | None
+    terminal_ready: bool
+    state: RuntimeSegmentState
 
 
 class _ReturnFlow(Exception):
@@ -37,8 +82,10 @@ class _ReturnFlow(Exception):
 class _AttemptBudget:
     """Atomically account for attempts shared by parallel step runners."""
 
-    def __init__(self) -> None:
-        self.executed = 0
+    def __init__(self, executed: int = 0) -> None:
+        if isinstance(executed, bool) or not isinstance(executed, int) or executed < 0:
+            raise ValueError("executed attempt count must be a non-negative integer")
+        self.executed = executed
         self._lock = threading.Lock()
 
     def ensure_available(self, limit: int | None) -> None:
@@ -130,6 +177,11 @@ class WorkflowRunner:
         self._run_lock = threading.Lock()
         self._pre_reserved_attempts = 0
         self._executed = 0
+        self._segment_phase = "uninitialized"
+        self._segment_next_index = 0
+        self._segment_deadline_epoch_ms: int | None = None
+        self._segment_output: Any = MISSING
+        self._segment_error: AutomationError | None = None
 
     def run(self, inputs: Mapping[str, Any] | None = None) -> RunResult:
         if not self._run_lock.acquire(blocking=False):
@@ -226,6 +278,493 @@ class WorkflowRunner:
         """Request cooperative cancellation and prevent new step dispatch."""
 
         self._cancelled.set()
+
+    def initialize(
+        self,
+        inputs: Mapping[str, Any] | None = None,
+        *,
+        deadline_epoch_ms: int | None = None,
+    ) -> RuntimeSegmentState:
+        """Initialize the opt-in, top-level segmented execution API.
+
+        The existing :meth:`run` path remains independent and keeps its DAG
+        scheduling behavior.  Segments are intended for a durable coordinator
+        that checkpoints only between complete top-level steps.
+        """
+
+        with self._segment_lock("initialize"):
+            if self._segment_phase not in {"uninitialized", "finalized"}:
+                raise self._segment_state_error(
+                    "segmented execution is already initialized"
+                )
+            self.events, self.step_records, self._executed = [], {}, 0
+            self._deadline_stack = []
+            self._attempt_budget = _AttemptBudget()
+            self._pre_reserved_attempts = 0
+            self._handler_output = MISSING
+            self._cancelled.clear()
+            actual_inputs = self._prepare_inputs(dict(inputs or {}))
+            self.context = {"inputs": actual_inputs, "vars": {}, "steps": {}}
+            self.variables = self._prepare_variables()
+            self.context["vars"] = self.variables
+            if deadline_epoch_ms is None:
+                budget = _duration(self.descriptor.budgets.get("max_duration"))
+                deadline_epoch_ms = (
+                    int((time.time() + budget) * 1_000)
+                    if budget is not None
+                    else None
+                )
+            self._set_segment_deadline(deadline_epoch_ms)
+            self._check_control()
+            self._check_requirements()
+            self._segment_phase = "between_top_level_steps"
+            self._segment_next_index = 0
+            self._segment_output = MISSING
+            self._segment_error = None
+            return self._export_segment_state()
+
+    def import_state(
+        self,
+        state: RuntimeSegmentState | Mapping[str, Any],
+        *,
+        inputs: Mapping[str, Any] | None = None,
+        allow_expired: bool = False,
+    ) -> RuntimeSegmentState:
+        """Restore a safe segmented boundary without extending its deadline."""
+
+        with self._segment_lock("import_state"):
+            normalized = self._normalize_segment_state(state)
+            if normalized.phase != "between_top_level_steps":
+                raise self._segment_state_error(
+                    "only a between_top_level_steps checkpoint is resumable",
+                    details={"phase": normalized.phase},
+                )
+            actual_inputs = self._prepare_inputs(dict(inputs or {}))
+            variables = _clone_runtime_value(normalized.variables)
+            context_steps = _clone_runtime_value(normalized.context_steps)
+            step_records = _clone_runtime_value(normalized.step_records)
+            self._validate_imported_segment_state(
+                normalized, variables, context_steps, step_records
+            )
+            self.events = []
+            self.variables = variables
+            self.context = {
+                "inputs": actual_inputs,
+                "vars": self.variables,
+                "steps": context_steps,
+            }
+            self.step_records = step_records
+            self._deadline_stack = []
+            self._attempt_budget = _AttemptBudget(normalized.executed_attempts)
+            self._pre_reserved_attempts = 0
+            self._executed = normalized.executed_attempts
+            self._handler_output = MISSING
+            self._cancelled.clear()
+            self._segment_phase = normalized.phase
+            self._segment_next_index = normalized.next_top_level_index
+            self._segment_output = MISSING
+            self._segment_error = None
+            self._set_segment_deadline(normalized.deadline_epoch_ms)
+            if not allow_expired:
+                self._check_control()
+            self._check_requirements()
+            return self._export_segment_state()
+
+    def export_state(self) -> RuntimeSegmentState:
+        """Return a detached JSON-compatible segmented runtime snapshot."""
+
+        with self._segment_lock("export_state"):
+            if self._segment_phase == "uninitialized":
+                raise self._segment_state_error(
+                    "segmented execution has not been initialized"
+                )
+            return self._export_segment_state()
+
+    def prepare_segment(self) -> SegmentResult:
+        """Mark the next top-level step as entered without executing it.
+
+        Durable coordinators persist the returned ``in_top_level_step`` state
+        before calling :meth:`run_segment`.  Such a state is intentionally not
+        resumable after a crash because the dispatch boundary is unknown.
+        """
+
+        with self._segment_lock("prepare_segment"):
+            if self._segment_phase != "between_top_level_steps":
+                raise self._segment_state_error(
+                    "runner is not at a top-level segment boundary",
+                    details={"phase": self._segment_phase},
+                )
+            if self._segment_next_index >= len(self.descriptor.steps):
+                return SegmentResult(None, True, self._export_segment_state())
+            step = self.descriptor.steps[self._segment_next_index]
+            completed = {
+                item.id
+                for item in self.descriptor.steps[: self._segment_next_index]
+            }
+            if any(dependency not in completed for dependency in step.depends_on):
+                raise self._segment_state_error(
+                    f"top-level step {step.id!r} is not ready",
+                    details={"dependsOn": list(step.depends_on)},
+                )
+            self._segment_phase = "in_top_level_step"
+            return SegmentResult(step.id, False, self._export_segment_state())
+
+    def run_segment(self) -> SegmentResult:
+        """Execute at most one complete top-level step.
+
+        A top-level control-flow step and all of its nested steps, handler, and
+        finally block form one indivisible segment.  Exceptions and explicit
+        returns are captured as terminal-ready state for :meth:`finalize`.
+        """
+
+        with self._segment_lock("run_segment"):
+            if self._segment_phase == "between_top_level_steps":
+                if self._segment_next_index >= len(self.descriptor.steps):
+                    return SegmentResult(None, True, self._export_segment_state())
+                self._prepare_segment_locked()
+            if self._segment_phase != "in_top_level_step":
+                raise self._segment_state_error(
+                    "runner has no prepared top-level segment",
+                    details={"phase": self._segment_phase},
+                )
+            step = self.descriptor.steps[self._segment_next_index]
+            try:
+                self._run_step(step)
+            except _ReturnFlow as returned:
+                self._segment_output = returned.value
+                self._segment_phase = "finalizing"
+                return SegmentResult(step.id, True, self._export_segment_state())
+            except AutomationError as caught:
+                try:
+                    error = self._apply_handler(self.descriptor.on_error, caught)
+                except _ReturnFlow as returned:
+                    self._segment_output = returned.value
+                    error = None
+                if error is None and self._segment_output is MISSING:
+                    self._segment_output = getattr(self, "_handler_output", None)
+                self._segment_error = error
+                self._segment_phase = "finalizing"
+                return SegmentResult(step.id, True, self._export_segment_state())
+            except Exception as caught:
+                self._segment_error = ensure_automation_error(caught)
+                self._segment_phase = "finalizing"
+                return SegmentResult(step.id, True, self._export_segment_state())
+            self._segment_next_index += 1
+            self._segment_phase = "between_top_level_steps"
+            return SegmentResult(
+                step.id,
+                self._segment_next_index == len(self.descriptor.steps),
+                self._export_segment_state(),
+            )
+
+    def abort_prepared_segment(self) -> RuntimeSegmentState:
+        """Return to the prior safe boundary before any segment execution."""
+
+        with self._segment_lock("abort_prepared_segment"):
+            if self._segment_phase != "in_top_level_step":
+                raise self._segment_state_error(
+                    "runner has no unexecuted prepared segment",
+                    details={"phase": self._segment_phase},
+                )
+            self._segment_phase = "between_top_level_steps"
+            return self._export_segment_state()
+
+    def _prepare_segment_locked(self) -> None:
+        step = self.descriptor.steps[self._segment_next_index]
+        completed = {
+            item.id for item in self.descriptor.steps[: self._segment_next_index]
+        }
+        if any(dependency not in completed for dependency in step.depends_on):
+            raise self._segment_state_error(
+                f"top-level step {step.id!r} is not ready",
+                details={"dependsOn": list(step.depends_on)},
+            )
+        self._segment_phase = "in_top_level_step"
+
+    def finalize(
+        self, *, error: AutomationError | None = None
+    ) -> RunResult:
+        """Run workflow cleanup once and produce a normal :class:`RunResult`."""
+
+        with self._segment_lock("finalize"):
+            if self._segment_phase == "finalized":
+                raise self._segment_state_error("workflow is already finalized")
+            if self._segment_phase not in {
+                "between_top_level_steps",
+                "finalizing",
+            }:
+                raise self._segment_state_error(
+                    "runner cannot finalize from its current phase",
+                    details={"phase": self._segment_phase},
+                )
+            if (
+                error is None
+                and self._segment_error is None
+                and self._segment_output is MISSING
+                and self._segment_next_index < len(self.descriptor.steps)
+            ):
+                raise self._segment_state_error(
+                    "workflow still has unexecuted top-level steps"
+                )
+            self._segment_phase = "finalizing"
+            final_error = error if error is not None else self._segment_error
+            output = self._segment_output
+            if output is MISSING and final_error is None:
+                try:
+                    output = self._workflow_outputs()
+                except AutomationError as caught:
+                    final_error = caught
+                except Exception as caught:
+                    final_error = ensure_automation_error(caught)
+            result = self._finalize_result(final_error, output)
+            self._segment_phase = "finalized"
+            self._cancelled.clear()
+            return result
+
+    def prepare_finalize(self) -> RuntimeSegmentState:
+        """Enter the non-resumable workflow-finalization phase."""
+
+        with self._segment_lock("prepare_finalize"):
+            if self._segment_phase == "finalizing":
+                return self._export_segment_state()
+            if self._segment_phase != "between_top_level_steps":
+                raise self._segment_state_error(
+                    "runner cannot enter finalization from its current phase",
+                    details={"phase": self._segment_phase},
+                )
+            self._segment_phase = "finalizing"
+            return self._export_segment_state()
+
+    def request_segment_cancellation(self) -> None:
+        """Mark an initialized segmented run for cooperative cancellation."""
+
+        self._cancelled.set()
+        if self._segment_phase == "between_top_level_steps":
+            self._segment_error = AutomationError(
+                "WORKFLOW.CANCELLED",
+                "Workflow execution was cancelled",
+                category="workflow",
+                phase="execute",
+            )
+            self._segment_phase = "finalizing"
+
+    def _finalize_result(
+        self, error: AutomationError | None, output: Any
+    ) -> RunResult:
+        cleanup_timeout = (
+            _duration(self.descriptor.budgets.get("cleanup_timeout"), 5.0)
+            or 5.0
+        )
+        original_deadline = self._deadline
+        self._deadline = time.monotonic() + cleanup_timeout
+        try:
+            self._run_steps(self.descriptor.finally_steps, cleanup=True)
+        except _ReturnFlow:
+            pass
+        except AutomationError as cleanup_error:
+            if error is not None:
+                error.add_suppressed(cleanup_error)
+            else:
+                error = AutomationError(
+                    "WORKFLOW.FINALLY_FAILED",
+                    "Workflow cleanup failed",
+                    phase="cleanup",
+                    cause=cleanup_error,
+                )
+        finally:
+            self._deadline = original_deadline
+            self._executed = self._attempt_budget.executed
+            for name in self._owned:
+                self.plugins[name].close()
+
+        status = "succeeded"
+        if error is not None:
+            if error.code == "ACTION.UNKNOWN_EFFECT" or error.effect == "unknown":
+                status = "unknown_effect"
+            elif error.code in {
+                "WORKFLOW.TIMEOUT",
+                "ACTION.TIMEOUT",
+                "STEP.TIMEOUT",
+                "SCRIPT.TIMEOUT",
+            }:
+                status = "timed_out"
+            elif error.code == "WORKFLOW.CANCELLED":
+                status = "cancelled"
+            else:
+                status = "failed"
+        return RunResult(
+            status,
+            None if output is MISSING else output,
+            dict(self.variables),
+            error,
+            list(self.events),
+            dict(self.step_records),
+        )
+
+    @contextmanager
+    def _segment_lock(self, operation: str) -> Iterator[None]:
+        if not self._run_lock.acquire(blocking=False):
+            raise self._segment_state_error(
+                "WorkflowRunner is already running",
+                details={"operation": operation},
+            )
+        try:
+            yield
+        finally:
+            self._run_lock.release()
+
+    def _set_segment_deadline(self, deadline_epoch_ms: int | None) -> None:
+        if deadline_epoch_ms is not None and (
+            isinstance(deadline_epoch_ms, bool)
+            or not isinstance(deadline_epoch_ms, int)
+            or deadline_epoch_ms < 0
+        ):
+            raise self._segment_state_error(
+                "deadlineEpochMs must be a non-negative integer or null"
+            )
+        self._segment_deadline_epoch_ms = deadline_epoch_ms
+        self._deadline = (
+            None
+            if deadline_epoch_ms is None
+            else time.monotonic()
+            + max(0.0, deadline_epoch_ms / 1_000 - time.time())
+        )
+
+    def _export_segment_state(self) -> RuntimeSegmentState:
+        if self._deadline_stack or self._pre_reserved_attempts:
+            raise self._segment_state_error(
+                "runtime state cannot be exported inside a step or attempt"
+            )
+        try:
+            return RuntimeSegmentState(
+                RUNTIME_STATE_SCHEMA_VERSION,
+                RUNTIME_VERSION,
+                canonical_plan_digest(self.descriptor),
+                self._segment_phase,
+                self._segment_next_index,
+                self._attempt_budget.executed,
+                self._segment_deadline_epoch_ms,
+                _clone_runtime_value(self.variables),
+                _clone_runtime_value(self.context.get("steps", {})),
+                _clone_runtime_value(self.step_records),
+            )
+        except (TypeError, ValueError) as exc:
+            raise self._segment_state_error(
+                "runtime state is not finite JSON data", cause=exc
+            ) from exc
+
+    def _normalize_segment_state(
+        self, state: RuntimeSegmentState | Mapping[str, Any]
+    ) -> RuntimeSegmentState:
+        if isinstance(state, RuntimeSegmentState):
+            return state
+        if not isinstance(state, Mapping):
+            raise self._segment_state_error("runtime state must be an object")
+        required = {
+            "schemaVersion",
+            "runtimeVersion",
+            "descriptorDigest",
+            "phase",
+            "nextTopLevelIndex",
+            "executedAttempts",
+            "deadlineEpochMs",
+            "variables",
+            "contextSteps",
+            "stepRecords",
+        }
+        if set(state) != required:
+            raise self._segment_state_error(
+                "runtime state fields do not match the supported schema",
+                details={
+                    "missing": sorted(required - set(state)),
+                    "unknown": sorted(set(state) - required),
+                },
+            )
+        return RuntimeSegmentState(
+            state["schemaVersion"],
+            state["runtimeVersion"],
+            state["descriptorDigest"],
+            state["phase"],
+            state["nextTopLevelIndex"],
+            state["executedAttempts"],
+            state["deadlineEpochMs"],
+            state["variables"],
+            state["contextSteps"],
+            state["stepRecords"],
+        )
+
+    def _validate_imported_segment_state(
+        self,
+        state: RuntimeSegmentState,
+        variables: Any,
+        context_steps: Any,
+        step_records: Any,
+    ) -> None:
+        if (
+            isinstance(state.schema_version, bool)
+            or not isinstance(state.schema_version, int)
+            or state.schema_version != RUNTIME_STATE_SCHEMA_VERSION
+        ):
+            raise self._segment_state_error(
+                "runtime state schema version is unsupported",
+                details={"schemaVersion": state.schema_version},
+            )
+        if not isinstance(state.runtime_version, str) or state.runtime_version != RUNTIME_VERSION:
+            raise self._segment_state_error(
+                "runtime state version does not match this runtime",
+                details={
+                    "checkpointRuntimeVersion": state.runtime_version,
+                    "runtimeVersion": RUNTIME_VERSION,
+                },
+            )
+        expected_digest = canonical_plan_digest(self.descriptor)
+        if not isinstance(state.descriptor_digest, str) or state.descriptor_digest != expected_digest:
+            raise self._segment_state_error(
+                "runtime state descriptor digest does not match",
+                details={
+                    "checkpointDescriptorDigest": state.descriptor_digest,
+                    "descriptorDigest": expected_digest,
+                },
+            )
+        index = state.next_top_level_index
+        attempts = state.executed_attempts
+        if isinstance(index, bool) or not isinstance(index, int) or not 0 <= index <= len(self.descriptor.steps):
+            raise self._segment_state_error("nextTopLevelIndex is out of range")
+        if isinstance(attempts, bool) or not isinstance(attempts, int) or attempts < 0:
+            raise self._segment_state_error("executedAttempts must be non-negative")
+        if not isinstance(variables, dict) or not isinstance(context_steps, dict) or not isinstance(step_records, dict):
+            raise self._segment_state_error(
+                "variables, contextSteps, and stepRecords must be objects"
+            )
+        unknown_variables = set(variables) - set(self.descriptor.variables)
+        known_steps = {step.id for step in self.descriptor.all_steps()}
+        unknown_steps = (set(context_steps) | set(step_records)) - known_steps
+        completed_ids = {step.id for step in self.descriptor.steps[:index]}
+        if unknown_variables or unknown_steps or not completed_ids.issubset(context_steps):
+            raise self._segment_state_error(
+                "runtime state does not match the descriptor",
+                details={
+                    "unknownVariables": sorted(unknown_variables),
+                    "unknownSteps": sorted(unknown_steps),
+                    "missingCompletedSteps": sorted(completed_ids - set(context_steps)),
+                },
+            )
+
+    @staticmethod
+    def _segment_state_error(
+        message: str,
+        *,
+        details: Mapping[str, Any] | None = None,
+        cause: BaseException | None = None,
+    ) -> AutomationError:
+        return AutomationError(
+            "RUNTIME.STATE_INVALID",
+            message,
+            category="runtime",
+            phase="restore",
+            details=details,
+            cause=cause,
+        )
 
     def _new_execution_worker(self) -> "WorkflowRunner":
         return object.__new__(WorkflowRunner)
@@ -1693,7 +2232,11 @@ def _values_equal(left: Any, right: Any) -> bool:
 
 
 def _clone_runtime_value(value: Any) -> Any:
-    if value is None or isinstance(value, (bool, int, float, str)):
+    if value is None or isinstance(value, (bool, int, str)):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise TypeError("runtime numbers must be finite")
         return value
     if isinstance(value, Mapping):
         if not all(isinstance(key, str) for key in value):
@@ -1702,6 +2245,19 @@ def _clone_runtime_value(value: Any) -> Any:
     if isinstance(value, (list, tuple)):
         return [_clone_runtime_value(item) for item in value]
     raise TypeError(f"unsupported runtime value {type(value).__name__!r}")
+
+
+def canonical_plan_digest(descriptor: WorkflowDescriptor) -> str:
+    """Return a stable digest of the canonical compiled descriptor input."""
+
+    payload = json.dumps(
+        _clone_runtime_value(descriptor.raw),
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return "sha256:" + hashlib.sha256(payload).hexdigest()
 
 
 def _references_current_step(value: Any, step_id: str) -> bool:
@@ -1895,4 +2451,13 @@ def _version_matches(version: str, constraint: str) -> bool:
         return False
 
 
-__all__ = ["WorkflowRunner", "run_descriptor", "RunResult"]
+__all__ = [
+    "RUNTIME_STATE_SCHEMA_VERSION",
+    "RUNTIME_VERSION",
+    "RuntimeSegmentState",
+    "SegmentResult",
+    "WorkflowRunner",
+    "canonical_plan_digest",
+    "run_descriptor",
+    "RunResult",
+]
