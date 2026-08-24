@@ -3,6 +3,13 @@ name: CI
 on:
   push:
   pull_request:
+  workflow_dispatch:
+    inputs:
+      run_windows_native:
+        description: "运行 Windows UIA 原生 fixture"
+        required: false
+        default: false
+        type: boolean
 
 jobs:
   test:
@@ -13,9 +20,6 @@ jobs:
           - os: ubuntu-latest
             python-version: "3.11"
             install-target: .
-          - os: windows-latest
-            python-version: "3.11"
-            install-target: .[windows-uia]
           - os: macos-latest
             python-version: "3.11"
             install-target: .
@@ -33,6 +37,24 @@ jobs:
       - name: Build macOS AX fixture test kit
         if: runner.os == 'macOS'
         run: tests/macos/build.sh
+      - name: Validate canonical example
+        run: python -m ai_auto_desktop validate examples/workflows/ocr-error-response.json
+      - name: Smoke capability probe
+        run: python -m ai_auto_desktop probe
+
+  windows-native:
+    if: github.event_name == 'workflow_dispatch' && inputs.run_windows_native == true
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install project with Windows UIA support
+        run: python -m pip install ".[windows-uia]"
+      - name: Run contract and Windows native tests
+        run: python -m unittest discover -s tests -v
       - name: Validate canonical example
         run: python -m ai_auto_desktop validate examples/workflows/ocr-error-response.json
       - name: Smoke capability probe

@@ -1,5 +1,8 @@
 # Windows UIA 原生 fixture 测试
 
+> CI 约束：Windows 原生 job 不随普通 push 或 pull request 自动运行。需要验证时，
+> 从 GitHub Actions 手动触发 `CI` workflow，并将 `run_windows_native` 设为 `true`。
+
 `tests/windows/uia_fixture_app.py` 是一个只依赖 Python 标准库 `ctypes` 的小型 Win32
 应用。它创建一个标题唯一的顶层窗口，以及原生 `EDIT`、`BUTTON` 和 `STATIC` 控件；其中
 一个按钮会更新状态文本，另外两个按钮故意使用相同名称来验证 locator 歧义处理。
@@ -15,8 +18,8 @@
 6. 通过 Runtime 执行 `set_value`，再由 `postcondition.observe` 调用真实 `snapshot`，
    验证动作后的新快照包含目标值，同时确认主动作只派发一次。
 
-该测试类在非 Windows 平台整体跳过。GitHub Actions 的 Windows 矩阵项安装
-`.[windows-uia]` 后随完整 unittest suite 执行一次；Linux 和 macOS 不安装 Windows 可选依赖，
+该测试类在非 Windows 平台整体跳过。手动启用的 GitHub Actions `windows-native` job
+安装 `.[windows-uia]` 后执行完整 unittest suite；Linux 和 macOS 不安装 Windows 可选依赖，
 也不会尝试模拟原生 UIA。
 
 在 Windows PowerShell 中本地运行：
