@@ -8,7 +8,7 @@ import time
 import unittest
 
 from ai_auto_desktop.compiler import compile_descriptor
-from ai_auto_desktop.plugin import ProcessPlugin
+from ai_auto_desktop.plugin import PluginError, ProcessPlugin
 from ai_auto_desktop.runtime import _version_matches, run_descriptor
 
 
@@ -258,6 +258,48 @@ class RuntimeSemVerContractTests(unittest.TestCase):
 
 
 class RuntimeFailClosedContractTests(unittest.TestCase):
+    def test_unknown_effect_is_never_retried_for_idempotent_action(self) -> None:
+        contract = action_contract(
+            effect={"default_class": "idempotent"},
+            errors=[
+                {
+                    "code": "DRIVER.ACTION_FAILED",
+                    "retryable": True,
+                    "effect": "unknown",
+                }
+            ],
+        )
+        plugin = RecordingPlugin(manifest(contract=contract))
+        self.addCleanup(plugin.close)
+
+        def fail(
+            action: str, args: object, timeout: float | None = None
+        ) -> object:
+            plugin.invoke_calls += 1
+            raise PluginError(
+                "DRIVER.ACTION_FAILED",
+                "native action outcome is unknown",
+                details={"dispatched": True},
+                retryable=True,
+            )
+
+        plugin.invoke = fail  # type: ignore[method-assign]
+        step = action_step(
+            effect={"class": "idempotent"},
+            retry={
+                "max_attempts": 3,
+                "on": {"codes": ["DRIVER.ACTION_FAILED"]},
+            },
+        )
+
+        result = run_descriptor(
+            compile_descriptor(workflow(step)), plugins={"fixture": plugin}
+        )
+
+        self.assertEqual(result.status, "unknown_effect")
+        self.assertEqual(result.error.effect, "unknown")
+        self.assertEqual(plugin.invoke_calls, 1)
+
     def test_declared_plugin_unknown_effect_reaches_run_status(self) -> None:
         contract = action_contract(
             effect={"default_class": "non_idempotent"},

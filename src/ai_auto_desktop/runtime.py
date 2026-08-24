@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import fnmatch
 import random
 import re
@@ -390,6 +391,11 @@ class WorkflowRunner:
             except _ReturnFlow: raise
             except AutomationError as error:
                 error.at_step(step.id, step_path=step.path, attempt=attempt, workflow=self.descriptor.name)
+                if (
+                    error.code == "ACTION.UNKNOWN_EFFECT"
+                    or error.effect == "unknown"
+                ):
+                    raise
                 if attempt >= max_attempts or effect not in {"read_only", "idempotent"} or not self._retry_match(retry, error): raise
                 delay = self._retry_delay(retry, attempt); remaining = self._remaining(local_deadline)
                 if remaining is not None and delay >= remaining: raise AutomationError("STEP.TIMEOUT", f"Step {step.id!r} timed out during retry", cause=error) from error
@@ -499,20 +505,86 @@ class WorkflowRunner:
         *,
         contract: Mapping[str, Any] | None = None,
     ) -> Any:
+        action_deadline = (
+            time.monotonic() + timeout if timeout is not None else None
+        )
         uses = step.params["uses"]; capability = uses.rsplit(".", 1)[0]; plugin = self.plugins.get(capability)
         if plugin is None: raise AutomationError("CAPABILITY.MISSING", f"No plugin registered for {capability!r}", details={"uses": uses})
         if contract is None:
             contract = self._action_contract(plugin, capability, uses)
         self._enforce_action_policy(step, plugin, contract)
+        effective_effect = self._effective_action_effect(
+            step, contract=contract
+        )
         pre = step.params.get("precondition")
         if pre and not bool(self._evaluate(thaw(pre["condition"]))): raise AutomationError("ACTION.PRECONDITION_FAILED", pre.get("message", "Action precondition failed"), phase="precondition")
         action_input = self._evaluate(thaw(step.params["with"]))
         self._validate_schema(action_input, contract.get("input_schema"), "ACTION.INPUT_INVALID", uses)
-        try: result = plugin.invoke(uses, action_input, timeout=timeout)
+        post = step.params.get("postcondition")
+        observation_preflight: tuple[
+            ProcessPlugin, str, Mapping[str, Any]
+        ] | None = None
+        if post is not None and post.get("observe") is not None:
+            observation_preflight = self._preflight_observation(step, post)
+        invoke_timeout = self._remaining(action_deadline)
+        if invoke_timeout == 0:
+            raise AutomationError(
+                "ACTION.TIMEOUT",
+                "Action deadline expired before dispatch",
+                category="action",
+                retryable=True,
+                effect="not_applied",
+            )
+        result = self._invoke_contract_action(
+            plugin,
+            uses,
+            action_input,
+            invoke_timeout,
+            contract=contract,
+            effective_effect=effective_effect,
+        )
+        self.context["steps"][step.id] = {"status": "running", "output": result}
+        if post is not None:
+            if post.get("observe") is None:
+                self._postcondition(post)
+            else:
+                try:
+                    self._postcondition(
+                        post, prepared_observation=observation_preflight
+                    )
+                except AutomationError as error:
+                    if effective_effect == "read_only":
+                        raise
+                    raise AutomationError(
+                        "ACTION.UNKNOWN_EFFECT",
+                        "Action outcome could not be verified after dispatch",
+                        category="action",
+                        phase="postcondition",
+                        retryable=False,
+                        effect="unknown",
+                        details={
+                            "cause": error.to_dict(),
+                            "last_observation": error.details.get(
+                                "last_observation"
+                            ),
+                        },
+                        cause=error,
+                    ) from error
+        return result
+
+    def _invoke_contract_action(
+        self,
+        plugin: ProcessPlugin,
+        uses: str,
+        action_input: Any,
+        timeout: float | None,
+        *,
+        contract: Mapping[str, Any],
+        effective_effect: str,
+    ) -> Any:
+        try:
+            result = plugin.invoke(uses, action_input, timeout=timeout)
         except PluginError as exc:
-            declared_effect = thaw(step.params.get("effect", {})).get("class")
-            provider_effect = thaw(contract.get("effect", {})).get("default_class")
-            effective_effect = _max_effect(provider_effect, declared_effect)
             ambiguous = exc.code in {"PLUGIN.HOST_TIMEOUT", "PLUGIN.HOST_EOF", "PLUGIN.HOST_PROTOCOL_ERROR"}
             if exc.dispatched and effective_effect in {"non_idempotent", "contextual"} and ambiguous:
                 raise AutomationError("ACTION.UNKNOWN_EFFECT", "Action outcome is unknown after dispatch", category="action", effect="unknown", details={"plugin_error": exc.to_dict()}, cause=exc) from exc
@@ -553,8 +625,6 @@ class WorkflowRunner:
                 cause=exc,
             ) from exc
         self._validate_schema(result, contract.get("output_schema"), "ACTION.OUTPUT_INVALID", uses)
-        self.context["steps"][step.id] = {"status": "running", "output": result}
-        if step.params.get("postcondition"): self._postcondition(step.params["postcondition"])
         return result
 
     def _action_contract(
@@ -646,7 +716,20 @@ class WorkflowRunner:
         plugin: ProcessPlugin,
         contract: Mapping[str, Any],
     ) -> None:
-        declared = thaw(step.params.get("risk", {}))
+        self._enforce_contract_policy(
+            plugin,
+            contract,
+            declared_risk=thaw(step.params.get("risk", {})),
+        )
+
+    def _enforce_contract_policy(
+        self,
+        plugin: ProcessPlugin,
+        contract: Mapping[str, Any],
+        *,
+        declared_risk: Mapping[str, Any] | None = None,
+    ) -> None:
+        declared = declared_risk or {}
         default = thaw(contract.get("risk", {}))
         risks = [risk for risk in (default, declared) if risk]
         manifest = plugin.manifest if isinstance(plugin.manifest, Mapping) else {}
@@ -729,15 +812,225 @@ class WorkflowRunner:
                 category="policy",
             )
 
-    def _postcondition(self, post: Mapping[str, Any]) -> None:
-        timeout = _duration(post.get("timeout"), 0.0) or 0.0; interval = _duration(post.get("poll_interval"), .1) or .1; deadline = time.monotonic() + timeout
-        parent_remaining = self._remaining()
-        if parent_remaining is not None:
-            deadline = min(deadline, time.monotonic() + parent_remaining)
-        while True:
-            if bool(self._evaluate(thaw(post["condition"]))): return
-            if time.monotonic() >= deadline: raise AutomationError("ACTION.POSTCONDITION_FAILED", post.get("message", "Action postcondition failed"), phase="postcondition")
-            time.sleep(min(interval, max(0, deadline - time.monotonic())))
+    def _preflight_observation(
+        self, step: CompiledStep, post: Mapping[str, Any]
+    ) -> tuple[ProcessPlugin, str, Mapping[str, Any]]:
+        """Validate an observer before the primary action can be dispatched."""
+        observe = thaw(post["observe"])
+        timeout = _duration(post.get("timeout"))
+        deadline = time.monotonic() + timeout if timeout is not None else None
+        if deadline is not None:
+            self._deadline_stack.append(deadline)
+        try:
+            prepared = self._prepare_observation(observe)
+            if not _references_current_step(observe["with"], step.id):
+                _, uses, contract = prepared
+                action_input = self._evaluate(observe["with"])
+                self._validate_schema(
+                    action_input,
+                    contract.get("input_schema"),
+                    "ACTION.INPUT_INVALID",
+                    uses,
+                )
+            return prepared
+        finally:
+            if deadline is not None:
+                self._deadline_stack.pop()
+
+    def _postcondition(
+        self,
+        post: Mapping[str, Any],
+        *,
+        prepared_observation: tuple[
+            ProcessPlugin, str, Mapping[str, Any]
+        ] | None = None,
+    ) -> None:
+        timeout = _duration(post.get("timeout"))
+        interval = _duration(post.get("poll_interval"), .1) or .1
+        started = time.monotonic()
+        deadline = started + timeout if timeout is not None else None
+        observe = post.get("observe")
+        last_observation: Any = MISSING
+        if deadline is not None:
+            self._deadline_stack.append(deadline)
+        try:
+            if observe is not None:
+                if prepared_observation is None:
+                    prepared_observation = self._prepare_observation(
+                        thaw(observe)
+                    )
+            while True:
+                if (
+                    deadline is not None
+                    and
+                    last_observation is not MISSING
+                    and time.monotonic() >= deadline
+                ):
+                    raise AutomationError(
+                        "ACTION.POSTCONDITION_FAILED",
+                        post.get(
+                            "message", "Action postcondition failed"
+                        ),
+                        phase="postcondition",
+                        details={"last_observation": last_observation},
+                    )
+                evaluation_context: Mapping[str, Any] | None = None
+                if observe is not None:
+                    last_observation = self._observe_postcondition(
+                        thaw(observe), prepared=prepared_observation
+                    )
+                    if self._remaining() == 0:
+                        raise AutomationError(
+                            "ACTION.TIMEOUT",
+                            "Postcondition observation exceeded its deadline",
+                            category="action",
+                            phase="postcondition",
+                            effect="not_applied",
+                            details={"last_observation": last_observation},
+                        )
+                    temporary_context = dict(self.context)
+                    temporary_context["observation"] = last_observation
+                    evaluation_context = temporary_context
+                if bool(
+                    self._evaluate(
+                        thaw(post["condition"]), evaluation_context
+                    )
+                ):
+                    return
+                if deadline is None:
+                    details = (
+                        {"last_observation": last_observation}
+                        if observe is not None
+                        else None
+                    )
+                    raise AutomationError(
+                        "ACTION.POSTCONDITION_FAILED",
+                        post.get(
+                            "message", "Action postcondition failed"
+                        ),
+                        phase="postcondition",
+                        details=details,
+                    )
+                remaining = self._remaining()
+                if remaining == 0:
+                    details = (
+                        {"last_observation": last_observation}
+                        if observe is not None
+                        else None
+                    )
+                    raise AutomationError(
+                        "ACTION.POSTCONDITION_FAILED",
+                        post.get(
+                            "message", "Action postcondition failed"
+                        ),
+                        phase="postcondition",
+                        details=details,
+                    )
+                sleep_for = interval
+                if remaining is not None:
+                    sleep_for = min(sleep_for, remaining)
+                if sleep_for:
+                    time.sleep(sleep_for)
+        except AutomationError as error:
+            if observe is not None and "last_observation" not in error.details:
+                error.details["last_observation"] = (
+                    None
+                    if last_observation is MISSING
+                    else last_observation
+                )
+            raise
+        finally:
+            if deadline is not None:
+                self._deadline_stack.pop()
+
+    def _observe_postcondition(
+        self,
+        observe: Mapping[str, Any],
+        *,
+        prepared: tuple[ProcessPlugin, str, Mapping[str, Any]] | None = None,
+    ) -> Any:
+        round_started = time.monotonic()
+        if self._remaining() == 0:
+            raise AutomationError(
+                "ACTION.TIMEOUT",
+                "Postcondition deadline expired before observation",
+                category="action",
+                phase="postcondition",
+                effect="not_applied",
+            )
+        if prepared is None:
+            prepared = self._prepare_observation(observe)
+        plugin, uses, contract = prepared
+        action_input = self._evaluate(thaw(observe["with"]))
+        self._validate_schema(
+            action_input,
+            contract.get("input_schema"),
+            "ACTION.INPUT_INVALID",
+            uses,
+        )
+        action_deadline: float | None = None
+        manifest_timeout = _duration(contract.get("timeout"))
+        if manifest_timeout is not None:
+            action_deadline = round_started + manifest_timeout
+        invoke_timeout = self._remaining(action_deadline)
+        if invoke_timeout == 0:
+            raise AutomationError(
+                "ACTION.TIMEOUT",
+                "Observation deadline expired before dispatch",
+                category="action",
+                phase="postcondition",
+                retryable=True,
+                effect="not_applied",
+            )
+        return self._invoke_contract_action(
+            plugin,
+            uses,
+            action_input,
+            invoke_timeout,
+            contract=contract,
+            effective_effect="read_only",
+        )
+
+    def _prepare_observation(
+        self, observe: Mapping[str, Any]
+    ) -> tuple[ProcessPlugin, str, Mapping[str, Any]]:
+        uses = observe["uses"]
+        capability = uses.rsplit(".", 1)[0]
+        plugin = self.plugins.get(capability)
+        if plugin is None:
+            raise AutomationError(
+                "CAPABILITY.MISSING",
+                f"No plugin registered for {capability!r}",
+                details={"uses": uses},
+            )
+        contract = self._action_contract(plugin, capability, uses)
+        provider_effect = thaw(contract.get("effect", {})).get(
+            "default_class"
+        )
+        if provider_effect != "read_only":
+            raise AutomationError(
+                "POLICY.DENIED",
+                "Postcondition observation action must be read-only",
+                category="policy",
+                phase="postcondition",
+                details={"uses": uses, "effect": provider_effect},
+            )
+        unsafe_errors = [
+            item.get("code")
+            for item in contract.get("errors", ())
+            if isinstance(item, Mapping)
+            and item.get("effect") != "not_applied"
+        ]
+        if unsafe_errors:
+            raise AutomationError(
+                "POLICY.DENIED",
+                "Postcondition observation errors must be not_applied",
+                category="policy",
+                phase="postcondition",
+                details={"uses": uses, "unsafe_errors": unsafe_errors},
+            )
+        self._enforce_contract_policy(plugin, contract)
+        return plugin, uses, contract
 
     def _script(self, step: CompiledStep, timeout: float | None) -> Any:
         if not self.allow_scripts: raise AutomationError("SCRIPT.SANDBOX_DENIED", "Scripts are disabled; pass --allow-scripts", category="script")
@@ -769,6 +1062,67 @@ class WorkflowRunner:
 
 def _duration(value: Any, default: float | None = None) -> float | None:
     return parse_duration(value, default)
+
+
+def _references_current_step(value: Any, step_id: str) -> bool:
+    """Return whether a template may read the current step's live state."""
+    if isinstance(value, Mapping):
+        return any(
+            _references_current_step(item, step_id)
+            for item in value.values()
+        )
+    if isinstance(value, (list, tuple)):
+        return any(_references_current_step(item, step_id) for item in value)
+    if not isinstance(value, str):
+        return False
+    for match in _TEMPLATE.finditer(value):
+        try:
+            tree = ast.parse(match.group(1).strip(), mode="eval")
+        except (SyntaxError, ValueError, RecursionError):
+            # The compiler reports malformed expressions.  Conservatively
+            # defer here so this helper never turns analysis into execution.
+            return True
+        parents = {
+            child: parent
+            for parent in ast.walk(tree)
+            for child in ast.iter_child_nodes(parent)
+        }
+        for node in ast.walk(tree):
+            parent = parents.get(node)
+            if (
+                isinstance(parent, (ast.Attribute, ast.Subscript))
+                and parent.value is node
+            ):
+                # Only inspect the outermost access chain.  Otherwise every
+                # ``steps.previous...`` also contains a nested bare ``steps``
+                # Name and would be misclassified as current-step dependent.
+                continue
+            path = _expression_access_path(node)
+            if not path or path[0] != "steps":
+                continue
+            if len(path) < 2 or path[1] is None or path[1] == step_id:
+                return True
+    return False
+
+
+def _expression_access_path(node: ast.AST) -> list[str | None] | None:
+    if isinstance(node, ast.Name):
+        return [node.id]
+    if isinstance(node, ast.Attribute):
+        parent = _expression_access_path(node.value)
+        return None if parent is None else [*parent, node.attr]
+    if isinstance(node, ast.Subscript):
+        parent = _expression_access_path(node.value)
+        if parent is None:
+            return None
+        key = (
+            node.slice.value
+            if isinstance(node.slice, ast.Constant)
+            and isinstance(node.slice.value, str)
+            else None
+        )
+        return [*parent, key]
+    return None
 
 
 def _max_effect(provider: Any, declared: Any) -> str:
