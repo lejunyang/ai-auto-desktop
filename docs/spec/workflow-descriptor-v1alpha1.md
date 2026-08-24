@@ -40,7 +40,7 @@ OCR 必须是显式 `action`，例如 `fixture.ocr@1` 或当前 Tesseract provid
 
 Duration 是不含空格的正整数加 `ms`、`s`、`m` 或 `h`。所有 timeout 都转换为基于 monotonic clock 的绝对 deadline；子作用域有效 deadline 是自身 deadline 与所有父级剩余 deadline 的最小值。
 
-表达式使用完整字符串 `${{ ... }}`。它是只读、确定性、无副作用 DSL，只能访问 `inputs`、`vars`、`steps`、当前控制流绑定和错误处理器绑定；不得访问文件、网络、环境变量、时钟、随机源或 secret。字符串插值不等于表达式，尤其不得把表达式拼进 script source。
+表达式使用完整字符串 `${{ ... }}`。它是只读、确定性、无副作用 DSL，只能访问 `inputs`、`vars`、`steps`、当前控制流绑定、错误处理器绑定，以及 `postcondition.observe` 条件作用域内的 `observation`；不得访问文件、网络、环境变量、时钟、随机源或 secret。字符串插值不等于表达式，尤其不得把表达式拼进 script source。
 
 ## 4. 通用步骤字段
 
@@ -73,14 +73,19 @@ step 路径由嵌套 `id` 构成；`foreach` 运行记录还必须带 index。�
     category: observe
     level: low
   postcondition:
-    condition: "${{ steps.read_text.output.confidence >= 0 }}"
+    observe:
+      uses: fixture.ocr@1
+      with:
+        text: Retry
+        language: en
+    condition: "${{ observation.confidence >= 0 }}"
     timeout: 2s
     poll_interval: 100ms
 ```
 
 `with` 必须通过已解析 action 的 `input_schema`，输出必须通过 `output_schema`。`effect.class` 是 `read_only`、`idempotent`、`non_idempotent` 或 `contextual`。`risk` 必须是对象：`category` 为 `observe|navigate|input|modify|send|delete|purchase|authorize|install|execute_script|capture_screen|custom`，`level` 为 `low|medium|high|critical|contextual`。
 
-Manifest 给出默认 effect/risk；descriptor、driver 动态判断和宿主策略都只能提高，不能降低有效等级。`precondition` 在执行前求值；`postcondition` 可在限定 timeout 内轮询。桌面动作必须完成 `observe → resolve → precondition → policy/confirm → execute → re-observe → postcondition` 闭环；每次 attempt 必须重新解析 locator，不得跨 snapshot 使用 `node_id`。
+Manifest 给出默认 effect/risk；descriptor、driver 动态判断和宿主策略都只能提高，不能降低有效等级。`precondition` 在执行前求值，且不得声明 `observe`。`postcondition` 可选声明专用观察动作 `observe: {uses, with}`：`uses` 必须是 canonical action ID，`with` 必须是对象；每次检查条件前执行该动作，并将其输出以 `observation` 暴露给 `condition`。`observe` 是闭合对象，不允许 `effect`、`risk`、`retry`、`on_error` 或其他字段。`postcondition` 可在限定 timeout 内轮询；存在 `observe` 时，每次轮询都必须重新执行观察动作。桌面动作必须完成 `observe → resolve → precondition → policy/confirm → execute → re-observe → postcondition` 闭环；每次 attempt 必须重新解析 locator，不得跨 snapshot 使用 `node_id`。
 
 ### 5.2 `script`
 

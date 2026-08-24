@@ -88,6 +88,11 @@
       "pattern": "^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$",
       "maxLength": 192
     },
+    "actionId": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*\\.[a-z][a-z0-9_]*@[1-9][0-9]*$",
+      "maxLength": 256
+    },
     "semver": {
       "type": "string",
       "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(?:-[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?(?:\\+[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?$"
@@ -724,9 +729,7 @@
               "const": "action"
             },
             "uses": {
-              "type": "string",
-              "pattern": "^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*\\.[a-z][a-z0-9_]*@[1-9][0-9]*$",
-              "maxLength": 256
+              "$ref": "#/$defs/actionId"
             },
             "with": {
               "type": "object"
@@ -777,11 +780,30 @@
           "type": "string",
           "maxLength": 2048
         },
+        "observe": {
+          "$ref": "#/$defs/postconditionObservation"
+        },
         "timeout": {
           "$ref": "#/$defs/duration"
         },
         "poll_interval": {
           "$ref": "#/$defs/duration"
+        }
+      },
+      "additionalProperties": false
+    },
+    "postconditionObservation": {
+      "type": "object",
+      "required": [
+        "uses",
+        "with"
+      ],
+      "properties": {
+        "uses": {
+          "$ref": "#/$defs/actionId"
+        },
+        "with": {
+          "type": "object"
         }
       },
       "additionalProperties": false

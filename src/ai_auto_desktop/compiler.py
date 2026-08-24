@@ -30,7 +30,9 @@ MAX_DESCRIPTOR_BYTES = 2 * 1024 * 1024
 _STEP_ID = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _NAME = re.compile(r"^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$")
 _IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")
-_USES = re.compile(r"^[a-z][a-z0-9_.-]*\.[a-z][a-z0-9_-]*@[1-9][0-9]*$")
+_USES = re.compile(
+    r"^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*\.[a-z][a-z0-9_]*@[1-9][0-9]*$"
+)
 _DURATION = re.compile(r"^(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:ms|s|m|h)$")
 _EXPRESSION = re.compile(r"^\$\{\{(.*?)\}\}$", re.DOTALL)
 _TOP = {"apiVersion", "kind", "metadata", "requires", "inputs", "variables", "outputs", "defaults", "budgets", "policy", "steps", "on_error", "finally", "extensions"}
@@ -259,12 +261,25 @@ class _Compiler:
             if risk.get("category") == "custom" and not isinstance(risk.get("custom_name"), str): self.issue(f"{path}.custom_name", "required for custom risk", "required")
             if risk.get("category") != "custom" and "custom_name" in risk: self.issue(f"{path}.custom_name", "only valid for custom risk", "policy")
 
+    def observation(self, value: Any, path: str) -> None:
+        obj = self.obj(value, path)
+        if obj is None: return
+        self.unknown(obj, {"uses", "with"}, path); self.required(obj, ["uses", "with"], path)
+        if not isinstance(obj.get("uses"), str) or not _USES.fullmatch(obj.get("uses", "")):
+            self.issue(f"{path}.uses", "must match capability.action@major", "format")
+        if "with" in obj:
+            if not isinstance(obj["with"], Mapping): self.issue(f"{path}.with", "must be an object", "type")
+            self.values(obj["with"], f"{path}.with")
+
     def assertion(self, value: Any, path: str, post: bool) -> None:
         obj = self.obj(value, path)
         if obj is None: return
-        self.unknown(obj, {"condition", "message", "timeout", "poll_interval"}, path); self.required(obj, ["condition"], path)
+        allowed = {"condition", "message", "timeout", "poll_interval"}
+        if post: allowed.add("observe")
+        self.unknown(obj, allowed, path); self.required(obj, ["condition"], path)
         if "condition" in obj: self.expression(obj["condition"], f"{path}.condition")
         if "message" in obj and not isinstance(obj["message"], str): self.issue(f"{path}.message", "must be a string", "type")
+        if post and "observe" in obj: self.observation(obj["observe"], f"{path}.observe")
         for key in ("timeout", "poll_interval"):
             if key in obj:
                 if not post: self.issue(f"{path}.{key}", "preconditions cannot poll", "unsupported")
