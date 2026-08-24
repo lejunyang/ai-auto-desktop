@@ -1,0 +1,151 @@
+{
+  "apiVersion": "ai-auto-desktop.dev/v1alpha1",
+  "kind": "Workflow",
+  "metadata": {
+    "name": "ocr-explicit-image-response",
+    "version": "1.0.0",
+    "description": "读取调用方显式提供的图片，仅在高置信度字面匹配时返回响应决策。",
+    "annotations": {
+      "ai-auto-desktop.dev/durable-eligibility": "denied-sensitive-ocr"
+    }
+  },
+  "requires": {
+    "runtime": ">=0.1.0",
+    "permissions": ["filesystem.read"],
+    "capabilities": [
+      {
+        "name": "vision.ocr",
+        "version": "^0.1.0",
+        "actions": ["recognize"]
+      }
+    ]
+  },
+  "inputs": {
+    "image_path": {
+      "schema": {
+        "type": "string",
+        "minLength": 1,
+        "description": "调用方显式选择的现有图片绝对路径。"
+      },
+      "required": true,
+      "sensitive": true
+    },
+    "target_text": {
+      "schema": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 1024,
+        "description": "必须识别到的区分大小写字面文本。"
+      },
+      "required": true,
+      "sensitive": true
+    },
+    "languages": {
+      "schema": {
+        "type": "array",
+        "minItems": 1,
+        "maxItems": 32,
+        "uniqueItems": true,
+        "items": {"type": "string", "pattern": "^[A-Za-z0-9_]+$"},
+        "description": "已安装的 Tesseract 语言 ID，例如 eng 或 chi_sim 加 eng。"
+      },
+      "default": ["eng"]
+    },
+    "minimum_confidence": {
+      "schema": {
+        "type": "number",
+        "minimum": 0,
+        "maximum": 1,
+        "description": "返回响应决策所需的最低整体及匹配单词置信度。"
+      },
+      "default": 0.85
+    }
+  },
+  "variables": {
+    "no_text_seen": {
+      "schema": {"type": "boolean"},
+      "mutable": true,
+      "initial": false
+    }
+  },
+  "budgets": {
+    "max_duration": "30s",
+    "max_executed_steps": 3,
+    "cleanup_timeout": "1s"
+  },
+  "policy": {
+    "allowed_risk": {"categories": ["observe"], "max_level": "low"},
+    "untrusted_inputs": {
+      "ocr_text": "tainted",
+      "allow_in_control_flow": true
+    }
+  },
+  "steps": [
+    {
+      "id": "recognize_image",
+      "type": "action",
+      "description": "仅识别显式图片路径；此步骤不会捕获桌面。",
+      "uses": "vision.ocr.recognize@1",
+      "with": {
+        "image": {"path": "${{ inputs.image_path }}"},
+        "languages": "${{ inputs.languages }}",
+        "patterns": [
+          {"id": "requested_content", "value": "${{ inputs.target_text }}"}
+        ]
+      },
+      "effect": {"class": "read_only"},
+      "risk": {"category": "observe", "level": "low"},
+      "timeout": "20s",
+      "retry": {"max_attempts": 1}
+    },
+    {
+      "id": "decide_response",
+      "type": "if",
+      "description": "同时要求字面匹配、整体置信度和匹配单词置信度达标。",
+      "condition": "${{ steps.recognize_image.output.matches != [] and steps.recognize_image.output.confidence >= inputs.minimum_confidence and steps.recognize_image.output.matches[0].confidence >= inputs.minimum_confidence }}",
+      "then": [
+        {
+          "id": "respond_to_match",
+          "type": "return",
+          "value": {
+            "decision": "respond",
+            "pattern_id": "${{ steps.recognize_image.output.matches[0].pattern_id }}",
+            "matched_text": "${{ steps.recognize_image.output.matches[0].text }}",
+            "match_confidence": "${{ steps.recognize_image.output.matches[0].confidence }}",
+            "ocr_confidence": "${{ steps.recognize_image.output.confidence }}",
+            "source_digest": "${{ steps.recognize_image.output.source.digest }}"
+          }
+        }
+      ],
+      "else": [
+        {
+          "id": "do_not_respond",
+          "type": "return",
+          "value": {
+            "decision": "no_response",
+            "reason": "target_not_confirmed",
+            "pattern_found": "${{ steps.recognize_image.output.matches != [] }}",
+            "ocr_confidence": "${{ steps.recognize_image.output.confidence }}"
+          }
+        }
+      ]
+    }
+  ],
+  "on_error": {
+    "match": {"codes": ["OCR.NO_TEXT"]},
+    "steps": [
+      {
+        "id": "record_no_text",
+        "type": "set",
+        "assign": {"vars.no_text_seen": true}
+      }
+    ],
+    "outcome": {
+      "mode": "return",
+      "output": {
+        "decision": "no_response",
+        "reason": "no_text_recognized"
+      }
+    }
+  }
+}

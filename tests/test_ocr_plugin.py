@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+from copy import deepcopy
 import hashlib
 import importlib.util
 import json
@@ -15,11 +16,24 @@ import time
 import unittest
 from unittest import mock
 
+import jsonschema
+from PIL import Image
+
+from ai_auto_desktop.compiler import load_descriptor
+from ai_auto_desktop.journal import (
+    SensitiveDataError,
+    assert_durable_descriptor_eligible,
+)
 from ai_auto_desktop.plugin import PluginError, ProcessPlugin
+from ai_auto_desktop.runtime import WorkflowRunner
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 OCR_PLUGIN = PROJECT_ROOT / "plugins" / "ocr_tesseract" / "ocr_tesseract_plugin.py"
+EXPLICIT_WORKFLOW = (
+    PROJECT_ROOT / "examples" / "workflows" / "ocr-explicit-image-response.yaml"
+)
+EXPLICIT_WORKFLOW_JSON = EXPLICIT_WORKFLOW.with_suffix(".json")
 PNG_1X1 = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
 )
@@ -75,6 +89,20 @@ class TesseractPluginTests(unittest.TestCase):
                         hashlib.sha256(Path(sys.argv[1]).read_bytes()).hexdigest(),
                         encoding="ascii",
                     )
+                rlimit_log = os.environ.get("FAKE_TESSERACT_RLIMIT_LOG")
+                if rlimit_log:
+                    import json
+                    import resource
+                    Path(rlimit_log).write_text(
+                        json.dumps({
+                            name: list(resource.getrlimit(getattr(resource, name)))
+                            for name in (
+                                "RLIMIT_AS", "RLIMIT_CPU", "RLIMIT_FSIZE",
+                                "RLIMIT_NOFILE", "RLIMIT_NPROC",
+                            )
+                        }),
+                        encoding="utf-8",
+                    )
                 code = int(os.environ.get("FAKE_TESSERACT_EXIT", "0"))
                 if code:
                     print("synthetic engine failure", file=sys.stderr)
@@ -124,6 +152,29 @@ class TesseractPluginTests(unittest.TestCase):
         self.addCleanup(plugin.close)
         return plugin
 
+    def run_explicit_workflow(
+        self,
+        *,
+        target_text: str,
+        minimum_confidence: float,
+        languages: list[str] | None = None,
+        tsv: str = TSV,
+    ):
+        plugin = self.make_plugin(env_updates={"FAKE_TESSERACT_TSV": tsv})
+        runner = WorkflowRunner(
+            load_descriptor(EXPLICIT_WORKFLOW),
+            plugins={"vision.ocr": plugin},
+            granted_permissions=["filesystem.read"],
+        )
+        return runner.run(
+            {
+                "image_path": str(self.image.resolve()),
+                "target_text": target_text,
+                "languages": languages or ["eng"],
+                "minimum_confidence": minimum_confidence,
+            }
+        )
+
     def test_manifest_declares_explicit_read_only_recognize_contract(self) -> None:
         manifest = self.make_plugin().start()
 
@@ -135,9 +186,64 @@ class TesseractPluginTests(unittest.TestCase):
         self.assertEqual(contract["risk"], {"category": "observe", "level": "low"})
         self.assertEqual(manifest["permissions"], ["filesystem.read"])
         self.assertIn("OCR.ENGINE_UNAVAILABLE", {item["code"] for item in contract["errors"]})
+        output_schema = contract["output_schema"]
+        jsonschema.Draft202012Validator.check_schema(output_schema)
+        source = output_schema["properties"]["source"]
+        line = output_schema["properties"]["lines"]["items"]
+        match = output_schema["properties"]["matches"]["items"]
+        self.assertEqual(
+            set(source["required"]),
+            {"kind", "path", "digest", "media_type", "size_bytes"},
+        )
+        self.assertEqual(set(line["required"]), {"text", "confidence", "bounds"})
+        self.assertEqual(
+            set(match["required"]),
+            {"pattern_id", "text", "span", "bounds", "confidence"},
+        )
+        self.assertFalse(source["additionalProperties"])
+        self.assertFalse(line["additionalProperties"])
+        self.assertFalse(match["additionalProperties"])
+
+    def test_explicit_workflow_examples_are_equivalent_and_return_only(self) -> None:
+        yaml_workflow = load_descriptor(EXPLICIT_WORKFLOW)
+        json_workflow = load_descriptor(EXPLICIT_WORKFLOW_JSON)
+
+        self.assertEqual(yaml_workflow.raw, json_workflow.raw)
+        self.assertEqual(
+            yaml_workflow.requires["permissions"], ("filesystem.read",)
+        )
+        actions = [
+            step for step in yaml_workflow.all_steps() if step.type == "action"
+        ]
+        self.assertEqual(len(actions), 1)
+        self.assertEqual(actions[0].params["uses"], "vision.ocr.recognize@1")
+        self.assertEqual(
+            actions[0].params["with"]["image"]["path"],
+            "${{ inputs.image_path }}",
+        )
+        self.assertEqual(
+            {"respond_to_match", "do_not_respond"},
+            {
+                step.id
+                for step in yaml_workflow.all_steps()
+                if step.type == "return"
+            },
+        )
+        self.assertTrue(yaml_workflow.inputs["image_path"]["sensitive"])
+        self.assertTrue(yaml_workflow.inputs["target_text"]["sensitive"])
+        self.assertEqual(
+            yaml_workflow.metadata["annotations"][
+                "ai-auto-desktop.dev/durable-eligibility"
+            ],
+            "denied-sensitive-ocr",
+        )
+        with self.assertRaises(SensitiveDataError):
+            assert_durable_descriptor_eligible(yaml_workflow)
 
     def test_recognizes_tsv_lines_matches_confidence_and_source(self) -> None:
-        result = self.make_plugin().invoke(
+        plugin = self.make_plugin()
+        manifest = plugin.start()
+        result = plugin.invoke(
             "vision.ocr.recognize@1",
             {
                 "artifact": {"path": str(self.image), "media_type": "image/png"},
@@ -159,7 +265,9 @@ class TesseractPluginTests(unittest.TestCase):
         self.assertEqual(result["matches"][0]["pattern_id"], "invoice_id")
         self.assertEqual(result["matches"][0]["text"], "A-42")
         self.assertEqual(result["matches"][0]["bounds"], {"x": 55, "y": 20, "width": 50, "height": 12})
-        engine_args = (self.directory / "engine.log").read_text(encoding="utf-8").splitlines()
+        engine_args = (self.directory / "engine.log").read_text(
+            encoding="utf-8"
+        ).splitlines()
         self.assertNotEqual(engine_args[0], str(self.image.resolve()))
         self.assertIn("aad-ocr-", engine_args[0])
         self.assertEqual(engine_args[1:4], ["stdout", "-l", "eng+deu"])
@@ -168,6 +276,78 @@ class TesseractPluginTests(unittest.TestCase):
             (self.directory / "digest.log").read_text(encoding="ascii"),
             result["source"]["digest"].removeprefix("sha256:"),
         )
+        schema = manifest["actions"]["recognize"]["output_schema"]
+        jsonschema.Draft202012Validator(schema).validate(result)
+        for field in ("source", "lines", "matches"):
+            malformed = deepcopy(result)
+            nested = malformed[field] if field == "source" else malformed[field][0]
+            nested["unexpected"] = True
+            with self.subTest(field=field), self.assertRaises(
+                jsonschema.ValidationError
+            ):
+                jsonschema.Draft202012Validator(schema).validate(malformed)
+
+    def test_real_provider_workflow_match_drives_response_branch(self) -> None:
+        matched = self.run_explicit_workflow(
+            target_text="A-42",
+            minimum_confidence=0.80,
+            languages=["eng", "chi_sim"],
+        )
+
+        self.assertTrue(matched.ok, matched.to_dict())
+        self.assertEqual(matched.output["decision"], "respond")
+        self.assertEqual(matched.output["matched_text"], "A-42")
+        self.assertGreaterEqual(matched.output["match_confidence"], 0.80)
+        self.assertEqual(
+            matched.steps["recognize_image"]["output"]["source"]["path"],
+            str(self.image.resolve()),
+        )
+        self.assertEqual(matched.steps["respond_to_match"]["status"], "succeeded")
+        self.assertNotIn("do_not_respond", matched.steps)
+        engine_args = (self.directory / "engine.log").read_text(encoding="utf-8").splitlines()
+        self.assertEqual(engine_args[1:4], ["stdout", "-l", "eng+chi_sim"])
+
+    def test_real_provider_workflow_low_confidence_does_not_respond(self) -> None:
+        low_confidence = self.run_explicit_workflow(
+            target_text="A-42", minimum_confidence=0.86
+        )
+
+        self.assertTrue(low_confidence.ok, low_confidence.to_dict())
+        self.assertEqual(low_confidence.output["decision"], "no_response")
+        self.assertTrue(low_confidence.output["pattern_found"])
+        recognition = low_confidence.steps["recognize_image"]["output"]
+        self.assertGreaterEqual(recognition["confidence"], 0.86)
+        self.assertLess(recognition["matches"][0]["confidence"], 0.86)
+        self.assertNotIn("respond_to_match", low_confidence.steps)
+        self.assertEqual(
+            low_confidence.steps["do_not_respond"]["status"], "succeeded"
+        )
+
+    def test_real_provider_workflow_no_match_does_not_respond(self) -> None:
+        no_match = self.run_explicit_workflow(
+            target_text="Approve payment", minimum_confidence=0.80
+        )
+
+        self.assertTrue(no_match.ok, no_match.to_dict())
+        self.assertEqual(no_match.output["decision"], "no_response")
+        self.assertFalse(no_match.output["pattern_found"])
+        self.assertNotIn("respond_to_match", no_match.steps)
+        self.assertEqual(no_match.steps["do_not_respond"]["status"], "succeeded")
+
+    def test_real_provider_workflow_no_text_explicitly_returns_no_response(self) -> None:
+        no_text = self.run_explicit_workflow(
+            target_text="A-42",
+            minimum_confidence=0.80,
+            tsv=TSV.splitlines()[0] + "\n",
+        )
+
+        self.assertTrue(no_text.ok, no_text.to_dict())
+        self.assertEqual(
+            no_text.output,
+            {"decision": "no_response", "reason": "no_text_recognized"},
+        )
+        self.assertEqual(no_text.steps["record_no_text"]["status"], "succeeded")
+        self.assertEqual(no_text.steps["recognize_image"]["status"], "failed")
 
     def test_missing_tesseract_is_a_structured_engine_unavailable_error(self) -> None:
         missing = str(self.directory / "missing-tesseract")
@@ -215,6 +395,94 @@ class TesseractPluginTests(unittest.TestCase):
             )
         self.assertEqual(raised.exception.code, "OCR.INVALID_REQUEST")
         self.assertEqual(raised.exception.details["index"], 0)
+
+    def test_duplicate_pattern_ids_and_nul_are_rejected_before_engine(self) -> None:
+        cases = {
+            "duplicate": [
+                {"id": "same", "value": "A"},
+                {"id": "same", "value": "B"},
+            ],
+            "id_nul": [{"id": "bad\x00id", "value": "A"}],
+            "value_nul": [{"id": "bad", "value": "A\x00B"}],
+        }
+        for name, patterns in cases.items():
+            with self.subTest(name=name), self.assertRaises(PluginError) as raised:
+                self.make_plugin().invoke(
+                    "vision.ocr.recognize@1",
+                    {"image": {"path": str(self.image)}, "patterns": patterns},
+                )
+            self.assertEqual(raised.exception.code, "OCR.INVALID_REQUEST")
+        self.assertFalse((self.directory / "engine.log").exists())
+
+    def test_out_of_bounds_region_is_rejected_before_engine(self) -> None:
+        with self.assertRaises(PluginError) as raised:
+            self.make_plugin().invoke(
+                "vision.ocr.recognize@1",
+                {
+                    "image": {"path": str(self.image)},
+                    "region": {"x": 1, "y": 0, "width": 1, "height": 1},
+                },
+            )
+
+        self.assertEqual(raised.exception.code, "OCR.INVALID_REQUEST")
+        self.assertEqual(raised.exception.details["image_width"], 1)
+        self.assertFalse((self.directory / "engine.log").exists())
+
+    def test_no_text_is_a_structured_provider_error(self) -> None:
+        with self.assertRaises(PluginError) as raised:
+            self.make_plugin(
+                env_updates={"FAKE_TESSERACT_TSV": TSV.splitlines()[0] + "\n"}
+            ).invoke(
+                "vision.ocr.recognize@1", {"image": {"path": str(self.image)}}
+            )
+
+        self.assertEqual(raised.exception.code, "OCR.NO_TEXT")
+        self.assertFalse(raised.exception.retryable)
+
+    def test_pixel_limit_and_decode_bomb_are_structured_before_engine(self) -> None:
+        oversized = self.directory / "oversized.png"
+        raw = bytearray(PNG_1X1)
+        raw[16:20] = (20_001).to_bytes(4, "big")
+        raw[20:24] = (20_001).to_bytes(4, "big")
+        oversized.write_bytes(raw)
+        with self.assertRaises(PluginError) as raised:
+            self.make_plugin().invoke(
+                "vision.ocr.recognize@1", {"image": {"path": str(oversized)}}
+            )
+        self.assertEqual(raised.exception.code, "OCR.IMAGE_LIMIT_EXCEEDED")
+        self.assertEqual(raised.exception.details["phase"], "file_header")
+        self.assertFalse((self.directory / "engine.log").exists())
+
+        module = load_ocr_module()
+        with mock.patch.object(Image, "MAX_IMAGE_PIXELS", 0):
+            with self.assertRaises(module.RequestError) as bomb:
+                module._validate_decoded_image(
+                    self.image, "image/png", time.monotonic() + 1
+                )
+        self.assertEqual(bomb.exception.code, "OCR.IMAGE_LIMIT_EXCEEDED")
+        self.assertEqual(bomb.exception.data["reason"], "DecompressionBombError")
+
+    def test_supported_format_headers_expose_dimensions_when_available(self) -> None:
+        module = load_ocr_module()
+        formats = (
+            ("PNG", "png"),
+            ("JPEG", "jpg"),
+            ("GIF", "gif"),
+            ("TIFF", "tiff"),
+            ("BMP", "bmp"),
+            ("WEBP", "webp"),
+            ("PPM", "ppm"),
+        )
+        for image_format, extension in formats:
+            path = self.directory / f"header.{extension}"
+            Image.new("RGB", (321, 123)).save(path, image_format)
+            payload = path.read_bytes()
+            detected = module._media_type(payload[:4096], payload[-16:], len(payload))
+            with self.subTest(image_format=image_format):
+                self.assertIsNotNone(detected)
+                self.assertEqual(
+                    module._header_dimensions(detected, payload[:4096]), (321, 123)
+                )
 
     def test_private_snapshot_survives_source_replacement(self) -> None:
         replacement = self.directory / "replacement.png"
@@ -306,6 +574,75 @@ class TesseractPluginTests(unittest.TestCase):
         self.assertNotIn("AWS_SECRET_ACCESS_KEY", environment)
         self.assertEqual(environment["TESSDATA_PREFIX"], "/trusted/tessdata")
         self.assertEqual(environment["FAKE_TESSERACT_TSV"], "fixture")
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "Linux prlimit contract")
+    def test_linux_engine_launch_has_resource_limits_and_fails_closed(self) -> None:
+        module = load_ocr_module()
+        prefix = module._linux_prlimit_prefix(time.monotonic() + 5)
+        self.assertTrue(prefix[0].endswith("prlimit"))
+        self.assertTrue(any(item.startswith("--as=") for item in prefix))
+        self.assertTrue(any(item.startswith("--cpu=") for item in prefix))
+        self.assertTrue(any(item.startswith("--fsize=") for item in prefix))
+        self.assertTrue(any(item.startswith("--nofile=") for item in prefix))
+        self.assertTrue(any(item.startswith("--nproc=") for item in prefix))
+        self.assertEqual(prefix[-1], "--")
+
+        with mock.patch.object(module.shutil, "which", return_value=None):
+            with self.assertRaises(module.RequestError) as raised:
+                module._linux_prlimit_prefix(time.monotonic() + 5)
+        self.assertEqual(raised.exception.code, "OCR.ENGINE_ISOLATION_UNAVAILABLE")
+
+        log = self.directory / "rlimits.json"
+        self.make_plugin(
+            env_updates={"FAKE_TESSERACT_RLIMIT_LOG": str(log)}
+        ).invoke(
+            "vision.ocr.recognize@1", {"image": {"path": str(self.image)}}
+        )
+        applied = json.loads(log.read_text(encoding="utf-8"))
+        self.assertEqual(applied["RLIMIT_AS"], [2 * 1024**3, 2 * 1024**3])
+        self.assertEqual(applied["RLIMIT_FSIZE"], [16 * 1024**2, 16 * 1024**2])
+        self.assertEqual(applied["RLIMIT_NOFILE"], [64, 64])
+        self.assertEqual(applied["RLIMIT_NPROC"], [512, 512])
+        self.assertGreaterEqual(applied["RLIMIT_CPU"][0], 1)
+        self.assertLessEqual(applied["RLIMIT_CPU"][0], 30)
+
+    def test_non_linux_engine_isolation_requires_explicit_operator_override(self) -> None:
+        module = load_ocr_module()
+        with (
+            mock.patch.object(module.sys, "platform", "darwin"),
+            mock.patch.dict(module.os.environ, {}, clear=True),
+            self.assertRaises(module.RequestError) as raised,
+        ):
+            module._linux_prlimit_prefix(time.monotonic() + 5)
+        self.assertEqual(raised.exception.code, "OCR.ENGINE_ISOLATION_UNAVAILABLE")
+        self.assertEqual(
+            raised.exception.data["operator_override"],
+            "OCR_ALLOW_UNSANDBOXED_ENGINE",
+        )
+        with (
+            mock.patch.object(module.sys, "platform", "win32"),
+            mock.patch.dict(
+                module.os.environ, {"OCR_ALLOW_UNSANDBOXED_ENGINE": "1"}, clear=True
+            ),
+        ):
+            self.assertEqual(module._linux_prlimit_prefix(time.monotonic() + 5), [])
+
+    def test_readme_documents_limits_isolation_and_durable_boundary(self) -> None:
+        readme = OCR_PLUGIN.with_name("README.md").read_text(encoding="utf-8")
+        spec = (
+            PROJECT_ROOT / "docs/spec/workflow-descriptor-v1alpha1.md"
+        ).read_text(encoding="utf-8")
+        for marker in (
+            "40,000,000",
+            "OCR.IMAGE_LIMIT_EXCEEDED",
+            "prlimit",
+            "不是完整沙箱",
+            "OCR_ALLOW_UNSANDBOXED_ENGINE=1",
+            "sensitive: true",
+            "OCR.NO_TEXT",
+        ):
+            self.assertIn(marker, readme)
+        self.assertIn("durable start 必须在创建 run 前拒绝", spec)
 
 
 if __name__ == "__main__":

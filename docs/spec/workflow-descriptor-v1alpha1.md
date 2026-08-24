@@ -206,4 +206,10 @@ Manifest 使用相同 `apiVersion`，`kind: CapabilityManifest`，并包含：
 
 ## 10. 示例
 
-`examples/workflows/ocr-error-response.json` 是 canonical JSON 数据模型，`ocr-error-response.yaml` 是等价 authoring 形式。它显式调用 fixture OCR，再根据 OCR 输出的置信度分支：低于阈值时由 workflow 产生 `OCR.LOW_CONFIDENCE`，达到阈值时才调用声明好的按钮动作。该示例使用 fixture 以保持确定性；真实 `vision.ocr` provider 位于 `plugins/ocr_tesseract`，同样不包含隐式截图或坐标点击。
+`examples/workflows/ocr-error-response.json` 是 fixture 控制流示例的 canonical JSON 数据模型，`ocr-error-response.yaml` 是等价 authoring 形式。它显式调用 fixture OCR，再根据 OCR 输出的置信度分支：低于阈值时由 workflow 产生 `OCR.LOW_CONFIDENCE`，达到阈值时才调用声明好的 fixture 按钮动作。
+
+`examples/workflows/ocr-explicit-image-response.json` 与等价 YAML 则调用真实的 `vision.ocr.recognize@1` 进程 provider。调用方必须显式传入现有图片的绝对路径、目标字面文本、Tesseract 语言 ID 和响应置信度；只有 `matches` 非空且整体与匹配置信度均达标时才返回 `decision: respond`。低置信度与无命中都返回 `decision: no_response`，不执行响应分支。该示例不请求截图、不读取桌面、不调用 pointer，也不把 OCR bounds 自动转换为坐标点击。桌面 capture/frame provenance 和 pointer/语义动作是后续独立能力；加入后仍须作为显式 capability/action 接受权限、风险、歧义和 postcondition 检查。
+
+真实 provider 对“没有识别到任何文本”返回不可重试的 `OCR.NO_TEXT`，而不是空成功结果；示例通过只匹配该 code 的工作流级 `on_error` 显式返回 `decision: no_response`，其他错误继续失败。图片字节和解码尺寸/像素/帧数必须有硬上限；Pillow decompression-bomb 与损坏图片必须转换为稳定的结构化错误。Linux 引擎至少应施加地址空间、CPU、输出文件、打开文件数和进程数限制，但进程分离和 `prlimit` 不等价于文件系统、网络或 syscall 沙箱；macOS/Windows 没有等价宿主隔离时应默认 fail-closed，只有操作者明确确认外部沙箱责任后才允许启动，且不得宣称独立进程本身就是完整沙箱。
+
+当前 durable journal 只依据 descriptor 的 `inputs/outputs.sensitive` 声明做持久化资格判断，不会自动追踪 action 产生的原始 OCR 文本。为 fail-closed，真实 OCR 示例将图片路径与目标文本标为 `sensitive: true`，因此 durable start 必须在创建 run 前拒绝；metadata 中的 `ai-auto-desktop.dev/durable-eligibility` annotation 仅是可读提示，不代替敏感声明。待 durable 层具备字段级脱敏、秘密引用和 OCR 输出污点策略后，才能设计新的可持久 OCR 示例。

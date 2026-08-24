@@ -28,12 +28,17 @@ import tempfile
 import threading
 import time
 from typing import Any, NoReturn
+import warnings
 
 
 PLUGIN_NAME = "vision.ocr"
 PLUGIN_VERSION = "0.1.0"
 ACTION_ID = "vision.ocr.recognize@1"
 MAX_IMAGE_BYTES = 64 * 1024 * 1024
+MAX_IMAGE_WIDTH = 20_000
+MAX_IMAGE_HEIGHT = 20_000
+MAX_IMAGE_PIXELS = 40_000_000
+MAX_IMAGE_FRAMES = 1
 MAX_ENGINE_STDOUT_BYTES = 4 * 1024 * 1024
 MAX_ENGINE_STDERR_BYTES = 64 * 1024
 MAX_NDJSON_BYTES = 7 * 1024 * 1024
@@ -43,20 +48,173 @@ MAX_LINES = 10_000
 MAX_TEXT_CHARS = 1_000_000
 MAX_WORD_TEXT_CHARS = 4_096
 MAX_MATCHES = 10_000
+MAX_RESULT_TEXT_CHARS = MAX_TEXT_CHARS + MAX_WORDS - 1
 MAX_COORDINATE = 1_000_000_000
 DEFAULT_ENGINE_TIMEOUT_SECONDS = 30.0
 PROCESS_POLL_SECONDS = 0.02
 PROCESS_TERMINATE_GRACE_SECONDS = 0.20
 RESPONSE_BUDGET_SECONDS = 0.10
+LINUX_ENGINE_ADDRESS_SPACE_BYTES = 2 * 1024 * 1024 * 1024
+LINUX_ENGINE_CPU_SECONDS = 30
+LINUX_ENGINE_FILE_BYTES = 16 * 1024 * 1024
+LINUX_ENGINE_OPEN_FILES = 64
+LINUX_ENGINE_PROCESSES = 512
+ALLOW_UNSANDBOXED_ENGINE_ENV = "OCR_ALLOW_UNSANDBOXED_ENGINE"
 
 BOUNDS_SCHEMA: dict[str, Any] = {
     "type": "object",
+    "description": "Pixel rectangle in source-image coordinates.",
     "required": ["x", "y", "width", "height"],
     "properties": {
-        "x": {"type": "integer", "minimum": 0},
-        "y": {"type": "integer", "minimum": 0},
-        "width": {"type": "integer", "minimum": 1},
-        "height": {"type": "integer", "minimum": 1},
+        "x": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": MAX_COORDINATE,
+            "description": "Zero-based horizontal pixel offset.",
+        },
+        "y": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": MAX_COORDINATE,
+            "description": "Zero-based vertical pixel offset.",
+        },
+        "width": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": MAX_COORDINATE,
+            "description": "Rectangle width in pixels.",
+        },
+        "height": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": MAX_COORDINATE,
+            "description": "Rectangle height in pixels.",
+        },
+    },
+    "additionalProperties": False,
+}
+
+SOURCE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "description": (
+        "Provenance for the caller-supplied image snapshot read by this request."
+    ),
+    "required": ["kind", "path", "digest", "media_type", "size_bytes"],
+    "properties": {
+        "kind": {
+            "enum": ["image", "artifact"],
+            "description": "Which mutually exclusive input field supplied the image.",
+        },
+        "path": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Resolved absolute path supplied by the caller.",
+        },
+        "digest": {
+            "type": "string",
+            "pattern": "^sha256:[0-9a-f]{64}$",
+            "description": "SHA-256 digest of the private image snapshot.",
+        },
+        "media_type": {
+            "enum": [
+                "image/png",
+                "image/jpeg",
+                "image/gif",
+                "image/tiff",
+                "image/bmp",
+                "image/webp",
+                "image/x-portable-anymap",
+            ],
+            "description": "Media type detected from the image bytes.",
+        },
+        "size_bytes": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": MAX_IMAGE_BYTES,
+            "description": "Byte length of the private image snapshot.",
+        },
+    },
+    "additionalProperties": False,
+}
+
+LINE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "description": "One recognized text line in source-image coordinates.",
+    "required": ["text", "confidence", "bounds"],
+    "properties": {
+        "text": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": MAX_RESULT_TEXT_CHARS,
+            "description": "Recognized words joined with one ASCII space.",
+        },
+        "confidence": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1,
+            "description": "Character-count-weighted confidence for the line.",
+        },
+        "bounds": BOUNDS_SCHEMA,
+    },
+    "additionalProperties": False,
+}
+
+SPAN_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "description": (
+        "Zero-based, end-exclusive character offsets into the aggregate text field."
+    ),
+    "required": ["start", "end"],
+    "properties": {
+        "start": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": MAX_RESULT_TEXT_CHARS - 1,
+            "description": "Inclusive match start offset.",
+        },
+        "end": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": MAX_RESULT_TEXT_CHARS,
+            "description": "Exclusive match end offset.",
+        },
+    },
+    "additionalProperties": False,
+}
+
+MATCH_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "description": "One case-sensitive literal match requested by the caller.",
+    "required": ["pattern_id", "text", "span", "bounds", "confidence"],
+    "properties": {
+        "pattern_id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "description": "Caller-provided ID of the matching pattern.",
+        },
+        "text": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1024,
+            "description": "Exact case-sensitive literal that matched.",
+        },
+        "span": SPAN_SCHEMA,
+        "bounds": {
+            "oneOf": [BOUNDS_SCHEMA, {"type": "null"}],
+            "description": (
+                "Union of matched word boxes, or null when a separator-only match "
+                "has no word box."
+            ),
+        },
+        "confidence": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1,
+            "description": (
+                "Minimum confidence of covered words, or zero without a word box."
+            ),
+        },
     },
     "additionalProperties": False,
 }
@@ -141,24 +299,30 @@ ACTION_CONTRACT: dict[str, Any] = {
         ],
         "properties": {
             "provider": {"const": "tesseract"},
-            "version": {"type": "string"},
-            "source": {
-                "type": "object",
-                "required": ["kind", "path", "digest", "media_type", "size_bytes"],
-                "properties": {
-                    "kind": {"enum": ["image", "artifact"]},
-                    "path": {"type": "string"},
-                    "digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
-                    "media_type": {"type": "string"},
-                    "size_bytes": {"type": "integer", "minimum": 1},
-                },
-                "additionalProperties": False,
+            "version": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Version reported by the configured Tesseract CLI.",
             },
+            "source": SOURCE_SCHEMA,
             "source_region": {"oneOf": [BOUNDS_SCHEMA, {"type": "null"}]},
-            "text": {"type": "string"},
+            "text": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": MAX_RESULT_TEXT_CHARS,
+            },
             "confidence": {"type": "number", "minimum": 0, "maximum": 1},
-            "lines": {"type": "array", "items": {"type": "object"}},
-            "matches": {"type": "array", "items": {"type": "object"}},
+            "lines": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": MAX_LINES,
+                "items": LINE_SCHEMA,
+            },
+            "matches": {
+                "type": "array",
+                "maxItems": MAX_MATCHES,
+                "items": MATCH_SCHEMA,
+            },
         },
         "additionalProperties": False,
     },
@@ -174,7 +338,10 @@ ACTION_CONTRACT: dict[str, Any] = {
             ("OCR.INVALID_REQUEST", "The image request or pattern is invalid.", False),
             ("OCR.IMAGE_UNAVAILABLE", "The explicit image cannot be read.", False),
             ("OCR.IMAGE_UNSUPPORTED", "The file is not a supported image.", False),
+            ("OCR.IMAGE_LIMIT_EXCEEDED", "The decoded image exceeds a hard dimension, pixel, or frame limit.", False),
+            ("OCR.IMAGE_VALIDATOR_UNAVAILABLE", "The required Pillow image validator is unavailable.", False),
             ("OCR.ENGINE_UNAVAILABLE", "The Tesseract CLI is unavailable.", False),
+            ("OCR.ENGINE_ISOLATION_UNAVAILABLE", "Required engine resource isolation is unavailable.", False),
             ("OCR.ENGINE_FAILED", "Tesseract exited unsuccessfully.", False),
             ("OCR.OUTPUT_INVALID", "Tesseract emitted invalid or excessive TSV.", False),
             ("OCR.NO_TEXT", "No text was recognized.", False),
@@ -344,9 +511,213 @@ def _media_type(header: bytes, tail: bytes, size: int) -> str | None:
     return None
 
 
+def _header_dimensions(media_type: str, header: bytes) -> tuple[int, int] | None:
+    """Return dimensions from fixed-format headers when safely available."""
+
+    if media_type == "image/png" and len(header) >= 24:
+        return (int.from_bytes(header[16:20], "big"), int.from_bytes(header[20:24], "big"))
+    if media_type == "image/gif" and len(header) >= 10:
+        return (int.from_bytes(header[6:8], "little"), int.from_bytes(header[8:10], "little"))
+    if media_type == "image/jpeg":
+        index = 2
+        sof_markers = {
+            *range(0xC0, 0xC4),
+            *range(0xC5, 0xC8),
+            *range(0xC9, 0xCC),
+            *range(0xCD, 0xD0),
+        }
+        while index + 3 < len(header):
+            if header[index] != 0xFF:
+                index += 1
+                continue
+            while index < len(header) and header[index] == 0xFF:
+                index += 1
+            if index >= len(header):
+                return None
+            marker = header[index]
+            index += 1
+            if marker == 0xDA:
+                return None
+            if marker in {0x01, 0xD8, 0xD9, *range(0xD0, 0xD8)}:
+                continue
+            if index + 2 > len(header):
+                return None
+            segment_length = int.from_bytes(header[index : index + 2], "big")
+            if segment_length < 2 or index + segment_length > len(header):
+                return None
+            if marker in sof_markers and segment_length >= 7:
+                return (
+                    int.from_bytes(header[index + 5 : index + 7], "big"),
+                    int.from_bytes(header[index + 3 : index + 5], "big"),
+                )
+            index += segment_length
+        return None
+    if media_type == "image/tiff" and len(header) >= 8:
+        byteorder = "little" if header[:2] == b"II" else "big"
+        directory_offset = int.from_bytes(header[4:8], byteorder)
+        if directory_offset + 2 > len(header):
+            return None
+        entry_count = int.from_bytes(
+            header[directory_offset : directory_offset + 2], byteorder
+        )
+        dimensions: dict[int, int] = {}
+        for entry_index in range(min(entry_count, 128)):
+            offset = directory_offset + 2 + entry_index * 12
+            if offset + 12 > len(header):
+                break
+            tag = int.from_bytes(header[offset : offset + 2], byteorder)
+            field_type = int.from_bytes(header[offset + 2 : offset + 4], byteorder)
+            count = int.from_bytes(header[offset + 4 : offset + 8], byteorder)
+            if tag not in {256, 257} or count != 1 or field_type not in {3, 4}:
+                continue
+            width = 2 if field_type == 3 else 4
+            dimensions[tag] = int.from_bytes(
+                header[offset + 8 : offset + 8 + width], byteorder
+            )
+        if 256 in dimensions and 257 in dimensions:
+            return dimensions[256], dimensions[257]
+        return None
+    if media_type == "image/bmp" and len(header) >= 26:
+        dib_size = int.from_bytes(header[14:18], "little")
+        if dib_size == 12:
+            return (
+                int.from_bytes(header[18:20], "little"),
+                int.from_bytes(header[20:22], "little"),
+            )
+        if dib_size >= 40:
+            width = int.from_bytes(header[18:22], "little", signed=True)
+            height = int.from_bytes(header[22:26], "little", signed=True)
+            return (abs(width), abs(height))
+    if media_type == "image/webp" and len(header) >= 30:
+        chunk = header[12:16]
+        if chunk == b"VP8X":
+            return (
+                1 + int.from_bytes(header[24:27], "little"),
+                1 + int.from_bytes(header[27:30], "little"),
+            )
+        if chunk == b"VP8L" and header[20:21] == b"/":
+            packed = int.from_bytes(header[21:25], "little")
+            return (1 + (packed & 0x3FFF), 1 + ((packed >> 14) & 0x3FFF))
+        if chunk == b"VP8 " and header[23:26] == b"\x9d\x01*":
+            return (
+                int.from_bytes(header[26:28], "little") & 0x3FFF,
+                int.from_bytes(header[28:30], "little") & 0x3FFF,
+            )
+        return None
+    if media_type == "image/x-portable-anymap":
+        without_comments = re.sub(rb"#[^\r\n]*", b" ", header)
+        if header.startswith(b"P7"):
+            width = re.search(rb"(?:^|[\r\n])WIDTH[ \t]+([0-9]+)", without_comments)
+            height = re.search(rb"(?:^|[\r\n])HEIGHT[ \t]+([0-9]+)", without_comments)
+            if width and height:
+                return int(width.group(1)), int(height.group(1))
+            return None
+        tokens = without_comments.split()
+        if len(tokens) >= 3:
+            try:
+                return int(tokens[1]), int(tokens[2])
+            except ValueError:
+                return None
+    return None
+
+
+def _check_image_limits(width: int, height: int, *, phase: str) -> None:
+    if (
+        width <= 0
+        or height <= 0
+        or width > MAX_IMAGE_WIDTH
+        or height > MAX_IMAGE_HEIGHT
+        or width * height > MAX_IMAGE_PIXELS
+    ):
+        raise RequestError(
+            "OCR.IMAGE_LIMIT_EXCEEDED",
+            "source image exceeds a hard decoded-size limit",
+            data={
+                "phase": phase,
+                "width": width,
+                "height": height,
+                "pixels": width * height if width >= 0 and height >= 0 else None,
+                "max_width": MAX_IMAGE_WIDTH,
+                "max_height": MAX_IMAGE_HEIGHT,
+                "max_pixels": MAX_IMAGE_PIXELS,
+            },
+        )
+
+
+def _validate_decoded_image(
+    source: Path, media_type: str, deadline: float
+) -> tuple[int, int]:
+    """Use Pillow as the mandatory decoder gate before untrusted image bytes."""
+
+    try:
+        from PIL import Image, UnidentifiedImageError
+    except ImportError as exc:
+        raise RequestError(
+            "OCR.IMAGE_VALIDATOR_UNAVAILABLE",
+            "Pillow is required to validate OCR source images",
+            data={"dependency": "Pillow"},
+        ) from exc
+
+    expected_format = {
+        "image/png": "PNG",
+        "image/jpeg": "JPEG",
+        "image/gif": "GIF",
+        "image/tiff": "TIFF",
+        "image/bmp": "BMP",
+        "image/webp": "WEBP",
+        "image/x-portable-anymap": {"PBM", "PGM", "PPM", "PNM"},
+    }[media_type]
+    try:
+        _remaining(deadline)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", Image.DecompressionBombWarning)
+            with Image.open(source) as image:
+                actual_format = image.format
+                valid_format = (
+                    actual_format in expected_format
+                    if isinstance(expected_format, set)
+                    else actual_format == expected_format
+                )
+                if not valid_format:
+                    raise RequestError(
+                        "OCR.IMAGE_UNSUPPORTED",
+                        "decoded image format does not match its signature",
+                        data={"detected": media_type, "decoded_format": actual_format},
+                    )
+                width, height = image.size
+                _check_image_limits(width, height, phase="decoder_header")
+                frame_count = int(getattr(image, "n_frames", 1))
+                if frame_count != MAX_IMAGE_FRAMES:
+                    raise RequestError(
+                        "OCR.IMAGE_LIMIT_EXCEEDED",
+                        "multi-frame images are not accepted",
+                        data={
+                            "frames": frame_count,
+                            "max_frames": MAX_IMAGE_FRAMES,
+                        },
+                    )
+                image.load()
+                _remaining(deadline)
+                return width, height
+    except RequestError:
+        raise
+    except (Image.DecompressionBombError, Image.DecompressionBombWarning) as exc:
+        raise RequestError(
+            "OCR.IMAGE_LIMIT_EXCEEDED",
+            "Pillow rejected the source image as a decompression bomb",
+            data={"reason": type(exc).__name__},
+        ) from exc
+    except (OSError, UnidentifiedImageError, ValueError, EOFError) as exc:
+        raise RequestError(
+            "OCR.IMAGE_UNSUPPORTED",
+            "source image could not be decoded safely",
+            data={"reason": type(exc).__name__},
+        ) from exc
+
+
 def _inspect_source(
     args: dict[str, Any], deadline: float, directory: Path
-) -> tuple[Path, dict[str, Any]]:
+) -> tuple[Path, dict[str, Any], tuple[int, int]]:
     present = [name for name in ("image", "artifact") if name in args]
     if len(present) != 1:
         _invalid("exactly one of image or artifact is required")
@@ -391,8 +762,8 @@ def _inspect_source(
                         f"source image exceeds {MAX_IMAGE_BYTES} bytes",
                         data={"path": str(path), "limit_bytes": MAX_IMAGE_BYTES},
                     )
-                if len(header) < 64:
-                    header.extend(chunk[: 64 - len(header)])
+                if len(header) < 4096:
+                    header.extend(chunk[: 4096 - len(header)])
                 tail.extend(chunk)
                 if len(tail) > 16:
                     del tail[:-16]
@@ -419,6 +790,9 @@ def _inspect_source(
             "source file does not have a supported image signature",
             data={"path": str(path)},
         )
+    dimensions = _header_dimensions(detected, bytes(header))
+    if dimensions is not None:
+        _check_image_limits(*dimensions, phase="file_header")
     declared = source_arg.get("media_type")
     if declared is not None:
         if not isinstance(declared, str) or not declared.startswith("image/"):
@@ -430,13 +804,14 @@ def _inspect_source(
                 "artifact media_type does not match the image content",
                 data={"declared": declared, "detected": detected},
             )
+    width, height = _validate_decoded_image(snapshot, detected, deadline)
     return snapshot, {
         "kind": kind,
         "path": str(path),
         "digest": f"sha256:{digest.hexdigest()}",
         "media_type": detected,
         "size_bytes": copied,
-    }
+    }, (width, height)
 
 
 def _region(value: Any) -> dict[str, int] | None:
@@ -448,8 +823,15 @@ def _region(value: Any) -> dict[str, int] | None:
     for name in ("x", "y", "width", "height"):
         item = value[name]
         minimum = 1 if name in {"width", "height"} else 0
-        if isinstance(item, bool) or not isinstance(item, int) or item < minimum:
-            _invalid(f"region.{name} must be an integer >= {minimum}")
+        if (
+            isinstance(item, bool)
+            or not isinstance(item, int)
+            or item < minimum
+            or item > MAX_COORDINATE
+        ):
+            _invalid(
+                f"region.{name} must be an integer between {minimum} and {MAX_COORDINATE}"
+            )
         result[name] = item
     return result
 
@@ -491,7 +873,12 @@ def _patterns(value: Any) -> list[tuple[str, str]]:
         if not isinstance(pattern, dict) or set(pattern) != {"id", "value"}:
             _invalid("each pattern must contain only id and value", index=index)
         pattern_id, literal = pattern["id"], pattern["value"]
-        if not isinstance(pattern_id, str) or not pattern_id or len(pattern_id) > 128:
+        if (
+            not isinstance(pattern_id, str)
+            or not pattern_id
+            or len(pattern_id) > 128
+            or "\x00" in pattern_id
+        ):
             _invalid("pattern id must be a non-empty string up to 128 characters", index=index)
         if pattern_id in ids:
             _invalid("pattern ids must be unique", id=pattern_id)
@@ -563,6 +950,39 @@ def _engine_environment(executable: str) -> dict[str, str]:
     return environment
 
 
+def _linux_prlimit_prefix(deadline: float) -> list[str]:
+    """Build the mandatory Linux resource-limit wrapper for one engine."""
+
+    if not sys.platform.startswith("linux"):
+        if os.environ.get(ALLOW_UNSANDBOXED_ENGINE_ENV) == "1":
+            return []
+        raise RequestError(
+            "OCR.ENGINE_ISOLATION_UNAVAILABLE",
+            "this platform has no built-in OCR engine resource sandbox",
+            data={
+                "platform": sys.platform,
+                "operator_override": ALLOW_UNSANDBOXED_ENGINE_ENV,
+            },
+        )
+    executable = shutil.which("prlimit")
+    if executable is None:
+        raise RequestError(
+            "OCR.ENGINE_ISOLATION_UNAVAILABLE",
+            "Linux OCR requires the prlimit command",
+            data={"required": "prlimit"},
+        )
+    cpu_seconds = max(1, min(LINUX_ENGINE_CPU_SECONDS, math.ceil(_remaining(deadline))))
+    return [
+        executable,
+        f"--as={LINUX_ENGINE_ADDRESS_SPACE_BYTES}:{LINUX_ENGINE_ADDRESS_SPACE_BYTES}",
+        f"--cpu={cpu_seconds}:{cpu_seconds}",
+        f"--fsize={LINUX_ENGINE_FILE_BYTES}:{LINUX_ENGINE_FILE_BYTES}",
+        f"--nofile={LINUX_ENGINE_OPEN_FILES}:{LINUX_ENGINE_OPEN_FILES}",
+        f"--nproc={LINUX_ENGINE_PROCESSES}:{LINUX_ENGINE_PROCESSES}",
+        "--",
+    ]
+
+
 def _terminate_process_tree(process: subprocess.Popen[bytes]) -> None:
     """Best-effort bounded termination of the engine and its descendants."""
 
@@ -632,6 +1052,7 @@ def _terminate_process_tree(process: subprocess.Popen[bytes]) -> None:
 
 def _run_process(command: list[str], deadline: float) -> tuple[bytes, bytes]:
     _remaining(deadline)
+    launch_command = _linux_prlimit_prefix(deadline) + command
     popen_options: dict[str, Any] = {
         "stdin": subprocess.DEVNULL,
         "stdout": subprocess.PIPE,
@@ -646,7 +1067,7 @@ def _run_process(command: list[str], deadline: float) -> tuple[bytes, bytes]:
             subprocess, "CREATE_NEW_PROCESS_GROUP", 0
         )
     try:
-        process = subprocess.Popen(command, **popen_options)
+        process = subprocess.Popen(launch_command, **popen_options)
     except FileNotFoundError as exc:
         raise RequestError(
             "OCR.ENGINE_UNAVAILABLE", "Tesseract executable was not found"
@@ -761,33 +1182,51 @@ def _engine_version(prefix: list[str], deadline: float) -> str:
     return version
 
 
-def _crop_image(source: Path, region: dict[str, int], directory: Path) -> Path:
+def _crop_image(
+    source: Path, region: dict[str, int], directory: Path, deadline: float
+) -> Path:
     try:
         from PIL import Image, UnidentifiedImageError
     except ImportError as exc:
         raise RequestError(
-            "OCR.ENGINE_UNAVAILABLE",
+            "OCR.IMAGE_VALIDATOR_UNAVAILABLE",
             "Pillow is required when region cropping is requested",
             data={"dependency": "Pillow"},
         ) from exc
     try:
-        with Image.open(source) as image:
-            image.load()
-            right = region["x"] + region["width"]
-            bottom = region["y"] + region["height"]
-            if right > image.width or bottom > image.height:
-                _invalid(
-                    "region falls outside the source image",
-                    image_width=image.width,
-                    image_height=image.height,
-                )
-            cropped = image.crop((region["x"], region["y"], right, bottom))
-            target = directory / "region.png"
-            cropped.save(target, format="PNG")
-            return target
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", Image.DecompressionBombWarning)
+            with Image.open(source) as image:
+                _check_image_limits(image.width, image.height, phase="crop_decoder")
+                if int(getattr(image, "n_frames", 1)) != MAX_IMAGE_FRAMES:
+                    raise RequestError(
+                        "OCR.IMAGE_LIMIT_EXCEEDED",
+                        "multi-frame images are not accepted",
+                        data={"frames": int(getattr(image, "n_frames", 1))},
+                    )
+                image.load()
+                _remaining(deadline)
+                right = region["x"] + region["width"]
+                bottom = region["y"] + region["height"]
+                if right > image.width or bottom > image.height:
+                    _invalid(
+                        "region falls outside the source image",
+                        image_width=image.width,
+                        image_height=image.height,
+                    )
+                cropped = image.crop((region["x"], region["y"], right, bottom))
+                target = directory / "region.png"
+                cropped.save(target, format="PNG")
+                return target
     except RequestError:
         raise
-    except (OSError, UnidentifiedImageError, ValueError) as exc:
+    except (Image.DecompressionBombError, Image.DecompressionBombWarning) as exc:
+        raise RequestError(
+            "OCR.IMAGE_LIMIT_EXCEEDED",
+            "Pillow rejected the source image as a decompression bomb",
+            data={"reason": type(exc).__name__},
+        ) from exc
+    except (OSError, UnidentifiedImageError, ValueError, EOFError) as exc:
         raise RequestError(
             "OCR.IMAGE_UNSUPPORTED",
             "source image could not be decoded for region cropping",
@@ -1045,12 +1484,25 @@ def recognize(args: Any, deadline_ms: Any) -> dict[str, Any]:
 
     with tempfile.TemporaryDirectory(prefix="aad-ocr-") as directory_name:
         private_directory = Path(directory_name)
-        source_path, source = _inspect_source(args, deadline, private_directory)
+        source_path, source, image_size = _inspect_source(
+            args, deadline, private_directory
+        )
+        if region is not None:
+            right = region["x"] + region["width"]
+            bottom = region["y"] + region["height"]
+            if right > image_size[0] or bottom > image_size[1]:
+                _invalid(
+                    "region falls outside the source image",
+                    image_width=image_size[0],
+                    image_height=image_size[1],
+                )
         version = _engine_version(prefix, deadline)
         input_path = source_path
         if region is not None:
             _remaining(deadline)
-            input_path = _crop_image(source_path, region, private_directory)
+            input_path = _crop_image(
+                source_path, region, private_directory, deadline
+            )
             _remaining(deadline)
         command = prefix + [str(input_path), "stdout"]
         if languages:
