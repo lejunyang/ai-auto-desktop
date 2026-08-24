@@ -1,8 +1,8 @@
 # Linux AT-SPI 进程驱动
 
 `desktop.linux_atspi` 通过当前 Linux 图形会话的 AT-SPI 可访问性树提供
-`list_applications`、`snapshot`、`find`、`focus`、`invoke`、`set_text`、`toggle`、
-`expand` 和 `collapse`。
+`list_applications`、`snapshot`、`find`、`focus`、`invoke`、`set_text`、显式
+`type_text`、`toggle`、`expand` 和 `collapse`。
 
 ## 运行
 
@@ -11,7 +11,7 @@ plugins/linux_atspi/run.sh
 ```
 
 进程通过标准输入和标准输出交换 UTF-8 NDJSON。`list_applications`、`snapshot`
-和 `find` 需要 `desktop.observe` 权限；六种写动作还需要
+和 `find` 需要 `desktop.observe` 权限；七种写动作还需要
 `desktop.input` 权限。
 
 ## 依赖
@@ -28,15 +28,27 @@ accessibility bus。Gio fallback 支持应用枚举和只读快照，不支持�
 
 ## 安全边界
 
-本驱动只调用 `Component.grab_focus`、`Action.do_action` 和
-`EditableText.set_text_contents` 等 AT-SPI 语义接口。它不会注入键盘或指针事件、
-不会按坐标点击、不会截图，也不会运行 OCR。受保护文本不会读取或回显，且禁止
-`set_text`。只读 Gio fallback 会为全部六种写动作返回结构化的
+默认动作只调用 `Component.grab_focus`、`Action.do_action` 和
+`EditableText.set_text_contents` 等 AT-SPI 语义接口。唯一例外是调用方明确选择的
+`desktop.linux_atspi.type_text@1`：它重新抓取并精确解析 target+locator，验证原生身份、
+语义指纹、进程归属和非 protected 后先聚焦，再用固定路径 C++ XTest helper 输入普通
+UTF-8。`set_text`/`invoke` 永远不会自动进入该路径。驱动不做坐标点击、截图或 OCR。
+只读 Gio fallback 会为全部七种写动作返回结构化的
 `DRIVER.ACTION_UNSUPPORTED`。定位器只支持精确匹配；多义、过期或截断快照均失败关闭。
 当前 v0 默认后端还要求进程环境明确报告 KDE、X11 和非空 `DISPLAY`；缺失这些证据，
 或处于 Wayland/GNOME，会返回 `DRIVER.UNAVAILABLE`，不会扩大本切片的支持声明。
 Gio 的 `GetChildren` 在线路响应解包后立即检查 5000 项硬上限；该上限用于阻止继续
 复制和遍历异常 fan-out，但受 D-Bus API 形状限制，无法在 wire 传输之前截断响应。
+
+`type_text` 接受 1–1024 个字符且最多 4096 UTF-8 字节，除换行外拒绝控制字符，不支持
+密码或 secret。先运行 `plugins/linux_atspi/build_x11_xtest_helper.sh` 构建 helper；
+Debian/Ubuntu 需要 `g++ pkg-config libx11-dev libxtst-dev`。helper 不使用 shell 拼接、
+`xdotool`、剪贴板或 `uinput`，文本只经 stdin 传递。首个输入事件后任何错误或超时
+都返回 `DRIVER.UNKNOWN_EFFECT` 且不得重试；成功后仍须 fresh snapshot 验证文本。
+helper 的 `submitted=true` 仅表示 X server 接受了事件请求，不表示目标应用已消费文本。
+登录管理器和锁屏界面不受支持；生产动作不主动解锁会话。
+显式选择示例见 `examples/workflows/linux-explicit-type-text-fallback.yaml`；示例只按调用方
+预先获得的 `semantic_set_text_available` 结果分支，不捕获语义动作失败后自动降级。
 
 快照额外观察 `checked`、`expandable`、`expanded`、`selectable` 和 `selected` 状态。
 本切片仅对 GTK3 明确映射语义动作：`toggle` 只接受 canonical 原生名精确等于
@@ -56,5 +68,6 @@ check button、expander 和 status label，在完整 PyGObject backend 可用时
 安装发行版提供的 `gir1.2-atspi-2.0`。
 `tests/linux/qt_atspi_fixture.cpp` 则提供 Qt 5 Widgets entry/button/label。测试会按需
 编译，并在同一真实 X11 display 上使用隔离的 session/AT-SPI bus，验证
-snapshot/find/focus/set_text/invoke 及动作后重新观察；它同样不使用 OCR、XTEST 或
-虚拟键盘鼠标。
+snapshot/find/focus/set_text/invoke 及动作后重新观察。私有 Xvfb + 隔离 accessibility
+bus 的 GTK3/Qt5 fixture 还会真实验证 `type_text` 的 XTEST UTF-8 输入和 fresh snapshot
+后置条件；不使用 OCR、`xdotool`、剪贴板或坐标点击。

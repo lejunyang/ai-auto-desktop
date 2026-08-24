@@ -32,6 +32,8 @@ DRIVER_PATH = PROJECT_ROOT / "plugins" / "linux_atspi" / "linux_atspi_driver.py"
 FIXTURE_PATH = PROJECT_ROOT / "tests" / "linux" / "atspi_fixture_app.py"
 QT_FIXTURE_SOURCE = PROJECT_ROOT / "tests" / "linux" / "qt_atspi_fixture.cpp"
 QT_FIXTURE_RUNNER = PROJECT_ROOT / "tests" / "linux" / "qt_atspi_native_runner.py"
+GTK_FIXTURE_RUNNER = PROJECT_ROOT / "tests" / "linux" / "gtk_atspi_native_runner.py"
+XTEST_BUILD_SCRIPT = PROJECT_ROOT / "plugins" / "linux_atspi" / "build_x11_xtest_helper.sh"
 TEST_TYPELIB_ENV = "AI_AUTO_DESKTOP_TEST_ATSPI_TYPELIB_PATH"
 FIXTURE_ENTRY_NAME = "Fixture text entry"
 FIXTURE_BUTTON_NAME = "Invoke fixture button"
@@ -57,6 +59,7 @@ SESSION_KEYS = (
     "XAUTHORITY",
     "XDG_CURRENT_DESKTOP",
     "XDG_RUNTIME_DIR",
+    "XDG_SESSION_ID",
     "XDG_SESSION_TYPE",
 )
 
@@ -563,6 +566,96 @@ class NativeKdeX11AtspiInfrastructureTests(unittest.TestCase):
             find(collapsed_snapshot, expander_locator)["node"]["states"]["expanded"]
         )
 
+    def _build_xtest_helper(self) -> None:
+        if not XTEST_BUILD_SCRIPT.is_file():
+            self.fail(f"XTest helper 构建脚本不存在：{XTEST_BUILD_SCRIPT}")
+        completed = subprocess.run(
+            ["sh", str(XTEST_BUILD_SCRIPT)],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=30,
+        )
+        if completed.returncode != 0:
+            self.fail(
+                "XTest helper 编译失败："
+                + completed.stderr.decode("utf-8", errors="replace")[-2000:]
+            )
+
+    def test_owned_gtk_fixture_supports_real_xtest_type_text(self) -> None:
+        session_id = self.session.get("XDG_SESSION_ID")
+        if session_id and shutil.which("loginctl"):
+            lock_state = subprocess.run(
+                ["loginctl", "show-session", session_id, "-p", "LockedHint", "--value"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                encoding="utf-8",
+                check=False,
+                timeout=5,
+            )
+            if lock_state.stdout.strip().lower() == "yes":
+                self.skipTest("当前 KDE 会话已锁屏；XTEST 事件会被锁屏器隔离")
+        if not FIXTURE_PATH.is_file() or not GTK_FIXTURE_RUNNER.is_file():
+            self.fail("GTK fixture 或隔离 runner 不存在")
+        dbus_run_session = shutil.which("dbus-run-session")
+        if dbus_run_session is None:
+            self.skipTest("GTK XTest fixture 需要 dbus-run-session")
+        environment = _native_subprocess_environment(self.session)
+        environment["PYTHONPATH"] = str(PROJECT_ROOT / "src")
+        environment.pop("AT_SPI_BUS_ADDRESS", None)
+        dependency_probe = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import gi; "
+                    "gi.require_version('Gtk', '3.0'); "
+                    "gi.require_version('Atspi', '2.0'); "
+                    "from gi.repository import Atspi, Gtk"
+                ),
+            ],
+            env=environment,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            timeout=5,
+        )
+        if dependency_probe.returncode != 0:
+            self.skipTest("GTK XTest fixture 需要 Gtk 3 与 Atspi 2.0 typelib")
+        self._build_xtest_helper()
+        completed = subprocess.run(
+            [
+                dbus_run_session,
+                "--",
+                sys.executable,
+                str(GTK_FIXTURE_RUNNER),
+                str(FIXTURE_PATH),
+                str(DRIVER_PATH),
+                "--type-text",
+            ],
+            env=environment,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            check=False,
+            timeout=45,
+        )
+        try:
+            report = json.loads(completed.stdout.strip().splitlines()[-1])
+        except (IndexError, json.JSONDecodeError) as exc:
+            self.fail(f"GTK fixture runner 未输出 JSON：{completed.stdout!r}; {exc}")
+        self.assertEqual(completed.returncode, 0, msg=f"{report!r}\n{completed.stderr}")
+        self.assertEqual(report["status"], "passed")
+        self.assertEqual(report["toolkit"], "gtk")
+        self.assertEqual(report["actions"], ["focus", "type_text"])
+        self.assertEqual(report["input_injection"], "XTEST")
+        self.assertTrue(report["type_text_observed"])
+
     def test_owned_qt5_fixture_supports_real_semantic_actions(self) -> None:
         compiler = shutil.which("g++")
         pkg_config = shutil.which("pkg-config")
@@ -580,6 +673,7 @@ class NativeKdeX11AtspiInfrastructureTests(unittest.TestCase):
         )
         if flags.returncode != 0:
             self.skipTest("完整 Qt5 fixture 测试需要 Qt5Widgets 开发包")
+        self._build_xtest_helper()
         temporary = tempfile.TemporaryDirectory(prefix="aad-qt-atspi-")
         self.addCleanup(temporary.cleanup)
         executable = Path(temporary.name) / "qt_atspi_fixture"
@@ -607,15 +701,32 @@ class NativeKdeX11AtspiInfrastructureTests(unittest.TestCase):
         environment = os.environ.copy()
         environment.update(self.session)
         environment["PYTHONPATH"] = str(PROJECT_ROOT / "src")
+        session_locked = False
+        session_id = self.session.get("XDG_SESSION_ID")
+        if session_id and shutil.which("loginctl"):
+            lock_state = subprocess.run(
+                ["loginctl", "show-session", session_id, "-p", "LockedHint", "--value"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                encoding="utf-8",
+                check=False,
+                timeout=5,
+            )
+            session_locked = lock_state.stdout.strip().lower() == "yes"
+        runner_command = [
+            dbus_run_session,
+            "--",
+            sys.executable,
+            str(QT_FIXTURE_RUNNER),
+            str(executable),
+            str(DRIVER_PATH),
+        ]
+        if not session_locked:
+            runner_command.append("--type-text")
         completed = subprocess.run(
-            [
-                dbus_run_session,
-                "--",
-                sys.executable,
-                str(QT_FIXTURE_RUNNER),
-                str(executable),
-                str(DRIVER_PATH),
-            ],
+            runner_command,
             env=environment,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
@@ -632,8 +743,18 @@ class NativeKdeX11AtspiInfrastructureTests(unittest.TestCase):
         self.assertEqual(completed.returncode, 0, msg=f"{report!r}\n{completed.stderr}")
         self.assertEqual(report["status"], "passed")
         self.assertEqual(report["toolkit"], "Qt")
-        self.assertEqual(report["actions"], ["focus", "set_text", "invoke"])
-        self.assertFalse(report["input_injection"])
+        self.assertEqual(
+            report["actions"],
+            (
+                ["focus", "set_text", "type_text", "invoke"]
+                if not session_locked
+                else ["focus", "set_text", "invoke"]
+            ),
+        )
+        self.assertEqual(
+            report["input_injection"], "XTEST" if not session_locked else False
+        )
+        self.assertEqual(report["type_text_observed"], not session_locked)
         self.assertFalse(report["ocr"])
 
     def test_system_settings_is_observed_when_qt_bridge_is_available(self) -> None:
@@ -722,6 +843,207 @@ class NativeKdeX11AtspiInfrastructureTests(unittest.TestCase):
             process.stderr.close()
         if process.stdout is not None:
             process.stdout.close()
+
+
+@unittest.skipUnless(sys.platform.startswith("linux"), "仅在 Linux 运行")
+class NativeIsolatedX11TypeTextTests(unittest.TestCase):
+    """Use a private Xvfb and private AT-SPI bus for deterministic XTEST."""
+
+    def setUp(self) -> None:
+        if shutil.which("Xvfb") is None or shutil.which("dbus-run-session") is None:
+            self.skipTest("XTest 真机测试需要 Xvfb 与 dbus-run-session")
+        session = _kde_x11_test_environment()
+        if session is None:
+            self.skipTest("需要当前用户的 KDE/X11 会话作为资格门")
+        self.base_environment = os.environ.copy()
+        self.base_environment.update(session)
+        self.base_environment["PYTHONPATH"] = str(PROJECT_ROOT / "src")
+        self.base_environment["XDG_SESSION_TYPE"] = "x11"
+        self.base_environment["XDG_CURRENT_DESKTOP"] = "KDE"
+        self.base_environment.pop("AT_SPI_BUS_ADDRESS", None)
+        self.temporary = tempfile.TemporaryDirectory(prefix="aad-x11-type-text-")
+        self.addCleanup(self.temporary.cleanup)
+        display_number = 120 + (os.getpid() % 300)
+        self.display = f":{display_number}"
+        self.xvfb = subprocess.Popen(
+            [
+                shutil.which("Xvfb"),
+                self.display,
+                "-screen",
+                "0",
+                "1280x800x24",
+                "-nolisten",
+                "tcp",
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+        self.addCleanup(NativeKdeX11AtspiInfrastructureTests._stop_process, self.xvfb)
+        socket = Path("/tmp/.X11-unix") / f"X{display_number}"
+        stop = time.monotonic() + 5
+        while not socket.exists() and time.monotonic() < stop:
+            if self.xvfb.poll() is not None:
+                self.fail("Xvfb 在 display 准备前退出")
+            time.sleep(0.05)
+        if not socket.exists():
+            self.fail("Xvfb display 未在 5 秒内准备就绪")
+        self.base_environment["DISPLAY"] = self.display
+        build = subprocess.run(
+            ["sh", str(XTEST_BUILD_SCRIPT)],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=30,
+        )
+        self.assertEqual(
+            build.returncode,
+            0,
+            build.stderr.decode("utf-8", errors="replace")[-2000:],
+        )
+
+    def _run_isolated(self, runner: Path, fixture: Path) -> dict[str, object]:
+        completed = subprocess.run(
+            [
+                shutil.which("dbus-run-session"),
+                "--",
+                sys.executable,
+                str(runner),
+                str(fixture),
+                str(DRIVER_PATH),
+                "--type-text",
+            ],
+            env=self.base_environment,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            check=False,
+            timeout=45,
+        )
+        try:
+            report = json.loads(completed.stdout.strip().splitlines()[-1])
+        except (IndexError, json.JSONDecodeError) as exc:
+            self.fail(f"fixture runner 未输出 JSON：{completed.stdout!r}; {exc}")
+        self.assertEqual(completed.returncode, 0, msg=f"{report!r}\n{completed.stderr}")
+        return report
+
+    def test_helper_rejects_wayland_and_unowned_focus_before_dispatch(self) -> None:
+        helper = PROJECT_ROOT / "plugins" / "linux_atspi" / ".build" / "x11_xtest_helper"
+        command = [
+            str(helper),
+            "type-text",
+            "--expected-pid",
+            str(os.getpid()),
+            "--deadline-monotonic-ns",
+            str(time.monotonic_ns() + 500_000_000),
+        ]
+        wayland_environment = dict(self.base_environment)
+        wayland_environment["XDG_SESSION_TYPE"] = "wayland"
+        wayland = subprocess.run(
+            command,
+            input=b"never",
+            env=wayland_environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=3,
+        )
+        self.assertEqual(wayland.returncode, 69)
+        wayland_result = json.loads(wayland.stdout.splitlines()[-1])
+        self.assertFalse(wayland_result["dispatch_started"])
+        self.assertEqual(wayland_result["code"], "unsupported_session")
+
+        wrong_focus = subprocess.run(
+            command,
+            input=b"never",
+            env=self.base_environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=3,
+        )
+        self.assertEqual(wrong_focus.returncode, 73)
+        focus_result = json.loads(wrong_focus.stdout.splitlines()[-1])
+        self.assertFalse(focus_result["dispatch_started"])
+        self.assertIn(
+            focus_result["code"],
+            {"focus_owner_mismatch", "pid_property_unavailable"},
+        )
+
+    def test_gtk3_type_text_is_observed_after_xtest_dispatch(self) -> None:
+        environment = _native_subprocess_environment(self.base_environment)
+        probe = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import gi; gi.require_version('Gtk', '3.0'); "
+                    "gi.require_version('Atspi', '2.0'); "
+                    "from gi.repository import Atspi, Gtk"
+                ),
+            ],
+            env=environment,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            timeout=5,
+        )
+        if probe.returncode != 0:
+            self.skipTest("GTK3/Atspi 2.0 依赖不可用")
+        self.base_environment.update(environment)
+        report = self._run_isolated(GTK_FIXTURE_RUNNER, FIXTURE_PATH)
+        self.assertEqual(report["toolkit"], "gtk")
+        self.assertEqual(report["input_injection"], "XTEST")
+        self.assertTrue(report["type_text_observed"])
+
+    def test_qt5_type_text_is_observed_after_xtest_dispatch(self) -> None:
+        compiler = shutil.which("g++")
+        pkg_config = shutil.which("pkg-config")
+        if compiler is None or pkg_config is None:
+            self.skipTest("Qt5 fixture 需要 g++ 与 pkg-config")
+        flags = subprocess.run(
+            [pkg_config, "--cflags", "--libs", "Qt5Widgets"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            check=False,
+            timeout=10,
+        )
+        if flags.returncode != 0:
+            self.skipTest("Qt5Widgets 开发包不可用")
+        executable = Path(self.temporary.name) / "qt_atspi_fixture"
+        compiled = subprocess.run(
+            [
+                compiler,
+                "-std=c++17",
+                "-O2",
+                "-fPIC",
+                str(QT_FIXTURE_SOURCE),
+                "-o",
+                str(executable),
+                *shlex.split(flags.stdout),
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=30,
+        )
+        self.assertEqual(
+            compiled.returncode,
+            0,
+            compiled.stderr.decode("utf-8", errors="replace")[-2000:],
+        )
+        report = self._run_isolated(QT_FIXTURE_RUNNER, executable)
+        self.assertEqual(report["toolkit"], "Qt")
+        self.assertEqual(report["input_injection"], "XTEST")
+        self.assertTrue(report["type_text_observed"])
 
 
 if __name__ == "__main__":

@@ -1,0 +1,109 @@
+apiVersion: ai-auto-desktop.dev/v1alpha1
+kind: Workflow
+metadata:
+  name: linux-explicit-type-text-fallback
+  version: 1.0.0
+  description: 由调用方已有的语义探测结果显式选择 set_text 或 KDE/X11 XTest 后备。
+requires:
+  platforms: [linux]
+  permissions: [desktop.observe, desktop.input]
+  capabilities:
+    - name: desktop.linux_atspi
+      version: ^0.1.0
+      actions: [snapshot, find, set_text, type_text]
+inputs:
+  semantic_set_text_available:
+    schema: {type: boolean}
+    required: true
+  locator:
+    schema: {type: object}
+    required: true
+  application:
+    schema: {type: object}
+    required: true
+  node_index:
+    schema: {type: integer, minimum: 0}
+    required: true
+  text:
+    schema: {type: string, minLength: 1, maxLength: 1024}
+    required: true
+budgets:
+  max_duration: 20s
+  max_executed_steps: 5
+  cleanup_timeout: 1s
+policy:
+  allowed_risk:
+    categories: [observe, input]
+    max_level: high
+  desktop:
+    single_writer: true
+    pause_on_user_input: true
+    allow_secure_desktop: false
+steps:
+  - id: capture_target
+    type: action
+    uses: desktop.linux_atspi.snapshot@1
+    with:
+      application: "${{ inputs.application }}"
+    effect: {class: read_only}
+    risk: {category: observe, level: low}
+    timeout: 5s
+    retry: {max_attempts: 1}
+
+  - id: resolve_target
+    type: action
+    uses: desktop.linux_atspi.find@1
+    with:
+      snapshot_id: "${{ steps.capture_target.output.snapshot_id }}"
+      revision: "${{ steps.capture_target.output.revision }}"
+      locator: "${{ inputs.locator }}"
+    effect: {class: read_only}
+    risk: {category: observe, level: low}
+    timeout: 5s
+    retry: {max_attempts: 1}
+
+  - id: choose_input_path
+    type: switch
+    description: 分支只读取预先获得的结果；动作失败不会自动改走另一条路径。
+    cases:
+      - when: "${{ inputs.semantic_set_text_available }}"
+        steps:
+          - id: semantic_set_text
+            type: action
+            uses: desktop.linux_atspi.set_text@1
+            with:
+              target: "${{ steps.resolve_target.output.target }}"
+              locator: "${{ inputs.locator }}"
+              text: "${{ inputs.text }}"
+            effect: {class: contextual}
+            risk: {category: input, level: high}
+            timeout: 10s
+            retry: {max_attempts: 1}
+            postcondition:
+              observe:
+                uses: desktop.linux_atspi.snapshot@1
+                with:
+                  application: "${{ inputs.application }}"
+              condition: "${{ observation.truncated == False and observation.nodes[inputs.node_index].value == inputs.text }}"
+              timeout: 3s
+              poll_interval: 100ms
+    default:
+      - id: explicit_x11_type_text
+        type: action
+        uses: desktop.linux_atspi.type_text@1
+        with:
+          target: "${{ steps.resolve_target.output.target }}"
+          locator: "${{ inputs.locator }}"
+          text: "${{ inputs.text }}"
+        effect: {class: contextual}
+        risk: {category: input, level: high}
+        timeout: 10s
+        retry: {max_attempts: 1}
+        postcondition:
+          observe:
+            uses: desktop.linux_atspi.snapshot@1
+            with:
+              application: "${{ inputs.application }}"
+          condition: "${{ observation.truncated == False and observation.nodes[inputs.node_index].value == inputs.text }}"
+          timeout: 3s
+          poll_interval: 100ms

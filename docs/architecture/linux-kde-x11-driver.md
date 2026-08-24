@@ -7,27 +7,29 @@
 ## 契约与支持边界
 
 该能力提供方名为 `desktop.linux_atspi`，提供以下 v1 动作：
-`list_applications`、`snapshot`、`find`、`focus`、`invoke`、`set_text`、`toggle`、
-`expand` 和 `collapse`。
+`list_applications`、`snapshot`、`find`、`focus`、`invoke`、`set_text`、显式
+`type_text`、`toggle`、`expand` 和 `collapse`。
 工作流中的 `uses` 由能力名、动作键和契约主版本号组成，例如
 `desktop.linux_atspi.snapshot@1`。能力清单的 `runtime.platforms` 为 `linux`，
 进程入口为 `./run.sh`。
 
 `list_applications`、`snapshot` 和 `find` 只要求 `desktop.observe`；
-全部六种写动作同时要求 `desktop.observe` 与
-`desktop.input`。这里的 `desktop.input` 表示允许通过 AT-SPI 原生语义接口改变
-应用状态，不表示允许注入键盘或指针事件。
+全部七种写动作同时要求 `desktop.observe` 与 `desktop.input`。只有调用方明确选择
+`type_text` 时，`desktop.input` 才授权本切片的受限 XTest 键盘注入。
 
 当前切片只使用 AT-SPI 暴露的可访问性树和接口：
 
 - `Component.grab_focus` 用于 `focus`；
 - `Action.do_action` 用于 `invoke`；
 - `EditableText.set_text_contents` 用于 `set_text`。
+- `Component.grab_focus` 后由固定路径 C++ XTest helper 注入普通 UTF-8，用于显式
+  `type_text`。
 - GTK3 上，`Action.do_action` 的 exact canonical `click` 用于 `toggle`，exact
   canonical `activate` 用于 `expand`/`collapse`。
 
-驱动不会调用 XTEST、`xdotool`、`uinput`、键鼠事件注入、截图或 OCR，也不会在
-语义动作不可用时自动退化到坐标点击。AT-SPI 未暴露节点或动作时，结果会明确失败。
+除显式 `type_text` 外，驱动不会调用 XTEST；`set_text`、`invoke` 或其他语义动作失败
+时也绝不会自动进入该路径。helper 不调用 `xdotool`、shell、`uinput` 或剪贴板，驱动
+不做坐标点击、截图或 OCR。AT-SPI 未暴露节点或动作时，结果会明确失败。
 登录管理器、锁屏、其他用户会话和提权界面不在当前支持范围内。
 
 ## 会话和后端报告
@@ -78,7 +80,7 @@ AT-SPI 身份线索。一个应用可以有多个顶层 frame、dialog 或 windo
 节点采用带 `parent_id` 的扁平列表，并包含 `node_id`、`role`、`name`、
 `description`、`value`、`attributes`、`states`、`bounds`、`actions` 和
 `provenance`。`bounds` 只是 AT-SPI `Component` 暴露的观察信息，不能用于本能力的
-输入注入。受保护文本不读取、不回显，`set_text` 对此类节点失败关闭。原生对象不会
+输入注入。受保护文本不读取、不回显，`set_text` 和 `type_text` 对此类节点失败关闭。原生对象不会
 跨越 NDJSON 边界。状态集合还包括 `checked`、`expandable`、`expanded`、
 `selectable` 和 `selected`；无法可靠读取时保留 `null`，不得由 role 或动作名猜测。
 
@@ -118,6 +120,21 @@ value、AT-SPI 身份线索、toolkit、attributes、states 与 actions；所有
 预算重新抓树，再次精确解析 locator，并比较原生身份与语义指纹。目标消失、变成
 多义、被替换或身份无法验证时返回 `DRIVER.STALE_SNAPSHOT`。旧快照或重新抓取结果
 被截断时返回 `DRIVER.SNAPSHOT_TRUNCATED`。这些失败都发生在原生动作派发之前。
+
+## 显式键盘后备
+
+`desktop.linux_atspi.type_text@1` 是独立动作，不是 `set_text`/`invoke` 的错误处理分支。
+调用方必须提供原 snapshot 的 target、原 locator 与普通文本；驱动以原预算 fresh
+capture，重新精确 resolve，比较原生身份和语义指纹，并检查普通 text/entry role、
+enabled、visible、showing、focusable、editable、sensitive、protected 与进程 ID。任一证据
+缺失都在聚焦前失败关闭。Wayland、其他桌面或缺少 `DISPLAY` 返回 unavailable。
+
+文本限制为 1–1024 个 Unicode 字符、最多 4096 UTF-8 字节；除换行外拒绝控制字符，
+不支持密码和 secret。helper 是固定路径单次 C++ 进程，非敏感 PID 与单调截止时间走
+严格 argv，文本只走 stdin；它核对 XTEST 与焦点窗口祖先 `_NET_WM_PID`。现有键盘映射
+无法表达的码点分别占用不同空闲非 modifier keycode，全部映射一次性提交并同步后才
+派发，结束时恢复映射。首个合成事件后任一错误/timeout 都映射为非 retryable 的
+`DRIVER.UNKNOWN_EFFECT`。成功只表示事件提交，调用方仍须 fresh snapshot 验证文本。
 
 驱动一旦进入原生写接口，就使当前公开快照失效。原生接口报错或截止时间在派发后
 耗尽时，驱动返回 `DRIVER.UNKNOWN_EFFECT`，不得自动重放。成功响应只证明 AT-SPI
@@ -159,7 +176,7 @@ AT-SPI bus。完整语义后端还需要 `Atspi 2.0` typelib；缺少该 typelib
 不以 root 运行，也不连接其他用户的 D-Bus session。
 
 跨平台测试通过 fake backend 验证 manifest、会话报告、快照归一化、精确与多义
-定位、revision/stale、截断保护、六种语义写动作、deadline 和 NDJSON 帧限制。Linux
+定位、revision/stale、截断保护、七种写动作、deadline 和 NDJSON 帧限制。Linux
 真机 smoke 仅在依赖与桌面确实可用时枚举应用并抓取有界快照；无 GUI、无 Gio 或无
 AT-SPI bus 时保守跳过或确认 `DRIVER.UNAVAILABLE`，不会把测试环境缺失误报为驱动
 成功。测试辅助可以从当前用户的 `kwin_x11` 进程恢复遗漏的 KDE/X11 环境变量，但这条
@@ -176,8 +193,13 @@ Qt AT-SPI bridge 不可用并跳过，不把进程启动成功误作可访问性
 本次 Debian 12、Plasma 5.27.5、Qt 5.15.8、X11 环境中，当前长期 AT-SPI registry
 一度无法接收新 Qt application；测试因此改为在同一真实 X11 display 上启动隔离的
 session/accessibility bus，现已真实通过 Qt Widgets 的 snapshot/find/focus/set_text/invoke
-及动作后重新观察。GTK3 的真实语义动作链路同样通过。测试未使用 OCR、XTEST、
-虚拟键盘鼠标或坐标点击。
+及动作后重新观察。GTK3 的真实语义动作链路同样通过。另以隔离 AT-SPI bus 的已解锁
+KDE/X11 display，以及私有 Xvfb + 私有 AT-SPI bus，分别验证 GTK3/Qt5 `type_text` 的
+真实 XTEST UTF-8 输入和 fresh snapshot 后置条件；未使用 OCR、`xdotool`、剪贴板或
+坐标点击。锁屏时 XTEST 请求可能被会话吞掉，因此成功响应仍不能替代后置条件。
+生产动作当前不读取登录管理器锁定状态；锁屏/登录界面明确不受支持，调用方必须在
+解锁的用户会话执行，并把返回字段 `submitted=true` 理解为“X server 已接受事件请求”，
+而不是“应用已接收文本”。
 代码中为 Qt 5 Widgets 保留了保守的已观测映射：按钮只有在 exact canonical `Press`
 唯一存在时才公开 `invoke`；由于 Qt 5 bridge 不导出 `AccessibleId`，写前身份验证要求
 bus/object path、toolkit/version 与进程 ID 全部一致，并继续比较语义指纹。该映射只有在

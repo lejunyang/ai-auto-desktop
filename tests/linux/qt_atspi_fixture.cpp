@@ -10,6 +10,7 @@
 namespace {
 constexpr auto kApplicationName = "AAD Qt AT-SPI Fixture";
 constexpr auto kEntryName = "Qt fixture text entry";
+constexpr auto kTypeEntryName = "Qt fixture XTest text entry";
 constexpr auto kButtonName = "Invoke Qt fixture button";
 constexpr auto kStatusInitial = "Qt fixture status idle";
 constexpr auto kStatusInvoked = "Qt fixture status invoked";
@@ -35,6 +36,12 @@ int main(int argc, char **argv) {
     entry->setObjectName("qt-fixture-entry");
     layout->addWidget(entry);
 
+    auto *typeEntry = new QLineEdit(&window);
+    typeEntry->setText("");
+    typeEntry->setAccessibleName(kTypeEntryName);
+    typeEntry->setObjectName("qt-fixture-xtest-entry");
+    layout->addWidget(typeEntry);
+
     auto *button = new QPushButton("Invoke", &window);
     button->setAccessibleName(kButtonName);
     button->setObjectName("qt-fixture-button");
@@ -51,6 +58,9 @@ int main(int argc, char **argv) {
     });
 
     window.show();
+    window.raise();
+    window.activateWindow();
+    typeEntry->setFocus(Qt::OtherFocusReason);
     QTextStream(stdout) << "READY\n" << Qt::flush;
     return application.exec();
 }

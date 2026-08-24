@@ -8,6 +8,7 @@ import io
 import json
 import os
 from pathlib import Path
+import stat
 import sys
 import time
 import unittest
@@ -61,7 +62,7 @@ def node(
             "showing": True,
             "focusable": "focus" in actions,
             "focused": False,
-            "editable": "set_text" in actions,
+            "editable": bool({"set_text", "type_text"}.intersection(actions)),
             "sensitive": True,
             "protected": protected,
             "checked": checked,
@@ -103,7 +104,7 @@ def default_tree() -> list[object]:
             "text",
             "Title",
             value="Draft",
-            actions=("focus", "set_text"),
+            actions=("focus", "set_text", "type_text"),
             attributes={"class": "QLineEdit", "id": "title"},
         ),
         node(
@@ -207,6 +208,38 @@ class FakeBackend:
     ) -> bool:
         self.calls.append(("same_element", previous, current))
         return previous == current
+
+
+class FakeXTestHelper:
+    def __init__(self) -> None:
+        self.calls: list[tuple[object, ...]] = []
+        self.failure: atspi.DriverError | None = None
+
+    def _qualified_environment(self) -> dict[str, str]:
+        self.calls.append(("qualified_environment",))
+        return {"DISPLAY": ":0"}
+
+    def _validated_path(self) -> str:
+        self.calls.append(("validated_path",))
+        return "/fixed/x11_xtest_helper"
+
+    def preflight(self) -> None:
+        self._qualified_environment()
+        self._validated_path()
+
+    def type_text(
+        self, text: str, *, expected_process_id: int, deadline: float
+    ) -> dict[str, object]:
+        self.calls.append(("type_text", text, expected_process_id))
+        if self.failure is not None:
+            raise self.failure
+        return {
+            "native_interface": "XTEST",
+            "synthetic_input": True,
+            "submitted": True,
+            "events": max(2, len(text) * 2),
+            "codepoints": len(text),
+        }
 
 
 class IdentityFailureBackend(FakeBackend):
@@ -350,6 +383,11 @@ class LinuxAtspiDriverCoreTests(unittest.TestCase):
             ("focus", {"object_path": "/org/a11y/atspi/accessible/save"}, {}),
             ("invoke", {"attributes": {"id": "save"}}, {}),
             ("set_text", {"attributes": {"id": "title"}}, {"text": "Final"}),
+            (
+                "type_text",
+                {"attributes": {"id": "title"}},
+                {"text": "UTF-8: 你好"},
+            ),
             ("toggle", {"attributes": {"id": "autosave"}}, {}),
             ("expand", {"attributes": {"id": "details"}}, {}),
             (
@@ -373,7 +411,8 @@ class LinuxAtspiDriverCoreTests(unittest.TestCase):
                         attributes={"class": "GtkExpander", "id": "details"},
                     )
                 backend = FakeBackend([tree])
-                driver = atspi.LinuxAtspiDriver(backend)
+                helper = FakeXTestHelper()
+                driver = atspi.LinuxAtspiDriver(backend, xtest_helper=helper)
                 snapshot = driver.execute(
                     "snapshot",
                     {"application": {"bus_name": ":1.42"}},
@@ -397,9 +436,210 @@ class LinuxAtspiDriverCoreTests(unittest.TestCase):
                 self.assertEqual(result["action"], action)
                 self.assertEqual(backend.capture_count, 2)
                 action_calls = [call for call in backend.calls if call[0] == action]
-                self.assertEqual(len(action_calls), 1)
+                self.assertEqual(len(action_calls), 0 if action == "type_text" else 1)
                 if action == "set_text":
                     self.assertEqual(action_calls[0], ("set_text", "title", "Final"))
+                if action == "type_text":
+                    self.assertEqual(action_calls, [])
+                    self.assertEqual(
+                        [call for call in backend.calls if call[0] == "focus"],
+                        [("focus", "title", None)],
+                    )
+                    self.assertEqual(
+                        helper.calls[-1], ("type_text", "UTF-8: 你好", 7)
+                    )
+                    self.assertTrue(result["backend_result"]["synthetic_input"])
+
+    def test_type_text_preflights_and_never_implicitly_falls_back(self) -> None:
+        helper = FakeXTestHelper()
+        driver = atspi.LinuxAtspiDriver(self.backend, xtest_helper=helper)
+        snapshot = driver.execute(
+            "snapshot", {"application": {"name": "Editor"}}, deadline=deadline()
+        )
+        found = driver.execute(
+            "find",
+            {
+                "snapshot_id": snapshot["snapshot_id"],
+                "revision": snapshot["revision"],
+                "locator": {"attributes": {"id": "title"}},
+            },
+            deadline=deadline(),
+        )
+        invalid_texts = ("", "tab\tforbidden", "nul\0forbidden", "x" * 1025)
+        for text in invalid_texts:
+            current = driver.execute(
+                "snapshot",
+                {"application": {"name": "Editor"}},
+                deadline=deadline(),
+            )
+            current_target = driver.execute(
+                "find",
+                {
+                    "snapshot_id": current["snapshot_id"],
+                    "revision": current["revision"],
+                    "locator": {"attributes": {"id": "title"}},
+                },
+                deadline=deadline(),
+            )["target"]
+            with self.subTest(text_length=len(text)), self.assertRaises(
+                atspi.DriverError
+            ) as raised:
+                driver.execute(
+                    "type_text",
+                    {
+                        "target": current_target,
+                        "locator": {"attributes": {"id": "title"}},
+                        "text": text,
+                    },
+                    deadline=deadline(),
+                )
+            self.assertEqual(raised.exception.code, "DRIVER.INVALID_REQUEST")
+        self.assertFalse(any(call[0] in {"focus", "set_text"} for call in self.backend.calls))
+        self.assertFalse(any(call[0] == "type_text" for call in helper.calls))
+
+        fresh = driver.execute(
+            "snapshot", {"application": {"name": "Editor"}}, deadline=deadline()
+        )
+        button = driver.execute(
+            "find",
+            {
+                "snapshot_id": fresh["snapshot_id"],
+                "revision": fresh["revision"],
+                "locator": {"attributes": {"id": "save"}},
+            },
+            deadline=deadline(),
+        )
+        with self.assertRaises(atspi.DriverError) as unsupported:
+            driver.execute(
+                "type_text",
+                {
+                    "target": button["target"],
+                    "locator": {"attributes": {"id": "save"}},
+                    "text": "never typed",
+                },
+                deadline=deadline(),
+            )
+        self.assertEqual(unsupported.exception.code, "DRIVER.ACTION_UNSUPPORTED")
+        self.assertFalse(any(call[0] == "set_text" for call in self.backend.calls))
+
+    def test_type_text_after_focus_failure_is_unknown_and_never_retried(self) -> None:
+        helper = FakeXTestHelper()
+        helper.failure = atspi.DriverError(
+            "DRIVER.TIMEOUT",
+            "synthetic helper timeout",
+            retryable=True,
+            data={"phase": "before_input_dispatch", "dispatch_started": False},
+        )
+        driver = atspi.LinuxAtspiDriver(FakeBackend(), xtest_helper=helper)
+        snapshot = driver.execute(
+            "snapshot", {"application": {"name": "Editor"}}, deadline=deadline()
+        )
+        found = driver.execute(
+            "find",
+            {
+                "snapshot_id": snapshot["snapshot_id"],
+                "revision": snapshot["revision"],
+                "locator": {"attributes": {"id": "title"}},
+            },
+            deadline=deadline(),
+        )
+        with self.assertRaises(atspi.DriverError) as raised:
+            driver.execute(
+                "type_text",
+                {
+                    "target": found["target"],
+                    "locator": {"attributes": {"id": "title"}},
+                    "text": "one attempt",
+                },
+                deadline=deadline(),
+            )
+        self.assertEqual(raised.exception.code, "DRIVER.UNKNOWN_EFFECT")
+        self.assertFalse(raised.exception.retryable)
+        self.assertEqual(raised.exception.data["effect"], "unknown")
+        self.assertEqual(
+            len([call for call in helper.calls if call[0] == "type_text"]), 1
+        )
+
+    def test_type_text_stale_or_protected_target_never_reaches_helper(self) -> None:
+        replacement = default_tree()
+        replacement[3] = node(
+            "replacement",
+            1,
+            "text",
+            "Title",
+            value="Draft",
+            actions=("focus", "set_text", "type_text"),
+            attributes={"class": "QLineEdit", "id": "title"},
+        )
+        helper = FakeXTestHelper()
+        backend = FakeBackend([default_tree(), replacement])
+        driver = atspi.LinuxAtspiDriver(backend, xtest_helper=helper)
+        snapshot = driver.execute(
+            "snapshot", {"application": {"name": "Editor"}}, deadline=deadline()
+        )
+        found = driver.execute(
+            "find",
+            {
+                "snapshot_id": snapshot["snapshot_id"],
+                "revision": snapshot["revision"],
+                "locator": {"attributes": {"id": "title"}},
+            },
+            deadline=deadline(),
+        )
+        with self.assertRaises(atspi.DriverError) as stale:
+            driver.execute(
+                "type_text",
+                {
+                    "target": found["target"],
+                    "locator": {"attributes": {"id": "title"}},
+                    "text": "never",
+                },
+                deadline=deadline(),
+            )
+        self.assertEqual(stale.exception.code, "DRIVER.STALE_SNAPSHOT")
+        self.assertFalse(any(call[0] == "focus" for call in backend.calls))
+        self.assertFalse(any(call[0] == "type_text" for call in helper.calls))
+
+        protected_tree = default_tree()
+        protected_tree[3] = node(
+            "password",
+            1,
+            "password_text",
+            "Password",
+            actions=("focus", "type_text"),
+            protected=True,
+            attributes={"id": "password"},
+        )
+        protected_backend = FakeBackend([protected_tree])
+        protected_helper = FakeXTestHelper()
+        protected_driver = atspi.LinuxAtspiDriver(
+            protected_backend, xtest_helper=protected_helper
+        )
+        protected_snapshot = protected_driver.execute(
+            "snapshot", {"application": {"name": "Editor"}}, deadline=deadline()
+        )
+        protected_found = protected_driver.execute(
+            "find",
+            {
+                "snapshot_id": protected_snapshot["snapshot_id"],
+                "revision": protected_snapshot["revision"],
+                "locator": {"attributes": {"id": "password"}},
+            },
+            deadline=deadline(),
+        )
+        with self.assertRaises(atspi.DriverError) as protected:
+            protected_driver.execute(
+                "type_text",
+                {
+                    "target": protected_found["target"],
+                    "locator": {"attributes": {"id": "password"}},
+                    "text": "secret",
+                },
+                deadline=deadline(),
+            )
+        self.assertEqual(protected.exception.code, "DRIVER.PROTECTED_ELEMENT")
+        self.assertFalse(any(call[0] == "focus" for call in protected_backend.calls))
+        self.assertFalse(any(call[0] == "type_text" for call in protected_helper.calls))
 
     def test_stale_revision_and_replaced_native_target_never_dispatch(self) -> None:
         replacement = default_tree()
@@ -1168,6 +1408,120 @@ class LinuxAtspiProcessTests(unittest.TestCase):
         self.addCleanup(plugin.close)
         return plugin
 
+    def test_xtest_helper_uses_stdin_and_post_dispatch_timeout_is_unknown(self) -> None:
+        class TimedOutProcess:
+            returncode: int | None = None
+
+            def __init__(self) -> None:
+                self.calls = 0
+                self.killed = False
+
+            def communicate(
+                self, input: bytes | None = None, timeout: float | None = None
+            ) -> tuple[bytes, bytes]:
+                self.calls += 1
+                if self.calls == 1:
+                    self.assert_input = input
+                    raise atspi.subprocess.TimeoutExpired(
+                        ["helper"],
+                        timeout or 0,
+                        output=b'{"event":"dispatch_started"}\n',
+                    )
+                return b"", b""
+
+            def kill(self) -> None:
+                self.killed = True
+
+        process = TimedOutProcess()
+        helper = atspi.XTestHelper(Path("/fixed/x11_xtest_helper"))
+        with (
+            mock.patch.object(
+                helper,
+                "_qualified_environment",
+                return_value={"DISPLAY": ":99", "XDG_SESSION_TYPE": "x11"},
+            ),
+            mock.patch.object(
+                helper, "_validated_path", return_value=str(helper.path)
+            ),
+            mock.patch.object(
+                atspi.subprocess, "Popen", return_value=process
+            ) as popen,
+        ):
+            with self.assertRaises(atspi.DriverError) as raised:
+                helper.type_text(
+                    "secret-free text",
+                    expected_process_id=77,
+                    deadline=time.monotonic() + 1,
+                )
+        self.assertEqual(raised.exception.code, "DRIVER.UNKNOWN_EFFECT")
+        self.assertFalse(raised.exception.retryable)
+        self.assertEqual(raised.exception.data["effect"], "unknown")
+        self.assertTrue(process.killed)
+        command = popen.call_args.args[0]
+        self.assertNotIn("secret-free text", command)
+        self.assertEqual(process.assert_input, b"secret-free text")
+        self.assertNotIn("shell", popen.call_args.kwargs)
+
+    def test_xtest_helper_success_reports_submitted_not_accepted(self) -> None:
+        class SuccessfulProcess:
+            returncode = 0
+
+            @staticmethod
+            def communicate(
+                input: bytes | None = None, timeout: float | None = None
+            ) -> tuple[bytes, bytes]:
+                return (
+                    b'{"event":"dispatch_started"}\n'
+                    b'{"ok":true,"dispatch_started":true,"events":2,'
+                    b'"codepoints":1}\n',
+                    b"",
+                )
+
+        helper = atspi.XTestHelper(Path("/fixed/x11_xtest_helper"))
+        with (
+            mock.patch.object(helper, "_qualified_environment", return_value={"DISPLAY": ":99"}),
+            mock.patch.object(helper, "_validated_path", return_value=str(helper.path)),
+            mock.patch.object(atspi.subprocess, "Popen", return_value=SuccessfulProcess()),
+        ):
+            result = helper.type_text(
+                "x", expected_process_id=77, deadline=time.monotonic() + 1
+            )
+        self.assertTrue(result["submitted"])
+        self.assertNotIn("accepted", result)
+
+    def test_xtest_helper_session_gate_is_fail_closed(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {
+                "DISPLAY": ":1",
+                "XDG_SESSION_TYPE": "wayland",
+                "XDG_CURRENT_DESKTOP": "KDE",
+            },
+            clear=True,
+        ), self.assertRaises(atspi.DriverError) as raised:
+            atspi.XTestHelper._qualified_environment()
+        self.assertEqual(raised.exception.code, "DRIVER.UNAVAILABLE")
+        self.assertEqual(raised.exception.data["reason"], "unsupported_session")
+
+    def test_xtest_helper_rejects_untrusted_executable(self) -> None:
+        helper_path = Path(self.id().replace(".", "_"))
+        helper = atspi.XTestHelper(helper_path)
+        with mock.patch.object(Path, "lstat") as lstat, mock.patch.object(
+            os, "access", return_value=True
+        ):
+            lstat.return_value = type(
+                "Details",
+                (),
+                {
+                    "st_mode": stat.S_IFREG | stat.S_IRWXU | stat.S_IWGRP,
+                    "st_uid": os.geteuid(),
+                },
+            )()
+            with self.assertRaises(atspi.DriverError) as raised:
+                helper._validated_path()
+        self.assertEqual(raised.exception.code, "DRIVER.UNAVAILABLE")
+        self.assertEqual(raised.exception.data["reason"], "helper_untrusted")
+
     def test_manifest_is_linux_only_and_uses_action_specific_permissions(self) -> None:
         manifest = self.make_plugin().start()
         self.assertEqual(manifest["metadata"]["name"], "desktop.linux_atspi")
@@ -1182,6 +1536,7 @@ class LinuxAtspiProcessTests(unittest.TestCase):
                 "focus",
                 "invoke",
                 "set_text",
+                "type_text",
                 "toggle",
                 "expand",
                 "collapse",
@@ -1196,6 +1551,7 @@ class LinuxAtspiProcessTests(unittest.TestCase):
             "focus",
             "invoke",
             "set_text",
+            "type_text",
             "toggle",
             "expand",
             "collapse",
@@ -1207,6 +1563,14 @@ class LinuxAtspiProcessTests(unittest.TestCase):
         self.assertEqual(
             manifest["actions"]["toggle"]["effect"]["default_class"],
             "non_idempotent",
+        )
+        self.assertEqual(
+            manifest["actions"]["type_text"]["effect"]["default_class"],
+            "contextual",
+        )
+        self.assertEqual(
+            manifest["actions"]["type_text"]["risk"],
+            {"category": "input", "level": "high"},
         )
         for name in ("expand", "collapse"):
             self.assertEqual(

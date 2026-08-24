@@ -14,19 +14,22 @@ from ai_auto_desktop.plugin import PluginError, ProcessPlugin
 
 
 ENTRY_NAME = "Qt fixture text entry"
+TYPE_ENTRY_NAME = "Qt fixture XTest text entry"
 BUTTON_NAME = "Invoke Qt fixture button"
 STATUS_INVOKED = "Qt fixture status invoked"
 
 
 def main() -> int:
-    if len(sys.argv) != 3:
+    if len(sys.argv) not in {3, 4} or (len(sys.argv) == 4 and sys.argv[3] != "--type-text"):
         print(json.dumps({"status": "failed", "reason": "invalid_arguments"}))
         return 64
+    test_type_text = len(sys.argv) == 4
     executable = Path(sys.argv[1]).resolve()
     driver = Path(sys.argv[2]).resolve()
     environment = os.environ.copy()
     environment["QT_LINUX_ACCESSIBILITY_ALWAYS_ON"] = "1"
     environment["QT_ACCESSIBILITY"] = "1"
+    environment.pop("AT_SPI_BUS_ADDRESS", None)
     stage = "launch_fixture"
     fixture = subprocess.Popen(
         [str(executable)],
@@ -116,6 +119,11 @@ def main() -> int:
             "toolkit_name": "Qt",
             "actions": ["invoke"],
         }
+        type_entry_locator = {
+            "role": "text",
+            "name": TYPE_ENTRY_NAME,
+            "toolkit_name": "Qt",
+        }
         stage = "initial_snapshot"
         initial_entry = find(snapshot(), entry_locator)["node"]
         if initial_entry["value"] != "Qt fixture initial text":
@@ -145,6 +153,54 @@ def main() -> int:
         )["node"]
         if changed_node["value"] != changed:
             raise RuntimeError("set_text was not observed")
+        if test_type_text:
+            stage = "invoke_type_text"
+            initial_type_entry = find(snapshot(), type_entry_locator)["node"]
+            if initial_type_entry["value"] != "":
+                raise RuntimeError("XTest entry did not start empty")
+            if "type_text" not in initial_type_entry["actions"]:
+                raise RuntimeError(
+                    f"XTest entry did not qualify for type_text: {initial_type_entry!r}"
+                )
+            focus_result = write("focus", type_entry_locator)
+            if not focus_result["backend_result"].get("accepted"):
+                raise RuntimeError("XTest entry focus was not accepted")
+            time.sleep(0.1)
+            typed = "Qt XTest UTF-8 你好"
+            typed_result = write("type_text", type_entry_locator, text=typed)
+            input_result = typed_result["backend_result"].get("input", {})
+            if input_result.get("native_interface") != "XTEST":
+                raise RuntimeError("type_text did not use the XTEST helper")
+            stage = "observe_type_text"
+            stop = time.monotonic() + 3
+            last_value = None
+            while True:
+                try:
+                    typed_node = find(
+                        snapshot(), {**type_entry_locator, "value": typed}
+                    )["node"]
+                    if typed_node["value"] == typed:
+                        break
+                except Exception as exc:
+                    try:
+                        last_value = find(snapshot(), type_entry_locator)["node"].get("value")
+                    except Exception:
+                        pass
+                    if time.monotonic() >= stop:
+                        text_nodes = [
+                            {
+                                "name": node.get("name"),
+                                "value": node.get("value"),
+                                "focused": node.get("states", {}).get("focused"),
+                            }
+                            for node in snapshot()["nodes"]
+                            if node.get("role") in {"text", "entry"}
+                        ]
+                        raise RuntimeError(
+                            f"type_text postcondition not observed; value={last_value!r}; "
+                            f"text_nodes={text_nodes!r}; input_result={input_result!r}"
+                        ) from exc
+                    time.sleep(0.1)
         stage = "invoke"
         invoked = write("invoke", button_locator)
         if invoked["backend_result"].get("native_action_name") != "Press":
@@ -172,8 +228,13 @@ def main() -> int:
                     "status": "passed",
                     "toolkit": application["toolkit_name"],
                     "toolkit_version": application["toolkit_version"],
-                    "actions": ["focus", "set_text", "invoke"],
-                    "input_injection": False,
+                    "actions": (
+                        ["focus", "set_text", "type_text", "invoke"]
+                        if test_type_text
+                        else ["focus", "set_text", "invoke"]
+                    ),
+                    "input_injection": "XTEST" if test_type_text else False,
+                    "type_text_observed": test_type_text,
                     "ocr": False,
                 },
                 ensure_ascii=False,

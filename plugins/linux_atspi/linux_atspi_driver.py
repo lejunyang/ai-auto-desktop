@@ -3,7 +3,8 @@
 
 进程边界使用仓库约定的 UTF-8 NDJSON 协议。驱动核心不依赖 PyGObject，
 因此可以在任意平台注入 fake backend 验证定位、快照与过期目标规则。
-本驱动只调用 AT-SPI 原生语义接口，不注入键盘、指针或坐标事件。
+除显式 ``type_text`` 的固定路径 XTest helper 外，本驱动只调用 AT-SPI 原生语义接口；
+不注入指针或坐标事件。
 """
 
 from __future__ import annotations
@@ -16,7 +17,10 @@ import hashlib
 import json
 import math
 import os
+from pathlib import Path
 import re
+import stat
+import subprocess
 import sys
 import time
 from typing import Any, NoReturn, Protocol
@@ -28,12 +32,17 @@ PLUGIN_VERSION = "0.1.0"
 MAX_REQUEST_BYTES = 1024 * 1024
 MAX_RESPONSE_BYTES = 8 * 1024 * 1024 - 1
 MAX_FIELD_CHARS = 4096
+MAX_TYPE_TEXT_CHARS = 1024
+MAX_TYPE_TEXT_BYTES = 4096
 DEFAULT_REQUEST_SECONDS = 30.0
 DEFAULT_MAX_DEPTH = 32
 DEFAULT_MAX_NODES = 1000
 MAX_DEPTH = 128
 MAX_NODES = 5000
 MAX_CANDIDATE_SUMMARIES = 10
+XTEST_HELPER_PATH = Path(__file__).resolve().parent / ".build" / "x11_xtest_helper"
+XTEST_HELPER_MAX_OUTPUT_BYTES = 64 * 1024
+TYPE_TEXT_ROLES = frozenset({"entry", "text"})
 # D-Bus 在返回 ``a(so)`` 后才交给 Python 解包；该上限不能避免总线已传输的
 # 数据，但会在解包后立即拒绝异常 fan-out，避免继续复制或遍历无界列表。
 MAX_DBUS_CHILDREN_PER_CALL = MAX_NODES
@@ -55,6 +64,7 @@ ACTION_IDS = {
         "focus",
         "invoke",
         "set_text",
+        "type_text",
         "toggle",
         "expand",
         "collapse",
@@ -62,7 +72,7 @@ ACTION_IDS = {
 }
 ACTION_NAMES = {full_name: short_name for short_name, full_name in ACTION_IDS.items()}
 WRITE_ACTIONS = frozenset(
-    {"focus", "invoke", "set_text", "toggle", "expand", "collapse"}
+    {"focus", "invoke", "set_text", "type_text", "toggle", "expand", "collapse"}
 )
 NODE_ACTIONS = WRITE_ACTIONS
 STATE_NAMES = (
@@ -340,6 +350,29 @@ ACTION_CONTRACTS: dict[str, dict[str, Any]] = {
         errors=COMMON_ERRORS + LOCATOR_ERRORS + ACTION_ERRORS,
         permissions=("desktop.observe", "desktop.input"),
     ),
+    "type_text": _contract(
+        "重新验证并聚焦目标后，通过受限 KDE/X11 XTest helper 显式输入普通 UTF-8 文本。",
+        effect="contextual",
+        risk_category="input",
+        risk_level="high",
+        input_schema={
+            "type": "object",
+            "required": ["target", "locator", "text"],
+            "properties": {
+                "target": TARGET_SCHEMA,
+                "locator": LOCATOR_SCHEMA,
+                "text": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": MAX_TYPE_TEXT_CHARS,
+                },
+            },
+            "additionalProperties": False,
+        },
+        output_schema=WRITE_OUTPUT_SCHEMA,
+        errors=COMMON_ERRORS + LOCATOR_ERRORS + ACTION_ERRORS,
+        permissions=("desktop.observe", "desktop.input"),
+    ),
     "toggle": _contract(
         "重新验证 GTK3 目标及 checked 状态后，精确调用名为 click 的 AT-SPI 动作。",
         effect="non_idempotent",
@@ -472,6 +505,232 @@ class _SnapshotRecord:
     max_nodes: int
 
 
+class XTestHelper:
+    """固定路径、单次进程的 X11/XTest 键盘注入边界。"""
+
+    def __init__(self, path: Path = XTEST_HELPER_PATH) -> None:
+        self.path = path
+
+    @staticmethod
+    def _qualified_environment() -> dict[str, str]:
+        session = _environment_session_info()
+        session_type = str(session.get("session_type") or "").strip().lower()
+        desktop_entries = {
+            item.upper()
+            for item in re.split(r"[:;]", str(session.get("desktop") or ""))
+            if item
+        }
+        if session_type != "x11" or not session.get("display") or "KDE" not in desktop_entries:
+            raise DriverError(
+                "DRIVER.UNAVAILABLE",
+                "type_text 仅支持明确的 KDE/X11/DISPLAY 会话",
+                data={
+                    "reason": "unsupported_session",
+                    "required_session_type": "x11",
+                    "required_desktop": "KDE",
+                    "session": session,
+                },
+            )
+        allowed = (
+            "DISPLAY",
+            "XAUTHORITY",
+            "XDG_SESSION_TYPE",
+            "XDG_CURRENT_DESKTOP",
+            "DESKTOP_SESSION",
+        )
+        return {name: os.environ[name] for name in allowed if os.environ.get(name)}
+
+    def _validated_path(self) -> str:
+        try:
+            details = self.path.lstat()
+        except OSError as exc:
+            raise DriverError(
+                "DRIVER.UNAVAILABLE",
+                "XTest helper 尚未构建",
+                data={
+                    "reason": "helper_missing",
+                    "build_command": "plugins/linux_atspi/build_x11_xtest_helper.sh",
+                    "exception_type": type(exc).__name__,
+                },
+            ) from exc
+        unsafe_mode = bool(details.st_mode & (stat.S_IWGRP | stat.S_IWOTH))
+        if (
+            not stat.S_ISREG(details.st_mode)
+            or details.st_uid != os.geteuid()
+            or unsafe_mode
+            or not os.access(self.path, os.X_OK)
+        ):
+            raise DriverError(
+                "DRIVER.UNAVAILABLE",
+                "XTest helper 身份或权限不可信",
+                data={
+                    "reason": "helper_untrusted",
+                    "regular": stat.S_ISREG(details.st_mode),
+                    "owner_matches": details.st_uid == os.geteuid(),
+                    "group_or_world_writable": unsafe_mode,
+                    "executable": os.access(self.path, os.X_OK),
+                },
+            )
+        return str(self.path)
+
+    def preflight(self) -> None:
+        self._qualified_environment()
+        self._validated_path()
+
+    @staticmethod
+    def _parse_output(output: bytes) -> tuple[bool, dict[str, Any] | None]:
+        if len(output) > XTEST_HELPER_MAX_OUTPUT_BYTES:
+            raise DriverError(
+                "DRIVER.ACTION_FAILED",
+                "XTest helper 输出超过限制",
+                data={"reason": "helper_output_too_large"},
+            )
+        dispatch_started = False
+        result: dict[str, Any] | None = None
+        for raw_line in output.splitlines():
+            try:
+                decoded = json.loads(raw_line.decode("utf-8", errors="strict"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                continue
+            if not isinstance(decoded, dict):
+                continue
+            if decoded.get("event") == "dispatch_started":
+                dispatch_started = True
+            elif "ok" in decoded:
+                result = decoded
+                dispatch_started = dispatch_started or decoded.get("dispatch_started") is True
+        return dispatch_started, result
+
+    def type_text(
+        self, text: str, *, expected_process_id: int, deadline: float
+    ) -> dict[str, Any]:
+        environment = self._qualified_environment()
+        executable = self._validated_path()
+        _check_deadline(deadline)
+        command = [
+            executable,
+            "type-text",
+            "--expected-pid",
+            str(expected_process_id),
+            "--deadline-monotonic-ns",
+            str(int(deadline * 1_000_000_000)),
+        ]
+        try:
+            process = subprocess.Popen(
+                command,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                cwd=str(self.path.parent),
+                env=environment,
+                close_fds=True,
+            )
+        except OSError as exc:
+            raise DriverError(
+                "DRIVER.UNAVAILABLE",
+                "无法启动固定路径 XTest helper",
+                data={"reason": "helper_start_failed", "exception_type": type(exc).__name__},
+            ) from exc
+        encoded = text.encode("utf-8", errors="strict")
+        try:
+            stdout, _stderr = process.communicate(
+                input=encoded, timeout=max(0.001, deadline - time.monotonic())
+            )
+        except subprocess.TimeoutExpired as exc:
+            partial = exc.output if isinstance(exc.output, bytes) else b""
+            process.kill()
+            tail, _stderr = process.communicate()
+            stdout = partial + tail
+            dispatch_started, _result = self._parse_output(stdout)
+            if dispatch_started:
+                raise DriverError(
+                    "DRIVER.UNKNOWN_EFFECT",
+                    "XTest helper 在首个输入事件后超时",
+                    retryable=False,
+                    data={
+                        "phase": "keyboard_dispatch",
+                        "dispatch_started": True,
+                        "effect": "unknown",
+                    },
+                ) from exc
+            raise DriverError(
+                "DRIVER.TIMEOUT",
+                "XTest helper 在首个输入事件前超时",
+                retryable=True,
+                data={
+                    "phase": "before_input_dispatch",
+                    "dispatch_started": False,
+                    "effect": "not_applied",
+                },
+            ) from exc
+        dispatch_started, result = self._parse_output(stdout)
+        if process.returncode == 0 and result is not None and result.get("ok") is True:
+            if not dispatch_started:
+                raise DriverError(
+                    "DRIVER.ACTION_FAILED",
+                    "XTest helper 未证明输入事件已派发",
+                    data={"reason": "missing_dispatch_marker"},
+                )
+            events = result.get("events")
+            codepoints = result.get("codepoints")
+            if (
+                isinstance(events, bool)
+                or not isinstance(events, int)
+                or events < 2
+                or isinstance(codepoints, bool)
+                or not isinstance(codepoints, int)
+                or codepoints < 1
+            ):
+                raise DriverError(
+                    "DRIVER.UNKNOWN_EFFECT",
+                    "XTest helper 在输入派发后返回无效结果",
+                    data={
+                        "phase": "post_dispatch",
+                        "dispatch_started": True,
+                        "effect": "unknown",
+                    },
+                )
+            return {
+                "native_interface": "XTEST",
+                "synthetic_input": True,
+                "submitted": True,
+                "events": events,
+                "codepoints": codepoints,
+                "expected_process_id": expected_process_id,
+            }
+        helper_code = result.get("code") if isinstance(result, dict) else None
+        helper_phase = result.get("phase") if isinstance(result, dict) else None
+        details = {
+            "helper_exit_code": process.returncode,
+            "helper_code": helper_code,
+            "phase": helper_phase or ("keyboard_dispatch" if dispatch_started else "pre_dispatch"),
+            "dispatch_started": dispatch_started,
+            "effect": "unknown" if dispatch_started else "not_applied",
+        }
+        if dispatch_started or process.returncode == 70:
+            raise DriverError(
+                "DRIVER.UNKNOWN_EFFECT",
+                "XTest helper 在首个输入事件后失败",
+                retryable=False,
+                data=details,
+            )
+        if process.returncode == 69:
+            raise DriverError("DRIVER.UNAVAILABLE", "X11/XTest 不可用", data=details)
+        if process.returncode == 74:
+            raise DriverError(
+                "DRIVER.ACTION_UNSUPPORTED", "当前 X11 键盘映射不支持完整文本", data=details
+            )
+        if process.returncode == 75:
+            raise DriverError(
+                "DRIVER.TIMEOUT", "XTest helper 在输入派发前超时", retryable=True, data=details
+            )
+        raise DriverError(
+            "DRIVER.ACTION_FAILED",
+            "XTest helper 未派发输入并失败关闭",
+            data=details,
+        )
+
+
 def _fail(code: str, message: str, **data: Any) -> NoReturn:
     raise DriverError(code, message, data=data or None)
 
@@ -528,6 +787,44 @@ def _safe_text(value: Any) -> str | None:
     except Exception:
         return None
     return text[:MAX_FIELD_CHARS]
+
+
+def _ordinary_type_text(value: Any) -> str:
+    """Validate the complete payload before any focus or XTest dispatch."""
+
+    if not isinstance(value, str):
+        _fail("DRIVER.INVALID_REQUEST", "text 必须是字符串")
+    if not value or len(value) > MAX_TYPE_TEXT_CHARS:
+        _fail(
+            "DRIVER.INVALID_REQUEST",
+            f"type_text 文本必须包含 1 到 {MAX_TYPE_TEXT_CHARS} 个字符",
+        )
+    try:
+        encoded = value.encode("utf-8", errors="strict")
+    except UnicodeEncodeError as exc:
+        raise DriverError(
+            "DRIVER.INVALID_REQUEST",
+            "type_text 文本必须是有效 UTF-8",
+            data={"reason": "invalid_unicode"},
+        ) from exc
+    if len(encoded) > MAX_TYPE_TEXT_BYTES:
+        _fail(
+            "DRIVER.INVALID_REQUEST",
+            f"type_text UTF-8 载荷超过 {MAX_TYPE_TEXT_BYTES} 字节",
+        )
+    if any(
+        (ord(character) < 0x20 and character != "\n")
+        or 0x7F <= ord(character) <= 0x9F
+        or 0xD800 <= ord(character) <= 0xDFFF
+        or 0xFDD0 <= ord(character) <= 0xFDEF
+        or (ord(character) & 0xFFFF) in {0xFFFE, 0xFFFF}
+        for character in value
+    ):
+        _fail(
+            "DRIVER.INVALID_REQUEST",
+            "type_text 只接受普通文本与换行，不接受控制字符",
+        )
+    return value
 
 
 def _json_safe(value: Any, *, depth: int = 0) -> Any:
@@ -597,8 +894,14 @@ def _session_info(backend: Any) -> dict[str, Any]:
 class LinuxAtspiDriver:
     """在可注入原生后端上实现快照限定的 AT-SPI 语义。"""
 
-    def __init__(self, backend: AtspiBackend | None = None) -> None:
+    def __init__(
+        self,
+        backend: AtspiBackend | None = None,
+        *,
+        xtest_helper: XTestHelper | None = None,
+    ) -> None:
         self.backend: AtspiBackend = backend if backend is not None else create_default_backend()
+        self.xtest_helper = xtest_helper if xtest_helper is not None else XTestHelper()
         self.generation = uuid.uuid4().hex
         self._revision = 0
         self._current: _SnapshotRecord | None = None
@@ -743,7 +1046,11 @@ class LinuxAtspiDriver:
                 "attributes": attributes,
                 "states": states,
                 "bounds": _normalize_bounds(backend_node.bounds),
-                "actions": [item for item in actions if not (protected and item == "set_text")],
+                "actions": [
+                    item
+                    for item in actions
+                    if not (protected and item in {"set_text", "type_text"})
+                ],
                 "provenance": provenance,
             }
             nodes.append(node)
@@ -959,7 +1266,8 @@ class LinuxAtspiDriver:
         }
 
     def _write(self, action: str, args: dict[str, Any], deadline: float) -> dict[str, Any]:
-        allowed = {"target", "locator"} | ({"text"} if action == "set_text" else set())
+        text_actions = {"set_text", "type_text"}
+        allowed = {"target", "locator"} | ({"text"} if action in text_actions else set())
         _only_keys(args, allowed, "args")
         if "target" not in args or "locator" not in args:
             _fail("DRIVER.INVALID_REQUEST", "target 和 locator 是必填字段")
@@ -1032,16 +1340,57 @@ class LinuxAtspiDriver:
                 },
             )
         text: str | None = None
-        if action == "set_text":
+        expected_process_id: int | None = None
+        if action in text_actions:
             if "text" not in args:
-                _fail("DRIVER.INVALID_REQUEST", "set_text 必须提供 text")
-            text = _text(args["text"], "text")
+                _fail("DRIVER.INVALID_REQUEST", f"{action} 必须提供 text")
+            text = (
+                _ordinary_type_text(args["text"])
+                if action == "type_text"
+                else _text(args["text"], "text")
+            )
             provenance = resolved.get("provenance", {})
             states = resolved.get("states", {})
             if (
                 isinstance(provenance, Mapping) and provenance.get("value_redacted") is True
             ) or (isinstance(states, Mapping) and states.get("protected") is True):
-                raise DriverError("DRIVER.PROTECTED_ELEMENT", "受保护文本元素禁止 set_text")
+                raise DriverError(
+                    "DRIVER.PROTECTED_ELEMENT", f"受保护文本元素禁止 {action}"
+                )
+            if action == "type_text":
+                if resolved.get("role") not in TYPE_TEXT_ROLES or not all(
+                    isinstance(states, Mapping) and states.get(name) is True
+                    for name in (
+                        "enabled",
+                        "visible",
+                        "showing",
+                        "focusable",
+                        "editable",
+                        "sensitive",
+                    )
+                ):
+                    raise DriverError(
+                        "DRIVER.ACTION_UNSUPPORTED",
+                        "type_text 只支持可见、可聚焦且可编辑的普通文本目标",
+                        data={"action": action, "role": resolved.get("role")},
+                    )
+                raw_process_id = (
+                    provenance.get("process_id")
+                    if isinstance(provenance, Mapping)
+                    else None
+                )
+                if (
+                    isinstance(raw_process_id, bool)
+                    or not isinstance(raw_process_id, int)
+                    or raw_process_id <= 0
+                    or fresh.public.get("application", {}).get("process_id")
+                    != raw_process_id
+                ):
+                    raise DriverError(
+                        "DRIVER.STALE_SNAPSHOT",
+                        "无法证明 type_text 目标的应用进程归属",
+                    )
+                expected_process_id = raw_process_id
         if isinstance(self.backend, GioAtspiBackend):
             # Gio fallback intentionally has no write surface, including
             # state-preserving expand/collapse calls that would otherwise no-op.
@@ -1052,6 +1401,9 @@ class LinuxAtspiDriver:
                 f"目标不支持原生 {action}",
                 data={"action": action, "available_actions": resolved["actions"]},
             )
+        if action == "type_text":
+            # Validate the helper path and desktop profile before changing focus.
+            self.xtest_helper.preflight()
         states = resolved.get("states")
         if not isinstance(states, Mapping):
             states = {}
@@ -1101,6 +1453,47 @@ class LinuxAtspiDriver:
             elif action == "set_text":
                 assert text is not None
                 backend_result = self.backend.set_text(native, text, deadline=deadline)
+            elif action == "type_text":
+                assert text is not None and expected_process_id is not None
+                focus_result = self.backend.focus(native, deadline=deadline)
+                # Component.grab_focus is a synchronous D-Bus call, but GTK/Qt
+                # commit the toolkit-local widget focus on their event loop.  The
+                # X input focus may already belong to the process during that
+                # short transition, so give the owned application one bounded
+                # iteration before the helper verifies the X focus owner.
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    _check_deadline(deadline, post_dispatch=True)
+                time.sleep(min(0.05, remaining))
+                _check_deadline(deadline, post_dispatch=True)
+                try:
+                    input_result = self.xtest_helper.type_text(
+                        text,
+                        expected_process_id=expected_process_id,
+                        deadline=deadline,
+                    )
+                except DriverError as exc:
+                    if exc.code == "DRIVER.UNKNOWN_EFFECT":
+                        raise
+                    details = dict(exc.data) if isinstance(exc.data, Mapping) else {}
+                    raise DriverError(
+                        "DRIVER.UNKNOWN_EFFECT",
+                        "目标聚焦后未能确定 XTest 输入效果",
+                        retryable=False,
+                        data={
+                            "action": action,
+                            "reason": exc.code,
+                            "phase": details.get("phase", "after_focus"),
+                            "dispatch_started": details.get("dispatch_started", False),
+                            "effect": "unknown",
+                        },
+                    ) from exc
+                backend_result = {
+                    "native_interface": "Component.grab_focus -> XTEST",
+                    "focus": _json_safe(focus_result),
+                    "input": _json_safe(input_result),
+                    "synthetic_input": True,
+                }
             elif action == "toggle":
                 backend_result = self.backend.toggle(native, deadline=deadline)
             elif action == "expand":
@@ -1582,6 +1975,8 @@ class PyGObjectAtspiBackend:
         )
         action_metadata = self._action_metadata(accessible, deadline=deadline)
         enabled = self._state(state_set, "ENABLED", deadline=deadline)
+        visible = self._state(state_set, "VISIBLE", deadline=deadline)
+        showing = self._state(state_set, "SHOWING", deadline=deadline)
         sensitive = self._state(state_set, "SENSITIVE", deadline=deadline)
         focusable = self._state(state_set, "FOCUSABLE", deadline=deadline)
         editable = self._state(state_set, "EDITABLE", deadline=deadline)
@@ -1620,6 +2015,22 @@ class PyGObjectAtspiBackend:
             and protected is not True
         ):
             actions.append("set_text")
+        process_id = application.get("process_id")
+        if (
+            enabled is True
+            and visible is True
+            and showing is True
+            and sensitive is True
+            and focusable is True
+            and editable is True
+            and protected is not True
+            and component_iface is not None
+            and role in TYPE_TEXT_ROLES
+            and isinstance(process_id, int)
+            and not isinstance(process_id, bool)
+            and process_id > 0
+        ):
+            actions.append("type_text")
         native_action_names: dict[str, str] = {}
         if "invoke" in actions and is_qualified_qt5:
             native_action_names["invoke"] = QT5_NATIVE_ACTION_NAMES["invoke"]
@@ -1688,8 +2099,8 @@ class PyGObjectAtspiBackend:
             attributes=attributes,
             states={
                 "enabled": enabled,
-                "visible": self._state(state_set, "VISIBLE", deadline=deadline),
-                "showing": self._state(state_set, "SHOWING", deadline=deadline),
+                "visible": visible,
+                "showing": showing,
                 "focusable": focusable,
                 "focused": self._state(state_set, "FOCUSED", deadline=deadline),
                 "editable": editable,

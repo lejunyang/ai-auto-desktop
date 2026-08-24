@@ -11,6 +11,7 @@ from gi.repository import GLib, Gtk
 
 APPLICATION_NAME = "AAD GTK AT-SPI Fixture"
 ENTRY_NAME = "Fixture text entry"
+TYPE_ENTRY_NAME = "Fixture XTest text entry"
 BUTTON_NAME = "Invoke fixture button"
 STATUS_INITIAL = "Fixture status idle"
 STATUS_INVOKED = "Fixture status invoked"
@@ -45,6 +46,11 @@ def main() -> int:
     _set_accessible(entry, ENTRY_NAME, "fixture-entry")
     layout.pack_start(entry, False, False, 0)
 
+    type_entry = Gtk.Entry()
+    type_entry.set_text("")
+    _set_accessible(type_entry, TYPE_ENTRY_NAME, "fixture-xtest-entry")
+    layout.pack_start(type_entry, False, False, 0)
+
     button = Gtk.Button(label="Invoke")
     _set_accessible(button, BUTTON_NAME, "fixture-button")
     layout.pack_start(button, False, False, 0)
@@ -72,6 +78,7 @@ def main() -> int:
 
     button.connect("clicked", on_clicked)
     window.show_all()
+    type_entry.grab_focus()
     print("READY", flush=True)
     Gtk.main()
     return 0
