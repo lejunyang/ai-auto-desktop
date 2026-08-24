@@ -666,20 +666,26 @@ class LinuxAtspiDriver:
             if not isinstance(provenance, dict):
                 provenance = {}
             provenance["backend"] = _backend_name(self.backend)
-            protected = states["protected"] is True or provenance.get("value_redacted") is True
+            role = _normalize_role(backend_node.role)
+            protected = (
+                states["protected"] is True
+                or provenance.get("value_redacted") is True
+                or _is_protected_role(role)
+            )
             if protected:
+                states["protected"] = True
                 provenance["value_redacted"] = True
             node = {
                 "node_id": node_id,
                 "parent_id": parent_id,
-                "role": _safe_text(backend_node.role) or "unknown",
+                "role": role,
                 "name": _safe_text(backend_node.name),
                 "description": _safe_text(backend_node.description),
                 "value": None if protected else _safe_text(backend_node.value),
                 "attributes": attributes,
                 "states": states,
                 "bounds": _normalize_bounds(backend_node.bounds),
-                "actions": actions,
+                "actions": [item for item in actions if not (protected and item == "set_text")],
                 "provenance": provenance,
             }
             nodes.append(node)
@@ -1519,7 +1525,7 @@ class PyGObjectAtspiBackend:
         _check_deadline(deadline)
         previous_identity = self._identity(previous)
         current_identity = self._identity(current)
-        if None in previous_identity or None in current_identity:
+        if not all(previous_identity) or not all(current_identity):
             return False
         return previous_identity == current_identity
 
@@ -1534,11 +1540,15 @@ def create_default_backend() -> AtspiBackend:
     try:
         return PyGObjectAtspiBackend()
     except DriverError as exc:
+        cause_data = dict(exc.data) if isinstance(exc.data, Mapping) else {}
+        reason = cause_data.get("reason")
+        if not isinstance(reason, str) or not reason:
+            reason = "initialization"
         return UnavailableBackend(
-            "initialization",
+            reason,
             cause_code=exc.code,
             cause_message=exc.message,
-            cause_data=exc.data if isinstance(exc.data, Mapping) else {},
+            cause_data=cause_data,
         )
     except Exception as exc:
         return UnavailableBackend(
