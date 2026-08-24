@@ -20,9 +20,10 @@
 
 该测试类在非 Windows 平台整体跳过。手动启用的 GitHub Actions `windows-native` job
 安装 `.[windows-uia]` 后，通过 `tests/windows/run-native-fixture.ps1` 运行
-`python -m unittest tests.test_windows_uia_native -v`；Linux 和 macOS 不安装 Windows 可选依赖，
-也不会尝试模拟原生 UIA。PowerShell runner 会保留 unittest 的退出码，因此 fixture 失败时
-job 仍然失败，不会因留存报告而被误判为通过。
+`python -m unittest discover -s tests -v`。这保留了 Windows 上的完整 contract suite，且其中的
+`tests.test_windows_uia_native` 会实际运行原生 fixture；Linux 和 macOS 不安装 Windows 可选依赖，
+也不会尝试模拟原生 UIA。PowerShell runner 会保留 unittest 的退出码，因此 fixture 或其他
+contract 失败时 job 仍然失败，不会因留存报告而被误判为通过。
 
 ## 下载并核验 CI 结果
 

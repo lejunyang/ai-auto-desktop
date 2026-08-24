@@ -43,21 +43,30 @@ function Get-CommitSha {
     return "unknown"
 }
 
+function Get-PythonVersion {
+    try {
+        $versionOutput = (& python --version 2>&1 | Out-String).Trim()
+        if ($LASTEXITCODE -eq 0 -and -not [string]::IsNullOrWhiteSpace($versionOutput)) {
+            return $versionOutput
+        }
+    }
+    catch {
+        # The test invocation below records the command failure as an error.
+    }
+    return "unavailable"
+}
+
 $startedAt = Get-UtcTimestamp
-$testCommand = "python -m unittest tests.test_windows_uia_native -v"
-$testArguments = @("-m", "unittest", "tests.test_windows_uia_native", "-v")
+$testCommand = "python -m unittest discover -s tests -v"
+$testArguments = @("-m", "unittest", "discover", "-s", "tests", "-v")
 $testResult = [ordered]@{
     command = $testCommand
     result = "not_run"
     exit_code = $null
+    error_type = $null
 }
 $status = "error"
 $scriptExitCode = 1
-
-$pythonVersionOutput = (& python --version 2>&1 | Out-String).Trim()
-if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($pythonVersionOutput)) {
-    $pythonVersionOutput = "unavailable"
-}
 
 $runnerInfo = [ordered]@{
     name = Get-ValueOrUnknown $env:RUNNER_NAME
@@ -73,7 +82,7 @@ $osInfo = [ordered]@{
 }
 $pythonInfo = [ordered]@{
     command = "python"
-    version = $pythonVersionOutput
+    version = Get-PythonVersion
 }
 
 try {

@@ -20,6 +20,15 @@ class CiTriggerContractTests(unittest.TestCase):
         self.assertRegex(
             source,
             re.compile(
+                r"run_windows_native:\n"
+                r"(?:\s+[^\n]+\n)*?"
+                r"\s+default: false\n"
+                r"\s+type: boolean"
+            ),
+        )
+        self.assertRegex(
+            source,
+            re.compile(
                 r"windows-native:\n"
                 r"\s+if: github\.event_name == 'workflow_dispatch' "
                 r"&& inputs\.run_windows_native == true"
@@ -49,20 +58,18 @@ class CiTriggerContractTests(unittest.TestCase):
         )
         self.assertIn(f"path: {WINDOWS_RESULT_PATH}", windows_job)
         self.assertIn("if-no-files-found: error", windows_job)
+        upload_and_later_steps = windows_job.split(upload_action, 1)[1]
+        for step_name in ("Validate canonical example", "Smoke capability probe"):
+            self.assertRegex(
+                upload_and_later_steps,
+                re.compile(rf"- name: {step_name}\n\s+if: success\(\)"),
+            )
         self.assertIn("id: windows-native-fixture", windows_job)
-        self.assertGreaterEqual(
-            windows_job.count(
-                "if: steps.windows-native-fixture.outcome == 'success'"
-            ),
-            2,
-        )
 
     def test_windows_result_runner_has_stable_machine_readable_fields(self) -> None:
         source = WINDOWS_RESULT_RUNNER.read_text(encoding="utf-8")
 
-        self.assertIn(
-            "python -m unittest tests.test_windows_uia_native -v", source
-        )
+        self.assertIn("python -m unittest discover -s tests -v", source)
         self.assertIn("finally {", source)
         self.assertIn("ConvertTo-Json", source)
         for field in (
@@ -75,9 +82,9 @@ class CiTriggerContractTests(unittest.TestCase):
             "timestamp",
             "status",
         ):
-            self.assertRegex(source, rf"(?m)^\s+{field} = " )
+            self.assertRegex(source, rf"(?m)^\s+{field} = ")
         for test_field in ("command", "result", "exit_code"):
-            self.assertRegex(source, rf"(?m)^\s+{test_field} = " )
+            self.assertRegex(source, rf"(?m)^\s+{test_field} = ")
 
         self.assertNotIn("GITHUB_TOKEN", source)
         self.assertNotRegex(source, r"(?i)Get-ChildItem\s+Env:")

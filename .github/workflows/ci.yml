@@ -38,8 +38,10 @@ jobs:
         if: runner.os == 'macOS'
         run: tests/macos/build.sh
       - name: Validate canonical example
+        if: success()
         run: python -m ai_auto_desktop validate examples/workflows/ocr-error-response.json
       - name: Smoke capability probe
+        if: success()
         run: python -m ai_auto_desktop probe
 
   windows-native:
@@ -66,8 +68,8 @@ jobs:
           if-no-files-found: error
           retention-days: 30
       - name: Validate canonical example
-        if: steps.windows-native-fixture.outcome == 'success'
+        if: success()
         run: python -m ai_auto_desktop validate examples/workflows/ocr-error-response.json
       - name: Smoke capability probe
-        if: steps.windows-native-fixture.outcome == 'success'
+        if: success()
         run: python -m ai_auto_desktop probe
