@@ -72,6 +72,15 @@ python -m ai_auto_desktop run workflow.yaml \
 Settings 没有注册到 registry，因此 Qt bridge 仍未通过资格验证；这不等于“任意 KDE
 应用已经支持”。驱动不注入键鼠、不截图、不执行 OCR。
 
+## macOS 真机自测包
+
+`tests/macos` 是可直接复制到 Intel 或 Apple Silicon Mac 的自包含测试套件。它使用
+系统 `xcrun`/`swiftc` 构建固定 bundle ID 的 AppKit fixture 与 AX runner，限定在自有
+fixture PID 内验证有界 AX 遍历、精确 identifier、focus、set value、press 和动作后
+重新观察。默认不弹权限请求；只有显式参数才请求 Accessibility。Screen Recording 仅
+做 preflight，整个测试不截图。运行方式与回传归档格式见
+`docs/testing/macos-fixture.md`。
+
 ## 描述文件与运行时
 
 只接受以下规范标识：

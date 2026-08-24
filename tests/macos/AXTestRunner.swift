@@ -1,0 +1,851 @@
+import AppKit
+import ApplicationServices
+import CoreGraphics
+import Darwin
+import Foundation
+
+private let fixtureBundleID = "dev.ai-auto-desktop.testkit.fixture"
+private let runnerBundleID = "dev.ai-auto-desktop.testkit.ax-runner"
+private let testValue = "AX updated value"
+private let expectedStatus = "Status: pressed: AX updated value"
+private let axMessageTimeout: Float = 1.0
+private var reportIdentityStability = "unknown"
+
+private struct Arguments {
+    let fixtureApp: URL
+    let reportPath: URL?
+    let pidFile: URL?
+    let cancelFile: URL?
+    let identityStability: String
+    let promptAccessibility: Bool
+    let maxDepth: Int
+    let maxNodes: Int
+}
+
+private struct Node {
+    let element: AXUIElement
+    let role: String?
+    let title: String?
+    let identifier: String?
+    let value: String?
+    let focused: Bool
+}
+
+private struct Snapshot {
+    let nodes: [Node]
+    let truncated: Bool
+    let axErrors: [Int]
+}
+
+private struct Outcome {
+    let report: [String: Any]
+    let exitCode: Int32
+}
+
+private func architectureName() -> String {
+#if arch(arm64)
+    return "arm64"
+#elseif arch(x86_64)
+    return "x86_64"
+#else
+    return "unknown"
+#endif
+}
+
+// Give the shell watchdog a dedicated process group; the fixture inherits it.
+// If the runner hangs, the launcher can terminate the complete test process tree.
+private func configureProcessGroup() -> Bool {
+    if getpgrp() == getpid() { return true }
+    return setpgid(0, 0) == 0
+}
+
+private func writePIDFile(_ destination: URL?) -> Bool {
+    guard let destination else { return true }
+    let data = Data("\(getpid())\n".utf8)
+    do {
+        try data.write(to: destination, options: .atomic)
+        return true
+    } catch {
+        return false
+    }
+}
+
+private func terminateAndReap(_ pid: pid_t) {
+    guard pid > 1 else { return }
+    var status: Int32 = 0
+    _ = kill(pid, SIGTERM)
+    let termDeadline = Date().addingTimeInterval(2)
+    var reaped = false
+    while Date() < termDeadline {
+        if waitpid(pid, &status, WNOHANG) == pid {
+            reaped = true
+            break
+        }
+        Thread.sleep(forTimeInterval: 0.05)
+    }
+    if !reaped {
+        _ = kill(pid, SIGKILL)
+        let killDeadline = Date().addingTimeInterval(2)
+        while Date() < killDeadline {
+            if waitpid(pid, &status, WNOHANG) == pid { break }
+            Thread.sleep(forTimeInterval: 0.05)
+        }
+    }
+}
+
+private func rosettaTranslated() -> Bool {
+    var value: Int32 = 0
+    var size = MemoryLayout<Int32>.size
+    return sysctlbyname("sysctl.proc_translated", &value, &size, nil, 0) == 0
+        && value == 1
+}
+
+private func settable(_ element: AXUIElement, _ name: CFString) -> (AXError, Bool) {
+    let timeoutError = AXUIElementSetMessagingTimeout(element, axMessageTimeout)
+    guard timeoutError == .success else { return (timeoutError, false) }
+    var result = DarwinBoolean(false)
+    let error = AXUIElementIsAttributeSettable(element, name, &result)
+    return (error, result.boolValue)
+}
+
+private func actions(_ element: AXUIElement) -> (AXError, [String]) {
+    let timeoutError = AXUIElementSetMessagingTimeout(element, axMessageTimeout)
+    guard timeoutError == .success else { return (timeoutError, []) }
+    var raw: CFArray?
+    let error = AXUIElementCopyActionNames(element, &raw)
+    guard error == .success, let values = raw else { return (error, []) }
+    var result: [String] = []
+    for index in 0..<CFArrayGetCount(values) {
+        let pointer = CFArrayGetValueAtIndex(values, index)
+        let value = Unmanaged<CFTypeRef>.fromOpaque(pointer).takeUnretainedValue()
+        guard CFGetTypeID(value) == CFStringGetTypeID() else {
+            return (.illegalArgument, [])
+        }
+        result.append(value as! String)
+    }
+    return (.success, result)
+}
+
+private func attribute<T>(
+    _ element: AXUIElement,
+    _ name: CFString,
+    as type: T.Type,
+    errors: inout [Int]
+) -> T? {
+    let timeoutError = AXUIElementSetMessagingTimeout(element, axMessageTimeout)
+    guard timeoutError == .success else {
+        errors.append(Int(timeoutError.rawValue))
+        return nil
+    }
+    var raw: CFTypeRef?
+    let copyError = AXUIElementCopyAttributeValue(element, name, &raw)
+    guard copyError == .success else {
+        if copyError != .attributeUnsupported && copyError != .noValue {
+            errors.append(Int(copyError.rawValue))
+        }
+        return nil
+    }
+    return raw as? T
+}
+
+private func boundedChildren(
+    _ element: AXUIElement, remaining: Int, errors: inout [Int]
+) -> (children: [AXUIElement], truncated: Bool) {
+    let timeoutError = AXUIElementSetMessagingTimeout(element, axMessageTimeout)
+    guard timeoutError == .success else {
+        errors.append(Int(timeoutError.rawValue))
+        return ([], true)
+    }
+    var count: CFIndex = 0
+    let countError = AXUIElementGetAttributeValueCount(
+        element, kAXChildrenAttribute as CFString, &count
+    )
+    if countError == .attributeUnsupported || countError == .noValue {
+        return ([], false)
+    }
+    guard countError == .success, count >= 0 else {
+        errors.append(Int(countError.rawValue))
+        return ([], true)
+    }
+    let requested = min(Int(count), max(0, remaining))
+    guard requested > 0 else { return ([], count > 0) }
+    var rawValues: CFArray?
+    let valuesError = AXUIElementCopyAttributeValues(
+        element, kAXChildrenAttribute as CFString, 0, requested, &rawValues
+    )
+    guard valuesError == .success, let values = rawValues else {
+        errors.append(Int(valuesError.rawValue))
+        return ([], true)
+    }
+    var children: [AXUIElement] = []
+    for index in 0..<CFArrayGetCount(values) {
+        let pointer = CFArrayGetValueAtIndex(values, index)
+        let value = Unmanaged<CFTypeRef>.fromOpaque(pointer).takeUnretainedValue()
+        guard CFGetTypeID(value) == AXUIElementGetTypeID() else {
+            errors.append(Int(AXError.illegalArgument.rawValue))
+            return ([], true)
+        }
+        children.append(unsafeBitCast(value, to: AXUIElement.self))
+    }
+    return (children, Int(count) > requested)
+}
+
+private func snapshot(_ root: AXUIElement, maxDepth: Int, maxNodes: Int) -> Snapshot {
+    var queue: [(AXUIElement, Int)] = [(root, 0)]
+    var cursor = 0
+    var nodes: [Node] = []
+    var truncated = false
+    var axErrors: [Int] = []
+    var visited: [AXUIElement] = []
+
+    while cursor < queue.count && nodes.count < maxNodes {
+        let (element, depth) = queue[cursor]
+        cursor += 1
+        if visited.contains(where: { CFEqual($0, element) }) {
+            continue
+        }
+        visited.append(element)
+        nodes.append(
+            Node(
+                element: element,
+                role: attribute(element, kAXRoleAttribute as CFString, as: String.self, errors: &axErrors),
+                title: attribute(element, kAXTitleAttribute as CFString, as: String.self, errors: &axErrors),
+                identifier: attribute(element, kAXIdentifierAttribute as CFString, as: String.self, errors: &axErrors),
+                value: attribute(element, kAXValueAttribute as CFString, as: String.self, errors: &axErrors),
+                focused: attribute(element, kAXFocusedAttribute as CFString, as: Bool.self, errors: &axErrors) ?? false
+            )
+        )
+
+        let remaining = maxNodes - nodes.count - (queue.count - cursor)
+        let childResult = boundedChildren(
+            element, remaining: remaining, errors: &axErrors
+        )
+        let children = childResult.children
+        if childResult.truncated { truncated = true }
+        if depth < maxDepth {
+            queue.append(contentsOf: children.map { ($0, depth + 1) })
+        } else if !children.isEmpty {
+            truncated = true
+        }
+    }
+    if cursor < queue.count {
+        truncated = true
+    }
+    return Snapshot(nodes: nodes, truncated: truncated, axErrors: axErrors)
+}
+
+private func parseArguments() -> Arguments? {
+    var fixturePath: String?
+    var reportPath: String?
+    var pidFile: String?
+    var cancelFile: String?
+    var identityStability = "unknown"
+    var prompt = false
+    var maxDepth = 8
+    var maxNodes = 128
+    var index = 1
+    let raw = CommandLine.arguments
+
+    while index < raw.count {
+        switch raw[index] {
+        case "--fixture-app":
+            guard index + 1 < raw.count else { return nil }
+            fixturePath = raw[index + 1]
+            index += 2
+        case "--prompt-accessibility":
+            prompt = true
+            index += 1
+        case "--report":
+            guard index + 1 < raw.count else { return nil }
+            reportPath = raw[index + 1]
+            index += 2
+        case "--pid-file":
+            guard index + 1 < raw.count else { return nil }
+            pidFile = raw[index + 1]
+            index += 2
+        case "--cancel-file":
+            guard index + 1 < raw.count else { return nil }
+            cancelFile = raw[index + 1]
+            index += 2
+        case "--identity-stability":
+            guard index + 1 < raw.count,
+                  ["ephemeral", "stable_identity_requested"].contains(raw[index + 1])
+            else { return nil }
+            identityStability = raw[index + 1]
+            index += 2
+        case "--max-depth":
+            guard index + 1 < raw.count, let value = Int(raw[index + 1]), value > 0 else { return nil }
+            maxDepth = min(value, 32)
+            index += 2
+        case "--max-nodes":
+            guard index + 1 < raw.count, let value = Int(raw[index + 1]), value > 0 else { return nil }
+            maxNodes = min(value, 2_048)
+            index += 2
+        default:
+            return nil
+        }
+    }
+    guard let fixturePath else { return nil }
+    return Arguments(
+        fixtureApp: URL(fileURLWithPath: fixturePath).standardizedFileURL,
+        reportPath: reportPath.map {
+            URL(fileURLWithPath: $0).standardizedFileURL
+        },
+        pidFile: pidFile.map {
+            URL(fileURLWithPath: $0).standardizedFileURL
+        },
+        cancelFile: cancelFile.map {
+            URL(fileURLWithPath: $0).standardizedFileURL
+        },
+        identityStability: identityStability,
+        promptAccessibility: prompt,
+        maxDepth: maxDepth,
+        maxNodes: maxNodes
+    )
+}
+
+private func makeReport(
+    status: String,
+    message: String,
+    promptRequested: Bool,
+    accessibilityTrusted: Bool,
+    screenCaptureGranted: Bool,
+    checks: [[String: Any]],
+    identityStability: String = reportIdentityStability
+) -> [String: Any] {
+    let passed = checks.filter { ($0["status"] as? String) == "pass" }.count
+    let failed = checks.filter { ($0["status"] as? String) == "fail" }.count
+    let actualRunnerBundleID = Bundle.main.bundleIdentifier
+    return [
+        "schema_version": "1.0",
+        "kind": "macos_ax_fixture_test",
+        "status": status,
+        "message": message,
+        "timestamp_utc": ISO8601DateFormatter().string(from: Date()),
+        "platform": [
+            "os": "macos",
+            "architecture": architectureName(),
+            "rosetta_translated": rosettaTranslated(),
+            "version": ProcessInfo.processInfo.operatingSystemVersionString,
+        ],
+        "identity": [
+            "runner_bundle_id": actualRunnerBundleID ?? "unavailable",
+            "fixture_bundle_id": fixtureBundleID,
+            "launcher_declared_identity_stability": identityStability,
+        ],
+        "permissions": [
+            "accessibility": [
+                "trusted": accessibilityTrusted,
+                "prompt_requested": promptRequested,
+            ],
+            "screen_capture": [
+                "preflight_granted": screenCaptureGranted,
+                "request_attempted": false,
+                "capture_attempted": false,
+            ],
+        ],
+        "limits": [
+            "target_scope": "fixture_process_only",
+            "screen_content_collected": false,
+        ],
+        "checks": checks,
+        "summary": ["passed": passed, "failed": failed, "total": checks.count],
+    ]
+}
+
+private func run(arguments parsedArguments: Arguments? = nil) -> Outcome {
+    guard let args = parsedArguments ?? parseArguments() else {
+        let report = makeReport(
+            status: "failed",
+            message: "参数无效：必须提供 --fixture-app <path>",
+            promptRequested: false,
+            accessibilityTrusted: false,
+            screenCaptureGranted: false,
+            checks: [["id": "arguments", "status": "fail", "message": "invalid arguments"]]
+        )
+        return Outcome(report: report, exitCode: 2)
+    }
+    reportIdentityStability = args.identityStability
+    guard writePIDFile(args.pidFile) else {
+        return Outcome(
+            report: makeReport(
+                status: "failed", message: "runner pid file write failed",
+                promptRequested: false, accessibilityTrusted: false,
+                screenCaptureGranted: false, checks: [[
+                    "id": "pid_file", "status": "fail",
+                    "message": "无法原子写入 watchdog PID 文件",
+                ]]
+            ), exitCode: 1
+        )
+    }
+    if let cancelFile = args.cancelFile,
+       FileManager.default.fileExists(atPath: cancelFile.path) {
+        return Outcome(
+            report: makeReport(
+                status: "failed", message: "runner launch was cancelled",
+                promptRequested: false, accessibilityTrusted: false,
+                screenCaptureGranted: false, checks: [[
+                    "id": "watchdog_cancel", "status": "fail",
+                    "message": "runner 在 LaunchServices 延迟期间被 watchdog 取消",
+                ]]
+            ), exitCode: 1
+        )
+    }
+
+    let screenCaptureGranted = CGPreflightScreenCaptureAccess()
+    guard processGroupConfigured else {
+        return Outcome(
+            report: makeReport(
+                status: "failed", message: "runner process group setup failed",
+                promptRequested: false, accessibilityTrusted: false,
+                screenCaptureGranted: screenCaptureGranted, checks: [[
+                    "id": "process_group", "status": "fail",
+                    "message": "无法建立可由 watchdog 清理的独立进程组",
+                ]]
+            ), exitCode: 1
+        )
+    }
+    guard Bundle.main.bundleIdentifier == runnerBundleID else {
+        return Outcome(
+            report: makeReport(
+                status: "failed",
+                message: "runner bundle identity validation failed",
+                promptRequested: false,
+                accessibilityTrusted: false,
+                screenCaptureGranted: screenCaptureGranted,
+                checks: [[
+                    "id": "runner_identity",
+                    "status": "fail",
+                    "message": "实际 runner bundle ID 缺失或不符合预期",
+                ]]
+            ),
+            exitCode: 1
+        )
+    }
+    if args.promptAccessibility {
+        let options = [
+            kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true
+        ] as CFDictionary
+        // The prompt is asynchronous.  Its return value is not treated as a
+        // completed authorization; the plain trust probe below remains the
+        // source of truth for this run.
+        _ = AXIsProcessTrustedWithOptions(options)
+    }
+    let accessibilityTrusted = AXIsProcessTrusted()
+
+    var checks: [[String: Any]] = [[
+        "id": "screen_capture_preflight",
+        "status": "pass",
+        "message": "仅检查授权状态；未请求授权，也未截图",
+        "evidence": ["granted": screenCaptureGranted, "capture_attempted": false],
+    ]]
+
+    guard accessibilityTrusted else {
+        checks.append([
+            "id": "accessibility_trust",
+            "status": "unsupported",
+            "message": args.promptAccessibility
+                ? "辅助功能授权尚不可用；完成系统设置后重新运行"
+                : "辅助功能未授权；默认未弹窗，可用 --prompt-accessibility 明确请求",
+        ])
+        return Outcome(
+            report: makeReport(
+                status: "unsupported",
+                message: "macOS Accessibility 权限不可用，未启动 fixture",
+                promptRequested: args.promptAccessibility,
+                accessibilityTrusted: false,
+                screenCaptureGranted: screenCaptureGranted,
+                checks: checks
+            ),
+            exitCode: 3
+        )
+    }
+    checks.append([
+        "id": "accessibility_trust",
+        "status": "pass",
+        "message": "AXIsProcessTrusted 返回 true",
+    ])
+
+    guard Bundle(url: args.fixtureApp)?.bundleIdentifier == fixtureBundleID else {
+        checks.append([
+            "id": "fixture_identity",
+            "status": "fail",
+            "message": "fixture bundle ID 不符合预期",
+        ])
+        return Outcome(
+            report: makeReport(
+                status: "failed",
+                message: "fixture identity validation failed",
+                promptRequested: args.promptAccessibility,
+                accessibilityTrusted: true,
+                screenCaptureGranted: screenCaptureGranted,
+                checks: checks
+            ),
+            exitCode: 1
+        )
+    }
+
+    let executable = args.fixtureApp.appendingPathComponent("Contents/MacOS/AiAutoDesktopAXFixture")
+    guard FileManager.default.isExecutableFile(atPath: executable.path) else {
+        checks.append([
+            "id": "fixture_executable",
+            "status": "fail",
+            "message": "fixture executable missing",
+        ])
+        return Outcome(
+            report: makeReport(
+                status: "failed",
+                message: "fixture executable unavailable",
+                promptRequested: args.promptAccessibility,
+                accessibilityTrusted: true,
+                screenCaptureGranted: screenCaptureGranted,
+                checks: checks
+            ),
+            exitCode: 1
+        )
+    }
+
+    let fixture = Process()
+    fixture.executableURL = executable
+    fixture.standardOutput = FileHandle.nullDevice
+    fixture.standardError = FileHandle.nullDevice
+    do {
+        try fixture.run()
+    } catch {
+        checks.append(["id": "fixture_launch", "status": "fail", "message": "fixture launch failed"])
+        return Outcome(
+            report: makeReport(
+                status: "failed",
+                message: "无法启动 fixture",
+                promptRequested: args.promptAccessibility,
+                accessibilityTrusted: true,
+                screenCaptureGranted: screenCaptureGranted,
+                checks: checks
+            ),
+            exitCode: 1
+        )
+    }
+    let fixturePID = fixture.processIdentifier
+    guard fixturePID > 1, getpgid(fixturePID) == getpgrp() else {
+        terminateAndReap(fixturePID)
+        checks.append([
+            "id": "fixture_process_group", "status": "fail",
+            "message": "fixture 没有继承 runner 的受控进程组",
+        ])
+        return Outcome(report: makeReport(
+            status: "failed", message: "fixture process group invalid",
+            promptRequested: args.promptAccessibility, accessibilityTrusted: true,
+            screenCaptureGranted: screenCaptureGranted, checks: checks
+        ), exitCode: 1)
+    }
+
+    defer {
+        terminateAndReap(fixturePID)
+    }
+
+    _ = NSRunningApplication(processIdentifier: fixturePID)?.activate(options: [.activateIgnoringOtherApps])
+    let appElement = AXUIElementCreateApplication(fixturePID)
+    let appTimeoutError = AXUIElementSetMessagingTimeout(
+        appElement, axMessageTimeout
+    )
+    guard appTimeoutError == .success else {
+        checks.append([
+            "id": "ax_messaging_timeout",
+            "status": "fail",
+            "message": "无法设置 AX 消息超时",
+            "evidence": ["ax_error": appTimeoutError.rawValue],
+        ])
+        return Outcome(
+            report: makeReport(
+                status: "failed", message: "AX timeout setup failed",
+                promptRequested: args.promptAccessibility, accessibilityTrusted: true,
+                screenCaptureGranted: screenCaptureGranted, checks: checks
+            ), exitCode: 1
+        )
+    }
+
+    func freshSnapshot() -> Snapshot {
+        snapshot(appElement, maxDepth: args.maxDepth, maxNodes: args.maxNodes)
+    }
+    func findOne(_ current: Snapshot, identifier: String) -> Node? {
+        let matches = current.nodes.filter { $0.identifier == identifier }
+        return matches.count == 1 ? matches[0] : nil
+    }
+    func freshNode(identifier: String, role: String) -> Node? {
+        let current = freshSnapshot()
+        guard !current.truncated,
+              current.axErrors.isEmpty,
+              let node = findOne(current, identifier: identifier),
+              node.role == role else { return nil }
+        return node
+    }
+
+    var initial: Snapshot?
+    let launchDeadline = Date().addingTimeInterval(10)
+    while Date() < launchDeadline {
+        let candidate = freshSnapshot()
+        if findOne(candidate, identifier: "fixture-input") != nil,
+           findOne(candidate, identifier: "fixture-apply") != nil,
+           findOne(candidate, identifier: "fixture-status") != nil {
+            initial = candidate
+            break
+        }
+        if kill(fixturePID, 0) != 0 { break }
+        Thread.sleep(forTimeInterval: 0.1)
+    }
+
+    guard let initial,
+          let initialInput = findOne(initial, identifier: "fixture-input"),
+          let initialButton = findOne(initial, identifier: "fixture-apply"),
+          let initialStatus = findOne(initial, identifier: "fixture-status") else {
+        checks.append(["id": "bounded_discovery", "status": "fail", "message": "未在时限内唯一定位三个 fixture 控件"])
+        return Outcome(
+            report: makeReport(
+                status: "failed",
+                message: "AX fixture discovery failed",
+                promptRequested: args.promptAccessibility,
+                accessibilityTrusted: true,
+                screenCaptureGranted: screenCaptureGranted,
+                checks: checks
+            ),
+            exitCode: 1
+        )
+    }
+    checks.append([
+        "id": "bounded_discovery",
+        "status": initial.truncated ? "fail" : "pass",
+        "message": initial.truncated ? "AX 遍历触及边界" : "在 fixture 进程内完成有界遍历和唯一定位",
+        "evidence": ["nodes_read": initial.nodes.count, "max_depth": args.maxDepth, "max_nodes": args.maxNodes],
+    ])
+    guard !initial.truncated else {
+        return Outcome(
+            report: makeReport(
+                status: "failed",
+                message: "bounded traversal truncated",
+                promptRequested: args.promptAccessibility,
+                accessibilityTrusted: true,
+                screenCaptureGranted: screenCaptureGranted,
+                checks: checks
+            ),
+            exitCode: 1
+        )
+    }
+    guard initial.axErrors.isEmpty,
+          initialInput.role == kAXTextFieldRole as String,
+          initialButton.role == kAXButtonRole as String,
+          initialStatus.role == kAXStaticTextRole as String else {
+        checks.append([
+            "id": "roles_and_ax_errors",
+            "status": "fail",
+            "message": "fixture role 不符合预期或 AX 读取发生错误",
+            "evidence": ["ax_errors": initial.axErrors],
+        ])
+        return Outcome(
+            report: makeReport(
+                status: "failed", message: "fixture semantics invalid",
+                promptRequested: args.promptAccessibility, accessibilityTrusted: true,
+                screenCaptureGranted: screenCaptureGranted, checks: checks
+            ), exitCode: 1
+        )
+    }
+    let windowCount = initial.nodes.filter {
+        $0.role == kAXWindowRole as String
+    }.count
+    guard windowCount == 1 else {
+        checks.append([
+            "id": "window_role", "status": "fail",
+            "message": "fixture 必须唯一暴露一个 AXWindow",
+            "evidence": ["candidate_count": windowCount],
+        ])
+        return Outcome(report: makeReport(
+            status: "failed", message: "window role validation failed",
+            promptRequested: args.promptAccessibility, accessibilityTrusted: true,
+            screenCaptureGranted: screenCaptureGranted, checks: checks
+        ), exitCode: 1)
+    }
+    let duplicateTitleCount = initial.nodes.filter {
+        $0.role == kAXButtonRole as String && $0.title == "Apply Fixture Value"
+    }.count
+    guard duplicateTitleCount == 2 else {
+        checks.append([
+            "id": "ambiguous_visible_title",
+            "status": "fail",
+            "message": "同名按钮歧义 fixture 未按预期暴露",
+            "evidence": ["candidate_count": duplicateTitleCount],
+        ])
+        return Outcome(
+            report: makeReport(
+                status: "failed", message: "ambiguity fixture invalid",
+                promptRequested: args.promptAccessibility, accessibilityTrusted: true,
+                screenCaptureGranted: screenCaptureGranted, checks: checks
+            ), exitCode: 1
+        )
+    }
+    checks.append([
+        "id": "roles_and_ambiguity", "status": "pass",
+        "message": "角色正确，且可见标题存在两个候选；identifier 可唯一定位",
+    ])
+
+    guard let focusInput = freshNode(
+        identifier: "fixture-input", role: kAXTextFieldRole as String
+    ) else {
+        return Outcome(report: makeReport(
+            status: "failed", message: "focus target re-resolve failed",
+            promptRequested: args.promptAccessibility, accessibilityTrusted: true,
+            screenCaptureGranted: screenCaptureGranted, checks: checks
+        ), exitCode: 1)
+    }
+    let (focusPreflightError, focusSettable) = settable(
+        focusInput.element, kAXFocusedAttribute as CFString
+    )
+    guard focusPreflightError == .success && focusSettable else {
+        checks.append(["id": "focus_preflight", "status": "fail", "message": "AXFocused 不可写", "evidence": ["ax_error": focusPreflightError.rawValue, "settable": focusSettable]])
+        return Outcome(report: makeReport(status: "failed", message: "focus preflight failed", promptRequested: args.promptAccessibility, accessibilityTrusted: true, screenCaptureGranted: screenCaptureGranted, checks: checks), exitCode: 1)
+    }
+    let focusError = AXUIElementSetAttributeValue(
+        focusInput.element, kAXFocusedAttribute as CFString, kCFBooleanTrue
+    )
+    Thread.sleep(forTimeInterval: 0.1)
+    let afterFocus = freshSnapshot()
+    let focused = !afterFocus.truncated
+        && afterFocus.axErrors.isEmpty
+        && findOne(afterFocus, identifier: "fixture-input")?.focused == true
+    checks.append([
+        "id": "focus_and_reread",
+        "status": focusError == .success && focused ? "pass" : "fail",
+        "message": "设置焦点后重新读取 AXFocused",
+        "evidence": ["ax_error": focusError.rawValue, "focused_after": focused],
+    ])
+    guard focusError == .success && focused else {
+        return Outcome(
+            report: makeReport(
+                status: "failed", message: "focus verification failed",
+                promptRequested: args.promptAccessibility, accessibilityTrusted: true,
+                screenCaptureGranted: screenCaptureGranted, checks: checks
+            ), exitCode: 1
+        )
+    }
+
+    guard let valueInput = freshNode(
+        identifier: "fixture-input", role: kAXTextFieldRole as String
+    ) else {
+        return Outcome(report: makeReport(status: "failed", message: "value target re-resolve failed", promptRequested: args.promptAccessibility, accessibilityTrusted: true, screenCaptureGranted: screenCaptureGranted, checks: checks), exitCode: 1)
+    }
+    let (valuePreflightError, valueSettable) = settable(
+        valueInput.element, kAXValueAttribute as CFString
+    )
+    guard valuePreflightError == .success && valueSettable else {
+        checks.append(["id": "set_value_preflight", "status": "fail", "message": "AXValue 不可写", "evidence": ["ax_error": valuePreflightError.rawValue, "settable": valueSettable]])
+        return Outcome(report: makeReport(status: "failed", message: "value preflight failed", promptRequested: args.promptAccessibility, accessibilityTrusted: true, screenCaptureGranted: screenCaptureGranted, checks: checks), exitCode: 1)
+    }
+    let valueError = AXUIElementSetAttributeValue(
+        valueInput.element, kAXValueAttribute as CFString, testValue as CFString
+    )
+    Thread.sleep(forTimeInterval: 0.1)
+    let afterValue = freshSnapshot()
+    let updatedValue = !afterValue.truncated && afterValue.axErrors.isEmpty
+        ? findOne(afterValue, identifier: "fixture-input")?.value
+        : nil
+    checks.append([
+        "id": "set_value_and_reread",
+        "status": valueError == .success && updatedValue == testValue ? "pass" : "fail",
+        "message": "写入 AXValue 后从新快照读取固定测试值",
+        "evidence": ["ax_error": valueError.rawValue, "value_matches": updatedValue == testValue],
+    ])
+    guard valueError == .success && updatedValue == testValue else {
+        return Outcome(
+            report: makeReport(
+                status: "failed", message: "set value verification failed",
+                promptRequested: args.promptAccessibility, accessibilityTrusted: true,
+                screenCaptureGranted: screenCaptureGranted, checks: checks
+            ), exitCode: 1
+        )
+    }
+
+    guard let pressButton = freshNode(
+        identifier: "fixture-apply", role: kAXButtonRole as String
+    ) else {
+        return Outcome(report: makeReport(status: "failed", message: "press target re-resolve failed", promptRequested: args.promptAccessibility, accessibilityTrusted: true, screenCaptureGranted: screenCaptureGranted, checks: checks), exitCode: 1)
+    }
+    let (actionPreflightError, supportedActions) = actions(pressButton.element)
+    let pressSupported = supportedActions.contains(kAXPressAction as String)
+    guard actionPreflightError == .success && pressSupported else {
+        checks.append(["id": "press_preflight", "status": "fail", "message": "AXPress 不受支持", "evidence": ["ax_error": actionPreflightError.rawValue, "supported": pressSupported]])
+        return Outcome(report: makeReport(status: "failed", message: "press preflight failed", promptRequested: args.promptAccessibility, accessibilityTrusted: true, screenCaptureGranted: screenCaptureGranted, checks: checks), exitCode: 1)
+    }
+    let pressError = AXUIElementPerformAction(
+        pressButton.element, kAXPressAction as CFString
+    )
+    var observedStatus: String? = initialStatus.value
+    var lastPostconditionErrors: [Int] = []
+    let pressDeadline = Date().addingTimeInterval(3)
+    while Date() < pressDeadline {
+        let current = freshSnapshot()
+        lastPostconditionErrors = current.axErrors
+        observedStatus = nil
+        if !current.truncated && current.axErrors.isEmpty {
+            observedStatus = findOne(
+                current, identifier: "fixture-status"
+            )?.value
+        }
+        if observedStatus == expectedStatus { break }
+        Thread.sleep(forTimeInterval: 0.05)
+    }
+    let pressVerified = pressError == .success && observedStatus == expectedStatus
+    checks.append([
+        "id": "press_and_reread",
+        "status": pressVerified ? "pass" : "fail",
+        "message": "执行 AXPress 后从新快照验证状态文本",
+        "evidence": [
+            "ax_error": pressError.rawValue,
+            "status_matches": observedStatus == expectedStatus,
+            "postcondition_ax_errors": lastPostconditionErrors,
+        ],
+    ])
+
+    return Outcome(
+        report: makeReport(
+            status: pressVerified ? "passed" : "failed",
+            message: pressVerified ? "macOS AX fixture 测试通过" : "press verification failed",
+            promptRequested: args.promptAccessibility,
+            accessibilityTrusted: true,
+            screenCaptureGranted: screenCaptureGranted,
+            checks: checks
+        ),
+        exitCode: pressVerified ? 0 : 1
+    )
+}
+
+private func emit(_ report: [String: Any], to destination: URL?) -> Bool {
+    guard JSONSerialization.isValidJSONObject(report),
+          let data = try? JSONSerialization.data(withJSONObject: report, options: [.sortedKeys]) else {
+        FileHandle.standardOutput.write(Data("{\"kind\":\"macos_ax_fixture_test\",\"status\":\"failed\",\"message\":\"JSON serialization failed\"}\n".utf8))
+        return false
+    }
+    guard let destination else {
+        FileHandle.standardOutput.write(data)
+        FileHandle.standardOutput.write(Data([0x0a]))
+        return true
+    }
+    let temporary = destination.deletingLastPathComponent().appendingPathComponent(
+        destination.lastPathComponent + ".writing-" + UUID().uuidString
+    )
+    do {
+        try data.write(to: temporary, options: .atomic)
+        if FileManager.default.fileExists(atPath: destination.path) {
+            try FileManager.default.removeItem(at: destination)
+        }
+        try FileManager.default.moveItem(at: temporary, to: destination)
+        return true
+    } catch {
+        try? FileManager.default.removeItem(at: temporary)
+        return false
+    }
+}
+
+let processGroupConfigured = configureProcessGroup()
+let parsedArguments = parseArguments()
+let outcome = run(arguments: parsedArguments)
+let reportDestination = parsedArguments?.reportPath
+exit(emit(outcome.report, to: reportDestination) ? outcome.exitCode : 1)
+
