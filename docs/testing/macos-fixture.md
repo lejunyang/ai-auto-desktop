@@ -31,6 +31,10 @@ runner 由 LaunchServices 以固定 `.app` 身份启动，并将报告原子写�
 - `identity.txt` 强制包含 Swift 版本、identity stability，以及 runner/fixture 各自非空的
   designated requirement、Identifier、CDHash、architectures 和 SHA-256；采集命令失败不会被
   `sed`/`awk` 等管道末端掩盖，也不会发布半份证明。
+- 源码包注入规范化 `SOURCE_MANIFEST.txt`：包含 Git commit SHA、clean/dirty 状态，并固定
+  除自身外每个白名单成员的 mode 和 SHA-256。`source_package_digest` 是该 manifest 的
+  SHA-256，以此避开自引用 hash；Mac 在构建前重算并验证，随后将 revision、worktree 与
+  digest 同时写入 report 和 identity。
 - 缺少 macOS、Command Line Tools、受支持 Swift 版本、原生架构或授权时输出结构化
   `unsupported`，不会伪造通过。watchdog 超时及 launcher/build/archive 失败会写入稳定的
   `error.code` 和有界的 `execution` 诊断字段；一旦 watchdog 判定超时，不接受迟到的
@@ -56,11 +60,15 @@ Screen Recording，不加入 pointer 或 `set_value` 自动 fallback。fixture�
 ./package-source.sh /absolute/path/macos-ax-testkit-source.tar.gz
 ```
 
-该命令按 `SOURCE_PACKAGE_FILES.txt` 白名单生成平铺的规范化源码包，不包含构建结果。接收方
+该命令按 `SOURCE_PACKAGE_FILES.txt` 白名单生成平铺的规范化源码包，不包含构建结果。默认
+要求白名单文件对应 clean Git worktree；开发中的未提交快照只能显式使用 `--allow-dirty`，
+且这样的结果永不获得 `source_trusted`。接收方
 解压到空目录后运行 `./run.sh --prompt-accessibility`，在系统设置中给
 `AI Auto Desktop AX Runner` 开启辅助功能后再运行 `./run.sh`。脚本会打印结果归档路径和
 外层 SHA-256；无论 `passed`、`failed` 还是 `unsupported`，都应回传该归档和 hash 行。最终
-对外交付源码包应由发布负责人从待交付 revision 生成，并通过可信渠道附上源码包 SHA-256。
+对外交付源码包应由发布负责人从待交付 revision 生成，并通过可信渠道附上命令打印的
+`源码 revision` 与 `源码内容 SHA-256`。后者是 manifest 内容摘要，不是会受 tar/gzip 表示
+影响的外层源码归档 SHA-256。
 
 ## 在本地验真回传归档
 
@@ -86,10 +94,16 @@ stdout 始终只有一个 JSON 文档。`archive_valid`（兼容别名 `verified
 ```sh
 tests/macos/verify-result.sh \
   --expected-archive-sha256 <independently-trusted-64-hex> \
+  --expected-source-revision <independently-trusted-git-commit-sha> \
+  --expected-source-package-digest <independently-trusted-64-hex> \
   /absolute/path/macos-ax-test-result.tar.gz
 ```
 
-只有预期 hash 匹配且报告为 `passed`，才返回 `trusted_archive=true`、`qualified=true` 和退出码
-`0`。把 hash 和归档由同一回传方、同一消息或同一不可信位置一起提供，不能建立信任，禁止
-据此使用该参数。完整的 `failed`/`unsupported` 报告仍会返回 `archive_valid=true`、
+只有外层结果归档 hash 匹配，才设置 `trusted_archive=true`；只有独立可信的源码 revision 与
+package digest 都匹配、report/identity 一致且 `source_worktree=clean`，才设置
+`source_trusted=true`。报告还必须为 `passed`，三者同时成立才返回 `qualified=true` 和退出码
+`0`。外层归档 hash 的既有信任语义保持不变，源码 pin 不会替代结果归档 pin；归档内自述的
+任意 hash 也不能自证来源。把预期值和归档由同一回传方、同一消息或同一不可信位置一起提供，
+不能建立信任。旧报告仍可做结构与内容验真，但缺少 source provenance 时即使提供新参数也会
+以 `source_provenance_missing` fail closed。完整的 `failed`/`unsupported` 报告仍会返回 `archive_valid=true`、
 `report_passed=false`、`qualified=false`；结构、hash 或语义失败则 `archive_valid=false`。

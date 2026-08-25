@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 from pathlib import Path
 import platform
@@ -21,6 +22,7 @@ BUILD_SCRIPT = TESTKIT_ROOT / "build.sh"
 ARCHIVE_SCRIPT = TESTKIT_ROOT / "archive.sh"
 IDENTITY_SCRIPT = TESTKIT_ROOT / "identity.sh"
 PACKAGE_SCRIPT = TESTKIT_ROOT / "package-source.sh"
+SOURCE_PROVENANCE_SCRIPT = TESTKIT_ROOT / "source-provenance.sh"
 SOURCE_PACKAGE_MANIFEST = TESTKIT_ROOT / "SOURCE_PACKAGE_FILES.txt"
 RUNNER_SOURCE = TESTKIT_ROOT / "AXTestRunner.swift"
 FIXTURE_SOURCE = TESTKIT_ROOT / "FixtureApp.swift"
@@ -30,6 +32,7 @@ SHELL_SCRIPTS = (
     ARCHIVE_SCRIPT,
     IDENTITY_SCRIPT,
     PACKAGE_SCRIPT,
+    SOURCE_PROVENANCE_SCRIPT,
 )
 EXECUTABLE_SHELL_SCRIPTS = (RUN_SCRIPT, BUILD_SCRIPT, PACKAGE_SCRIPT)
 FIXTURE_BUNDLE_ID = "dev.ai-auto-desktop.testkit.fixture"
@@ -325,6 +328,27 @@ class MacOSTestkitSourceContracts(unittest.TestCase):
             '"runner_pid_observed":$runner_pid_observed', self.launcher
         )
 
+    def test_source_provenance_is_passed_to_runner_and_reported(self) -> None:
+        for marker in (
+            '--source-revision "$source_revision"',
+            '--source-worktree "$source_worktree"',
+            '--source-package-digest "$source_package_digest"',
+        ):
+            with self.subTest(marker=marker):
+                self.assertIn(marker, self.launcher)
+        for marker in (
+            'case "--source-revision"',
+            'case "--source-worktree"',
+            'case "--source-package-digest"',
+            '"revision": reportSourceRevision',
+            '"worktree": reportSourceWorktree',
+            '"package_digest": reportSourcePackageDigest',
+            'isLowercaseHex(raw[index + 1], lengths: [40, 64])',
+            'isLowercaseHex(raw[index + 1], lengths: [64])',
+        ):
+            with self.subTest(marker=marker):
+                self.assertIn(marker, self.runner)
+
     def test_build_declares_and_checks_minimum_swift_version(self) -> None:
         self.assertIn('"$swiftc_path" --version', self.build)
         self.assertIn('至少需要 Swift 5.3', self.build)
@@ -384,6 +408,7 @@ class MacOSTestkitSourceContracts(unittest.TestCase):
                 "build.sh",
                 "archive.sh",
                 "identity.sh",
+                "source-provenance.sh",
                 "FixtureApp.swift",
                 "AXTestRunner.swift",
                 "SOURCE_PACKAGE_FILES.txt",
@@ -398,6 +423,115 @@ class MacOSTestkitSourceContracts(unittest.TestCase):
         manifest_text = SOURCE_PACKAGE_MANIFEST.read_text(encoding="utf-8")
         self.assertIn("# type_text sources:", manifest_text)
         self.assertIn("# FixtureApp.swift AXTestRunner.swift", manifest_text)
+
+    def test_source_package_is_reproducible_and_manifest_covers_members(
+        self,
+    ) -> None:
+        if shutil.which("tar") is None or shutil.which("gzip") is None:
+            self.skipTest("tar and gzip are required")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            archives = (root / "first.tar.gz", root / "second.tar.gz")
+            for archive_path in archives:
+                completed = subprocess.run(
+                    [str(PACKAGE_SCRIPT), "--allow-dirty", str(archive_path)],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    text=True, encoding="utf-8", check=False,
+                )
+                self.assertEqual(completed.returncode, 0, msg=completed.stderr)
+                self.assertRegex(
+                    completed.stderr, r"源码 revision：[0-9a-f]{40,64}"
+                )
+                self.assertRegex(
+                    completed.stderr, r"源码内容 SHA-256：[0-9a-f]{64}"
+                )
+            self.assertEqual(archives[0].read_bytes(), archives[1].read_bytes())
+            with tarfile.open(archives[0], "r:gz") as archive:
+                contents = {
+                    member.name: archive.extractfile(member).read()
+                    for member in archive.getmembers()
+                }
+            manifest = contents.pop("SOURCE_MANIFEST.txt").decode()
+            lines = manifest.splitlines()
+            self.assertEqual(
+                lines[0],
+                "schema_version=ai-auto-desktop.macos-source-manifest/v1",
+            )
+            self.assertRegex(lines[2], r"^source_worktree=(?:clean|dirty)$")
+            self.assertEqual(lines[3], f"member_count={len(contents)}")
+            expected_file_lines = []
+            for member in SOURCE_PACKAGE_MANIFEST.read_text(
+                encoding="utf-8"
+            ).splitlines():
+                if not member or member.startswith("#"):
+                    continue
+                mode = "0755" if os.access(TESTKIT_ROOT / member, os.X_OK) else "0644"
+                expected_file_lines.append(
+                    f"file={mode}:{hashlib.sha256(contents[member]).hexdigest()}:{member}"
+                )
+            self.assertEqual(lines[4:], expected_file_lines)
+
+    def test_source_package_rejects_dirty_release_without_override(self) -> None:
+        git = shutil.which("git")
+        if git is None:
+            self.skipTest("git is required")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            repository = root / "repository"
+            copied_testkit = repository / "tests" / "macos"
+            copied_testkit.parent.mkdir(parents=True)
+            shutil.copytree(TESTKIT_ROOT, copied_testkit)
+            subprocess.run([git, "init", "-q"], cwd=repository, check=True)
+            subprocess.run([git, "add", "tests/macos"], cwd=repository, check=True)
+            subprocess.run(
+                [git, "-c", "user.name=Test", "-c",
+                 "user.email=test@example.invalid", "commit", "-qm",
+                 "fixture baseline"],
+                cwd=repository, check=True,
+            )
+            with (copied_testkit / "README.md").open("a", encoding="utf-8") as stream:
+                stream.write("dirty test\n")
+            archive = root / "release.tar.gz"
+            completed = subprocess.run(
+                [str(copied_testkit / "package-source.sh"), str(archive)],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, encoding="utf-8", check=False,
+            )
+            self.assertEqual(completed.returncode, 65)
+            self.assertIn("--allow-dirty", completed.stderr)
+            self.assertFalse(archive.exists())
+
+    def test_extracted_source_tamper_fails_before_native_build(self) -> None:
+        if shutil.which("tar") is None or shutil.which("gzip") is None:
+            self.skipTest("tar and gzip are required")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            archive = root / "source.tar.gz"
+            packaged = subprocess.run(
+                [str(PACKAGE_SCRIPT), "--allow-dirty", str(archive)],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, encoding="utf-8", check=False,
+            )
+            self.assertEqual(packaged.returncode, 0, msg=packaged.stderr)
+            extracted = root / "extracted"
+            extracted.mkdir()
+            with tarfile.open(archive, "r:gz") as source_tar:
+                source_tar.extractall(extracted)
+            with (extracted / "FixtureApp.swift").open("a", encoding="utf-8") as stream:
+                stream.write("// tampered\n")
+            completed = subprocess.run(
+                [
+                    str(extracted / "run.sh"),
+                    "--output", str(root / "output"),
+                    "--build-dir", str(root / "build"),
+                ],
+                cwd=extracted, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, encoding="utf-8", check=False, timeout=30,
+            )
+            report = _decode_single_json(completed.stdout)
+            self.assertEqual(completed.returncode, 1)
+            self.assertEqual(report["error"]["code"], "invalid_source_provenance")
+            self.assertFalse((root / "build").exists())
 
 
 class NormalizedArchiveContracts(unittest.TestCase):
@@ -629,7 +763,7 @@ esac
         command = (
             f'. "{IDENTITY_SCRIPT}"; '
             'write_identity_attestation "$1" "$2" "$3" "$4" '
-            '"$5" "$6" Runner.app Runner.app/runner '
+            '"$5" "$6" "$7" clean "$8" Runner.app Runner.app/runner '
             'dev.ai-auto-desktop.testkit.ax-runner Fixture.app '
             'Fixture.app/fixture dev.ai-auto-desktop.testkit.fixture'
         )
@@ -639,7 +773,8 @@ esac
         completed = subprocess.run(
             [shell, "-eu", "-c", command, "identity-test",
              str(output), str(tools["swiftc"]), str(tools["codesign"]),
-             str(tools["lipo"]), str(tools["shasum"]), stability],
+             str(tools["lipo"]), str(tools["shasum"]), stability,
+             "a" * 40, "b" * 64],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -658,6 +793,8 @@ esac
             attestation = output.read_text(encoding="utf-8")
             self.assertIn("swift=Apple Swift version 6.0", attestation)
             self.assertIn("identity_stability=ephemeral", attestation)
+            self.assertIn(f"source_revision={'a' * 40}", attestation)
+            self.assertIn(f"source_package_digest={'b' * 64}", attestation)
             for field in ("designated =>", "Identifier=", "CDHash=",
                           "architectures=", "sha256="):
                 with self.subTest(field=field):
@@ -714,7 +851,7 @@ class NonMacOSLauncherContracts(unittest.TestCase):
             root = Path(temporary)
             source_archive = root / "macos-testkit-source.tar.gz"
             packaged = subprocess.run(
-                [str(PACKAGE_SCRIPT), str(source_archive)],
+                [str(PACKAGE_SCRIPT), "--allow-dirty", str(source_archive)],
                 cwd=root,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -725,9 +862,11 @@ class NonMacOSLauncherContracts(unittest.TestCase):
             self.assertEqual(packaged.returncode, 0, msg=packaged.stderr)
             with tarfile.open(source_archive, "r:gz") as archive:
                 members = archive.getmembers()
-            self.assertEqual({member.name for member in members},
-                             SOURCE_PACKAGE_MEMBERS)
-            self.assertEqual(len(members), len(SOURCE_PACKAGE_MEMBERS))
+            self.assertEqual(
+                {member.name for member in members},
+                SOURCE_PACKAGE_MEMBERS | {"SOURCE_MANIFEST.txt"},
+            )
+            self.assertEqual(len(members), len(SOURCE_PACKAGE_MEMBERS) + 1)
             self.assertTrue(all(member.isfile() for member in members))
 
             extracted = root / "extracted"
@@ -749,6 +888,11 @@ class NonMacOSLauncherContracts(unittest.TestCase):
                 'secureInput.stringValue = "fixture-secret"',
                 _read(extracted / "FixtureApp.swift"),
             )
+            source_manifest = _read(extracted / "SOURCE_MANIFEST.txt")
+            self.assertRegex(
+                source_manifest, r"(?m)^source_worktree=(?:clean|dirty)$"
+            )
+            self.assertIn("source_revision=", source_manifest)
             extracted_run = extracted / "run.sh"
             self.assertTrue(os.access(extracted_run, os.X_OK))
             completed = subprocess.run(

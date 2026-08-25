@@ -44,6 +44,11 @@ CDHash、Mach-O 架构和可执行文件 SHA-256，不保存绝对路径。
 其中 Swift 版本、identity stability，以及 runner/fixture 各自的 designated requirement、
 Identifier、CDHash、架构、SHA-256 都是必填证明；任何工具失败、字段缺失或空值都会让构建
 失败，不会产生半份 `identity.txt`。
+`report.json` 与 `identity.txt` 还会同时携带源码 revision、worktree 状态和
+`source_package_digest`。digest 是规范化 `SOURCE_MANIFEST.txt` 的 SHA-256；manifest
+逐项固定除自身外所有源码包成员的 mode 和 SHA-256，因此没有自引用 hash。运行前会重建并
+逐字比较该 manifest，源码包被修改后会在编译和 TCC 操作前以
+`invalid_source_provenance` 失败。这些值是可核对的携带数据，不会仅凭归档自述建立信任。
 
 `run.sh` 会自动在 stderr 输出归档路径和完整 SHA-256。也可在 Mac 本机复核：
 
@@ -113,6 +118,18 @@ cd macos-ax-testkit
 ./run.sh
 ```
 
-接收方无需安装本项目或 Python。发布负责人应从待交付 revision 生成源码包，并通过可信
-渠道同时提供源码包 SHA-256。
+接收方无需安装本项目或 Python。发布负责人应从待交付的 clean Git revision 生成源码包。
+命令会输出源码 revision、worktree 状态、源码内容 SHA-256（即 package digest）和外层源码
+归档 SHA-256；至少把 revision 与源码内容 SHA-256 通过独立可信渠道交给结果验真方。外层
+源码归档 hash 适合传输完整性复核，但结果 verifier 绑定的是不依赖 gzip/tar 表示的内容
+digest。
+
+默认命令会拒绝白名单文件存在未提交改动。仅用于开发测试时可显式生成 dirty 包：
+
+```sh
+./package-source.sh --allow-dirty /absolute/path/dev-macos-testkit.tar.gz
+```
+
+dirty 状态会进入 manifest 和结果；即使 revision/digest 都匹配，验真器也不会令其
+`source_trusted=true` 或用于资格认定。
 

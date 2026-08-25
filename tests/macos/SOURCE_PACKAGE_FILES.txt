@@ -3,9 +3,11 @@ run.sh
 build.sh
 archive.sh
 identity.sh
+source-provenance.sh
 # type_text sources: both files below are required for the secure fixture and runner.
 # FixtureApp.swift AXTestRunner.swift
 FixtureApp.swift
 AXTestRunner.swift
 SOURCE_PACKAGE_FILES.txt
 package-source.sh
+# SOURCE_MANIFEST.txt is generated at packaging time and hashes every member above.

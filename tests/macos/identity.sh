@@ -141,7 +141,7 @@ identity_collect_app() {
 }
 
 write_identity_attestation() {
-    if [ "$#" -ne 12 ]; then
+    if [ "$#" -ne 15 ]; then
         printf '%s\n' '失败：identity attestation 参数数量无效。' >&2
         return 1
     fi
@@ -151,13 +151,16 @@ write_identity_attestation() {
     identity_lipo=$4
     identity_shasum=$5
     identity_stability=$6
-    identity_runner_app=$7
-    identity_runner_executable=$8
-    identity_runner_identifier=$9
+    identity_source_revision=$7
+    identity_source_worktree=$8
+    identity_source_package_digest=$9
     shift 9
-    identity_fixture_app=$1
-    identity_fixture_executable=$2
-    identity_fixture_identifier=$3
+    identity_runner_app=$1
+    identity_runner_executable=$2
+    identity_runner_identifier=$3
+    identity_fixture_app=$4
+    identity_fixture_executable=$5
+    identity_fixture_identifier=$6
 
     if ! identity_value_is_single_nonempty_line "$identity_stability"; then
         printf '%s\n' '失败：identity stability 为空或无效。' >&2
@@ -167,6 +170,36 @@ write_identity_attestation() {
         ephemeral|stable_identity_requested) ;;
         *)
             printf '%s\n' '失败：identity stability 值不受支持。' >&2
+            return 1
+            ;;
+    esac
+    case ${#identity_source_revision} in
+        40|64) ;;
+        *)
+            printf '%s\n' '失败：source revision 长度无效。' >&2
+            return 1
+            ;;
+    esac
+    case $identity_source_revision in
+        *[!0123456789abcdef]*)
+            printf '%s\n' '失败：source revision 不是小写十六进制。' >&2
+            return 1
+            ;;
+    esac
+    case $identity_source_worktree in
+        clean|dirty) ;;
+        *)
+            printf '%s\n' '失败：source worktree 状态无效。' >&2
+            return 1
+            ;;
+    esac
+    if [ "${#identity_source_package_digest}" -ne 64 ]; then
+        printf '%s\n' '失败：source package digest 长度无效。' >&2
+        return 1
+    fi
+    case $identity_source_package_digest in
+        *[!0123456789abcdef]*)
+            printf '%s\n' '失败：source package digest 不是小写十六进制。' >&2
             return 1
             ;;
     esac
@@ -200,6 +233,10 @@ write_identity_attestation() {
     {
         printf '%s\n' "swift=$identity_swift_version"
         printf '%s\n' "identity_stability=$identity_stability"
+        printf '%s\n' "source_revision=$identity_source_revision"
+        printf '%s\n' "source_worktree=$identity_source_worktree"
+        printf '%s\n' \
+            "source_package_digest=$identity_source_package_digest"
     } >>"$identity_document"
 
     if ! identity_collect_app runner "$identity_runner_app" \

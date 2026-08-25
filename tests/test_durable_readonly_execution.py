@@ -477,6 +477,28 @@ class DurableReadOnlyExecutionTests(unittest.TestCase):
         )
         self.assertEqual(plugin.calls, [])
 
+    def test_heartbeat_start_does_not_swallow_process_interrupts(self) -> None:
+        for signal in (KeyboardInterrupt(), SystemExit(7), GeneratorExit()):
+            with self.subTest(signal=type(signal).__name__), tempfile.TemporaryDirectory() as temporary:
+                path = Path(temporary) / "runs.sqlite3"
+                with JournalStore(path) as store:
+                    plugin = StubPlugin()
+                    keeper = mock.Mock()
+                    keeper.start.side_effect = signal
+                    with mock.patch(
+                        "ai_auto_desktop.durable._LeaseHeartbeatKeeper",
+                        return_value=keeper,
+                    ), self.assertRaises(type(signal)):
+                        DurableExecutor(
+                            store, owner_id="interrupt",
+                            durable_action_mode="read-only",
+                        ).start(
+                            plan(), inputs={"query": "public"},
+                            run_id="heartbeat-interrupt",
+                            plugins={"fixture": plugin},
+                        )
+                    self.assertEqual(plugin.calls, [])
+
     def test_declared_error_is_redacted_before_persistence(self) -> None:
         plugin = StubPlugin(PluginError("FIXTURE.FAIL", RAW, details={"secret": RAW}))
         outcome = self.executor().start(plan(), inputs={"query": "public"}, run_id="failed", plugins={"fixture": plugin})

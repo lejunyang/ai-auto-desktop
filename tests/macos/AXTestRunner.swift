@@ -13,6 +13,9 @@ private let expectedStatus = "Status: pressed: \(typeTextValue)"
 private let maximumUnicodeUnitsPerEvent = 20
 private let axMessageTimeout: Float = 1.0
 private var reportIdentityStability = "unknown"
+private var reportSourceRevision = "unavailable"
+private var reportSourceWorktree = "unavailable"
+private var reportSourcePackageDigest = "unavailable"
 
 private struct Arguments {
     let fixtureApp: URL
@@ -20,6 +23,9 @@ private struct Arguments {
     let pidFile: URL?
     let cancelFile: URL?
     let identityStability: String
+    let sourceRevision: String
+    let sourceWorktree: String
+    let sourcePackageDigest: String
     let promptAccessibility: Bool
     let maxDepth: Int
     let maxNodes: Int
@@ -54,6 +60,14 @@ private func architectureName() -> String {
 #else
     return "unknown"
 #endif
+}
+
+private func isLowercaseHex(_ value: String, lengths: Set<Int>) -> Bool {
+    let bytes = Array(value.utf8)
+    guard lengths.contains(bytes.count) else { return false }
+    return bytes.allSatisfy { byte in
+        (48...57).contains(byte) || (97...102).contains(byte)
+    }
 }
 
 // Give the shell watchdog a dedicated process group; the fixture inherits it.
@@ -296,6 +310,9 @@ private func parseArguments() -> Arguments? {
     var pidFile: String?
     var cancelFile: String?
     var identityStability = "unknown"
+    var sourceRevision: String?
+    var sourceWorktree: String?
+    var sourcePackageDigest: String?
     var prompt = false
     var maxDepth = 8
     var maxNodes = 128
@@ -329,6 +346,24 @@ private func parseArguments() -> Arguments? {
             else { return nil }
             identityStability = raw[index + 1]
             index += 2
+        case "--source-revision":
+            guard index + 1 < raw.count,
+                  isLowercaseHex(raw[index + 1], lengths: [40, 64])
+            else { return nil }
+            sourceRevision = raw[index + 1]
+            index += 2
+        case "--source-worktree":
+            guard index + 1 < raw.count,
+                  ["clean", "dirty"].contains(raw[index + 1])
+            else { return nil }
+            sourceWorktree = raw[index + 1]
+            index += 2
+        case "--source-package-digest":
+            guard index + 1 < raw.count,
+                  isLowercaseHex(raw[index + 1], lengths: [64])
+            else { return nil }
+            sourcePackageDigest = raw[index + 1]
+            index += 2
         case "--max-depth":
             guard index + 1 < raw.count, let value = Int(raw[index + 1]), value > 0 else { return nil }
             maxDepth = min(value, 32)
@@ -341,7 +376,10 @@ private func parseArguments() -> Arguments? {
             return nil
         }
     }
-    guard let fixturePath = fixturePath else { return nil }
+    guard let fixturePath = fixturePath,
+          let sourceRevision = sourceRevision,
+          let sourceWorktree = sourceWorktree,
+          let sourcePackageDigest = sourcePackageDigest else { return nil }
     return Arguments(
         fixtureApp: URL(fileURLWithPath: fixturePath).standardizedFileURL,
         reportPath: reportPath.map {
@@ -354,6 +392,9 @@ private func parseArguments() -> Arguments? {
             URL(fileURLWithPath: $0).standardizedFileURL
         },
         identityStability: identityStability,
+        sourceRevision: sourceRevision,
+        sourceWorktree: sourceWorktree,
+        sourcePackageDigest: sourcePackageDigest,
         promptAccessibility: prompt,
         maxDepth: maxDepth,
         maxNodes: maxNodes
@@ -377,6 +418,11 @@ private func makeReport(
         "kind": "macos_ax_fixture_test",
         "status": status,
         "message": message,
+        "source": [
+            "revision": reportSourceRevision,
+            "worktree": reportSourceWorktree,
+            "package_digest": reportSourcePackageDigest,
+        ],
         "timestamp_utc": ISO8601DateFormatter().string(from: Date()),
         "platform": [
             "os": "macos",
@@ -422,6 +468,9 @@ private func run(arguments parsedArguments: Arguments? = nil) -> Outcome {
         return Outcome(report: report, exitCode: 2)
     }
     reportIdentityStability = args.identityStability
+    reportSourceRevision = args.sourceRevision
+    reportSourceWorktree = args.sourceWorktree
+    reportSourcePackageDigest = args.sourcePackageDigest
     guard writePIDFile(args.pidFile) else {
         return Outcome(
             report: makeReport(

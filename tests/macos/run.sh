@@ -3,6 +3,7 @@ set -eu
 
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
 . "$script_dir/archive.sh"
+. "$script_dir/source-provenance.sh"
 build_root="$script_dir/.build"
 output_root="$script_dir/results"
 prompt_accessibility=false
@@ -10,6 +11,12 @@ runner_timeout_seconds=30
 runner_pid=
 watchdog_pid=
 runner_pid_observed=false
+source_revision=unavailable
+source_worktree=unavailable
+source_package_digest=unavailable
+source_manifest_path=
+source_verified=false
+identity_available_this_run=false
 
 usage() {
     cat >&2 <<'EOF'
@@ -18,6 +25,7 @@ usage() {
 默认只检查 Accessibility trust，不弹授权提示。只有显式传入
 --prompt-accessibility 才会调用带 prompt 的系统 API。套件绝不请求截屏授权，也不截图。
 runner 默认最多运行 30 秒；--timeout 只接受 1 到 600 的整数秒。
+运行前会验证 SOURCE_MANIFEST.txt；结果携带源码 revision 和源码内容摘要。
 EOF
 }
 
@@ -85,6 +93,18 @@ fi
 mkdir "$result_dir"
 chmod 700 "$result_dir"
 
+if load_source_provenance "$script_dir" \
+    "$script_dir/SOURCE_PACKAGE_FILES.txt"; then
+    source_revision=$SOURCE_REVISION
+    source_worktree=$SOURCE_WORKTREE
+    source_package_digest=$SOURCE_PACKAGE_DIGEST
+    source_manifest_path=$SOURCE_MANIFEST_PATH
+    source_verified=true
+    release_source_provenance
+else
+    write_provenance_error=invalid_source_provenance
+fi
+
 run_with_watchdog() {
     timeout_marker="$result_dir/.runner-timeout"
     runner_pid_file="$result_dir/.runner-pid"
@@ -95,7 +115,10 @@ run_with_watchdog() {
     /usr/bin/open -n -W "$runner_app" --args "$@" \
         --pid-file "$runner_pid_file" \
         --cancel-file "$cancel_file" \
-        --identity-stability "$identity_stability" &
+        --identity-stability "$identity_stability" \
+        --source-revision "$source_revision" \
+        --source-worktree "$source_worktree" \
+        --source-package-digest "$source_package_digest" &
     open_pid=$!
     (
         sleep "$runner_timeout_seconds"
@@ -174,13 +197,21 @@ write_launcher_report() {
         Darwin|Linux) ;;
         *) report_os=unknown ;;
     esac
+    report_source=
+    if [ "$source_verified" = true ]; then
+        report_source=',"source":{"revision":"'"$source_revision"'","worktree":"'"$source_worktree"'","package_digest":"'"$source_package_digest"'"}'
+    fi
     cat >"$report_path" <<EOF
-{"schema_version":"1.0","kind":"macos_ax_fixture_test","status":"$report_status","message":"$report_message","platform":{"os":"$report_os","architecture":"$arch"},"permissions":{"accessibility":{"checked":false,"prompt_requested":$prompt_accessibility},"screen_capture":{"checked":false,"request_attempted":false,"capture_attempted":false}},"execution":{"phase":"$report_phase","command_status":$report_command_status,"timed_out":$report_timed_out,"timeout_seconds":$runner_timeout_seconds,"runner_pid_observed":$runner_pid_observed},"error":{"code":"$report_error_code","message":"$report_message"},"checks":[{"id":"launcher_$report_phase","status":"$report_check_status","message":"$report_message"}],"summary":{"passed":0,"failed":$report_failed,"total":1}}
+{"schema_version":"1.0","kind":"macos_ax_fixture_test","status":"$report_status","message":"$report_message"$report_source,"platform":{"os":"$report_os","architecture":"$arch"},"permissions":{"accessibility":{"checked":false,"prompt_requested":$prompt_accessibility},"screen_capture":{"checked":false,"request_attempted":false,"capture_attempted":false}},"execution":{"phase":"$report_phase","command_status":$report_command_status,"timed_out":$report_timed_out,"timeout_seconds":$runner_timeout_seconds,"runner_pid_observed":$runner_pid_observed},"error":{"code":"$report_error_code","message":"$report_message"},"checks":[{"id":"launcher_$report_phase","status":"$report_check_status","message":"$report_message"}],"summary":{"passed":0,"failed":$report_failed,"total":1}}
 EOF
 }
 
 build_status=0
-"$script_dir/build.sh" "$build_root" || build_status=$?
+if [ "${write_provenance_error:-}" = invalid_source_provenance ]; then
+    build_status=82
+else
+    "$script_dir/build.sh" "$build_root" || build_status=$?
+fi
 if [ "$build_status" -ne 0 ]; then
     case $build_status in
         69) write_launcher_report unsupported "requires_macos" build requires_macos "$build_status" false; final_status=3 ;;
@@ -189,6 +220,7 @@ if [ "$build_status" -ne 0 ]; then
         74) write_launcher_report unsupported "codesign_unavailable" build codesign_unavailable "$build_status" false; final_status=3 ;;
         79) write_launcher_report unsupported "unsupported_architecture" build unsupported_architecture "$build_status" false; final_status=3 ;;
         81) write_launcher_report unsupported "unsupported_swift_version" build unsupported_swift_version "$build_status" false; final_status=3 ;;
+        82) write_launcher_report failed "invalid_source_provenance" build invalid_source_provenance "$build_status" false; final_status=1 ;;
         72) write_launcher_report failed "fixture_compile_failed" build fixture_compile_failed "$build_status" false; final_status=1 ;;
         73) write_launcher_report failed "runner_compile_failed" build runner_compile_failed "$build_status" false; final_status=1 ;;
         75) write_launcher_report failed "fixture_codesign_failed" build fixture_codesign_failed "$build_status" false; final_status=1 ;;
@@ -198,6 +230,7 @@ if [ "$build_status" -ne 0 ]; then
         *) write_launcher_report failed "native_build_failed" build native_build_failed "$build_status" false; final_status=1 ;;
     esac
 else
+    identity_available_this_run=true
     runner="$build_root/AiAutoDesktopAXRunner.app/Contents/MacOS/AiAutoDesktopAXRunner"
     fixture="$build_root/AiAutoDesktopAXFixture.app"
     temporary_report="$result_dir/report.json.tmp"
@@ -252,11 +285,23 @@ cat >"$result_dir/README.txt" <<'EOF'
 - 未保存截图或屏幕像素；
 - 未枚举 fixture 进程之外的 Accessibility 树；
 - 未包含构建日志、用户名、主机名或其他应用的窗口内容。
+- source revision/package digest 来自已验证的源码包 manifest，但仍需请求方用可信预期值校验。
 EOF
-if [ -f "$build_root/identity.txt" ]; then
+if [ "$identity_available_this_run" = true ] \
+    && [ -f "$build_root/identity.txt" ]; then
     cp "$build_root/identity.txt" "$result_dir/identity.txt"
 else
-    printf '%s\n' 'identity_attestation=unavailable' >"$result_dir/identity.txt"
+    if [ "$source_verified" = true ]; then
+        {
+            printf '%s\n' 'identity_attestation=unavailable'
+            printf '%s\n' "source_revision=$source_revision"
+            printf '%s\n' "source_worktree=$source_worktree"
+            printf '%s\n' "source_package_digest=$source_package_digest"
+        } >"$result_dir/identity.txt"
+    else
+        printf '%s\n' 'identity_attestation=unavailable' \
+            >"$result_dir/identity.txt"
+    fi
 fi
 
 if [ -x /usr/bin/shasum ]; then

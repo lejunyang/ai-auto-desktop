@@ -32,9 +32,11 @@ REQUIRED_CHECKS = (
     "type_text_unicode_and_reread",
     "press_and_reread",
 )
+SOURCE_REVISION = "a" * 40
+SOURCE_PACKAGE_DIGEST = "b" * 64
 
 
-def _report(status: str = "passed") -> bytes:
+def _report(status: str = "passed", *, with_source: bool = True) -> bytes:
     if status == "passed":
         checks = [
             {"id": check_id, "status": "pass", "message": "ok"}
@@ -93,15 +95,29 @@ def _report(status: str = "passed") -> bytes:
             "total": len(checks),
         },
     }
+    if with_source:
+        document["source"] = {
+            "revision": SOURCE_REVISION,
+            "worktree": "clean",
+            "package_digest": SOURCE_PACKAGE_DIGEST,
+        }
     return (
         json.dumps(document, ensure_ascii=False, sort_keys=True).encode() + b"\n"
     )
 
 
-def _identity() -> bytes:
+def _identity(*, with_source: bool = True) -> bytes:
+    provenance = (
+        f"source_revision={SOURCE_REVISION}\n"
+        "source_worktree=clean\n"
+        f"source_package_digest={SOURCE_PACKAGE_DIGEST}\n"
+        if with_source else ""
+    )
     return (
         "swift=Apple Swift version 6.0\n"
         "identity_stability=ephemeral\n"
+        + provenance
+        +
         "[runner]\n"
         "designated => identifier runner and anchor apple generic\n"
         "Identifier=dev.ai-auto-desktop.testkit.ax-runner\n"
@@ -119,11 +135,13 @@ def _identity() -> bytes:
     ).encode()
 
 
-def _files(status: str = "passed") -> dict[str, bytes]:
+def _files(
+    status: str = "passed", *, with_source: bool = True
+) -> dict[str, bytes]:
     files = {
-        "report.json": _report(status),
+        "report.json": _report(status, with_source=with_source),
         "README.txt": "仅包含结构化测试结果。\n".encode(),
-        "identity.txt": _identity(),
+        "identity.txt": _identity(with_source=with_source),
     }
     files["SHA256SUMS"] = "".join(
         f"{hashlib.sha256(files[name]).hexdigest()}  {name}\n"
@@ -208,11 +226,19 @@ def _regular_entries(
 
 class MacOSResultVerifierTests(unittest.TestCase):
     def _run(
-        self, archive: Path, expected_sha256: str | None = None
+        self, archive: Path, expected_sha256: str | None = None,
+        *, expected_revision: str | None = None,
+        expected_package_digest: str | None = None,
     ) -> tuple[subprocess.CompletedProcess[str], dict[str, object]]:
         arguments = [str(VERIFIER)]
         if expected_sha256 is not None:
             arguments.extend(["--expected-archive-sha256", expected_sha256])
+        if expected_revision is not None:
+            arguments.extend(["--expected-source-revision", expected_revision])
+        if expected_package_digest is not None:
+            arguments.extend([
+                "--expected-source-package-digest", expected_package_digest
+            ])
         arguments.append(str(archive))
         completed = subprocess.run(
             arguments,
@@ -256,12 +282,170 @@ class MacOSResultVerifierTests(unittest.TestCase):
             archive = Path(temporary) / "macos-ax-test-result.tar.gz"
             _write_archive(archive, _regular_entries(_files()))
             expected = hashlib.sha256(archive.read_bytes()).hexdigest()
-            completed, result = self._run(archive, expected)
+            completed, result = self._run(
+                archive, expected, expected_revision=SOURCE_REVISION,
+                expected_package_digest=SOURCE_PACKAGE_DIGEST,
+            )
         self.assertEqual(completed.returncode, 0)
         self.assertIs(result["archive_valid"], True)
         self.assertIs(result["report_passed"], True)
         self.assertIs(result["trusted_archive"], True)
+        self.assertIs(result["source_trusted"], True)
         self.assertIs(result["qualified"], True)
+
+    def test_archive_hash_alone_no_longer_qualifies_source_bound_report(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            archive = Path(temporary) / "macos-ax-test-result.tar.gz"
+            _write_archive(archive, _regular_entries(_files()))
+            expected = hashlib.sha256(archive.read_bytes()).hexdigest()
+            completed, result = self._run(archive, expected)
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIs(result["trusted_archive"], True)
+        self.assertIs(result["source_trusted"], False)
+        self.assertIs(result["qualified"], False)
+        self.assertEqual(result["error"]["code"], "untrusted_source")
+
+    def test_source_pins_cannot_self_authenticate_untrusted_archive(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            archive = Path(temporary) / "result.tar.gz"
+            _write_archive(archive, _regular_entries(_files()))
+            completed, result = self._run(
+                archive, expected_revision=SOURCE_REVISION,
+                expected_package_digest=SOURCE_PACKAGE_DIGEST,
+            )
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIs(result["trusted_archive"], False)
+        self.assertIs(result["source_trusted"], False)
+        self.assertIs(result["qualified"], False)
+        self.assertEqual(result["error"]["code"], "untrusted_archive")
+
+    def test_old_report_is_valid_but_fails_closed_for_source_trust(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            archive = Path(temporary) / "old-result.tar.gz"
+            _write_archive(
+                archive, _regular_entries(_files(with_source=False))
+            )
+            expected = hashlib.sha256(archive.read_bytes()).hexdigest()
+            completed, result = self._run(
+                archive, expected, expected_revision=SOURCE_REVISION,
+                expected_package_digest=SOURCE_PACKAGE_DIGEST,
+            )
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIs(result["archive_valid"], True)
+        self.assertIs(result["trusted_archive"], True)
+        self.assertIs(result["source_trusted"], False)
+        self.assertEqual(
+            result["error"]["code"], "source_provenance_missing"
+        )
+
+    def test_source_revision_and_package_digest_mismatches_fail_closed(
+        self,
+    ) -> None:
+        cases = (
+            ("c" * 40, SOURCE_PACKAGE_DIGEST, "source_revision_mismatch"),
+            (SOURCE_REVISION, "d" * 64, "source_package_digest_mismatch"),
+        )
+        for revision, digest, expected_code in cases:
+            with self.subTest(expected_code=expected_code), tempfile.TemporaryDirectory(
+            ) as temporary:
+                archive = Path(temporary) / "result.tar.gz"
+                _write_archive(archive, _regular_entries(_files()))
+                archive_hash = hashlib.sha256(archive.read_bytes()).hexdigest()
+                completed, result = self._run(
+                    archive, archive_hash, expected_revision=revision,
+                    expected_package_digest=digest,
+                )
+                self.assertNotEqual(completed.returncode, 0)
+                self.assertIs(result["trusted_archive"], True)
+                self.assertIs(result["source_trusted"], False)
+                self.assertEqual(result["error"]["code"], expected_code)
+
+    def test_report_identity_source_mismatch_invalidates_archive(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            files = _files()
+            files["identity.txt"] = files["identity.txt"].replace(
+                SOURCE_PACKAGE_DIGEST.encode(), b"c" * 64, 1
+            )
+            _refresh_manifest(files)
+            archive = Path(temporary) / "result.tar.gz"
+            _write_archive(archive, _regular_entries(files))
+            completed, result = self._run(archive)
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIs(result["archive_valid"], False)
+        self.assertEqual(
+            result["error"]["code"], "source_provenance_mismatch"
+        )
+
+    def test_one_sided_source_provenance_invalidates_archive(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            files = _files()
+            report = json.loads(files["report.json"])
+            del report["source"]
+            files["report.json"] = (
+                json.dumps(report, sort_keys=True).encode() + b"\n"
+            )
+            _refresh_manifest(files)
+            archive = Path(temporary) / "result.tar.gz"
+            _write_archive(archive, _regular_entries(files))
+            completed, result = self._run(archive)
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIs(result["archive_valid"], False)
+        self.assertEqual(
+            result["error"]["code"], "source_provenance_mismatch"
+        )
+
+    def test_dirty_source_never_qualifies(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            files = _files()
+            files["report.json"] = files["report.json"].replace(
+                b'"worktree": "clean"', b'"worktree": "dirty"'
+            )
+            files["identity.txt"] = files["identity.txt"].replace(
+                b"source_worktree=clean", b"source_worktree=dirty"
+            )
+            _refresh_manifest(files)
+            archive = Path(temporary) / "dirty-result.tar.gz"
+            _write_archive(archive, _regular_entries(files))
+            expected = hashlib.sha256(archive.read_bytes()).hexdigest()
+            completed, result = self._run(
+                archive, expected, expected_revision=SOURCE_REVISION,
+                expected_package_digest=SOURCE_PACKAGE_DIGEST,
+            )
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIs(result["trusted_archive"], True)
+        self.assertIs(result["source_trusted"], False)
+        self.assertEqual(result["error"]["code"], "source_worktree_dirty")
+
+    def test_source_pin_arguments_must_be_complete_and_well_formed(
+        self,
+    ) -> None:
+        cases = (
+            (SOURCE_REVISION, None, "incomplete_expected_source"),
+            ("not-a-commit", SOURCE_PACKAGE_DIGEST,
+             "invalid_expected_source_revision"),
+            (SOURCE_REVISION, "ABC",
+             "invalid_expected_source_package_digest"),
+        )
+        for revision, digest, expected_code in cases:
+            with self.subTest(expected_code=expected_code), tempfile.TemporaryDirectory(
+            ) as temporary:
+                archive = Path(temporary) / "result.tar.gz"
+                _write_archive(archive, _regular_entries(_files()))
+                archive_hash = hashlib.sha256(archive.read_bytes()).hexdigest()
+                completed, result = self._run(
+                    archive, archive_hash, expected_revision=revision,
+                    expected_package_digest=digest,
+                )
+                self.assertNotEqual(completed.returncode, 0)
+                self.assertIs(result["trusted_archive"], True)
+                self.assertIs(result["source_trusted"], False)
+                self.assertEqual(result["error"]["code"], expected_code)
 
     def test_mismatched_expected_archive_hash_does_not_invalidate_archive(
         self,
@@ -304,7 +488,10 @@ class MacOSResultVerifierTests(unittest.TestCase):
             archive = Path(temporary) / "macos-ax-test-result.tar.gz"
             _write_archive(archive, _regular_entries(files))
             expected = hashlib.sha256(archive.read_bytes()).hexdigest()
-            completed, result = self._run(archive, expected)
+            completed, result = self._run(
+                archive, expected, expected_revision=SOURCE_REVISION,
+                expected_package_digest=SOURCE_PACKAGE_DIGEST,
+            )
         self.assertEqual(completed.returncode, 0)
         self.assertIs(result["qualified"], True)
 
@@ -528,6 +715,25 @@ class MacOSResultVerifierTests(unittest.TestCase):
         self.assertEqual(
             result["error"]["code"], "report_not_passed"
         )
+
+    def test_failed_report_can_still_bind_trusted_source_for_diagnostics(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            archive = Path(temporary) / "failed-result.tar.gz"
+            _write_archive(archive, _regular_entries(_files("failed")))
+            expected = hashlib.sha256(archive.read_bytes()).hexdigest()
+            completed, result = self._run(
+                archive, expected, expected_revision=SOURCE_REVISION,
+                expected_package_digest=SOURCE_PACKAGE_DIGEST,
+            )
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIs(result["archive_valid"], True)
+        self.assertIs(result["trusted_archive"], True)
+        self.assertIs(result["source_trusted"], True)
+        self.assertIs(result["report_passed"], False)
+        self.assertIs(result["qualified"], False)
+        self.assertEqual(result["error"]["code"], "report_not_passed")
 
     def test_minimal_unsupported_report_is_verified_not_qualified(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

@@ -113,6 +113,8 @@ fallback。它接收 `target`、`locator` 和 `text`，只允许 1–1024 个 Un
   因此不能据此声明平台资格已完成。
 - 可发送给真实 Mac 操作者的自包含 fixture 源码包由 `tests/macos/package-source.sh` 生成；
   它不要求预装本项目依赖，操作和回传规则见 `docs/testing/macos-fixture.md`。fixture 结果只
-  覆盖本仓库自有 AppKit 控件，不替代本 helper 对第三方应用的单独资格验证。
+  覆盖本仓库自有 AppKit 控件，不替代本 helper 对第三方应用的单独资格验证。源码包带 Git
+  revision 与覆盖其余成员的规范化 content manifest digest，Mac 端会在构建前验证并回传；
+  接收方仍必须用独立可信预期值同时 pin 结果归档和源码身份，不能依赖归档自述。
 
 完整契约和后续真机验收项见 `docs/architecture/macos-ax-driver.md`。

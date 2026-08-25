@@ -3,13 +3,22 @@ set -eu
 
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
 . "$script_dir/identity.sh"
+. "$script_dir/source-provenance.sh"
 build_root=${1:-"$script_dir/.build"}
 signing_identity=${MACOS_TEST_CODESIGN_IDENTITY:--}
 fixture_app="$build_root/AiAutoDesktopAXFixture.app"
 runner_app="$build_root/AiAutoDesktopAXRunner.app"
 signing_marker="$build_root/.codesign-identity"
+source_digest_marker="$build_root/.source-package-digest"
 attestation="$build_root/identity.txt"
 rm -f "$attestation"
+
+if ! load_source_provenance "$script_dir" \
+    "$script_dir/SOURCE_PACKAGE_FILES.txt"; then
+    printf '%s\n' '失败：源码包 provenance 验证失败。' >&2
+    exit 82
+fi
+release_source_provenance
 
 if [ "$(uname -s 2>/dev/null || printf unknown)" != Darwin ]; then
     printf '%s\n' '不支持：此构建脚本必须在 macOS 上运行。' >&2
@@ -135,22 +144,29 @@ build_runner() {
 }
 
 previous_signing_identity=
+previous_source_package_digest=
 if [ -f "$signing_marker" ]; then
     previous_signing_identity=$(sed -n '1p' "$signing_marker")
+fi
+if [ -f "$source_digest_marker" ]; then
+    previous_source_package_digest=$(sed -n '1p' "$source_digest_marker")
 fi
 if [ ! -x "$fixture_app/Contents/MacOS/AiAutoDesktopAXFixture" ] \
     || [ "$script_dir/FixtureApp.swift" -nt "$fixture_app/Contents/MacOS/AiAutoDesktopAXFixture" ] \
     || [ "$0" -nt "$fixture_app/Contents/MacOS/AiAutoDesktopAXFixture" ] \
+    || [ "$previous_source_package_digest" != "$SOURCE_PACKAGE_DIGEST" ] \
     || [ "$previous_signing_identity" != "$signing_identity" ]; then
     build_fixture
 fi
 if [ ! -x "$runner_app/Contents/MacOS/AiAutoDesktopAXRunner" ] \
     || [ "$script_dir/AXTestRunner.swift" -nt "$runner_app/Contents/MacOS/AiAutoDesktopAXRunner" ] \
     || [ "$0" -nt "$runner_app/Contents/MacOS/AiAutoDesktopAXRunner" ] \
+    || [ "$previous_source_package_digest" != "$SOURCE_PACKAGE_DIGEST" ] \
     || [ "$previous_signing_identity" != "$signing_identity" ]; then
     build_runner
 fi
 printf '%s\n' "$signing_identity" >"$signing_marker"
+printf '%s\n' "$SOURCE_PACKAGE_DIGEST" >"$source_digest_marker"
 
 if [ "$signing_identity" = - ]; then
     identity_stability=ephemeral
@@ -179,6 +195,9 @@ if ! write_identity_attestation \
     /usr/bin/lipo \
     /usr/bin/shasum \
     "$identity_stability" \
+    "$SOURCE_REVISION" \
+    "$SOURCE_WORKTREE" \
+    "$SOURCE_PACKAGE_DIGEST" \
     "$runner_app" \
     "$runner_app/Contents/MacOS/AiAutoDesktopAXRunner" \
     dev.ai-auto-desktop.testkit.ax-runner \

@@ -58,6 +58,8 @@ REQUIRED_PASSED_CHECKS = frozenset({
     "press_and_reread",
 })
 HEX_64 = re.compile(r"^[0-9a-fA-F]{64}$")
+LOWER_HEX_64 = re.compile(r"^[0-9a-f]{64}$")
+SOURCE_REVISION = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
 CDHASH = re.compile(r"^[0-9a-fA-F]+$")
 SAFE_MEMBER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 TIMESTAMP_UTC = re.compile(
@@ -523,6 +525,20 @@ def _validate_report(data: bytes) -> dict[str, Any]:
         _fail("invalid_report_status", "report status 无效。")
     _nonempty_string(report.get("message"), "message")
     _validate_launcher_diagnostics(report)
+    source_value = report.get("source")
+    if source_value is not None:
+        source = _dict(source_value, "source")
+        revision = _nonempty_string(source.get("revision"), "source.revision")
+        worktree = _nonempty_string(source.get("worktree"), "source.worktree")
+        package_digest = _nonempty_string(
+            source.get("package_digest"), "source.package_digest"
+        )
+        if (
+            SOURCE_REVISION.fullmatch(revision) is None
+            or worktree not in ("clean", "dirty")
+            or LOWER_HEX_64.fullmatch(package_digest) is None
+        ):
+            _fail("invalid_source_provenance", "report source provenance 无效。")
 
     checks = report.get("checks")
     if not isinstance(checks, list):
@@ -713,7 +729,11 @@ def _parse_identity(
             _fail("invalid_identity", "identity 字段为空或重复。", {"field": key})
         target[key] = value
 
-    if set(globals_) != {"swift", "identity_stability"}:
+    required_globals = {"swift", "identity_stability"}
+    provenance_globals = {
+        "source_revision", "source_worktree", "source_package_digest"
+    }
+    if set(globals_) not in (required_globals, required_globals | provenance_globals):
         _fail("invalid_identity", "identity 顶层必填字段不完整。")
     if set(sections) != {"runner", "fixture"}:
         _fail("invalid_identity", "identity runner/fixture section 不完整。")
@@ -767,27 +787,104 @@ def _parse_identity(
         parsed_sections["fixture"]["architectures"]
     ):
         _fail("identity_architecture_mismatch", "runner 与 fixture 架构集合不一致。")
-    return {
+    result = {
         "available": True,
         "stability": stability,
         "runner": parsed_sections["runner"],
         "fixture": parsed_sections["fixture"],
     }
+    if provenance_globals.issubset(globals_):
+        if (
+            SOURCE_REVISION.fullmatch(globals_["source_revision"]) is None
+            or globals_["source_worktree"] not in ("clean", "dirty")
+            or LOWER_HEX_64.fullmatch(
+                globals_["source_package_digest"]
+            ) is None
+        ):
+            _fail("invalid_source_provenance", "identity source provenance 无效。")
+        result["source"] = {
+            "revision": globals_["source_revision"],
+            "worktree": globals_["source_worktree"],
+            "package_digest": globals_["source_package_digest"],
+        }
+    return result
 
 
 def _inspect_nonpassed_identity(data: bytes) -> dict[str, Any]:
     text = _decode_utf8(data, "identity.txt")
-    if text == "identity_attestation=unavailable\n":
-        return {"available": False, "validated": False}
-    return {
+    if text.startswith("identity_attestation=unavailable\n"):
+        lines = text.splitlines()
+        if len(lines) == 1:
+            return {"available": False, "validated": False}
+        if len(lines) == 4:
+            values: dict[str, str] = {}
+            for line in lines[1:]:
+                if "=" not in line:
+                    _fail("invalid_source_provenance", "identity source provenance 无效。")
+                key, value = line.split("=", 1)
+                if key in values:
+                    _fail("invalid_source_provenance", "identity source provenance 重复。")
+                values[key] = value
+            if (
+                set(values)
+                != {"source_revision", "source_worktree", "source_package_digest"}
+                or SOURCE_REVISION.fullmatch(values["source_revision"]) is None
+                or values["source_worktree"] not in ("clean", "dirty")
+                or LOWER_HEX_64.fullmatch(values["source_package_digest"]) is None
+            ):
+                _fail("invalid_source_provenance", "identity source provenance 无效。")
+            return {
+                "available": False,
+                "validated": False,
+                "source": {
+                    "revision": values["source_revision"],
+                    "worktree": values["source_worktree"],
+                    "package_digest": values["source_package_digest"],
+                },
+            }
+        _fail("invalid_source_provenance", "identity unavailable 格式无效。")
+    result: dict[str, Any] = {
         "available": True,
         "validated": False,
         "sha256": hashlib.sha256(data).hexdigest(),
     }
+    provenance: dict[str, str] = {}
+    for line in text.splitlines():
+        if line.startswith("["):
+            break
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        if key in (
+            "source_revision", "source_worktree",
+            "source_package_digest",
+        ):
+            if key in provenance:
+                _fail("invalid_source_provenance", "identity source provenance 重复。")
+            provenance[key] = value
+    if provenance:
+        if (
+            set(provenance)
+            != {"source_revision", "source_worktree", "source_package_digest"}
+            or SOURCE_REVISION.fullmatch(provenance["source_revision"]) is None
+            or provenance["source_worktree"] not in ("clean", "dirty")
+            or LOWER_HEX_64.fullmatch(
+                provenance["source_package_digest"]
+            ) is None
+        ):
+            _fail("invalid_source_provenance", "identity source provenance 无效。")
+        result["source"] = {
+            "revision": provenance["source_revision"],
+            "worktree": provenance["source_worktree"],
+            "package_digest": provenance["source_package_digest"],
+        }
+    return result
 
 
 def verify(
-    path: Path, expected_archive_sha256: str | None = None
+    path: Path, expected_archive_sha256: str | None = None,
+    expected_source_revision: str | None = None,
+    expected_source_package_digest: str | None = None,
 ) -> dict[str, Any]:
     compressed, metadata = _read_archive(path)
     archive_sha256 = hashlib.sha256(compressed).hexdigest()
@@ -814,6 +911,18 @@ def verify(
             )
     else:
         identity = _inspect_nonpassed_identity(members["identity.txt"])
+    source = report.get("source")
+    identity_source = identity.get("source")
+    if (source is None) != (identity_source is None):
+        _fail(
+            "source_provenance_mismatch",
+            "report 与 identity 必须同时携带或同时缺少 source provenance。",
+        )
+    if source is not None and identity_source is not None and source != identity_source:
+        _fail(
+            "source_provenance_mismatch",
+            "report 与 identity 的 source provenance 不一致。",
+        )
     report_platform = report["platform"]
     architecture = report_platform["architecture"]
     if report_passed:
@@ -826,6 +935,8 @@ def verify(
                 )
 
     trusted_archive = False
+    source_trusted = False
+    source_binding_matches = False
     trust_error: dict[str, Any] | None = None
     if expected_archive_sha256 is not None:
         if not HEX_64.fullmatch(expected_archive_sha256):
@@ -842,7 +953,58 @@ def verify(
             }
         else:
             trusted_archive = True
-    qualified = report_passed and trusted_archive
+    if trust_error is None and (
+        expected_source_revision is not None
+        or expected_source_package_digest is not None
+    ):
+        if expected_source_revision is None or expected_source_package_digest is None:
+            trust_error = {
+                "code": "incomplete_expected_source",
+                "message": "可信源码预期值必须同时提供 revision 和 package digest。",
+            }
+        elif SOURCE_REVISION.fullmatch(expected_source_revision) is None:
+            trust_error = {
+                "code": "invalid_expected_source_revision",
+                "message": "受信任的预期源码 revision 必须是小写 Git commit SHA。",
+            }
+        elif LOWER_HEX_64.fullmatch(expected_source_package_digest) is None:
+            trust_error = {
+                "code": "invalid_expected_source_package_digest",
+                "message": "受信任的预期源码 package digest 必须是 64 位小写十六进制。",
+            }
+        elif not trusted_archive:
+            # Matching values inside an unauthenticated result archive cannot
+            # prove which source produced it. Preserve the outer archive hash
+            # as the root of trust before evaluating the source binding.
+            pass
+        elif source is None or identity_source is None:
+            trust_error = {
+                "code": "source_provenance_missing",
+                "message": "旧报告未携带可校验的源码 provenance；拒绝源码信任。",
+            }
+        elif not hmac.compare_digest(
+            expected_source_revision, source["revision"]
+        ):
+            trust_error = {
+                "code": "source_revision_mismatch",
+                "message": "报告源码 revision 与受信任预期值不一致。",
+            }
+        elif not hmac.compare_digest(
+            expected_source_package_digest, source["package_digest"]
+        ):
+            trust_error = {
+                "code": "source_package_digest_mismatch",
+                "message": "报告源码 package digest 与受信任预期值不一致。",
+            }
+        elif source["worktree"] != "clean":
+            trust_error = {
+                "code": "source_worktree_dirty",
+                "message": "报告来自显式允许的 dirty 开发源码包，不能用于资格认定。",
+            }
+        else:
+            source_binding_matches = True
+    source_trusted = trusted_archive and source_binding_matches
+    qualified = report_passed and trusted_archive and source_trusted
     result: dict[str, Any] = {
         "schema_version": VERIFIER_SCHEMA,
         "status": "passed" if qualified else "failed",
@@ -850,6 +1012,7 @@ def verify(
         "verified_archive": True,
         "report_passed": report_passed,
         "trusted_archive": trusted_archive,
+        "source_trusted": source_trusted,
         "qualified": qualified,
         "archive": {
             "sha256": archive_sha256,
@@ -862,6 +1025,7 @@ def verify(
             "checks_passed": report["summary"]["passed"],
         },
         "identity": identity,
+        "source": source,
     }
     if trust_error is not None:
         result["error"] = trust_error
@@ -879,21 +1043,48 @@ def verify(
                 "不能确认归档来源。"
             ),
         }
+    elif not source_trusted:
+        result["error"] = {
+            "code": "untrusted_source",
+            "message": (
+                "归档来源已绑定，但未同时提供经独立可信渠道取得的源码 "
+                "revision 与 package digest；不能确认测试源码。"
+            ),
+        }
     return result
 
 
 def main(argv: list[str] | None = None) -> int:
     arguments = sys.argv[1:] if argv is None else argv
     expected_archive_sha256: str | None = None
-    if len(arguments) == 1 and arguments[0] not in ("-h", "--help"):
-        archive_argument = arguments[0]
-    elif (
-        len(arguments) == 3
-        and arguments[0] == "--expected-archive-sha256"
-    ):
-        expected_archive_sha256 = arguments[1]
-        archive_argument = arguments[2]
-    else:
+    expected_source_revision: str | None = None
+    expected_source_package_digest: str | None = None
+    archive_argument: str | None = None
+    index = 0
+    while index < len(arguments):
+        argument = arguments[index]
+        if argument in (
+            "--expected-archive-sha256",
+            "--expected-source-revision",
+            "--expected-source-package-digest",
+        ):
+            if index + 1 >= len(arguments):
+                archive_argument = None
+                break
+            if argument == "--expected-archive-sha256":
+                expected_archive_sha256 = arguments[index + 1]
+            elif argument == "--expected-source-revision":
+                expected_source_revision = arguments[index + 1]
+            else:
+                expected_source_package_digest = arguments[index + 1]
+            index += 2
+        elif argument not in ("-h", "--help") and archive_argument is None:
+            archive_argument = argument
+            index += 1
+        else:
+            archive_argument = None
+            break
+    if archive_argument is None:
         _emit({
             "schema_version": VERIFIER_SCHEMA,
             "status": "failed",
@@ -901,18 +1092,24 @@ def main(argv: list[str] | None = None) -> int:
             "verified_archive": False,
             "report_passed": False,
             "trusted_archive": False,
+            "source_trusted": False,
             "qualified": False,
             "error": {
                 "code": "usage",
                 "message": (
                     "用法：verify-result.sh [--expected-archive-sha256 HEX] "
+                    "[--expected-source-revision SHA] "
+                    "[--expected-source-package-digest HEX] "
                     "/path/to/macos-ax-test-result.tar.gz"
                 ),
             },
         })
         return 64
     try:
-        result = verify(Path(archive_argument), expected_archive_sha256)
+        result = verify(
+            Path(archive_argument), expected_archive_sha256,
+            expected_source_revision, expected_source_package_digest,
+        )
     except VerificationError as exc:
         error: dict[str, Any] = {"code": exc.code, "message": exc.message}
         if exc.details:
@@ -924,6 +1121,7 @@ def main(argv: list[str] | None = None) -> int:
             "verified_archive": False,
             "report_passed": False,
             "trusted_archive": False,
+            "source_trusted": False,
             "qualified": False,
             "error": error,
         })
@@ -936,6 +1134,7 @@ def main(argv: list[str] | None = None) -> int:
             "verified_archive": False,
             "report_passed": False,
             "trusted_archive": False,
+            "source_trusted": False,
             "qualified": False,
             "error": {
                 "code": "internal_error",

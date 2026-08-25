@@ -676,7 +676,7 @@ class DurableExecutor:
         )
         try:
             keeper.start()
-        except BaseException:
+        except Exception:
             raise self._lease_heartbeat_error(
                 lease, stage="before_dispatch", provider_completed=False
             ) from None
