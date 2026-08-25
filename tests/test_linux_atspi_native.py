@@ -16,6 +16,7 @@ from pathlib import Path
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -32,6 +33,8 @@ DRIVER_PATH = PROJECT_ROOT / "plugins" / "linux_atspi" / "linux_atspi_driver.py"
 FIXTURE_PATH = PROJECT_ROOT / "tests" / "linux" / "atspi_fixture_app.py"
 QT_FIXTURE_SOURCE = PROJECT_ROOT / "tests" / "linux" / "qt_atspi_fixture.cpp"
 QT_FIXTURE_RUNNER = PROJECT_ROOT / "tests" / "linux" / "qt_atspi_native_runner.py"
+QML_FIXTURE_SOURCE = PROJECT_ROOT / "tests" / "linux" / "qml_atspi_fixture.qml"
+QML_FIXTURE_RUNNER = PROJECT_ROOT / "tests" / "linux" / "qml_atspi_native_runner.py"
 GTK_FIXTURE_RUNNER = PROJECT_ROOT / "tests" / "linux" / "gtk_atspi_native_runner.py"
 XTEST_BUILD_SCRIPT = PROJECT_ROOT / "plugins" / "linux_atspi" / "build_x11_xtest_helper.sh"
 TEST_TYPELIB_ENV = "AI_AUTO_DESKTOP_TEST_ATSPI_TYPELIB_PATH"
@@ -755,6 +758,71 @@ class NativeKdeX11AtspiInfrastructureTests(unittest.TestCase):
             report["input_injection"], "XTEST" if not session_locked else False
         )
         self.assertEqual(report["type_text_observed"], not session_locked)
+        self.assertFalse(report["ocr"])
+
+    def test_owned_qml_fixture_supports_real_semantic_invoke(self) -> None:
+        qmlscene = shutil.which("qmlscene") or shutil.which("qmlscene-qt5")
+        dbus_run_session = shutil.which("dbus-run-session")
+        if not QML_FIXTURE_SOURCE.is_file():
+            self.fail(f"仓库 QML fixture 不存在：{QML_FIXTURE_SOURCE}")
+        if not QML_FIXTURE_RUNNER.is_file():
+            self.fail(f"仓库 QML runner 不存在：{QML_FIXTURE_RUNNER}")
+        if qmlscene is None or dbus_run_session is None:
+            self.skipTest("Qt Quick fixture 需要 qmlscene 与 dbus-run-session")
+        with tempfile.TemporaryDirectory(prefix="aad-qml-atspi-") as temporary:
+            root = Path(temporary)
+            environment = _native_subprocess_environment(self.session)
+            environment["PYTHONPATH"] = str(PROJECT_ROOT / "src")
+            environment.pop("AT_SPI_BUS_ADDRESS", None)
+            for key, leaf in (
+                ("HOME", "home"), ("XDG_CONFIG_HOME", "config"),
+                ("XDG_CACHE_HOME", "cache"),
+                ("XDG_DATA_HOME", "data"),
+                ("XDG_STATE_HOME", "state"),
+                ("XDG_RUNTIME_DIR", "runtime"),
+            ):
+                directory = root / leaf
+                directory.mkdir(mode=0o700)
+                environment[key] = str(directory)
+            command = [
+                dbus_run_session, "--", sys.executable,
+                str(QML_FIXTURE_RUNNER), qmlscene,
+                str(QML_FIXTURE_SOURCE), str(DRIVER_PATH),
+            ]
+            process = subprocess.Popen(
+                command, env=environment, stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                encoding="utf-8", start_new_session=True,
+            )
+            try:
+                stdout, stderr = process.communicate(timeout=45)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(process.pid, signal.SIGTERM)
+                    process.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    os.killpg(process.pid, signal.SIGKILL)
+                    process.wait(timeout=3)
+                self.fail("QML fixture runner 超时且已回收整个进程组")
+            completed = subprocess.CompletedProcess(
+                command, process.returncode, stdout, stderr
+            )
+        try:
+            report = json.loads(completed.stdout.strip().splitlines()[-1])
+        except (IndexError, json.JSONDecodeError) as exc:
+            self.fail(
+                f"QML fixture runner 未输出 JSON：{completed.stdout!r}; {exc}"
+            )
+        self.assertEqual(
+            completed.returncode, 0, msg=f"{report!r}\n{completed.stderr}"
+        )
+        self.assertEqual(report["status"], "passed")
+        self.assertEqual(report["toolkit"], "Qt Quick")
+        self.assertEqual(report["actions"], ["invoke"])
+        self.assertEqual(report["native_interface"], "Action.do_action")
+        self.assertEqual(report["native_action_name"], "Press")
+        self.assertTrue(report["postcondition_observed"])
+        self.assertFalse(report["input_injection"])
         self.assertFalse(report["ocr"])
 
     def test_system_settings_is_observed_when_qt_bridge_is_available(self) -> None:

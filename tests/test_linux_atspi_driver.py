@@ -285,6 +285,12 @@ class LinuxAtspiDriverCoreTests(unittest.TestCase):
         )
 
     def test_list_applications_and_snapshot_report_session_and_backend(self) -> None:
+        session = self.driver.execute("inspect_session", {}, deadline=deadline())
+        self.assertEqual(session, {
+            "backend": "fake_linux_atspi",
+            "session_type": "x11",
+            "desktop": "KDE",
+        })
         result = self.driver.execute("list_applications", {}, deadline=deadline())
         self.assertEqual(result["backend"], "fake_linux_atspi")
         self.assertEqual(result["session"]["session_type"], "x11")
@@ -1530,6 +1536,7 @@ class LinuxAtspiProcessTests(unittest.TestCase):
         self.assertEqual(
             set(manifest["actions"]),
             {
+                "inspect_session",
                 "list_applications",
                 "snapshot",
                 "find",
@@ -1542,11 +1549,22 @@ class LinuxAtspiProcessTests(unittest.TestCase):
                 "collapse",
             },
         )
-        for name in ("list_applications", "snapshot", "find"):
+        for name in ("inspect_session", "list_applications", "snapshot", "find"):
             self.assertEqual(
                 manifest["actions"][name]["permissions"],
                 ["desktop.observe"],
             )
+        durable = manifest["actions"]["inspect_session"]
+        self.assertEqual(
+            durable["sensitivity"],
+            {"input": "public", "output": "public", "error": "public"},
+        )
+        self.assertEqual(
+            set(durable["durability"]["checkpoint_fields"]),
+            {"backend", "session_type", "desktop"},
+        )
+        for name in ("list_applications", "snapshot", "find"):
+            self.assertNotIn("durability", manifest["actions"][name])
         for name in (
             "focus",
             "invoke",

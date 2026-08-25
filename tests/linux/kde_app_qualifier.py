@@ -23,12 +23,13 @@ import subprocess
 import sys
 import tempfile
 import time
-from typing import Any
+from typing import Any, Mapping
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SRC_ROOT = PROJECT_ROOT / "src"
 DRIVER_PATH = PROJECT_ROOT / "plugins" / "linux_atspi" / "linux_atspi_driver.py"
+QML_FIXTURE_PATH = PROJECT_ROOT / "tests" / "linux" / "qml_atspi_fixture.qml"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
@@ -40,15 +41,36 @@ SESSION_KEYS = (
     "DISPLAY",
     "XAUTHORITY",
     "XDG_CURRENT_DESKTOP",
+    "XDG_RUNTIME_DIR",
     "XDG_SESSION_ID",
     "XDG_SESSION_TYPE",
 )
+QUALIFIER_ENVIRONMENT_KEYS = frozenset({
+    *SESSION_KEYS,
+    "AI_AUTO_DESKTOP_QUALIFIER_PRIVATE_BUS",
+    "AI_AUTO_DESKTOP_TEST_ATSPI_TYPELIB_PATH",
+    "DBUS_SESSION_BUS_ADDRESS",
+    "HOME",
+    "KDE_FULL_SESSION",
+    "KDE_SESSION_VERSION",
+    "XDG_CACHE_HOME",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "XDG_STATE_HOME",
+})
 STATE_NAMES = (
     "enabled", "visible", "showing", "focusable", "focused",
     "editable", "sensitive", "protected", "checked",
     "expandable", "expanded", "selectable", "selected",
 )
 APP_SPECS: dict[str, dict[str, Any]] = {
+    "dolphin": {
+        "executables": ("dolphin",),
+        # The qualifier supplies a private, empty directory below its
+        # temporary work root.  Dolphin therefore cannot enumerate or mutate
+        # the operator's real home directory during this read-only audit.
+        "launch_args": ("--new-window", "{fixture_dir}"),
+    },
     "konsole": {
         "executables": ("konsole",),
         "launch_args": (
@@ -57,11 +79,33 @@ APP_SPECS: dict[str, dict[str, Any]] = {
             "-e", "/bin/sleep", "60",
         ),
     },
+    "qml-fixture": {
+        "executables": ("qmlscene", "qmlscene-qt5"),
+        "launch_args": (str(QML_FIXTURE_PATH),),
+        # qmlscene treats --version as a scene URL and opens an error window.
+        # Qt itself is recorded separately by the host qmake probe.
+        "version_args": None,
+    },
     "system-settings": {
         "executables": ("systemsettings5", "systemsettings"),
         "launch_args": (),
     },
 }
+
+
+def sanitized_environment(
+    source: Mapping[str, str],
+) -> dict[str, str]:
+    """Keep only display/runtime values needed by owned test processes."""
+
+    result = {
+        key: value for key, value in source.items()
+        if key in QUALIFIER_ENVIRONMENT_KEYS and value
+    }
+    result["PATH"] = "/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin"
+    result["LANG"] = "C.UTF-8"
+    result["LC_ALL"] = "C.UTF-8"
+    return result
 
 
 def _ratio(numerator: int, denominator: int) -> float | None:
@@ -269,6 +313,73 @@ def _stop_owned_process(process: subprocess.Popen[Any]) -> None:
         pass
 
 
+def _process_start_time(pid: int) -> int | None:
+    """Return Linux /proc starttime without being confused by ')' in comm."""
+
+    try:
+        raw = (Path("/proc") / str(pid) / "stat").read_text(encoding="ascii")
+        fields = raw[raw.rindex(")") + 2:].split()
+        return int(fields[19])
+    except (OSError, UnicodeError, ValueError, IndexError):
+        return None
+
+
+def _stop_exact_process_group(
+    process: subprocess.Popen[Any], expected_start_time: int | None,
+) -> bool:
+    """Stop only the live process instance started as our group leader."""
+
+    if process.poll() is not None:
+        return True
+    pid = process.pid
+
+    def still_owned() -> bool:
+        try:
+            return (
+                expected_start_time is not None
+                and _process_start_time(pid) == expected_start_time
+                and os.getpgid(pid) == pid
+                and (Path("/proc") / str(pid)).stat().st_uid == os.getuid()
+            )
+        except (OSError, ProcessLookupError):
+            return False
+
+    if not still_owned():
+        return process.poll() is not None
+    try:
+        os.killpg(pid, signal.SIGTERM)
+        process.wait(timeout=3)
+    except subprocess.TimeoutExpired:
+        if not still_owned():
+            return process.poll() is not None
+        try:
+            os.killpg(pid, signal.SIGKILL)
+            process.wait(timeout=3)
+        except (OSError, ProcessLookupError, subprocess.TimeoutExpired):
+            pass
+    except (OSError, ProcessLookupError):
+        pass
+    return process.poll() is not None
+
+
+def _run_private_qualifier(
+    command: list[str], environment: dict[str, str], timeout: float,
+) -> tuple[int | None, bool]:
+    """Run the private bus as an owned group and clean it on timeout."""
+
+    process = subprocess.Popen(
+        command, env=environment, stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    start_time = _process_start_time(process.pid)
+    try:
+        return process.wait(timeout=timeout), False
+    except subprocess.TimeoutExpired:
+        _stop_exact_process_group(process, start_time)
+        return None, True
+
+
 def qualify_application(
     name: str, environment: dict[str, str], *, registration_timeout: float,
     snapshot_timeout: float, max_depth: int, max_nodes: int, work_dir: Path,
@@ -303,7 +414,12 @@ def qualify_application(
             "retryable": False,
         })
         return result
-    result["version"] = _command_output([executable, "--version"], environment)
+    version_args = spec.get("version_args", ("--version",))
+    result["version"] = (
+        {"available": True, "source": "host.qt"}
+        if version_args is None
+        else _command_output([executable, *version_args], environment)
+    )
 
     plugin = ProcessPlugin(
         [sys.executable, str(DRIVER_PATH)], env=environment, timeout=20,
@@ -321,7 +437,13 @@ def qualify_application(
         result["private_registry_baseline_count"] = len(
             baseline.get("applications", [])
         )
-        command = [executable, *spec["launch_args"]]
+        fixture_dir = work_dir / f"{name}-fixture"
+        fixture_dir.mkdir(mode=0o700, exist_ok=True)
+        launch_args = [
+            str(fixture_dir) if item == "{fixture_dir}" else item
+            for item in spec["launch_args"]
+        ]
+        command = [executable, *launch_args]
         with log_path.open("wb") as stderr_file:
             launch_started = time.monotonic()
             process = subprocess.Popen(
@@ -462,15 +584,13 @@ def _host_facts(environment: dict[str, str]) -> dict[str, Any]:
 
 
 def run_qualification(args: argparse.Namespace) -> dict[str, Any]:
-    environment = os.environ.copy()
+    environment = sanitized_environment(os.environ)
     environment["QT_QPA_PLATFORM"] = "xcb"
     environment["QT_LINUX_ACCESSIBILITY_ALWAYS_ON"] = "1"
     environment["QT_ACCESSIBILITY"] = "1"
     environment.pop("NO_AT_BRIDGE", None)
     environment.pop("AT_SPI_BUS_ADDRESS", None)
-    environment["PYTHONPATH"] = os.pathsep.join(
-        part for part in (str(SRC_ROOT), environment.get("PYTHONPATH", "")) if part
-    )
+    environment["PYTHONPATH"] = str(SRC_ROOT)
     started = time.monotonic()
     with tempfile.TemporaryDirectory(prefix="aad-kde-qualifier-work-") as temporary:
         work_dir = Path(temporary)
@@ -603,7 +723,7 @@ def main(argv: list[str] | None = None) -> int:
 
     with tempfile.TemporaryDirectory(prefix="aad-kde-qualifier-") as temporary:
         root = Path(temporary)
-        environment = os.environ.copy()
+        environment = sanitized_environment(os.environ)
         environment.update(session)
         environment.pop("DBUS_SESSION_BUS_ADDRESS", None)
         environment.pop("AT_SPI_BUS_ADDRESS", None)

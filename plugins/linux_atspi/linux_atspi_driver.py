@@ -58,6 +58,7 @@ QT5_NATIVE_ACTION_NAMES = {
 ACTION_IDS = {
     name: f"{PLUGIN_NAME}.{name}@1"
     for name in (
+        "inspect_session",
         "list_applications",
         "snapshot",
         "find",
@@ -182,8 +183,10 @@ def _contract(
     output_schema: dict[str, Any],
     errors: Sequence[tuple[str, str, bool]],
     permissions: Sequence[str],
+    sensitivity: Mapping[str, str] | None = None,
+    durability: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    return {
+    contract: dict[str, Any] = {
         "contract_major": 1,
         "description": description,
         "effect": {"default_class": effect},
@@ -193,6 +196,11 @@ def _contract(
         "output_schema": output_schema,
         "errors": _error_contracts(errors),
     }
+    if sensitivity is not None:
+        contract["sensitivity"] = dict(sensitivity)
+    if durability is not None:
+        contract["durability"] = copy.deepcopy(dict(durability))
+    return contract
 
 
 APPLICATION_SELECTOR_SCHEMA: dict[str, Any] = {
@@ -249,6 +257,44 @@ WRITE_OUTPUT_SCHEMA: dict[str, Any] = {
 }
 
 ACTION_CONTRACTS: dict[str, dict[str, Any]] = {
+    "inspect_session": _contract(
+        "返回不含应用内容的当前 AT-SPI backend 与桌面会话类型。",
+        effect="read_only",
+        risk_category="observe",
+        risk_level="low",
+        input_schema={"type": "object", "additionalProperties": False},
+        output_schema={
+            "type": "object",
+            "required": ["backend", "session_type", "desktop"],
+            "properties": {
+                "backend": {"type": "string", "maxLength": 128},
+                "session_type": {"type": ["string", "null"], "maxLength": 128},
+                "desktop": {"type": ["string", "null"], "maxLength": 256},
+            },
+            "additionalProperties": False,
+        },
+        errors=COMMON_ERRORS,
+        permissions=("desktop.observe",),
+        sensitivity={
+            "input": "public", "output": "public", "error": "public"
+        },
+        durability={
+            "checkpoint_fields": {
+                "backend": {
+                    "pointer": "/backend",
+                    "schema": {"type": "string", "maxLength": 128},
+                },
+                "session_type": {
+                    "pointer": "/session_type",
+                    "schema": {"type": ["string", "null"], "maxLength": 128},
+                },
+                "desktop": {
+                    "pointer": "/desktop",
+                    "schema": {"type": ["string", "null"], "maxLength": 256},
+                },
+            }
+        },
+    ),
     "list_applications": _contract(
         "通过 AT-SPI desktop 根节点枚举当前会话的桌面应用。",
         effect="read_only",
@@ -909,6 +955,8 @@ class LinuxAtspiDriver:
     def execute(self, action: str, args: Any, *, deadline: float) -> Any:
         _check_deadline(deadline)
         values = {} if args is None else _object(args, "args")
+        if action == "inspect_session":
+            return self._inspect_session(values)
         if action == "list_applications":
             return self._list_applications(values, deadline)
         if action == "snapshot":
@@ -918,6 +966,15 @@ class LinuxAtspiDriver:
         if action in WRITE_ACTIONS:
             return self._write(action, values, deadline)
         _fail("DRIVER.INVALID_REQUEST", f"未知动作：{action}", action=action)
+
+    def _inspect_session(self, args: dict[str, Any]) -> dict[str, Any]:
+        _only_keys(args, set(), "args")
+        session = _session_info(self.backend)
+        return {
+            "backend": _backend_name(self.backend),
+            "session_type": _safe_text(session.get("session_type")),
+            "desktop": _safe_text(session.get("desktop")),
+        }
 
     def _list_applications(self, args: dict[str, Any], deadline: float) -> dict[str, Any]:
         _only_keys(args, set(), "args")

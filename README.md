@@ -70,9 +70,11 @@ python -m ai_auto_desktop run workflow.yaml \
 自有 GTK3 fixture 验证 focus、set_text、invoke、toggle、expand/collapse，自有 Qt 5
 Widgets fixture 也验证 snapshot/find/focus/set_text/invoke；隔离 X11/AT-SPI fixture 还
 验证两套 toolkit 的 `type_text` 经 XTEST 输入 UTF-8 后由 fresh snapshot 观察。
-Konsole 22.12.3 与 System Settings 5.27.5 的初始窗口已完成只读资格验证，分别取得
-352 与 256 个未截断节点，且写动作派发数为零；这仍不等于“任意 KDE 应用已经支持”。
-Dolphin、更多 QML 页面、多窗口和动态页面仍需单独验证。除显式 `type_text` 外不会注入
+真实应用 Dolphin 22.12.3、Konsole 22.12.3、System Settings 5.27.5 以及自有 Qt
+Quick/QML fixture 的初始窗口已完成只读资格验证，分别取得 358、352、256 与 5 个未截断
+节点，且写动作派发数为零；Dolphin 只打开临时空目录。这仍不等于“任意 KDE/QML 应用已经
+支持”。自有 QML fixture 还通过 exact AT-SPI `Press` 和 fresh snapshot 状态变化验证，未使用
+键盘注入、OCR 或坐标；第三方 QML 页面、多窗口和动态页面仍需单独验证。除显式 `type_text` 外不会注入
 键鼠；驱动不截图、不执行 OCR。
 
 ## macOS 真机自测包

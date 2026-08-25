@@ -6,18 +6,24 @@
 ## 结论
 
 本机 `veLinux 2`、KDE Plasma `5.27.5`、Qt `5.15.8`、X.Org `1.21.1.7`、
-`DISPLAY=:10.0` 上，Konsole `22.12.3` 与 System Settings `5.27.5` 均由本任务
-新启动，并通过生产 `desktop.linux_atspi` driver 的精确 PID selector 注册和读取。
-两份有界快照均未截断。
+`DISPLAY=:10.0` 上，Dolphin `22.12.3`、Konsole `22.12.3`、System Settings
+`5.27.5` 与仓库自有 Qt Quick/QML fixture 均由本任务新启动，并通过生产
+`desktop.linux_atspi` driver 的精确 PID selector 注册和读取。四份有界快照均未截断。
 
 | 应用 | 结果 | 注册延迟 | 快照延迟 | 元素数 | 暴露的语义动作 |
 | --- | --- | ---: | ---: | ---: | --- |
-| Konsole | `supported / observed_read_only` | 406.26 ms | 1089.88 ms | 352 | focus 61、invoke 30、set_text 16 |
-| System Settings | `supported / observed_read_only` | 1614.83 ms | 696.78 ms | 256 | focus 27、invoke 9 |
+| Dolphin | `supported / observed_read_only` | 611.59 ms | 1188.59 ms | 358 | focus 56、invoke 15、set_text 3 |
+| Konsole | `supported / observed_read_only` | 411.30 ms | 974.04 ms | 352 | focus 61、invoke 30、set_text 16 |
+| Qt Quick/QML fixture | `supported / observed_read_only` | 506.72 ms | 19.42 ms | 5 | focus 2、invoke 1、type_text 1 |
+| System Settings | `supported / observed_read_only` | 1432.18 ms | 770.02 ms | 256 | focus 27、invoke 9 |
 
 这里的“暴露动作”只表示 snapshot 中 driver 根据 AT-SPI 信息声明了相应语义能力；
-本次 qualifier 没有调用它们，不能据此宣称写动作通过。System Settings 若在其他环境
+本次 qualifier 没有调用它们，不能据此宣称写动作通过。Dolphin 只打开 qualifier 临时空目录，
+不会枚举用户真实 home；QML 项是仓库自有 fixture，用于验证 Qt Quick 语义树而非第三方应用。
+System Settings 若在其他环境
 15 秒内没有以本次启动 PID 注册，将记录为 `unsupported`，不会作为 skip 或 pass。
+另一个专用原生测试已对自有 QML 按钮执行 exact `Press`，并从 fresh snapshot 观察状态 label
+变化；该测试只使用 AT-SPI `Action.do_action`，不使用 XTEST、OCR 或坐标输入。
 
 ## 安全和隔离
 
@@ -100,11 +106,12 @@ sh plugins/linux_atspi/build_x11_xtest_helper.sh
 
 PYTHONPATH=src /usr/bin/python3 -m pytest -vv -rs \
   tests/test_linux_atspi_native.py
-# 结果：5 passed, 5 skipped in 25.63s
+# 结果：新增 QML semantic invoke 后为 6 passed, 5 skipped；其中 QML Press 及
+# fresh snapshot 后置条件通过，input_injection=false、ocr=false
 
 PYTHONPATH=src /usr/bin/python3 tests/linux/kde_app_qualifier.py \
   --output artifacts/kde-x11-qualification.json
-# 结果：2 supported, 0 unsupported, 0 error；总耗时 4890.09 ms
+# 结果：4 supported, 0 unsupported, 0 error；总耗时 7600.11 ms
 ```
 
 native suite 的五个 skip 均有明确边界：Atspi typelib 已安装而无需测试 Gio
@@ -127,5 +134,5 @@ RemoteDesktop portal 可用，uinput 因当前进程不可写而 degraded，Wayl
   数值以忽略的 JSON artifact 为准。
 - 尚未执行任何低风险写动作；若以后增加，仍须限定自有 PID、使用 `find` 返回的 target 与
   exact locator、重新抓树验证后置条件，并在报告中逐项记录。
-- 本轮只在自有 fixture 上执行语义写动作；真实 KDE 应用资格矩阵保持只读。活动 KDE
+- 本轮只在自有 fixture（含 Qt Quick/QML）上执行语义写动作；真实 KDE 应用资格矩阵保持只读。活动 KDE
   display 处于锁屏状态，因此未覆盖已解锁桌面上的 XTEST 后置条件。

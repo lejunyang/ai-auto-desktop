@@ -61,7 +61,44 @@ class KdeAppQualifierContractTests(unittest.TestCase):
             qualifier._parse_args(["--max-nodes", "5001"])
         parsed = qualifier._parse_args([])
         self.assertEqual(parsed.registration_timeout, 15.0)
-        self.assertEqual(parsed.app, ["konsole", "system-settings"])
+        self.assertEqual(
+            parsed.app,
+            ["dolphin", "konsole", "qml-fixture", "system-settings"],
+        )
+
+    def test_dolphin_is_scoped_to_a_private_fixture_directory(self) -> None:
+        spec = qualifier.APP_SPECS["dolphin"]
+        self.assertEqual(spec["executables"], ("dolphin",))
+        self.assertIn("{fixture_dir}", spec["launch_args"])
+        self.assertNotIn("~", spec["launch_args"])
+
+    def test_qml_fixture_is_an_owned_local_source(self) -> None:
+        spec = qualifier.APP_SPECS["qml-fixture"]
+        self.assertEqual(spec["executables"], ("qmlscene", "qmlscene-qt5"))
+        source = Path(spec["launch_args"][0])
+        self.assertEqual(source, qualifier.QML_FIXTURE_PATH)
+        self.assertTrue(source.is_file())
+        self.assertIn("Accessible.name", source.read_text(encoding="utf-8"))
+
+    def test_qualification_environment_drops_unrelated_credentials(self) -> None:
+        environment = qualifier.sanitized_environment({
+            "PATH": "/usr/bin:/bin",
+            "DISPLAY": ":10.0",
+            "DBUS_SESSION_BUS_ADDRESS": "unix:path=/tmp/bus",
+            "XDG_RUNTIME_DIR": "/tmp/private-runtime",
+            "AWS_SECRET_ACCESS_KEY": "must-not-reach-fixtures",
+            "TOKEN": "must-not-reach-fixtures",
+        })
+        self.assertEqual(environment["DISPLAY"], ":10.0")
+        self.assertEqual(
+            environment["PATH"],
+            "/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin",
+        )
+        self.assertIn("DBUS_SESSION_BUS_ADDRESS", environment)
+        self.assertEqual(environment["XDG_RUNTIME_DIR"], "/tmp/private-runtime")
+        self.assertEqual(environment["LANG"], "C.UTF-8")
+        self.assertNotIn("AWS_SECRET_ACCESS_KEY", environment)
+        self.assertNotIn("TOKEN", environment)
 
     def test_no_write_action_is_present_in_qualification_source(self) -> None:
         source = QUALIFIER_PATH.read_text(encoding="utf-8")

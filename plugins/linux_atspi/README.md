@@ -1,7 +1,7 @@
 # Linux AT-SPI 进程驱动
 
 `desktop.linux_atspi` 通过当前 Linux 图形会话的 AT-SPI 可访问性树提供
-`list_applications`、`snapshot`、`find`、`focus`、`invoke`、`set_text`、显式
+`inspect_session`、`list_applications`、`snapshot`、`find`、`focus`、`invoke`、`set_text`、显式
 `type_text`、`toggle`、`expand` 和 `collapse`。
 
 ## 运行
@@ -10,7 +10,7 @@
 plugins/linux_atspi/run.sh
 ```
 
-进程通过标准输入和标准输出交换 UTF-8 NDJSON。`list_applications`、`snapshot`
+进程通过标准输入和标准输出交换 UTF-8 NDJSON。`inspect_session`、`list_applications`、`snapshot`
 和 `find` 需要 `desktop.observe` 权限；七种写动作还需要
 `desktop.input` 权限。
 
@@ -37,6 +37,10 @@ UTF-8。`set_text`/`invoke` 永远不会自动进入该路径。驱动不做坐�
 `DRIVER.ACTION_UNSUPPORTED`。定位器只支持精确匹配；多义、过期或截断快照均失败关闭。
 当前 v0 默认后端还要求进程环境明确报告 KDE、X11 和非空 `DISPLAY`；缺失这些证据，
 或处于 Wayland/GNOME，会返回 `DRIVER.UNAVAILABLE`，不会扩大本切片的支持声明。
+`inspect_session` 只返回 backend、session type 与 desktop 三个粗粒度字段，不读取应用树；
+它是当前真实 Linux provider 唯一声明可进入 `--durable-actions read-only` 的操作。其输入、
+输出、错误均声明为 public，且 checkpoint 只能显式投影这三个字段。应用列表、snapshot、
+find 与全部写动作没有 durable 资格，避免窗口标题、控件文本或短期 target 落入 journal。
 Gio 的 `GetChildren` 在线路响应解包后立即检查 5000 项硬上限；该上限用于阻止继续
 复制和遍历异常 fan-out，但受 D-Bus API 形状限制，无法在 wire 传输之前截断响应。
 
