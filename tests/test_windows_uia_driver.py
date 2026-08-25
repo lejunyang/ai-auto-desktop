@@ -39,6 +39,9 @@ def node(
     actions: tuple[str, ...] = (),
     automation_id: str | None = None,
     protected: bool = False,
+    offscreen: bool = False,
+    bounds: dict[str, int] | None = None,
+    process_id: int = 7,
 ) -> object:
     return uia.BackendNode(
         native=key,
@@ -48,18 +51,18 @@ def node(
         value=value,
         states={
             "enabled": True,
-            "offscreen": False,
+            "offscreen": offscreen,
             "focusable": "focus" in actions,
             "focused": False,
             "read_only": False if "set_value" in actions else None,
         },
-        bounds={"x": 10, "y": 20, "width": 120, "height": 30},
+        bounds={"x": 10, "y": 20, "width": 120, "height": 30} if bounds is None else bounds,
         actions=actions,
         provenance={
             "automation_id": automation_id,
             "class_name": "FakeControl",
             "framework_id": "Fake",
-            "process_id": 7,
+            "process_id": process_id,
             "runtime_id": [42, key],
             "value_redacted": protected,
         },
@@ -68,15 +71,22 @@ def node(
 
 def default_tree() -> list[object]:
     return [
-        node("root", None, "window", "Editor", actions=("focus",), automation_id="main"),
-        node("save", 0, "button", "Save", actions=("focus", "invoke"), automation_id="save"),
+        node("root", None, "window", "Editor", actions=("focus", "pointer_click"), automation_id="main"),
+        node(
+            "save",
+            0,
+            "button",
+            "Save",
+            actions=("focus", "invoke", "pointer_click"),
+            automation_id="save",
+        ),
         node(
             "title",
             0,
             "edit",
             "Title",
             value="Draft",
-            actions=("focus", "set_value", "type_text"),
+            actions=("focus", "set_value", "type_text", "pointer_click"),
             automation_id="title",
         ),
     ]
@@ -147,6 +157,29 @@ class FakeBackend:
             raise RuntimeError("synthetic native failure")
         return {"native_pattern": "type_text"}
 
+    def pointer_click(
+        self,
+        native: object,
+        *,
+        target_process_id: int,
+        window_handle: int,
+        x: int,
+        y: int,
+        deadline: float,
+    ) -> object:
+        self.calls.append(
+            ("pointer_click", native, target_process_id, window_handle, x, y)
+        )
+        if self.fail == "pointer_click":
+            raise RuntimeError("synthetic native failure")
+        return {
+            "native_pattern": "SendInput",
+            "input_mode": "mouse",
+            "submitted": True,
+            "events_submitted": 3,
+            "point": {"x": x, "y": y},
+        }
+
     def same_element(
         self, previous: object, current: object, *, deadline: float
     ) -> bool:
@@ -192,7 +225,7 @@ class WindowsUIADriverCoreTests(unittest.TestCase):
         self.assertEqual(save["value"], None)
         self.assertEqual(save["states"]["enabled"], True)
         self.assertEqual(save["bounds"], {"x": 10, "y": 20, "width": 120, "height": 30})
-        self.assertEqual(save["actions"], ["focus", "invoke"])
+        self.assertEqual(save["actions"], ["focus", "invoke", "pointer_click"])
         self.assertEqual(save["provenance"]["backend"], "fake_windows_uia")
 
     def test_find_defaults_to_exact_and_never_selects_first_ambiguous_node(self) -> None:
@@ -222,6 +255,11 @@ class WindowsUIADriverCoreTests(unittest.TestCase):
             ("invoke", {"automation_id": "save"}, {}),
             ("set_value", {"automation_id": "title"}, {"value": "Final"}),
             ("type_text", {"automation_id": "title"}, {"text": "中文 A😀"}),
+            (
+                "pointer_click",
+                {"automation_id": "save", "actions": ["pointer_click"]},
+                {"button": "left", "position": "center"},
+            ),
         )
         for action, locator, extra in cases:
             with self.subTest(action=action):
@@ -254,6 +292,10 @@ class WindowsUIADriverCoreTests(unittest.TestCase):
                 elif action == "type_text":
                     self.assertEqual(
                         action_calls[0], ("type_text", "title", "中文 A😀", 101)
+                    )
+                elif action == "pointer_click":
+                    self.assertEqual(
+                        action_calls[0], ("pointer_click", "save", 7, 101, 70, 35)
                     )
 
     def test_stale_snapshot_and_replaced_target_are_rejected_without_write(self) -> None:
@@ -439,6 +481,7 @@ class WindowsUIADriverCoreTests(unittest.TestCase):
             },
             deadline=deadline(),
         )
+        self.assertNotIn("pointer_click", found["node"]["actions"])
         with self.assertRaises(uia.DriverError) as protected:
             driver.execute(
                 "type_text",
@@ -452,6 +495,37 @@ class WindowsUIADriverCoreTests(unittest.TestCase):
         self.assertEqual(protected.exception.code, "DRIVER.PROTECTED_ELEMENT")
         self.assertEqual(protected.exception.data["phase"], "before_dispatch")
         self.assertFalse(any(call[0] == "type_text" for call in backend.calls))
+
+        snapshot = driver.execute(
+            "snapshot", {"window": {"handle": 101}}, deadline=deadline()
+        )
+        found = driver.execute(
+            "find",
+            {
+                "snapshot_id": snapshot["snapshot_id"],
+                "revision": snapshot["revision"],
+                "locator": {"automation_id": "secret"},
+            },
+            deadline=deadline(),
+        )
+        with self.assertRaises(uia.DriverError) as protected_click:
+            driver.execute(
+                "pointer_click",
+                {
+                    "target": found["target"],
+                    "locator": {"automation_id": "secret"},
+                },
+                deadline=deadline(),
+            )
+        self.assertEqual(
+            protected_click.exception.code, "DRIVER.PROTECTED_ELEMENT"
+        )
+        self.assertEqual(
+            protected_click.exception.data["effect"], "not_applied"
+        )
+        self.assertFalse(
+            any(call[0] == "pointer_click" for call in backend.calls)
+        )
 
         snapshot = self.snapshot()
         save = self.find(snapshot, {"automation_id": "save"})
@@ -506,6 +580,146 @@ class WindowsUIADriverCoreTests(unittest.TestCase):
         self.assertEqual(raised.exception.data["phase"], "before_dispatch")
         self.assertEqual(raised.exception.data["events_submitted"], 0)
         self.assertFalse(any(call[0] == "type_text" for call in backend.calls))
+
+    def test_pointer_click_rejects_invalid_shape_and_unadvertised_targets(self) -> None:
+        snapshot = self.snapshot()
+        save = self.find(snapshot, {"automation_id": "save"})
+        with self.assertRaises(uia.DriverError) as bad_button:
+            self.driver.execute(
+                "pointer_click",
+                {
+                    "target": save["target"],
+                    "locator": {"automation_id": "save"},
+                    "button": "right",
+                },
+                deadline=deadline(),
+            )
+        self.assertEqual(bad_button.exception.code, "DRIVER.INVALID_REQUEST")
+
+        with self.assertRaises(uia.DriverError) as bad_position:
+            self.driver.execute(
+                "pointer_click",
+                {
+                    "target": save["target"],
+                    "locator": {"automation_id": "save"},
+                    "position": "top_left",
+                },
+                deadline=deadline(),
+            )
+        self.assertEqual(bad_position.exception.code, "DRIVER.INVALID_REQUEST")
+
+        offscreen_tree = default_tree()
+        offscreen_tree[1] = node(
+            "save",
+            0,
+            "button",
+            "Save",
+            actions=("focus", "invoke"),
+            automation_id="save",
+            offscreen=True,
+        )
+        backend = FakeBackend([offscreen_tree])
+        driver = uia.WindowsUIADriver(backend)
+        snapshot = driver.execute(
+            "snapshot", {"window": {"handle": 101}}, deadline=deadline()
+        )
+        found = driver.execute(
+            "find",
+            {
+                "snapshot_id": snapshot["snapshot_id"],
+                "revision": snapshot["revision"],
+                "locator": {"automation_id": "save"},
+            },
+            deadline=deadline(),
+        )
+        self.assertNotIn("pointer_click", found["node"]["actions"])
+        with self.assertRaises(uia.DriverError) as unsupported:
+            driver.execute(
+                "pointer_click",
+                {
+                    "target": found["target"],
+                    "locator": {"automation_id": "save"},
+                },
+                deadline=deadline(),
+            )
+        self.assertEqual(unsupported.exception.code, "DRIVER.ACTION_UNSUPPORTED")
+        self.assertFalse(any(call[0] == "pointer_click" for call in backend.calls))
+
+    def test_pointer_click_requires_positive_bounds_and_window_process_identity(self) -> None:
+        zero_bounds_tree = default_tree()
+        zero_bounds_tree[1] = node(
+            "save",
+            0,
+            "button",
+            "Save",
+            actions=("focus", "invoke"),
+            automation_id="save",
+            bounds={"x": 10, "y": 20, "width": 0, "height": 30},
+        )
+        backend = FakeBackend([zero_bounds_tree])
+        driver = uia.WindowsUIADriver(backend)
+        snapshot = driver.execute(
+            "snapshot", {"window": {"handle": 101}}, deadline=deadline()
+        )
+        found = driver.execute(
+            "find",
+            {
+                "snapshot_id": snapshot["snapshot_id"],
+                "revision": snapshot["revision"],
+                "locator": {"automation_id": "save"},
+            },
+            deadline=deadline(),
+        )
+        self.assertNotIn("pointer_click", found["node"]["actions"])
+        with self.assertRaises(uia.DriverError) as unsupported:
+            driver.execute(
+                "pointer_click",
+                {
+                    "target": found["target"],
+                    "locator": {"automation_id": "save"},
+                },
+                deadline=deadline(),
+            )
+        self.assertEqual(unsupported.exception.code, "DRIVER.ACTION_UNSUPPORTED")
+
+        backend = FakeBackend()
+        original_capture = backend.capture
+
+        def capture_mismatched_pid(*args: object, **kwargs: object) -> object:
+            result = original_capture(*args, **kwargs)
+            if backend.capture_count >= 2:
+                result.window = {
+                    "handle": 101,
+                    "title": "Editor",
+                    "process_id": 9,
+                }
+            return result
+
+        backend.capture = capture_mismatched_pid  # type: ignore[method-assign]
+        driver = uia.WindowsUIADriver(backend)
+        snapshot = driver.execute(
+            "snapshot", {"window": {"handle": 101}}, deadline=deadline()
+        )
+        found = driver.execute(
+            "find",
+            {
+                "snapshot_id": snapshot["snapshot_id"],
+                "revision": snapshot["revision"],
+                "locator": {"automation_id": "save"},
+            },
+            deadline=deadline(),
+        )
+        with self.assertRaises(uia.DriverError) as stale:
+            driver.execute(
+                "pointer_click",
+                {
+                    "target": found["target"],
+                    "locator": {"automation_id": "save"},
+                },
+                deadline=deadline(),
+            )
+        self.assertEqual(stale.exception.code, "DRIVER.STALE_SNAPSHOT")
+        self.assertFalse(any(call[0] == "pointer_click" for call in backend.calls))
 
     def test_type_text_distinguishes_pre_dispatch_and_unknown_effect(self) -> None:
         for failure, expected_code, expected_phase, expected_effect in (
@@ -679,6 +893,266 @@ class WindowsUIADriverCoreTests(unittest.TestCase):
         self.assertEqual(drifted.exception.code, "DRIVER.UNKNOWN_EFFECT")
         self.assertEqual(drifted.exception.data["events_submitted"], 2)
         self.assertEqual(drifted.exception.data["effect"], "unknown")
+
+    def test_pointer_send_input_adapter_normalizes_virtual_desktop_and_effect_boundary(
+        self,
+    ) -> None:
+        captured: list[tuple[int, list[tuple[int, int, int]], int]] = []
+
+        def accept_all(count: int, events: object, size: int) -> int:
+            captured.append(
+                (
+                    count,
+                    [
+                        (events[index].mi.dx, events[index].mi.dy, events[index].mi.dwFlags)
+                        for index in range(count)
+                    ],
+                    size,
+                )
+            )
+            return count
+
+        metrics = {
+            uia.SM_XVIRTUALSCREEN: -100,
+            uia.SM_YVIRTUALSCREEN: -50,
+            uia.SM_CXVIRTUALSCREEN: 400,
+            uia.SM_CYVIRTUALSCREEN: 300,
+        }
+        adapter = uia.UnicodeSendInputAdapter(
+            accept_all,
+            lambda: 0,
+            lambda metric: metrics[metric],
+        )
+        result = adapter.send_pointer_click(-100, 249, deadline=deadline())
+        self.assertTrue(result["submitted"])
+        self.assertEqual(result["events_submitted"], 3)
+        self.assertEqual([batch[0] for batch in captured], [3])
+        self.assertEqual(
+            captured[0][1],
+            [
+                (
+                    0,
+                    65535,
+                    uia.MOUSEEVENTF_MOVE
+                    | uia.MOUSEEVENTF_ABSOLUTE
+                    | uia.MOUSEEVENTF_VIRTUALDESK,
+                ),
+                (
+                    0,
+                    65535,
+                    uia.MOUSEEVENTF_LEFTDOWN
+                    | uia.MOUSEEVENTF_ABSOLUTE
+                    | uia.MOUSEEVENTF_VIRTUALDESK,
+                ),
+                (
+                    0,
+                    65535,
+                    uia.MOUSEEVENTF_LEFTUP
+                    | uia.MOUSEEVENTF_ABSOLUTE
+                    | uia.MOUSEEVENTF_VIRTUALDESK,
+                ),
+            ],
+        )
+
+        for sent, expected_code, expected_effect in (
+            (0, "DRIVER.ACTION_FAILED", "not_applied"),
+            (1, "DRIVER.UNKNOWN_EFFECT", "unknown"),
+        ):
+            with self.subTest(sent=sent):
+                failing = uia.UnicodeSendInputAdapter(
+                    lambda count, events, size, sent=sent: sent,
+                    lambda: 5,
+                    lambda metric: metrics[metric],
+                )
+                with self.assertRaises(uia.DriverError) as raised:
+                    failing.send_pointer_click(0, 0, deadline=deadline())
+                self.assertEqual(raised.exception.code, expected_code)
+                self.assertEqual(raised.exception.data["effect"], expected_effect)
+                self.assertFalse(raised.exception.retryable)
+
+    def test_native_pointer_click_requires_expected_foreground_window(self) -> None:
+        calls: list[tuple[object, ...]] = []
+
+        class Native:
+            CurrentProcessId = 7
+            CurrentIsEnabled = True
+            CurrentIsOffscreen = False
+
+        class Adapter:
+            def foreground_window_identity(self) -> tuple[int, int]:
+                calls.append(("foreground_window_identity",))
+                return 101, 7
+
+            def send_pointer_click(
+                self,
+                x: int,
+                y: int,
+                *,
+                before_dispatch: object,
+                deadline: float,
+            ) -> dict[str, object]:
+                before_dispatch(0)
+                calls.append(("send_pointer_click", x, y))
+                return {"native_pattern": "SendInput", "submitted": True}
+
+        backend = object.__new__(uia.ComtypesUIABackend)
+        backend.input_adapter = Adapter()
+        backend._point_hits_target = lambda native, x, y, deadline: True  # type: ignore[method-assign]
+        result = backend.pointer_click(
+            Native(),
+            target_process_id=7,
+            window_handle=101,
+            x=70,
+            y=35,
+            deadline=deadline(),
+        )
+        self.assertEqual(
+            calls,
+            [
+                ("foreground_window_identity",),
+                ("send_pointer_click", 70, 35),
+            ],
+        )
+        self.assertEqual(result["native_pattern"], "SendInput")
+
+        class MismatchAdapter(Adapter):
+            def foreground_window_identity(self) -> tuple[int, int]:
+                calls.append(("foreground_window_identity",))
+                return 102, 7
+
+        calls.clear()
+        backend.input_adapter = MismatchAdapter()
+        backend._point_hits_target = lambda native, x, y, deadline: True  # type: ignore[method-assign]
+        with self.assertRaises(uia.DriverError) as raised:
+            backend.pointer_click(
+                Native(),
+                target_process_id=7,
+                window_handle=101,
+                x=70,
+                y=35,
+                deadline=deadline(),
+            )
+        self.assertEqual(raised.exception.code, "DRIVER.ACTION_FAILED")
+        self.assertEqual(raised.exception.data["phase"], "before_dispatch")
+        self.assertFalse(any(call[0] == "send_pointer_click" for call in calls))
+
+    def test_native_pointer_click_requires_hit_test_match_before_sendinput(self) -> None:
+        calls: list[tuple[object, ...]] = []
+
+        class Native:
+            CurrentProcessId = 7
+            CurrentIsEnabled = True
+            CurrentIsOffscreen = False
+
+        class Adapter:
+            def foreground_window_identity(self) -> tuple[int, int]:
+                calls.append(("foreground_window_identity",))
+                return 101, 7
+
+            def send_pointer_click(
+                self,
+                x: int,
+                y: int,
+                *,
+                before_dispatch: object,
+                deadline: float,
+            ) -> dict[str, object]:
+                before_dispatch(0)
+                calls.append(("send_pointer_click", x, y))
+                return {"native_pattern": "SendInput", "submitted": True}
+
+        backend = object.__new__(uia.ComtypesUIABackend)
+        backend.input_adapter = Adapter()
+
+        calls.clear()
+        backend._point_hits_target = lambda native, x, y, deadline: False  # type: ignore[method-assign]
+        with self.assertRaises(uia.DriverError) as stale:
+            backend.pointer_click(
+                Native(),
+                target_process_id=7,
+                window_handle=101,
+                x=70,
+                y=35,
+                deadline=deadline(),
+            )
+        self.assertEqual(stale.exception.code, "DRIVER.STALE_SNAPSHOT")
+        self.assertEqual(stale.exception.data["phase"], "before_dispatch")
+        self.assertFalse(any(call[0] == "send_pointer_click" for call in calls))
+
+        def fail_hit_test(native: object, x: int, y: int, *, deadline: float) -> bool:
+            raise uia.DriverError(
+                "DRIVER.ACTION_FAILED",
+                "ElementFromPoint failed",
+                data={"operation": "ElementFromPoint"},
+            )
+
+        calls.clear()
+        backend._point_hits_target = fail_hit_test  # type: ignore[method-assign]
+        with self.assertRaises(uia.DriverError) as failed:
+            backend.pointer_click(
+                Native(),
+                target_process_id=7,
+                window_handle=101,
+                x=70,
+                y=35,
+                deadline=deadline(),
+            )
+        self.assertEqual(failed.exception.code, "DRIVER.ACTION_FAILED")
+        self.assertEqual(failed.exception.data["phase"], "before_dispatch")
+        self.assertFalse(any(call[0] == "send_pointer_click" for call in calls))
+
+    def test_native_pointer_click_runs_hit_test_immediately_before_dispatch(self) -> None:
+        calls: list[tuple[object, ...]] = []
+
+        class Native:
+            CurrentProcessId = 7
+            CurrentIsEnabled = True
+            CurrentIsOffscreen = False
+
+        class Adapter:
+            def foreground_window_identity(self) -> tuple[int, int]:
+                calls.append(("foreground_window_identity",))
+                return 101, 7
+
+            def send_pointer_click(
+                self,
+                x: int,
+                y: int,
+                *,
+                before_dispatch: object,
+                deadline: float,
+            ) -> dict[str, object]:
+                calls.append(("send_pointer_click_enter", x, y))
+                before_dispatch(0)
+                calls.append(("send_pointer_click_after_check", x, y))
+                return {"native_pattern": "SendInput", "submitted": True}
+
+        backend = object.__new__(uia.ComtypesUIABackend)
+        backend.input_adapter = Adapter()
+
+        def hit_test(native: object, x: int, y: int, *, deadline: float) -> bool:
+            calls.append(("point_hits_target", x, y))
+            return True
+
+        backend._point_hits_target = hit_test  # type: ignore[method-assign]
+        result = backend.pointer_click(
+            Native(),
+            target_process_id=7,
+            window_handle=101,
+            x=70,
+            y=35,
+            deadline=deadline(),
+        )
+        self.assertEqual(
+            calls,
+            [
+                ("send_pointer_click_enter", 70, 35),
+                ("point_hits_target", 70, 35),
+                ("foreground_window_identity",),
+                ("send_pointer_click_after_check", 70, 35),
+            ],
+        )
+        self.assertEqual(result["native_pattern"], "SendInput")
 
     def test_native_type_text_focuses_before_sendinput_and_focus_failure_is_safe(
         self,
@@ -938,6 +1412,7 @@ class WindowsUIAProcessTests(unittest.TestCase):
                 "invoke",
                 "set_value",
                 "type_text",
+                "pointer_click",
             },
         )
         for name, contract in manifest["actions"].items():

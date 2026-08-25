@@ -7,7 +7,7 @@
 
 该能力提供方对外声明 `metadata.name: desktop.windows_uia`，并提供以下 v1
 动作：`list_windows`、`snapshot`、`find`、`focus`、`invoke`、
-`set_value` 和显式键盘后备 `type_text`。工作流中的 `uses` 值由能力清单标识、动作键和契约主版本号
+`set_value`、显式键盘后备 `type_text` 和显式鼠标输入 `pointer_click`。工作流中的 `uses` 值由能力清单标识、动作键和契约主版本号
 组成，例如 `desktop.windows_uia.snapshot@1`。能力清单的
 `runtime.platforms` 仅声明 `windows`。
 
@@ -23,9 +23,10 @@ Python 无法安全抢占单次 COM 调用，因此宿主进程的进程超时�
 调用会返回结构化的 `DRIVER.UNAVAILABLE`。这样既能让使用模拟后端的契约测试跨平台
 运行，又不会对该能力的平台适用范围作出不实声明。
 
-当前切片仅支持 `type_text` 的有界 Unicode 键盘注入，不支持快捷键、组合键、指针注入、
-截图、OCR 或可点击点回退机制，也不会隐式改用其他定位器。`set_value` 只使用
-`ValuePattern.SetValue`，失败时绝不会自动退化为 `type_text`。
+当前切片仅支持 `type_text` 的有界 Unicode 键盘注入和 `pointer_click` 的显式鼠标注入，
+不支持快捷键、组合键、截图、OCR 或可点击点回退机制，也不会隐式改用其他定位器。
+`set_value` 只使用 `ValuePattern.SetValue`，失败时绝不会自动退化为 `type_text`；
+其他动作也绝不会自动退化为 `pointer_click`。
 
 ## 归一化观察结果
 
@@ -83,12 +84,37 @@ states 和所支持动作的结构化谓词。当前 v0 切片只支持区分大
 无法证明派发之后 UI 树仍未改变。当前成功响应不会在派发后重新观察 UI，也不验证
 action-specific postcondition；如需确认界面结果，调用方必须获取新快照。
 
-效果分类采取保守策略：`invoke` 的 `effect.default_class` 为 `non_idempotent`；
+效果分类采取保守策略：`invoke` 与 `pointer_click` 的 `effect.default_class` 为 `non_idempotent`；
 `focus`、`set_value` 和 `type_text` 的 `effect.default_class` 为 `contextual`。错误使用稳定的
 `DRIVER.*` 错误码，并携带有界诊断细节；部分定位失败细节会回显原始定位器或候选节点
 摘要，因此这里不提供通用的 secret-redaction 保证。原生调用前可以确认未生效的失败保持
 `not_applied`；进入后端派发边界后若发生 `DRIVER.ACTION_FAILED`、
 `DRIVER.TIMEOUT` 或未预期异常，则转换为 `DRIVER.UNKNOWN_EFFECT`，不得盲目重放。
+
+### 显式 pointer_click
+
+`desktop.windows_uia.pointer_click@1` 接收 `target`、`locator`，可选 `button` 与
+`position`；v0 仅接受 `button=left`、`position=center`。它不接受裸 `x/y`，调用方也不能
+借 locator 直接要求绝对屏幕点。驱动先执行与其他写动作一致的 fresh capture、唯一重解析、
+`CompareElements` 原生身份与语义指纹校验，然后要求目标在 fresh snapshot 中具备可证明的
+PID 归属、`enabled=true`、`offscreen=false`，并且 `bounds` 必须存在且为正面积。
+
+为提高 discoverability，snapshot 只会在满足 `enabled && !offscreen && bounds.width > 0 &&
+bounds.height > 0 && process_id > 0` 时把 `pointer_click` 广告到节点 `actions`。但这只是候选
+资格提示，不是 dispatch 证明；真正执行前仍要再次验证目标 PID、fresh snapshot 顶层窗口
+`HWND/PID`、以及当前 foreground `HWND/PID` 与目标完全一致。
+
+鼠标注入通过一批 Win32 `SendInput` mouse `INPUT` 完成，固定发送
+`MOVE + LEFTDOWN + LEFTUP`。坐标按虚拟桌面边界归一化到 `0..65535`，始终携带
+`MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK`，因此支持包含负坐标的多显示器布局，
+并在虚拟桌面端点精确钳制到 `0` 或 `65535`。该 action 不会自动执行额外聚焦、不会回退到
+UIA InvokePattern，也不会在失败后自动重试。
+
+effect boundary 由 `SendInput` 返回的 accepted count 决定。0 个事件表示 `not_applied`；
+一旦至少 1 个事件已被接受，后续异常、部分提交或 post-dispatch timeout 都必须归一化为
+不可重试的 `DRIVER.UNKNOWN_EFFECT`。成功响应使用 `submitted=true`，只说明该批鼠标事件已进入
+Windows 输入流，不能等价为“按钮已点击”或“界面已变化”，调用方仍须重新观察并验证
+postcondition。
 
 ### 显式 Unicode 键盘后备
 
@@ -129,8 +155,9 @@ Session 0、UAC secure desktop、登录或锁屏桌面。输入依赖当时的�
 模拟后端契约测试。
 
 Linux/macOS 测试路径会验证能力清单、不可用状态行为、归一化快照、精确/多义/未找到
-解析、目标替换后的过期检测、通过模拟后端执行的四种写入动作语义、截止时间、
-结构化错误、Unicode 代理对编码、INPUT 派发边界和输入帧上限；模拟后端测试不等同于真实
-UIA 调用资格验证。Windows-only 原生测试会在自有 Win32 EDIT fixture 上显式执行
-`type_text` 并重新观察文本，但不会在非 Windows 环境或普通 Linux 契约测试中触发。提权/UIPI、
+解析、目标替换后的过期检测、通过模拟后端执行的写入动作语义、截止时间、
+结构化错误、Unicode 代理对编码、mouse 虚拟桌面归一化、INPUT 派发边界和输入帧上限；
+模拟后端测试不等同于真实 UIA 调用资格验证。Windows-only 原生测试会在自有 Win32 fixture 上
+显式执行 `type_text` 与 `pointer_click`，并通过 fresh snapshot 重新观察文本/状态变化；
+在非 Windows 环境该测试文件只做 skip，不尝试伪造 Win32 输入行为。提权/UIPI、
 secure desktop、输入法与前台焦点竞争仍需单独的平台验收，不能由自有 fixture 的通过外推。

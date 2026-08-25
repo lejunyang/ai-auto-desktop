@@ -28,6 +28,8 @@ INVOKED_STATUS = "Status: invoked"
 DUPLICATE_BUTTON_NAME = "Duplicate action"
 RUNTIME_EDIT_VALUE = "Observed through Runtime"
 TYPED_TEXT = "Typed by SendInput"
+POINTER_BUTTON_NAME = "Pointer click target"
+POINTER_STATUS = "Status: pointer clicked"
 
 
 def action(name: str) -> str:
@@ -341,6 +343,38 @@ class NativeWindowsUIATests(unittest.TestCase):
         final_snapshot = self._snapshot(selector)
         final_edit = self._find(final_snapshot, edit_locator)
         self.assertEqual(final_edit["node"]["value"], TYPED_TEXT)
+
+    def test_pointer_click_uses_explicit_mouse_send_input(self) -> None:
+        self.plugin.start()
+        window = self._wait_for_window()
+        selector = {
+            "handle": window["handle"],
+            "title": self.title,
+            "process_id": self.fixture.pid,
+        }
+        button_locator = {"role": "button", "name": POINTER_BUTTON_NAME}
+
+        snapshot = self._snapshot(selector)
+        button = self._find(snapshot, button_locator)
+        self.assertIn("pointer_click", button["node"]["actions"])
+        result = self.plugin.invoke(
+            action("pointer_click"),
+            {
+                "target": button["target"],
+                "locator": button_locator,
+                "button": "left",
+                "position": "center",
+            },
+        )
+        self.assertEqual(result["backend_result"]["native_pattern"], "SendInput")
+        self.assertEqual(result["backend_result"]["input_mode"], "mouse")
+        self.assertTrue(result["backend_result"]["submitted"])
+        self.assertEqual(result["backend_result"]["events_submitted"], 3)
+
+        final_snapshot = self._snapshot(selector)
+        self.assertEqual(
+            len(self._nodes(final_snapshot, role="text", name=POINTER_STATUS)), 1
+        )
 
 
 if __name__ == "__main__":

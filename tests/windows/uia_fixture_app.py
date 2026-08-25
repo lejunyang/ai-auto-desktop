@@ -21,13 +21,16 @@ INVOKE_ID = 1002
 STATUS_ID = 1003
 DUPLICATE_ONE_ID = 1004
 DUPLICATE_TWO_ID = 1005
+POINTER_ID = 1006
 
 INITIAL_EDIT_VALUE = "Draft"
 INVOKE_BUTTON_NAME = "Apply fixture value"
 DUPLICATE_BUTTON_NAME = "Duplicate action"
+POINTER_BUTTON_NAME = "Pointer click target"
 INITIAL_STATUS = "Status: idle"
 INVOKED_STATUS = "Status: invoked"
 DUPLICATE_STATUS = "Status: duplicate invoked"
+POINTER_STATUS = "Status: pointer clicked"
 
 
 def main() -> int:
@@ -133,6 +136,9 @@ def main() -> int:
                 if control_id in {DUPLICATE_ONE_ID, DUPLICATE_TWO_ID}:
                     user32.SetWindowTextW(status_handle, DUPLICATE_STATUS)
                     return 0
+                if control_id == POINTER_ID:
+                    user32.SetWindowTextW(status_handle, POINTER_STATUS)
+                    return 0
         if message == WM_DESTROY:
             user32.PostQuitMessage(0)
             return 0
@@ -224,6 +230,9 @@ def main() -> int:
     duplicate_two_handle = create_control(
         "BUTTON", DUPLICATE_BUTTON_NAME, WS_TABSTOP, 220, 164, 180, 32, DUPLICATE_TWO_ID
     )
+    pointer_handle = create_control(
+        "BUTTON", POINTER_BUTTON_NAME, WS_TABSTOP, 24, 212, 180, 32, POINTER_ID
+    )
 
     user32.ShowWindow(hwnd, SW_SHOW)
     user32.UpdateWindow(hwnd)
@@ -240,6 +249,7 @@ def main() -> int:
                     "status": int(status_handle),
                     "duplicate_one": int(duplicate_one_handle),
                     "duplicate_two": int(duplicate_two_handle),
+                    "pointer": int(pointer_handle),
                 },
             },
             sort_keys=True,

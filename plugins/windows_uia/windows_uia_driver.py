@@ -5,10 +5,11 @@ The process boundary speaks the repository's UTF-8 NDJSON protocol.  The
 driver core is deliberately independent from COM so its locator, snapshot and
 stale-target rules can be exercised with a fake backend on every platform.
 
-The only input-injection operation is the explicit ``type_text`` action, which
-uses bounded Win32 Unicode keyboard events after UIA target verification.  The
-driver never falls back to it from ``set_value`` and never injects pointer
-input, captures pixels, or invokes OCR.
+The only input-injection operations are the explicit ``type_text`` and
+``pointer_click`` actions.  They use bounded Win32 ``SendInput`` keyboard or
+mouse batches after UIA target verification.  The driver never falls back to
+either input path from other actions, never captures pixels, and never invokes
+OCR.
 """
 
 from __future__ import annotations
@@ -53,21 +54,36 @@ ACTION_IDS = {
         "invoke",
         "set_value",
         "type_text",
+        "pointer_click",
     )
 }
 ACTION_NAMES = {full_name: short_name for short_name, full_name in ACTION_IDS.items()}
-WRITE_ACTIONS = frozenset({"focus", "invoke", "set_value", "type_text"})
-NODE_ACTIONS = frozenset(WRITE_ACTIONS)
+WRITE_ACTIONS = frozenset({"focus", "invoke", "set_value", "type_text", "pointer_click"})
+NODE_ACTIONS = frozenset({"focus", "invoke", "set_value", "type_text", "pointer_click"})
 STATE_NAMES = ("enabled", "offscreen", "focusable", "focused", "read_only")
 
+INPUT_MOUSE = 0
 INPUT_KEYBOARD = 1
 KEYEVENTF_KEYUP = 0x0002
 KEYEVENTF_UNICODE = 0x0004
+MOUSEEVENTF_MOVE = 0x0001
+MOUSEEVENTF_LEFTDOWN = 0x0002
+MOUSEEVENTF_LEFTUP = 0x0004
+MOUSEEVENTF_VIRTUALDESK = 0x4000
+MOUSEEVENTF_ABSOLUTE = 0x8000
+
+SM_XVIRTUALSCREEN = 76
+SM_YVIRTUALSCREEN = 77
+SM_CXVIRTUALSCREEN = 78
+SM_CYVIRTUALSCREEN = 79
+
+POINTER_BUTTONS = frozenset({"left"})
+POINTER_POSITIONS = frozenset({"center"})
 
 
 class _MouseInput(ctypes.Structure):
     # INPUT is a tagged union; this ABI member is required for correct struct
-    # size/alignment.  The driver never constructs a mouse INPUT.
+    # size/alignment for explicit pointer SendInput batches.
     _fields_ = [
         ("dx", ctypes.c_int32),
         ("dy", ctypes.c_int32),
@@ -244,6 +260,17 @@ COMMON_WRITE_INPUT: dict[str, Any] = {
     "properties": {"target": TARGET_SCHEMA, "locator": LOCATOR_SCHEMA},
     "additionalProperties": False,
 }
+POINTER_CLICK_INPUT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "required": ["target", "locator"],
+    "properties": {
+        "target": TARGET_SCHEMA,
+        "locator": LOCATOR_SCHEMA,
+        "button": {"enum": sorted(POINTER_BUTTONS)},
+        "position": {"enum": sorted(POINTER_POSITIONS)},
+    },
+    "additionalProperties": False,
+}
 WRITE_OUTPUT_SCHEMA: dict[str, Any] = {
     "type": "object",
     "required": ["ok", "action", "resolved"],
@@ -388,6 +415,19 @@ ACTION_CONTRACTS: dict[str, dict[str, Any]] = {
         errors=TYPE_TEXT_ERRORS,
         permissions=("desktop.observe", "desktop.input"),
     ),
+    "pointer_click": _contract(
+        (
+            "Explicitly re-resolve a current UIA target and submit one Win32 "
+            "SendInput absolute mouse batch at the target center."
+        ),
+        effect="non_idempotent",
+        risk_category="modify",
+        risk_level="high",
+        input_schema=POINTER_CLICK_INPUT_SCHEMA,
+        output_schema=WRITE_OUTPUT_SCHEMA,
+        errors=COMMON_ERRORS + LOCATOR_ERRORS + ACTION_ERRORS,
+        permissions=("desktop.observe", "desktop.input"),
+    ),
 }
 
 MANIFEST: dict[str, Any] = {
@@ -474,6 +514,17 @@ class UIABackend(Protocol):
         text: str,
         *,
         window_handle: int,
+        deadline: float,
+    ) -> Any: ...
+
+    def pointer_click(
+        self,
+        native: Any,
+        *,
+        target_process_id: int,
+        window_handle: int,
+        x: int,
+        y: int,
         deadline: float,
     ) -> Any: ...
 
@@ -578,6 +629,28 @@ def _type_text(value: Any) -> str:
     return value
 
 
+def _pointer_button(value: Any) -> str:
+    if value is None:
+        return "left"
+    if not isinstance(value, str) or value not in POINTER_BUTTONS:
+        _fail(
+            "DRIVER.INVALID_REQUEST",
+            f"pointer_click.button only supports {sorted(POINTER_BUTTONS)!r}",
+        )
+    return value
+
+
+def _pointer_position(value: Any) -> str:
+    if value is None:
+        return "center"
+    if not isinstance(value, str) or value not in POINTER_POSITIONS:
+        _fail(
+            "DRIVER.INVALID_REQUEST",
+            f"pointer_click.position only supports {sorted(POINTER_POSITIONS)!r}",
+        )
+    return value
+
+
 def _safe_text(value: Any) -> str | None:
     if value is None:
         return None
@@ -618,10 +691,35 @@ def _normalize_bounds(value: Mapping[str, Any] | None) -> dict[str, int] | None:
     return {"x": x, "y": y, "width": width, "height": height}
 
 
-class UnicodeSendInputAdapter:
-    """Bounded Win32 Unicode keyboard injection with an explicit effect boundary."""
+def _center_point(bounds: Mapping[str, Any]) -> tuple[int, int]:
+    try:
+        x = int(bounds["x"])
+        y = int(bounds["y"])
+        width = int(bounds["width"])
+        height = int(bounds["height"])
+    except (KeyError, TypeError, ValueError, OverflowError) as exc:
+        raise DriverError(
+            "DRIVER.ACTION_UNSUPPORTED",
+            "pointer_click target lacks valid bounds",
+        ) from exc
+    if width <= 0 or height <= 0:
+        raise DriverError(
+            "DRIVER.ACTION_UNSUPPORTED",
+            "pointer_click requires positive-area target bounds",
+            data={"bounds": _json_safe(dict(bounds))},
+        )
+    return (x + width // 2, y + height // 2)
 
-    def __init__(self, send_input: Any = None, get_last_error: Any = None) -> None:
+
+class UnicodeSendInputAdapter:
+    """Bounded Win32 keyboard and mouse SendInput helpers."""
+
+    def __init__(
+        self,
+        send_input: Any = None,
+        get_last_error: Any = None,
+        get_system_metrics: Any = None,
+    ) -> None:
         if send_input is None:
             if sys.platform != "win32":
                 raise DriverError(
@@ -643,11 +741,15 @@ class UnicodeSendInputAdapter:
                 ctypes.POINTER(ctypes.c_uint32),
             ]
             user32.GetWindowThreadProcessId.restype = ctypes.c_uint32
+            user32.GetSystemMetrics.argtypes = [ctypes.c_int]
+            user32.GetSystemMetrics.restype = ctypes.c_int
             send_input = user32.SendInput
             get_last_error = ctypes.get_last_error
+            get_system_metrics = user32.GetSystemMetrics
             self._user32 = user32
         self._send_input = send_input
         self._get_last_error = get_last_error or (lambda: 0)
+        self._get_system_metrics = get_system_metrics
 
     def foreground_window_identity(self) -> tuple[int, int]:
         user32 = getattr(self, "_user32", None)
@@ -698,6 +800,52 @@ class UnicodeSendInputAdapter:
             )
         return int(hwnd), int(process_id.value)
 
+    def virtual_screen_metrics(self) -> tuple[int, int, int, int]:
+        get_system_metrics = self._get_system_metrics
+        if get_system_metrics is None:
+            raise DriverError(
+                "DRIVER.ACTION_FAILED",
+                "virtual desktop metrics are unavailable",
+                retryable=False,
+                data={
+                    "operation": "GetSystemMetrics",
+                    "phase": "before_dispatch",
+                    "effect": "not_applied",
+                    "events_submitted": 0,
+                },
+            )
+        try:
+            left = int(get_system_metrics(SM_XVIRTUALSCREEN))
+            top = int(get_system_metrics(SM_YVIRTUALSCREEN))
+            width = int(get_system_metrics(SM_CXVIRTUALSCREEN))
+            height = int(get_system_metrics(SM_CYVIRTUALSCREEN))
+        except Exception as exc:
+            raise DriverError(
+                "DRIVER.ACTION_FAILED",
+                "virtual desktop metrics lookup failed before SendInput",
+                retryable=False,
+                data={
+                    "operation": "GetSystemMetrics",
+                    "phase": "before_dispatch",
+                    "effect": "not_applied",
+                    "events_submitted": 0,
+                    "exception_type": type(exc).__name__,
+                },
+            ) from exc
+        if width <= 0 or height <= 0:
+            raise DriverError(
+                "DRIVER.ACTION_FAILED",
+                "Windows did not report a valid virtual desktop",
+                retryable=False,
+                data={
+                    "operation": "GetSystemMetrics",
+                    "phase": "before_dispatch",
+                    "effect": "not_applied",
+                    "events_submitted": 0,
+                },
+            )
+        return left, top, width, height
+
     @staticmethod
     def _utf16_units(text: str) -> list[int]:
         encoded = text.encode("utf-16-le", errors="strict")
@@ -716,6 +864,40 @@ class UnicodeSendInputAdapter:
                     wVk=0,
                     wScan=unit,
                     dwFlags=flags,
+                    time=0,
+                    dwExtraInfo=0,
+                )
+            ),
+        )
+
+    @staticmethod
+    def _absolute_coordinate(value: int, offset: int, span: int) -> int:
+        if span <= 1:
+            return 0
+        if value <= offset:
+            return 0
+        if value >= offset + span - 1:
+            return 65535
+        return int(round(((value - offset) * 65535) / (span - 1)))
+
+    @classmethod
+    def _mouse_event(
+        cls,
+        x: int,
+        y: int,
+        *,
+        flags: int,
+        virtual_screen: tuple[int, int, int, int],
+    ) -> _Input:
+        left, top, width, height = virtual_screen
+        return _Input(
+            type=INPUT_MOUSE,
+            payload=_InputPayload(
+                mi=_MouseInput(
+                    dx=cls._absolute_coordinate(x, left, width),
+                    dy=cls._absolute_coordinate(y, top, height),
+                    mouseData=0,
+                    dwFlags=flags | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
                     time=0,
                     dwExtraInfo=0,
                 )
@@ -872,6 +1054,135 @@ class UnicodeSendInputAdapter:
             "events_submitted": events_submitted,
         }
 
+    def send_pointer_click(
+        self,
+        x: int,
+        y: int,
+        *,
+        before_dispatch: Callable[[int], None] | None = None,
+        deadline: float,
+    ) -> dict[str, Any]:
+        if isinstance(x, bool) or not isinstance(x, int):
+            _fail("DRIVER.INVALID_REQUEST", "pointer_click x must be an integer")
+        if isinstance(y, bool) or not isinstance(y, int):
+            _fail("DRIVER.INVALID_REQUEST", "pointer_click y must be an integer")
+        virtual_screen = self.virtual_screen_metrics()
+        left, top, width, height = virtual_screen
+        if not (left <= x < left + width and top <= y < top + height):
+            raise DriverError(
+                "DRIVER.ACTION_UNSUPPORTED",
+                "pointer_click center point is outside the virtual desktop",
+                data={
+                    "point": {"x": x, "y": y},
+                    "virtual_desktop": {
+                        "x": left,
+                        "y": top,
+                        "width": width,
+                        "height": height,
+                    },
+                },
+            )
+        events = [
+            self._mouse_event(
+                x,
+                y,
+                flags=MOUSEEVENTF_MOVE,
+                virtual_screen=virtual_screen,
+            ),
+            self._mouse_event(
+                x,
+                y,
+                flags=MOUSEEVENTF_LEFTDOWN,
+                virtual_screen=virtual_screen,
+            ),
+            self._mouse_event(
+                x,
+                y,
+                flags=MOUSEEVENTF_LEFTUP,
+                virtual_screen=virtual_screen,
+            ),
+        ]
+        try:
+            _check_deadline(deadline)
+            if before_dispatch is not None:
+                before_dispatch(0)
+            event_array = (_Input * len(events))(*events)
+            submitted = int(
+                self._send_input(
+                    len(events),
+                    event_array,
+                    ctypes.sizeof(_Input),
+                )
+            )
+        except DriverError:
+            raise
+        except Exception as exc:
+            raise DriverError(
+                "DRIVER.UNKNOWN_EFFECT",
+                "SendInput pointer click outcome is unknown after dispatch",
+                retryable=False,
+                data={
+                    "operation": "SendInput",
+                    "phase": "post_dispatch",
+                    "effect": "unknown",
+                    "events_requested": len(events),
+                    "events_submitted": 0,
+                    "exception_type": type(exc).__name__,
+                },
+            ) from exc
+        submitted = max(0, submitted)
+        if submitted != len(events):
+            try:
+                win32_error = int(self._get_last_error())
+            except Exception:
+                win32_error = 0
+            details = {
+                "operation": "SendInput",
+                "events_requested": len(events),
+                "events_submitted": submitted,
+                "win32_error": win32_error,
+            }
+            if submitted <= 0:
+                raise DriverError(
+                    "DRIVER.ACTION_FAILED",
+                    (
+                        "SendInput submitted no pointer INPUT events; Windows may have "
+                        "blocked injection at an integrity or desktop boundary"
+                    ),
+                    retryable=False,
+                    data={
+                        **details,
+                        "phase": "before_dispatch",
+                        "effect": "not_applied",
+                    },
+                )
+            raise DriverError(
+                "DRIVER.UNKNOWN_EFFECT",
+                "SendInput submitted only part of the pointer click batch",
+                retryable=False,
+                data={
+                    **details,
+                    "phase": "post_dispatch",
+                    "effect": "unknown",
+                },
+            )
+        _check_deadline(deadline, post_dispatch=True)
+        return {
+            "native_pattern": "SendInput",
+            "input_mode": "mouse",
+            "submitted": True,
+            "button": "left",
+            "position": "center",
+            "events_submitted": submitted,
+            "point": {"x": x, "y": y},
+            "virtual_desktop": {
+                "x": left,
+                "y": top,
+                "width": width,
+                "height": height,
+            },
+        }
+
 
 class WindowsUIADriver:
     """Snapshot-scoped UIA semantics over an injected native backend."""
@@ -886,10 +1197,10 @@ class WindowsUIADriver:
         try:
             _check_deadline(deadline)
         except DriverError as exc:
-            if action == "type_text" and exc.code == "DRIVER.TIMEOUT":
+            if action in {"type_text", "pointer_click"} and exc.code == "DRIVER.TIMEOUT":
                 exc.retryable = False
             raise
-        if action == "type_text" and isinstance(self.backend, UnavailableBackend):
+        if action in {"type_text", "pointer_click"} and isinstance(self.backend, UnavailableBackend):
             self.backend._raise()
         values = {} if args is None else _object(args, "args")
         if action == "list_windows":
@@ -905,7 +1216,7 @@ class WindowsUIADriver:
                 # Input injection is never automatically retryable.  A timeout
                 # after a submitted INPUT is already normalized to UNKNOWN_EFFECT;
                 # this covers every remaining pre-dispatch timeout.
-                if action == "type_text" and exc.code == "DRIVER.TIMEOUT":
+                if action in {"type_text", "pointer_click"} and exc.code == "DRIVER.TIMEOUT":
                     exc.retryable = False
                 raise
         _fail("DRIVER.INVALID_REQUEST", f"unknown action: {action}", action=action)
@@ -999,6 +1310,12 @@ class WindowsUIADriver:
             if not isinstance(provenance, dict):
                 provenance = {}
             provenance["backend"] = _safe_text(getattr(self.backend, "name", None)) or "unknown"
+            if provenance.get("value_redacted") is True:
+                actions = [
+                    action
+                    for action in actions
+                    if action not in {"pointer_click", "set_value", "type_text"}
+                ]
             node = {
                 "node_id": node_id,
                 "parent_id": parent_id,
@@ -1215,10 +1532,14 @@ class WindowsUIADriver:
     def _write(self, action: str, args: dict[str, Any], deadline: float) -> dict[str, Any]:
         payload_field = {"set_value": "value", "type_text": "text"}.get(action)
         allowed = {"target", "locator"} | ({payload_field} if payload_field else set())
+        if action == "pointer_click":
+            allowed |= {"button", "position"}
         _only_keys(args, allowed, "args")
         if "target" not in args or "locator" not in args:
             _fail("DRIVER.INVALID_REQUEST", "target and locator are required")
         value: str | None = None
+        pointer_button: str | None = None
+        pointer_position: str | None = None
         if action == "set_value":
             if "value" not in args:
                 _fail("DRIVER.INVALID_REQUEST", "value is required for set_value")
@@ -1227,6 +1548,9 @@ class WindowsUIADriver:
             if "text" not in args:
                 _fail("DRIVER.INVALID_REQUEST", "text is required for type_text")
             value = _type_text(args["text"])
+        elif action == "pointer_click":
+            pointer_button = _pointer_button(args.get("button"))
+            pointer_position = _pointer_position(args.get("position"))
         target = _object(args["target"], "target")
         _only_keys(target, {"snapshot_id", "revision", "node_id"}, "target")
         node_id = target.get("node_id")
@@ -1303,11 +1627,11 @@ class WindowsUIADriver:
         protected = isinstance(provenance, Mapping) and (
             provenance.get("value_redacted") is True
         )
-        protection_unknown = action == "type_text" and (
+        protection_unknown = action in {"type_text", "pointer_click"} and (
             not isinstance(provenance, Mapping)
             or provenance.get("value_redacted") is not False
         )
-        if action in {"set_value", "type_text"} and (
+        if action in {"set_value", "type_text", "pointer_click"} and (
             protected or protection_unknown
         ):
             raise DriverError(
@@ -1319,7 +1643,23 @@ class WindowsUIADriver:
                     "effect": "not_applied",
                 },
             )
-        if action not in resolved["actions"]:
+        if action == "pointer_click":
+            states = resolved.get("states")
+            if not isinstance(states, Mapping):
+                states = {}
+            if states.get("enabled") is not True or states.get("offscreen") is not False:
+                raise DriverError(
+                    "DRIVER.ACTION_UNSUPPORTED",
+                    "pointer_click only supports enabled, on-screen targets",
+                    data={"action": action, "states": _json_safe(dict(states))},
+                )
+            if action not in resolved["actions"]:
+                raise DriverError(
+                    "DRIVER.ACTION_UNSUPPORTED",
+                    "target does not advertise pointer_click support",
+                    data={"action": action, "available_actions": resolved["actions"]},
+                )
+        elif action not in resolved["actions"]:
             raise DriverError(
                 "DRIVER.ACTION_UNSUPPORTED",
                 f"target does not support native {action}",
@@ -1328,7 +1668,9 @@ class WindowsUIADriver:
         _check_deadline(deadline)
         native = fresh.handles[fresh_node_id]
         window_handle: int | None = None
-        if action == "type_text":
+        target_process_id: int | None = None
+        click_point: tuple[int, int] | None = None
+        if action in {"type_text", "pointer_click"}:
             raw_window_handle = fresh.public["window"].get("handle")
             if (
                 isinstance(raw_window_handle, bool)
@@ -1347,6 +1689,40 @@ class WindowsUIADriver:
                     },
                 )
             window_handle = raw_window_handle
+        if action == "pointer_click":
+            raw_window_process_id = fresh.public["window"].get("process_id")
+            raw_target_process_id = provenance.get("process_id") if isinstance(provenance, Mapping) else None
+            if (
+                isinstance(raw_window_process_id, bool)
+                or not isinstance(raw_window_process_id, int)
+                or raw_window_process_id <= 0
+                or isinstance(raw_target_process_id, bool)
+                or not isinstance(raw_target_process_id, int)
+                or raw_target_process_id <= 0
+                or raw_target_process_id != raw_window_process_id
+            ):
+                raise DriverError(
+                    "DRIVER.STALE_SNAPSHOT",
+                    "pointer_click cannot prove the target process and window identity",
+                    data={
+                        "window_process_id": None
+                        if isinstance(raw_window_process_id, bool)
+                        or not isinstance(raw_window_process_id, int)
+                        else raw_window_process_id,
+                        "target_process_id": None
+                        if isinstance(raw_target_process_id, bool)
+                        or not isinstance(raw_target_process_id, int)
+                        else raw_target_process_id,
+                    },
+                )
+            bounds = resolved.get("bounds")
+            if not isinstance(bounds, Mapping):
+                raise DriverError(
+                    "DRIVER.ACTION_UNSUPPORTED",
+                    "pointer_click target lacks clickable bounds",
+                )
+            click_point = _center_point(bounds)
+            target_process_id = raw_target_process_id
         dispatched = False
         try:
             dispatched = True
@@ -1357,6 +1733,22 @@ class WindowsUIADriver:
             elif action == "set_value":
                 assert value is not None
                 backend_result = self.backend.set_value(native, value, deadline=deadline)
+            elif action == "pointer_click":
+                assert (
+                    window_handle is not None
+                    and target_process_id is not None
+                    and click_point is not None
+                    and pointer_button == "left"
+                    and pointer_position == "center"
+                )
+                backend_result = self.backend.pointer_click(
+                    native,
+                    target_process_id=target_process_id,
+                    window_handle=window_handle,
+                    x=click_point[0],
+                    y=click_point[1],
+                    deadline=deadline,
+                )
             else:
                 assert (
                     action == "type_text"
@@ -1373,7 +1765,7 @@ class WindowsUIADriver:
         except DriverError as exc:
             details = dict(exc.data) if isinstance(exc.data, Mapping) else {}
             if (
-                action == "type_text"
+                action in {"type_text", "pointer_click"}
                 and exc.code in {"DRIVER.ACTION_FAILED", "DRIVER.TIMEOUT"}
                 and details.get("phase") == "before_dispatch"
                 and details.get("effect") == "not_applied"
@@ -1464,6 +1856,18 @@ class UnavailableBackend:
         text: str,
         *,
         window_handle: int,
+        deadline: float,
+    ) -> Any:
+        self._raise()
+
+    def pointer_click(
+        self,
+        native: Any,
+        *,
+        target_process_id: int,
+        window_handle: int,
+        x: int,
+        y: int,
         deadline: float,
     ) -> Any:
         self._raise()
@@ -1738,6 +2142,24 @@ class ComtypesUIABackend:
                 data={"pattern": pattern_name, **self._exception_data(exc)},
             ) from exc
 
+    def _element_from_point(self, x: int, y: int) -> Any:
+        class POINT(ctypes.Structure):
+            _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+        try:
+            return self.automation.ElementFromPoint(POINT(x=x, y=y))
+        except Exception as exc:
+            raise self._native_failure("ElementFromPoint", exc) from exc
+
+    def _point_hits_target(self, target: Any, x: int, y: int, *, deadline: float) -> bool:
+        _check_deadline(deadline)
+        hit = self._element_from_point(x, y)
+        _check_deadline(deadline)
+        try:
+            return bool(self.automation.CompareElements(hit, target))
+        except Exception as exc:
+            raise self._native_failure("CompareElements", exc) from exc
+
     @staticmethod
     def _bounds(rectangle: Any) -> dict[str, int] | None:
         try:
@@ -1788,11 +2210,25 @@ class ComtypesUIABackend:
             except DriverError:
                 value_available = False
                 read_only = None
+        bounds = self._bounds(self._property(element, "CurrentBoundingRectangle"))
+        process_id = self._property(element, "CurrentProcessId")
+        pointer_clickable = (
+            enabled
+            and not is_password
+            and not bool(self._property(element, "CurrentIsOffscreen", False))
+            and isinstance(process_id, int)
+            and process_id > 0
+            and isinstance(bounds, dict)
+            and bounds["width"] > 0
+            and bounds["height"] > 0
+        )
         actions: list[str] = []
         if enabled and focusable:
             actions.append("focus")
             if not is_password:
                 actions.append("type_text")
+        if pointer_clickable:
+            actions.append("pointer_click")
         if enabled and invoke_available:
             actions.append("invoke")
         if enabled and value_available and read_only is False:
@@ -1815,14 +2251,14 @@ class ComtypesUIABackend:
                 "focused": bool(self._property(element, "CurrentHasKeyboardFocus", False)),
                 "read_only": read_only,
             },
-            bounds=self._bounds(self._property(element, "CurrentBoundingRectangle")),
+            bounds=bounds,
             actions=actions,
             provenance={
                 "control_type_id": control_type_id,
                 "automation_id": _safe_text(self._property(element, "CurrentAutomationId")),
                 "class_name": _safe_text(self._property(element, "CurrentClassName")),
                 "framework_id": _safe_text(self._property(element, "CurrentFrameworkId")),
-                "process_id": self._property(element, "CurrentProcessId"),
+                "process_id": process_id,
                 "native_window_handle": self._property(element, "CurrentNativeWindowHandle"),
                 "runtime_id": runtime_id,
                 "value_redacted": is_password,
@@ -2004,6 +2440,123 @@ class ComtypesUIABackend:
                 data=details,
             ) from exc
 
+    def pointer_click(
+        self,
+        native: Any,
+        *,
+        target_process_id: int,
+        window_handle: int,
+        x: int,
+        y: int,
+        deadline: float,
+    ) -> Any:
+        if (
+            isinstance(target_process_id, bool)
+            or not isinstance(target_process_id, int)
+            or target_process_id <= 0
+        ):
+            _fail("DRIVER.INVALID_REQUEST", "target_process_id must be a positive integer")
+        if isinstance(window_handle, bool) or not isinstance(window_handle, int) or window_handle <= 0:
+            _fail("DRIVER.INVALID_REQUEST", "window_handle must be a positive integer")
+        if isinstance(x, bool) or not isinstance(x, int):
+            _fail("DRIVER.INVALID_REQUEST", "x must be an integer")
+        if isinstance(y, bool) or not isinstance(y, int):
+            _fail("DRIVER.INVALID_REQUEST", "y must be an integer")
+        _check_deadline(deadline)
+
+        def verify_target_context(events_submitted: int) -> None:
+            if not bool(self._property(native, "CurrentIsEnabled", False)):
+                raise DriverError(
+                    "DRIVER.ACTION_UNSUPPORTED",
+                    "pointer_click target is disabled before SendInput",
+                    retryable=False,
+                    data={
+                        "operation": "pointer target verification",
+                        "phase": "before_dispatch",
+                        "effect": "not_applied",
+                        "events_submitted": events_submitted,
+                    },
+                )
+            if bool(self._property(native, "CurrentIsOffscreen", True)):
+                raise DriverError(
+                    "DRIVER.ACTION_UNSUPPORTED",
+                    "pointer_click target is offscreen before SendInput",
+                    retryable=False,
+                    data={
+                        "operation": "pointer target verification",
+                        "phase": "before_dispatch",
+                        "effect": "not_applied",
+                        "events_submitted": events_submitted,
+                    },
+                )
+            try:
+                hit_matches = self._point_hits_target(native, x, y, deadline=deadline)
+            except DriverError as exc:
+                details = dict(exc.data) if isinstance(exc.data, Mapping) else {}
+                details.update(
+                    {
+                        "phase": "before_dispatch",
+                        "effect": "not_applied",
+                        "events_submitted": events_submitted,
+                        "point": {"x": x, "y": y},
+                    }
+                )
+                raise DriverError(
+                    "DRIVER.ACTION_FAILED",
+                    "pointer_click hit-test failed before SendInput",
+                    retryable=False,
+                    data=details,
+                ) from exc
+            if not hit_matches:
+                raise DriverError(
+                    "DRIVER.STALE_SNAPSHOT",
+                    "pointer_click hit-test did not match the target element",
+                    retryable=False,
+                    data={
+                        "phase": "before_dispatch",
+                        "effect": "not_applied",
+                        "events_submitted": events_submitted,
+                        "point": {"x": x, "y": y},
+                    },
+                )
+            raw_target_process_id = self._property(native, "CurrentProcessId")
+            try:
+                current_target_process_id = int(raw_target_process_id)
+            except (TypeError, ValueError, OverflowError):
+                current_target_process_id = 0
+            foreground_window_handle, foreground_process_id = (
+                self.input_adapter.foreground_window_identity()
+            )
+            if (
+                current_target_process_id <= 0
+                or current_target_process_id != target_process_id
+                or foreground_process_id != target_process_id
+                or foreground_window_handle != window_handle
+            ):
+                raise DriverError(
+                    "DRIVER.ACTION_FAILED",
+                    "pointer_click target is not in the expected foreground window",
+                    retryable=False,
+                    data={
+                        "operation": "foreground target verification",
+                        "phase": "before_dispatch",
+                        "effect": "not_applied",
+                        "events_submitted": events_submitted,
+                        "target_process_id": current_target_process_id or None,
+                        "expected_target_process_id": target_process_id,
+                        "foreground_process_id": foreground_process_id,
+                        "expected_window_handle": window_handle,
+                        "foreground_window_handle": foreground_window_handle,
+                    },
+                )
+
+        return self.input_adapter.send_pointer_click(
+            x,
+            y,
+            before_dispatch=verify_target_context,
+            deadline=deadline,
+        )
+
     def same_element(self, previous: Any, current: Any, *, deadline: float) -> bool:
         _check_deadline(deadline)
         try:
@@ -2108,7 +2661,8 @@ def handle_request(request: Any, driver: WindowsUIADriver) -> None:
             )
         action_name = ACTION_NAMES[action_id]
         deadline = _wire_deadline(
-            request.get("deadline_ms"), retryable=action_name != "type_text"
+            request.get("deadline_ms"),
+            retryable=action_name not in {"type_text", "pointer_click"},
         )
         result = driver.execute(
             action_name, request.get("args"), deadline=deadline
