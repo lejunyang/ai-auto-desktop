@@ -12,6 +12,7 @@ from ai_auto_desktop.compiler import load_descriptor
 from ai_auto_desktop.durable import DurableExecutor
 from ai_auto_desktop.errors import AutomationError
 from ai_auto_desktop.journal import JournalStore, RunStatus
+from ai_auto_desktop.plugin import ProcessPlugin
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -30,12 +31,21 @@ class LinuxAtspiDurableTests(unittest.TestCase):
         self.workflow = load_descriptor(WORKFLOW)
 
     def test_real_process_provider_persists_only_public_session_projection(self) -> None:
+        environment = os.environ.copy()
+        environment.setdefault("XDG_SESSION_TYPE", "x11")
+        environment.setdefault("XDG_CURRENT_DESKTOP", "KDE")
+        environment.setdefault("DISPLAY", ":fixture")
         outcome = DurableExecutor(
             self.store, owner_id="linux-reader",
             durable_action_mode="read-only",
         ).start(
             self.workflow, run_id="linux-session",
-            plugins={"desktop.linux_atspi": [str(PLUGIN)]},
+            plugins={
+                "desktop.linux_atspi": ProcessPlugin(
+                    [str(PLUGIN)], env=environment,
+                    name="desktop.linux_atspi",
+                )
+            },
             granted_permissions=["desktop.observe"],
         )
 

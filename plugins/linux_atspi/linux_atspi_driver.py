@@ -969,6 +969,8 @@ class LinuxAtspiDriver:
 
     def _inspect_session(self, args: dict[str, Any]) -> dict[str, Any]:
         _only_keys(args, set(), "args")
+        if isinstance(self.backend, UnavailableBackend):
+            self.backend._raise()
         session = _session_info(self.backend)
         return {
             "backend": _backend_name(self.backend),
