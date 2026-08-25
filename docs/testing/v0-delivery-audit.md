@@ -58,19 +58,30 @@
 | `b778a7e` | Windows 原生测试 JSON 证据产物与失败留存 |
 | `7421b79` | Windows 手动 job 运行完整测试套件并修正门禁 |
 | `9a305a2` | macOS 回传归档本地验真与信任分层 |
+| `bbf3c83` | durable 只读 action 的安全恢复与一次派发语义 |
+| `414c0a5` | 本机 KDE/X11 初始资格验证 |
+| `713c483` | 可搬运的 macOS 原生测试套件 |
+| `f5c5a02` | durable 只读恢复边界的中文文档 |
+| `3c883d9` | Dolphin、Qt Quick/QML 矩阵与原生语义动作 |
+| `8258005` | KDE 资格报告的独立、失败关闭验真门禁 |
+| `4bff73c` | Linux durable session 可用性校验 |
+| `8f7b3a9` | durable lease heartbeat 与 finalization v3 恢复窗口加固 |
+| `39990b6` | macOS 结果证据绑定源码 revision 与 package digest |
+| `bf601c0` | heartbeat 启动异常清理与 lease-loss 错误分流 |
 
 每个提交均包含且仅包含一条 `Co-authored-by: TRAE CLI <noreply@bytedance.com>` trailer。后续文档修订的 commit ID 以 `git log` 为准。
 
 ## 4. 验证记录
 
-- 当前 revision 的全量 Python 测试结果以仓库全量测试命令的最新输出为准；下列平台证据与确定性契约测试分开计算，不在本文硬编码会随用例增长而失效的总数。
+- `bf601c0` 的全量 Python 回归：`PYTHONPATH=src PYTHONDONTWRITEBYTECODE=1 python -m unittest discover -s tests -q`，共 492 项，通过，跳过 10 项非当前平台原生用例；耗时 98.568 秒。
+- durable 定向回归：read-only、finalization、journal 与 run service 共 93 项通过；独立复审未发现 P0/P1。heartbeat 启动握手失败后线程停止、lease 不再续期且到期可接管；`0.001/0.005/0.01/0.02/0.05s` 极短 TTL 均稳定返回可重试 `RUN.LEASE_LOST`，不会误报状态冲突/存储故障，也没有 provider 重复派发或 token 落盘。
 - Linux 本机：Debian 12、KDE Plasma 5.27.5、Qt 5.15.8、X11 `DISPLAY=:10.0`。
 - Linux 自有 fixture：GTK3 和 Qt5 的 snapshot/find/focus/语义写动作通过；显式 XTest UTF-8 输入后由 fresh AT-SPI snapshot 观察通过。
 - Linux 隔离环境：私有 Xvfb + 私有 session/AT-SPI bus 的 GTK3/Qt5 输入用例通过。
 - Linux capability probe：同一 KDE/X11 会话中 `linux.at_spi`、`linux.x11` 和 `linux.remote_desktop_portal` 为 `available`；`linux.uinput=degraded`，Wayland/libei 不可用。X11 查询使用单个根窗口属性，避免完整 `xdpyinfo` 输出超过通用子进程上限。
 - Linux 应用只读矩阵：Dolphin 22.12.3（358 节点）、Konsole 22.12.3（352 节点）、System Settings 5.27.5（256 节点）与自有 Qt Quick/QML fixture（5 节点）均通过精确 PID 选择和未截断快照；写动作派发数为零，Dolphin 仅打开临时空目录，详细聚合指标见 `docs/testing/kde-x11-qualification.md`。
 - Windows：跨平台契约、ctypes ABI 和 CI artifact 静态契约测试通过；Windows-only fixture 在非 Windows 主机跳过，远端 CI 未触发。
-- macOS：driver/testkit 静态与协议测试通过，源码包可复现；37 项回传归档与 testkit 契约测试通过。该结果只验证 Linux 上的验真逻辑，当前 Linux 主机无法编译或执行 Apple framework。
+- macOS：driver/testkit 静态与协议测试通过，源码包可复现并绑定 clean Git revision、manifest digest 与结果归档 hash。该结果只验证 Linux 上的验真逻辑，当前 Linux 主机无法编译或执行 Apple framework；最终源码包的具体 revision 和三类 SHA-256 记录在随包交付消息中。
 - `python -m compileall -q src plugins tests`、`git diff --check` 和 XTest helper 本机构建通过。
 
 ## 5. 外部门禁与未完成资格
