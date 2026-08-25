@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 import tempfile
 import time
@@ -78,6 +79,15 @@ class DurableExecutionTests(unittest.TestCase):
         event_types = [event.event_type for event in self.store.list_events("run-1")]
         self.assertEqual(event_types[0:2], ["run.created", "run.started"])
         self.assertEqual(event_types[-1], "run.finished")
+        self.assertEqual(
+            event_types[-4:],
+            [
+                "run.finalization_intent",
+                "run.finalization_started",
+                "run.finalization_completed",
+                "run.finished",
+            ],
+        )
 
     def test_run_service_exposes_durable_start_entrypoint(self) -> None:
         plan = workflow(assign("only", 6))
@@ -118,6 +128,39 @@ class DurableExecutionTests(unittest.TestCase):
             with self.subTest(plan=plan), self.assertRaises(AutomationError) as rejected:
                 self.executor.start(plan, run_id=f"unsafe-{index}")
             self.assertEqual(rejected.exception.code, "DURABLE.UNSUPPORTED_PLAN")
+        self.assertEqual(self.store.list_runs(), [])
+
+    def test_workflow_finally_cannot_hide_action_or_script(self) -> None:
+        action_plan = workflow(
+            assign("work", 1),
+            finally_steps=[{
+                "id": "cleanup_action", "type": "action",
+                "uses": "fixture.ocr@1", "with": {},
+                "effect": {"class": "read_only"},
+                "risk": {"category": "observe", "level": "low"},
+            }],
+        )
+        script_plan = workflow(
+            assign("work", 1),
+            finally_steps=[{
+                "id": "cleanup_script", "type": "script",
+                "runtime": "python", "source": "print(1)",
+                "output_schema": {},
+            }],
+        )
+        for index, unsafe_plan in enumerate((action_plan, script_plan)):
+            with self.subTest(index=index):
+                executor = DurableExecutor(
+                    self.store, owner_id=f"cleanup-worker-{index}",
+                    durable_action_mode="read-only",
+                )
+                with self.assertRaises(AutomationError) as rejected:
+                    executor.start(
+                        unsafe_plan, run_id=f"unsafe-cleanup-{index}"
+                    )
+                self.assertEqual(
+                    rejected.exception.code, "DURABLE.UNSUPPORTED_PLAN"
+                )
         self.assertEqual(self.store.list_runs(), [])
 
     def test_segment_enter_cancel_race_prevents_next_segment_dispatch(self) -> None:
@@ -312,6 +355,325 @@ class DurableExecutionTests(unittest.TestCase):
         self.assertEqual(
             outcome.run.checkpoint["deadlineEpochMs"], 1
         )
+
+    def _crash_at_finalization_stage(
+        self, plan: object, run_id: str, stage: str,
+    ) -> None:
+        original = self.store.append_event_with_checkpoint
+
+        def crash_after_checkpoint(
+            target_run_id: str, event_type: str, payload: object,
+            checkpoint: object, **kwargs: object,
+        ) -> object:
+            saved = original(
+                target_run_id, event_type, payload, checkpoint, **kwargs
+            )
+            if (
+                isinstance(checkpoint, dict)
+                and isinstance(checkpoint.get("finalization"), dict)
+                and checkpoint["finalization"].get("stage") == stage
+            ):
+                raise RuntimeError(f"crash-after-{stage}")
+            return saved
+
+        with mock.patch.object(
+            self.store, "append_event_with_checkpoint",
+            side_effect=crash_after_checkpoint,
+        ), self.assertRaises(AutomationError):
+            self.executor.start(plan, run_id=run_id)
+        self.store._connection.execute(
+            "UPDATE runs SET lease_expires_at = 0 WHERE run_id = ?",
+            (run_id,),
+        )
+
+    def test_finalization_intent_resume_runs_cleanup_once(self) -> None:
+        plan = workflow(
+            assign("work", 1),
+            finally_steps=[assign("cleanup", 7)],
+        )
+        self._crash_at_finalization_stage(plan, "intent-crash", "intent")
+
+        crashed = self.store.get_run("intent-crash")
+        self.assertEqual(crashed.checkpoint["finalization"]["stage"], "intent")
+        outcome = DurableExecutor(
+            self.store, owner_id="recovery"
+        ).resume("intent-crash", plan)
+
+        self.assertEqual(outcome.run.status, RunStatus.SUCCEEDED)
+        self.assertEqual(outcome.run.output, {"count": 1})
+        self.assertEqual(outcome.result.variables["count"], 7)
+        cleanup_events = [
+            event for event in outcome.result.events
+            if event.get("step_id") == "cleanup"
+            and event.get("event") == "step.started"
+        ]
+        self.assertEqual(len(cleanup_events), 1)
+
+    def test_finalization_started_resume_does_not_repeat_cleanup(self) -> None:
+        plan = workflow(
+            assign("work", 1),
+            finally_steps=[assign("cleanup", 7)],
+        )
+        self._crash_at_finalization_stage(
+            plan, "started-crash", "started"
+        )
+
+        outcome = DurableExecutor(
+            self.store, owner_id="recovery"
+        ).resume("started-crash", plan)
+
+        self.assertEqual(outcome.run.status, RunStatus.UNKNOWN_EFFECT)
+        self.assertEqual(
+            outcome.run.error["details"]["checkpointPhase"],
+            "finalization_started",
+        )
+
+    def test_finalization_result_resume_only_commits_terminal_result(self) -> None:
+        plan = workflow(
+            assign("work", 1),
+            finally_steps=[assign("cleanup", 7)],
+        )
+        self._crash_at_finalization_stage(plan, "result-crash", "result")
+
+        factory = mock.Mock(side_effect=AssertionError("zero cleanup replay"))
+        outcome = DurableExecutor(
+            self.store, owner_id="recovery", runner_factory=factory
+        ).resume("result-crash", plan)
+
+        self.assertEqual(outcome.run.status, RunStatus.SUCCEEDED)
+        self.assertEqual(outcome.run.output, {"count": 1})
+        self.assertEqual(outcome.result.variables["count"], 7)
+        factory.assert_not_called()
+
+    def test_failed_step_finalization_intent_preserves_failure(self) -> None:
+        plan = workflow(
+            {
+                "id": "fail", "type": "fail",
+                "error": {"code": "TEST.FAIL", "message": "boom"},
+            },
+            finally_steps=[assign("cleanup", 7)],
+        )
+        self._crash_at_finalization_stage(plan, "failure-intent", "intent")
+
+        outcome = DurableExecutor(
+            self.store, owner_id="recovery"
+        ).resume("failure-intent", plan)
+
+        self.assertEqual(outcome.run.status, RunStatus.FAILED)
+        self.assertEqual(outcome.run.error["code"], "TEST.FAIL")
+        self.assertEqual(outcome.result.variables["count"], 7)
+
+    def test_timed_out_finalization_intent_preserves_timeout(self) -> None:
+        plan = workflow(
+            assign("never", 1),
+            finally_steps=[assign("cleanup", 7)],
+        )
+        service = RunService(self.store)
+        service.create(
+            run_id="timeout-intent", workflow_name=plan.name, inputs={},
+            descriptor=plan, plan_digest=canonical_plan_digest(plan),
+        )
+        lease = self.store.claim_owner(
+            "timeout-intent", owner_id="dead", ttl_seconds=1, now=1
+        )
+        runner = WorkflowRunner(plan)
+        state = runner.initialize().to_dict()
+        state["deadlineEpochMs"] = 1
+        self.store.set_status_with_event(
+            "timeout-intent", expected=RunStatus.PENDING,
+            status=RunStatus.RUNNING, owner_id=lease.owner_id,
+            token=lease.token, now=1.1, event_type="run.started",
+            event_payload={},
+            checkpoint={"checkpointSchemaVersion": 1, **state},
+        )
+        original = self.store.append_event_with_checkpoint
+
+        def crash_after_intent(
+            target_run_id: str, event_type: str, payload: object,
+            checkpoint: object, **kwargs: object,
+        ) -> object:
+            saved = original(
+                target_run_id, event_type, payload, checkpoint, **kwargs
+            )
+            if (
+                isinstance(checkpoint, dict)
+                and isinstance(checkpoint.get("finalization"), dict)
+                and checkpoint["finalization"].get("stage") == "intent"
+            ):
+                raise RuntimeError("crash-after-timeout-intent")
+            return saved
+
+        with mock.patch.object(
+            self.store, "append_event_with_checkpoint",
+            side_effect=crash_after_intent,
+        ), self.assertRaises(AutomationError):
+            DurableExecutor(
+                self.store, owner_id="first-recovery"
+            ).resume("timeout-intent", plan)
+        self.store._connection.execute(
+            "UPDATE runs SET lease_expires_at = 0 WHERE run_id = ?",
+            ("timeout-intent",),
+        )
+
+        outcome = DurableExecutor(
+            self.store, owner_id="second-recovery"
+        ).resume("timeout-intent", plan)
+
+        self.assertEqual(outcome.run.status, RunStatus.TIMED_OUT)
+        self.assertEqual(outcome.run.error["code"], "WORKFLOW.TIMEOUT")
+        self.assertEqual(outcome.result.variables["count"], 7)
+
+    def test_pause_and_cancel_races_do_not_strand_finalization(self) -> None:
+        for desired, expected in (
+            (DesiredState.PAUSE, RunStatus.SUCCEEDED),
+            (DesiredState.CANCEL, RunStatus.CANCELLED),
+        ):
+            with self.subTest(desired=desired), tempfile.TemporaryDirectory() as temporary:
+                store = JournalStore(Path(temporary) / "runs.sqlite3")
+                self.addCleanup(store.close)
+                service = RunService(store)
+                plan = workflow(
+                    assign("work", 1),
+                    finally_steps=[assign("cleanup", 7)],
+                )
+                original = store.append_event_with_checkpoint
+                raced = False
+
+                def request_control_after_started(
+                    run_id: str, event_type: str, payload: object,
+                    checkpoint: object, **kwargs: object,
+                ) -> object:
+                    nonlocal raced
+                    saved = original(
+                        run_id, event_type, payload, checkpoint, **kwargs
+                    )
+                    if (
+                        not raced
+                        and isinstance(checkpoint, dict)
+                        and isinstance(checkpoint.get("finalization"), dict)
+                        and checkpoint["finalization"].get("stage") == "started"
+                    ):
+                        raced = True
+                        if desired is DesiredState.PAUSE:
+                            service.request_pause(run_id)
+                        else:
+                            service.request_cancel(run_id)
+                    return saved
+
+                with mock.patch.object(
+                    store, "append_event_with_checkpoint",
+                    side_effect=request_control_after_started,
+                ):
+                    outcome = DurableExecutor(
+                        store, owner_id="race-worker"
+                    ).start(plan, run_id=f"finalize-{desired.value}")
+
+                self.assertEqual(outcome.run.status, expected)
+                self.assertEqual(outcome.run.desired_state, desired)
+                if desired is DesiredState.PAUSE:
+                    self.assertEqual(outcome.result.variables["count"], 7)
+                else:
+                    self.assertIsNone(outcome.result)
+
+    def test_finalization_result_resume_is_lease_fenced(self) -> None:
+        plan = workflow(assign("work", 1))
+        self._crash_at_finalization_stage(plan, "result-fenced", "result")
+        active = self.store.claim_owner(
+            "result-fenced", owner_id="replacement", ttl_seconds=60
+        )
+
+        with self.assertRaises(AutomationError) as rejected:
+            DurableExecutor(
+                self.store, owner_id="stale"
+            ).resume("result-fenced", plan)
+
+        self.assertIn(
+            rejected.exception.code,
+            {"RUN.JOURNAL_FAILURE", "RUN.LEASE_CONFLICT"},
+        )
+        current = self.store.get_run("result-fenced")
+        self.assertEqual(current.status, RunStatus.RUNNING)
+        self.assertEqual(current.owner_id, active.owner_id)
+
+    def test_paused_finalization_intent_resumes_cleanup_after_request_run(self) -> None:
+        plan = workflow(
+            assign("work", 1),
+            finally_steps=[assign("cleanup", 7)],
+        )
+        self._crash_at_finalization_stage(plan, "paused-intent", "intent")
+        service = RunService(self.store)
+        service.request_pause("paused-intent")
+
+        paused = DurableExecutor(
+            self.store, owner_id="pause-worker"
+        ).resume("paused-intent", plan)
+        self.assertEqual(paused.run.status, RunStatus.PAUSED)
+        self.assertEqual(
+            paused.run.checkpoint["finalization"]["stage"], "intent"
+        )
+
+        outcome = DurableExecutor(
+            self.store, owner_id="resume-worker"
+        ).resume("paused-intent", plan, request_run=True)
+        self.assertEqual(outcome.run.status, RunStatus.SUCCEEDED)
+        self.assertEqual(outcome.result.variables["count"], 7)
+
+    def test_cancelled_finalization_intent_runs_cleanup_once(self) -> None:
+        plan = workflow(
+            assign("work", 1),
+            finally_steps=[assign("cleanup", 7)],
+        )
+        self._crash_at_finalization_stage(plan, "cancelled-intent", "intent")
+        RunService(self.store).request_cancel("cancelled-intent")
+
+        outcome = DurableExecutor(
+            self.store, owner_id="cancel-worker"
+        ).resume("cancelled-intent", plan)
+
+        self.assertEqual(outcome.run.status, RunStatus.CANCELLED)
+        self.assertEqual(outcome.run.desired_state, DesiredState.CANCEL)
+        self.assertIsNone(outcome.result)
+
+    def test_malformed_finalization_checkpoint_never_creates_runner(self) -> None:
+        plan = workflow(assign("work", 1))
+        self._crash_at_finalization_stage(plan, "bad-finalization", "intent")
+        checkpoint = self.store.get_run("bad-finalization").checkpoint
+        checkpoint["finalization"]["extra"] = True
+        self.store._connection.execute(
+            "UPDATE runs SET checkpoint_json=? WHERE run_id=?",
+            (json.dumps(checkpoint), "bad-finalization"),
+        )
+        factory = mock.Mock(side_effect=AssertionError("zero runner creation"))
+
+        with self.assertRaises(AutomationError) as rejected:
+            DurableExecutor(
+                self.store, owner_id="recovery", runner_factory=factory
+            ).resume("bad-finalization", plan)
+
+        self.assertEqual(rejected.exception.code, "DURABLE.CHECKPOINT_INVALID")
+        factory.assert_not_called()
+
+    def test_finalization_result_commit_failure_is_mapped(self) -> None:
+        plan = workflow(assign("work", 1))
+        self._crash_at_finalization_stage(
+            plan, "result-commit-failure", "result"
+        )
+        original = self.store.set_status_with_event
+
+        def fail_terminal_commit(run_id: str, **kwargs: object) -> object:
+            if kwargs.get("event_type") == "run.finished":
+                raise RuntimeError("terminal storage unavailable")
+            return original(run_id, **kwargs)
+
+        with mock.patch.object(
+            self.store, "set_status_with_event",
+            side_effect=fail_terminal_commit,
+        ), self.assertRaises(AutomationError) as rejected:
+            DurableExecutor(
+                self.store, owner_id="recovery"
+            ).resume("result-commit-failure", plan)
+
+        self.assertEqual(rejected.exception.code, "DURABLE.JOURNAL_FAILURE")
 
 
 if __name__ == "__main__":

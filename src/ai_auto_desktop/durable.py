@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import re
+import threading
 import time
 from typing import Any, Callable, Mapping, Sequence
 import uuid
@@ -24,13 +25,14 @@ from .plugin import ProcessPlugin
 from .run_service import DispatchState, RunService, RunServiceError
 from .runtime import (
     RUNTIME_STATE_SCHEMA_VERSION,
+    RuntimeFinalizationIntent,
     RuntimeSegmentState,
     WorkflowRunner,
     canonical_plan_digest,
 )
 
 
-DURABLE_CHECKPOINT_SCHEMA_VERSION = 2
+DURABLE_CHECKPOINT_SCHEMA_VERSION = 3
 DEFAULT_LEASE_TTL_SECONDS = 30.0
 
 
@@ -56,11 +58,94 @@ class _PreparedAction:
     dispatch_deadline_epoch_ms: int
 
 
+class _LeaseHeartbeatKeeper:
+    """Renew one lease from a connection owned by a background thread."""
+
+    _INTERVAL_FRACTION = 0.25
+    _MAX_BUSY_TIMEOUT_MS = 500
+
+    def __init__(self, journal: JournalStore, lease: OwnerLease, ttl: float) -> None:
+        self._path = journal.path
+        self._lease = lease
+        self._ttl = ttl
+        self._interval = ttl * self._INTERVAL_FRACTION
+        self._busy_timeout_ms = min(
+            journal.busy_timeout_ms,
+            self._MAX_BUSY_TIMEOUT_MS,
+            max(1, int(self._interval * 500)),
+        )
+        self._stop = threading.Event()
+        self._ready = threading.Event()
+        self._failure_lock = threading.Lock()
+        self._failure: BaseException | None = None
+        self._thread = threading.Thread(
+            target=self._run,
+            name="durable-lease-heartbeat",
+            daemon=True,
+        )
+
+    def start(self) -> None:
+        self._thread.start()
+        startup_timeout = max(0.05, min(1.0, self._ttl * 0.5))
+        if not self._ready.wait(startup_timeout):
+            self._record_failure(TimeoutError("heartbeat keeper startup timed out"))
+            self.stop()
+        failure = self.failure
+        if failure is not None:
+            raise failure
+
+    def stop(self) -> BaseException | None:
+        self._stop.set()
+        join_timeout = min(1.5, 0.1 + 3 * self._busy_timeout_ms / 1_000)
+        self._thread.join(join_timeout)
+        if self._thread.is_alive():
+            self._record_failure(TimeoutError("heartbeat keeper did not stop"))
+        return self.failure
+
+    @property
+    def failure(self) -> BaseException | None:
+        with self._failure_lock:
+            return self._failure
+
+    def _record_failure(self, failure: BaseException) -> None:
+        with self._failure_lock:
+            if self._failure is None:
+                self._failure = failure
+        self._ready.set()
+
+    def _run(self) -> None:
+        try:
+            with JournalStore(
+                self._path, busy_timeout_ms=self._busy_timeout_ms
+            ) as journal:
+                if self._stop.is_set():
+                    return
+                journal.heartbeat_owner(
+                    self._lease.run_id,
+                    owner_id=self._lease.owner_id,
+                    token=self._lease.token,
+                    ttl_seconds=self._ttl,
+                )
+                self._ready.set()
+                while not self._stop.wait(self._interval):
+                    journal.heartbeat_owner(
+                        self._lease.run_id,
+                        owner_id=self._lease.owner_id,
+                        token=self._lease.token,
+                        ttl_seconds=self._ttl,
+                    )
+        except BaseException as exc:
+            self._record_failure(exc)
+        finally:
+            self._ready.set()
+
+
 class DurableExecutor:
     """Drive :class:`WorkflowRunner` through journaled safe boundaries.
 
-    Heartbeats happen synchronously at every durable boundary.  This class does
-    not claim to interrupt an already dispatched OS/plugin call asynchronously.
+    Heartbeats happen synchronously at every durable boundary.  Read-only
+    provider calls additionally use an independently connected heartbeat
+    keeper so their owner lease remains live while the caller is blocked.
     """
 
     def __init__(
@@ -220,7 +305,50 @@ class DurableExecutor:
         checkpoint = self._require_checkpoint(run)
         phase = checkpoint.get("phase")
         action_intent = self._is_action_intent(checkpoint)
-        if phase != "between_top_level_steps" and not action_intent:
+        finalization_kind = self._finalization_kind(checkpoint)
+        if finalization_kind == "result":
+            lease = self._claim(run_id)
+            try:
+                current = self.service.get(run_id)
+                current_checkpoint = self._require_checkpoint(current)
+                if self._finalization_kind(current_checkpoint) != "result":
+                    raise self._error(
+                        "DURABLE.STATE_CONFLICT",
+                        "finalization checkpoint changed after lease claim",
+                        run=current,
+                    )
+                return self._commit_result(
+                    run_id, lease,
+                    self._finalization_result(current_checkpoint, current),
+                )
+            except BaseException as exc:
+                if isinstance(exc, AutomationError):
+                    raise
+                raise self._map_error(exc, run_id=run_id) from exc
+        if finalization_kind == "started":
+            lease = self._claim(run_id)
+            try:
+                current = self.service.get(run_id)
+                current_checkpoint = self._require_checkpoint(current)
+                if self._finalization_kind(current_checkpoint) != "started":
+                    raise self._error(
+                        "DURABLE.STATE_CONFLICT",
+                        "finalization checkpoint changed after lease claim",
+                        run=current,
+                    )
+                terminal = self._reject_unsafe_recovery(
+                    current, lease, phase="finalization_started"
+                )
+                return DurableExecutionResult(terminal)
+            except BaseException as exc:
+                if isinstance(exc, AutomationError):
+                    raise
+                raise self._map_error(exc, run_id=run_id) from exc
+        if (
+            phase != "between_top_level_steps"
+            and not action_intent
+            and finalization_kind != "intent"
+        ):
             lease = self._claim(run_id)
             terminal = self._reject_unsafe_recovery(run, lease, phase=phase)
             return DurableExecutionResult(terminal)
@@ -236,6 +364,39 @@ class DurableExecutor:
             return DurableExecutionResult(paused)
         lease = self._claim(run_id)
         current = self.service.get(run_id)
+        current_checkpoint = self._require_checkpoint(current)
+        if (
+            self._finalization_kind(current_checkpoint) != finalization_kind
+            or current_checkpoint != checkpoint
+        ):
+            raise self._error(
+                "DURABLE.STATE_CONFLICT",
+                "checkpoint changed after lease claim", run=current,
+            )
+        if finalization_kind == "intent":
+            if current.desired_state is DesiredState.PAUSE:
+                paused = self.service.runner_safe_point(
+                    run_id, owner_id=lease.owner_id, token=lease.token
+                )
+                return DurableExecutionResult(paused)
+            if current.status is RunStatus.PAUSED:
+                current, _ = self.journal.set_status_with_event(
+                    run_id, expected=RunStatus.PAUSED,
+                    status=RunStatus.RUNNING, owner_id=lease.owner_id,
+                    token=lease.token, event_type="run.resumed",
+                    event_payload={"ownerId": lease.owner_id},
+                    checkpoint=checkpoint, sensitive=False,
+                )
+            elif current.status is not RunStatus.RUNNING:
+                raise self._error(
+                    "DURABLE.INVALID_STATE",
+                    f"run {run_id} cannot resume from {current.status.value}",
+                    run=current,
+                )
+            return self._resume_finalization_intent(
+                current, descriptor, checkpoint, lease, plugins,
+                allow_scripts, granted_permissions,
+            )
         if current.desired_state is DesiredState.CANCEL:
             if action_intent:
                 return DurableExecutionResult(
@@ -281,13 +442,9 @@ class DurableExecutor:
                     inputs=run.inputs,
                     allow_expired=True,
                 )
-                finalizing = runner.prepare_finalize()
-                self.journal.save_checkpoint(
-                    run_id, self._checkpoint(finalizing),
-                    owner_id=lease.owner_id, token=lease.token, sensitive=False,
+                return self._finalize(
+                    runner, run_id, lease, error=exc
                 )
-                result = runner.finalize(error=exc)
-                return self._commit_result(run_id, lease, result)
             if current.status is RunStatus.PAUSED:
                 current, _ = self.journal.set_status_with_event(
                     run_id,
@@ -327,23 +484,11 @@ class DurableExecutor:
                 return DurableExecutionResult(paused)
             if intent.desired_state is DesiredState.CANCEL:
                 runner.request_segment_cancellation()
-                prepared = runner.export_state()
-                self.journal.save_checkpoint(
-                    run.run_id, self._checkpoint(prepared),
-                    owner_id=lease.owner_id, token=lease.token, sensitive=False,
-                )
-                result = runner.finalize()
-                return self._commit_result(run.run_id, lease, result)
+                return self._finalize(runner, run.run_id, lease)
 
             prepared = runner.prepare_segment()
             if prepared.step_id is None:
-                finalizing = runner.prepare_finalize()
-                self.journal.save_checkpoint(
-                    run.run_id, self._checkpoint(finalizing),
-                    owner_id=lease.owner_id, token=lease.token, sensitive=False,
-                )
-                result = runner.finalize()
-                return self._commit_result(run.run_id, lease, result)
+                return self._finalize(runner, run.run_id, lease)
             step = runner.descriptor.steps[prepared.state.next_top_level_index]
             if step.type == "action":
                 return self._dispatch_read_only_action(
@@ -372,13 +517,7 @@ class DurableExecutor:
                     return DurableExecutionResult(paused)
                 if intent.desired_state is DesiredState.CANCEL:
                     runner.request_segment_cancellation()
-                    prepared_cancel = runner.export_state()
-                    self.journal.save_checkpoint(
-                        run.run_id, self._checkpoint(prepared_cancel),
-                        owner_id=lease.owner_id, token=lease.token, sensitive=False,
-                    )
-                    result = runner.finalize()
-                    return self._commit_result(run.run_id, lease, result)
+                    return self._finalize(runner, run.run_id, lease)
                 raise
             segment = runner.run_segment()
             lease = self._heartbeat(lease)
@@ -397,12 +536,7 @@ class DurableExecutor:
                 )
                 continue
 
-            self.journal.save_checkpoint(
-                run.run_id, self._checkpoint(segment.state),
-                owner_id=lease.owner_id, token=lease.token, sensitive=False,
-            )
-            result = runner.finalize()
-            return self._commit_result(run.run_id, lease, result)
+            return self._finalize(runner, run.run_id, lease)
 
     def _dispatch_read_only_action(
         self, runner: WorkflowRunner, run: RunRecord, lease: OwnerLease,
@@ -416,11 +550,6 @@ class DurableExecutor:
             # back to a safe boundary and persist a redacted terminal failure
             # instead of abandoning a running row with a live lease.
             runner.abort_prepared_segment()
-            finalizing = runner.prepare_finalize()
-            self.journal.save_checkpoint(
-                run.run_id, self._checkpoint(finalizing),
-                owner_id=lease.owner_id, token=lease.token, sensitive=False,
-            )
             original = ensure_automation_error(exc)
             safe_error = AutomationError(
                 "DURABLE.ACTION_PREPARATION_FAILED",
@@ -431,8 +560,9 @@ class DurableExecutor:
                 effect="not_applied",
                 details={"stepId": step.id, "originalCode": original.code},
             )
-            result = runner.finalize(error=safe_error)
-            return self._commit_result(run.run_id, lease, result)
+            return self._finalize(
+                runner, run.run_id, lease, error=safe_error
+            )
         checkpoint = self._action_intent_checkpoint(state, prepared)
         try:
             self.journal.append_event_with_checkpoint(
@@ -506,16 +636,10 @@ class DurableExecutor:
             segment = runner.run_durable_action_segment(
                 prepared.binding, prepared.dispatch_deadline_epoch_ms
             )
-            self.journal.save_checkpoint(
-                run.run_id, self._checkpoint(segment.state),
-                owner_id=lease.owner_id, token=lease.token, sensitive=False,
-            )
-            result = runner.finalize()
-            return self._commit_result(run.run_id, lease, result)
-        segment = runner.run_durable_action_segment(
-            prepared.binding, prepared.dispatch_deadline_epoch_ms
+            return self._finalize(runner, run.run_id, lease)
+        segment, lease = self._run_action_with_lease_heartbeat(
+            runner, lease, prepared
         )
-        lease = self._heartbeat(lease)
         if segment.state.phase == "between_top_level_steps":
             boundary = self._checkpoint(segment.state)
             try:
@@ -539,12 +663,62 @@ class DurableExecutor:
                     runner, run.run_id, lease
                 )
             return self._execute_loop(runner, self.service.get(run.run_id), lease)
-        self.journal.save_checkpoint(
-            run.run_id, self._checkpoint(segment.state),
-            owner_id=lease.owner_id, token=lease.token, sensitive=False,
+        return self._finalize(runner, run.run_id, lease)
+
+    def _run_action_with_lease_heartbeat(
+        self,
+        runner: WorkflowRunner,
+        lease: OwnerLease,
+        prepared: _PreparedAction,
+    ) -> tuple[Any, OwnerLease]:
+        keeper = _LeaseHeartbeatKeeper(
+            self.journal, lease, self.lease_ttl_seconds
         )
-        result = runner.finalize()
-        return self._commit_result(run.run_id, lease, result)
+        try:
+            keeper.start()
+        except BaseException:
+            raise self._lease_heartbeat_error(
+                lease, stage="before_dispatch", provider_completed=False
+            ) from None
+
+        try:
+            segment = runner.run_durable_action_segment(
+                prepared.binding, prepared.dispatch_deadline_epoch_ms
+            )
+        except BaseException:
+            # A keeper shutdown problem must never replace an exception raised
+            # by the provider/runtime path.
+            keeper.stop()
+            raise
+
+        keeper_failure = keeper.stop()
+        try:
+            renewed = self._heartbeat(lease)
+        except AutomationError:
+            raise self._lease_heartbeat_error(
+                lease, stage="after_dispatch", provider_completed=True
+            ) from None
+
+        if keeper_failure is not None:
+            # The synchronous renewal proves that this token is still fenced
+            # in.  Preserve the provider result and expose only a sanitized
+            # degradation marker; keeper exceptions may contain DB paths or
+            # other values that do not belong in the durable journal.
+            try:
+                self.journal.append_event(
+                    lease.run_id,
+                    "run.lease_heartbeat_failed",
+                    {"recovered": True},
+                    owner_id=lease.owner_id,
+                    token=lease.token,
+                    sensitive=False,
+                )
+            except Exception:
+                # This is diagnostic-only.  The next fenced checkpoint write
+                # still detects lease loss, and an unavailable marker must not
+                # replace an already obtained provider result.
+                pass
+        return segment, renewed
 
     def _apply_control_before_dispatch(
         self, runner: WorkflowRunner, run_id: str, lease: OwnerLease
@@ -601,7 +775,7 @@ class DurableExecutor:
         state: RuntimeSegmentState, prepared: _PreparedAction
     ) -> dict[str, Any]:
         return {
-            "checkpointSchemaVersion": 2, **{
+            "checkpointSchemaVersion": DURABLE_CHECKPOINT_SCHEMA_VERSION, **{
                 **state.to_dict(), "phase": "action_intent"
             },
             "actionIntent": {
@@ -665,13 +839,75 @@ class DurableExecutor:
                 self._runtime_state(checkpoint), inputs=run.inputs, allow_expired=True
             )
             runner.request_segment_cancellation()
-            prepared = runner.export_state()
-            self.journal.save_checkpoint(
-                run.run_id, self._checkpoint(prepared),
-                owner_id=lease.owner_id, token=lease.token, sensitive=False,
+            return self._finalize(runner, run.run_id, lease)
+        finally:
+            runner.close()
+
+    def _finalize(
+        self,
+        runner: WorkflowRunner,
+        run_id: str,
+        lease: OwnerLease,
+        *,
+        error: AutomationError | None = None,
+    ) -> DurableExecutionResult:
+        """Persist pre-cleanup intent, cleanup entry, and its result."""
+
+        intent = runner.export_finalization_intent(error=error)
+        intent_checkpoint = self._finalization_intent_checkpoint(intent)
+        self.journal.append_event_with_checkpoint(
+            run_id, "run.finalization_intent", {}, intent_checkpoint,
+            owner_id=lease.owner_id, token=lease.token,
+            expected_status=RunStatus.RUNNING, sensitive=False,
+        )
+        started_checkpoint = {
+            **intent_checkpoint,
+            "finalization": {
+                **intent_checkpoint["finalization"],
+                "stage": "started",
+            },
+        }
+        self.journal.append_event_with_checkpoint(
+            run_id, "run.finalization_started", {}, started_checkpoint,
+            owner_id=lease.owner_id, token=lease.token,
+            expected_status=RunStatus.RUNNING, sensitive=False,
+        )
+        result = runner.finalize()
+        self.journal.append_event_with_checkpoint(
+            run_id, "run.finalization_completed",
+            {"status": result.status},
+            self._finalization_result_checkpoint(intent.state, result),
+            owner_id=lease.owner_id, token=lease.token,
+            expected_status=RunStatus.RUNNING, sensitive=False,
+        )
+        return self._commit_result(run_id, lease, result)
+
+    def _resume_finalization_intent(
+        self,
+        run: RunRecord,
+        descriptor: WorkflowDescriptor,
+        checkpoint: Mapping[str, Any],
+        lease: OwnerLease,
+        plugins: Mapping[str, ProcessPlugin | Sequence[str] | str] | None,
+        allow_scripts: bool,
+        granted_permissions: Sequence[str] | None,
+    ) -> DurableExecutionResult:
+        runner = self._new_runner(
+            descriptor, plugins=plugins, allow_scripts=allow_scripts,
+            granted_permissions=granted_permissions,
+        )
+        try:
+            finalization = checkpoint["finalization"]
+            restored_error = self._automation_error(
+                finalization.get("error"), run=run
             )
-            result = runner.finalize()
-            return self._commit_result(run.run_id, lease, result)
+            runner.restore_finalization_intent(
+                self._runtime_state(checkpoint), inputs=run.inputs,
+                output_set=finalization["outputSet"],
+                output=finalization.get("output"),
+                error=restored_error,
+            )
+            return self._finalize(runner, run.run_id, lease)
         finally:
             runner.close()
 
@@ -769,10 +1005,71 @@ class DurableExecutor:
             raise self._map_error(exc, run_id=lease.run_id) from exc
 
     @staticmethod
+    def _lease_heartbeat_error(
+        lease: OwnerLease, *, stage: str, provider_completed: bool
+    ) -> AutomationError:
+        return AutomationError(
+            "DURABLE.LEASE_HEARTBEAT_FAILED",
+            "durable action lease heartbeat failed",
+            category="durable",
+            phase="execute",
+            retryable=not provider_completed,
+            effect="not_applied" if not provider_completed else "unknown",
+            details={
+                "runId": lease.run_id,
+                "stage": stage,
+                "providerCompleted": provider_completed,
+            },
+        )
+
+    @staticmethod
     def _checkpoint(state: RuntimeSegmentState) -> dict[str, Any]:
         return {
             "checkpointSchemaVersion": DURABLE_CHECKPOINT_SCHEMA_VERSION,
             **state.to_dict(),
+        }
+
+    @staticmethod
+    def _finalization_intent_checkpoint(
+        intent: RuntimeFinalizationIntent,
+    ) -> dict[str, Any]:
+        output_set = intent.output_set and intent.error is None
+        return {
+            "checkpointSchemaVersion": DURABLE_CHECKPOINT_SCHEMA_VERSION,
+            **intent.state.to_dict(),
+            "finalization": {
+                "version": 1,
+                "stage": "intent",
+                "outputSet": output_set,
+                "output": intent.output if output_set else None,
+                "error": (
+                    None if intent.error is None else intent.error.to_dict()
+                ),
+            },
+        }
+
+    @staticmethod
+    def _finalization_result_checkpoint(
+        state: RuntimeSegmentState, result: RunResult,
+    ) -> dict[str, Any]:
+        return {
+            "checkpointSchemaVersion": DURABLE_CHECKPOINT_SCHEMA_VERSION,
+            **state.to_dict(),
+            "finalization": {
+                "version": 1,
+                "stage": "result",
+                "result": {
+                    "status": result.status,
+                    "output": (
+                        result.output if result.status == "succeeded" else None
+                    ),
+                    "variables": result.variables,
+                    "steps": result.steps,
+                    "error": (
+                        None if result.error is None else result.error.to_dict()
+                    ),
+                },
+            },
         }
 
     def _require_checkpoint(self, run: RunRecord) -> Mapping[str, Any]:
@@ -796,20 +1093,24 @@ class DurableExecutor:
             "stepRecords",
         }
         allowed = required | {"actionIntent"}
+        finalization_allowed = required | {"finalization"}
         keys = frozenset(value)
-        if keys not in {frozenset(required), frozenset(allowed)}:
+        if keys not in {
+            frozenset(required), frozenset(allowed),
+            frozenset(finalization_allowed),
+        }:
             raise self._error(
                 "DURABLE.CHECKPOINT_INVALID",
                 "checkpoint fields do not match the supported schema", run=run,
             )
         version = value.get("checkpointSchemaVersion")
-        if version not in {1, DURABLE_CHECKPOINT_SCHEMA_VERSION}:
+        if version not in {1, 2, DURABLE_CHECKPOINT_SCHEMA_VERSION}:
             raise self._error(
                 "DURABLE.CHECKPOINT_VERSION",
                 "checkpoint schema version is unsupported", run=run,
             )
         if "actionIntent" in value:
-            if version != 2 or value.get("phase") != "action_intent":
+            if version not in {2, 3} or value.get("phase") != "action_intent":
                 raise self._error(
                     "DURABLE.CHECKPOINT_INVALID",
                     "action intent checkpoint phase or version is invalid", run=run,
@@ -848,10 +1149,23 @@ class DurableExecutor:
                     "DURABLE.CHECKPOINT_INVALID",
                     "action intent field types are invalid", run=run,
                 )
-        elif version == 2 and value.get("phase") == "action_intent":
+        elif version in {2, 3} and value.get("phase") == "action_intent":
             raise self._error(
                 "DURABLE.CHECKPOINT_INVALID",
                 "action intent payload is missing", run=run,
+            )
+        if "finalization" in value:
+            if version != 3 or value.get("phase") != "finalizing":
+                raise self._error(
+                    "DURABLE.CHECKPOINT_INVALID",
+                    "finalization checkpoint phase or version is invalid",
+                    run=run,
+                )
+            self._validate_finalization(value["finalization"], run)
+        elif version == 3 and value.get("phase") == "finalizing":
+            raise self._error(
+                "DURABLE.CHECKPOINT_INVALID",
+                "finalization payload is missing", run=run,
             )
         return value
 
@@ -860,15 +1174,158 @@ class DurableExecutor:
         return {
             key: value
             for key, value in checkpoint.items()
-            if key not in {"checkpointSchemaVersion", "actionIntent"}
+            if key not in {
+                "checkpointSchemaVersion", "actionIntent", "finalization"
+            }
         }
 
     @staticmethod
     def _is_action_intent(checkpoint: Mapping[str, Any]) -> bool:
         return (
-            checkpoint.get("checkpointSchemaVersion") == 2
+            checkpoint.get("checkpointSchemaVersion") in {2, 3}
             and checkpoint.get("phase") == "action_intent"
             and isinstance(checkpoint.get("actionIntent"), Mapping)
+        )
+
+    @staticmethod
+    def _finalization_kind(
+        checkpoint: Mapping[str, Any],
+    ) -> str | None:
+        value = checkpoint.get("finalization")
+        if (
+            checkpoint.get("checkpointSchemaVersion") == 3
+            and checkpoint.get("phase") == "finalizing"
+            and isinstance(value, Mapping)
+        ):
+            stage = value.get("stage")
+            return stage if stage in {"intent", "started", "result"} else None
+        return None
+
+    def _validate_finalization(
+        self, value: Any, run: RunRecord,
+    ) -> None:
+        if not isinstance(value, Mapping) or value.get("version") != 1:
+            raise self._error(
+                "DURABLE.CHECKPOINT_INVALID",
+                "finalization payload is invalid", run=run,
+            )
+        stage = value.get("stage")
+        if stage in {"intent", "started"}:
+            expected = {
+                "version", "stage", "outputSet", "output", "error"
+            }
+            if (
+                set(value) != expected
+                or not isinstance(value.get("outputSet"), bool)
+                or (not value["outputSet"] and value.get("output") is not None)
+            ):
+                raise self._error(
+                    "DURABLE.CHECKPOINT_INVALID",
+                    "finalization intent fields are invalid", run=run,
+                )
+            self._validate_error_payload(value.get("error"), run)
+            return
+        if stage == "result":
+            if set(value) != {"version", "stage", "result"}:
+                raise self._error(
+                    "DURABLE.CHECKPOINT_INVALID",
+                    "finalization result fields are invalid", run=run,
+                )
+            self._validate_result_payload(value.get("result"), run)
+            return
+        raise self._error(
+            "DURABLE.CHECKPOINT_INVALID",
+            "finalization stage is invalid", run=run,
+        )
+
+    def _validate_result_payload(
+        self, value: Any, run: RunRecord,
+    ) -> None:
+        required = {
+            "status", "output", "variables", "steps", "error"
+        }
+        if (
+            not isinstance(value, Mapping)
+            or set(value) != required
+            or value.get("status") not in {
+                RunStatus.SUCCEEDED.value, RunStatus.FAILED.value,
+                RunStatus.TIMED_OUT.value, RunStatus.CANCELLED.value,
+                RunStatus.UNKNOWN_EFFECT.value,
+            }
+            or (value.get("status") == RunStatus.SUCCEEDED.value
+                and value.get("error") is not None)
+            or (value.get("status") != RunStatus.SUCCEEDED.value
+                and value.get("error") is None)
+            or (value.get("status") != RunStatus.SUCCEEDED.value
+                and value.get("output") is not None)
+            or not isinstance(value.get("variables"), Mapping)
+            or not isinstance(value.get("steps"), Mapping)
+        ):
+            raise self._error(
+                "DURABLE.CHECKPOINT_INVALID",
+                "finalization result payload is invalid", run=run,
+            )
+        self._validate_error_payload(value.get("error"), run)
+
+    def _validate_error_payload(
+        self, value: Any, run: RunRecord,
+    ) -> None:
+        if value is None:
+            return
+        required = {
+            "schema_version", "code", "category", "message",
+            "retryable", "effect", "details", "cause", "suppressed",
+        }
+        allowed = required | {"phase", "location"}
+        if (
+            not isinstance(value, Mapping)
+            or not required.issubset(value)
+            or not set(value).issubset(allowed)
+            or value.get("schema_version") != "1"
+            or not isinstance(value.get("code"), str)
+            or not value["code"]
+            or not isinstance(value.get("category"), str)
+            or not isinstance(value.get("message"), str)
+            or not isinstance(value.get("retryable"), bool)
+            or not isinstance(value.get("effect"), str)
+            or not isinstance(value.get("details"), Mapping)
+            or not isinstance(value.get("suppressed"), list)
+        ):
+            raise self._error(
+                "DURABLE.CHECKPOINT_INVALID",
+                "finalization error payload is invalid", run=run,
+            )
+
+    def _automation_error(
+        self, value: Any, *, run: RunRecord,
+    ) -> AutomationError | None:
+        if value is None:
+            return None
+        self._validate_error_payload(value, run)
+        location = value.get("location")
+        location = location if isinstance(location, Mapping) else {}
+        return AutomationError(
+            value["code"], value["message"],
+            category=value["category"], phase=value.get("phase"),
+            retryable=value["retryable"], effect=value["effect"],
+            step_id=location.get("step_id"),
+            step_path=location.get("step_path"),
+            attempt=location.get("attempt"),
+            workflow=location.get("workflow"),
+            details=value["details"], cause=value.get("cause"),
+            suppressed=value["suppressed"],
+        )
+
+    def _finalization_result(
+        self, checkpoint: Mapping[str, Any], run: RunRecord,
+    ) -> RunResult:
+        value = checkpoint["finalization"]["result"]
+        self._validate_result_payload(value, run)
+        return RunResult(
+            value["status"], value.get("output"),
+            dict(value["variables"]),
+            self._automation_error(value.get("error"), run=run),
+            [], dict(value["steps"]),
         )
 
     def _assert_durable_plan(self, descriptor: WorkflowDescriptor) -> None:
@@ -910,6 +1367,17 @@ class DurableExecutor:
                 "durable execution rejects scripts and non-opted-in or nested actions",
                 category="durable",
                 details={"unsupportedSteps": unsupported},
+            )
+        if (
+            self.durable_action_mode == "read_only"
+            and str(self.journal.path) == ":memory:"
+            and any(step.type == "action" for step in descriptor.steps)
+        ):
+            raise AutomationError(
+                "DURABLE.UNSUPPORTED_JOURNAL",
+                "durable read-only actions require a file-backed journal "
+                "for independent lease heartbeats",
+                category="durable",
             )
         previous: str | None = None
         for step in descriptor.steps:

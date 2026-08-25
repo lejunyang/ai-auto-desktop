@@ -75,6 +75,16 @@ class SegmentResult:
 
 
 @dataclass(frozen=True, slots=True)
+class RuntimeFinalizationIntent:
+    """Terminal-ready runtime data needed to execute workflow cleanup."""
+
+    state: RuntimeSegmentState
+    output_set: bool
+    output: Any
+    error: AutomationError | None
+
+
+@dataclass(frozen=True, slots=True)
 class DurableActionBinding:
     """Immutable, canonical provider binding for one durable action."""
 
@@ -726,6 +736,84 @@ class WorkflowRunner:
                     details={"phase": self._segment_phase},
                 )
             self._segment_phase = "finalizing"
+            return self._export_segment_state()
+
+    def export_finalization_intent(
+        self, *, error: AutomationError | None = None
+    ) -> RuntimeFinalizationIntent:
+        """Capture terminal-ready state before workflow cleanup starts."""
+
+        with self._segment_lock("export_finalization_intent"):
+            if self._segment_phase not in {
+                "between_top_level_steps",
+                "finalizing",
+            }:
+                raise self._segment_state_error(
+                    "runner cannot prepare finalization from its current phase",
+                    details={"phase": self._segment_phase},
+                )
+            final_error = error if error is not None else self._segment_error
+            if (
+                final_error is None
+                and self._segment_output is MISSING
+                and self._segment_next_index < len(self.descriptor.steps)
+            ):
+                raise self._segment_state_error(
+                    "workflow still has unexecuted top-level steps"
+                )
+            output = self._segment_output
+            if output is MISSING and final_error is None:
+                try:
+                    output = self._workflow_outputs()
+                except AutomationError as caught:
+                    final_error = caught
+                except Exception as caught:
+                    final_error = ensure_automation_error(caught)
+            output_set = output is not MISSING
+            self._segment_output = output
+            self._segment_error = final_error
+            self._segment_phase = "finalizing"
+            return RuntimeFinalizationIntent(
+                self._export_segment_state(),
+                output_set,
+                None if not output_set else _clone_runtime_value(output),
+                final_error,
+            )
+
+    def restore_finalization_intent(
+        self,
+        state: RuntimeSegmentState | Mapping[str, Any],
+        *,
+        inputs: Mapping[str, Any] | None = None,
+        output_set: bool = False,
+        output: Any = None,
+        error: AutomationError | None = None,
+    ) -> RuntimeSegmentState:
+        """Restore a checkpoint proven to precede workflow cleanup."""
+
+        with self._segment_lock("restore_finalization_intent"):
+            normalized = self._normalize_segment_state(state)
+            if normalized.phase != "finalizing":
+                raise self._segment_state_error(
+                    "only a finalizing intent checkpoint can be restored",
+                    details={"phase": normalized.phase},
+                )
+            if not isinstance(output_set, bool):
+                raise self._segment_state_error(
+                    "finalization output_set must be a boolean"
+                )
+            if error is not None and not isinstance(error, AutomationError):
+                raise self._segment_state_error(
+                    "finalization error must be an AutomationError or null"
+                )
+            self._restore_segment_state(
+                normalized, inputs=inputs, allow_expired=True
+            )
+            self._segment_phase = "finalizing"
+            self._segment_output = (
+                _clone_runtime_value(output) if output_set else MISSING
+            )
+            self._segment_error = error
             return self._export_segment_state()
 
     def request_segment_cancellation(self) -> None:
@@ -3280,6 +3368,7 @@ __all__ = [
     "DurableActionBinding",
     "RUNTIME_STATE_SCHEMA_VERSION",
     "RUNTIME_VERSION",
+    "RuntimeFinalizationIntent",
     "RuntimeSegmentState",
     "SegmentResult",
     "WorkflowRunner",

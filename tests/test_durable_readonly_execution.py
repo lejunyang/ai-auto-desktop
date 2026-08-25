@@ -5,6 +5,7 @@ from __future__ import annotations
 from copy import deepcopy
 import json
 from pathlib import Path
+import threading
 import tempfile
 import unittest
 from unittest import mock
@@ -95,6 +96,22 @@ class ManifestFailurePlugin(StubPlugin):
         )
 
 
+class BlockingPlugin(StubPlugin):
+    def __init__(self) -> None:
+        super().__init__()
+        self.invoked = threading.Event()
+        self.release = threading.Event()
+
+    def invoke(
+        self, action: str, args: object, timeout: float | None = None
+    ) -> object:
+        self.calls.append(deepcopy(args))
+        self.invoked.set()
+        if not self.release.wait(5):
+            raise AssertionError("test did not release blocking provider")
+        return deepcopy(self.outcome)
+
+
 class DurableReadOnlyExecutionTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
@@ -114,6 +131,20 @@ class DurableReadOnlyExecutionTests(unittest.TestCase):
             self.executor().start(plan(sensitive_input=True), inputs={"query": RAW}, plugins={"fixture": plugin})
         self.assertEqual(rejected.exception.code, "DURABLE.SENSITIVE_DESCRIPTOR")
         self.assertEqual(self.store.list_runs(), [])
+
+    def test_read_only_action_requires_file_backed_journal(self) -> None:
+        with JournalStore(":memory:") as store:
+            with self.assertRaises(AutomationError) as rejected:
+                DurableExecutor(
+                    store, durable_action_mode="read-only"
+                ).start(
+                    plan(), inputs={"query": "public"},
+                    plugins={"fixture": StubPlugin()},
+                )
+            self.assertEqual(
+                rejected.exception.code, "DURABLE.UNSUPPORTED_JOURNAL"
+            )
+            self.assertEqual(store.list_runs(), [])
 
     def test_preflight_provider_failure_is_redacted_before_run_creation(self) -> None:
         with self.assertRaises(AutomationError) as rejected:
@@ -217,6 +248,51 @@ class DurableReadOnlyExecutionTests(unittest.TestCase):
         )
         self.assertEqual(plugin.calls, [])
 
+    def test_action_preparation_finalization_intent_resumes_as_failure(self) -> None:
+        plugin = StubPlugin()
+        workflow = plan(action_extra={"with": {"query": "${{ 1 / 0 }}"}})
+        original = self.store.append_event_with_checkpoint
+
+        def crash_after_intent(
+            run_id: str, event_type: str, payload: object,
+            checkpoint: object, **kwargs: object,
+        ) -> object:
+            saved = original(
+                run_id, event_type, payload, checkpoint, **kwargs
+            )
+            if (
+                isinstance(checkpoint, dict)
+                and isinstance(checkpoint.get("finalization"), dict)
+                and checkpoint["finalization"].get("stage") == "intent"
+            ):
+                raise RuntimeError("crash-after-preparation-intent")
+            return saved
+
+        with mock.patch.object(
+            self.store, "append_event_with_checkpoint",
+            side_effect=crash_after_intent,
+        ), self.assertRaises(AutomationError):
+            self.executor().start(
+                workflow, inputs={"query": "public"},
+                run_id="prepare-intent", plugins={"fixture": plugin},
+            )
+        self.store._connection.execute(
+            "UPDATE runs SET lease_expires_at = 0 WHERE run_id = ?",
+            ("prepare-intent",),
+        )
+
+        outcome = DurableExecutor(
+            self.store, owner_id="recovery", durable_action_mode="read-only"
+        ).resume(
+            "prepare-intent", workflow, plugins={"fixture": plugin}
+        )
+
+        self.assertEqual(outcome.run.status, RunStatus.FAILED)
+        self.assertEqual(
+            outcome.run.error["code"], "DURABLE.ACTION_PREPARATION_FAILED"
+        )
+        self.assertEqual(plugin.calls, [])
+
     def test_legacy_runner_factory_signature_still_works_in_default_mode(self) -> None:
         from ai_auto_desktop.runtime import WorkflowRunner
         simple = compile_descriptor({
@@ -247,6 +323,159 @@ class DurableReadOnlyExecutionTests(unittest.TestCase):
             candidate = Path(str(self.path) + suffix)
             if candidate.exists():
                 self.assertNotIn(RAW.encode(), candidate.read_bytes())
+
+    def test_slow_provider_keeps_lease_and_cannot_be_claimed_twice(self) -> None:
+        plugin = BlockingPlugin()
+        ttl = 0.4
+        outcome: list[object] = []
+        failure: list[BaseException] = []
+
+        def execute() -> None:
+            try:
+                with JournalStore(self.path) as store:
+                    outcome.append(DurableExecutor(
+                        store, owner_id="first", lease_ttl_seconds=ttl,
+                        durable_action_mode="read-only",
+                    ).start(
+                        plan(), inputs={"query": "public"},
+                        run_id="slow", plugins={"fixture": plugin},
+                    ))
+            except BaseException as exc:
+                failure.append(exc)
+
+        worker = threading.Thread(target=execute)
+        worker.start()
+        try:
+            self.assertTrue(plugin.invoked.wait(3))
+            time.sleep(ttl * 1.5)
+            with self.assertRaises(JournalConflictError):
+                self.store.claim_owner(
+                    "slow", owner_id="second", ttl_seconds=ttl
+                )
+        finally:
+            plugin.release.set()
+            worker.join(3)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(failure, [])
+        self.assertEqual(outcome[0].run.status, RunStatus.SUCCEEDED)
+        self.assertEqual(len(plugin.calls), 1)
+
+    def test_heartbeat_failure_is_visible_without_masking_provider_result(self) -> None:
+        plugin = StubPlugin()
+        failure = RuntimeError("SECRET-HEARTBEAT-FAILURE")
+        keeper = mock.Mock()
+        keeper.stop.return_value = failure
+
+        with mock.patch(
+            "ai_auto_desktop.durable._LeaseHeartbeatKeeper",
+            return_value=keeper,
+        ):
+            outcome = self.executor().start(
+                plan(), inputs={"query": "public"},
+                run_id="heartbeat-degraded", plugins={"fixture": plugin},
+            )
+
+        self.assertEqual(outcome.run.status, RunStatus.SUCCEEDED)
+        self.assertEqual(outcome.run.output, {"title": "ok"})
+        self.assertEqual(len(plugin.calls), 1)
+        events = self.store.list_events("heartbeat-degraded")
+        self.assertEqual(
+            sum(
+                event.event_type == "run.lease_heartbeat_failed"
+                for event in events
+            ),
+            1,
+        )
+        self.assertNotIn(
+            str(failure),
+            json.dumps([event.to_dict() for event in events]),
+        )
+
+    def test_heartbeat_loss_fences_old_owner_after_provider_returns(self) -> None:
+        plugin = BlockingPlugin()
+        ttl = 0.3
+        failures: list[BaseException] = []
+        keeper = mock.Mock()
+        keeper.stop.return_value = RuntimeError("SECRET-KEEPER-FAILURE")
+
+        def execute() -> None:
+            try:
+                with JournalStore(self.path) as store, mock.patch(
+                    "ai_auto_desktop.durable._LeaseHeartbeatKeeper",
+                    return_value=keeper,
+                ):
+                    DurableExecutor(
+                        store, owner_id="old-owner",
+                        lease_ttl_seconds=ttl,
+                        durable_action_mode="read-only",
+                    ).start(
+                        plan(), inputs={"query": "public"},
+                        run_id="fenced", plugins={"fixture": plugin},
+                    )
+            except BaseException as exc:
+                failures.append(exc)
+
+        worker = threading.Thread(target=execute)
+        worker.start()
+        try:
+            self.assertTrue(plugin.invoked.wait(3))
+            time.sleep(ttl * 1.5)
+            replacement = self.store.claim_owner(
+                "fenced", owner_id="new-owner", ttl_seconds=2
+            )
+        finally:
+            plugin.release.set()
+            worker.join(3)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(len(failures), 1)
+        self.assertIsInstance(failures[0], AutomationError)
+        self.assertEqual(
+            failures[0].code, "DURABLE.LEASE_HEARTBEAT_FAILED"
+        )
+        self.assertEqual(failures[0].details["providerCompleted"], True)
+        self.assertNotIn(
+            str(keeper.stop.return_value),
+            json.dumps(failures[0].to_dict()),
+        )
+        current = self.store.get_run("fenced")
+        self.assertEqual(current.owner_id, replacement.owner_id)
+        self.assertEqual(current.status, RunStatus.RUNNING)
+        self.assertEqual(current.checkpoint["phase"], "action_intent")
+        self.assertEqual(len(plugin.calls), 1)
+
+    def test_heartbeat_start_failure_prevents_provider_dispatch(self) -> None:
+        plugin = StubPlugin()
+        keeper = mock.Mock()
+        keeper.start.side_effect = RuntimeError("SECRET-START-FAILURE")
+
+        with mock.patch(
+            "ai_auto_desktop.durable._LeaseHeartbeatKeeper",
+            return_value=keeper,
+        ), self.assertRaises(AutomationError) as rejected:
+            self.executor().start(
+                plan(), inputs={"query": "public"},
+                run_id="heartbeat-start-failed",
+                plugins={"fixture": plugin},
+            )
+
+        self.assertEqual(
+            rejected.exception.code, "DURABLE.LEASE_HEARTBEAT_FAILED"
+        )
+        self.assertEqual(
+            rejected.exception.details,
+            {
+                "runId": "heartbeat-start-failed",
+                "stage": "before_dispatch",
+                "providerCompleted": False,
+            },
+        )
+        self.assertNotIn(
+            str(keeper.start.side_effect),
+            json.dumps(rejected.exception.to_dict()),
+        )
+        self.assertEqual(plugin.calls, [])
 
     def test_declared_error_is_redacted_before_persistence(self) -> None:
         plugin = StubPlugin(PluginError("FIXTURE.FAIL", RAW, details={"secret": RAW}))
