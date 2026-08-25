@@ -507,7 +507,7 @@ class MacOSTestkitSourceContracts(unittest.TestCase):
                 self.assertTrue(member_path.is_file())
                 self.assertFalse(member_path.is_symlink())
         manifest_text = SOURCE_PACKAGE_MANIFEST.read_text(encoding="utf-8")
-        self.assertIn("# type_text sources:", manifest_text)
+        self.assertIn("# type_text/pointer_click sources:", manifest_text)
         self.assertIn("# FixtureApp.swift AXTestRunner.swift", manifest_text)
 
     def test_source_package_is_reproducible_and_manifest_covers_members(
