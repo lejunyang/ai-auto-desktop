@@ -4,7 +4,7 @@ build.sh
 archive.sh
 identity.sh
 source-provenance.sh
-# type_text sources: both files below are required for the secure fixture and runner.
+# type_text/pointer_click sources: both files below are required for the secure fixture and runner.
 # FixtureApp.swift AXTestRunner.swift
 FixtureApp.swift
 AXTestRunner.swift
