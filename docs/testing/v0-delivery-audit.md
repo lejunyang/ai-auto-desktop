@@ -78,12 +78,17 @@
 | `4e6df46` | macOS pointer 真机回传与严格验真 |
 | `a2933c4` | 同步三端显式 pointer 边界与脚本实机沙箱证据 |
 | `90aefc7` | 修正 macOS protected pointer helper 拒绝位置 |
+| `fe12424` | 明确 macOS pointer 真机包的源码白名单归属 |
+| `6f6dad6` | 记录三端显式 pointer 的最终资格边界 |
+| `90c5c68` | 扩大自有 Qt5 fixture 的有界快照余量，消除主题/辅助功能配置导致的偶发截断 |
 
-每个提交均包含且仅包含一条 `Co-authored-by: TRAE CLI <noreply@bytedance.com>` trailer。后续文档修订的 commit ID 以 `git log` 为准。
+本表所列提交均包含且仅包含一条
+`Co-authored-by: TRAE CLI <noreply@bytedance.com>` trailer。后续文档修订的 commit ID
+以 `git log` 为准；这项陈述不追溯覆盖仓库早期未列入本表的历史提交。
 
 ## 4. 验证记录
 
-- `a2933c4` 阶段的全量 Python 回归：`PYTHONPATH=src PYTHONDONTWRITEBYTECODE=1 python -m unittest discover -s tests -q`，共 534 项，通过，跳过 11 项非当前平台/会话用例；最终 revision 的结果在本节后续实跑后更新。
+- 实现冻结 revision `90c5c68` 的全量 Python 回归：`PYTHONPATH=src PYTHONDONTWRITEBYTECODE=1 python -m unittest discover -s tests -q`，共 534 项，通过，跳过 11 项非当前平台/会话用例，耗时 109.069 秒。该 revision 已包含三端 pointer、严格 Mac 回传证据、最终文档同步，以及 Qt5 fixture 的有界快照稳定性修复。
 - durable 定向回归：read-only、finalization、journal 与 run service 共 93 项通过；独立复审未发现 P0/P1。heartbeat 启动握手失败后线程停止、lease 不再续期且到期可接管；`0.001/0.005/0.01/0.02/0.05s` 极短 TTL 均稳定返回可重试 `RUN.LEASE_LOST`，不会误报状态冲突/存储故障，也没有 provider 重复派发或 token 落盘。
 - Linux 本机：Debian 12、KDE Plasma 5.27.5、Qt 5.15.8、X11 `DISPLAY=:10.0`。
 - Linux 自有 fixture：GTK3 和 Qt5 的 snapshot/find/focus/语义写动作通过；显式 XTest UTF-8 输入后由 fresh AT-SPI snapshot 观察通过。
@@ -95,13 +100,14 @@
 - `python -m compileall -q src plugins tests`、`git diff --check` 和 XTest helper 本机构建通过。
 - Linux 显式 pointer：私有 Xvfb + 隔离 AT-SPI bus 上，自有 GTK3 和 Qt5 fixture 均通过语义节点中心点 XTEST 左键点击，并由 fresh AT-SPI snapshot 观察独立状态变化；driver 还要求 AT-SPI element-at-point 命中目标子树，X11 helper 再核对焦点与点下窗口 PID。
 - OCR 实机：本机安装 Tesseract 5.3.0 与 `eng`/`chi_sim`，真实生成中英图片后，provider 识别 `状态 READY 2026`，workflow 对字面目标 `READY` 返回 `decision=respond`。共享 UID 下固定 `RLIMIT_NPROC` 导致的误杀已改为 OpenMP 单线程约束，同时保留地址空间、CPU、文件大小、fd、deadline、输出与进程组边界。
+- 最终独立只读审查未发现 P0/P1。审查指出自有 Qt5 fixture 在部分主机上可能因主题或输入法暴露额外 AT-SPI 子节点而触发 64 节点截断；`90c5c68` 将该测试专用上限提高到仍远低于 driver 5000 节点硬上限的 256，并重新实跑 GTK3/Qt5 隔离测试和全量回归。
 
 ## 5. 外部门禁与未完成资格
 
 当前代码纵向切片可交付，但不能宣称三端产品级资格已完成：
 
 - Windows：等待用户允许后手动触发 `workflow_dispatch(run_windows_native=true)`，还需记录 runner、系统版本、commit SHA、fixture 结果和 UIPI/secure desktop 边界。
-- macOS：等待真实 Mac 回传 `macos-ax-test-result.tar.gz`；必须通过仓库验真器，并仅在 `archive_valid=true`、`report_passed=true`、`trusted_archive=true`、`qualified=true` 时记为通过。预期归档 SHA-256 必须来自独立可信渠道。
+- macOS：等待真实 Mac 回传 `macos-ax-test-result.tar.gz`；必须通过仓库验真器，并仅在 `archive_valid=true`、`report_passed=true`、`trusted_archive=true`、`source_trusted=true`、`qualified=true` 时记为通过。预期结果归档 SHA-256 必须来自与回传归档独立的可信渠道。
 - Linux：自有 GTK3/Qt5 语义动作、XTest 文本输入与显式中心点左键 pointer click 已通过；Dolphin、Konsole、System Settings 和自有 Qt Quick/QML fixture 已完成初始窗口只读矩阵。真实应用写动作、第三方 QML 页面、多窗口和动态页面仍待独立资格验证。
 
 ## 6. 下一阶段
