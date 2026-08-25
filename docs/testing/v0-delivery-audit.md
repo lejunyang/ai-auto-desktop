@@ -83,6 +83,8 @@
 | `90c5c68` | 扩大自有 Qt5 fixture 的有界快照余量，消除主题/辅助功能配置导致的偶发截断 |
 | `235945a` | 增加隔离 KCalc 真实语义计算闭环并修正文档事实 |
 | `ced4dee` | 加固 KCalc 私有 Xvfb、进程身份和超时清理证明 |
+| `2be1adb` | 为 AT-SPI pointer hit-test 增加 bounds、循环与跳数边界 |
+| `ef5fb64` | 验证真实 KCalc 的显式 pointer 计算闭环 |
 
 本表所列提交均包含且仅包含一条
 `Co-authored-by: TRAE CLI <noreply@bytedance.com>` trailer。后续文档修订的 commit ID
@@ -108,6 +110,9 @@
   会话用例，耗时 125.198 秒；独立只读审查未发现 P0/P1/P2。Linux driver、native、
   qualification 与 verifier 定向回归共 75 项通过，跳过 6 项；Mac testkit、结果验真、
   workflow 示例和 OCR 定向回归共 88 项通过。
+- KCalc pointer revision `ef5fb64` 的全量 Python 回归共 544 项通过，跳过 12 项，耗时
+  134.969 秒；Linux driver 与 native 定向回归共 61 项通过，跳过 6 项。真实 KCalc
+  pointer `1+2=3` 在相同隔离环境连续运行三次均通过。独立只读审查未发现 P0/P1/P2。
 
 ## 5. 外部门禁与未完成资格
 
