@@ -1446,6 +1446,17 @@ class NativeIsolatedX11ActionTests(unittest.TestCase):
                     isinstance(action["click_point"][axis], int)
                     for axis in ("x", "y")
                 )
+                and action["preflight_evidence"] == {
+                    "fresh_target_resolved": True,
+                    "native_identity_matched": True,
+                    "semantic_fingerprint_matched": True,
+                    "positive_area_bounds": True,
+                    "center_derived_from_bounds": True,
+                    "atspi_hit_within_target_subtree": True,
+                    "target_process_id": report["application_process_id"],
+                    "x11_focus_owner_matched": True,
+                    "x11_point_window_process_matched": True,
+                }
                 for action in report["actions"]
             )
         )

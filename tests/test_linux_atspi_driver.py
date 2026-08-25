@@ -500,6 +500,20 @@ class LinuxAtspiDriverCoreTests(unittest.TestCase):
                         result["backend_result"]["click_point"], {"x": 70, "y": 35}
                     )
                     self.assertTrue(result["backend_result"]["synthetic_input"])
+                    self.assertEqual(
+                        result["backend_result"]["preflight_evidence"],
+                        {
+                            "fresh_target_resolved": True,
+                            "native_identity_matched": True,
+                            "semantic_fingerprint_matched": True,
+                            "positive_area_bounds": True,
+                            "center_derived_from_bounds": True,
+                            "atspi_hit_within_target_subtree": True,
+                            "target_process_id": 7,
+                            "x11_focus_owner_matched": True,
+                            "x11_point_window_process_matched": True,
+                        },
+                    )
 
     def test_type_text_preflights_and_never_implicitly_falls_back(self) -> None:
         helper = FakeXTestHelper()
@@ -974,6 +988,11 @@ class LinuxAtspiDriverCoreTests(unittest.TestCase):
         )
         self.assertTrue(result["ok"])
         self.assertEqual(helper.calls[-1], ("pointer_click", 7, 70, 35))
+        self.assertTrue(
+            result["backend_result"]["preflight_evidence"][
+                "atspi_hit_within_target_subtree"
+            ]
+        )
 
     def test_type_text_stale_or_protected_target_never_reaches_helper(self) -> None:
         replacement = default_tree()

@@ -1946,6 +1946,17 @@ class LinuxAtspiDriver:
                     "button": pointer_button,
                     "position": pointer_position,
                     "click_point": {"x": click_point[0], "y": click_point[1]},
+                    "preflight_evidence": {
+                        "fresh_target_resolved": True,
+                        "native_identity_matched": True,
+                        "semantic_fingerprint_matched": True,
+                        "positive_area_bounds": True,
+                        "center_derived_from_bounds": True,
+                        "atspi_hit_within_target_subtree": True,
+                        "target_process_id": expected_process_id,
+                        "x11_focus_owner_matched": True,
+                        "x11_point_window_process_matched": True,
+                    },
                 }
             elif action == "toggle":
                 backend_result = self.backend.toggle(native, deadline=deadline)

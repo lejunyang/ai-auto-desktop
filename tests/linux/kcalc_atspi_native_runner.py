@@ -416,6 +416,19 @@ def main() -> int:
                     raise RuntimeError(f"button {name!r} did not use the left button")
                 if backend.get("click_point") != input_result.get("click_point"):
                     raise RuntimeError(f"button {name!r} click point evidence disagrees")
+                expected_preflight = {
+                    "fresh_target_resolved": True,
+                    "native_identity_matched": True,
+                    "semantic_fingerprint_matched": True,
+                    "positive_area_bounds": True,
+                    "center_derived_from_bounds": True,
+                    "atspi_hit_within_target_subtree": True,
+                    "target_process_id": application_process.pid,
+                    "x11_focus_owner_matched": True,
+                    "x11_point_window_process_matched": True,
+                }
+                if backend.get("preflight_evidence") != expected_preflight:
+                    raise RuntimeError(f"button {name!r} preflight evidence is incomplete")
                 action_evidence = {
                     "native_interface": backend["native_interface"],
                     "synthetic_input": backend.get("synthetic_input"),
@@ -423,6 +436,7 @@ def main() -> int:
                     "button_kind": backend["button"],
                     "click_point": input_result.get("click_point"),
                     "focus": backend.get("focus"),
+                    "preflight_evidence": backend["preflight_evidence"],
                 }
             return {
                 "button": name,
