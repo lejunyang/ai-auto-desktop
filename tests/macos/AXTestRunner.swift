@@ -10,6 +10,8 @@ private let runnerBundleID = "dev.ai-auto-desktop.testkit.ax-runner"
 private let testValue = "AX updated value"
 private let typeTextValue = "ASCII 中文 😀"
 private let expectedStatus = "Status: pressed: \(typeTextValue)"
+private let expectedInitialPointerStatus = "Pointer status: idle"
+private let expectedPointerStatus = "Pointer status: clicked"
 private let maximumUnicodeUnitsPerEvent = 20
 private let axMessageTimeout: Float = 1.0
 private var reportIdentityStability = "unknown"
@@ -149,6 +151,44 @@ private struct TypeTextDispatch {
     let utf16UnitsPosted: Int
 }
 
+private struct PointerClickDispatch {
+    let submitted: Bool
+    let frontmostAtDispatch: Bool
+}
+
+private func postLeftClick(at point: CGPoint, to pid: pid_t) -> PointerClickDispatch {
+    guard let move = CGEvent(
+        mouseEventSource: nil, mouseType: .mouseMoved,
+        mouseCursorPosition: point, mouseButton: .left
+    ), let down = CGEvent(
+        mouseEventSource: nil, mouseType: .leftMouseDown,
+        mouseCursorPosition: point, mouseButton: .left
+    ), let up = CGEvent(
+        mouseEventSource: nil, mouseType: .leftMouseUp,
+        mouseCursorPosition: point, mouseButton: .left
+    ) else {
+        return PointerClickDispatch(
+            submitted: false, frontmostAtDispatch: false
+        )
+    }
+    move.setIntegerValueField(.mouseEventClickState, value: 1)
+    down.setIntegerValueField(.mouseEventClickState, value: 1)
+    up.setIntegerValueField(.mouseEventClickState, value: 1)
+    let frontmostAtDispatch =
+        NSWorkspace.shared.frontmostApplication?.processIdentifier == pid
+    guard frontmostAtDispatch else {
+        return PointerClickDispatch(
+            submitted: false, frontmostAtDispatch: false
+        )
+    }
+    move.postToPid(pid)
+    down.postToPid(pid)
+    up.postToPid(pid)
+    return PointerClickDispatch(
+        submitted: true, frontmostAtDispatch: true
+    )
+}
+
 private func typeTextTargetIsEligible(_ node: Node) -> Bool {
     let protected = node.role == "AXSecureTextField" || node.subrole == "AXSecureTextField"
     return !protected && ["AXTextField", "AXTextArea", "AXComboBox"].contains(node.role ?? "")
@@ -206,6 +246,53 @@ private func attribute<T>(
         return nil
     }
     return raw as? T
+}
+
+private func elementBounds(
+    _ element: AXUIElement, errors: inout [Int]
+) -> CGRect? {
+    let timeoutError = AXUIElementSetMessagingTimeout(element, axMessageTimeout)
+    guard timeoutError == .success else {
+        errors.append(Int(timeoutError.rawValue))
+        return nil
+    }
+    var rawPosition: CFTypeRef?
+    let positionError = AXUIElementCopyAttributeValue(
+        element, kAXPositionAttribute as CFString, &rawPosition
+    )
+    guard positionError == .success, let positionReference = rawPosition,
+          CFGetTypeID(positionReference) == AXValueGetTypeID() else {
+        errors.append(Int(positionError == .success
+            ? AXError.illegalArgument.rawValue : positionError.rawValue))
+        return nil
+    }
+    var rawSize: CFTypeRef?
+    let sizeError = AXUIElementCopyAttributeValue(
+        element, kAXSizeAttribute as CFString, &rawSize
+    )
+    guard sizeError == .success, let sizeReference = rawSize,
+          CFGetTypeID(sizeReference) == AXValueGetTypeID() else {
+        errors.append(Int(sizeError == .success
+            ? AXError.illegalArgument.rawValue : sizeError.rawValue))
+        return nil
+    }
+    let positionValue = unsafeBitCast(positionReference, to: AXValue.self)
+    let sizeValue = unsafeBitCast(sizeReference, to: AXValue.self)
+    guard AXValueGetType(positionValue) == .cgPoint,
+          AXValueGetType(sizeValue) == .cgSize else {
+        errors.append(Int(AXError.illegalArgument.rawValue))
+        return nil
+    }
+    var position = CGPoint.zero
+    var size = CGSize.zero
+    guard AXValueGetValue(positionValue, .cgPoint, &position),
+          AXValueGetValue(sizeValue, .cgSize, &size),
+          position.x.isFinite, position.y.isFinite,
+          size.width.isFinite, size.height.isFinite else {
+        errors.append(Int(AXError.illegalArgument.rawValue))
+        return nil
+    }
+    return CGRect(origin: position, size: size)
 }
 
 private func boundedChildren(
@@ -693,7 +780,9 @@ private func run(arguments parsedArguments: Arguments? = nil) -> Outcome {
         if findOne(candidate, identifier: "fixture-input") != nil,
            findOne(candidate, identifier: "fixture-secure-input") != nil,
            findOne(candidate, identifier: "fixture-apply") != nil,
-           findOne(candidate, identifier: "fixture-status") != nil {
+           findOne(candidate, identifier: "fixture-status") != nil,
+           findOne(candidate, identifier: "fixture-pointer") != nil,
+           findOne(candidate, identifier: "fixture-pointer-status") != nil {
             initial = candidate
             break
         }
@@ -705,8 +794,12 @@ private func run(arguments parsedArguments: Arguments? = nil) -> Outcome {
           let initialInput = findOne(initial, identifier: "fixture-input"),
           let initialSecureInput = findOne(initial, identifier: "fixture-secure-input"),
           let initialButton = findOne(initial, identifier: "fixture-apply"),
-          let initialStatus = findOne(initial, identifier: "fixture-status") else {
-        checks.append(["id": "bounded_discovery", "status": "fail", "message": "未在时限内唯一定位四个 fixture 控件"])
+          let initialStatus = findOne(initial, identifier: "fixture-status"),
+          let initialPointerButton = findOne(initial, identifier: "fixture-pointer"),
+          let initialPointerStatus = findOne(
+              initial, identifier: "fixture-pointer-status"
+          ) else {
+        checks.append(["id": "bounded_discovery", "status": "fail", "message": "未在时限内唯一定位六个 fixture 控件"])
         return Outcome(
             report: makeReport(
                 status: "failed",
@@ -744,7 +837,9 @@ private func run(arguments parsedArguments: Arguments? = nil) -> Outcome {
           initialInput.role == kAXTextFieldRole as String,
           secureRoleAccepted,
           initialButton.role == kAXButtonRole as String,
-          initialStatus.role == kAXStaticTextRole as String else {
+          initialStatus.role == kAXStaticTextRole as String,
+          initialPointerButton.role == kAXButtonRole as String,
+          initialPointerStatus.role == kAXStaticTextRole as String else {
         checks.append([
             "id": "roles_and_ax_errors",
             "status": "fail",
@@ -1039,17 +1134,141 @@ private func run(arguments parsedArguments: Arguments? = nil) -> Outcome {
             "postcondition_ax_errors": lastPostconditionErrors,
         ],
     ])
+    guard pressVerified else {
+        return Outcome(
+            report: makeReport(
+                status: "failed", message: "press verification failed",
+                promptRequested: args.promptAccessibility, accessibilityTrusted: true,
+                screenCaptureGranted: screenCaptureGranted, checks: checks
+            ),
+            exitCode: 1
+        )
+    }
+
+    // pointer_click uses only a freshly resolved element in the owned fixture.
+    // Its center is derived from AX bounds; there are no screen pixels, image recognition, or
+    // caller-provided/raw desktop coordinates in this path.
+    let beforePointer = freshSnapshot()
+    guard !beforePointer.truncated, beforePointer.axErrors.isEmpty,
+          let pointerButton = findOne(
+              beforePointer, identifier: "fixture-pointer"
+          ), pointerButton.role == kAXButtonRole as String,
+          let pointerStatusBefore = findOne(
+              beforePointer, identifier: "fixture-pointer-status"
+          ), pointerStatusBefore.role == kAXStaticTextRole as String else {
+        checks.append([
+            "id": "pointer_click_and_reread", "status": "fail",
+            "message": "pointer target fresh AX 唯一定位失败",
+            "evidence": [
+                "event_submitted": false,
+                "fresh_target": false,
+                "postcondition_reread": false,
+            ],
+        ])
+        return Outcome(report: makeReport(
+            status: "failed", message: "pointer target re-resolve failed",
+            promptRequested: args.promptAccessibility, accessibilityTrusted: true,
+            screenCaptureGranted: screenCaptureGranted, checks: checks
+        ), exitCode: 1)
+    }
+    var pointerBoundsErrors: [Int] = []
+    let pointerBounds = elementBounds(
+        pointerButton.element, errors: &pointerBoundsErrors
+    )
+    let positiveAreaBounds = pointerBounds.map {
+        $0.width > 0 && $0.height > 0
+    } ?? false
+    var pointerTargetPID = pid_t(0)
+    let pointerPIDError = AXUIElementGetPid(
+        pointerButton.element, &pointerTargetPID
+    )
+    let targetPIDMatches = pointerPIDError == .success
+        && pointerTargetPID == fixturePID
+    let frontmostBeforeDispatch =
+        NSWorkspace.shared.frontmostApplication?.processIdentifier == fixturePID
+    let pointerStatusIdleBeforeDispatch =
+        pointerStatusBefore.value == expectedInitialPointerStatus
+    var pointerHitTestMatchesTarget = false
+    var pointerHitTestErrorCode = -1
+    var pointerDispatch = PointerClickDispatch(
+        submitted: false, frontmostAtDispatch: false
+    )
+    var pointerCenterFinite = false
+    if let bounds = pointerBounds, positiveAreaBounds, targetPIDMatches,
+       frontmostBeforeDispatch, pointerStatusIdleBeforeDispatch {
+        let center = CGPoint(x: bounds.midX, y: bounds.midY)
+        pointerCenterFinite = center.x.isFinite && center.y.isFinite
+        var hitElement: AXUIElement?
+        let pointerHitTestError = AXUIElementCopyElementAtPosition(
+            appElement, Float(center.x), Float(center.y), &hitElement
+        )
+        pointerHitTestErrorCode = Int(pointerHitTestError.rawValue)
+        pointerHitTestMatchesTarget = pointerHitTestError == .success
+            && hitElement.map { CFEqual($0, pointerButton.element) } == true
+        if pointerCenterFinite && pointerHitTestMatchesTarget {
+            pointerDispatch = postLeftClick(
+                at: center, to: pointerTargetPID
+            )
+        }
+    }
+
+    var observedPointerStatus: String?
+    var pointerPostconditionErrors: [Int] = []
+    var pointerPostconditionFresh = false
+    if pointerDispatch.submitted {
+        let pointerDeadline = Date().addingTimeInterval(3)
+        while Date() < pointerDeadline {
+            let afterPointer = freshSnapshot()
+            pointerPostconditionErrors = afterPointer.axErrors
+            pointerPostconditionFresh = !afterPointer.truncated
+                && afterPointer.axErrors.isEmpty
+            observedPointerStatus = pointerPostconditionFresh
+                ? findOne(
+                    afterPointer, identifier: "fixture-pointer-status"
+                )?.value : nil
+            if observedPointerStatus == expectedPointerStatus { break }
+            Thread.sleep(forTimeInterval: 0.05)
+        }
+    }
+    let pointerVerified = pointerDispatch.submitted
+        && pointerPostconditionFresh
+        && observedPointerStatus == expectedPointerStatus
+    checks.append([
+        "id": "pointer_click_and_reread",
+        "status": pointerVerified ? "pass" : "fail",
+        "message": "从 fresh AX 唯一目标的正面积 bounds 计算中心点，向 fixture PID 提交 CGEvent 左键点击并重新读取状态",
+        "evidence": [
+            "fresh_target": true,
+            "positive_area_bounds": positiveAreaBounds,
+            "bounds_ax_errors": pointerBoundsErrors,
+            "target_pid_matches_fixture": targetPIDMatches,
+            "pid_ax_error": pointerPIDError.rawValue,
+            "frontmost_before_dispatch": frontmostBeforeDispatch,
+            "frontmost_at_dispatch": pointerDispatch.frontmostAtDispatch,
+            "status_idle_before_dispatch": pointerStatusIdleBeforeDispatch,
+            "center_derived_from_ax_bounds": true,
+            "center_finite": pointerCenterFinite,
+            "hit_test_matches_target": pointerHitTestMatchesTarget,
+            "hit_test_ax_error": pointerHitTestErrorCode,
+            "event_submitted": pointerDispatch.submitted,
+            "button": "left",
+            "position": "center",
+            "postcondition_reread": pointerPostconditionFresh,
+            "status_matches_from_fresh_snapshot": observedPointerStatus == expectedPointerStatus,
+            "postcondition_ax_errors": pointerPostconditionErrors,
+        ],
+    ])
 
     return Outcome(
         report: makeReport(
-            status: pressVerified ? "passed" : "failed",
-            message: pressVerified ? "macOS AX fixture 测试通过" : "press verification failed",
+            status: pointerVerified ? "passed" : "failed",
+            message: pointerVerified ? "macOS AX fixture 测试通过" : "pointer click verification failed",
             promptRequested: args.promptAccessibility,
             accessibilityTrusted: true,
             screenCaptureGranted: screenCaptureGranted,
             checks: checks
         ),
-        exitCode: pressVerified ? 0 : 1
+        exitCode: pointerVerified ? 0 : 1
     )
 }
 

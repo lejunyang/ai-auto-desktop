@@ -201,6 +201,7 @@ class MacOSTestkitSourceContracts(unittest.TestCase):
             "focus target re-resolve failed",
             "value target re-resolve failed",
             "press target re-resolve failed",
+            "pointer target re-resolve failed",
             "let afterFocus = freshSnapshot()",
             "let afterValue = freshSnapshot()",
             'let current = freshSnapshot()',
@@ -208,6 +209,91 @@ class MacOSTestkitSourceContracts(unittest.TestCase):
         ):
             with self.subTest(marker=marker):
                 self.assertIn(marker, self.runner)
+
+    def test_pointer_click_uses_fresh_fixture_ax_bounds_pid_and_reread(self) -> None:
+        for marker in (
+            'setAccessibilityIdentifier("fixture-pointer")',
+            'setAccessibilityIdentifier("fixture-pointer-status")',
+            '@objc private func recordPointerClick()',
+            'private let expectedPointerStatus = "Pointer status: clicked"',
+            'identifier: "fixture-pointer"',
+            'identifier: "fixture-pointer-status"',
+            'let beforePointer = freshSnapshot()',
+            'let pointerBounds = elementBounds(',
+            '$0.width > 0 && $0.height > 0',
+            'AXUIElementGetPid(',
+            'pointerTargetPID == fixturePID',
+            'NSWorkspace.shared.frontmostApplication?.processIdentifier == fixturePID',
+            'let center = CGPoint(x: bounds.midX, y: bounds.midY)',
+            'AXUIElementCopyElementAtPosition(',
+            'CFEqual($0, pointerButton.element)',
+            'pointerDispatch = postLeftClick(',
+            'at: center, to: pointerTargetPID',
+            'let afterPointer = freshSnapshot()',
+            '"id": "pointer_click_and_reread"',
+            '"status_matches_from_fresh_snapshot"',
+        ):
+            with self.subTest(marker=marker):
+                self.assertIn(marker, self.native_sources)
+
+        pointer_block = self.runner[
+            self.runner.index("let beforePointer = freshSnapshot()") :
+            self.runner.index("private func emit(")
+        ]
+        for preflight in (
+            'findOne(\n              beforePointer, identifier: "fixture-pointer"',
+            "let pointerBounds = elementBounds(",
+            "pointerTargetPID == fixturePID",
+            "let center = CGPoint(x: bounds.midX, y: bounds.midY)",
+            "pointerHitTestMatchesTarget = pointerHitTestError == .success",
+            "pointerStatusIdleBeforeDispatch",
+        ):
+            with self.subTest(preflight=preflight):
+                self.assertLess(
+                    pointer_block.index(preflight),
+                    pointer_block.index("pointerDispatch = postLeftClick("),
+                )
+        self.assertLess(
+            self.runner.index("pointerDispatch = postLeftClick("),
+            self.runner.index("let afterPointer = freshSnapshot()"),
+        )
+
+    def test_pointer_click_posts_only_pid_scoped_left_click_events(self) -> None:
+        pointer_dispatch = self.runner[
+            self.runner.index("private func postLeftClick") :
+            self.runner.index("private func typeTextTargetIsEligible")
+        ]
+        for marker in (
+            "mouseType: .mouseMoved",
+            "mouseType: .leftMouseDown",
+            "mouseType: .leftMouseUp",
+            "move.postToPid(pid)",
+            "down.postToPid(pid)",
+            "up.postToPid(pid)",
+            "frontmostAtDispatch",
+            "NSWorkspace.shared.frontmostApplication?.processIdentifier == pid",
+        ):
+            with self.subTest(marker=marker):
+                self.assertIn(marker, pointer_dispatch)
+        self.assertNotIn("CGEventPost(", pointer_dispatch)
+        self.assertNotIn(".post(tap:", pointer_dispatch)
+        self.assertNotIn("CGWarpMouseCursorPosition", pointer_dispatch)
+        self.assertNotIn("CGEventSource", pointer_dispatch)
+
+    def test_pointer_click_never_uses_screen_capture_ocr_or_raw_coordinates(self) -> None:
+        for marker in (
+            "screenshot", "Screenshot", "VNRecognizeTextRequest",
+            "import Vision",
+            "CGWindowListCreateImage", "CGDisplayCreateImage",
+            "CGWarpMouseCursorPosition",
+        ):
+            with self.subTest(marker=marker):
+                self.assertNotIn(marker, self.native_sources)
+        self.assertNotRegex(
+            self.runner,
+            r"CGPoint\s*\(\s*x:\s*-?\d+(?:\.\d+)?\s*,"
+            r"\s*y:\s*-?\d+(?:\.\d+)?\s*\)",
+        )
 
     def test_type_text_covers_unicode_fresh_snapshots_and_secure_rejection(self) -> None:
         for marker in (
@@ -265,14 +351,14 @@ class MacOSTestkitSourceContracts(unittest.TestCase):
             type_text_block.index("value_matches_from_fresh_snapshot"),
         )
 
-    def test_type_text_stays_fixture_scoped_without_screen_or_pointer_input(self) -> None:
+    def test_event_input_stays_fixture_pid_scoped_without_global_post(self) -> None:
         self.assertNotIn("CGEventPost(", self.native_sources)
         self.assertNotIn(".post(tap:", self.native_sources)
-        for marker in ("CGEvent(mouseEventSource:", "CGWarpMouseCursorPosition"):
-            with self.subTest(marker=marker):
-                self.assertNotIn(marker, self.native_sources)
+        self.assertNotIn("CGWarpMouseCursorPosition", self.native_sources)
         self.assertIn("NSWorkspace.shared.frontmostApplication", self.runner)
         self.assertIn("postUnicodeText(segment, to: fixturePID)", self.runner)
+        self.assertIn("postLeftClick(", self.runner)
+        self.assertIn("at: center, to: pointerTargetPID", self.runner)
         self.assertIn("import Carbon.HIToolbox", self.runner)
         self.assertIn("-framework Carbon", self.build)
 

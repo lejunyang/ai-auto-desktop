@@ -13,6 +13,13 @@ ASCII、中文和非 BMP emoji；每段输入前重新解析 AX 目标并确认 
 snapshot 验证累计值。每段还在首事件前记录 `IsSecureEventInputEnabled()`，启用时 fail closed。
 `NSSecureTextField` 负向 case 在任何事件发布前拒绝 secure text；报告只声明事件已提交，不把
 void `postToPid` 当成接收确认。
+显式 `pointer_click` 使用 fixture 中独立的按钮和状态文本。runner 在动作前从自有 fixture PID
+的 fresh AX snapshot 按 identifier 唯一定位按钮，要求 `AXPosition`/`AXSize` 可读且 bounds 面积
+为正，只由 bounds 计算中心点，并校验 element PID 与 fixture PID、事件创建前和实际提交前确认 fixture
+frontmost；中心点 AX hit test 还必须解析回同一按钮，且独立状态必须仍为 idle。随后它向
+fixture PID 定向提交 `.mouseMoved`、`.leftMouseDown`、`.leftMouseUp`
+CGEvent，动作后从 fresh AX snapshot 读取状态作为唯一成功判据。该路径不接受裸坐标，不截图、
+不做 OCR，也不使用全局 event tap。
 每个被访问的 AX element 还会设置消息超时，避免
 目标进程无响应时无限等待。
 runner 由 LaunchServices 以固定 `.app` 身份启动，并将报告原子写入结果目录；外层脚本
@@ -49,10 +56,15 @@ runner 由 LaunchServices 以固定 `.app` 身份启动，并将报告原子写�
 
 这是一条真机 fixture 验证链路，不等同于对任意第三方应用、锁屏、安全输入、跨用户会话
 或完整 macOS 平台兼容性的资格声明。Linux 机器只能对 shell 和源码结构进行静态检查。
-真机 kit 已实现 `desktop.macos_ax.type_text@1` 对应的 Unicode 和 secure text case；在真实 Mac
-生成 `passed` 报告前，仍不能把它写成已经通过资格验证。该验证只需 Accessibility，不请求
-Screen Recording，不加入 pointer 或 `set_value` 自动 fallback。fixture、runner 与说明均已纳入
+真机 kit 已实现 `desktop.macos_ax.type_text@1` 对应的 Unicode/secure text case，以及
+`desktop.macos_ax.pointer_click@1` 对应的 fixture 中心左键 case；在真实 Mac 生成 `passed` 报告
+前，仍不能把它写成已经通过资格验证。验证只需 Accessibility，不请求 Screen Recording；
+pointer click 是显式动作，不作为 `set_value`、`invoke` 或其他动作的自动 fallback。fixture、runner 与说明均已纳入
 `tests/macos/SOURCE_PACKAGE_FILES.txt` 白名单。
+passed 报告还必须包含并通过 `pointer_click_and_reread`；本地 verifier 缺少该 check 时以
+`missing_required_checks` fail closed。新增 case 不改变 source provenance：report/identity 仍须
+一致携带 revision、worktree 与 package digest，资格认定仍要求独立可信的归档 hash 与 clean
+source pins。
 
 需要把真机套件交给仓库外的 Mac 时，在 `tests/macos/` 执行：
 

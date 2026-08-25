@@ -31,6 +31,7 @@ REQUIRED_CHECKS = (
     "set_value_and_reread",
     "type_text_unicode_and_reread",
     "press_and_reread",
+    "pointer_click_and_reread",
 )
 SOURCE_REVISION = "a" * 40
 SOURCE_PACKAGE_DIGEST = "b" * 64
@@ -38,10 +39,31 @@ SOURCE_PACKAGE_DIGEST = "b" * 64
 
 def _report(status: str = "passed", *, with_source: bool = True) -> bytes:
     if status == "passed":
-        checks = [
-            {"id": check_id, "status": "pass", "message": "ok"}
-            for check_id in REQUIRED_CHECKS
-        ]
+        checks = []
+        for check_id in REQUIRED_CHECKS:
+            check = {"id": check_id, "status": "pass", "message": "ok"}
+            if check_id == "pointer_click_and_reread":
+                check["evidence"] = {
+                    "fresh_target": True,
+                    "positive_area_bounds": True,
+                    "bounds_ax_errors": [],
+                    "target_pid_matches_fixture": True,
+                    "pid_ax_error": 0,
+                    "frontmost_before_dispatch": True,
+                    "frontmost_at_dispatch": True,
+                    "status_idle_before_dispatch": True,
+                    "center_derived_from_ax_bounds": True,
+                    "center_finite": True,
+                    "hit_test_matches_target": True,
+                    "hit_test_ax_error": 0,
+                    "event_submitted": True,
+                    "button": "left",
+                    "position": "center",
+                    "postcondition_reread": True,
+                    "status_matches_from_fresh_snapshot": True,
+                    "postcondition_ax_errors": [],
+                }
+            checks.append(check)
         message = "macOS AX fixture 测试通过"
     else:
         checks = [
@@ -859,6 +881,89 @@ class MacOSResultVerifierTests(unittest.TestCase):
                 self.assertNotEqual(completed.returncode, 0)
                 self.assertEqual(
                     result["error"]["code"], expected_code
+                )
+
+    def test_passed_report_without_pointer_check_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            files = _files()
+            report = json.loads(files["report.json"])
+            report["checks"] = [
+                check for check in report["checks"]
+                if check["id"] != "pointer_click_and_reread"
+            ]
+            report["summary"]["passed"] -= 1
+            report["summary"]["total"] -= 1
+            files["report.json"] = (
+                json.dumps(report, sort_keys=True).encode() + b"\n"
+            )
+            _refresh_manifest(files)
+            archive = Path(temporary) / "macos-ax-test-result.tar.gz"
+            _write_archive(archive, _regular_entries(files))
+            completed, result = self._run(archive)
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertEqual(
+                result["error"]["code"], "missing_required_checks"
+            )
+            self.assertEqual(
+                result["error"]["details"]["checks"],
+                ["pointer_click_and_reread"],
+            )
+
+    def test_passed_report_rejects_failed_pointer_check(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            files = _files()
+            report = json.loads(files["report.json"])
+            pointer_check = next(
+                check for check in report["checks"]
+                if check["id"] == "pointer_click_and_reread"
+            )
+            pointer_check["status"] = "fail"
+            report["summary"]["passed"] -= 1
+            report["summary"]["failed"] += 1
+            files["report.json"] = (
+                json.dumps(report, sort_keys=True).encode() + b"\n"
+            )
+            _refresh_manifest(files)
+            archive = Path(temporary) / "macos-ax-test-result.tar.gz"
+            _write_archive(archive, _regular_entries(files))
+            completed, result = self._run(archive)
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertEqual(
+                result["error"]["code"], "invalid_report_checks"
+            )
+
+    def test_passed_report_rejects_incomplete_pointer_evidence(self) -> None:
+        mutations = (
+            ("fresh_target", False),
+            ("event_submitted", None),
+            ("button", "right"),
+            ("position", "top_left"),
+            ("bounds_ax_errors", [1]),
+            ("postcondition_ax_errors", "none"),
+            ("pid_ax_error", 1),
+        )
+        for field, value in mutations:
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as temporary:
+                files = _files()
+                report = json.loads(files["report.json"])
+                pointer_check = next(
+                    check for check in report["checks"]
+                    if check["id"] == "pointer_click_and_reread"
+                )
+                if value is None:
+                    pointer_check["evidence"].pop(field)
+                else:
+                    pointer_check["evidence"][field] = value
+                files["report.json"] = (
+                    json.dumps(report, sort_keys=True).encode() + b"\n"
+                )
+                _refresh_manifest(files)
+                archive = Path(temporary) / "macos-ax-test-result.tar.gz"
+                _write_archive(archive, _regular_entries(files))
+                completed, result = self._run(archive)
+                self.assertNotEqual(completed.returncode, 0)
+                self.assertEqual(
+                    result["error"]["code"], "invalid_pointer_evidence"
                 )
 
 

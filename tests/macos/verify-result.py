@@ -56,6 +56,7 @@ REQUIRED_PASSED_CHECKS = frozenset({
     "set_value_and_reread",
     "type_text_unicode_and_reread",
     "press_and_reread",
+    "pointer_click_and_reread",
 })
 HEX_64 = re.compile(r"^[0-9a-fA-F]{64}$")
 LOWER_HEX_64 = re.compile(r"^[0-9a-f]{64}$")
@@ -584,6 +585,63 @@ def _validate_report(data: bytes) -> dict[str, Any]:
                 "missing_required_checks",
                 "passed 报告缺少必需 check。",
                 {"checks": missing_checks},
+            )
+        pointer_check = next(
+            check
+            for check in checks
+            if check["id"] == "pointer_click_and_reread"
+        )
+        pointer_evidence = _dict(
+            pointer_check.get("evidence"),
+            "checks.pointer_click_and_reread.evidence",
+        )
+        required_true = (
+            "fresh_target",
+            "positive_area_bounds",
+            "target_pid_matches_fixture",
+            "frontmost_before_dispatch",
+            "frontmost_at_dispatch",
+            "status_idle_before_dispatch",
+            "center_derived_from_ax_bounds",
+            "center_finite",
+            "hit_test_matches_target",
+            "event_submitted",
+            "postcondition_reread",
+            "status_matches_from_fresh_snapshot",
+        )
+        for field in required_true:
+            if pointer_evidence.get(field) is not True:
+                _fail(
+                    "invalid_pointer_evidence",
+                    "passed 报告的 pointer click 证据不完整。",
+                    {"field": field},
+                )
+        if pointer_evidence.get("button") != "left":
+            _fail(
+                "invalid_pointer_evidence",
+                "passed 报告必须证明使用左键。",
+                {"field": "button"},
+            )
+        if pointer_evidence.get("position") != "center":
+            _fail(
+                "invalid_pointer_evidence",
+                "passed 报告必须证明点位由目标中心推导。",
+                {"field": "position"},
+            )
+        for field in ("bounds_ax_errors", "postcondition_ax_errors"):
+            errors = pointer_evidence.get(field)
+            if not isinstance(errors, list) or errors:
+                _fail(
+                    "invalid_pointer_evidence",
+                    "passed 报告的 pointer click AX 错误必须为空。",
+                    {"field": field},
+                )
+        pid_error = pointer_evidence.get("pid_ax_error")
+        if type(pid_error) is not int or pid_error != 0:
+            _fail(
+                "invalid_pointer_evidence",
+                "passed 报告的 pointer click PID 校验未成功。",
+                {"field": "pid_ax_error"},
             )
 
     timestamp = report.get("timestamp_utc")

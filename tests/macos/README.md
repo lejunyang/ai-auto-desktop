@@ -80,14 +80,28 @@ press，并在每个动作后重新遍历读取。键盘输入分段覆盖 ASCII
 void `postToPid` 描述为已接受。每段首事件前还记录 `IsSecureEventInputEnabled()` 结果并在启用
 时拒绝提交。套件还通过 `NSSecureTextField`
 确认 secure text 在任何键盘事件前被拒绝。
+
+套件还用独立的 `Pointer Click Target` 按钮覆盖显式
+`desktop.macos_ax.pointer_click@1`：每次点击前都从 fixture PID 的 fresh AX snapshot 按
+`fixture-pointer` identifier 唯一定位按钮，读取并要求正面积的 `AXPosition`/`AXSize`，只由
+该 bounds 计算中心点。runner 同时校验 AX element 的 PID 等于自有 fixture PID，并在事件创建
+前和实际提交前确认 fixture 为 frontmost；中心点的 AX hit test 也必须仍解析为同一按钮，且
+独立状态仍为 idle。随后用定向到该 PID 的 `.mouseMoved`、
+`.leftMouseDown`、`.leftMouseUp` CGEvent 提交一次左键中心点击。它不接收或保存裸桌面坐标，
+不截图、不做 OCR，也不使用全局 event tap；动作后重新遍历 AX 树读取独立状态文本。只有
+`pointer_click_and_reread` 通过，最终报告才会是 `passed`。
 runner 通过 LaunchServices (`open -n -W`) 启动，使 TCC 对应实际 `.app` 身份；结果由 runner
 原子写入指定文件，外层脚本不把 `open` 的退出码当作测试结论。
 
-这些 case 对齐进程驱动新增的显式 `desktop.macos_ax.type_text@1`，但在真实 Mac 回传
-`passed` 报告之前仍只代表测试实现已就绪。它只需要 Accessibility，不需要 Screen Recording，
-不注入 pointer，也不是 `set_value` 的自动 fallback。fixture、runner 和本 README 均在
+这些 case 对齐进程驱动新增的显式 `desktop.macos_ax.type_text@1` 和
+`desktop.macos_ax.pointer_click@1`，但在真实 Mac 回传 `passed` 报告之前仍只代表测试实现已
+就绪。它们只需要 Accessibility，不需要 Screen Recording；pointer click 是显式动作，不是
+`set_value`、`invoke` 或其他动作的自动 fallback。fixture、runner 和本 README 均在
 `SOURCE_PACKAGE_FILES.txt` 白名单内；本地验真工具由接收方仓库提供，不放入 Mac 执行包。
 若未来增加真机运行所需文件，必须同步更新该白名单。
+验真器把 `pointer_click_and_reread` 列为 passed 报告的必需 check：即使其余 checks 自称通过，
+缺少该 check 也会以 `missing_required_checks` fail closed。源码 revision、clean/dirty 状态和
+package digest 的 provenance 生成、携带与独立可信 pin 规则不因新增 pointer case 改变。
 
 如缺少工具，先运行：
 
