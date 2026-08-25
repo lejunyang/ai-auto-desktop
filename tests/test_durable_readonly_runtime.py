@@ -186,6 +186,11 @@ def execute_durable(
     runner, binding = durable_runner(plan, plugin, inputs=inputs)
     runner.prepare_segment()
     runner.reserve_prepared_action_attempt()
+    if deadline is None:
+        deadline = runner.durable_action_deadlines(
+            plan.steps[0], binding
+        )["dispatchDeadlineEpochMs"]
+    assert isinstance(deadline, int)
     segment = runner.run_durable_action_segment(binding, deadline)
     result = runner.finalize()
     return runner, segment, result
@@ -224,6 +229,41 @@ class DurableReadonlyRuntimeTests(unittest.TestCase):
             self.assertRegex(digest, r"^sha256:[0-9a-f]{64}$")
         with self.assertRaises(TypeError):
             first.contract["timeout"] = "1s"  # type: ignore[index]
+
+    def test_serialized_binding_tampering_cannot_change_projection(self) -> None:
+        plan = workflow()
+        plugin = StubPlugin(manifest())
+        runner, binding = durable_runner(plan, plugin)
+        runner.prepare_segment()
+        runner.reserve_prepared_action_attempt()
+        tampered = binding.to_dict()
+        tampered["contract"]["durability"]["checkpoint_fields"][
+            "title"
+        ]["pointer"] = "/secret"
+
+        with self.assertRaises(AutomationError) as rejected:
+            runner.run_durable_action_segment(
+                tampered, int((time.time() + 1) * 1000)
+            )
+        self.assertEqual(rejected.exception.code, "DURABLE.BINDING_MISMATCH")
+        self.assertEqual(plugin.calls, [])
+
+    def test_projection_change_changes_binding_digest(self) -> None:
+        project = workflow()
+        omit = workflow(action_step(checkpoint={"output": {"mode": "omit"}}))
+        project_runner, project_binding = durable_runner(
+            project, StubPlugin(manifest())
+        )
+        omit_runner, omit_binding = durable_runner(
+            omit, StubPlugin(manifest(action_contract(fields={})))
+        )
+        project_digest = project_runner.durable_action_binding_digest(
+            project.steps[0], project_binding
+        )
+        omit_digest = omit_runner.durable_action_binding_digest(
+            omit.steps[0], omit_binding
+        )
+        self.assertNotEqual(project_digest, omit_digest)
 
     def test_manifest_fallback_is_forbidden(self) -> None:
         plan = workflow()
@@ -272,6 +312,33 @@ class DurableReadonlyRuntimeTests(unittest.TestCase):
         runner, binding = durable_runner(omit, StubPlugin(manifest(action_contract(fields={}))))
         self.assertEqual(binding.to_dict()["projectionDigest"][:7], "sha256:")
         self.assertEqual(runner.context["steps"], {})
+
+    def test_guard_retry_handlers_and_finally_are_rejected(self) -> None:
+        variants = []
+        guarded = action_step(); guarded["if"] = "${{ False }}"; variants.append(guarded)
+        retried = action_step(); retried["retry"] = {
+            "max_attempts": 2,
+            "on": {"codes": ["FIXTURE.NOT_READY"]},
+        }; variants.append(retried)
+        handled = action_step(); handled["on_error"] = {
+            "steps": [{"id": "recover", "type": "return", "value": None}],
+            "match": {"codes": ["FIXTURE.NOT_READY"]},
+            "outcome": {"mode": "continue", "output": None},
+        }; variants.append(handled)
+        finalized = action_step(); finalized["finally"] = [
+            {"id": "cleanup", "type": "return", "value": None}
+        ]; variants.append(finalized)
+        for step in variants:
+            with self.subTest(step=step):
+                plan = workflow(step)
+                runner = WorkflowRunner(
+                    plan, plugins={"fixture": StubPlugin(manifest())},
+                    durable_action_mode="read_only",
+                )
+                runner.initialize()
+                with self.assertRaises(AutomationError) as rejected:
+                    runner.durable_action_binding(plan.steps[0])
+                self.assertEqual(rejected.exception.code, "DURABLE.UNSUPPORTED_PLAN")
 
     def test_pointer_constraints_duplicate_and_null_schema_are_enforced(self) -> None:
         invalid_fields = (
@@ -385,6 +452,13 @@ class DurableReadonlyRuntimeTests(unittest.TestCase):
         invalid = intent.to_dict(); invalid["executedAttempts"] = 0
         with self.assertRaises(AutomationError):
             WorkflowRunner(plan, plugins={"fixture": plugin}, durable_action_mode="read_only").restore_action_intent(invalid)
+
+        overflow = intent.to_dict(); overflow["executedAttempts"] = 2
+        with self.assertRaises(AutomationError):
+            WorkflowRunner(
+                plan, plugins={"fixture": plugin},
+                durable_action_mode="read_only",
+            ).restore_action_intent(overflow)
 
     def test_expired_dispatch_deadline_never_invokes_provider(self) -> None:
         plan = workflow()

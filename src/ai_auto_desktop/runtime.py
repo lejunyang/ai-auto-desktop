@@ -567,6 +567,11 @@ class WorkflowRunner:
                 raise self._segment_state_error(
                     "action intent has no reserved attempt"
                 )
+            limit = self.descriptor.budgets.get("max_executed_steps")
+            if limit is not None and normalized.executed_attempts > int(limit):
+                raise self._segment_state_error(
+                    "action intent exceeds the attempt budget"
+                )
             self._pre_reserved_attempts = 1
             return self._export_segment_state(allow_reserved_attempt=True)
 
@@ -587,7 +592,7 @@ class WorkflowRunner:
     def run_durable_action_segment(
         self,
         binding: DurableActionBinding | Mapping[str, Any],
-        dispatch_deadline_epoch_ms: int | None,
+        dispatch_deadline_epoch_ms: int,
     ) -> SegmentResult:
         """Execute one reserved durable action using its frozen binding."""
 
@@ -597,10 +602,14 @@ class WorkflowRunner:
                 raise self._segment_state_error(
                     "durable action attempt must be reserved before dispatch"
                 )
-            normalized = self._normalize_durable_binding(binding)
+            normalized = self._require_current_durable_binding(step, binding)
             deadline = self._validate_absolute_deadline(
                 dispatch_deadline_epoch_ms, "dispatchDeadlineEpochMs"
             )
+            if deadline is None:
+                raise self._segment_state_error(
+                    "dispatchDeadlineEpochMs must not be null"
+                )
             try:
                 self._run_step(
                     step,
@@ -957,9 +966,8 @@ class WorkflowRunner:
     def _normalize_durable_binding(
         binding: DurableActionBinding | Mapping[str, Any],
     ) -> DurableActionBinding:
-        if isinstance(binding, DurableActionBinding):
-            return binding
-        if not isinstance(binding, Mapping):
+        raw = binding.to_dict() if isinstance(binding, DurableActionBinding) else binding
+        if not isinstance(raw, Mapping):
             raise AutomationError(
                 "DURABLE.BINDING_MISMATCH",
                 "durable action binding must be an object",
@@ -969,8 +977,8 @@ class WorkflowRunner:
             "contract", "providerDigest", "contractDigest",
             "projectionDigest",
         }
-        if set(binding) != required or not isinstance(
-            binding.get("contract"), Mapping
+        if set(raw) != required or not isinstance(
+            raw.get("contract"), Mapping
         ):
             raise AutomationError(
                 "DURABLE.BINDING_MISMATCH",
@@ -978,8 +986,8 @@ class WorkflowRunner:
                 category="durable",
             )
         digests = [
-            binding["providerDigest"], binding["contractDigest"],
-            binding["projectionDigest"],
+            raw["providerDigest"], raw["contractDigest"],
+            raw["projectionDigest"],
         ]
         if any(not _is_sha256_digest(value) for value in digests):
             raise AutomationError(
@@ -987,11 +995,16 @@ class WorkflowRunner:
                 "durable action binding digests are invalid",
                 category="durable",
             )
+        contract = _clone_runtime_value(raw["contract"])
+        if _canonical_digest(contract) != raw["contractDigest"]:
+            raise AutomationError(
+                "DURABLE.BINDING_MISMATCH",
+                "durable action contract digest does not match its content",
+                category="durable",
+            )
         return DurableActionBinding(
-            _clone_runtime_value(binding["contract"]),
-            binding["providerDigest"],
-            binding["contractDigest"],
-            binding["projectionDigest"],
+            freeze(contract), raw["providerDigest"],
+            raw["contractDigest"], raw["projectionDigest"],
         )
 
     @staticmethod
@@ -1860,10 +1873,22 @@ class WorkflowRunner:
                 "durable actions require explicit read_only mode",
                 category="durable",
             )
-        if "postcondition" in step.params:
+        retry = thaw(
+            step.params.get(
+                "retry", self.descriptor.defaults.get("retry", {})
+            )
+        )
+        if (
+            "if" in step.params
+            or "precondition" in step.params
+            or "postcondition" in step.params
+            or step.on_error is not None
+            or bool(step.finally_steps)
+            or int(retry.get("max_attempts", 1)) != 1
+        ):
             raise AutomationError(
                 "DURABLE.UNSUPPORTED_PLAN",
-                "durable read-only actions do not support postconditions",
+                "durable read-only actions require one unconditional attempt without handlers",
                 category="durable",
                 details={"stepId": step.id},
             )
@@ -2038,7 +2063,7 @@ class WorkflowRunner:
     ) -> str:
         """Hash evaluated invocation input without returning or storing it."""
 
-        normalized = self._normalize_durable_binding(binding)
+        normalized = self._require_current_durable_binding(step, binding)
         uses = step.params["uses"]
         capability = uses.rsplit(".", 1)[0]
         plugin = self.plugins.get(capability)
@@ -2064,8 +2089,28 @@ class WorkflowRunner:
                 "input": action_input,
                 "providerDigest": normalized.provider_digest,
                 "contractDigest": normalized.contract_digest,
+                "projectionDigest": normalized.projection_digest,
             }
         )
+
+    def _require_current_durable_binding(
+        self,
+        step: CompiledStep,
+        binding: DurableActionBinding | Mapping[str, Any],
+    ) -> DurableActionBinding:
+        supplied = self._normalize_durable_binding(binding)
+        current = self.durable_action_binding(step)
+        if (
+            supplied.provider_digest != current.provider_digest
+            or supplied.contract_digest != current.contract_digest
+            or supplied.projection_digest != current.projection_digest
+        ):
+            raise AutomationError(
+                "DURABLE.BINDING_MISMATCH",
+                "durable action binding no longer matches the provider or projection",
+                category="durable",
+            )
+        return current
 
     def durable_action_deadlines(
         self,
@@ -2074,7 +2119,7 @@ class WorkflowRunner:
     ) -> dict[str, int | None]:
         """Freeze absolute workflow/step/attempt/provider deadline bounds."""
 
-        normalized = self._normalize_durable_binding(binding)
+        normalized = self._require_current_durable_binding(step, binding)
         now_ms = int(time.time() * 1_000)
 
         def deadline(value: Any) -> int | None:
