@@ -7,8 +7,9 @@ from pathlib import Path
 import json
 import tempfile
 import unittest
+from unittest.mock import patch
 
-from ai_auto_desktop.compiler import compile_descriptor, load_descriptor
+from ai_auto_desktop.compiler import _schema_issues, compile_descriptor, load_descriptor
 from ai_auto_desktop.errors import DescriptorError
 from ai_auto_desktop.model import WorkflowDescriptor
 
@@ -219,6 +220,84 @@ class CompilerTests(unittest.TestCase):
                 }
             )
         )
+
+    def test_script_runtime_is_rejected_by_schema(self) -> None:
+        for runtime in ("javascript", "shell"):
+            with self.subTest(runtime=runtime):
+                error = self.assert_invalid(
+                    descriptor(
+                        {
+                            "id": "compute",
+                            "type": "script",
+                            "runtime": runtime,
+                            "source": "print(1)\n",
+                            "output_schema": {},
+                        }
+                    )
+                )
+                self.assertEqual(error.issues[0]["code"], "schema")
+                self.assertEqual(error.issues[0]["path"], "$.steps[0]")
+
+    def test_script_capabilities_are_unknown_to_compiler(self) -> None:
+        value = descriptor(
+            {
+                "id": "compute",
+                "type": "script",
+                "runtime": "python",
+                "source": "print(1)\n",
+                "output_schema": {},
+                "capabilities": ["desktop.observe"],
+            }
+        )
+
+        with patch("ai_auto_desktop.compiler._schema_issues", return_value=[]):
+            error = self.assert_invalid(value)
+        self.assertIn(
+            {
+                "path": "$.steps[0].capabilities",
+                "message": "unknown field",
+                "code": "unknown_field",
+            },
+            error.issues,
+        )
+
+    def test_script_non_deny_sandbox_modes_are_rejected_by_schema(self) -> None:
+        invalid_sandboxes = (
+            {"network": {"mode": "allowlist", "hosts": ["example.com"]}},
+            {"filesystem": {"mode": "read_only"}},
+            {"environment": {"mode": "allowlist", "names": ["LANG"]}},
+        )
+        for sandbox in invalid_sandboxes:
+            with self.subTest(sandbox=sandbox):
+                error = self.assert_invalid(
+                    descriptor(
+                        {
+                            "id": "compute",
+                            "type": "script",
+                            "runtime": "python",
+                            "source": "print(1)\n",
+                            "output_schema": {},
+                            "sandbox": sandbox,
+                        }
+                    )
+                )
+                self.assertEqual(error.issues[0]["code"], "schema")
+                self.assertEqual(error.issues[0]["path"], "$.steps[0]")
+
+    def test_schema_narrows_set_target_to_top_level_vars_name(self) -> None:
+        issues = _schema_issues(
+            descriptor(
+                {
+                    "id": "write",
+                    "type": "set",
+                    "assign": {"vars.value.nested": 1},
+                }
+            )
+        )
+
+        self.assertTrue(issues)
+        self.assertEqual(issues[0].code, "schema")
+        self.assertEqual(issues[0].path, "$.steps[0]")
 
 
 if __name__ == "__main__":

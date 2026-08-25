@@ -100,13 +100,13 @@ provider action 合约的对应三项也均为 `public`，才有资格进入该�
 
 ### 5.2 `script`
 
-`runtime` 为 `python|javascript|shell`；`source` 和 `entrypoint` 必须且只能提供一个。`inputs` 是唯一的数据输入，stdout 结果必须通过 `output_schema`。`sandbox` 默认 deny，可显式限定 network allowlist、filesystem paths、environment allowlist 和 `max_output_bytes`。
+v1alpha1 目标语义允许未来扩展多个脚本 runtime，但当前 v0 仅接受 `runtime: python`。`source` 和 `entrypoint` 必须且只能提供一个。`inputs` 是唯一的数据输入，stdout 结果必须通过 `output_schema`。当前 v0 的 `sandbox` 只接受 deny-only 边界：`network.mode`、`filesystem.mode`、`environment.mode` 都必须是 `deny`；可额外声明 `max_output_bytes`。script 不接受 `capabilities` 授权字段。
 
 script 必须运行在独立进程/容器中；Python `eval/exec`、Node `vm`、worker thread 或语言内限制不是安全边界。取消必须终止完整进程树。secret 不得进入命令行、默认环境变量、源码或日志。
 
 ### 5.3 `set`
 
-`assign` 是 `vars.<name>[.<field>...]` 到 literal/expression 的非空映射。所有右值先在旧 context 中求值并校验，之后原子提交；不可变变量、未知变量或类型不匹配报错。
+当前 v0 中，`assign` 是 `vars.<name>` 到 literal/expression 的非空映射，不支持 `vars.<name>.<field>` 这类嵌套写入。所有右值先在旧 context 中求值并校验，之后原子提交；不可变变量、未知变量或类型不匹配报错。
 
 ### 5.4 `if` 和 `switch`
 
@@ -201,7 +201,7 @@ Manifest 使用相同 `apiVersion`，`kind: CapabilityManifest`，并包含：
 | `action` + NDJSON process fixture | 支持/优先 | 多 provider、版本解析、schema 校验 |
 | `set`, `if`, `fail`, `return` | 首版子集 | 完整语义 |
 | `switch`, `foreach`, `while`, `block` | 支持串行有界执行；`foreach.concurrency != 1` 明确拒绝 | 完整且有界 |
-| `script` | 默认关闭；仅 Linux bubblewrap + prlimit 可用时执行 | 三端独立进程和 deny-by-default sandbox |
+| `script` | 默认关闭；仅接受 `runtime: python`、deny-only sandbox，并且只在 Linux bubblewrap + prlimit 可用时执行 | 三端独立进程和 deny-by-default sandbox |
 | retry/on_error/finally | 支持基础语义、父子 deadline、合作式取消、unknown effect，以及受限串行计划的顶层安全点恢复 | action/script reconciliation 与协议级取消 |
 | budgets、risk/permission/confirmation policy | 支持执行预算、SQLite journal/lease 与 fail-closed 前置检查 | 跨进程 single-writer、真实确认 token 与完整 taint enforcement |
 | Windows UIA | 进程 driver：list/snapshot/find/focus/invoke/set_value/type_text；待 Windows 真机资格测试 | 完整 driver |

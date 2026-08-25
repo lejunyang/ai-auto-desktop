@@ -47,7 +47,7 @@ _FIELDS = {
     "switch": {"cases", "default"},
     "foreach": {"items", "as", "index_as", "max_items", "concurrency", "steps"},
     "while": {"condition", "max_iterations", "steps"}, "block": {"steps"},
-    "script": {"runtime", "source", "entrypoint", "inputs", "output_schema", "capabilities", "sandbox"},
+    "script": {"runtime", "source", "entrypoint", "inputs", "output_schema", "sandbox"},
     "fail": {"error"}, "return": {"value"},
 }
 _EFFECTS = {"read_only", "idempotent", "non_idempotent", "contextual"}
@@ -542,18 +542,38 @@ class _Compiler:
         elif step_type == "block": self.required(obj, ["steps"], path); nested = self.steps(obj.get("steps", []), f"{path}.steps")
         elif step_type == "script":
             self.required(obj, ["runtime", "output_schema"], path)
-            if obj.get("runtime") not in {"python", "javascript", "shell"}: self.issue(f"{path}.runtime", "invalid script runtime", "enum")
+            if obj.get("runtime") != "python": self.issue(f"{path}.runtime", "v0 only supports python script runtime", "unsupported")
             if ("source" in obj) == ("entrypoint" in obj): self.issue(path, "exactly one of source and entrypoint is required", "one_of")
             if "inputs" in obj:
                 if not isinstance(obj["inputs"], Mapping): self.issue(f"{path}.inputs", "must be an object", "type")
                 self.values(obj["inputs"], f"{path}.inputs")
             if "output_schema" in obj and not isinstance(obj["output_schema"], (Mapping, bool)):
                 self.issue(f"{path}.output_schema", "must be an object or boolean JSON Schema", "type")
-            if "capabilities" in obj: self.strings(obj["capabilities"], f"{path}.capabilities")
             if "source" in obj and "$" + "{{" in obj["source"]: self.issue(f"{path}.source", "expressions are forbidden in source", "policy")
             if "sandbox" in obj:
                 sandbox = self.obj(obj["sandbox"], f"{path}.sandbox")
-                if sandbox is not None: self.unknown(sandbox, {"network", "filesystem", "environment", "max_output_bytes"}, f"{path}.sandbox")
+                if sandbox is not None:
+                    self.unknown(sandbox, {"network", "filesystem", "environment", "max_output_bytes"}, f"{path}.sandbox")
+                    if "max_output_bytes" in sandbox and (
+                        not isinstance(sandbox["max_output_bytes"], int)
+                        or isinstance(sandbox["max_output_bytes"], bool)
+                        or sandbox["max_output_bytes"] < 1
+                    ):
+                        self.issue(f"{path}.sandbox.max_output_bytes", "must be a positive integer", "range")
+                    for boundary in ("network", "filesystem", "environment"):
+                        if boundary not in sandbox:
+                            continue
+                        config = self.obj(sandbox[boundary], f"{path}.sandbox.{boundary}")
+                        if config is None:
+                            continue
+                        self.unknown(config, {"mode"}, f"{path}.sandbox.{boundary}")
+                        self.required(config, ["mode"], f"{path}.sandbox.{boundary}")
+                        if config.get("mode") != "deny":
+                            self.issue(
+                                f"{path}.sandbox.{boundary}.mode",
+                                f"v0 only supports deny-only script {boundary} sandbox",
+                                "unsupported",
+                            )
         elif step_type == "fail":
             self.required(obj, ["error"], path); error = self.obj(obj.get("error"), f"{path}.error") if "error" in obj else None
             if error is not None:

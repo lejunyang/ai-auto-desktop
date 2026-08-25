@@ -884,11 +884,7 @@
               "const": "script"
             },
             "runtime": {
-              "enum": [
-                "python",
-                "javascript",
-                "shell"
-              ]
+              "const": "python"
             },
             "source": {
               "type": "string",
@@ -904,15 +900,6 @@
             },
             "output_schema": {
               "$ref": "#/$defs/jsonSchema"
-            },
-            "capabilities": {
-              "type": "array",
-              "items": {
-                "type": "string",
-                "minLength": 1,
-                "maxLength": 192
-              },
-              "uniqueItems": true
             },
             "sandbox": {
               "$ref": "#/$defs/sandbox"
@@ -954,39 +941,7 @@
           ],
           "properties": {
             "mode": {
-              "enum": [
-                "deny",
-                "allowlist"
-              ]
-            },
-            "hosts": {
-              "type": "array",
-              "items": {
-                "type": "string",
-                "minLength": 1,
-                "maxLength": 253
-              },
-              "minItems": 1,
-              "uniqueItems": true
-            }
-          },
-          "if": {
-            "properties": {
-              "mode": {
-                "const": "allowlist"
-              }
-            }
-          },
-          "then": {
-            "required": [
-              "hosts"
-            ]
-          },
-          "else": {
-            "not": {
-              "required": [
-                "hosts"
-              ]
+              "const": "deny"
             }
           },
           "additionalProperties": false
@@ -998,37 +953,7 @@
           ],
           "properties": {
             "mode": {
-              "enum": [
-                "deny",
-                "read_only",
-                "read_write"
-              ]
-            },
-            "paths": {
-              "type": "array",
-              "items": {
-                "type": "object",
-                "required": [
-                  "path",
-                  "access"
-                ],
-                "properties": {
-                  "path": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": 4096
-                  },
-                  "access": {
-                    "enum": [
-                      "read",
-                      "write",
-                      "read_write"
-                    ]
-                  }
-                },
-                "additionalProperties": false
-              },
-              "uniqueItems": true
+              "const": "deny"
             }
           },
           "additionalProperties": false
@@ -1040,38 +965,7 @@
           ],
           "properties": {
             "mode": {
-              "enum": [
-                "deny",
-                "allowlist"
-              ]
-            },
-            "names": {
-              "type": "array",
-              "items": {
-                "type": "string",
-                "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
-              },
-              "minItems": 1,
-              "uniqueItems": true
-            }
-          },
-          "if": {
-            "properties": {
-              "mode": {
-                "const": "allowlist"
-              }
-            }
-          },
-          "then": {
-            "required": [
-              "names"
-            ]
-          },
-          "else": {
-            "not": {
-              "required": [
-                "names"
-              ]
+              "const": "deny"
             }
           },
           "additionalProperties": false
@@ -1102,7 +996,7 @@
               "type": "object",
               "propertyNames": {
                 "type": "string",
-                "pattern": "^vars\\.[A-Za-z_][A-Za-z0-9_]*(?:\\.[A-Za-z_][A-Za-z0-9_]*)*$"
+                "pattern": "^vars\\.[A-Za-z_][A-Za-z0-9_]*$"
               },
               "additionalProperties": {
                 "$ref": "#/$defs/valueOrExpression"

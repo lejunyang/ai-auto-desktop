@@ -161,7 +161,7 @@ class ScriptPolicyContracts(unittest.TestCase):
             ), mock.patch.object(script.subprocess, "Popen") as popen:
                 with self.assertRaises(AutomationError) as raised:
                     execute(script_plan(**request))
-                self.assertEqual(raised.exception.code, "SCRIPT.SANDBOX_DENIED")
+                self.assertEqual(raised.exception.code, "DESCRIPTOR.INVALID")
                 popen.assert_not_called()
 
     def test_unsupported_runtime_is_rejected_before_process_start(self) -> None:
@@ -176,7 +176,7 @@ class ScriptPolicyContracts(unittest.TestCase):
                 with self.assertRaises(AutomationError) as raised:
                     execute(script_plan(runtime=runtime))
                 self.assertEqual(
-                    raised.exception.code, "DESCRIPTOR.UNSUPPORTED_FEATURE"
+                    raised.exception.code, "DESCRIPTOR.INVALID"
                 )
                 popen.assert_not_called()
 

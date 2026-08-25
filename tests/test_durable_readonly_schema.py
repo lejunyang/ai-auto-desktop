@@ -74,6 +74,34 @@ def _manifest(pointer: str = "/window/title") -> dict[str, object]:
 
 
 class DurableReadOnlySchemaTests(unittest.TestCase):
+    def test_workflow_schema_pins_current_v0_script_and_set_subset(self) -> None:
+        schema = json.loads(
+            (
+                ROOT
+                / "schemas"
+                / "workflow"
+                / "v1alpha1"
+                / "workflow.schema.json"
+            ).read_text(encoding="utf-8")
+        )
+        script = schema["$defs"]["scriptStep"]["allOf"][1]["properties"]
+        sandbox = schema["$defs"]["sandbox"]["properties"]
+        set_assign = schema["$defs"]["setStep"]["allOf"][1]["properties"]["assign"]
+
+        self.assertEqual(script["runtime"], {"const": "python"})
+        self.assertNotIn("capabilities", script)
+        self.assertEqual(sandbox["network"]["properties"]["mode"], {"const": "deny"})
+        self.assertEqual(
+            sandbox["filesystem"]["properties"]["mode"], {"const": "deny"}
+        )
+        self.assertEqual(
+            sandbox["environment"]["properties"]["mode"], {"const": "deny"}
+        )
+        self.assertEqual(
+            set_assign["propertyNames"]["pattern"],
+            r"^vars\.[A-Za-z_][A-Za-z0-9_]*$",
+        )
+
     def test_workflow_fields_compile_and_are_frozen(self) -> None:
         compiled = compile_descriptor(_workflow())
         action = compiled.steps[0]
