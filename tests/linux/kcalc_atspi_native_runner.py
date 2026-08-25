@@ -32,6 +32,11 @@ CHILD_ENVIRONMENT_KEYS = frozenset({
 })
 
 
+def _json_failure(reason: str, *, status: int = 64) -> int:
+    print(json.dumps({"status": "failed", "reason": reason}))
+    return status
+
+
 def _stop_owned(process: subprocess.Popen[Any]) -> None:
     if process.poll() is not None:
         return
@@ -71,11 +76,16 @@ def _process_start_time(pid: int) -> int:
 
 
 def main() -> int:
-    if len(sys.argv) != 3:
-        print(json.dumps({"status": "failed", "reason": "invalid_arguments"}))
-        return 64
+    if len(sys.argv) not in {4, 5}:
+        return _json_failure("invalid_arguments")
+    mode = "semantic"
+    if len(sys.argv) == 5:
+        if sys.argv[4] != "--pointer-click":
+            return _json_failure("invalid_arguments")
+        mode = "pointer_click"
     executable = Path(sys.argv[1])
-    driver = Path(sys.argv[2]).resolve()
+    window_manager = Path(sys.argv[2])
+    driver = Path(sys.argv[3]).resolve()
     if (
         not executable.is_absolute()
         or executable != Path("/usr/bin/kcalc")
@@ -84,8 +94,16 @@ def main() -> int:
         or executable.stat().st_uid != 0
         or stat.S_IMODE(executable.stat().st_mode) & 0o022
     ):
-        print(json.dumps({"status": "failed", "reason": "invalid_kcalc"}))
-        return 64
+        return _json_failure("invalid_kcalc")
+    if (
+        not window_manager.is_absolute()
+        or window_manager != Path("/usr/bin/kwin_x11")
+        or window_manager.is_symlink()
+        or not window_manager.is_file()
+        or window_manager.stat().st_uid != 0
+        or stat.S_IMODE(window_manager.stat().st_mode) & 0o022
+    ):
+        return _json_failure("invalid_window_manager")
     display = os.environ.get("DISPLAY", "")
     session_bus = os.environ.get("DBUS_SESSION_BUS_ADDRESS", "")
     expected_display = os.environ.get("AI_AUTO_DESKTOP_TEST_XVFB_DISPLAY", "")
@@ -104,8 +122,7 @@ def main() -> int:
         or not private_root
         or not private_token
     ):
-        print(json.dumps({"status": "failed", "reason": "private_xvfb_not_proven"}))
-        return 64
+        return _json_failure("private_xvfb_not_proven")
     xvfb_pid = int(expected_xvfb_pid)
     supplied_root = Path(private_root)
     root = supplied_root.resolve()
@@ -136,8 +153,7 @@ def main() -> int:
         xauthority = xauthority_path.resolve()
         xauthority_metadata = xauthority_path.lstat()
     except (KeyError, OSError):
-        print(json.dumps({"status": "failed", "reason": "private_xvfb_not_proven"}))
-        return 64
+        return _json_failure("private_xvfb_not_proven")
     if (
         xvfb_executable.name != "Xvfb"
         or xvfb_uid != os.getuid()
@@ -172,8 +188,7 @@ def main() -> int:
         or xauthority_metadata.st_uid != os.getuid()
         or stat.S_IMODE(xauthority_metadata.st_mode) != 0o600
     ):
-        print(json.dumps({"status": "failed", "reason": "private_xvfb_not_proven"}))
-        return 64
+        return _json_failure("private_xvfb_not_proven")
 
     environment = {
         key: value for key, value in os.environ.items()
@@ -189,10 +204,7 @@ def main() -> int:
     environment.pop("AT_SPI_BUS_ADDRESS", None)
     dpkg_query = Path("/usr/bin/dpkg-query")
     if not dpkg_query.is_file():
-        print(json.dumps({
-            "status": "failed", "reason": "kcalc_version_unavailable"
-        }))
-        return 1
+        return _json_failure("kcalc_version_unavailable", status=1)
     version = subprocess.run(
         [str(dpkg_query), "-W", "-f=${Version}", "kcalc"],
         env=environment,
@@ -206,10 +218,7 @@ def main() -> int:
     )
     version_text = version.stdout.strip()[:200]
     if version.returncode != 0 or not version_text:
-        print(json.dumps({
-            "status": "failed", "reason": "kcalc_version_unavailable"
-        }))
-        return 1
+        return _json_failure("kcalc_version_unavailable", status=1)
     package_owner = subprocess.run(
         [str(dpkg_query), "-S", str(executable)],
         env=environment,
@@ -225,8 +234,43 @@ def main() -> int:
         package_owner.returncode != 0
         or package_owner.stdout.strip() != "kcalc: /usr/bin/kcalc"
     ):
-        print(json.dumps({"status": "failed", "reason": "kcalc_package_untrusted"}))
-        return 1
+        return _json_failure("kcalc_package_untrusted", status=1)
+    window_manager_owner = subprocess.run(
+        [str(dpkg_query), "-S", str(window_manager)],
+        env=environment,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        encoding="utf-8",
+        check=False,
+        timeout=5,
+    )
+    if (
+        window_manager_owner.returncode != 0
+        or window_manager_owner.stdout.strip() != "kwin-x11: /usr/bin/kwin_x11"
+    ):
+        return _json_failure("window_manager_package_untrusted", status=1)
+
+    window_manager_process = subprocess.Popen(
+        [str(window_manager), "--replace"],
+        env=environment,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    try:
+        window_manager_start_time = _process_start_time(window_manager_process.pid)
+    except (OSError, UnicodeError, ValueError, IndexError):
+        _stop_owned(window_manager_process)
+        return _json_failure("window_manager_identity_unavailable", status=1)
+    time.sleep(0.3)
+    try:
+        _assert_owned_application(window_manager_process, window_manager_start_time)
+    except Exception:
+        _stop_owned(window_manager_process)
+        return _json_failure("window_manager_start_failed", status=1)
 
     application_process = subprocess.Popen(
         [str(executable)],
@@ -240,10 +284,8 @@ def main() -> int:
         application_start_time = _process_start_time(application_process.pid)
     except (OSError, UnicodeError, ValueError, IndexError):
         _stop_owned(application_process)
-        print(json.dumps({
-            "status": "failed", "reason": "kcalc_identity_unavailable"
-        }))
-        return 1
+        _stop_owned(window_manager_process)
+        return _json_failure("kcalc_identity_unavailable", status=1)
     plugin: ProcessPlugin | None = None
     stage = "registration"
     try:
@@ -307,7 +349,7 @@ def main() -> int:
                 timeout=5,
             )
 
-        def invoke_button(name: str) -> dict[str, Any]:
+        def activate_button(name: str) -> dict[str, Any]:
             _assert_owned_application(application_process, application_start_time)
             locator = {
                 "role": "push_button",
@@ -325,18 +367,63 @@ def main() -> int:
             located = find(captured, locator)
             target = located["target"]
             node = located["node"]
-            result = plugin.invoke(
-                "desktop.linux_atspi.invoke@1",
-                {"target": target, "locator": locator},
-                timeout=5,
-            )
+            if mode == "semantic":
+                result = plugin.invoke(
+                    "desktop.linux_atspi.invoke@1",
+                    {"target": target, "locator": locator},
+                    timeout=5,
+                )
+            else:
+                result = plugin.invoke(
+                    "desktop.linux_atspi.pointer_click@1",
+                    {
+                        "target": target,
+                        "locator": locator,
+                        "button": "left",
+                        "position": "center",
+                    },
+                    # KCalc exposes about 217 AT-SPI nodes on this image.  A
+                    # pointer action performs another full fresh capture plus
+                    # component hit-testing before XTEST, so keep a larger but
+                    # still bounded per-action deadline than semantic Press.
+                    timeout=12,
+                )
             backend = result.get("backend_result", {})
-            if backend.get("native_interface") != "Action.do_action":
-                raise RuntimeError(f"button {name!r} did not use Action.do_action")
-            if backend.get("native_action_name") != "Press":
-                raise RuntimeError(f"button {name!r} did not use exact Press")
-            if backend.get("accepted") is not True:
-                raise RuntimeError(f"button {name!r} was not accepted")
+            if mode == "semantic":
+                if backend.get("native_interface") != "Action.do_action":
+                    raise RuntimeError(
+                        f"button {name!r} did not use Action.do_action"
+                    )
+                if backend.get("native_action_name") != "Press":
+                    raise RuntimeError(f"button {name!r} did not use exact Press")
+                if backend.get("accepted") is not True:
+                    raise RuntimeError(f"button {name!r} was not accepted")
+                action_evidence = {
+                    "native_interface": backend["native_interface"],
+                    "native_action_name": backend["native_action_name"],
+                    "accepted": True,
+                    "synthetic_input": False,
+                }
+            else:
+                input_result = backend.get("input", {})
+                if backend.get("native_interface") != "Component.grab_focus -> XTEST":
+                    raise RuntimeError(f"button {name!r} did not use XTEST pointer click")
+                if input_result.get("native_interface") != "XTEST":
+                    raise RuntimeError(f"button {name!r} did not report XTEST")
+                if input_result.get("submitted") is not True:
+                    raise RuntimeError(f"button {name!r} pointer click was not submitted")
+                if backend.get("button") != "left":
+                    raise RuntimeError(f"button {name!r} did not use the left button")
+                if backend.get("click_point") != input_result.get("click_point"):
+                    raise RuntimeError(f"button {name!r} click point evidence disagrees")
+                action_evidence = {
+                    "native_interface": backend["native_interface"],
+                    "synthetic_input": backend.get("synthetic_input"),
+                    "submitted": input_result["submitted"],
+                    "button_kind": backend["button"],
+                    "click_point": input_result.get("click_point"),
+                    "focus": backend.get("focus"),
+                }
             return {
                 "button": name,
                 "role": node.get("role"),
@@ -348,9 +435,7 @@ def main() -> int:
                         "toolkit_name", "toolkit_version",
                     )
                 },
-                "native_interface": backend["native_interface"],
-                "native_action_name": backend["native_action_name"],
-                "accepted": True,
+                **action_evidence,
             }
 
         result_locator = {
@@ -376,7 +461,10 @@ def main() -> int:
             raise RuntimeError("KCalc display identity was incomplete")
 
         stage = "invoke_buttons"
-        actions = [invoke_button(name) for name in BUTTONS]
+        actions = []
+        for name in BUTTONS:
+            stage = f"activate_button_{name}"
+            actions.append(activate_button(name))
 
         stage = "postcondition"
         final_locator = {
@@ -413,10 +501,11 @@ def main() -> int:
             "application_version": version_text,
             "executable": str(executable.resolve()),
             "display": display,
-            "display_kind": "private_xvfb_without_window_manager",
+            "display_kind": "private_xvfb_with_kwin_x11",
             "node_count": len(initial.get("nodes", [])),
             "snapshot_truncated": False,
             "operation": "1+2=3",
+            "action_mode": mode,
             "actions": actions,
             "fresh_snapshot_before_each_action": True,
             "fresh_snapshot_postcondition": True,
@@ -431,9 +520,12 @@ def main() -> int:
                     session_bus
                 ),
                 "private_home_xdg": True,
-                "window_manager_started": False,
+                "window_manager_started": True,
+                "window_manager": "kwin_x11",
+                "window_manager_process_id": window_manager_process.pid,
+                "window_manager_process_start_time": window_manager_start_time,
             },
-            "input_injection": False,
+            "input_injection": "XTEST" if mode == "pointer_click" else False,
             "ocr": False,
             "screenshots": False,
         }, ensure_ascii=False, sort_keys=True))
@@ -444,12 +536,14 @@ def main() -> int:
             "stage": stage,
             "error_type": type(exc).__name__,
             "message": str(exc)[:1000],
+            "plugin_stderr": (plugin.stderr[-4000:] if plugin is not None else ""),
         }, ensure_ascii=False, sort_keys=True))
         return 1
     finally:
         if plugin is not None:
             plugin.close()
         _stop_owned(application_process)
+        _stop_owned(window_manager_process)
 
 
 if __name__ == "__main__":

@@ -23,7 +23,7 @@
 - script 默认拒绝；`--allow-scripts` 显式启用后仅在具备 bubblewrap + `prlimit` 的 Linux 上运行，其他平台返回 `SCRIPT.SANDBOX_UNAVAILABLE`。
 - SQLite journal、owner lease 和受限 durable executor 已串通：`start/resume/status/list/events/pause/cancel` 使用 JSON-only CLI。action 默认拒绝；`start` 和 `resume` 仅在显式使用 `--durable-actions read-only` 时接受顶层、隐式串行、无条件、无 pre/postcondition、无 retry/handler/finally 的单次 `read_only` action。provider 与 descriptor 必须把 input/output/error 声明为 `public`，并通过 provider `checkpoint_fields` 与 descriptor `project|omit` 只持久化批准的投影。dispatch 前持久化 `action_intent` v2，恢复时校验绑定后可安全重放只读 action；其他不安全阶段仍恢复为 `UNKNOWN_EFFECT`。script、写 action 与敏感数据继续拒绝。
 
-尚未实现或尚未证明：Windows/macOS 真机执行结果与真实应用矩阵、任意 KDE/QML 应用资格；可靠的 Windows 后代进程树终止；完整 wire 协议版本协商；跨进程 single-writer session manager；写 action、script、敏感值和复杂控制流的通用持久恢复与 reconciliation；系统 secret store；签名插件；真实截图；taint tracking、确认 token 与完整 policy enforcement；安装器和权限引导。当前已有 Windows Win32 fixture/手动 CI 入口、macOS AX driver/真机回传包，以及 Linux KDE/X11 AT-SPI driver；三端均已实现只允许 fresh 语义节点中心点的显式 `pointer_click`，但 Windows/macOS 仍待真机证据。本机已用自有 GTK3、Qt 5 Widgets 与 Qt Quick/QML fixture 验证语义树，其中 GTK3/Qt Widgets 还验证了语义写动作、显式 XTEST 文本输入和 pointer click；Dolphin、Konsole 与 System Settings 完成初始窗口只读矩阵，发行版 KCalc 22.12.3 还在私有 Xvfb/总线和临时配置中通过 exact AT-SPI `Press` 完成 `1+2=3` 并由 fresh snapshot 回读同一显示控件。当前 OCR 已能处理显式图片并完成本机 Tesseract 中英文 smoke，但尚未接入受控截图/frame provenance，因此不能视为桌面视觉闭环。M0 已具备 manifest/action contract、`postcondition.observe` 和基础 action risk policy 校验，其任务是继续把 v0 收敛成可验证基线，而不是扩大产品宣称。
+尚未实现或尚未证明：Windows/macOS 真机执行结果与真实应用矩阵、任意 KDE/QML 应用资格；可靠的 Windows 后代进程树终止；完整 wire 协议版本协商；跨进程 single-writer session manager；写 action、script、敏感值和复杂控制流的通用持久恢复与 reconciliation；系统 secret store；签名插件；真实截图；taint tracking、确认 token 与完整 policy enforcement；安装器和权限引导。当前已有 Windows Win32 fixture/手动 CI 入口、macOS AX driver/真机回传包，以及 Linux KDE/X11 AT-SPI driver；三端均已实现只允许 fresh 语义节点中心点的显式 `pointer_click`，但 Windows/macOS 仍待真机证据。本机已用自有 GTK3、Qt 5 Widgets 与 Qt Quick/QML fixture 验证语义树，其中 GTK3/Qt Widgets 还验证了语义写动作、显式 XTEST 文本输入和 pointer click；Dolphin、Konsole 与 System Settings 完成初始窗口只读矩阵，发行版 KCalc 22.12.3 还在私有 Xvfb/KWin/总线和临时配置中分别通过 exact AT-SPI `Press` 与显式中心点 `pointer_click` 完成 `1+2=3`，并由 fresh snapshot 回读同一显示控件。当前 OCR 已能处理显式图片并完成本机 Tesseract 中英文 smoke，但尚未接入受控截图/frame provenance，因此不能视为桌面视觉闭环。M0 已具备 manifest/action contract、`postcondition.observe` 和基础 action risk policy 校验，其任务是继续把 v0 收敛成可验证基线，而不是扩大产品宣称。
 
 ## 3. M0：冻结 Python 运行时 v0 合约
 
@@ -81,7 +81,7 @@
 ### 范围
 
 - macOS：已实现 Swift AX helper、显式 CGEvent 文本/中心点左键输入与可回传真机套件；仍需在真实 Mac 验证 TCC、签名身份、AX 动作和输入后置条件。
-- Linux：先限定当前已验证基线 KDE Plasma 5.27/X11；自有 GTK3/Qt 5 Widgets fixture 的语义动作与显式 XTEST 文本输入、中心点左键点击已通过，Dolphin、Konsole、System Settings 和自有 Qt Quick/QML fixture 的初始窗口只读矩阵也已通过；KCalc 22.12.3 的隔离语义计算闭环已提供首个真实 KDE 应用写动作证据。下一步扩展第三方 QML、多窗口、动态页面及其他受控真实应用写动作。GNOME 与 Wayland portal/libei 作为不同 capability/profile，必须独立资格验证。
+- Linux：先限定当前已验证基线 KDE Plasma 5.27/X11；自有 GTK3/Qt 5 Widgets fixture 的语义动作与显式 XTEST 文本输入、中心点左键点击已通过，Dolphin、Konsole、System Settings 和自有 Qt Quick/QML fixture 的初始窗口只读矩阵也已通过；KCalc 22.12.3 的隔离语义计算闭环已提供首个真实 KDE 应用 `Press` 与 pointer 写动作证据。下一步扩展第三方 QML、多窗口、动态页面及其他受控真实应用写动作。GNOME 与 Wayland portal/libei 作为不同 capability/profile，必须独立资格验证。
 - 三端加入 single-desktop-writer session manager、用户介入检测、多显示器/DPI/坐标 provenance。
 - screenshot 由 Host/driver 获取并受 policy/audit 控制；OCR 独立进程仅接受显式 frame/region，输出带 confidence 和 bounds 的 perception layer。
 - 固定回退顺序并实现显式 gate：native/app API → accessibility → keyboard → semantic bounds pointer → declared vision → declared OCR。

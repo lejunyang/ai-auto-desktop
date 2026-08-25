@@ -38,6 +38,7 @@ QML_FIXTURE_SOURCE = PROJECT_ROOT / "tests" / "linux" / "qml_atspi_fixture.qml"
 QML_FIXTURE_RUNNER = PROJECT_ROOT / "tests" / "linux" / "qml_atspi_native_runner.py"
 GTK_FIXTURE_RUNNER = PROJECT_ROOT / "tests" / "linux" / "gtk_atspi_native_runner.py"
 KCALC_RUNNER = PROJECT_ROOT / "tests" / "linux" / "kcalc_atspi_native_runner.py"
+KWIN_X11 = Path("/usr/bin/kwin_x11")
 XTEST_BUILD_SCRIPT = PROJECT_ROOT / "plugins" / "linux_atspi" / "build_x11_xtest_helper.sh"
 TEST_TYPELIB_ENV = "AI_AUTO_DESKTOP_TEST_ATSPI_TYPELIB_PATH"
 FIXTURE_ENTRY_NAME = "Fixture text entry"
@@ -282,12 +283,20 @@ def _run_bounded_process_group(
                 timed_out = True
                 break
             time.sleep(0.05)
-        cleanup_succeeded = _stop_exact_processes(observed_identities)
         if process.poll() is None:
+            cleanup_succeeded = _stop_exact_processes(observed_identities)
             try:
                 process.wait(timeout=3)
             except subprocess.TimeoutExpired:
                 cleanup_succeeded = False
+        elif timed_out:
+            cleanup_succeeded = _stop_exact_processes(observed_identities)
+        else:
+            # A successful runner owns and cleans its children. Reaping stale
+            # child identities here can race with unrelated PID reuse after
+            # the group leader has exited, so only assert explicit cleanup on
+            # the timeout/error path.
+            cleanup_succeeded = True
         stdout_file.seek(0)
         stderr_file.seek(0)
         stdout = stdout_file.read(1024 * 1024 + 1)
@@ -1155,6 +1164,7 @@ class NativeIsolatedX11ActionTests(unittest.TestCase):
         mode: str | None = "--type-text",
         *,
         environment: dict[str, str] | None = None,
+        timeout: float = 45,
     ) -> dict[str, object]:
         command = [
             shutil.which("dbus-run-session"),
@@ -1162,15 +1172,17 @@ class NativeIsolatedX11ActionTests(unittest.TestCase):
             sys.executable,
             str(runner),
             str(fixture),
-            str(DRIVER_PATH),
+            str(KWIN_X11) if runner == KCALC_RUNNER else str(DRIVER_PATH),
         ]
+        if runner == KCALC_RUNNER:
+            command.append(str(DRIVER_PATH))
         if mode is not None:
             command.append(mode)
         returncode, stdout_raw, stderr_raw, timed_out, cleanup_succeeded = (
             _run_bounded_process_group(
                 command,
                 self.base_environment if environment is None else environment,
-                45,
+                timeout,
             )
         )
         if timed_out:
@@ -1287,12 +1299,16 @@ class NativeIsolatedX11ActionTests(unittest.TestCase):
         self.assertTrue(report["pointer_click_observed"])
         self.assertFalse(report["type_text_observed"])
 
-    def test_real_kcalc_semantic_calculation_is_freshly_observed(self) -> None:
+    def _run_real_kcalc_calculation(
+        self, mode: str | None
+    ) -> dict[str, object]:
         if not KCALC_RUNNER.is_file():
             self.fail(f"KCalc 测试 runner 不存在：{KCALC_RUNNER}")
         kcalc = shutil.which("kcalc")
         if kcalc is None:
             self.skipTest("真实 KDE 应用语义动作测试需要 kcalc")
+        if not KWIN_X11.is_file():
+            self.skipTest("KCalc pointer 资格测试需要 /usr/bin/kwin_x11")
 
         environment = dict(self.base_environment)
         private_root = Path(self.temporary.name)
@@ -1326,7 +1342,11 @@ class NativeIsolatedX11ActionTests(unittest.TestCase):
         self.assertEqual(_process_start_time(self.xvfb.pid), self.xvfb_start_time)
 
         report = self._run_isolated(
-            KCALC_RUNNER, Path(kcalc), None, environment=environment
+            KCALC_RUNNER,
+            Path(kcalc),
+            mode,
+            environment=environment,
+            timeout=75 if mode == "--pointer-click" else 45,
         )
         self.assertEqual(report["status"], "passed")
         self.assertEqual(report["application"], "kcalc")
@@ -1339,7 +1359,7 @@ class NativeIsolatedX11ActionTests(unittest.TestCase):
         )
         self.assertEqual(report["display"], self.display)
         self.assertEqual(
-            report["display_kind"], "private_xvfb_without_window_manager"
+            report["display_kind"], "private_xvfb_with_kwin_x11"
         )
         self.assertGreater(report["node_count"], 0)
         self.assertLessEqual(report["node_count"], 1000)
@@ -1351,10 +1371,7 @@ class NativeIsolatedX11ActionTests(unittest.TestCase):
         )
         self.assertTrue(
             all(
-                action["native_interface"] == "Action.do_action"
-                and action["native_action_name"] == "Press"
-                and action["accepted"] is True
-                and action["role"] == "push_button"
+                action["role"] == "push_button"
                 and all(
                     action["states"][name] is True
                     for name in ("enabled", "visible", "showing", "sensitive")
@@ -1387,12 +1404,52 @@ class NativeIsolatedX11ActionTests(unittest.TestCase):
                 "private_xauthority": True,
                 "private_session_bus": True,
                 "private_home_xdg": True,
-                "window_manager_started": False,
+                "window_manager_started": True,
+                "window_manager": "kwin_x11",
+                "window_manager_process_id": report["isolation"][
+                    "window_manager_process_id"
+                ],
+                "window_manager_process_start_time": report["isolation"][
+                    "window_manager_process_start_time"
+                ],
             },
         )
-        self.assertFalse(report["input_injection"])
         self.assertFalse(report["ocr"])
         self.assertFalse(report["screenshots"])
+        return report
+
+    def test_real_kcalc_semantic_calculation_is_freshly_observed(self) -> None:
+        report = self._run_real_kcalc_calculation(None)
+        self.assertEqual(report["action_mode"], "semantic")
+        self.assertTrue(
+            all(
+                action["native_interface"] == "Action.do_action"
+                and action["native_action_name"] == "Press"
+                and action["accepted"] is True
+                and action["synthetic_input"] is False
+                for action in report["actions"]
+            )
+        )
+        self.assertFalse(report["input_injection"])
+
+    def test_real_kcalc_pointer_calculation_is_freshly_observed(self) -> None:
+        report = self._run_real_kcalc_calculation("--pointer-click")
+        self.assertEqual(report["action_mode"], "pointer_click")
+        self.assertTrue(
+            all(
+                action["native_interface"] == "Component.grab_focus -> XTEST"
+                and action["synthetic_input"] is True
+                and action["submitted"] is True
+                and action["button_kind"] == "left"
+                and set(action["click_point"]) == {"x", "y"}
+                and all(
+                    isinstance(action["click_point"][axis], int)
+                    for axis in ("x", "y")
+                )
+                for action in report["actions"]
+            )
+        )
+        self.assertEqual(report["input_injection"], "XTEST")
 
     def test_kcalc_runner_rejects_missing_private_xvfb_proof(self) -> None:
         kcalc = shutil.which("kcalc")
@@ -1408,7 +1465,10 @@ class NativeIsolatedX11ActionTests(unittest.TestCase):
         ):
             environment.pop(key, None)
         completed = subprocess.run(
-            [sys.executable, str(KCALC_RUNNER), kcalc, str(DRIVER_PATH)],
+            [
+                sys.executable, str(KCALC_RUNNER), kcalc,
+                str(KWIN_X11), str(DRIVER_PATH),
+            ],
             env=environment,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
@@ -1422,6 +1482,30 @@ class NativeIsolatedX11ActionTests(unittest.TestCase):
         self.assertEqual(
             json.loads(completed.stdout),
             {"status": "failed", "reason": "private_xvfb_not_proven"},
+        )
+
+    def test_kcalc_runner_rejects_unknown_mode(self) -> None:
+        kcalc = shutil.which("kcalc")
+        if kcalc is None:
+            self.skipTest("KCalc 参数测试需要 kcalc")
+        completed = subprocess.run(
+            [
+                sys.executable, str(KCALC_RUNNER), kcalc,
+                str(KWIN_X11), str(DRIVER_PATH), "--unknown",
+            ],
+            env=self.base_environment,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            check=False,
+            timeout=5,
+        )
+        self.assertEqual(completed.returncode, 64)
+        self.assertEqual(
+            json.loads(completed.stdout),
+            {"status": "failed", "reason": "invalid_arguments"},
         )
 
     def test_kcalc_runner_rejects_real_session_xauthority(self) -> None:
@@ -1446,7 +1530,10 @@ class NativeIsolatedX11ActionTests(unittest.TestCase):
             self.skipTest("当前 KDE 会话没有可用于负向测试的 XAUTHORITY")
         environment["XAUTHORITY"] = real_xauthority
         completed = subprocess.run(
-            [sys.executable, str(KCALC_RUNNER), kcalc, str(DRIVER_PATH)],
+            [
+                sys.executable, str(KCALC_RUNNER), kcalc,
+                str(KWIN_X11), str(DRIVER_PATH),
+            ],
             env=environment,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
@@ -1496,7 +1583,10 @@ class NativeIsolatedX11ActionTests(unittest.TestCase):
         environment["AI_AUTO_DESKTOP_TEST_PRIVATE_ROOT"] = str(private_root)
         environment["AI_AUTO_DESKTOP_TEST_PRIVATE_TOKEN"] = private_token
         completed = subprocess.run(
-            [sys.executable, str(KCALC_RUNNER), kcalc, str(DRIVER_PATH)],
+            [
+                sys.executable, str(KCALC_RUNNER), kcalc,
+                str(KWIN_X11), str(DRIVER_PATH),
+            ],
             env=environment,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,

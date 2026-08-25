@@ -85,8 +85,10 @@ snapshot/find/focus/set_text/invoke 及动作后重新观察。私有 Xvfb + 隔
 bus 的 GTK3/Qt5 fixture 还会真实验证 `type_text` 的 XTEST UTF-8 输入和 fresh snapshot
 后置条件。当前仓库还以同一套隔离 runner 真实验证 `pointer_click` 的 XTEST 左键中心点点击
 及 fresh snapshot 后置条件；不使用 OCR、`xdotool`、剪贴板或调用方提供的裸坐标。
-另有真实应用 runner 在禁用 TCP、使用一次性 Xauthority 的私有 Xvfb，以及私有
+另有真实应用 runner 在禁用 TCP、使用一次性 Xauthority 的私有 Xvfb/KWin，以及私有
 session/AT-SPI bus 与临时 HOME/XDG 中启动发行版 KCalc 22.12.3，每次用 fresh snapshot
-精确定位 `1`、`+`、`2`、`=`，通过 `Action.do_action` 的 exact `Press` 完成计算，并从
-fresh snapshot 读取同一显示控件的结果 `3`。
+精确定位 `1`、`+`、`2`、`=`，分别通过 `Action.do_action` 的 exact `Press` 和显式
+`pointer_click` 完成计算。pointer 路径从语义 bounds 推导中心点，经 AT-SPI subtree
+hit-test 与 X11 PID/focus 复核后用 XTEST 派发；两条路径最后都从 fresh snapshot 读取同一
+显示控件的结果 `3`，且不使用 OCR 或截图。
 这只证明该受控 KCalc 场景，不外推为任意 KDE 应用写动作均已通过。

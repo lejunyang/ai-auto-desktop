@@ -211,12 +211,13 @@ KDE/X11 display，以及私有 Xvfb + 私有 AT-SPI bus，分别验证 GTK3/Qt5 
 解锁的用户会话执行，并把返回字段 `submitted=true` 理解为“X server 已接受事件请求”，
 而不是“应用已接收文本”。
 真实 KDE 应用验证另使用发行版 KCalc 22.12.3，而非仓库 fixture。测试在禁用 TCP、使用
-一次性 Xauthority 的私有 Xvfb，以及私有 session/AT-SPI bus 和临时 HOME/XDG 中启动
-独占 KCalc PID；每次从未截断的 fresh
-snapshot 精确定位 `1`、`+`、`2`、`=` 四个按钮，要求原生接口为
-`Action.do_action`、canonical action 为 exact `Press`，最后再从 fresh snapshot 唯一读取
-同一显示节点 `3`。这证明了一个真实 KDE/Qt Widgets 应用的受控语义写动作闭环，但不外推为
-任意 KDE 应用、页面或动作均已通过。整个 case 不使用 XTEST、OCR、截图或用户配置目录。
+一次性 Xauthority 的私有 Xvfb/KWin，以及私有 session/AT-SPI bus 和临时 HOME/XDG 中
+启动独占 KCalc PID；每次从未截断的 fresh snapshot 精确定位 `1`、`+`、`2`、`=` 四个
+按钮。计算分别走 `Action.do_action` 的 exact `Press` 与显式 `pointer_click`：后者由 fresh
+bounds 推导中心点，经 AT-SPI subtree hit-test、KWin 焦点与 X11 点下窗口 PID 复核后用
+XTEST 派发。两条路径最后都从 fresh snapshot 唯一读取同一显示节点 `3`。这证明了一个
+真实 KDE/Qt Widgets 应用的受控写动作闭环，但不外推为任意 KDE 应用、页面或动作均已通过；
+整个 case 不使用 OCR、截图或用户配置目录。
 代码中为 Qt 5 Widgets 保留了保守的已观测映射：按钮只有在 exact canonical `Press`
 唯一存在时才公开 `invoke`；由于 Qt 5 bridge 不导出 `AccessibleId`，写前身份验证要求
 bus/object path、toolkit/version 与进程 ID 全部一致，并继续比较语义指纹。该映射只有在
