@@ -92,7 +92,12 @@ def main() -> int:
         def snapshot() -> dict[str, object]:
             result = plugin.invoke(
                 "desktop.linux_atspi.snapshot@1",
-                {"application": selector, "max_depth": 8, "max_nodes": 64},
+                # Qt may expose transient implementation children (for example
+                # style or input-method accessibles) in addition to the owned
+                # fixture controls. Keep the snapshot bounded, but leave enough
+                # headroom that those children do not make native qualification
+                # depend on the host's Qt theme or accessibility configuration.
+                {"application": selector, "max_depth": 8, "max_nodes": 256},
             )
             if result.get("truncated") is not False:
                 raise RuntimeError("fixture snapshot was truncated")
