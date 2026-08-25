@@ -137,7 +137,8 @@ sh plugins/linux_atspi/build_x11_xtest_helper.sh
 
 PYTHONPATH=src PYTHONDONTWRITEBYTECODE=1 /usr/bin/python3 -m unittest -q \
   tests.test_linux_atspi_native
-# 结果：16 tests，OK（skipped=5）；其中 NativeIsolatedX11ActionTests 为 8 tests，OK
+# 结果：18 tests，OK（skipped=6）；其中 NativeIsolatedX11ActionTests 为 10 tests，
+# OK（skipped=1；当前会话无 XAUTHORITY 时，相关负向 case 跳过）
 # KCalc 的 1+2=3 与 QML Press 都由 fresh snapshot 验证，未使用 OCR
 
 PYTHONPATH=src /usr/bin/python3 tests/linux/kde_app_qualifier.py \

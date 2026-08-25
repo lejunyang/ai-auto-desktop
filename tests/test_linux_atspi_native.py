@@ -222,28 +222,26 @@ def _stop_exact_processes(identities: list[tuple[int, int, int]]) -> bool:
     """终止已经观测并以 PID/starttime 绑定的自有进程。"""
 
     identities = list(dict.fromkeys(identities))
-    group_ids = sorted({
-        group_id
-        for pid, group_id, _start in identities
-        if pid == group_id and group_id != os.getpgrp()
-    })
-    for group_id in group_ids:
-        try:
-            os.killpg(group_id, signal.SIGTERM)
-        except (OSError, ProcessLookupError):
-            pass
+    group_leaders = [
+        identity
+        for identity in identities
+        if identity[0] == identity[1] and identity[1] != os.getpgrp()
+    ]
+    for identity in group_leaders:
+        if _identity_is_current(identity):
+            try:
+                os.killpg(identity[1], signal.SIGTERM)
+            except (OSError, ProcessLookupError):
+                pass
     deadline = time.monotonic() + 3
     while time.monotonic() < deadline and any(
         _identity_is_current(item) for item in identities
     ):
         time.sleep(0.02)
-    for group_id in group_ids:
-        if any(
-            identity[1] == group_id and _identity_is_current(identity)
-            for identity in identities
-        ):
+    for identity in group_leaders:
+        if _identity_is_current(identity):
             try:
-                os.killpg(group_id, signal.SIGKILL)
+                os.killpg(identity[1], signal.SIGKILL)
             except (OSError, ProcessLookupError):
                 pass
     for identity in identities:
@@ -260,7 +258,10 @@ def _run_bounded_process_group(
 ) -> tuple[int | None, bytes, bytes, bool, bool]:
     """运行隔离 helper，并持续记录可安全回收的精确后代身份。"""
 
-    with tempfile.TemporaryFile() as stdout_file, tempfile.TemporaryFile() as stderr_file:
+    with (
+        tempfile.TemporaryFile() as stdout_file,
+        tempfile.TemporaryFile() as stderr_file,
+    ):
         process = subprocess.Popen(
             command,
             env=environment,
@@ -1072,6 +1073,7 @@ class NativeIsolatedX11ActionTests(unittest.TestCase):
         session = _kde_x11_test_environment()
         if session is None:
             self.skipTest("需要当前用户的 KDE/X11 会话作为资格门")
+        self.session = session
         self.base_environment = os.environ.copy()
         self.base_environment.update(session)
         self.base_environment["PYTHONPATH"] = str(PROJECT_ROOT / "src")
@@ -1087,7 +1089,10 @@ class NativeIsolatedX11ActionTests(unittest.TestCase):
         self.xauthority.chmod(0o600)
         cookie = secrets.token_hex(16)
         authorization = subprocess.run(
-            [shutil.which("xauth"), "-f", str(self.xauthority), "add", self.display, ".", cookie],
+            [
+                shutil.which("xauth"), "-f", str(self.xauthority),
+                "add", self.display, ".", cookie,
+            ],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -1328,7 +1333,10 @@ class NativeIsolatedX11ActionTests(unittest.TestCase):
         self.assertIsInstance(report["application_process_start_time"], int)
         self.assertGreater(report["application_process_start_time"], 0)
         self.assertEqual(report["toolkit"], "Qt")
-        self.assertRegex(report["application_version"], r"^[0-9]+:[0-9]+(?:\.[0-9]+)+(?:[-+~].*)?$")
+        self.assertRegex(
+            report["application_version"],
+            r"^[0-9]+:[0-9]+(?:\.[0-9]+)+(?:[-+~].*)?$",
+        )
         self.assertEqual(report["display"], self.display)
         self.assertEqual(
             report["display_kind"], "private_xvfb_without_window_manager"
@@ -1399,6 +1407,94 @@ class NativeIsolatedX11ActionTests(unittest.TestCase):
             "AI_AUTO_DESKTOP_TEST_PRIVATE_TOKEN",
         ):
             environment.pop(key, None)
+        completed = subprocess.run(
+            [sys.executable, str(KCALC_RUNNER), kcalc, str(DRIVER_PATH)],
+            env=environment,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            check=False,
+            timeout=5,
+        )
+        self.assertEqual(completed.returncode, 64)
+        self.assertEqual(
+            json.loads(completed.stdout),
+            {"status": "failed", "reason": "private_xvfb_not_proven"},
+        )
+
+    def test_kcalc_runner_rejects_real_session_xauthority(self) -> None:
+        kcalc = shutil.which("kcalc")
+        if kcalc is None:
+            self.skipTest("KCalc 安全门测试需要 kcalc")
+        environment = dict(self.base_environment)
+        private_root = Path(self.temporary.name)
+        token = secrets.token_hex(32)
+        token_path = private_root / ".xvfb-owner-token"
+        token_path.write_text(token, encoding="ascii")
+        token_path.chmod(0o600)
+        environment["AI_AUTO_DESKTOP_TEST_XVFB_DISPLAY"] = self.display
+        environment["AI_AUTO_DESKTOP_TEST_XVFB_PID"] = str(self.xvfb.pid)
+        environment["AI_AUTO_DESKTOP_TEST_XVFB_START_TIME"] = str(
+            self.xvfb_start_time
+        )
+        environment["AI_AUTO_DESKTOP_TEST_PRIVATE_ROOT"] = str(private_root)
+        environment["AI_AUTO_DESKTOP_TEST_PRIVATE_TOKEN"] = token
+        real_xauthority = self.session.get("XAUTHORITY")
+        if not real_xauthority:
+            self.skipTest("当前 KDE 会话没有可用于负向测试的 XAUTHORITY")
+        environment["XAUTHORITY"] = real_xauthority
+        completed = subprocess.run(
+            [sys.executable, str(KCALC_RUNNER), kcalc, str(DRIVER_PATH)],
+            env=environment,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            check=False,
+            timeout=5,
+        )
+        self.assertEqual(completed.returncode, 64)
+        self.assertEqual(
+            json.loads(completed.stdout),
+            {"status": "failed", "reason": "private_xvfb_not_proven"},
+        )
+
+    def test_kcalc_runner_rejects_symlinked_private_home(self) -> None:
+        kcalc = shutil.which("kcalc")
+        if kcalc is None:
+            self.skipTest("KCalc 安全门测试需要 kcalc")
+        private_root = Path(self.temporary.name)
+        private_token = secrets.token_hex(32)
+        token_path = private_root / ".xvfb-owner-token"
+        token_path.write_text(private_token, encoding="ascii")
+        token_path.chmod(0o600)
+        real_home = private_root / "real-home"
+        real_home.mkdir(mode=0o700)
+        symlinked_home = private_root / "home-link"
+        symlinked_home.symlink_to(real_home, target_is_directory=True)
+        environment = dict(self.base_environment)
+        environment["HOME"] = str(symlinked_home)
+        for key, leaf in (
+            ("XDG_CONFIG_HOME", "config"),
+            ("XDG_CACHE_HOME", "cache"),
+            ("XDG_DATA_HOME", "data"),
+            ("XDG_STATE_HOME", "state"),
+            ("XDG_RUNTIME_DIR", "runtime"),
+        ):
+            directory = private_root / leaf
+            directory.mkdir(mode=0o700)
+            environment[key] = str(directory)
+        environment.pop("AT_SPI_BUS_ADDRESS", None)
+        environment["AI_AUTO_DESKTOP_TEST_XVFB_DISPLAY"] = self.display
+        environment["AI_AUTO_DESKTOP_TEST_XVFB_PID"] = str(self.xvfb.pid)
+        environment["AI_AUTO_DESKTOP_TEST_XVFB_START_TIME"] = str(
+            self.xvfb_start_time
+        )
+        environment["AI_AUTO_DESKTOP_TEST_PRIVATE_ROOT"] = str(private_root)
+        environment["AI_AUTO_DESKTOP_TEST_PRIVATE_TOKEN"] = private_token
         completed = subprocess.run(
             [sys.executable, str(KCALC_RUNNER), kcalc, str(DRIVER_PATH)],
             env=environment,

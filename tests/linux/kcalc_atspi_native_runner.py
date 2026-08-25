@@ -87,13 +87,17 @@ def main() -> int:
         print(json.dumps({"status": "failed", "reason": "invalid_kcalc"}))
         return 64
     display = os.environ.get("DISPLAY", "")
+    session_bus = os.environ.get("DBUS_SESSION_BUS_ADDRESS", "")
     expected_display = os.environ.get("AI_AUTO_DESKTOP_TEST_XVFB_DISPLAY", "")
     expected_xvfb_pid = os.environ.get("AI_AUTO_DESKTOP_TEST_XVFB_PID", "")
-    expected_xvfb_start = os.environ.get("AI_AUTO_DESKTOP_TEST_XVFB_START_TIME", "")
+    expected_xvfb_start = os.environ.get(
+        "AI_AUTO_DESKTOP_TEST_XVFB_START_TIME", ""
+    )
     private_root = os.environ.get("AI_AUTO_DESKTOP_TEST_PRIVATE_ROOT", "")
     private_token = os.environ.get("AI_AUTO_DESKTOP_TEST_PRIVATE_TOKEN", "")
     if (
         not PRIVATE_DISPLAY_PATTERN.fullmatch(display)
+        or not session_bus.startswith("unix:path=/tmp/dbus-")
         or display != expected_display
         or not expected_xvfb_pid.isdecimal()
         or not expected_xvfb_start.isdecimal()
@@ -107,14 +111,23 @@ def main() -> int:
     root = supplied_root.resolve()
     try:
         supplied_root_metadata = supplied_root.lstat()
-        xvfb_executable = (Path("/proc") / str(xvfb_pid) / "exe").resolve(strict=True)
+        xvfb_executable = (
+            Path("/proc") / str(xvfb_pid) / "exe"
+        ).resolve(strict=True)
         xvfb_uid = (Path("/proc") / str(xvfb_pid)).stat().st_uid
         xvfb_start = _process_start_time(xvfb_pid)
-        xvfb_argv = (Path("/proc") / str(xvfb_pid) / "cmdline").read_bytes().split(b"\0")
-        own_paths = [Path(os.environ[name]).resolve() for name in (
+        xvfb_argv = (
+            Path("/proc") / str(xvfb_pid) / "cmdline"
+        ).read_bytes().split(b"\0")
+        own_path_names = (
             "HOME", "XDG_CONFIG_HOME", "XDG_CACHE_HOME",
             "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_RUNTIME_DIR",
-        )]
+        )
+        own_path_items = []
+        for name in own_path_names:
+            supplied_path = Path(os.environ[name])
+            metadata = supplied_path.lstat()
+            own_path_items.append((supplied_path.resolve(), metadata))
         root_metadata = root.stat()
         token_path = root / ".xvfb-owner-token"
         token_metadata = token_path.lstat()
@@ -143,7 +156,16 @@ def main() -> int:
         or token_metadata.st_uid != os.getuid()
         or stat.S_IMODE(token_metadata.st_mode) != 0o600
         or token_value != private_token
-        or any(root != item and root not in item.parents for item in own_paths)
+        or any(
+            (
+                (root != resolved and root not in resolved.parents)
+                or stat.S_ISLNK(metadata.st_mode)
+                or not stat.S_ISDIR(metadata.st_mode)
+                or metadata.st_uid != os.getuid()
+                or stat.S_IMODE(metadata.st_mode) != 0o700
+            )
+            for resolved, metadata in own_path_items
+        )
         or root not in xauthority.parents
         or stat.S_ISLNK(xauthority_metadata.st_mode)
         or not stat.S_ISREG(xauthority_metadata.st_mode)
@@ -167,7 +189,9 @@ def main() -> int:
     environment.pop("AT_SPI_BUS_ADDRESS", None)
     dpkg_query = Path("/usr/bin/dpkg-query")
     if not dpkg_query.is_file():
-        print(json.dumps({"status": "failed", "reason": "kcalc_version_unavailable"}))
+        print(json.dumps({
+            "status": "failed", "reason": "kcalc_version_unavailable"
+        }))
         return 1
     version = subprocess.run(
         [str(dpkg_query), "-W", "-f=${Version}", "kcalc"],
@@ -182,7 +206,9 @@ def main() -> int:
     )
     version_text = version.stdout.strip()[:200]
     if version.returncode != 0 or not version_text:
-        print(json.dumps({"status": "failed", "reason": "kcalc_version_unavailable"}))
+        print(json.dumps({
+            "status": "failed", "reason": "kcalc_version_unavailable"
+        }))
         return 1
     package_owner = subprocess.run(
         [str(dpkg_query), "-S", str(executable)],
@@ -195,7 +221,10 @@ def main() -> int:
         check=False,
         timeout=5,
     )
-    if package_owner.returncode != 0 or package_owner.stdout.strip() != "kcalc: /usr/bin/kcalc":
+    if (
+        package_owner.returncode != 0
+        or package_owner.stdout.strip() != "kcalc: /usr/bin/kcalc"
+    ):
         print(json.dumps({"status": "failed", "reason": "kcalc_package_untrusted"}))
         return 1
 
@@ -211,7 +240,9 @@ def main() -> int:
         application_start_time = _process_start_time(application_process.pid)
     except (OSError, UnicodeError, ValueError, IndexError):
         _stop_owned(application_process)
-        print(json.dumps({"status": "failed", "reason": "kcalc_identity_unavailable"}))
+        print(json.dumps({
+            "status": "failed", "reason": "kcalc_identity_unavailable"
+        }))
         return 1
     plugin: ProcessPlugin | None = None
     stage = "registration"
@@ -397,7 +428,7 @@ def main() -> int:
                 "x11_tcp_disabled": True,
                 "private_xauthority": True,
                 "private_session_bus": bool(
-                    os.environ.get("DBUS_SESSION_BUS_ADDRESS")
+                    session_bus
                 ),
                 "private_home_xdg": True,
                 "window_manager_started": False,
