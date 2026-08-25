@@ -1499,6 +1499,138 @@ class LinuxAtspiDriverCoreTests(unittest.TestCase):
             sum(1 for call in calls if call[0] == "set_timeout"), 6
         )
 
+    def test_pygobject_point_lookup_stops_on_repeated_accessible(self) -> None:
+        calls: list[str] = []
+
+        class Component:
+            def __init__(self, hit: object | None = None) -> None:
+                self.hit = hit
+
+            def get_extents(self, coord_type: object) -> object:
+                return type(
+                    "Rectangle", (),
+                    {"x": 0, "y": 0, "width": 100, "height": 100},
+                )()
+
+            def get_accessible_at_point(
+                self, x: int, y: int, coord_type: object
+            ) -> object:
+                calls.append("hit")
+                assert self.hit is not None
+                return self.hit
+
+        class Accessible:
+            app = type("Application", (), {"bus_name": ":1.9"})()
+
+            def __init__(self, path: str) -> None:
+                self.path = path
+                self.component = Component()
+
+            def get_component_iface(self) -> object:
+                return self.component
+
+        first = Accessible("/first")
+        second = Accessible("/second")
+        first.component.hit = second
+        second.component.hit = first
+        backend = object.__new__(atspi.PyGObjectAtspiBackend)
+        backend.Atspi = type(
+            "Atspi",
+            (),
+            {
+                "CoordType": type("CoordType", (), {"SCREEN": "screen"}),
+                "set_timeout": staticmethod(lambda *_: None),
+            },
+        )
+        backend.same_element = lambda previous, current, **_: previous is current
+        hit = backend.accessible_at_point(first, 50, 50, deadline=deadline())
+        self.assertIs(hit, first)
+        self.assertEqual(calls, ["hit", "hit"])
+
+    def test_pygobject_point_lookup_skips_zero_area_container(self) -> None:
+        class Component:
+            calls = 0
+
+            @staticmethod
+            def get_extents(coord_type: object) -> object:
+                return type(
+                    "Rectangle", (),
+                    {"x": 0, "y": 0, "width": 0, "height": 100},
+                )()
+
+            @classmethod
+            def get_accessible_at_point(
+                cls, x: int, y: int, coord_type: object
+            ) -> object:
+                cls.calls += 1
+                raise AssertionError("zero-area component must not be queried")
+
+        class Accessible:
+            app = type("Application", (), {"bus_name": ":1.9"})()
+            path = "/zero-area"
+
+            @staticmethod
+            def get_component_iface() -> object:
+                return Component()
+
+        backend = object.__new__(atspi.PyGObjectAtspiBackend)
+        backend.Atspi = type(
+            "Atspi",
+            (),
+            {
+                "CoordType": type("CoordType", (), {"SCREEN": "screen"}),
+                "set_timeout": staticmethod(lambda *_: None),
+            },
+        )
+        self.assertIsNone(
+            backend.accessible_at_point(
+                Accessible(), 50, 50, deadline=deadline()
+            )
+        )
+        self.assertEqual(Component.calls, 0)
+
+    def test_pygobject_point_lookup_has_a_hard_hop_limit(self) -> None:
+        class Component:
+            def __init__(self, owner: object) -> None:
+                self.owner = owner
+
+            @staticmethod
+            def get_extents(coord_type: object) -> object:
+                return type(
+                    "Rectangle", (),
+                    {"x": 0, "y": 0, "width": 100, "height": 100},
+                )()
+
+            def get_accessible_at_point(
+                self, x: int, y: int, coord_type: object
+            ) -> object:
+                return type(self.owner)(self.owner.index + 1)
+
+        class Accessible:
+            app = type("Application", (), {"bus_name": ":1.9"})()
+
+            def __init__(self, index: int) -> None:
+                self.index = index
+                self.path = f"/node/{index}"
+
+            def get_component_iface(self) -> object:
+                return Component(self)
+
+        backend = object.__new__(atspi.PyGObjectAtspiBackend)
+        backend.Atspi = type(
+            "Atspi",
+            (),
+            {
+                "CoordType": type("CoordType", (), {"SCREEN": "screen"}),
+                "set_timeout": staticmethod(lambda *_: None),
+            },
+        )
+        backend.same_element = lambda previous, current, **_: previous is current
+        hit = backend.accessible_at_point(
+            Accessible(0), 50, 50, deadline=deadline()
+        )
+        self.assertEqual(hit.index, atspi.MAX_DEPTH + 1)
+
     def test_pygobject_named_actions_match_only_exact_gtk3_canonical_names(self) -> None:
         calls: list[tuple[object, ...]] = []
 

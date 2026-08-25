@@ -2358,7 +2358,37 @@ class PyGObjectAtspiBackend:
         if coord_type is None:
             return None
 
+        seen: set[tuple[str | None, str | None]] = set()
+        # A provider can return itself, an ancestor, or a short cycle for
+        # implementation containers. Keep this lookup independently bounded
+        # from the snapshot traversal.
+        remaining_hops = MAX_DEPTH + 1
+
         def descend(accessible: Any, screen_x: int, screen_y: int) -> Any | None:
+            nonlocal remaining_hops
+            if remaining_hops <= 0:
+                return accessible
+            remaining_hops -= 1
+            identity = self._identity(accessible)
+            if all(identity):
+                if identity in seen:
+                    return accessible
+                seen.add(identity)
+            # A fresh tree already bounds candidate descendants.  Avoid asking
+            # Qt container nodes without a usable on-screen rectangle: some
+            # bridges expose Component but block in get_accessible_at_point for
+            # hidden/zero-area implementation containers.
+            bounds = self._bounds(accessible, deadline=deadline)
+            if (
+                bounds is None
+                or bounds["width"] <= 0
+                or bounds["height"] <= 0
+                or screen_x < bounds["x"]
+                or screen_y < bounds["y"]
+                or screen_x >= bounds["x"] + bounds["width"]
+                or screen_y >= bounds["y"] + bounds["height"]
+            ):
+                return None
             component = self._interface(
                 accessible, "get_component_iface", deadline=deadline
             )
@@ -2376,6 +2406,9 @@ class PyGObjectAtspiBackend:
             if hit is None:
                 return None
             if self.same_element(hit, accessible, deadline=deadline):
+                return hit
+            hit_identity = self._identity(hit)
+            if all(hit_identity) and hit_identity in seen:
                 return hit
             deeper = descend(hit, screen_x, screen_y)
             return deeper if deeper is not None else hit
