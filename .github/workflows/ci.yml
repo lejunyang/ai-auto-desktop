@@ -40,6 +40,9 @@ jobs:
       - name: Validate canonical example
         if: success()
         run: python -m ai_auto_desktop validate examples/workflows/ocr-error-response.json
+      - name: Gate tracked workflow examples
+        if: success()
+        run: python -m unittest tests.test_examples -v
       - name: Smoke capability probe
         if: success()
         run: python -m ai_auto_desktop probe
@@ -70,6 +73,9 @@ jobs:
       - name: Validate canonical example
         if: success()
         run: python -m ai_auto_desktop validate examples/workflows/ocr-error-response.json
+      - name: Gate tracked workflow examples
+        if: success()
+        run: python -m unittest tests.test_examples -v
       - name: Smoke capability probe
         if: success()
         run: python -m ai_auto_desktop probe

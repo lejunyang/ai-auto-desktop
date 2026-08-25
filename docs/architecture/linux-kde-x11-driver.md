@@ -180,8 +180,10 @@ AT-SPI bus。完整语义后端还需要 `Atspi 2.0` typelib；缺少该 typelib
 真机 smoke 仅在依赖与桌面确实可用时枚举应用并抓取有界快照；无 GUI、无 Gio 或无
 AT-SPI bus 时保守跳过或确认 `DRIVER.UNAVAILABLE`，不会把测试环境缺失误报为驱动
 成功。测试辅助可以从当前用户的 `kwin_x11` 进程恢复遗漏的 KDE/X11 环境变量，但这条
-逻辑不进入生产驱动。System Settings 未注册进 AT-SPI registry 时，测试明确报告当前
-Qt AT-SPI bridge 不可用并跳过，不把进程启动成功误作可访问性支持成功。
+逻辑不进入生产驱动。若某次运行中 System Settings 未注册进 AT-SPI registry，测试会
+明确报告当前 Qt AT-SPI bridge 不可用并跳过，不把进程启动成功误作可访问性支持成功；
+当前仓库记录的资格结果里，System Settings 已在 qualifier 的私有 bus 中完成精确 PID
+注册和只读快照验证。
 仓库还提供自有 GTK3 fixture；当系统安装 `Atspi 2.0` typelib 时，它通过正式进程驱动
 真实验证 `snapshot/find`、`Component.grab_focus`、`EditableText.set_text_contents` 与
 `Action.do_action`；动作后还会重新抓取快照核对文本、checked 和 expanded 状态。当前

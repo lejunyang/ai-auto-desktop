@@ -66,6 +66,15 @@ class CiTriggerContractTests(unittest.TestCase):
             )
         self.assertIn("id: windows-native-fixture", windows_job)
 
+    def test_all_platform_jobs_gate_every_tracked_workflow_example(self) -> None:
+        source = CI_WORKFLOW.read_text(encoding="utf-8")
+        automatic_job, windows_job = source.split("  windows-native:", 1)
+
+        for name, job in (("automatic", automatic_job), ("windows", windows_job)):
+            with self.subTest(job=name):
+                self.assertIn("- name: Gate tracked workflow examples", job)
+                self.assertIn("python -m unittest tests.test_examples -v", job)
+
     def test_windows_result_runner_has_stable_machine_readable_fields(self) -> None:
         source = WINDOWS_RESULT_RUNNER.read_text(encoding="utf-8")
 

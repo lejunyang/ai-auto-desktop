@@ -63,5 +63,6 @@ Apple Silicon macOS 也不适合作为当前 x86_64 主机上的全系统跨架�
   `/proc`。系统现已安装 Atspi typelib、GTK bridge、Qt 5 开发包和 XTest 开发包，并在已解锁
   的真实 `DISPLAY=:10.0` 上通过 GTK3/Qt5 自有 fixture 的语义读取、写动作与显式 XTEST
   UTF-8 文本输入，再由 fresh AT-SPI snapshot 验证结果。私有 Xvfb + 隔离 AT-SPI bus 的
-  同类测试也通过。锁屏会阻断输入，生产驱动不会主动解锁；System Settings 等真实 KDE
-  应用矩阵仍待资格验证。
+  同类测试也通过。Dolphin、Konsole、System Settings 与自有 Qt Quick/QML fixture 的
+  初始窗口只读矩阵现已完成，写动作派发数为零；锁屏会阻断输入，生产驱动不会主动解锁，
+  真实 KDE 应用写动作、第三方 QML 页面、多窗口和动态页面仍待独立资格验证。

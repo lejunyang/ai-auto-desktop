@@ -4,7 +4,7 @@
   "metadata": {
     "name": "ocr-error-response",
     "version": "1.0.0",
-    "description": "Explicit OCR step followed by a deterministic structured low-confidence error."
+    "description": "显式 OCR 步骤后返回确定性的低置信度结构化错误。"
   },
   "requires": {
     "runtime": ">=0.1.0",
@@ -80,7 +80,7 @@
           "type": "fail",
           "error": {
             "code": "OCR.LOW_CONFIDENCE",
-            "message": "OCR confidence is below the required threshold",
+            "message": "OCR 置信度低于要求阈值",
             "retryable": false,
             "effect": "not_applied",
             "details": {
