@@ -12,8 +12,8 @@
 
 | 应用 | 结果 | 注册延迟 | 快照延迟 | 元素数 | 暴露的语义动作 |
 | --- | --- | ---: | ---: | ---: | --- |
-| Konsole | `supported / observed_read_only` | 406.64 ms | 1066.61 ms | 352 | focus 61、invoke 30、set_text 16 |
-| System Settings | `supported / observed_read_only` | 1597.05 ms | 724.27 ms | 256 | focus 27、invoke 9 |
+| Konsole | `supported / observed_read_only` | 406.26 ms | 1089.88 ms | 352 | focus 61、invoke 30、set_text 16 |
+| System Settings | `supported / observed_read_only` | 1614.83 ms | 696.78 ms | 256 | focus 27、invoke 9 |
 
 这里的“暴露动作”只表示 snapshot 中 driver 根据 AT-SPI 信息声明了相应语义能力；
 本次 qualifier 没有调用它们，不能据此宣称写动作通过。System Settings 若在其他环境
@@ -62,6 +62,63 @@ PYTHONPATH=src python tests/linux/kde_app_qualifier.py \
 PYTHONPATH=src python -m unittest tests.test_linux_kde_qualification -v
 ```
 
+## 本机原生复测记录
+
+2026-08-25 的复测宿主是 `veLinux GNU/Linux 2 (lyra)`、内核
+`5.15.120.bsk.3-amd64`、x86_64。活动图形会话由 `xrdp-sesman` 启动，
+`loginctl` 报告 session `c2` 为 active X11，实际进程为 X.Org `:10.0`、
+`kwin_x11` 和 Plasma `5.27.5`。`xdpyinfo` 确认 X.Org `1.21.1.7`，扩展列表
+包含 `XTEST`；`org.a11y.Bus.GetAddress` 返回当前用户的 AT-SPI bus 地址。
+
+测试开始时该会话的 `LockedHint=yes`，KDE 屏保也报告 active。因此结果严格
+区分以下三类：
+
+- **真实 KDE display 通过**：自有 GTK3 fixture 在 `:10.0` 上通过
+  `snapshot/find/focus/set_text/invoke/toggle/expand/collapse`；自有 Qt 5 Widgets
+  fixture 通过 `snapshot/find/focus/set_text/invoke`。两者使用生产 driver 和真实
+  AT-SPI bridge，不使用 OCR 或坐标点击。
+- **本机私有 X11 通过**：私有 Xvfb、私有 AT-SPI bus 上，GTK3 与 Qt5 fixture
+  均通过 XTest helper 输入 UTF-8 文本并由 fresh snapshot 验证后置条件；负向测试
+  同时证明 helper 在 Wayland profile 或焦点 PID 不匹配时会在派发前拒绝。
+- **真实 KDE display 输入跳过**：因 `LockedHint=yes`，测试没有尝试向锁屏会话
+  注入按键。`XTEST` 扩展可见不等于锁屏后的应用能够接收事件，因此本轮不能声明
+  已解锁 KDE 桌面的 `type_text` 端到端通过。
+
+定向命令与输出摘要：
+
+```bash
+# 安装本轮唯一缺少的测试入口；其余 GTK/Qt/AT-SPI/X11 开发依赖均已存在
+sudo -n apt-get install -y --no-install-recommends python3-pytest
+# 结果：0 upgraded, 7 newly installed；python3-pytest 7.2.1-2
+
+PYTHONPATH=src /usr/bin/python3 -m pytest -q \
+  tests/test_linux_atspi_driver.py tests/test_linux_kde_qualification.py
+# 结果：36 passed in 0.70s
+
+sh plugins/linux_atspi/build_x11_xtest_helper.sh
+# 结果：生成 .build/x11_xtest_helper；链接 libX11.so.6 与 libXtst.so.6
+
+PYTHONPATH=src /usr/bin/python3 -m pytest -vv -rs \
+  tests/test_linux_atspi_native.py
+# 结果：5 passed, 5 skipped in 25.63s
+
+PYTHONPATH=src /usr/bin/python3 tests/linux/kde_app_qualifier.py \
+  --output artifacts/kde-x11-qualification.json
+# 结果：2 supported, 0 unsupported, 0 error；总耗时 4890.09 ms
+```
+
+native suite 的五个 skip 均有明确边界：Atspi typelib 已安装而无需测试 Gio
+fallback；长期桌面 registry 当时没有应用，两个基础设施 smoke 因此跳过；System
+Settings 没有注册到长期 registry；真实 KDE display 的 GTK XTEST 用例因锁屏跳过。
+System Settings 随后在 qualifier 的私有 bus 中以精确自有 PID 成功注册并完成快照，
+所以长期 registry 的 skip 不影响上表只读资格结论。
+
+同一环境运行只读 capability probe 时，最初使用完整 `xdpyinfo` 输出触发了 65,536 bytes
+通用上限，产生 `linux.x11=unknown` 误阴性。probe 已改为读取根窗口单个属性的有界
+`xprop` 查询，并在同一 `:10.0` 会话复测为 `linux.x11=available/query=ok`。最终汇总为
+3 项 available、1 项 degraded、2 项 unavailable、0 项 unknown；其中 AT-SPI、X11 与
+RemoteDesktop portal 可用，uinput 因当前进程不可写而 degraded，Wayland 与 libei 不可用。
+
 ## 当前边界
 
 - 这轮只覆盖应用初始窗口的一次有界快照，没有覆盖对话框、多窗口、动态页面、虚拟列表、
@@ -70,3 +127,5 @@ PYTHONPATH=src python -m unittest tests.test_linux_kde_qualification -v
   数值以忽略的 JSON artifact 为准。
 - 尚未执行任何低风险写动作；若以后增加，仍须限定自有 PID、使用 `find` 返回的 target 与
   exact locator、重新抓树验证后置条件，并在报告中逐项记录。
+- 本轮只在自有 fixture 上执行语义写动作；真实 KDE 应用资格矩阵保持只读。活动 KDE
+  display 处于锁屏状态，因此未覆盖已解锁桌面上的 XTEST 后置条件。

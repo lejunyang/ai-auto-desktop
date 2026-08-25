@@ -449,16 +449,26 @@ def _probe_linux_atspi(environ: Mapping[str, str]) -> CapabilityCheck:
 
 def _probe_linux_x11(environ: Mapping[str, str]) -> CapabilityCheck:
     display = bool(environ.get("DISPLAY"))
-    tool_path = _which("xdpyinfo")
+    # ``xdpyinfo`` dumps every visual by default and can easily exceed the
+    # generic probe output cap on modern or remote displays.  ``xprop`` with
+    # one root-window atom is a bounded, read-only round trip that proves the
+    # advertised display and Xauthority are usable without consuming pixels
+    # or injecting input.
+    tool_path = _which("xprop")
     tool = tool_path is not None
-    evidence: dict[str, Any] = {"display_advertised": display, "libx11_found": _library_found("X11"), "xdpyinfo_found": tool, "query": "not_run"}
+    evidence: dict[str, Any] = {
+        "display_advertised": display,
+        "libx11_found": _library_found("X11"),
+        "xprop_found": tool,
+        "query": "not_run",
+    }
     if not display:
         return CapabilityCheck("linux.x11", "unavailable", "No X11 display is advertised to this process.", evidence)
     if not tool:
         return CapabilityCheck("linux.x11", "degraded", "An X11 display is advertised, but it was not possible to query it.", evidence)
     assert tool_path is not None
     result = _run_read_only(
-        (tool_path,),
+        (tool_path, "-root", "_NET_SUPPORTING_WM_CHECK"),
         environ=environ,
         pass_environment=("DISPLAY", "XAUTHORITY"),
     )

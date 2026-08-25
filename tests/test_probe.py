@@ -127,6 +127,29 @@ class ProbeTests(unittest.TestCase):
         self.assertEqual(result.outcome, "error")
         popen.assert_not_called()
 
+    def test_x11_probe_uses_bounded_root_property_query(self) -> None:
+        environment = {"DISPLAY": ":10.0", "XAUTHORITY": "/tmp/auth"}
+        with (
+            mock.patch.object(probe, "_which", return_value="/usr/bin/xprop"),
+            mock.patch.object(probe, "_library_found", return_value=True),
+            mock.patch.object(
+                probe, "_run_read_only",
+                return_value=probe._CommandResult("ok", 0, "atom(WINDOW)"),
+            ) as run,
+        ):
+            result = probe._probe_linux_x11(environment)
+
+        self.assertEqual(result.state, "available")
+        self.assertTrue(result.evidence["xprop_found"])
+        self.assertEqual(
+            run.call_args.args[0],
+            ("/usr/bin/xprop", "-root", "_NET_SUPPORTING_WM_CHECK"),
+        )
+        self.assertEqual(
+            run.call_args.kwargs["pass_environment"],
+            ("DISPLAY", "XAUTHORITY"),
+        )
+
     def test_session_probe_tolerates_missing_stdin(self) -> None:
         with mock.patch.object(probe.sys, "stdin", None):
             session = probe._session_info("linux", {})

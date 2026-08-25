@@ -59,7 +59,7 @@
 ### Linux 系统
 
 - `linux.at_spi`：通过 `gdbus` 调用只读 `org.a11y.Bus.GetAddress`；同时记录 AT-SPI 地址、session bus、libatspi 与查询工具是否可见，但不读取 accessibility tree。
-- `linux.x11`：记录 DISPLAY、libX11、`xdpyinfo`，并在可用时做有界元数据查询；不执行 XTEST 或输入注入。
+- `linux.x11`：记录 DISPLAY、libX11、`xprop`，并通过读取根窗口单个属性做有界元数据查询；不执行 XTEST 或输入注入。
 - `linux.wayland`：只检查 WAYLAND_DISPLAY 与对应 socket 元数据，不连接 compositor。
 - `linux.remote_desktop_portal`：只读取 `org.freedesktop.portal.RemoteDesktop` 的 `version` 属性，不调用 `CreateSession`、`SelectDevices` 或 `Start`，因此不证明用户会授权或 compositor 会提供 EIS。
 - `linux.libei`：检查 libei/liboeffis 和已知诊断命令是否可发现，不建立连接。
