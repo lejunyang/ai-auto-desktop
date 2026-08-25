@@ -53,7 +53,14 @@ collapse，也不保留节点名称和值；机器报告只保留完整度计数
 
 报告包括主机/Plasma/Qt/X11/应用版本、backend、注册和 snapshot 延迟、编码大小、
 `truncated`、元素数、role/name/description/value/state 完整度、driver 语义动作、错误和
-清理结果。`unsupported` 是有效的资格结论，不会伪装成成功。
+清理结果。`unsupported` 是有效的资格结论，不会伪装成成功。qualifier 的退出码也代表
+资格结论：只有默认 `APP_SPECS` 中每个必选应用均为
+`supported / observed_read_only`、snapshot 未截断、自有进程组清理成功且
+`writes_dispatched` 为空时才返回 0；`unsupported`、`error` 或任一安全条件不成立均返回非 0，
+但报告仍会原子写入指定路径。外层私有 D-Bus 运行达到 75 秒上限时，会依据启动时记录的
+PID、进程组和 Linux `/proc` starttime 有界清理已观测到的自有进程树，再写入 `error` 报告。
+`--app` 子集运行可用于定向诊断并照常写 JSON，但不是完整矩阵，因此 qualifier 和严格
+验真器都会返回非 0，不能将子集误当成整套资格通过。
 
 运行：
 
@@ -62,10 +69,27 @@ PYTHONPATH=src python tests/linux/kde_app_qualifier.py \
   --output artifacts/kde-x11-qualification.json
 ```
 
+报告需要作为门禁输入时，再运行本地验真器：
+
+```bash
+tests/linux/verify-kde-result.sh artifacts/kde-x11-qualification.json
+```
+
+验真器只读取不超过 1 MiB 的普通 JSON 文件，拒绝 symlink、非普通文件、重复 JSON key、
+非有限数值与不支持的 schema。它从同版本 `kde_app_qualifier.py` 的 `APP_SPECS` 字面量读取
+必选应用集合（因此 Dolphin、QML fixture 或后续新增项不会被静态名单漏掉），并核对顶层与
+summary 一致性、应用唯一性和完整性、`support_level`、snapshot bounds/`truncated`、
+launch/AT-SPI/snapshot 的 exact PID、聚合且无 UI 文本的 content retention、安全隔离字段、
+cleanup 证明以及零写动作。通过时输出 verifier schema
+`ai-auto-desktop.kde-x11-result-verifier/v1`、`qualified=true` 并返回 0；格式有效但资格不通过
+以及格式不可信时均 fail closed、输出机器可读错误并返回非 0。
+
 确定性契约测试不启动 GUI：
 
 ```bash
-PYTHONPATH=src python -m unittest tests.test_linux_kde_qualification -v
+PYTHONPATH=src python -m unittest \
+  tests.test_linux_kde_qualification \
+  tests.test_linux_kde_result_verifier -v
 ```
 
 ## 本机原生复测记录

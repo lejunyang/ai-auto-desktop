@@ -3,9 +3,15 @@
 from __future__ import annotations
 
 import importlib.util
+import copy
+import os
+import json
 from pathlib import Path
 import sys
+import tempfile
+import time
 import unittest
+from unittest import mock
 
 
 QUALIFIER_PATH = Path(__file__).parent / "linux" / "kde_app_qualifier.py"
@@ -96,9 +102,132 @@ class KdeAppQualifierContractTests(unittest.TestCase):
         )
         self.assertIn("DBUS_SESSION_BUS_ADDRESS", environment)
         self.assertEqual(environment["XDG_RUNTIME_DIR"], "/tmp/private-runtime")
+        self.assertEqual(
+            qualifier.sanitized_environment(environment)["XDG_RUNTIME_DIR"],
+            "/tmp/private-runtime",
+        )
         self.assertEqual(environment["LANG"], "C.UTF-8")
         self.assertNotIn("AWS_SECRET_ACCESS_KEY", environment)
         self.assertNotIn("TOKEN", environment)
+
+    def test_inside_private_bus_exit_reflects_qualification_result(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "result.json"
+            base = {
+                "status": "completed",
+                "summary": {
+                    "total": len(qualifier.APP_SPECS),
+                    "supported": len(qualifier.APP_SPECS),
+                    "unsupported": 0,
+                    "error": 0,
+                },
+                "applications": [
+                    {
+                        "application": name,
+                        "status": "supported",
+                        "support_level": "observed_read_only",
+                        "snapshot": {"truncated": False},
+                        "writes_dispatched": [],
+                        "cleanup": {"owned_process_group_stopped": True},
+                    }
+                    for name in qualifier.APP_SPECS
+                ],
+            }
+            args = ["--inside-private-bus", "--output", str(output)]
+            with mock.patch.object(qualifier, "run_qualification", return_value=base), mock.patch("builtins.print"):
+                self.assertEqual(qualifier.main(args), 0)
+            self.assertEqual(
+                json.loads(output.read_text(encoding="utf-8"))["status"],
+                "completed",
+            )
+
+            for mutation in (
+                lambda report: report["summary"].update(unsupported=1, supported=len(qualifier.APP_SPECS) - 1),
+                lambda report: report["applications"][0]["snapshot"].update(truncated=True),
+                lambda report: report["applications"][0].update(writes_dispatched=["invoke"]),
+                lambda report: report["applications"][0]["cleanup"].update(owned_process_group_stopped=False),
+            ):
+                with self.subTest(mutation=mutation):
+                    failed = copy.deepcopy(base)
+                    mutation(failed)
+                    with mock.patch.object(qualifier, "run_qualification", return_value=failed), mock.patch("builtins.print"):
+                        self.assertNotEqual(qualifier.main(args), 0)
+                    self.assertEqual(
+                        json.loads(output.read_text(encoding="utf-8"))["status"],
+                        "completed",
+                    )
+
+            subset = copy.deepcopy(base)
+            subset["applications"] = [
+                application for application in subset["applications"]
+                if application["application"] == "konsole"
+            ]
+            subset["summary"].update(total=1, supported=1)
+            with mock.patch.object(qualifier, "run_qualification", return_value=subset), mock.patch("builtins.print"):
+                self.assertNotEqual(
+                    qualifier.main([*args, "--app", "konsole"]), 0
+                )
+            self.assertEqual(
+                json.loads(output.read_text(encoding="utf-8"))["applications"][0]["application"],
+                "konsole",
+            )
+
+    @unittest.skipUnless(Path("/proc").is_dir(), "requires Linux /proc")
+    def test_private_qualifier_timeout_kills_exact_descendant_tree(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            child_pid_file = Path(temporary) / "child.pid"
+            script = (
+                "import pathlib, subprocess, sys, time; "
+                "child=subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'], "
+                "start_new_session=True); "
+                "pathlib.Path(sys.argv[1]).write_text(str(child.pid)); time.sleep(60)"
+            )
+            returncode, timed_out, cleanup_succeeded = qualifier._run_private_qualifier(
+                [sys.executable, "-c", script, str(child_pid_file)],
+                os.environ.copy(),
+                0.5,
+                termination_grace=0.5,
+            )
+            self.assertIsNone(returncode)
+            self.assertIs(timed_out, True)
+            self.assertIs(cleanup_succeeded, True)
+            child_pid = int(child_pid_file.read_text(encoding="utf-8"))
+            deadline = time.monotonic() + 1
+            while time.monotonic() < deadline:
+                try:
+                    os.kill(child_pid, 0)
+                except ProcessLookupError:
+                    break
+                time.sleep(0.02)
+            else:
+                self.fail(f"timeout left descendant PID {child_pid} alive")
+
+    def test_outer_private_runner_failure_still_replaces_output_with_json(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "result.json"
+            output.write_text('{"status":"stale"}', encoding="utf-8")
+            with mock.patch.object(
+                qualifier, "discover_kde_x11_session",
+                return_value={
+                    "DISPLAY": ":1",
+                    "XDG_CURRENT_DESKTOP": "KDE",
+                    "XDG_SESSION_TYPE": "x11",
+                },
+            ), mock.patch.object(
+                qualifier.shutil, "which", return_value="/usr/bin/dbus-run-session"
+            ), mock.patch.object(
+                qualifier, "_run_private_qualifier",
+                return_value=(None, True, True),
+            ), mock.patch("builtins.print"):
+                self.assertNotEqual(
+                    qualifier.main(["--output", str(output)]), 0
+                )
+            report = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual(report["status"], "error")
+            self.assertEqual(
+                report["errors"][0]["code"], "private_qualifier_timeout"
+            )
+            self.assertIs(report["errors"][0]["cleanup_succeeded"], True)
 
     def test_no_write_action_is_present_in_qualification_source(self) -> None:
         source = QUALIFIER_PATH.read_text(encoding="utf-8")

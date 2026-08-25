@@ -324,47 +324,145 @@ def _process_start_time(pid: int) -> int | None:
         return None
 
 
-def _stop_exact_process_group(
-    process: subprocess.Popen[Any], expected_start_time: int | None,
-) -> bool:
-    """Stop only the live process instance started as our group leader."""
+def _process_table() -> dict[int, tuple[int, int, int]]:
+    """Return same-user PID -> (PPID, process group, starttime)."""
 
-    if process.poll() is not None:
-        return True
-    pid = process.pid
-
-    def still_owned() -> bool:
-        try:
-            return (
-                expected_start_time is not None
-                and _process_start_time(pid) == expected_start_time
-                and os.getpgid(pid) == pid
-                and (Path("/proc") / str(pid)).stat().st_uid == os.getuid()
-            )
-        except (OSError, ProcessLookupError):
-            return False
-
-    if not still_owned():
-        return process.poll() is not None
+    table: dict[int, tuple[int, int, int]] = {}
     try:
-        os.killpg(pid, signal.SIGTERM)
-        process.wait(timeout=3)
-    except subprocess.TimeoutExpired:
-        if not still_owned():
-            return process.poll() is not None
+        entries = list(Path("/proc").iterdir())
+    except OSError:
+        return table
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
         try:
-            os.killpg(pid, signal.SIGKILL)
-            process.wait(timeout=3)
-        except (OSError, ProcessLookupError, subprocess.TimeoutExpired):
-            pass
-    except (OSError, ProcessLookupError):
-        pass
-    return process.poll() is not None
+            if entry.stat().st_uid != os.getuid():
+                continue
+            raw = (entry / "stat").read_text(encoding="ascii")
+            fields = raw[raw.rindex(")") + 2:].split()
+            table[int(entry.name)] = (
+                int(fields[1]), int(fields[2]), int(fields[19])
+            )
+        except (OSError, UnicodeError, ValueError, IndexError):
+            continue
+    return table
+
+
+def _owned_descendant_identities(root_pid: int) -> list[tuple[int, int, int]]:
+    """Snapshot exact identities of the same-user process subtree."""
+
+    table = _process_table()
+    descendants = {root_pid}
+    changed = True
+    while changed:
+        changed = False
+        for pid, (parent_pid, _group_id, _start_time) in table.items():
+            if parent_pid in descendants and pid not in descendants:
+                descendants.add(pid)
+                changed = True
+    return [
+        (pid, table[pid][1], table[pid][2])
+        for pid in sorted(descendants, reverse=True)
+        if pid in table
+    ]
+
+
+def _identity_is_current(identity: tuple[int, int, int]) -> bool:
+    pid, group_id, start_time = identity
+    try:
+        stat_path = Path("/proc") / str(pid) / "stat"
+        raw = stat_path.read_text(encoding="ascii")
+        fields = raw[raw.rindex(")") + 2:].split()
+        return (
+            fields[0] != "Z"
+            and int(fields[2]) == group_id
+            and int(fields[19]) == start_time
+            and stat_path.parent.stat().st_uid == os.getuid()
+        )
+    except (OSError, ProcessLookupError, UnicodeError, ValueError, IndexError):
+        return False
+
+
+def _stop_exact_processes(
+    identities: list[tuple[int, int, int]], *, grace_seconds: float,
+) -> bool:
+    """Boundedly stop only PID/starttime identities observed as descendants."""
+
+    unique = list(dict.fromkeys(identities))
+    group_leaders = [item for item in unique if item[0] == item[1]]
+    for pid, _group_id, _start_time in group_leaders:
+        identity = next(item for item in unique if item[0] == pid)
+        if _identity_is_current(identity):
+            try:
+                os.killpg(pid, signal.SIGTERM)
+            except (OSError, ProcessLookupError):
+                pass
+    deadline = time.monotonic() + grace_seconds
+    while time.monotonic() < deadline and any(
+        _identity_is_current(item) for item in unique
+    ):
+        time.sleep(min(0.02, max(0.0, deadline - time.monotonic())))
+    for pid, _group_id, _start_time in group_leaders:
+        identity = next(item for item in unique if item[0] == pid)
+        if _identity_is_current(identity):
+            try:
+                os.killpg(pid, signal.SIGKILL)
+            except (OSError, ProcessLookupError):
+                pass
+    for identity in unique:
+        if _identity_is_current(identity):
+            try:
+                os.kill(identity[0], signal.SIGKILL)
+            except (OSError, ProcessLookupError):
+                pass
+    deadline = time.monotonic() + grace_seconds
+    while time.monotonic() < deadline and any(
+        _identity_is_current(item) for item in unique
+    ):
+        time.sleep(min(0.02, max(0.0, deadline - time.monotonic())))
+    return not any(_identity_is_current(item) for item in unique)
+
+
+def _qualification_passed(report: Mapping[str, Any], required_apps: list[str]) -> bool:
+    summary = report.get("summary")
+    applications = report.get("applications")
+    if not isinstance(summary, dict) or not isinstance(applications, list):
+        return False
+    names = [
+        item.get("application")
+        for item in applications
+        if isinstance(item, dict)
+    ]
+    if not all(isinstance(name, str) for name in names):
+        return False
+    return (
+        report.get("status") == "completed"
+        and len(applications) == len(required_apps)
+        and len(names) == len(applications)
+        and len(set(names)) == len(names)
+        and set(names) == set(required_apps)
+        and summary.get("total") == len(required_apps)
+        and summary.get("supported") == len(required_apps)
+        and summary.get("unsupported") == 0
+        and summary.get("error") == 0
+        and all(
+            item.get("status") == "supported"
+            and item.get("support_level") == "observed_read_only"
+            and isinstance(item.get("snapshot"), dict)
+            and item["snapshot"].get("truncated") is False
+            and item.get("writes_dispatched") == []
+            and isinstance(item.get("cleanup"), dict)
+            and item["cleanup"].get("owned_process_group_stopped") is True
+            for item in applications
+            if isinstance(item, dict)
+        )
+    )
 
 
 def _run_private_qualifier(
     command: list[str], environment: dict[str, str], timeout: float,
-) -> tuple[int | None, bool]:
+    *, termination_grace: float = 3.0,
+) -> tuple[int | None, bool, bool]:
     """Run the private bus as an owned group and clean it on timeout."""
 
     process = subprocess.Popen(
@@ -372,12 +470,22 @@ def _run_private_qualifier(
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         start_new_session=True,
     )
-    start_time = _process_start_time(process.pid)
     try:
-        return process.wait(timeout=timeout), False
+        return process.wait(timeout=timeout), False, True
     except subprocess.TimeoutExpired:
-        _stop_exact_process_group(process, start_time)
-        return None, True
+        identities = _owned_descendant_identities(process.pid)
+        cleanup_succeeded = _stop_exact_processes(
+            identities, grace_seconds=termination_grace
+        )
+        try:
+            process.wait(timeout=termination_grace)
+        except subprocess.TimeoutExpired:
+            cleanup_succeeded = False
+        return None, True, cleanup_succeeded
+    except Exception:
+        identities = _owned_descendant_identities(process.pid)
+        _stop_exact_processes(identities, grace_seconds=termination_grace)
+        raise
 
 
 def qualify_application(
@@ -663,6 +771,21 @@ def _unsupported_report(reason: str) -> dict[str, Any]:
     }
 
 
+def _terminal_error_report(
+    code: str, *, details: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    error: dict[str, Any] = {"stage": "private_session", "code": code}
+    if details:
+        error.update(details)
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "status": "error",
+        "errors": [error],
+        "applications": [],
+    }
+
+
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Read-only qualification of newly launched KDE/X11 applications"
@@ -694,19 +817,28 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
     if args.inside_private_bus:
-        report = run_qualification(args)
+        try:
+            report = run_qualification(args)
+        except Exception as exc:
+            report = _terminal_error_report(
+                "qualification_failed",
+                details={"reason": type(exc).__name__},
+            )
         _atomic_write(args.output, report)
         print(
             json.dumps(
                 {
-                    "status": report["status"],
-                    "summary": report["summary"],
+                    "status": report.get("status"),
+                    "summary": report.get("summary"),
                     "output": str(args.output),
                 },
                 ensure_ascii=False,
             )
         )
-        return 0
+        # A filtered run is useful for diagnosis but cannot qualify the full
+        # release matrix.  Exit zero only for the complete required set.
+        passed = _qualification_passed(report, list(APP_SPECS))
+        return 0 if passed else 1
 
     session = discover_kde_x11_session(args.display)
     if session is None:
@@ -723,6 +855,7 @@ def main(argv: list[str] | None = None) -> int:
 
     with tempfile.TemporaryDirectory(prefix="aad-kde-qualifier-") as temporary:
         root = Path(temporary)
+        private_output = root / "qualification.json"
         environment = sanitized_environment(os.environ)
         environment.update(session)
         environment.pop("DBUS_SESSION_BUS_ADDRESS", None)
@@ -738,7 +871,7 @@ def main(argv: list[str] | None = None) -> int:
         environment["AI_AUTO_DESKTOP_QUALIFIER_PRIVATE_BUS"] = "1"
         command = [
             dbus_run_session, "--", sys.executable, str(Path(__file__).resolve()),
-            "--inside-private-bus", "--output", str(args.output),
+            "--inside-private-bus", "--output", str(private_output),
             "--registration-timeout", str(args.registration_timeout),
             "--snapshot-timeout", str(args.snapshot_timeout),
             "--max-depth", str(args.max_depth), "--max-nodes", str(args.max_nodes),
@@ -747,18 +880,43 @@ def main(argv: list[str] | None = None) -> int:
             command.extend(("--app", app))
         # Private bus services may inherit stdout/stderr.  DEVNULL keeps their
         # lifetime from extending communicate() after the qualifier exits.
-        completed = subprocess.run(
-            command, env=environment, stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            check=False, timeout=75,
-        )
-    if args.output.is_file():
         try:
-            report = json.loads(args.output.read_text(encoding="utf-8"))
-            print(json.dumps({"status": report.get("status"), "summary": report.get("summary"), "output": str(args.output)}, ensure_ascii=False))
-        except (OSError, json.JSONDecodeError):
-            pass
-    return completed.returncode
+            returncode, timed_out, cleanup_succeeded = _run_private_qualifier(
+                command, environment, 75
+            )
+        except Exception as exc:
+            returncode, timed_out = None, False
+            report = _terminal_error_report(
+                "private_qualifier_start_failed",
+                details={"reason": type(exc).__name__},
+            )
+        else:
+            if timed_out:
+                report = _terminal_error_report(
+                    "private_qualifier_timeout",
+                    details={"cleanup_succeeded": cleanup_succeeded},
+                )
+            else:
+                try:
+                    loaded = json.loads(private_output.read_text(encoding="utf-8"))
+                    if not isinstance(loaded, dict):
+                        raise ValueError("qualification report is not an object")
+                    report = loaded
+                except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
+                    report = _terminal_error_report(
+                        "private_qualifier_result_unreadable",
+                        details={
+                            "reason": type(exc).__name__,
+                            "returncode": returncode,
+                        },
+                    )
+        _atomic_write(args.output, report)
+    print(json.dumps({
+        "status": report.get("status"),
+        "summary": report.get("summary"),
+        "output": str(args.output),
+    }, ensure_ascii=False))
+    return 1 if timed_out or returncode is None else int(returncode)
 
 
 if __name__ == "__main__":
