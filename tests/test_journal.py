@@ -379,6 +379,27 @@ class JournalTests(unittest.TestCase):
             )
         self.assertEqual([item.seq for item in self.store.list_events("run-1")], [1])
 
+    def test_status_event_expected_desired_state_rolls_back_atomically(self) -> None:
+        self.create()
+        lease = self.claim()
+        self.store.compare_and_set_desired_state(
+            "run-1", expected=DesiredState.RUN, desired=DesiredState.CANCEL
+        )
+
+        with self.assertRaises(JournalConflictError):
+            self.store.set_status_with_event(
+                "run-1", expected=RunStatus.PENDING,
+                expected_desired_state=DesiredState.RUN,
+                status=RunStatus.CANCELLED, owner_id=lease.owner_id,
+                token=lease.token, now=2, event_type="run.finished",
+                event_payload={}, error={"code": "RUN.CANCELLED"},
+            )
+
+        current = self.store.get_run("run-1")
+        self.assertEqual(current.status, RunStatus.PENDING)
+        self.assertEqual(current.desired_state, DesiredState.CANCEL)
+        self.assertEqual(self.store.list_events("run-1"), [])
+
     def test_sensitive_flag_and_strict_json_round_trip_fail_closed(self) -> None:
         self.create()
         lease = self.claim()

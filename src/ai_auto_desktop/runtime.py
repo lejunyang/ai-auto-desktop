@@ -2093,6 +2093,31 @@ class WorkflowRunner:
             }
         )
 
+    def preflight_durable_action(
+        self, step: CompiledStep
+    ) -> DurableActionBinding:
+        """Validate a durable provider and static policy without inputs.
+
+        Action inputs may legitimately reference outputs from earlier durable
+        steps, so creation-time preflight must not evaluate ``with``.  The
+        provider contract and all policy that is independent of those inputs
+        can still be rejected before a run is persisted.
+        """
+
+        binding = self.durable_action_binding(step)
+        uses = step.params["uses"]
+        capability = uses.rsplit(".", 1)[0]
+        plugin = self.plugins.get(capability)
+        if plugin is None:
+            raise AutomationError(
+                "CAPABILITY.MISSING",
+                f"No plugin registered for {capability!r}",
+                category="capability",
+                details={"uses": uses},
+            )
+        self._enforce_action_policy(step, plugin, binding.contract)
+        return binding
+
     def _require_current_durable_binding(
         self,
         step: CompiledStep,

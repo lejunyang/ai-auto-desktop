@@ -171,6 +171,7 @@ class RunService:
         plugins: Mapping[str, ProcessPlugin | Sequence[str] | str] | None = None,
         allow_scripts: bool = False,
         granted_permissions: Sequence[str] | None = None,
+        durable_action_mode: str = "deny",
     ) -> DurableExecutionResult:
         """Create and execute a durable run through the segment engine."""
 
@@ -179,6 +180,7 @@ class RunService:
         return DurableExecutor(
             self._journal, owner_id=owner_id,
             lease_ttl_seconds=lease_ttl_seconds,
+            durable_action_mode=durable_action_mode,
         ).start(
             descriptor, inputs=inputs, run_id=run_id, plugins=plugins,
             allow_scripts=allow_scripts,
@@ -195,6 +197,7 @@ class RunService:
         plugins: Mapping[str, ProcessPlugin | Sequence[str] | str] | None = None,
         allow_scripts: bool = False,
         granted_permissions: Sequence[str] | None = None,
+        durable_action_mode: str = "deny",
     ) -> DurableExecutionResult:
         """Execute a separately created pending durable run."""
 
@@ -203,6 +206,7 @@ class RunService:
         return DurableExecutor(
             self._journal, owner_id=owner_id,
             lease_ttl_seconds=lease_ttl_seconds,
+            durable_action_mode=durable_action_mode,
         ).execute(
             run_id, descriptor, plugins=plugins, allow_scripts=allow_scripts,
             granted_permissions=granted_permissions,
@@ -218,6 +222,7 @@ class RunService:
         plugins: Mapping[str, ProcessPlugin | Sequence[str] | str] | None = None,
         allow_scripts: bool = False,
         granted_permissions: Sequence[str] | None = None,
+        durable_action_mode: str = "deny",
     ) -> DurableExecutionResult:
         """Resume a durable run from its last safe checkpoint."""
 
@@ -226,6 +231,7 @@ class RunService:
         return DurableExecutor(
             self._journal, owner_id=owner_id,
             lease_ttl_seconds=lease_ttl_seconds,
+            durable_action_mode=durable_action_mode,
         ).resume(
             run_id, descriptor, plugins=plugins, allow_scripts=allow_scripts,
             granted_permissions=granted_permissions, request_run=True,

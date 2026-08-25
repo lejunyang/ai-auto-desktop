@@ -742,6 +742,7 @@ class JournalStore:
         output: Any | None = None,
         error: Any | None = None,
         checkpoint: Any = _UNSET,
+        expected_desired_state: DesiredState | str | None = None,
         sensitive: bool = False,
     ) -> tuple[RunRecord, EventRecord]:
         """Atomically append an event and perform an owner-fenced status CAS."""
@@ -749,6 +750,11 @@ class JournalStore:
         _reject_sensitive(sensitive)
         expected_value = _run_status(expected)
         status_value = _run_status(status)
+        expected_desired_value = (
+            None
+            if expected_desired_state is None
+            else _desired_state(expected_desired_state)
+        )
         now_value = _timestamp(now)
         checkpoint_json = (
             None if checkpoint is _UNSET else _encode_json(checkpoint, "checkpoint")
@@ -756,6 +762,10 @@ class JournalStore:
         with self._transaction():
             self._require_live_lease_locked(
                 run_id, owner_id=owner_id, token=token, now=now_value
+            )
+            self._require_expected_run_state_locked(
+                run_id, status=expected_value,
+                desired_state=expected_desired_value,
             )
             event = self._append_event_locked(run_id, event_type, event_payload)
             if checkpoint is not _UNSET:

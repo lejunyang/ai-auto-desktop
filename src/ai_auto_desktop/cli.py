@@ -110,6 +110,10 @@ def _execution_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--plugin", action="append", default=[], metavar="NAME=COMMAND")
     parser.add_argument("--permission", action="append", default=[])
     parser.add_argument("--allow-scripts", action="store_true")
+    parser.add_argument(
+        "--durable-actions", choices=("deny", "read-only"),
+        default="deny",
+    )
     parser.add_argument("--owner-id")
     parser.add_argument("--lease-ttl", type=float, default=30.0)
 
@@ -209,6 +213,7 @@ def main(argv: list[str] | None = None) -> int:
                 executor = DurableExecutor(
                     journal, owner_id=options.owner_id,
                     lease_ttl_seconds=options.lease_ttl,
+                    durable_action_mode=options.durable_actions,
                 )
                 common = {
                     "plugins": _plugins(options.plugin),
