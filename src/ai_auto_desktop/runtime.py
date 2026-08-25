@@ -21,7 +21,7 @@ from typing import Any
 from .compiler import parse_duration
 from .errors import AutomationError, ensure_automation_error
 from .expression import ExpressionError, evaluate_expression
-from .model import MISSING, CompiledStep, ErrorHandler, RunResult, WorkflowDescriptor, thaw
+from .model import MISSING, CompiledStep, ErrorHandler, RunResult, WorkflowDescriptor, freeze, thaw
 from .plugin import PluginError, ProcessPlugin
 from .script import execute_python_script
 
@@ -72,6 +72,24 @@ class SegmentResult:
     step_id: str | None
     terminal_ready: bool
     state: RuntimeSegmentState
+
+
+@dataclass(frozen=True, slots=True)
+class DurableActionBinding:
+    """Immutable, canonical provider binding for one durable action."""
+
+    contract: Mapping[str, Any]
+    provider_digest: str
+    contract_digest: str
+    projection_digest: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "contract": _clone_runtime_value(self.contract),
+            "providerDigest": self.provider_digest,
+            "contractDigest": self.contract_digest,
+            "projectionDigest": self.projection_digest,
+        }
 
 
 class _ReturnFlow(Exception):
@@ -152,8 +170,14 @@ class WorkflowRunner:
         allow_scripts: bool = False,
         granted_permissions: Sequence[str] | None = None,
         event_sink: Callable[[Mapping[str, Any]], None] | None = None,
+        durable_action_mode: str = "deny",
     ) -> None:
+        if durable_action_mode not in {"deny", "read_only"}:
+            raise ValueError(
+                "durable_action_mode must be 'deny' or 'read_only'"
+            )
         self.descriptor = descriptor
+        self.durable_action_mode = durable_action_mode
         self.allow_scripts = allow_scripts
         self.granted_permissions = frozenset(granted_permissions or ())
         self.event_sink = event_sink
@@ -339,36 +363,47 @@ class WorkflowRunner:
                     "only a between_top_level_steps checkpoint is resumable",
                     details={"phase": normalized.phase},
                 )
-            actual_inputs = self._prepare_inputs(dict(inputs or {}))
-            variables = _clone_runtime_value(normalized.variables)
-            context_steps = _clone_runtime_value(normalized.context_steps)
-            step_records = _clone_runtime_value(normalized.step_records)
-            self._validate_imported_segment_state(
-                normalized, variables, context_steps, step_records
+            self._restore_segment_state(
+                normalized, inputs=inputs, allow_expired=allow_expired
             )
-            self.events = []
-            self.variables = variables
-            self.context = {
-                "inputs": actual_inputs,
-                "vars": self.variables,
-                "steps": context_steps,
-            }
-            self.step_records = step_records
-            self._deadline_stack = []
-            self._attempt_budget = _AttemptBudget(normalized.executed_attempts)
-            self._pre_reserved_attempts = 0
-            self._executed = normalized.executed_attempts
-            self._handler_output = MISSING
-            self._cancelled.clear()
-            self._segment_phase = normalized.phase
-            self._segment_next_index = normalized.next_top_level_index
-            self._segment_output = MISSING
-            self._segment_error = None
-            self._set_segment_deadline(normalized.deadline_epoch_ms)
-            if not allow_expired:
-                self._check_control()
-            self._check_requirements()
             return self._export_segment_state()
+
+    def _restore_segment_state(
+        self,
+        normalized: RuntimeSegmentState,
+        *,
+        inputs: Mapping[str, Any] | None,
+        allow_expired: bool,
+    ) -> None:
+        actual_inputs = self._prepare_inputs(dict(inputs or {}))
+        variables = _clone_runtime_value(normalized.variables)
+        context_steps = _clone_runtime_value(normalized.context_steps)
+        step_records = _clone_runtime_value(normalized.step_records)
+        self._validate_imported_segment_state(
+            normalized, variables, context_steps, step_records
+        )
+        self.events = []
+        self.variables = variables
+        self.context = {
+            "inputs": actual_inputs,
+            "vars": self.variables,
+            "steps": context_steps,
+        }
+        self.step_records = step_records
+        self._deadline_stack = []
+        self._attempt_budget = _AttemptBudget(normalized.executed_attempts)
+        self._pre_reserved_attempts = 0
+        self._executed = normalized.executed_attempts
+        self._handler_output = MISSING
+        self._cancelled.clear()
+        self._segment_phase = normalized.phase
+        self._segment_next_index = normalized.next_top_level_index
+        self._segment_output = MISSING
+        self._segment_error = None
+        self._set_segment_deadline(normalized.deadline_epoch_ms)
+        if not allow_expired:
+            self._check_control()
+        self._check_requirements()
 
     def export_state(self) -> RuntimeSegmentState:
         """Return a detached JSON-compatible segmented runtime snapshot."""
@@ -468,6 +503,155 @@ class WorkflowRunner:
                 )
             self._segment_phase = "between_top_level_steps"
             return self._export_segment_state()
+
+    def reserve_prepared_action_attempt(self) -> RuntimeSegmentState:
+        """Reserve one attempt before a durable action intent is written."""
+
+        with self._segment_lock("reserve_prepared_action_attempt"):
+            self._require_prepared_durable_action()
+            if self._pre_reserved_attempts:
+                raise self._segment_state_error(
+                    "prepared action attempt is already reserved"
+                )
+            self._attempt_budget.reserve(
+                self.descriptor.budgets.get("max_executed_steps")
+            )
+            self._executed = self._attempt_budget.executed
+            self._pre_reserved_attempts = 1
+            return self._export_segment_state(allow_reserved_attempt=True)
+
+    def export_action_intent_state(self) -> RuntimeSegmentState:
+        """Export a reserved action attempt without exposing live values."""
+
+        with self._segment_lock("export_action_intent_state"):
+            self._require_prepared_durable_action()
+            if self._pre_reserved_attempts != 1:
+                raise self._segment_state_error(
+                    "prepared action attempt is not reserved"
+                )
+            state = self._export_segment_state(allow_reserved_attempt=True)
+            return RuntimeSegmentState(
+                state.schema_version,
+                state.runtime_version,
+                state.descriptor_digest,
+                "action_intent",
+                state.next_top_level_index,
+                state.executed_attempts,
+                state.deadline_epoch_ms,
+                state.variables,
+                state.context_steps,
+                state.step_records,
+            )
+
+    def restore_action_intent(
+        self,
+        state: RuntimeSegmentState | Mapping[str, Any],
+        *,
+        inputs: Mapping[str, Any] | None = None,
+        allow_expired: bool = False,
+    ) -> RuntimeSegmentState:
+        """Restore a v2 read-only action intent with its consumed attempt."""
+
+        with self._segment_lock("restore_action_intent"):
+            normalized = self._normalize_segment_state(state)
+            if normalized.phase != "action_intent":
+                raise self._segment_state_error(
+                    "only an action_intent checkpoint can be restored",
+                    details={"phase": normalized.phase},
+                )
+            self._restore_segment_state(
+                normalized, inputs=inputs, allow_expired=allow_expired
+            )
+            self._require_prepared_durable_action()
+            if normalized.executed_attempts < 1:
+                raise self._segment_state_error(
+                    "action intent has no reserved attempt"
+                )
+            self._pre_reserved_attempts = 1
+            return self._export_segment_state(allow_reserved_attempt=True)
+
+    def release_prepared_action_attempt(self) -> RuntimeSegmentState:
+        """Rollback a reservation when durable intent persistence loses CAS."""
+
+        with self._segment_lock("release_prepared_action_attempt"):
+            self._require_prepared_durable_action()
+            if self._pre_reserved_attempts != 1:
+                raise self._segment_state_error(
+                    "prepared action attempt is not reserved"
+                )
+            self._pre_reserved_attempts = 0
+            self._attempt_budget.release()
+            self._executed = self._attempt_budget.executed
+            return self._export_segment_state()
+
+    def run_durable_action_segment(
+        self,
+        binding: DurableActionBinding | Mapping[str, Any],
+        dispatch_deadline_epoch_ms: int | None,
+    ) -> SegmentResult:
+        """Execute one reserved durable action using its frozen binding."""
+
+        with self._segment_lock("run_durable_action_segment"):
+            step = self._require_prepared_durable_action()
+            if self._pre_reserved_attempts != 1:
+                raise self._segment_state_error(
+                    "durable action attempt must be reserved before dispatch"
+                )
+            normalized = self._normalize_durable_binding(binding)
+            deadline = self._validate_absolute_deadline(
+                dispatch_deadline_epoch_ms, "dispatchDeadlineEpochMs"
+            )
+            try:
+                self._run_step(
+                    step,
+                    action_contract=normalized.contract,
+                    action_deadline_epoch_ms=deadline,
+                )
+            except AutomationError as caught:
+                self._pre_reserved_attempts = 0
+                self._segment_error = self._redact_durable_action_error(
+                    caught, normalized.contract
+                )
+                self._segment_phase = "finalizing"
+                return SegmentResult(
+                    step.id, True, self._export_segment_state()
+                )
+            except Exception as caught:
+                self._pre_reserved_attempts = 0
+                self._segment_error = self._redact_durable_action_error(
+                    ensure_automation_error(caught), normalized.contract
+                )
+                self._segment_phase = "finalizing"
+                return SegmentResult(
+                    step.id, True, self._export_segment_state()
+                )
+            self._segment_next_index += 1
+            self._segment_phase = "between_top_level_steps"
+            return SegmentResult(
+                step.id,
+                self._segment_next_index == len(self.descriptor.steps),
+                self._export_segment_state(),
+            )
+
+    def _require_prepared_durable_action(self) -> CompiledStep:
+        if self.durable_action_mode != "read_only":
+            raise self._segment_state_error(
+                "durable read-only action mode is not enabled"
+            )
+        if self._segment_phase not in {"in_top_level_step", "action_intent"}:
+            raise self._segment_state_error(
+                "runner has no prepared top-level action",
+                details={"phase": self._segment_phase},
+            )
+        if self._segment_next_index >= len(self.descriptor.steps):
+            raise self._segment_state_error("prepared action index is out of range")
+        step = self.descriptor.steps[self._segment_next_index]
+        if step.type != "action":
+            raise self._segment_state_error(
+                "prepared top-level step is not an action",
+                details={"stepId": step.id},
+            )
+        return step
 
     def _prepare_segment_locked(self) -> None:
         step = self.descriptor.steps[self._segment_next_index]
@@ -630,8 +814,12 @@ class WorkflowRunner:
             + max(0.0, deadline_epoch_ms / 1_000 - time.time())
         )
 
-    def _export_segment_state(self) -> RuntimeSegmentState:
-        if self._deadline_stack or self._pre_reserved_attempts:
+    def _export_segment_state(
+        self, *, allow_reserved_attempt: bool = False
+    ) -> RuntimeSegmentState:
+        if self._deadline_stack or (
+            self._pre_reserved_attempts and not allow_reserved_attempt
+        ):
             raise self._segment_state_error(
                 "runtime state cannot be exported inside a step or attempt"
             )
@@ -751,6 +939,62 @@ class WorkflowRunner:
             )
 
     @staticmethod
+    def _validate_absolute_deadline(
+        value: int | None, name: str
+    ) -> int | None:
+        if value is not None and (
+            isinstance(value, bool) or not isinstance(value, int) or value < 0
+        ):
+            raise AutomationError(
+                "RUNTIME.STATE_INVALID",
+                f"{name} must be a non-negative integer or null",
+                category="runtime",
+                phase="restore",
+            )
+        return value
+
+    @staticmethod
+    def _normalize_durable_binding(
+        binding: DurableActionBinding | Mapping[str, Any],
+    ) -> DurableActionBinding:
+        if isinstance(binding, DurableActionBinding):
+            return binding
+        if not isinstance(binding, Mapping):
+            raise AutomationError(
+                "DURABLE.BINDING_MISMATCH",
+                "durable action binding must be an object",
+                category="durable",
+            )
+        required = {
+            "contract", "providerDigest", "contractDigest",
+            "projectionDigest",
+        }
+        if set(binding) != required or not isinstance(
+            binding.get("contract"), Mapping
+        ):
+            raise AutomationError(
+                "DURABLE.BINDING_MISMATCH",
+                "durable action binding fields are invalid",
+                category="durable",
+            )
+        digests = [
+            binding["providerDigest"], binding["contractDigest"],
+            binding["projectionDigest"],
+        ]
+        if any(not _is_sha256_digest(value) for value in digests):
+            raise AutomationError(
+                "DURABLE.BINDING_MISMATCH",
+                "durable action binding digests are invalid",
+                category="durable",
+            )
+        return DurableActionBinding(
+            _clone_runtime_value(binding["contract"]),
+            binding["providerDigest"],
+            binding["contractDigest"],
+            binding["projectionDigest"],
+        )
+
+    @staticmethod
     def _segment_state_error(
         message: str,
         *,
@@ -767,7 +1011,13 @@ class WorkflowRunner:
         )
 
     def _new_execution_worker(self) -> "WorkflowRunner":
-        return object.__new__(WorkflowRunner)
+        worker = object.__new__(WorkflowRunner)
+        # Workers are populated from an initialized parent in
+        # ``_run_parallel_batch``.  Set the new opt-in mode here as a defensive
+        # default so an exception during population cannot turn into an
+        # unrelated AttributeError.
+        worker.durable_action_mode = "deny"
+        return worker
 
     def _prepare_inputs(self, supplied: dict[str, Any]) -> dict[str, Any]:
         extras = set(supplied) - set(self.descriptor.inputs)
@@ -868,7 +1118,15 @@ class WorkflowRunner:
                     details={"actions": missing_actions},
                 )
 
-    def _validate_schema(self, value: Any, schema: Any, code: str, name: str) -> None:
+    def _validate_schema(
+        self,
+        value: Any,
+        schema: Any,
+        code: str,
+        name: str,
+        *,
+        redact: bool = False,
+    ) -> None:
         if schema is None or schema is True: return
         if jsonschema is None:
             raise AutomationError(
@@ -877,7 +1135,13 @@ class WorkflowRunner:
                 category="runtime",
             )
         try: jsonschema.validate(value, thaw(schema))
-        except Exception as exc: raise AutomationError(code, f"{name!r} does not satisfy its schema", details={"validation": str(exc)}) from exc
+        except Exception as exc:
+            raise AutomationError(
+                code,
+                f"{name!r} does not satisfy its schema",
+                details={} if redact else {"validation": str(exc)},
+                cause=None if redact else exc,
+            ) from (None if redact else exc)
 
     def _evaluate(self, value: Any, context: Mapping[str, Any] | None = None) -> Any:
         context = context or self.context
@@ -1213,6 +1477,7 @@ class WorkflowRunner:
         try:
             worker = self._new_execution_worker()
             worker.descriptor = self.descriptor
+            worker.durable_action_mode = self.durable_action_mode
             worker.allow_scripts = self.allow_scripts
             worker.granted_permissions = self.granted_permissions
             worker.event_sink = None
@@ -1371,6 +1636,7 @@ class WorkflowRunner:
         cleanup: bool = False,
         *,
         action_contract: Mapping[str, Any] | None = None,
+        action_deadline_epoch_ms: int | None = None,
     ) -> Any:
         self._check_control(cleanup)
         if "if" in step.params and not bool(self._evaluate(thaw(step.params["if"]))):
@@ -1383,6 +1649,19 @@ class WorkflowRunner:
         self.step_records[step.id] = {"status": "running", "attempts": 0}; self._event("step.started", step_id=step.id, step_type=step.type)
         timeout = _duration(step.params.get("timeout"), _duration(self.descriptor.defaults.get("timeout")))
         local_deadline = started + timeout if timeout else None
+        if action_deadline_epoch_ms is not None:
+            frozen_deadline = self._validate_absolute_deadline(
+                action_deadline_epoch_ms, "dispatchDeadlineEpochMs"
+            )
+            assert frozen_deadline is not None
+            durable_deadline = time.monotonic() + max(
+                0.0, frozen_deadline / 1_000 - time.time()
+            )
+            local_deadline = (
+                durable_deadline
+                if local_deadline is None
+                else min(local_deadline, durable_deadline)
+            )
         if local_deadline is not None:
             self._deadline_stack.append(local_deadline)
         pending: AutomationError | None = None
@@ -1398,6 +1677,13 @@ class WorkflowRunner:
             raise
         except AutomationError as caught:
             caught.at_step(step.id, step_path=step.path, workflow=self.descriptor.name)
+            if step.type == "action" and self.durable_action_mode == "read_only":
+                caught = self._redact_durable_action_error(
+                    caught, action_contract or {}
+                )
+                caught.at_step(
+                    step.id, step_path=step.path, workflow=self.descriptor.name
+                )
             if caught.code in {"WORKFLOW.CANCELLED", "WORKFLOW.TIMEOUT"}:
                 pending = caught
             else:
@@ -1563,6 +1849,268 @@ class WorkflowRunner:
             )
         return self._action_contract(plugin, capability, uses)
 
+    def durable_action_binding(
+        self, step: CompiledStep
+    ) -> DurableActionBinding:
+        """Bind a durable action to a validated canonical manifest."""
+
+        if self.durable_action_mode != "read_only" or step.type != "action":
+            raise AutomationError(
+                "DURABLE.UNSUPPORTED_PLAN",
+                "durable actions require explicit read_only mode",
+                category="durable",
+            )
+        if "postcondition" in step.params:
+            raise AutomationError(
+                "DURABLE.UNSUPPORTED_PLAN",
+                "durable read-only actions do not support postconditions",
+                category="durable",
+                details={"stepId": step.id},
+            )
+        uses = step.params["uses"]
+        capability = uses.rsplit(".", 1)[0]
+        plugin = self.plugins.get(capability)
+        if plugin is None:
+            raise AutomationError(
+                "CAPABILITY.MISSING",
+                f"No plugin registered for {capability!r}",
+                category="capability",
+                details={"uses": uses},
+            )
+        manifest = self._plugin_manifest(plugin)
+        if not isinstance(manifest, Mapping):
+            raise AutomationError(
+                "DURABLE.UNSUPPORTED_PLAN",
+                "durable actions require a canonical provider manifest",
+                category="durable",
+                details={"uses": uses},
+            )
+        try:
+            plugin._validate_manifest(dict(manifest))
+        except PluginError as exc:
+            raise AutomationError(
+                "DURABLE.UNSUPPORTED_PLAN",
+                "durable action provider manifest is invalid",
+                category="durable",
+                details={"uses": uses},
+            ) from exc
+        contract = self._action_contract(plugin, capability, uses)
+        if self._effective_action_effect(step, contract=contract) != "read_only":
+            raise AutomationError(
+                "DURABLE.UNSUPPORTED_PLAN",
+                "durable action must be effectively read-only",
+                category="durable",
+                details={"uses": uses},
+            )
+        errors = contract.get("errors")
+        if (
+            not isinstance(errors, (list, tuple))
+            or not errors
+            or any(
+                not isinstance(item, Mapping)
+                or item.get("effect") != "not_applied"
+                for item in errors
+            )
+        ):
+            raise AutomationError(
+                "DURABLE.UNSUPPORTED_PLAN",
+                "durable action errors must be non-empty and not_applied",
+                category="durable",
+                details={"uses": uses},
+            )
+        provider_sensitivity = contract.get("sensitivity")
+        descriptor_sensitivity = thaw(step.params.get("sensitivity", {}))
+        sensitivity_fields = ("input", "output", "error")
+        if (
+            not isinstance(provider_sensitivity, Mapping)
+            or not isinstance(descriptor_sensitivity, Mapping)
+            or any(
+                provider_sensitivity.get(name) != "public"
+                or descriptor_sensitivity.get(name) != "public"
+                for name in sensitivity_fields
+            )
+        ):
+            raise AutomationError(
+                "DURABLE.SENSITIVE_ACTION",
+                "durable action input, output, and error must be explicitly public",
+                category="durable",
+                details={"uses": uses},
+            )
+        durability = contract.get("durability")
+        provider_fields = (
+            durability.get("checkpoint_fields")
+            if isinstance(durability, Mapping)
+            else None
+        )
+        if not isinstance(provider_fields, Mapping):
+            raise AutomationError(
+                "DURABLE.UNSUPPORTED_PLAN",
+                "durable action provider has no checkpoint field whitelist",
+                category="durable",
+                details={"uses": uses},
+            )
+        seen_pointers: set[str] = set()
+        for alias, definition in provider_fields.items():
+            if not isinstance(alias, str) or not isinstance(definition, Mapping):
+                raise AutomationError(
+                    "DURABLE.UNSUPPORTED_PLAN",
+                    "durable checkpoint field is invalid",
+                    category="durable",
+                    details={"uses": uses, "field": alias},
+                )
+            pointer = definition.get("pointer")
+            if (
+                not _valid_json_pointer(pointer)
+                or len(pointer) > 1024
+                or len(pointer.split("/")) - 1 > 64
+                or pointer in seen_pointers
+            ):
+                raise AutomationError(
+                    "DURABLE.UNSUPPORTED_PLAN",
+                    "durable checkpoint pointers must be unique, non-root, and bounded",
+                    category="durable",
+                    details={"uses": uses, "field": alias},
+                )
+            seen_pointers.add(pointer)
+            if definition.get("missing", "error") == "null":
+                try:
+                    self._validate_schema(
+                        None,
+                        definition.get("schema"),
+                        "DURABLE.UNSUPPORTED_PLAN",
+                        str(alias),
+                        redact=True,
+                    )
+                except AutomationError as exc:
+                    raise AutomationError(
+                        "DURABLE.UNSUPPORTED_PLAN",
+                        "null checkpoint fallback must satisfy its schema",
+                        category="durable",
+                        details={"uses": uses, "field": alias},
+                    ) from exc
+        checkpoint = thaw(step.params.get("checkpoint", {}))
+        output = checkpoint.get("output")
+        if not isinstance(output, Mapping):
+            raise AutomationError(
+                "DURABLE.UNSUPPORTED_PLAN",
+                "durable action checkpoint output must be explicit",
+                category="durable",
+                details={"uses": uses},
+            )
+        mode = output.get("mode")
+        fields = output.get("fields", ())
+        if mode == "omit":
+            selected: list[str] = []
+        elif (
+            mode == "project"
+            and isinstance(fields, (list, tuple))
+            and bool(fields)
+            and all(isinstance(item, str) for item in fields)
+            and set(fields).issubset(provider_fields)
+        ):
+            selected = list(fields)
+        else:
+            raise AutomationError(
+                "DURABLE.UNSUPPORTED_PLAN",
+                "durable action projection is not provider-approved",
+                category="durable",
+                details={"uses": uses},
+            )
+        projection = {
+            "mode": mode,
+            "fields": selected,
+            "definitions": {
+                alias: _clone_runtime_value(provider_fields[alias])
+                for alias in selected
+            },
+        }
+        return DurableActionBinding(
+            freeze(_clone_runtime_value(contract)),
+            _canonical_digest(manifest),
+            _canonical_digest(contract),
+            _canonical_digest(projection),
+        )
+
+    def durable_action_binding_digest(
+        self,
+        step: CompiledStep,
+        binding: DurableActionBinding | Mapping[str, Any],
+    ) -> str:
+        """Hash evaluated invocation input without returning or storing it."""
+
+        normalized = self._normalize_durable_binding(binding)
+        uses = step.params["uses"]
+        capability = uses.rsplit(".", 1)[0]
+        plugin = self.plugins.get(capability)
+        if plugin is None:
+            raise AutomationError(
+                "CAPABILITY.MISSING",
+                f"No plugin registered for {capability!r}",
+                category="capability",
+                details={"uses": uses},
+            )
+        self._enforce_action_policy(step, plugin, normalized.contract)
+        action_input = self._evaluate(thaw(step.params["with"]))
+        self._validate_schema(
+            action_input,
+            normalized.contract.get("input_schema"),
+            "ACTION.INPUT_INVALID",
+            uses,
+            redact=True,
+        )
+        return _canonical_digest(
+            {
+                "uses": uses,
+                "input": action_input,
+                "providerDigest": normalized.provider_digest,
+                "contractDigest": normalized.contract_digest,
+            }
+        )
+
+    def durable_action_deadlines(
+        self,
+        step: CompiledStep,
+        binding: DurableActionBinding | Mapping[str, Any],
+    ) -> dict[str, int | None]:
+        """Freeze absolute workflow/step/attempt/provider deadline bounds."""
+
+        normalized = self._normalize_durable_binding(binding)
+        now_ms = int(time.time() * 1_000)
+
+        def deadline(value: Any) -> int | None:
+            seconds = _duration(value)
+            return None if seconds is None else now_ms + int(seconds * 1_000)
+
+        workflow_deadline = self._segment_deadline_epoch_ms
+        step_deadline = deadline(
+            step.params.get("timeout", self.descriptor.defaults.get("timeout"))
+        )
+        bounds = [
+            item for item in (workflow_deadline, step_deadline)
+            if item is not None
+        ]
+        attempt_deadline = deadline(step.params.get("attempt_timeout"))
+        if bounds:
+            attempt_deadline = (
+                min(*bounds, attempt_deadline)
+                if attempt_deadline is not None
+                else min(bounds)
+            )
+        provider_deadline = deadline(normalized.contract.get("timeout"))
+        if attempt_deadline is not None:
+            provider_deadline = (
+                min(provider_deadline, attempt_deadline)
+                if provider_deadline is not None
+                else attempt_deadline
+            )
+        return {
+            "workflowDeadlineEpochMs": workflow_deadline,
+            "stepDeadlineEpochMs": step_deadline,
+            "attemptDeadlineEpochMs": attempt_deadline,
+            "providerDeadlineEpochMs": provider_deadline,
+            "dispatchDeadlineEpochMs": provider_deadline,
+        }
+
     def _effective_action_effect(
         self, step: CompiledStep, *, contract: Mapping[str, Any] | None = None
     ) -> str:
@@ -1665,7 +2213,13 @@ class WorkflowRunner:
         pre = step.params.get("precondition")
         if pre and not bool(self._evaluate(thaw(pre["condition"]))): raise AutomationError("ACTION.PRECONDITION_FAILED", pre.get("message", "Action precondition failed"), phase="precondition")
         action_input = self._evaluate(thaw(step.params["with"]))
-        self._validate_schema(action_input, contract.get("input_schema"), "ACTION.INPUT_INVALID", uses)
+        self._validate_schema(
+            action_input,
+            contract.get("input_schema"),
+            "ACTION.INPUT_INVALID",
+            uses,
+            redact=self.durable_action_mode == "read_only",
+        )
         post = step.params.get("postcondition")
         observation_preflight: tuple[
             ProcessPlugin, str, Mapping[str, Any]
@@ -1689,6 +2243,8 @@ class WorkflowRunner:
             contract=contract,
             effective_effect=effective_effect,
         )
+        if self.durable_action_mode == "read_only":
+            return self._project_durable_action_output(step, contract, result)
         self.context["steps"][step.id] = {"status": "running", "output": result}
         if post is not None:
             if post.get("observe") is None:
@@ -1718,6 +2274,57 @@ class WorkflowRunner:
                     ) from error
         return result
 
+    def _project_durable_action_output(
+        self, step: CompiledStep, contract: Mapping[str, Any], result: Any
+    ) -> Any:
+        checkpoint = thaw(step.params.get("checkpoint", {}))
+        output = checkpoint.get("output", {})
+        if output.get("mode") == "omit":
+            return None
+        fields = output.get("fields")
+        provider_fields = thaw(
+            contract.get("durability", {}).get("checkpoint_fields", {})
+        )
+        if output.get("mode") != "project" or not isinstance(fields, list):
+            raise AutomationError(
+                "DURABLE.UNSUPPORTED_PLAN",
+                "durable action output projection is not explicit",
+                category="durable",
+            )
+        projected: dict[str, Any] = {}
+        for alias in fields:
+            definition = provider_fields.get(alias)
+            if not isinstance(definition, Mapping):
+                raise AutomationError(
+                    "DURABLE.BINDING_MISMATCH",
+                    "durable action projection is not provider-approved",
+                    category="durable",
+                    details={"stepId": step.id, "field": alias},
+                )
+            found, value = _resolve_json_pointer(result, definition["pointer"])
+            if not found:
+                missing = definition.get("missing", "error")
+                if missing == "omit":
+                    continue
+                if missing == "null":
+                    value = None
+                else:
+                    raise AutomationError(
+                        "ACTION.OUTPUT_INVALID",
+                        "durable checkpoint field is missing",
+                        category="action",
+                        details={"stepId": step.id, "field": alias},
+                    )
+            self._validate_schema(
+                value,
+                definition.get("schema"),
+                "ACTION.OUTPUT_INVALID",
+                f"{step.id}.{alias}",
+                redact=True,
+            )
+            projected[alias] = _clone_runtime_value(value)
+        return projected
+
     def _invoke_contract_action(
         self,
         plugin: ProcessPlugin,
@@ -1731,6 +2338,37 @@ class WorkflowRunner:
         try:
             result = plugin.invoke(uses, action_input, timeout=timeout)
         except PluginError as exc:
+            if self.durable_action_mode == "read_only":
+                declared = any(
+                    isinstance(item, Mapping) and item.get("code") == exc.code
+                    for item in contract.get("errors", ())
+                )
+                if declared:
+                    raise AutomationError(
+                        exc.code,
+                        "Durable action failed with a declared provider error",
+                        category="action",
+                        phase="execute",
+                        retryable=False,
+                        effect="not_applied",
+                    ) from None
+                if exc.code == "PLUGIN.HOST_TIMEOUT":
+                    raise AutomationError(
+                        "ACTION.TIMEOUT",
+                        "Durable read-only action timed out",
+                        category="action",
+                        phase="execute",
+                        retryable=False,
+                        effect="not_applied",
+                    ) from None
+                raise AutomationError(
+                    "ACTION.UNDECLARED_ERROR",
+                    "Durable action returned an undeclared error",
+                    category="action",
+                    phase="execute",
+                    retryable=False,
+                    effect="unknown",
+                ) from None
             ambiguous = exc.code in {"PLUGIN.HOST_TIMEOUT", "PLUGIN.HOST_EOF", "PLUGIN.HOST_PROTOCOL_ERROR"}
             if exc.dispatched and effective_effect in {"non_idempotent", "contextual"} and ambiguous:
                 raise AutomationError("ACTION.UNKNOWN_EFFECT", "Action outcome is unknown after dispatch", category="action", effect="unknown", details={"plugin_error": exc.to_dict()}, cause=exc) from exc
@@ -1770,8 +2408,71 @@ class WorkflowRunner:
                 details=exc.details,
                 cause=exc,
             ) from exc
-        self._validate_schema(result, contract.get("output_schema"), "ACTION.OUTPUT_INVALID", uses)
+        self._validate_schema(
+            result,
+            contract.get("output_schema"),
+            "ACTION.OUTPUT_INVALID",
+            uses,
+            redact=self.durable_action_mode == "read_only",
+        )
         return result
+
+    @staticmethod
+    def _redact_durable_action_error(
+        error: AutomationError, contract: Mapping[str, Any]
+    ) -> AutomationError:
+        declared_codes = {
+            item.get("code")
+            for item in contract.get("errors", ())
+            if isinstance(item, Mapping)
+            and item.get("effect") == "not_applied"
+        }
+        if error.code in declared_codes:
+            return AutomationError(
+                error.code,
+                "Durable action failed with a declared provider error",
+                category="action",
+                phase=error.phase or "execute",
+                retryable=False,
+                effect="not_applied",
+            )
+        safe_codes = {
+            "ACTION.INPUT_INVALID",
+            "ACTION.OUTPUT_INVALID",
+            "ACTION.PRECONDITION_FAILED",
+            "ACTION.TIMEOUT",
+            "STEP.TIMEOUT",
+            "WORKFLOW.TIMEOUT",
+            "WORKFLOW.CANCELLED",
+            "POLICY.DENIED",
+            "POLICY.CONFIRMATION_REQUIRED",
+            "CAPABILITY.MISSING",
+            "CAPABILITY.VERSION_INCOMPATIBLE",
+            "CAPABILITY.PLATFORM_UNSUPPORTED",
+            "DURABLE.BINDING_MISMATCH",
+            "DURABLE.UNSUPPORTED_PLAN",
+        }
+        if error.code in safe_codes:
+            return AutomationError(
+                error.code,
+                "Durable read-only action failed",
+                category=error.category,
+                phase=error.phase or "execute",
+                retryable=False,
+                effect=(
+                    "none"
+                    if error.code == "WORKFLOW.CANCELLED"
+                    else "not_applied"
+                ),
+            )
+        return AutomationError(
+            "ACTION.UNDECLARED_ERROR",
+            "Durable action returned an undeclared error",
+            category="action",
+            phase="execute",
+            retryable=False,
+            effect="unknown",
+        )
 
     def _action_contract(
         self, plugin: ProcessPlugin, capability: str, uses: str
@@ -2247,6 +2948,60 @@ def _clone_runtime_value(value: Any) -> Any:
     raise TypeError(f"unsupported runtime value {type(value).__name__!r}")
 
 
+def _resolve_json_pointer(document: Any, pointer: str) -> tuple[bool, Any]:
+    """Resolve a validated, non-root RFC 6901 JSON pointer."""
+
+    if not _valid_json_pointer(pointer):
+        return False, None
+    current = document
+    for raw_token in pointer.split("/")[1:]:
+        token = raw_token.replace("~1", "/").replace("~0", "~")
+        if isinstance(current, Mapping):
+            if token not in current:
+                return False, None
+            current = current[token]
+        elif isinstance(current, (list, tuple)):
+            if (
+                not token.isascii()
+                or not token.isdigit()
+                or (token != "0" and token.startswith("0"))
+            ):
+                return False, None
+            index = int(token)
+            if index >= len(current):
+                return False, None
+            current = current[index]
+        else:
+            return False, None
+    return True, current
+
+
+def _valid_json_pointer(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and value.startswith("/")
+        and re.fullmatch(r"/(?:[^~/]|~[01])*(?:/(?:[^~/]|~[01])*)*", value)
+        is not None
+    )
+
+
+def _canonical_digest(value: Any) -> str:
+    payload = json.dumps(
+        _clone_runtime_value(value),
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return "sha256:" + hashlib.sha256(payload).hexdigest()
+
+
+def _is_sha256_digest(value: Any) -> bool:
+    return isinstance(value, str) and re.fullmatch(
+        r"sha256:[0-9a-f]{64}", value
+    ) is not None
+
+
 def canonical_plan_digest(descriptor: WorkflowDescriptor) -> str:
     """Return a stable digest of the canonical compiled descriptor input."""
 
@@ -2452,6 +3207,7 @@ def _version_matches(version: str, constraint: str) -> bool:
 
 
 __all__ = [
+    "DurableActionBinding",
     "RUNTIME_STATE_SCHEMA_VERSION",
     "RUNTIME_VERSION",
     "RuntimeSegmentState",
