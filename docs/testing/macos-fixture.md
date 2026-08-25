@@ -1,7 +1,9 @@
 # macOS Accessibility 真机 fixture 测试
 
 仓库提供 `tests/macos/` 自包含测试套件，供用户在真实 Intel 或 Apple Silicon Mac 的
-可交互登录会话中执行。详细命令和授权步骤见 `tests/macos/README.md`。
+可交互图形登录会话中执行；纯 SSH、CI 或无 GUI 会话不在支持范围内。详细命令和授权步骤
+见 `tests/macos/README.md`。源码包不依赖已安装的本项目或 Python，只需要 macOS 11+ 与
+Xcode 12 / Swift 5.3+ Command Line Tools。
 
 测试通过系统 `xcrun`/`swiftc` 构建固定 bundle ID、ad-hoc 签名的 AppKit fixture 和
 AX runner。授权可用时，runner 只从 fixture PID 创建 `AXUIElement`，进行有界遍历与唯一
@@ -29,12 +31,17 @@ runner 由 LaunchServices 以固定 `.app` 身份启动，并将报告原子写�
 - `identity.txt` 强制包含 Swift 版本、identity stability，以及 runner/fixture 各自非空的
   designated requirement、Identifier、CDHash、architectures 和 SHA-256；采集命令失败不会被
   `sed`/`awk` 等管道末端掩盖，也不会发布半份证明。
-- 缺少 macOS、Command Line Tools 或授权时输出结构化 `unsupported`，不会伪造通过。
+- 缺少 macOS、Command Line Tools、受支持 Swift 版本、原生架构或授权时输出结构化
+  `unsupported`，不会伪造通过。watchdog 超时及 launcher/build/archive 失败会写入稳定的
+  `error.code` 和有界的 `execution` 诊断字段；一旦 watchdog 判定超时，不接受迟到的
+  `passed` 报告。
 
 固定 bundle ID 与稳定构建路径可以减少 TCC 身份漂移，但 ad-hoc 签名在重编译后不保证
 保留授权，其身份稳定性只能标为 `ephemeral`；长期固定 runner 应通过
 `MACOS_TEST_CODESIGN_IDENTITY` 使用同一 Developer ID 签名。带 prompt 的 AX API 是异步的，
 本次运行仍以普通 `AXIsProcessTrusted()` 的即时结果为准。
+每次构建和运行只覆盖当前 `uname -m` 架构；报告同时记录 `architecture` 与 Rosetta 转译
+状态。需要 arm64 与 x86_64 双架构资格时，必须分别收集并验真两份归档。
 
 这是一条真机 fixture 验证链路，不等同于对任意第三方应用、锁屏、安全输入、跨用户会话
 或完整 macOS 平台兼容性的资格声明。Linux 机器只能对 shell 和源码结构进行静态检查。
@@ -50,7 +57,10 @@ Screen Recording，不加入 pointer 或 `set_value` 自动 fallback。fixture�
 ```
 
 该命令按 `SOURCE_PACKAGE_FILES.txt` 白名单生成平铺的规范化源码包，不包含构建结果。接收方
-解压到空目录后即可运行 `./run.sh`。最终对外交付归档应由发布负责人从待交付 revision 生成。
+解压到空目录后运行 `./run.sh --prompt-accessibility`，在系统设置中给
+`AI Auto Desktop AX Runner` 开启辅助功能后再运行 `./run.sh`。脚本会打印结果归档路径和
+外层 SHA-256；无论 `passed`、`failed` 还是 `unsupported`，都应回传该归档和 hash 行。最终
+对外交付源码包应由发布负责人从待交付 revision 生成，并通过可信渠道附上源码包 SHA-256。
 
 ## 在本地验真回传归档
 
@@ -63,8 +73,8 @@ tests/macos/verify-result.sh /absolute/path/macos-ax-test-result.tar.gz
 验真器不向磁盘提取任何成员，并对压缩输入、解压后的 tar、单个成员和成员总量设置硬上限。
 它只接受 `run.sh` 生成的四个平铺普通文件，先拒绝路径穿越、重复/额外成员、符号链接、
 硬链接、设备文件及其他特殊类型，再校验 `SHA256SUMS`、报告 schema、状态、checks/summary，
-identity 的固定 bundle ID、架构和 hash 字段，以及生成器承诺的 gzip 无名称/零时间和 tar
-mode、uid/gid、uname/gname、mtime 等归一化元数据。
+identity 的固定 bundle ID、架构和 hash 字段，以及生成器承诺的 gzip 单一 member、无名称、
+零时间、固定 XFL/OS 和 tar 成员顺序、mode、uid/gid、uname/gname、mtime 等归一化元数据。
 
 stdout 始终只有一个 JSON 文档。`archive_valid`（兼容别名 `verified_archive`）只表示归档
 结构、内容 hash 和报告格式自洽；`report_passed` 只表示归档内的报告自称通过，两者都不认证

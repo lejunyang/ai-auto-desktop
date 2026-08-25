@@ -191,9 +191,13 @@ def _write_archive(
             )
     with path.open("wb") as output:
         with gzip.GzipFile(
-            filename="", mode="wb", fileobj=output, mtime=gzip_mtime
+            filename="", mode="wb", fileobj=output, mtime=gzip_mtime,
+            compresslevel=6,
         ) as stream:
             stream.write(tar_payload.getvalue())
+    normalized = bytearray(path.read_bytes())
+    normalized[9] = 3
+    path.write_bytes(normalized)
 
 
 def _regular_entries(
@@ -340,9 +344,13 @@ class MacOSResultVerifierTests(unittest.TestCase):
             bomb = root / "bomb.tar.gz"
             with bomb.open("wb") as output:
                 with gzip.GzipFile(
-                    filename="", mode="wb", fileobj=output, mtime=0
+                    filename="", mode="wb", fileobj=output, mtime=0,
+                    compresslevel=6,
                 ) as stream:
                     stream.write(b"x" * (4 * 1024 * 1024 + 1))
+            normalized = bytearray(bomb.read_bytes())
+            normalized[9] = 3
+            bomb.write_bytes(normalized)
             completed, result = self._run(bomb)
             self.assertNotEqual(completed.returncode, 0)
             self.assertEqual(
@@ -390,6 +398,52 @@ class MacOSResultVerifierTests(unittest.TestCase):
                     result["error"]["code"],
                     "non_normalized_tar_metadata",
                 )
+
+    def test_gzip_header_and_single_member_contract_are_enforced(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            valid = root / "valid.tar.gz"
+            _write_archive(valid, _regular_entries(_files()))
+
+            for offset, value in ((8, 4), (9, 42)):
+                with self.subTest(offset=offset):
+                    payload = bytearray(valid.read_bytes())
+                    payload[offset] = value
+                    archive = root / f"header-{offset}.tar.gz"
+                    archive.write_bytes(payload)
+                    completed, result = self._run(archive)
+                    self.assertNotEqual(completed.returncode, 0)
+                    self.assertEqual(
+                        result["error"]["code"],
+                        "non_normalized_gzip",
+                    )
+
+            concatenated = root / "concatenated.tar.gz"
+            concatenated.write_bytes(
+                valid.read_bytes() + valid.read_bytes()
+            )
+            completed, result = self._run(concatenated)
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertEqual(result["error"]["code"], "invalid_gzip")
+
+    def test_noncanonical_member_order_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            files = _files()
+            order = (
+                "README.txt",
+                "report.json",
+                "identity.txt",
+                "SHA256SUMS",
+            )
+            archive = Path(temporary) / "reordered.tar.gz"
+            _write_archive(
+                archive, [_regular(name, files[name]) for name in order]
+            )
+            completed, result = self._run(archive)
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertEqual(
+            result["error"]["code"], "non_normalized_tar_order"
+        )
 
     def test_links_devices_and_duplicate_members_are_rejected(self) -> None:
         special_types = (
@@ -489,6 +543,51 @@ class MacOSResultVerifierTests(unittest.TestCase):
         self.assertIs(result["qualified"], False)
         self.assertIs(result["identity"]["available"], False)
         self.assertEqual(result["report"]["status"], "unsupported")
+
+    def test_launcher_timeout_diagnostics_are_validated(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            files = _minimal_unsupported_files()
+            report = json.loads(files["report.json"])
+            report["status"] = "failed"
+            report["message"] = "runner_timeout"
+            report["checks"] = [{
+                "id": "launcher_runner",
+                "status": "fail",
+                "message": "runner_timeout",
+            }]
+            report["summary"] = {"passed": 0, "failed": 1, "total": 1}
+            report["execution"] = {
+                "phase": "runner",
+                "command_status": 124,
+                "timed_out": True,
+                "timeout_seconds": 30,
+                "runner_pid_observed": True,
+            }
+            report["error"] = {
+                "code": "runner_timeout", "message": "runner_timeout"
+            }
+            files["report.json"] = (
+                json.dumps(report, sort_keys=True).encode() + b"\n"
+            )
+            _refresh_manifest(files)
+            archive = Path(temporary) / "timeout.tar.gz"
+            _write_archive(archive, _regular_entries(files))
+            completed, result = self._run(archive)
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertIs(result["archive_valid"], True)
+            self.assertEqual(result["error"]["code"], "report_not_passed")
+
+            report["execution"]["timed_out"] = False
+            files["report.json"] = (
+                json.dumps(report, sort_keys=True).encode() + b"\n"
+            )
+            _refresh_manifest(files)
+            invalid = Path(temporary) / "invalid-timeout.tar.gz"
+            _write_archive(invalid, _regular_entries(files))
+            completed, result = self._run(invalid)
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIs(result["archive_valid"], False)
+        self.assertEqual(result["error"]["code"], "invalid_report_schema")
 
     def test_passed_report_rejects_invalid_identity_fields(self) -> None:
         mutations = (

@@ -8,17 +8,17 @@ the four expected regular files are validated in memory.
 
 from __future__ import annotations
 
-import gzip
 import hashlib
 import hmac
-import io
 import json
 import os
 from pathlib import Path
 import re
 import stat
+import struct
 import sys
 from typing import Any, NoReturn
+import zlib
 
 
 VERIFIER_SCHEMA = "ai-auto-desktop.macos-result-verifier/v1"
@@ -173,14 +173,34 @@ def _decompress(compressed: bytes) -> bytes:
         )
     if compressed[4:8] != b"\0\0\0\0":
         _fail("non_normalized_gzip", "gzip mtime 必须为零。")
+    if compressed[8] != 0 or compressed[9] != 3:
+        _fail(
+            "non_normalized_gzip",
+            "gzip XFL/OS header 与受支持生成器不匹配。",
+            {"xfl": compressed[8], "os": compressed[9]},
+        )
     try:
-        with gzip.GzipFile(fileobj=io.BytesIO(compressed)) as stream:
-            payload = stream.read(MAX_TAR_BYTES + 1)
-    except (EOFError, OSError, gzip.BadGzipFile) as exc:
+        decompressor = zlib.decompressobj(wbits=-zlib.MAX_WBITS)
+        payload = decompressor.decompress(
+            compressed[10:-8], MAX_TAR_BYTES + 1
+        )
+        if decompressor.unconsumed_tail or len(payload) > MAX_TAR_BYTES:
+            _fail(
+                "tar_payload_too_large",
+                "gzip 解压后的 tar 数据超过硬上限。",
+                {"limit_bytes": MAX_TAR_BYTES},
+            )
+        payload += decompressor.flush(MAX_TAR_BYTES + 1 - len(payload))
+    except zlib.error as exc:
         _fail(
             "invalid_gzip",
             "归档不是完整有效的 gzip 数据。",
             {"reason": exc.__class__.__name__},
+        )
+    if not decompressor.eof or decompressor.unused_data:
+        _fail(
+            "invalid_gzip",
+            "归档必须恰好包含一个完整 gzip member。",
         )
     if len(payload) > MAX_TAR_BYTES:
         _fail(
@@ -188,6 +208,11 @@ def _decompress(compressed: bytes) -> bytes:
             "gzip 解压后的 tar 数据超过硬上限。",
             {"limit_bytes": MAX_TAR_BYTES},
         )
+    expected_crc32, expected_size = struct.unpack("<II", compressed[-8:])
+    if zlib.crc32(payload) & 0xFFFFFFFF != expected_crc32:
+        _fail("invalid_gzip", "gzip CRC32 校验失败。")
+    if len(payload) & 0xFFFFFFFF != expected_size:
+        _fail("invalid_gzip", "gzip ISIZE 校验失败。")
     return payload
 
 
@@ -225,6 +250,7 @@ def _parse_ustar(payload: bytes) -> dict[str, bytes]:
         _fail("invalid_tar", "tar 长度或结束块无效。")
 
     members: dict[str, bytes] = {}
+    member_order: list[str] = []
     total_size = 0
     offset = 0
     saw_end = False
@@ -248,7 +274,6 @@ def _parse_ustar(payload: bytes) -> dict[str, bytes]:
             _fail("invalid_tar_header", "tar header checksum 不匹配。")
         if header[257:263] != b"ustar\0" or header[263:265] != b"00":
             _fail("invalid_tar_format", "结果归档必须使用 ustar 格式。")
-
         name = _tar_text(header[0:100], "member name")
         prefix = _tar_text(header[345:500], "member prefix")
         if prefix:
@@ -344,6 +369,7 @@ def _parse_ustar(payload: bytes) -> dict[str, bytes]:
                 {"member": name},
             )
         members[name] = payload[content_start:content_end]
+        member_order.append(name)
         offset = next_offset
 
     if not saw_end:
@@ -353,6 +379,12 @@ def _parse_ustar(payload: bytes) -> dict[str, bytes]:
         _fail("missing_member", "归档缺少必需成员。", {"members": missing})
     if len(members) != len(EXPECTED_MEMBERS):
         _fail("invalid_member_set", "归档成员集合无效。")
+    if tuple(member_order) != EXPECTED_MEMBERS:
+        _fail(
+            "non_normalized_tar_order",
+            "归档成员顺序未按生成器规范固定。",
+            {"members": member_order},
+        )
     return members
 
 
@@ -441,6 +473,43 @@ def _integer(value: Any, field: str) -> int:
     return value
 
 
+def _validate_launcher_diagnostics(report: dict[str, Any]) -> None:
+    execution_value = report.get("execution")
+    error_value = report.get("error")
+    if execution_value is None and error_value is None:
+        return
+    execution = _dict(execution_value, "execution")
+    phase = execution.get("phase")
+    if phase not in ("build", "runner", "archive"):
+        _fail("invalid_report_schema", "report execution.phase 无效。")
+    command_status = _integer(
+        execution.get("command_status"), "execution.command_status"
+    )
+    if command_status > 255:
+        _fail("invalid_report_schema", "report command_status 超出范围。")
+    timed_out = _boolean(
+        execution.get("timed_out"), "execution.timed_out"
+    )
+    timeout_seconds = _integer(
+        execution.get("timeout_seconds"), "execution.timeout_seconds"
+    )
+    if not 1 <= timeout_seconds <= 600:
+        _fail("invalid_report_schema", "report timeout_seconds 超出范围。")
+    _boolean(
+        execution.get("runner_pid_observed"),
+        "execution.runner_pid_observed",
+    )
+    error = _dict(error_value, "error")
+    error_code = _nonempty_string(error.get("code"), "error.code")
+    _nonempty_string(error.get("message"), "error.message")
+    if report["status"] == "passed":
+        _fail("invalid_report_schema", "passed 报告不能包含 launcher error。")
+    if timed_out and (phase != "runner" or command_status != 124):
+        _fail("invalid_report_schema", "timeout 诊断与 runner 状态不一致。")
+    if error_code == "runner_timeout" and not timed_out:
+        _fail("invalid_report_schema", "runner_timeout 必须标记 timed_out。")
+
+
 def _validate_report(data: bytes) -> dict[str, Any]:
     report = _json_without_duplicates(_decode_utf8(data, "report.json"))
     if not isinstance(report, dict):
@@ -453,6 +522,7 @@ def _validate_report(data: bytes) -> dict[str, Any]:
     if status not in ("passed", "failed", "unsupported"):
         _fail("invalid_report_status", "report status 无效。")
     _nonempty_string(report.get("message"), "message")
+    _validate_launcher_diagnostics(report)
 
     checks = report.get("checks")
     if not isinstance(checks, list):

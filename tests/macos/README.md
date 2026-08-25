@@ -6,23 +6,37 @@
 - `dev.ai-auto-desktop.testkit.fixture`：只包含原生 AppKit 文本框、按钮和状态文本；
 - `dev.ai-auto-desktop.testkit.ax-runner`：只遍历上述 fixture 进程的 AX 树。
 
-在 Intel 和 Apple Silicon Mac 上执行：
+在 Intel 和 Apple Silicon Mac 的本地图形登录会话中执行（不支持仅 SSH、CI 或无 GUI
+会话）。需要 macOS 11 或更高版本，以及 Xcode 12 / Swift 5.3 或更高版本的 Command Line
+Tools；不需要预装 Python、项目包或第三方依赖。
 
-```sh
-./run.sh
-```
-
-默认运行不会弹出辅助功能授权请求。若报告为 `unsupported`，可明确请求一次系统授权，
-完成“系统设置 → 隐私与安全性 → 辅助功能”操作后重新运行：
+解压源码包后执行：
 
 ```sh
 ./run.sh --prompt-accessibility
+```
+
+默认运行不会弹出辅助功能授权请求；上面的首次运行命令明确请求一次系统授权。
+
+若报告为 `unsupported`，请在“系统设置 → 隐私与安全性 → 辅助功能”中确认
+`AI Auto Desktop AX Runner` 已出现并开启；必要时用 `+` 选择当前目录下的
+`.build/AiAutoDesktopAXRunner.app`。授权后保持源码和 `.build` 路径不变，关闭已启动的测试
+窗口并重新运行：
+
+```sh
 ./run.sh
 ```
 
+带 prompt 的系统 API 是异步的，第一次命令返回 `unsupported` 并不代表授权操作失败。若
+重编译、移动目录或删除 `.build` 后再次变成未授权，请移除系统设置里的旧条目，按上述步骤
+重新授权。
+
 `run.sh` 会在 stdout 输出单个 JSON 文档，并在 stderr 打印结果归档路径。退出码为：
-`0` 通过、`1` 测试或构建失败、`3` 当前环境不支持/未授权、`64` 参数错误。
-结果目录默认位于 `tests/macos/results/`，其中的 `macos-ax-test-result.tar.gz` 可直接回传。
+`0` 通过、`1` 测试或构建失败、`3` 当前环境不支持/未授权、`64` 参数错误。默认 runner
+超时为 30 秒，可用 `--timeout 1..600` 调整。watchdog 超时优先于迟到的 runner 报告，
+并写入 `error.code=runner_timeout`；构建、签名、报告解析和归档阶段也使用稳定错误码及
+`execution` 字段，便于远程排查。
+结果目录默认位于当前目录的 `results/`，其中的 `macos-ax-test-result.tar.gz` 可直接回传。
 归档只含 `report.json`、`identity.txt`、`SHA256SUMS` 和隐私说明，不含截图、屏幕像素、构建日志、用户名、主机名，
 也不读取 fixture 之外的应用。
 `identity.txt` 仅保存 bundle 的 designated requirement、Identifier、TeamIdentifier、
@@ -31,15 +45,21 @@ CDHash、Mach-O 架构和可执行文件 SHA-256，不保存绝对路径。
 Identifier、CDHash、架构、SHA-256 都是必填证明；任何工具失败、字段缺失或空值都会让构建
 失败，不会产生半份 `identity.txt`。
 
-回传时还应在 Mac 本机执行：
+`run.sh` 会自动在 stderr 输出归档路径和完整 SHA-256。也可在 Mac 本机复核：
 
 ```sh
 shasum -a 256 results/*/macos-ax-test-result.tar.gz
 ```
 
-请把归档和该命令的完整输出分别发给测试请求方。归档内的 `SHA256SUMS` 只验证成员
+请回传最新的 `macos-ax-test-result.tar.gz` 和 `归档 SHA-256` 那一行；即使报告为
+`failed` 或 `unsupported` 也请完整回传，以便诊断。归档内的 `SHA256SUMS` 只验证成员
 自洽，不能认证回传来源；外层归档 SHA-256 也只有通过独立可信渠道取得时，才可作为
 来源绑定证据。
+
+每次运行只证明当前进程架构：Intel Mac 为 `x86_64`，Apple Silicon 原生终端为 `arm64`，
+Apple Silicon 的 Rosetta 终端可能为 `x86_64`；报告同时记录 `architecture` 与
+`rosetta_translated`。若资格范围要求同时覆盖两种架构，必须分别取得两份可信回传归档，
+不能用单次运行替代双架构验证。
 
 结果归档使用固定的成员顺序、UTC 时间（2000-01-01 00:00:00）、文件权限和 root/0
 owner/group，并移除 ACL、file flags、扩展属性与 macOS AppleDouble 元数据；gzip header 也不
@@ -70,7 +90,7 @@ runner 通过 LaunchServices (`open -n -W`) 启动，使 TCC 对应实际 `.app`
 xcode-select --install
 ```
 
-为减少 TCC 中的应用身份和路径变化，默认构建目录是稳定的 `tests/macos/.build/`；
+为减少 TCC 中的应用身份和路径变化，默认构建目录是稳定的当前目录 `.build/`；
 源码未变化时不会重复编译。不要在授权与复测之间删除该目录。固定 bundle ID 加 ad-hoc
 签名的 `identity_stability` 是 `ephemeral`，重编译后可能需要重新授权；长期固定测试节点应
 设置 `MACOS_TEST_CODESIGN_IDENTITY`，始终使用同一 Developer ID 签名。
@@ -92,4 +112,7 @@ tar -xzf macos-ax-testkit-source.tar.gz -C macos-ax-testkit
 cd macos-ax-testkit
 ./run.sh
 ```
+
+接收方无需安装本项目或 Python。发布负责人应从待交付 revision 生成源码包，并通过可信
+渠道同时提供源码包 SHA-256。
 

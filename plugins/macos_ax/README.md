@@ -111,5 +111,8 @@ fallback。它接收 `target`、`locator` 和 `text`，只允许 1–1024 个 Un
   `type_text` 以独立的 `keyboard_dispatch_started` marker 判断文本效果。
 - 当前源码没有经过 macOS 真机构建、TCC、Intel/Apple Silicon、多显示器或第三方应用验证，
   因此不能据此声明平台资格已完成。
+- 可发送给真实 Mac 操作者的自包含 fixture 源码包由 `tests/macos/package-source.sh` 生成；
+  它不要求预装本项目依赖，操作和回传规则见 `docs/testing/macos-fixture.md`。fixture 结果只
+  覆盖本仓库自有 AppKit 控件，不替代本 helper 对第三方应用的单独资格验证。
 
 完整契约和后续真机验收项见 `docs/architecture/macos-ax-driver.md`。

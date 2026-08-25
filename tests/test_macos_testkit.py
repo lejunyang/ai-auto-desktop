@@ -305,6 +305,30 @@ class MacOSTestkitSourceContracts(unittest.TestCase):
         self.assertIn('--pid-file "$runner_pid_file"', self.launcher)
         self.assertIn('--cancel-file "$cancel_file"', self.launcher)
         self.assertIn('plutil -extract status raw', self.launcher)
+        timeout_branch = self.launcher.index('runner_status" -eq 124')
+        missing_report_branch = self.launcher.index(
+            '! -s "$temporary_report"'
+        )
+        self.assertLess(timeout_branch, missing_report_branch)
+        self.assertIn('runner_timeout', self.launcher)
+        self.assertIn('result_archive_failed', self.launcher)
+        self.assertIn('archive_hash_failed', self.launcher)
+
+    def test_launcher_has_bounded_configurable_timeout(self) -> None:
+        self.assertIn('--timeout SECONDS', self.launcher)
+        self.assertIn('[ "$2" -lt 1 ]', self.launcher)
+        self.assertIn('[ "$2" -gt 600 ]', self.launcher)
+        self.assertIn(
+            '"timeout_seconds":$runner_timeout_seconds', self.launcher
+        )
+        self.assertIn(
+            '"runner_pid_observed":$runner_pid_observed', self.launcher
+        )
+
+    def test_build_declares_and_checks_minimum_swift_version(self) -> None:
+        self.assertIn('"$swiftc_path" --version', self.build)
+        self.assertIn('至少需要 Swift 5.3', self.build)
+        self.assertIn('exit 81', self.build)
 
     def test_result_archiver_normalizes_metadata_portably(self) -> None:
         self.assertIn(
@@ -319,6 +343,9 @@ class MacOSTestkitSourceContracts(unittest.TestCase):
             "--no-acls --no-selinux --no-xattrs",
             "touch -t 200001010000",
             '"$normalized_archive_gzip" -n -c',
+            'od -An -tu1 -j 8 -N 2',
+            '[ "$1" != 0 ]',
+            '[ "$2" != 3 ]',
         ):
             with self.subTest(marker=marker):
                 self.assertIn(marker, self.archive)
@@ -422,6 +449,8 @@ class NormalizedArchiveContracts(unittest.TestCase):
             self.assertEqual(gzip_header[:3], b"\x1f\x8b\x08")
             self.assertEqual(gzip_header[3], 0)
             self.assertEqual(gzip_header[4:8], b"\0\0\0\0")
+            self.assertEqual(gzip_header[8], 0)
+            self.assertEqual(gzip_header[9], 3)
             self.assertEqual(int(archives[0].stat().st_mtime), NORMALIZED_MTIME)
 
             with tarfile.open(archives[0], "r:gz") as archive:
@@ -741,6 +770,9 @@ class NonMacOSLauncherContracts(unittest.TestCase):
             self.assertIsInstance(report, dict)
             assert isinstance(report, dict)
             self.assertEqual(report["message"], "requires_macos")
+            self.assertEqual(report["error"]["code"], "requires_macos")
+            self.assertEqual(report["execution"]["phase"], "build")
+            self.assertEqual(report["execution"]["command_status"], 69)
 
     def test_unsupported_host_emits_one_json_and_minimal_archive(self) -> None:
         shell = shutil.which("sh")
@@ -785,6 +817,9 @@ class NonMacOSLauncherContracts(unittest.TestCase):
                 assert isinstance(report, dict)
                 self.assertEqual(report["status"], "unsupported")
                 self.assertEqual(report["message"], "requires_macos")
+                self.assertEqual(report["error"]["code"], "requires_macos")
+                self.assertEqual(report["execution"]["phase"], "build")
+                self.assertIs(report["execution"]["timed_out"], False)
                 self.assertFalse(
                     report["permissions"]["screen_capture"][
                         "request_attempted"

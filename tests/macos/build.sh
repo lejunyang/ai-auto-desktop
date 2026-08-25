@@ -23,6 +23,26 @@ if ! swiftc_path=$(xcrun --sdk macosx --find swiftc 2>/dev/null); then
     printf '%s\n' '不支持：找不到 macOS SDK 或 swiftc，请运行 xcode-select --install。' >&2
     exit 71
 fi
+if ! swift_version_output=$("$swiftc_path" --version 2>&1); then
+    printf '%s\n' '不支持：无法读取 Swift 编译器版本。' >&2
+    exit 81
+fi
+swift_version_numbers=$(
+    printf '%s\n' "$swift_version_output" \
+        | sed -n '1s/.*Swift version \([0-9][0-9]*\)\.\([0-9][0-9]*\).*/\1 \2/p'
+)
+set -- $swift_version_numbers
+if [ "$#" -ne 2 ]; then
+    printf '%s\n' '不支持：无法解析 Swift 编译器版本（至少需要 Swift 5.3）。' >&2
+    exit 81
+fi
+swift_major=$1
+swift_minor=$2
+if [ "$swift_major" -lt 5 ] \
+    || { [ "$swift_major" -eq 5 ] && [ "$swift_minor" -lt 3 ]; }; then
+    printf '%s\n' '不支持：至少需要 Swift 5.3（Xcode 12 或更新版本）。' >&2
+    exit 81
+fi
 if ! sdk_path=$(xcrun --sdk macosx --show-sdk-path 2>/dev/null); then
     printf '%s\n' '不支持：找不到 macOS SDK。' >&2
     exit 71

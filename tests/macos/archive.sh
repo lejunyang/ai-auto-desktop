@@ -149,6 +149,23 @@ create_normalized_tar_gz() {
         printf '%s\n' '失败：无法压缩规范化归档。' >&2
         return 1
     fi
+    # gzip -n guarantees no filename/mtime.  This kit also pins the remaining
+    # header bytes to the gzip(1) defaults used by the receiver's verifier:
+    # XFL=0 (default level) and OS=3 (Unix, including macOS gzip).
+    if ! normalized_archive_gzip_header=$(
+        LC_ALL=C od -An -tu1 -j 8 -N 2 "$normalized_archive_gzip_file" \
+            2>/dev/null
+    ); then
+        rm -rf "$normalized_archive_work" 2>/dev/null || :
+        printf '%s\n' '失败：无法检查 gzip header。' >&2
+        return 1
+    fi
+    set -- $normalized_archive_gzip_header
+    if [ "$#" -ne 2 ] || [ "$1" != 0 ] || [ "$2" != 3 ]; then
+        rm -rf "$normalized_archive_work" 2>/dev/null || :
+        printf '%s\n' '失败：gzip header 不符合规范化要求。' >&2
+        return 1
+    fi
     if ! chmod 600 "$normalized_archive_gzip_file"; then
         rm -rf "$normalized_archive_work" 2>/dev/null || :
         printf '%s\n' '失败：无法设置归档文件权限。' >&2

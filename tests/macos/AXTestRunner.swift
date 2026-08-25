@@ -64,7 +64,7 @@ private func configureProcessGroup() -> Bool {
 }
 
 private func writePIDFile(_ destination: URL?) -> Bool {
-    guard let destination else { return true }
+    guard let destination = destination else { return true }
     let data = Data("\(getpid())\n".utf8)
     do {
         try data.write(to: destination, options: .atomic)
@@ -341,7 +341,7 @@ private func parseArguments() -> Arguments? {
             return nil
         }
     }
-    guard let fixturePath else { return nil }
+    guard let fixturePath = fixturePath else { return nil }
     return Arguments(
         fixtureApp: URL(fileURLWithPath: fixturePath).standardizedFileURL,
         reportPath: reportPath.map {
@@ -1010,7 +1010,7 @@ private func emit(_ report: [String: Any], to destination: URL?) -> Bool {
         FileHandle.standardOutput.write(Data("{\"kind\":\"macos_ax_fixture_test\",\"status\":\"failed\",\"message\":\"JSON serialization failed\"}\n".utf8))
         return false
     }
-    guard let destination else {
+    guard let destination = destination else {
         FileHandle.standardOutput.write(data)
         FileHandle.standardOutput.write(Data([0x0a]))
         return true

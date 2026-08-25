@@ -9,13 +9,15 @@ prompt_accessibility=false
 runner_timeout_seconds=30
 runner_pid=
 watchdog_pid=
+runner_pid_observed=false
 
 usage() {
     cat >&2 <<'EOF'
-用法：tests/macos/run.sh [--prompt-accessibility] [--output DIR] [--build-dir DIR]
+用法：tests/macos/run.sh [--prompt-accessibility] [--timeout SECONDS] [--output DIR] [--build-dir DIR]
 
 默认只检查 Accessibility trust，不弹授权提示。只有显式传入
 --prompt-accessibility 才会调用带 prompt 的系统 API。套件绝不请求截屏授权，也不截图。
+runner 默认最多运行 30 秒；--timeout 只接受 1 到 600 的整数秒。
 EOF
 }
 
@@ -24,6 +26,18 @@ while [ "$#" -gt 0 ]; do
         --prompt-accessibility)
             prompt_accessibility=true
             shift
+            ;;
+        --timeout)
+            [ "$#" -ge 2 ] || { usage; exit 64; }
+            case $2 in
+                ''|*[!0-9]*) usage; exit 64 ;;
+            esac
+            if [ "$2" -lt 1 ] || [ "$2" -gt 600 ]; then
+                usage
+                exit 64
+            fi
+            runner_timeout_seconds=$2
+            shift 2
             ;;
         --output)
             [ "$#" -ge 2 ] || { usage; exit 64; }
@@ -60,6 +74,10 @@ if [ -L "$output_root" ]; then
     exit 1
 fi
 mkdir -p "$output_root"
+if [ -L "$build_root" ]; then
+    printf '%s\n' '失败：构建目录不能是符号链接。' >&2
+    exit 1
+fi
 if [ -e "$result_dir" ] || [ -L "$result_dir" ]; then
     printf '%s\n' '失败：结果目录已存在。' >&2
     exit 1
@@ -118,6 +136,14 @@ run_with_watchdog() {
     if [ -f "$timeout_marker" ]; then
         runner_status=124
     fi
+    if [ -s "$runner_pid_file" ]; then
+        observed_pid=
+        IFS= read -r observed_pid <"$runner_pid_file" || observed_pid=
+        case $observed_pid in
+            ''|*[!0-9]*) ;;
+            *) runner_pid_observed=true ;;
+        esac
+    fi
     if [ "$runner_status" -eq 0 ] && [ ! -s "$runner_pid_file" ]; then
         runner_status=1
     fi
@@ -132,11 +158,24 @@ run_with_watchdog() {
     return "$runner_status"
 }
 
-write_environment_report() {
+write_launcher_report() {
     report_status=$1
     report_message=$2
+    report_phase=$3
+    report_error_code=$4
+    report_command_status=$5
+    report_timed_out=$6
+    case $report_status in
+        unsupported) report_check_status=unsupported; report_failed=0 ;;
+        *) report_check_status=fail; report_failed=1 ;;
+    esac
+    report_os=$(uname -s 2>/dev/null || printf unknown)
+    case $report_os in
+        Darwin|Linux) ;;
+        *) report_os=unknown ;;
+    esac
     cat >"$report_path" <<EOF
-{"schema_version":"1.0","kind":"macos_ax_fixture_test","status":"$report_status","message":"$report_message","platform":{"os":"$(uname -s 2>/dev/null || printf unknown)","architecture":"$arch"},"permissions":{"accessibility":{"checked":false,"prompt_requested":$prompt_accessibility},"screen_capture":{"checked":false,"request_attempted":false,"capture_attempted":false}},"checks":[],"summary":{"passed":0,"failed":0,"total":0}}
+{"schema_version":"1.0","kind":"macos_ax_fixture_test","status":"$report_status","message":"$report_message","platform":{"os":"$report_os","architecture":"$arch"},"permissions":{"accessibility":{"checked":false,"prompt_requested":$prompt_accessibility},"screen_capture":{"checked":false,"request_attempted":false,"capture_attempted":false}},"execution":{"phase":"$report_phase","command_status":$report_command_status,"timed_out":$report_timed_out,"timeout_seconds":$runner_timeout_seconds,"runner_pid_observed":$runner_pid_observed},"error":{"code":"$report_error_code","message":"$report_message"},"checks":[{"id":"launcher_$report_phase","status":"$report_check_status","message":"$report_message"}],"summary":{"passed":0,"failed":$report_failed,"total":1}}
 EOF
 }
 
@@ -144,9 +183,19 @@ build_status=0
 "$script_dir/build.sh" "$build_root" || build_status=$?
 if [ "$build_status" -ne 0 ]; then
     case $build_status in
-        69) write_environment_report unsupported "requires_macos"; final_status=3 ;;
-        70|71|74|79) write_environment_report unsupported "xcode_command_line_tools_or_architecture_unavailable"; final_status=3 ;;
-        *) write_environment_report failed "native_build_failed"; final_status=1 ;;
+        69) write_launcher_report unsupported "requires_macos" build requires_macos "$build_status" false; final_status=3 ;;
+        70) write_launcher_report unsupported "xcode_command_line_tools_missing" build xcode_command_line_tools_missing "$build_status" false; final_status=3 ;;
+        71) write_launcher_report unsupported "swift_toolchain_unavailable" build swift_toolchain_unavailable "$build_status" false; final_status=3 ;;
+        74) write_launcher_report unsupported "codesign_unavailable" build codesign_unavailable "$build_status" false; final_status=3 ;;
+        79) write_launcher_report unsupported "unsupported_architecture" build unsupported_architecture "$build_status" false; final_status=3 ;;
+        81) write_launcher_report unsupported "unsupported_swift_version" build unsupported_swift_version "$build_status" false; final_status=3 ;;
+        72) write_launcher_report failed "fixture_compile_failed" build fixture_compile_failed "$build_status" false; final_status=1 ;;
+        73) write_launcher_report failed "runner_compile_failed" build runner_compile_failed "$build_status" false; final_status=1 ;;
+        75) write_launcher_report failed "fixture_codesign_failed" build fixture_codesign_failed "$build_status" false; final_status=1 ;;
+        76) write_launcher_report failed "runner_codesign_failed" build runner_codesign_failed "$build_status" false; final_status=1 ;;
+        77|78) write_launcher_report failed "bundle_identity_validation_failed" build bundle_identity_validation_failed "$build_status" false; final_status=1 ;;
+        80) write_launcher_report failed "identity_attestation_failed" build identity_attestation_failed "$build_status" false; final_status=1 ;;
+        *) write_launcher_report failed "native_build_failed" build native_build_failed "$build_status" false; final_status=1 ;;
     esac
 else
     runner="$build_root/AiAutoDesktopAXRunner.app/Contents/MacOS/AiAutoDesktopAXRunner"
@@ -166,20 +215,35 @@ else
         run_with_watchdog --fixture-app "$fixture" \
             --report "$temporary_report" || runner_status=$?
     fi
-    if [ ! -s "$temporary_report" ]; then
-        write_environment_report failed "runner_produced_no_json"
+    if [ "$runner_status" -eq 124 ]; then
+        rm -f "$temporary_report"
+        write_launcher_report failed "runner_timeout" runner runner_timeout "$runner_status" true
         final_status=1
-    elif command -v plutil >/dev/null 2>&1 && ! plutil -lint "$temporary_report" >/dev/null 2>&1; then
-        write_environment_report failed "runner_produced_invalid_json"
+    elif [ ! -s "$temporary_report" ]; then
+        write_launcher_report failed "runner_produced_no_json" runner runner_produced_no_json "$runner_status" false
+        final_status=1
+    elif [ ! -x /usr/bin/plutil ]; then
+        write_launcher_report failed "json_validator_unavailable" runner json_validator_unavailable "$runner_status" false
+        final_status=1
+    elif ! /usr/bin/plutil -lint "$temporary_report" >/dev/null 2>&1; then
+        write_launcher_report failed "runner_produced_invalid_json" runner runner_produced_invalid_json "$runner_status" false
         final_status=1
     else
         mv "$temporary_report" "$report_path"
-        report_status=$(/usr/bin/plutil -extract status raw -o - "$report_path" 2>/dev/null || printf invalid)
-        case $report_status in
-            passed) final_status=0 ;;
-            unsupported) final_status=3 ;;
-            *) final_status=1 ;;
-        esac
+        if report_status=$(/usr/bin/plutil -extract status raw -o - "$report_path" 2>/dev/null); then
+            case $report_status in
+                passed) final_status=0 ;;
+                unsupported) final_status=3 ;;
+                failed) final_status=1 ;;
+                *)
+                    write_launcher_report failed "runner_report_status_invalid" runner runner_report_status_invalid "$runner_status" false
+                    final_status=1
+                    ;;
+            esac
+        else
+            write_launcher_report failed "runner_report_status_missing" runner runner_report_status_missing "$runner_status" false
+            final_status=1
+        fi
     fi
 fi
 
@@ -195,28 +259,40 @@ else
     printf '%s\n' 'identity_attestation=unavailable' >"$result_dir/identity.txt"
 fi
 
-if command -v shasum >/dev/null 2>&1; then
+if [ -x /usr/bin/shasum ]; then
     if ! (cd "$result_dir" \
-        && shasum -a 256 report.json README.txt identity.txt \
+        && /usr/bin/shasum -a 256 report.json README.txt identity.txt \
             >SHA256SUMS.tmp); then
         rm -f "$result_dir/SHA256SUMS.tmp"
         printf '%s\n' '失败：无法计算结果文件 SHA-256。' >&2
+        write_launcher_report failed "result_hash_failed" archive result_hash_failed 1 false
         cat "$report_path"
         exit 1
     fi
     mv "$result_dir/SHA256SUMS.tmp" "$result_dir/SHA256SUMS"
 else
     printf '%s\n' '失败：系统 shasum 不可用，拒绝生成无校验清单的归档。' >&2
+    write_launcher_report failed "shasum_unavailable" archive shasum_unavailable 69 false
     cat "$report_path"
     exit 1
 fi
 if ! create_normalized_tar_gz "$archive_path" "$result_dir" \
     report.json README.txt identity.txt SHA256SUMS; then
     printf '%s\n' '失败：无法创建结果归档。' >&2
+    rm -f "$result_dir/SHA256SUMS"
+    write_launcher_report failed "result_archive_failed" archive result_archive_failed 1 false
+    cat "$report_path"
+    exit 1
+fi
+if ! archive_sha256=$(/usr/bin/shasum -a 256 "$archive_path" 2>/dev/null); then
+    printf '%s\n' '失败：无法计算结果归档 SHA-256。' >&2
+    rm -f "$archive_path"
+    write_launcher_report failed "archive_hash_failed" archive archive_hash_failed 1 false
     cat "$report_path"
     exit 1
 fi
 cat "$report_path"
 printf '%s\n' "结果归档：$archive_path" >&2
+printf '%s\n' "归档 SHA-256：${archive_sha256%% *}" >&2
 exit "$final_status"
 
