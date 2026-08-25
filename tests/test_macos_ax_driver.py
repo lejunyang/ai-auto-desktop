@@ -49,6 +49,7 @@ def node(
     value: str | None = None,
     actions: tuple[str, ...] = (),
     protected: bool = False,
+    bounds: dict[str, int] | None = None,
 ) -> object:
     return ax.BackendNode(
         native=key,
@@ -65,7 +66,7 @@ def node(
             "editable": "set_value" in actions,
             "protected": protected,
         },
-        bounds={"x": 10, "y": 20, "width": 120, "height": 30},
+        bounds={"x": 10, "y": 20, "width": 120, "height": 30} if bounds is None else bounds,
         actions=actions,
         provenance={
             "identifier": identifier,
@@ -79,14 +80,17 @@ def node(
 def default_tree() -> list[object]:
     return [
         node("app", None, "AXApplication", "Editor", identifier="app"),
-        node("window", 0, "AXWindow", "Editor", identifier="main", actions=("focus",)),
+        node(
+            "window", 0, "AXWindow", "Editor", identifier="main",
+            actions=("focus", "pointer_click"),
+        ),
         node(
             "save",
             1,
             "AXButton",
             "Save",
             identifier="save",
-            actions=("focus", "invoke"),
+            actions=("focus", "invoke", "pointer_click"),
         ),
         node(
             "title",
@@ -95,7 +99,7 @@ def default_tree() -> list[object]:
             "Title",
             identifier="title",
             value="Draft",
-            actions=("focus", "set_value", "type_text"),
+            actions=("focus", "pointer_click", "set_value", "type_text"),
         ),
     ]
 
@@ -154,6 +158,19 @@ class FakeBackend:
     def invoke(self, native: object, *, deadline: float) -> object:
         return self._action("invoke", native)
 
+    def pointer_click(
+        self, native: object, *, button: str, position: str, deadline: float
+    ) -> object:
+        self.calls.append(("pointer_click", native, button, position))
+        if self.fail == "pointer_click":
+            raise RuntimeError("synthetic native failure")
+        return {
+            "native_operation": "CGEventLeftClick",
+            "submitted": True,
+            "pointer_dispatch_started": True,
+            "phase": "submitted",
+        }
+
     def set_value(self, native: object, value: str, *, deadline: float) -> object:
         return self._action("set_value", native, value)
 
@@ -211,6 +228,33 @@ class TypeTextFaultBackend(FakeBackend):
                 "focus_changed": self.focus_changed,
                 "effect": "unknown" if self.keyboard_dispatch_started
                 else "contextual" if self.focus_changed else "not_applied",
+            },
+        )
+
+    def terminate_after_unknown_effect(self) -> None:
+        self.terminated += 1
+
+
+class PointerClickFaultBackend(FakeBackend):
+    def __init__(self, code: str, *, pointer_dispatch_started: bool) -> None:
+        super().__init__()
+        self.code = code
+        self.pointer_dispatch_started = pointer_dispatch_started
+        self.terminated = 0
+
+    def pointer_click(
+        self, native: object, *, button: str, position: str, deadline: float
+    ) -> object:
+        self.calls.append(("pointer_click_attempt", native, button, position))
+        raise ax.DriverError(
+            self.code,
+            "synthetic pointer_click failure",
+            retryable=self.code == "DRIVER.TIMEOUT",
+            data={
+                "helper_channel_failure": True,
+                "helper_request_dispatched": True,
+                "pointer_dispatch_started": self.pointer_dispatch_started,
+                "effect": "unknown" if self.pointer_dispatch_started else "not_applied",
             },
         )
 
@@ -332,7 +376,7 @@ class MacOSAXCoreTests(unittest.TestCase):
         self.assertEqual(save["parent_id"], "n1")
         self.assertEqual(save["role"], "AXButton")
         self.assertEqual(save["bounds"]["x"], 10)
-        self.assertEqual(save["actions"], ["focus", "invoke"])
+        self.assertEqual(save["actions"], ["focus", "invoke", "pointer_click"])
         self.assertEqual(save["provenance"]["backend"], "fake_macos_ax")
 
     def test_locator_is_exact_and_never_selects_first_ambiguous_node(self) -> None:
@@ -383,6 +427,7 @@ class MacOSAXCoreTests(unittest.TestCase):
         cases = (
             ("focus", {"identifier": "save"}, {}),
             ("invoke", {"identifier": "save"}, {}),
+            ("pointer_click", {"identifier": "save"}, {}),
             ("set_value", {"identifier": "title"}, {"value": "Final"}),
             ("type_text", {"identifier": "title"}, {"text": "你好, macOS 👋"}),
         )
@@ -423,6 +468,10 @@ class MacOSAXCoreTests(unittest.TestCase):
                 self.assertEqual(len(action_calls), 1)
                 if action == "type_text":
                     self.assertEqual(action_calls[0], ("type_text", "title", "你好, macOS 👋"))
+                elif action == "pointer_click":
+                    self.assertEqual(
+                        action_calls[0], ("pointer_click", "save", "left", "center")
+                    )
                 with self.assertRaises(ax.DriverError) as stale_after_write:
                     driver.execute(
                         "find",
@@ -468,6 +517,66 @@ class MacOSAXCoreTests(unittest.TestCase):
         self.assertEqual(stale.exception.code, "DRIVER.STALE_SNAPSHOT")
         self.assertFalse(any(call[0] == "invoke" for call in backend.calls))
 
+    def test_pointer_click_defaults_and_rejects_coordinates(self) -> None:
+        snapshot = self.snapshot()
+        found = self.find(snapshot, {"identifier": "save"})
+        result = self.driver.execute(
+            "pointer_click",
+            {"target": found["target"], "locator": {"identifier": "save"}},
+            deadline=deadline(),
+        )
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["backend_result"]["pointer_dispatch_started"], True)
+        self.assertIn(("pointer_click", "save", "left", "center"), self.backend.calls)
+
+        invalid_args = (
+            {"target": found["target"], "locator": {"identifier": "save"}, "button": "right"},
+            {"target": found["target"], "locator": {"identifier": "save"}, "position": "top_left"},
+            {
+                "target": found["target"],
+                "locator": {"identifier": "save"},
+                "coordinates": {"x": 1, "y": 2},
+            },
+        )
+        for args in invalid_args:
+            with self.subTest(args=args), self.assertRaises(ax.DriverError) as raised:
+                self.driver.execute("pointer_click", args, deadline=deadline())
+            self.assertEqual(raised.exception.code, "DRIVER.INVALID_REQUEST")
+
+    def test_pointer_click_requires_positive_bounds(self) -> None:
+        tree = default_tree()
+        tree[2] = node(
+            "save",
+            1,
+            "AXButton",
+            "Save",
+            identifier="save",
+            actions=("focus", "invoke", "pointer_click"),
+            bounds={"x": 10, "y": 20, "width": 0, "height": 30},
+        )
+        backend = FakeBackend([tree])
+        driver = ax.MacOSAXDriver(backend)
+        snapshot = driver.execute(
+            "snapshot", {"app": {"process_id": 7}}, deadline=deadline()
+        )
+        found = driver.execute(
+            "find",
+            {
+                "snapshot_id": snapshot["snapshot_id"],
+                "revision": snapshot["revision"],
+                "locator": {"identifier": "save"},
+            },
+            deadline=deadline(),
+        )
+        with self.assertRaises(ax.DriverError) as raised:
+            driver.execute(
+                "pointer_click",
+                {"target": found["target"], "locator": {"identifier": "save"}},
+                deadline=deadline(),
+            )
+        self.assertEqual(raised.exception.code, "DRIVER.ACTION_UNSUPPORTED")
+        self.assertFalse(any(call[0] == "pointer_click" for call in backend.calls))
+
     def test_truncated_and_protected_nodes_fail_closed(self) -> None:
         self.backend.truncated = True
         snapshot = self.snapshot()
@@ -484,7 +593,7 @@ class MacOSAXCoreTests(unittest.TestCase):
                 "Password",
                 identifier="password",
                 value="secret",
-                actions=("focus", "set_value", "type_text"),
+                actions=("focus", "pointer_click", "set_value", "type_text"),
                 protected=True,
             )
         )
@@ -498,6 +607,7 @@ class MacOSAXCoreTests(unittest.TestCase):
         self.assertTrue(protected_node["provenance"]["value_redacted"])
         self.assertNotIn("set_value", protected_node["actions"])
         self.assertNotIn("type_text", protected_node["actions"])
+        self.assertNotIn("pointer_click", protected_node["actions"])
         found = driver.execute(
             "find",
             {
@@ -545,6 +655,33 @@ class MacOSAXCoreTests(unittest.TestCase):
         self.assertEqual(typed.exception.code, "DRIVER.PROTECTED_ELEMENT")
         self.assertEqual(typed.exception.data["effect"], "not_applied")
         self.assertFalse(any(call[0] == "type_text" for call in backend.calls))
+
+        fresh_snapshot = driver.execute(
+            "snapshot", {"app": {"process_id": 7}}, deadline=deadline()
+        )
+        found = driver.execute(
+            "find",
+            {
+                "snapshot_id": fresh_snapshot["snapshot_id"],
+                "revision": fresh_snapshot["revision"],
+                "locator": {"identifier": "password"},
+            },
+            deadline=deadline(),
+        )
+        with self.assertRaises(ax.DriverError) as clicked:
+            driver.execute(
+                "pointer_click",
+                {
+                    "target": found["target"],
+                    "locator": {"identifier": "password"},
+                },
+                deadline=deadline(),
+            )
+        self.assertEqual(clicked.exception.code, "DRIVER.PROTECTED_ELEMENT")
+        self.assertEqual(clicked.exception.data["effect"], "not_applied")
+        self.assertFalse(
+            any(call[0] == "pointer_click" for call in backend.calls)
+        )
 
     def test_type_text_rejects_empty_control_and_oversized_input_before_capture(self) -> None:
         snapshot = self.snapshot()
@@ -631,6 +768,75 @@ class MacOSAXCoreTests(unittest.TestCase):
                 self.assertEqual(raised.exception.data["effect"], "unknown")
                 self.assertEqual(backend.terminated, 1)
                 self.assertIsNone(driver._current)
+
+    def test_pointer_click_dispatch_failure_is_unknown_and_terminates_backend(self) -> None:
+        for code in (
+            "DRIVER.ACTION_FAILED",
+            "DRIVER.TIMEOUT",
+            "DRIVER.ACTION_UNSUPPORTED",
+        ):
+            with self.subTest(code=code):
+                backend = PointerClickFaultBackend(
+                    code, pointer_dispatch_started=True
+                )
+                driver = ax.MacOSAXDriver(backend)
+                snapshot = driver.execute(
+                    "snapshot", {"app": {"process_id": 7}}, deadline=deadline()
+                )
+                found = driver.execute(
+                    "find",
+                    {
+                        "snapshot_id": snapshot["snapshot_id"],
+                        "revision": snapshot["revision"],
+                        "locator": {"identifier": "save"},
+                    },
+                    deadline=deadline(),
+                )
+                with self.assertRaises(ax.DriverError) as raised:
+                    driver.execute(
+                        "pointer_click",
+                        {
+                            "target": found["target"],
+                            "locator": {"identifier": "save"},
+                        },
+                        deadline=deadline(),
+                    )
+                self.assertEqual(raised.exception.code, "DRIVER.UNKNOWN_EFFECT")
+                self.assertEqual(raised.exception.data["effect"], "unknown")
+                self.assertTrue(raised.exception.data["pointer_dispatch_started"])
+                self.assertEqual(backend.terminated, 1)
+                self.assertIsNone(driver._current)
+
+    def test_pointer_click_pre_dispatch_failure_is_not_applied(self) -> None:
+        backend = PointerClickFaultBackend(
+            "DRIVER.UNAVAILABLE", pointer_dispatch_started=False
+        )
+        driver = ax.MacOSAXDriver(backend)
+        snapshot = driver.execute(
+            "snapshot", {"app": {"process_id": 7}}, deadline=deadline()
+        )
+        found = driver.execute(
+            "find",
+            {
+                "snapshot_id": snapshot["snapshot_id"],
+                "revision": snapshot["revision"],
+                "locator": {"identifier": "save"},
+            },
+            deadline=deadline(),
+        )
+        with self.assertRaises(ax.DriverError) as raised:
+            driver.execute(
+                "pointer_click",
+                {
+                    "target": found["target"],
+                    "locator": {"identifier": "save"},
+                },
+                deadline=deadline(),
+            )
+        self.assertEqual(raised.exception.code, "DRIVER.UNAVAILABLE")
+        self.assertEqual(raised.exception.data["effect"], "not_applied")
+        self.assertFalse(raised.exception.data["pointer_dispatch_started"])
+        self.assertEqual(backend.terminated, 0)
 
     def test_type_text_pre_dispatch_helper_failure_is_not_applied(self) -> None:
         backend = TypeTextFaultBackend(
@@ -837,23 +1043,38 @@ class MacOSAXProcessTests(unittest.TestCase):
                 "find",
                 "focus",
                 "invoke",
+                "pointer_click",
                 "set_value",
                 "type_text",
             },
         )
         for name in ("list_apps", "snapshot", "find"):
             self.assertEqual(manifest["actions"][name]["permissions"], ["desktop.observe"])
-        for name in ("focus", "invoke", "set_value", "type_text"):
+        for name in ("focus", "invoke", "pointer_click", "set_value", "type_text"):
             self.assertEqual(
                 manifest["actions"][name]["permissions"],
                 ["desktop.observe", "desktop.input"],
             )
         self.assertEqual(manifest["actions"]["invoke"]["effect"]["default_class"], "non_idempotent")
+        self.assertEqual(
+            manifest["actions"]["pointer_click"]["effect"]["default_class"],
+            "non_idempotent",
+        )
         type_text = manifest["actions"]["type_text"]
         self.assertEqual(type_text["effect"]["default_class"], "contextual")
         self.assertEqual(type_text["risk"], {"category": "input", "level": "high"})
         self.assertEqual(
             type_text["input_schema"]["required"], ["target", "locator", "text"]
+        )
+        pointer_click = manifest["actions"]["pointer_click"]
+        self.assertEqual(
+            pointer_click["input_schema"]["required"], ["target", "locator"]
+        )
+        self.assertEqual(
+            pointer_click["input_schema"]["properties"]["button"]["enum"], ["left"]
+        )
+        self.assertEqual(
+            pointer_click["input_schema"]["properties"]["position"]["enum"], ["center"]
         )
         unknown_effect = next(
             error for error in type_text["errors"] if error["code"] == "DRIVER.UNKNOWN_EFFECT"
@@ -1022,6 +1243,29 @@ class MacOSAXProcessTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, "DRIVER.UNKNOWN_EFFECT")
         self.assertTrue(raised.exception.data["keyboard_dispatch_started"])
         self.assertEqual(raised.exception.data["effect"], "unknown")
+        self.assertTrue(backend._closed)
+        self.assertEqual(process.killed, 1)
+
+    def test_type_text_progress_rejects_pointer_field(self) -> None:
+        backend, process = helper_backend()
+        bad_progress = json.dumps(
+            {
+                "id": "h1",
+                "progress": {
+                    "phase": "keyboard_dispatch",
+                    "keyboard_dispatch_started": True,
+                    "focus_changed": True,
+                    "pointer_dispatch_started": False,
+                },
+            }
+        ).encode()
+        with mock.patch.object(
+            ax.os, "write", side_effect=lambda _fd, data: len(data)
+        ), mock.patch.object(backend, "_readline", return_value=bad_progress):
+            with self.assertRaises(ax.DriverError) as raised:
+                backend.type_text("n", "hello", deadline=deadline())
+        self.assertEqual(raised.exception.code, "DRIVER.ACTION_FAILED")
+        self.assertEqual(raised.exception.data["reason"], "helper_protocol_error")
         self.assertTrue(backend._closed)
         self.assertEqual(process.killed, 1)
 
@@ -1247,6 +1491,192 @@ class MacOSAXProcessTests(unittest.TestCase):
         self.assertTrue(backend._closed)
         self.assertEqual(process.killed, 1)
 
+    def test_pointer_click_progress_then_timeout_is_unknown_and_kills_helper(self) -> None:
+        backend, process = helper_backend()
+        progress = json.dumps(
+            {
+                "id": "h1",
+                "progress": {
+                    "phase": "pointer_dispatch",
+                    "pointer_dispatch_started": True,
+                },
+            }
+        ).encode()
+        with mock.patch.object(
+            ax.os, "write", side_effect=lambda _fd, data: len(data)
+        ), mock.patch.object(
+            backend, "_readline",
+            side_effect=[
+                progress,
+                ax.DriverError(
+                    "DRIVER.TIMEOUT",
+                    "synthetic timeout",
+                    retryable=True,
+                    data={
+                        "helper_channel_failure": True,
+                        "helper_request_dispatched": True,
+                        "pointer_dispatch_started": True,
+                        "effect": "unknown",
+                    },
+                ),
+            ],
+        ):
+            with self.assertRaises(ax.DriverError) as raised:
+                backend.pointer_click("n", button="left", position="center", deadline=deadline())
+        self.assertEqual(raised.exception.code, "DRIVER.UNKNOWN_EFFECT")
+        self.assertTrue(raised.exception.data["pointer_dispatch_started"])
+        self.assertEqual(raised.exception.data["effect"], "unknown")
+        self.assertTrue(backend._closed)
+        self.assertEqual(process.killed, 1)
+
+    def test_pointer_click_progress_rejects_keyboard_and_focus_fields(self) -> None:
+        backend, process = helper_backend()
+        bad_progress = json.dumps(
+            {
+                "id": "h1",
+                "progress": {
+                    "phase": "pointer_dispatch",
+                    "pointer_dispatch_started": True,
+                    "keyboard_dispatch_started": False,
+                    "focus_changed": False,
+                },
+            }
+        ).encode()
+        with mock.patch.object(
+            ax.os, "write", side_effect=lambda _fd, data: len(data)
+        ), mock.patch.object(backend, "_readline", return_value=bad_progress):
+            with self.assertRaises(ax.DriverError) as raised:
+                backend.pointer_click("n", button="left", position="center", deadline=deadline())
+        self.assertEqual(raised.exception.code, "DRIVER.ACTION_FAILED")
+        self.assertEqual(raised.exception.data["reason"], "helper_protocol_error")
+        self.assertTrue(backend._closed)
+        self.assertEqual(process.killed, 1)
+
+    def test_pointer_click_timeout_before_progress_is_not_applied(self) -> None:
+        backend, _process = helper_backend()
+        with mock.patch.object(
+            ax.os, "write", side_effect=lambda _fd, data: len(data)
+        ), mock.patch.object(
+            backend, "_readline",
+            side_effect=ax.DriverError(
+                "DRIVER.TIMEOUT",
+                "synthetic timeout",
+                retryable=True,
+                data={
+                    "helper_channel_failure": True,
+                    "helper_request_dispatched": True,
+                    "pointer_dispatch_started": False,
+                    "effect": "not_applied",
+                },
+            ),
+        ):
+            with self.assertRaises(ax.DriverError) as raised:
+                backend.pointer_click("n", button="left", position="center", deadline=deadline())
+        self.assertEqual(raised.exception.code, "DRIVER.TIMEOUT")
+        self.assertFalse(raised.exception.data["pointer_dispatch_started"])
+        self.assertEqual(raised.exception.data["effect"], "not_applied")
+
+    def test_pointer_click_rpc_parses_preflight_error_as_not_applied(self) -> None:
+        backend, process = helper_backend()
+        response = json.dumps(
+            {
+                "id": "h1",
+                "error": {
+                    "code": "DRIVER.ACTION_UNSUPPORTED",
+                    "message": "pointer target has no usable bounds",
+                    "retryable": False,
+                    "data": {
+                        "phase": "bounds_preflight",
+                        "pointer_dispatch_started": False,
+                    },
+                },
+            }
+        ).encode()
+        with mock.patch.object(
+            ax.os, "write", side_effect=lambda _fd, data: len(data)
+        ), mock.patch.object(backend, "_readline", return_value=response):
+            with self.assertRaises(ax.DriverError) as raised:
+                backend.pointer_click("n", button="left", position="center", deadline=deadline())
+        self.assertEqual(raised.exception.code, "DRIVER.ACTION_UNSUPPORTED")
+        self.assertEqual(raised.exception.data["effect"], "not_applied")
+        self.assertFalse(raised.exception.data["pointer_dispatch_started"])
+        self.assertFalse(backend._closed)
+        self.assertEqual(process.killed, 0)
+
+    def test_pointer_click_rpc_parses_hit_test_mismatch_as_not_applied(self) -> None:
+        backend, process = helper_backend()
+        response = json.dumps(
+            {
+                "id": "h1",
+                "error": {
+                    "code": "DRIVER.ACTION_FAILED",
+                    "message": "pointer hit test no longer resolves to the target element",
+                    "retryable": False,
+                    "data": {
+                        "phase": "hit_test_verification",
+                        "pointer_dispatch_started": False,
+                    },
+                },
+            }
+        ).encode()
+        with mock.patch.object(
+            ax.os, "write", side_effect=lambda _fd, data: len(data)
+        ), mock.patch.object(backend, "_readline", return_value=response):
+            with self.assertRaises(ax.DriverError) as raised:
+                backend.pointer_click("n", button="left", position="center", deadline=deadline())
+        self.assertEqual(raised.exception.code, "DRIVER.ACTION_FAILED")
+        self.assertEqual(raised.exception.data["effect"], "not_applied")
+        self.assertFalse(raised.exception.data["pointer_dispatch_started"])
+        self.assertFalse(backend._closed)
+        self.assertEqual(process.killed, 0)
+
+    def test_pointer_click_success_requires_submitted_dispatch_metadata(self) -> None:
+        backend, _process = helper_backend()
+        valid = {
+            "submitted": True,
+            "native_operation": "CGEventLeftClick",
+            "pointer_dispatch_started": True,
+            "phase": "submitted",
+        }
+        with mock.patch.object(backend, "_rpc", return_value=valid):
+            self.assertEqual(
+                backend.pointer_click("n", button="left", position="center", deadline=deadline()),
+                valid,
+            )
+        backend, process = helper_backend()
+        with mock.patch.object(
+            backend, "_rpc",
+            return_value={"accepted": True, "native_operation": "CGEventLeftClick"},
+        ):
+            with self.assertRaises(ax.DriverError) as raised:
+                backend.pointer_click("n", button="left", position="center", deadline=deadline())
+        self.assertEqual(raised.exception.code, "DRIVER.ACTION_FAILED")
+        self.assertEqual(process.killed, 1)
+
+    def test_pointer_click_result_cannot_claim_dispatch_without_progress(self) -> None:
+        backend, process = helper_backend()
+        result_without_progress = json.dumps(
+            {
+                "id": "h1",
+                "result": {
+                    "submitted": True,
+                    "native_operation": "CGEventLeftClick",
+                    "pointer_dispatch_started": True,
+                    "phase": "submitted",
+                },
+            }
+        ).encode()
+        with mock.patch.object(
+            ax.os, "write", side_effect=lambda _fd, data: len(data)
+        ), mock.patch.object(backend, "_readline", return_value=result_without_progress):
+            with self.assertRaises(ax.DriverError) as raised:
+                backend.pointer_click("n", button="left", position="center", deadline=deadline())
+        self.assertEqual(raised.exception.code, "DRIVER.UNKNOWN_EFFECT")
+        self.assertTrue(raised.exception.data["pointer_dispatch_started"])
+        self.assertEqual(raised.exception.data["effect"], "unknown")
+        self.assertTrue(backend._closed)
+        self.assertEqual(process.killed, 1)
+
     def test_helper_timeout_eof_and_output_limit_are_fatal(self) -> None:
         scenarios = (
             ("timeout", "DRIVER.TIMEOUT"),
@@ -1378,10 +1808,25 @@ class MacOSAXSourceContracts(unittest.TestCase):
             "AXUIElementSetAttributeValue",
             "AXUIElementPerformAction",
             "AXUIElementSetMessagingTimeout",
+            "AXUIElementCopyElementAtPosition",
             "CFEqual(previous, current)",
+            "CFEqual(hitElement, element)",
+            'case "pointer_click"',
             'case "type_text"',
+            "emitPointerProgress(id: requestID, pointerDispatchStarted: true)",
+            "emitKeyboardFocusProgress(id: requestID, focusChanged: true)",
+            "emitKeyboardDispatchProgress(",
+            '"pointer_dispatch_started": pointerDispatchStarted',
+            '"keyboard_dispatch_started": keyboardDispatchStarted',
             "CGEvent(keyboardEventSource: nil",
+            "CGEvent(mouseEventSource: nil, mouseType: .mouseMoved",
+            "CGEvent(mouseEventSource: nil, mouseType: .leftMouseDown",
+            "CGEvent(mouseEventSource: nil, mouseType: .leftMouseUp",
+            "pointer hit test no longer resolves to the target element",
             "keyboardSetUnicodeString",
+            "move.postToPid(targetPID)",
+            "down.postToPid(targetPID)",
+            "up.postToPid(targetPID)",
             "keyDown.postToPid(targetPID)",
             "keyUp.postToPid(targetPID)",
             "maximumUnicodeUnitsPerEvent = 20",
@@ -1392,8 +1837,10 @@ class MacOSAXSourceContracts(unittest.TestCase):
             "IsSecureEventInputEnabled()",
             '"keyboard_dispatch_started": progress.keyboardDispatchStarted',
             '"submitted": true',
-            "emitProgress(",
-            'phase: "focus_changed"',
+            "emitKeyboardFocusProgress(",
+            "emitKeyboardDispatchProgress(",
+            "emitPointerProgress(",
+            'emitKeyboardFocusProgress(id: requestID, focusChanged: true)',
         ):
             with self.subTest(marker=marker):
                 self.assertIn(marker, source)
@@ -1407,8 +1854,45 @@ class MacOSAXSourceContracts(unittest.TestCase):
         ):
             with self.subTest(forbidden=forbidden):
                 self.assertNotIn(forbidden, source)
+        self.assertIn(
+            '\"progress\": [\n            \"phase\": \"focus_changed\",\n            \"keyboard_dispatch_started\": false,\n            \"focus_changed\": focusChanged,',
+            source,
+        )
+        self.assertNotIn(
+            '\"progress\": [\n            \"phase\": \"focus_changed\",\n            \"keyboard_dispatch_started\": false,\n            \"pointer_dispatch_started\":',
+            source,
+        )
+        self.assertIn(
+            '\"progress\": [\n            \"phase\": \"pointer_dispatch\",\n            \"pointer_dispatch_started\": pointerDispatchStarted,',
+            source,
+        )
+        self.assertNotIn(
+            '\"progress\": [\n            \"phase\": \"pointer_dispatch\",\n            \"pointer_dispatch_started\": pointerDispatchStarted,\n            \"keyboard_dispatch_started\":',
+            source,
+        )
         self.assertLess(source.index("isSettable(element, kAXFocusedAttribute"), source.index("AXUIElementSetAttributeValue(\n            element, kAXFocusedAttribute"))
         self.assertLess(source.index("copyActionNames(element).contains(kAXPressAction"), source.index("AXUIElementPerformAction(element"))
+        pointer_click_source = source[source.index("private func pointerClick") :]
+        self.assertLess(
+            pointer_click_source.index("copyBounds(element)"),
+            pointer_click_source.index("move.postToPid(targetPID)"),
+        )
+        self.assertLess(
+            pointer_click_source.index("AXUIElementCopyElementAtPosition("),
+            pointer_click_source.index("move.postToPid(targetPID)"),
+        )
+        self.assertLess(
+            pointer_click_source.index("CFEqual(hitElement, element)"),
+            pointer_click_source.index("move.postToPid(targetPID)"),
+        )
+        self.assertLess(
+            pointer_click_source.index("requireFrontmost(targetPID, operation: \"pointer_click\")"),
+            pointer_click_source.index("move.postToPid(targetPID)"),
+        )
+        self.assertLess(
+            pointer_click_source.index("emitPointerProgress("),
+            pointer_click_source.index("move.postToPid(targetPID)"),
+        )
         type_text_source = source[source.index("private func typeText") :]
         self.assertLess(
             type_text_source.index("AXUIElementSetAttributeValue("),
@@ -1423,7 +1907,7 @@ class MacOSAXSourceContracts(unittest.TestCase):
             type_text_source.index("keyDown.postToPid(targetPID)"),
         )
         self.assertLess(
-            type_text_source.index("emitProgress("),
+            type_text_source.index("emitKeyboardDispatchProgress("),
             type_text_source.index("keyDown.postToPid(targetPID)"),
         )
         for marker in (

@@ -55,16 +55,19 @@ ACTION_IDS = {
         "find",
         "focus",
         "invoke",
+        "pointer_click",
         "set_value",
         "type_text",
     )
 }
 ACTION_NAMES = {full_name: short_name for short_name, full_name in ACTION_IDS.items()}
-WRITE_ACTIONS = frozenset({"focus", "invoke", "set_value", "type_text"})
+WRITE_ACTIONS = frozenset({"focus", "invoke", "pointer_click", "set_value", "type_text"})
 NODE_ACTIONS = WRITE_ACTIONS
 STATE_NAMES = ("enabled", "focused", "focusable", "editable", "protected")
 APP_SELECTOR_FIELDS = frozenset({"process_id", "bundle_id", "name"})
 TYPE_TEXT_ROLES = frozenset({"AXTextField", "AXTextArea", "AXComboBox"})
+POINTER_CLICK_BUTTONS = frozenset({"left"})
+POINTER_CLICK_POSITIONS = frozenset({"center"})
 
 
 LOCATOR_SCHEMA: dict[str, Any] = {
@@ -204,6 +207,17 @@ WRITE_OUTPUT_SCHEMA: dict[str, Any] = {
     },
     "additionalProperties": False,
 }
+POINTER_CLICK_INPUT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "required": ["target", "locator"],
+    "properties": {
+        "target": TARGET_SCHEMA,
+        "locator": LOCATOR_SCHEMA,
+        "button": {"enum": sorted(POINTER_CLICK_BUTTONS)},
+        "position": {"enum": sorted(POINTER_CLICK_POSITIONS)},
+    },
+    "additionalProperties": False,
+}
 
 ACTION_CONTRACTS: dict[str, dict[str, Any]] = {
     "list_apps": _contract(
@@ -285,6 +299,16 @@ ACTION_CONTRACTS: dict[str, dict[str, Any]] = {
         risk_category="modify",
         risk_level="high",
         input_schema=COMMON_WRITE_INPUT,
+        output_schema=WRITE_OUTPUT_SCHEMA,
+        errors=COMMON_ERRORS + LOCATOR_ERRORS + ACTION_ERRORS,
+        permissions=("desktop.observe", "desktop.input"),
+    ),
+    "pointer_click": _contract(
+        "重新验证目标后，仅按元素正面积 bounds 的中心点显式派发左键 pointer click。",
+        effect="non_idempotent",
+        risk_category="modify",
+        risk_level="high",
+        input_schema=POINTER_CLICK_INPUT_SCHEMA,
         output_schema=WRITE_OUTPUT_SCHEMA,
         errors=COMMON_ERRORS + LOCATOR_ERRORS + ACTION_ERRORS,
         permissions=("desktop.observe", "desktop.input"),
@@ -406,6 +430,10 @@ class AXBackend(Protocol):
 
     def invoke(self, native: Any, *, deadline: float) -> Any: ...
 
+    def pointer_click(
+        self, native: Any, *, button: str, position: str, deadline: float
+    ) -> Any: ...
+
     def set_value(self, native: Any, value: str, *, deadline: float) -> Any: ...
 
     def type_text(self, native: Any, text: str, *, deadline: float) -> Any: ...
@@ -517,6 +545,26 @@ def _keyboard_text(value: Any) -> str:
     return text
 
 
+def _enum_text(
+    value: Any,
+    name: str,
+    *,
+    allowed: frozenset[str],
+    default: str,
+) -> str:
+    if value is None:
+        return default
+    if not isinstance(value, str):
+        _fail("DRIVER.INVALID_REQUEST", f"{name} 必须是字符串")
+    if value not in allowed:
+        _fail(
+            "DRIVER.INVALID_REQUEST",
+            f"{name} 只支持 {', '.join(sorted(allowed))}",
+            allowed=sorted(allowed),
+        )
+    return value
+
+
 def _json_safe(value: Any, *, depth: int = 0) -> Any:
     if depth > 8:
         return None
@@ -547,6 +595,13 @@ def _normalize_bounds(value: Mapping[str, Any] | None) -> dict[str, int] | None:
     return {"x": x, "y": y, "width": width, "height": height}
 
 
+def _has_positive_area(bounds: Mapping[str, Any] | None) -> bool:
+    normalized = _normalize_bounds(bounds)
+    if normalized is None:
+        return False
+    return normalized["width"] > 0 and normalized["height"] > 0
+
+
 def _backend_name(backend: Any) -> str:
     return _safe_text(getattr(backend, "name", None)) or "unknown"
 
@@ -573,14 +628,10 @@ class MacOSAXDriver:
             try:
                 return self._write(action, values, deadline)
             except DriverError as exc:
-                if action != "type_text" or exc.code == "DRIVER.UNKNOWN_EFFECT":
+                if action not in {"type_text", "pointer_click"} or exc.code == "DRIVER.UNKNOWN_EFFECT":
                     raise
                 details = dict(exc.data) if isinstance(exc.data, Mapping) else {}
-                details["effect"] = (
-                    "contextual"
-                    if details.get("focus_changed") is True
-                    else "not_applied"
-                )
+                details["effect"] = self._pre_dispatch_effect(action, details)
                 raise DriverError(
                     exc.code, exc.message, retryable=exc.retryable, data=details
                 ) from exc
@@ -711,7 +762,9 @@ class MacOSAXDriver:
             )
             if protected:
                 actions = [
-                    action for action in actions if action not in {"set_value", "type_text"}
+                    action
+                    for action in actions
+                    if action not in {"pointer_click", "set_value", "type_text"}
                 ]
             provenance = _json_safe(dict(backend_node.provenance or {}))
             if not isinstance(provenance, dict):
@@ -928,20 +981,43 @@ class MacOSAXDriver:
             "node_id": node_id,
         }
 
+    @staticmethod
+    def _dispatch_state_field(action: str) -> str | None:
+        if action == "type_text":
+            return "keyboard_dispatch_started"
+        if action == "pointer_click":
+            return "pointer_dispatch_started"
+        return None
+
+    def _dispatch_started(self, action: str, details: Mapping[str, Any]) -> bool:
+        field = self._dispatch_state_field(action)
+        return bool(field and details.get(field) is True)
+
+    @staticmethod
+    def _pre_dispatch_effect(action: str, details: Mapping[str, Any]) -> str:
+        if action == "type_text" and details.get("focus_changed") is True:
+            return "contextual"
+        return "not_applied"
+
     def _write(self, action: str, args: dict[str, Any], deadline: float) -> dict[str, Any]:
-        payload_field = (
-            "value"
-            if action == "set_value"
-            else "text"
-            if action == "type_text"
-            else None
+        extra_fields: set[str] = set()
+        payload_field = None
+        if action == "set_value":
+            payload_field = "value"
+        elif action == "type_text":
+            payload_field = "text"
+        elif action == "pointer_click":
+            extra_fields = {"button", "position"}
+        allowed = {"target", "locator"} | extra_fields | (
+            {payload_field} if payload_field else set()
         )
-        allowed = {"target", "locator"} | ({payload_field} if payload_field else set())
         _only_keys(args, allowed, "args")
         if "target" not in args or "locator" not in args:
             _fail("DRIVER.INVALID_REQUEST", "target 和 locator 为必填字段")
         value: str | None = None
         text: str | None = None
+        button = "left"
+        position = "center"
         if action == "set_value":
             if "value" not in args:
                 _fail("DRIVER.INVALID_REQUEST", "set_value 必须提供 value")
@@ -950,6 +1026,19 @@ class MacOSAXDriver:
             if "text" not in args:
                 _fail("DRIVER.INVALID_REQUEST", "type_text 必须提供 text")
             text = _keyboard_text(args["text"])
+        elif action == "pointer_click":
+            button = _enum_text(
+                args.get("button"),
+                "button",
+                allowed=POINTER_CLICK_BUTTONS,
+                default="left",
+            )
+            position = _enum_text(
+                args.get("position"),
+                "position",
+                allowed=POINTER_CLICK_POSITIONS,
+                default="center",
+            )
         target = _object(args["target"], "target")
         _only_keys(target, {"snapshot_id", "revision", "node_id"}, "target")
         node_id = target.get("node_id")
@@ -966,7 +1055,7 @@ class MacOSAXDriver:
                 "target 与该快照中的定位结果不一致",
                 data={"node_id": node_id, "resolved_node_id": expected["node_id"]},
             )
-        if action in {"set_value", "type_text"} and expected["states"].get("protected") is True:
+        if action in {"pointer_click", "set_value", "type_text"} and expected["states"].get("protected") is True:
             raise DriverError(
                 "DRIVER.PROTECTED_ELEMENT", f"受保护元素不允许 {action}"
             )
@@ -1029,7 +1118,7 @@ class MacOSAXDriver:
                     "current_snapshot_id": fresh.public["snapshot_id"],
                 },
             )
-        if action in {"set_value", "type_text"} and resolved["states"].get("protected") is True:
+        if action in {"pointer_click", "set_value", "type_text"} and resolved["states"].get("protected") is True:
             raise DriverError(
                 "DRIVER.PROTECTED_ELEMENT", f"受保护元素不允许 {action}"
             )
@@ -1041,6 +1130,15 @@ class MacOSAXDriver:
                 "DRIVER.ACTION_UNSUPPORTED",
                 "type_text 只支持可确认非受保护的文本输入目标",
                 data={"action": action, "role": resolved.get("role")},
+            )
+        if action == "pointer_click" and not _has_positive_area(resolved.get("bounds")):
+            raise DriverError(
+                "DRIVER.ACTION_UNSUPPORTED",
+                "pointer_click 只支持具有正面积 bounds 的目标",
+                data={
+                    "action": action,
+                    "bounds": _normalize_bounds(resolved.get("bounds")),
+                },
             )
         if action not in resolved["actions"]:
             raise DriverError(
@@ -1062,6 +1160,10 @@ class MacOSAXDriver:
                 backend_result = self.backend.focus(native, deadline=deadline)
             elif action == "invoke":
                 backend_result = self.backend.invoke(native, deadline=deadline)
+            elif action == "pointer_click":
+                backend_result = self.backend.pointer_click(
+                    native, button=button, position=position, deadline=deadline
+                )
             elif action == "set_value":
                 assert value is not None
                 backend_result = self.backend.set_value(native, value, deadline=deadline)
@@ -1077,28 +1179,20 @@ class MacOSAXDriver:
             channel_failure = details.get("helper_channel_failure") is True
             channel_failed = channel_failure
             if exc.code == "DRIVER.UNKNOWN_EFFECT":
-                if (
-                    action == "type_text"
-                    and details.get("keyboard_dispatch_started") is True
-                ):
+                if self._dispatch_started(action, details):
                     self._terminate_backend_after_unknown_effect()
                 raise
-            if action == "type_text":
-                keyboard_started = details.get("keyboard_dispatch_started") is True
-                if keyboard_started:
+            if action in {"type_text", "pointer_click"}:
+                if self._dispatch_started(action, details):
                     self._terminate_backend_after_unknown_effect()
                     details.setdefault("action", action)
                     details["effect"] = "unknown"
                     raise DriverError(
                         "DRIVER.UNKNOWN_EFFECT",
-                        "显式键盘输入派发后的结果未知",
+                        f"显式 {action} 派发后的结果未知",
                         data=details,
                     ) from exc
-                details["effect"] = (
-                    "contextual"
-                    if details.get("focus_changed") is True
-                    else "not_applied"
-                )
+                details["effect"] = self._pre_dispatch_effect(action, details)
                 raise DriverError(
                     exc.code, exc.message, retryable=exc.retryable, data=details
                 ) from exc
@@ -1172,6 +1266,11 @@ class UnavailableBackend:
         self._raise()
 
     def invoke(self, native: Any, *, deadline: float) -> Any:
+        self._raise()
+
+    def pointer_click(
+        self, native: Any, *, button: str, position: str, deadline: float
+    ) -> Any:
         self._raise()
 
     def set_value(self, native: Any, value: str, *, deadline: float) -> Any:
@@ -1430,13 +1529,13 @@ class SwiftHelperBackend:
 
     def _readline(
         self, deadline: float, *, request_dispatched: bool = True,
-        keyboard_dispatch_started: bool = False, focus_changed: bool = False,
+        dispatch_started: bool = False, focus_changed: bool = False,
     ) -> bytes:
         process = self._process
         stdout = None if process is None else process.stdout
         channel_effect = (
             "unknown"
-            if keyboard_dispatch_started
+            if dispatch_started
             else "contextual"
             if focus_changed
             else "not_applied"
@@ -1448,7 +1547,7 @@ class SwiftHelperBackend:
                     request_dispatched=request_dispatched,
                     data={
                         "reason": "helper_stdout_missing",
-                        "keyboard_dispatch_started": keyboard_dispatch_started,
+                        "dispatch_started": dispatch_started,
                         "focus_changed": focus_changed,
                         "effect": channel_effect,
                     },
@@ -1463,7 +1562,7 @@ class SwiftHelperBackend:
                     request_dispatched=request_dispatched,
                     data={
                         "limit_bytes": MAX_HELPER_RESPONSE_BYTES,
-                        "keyboard_dispatch_started": keyboard_dispatch_started,
+                        "dispatch_started": dispatch_started,
                         "focus_changed": focus_changed,
                         "effect": channel_effect,
                     },
@@ -1482,7 +1581,7 @@ class SwiftHelperBackend:
                     retryable=True,
                     data={
                         "phase": "helper_response",
-                        "keyboard_dispatch_started": keyboard_dispatch_started,
+                        "dispatch_started": dispatch_started,
                         "focus_changed": focus_changed,
                         "effect": channel_effect,
                     },
@@ -1497,7 +1596,7 @@ class SwiftHelperBackend:
                     data={
                         "reason": "helper_read_failed",
                         "exception_type": type(exc).__name__,
-                        "keyboard_dispatch_started": keyboard_dispatch_started,
+                        "dispatch_started": dispatch_started,
                         "focus_changed": focus_changed,
                         "effect": channel_effect,
                     },
@@ -1514,7 +1613,7 @@ class SwiftHelperBackend:
                     data={
                         "reason": "helper_read_failed",
                         "exception_type": type(exc).__name__,
-                        "keyboard_dispatch_started": keyboard_dispatch_started,
+                        "dispatch_started": dispatch_started,
                         "focus_changed": focus_changed,
                         "effect": channel_effect,
                     },
@@ -1527,7 +1626,7 @@ class SwiftHelperBackend:
                     data={
                         "reason": "helper_eof",
                         "exit_code": process.poll(),
-                        "keyboard_dispatch_started": keyboard_dispatch_started,
+                        "dispatch_started": dispatch_started,
                         "focus_changed": focus_changed,
                         "effect": channel_effect,
                     },
@@ -1538,8 +1637,18 @@ class SwiftHelperBackend:
 
     def _rpc(
         self, operation: str, args: Mapping[str, Any], *, deadline: float,
-        require_keyboard_dispatch_state: bool = False,
+        require_dispatch_state: bool = False,
     ) -> Any:
+        dispatch_state_field: str | None = None
+        track_focus_change = False
+        progress_phases: set[str] = set()
+        if operation == "type_text":
+            dispatch_state_field = "keyboard_dispatch_started"
+            track_focus_change = True
+            progress_phases = {"focus_changed", "keyboard_dispatch"}
+        elif operation == "pointer_click":
+            dispatch_state_field = "pointer_dispatch_started"
+            progress_phases = {"pointer_dispatch"}
         try:
             _check_deadline(deadline)
         except DriverError as exc:
@@ -1613,25 +1722,27 @@ class SwiftHelperBackend:
                     "exception_type": type(exc).__name__,
                 },
             ) from exc
-        keyboard_dispatch_started = False
+        event_dispatch_started = False
         focus_changed = False
         while True:
             try:
                 line = self._readline(
                     deadline,
                     request_dispatched=True,
-                    keyboard_dispatch_started=keyboard_dispatch_started,
+                    dispatch_started=event_dispatch_started,
                     focus_changed=focus_changed,
                 )
             except DriverError as exc:
                 details = dict(exc.data) if isinstance(exc.data, Mapping) else {}
-                details["keyboard_dispatch_started"] = keyboard_dispatch_started
-                details["focus_changed"] = focus_changed
+                if dispatch_state_field is not None:
+                    details[dispatch_state_field] = event_dispatch_started
+                if track_focus_change:
+                    details["focus_changed"] = focus_changed
                 details["effect"] = (
                     "unknown"
-                    if keyboard_dispatch_started
+                    if event_dispatch_started
                     else "contextual"
-                    if focus_changed
+                    if track_focus_change and focus_changed
                     else "not_applied"
                 )
                 raise DriverError(
@@ -1647,8 +1758,16 @@ class SwiftHelperBackend:
                     data={
                         "reason": "helper_protocol_error",
                         "exception_type": type(exc).__name__,
-                        "keyboard_dispatch_started": keyboard_dispatch_started,
-                        "focus_changed": focus_changed,
+                        **(
+                            {dispatch_state_field: event_dispatch_started}
+                            if dispatch_state_field is not None
+                            else {}
+                        ),
+                        **(
+                            {"focus_changed": focus_changed}
+                            if track_focus_change
+                            else {}
+                        ),
                     },
                 ) from exc
             if (
@@ -1658,27 +1777,32 @@ class SwiftHelperBackend:
             ):
                 progress = response.get("progress")
                 if (
-                    operation != "type_text"
+                    dispatch_state_field is None
                     or not isinstance(progress, Mapping)
                     or not set(progress).issubset(
-                        {"phase", "keyboard_dispatch_started", "focus_changed"}
+                        {"phase", dispatch_state_field}
+                        | ({"focus_changed"} if track_focus_change else set())
                     )
-                    or progress.get("phase")
-                    not in {"focus_changed", "keyboard_dispatch"}
-                    or not isinstance(
-                        progress.get("keyboard_dispatch_started"), bool
+                    or progress.get("phase") not in progress_phases
+                    or not isinstance(progress.get(dispatch_state_field), bool)
+                    or (
+                        track_focus_change
+                        and not isinstance(progress.get("focus_changed"), bool)
                     )
-                    or not isinstance(progress.get("focus_changed"), bool)
                     or (
                         progress.get("phase") == "focus_changed"
                         and (
-                            progress.get("keyboard_dispatch_started") is not False
+                            progress.get(dispatch_state_field) is not False
                             or progress.get("focus_changed") is not True
                         )
                     )
                     or (
                         progress.get("phase") == "keyboard_dispatch"
-                        and progress.get("keyboard_dispatch_started") is not True
+                        and progress.get(dispatch_state_field) is not True
+                    )
+                    or (
+                        progress.get("phase") == "pointer_dispatch"
+                        and progress.get(dispatch_state_field) is not True
                     )
                 ):
                     raise self._channel_error(
@@ -1687,12 +1811,21 @@ class SwiftHelperBackend:
                         request_dispatched=True,
                         data={
                             "reason": "helper_protocol_error",
-                            "keyboard_dispatch_started": keyboard_dispatch_started,
-                            "focus_changed": focus_changed,
+                            **(
+                                {dispatch_state_field: event_dispatch_started}
+                                if dispatch_state_field is not None
+                                else {}
+                            ),
+                            **(
+                                {"focus_changed": focus_changed}
+                                if track_focus_change
+                                else {}
+                            ),
                         },
                     )
-                keyboard_dispatch_started = progress["keyboard_dispatch_started"]
-                focus_changed = progress["focus_changed"]
+                event_dispatch_started = progress[dispatch_state_field]
+                if track_focus_change:
+                    focus_changed = progress["focus_changed"]
                 continue
             break
         if (
@@ -1706,8 +1839,12 @@ class SwiftHelperBackend:
                 request_dispatched=True,
                 data={
                     "reason": "helper_protocol_error",
-                    "keyboard_dispatch_started": keyboard_dispatch_started,
-                    "focus_changed": focus_changed,
+                    **(
+                        {dispatch_state_field: event_dispatch_started}
+                        if dispatch_state_field is not None
+                        else {}
+                    ),
+                    **({"focus_changed": focus_changed} if track_focus_change else {}),
                 },
             )
         has_error = "error" in response
@@ -1719,8 +1856,12 @@ class SwiftHelperBackend:
                 request_dispatched=True,
                 data={
                     "reason": "helper_protocol_error",
-                    "keyboard_dispatch_started": keyboard_dispatch_started,
-                    "focus_changed": focus_changed,
+                    **(
+                        {dispatch_state_field: event_dispatch_started}
+                        if dispatch_state_field is not None
+                        else {}
+                    ),
+                    **({"focus_changed": focus_changed} if track_focus_change else {}),
                 },
             )
         error = response.get("error")
@@ -1732,8 +1873,16 @@ class SwiftHelperBackend:
                     request_dispatched=True,
                     data={
                         "reason": "helper_protocol_error",
-                        "keyboard_dispatch_started": keyboard_dispatch_started,
-                        "focus_changed": focus_changed,
+                        **(
+                            {dispatch_state_field: event_dispatch_started}
+                            if dispatch_state_field is not None
+                            else {}
+                        ),
+                        **(
+                            {"focus_changed": focus_changed}
+                            if track_focus_change
+                            else {}
+                        ),
                     },
                 )
             code = error.get("code")
@@ -1757,8 +1906,16 @@ class SwiftHelperBackend:
                     request_dispatched=True,
                     data={
                         "reason": "helper_protocol_error",
-                        "keyboard_dispatch_started": keyboard_dispatch_started,
-                        "focus_changed": focus_changed,
+                        **(
+                            {dispatch_state_field: event_dispatch_started}
+                            if dispatch_state_field is not None
+                            else {}
+                        ),
+                        **(
+                            {"focus_changed": focus_changed}
+                            if track_focus_change
+                            else {}
+                        ),
                     },
                 )
             details = _json_safe(raw_data)
@@ -1769,9 +1926,13 @@ class SwiftHelperBackend:
             details.pop("helper_channel_failure", None)
             details.pop("helper_request_dispatched", None)
             details.pop("effect", None)
-            declared_keyboard_dispatch = details.get("keyboard_dispatch_started")
-            if declared_keyboard_dispatch is not None and not isinstance(
-                declared_keyboard_dispatch, bool
+            declared_dispatch_started = (
+                details.get(dispatch_state_field)
+                if dispatch_state_field is not None
+                else None
+            )
+            if declared_dispatch_started is not None and not isinstance(
+                declared_dispatch_started, bool
             ):
                 raise self._channel_error(
                     "DRIVER.ACTION_FAILED",
@@ -1779,37 +1940,55 @@ class SwiftHelperBackend:
                     request_dispatched=True,
                     data={
                         "reason": "helper_protocol_error",
-                        "keyboard_dispatch_started": keyboard_dispatch_started,
-                        "focus_changed": focus_changed,
+                        **(
+                            {dispatch_state_field: event_dispatch_started}
+                            if dispatch_state_field is not None
+                            else {}
+                        ),
+                        **(
+                            {"focus_changed": focus_changed}
+                            if track_focus_change
+                            else {}
+                        ),
                     },
                 )
-            if declared_keyboard_dispatch is not None:
-                keyboard_dispatch_started = declared_keyboard_dispatch
+            if declared_dispatch_started is not None:
+                event_dispatch_started = declared_dispatch_started
             declared_focus_changed = details.get("focus_changed")
-            if declared_focus_changed is not None and not isinstance(declared_focus_changed, bool):
+            if (
+                track_focus_change
+                and declared_focus_changed is not None
+                and not isinstance(declared_focus_changed, bool)
+            ):
                 raise self._channel_error(
                     "DRIVER.ACTION_FAILED",
                     "AX helper 返回了无效焦点状态",
                     request_dispatched=True,
                     data={
                         "reason": "helper_protocol_error",
-                        "keyboard_dispatch_started": keyboard_dispatch_started,
+                        **(
+                            {dispatch_state_field: event_dispatch_started}
+                            if dispatch_state_field is not None
+                            else {}
+                        ),
                         "focus_changed": focus_changed,
                     },
                 )
-            if declared_focus_changed is not None:
+            if track_focus_change and declared_focus_changed is not None:
                 focus_changed = declared_focus_changed
-            details["keyboard_dispatch_started"] = keyboard_dispatch_started
-            details["focus_changed"] = focus_changed
+            if dispatch_state_field is not None:
+                details[dispatch_state_field] = event_dispatch_started
+            if track_focus_change:
+                details["focus_changed"] = focus_changed
             details["effect"] = (
                 "unknown"
-                if keyboard_dispatch_started
+                if event_dispatch_started
                 else "contextual"
-                if focus_changed
+                if track_focus_change and focus_changed
                 else "not_applied"
             )
             details["helper_request_dispatched"] = True
-            if require_keyboard_dispatch_state and declared_keyboard_dispatch is None:
+            if require_dispatch_state and declared_dispatch_started is None:
                 # Protocol v2 emits progress before native dispatch.  With no
                 # observed marker, a missing final-state field is a fatal
                 # protocol error but is not evidence that text was submitted.
@@ -1819,8 +1998,16 @@ class SwiftHelperBackend:
                     request_dispatched=True,
                     data={
                         "reason": "helper_protocol_error",
-                        "keyboard_dispatch_started": keyboard_dispatch_started,
-                        "focus_changed": focus_changed,
+                        **(
+                            {dispatch_state_field: event_dispatch_started}
+                            if dispatch_state_field is not None
+                            else {}
+                        ),
+                        **(
+                            {"focus_changed": focus_changed}
+                            if track_focus_change
+                            else {}
+                        ),
                     },
                 )
             if code.startswith("PROTOCOL."):
@@ -1847,25 +2034,31 @@ class SwiftHelperBackend:
                 data=details,
             )
         result = response["result"]
-        if require_keyboard_dispatch_state:
-            result_keyboard_started = (
-                result.get("keyboard_dispatch_started")
-                if isinstance(result, Mapping)
+        if require_dispatch_state:
+            result_dispatch_started = (
+                result.get(dispatch_state_field)
+                if isinstance(result, Mapping) and dispatch_state_field is not None
                 else None
             )
             result_focus_changed = (
                 result.get("focus_changed")
-                if isinstance(result, Mapping)
+                if isinstance(result, Mapping) and track_focus_change
                 else None
             )
             if (
-                not isinstance(result_keyboard_started, bool)
-                or not isinstance(result_focus_changed, bool)
-                or result_keyboard_started is not keyboard_dispatch_started
-                or result_focus_changed is not focus_changed
+                not isinstance(result_dispatch_started, bool)
+                or (
+                    track_focus_change
+                    and not isinstance(result_focus_changed, bool)
+                )
+                or result_dispatch_started is not event_dispatch_started
+                or (
+                    track_focus_change
+                    and result_focus_changed is not focus_changed
+                )
             ):
                 effective_keyboard_started = (
-                    keyboard_dispatch_started or result_keyboard_started is True
+                    event_dispatch_started or result_dispatch_started is True
                 )
                 effective_focus_changed = (
                     focus_changed or result_focus_changed is True
@@ -1876,13 +2069,21 @@ class SwiftHelperBackend:
                     request_dispatched=True,
                     data={
                         "reason": "helper_protocol_error",
-                        "keyboard_dispatch_started": effective_keyboard_started,
-                        "focus_changed": effective_focus_changed,
+                        **(
+                            {dispatch_state_field: effective_keyboard_started}
+                            if dispatch_state_field is not None
+                            else {}
+                        ),
+                        **(
+                            {"focus_changed": effective_focus_changed}
+                            if track_focus_change
+                            else {}
+                        ),
                         "effect": (
                             "unknown"
                             if effective_keyboard_started
                             else "contextual"
-                            if effective_focus_changed
+                            if track_focus_change and effective_focus_changed
                             else "not_applied"
                         ),
                     },
@@ -2041,6 +2242,15 @@ class SwiftHelperBackend:
     def invoke(self, native: Any, *, deadline: float) -> Any:
         return self._write_rpc("invoke", {"native_token": native}, deadline=deadline)
 
+    def pointer_click(
+        self, native: Any, *, button: str, position: str, deadline: float
+    ) -> Any:
+        return self._write_rpc(
+            "pointer_click",
+            {"native_token": native, "button": button, "position": position},
+            deadline=deadline,
+        )
+
     def set_value(self, native: Any, value: str, *, deadline: float) -> Any:
         return self._write_rpc(
             "set_value", {"native_token": native, "value": value}, deadline=deadline
@@ -2057,13 +2267,17 @@ class SwiftHelperBackend:
         try:
             result = self._rpc(
                 operation, args, deadline=deadline,
-                require_keyboard_dispatch_state=operation == "type_text",
+                require_dispatch_state=operation in {"type_text", "pointer_click"},
             )
-            expected_flag = "submitted" if operation == "type_text" else "accepted"
+            expected_flag = "submitted" if operation in {"type_text", "pointer_click"} else "accepted"
             allowed_result_fields = {expected_flag, "native_operation"}
             if operation == "type_text":
                 allowed_result_fields.update(
                     {"keyboard_dispatch_started", "focus_changed", "phase"}
+                )
+            elif operation == "pointer_click":
+                allowed_result_fields.update(
+                    {"pointer_dispatch_started", "phase"}
                 )
             if (
                 not isinstance(result, Mapping)
@@ -2078,6 +2292,13 @@ class SwiftHelperBackend:
                         or result.get("phase") != "submitted"
                     )
                 )
+                or (
+                    operation == "pointer_click"
+                    and (
+                        result.get("pointer_dispatch_started") is not True
+                        or result.get("phase") != "submitted"
+                    )
+                )
             ):
                 raise self._channel_error(
                     "DRIVER.ACTION_FAILED",
@@ -2088,25 +2309,34 @@ class SwiftHelperBackend:
         except DriverError as exc:
             details = dict(exc.data) if isinstance(exc.data, Mapping) else {}
             if (
-                operation == "type_text"
-                and details.get("keyboard_dispatch_started") is True
+                operation in {"type_text", "pointer_click"}
+                and (
+                    details.get("keyboard_dispatch_started") is True
+                    or details.get("pointer_dispatch_started") is True
+                )
             ):
                 # The helper emits this marker immediately before the first
-                # keyDown post.  Only that native boundary makes text effect
-                # unknown; a complete request frame alone is insufficient.
+                # synthetic event post.  Only that native boundary makes
+                # input effect unknown; a complete request frame alone is
+                # insufficient.
                 self._close_process(force=True)
                 details["effect"] = "unknown"
                 details["helper_terminated"] = True
                 details.setdefault("operation", operation)
                 raise DriverError(
                     "DRIVER.UNKNOWN_EFFECT",
-                    "AX helper 键盘输入请求派发后的结果未知",
+                    "AX helper 首个输入事件派发后的结果未知",
                     data=details,
                 ) from exc
             if operation == "type_text":
                 details["effect"] = (
                     "contextual" if details.get("focus_changed") is True else "not_applied"
                 )
+                raise DriverError(
+                    exc.code, exc.message, retryable=exc.retryable, data=details
+                ) from exc
+            if operation == "pointer_click":
+                details["effect"] = "not_applied"
                 raise DriverError(
                     exc.code, exc.message, retryable=exc.retryable, data=details
                 ) from exc

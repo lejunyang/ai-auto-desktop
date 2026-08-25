@@ -35,6 +35,7 @@ private struct HelperFailure: Error {
 
 private final class RequestProgress {
     private(set) var keyboardDispatchStarted = false
+    private(set) var pointerDispatchStarted = false
     private(set) var focusChanged = false
 
     func markFocusChanged() {
@@ -45,11 +46,22 @@ private final class RequestProgress {
         keyboardDispatchStarted = true
     }
 
-    func metadata(phase: String) -> [String: Any] {
+    func markPointerDispatchStarted() {
+        pointerDispatchStarted = true
+    }
+
+    func keyboardMetadata(phase: String) -> [String: Any] {
         [
             "phase": phase,
             "keyboard_dispatch_started": keyboardDispatchStarted,
             "focus_changed": focusChanged,
+        ]
+    }
+
+    func pointerMetadata(phase: String) -> [String: Any] {
+        [
+            "phase": phase,
+            "pointer_dispatch_started": pointerDispatchStarted,
         ]
     }
 }
@@ -176,6 +188,11 @@ private final class AXService {
             return try focus(args: Arguments(values: args), deadlineMS: deadlineMS)
         case "invoke":
             return try invoke(args: Arguments(values: args), deadlineMS: deadlineMS)
+        case "pointer_click":
+            return try pointerClick(
+                args: Arguments(values: args), deadlineMS: deadlineMS,
+                requestID: requestID, progress: progress
+            )
         case "set_value":
             return try setValue(args: Arguments(values: args), deadlineMS: deadlineMS)
         case "type_text":
@@ -364,8 +381,13 @@ private final class AXService {
         let valueSettable = isSettable(element, kAXValueAttribute as CFString)
         let actionNames = copyActionNames(element)
         let enabled = boolAttribute(element, kAXEnabledAttribute as CFString)
+        let normalizedBounds = copyBounds(element)
         var actions: [String] = []
         if focusSettable && enabled != false { actions.append("focus") }
+        if let bounds = normalizedBounds, bounds["width", default: 0] > 0, bounds["height", default: 0] > 0,
+           enabled != false && !protected {
+            actions.append("pointer_click")
+        }
         if actionNames.contains(kAXPressAction as String) && enabled != false { actions.append("invoke") }
         if valueSettable && !protected && enabled != false { actions.append("set_value") }
         if isKeyboardTextTarget(role: role) && focusSettable && !protected && enabled != false {
@@ -400,7 +422,7 @@ private final class AXService {
                 "editable": valueSettable && !protected,
                 "protected": protected,
             ],
-            bounds: copyBounds(element),
+            bounds: normalizedBounds,
             actions: actions.sorted(),
             provenance: provenance
         )
@@ -448,6 +470,15 @@ private final class AXService {
         try requireTrusted()
         let element = try tokens.resolve(try args.string("native_token")!)
         try configureTimeout(element, deadlineMS: deadlineMS)
+        let role = stringAttribute(element, kAXRoleAttribute as CFString)
+        let subrole = stringAttribute(element, kAXSubroleAttribute as CFString)
+        guard role != "AXSecureTextField", subrole != "AXSecureTextField" else {
+            throw HelperFailure(
+                "DRIVER.PROTECTED_ELEMENT",
+                "protected element does not permit pointer_click",
+                data: progress.pointerMetadata(phase: "target_preflight")
+            )
+        }
         guard isSettable(element, kAXFocusedAttribute as CFString) else {
             throw HelperFailure("DRIVER.ACTION_UNSUPPORTED", "AXFocused is not settable", data: ["attribute": "AXFocused"])
         }
@@ -471,6 +502,110 @@ private final class AXService {
         let error = AXUIElementPerformAction(element, kAXPressAction as CFString)
         try requireSuccess(error, operation: "AXUIElementPerformAction(AXPress)")
         return ["native_operation": "AXPress", "accepted": true]
+    }
+
+    private func pointerClick(
+        args: Arguments, deadlineMS: Double?, requestID: String,
+        progress: RequestProgress
+    ) throws -> [String: Any] {
+        try args.only(["native_token", "button", "position"])
+        try requireTrusted()
+        let button = try args.string("button")!
+        guard button == "left" else {
+            throw HelperFailure(
+                "DRIVER.INVALID_REQUEST",
+                "helper args.button must be left"
+            )
+        }
+        let position = try args.string("position")!
+        guard position == "center" else {
+            throw HelperFailure(
+                "DRIVER.INVALID_REQUEST",
+                "helper args.position must be center"
+            )
+        }
+        let element = try tokens.resolve(try args.string("native_token")!)
+        try configureTimeout(element, deadlineMS: deadlineMS)
+        guard boolAttribute(element, kAXEnabledAttribute as CFString) != false else {
+            throw HelperFailure(
+                "DRIVER.ACTION_UNSUPPORTED",
+                "pointer target is disabled",
+                data: progress.pointerMetadata(phase: "target_preflight")
+            )
+        }
+        guard let bounds = copyBounds(element) else {
+            throw HelperFailure(
+                "DRIVER.ACTION_UNSUPPORTED",
+                "pointer target has no usable bounds",
+                data: progress.pointerMetadata(phase: "bounds_preflight")
+            )
+        }
+        guard bounds["width", default: 0] > 0, bounds["height", default: 0] > 0 else {
+            throw HelperFailure(
+                "DRIVER.ACTION_UNSUPPORTED",
+                "pointer target bounds must have positive area",
+                data: progress.pointerMetadata(phase: "bounds_preflight")
+            )
+        }
+        var targetPID = pid_t(0)
+        let pidError = AXUIElementGetPid(element, &targetPID)
+        try requireSuccess(pidError, operation: "AXUIElementGetPid")
+        guard targetPID > 0 else {
+            throw HelperFailure(
+                "DRIVER.ACTION_FAILED",
+                "pointer target has no valid process id"
+            )
+        }
+        try requireFrontmost(targetPID, operation: "pointer_click")
+        try checkDeadline(deadlineMS)
+
+        let point = CGPoint(
+            x: CGFloat(bounds["x", default: 0]) + CGFloat(bounds["width", default: 0]) / 2.0,
+            y: CGFloat(bounds["y", default: 0]) + CGFloat(bounds["height", default: 0]) / 2.0
+        )
+        let application = AXUIElementCreateApplication(targetPID)
+        try configureTimeout(application, deadlineMS: deadlineMS)
+        var hitElement: AXUIElement?
+        let hitError = AXUIElementCopyElementAtPosition(
+            application, Float(point.x), Float(point.y), &hitElement
+        )
+        try requireSuccess(hitError, operation: "AXUIElementCopyElementAtPosition")
+        guard let hitElement, CFEqual(hitElement, element) else {
+            throw HelperFailure(
+                "DRIVER.ACTION_FAILED",
+                "pointer hit test no longer resolves to the target element",
+                data: progress.pointerMetadata(phase: "hit_test_verification")
+            )
+        }
+        guard let move = CGEvent(mouseEventSource: nil, mouseType: .mouseMoved, mouseCursorPosition: point, mouseButton: .left),
+              let down = CGEvent(mouseEventSource: nil, mouseType: .leftMouseDown, mouseCursorPosition: point, mouseButton: .left),
+              let up = CGEvent(mouseEventSource: nil, mouseType: .leftMouseUp, mouseCursorPosition: point, mouseButton: .left)
+        else {
+            throw HelperFailure(
+                "DRIVER.ACTION_FAILED",
+                "could not create pointer click events",
+                data: progress.pointerMetadata(phase: "event_construction")
+            )
+        }
+        move.setIntegerValueField(.mouseEventClickState, value: 1)
+        down.setIntegerValueField(.mouseEventClickState, value: 1)
+        up.setIntegerValueField(.mouseEventClickState, value: 1)
+        try requireFrontmost(targetPID, operation: "pointer_click")
+        try checkDeadline(deadlineMS)
+        if !progress.pointerDispatchStarted {
+            progress.markPointerDispatchStarted()
+            emitPointerProgress(id: requestID, pointerDispatchStarted: true)
+        }
+        move.postToPid(targetPID)
+        down.postToPid(targetPID)
+        up.postToPid(targetPID)
+        try checkDeadline(deadlineMS)
+        return [
+            "native_operation": "CGEventLeftClick",
+            "submitted": true,
+            "pointer_dispatch_started": progress.pointerDispatchStarted,
+            "phase": "submitted",
+        ]
     }
 
     private func setValue(args: Arguments, deadlineMS: Double?) throws -> [String: Any] {
@@ -536,14 +671,14 @@ private final class AXService {
         guard boolAttribute(element, kAXEnabledAttribute as CFString) != false else {
             throw HelperFailure(
                 "DRIVER.ACTION_UNSUPPORTED", "keyboard input target is disabled",
-                data: progress.metadata(phase: "target_preflight")
+                data: progress.keyboardMetadata(phase: "target_preflight")
             )
         }
         guard IsSecureEventInputEnabled() == 0 else {
             throw HelperFailure(
                 "DRIVER.PROTECTED_ELEMENT",
                 "macOS Secure Event Input is enabled",
-                data: progress.metadata(phase: "secure_event_input_preflight")
+                data: progress.keyboardMetadata(phase: "secure_event_input_preflight")
             )
         }
         guard isSettable(element, kAXFocusedAttribute as CFString) else {
@@ -565,16 +700,13 @@ private final class AXService {
         guard targetPID > 0 else {
             throw HelperFailure("DRIVER.ACTION_FAILED", "keyboard input target has no valid process id")
         }
-        try requireFrontmost(targetPID)
+        try requireFrontmost(targetPID, operation: "type_text")
 
         try checkDeadline(deadlineMS)
         // From this marker until AX focus returns, the target's focus may have
         // changed, but no keyboard event has been submitted.
         progress.markFocusChanged()
-        emitProgress(
-            id: requestID, phase: "focus_changed",
-            keyboardDispatchStarted: false, focusChanged: true
-        )
+        emitKeyboardFocusProgress(id: requestID, focusChanged: true)
         let focusError = AXUIElementSetAttributeValue(
             element, kAXFocusedAttribute as CFString, kCFBooleanTrue
         )
@@ -582,21 +714,21 @@ private final class AXService {
         guard boolAttribute(element, kAXFocusedAttribute as CFString) == true else {
             throw HelperFailure(
                 "DRIVER.ACTION_FAILED", "AX target did not become focused",
-                data: progress.metadata(phase: "focus_verification")
+                data: progress.keyboardMetadata(phase: "focus_verification")
             )
         }
-        try requireFrontmost(targetPID)
+        try requireFrontmost(targetPID, operation: "type_text")
         try checkDeadline(deadlineMS)
 
         let utf16 = Array(text.utf16)
         var offset = 0
         while offset < utf16.count {
-            try requireFrontmost(targetPID)
+            try requireFrontmost(targetPID, operation: "type_text")
             guard IsSecureEventInputEnabled() == 0 else {
                 throw HelperFailure(
                     "DRIVER.PROTECTED_ELEMENT",
                     "macOS Secure Event Input became enabled before keyboard dispatch",
-                    data: progress.metadata(phase: "secure_event_input_preflight")
+                    data: progress.keyboardMetadata(phase: "secure_event_input_preflight")
                 )
             }
             guard boolAttribute(element, kAXFocusedAttribute as CFString) == true else {
@@ -627,11 +759,11 @@ private final class AXService {
         ]
     }
 
-    private func requireFrontmost(_ targetPID: pid_t) throws {
+    private func requireFrontmost(_ targetPID: pid_t, operation: String) throws {
         guard NSWorkspace.shared.frontmostApplication?.processIdentifier == targetPID else {
             throw HelperFailure(
                 "DRIVER.ACTION_FAILED",
-                "keyboard input requires the selected application to remain frontmost",
+                "\(operation) requires the selected application to remain frontmost",
                 data: ["reason": "target_not_frontmost"]
             )
         }
@@ -668,14 +800,15 @@ private final class AXService {
             throw HelperFailure(
                 "DRIVER.PROTECTED_ELEMENT",
                 "macOS Secure Event Input became enabled before keyboard dispatch",
-                data: progress.metadata(phase: "secure_event_input_preflight")
+                data: progress.keyboardMetadata(phase: "secure_event_input_preflight")
             )
         }
         if !progress.keyboardDispatchStarted {
             progress.markKeyboardDispatchStarted()
-            emitProgress(
-                id: requestID, phase: "keyboard_dispatch",
-                keyboardDispatchStarted: true, focusChanged: progress.focusChanged
+            emitKeyboardDispatchProgress(
+                id: requestID,
+                keyboardDispatchStarted: true,
+                focusChanged: progress.focusChanged
             )
         }
         keyDown.postToPid(targetPID)
@@ -833,15 +966,36 @@ private func emitFailure(_ failure: HelperFailure, id: Any) {
     emit(["id": id, "error": error])
 }
 
-private func emitProgress(
-    id: String, phase: String, keyboardDispatchStarted: Bool, focusChanged: Bool
+private func emitKeyboardFocusProgress(id: String, focusChanged: Bool) {
+    emit([
+        "id": id,
+        "progress": [
+            "phase": "focus_changed",
+            "keyboard_dispatch_started": false,
+            "focus_changed": focusChanged,
+        ],
+    ])
+}
+
+private func emitKeyboardDispatchProgress(
+    id: String, keyboardDispatchStarted: Bool, focusChanged: Bool
 ) {
     emit([
         "id": id,
         "progress": [
-            "phase": phase,
+            "phase": "keyboard_dispatch",
             "keyboard_dispatch_started": keyboardDispatchStarted,
             "focus_changed": focusChanged,
+        ],
+    ])
+}
+
+private func emitPointerProgress(id: String, pointerDispatchStarted: Bool) {
+    emit([
+        "id": id,
+        "progress": [
+            "phase": "pointer_dispatch",
+            "pointer_dispatch_started": pointerDispatchStarted,
         ],
     ])
 }
@@ -926,26 +1080,32 @@ private func handleFrame(_ data: Data, service: AXService) {
             )
             emit(["id": identifier, "result": result])
         } catch let failure as HelperFailure {
-            guard operation == "type_text" else { throw failure }
+            guard operation == "type_text" || operation == "pointer_click" else { throw failure }
             var data = failure.data
-            for (key, value) in progress.metadata(phase: data["phase"] as? String ?? "pre_dispatch")
-                where data[key] == nil {
-                data[key] = value
-            }
+            let defaults = operation == "type_text"
+                ? progress.keyboardMetadata(phase: data["phase"] as? String ?? "pre_dispatch")
+                : progress.pointerMetadata(phase: data["phase"] as? String ?? "pre_dispatch")
+            for (key, value) in defaults where data[key] == nil { data[key] = value }
             throw HelperFailure(
                 failure.code, failure.message, retryable: failure.retryable, data: data
             )
         } catch {
-            guard operation == "type_text" else { throw error }
+            guard operation == "type_text" || operation == "pointer_click" else { throw error }
+            let phase = progress.keyboardDispatchStarted
+                ? "keyboard_dispatch"
+                : progress.pointerDispatchStarted
+                ? "pointer_dispatch"
+                : "pre_dispatch"
+            var data: [String: Any] = ["exception_type": String(describing: type(of: error))]
+            if operation == "type_text" {
+                data.merge(progress.keyboardMetadata(phase: phase)) { current, _ in current }
+            } else {
+                data.merge(progress.pointerMetadata(phase: phase)) { current, _ in current }
+            }
             throw HelperFailure(
                 "DRIVER.ACTION_FAILED",
                 "unexpected native helper failure",
-                data: [
-                    "exception_type": String(describing: type(of: error)),
-                    "phase": progress.keyboardDispatchStarted ? "keyboard_dispatch" : "pre_dispatch",
-                    "keyboard_dispatch_started": progress.keyboardDispatchStarted,
-                    "focus_changed": progress.focusChanged,
-                ]
+                data: data
             )
         }
     } catch let failure as HelperFailure {
