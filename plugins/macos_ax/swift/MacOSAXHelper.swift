@@ -470,15 +470,6 @@ private final class AXService {
         try requireTrusted()
         let element = try tokens.resolve(try args.string("native_token")!)
         try configureTimeout(element, deadlineMS: deadlineMS)
-        let role = stringAttribute(element, kAXRoleAttribute as CFString)
-        let subrole = stringAttribute(element, kAXSubroleAttribute as CFString)
-        guard role != "AXSecureTextField", subrole != "AXSecureTextField" else {
-            throw HelperFailure(
-                "DRIVER.PROTECTED_ELEMENT",
-                "protected element does not permit pointer_click",
-                data: progress.pointerMetadata(phase: "target_preflight")
-            )
-        }
         guard isSettable(element, kAXFocusedAttribute as CFString) else {
             throw HelperFailure("DRIVER.ACTION_UNSUPPORTED", "AXFocused is not settable", data: ["attribute": "AXFocused"])
         }
@@ -526,6 +517,15 @@ private final class AXService {
         }
         let element = try tokens.resolve(try args.string("native_token")!)
         try configureTimeout(element, deadlineMS: deadlineMS)
+        let role = stringAttribute(element, kAXRoleAttribute as CFString)
+        let subrole = stringAttribute(element, kAXSubroleAttribute as CFString)
+        guard role != "AXSecureTextField", subrole != "AXSecureTextField" else {
+            throw HelperFailure(
+                "DRIVER.PROTECTED_ELEMENT",
+                "protected element does not permit pointer_click",
+                data: progress.pointerMetadata(phase: "target_preflight")
+            )
+        }
         guard boolAttribute(element, kAXEnabledAttribute as CFString) != false else {
             throw HelperFailure(
                 "DRIVER.ACTION_UNSUPPORTED",
