@@ -923,6 +923,23 @@ class JournalStore:
             self._raise_lease_lost(run_id)
         return self.get_run(run_id)
 
+    def ensure_live_lease(
+        self,
+        run_id: str,
+        *,
+        owner_id: str,
+        token: str,
+        now: float | None = None,
+    ) -> RunRecord:
+        """Return the run only when the supplied owner lease is still live."""
+
+        now_value = _timestamp(now)
+        with self._transaction():
+            self._require_live_lease_locked(
+                run_id, owner_id=owner_id, token=token, now=now_value
+            )
+        return self.get_run(run_id)
+
     def _raise_lease_lost(self, run_id: str) -> None:
         run = self.get_run(run_id)
         if run.terminal:

@@ -15,6 +15,8 @@ from .journal import (
     JournalConflictError,
     JournalError,
     JournalStore,
+    LeaseConflictError,
+    LeaseLostError,
     OwnerLease,
     RunRecord,
     RunStatus,
@@ -83,9 +85,11 @@ class _LeaseHeartbeatKeeper:
             name="durable-lease-heartbeat",
             daemon=True,
         )
+        self._started = False
 
     def start(self) -> None:
         self._thread.start()
+        self._started = True
         startup_timeout = max(0.05, min(1.0, self._ttl * 0.5))
         if not self._ready.wait(startup_timeout):
             self._record_failure(TimeoutError("heartbeat keeper startup timed out"))
@@ -97,8 +101,9 @@ class _LeaseHeartbeatKeeper:
     def stop(self) -> BaseException | None:
         self._stop.set()
         join_timeout = min(1.5, 0.1 + 3 * self._busy_timeout_ms / 1_000)
-        self._thread.join(join_timeout)
-        if self._thread.is_alive():
+        if self._started:
+            self._thread.join(join_timeout)
+        if self._started and self._thread.is_alive():
             self._record_failure(TimeoutError("heartbeat keeper did not stop"))
         return self.failure
 
@@ -506,8 +511,12 @@ class DurableExecutor:
                     expected_desired_state=DesiredState.RUN,
                     sensitive=False,
                 )
+            except LeaseLostError:
+                runner.abort_prepared_segment()
+                raise
             except JournalConflictError:
                 runner.abort_prepared_segment()
+                self._raise_if_lease_lost_while_running(run.run_id, lease)
                 intent = self.service.get(run.run_id)
                 if intent.desired_state is DesiredState.PAUSE:
                     paused = self.service.runner_safe_point(
@@ -572,9 +581,14 @@ class DurableExecutor:
                 expected_status=RunStatus.RUNNING,
                 expected_desired_state=DesiredState.RUN, sensitive=False,
             )
+        except LeaseLostError:
+            runner.release_prepared_action_attempt()
+            runner.abort_prepared_segment()
+            raise
         except JournalConflictError:
             runner.release_prepared_action_attempt()
             runner.abort_prepared_segment()
+            self._raise_if_lease_lost_while_running(run.run_id, lease)
             return self._apply_control_before_dispatch(runner, run.run_id, lease)
         return self._authorize_and_run_action(
             runner, self.service.get(run.run_id), lease, prepared, checkpoint
@@ -630,7 +644,10 @@ class DurableExecutor:
                 expected_status=RunStatus.RUNNING,
                 expected_desired_state=DesiredState.RUN, sensitive=False,
             )
+        except LeaseLostError:
+            raise
         except JournalConflictError:
+            self._raise_if_lease_lost_while_running(run.run_id, lease)
             return self._apply_control_before_dispatch(runner, run.run_id, lease)
         if prepared.dispatch_deadline_epoch_ms <= int(time.time() * 1_000):
             segment = runner.run_durable_action_segment(
@@ -651,7 +668,10 @@ class DurableExecutor:
                     expected_status=RunStatus.RUNNING,
                     expected_desired_state=DesiredState.RUN, sensitive=False,
                 )
+            except LeaseLostError:
+                raise
             except JournalConflictError:
+                self._raise_if_lease_lost_while_running(run.run_id, lease)
                 # The read-only result is already projected and safe to persist.
                 # Save it before applying a concurrently requested pause/cancel
                 # so resume never replays an already completed observation.
@@ -676,10 +696,17 @@ class DurableExecutor:
         )
         try:
             keeper.start()
-        except Exception:
-            raise self._lease_heartbeat_error(
-                lease, stage="before_dispatch", provider_completed=False
-            ) from None
+        except BaseException as exc:
+            self._stop_keeper(keeper)
+            if isinstance(
+                exc, (KeyboardInterrupt, SystemExit, GeneratorExit)
+            ):
+                raise
+            if isinstance(exc, Exception):
+                raise self._lease_heartbeat_error(
+                    lease, stage="before_dispatch", provider_completed=False
+                ) from None
+            raise
 
         try:
             segment = runner.run_durable_action_segment(
@@ -688,10 +715,25 @@ class DurableExecutor:
         except BaseException:
             # A keeper shutdown problem must never replace an exception raised
             # by the provider/runtime path.
-            keeper.stop()
+            self._stop_keeper(keeper)
             raise
 
-        keeper_failure = keeper.stop()
+        try:
+            keeper_failure = keeper.stop()
+        except BaseException as exc:
+            # There is no earlier provider exception to preserve on this
+            # path.  Process-control exceptions must remain observable, but
+            # make one final best-effort stop first so an interrupted join
+            # cannot leave the renewal thread running indefinitely.
+            self._stop_keeper(keeper)
+            if isinstance(
+                exc, (KeyboardInterrupt, SystemExit, GeneratorExit)
+            ):
+                raise
+            if isinstance(exc, Exception):
+                keeper_failure = exc
+            else:
+                raise
         try:
             renewed = self._heartbeat(lease)
         except AutomationError:
@@ -951,7 +993,11 @@ class DurableExecutor:
                     sensitive=False,
                 )
                 return DurableExecutionResult(terminal, result)
+            except LeaseLostError:
+                raise
             except JournalConflictError:
+                if current.desired_state is DesiredState.RUN:
+                    self._raise_if_lease_lost_while_running(run_id, lease)
                 # Operator intent changed after the read.  Re-read and either
                 # commit against that exact intent or apply sticky cancel.
                 continue
@@ -1003,6 +1049,15 @@ class DurableExecutor:
             )
         except Exception as exc:
             raise self._map_error(exc, run_id=lease.run_id) from exc
+
+    @staticmethod
+    def _stop_keeper(
+        keeper: _LeaseHeartbeatKeeper,
+    ) -> BaseException | None:
+        try:
+            return keeper.stop()
+        except BaseException as exc:
+            return exc
 
     @staticmethod
     def _lease_heartbeat_error(
@@ -1462,6 +1517,24 @@ class DurableExecutor:
             return exc
         if isinstance(exc, RunServiceError):
             return exc
+        if isinstance(exc, LeaseConflictError):
+            return RunService._error(
+                "RUN.LEASE_CONFLICT",
+                f"run {run_id} has another live owner",
+                operation="durable_execute",
+                run_id=run_id,
+                retryable=True,
+                cause=exc,
+            )
+        if isinstance(exc, LeaseLostError):
+            return RunService._error(
+                "RUN.LEASE_LOST",
+                f"owner lease is no longer valid for run {run_id}",
+                operation="durable_execute",
+                run_id=run_id,
+                retryable=True,
+                cause=exc,
+            )
         if isinstance(exc, JournalError):
             return RunService._error(
                 "RUN.JOURNAL_FAILURE",
@@ -1478,6 +1551,16 @@ class DurableExecutor:
             phase="execute",
             details={"runId": run_id},
             cause=ensure_automation_error(exc),
+        )
+
+    def _raise_if_lease_lost_while_running(
+        self, run_id: str, lease: OwnerLease
+    ) -> None:
+        current = self.service.get(run_id)
+        if current.desired_state is not DesiredState.RUN:
+            return
+        self.journal.ensure_live_lease(
+            run_id, owner_id=lease.owner_id, token=lease.token
         )
 
 

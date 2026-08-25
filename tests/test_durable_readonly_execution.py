@@ -11,6 +11,7 @@ import unittest
 from unittest import mock
 import time
 
+from ai_auto_desktop import durable as durable_module
 from ai_auto_desktop.cli import build_parser
 from ai_auto_desktop.compiler import compile_descriptor
 from ai_auto_desktop.durable import DurableExecutor
@@ -463,6 +464,7 @@ class DurableReadOnlyExecutionTests(unittest.TestCase):
         self.assertEqual(
             rejected.exception.code, "DURABLE.LEASE_HEARTBEAT_FAILED"
         )
+        keeper.stop.assert_called_once_with()
         self.assertEqual(
             rejected.exception.details,
             {
@@ -497,7 +499,96 @@ class DurableReadOnlyExecutionTests(unittest.TestCase):
                             run_id="heartbeat-interrupt",
                             plugins={"fixture": plugin},
                         )
+                    keeper.stop.assert_called_once_with()
                     self.assertEqual(plugin.calls, [])
+
+    def test_heartbeat_start_wait_failure_stops_live_thread_and_allows_reclaim(self) -> None:
+        plugin = StubPlugin()
+        ttl = 0.25
+        created: list[object] = []
+        keeper_class = durable_module._LeaseHeartbeatKeeper
+
+        def keeper_factory(
+            journal: JournalStore, lease: object, keeper_ttl: float
+        ) -> object:
+            keeper = keeper_class(journal, lease, keeper_ttl)
+            original_wait = keeper._ready.wait
+
+            def raising_wait(timeout: float | None = None) -> bool:
+                original_wait(timeout)
+                raise RuntimeError("SECRET-WAIT-FAILURE")
+
+            keeper._ready.wait = raising_wait  # type: ignore[method-assign]
+            created.append(keeper)
+            return keeper
+
+        with mock.patch(
+            "ai_auto_desktop.durable._LeaseHeartbeatKeeper",
+            side_effect=keeper_factory,
+        ), self.assertRaises(AutomationError) as rejected:
+            DurableExecutor(
+                self.store,
+                owner_id="worker",
+                lease_ttl_seconds=ttl,
+                durable_action_mode="read-only",
+            ).start(
+                plan(),
+                inputs={"query": "public"},
+                run_id="heartbeat-wait-failed",
+                plugins={"fixture": plugin},
+            )
+
+        self.assertEqual(
+            rejected.exception.code, "DURABLE.LEASE_HEARTBEAT_FAILED"
+        )
+        self.assertEqual(plugin.calls, [])
+        self.assertEqual(len(created), 1)
+        keeper = created[0]
+        self.assertFalse(keeper._thread.is_alive())
+
+        current = self.store.get_run("heartbeat-wait-failed")
+        self.assertEqual(current.owner_id, "worker")
+        self.assertIsNotNone(current.lease_expires_at)
+        expires_at = current.lease_expires_at
+
+        time.sleep(ttl * 0.75)
+        stalled = self.store.get_run("heartbeat-wait-failed")
+        self.assertEqual(stalled.lease_expires_at, expires_at)
+
+        remaining = max(0.0, expires_at - time.time()) + 0.1
+        time.sleep(remaining)
+        replacement = self.store.claim_owner(
+            "heartbeat-wait-failed",
+            owner_id="replacement",
+            ttl_seconds=1.0,
+        )
+        self.assertEqual(replacement.owner_id, "replacement")
+
+    def test_heartbeat_stop_does_not_swallow_process_interrupts(self) -> None:
+        for signal in (KeyboardInterrupt(), SystemExit(7), GeneratorExit()):
+            with self.subTest(signal=type(signal).__name__), tempfile.TemporaryDirectory() as temporary:
+                path = Path(temporary) / "runs.sqlite3"
+                with JournalStore(path) as store:
+                    plugin = StubPlugin()
+                    keeper = mock.Mock()
+                    keeper.stop.side_effect = [signal, None]
+                    with mock.patch(
+                        "ai_auto_desktop.durable._LeaseHeartbeatKeeper",
+                        return_value=keeper,
+                    ), self.assertRaises(type(signal)):
+                        DurableExecutor(
+                            store, owner_id="interrupt",
+                            durable_action_mode="read-only",
+                        ).start(
+                            plan(), inputs={"query": "public"},
+                            run_id="heartbeat-stop-interrupt",
+                            plugins={"fixture": plugin},
+                        )
+                    self.assertEqual(len(plugin.calls), 1)
+                    self.assertEqual(keeper.stop.call_count, 2)
+                    current = store.get_run("heartbeat-stop-interrupt")
+                    self.assertEqual(current.status, RunStatus.RUNNING)
+                    self.assertEqual(current.checkpoint["phase"], "action_intent")
 
     def test_declared_error_is_redacted_before_persistence(self) -> None:
         plugin = StubPlugin(PluginError("FIXTURE.FAIL", RAW, details={"secret": RAW}))
@@ -575,6 +666,41 @@ class DurableReadOnlyExecutionTests(unittest.TestCase):
         authorized = [e for e in self.store.list_events("replay") if e.event_type == "run.action_dispatch_authorized"]
         self.assertEqual(len(authorized), 1)
         self.assertEqual(checkpoint["actionIntent"]["dispatchDeadlineEpochMs"], original_deadline)
+
+    def test_tiny_ttl_action_dispatch_conflict_is_reported_as_lease_lost(self) -> None:
+        plugin = StubPlugin()
+        workflow, _ = self._seed_action_intent("tiny-ttl-intent", plugin)
+        original = self.store.append_event_with_checkpoint
+
+        def expire_before_authorize(
+            run_id: str,
+            event_type: str,
+            payload: object,
+            checkpoint: object,
+            **kwargs: object,
+        ) -> object:
+            if event_type == "run.action_dispatch_authorized":
+                self.store._connection.execute(
+                    "UPDATE runs SET lease_expires_at = 0 WHERE run_id = ?",
+                    (run_id,),
+                )
+            return original(run_id, event_type, payload, checkpoint, **kwargs)
+
+        with mock.patch.object(
+            self.store,
+            "append_event_with_checkpoint",
+            side_effect=expire_before_authorize,
+        ), self.assertRaises(AutomationError) as rejected:
+            DurableExecutor(
+                self.store, owner_id="recovery", durable_action_mode="read-only"
+            ).resume("tiny-ttl-intent", workflow, plugins={"fixture": plugin})
+
+        self.assertEqual(rejected.exception.code, "RUN.LEASE_LOST")
+        self.assertTrue(rejected.exception.retryable)
+        self.assertEqual(plugin.calls, [])
+        current = self.store.get_run("tiny-ttl-intent")
+        self.assertEqual(current.status, RunStatus.RUNNING)
+        self.assertEqual(current.desired_state, DesiredState.RUN)
 
     def test_malformed_or_changed_intent_never_dispatches(self) -> None:
         for mutation in (

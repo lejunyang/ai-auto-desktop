@@ -587,13 +587,40 @@ class DurableExecutionTests(unittest.TestCase):
                 self.store, owner_id="stale"
             ).resume("result-fenced", plan)
 
-        self.assertIn(
-            rejected.exception.code,
-            {"RUN.JOURNAL_FAILURE", "RUN.LEASE_CONFLICT"},
-        )
+        self.assertEqual(rejected.exception.code, "RUN.LEASE_CONFLICT")
+        self.assertTrue(rejected.exception.retryable)
         current = self.store.get_run("result-fenced")
         self.assertEqual(current.status, RunStatus.RUNNING)
         self.assertEqual(current.owner_id, active.owner_id)
+
+    def test_tiny_ttl_finalization_commit_reports_retryable_lease_lost(self) -> None:
+        plan = workflow(assign("work", 1))
+        self._crash_at_finalization_stage(plan, "tiny-ttl-result", "result")
+        lease = self.store.get_run("tiny-ttl-result")
+        self.assertEqual(lease.status, RunStatus.RUNNING)
+
+        original = self.store.set_status_with_event
+
+        def expire_before_commit(run_id: str, **kwargs: object) -> object:
+            if kwargs.get("event_type") == "run.finished":
+                self.store._connection.execute(
+                    "UPDATE runs SET lease_expires_at = ? WHERE run_id = ?",
+                    (time.time() - 1, run_id),
+                )
+            return original(run_id, **kwargs)
+
+        with mock.patch.object(
+            self.store, "set_status_with_event", side_effect=expire_before_commit
+        ), self.assertRaises(AutomationError) as rejected:
+            DurableExecutor(
+                self.store, owner_id="recovery"
+            ).resume("tiny-ttl-result", plan)
+
+        self.assertEqual(rejected.exception.code, "RUN.LEASE_LOST")
+        self.assertTrue(rejected.exception.retryable)
+        self.assertNotIn("token", json.dumps(rejected.exception.to_dict()))
+        current = self.store.get_run("tiny-ttl-result")
+        self.assertEqual(current.status, RunStatus.RUNNING)
 
     def test_paused_finalization_intent_resumes_cleanup_after_request_run(self) -> None:
         plan = workflow(
