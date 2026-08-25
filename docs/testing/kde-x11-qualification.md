@@ -24,6 +24,13 @@ System Settings 若在其他环境
 15 秒内没有以本次启动 PID 注册，将记录为 `unsupported`，不会作为 skip 或 pass。
 另一个专用原生测试已对自有 QML 按钮执行 exact `Press`，并从 fresh snapshot 观察状态 label
 变化；该测试只使用 AT-SPI `Action.do_action`，不使用 XTEST、OCR 或坐标输入。
+独立的真实应用写动作测试还会启动发行版 KCalc 22.12.3，在禁用 TCP 并使用一次性
+Xauthority 的私有 Xvfb、私有 session/AT-SPI bus 与临时 HOME/XDG 中依次精确定位
+`1`、`+`、`2`、`=` 按钮。每次
+动作前都重新抓取未截断快照并重新定位，只接受 `Action.do_action` 的 exact `Press`，最后
+从 fresh snapshot 读取显示节点 `3`。因此这条证据覆盖一个真实 KDE/Qt Widgets 应用的
+低风险语义写动作；它不改变上表四应用只读 qualifier 的零写动作判定，也不使用键鼠注入、
+OCR 或截图。
 
 ## 安全和隔离
 
@@ -128,10 +135,10 @@ PYTHONPATH=src /usr/bin/python3 -m pytest -q \
 sh plugins/linux_atspi/build_x11_xtest_helper.sh
 # 结果：生成 .build/x11_xtest_helper；链接 libX11.so.6 与 libXtst.so.6
 
-PYTHONPATH=src /usr/bin/python3 -m pytest -vv -rs \
-  tests/test_linux_atspi_native.py
-# 结果：新增 QML semantic invoke 后为 6 passed, 5 skipped；其中 QML Press 及
-# fresh snapshot 后置条件通过，input_injection=false、ocr=false
+PYTHONPATH=src PYTHONDONTWRITEBYTECODE=1 /usr/bin/python3 -m unittest -q \
+  tests.test_linux_atspi_native
+# 结果：16 tests，OK（skipped=5）；其中 NativeIsolatedX11ActionTests 为 8 tests，OK
+# KCalc 的 1+2=3 与 QML Press 都由 fresh snapshot 验证，未使用 OCR
 
 PYTHONPATH=src /usr/bin/python3 tests/linux/kde_app_qualifier.py \
   --output artifacts/kde-x11-qualification.json
@@ -156,7 +163,8 @@ RemoteDesktop portal 可用，uinput 因当前进程不可写而 degraded，Wayl
   多显示器或 DPI。
 - name 非空比例不应被当成所有控件均有可用 accessible name；完整 role/name/value/state
   数值以忽略的 JSON artifact 为准。
-- 尚未执行任何低风险写动作；若以后增加，仍须限定自有 PID、使用 `find` 返回的 target 与
-  exact locator、重新抓树验证后置条件，并在报告中逐项记录。
-- 本轮只在自有 fixture（含 Qt Quick/QML）上执行语义写动作；真实 KDE 应用资格矩阵保持只读。活动 KDE
-  display 处于锁屏状态，因此未覆盖已解锁桌面上的 XTEST 后置条件。
+- 只读 qualifier 本身仍不派发写动作；真实 KCalc 的 `1+2=3` 是独立、隔离的定向测试，
+  不能替代对 Dolphin、Konsole、System Settings 或任意第三方页面的写资格。
+- 自有 fixture（含 Qt Quick/QML）已覆盖更多语义动作；真实 KDE 应用目前只额外覆盖 KCalc
+  四次 exact `Press` 与结果回读。活动 KDE display 处于锁屏状态，因此未覆盖已解锁桌面上的
+  XTEST 后置条件。

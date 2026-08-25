@@ -33,8 +33,10 @@ accessibility bus。Gio fallback 支持应用枚举和只读快照，不支持�
 `desktop.linux_atspi.pointer_click@1` 与 `desktop.linux_atspi.type_text@1`：二者都会重新抓取并
 精确解析 target+locator，验证原生身份、语义指纹、进程归属后先聚焦，再调用固定路径 C++
 XTest helper。`pointer_click` v0 只支持 `button=left`、`position=center`，并要求 fresh
-snapshot 上的目标具有正面积 bounds；调用方不能传入裸 `x/y` 坐标。`set_text`/`invoke`
-永远不会自动进入这些路径。驱动不做 OCR，也不依赖 `xdotool`、剪贴板或 `uinput`。
+snapshot 上的目标具有正面积 bounds；AT-SPI element-at-point 还必须命中目标本身或其
+后代，避免同进程 sibling/overlay 覆盖中心点时误点。调用方不能传入裸 `x/y` 坐标。
+`set_text`/`invoke` 永远不会自动进入这些路径。驱动不做 OCR，也不依赖 `xdotool`、剪贴板
+或 `uinput`。
 只读 Gio fallback 会为全部八种写动作返回结构化的
 `DRIVER.ACTION_UNSUPPORTED`。定位器只支持精确匹配；多义、过期或截断快照均失败关闭。
 当前 v0 默认后端还要求进程环境明确报告 KDE、X11 和非空 `DISPLAY`；缺失这些证据，
@@ -55,6 +57,8 @@ XTEST 发送 move + Button1 down/up。`type_text` 接受 1–1024 个字符且�
 字节，除换行外拒绝控制字符，不支持密码或 secret。首个输入/指针事件后任何错误或超时
 都返回 `DRIVER.UNKNOWN_EFFECT` 且不得重试；成功后仍须 fresh snapshot 验证文本或点击
 后置条件。helper 的 `submitted=true` 仅表示 X server 接受了事件请求，不表示目标应用已消费文本。
+`pointer_click` 在指针事件前需要先聚焦目标；如果尚未提交点击但焦点已改变，失败也按
+不可重试的 contextual effect 返回，不能伪装成完全没有副作用。
 登录管理器和锁屏界面不受支持；生产动作不主动解锁会话。
 显式选择示例见 `examples/workflows/linux-explicit-type-text-fallback.yaml`；示例只按调用方
 预先获得的 `semantic_set_text_available` 结果分支，不捕获语义动作失败后自动降级。
@@ -81,3 +85,8 @@ snapshot/find/focus/set_text/invoke 及动作后重新观察。私有 Xvfb + 隔
 bus 的 GTK3/Qt5 fixture 还会真实验证 `type_text` 的 XTEST UTF-8 输入和 fresh snapshot
 后置条件。当前仓库还以同一套隔离 runner 真实验证 `pointer_click` 的 XTEST 左键中心点点击
 及 fresh snapshot 后置条件；不使用 OCR、`xdotool`、剪贴板或调用方提供的裸坐标。
+另有真实应用 runner 在禁用 TCP、使用一次性 Xauthority 的私有 Xvfb，以及私有
+session/AT-SPI bus 与临时 HOME/XDG 中启动发行版 KCalc 22.12.3，每次用 fresh snapshot
+精确定位 `1`、`+`、`2`、`=`，通过 `Action.do_action` 的 exact `Press` 完成计算，并从
+fresh snapshot 读取同一显示控件的结果 `3`。
+这只证明该受控 KCalc 场景，不外推为任意 KDE 应用写动作均已通过。

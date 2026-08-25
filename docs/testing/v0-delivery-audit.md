@@ -36,7 +36,7 @@
 | Linux 显式输入 | AT-SPI fresh resolve + PID/focus + 固定路径 XTest helper；fresh snapshot 验证 | GTK3/Qt5 在本机 KDE/X11 和私有 Xvfb 均通过 |
 | 三端显式鼠标 | `pointer_click@1` 只接受 fresh semantic target + locator，固定中心点左键；Windows/macOS 做原生 element-at-point exact hit-test，Linux 要求 AT-SPI 命中目标子树并叠加 X11 焦点/点下窗口 PID | 三端契约已验证；Linux GTK3/Qt5 私有 Xvfb 真动作通过，Windows/macOS 真机证据待回传 |
 | Linux capability probe | AT-SPI bus、根窗口有界 `xprop` X11 round-trip、portal/libei/uinput/Wayland 分项报告 | 本机 `available=3/degraded=1/unavailable=2/unknown=0`；X11 误阴性已修复 |
-| KDE/QML 应用矩阵 | `tests/linux/kde_app_qualifier.py` 只启动自有进程、按精确 PID 抓取聚合树；专用 runner 仅对自有 QML fixture 调用 exact `Press` 并 fresh snapshot | Dolphin、Konsole、System Settings 与自有 Qt Quick/QML fixture 只读观察通过；QML 自有 fixture 语义 invoke 通过，真实应用未执行写动作 |
+| KDE/QML 应用矩阵 | `tests/linux/kde_app_qualifier.py` 对四应用做只读聚合；专用 runner 对自有 QML fixture 与发行版 KCalc 使用 exact `Press` 并 fresh snapshot | Dolphin、Konsole、System Settings 与自有 Qt Quick/QML fixture 只读观察通过；自有 QML 与隔离 KCalc 语义 invoke 通过 |
 | Windows 测试门禁与证据 | `.github/workflows/ci.yml` 仅在 `workflow_dispatch` 且 `run_windows_native=true` 时运行完整测试；`tests/windows/run-native-fixture.ps1` 生成 JSON，失败时也上传并保留 30 天 | 静态契约已验证；本轮未触发，无 Windows 真机结论 |
 | 虚拟机可行性 | `docs/testing/virtual-machine-capability.md` | 当前主机无 `/dev/kvm`/嵌套虚拟化；Windows 用远端 runner，macOS 用 Apple 硬件 |
 | Mac 回传包 | `tests/macos/package-source.sh` 与 `run.sh`；结果包含 report、identity、SHA256 和隐私说明 | 源码包与回传格式已就绪；等待真实结果 |
@@ -95,6 +95,7 @@
 - Linux 隔离环境：私有 Xvfb + 私有 session/AT-SPI bus 的 GTK3/Qt5 输入用例通过。
 - Linux capability probe：同一 KDE/X11 会话中 `linux.at_spi`、`linux.x11` 和 `linux.remote_desktop_portal` 为 `available`；`linux.uinput=degraded`，Wayland/libei 不可用。X11 查询使用单个根窗口属性，避免完整 `xdpyinfo` 输出超过通用子进程上限。
 - Linux 应用只读矩阵：Dolphin 22.12.3（358 节点）、Konsole 22.12.3（352 节点）、System Settings 5.27.5（256 节点）与自有 Qt Quick/QML fixture（5 节点）均通过精确 PID 选择和未截断快照；写动作派发数为零，Dolphin 仅打开临时空目录，详细聚合指标见 `docs/testing/kde-x11-qualification.md`。
+- Linux 真实 KDE 写动作：发行版 KCalc 22.12.3 在禁用 TCP、使用一次性 Xauthority 的私有 Xvfb，以及私有 session/AT-SPI bus 和临时 HOME/XDG 中以精确 PID 启动；测试从每次 fresh、未截断快照定位 `1`、`+`、`2`、`=`，四次均由 `Action.do_action` 执行 exact `Press`，最终从 fresh snapshot 唯一读取同一显示控件的结果 `3`。未使用 XTEST、OCR、截图或用户配置目录。
 - Windows：跨平台契约、ctypes ABI 和 CI artifact 静态契约测试通过；Windows-only fixture 在非 Windows 主机跳过，远端 CI 未触发。
 - macOS：driver/testkit 静态与协议测试通过，源码包可复现并绑定 clean Git revision、manifest digest 与结果归档 hash；真机套件现将 `pointer_click_and_reread` 设为 passed 报告必需项，并严格校验 fresh target、正面积 bounds、PID/frontmost、AX hit-test、显式左键中心点和 fresh postcondition 证据。该结果只验证 Linux 上的验真逻辑，当前 Linux 主机无法编译或执行 Apple framework；最终源码包的具体 revision 和三类 SHA-256 记录在随包交付消息中。
 - `python -m compileall -q src plugins tests`、`git diff --check` 和 XTest helper 本机构建通过。
@@ -108,7 +109,7 @@
 
 - Windows：等待用户允许后手动触发 `workflow_dispatch(run_windows_native=true)`，还需记录 runner、系统版本、commit SHA、fixture 结果和 UIPI/secure desktop 边界。
 - macOS：等待真实 Mac 回传 `macos-ax-test-result.tar.gz`；必须通过仓库验真器，并仅在 `archive_valid=true`、`report_passed=true`、`trusted_archive=true`、`source_trusted=true`、`qualified=true` 时记为通过。预期结果归档 SHA-256 必须来自与回传归档独立的可信渠道。
-- Linux：自有 GTK3/Qt5 语义动作、XTest 文本输入与显式中心点左键 pointer click 已通过；Dolphin、Konsole、System Settings 和自有 Qt Quick/QML fixture 已完成初始窗口只读矩阵。真实应用写动作、第三方 QML 页面、多窗口和动态页面仍待独立资格验证。
+- Linux：自有 GTK3/Qt5 语义动作、XTest 文本输入与显式中心点左键 pointer click 已通过；Dolphin、Konsole、System Settings 和自有 Qt Quick/QML fixture 已完成初始窗口只读矩阵，KCalc 已完成一个隔离语义计算写动作闭环。其他真实应用写动作、第三方 QML 页面、多窗口和动态页面仍待独立资格验证。
 
 ## 6. 下一阶段
 

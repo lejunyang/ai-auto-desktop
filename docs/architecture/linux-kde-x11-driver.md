@@ -32,7 +32,9 @@
 除显式 `pointer_click` 与 `type_text` 外，驱动不会调用 XTEST；`set_text`、`invoke` 或
 其他语义动作失败时也绝不会自动进入这些路径。`pointer_click` v0 只接受
 `target + locator`，只支持 `button=left` 与 `position=center`，显式拒绝调用方提供的
-裸 `x/y` 坐标。helper 不调用 `xdotool`、shell、`uinput` 或剪贴板，驱动不做 OCR。
+裸 `x/y` 坐标。派发前 AT-SPI element-at-point 必须命中目标本身或目标子树，随后 helper
+再核对 X focus owner 和点击点下窗口 PID；同进程 sibling/overlay 不会仅凭 PID 一致而放行。
+helper 不调用 `xdotool`、shell、`uinput` 或剪贴板，驱动不做 OCR。
 AT-SPI 未暴露节点、bounds 或动作时，结果会明确失败。
 登录管理器、锁屏、其他用户会话和提权界面不在当前支持范围内。
 
@@ -139,6 +141,8 @@ enabled、visible、showing、focusable、editable、sensitive、protected 与�
 无法表达的码点分别占用不同空闲非 modifier keycode，全部映射一次性提交并同步后才
 派发，结束时恢复映射。首个合成事件后任一错误/timeout 都映射为非 retryable 的
 `DRIVER.UNKNOWN_EFFECT`。成功只表示事件提交，调用方仍须 fresh snapshot 验证文本。
+对于 `pointer_click`，若 XTEST 尚未提交但前置聚焦已经改变上下文，错误同样不可重试并标为
+contextual effect；只有在聚焦前失败时才能声明 `not_applied`。
 
 驱动一旦进入原生写接口，就使当前公开快照失效。原生接口报错或截止时间在派发后
 耗尽时，驱动返回 `DRIVER.UNKNOWN_EFFECT`，不得自动重放。成功响应只证明 AT-SPI
@@ -206,6 +210,13 @@ KDE/X11 display，以及私有 Xvfb + 私有 AT-SPI bus，分别验证 GTK3/Qt5 
 生产动作当前不读取登录管理器锁定状态；锁屏/登录界面明确不受支持，调用方必须在
 解锁的用户会话执行，并把返回字段 `submitted=true` 理解为“X server 已接受事件请求”，
 而不是“应用已接收文本”。
+真实 KDE 应用验证另使用发行版 KCalc 22.12.3，而非仓库 fixture。测试在禁用 TCP、使用
+一次性 Xauthority 的私有 Xvfb，以及私有 session/AT-SPI bus 和临时 HOME/XDG 中启动
+独占 KCalc PID；每次从未截断的 fresh
+snapshot 精确定位 `1`、`+`、`2`、`=` 四个按钮，要求原生接口为
+`Action.do_action`、canonical action 为 exact `Press`，最后再从 fresh snapshot 唯一读取
+同一显示节点 `3`。这证明了一个真实 KDE/Qt Widgets 应用的受控语义写动作闭环，但不外推为
+任意 KDE 应用、页面或动作均已通过。整个 case 不使用 XTEST、OCR、截图或用户配置目录。
 代码中为 Qt 5 Widgets 保留了保守的已观测映射：按钮只有在 exact canonical `Press`
 唯一存在时才公开 `invoke`；由于 Qt 5 bridge 不导出 `AccessibleId`，写前身份验证要求
 bus/object path、toolkit/version 与进程 ID 全部一致，并继续比较语义指纹。该映射只有在

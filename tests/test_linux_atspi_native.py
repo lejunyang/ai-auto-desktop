@@ -17,6 +17,7 @@ import re
 import shlex
 import shutil
 import signal
+import secrets
 import subprocess
 import sys
 import tempfile
@@ -36,6 +37,7 @@ QT_FIXTURE_RUNNER = PROJECT_ROOT / "tests" / "linux" / "qt_atspi_native_runner.p
 QML_FIXTURE_SOURCE = PROJECT_ROOT / "tests" / "linux" / "qml_atspi_fixture.qml"
 QML_FIXTURE_RUNNER = PROJECT_ROOT / "tests" / "linux" / "qml_atspi_native_runner.py"
 GTK_FIXTURE_RUNNER = PROJECT_ROOT / "tests" / "linux" / "gtk_atspi_native_runner.py"
+KCALC_RUNNER = PROJECT_ROOT / "tests" / "linux" / "kcalc_atspi_native_runner.py"
 XTEST_BUILD_SCRIPT = PROJECT_ROOT / "plugins" / "linux_atspi" / "build_x11_xtest_helper.sh"
 TEST_TYPELIB_ENV = "AI_AUTO_DESKTOP_TEST_ATSPI_TYPELIB_PATH"
 FIXTURE_ENTRY_NAME = "Fixture text entry"
@@ -146,6 +148,150 @@ def _native_subprocess_environment(session: dict[str, str]) -> dict[str, str]:
             )
         environment["GI_TYPELIB_PATH"] = os.pathsep.join(paths)
     return environment
+
+
+def _process_start_time(pid: int) -> int | None:
+    """读取 Linux /proc starttime，避免 PID 复用造成归属误判。"""
+
+    try:
+        raw = (Path("/proc") / str(pid) / "stat").read_text(encoding="ascii")
+        fields = raw[raw.rindex(")") + 2:].split()
+        return int(fields[19])
+    except (OSError, UnicodeError, ValueError, IndexError):
+        return None
+
+
+def _process_table() -> dict[int, tuple[int, int, int]]:
+    """返回当前用户 PID 到 (PPID, PGID, starttime) 的有界快照。"""
+
+    table: dict[int, tuple[int, int, int]] = {}
+    try:
+        entries = list(Path("/proc").iterdir())
+    except OSError:
+        return table
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        try:
+            if entry.stat().st_uid != os.getuid():
+                continue
+            raw = (entry / "stat").read_text(encoding="ascii")
+            fields = raw[raw.rindex(")") + 2:].split()
+            table[int(entry.name)] = (
+                int(fields[1]), int(fields[2]), int(fields[19])
+            )
+        except (OSError, UnicodeError, ValueError, IndexError):
+            continue
+    return table
+
+
+def _owned_descendant_identities(root_pid: int) -> list[tuple[int, int, int]]:
+    table = _process_table()
+    descendants = {root_pid}
+    changed = True
+    while changed:
+        changed = False
+        for pid, (parent_pid, _group_id, _start_time) in table.items():
+            if parent_pid in descendants and pid not in descendants:
+                descendants.add(pid)
+                changed = True
+    return [
+        (pid, table[pid][1], table[pid][2])
+        for pid in sorted(descendants, reverse=True)
+        if pid in table
+    ]
+
+
+def _identity_is_current(identity: tuple[int, int, int]) -> bool:
+    pid, group_id, start_time = identity
+    try:
+        stat_path = Path("/proc") / str(pid) / "stat"
+        raw = stat_path.read_text(encoding="ascii")
+        fields = raw[raw.rindex(")") + 2:].split()
+        return (
+            fields[0] != "Z"
+            and int(fields[2]) == group_id
+            and int(fields[19]) == start_time
+            and stat_path.parent.stat().st_uid == os.getuid()
+        )
+    except (OSError, UnicodeError, ValueError, IndexError):
+        return False
+
+
+def _stop_exact_processes(identities: list[tuple[int, int, int]]) -> bool:
+    """终止已经观测并以 PID/starttime 绑定的自有进程。"""
+
+    identities = list(dict.fromkeys(identities))
+    group_ids = sorted({
+        group_id
+        for pid, group_id, _start in identities
+        if pid == group_id and group_id != os.getpgrp()
+    })
+    for group_id in group_ids:
+        try:
+            os.killpg(group_id, signal.SIGTERM)
+        except (OSError, ProcessLookupError):
+            pass
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline and any(
+        _identity_is_current(item) for item in identities
+    ):
+        time.sleep(0.02)
+    for group_id in group_ids:
+        if any(
+            identity[1] == group_id and _identity_is_current(identity)
+            for identity in identities
+        ):
+            try:
+                os.killpg(group_id, signal.SIGKILL)
+            except (OSError, ProcessLookupError):
+                pass
+    for identity in identities:
+        if _identity_is_current(identity):
+            try:
+                os.kill(identity[0], signal.SIGKILL)
+            except (OSError, ProcessLookupError):
+                pass
+    return not any(_identity_is_current(item) for item in identities)
+
+
+def _run_bounded_process_group(
+    command: list[str], environment: dict[str, str], timeout: float
+) -> tuple[int | None, bytes, bytes, bool, bool]:
+    """运行隔离 helper，并持续记录可安全回收的精确后代身份。"""
+
+    with tempfile.TemporaryFile() as stdout_file, tempfile.TemporaryFile() as stderr_file:
+        process = subprocess.Popen(
+            command,
+            env=environment,
+            stdin=subprocess.DEVNULL,
+            stdout=stdout_file,
+            stderr=stderr_file,
+            start_new_session=True,
+        )
+        observed_identities: list[tuple[int, int, int]] = []
+        deadline = time.monotonic() + timeout
+        timed_out = False
+        while True:
+            observed_identities.extend(_owned_descendant_identities(process.pid))
+            returncode = process.poll()
+            if returncode is not None:
+                break
+            if time.monotonic() >= deadline:
+                timed_out = True
+                break
+            time.sleep(0.05)
+        cleanup_succeeded = _stop_exact_processes(observed_identities)
+        if process.poll() is None:
+            try:
+                process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                cleanup_succeeded = False
+        stdout_file.seek(0)
+        stderr_file.seek(0)
+        stdout = stdout_file.read(1024 * 1024 + 1)
+        stderr = stderr_file.read(1024 * 1024 + 1)
+    return returncode, stdout, stderr, timed_out, cleanup_succeeded
 
 
 @contextmanager
@@ -914,12 +1060,15 @@ class NativeKdeX11AtspiInfrastructureTests(unittest.TestCase):
 
 
 @unittest.skipUnless(sys.platform.startswith("linux"), "仅在 Linux 运行")
-class NativeIsolatedX11TypeTextTests(unittest.TestCase):
-    """Use a private Xvfb and private AT-SPI bus for deterministic XTEST."""
+class NativeIsolatedX11ActionTests(unittest.TestCase):
+    """在私有 Xvfb 与 AT-SPI bus 中验证确定性原生动作。"""
 
     def setUp(self) -> None:
-        if shutil.which("Xvfb") is None or shutil.which("dbus-run-session") is None:
-            self.skipTest("XTest 真机测试需要 Xvfb 与 dbus-run-session")
+        if any(
+            shutil.which(command) is None
+            for command in ("Xvfb", "dbus-run-session", "xauth")
+        ):
+            self.skipTest("隔离原生动作测试需要 Xvfb、xauth 与 dbus-run-session")
         session = _kde_x11_test_environment()
         if session is None:
             self.skipTest("需要当前用户的 KDE/X11 会话作为资格门")
@@ -933,6 +1082,23 @@ class NativeIsolatedX11TypeTextTests(unittest.TestCase):
         self.addCleanup(self.temporary.cleanup)
         display_number = 120 + (os.getpid() % 300)
         self.display = f":{display_number}"
+        self.xauthority = Path(self.temporary.name) / "Xauthority"
+        self.xauthority.touch(mode=0o600)
+        self.xauthority.chmod(0o600)
+        cookie = secrets.token_hex(16)
+        authorization = subprocess.run(
+            [shutil.which("xauth"), "-f", str(self.xauthority), "add", self.display, ".", cookie],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=5,
+        )
+        self.assertEqual(
+            authorization.returncode,
+            0,
+            authorization.stderr.decode("utf-8", errors="replace")[-2000:],
+        )
         self.xvfb = subprocess.Popen(
             [
                 shutil.which("Xvfb"),
@@ -942,12 +1108,16 @@ class NativeIsolatedX11TypeTextTests(unittest.TestCase):
                 "1280x800x24",
                 "-nolisten",
                 "tcp",
+                "-auth",
+                str(self.xauthority),
             ],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             start_new_session=True,
         )
+        self.xvfb_start_time = _process_start_time(self.xvfb.pid)
+        self.assertIsNotNone(self.xvfb_start_time)
         self.addCleanup(NativeKdeX11AtspiInfrastructureTests._stop_process, self.xvfb)
         socket = Path("/tmp/.X11-unix") / f"X{display_number}"
         stop = time.monotonic() + 5
@@ -958,6 +1128,7 @@ class NativeIsolatedX11TypeTextTests(unittest.TestCase):
         if not socket.exists():
             self.fail("Xvfb display 未在 5 秒内准备就绪")
         self.base_environment["DISPLAY"] = self.display
+        self.base_environment["XAUTHORITY"] = str(self.xauthority)
         build = subprocess.run(
             ["sh", str(XTEST_BUILD_SCRIPT)],
             stdin=subprocess.DEVNULL,
@@ -973,32 +1144,45 @@ class NativeIsolatedX11TypeTextTests(unittest.TestCase):
         )
 
     def _run_isolated(
-        self, runner: Path, fixture: Path, mode: str = "--type-text"
+        self,
+        runner: Path,
+        fixture: Path,
+        mode: str | None = "--type-text",
+        *,
+        environment: dict[str, str] | None = None,
     ) -> dict[str, object]:
-        completed = subprocess.run(
-            [
-                shutil.which("dbus-run-session"),
-                "--",
-                sys.executable,
-                str(runner),
-                str(fixture),
-                str(DRIVER_PATH),
-                mode,
-            ],
-            env=self.base_environment,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            check=False,
-            timeout=45,
+        command = [
+            shutil.which("dbus-run-session"),
+            "--",
+            sys.executable,
+            str(runner),
+            str(fixture),
+            str(DRIVER_PATH),
+        ]
+        if mode is not None:
+            command.append(mode)
+        returncode, stdout_raw, stderr_raw, timed_out, cleanup_succeeded = (
+            _run_bounded_process_group(
+                command,
+                self.base_environment if environment is None else environment,
+                45,
+            )
         )
+        if timed_out:
+            self.fail(
+                "隔离原生 action runner 超时；"
+                f"进程树清理成功={cleanup_succeeded}"
+            )
+        self.assertTrue(cleanup_succeeded, "隔离 runner 遗留了已观测后代进程")
+        self.assertLessEqual(len(stdout_raw), 1024 * 1024)
+        self.assertLessEqual(len(stderr_raw), 1024 * 1024)
+        stdout = stdout_raw.decode("utf-8", errors="replace")
+        stderr = stderr_raw.decode("utf-8", errors="replace")
         try:
-            report = json.loads(completed.stdout.strip().splitlines()[-1])
+            report = json.loads(stdout.strip().splitlines()[-1])
         except (IndexError, json.JSONDecodeError) as exc:
-            self.fail(f"fixture runner 未输出 JSON：{completed.stdout!r}; {exc}")
-        self.assertEqual(completed.returncode, 0, msg=f"{report!r}\n{completed.stderr}")
+            self.fail(f"fixture runner 未输出 JSON：{stdout!r}; {exc}")
+        self.assertEqual(returncode, 0, msg=f"{report!r}\n{stderr}")
         return report
 
     def test_helper_rejects_wayland_and_unowned_focus_before_dispatch(self) -> None:
@@ -1097,6 +1281,163 @@ class NativeIsolatedX11TypeTextTests(unittest.TestCase):
         self.assertEqual(report["input_injection"], "XTEST")
         self.assertTrue(report["pointer_click_observed"])
         self.assertFalse(report["type_text_observed"])
+
+    def test_real_kcalc_semantic_calculation_is_freshly_observed(self) -> None:
+        if not KCALC_RUNNER.is_file():
+            self.fail(f"KCalc 测试 runner 不存在：{KCALC_RUNNER}")
+        kcalc = shutil.which("kcalc")
+        if kcalc is None:
+            self.skipTest("真实 KDE 应用语义动作测试需要 kcalc")
+
+        environment = dict(self.base_environment)
+        private_root = Path(self.temporary.name)
+        profile_root = private_root / "kcalc-profile"
+        profile_root.mkdir(mode=0o700)
+        private_token = secrets.token_hex(32)
+        token_path = private_root / ".xvfb-owner-token"
+        token_path.write_text(private_token, encoding="ascii")
+        token_path.chmod(0o600)
+        for key, leaf in (
+            ("HOME", "home"),
+            ("XDG_CONFIG_HOME", "config"),
+            ("XDG_CACHE_HOME", "cache"),
+            ("XDG_DATA_HOME", "data"),
+            ("XDG_STATE_HOME", "state"),
+            ("XDG_RUNTIME_DIR", "runtime"),
+        ):
+            directory = profile_root / leaf
+            directory.mkdir(parents=True, mode=0o700)
+            environment[key] = str(directory)
+        environment.pop("DBUS_SESSION_BUS_ADDRESS", None)
+        environment.pop("AT_SPI_BUS_ADDRESS", None)
+        environment["XAUTHORITY"] = str(self.xauthority)
+        environment["AI_AUTO_DESKTOP_TEST_XVFB_DISPLAY"] = self.display
+        environment["AI_AUTO_DESKTOP_TEST_XVFB_PID"] = str(self.xvfb.pid)
+        environment["AI_AUTO_DESKTOP_TEST_XVFB_START_TIME"] = str(
+            self.xvfb_start_time
+        )
+        environment["AI_AUTO_DESKTOP_TEST_PRIVATE_ROOT"] = str(private_root)
+        environment["AI_AUTO_DESKTOP_TEST_PRIVATE_TOKEN"] = private_token
+        self.assertEqual(_process_start_time(self.xvfb.pid), self.xvfb_start_time)
+
+        report = self._run_isolated(
+            KCALC_RUNNER, Path(kcalc), None, environment=environment
+        )
+        self.assertEqual(report["status"], "passed")
+        self.assertEqual(report["application"], "kcalc")
+        self.assertIsInstance(report["application_process_start_time"], int)
+        self.assertGreater(report["application_process_start_time"], 0)
+        self.assertEqual(report["toolkit"], "Qt")
+        self.assertRegex(report["application_version"], r"^[0-9]+:[0-9]+(?:\.[0-9]+)+(?:[-+~].*)?$")
+        self.assertEqual(report["display"], self.display)
+        self.assertEqual(
+            report["display_kind"], "private_xvfb_without_window_manager"
+        )
+        self.assertGreater(report["node_count"], 0)
+        self.assertLessEqual(report["node_count"], 1000)
+        self.assertFalse(report["snapshot_truncated"])
+        self.assertEqual(report["operation"], "1+2=3")
+        self.assertEqual(
+            [action["button"] for action in report["actions"]],
+            ["1", "+", "2", "="],
+        )
+        self.assertTrue(
+            all(
+                action["native_interface"] == "Action.do_action"
+                and action["native_action_name"] == "Press"
+                and action["accepted"] is True
+                and action["role"] == "push_button"
+                and all(
+                    action["states"][name] is True
+                    for name in ("enabled", "visible", "showing", "sensitive")
+                )
+                and action["provenance"]["process_id"]
+                == report["application_process_id"]
+                and action["provenance"]["toolkit_name"] == "Qt"
+                and isinstance(action["provenance"]["bus_name"], str)
+                and action["provenance"]["bus_name"]
+                and isinstance(action["provenance"]["object_path"], str)
+                and action["provenance"]["object_path"].startswith("/")
+                for action in report["actions"]
+            )
+        )
+        self.assertTrue(report["fresh_snapshot_before_each_action"])
+        self.assertTrue(report["fresh_snapshot_postcondition"])
+        self.assertTrue(report["postcondition_observed"])
+        self.assertEqual(
+            report["display_identity"]["process_id"],
+            report["application_process_id"],
+        )
+        self.assertEqual(
+            report["final_display_identity"], report["display_identity"]
+        )
+        self.assertEqual(
+            report["isolation"],
+            {
+                "private_xvfb": True,
+                "x11_tcp_disabled": True,
+                "private_xauthority": True,
+                "private_session_bus": True,
+                "private_home_xdg": True,
+                "window_manager_started": False,
+            },
+        )
+        self.assertFalse(report["input_injection"])
+        self.assertFalse(report["ocr"])
+        self.assertFalse(report["screenshots"])
+
+    def test_kcalc_runner_rejects_missing_private_xvfb_proof(self) -> None:
+        kcalc = shutil.which("kcalc")
+        if kcalc is None:
+            self.skipTest("KCalc 安全门测试需要 kcalc")
+        environment = dict(self.base_environment)
+        for key in (
+            "AI_AUTO_DESKTOP_TEST_XVFB_DISPLAY",
+            "AI_AUTO_DESKTOP_TEST_XVFB_PID",
+            "AI_AUTO_DESKTOP_TEST_XVFB_START_TIME",
+            "AI_AUTO_DESKTOP_TEST_PRIVATE_ROOT",
+            "AI_AUTO_DESKTOP_TEST_PRIVATE_TOKEN",
+        ):
+            environment.pop(key, None)
+        completed = subprocess.run(
+            [sys.executable, str(KCALC_RUNNER), kcalc, str(DRIVER_PATH)],
+            env=environment,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            check=False,
+            timeout=5,
+        )
+        self.assertEqual(completed.returncode, 64)
+        self.assertEqual(
+            json.loads(completed.stdout),
+            {"status": "failed", "reason": "private_xvfb_not_proven"},
+        )
+
+    def test_bounded_group_timeout_reaps_observed_descendants(self) -> None:
+        marker = Path(self.temporary.name) / "timeout-child.pid"
+        command = [
+            sys.executable,
+            "-c",
+            (
+                "import pathlib, subprocess, sys, time; "
+                "child=subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'], "
+                "start_new_session=True); "
+                "pathlib.Path(sys.argv[1]).write_text(str(child.pid)); "
+                "time.sleep(60)"
+            ),
+            str(marker),
+        ]
+        returncode, _stdout, _stderr, timed_out, cleanup_succeeded = (
+            _run_bounded_process_group(command, dict(self.base_environment), 0.5)
+        )
+        self.assertIsNone(returncode)
+        self.assertTrue(timed_out)
+        self.assertTrue(cleanup_succeeded)
+        child_pid = int(marker.read_text(encoding="ascii"))
+        self.assertFalse(Path("/proc", str(child_pid)).exists())
 
     def test_qt5_type_text_is_observed_after_xtest_dispatch(self) -> None:
         compiler = shutil.which("g++")

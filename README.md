@@ -35,11 +35,17 @@ python -m ai_auto_desktop run workflow.yaml \
   --plugin vision.ocr=plugins/ocr_tesseract/run.sh
 ```
 
-Tesseract 是可选的系统依赖；只有区域裁剪需要 Pillow。依赖缺失、低置信度等情况都会返回结构化 `OCR.*` 错误。OCR 输出始终是不可信数据，只有后续显式的 `if` 或 `switch` 才能据此选择响应动作。
+Tesseract 是可选的系统依赖；所有 OCR 请求都需要 Pillow 完成图片格式、尺寸、帧数与完整
+解码校验，区域裁剪也由 Pillow 执行。依赖缺失、低置信度等情况都会返回结构化 `OCR.*`
+错误。OCR 输出始终是不可信数据，只有后续显式的 `if` 或 `switch` 才能据此选择响应动作。
 
 ## Windows 用户界面自动化驱动（UIA）
 
-`plugins/windows_uia` 是首个真实原生桌面驱动。在 Windows 上，它使用可选的 `comtypes` 绑定枚举窗口并归一化有界的 UIA Control View。驱动支持精确定位，以及原生 `SetFocus`、`InvokePattern.Invoke`、`ValuePattern.SetValue`、显式 `type_text` Unicode 键盘后备和显式 `pointer_click` 左键后备；每次写操作都会在派发前重新抓取快照、解析目标并核对原生元素身份。安装并注册：
+`plugins/windows_uia` 是首个原生 UIA 驱动实现，真实 Windows 运行结果仍待手动 CI。
+在 Windows 上，它使用可选的 `comtypes` 绑定枚举窗口并归一化有界的 UIA Control View。
+驱动支持精确定位，以及原生 `SetFocus`、`InvokePattern.Invoke`、`ValuePattern.SetValue`、
+显式 `type_text` Unicode 键盘后备和显式 `pointer_click` 左键后备；每次写操作都会在派发前
+重新抓取快照、解析目标并核对原生元素身份。安装并注册：
 
 ```powershell
 pip install .[windows-uia]
@@ -70,6 +76,10 @@ python -m ai_auto_desktop run workflow.yaml \
 自有 GTK3 fixture 验证 focus、set_text、invoke、toggle、expand/collapse，自有 Qt 5
 Widgets fixture 也验证 snapshot/find/focus/set_text/invoke；隔离 X11/AT-SPI fixture 还
 验证两套 toolkit 的 `type_text` 经 XTEST 输入 UTF-8 后由 fresh snapshot 观察。
+发行版 KCalc 22.12.3 还在禁用 TCP、使用一次性 Xauthority 的私有 Xvfb，以及私有
+D-Bus 与临时 HOME/XDG 中，通过精确按钮定位依次执行原生 AT-SPI `Press` 完成
+`1+2=3`，并从 fresh snapshot 读取同一显示控件的结果 `3`；该 case 不使用键鼠注入、
+OCR 或截图。
 真实应用 Dolphin 22.12.3、Konsole 22.12.3、System Settings 5.27.5 以及自有 Qt
 Quick/QML fixture 的初始窗口已完成只读资格验证，分别取得 358、352、256 与 5 个未截断
 节点，且写动作派发数为零；Dolphin 只打开临时空目录。这仍不等于“任意 KDE/QML 应用已经
@@ -81,7 +91,8 @@ Quick/QML fixture 的初始窗口已完成只读资格验证，分别取得 358�
 
 ## macOS 真机自测包
 
-`tests/macos` 是可直接复制到 Intel 或 Apple Silicon Mac 的自包含测试套件。它使用
+`tests/macos/package-source.sh` 可生成能复制到 Intel 或 Apple Silicon Mac 的自包含源码包。
+该套件使用
 系统 `xcrun`/`swiftc` 构建固定 bundle ID 的 AppKit fixture 与 AX runner，限定在自有
 fixture PID 内验证有界 AX 遍历、精确 identifier、focus、set value、press、显式
 `type_text` 的 ASCII、中文和非 BMP Unicode 输入，以及由 fresh AX bounds 推导中心点的显式

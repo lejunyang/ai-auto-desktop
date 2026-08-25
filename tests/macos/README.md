@@ -1,6 +1,8 @@
 # macOS Accessibility 自包含测试套件
 
-本目录提供一个只依赖 macOS 系统 `xcrun`、`swiftc` 和系统 framework 的真机测试套件。
+本目录提供一个无需 Python 或第三方包的真机测试套件；它依赖 Xcode Command Line Tools
+中的 `xcrun`、`swiftc`，以及 `codesign`、`plutil`、`shasum`、`tar`、`gzip`、`open`、
+`mktemp` 等 macOS 自带命令和系统 framework。
 它会构建两个使用固定 bundle ID 的 ad-hoc 签名 `.app`：
 
 - `dev.ai-auto-desktop.testkit.fixture`：只包含原生 AppKit 文本框、按钮和状态文本；
