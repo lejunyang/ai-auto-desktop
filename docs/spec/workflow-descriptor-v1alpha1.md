@@ -92,6 +92,12 @@ step 路径由嵌套 `id` 构成；`foreach` 运行记录还必须带 index。�
 
 Manifest 给出默认 effect/risk；descriptor、driver 动态判断和宿主策略都只能提高，不能降低有效等级。`precondition` 在执行前求值，且不得声明 `observe`。`postcondition` 可选声明专用观察动作 `observe: {uses, with}`：`uses` 必须是 canonical action ID，`with` 必须是对象；每次检查条件前执行该动作，并将其输出以 `observation` 暴露给 `condition`。`observe` 是闭合对象，不允许 `effect`、`risk`、`retry`、`on_error` 或其他字段。Runtime 必须在主动作派发前验证观察器存在、版本、平台、权限、风险、`read_only` effect，以及其所有错误均为 `not_applied`；不依赖当前 step 输出的静态 `with` 也必须提前校验。依赖 `steps.<当前步骤>.output` 的动态 `with` 只能在动作返回后求值。`postcondition.timeout` 存在时可在其预算内轮询；省略时仍立即观察并求值一次，但不继续轮询。任何 `unknown` effect 都禁止自动 retry。桌面动作必须完成 `observe → resolve → precondition → policy/confirm → execute → re-observe → postcondition` 闭环；每次 attempt 必须重新解析 locator，不得跨 snapshot 使用 `node_id`。
 
+action 可为受限 durable read-only 模式额外声明 `sensitivity` 与 `checkpoint`。`sensitivity` 的
+`input`、`output`、`error` 必须分别显式标为 `public|sensitive`；只有三项均为 `public`，且
+provider action 合约的对应三项也均为 `public`，才有资格进入该模式。`checkpoint.output` 必须是
+`{mode: omit}`，或 `{mode: project, fields: [...]}`；`project` 中的字段只能选择 provider
+`durability.checkpoint_fields` 预先声明的稳定别名。
+
 ### 5.2 `script`
 
 `runtime` 为 `python|javascript|shell`；`source` 和 `entrypoint` 必须且只能提供一个。`inputs` 是唯一的数据输入，stdout 结果必须通过 `output_schema`。`sandbox` 默认 deny，可显式限定 network allowlist、filesystem paths、environment allowlist 和 `max_output_bytes`。
@@ -181,6 +187,7 @@ Manifest 使用相同 `apiVersion`，`kind: CapabilityManifest`，并包含：
 - 可选 `runtime`：`kind`、`protocol`、进程/WASM `entrypoint`、args、platforms、host version 与 shutdown grace；
 - 可选 provider 级 `permissions`；
 - `actions` map，每项含 `contract_major`、相互独立的默认 `effect` 与 `risk`、`input_schema`、`output_schema`，并可声明 permissions、timeout 和结构化 `errors`。Workflow action 和 Manifest action 都把 `effect`、`risk` 作为同级字段；Manifest 仅将 effect 的字段命名为 `default_class`，表示 provider 默认值。
+- 为受限 durable read-only 通道声明的 action 还必须显式提供 input/output/error 均为 `public` 的 `sensitivity`，以及 `durability.checkpoint_fields`。每个 checkpoint 字段由稳定别名、有界非根 JSON Pointer、字段 schema 和 `error|omit|null` 缺失策略组成；别名与 pointer 必须唯一，`null` 必须能通过字段 schema。
 
 每项 error contract 的 `effect` 为 `not_applied|applied|unknown`。Manifest 只声明能力，不授予权限；workflow 声明、manifest、provider 动态判断和 trusted host policy 必须全部允许。第三方 native provider 必须进程外运行，不能 import/dlopen 到 trusted host。
 
@@ -200,7 +207,7 @@ Manifest 使用相同 `apiVersion`，`kind: CapabilityManifest`，并包含：
 | Windows UIA | 进程 driver：list/snapshot/find/focus/invoke/set_value/type_text；待 Windows 真机资格测试 | 完整 driver |
 | macOS AX | 已实现进程 driver、显式 type_text 与自包含真机测试包；真实 Mac TCC 结果待回传 | 签名稳定且经过应用矩阵验证的正式 driver |
 | Linux AT-SPI | KDE/X11 driver；本机 GTK3 与 Qt 5 Widgets 自有 fixture 已验证语义读取、写动作与显式 XTEST type_text；Konsole 与 System Settings 初始窗口的只读矩阵已通过 | 按 desktop/session profile 扩展 Dolphin、更多 QML 页面、多窗口、动态页面与受控写动作 |
-| durable execution | JSON-only CLI 支持 start/resume/status/list/events/pause/cancel；仅允许串行、无 action/script、无敏感字段的计划，并只从顶层步骤之间恢复 | 带字段级脱敏与动作 reconciliation 的通用恢复 |
+| durable execution | JSON-only CLI 支持 start/resume/status/list/events/pause/cancel；默认拒绝 action，显式 `--durable-actions read-only` 后仅允许顶层隐式串行、无条件、无 pre/post/retry/handler/finally 的单次只读 action。双方 sensitivity 必须为 public，输出须按 provider `checkpoint_fields` 做 `project|omit`；`action_intent` v2 在 dispatch 前持久化并可安全重放。script、写 action、敏感值和复杂 action 控制流仍拒绝 | 写 action reconciliation、完整 taint tracking 与更通用的恢复 |
 | OCR engine | 显式 Tesseract 图片 provider；不自行截图 | 受控 frame/capture provenance |
 
 运行时遇到合法但未实现的规范字段必须明确返回 `CAPABILITY.MISSING`、`DESCRIPTOR.VERSION_UNSUPPORTED` 或实现定义的结构化 unsupported 错误；不得静默忽略。
@@ -213,4 +220,18 @@ Manifest 使用相同 `apiVersion`，`kind: CapabilityManifest`，并包含：
 
 真实 provider 对“没有识别到任何文本”返回不可重试的 `OCR.NO_TEXT`，而不是空成功结果；示例通过只匹配该 code 的工作流级 `on_error` 显式返回 `decision: no_response`，其他错误继续失败。图片字节和解码尺寸/像素/帧数必须有硬上限；Pillow decompression-bomb 与损坏图片必须转换为稳定的结构化错误。Linux 引擎至少应施加地址空间、CPU、输出文件、打开文件数和进程数限制，但进程分离和 `prlimit` 不等价于文件系统、网络或 syscall 沙箱；macOS/Windows 没有等价宿主隔离时应默认 fail-closed，只有操作者明确确认外部沙箱责任后才允许启动，且不得宣称独立进程本身就是完整沙箱。
 
-当前 durable journal 只依据 descriptor 的 `inputs/outputs.sensitive` 声明做持久化资格判断，不会自动追踪 action 产生的原始 OCR 文本。为 fail-closed，真实 OCR 示例将图片路径与目标文本标为 `sensitive: true`，因此 durable start 必须在创建 run 前拒绝；metadata 中的 `ai-auto-desktop.dev/durable-eligibility` annotation 仅是可读提示，不代替敏感声明。待 durable 层具备字段级脱敏、秘密引用和 OCR 输出污点策略后，才能设计新的可持久 OCR 示例。
+当前 durable journal 不做完整 taint tracking。它依据 descriptor 的 `inputs/outputs.sensitive`
+声明拒绝敏感 workflow，并在可选的 read-only action 通道中同时要求 provider 与 descriptor
+把 action input/output/error 明确标为 `public`。run 创建前会校验 canonical manifest、有效
+`read_only` effect、非空且全为 `not_applied` 的错误合约、sensitivity、checkpoint projection 和
+静态 policy；但不会预求值可能引用前序 `steps.<id>.output` 的动态 `with`。dispatch 前必须先
+持久化 `action_intent` v2，其中只包含 operation/attempt/deadline 与 provider、contract、
+projection、input binding 摘要；恢复时重新验证后才可重放。完成后只把 provider 白名单允许且
+descriptor 选中的投影字段写入 checkpoint，`omit` 不保存输出，原始 provider 响应不得落盘。
+
+真实 OCR 示例将图片路径与目标文本标为 `sensitive: true`，因此即使启用
+`--durable-actions read-only`，durable start 必须在创建 run 前拒绝；metadata 中的
+`ai-auto-desktop.dev/durable-eligibility` annotation 仅是可读提示，不代替敏感声明。待 durable
+层具备秘密引用和 OCR 输出污点策略后，才能设计新的可持久 OCR 示例。pause/cancel 与 action
+completion 必须使用期望 `desiredState` 的 CAS，避免竞态覆盖 operator 控制意图或重放已完成的
+只读 observation。

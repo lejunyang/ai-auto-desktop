@@ -21,7 +21,7 @@
 |---|---|---|
 | 描述符 | JSON/YAML 都归一到唯一形状：`apiVersion: ai-auto-desktop.dev/v1alpha1`、`kind: Workflow`、`metadata.name`；严格校验并编译为冻结模型 | 版本化 canonical schema、迁移工具、签名与兼容策略 |
 | 表达式 | 白名单 Python AST 的只读解释器，不使用 `eval/exec`，禁止所有函数和方法调用 | 保持无 I/O、有限成本、跨语言一致的表达式语义与测试向量 |
-| 步骤与控制流 | `action/set/block/fail/return/script`、`if/switch/foreach/while`、`on_error/finally`；sibling DAG 已支持有界只读并发；受限串行计划支持顶层安全点恢复；script 默认拒绝 | action/script reconciliation 与更通用的可恢复计划状态机 |
+| 步骤与控制流 | `action/set/block/fail/return/script`、`if/switch/foreach/while`、`on_error/finally`；sibling DAG 已支持有界只读并发；受限串行计划支持顶层安全点恢复，显式 opt-in 后支持具备投影契约的顶层只读 action 与 `action_intent` v2 重放；script 默认拒绝 | 写 action/script reconciliation 与更通用的可恢复计划状态机 |
 | 状态 | run 结果为 `succeeded/failed/timed_out/cancelled/unknown_effect`，step 另有 `skipped` | 冻结跨语言状态兼容与迁移规则 |
 | 执行能力 | 已有 Windows UIA、macOS AX、Linux KDE/X11 AT-SPI 进程 driver、三端显式文本输入后备和显式图片 OCR；资格范围分别记录 | 真实应用矩阵、受控截图与应用专用 adapter |
 | IPC | stdio NDJSON v0，便于调试和跨语言实现；已校验 manifest schema/action major，尚无完整 wire version 协商 | 保留语义兼容层，迁移到 Protobuf/CBOR 等 IDL + named pipe/Unix socket |
@@ -179,9 +179,42 @@ operator 不持有 runner 的 bearer token，也不应为提交控制意图而�
 
 JournalStore 只执行调用方给出的敏感标记和存储不变量，不通过内容猜测 secret。RunService 是可信持久化入口：它必须按 descriptor 的 input/output `sensitive` 声明显式传递标记并 fail closed。当前机制不是完整 taint tracking；未实现跨变量、插件响应与派生值的自动敏感传播前，不得宣称能自动防止所有 secret 泄漏。
 
-当前 durable executor 只接受 `max_concurrency=1` 且顶层未显式声明 `depends_on` 的 legacy 串行计划，其他 DAG 在创建 run 前失败关闭。v0 还保守拒绝包含 action 或 script 的计划，避免把未经完整 taint tracking 的插件/脚本返回值写入 checkpoint；这意味着当前 durable 纵向切片只覆盖由受信任描述符产生的控制流、变量、失败与 return，而不是 OCR 或桌面动作。它复用 WorkflowRunner 的单顶层 segment API；一个顶层控制流节点连同其嵌套步骤、handler 和 finally 是不可拆分的执行段。checkpoint 记录 schema/runtime 版本、canonical descriptor SHA-256、phase、下一顶层索引、已消耗 attempt 数、首次启动时确定的绝对 deadline，以及 variables、表达式可见 step context 和诊断 step records。暂停时间仍消耗该绝对 deadline，resume 不重置预算。
+当前 durable executor 默认使用 `deny` 模式；CLI 只有在 `start` 与 `resume` 显式传入
+`--durable-actions read-only` 时才启用受限 action 通道。两种模式都只接受
+`max_concurrency=1` 且顶层未显式声明 `depends_on` 的 legacy 串行计划，其他 DAG 在创建 run 前
+失败关闭。opt-in action 只能位于顶层，必须有效为 `read_only`，并且是无 `if`、
+`precondition`、`postcondition`、retry、step handler 或 step `finally` 的单次 attempt。嵌套
+action、写 action、script，以及声明敏感 input/output 的 workflow 仍被拒绝。
 
-每个顶层段 dispatch 前先原子写入 `in_top_level_step` checkpoint，整个 step 及其 finally 完成后再原子写入 `between_top_level_steps`。进程崩溃后只允许从后者恢复；看到 `in_top_level_step` 或 `finalizing` 时不得重放，必须零 dispatch 地终结为 `UNKNOWN_EFFECT`。进入 workflow finally 前也先写 `finalizing`，避免崩溃后重复 cleanup。lease 目前只在这些持久边界同步 heartbeat；它保证旧 owner 不能继续写 journal，但不等于能异步强杀已经进入插件或 OS 的调用。
+durable action 的 provider manifest 与 descriptor step 都必须把 input、output、error
+sensitivity 显式声明为 `public`。manifest action 还必须给出稳定的
+`durability.checkpoint_fields`，每个字段以有界 JSON Pointer、schema 和缺失策略定义；descriptor
+则通过 `checkpoint.output.mode` 明确选择 `project` 的 provider 白名单字段或 `omit`。创建 run 前
+会验证 canonical manifest、有效 `read_only` effect、非空且全为 `not_applied` 的错误合约、双方
+sensitivity、checkpoint 投影和与输入无关的静态 policy。预检不会求值 action 的 `with`，因此
+它可以引用前序顶层 step 的动态输出；实际输入只在该 action 即将执行时求值并做 schema 与
+policy 校验。
+
+普通顶层控制流节点继续复用 WorkflowRunner 的单顶层 segment API；一个节点连同其嵌套步骤、
+handler 和 finally 是不可拆分的执行段。checkpoint 记录 schema/runtime 版本、canonical descriptor
+SHA-256、phase、下一顶层索引、已消耗 attempt 数、首次启动时确定的绝对 deadline，以及
+variables、表达式可见 step context 和诊断 step records。暂停时间仍消耗该绝对 deadline，resume
+不重置预算。
+
+普通顶层段在执行前先原子写入 `in_top_level_step` checkpoint，完成后写入
+`between_top_level_steps`。符合条件的只读 action 会在 provider dispatch 前额外原子持久化
+`action_intent` v2：它记录 operation、step、已预留 attempt、原始 dispatch deadline，以及
+provider/contract/projection/input binding 摘要，不记录原始 action input。恢复会重新校验这些绑定，
+并只对该只读 intent 执行安全重放；篡改、过期或不匹配的 intent 均在 dispatch 前失败关闭。action
+成功后，表达式上下文、checkpoint 与最终输出只能看到 `project` 选中的字段；`omit` 产生空输出，
+原始 provider 响应不会持久化。
+
+没有合法 `action_intent` 的 `in_top_level_step` 或 `finalizing` 仍不得重放，必须零 dispatch 地
+终结为 `UNKNOWN_EFFECT`；进入 workflow finally 前也先写 `finalizing`，避免崩溃后重复 cleanup。
+action intent、dispatch 授权、完成 checkpoint 与终态提交都用期望 `desiredState` 做 CAS。若
+pause/cancel 与完成并发，CAS 冲突会转入相应控制路径，不覆盖 operator 意图，也不会为已完成的
+只读 observation 再次 dispatch。lease 目前只在这些持久边界同步 heartbeat；它保证旧 owner 不能
+继续写 journal，但不等于能异步强杀已经进入插件或 OS 的调用。
 
 ## 9. 状态与结构化错误
 

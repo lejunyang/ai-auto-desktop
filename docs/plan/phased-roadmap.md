@@ -21,9 +21,9 @@
 - stdio NDJSON 长驻 process plugin 和确定性 fixture，用于成功、retryable error、永久失败、睡眠、mock OCR 与 mock desktop invoke；另有真实 Tesseract process provider，只接受调用方显式提供的图片。
 - `probe` 命令只读检查 Windows UIA、macOS Accessibility/Screen Capture 和 Linux AT-SPI/X11/Wayland/portal/libei/uinput 前置条件，不请求权限、不截图、不注入输入。
 - script 默认拒绝；`--allow-scripts` 显式启用后仅在具备 bubblewrap + `prlimit` 的 Linux 上运行，其他平台返回 `SCRIPT.SANDBOX_UNAVAILABLE`。
-- SQLite journal、owner lease 和受限 durable executor 已串通：`start/resume/status/list/events/pause/cancel` 使用 JSON-only CLI，只从顶层步骤之间的安全检查点恢复；不安全阶段恢复为 `UNKNOWN_EFFECT`。当前为避免未追踪的敏感插件输出进入 checkpoint，durable v0 拒绝 action/script。
+- SQLite journal、owner lease 和受限 durable executor 已串通：`start/resume/status/list/events/pause/cancel` 使用 JSON-only CLI。action 默认拒绝；`start` 和 `resume` 仅在显式使用 `--durable-actions read-only` 时接受顶层、隐式串行、无条件、无 pre/postcondition、无 retry/handler/finally 的单次 `read_only` action。provider 与 descriptor 必须把 input/output/error 声明为 `public`，并通过 provider `checkpoint_fields` 与 descriptor `project|omit` 只持久化批准的投影。dispatch 前持久化 `action_intent` v2，恢复时校验绑定后可安全重放只读 action；其他不安全阶段仍恢复为 `UNKNOWN_EFFECT`。script、写 action 与敏感数据继续拒绝。
 
-尚未实现或尚未证明：Windows/macOS 真机执行结果与真实应用矩阵、任意 KDE 应用资格；可靠的 Windows 后代进程树终止；完整 wire 协议版本协商；跨进程 single-writer session manager；带 action/script、字段级脱敏与 reconciliation 的通用持久恢复；系统 secret store；签名插件；真实截图；taint tracking、确认 token 与完整 policy enforcement；安装器和权限引导。当前已有 Windows Win32 fixture/手动 CI 入口、macOS AX driver/真机回传包，以及 Linux KDE/X11 AT-SPI driver；本机已用自有 GTK3 和 Qt 5 Widgets fixture 真实验证语义树、语义写动作和显式 XTEST 文本输入。当前 OCR 已能处理显式图片，但尚未接入受控截图/frame provenance，因此不能视为桌面视觉闭环。M0 已具备 manifest/action contract、`postcondition.observe` 和基础 action risk policy 校验，其任务是继续把 v0 收敛成可验证基线，而不是扩大产品宣称。
+尚未实现或尚未证明：Windows/macOS 真机执行结果与真实应用矩阵、任意 KDE 应用资格；可靠的 Windows 后代进程树终止；完整 wire 协议版本协商；跨进程 single-writer session manager；写 action、script、敏感值和复杂控制流的通用持久恢复与 reconciliation；系统 secret store；签名插件；真实截图；taint tracking、确认 token 与完整 policy enforcement；安装器和权限引导。当前已有 Windows Win32 fixture/手动 CI 入口、macOS AX driver/真机回传包，以及 Linux KDE/X11 AT-SPI driver；本机已用自有 GTK3 和 Qt 5 Widgets fixture 真实验证语义树、语义写动作和显式 XTEST 文本输入。当前 OCR 已能处理显式图片，但尚未接入受控截图/frame provenance，因此不能视为桌面视觉闭环。M0 已具备 manifest/action contract、`postcondition.observe` 和基础 action risk policy 校验，其任务是继续把 v0 收敛成可验证基线，而不是扩大产品宣称。
 
 ## 3. M0：冻结 Python 运行时 v0 合约
 
@@ -44,6 +44,8 @@
 - 两个同名候选时不 dispatch；非幂等请求只 dispatch 一次，dispatch 后 timeout/EOF 得到 `UNKNOWN_EFFECT`。
 - retry 只发生在 `retryable=true` 且 read-only/idempotent 的步骤；attempt、退避和总 deadline 均有上限。
 - `finally` 在成功、失败、超时、取消路径运行，cleanup 错误进入 `suppressed`，不覆盖根因。
+- durable action 默认拒绝；显式只读模式只接受公开、单次、顶层 action，并在创建 run 前验证 manifest/effect/errors/sensitivity/projection/static policy。`action_intent` v2 必须先于 dispatch 持久化，恢复只能重放绑定未变的 read-only action，checkpoint 不得包含原始 provider 输出。
+- pause/cancel 与 action completion 通过 `desiredState` CAS 协调；竞态不能丢失 operator 意图，也不能重复派发已完成的只读 action。
 - 文档、样例和测试明确标注所有桌面/OCR 结果均为 fixture，不是 OS 支持证明。
 
 ### 非目标

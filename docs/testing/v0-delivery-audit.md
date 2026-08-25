@@ -23,14 +23,18 @@
 | DAG、并发与重试 | sibling DAG 编译和 runtime；仅并发经 manifest 证明的非桌面 read-only action | 已验证 |
 | 脚本执行 | `script.py`；Linux 仅在 bubblewrap + prlimit 可用时启用，其他平台失败关闭 | v0 边界内已验证 |
 | 超时、错误和清理 | 绝对 deadline、父子 deadline、结构化 `AutomationError`、`on_error/finally`、`UNKNOWN_EFFECT` | 已验证 |
-| 可恢复 run 与日志 | SQLite WAL journal、owner lease、`DurableExecutor`、JSON-only `start/resume/status/list/events/pause/cancel` | 受限 v0 已验证 |
-| 安全恢复 | 只从 `between_top_level_steps` 恢复；`in_top_level_step/finalizing` 零重放并终结为 `unknown_effect` | 已验证 |
-| durable 敏感边界 | v0 拒绝 action/script 和声明 sensitive 的输入/输出，避免未跟踪内容进入 checkpoint | 已验证；通用 action reconciliation 待后续 |
+| 可恢复 run 与日志 | SQLite WAL journal、owner lease、`DurableExecutor`、JSON-only `start/resume/status/list/events/pause/cancel`；action 默认 deny，CLI 可显式选择 `--durable-actions read-only` | 受限 v0 已验证 |
+| 安全恢复 | 普通计划从 `between_top_level_steps` 恢复；合法 `action_intent` v2 可在重新校验绑定后重放只读 action；其他 `in_top_level_step/finalizing` 零重放并终结为 `unknown_effect` | 已验证 |
+| durable 只读 action 边界 | 仅顶层隐式串行、无 `if`/pre/post/retry/handler/finally 的单次 `read_only` action；provider 与 descriptor input/output/error 均须为 `public`，provider 声明稳定 `checkpoint_fields`，descriptor 显式 `project|omit` | 已验证；写 action 与复杂控制流 reconciliation 待后续 |
+| durable 最小持久化 | run 创建前验证 manifest/effect/errors/sensitivity/projection/static policy，但不预求值引用前序 step 的动态输入；dispatch 前持久化不含原始输入的 intent v2，完成后只保存批准的投影，原始 provider 响应不落 journal | 已验证 |
+| durable 控制竞态 | pause/cancel 请求与 action intent、dispatch 授权、完成 checkpoint、终态提交均以 `desiredState` CAS 协调 | 已验证；不会丢失控制意图或重复派发已完成读操作 |
+| durable 敏感边界 | v0 继续拒绝 script、写 action、敏感 workflow 输入/输出，以及 provider 或 descriptor 标记敏感的 action 输入/输出/错误 | 已验证；完整 taint tracking 待后续 |
 | 显式 OCR | `vision.ocr.recognize@1`、JSON/YAML 示例、字面匹配和置信度分支；无截图/点击 | 已验证 |
 | OCR 资源边界 | 64 MiB、20k 单边、40 MP、单帧、Pillow 完整解码；Linux Tesseract prlimit | 已验证 |
 | Windows 显式输入 | UIA fresh resolve + protected/focus/前台 HWND/PID + 分批 Unicode SendInput | 契约和原生 fixture 已就绪；真实 Windows 结果待手动 CI |
 | macOS 显式输入 | AX fresh resolve + Secure Event Input + focus/frontmost + CGEvent progress marker | 契约和真机套件已就绪；真实 Mac 结果待回传 |
 | Linux 显式输入 | AT-SPI fresh resolve + PID/focus + 固定路径 XTest helper；fresh snapshot 验证 | GTK3/Qt5 在本机 KDE/X11 和私有 Xvfb 均通过 |
+| Linux capability probe | AT-SPI bus、根窗口有界 `xprop` X11 round-trip、portal/libei/uinput/Wayland 分项报告 | 本机 `available=3/degraded=1/unavailable=2/unknown=0`；X11 误阴性已修复 |
 | KDE 真实应用矩阵 | `tests/linux/kde_app_qualifier.py` 只启动自有进程、按精确 PID 抓取聚合树；`docs/testing/kde-x11-qualification.md` 记录证据 | Konsole 与 System Settings 只读观察通过；未执行写动作 |
 | Windows 测试门禁与证据 | `.github/workflows/ci.yml` 仅在 `workflow_dispatch` 且 `run_windows_native=true` 时运行完整测试；`tests/windows/run-native-fixture.ps1` 生成 JSON，失败时也上传并保留 30 天 | 静态契约已验证；本轮未触发，无 Windows 真机结论 |
 | 虚拟机可行性 | `docs/testing/virtual-machine-capability.md` | 当前主机无 `/dev/kvm`/嵌套虚拟化；Windows 用远端 runner，macOS 用 Apple 硬件 |
@@ -59,10 +63,11 @@
 
 ## 4. 验证记录
 
-- 当前 revision 的全量 Python 测试：383 项通过，9 项因平台或当前会话条件跳过；下列平台证据与确定性契约测试分开计算。
+- 当前 revision 的全量 Python 测试结果以仓库全量测试命令的最新输出为准；下列平台证据与确定性契约测试分开计算，不在本文硬编码会随用例增长而失效的总数。
 - Linux 本机：Debian 12、KDE Plasma 5.27.5、Qt 5.15.8、X11 `DISPLAY=:10.0`。
 - Linux 自有 fixture：GTK3 和 Qt5 的 snapshot/find/focus/语义写动作通过；显式 XTest UTF-8 输入后由 fresh AT-SPI snapshot 观察通过。
 - Linux 隔离环境：私有 Xvfb + 私有 session/AT-SPI bus 的 GTK3/Qt5 输入用例通过。
+- Linux capability probe：同一 KDE/X11 会话中 `linux.at_spi`、`linux.x11` 和 `linux.remote_desktop_portal` 为 `available`；`linux.uinput=degraded`，Wayland/libei 不可用。X11 查询使用单个根窗口属性，避免完整 `xdpyinfo` 输出超过通用子进程上限。
 - Linux 真实应用只读矩阵：Konsole 22.12.3 的 352 个节点、System Settings 5.27.5 的 256 个节点均通过精确 PID 选择和未截断快照；写动作派发数为零，详细聚合指标见 `docs/testing/kde-x11-qualification.md`。
 - Windows：跨平台契约、ctypes ABI 和 CI artifact 静态契约测试通过；Windows-only fixture 在非 Windows 主机跳过，远端 CI 未触发。
 - macOS：driver/testkit 静态与协议测试通过，源码包可复现；37 项回传归档与 testkit 契约测试通过。该结果只验证 Linux 上的验真逻辑，当前 Linux 主机无法编译或执行 Apple framework。
@@ -80,5 +85,5 @@
 
 1. 收集 Mac 与 Windows 的真实平台证据。
 2. 把现有 KDE 只读矩阵扩展至 Dolphin、更多 QML 页面、多窗口与动态页面，并另行验证受控写动作；继续记录 `supported/unsupported/error`，不把未注册 AT-SPI 记作通过。
-3. 为 durable action 增加字段级 checkpoint projection/redaction、显式 reconciliation contract 与 single-desktop-writer 后，再解除 v0 对 action/script 的保守拒绝。
+3. 在现有 durable read-only projection 与 `action_intent` v2 基础上，继续设计写 action 的显式 reconciliation、敏感值传播与 single-desktop-writer；这些能力完成前，不解除对写 action、script、敏感数据及复杂 action 控制流的保守拒绝。
 4. 增加用户介入检测、确认 token、secret store、签名/发布链和真实应用 SLO；这些均不属于当前纵向切片已完成能力。

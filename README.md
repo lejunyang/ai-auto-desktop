@@ -135,6 +135,19 @@ python -m ai_auto_desktop resume demo workflow.yaml --journal runs.sqlite3
 python -m ai_auto_desktop events demo --journal runs.sqlite3
 ```
 
+持久执行默认拒绝所有 action。只有在 `start` 和后续 `resume` 时显式传入
+`--durable-actions read-only`，才会启用受限的只读 action 通道；例如还需按普通运行方式
+注册对应插件：
+
+```bash
+python -m ai_auto_desktop start readonly.yaml --journal runs.sqlite3 \
+  --run-id read-demo --durable-actions read-only \
+  --plugin records='python path/to/read_only_provider.py'
+python -m ai_auto_desktop resume read-demo readonly.yaml --journal runs.sqlite3 \
+  --durable-actions read-only \
+  --plugin records='python path/to/read_only_provider.py'
+```
+
 Python API 示例：
 
 ```python
@@ -148,10 +161,26 @@ with JournalStore("runs.sqlite3") as journal:
 
 `request_pause`、`request_resume` 和 `request_cancel` 只原子记录 operator 的期望；
 runner 在持有有效 owner lease 的安全点应用状态。暂停会原子释放 lease，恢复后必须重新
-claim。当前受限 v0 只接受 `max_concurrency=1`、顶层隐式串行链，且保守拒绝 `action`、
-`script` 及敏感输入/输出；它只从 `between_top_level_steps` 检查点恢复。若进程在
-`in_top_level_step` 或 `finalizing` 阶段崩溃，恢复会零派发地终结为 `unknown_effect`，不会重放
-可能产生副作用的步骤。原始绝对 deadline 与已消耗 attempt 数不会因恢复而重置。
+claim。状态完成与并发的暂停/取消请求都以 `desiredState` 做 CAS，避免覆盖 operator 的控制
+意图。当前受限 v0 只接受 `max_concurrency=1`、顶层未显式声明 `depends_on` 的隐式串行链。
+即使启用只读通道，action 也必须是顶层、无条件且只有一次 attempt，不能带 `if`、
+`precondition`、`postcondition`、retry、step handler 或 step `finally`；嵌套 action、script、
+非 `read_only` action 及敏感输入/输出仍会失败关闭。
+
+可持久 action 要求 provider manifest 中的 action 合约和 descriptor action 都将 input、output、
+error sensitivity 显式声明为 `public`。provider 还要声明稳定的
+`durability.checkpoint_fields` 白名单，descriptor 必须通过 `checkpoint.output` 选择 `project`
+字段或 `omit` 输出。创建 run 前会验证 manifest、有效 effect、错误合约、sensitivity、投影和
+静态 policy；错误合约必须非空且全部声明为 `not_applied`。预检不会提前求值可能引用前序
+`steps.<id>.output` 的动态 `with`；实际输入在派发前求值并校验。
+
+符合条件的 action 会在 provider dispatch 前持久化 `action_intent` v2；其中只保存 operation、
+attempt、deadline 和 provider/contract/projection/input binding 摘要，不保存原始输入。恢复时会
+重新验证绑定，并可安全重放只读 action。成功后只把 `project` 选中的字段写入 checkpoint，
+`omit` 则不保存 provider 输出；原始响应不会进入持久状态。普通
+`between_top_level_steps` 仍是安全恢复点，而没有合法 intent 的 `in_top_level_step` 或
+`finalizing` 仍会零派发地终结为 `unknown_effect`。原始绝对 deadline 与已消耗 attempt 数不会
+因恢复而重置。
 
 ## 进程插件协议
 
@@ -164,7 +193,9 @@ claim。当前受限 v0 只接受 `max_concurrency=1`、顶层隐式串行链，
 当前范围包含 Windows UIA、macOS AX 与 Linux KDE/X11 AT-SPI 纵向切片，但尚未完成
 Windows/macOS 真机应用矩阵或任意 KDE 应用的产品级资格验证。运行时已有 SQLite run/event
 journal、owner lease fencing，以及受限串行计划在顶层安全点的 checkpoint 恢复；控制仍是
-安全点生效的合作式机制，已派发的 OS/插件调用不能被异步强杀。DAG runtime 会并发独立的非桌面
+安全点生效的合作式机制，已派发的 OS/插件调用不能被异步强杀。durable 模式默认拒绝 action，
+但显式 opt-in 后可执行并恢复经过投影约束的顶层只读 action；写 action、script 和敏感数据仍
+拒绝。DAG runtime 会并发独立的非桌面
 `read_only` action，其余写动作与控制流保持全局独占。系统 secret store、确认 token、完整
 污点传播和跨进程 single-desktop-writer 仍未实现。v0 宿主已经执行声明式风险/权限检查，
 校验 Manifest 与 action 输入输出契约，并可通过 `postcondition.observe` 获取动作后真实观察。
