@@ -228,6 +228,69 @@ bool FocusBelongsToPid(Display *display, unsigned long expected_pid, Atom pid_at
     return owner.has_value() && owner.value() == expected_pid;
 }
 
+bool ParseInt(std::string_view value, int *out) {
+    if (value.empty() || out == nullptr) {
+        return false;
+    }
+    int sign = 1;
+    std::size_t index = 0;
+    if (value[0] == '-') {
+        sign = -1;
+        index = 1;
+    }
+    if (index >= value.size()) {
+        return false;
+    }
+    long long parsed = 0;
+    for (; index < value.size(); ++index) {
+        const char item = value[index];
+        if (item < '0' || item > '9') {
+            return false;
+        }
+        parsed = parsed * 10 + static_cast<long long>(item - '0');
+        if (parsed > std::numeric_limits<int>::max()) {
+            return false;
+        }
+    }
+    parsed *= sign;
+    if (parsed < std::numeric_limits<int>::min() ||
+        parsed > std::numeric_limits<int>::max()) {
+        return false;
+    }
+    *out = static_cast<int>(parsed);
+    return true;
+}
+
+bool WindowAtPointBelongsToPid(Display *display, int x, int y, unsigned long expected_pid,
+                               Atom pid_atom) {
+    Window root = DefaultRootWindow(display);
+    Window target = None;
+    Window parent = root;
+    while (true) {
+        Window child_return = None;
+        int child_x = 0;
+        int child_y = 0;
+        g_x_error = false;
+        const Bool translated = XTranslateCoordinates(
+            display, root, parent, x, y, &child_x, &child_y, &child_return);
+        XSync(display, False);
+        if (!translated || g_x_error) {
+            return false;
+        }
+        if (child_return == None) {
+            target = parent;
+            break;
+        }
+        target = child_return;
+        parent = child_return;
+    }
+    if (target == None) {
+        return false;
+    }
+    const auto owner = WindowPid(display, target, pid_atom);
+    return owner.has_value() && owner.value() == expected_pid;
+}
+
 struct KeyStroke {
     KeyCode keycode = 0;
     bool shift = false;
@@ -322,14 +385,44 @@ std::optional<KeyPlan> BuildKeyPlan(
 }  // namespace
 
 int main(int argc, char **argv) {
-    if (argc != 6 || std::string_view(argv[1]) != "type-text" ||
-        std::string_view(argv[2]) != "--expected-pid" ||
-        std::string_view(argv[4]) != "--deadline-monotonic-ns") {
+    if (argc < 2) {
         EmitError("invalid_arguments", "arguments", false);
         return kExitInvalid;
     }
-    const auto expected_pid = ParseUnsigned(argv[3]);
-    const auto deadline_ns = ParseUnsigned(argv[5]);
+    const std::string_view command(argv[1]);
+    std::optional<std::uint64_t> expected_pid;
+    std::optional<std::uint64_t> deadline_ns;
+    std::optional<int> click_x;
+    std::optional<int> click_y;
+    if (command == "type-text") {
+        if (argc != 6 || std::string_view(argv[2]) != "--expected-pid" ||
+            std::string_view(argv[4]) != "--deadline-monotonic-ns") {
+            EmitError("invalid_arguments", "arguments", false);
+            return kExitInvalid;
+        }
+        expected_pid = ParseUnsigned(argv[3]);
+        deadline_ns = ParseUnsigned(argv[5]);
+    } else if (command == "pointer-click") {
+        if (argc != 10 || std::string_view(argv[2]) != "--expected-pid" ||
+            std::string_view(argv[4]) != "--x" || std::string_view(argv[6]) != "--y" ||
+            std::string_view(argv[8]) != "--deadline-monotonic-ns") {
+            EmitError("invalid_arguments", "arguments", false);
+            return kExitInvalid;
+        }
+        expected_pid = ParseUnsigned(argv[3]);
+        deadline_ns = ParseUnsigned(argv[9]);
+        int parsed_x = 0;
+        int parsed_y = 0;
+        if (!ParseInt(argv[5], &parsed_x) || !ParseInt(argv[7], &parsed_y)) {
+            EmitError("invalid_arguments", "arguments", false);
+            return kExitInvalid;
+        }
+        click_x = parsed_x;
+        click_y = parsed_y;
+    } else {
+        EmitError("invalid_arguments", "arguments", false);
+        return kExitInvalid;
+    }
     if (!expected_pid.has_value() || expected_pid.value() == 0 ||
         expected_pid.value() > static_cast<std::uint64_t>(INT_MAX) ||
         !deadline_ns.has_value()) {
@@ -345,24 +438,27 @@ int main(int argc, char **argv) {
         return kExitTargetMismatch;
     }
 
-    std::string input;
-    input.reserve(kMaxInputBytes);
-    char buffer[1024];
-    while (std::cin.good()) {
-        std::cin.read(buffer, sizeof(buffer));
-        const std::streamsize count = std::cin.gcount();
-        if (count > 0) {
-            input.append(buffer, static_cast<std::size_t>(count));
-            if (input.size() > kMaxInputBytes) {
-                EmitError("input_too_large", "text_preflight", false);
-                return kExitInvalid;
+    std::optional<std::vector<std::uint32_t>> codepoints;
+    if (command == "type-text") {
+        std::string input;
+        input.reserve(kMaxInputBytes);
+        char buffer[1024];
+        while (std::cin.good()) {
+            std::cin.read(buffer, sizeof(buffer));
+            const std::streamsize count = std::cin.gcount();
+            if (count > 0) {
+                input.append(buffer, static_cast<std::size_t>(count));
+                if (input.size() > kMaxInputBytes) {
+                    EmitError("input_too_large", "text_preflight", false);
+                    return kExitInvalid;
+                }
             }
         }
-    }
-    const auto codepoints = DecodeUtf8(input);
-    if (!codepoints.has_value() || codepoints->empty()) {
-        EmitError("unsupported_text", "text_preflight", false);
-        return kExitUnsupportedText;
+        codepoints = DecodeUtf8(input);
+        if (!codepoints.has_value() || codepoints->empty()) {
+            EmitError("unsupported_text", "text_preflight", false);
+            return kExitUnsupportedText;
+        }
     }
     if (DeadlineExpired(deadline_ns.value())) {
         EmitError("deadline_exceeded", "pre_dispatch", false);
@@ -397,6 +493,53 @@ int main(int argc, char **argv) {
             return kExitTargetMismatch;
         }
         usleep(5000);
+    }
+    if (command == "pointer-click") {
+        if (!click_x.has_value() || !click_y.has_value() ||
+            !WindowAtPointBelongsToPid(display, click_x.value(), click_y.value(),
+                                       expected_pid.value(), pid_atom)) {
+            XCloseDisplay(display);
+            EmitError("target_point_mismatch", "target_preflight", false);
+            return kExitTargetMismatch;
+        }
+        bool dispatch_started = false;
+        unsigned long event_count = 0;
+        auto finish_failure = [&](std::string_view code, std::string_view phase,
+                                  int pre_dispatch_exit) {
+            XSync(display, False);
+            XCloseDisplay(display);
+            EmitError(code, phase, dispatch_started);
+            return dispatch_started ? kExitUnknownEffect : pre_dispatch_exit;
+        };
+        if (DeadlineExpired(deadline_ns.value())) {
+            return finish_failure("deadline_exceeded", "pre_dispatch",
+                                  kExitTimeoutBeforeDispatch);
+        }
+        if (!FocusBelongsToPid(display, expected_pid.value(), pid_atom)) {
+            return finish_failure("focus_owner_changed", "target_preflight",
+                                  kExitTargetMismatch);
+        }
+        std::cout << "{\"event\":\"dispatch_started\"}" << std::endl;
+        dispatch_started = true;
+        g_x_error = false;
+        bool submitted = XTestFakeMotionEvent(display, -1, click_x.value(), click_y.value(), 1) != 0;
+        submitted = XTestFakeButtonEvent(display, 1, True, 1) != 0 && submitted;
+        submitted = XTestFakeButtonEvent(display, 1, False, 1) != 0 && submitted;
+        event_count += 3;
+        XSync(display, False);
+        if (!submitted || g_x_error) {
+            return finish_failure("x11_error", "pointer_dispatch", kExitUnknownEffect);
+        }
+        const bool final_error = g_x_error;
+        XCloseDisplay(display);
+        if (final_error) {
+            EmitError("x11_error", "post_dispatch", dispatch_started);
+            return dispatch_started ? kExitUnknownEffect : kExitUnavailable;
+        }
+        std::cout << "{\"ok\":true,\"dispatch_started\":"
+                  << (dispatch_started ? "true" : "false")
+                  << ",\"events\":" << event_count << "}" << std::endl;
+        return 0;
     }
 
     int minimum = 0;

@@ -972,7 +972,9 @@ class NativeIsolatedX11TypeTextTests(unittest.TestCase):
             build.stderr.decode("utf-8", errors="replace")[-2000:],
         )
 
-    def _run_isolated(self, runner: Path, fixture: Path) -> dict[str, object]:
+    def _run_isolated(
+        self, runner: Path, fixture: Path, mode: str = "--type-text"
+    ) -> dict[str, object]:
         completed = subprocess.run(
             [
                 shutil.which("dbus-run-session"),
@@ -981,7 +983,7 @@ class NativeIsolatedX11TypeTextTests(unittest.TestCase):
                 str(runner),
                 str(fixture),
                 str(DRIVER_PATH),
-                "--type-text",
+                mode,
             ],
             env=self.base_environment,
             stdin=subprocess.DEVNULL,
@@ -1067,6 +1069,34 @@ class NativeIsolatedX11TypeTextTests(unittest.TestCase):
         self.assertEqual(report["toolkit"], "gtk")
         self.assertEqual(report["input_injection"], "XTEST")
         self.assertTrue(report["type_text_observed"])
+        self.assertFalse(report["pointer_click_observed"])
+
+    def test_gtk3_pointer_click_is_observed_after_xtest_dispatch(self) -> None:
+        environment = _native_subprocess_environment(self.base_environment)
+        probe = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import gi; gi.require_version('Gtk', '3.0'); "
+                    "gi.require_version('Atspi', '2.0'); "
+                    "from gi.repository import Atspi, Gtk"
+                ),
+            ],
+            env=environment,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            timeout=5,
+        )
+        if probe.returncode != 0:
+            self.skipTest("GTK3/Atspi 2.0 依赖不可用")
+        self.base_environment.update(environment)
+        report = self._run_isolated(GTK_FIXTURE_RUNNER, FIXTURE_PATH, "--pointer-click")
+        self.assertEqual(report["toolkit"], "gtk")
+        self.assertEqual(report["input_injection"], "XTEST")
+        self.assertTrue(report["pointer_click_observed"])
+        self.assertFalse(report["type_text_observed"])
 
     def test_qt5_type_text_is_observed_after_xtest_dispatch(self) -> None:
         compiler = shutil.which("g++")
@@ -1112,6 +1142,53 @@ class NativeIsolatedX11TypeTextTests(unittest.TestCase):
         self.assertEqual(report["toolkit"], "Qt")
         self.assertEqual(report["input_injection"], "XTEST")
         self.assertTrue(report["type_text_observed"])
+        self.assertFalse(report["pointer_click_observed"])
+
+    def test_qt5_pointer_click_is_observed_after_xtest_dispatch(self) -> None:
+        compiler = shutil.which("g++")
+        pkg_config = shutil.which("pkg-config")
+        if compiler is None or pkg_config is None:
+            self.skipTest("Qt5 fixture 需要 g++ 与 pkg-config")
+        flags = subprocess.run(
+            [pkg_config, "--cflags", "--libs", "Qt5Widgets"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            check=False,
+            timeout=10,
+        )
+        if flags.returncode != 0:
+            self.skipTest("Qt5Widgets 开发包不可用")
+        executable = Path(self.temporary.name) / "qt_atspi_fixture"
+        compiled = subprocess.run(
+            [
+                compiler,
+                "-std=c++17",
+                "-O2",
+                "-fPIC",
+                str(QT_FIXTURE_SOURCE),
+                "-o",
+                str(executable),
+                *shlex.split(flags.stdout),
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=30,
+        )
+        self.assertEqual(
+            compiled.returncode,
+            0,
+            compiled.stderr.decode("utf-8", errors="replace")[-2000:],
+        )
+        report = self._run_isolated(QT_FIXTURE_RUNNER, executable, "--pointer-click")
+        self.assertEqual(report["toolkit"], "Qt")
+        self.assertEqual(report["input_injection"], "XTEST")
+        self.assertTrue(report["pointer_click_observed"])
+        self.assertFalse(report["type_text_observed"])
 
 
 if __name__ == "__main__":

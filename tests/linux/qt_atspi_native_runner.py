@@ -20,10 +20,19 @@ STATUS_INVOKED = "Qt fixture status invoked"
 
 
 def main() -> int:
-    if len(sys.argv) not in {3, 4} or (len(sys.argv) == 4 and sys.argv[3] != "--type-text"):
+    if len(sys.argv) not in {3, 4}:
         print(json.dumps({"status": "failed", "reason": "invalid_arguments"}))
         return 64
-    test_type_text = len(sys.argv) == 4
+    mode = "semantic"
+    if len(sys.argv) == 4:
+        flag = sys.argv[3]
+        if flag == "--type-text":
+            mode = "type_text"
+        elif flag == "--pointer-click":
+            mode = "pointer_click"
+        else:
+            print(json.dumps({"status": "failed", "reason": "invalid_arguments"}))
+            return 64
     executable = Path(sys.argv[1]).resolve()
     driver = Path(sys.argv[2]).resolve()
     environment = os.environ.copy()
@@ -153,7 +162,7 @@ def main() -> int:
         )["node"]
         if changed_node["value"] != changed:
             raise RuntimeError("set_text was not observed")
-        if test_type_text:
+        if mode == "type_text":
             stage = "invoke_type_text"
             initial_type_entry = find(snapshot(), type_entry_locator)["node"]
             if initial_type_entry["value"] != "":
@@ -201,27 +210,62 @@ def main() -> int:
                             f"text_nodes={text_nodes!r}; input_result={input_result!r}"
                         ) from exc
                     time.sleep(0.1)
-        stage = "invoke"
-        invoked = write("invoke", button_locator)
-        if invoked["backend_result"].get("native_action_name") != "Press":
-            raise RuntimeError("Qt button did not use exact Press action")
-        stop = time.monotonic() + 3
-        while True:
-            try:
-                status = find(
-                    snapshot(),
-                    {
-                        "role": "label",
-                        "name": STATUS_INVOKED,
-                        "toolkit_name": "Qt",
-                    },
+        if mode == "pointer_click":
+            stage = "invoke_pointer_click"
+            initial_button = find(snapshot(), button_locator)["node"]
+            if "pointer_click" not in initial_button["actions"]:
+                raise RuntimeError(
+                    f"Qt button did not qualify for pointer_click: {initial_button!r}"
                 )
-                if status["node"]["name"] == STATUS_INVOKED:
-                    break
-            except Exception:
-                if time.monotonic() >= stop:
-                    raise
-                time.sleep(0.1)
+            clicked = write(
+                "pointer_click",
+                button_locator,
+                button="left",
+                position="center",
+            )
+            input_result = clicked["backend_result"].get("input", {})
+            if input_result.get("native_interface") != "XTEST":
+                raise RuntimeError("pointer_click did not use the XTEST helper")
+        stage = "invoke"
+        if mode == "pointer_click":
+            stop = time.monotonic() + 3
+            while True:
+                try:
+                    status = find(
+                        snapshot(),
+                        {
+                            "role": "label",
+                            "name": STATUS_INVOKED,
+                            "toolkit_name": "Qt",
+                        },
+                    )
+                    if status["node"]["name"] == STATUS_INVOKED:
+                        break
+                except Exception:
+                    if time.monotonic() >= stop:
+                        raise
+                    time.sleep(0.1)
+        else:
+            invoked = write("invoke", button_locator)
+            if invoked["backend_result"].get("native_action_name") != "Press":
+                raise RuntimeError("Qt button did not use exact Press action")
+            stop = time.monotonic() + 3
+            while True:
+                try:
+                    status = find(
+                        snapshot(),
+                        {
+                            "role": "label",
+                            "name": STATUS_INVOKED,
+                            "toolkit_name": "Qt",
+                        },
+                    )
+                    if status["node"]["name"] == STATUS_INVOKED:
+                        break
+                except Exception:
+                    if time.monotonic() >= stop:
+                        raise
+                    time.sleep(0.1)
         print(
             json.dumps(
                 {
@@ -229,12 +273,17 @@ def main() -> int:
                     "toolkit": application["toolkit_name"],
                     "toolkit_version": application["toolkit_version"],
                     "actions": (
-                        ["focus", "set_text", "type_text", "invoke"]
-                        if test_type_text
-                        else ["focus", "set_text", "invoke"]
+                        ["focus", "pointer_click"]
+                        if mode == "pointer_click"
+                        else (
+                            ["focus", "set_text", "type_text", "invoke"]
+                            if mode == "type_text"
+                            else ["focus", "set_text", "invoke"]
+                        )
                     ),
-                    "input_injection": "XTEST" if test_type_text else False,
-                    "type_text_observed": test_type_text,
+                    "input_injection": "XTEST" if mode in {"type_text", "pointer_click"} else False,
+                    "type_text_observed": mode == "type_text",
+                    "pointer_click_observed": mode == "pointer_click",
                     "ocr": False,
                 },
                 ensure_ascii=False,

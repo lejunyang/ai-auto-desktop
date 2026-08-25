@@ -54,6 +54,8 @@ GTK3_NATIVE_ACTION_NAMES = {
 QT5_NATIVE_ACTION_NAMES = {
     "invoke": "Press",
 }
+POINTER_BUTTONS = frozenset({"left"})
+POINTER_POSITIONS = frozenset({"center"})
 
 ACTION_IDS = {
     name: f"{PLUGIN_NAME}.{name}@1"
@@ -64,6 +66,7 @@ ACTION_IDS = {
         "find",
         "focus",
         "invoke",
+        "pointer_click",
         "set_text",
         "type_text",
         "toggle",
@@ -73,7 +76,16 @@ ACTION_IDS = {
 }
 ACTION_NAMES = {full_name: short_name for short_name, full_name in ACTION_IDS.items()}
 WRITE_ACTIONS = frozenset(
-    {"focus", "invoke", "set_text", "type_text", "toggle", "expand", "collapse"}
+    {
+        "focus",
+        "invoke",
+        "pointer_click",
+        "set_text",
+        "type_text",
+        "toggle",
+        "expand",
+        "collapse",
+    }
 )
 NODE_ACTIONS = WRITE_ACTIONS
 STATE_NAMES = (
@@ -244,6 +256,17 @@ COMMON_WRITE_INPUT: dict[str, Any] = {
     "properties": {"target": TARGET_SCHEMA, "locator": LOCATOR_SCHEMA},
     "additionalProperties": False,
 }
+POINTER_CLICK_INPUT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "required": ["target", "locator"],
+    "properties": {
+        "target": TARGET_SCHEMA,
+        "locator": LOCATOR_SCHEMA,
+        "button": {"enum": sorted(POINTER_BUTTONS)},
+        "position": {"enum": sorted(POINTER_POSITIONS)},
+    },
+    "additionalProperties": False,
+}
 WRITE_OUTPUT_SCHEMA: dict[str, Any] = {
     "type": "object",
     "required": ["ok", "action", "resolved"],
@@ -373,6 +396,19 @@ ACTION_CONTRACTS: dict[str, dict[str, Any]] = {
         risk_category="modify",
         risk_level="high",
         input_schema=COMMON_WRITE_INPUT,
+        output_schema=WRITE_OUTPUT_SCHEMA,
+        errors=COMMON_ERRORS + LOCATOR_ERRORS + ACTION_ERRORS,
+        permissions=("desktop.observe", "desktop.input"),
+    ),
+    "pointer_click": _contract(
+        (
+            "重新验证目标后，仅在明确的 KDE/X11 会话中，通过固定路径 XTest helper "
+            "按目标 bounds 中心点显式执行左键单击。"
+        ),
+        effect="non_idempotent",
+        risk_category="modify",
+        risk_level="high",
+        input_schema=POINTER_CLICK_INPUT_SCHEMA,
         output_schema=WRITE_OUTPUT_SCHEMA,
         errors=COMMON_ERRORS + LOCATOR_ERRORS + ACTION_ERRORS,
         permissions=("desktop.observe", "desktop.input"),
@@ -539,6 +575,10 @@ class AtspiBackend(Protocol):
     def collapse(self, native: Any, *, deadline: float) -> Any: ...
 
     def same_element(self, previous: Any, current: Any, *, deadline: float) -> bool: ...
+
+    def accessible_at_point(
+        self, root: Any, x: int, y: int, *, deadline: float
+    ) -> Any | None: ...
 
 
 @dataclass(slots=True)
@@ -776,6 +816,132 @@ class XTestHelper:
             data=details,
         )
 
+    def pointer_click(
+        self,
+        *,
+        expected_process_id: int,
+        x: int,
+        y: int,
+        deadline: float,
+    ) -> dict[str, Any]:
+        environment = self._qualified_environment()
+        executable = self._validated_path()
+        _check_deadline(deadline)
+        command = [
+            executable,
+            "pointer-click",
+            "--expected-pid",
+            str(expected_process_id),
+            "--x",
+            str(x),
+            "--y",
+            str(y),
+            "--deadline-monotonic-ns",
+            str(int(deadline * 1_000_000_000)),
+        ]
+        try:
+            process = subprocess.Popen(
+                command,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                cwd=str(self.path.parent),
+                env=environment,
+                close_fds=True,
+            )
+        except OSError as exc:
+            raise DriverError(
+                "DRIVER.UNAVAILABLE",
+                "无法启动固定路径 XTest helper",
+                data={"reason": "helper_start_failed", "exception_type": type(exc).__name__},
+            ) from exc
+        try:
+            stdout, _stderr = process.communicate(timeout=max(0.001, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired as exc:
+            partial = exc.output if isinstance(exc.output, bytes) else b""
+            process.kill()
+            tail, _stderr = process.communicate()
+            stdout = partial + tail
+            dispatch_started, _result = self._parse_output(stdout)
+            if dispatch_started:
+                raise DriverError(
+                    "DRIVER.UNKNOWN_EFFECT",
+                    "XTest helper 在首个 pointer 事件后超时",
+                    retryable=False,
+                    data={
+                        "phase": "pointer_dispatch",
+                        "dispatch_started": True,
+                        "effect": "unknown",
+                    },
+                ) from exc
+            raise DriverError(
+                "DRIVER.TIMEOUT",
+                "XTest helper 在首个 pointer 事件前超时",
+                retryable=True,
+                data={
+                    "phase": "before_pointer_dispatch",
+                    "dispatch_started": False,
+                    "effect": "not_applied",
+                },
+            ) from exc
+        dispatch_started, result = self._parse_output(stdout)
+        if process.returncode == 0 and result is not None and result.get("ok") is True:
+            if not dispatch_started:
+                raise DriverError(
+                    "DRIVER.ACTION_FAILED",
+                    "XTest helper 未证明 pointer 事件已派发",
+                    data={"reason": "missing_dispatch_marker"},
+                )
+            events = result.get("events")
+            if isinstance(events, bool) or not isinstance(events, int) or events < 3:
+                raise DriverError(
+                    "DRIVER.UNKNOWN_EFFECT",
+                    "XTest helper 在 pointer 派发后返回无效结果",
+                    data={
+                        "phase": "post_dispatch",
+                        "dispatch_started": True,
+                        "effect": "unknown",
+                    },
+                )
+            return {
+                "native_interface": "XTEST",
+                "synthetic_input": True,
+                "submitted": True,
+                "events": events,
+                "expected_process_id": expected_process_id,
+                "click_point": {"x": x, "y": y},
+            }
+        helper_code = result.get("code") if isinstance(result, dict) else None
+        helper_phase = result.get("phase") if isinstance(result, dict) else None
+        details = {
+            "helper_exit_code": process.returncode,
+            "helper_code": helper_code,
+            "phase": helper_phase or ("pointer_dispatch" if dispatch_started else "pre_dispatch"),
+            "dispatch_started": dispatch_started,
+            "effect": "unknown" if dispatch_started else "not_applied",
+        }
+        if dispatch_started or process.returncode == 70:
+            raise DriverError(
+                "DRIVER.UNKNOWN_EFFECT",
+                "XTest helper 在首个 pointer 事件后失败",
+                retryable=False,
+                data=details,
+            )
+        if process.returncode == 69:
+            raise DriverError("DRIVER.UNAVAILABLE", "X11/XTest 不可用", data=details)
+        if process.returncode == 75:
+            raise DriverError(
+                "DRIVER.TIMEOUT",
+                "XTest helper 在 pointer 派发前超时",
+                retryable=True,
+                data=details,
+            )
+        raise DriverError(
+            "DRIVER.ACTION_FAILED",
+            "XTest helper 未派发 pointer 并失败关闭",
+            data=details,
+        )
+
 
 def _fail(code: str, message: str, **data: Any) -> NoReturn:
     raise DriverError(code, message, data=data or None)
@@ -873,6 +1039,28 @@ def _ordinary_type_text(value: Any) -> str:
     return value
 
 
+def _pointer_button(value: Any) -> str:
+    if value is None:
+        return "left"
+    if not isinstance(value, str) or value not in POINTER_BUTTONS:
+        _fail(
+            "DRIVER.INVALID_REQUEST",
+            f"pointer_click.button 仅支持 {sorted(POINTER_BUTTONS)!r}",
+        )
+    return value
+
+
+def _pointer_position(value: Any) -> str:
+    if value is None:
+        return "center"
+    if not isinstance(value, str) or value not in POINTER_POSITIONS:
+        _fail(
+            "DRIVER.INVALID_REQUEST",
+            f"pointer_click.position 仅支持 {sorted(POINTER_POSITIONS)!r}",
+        )
+    return value
+
+
 def _json_safe(value: Any, *, depth: int = 0) -> Any:
     if depth > 8:
         return None
@@ -901,6 +1089,26 @@ def _normalize_bounds(value: Mapping[str, Any] | None) -> dict[str, int] | None:
     except (KeyError, TypeError, ValueError, OverflowError):
         return None
     return {"x": x, "y": y, "width": width, "height": height}
+
+
+def _center_point(bounds: Mapping[str, Any]) -> tuple[int, int]:
+    try:
+        x = int(bounds["x"])
+        y = int(bounds["y"])
+        width = int(bounds["width"])
+        height = int(bounds["height"])
+    except (KeyError, TypeError, ValueError, OverflowError) as exc:
+        raise DriverError(
+            "DRIVER.ACTION_UNSUPPORTED",
+            "pointer_click 目标缺少有效 bounds",
+        ) from exc
+    if width <= 0 or height <= 0:
+        raise DriverError(
+            "DRIVER.ACTION_UNSUPPORTED",
+            "pointer_click 只支持正面积目标",
+            data={"bounds": _json_safe(dict(bounds))},
+        )
+    return (x + width // 2, y + height // 2)
 
 
 def _normalize_role(value: Any) -> str:
@@ -1108,7 +1316,10 @@ class LinuxAtspiDriver:
                 "actions": [
                     item
                     for item in actions
-                    if not (protected and item in {"set_text", "type_text"})
+                    if not (
+                        protected
+                        and item in {"pointer_click", "set_text", "type_text"}
+                    )
                 ],
                 "provenance": provenance,
             }
@@ -1326,8 +1537,16 @@ class LinuxAtspiDriver:
 
     def _write(self, action: str, args: dict[str, Any], deadline: float) -> dict[str, Any]:
         text_actions = {"set_text", "type_text"}
+        pointer_action = action == "pointer_click"
         allowed = {"target", "locator"} | ({"text"} if action in text_actions else set())
+        pointer_button: str | None = None
+        pointer_position: str | None = None
+        if pointer_action:
+            allowed |= {"button", "position"}
         _only_keys(args, allowed, "args")
+        if pointer_action:
+            pointer_button = _pointer_button(args.get("button"))
+            pointer_position = _pointer_position(args.get("position"))
         if "target" not in args or "locator" not in args:
             _fail("DRIVER.INVALID_REQUEST", "target 和 locator 是必填字段")
         target = _object(args["target"], "target")
@@ -1368,6 +1587,29 @@ class LinuxAtspiDriver:
                 ) from exc
             raise
         fresh_node_id = resolved["node_id"]
+        target_subtree_ids: set[str] = {fresh_node_id}
+        target_ancestor_ids: list[str] = [fresh_node_id]
+        if pointer_action:
+            queue = deque([fresh_node_id])
+            while queue:
+                parent_id = queue.popleft()
+                for candidate in fresh.public["nodes"]:
+                    if candidate.get("parent_id") != parent_id:
+                        continue
+                    child_id = candidate["node_id"]
+                    if child_id in target_subtree_ids:
+                        continue
+                    target_subtree_ids.add(child_id)
+                    queue.append(child_id)
+            parent_lookup = {
+                candidate["node_id"]: candidate.get("parent_id")
+                for candidate in fresh.public["nodes"]
+            }
+            current_ancestor = fresh_node_id
+            while parent_lookup.get(current_ancestor) is not None:
+                current_ancestor = parent_lookup[current_ancestor]
+                target_ancestor_ids.append(current_ancestor)
+            target_ancestor_ids.reverse()
         try:
             same = self.backend.same_element(
                 record.handles[node_id], fresh.handles[fresh_node_id], deadline=deadline
@@ -1400,6 +1642,7 @@ class LinuxAtspiDriver:
             )
         text: str | None = None
         expected_process_id: int | None = None
+        click_point: tuple[int, int] | None = None
         if action in text_actions:
             if "text" not in args:
                 _fail("DRIVER.INVALID_REQUEST", f"{action} 必须提供 text")
@@ -1450,6 +1693,94 @@ class LinuxAtspiDriver:
                         "无法证明 type_text 目标的应用进程归属",
                     )
                 expected_process_id = raw_process_id
+        elif pointer_action:
+            provenance = resolved.get("provenance", {})
+            if (
+                isinstance(provenance, Mapping)
+                and provenance.get("value_redacted") is True
+            ) or (
+                isinstance(resolved.get("states"), Mapping)
+                and resolved["states"].get("protected") is True
+            ):
+                raise DriverError(
+                    "DRIVER.PROTECTED_ELEMENT",
+                    "受保护元素禁止 pointer_click",
+                )
+            raw_process_id = (
+                provenance.get("process_id")
+                if isinstance(provenance, Mapping)
+                else None
+            )
+            if (
+                isinstance(raw_process_id, bool)
+                or not isinstance(raw_process_id, int)
+                or raw_process_id <= 0
+                or fresh.public.get("application", {}).get("process_id")
+                != raw_process_id
+            ):
+                raise DriverError(
+                    "DRIVER.STALE_SNAPSHOT",
+                    "无法证明 pointer_click 目标的应用进程归属",
+                )
+            states = resolved.get("states")
+            if not isinstance(states, Mapping):
+                states = {}
+            if not all(
+                states.get(name) is True
+                for name in ("enabled", "visible", "showing", "sensitive")
+            ):
+                raise DriverError(
+                    "DRIVER.ACTION_UNSUPPORTED",
+                    "pointer_click 只支持可见且可交互的目标",
+                    data={"action": action, "states": _json_safe(dict(states))},
+                )
+            bounds = resolved.get("bounds")
+            if not isinstance(bounds, Mapping):
+                raise DriverError(
+                    "DRIVER.ACTION_UNSUPPORTED",
+                    "pointer_click 目标缺少可点击 bounds",
+                )
+            click_point = _center_point(bounds)
+            point_accessible = None
+            for candidate_node_id in target_ancestor_ids:
+                point_accessible = self.backend.accessible_at_point(
+                    fresh.handles[candidate_node_id],
+                    click_point[0],
+                    click_point[1],
+                    deadline=deadline,
+                )
+                if point_accessible is not None:
+                    break
+            if point_accessible is None:
+                raise DriverError(
+                    "DRIVER.ACTION_UNSUPPORTED",
+                    "pointer_click 无法通过 AT-SPI 证明点击点命中目标子树",
+                )
+            point_hits_target = False
+            for candidate_node_id in target_subtree_ids:
+                try:
+                    if self.backend.same_element(
+                        point_accessible,
+                        fresh.handles[candidate_node_id],
+                        deadline=deadline,
+                    ):
+                        point_hits_target = True
+                        break
+                except DriverError as exc:
+                    if exc.code == "DRIVER.TIMEOUT":
+                        raise
+                except Exception:
+                    continue
+            if not point_hits_target:
+                raise DriverError(
+                    "DRIVER.ACTION_UNSUPPORTED",
+                    "pointer_click 点击点未命中 fresh target 或其后代",
+                    data={
+                        "effect": "not_applied",
+                        "click_point": {"x": click_point[0], "y": click_point[1]},
+                    },
+                )
+            expected_process_id = raw_process_id
         if isinstance(self.backend, GioAtspiBackend):
             # Gio fallback intentionally has no write surface, including
             # state-preserving expand/collapse calls that would otherwise no-op.
@@ -1462,6 +1793,8 @@ class LinuxAtspiDriver:
             )
         if action == "type_text":
             # Validate the helper path and desktop profile before changing focus.
+            self.xtest_helper.preflight()
+        elif pointer_action:
             self.xtest_helper.preflight()
         states = resolved.get("states")
         if not isinstance(states, Mapping):
@@ -1504,16 +1837,19 @@ class LinuxAtspiDriver:
         native = fresh.handles[fresh_node_id]
         dispatched = False
         try:
-            dispatched = True
             if action == "focus":
+                dispatched = True
                 backend_result = self.backend.focus(native, deadline=deadline)
             elif action == "invoke":
+                dispatched = True
                 backend_result = self.backend.invoke(native, deadline=deadline)
             elif action == "set_text":
                 assert text is not None
+                dispatched = True
                 backend_result = self.backend.set_text(native, text, deadline=deadline)
             elif action == "type_text":
                 assert text is not None and expected_process_id is not None
+                dispatched = True
                 focus_result = self.backend.focus(native, deadline=deadline)
                 # Component.grab_focus is a synchronous D-Bus call, but GTK/Qt
                 # commit the toolkit-local widget focus on their event loop.  The
@@ -1552,6 +1888,64 @@ class LinuxAtspiDriver:
                     "focus": _json_safe(focus_result),
                     "input": _json_safe(input_result),
                     "synthetic_input": True,
+                }
+            elif action == "pointer_click":
+                assert expected_process_id is not None and click_point is not None
+                focus_changed = False
+                focus_result = self.backend.focus(native, deadline=deadline)
+                focus_changed = True
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    _check_deadline(deadline, post_dispatch=True)
+                time.sleep(min(0.05, remaining))
+                _check_deadline(deadline, post_dispatch=True)
+                try:
+                    input_result = self.xtest_helper.pointer_click(
+                        expected_process_id=expected_process_id,
+                        x=click_point[0],
+                        y=click_point[1],
+                        deadline=deadline,
+                    )
+                except DriverError as exc:
+                    if exc.code == "DRIVER.UNKNOWN_EFFECT":
+                        raise
+                    details = dict(exc.data) if isinstance(exc.data, Mapping) else {}
+                    if details.get("dispatch_started") is True:
+                        raise DriverError(
+                            "DRIVER.UNKNOWN_EFFECT",
+                            "目标聚焦后未能确定 XTest pointer_click 效果",
+                            retryable=False,
+                            data={
+                                "action": action,
+                                "reason": exc.code,
+                                "phase": details.get("phase", "pointer_dispatch"),
+                                "dispatch_started": True,
+                                "focus_changed": focus_changed,
+                                "effect": "unknown",
+                            },
+                        ) from exc
+                    raise DriverError(
+                        exc.code,
+                        "pointer_click 在点击派发前失败；目标焦点可能已改变",
+                        retryable=False,
+                        data={
+                            "action": action,
+                            "reason": exc.code,
+                            "phase": details.get("phase", "before_pointer_dispatch"),
+                            "dispatch_started": False,
+                            "focus_changed": focus_changed,
+                            "effect": "contextual" if focus_changed else "not_applied",
+                        },
+                    ) from exc
+                dispatched = True
+                backend_result = {
+                    "native_interface": "Component.grab_focus -> XTEST",
+                    "focus": _json_safe(focus_result),
+                    "input": _json_safe(input_result),
+                    "synthetic_input": True,
+                    "button": pointer_button,
+                    "position": pointer_position,
+                    "click_point": {"x": click_point[0], "y": click_point[1]},
                 }
             elif action == "toggle":
                 backend_result = self.backend.toggle(native, deadline=deadline)
@@ -1666,6 +2060,11 @@ class UnavailableBackend:
         self._raise()
 
     def same_element(self, previous: Any, current: Any, *, deadline: float) -> bool:
+        self._raise()
+
+    def accessible_at_point(
+        self, root: Any, x: int, y: int, *, deadline: float
+    ) -> Any | None:
         self._raise()
 
 
@@ -1952,6 +2351,37 @@ class PyGObjectAtspiBackend:
             _check_deadline(deadline)
             return None
 
+    def accessible_at_point(
+        self, root: Any, x: int, y: int, *, deadline: float
+    ) -> Any | None:
+        coord_type = getattr(getattr(self.Atspi, "CoordType", None), "SCREEN", None)
+        if coord_type is None:
+            return None
+
+        def descend(accessible: Any, screen_x: int, screen_y: int) -> Any | None:
+            component = self._interface(
+                accessible, "get_component_iface", deadline=deadline
+            )
+            if component is None:
+                return None
+            self._bound_timeout(deadline)
+            try:
+                hit = component.get_accessible_at_point(
+                    int(screen_x), int(screen_y), coord_type
+                )
+            except Exception:
+                _check_deadline(deadline)
+                return None
+            _check_deadline(deadline)
+            if hit is None:
+                return None
+            if self.same_element(hit, accessible, deadline=deadline):
+                return hit
+            deeper = descend(hit, screen_x, screen_y)
+            return deeper if deeper is not None else hit
+
+        return descend(root, int(x), int(y))
+
     def _action_metadata(
         self, accessible: Any, *, deadline: float
     ) -> list[dict[str, Any]]:
@@ -2090,6 +2520,24 @@ class PyGObjectAtspiBackend:
             and process_id > 0
         ):
             actions.append("type_text")
+        bounds = self._bounds(accessible, deadline=deadline)
+        if (
+            enabled is True
+            and visible is True
+            and showing is True
+            and sensitive is True
+            and focusable is True
+            and component_iface is not None
+            and protected is not True
+            and isinstance(process_id, int)
+            and not isinstance(process_id, bool)
+            and process_id > 0
+            and bounds is not None
+            and bounds.get("width", 0) > 0
+            and bounds.get("height", 0) > 0
+            and type(self).accessible_at_point is not UnavailableBackend.accessible_at_point
+        ):
+            actions.append("pointer_click")
         native_action_names: dict[str, str] = {}
         if "invoke" in actions and is_qualified_qt5:
             native_action_names["invoke"] = QT5_NATIVE_ACTION_NAMES["invoke"]
@@ -2171,7 +2619,7 @@ class PyGObjectAtspiBackend:
                 "selectable": selectable,
                 "selected": selected,
             },
-            bounds=self._bounds(accessible, deadline=deadline),
+            bounds=bounds,
             actions=actions,
             provenance={
                 "bus_name": bus_name,
@@ -3020,6 +3468,12 @@ class GioAtspiBackend:
             and bool(previous.object_path)
             and previous == current
         )
+
+    def accessible_at_point(
+        self, root: Any, x: int, y: int, *, deadline: float
+    ) -> Any | None:
+        _check_deadline(deadline)
+        self._unsupported("pointer_click")
 
 
 def create_default_backend() -> AtspiBackend:

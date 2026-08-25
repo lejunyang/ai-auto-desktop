@@ -95,7 +95,7 @@ def default_tree() -> list[object]:
             "push_button",
             "Save",
             description="Save document",
-            actions=("focus", "invoke"),
+            actions=("focus", "invoke", "pointer_click"),
             attributes={"class": "QPushButton", "id": "save"},
         ),
         node(
@@ -138,6 +138,7 @@ class FakeBackend:
         self.calls: list[tuple[object, ...]] = []
         self.fail: str | None = None
         self.truncated = False
+        self.point_target: object | None = None
 
     def session_info(self) -> dict[str, object]:
         return {
@@ -209,6 +210,14 @@ class FakeBackend:
         self.calls.append(("same_element", previous, current))
         return previous == current
 
+    def accessible_at_point(
+        self, root: object, x: int, y: int, *, deadline: float
+    ) -> object | None:
+        self.calls.append(("accessible_at_point", root, x, y))
+        if self.point_target is not None:
+            return self.point_target
+        return "save"
+
 
 class FakeXTestHelper:
     def __init__(self) -> None:
@@ -239,6 +248,19 @@ class FakeXTestHelper:
             "submitted": True,
             "events": max(2, len(text) * 2),
             "codepoints": len(text),
+        }
+
+    def pointer_click(
+        self, *, expected_process_id: int, x: int, y: int, deadline: float
+    ) -> dict[str, object]:
+        self.calls.append(("pointer_click", expected_process_id, x, y))
+        if self.failure is not None:
+            raise self.failure
+        return {
+            "native_interface": "XTEST",
+            "synthetic_input": True,
+            "submitted": True,
+            "events": 3,
         }
 
 
@@ -311,7 +333,7 @@ class LinuxAtspiDriverCoreTests(unittest.TestCase):
         save = snapshot["nodes"][2]
         self.assertEqual(save["parent_id"], "n1")
         self.assertEqual(save["description"], "Save document")
-        self.assertEqual(save["actions"], ["focus", "invoke"])
+        self.assertEqual(save["actions"], ["focus", "invoke", "pointer_click"])
         self.assertEqual(save["attributes"]["class"], "QPushButton")
         self.assertEqual(save["provenance"]["backend"], "fake_linux_atspi")
         self.assertFalse(snapshot["nodes"][4]["states"]["checked"])
@@ -388,6 +410,11 @@ class LinuxAtspiDriverCoreTests(unittest.TestCase):
         cases = (
             ("focus", {"object_path": "/org/a11y/atspi/accessible/save"}, {}),
             ("invoke", {"attributes": {"id": "save"}}, {}),
+            (
+                "pointer_click",
+                {"attributes": {"id": "save"}},
+                {"button": "left", "position": "center"},
+            ),
             ("set_text", {"attributes": {"id": "title"}}, {"text": "Final"}),
             (
                 "type_text",
@@ -442,7 +469,10 @@ class LinuxAtspiDriverCoreTests(unittest.TestCase):
                 self.assertEqual(result["action"], action)
                 self.assertEqual(backend.capture_count, 2)
                 action_calls = [call for call in backend.calls if call[0] == action]
-                self.assertEqual(len(action_calls), 0 if action == "type_text" else 1)
+                self.assertEqual(
+                    len(action_calls),
+                    0 if action in {"type_text", "pointer_click"} else 1,
+                )
                 if action == "set_text":
                     self.assertEqual(action_calls[0], ("set_text", "title", "Final"))
                 if action == "type_text":
@@ -453,6 +483,21 @@ class LinuxAtspiDriverCoreTests(unittest.TestCase):
                     )
                     self.assertEqual(
                         helper.calls[-1], ("type_text", "UTF-8: 你好", 7)
+                    )
+                    self.assertTrue(result["backend_result"]["synthetic_input"])
+                if action == "pointer_click":
+                    self.assertEqual(action_calls, [])
+                    self.assertEqual(
+                        [call for call in backend.calls if call[0] == "focus"],
+                        [("focus", "save", None)],
+                    )
+                    self.assertEqual(
+                        helper.calls[-1], ("pointer_click", 7, 70, 35)
+                    )
+                    self.assertEqual(result["backend_result"]["button"], "left")
+                    self.assertEqual(result["backend_result"]["position"], "center")
+                    self.assertEqual(
+                        result["backend_result"]["click_point"], {"x": 70, "y": 35}
                     )
                     self.assertTrue(result["backend_result"]["synthetic_input"])
 
@@ -565,6 +610,370 @@ class LinuxAtspiDriverCoreTests(unittest.TestCase):
         self.assertEqual(
             len([call for call in helper.calls if call[0] == "type_text"]), 1
         )
+
+    def test_pointer_click_validates_contract_and_distinguishes_pre_dispatch_failure(self) -> None:
+        helper = FakeXTestHelper()
+        driver = atspi.LinuxAtspiDriver(FakeBackend(), xtest_helper=helper)
+        snapshot = driver.execute(
+            "snapshot", {"application": {"name": "Editor"}}, deadline=deadline()
+        )
+        found = driver.execute(
+            "find",
+            {
+                "snapshot_id": snapshot["snapshot_id"],
+                "revision": snapshot["revision"],
+                "locator": {"attributes": {"id": "save"}},
+            },
+            deadline=deadline(),
+        )
+        for extra in (
+            {"button": "right"},
+            {"position": "top_left"},
+            {"x": 12, "y": 34},
+        ):
+            current_snapshot = driver.execute(
+                "snapshot", {"application": {"name": "Editor"}}, deadline=deadline()
+            )
+            current_found = driver.execute(
+                "find",
+                {
+                    "snapshot_id": current_snapshot["snapshot_id"],
+                    "revision": current_snapshot["revision"],
+                    "locator": {"attributes": {"id": "save"}},
+                },
+                deadline=deadline(),
+            )
+            with self.subTest(extra=extra), self.assertRaises(atspi.DriverError) as invalid:
+                driver.execute(
+                    "pointer_click",
+                    {
+                        "target": current_found["target"],
+                        "locator": {"attributes": {"id": "save"}},
+                        **extra,
+                    },
+                    deadline=deadline(),
+                )
+            self.assertEqual(invalid.exception.code, "DRIVER.INVALID_REQUEST")
+
+        helper.failure = atspi.DriverError(
+            "DRIVER.TIMEOUT",
+            "synthetic pointer helper timeout",
+            retryable=True,
+            data={"phase": "before_pointer_dispatch", "dispatch_started": False},
+        )
+        failure_snapshot = driver.execute(
+            "snapshot", {"application": {"name": "Editor"}}, deadline=deadline()
+        )
+        failure_found = driver.execute(
+            "find",
+            {
+                "snapshot_id": failure_snapshot["snapshot_id"],
+                "revision": failure_snapshot["revision"],
+                "locator": {"attributes": {"id": "save"}},
+            },
+            deadline=deadline(),
+        )
+        with self.assertRaises(atspi.DriverError) as raised:
+            driver.execute(
+                "pointer_click",
+                {
+                    "target": failure_found["target"],
+                    "locator": {"attributes": {"id": "save"}},
+                },
+                deadline=deadline(),
+            )
+        self.assertEqual(raised.exception.code, "DRIVER.TIMEOUT")
+        self.assertFalse(raised.exception.retryable)
+        self.assertEqual(raised.exception.data["effect"], "contextual")
+        self.assertTrue(raised.exception.data["focus_changed"])
+        self.assertFalse(raised.exception.data["dispatch_started"])
+        self.assertEqual(
+            len([call for call in helper.calls if call[0] == "pointer_click"]), 1
+        )
+
+    def test_pointer_click_stale_and_bounds_fail_closed_before_helper(self) -> None:
+        replacement = default_tree()
+        replacement[2] = node(
+            "replacement",
+            1,
+            "push_button",
+            "Save",
+            actions=("focus", "invoke", "pointer_click"),
+            attributes={"class": "QPushButton", "id": "save"},
+        )
+        helper = FakeXTestHelper()
+        backend = FakeBackend([default_tree(), replacement])
+        driver = atspi.LinuxAtspiDriver(backend, xtest_helper=helper)
+        snapshot = driver.execute(
+            "snapshot", {"application": {"name": "Editor"}}, deadline=deadline()
+        )
+        found = driver.execute(
+            "find",
+            {
+                "snapshot_id": snapshot["snapshot_id"],
+                "revision": snapshot["revision"],
+                "locator": {"attributes": {"id": "save"}},
+            },
+            deadline=deadline(),
+        )
+        with self.assertRaises(atspi.DriverError) as stale:
+            driver.execute(
+                "pointer_click",
+                {
+                    "target": found["target"],
+                    "locator": {"attributes": {"id": "save"}},
+                },
+                deadline=deadline(),
+            )
+        self.assertEqual(stale.exception.code, "DRIVER.STALE_SNAPSHOT")
+        self.assertFalse(any(call[0] == "pointer_click" for call in helper.calls))
+
+        missing_bounds = default_tree()
+        missing_bounds[2] = atspi.BackendNode(
+            native="save",
+            parent_index=1,
+            role="push_button",
+            name="Save",
+            description="Save document",
+            attributes={"class": "QPushButton", "id": "save"},
+            states={
+                "enabled": True,
+                "visible": True,
+                "showing": True,
+                "focusable": True,
+                "focused": False,
+                "editable": False,
+                "sensitive": True,
+                "protected": False,
+                "checked": None,
+                "expandable": None,
+                "expanded": None,
+                "selectable": None,
+                "selected": None,
+            },
+            bounds=None,
+            actions=("focus", "invoke", "pointer_click"),
+            provenance={
+                "bus_name": ":1.42",
+                "object_path": "/org/a11y/atspi/accessible/save",
+                "application_name": "Editor",
+                "toolkit_name": "Qt",
+                "process_id": 7,
+                "value_redacted": False,
+                "coordinate_space": "screen",
+            },
+        )
+        missing_backend = FakeBackend([missing_bounds])
+        missing_helper = FakeXTestHelper()
+        missing_driver = atspi.LinuxAtspiDriver(
+            missing_backend, xtest_helper=missing_helper
+        )
+        missing_snapshot = missing_driver.execute(
+            "snapshot", {"application": {"name": "Editor"}}, deadline=deadline()
+        )
+        missing_found = missing_driver.execute(
+            "find",
+            {
+                "snapshot_id": missing_snapshot["snapshot_id"],
+                "revision": missing_snapshot["revision"],
+                "locator": {"attributes": {"id": "save"}},
+            },
+            deadline=deadline(),
+        )
+        with self.assertRaises(atspi.DriverError) as unsupported:
+            missing_driver.execute(
+                "pointer_click",
+                {
+                    "target": missing_found["target"],
+                    "locator": {"attributes": {"id": "save"}},
+                },
+                deadline=deadline(),
+            )
+        self.assertEqual(unsupported.exception.code, "DRIVER.ACTION_UNSUPPORTED")
+        self.assertFalse(any(call[0] == "pointer_click" for call in missing_helper.calls))
+
+    def test_pointer_click_is_not_advertised_for_protected_nodes(self) -> None:
+        protected_tree = default_tree()
+        protected_tree[2] = atspi.BackendNode(
+            native="save",
+            parent_index=1,
+            role="push_button",
+            name="Save",
+            description="Save document",
+            attributes={"class": "QPushButton", "id": "save"},
+            states={
+                "enabled": True,
+                "visible": True,
+                "showing": True,
+                "focusable": True,
+                "focused": False,
+                "editable": False,
+                "sensitive": True,
+                "protected": True,
+                "checked": None,
+                "expandable": None,
+                "expanded": None,
+                "selectable": None,
+                "selected": None,
+            },
+            bounds={"x": 10, "y": 20, "width": 120, "height": 30},
+            actions=("focus", "invoke"),
+            provenance={
+                "bus_name": ":1.42",
+                "object_path": "/org/a11y/atspi/accessible/save",
+                "application_name": "Editor",
+                "toolkit_name": "Qt",
+                "process_id": 7,
+                "value_redacted": False,
+                "coordinate_space": "screen",
+            },
+        )
+        driver = atspi.LinuxAtspiDriver(FakeBackend([protected_tree]))
+        snapshot = driver.execute(
+            "snapshot", {"application": {"name": "Editor"}}, deadline=deadline()
+        )
+        found = driver.execute(
+            "find",
+            {
+                "snapshot_id": snapshot["snapshot_id"],
+                "revision": snapshot["revision"],
+                "locator": {"attributes": {"id": "save"}},
+            },
+            deadline=deadline(),
+        )
+        self.assertNotIn("pointer_click", found["node"]["actions"])
+
+    def test_pointer_click_fails_closed_when_atspi_point_hits_same_process_sibling(self) -> None:
+        overlay_tree = default_tree()
+        overlay_tree.append(
+            atspi.BackendNode(
+                native="overlay",
+                parent_index=1,
+                role="panel",
+                name="Overlay",
+                description="Sibling overlay",
+                attributes={"class": "QWidget", "id": "overlay"},
+                states={
+                    "enabled": True,
+                    "visible": True,
+                    "showing": True,
+                    "focusable": False,
+                    "focused": False,
+                    "editable": False,
+                    "sensitive": True,
+                    "protected": False,
+                    "checked": None,
+                    "expandable": None,
+                    "expanded": None,
+                    "selectable": None,
+                    "selected": None,
+                },
+                bounds={"x": 10, "y": 20, "width": 120, "height": 30},
+                actions=(),
+                provenance={
+                    "bus_name": ":1.42",
+                    "object_path": "/org/a11y/atspi/accessible/overlay",
+                    "application_name": "Editor",
+                    "toolkit_name": "Qt",
+                    "process_id": 7,
+                    "value_redacted": False,
+                    "coordinate_space": "screen",
+                },
+            )
+        )
+        backend = FakeBackend([overlay_tree])
+        backend.point_target = "overlay"
+        helper = FakeXTestHelper()
+        driver = atspi.LinuxAtspiDriver(backend, xtest_helper=helper)
+        snapshot = driver.execute(
+            "snapshot", {"application": {"name": "Editor"}}, deadline=deadline()
+        )
+        found = driver.execute(
+            "find",
+            {
+                "snapshot_id": snapshot["snapshot_id"],
+                "revision": snapshot["revision"],
+                "locator": {"attributes": {"id": "save"}},
+            },
+            deadline=deadline(),
+        )
+        with self.assertRaises(atspi.DriverError) as blocked:
+            driver.execute(
+                "pointer_click",
+                {
+                    "target": found["target"],
+                    "locator": {"attributes": {"id": "save"}},
+                },
+                deadline=deadline(),
+            )
+        self.assertEqual(blocked.exception.code, "DRIVER.ACTION_UNSUPPORTED")
+        self.assertEqual(blocked.exception.data["effect"], "not_applied")
+        self.assertFalse(any(call[0] == "pointer_click" for call in helper.calls))
+
+    def test_pointer_click_allows_atspi_descendant_hit_within_target_subtree(self) -> None:
+        subtree = default_tree()
+        subtree.append(
+            atspi.BackendNode(
+                native="save-icon",
+                parent_index=2,
+                role="icon",
+                name="Save icon",
+                description="Icon child",
+                attributes={"class": "QIcon", "id": "save-icon"},
+                states={
+                    "enabled": True,
+                    "visible": True,
+                    "showing": True,
+                    "focusable": False,
+                    "focused": False,
+                    "editable": False,
+                    "sensitive": True,
+                    "protected": False,
+                    "checked": None,
+                    "expandable": None,
+                    "expanded": None,
+                    "selectable": None,
+                    "selected": None,
+                },
+                bounds={"x": 30, "y": 25, "width": 20, "height": 20},
+                actions=(),
+                provenance={
+                    "bus_name": ":1.42",
+                    "object_path": "/org/a11y/atspi/accessible/save-icon",
+                    "application_name": "Editor",
+                    "toolkit_name": "Qt",
+                    "process_id": 7,
+                    "value_redacted": False,
+                    "coordinate_space": "screen",
+                },
+            )
+        )
+        backend = FakeBackend([subtree])
+        backend.point_target = "save-icon"
+        helper = FakeXTestHelper()
+        driver = atspi.LinuxAtspiDriver(backend, xtest_helper=helper)
+        snapshot = driver.execute(
+            "snapshot", {"application": {"name": "Editor"}}, deadline=deadline()
+        )
+        found = driver.execute(
+            "find",
+            {
+                "snapshot_id": snapshot["snapshot_id"],
+                "revision": snapshot["revision"],
+                "locator": {"attributes": {"id": "save"}},
+            },
+            deadline=deadline(),
+        )
+        result = driver.execute(
+            "pointer_click",
+            {
+                "target": found["target"],
+                "locator": {"attributes": {"id": "save"}},
+            },
+            deadline=deadline(),
+        )
+        self.assertTrue(result["ok"])
+        self.assertEqual(helper.calls[-1], ("pointer_click", 7, 70, 35))
 
     def test_type_text_stale_or_protected_target_never_reaches_helper(self) -> None:
         replacement = default_tree()
@@ -1542,6 +1951,7 @@ class LinuxAtspiProcessTests(unittest.TestCase):
                 "find",
                 "focus",
                 "invoke",
+                "pointer_click",
                 "set_text",
                 "type_text",
                 "toggle",
@@ -1568,6 +1978,7 @@ class LinuxAtspiProcessTests(unittest.TestCase):
         for name in (
             "focus",
             "invoke",
+            "pointer_click",
             "set_text",
             "type_text",
             "toggle",
@@ -1589,6 +2000,14 @@ class LinuxAtspiProcessTests(unittest.TestCase):
         self.assertEqual(
             manifest["actions"]["type_text"]["risk"],
             {"category": "input", "level": "high"},
+        )
+        self.assertEqual(
+            manifest["actions"]["pointer_click"]["effect"]["default_class"],
+            "non_idempotent",
+        )
+        self.assertEqual(
+            manifest["actions"]["pointer_click"]["risk"],
+            {"category": "modify", "level": "high"},
         )
         for name in ("expand", "collapse"):
             self.assertEqual(

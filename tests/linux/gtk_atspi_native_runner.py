@@ -14,12 +14,24 @@ from ai_auto_desktop.plugin import ProcessPlugin
 
 
 TYPE_ENTRY_NAME = "Fixture XTest text entry"
+BUTTON_NAME = "Invoke fixture button"
+STATUS_INVOKED = "Fixture status invoked"
 
 
 def main() -> int:
-    if len(sys.argv) not in {3, 4} or (len(sys.argv) == 4 and sys.argv[3] != "--type-text"):
+    if len(sys.argv) not in {3, 4}:
         print(json.dumps({"status": "failed", "reason": "invalid_arguments"}))
         return 64
+    mode = "type_text"
+    if len(sys.argv) == 4:
+        flag = sys.argv[3]
+        if flag == "--type-text":
+            mode = "type_text"
+        elif flag == "--pointer-click":
+            mode = "pointer_click"
+        else:
+            print(json.dumps({"status": "failed", "reason": "invalid_arguments"}))
+            return 64
     fixture_path = Path(sys.argv[1]).resolve()
     driver_path = Path(sys.argv[2]).resolve()
     environment = os.environ.copy()
@@ -102,62 +114,111 @@ def main() -> int:
                 {"target": target, "locator": locator, **extra},
             )
 
-        locator = {
-            "role": "text",
-            "name": TYPE_ENTRY_NAME,
-            "toolkit_name": "gtk",
-        }
-        stage = "initial_snapshot"
-        initial = find(snapshot(), locator)["node"]
-        if initial["value"] != "":
-            raise RuntimeError("XTest entry did not start empty")
-        if "type_text" not in initial["actions"]:
-            raise RuntimeError(
-                f"XTest entry did not qualify for type_text: {initial!r}"
-            )
-        stage = "invoke_type_text"
-        typed = "GTK XTest UTF-8 你好"
-        result = write("type_text", locator, text=typed)
-        input_result = result["backend_result"].get("input", {})
-        if input_result.get("native_interface") != "XTEST":
-            raise RuntimeError("type_text did not use the XTEST helper")
-        stage = "observe_type_text"
-        stop = time.monotonic() + 3
-        last_value = None
-        while True:
-            try:
-                observed = find(snapshot(), {**locator, "value": typed})["node"]
-                if observed["value"] == typed:
-                    break
-            except Exception as exc:
+        if mode == "type_text":
+            locator = {
+                "role": "text",
+                "name": TYPE_ENTRY_NAME,
+                "toolkit_name": "gtk",
+            }
+            stage = "initial_snapshot"
+            initial = find(snapshot(), locator)["node"]
+            if initial["value"] != "":
+                raise RuntimeError("XTest entry did not start empty")
+            if "type_text" not in initial["actions"]:
+                raise RuntimeError(
+                    f"XTest entry did not qualify for type_text: {initial!r}"
+                )
+            stage = "invoke_type_text"
+            typed = "GTK XTest UTF-8 你好"
+            result = write("type_text", locator, text=typed)
+            input_result = result["backend_result"].get("input", {})
+            if input_result.get("native_interface") != "XTEST":
+                raise RuntimeError("type_text did not use the XTEST helper")
+            stage = "observe_type_text"
+            stop = time.monotonic() + 3
+            last_value = None
+            while True:
                 try:
-                    last_value = find(snapshot(), locator)["node"].get("value")
-                except Exception:
-                    pass
-                if time.monotonic() >= stop:
-                    text_nodes = [
+                    observed = find(snapshot(), {**locator, "value": typed})["node"]
+                    if observed["value"] == typed:
+                        break
+                except Exception as exc:
+                    try:
+                        last_value = find(snapshot(), locator)["node"].get("value")
+                    except Exception:
+                        pass
+                    if time.monotonic() >= stop:
+                        text_nodes = [
+                            {
+                                "name": node.get("name"),
+                                "value": node.get("value"),
+                                "focused": node.get("states", {}).get("focused"),
+                            }
+                            for node in snapshot()["nodes"]
+                            if node.get("role") in {"text", "entry"}
+                        ]
+                        raise RuntimeError(
+                            f"type_text postcondition not observed; value={last_value!r}; "
+                            f"text_nodes={text_nodes!r}; input_result={input_result!r}"
+                        ) from exc
+                    time.sleep(0.1)
+            report = {
+                "actions": ["focus", "type_text"],
+                "type_text_observed": True,
+                "pointer_click_observed": False,
+            }
+        else:
+            locator = {
+                "role": "push_button",
+                "name": BUTTON_NAME,
+                "toolkit_name": "gtk",
+            }
+            stage = "initial_snapshot"
+            initial = find(snapshot(), locator)["node"]
+            if "pointer_click" not in initial["actions"]:
+                raise RuntimeError(
+                    f"button did not qualify for pointer_click: {initial!r}"
+                )
+            stage = "invoke_pointer_click"
+            result = write("pointer_click", locator, button="left", position="center")
+            input_result = result["backend_result"].get("input", {})
+            if input_result.get("native_interface") != "XTEST":
+                raise RuntimeError("pointer_click did not use the XTEST helper")
+            stage = "observe_pointer_click"
+            stop = time.monotonic() + 3
+            while True:
+                try:
+                    status = find(
+                        snapshot(),
                         {
-                            "name": node.get("name"),
-                            "value": node.get("value"),
-                            "focused": node.get("states", {}).get("focused"),
-                        }
-                        for node in snapshot()["nodes"]
-                        if node.get("role") in {"text", "entry"}
-                    ]
-                    raise RuntimeError(
-                        f"type_text postcondition not observed; value={last_value!r}; "
-                        f"text_nodes={text_nodes!r}; input_result={input_result!r}"
-                    ) from exc
-                time.sleep(0.1)
+                            "role": "label",
+                            "name": STATUS_INVOKED,
+                            "toolkit_name": "gtk",
+                        },
+                    )["node"]
+                    if status["name"] == STATUS_INVOKED:
+                        break
+                except Exception as exc:
+                    if time.monotonic() >= stop:
+                        raise RuntimeError(
+                            f"pointer_click postcondition not observed; input_result={input_result!r}"
+                        ) from exc
+                    time.sleep(0.1)
+            report = {
+                "actions": ["focus", "pointer_click"],
+                "type_text_observed": False,
+                "pointer_click_observed": True,
+            }
         print(
             json.dumps(
                 {
                     "status": "passed",
                     "toolkit": application["toolkit_name"],
                     "toolkit_version": application["toolkit_version"],
-                    "actions": ["focus", "type_text"],
+                    "actions": report["actions"],
                     "input_injection": "XTEST",
-                    "type_text_observed": True,
+                    "type_text_observed": report["type_text_observed"],
+                    "pointer_click_observed": report["pointer_click_observed"],
                     "ocr": False,
                 },
                 ensure_ascii=False,

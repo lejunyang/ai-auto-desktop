@@ -7,29 +7,33 @@
 ## 契约与支持边界
 
 该能力提供方名为 `desktop.linux_atspi`，提供以下 v1 动作：
-`list_applications`、`snapshot`、`find`、`focus`、`invoke`、`set_text`、显式
-`type_text`、`toggle`、`expand` 和 `collapse`。
+`list_applications`、`snapshot`、`find`、`focus`、`invoke`、显式
+`pointer_click`、`set_text`、显式 `type_text`、`toggle`、`expand` 和 `collapse`。
 工作流中的 `uses` 由能力名、动作键和契约主版本号组成，例如
 `desktop.linux_atspi.snapshot@1`。能力清单的 `runtime.platforms` 为 `linux`，
 进程入口为 `./run.sh`。
 
 `list_applications`、`snapshot` 和 `find` 只要求 `desktop.observe`；
-全部七种写动作同时要求 `desktop.observe` 与 `desktop.input`。只有调用方明确选择
-`type_text` 时，`desktop.input` 才授权本切片的受限 XTest 键盘注入。
+全部八种写动作同时要求 `desktop.observe` 与 `desktop.input`。只有调用方明确选择
+`pointer_click` 或 `type_text` 时，`desktop.input` 才授权本切片的受限 XTest 注入。
 
 当前切片只使用 AT-SPI 暴露的可访问性树和接口：
 
 - `Component.grab_focus` 用于 `focus`；
 - `Action.do_action` 用于 `invoke`；
+- `Component.grab_focus` 后由固定路径 C++ XTest helper 注入 move + Button1 down/up，用于显式
+  `pointer_click`；
 - `EditableText.set_text_contents` 用于 `set_text`。
 - `Component.grab_focus` 后由固定路径 C++ XTest helper 注入普通 UTF-8，用于显式
   `type_text`。
 - GTK3 上，`Action.do_action` 的 exact canonical `click` 用于 `toggle`，exact
   canonical `activate` 用于 `expand`/`collapse`。
 
-除显式 `type_text` 外，驱动不会调用 XTEST；`set_text`、`invoke` 或其他语义动作失败
-时也绝不会自动进入该路径。helper 不调用 `xdotool`、shell、`uinput` 或剪贴板，驱动
-不做坐标点击、截图或 OCR。AT-SPI 未暴露节点或动作时，结果会明确失败。
+除显式 `pointer_click` 与 `type_text` 外，驱动不会调用 XTEST；`set_text`、`invoke` 或
+其他语义动作失败时也绝不会自动进入这些路径。`pointer_click` v0 只接受
+`target + locator`，只支持 `button=left` 与 `position=center`，显式拒绝调用方提供的
+裸 `x/y` 坐标。helper 不调用 `xdotool`、shell、`uinput` 或剪贴板，驱动不做 OCR。
+AT-SPI 未暴露节点、bounds 或动作时，结果会明确失败。
 登录管理器、锁屏、其他用户会话和提权界面不在当前支持范围内。
 
 ## 会话和后端报告
