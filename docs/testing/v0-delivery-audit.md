@@ -88,7 +88,7 @@
 
 ## 4. 验证记录
 
-- 实现冻结 revision `90c5c68` 的全量 Python 回归：`PYTHONPATH=src PYTHONDONTWRITEBYTECODE=1 python -m unittest discover -s tests -q`，共 534 项，通过，跳过 11 项非当前平台/会话用例，耗时 109.069 秒；审计文档提交后的最终 clean HEAD `7528df8` 使用同一命令再次运行，共 534 项通过、跳过 11 项，耗时 109.235 秒。最终实现包含三端 pointer、严格 Mac 回传证据、最终文档同步，以及 Qt5 fixture 的有界快照稳定性修复。
+- 实现冻结 revision `90c5c68` 的全量 Python 回归：`PYTHONPATH=src PYTHONDONTWRITEBYTECODE=1 python -m unittest discover -s tests -q`，共 534 项，通过，跳过 11 项非当前平台/会话用例，耗时 109.069 秒；审计文档 revision `7528df8` 使用同一命令再次运行，共 534 项通过、跳过 11 项，耗时 109.235 秒。两次实测都覆盖三端 pointer、严格 Mac 回传证据，以及 Qt5 fixture 的有界快照稳定性修复。具体对外交付 revision、源码内容摘要和源码归档摘要以每次从 clean worktree 生成测试包时的脚本输出及随包交付消息为准，不把会继续前移的 `HEAD` 写成固定事实。
 - durable 定向回归：read-only、finalization、journal 与 run service 共 93 项通过；独立复审未发现 P0/P1。heartbeat 启动握手失败后线程停止、lease 不再续期且到期可接管；`0.001/0.005/0.01/0.02/0.05s` 极短 TTL 均稳定返回可重试 `RUN.LEASE_LOST`，不会误报状态冲突/存储故障，也没有 provider 重复派发或 token 落盘。
 - Linux 本机：Debian 12、KDE Plasma 5.27.5、Qt 5.15.8、X11 `DISPLAY=:10.0`。
 - Linux 自有 fixture：GTK3 和 Qt5 的 snapshot/find/focus/语义写动作通过；显式 XTest UTF-8 输入后由 fresh AT-SPI snapshot 观察通过。
