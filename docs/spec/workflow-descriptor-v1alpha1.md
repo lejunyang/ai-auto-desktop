@@ -90,7 +90,7 @@ step 路径由嵌套 `id` 构成；`foreach` 运行记录还必须带 index。�
 
 `with` 必须通过已解析 action 的 `input_schema`，输出必须通过 `output_schema`。`effect.class` 是 `read_only`、`idempotent`、`non_idempotent` 或 `contextual`。`risk` 必须是对象：`category` 为 `observe|navigate|input|modify|send|delete|purchase|authorize|install|execute_script|capture_screen|custom`，`level` 为 `low|medium|high|critical|contextual`。
 
-Manifest 给出默认 effect/risk；descriptor、driver 动态判断和宿主策略都只能提高，不能降低有效等级。`precondition` 在执行前求值，且不得声明 `observe`。`postcondition` 可选声明专用观察动作 `observe: {uses, with}`：`uses` 必须是 canonical action ID，`with` 必须是对象；每次检查条件前执行该动作，并将其输出以 `observation` 暴露给 `condition`。`observe` 是闭合对象，不允许 `effect`、`risk`、`retry`、`on_error` 或其他字段。Runtime 必须在主动作派发前验证观察器存在、版本、平台、权限、风险、`read_only` effect，以及其所有错误均为 `not_applied`；不依赖当前 step 输出的静态 `with` 也必须提前校验。依赖 `steps.<当前步骤>.output` 的动态 `with` 只能在动作返回后求值。`postcondition.timeout` 存在时可在其预算内轮询；省略时仍立即观察并求值一次，但不继续轮询。任何 `unknown` effect 都禁止自动 retry。桌面动作必须完成 `observe → resolve → precondition → policy/confirm → execute → re-observe → postcondition` 闭环；每次 attempt 必须重新解析 locator，不得跨 snapshot 使用 `node_id`。
+Manifest 给出默认 effect/risk；descriptor、driver 动态判断和宿主策略都只能提高，不能降低有效等级。`precondition` 在执行前求值，且不得声明 `observe`。`postcondition` 可选声明专用观察动作 `observe: {uses, with}`：`uses` 必须是 canonical action ID，`with` 必须是对象；每次检查条件前执行该动作，并将其输出以 `observation` 暴露给 `condition`。`observe` 是闭合对象，不允许 `effect`、`risk`、`retry`、`on_error` 或其他字段。Runtime 必须在主动作派发前验证观察器存在、版本、平台、权限、风险、`read_only` effect，以及其所有错误均为 `not_applied`；不依赖当前 step 输出的静态 `with` 也必须提前校验。依赖 `steps.<当前步骤>.output` 的动态 `with` 只能在动作返回后求值。`postcondition.timeout` 存在时可在其预算内轮询；省略时仍立即观察并求值一次，但不继续轮询。任何 `unknown` effect 都禁止自动 retry。桌面动作必须完成 `observe → resolve → precondition → policy/confirm → execute → re-observe → postcondition` 闭环；每次 attempt 必须重新解析 locator，不得跨 snapshot 使用 `node_id`。三端 `pointer_click` v0 只能作为显式 action 使用，只接受 `target + locator` 与固定的 `button=left`、`position=center`，坐标必须由 fresh 语义节点 bounds 推导，并在派发前通过平台原生 element-at-point 验证；不接受裸坐标，也不得由 `invoke`、文本输入或 OCR 失败隐式触发。
 
 action 可为受限 durable read-only 模式额外声明 `sensitivity` 与 `checkpoint`。`sensitivity` 的
 `input`、`output`、`error` 必须分别显式标为 `public|sensitive`；只有三项均为 `public`，且
@@ -204,9 +204,9 @@ Manifest 使用相同 `apiVersion`，`kind: CapabilityManifest`，并包含：
 | `script` | 默认关闭；仅接受 `runtime: python`、deny-only sandbox，并且只在 Linux bubblewrap + prlimit 可用时执行 | 三端独立进程和 deny-by-default sandbox |
 | retry/on_error/finally | 支持基础语义、父子 deadline、合作式取消、unknown effect，以及受限串行计划的顶层安全点恢复 | action/script reconciliation 与协议级取消 |
 | budgets、risk/permission/confirmation policy | 支持执行预算、SQLite journal/lease 与 fail-closed 前置检查 | 跨进程 single-writer、真实确认 token 与完整 taint enforcement |
-| Windows UIA | 进程 driver：list/snapshot/find/focus/invoke/set_value/type_text；待 Windows 真机资格测试 | 完整 driver |
-| macOS AX | 已实现进程 driver、显式 type_text 与自包含真机测试包；真实 Mac TCC 结果待回传 | 签名稳定且经过应用矩阵验证的正式 driver |
-| Linux AT-SPI | KDE/X11 driver；本机 GTK3 与 Qt 5 Widgets 自有 fixture 已验证语义读取、写动作与显式 XTEST type_text；Konsole 与 System Settings 初始窗口的只读矩阵已通过 | 按 desktop/session profile 扩展 Dolphin、更多 QML 页面、多窗口、动态页面与受控写动作 |
+| Windows UIA | 进程 driver：list/snapshot/find/focus/invoke/set_value/type_text/pointer_click；待 Windows 真机资格测试 | 完整 driver |
+| macOS AX | 已实现进程 driver、显式 type_text/pointer_click 与自包含真机测试包；真实 Mac TCC 结果待回传 | 签名稳定且经过应用矩阵验证的正式 driver |
+| Linux AT-SPI | KDE/X11 driver；本机 GTK3 与 Qt 5 Widgets 自有 fixture 已验证语义读取、写动作、显式 XTEST type_text 与 pointer_click；Dolphin、Konsole、System Settings 和 QML fixture 初始窗口只读矩阵已通过 | 按 desktop/session profile 扩展更多 QML 页面、多窗口、动态页面与受控真实应用写动作 |
 | durable execution | JSON-only CLI 支持 start/resume/status/list/events/pause/cancel；默认拒绝 action，显式 `--durable-actions read-only` 后仅允许顶层隐式串行、无条件、无 pre/post/retry/handler/finally 的单次只读 action。双方 sensitivity 必须为 public，输出须按 provider `checkpoint_fields` 做 `project|omit`；`action_intent` v2 在 dispatch 前持久化并可安全重放。script、写 action、敏感值和复杂 action 控制流仍拒绝 | 写 action reconciliation、完整 taint tracking 与更通用的恢复 |
 | OCR engine | 显式 Tesseract 图片 provider；不自行截图 | 受控 frame/capture provenance |
 

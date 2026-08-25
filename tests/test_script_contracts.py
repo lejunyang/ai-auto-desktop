@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import json
 import shutil
 import sys
 import unittest
@@ -182,6 +183,40 @@ class ScriptPolicyContracts(unittest.TestCase):
 
 
 class LinuxScriptLaunchContracts(unittest.TestCase):
+    @unittest.skipUnless(sys.platform.startswith("linux"), "Linux sandbox smoke")
+    def test_real_sandbox_hides_host_files_and_environment(self) -> None:
+        if shutil.which("bwrap") is None or shutil.which("prlimit") is None:
+            self.skipTest("bubblewrap and prlimit are required")
+        source = (
+            "import json, os, sys\n"
+            "payload = json.load(sys.stdin)\n"
+            "def readable(path):\n"
+            "    try:\n"
+            "        open(path, encoding='utf-8').read(1)\n"
+            "        return True\n"
+            "    except OSError:\n"
+            "        return False\n"
+            "json.dump({'answer': payload['value'] * 2, "
+            "'passwd_visible': readable('/etc/passwd'), "
+            "'home_visible': readable('/data00/home/lejunyang/.ssh/id_rsa'), "
+            "'environment_keys': sorted(os.environ)}, sys.stdout)\n"
+        )
+        plan = script_plan(source=source)
+
+        with mock.patch.dict(
+            script.os.environ, {"AAD_HOST_SECRET": "must-not-cross"}
+        ):
+            result = execute(plan, timeout=5.0)
+
+        self.assertEqual(result["answer"], 42)
+        self.assertFalse(result["passwd_visible"])
+        self.assertFalse(result["home_visible"])
+        self.assertNotIn("AAD_HOST_SECRET", result["environment_keys"])
+        self.assertLessEqual(
+            set(result["environment_keys"]),
+            {"PATH", "PWD", "PYTHONIOENCODING", "LC_CTYPE"},
+        )
+
     def run_with_fake_sandbox(
         self,
         *,

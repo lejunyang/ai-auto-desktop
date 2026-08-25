@@ -39,7 +39,7 @@ Tesseract 是可选的系统依赖；只有区域裁剪需要 Pillow。依赖缺
 
 ## Windows 用户界面自动化驱动（UIA）
 
-`plugins/windows_uia` 是首个真实原生桌面驱动。在 Windows 上，它使用可选的 `comtypes` 绑定枚举窗口并归一化有界的 UIA Control View。驱动支持精确定位，以及原生 `SetFocus`、`InvokePattern.Invoke`、`ValuePattern.SetValue` 和显式 `type_text` Unicode 键盘后备；每次写操作都会在派发前重新抓取快照、解析目标并核对原生元素身份。安装并注册：
+`plugins/windows_uia` 是首个真实原生桌面驱动。在 Windows 上，它使用可选的 `comtypes` 绑定枚举窗口并归一化有界的 UIA Control View。驱动支持精确定位，以及原生 `SetFocus`、`InvokePattern.Invoke`、`ValuePattern.SetValue`、显式 `type_text` Unicode 键盘后备和显式 `pointer_click` 左键后备；每次写操作都会在派发前重新抓取快照、解析目标并核对原生元素身份。安装并注册：
 
 ```powershell
 pip install .[windows-uia]
@@ -49,14 +49,14 @@ python -m ai_auto_desktop run workflow.yaml `
   --plugin "desktop.windows_uia=plugins\windows_uia\run.cmd"
 ```
 
-读取类工作流声明 `desktop.observe`，写操作还要声明 `desktop.input`，两者都需要宿主显式授权。`type_text` 不会从 `set_value` 自动启用，只接受有界普通文本并禁止密码/protected 元素；它受 UIPI、完整性级别与前台焦点限制。该驱动不截图、不执行 OCR，也不提供指针输入。
+读取类工作流声明 `desktop.observe`，写操作还要声明 `desktop.input`，两者都需要宿主显式授权。`type_text` 不会从 `set_value` 自动启用，只接受有界普通文本并禁止密码/protected 元素；它受 UIPI、完整性级别与前台焦点限制。`pointer_click` 也不会由其他动作失败隐式启用，只能点击 fresh UIA 节点 bounds 的中心，并要求原生 hit-test 仍命中该元素。该驱动不截图、不执行 OCR。
 真实 Windows fixture 与 CI 已包含 `set_value → postcondition.observe(snapshot) → condition`
 闭环；在非 Windows 主机上只做契约测试，不能替代真实 UIA runner。
 
 ## Linux KDE/X11 AT-SPI 驱动
 
 `plugins/linux_atspi` 提供 `list_applications`、`snapshot`、`find`、`focus`、
-`invoke`、`set_text`、显式 `type_text`、`toggle`、`expand` 和 `collapse`。当前 v0 仅在进程环境明确为 KDE + X11 时启用；优先使用
+`invoke`、`set_text`、显式 `type_text`、显式 `pointer_click`、`toggle`、`expand` 和 `collapse`。当前 v0 仅在进程环境明确为 KDE + X11 时启用；优先使用
 `Atspi 2.0` typelib，缺失时用 Gio/D-Bus fallback 提供只读枚举和快照。Gio fallback
 不会伪装写能力，全部写动作都会返回 `DRIVER.ACTION_UNSUPPORTED`。注册方式：
 
@@ -74,15 +74,18 @@ Widgets fixture 也验证 snapshot/find/focus/set_text/invoke；隔离 X11/AT-SP
 Quick/QML fixture 的初始窗口已完成只读资格验证，分别取得 358、352、256 与 5 个未截断
 节点，且写动作派发数为零；Dolphin 只打开临时空目录。这仍不等于“任意 KDE/QML 应用已经
 支持”。自有 QML fixture 还通过 exact AT-SPI `Press` 和 fresh snapshot 状态变化验证，未使用
-键盘注入、OCR 或坐标；第三方 QML 页面、多窗口和动态页面仍需单独验证。除显式 `type_text` 外不会注入
-键鼠；驱动不截图、不执行 OCR。
+键盘注入、OCR 或坐标；第三方 QML 页面、多窗口和动态页面仍需单独验证。显式
+`pointer_click` 已在私有 Xvfb 的自有 GTK3/Qt5 fixture 上通过 XTEST 点击和 fresh snapshot
+后置条件；它只接受语义节点中心点，并要求 AT-SPI point hit 落在目标子树内。除显式
+`type_text`/`pointer_click` 外不会注入键鼠；驱动不截图、不执行 OCR。
 
 ## macOS 真机自测包
 
 `tests/macos` 是可直接复制到 Intel 或 Apple Silicon Mac 的自包含测试套件。它使用
 系统 `xcrun`/`swiftc` 构建固定 bundle ID 的 AppKit fixture 与 AX runner，限定在自有
-fixture PID 内验证有界 AX 遍历、精确 identifier、focus、set value、press，以及显式
-`type_text` 的 ASCII、中文和非 BMP Unicode 输入；每个动作后都重新观察。套件还会在
+fixture PID 内验证有界 AX 遍历、精确 identifier、focus、set value、press、显式
+`type_text` 的 ASCII、中文和非 BMP Unicode 输入，以及由 fresh AX bounds 推导中心点的显式
+`pointer_click`；每个动作后都重新观察。套件还会在
 派发前检查 Secure Event Input，并验证 secure text 目标被拒绝。默认不弹权限请求；只有
 显式参数才请求 Accessibility。Screen Recording 仅做 preflight，整个测试不截图。
 运行方式与回传归档格式见

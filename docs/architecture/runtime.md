@@ -23,7 +23,7 @@
 | 表达式 | 白名单 Python AST 的只读解释器，不使用 `eval/exec`，禁止所有函数和方法调用 | 保持无 I/O、有限成本、跨语言一致的表达式语义与测试向量 |
 | 步骤与控制流 | `action/set/block/fail/return/script`、`if/switch/foreach/while`、`on_error/finally`；sibling DAG 已支持有界只读并发；受限串行计划支持顶层安全点恢复，显式 opt-in 后支持具备投影契约的顶层只读 action 与 `action_intent` v2 重放；script 默认拒绝 | 写 action/script reconciliation 与更通用的可恢复计划状态机 |
 | 状态 | run 结果为 `succeeded/failed/timed_out/cancelled/unknown_effect`，step 另有 `skipped` | 冻结跨语言状态兼容与迁移规则 |
-| 执行能力 | 已有 Windows UIA、macOS AX、Linux KDE/X11 AT-SPI 进程 driver、三端显式文本输入后备和显式图片 OCR；资格范围分别记录 | 真实应用矩阵、受控截图与应用专用 adapter |
+| 执行能力 | 已有 Windows UIA、macOS AX、Linux KDE/X11 AT-SPI 进程 driver、三端显式文本输入、受限中心点左键 `pointer_click` 和显式图片 OCR；资格范围分别记录 | 真实应用矩阵、受控截图与应用专用 adapter |
 | IPC | stdio NDJSON v0，便于调试和跨语言实现；已校验 manifest schema/action major，尚无完整 wire version 协商 | 保留语义兼容层，迁移到 Protobuf/CBOR 等 IDL + named pipe/Unix socket |
 | 隔离 | process plugin 使用 POSIX 进程组；Linux script 使用 bubblewrap + prlimit，其他平台 fail-closed | Windows Job Object/restricted token；macOS 受控 helper；Linux bubblewrap/OCI；资源与 capability 限额 |
 | 安全 | 结构化错误、script fail-closed、action risk policy、manifest 与 action I/O schema 校验；确认 token/taint 等尚未实现 | 签名插件、系统 secret store、确认 token、完整 taint enforcement、审计与更新回滚 |
@@ -98,7 +98,7 @@ Host 还应维护全局 `max_steps`、`max_events`、`max_output_bytes` 等防�
 2. UIA / AX / AT-SPI accessibility 强标识和语义 action；
 3. accessibility 的关系、role、name、state 与可验证的弱匹配；
 4. 聚焦控件后的键盘快捷键；
-5. 从当前语义节点 bounds 推导的 pointer 动作；
+5. 从当前 fresh 语义节点 bounds 推导的显式 pointer 动作；v0 只允许中心点左键，并要求平台 hit-test 仍命中目标或其已证明子树；
 6. descriptor 显式声明的截图 + 非 OCR 视觉定位；
 7. descriptor 显式声明的 OCR step，其输出再由后续条件和动作消费。
 

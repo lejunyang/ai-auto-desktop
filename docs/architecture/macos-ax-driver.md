@@ -8,8 +8,9 @@
 ## 进程与信任边界
 
 公开能力名是 `desktop.macos_ax`，动作是 `list_apps`、`snapshot`、`find`、`focus`、
-`invoke`、`set_value` 和 `type_text`。manifest 只声明 `runtime.platforms: [macos]`，入口为
-`./run.sh`。观察动作要求 `desktop.observe`；四个写动作还要求 `desktop.input`。
+`invoke`、`set_value`、`type_text` 和 `pointer_click`。manifest 只声明
+`runtime.platforms: [macos]`，入口为 `./run.sh`。观察动作要求 `desktop.observe`；五个
+写动作还要求 `desktop.input`。
 
 实现分为两层：
 
@@ -36,8 +37,8 @@ package type。该检查是签名完整性检查，不是来源认证：当前�
 `source_authenticated=false`，部署者必须在本驱动之外建立来源信任。原生 helper 使用
 AppKit 枚举 `NSRunningApplication`，使用
 ApplicationServices 的 `AXUIElementCreateApplication`、属性 API 和动作 API；Python 没有
-PyObjC 或 AppleScript 路径，键盘输入仅存在于显式 `type_text` 动作，不是 `set_value` 的
-自动 fallback。
+PyObjC 或 AppleScript 路径，键鼠输入仅存在于显式 `type_text` / `pointer_click` 动作，不是
+其他动作的自动 fallback。
 
 原生 `AXUIElement` 仅保存在 Swift 进程的短期 token store 中，绝不出现在公开 NDJSON。
 每次 snapshot 开启新 token generation，只保留当前和上一 generation，以便写前重抓后比较
@@ -73,9 +74,11 @@ PyObjC 或 AppleScript 路径，键盘输入仅存在于显式 `type_text` 动�
 
 节点是带 `parent_id` 的扁平列表，字段包括 `role`、`subrole`、`name`、
 `description`、`value`、`states`、`bounds`、`actions` 和 `provenance`。bounds 使用 macOS
-全局屏幕 point 坐标，只作为观察信息，不能用于本驱动的输入回退。helper 只把可预检的动作
+全局屏幕 point 坐标；只有显式 `pointer_click` 可从 fresh 节点 bounds 推导中心点，调用方
+不能提交裸坐标。helper 只把可预检的动作
 声明到 `actions`：`AXFocused` 可写对应 `focus`，`AXPress` 存在对应 `invoke`，`AXValue`
-可写对应 `set_value`；非受保护、enabled、可聚焦且 role 为 `AXTextField`、`AXTextArea` 或
+可写对应 `set_value`；非受保护、enabled 且有正面积 bounds 对应 `pointer_click`；非受保护、
+enabled、可聚焦且 role 为 `AXTextField`、`AXTextArea` 或
 `AXComboBox` 的节点对应 `type_text`。secure text 的值始终是 null，标记 `protected` 和
 `value_redacted`，且不声明 `set_value` 或 `type_text`。
 

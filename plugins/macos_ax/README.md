@@ -1,13 +1,13 @@
 # macOS AX 进程驱动
 
 `desktop.macos_ax` 是 macOS 原生 Accessibility API（AX）能力的进程驱动。它提供
-`list_apps`、`snapshot`、`find`、`focus`、`invoke`、`set_value` 和显式键盘输入
-`type_text` 七个 v1 动作。
+`list_apps`、`snapshot`、`find`、`focus`、`invoke`、`set_value`、显式键盘输入
+`type_text` 和显式鼠标输入 `pointer_click` 八个 v1 动作。
 
 当前状态必须准确理解为：**跨平台协议核心和 native helper 源码已实现，但尚未在本仓库的
 macOS CI/真机上完成编译及资格验证**。Linux 等非 macOS 主机只运行 fake backend 契约测试；
 这不证明真实 AX 调用可用。未构建 helper、签名无效或未授予 Accessibility 权限时，生产
-路径会明确返回 `DRIVER.UNAVAILABLE`，不会使用伪实现、AppleScript、坐标点击或键鼠注入兜底。
+路径会明确返回 `DRIVER.UNAVAILABLE`，不会使用伪实现、AppleScript 或隐式键鼠注入兜底。
 
 ## 组成
 
@@ -85,14 +85,23 @@ fallback。它接收 `target`、`locator` 和 `text`，只允许 1–1024 个 Un
 {"type":"invoke","id":"t1","action":"desktop.macos_ax.type_text@1","args":{"target":{"snapshot_id":"...","revision":1,"node_id":"n3"},"locator":{"identifier":"title"},"text":"你好 macOS"}}
 ```
 
+`desktop.macos_ax.pointer_click@1` 同样只能显式调用。它只接受当前 snapshot 的
+`target + locator`，可选字段固定为 `button=left`、`position=center`，拒绝调用方裸传
+`x/y`。driver 会 fresh capture、唯一重解析并用 `CFEqual` 校验目标；Swift helper 再从
+fresh AX bounds 推导中心点，检查目标非 protected、应用仍 frontmost，并通过
+`AXUIElementCopyElementAtPosition` 确认中心点仍命中同一 AX 元素，才向目标 PID 提交
+`mouseMoved + leftMouseDown + leftMouseUp`。严格 exact hit-test 可能对返回内部子元素的应用
+安全地拒绝；v0 不为扩大覆盖而放松到同 PID。成功只表示事件已提交，仍需 fresh AX
+postcondition。
+
 ## 明确边界
 
 - 不支持模糊、contains 或正则定位；所有字段区分大小写并精确相等。
 - 截断快照不能用于 `find` 或写动作。
-- 密码/secure text 的值不读取、不回传，也不允许 `set_value` 或 `type_text`。
+- 密码/secure text 的值不读取、不回传，也不允许 `set_value`、`type_text` 或 `pointer_click`。
 - 不调用 `AXUIElementCreateSystemWide`，每棵树都限定在一个精确选中的 PID。
-- `type_text` 需要 Accessibility 权限，不需要 Screen Recording；目标应用必须保持前台，
-  不会自动激活应用。驱动不截图、不调用 AppleScript、不注入 pointer 事件。
+- `type_text` 和 `pointer_click` 需要 Accessibility 权限，不需要 Screen Recording；目标应用
+  必须保持前台，不会自动激活应用。驱动不截图、不调用 AppleScript。
 - `type_text` 只对 `AXTextField`、`AXTextArea`、`AXComboBox` 暴露，拒绝空文本、NUL、
   C0/C1 控制字符、孤立 surrogate 和超过上限的输入；换行或 Tab 应使用未来单独的按键动作。
 - helper 在首个 `keyDown.postToPid` 前检查系统 `IsSecureEventInputEnabled()`；启用时 fail closed，
@@ -102,6 +111,9 @@ fallback。它接收 `target`、`locator` 和 `text`，只允许 1–1024 个 Un
   `DRIVER.UNKNOWN_EFFECT` 并 kill helper。焦点已经改变但尚未发键时报告 `focus_changed=true` /
   `effect=contextual`；helper 在确认焦点后先发送独立进度帧，因此随后 timeout 也不会声称文本
   可能已输入。
+- `pointer_click` 在首个鼠标事件前发出独立 `pointer_dispatch_started=true` marker；marker
+  之前的失败为 `not_applied`，之后的 timeout、EOF、协议失败或部分结果一律归一为
+  `DRIVER.UNKNOWN_EFFECT`，不得自动重试。
 - `type_text` 不是密码输入、快捷键或粘贴接口：文本会经过进程间 NDJSON，调用方不得把
   secret 作为普通文本传入。
 - AX API 是同步 API；helper 为每个 element 设置不超过请求剩余时间的 messaging timeout，
