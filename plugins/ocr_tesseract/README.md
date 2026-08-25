@@ -51,12 +51,20 @@ Tesseract 前由 Pillow 检查尺寸、帧数并完整解码一次。Pillow 的 
 `OCR.ENGINE_UNAVAILABLE`；输入无效、图片不可读或签名无效、引擎失败、文本为空、置信度
 过低、TSV 格式错误或过大、输出含 NUL 或不是 UTF-8，以及超过截止时间，也都会以结构化
 错误返回。每次启动引擎都会创建独立的进程组或会话。Linux 上还强制通过 `prlimit` 限制
-地址空间、CPU 时间、输出文件大小、打开文件数和进程数；缺少 `prlimit` 时返回
+地址空间、CPU 时间、输出文件大小和打开文件数；缺少 `prlimit` 时返回
 `OCR.ENGINE_ISOLATION_UNAVAILABLE`，不会无约束启动。POSIX 上发生超时或输出溢出时会
 终止该进程组；Windows 上会尽力使用 `taskkill /T`（并在宽限期后使用 `/F`）。`stdout`、
 `stderr`、TSV 行、单词、文本行、文本、匹配项以及最终 NDJSON 响应均设有硬性上限。
 
-进程分离、精简环境、进程组清理和 Linux `prlimit` 只是纵深防御，不是完整沙箱：它们不隔离
+插件会把引擎环境精简到最小必需集合，并在默认情况下设置 `OMP_NUM_THREADS=1`、
+`OMP_THREAD_LIMIT=1`，将 Tesseract/libgomp 限制为单线程。这样做是因为 Linux 的
+`RLIMIT_NPROC` 语义是按同一 UID 的总任务数（包含线程）计数；在共享主机上把它固定为
+`512` 会把其他同 UID 进程和 OpenMP 工作线程一并算进去，导致真实 Tesseract 在启动时因
+`libgomp: Thread creation failed` fail-closed。为避免把共享主机上的外部噪声变成插件自身的
+可用性故障，provider 不再对引擎追加 `--nproc`，但仍保留其余 `prlimit` 边界、总 deadline、
+输出上限和进程组清理。
+
+进程分离、精简环境、OpenMP 单线程约束、进程组清理和 Linux `prlimit` 只是纵深防御，不是完整沙箱：它们不隔离
 文件系统、网络、系统调用或同一用户下的其他进程。当前 macOS 与 Windows 路径没有内置的
 等价资源沙箱，默认 fail-closed 为 `OCR.ENGINE_ISOLATION_UNAVAILABLE`。只有操作者已经用受控
 容器/低权限账户，或可信包装器提供 Job Object、sandbox profile 等外部边界时，才可显式设置

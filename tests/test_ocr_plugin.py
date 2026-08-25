@@ -9,6 +9,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 import textwrap
@@ -18,6 +19,8 @@ from unittest import mock
 
 import jsonschema
 from PIL import Image
+from PIL import ImageDraw
+from PIL import ImageFont
 
 from ai_auto_desktop.compiler import load_descriptor
 from ai_auto_desktop.journal import (
@@ -574,6 +577,8 @@ class TesseractPluginTests(unittest.TestCase):
         self.assertNotIn("AWS_SECRET_ACCESS_KEY", environment)
         self.assertEqual(environment["TESSDATA_PREFIX"], "/trusted/tessdata")
         self.assertEqual(environment["FAKE_TESSERACT_TSV"], "fixture")
+        self.assertEqual(environment["OMP_NUM_THREADS"], "1")
+        self.assertEqual(environment["OMP_THREAD_LIMIT"], "1")
 
     @unittest.skipUnless(sys.platform.startswith("linux"), "Linux prlimit contract")
     def test_linux_engine_launch_has_resource_limits_and_fails_closed(self) -> None:
@@ -584,7 +589,7 @@ class TesseractPluginTests(unittest.TestCase):
         self.assertTrue(any(item.startswith("--cpu=") for item in prefix))
         self.assertTrue(any(item.startswith("--fsize=") for item in prefix))
         self.assertTrue(any(item.startswith("--nofile=") for item in prefix))
-        self.assertTrue(any(item.startswith("--nproc=") for item in prefix))
+        self.assertFalse(any(item.startswith("--nproc=") for item in prefix))
         self.assertEqual(prefix[-1], "--")
 
         with mock.patch.object(module.shutil, "which", return_value=None):
@@ -602,7 +607,6 @@ class TesseractPluginTests(unittest.TestCase):
         self.assertEqual(applied["RLIMIT_AS"], [2 * 1024**3, 2 * 1024**3])
         self.assertEqual(applied["RLIMIT_FSIZE"], [16 * 1024**2, 16 * 1024**2])
         self.assertEqual(applied["RLIMIT_NOFILE"], [64, 64])
-        self.assertEqual(applied["RLIMIT_NPROC"], [512, 512])
         self.assertGreaterEqual(applied["RLIMIT_CPU"][0], 1)
         self.assertLessEqual(applied["RLIMIT_CPU"][0], 30)
 
@@ -636,6 +640,7 @@ class TesseractPluginTests(unittest.TestCase):
             "40,000,000",
             "OCR.IMAGE_LIMIT_EXCEEDED",
             "prlimit",
+            "OMP_NUM_THREADS=1",
             "不是完整沙箱",
             "OCR_ALLOW_UNSANDBOXED_ENGINE=1",
             "sensitive: true",
@@ -643,6 +648,68 @@ class TesseractPluginTests(unittest.TestCase):
         ):
             self.assertIn(marker, readme)
         self.assertIn("durable start 必须在创建 run 前拒绝", spec)
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "Linux Tesseract smoke")
+    def test_real_tesseract_smoke_uses_single_thread_environment(self) -> None:
+        if not Path("/usr/bin/tesseract").exists():
+            self.skipTest("/usr/bin/tesseract is not installed")
+
+        languages = subprocess.run(
+            ["/usr/bin/tesseract", "--list-langs"],
+            check=False,
+            capture_output=True,
+            text=True,
+            env={"PATH": "/usr/bin:/bin", "LC_ALL": "C.UTF-8", "LANG": "C.UTF-8"},
+        )
+        if languages.returncode != 0:
+            self.skipTest(f"unable to query Tesseract languages: {languages.stderr.strip()}")
+        available = {line.strip() for line in languages.stdout.splitlines() if line.strip()}
+        if not {"eng", "chi_sim"}.issubset(available):
+            self.skipTest(f"missing Tesseract languages: {sorted({'eng', 'chi_sim'} - available)}")
+
+        font_query = subprocess.run(
+            ["fc-match", "-f", "%{file}\n", "Noto Sans CJK SC"],
+            check=False,
+            capture_output=True,
+            text=True,
+            env={"PATH": "/usr/bin:/bin"},
+        )
+        font_path = Path(font_query.stdout.strip())
+        if font_query.returncode != 0 or not font_path.exists():
+            self.skipTest("missing a system font capable of rendering chi_sim smoke text")
+
+        image = self.directory / "smoke.png"
+        canvas = Image.new("RGB", (240, 80), "white")
+        draw = ImageDraw.Draw(canvas)
+        font = ImageFont.truetype(str(font_path), 24)
+        draw.text((12, 8), "TEST 42", fill="black", font=font)
+        draw.text((12, 40), "中文", fill="black", font=font)
+        canvas.save(image, "PNG")
+
+        plugin = ProcessPlugin(
+            [sys.executable, str(OCR_PLUGIN)],
+            env={
+                "PATH": "/usr/bin:/bin",
+                "TESSERACT_CMD": "/usr/bin/tesseract",
+            },
+            timeout=8,
+            name="vision.ocr",
+        )
+        self.addCleanup(plugin.close)
+        result = plugin.invoke(
+            "vision.ocr.recognize@1",
+            {
+                "image": {"path": str(image)},
+                "languages": ["eng", "chi_sim"],
+                "minimum_confidence": 0.0,
+                "patterns": [{"id": "ascii", "value": "TEST"}],
+            },
+        )
+
+        self.assertEqual(result["provider"], "tesseract")
+        self.assertIn("TEST", result["text"])
+        self.assertEqual(result["matches"][0]["pattern_id"], "ascii")
+        self.assertGreaterEqual(result["confidence"], 0.0)
 
 
 if __name__ == "__main__":

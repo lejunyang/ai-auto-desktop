@@ -58,7 +58,13 @@ LINUX_ENGINE_ADDRESS_SPACE_BYTES = 2 * 1024 * 1024 * 1024
 LINUX_ENGINE_CPU_SECONDS = 30
 LINUX_ENGINE_FILE_BYTES = 16 * 1024 * 1024
 LINUX_ENGINE_OPEN_FILES = 64
-LINUX_ENGINE_PROCESSES = 512
+ENGINE_THREAD_ENVIRONMENT = {
+    # Tesseract can load libgomp/OpenMP, and RLIMIT_NPROC counts threads against
+    # the per-UID total on Linux. Keep the engine single-threaded so it remains
+    # viable on shared hosts without relaxing other resource limits.
+    "OMP_NUM_THREADS": "1",
+    "OMP_THREAD_LIMIT": "1",
+}
 ALLOW_UNSANDBOXED_ENGINE_ENV = "OCR_ALLOW_UNSANDBOXED_ENGINE"
 
 BOUNDS_SCHEMA: dict[str, Any] = {
@@ -935,6 +941,7 @@ def _engine_environment(executable: str) -> dict[str, str]:
         search_paths.extend(("/usr/bin", "/bin"))
     environment: dict[str, str] = {
         "PATH": os.pathsep.join(dict.fromkeys(filter(None, search_paths))),
+        **ENGINE_THREAD_ENVIRONMENT,
         "PYTHONIOENCODING": "utf-8",
         "PYTHONUTF8": "1",
     }
@@ -978,7 +985,6 @@ def _linux_prlimit_prefix(deadline: float) -> list[str]:
         f"--cpu={cpu_seconds}:{cpu_seconds}",
         f"--fsize={LINUX_ENGINE_FILE_BYTES}:{LINUX_ENGINE_FILE_BYTES}",
         f"--nofile={LINUX_ENGINE_OPEN_FILES}:{LINUX_ENGINE_OPEN_FILES}",
-        f"--nproc={LINUX_ENGINE_PROCESSES}:{LINUX_ENGINE_PROCESSES}",
         "--",
     ]
 
