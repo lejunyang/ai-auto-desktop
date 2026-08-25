@@ -81,6 +81,8 @@
 | `fe12424` | 明确 macOS pointer 真机包的源码白名单归属 |
 | `6f6dad6` | 记录三端显式 pointer 的最终资格边界 |
 | `90c5c68` | 扩大自有 Qt5 fixture 的有界快照余量，消除主题/辅助功能配置导致的偶发截断 |
+| `235945a` | 增加隔离 KCalc 真实语义计算闭环并修正文档事实 |
+| `ced4dee` | 加固 KCalc 私有 Xvfb、进程身份和超时清理证明 |
 
 本表所列提交均包含且仅包含一条
 `Co-authored-by: TRAE CLI <noreply@bytedance.com>` trailer。后续文档修订的 commit ID
@@ -102,6 +104,10 @@
 - Linux 显式 pointer：私有 Xvfb + 隔离 AT-SPI bus 上，自有 GTK3 和 Qt5 fixture 均通过语义节点中心点 XTEST 左键点击，并由 fresh AT-SPI snapshot 观察独立状态变化；driver 还要求 AT-SPI element-at-point 命中目标子树，X11 helper 再核对焦点与点下窗口 PID。
 - OCR 实机：本机安装 Tesseract 5.3.0 与 `eng`/`chi_sim`，真实生成中英图片后，provider 识别 `状态 READY 2026`，workflow 对字面目标 `READY` 返回 `decision=respond`。共享 UID 下固定 `RLIMIT_NPROC` 导致的误杀已改为 OpenMP 单线程约束，同时保留地址空间、CPU、文件大小、fd、deadline、输出与进程组边界。
 - 最终独立只读审查未发现 P0/P1。审查指出自有 Qt5 fixture 在部分主机上可能因主题或输入法暴露额外 AT-SPI 子节点而触发 64 节点截断；`90c5c68` 将该测试专用上限提高到仍远低于 driver 5000 节点硬上限的 256，并重新实跑 GTK3/Qt5 隔离测试和全量回归。
+- KCalc 加固 revision `ced4dee` 的全量 Python 回归共 539 项通过，跳过 12 项非当前平台/
+  会话用例，耗时 125.198 秒；独立只读审查未发现 P0/P1/P2。Linux driver、native、
+  qualification 与 verifier 定向回归共 75 项通过，跳过 6 项；Mac testkit、结果验真、
+  workflow 示例和 OCR 定向回归共 88 项通过。
 
 ## 5. 外部门禁与未完成资格
 
