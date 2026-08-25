@@ -39,7 +39,10 @@ _EXPRESSION = re.compile(r"^\$\{\{(.*?)\}\}$", re.DOTALL)
 _TOP = {"apiVersion", "kind", "metadata", "requires", "inputs", "variables", "outputs", "defaults", "budgets", "policy", "steps", "on_error", "finally", "extensions"}
 _COMMON = {"id", "type", "depends_on", "description", "if", "timeout", "attempt_timeout", "retry", "on_error", "finally", "extensions"}
 _FIELDS = {
-    "action": {"uses", "with", "effect", "risk", "precondition", "postcondition"},
+    "action": {
+        "uses", "with", "effect", "risk", "precondition",
+        "postcondition", "sensitivity", "checkpoint",
+    },
     "set": {"assign"}, "if": {"condition", "then", "else"},
     "switch": {"cases", "default"},
     "foreach": {"items", "as", "index_as", "max_items", "concurrency", "steps"},
@@ -376,6 +379,36 @@ class _Compiler:
             if not isinstance(obj["with"], Mapping): self.issue(f"{path}.with", "must be an object", "type")
             self.values(obj["with"], f"{path}.with")
 
+    def action_sensitivity(self, value: Any, path: str) -> None:
+        obj = self.obj(value, path)
+        if obj is None:
+            return
+        self.unknown(obj, {"input", "output", "error"}, path)
+        for key in ("input", "output", "error"):
+            if key in obj and obj[key] not in {"public", "sensitive"}:
+                self.issue(f"{path}.{key}", "must be public or sensitive", "enum")
+
+    def action_checkpoint(self, value: Any, path: str) -> None:
+        checkpoint = self.obj(value, path)
+        if checkpoint is None:
+            return
+        self.unknown(checkpoint, {"output"}, path)
+        self.required(checkpoint, ["output"], path)
+        output = self.obj(checkpoint.get("output"), f"{path}.output")
+        if output is None:
+            return
+        self.unknown(output, {"mode", "fields"}, f"{path}.output")
+        self.required(output, ["mode"], f"{path}.output")
+        mode = output.get("mode")
+        if mode not in {"omit", "project"}:
+            self.issue(f"{path}.output.mode", "invalid checkpoint mode", "enum")
+        if mode == "project":
+            self.required(output, ["fields"], f"{path}.output")
+            if "fields" in output:
+                self.strings(output["fields"], f"{path}.output.fields")
+        elif "fields" in output:
+            self.issue(f"{path}.output.fields", "fields require project mode", "policy")
+
     def assertion(self, value: Any, path: str, post: bool) -> None:
         obj = self.obj(value, path)
         if obj is None: return
@@ -471,6 +504,8 @@ class _Compiler:
             if "risk" in obj: self.risk(obj["risk"], f"{path}.risk")
             if "precondition" in obj: self.assertion(obj["precondition"], f"{path}.precondition", False)
             if "postcondition" in obj: self.assertion(obj["postcondition"], f"{path}.postcondition", True)
+            if "sensitivity" in obj: self.action_sensitivity(obj["sensitivity"], f"{path}.sensitivity")
+            if "checkpoint" in obj: self.action_checkpoint(obj["checkpoint"], f"{path}.checkpoint")
         elif step_type == "set":
             self.required(obj, ["assign"], path); assign = self.obj(obj.get("assign"), f"{path}.assign") if "assign" in obj else None
             if assign is not None:

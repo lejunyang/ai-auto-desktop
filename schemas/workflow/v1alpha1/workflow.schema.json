@@ -106,6 +106,47 @@
       "pattern": "^\\$\\{\\{[\\s\\S]+\\}\\}$",
       "maxLength": 8192
     },
+    "actionSensitivity": {
+      "type": "object",
+      "properties": {
+        "input": {"enum": ["public", "sensitive"]},
+        "output": {"enum": ["public", "sensitive"]},
+        "error": {"enum": ["public", "sensitive"]}
+      },
+      "additionalProperties": false
+    },
+    "actionCheckpoint": {
+      "type": "object",
+      "required": ["output"],
+      "properties": {
+        "output": {
+          "oneOf": [
+            {
+              "type": "object",
+              "required": ["mode"],
+              "properties": {"mode": {"const": "omit"}},
+              "additionalProperties": false
+            },
+            {
+              "type": "object",
+              "required": ["mode", "fields"],
+              "properties": {
+                "mode": {"const": "project"},
+                "fields": {
+                  "type": "array",
+                  "items": {"$ref": "#/$defs/identifier"},
+                  "minItems": 1,
+                  "maxItems": 128,
+                  "uniqueItems": true
+                }
+              },
+              "additionalProperties": false
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
     "valueOrExpression": true,
     "jsonSchema": {
       "oneOf": [
@@ -758,6 +799,12 @@
             },
             "postcondition": {
               "$ref": "#/$defs/postcondition"
+            },
+            "sensitivity": {
+              "$ref": "#/$defs/actionSensitivity"
+            },
+            "checkpoint": {
+              "$ref": "#/$defs/actionCheckpoint"
             }
           }
         }

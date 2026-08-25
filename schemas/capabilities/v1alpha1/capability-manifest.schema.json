@@ -57,6 +57,50 @@
       "type": "string",
       "pattern": "^[1-9][0-9]*(?:ms|s|m|h)$"
     },
+    "identifier": {
+      "type": "string",
+      "pattern": "^[A-Za-z_][A-Za-z0-9_]*$",
+      "maxLength": 128
+    },
+    "actionSensitivity": {
+      "type": "object",
+      "properties": {
+        "input": {"enum": ["public", "sensitive"]},
+        "output": {"enum": ["public", "sensitive"]},
+        "error": {"enum": ["public", "sensitive"]}
+      },
+      "additionalProperties": false
+    },
+    "checkpointField": {
+      "type": "object",
+      "required": ["pointer", "schema"],
+      "properties": {
+        "pointer": {
+          "type": "string",
+          "pattern": "^/(?:[^/~]|~[01])*(?:/(?:[^/~]|~[01])*){0,63}$",
+          "maxLength": 1024
+        },
+        "schema": {"$ref": "#/$defs/jsonSchema"},
+        "missing": {
+          "enum": ["error", "omit", "null"],
+          "default": "error"
+        }
+      },
+      "additionalProperties": false
+    },
+    "actionDurability": {
+      "type": "object",
+      "required": ["checkpoint_fields"],
+      "properties": {
+        "checkpoint_fields": {
+          "type": "object",
+          "propertyNames": {"$ref": "#/$defs/identifier"},
+          "additionalProperties": {"$ref": "#/$defs/checkpointField"},
+          "maxProperties": 128
+        }
+      },
+      "additionalProperties": false
+    },
     "metadata": {
       "type": "object",
       "required": [
@@ -359,6 +403,12 @@
             "$ref": "#/$defs/errorContract"
           },
           "uniqueItems": true
+        },
+        "sensitivity": {
+          "$ref": "#/$defs/actionSensitivity"
+        },
+        "durability": {
+          "$ref": "#/$defs/actionDurability"
         }
       },
       "additionalProperties": false
