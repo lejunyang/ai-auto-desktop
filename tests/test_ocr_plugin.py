@@ -144,6 +144,11 @@ class TesseractPluginTests(unittest.TestCase):
         env["FAKE_TESSERACT_TSV"] = TSV
         env["FAKE_TESSERACT_LOG"] = str(self.directory / "engine.log")
         env["FAKE_TESSERACT_DIGEST_LOG"] = str(self.directory / "digest.log")
+        # The synthetic engine is the test-controlled process whose protocol
+        # behavior is under test.  Non-Linux hosts have no prlimit equivalent,
+        # so opt in explicitly instead of making the production plugin infer
+        # that an unsandboxed engine is acceptable.
+        env["OCR_ALLOW_UNSANDBOXED_ENGINE"] = "1"
         if env_updates:
             env.update(env_updates)
         plugin = ProcessPlugin(

@@ -224,6 +224,16 @@ private final class AXService {
         }
     }
 
+    // Carbon's Boolean result was imported as UInt8 by older Swift SDKs and as
+    // Bool by current SDKs. Keep both overloads so either importer is accepted.
+    private func secureEventInputIsEnabled(_ value: Bool) -> Bool {
+        return value
+    }
+
+    private func secureEventInputIsEnabled(_ value: UInt8) -> Bool {
+        return value != 0
+    }
+
     private func requireTrusted() throws {
         guard AXIsProcessTrusted() else {
             throw HelperFailure(
@@ -449,7 +459,8 @@ private final class AXService {
         guard copyError == .success, let values = raw else { return ([], true) }
         var result: [AXUIElement] = []
         for index in 0..<CFArrayGetCount(values) {
-            let pointer = CFArrayGetValueAtIndex(values, index)
+            let rawPointer: UnsafeRawPointer? = CFArrayGetValueAtIndex(values, index)
+            guard let pointer = rawPointer else { return (result, true) }
             let value = Unmanaged<CFTypeRef>.fromOpaque(pointer).takeUnretainedValue()
             guard CFGetTypeID(value) == AXUIElementGetTypeID() else { return (result, true) }
             result.append(unsafeBitCast(value, to: AXUIElement.self))
@@ -674,7 +685,10 @@ private final class AXService {
                 data: progress.keyboardMetadata(phase: "target_preflight")
             )
         }
-        guard IsSecureEventInputEnabled() == 0 else {
+        let secureEventInputEnabled = secureEventInputIsEnabled(
+            IsSecureEventInputEnabled()
+        )
+        guard !secureEventInputEnabled else {
             throw HelperFailure(
                 "DRIVER.PROTECTED_ELEMENT",
                 "macOS Secure Event Input is enabled",
@@ -724,7 +738,10 @@ private final class AXService {
         var offset = 0
         while offset < utf16.count {
             try requireFrontmost(targetPID, operation: "type_text")
-            guard IsSecureEventInputEnabled() == 0 else {
+            let secureEventInputEnabled = secureEventInputIsEnabled(
+                IsSecureEventInputEnabled()
+            )
+            guard !secureEventInputEnabled else {
                 throw HelperFailure(
                     "DRIVER.PROTECTED_ELEMENT",
                     "macOS Secure Event Input became enabled before keyboard dispatch",
@@ -796,7 +813,10 @@ private final class AXService {
                 stringLength: buffer.count, unicodeString: buffer.baseAddress
             )
         }
-        guard IsSecureEventInputEnabled() == 0 else {
+        let secureEventInputEnabled = secureEventInputIsEnabled(
+            IsSecureEventInputEnabled()
+        )
+        guard !secureEventInputEnabled else {
             throw HelperFailure(
                 "DRIVER.PROTECTED_ELEMENT",
                 "macOS Secure Event Input became enabled before keyboard dispatch",
@@ -878,7 +898,8 @@ private final class AXService {
         guard AXUIElementCopyActionNames(element, &raw) == .success, let values = raw else { return [] }
         var result: [String] = []
         for index in 0..<CFArrayGetCount(values) {
-            let pointer = CFArrayGetValueAtIndex(values, index)
+            let rawPointer: UnsafeRawPointer? = CFArrayGetValueAtIndex(values, index)
+            guard let pointer = rawPointer else { continue }
             let value = Unmanaged<CFTypeRef>.fromOpaque(pointer).takeUnretainedValue()
             if CFGetTypeID(value) == CFStringGetTypeID() {
                 result.append(bounded(value as! String))

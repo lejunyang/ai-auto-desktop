@@ -30,10 +30,13 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
-      - name: Install project
-        run: python -m pip install "${{ matrix.install-target }}"
+      - name: Install project and contract test dependencies
+        run: python -m pip install wheel "${{ matrix.install-target }}[ocr]"
       - name: Run contract tests
         run: python -m unittest discover -s tests -v
+      - name: Build production macOS AX helper
+        if: runner.os == 'macOS'
+        run: plugins/macos_ax/build.sh
       - name: Build macOS AX fixture test kit
         if: runner.os == 'macOS'
         run: tests/macos/build.sh

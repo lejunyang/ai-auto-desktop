@@ -12,6 +12,43 @@ WINDOWS_RESULT_PATH = "artifacts/windows-native-fixture-result.json"
 
 
 class CiTriggerContractTests(unittest.TestCase):
+    def test_automatic_contract_jobs_install_declared_optional_dependencies(
+        self,
+    ) -> None:
+        source = CI_WORKFLOW.read_text(encoding="utf-8")
+        automatic_job = source.split("  windows-native:", 1)[0]
+
+        self.assertIn(
+            'python -m pip install wheel "${{ matrix.install-target }}[ocr]"',
+            automatic_job,
+        )
+        self.assertNotIn("apt-get", automatic_job)
+        self.assertNotIn("brew install", automatic_job)
+
+    def test_macos_builds_production_helper_after_portable_contracts(self) -> None:
+        source = CI_WORKFLOW.read_text(encoding="utf-8")
+        automatic_job = source.split("  windows-native:", 1)[0]
+        contract_command = "python -m unittest discover -s tests -v"
+        production_build = "plugins/macos_ax/build.sh"
+        fixture_build = "tests/macos/build.sh"
+
+        self.assertIn(production_build, automatic_job)
+        self.assertRegex(
+            automatic_job,
+            re.compile(
+                r"- name: Build production macOS AX helper\n"
+                r"\s+if: runner\.os == 'macOS'\n"
+                r"\s+run: plugins/macos_ax/build\.sh"
+            ),
+        )
+        self.assertLess(
+            automatic_job.index(contract_command),
+            automatic_job.index(production_build),
+        )
+        self.assertLess(
+            automatic_job.index(production_build), automatic_job.index(fixture_build)
+        )
+
     def test_windows_native_job_requires_explicit_manual_input(self) -> None:
         source = CI_WORKFLOW.read_text(encoding="utf-8")
 
@@ -78,7 +115,10 @@ class CiTriggerContractTests(unittest.TestCase):
     def test_windows_result_runner_has_stable_machine_readable_fields(self) -> None:
         source = WINDOWS_RESULT_RUNNER.read_text(encoding="utf-8")
 
-        self.assertIn("python -m unittest discover -s tests -v", source)
+        self.assertIn(
+            "python -m unittest -v tests.test_windows_uia_native", source
+        )
+        self.assertNotIn("unittest discover -s tests", source)
         self.assertIn("finally {", source)
         self.assertIn("ConvertTo-Json", source)
         for field in (

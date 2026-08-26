@@ -39,8 +39,11 @@ Tools；不需要预装 Python、项目包或第三方依赖。
 并写入 `error.code=runner_timeout`；构建、签名、报告解析和归档阶段也使用稳定错误码及
 `execution` 字段，便于远程排查。
 结果目录默认位于当前目录的 `results/`，其中的 `macos-ax-test-result.tar.gz` 可直接回传。
-归档只含 `report.json`、`identity.txt`、`SHA256SUMS` 和隐私说明，不含截图、屏幕像素、构建日志、用户名、主机名，
-也不读取 fixture 之外的应用。
+归档只含 `report.json`、`identity.txt`、`SHA256SUMS` 和隐私说明，不含截图、屏幕像素、
+原始构建日志、用户名、主机名，也不读取 fixture 之外的应用。若 Swift 编译失败，
+`README.txt` 会追加一段最多 120 行、每行最多 512 bytes、正文最多 12 KiB 的诊断；该段只保留
+编译器文本，并把 testkit、build、SDK、swiftc 及其他绝对路径替换为占位符，同时移除非打印
+字符。诊断总文件还受 16 KiB 上限约束，归档完成后会从 build 目录删除，避免陈旧错误混入下次结果。
 `identity.txt` 仅保存 bundle 的 designated requirement、Identifier、TeamIdentifier、
 CDHash、Mach-O 架构和可执行文件 SHA-256，不保存绝对路径。
 其中 Swift 版本、identity stability，以及 runner/fixture 各自的 designated requirement、

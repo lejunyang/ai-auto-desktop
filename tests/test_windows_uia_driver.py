@@ -1101,6 +1101,24 @@ class WindowsUIADriverCoreTests(unittest.TestCase):
         self.assertEqual(failed.exception.data["phase"], "before_dispatch")
         self.assertFalse(any(call[0] == "send_pointer_click" for call in calls))
 
+    def test_element_from_point_uses_comtypes_generated_point_type(self) -> None:
+        observed: list[object] = []
+
+        class Automation:
+            def ElementFromPoint(self, point: object) -> str:
+                observed.append(point)
+                if type(point) is not uia.wintypes.POINT:
+                    raise TypeError("incompatible POINT type")
+                return "hit"
+
+        backend = object.__new__(uia.ComtypesUIABackend)
+        backend.automation = Automation()
+
+        self.assertEqual(backend._element_from_point(-25, 40), "hit")
+        self.assertEqual(len(observed), 1)
+        self.assertIs(type(observed[0]), uia.wintypes.POINT)
+        self.assertEqual((observed[0].x, observed[0].y), (-25, 40))
+
     def test_native_pointer_click_runs_hit_test_immediately_before_dispatch(self) -> None:
         calls: list[tuple[object, ...]] = []
 

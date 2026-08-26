@@ -56,11 +56,12 @@ class CompilerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory, "workflow.json")
             path.write_text(json.dumps(value), encoding="utf-8")
+            canonical_path = path.resolve()
 
             compiled = load_descriptor(path)
 
-        self.assertEqual(compiled.name, "compiler-contract")
-        self.assertEqual(compiled.source, path)
+            self.assertEqual(compiled.name, "compiler-contract")
+            self.assertEqual(compiled.source, canonical_path)
 
     def test_required_input_cannot_also_have_default(self) -> None:
         value = descriptor({"id": "finish", "type": "return"})

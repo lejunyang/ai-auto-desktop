@@ -194,6 +194,40 @@ class MacOSTestkitSourceContracts(unittest.TestCase):
             )
         )
 
+    def test_cfarray_values_promote_to_optional_and_fail_closed(self) -> None:
+        self.assertEqual(
+            self.runner.count(
+                "let rawPointer: UnsafeRawPointer? = "
+                "CFArrayGetValueAtIndex(values, index)"
+            ),
+            2,
+        )
+        self.assertEqual(
+            self.runner.count("guard let pointer = rawPointer else {"), 2
+        )
+        self.assertNotRegex(
+            self.runner,
+            r"guard let pointer = CFArrayGetValueAtIndex",
+        )
+
+    def test_private_runner_types_do_not_escape_through_top_level_values(
+        self,
+    ) -> None:
+        self.assertIn("private struct Arguments", self.runner)
+        self.assertIn("private struct Outcome", self.runner)
+        self.assertIn("private func main() -> Never", self.runner)
+        main = self.runner[self.runner.index("private func main() -> Never") :]
+        for marker in (
+            "let parsedArguments = parseArguments()",
+            "let outcome = run(arguments: parsedArguments)",
+            "let reportDestination = parsedArguments?.reportPath",
+        ):
+            with self.subTest(marker=marker):
+                self.assertIn(marker, main)
+        prefix = self.runner[: self.runner.index("private func main() -> Never")]
+        self.assertNotRegex(prefix, r"(?m)^let parsedArguments =")
+        self.assertNotRegex(prefix, r"(?m)^let outcome =")
+
     def test_each_mutation_uses_a_freshly_resolved_element_and_rereads(self) -> None:
         for marker in (
             "func freshSnapshot() -> Snapshot",
@@ -316,12 +350,15 @@ class MacOSTestkitSourceContracts(unittest.TestCase):
             '"utf16_units_posted": dispatch.utf16UnitsPosted',
             '"event_submitted": dispatch.submitted',
             "IsSecureEventInputEnabled()",
+            "private func secureEventInputIsEnabled(_ value: Bool) -> Bool",
+            "private func secureEventInputIsEnabled(_ value: UInt8) -> Bool",
             "secure_event_input_enabled_before_dispatch",
             "secure_event_input_checked_before_dispatch",
             "let protected = role == \"AXSecureTextField\"",
         ):
             with self.subTest(marker=marker):
                 self.assertIn(marker, self.runner)
+        self.assertNotIn("IsSecureEventInputEnabled() != 0", self.runner)
         self.assertIn(
             "secureInput = NSSecureTextField(",
             self.fixture,
@@ -439,6 +476,39 @@ class MacOSTestkitSourceContracts(unittest.TestCase):
         self.assertIn('"$swiftc_path" --version', self.build)
         self.assertIn('至少需要 Swift 5.3', self.build)
         self.assertIn('exit 81', self.build)
+
+    def test_compile_diagnostics_are_bounded_sanitized_and_archived_in_readme(
+        self,
+    ) -> None:
+        for marker in (
+            'compile_diagnostics="$build_root/compile-diagnostics.txt"',
+            "max_lines=120",
+            "max_output_bytes=12288",
+            "max_line_bytes = 512",
+            "LC_ALL=C head -c 131072",
+            "compile_status_file=$compile_log.status",
+            "compile_overflow_file=$compile_log.overflow",
+            "compile_overflow_bytes=$(LC_ALL=C wc -c",
+            "raw_capture_limit_bytes=131072",
+            "raw_capture_truncated=",
+            'replace_literal(value, diagnostic_script_dir, "<TESTKIT>")',
+            'replace_literal(value, diagnostic_build_root, "<BUILD>")',
+            'replace_literal(value, diagnostic_sdk_path, "<SDK>")',
+            '"[compiler output truncated]"',
+        ):
+            with self.subTest(marker=marker):
+                self.assertIn(marker, self.build)
+        for marker in (
+            'compile_diagnostics_size" -le 16384',
+            "--- sanitized Swift compile diagnostics ---",
+            'cat "$compile_diagnostics_path"',
+            'rm -f "$build_root/compile-diagnostics.txt"',
+        ):
+            with self.subTest(marker=marker):
+                self.assertIn(marker, self.launcher)
+        self.assertNotIn(
+            "compile-diagnostics.txt SHA256SUMS", self.launcher
+        )
 
     def test_result_archiver_normalizes_metadata_portably(self) -> None:
         self.assertIn(
@@ -618,6 +688,208 @@ class MacOSTestkitSourceContracts(unittest.TestCase):
             self.assertEqual(completed.returncode, 1)
             self.assertEqual(report["error"]["code"], "invalid_source_provenance")
             self.assertFalse((root / "build").exists())
+
+
+class MacOSTestkitCompileDiagnosticContracts(unittest.TestCase):
+    @staticmethod
+    def _copy_testkit(root: Path) -> Path:
+        repository = root / "repository"
+        copied = repository / "tests" / "macos"
+        copied.parent.mkdir(parents=True)
+        shutil.copytree(TESTKIT_ROOT, copied)
+        git = shutil.which("git")
+        if git is None:
+            raise unittest.SkipTest("git is required")
+        subprocess.run([git, "init", "-q"], cwd=repository, check=True)
+        subprocess.run([git, "add", "tests/macos"], cwd=repository, check=True)
+        subprocess.run(
+            [
+                git, "-c", "user.name=Test",
+                "-c", "user.email=test@example.invalid",
+                "commit", "-qm", "fixture baseline",
+            ],
+            cwd=repository,
+            check=True,
+        )
+        return copied
+
+    @staticmethod
+    def _write_mock_tools(
+        root: Path, testkit: Path, *, flood_output: bool = False
+    ) -> Path:
+        fake_bin = root / "bin"
+        fake_bin.mkdir()
+        flood_script = ""
+        if flood_output:
+            flood_script = """
+    index=0
+    while [ "$index" -lt 300 ]; do
+      printf 'detail-%03d ' "$index" >&2
+      printf '%0600d\n' 0 >&2
+      index=$((index + 1))
+    done
+"""
+        scripts = {
+            "uname": """#!/bin/sh
+if [ "${1:-}" = -s ]; then printf '%s\n' Darwin; else printf '%s\n' arm64; fi
+""",
+            "xcrun": f"""#!/bin/sh
+case " $* " in
+  *' --find swiftc '*) printf '%s\n' '{fake_bin / "swiftc"}' ;;
+  *' --show-sdk-path '*) printf '%s\n' '{root / "Secret SDK"}' ;;
+  *) exit 1 ;;
+esac
+""",
+            "swiftc": f"""#!/bin/sh
+if [ "${{1:-}}" = --version ]; then
+  printf '%s\n' 'Apple Swift version 6.2'
+  exit 0
+fi
+case " $* " in
+  *FixtureApp.swift*)
+    output=
+    while [ "$#" -gt 0 ]; do
+      if [ "$1" = -o ]; then shift; output=$1; break; fi
+      shift
+    done
+    : >"$output"
+    chmod 755 "$output"
+    ;;
+  *)
+    printf '%s\n' '{testkit}/AXTestRunner.swift:139:9: error: synthetic failure' >&2
+    printf '%s\n' '{root}/private-secret.txt:1:1: note: must be redacted' >&2
+{flood_script}
+    exit 1
+    ;;
+esac
+""",
+            "codesign": "#!/bin/sh\nexit 0\n",
+        }
+        for name, content in scripts.items():
+            path = fake_bin / name
+            path.write_text(content, encoding="utf-8")
+            path.chmod(0o755)
+        return fake_bin
+
+    def test_runner_compile_failure_archives_only_bounded_sanitized_output(
+        self,
+    ) -> None:
+        shell = shutil.which("sh")
+        if shell is None or shutil.which("tar") is None:
+            self.skipTest("POSIX sh and tar are required")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            testkit = self._copy_testkit(root)
+            fake_bin = self._write_mock_tools(root, testkit)
+            build_root = root / "private-build"
+            output_root = root / "output"
+            environment = os.environ.copy()
+            environment["PATH"] = f"{fake_bin}:{environment['PATH']}"
+            completed = subprocess.run(
+                [
+                    shell, str(testkit / "run.sh"),
+                    "--output", str(output_root),
+                    "--build-dir", str(build_root),
+                ],
+                cwd=testkit,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                env=environment,
+                check=False,
+                timeout=30,
+            )
+            self.assertEqual(completed.returncode, 1, msg=completed.stderr)
+            report = _decode_single_json(completed.stdout)
+            self.assertEqual(report["error"]["code"], "runner_compile_failed")
+            self.assertIs(
+                report["execution"]["compile_diagnostics_archived"], True
+            )
+            result_directory, = output_root.iterdir()
+            archive_path = result_directory / "macos-ax-test-result.tar.gz"
+            with tarfile.open(archive_path, "r:gz") as archive:
+                self.assertEqual(
+                    {member.name for member in archive.getmembers()},
+                    ARCHIVE_MEMBERS,
+                )
+                readme_file = archive.extractfile("README.txt")
+                self.assertIsNotNone(readme_file)
+                assert readme_file is not None
+                readme = readme_file.read().decode("utf-8")
+            self.assertIn("synthetic failure", readme)
+            self.assertIn("<TESTKIT>:AXTestRunner.swift:139:9", readme)
+            self.assertIn("<ABSOLUTE_PATH>:1:1", readme)
+            self.assertIn("raw_capture_truncated=false", readme)
+            self.assertNotIn(str(testkit), readme)
+            self.assertNotIn(str(root), readme)
+            self.assertLessEqual(len(readme.encode("utf-8")), 16 * 1024)
+            self.assertFalse((build_root / "compile-diagnostics.txt").exists())
+            verified = subprocess.run(
+                [str(TESTKIT_ROOT / "verify-result.py"), str(archive_path)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                check=False,
+                timeout=10,
+            )
+            verification = _decode_single_json(verified.stdout)
+            self.assertNotEqual(verified.returncode, 0)
+            self.assertIs(verification["archive_valid"], True)
+            self.assertIs(verification["report_passed"], False)
+
+    def test_excessive_compiler_output_is_drained_and_marked_truncated(
+        self,
+    ) -> None:
+        shell = shutil.which("sh")
+        if shell is None or shutil.which("tar") is None:
+            self.skipTest("POSIX sh and tar are required")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            testkit = self._copy_testkit(root)
+            fake_bin = self._write_mock_tools(
+                root, testkit, flood_output=True
+            )
+            build_root = root / "private-build"
+            output_root = root / "output"
+            environment = os.environ.copy()
+            environment["PATH"] = f"{fake_bin}:{environment['PATH']}"
+            completed = subprocess.run(
+                [
+                    shell, str(testkit / "run.sh"),
+                    "--output", str(output_root),
+                    "--build-dir", str(build_root),
+                ],
+                cwd=testkit,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                env=environment,
+                check=False,
+                timeout=30,
+            )
+            self.assertEqual(completed.returncode, 1, msg=completed.stderr)
+            report = _decode_single_json(completed.stdout)
+            self.assertEqual(report["error"]["code"], "runner_compile_failed")
+            result_directory, = output_root.iterdir()
+            archive_path = result_directory / "macos-ax-test-result.tar.gz"
+            with tarfile.open(archive_path, "r:gz") as archive:
+                readme_file = archive.extractfile("README.txt")
+                self.assertIsNotNone(readme_file)
+                assert readme_file is not None
+                readme = readme_file.read().decode("utf-8")
+            self.assertIn("synthetic failure", readme)
+            self.assertIn("raw_capture_limit_bytes=131072", readme)
+            self.assertIn("raw_capture_truncated=true", readme)
+            self.assertIn("[line truncated]", readme)
+            self.assertIn("[compiler output truncated]", readme)
+            self.assertNotIn(str(root), readme)
+            self.assertLessEqual(len(readme.encode("utf-8")), 16 * 1024)
+            self.assertFalse((build_root / "compile-diagnostics.txt").exists())
 
 
 class NormalizedArchiveContracts(unittest.TestCase):

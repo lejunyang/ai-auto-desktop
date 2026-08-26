@@ -31,7 +31,7 @@ runner 由 LaunchServices 以固定 `.app` 身份启动，并将报告原子写�
   `--prompt-accessibility` 才调用带 prompt 的 trust check。
 - 调用 `CGPreflightScreenCaptureAccess()` 只读取状态；不请求屏幕录制授权，也不截图。
 - AX 树限定于测试套件自行启动的 fixture 进程，默认最大深度 8、最多 128 个节点。
-- 可回传归档只包含结构化 JSON、签名/架构证明、SHA-256 清单和隐私说明，不含屏幕内容或其他应用数据；签名证明不保存绝对路径。
+- 可回传归档只包含结构化 JSON、签名/架构证明、SHA-256 清单和隐私说明，不含屏幕内容或其他应用数据；签名证明不保存绝对路径。Swift 编译失败时，隐私说明末尾可携带有界脱敏诊断（最多 120 行、每行 512 bytes、正文 12 KiB），绝对路径和非打印字符会被移除，且不会新增归档成员。
 - 结果归档会把 owner/group 固定为 root/0、mtime 固定为 2000-01-01 UTC，并把普通文件
   mode 固定为 `0644`；同时关闭 ACL、file flags、xattr、AppleDouble 和 gzip header 时间/文件名。
   它只接受已知的 macOS bsdtar/libarchive 或 GNU tar，归一化能力不可用时会 fail closed。

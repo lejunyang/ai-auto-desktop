@@ -17,6 +17,8 @@ source_package_digest=unavailable
 source_manifest_path=
 source_verified=false
 identity_available_this_run=false
+compile_diagnostics_archived=false
+compile_diagnostics_path=
 
 usage() {
     cat >&2 <<'EOF'
@@ -202,7 +204,7 @@ write_launcher_report() {
         report_source=',"source":{"revision":"'"$source_revision"'","worktree":"'"$source_worktree"'","package_digest":"'"$source_package_digest"'"}'
     fi
     cat >"$report_path" <<EOF
-{"schema_version":"1.0","kind":"macos_ax_fixture_test","status":"$report_status","message":"$report_message"$report_source,"platform":{"os":"$report_os","architecture":"$arch"},"permissions":{"accessibility":{"checked":false,"prompt_requested":$prompt_accessibility},"screen_capture":{"checked":false,"request_attempted":false,"capture_attempted":false}},"execution":{"phase":"$report_phase","command_status":$report_command_status,"timed_out":$report_timed_out,"timeout_seconds":$runner_timeout_seconds,"runner_pid_observed":$runner_pid_observed},"error":{"code":"$report_error_code","message":"$report_message"},"checks":[{"id":"launcher_$report_phase","status":"$report_check_status","message":"$report_message"}],"summary":{"passed":0,"failed":$report_failed,"total":1}}
+{"schema_version":"1.0","kind":"macos_ax_fixture_test","status":"$report_status","message":"$report_message"$report_source,"platform":{"os":"$report_os","architecture":"$arch"},"permissions":{"accessibility":{"checked":false,"prompt_requested":$prompt_accessibility},"screen_capture":{"checked":false,"request_attempted":false,"capture_attempted":false}},"execution":{"phase":"$report_phase","command_status":$report_command_status,"timed_out":$report_timed_out,"timeout_seconds":$runner_timeout_seconds,"runner_pid_observed":$runner_pid_observed,"compile_diagnostics_archived":$compile_diagnostics_archived},"error":{"code":"$report_error_code","message":"$report_message"},"checks":[{"id":"launcher_$report_phase","status":"$report_check_status","message":"$report_message"}],"summary":{"passed":0,"failed":$report_failed,"total":1}}
 EOF
 }
 
@@ -211,6 +213,30 @@ if [ "${write_provenance_error:-}" = invalid_source_provenance ]; then
     build_status=82
 else
     "$script_dir/build.sh" "$build_root" || build_status=$?
+fi
+case $build_status in
+    72|73)
+        compile_diagnostics_candidate=$build_root/compile-diagnostics.txt
+        if [ -f "$compile_diagnostics_candidate" ] \
+            && [ ! -L "$compile_diagnostics_candidate" ]; then
+            compile_diagnostics_size=$(
+                LC_ALL=C wc -c <"$compile_diagnostics_candidate" \
+                    | tr -d '[:space:]'
+            )
+            case $compile_diagnostics_size in
+                ''|*[!0-9]*) ;;
+                *)
+                    if [ "$compile_diagnostics_size" -le 16384 ]; then
+                        compile_diagnostics_path=$compile_diagnostics_candidate
+                        compile_diagnostics_archived=true
+                    fi
+                    ;;
+            esac
+        fi
+        ;;
+esac
+if [ "$compile_diagnostics_archived" != true ]; then
+    rm -f "$build_root/compile-diagnostics.txt"
 fi
 if [ "$build_status" -ne 0 ]; then
     case $build_status in
@@ -284,9 +310,16 @@ cat >"$result_dir/README.txt" <<'EOF'
 此归档可回传给测试请求方。它只包含结构化测试结果和本说明：
 - 未保存截图或屏幕像素；
 - 未枚举 fixture 进程之外的 Accessibility 树；
-- 未包含构建日志、用户名、主机名或其他应用的窗口内容。
+- 不包含原始构建日志、用户名、主机名或其他应用的窗口内容；Swift 编译失败时，
+  本说明末尾会附带有硬上限且已移除绝对路径和非打印字符的编译诊断。
 - source revision/package digest 来自已验证的源码包 manifest，但仍需请求方用可信预期值校验。
 EOF
+if [ "$compile_diagnostics_archived" = true ]; then
+    {
+        printf '%s\n' '' '--- sanitized Swift compile diagnostics ---'
+        cat "$compile_diagnostics_path"
+    } >>"$result_dir/README.txt"
+fi
 if [ "$identity_available_this_run" = true ] \
     && [ -f "$build_root/identity.txt" ]; then
     cp "$build_root/identity.txt" "$result_dir/identity.txt"
@@ -308,6 +341,7 @@ if [ -x /usr/bin/shasum ]; then
     if ! (cd "$result_dir" \
         && /usr/bin/shasum -a 256 report.json README.txt identity.txt \
             >SHA256SUMS.tmp); then
+        rm -f "$build_root/compile-diagnostics.txt"
         rm -f "$result_dir/SHA256SUMS.tmp"
         printf '%s\n' '失败：无法计算结果文件 SHA-256。' >&2
         write_launcher_report failed "result_hash_failed" archive result_hash_failed 1 false
@@ -316,6 +350,7 @@ if [ -x /usr/bin/shasum ]; then
     fi
     mv "$result_dir/SHA256SUMS.tmp" "$result_dir/SHA256SUMS"
 else
+    rm -f "$build_root/compile-diagnostics.txt"
     printf '%s\n' '失败：系统 shasum 不可用，拒绝生成无校验清单的归档。' >&2
     write_launcher_report failed "shasum_unavailable" archive shasum_unavailable 69 false
     cat "$report_path"
@@ -323,6 +358,7 @@ else
 fi
 if ! create_normalized_tar_gz "$archive_path" "$result_dir" \
     report.json README.txt identity.txt SHA256SUMS; then
+    rm -f "$build_root/compile-diagnostics.txt"
     printf '%s\n' '失败：无法创建结果归档。' >&2
     rm -f "$result_dir/SHA256SUMS"
     write_launcher_report failed "result_archive_failed" archive result_archive_failed 1 false
@@ -330,12 +366,14 @@ if ! create_normalized_tar_gz "$archive_path" "$result_dir" \
     exit 1
 fi
 if ! archive_sha256=$(/usr/bin/shasum -a 256 "$archive_path" 2>/dev/null); then
+    rm -f "$build_root/compile-diagnostics.txt"
     printf '%s\n' '失败：无法计算结果归档 SHA-256。' >&2
     rm -f "$archive_path"
     write_launcher_report failed "archive_hash_failed" archive archive_hash_failed 1 false
     cat "$report_path"
     exit 1
 fi
+rm -f "$build_root/compile-diagnostics.txt"
 cat "$report_path"
 printf '%s\n' "结果归档：$archive_path" >&2
 printf '%s\n' "归档 SHA-256：${archive_sha256%% *}" >&2

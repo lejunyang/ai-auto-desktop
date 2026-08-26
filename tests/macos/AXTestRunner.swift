@@ -136,7 +136,10 @@ private func actions(_ element: AXUIElement) -> (AXError, [String]) {
     guard error == .success, let values = raw else { return (error, []) }
     var result: [String] = []
     for index in 0..<CFArrayGetCount(values) {
-        let pointer = CFArrayGetValueAtIndex(values, index)
+        let rawPointer: UnsafeRawPointer? = CFArrayGetValueAtIndex(values, index)
+        guard let pointer = rawPointer else {
+            return (.illegalArgument, [])
+        }
         let value = Unmanaged<CFTypeRef>.fromOpaque(pointer).takeUnretainedValue()
         guard CFGetTypeID(value) == CFStringGetTypeID() else {
             return (.illegalArgument, [])
@@ -192,6 +195,16 @@ private func postLeftClick(at point: CGPoint, to pid: pid_t) -> PointerClickDisp
 private func typeTextTargetIsEligible(_ node: Node) -> Bool {
     let protected = node.role == "AXSecureTextField" || node.subrole == "AXSecureTextField"
     return !protected && ["AXTextField", "AXTextArea", "AXComboBox"].contains(node.role ?? "")
+}
+
+// Carbon's Boolean result was imported as UInt8 by older Swift SDKs and as
+// Bool by current SDKs. Keep both overloads so either importer is accepted.
+private func secureEventInputIsEnabled(_ value: Bool) -> Bool {
+    return value
+}
+
+private func secureEventInputIsEnabled(_ value: UInt8) -> Bool {
+    return value != 0
 }
 
 private func postUnicodeText(_ text: String, to pid: pid_t) -> TypeTextDispatch {
@@ -326,7 +339,11 @@ private func boundedChildren(
     }
     var children: [AXUIElement] = []
     for index in 0..<CFArrayGetCount(values) {
-        let pointer = CFArrayGetValueAtIndex(values, index)
+        let rawPointer: UnsafeRawPointer? = CFArrayGetValueAtIndex(values, index)
+        guard let pointer = rawPointer else {
+            errors.append(Int(AXError.illegalArgument.rawValue))
+            return ([], true)
+        }
         let value = Unmanaged<CFTypeRef>.fromOpaque(pointer).takeUnretainedValue()
         guard CFGetTypeID(value) == AXUIElementGetTypeID() else {
             errors.append(Int(AXError.illegalArgument.rawValue))
@@ -1035,7 +1052,9 @@ private func run(arguments parsedArguments: Arguments? = nil) -> Outcome {
             && beforeType.axErrors.isEmpty
             && findOne(beforeType, identifier: "fixture-input")?.focused == true
         let frontmost = NSWorkspace.shared.frontmostApplication?.processIdentifier == fixturePID
-        let secureEventInputEnabled = IsSecureEventInputEnabled() != 0
+        let secureEventInputEnabled = secureEventInputIsEnabled(
+            IsSecureEventInputEnabled()
+        )
         var dispatch = TypeTextDispatch(submitted: false, utf16UnitsPosted: 0)
         if clearError == .success && typeFocusError == .success
             && focusVerified && frontmost && !secureEventInputEnabled {
@@ -1300,8 +1319,12 @@ private func emit(_ report: [String: Any], to destination: URL?) -> Bool {
 }
 
 let processGroupConfigured = configureProcessGroup()
-let parsedArguments = parseArguments()
-let outcome = run(arguments: parsedArguments)
-let reportDestination = parsedArguments?.reportPath
-exit(emit(outcome.report, to: reportDestination) ? outcome.exitCode : 1)
+private func main() -> Never {
+    let parsedArguments = parseArguments()
+    let outcome = run(arguments: parsedArguments)
+    let reportDestination = parsedArguments?.reportPath
+    exit(emit(outcome.report, to: reportDestination) ? outcome.exitCode : 1)
+}
+
+main()
 

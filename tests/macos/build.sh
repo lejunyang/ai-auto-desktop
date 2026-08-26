@@ -11,7 +11,25 @@ runner_app="$build_root/AiAutoDesktopAXRunner.app"
 signing_marker="$build_root/.codesign-identity"
 source_digest_marker="$build_root/.source-package-digest"
 attestation="$build_root/identity.txt"
+compile_diagnostics="$build_root/compile-diagnostics.txt"
+compile_log=
+compile_status_file=
+compile_overflow_file=
 rm -f "$attestation"
+
+cleanup_compile_log() {
+    if [ -n "${compile_log:-}" ]; then
+        rm -f "$compile_log" 2>/dev/null || :
+    fi
+    if [ -n "${compile_status_file:-}" ]; then
+        rm -f "$compile_status_file" 2>/dev/null || :
+    fi
+    if [ -n "${compile_overflow_file:-}" ]; then
+        rm -f "$compile_overflow_file" 2>/dev/null || :
+    fi
+}
+trap cleanup_compile_log 0
+trap 'cleanup_compile_log; exit 1' HUP INT TERM
 
 if ! load_source_provenance "$script_dir" \
     "$script_dir/SOURCE_PACKAGE_FILES.txt"; then
@@ -70,6 +88,198 @@ if ! command -v codesign >/dev/null 2>&1; then
 fi
 
 mkdir -p "$build_root"
+rm -f "$compile_diagnostics"
+
+write_compile_diagnostics() {
+    diagnostic_phase=$1
+    diagnostic_status=$2
+    diagnostic_input=$3
+    diagnostic_capture_truncated=$4
+    diagnostic_temporary=$compile_diagnostics.writing-$$
+    rm -f "$diagnostic_temporary"
+    if ! (
+        umask 077
+        {
+            printf '%s\n' \
+                'schema=ai-auto-desktop.macos-compile-diagnostics/v1' \
+                "phase=$diagnostic_phase" \
+                "command_status=$diagnostic_status" \
+                "swift=$swift_major.$swift_minor" \
+                "target=$target" \
+                'sanitized=true' \
+                'max_lines=120' \
+                'max_output_bytes=12288' \
+                'raw_capture_limit_bytes=131072' \
+                "raw_capture_truncated=$diagnostic_capture_truncated" \
+                'compiler_output_begin'
+            LC_ALL=C awk \
+                -v diagnostic_build_root="$build_root" \
+                -v diagnostic_script_dir="$script_dir" \
+                -v diagnostic_sdk_path="$sdk_path" \
+                -v diagnostic_swiftc_path="$swiftc_path" '
+function replace_literal(value, needle, replacement, position) {
+    if (needle == "") {
+        return value
+    }
+    while ((position = index(value, needle)) != 0) {
+        value = substr(value, 1, position - 1) replacement \
+            substr(value, position + length(needle))
+    }
+    return value
+}
+function scrub(value) {
+    value = replace_literal(value, diagnostic_build_root "/", "<BUILD>:")
+    value = replace_literal(value, diagnostic_script_dir "/", "<TESTKIT>:")
+    value = replace_literal(value, diagnostic_sdk_path "/", "<SDK>:")
+    value = replace_literal(value, diagnostic_build_root, "<BUILD>")
+    value = replace_literal(value, diagnostic_script_dir, "<TESTKIT>")
+    value = replace_literal(value, diagnostic_sdk_path, "<SDK>")
+    value = replace_literal(value, diagnostic_swiftc_path, "<SWIFTC>")
+    gsub(/\/[[:alnum:]_.~+@%=-][^[:space:]"<>:]*/, "<ABSOLUTE_PATH>", value)
+    gsub(/[^\t -~]/, "?", value)
+    return value
+}
+BEGIN {
+    emitted_lines = 0
+    emitted_bytes = 0
+    max_lines = 120
+    max_bytes = 12288
+    max_line_bytes = 512
+    truncation_marker = "[compiler output truncated]"
+    reserved_bytes = length(truncation_marker) + 1
+}
+{
+    value = scrub($0)
+    if (length(value) > max_line_bytes) {
+        value = substr(value, 1, max_line_bytes - 20) " [line truncated]"
+    }
+    required = length(value) + 1
+    if (emitted_lines >= max_lines - 1 \
+            || emitted_bytes + required > max_bytes - reserved_bytes) {
+        truncated = 1
+        next
+    }
+    print value
+    emitted_lines++
+    emitted_bytes += required
+}
+END {
+    if (NR == 0) {
+        print "[compiler emitted no output]"
+    }
+    if (truncated) {
+        print truncation_marker
+    }
+}
+' "$diagnostic_input"
+            printf '%s\n' 'compiler_output_end'
+        } >"$diagnostic_temporary"
+    ); then
+        rm -f "$diagnostic_temporary"
+        return 1
+    fi
+    if ! chmod 600 "$diagnostic_temporary" \
+        || ! mv "$diagnostic_temporary" "$compile_diagnostics"; then
+        rm -f "$diagnostic_temporary"
+        return 1
+    fi
+}
+
+compile_swift() {
+    compile_phase=$1
+    compile_failure_status=$2
+    shift 2
+    compile_capture_truncated=false
+    if ! compile_log=$(mktemp "$build_root/.swiftc-output.XXXXXX"); then
+        printf '%s\n' '失败：无法创建私有 Swift 编译诊断文件。' >&2
+        exit "$compile_failure_status"
+    fi
+    chmod 600 "$compile_log"
+    # Keep the first 128 KiB, then drain the rest so the compiler cannot be
+    # killed by SIGPIPE before its real exit status is written to the sidecar.
+    compile_status_file=$compile_log.status
+    compile_overflow_file=$compile_log.overflow
+    if (
+        set +e
+        "$@" 2>&1
+        printf '%s\n' "$?" >"$compile_status_file"
+    ) | (
+        LC_ALL=C head -c 131072 >"$compile_log"
+        compile_overflow_bytes=$(LC_ALL=C wc -c | tr -d '[:space:]')
+        printf '%s\n' "$compile_overflow_bytes" >"$compile_overflow_file"
+    ); then
+        :
+    else
+        rm -f "$compile_status_file"
+        printf '%s\n' '失败：无法有界捕获 Swift 编译器输出。' >&2
+        return 1
+    fi
+    if [ ! -f "$compile_overflow_file" ] \
+        || [ -L "$compile_overflow_file" ]; then
+        printf '%s\n' '失败：无法读取 Swift 编译器输出边界。' >&2
+        return 1
+    fi
+    IFS= read -r compile_overflow_bytes <"$compile_overflow_file" \
+        || compile_overflow_bytes=
+    rm -f "$compile_overflow_file"
+    compile_overflow_file=
+    case $compile_overflow_bytes in
+        ''|*[!0-9]*)
+            printf '%s\n' '失败：无法检查 Swift 编译器输出大小。' >&2
+            return 1
+            ;;
+        0) ;;
+        *) compile_capture_truncated=true ;;
+    esac
+    if [ ! -f "$compile_status_file" ] || [ -L "$compile_status_file" ]; then
+        printf '%s\n' '失败：无法读取 Swift 编译器状态。' >&2
+        return 1
+    fi
+    IFS= read -r compile_status <"$compile_status_file" || compile_status=
+    rm -f "$compile_status_file"
+    compile_status_file=
+    case $compile_status in
+        0) ;;
+        ''|*[!0-9]*)
+            printf '%s\n' '失败：Swift 编译器状态无效。' >&2
+            return 1
+            ;;
+    esac
+    if [ "$compile_status" -eq 0 ]; then
+        if [ -s "$compile_log" ]; then
+            if write_compile_diagnostics \
+                "$compile_phase" 0 "$compile_log" \
+                "$compile_capture_truncated"; then
+                cat "$compile_diagnostics" >&2
+                rm -f "$compile_diagnostics"
+            else
+                printf '%s\n' \
+                    '警告：Swift 编译器有输出，但无法安全整理诊断。' >&2
+            fi
+        fi
+        rm -f "$compile_log"
+        compile_log=
+        return 0
+    fi
+    if ! write_compile_diagnostics \
+        "$compile_phase" "$compile_status" "$compile_log" \
+        "$compile_capture_truncated"; then
+        {
+            printf '%s\n' \
+                'schema=ai-auto-desktop.macos-compile-diagnostics/v1' \
+                "phase=$compile_phase" \
+                "command_status=$compile_status" \
+                'sanitized=true' \
+                "raw_capture_truncated=$compile_capture_truncated" \
+                'diagnostic_unavailable=true'
+        } >"$compile_diagnostics"
+        chmod 600 "$compile_diagnostics"
+    fi
+    cat "$compile_diagnostics" >&2
+    rm -f "$compile_log"
+    compile_log=
+    return 1
+}
 
 write_fixture_plist() {
     destination=$1
@@ -113,7 +323,8 @@ build_fixture() {
     rm -rf "$fixture_app"
     mkdir -p "$fixture_app/Contents/MacOS"
     write_fixture_plist "$fixture_app/Contents/Info.plist"
-    if ! "$swiftc_path" -O -sdk "$sdk_path" -target "$target" -framework AppKit \
+    if ! compile_swift fixture 72 \
+        "$swiftc_path" -O -sdk "$sdk_path" -target "$target" -framework AppKit \
         "$script_dir/FixtureApp.swift" \
         -o "$fixture_app/Contents/MacOS/AiAutoDesktopAXFixture"; then
         printf '%s\n' '失败：AppKit fixture 编译失败。' >&2
@@ -129,7 +340,8 @@ build_runner() {
     rm -rf "$runner_app"
     mkdir -p "$runner_app/Contents/MacOS"
     write_runner_plist "$runner_app/Contents/Info.plist"
-    if ! "$swiftc_path" -O -sdk "$sdk_path" -target "$target" \
+    if ! compile_swift runner 73 \
+        "$swiftc_path" -O -sdk "$sdk_path" -target "$target" \
         -framework AppKit -framework ApplicationServices -framework Carbon \
         -framework CoreGraphics \
         "$script_dir/AXTestRunner.swift" \

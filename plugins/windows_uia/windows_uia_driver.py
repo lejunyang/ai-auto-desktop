@@ -19,6 +19,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 import copy
 import ctypes
+from ctypes import wintypes
 import hashlib
 import json
 import math
@@ -2143,11 +2144,11 @@ class ComtypesUIABackend:
             ) from exc
 
     def _element_from_point(self, x: int, y: int) -> Any:
-        class POINT(ctypes.Structure):
-            _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
-
         try:
-            return self.automation.ElementFromPoint(POINT(x=x, y=y))
+            # comtypes generates IUIAutomation.ElementFromPoint with the exact
+            # ctypes.wintypes.tagPOINT argument type. A distinct Structure with
+            # identical fields is not assignment-compatible at the COM call.
+            return self.automation.ElementFromPoint(wintypes.POINT(x=x, y=y))
         except Exception as exc:
             raise self._native_failure("ElementFromPoint", exc) from exc
 

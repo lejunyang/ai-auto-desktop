@@ -357,15 +357,22 @@ class NativeWindowsUIATests(unittest.TestCase):
         snapshot = self._snapshot(selector)
         button = self._find(snapshot, button_locator)
         self.assertIn("pointer_click", button["node"]["actions"])
-        result = self.plugin.invoke(
-            action("pointer_click"),
-            {
-                "target": button["target"],
-                "locator": button_locator,
-                "button": "left",
-                "position": "center",
-            },
-        )
+        try:
+            result = self.plugin.invoke(
+                action("pointer_click"),
+                {
+                    "target": button["target"],
+                    "locator": button_locator,
+                    "button": "left",
+                    "position": "center",
+                },
+            )
+        except PluginError as exc:
+            self.fail(
+                "native pointer_click failed: "
+                f"code={exc.code!r} message={exc.message!r} "
+                f"details={exc.details!r} stderr={self.plugin.stderr!r}"
+            )
         self.assertEqual(result["backend_result"]["native_pattern"], "SendInput")
         self.assertEqual(result["backend_result"]["input_mode"], "mouse")
         self.assertTrue(result["backend_result"]["submitted"])

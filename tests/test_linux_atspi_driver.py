@@ -2354,7 +2354,9 @@ class LinuxAtspiProcessTests(unittest.TestCase):
             ),
         )
         for environment, label in cases:
-            with self.subTest(label=label), mock.patch.dict(
+            with self.subTest(label=label), mock.patch.object(
+                atspi.sys, "platform", "linux"
+            ), mock.patch.dict(
                 os.environ, environment, clear=True
             ), mock.patch.object(atspi, "PyGObjectAtspiBackend") as pygobject, mock.patch.object(
                 atspi, "GioAtspiBackend"
@@ -2386,12 +2388,60 @@ class LinuxAtspiProcessTests(unittest.TestCase):
             def __new__(cls) -> object:
                 return fallback
 
-        with mock.patch.dict(os.environ, environment, clear=True), mock.patch.object(
+        with mock.patch.object(
+            atspi.sys, "platform", "linux"
+        ), mock.patch.dict(os.environ, environment, clear=True), mock.patch.object(
             atspi, "PyGObjectAtspiBackend", MissingAtspi
         ), mock.patch.object(
             atspi, "GioAtspiBackend", GioFallback
         ):
             self.assertIs(atspi.create_default_backend(), fallback)
+
+    def test_default_backend_rejects_non_linux_before_session_or_dependency_probe(
+        self,
+    ) -> None:
+        environment = {
+            "XDG_SESSION_TYPE": "x11",
+            "XDG_CURRENT_DESKTOP": "KDE",
+            "DISPLAY": ":10.0",
+        }
+        with mock.patch.object(
+            atspi.sys, "platform", "darwin"
+        ), mock.patch.dict(os.environ, environment, clear=True), mock.patch.object(
+            atspi, "PyGObjectAtspiBackend"
+        ) as pygobject, mock.patch.object(atspi, "GioAtspiBackend") as gio:
+            backend = atspi.create_default_backend()
+
+        self.assertIsInstance(backend, atspi.UnavailableBackend)
+        self.assertEqual(backend.reason, "platform")
+        self.assertEqual(backend.details["platform"], "darwin")
+        pygobject.assert_not_called()
+        gio.assert_not_called()
+
+    def test_inspect_session_remains_available_for_diagnostics_when_backend_is_not(
+        self,
+    ) -> None:
+        environment = {
+            "XDG_SESSION_TYPE": "wayland",
+            "XDG_CURRENT_DESKTOP": "CI",
+        }
+        unavailable = atspi.UnavailableBackend("unsupported_session")
+        with mock.patch.dict(os.environ, environment, clear=True):
+            result = atspi.LinuxAtspiDriver(unavailable).execute(
+                "inspect_session", {}, deadline=deadline()
+            )
+
+        self.assertEqual(
+            result,
+            {
+                "backend": "linux_atspi_unavailable",
+                "session_type": "wayland",
+                "desktop": "CI",
+            },
+        )
+        with self.assertRaises(atspi.DriverError) as raised:
+            unavailable.list_applications(deadline=deadline())
+        self.assertEqual(raised.exception.code, "DRIVER.UNAVAILABLE")
 
     def test_gio_children_response_has_post_decode_hard_cap(self) -> None:
         backend = object.__new__(atspi.GioAtspiBackend)

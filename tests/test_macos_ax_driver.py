@@ -1834,6 +1834,9 @@ class MacOSAXSourceContracts(unittest.TestCase):
             "NSWorkspace.shared.frontmostApplication",
             "AX target lost focus during keyboard input",
             "import Carbon.HIToolbox",
+            "private func secureEventInputIsEnabled(_ value: Bool) -> Bool",
+            "private func secureEventInputIsEnabled(_ value: UInt8) -> Bool",
+            "let secureEventInputEnabled = secureEventInputIsEnabled(",
             "IsSecureEventInputEnabled()",
             '"keyboard_dispatch_started": progress.keyboardDispatchStarted',
             '"submitted": true',
@@ -1841,6 +1844,8 @@ class MacOSAXSourceContracts(unittest.TestCase):
             "emitKeyboardDispatchProgress(",
             "emitPointerProgress(",
             'emitKeyboardFocusProgress(id: requestID, focusChanged: true)',
+            "let rawPointer: UnsafeRawPointer? = CFArrayGetValueAtIndex(values, index)",
+            "guard let pointer = rawPointer",
         ):
             with self.subTest(marker=marker):
                 self.assertIn(marker, source)
@@ -1851,9 +1856,15 @@ class MacOSAXSourceContracts(unittest.TestCase):
             "osascript",
             "readLine(",
             "executableURL",
+            "IsSecureEventInputEnabled() == 0",
         ):
             with self.subTest(forbidden=forbidden):
                 self.assertNotIn(forbidden, source)
+        self.assertEqual(
+            source.count("let rawPointer: UnsafeRawPointer? = CFArrayGetValueAtIndex(values, index)"),
+            2,
+        )
+        self.assertEqual(source.count("guard let pointer = rawPointer"), 2)
         self.assertIn(
             '\"progress\": [\n            \"phase\": \"focus_changed\",\n            \"keyboard_dispatch_started\": false,\n            \"focus_changed\": focusChanged,',
             source,
@@ -1903,7 +1914,7 @@ class MacOSAXSourceContracts(unittest.TestCase):
             type_text_source.index("keyDown.postToPid(targetPID)"),
         )
         self.assertLess(
-            type_text_source.index("IsSecureEventInputEnabled()"),
+            type_text_source.index("let secureEventInputEnabled = secureEventInputIsEnabled("),
             type_text_source.index("keyDown.postToPid(targetPID)"),
         )
         self.assertLess(

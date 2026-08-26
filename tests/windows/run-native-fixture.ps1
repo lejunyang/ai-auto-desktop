@@ -57,8 +57,8 @@ function Get-PythonVersion {
 }
 
 $startedAt = Get-UtcTimestamp
-$testCommand = "python -m unittest discover -s tests -v"
-$testArguments = @("-m", "unittest", "discover", "-s", "tests", "-v")
+$testCommand = "python -m unittest -v tests.test_windows_uia_native"
+$testArguments = @("-m", "unittest", "-v", "tests.test_windows_uia_native")
 $testResult = [ordered]@{
     command = $testCommand
     result = "not_run"

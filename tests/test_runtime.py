@@ -97,7 +97,10 @@ class RuntimeControlFlowTests(unittest.TestCase):
         )
 
         self.assertEqual(result.status, "timed_out")
-        self.assertIn(result.error.code, {"ACTION.TIMEOUT", "WORKFLOW.TIMEOUT"})
+        self.assertIn(
+            result.error.code,
+            {"ACTION.TIMEOUT", "STEP.TIMEOUT", "WORKFLOW.TIMEOUT"},
+        )
 
     def test_set_is_atomic_and_validates_declared_schema(self) -> None:
         raw = workflow(

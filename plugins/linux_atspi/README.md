@@ -42,6 +42,9 @@ snapshot 上的目标具有正面积 bounds；AT-SPI element-at-point 还必须�
 当前 v0 默认后端还要求进程环境明确报告 KDE、X11 和非空 `DISPLAY`；缺失这些证据，
 或处于 Wayland/GNOME，会返回 `DRIVER.UNAVAILABLE`，不会扩大本切片的支持声明。
 `inspect_session` 只返回 backend、session type 与 desktop 三个粗粒度字段，不读取应用树；
+即使当前平台、会话或 AT-SPI 依赖不可用，该诊断动作仍会返回
+`backend=linux_atspi_unavailable` 和环境会话字段。它不会将 list/snapshot/写操作放行；
+这些动作在 backend 不可用时仍以 `DRIVER.UNAVAILABLE` 失败关闭。
 它是当前真实 Linux provider 唯一声明可进入 `--durable-actions read-only` 的操作。其输入、
 输出、错误均声明为 public，且 checkpoint 只能显式投影这三个字段。应用列表、snapshot、
 find 与全部写动作没有 durable 资格，避免窗口标题、控件文本或短期 target 落入 journal。
