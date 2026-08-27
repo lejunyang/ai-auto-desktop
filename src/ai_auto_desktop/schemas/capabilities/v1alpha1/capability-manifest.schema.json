@@ -352,6 +352,67 @@
       ],
       "additionalProperties": false
     },
+    "artifactSlot": {
+      "type": "object",
+      "required": [
+        "pointer",
+        "media_types",
+        "max_size_bytes"
+      ],
+      "properties": {
+        "pointer": {
+          "type": "string",
+          "pattern": "^(?![\\s\\S]*[\\u0000-\\u001F\\u007F])/(?:[^/~]|~[01])*(?:/(?:[^/~]|~[01])*){0,63}(?![\\s\\S])",
+          "maxLength": 1024
+        },
+        "media_types": {
+          "type": "array",
+          "items": {
+            "enum": [
+              "image/png",
+              "image/jpeg",
+              "image/gif",
+              "image/tiff",
+              "image/bmp",
+              "image/webp",
+              "image/x-portable-anymap"
+            ]
+          },
+          "minItems": 1,
+          "uniqueItems": true
+        },
+        "max_size_bytes": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 67108864
+        }
+      },
+      "additionalProperties": false
+    },
+    "artifactSlots": {
+      "type": "object",
+      "propertyNames": {
+        "$ref": "#/$defs/identifier"
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/artifactSlot"
+      },
+      "minProperties": 1,
+      "maxProperties": 32
+    },
+    "actionArtifacts": {
+      "type": "object",
+      "properties": {
+        "inputs": {
+          "$ref": "#/$defs/artifactSlots"
+        },
+        "outputs": {
+          "$ref": "#/$defs/artifactSlots"
+        }
+      },
+      "minProperties": 1,
+      "additionalProperties": false
+    },
     "action": {
       "type": "object",
       "required": [
@@ -409,6 +470,9 @@
         },
         "durability": {
           "$ref": "#/$defs/actionDurability"
+        },
+        "artifacts": {
+          "$ref": "#/$defs/actionArtifacts"
         }
       },
       "additionalProperties": false

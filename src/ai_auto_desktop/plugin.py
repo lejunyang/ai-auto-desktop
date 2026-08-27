@@ -50,6 +50,15 @@ _MANIFEST_SCHEMA_RESOURCE = (
 )
 
 
+def _json_pointer_tokens(pointer: str) -> tuple[str, ...]:
+    """Decode the RFC 6901 tokens of a schema-validated JSON pointer."""
+
+    return tuple(
+        raw_token.replace("~1", "/").replace("~0", "~")
+        for raw_token in pointer.split("/")[1:]
+    )
+
+
 class PluginError(RuntimeError):
     """A structured error raised by a process plugin or its host.
 
@@ -645,6 +654,45 @@ class ProcessPlugin:
                 "PLUGIN.HOST_PROTOCOL_ERROR",
                 "plugin manifest must contain an actions object",
             )
+        for action_name, contract in actions.items():
+            artifacts = contract.get("artifacts")
+            if artifacts is None:
+                continue
+            inputs = artifacts.get("inputs", {})
+            outputs = artifacts.get("outputs", {})
+            duplicate_names = sorted(set(inputs).intersection(outputs))
+            if duplicate_names:
+                raise self._host_error(
+                    "PLUGIN.HOST_PROTOCOL_ERROR",
+                    "artifact slot names must be unique within an action",
+                    extra={
+                        "action": action_name,
+                        "duplicate_slots": duplicate_names,
+                    },
+                )
+            for direction, slots in (("inputs", inputs), ("outputs", outputs)):
+                declared = [
+                    (slot_name, slot["pointer"], _json_pointer_tokens(slot["pointer"]))
+                    for slot_name, slot in slots.items()
+                ]
+                for index, (left_name, left_pointer, left_tokens) in enumerate(
+                    declared
+                ):
+                    for right_name, right_pointer, right_tokens in declared[index + 1 :]:
+                        shared = min(len(left_tokens), len(right_tokens))
+                        if left_tokens[:shared] != right_tokens[:shared]:
+                            continue
+                        raise self._host_error(
+                            "PLUGIN.HOST_PROTOCOL_ERROR",
+                            "artifact slot pointers must not overlap per direction",
+                            extra={
+                                "action": action_name,
+                                "direction": direction,
+                                "slots": sorted((left_name, right_name)),
+                                "pointers": sorted((left_pointer, right_pointer)),
+                            },
+                        )
+
     def _result_from_message(
         self, message: dict[str, Any], expected_id: str, *, dispatched: bool
     ) -> Any:
