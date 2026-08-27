@@ -1,0 +1,120 @@
+apiVersion: ai-auto-desktop.dev/v1alpha1
+kind: Workflow
+metadata:
+  name: linux-capture-ocr-decision
+  version: 1.0.0
+  description: 对调用方预先选定的 KDE/X11 语义目标截图，显式 OCR 后仅返回判断结果。
+requires:
+  runtime: ">=0.1.0"
+  platforms: [linux]
+  permissions: [desktop.observe, desktop.capture]
+  capabilities:
+    - name: desktop.linux_atspi
+      version: ^0.1.0
+      actions: [capture_target]
+    - name: vision.ocr
+      version: ^0.1.0
+      actions: [recognize_artifact]
+inputs:
+  target:
+    schema:
+      type: object
+    required: true
+  locator:
+    schema:
+      type: object
+    required: true
+  target_text:
+    schema:
+      type: string
+      minLength: 1
+      maxLength: 1024
+    required: true
+    sensitive: true
+  languages:
+    schema:
+      type: array
+      minItems: 1
+      maxItems: 32
+      uniqueItems: true
+      items:
+        type: string
+        pattern: "^[A-Za-z0-9_]+$"
+    default: [eng]
+  minimum_confidence:
+    schema:
+      type: number
+      minimum: 0
+      maximum: 1
+    default: 0.85
+budgets:
+  max_duration: 30s
+  max_executed_steps: 4
+  cleanup_timeout: 1s
+policy:
+  allowed_risk:
+    categories: [observe]
+    max_level: medium
+  untrusted_inputs:
+    ocr_text: tainted
+    allow_in_control_flow: true
+  screenshots:
+    retention: memory_only
+    cloud_upload: deny
+steps:
+  - id: capture_target
+    type: action
+    description: 只截取已由 AT-SPI 精确定位并 fresh 重验证的目标可见区域。
+    uses: desktop.linux_atspi.capture_target@1
+    with:
+      target: "${{ inputs.target }}"
+      locator: "${{ inputs.locator }}"
+      format: png
+    effect:
+      class: read_only
+    risk:
+      category: observe
+      level: medium
+    timeout: 8s
+    retry:
+      max_attempts: 1
+
+  - id: recognize_target
+    type: action
+    description: 显式消费上一动作的 ArtifactRef；不会重新截图或读取 Host 路径。
+    uses: vision.ocr.recognize_artifact@1
+    with:
+      artifact: "${{ steps.capture_target.output.frame }}"
+      languages: "${{ inputs.languages }}"
+      patterns:
+        - id: requested_content
+          value: "${{ inputs.target_text }}"
+    effect:
+      class: read_only
+    risk:
+      category: observe
+      level: low
+    timeout: 20s
+    retry:
+      max_attempts: 1
+
+  - id: decide
+    type: if
+    description: OCR 只作为显式判断输入，不把文字边界转换为点击坐标。
+    condition: "${{ steps.recognize_target.output.matches != [] and steps.recognize_target.output.confidence >= inputs.minimum_confidence and steps.recognize_target.output.matches[0].confidence >= inputs.minimum_confidence }}"
+    then:
+      - id: matched
+        type: return
+        value:
+          decision: matched
+          text: "${{ steps.recognize_target.output.matches[0].text }}"
+          confidence: "${{ steps.recognize_target.output.matches[0].confidence }}"
+          frame_digest: "${{ steps.capture_target.output.frame.digest }}"
+          provenance: "${{ steps.capture_target.output.provenance }}"
+    else:
+      - id: not_matched
+        type: return
+        value:
+          decision: not_matched
+          frame_digest: "${{ steps.capture_target.output.frame.digest }}"
+          ocr_confidence: "${{ steps.recognize_target.output.confidence }}"

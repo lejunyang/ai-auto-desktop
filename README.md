@@ -38,6 +38,11 @@ python -m ai_auto_desktop run workflow.yaml \
 Tesseract 是可选的系统依赖；所有 OCR 请求都需要 Pillow 完成图片格式、尺寸、帧数与完整
 解码校验，区域裁剪也由 Pillow 执行。依赖缺失、低置信度等情况都会返回结构化 `OCR.*`
 错误。OCR 输出始终是不可信数据，只有后续显式的 `if` 或 `switch` 才能据此选择响应动作。
+推荐的新路径是 `vision.ocr.recognize_artifact@1`：它只接受同一 run 中 Host 管理的
+`ArtifactRef`，图片字节通过私有 side channel 传入，结果不会暴露 Host 路径。原
+`recognize@1` 继续兼容显式绝对路径，并单独要求 `filesystem.read`。仓库中的
+`linux-capture-ocr-decision.yaml` 演示了受控目标截图后显式 OCR、再用 `if` 判断的流程；
+示例不包含点击动作，也不会把 OCR bounds 自动转换为坐标操作。
 
 ## Windows 用户界面自动化驱动（UIA）
 
