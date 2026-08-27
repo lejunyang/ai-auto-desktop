@@ -711,7 +711,11 @@ class MacOSTestkitCompileDiagnosticContracts(unittest.TestCase):
             cwd=repository,
             check=True,
         )
-        return copied
+        # macOS exposes temporary directories through both /var and
+        # /private/var.  build.sh intentionally canonicalizes its own path
+        # with pwd -P, so the mock compiler must emit that same physical path
+        # for the <TESTKIT> redaction contract to be deterministic.
+        return copied.resolve()
 
     @staticmethod
     def _write_mock_tools(

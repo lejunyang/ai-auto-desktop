@@ -41,7 +41,8 @@ Tesseract 是可选的系统依赖；所有 OCR 请求都需要 Pillow 完成图
 
 ## Windows 用户界面自动化驱动（UIA）
 
-`plugins/windows_uia` 是首个原生 UIA 驱动实现，真实 Windows 运行结果仍待手动 CI。
+`plugins/windows_uia` 是首个原生 UIA 驱动实现；Windows 原生 CI 只在手动布尔输入或
+可信 push 的 `[windows-native]` 提交标记下显式运行。
 在 Windows 上，它使用可选的 `comtypes` 绑定枚举窗口并归一化有界的 UIA Control View。
 驱动支持精确定位，以及原生 `SetFocus`、`InvokePattern.Invoke`、`ValuePattern.SetValue`、
 显式 `type_text` Unicode 键盘后备和显式 `pointer_click` 左键后备；每次写操作都会在派发前

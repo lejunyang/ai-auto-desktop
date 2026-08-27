@@ -1,7 +1,8 @@
 # Windows UIA 原生 fixture 测试
 
 > CI 约束：Windows 原生 job 不随普通 push 或 pull request 自动运行。需要验证时，
-> 从 GitHub Actions 手动触发 `CI` workflow，并将 `run_windows_native` 设为 `true`。
+> 可以从 GitHub Actions 手动触发 `CI` workflow 并将 `run_windows_native` 设为 `true`；
+> 也可以在可信 push 的提交消息中显式加入 `[windows-native]`。
 
 `tests/windows/uia_fixture_app.py` 是一个只依赖 Python 标准库 `ctypes` 的小型 Win32
 应用。它创建一个标题唯一的顶层窗口，以及原生 `EDIT`、`BUTTON` 和 `STATIC` 控件；其中
@@ -18,18 +19,18 @@
 6. 通过 Runtime 执行 `set_value`，再由 `postcondition.observe` 调用真实 `snapshot`，
    验证动作后的新快照包含目标值，同时确认主动作只派发一次。
 
-该测试类在非 Windows 平台整体跳过。手动启用的 GitHub Actions `windows-native` job
+该测试类在非 Windows 平台整体跳过。显式启用的 GitHub Actions `windows-native` job
 安装 `.[windows-uia]` 后，通过 `tests/windows/run-native-fixture.ps1` 运行
-`python -m unittest discover -s tests -v`。这保留了 Windows 上的完整 contract suite，且其中的
-`tests.test_windows_uia_native` 会实际运行原生 fixture；Linux 和 macOS 不安装 Windows 可选依赖，
+`python -m unittest -v tests.test_windows_uia_native`，只运行真实 Windows fixture；Linux 和 macOS 不安装 Windows 可选依赖，
 也不会尝试模拟原生 UIA。PowerShell runner 会保留 unittest 的退出码，因此 fixture 或其他
 contract 失败时 job 仍然失败，不会因留存报告而被误判为通过。
 
 ## 下载并核验 CI 结果
 
-只有从 GitHub Actions 页面手动运行 `CI`，并显式选择
-`run_windows_native=true`，才会创建 `windows-native` job。普通 push、pull request 和未勾选该
-输入的手动运行都不会启动 Windows runner。选择要验证的 branch 或 commit 后，可按以下步骤取证：
+只有从 GitHub Actions 页面手动运行 `CI` 并显式选择 `run_windows_native=true`，
+或在可信 push 的提交消息中加入 `[windows-native]`，才会创建 `windows-native` job。
+普通 push、pull request 和未勾选该输入的手动运行都不会启动 Windows runner。
+选择要验证的 branch 或 commit 后，可按以下步骤取证：
 
 1. 打开该次 workflow run，在页面底部的 **Artifacts** 区域下载
    `windows-native-fixture-result-<run_id>-<run_attempt>`。

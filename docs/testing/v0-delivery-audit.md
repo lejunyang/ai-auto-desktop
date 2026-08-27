@@ -11,7 +11,7 @@
 3. OCR 只能显式调用；允许“识别指定内容后再决定响应”，不得由 locator 或语义动作失败隐式触发。
 4. 语义接口优先；键盘和鼠标输入只作为显式 `type_text` / `pointer_click` 能力，并保留 protected、焦点、会话、hit-test 和 `UNKNOWN_EFFECT` 边界。
 5. 运行状态和事件持久化；仅在证明安全的边界恢复，不重放效果不明的步骤。
-6. Linux 以本机 KDE Plasma/X11 为首个真实目标；Windows 不使用 Wine，原生 CI 保持手动；macOS 提供可搬运、可回传的真机套件。
+6. Linux 以本机 KDE Plasma/X11 为首个真实目标；Windows 不使用 Wine，原生 CI 保持显式 opt-in；macOS 提供可搬运、可回传的真机套件。
 7. 用户文档为中文；每个实现阶段经过测试、独立审查和原子提交。
 
 ## 2. Prompt 到产物检查表
@@ -31,13 +31,13 @@
 | durable 敏感边界 | v0 继续拒绝 script、写 action、敏感 workflow 输入/输出，以及 provider 或 descriptor 标记敏感的 action 输入/输出/错误 | 已验证；完整 taint tracking 待后续 |
 | 显式 OCR | `vision.ocr.recognize@1`、JSON/YAML 示例、字面匹配和置信度分支；无截图/点击 | 已验证 |
 | OCR 资源边界 | 64 MiB、20k 单边、40 MP、单帧、Pillow 完整解码；Linux Tesseract prlimit | 已验证 |
-| Windows 显式输入 | UIA fresh resolve + protected/focus/前台 HWND/PID + 分批 Unicode SendInput | 契约和原生 fixture 已就绪；真实 Windows 结果待手动 CI |
+| Windows 显式输入 | UIA fresh resolve + protected/focus/前台 HWND/PID + 分批 Unicode SendInput | 契约和原生 fixture 已就绪；真实 Windows 结果待显式 CI |
 | macOS 显式输入 | AX fresh resolve + Secure Event Input + focus/frontmost + CGEvent progress marker | 契约和真机套件已就绪；真实 Mac 结果待回传 |
 | Linux 显式输入 | AT-SPI fresh resolve + PID/focus + 固定路径 XTest helper；fresh snapshot 验证 | GTK3/Qt5 在本机 KDE/X11 和私有 Xvfb 均通过 |
 | 三端显式鼠标 | `pointer_click@1` 只接受 fresh semantic target + locator，固定中心点左键；Windows/macOS 做原生 element-at-point exact hit-test，Linux 要求 AT-SPI 命中目标子树并叠加 X11 焦点/点下窗口 PID | 三端契约已验证；Linux GTK3/Qt5 私有 Xvfb 真动作通过，Windows/macOS 真机证据待回传 |
 | Linux capability probe | AT-SPI bus、根窗口有界 `xprop` X11 round-trip、portal/libei/uinput/Wayland 分项报告 | 本机 `available=3/degraded=1/unavailable=2/unknown=0`；X11 误阴性已修复 |
 | KDE/QML 应用矩阵 | `tests/linux/kde_app_qualifier.py` 对四应用做只读聚合；专用 runner 对自有 QML fixture 与发行版 KCalc 使用 exact `Press` 并 fresh snapshot | Dolphin、Konsole、System Settings 与自有 Qt Quick/QML fixture 只读观察通过；自有 QML 与隔离 KCalc 语义 invoke 通过，KCalc 显式 pointer 闭环也通过 |
-| Windows 测试门禁与证据 | `.github/workflows/ci.yml` 仅在 `workflow_dispatch` 且 `run_windows_native=true` 时运行完整测试；`tests/windows/run-native-fixture.ps1` 生成 JSON，失败时也上传并保留 30 天 | 静态契约已验证；本轮未触发，无 Windows 真机结论 |
+| Windows 测试门禁与证据 | `.github/workflows/ci.yml` 仅在 `workflow_dispatch(run_windows_native=true)` 或可信 push 提交消息含 `[windows-native]` 时运行原生 fixture；`tests/windows/run-native-fixture.ps1` 生成 JSON，失败时也上传并保留 30 天 | 静态契约已验证；本轮将显式触发真机验证 |
 | 虚拟机可行性 | `docs/testing/virtual-machine-capability.md` | 当前主机无 `/dev/kvm`/嵌套虚拟化；Windows 用远端 runner，macOS 用 Apple 硬件 |
 | Mac 回传包 | `tests/macos/package-source.sh` 与 `run.sh`；结果包含 report、identity、SHA256 和隐私说明 | 源码包与回传格式已就绪；等待真实结果 |
 | Mac 回传验真 | `tests/macos/verify-result.sh` 有界、内存解析归档，校验成员、hash、报告、identity 与规范化元数据，并区分自洽、报告通过、来源受信和最终资格 | 逻辑已验证；尚无真实 Mac 归档，不能宣称平台通过 |
@@ -118,7 +118,7 @@
 
 当前代码纵向切片可交付，但不能宣称三端产品级资格已完成：
 
-- Windows：等待用户允许后手动触发 `workflow_dispatch(run_windows_native=true)`，还需记录 runner、系统版本、commit SHA、fixture 结果和 UIPI/secure desktop 边界。
+- Windows：经用户允许后触发 `workflow_dispatch(run_windows_native=true)` 或可信 push 的 `[windows-native]` 标记，还需记录 runner、系统版本、commit SHA、fixture 结果和 UIPI/secure desktop 边界。
 - macOS：等待真实 Mac 回传 `macos-ax-test-result.tar.gz`；必须通过仓库验真器，并仅在 `archive_valid=true`、`report_passed=true`、`trusted_archive=true`、`source_trusted=true`、`qualified=true` 时记为通过。预期结果归档 SHA-256 必须来自与回传归档独立的可信渠道。
 - Linux：自有 GTK3/Qt5 语义动作、XTest 文本输入与显式中心点左键 pointer click 已通过；Dolphin、Konsole、System Settings 和自有 Qt Quick/QML fixture 已完成初始窗口只读矩阵，KCalc 已完成隔离的语义 `Press` 与显式 pointer 两种计算闭环。其他真实应用写动作、第三方 QML 页面、多窗口和动态页面仍待独立资格验证。
 

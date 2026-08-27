@@ -49,7 +49,7 @@ class CiTriggerContractTests(unittest.TestCase):
             automatic_job.index(production_build), automatic_job.index(fixture_build)
         )
 
-    def test_windows_native_job_requires_explicit_manual_input(self) -> None:
+    def test_windows_native_job_requires_explicit_opt_in(self) -> None:
         source = CI_WORKFLOW.read_text(encoding="utf-8")
 
         self.assertIn("workflow_dispatch:", source)
@@ -67,9 +67,17 @@ class CiTriggerContractTests(unittest.TestCase):
             source,
             re.compile(
                 r"windows-native:\n"
-                r"\s+if: github\.event_name == 'workflow_dispatch' "
-                r"&& inputs\.run_windows_native == true"
+                r"\s+if: >-\n"
+                r"\s+\(github\.event_name == 'workflow_dispatch' "
+                r"&& inputs\.run_windows_native == true\) \|\|\n"
+                r"\s+\(github\.event_name == 'push' "
+                r"&& contains\(github\.event\.head_commit\.message, "
+                r"'\[windows-native\]'\)\)"
             ),
+        )
+        self.assertNotIn(
+            "github.event_name == 'pull_request'",
+            source.split("  windows-native:", 1)[1],
         )
 
         automatic_matrix = source.split("  windows-native:", 1)[0]
