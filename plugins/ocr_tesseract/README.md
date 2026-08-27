@@ -55,6 +55,9 @@ Tesseract 前由 Pillow 检查尺寸、帧数并完整解码一次。Pillow 的 
 `OCR.ENGINE_ISOLATION_UNAVAILABLE`，不会无约束启动。POSIX 上发生超时或输出溢出时会
 终止该进程组；Windows 上会尽力使用 `taskkill /T`（并在宽限期后使用 `/F`）。`stdout`、
 `stderr`、TSV 行、单词、文本行、文本、匹配项以及最终 NDJSON 响应均设有硬性上限。
+为确保超时时仍能同步回收引擎并在宿主硬截止时间前返回结构化 `OCR.TIMEOUT`，provider
+会为最坏清理路径和 NDJSON 写回预留约 1.3 秒；剩余调用预算不大于该值时会在启动
+Tesseract 前直接失败。调用方应为真实识别设置明显更大的总超时，例如示例中的 20 秒。
 
 插件会把引擎环境精简到最小必需集合，并在默认情况下设置 `OMP_NUM_THREADS=1`、
 `OMP_THREAD_LIMIT=1`，将 Tesseract/libgomp 限制为单线程。这样做是因为 Linux 的

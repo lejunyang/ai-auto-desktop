@@ -53,7 +53,16 @@ MAX_COORDINATE = 1_000_000_000
 DEFAULT_ENGINE_TIMEOUT_SECONDS = 30.0
 PROCESS_POLL_SECONDS = 0.02
 PROCESS_TERMINATE_GRACE_SECONDS = 0.20
-RESPONSE_BUDGET_SECONDS = 0.10
+# The provider must synchronously stop/reap the engine and drain both output
+# readers before it can serialize a structured timeout.  The slowest supported
+# cleanup path has at most six bounded grace waits (Windows taskkill/wait or the
+# POSIX overflow fallback plus two reader joins).  Reserve that entire bound,
+# then keep a separate allowance for NDJSON serialization and scheduler jitter.
+PROCESS_CLEANUP_BUDGET_SECONDS = 6 * PROCESS_TERMINATE_GRACE_SECONDS
+RESPONSE_WRITE_BUDGET_SECONDS = 0.10
+RESPONSE_BUDGET_SECONDS = (
+    PROCESS_CLEANUP_BUDGET_SECONDS + RESPONSE_WRITE_BUDGET_SECONDS
+)
 LINUX_ENGINE_ADDRESS_SPACE_BYTES = 2 * 1024 * 1024 * 1024
 LINUX_ENGINE_CPU_SECONDS = 30
 LINUX_ENGINE_FILE_BYTES = 16 * 1024 * 1024

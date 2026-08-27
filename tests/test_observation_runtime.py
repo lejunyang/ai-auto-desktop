@@ -8,6 +8,7 @@ import sys
 import time
 import unittest
 from typing import Any
+from unittest.mock import patch
 
 from ai_auto_desktop.compiler import compile_descriptor
 from ai_auto_desktop.plugin import PluginError, ProcessPlugin
@@ -150,6 +151,27 @@ class ScriptedPlugin(ProcessPlugin):
         if isinstance(outcome, BaseException):
             raise outcome
         return deepcopy(outcome)
+
+
+class DeterministicClock:
+    def __init__(self, now: float = 100.0) -> None:
+        self.now = now
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+    def sleep_interruptibly(
+        self,
+        seconds: float,
+        local_deadline: float | None = None,
+        *,
+        cleanup: bool = False,
+    ) -> None:
+        del local_deadline, cleanup
+        self.advance(seconds)
 
 
 def fixture_plugin(
@@ -450,7 +472,16 @@ class ObservationRuntimeTests(unittest.TestCase):
         self.assertEqual(plugin.counts["apply"], 1)
         self.assertEqual(plugin.counts["observe"], 1)
 
-    def test_each_observation_gets_a_fresh_manifest_action_timeout(self) -> None:
+    def test_each_observation_gets_fresh_timeout_clamped_by_postcondition_deadline(
+        self,
+    ) -> None:
+        clock = DeterministicClock()
+
+        def first_observation(timeout: float | None) -> dict[str, bool]:
+            self.assertAlmostEqual(timeout or 0.0, 0.05)
+            clock.advance(0.02)
+            return {"ready": False}
+
         contract = action_contract(
             timeout="50ms",
             output_schema={
@@ -460,19 +491,31 @@ class ObservationRuntimeTests(unittest.TestCase):
             },
         )
         plugin = fixture_plugin(
-            observations=[{"ready": False}, {"ready": True}],
+            observations=[first_observation, {"ready": True}],
             observer_contract=contract,
         )
         self.addCleanup(plugin.close)
-
-        result = run_descriptor(
+        runner = WorkflowRunner(
             compile_descriptor(
                 workflow(
-                    observed_action(timeout="200ms", poll_interval="30ms")
+                    observed_action(timeout="70ms", poll_interval="30ms")
                 )
             ),
             plugins={"fixture": plugin},
         )
+
+        with (
+            patch(
+                "ai_auto_desktop.runtime.time.monotonic",
+                side_effect=clock.monotonic,
+            ),
+            patch.object(
+                runner,
+                "_sleep_interruptibly",
+                side_effect=clock.sleep_interruptibly,
+            ),
+        ):
+            result = runner.run()
 
         self.assertTrue(result.ok, result.to_dict())
         observe_timeouts = [
@@ -481,12 +524,11 @@ class ObservationRuntimeTests(unittest.TestCase):
             if action == "fixture.observe@1"
         ]
         self.assertEqual(len(observe_timeouts), 2)
-        for timeout in observe_timeouts:
-            self.assertIsNotNone(timeout)
-            self.assertGreater(timeout, 0.04)
-            self.assertLessEqual(timeout, 0.05)
+        self.assertAlmostEqual(observe_timeouts[0] or 0.0, 0.05)
+        self.assertAlmostEqual(observe_timeouts[1] or 0.0, 0.02)
 
     def test_effectful_action_postcondition_expiry_is_unknown_and_not_retried(self) -> None:
+        clock = DeterministicClock()
         plugin = fixture_plugin(
             main_effect="idempotent", observations=[{"ready": False}]
         )
@@ -500,12 +542,21 @@ class ObservationRuntimeTests(unittest.TestCase):
                 "on": {"codes": ["ACTION.UNKNOWN_EFFECT"]},
             },
         )
-        started = time.monotonic()
-
-        result = run_descriptor(
+        runner = WorkflowRunner(
             compile_descriptor(workflow(step)), plugins={"fixture": plugin}
         )
-        elapsed = time.monotonic() - started
+        with (
+            patch(
+                "ai_auto_desktop.runtime.time.monotonic",
+                side_effect=clock.monotonic,
+            ),
+            patch.object(
+                runner,
+                "_sleep_interruptibly",
+                side_effect=clock.sleep_interruptibly,
+            ),
+        ):
+            result = runner.run()
 
         self.assertEqual(result.status, "unknown_effect")
         self.assertEqual(result.error.code, "ACTION.UNKNOWN_EFFECT")
@@ -513,7 +564,7 @@ class ObservationRuntimeTests(unittest.TestCase):
         self.assertEqual(result.steps["apply"]["attempts"], 1)
         self.assertEqual(plugin.counts["apply"], 1)
         self.assertEqual(plugin.counts["observe"], 1)
-        self.assertLess(elapsed, 0.2)
+        self.assertAlmostEqual(clock.now, 100.02)
         self.assertEqual(
             result.error.details["cause"]["code"],
             "ACTION.POSTCONDITION_FAILED",

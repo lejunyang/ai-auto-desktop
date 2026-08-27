@@ -72,15 +72,33 @@ class TesseractPluginTests(unittest.TestCase):
                 import hashlib
                 import os
                 from pathlib import Path
+                import signal
                 import sys
                 import time
 
+                started_log = os.environ.get("FAKE_TESSERACT_STARTED_LOG")
+                if started_log:
+                    with Path(started_log).open("a", encoding="utf-8") as stream:
+                        stream.write(f"{os.getpid()} {' '.join(sys.argv[1:])}\\n")
+                if (
+                    os.name == "posix"
+                    and os.environ.get("FAKE_TESSERACT_IGNORE_SIGTERM") == "1"
+                ):
+                    signal.signal(signal.SIGTERM, lambda _signum, _frame: None)
                 if "--version" in sys.argv:
                     replacement = os.environ.get("FAKE_TESSERACT_REPLACEMENT")
                     source = os.environ.get("FAKE_TESSERACT_SOURCE")
                     if replacement and source:
                         os.replace(replacement, source)
-                    time.sleep(float(os.environ.get("FAKE_TESSERACT_VERSION_DELAY", "0")))
+                    delay = float(os.environ.get("FAKE_TESSERACT_VERSION_DELAY", "0"))
+                    delay_once = os.environ.get("FAKE_TESSERACT_VERSION_DELAY_ONCE")
+                    if delay_once:
+                        marker = Path(delay_once)
+                        if marker.exists():
+                            delay = 0
+                        else:
+                            marker.write_text("started", encoding="ascii")
+                    time.sleep(delay)
                     print("tesseract 5.4.1")
                     raise SystemExit(0)
                 log = os.environ.get("FAKE_TESSERACT_LOG")
@@ -553,10 +571,76 @@ class TesseractPluginTests(unittest.TestCase):
     def test_total_deadline_covers_version_and_recognition(self) -> None:
         with self.assertRaises(PluginError) as raised:
             self.make_plugin(
-                env_updates={"FAKE_TESSERACT_VERSION_DELAY": "0.35"}, timeout=0.25
+                env_updates={"FAKE_TESSERACT_VERSION_DELAY": "2"}, timeout=2
             ).invoke("vision.ocr.recognize@1", {"image": {"path": str(self.image)}})
         self.assertEqual(raised.exception.code, "OCR.TIMEOUT")
         self.assertTrue(raised.exception.retryable)
+
+    def test_short_budget_does_not_launch_engine_and_provider_remains_usable(self) -> None:
+        started_log = self.directory / "started.log"
+        plugin = self.make_plugin(
+            env_updates={"FAKE_TESSERACT_STARTED_LOG": str(started_log)},
+            timeout=3,
+        )
+        plugin.start()
+        provider_pid = plugin.pid
+
+        with self.assertRaises(PluginError) as raised:
+            plugin.invoke(
+                "vision.ocr.recognize@1",
+                {"image": {"path": str(self.image)}},
+                timeout=0.35,
+            )
+
+        self.assertEqual(raised.exception.code, "OCR.TIMEOUT")
+        self.assertTrue(raised.exception.retryable)
+        self.assertFalse(started_log.exists())
+        self.assertEqual(plugin.pid, provider_pid)
+        result = plugin.invoke(
+            "vision.ocr.recognize@1",
+            {"image": {"path": str(self.image)}},
+            timeout=2,
+        )
+        self.assertEqual(result["text"], "Invoice A-42\nTotal $12.50")
+        self.assertEqual(plugin.pid, provider_pid)
+
+    def test_slow_engine_termination_returns_ocr_timeout_and_reuses_provider(self) -> None:
+        started_log = self.directory / "started.log"
+        delay_once = self.directory / "version-delay-started"
+        plugin = self.make_plugin(
+            env_updates={
+                "FAKE_TESSERACT_STARTED_LOG": str(started_log),
+                "FAKE_TESSERACT_IGNORE_SIGTERM": "1",
+                "FAKE_TESSERACT_VERSION_DELAY": "30",
+                "FAKE_TESSERACT_VERSION_DELAY_ONCE": str(delay_once),
+            },
+            timeout=3,
+        )
+        plugin.start()
+        provider_pid = plugin.pid
+
+        with self.assertRaises(PluginError) as raised:
+            plugin.invoke(
+                "vision.ocr.recognize@1",
+                {"image": {"path": str(self.image)}},
+                timeout=2,
+            )
+
+        self.assertEqual(raised.exception.code, "OCR.TIMEOUT")
+        self.assertTrue(raised.exception.retryable)
+        self.assertEqual(plugin.pid, provider_pid)
+        first_engine_pid = int(started_log.read_text(encoding="utf-8").split()[0])
+        if os.name == "posix":
+            with self.assertRaises(ProcessLookupError):
+                os.kill(first_engine_pid, 0)
+
+        result = plugin.invoke(
+            "vision.ocr.recognize@1",
+            {"image": {"path": str(self.image)}},
+            timeout=2,
+        )
+        self.assertEqual(result["text"], "Invoice A-42\nTotal $12.50")
+        self.assertEqual(plugin.pid, provider_pid)
 
     def test_windows_launcher_and_permission_documentation_exist(self) -> None:
         launcher = OCR_PLUGIN.with_name("run.cmd").read_text(encoding="utf-8")
