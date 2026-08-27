@@ -149,7 +149,11 @@ class PackageResourceTests(unittest.TestCase):
         self.assertIn("requires jsonschema", raised.exception.message)
 
     def test_installed_package_uses_schemas_for_negative_validation(self) -> None:
-        target = self.temporary_path / "target"
+        # macOS exposes the same temporary directory as both /var/... and
+        # /private/var/....  Canonicalize before passing the install path to
+        # pip and the child interpreter so the containment assertion compares
+        # one physical path representation on every platform.
+        target = (self.temporary_path / "target").resolve()
         completed = subprocess.run(
             [
                 sys.executable,
