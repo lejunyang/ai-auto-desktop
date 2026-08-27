@@ -18,6 +18,7 @@ import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from typing import Any
 
+from .artifacts import ArtifactError, ArtifactStore
 from .compiler import parse_duration
 from .errors import AutomationError, ensure_automation_error
 from .expression import ExpressionError, evaluate_expression
@@ -181,6 +182,7 @@ class WorkflowRunner:
         granted_permissions: Sequence[str] | None = None,
         event_sink: Callable[[Mapping[str, Any]], None] | None = None,
         durable_action_mode: str = "deny",
+        artifact_store: ArtifactStore | None = None,
     ) -> None:
         if durable_action_mode not in {"deny", "read_only"}:
             raise ValueError(
@@ -191,6 +193,8 @@ class WorkflowRunner:
         self.allow_scripts = allow_scripts
         self.granted_permissions = frozenset(granted_permissions or ())
         self.event_sink = event_sink
+        self.artifact_store = artifact_store
+        self._owns_artifact_store = False
         self.plugins: dict[str, ProcessPlugin] = {}
         self._owned: set[str] = set()
         for name, plugin in (plugins or {}).items():
@@ -232,6 +236,26 @@ class WorkflowRunner:
         finally:
             self._cancelled.clear()
             self._run_lock.release()
+
+    def import_artifact_bytes(
+        self,
+        data: bytes | bytearray | memoryview,
+        *,
+        media_type: str | None = None,
+        ttl_seconds: float | None = None,
+    ) -> dict[str, Any]:
+        """Import trusted bytes into this runner's ephemeral artifact scope."""
+
+        store = self._ensure_artifact_store()
+        return store.import_bytes(
+            data, media_type=media_type, ttl_seconds=ttl_seconds
+        ).to_dict()
+
+    def _ensure_artifact_store(self) -> ArtifactStore:
+        if self.artifact_store is None:
+            self.artifact_store = ArtifactStore()
+            self._owns_artifact_store = True
+        return self.artifact_store
 
     def _run(self, inputs: Mapping[str, Any] | None = None) -> RunResult:
         self.events, self.step_records, self._executed = [], {}, 0
@@ -296,7 +320,7 @@ class WorkflowRunner:
                 status = "timed_out"
             elif error.code == "WORKFLOW.CANCELLED": status = "cancelled"
             else: status = "failed"
-        return RunResult(
+        result = RunResult(
             status,
             None if output is MISSING else output,
             dict(self.variables),
@@ -304,9 +328,20 @@ class WorkflowRunner:
             list(self.events),
             dict(self.step_records),
         )
+        if self.artifact_store is not None:
+            result._artifact_store = self.artifact_store
+            result._owns_artifact_store = self._owns_artifact_store
+            if self._owns_artifact_store:
+                self.artifact_store = None
+                self._owns_artifact_store = False
+        return result
 
     def close(self) -> None:
         for name in self._owned: self.plugins[name].close()
+        if self._owns_artifact_store and self.artifact_store is not None:
+            self.artifact_store.cleanup()
+            self.artifact_store = None
+            self._owns_artifact_store = False
 
     def cancel(self) -> None:
         """Request cooperative cancellation and prevent new step dispatch."""
@@ -873,7 +908,7 @@ class WorkflowRunner:
                 status = "cancelled"
             else:
                 status = "failed"
-        return RunResult(
+        result = RunResult(
             status,
             None if output is MISSING else output,
             dict(self.variables),
@@ -881,6 +916,13 @@ class WorkflowRunner:
             list(self.events),
             dict(self.step_records),
         )
+        if self.artifact_store is not None:
+            result._artifact_store = self.artifact_store
+            result._owns_artifact_store = self._owns_artifact_store
+            if self._owns_artifact_store:
+                self.artifact_store = None
+                self._owns_artifact_store = False
+        return result
 
     @contextmanager
     def _segment_lock(self, operation: str) -> Iterator[None]:
@@ -1495,6 +1537,8 @@ class WorkflowRunner:
         ):
             return None
         contract = self._resolve_action_contract(step)
+        if contract.get("artifacts") is not None:
+            return None
         if self._effective_action_effect(step, contract=contract) != "read_only":
             return None
         permissions = set(contract.get("permissions", ()))
@@ -1584,6 +1628,8 @@ class WorkflowRunner:
             worker.event_sink = None
             worker.plugins = self.plugins
             worker._owned = set()
+            worker.artifact_store = self.artifact_store
+            worker._owns_artifact_store = False
             worker.events = []
             worker.step_records = {}
             worker.context = _clone_runtime_value(context)
@@ -2008,6 +2054,13 @@ class WorkflowRunner:
                 details={"uses": uses},
             ) from exc
         contract = self._action_contract(plugin, capability, uses)
+        if contract.get("artifacts") is not None:
+            raise AutomationError(
+                "DURABLE.UNSUPPORTED_PLAN",
+                "durable actions cannot use ephemeral artifact transport",
+                category="durable",
+                details={"uses": uses, "reason": "ephemeral_artifact_transport"},
+            )
         if self._effective_action_effect(step, contract=contract) != "read_only":
             raise AutomationError(
                 "DURABLE.UNSUPPORTED_PLAN",
@@ -2494,7 +2547,34 @@ class WorkflowRunner:
         effective_effect: str,
     ) -> Any:
         try:
-            result = plugin.invoke(uses, action_input, timeout=timeout)
+            artifacts = contract.get("artifacts")
+            if artifacts is None:
+                result = plugin.invoke(uses, action_input, timeout=timeout)
+            else:
+                if self.durable_action_mode == "read_only":
+                    raise AutomationError(
+                        "DURABLE.UNSUPPORTED_PLAN",
+                        "durable actions cannot use ephemeral artifact transport",
+                        category="durable",
+                        details={"uses": uses, "reason": "ephemeral_artifact_transport"},
+                    )
+                if self.artifact_store is None:
+                    try:
+                        self._ensure_artifact_store()
+                    except ArtifactError as exc:
+                        raise AutomationError(
+                            exc.code, exc.message, category=exc.category,
+                            phase=exc.phase, details=exc.details, cause=exc,
+                        ) from exc
+                assert self.artifact_store is not None
+                result = plugin.invoke_with_artifacts(
+                    uses, action_input, self.artifact_store,
+                    contract=contract, timeout=timeout,
+                    result_validator=lambda value: self._validate_schema(
+                        value, contract.get("output_schema"),
+                        "ACTION.OUTPUT_INVALID", uses,
+                    ),
+                )
         except PluginError as exc:
             if self.durable_action_mode == "read_only":
                 declared = any(
@@ -2527,7 +2607,12 @@ class WorkflowRunner:
                     retryable=False,
                     effect="unknown",
                 ) from None
-            ambiguous = exc.code in {"PLUGIN.HOST_TIMEOUT", "PLUGIN.HOST_EOF", "PLUGIN.HOST_PROTOCOL_ERROR"}
+            ambiguous = exc.code in {
+                "PLUGIN.HOST_TIMEOUT", "PLUGIN.HOST_EOF",
+                "PLUGIN.HOST_PROTOCOL_ERROR",
+                "PLUGIN.HOST_ARTIFACT_PROTOCOL_ERROR",
+                "PLUGIN.HOST_ARTIFACT_CHANNEL_UNAVAILABLE",
+            }
             if exc.dispatched and effective_effect in {"non_idempotent", "contextual"} and ambiguous:
                 raise AutomationError("ACTION.UNKNOWN_EFFECT", "Action outcome is unknown after dispatch", category="action", effect="unknown", details={"plugin_error": exc.to_dict()}, cause=exc) from exc
             if exc.code == "PLUGIN.HOST_TIMEOUT":
@@ -2560,7 +2645,8 @@ class WorkflowRunner:
             raise AutomationError(
                 exc.code,
                 exc.message,
-                category="plugin",
+                category=("artifact" if exc.code.startswith("ARTIFACT.") else "plugin"),
+                phase=("artifact" if exc.code.startswith("ARTIFACT.") else None),
                 retryable=exc.retryable,
                 effect=error_effect,
                 details=exc.details,
@@ -3245,8 +3331,8 @@ def _max_effect(provider: Any, declared: Any) -> str:
     return max(values, key=lambda item: order[item]) if values else "contextual"
 
 
-def run_descriptor(descriptor: WorkflowDescriptor, *, inputs: Mapping[str, Any] | None = None, plugins: Mapping[str, ProcessPlugin | Sequence[str] | str] | None = None, allow_scripts: bool = False, granted_permissions: Sequence[str] | None = None, event_sink: Callable[[Mapping[str, Any]], None] | None = None) -> RunResult:
-    return WorkflowRunner(descriptor, plugins=plugins, allow_scripts=allow_scripts, granted_permissions=granted_permissions, event_sink=event_sink).run(inputs)
+def run_descriptor(descriptor: WorkflowDescriptor, *, inputs: Mapping[str, Any] | None = None, plugins: Mapping[str, ProcessPlugin | Sequence[str] | str] | None = None, allow_scripts: bool = False, granted_permissions: Sequence[str] | None = None, event_sink: Callable[[Mapping[str, Any]], None] | None = None, artifact_store: ArtifactStore | None = None) -> RunResult:
+    return WorkflowRunner(descriptor, plugins=plugins, allow_scripts=allow_scripts, granted_permissions=granted_permissions, event_sink=event_sink, artifact_store=artifact_store).run(inputs)
 
 
 def _platform_name() -> str:

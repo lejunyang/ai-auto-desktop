@@ -11,6 +11,7 @@ from __future__ import annotations
 from collections import deque
 from collections.abc import Mapping
 from dataclasses import dataclass
+import hashlib
 from importlib import resources
 import json
 import math
@@ -18,12 +19,24 @@ import os
 from pathlib import Path
 import queue
 import signal
+import socket
+import select
 import subprocess
 import threading
 import time
 from types import TracebackType
 from typing import Any, BinaryIO
 import uuid
+
+from .artifact_ipc import (
+    ArtifactIPCError,
+    CHANNEL_FD_ENV,
+    MAX_FRAME_PAYLOAD_BYTES,
+    PROTOCOL as ARTIFACT_PROTOCOL,
+    receive_frame,
+    send_frame,
+)
+from .artifacts import ArtifactError, ArtifactRef, ArtifactStore
 
 try:
     import jsonschema
@@ -42,6 +55,7 @@ _MAX_STDERR_BYTES = 64 * 1024
 _STDERR_CHUNK_BYTES = 4096
 _MANIFEST_PROBE_SECONDS = 0.10
 _TERMINATE_GRACE_SECONDS = 0.50
+_MAX_ARTIFACT_INVOCATION_BYTES = 256 * 1024 * 1024
 _MANIFEST_SCHEMA_RESOURCE = (
     "schemas",
     "capabilities",
@@ -160,6 +174,8 @@ class ProcessPlugin:
         # If a proactive manifest races with our fallback manifest request, its
         # eventual response remains a paired but ignorable transport message.
         self._discard_response_ids: set[str] = set()
+        self._artifact_channel: socket.socket | None = None
+        self._artifact_child_channel: socket.socket | None = None
 
     @property
     def pid(self) -> int | None:
@@ -228,6 +244,22 @@ class ProcessPlugin:
             }
             if os.name == "posix":
                 popen_options["start_new_session"] = True
+                try:
+                    host_channel, child_channel = socket.socketpair()
+                    host_channel.setblocking(False)
+                except OSError as exc:
+                    self._closed = True
+                    raise PluginError(
+                        "PLUGIN.HOST_ARTIFACT_CHANNEL_UNAVAILABLE",
+                        f"could not create artifact channel for plugin {self.name!r}",
+                        details={"exception_type": type(exc).__name__},
+                    ) from exc
+                environment = dict(os.environ if self.env is None else self.env)
+                environment[CHANNEL_FD_ENV] = str(child_channel.fileno())
+                popen_options["env"] = environment
+                popen_options["pass_fds"] = (child_channel.fileno(),)
+                self._artifact_channel = host_channel
+                self._artifact_child_channel = child_channel
             elif os.name == "nt":
                 popen_options["creationflags"] = getattr(
                     subprocess, "CREATE_NEW_PROCESS_GROUP", 0
@@ -236,6 +268,7 @@ class ProcessPlugin:
             try:
                 process = subprocess.Popen(self.command, **popen_options)
             except (OSError, ValueError) as exc:
+                self._close_artifact_channels()
                 self._closed = True
                 raise PluginError(
                     "PLUGIN.START_FAILED",
@@ -245,6 +278,9 @@ class ProcessPlugin:
                 ) from exc
 
             self._process = process
+            if self._artifact_child_channel is not None:
+                self._artifact_child_channel.close()
+                self._artifact_child_channel = None
             self._start_readers(process)
 
         startup_deadline = time.monotonic() + self.timeout
@@ -326,7 +362,6 @@ class ProcessPlugin:
         with self._request_lock:
             self._start_locked(deadline=deadline)
             request_id = self._new_request_id()
-            dispatched = False
             try:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
@@ -369,11 +404,83 @@ class ProcessPlugin:
                     raise AssertionError("unreachable")
                 raise exc
 
+    def invoke_with_artifacts(
+        self,
+        action: str,
+        args: Any,
+        artifact_store: ArtifactStore,
+        *,
+        contract: Mapping[str, Any] | None = None,
+        timeout: float | None = None,
+        result_validator: Any = None,
+    ) -> Any:
+        """Invoke one declared artifact action over the private side channel."""
+
+        if not isinstance(artifact_store, ArtifactStore):
+            raise PluginError(
+                "PLUGIN.INVALID_REQUEST",
+                "artifact_store must be an ArtifactStore",
+                details={"dispatched": False},
+            )
+        if not isinstance(action, str) or not action:
+            raise PluginError(
+                "PLUGIN.INVALID_REQUEST",
+                "action must be a non-empty string",
+                details={"dispatched": False},
+            )
+        effective_timeout = (
+            self.timeout
+            if timeout is None
+            else _validate_timeout(timeout, "invoke timeout")
+        )
+        deadline = time.monotonic() + effective_timeout
+        with self._request_lock:
+            self._start_locked(deadline=deadline)
+            actual_contract = (
+                self._artifact_contract_for_action(action)
+            )
+            if contract is not None and dict(contract) != dict(actual_contract):
+                raise PluginError(
+                    "PLUGIN.INVALID_REQUEST",
+                    "artifact action contract does not match the plugin manifest",
+                    details={"dispatched": False},
+                )
+            artifact_contract = actual_contract.get("artifacts")
+            if not isinstance(artifact_contract, Mapping):
+                raise PluginError(
+                    "PLUGIN.INVALID_REQUEST",
+                    "action does not declare artifact transport",
+                    details={"dispatched": False},
+                )
+            channel = self._artifact_channel
+            if channel is None:
+                raise self._host_error(
+                    "PLUGIN.HOST_ARTIFACT_CHANNEL_UNAVAILABLE",
+                    "artifact side channel is unavailable on this platform",
+                )
+            request_id = self._new_request_id()
+            dispatched = False
+            try:
+                return self._invoke_artifacts_locked(
+                    action, args, artifact_store, actual_contract, channel,
+                    request_id=request_id, deadline=deadline,
+                    result_validator=result_validator,
+                )
+            except PluginError as exc:
+                if exc.code.startswith("PLUGIN.HOST_"):
+                    self._abort(exc)
+                    raise AssertionError("unreachable")
+                raise
+            except ArtifactError as exc:
+                raise PluginError(
+                    exc.code, exc.message, details={**exc.details, "dispatched": False}
+                ) from exc
+
     def close(self) -> None:
         """Terminate the plugin process tree.  The method is idempotent."""
 
         with self._lifecycle_lock:
-            if self._closed:
+            if self._closed and self._artifact_channel is None and self._artifact_child_channel is None:
                 return
             self._closed = True
             process = self._process
@@ -384,6 +491,7 @@ class ProcessPlugin:
         if process is not None:
             self._terminate_process(process)
         self._reader_stop.set()
+        self._close_artifact_channels()
         self._close_pipes(process)
         self._join_readers()
 
@@ -693,6 +801,484 @@ class ProcessPlugin:
                             },
                         )
 
+    def _artifact_contract_for_action(self, action: str) -> Mapping[str, Any]:
+        manifest = self.manifest
+        if not isinstance(manifest, Mapping):
+            raise self._host_error(
+                "PLUGIN.HOST_PROTOCOL_ERROR", "plugin manifest is unavailable"
+            )
+        metadata = manifest.get("metadata")
+        name = metadata.get("name") if isinstance(metadata, Mapping) else None
+        action_name = action
+        if isinstance(name, str) and action.startswith(name + "."):
+            action_name = action[len(name) + 1 :]
+        if "@" in action_name:
+            action_name, major_text = action_name.rsplit("@", 1)
+        else:
+            major_text = ""
+        contract = manifest.get("actions", {}).get(action_name)
+        if (
+            not isinstance(contract, Mapping)
+            or not major_text.isdigit()
+            or contract.get("contract_major") != int(major_text)
+        ):
+            raise PluginError(
+                "PLUGIN.INVALID_REQUEST",
+                "artifact action does not match the plugin manifest",
+                details={"dispatched": False},
+            )
+        return contract
+
+    def _invoke_artifacts_locked(
+        self,
+        action: str,
+        args: Any,
+        artifact_store: ArtifactStore,
+        contract: Mapping[str, Any],
+        channel: socket.socket,
+        *,
+        request_id: str,
+        deadline: float,
+        result_validator: Any,
+    ) -> Any:
+        artifacts = contract["artifacts"]
+        input_slots = artifacts.get("inputs", {})
+        output_slots = artifacts.get("outputs", {})
+        prepared_args = _clone_json_value(args)
+        input_values: list[tuple[str, ArtifactRef, str, bytes]] = []
+        input_bytes = 0
+        tokens: set[str] = set()
+        input_bindings: dict[str, Any] = {}
+        output_bindings: dict[str, Any] = {}
+        for slot_name in sorted(input_slots):
+            slot = input_slots[slot_name]
+            found, raw_reference = _pointer_get(prepared_args, slot["pointer"])
+            if not found:
+                raise PluginError(
+                    "PLUGIN.ARTIFACT_INPUT_MISSING",
+                    "declared artifact input is missing",
+                    details={"slot": slot_name, "dispatched": False},
+                )
+            try:
+                reference = ArtifactRef.from_dict(raw_reference)
+            except (ArtifactError, TypeError, ValueError) as exc:
+                raise PluginError(
+                    "PLUGIN.ARTIFACT_INPUT_INVALID",
+                    "declared artifact input is invalid",
+                    details={"slot": slot_name, "dispatched": False},
+                ) from exc
+            if (
+                reference.media_type not in slot["media_types"]
+                or reference.size_bytes > slot["max_size_bytes"]
+            ):
+                raise PluginError(
+                    "PLUGIN.ARTIFACT_INPUT_REJECTED",
+                    "declared artifact input violates its slot contract",
+                    details={"slot": slot_name, "dispatched": False},
+                )
+            token = _new_artifact_token(tokens)
+            try:
+                with artifact_store.resolve(reference) as handle:
+                    payload = handle.read()
+            except ArtifactError as exc:
+                raise PluginError(
+                    exc.code, exc.message,
+                    details={**exc.details, "slot": slot_name, "dispatched": False},
+                ) from exc
+            input_bytes += len(payload)
+            if input_bytes > _MAX_ARTIFACT_INVOCATION_BYTES:
+                raise PluginError(
+                    "PLUGIN.ARTIFACT_TOTAL_SIZE_EXCEEDED",
+                    "artifact inputs exceed the invocation byte limit",
+                    details={
+                        "limit_bytes": _MAX_ARTIFACT_INVOCATION_BYTES,
+                        "dispatched": False,
+                    },
+                )
+            input_values.append((slot_name, reference, token, payload))
+            input_bindings[slot_name] = {
+                "token": token,
+                "media_type": reference.media_type,
+                "size_bytes": reference.size_bytes,
+                "digest": reference.digest,
+            }
+        for slot_name in sorted(output_slots):
+            slot = output_slots[slot_name]
+            token = _new_artifact_token(tokens)
+            output_bindings[slot_name] = {
+                "token": token,
+                "media_types": list(slot["media_types"]),
+                "max_size_bytes": slot["max_size_bytes"],
+            }
+        declared_input_pointers = {
+            _json_pointer_tokens(slot["pointer"]) for slot in input_slots.values()
+        }
+        _reject_undeclared_artifact_values(prepared_args, declared_input_pointers)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise self._host_error(
+                "PLUGIN.HOST_TIMEOUT",
+                f"plugin {self.name!r} did not respond before the deadline",
+                retryable=True,
+            )
+        deadline_ms = int((time.time() + remaining) * 1000)
+        request = {
+            "type": "invoke", "id": request_id, "action": action,
+            "args": prepared_args, "deadline_ms": deadline_ms,
+            "host_artifacts": {
+                "protocol": ARTIFACT_PROTOCOL, "request_id": request_id,
+                "inputs": input_bindings, "outputs": output_bindings,
+            },
+        }
+        dispatched = self._write_request(request)
+        sender_errors: list[BaseException] = []
+        sender_done = threading.Event()
+
+        def send_inputs() -> None:
+            try:
+                self._send_artifact_inputs(
+                    channel, request_id, input_values, deadline
+                )
+            except BaseException as exc:
+                sender_errors.append(exc)
+            finally:
+                sender_done.set()
+
+        sender: threading.Thread | None = None
+        try:
+            try:
+                self._await_artifact_ready(channel, request_id, deadline)
+            except ArtifactIPCError as exc:
+                raise self._host_error(
+                    (
+                        "PLUGIN.HOST_TIMEOUT"
+                        if exc.code == "ARTIFACT_IPC.DEADLINE_EXCEEDED"
+                        else "PLUGIN.HOST_ARTIFACT_PROTOCOL_ERROR"
+                    ),
+                    exc.message,
+                    extra={"artifact_code": exc.code, "dispatched": True},
+                    retryable=exc.code == "ARTIFACT_IPC.DEADLINE_EXCEEDED",
+                ) from exc
+            sender = threading.Thread(
+                target=send_inputs,
+                name=f"{self.name}-artifact-input",
+                daemon=True,
+            )
+            sender.start()
+            staged: dict[str, tuple[bytes, str, str]] = {}
+            completion: dict[str, Any] | None = None
+            total_output_bytes = 0
+            inputs_accepted = False
+            first_frame = self._artifact_receive(channel, deadline)
+            if first_frame[0].get("type") == "inputs_accepted":
+                header, payload = first_frame
+                if payload or header.get("request_id") != request_id:
+                    raise self._host_error(
+                        "PLUGIN.HOST_ARTIFACT_PROTOCOL_ERROR",
+                        "artifact input acknowledgement is invalid",
+                    )
+                inputs_accepted = True
+                first_frame = None
+            for slot_name in sorted(output_slots):
+                if first_frame is None:
+                    first_frame = self._artifact_receive(channel, deadline)
+                if first_frame[0].get("type") == "invocation_complete":
+                    completion, completion_payload = first_frame
+                    if completion_payload:
+                        raise self._host_error(
+                            "PLUGIN.HOST_ARTIFACT_PROTOCOL_ERROR",
+                            "artifact invocation completion contains data",
+                        )
+                    break
+                value = self._receive_artifact_output(
+                    channel, request_id, slot_name,
+                    output_bindings[slot_name]["token"], output_slots[slot_name], deadline,
+                    first_frame=first_frame,
+                    remaining_bytes=_MAX_ARTIFACT_INVOCATION_BYTES - total_output_bytes,
+                )
+                staged[slot_name] = value
+                total_output_bytes += len(value[0])
+                first_frame = None
+            if completion is None:
+                completion, completion_payload = self._artifact_receive(channel, deadline)
+            if completion_payload or completion.get("type") != "invocation_complete" or completion.get("request_id") != request_id:
+                raise self._host_error(
+                    "PLUGIN.HOST_ARTIFACT_PROTOCOL_ERROR",
+                    "artifact invocation completion is invalid",
+                )
+            status = completion.get("status")
+            if status == "error":
+                if not inputs_accepted:
+                    try:
+                        channel.shutdown(socket.SHUT_WR)
+                    except OSError:
+                        pass
+                    if sender is not None:
+                        sender.join(timeout=_TERMINATE_GRACE_SECONDS)
+                message = self._read_invoke_response(deadline, request_id, dispatched)
+                side_error = completion.get("error")
+                wire_error = message.get("error")
+                if (
+                    not isinstance(side_error, Mapping)
+                    or not isinstance(wire_error, Mapping)
+                    or side_error.get("code") != wire_error.get("code")
+                    or side_error.get("message") != wire_error.get("message")
+                ):
+                    raise self._host_error(
+                        "PLUGIN.HOST_ARTIFACT_PROTOCOL_ERROR",
+                        "artifact error completion does not match stdout",
+                    )
+                error = self._plugin_error_from_message(message, dispatched=True)
+                if not inputs_accepted:
+                    self.close()
+                raise error
+            if not sender_done.wait(max(0.0, deadline - time.monotonic())):
+                raise self._host_error(
+                    "PLUGIN.HOST_TIMEOUT",
+                    "artifact input transfer did not finish before the deadline",
+                    retryable=True,
+                )
+            assert sender is not None
+            sender.join(timeout=0)
+            if sender_errors:
+                error = sender_errors[0]
+                if isinstance(error, ArtifactIPCError):
+                    raise error
+                raise self._host_error(
+                    "PLUGIN.HOST_ARTIFACT_PROTOCOL_ERROR",
+                    "artifact input transfer failed",
+                ) from error
+            message = self._read_invoke_response(deadline, request_id, dispatched)
+            if not inputs_accepted:
+                raise self._host_error(
+                    "PLUGIN.HOST_ARTIFACT_PROTOCOL_ERROR",
+                    "artifact worker completed before accepting all inputs",
+                )
+            if status != "ok" or "result" not in message:
+                raise self._host_error(
+                    "PLUGIN.HOST_ARTIFACT_PROTOCOL_ERROR",
+                    "artifact success completion does not match stdout",
+                )
+            if set(staged) != set(output_slots):
+                raise self._host_error(
+                    "PLUGIN.HOST_ARTIFACT_PROTOCOL_ERROR",
+                    "artifact success completion omitted a declared output",
+                )
+            result = _clone_json_value(message["result"])
+            expected_placeholders = {
+                _json_pointer_tokens(slot["pointer"]): (slot_name, output_bindings[slot_name]["token"])
+                for slot_name, slot in output_slots.items()
+            }
+            _validate_output_placeholders(result, request_id, expected_placeholders)
+            if output_slots:
+                batch = artifact_store.batch()
+                with batch:
+                    references: dict[str, ArtifactRef] = {}
+                    for slot_name in sorted(staged):
+                        payload, media_type, _digest = staged[slot_name]
+                        references[slot_name] = batch.import_bytes(
+                            payload, media_type=media_type
+                        )
+                    for pointer, (slot_name, _token) in expected_placeholders.items():
+                        _pointer_set(result, pointer, references[slot_name].to_dict())
+                    if result_validator is not None:
+                        result_validator(result)
+                    batch.commit()
+            elif result_validator is not None:
+                result_validator(result)
+            return result
+        except ArtifactIPCError as exc:
+            code = (
+                "PLUGIN.HOST_TIMEOUT"
+                if exc.code == "ARTIFACT_IPC.DEADLINE_EXCEEDED"
+                else "PLUGIN.HOST_ARTIFACT_PROTOCOL_ERROR"
+            )
+            raise self._host_error(
+                code, exc.message,
+                extra={"artifact_code": exc.code, "dispatched": dispatched},
+                retryable=exc.code == "ARTIFACT_IPC.DEADLINE_EXCEEDED",
+            ) from exc
+        except ArtifactError as exc:
+            raise PluginError(
+                exc.code, exc.message,
+                details={**exc.details, "dispatched": dispatched},
+            ) from exc
+        except PluginError as exc:
+            if dispatched:
+                raise _with_dispatched(exc)
+            raise
+        finally:
+            if sender is not None and not sender_done.is_set():
+                if inputs_accepted:
+                    sender.join(timeout=_TERMINATE_GRACE_SECONDS)
+                else:
+                    try:
+                        channel.shutdown(socket.SHUT_RDWR)
+                    except OSError:
+                        pass
+                    sender.join(timeout=_TERMINATE_GRACE_SECONDS)
+
+    def _send_artifact_inputs(
+        self, channel: socket.socket, request_id: str,
+        input_values: list[tuple[str, ArtifactRef, str, bytes]], deadline: float,
+    ) -> None:
+        for slot_name, reference, token, payload in input_values:
+            identity = {
+                "request_id": request_id, "slot": slot_name, "token": token
+            }
+            metadata = {
+                **identity, "media_type": reference.media_type,
+                "size_bytes": reference.size_bytes, "digest": reference.digest,
+            }
+            self._artifact_send(
+                channel, {"type": "input_open", **metadata}, b"", deadline
+            )
+            for offset in range(0, len(payload), MAX_FRAME_PAYLOAD_BYTES):
+                self._artifact_send(
+                    channel, {"type": "input_chunk", **identity},
+                    payload[offset : offset + MAX_FRAME_PAYLOAD_BYTES], deadline,
+                )
+            self._artifact_send(
+                channel, {"type": "input_end", **identity,
+                "size_bytes": reference.size_bytes, "digest": reference.digest},
+                b"", deadline,
+            )
+        self._artifact_send(
+            channel, {"type": "inputs_complete", "request_id": request_id},
+            b"", deadline,
+        )
+
+    def _await_artifact_ready(
+        self, channel: socket.socket, request_id: str, deadline: float
+    ) -> None:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise self._host_error(
+                    "PLUGIN.HOST_TIMEOUT",
+                    "artifact worker did not become ready before the deadline",
+                    retryable=True,
+                )
+            try:
+                readable, _, _ = select.select(
+                    [channel], [], [], min(remaining, 0.02)
+                )
+            except (OSError, ValueError) as exc:
+                raise self._host_error(
+                    "PLUGIN.HOST_ARTIFACT_CHANNEL_UNAVAILABLE",
+                    "artifact side channel became unavailable",
+                ) from exc
+            if readable:
+                header, payload = self._artifact_receive(channel, deadline)
+                if (
+                    payload
+                    or header.get("type") != "invocation_ready"
+                    or header.get("request_id") != request_id
+                ):
+                    raise self._host_error(
+                        "PLUGIN.HOST_ARTIFACT_PROTOCOL_ERROR",
+                        "artifact worker ready frame is invalid",
+                    )
+                return
+            message = self._read_message(
+                min(deadline, time.monotonic() + 0.001), allow_timeout=True
+            )
+            if message is not None:
+                response_id = message.get("id")
+                if (
+                    isinstance(response_id, str)
+                    and response_id in self._discard_response_ids
+                ):
+                    self._validate_discarded_response(message, response_id)
+                    self._discard_response_ids.remove(response_id)
+                    continue
+                self._require_response_id(message, request_id)
+                raise self._host_error(
+                    "PLUGIN.HOST_ARTIFACT_PROTOCOL_ERROR",
+                    "artifact worker responded before opening its data channel",
+                )
+
+    def _read_invoke_response(
+        self, deadline: float, request_id: str, dispatched: bool
+    ) -> dict[str, Any]:
+        while True:
+            message = self._read_message(deadline)
+            assert message is not None
+            response_id = message.get("id")
+            if isinstance(response_id, str) and response_id in self._discard_response_ids:
+                self._validate_discarded_response(message, response_id)
+                self._discard_response_ids.remove(response_id)
+                continue
+            self._require_response_id(message, request_id)
+            has_result = "result" in message
+            has_error = "error" in message
+            if has_result == has_error:
+                raise self._host_error(
+                    "PLUGIN.HOST_PROTOCOL_ERROR",
+                    "plugin response must contain exactly one of result or error",
+                )
+            return message
+
+    def _receive_artifact_output(
+        self, channel: socket.socket, request_id: str, slot_name: str, token: str,
+        slot: Mapping[str, Any], deadline: float,
+        *,
+        first_frame: tuple[dict[str, Any], bytes] | None = None,
+        remaining_bytes: int = _MAX_ARTIFACT_INVOCATION_BYTES,
+    ) -> tuple[bytes, str, str]:
+        header, payload = (
+            first_frame if first_frame is not None
+            else self._artifact_receive(channel, deadline)
+        )
+        _require_artifact_frame(header, payload, "output_open", request_id, slot_name, token)
+        media_type = header["media_type"]
+        declared_size = header["size_bytes"]
+        declared_digest = header["digest"]
+        if (
+            media_type not in slot["media_types"]
+            or declared_size > slot["max_size_bytes"]
+            or declared_size > remaining_bytes
+        ):
+            raise ArtifactIPCError(
+                "ARTIFACT_IPC.METADATA_MISMATCH",
+                "Artifact output violates its declared slot contract.",
+            )
+        received = bytearray()
+        digest = hashlib.sha256()
+        while True:
+            header, payload = self._artifact_receive(channel, deadline)
+            if header.get("type") == "output_chunk":
+                _require_artifact_frame(header, payload, "output_chunk", request_id, slot_name, token)
+                if len(received) + len(payload) > declared_size or len(received) + len(payload) > slot["max_size_bytes"]:
+                    raise ArtifactIPCError(
+                        "ARTIFACT_IPC.SIZE_MISMATCH", "Artifact output exceeds its declared size."
+                    )
+                received.extend(payload); digest.update(payload)
+                continue
+            _require_artifact_frame(header, payload, "output_end", request_id, slot_name, token)
+            actual_digest = "sha256:" + digest.hexdigest()
+            if (
+                len(received) != declared_size
+                or header.get("size_bytes") != declared_size
+                or header.get("digest") != declared_digest
+                or actual_digest != declared_digest
+            ):
+                raise ArtifactIPCError(
+                    "ARTIFACT_IPC.DIGEST_MISMATCH",
+                    "Artifact output size or digest verification failed.",
+                )
+            return bytes(received), media_type, actual_digest
+
+    def _artifact_send(
+        self, channel: socket.socket, header: Mapping[str, Any], payload: bytes, deadline: float
+    ) -> None:
+        send_frame(channel, header, payload, deadline_ms=_epoch_deadline_ms(deadline))
+
+    def _artifact_receive(
+        self, channel: socket.socket, deadline: float
+    ) -> tuple[dict[str, Any], bytes]:
+        return receive_frame(channel, deadline_ms=_epoch_deadline_ms(deadline))
+
     def _result_from_message(
         self, message: dict[str, Any], expected_id: str, *, dispatched: bool
     ) -> Any:
@@ -839,6 +1425,7 @@ class ProcessPlugin:
         if process is not None:
             self._terminate_process(process)
         self._reader_stop.set()
+        self._close_artifact_channels()
         self._close_pipes(process)
         self._join_readers()
         raise error
@@ -905,6 +1492,16 @@ class ProcessPlugin:
                 except OSError:
                     pass
 
+    def _close_artifact_channels(self) -> None:
+        for attribute in ("_artifact_channel", "_artifact_child_channel"):
+            channel = getattr(self, attribute, None)
+            setattr(self, attribute, None)
+            if channel is not None:
+                try:
+                    channel.close()
+                except OSError:
+                    pass
+
     def _join_readers(self) -> None:
         current = threading.current_thread()
         for thread in (self._stdout_thread, self._stderr_thread):
@@ -926,6 +1523,198 @@ def _validate_timeout(value: float, label: str) -> float:
     if not math.isfinite(timeout) or timeout <= 0:
         raise ValueError(f"{label} must be a positive finite number")
     return timeout
+
+
+def _epoch_deadline_ms(deadline: float) -> int:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise ArtifactIPCError(
+            "ARTIFACT_IPC.DEADLINE_EXCEEDED",
+            "Artifact IPC deadline expired.",
+        )
+    return int((time.time() + remaining) * 1000)
+
+
+def _clone_json_value(value: Any) -> Any:
+    try:
+        return json.loads(
+            json.dumps(
+                value, ensure_ascii=False, allow_nan=False, separators=(",", ":")
+            )
+        )
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise PluginError(
+            "PLUGIN.INVALID_REQUEST",
+            "artifact invocation arguments must be JSON serializable",
+            details={"dispatched": False},
+        ) from exc
+
+
+def _pointer_get(document: Any, pointer: str) -> tuple[bool, Any]:
+    current = document
+    for token in _json_pointer_tokens(pointer):
+        if isinstance(current, dict):
+            if token not in current:
+                return False, None
+            current = current[token]
+        elif isinstance(current, list):
+            if (
+                not token.isascii()
+                or not token.isdigit()
+                or (token != "0" and token.startswith("0"))
+            ):
+                return False, None
+            index = int(token)
+            if index >= len(current):
+                return False, None
+            current = current[index]
+        else:
+            return False, None
+    return True, current
+
+
+def _pointer_set(document: Any, tokens: tuple[str, ...], value: Any) -> None:
+    if not tokens:
+        raise PluginError(
+            "PLUGIN.HOST_ARTIFACT_PROTOCOL_ERROR",
+            "artifact output pointer cannot target the document root",
+        )
+    parent = document
+    for token in tokens[:-1]:
+        if isinstance(parent, dict) and token in parent:
+            parent = parent[token]
+        elif isinstance(parent, list) and token.isascii() and token.isdigit():
+            index = int(token)
+            if index >= len(parent):
+                raise PluginError(
+                    "PLUGIN.HOST_ARTIFACT_PROTOCOL_ERROR",
+                    "artifact output pointer is missing",
+                )
+            parent = parent[index]
+        else:
+            raise PluginError(
+                "PLUGIN.HOST_ARTIFACT_PROTOCOL_ERROR",
+                "artifact output pointer is missing",
+            )
+    leaf = tokens[-1]
+    if isinstance(parent, dict) and leaf in parent:
+        parent[leaf] = value
+        return
+    if isinstance(parent, list) and leaf.isascii() and leaf.isdigit():
+        index = int(leaf)
+        if index < len(parent):
+            parent[index] = value
+            return
+    raise PluginError(
+        "PLUGIN.HOST_ARTIFACT_PROTOCOL_ERROR",
+        "artifact output pointer is missing",
+    )
+
+
+def _new_artifact_token(used: set[str]) -> str:
+    for _ in range(16):
+        token = uuid.uuid4().hex
+        if token not in used:
+            used.add(token)
+            return token
+    raise PluginError(
+        "PLUGIN.HOST_ARTIFACT_PROTOCOL_ERROR",
+        "artifact token generation failed",
+    )
+
+
+def _is_artifact_ref_shape(value: Any) -> bool:
+    return (
+        isinstance(value, dict)
+        and (value.get("kind") == "ArtifactRef" or "artifactId" in value)
+    )
+
+
+def _is_placeholder_shape(value: Any) -> bool:
+    return isinstance(value, dict) and "$hostArtifact" in value
+
+
+def _walk_json(value: Any, tokens: tuple[str, ...] = ()):
+    yield tokens, value
+    if isinstance(value, dict):
+        for key, item in value.items():
+            yield from _walk_json(item, tokens + (key,))
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            yield from _walk_json(item, tokens + (str(index),))
+
+
+def _reject_undeclared_artifact_values(
+    document: Any, declared: set[tuple[str, ...]]
+) -> None:
+    for tokens, value in _walk_json(document):
+        if _is_placeholder_shape(value):
+            raise PluginError(
+                "PLUGIN.ARTIFACT_PLACEHOLDER_FORBIDDEN",
+                "Host artifact placeholders are forbidden in invocation arguments",
+                details={"dispatched": False},
+            )
+        if _is_artifact_ref_shape(value) and tokens not in declared:
+            raise PluginError(
+                "PLUGIN.ARTIFACT_INPUT_UNDECLARED",
+                "ArtifactRef appears outside a declared input slot",
+                details={"dispatched": False},
+            )
+
+
+def _validate_output_placeholders(
+    document: Any,
+    request_id: str,
+    expected: Mapping[tuple[str, ...], tuple[str, str]],
+) -> None:
+    seen: set[tuple[str, ...]] = set()
+    for tokens, value in _walk_json(document):
+        if _is_artifact_ref_shape(value):
+            raise PluginError(
+                "PLUGIN.HOST_ARTIFACT_PROTOCOL_ERROR",
+                "plugin forged a public artifact reference",
+            )
+        if not _is_placeholder_shape(value):
+            continue
+        declaration = expected.get(tokens)
+        placeholder = value.get("$hostArtifact")
+        if (
+            declaration is None
+            or set(value) != {"$hostArtifact"}
+            or not isinstance(placeholder, dict)
+            or set(placeholder) != {"request_id", "slot", "token"}
+            or placeholder.get("request_id") != request_id
+            or placeholder.get("slot") != declaration[0]
+            or placeholder.get("token") != declaration[1]
+            or tokens in seen
+        ):
+            raise PluginError(
+                "PLUGIN.HOST_ARTIFACT_PROTOCOL_ERROR",
+                "plugin returned an invalid artifact placeholder",
+            )
+        seen.add(tokens)
+    if seen != set(expected):
+        raise PluginError(
+            "PLUGIN.HOST_ARTIFACT_PROTOCOL_ERROR",
+            "plugin omitted a declared artifact placeholder",
+        )
+
+
+def _require_artifact_frame(
+    header: Mapping[str, Any], payload: bytes, frame_type: str,
+    request_id: str, slot: str, token: str,
+) -> None:
+    if (
+        header.get("type") != frame_type
+        or header.get("request_id") != request_id
+        or header.get("slot") != slot
+        or header.get("token") != token
+        or (frame_type != "output_chunk" and payload)
+    ):
+        raise ArtifactIPCError(
+            "ARTIFACT_IPC.PROTOCOL_ERROR",
+            "Artifact output frame does not match its binding.",
+        )
 
 
 def _with_dispatched(error: PluginError) -> PluginError:

@@ -105,6 +105,21 @@ fixture PID 内验证有界 AX 遍历、精确 identifier、focus、set value、
 运行方式与回传归档格式见
 `docs/testing/macos-fixture.md`。
 
+## Host 管理的图片制品
+
+运行时支持在 capability manifest 的 action 上声明 `artifacts.inputs` 和
+`artifacts.outputs`。工作流和 NDJSON 控制面只携带闭合的 `ArtifactRef`（ID、SHA-256、
+媒体类型和字节数），不会暴露 Host 的文件路径、存储键或文件描述符。POSIX 上，实际图片
+字节通过进程启动时建立的私有 Unix socket side channel 传输；每个调用和 slot 都有不可复用
+token，并受同一个绝对 deadline、单 slot 大小及单次调用总量约束。Host 对输出做完整摘要、
+图片结构和配额校验，并在 output schema 通过后一次性发布全部输出；任何一步失败都会回滚。
+
+Python 调用方可以为一次 run 显式传入 `ArtifactStore`，先用
+`runner.import_artifact_bytes(...)` 导入可信图片，再将返回的 ref 放入 action 输入；返回的
+`RunResult.resolve_artifact(...)` 可在结果关闭前读取输出。当前存储与 side-channel 后端明确是
+POSIX-only；Windows 的公共 ref/manifest 契约已统一，但原生内容通道仍待 named pipe 后端。
+fixture 的 `fixture.artifact_copy@1` 只用于验证这条无路径传输链，不能视作截图或 OCR 能力。
+
 ## 描述文件与运行时
 
 只接受以下规范标识：

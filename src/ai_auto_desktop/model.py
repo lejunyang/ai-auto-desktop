@@ -7,6 +7,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Mapping
 
+from .artifacts import ArtifactError, ArtifactHandle, ArtifactRef, ArtifactStore
 from .errors import AutomationError
 
 
@@ -125,6 +126,8 @@ class RunResult:
     error: AutomationError | None = None
     events: list[dict[str, Any]] = field(default_factory=list)
     steps: dict[str, dict[str, Any]] = field(default_factory=dict)
+    _artifact_store: Any = field(default=None, repr=False, compare=False)
+    _owns_artifact_store: bool = field(default=False, repr=False, compare=False)
 
     @property
     def ok(self) -> bool:
@@ -139,4 +142,36 @@ class RunResult:
             "events": thaw(self.events),
             "error": self.error.to_dict() if self.error is not None else None,
         }
+
+    def close(self) -> None:
+        store = self._artifact_store
+        self._artifact_store = None
+        if store is not None and self._owns_artifact_store:
+            store.cleanup()
+        self._owns_artifact_store = False
+
+    def resolve_artifact(
+        self, reference: ArtifactRef | Mapping[str, Any]
+    ) -> ArtifactHandle:
+        """Resolve a returned ref while this run result still owns its scope."""
+
+        store = self._artifact_store
+        if not isinstance(store, ArtifactStore):
+            raise ArtifactError(
+                "ARTIFACT.STORE_UNAVAILABLE",
+                "This run result has no live artifact store.",
+            )
+        return store.resolve(reference)
+
+    def __enter__(self) -> "RunResult":
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        self.close()
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
 

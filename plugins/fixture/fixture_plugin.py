@@ -14,12 +14,78 @@ import sys
 import time
 from typing import Any, NoReturn
 
+from ai_auto_desktop.artifact_ipc import (
+    ArtifactIPCError,
+    WorkerArtifactInvocation,
+)
+
 
 PLUGIN_NAME = "fixture"
 PLUGIN_VERSION = "1.0.0"
 PROTOCOL_VERSION = 1
 
 ACTION_CONTRACTS: dict[str, dict[str, Any]] = {
+    "artifact_copy": {
+        "contract_major": 1,
+        "description": "Copy one Host-mediated image artifact without receiving a path.",
+        "effect": {
+            "default_class": "read_only",
+        },
+        "risk": {"category": "observe", "level": "low"},
+        "input_schema": {
+            "type": "object",
+            "required": ["source"],
+            "properties": {"source": {"type": "object"}},
+            "additionalProperties": False,
+        },
+        "output_schema": {
+            "type": "object",
+            "required": ["result"],
+            "properties": {"result": {"type": "object"}},
+            "additionalProperties": False,
+        },
+        "artifacts": {
+            "inputs": {
+                "source": {
+                    "pointer": "/source",
+                    "media_types": [
+                        "image/png",
+                        "image/jpeg",
+                        "image/gif",
+                        "image/tiff",
+                        "image/bmp",
+                        "image/webp",
+                        "image/x-portable-anymap",
+                    ],
+                    "max_size_bytes": 67108864,
+                }
+            },
+            "outputs": {
+                "result": {
+                    "pointer": "/result",
+                    "media_types": [
+                        "image/png",
+                        "image/jpeg",
+                        "image/gif",
+                        "image/tiff",
+                        "image/bmp",
+                        "image/webp",
+                        "image/x-portable-anymap",
+                    ],
+                    "max_size_bytes": 67108864,
+                }
+            },
+        },
+        "errors": [
+            {
+                "code": "FIXTURE.ARTIFACT_IPC",
+                "description": "The Host-mediated artifact exchange failed.",
+                "retryable": False,
+                "effect": "not_applied",
+                "data_schema": {"type": "object"},
+            }
+        ],
+    },
     "ocr": {
         "contract_major": 1,
         "description": "Return deterministic mock OCR data.",
@@ -261,6 +327,7 @@ ACTION_ALIASES = {
     "fail": "error",
     "fixture.sleep@1": "sleep",
     "delay": "sleep",
+    "fixture.artifact_copy@1": "artifact_copy",
 }
 
 _transient_attempts: dict[str, int] = {}
@@ -516,7 +583,53 @@ def action_sleep(args: dict[str, Any]) -> Any:
     return {"ok": True, "sleptSeconds": seconds}
 
 
-def dispatch(action: str, args: dict[str, Any]) -> Any:
+def action_artifact_copy(request: dict[str, Any]) -> Any:
+    invocation: WorkerArtifactInvocation | None = None
+    try:
+        invocation = WorkerArtifactInvocation.from_request(
+            request,
+            input_slots=("source",),
+            output_slots=("result",),
+            expected_action="fixture.artifact_copy@1",
+        )
+        source = invocation.read_input("source")
+        result = invocation.write_output(
+            "result", source.data, media_type=source.media_type
+        )
+        invocation.complete_ok()
+        return {"result": result}
+    except ArtifactIPCError as exc:
+        if invocation is not None and not invocation.completed:
+            try:
+                invocation.complete_error(
+                    "FIXTURE.ARTIFACT_IPC", "artifact copy failed"
+                )
+            except ArtifactIPCError:
+                pass
+        raise RequestError(
+            "FIXTURE.ARTIFACT_IPC",
+            "artifact copy failed",
+            data={"stage": exc.code},
+        ) from exc
+    except Exception as exc:
+        if invocation is not None and not invocation.completed:
+            try:
+                invocation.complete_error(
+                    "FIXTURE.ARTIFACT_IPC", "artifact copy failed"
+                )
+            except ArtifactIPCError:
+                pass
+        raise RequestError(
+            "FIXTURE.ARTIFACT_IPC", "artifact copy failed"
+        ) from exc
+    finally:
+        if invocation is not None:
+            invocation.close()
+
+
+def dispatch(
+    action: str, args: dict[str, Any], *, request: dict[str, Any] | None = None
+) -> Any:
     if action == "manifest":
         return MANIFEST
     if action == "ocr":
@@ -529,6 +642,12 @@ def dispatch(action: str, args: dict[str, Any]) -> Any:
         return action_error(args)
     if action == "sleep":
         return action_sleep(args)
+    if action == "artifact_copy":
+        if request is None:
+            raise RequestError(
+                "FIXTURE.ARTIFACT_IPC", "artifact copy requires its request envelope"
+            )
+        return action_artifact_copy(request)
     raise RequestError(
         "PROTOCOL.ACTION_NOT_FOUND",
         f"unknown action: {action}",
@@ -559,7 +678,7 @@ def handle_line(line: str) -> None:
             request_id = request.get("id")
         request_id, action, args = parse_request(request)
         debug(f"request id={request_id!r} action={action!r}")
-        result = dispatch(action, args)
+        result = dispatch(action, args, request=request)
         emit_result(request_id, result, request)
     except RequestError as exc:
         debug(f"error id={request_id!r} code={exc.code!r}: {exc.message}")

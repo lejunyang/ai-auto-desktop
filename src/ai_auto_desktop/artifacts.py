@@ -332,6 +332,96 @@ class _PublishedArtifact:
     info: os.stat_result
 
 
+class ArtifactBatch:
+    """Host-private, all-or-nothing publication batch.
+
+    Payloads are fully copied and validated while staging, but their public
+    references cannot be resolved until :meth:`commit` publishes the entire
+    batch under the store lock.  Closing an uncommitted batch removes every
+    staged leaf.
+    """
+
+    __slots__ = ("_closed", "_entries", "_lock", "_store")
+
+    def __init__(self, store: "ArtifactStore") -> None:
+        self._store = store
+        self._entries: list[
+            tuple[ArtifactRef, _ArtifactRecord, _PublishReservation]
+        ] = []
+        self._closed = False
+        self._lock = threading.RLock()
+
+    def import_bytes(
+        self,
+        data: bytes | bytearray | memoryview,
+        *,
+        media_type: str | None = None,
+        ttl_seconds: float | None = None,
+    ) -> ArtifactRef:
+        if not isinstance(data, (bytes, bytearray, memoryview)):
+            raise ArtifactError(
+                "ARTIFACT.INVALID_SOURCE",
+                "Artifact bytes must be a bytes-like value.",
+            )
+        if len(data) > self._store._max_size_bytes:
+            raise ArtifactError(
+                "ARTIFACT.SIZE_LIMIT_EXCEEDED",
+                "Artifact exceeds the configured byte limit.",
+                details={"maxSizeBytes": self._store._max_size_bytes},
+            )
+        return self.import_source(
+            io.BytesIO(bytes(data)),
+            media_type=media_type,
+            ttl_seconds=ttl_seconds,
+        )
+
+    def import_source(
+        self,
+        source: BinaryIO,
+        *,
+        media_type: str | None = None,
+        ttl_seconds: float | None = None,
+    ) -> ArtifactRef:
+        with self._lock:
+            if self._closed:
+                raise ArtifactError(
+                    "ARTIFACT.BATCH_CLOSED", "Artifact publication batch is closed."
+                )
+            return self._store._stage_batch_source(
+                self, source, media_type=media_type, ttl_seconds=ttl_seconds
+            )
+
+    def commit(self) -> tuple[ArtifactRef, ...]:
+        with self._lock:
+            if self._closed:
+                raise ArtifactError(
+                    "ARTIFACT.BATCH_CLOSED", "Artifact publication batch is closed."
+                )
+            try:
+                references = self._store._commit_batch(self)
+            except BaseException:
+                self._store._rollback_batch(self)
+                self._closed = True
+                raise
+            self._closed = True
+            return references
+
+    def rollback(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            self._store._rollback_batch(self)
+            self._closed = True
+
+    close = rollback
+
+    def __enter__(self) -> "ArtifactBatch":
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        self.rollback()
+
+
 class ArtifactStore:
     """An isolated execution scope for immutable image artifacts."""
 
@@ -377,6 +467,8 @@ class ArtifactStore:
         self._condition = threading.Condition(self._lock)
         self._publish_lock = threading.Lock()
         self._records: dict[str, _ArtifactRecord] = {}
+        self._active_batches: set[ArtifactBatch] = set()
+        self._provisional_ids: set[str] = set()
         self._handles: weakref.WeakSet[ArtifactHandle] = weakref.WeakSet()
         self._temporary_names: set[str] = set()
         self._active_operations = 0
@@ -447,6 +539,21 @@ class ArtifactStore:
 
     def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
         self.cleanup()
+
+    def __del__(self) -> None:
+        try:
+            self.cleanup()
+        except Exception:
+            pass
+
+    def batch(self) -> ArtifactBatch:
+        """Create a Host-private atomic publication batch."""
+
+        with self._lock:
+            self._ensure_open()
+            batch = ArtifactBatch(self)
+            self._active_batches.add(batch)
+            return batch
 
     def import_bytes(
         self,
@@ -651,6 +758,137 @@ class ArtifactStore:
                     self._active_operations -= 1
                     self._condition.notify_all()
 
+    def _stage_batch_source(
+        self,
+        batch: ArtifactBatch,
+        source: BinaryIO,
+        *,
+        media_type: str | None,
+        ttl_seconds: float | None,
+    ) -> ArtifactRef:
+        if batch._store is not self or batch._closed:
+            raise ArtifactError(
+                "ARTIFACT.BATCH_CLOSED", "Artifact publication batch is closed."
+            )
+        if not callable(getattr(source, "read", None)):
+            raise ArtifactError(
+                "ARTIFACT.INVALID_SOURCE",
+                "Artifact source must be a binary reader.",
+            )
+        ttl = self._ttl_seconds if ttl_seconds is None else _positive_number(
+            ttl_seconds, "ttl_seconds"
+        )
+        reservation: _PublishReservation | None = None
+        record: _ArtifactRecord | None = None
+        staged = False
+        operation_active = False
+        with self._publish_lock:
+            try:
+                with self._lock:
+                    self._ensure_open()
+                    self._validate_root_fd()
+                    now = _read_clock(self._clock, initial=False)
+                    expires_at = now + ttl
+                    if not math.isfinite(expires_at):
+                        raise ArtifactError(
+                            "ARTIFACT.TTL_OVERFLOW",
+                            "Artifact expiry exceeds the supported clock range.",
+                        )
+                    reservation = self._reserve_publish_locked()
+                    self._active_operations += 1
+                    operation_active = True
+                published = self._publish_operation(
+                    source, media_type=media_type, reservation=reservation
+                )
+                with self._lock:
+                    reference, record = self._finish_published_locked(
+                        published, expires_at=expires_at
+                    )
+                    if self._closing or self._closed:
+                        self._unlink_record_best_effort(record)
+                        raise ArtifactError(
+                            "ARTIFACT.STORE_CLOSED",
+                            "Artifact execution scope is closed.",
+                        )
+                    self._provisional_ids.add(reference.artifact_id)
+                    batch._entries.append((reference, record, reservation))
+                    self._active_batches.add(batch)
+                    self._temporary_names.discard(record.storage_name)
+                    staged = True
+                    return reference
+            except BaseException:
+                if record is not None:
+                    with self._lock:
+                        self._unlink_record_best_effort(record)
+                raise
+            finally:
+                with self._lock:
+                    if reservation is not None and reservation.active and not staged:
+                        self._release_publish_reservation_locked(reservation)
+                    if operation_active:
+                        self._active_operations -= 1
+                        self._condition.notify_all()
+
+    def _commit_batch(self, batch: ArtifactBatch) -> tuple[ArtifactRef, ...]:
+        if batch._store is not self or batch._closed:
+            raise ArtifactError(
+                "ARTIFACT.BATCH_CLOSED", "Artifact publication batch is closed."
+            )
+        with self._lock:
+            self._ensure_open()
+            self._validate_root_fd()
+            entries = tuple(batch._entries)
+            references = tuple(reference for reference, _, _ in entries)
+            if not entries:
+                raise ArtifactError(
+                    "ARTIFACT.EMPTY_BATCH",
+                    "Artifact publication batch has no staged artifacts.",
+                )
+            if len(self._records) + len(entries) > self._max_artifacts:
+                _quota_error("maxArtifacts", self._max_artifacts)
+            total = sum(record.ref.size_bytes for _, record, _ in entries)
+            if self._stored_bytes + total > self._max_total_bytes:
+                _quota_error("maxTotalBytes", self._max_total_bytes)
+            if any(reference.artifact_id in self._records for reference, _, _ in entries):
+                raise ArtifactError(
+                    "ARTIFACT.INTERNAL", "Artifact identifier collision."
+                )
+            stored_bytes_before = self._stored_bytes
+            committed: list[tuple[ArtifactRef, _ArtifactRecord]] = []
+            try:
+                for reference, record, reservation in entries:
+                    committed.append((reference, record))
+                    self._records[reference.artifact_id] = record
+                    self._provisional_ids.discard(reference.artifact_id)
+                    self._stored_bytes += record.ref.size_bytes
+                for _reference, _record, reservation in entries:
+                    self._release_publish_reservation_locked(reservation)
+            except BaseException:
+                for reference, record in committed:
+                    if self._records.get(reference.artifact_id) is record:
+                        self._records.pop(reference.artifact_id, None)
+                        self._provisional_ids.add(reference.artifact_id)
+                self._stored_bytes = stored_bytes_before
+                raise
+            batch._entries.clear()
+            self._active_batches.discard(batch)
+            return references
+
+    def _rollback_batch(self, batch: ArtifactBatch) -> None:
+        if batch._store is not self:
+            return
+        with self._lock:
+            self._rollback_batch_locked(batch)
+
+    def _rollback_batch_locked(self, batch: ArtifactBatch) -> None:
+        for reference, record, reservation in batch._entries:
+            self._unlink_record_best_effort(record)
+            self._provisional_ids.discard(reference.artifact_id)
+            if reservation.active:
+                self._release_publish_reservation_noexcept_locked(reservation)
+        batch._entries.clear()
+        self._active_batches.discard(batch)
+
     def purge_expired(self) -> int:
         """Remove expired records/files and expire all issued handles."""
 
@@ -683,6 +921,9 @@ class ArtifactStore:
             for handle in tuple(self._handles):
                 handle._close_from_store()
             self._handles.clear()
+            for batch in tuple(self._active_batches):
+                self._rollback_batch_locked(batch)
+                batch._closed = True
             self._records.clear()
             self._open_handle_count = 0
             self._resolved_bytes = 0
@@ -692,6 +933,7 @@ class ArtifactStore:
             self._reserved_artifacts = 0
             self._reserved_storage_bytes = 0
             self._temporary_names.clear()
+            self._provisional_ids.clear()
         try:
             with self._lock:
                 self._validate_root_fd()
@@ -938,6 +1180,17 @@ class ArtifactStore:
         self._reserved_artifacts -= 1
         self._reserved_storage_bytes -= reservation.size_bytes
 
+    def _release_publish_reservation_noexcept_locked(
+        self, reservation: _PublishReservation
+    ) -> None:
+        """Release accounting during rollback without calling patchable hooks."""
+
+        if not reservation.active:
+            return
+        reservation.active = False
+        self._reserved_artifacts -= 1
+        self._reserved_storage_bytes -= reservation.size_bytes
+
     def _finish_published_locked(
         self, published: _PublishedArtifact, *, expires_at: float
     ) -> tuple[ArtifactRef, _ArtifactRecord]:
@@ -1117,7 +1370,11 @@ class ArtifactStore:
     def _new_artifact_id_locked(self) -> str:
         for _ in range(16):
             artifact_id = "art_" + secrets.token_urlsafe(24)
-            if _ARTIFACT_ID.fullmatch(artifact_id) and artifact_id not in self._records:
+            if (
+                _ARTIFACT_ID.fullmatch(artifact_id)
+                and artifact_id not in self._records
+                and artifact_id not in self._provisional_ids
+            ):
                 return artifact_id
         raise ArtifactError(
             "ARTIFACT.PUBLISH_FAILED",

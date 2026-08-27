@@ -396,6 +396,171 @@ class ArtifactStoreTests(unittest.TestCase):
             reference = store.import_bytes(self.png)
             self.assertIn(reference.artifact_id, store._records)
 
+    def test_batch_references_are_invisible_until_atomic_commit(self) -> None:
+        with ArtifactStore(temporary_parent=self.parent) as store:
+            batch = store.batch()
+            first = batch.import_bytes(self.png, media_type="image/png")
+            second_payload = encoded_image(size=(4, 4))
+            second = batch.import_bytes(second_payload, media_type="image/png")
+            self.assertEqual(store._records, {})
+            self.assert_artifact_error(
+                "ARTIFACT.SCOPE_MISMATCH", lambda: store.resolve(first)
+            )
+
+            self.assertEqual(batch.commit(), (first, second))
+            with store.resolve(first) as handle:
+                self.assertEqual(handle.read(), self.png)
+            with store.resolve(second) as handle:
+                self.assertEqual(handle.read(), second_payload)
+
+    def test_batch_rollback_removes_staged_bytes_and_releases_quota(self) -> None:
+        with ArtifactStore(
+            temporary_parent=self.parent, max_artifacts=1,
+            max_total_bytes=len(self.png), max_size_bytes=len(self.png),
+        ) as store:
+            with store.batch() as batch:
+                staged = batch.import_bytes(self.png)
+                self.assert_artifact_error(
+                    "ARTIFACT.SCOPE_MISMATCH", lambda: store.resolve(staged)
+                )
+            self.assertEqual(list(store._root.iterdir()), [])
+            replacement = store.import_bytes(self.png)
+            self.assertIn(replacement.artifact_id, store._records)
+
+    def test_batch_failure_does_not_publish_an_earlier_output(self) -> None:
+        with ArtifactStore(temporary_parent=self.parent) as store:
+            first = None
+            with self.assertRaises(ArtifactError):
+                with store.batch() as batch:
+                    first = batch.import_bytes(self.png)
+                    batch.import_bytes(b"not an image")
+            self.assertIsNotNone(first)
+            self.assertEqual(store._records, {})
+            self.assertEqual(list(store._root.iterdir()), [])
+            self.assert_artifact_error(
+                "ARTIFACT.SCOPE_MISMATCH", lambda: store.resolve(first)
+            )
+
+    def test_store_cleanup_closes_an_uncommitted_batch(self) -> None:
+        store = ArtifactStore(temporary_parent=self.parent)
+        batch = store.batch()
+        reference = batch.import_bytes(self.png)
+        store.cleanup()
+        self.assertTrue(batch._closed)
+        self.assertEqual(batch._entries, [])
+        self.assert_artifact_error(
+            "ARTIFACT.BATCH_CLOSED", lambda: batch.import_bytes(self.png)
+        )
+        self.assert_artifact_error(
+            "ARTIFACT.STORE_CLOSED", lambda: store.resolve(reference)
+        )
+
+    def test_batch_stage_and_rollback_are_serialized(self) -> None:
+        started = threading.Event()
+        release = threading.Event()
+        payload = self.png
+
+        class BlockingReader:
+            def __init__(self) -> None:
+                self.sent = False
+
+            def read(self, _size: int) -> bytes:
+                if self.sent:
+                    return b""
+                started.set()
+                release.wait(2)
+                self.sent = True
+                return payload
+
+        with ArtifactStore(
+            temporary_parent=self.parent, max_artifacts=1,
+            max_total_bytes=len(payload), max_size_bytes=len(payload),
+        ) as store:
+            batch = store.batch()
+            published: list[object] = []
+            publisher = threading.Thread(
+                target=lambda: published.append(batch.import_source(BlockingReader()))
+            )
+            publisher.start()
+            self.assertTrue(started.wait(1))
+            rolled_back = threading.Event()
+            rollback = threading.Thread(
+                target=lambda: (batch.rollback(), rolled_back.set())
+            )
+            rollback.start()
+            self.assertFalse(rolled_back.wait(0.05))
+            release.set()
+            publisher.join(timeout=2)
+            rollback.join(timeout=2)
+            self.assertFalse(publisher.is_alive())
+            self.assertFalse(rollback.is_alive())
+            self.assertEqual(len(published), 1)
+            self.assertEqual(store._records, {})
+            self.assertEqual(store._reserved_artifacts, 0)
+            self.assertEqual(list(store._root.iterdir()), [])
+            store.import_bytes(payload)
+
+    def test_commit_failure_rolls_back_partially_mutated_records(self) -> None:
+        with ArtifactStore(temporary_parent=self.parent) as store:
+            batch = store.batch()
+            first = batch.import_bytes(self.png)
+            second = batch.import_bytes(encoded_image(size=(4, 4)))
+            calls = 0
+
+            def fail_second(reservation) -> None:
+                nonlocal calls
+                calls += 1
+                if calls == 2:
+                    raise MemoryError("injected commit failure")
+
+            with mock.patch.object(
+                store, "_release_publish_reservation_locked",
+                side_effect=fail_second,
+            ), self.assertRaises(MemoryError):
+                batch.commit()
+
+            self.assertNotIn(first.artifact_id, store._records)
+            self.assertNotIn(second.artifact_id, store._records)
+            self.assertEqual(store._stored_bytes, 0)
+            self.assertEqual(list(store._root.iterdir()), [])
+            self.assertEqual(store._reserved_artifacts, 0)
+            self.assertEqual(store._reserved_storage_bytes, 0)
+
+    def test_commit_failure_after_record_insert_restores_byte_accounting(self) -> None:
+        class InsertThenFail(dict):
+            def __setitem__(self, key, value) -> None:
+                super().__setitem__(key, value)
+                raise MemoryError("injected insertion failure")
+
+        with ArtifactStore(
+            temporary_parent=self.parent, max_total_bytes=len(self.png),
+            max_size_bytes=len(self.png),
+        ) as store:
+            batch = store.batch()
+            staged = batch.import_bytes(self.png)
+            store._records = InsertThenFail(store._records)
+            with self.assertRaises(MemoryError):
+                batch.commit()
+
+            self.assertNotIn(staged.artifact_id, store._records)
+            self.assertEqual(store._stored_bytes, 0)
+            self.assertEqual(store._reserved_artifacts, 0)
+            self.assertEqual(store._reserved_storage_bytes, 0)
+            self.assertEqual(list(store._root.iterdir()), [])
+
+    def test_empty_or_reused_batch_fails_closed(self) -> None:
+        with ArtifactStore(temporary_parent=self.parent) as store:
+            empty = store.batch()
+            self.assert_artifact_error("ARTIFACT.EMPTY_BATCH", empty.commit)
+            self.assert_artifact_error(
+                "ARTIFACT.BATCH_CLOSED", lambda: empty.import_bytes(self.png)
+            )
+
+            batch = store.batch()
+            batch.import_bytes(self.png)
+            batch.commit()
+            self.assert_artifact_error("ARTIFACT.BATCH_CLOSED", batch.commit)
+
     def test_quota_configuration_requires_positive_integers(self) -> None:
         for name in (
             "max_artifacts",

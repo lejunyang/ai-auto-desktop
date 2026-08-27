@@ -24,7 +24,7 @@
 | 步骤与控制流 | `action/set/block/fail/return/script`、`if/switch/foreach/while`、`on_error/finally`；sibling DAG 已支持有界只读并发；受限串行计划支持顶层安全点恢复，显式 opt-in 后支持具备投影契约的顶层只读 action 与 `action_intent` v2 重放；script 默认拒绝 | 写 action/script reconciliation 与更通用的可恢复计划状态机 |
 | 状态 | run 结果为 `succeeded/failed/timed_out/cancelled/unknown_effect`，step 另有 `skipped` | 冻结跨语言状态兼容与迁移规则 |
 | 执行能力 | 已有 Windows UIA、macOS AX、Linux KDE/X11 AT-SPI 进程 driver、三端显式文本输入、受限中心点左键 `pointer_click` 和显式图片 OCR；资格范围分别记录 | 真实应用矩阵、受控截图与应用专用 adapter |
-| IPC | stdio NDJSON v0，便于调试和跨语言实现；已校验 manifest schema/action major，尚无完整 wire version 协商 | 保留语义兼容层，迁移到 Protobuf/CBOR 等 IDL + named pipe/Unix socket |
+| IPC | stdio NDJSON v0 控制面；声明图片 slot 的 action 在 POSIX 上使用 AADF v1 私有 Unix socket 数据面，已校验 manifest、action major、token、摘要、大小和原子发布；尚无 Windows named pipe 与完整 wire 协商 | 保留语义兼容层，迁移到 Protobuf/CBOR 等 IDL + named pipe/Unix socket |
 | 隔离 | process plugin 使用 POSIX 进程组；Linux script 使用 bubblewrap + prlimit，其他平台 fail-closed | Windows Job Object/restricted token；macOS 受控 helper；Linux bubblewrap/OCI；资源与 capability 限额 |
 | 安全 | 结构化错误、script fail-closed、action risk policy、manifest 与 action I/O schema 校验；确认 token/taint 等尚未实现 | 签名插件、系统 secret store、确认 token、完整 taint enforcement、审计与更新回滚 |
 | 平台能力 | 已有只读三端 probe、Windows UIA 与 macOS AX process driver，以及 Linux KDE/X11 AT-SPI 纵向切片；Linux 自有 GTK3/Qt5 fixture 已通过，Windows/macOS 真机结果待回传 | 各平台按真实应用矩阵分级支持 |
@@ -150,6 +150,21 @@ v0 使用 stdio 上每行一个 UTF-8 JSON object，协议 stdout 不得混入�
 ```
 
 v0 的 `deadline_ms` 表示 Unix epoch 毫秒绝对时间，不是“从收到消息开始再等 N 毫秒”。每个 request ID 严格对应一个含 `result` 或 `error` 的响应。Host 先短暂探测插件主动输出的 `{type: "manifest"}`；没有主动 manifest 时再发 manifest 请求。当前 v0 接受多种兼容响应形状并校验 manifest schema 与 action contract major；完整的 wire protocol major/minor 协商仍属于后续门槛。
+
+声明 `action.artifacts` 后，NDJSON 中仍只出现无路径的 `ArtifactRef` 与 Host 私有
+placeholder。POSIX Host 在启动长期 worker 前创建一对 Unix stream socket，并只把子端 FD
+继承给该 worker；图片原始字节使用 `AADF` v1 有界帧传输，不做 base64，也不与 stdout
+日志/响应混流。调用按 `ready → input open/chunks/end → inputs accepted → output
+open/chunks/end → invocation complete` 顺序推进，共享一个绝对 deadline。Host 会重新验证
+输入 ref 的执行域、MIME、大小和摘要；输出只有在所有 slot、placeholder、图片结构及 action
+output schema 全部通过后，才通过 ArtifactStore batch 一次性变为可解析状态。提前错误会终止
+已失步的 worker，已完整接收输入后的正常错误则可安全复用连接。公共协议绝不传 Host 路径、
+存储名或 FD。
+
+该数据面当前明确为 POSIX-only，并且 ArtifactStore 仍只接受可信内置 producer 的图片；
+Windows 需要在相同语义后补带 ACL 的 named pipe，第三方不可信图片解码需要迁移到受限
+worker。ArtifactRef 是本次 live execution scope 的能力，不可作为跨进程重启的 durable
+checkpoint，因此 durable action 在预检阶段拒绝任何 `artifacts` 契约。
 
 Host 写入并 flush 请求成功后，将插件错误、timeout、EOF 和协议错误标记为 `details.dispatched=true`；写前失败则为 false 或缺省。当前每个进程只允许一个 in-flight 请求，没有 streaming、请求级 cancel、自动重启或进程池；timeout/EOF/协议错误会 fail-stop 并回收整个插件进程。stderr 只保留有界 tail，stdout 行与内部队列也必须有界。
 
