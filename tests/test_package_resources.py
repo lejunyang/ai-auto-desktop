@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import tempfile
@@ -25,6 +26,7 @@ SCHEMA_PATHS = (
     "capabilities/v1alpha1/capability-manifest.schema.json",
     "runtime/v1alpha1/run.schema.json",
     "runtime/v1alpha1/event.schema.json",
+    "runtime/v1alpha1/artifact-ref.schema.json",
 )
 
 
@@ -37,6 +39,10 @@ class PackageResourceTests(unittest.TestCase):
             DurableExecutor,
             RunService,
             RunStatus,
+            ArtifactError,
+            ArtifactHandle,
+            ArtifactRef,
+            ArtifactStore,
         )
 
         self.assertEqual(DesiredState.PAUSE.value, "pause")
@@ -45,6 +51,10 @@ class PackageResourceTests(unittest.TestCase):
         self.assertTrue(callable(JournalStore))
         self.assertTrue(callable(DurableExecutor))
         self.assertTrue(callable(RunService))
+        self.assertTrue(callable(ArtifactError))
+        self.assertTrue(callable(ArtifactHandle))
+        self.assertTrue(callable(ArtifactRef))
+        self.assertTrue(callable(ArtifactStore))
 
     @classmethod
     def setUpClass(cls) -> None:
@@ -90,6 +100,28 @@ class PackageResourceTests(unittest.TestCase):
                     canonical_path.read_bytes(),
                     f"packaged {relative_path} drifted from the canonical schema",
                 )
+
+    def test_wheel_declares_pillow_as_a_core_dependency(self) -> None:
+        with zipfile.ZipFile(self.wheel) as archive:
+            metadata_names = [
+                name for name in archive.namelist()
+                if name.endswith(".dist-info/METADATA")
+            ]
+            self.assertEqual(len(metadata_names), 1)
+            metadata = archive.read(metadata_names[0]).decode("utf-8")
+        requirements = [
+            line.removeprefix("Requires-Dist:").strip()
+            for line in metadata.splitlines()
+            if line.startswith("Requires-Dist:")
+        ]
+        self.assertTrue(
+            any(
+                re.match(r"(?i)^pillow(?:\s|\(|$)", requirement)
+                and ";" not in requirement
+                for requirement in requirements
+            ),
+            f"Pillow must be an unconditional core dependency: {requirements!r}",
+        )
 
     def test_missing_schema_resources_fail_closed(self) -> None:
         workflow = {
@@ -178,17 +210,53 @@ class PackageResourceTests(unittest.TestCase):
         validation_script = textwrap.dedent(
             f"""
             import json
+            import base64
+            from importlib import resources
+            import os
             from pathlib import Path
 
             import ai_auto_desktop
+            from ai_auto_desktop import ArtifactError, ArtifactRef, ArtifactStore
             from ai_auto_desktop.compiler import compile_descriptor
             from ai_auto_desktop.errors import DescriptorError
             from ai_auto_desktop.plugin import PluginError, ProcessPlugin
+            import jsonschema
 
             target = Path({os.fspath(target)!r}).resolve()
             package_file = Path(ai_auto_desktop.__file__).resolve()
             if target not in package_file.parents:
                 raise AssertionError(f"import escaped target install: {{package_file}}")
+
+            artifact_schema = json.loads(
+                resources.files("ai_auto_desktop")
+                .joinpath("schemas/runtime/v1alpha1/artifact-ref.schema.json")
+                .read_text(encoding="utf-8")
+            )
+            jsonschema.Draft202012Validator.check_schema(artifact_schema)
+            png = base64.b64decode(
+                "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+            )
+            if os.name == "posix":
+                with ArtifactStore() as artifact_store:
+                    artifact_ref = artifact_store.import_bytes(
+                        png, media_type="image/png"
+                    )
+                    artifact_document = artifact_ref.to_dict()
+                    jsonschema.Draft202012Validator(artifact_schema).validate(
+                        artifact_document
+                    )
+                    restored_ref = ArtifactRef.from_dict(artifact_document)
+                    with artifact_store.resolve(restored_ref) as artifact_handle:
+                        if artifact_handle.read() != png:
+                            raise AssertionError("installed artifact roundtrip drifted")
+            else:
+                try:
+                    ArtifactStore()
+                except ArtifactError as exc:
+                    if exc.code != "ARTIFACT.PLATFORM_UNSUPPORTED":
+                        raise AssertionError(exc.to_dict())
+                else:
+                    raise AssertionError("non-POSIX artifact store did not fail closed")
 
             workflow = {{
                 "apiVersion": "ai-auto-desktop.dev/v1alpha1",

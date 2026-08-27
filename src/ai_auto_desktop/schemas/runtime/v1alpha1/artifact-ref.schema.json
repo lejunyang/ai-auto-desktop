@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.ai-auto-desktop.dev/runtime/v1alpha1/artifact-ref.schema.json",
+  "title": "AI Auto Desktop Artifact Reference v1alpha1",
+  "description": "Closed, location-free reference to a run-scoped artifact managed by the trusted host.",
+  "type": "object",
+  "required": [
+    "apiVersion",
+    "kind",
+    "artifactId",
+    "digest",
+    "mediaType",
+    "sizeBytes"
+  ],
+  "properties": {
+    "apiVersion": {
+      "const": "ai-auto-desktop.dev/v1alpha1"
+    },
+    "kind": {
+      "const": "ArtifactRef"
+    },
+    "artifactId": {
+      "type": "string",
+      "minLength": 36,
+      "maxLength": 36,
+      "pattern": "^art_[A-Za-z0-9_-]{32}$"
+    },
+    "digest": {
+      "type": "string",
+      "minLength": 71,
+      "maxLength": 71,
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "mediaType": {
+      "enum": [
+        "image/png",
+        "image/jpeg",
+        "image/gif",
+        "image/tiff",
+        "image/bmp",
+        "image/webp",
+        "image/x-portable-anymap"
+      ]
+    },
+    "sizeBytes": {
+      "type": "integer",
+      "minimum": 1
+    }
+  },
+  "additionalProperties": false
+}

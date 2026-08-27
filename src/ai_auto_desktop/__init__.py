@@ -1,5 +1,6 @@
 """Public API for ai-auto-desktop."""
 
+from .artifacts import ArtifactError, ArtifactHandle, ArtifactRef, ArtifactStore
 from .compiler import API_VERSION, KIND, compile_descriptor, load_descriptor
 from .durable import DurableExecutionResult, DurableExecutor
 from .errors import AutomationError, DescriptorError, DescriptorIssue
@@ -19,7 +20,8 @@ from .runtime import WorkflowRunner, run_descriptor
 __version__ = "0.1.0"
 
 __all__ = [
-    "API_VERSION", "KIND", "AutomationError", "CompiledStep", "DescriptorError",
+    "API_VERSION", "KIND", "ArtifactError", "ArtifactHandle", "ArtifactRef",
+    "ArtifactStore", "AutomationError", "CompiledStep", "DescriptorError",
     "DescriptorIssue", "DesiredState", "DispatchState",
     "DurableExecutionResult", "DurableExecutor", "EventRecord",
     "JournalStore", "OwnerLease", "PluginError", "ProcessPlugin",
