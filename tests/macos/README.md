@@ -44,11 +44,16 @@ Tools；不需要预装 Python、项目包或第三方依赖。
 `README.txt` 会追加一段最多 120 行、每行最多 512 bytes、正文最多 12 KiB 的诊断；该段只保留
 编译器文本，并把 testkit、build、SDK、swiftc 及其他绝对路径替换为占位符，同时移除非打印
 字符。诊断总文件还受 16 KiB 上限约束，归档完成后会从 build 目录删除，避免陈旧错误混入下次结果。
-`identity.txt` 仅保存 bundle 的 designated requirement、Identifier、TeamIdentifier、
+`identity.txt` 仅保存 bundle 的 designated requirement、它来自 codesign 的
+`implicit`/`explicit` 形式、Identifier、TeamIdentifier、
 CDHash、Mach-O 架构和可执行文件 SHA-256，不保存绝对路径。
 其中 Swift 版本、identity stability，以及 runner/fixture 各自的 designated requirement、
 Identifier、CDHash、架构、SHA-256 都是必填证明；任何工具失败、字段缺失或空值都会让构建
 失败，不会产生半份 `identity.txt`。
+套件严格接受 `codesign -d -r-` 的唯一一条 `designated => expression`（explicit）或
+`# designated => expression`（implicit），拒绝缺失、重复、空值和畸形形式，并用
+`codesign --verify --strict --test-requirement "=expression"` 对原 app 回验。ad-hoc
+（`ephemeral`）签名必须产生 implicit requirement；固定签名身份允许 explicit 或 implicit。
 `report.json` 与 `identity.txt` 还会同时携带源码 revision、worktree 状态和
 `source_package_digest`。digest 是规范化 `SOURCE_MANIFEST.txt` 的 SHA-256；manifest
 逐项固定除自身外所有源码包成员的 mode 和 SHA-256，因此没有自引用 hash。运行前会重建并
@@ -116,7 +121,7 @@ xcode-select --install
 
 为减少 TCC 中的应用身份和路径变化，默认构建目录是稳定的当前目录 `.build/`；
 源码未变化时不会重复编译。不要在授权与复测之间删除该目录。固定 bundle ID 加 ad-hoc
-签名的 `identity_stability` 是 `ephemeral`，重编译后可能需要重新授权；长期固定测试节点应
+签名的 `identity_stability` 是 `ephemeral`，其 requirement origin 必须是 `implicit`，重编译后可能需要重新授权；长期固定测试节点应
 设置 `MACOS_TEST_CODESIGN_IDENTITY`，始终使用同一 Developer ID 签名。
 
 ## 制作可搬运源码包

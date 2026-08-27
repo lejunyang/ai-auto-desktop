@@ -14,6 +14,45 @@ identity_value_is_single_nonempty_line() {
     esac
 }
 
+identity_parse_designated_requirement() {
+    identity_requirement_input=$1
+    identity_requirement_origin_output=$2
+    identity_requirement_expression_output=$3
+
+    awk \
+        -v origin_output="$identity_requirement_origin_output" \
+        -v expression_output="$identity_requirement_expression_output" '
+        function record(origin, expression) {
+            candidate_count++
+            if (expression !~ /[^[:space:]]/ \
+                || expression ~ /^[[:space:]]/ \
+                || expression ~ /[[:space:]]$/) {
+                invalid = 1
+            }
+            candidate_origin = origin
+            candidate_expression = expression
+        }
+        /^designated => / {
+            record("explicit", substr($0, length("designated => ") + 1))
+            next
+        }
+        /^# designated => / {
+            record("implicit", substr($0, length("# designated => ") + 1))
+            next
+        }
+        /(^|[[:space:]#])designated[[:space:]]*=>/ {
+            invalid = 1
+        }
+        END {
+            if (invalid || candidate_count != 1) {
+                exit 1
+            }
+            print candidate_origin > origin_output
+            print candidate_expression > expression_output
+        }
+    ' "$identity_requirement_input"
+}
+
 identity_collect_app() {
     identity_label=$1
     identity_app=$2
@@ -23,6 +62,9 @@ identity_collect_app() {
     identity_details_output=$identity_work/$identity_label.details
     identity_architectures_output=$identity_work/$identity_label.architectures
     identity_sha_output=$identity_work/$identity_label.sha256
+    identity_requirement_origin_output="$identity_work/$identity_label.requirement-origin"
+    identity_requirement_expression_output="$identity_work/$identity_label.requirement-expression"
+    identity_requirement_verify_output="$identity_work/$identity_label.requirement-verify"
 
     if ! "$identity_codesign" -d -r- "$identity_app" \
         >"$identity_requirement_output" 2>&1; then
@@ -30,15 +72,47 @@ identity_collect_app() {
         printf '%s\n' "失败：无法读取 $identity_label designated requirement。" >&2
         return 1
     fi
-    if ! identity_designated_requirement=$(
-        sed -n 's/^designated =>[[:space:]]*//p' "$identity_requirement_output"
-    ); then
-        printf '%s\n' "失败：无法解析 $identity_label designated requirement。" >&2
+    if ! identity_parse_designated_requirement \
+        "$identity_requirement_output" \
+        "$identity_requirement_origin_output" \
+        "$identity_requirement_expression_output"; then
+        identity_set_error "$identity_label.requirement_invalid"
+        printf '%s\n' "失败：$identity_label designated requirement 为空或无效（包括重复）。" >&2
         return 1
     fi
-    if ! identity_value_is_single_nonempty_line "$identity_designated_requirement"; then
+    identity_designated_requirement_origin=$(
+        sed -n '1p' "$identity_requirement_origin_output"
+    )
+    identity_designated_requirement=$(
+        sed -n '1p' "$identity_requirement_expression_output"
+    )
+    if ! identity_value_is_single_nonempty_line \
+        "$identity_designated_requirement_origin" \
+        || ! identity_value_is_single_nonempty_line \
+            "$identity_designated_requirement"; then
         identity_set_error "$identity_label.requirement_invalid"
-        printf '%s\n' "失败：$identity_label designated requirement 为空或无效。" >&2
+        printf '%s\n' "失败：$identity_label designated requirement 为空或无效（包括重复）。" >&2
+        return 1
+    fi
+    case $identity_designated_requirement_origin in
+        implicit|explicit) ;;
+        *)
+            identity_set_error "$identity_label.requirement_invalid"
+            printf '%s\n' "失败：$identity_label designated requirement 来源无效。" >&2
+            return 1
+            ;;
+    esac
+    if [ "$identity_stability" = ephemeral ] \
+        && [ "$identity_designated_requirement_origin" != implicit ]; then
+        identity_set_error "$identity_label.requirement_origin_mismatch"
+        printf '%s\n' "失败：$identity_label ad-hoc 签名未产生 implicit designated requirement。" >&2
+        return 1
+    fi
+    if ! "$identity_codesign" --verify --strict --test-requirement \
+        "=$identity_designated_requirement" "$identity_app" \
+        >"$identity_requirement_verify_output" 2>&1; then
+        identity_set_error "$identity_label.requirement_verify"
+        printf '%s\n' "失败：$identity_label designated requirement 回验失败。" >&2
         return 1
     fi
 
@@ -148,6 +222,8 @@ identity_collect_app() {
     {
         printf '%s\n' "[$identity_label]"
         printf '%s\n' "designated => $identity_designated_requirement"
+        printf '%s\n' \
+            "designated_requirement_origin=$identity_designated_requirement_origin"
         printf '%s\n' "Identifier=$identity_identifier"
         if [ -n "$identity_team_identifier" ]; then
             printf '%s\n' "TeamIdentifier=$identity_team_identifier"

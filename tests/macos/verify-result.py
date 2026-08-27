@@ -801,7 +801,8 @@ def _parse_identity(
 
     expected_ids = {"runner": RUNNER_BUNDLE_ID, "fixture": FIXTURE_BUNDLE_ID}
     allowed_fields = {
-        "designated", "Identifier", "TeamIdentifier",
+        "designated", "designated_requirement_origin",
+        "Identifier", "TeamIdentifier",
         "CDHash", "architectures", "sha256",
     }
     required_fields = allowed_fields - {"TeamIdentifier"}
@@ -813,6 +814,26 @@ def _parse_identity(
             _fail(
                 "invalid_identity",
                 "identity section 字段不完整或未知。",
+                {"section": name},
+            )
+        designated = fields["designated"]
+        if designated != designated.strip():
+            _fail(
+                "invalid_designated_requirement",
+                "identity designated requirement 格式无效。",
+                {"section": name},
+            )
+        requirement_origin = fields["designated_requirement_origin"]
+        if requirement_origin not in ("implicit", "explicit"):
+            _fail(
+                "invalid_designated_requirement_origin",
+                "identity designated requirement origin 无效。",
+                {"section": name},
+            )
+        if stability == "ephemeral" and requirement_origin != "implicit":
+            _fail(
+                "identity_requirement_origin_mismatch",
+                "ephemeral identity 必须使用 implicit designated requirement。",
                 {"section": name},
             )
         if fields["Identifier"] != expected_ids[name]:
@@ -838,6 +859,7 @@ def _parse_identity(
             )
         parsed_sections[name] = {
             "bundle_id": fields["Identifier"],
+            "designated_requirement_origin": requirement_origin,
             "architectures": architectures,
             "sha256": fields["sha256"].lower(),
         }

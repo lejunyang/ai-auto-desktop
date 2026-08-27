@@ -142,6 +142,7 @@ def _identity(*, with_source: bool = True) -> bytes:
         +
         "[runner]\n"
         "designated => identifier runner and anchor apple generic\n"
+        "designated_requirement_origin=implicit\n"
         "Identifier=dev.ai-auto-desktop.testkit.ax-runner\n"
         "TeamIdentifier=TESTTEAM\n"
         "CDHash=0123456789abcdef0123456789abcdef01234567\n"
@@ -149,6 +150,7 @@ def _identity(*, with_source: bool = True) -> bytes:
         f"sha256={'1' * 64}\n"
         "[fixture]\n"
         "designated => identifier fixture and anchor apple generic\n"
+        "designated_requirement_origin=implicit\n"
         "Identifier=dev.ai-auto-desktop.testkit.fixture\n"
         "TeamIdentifier=TESTTEAM\n"
         "CDHash=89abcdef0123456789abcdef0123456789abcdef\n"
@@ -314,6 +316,80 @@ class MacOSResultVerifierTests(unittest.TestCase):
         self.assertIs(result["trusted_archive"], True)
         self.assertIs(result["source_trusted"], True)
         self.assertIs(result["qualified"], True)
+        self.assertEqual(
+            result["identity"]["runner"][
+                "designated_requirement_origin"
+            ],
+            "implicit",
+        )
+
+    def test_stable_identity_accepts_explicit_or_implicit_requirement_origin(
+        self,
+    ) -> None:
+        for origin in ("explicit", "implicit"):
+            with self.subTest(origin=origin), tempfile.TemporaryDirectory(
+            ) as temporary:
+                files = _files()
+                files["report.json"] = files["report.json"].replace(
+                    b'"launcher_declared_identity_stability": "ephemeral"',
+                    b'"launcher_declared_identity_stability": '
+                    b'"stable_identity_requested"',
+                )
+                files["identity.txt"] = files["identity.txt"].replace(
+                    b"identity_stability=ephemeral",
+                    b"identity_stability=stable_identity_requested",
+                ).replace(
+                    b"designated_requirement_origin=implicit",
+                    f"designated_requirement_origin={origin}".encode(),
+                )
+                _refresh_manifest(files)
+                archive = Path(temporary) / "stable-result.tar.gz"
+                _write_archive(archive, _regular_entries(files))
+                expected = hashlib.sha256(archive.read_bytes()).hexdigest()
+                completed, result = self._run(
+                    archive, expected, expected_revision=SOURCE_REVISION,
+                    expected_package_digest=SOURCE_PACKAGE_DIGEST,
+                )
+                self.assertEqual(completed.returncode, 0)
+                self.assertEqual(
+                    result["identity"]["fixture"][
+                        "designated_requirement_origin"
+                    ],
+                    origin,
+                )
+
+    def test_passed_identity_requires_requirement_origin_and_ephemeral_implicit(
+        self,
+    ) -> None:
+        mutations = (
+            (
+                b"designated_requirement_origin=implicit\n", b"",
+                "invalid_identity",
+            ),
+            (
+                b"designated_requirement_origin=implicit",
+                b"designated_requirement_origin=unknown",
+                "invalid_designated_requirement_origin",
+            ),
+            (
+                b"designated_requirement_origin=implicit",
+                b"designated_requirement_origin=explicit",
+                "identity_requirement_origin_mismatch",
+            ),
+        )
+        for old, new, expected_code in mutations:
+            with self.subTest(expected_code=expected_code), \
+                    tempfile.TemporaryDirectory() as temporary:
+                files = _files()
+                files["identity.txt"] = files["identity.txt"].replace(
+                    old, new, 1
+                )
+                _refresh_manifest(files)
+                archive = Path(temporary) / "invalid-origin.tar.gz"
+                _write_archive(archive, _regular_entries(files))
+                completed, result = self._run(archive)
+                self.assertNotEqual(completed.returncode, 0)
+                self.assertEqual(result["error"]["code"], expected_code)
 
     def test_archive_hash_alone_no_longer_qualifies_source_bound_report(
         self,

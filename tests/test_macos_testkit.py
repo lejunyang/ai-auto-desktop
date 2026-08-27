@@ -548,6 +548,8 @@ class MacOSTestkitSourceContracts(unittest.TestCase):
         )
         for marker in (
             "designated requirement 为空或无效",
+            "designated_requirement_origin=",
+            "--test-requirement",
             "Identifier 为空或无效",
             "CDHash 为空或无效",
             "architectures 为空或无效",
@@ -1089,7 +1091,24 @@ class IdentityAttestationContracts(unittest.TestCase):
 case " $* " in
     *' -r- '*)
         [ "${MOCK_FAIL_FIELD:-}" = requirement ] && exit 9
-        [ "${MOCK_EMPTY_FIELD:-}" = requirement ] || printf '%s\n' 'designated => identifier test and anchor apple generic'
+        if [ "${MOCK_EMPTY_FIELD:-}" != requirement ]; then
+            if [ "${MOCK_REQUIREMENT_OUTPUT+x}" = x ]; then
+                printf '%s\n' "$MOCK_REQUIREMENT_OUTPUT"
+            else
+                printf '%s\n' '# designated => identifier test and anchor apple generic'
+            fi
+        fi
+        ;;
+    *' --test-requirement '*)
+        [ "${MOCK_FAIL_FIELD:-}" = requirement_verify ] && exit 9
+        if [ -n "${MOCK_VERIFY_ARGS_FILE:-}" ]; then
+            {
+                printf '%s\n' CALL
+                for argument do
+                    printf '%s\n' "$argument"
+                done
+            } >>"$MOCK_VERIFY_ARGS_FILE"
+        fi
         ;;
     *' --verbose=4 '*)
         [ "${MOCK_FAIL_FIELD:-}" = details ] && exit 9
@@ -1122,7 +1141,10 @@ esac
 
     def _run_identity(
         self, root: Path, *, empty_field: str = "",
-        fail_field: str = "", stability: str = "ephemeral"
+        fail_field: str = "", stability: str = "ephemeral",
+        requirement_output: str | None = None,
+        runner_app: str = "Runner.app",
+        fixture_app: str = "Fixture.app",
     ) -> tuple[subprocess.CompletedProcess[str], Path]:
         shell = shutil.which("sh")
         assert shell is not None
@@ -1133,18 +1155,23 @@ esac
         command = (
             f'. "{IDENTITY_SCRIPT}"; '
             'write_identity_attestation "$1" "$2" "$3" "$4" '
-            '"$5" "$6" "$7" clean "$8" Runner.app Runner.app/runner '
-            'dev.ai-auto-desktop.testkit.ax-runner Fixture.app '
-            'Fixture.app/fixture dev.ai-auto-desktop.testkit.fixture'
+            '"$5" "$6" "$7" clean "$8" "${9}" "${10}" '
+            'dev.ai-auto-desktop.testkit.ax-runner "${11}" "${12}" '
+            'dev.ai-auto-desktop.testkit.fixture'
         )
         environment = os.environ.copy()
         environment["MOCK_EMPTY_FIELD"] = empty_field
         environment["MOCK_FAIL_FIELD"] = fail_field
+        if requirement_output is not None:
+            environment["MOCK_REQUIREMENT_OUTPUT"] = requirement_output
+        verify_arguments = root / "requirement verify arguments.txt"
+        environment["MOCK_VERIFY_ARGS_FILE"] = os.fspath(verify_arguments)
         completed = subprocess.run(
             [shell, "-eu", "-c", command, "identity-test",
              str(output), str(tools["swiftc"]), str(tools["codesign"]),
              str(tools["lipo"]), str(tools["shasum"]), stability,
-             "a" * 40, "b" * 64],
+             "a" * 40, "b" * 64, runner_app, f"{runner_app}/runner",
+             fixture_app, f"{fixture_app}/fixture"],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -1166,7 +1193,8 @@ esac
             self.assertIn(f"source_revision={'a' * 40}", attestation)
             self.assertIn(f"source_package_digest={'b' * 64}", attestation)
             for field in ("designated =>", "Identifier=", "CDHash=",
-                          "architectures=", "sha256="):
+                          "architectures=", "sha256=",
+                          "designated_requirement_origin=implicit"):
                 with self.subTest(field=field):
                     self.assertEqual(
                         sum(
@@ -1175,6 +1203,153 @@ esac
                         ),
                         2,
                     )
+
+    def test_designated_requirement_accepts_exact_implicit_and_explicit_forms(
+        self,
+    ) -> None:
+        if shutil.which("sh") is None:
+            self.skipTest("a POSIX sh is unavailable")
+        expression = 'identifier "test" and anchor apple generic'
+        cases = (
+            ("ephemeral", f"# designated => {expression}", "implicit"),
+            ("stable_identity_requested",
+             f"designated => {expression}", "explicit"),
+            ("stable_identity_requested",
+             f"# designated => {expression}", "implicit"),
+        )
+        for stability, requirement, origin in cases:
+            with self.subTest(
+                stability=stability, origin=origin
+            ), tempfile.TemporaryDirectory() as temporary:
+                completed, output = self._run_identity(
+                    Path(temporary), stability=stability,
+                    requirement_output=requirement,
+                )
+                self.assertEqual(completed.returncode, 0, msg=completed.stderr)
+                attestation = output.read_text(encoding="utf-8")
+                self.assertEqual(
+                    attestation.count(
+                        f"designated_requirement_origin={origin}\n"
+                    ),
+                    2,
+                )
+
+    def test_designated_requirement_rejects_zero_duplicate_mixed_and_malformed(
+        self,
+    ) -> None:
+        if shutil.which("sh") is None:
+            self.skipTest("a POSIX sh is unavailable")
+        expression = "identifier test and anchor apple generic"
+        invalid_outputs = (
+            "unrelated codesign diagnostic",
+            f"# designated => {expression}\n# designated => {expression}",
+            f"# designated => {expression}\ndesignated => {expression}",
+            "# designated => ",
+            "designated => ",
+            f"#designated => {expression}",
+            f"# designated=> {expression}",
+            f"prefix designated => {expression}",
+            f"# designated =>  {expression}",
+        )
+        for requirement in invalid_outputs:
+            with self.subTest(
+                requirement=requirement
+            ), tempfile.TemporaryDirectory() as temporary:
+                completed, output = self._run_identity(
+                    Path(temporary), requirement_output=requirement
+                )
+                self.assertNotEqual(completed.returncode, 0)
+                self.assertFalse(output.exists())
+
+    def test_ephemeral_identity_rejects_explicit_requirement_with_stable_code(
+        self,
+    ) -> None:
+        if shutil.which("sh") is None:
+            self.skipTest("a POSIX sh is unavailable")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            completed, output = self._run_identity(
+                root,
+                requirement_output=
+                    "designated => identifier test and anchor apple generic",
+            )
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertIn(
+                "ad-hoc 签名未产生 implicit designated requirement",
+                completed.stderr,
+            )
+            self.assertFalse(output.exists())
+
+    def test_requirement_verify_uses_one_literal_argument_and_space_paths(
+        self,
+    ) -> None:
+        if shutil.which("sh") is None:
+            self.skipTest("a POSIX sh is unavailable")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "identity test with spaces"
+            root.mkdir()
+            marker = root / "must not be created"
+            expression = (
+                'identifier "test" and info[foo] = "$(touch '
+                f'{marker}); `false`; *; ?; $HOME"'
+            )
+            runner_app = os.fspath(root / "Runner App.app")
+            fixture_app = os.fspath(root / "Fixture App.app")
+            completed, output = self._run_identity(
+                root, requirement_output=f"# designated => {expression}",
+                runner_app=runner_app, fixture_app=fixture_app,
+            )
+            self.assertEqual(completed.returncode, 0, msg=completed.stderr)
+            self.assertTrue(output.is_file())
+            self.assertFalse(marker.exists())
+            argument_log = (root / "requirement verify arguments.txt").read_text(
+                encoding="utf-8"
+            ).splitlines()
+            self.assertEqual(
+                argument_log,
+                [
+                    "CALL", "--verify", "--strict",
+                    "--test-requirement", f"={expression}", runner_app,
+                    "CALL", "--verify", "--strict",
+                    "--test-requirement", f"={expression}", fixture_app,
+                ],
+            )
+
+    def test_requirement_verify_failure_has_stable_stage_code(self) -> None:
+        if shutil.which("sh") is None:
+            self.skipTest("a POSIX sh is unavailable")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            shell = shutil.which("sh")
+            assert shell is not None
+            tool_dir = root / "tools"
+            tool_dir.mkdir()
+            tools = self._write_mock_tools(tool_dir)
+            output = root / "identity.txt"
+            command = (
+                f'. "{IDENTITY_SCRIPT}"; '
+                'if write_identity_attestation "$1" "$2" "$3" "$4" '
+                '"$5" ephemeral "$6" clean "$7" Runner.app '
+                'Runner.app/runner dev.ai-auto-desktop.testkit.ax-runner '
+                'Fixture.app Fixture.app/fixture '
+                'dev.ai-auto-desktop.testkit.fixture; then exit 8; fi; '
+                'printf "%s\n" "$IDENTITY_ATTESTATION_ERROR"'
+            )
+            environment = os.environ.copy()
+            environment["MOCK_FAIL_FIELD"] = "requirement_verify"
+            completed = subprocess.run(
+                [
+                    shell, "-eu", "-c", command, "identity-test",
+                    str(output), str(tools["swiftc"]),
+                    str(tools["codesign"]), str(tools["lipo"]),
+                    str(tools["shasum"]), "a" * 40, "b" * 64,
+                ],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                encoding="utf-8", env=environment, check=False,
+            )
+            self.assertEqual(completed.returncode, 0, msg=completed.stderr)
+            self.assertEqual(completed.stdout.strip(), "runner.requirement_verify")
+            self.assertFalse(output.exists())
 
     def test_empty_required_fields_fail_closed(self) -> None:
         if shutil.which("sh") is None:

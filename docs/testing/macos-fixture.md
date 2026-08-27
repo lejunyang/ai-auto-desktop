@@ -36,8 +36,14 @@ runner 由 LaunchServices 以固定 `.app` 身份启动，并将报告原子写�
   mode 固定为 `0644`；同时关闭 ACL、file flags、xattr、AppleDouble 和 gzip header 时间/文件名。
   它只接受已知的 macOS bsdtar/libarchive 或 GNU tar，归一化能力不可用时会 fail closed。
 - `identity.txt` 强制包含 Swift 版本、identity stability，以及 runner/fixture 各自非空的
-  designated requirement、Identifier、CDHash、architectures 和 SHA-256；采集命令失败不会被
+  designated requirement、requirement origin（`implicit`/`explicit`）、Identifier、CDHash、architectures 和 SHA-256；采集命令失败不会被
   `sed`/`awk` 等管道末端掩盖，也不会发布半份证明。
+- designated requirement 只接受 `codesign -d -r-` 唯一一条规范的 explicit
+  `designated => expression` 或 implicit `# designated => expression`，随后以
+  `codesign --verify --strict --test-requirement "=expression"` 回验对应 app；缺失、重复、
+  空值、畸形或回验失败都会以稳定阶段码 fail closed。ad-hoc（`ephemeral`）构建必须是
+  implicit；固定签名身份可为 explicit 或 implicit。新的 `passed` 归档必须携带 origin，
+  缺失该字段的旧 `passed` 归档不再被当前 verifier 接受。
 - 源码包注入规范化 `SOURCE_MANIFEST.txt`：包含 Git commit SHA、clean/dirty 状态，并固定
   除自身外每个白名单成员的 mode 和 SHA-256。`source_package_digest` 是该 manifest 的
   SHA-256，以此避开自引用 hash；Mac 在构建前重算并验证，随后将 revision、worktree 与
