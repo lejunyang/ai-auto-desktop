@@ -50,6 +50,11 @@ if ! swiftc_path=$(xcrun --sdk macosx --find swiftc 2>/dev/null); then
     printf '%s\n' '不支持：找不到 macOS SDK 或 swiftc，请运行 xcode-select --install。' >&2
     exit 71
 fi
+if ! lipo_path=$(xcrun --sdk macosx --find lipo 2>/dev/null) \
+    || [ ! -x "$lipo_path" ]; then
+    printf '%s\n' '不支持：找不到 macOS SDK 中的 lipo。' >&2
+    exit 71
+fi
 if ! swift_version_output=$("$swiftc_path" --version 2>&1); then
     printf '%s\n' '不支持：无法读取 Swift 编译器版本。' >&2
     exit 81
@@ -404,7 +409,7 @@ if ! write_identity_attestation \
     "$attestation" \
     "$swiftc_path" \
     "$(command -v codesign)" \
-    /usr/bin/lipo \
+    "$lipo_path" \
     /usr/bin/shasum \
     "$identity_stability" \
     "$SOURCE_REVISION" \
@@ -417,6 +422,10 @@ if ! write_identity_attestation \
     "$fixture_app/Contents/MacOS/AiAutoDesktopAXFixture" \
     dev.ai-auto-desktop.testkit.fixture; then
     rm -f "$attestation"
+    if [ -n "${GITHUB_ACTIONS:-}" ]; then
+        printf '%s\n' \
+            "::error title=macOS identity attestation failed::$IDENTITY_ATTESTATION_ERROR"
+    fi
     printf '%s\n' '失败：无法生成完整的 identity attestation。' >&2
     exit 80
 fi

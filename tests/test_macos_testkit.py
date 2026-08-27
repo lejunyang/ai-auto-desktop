@@ -474,6 +474,9 @@ class MacOSTestkitSourceContracts(unittest.TestCase):
 
     def test_build_declares_and_checks_minimum_swift_version(self) -> None:
         self.assertIn('"$swiftc_path" --version', self.build)
+        self.assertIn("xcrun --sdk macosx --find lipo", self.build)
+        self.assertIn('"$lipo_path"', self.build)
+        self.assertNotIn("/usr/bin/lipo", self.build)
         self.assertIn('至少需要 Swift 5.3', self.build)
         self.assertIn('exit 81', self.build)
 
@@ -554,6 +557,9 @@ class MacOSTestkitSourceContracts(unittest.TestCase):
         ):
             with self.subTest(marker=marker):
                 self.assertIn(marker, self.identity)
+        self.assertIn("IDENTITY_ATTESTATION_ERROR=unknown", self.identity)
+        self.assertIn("identity_set_error", self.identity)
+        self.assertIn("macOS identity attestation failed", self.build)
 
     def test_source_package_manifest_is_complete_and_minimal(self) -> None:
         self.assertEqual(
@@ -740,6 +746,7 @@ if [ "${1:-}" = -s ]; then printf '%s\n' Darwin; else printf '%s\n' arm64; fi
             "xcrun": f"""#!/bin/sh
 case " $* " in
   *' --find swiftc '*) printf '%s\n' '{fake_bin / "swiftc"}' ;;
+  *' --find lipo '*) printf '%s\n' '{fake_bin / "lipo"}' ;;
   *' --show-sdk-path '*) printf '%s\n' '{root / "Secret SDK"}' ;;
   *) exit 1 ;;
 esac
@@ -768,6 +775,7 @@ case " $* " in
 esac
 """,
             "codesign": "#!/bin/sh\nexit 0\n",
+            "lipo": "#!/bin/sh\nprintf '%s\n' arm64\n",
         }
         for name, content in scripts.items():
             path = fake_bin / name
@@ -1199,6 +1207,43 @@ esac
                 )
                 self.assertNotEqual(completed.returncode, 0)
                 self.assertFalse(output.exists())
+
+    def test_failure_exposes_only_a_stable_stage_code(self) -> None:
+        if shutil.which("sh") is None:
+            self.skipTest("a POSIX sh is unavailable")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            shell = shutil.which("sh")
+            assert shell is not None
+            tool_dir = root / "tools"
+            tool_dir.mkdir()
+            tools = self._write_mock_tools(tool_dir)
+            output = root / "identity.txt"
+            command = (
+                f'. "{IDENTITY_SCRIPT}"; '
+                'if write_identity_attestation "$1" "$2" "$3" "$4" '
+                '"$5" ephemeral "$6" clean "$7" Runner.app '
+                'Runner.app/runner dev.ai-auto-desktop.testkit.ax-runner '
+                'Fixture.app Fixture.app/fixture '
+                'dev.ai-auto-desktop.testkit.fixture; then exit 8; fi; '
+                'printf "%s\n" "$IDENTITY_ATTESTATION_ERROR"'
+            )
+            environment = os.environ.copy()
+            environment["MOCK_FAIL_FIELD"] = "architectures"
+            completed = subprocess.run(
+                [
+                    shell, "-eu", "-c", command, "identity-test",
+                    str(output), str(tools["swiftc"]),
+                    str(tools["codesign"]), str(tools["lipo"]),
+                    str(tools["shasum"]), "a" * 40, "b" * 64,
+                ],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                encoding="utf-8", env=environment, check=False,
+            )
+            self.assertEqual(completed.returncode, 0, msg=completed.stderr)
+            self.assertEqual(completed.stdout.strip(), "runner.architectures_read")
+            self.assertNotIn(os.fspath(root), completed.stdout)
+            self.assertFalse(output.exists())
 
 
 @unittest.skipIf(platform.system() == "Darwin", "exercises the non-macOS shell path")
