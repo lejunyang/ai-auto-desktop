@@ -22,7 +22,15 @@ class CiTriggerContractTests(unittest.TestCase):
             'python -m pip install wheel "${{ matrix.install-target }}[ocr]"',
             automatic_job,
         )
-        self.assertNotIn("apt-get", automatic_job)
+        self.assertRegex(
+            automatic_job,
+            re.compile(
+                r"- name: Install Linux X11 capture test dependencies\n"
+                r"\s+if: runner\.os == 'Linux'\n"
+                r"\s+run: sudo apt-get update && sudo apt-get install -y "
+                r"--no-install-recommends xvfb libx11-dev pkg-config g\+\+"
+            ),
+        )
         self.assertNotIn("brew install", automatic_job)
 
     def test_macos_builds_production_helper_after_portable_contracts(self) -> None:
