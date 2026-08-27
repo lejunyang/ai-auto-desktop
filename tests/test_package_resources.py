@@ -116,7 +116,8 @@ class PackageResourceTests(unittest.TestCase):
         ]
         self.assertTrue(
             any(
-                re.match(r"(?i)^pillow(?:\s|\(|$)", requirement)
+                re.split(r"[\s(<>=!~;\[]", requirement, maxsplit=1)[0].lower()
+                == "pillow"
                 and ";" not in requirement
                 for requirement in requirements
             ),
