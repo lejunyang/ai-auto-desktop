@@ -1,7 +1,7 @@
 # Linux AT-SPI 进程驱动
 
 `desktop.linux_atspi` 通过当前 Linux 图形会话的 AT-SPI 可访问性树提供
-`inspect_session`、`list_applications`、`snapshot`、`find`、`focus`、`invoke`、显式
+`inspect_session`、`list_applications`、`snapshot`、`find`、显式 `capture_target`、`focus`、`invoke`、显式
 `pointer_click`、`set_text`、显式 `type_text`、`toggle`、`expand` 和 `collapse`。
 
 ## 运行
@@ -13,6 +13,7 @@ plugins/linux_atspi/run.sh
 进程通过标准输入和标准输出交换 UTF-8 NDJSON。`inspect_session`、`list_applications`、`snapshot`
 和 `find` 需要 `desktop.observe` 权限；八种写动作还需要
 `desktop.input` 权限。
+`capture_target` 另需独立的 `desktop.capture` 权限；普通可访问性观察权限不包含像素读取。
 
 ## 依赖
 
@@ -37,6 +38,10 @@ snapshot 上的目标具有正面积 bounds；AT-SPI element-at-point 还必须�
 后代，避免同进程 sibling/overlay 覆盖中心点时误点。调用方不能传入裸 `x/y` 坐标。
 `set_text`/`invoke` 永远不会自动进入这些路径。驱动不做 OCR，也不依赖 `xdotool`、剪贴板
 或 `uinput`。
+`capture_target` 也不是语义定位失败后的后备。它只接受已有 snapshot 中的
+`target + locator + format=png`，fresh 重解析并校验身份、PID、screen bounds、protected 子树
+和 X11 遮挡后，才将当前可见区域作为 Host 托管 `ArtifactRef` 返回。它禁止全屏、任意 region、
+padding 和裸坐标，不包含鼠标指针，也不执行 OCR；OCR 只能是工作流中显式的后续 action。
 只读 Gio fallback 会为全部八种写动作返回结构化的
 `DRIVER.ACTION_UNSUPPORTED`。定位器只支持精确匹配；多义、过期或截断快照均失败关闭。
 当前 v0 默认后端还要求进程环境明确报告 KDE、X11 和非空 `DISPLAY`；缺失这些证据，
@@ -63,6 +68,9 @@ XTEST 发送 move + Button1 down/up。`type_text` 接受 1–1024 个字符且�
 `pointer_click` 在指针事件前需要先聚焦目标；如果尚未提交点击但焦点已改变，失败也按
 不可重试的 contextual effect 返回，不能伪装成完全没有副作用。
 登录管理器和锁屏界面不受支持；生产动作不主动解锁会话。
+`capture_target` 另需运行 `plugins/linux_atspi/build_x11_capture_helper.sh`。截图 helper 只依赖
+Xlib，PNG 原始字节走 stdout，metadata 走一条有界 stderr JSON；不创建图片文件，也不调用
+shell、ImageMagick 或外部编码器。helper 输出与 Host artifact slot 都有 64 MiB 硬上限。
 显式选择示例见 `examples/workflows/linux-explicit-type-text-fallback.yaml`；示例只按调用方
 预先获得的 `semantic_set_text_available` 结果分支，不捕获语义动作失败后自动降级。
 

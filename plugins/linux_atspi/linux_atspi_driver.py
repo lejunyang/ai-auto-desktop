@@ -19,12 +19,19 @@ import math
 import os
 from pathlib import Path
 import re
+import selectors
 import stat
+import struct
 import subprocess
 import sys
 import time
 from typing import Any, NoReturn, Protocol
 import uuid
+
+from ai_auto_desktop.artifact_ipc import (
+    ArtifactIPCError,
+    WorkerArtifactInvocation,
+)
 
 
 PLUGIN_NAME = "desktop.linux_atspi"
@@ -42,6 +49,12 @@ MAX_NODES = 5000
 MAX_CANDIDATE_SUMMARIES = 10
 XTEST_HELPER_PATH = Path(__file__).resolve().parent / ".build" / "x11_xtest_helper"
 XTEST_HELPER_MAX_OUTPUT_BYTES = 64 * 1024
+X11_CAPTURE_HELPER_PATH = (
+    Path(__file__).resolve().parent / ".build" / "x11_capture_helper"
+)
+CAPTURE_MAX_BYTES = 64 * 1024 * 1024
+CAPTURE_HELPER_MAX_METADATA_BYTES = 64 * 1024
+PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 TYPE_TEXT_ROLES = frozenset({"entry", "text"})
 # D-Bus 在返回 ``a(so)`` 后才交给 Python 解包；该上限不能避免总线已传输的
 # 数据，但会在解包后立即拒绝异常 fan-out，避免继续复制或遍历无界列表。
@@ -64,6 +77,7 @@ ACTION_IDS = {
         "list_applications",
         "snapshot",
         "find",
+        "capture_target",
         "focus",
         "invoke",
         "pointer_click",
@@ -169,6 +183,10 @@ ACTION_ERRORS = (
     ("DRIVER.ACTION_UNSUPPORTED", "目标缺少所需 AT-SPI 接口。", False),
     ("DRIVER.PROTECTED_ELEMENT", "目标是受保护元素。", False),
     ("DRIVER.UNKNOWN_EFFECT", "原生动作可能已生效。", False),
+)
+CAPTURE_ERRORS = (
+    ("DRIVER.CAPTURE_FAILED", "X11 目标截图失败。", False),
+    ("DRIVER.ARTIFACT_IPC", "截图 artifact 传输失败。", False),
 )
 
 
@@ -278,6 +296,85 @@ WRITE_OUTPUT_SCHEMA: dict[str, Any] = {
     },
     "additionalProperties": False,
 }
+CAPTURE_INPUT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "required": ["target", "locator", "format"],
+    "properties": {
+        "target": TARGET_SCHEMA,
+        "locator": LOCATOR_SCHEMA,
+        "format": {"const": "png"},
+    },
+    "additionalProperties": False,
+}
+CAPTURE_PROVENANCE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "required": [
+        "capture_method",
+        "snapshot_id",
+        "revision",
+        "node_id",
+        "application_process_id",
+        "format",
+        "mime_type",
+        "target_process_id",
+        "target_window",
+        "target_top_level_window",
+        "root_window",
+        "bounds",
+        "root_size",
+        "cursor_included",
+        "occlusion_checked",
+        "same_euid_verified",
+        "scene_stable",
+    ],
+    "properties": {
+        "capture_method": {"const": "x11_root_xgetimage"},
+        "snapshot_id": {"type": "string", "minLength": 1},
+        "revision": {"type": "integer", "minimum": 1},
+        "node_id": {"type": "string", "minLength": 1},
+        "application_process_id": {"type": "integer", "minimum": 1},
+        "format": {"const": "png"},
+        "mime_type": {"const": "image/png"},
+        "target_process_id": {"type": "integer", "minimum": 1},
+        "target_window": {"type": "integer", "minimum": 1},
+        "target_top_level_window": {"type": "integer", "minimum": 1},
+        "root_window": {"type": "integer", "minimum": 1},
+        "bounds": {
+            "type": "object",
+            "required": ["x", "y", "width", "height"],
+            "properties": {
+                "x": {"type": "integer"},
+                "y": {"type": "integer"},
+                "width": {"type": "integer", "minimum": 1},
+                "height": {"type": "integer", "minimum": 1},
+            },
+            "additionalProperties": False,
+        },
+        "root_size": {
+            "type": "object",
+            "required": ["width", "height"],
+            "properties": {
+                "width": {"type": "integer", "minimum": 1},
+                "height": {"type": "integer", "minimum": 1},
+            },
+            "additionalProperties": False,
+        },
+        "cursor_included": {"const": False},
+        "occlusion_checked": {"const": True},
+        "same_euid_verified": {"const": True},
+        "scene_stable": {"const": True},
+    },
+    "additionalProperties": False,
+}
+CAPTURE_OUTPUT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "required": ["frame", "provenance"],
+    "properties": {
+        "frame": {"type": "object"},
+        "provenance": CAPTURE_PROVENANCE_SCHEMA,
+    },
+    "additionalProperties": False,
+}
 
 ACTION_CONTRACTS: dict[str, dict[str, Any]] = {
     "inspect_session": _contract(
@@ -380,6 +477,31 @@ ACTION_CONTRACTS: dict[str, dict[str, Any]] = {
         errors=COMMON_ERRORS + LOCATOR_ERRORS,
         permissions=("desktop.observe",),
     ),
+    "capture_target": {
+        **_contract(
+            (
+                "重新验证精确 AT-SPI 目标后，经固定 X11 helper 截取其 fresh "
+                "screen bounds；仅输出 host 托管 PNG artifact 与可审计 provenance。"
+            ),
+            effect="read_only",
+            risk_category="observe",
+            risk_level="medium",
+            input_schema=CAPTURE_INPUT_SCHEMA,
+            output_schema=CAPTURE_OUTPUT_SCHEMA,
+            errors=COMMON_ERRORS + LOCATOR_ERRORS + ACTION_ERRORS[:2] + CAPTURE_ERRORS,
+            permissions=("desktop.observe", "desktop.capture"),
+            sensitivity={"input": "public", "output": "sensitive", "error": "public"},
+        ),
+        "artifacts": {
+            "outputs": {
+                "frame": {
+                    "pointer": "/frame",
+                    "media_types": ["image/png"],
+                    "max_size_bytes": CAPTURE_MAX_BYTES,
+                }
+            }
+        },
+    },
     "focus": _contract(
         "重新验证目标后调用 AT-SPI Component.grab_focus。",
         effect="contextual",
@@ -589,6 +711,15 @@ class _SnapshotRecord:
     application_selector: dict[str, Any]
     max_depth: int
     max_nodes: int
+
+
+@dataclass(slots=True)
+class _FreshTarget:
+    previous: _SnapshotRecord
+    fresh: _SnapshotRecord
+    previous_node_id: str
+    node_id: str
+    node: dict[str, Any]
 
 
 class XTestHelper:
@@ -943,6 +1074,429 @@ class XTestHelper:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class CaptureResult:
+    """由固定 X11 helper 返回的有界 PNG 与已验证 capture metadata。"""
+
+    png: bytes
+    metadata: dict[str, Any]
+
+
+class X11CaptureHelper:
+    """固定路径、单次进程的 X11 target capture 边界。"""
+
+    _SUCCESS_FIELDS = frozenset(
+        {
+            "ok",
+            "schema_version",
+            "capture_method",
+            "format",
+            "mime_type",
+            "expected_pid",
+            "target_pid",
+            "target_window",
+            "target_top_level_window",
+            "root_window",
+            "x",
+            "y",
+            "width",
+            "height",
+            "root_width",
+            "root_height",
+            "png_bytes",
+            "cursor_included",
+            "occlusion_checked",
+            "same_euid_verified",
+            "scene_stable",
+        }
+    )
+    _FAILURE_FIELDS = frozenset({"ok", "schema_version", "code", "phase"})
+    _FAILURE_CONTEXT_FIELDS = frozenset(
+        {"expected_pid", "x", "y", "width", "height"}
+    )
+
+    def __init__(self, path: Path = X11_CAPTURE_HELPER_PATH) -> None:
+        self.path = path
+
+    @staticmethod
+    def _qualified_environment() -> dict[str, str]:
+        session = _environment_session_info()
+        session_type = str(session.get("session_type") or "").strip().lower()
+        if session_type != "x11" or not session.get("display"):
+            raise DriverError(
+                "DRIVER.UNAVAILABLE",
+                "capture_target 仅支持明确的 X11/DISPLAY 会话",
+                data={
+                    "reason": "unsupported_session",
+                    "required_session_type": "x11",
+                    "session": session,
+                },
+            )
+        allowed = (
+            "DISPLAY",
+            "XAUTHORITY",
+            "XDG_SESSION_TYPE",
+            "XDG_CURRENT_DESKTOP",
+            "DESKTOP_SESSION",
+        )
+        return {name: os.environ[name] for name in allowed if os.environ.get(name)}
+
+    def _validated_path(self) -> str:
+        try:
+            details = self.path.lstat()
+        except OSError as exc:
+            raise DriverError(
+                "DRIVER.UNAVAILABLE",
+                "X11 capture helper 尚未构建",
+                data={
+                    "reason": "capture_helper_missing",
+                    "exception_type": type(exc).__name__,
+                },
+            ) from exc
+        unsafe_mode = bool(details.st_mode & (stat.S_IWGRP | stat.S_IWOTH))
+        if (
+            not stat.S_ISREG(details.st_mode)
+            or details.st_uid != os.geteuid()
+            or unsafe_mode
+            or not os.access(self.path, os.X_OK)
+        ):
+            raise DriverError(
+                "DRIVER.UNAVAILABLE",
+                "X11 capture helper 身份或权限不可信",
+                data={
+                    "reason": "capture_helper_untrusted",
+                    "regular": stat.S_ISREG(details.st_mode),
+                    "owner_matches": details.st_uid == os.geteuid(),
+                    "group_or_world_writable": unsafe_mode,
+                    "executable": os.access(self.path, os.X_OK),
+                },
+            )
+        return str(self.path)
+
+    def _open_validated_executable(self) -> int:
+        """Open the verified helper inode so pathname replacement cannot race exec."""
+
+        self._validated_path()
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = -1
+        try:
+            descriptor = os.open(self.path, flags)
+            details = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(details.st_mode)
+                or details.st_uid != os.geteuid()
+                or bool(details.st_mode & (stat.S_IWGRP | stat.S_IWOTH))
+                or not bool(details.st_mode & stat.S_IXUSR)
+            ):
+                raise OSError
+            return descriptor
+        except (OSError, ValueError):
+            if descriptor >= 0:
+                os.close(descriptor)
+            raise DriverError(
+                "DRIVER.UNAVAILABLE",
+                "X11 capture helper 无法通过已验证描述符启动",
+                data={"reason": "capture_helper_untrusted"},
+            ) from None
+
+    @staticmethod
+    def _metadata(stderr: bytes) -> dict[str, Any]:
+        if len(stderr) > CAPTURE_HELPER_MAX_METADATA_BYTES:
+            raise DriverError(
+                "DRIVER.CAPTURE_FAILED",
+                "X11 capture helper metadata 超过限制",
+                data={"reason": "helper_metadata_too_large"},
+            )
+        lines = stderr.splitlines()
+        if len(lines) != 1:
+            raise DriverError(
+                "DRIVER.CAPTURE_FAILED",
+                "X11 capture helper 未返回唯一 metadata 记录",
+                data={"reason": "invalid_helper_metadata"},
+            )
+        def closed_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+            result: dict[str, Any] = {}
+            for key, value in pairs:
+                if key in result:
+                    raise ValueError("duplicate metadata field")
+                result[key] = value
+            return result
+
+        try:
+            value = json.loads(
+                lines[0].decode("utf-8", errors="strict"),
+                object_pairs_hook=closed_object,
+            )
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+            raise DriverError(
+                "DRIVER.CAPTURE_FAILED",
+                "X11 capture helper metadata 无效",
+                data={"reason": "invalid_helper_metadata"},
+            ) from exc
+        if not isinstance(value, dict):
+            raise DriverError(
+                "DRIVER.CAPTURE_FAILED",
+                "X11 capture helper metadata 必须是对象",
+                data={"reason": "invalid_helper_metadata"},
+            )
+        return value
+
+    @staticmethod
+    def _positive_integer(value: Any) -> bool:
+        return not isinstance(value, bool) and isinstance(value, int) and value > 0
+
+    @classmethod
+    def _validate_success(
+        cls, metadata: dict[str, Any], *, expected_process_id: int, bounds: Mapping[str, int]
+    ) -> None:
+        if set(metadata) != cls._SUCCESS_FIELDS:
+            raise DriverError(
+                "DRIVER.CAPTURE_FAILED",
+                "X11 capture helper success metadata 字段不匹配",
+                data={"reason": "invalid_helper_metadata"},
+            )
+        integer_fields = (
+            "expected_pid",
+            "target_pid",
+            "target_window",
+            "target_top_level_window",
+            "root_window",
+            "root_width",
+            "root_height",
+            "png_bytes",
+        )
+        if (
+            metadata.get("ok") is not True
+            or isinstance(metadata.get("schema_version"), bool)
+            or metadata.get("schema_version") != 1
+            or metadata.get("capture_method") != "x11_root_xgetimage"
+            or metadata.get("format") != "png"
+            or metadata.get("mime_type") != "image/png"
+            or metadata.get("expected_pid") != expected_process_id
+            or metadata.get("target_pid") != expected_process_id
+            or metadata.get("cursor_included") is not False
+            or metadata.get("occlusion_checked") is not True
+            or metadata.get("same_euid_verified") is not True
+            or metadata.get("scene_stable") is not True
+            or any(not cls._positive_integer(metadata.get(name)) for name in integer_fields)
+            or any(
+                isinstance(metadata.get(name), bool)
+                or not isinstance(metadata.get(name), int)
+                for name in ("x", "y", "width", "height")
+            )
+            or any(metadata.get(name) != bounds[name] for name in ("x", "y", "width", "height"))
+            or metadata["x"] < 0
+            or metadata["y"] < 0
+            or metadata["width"] <= 0
+            or metadata["height"] <= 0
+            or metadata["x"] + metadata["width"] > metadata["root_width"]
+            or metadata["y"] + metadata["height"] > metadata["root_height"]
+        ):
+            raise DriverError(
+                "DRIVER.CAPTURE_FAILED",
+                "X11 capture helper 未证明精确且未遮挡的目标截图",
+                data={"reason": "capture_evidence_mismatch"},
+            )
+
+    @staticmethod
+    def _validate_png(png: bytes, *, width: int, height: int) -> None:
+        if not png or len(png) > CAPTURE_MAX_BYTES:
+            raise DriverError(
+                "DRIVER.CAPTURE_FAILED",
+                "X11 capture helper PNG 为空或超过限制",
+                data={"reason": "invalid_png_size", "limit_bytes": CAPTURE_MAX_BYTES},
+            )
+        if len(png) < 24 or png[:8] != PNG_SIGNATURE or png[12:16] != b"IHDR":
+            raise DriverError(
+                "DRIVER.CAPTURE_FAILED",
+                "X11 capture helper 未返回 PNG",
+                data={"reason": "invalid_png"},
+            )
+        actual_width, actual_height = struct.unpack(">II", png[16:24])
+        if actual_width != width or actual_height != height:
+            raise DriverError(
+                "DRIVER.CAPTURE_FAILED",
+                "PNG 尺寸与目标 bounds 不一致",
+                data={
+                    "reason": "png_dimensions_mismatch",
+                    "expected": {"width": width, "height": height},
+                    "actual": {"width": actual_width, "height": actual_height},
+                },
+            )
+
+    def capture_target(
+        self,
+        *,
+        expected_process_id: int,
+        bounds: Mapping[str, int],
+        deadline: float,
+    ) -> CaptureResult:
+        environment = self._qualified_environment()
+        executable_fd = self._open_validated_executable()
+        executable = f"/proc/self/fd/{executable_fd}"
+        _check_deadline(deadline)
+        command = [
+            executable,
+            "capture-target",
+            "--expected-pid",
+            str(expected_process_id),
+            "--x",
+            str(bounds["x"]),
+            "--y",
+            str(bounds["y"]),
+            "--width",
+            str(bounds["width"]),
+            "--height",
+            str(bounds["height"]),
+            "--deadline-monotonic-ns",
+            str(int(deadline * 1_000_000_000)),
+        ]
+        try:
+            process = subprocess.Popen(
+                command,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                cwd=str(self.path.parent),
+                env=environment,
+                close_fds=True,
+                pass_fds=(executable_fd,),
+            )
+        except OSError as exc:
+            raise DriverError(
+                "DRIVER.UNAVAILABLE",
+                "无法启动固定路径 X11 capture helper",
+                data={
+                    "reason": "capture_helper_start_failed",
+                    "exception_type": type(exc).__name__,
+                },
+            ) from exc
+        finally:
+            os.close(executable_fd)
+        stdout, stderr = self._communicate_bounded(process, deadline)
+        metadata = self._metadata(stderr)
+        if process.returncode != 0:
+            valid_failure = (
+                process.returncode in {64, 69, 70, 73, 75, 76}
+                and
+                self._FAILURE_FIELDS.issubset(metadata)
+                and set(metadata) <= self._FAILURE_FIELDS | self._FAILURE_CONTEXT_FIELDS
+                and metadata.get("ok") is False
+                and metadata.get("schema_version") == 1
+                and isinstance(metadata.get("code"), str)
+                and 0 < len(metadata.get("code")) <= MAX_FIELD_CHARS
+                and isinstance(metadata.get("phase"), str)
+                and 0 < len(metadata.get("phase")) <= MAX_FIELD_CHARS
+                and (
+                    "expected_pid" not in metadata
+                    or metadata.get("expected_pid") == expected_process_id
+                )
+                and all(
+                    name not in metadata
+                    or (
+                        not isinstance(metadata.get(name), bool)
+                        and isinstance(metadata.get(name), int)
+                        and (metadata.get(name) >= 0 if name in {"x", "y"} else metadata.get(name) > 0)
+                        and metadata.get(name) == (
+                            expected_process_id if name == "expected_pid" else bounds[name]
+                        )
+                    )
+                    for name in self._FAILURE_CONTEXT_FIELDS
+                )
+                and not stdout
+            )
+            details = {
+                "helper_exit_code": process.returncode,
+                "helper_code": metadata.get("code") if valid_failure else None,
+                "phase": metadata.get("phase") if valid_failure else "capture",
+                "reason": "helper_failed" if valid_failure else "invalid_helper_failure",
+                "effect": "not_applied",
+            }
+            if valid_failure and process.returncode == 69:
+                raise DriverError("DRIVER.UNAVAILABLE", "X11 capture 不可用", data=details)
+            if valid_failure and process.returncode == 75:
+                raise DriverError(
+                    "DRIVER.TIMEOUT", "X11 capture helper 超时", retryable=True, data=details
+                )
+            raise DriverError("DRIVER.CAPTURE_FAILED", "X11 capture helper 失败关闭", data=details)
+        self._validate_success(
+            metadata, expected_process_id=expected_process_id, bounds=bounds
+        )
+        self._validate_png(
+            stdout, width=int(bounds["width"]), height=int(bounds["height"])
+        )
+        if metadata.get("png_bytes") != len(stdout):
+            raise DriverError(
+                "DRIVER.CAPTURE_FAILED",
+                "X11 capture helper PNG byte count 不匹配",
+                data={"reason": "png_size_mismatch"},
+            )
+        return CaptureResult(bytes(stdout), metadata)
+
+    @staticmethod
+    def _communicate_bounded(
+        process: subprocess.Popen[bytes], deadline: float
+    ) -> tuple[bytes, bytes]:
+        assert process.stdout is not None
+        assert process.stderr is not None
+        stdout = bytearray()
+        stderr = bytearray()
+        streams = selectors.DefaultSelector()
+        try:
+            for stream, kind in ((process.stdout, "stdout"), (process.stderr, "stderr")):
+                os.set_blocking(stream.fileno(), False)
+                streams.register(stream, selectors.EVENT_READ, kind)
+            while streams.get_map():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise DriverError(
+                        "DRIVER.TIMEOUT", "X11 capture helper 超时", retryable=True,
+                        data={"phase": "capture", "effect": "not_applied"},
+                    )
+                for key, _events in streams.select(min(remaining, 0.05)):
+                    try:
+                        chunk = os.read(key.fileobj.fileno(), 64 * 1024)
+                    except BlockingIOError:
+                        continue
+                    if not chunk:
+                        streams.unregister(key.fileobj)
+                        continue
+                    target = stdout if key.data == "stdout" else stderr
+                    target.extend(chunk)
+                    limit = (
+                        CAPTURE_MAX_BYTES
+                        if key.data == "stdout"
+                        else CAPTURE_HELPER_MAX_METADATA_BYTES
+                    )
+                    if len(target) > limit:
+                        raise DriverError(
+                            "DRIVER.CAPTURE_FAILED",
+                            "X11 capture helper 输出超过限制",
+                            data={"stream": key.data, "limit_bytes": limit},
+                        )
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise DriverError(
+                    "DRIVER.TIMEOUT", "X11 capture helper 超时", retryable=True,
+                    data={"phase": "capture", "effect": "not_applied"},
+                )
+            process.wait(timeout=max(0.001, remaining))
+            return bytes(stdout), bytes(stderr)
+        except (DriverError, subprocess.TimeoutExpired) as exc:
+            process.kill()
+            process.wait(timeout=1)
+            if isinstance(exc, DriverError):
+                raise
+            raise DriverError(
+                "DRIVER.TIMEOUT", "X11 capture helper 超时", retryable=True,
+                data={"phase": "capture", "effect": "not_applied"},
+            ) from exc
+        finally:
+            streams.close()
+            process.stdout.close()
+            process.stderr.close()
+
+
 def _fail(code: str, message: str, **data: Any) -> NoReturn:
     raise DriverError(code, message, data=data or None)
 
@@ -1153,9 +1707,13 @@ class LinuxAtspiDriver:
         backend: AtspiBackend | None = None,
         *,
         xtest_helper: XTestHelper | None = None,
+        capture_helper: X11CaptureHelper | None = None,
     ) -> None:
         self.backend: AtspiBackend = backend if backend is not None else create_default_backend()
         self.xtest_helper = xtest_helper if xtest_helper is not None else XTestHelper()
+        self.capture_helper = (
+            capture_helper if capture_helper is not None else X11CaptureHelper()
+        )
         self.generation = uuid.uuid4().hex
         self._revision = 0
         self._current: _SnapshotRecord | None = None
@@ -1171,6 +1729,11 @@ class LinuxAtspiDriver:
             return self._snapshot(values, deadline)
         if action == "find":
             return self._find(values, deadline)
+        if action == "capture_target":
+            _fail(
+                "DRIVER.INVALID_REQUEST",
+                "capture_target 必须通过完整 Host artifact invocation 调用",
+            )
         if action in WRITE_ACTIONS:
             return self._write(action, values, deadline)
         _fail("DRIVER.INVALID_REQUEST", f"未知动作：{action}", action=action)
@@ -1533,18 +2096,9 @@ class LinuxAtspiDriver:
             "node_id": node_id,
         }
 
-    def _write(self, action: str, args: dict[str, Any], deadline: float) -> dict[str, Any]:
-        text_actions = {"set_text", "type_text"}
-        pointer_action = action == "pointer_click"
-        allowed = {"target", "locator"} | ({"text"} if action in text_actions else set())
-        pointer_button: str | None = None
-        pointer_position: str | None = None
-        if pointer_action:
-            allowed |= {"button", "position"}
-        _only_keys(args, allowed, "args")
-        if pointer_action:
-            pointer_button = _pointer_button(args.get("button"))
-            pointer_position = _pointer_position(args.get("position"))
+    def _fresh_target(
+        self, args: Mapping[str, Any], deadline: float, *, purpose: str
+    ) -> _FreshTarget:
         if "target" not in args or "locator" not in args:
             _fail("DRIVER.INVALID_REQUEST", "target 和 locator 是必填字段")
         target = _object(args["target"], "target")
@@ -1554,7 +2108,9 @@ class LinuxAtspiDriver:
             _fail("DRIVER.INVALID_REQUEST", "target.node_id 必须是非空字符串")
         record = self._record(target.get("snapshot_id"), target.get("revision"))
         if record.public.get("truncated"):
-            raise DriverError("DRIVER.SNAPSHOT_TRUNCATED", "截断快照不能用于写动作")
+            raise DriverError(
+                "DRIVER.SNAPSHOT_TRUNCATED", f"截断快照不能用于 {purpose}"
+            )
         locator = self._locator(args["locator"])
         expected = self._resolve(record, locator, deadline)
         if expected["node_id"] != node_id or node_id not in record.handles:
@@ -1572,7 +2128,10 @@ class LinuxAtspiDriver:
             deadline=deadline,
         )
         if fresh.public.get("truncated"):
-            raise DriverError("DRIVER.SNAPSHOT_TRUNCATED", "派发前重新抓取的快照已截断")
+            raise DriverError(
+                "DRIVER.SNAPSHOT_TRUNCATED",
+                f"{purpose} 前重新抓取的快照已截断",
+            )
         try:
             resolved = self._resolve(fresh, locator, deadline)
         except DriverError as exc:
@@ -1585,29 +2144,6 @@ class LinuxAtspiDriver:
                 ) from exc
             raise
         fresh_node_id = resolved["node_id"]
-        target_subtree_ids: set[str] = {fresh_node_id}
-        target_ancestor_ids: list[str] = [fresh_node_id]
-        if pointer_action:
-            queue = deque([fresh_node_id])
-            while queue:
-                parent_id = queue.popleft()
-                for candidate in fresh.public["nodes"]:
-                    if candidate.get("parent_id") != parent_id:
-                        continue
-                    child_id = candidate["node_id"]
-                    if child_id in target_subtree_ids:
-                        continue
-                    target_subtree_ids.add(child_id)
-                    queue.append(child_id)
-            parent_lookup = {
-                candidate["node_id"]: candidate.get("parent_id")
-                for candidate in fresh.public["nodes"]
-            }
-            current_ancestor = fresh_node_id
-            while parent_lookup.get(current_ancestor) is not None:
-                current_ancestor = parent_lookup[current_ancestor]
-                target_ancestor_ids.append(current_ancestor)
-            target_ancestor_ids.reverse()
         try:
             same = self.backend.same_element(
                 record.handles[node_id], fresh.handles[fresh_node_id], deadline=deadline
@@ -1638,6 +2174,265 @@ class LinuxAtspiDriver:
                     "current_snapshot_id": fresh.public["snapshot_id"],
                 },
             )
+        return _FreshTarget(record, fresh, node_id, fresh_node_id, resolved)
+
+    @staticmethod
+    def _untrusted_capture_subtree(
+        record: _SnapshotRecord, node_id: str
+    ) -> dict[str, Any] | None:
+        queue = deque([node_id])
+        while queue:
+            current = queue.popleft()
+            node = record.public["nodes"][int(current[1:])]
+            states = node.get("states")
+            provenance = node.get("provenance")
+            if (
+                not isinstance(states, Mapping)
+                or states.get("protected") is not False
+                or not isinstance(provenance, Mapping)
+                or provenance.get("value_redacted") is not False
+                or _is_protected_role(node.get("role"))
+            ):
+                return node
+            queue.extend(
+                candidate["node_id"]
+                for candidate in record.public["nodes"]
+                if candidate.get("parent_id") == current
+            )
+        return None
+
+    @staticmethod
+    def _rectangles_overlap(
+        left: Mapping[str, int], right: Mapping[str, int]
+    ) -> bool:
+        return (
+            left["x"] < right["x"] + right["width"]
+            and right["x"] < left["x"] + left["width"]
+            and left["y"] < right["y"] + right["height"]
+            and right["y"] < left["y"] + left["height"]
+        )
+
+    def _validate_accessible_capture_surface(
+        self, target: _FreshTarget, bounds: Mapping[str, int], deadline: float
+    ) -> None:
+        nodes = target.fresh.public["nodes"]
+        descendants: set[str] = {target.node_id}
+        queue = deque([target.node_id])
+        while queue:
+            parent_id = queue.popleft()
+            for candidate in nodes:
+                if candidate.get("parent_id") != parent_id:
+                    continue
+                child_id = candidate["node_id"]
+                if child_id not in descendants:
+                    descendants.add(child_id)
+                    queue.append(child_id)
+        parents = {candidate["node_id"]: candidate.get("parent_id") for candidate in nodes}
+        ancestors: list[str] = []
+        current = target.node_id
+        while current is not None:
+            ancestors.append(current)
+            current = parents.get(current)
+        center = _center_point(bounds)
+        hit = None
+        for node_id in reversed(ancestors):
+            hit = self.backend.accessible_at_point(
+                target.fresh.handles[node_id], center[0], center[1], deadline=deadline
+            )
+            if hit is not None:
+                break
+        if hit is None or not any(
+            self.backend.same_element(
+                hit, target.fresh.handles[node_id], deadline=deadline
+            )
+            for node_id in descendants
+        ):
+            raise DriverError(
+                "DRIVER.ACTION_UNSUPPORTED",
+                "capture_target 中心点未命中 fresh 目标子树",
+            )
+        safe_ids = descendants | set(ancestors)
+        for candidate in nodes:
+            if candidate["node_id"] in safe_ids:
+                continue
+            candidate_bounds = candidate.get("bounds")
+            if not isinstance(candidate_bounds, Mapping):
+                continue
+            try:
+                normalized = {
+                    name: int(candidate_bounds[name])
+                    for name in ("x", "y", "width", "height")
+                }
+            except (KeyError, TypeError, ValueError, OverflowError):
+                continue
+            if normalized["width"] <= 0 or normalized["height"] <= 0:
+                continue
+            states = candidate.get("states")
+            if (
+                self._rectangles_overlap(bounds, normalized)
+                and (not isinstance(states, Mapping)
+                     or states.get("visible") is not False)
+                and (not isinstance(states, Mapping)
+                     or states.get("showing") is not False)
+            ):
+                raise DriverError(
+                    "DRIVER.ACTION_UNSUPPORTED",
+                    "capture_target 区域与目标子树之外的可见节点相交",
+                    data={"overlapping_node_id": candidate["node_id"]},
+                )
+
+    def _capture_target(
+        self,
+        args: dict[str, Any],
+        invocation: WorkerArtifactInvocation,
+        deadline: float,
+    ) -> dict[str, Any]:
+        _only_keys(args, {"target", "locator", "format"}, "args")
+        if args.get("format") != "png":
+            _fail("DRIVER.INVALID_REQUEST", "capture_target.format 必须是 png")
+        target = self._fresh_target(args, deadline, purpose="capture_target")
+        resolved = target.node
+        states = resolved.get("states")
+        if not isinstance(states, Mapping) or not all(
+            states.get(name) is True for name in ("visible", "showing")
+        ):
+            raise DriverError(
+                "DRIVER.ACTION_UNSUPPORTED",
+                "capture_target 只支持 fresh snapshot 中可见且正在显示的目标",
+                data={"states": _json_safe(dict(states or {}))},
+            )
+        protected = self._untrusted_capture_subtree(target.fresh, target.node_id)
+        if protected is not None:
+            raise DriverError(
+                "DRIVER.PROTECTED_ELEMENT",
+                "目标或其后代无法明确证明为非受保护内容，禁止截图",
+                data={
+                    "target_node_id": target.node_id,
+                    "protected_node_id": protected.get("node_id"),
+                },
+            )
+        bounds = resolved.get("bounds")
+        if not isinstance(bounds, Mapping):
+            raise DriverError(
+                "DRIVER.ACTION_UNSUPPORTED", "capture_target 目标缺少 screen bounds"
+            )
+        try:
+            normalized_bounds = {
+                name: int(bounds[name]) for name in ("x", "y", "width", "height")
+            }
+        except (KeyError, TypeError, ValueError, OverflowError) as exc:
+            raise DriverError(
+                "DRIVER.ACTION_UNSUPPORTED", "capture_target 目标 bounds 无效"
+            ) from exc
+        if normalized_bounds["width"] <= 0 or normalized_bounds["height"] <= 0:
+            raise DriverError(
+                "DRIVER.ACTION_UNSUPPORTED",
+                "capture_target 只支持正面积目标",
+                data={"bounds": normalized_bounds},
+            )
+        provenance = resolved.get("provenance")
+        if not isinstance(provenance, Mapping):
+            provenance = {}
+        process_id = provenance.get("process_id")
+        application_process_id = target.fresh.public.get("application", {}).get(
+            "process_id"
+        )
+        if (
+            isinstance(process_id, bool)
+            or not isinstance(process_id, int)
+            or process_id <= 0
+            or application_process_id != process_id
+        ):
+            raise DriverError(
+                "DRIVER.STALE_SNAPSHOT",
+                "无法证明 capture_target 目标的应用进程归属",
+            )
+        if provenance.get("coordinate_space") != "screen":
+            raise DriverError(
+                "DRIVER.ACTION_UNSUPPORTED",
+                "capture_target 目标 bounds 不是 screen coordinate space",
+            )
+        self._validate_accessible_capture_surface(
+            target, normalized_bounds, deadline
+        )
+        _check_deadline(deadline)
+        captured = self.capture_helper.capture_target(
+            expected_process_id=process_id,
+            bounds=normalized_bounds,
+            deadline=deadline,
+        )
+        metadata = captured.metadata
+        output_provenance = {
+            "capture_method": metadata["capture_method"],
+            "snapshot_id": target.fresh.public["snapshot_id"],
+            "revision": target.fresh.public["revision"],
+            "node_id": target.node_id,
+            "application_process_id": process_id,
+            "format": metadata["format"],
+            "mime_type": metadata["mime_type"],
+            "target_process_id": metadata["target_pid"],
+            "target_window": metadata["target_window"],
+            "target_top_level_window": metadata["target_top_level_window"],
+            "root_window": metadata["root_window"],
+            "bounds": {
+                name: metadata[name] for name in ("x", "y", "width", "height")
+            },
+            "root_size": {
+                "width": metadata["root_width"],
+                "height": metadata["root_height"],
+            },
+            "cursor_included": metadata["cursor_included"],
+            "occlusion_checked": metadata["occlusion_checked"],
+            "same_euid_verified": metadata["same_euid_verified"],
+            "scene_stable": metadata["scene_stable"],
+        }
+        frame = invocation.write_output(
+            "frame", captured.png, media_type="image/png"
+        )
+        invocation.complete_ok()
+        return {"frame": frame, "provenance": output_provenance}
+
+    def _write(self, action: str, args: dict[str, Any], deadline: float) -> dict[str, Any]:
+        text_actions = {"set_text", "type_text"}
+        pointer_action = action == "pointer_click"
+        allowed = {"target", "locator"} | ({"text"} if action in text_actions else set())
+        pointer_button: str | None = None
+        pointer_position: str | None = None
+        if pointer_action:
+            allowed |= {"button", "position"}
+        _only_keys(args, allowed, "args")
+        if pointer_action:
+            pointer_button = _pointer_button(args.get("button"))
+            pointer_position = _pointer_position(args.get("position"))
+        fresh_target = self._fresh_target(args, deadline, purpose="写动作")
+        record = fresh_target.previous
+        fresh = fresh_target.fresh
+        node_id = fresh_target.previous_node_id
+        fresh_node_id = fresh_target.node_id
+        resolved = fresh_target.node
+        target_subtree_ids: set[str] = {fresh_node_id}
+        target_ancestor_ids: list[str] = [fresh_node_id]
+        if pointer_action:
+            queue = deque([fresh_node_id])
+            while queue:
+                parent_id = queue.popleft()
+                for candidate in fresh.public["nodes"]:
+                    if candidate.get("parent_id") != parent_id:
+                        continue
+                    child_id = candidate["node_id"]
+                    if child_id in target_subtree_ids:
+                        continue
+                    target_subtree_ids.add(child_id)
+                    queue.append(child_id)
+            parent_lookup = {
+                candidate["node_id"]: candidate.get("parent_id")
+                for candidate in fresh.public["nodes"]
+            }
+            current_ancestor = fresh_node_id
+            while parent_lookup.get(current_ancestor) is not None:
+                current_ancestor = parent_lookup[current_ancestor]
+                target_ancestor_ids.append(current_ancestor)
+            target_ancestor_ids.reverse()
         text: str | None = None
         expected_process_id: int | None = None
         click_point: tuple[int, int] | None = None
@@ -3625,6 +4420,7 @@ def emit_error(request_id: Any, error: DriverError) -> None:
 
 def handle_request(request: Any, driver: LinuxAtspiDriver) -> None:
     request_id: Any = request.get("id") if isinstance(request, dict) else None
+    invocation: WorkerArtifactInvocation | None = None
     try:
         if not isinstance(request, dict):
             raise DriverError("PROTOCOL.INVALID_REQUEST", "请求必须是 JSON 对象")
@@ -3642,12 +4438,47 @@ def handle_request(request: Any, driver: LinuxAtspiDriver) -> None:
                 data={"action": action_id, "available_actions": list(ACTION_NAMES)},
             )
         deadline = _wire_deadline(request.get("deadline_ms"))
-        result = driver.execute(ACTION_NAMES[action_id], request.get("args"), deadline=deadline)
+        action = ACTION_NAMES[action_id]
+        if action == "capture_target":
+            try:
+                invocation = WorkerArtifactInvocation.from_request(
+                    request,
+                    input_slots=(),
+                    output_slots=("frame",),
+                    expected_action=ACTION_IDS["capture_target"],
+                )
+                invocation.finish_inputs()
+                values = (
+                    {}
+                    if request.get("args") is None
+                    else _object(request.get("args"), "args")
+                )
+                result = driver._capture_target(values, invocation, deadline)
+            except ArtifactIPCError as exc:
+                raise DriverError(
+                    "DRIVER.ARTIFACT_IPC",
+                    "截图 artifact 传输失败",
+                    data={"stage": exc.code},
+                ) from exc
+        else:
+            result = driver.execute(action, request.get("args"), deadline=deadline)
         emit({"id": request_id, "result": result})
     except DriverError as exc:
+        if invocation is not None and not invocation.completed:
+            try:
+                invocation.complete_error(exc.code, exc.message)
+            except ArtifactIPCError:
+                pass
         debug(f"request failed code={exc.code}")
         emit_error(request_id, exc)
     except Exception as exc:
+        if invocation is not None and not invocation.completed:
+            try:
+                invocation.complete_error(
+                    "DRIVER.ACTION_FAILED", "Linux AT-SPI 驱动遇到内部错误"
+                )
+            except ArtifactIPCError:
+                pass
         debug(f"internal error type={type(exc).__name__}")
         emit_error(
             request_id,
@@ -3657,6 +4488,9 @@ def handle_request(request: Any, driver: LinuxAtspiDriver) -> None:
                 data={"exception_type": type(exc).__name__},
             ),
         )
+    finally:
+        if invocation is not None:
+            invocation.close()
 
 
 def _discard_until_newline(stream: Any) -> None:

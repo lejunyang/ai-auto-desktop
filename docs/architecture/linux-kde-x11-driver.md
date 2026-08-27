@@ -7,13 +7,14 @@
 ## 契约与支持边界
 
 该能力提供方名为 `desktop.linux_atspi`，提供以下 v1 动作：
-`list_applications`、`snapshot`、`find`、`focus`、`invoke`、显式
+`list_applications`、`snapshot`、`find`、显式 `capture_target`、`focus`、`invoke`、显式
 `pointer_click`、`set_text`、显式 `type_text`、`toggle`、`expand` 和 `collapse`。
 工作流中的 `uses` 由能力名、动作键和契约主版本号组成，例如
 `desktop.linux_atspi.snapshot@1`。能力清单的 `runtime.platforms` 为 `linux`，
 进程入口为 `./run.sh`。
 
-`list_applications`、`snapshot` 和 `find` 只要求 `desktop.observe`；
+`list_applications`、`snapshot` 和 `find` 只要求 `desktop.observe`；`capture_target`
+同时要求 `desktop.observe` 与独立的 `desktop.capture`；
 全部八种写动作同时要求 `desktop.observe` 与 `desktop.input`。只有调用方明确选择
 `pointer_click` 或 `type_text` 时，`desktop.input` 才授权本切片的受限 XTest 注入。
 
@@ -37,6 +38,21 @@
 helper 不调用 `xdotool`、shell、`uinput` 或剪贴板，驱动不做 OCR。
 AT-SPI 未暴露节点、bounds 或动作时，结果会明确失败。
 登录管理器、锁屏、其他用户会话和提权界面不在当前支持范围内。
+
+## 受控目标截图
+
+`capture_target@1` 只接受先前 `find` 返回的 target、同一 exact locator 与 `format=png`。
+它复用写动作的 fresh 重解析、原生 identity 与语义 fingerprint 校验，并要求 fresh 快照未截断、
+应用与节点 PID 一致、目标及已枚举后代的 protected/value-redacted 都明确为 false、screen bounds
+为正面积。调用方不能传全屏、任意 region、padding 或裸坐标。
+
+固定路径 X11 helper 在当前 euid 内再次核对 PID 与窗口层级，要求 region 完整落在 root 和唯一
+目标顶层窗口内，并拒绝更高顶层窗口相交。它在短暂 server grab 内复核场景、从 root
+`XGetImage` 读取当前可见像素，随后释放 grab 再编码 PNG；鼠标指针不进入 XGetImage。PNG 经
+Host artifact side channel 返回，不进入 NDJSON，也不暴露本机路径。provenance 记录 fresh
+snapshot/node、应用 PID、目标/顶层/root 窗口、bounds/root size、遮挡检查、same-EUID 与场景稳定性。
+截图是 read-only 但输出敏感，且 run-scoped ArtifactRef 不能进入 durable checkpoint。该动作不会
+执行 OCR；OCR 只能由 descriptor 显式安排为下一步，任何语义失败也不会自动截图。
 
 ## 会话和后端报告
 

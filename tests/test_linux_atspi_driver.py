@@ -47,6 +47,7 @@ def node(
     selectable: bool | None = None,
     selected: bool | None = None,
     attributes: dict[str, str] | None = None,
+    bounds: dict[str, int] | None = None,
 ) -> object:
     return atspi.BackendNode(
         native=key,
@@ -71,7 +72,7 @@ def node(
             "selectable": selectable,
             "selected": selected,
         },
-        bounds={"x": 10, "y": 20, "width": 120, "height": 30},
+        bounds=bounds or {"x": 10, "y": 20, "width": 120, "height": 30},
         actions=actions,
         provenance={
             "bus_name": ":1.42",
@@ -106,6 +107,7 @@ def default_tree() -> list[object]:
             value="Draft",
             actions=("focus", "set_text", "type_text"),
             attributes={"class": "QLineEdit", "id": "title"},
+            bounds={"x": 10, "y": 60, "width": 120, "height": 30},
         ),
         node(
             "autosave",
@@ -115,6 +117,7 @@ def default_tree() -> list[object]:
             actions=("toggle",),
             checked=False,
             attributes={"class": "GtkCheckButton", "id": "autosave"},
+            bounds={"x": 10, "y": 100, "width": 120, "height": 30},
         ),
         node(
             "details",
@@ -125,6 +128,7 @@ def default_tree() -> list[object]:
             expandable=True,
             expanded=False,
             attributes={"class": "GtkExpander", "id": "details"},
+            bounds={"x": 10, "y": 140, "width": 120, "height": 30},
         ),
     ]
 
@@ -264,6 +268,60 @@ class FakeXTestHelper:
         }
 
 
+def fake_png(width: int = 120, height: int = 30) -> bytes:
+    return atspi.PNG_SIGNATURE + b"\x00\x00\x00\x0dIHDR" + width.to_bytes(
+        4, "big"
+    ) + height.to_bytes(4, "big")
+
+
+class FakeCaptureHelper:
+    def __init__(self) -> None:
+        self.calls: list[tuple[object, ...]] = []
+
+    def capture_target(
+        self, *, expected_process_id: int, bounds: object, deadline: float
+    ) -> object:
+        normalized = dict(bounds)
+        self.calls.append(("capture_target", expected_process_id, normalized))
+        png = fake_png(normalized["width"], normalized["height"])
+        return atspi.CaptureResult(
+            png,
+            {
+                "ok": True,
+                "schema_version": 1,
+                "capture_method": "x11_root_xgetimage",
+                "format": "png",
+                "mime_type": "image/png",
+                "expected_pid": expected_process_id,
+                "target_pid": expected_process_id,
+                "target_window": 41,
+                "target_top_level_window": 40,
+                "root_window": 1,
+                **normalized,
+                "root_width": 1920,
+                "root_height": 1080,
+                "png_bytes": len(png),
+                "cursor_included": False,
+                "occlusion_checked": True,
+                "same_euid_verified": True,
+                "scene_stable": True,
+            },
+        )
+
+
+class FakeArtifactInvocation:
+    def __init__(self) -> None:
+        self.completed = False
+        self.outputs: list[tuple[str, bytes, str]] = []
+
+    def write_output(self, slot: str, data: bytes, *, media_type: str) -> object:
+        self.outputs.append((slot, data, media_type))
+        return {"$hostArtifact": {"request_id": "req", "slot": slot, "token": "t" * 32}}
+
+    def complete_ok(self) -> None:
+        self.completed = True
+
+
 class IdentityFailureBackend(FakeBackend):
     def same_element(
         self, previous: object, current: object, *, deadline: float
@@ -305,6 +363,286 @@ class LinuxAtspiDriverCoreTests(unittest.TestCase):
             },
             deadline=deadline(),
         )
+
+    def capture(
+        self,
+        driver: object | None = None,
+        *,
+        locator: dict[str, object] | None = None,
+        target: dict[str, object] | None = None,
+    ) -> tuple[object, FakeCaptureHelper, FakeArtifactInvocation]:
+        helper = FakeCaptureHelper()
+        selected = driver or atspi.LinuxAtspiDriver(
+            self.backend, capture_helper=helper
+        )
+        if target is None:
+            snapshot = selected.execute(
+                "snapshot", {"application": {"bus_name": ":1.42"}}, deadline=deadline()
+            )
+            found = selected.execute(
+                "find",
+                {
+                    "snapshot_id": snapshot["snapshot_id"],
+                    "revision": snapshot["revision"],
+                    "locator": locator or {"attributes": {"id": "save"}},
+                },
+                deadline=deadline(),
+            )
+            target = found["target"]
+        invocation = FakeArtifactInvocation()
+        result = selected._capture_target(
+            {
+                "target": target,
+                "locator": locator or {"attributes": {"id": "save"}},
+                "format": "png",
+            },
+            invocation,
+            deadline(),
+        )
+        return result, helper, invocation
+
+    def test_capture_target_revalidates_and_publishes_only_artifact_placeholder(self) -> None:
+        helper = FakeCaptureHelper()
+        driver = atspi.LinuxAtspiDriver(self.backend, capture_helper=helper)
+        snapshot = driver.execute(
+            "snapshot", {"application": {"bus_name": ":1.42"}}, deadline=deadline()
+        )
+        found = driver.execute(
+            "find",
+            {
+                "snapshot_id": snapshot["snapshot_id"],
+                "revision": snapshot["revision"],
+                "locator": {"attributes": {"id": "save"}},
+            },
+            deadline=deadline(),
+        )
+        invocation = FakeArtifactInvocation()
+        result = driver._capture_target(
+            {
+                "target": found["target"],
+                "locator": {"attributes": {"id": "save"}},
+                "format": "png",
+            },
+            invocation,
+            deadline(),
+        )
+
+        self.assertEqual(helper.calls, [("capture_target", 7, {"x": 10, "y": 20, "width": 120, "height": 30})])
+        self.assertEqual(invocation.outputs, [("frame", fake_png(), "image/png")])
+        self.assertTrue(invocation.completed)
+        self.assertEqual(set(result), {"frame", "provenance"})
+        self.assertEqual(result["frame"]["$hostArtifact"]["slot"], "frame")
+        self.assertNotIn("png", result)
+        self.assertEqual(result["provenance"]["application_process_id"], 7)
+        self.assertEqual(result["provenance"]["bounds"], {"x": 10, "y": 20, "width": 120, "height": 30})
+        self.assertTrue(result["provenance"]["occlusion_checked"])
+        self.assertTrue(result["provenance"]["same_euid_verified"])
+        self.assertTrue(result["provenance"]["scene_stable"])
+        self.assertIn(("same_element", "save", "save"), self.backend.calls)
+
+    def test_capture_target_rejects_invalid_shape_before_helper(self) -> None:
+        helper = FakeCaptureHelper()
+        driver = atspi.LinuxAtspiDriver(self.backend, capture_helper=helper)
+        for args in (
+            {"locator": {"name": "Save"}, "format": "png"},
+            {"target": {}, "locator": {"name": "Save"}},
+            {"target": {}, "locator": {"name": "Save"}, "format": "jpeg"},
+            {"target": {}, "locator": {"name": "Save"}, "format": "png", "region": {}},
+            {"target": {}, "locator": {"name": "Save"}, "format": "png", "x": 1},
+        ):
+            with self.subTest(args=args), self.assertRaises(atspi.DriverError) as raised:
+                driver._capture_target(args, FakeArtifactInvocation(), deadline())
+            self.assertEqual(raised.exception.code, "DRIVER.INVALID_REQUEST")
+        self.assertEqual(helper.calls, [])
+
+    def test_capture_target_fails_closed_for_protected_descendant(self) -> None:
+        tree = default_tree()
+        tree.append(
+            node(
+                "secret",
+                2,
+                "password_text",
+                "Password",
+                protected=True,
+                attributes={"id": "secret"},
+            )
+        )
+        backend = FakeBackend([tree])
+        helper = FakeCaptureHelper()
+        driver = atspi.LinuxAtspiDriver(backend, capture_helper=helper)
+        snapshot = driver.execute(
+            "snapshot", {"application": {"name": "Editor"}}, deadline=deadline()
+        )
+        found = driver.execute(
+            "find",
+            {
+                "snapshot_id": snapshot["snapshot_id"],
+                "revision": snapshot["revision"],
+                "locator": {"attributes": {"id": "save"}},
+            },
+            deadline=deadline(),
+        )
+        with self.assertRaises(atspi.DriverError) as raised:
+            driver._capture_target(
+                {"target": found["target"], "locator": {"attributes": {"id": "save"}}, "format": "png"},
+                FakeArtifactInvocation(),
+                deadline(),
+            )
+        self.assertEqual(raised.exception.code, "DRIVER.PROTECTED_ELEMENT")
+        self.assertEqual(raised.exception.data["protected_node_id"], "n6")
+        self.assertEqual(helper.calls, [])
+
+    def test_capture_target_fails_closed_for_unknown_protected_descendant(self) -> None:
+        tree = default_tree()
+        tree.append(
+            node(
+                "unknown", 2, "text", "Unknown",
+                attributes={"id": "unknown"},
+            )
+        )
+        tree[-1].states = {**tree[-1].states, "protected": None}
+        tree[-1].provenance = {
+            **tree[-1].provenance, "value_redacted": None
+        }
+        backend = FakeBackend([tree])
+        helper = FakeCaptureHelper()
+        driver = atspi.LinuxAtspiDriver(backend, capture_helper=helper)
+        snapshot = driver.execute(
+            "snapshot", {"application": {"name": "Editor"}}, deadline=deadline()
+        )
+        found = driver.execute(
+            "find",
+            {
+                "snapshot_id": snapshot["snapshot_id"],
+                "revision": snapshot["revision"],
+                "locator": {"attributes": {"id": "save"}},
+            },
+            deadline=deadline(),
+        )
+        with self.assertRaises(atspi.DriverError) as raised:
+            driver._capture_target(
+                {
+                    "target": found["target"],
+                    "locator": {"attributes": {"id": "save"}},
+                    "format": "png",
+                },
+                FakeArtifactInvocation(),
+                deadline(),
+            )
+        self.assertEqual(raised.exception.code, "DRIVER.PROTECTED_ELEMENT")
+        self.assertEqual(helper.calls, [])
+
+    def test_capture_target_rejects_unshown_bad_bounds_and_pid_mismatch(self) -> None:
+        cases: list[tuple[str, list[object], str]] = []
+        for label, mutation, code in (
+            ("not_showing", {"states": {"showing": False}}, "DRIVER.ACTION_UNSUPPORTED"),
+            ("zero_bounds", {"bounds": {"x": 10, "y": 20, "width": 0, "height": 30}}, "DRIVER.ACTION_UNSUPPORTED"),
+            ("pid_mismatch", {"process_id": 8}, "DRIVER.STALE_SNAPSHOT"),
+        ):
+            tree = default_tree()
+            original = tree[2]
+            if "states" in mutation:
+                original.states = {**original.states, **mutation["states"]}
+            elif "bounds" in mutation:
+                original.bounds = mutation["bounds"]
+            else:
+                original.provenance = {**original.provenance, "process_id": mutation["process_id"]}
+            cases.append((label, tree, code))
+        for label, tree, code in cases:
+            with self.subTest(label=label):
+                backend = FakeBackend([tree])
+                helper = FakeCaptureHelper()
+                driver = atspi.LinuxAtspiDriver(backend, capture_helper=helper)
+                snapshot = driver.execute(
+                    "snapshot", {"application": {"name": "Editor"}}, deadline=deadline()
+                )
+                found = driver.execute(
+                    "find",
+                    {"snapshot_id": snapshot["snapshot_id"], "revision": snapshot["revision"], "locator": {"attributes": {"id": "save"}}},
+                    deadline=deadline(),
+                )
+                with self.assertRaises(atspi.DriverError) as raised:
+                    driver._capture_target(
+                        {"target": found["target"], "locator": {"attributes": {"id": "save"}}, "format": "png"},
+                        FakeArtifactInvocation(),
+                        deadline(),
+                    )
+                self.assertEqual(raised.exception.code, code)
+                self.assertEqual(helper.calls, [])
+
+    def test_capture_target_rejects_visible_sibling_overlay(self) -> None:
+        tree = default_tree()
+        tree.append(
+            node(
+                "overlay", 1, "panel", "Overlay",
+                attributes={"id": "overlay"},
+                bounds={"x": 20, "y": 25, "width": 30, "height": 20},
+            )
+        )
+        backend = FakeBackend([tree])
+        helper = FakeCaptureHelper()
+        driver = atspi.LinuxAtspiDriver(backend, capture_helper=helper)
+        snapshot = driver.execute(
+            "snapshot", {"application": {"name": "Editor"}}, deadline=deadline()
+        )
+        found = driver.execute(
+            "find",
+            {
+                "snapshot_id": snapshot["snapshot_id"],
+                "revision": snapshot["revision"],
+                "locator": {"attributes": {"id": "save"}},
+            },
+            deadline=deadline(),
+        )
+        with self.assertRaises(atspi.DriverError) as raised:
+            driver._capture_target(
+                {
+                    "target": found["target"],
+                    "locator": {"attributes": {"id": "save"}},
+                    "format": "png",
+                },
+                FakeArtifactInvocation(),
+                deadline(),
+            )
+        self.assertEqual(raised.exception.code, "DRIVER.ACTION_UNSUPPORTED")
+        self.assertEqual(raised.exception.data["overlapping_node_id"], "n6")
+        self.assertEqual(helper.calls, [])
+
+    def test_capture_target_rejects_truncated_stale_and_fresh_ambiguity(self) -> None:
+        truncated_backend = FakeBackend()
+        truncated_backend.truncated = True
+        driver = atspi.LinuxAtspiDriver(
+            truncated_backend, capture_helper=FakeCaptureHelper()
+        )
+        snapshot = driver.execute(
+            "snapshot", {"application": {"name": "Editor"}}, deadline=deadline()
+        )
+        target = {"snapshot_id": snapshot["snapshot_id"], "revision": snapshot["revision"], "node_id": "n2"}
+        with self.assertRaises(atspi.DriverError) as truncated:
+            driver._capture_target(
+                {"target": target, "locator": {"name": "Save"}, "format": "png"},
+                FakeArtifactInvocation(), deadline(),
+            )
+        self.assertEqual(truncated.exception.code, "DRIVER.SNAPSHOT_TRUNCATED")
+
+        initial = default_tree()
+        ambiguous = default_tree()
+        ambiguous.append(node("save2", 1, "push_button", "Save"))
+        backend = FakeBackend([initial, ambiguous])
+        driver = atspi.LinuxAtspiDriver(backend, capture_helper=FakeCaptureHelper())
+        snapshot = driver.execute(
+            "snapshot", {"application": {"name": "Editor"}}, deadline=deadline()
+        )
+        found = driver.execute(
+            "find", {"snapshot_id": snapshot["snapshot_id"], "revision": snapshot["revision"], "locator": {"name": "Save"}}, deadline=deadline()
+        )
+        with self.assertRaises(atspi.DriverError) as stale:
+            driver._capture_target(
+                {"target": found["target"], "locator": {"name": "Save"}, "format": "png"},
+                FakeArtifactInvocation(), deadline(),
+            )
+        self.assertEqual(stale.exception.code, "DRIVER.STALE_SNAPSHOT")
+        self.assertEqual(stale.exception.data["reason"], "DRIVER.AMBIGUOUS")
 
     def test_list_applications_and_snapshot_report_session_and_backend(self) -> None:
         session = self.driver.execute("inspect_session", {}, deadline=deadline())
@@ -2028,6 +2366,131 @@ class LinuxAtspiProcessTests(unittest.TestCase):
         self.assertEqual(process.assert_input, b"secret-free text")
         self.assertNotIn("shell", popen.call_args.kwargs)
 
+    def test_capture_helper_validates_frozen_metadata_and_png(self) -> None:
+        png = fake_png()
+        metadata = {
+            "ok": True,
+            "schema_version": 1,
+            "capture_method": "x11_root_xgetimage",
+            "format": "png",
+            "mime_type": "image/png",
+            "expected_pid": 7,
+            "target_pid": 7,
+            "target_window": 41,
+            "target_top_level_window": 40,
+            "root_window": 1,
+            "x": 10,
+            "y": 20,
+            "width": 120,
+            "height": 30,
+            "root_width": 1920,
+            "root_height": 1080,
+            "png_bytes": len(png),
+            "cursor_included": False,
+            "occlusion_checked": True,
+            "same_euid_verified": True,
+            "scene_stable": True,
+        }
+
+        helper = atspi.X11CaptureHelper(Path("/fixed/x11_capture_helper"))
+        with (
+            mock.patch.object(helper, "_qualified_environment", return_value={"DISPLAY": ":99"}),
+            mock.patch.object(helper, "_open_validated_executable", return_value=99),
+            mock.patch.object(atspi.os, "close"),
+            mock.patch.object(atspi.subprocess, "Popen") as popen,
+            mock.patch.object(
+                helper, "_communicate_bounded",
+                return_value=(png, json.dumps(metadata).encode() + b"\n"),
+            ),
+        ):
+            popen.return_value.returncode = 0
+            result = helper.capture_target(
+                expected_process_id=7,
+                bounds={"x": 10, "y": 20, "width": 120, "height": 30},
+                deadline=deadline(),
+            )
+        self.assertEqual(result.png, png)
+        self.assertEqual(result.metadata, metadata)
+        command = popen.call_args.args[0]
+        self.assertEqual(command[0], "/proc/self/fd/99")
+        self.assertEqual(command[1], "capture-target")
+        self.assertIn("--expected-pid", command)
+        self.assertNotIn("shell", popen.call_args.kwargs)
+        self.assertEqual(popen.call_args.kwargs["pass_fds"], (99,))
+
+        invalid = dict(metadata, occlusion_checked=False)
+        with self.assertRaises(atspi.DriverError) as raised:
+            helper._validate_success(
+                invalid,
+                expected_process_id=7,
+                bounds={"x": 10, "y": 20, "width": 120, "height": 30},
+            )
+        self.assertEqual(raised.exception.code, "DRIVER.CAPTURE_FAILED")
+
+    def test_capture_helper_bounded_reader_kills_oversized_stdout(self) -> None:
+        class Stream:
+            def __init__(self, descriptor: int) -> None:
+                self._descriptor = descriptor
+
+            def fileno(self) -> int:
+                return self._descriptor
+
+            def close(self) -> None:
+                try:
+                    os.close(self._descriptor)
+                except OSError:
+                    pass
+
+        read_out, write_out = os.pipe()
+        read_err, write_err = os.pipe()
+        os.write(write_out, b"x" * 9)
+        os.close(write_out)
+        os.close(write_err)
+
+        class Process:
+            returncode = 0
+
+            def __init__(self) -> None:
+                self.stdout = Stream(read_out)
+                self.stderr = Stream(read_err)
+                self.killed = False
+
+            def kill(self) -> None:
+                self.killed = True
+
+            def wait(self, timeout: float | None = None) -> int:
+                return 0
+
+        process = Process()
+        with mock.patch.object(atspi, "CAPTURE_MAX_BYTES", 8), self.assertRaises(
+            atspi.DriverError
+        ) as raised:
+            atspi.X11CaptureHelper._communicate_bounded(
+                process, time.monotonic() + 2
+            )
+        self.assertEqual(raised.exception.code, "DRIVER.CAPTURE_FAILED")
+        self.assertTrue(process.killed)
+
+    def test_capture_helper_executes_the_verified_descriptor(self) -> None:
+        helper = atspi.X11CaptureHelper(Path("/fixed/x11_capture_helper"))
+        with (
+            mock.patch.object(helper, "_qualified_environment", return_value={"DISPLAY": ":99"}),
+            mock.patch.object(helper, "_open_validated_executable", return_value=77),
+            mock.patch.object(atspi.os, "close") as close_fd,
+            mock.patch.object(atspi.subprocess, "Popen", side_effect=OSError("stop")) as popen,
+        ):
+            with self.assertRaises(atspi.DriverError) as raised:
+                helper.capture_target(
+                    expected_process_id=7,
+                    bounds={"x": 10, "y": 20, "width": 120, "height": 30},
+                    deadline=deadline(),
+                )
+        self.assertEqual(raised.exception.code, "DRIVER.UNAVAILABLE")
+        command = popen.call_args.args[0]
+        self.assertEqual(command[0], "/proc/self/fd/77")
+        self.assertEqual(popen.call_args.kwargs["pass_fds"], (77,))
+        close_fd.assert_called_once_with(77)
+
     def test_xtest_helper_success_reports_submitted_not_accepted(self) -> None:
         class SuccessfulProcess:
             returncode = 0
@@ -2100,6 +2563,7 @@ class LinuxAtspiProcessTests(unittest.TestCase):
                 "list_applications",
                 "snapshot",
                 "find",
+                "capture_target",
                 "focus",
                 "invoke",
                 "pointer_click",
@@ -2115,6 +2579,18 @@ class LinuxAtspiProcessTests(unittest.TestCase):
                 manifest["actions"][name]["permissions"],
                 ["desktop.observe"],
             )
+        capture = manifest["actions"]["capture_target"]
+        self.assertEqual(capture["effect"]["default_class"], "read_only")
+        self.assertEqual(capture["risk"], {"category": "observe", "level": "medium"})
+        self.assertEqual(capture["permissions"], ["desktop.observe", "desktop.capture"])
+        self.assertEqual(capture["sensitivity"]["output"], "sensitive")
+        self.assertEqual(capture["input_schema"]["required"], ["target", "locator", "format"])
+        self.assertFalse(capture["input_schema"]["additionalProperties"])
+        self.assertEqual(capture["input_schema"]["properties"]["format"], {"const": "png"})
+        self.assertEqual(
+            capture["artifacts"],
+            {"outputs": {"frame": {"pointer": "/frame", "media_types": ["image/png"], "max_size_bytes": 64 * 1024 * 1024}}},
+        )
         durable = manifest["actions"]["inspect_session"]
         self.assertEqual(
             durable["sensitivity"],
