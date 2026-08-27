@@ -27,13 +27,17 @@ import sys
 import tempfile
 import threading
 import time
-from typing import Any, NoReturn
+from typing import TYPE_CHECKING, Any, NoReturn
 import warnings
+
+if TYPE_CHECKING:
+    from ai_auto_desktop.artifact_ipc import ArtifactPayload
 
 
 PLUGIN_NAME = "vision.ocr"
-PLUGIN_VERSION = "0.1.0"
+PLUGIN_VERSION = "0.1.1"
 ACTION_ID = "vision.ocr.recognize@1"
+ARTIFACT_ACTION_ID = "vision.ocr.recognize_artifact@1"
 MAX_IMAGE_BYTES = 64 * 1024 * 1024
 MAX_IMAGE_WIDTH = 20_000
 MAX_IMAGE_HEIGHT = 20_000
@@ -75,6 +79,15 @@ ENGINE_THREAD_ENVIRONMENT = {
     "OMP_THREAD_LIMIT": "1",
 }
 ALLOW_UNSANDBOXED_ENGINE_ENV = "OCR_ALLOW_UNSANDBOXED_ENGINE"
+SUPPORTED_IMAGE_MEDIA_TYPES = [
+    "image/png",
+    "image/jpeg",
+    "image/gif",
+    "image/tiff",
+    "image/bmp",
+    "image/webp",
+    "image/x-portable-anymap",
+]
 
 BOUNDS_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -131,15 +144,7 @@ SOURCE_SCHEMA: dict[str, Any] = {
             "description": "SHA-256 digest of the private image snapshot.",
         },
         "media_type": {
-            "enum": [
-                "image/png",
-                "image/jpeg",
-                "image/gif",
-                "image/tiff",
-                "image/bmp",
-                "image/webp",
-                "image/x-portable-anymap",
-            ],
+            "enum": SUPPORTED_IMAGE_MEDIA_TYPES,
             "description": "Media type detected from the image bytes.",
         },
         "size_bytes": {
@@ -147,6 +152,49 @@ SOURCE_SCHEMA: dict[str, Any] = {
             "minimum": 1,
             "maximum": MAX_IMAGE_BYTES,
             "description": "Byte length of the private image snapshot.",
+        },
+    },
+    "additionalProperties": False,
+}
+
+ARTIFACT_SOURCE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "description": (
+        "Location-free provenance for the Host-mediated artifact snapshot."
+    ),
+    "required": ["kind", "digest", "media_type", "size_bytes"],
+    "properties": {
+        "kind": {"const": "artifact"},
+        "digest": SOURCE_SCHEMA["properties"]["digest"],
+        "media_type": SOURCE_SCHEMA["properties"]["media_type"],
+        "size_bytes": SOURCE_SCHEMA["properties"]["size_bytes"],
+    },
+    "additionalProperties": False,
+}
+
+ARTIFACT_REF_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "required": [
+        "apiVersion",
+        "kind",
+        "artifactId",
+        "digest",
+        "mediaType",
+        "sizeBytes",
+    ],
+    "properties": {
+        "apiVersion": {"const": "ai-auto-desktop.dev/v1alpha1"},
+        "kind": {"const": "ArtifactRef"},
+        "artifactId": {
+            "type": "string",
+            "pattern": "^art_[A-Za-z0-9_-]{32}$",
+        },
+        "digest": SOURCE_SCHEMA["properties"]["digest"],
+        "mediaType": {"enum": SUPPORTED_IMAGE_MEDIA_TYPES},
+        "sizeBytes": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": MAX_IMAGE_BYTES,
         },
     },
     "additionalProperties": False,
@@ -242,6 +290,7 @@ ACTION_CONTRACT: dict[str, Any] = {
     ),
     "effect": {"default_class": "read_only"},
     "risk": {"category": "observe", "level": "low"},
+    "permissions": ["filesystem.read"],
     "input_schema": {
         "type": "object",
         "properties": {
@@ -366,6 +415,60 @@ ACTION_CONTRACT: dict[str, Any] = {
     ],
 }
 
+ARTIFACT_ACTION_CONTRACT: dict[str, Any] = {
+    "contract_major": 1,
+    "description": (
+        "Recognize text in an explicit Host-managed image artifact with "
+        "Tesseract. The worker receives verified bytes, never a Host path."
+    ),
+    "effect": {"default_class": "read_only"},
+    "risk": {"category": "observe", "level": "low"},
+    "input_schema": {
+        "type": "object",
+        "required": ["artifact"],
+        "properties": {
+            "artifact": ARTIFACT_REF_SCHEMA,
+            "region": BOUNDS_SCHEMA,
+            "languages": ACTION_CONTRACT["input_schema"]["properties"][
+                "languages"
+            ],
+            "minimum_confidence": ACTION_CONTRACT["input_schema"][
+                "properties"
+            ]["minimum_confidence"],
+            "patterns": ACTION_CONTRACT["input_schema"]["properties"][
+                "patterns"
+            ],
+        },
+        "additionalProperties": False,
+    },
+    "output_schema": {
+        **ACTION_CONTRACT["output_schema"],
+        "properties": {
+            **ACTION_CONTRACT["output_schema"]["properties"],
+            "source": ARTIFACT_SOURCE_SCHEMA,
+        },
+    },
+    "artifacts": {
+        "inputs": {
+            "source": {
+                "pointer": "/artifact",
+                "media_types": SUPPORTED_IMAGE_MEDIA_TYPES,
+                "max_size_bytes": MAX_IMAGE_BYTES,
+            }
+        }
+    },
+    "errors": [
+        *ACTION_CONTRACT["errors"],
+        {
+            "code": "OCR.ARTIFACT_IPC",
+            "description": "The Host-mediated artifact transfer failed.",
+            "retryable": False,
+            "effect": "not_applied",
+            "data_schema": {"type": "object"},
+        },
+    ],
+}
+
 MANIFEST: dict[str, Any] = {
     "apiVersion": "ai-auto-desktop.dev/v1alpha1",
     "kind": "CapabilityManifest",
@@ -374,8 +477,10 @@ MANIFEST: dict[str, Any] = {
         "version": PLUGIN_VERSION,
         "description": "Optional process-isolated Tesseract OCR provider.",
     },
-    "permissions": ["filesystem.read"],
-    "actions": {"recognize": ACTION_CONTRACT},
+    "actions": {
+        "recognize": ACTION_CONTRACT,
+        "recognize_artifact": ARTIFACT_ACTION_CONTRACT,
+    },
     "runtime": {
         "kind": "process",
         "protocol": "ndjson-stdio-v1",
@@ -826,6 +931,64 @@ def _inspect_source(
         "digest": f"sha256:{digest.hexdigest()}",
         "media_type": detected,
         "size_bytes": copied,
+    }, (width, height)
+
+
+def _inspect_artifact_source(
+    payload: ArtifactPayload, deadline: float, directory: Path
+) -> tuple[Path, dict[str, Any], tuple[int, int]]:
+    """Snapshot verified side-channel bytes without accepting a Host path."""
+
+    _remaining(deadline)
+    if payload.size_bytes <= 0 or payload.size_bytes > MAX_IMAGE_BYTES:
+        raise RequestError(
+            "OCR.IMAGE_UNAVAILABLE",
+            f"source image must be between 1 and {MAX_IMAGE_BYTES} bytes",
+            data={"size_bytes": payload.size_bytes},
+        )
+    if len(payload.data) != payload.size_bytes:
+        raise RequestError(
+            "OCR.ARTIFACT_IPC",
+            "artifact source metadata did not match the received bytes",
+        )
+    actual_digest = "sha256:" + hashlib.sha256(payload.data).hexdigest()
+    if actual_digest != payload.digest:
+        raise RequestError(
+            "OCR.ARTIFACT_IPC",
+            "artifact source digest verification failed",
+        )
+    header = payload.data[:4096]
+    tail = payload.data[-16:]
+    detected = _media_type(header, tail, payload.size_bytes)
+    if detected is None:
+        raise RequestError(
+            "OCR.IMAGE_UNSUPPORTED",
+            "source file does not have a supported image signature",
+        )
+    if detected != payload.media_type:
+        raise RequestError(
+            "OCR.IMAGE_UNSUPPORTED",
+            "artifact media type does not match the image content",
+            data={"declared": payload.media_type, "detected": detected},
+        )
+    dimensions = _header_dimensions(detected, header)
+    if dimensions is not None:
+        _check_image_limits(*dimensions, phase="file_header")
+    snapshot = directory / "source.img"
+    try:
+        snapshot.write_bytes(payload.data)
+    except OSError as exc:
+        raise RequestError(
+            "OCR.IMAGE_UNAVAILABLE",
+            "artifact source could not be snapshotted",
+            data={"reason": type(exc).__name__},
+        ) from exc
+    width, height = _validate_decoded_image(snapshot, detected, deadline)
+    return snapshot, {
+        "kind": "artifact",
+        "digest": payload.digest,
+        "media_type": detected,
+        "size_bytes": payload.size_bytes,
     }, (width, height)
 
 
@@ -1480,17 +1643,38 @@ def _matches(
     return result
 
 
-def recognize(args: Any, deadline_ms: Any) -> dict[str, Any]:
+def recognize(
+    args: Any,
+    deadline_ms: Any,
+    *,
+    artifact_payload: ArtifactPayload | None = None,
+) -> dict[str, Any]:
     deadline = _request_deadline(deadline_ms)
     if not isinstance(args, dict):
         _invalid("args must be an object")
-    allowed = {
-        "image", "artifact", "region", "languages",
-        "minimum_confidence", "patterns",
-    }
+    allowed = {"region", "languages", "minimum_confidence", "patterns"}
+    allowed.update(
+        {"artifact"}
+        if artifact_payload is not None
+        else {"image", "artifact"}
+    )
     unexpected = sorted(set(args) - allowed)
     if unexpected:
         _invalid("request contains unsupported fields", fields=unexpected)
+    if artifact_payload is not None:
+        reference = args.get("artifact")
+        if not isinstance(reference, dict) or set(reference) != set(
+            ARTIFACT_REF_SCHEMA["required"]
+        ):
+            _invalid("artifact must be a closed ArtifactRef object")
+        if (
+            reference.get("apiVersion") != "ai-auto-desktop.dev/v1alpha1"
+            or reference.get("kind") != "ArtifactRef"
+            or reference.get("digest") != artifact_payload.digest
+            or reference.get("mediaType") != artifact_payload.media_type
+            or reference.get("sizeBytes") != artifact_payload.size_bytes
+        ):
+            _invalid("artifact reference does not match the received snapshot")
     region = _region(args.get("region"))
     languages = _languages(args.get("languages"))
     threshold = _minimum_confidence(args.get("minimum_confidence"))
@@ -1499,9 +1683,14 @@ def recognize(args: Any, deadline_ms: Any) -> dict[str, Any]:
 
     with tempfile.TemporaryDirectory(prefix="aad-ocr-") as directory_name:
         private_directory = Path(directory_name)
-        source_path, source, image_size = _inspect_source(
-            args, deadline, private_directory
-        )
+        if artifact_payload is None:
+            source_path, source, image_size = _inspect_source(
+                args, deadline, private_directory
+            )
+        else:
+            source_path, source, image_size = _inspect_artifact_source(
+                artifact_payload, deadline, private_directory
+            )
         if region is not None:
             right = region["x"] + region["width"]
             bottom = region["y"] + region["height"]
@@ -1559,6 +1748,7 @@ def recognize(args: Any, deadline_ms: Any) -> dict[str, Any]:
 def handle_line(line: str) -> None:
     request: Any = None
     request_id: Any = None
+    invocation: Any = None
     try:
         try:
             request = json.loads(line)
@@ -1575,22 +1765,69 @@ def handle_line(line: str) -> None:
             emit_result(request_id, MANIFEST)
             return
         action = request.get("action")
-        if request.get("type") != "invoke" or action != ACTION_ID:
+        if request.get("type") != "invoke" or action not in {
+            ACTION_ID,
+            ARTIFACT_ACTION_ID,
+        }:
             raise RequestError(
                 "PROTOCOL.ACTION_NOT_FOUND",
                 f"unknown action: {action}",
-                data={"action": action, "availableActions": [ACTION_ID]},
+                data={
+                    "action": action,
+                    "availableActions": [ACTION_ID, ARTIFACT_ACTION_ID],
+                },
             )
-        emit_result(request_id, recognize(request.get("args"), request.get("deadline_ms")))
+        if action == ARTIFACT_ACTION_ID:
+            from ai_auto_desktop.artifact_ipc import (
+                ArtifactIPCError,
+                WorkerArtifactInvocation,
+            )
+
+            try:
+                invocation = WorkerArtifactInvocation.from_request(
+                    request,
+                    input_slots=("source",),
+                    output_slots=(),
+                    expected_action=ARTIFACT_ACTION_ID,
+                )
+                payload = invocation.read_input("source")
+            except ArtifactIPCError as exc:
+                raise RequestError(
+                    "OCR.ARTIFACT_IPC",
+                    "artifact input transfer failed",
+                    data={"stage": exc.code},
+                ) from exc
+            result = recognize(
+                request.get("args"),
+                request.get("deadline_ms"),
+                artifact_payload=payload,
+            )
+            invocation.complete_ok()
+        else:
+            result = recognize(request.get("args"), request.get("deadline_ms"))
+        emit_result(request_id, result)
     except RequestError as exc:
+        if invocation is not None and not invocation.completed:
+            try:
+                invocation.complete_error(exc.code, exc.message)
+            except ArtifactIPCError:
+                pass
         debug(f"request id={request_id!r} failed code={exc.code}")
         emit_error(request_id, exc)
     except Exception as exc:
         debug(f"internal error id={request_id!r}: {type(exc).__name__}: {exc}")
-        emit_error(
-            request_id,
-            RequestError("PLUGIN.INTERNAL", "OCR provider encountered an internal error"),
+        error = RequestError(
+            "PLUGIN.INTERNAL", "OCR provider encountered an internal error"
         )
+        if invocation is not None and not invocation.completed:
+            try:
+                invocation.complete_error(error.code, error.message)
+            except ArtifactIPCError:
+                pass
+        emit_error(request_id, error)
+    finally:
+        if invocation is not None:
+            invocation.close()
 
 
 def main() -> int:
@@ -1600,7 +1837,9 @@ def main() -> int:
             reconfigure(encoding="utf-8", errors="strict")
     if "--manifest" in sys.argv[1:]:
         emit({"type": "manifest", "manifest": MANIFEST})
-    debug(f"started pid={os.getpid()} action={ACTION_ID}")
+    debug(
+        f"started pid={os.getpid()} actions={ACTION_ID},{ARTIFACT_ACTION_ID}"
+    )
     for raw_line in sys.stdin:
         line = raw_line.strip()
         if line:

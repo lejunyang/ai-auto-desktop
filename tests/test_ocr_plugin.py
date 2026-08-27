@@ -22,6 +22,7 @@ from PIL import Image
 from PIL import ImageDraw
 from PIL import ImageFont
 
+from ai_auto_desktop.artifacts import ArtifactStore
 from ai_auto_desktop.compiler import load_descriptor
 from ai_auto_desktop.journal import (
     SensitiveDataError,
@@ -205,12 +206,15 @@ class TesseractPluginTests(unittest.TestCase):
         manifest = self.make_plugin().start()
 
         self.assertEqual(manifest["metadata"]["name"], "vision.ocr")
-        self.assertEqual(set(manifest["actions"]), {"recognize"})
+        self.assertEqual(
+            set(manifest["actions"]), {"recognize", "recognize_artifact"}
+        )
+        self.assertNotIn("permissions", manifest)
         contract = manifest["actions"]["recognize"]
         self.assertEqual(contract["contract_major"], 1)
         self.assertEqual(contract["effect"]["default_class"], "read_only")
         self.assertEqual(contract["risk"], {"category": "observe", "level": "low"})
-        self.assertEqual(manifest["permissions"], ["filesystem.read"])
+        self.assertEqual(contract["permissions"], ["filesystem.read"])
         self.assertIn("OCR.ENGINE_UNAVAILABLE", {item["code"] for item in contract["errors"]})
         output_schema = contract["output_schema"]
         jsonschema.Draft202012Validator.check_schema(output_schema)
@@ -229,6 +233,70 @@ class TesseractPluginTests(unittest.TestCase):
         self.assertFalse(source["additionalProperties"])
         self.assertFalse(line["additionalProperties"])
         self.assertFalse(match["additionalProperties"])
+
+        artifact_contract = manifest["actions"]["recognize_artifact"]
+        self.assertEqual(artifact_contract["contract_major"], 1)
+        self.assertEqual(
+            artifact_contract["effect"]["default_class"], "read_only"
+        )
+        self.assertNotIn("permissions", artifact_contract)
+        self.assertEqual(
+            artifact_contract["artifacts"],
+            {
+                "inputs": {
+                    "source": {
+                        "pointer": "/artifact",
+                        "media_types": [
+                            "image/png",
+                            "image/jpeg",
+                            "image/gif",
+                            "image/tiff",
+                            "image/bmp",
+                            "image/webp",
+                            "image/x-portable-anymap",
+                        ],
+                        "max_size_bytes": 64 * 1024 * 1024,
+                    }
+                }
+            },
+        )
+        artifact_input = artifact_contract["input_schema"]
+        self.assertEqual(artifact_input["required"], ["artifact"])
+        self.assertNotIn("image", artifact_input["properties"])
+        self.assertFalse(artifact_input["additionalProperties"])
+        artifact_source = artifact_contract["output_schema"]["properties"][
+            "source"
+        ]
+        self.assertEqual(
+            set(artifact_source["required"]),
+            {"kind", "digest", "media_type", "size_bytes"},
+        )
+        self.assertNotIn("path", artifact_source["properties"])
+        self.assertFalse(artifact_source["additionalProperties"])
+        jsonschema.Draft202012Validator.check_schema(
+            artifact_contract["input_schema"]
+        )
+        jsonschema.Draft202012Validator.check_schema(
+            artifact_contract["output_schema"]
+        )
+
+    def test_legacy_manifest_starts_without_package_import_path(self) -> None:
+        completed = subprocess.run(
+            [sys.executable, str(OCR_PLUGIN), "--manifest"],
+            input=b"",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env={
+                "PATH": os.environ.get("PATH", ""),
+                "PYTHONIOENCODING": "utf-8",
+            },
+            timeout=2,
+            check=False,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr.decode())
+        message = json.loads(completed.stdout.splitlines()[0])
+        self.assertEqual(message["manifest"]["metadata"]["version"], "0.1.1")
 
     def test_explicit_workflow_examples_are_equivalent_and_return_only(self) -> None:
         yaml_workflow = load_descriptor(EXPLICIT_WORKFLOW)
@@ -312,6 +380,108 @@ class TesseractPluginTests(unittest.TestCase):
                 jsonschema.ValidationError
             ):
                 jsonschema.Draft202012Validator(schema).validate(malformed)
+
+    @unittest.skipUnless(os.name == "posix", "artifact socket v1 is POSIX-only")
+    def test_artifact_action_consumes_bytes_without_exposing_a_host_path(self) -> None:
+        store = ArtifactStore(temporary_parent=self.temporary.name)
+        self.addCleanup(store.cleanup)
+        reference = store.import_bytes(PNG_1X1, media_type="image/png")
+        plugin = self.make_plugin()
+
+        result = plugin.invoke_with_artifacts(
+            "vision.ocr.recognize_artifact@1",
+            {
+                "artifact": reference.to_dict(),
+                "languages": ["eng"],
+                "patterns": [{"id": "invoice_id", "value": "A-42"}],
+            },
+            store,
+        )
+
+        self.assertEqual(result["text"], "Invoice A-42\nTotal $12.50")
+        self.assertEqual(
+            result["source"],
+            {
+                "kind": "artifact",
+                "digest": reference.digest,
+                "media_type": reference.media_type,
+                "size_bytes": reference.size_bytes,
+            },
+        )
+        self.assertNotIn("path", result["source"])
+        self.assertNotIn(os.fspath(store._root), repr(result) + plugin.stderr)
+        self.assertNotIn(str(self.image.resolve()), repr(result) + plugin.stderr)
+        self.assertEqual(
+            (self.directory / "digest.log").read_text(encoding="ascii"),
+            reference.digest.removeprefix("sha256:"),
+        )
+        schema = plugin.manifest["actions"]["recognize_artifact"][
+            "output_schema"
+        ]
+        jsonschema.Draft202012Validator(schema).validate(result)
+
+    @unittest.skipUnless(os.name == "posix", "artifact socket v1 is POSIX-only")
+    def test_artifact_action_error_and_timeout_keep_connection_reusable(self) -> None:
+        store = ArtifactStore(temporary_parent=self.temporary.name)
+        self.addCleanup(store.cleanup)
+        reference = store.import_bytes(PNG_1X1, media_type="image/png")
+        plugin = self.make_plugin(timeout=3)
+        plugin.start()
+        provider_pid = plugin.pid
+        arguments = {"artifact": reference.to_dict()}
+
+        with self.assertRaises(PluginError) as low_confidence:
+            plugin.invoke_with_artifacts(
+                "vision.ocr.recognize_artifact@1",
+                {**arguments, "minimum_confidence": 0.99},
+                store,
+                timeout=2,
+            )
+        self.assertEqual(low_confidence.exception.code, "OCR.LOW_CONFIDENCE")
+        self.assertEqual(
+            low_confidence.exception.message,
+            "recognized text is below minimum_confidence",
+        )
+        self.assertFalse(plugin.closed)
+        self.assertEqual(plugin.pid, provider_pid)
+
+        with self.assertRaises(PluginError) as timed_out:
+            plugin.invoke_with_artifacts(
+                "vision.ocr.recognize_artifact@1",
+                arguments,
+                store,
+                timeout=0.35,
+            )
+        self.assertEqual(timed_out.exception.code, "OCR.TIMEOUT")
+        self.assertEqual(
+            timed_out.exception.message,
+            "host deadline elapsed before OCR could complete",
+        )
+        self.assertFalse(plugin.closed)
+        self.assertEqual(plugin.pid, provider_pid)
+
+        result = plugin.invoke_with_artifacts(
+            "vision.ocr.recognize_artifact@1", arguments, store, timeout=2
+        )
+        self.assertEqual(result["text"], "Invoice A-42\nTotal $12.50")
+        self.assertEqual(plugin.pid, provider_pid)
+
+    @unittest.skipUnless(os.name == "posix", "artifact socket v1 is POSIX-only")
+    def test_artifact_action_rejects_path_object_before_dispatch(self) -> None:
+        store = ArtifactStore(temporary_parent=self.temporary.name)
+        self.addCleanup(store.cleanup)
+        plugin = self.make_plugin()
+
+        with self.assertRaises(PluginError) as raised:
+            plugin.invoke_with_artifacts(
+                "vision.ocr.recognize_artifact@1",
+                {"artifact": {"path": str(self.image)}},
+                store,
+            )
+
+        self.assertEqual(raised.exception.code, "PLUGIN.ARTIFACT_INPUT_INVALID")
+        self.assertFalse(raised.exception.dispatched)
+        self.assertFalse((self.directory / "engine.log").exists())
 
     def test_real_provider_workflow_match_drives_response_branch(self) -> None:
         matched = self.run_explicit_workflow(

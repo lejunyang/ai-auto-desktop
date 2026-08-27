@@ -1,7 +1,12 @@
 # Tesseract 光学字符识别（OCR）进程插件
 
-这个可选提供程序通过仓库的 NDJSON 进程协议提供 `vision.ocr.recognize@1`。它只读取
-调用方提供的绝对图片路径；绝不会自行截屏，也不会静默回退到屏幕捕获。
+这个可选提供程序通过仓库的 NDJSON 进程协议提供两个显式操作：
+
+- `vision.ocr.recognize_artifact@1`（推荐）通过现有 Artifact side channel 消费
+  Host 托管的 `ArtifactRef`，worker 只收到校验后的图片 bytes，不接收 Host 文件路径。
+- `vision.ocr.recognize@1` 保留原有绝对路径输入，作为兼容既有工作流的 legacy 操作。
+
+两个操作都绝不会自行截屏，也不会静默回退到屏幕捕获。
 
 运行要求为 `PATH` 中存在 `tesseract` CLI，并使用 Python 3.11 或更高版本。所有图片都必须先
 通过 Pillow 的格式、结构、帧数和解码大小验证（`python -m pip install ".[ocr]"`）；不是只有
@@ -9,10 +14,12 @@
 或将 `OCR_TESSERACT_COMMAND` 设为可信的 JSON `argv` 数组（适用于包装器和隔离、可复现的测试）。
 这项设置属于高权限的操作者配置，而非工作流输入。
 
-提供程序清单要求 `filesystem.read`。工作流必须在 `requires.permissions` 中声明该权限，
-同时宿主操作者还必须通过 `--permission filesystem.read` 显式授予权限；仅声明绝不代表
-已授权。该权限覆盖调用方提供的绝对路径。提供程序会将文件复制到私有请求目录中，对该
-快照计算哈希，并且只把快照（或其裁剪结果）交给 Tesseract。
+只有 legacy `recognize@1` action 要求 `filesystem.read`。使用它的工作流必须在
+`requires.permissions` 中声明该权限，同时宿主操作者还必须通过
+`--permission filesystem.read` 显式授予；仅声明绝不代表已授权。该权限覆盖调用方提供的
+绝对路径。`recognize_artifact@1` 不要求 `filesystem.read`：Host 在 dispatch 前解析并校验
+`ArtifactRef`，再通过私有 side channel 发送 bytes。两种模式都会在私有请求目录创建快照，
+并且只把该快照（或其裁剪结果）交给 Tesseract。
 
 请显式注册该插件：
 
@@ -33,8 +40,16 @@ py -3 -m ai_auto_desktop run workflow.yaml `
 同时提供了 `run.cmd`，供接受 `.cmd` 插件命令的命令行环境使用。若系统已注册 Python 启动器，
 它会使用 `py -3`；否则会回退到 `PATH` 中的 `python`。
 
-该操作必须且只能接受 `image: {path}` 或 `artifact: {path, media_type?}` 之一。路径本身必须
-是绝对路径，并指向不超过 64 MiB 的常规图片文件。解码后的图片还必须同时满足：宽、高各不
+推荐操作 `recognize_artifact@1` 必须接受 `artifact: ArtifactRef`，其中闭合对象包含
+`apiVersion`、`kind: ArtifactRef`、`artifactId`、`digest`、`mediaType` 和 `sizeBytes`；不得用
+`path` 代替。其 manifest 显式声明 `artifacts.inputs.source.pointer=/artifact`，接受
+PNG/JPEG/GIF/TIFF/BMP/WebP/PNM，最大 64 MiB。应由运行时或直接调用
+`ProcessPlugin.invoke_with_artifacts(...)` 的代码提供与该引用同 scope 的 `ArtifactStore`。
+
+legacy `recognize@1` 必须且只能接受 `image: {path}` 或旧式
+`artifact: {path, media_type?}` 之一。路径必须是绝对路径，并指向不超过 64 MiB 的常规图片
+文件。旧式 `artifact: {path, ...}` 只是名称兼容，不是 `ArtifactRef`，新调用方不应继续采用。
+解码后的图片还必须同时满足：宽、高各不
 超过 20,000 像素，总像素数不超过 40,000,000，且只能有一帧。provider 会尽量从
 PNG/GIF/JPEG/TIFF/BMP/WebP/PNM 头部预检尺寸；即使头部布局无法安全解析，也会在交给
 Tesseract 前由 Pillow 检查尺寸、帧数并完整解码一次。Pillow 的 decompression-bomb 警告与
@@ -46,8 +61,9 @@ Tesseract 前由 Pillow 检查尺寸、帧数并完整解码一次。Pillow 的 
 边界坐标仍相对于原始图片。模式值是区分大小写的字面子字符串；系统有意不执行正则
 表达式语法。
 
-结果包含提供程序与版本的溯源信息、解析后的源路径及其 SHA-256 摘要、请求的源区域、聚合文本与
-置信度、文本行边界和模式匹配结果。找不到 Tesseract 时会返回
+结果包含提供程序与版本的溯源信息、请求的源区域、聚合文本与置信度、文本行边界和模式匹配
+结果。legacy 路径操作还返回解析后的源路径；Artifact 操作的结果和错误均不包含 Host 路径。
+找不到 Tesseract 时会返回
 `OCR.ENGINE_UNAVAILABLE`；输入无效、图片不可读或签名无效、引擎失败、文本为空、置信度
 过低、TSV 格式错误或过大、输出含 NUL 或不是 UTF-8，以及超过截止时间，也都会以结构化
 错误返回。每次启动引擎都会创建独立的进程组或会话。Linux 上还强制通过 `prlimit` 限制
@@ -78,8 +94,9 @@ Tesseract 前直接失败。调用方应为真实识别设置明显更大的总�
 
 `recognize` 的输出是闭合对象；宿主会依据 manifest 校验所有字段，不接受未声明字段：
 
-- `source` 恰好包含 `kind`、解析后的绝对 `path`、私有快照的 `digest`、根据文件内容检测的
-  `media_type` 和 `size_bytes`。摘要格式固定为 `sha256:<64 个小写十六进制字符>`。
+- `recognize_artifact@1` 的 `source` 恰好包含 `kind: artifact`、`digest`、根据文件内容检测的
+  `media_type` 和 `size_bytes`，不含 `path`。`recognize@1` 的 legacy `source` 额外包含解析后的
+  绝对 `path`。摘要格式固定为 `sha256:<64 个小写十六进制字符>`。
 - `lines` 至少包含一项。每项恰好包含非空 `text`、零到一的字符数加权 `confidence`，以及
   原图坐标系中的 `bounds: {x,y,width,height}`。
 - `matches` 只包含调用方所声明的区分大小写字面匹配。每项恰好包含 `pattern_id`、`text`、
