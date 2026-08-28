@@ -29,12 +29,16 @@ from typing import Any, BinaryIO
 import uuid
 
 from .artifact_ipc import (
+    ArtifactChannel,
     ArtifactIPCError,
     CHANNEL_FD_ENV,
+    CHANNEL_HOST_PID_ENV,
+    CHANNEL_PIPE_ENV,
     MAX_FRAME_PAYLOAD_BYTES,
     PROTOCOL as ARTIFACT_PROTOCOL,
     receive_frame,
     send_frame,
+    wrap_socket_channel,
 )
 from .artifacts import ArtifactError, ArtifactRef, ArtifactStore
 
@@ -174,8 +178,9 @@ class ProcessPlugin:
         # If a proactive manifest races with our fallback manifest request, its
         # eventual response remains a paired but ignorable transport message.
         self._discard_response_ids: set[str] = set()
-        self._artifact_channel: socket.socket | None = None
+        self._artifact_channel: ArtifactChannel | None = None
         self._artifact_child_channel: socket.socket | None = None
+        self._artifact_pipe_server: Any = None
 
     @property
     def pid(self) -> int | None:
@@ -258,12 +263,28 @@ class ProcessPlugin:
                 environment[CHANNEL_FD_ENV] = str(child_channel.fileno())
                 popen_options["env"] = environment
                 popen_options["pass_fds"] = (child_channel.fileno(),)
-                self._artifact_channel = host_channel
+                self._artifact_channel = wrap_socket_channel(host_channel)
                 self._artifact_child_channel = child_channel
             elif os.name == "nt":
                 popen_options["creationflags"] = getattr(
                     subprocess, "CREATE_NEW_PROCESS_GROUP", 0
                 )
+                try:
+                    from ._win_named_pipe import WindowsPipeServer
+
+                    pipe_server = WindowsPipeServer()
+                except Exception as exc:
+                    self._closed = True
+                    raise PluginError(
+                        "PLUGIN.HOST_ARTIFACT_CHANNEL_UNAVAILABLE",
+                        f"could not create artifact channel for plugin {self.name!r}",
+                        details={"exception_type": type(exc).__name__},
+                    ) from exc
+                environment = dict(os.environ if self.env is None else self.env)
+                environment[CHANNEL_PIPE_ENV] = pipe_server.name
+                environment[CHANNEL_HOST_PID_ENV] = str(os.getpid())
+                popen_options["env"] = environment
+                self._artifact_pipe_server = pipe_server
 
             try:
                 process = subprocess.Popen(self.command, **popen_options)
@@ -453,7 +474,7 @@ class ProcessPlugin:
                     details={"dispatched": False},
                 )
             channel = self._artifact_channel
-            if channel is None:
+            if channel is None and self._artifact_pipe_server is None:
                 raise self._host_error(
                     "PLUGIN.HOST_ARTIFACT_CHANNEL_UNAVAILABLE",
                     "artifact side channel is unavailable on this platform",
@@ -480,7 +501,12 @@ class ProcessPlugin:
         """Terminate the plugin process tree.  The method is idempotent."""
 
         with self._lifecycle_lock:
-            if self._closed and self._artifact_channel is None and self._artifact_child_channel is None:
+            if (
+                self._closed
+                and self._artifact_channel is None
+                and self._artifact_child_channel is None
+                and self._artifact_pipe_server is None
+            ):
                 return
             self._closed = True
             process = self._process
@@ -835,7 +861,7 @@ class ProcessPlugin:
         args: Any,
         artifact_store: ArtifactStore,
         contract: Mapping[str, Any],
-        channel: socket.socket,
+        channel: ArtifactChannel | None,
         *,
         request_id: str,
         deadline: float,
@@ -931,6 +957,10 @@ class ProcessPlugin:
             },
         }
         dispatched = self._write_request(request)
+        if channel is None:
+            channel = self._accept_windows_artifact_channel(
+                deadline=deadline, dispatched=dispatched
+            )
         sender_errors: list[BaseException] = []
         sender_done = threading.Event()
 
@@ -1010,8 +1040,8 @@ class ProcessPlugin:
             if status == "error":
                 if not inputs_accepted:
                     try:
-                        channel.shutdown(socket.SHUT_WR)
-                    except OSError:
+                        channel.shutdown_write()
+                    except Exception:
                         pass
                     if sender is not None:
                         sender.join(timeout=_TERMINATE_GRACE_SECONDS)
@@ -1113,13 +1143,13 @@ class ProcessPlugin:
                     sender.join(timeout=_TERMINATE_GRACE_SECONDS)
                 else:
                     try:
-                        channel.shutdown(socket.SHUT_RDWR)
-                    except OSError:
+                        channel.shutdown_both()
+                    except Exception:
                         pass
                     sender.join(timeout=_TERMINATE_GRACE_SECONDS)
 
     def _send_artifact_inputs(
-        self, channel: socket.socket, request_id: str,
+        self, channel: ArtifactChannel, request_id: str,
         input_values: list[tuple[str, ArtifactRef, str, bytes]], deadline: float,
     ) -> None:
         for slot_name, reference, token, payload in input_values:
@@ -1148,8 +1178,49 @@ class ProcessPlugin:
             b"", deadline,
         )
 
+    def _accept_windows_artifact_channel(
+        self, *, deadline: float, dispatched: bool
+    ) -> ArtifactChannel:
+        server = self._artifact_pipe_server
+        process = self._process
+        if server is None or process is None:
+            raise self._host_error(
+                "PLUGIN.HOST_ARTIFACT_CHANNEL_UNAVAILABLE",
+                "artifact side channel is unavailable on this platform",
+                extra={"dispatched": dispatched},
+            )
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise self._host_error(
+                "PLUGIN.HOST_TIMEOUT",
+                "artifact worker did not connect before the deadline",
+                extra={"dispatched": dispatched},
+                retryable=True,
+            )
+        try:
+            channel = server.accept(
+                process.pid, int((time.time() + remaining) * 1000)
+            )
+        except Exception as exc:
+            kind = getattr(exc, "kind", None)
+            raise self._host_error(
+                (
+                    "PLUGIN.HOST_TIMEOUT"
+                    if kind == "deadline"
+                    else "PLUGIN.HOST_ARTIFACT_CHANNEL_UNAVAILABLE"
+                ),
+                "artifact worker could not establish its private channel",
+                extra={"dispatched": dispatched},
+                retryable=kind == "deadline",
+            ) from exc
+        finally:
+            server.close()
+            self._artifact_pipe_server = None
+        self._artifact_channel = channel
+        return channel
+
     def _await_artifact_ready(
-        self, channel: socket.socket, request_id: str, deadline: float
+        self, channel: ArtifactChannel, request_id: str, deadline: float
     ) -> None:
         while True:
             remaining = deadline - time.monotonic()
@@ -1160,10 +1231,8 @@ class ProcessPlugin:
                     retryable=True,
                 )
             try:
-                readable, _, _ = select.select(
-                    [channel], [], [], min(remaining, 0.02)
-                )
-            except (OSError, ValueError) as exc:
+                readable = channel.readable(min(remaining, 0.02))
+            except Exception as exc:
                 raise self._host_error(
                     "PLUGIN.HOST_ARTIFACT_CHANNEL_UNAVAILABLE",
                     "artifact side channel became unavailable",
@@ -1220,7 +1289,7 @@ class ProcessPlugin:
             return message
 
     def _receive_artifact_output(
-        self, channel: socket.socket, request_id: str, slot_name: str, token: str,
+        self, channel: ArtifactChannel, request_id: str, slot_name: str, token: str,
         slot: Mapping[str, Any], deadline: float,
         *,
         first_frame: tuple[dict[str, Any], bytes] | None = None,
@@ -1270,12 +1339,12 @@ class ProcessPlugin:
             return bytes(received), media_type, actual_digest
 
     def _artifact_send(
-        self, channel: socket.socket, header: Mapping[str, Any], payload: bytes, deadline: float
+        self, channel: ArtifactChannel, header: Mapping[str, Any], payload: bytes, deadline: float
     ) -> None:
         send_frame(channel, header, payload, deadline_ms=_epoch_deadline_ms(deadline))
 
     def _artifact_receive(
-        self, channel: socket.socket, deadline: float
+        self, channel: ArtifactChannel, deadline: float
     ) -> tuple[dict[str, Any], bytes]:
         return receive_frame(channel, deadline_ms=_epoch_deadline_ms(deadline))
 
@@ -1501,6 +1570,13 @@ class ProcessPlugin:
                     channel.close()
                 except OSError:
                     pass
+        server = self._artifact_pipe_server
+        self._artifact_pipe_server = None
+        if server is not None:
+            try:
+                server.close()
+            except OSError:
+                pass
 
     def _join_readers(self) -> None:
         current = threading.current_thread()

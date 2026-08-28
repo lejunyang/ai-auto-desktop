@@ -29,11 +29,16 @@ import socket
 import struct
 import time
 from types import TracebackType
-from typing import Any
+from typing import Any, Protocol
 
 
+# Kept stable for wire compatibility.  The spelling predates the Windows
+# transport; v1 now means an AADF framed private byte stream over either a
+# Unix socket or a Windows named pipe.
 PROTOCOL = "aad-artifact-socket-v1"
 CHANNEL_FD_ENV = "AAD_ARTIFACT_CHANNEL_FD"
+CHANNEL_PIPE_ENV = "AAD_ARTIFACT_PIPE_NAME"
+CHANNEL_HOST_PID_ENV = "AAD_ARTIFACT_HOST_PID"
 MAGIC = b"AADF"
 VERSION = 1
 MAX_HEADER_BYTES = 4096
@@ -84,6 +89,60 @@ class ArtifactIPCError(RuntimeError):
         return f"{self.code}: {self.message}"
 
 
+class ArtifactChannel(Protocol):
+    """Internal deadline-aware duplex byte stream."""
+
+    def send_all(self, data: bytes, deadline_ms: int | None) -> None: ...
+
+    def recv_exact(self, size: int, deadline_ms: int | None) -> bytes: ...
+
+    def readable(self, timeout: float) -> bool: ...
+
+    def shutdown_write(self) -> None: ...
+
+    def shutdown_both(self) -> None: ...
+
+    def close(self) -> None: ...
+
+
+class SocketArtifactChannel:
+    """POSIX socket adapter preserving the existing AADF v1 transport."""
+
+    def __init__(self, channel: socket.socket) -> None:
+        self._channel = channel
+
+    def send_all(self, data: bytes, deadline_ms: int | None) -> None:
+        _socket_send_all(self._channel, data, deadline_ms)
+
+    def recv_exact(self, size: int, deadline_ms: int | None) -> bytes:
+        return _socket_receive_exact(self._channel, size, deadline_ms)
+
+    def readable(self, timeout: float) -> bool:
+        try:
+            readable, _, _ = select.select([self._channel], [], [], timeout)
+        except (OSError, ValueError):
+            _channel_error()
+        return bool(readable)
+
+    def shutdown_write(self) -> None:
+        try:
+            self._channel.shutdown(socket.SHUT_WR)
+        except OSError:
+            pass
+
+    def shutdown_both(self) -> None:
+        try:
+            self._channel.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+
+    def close(self) -> None:
+        try:
+            self._channel.close()
+        except OSError:
+            pass
+
+
 @dataclass(frozen=True, slots=True)
 class ArtifactPayload:
     """Validated bytes received for one declared input slot."""
@@ -110,7 +169,7 @@ class _OutputBinding:
 
 
 def send_frame(
-    channel: socket.socket,
+    channel: ArtifactChannel | socket.socket,
     header: Mapping[str, Any],
     payload: bytes | bytearray | memoryview = b"",
     *,
@@ -143,7 +202,7 @@ def send_frame(
 
 
 def receive_frame(
-    channel: socket.socket, *, deadline_ms: int | None = None
+    channel: ArtifactChannel | socket.socket, *, deadline_ms: int | None = None
 ) -> tuple[dict[str, Any], bytes]:
     """Read and validate exactly one v1 frame."""
 
@@ -185,7 +244,7 @@ class WorkerArtifactInvocation:
 
     def __init__(
         self,
-        channel: socket.socket,
+        channel: ArtifactChannel,
         *,
         request_id: str,
         deadline_ms: int,
@@ -215,7 +274,7 @@ class WorkerArtifactInvocation:
         expected_action: str | None = None,
         environ: Mapping[str, str] | None = None,
     ) -> "WorkerArtifactInvocation":
-        """Validate the Host envelope and duplicate its inherited socket FD."""
+        """Validate the Host envelope and open its private data channel."""
 
         request_id, deadline_ms, inputs, outputs = _parse_request_envelope(
             request,
@@ -225,45 +284,7 @@ class WorkerArtifactInvocation:
         )
         _require_before_deadline(deadline_ms)
         environment = os.environ if environ is None else environ
-        descriptor_text = environment.get(CHANNEL_FD_ENV)
-        if (
-            not isinstance(descriptor_text, str)
-            or len(descriptor_text) > 10
-            or not descriptor_text.isascii()
-            or not descriptor_text.isdecimal()
-        ):
-            raise ArtifactIPCError(
-                "ARTIFACT_IPC.CHANNEL_UNAVAILABLE",
-                "Artifact side channel is unavailable.",
-            )
-        descriptor = int(descriptor_text, 10)
-        if descriptor < 3:
-            raise ArtifactIPCError(
-                "ARTIFACT_IPC.CHANNEL_UNAVAILABLE",
-                "Artifact side channel is unavailable.",
-            )
-        duplicate = -1
-        channel: socket.socket | None = None
-        try:
-            duplicate = os.dup(descriptor)
-            channel = socket.socket(fileno=duplicate)
-            duplicate = -1
-            if (
-                channel.family != socket.AF_UNIX
-                or channel.getsockopt(socket.SOL_SOCKET, socket.SO_TYPE)
-                != socket.SOCK_STREAM
-            ):
-                raise OSError
-            channel.setblocking(False)
-        except (OSError, OverflowError, ValueError):
-            if channel is not None:
-                channel.close()
-            elif duplicate >= 0:
-                os.close(duplicate)
-            raise ArtifactIPCError(
-                "ARTIFACT_IPC.CHANNEL_UNAVAILABLE",
-                "Artifact side channel is unavailable.",
-            ) from None
+        channel = _open_worker_channel(environment, deadline_ms)
         invocation = cls(
             channel,
             request_id=request_id,
@@ -455,10 +476,7 @@ class WorkerArtifactInvocation:
         if self._closed:
             return
         self._closed = True
-        try:
-            self._channel.close()
-        except OSError:
-            pass
+        self._channel.close()
 
     def __enter__(self) -> "WorkerArtifactInvocation":
         self._ensure_active()
@@ -547,6 +565,81 @@ class WorkerArtifactInvocation:
     def _digest_error(message: str) -> None:
         raise ArtifactIPCError("ARTIFACT_IPC.DIGEST_MISMATCH", message)
 
+
+def _open_worker_channel(
+    environment: Mapping[str, str], deadline_ms: int
+) -> ArtifactChannel:
+    if os.name == "posix":
+        descriptor_text = environment.get(CHANNEL_FD_ENV)
+        if (
+            not isinstance(descriptor_text, str)
+            or len(descriptor_text) > 10
+            or not descriptor_text.isascii()
+            or not descriptor_text.isdecimal()
+        ):
+            raise ArtifactIPCError(
+                "ARTIFACT_IPC.CHANNEL_UNAVAILABLE",
+                "Artifact side channel is unavailable.",
+            )
+        descriptor = int(descriptor_text, 10)
+        if descriptor < 3:
+            raise ArtifactIPCError(
+                "ARTIFACT_IPC.CHANNEL_UNAVAILABLE",
+                "Artifact side channel is unavailable.",
+            )
+        duplicate = -1
+        channel: socket.socket | None = None
+        try:
+            duplicate = os.dup(descriptor)
+            channel = socket.socket(fileno=duplicate)
+            duplicate = -1
+            if (
+                channel.family != socket.AF_UNIX
+                or channel.getsockopt(socket.SOL_SOCKET, socket.SO_TYPE)
+                != socket.SOCK_STREAM
+            ):
+                raise OSError
+            channel.setblocking(False)
+        except (OSError, OverflowError, ValueError):
+            if channel is not None:
+                channel.close()
+            elif duplicate >= 0:
+                os.close(duplicate)
+            raise ArtifactIPCError(
+                "ARTIFACT_IPC.CHANNEL_UNAVAILABLE",
+                "Artifact side channel is unavailable.",
+            ) from None
+        try:
+            return SocketArtifactChannel(channel)
+        except BaseException:
+            channel.close()
+            raise
+    if os.name == "nt":
+        pipe_name = environment.get(CHANNEL_PIPE_ENV)
+        host_pid_text = environment.get(CHANNEL_HOST_PID_ENV)
+        if (
+            not isinstance(pipe_name, str)
+            or not isinstance(host_pid_text, str)
+            or len(host_pid_text) > 10
+            or not host_pid_text.isascii()
+            or not host_pid_text.isdecimal()
+        ):
+            _channel_unavailable()
+        try:
+            from ._win_named_pipe import connect_worker
+
+            return connect_worker(pipe_name, int(host_pid_text), deadline_ms)
+        except Exception as error:
+            _map_windows_pipe_error(error)
+    _channel_unavailable()
+
+
+def wrap_socket_channel(channel: socket.socket) -> SocketArtifactChannel:
+    """Wrap an already validated socket for Host-side framed I/O."""
+
+    if not isinstance(channel, socket.socket):
+        raise TypeError("channel must be a socket")
+    return SocketArtifactChannel(channel)
 
 def _parse_request_envelope(
     request: Mapping[str, Any],
@@ -788,7 +881,23 @@ def _coerce_artifact_bytes(value: bytes | bytearray | memoryview) -> bytes:
     return payload
 
 
-def _send_all(channel: socket.socket, data: bytes, deadline_ms: int | None) -> None:
+def _send_all(
+    channel: ArtifactChannel | socket.socket,
+    data: bytes,
+    deadline_ms: int | None,
+) -> None:
+    if not isinstance(channel, socket.socket):
+        try:
+            channel.send_all(data, deadline_ms)
+            return
+        except Exception as error:
+            _map_windows_pipe_error(error)
+    _socket_send_all(channel, data, deadline_ms)
+
+
+def _socket_send_all(
+    channel: socket.socket, data: bytes, deadline_ms: int | None
+) -> None:
     view = memoryview(data)
     while view:
         timeout = _deadline_timeout(deadline_ms)
@@ -810,6 +919,17 @@ def _send_all(channel: socket.socket, data: bytes, deadline_ms: int | None) -> N
 
 
 def _receive_exact(
+    channel: ArtifactChannel | socket.socket, size: int, deadline_ms: int | None
+) -> bytes:
+    if not isinstance(channel, socket.socket):
+        try:
+            return channel.recv_exact(size, deadline_ms)
+        except Exception as error:
+            _map_windows_pipe_error(error)
+    return _socket_receive_exact(channel, size, deadline_ms)
+
+
+def _socket_receive_exact(
     channel: socket.socket, size: int, deadline_ms: int | None
 ) -> bytes:
     value = bytearray()
@@ -937,6 +1057,24 @@ def _channel_error() -> None:
     )
 
 
+def _channel_unavailable() -> None:
+    raise ArtifactIPCError(
+        "ARTIFACT_IPC.CHANNEL_UNAVAILABLE",
+        "Artifact side channel is unavailable.",
+    )
+
+
+def _map_windows_pipe_error(error: BaseException) -> None:
+    kind = getattr(error, "kind", None)
+    if kind == "deadline":
+        _deadline_error()
+    if kind == "truncated":
+        _truncated_error()
+    if kind in {"unavailable", "security", "identity"}:
+        _channel_unavailable()
+    _channel_error()
+
+
 def _truncated_error() -> None:
     raise ArtifactIPCError(
         "ARTIFACT_IPC.TRUNCATED_FRAME",
@@ -947,7 +1085,10 @@ def _truncated_error() -> None:
 __all__ = [
     "ArtifactIPCError",
     "ArtifactPayload",
+    "ArtifactChannel",
     "CHANNEL_FD_ENV",
+    "CHANNEL_HOST_PID_ENV",
+    "CHANNEL_PIPE_ENV",
     "MAGIC",
     "MAX_ARTIFACT_BYTES",
     "MAX_FRAME_PAYLOAD_BYTES",
@@ -955,6 +1096,8 @@ __all__ = [
     "PROTOCOL",
     "VERSION",
     "WorkerArtifactInvocation",
+    "SocketArtifactChannel",
     "receive_frame",
     "send_frame",
+    "wrap_socket_channel",
 ]
