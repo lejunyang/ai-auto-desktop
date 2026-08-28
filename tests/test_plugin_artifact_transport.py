@@ -27,12 +27,19 @@ def png_bytes(*, color: str = "#235789") -> bytes:
     return output.getvalue()
 
 
-@unittest.skipUnless(os.name == "posix", "artifact socket v1 is POSIX-only")
+@unittest.skipUnless(
+    os.name in {"posix", "nt"}, "artifact byte-stream transport is unavailable"
+)
 class ProcessPluginArtifactTransportTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
-        self.store = ArtifactStore(temporary_parent=self.temporary.name)
+        options = (
+            {"temporary_parent": self.temporary.name}
+            if os.name == "posix"
+            else {}
+        )
+        self.store = ArtifactStore(**options)
         self.addCleanup(self.store.cleanup)
         self.plugin = ProcessPlugin(
             [sys.executable, str(FIXTURE_PLUGIN)], timeout=2, name="fixture"
@@ -54,11 +61,17 @@ class ProcessPluginArtifactTransportTests(unittest.TestCase):
         with self.store.resolve(copied) as handle:
             self.assertEqual(handle.read(), payload)
         wire = repr(result) + self.plugin.stderr
-        self.assertNotIn(os.fspath(self.store._root), wire)
+        if self.store._root is not None:
+            self.assertNotIn(os.fspath(self.store._root), wire)
         self.assertNotIn("storageKey", wire)
 
     def test_input_is_resolved_before_request_dispatch(self) -> None:
-        other = ArtifactStore(temporary_parent=self.temporary.name)
+        options = (
+            {"temporary_parent": self.temporary.name}
+            if os.name == "posix"
+            else {}
+        )
+        other = ArtifactStore(**options)
         self.addCleanup(other.cleanup)
         foreign = other.import_bytes(png_bytes())
 

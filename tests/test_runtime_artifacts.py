@@ -59,12 +59,19 @@ def artifact_workflow(reference: dict[str, object]) -> dict[str, object]:
     }
 
 
-@unittest.skipUnless(os.name == "posix", "artifact socket v1 is POSIX-only")
+@unittest.skipUnless(
+    os.name in {"posix", "nt"}, "artifact byte-stream transport is unavailable"
+)
 class RuntimeArtifactTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
-        self.store = ArtifactStore(temporary_parent=self.temporary.name)
+        options = (
+            {"temporary_parent": self.temporary.name}
+            if os.name == "posix"
+            else {}
+        )
+        self.store = ArtifactStore(**options)
         self.addCleanup(self.store.cleanup)
         self.plugin = ProcessPlugin(
             [sys.executable, str(FIXTURE_PLUGIN)], timeout=2, name="fixture"
@@ -91,7 +98,12 @@ class RuntimeArtifactTests(unittest.TestCase):
 
     def test_foreign_input_fails_without_publishing_an_output(self) -> None:
         payload = png_bytes()
-        other = ArtifactStore(temporary_parent=self.temporary.name)
+        options = (
+            {"temporary_parent": self.temporary.name}
+            if os.name == "posix"
+            else {}
+        )
+        other = ArtifactStore(**options)
         self.addCleanup(other.cleanup)
         source = other.import_bytes(payload)
         descriptor = compile_descriptor(artifact_workflow(source.to_dict()))

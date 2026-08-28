@@ -381,9 +381,17 @@ class TesseractPluginTests(unittest.TestCase):
             ):
                 jsonschema.Draft202012Validator(schema).validate(malformed)
 
-    @unittest.skipUnless(os.name == "posix", "artifact socket v1 is POSIX-only")
+    @unittest.skipUnless(
+        os.name in {"posix", "nt"}, "artifact byte-stream transport unavailable"
+    )
     def test_artifact_action_consumes_bytes_without_exposing_a_host_path(self) -> None:
-        store = ArtifactStore(temporary_parent=self.temporary.name)
+        store = ArtifactStore(
+            **(
+                {"temporary_parent": self.temporary.name}
+                if os.name == "posix"
+                else {}
+            )
+        )
         self.addCleanup(store.cleanup)
         reference = store.import_bytes(PNG_1X1, media_type="image/png")
         plugin = self.make_plugin()
@@ -409,7 +417,8 @@ class TesseractPluginTests(unittest.TestCase):
             },
         )
         self.assertNotIn("path", result["source"])
-        self.assertNotIn(os.fspath(store._root), repr(result) + plugin.stderr)
+        if store._root is not None:
+            self.assertNotIn(os.fspath(store._root), repr(result) + plugin.stderr)
         self.assertNotIn(str(self.image.resolve()), repr(result) + plugin.stderr)
         self.assertEqual(
             (self.directory / "digest.log").read_text(encoding="ascii"),
@@ -420,9 +429,17 @@ class TesseractPluginTests(unittest.TestCase):
         ]
         jsonschema.Draft202012Validator(schema).validate(result)
 
-    @unittest.skipUnless(os.name == "posix", "artifact socket v1 is POSIX-only")
+    @unittest.skipUnless(
+        os.name in {"posix", "nt"}, "artifact byte-stream transport unavailable"
+    )
     def test_artifact_action_error_and_timeout_keep_connection_reusable(self) -> None:
-        store = ArtifactStore(temporary_parent=self.temporary.name)
+        store = ArtifactStore(
+            **(
+                {"temporary_parent": self.temporary.name}
+                if os.name == "posix"
+                else {}
+            )
+        )
         self.addCleanup(store.cleanup)
         reference = store.import_bytes(PNG_1X1, media_type="image/png")
         plugin = self.make_plugin(timeout=3)
@@ -466,9 +483,17 @@ class TesseractPluginTests(unittest.TestCase):
         self.assertEqual(result["text"], "Invoice A-42\nTotal $12.50")
         self.assertEqual(plugin.pid, provider_pid)
 
-    @unittest.skipUnless(os.name == "posix", "artifact socket v1 is POSIX-only")
+    @unittest.skipUnless(
+        os.name in {"posix", "nt"}, "artifact byte-stream transport unavailable"
+    )
     def test_artifact_action_rejects_path_object_before_dispatch(self) -> None:
-        store = ArtifactStore(temporary_parent=self.temporary.name)
+        store = ArtifactStore(
+            **(
+                {"temporary_parent": self.temporary.name}
+                if os.name == "posix"
+                else {}
+            )
+        )
         self.addCleanup(store.cleanup)
         plugin = self.make_plugin()
 

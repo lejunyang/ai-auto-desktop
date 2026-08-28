@@ -39,7 +39,9 @@ Tesseract 是可选的系统依赖；所有 OCR 请求都需要 Pillow 完成图
 解码校验，区域裁剪也由 Pillow 执行。依赖缺失、低置信度等情况都会返回结构化 `OCR.*`
 错误。OCR 输出始终是不可信数据，只有后续显式的 `if` 或 `switch` 才能据此选择响应动作。
 推荐的新路径是 `vision.ocr.recognize_artifact@1`：它只接受同一 run 中 Host 管理的
-`ArtifactRef`，图片字节通过私有 side channel 传入，结果不会暴露 Host 路径。原
+`ArtifactRef`，图片字节通过私有 side channel 传入，结果不会暴露 Host 路径。POSIX 使用
+Unix socket，Windows 使用 current-user + SYSTEM 受保护、仅单实例并校验 Host/worker PID 的
+duplex named pipe。原
 `recognize@1` 继续兼容显式绝对路径，并单独要求 `filesystem.read`。仓库中的
 `linux-capture-ocr-decision.yaml` 演示了受控目标截图后显式 OCR、再用 `if` 判断的流程；
 示例不包含点击动作，也不会把 OCR bounds 自动转换为坐标操作。
@@ -114,15 +116,17 @@ fixture PID 内验证有界 AX 遍历、精确 identifier、focus、set value、
 
 运行时支持在 capability manifest 的 action 上声明 `artifacts.inputs` 和
 `artifacts.outputs`。工作流和 NDJSON 控制面只携带闭合的 `ArtifactRef`（ID、SHA-256、
-媒体类型和字节数），不会暴露 Host 的文件路径、存储键或文件描述符。POSIX 上，实际图片
-字节通过进程启动时建立的私有 Unix socket side channel 传输；每个调用和 slot 都有不可复用
-token，并受同一个绝对 deadline、单 slot 大小及单次调用总量约束。Host 对输出做完整摘要、
-图片结构和配额校验，并在 output schema 通过后一次性发布全部输出；任何一步失败都会回滚。
+媒体类型和字节数），不会暴露 Host 的文件路径、存储键或文件描述符。实际图片字节通过私有
+side channel 传输：POSIX 使用进程启动时继承的 Unix socket，Windows 使用随机命名、受保护
+ACL、单实例并双向核验进程 PID 的 duplex named pipe。每个调用和 slot 都有不可复用 token，
+并受同一个绝对 deadline、单 slot 大小及单次调用总量约束。Host 对输出做完整摘要、图片结构
+和配额校验，并在 output schema 通过后一次性发布全部输出；任何一步失败都会回滚。
 
 Python 调用方可以为一次 run 显式传入 `ArtifactStore`，先用
 `runner.import_artifact_bytes(...)` 导入可信图片，再将返回的 ref 放入 action 输入；返回的
-`RunResult.resolve_artifact(...)` 可在结果关闭前读取输出。当前存储与 side-channel 后端明确是
-POSIX-only；Windows 的公共 ref/manifest 契约已统一，但原生内容通道仍待 named pipe 后端。
+`RunResult.resolve_artifact(...)` 可在结果关闭前读取输出。POSIX 存储使用 fd-relative 私有目录；
+Windows 使用 run-scoped、不可变、受配额约束的内存后端，不支持路径导入、跨进程重启恢复或
+磁盘 spill。Windows named pipe 与内存 store 会在常规 `windows-contracts` CI 中原生验证；
 fixture 的 `fixture.artifact_copy@1` 只用于验证这条无路径传输链，不能视作截图或 OCR 能力。
 
 ## 描述文件与运行时

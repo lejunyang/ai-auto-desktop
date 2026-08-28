@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import subprocess
 import re
 import sys
 import time
@@ -64,19 +65,29 @@ class WindowsPipePortableContractTests(unittest.TestCase):
 
 @unittest.skipUnless(sys.platform == "win32", "requires native Windows named pipes")
 class WindowsPipeNativeTests(unittest.TestCase):
-    def test_server_and_worker_exchange_bytes_and_verify_pids(self) -> None:
+    def test_server_and_child_worker_exchange_bytes_and_verify_pids(self) -> None:
         server = pipe.WindowsPipeServer()
         self.addCleanup(server.close)
-        deadline = int((time.time() + 3) * 1000)
-        worker = pipe.connect_worker(server.name, os.getpid(), deadline)
-        self.addCleanup(worker.close)
-        host = server.accept(os.getpid(), deadline)
+        deadline = int((time.time() + 5) * 1000)
+        script = (
+            "import os,sys,time; "
+            "from ai_auto_desktop._win_named_pipe import connect_worker; "
+            "c=connect_worker(sys.argv[1],int(sys.argv[2]),int(sys.argv[3])); "
+            "c.send_all(b'worker',int(sys.argv[3])); "
+            "assert c.recv_exact(4,int(sys.argv[3]))==b'host'; c.close()"
+        )
+        process = subprocess.Popen(
+            [sys.executable, "-c", script, server.name, str(os.getpid()), str(deadline)],
+            env=dict(os.environ),
+        )
+        self.addCleanup(
+            lambda: process.kill() if process.poll() is None else None
+        )
+        host = server.accept(process.pid, deadline)
         self.addCleanup(host.close)
-
-        worker.send_all(b"worker", deadline)
         self.assertEqual(host.recv_exact(6, deadline), b"worker")
         host.send_all(b"host", deadline)
-        self.assertEqual(worker.recv_exact(4, deadline), b"host")
+        self.assertEqual(process.wait(timeout=3), 0)
 
     def test_wrong_host_pid_is_rejected(self) -> None:
         server = pipe.WindowsPipeServer()

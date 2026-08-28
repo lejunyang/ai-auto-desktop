@@ -53,6 +53,42 @@ jobs:
         if: success()
         run: python -m ai_auto_desktop probe
 
+  windows-contracts:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install project and Windows contract dependencies
+        run: python -m pip install wheel ".[ocr,windows-uia]"
+      - name: Run Windows ArtifactStore and named-pipe contracts
+        run: >-
+          python -m unittest -v
+          tests.test_artifacts
+          tests.test_artifact_ipc
+          tests.test_windows_artifact_pipe_contract
+          tests.test_plugin_artifact_transport
+          tests.test_runtime_artifacts
+          tests.test_ocr_plugin
+          tests.test_package_resources
+      - name: Run portable Windows driver and runtime contracts
+        run: >-
+          python -m unittest -v
+          tests.test_plugin
+          tests.test_runtime
+          tests.test_windows_uia_driver
+      - name: Validate canonical example
+        if: success()
+        run: python -m ai_auto_desktop validate examples/workflows/ocr-error-response.json
+      - name: Gate tracked workflow examples
+        if: success()
+        run: python -m unittest tests.test_examples -v
+      - name: Smoke capability probe
+        if: success()
+        run: python -m ai_auto_desktop probe
+
   windows-native:
     if: >-
       (github.event_name == 'workflow_dispatch' && inputs.run_windows_native == true) ||

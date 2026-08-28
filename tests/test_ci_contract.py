@@ -88,9 +88,29 @@ class CiTriggerContractTests(unittest.TestCase):
             source.split("  windows-native:", 1)[1],
         )
 
-        automatic_matrix = source.split("  windows-native:", 1)[0]
+        automatic_matrix = source.split("  windows-contracts:", 1)[0]
         self.assertNotIn("windows-latest", automatic_matrix)
         self.assertIn("windows-latest", source.split("  windows-native:", 1)[1])
+
+    def test_windows_contract_job_gates_native_artifact_transport_and_store(self) -> None:
+        source = CI_WORKFLOW.read_text(encoding="utf-8")
+        windows_contracts = source.split("  windows-contracts:", 1)[1].split(
+            "  windows-native:", 1
+        )[0]
+
+        self.assertIn("runs-on: windows-latest", windows_contracts)
+        self.assertIn('python -m pip install wheel ".[ocr,windows-uia]"', windows_contracts)
+        for module in (
+            "tests.test_artifacts",
+            "tests.test_artifact_ipc",
+            "tests.test_windows_artifact_pipe_contract",
+            "tests.test_plugin_artifact_transport",
+            "tests.test_runtime_artifacts",
+            "tests.test_ocr_plugin",
+            "tests.test_package_resources",
+        ):
+            self.assertIn(module, windows_contracts)
+        self.assertNotIn("tests.test_windows_uia_native", windows_contracts)
 
     def test_windows_result_is_uploaded_even_when_fixture_fails(self) -> None:
         source = CI_WORKFLOW.read_text(encoding="utf-8")
@@ -121,9 +141,14 @@ class CiTriggerContractTests(unittest.TestCase):
 
     def test_all_platform_jobs_gate_every_tracked_workflow_example(self) -> None:
         source = CI_WORKFLOW.read_text(encoding="utf-8")
-        automatic_job, windows_job = source.split("  windows-native:", 1)
+        automatic_job, remainder = source.split("  windows-contracts:", 1)
+        windows_contracts, windows_job = remainder.split("  windows-native:", 1)
 
-        for name, job in (("automatic", automatic_job), ("windows", windows_job)):
+        for name, job in (
+            ("automatic", automatic_job),
+            ("windows-contracts", windows_contracts),
+            ("windows-native", windows_job),
+        ):
             with self.subTest(job=name):
                 self.assertIn("- name: Gate tracked workflow examples", job)
                 self.assertIn("python -m unittest tests.test_examples -v", job)
