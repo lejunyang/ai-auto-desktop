@@ -237,7 +237,7 @@ class PackageResourceTests(unittest.TestCase):
             png = base64.b64decode(
                 "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
             )
-            if os.name == "posix":
+            if os.name in {{"posix", "nt"}}:
                 with ArtifactStore() as artifact_store:
                     artifact_ref = artifact_store.import_bytes(
                         png, media_type="image/png"
@@ -257,7 +257,7 @@ class PackageResourceTests(unittest.TestCase):
                     if exc.code != "ARTIFACT.PLATFORM_UNSUPPORTED":
                         raise AssertionError(exc.to_dict())
                 else:
-                    raise AssertionError("non-POSIX artifact store did not fail closed")
+                    raise AssertionError("unsupported artifact store did not fail closed")
 
             workflow = {{
                 "apiVersion": "ai-auto-desktop.dev/v1alpha1",

@@ -133,15 +133,91 @@ class ArtifactRefTests(unittest.TestCase):
 
 
 class ArtifactPlatformTests(unittest.TestCase):
-    def test_non_posix_fails_before_creating_temporary_root(self) -> None:
+    def test_windows_selects_memory_backend_without_creating_temporary_root(self) -> None:
         with mock.patch(
             "ai_auto_desktop.artifacts.os.name", "nt"
+        ), mock.patch(
+            "ai_auto_desktop.artifacts.tempfile.mkdtemp"
+        ) as make_directory:
+            store = ArtifactStore()
+            self.addCleanup(store.cleanup)
+        self.assertTrue(store._memory_backend)
+        make_directory.assert_not_called()
+
+    def test_windows_memory_backend_rejects_temporary_parent(self) -> None:
+        with mock.patch(
+            "ai_auto_desktop.artifacts.os.name", "nt"
+        ), self.assertRaises(ArtifactError) as raised:
+            ArtifactStore(temporary_parent="C:/private")
+        self.assertEqual(raised.exception.code, "ARTIFACT.INVALID_CONFIGURATION")
+
+    def test_unknown_platform_fails_before_creating_temporary_root(self) -> None:
+        with mock.patch(
+            "ai_auto_desktop.artifacts.os.name", "java"
         ), mock.patch(
             "ai_auto_desktop.artifacts.tempfile.mkdtemp"
         ) as make_directory, self.assertRaises(ArtifactError) as raised:
             ArtifactStore()
         self.assertEqual(raised.exception.code, "ARTIFACT.PLATFORM_UNSUPPORTED")
         make_directory.assert_not_called()
+
+
+class WindowsMemoryArtifactStoreTests(unittest.TestCase):
+    def setUp(self) -> None:
+        patcher = mock.patch("ai_auto_desktop.artifacts.os.name", "nt")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.png = encoded_image()
+
+    def test_roundtrip_is_immutable_path_free_and_quota_bounded(self) -> None:
+        store = ArtifactStore(max_total_bytes=len(self.png))
+        self.addCleanup(store.cleanup)
+        reference = store.import_bytes(bytearray(self.png), media_type="image/png")
+        record = store._records[reference.artifact_id]
+        self.assertEqual(record.payload, self.png)
+        self.assertEqual(record.storage_name, "")
+        self.assertIsNone(store._root)
+        with store.resolve(reference) as handle:
+            self.assertEqual(handle.read(), self.png)
+            self.assertFalse(hasattr(handle, "name"))
+        with self.assertRaises(ArtifactError) as raised:
+            store.import_bytes(self.png)
+        self.assertEqual(raised.exception.code, "ARTIFACT.QUOTA_EXCEEDED")
+
+    def test_batch_is_invisible_until_atomic_commit(self) -> None:
+        store = ArtifactStore()
+        self.addCleanup(store.cleanup)
+        batch = store.batch()
+        first = batch.import_bytes(self.png)
+        second = batch.import_bytes(encoded_image(size=(4, 3)))
+        for reference in (first, second):
+            with self.assertRaises(ArtifactError) as raised:
+                store.resolve(reference)
+            self.assertEqual(raised.exception.code, "ARTIFACT.SCOPE_MISMATCH")
+        self.assertEqual(batch.commit(), (first, second))
+        for reference in (first, second):
+            with store.resolve(reference) as handle:
+                self.assertGreater(len(handle.read()), 0)
+
+    def test_cleanup_and_expiry_revoke_payload_and_handles(self) -> None:
+        now = [10.0]
+        store = ArtifactStore(ttl_seconds=1, clock=lambda: now[0])
+        reference = store.import_bytes(self.png)
+        handle = store.resolve(reference)
+        now[0] = 11.0
+        self.assertEqual(store.purge_expired(), 1)
+        self.assertTrue(handle.closed)
+        self.assertNotIn(reference.artifact_id, store._records)
+        store.cleanup()
+        self.assertTrue(store.closed)
+
+    def test_import_file_is_fail_closed(self) -> None:
+        store = ArtifactStore()
+        self.addCleanup(store.cleanup)
+        with self.assertRaises(ArtifactError) as raised:
+            store.import_file("C:/secret/image.png")
+        self.assertEqual(raised.exception.code, "ARTIFACT.PLATFORM_UNSUPPORTED")
+        self.assertNotIn("secret", str(raised.exception))
 
 
 @unittest.skipUnless(os.name == "posix", "ArtifactStore v1alpha1 is POSIX-only")

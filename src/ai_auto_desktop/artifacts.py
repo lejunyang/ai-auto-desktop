@@ -4,10 +4,11 @@
 contains a filesystem path, run identifier, or storage key.  Only the
 ``ArtifactStore`` that issued a reference can resolve it.
 
-This v1alpha1 store is POSIX-only and is a trusted-Host boundary for built-in
-producers.  Pillow decoding still occurs in the Host process; untrusted image
-decoding must move to a separately constrained worker before third-party
-producers can use this API.
+The POSIX backend uses an fd-relative private directory.  Windows uses an
+immutable, quota-bounded in-memory backend because v1alpha1 artifacts are
+strictly run-scoped and are never restart-persistent.  Pillow decoding still
+occurs in the Host process; untrusted image decoding must move to a separately
+constrained worker before third-party producers can use this API.
 """
 
 from __future__ import annotations
@@ -308,6 +309,7 @@ class _ArtifactRecord:
     links: int
     modified_ns: int
     changed_ns: int
+    payload: bytes | None = None
 
 
 @dataclass(slots=True)
@@ -329,7 +331,8 @@ class _PublishedArtifact:
     digest: str
     media_type: str
     size_bytes: int
-    info: os.stat_result
+    info: os.stat_result | None
+    payload: bytes | None = None
 
 
 class ArtifactBatch:
@@ -439,7 +442,7 @@ class ArtifactStore:
         temporary_parent: str | os.PathLike[str] | None = None,
         clock: Callable[[], float] | None = None,
     ) -> None:
-        _require_posix_platform()
+        _require_supported_platform()
         self._ttl_seconds = _positive_number(ttl_seconds, "ttl_seconds")
         self._max_size_bytes = _positive_integer(max_size_bytes, "max_size_bytes")
         self._max_pixels = _positive_integer(max_pixels, "max_pixels")
@@ -481,6 +484,12 @@ class ArtifactStore:
         self._resolved_bytes = 0
         self._reserved_handles = 0
         self._reserved_resolved_bytes = 0
+        self._memory_backend = os.name == "nt"
+        if self._memory_backend and temporary_parent is not None:
+            raise ArtifactError(
+                "ARTIFACT.INVALID_CONFIGURATION",
+                "temporary_parent is unavailable for the Windows memory backend.",
+            )
         self._root_fd = -1
         self._parent_fd = -1
         self._root: Path | None = None
@@ -490,6 +499,8 @@ class ArtifactStore:
         parent_fd = -1
         created_info: os.stat_result | None = None
         root_info: os.stat_result | None = None
+        if self._memory_backend:
+            return
         try:
             root = Path(
                 tempfile.mkdtemp(
@@ -595,6 +606,11 @@ class ArtifactStore:
         media_type: str | None = None,
         ttl_seconds: float | None = None,
     ) -> ArtifactRef:
+        if self._memory_backend:
+            raise ArtifactError(
+                "ARTIFACT.PLATFORM_UNSUPPORTED",
+                "Windows ArtifactStore accepts trusted bytes/readers, not paths.",
+            )
         try:
             source_path = Path(source)
             descriptor = os.open(source_path, _READ_FLAGS)
@@ -652,7 +668,6 @@ class ArtifactStore:
             ttl_seconds, "ttl_seconds"
         )
         reservation: _PublishReservation | None = None
-        result: tuple[ArtifactRef, _ArtifactRecord] | None = None
         operation_active = False
         with self._publish_lock:
             try:
@@ -853,6 +868,19 @@ class ArtifactStore:
                 raise ArtifactError(
                     "ARTIFACT.INTERNAL", "Artifact identifier collision."
                 )
+            if self._memory_backend:
+                replacement = dict(self._records)
+                for reference, record, _reservation in entries:
+                    replacement[reference.artifact_id] = record
+                for reference, _record, _reservation in entries:
+                    self._provisional_ids.discard(reference.artifact_id)
+                self._records = replacement
+                self._stored_bytes += total
+                for _reference, _record, reservation in entries:
+                    self._release_publish_reservation_locked(reservation)
+                batch._entries.clear()
+                self._active_batches.discard(batch)
+                return references
             stored_bytes_before = self._stored_bytes
             committed: list[tuple[ArtifactRef, _ArtifactRecord]] = []
             try:
@@ -936,9 +964,11 @@ class ArtifactStore:
             self._provisional_ids.clear()
         try:
             with self._lock:
-                self._validate_root_fd()
-                self._clear_root_locked()
-            _fsync_directory_fd(self._root_fd)
+                if not self._memory_backend:
+                    self._validate_root_fd()
+                    self._clear_root_locked()
+            if not self._memory_backend:
+                _fsync_directory_fd(self._root_fd)
         except ArtifactError:
             pass
         finally:
@@ -960,6 +990,10 @@ class ArtifactStore:
         media_type: str | None,
         reservation: _PublishReservation,
     ) -> _PublishedArtifact:
+        if self._memory_backend:
+            return self._publish_memory_operation(
+                source, media_type=media_type, reservation=reservation
+            )
         with self._lock:
             self._ensure_open()
             staging = self._new_storage_name_locked()
@@ -1089,6 +1123,16 @@ class ArtifactStore:
                 self._temporary_names.discard(destination)
 
     def _read_record_operation(self, record: _ArtifactRecord) -> bytes:
+        if self._memory_backend:
+            payload = record.payload
+            if type(payload) is not bytes:
+                _integrity_error()
+            actual_digest = "sha256:" + hashlib.sha256(payload).hexdigest()
+            if len(payload) != record.ref.size_bytes or not hmac.compare_digest(
+                actual_digest, record.ref.digest
+            ):
+                _integrity_error()
+            return bytes(payload)
         descriptor = -1
         try:
             descriptor = os.open(
@@ -1202,6 +1246,24 @@ class ArtifactStore:
             size_bytes=published.size_bytes,
         )
         info = published.info
+        if self._memory_backend:
+            if info is not None or type(published.payload) is not bytes:
+                _integrity_error()
+            return reference, _ArtifactRecord(
+                ref=_copy_ref(reference),
+                storage_name="",
+                expires_at=expires_at,
+                device=0,
+                inode=0,
+                owner=0,
+                mode=0,
+                links=0,
+                modified_ns=0,
+                changed_ns=0,
+                payload=published.payload,
+            )
+        if info is None:
+            _integrity_error()
         record = _ArtifactRecord(
             ref=_copy_ref(reference),
             storage_name=published.storage_name,
@@ -1288,6 +1350,8 @@ class ArtifactStore:
                 self._expire_record_locked(handle._artifact_id)
 
     def _unlink_record_best_effort(self, record: _ArtifactRecord) -> None:
+        if self._memory_backend:
+            return
         descriptor = -1
         try:
             descriptor = os.open(
@@ -1382,6 +1446,8 @@ class ArtifactStore:
         )
 
     def _validate_root_fd(self) -> os.stat_result:
+        if self._memory_backend:
+            return os.stat_result((0,) * 10)
         if self._root_fd < 0:
             _integrity_error()
         try:
@@ -1392,6 +1458,63 @@ class ArtifactStore:
             _integrity_error()
         _validate_root_stat(info)
         return info
+
+    def _publish_memory_operation(
+        self,
+        source: BinaryIO,
+        *,
+        media_type: str | None,
+        reservation: _PublishReservation,
+    ) -> _PublishedArtifact:
+        payload = bytearray()
+        digest = hashlib.sha256()
+        while True:
+            try:
+                chunk = source.read(_CHUNK_SIZE)
+            except Exception:
+                raise ArtifactError(
+                    "ARTIFACT.SOURCE_READ_FAILED",
+                    "Artifact source could not be read.",
+                ) from None
+            if chunk == b"":
+                break
+            if type(chunk) not in (bytes, bytearray, memoryview):
+                raise ArtifactError(
+                    "ARTIFACT.INVALID_SOURCE",
+                    "Artifact source did not return binary data.",
+                )
+            try:
+                chunk_size = memoryview(chunk).nbytes
+                block = bytes(chunk)
+            except (TypeError, ValueError):
+                raise ArtifactError(
+                    "ARTIFACT.INVALID_SOURCE",
+                    "Artifact source did not return contiguous binary data.",
+                ) from None
+            if chunk_size > _CHUNK_SIZE or len(block) != chunk_size:
+                raise ArtifactError(
+                    "ARTIFACT.INVALID_SOURCE",
+                    "Artifact source returned an invalid byte block.",
+                )
+            if len(payload) + chunk_size > self._max_size_bytes:
+                raise ArtifactError(
+                    "ARTIFACT.SIZE_LIMIT_EXCEEDED",
+                    "Artifact exceeds the configured byte limit.",
+                    details={"maxSizeBytes": self._max_size_bytes},
+                )
+            self._grow_publish_reservation(reservation, chunk_size)
+            payload.extend(block)
+            digest.update(block)
+        immutable = bytes(payload)
+        detected_media = self._validate_image_bytes(immutable, media_type)
+        return _PublishedArtifact(
+            storage_name="",
+            digest="sha256:" + digest.hexdigest(),
+            media_type=detected_media,
+            size_bytes=len(immutable),
+            info=None,
+            payload=immutable,
+        )
 
     def _ensure_open(self) -> None:
         if self._closed or self._closing:
@@ -1473,6 +1596,85 @@ class ArtifactStore:
                 pass
         return detected
 
+    def _validate_image_bytes(
+        self, payload: bytes, requested_media: str | None
+    ) -> str:
+        return self._validate_image_reader(io.BytesIO(payload), requested_media)
+
+    def _validate_image_reader(
+        self, reader: BinaryIO, requested_media: str | None
+    ) -> str:
+        if Image is None:
+            raise ArtifactError(
+                "ARTIFACT.DEPENDENCY_UNAVAILABLE",
+                "Pillow is required to validate image artifacts.",
+            )
+        try:
+            reader.seek(0)
+            header = reader.read(16)
+            reader.seek(0)
+        except Exception:
+            raise ArtifactError(
+                "ARTIFACT.INVALID_IMAGE",
+                "Artifact image could not be inspected.",
+            ) from None
+        detected = _detect_media_type(header)
+        if detected is None:
+            raise ArtifactError(
+                "ARTIFACT.UNSUPPORTED_MEDIA_TYPE",
+                "Artifact is not a supported image format.",
+            )
+        if requested_media is not None:
+            if type(requested_media) is not str or requested_media not in SUPPORTED_MEDIA_TYPES:
+                raise ArtifactError(
+                    "ARTIFACT.UNSUPPORTED_MEDIA_TYPE",
+                    "Requested artifact media type is not supported.",
+                )
+            if not hmac.compare_digest(requested_media, detected):
+                raise ArtifactError(
+                    "ARTIFACT.MEDIA_TYPE_MISMATCH",
+                    "Artifact bytes do not match the requested media type.",
+                )
+        expected_format = {
+            "image/png": "PNG",
+            "image/jpeg": "JPEG",
+            "image/gif": "GIF",
+            "image/tiff": "TIFF",
+            "image/bmp": "BMP",
+            "image/webp": "WEBP",
+            "image/x-portable-anymap": "PPM",
+        }[detected]
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("error")
+                reader.seek(0)
+                with Image.open(reader) as image:
+                    self._validate_image_metadata(image, expected_format)
+                    image.verify()
+                reader.seek(0)
+                with Image.open(reader) as image:
+                    self._validate_image_metadata(image, expected_format)
+                    image.load()
+        except ArtifactError:
+            raise
+        except (Image.DecompressionBombError, Image.DecompressionBombWarning):
+            raise ArtifactError(
+                "ARTIFACT.PIXEL_LIMIT_EXCEEDED",
+                "Artifact image exceeds the decoder pixel safety limit.",
+                details={"maxPixels": self._max_pixels},
+            ) from None
+        except Exception:
+            raise ArtifactError(
+                "ARTIFACT.INVALID_IMAGE",
+                "Artifact image failed structural validation.",
+            ) from None
+        finally:
+            try:
+                reader.seek(0)
+            except Exception:
+                pass
+        return detected
+
     def _validate_image_metadata(self, image: Any, expected_format: str) -> None:
         if image.format != expected_format:
             raise ArtifactError(
@@ -1517,7 +1719,9 @@ class ArtifactStore:
         )
 
 
-def _require_posix_platform() -> None:
+def _require_supported_platform() -> None:
+    if os.name == "nt":
+        return
     required_dir_fd = (os.open, os.stat, os.link, os.unlink, os.rmdir)
     if (
         os.name != "posix"
@@ -1529,7 +1733,7 @@ def _require_posix_platform() -> None:
     ):
         raise ArtifactError(
             "ARTIFACT.PLATFORM_UNSUPPORTED",
-            "Artifact storage requires qualified POSIX dir-fd primitives.",
+            "Artifact storage requires Windows or qualified POSIX dir-fd primitives.",
         )
 
 
