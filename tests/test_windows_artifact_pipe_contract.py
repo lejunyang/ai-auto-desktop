@@ -89,6 +89,34 @@ class WindowsPipeNativeTests(unittest.TestCase):
         host.send_all(b"host", deadline)
         self.assertEqual(process.wait(timeout=3), 0)
 
+    def test_same_pipe_name_accepts_two_sequential_child_connections(self) -> None:
+        first = pipe.WindowsPipeServer()
+        self.addCleanup(first.close)
+        name = first.name
+        server = first
+        for iteration in range(2):
+            if iteration:
+                server = pipe.WindowsPipeServer(name)
+                self.addCleanup(server.close)
+            deadline = int((time.time() + 5) * 1000)
+            script = (
+                "import os,sys; "
+                "from ai_auto_desktop._win_named_pipe import connect_worker; "
+                "c=connect_worker(sys.argv[1],int(sys.argv[2]),int(sys.argv[3])); "
+                "c.send_all(b'ok',int(sys.argv[3])); c.close()"
+            )
+            process = subprocess.Popen(
+                [
+                    sys.executable, "-c", script, name, str(os.getpid()),
+                    str(deadline),
+                ],
+                env=dict(os.environ),
+            )
+            channel = server.accept(process.pid, deadline)
+            self.assertEqual(channel.recv_exact(2, deadline), b"ok")
+            channel.close()
+            self.assertEqual(process.wait(timeout=3), 0)
+
     def test_wrong_host_pid_is_rejected(self) -> None:
         server = pipe.WindowsPipeServer()
         self.addCleanup(server.close)

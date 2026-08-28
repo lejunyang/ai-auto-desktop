@@ -375,11 +375,17 @@ class WindowsPipeChannel:
 class WindowsPipeServer:
     """Single-instance current-user pipe listener created before Popen."""
 
-    def __init__(self) -> None:
+    def __init__(self, name: str | None = None) -> None:
         kernel = _kernel32()
         advapi = _advapi32()
         _configure_apis(kernel, advapi)
-        name = f"\\\\.\\pipe\\aad-artifact-{os.getpid()}-{secrets.token_hex(32)}"
+        if name is None:
+            name = (
+                f"\\\\.\\pipe\\aad-artifact-{os.getpid()}-"
+                f"{secrets.token_hex(32)}"
+            )
+        else:
+            name = _validate_pipe_name(name)
         descriptor = _SecurityDescriptor(kernel, advapi)
         try:
             handle = kernel.CreateNamedPipeW(

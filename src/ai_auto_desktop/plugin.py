@@ -181,6 +181,7 @@ class ProcessPlugin:
         self._artifact_channel: ArtifactChannel | None = None
         self._artifact_child_channel: socket.socket | None = None
         self._artifact_pipe_server: Any = None
+        self._artifact_pipe_name: str | None = None
 
     @property
     def pid(self) -> int | None:
@@ -285,6 +286,7 @@ class ProcessPlugin:
                 environment[CHANNEL_HOST_PID_ENV] = str(os.getpid())
                 popen_options["env"] = environment
                 self._artifact_pipe_server = pipe_server
+                self._artifact_pipe_name = pipe_server.name
 
             try:
                 process = subprocess.Popen(self.command, **popen_options)
@@ -474,7 +476,11 @@ class ProcessPlugin:
                     details={"dispatched": False},
                 )
             channel = self._artifact_channel
-            if channel is None and self._artifact_pipe_server is None:
+            if (
+                channel is None
+                and self._artifact_pipe_server is None
+                and self._artifact_pipe_name is None
+            ):
                 raise self._host_error(
                     "PLUGIN.HOST_ARTIFACT_CHANNEL_UNAVAILABLE",
                     "artifact side channel is unavailable on this platform",
@@ -506,6 +512,7 @@ class ProcessPlugin:
                 and self._artifact_channel is None
                 and self._artifact_child_channel is None
                 and self._artifact_pipe_server is None
+                and self._artifact_pipe_name is None
             ):
                 return
             self._closed = True
@@ -1147,6 +1154,10 @@ class ProcessPlugin:
                     except Exception:
                         pass
                     sender.join(timeout=_TERMINATE_GRACE_SECONDS)
+            if os.name == "nt" and channel is not None:
+                channel.close()
+                if self._artifact_channel is channel:
+                    self._artifact_channel = None
 
     def _send_artifact_inputs(
         self, channel: ArtifactChannel, request_id: str,
@@ -1183,6 +1194,18 @@ class ProcessPlugin:
     ) -> ArtifactChannel:
         server = self._artifact_pipe_server
         process = self._process
+        if server is None and self._artifact_pipe_name is not None:
+            try:
+                from ._win_named_pipe import WindowsPipeServer
+
+                server = WindowsPipeServer(self._artifact_pipe_name)
+                self._artifact_pipe_server = server
+            except Exception as exc:
+                raise self._host_error(
+                    "PLUGIN.HOST_ARTIFACT_CHANNEL_UNAVAILABLE",
+                    "artifact side channel could not be prepared",
+                    extra={"dispatched": dispatched},
+                ) from exc
         if server is None or process is None:
             raise self._host_error(
                 "PLUGIN.HOST_ARTIFACT_CHANNEL_UNAVAILABLE",
@@ -1577,6 +1600,7 @@ class ProcessPlugin:
                 server.close()
             except OSError:
                 pass
+        self._artifact_pipe_name = None
 
     def _join_readers(self) -> None:
         current = threading.current_thread()
