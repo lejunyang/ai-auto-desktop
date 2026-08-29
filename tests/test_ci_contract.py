@@ -112,6 +112,25 @@ class CiTriggerContractTests(unittest.TestCase):
             self.assertIn(module, windows_contracts)
         self.assertNotIn("tests.test_windows_uia_native", windows_contracts)
 
+    def test_windows_contract_job_gates_kernel_confinement(self) -> None:
+        # The Job Object supervisor, the script sandbox and the Windows probe
+        # checks all assert real kernel behaviour, so a Linux run cannot cover
+        # them.  They must run on the Windows job that executes on every push,
+        # not only on the opt-in native fixture job.
+        source = CI_WORKFLOW.read_text(encoding="utf-8")
+        windows_contracts = source.split("  windows-contracts:", 1)[1].split(
+            "  windows-native:", 1
+        )[0]
+
+        for module in (
+            "tests.test_windows_job_supervisor",
+            "tests.test_windows_script_sandbox",
+            "tests.test_windows_probe",
+            "tests.test_script_contracts",
+            "tests.test_probe",
+        ):
+            self.assertIn(module, windows_contracts)
+
     def test_windows_result_is_uploaded_even_when_fixture_fails(self) -> None:
         source = CI_WORKFLOW.read_text(encoding="utf-8")
         windows_job = source.split("  windows-native:", 1)[1]
