@@ -39,7 +39,8 @@
 | `apiVersion` / `kind` | 是 | 格式标识。 |
 | `metadata` | 是 | `name` 必需；可含 `version` `description` `labels` `annotations`。 |
 | `capture` | 是 | 录制环境事实，见 §4。 |
-| `steps` | 是 | 有序录制步骤列表，可为空（空录制是合法的，编译产出无 step 的 workflow 并在编译期报 `RECORDING.EMPTY` 警告）。 |
+| `steps` | 是 | 有序录制步骤列表，**不得为空**。实测 `workflow.schema.json` 将顶层 `steps` 定义为 `nonEmptySteps`（`minItems: 1`），空 step 列表会被直接拒绝（`$.steps: [] should be non-empty`）。因此空录制**不可编译**，必须报 `RECORDING.EMPTY` 错误而非警告；全部步骤被 `enabled: false` 禁用时同理。 |
+| `inputs` | 否 | 外部输入声明，直接映射为 workflow `inputs`。`logic` 条件与 `text.source: input` 引用的输入**必须**在此声明或由 `type_text` 自动推导。实测现有 workflow 编译器**不校验**输入引用：删除已被 `${{ inputs.X }}` 引用的声明，甚至引用完全不存在的输入，descriptor 仍被接受。因此录制编译器**必须**自行校验，缺失时报 `RECORDING.ORDER_INVALID`。 |
 | `redaction` | 是 | 脱敏策略与已脱敏字段清单，见 §5。 |
 | `platform_binding` | 是 | 录制平台绑定，见 §6。 |
 | `extensions` | 否 | `domain/key` 命名扩展。 |
@@ -283,7 +284,7 @@
 重排语义：`steps` 的**列表顺序**是唯一的顺序真相。重排就是改变列表顺序，编译器按现有规则把「未声明依赖」规范化为串行链。因此：
 
 - 重排后编译**必须**重新校验数据依赖。实测确认现有 `compile_descriptor()` 已覆盖这一项：把引用 `steps.X.output` 的步骤移到 X 之前，编译期即报 `uncovered_step_reference`。录制编译器复用该校验，不自建。
-- **引用完整性必须由录制编译器自行校验。** 实测发现现有 workflow 编译器**不覆盖**此项：删除被引用的步骤后，descriptor 仍被接受（因为现有语义是「引用必须被 `depends_on` 覆盖」，而缺失的 step 不产生依赖）；引用完全不存在的 id 同样被接受。因此录制编译器**必须**在生成 workflow 之前校验：每个 `steps.<id>` 引用与每个 `assertion.of_step` 都指向存在且 `enabled: true` 的步骤，否则报 `RECORDING.ORDER_INVALID`。
+- **引用完整性必须由录制编译器自行校验。** 实测发现现有 workflow 编译器**不覆盖**此项：删除被引用的步骤后，descriptor 仍被接受（因为现有语义是「引用必须被 `depends_on` 覆盖」，而缺失的 step 不产生依赖）；引用完全不存在的 id 同样被接受。**输入引用同样不被覆盖**——以已知可编译的 descriptor 为基线做单点改动，删掉 `should_save` 的声明而保留 `${{ inputs.should_save }}` 引用，仍被接受；引用凭空捏造的输入亦然。因此录制编译器**必须**在生成 workflow 之前校验：每个 `steps.<id>` 引用与每个 `assertion.of_step` 都指向存在且 `enabled: true` 的步骤，且每个 `${{ inputs.X }}` 都有对应声明，否则报 `RECORDING.ORDER_INVALID`。
 - 删除步骤时，任何引用它的 assertion 或表达式必须报错。UI **应当**默认提供 `enabled: false` 而非删除，因为禁用不产生悬空引用。
 - 录制顺序会被保留在 `metadata.annotations` 的 `ai-auto-desktop.dev/recorded-order` 中，供 UI 显示「已偏离录制顺序」，但它**不参与**执行语义。
 

@@ -112,6 +112,18 @@ class CiTriggerContractTests(unittest.TestCase):
             self.assertIn(module, windows_contracts)
         self.assertNotIn("tests.test_windows_uia_native", windows_contracts)
 
+    def test_windows_contract_job_gates_recording_compiler(self) -> None:
+        # The Windows job runs an explicit module list, so a new test module is
+        # only executed there if it is named.  The compiler turns captured
+        # events into something replayable, so a regression is not detectable
+        # from the capture tests alone.
+        source = CI_WORKFLOW.read_text(encoding="utf-8")
+        windows_contracts = source.split("  windows-contracts:", 1)[1].split(
+            "  windows-native:", 1
+        )[0]
+
+        self.assertIn("tests.test_recording_compiler", windows_contracts)
+
     def test_windows_contract_job_gates_recorder_capture(self) -> None:
         # Capture runs against a fake backend and needs no UIA, so every push
         # must exercise it.  Otherwise the recorder's privacy and event-loss

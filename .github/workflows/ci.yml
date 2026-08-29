@@ -80,6 +80,7 @@ jobs:
           tests.test_runtime
           tests.test_windows_uia_driver
           tests.test_windows_uia_capture
+          tests.test_recording_compiler
       - name: Run Windows kernel confinement contracts
         run: >-
           python -m unittest -v

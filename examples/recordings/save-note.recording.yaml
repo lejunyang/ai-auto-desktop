@@ -5,8 +5,10 @@ metadata:
   version: 0.1.0
   description: >-
     参考录制产物。展示三种步骤类型、locator 消歧策略与脱敏声明。
-    其编译结果见同目录 save-note.compiled.json，该结果已通过
+    本文件由 ai_auto_desktop.recording.compile_recording() 编译，
+    产物等价于同目录 save-note.compiled.json，并通过
     workflow.schema.json 与 ai_auto_desktop.compiler.compile_descriptor()。
+    两者的一致性由 tests/test_recording_compiler.py 守护。
   annotations:
     ai-auto-desktop.dev/recorded-order: focus_editor,enter_note,note_present,only_if_requested
 
@@ -34,6 +36,13 @@ redaction:
   title_policy: drop
   screenshots: none
   disclosed: []
+
+# 外部输入声明。logic 条件引用的输入必须在此声明，否则编译期报
+# RECORDING.ORDER_INVALID——现有 workflow 编译器不校验这一项。
+inputs:
+  should_save:
+    schema: {type: boolean}
+    default: false
 
 # 录制产物绑定录制平台：只能在 Windows 回放。
 platform_binding:
