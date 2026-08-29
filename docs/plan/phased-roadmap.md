@@ -111,6 +111,8 @@
 - Linux 先发布经资格验证的 KDE Plasma/X11 `.deb` 与诊断包；GNOME 与 Wayland 达到各自门槛后再增加对应 capability/profile，不宣称一包覆盖任意发行版。
 - Python 使用锁定 wheelhouse/哈希与可复现构建，优先 onedir/内嵌 runtime；原生 helper、OCR 模型和浏览器依赖分层打包。
 - 系统 secret store、确认 UI、policy 管理、审计完整性/保留/导出、截图 TTL 与隐私擦除。
+- 录制回放编排（契约见 `docs/spec/recording-session-v1alpha1.md`，架构见 `docs/architecture/record-replay.md`）：基于可访问性事件的录制、locator 唯一性合成与验证、stdlib 本地 UI 的编辑/重排、编译到 workflow、回放判定与失败归因。按平台分期：Windows 先行，Linux 次之，macOS 受 TCC 约束最后。
+- Windows 脚本沙箱（已实现，现状见 `docs/architecture/script-execution.md`）：复用 `_win_job` 的 Job Object 强制内存/CPU/进程数上限与进程树回收，配合空环境、隔离 cwd 与隔离解释器；探针以 `script.sandbox` 报告为 `degraded`，因为 Windows 无 per-process 网络/mount 命名空间，`network` 与 `filesystem` 仍未隔离。剩余工作：以 AppContainer 降权并真机验证这两项确实被拒，验证通过后方可改为 `available`。
 - 崩溃报告和 telemetry 默认脱敏、可关闭；建立真实应用 qualification matrix、SLO 和回归实验室。
 
 ### 退出门槛
@@ -118,6 +120,7 @@
 - 每个平台在对应真实 runner/VM 完成安装、升级、回滚、卸载、权限授权与最小真实动作 smoke；不能只以交叉编译成功验收。
 - 更新和插件包签名校验失败时拒绝安装，并能恢复上一可用版本。
 - 断电/Host crash/driver crash 后 journal 能区分可重放 read-only、可 reconcile idempotent 与 `UNKNOWN_EFFECT` 写步骤。
+- 录制回放：录制产物编译结果必须通过 `workflow.schema.json` 与 `compile_descriptor()`；录制器不得安装全局输入钩子；`value` 默认脱敏；locator 未能证明唯一时必须落盘为 `unresolved` 且禁用，不得乐观回放。
 - 发布说明列出经过资格验证的应用、OS 版本、桌面环境、权限和已知边界；未知应用明确标为 best effort。
 - 完成安全评审：prompt injection、plugin supply chain、secret exfiltration、symlink/path traversal、IPC spoofing、日志泄漏与 DoS。
 

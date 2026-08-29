@@ -25,6 +25,74 @@
 也不会尝试模拟原生 UIA。PowerShell runner 会保留 unittest 的退出码，因此 fixture 或其他
 contract 失败时 job 仍然失败，不会因留存报告而被误判为通过。
 
+
+## 在 Windows 上本地跑全量测试
+
+先设置 `PYTHONPATH`，否则 `ai_auto_desktop` 不可导入，会得到大量与平台无关的假失败：
+
+```powershell
+$env:PYTHONPATH = "<repo>\src"
+python -m unittest discover -s tests -t . -q
+```
+
+### 预期基线：76 errors、0 failures
+
+在 Windows 上跑全量套件**必然**出现 76 个 error。它们不是回归，而是若干 POSIX 专用测试在
+Windows 上无法运行：
+
+| 来源模块 | error 数 |
+| --- | --- |
+| `test_macos_result_verifier` | 54 |
+| `test_linux_kde_result_verifier` | 16 |
+| `test_durable_execution` | 2 |
+| `test_linux_atspi_driver` | 2 |
+| `test_macos_ax_driver` | 1 |
+| `test_macos_testkit` | 1 |
+
+根因只有两类：70 个是试图执行 `.sh` 辅助脚本（`WinError 193`，Windows 不能直接执行 shell
+脚本），4 个依赖 POSIX 权限语义。这些测试用的是 error 而非 `skipTest`，所以不会显示为
+skip——**这正是需要写下基线的原因**。
+
+判断标准，按此顺序检查：
+
+1. **`failures` 必须为 0。** 任何 failure 都是真实回归，不属于基线。
+2. **error 数不得超过 76，且分布必须与上表一致。** 数量变化就要逐条归因，不要因为「差不多」
+   放过；本次工作中 error 曾从 76 变为 77，追查后发现那 1 个确实是新增代码造成的
+   （给 `_probe_macos()` 增加检查后，旧测试仍按 2 元组解包），已修复。
+3. **下列模块必须全绿**，它们覆盖跨平台契约与 Windows 专有行为：
+
+   ```powershell
+   python -m unittest tests.test_probe tests.test_examples tests.test_script_contracts `
+     tests.test_windows_probe tests.test_windows_job_supervisor `
+     tests.test_windows_script_sandbox -q
+   ```
+
+   预期 `OK`（81 tests，5 skipped——skip 的是需要真实 macOS/Linux 的用例）。
+
+### 已知不稳定：`tests.test_journal` 并发迁移用例
+
+`test_concurrent_first_open_migrates_exactly_once` 在 Windows 上**不稳定**，会以
+`sqlite3.OperationalError: database is locked` 间歇失败。实测重复 12 次，工作区 5/12 失败；
+在不含本项工作的 HEAD 纯净 checkout 上同样复现（1/12），因此属于既有问题，与脚本沙箱无关。
+
+原因是该用例用 12 个线程竞争同一次 journal 迁移，而 Windows 的 SQLite 文件锁行为比 POSIX
+更严格，默认 busy timeout 下容易直接报锁冲突。
+
+因此**不要**把这个模块放进「必须全绿」的判定命令里，否则会出现随机红灯，反而掩盖真实回归。
+需要单独观察时可以重复运行定位：
+
+```powershell
+1..12 | ForEach-Object {
+  python -m unittest tests.test_journal.JournalTests.test_concurrent_first_open_migrates_exactly_once -q
+}
+```
+
+修复方向（尚未实施）：给该测试的连接设置足够的 busy timeout，或在 Windows 上降低并发度并显式
+断言迁移只发生一次，而不是依赖线程数。
+
+只有 Linux CI 与显式启用的 `windows-native` job 才是发布判定依据；本节只用于本地开发时
+快速区分「预期噪声」与「我刚写坏了」。
+
 ## 下载并核验 CI 结果
 
 只有从 GitHub Actions 页面手动运行 `CI` 并显式选择 `run_windows_native=true`，
