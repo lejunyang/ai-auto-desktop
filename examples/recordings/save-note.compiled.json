@@ -1,0 +1,235 @@
+{
+  "apiVersion": "ai-auto-desktop.dev/v1alpha1",
+  "kind": "Workflow",
+  "metadata": {
+    "name": "save-note",
+    "version": "0.1.0",
+    "annotations": {
+      "ai-auto-desktop.dev/recorded-order": "focus_editor,enter_note,note_present,only_if_requested"
+    }
+  },
+  "requires": {
+    "platforms": [
+      "windows"
+    ],
+    "capabilities": [
+      {
+        "name": "desktop.windows_uia",
+        "version": ">=0.1.0"
+      }
+    ]
+  },
+  "inputs": {
+    "note_text": {
+      "schema": {
+        "type": "string"
+      },
+      "required": true,
+      "sensitive": true
+    },
+    "should_save": {
+      "schema": {
+        "type": "boolean"
+      },
+      "default": false
+    }
+  },
+  "budgets": {
+    "max_duration": "5m",
+    "max_executed_steps": 200
+  },
+  "steps": [
+    {
+      "id": "focus_editor__snapshot",
+      "type": "action",
+      "uses": "desktop.windows_uia.snapshot@1",
+      "with": {
+        "window": {
+          "class_name": "Notepad"
+        }
+      },
+      "effect": {
+        "class": "read_only"
+      },
+      "risk": {
+        "category": "observe",
+        "level": "low"
+      }
+    },
+    {
+      "id": "focus_editor__find",
+      "type": "action",
+      "uses": "desktop.windows_uia.find@1",
+      "with": {
+        "snapshot_id": "${{ steps.focus_editor__snapshot.output.snapshot_id }}",
+        "revision": "${{ steps.focus_editor__snapshot.output.revision }}",
+        "locator": {
+          "role": "pane",
+          "name": "",
+          "class_name": "NotepadTextBox"
+        }
+      },
+      "effect": {
+        "class": "read_only"
+      },
+      "risk": {
+        "category": "observe",
+        "level": "low"
+      }
+    },
+    {
+      "id": "focus_editor",
+      "type": "action",
+      "uses": "desktop.windows_uia.focus@1",
+      "with": {
+        "target": "${{ steps.focus_editor__find.output.target }}",
+        "locator": {
+          "role": "pane",
+          "name": "",
+          "class_name": "NotepadTextBox"
+        }
+      },
+      "effect": {
+        "class": "idempotent"
+      },
+      "risk": {
+        "category": "observe",
+        "level": "low"
+      }
+    },
+    {
+      "id": "enter_note__snapshot",
+      "type": "action",
+      "uses": "desktop.windows_uia.snapshot@1",
+      "with": {
+        "window": {
+          "class_name": "Notepad"
+        }
+      },
+      "effect": {
+        "class": "read_only"
+      },
+      "risk": {
+        "category": "observe",
+        "level": "low"
+      }
+    },
+    {
+      "id": "enter_note__find",
+      "type": "action",
+      "uses": "desktop.windows_uia.find@1",
+      "with": {
+        "snapshot_id": "${{ steps.enter_note__snapshot.output.snapshot_id }}",
+        "revision": "${{ steps.enter_note__snapshot.output.revision }}",
+        "locator": {
+          "role": "document",
+          "name": "文本编辑器"
+        }
+      },
+      "effect": {
+        "class": "read_only"
+      },
+      "risk": {
+        "category": "observe",
+        "level": "low"
+      }
+    },
+    {
+      "id": "enter_note",
+      "type": "action",
+      "uses": "desktop.windows_uia.type_text@1",
+      "with": {
+        "target": "${{ steps.enter_note__find.output.target }}",
+        "locator": {
+          "role": "document",
+          "name": "文本编辑器"
+        },
+        "text": "${{ inputs.note_text }}"
+      },
+      "effect": {
+        "class": "non_idempotent"
+      },
+      "risk": {
+        "category": "input",
+        "level": "medium"
+      },
+      "postcondition": {
+        "observe": {
+          "uses": "desktop.windows_uia.find@1",
+          "with": {
+            "locator": {
+              "role": "document",
+              "name": "文本编辑器"
+            }
+          }
+        },
+        "condition": "${{ observation.found }}",
+        "timeout": "5s",
+        "poll_interval": "200ms"
+      }
+    },
+    {
+      "id": "only_if_requested",
+      "type": "if",
+      "condition": "${{ inputs.should_save }}",
+      "then": [
+        {
+          "id": "click_save__snapshot",
+          "type": "action",
+          "uses": "desktop.windows_uia.snapshot@1",
+          "with": {
+            "window": {
+              "class_name": "Notepad"
+            }
+          },
+          "effect": {
+            "class": "read_only"
+          },
+          "risk": {
+            "category": "observe",
+            "level": "low"
+          }
+        },
+        {
+          "id": "click_save__find",
+          "type": "action",
+          "uses": "desktop.windows_uia.find@1",
+          "with": {
+            "snapshot_id": "${{ steps.click_save__snapshot.output.snapshot_id }}",
+            "revision": "${{ steps.click_save__snapshot.output.revision }}",
+            "locator": {
+              "role": "button",
+              "name": "保存"
+            }
+          },
+          "effect": {
+            "class": "read_only"
+          },
+          "risk": {
+            "category": "observe",
+            "level": "low"
+          }
+        },
+        {
+          "id": "click_save",
+          "type": "action",
+          "uses": "desktop.windows_uia.invoke@1",
+          "with": {
+            "target": "${{ steps.click_save__find.output.target }}",
+            "locator": {
+              "role": "button",
+              "name": "保存"
+            }
+          },
+          "effect": {
+            "class": "non_idempotent"
+          },
+          "risk": {
+            "category": "input",
+            "level": "medium"
+          }
+        }
+      ]
+    }
+  ]
+}

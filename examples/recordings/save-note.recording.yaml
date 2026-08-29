@@ -1,0 +1,108 @@
+apiVersion: ai-auto-desktop.dev/v1alpha1
+kind: Recording
+metadata:
+  name: save-note
+  version: 0.1.0
+  description: >-
+    参考录制产物。展示三种步骤类型、locator 消歧策略与脱敏声明。
+    其编译结果见同目录 save-note.compiled.json，该结果已通过
+    workflow.schema.json 与 ai_auto_desktop.compiler.compile_descriptor()。
+  annotations:
+    ai-auto-desktop.dev/recorded-order: focus_editor,enter_note,note_present,only_if_requested
+
+# 录制环境事实。必须由 probe_capabilities() 真实输出填充。
+capture:
+  platform: windows
+  recorded_at: "2026-08-29T10:00:00Z"
+  driver:
+    name: desktop.windows_uia
+    version: 0.1.0
+  probe:
+    windows.session: available
+    windows.input_desktop: available
+    windows.integrity: available
+    windows.dpi: degraded
+  environment:
+    integrity_level: medium
+    # 250% 缩放下指针坐标量化到 2.5 物理像素：小目标回放可能偏移。
+    pointer_quantisation: 2.5
+    scaled_display: true
+
+# 脱敏是默认行为。语义树的 value 会带出文件正文，故默认丢弃。
+redaction:
+  value_policy: drop
+  title_policy: drop
+  screenshots: none
+  disclosed: []
+
+# 录制产物绑定录制平台：只能在 Windows 回放。
+platform_binding:
+  platform: windows
+  replay_platforms: [windows]
+
+steps:
+  # role+name+class_name 达到唯一，即停止收窄。
+  - id: focus_editor
+    kind: interaction
+    action: focus
+    locator:
+      role: pane
+      name: ""
+      class_name: NotepadTextBox
+    disambiguation:
+      strategy: unique
+      verified: true
+    observed:
+      role: pane
+      had_value: false
+      actions: [focus, type_text, pointer_click]
+      states: {enabled: true, offscreen: false, focusable: true}
+      # 仅作诊断，不得用于生成坐标点击。
+      bounds: {x: 390, y: 289, width: 1140, height: 33}
+      provenance: {framework_id: XAML}
+
+  # 文本外提为 input，不内联字面量。
+  - id: enter_note
+    kind: interaction
+    action: type_text
+    locator:
+      role: document
+      name: 文本编辑器
+    text:
+      source: input
+      input: note_text
+      sensitive: true
+    disambiguation:
+      strategy: unique
+      verified: true
+
+  # assertion 编译为 enter_note 的 postcondition，不是独立步骤。
+  - id: note_present
+    kind: assertion
+    of_step: enter_note
+    observe:
+      action: find
+      locator:
+        role: document
+        name: 文本编辑器
+    expect:
+      mode: exists
+    timeout: 5s
+    poll_interval: 200ms
+
+  # 人工插入的自定义逻辑，映射到已有的 if step。
+  - id: only_if_requested
+    kind: logic
+    logic:
+      type: condition
+      when: "${{ inputs.should_save }}"
+    steps:
+      - id: click_save
+        kind: interaction
+        action: invoke
+        locator:
+          role: button
+          name: 保存
+        disambiguation:
+          strategy: unique
+          verified: true
