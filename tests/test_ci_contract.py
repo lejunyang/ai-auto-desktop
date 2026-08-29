@@ -112,6 +112,17 @@ class CiTriggerContractTests(unittest.TestCase):
             self.assertIn(module, windows_contracts)
         self.assertNotIn("tests.test_windows_uia_native", windows_contracts)
 
+    def test_windows_contract_job_gates_recorder_capture(self) -> None:
+        # Capture runs against a fake backend and needs no UIA, so every push
+        # must exercise it.  Otherwise the recorder's privacy and event-loss
+        # guarantees would only be checked on the opt-in native job.
+        source = CI_WORKFLOW.read_text(encoding="utf-8")
+        windows_contracts = source.split("  windows-contracts:", 1)[1].split(
+            "  windows-native:", 1
+        )[0]
+
+        self.assertIn("tests.test_windows_uia_capture", windows_contracts)
+
     def test_windows_contract_job_gates_kernel_confinement(self) -> None:
         # The Job Object supervisor, the script sandbox and the Windows probe
         # checks all assert real kernel behaviour, so a Linux run cannot cover

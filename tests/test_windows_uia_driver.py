@@ -1431,6 +1431,9 @@ class WindowsUIAProcessTests(unittest.TestCase):
                 "set_value",
                 "type_text",
                 "pointer_click",
+                "capture_start",
+                "capture_poll",
+                "capture_stop",
             },
         )
         for name, contract in manifest["actions"].items():

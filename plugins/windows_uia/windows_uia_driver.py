@@ -25,6 +25,7 @@ import json
 import math
 import os
 import sys
+import threading
 import time
 from typing import Any, Callable, NoReturn, Protocol
 import unicodedata
@@ -45,6 +46,46 @@ MAX_DEPTH = 128
 MAX_NODES = 5000
 MAX_CANDIDATE_SUMMARIES = 10
 
+# Capture session limits.  The buffer is bounded because a session the operator
+# forgets to stop must not grow without limit; overflow is reported rather than
+# hidden, since a silently dropped event is indistinguishable from no
+# interaction at all.
+# UIA event ids mapped to the recorder vocabulary.  Numeric literals rather
+# than UIA module attributes, so the mapping stays testable on hosts without
+# comtypes.  Measured against a real window: Invoked=20009, TextChanged=20015,
+# ElementSelected=20012, and the Value property is 30045.
+_CAPTURE_EVENT_KINDS = {
+    20009: "invoked",
+    20015: "value_changed",
+    20012: "selection_changed",
+}
+UIA_VALUE_PROPERTY_ID = 30045
+
+MAX_CAPTURE_EVENTS = 512
+MAX_CAPTURE_SESSIONS = 4
+MAX_CAPTURE_POLL_EVENTS = 128
+CAPTURE_SESSION_SECONDS = 3600.0
+
+# Interactions measured to raise no accessibility event whatsoever.  Reported to
+# the caller so the recorder UI can say "nothing recordable here" instead of
+# dropping the interaction silently.
+CAPTURE_BLIND_SPOTS = (
+    {
+        "kind": "non_focusable_click",
+        "detail": (
+            "Clicking a control that cannot take focus raises no event; such "
+            "controls do not respond to the click at all."
+        ),
+    },
+    {
+        "kind": "pointer_motion",
+        "detail": (
+            "Hover and pointer motion raise no event and are deliberately not "
+            "recorded; they are not replayable as a semantic action."
+        ),
+    },
+)
+
 ACTION_IDS = {
     name: f"{PLUGIN_NAME}.{name}@1"
     for name in (
@@ -56,10 +97,14 @@ ACTION_IDS = {
         "set_value",
         "type_text",
         "pointer_click",
+        "capture_start",
+        "capture_poll",
+        "capture_stop",
     )
 }
 ACTION_NAMES = {full_name: short_name for short_name, full_name in ACTION_IDS.items()}
 WRITE_ACTIONS = frozenset({"focus", "invoke", "set_value", "type_text", "pointer_click"})
+CAPTURE_ACTIONS = frozenset({"capture_start", "capture_poll", "capture_stop"})
 NODE_ACTIONS = frozenset({"focus", "invoke", "set_value", "type_text", "pointer_click"})
 STATE_NAMES = ("enabled", "offscreen", "focusable", "focused", "read_only")
 
@@ -284,6 +329,70 @@ WRITE_OUTPUT_SCHEMA: dict[str, Any] = {
     "additionalProperties": False,
 }
 
+CAPTURE_ERRORS: tuple[tuple[str, str, bool], ...] = (
+    ("DRIVER.CAPTURE_UNSUPPORTED", "Event capture is unavailable on this host.", False),
+    ("DRIVER.CAPTURE_NOT_FOUND", "The capture session does not exist.", False),
+    ("DRIVER.CAPTURE_LIMIT", "Too many concurrent capture sessions.", False),
+)
+
+# An observed interaction.  There is deliberately no field for the element's
+# value: the value is readable, but recording it would persist whatever the user
+# typed, so the recorder captures only that a change occurred.
+CAPTURE_EVENT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "required": ["kind", "sequence", "element"],
+    "properties": {
+        "kind": {
+            "enum": ["focus_changed", "invoked", "value_changed", "selection_changed"]
+        },
+        "sequence": {"type": "integer", "minimum": 0},
+        "element": {
+            "type": "object",
+            "required": ["role_id", "name", "class_name", "automation_id"],
+            "properties": {
+                "role_id": {"type": ["integer", "null"]},
+                "name": {"type": ["string", "null"]},
+                "class_name": {"type": ["string", "null"]},
+                "automation_id": {"type": ["string", "null"]},
+                "framework_id": {"type": ["string", "null"]},
+                "process_id": {"type": ["integer", "null"]},
+            },
+            "additionalProperties": False,
+        },
+    },
+    "additionalProperties": False,
+}
+
+CAPTURE_BLIND_SPOT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "required": ["kind", "detail"],
+    "properties": {"kind": {"type": "string"}, "detail": {"type": "string"}},
+    "additionalProperties": False,
+}
+
+CAPTURE_SESSION_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "required": ["session_id", "window", "blind_spots"],
+    "properties": {
+        "session_id": {"type": "string"},
+        "window": {"type": "object"},
+        "blind_spots": {"type": "array", "items": CAPTURE_BLIND_SPOT_SCHEMA},
+    },
+    "additionalProperties": False,
+}
+
+CAPTURE_POLL_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "required": ["session_id", "events", "dropped_events", "active"],
+    "properties": {
+        "session_id": {"type": "string"},
+        "events": {"type": "array", "items": CAPTURE_EVENT_SCHEMA},
+        "dropped_events": {"type": "integer", "minimum": 0},
+        "active": {"type": "boolean"},
+    },
+    "additionalProperties": False,
+}
+
 ACTION_CONTRACTS: dict[str, dict[str, Any]] = {
     "list_windows": _contract(
         "List top-level Windows desktop windows through Win32/UIA.",
@@ -429,6 +538,76 @@ ACTION_CONTRACTS: dict[str, dict[str, Any]] = {
         errors=COMMON_ERRORS + LOCATOR_ERRORS + ACTION_ERRORS,
         permissions=("desktop.observe", "desktop.input"),
     ),
+    "capture_start": _contract(
+        (
+            "Subscribe to accessibility events for one window so interactions "
+            "can be observed.  Reads no element values and injects no input."
+        ),
+        effect="contextual",
+        risk_category="observe",
+        risk_level="medium",
+        input_schema={
+            "type": "object",
+            "required": ["window"],
+            "properties": {"window": {"type": "object", "minProperties": 1}},
+            "additionalProperties": False,
+        },
+        output_schema=CAPTURE_SESSION_SCHEMA,
+        errors=COMMON_ERRORS + CAPTURE_ERRORS,
+        permissions=("desktop.observe",),
+    ),
+    "capture_poll": _contract(
+        (
+            "Drain buffered interaction events for one capture session.  Never "
+            "returns element values; reports dropped events and known blind "
+            "spots instead of hiding them."
+        ),
+        effect="contextual",
+        risk_category="observe",
+        risk_level="low",
+        input_schema={
+            "type": "object",
+            "required": ["session_id"],
+            "properties": {
+                "session_id": {"type": "string", "minLength": 1, "maxLength": 64},
+                "max_events": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": MAX_CAPTURE_POLL_EVENTS,
+                },
+            },
+            "additionalProperties": False,
+        },
+        output_schema=CAPTURE_POLL_SCHEMA,
+        errors=COMMON_ERRORS + CAPTURE_ERRORS,
+        permissions=("desktop.observe",),
+    ),
+    "capture_stop": _contract(
+        "Unsubscribe one capture session and release its native handlers.",
+        effect="contextual",
+        risk_category="observe",
+        risk_level="low",
+        input_schema={
+            "type": "object",
+            "required": ["session_id"],
+            "properties": {
+                "session_id": {"type": "string", "minLength": 1, "maxLength": 64}
+            },
+            "additionalProperties": False,
+        },
+        output_schema={
+            "type": "object",
+            "required": ["session_id", "stopped", "dropped_events"],
+            "properties": {
+                "session_id": {"type": "string"},
+                "stopped": {"type": "boolean"},
+                "dropped_events": {"type": "integer", "minimum": 0},
+            },
+            "additionalProperties": False,
+        },
+        errors=COMMON_ERRORS + CAPTURE_ERRORS,
+        permissions=("desktop.observe",),
+    ),
 }
 
 MANIFEST: dict[str, Any] = {
@@ -530,6 +709,115 @@ class UIABackend(Protocol):
     ) -> Any: ...
 
     def same_element(self, previous: Any, current: Any, *, deadline: float) -> bool: ...
+
+    def subscribe(
+        self,
+        window: Mapping[str, Any],
+        sink: "CaptureSink",
+        *,
+        deadline: float,
+    ) -> Any: ...
+
+    def unsubscribe(self, subscription: Any, *, deadline: float) -> None: ...
+
+
+class CaptureSink:
+    """Thread-safe buffer between native event callbacks and the request loop.
+
+    In the driver's MTA apartment, UIA delivers callbacks on COM RPC worker
+    threads (measured: callbacks arrived on a thread distinct from the main
+    one), concurrently with request handling.  Every field is therefore guarded
+    by the lock.
+
+    The buffer is bounded.  When it overflows the oldest events are discarded
+    and counted, because a silently dropped event is indistinguishable from the
+    user not interacting at all -- the exact failure mode this design has to
+    avoid.
+    """
+
+    __slots__ = ("_lock", "_events", "_dropped", "_sequence", "_limit")
+
+    def __init__(self, limit: int = MAX_CAPTURE_EVENTS) -> None:
+        self._lock = threading.Lock()
+        self._events: deque[dict[str, Any]] = deque()
+        self._dropped = 0
+        self._sequence = 0
+        self._limit = limit
+
+    def emit(self, kind: str, element: Mapping[str, Any] | None) -> None:
+        """Record one observed interaction.
+
+        Called from native callback threads.  Must never raise into the COM
+        caller: a handler that throws can tear down the subscription.
+        """
+
+        try:
+            record = {
+                "kind": kind,
+                "element": _capture_element(element),
+            }
+        except Exception:
+            # An element that vanished mid-callback must not kill the session.
+            record = {"kind": kind, "element": _capture_element(None)}
+        with self._lock:
+            record["sequence"] = self._sequence
+            self._sequence += 1
+            self._events.append(record)
+            while len(self._events) > self._limit:
+                self._events.popleft()
+                self._dropped += 1
+
+    def drain(self, max_events: int) -> tuple[list[dict[str, Any]], int]:
+        with self._lock:
+            taken = [self._events.popleft()
+                     for _ in range(min(max_events, len(self._events)))]
+            dropped = self._dropped
+            self._dropped = 0
+        return taken, dropped
+
+    @property
+    def dropped(self) -> int:
+        with self._lock:
+            return self._dropped
+
+
+def _capture_element(element: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Normalize an event element to identity fields only.
+
+    Value is deliberately absent.  It is readable -- measured: value changes
+    raise TextChanged plus a Value property change, and the new text can be read
+    back -- but persisting it would store whatever the user typed.  The recorder
+    keeps only what a locator needs.
+    """
+
+    source: Mapping[str, Any] = element if isinstance(element, Mapping) else {}
+
+    def field(name: str) -> Any:
+        value = source.get(name)
+        if isinstance(value, str):
+            return value[:MAX_FIELD_CHARS]
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value
+        return None
+
+    return {
+        "role_id": field("role_id"),
+        "name": field("name"),
+        "class_name": field("class_name"),
+        "automation_id": field("automation_id"),
+        "framework_id": field("framework_id"),
+        "process_id": field("process_id"),
+    }
+
+
+@dataclass(slots=True)
+class _CaptureSession:
+    session_id: str
+    window: dict[str, Any]
+    sink: CaptureSink
+    subscription: Any
+    expires_at: float
+    active: bool = True
 
 
 @dataclass(slots=True)
@@ -1193,6 +1481,10 @@ class WindowsUIADriver:
         self.generation = uuid.uuid4().hex
         self._revision = 0
         self._current: _SnapshotRecord | None = None
+        # Capture sessions are keyed by id.  Guarded because capture_poll may
+        # run while a native callback thread is appending to a sink.
+        self._captures: dict[str, _CaptureSession] = {}
+        self._capture_lock = threading.Lock()
 
     def execute(self, action: str, args: Any, *, deadline: float) -> Any:
         try:
@@ -1210,6 +1502,12 @@ class WindowsUIADriver:
             return self._snapshot(values, deadline)
         if action == "find":
             return self._find(values, deadline)
+        if action == "capture_start":
+            return self._capture_start(values, deadline)
+        if action == "capture_poll":
+            return self._capture_poll(values, deadline)
+        if action == "capture_stop":
+            return self._capture_stop(values, deadline)
         if action in WRITE_ACTIONS:
             try:
                 return self._write(action, values, deadline)
@@ -1221,6 +1519,131 @@ class WindowsUIADriver:
                     exc.retryable = False
                 raise
         _fail("DRIVER.INVALID_REQUEST", f"unknown action: {action}", action=action)
+
+    def _capture_start(self, args: dict[str, Any], deadline: float) -> dict[str, Any]:
+        _only_keys(args, {"window"}, "args")
+        window = _object(args.get("window"), "window")
+        if not window:
+            _fail("DRIVER.INVALID_REQUEST", "window must not be empty")
+
+        self._expire_captures()
+        with self._capture_lock:
+            if len(self._captures) >= MAX_CAPTURE_SESSIONS:
+                _fail(
+                    "DRIVER.CAPTURE_LIMIT",
+                    "too many concurrent capture sessions",
+                    active_sessions=len(self._captures),
+                    limit=MAX_CAPTURE_SESSIONS,
+                )
+
+        subscribe = getattr(self.backend, "subscribe", None)
+        if subscribe is None:
+            _fail(
+                "DRIVER.CAPTURE_UNSUPPORTED",
+                "this backend cannot observe accessibility events",
+                backend=getattr(self.backend, "name", "unknown"),
+            )
+
+        sink = CaptureSink()
+        subscription = subscribe(window, sink, deadline=deadline)
+        session = _CaptureSession(
+            session_id=uuid.uuid4().hex,
+            window=_json_safe(window),
+            sink=sink,
+            subscription=subscription,
+            expires_at=time.monotonic() + CAPTURE_SESSION_SECONDS,
+        )
+        with self._capture_lock:
+            self._captures[session.session_id] = session
+        return {
+            "session_id": session.session_id,
+            "window": session.window,
+            # Reported up front so the UI can warn before recording, rather
+            # than leaving the operator to wonder why an interaction vanished.
+            "blind_spots": [dict(item) for item in CAPTURE_BLIND_SPOTS],
+        }
+
+    def _capture_poll(self, args: dict[str, Any], deadline: float) -> dict[str, Any]:
+        _only_keys(args, {"session_id", "max_events"}, "args")
+        session = self._capture_session(args.get("session_id"))
+        max_events = args.get("max_events", MAX_CAPTURE_POLL_EVENTS)
+        if isinstance(max_events, bool) or not isinstance(max_events, int):
+            _fail("DRIVER.INVALID_REQUEST", "max_events must be an integer")
+        if not 1 <= max_events <= MAX_CAPTURE_POLL_EVENTS:
+            _fail(
+                "DRIVER.INVALID_REQUEST",
+                "max_events is out of range",
+                minimum=1,
+                maximum=MAX_CAPTURE_POLL_EVENTS,
+            )
+        events, dropped = session.sink.drain(max_events)
+        return {
+            "session_id": session.session_id,
+            "events": events,
+            # Never hidden: a dropped event and an idle user look identical
+            # unless the loss is reported explicitly.
+            "dropped_events": dropped,
+            "active": session.active,
+        }
+
+    def _capture_stop(self, args: dict[str, Any], deadline: float) -> dict[str, Any]:
+        _only_keys(args, {"session_id"}, "args")
+        session = self._capture_session(args.get("session_id"))
+        dropped = self._release_capture(session, deadline)
+        return {
+            "session_id": session.session_id,
+            "stopped": True,
+            "dropped_events": dropped,
+        }
+
+    def _capture_session(self, value: Any) -> _CaptureSession:
+        if not isinstance(value, str) or not value:
+            _fail("DRIVER.INVALID_REQUEST", "session_id must be a non-empty string")
+        self._expire_captures()
+        with self._capture_lock:
+            session = self._captures.get(value)
+        if session is None:
+            _fail("DRIVER.CAPTURE_NOT_FOUND", "unknown capture session")
+        return session
+
+    def _release_capture(self, session: _CaptureSession, deadline: float) -> int:
+        with self._capture_lock:
+            self._captures.pop(session.session_id, None)
+        session.active = False
+        remaining, dropped = session.sink.drain(MAX_CAPTURE_EVENTS)
+        unsubscribe = getattr(self.backend, "unsubscribe", None)
+        if unsubscribe is not None and session.subscription is not None:
+            try:
+                unsubscribe(session.subscription, deadline=deadline)
+            except DriverError:
+                raise
+            except Exception as exc:  # native teardown must not leak
+                raise DriverError(
+                    "DRIVER.ACTION_FAILED",
+                    "capture teardown failed",
+                    data={"exception_type": type(exc).__name__},
+                ) from exc
+        return dropped + len(remaining)
+
+    def _expire_captures(self) -> None:
+        """Drop sessions past their deadline so a forgotten session cannot
+        hold native handlers forever."""
+
+        now = time.monotonic()
+        with self._capture_lock:
+            stale = [s for s in self._captures.values() if s.expires_at <= now]
+            for session in stale:
+                self._captures.pop(session.session_id, None)
+        for session in stale:
+            session.active = False
+            unsubscribe = getattr(self.backend, "unsubscribe", None)
+            if unsubscribe is not None and session.subscription is not None:
+                try:
+                    unsubscribe(session.subscription, deadline=now + 5.0)
+                except Exception:
+                    # Expiry is best effort; a failure here must not block the
+                    # request that triggered the sweep.
+                    pass
 
     def _list_windows(self, args: dict[str, Any], deadline: float) -> dict[str, Any]:
         _only_keys(args, {"include_invisible"}, "args")
@@ -2161,6 +2584,45 @@ class ComtypesUIABackend:
         except Exception as exc:
             raise self._native_failure("CompareElements", exc) from exc
 
+    def subscribe(
+        self, window: Mapping[str, Any], sink: CaptureSink, *, deadline: float
+    ) -> Any:
+        selected = self._resolve_window(window, deadline=deadline)
+        hwnd = selected["window"]["handle"]
+        try:
+            element = self.automation.ElementFromHandle(hwnd)
+        except Exception as exc:
+            raise self._native_failure("ElementFromHandle", exc) from exc
+        try:
+            return _install_capture_handlers(self, element, sink)
+        except Exception as exc:
+            raise self._native_failure("AddEventHandler", exc) from exc
+
+    def unsubscribe(self, subscription: Any, *, deadline: float) -> None:
+        if not isinstance(subscription, Mapping):
+            return
+        element = subscription.get("element")
+        failures = []
+        try:
+            self.automation.RemoveFocusChangedEventHandler(subscription["focus"])
+        except Exception as exc:
+            failures.append(exc)
+        for event_id in _CAPTURE_EVENT_KINDS:
+            try:
+                self.automation.RemoveAutomationEventHandler(
+                    event_id, element, subscription["automation"]
+                )
+            except Exception as exc:
+                failures.append(exc)
+        try:
+            self.automation.RemovePropertyChangedEventHandler(
+                element, subscription["property"]
+            )
+        except Exception as exc:
+            failures.append(exc)
+        if failures:
+            raise self._native_failure("RemoveEventHandler", failures[0])
+
     @staticmethod
     def _bounds(rectangle: Any) -> dict[str, int] | None:
         try:
@@ -2564,6 +3026,89 @@ class ComtypesUIABackend:
             return bool(self.automation.CompareElements(previous, current))
         except Exception as exc:
             raise self._native_failure("CompareElements", exc) from exc
+
+
+def _install_capture_handlers(backend: Any, element: Any, sink: CaptureSink) -> dict:
+    """Register UIA event handlers for one window subtree.
+
+    Returns the handler objects so they can be removed later and, critically,
+    so they stay referenced: a comtypes COMObject that goes out of scope can be
+    collected while UIA still holds a raw pointer to it.
+    """
+
+    import comtypes
+
+    UIA = backend.UIA
+    automation = backend.automation
+
+    def describe(sender: Any) -> dict:
+        # Property reads on a dying element can fail; identity is best effort.
+        def read(name: str) -> Any:
+            try:
+                return getattr(sender, name)
+            except Exception:
+                return None
+
+        return {
+            "role_id": read("CurrentControlType"),
+            "name": read("CurrentName"),
+            "class_name": read("CurrentClassName"),
+            "automation_id": read("CurrentAutomationId"),
+            "framework_id": read("CurrentFrameworkId"),
+            "process_id": read("CurrentProcessId"),
+        }
+
+    class _FocusHandler(comtypes.COMObject):
+        _com_interfaces_ = [UIA.IUIAutomationFocusChangedEventHandler]
+
+        def IUIAutomationFocusChangedEventHandler_HandleFocusChangedEvent(self, sender):
+            sink.emit("focus_changed", describe(sender))
+            return 0
+
+    class _AutomationHandler(comtypes.COMObject):
+        _com_interfaces_ = [UIA.IUIAutomationEventHandler]
+
+        def IUIAutomationEventHandler_HandleAutomationEvent(self, sender, event_id):
+            kind = _CAPTURE_EVENT_KINDS.get(event_id)
+            if kind is not None:
+                sink.emit(kind, describe(sender))
+            return 0
+
+    class _PropertyHandler(comtypes.COMObject):
+        _com_interfaces_ = [UIA.IUIAutomationPropertyChangedEventHandler]
+
+        def IUIAutomationPropertyChangedEventHandler_HandlePropertyChangedEvent(
+            self, sender, property_id, new_value
+        ):
+            # new_value carries the typed text.  Deliberately discarded: the
+            # recorder stores that a value changed, never what it became.
+            del new_value
+            if property_id == UIA.UIA_ValueValuePropertyId:
+                sink.emit("value_changed", describe(sender))
+            return 0
+
+    focus_handler = _FocusHandler()
+    automation_handler = _AutomationHandler()
+    property_handler = _PropertyHandler()
+
+    automation.AddFocusChangedEventHandler(None, focus_handler)
+    for event_id in _CAPTURE_EVENT_KINDS:
+        automation.AddAutomationEventHandler(
+            event_id, element, UIA.TreeScope_Subtree, None, automation_handler
+        )
+    automation.AddPropertyChangedEventHandler(
+        element,
+        UIA.TreeScope_Subtree,
+        None,
+        property_handler,
+        [UIA.UIA_ValueValuePropertyId],
+    )
+    return {
+        "element": element,
+        "focus": focus_handler,
+        "automation": automation_handler,
+        "property": property_handler,
+    }
 
 
 def create_default_backend() -> UIABackend:

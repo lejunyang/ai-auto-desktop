@@ -65,7 +65,16 @@ UIA 事件通过 COM 回调投递，**订阅方必须持续 dispatch 窗口消�
 
 实测过程：第一轮测量对 6 种交互全部得到「0 事件」，看起来像「UIA 什么都观察不到」。真实原因是等待代码只调用了 `time.sleep()`，从未 dispatch 消息。补上 `PeekMessageW`/`TranslateMessage`/`DispatchMessageW` 循环后，同样的订阅立刻收到事件。
 
-因此 driver 的捕获线程规定为：注册 handler → 进入消息泵循环 → 在泵循环内消费事件队列。**不得**用 `sleep` 等待事件；用 `sleep` 等待会得到「静默无事件」，而这与「用户真的没操作」在观测上完全一样，属于最危险的一类假阴性。
+但这条结论**只对 STA 成立**，而现有 Windows driver 运行在 MTA（import comtypes 前设置 `sys.coinit_flags = 0`）。补测对比：
+
+| 套间 | 无消息泵时的事件数 | 回调线程 |
+| --- | --- | --- |
+| STA | 0（假阴性） | 订阅线程 |
+| MTA | 2（正常收到） | RPC 工作线程（非主线程） |
+
+因此 driver 的捕获线程规定为：**MTA 下不加消息泵**，而是假定回调在任意 RPC 线程并发到达——事件缓冲加锁、状态不跨线程裸读。这同时意味着捕获不能占用 NDJSON 主循环：回调自行入队，`observe` 请求只负责把已入队事件取走。
+
+若将来某平台改用 STA，则该线程**必须**运行消息泵，且不得以 `sleep` 等待事件。把这条写清的原因是：STA 下缺少消息泵会得到「静默无事件」，与「用户真的没操作」在观测上完全一样，属于最危险的一类假阴性。
 
 ### 3.2 实测：哪些交互可观察，哪些是盲区
 
@@ -254,3 +263,50 @@ only_if_requested (if)     depends_on=('enter_note',)
 - 不做「录制即可信」。录制产物经过与手写 workflow 完全相同的校验与策略检查。
 - 不在录制路径引入新的 IPC 机制。复用现有 NDJSON + artifact 通道。
 - 不默认截图。`redaction.screenshots` 默认 `none`；实测已证明语义树本身就会带出文件正文（spec §5），截图只会放大暴露面。
+
+## 11. 捕获层实现（Windows / UIA）
+
+§3 只到设计为止，本节记录已落地的实现。三个 action 均声明 `desktop.observe` 单一权限，**不含** `desktop.input`——捕获只观察，不注入。
+
+| action | 作用 | 关键约束 |
+| --- | --- | --- |
+| `capture_start` | 订阅一个窗口的事件 | 返回 `blind_spots`，把已知观察不到的交互**前置**告知 |
+| `capture_poll` | 取走缓冲区中的事件 | 返回 `dropped_events`，事件丢失必须显式暴露 |
+| `capture_stop` | 注销订阅、释放原生 handler | 返回未被取走的事件计数 |
+
+### 11.1 为什么是三次调用而不是一次阻塞调用
+
+driver 走 NDJSON 请求/响应，一个长跑的捕获会独占主循环。因此回调只负责入队，`capture_poll` 只负责取走；捕获期间 driver 仍可服务其他请求。
+
+### 11.2 并发模型：MTA，无消息泵
+
+实测（§3.1、证据 §11.5）：在 driver 的 MTA 套间中，COM 在独立 RPC 线程投递回调，不需要消息泵。由此产生两条硬性要求，均已实现并有测试覆盖：
+
+- 事件缓冲区 `CaptureSink` 全程持锁，`emit` 与 `drain` 可并发；回归测试用 4 个写线程 + 1 个读线程共 2000 个事件验证**零丢失、序号唯一**。
+- 回调**不得**向 COM 抛异常：元素在回调期间失效是正常现象，`emit` 捕获异常并降级为空 identity，而不是让订阅被拆掉。
+
+### 11.3 缓冲有界，且丢失必须可见
+
+会话缓冲上限 `MAX_CAPTURE_EVENTS`，溢出时丢弃最旧事件并计数，由 `capture_poll` 上报。这条不是防御性编程，而是直接来自本项目反复踩到的失败模式：**静默丢弃的事件与「用户什么都没做」在观测上完全一致**。同理，`capture_stop` 也会把未取走的事件计入返回值，而不是当作无事发生。
+
+会话数量上限 `MAX_CAPTURE_SESSIONS`，并有 `CAPTURE_SESSION_SECONDS` 过期清理——忘记 stop 的会话不能永久持有原生 handler。
+
+### 11.4 值可读，但刻意不记录
+
+事件 schema 的 `element` 只有定位所需字段（`role_id`/`name`/`class_name`/`automation_id`/`framework_id`/`process_id`），**没有** value 字段。属性回调收到的 `new_value` 被显式丢弃。
+
+这不是能力限制：实测值变更完全可读（§3.3）。这是隐私取舍——录制器记录「某控件的值变了」，不记录「变成了什么」。回归测试对此有两道保险：schema 中不得出现 value 字段，以及即使传入携带值的元素，产出的事件文本中也不得包含该值。
+
+### 11.5 已验证
+
+对真实 fixture 窗口跑通端到端，每条「已捕获」结论都配了独立证据：
+
+| 场景 | 独立证据 | 捕获结果 |
+| --- | --- | --- |
+| Invoke 按钮 | fixture 状态标签 `idle` → `invoked` | `focus_changed` + `invoked` |
+| 值变更 | `Value` 由 `Draft` → `captured-e2e` | `value_changed` |
+| 隐私 | — | 事件文本中不含 `captured-e2e` |
+| 点击不可聚焦控件 | 状态标签**未变**，证明控件本身忽略点击 | 0 事件（真实盲区） |
+| stop 后再 poll | — | `DRIVER.CAPTURE_NOT_FOUND` |
+
+单元测试 24 项，全部经过变异验证：注入「记录 value」「静默丢弃」「去掉盲区提示」「去掉会话上限」「stop 后仍可 poll」「给捕获加 input 权限」六种缺陷，均被对应测试捕获。
