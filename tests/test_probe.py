@@ -5,6 +5,7 @@ from __future__ import annotations
 from contextlib import redirect_stdout
 import io
 import json
+import os
 import unittest
 from unittest import mock
 
@@ -47,7 +48,12 @@ class ProbeTests(unittest.TestCase):
         with mock.patch.object(
             probe, "_call_boolean_symbol", side_effect=(("ok", True), ("ok", False))
         ) as call:
-            accessibility, capture = probe._probe_macos()
+            checks = {check.name: check for check in probe._probe_macos()}
+
+        # Select by name: the probe reports additional checks (such as the
+        # script sandbox) and this test is about the two permission preflights.
+        accessibility = checks["macos.accessibility"]
+        capture = checks["macos.screen_capture"]
 
         self.assertEqual(accessibility.state, "available")
         self.assertEqual(capture.state, "unavailable")
@@ -100,25 +106,69 @@ class ProbeTests(unittest.TestCase):
 
         completed = Completed()
         supplied = {
-            "PATH": "/tmp/untrusted",
+            "PATH": "/tmp/untrusted" if os.name != "nt" else r"C:\untrusted",
             "DBUS_SESSION_BUS_ADDRESS": "unix:path=/fixture",
             "SECRET": "must-not-leak",
         }
+        # An absolute program path is platform specific: a POSIX-rooted path is
+        # not absolute to a Windows kernel and vice versa.  Use whichever form
+        # the running platform would actually accept.
+        program = (
+            r"C:\Windows\System32\whoami.exe"
+            if os.name == "nt"
+            else "/usr/bin/gdbus"
+        )
         with mock.patch.object(probe.subprocess, "Popen", return_value=completed) as popen:
             result = probe._run_read_only(
-                ("/usr/bin/gdbus", "--version"),
+                (program, "--version"),
                 environ=supplied,
                 pass_environment=("DBUS_SESSION_BUS_ADDRESS",),
             )
 
         self.assertEqual(result.outcome, "ok")
         child_environment = popen.call_args.kwargs["env"]
-        self.assertEqual(child_environment["PATH"], probe._TRUSTED_COMMAND_PATH)
+        self.assertEqual(
+            child_environment["PATH"], probe._trusted_command_path()
+        )
+        self.assertNotEqual(
+            child_environment["PATH"], supplied["PATH"],
+            "the caller's PATH must never reach a probe helper",
+        )
         self.assertEqual(
             child_environment["DBUS_SESSION_BUS_ADDRESS"],
             "unix:path=/fixture",
         )
         self.assertNotIn("SECRET", child_environment)
+
+    def test_trusted_command_path_is_fixed_system_directories(self) -> None:
+        entries = probe._trusted_command_path().split(os.pathsep)
+        self.assertTrue(entries)
+        for entry in entries:
+            with self.subTest(entry=entry):
+                self.assertTrue(
+                    probe._is_absolute_program_path(entry),
+                    "every trusted directory must be absolute",
+                )
+
+    def test_absolute_program_path_is_evaluated_for_this_platform(self) -> None:
+        relative = (
+            r"..\helper.exe" if os.name == "nt" else "../helper"
+        )
+        for rejected in ("", "gdbus", "gdbus.exe", relative):
+            with self.subTest(rejected=rejected):
+                self.assertFalse(probe._is_absolute_program_path(rejected))
+        if os.name == "nt":
+            self.assertTrue(
+                probe._is_absolute_program_path(r"C:\Windows\notepad.exe")
+            )
+            self.assertTrue(
+                probe._is_absolute_program_path(r"\\server\share\tool.exe")
+            )
+            # Drive-relative, i.e. resolved against the drive's current
+            # directory.  Accepting it would reintroduce a search.
+            self.assertFalse(probe._is_absolute_program_path("C:helper.exe"))
+        else:
+            self.assertTrue(probe._is_absolute_program_path("/usr/bin/gdbus"))
 
     def test_read_only_command_rejects_path_lookup(self) -> None:
         with mock.patch.object(probe.subprocess, "Popen") as popen:

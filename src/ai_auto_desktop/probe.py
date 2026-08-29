@@ -26,7 +26,7 @@ import uuid
 PROBE_API_VERSION = "ai-auto-desktop.dev/probe/v1alpha1"
 PROBE_KIND = "CapabilityProbe"
 PROBE_STATES = frozenset({"available", "degraded", "unavailable", "unknown"})
-_TRUSTED_COMMAND_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
+_POSIX_TRUSTED_COMMAND_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
 _COMMAND_OUTPUT_LIMIT = 64 * 1024
 _SYSTEM_LIBRARY_DIRECTORIES = (
     Path("/lib"),
@@ -34,6 +34,52 @@ _SYSTEM_LIBRARY_DIRECTORIES = (
     Path("/usr/lib"),
     Path("/usr/lib64"),
 )
+
+
+# Win32 constants used by the read-only Windows probes.
+_SM_CXSCREEN = 0
+_SM_REMOTESESSION = 0x1000
+_DESKTOPHORZRES = 118
+_UOI_NAME = 2
+_DESKTOP_READOBJECTS = 0x0001
+_TOKEN_QUERY = 0x0008
+_TokenElevation = 20
+_TokenIntegrityLevel = 25
+# Mandatory label RIDs, highest first, mapped to stable reportable names.
+_INTEGRITY_LEVELS = (
+    (0x4000, "system"),
+    (0x3000, "high"),
+    (0x2000, "medium"),
+    (0x1000, "low"),
+)
+_DPI_AWARENESS = {0: "unaware", 1: "system", 2: "per_monitor"}
+
+
+def _windows_trusted_command_path() -> str:
+    """Fixed system directories for Windows probe helpers.
+
+    Resolved from SystemRoot rather than assuming ``C:\\Windows`` so the probe
+    still works on a system installed to another volume, and never from the
+    caller's PATH.  A probe helper is executable code, so an attacker-controlled
+    PATH entry must not be able to satisfy a lookup.
+    """
+
+    system_root = os.environ.get("SystemRoot") or os.environ.get("windir")
+    if not system_root:
+        system_root = "C:\\Windows"
+    root = Path(system_root)
+    return os.pathsep.join(
+        str(candidate)
+        for candidate in (root / "System32", root, root / "System32" / "Wbem")
+    )
+
+
+def _trusted_command_path() -> str:
+    """The platform's fixed search path for probe helpers."""
+
+    if os.name == "nt":
+        return _windows_trusted_command_path()
+    return _POSIX_TRUSTED_COMMAND_PATH
 
 
 @dataclass(frozen=True, slots=True)
@@ -153,7 +199,30 @@ def _which(command: str) -> str | None:
     # Probe helpers are executable code.  Resolve only from fixed system
     # directories rather than trusting the caller's PATH, then execute the
     # returned absolute path to avoid a second PATH lookup.
-    return shutil.which(command, path=_TRUSTED_COMMAND_PATH)
+    return shutil.which(command, path=_trusted_command_path())
+
+
+def _is_absolute_program_path(program: str) -> bool:
+    """Whether ``program`` is an absolute path on the *current* platform.
+
+    ``Path('/usr/bin/gdbus').is_absolute()`` is False on Windows and
+    ``Path('C:/Windows/System32/whoami.exe').is_absolute()`` is False on POSIX,
+    so a single pathlib call cannot express "already resolved, do not search
+    PATH".  The check below accepts what the running kernel would treat as
+    absolute, and additionally accepts a POSIX-rooted path on POSIX only, so a
+    Windows drive-relative path such as ``C:helper.exe`` is still rejected.
+    """
+
+    if not program:
+        return False
+    if os.name == "nt":
+        drive, tail = os.path.splitdrive(program)
+        if drive and tail[:1] in ("\\", "/"):
+            return True
+        # A UNC path (\\server\share) has a drive component and a rooted tail,
+        # so it is covered above.  Anything else is relative.
+        return False
+    return program.startswith("/")
 
 
 def _library_found(name: str) -> bool:
@@ -180,14 +249,22 @@ def _run_read_only(
     environ: Mapping[str, str] | None = None,
     pass_environment: Sequence[str] = (),
 ) -> _CommandResult:
-    if not argv or not Path(argv[0]).is_absolute():
+    if not argv or not _is_absolute_program_path(argv[0]):
         return _CommandResult("error")
     source_environment = os.environ if environ is None else environ
     child_environment = {
-        "PATH": _TRUSTED_COMMAND_PATH,
+        "PATH": _trusted_command_path(),
         "LANG": "C",
         "LC_ALL": "C",
     }
+    if os.name == "nt":
+        # Windows resolves a bare program name against SystemRoot even with a
+        # restricted PATH, and several console helpers fail outright without
+        # SystemRoot present.  Pass the minimum needed to run, nothing more.
+        for name in ("SystemRoot", "windir", "SystemDrive"):
+            value = source_environment.get(name) or os.environ.get(name)
+            if value:
+                child_environment[name] = value
     for name in pass_environment:
         value = source_environment.get(name)
         if value:
@@ -271,7 +348,551 @@ def _terminate_probe_process(process: subprocess.Popen[bytes]) -> None:
 
 
 def _probe_windows() -> tuple[CapabilityCheck, ...]:
-    return (_check_windows_uia(),)
+    return (
+        _check_windows_uia(),
+        _check_windows_session(),
+        _check_windows_input_desktop(),
+        _check_windows_integrity(),
+        _check_windows_dpi(),
+        _check_script_sandbox(),
+    )
+
+
+def _check_script_sandbox() -> CapabilityCheck:
+    """Report whether script steps can run here, and which boundaries hold.
+
+    This is deliberately not a boolean.  A ``degraded`` sandbox still executes
+    scripts with kernel-enforced resource limits, an empty environment and an
+    isolated interpreter, but leaves the boundaries named in ``gaps`` to the
+    ambient user account.  Reporting that difference is the point: an operator
+    deciding whether to pass ``--allow-scripts`` needs to know which
+    boundaries are real on this host.
+    """
+
+    try:
+        from .script import sandbox_availability
+
+        report = sandbox_availability()
+    except Exception as exc:  # pragma: no cover - defensive
+        return CapabilityCheck(
+            "script.sandbox",
+            "unknown",
+            "The script sandbox could not be inspected.",
+            {"exception_type": type(exc).__name__},
+        )
+
+    state = str(report.get("state", "unknown"))
+    mechanism = report.get("mechanism")
+    gaps = tuple(report.get("gaps", ()))
+    missing = tuple(report.get("missing", ()))
+    evidence: dict[str, Any] = {
+        "mechanism": mechanism,
+        "enforced": (
+            "memory_limit",
+            "cpu_time_limit",
+            "process_count_limit",
+            "process_tree_reclamation",
+            "empty_environment",
+            "isolated_working_directory",
+            "isolated_interpreter",
+        )
+        if state in {"available", "degraded"}
+        else (),
+        "not_enforced": gaps,
+        "missing_prerequisites": missing,
+    }
+    if "interpreter" in report:
+        # The path itself is withheld: an interpreter under a user profile
+        # contains the account name, and the probe report must not carry
+        # environment-identifying values.  What matters for diagnosis is that a
+        # concrete interpreter was resolved and pinned, not where it lives.
+        evidence["interpreter_resolved"] = bool(report["interpreter"])
+
+    if state == "unavailable":
+        return CapabilityCheck(
+            "script.sandbox",
+            "unavailable",
+            "No supported script sandbox is available here, so script steps "
+            "fail closed. Nothing was executed.",
+            evidence,
+        )
+    if state == "degraded":
+        return CapabilityCheck(
+            "script.sandbox",
+            "degraded",
+            "Script steps can run with kernel-enforced resource limits, an "
+            "empty environment and an isolated interpreter, but "
+            f"{', '.join(gaps) if gaps else 'some boundaries'} are not "
+            "isolated: a script retains the ambient user account's access "
+            "there. Scripts still require --allow-scripts.",
+            evidence,
+        )
+    return CapabilityCheck(
+        "script.sandbox",
+        "available",
+        "Script steps can run with every documented boundary enforced; "
+        "scripts still require --allow-scripts. Nothing was executed.",
+        evidence,
+    )
+
+
+def _windows_dll(name: str) -> Any:
+    """Load a system DLL by bare name, letting Windows resolve from System32.
+
+    ``ctypes.WinDLL`` on a bare well-known system name resolves through the
+    standard search order, which begins with the already-loaded module and
+    System32.  The probe never accepts a caller-supplied library name.
+    """
+
+    return ctypes.WinDLL(name, use_last_error=True)  # type: ignore[attr-defined]
+
+
+def _check_windows_session() -> CapabilityCheck:
+    """Report whether this process sits in an interactive session.
+
+    Session 0 isolation is the single most common reason a service-hosted
+    automation host sees an empty desktop: it can create UIA objects and still
+    have no interactive window station to drive.  The check is pure
+    observation - it never attaches to another session or desktop.
+    """
+
+    evidence: dict[str, Any] = {
+        "session_id_available": False,
+        "interactive_session": None,
+        "session_zero": None,
+        "remote_session": None,
+    }
+    try:
+        kernel = _windows_dll("kernel32")
+        session_id = ctypes.c_uint32()
+        kernel.ProcessIdToSessionId.argtypes = [
+            ctypes.c_uint32, ctypes.POINTER(ctypes.c_uint32)
+        ]
+        kernel.ProcessIdToSessionId.restype = ctypes.c_int
+        if not kernel.ProcessIdToSessionId(
+            ctypes.c_uint32(os.getpid()), ctypes.byref(session_id)
+        ):
+            return CapabilityCheck(
+                "windows.session",
+                "unknown",
+                "The session identifier for this process could not be read.",
+                evidence,
+            )
+        evidence["session_id_available"] = True
+        # The numeric id is deliberately not reported: it is environment
+        # identifying detail, and only the Session 0 distinction is actionable.
+        evidence["session_zero"] = session_id.value == 0
+        evidence["interactive_session"] = session_id.value != 0
+
+        user32 = _windows_dll("user32")
+        user32.GetSystemMetrics.argtypes = [ctypes.c_int]
+        user32.GetSystemMetrics.restype = ctypes.c_int
+        evidence["remote_session"] = bool(
+            user32.GetSystemMetrics(_SM_REMOTESESSION)
+        )
+    except (AttributeError, OSError) as exc:
+        evidence["error_type"] = type(exc).__name__
+        return CapabilityCheck(
+            "windows.session",
+            "unknown",
+            "The Windows session prerequisite check could not run.",
+            evidence,
+        )
+    if evidence["session_zero"]:
+        return CapabilityCheck(
+            "windows.session",
+            "unavailable",
+            "This process runs in Session 0, which has no interactive desktop; "
+            "UI automation cannot reach user applications from here.",
+            evidence,
+        )
+    return CapabilityCheck(
+        "windows.session",
+        "available",
+        "This process runs in an interactive session; no desktop was attached "
+        "and no window was enumerated.",
+        evidence,
+    )
+
+
+def _check_windows_input_desktop() -> CapabilityCheck:
+    """Report whether the process is on the window station receiving input.
+
+    A process whose thread desktop is not the current input desktop can read
+    parts of UIA yet never see or drive what the user sees.  While a UAC or
+    credential prompt owns the input desktop, that desktop is the secure
+    desktop and is unreachable to a normal process by design; this check
+    observes that condition rather than trying to defeat it.
+    """
+
+    evidence: dict[str, Any] = {
+        "window_station_named": False,
+        "interactive_window_station": None,
+        "input_desktop_readable": None,
+        "thread_desktop_is_input_desktop": None,
+    }
+    input_desktop = None
+    user32 = None
+    try:
+        user32 = _windows_dll("user32")
+        kernel = _windows_dll("kernel32")
+        user32.GetProcessWindowStation.restype = ctypes.c_void_p
+        user32.GetThreadDesktop.argtypes = [ctypes.c_uint32]
+        user32.GetThreadDesktop.restype = ctypes.c_void_p
+        user32.OpenInputDesktop.argtypes = [
+            ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32
+        ]
+        user32.OpenInputDesktop.restype = ctypes.c_void_p
+        user32.CloseDesktop.argtypes = [ctypes.c_void_p]
+        user32.CloseDesktop.restype = ctypes.c_int
+        kernel.GetCurrentThreadId.restype = ctypes.c_uint32
+
+        station = user32.GetProcessWindowStation()
+        station_name = _windows_user_object_name(user32, station)
+        if station_name is not None:
+            evidence["window_station_named"] = True
+            # WinSta0 is the only interactive window station.  The name itself
+            # is a fixed OS constant, so reporting the comparison is safe.
+            evidence["interactive_window_station"] = (
+                station_name.upper() == "WINSTA0"
+            )
+
+        thread_desktop = user32.GetThreadDesktop(kernel.GetCurrentThreadId())
+        thread_desktop_name = _windows_user_object_name(user32, thread_desktop)
+
+        input_desktop = user32.OpenInputDesktop(0, False, _DESKTOP_READOBJECTS)
+        if not input_desktop:
+            # Access is denied while the secure desktop is in front, which is
+            # a legitimate state rather than a misconfiguration.
+            evidence["input_desktop_readable"] = False
+            evidence["last_error"] = ctypes.get_last_error()
+            return CapabilityCheck(
+                "windows.input_desktop",
+                "degraded",
+                "The current input desktop cannot be opened; a secure desktop "
+                "or another session may own user input.",
+                evidence,
+            )
+        evidence["input_desktop_readable"] = True
+        input_desktop_name = _windows_user_object_name(user32, input_desktop)
+        if thread_desktop_name is not None and input_desktop_name is not None:
+            evidence["thread_desktop_is_input_desktop"] = (
+                thread_desktop_name == input_desktop_name
+            )
+    except (AttributeError, OSError) as exc:
+        evidence["error_type"] = type(exc).__name__
+        return CapabilityCheck(
+            "windows.input_desktop",
+            "unknown",
+            "The Windows desktop prerequisite check could not run.",
+            evidence,
+        )
+    finally:
+        if input_desktop and user32 is not None:
+            try:
+                user32.CloseDesktop(input_desktop)
+            except OSError:
+                pass
+
+    if evidence["interactive_window_station"] is False:
+        return CapabilityCheck(
+            "windows.input_desktop",
+            "unavailable",
+            "This process is not on the interactive window station, so it "
+            "cannot observe or drive the user's desktop.",
+            evidence,
+        )
+    if evidence["thread_desktop_is_input_desktop"] is False:
+        return CapabilityCheck(
+            "windows.input_desktop",
+            "degraded",
+            "This thread's desktop is not the desktop currently receiving "
+            "input; injected input would not reach the visible session.",
+            evidence,
+        )
+    if evidence["thread_desktop_is_input_desktop"] is None:
+        return CapabilityCheck(
+            "windows.input_desktop",
+            "unknown",
+            "The relationship between this thread's desktop and the input "
+            "desktop could not be established.",
+            evidence,
+        )
+    return CapabilityCheck(
+        "windows.input_desktop",
+        "available",
+        "This process is on the interactive window station and its thread "
+        "desktop is the current input desktop; no input was injected.",
+        evidence,
+    )
+
+
+def _windows_user_object_name(user32: Any, handle: Any) -> str | None:
+    """Read a window station or desktop name, or None when unavailable."""
+
+    if not handle:
+        return None
+    try:
+        user32.GetUserObjectInformationW.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+            ctypes.POINTER(ctypes.c_uint32),
+        ]
+        user32.GetUserObjectInformationW.restype = ctypes.c_int
+        buffer = ctypes.create_unicode_buffer(256)
+        needed = ctypes.c_uint32()
+        if not user32.GetUserObjectInformationW(
+            handle,
+            _UOI_NAME,
+            buffer,
+            ctypes.sizeof(buffer),
+            ctypes.byref(needed),
+        ):
+            return None
+        return buffer.value or None
+    except (AttributeError, OSError, ValueError):
+        return None
+
+
+def _check_windows_integrity() -> CapabilityCheck:
+    """Report this process's integrity level and elevation.
+
+    UIPI blocks input and most window messages from a lower-integrity process
+    to a higher-integrity one.  A medium-integrity host therefore cannot drive
+    an elevated application even though every UIA object creates successfully,
+    which is precisely the failure that looks like a driver bug at runtime.
+    """
+
+    evidence: dict[str, Any] = {
+        "token_readable": False,
+        "elevated": None,
+        "integrity_level": None,
+    }
+    token = ctypes.c_void_p()
+    kernel = None
+    try:
+        advapi = _windows_dll("advapi32")
+        kernel = _windows_dll("kernel32")
+        kernel.GetCurrentProcess.restype = ctypes.c_void_p
+        advapi.OpenProcessToken.argtypes = [
+            ctypes.c_void_p, ctypes.c_uint32, ctypes.POINTER(ctypes.c_void_p)
+        ]
+        advapi.OpenProcessToken.restype = ctypes.c_int
+        if not advapi.OpenProcessToken(
+            kernel.GetCurrentProcess(), _TOKEN_QUERY, ctypes.byref(token)
+        ):
+            return CapabilityCheck(
+                "windows.integrity",
+                "unknown",
+                "The process token could not be opened for the UIPI check.",
+                evidence,
+            )
+        evidence["token_readable"] = True
+
+        advapi.GetTokenInformation.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+            ctypes.POINTER(ctypes.c_uint32),
+        ]
+        advapi.GetTokenInformation.restype = ctypes.c_int
+
+        elevation = ctypes.c_uint32()
+        returned = ctypes.c_uint32()
+        if advapi.GetTokenInformation(
+            token,
+            _TokenElevation,
+            ctypes.byref(elevation),
+            ctypes.sizeof(elevation),
+            ctypes.byref(returned),
+        ):
+            evidence["elevated"] = bool(elevation.value)
+
+        evidence["integrity_level"] = _windows_integrity_level(advapi, token)
+    except (AttributeError, OSError) as exc:
+        evidence["error_type"] = type(exc).__name__
+        return CapabilityCheck(
+            "windows.integrity",
+            "unknown",
+            "The Windows integrity prerequisite check could not run.",
+            evidence,
+        )
+    finally:
+        if token and kernel is not None:
+            try:
+                kernel.CloseHandle.argtypes = [ctypes.c_void_p]
+                kernel.CloseHandle(token)
+            except OSError:
+                pass
+
+    level = evidence["integrity_level"]
+    if level in {"untrusted", "low"}:
+        return CapabilityCheck(
+            "windows.integrity",
+            "unavailable",
+            f"This process runs at {level} integrity, so UIPI blocks input to "
+            "ordinary applications.",
+            evidence,
+        )
+    if level is None:
+        return CapabilityCheck(
+            "windows.integrity",
+            "unknown",
+            "The integrity level of this process could not be determined.",
+            evidence,
+        )
+    # Medium integrity is the normal, expected case.  It is reported as
+    # available with the UIPI ceiling stated, not as degraded, because nothing
+    # is misconfigured; driving an elevated target is simply out of scope.
+    return CapabilityCheck(
+        "windows.integrity",
+        "available",
+        f"This process runs at {level} integrity; UIPI still prevents driving "
+        "any application at a higher integrity level.",
+        evidence,
+    )
+
+
+def _windows_integrity_level(advapi: Any, token: Any) -> str | None:
+    """Map the token's mandatory label RID onto a stable name."""
+
+    try:
+        size = ctypes.c_uint32()
+        advapi.GetTokenInformation(
+            token, _TokenIntegrityLevel, None, 0, ctypes.byref(size)
+        )
+        if not size.value:
+            return None
+        buffer = ctypes.create_string_buffer(size.value)
+        if not advapi.GetTokenInformation(
+            token,
+            _TokenIntegrityLevel,
+            buffer,
+            size.value,
+            ctypes.byref(size),
+        ):
+            return None
+        advapi.GetSidSubAuthorityCount.argtypes = [ctypes.c_void_p]
+        advapi.GetSidSubAuthorityCount.restype = ctypes.POINTER(ctypes.c_ubyte)
+        advapi.GetSidSubAuthority.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+        advapi.GetSidSubAuthority.restype = ctypes.POINTER(ctypes.c_uint32)
+        # TOKEN_MANDATORY_LABEL begins with a SID pointer.
+        sid = ctypes.cast(buffer, ctypes.POINTER(ctypes.c_void_p))[0]
+        if not sid:
+            return None
+        count = advapi.GetSidSubAuthorityCount(sid)[0]
+        if count <= 0:
+            return None
+        rid = int(advapi.GetSidSubAuthority(sid, count - 1)[0])
+    except (AttributeError, OSError, ValueError, IndexError):
+        return None
+    for threshold, name in _INTEGRITY_LEVELS:
+        if rid >= threshold:
+            return name
+    return "untrusted"
+
+
+def _check_windows_dpi() -> CapabilityCheck:
+    """Report DPI awareness and the resulting pointer-coordinate resolution.
+
+    UIA bounding rectangles and ``GetSystemMetrics`` are reported in the same
+    space as each other, so an unaware host is internally consistent and does
+    not mis-aim clicks.  What it loses is resolution: on a scaled display the
+    whole desktop is addressed through a virtualized coordinate grid, so
+    distinct physical pixels collapse onto one addressable point.  This check
+    reports that quantisation instead of implying a coordinate mismatch.
+    """
+
+    evidence: dict[str, Any] = {
+        "awareness_readable": False,
+        "awareness": None,
+        "scaled_display": None,
+        "pointer_quantisation": None,
+    }
+    try:
+        try:
+            shcore = _windows_dll("shcore")
+            shcore.GetProcessDpiAwareness.argtypes = [
+                ctypes.c_void_p, ctypes.POINTER(ctypes.c_int)
+            ]
+            shcore.GetProcessDpiAwareness.restype = ctypes.c_long
+            awareness = ctypes.c_int()
+            if shcore.GetProcessDpiAwareness(None, ctypes.byref(awareness)) == 0:
+                evidence["awareness_readable"] = True
+                evidence["awareness"] = _DPI_AWARENESS.get(
+                    awareness.value, "unknown"
+                )
+        except OSError:
+            # shcore.dll predates Windows 8.1; an older system is always the
+            # equivalent of system-DPI awareness.
+            evidence["awareness"] = "unsupported_api"
+
+        user32 = _windows_dll("user32")
+        gdi32 = _windows_dll("gdi32")
+        user32.GetSystemMetrics.argtypes = [ctypes.c_int]
+        user32.GetSystemMetrics.restype = ctypes.c_int
+        user32.GetDC.argtypes = [ctypes.c_void_p]
+        user32.GetDC.restype = ctypes.c_void_p
+        user32.ReleaseDC.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        user32.ReleaseDC.restype = ctypes.c_int
+        gdi32.GetDeviceCaps.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        gdi32.GetDeviceCaps.restype = ctypes.c_int
+
+        reported_width = int(user32.GetSystemMetrics(_SM_CXSCREEN))
+        device = user32.GetDC(None)
+        if device:
+            try:
+                physical_width = int(
+                    gdi32.GetDeviceCaps(device, _DESKTOPHORZRES)
+                )
+            finally:
+                user32.ReleaseDC(None, device)
+        else:
+            physical_width = 0
+
+        if reported_width > 0 and physical_width > 0:
+            evidence["scaled_display"] = physical_width != reported_width
+            # Physical pixels per addressable coordinate step.  1.0 means the
+            # host can aim at every physical pixel.
+            evidence["pointer_quantisation"] = round(
+                physical_width / reported_width, 4
+            )
+    except (AttributeError, OSError) as exc:
+        evidence["error_type"] = type(exc).__name__
+        return CapabilityCheck(
+            "windows.dpi",
+            "unknown",
+            "The Windows DPI prerequisite check could not run.",
+            evidence,
+        )
+
+    quantisation = evidence["pointer_quantisation"]
+    if quantisation is None:
+        return CapabilityCheck(
+            "windows.dpi",
+            "unknown",
+            "Display scaling could not be determined for this process.",
+            evidence,
+        )
+    if quantisation > 1.0:
+        return CapabilityCheck(
+            "windows.dpi",
+            "degraded",
+            "This process is not DPI aware on a scaled display, so pointer "
+            f"coordinates quantise to about {quantisation} physical pixels; "
+            "targets smaller than that step cannot be addressed exactly.",
+            evidence,
+        )
+    return CapabilityCheck(
+        "windows.dpi",
+        "available",
+        "Pointer coordinates map one-to-one onto physical pixels for this "
+        "process; no input was injected.",
+        evidence,
+    )
 
 
 def _check_windows_uia() -> CapabilityCheck:
@@ -402,7 +1023,7 @@ def _probe_macos() -> tuple[CapabilityCheck, ...]:
             "macos.screen_capture", "unknown", "Screen Capture permission could not be checked with the safe preflight API.",
             {"preflight_completed": False, "authorized": None, "prompt_requested": False, "capture_attempted": False, "outcome": capture_outcome},
         )
-    return ax, capture
+    return ax, capture, _check_script_sandbox()
 
 
 def _path_state(path: Path) -> str:
@@ -571,6 +1192,7 @@ def _probe_linux(environ: Mapping[str, str]) -> tuple[CapabilityCheck, ...]:
         _probe_linux_portal(environ),
         _probe_linux_libei(),
         _probe_linux_uinput(),
+        _check_script_sandbox(),
     )
 
 
