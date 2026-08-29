@@ -59,6 +59,10 @@ _MAX_STDERR_BYTES = 64 * 1024
 _STDERR_CHUNK_BYTES = 4096
 _MANIFEST_PROBE_SECONDS = 0.10
 _TERMINATE_GRACE_SECONDS = 0.50
+# Windows workers start suspended so the host can put them in a Job Object
+# before they are able to spawn anything.  subprocess does not export the
+# flag, and its value is part of the stable Win32 process-creation ABI.
+_WINDOWS_CREATE_SUSPENDED = 0x00000004
 _MAX_ARTIFACT_INVOCATION_BYTES = 256 * 1024 * 1024
 _MANIFEST_SCHEMA_RESOURCE = (
     "schemas",
@@ -182,6 +186,15 @@ class ProcessPlugin:
         self._artifact_child_channel: socket.socket | None = None
         self._artifact_pipe_server: Any = None
         self._artifact_pipe_name: str | None = None
+        # Windows only.  ``_windows_job`` supervises the worker's whole process
+        # tree; ``_windows_process_tree_bounded`` records whether that
+        # supervision was actually established, so a degraded host never
+        # reports a stronger cancellation guarantee than it can honour.
+        self._windows_job: Any = None
+        self._windows_process_tree_bounded = False
+        # Popen does not retain creationflags, so remember whether this worker
+        # was started suspended and therefore still needs an explicit resume.
+        self._windows_started_suspended = False
 
     @property
     def pid(self) -> int | None:
@@ -191,6 +204,25 @@ class ProcessPlugin:
     @property
     def started(self) -> bool:
         return self._process is not None and self.manifest is not None
+
+    @property
+    def process_tree_bounded(self) -> bool:
+        """Whether cancelling this worker provably reclaims its descendants.
+
+        POSIX hosts always bound the tree through a dedicated session/process
+        group.  Windows hosts bound it through a Job Object, which a very old
+        kernel may refuse; in that case this is False and termination is best
+        effort against the immediate child only.  Callers must not describe a
+        False value as a guaranteed process-tree cancellation.
+        """
+
+        if self._process is None:
+            return False
+        if os.name == "posix":
+            return True
+        if os.name == "nt":
+            return self._windows_process_tree_bounded
+        return False
 
     @property
     def closed(self) -> bool:
@@ -267,14 +299,25 @@ class ProcessPlugin:
                 self._artifact_channel = wrap_socket_channel(host_channel)
                 self._artifact_child_channel = child_channel
             elif os.name == "nt":
-                popen_options["creationflags"] = getattr(
+                # A new process group lets descendants opt into console control
+                # events, but it does not bound the tree.  The Job Object is
+                # what makes cancellation reclaim descendants, so the worker is
+                # started suspended and only resumed once it is a job member.
+                creationflags = getattr(
                     subprocess, "CREATE_NEW_PROCESS_GROUP", 0
                 )
+                job = _create_windows_job()
+                if job is not None:
+                    creationflags |= _WINDOWS_CREATE_SUSPENDED
+                    self._windows_started_suspended = True
+                self._windows_job = job
+                popen_options["creationflags"] = creationflags
                 try:
                     from ._win_named_pipe import WindowsPipeServer
 
                     pipe_server = WindowsPipeServer()
                 except Exception as exc:
+                    self._close_windows_job()
                     self._closed = True
                     raise PluginError(
                         "PLUGIN.HOST_ARTIFACT_CHANNEL_UNAVAILABLE",
@@ -292,6 +335,7 @@ class ProcessPlugin:
                 process = subprocess.Popen(self.command, **popen_options)
             except (OSError, ValueError) as exc:
                 self._close_artifact_channels()
+                self._close_windows_job()
                 self._closed = True
                 raise PluginError(
                     "PLUGIN.START_FAILED",
@@ -301,6 +345,12 @@ class ProcessPlugin:
                 ) from exc
 
             self._process = process
+            # The worker is still suspended on Windows.  Make it a job member
+            # before it can run, then resume it.  A kernel that refuses nested
+            # assignment degrades to direct termination instead of failing the
+            # run, and that degradation is recorded so callers can tell a
+            # bounded tree from a best-effort one.
+            self._adopt_windows_process(process)
             if self._artifact_child_channel is not None:
                 self._artifact_child_channel.close()
                 self._artifact_child_channel = None
@@ -1527,9 +1577,13 @@ class ProcessPlugin:
             self._terminate_posix_group(process)
             return
 
-        # CREATE_NEW_PROCESS_GROUP above is useful to descendants which opt in
-        # to console control handling.  terminate/kill is the dependable stdlib
-        # fallback on Windows; Python exposes no general process-tree kill API.
+        # A Job Object is the only Windows mechanism that also reclaims
+        # descendants the host never saw, so it is the primary path:
+        # TerminateJobObject ends every member at once.  The stdlib
+        # terminate/kill below remains only for a kernel that refused job
+        # assignment, where the tree guarantee is explicitly best effort.
+        if self._terminate_windows_job(process):
+            return
         try:
             process.terminate()
         except (OSError, ProcessLookupError):
@@ -1601,6 +1655,75 @@ class ProcessPlugin:
             except OSError:
                 pass
         self._artifact_pipe_name = None
+        # Closing the job handle is the last-resort reclamation: any survivor
+        # is killed by JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE.
+        self._close_windows_job()
+
+    def _adopt_windows_process(self, process: subprocess.Popen[bytes]) -> None:
+        """Assign a suspended Windows worker to its job, then resume it."""
+
+        if os.name != "nt":
+            return
+        job = self._windows_job
+        if job is not None:
+            try:
+                job.assign(process.pid)
+            except Exception:
+                # The kernel refused nested job assignment.  Drop the job and
+                # fall back to direct termination.  The worker is still
+                # suspended, so it has not spawned anything yet.
+                self._windows_process_tree_bounded = False
+                self._close_windows_job()
+            else:
+                self._windows_process_tree_bounded = True
+        if not self._windows_started_suspended:
+            return
+        self._windows_started_suspended = False
+        try:
+            _resume_windows_process(process.pid)
+        except Exception as exc:
+            # The worker was created but never ran.  Reclaim it rather than
+            # leaving a suspended process behind, and fail the start.
+            self._terminate_windows_job(process)
+            try:
+                process.kill()
+            except (OSError, ProcessLookupError):
+                pass
+            self._close_artifact_channels()
+            self._closed = True
+            raise PluginError(
+                "PLUGIN.START_FAILED",
+                f"could not resume plugin {self.name!r} after job assignment",
+                details={
+                    "dispatched": False,
+                    "exception_type": type(exc).__name__,
+                },
+            ) from exc
+
+    def _terminate_windows_job(self, process: subprocess.Popen[bytes]) -> bool:
+        """Terminate the worker's whole job.  Returns False when unavailable."""
+
+        job = self._windows_job
+        if job is None:
+            return False
+        if not job.terminate():
+            return False
+        try:
+            process.wait(timeout=_TERMINATE_GRACE_SECONDS)
+        except (subprocess.TimeoutExpired, OSError):
+            # TerminateJobObject is synchronous for job membership; a slow wait
+            # here only reflects handle bookkeeping inside this process.
+            pass
+        return True
+
+    def _close_windows_job(self) -> None:
+        job = self._windows_job
+        self._windows_job = None
+        if job is not None:
+            try:
+                job.close()
+            except OSError:
+                pass
 
     def _join_readers(self) -> None:
         current = threading.current_thread()
@@ -1828,6 +1951,32 @@ def _with_dispatched(error: PluginError) -> PluginError:
         details=details,
         retryable=error.retryable,
     )
+
+
+def _create_windows_job() -> Any:
+    """Create a job for one worker, or None when jobs are unavailable.
+
+    An unavailable job is not fatal: the host degrades to direct termination.
+    That is a weaker tree guarantee, not a silent correctness change, and it is
+    surfaced through ``ProcessPlugin.process_tree_bounded``.
+    """
+
+    if os.name != "nt":
+        return None
+    try:
+        from ._win_job import WindowsJob
+
+        return WindowsJob()
+    except Exception:
+        return None
+
+
+def _resume_windows_process(pid: int) -> None:
+    """Resume a worker created with CREATE_SUSPENDED."""
+
+    from ._win_job import resume_process
+
+    resume_process(pid)
 
 
 def _process_group_exists(pgid: int) -> bool:
