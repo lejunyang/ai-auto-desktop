@@ -1,0 +1,56 @@
+apiVersion: ai-auto-desktop.dev/v1alpha1
+kind: Workflow
+metadata:
+  name: script-smoke
+  version: 0.1.0
+  description: End-to-end check that a script step runs on Windows via the CLI.
+requires:
+  platforms: [windows]
+budgets:
+  max_duration: 2m
+  max_executed_steps: 20
+inputs:
+  values:
+    schema:
+      type: array
+      items: {type: number}
+    default: [3, 1, 4, 1, 5, 9, 2, 6]
+outputs:
+  stats:
+    value: "${{ steps.summarise.output }}"
+steps:
+  - id: summarise
+    type: script
+    runtime: python
+    inputs:
+      numbers: "${{ inputs.values }}"
+    source: |
+      import json
+      import statistics
+      import sys
+
+      payload = json.load(sys.stdin)
+      numbers = payload["numbers"]
+      print(json.dumps({
+          "count": len(numbers),
+          "total": sum(numbers),
+          "mean": statistics.fmean(numbers),
+          "median": statistics.median(numbers),
+          "sorted": sorted(numbers),
+      }))
+    output_schema:
+      type: object
+      required: [count, total, mean, median, sorted]
+      properties:
+        count: {type: integer}
+        total: {type: number}
+        mean: {type: number}
+        median: {type: number}
+        sorted:
+          type: array
+          items: {type: number}
+    sandbox:
+      network: {mode: deny}
+      filesystem: {mode: deny}
+      environment: {mode: deny}
+      max_output_bytes: 65536

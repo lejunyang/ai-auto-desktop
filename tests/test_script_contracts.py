@@ -80,10 +80,13 @@ class ScriptAvailabilityContracts(unittest.TestCase):
             execute(plan)
         self.assertEqual(raised.exception.code, "SCRIPT.SANDBOX_UNAVAILABLE")
 
-    def test_windows_and_macos_fail_closed_before_process_start(self) -> None:
+    def test_platforms_without_a_sandbox_fail_closed_before_process_start(self) -> None:
+        # macOS has no sandbox implementation yet, so it must refuse to run a
+        # script rather than executing one unconfined.  Windows is covered
+        # separately below because it now has its own sandbox.
         plan = script_plan()
 
-        for platform in ("win32", "darwin"):
+        for platform in ("darwin", "freebsd14"):
             with self.subTest(platform=platform), mock.patch.object(
                 script.sys, "platform", platform
             ), mock.patch.object(
@@ -93,6 +96,27 @@ class ScriptAvailabilityContracts(unittest.TestCase):
             ), mock.patch.object(script.subprocess, "Popen") as popen:
                 self.assert_unavailable(plan)
                 popen.assert_not_called()
+
+    def test_unsupported_platforms_report_no_sandbox(self) -> None:
+        for platform in ("darwin", "freebsd14"):
+            with self.subTest(platform=platform), mock.patch.object(
+                script.sys, "platform", platform
+            ):
+                report = script.sandbox_availability()
+                self.assertEqual(report["state"], "unavailable")
+                self.assertIsNone(report["mechanism"])
+
+    def test_windows_reports_a_degraded_sandbox_naming_its_gaps(self) -> None:
+        # Windows deliberately does NOT fail closed any more: it runs scripts
+        # under a Job Object.  The contract is that it must advertise the
+        # boundaries it cannot enforce instead of implying full isolation.
+        if sys.platform != "win32":
+            self.skipTest("requires a real Windows kernel")
+        report = script.sandbox_availability()
+        self.assertEqual(report["state"], "degraded")
+        self.assertEqual(report["mechanism"], "windows.job_object")
+        self.assertIn("network", report["gaps"])
+        self.assertIn("filesystem", report["gaps"])
 
     def test_linux_without_each_required_tool_fails_closed(self) -> None:
         plan = script_plan()
@@ -113,14 +137,18 @@ class ScriptAvailabilityContracts(unittest.TestCase):
                 popen.assert_not_called()
 
     def test_current_host_reports_unavailable_without_prerequisites(self) -> None:
-        prerequisites = (
+        linux_ready = (
             sys.platform.startswith("linux")
             and shutil.which("bwrap") is not None
             and shutil.which("prlimit") is not None
             and Path("/usr/bin/python3").is_file()
         )
-        if prerequisites:
+        if linux_ready:
             self.skipTest("host has the Linux sandbox prerequisites")
+        if sys.platform == "win32":
+            # Windows has its own sandbox; absence of the Linux tooling is not
+            # a reason for it to fail closed.
+            self.skipTest("host has the Windows sandbox")
 
         with mock.patch.object(script.subprocess, "Popen") as popen:
             self.assert_unavailable(script_plan())
