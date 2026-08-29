@@ -169,3 +169,44 @@ Windows 脚本沙箱已实现（`_execute_windows`，复用 `_win_job.WindowsJob
 **尚未验证**（不得据此声称与 Linux 等价）：AppContainer 是否真的拒绝网络（Windows 无 per-process 网络命名空间），以及是否真的限制文件系统访问（无 per-process mount 命名空间，无法 `--ro-bind`）。这两项必须真机验证后才可把 Windows 脚本沙箱标为 `available`。
 
 另：Linux 路径硬编码 `/usr/bin/python3`；Windows 无等价固定路径，实测 `sys.executable` 指向嵌入式 runtime，故 Windows 实现必须显式发现并固定解释器路径。
+
+## 11. 捕获层可观察性实测
+
+在真实 fixture 窗口（原生 `EDIT`/`BUTTON`/`STATIC`，系统默认 UIA provider）上，同时订阅 focus / property / automation / structure 四类事件测得。
+
+### 11.1 事件投递需要消息泵
+
+首轮 6 种交互全部得到 0 事件，看似「UIA 观察不到任何东西」。真实原因是等待逻辑只有 `time.sleep()`，从未 dispatch 窗口消息，而 UIA 事件经 COM 回调投递。补上 `PeekMessageW`/`TranslateMessage`/`DispatchMessageW` 后，同样订阅立即收到事件（前台化即收到 1 个 focus 事件，`SetFocus` 到 Edit、Button 各收到 1 个）。
+
+### 11.2 逐项结果（均在消息泵生效下测得）
+
+| 交互 | 事件数 | 事件族 |
+| --- | --- | --- |
+| 焦点移到 Edit（对照） | 1 | `focus` |
+| Invoke 按钮 | 3 | `focus` + `automation`(20009) + `property` |
+| 真实鼠标点击可聚焦按钮 | 3 | `focus` + `automation`(20009) + `property` |
+| `SetValue` 修改文本框 | 2 | `automation`(20015) + `property`(30045) |
+| `WM_CHAR` 输入（送达已证实） | 2 | `automation`(20015) + `property`(30045) |
+| 点击不可聚焦 STATIC | 0 | 无 |
+| 纯 hover | 0 | 无 |
+
+### 11.3 盲区结论均带对照组
+
+fixture 在收到真实指针点击时会更新状态标签，因此「点击是否送达」可独立于 UIA 事件验证：
+
+- 对照：点击可聚焦按钮 → 状态 `Status: idle` → `Status: pointer clicked`，3 个事件；
+- 待测：点击 STATIC 标签 → 状态**未变化**，0 个事件。
+
+即该控件本身不响应点击，属于真实盲区，而非测量失误。
+
+### 11.4 三次被推翻的错误结论
+
+本轮共有三次「看似成立」的结论被自查推翻，全部源于同一个缺陷：**未证明被测交互真的发生**。
+
+| 错误结论 | 假象来源 | 纠正方式 |
+| --- | --- | --- |
+| AppContainer 已拒绝网络 | cmd 在解析期展开 `%errorlevel%`，返回码全是初始 0 | 改用 `/v:on` 延迟展开 |
+| AppContainer 已拒绝网络（第二次） | `^&` 转义导致容器只 echo 命令，未执行 | 加 `START` 执行标记 + 容器外对照组，暴露为 INCONCLUSIVE |
+| 真实键盘输入不可观察 | `keybd_event` 未送达，`Value` 前后均为 `'Draft'` | 改用 `WM_CHAR`，`Value` 变为 `'XYDraft'`，证实送达后事件数为 2 |
+
+由此确立方法论要求：任何「不可观察 / 已被拒绝」的结论，都必须先用**独立于被测通道**的方式证明交互确实发生（值确实改变、应用状态确实变化）。缺少这一步时，「被拒绝」与「根本没发生」在观测上不可区分。
