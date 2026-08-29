@@ -110,9 +110,40 @@ Windows 没有 per-process 网络命名空间，也没有 mount 命名空间，�
 
 因此 `sandbox_availability()` 坚持把 `network` 与 `filesystem` 列在 `gaps` 中，探针 evidence 也把它们放在 `not_enforced`。**不得**因为「实测连不上网」就宣称网络已隔离。
 
-要把 Windows 提升到 `available`，需要 AppContainer 降权并真机验证网络与文件系统确实被拒（`CreateAppContainerProfile` 已实测可在无提权情况下创建，返回 `HRESULT 0x00000000`）；在那之前状态保持 `degraded`。
+要把 Windows 提升到 `available`，需要 AppContainer 降权并真机验证网络与文件系统确实被拒。已做过一轮实测，结论是**当前被一个结构性障碍挡住**，详见 §4.3。在此之前状态保持 `degraded`。
 
 顺带确认空环境没有牺牲纯计算能力：`math`、`statistics`、`decimal`、`fractions`、`datetime`、`re`、`itertools`、`functools`、`collections`、`random`、`hashlib`、`base64`、`csv`、`textwrap`、`unicodedata`、`tempfile`、`uuid`、`secrets` 共 19 个模块全部可导入，`tempfile` 在无 `TEMP`/`TMP` 时仍可用。唯一例外是 `zoneinfo` 查询时区抛 `ZoneInfoNotFoundError`——这是 Windows 缺少系统 tzdata 的既有特性，与沙箱无关。
+
+### 4.3 AppContainer 实测结论：被解释器可达性挡住
+
+尝试用 AppContainer 补上 §4.2 的两个缺口，实测结果如下。
+
+**能做到的部分。** `CreateAppContainerProfile` 在无提权下成功（`HRESULT 0x00000000`），可派生容器 SID，`DeleteAppContainerProfile` 可清理。用 `STARTUPINFOEX` + `PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES` 创建容器内进程也能成功返回 pid。
+
+**挡住的地方：容器进程读不到解释器。** AppContainer 令牌里**没有用户 SID**，因此继承自 `Users` 的授权对它一律无效；它只能访问 ACL 中显式授予其容器 SID、或授予 `ALL APPLICATION PACKAGES` 的对象。实测本机三个 Python 解释器：
+
+| 解释器 | 位于用户目录 | 有 `ALL APPLICATION PACKAGES` 授权 |
+| --- | --- | --- |
+| 当前运行的解释器 | 是 | 否 |
+| `C:\Python311\python.exe` | 否 | 否 |
+| `WindowsApps\python.exe` | 是 | 否 |
+
+对比之下 `System32` 下的 `cmd.exe`、`curl.exe`、`PING.EXE` **都有**该授权——这也说明缺失并非偶然，而是 Windows 只给系统组件开放。
+
+于是要让容器跑起来，只有两条路，都不可接受：
+
+1. **给真实解释器路径加 ACL**：这会持久修改用户文件的权限，属于沙箱不该有的副作用；
+2. **把整个 runtime 复制到沙箱自有目录**：实测该 runtime 为 79.9 MiB，每次执行脚本都复制不可行。
+
+**一个必须记录的教训：三次测量都差点得出错误结论。** 前两次都报告「网络已被拒绝」，但都是假象：
+
+- 第 1 次用 `&` 串接命令并读 `%errorlevel%`，而 cmd 在**解析期**就展开该变量，所有返回码都是初始的 0，数字毫无意义；
+- 第 2 次改用 `^&` 转义，结果容器只是把命令行**原样 echo 出来**，什么都没执行——「拒绝」其实是「从未运行」；
+- 第 3 次改用 .bat 文件并加入 `START` 执行标记与容器外**对照组**，才暴露真相：容器进程根本没启动（无 `START` 标记），结论只能是 **INCONCLUSIVE**。
+
+因此本文档对 AppContainer 的网络/文件系统隔离效果**不做任何断言**。可靠的测量必须同时具备：容器外对照组证明目标本可达、以及容器内执行标记证明进程真的跑了。缺少任何一项，「拒绝」都可能只是「没跑起来」。
+
+**后续可行方向**（均未验证，不得据此改状态）：改用带 `ALL APPLICATION PACKAGES` 授权的系统级解释器位置；或让宿主提前把脚本编译为不依赖用户目录 runtime 的形式；或改用 Windows Sandbox / 容器等更重的隔离，代价是启动开销。
 
 ## 5. 当前 sandbox 参数的真实自由度
 
@@ -128,11 +159,14 @@ Windows 没有 per-process 网络命名空间，也没有 mount 命名空间，�
 
 ## 6. 后续工作
 
-Windows 沙箱已落地并有回归测试（`tests/test_windows_script_sandbox.py`，22 项，其中 2 项在非 Windows 上跳过）。剩余工作只有一件，且必须真机验证后才可改状态：
+Windows 沙箱已落地并有回归测试（`tests/test_windows_script_sandbox.py`，22 项，其中 2 项在非 Windows 上跳过），并已纳入 CI：`windows-contracts` job 每次 push 都在真机 Windows 上运行沙箱、Job Object 与探针契约，`tests/test_ci_contract.py` 反过来断言该 gate 不会被悄悄移除。
 
-- 用 AppContainer 降权，验证网络与文件系统**确实**被拒，然后把 Windows 的 `sandbox_availability()` 从 `degraded` 改为 `available`，并从 `gaps` 中移除对应项。在验证完成之前**不得**修改状态。
+剩余工作及其真实状态：
 
-macOS 仍无实现，保持 `unavailable`。
+- **AppContainer 降权：已尝试，被结构性障碍阻塞**（详见 §4.3）。容器令牌没有用户 SID，而本机所有 Python 解释器都缺少 `ALL APPLICATION PACKAGES` 授权，因此容器进程无法启动解释器；绕过它要么持久改动用户文件 ACL，要么每次复制 79.9 MiB runtime，两者都不可接受。**在找到不产生副作用的解释器可达方案之前，状态必须保持 `degraded`。**
+- macOS 仍无实现，保持 `unavailable`。
+
+一条流程约束：任何声称「网络/文件系统已被隔离」的测量，都必须包含容器外对照组与容器内执行标记。§4.3 记录的三次失败测量说明，缺少任一项时，「被拒绝」与「根本没运行」在观测上无法区分。
 
 ## 7. 与录制回放的关系
 
