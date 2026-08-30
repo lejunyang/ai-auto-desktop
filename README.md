@@ -25,6 +25,24 @@ python -m ai_auto_desktop run workflow.yaml \
 
 `probe` 会保守、只读地检查桌面自动化前置条件：Windows 上检查 UIA，macOS 上检查辅助功能与屏幕录制授权，Linux 上分别检查 AT-SPI、X11、Wayland、RemoteDesktop portal、libei 和 uinput。某项能力不可用只会体现在 JSON 报告中，不会让探针命令失败。探针结果是诊断证据，不代表 UI 自动化已经成功。
 
+## 编辑录制
+
+```bash
+python -m ai_auto_desktop edit recording.yaml --output edited.json
+```
+
+在系统默认浏览器中打开录制编辑器：拖拽重排步骤、启用/禁用、修正 locator、
+把步骤包进条件分支，编译结果实时显示。按 Ctrl+C 结束会话。
+
+编辑**不会覆盖输入文件**——结果写到 `--output`，未指定时写到标准输出。
+每次编辑都会立即落盘，因此终端被关闭或进程被杀死都不会丢失会话
+（实测：Windows 上进程终止既不触发 `finally` 也不产生 `KeyboardInterrupt`）。
+
+服务只绑定 `127.0.0.1`、端口由操作系统分配，API 需要 `X-Recorder-Token` 头。
+该 token 防的是走失的浏览器标签页或另一 origin 的页面，**不防**已以本用户
+身份运行的任意代码——回环不做进程隔离。编辑器**没有**任何执行端点，
+无法用来绕过 workflow 的权限检查。
+
 ## 可选 Tesseract OCR
 
 `plugins/ocr_tesseract` 中的进程插件实现了 `vision.ocr.recognize@1`。它只接受显式传入的绝对图片或 artifact 路径，绝不会自行截图。插件支持裁剪声明的像素区域、指定 Tesseract 语言、设置最低置信度，并返回文本行边界和命名的字面文本匹配。工作流还必须在 `requires.permissions` 中声明 `filesystem.read`，注册示例：

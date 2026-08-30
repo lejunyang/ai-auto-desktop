@@ -93,6 +93,11 @@ def build_parser() -> argparse.ArgumentParser:
     commands.add_parser("probe")
     validate = commands.add_parser("validate")
     validate.add_argument("file", type=Path)
+
+    edit = commands.add_parser("edit")
+    edit.add_argument("file", type=Path)
+    edit.add_argument("--no-browser", action="store_true")
+    edit.add_argument("--output", type=Path)
     run = commands.add_parser("run")
     run.add_argument("file", type=Path)
     run.add_argument("--input", action="append", default=[], metavar="NAME=JSON")
@@ -179,6 +184,77 @@ def _emit(value: Any) -> None:
     sys.stdout.write(json.dumps(value, ensure_ascii=False, sort_keys=True) + "\n")
 
 
+def _edit_command(options: Any) -> int:
+    """Serve the editor UI until interrupted, then emit the recording.
+
+    The result goes to stdout (or --output) rather than overwriting the input:
+    a capture cannot be cheaply retaken, so an editing session must not be able
+    to destroy the thing it was editing.
+    """
+
+    import json
+    import os
+    import threading
+    import webbrowser
+
+    from .editor_page import PAGE
+    from .editor_server import serve
+
+    raw = options.file.read_text(encoding="utf-8")
+    if options.file.suffix in {".yaml", ".yml"}:
+        import yaml
+
+        recording = yaml.safe_load(raw)
+    else:
+        recording = json.loads(raw)
+
+    destination = options.output
+
+    def save(edited: dict) -> None:
+        """Write the recording atomically after each change.
+
+        Not at exit: measured, a killed process on Windows runs no `finally`
+        and receives no KeyboardInterrupt, so an exit-time write can simply
+        never happen.  Written via a temporary file and replaced, so a process
+        killed mid-write cannot leave a truncated recording behind.
+        """
+
+        if destination is None:
+            return
+        temporary = destination.with_suffix(destination.suffix + ".tmp")
+        temporary.write_text(
+            json.dumps(edited, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8")
+        os.replace(temporary, destination)
+
+    server = serve(recording, PAGE, on_change=save)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    # The URL goes to stderr so that stdout stays a clean recording document
+    # and `... edit x.yaml > y.yaml` still produces a usable file.
+    print(f"editor: {server.url}", file=sys.stderr, flush=True)
+    if not options.no_browser:
+        webbrowser.open(server.url)
+
+    try:
+        thread.join()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    edited = server.session.recording
+    payload = json.dumps(edited, ensure_ascii=False, indent=2)
+    if options.output:
+        # Already written by the autosave hook; repeated here so a clean exit
+        # still produces a complete file even if no edit was ever made.
+        save(edited)
+    else:
+        sys.stdout.write(payload + "\n")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     try:
         options = build_parser().parse_args(argv)
@@ -194,6 +270,8 @@ def main(argv: list[str] | None = None) -> int:
         if options.command == "probe":
             _emit(probe_capabilities().to_dict())
             return 0
+        if options.command == "edit":
+            return _edit_command(options)
         if options.command in {"status", "list", "events", "pause", "cancel"}:
             with JournalStore(options.journal) as journal:
                 service = RunService(journal)

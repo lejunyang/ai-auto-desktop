@@ -281,3 +281,70 @@ selector`。对照组：显式 title 正确解析到目标窗口。故 driver �
   `matches >= 1` 变异（该变异使 2 匹配被标为 unique）。已补断言。
 - 一项名为「只读录制不要求 input」的测试用的是 `focus` 步骤，而 focus 本就需要 input，
   它**根本无法**检测过度授权。已换成真正只读的动作。
+
+## 13. 编辑 UI 实测
+
+### 13.1 安全性质（复现 §5 的三项主张）
+
+| 性质 | 方法 | 结果 |
+| --- | --- | --- |
+| 绑定回环 + OS 分配端口 | 读 `server_address` | `127.0.0.1`，端口由 OS 指定 |
+| token 校验 | 三种 token 各发一次请求 | 正确 200 / 缺失 401 / 错误 401 |
+| 非回环不可达 | 从本机 LAN 地址裸 TCP connect | `ConnectionRefusedError` |
+
+### 13.2 自引入的 token 泄露与修复
+
+未认证的 `/bootstrap` 返回 token。用**独立子进程**复现窃取：该进程 fetch
+`/bootstrap` 拿到 token，随即带着它读 `/api/state` 成功，输出
+`stole token and read state: ['compile', 'inputs', 'name']`。
+
+删除该路由后复测：`/bootstrap` → 401；页面仍 200、占位符已替换、
+从页面解析出的 token 可正常调用 API；无 token / 错 token 仍 401。
+
+### 13.3 退出路径实测（决定了自动保存的必要性）
+
+| 终止方式 | `finally` 执行 | 收到 `KeyboardInterrupt` |
+| --- | --- | --- |
+| `terminate()` | 否 | 否 |
+| `CTRL_BREAK_EVENT` | 否 | 否 |
+
+据此把「退出时写出」改为「每次编辑后写出」。修复前后对同一场景实测：
+修复前编辑丢失（`no output document was written`），修复后
+`emitted document contains the edit: enabled=False`，且
+`input file untouched: True`。
+
+### 13.4 浏览器端到端
+
+在 Chrome 中对真实服务操作，逐项结果见架构文档 §14.7。关键一项：
+**原生 HTML5 拖拽重排确实生效**，顺序由
+`['focus_editor','editor_ready','enter_note','click_save']` 变为
+`['focus_editor','click_save','editor_ready','enter_note']`，
+编译产物的步骤序列同步改变。
+
+### 13.5 变异测试
+
+13 项变异，**13 项全部被捕获**；无变异对照组绿、还原后绿。
+每轮清空项目外 pyc 缓存并使用 `-B`。
+
+首轮有 1 项存活：「允许重复 step id」。原因是 `insert_logic` 自带重复检查，
+结构校验里的同一条规则**从未被任何测试触及**。补上一条「加载的录制本身
+就带重复 id」的用例后捕获——ids 是所有 assertion 与 logic 分支引用步骤的方式，
+这条规则不能只在一条路径上生效。
+
+### 13.6 全量基线
+
+`847 tests, 0 failures, 76 errors, 108 skipped`。较上一轮的 814 增加 33，
+与新增用例数一致；76 个 error 全部为既有 POSIX-only 用例，未变。
+
+### 13.7 一个既有的不稳定用例（非本轮引入）
+
+全量运行时出现 1 个 failure：
+`test_durable_readonly_execution.test_slow_provider_keeps_lease_and_cannot_be_claimed_twice`
+（`owner lease is no longer valid for run slow`）。
+
+已归因，**与编辑 UI 无关**：把本轮全部改动 `git stash` 后，在干净基线上
+单独运行该模块 6 次，仍有 2 次失败；而单独运行该用例本身 8 次全绿。
+说明它依赖模块内并发执行下的 lease 时序，属于既有的不稳定用例。
+
+记录于此以免日后被误记到编辑 UI 头上。租约超时本身值得单独修复，
+但那是另一处代码的问题，不在本轮范围内。
