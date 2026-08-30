@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shlex
 import sys
 from pathlib import Path
@@ -51,6 +52,29 @@ class _ParserExit(Exception):
     def __init__(self, payload: Mapping[str, Any]) -> None:
         super().__init__(str(payload.get("status", "help")))
         self.payload = dict(payload)
+
+
+def _split_command(command: str) -> list[str]:
+    """Split a plugin command into argv.
+
+    POSIX splitting is wrong on Windows: it treats the path separator as an
+    escape, so ``plugins\\windows_uia\\run.cmd`` collapses into a single
+    meaningless token and any interpreter path containing spaces is torn apart.
+    Measured on Windows, that made every documented invocation of the UIA driver
+    fail before the plugin was ever launched.
+
+    Forward slashes are not a workaround: cmd.exe resolves a ``.cmd`` only when
+    given backslashes, so the two requirements are mutually exclusive under
+    POSIX rules.  Windows therefore uses non-POSIX splitting, which keeps
+    separators intact, and the surrounding quotes it preserves are stripped
+    because CreateProcess would otherwise treat them as part of the filename.
+    """
+
+    if os.name != "nt":
+        return shlex.split(command)
+    parts = shlex.split(command, posix=False)
+    return [part[1:-1] if len(part) > 1 and part[0] == part[-1] == '"' else part
+            for part in parts]
 
 
 def _assignment(value: str, label: str) -> tuple[str, str]:
@@ -138,7 +162,7 @@ def _plugins(values: list[str]) -> dict[str, list[str]]:
         if name in result:
             raise AutomationError("CLI.INVALID_ARGUMENT", f"plugin {name!r} is repeated", category="cli")
         try:
-            argv = shlex.split(command)
+            argv = _split_command(command)
         except ValueError as exc:
             raise AutomationError(
                 "CLI.INVALID_ARGUMENT",

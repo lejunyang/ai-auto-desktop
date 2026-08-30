@@ -19,6 +19,8 @@ capture:
   driver:
     name: desktop.windows_uia
     version: 0.1.0
+  window:
+    class_name: Notepad
   probe:
     windows.session: available
     windows.input_desktop: available

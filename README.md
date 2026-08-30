@@ -61,7 +61,9 @@ python -m ai_auto_desktop run workflow.yaml `
   --permission desktop.observe `
   --permission desktop.input `
   --plugin "desktop.windows_uia=plugins\windows_uia\run.cmd"
-```
+`
+
+Windows 下 --plugin 的命令按 Windows 规则切分，路径分隔符保留；解释器路径含空格时需用引号包裹，例如 --plugin "desktop.windows_uia=\"C:\Program Files\Python\python.exe\" plugins/windows_uia/windows_uia_driver.py"。注意 .cmd 需要反斜杠路径：cmd.exe 不接受正斜杠形式。``
 
 读取类工作流声明 `desktop.observe`，写操作还要声明 `desktop.input`，两者都需要宿主显式授权。`type_text` 不会从 `set_value` 自动启用，只接受有界普通文本并禁止密码/protected 元素；它受 UIPI、完整性级别与前台焦点限制。`pointer_click` 也不会由其他动作失败隐式启用，只能点击 fresh UIA 节点 bounds 的中心，并要求原生 hit-test 仍命中该元素。该驱动不截图、不执行 OCR。
 真实 Windows fixture 与 CI 已包含 `set_value → postcondition.observe(snapshot) → condition`

@@ -17,26 +17,15 @@
         "name": "desktop.windows_uia",
         "version": ">=0.1.0"
       }
+    ],
+    "permissions": [
+      "desktop.input",
+      "desktop.observe"
     ]
-  },
-  "inputs": {
-    "note_text": {
-      "schema": {
-        "type": "string"
-      },
-      "required": true,
-      "sensitive": true
-    },
-    "should_save": {
-      "schema": {
-        "type": "boolean"
-      },
-      "default": false
-    }
   },
   "budgets": {
     "max_duration": "5m",
-    "max_executed_steps": 200
+    "max_executed_steps": 20
   },
   "steps": [
     {
@@ -231,5 +220,20 @@
         }
       ]
     }
-  ]
+  ],
+  "inputs": {
+    "should_save": {
+      "schema": {
+        "type": "boolean"
+      },
+      "default": false
+    },
+    "note_text": {
+      "schema": {
+        "type": "string"
+      },
+      "required": true,
+      "sensitive": true
+    }
+  }
 }

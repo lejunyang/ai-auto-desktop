@@ -38,7 +38,7 @@
 | --- | --- | --- |
 | `apiVersion` / `kind` | 是 | 格式标识。 |
 | `metadata` | 是 | `name` 必需；可含 `version` `description` `labels` `annotations`。 |
-| `capture` | 是 | 录制环境事实，见 §4。 |
+| `capture` | 是 | 录制环境事实，见 §4。**必须**含 `window`：回放需要一个精确窗口选择器，实测 driver 对空选择器返回 `DRIVER.INVALID_REQUEST`（`window must contain an exact selector`）。 |
 | `steps` | 是 | 有序录制步骤列表，**不得为空**。实测 `workflow.schema.json` 将顶层 `steps` 定义为 `nonEmptySteps`（`minItems: 1`），空 step 列表会被直接拒绝（`$.steps: [] should be non-empty`）。因此空录制**不可编译**，必须报 `RECORDING.EMPTY` 错误而非警告；全部步骤被 `enabled: false` 禁用时同理。 |
 | `inputs` | 否 | 外部输入声明，直接映射为 workflow `inputs`。`logic` 条件与 `text.source: input` 引用的输入**必须**在此声明或由 `type_text` 自动推导。实测现有 workflow 编译器**不校验**输入引用：删除已被 `${{ inputs.X }}` 引用的声明，甚至引用完全不存在的输入，descriptor 仍被接受。因此录制编译器**必须**自行校验，缺失时报 `RECORDING.ORDER_INVALID`。 |
 | `redaction` | 是 | 脱敏策略与已脱敏字段清单，见 §5。 |
@@ -314,3 +314,32 @@
 - 编译产物必须通过 `schemas/workflow/v1alpha1/workflow.schema.json`。
 - 录制不绕过 policy：编译后的 workflow 仍须声明 `budgets`，并接受 risk/permission/confirmation 检查。录制时操作者「手动点过一次」**不构成**运行时确认。
 - 桌面动作的 `observe → resolve → precondition → policy/confirm → execute → re-observe → postcondition` 闭环由运行时保证；录制格式只负责产出正确的 locator 与 postcondition，不参与该闭环。
+## 11. 回放前置条件（实测补充）
+
+以下三项由真实回放暴露，规范此前均未覆盖。共同点：违反任一项都能通过
+`validate`，但一定无法 `run`。
+
+### 11.1 `requires.permissions` 必须声明
+
+编译产物须在 `requires.permissions` 声明所需权限，否则运行期被策略拒绝
+（`POLICY.DENIED`，`undeclared_permissions`）。`validate` **不执行策略检查**，
+因此缺失不可见。权限按启用步骤的动作取并集：读取类动作只需 `desktop.observe`，
+驱动 UI 的动作追加 `desktop.input`。为只读录制声明 input 属过度授权。
+
+### 11.2 动作必须有权限分类
+
+未登记的动作不得编译。实测未知动作会被展开成不存在的 driver 动作且只声明 observe，
+未来新增写动作若漏登记将静默少声明权限。缺分类时报 `RECORDING.LOGIC_UNSUPPORTED`。
+
+### 11.3 `disambiguation.strategy` 不得未经解析即声称唯一
+
+转换器只有事件流、没有快照，**无法**判断 locator 是否唯一，必须写
+`strategy: unresolved`。只有实际解析过（`verify_locators`）且恰好 1 个匹配，
+才可升级为 `unique / verified: true`；0 或多个匹配必须保持 `unresolved`，
+且**已 verified 的步骤在重新校验后必须能被降级**（录制可编辑，界面会变）。
+编译器拒绝任何 `unresolved` 步骤，报 `RECORDING.LOCATOR_UNRESOLVED` 并携带步骤 `id`。
+
+### 11.4 窗口选择器
+
+`capture.window` 为必需；步骤级 `window` 是**可选覆盖**，仅用于跨窗口流程。
+两者皆缺时报 `RECORDING.WINDOW_UNRESOLVED` 并指名步骤。

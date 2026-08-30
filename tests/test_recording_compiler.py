@@ -21,11 +21,15 @@ from pathlib import Path
 import unittest
 
 from ai_auto_desktop.compiler import compile_descriptor
+import os
+
+from ai_auto_desktop.cli import _split_command
 from ai_auto_desktop.recording import (
     RecordingError,
     _coalesce,
     compile_recording,
     convert_events,
+    verify_locators,
 )
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -56,6 +60,7 @@ def minimal_recording(**overrides: object) -> dict:
             "platform": "windows",
             "recorded_at": "2026-08-30T00:00:00Z",
             "driver": {"name": "desktop.windows_uia", "version": "0.1.0"},
+            "window": {"class_name": "Notepad"},
         },
         "redaction": {
             "value_policy": "drop",
@@ -195,10 +200,24 @@ class ConverterTests(unittest.TestCase):
         )
         self.assertEqual(recording["redaction"]["value_policy"], "drop")
 
-    def test_converted_recording_compiles(self) -> None:
+    def test_converted_recording_needs_verification_before_compiling(self) -> None:
+        # Compiling straight from converter output is what produced a recording
+        # that reached replay and died with DRIVER.AMBIGUOUS.  The converter has
+        # events, not a snapshot, so it cannot know a locator is unique.
         recording, _ = self.convert(
             [event(1, "invoked"), event(2, "value_changed", role_id=50004)]
         )
+        with self.assertRaises(RecordingError) as caught:
+            compile_recording(recording)
+        self.assertEqual(caught.exception.code, "RECORDING.LOCATOR_UNRESOLVED")
+
+    def test_verified_recording_compiles(self) -> None:
+        recording, _ = self.convert(
+            [event(1, "invoked"), event(2, "value_changed", role_id=50004)]
+        )
+        # Replay must name a window; the driver rejects an empty selector.
+        recording["capture"]["window"] = {"class_name": "Notepad"}
+        verify_locators(recording, lambda window, locator: 1)
         workflow = compile_recording(recording)
         # Judged by the project's own compiler, not by my assertions.
         compile_descriptor(workflow, source="test")
@@ -389,6 +408,202 @@ class TrackedExampleTests(unittest.TestCase):
         self.assertNotIn("note_present", ids)
         note = [s for s in workflow["steps"] if s["id"] == "enter_note"][0]
         self.assertIn("postcondition", note)
+
+
+class ReplayContractTests(unittest.TestCase):
+    """Properties that only failed once a recording was really run."""
+
+    def test_compiled_workflow_declares_the_permissions_it_needs(self) -> None:
+        # Replay was refused with POLICY.DENIED before this was emitted.
+        # `validate` does not enforce policy, so the omission was invisible.
+        workflow = compile_recording(minimal_recording())
+        permissions = workflow["requires"]["permissions"]
+        self.assertIn("desktop.observe", permissions)
+        self.assertIn("desktop.input", permissions)
+
+    def test_disabled_write_step_does_not_demand_input(self) -> None:
+        # Asking for more than the run needs trains operators to grant blindly.
+        # The earlier version of this test used a `focus` step, which genuinely
+        # needs input, so it could not have detected over-granting at all.
+        recording = minimal_recording()
+        recording["steps"] = [
+            {
+                "id": "click_save",
+                "kind": "interaction",
+                "action": "invoke",
+                "locator": {"role": "button", "name": "Save"},
+                "disambiguation": {"strategy": "unique", "verified": True},
+                "enabled": False,
+            },
+            {
+                "id": "read_only_probe",
+                "kind": "interaction",
+                "action": "observe",
+                "locator": {"role": "button", "name": "Save"},
+                "disambiguation": {"strategy": "unique", "verified": True},
+            },
+        ]
+        workflow = compile_recording(recording)
+        permissions = workflow["requires"]["permissions"]
+        self.assertIn("desktop.observe", permissions)
+        # The only writing step is disabled, so replay never drives the UI.
+        self.assertNotIn("desktop.input", permissions)
+
+    def test_converter_does_not_claim_unverified_uniqueness(self) -> None:
+        # Measured: a locator labelled "unique" without checking matched two
+        # identically named buttons and failed replay with DRIVER.AMBIGUOUS.
+        recording, _ = convert_events(
+            [event(1, "invoked")], name="demo",
+            recorded_at="2026-08-30T00:00:00Z")
+        disambiguation = recording["steps"][0]["disambiguation"]
+        self.assertEqual(disambiguation["strategy"], "unresolved")
+        self.assertFalse(disambiguation["verified"])
+
+    def test_unverified_recording_fails_at_compile_not_at_replay(self) -> None:
+        recording, _ = convert_events(
+            [event(1, "invoked")], name="demo",
+            recorded_at="2026-08-30T00:00:00Z")
+        with self.assertRaises(RecordingError) as caught:
+            compile_recording(recording)
+        self.assertEqual(caught.exception.code, "RECORDING.LOCATOR_UNRESOLVED")
+        # Naming the step is the point: at replay the operator only saw that
+        # some locator was ambiguous.
+        self.assertEqual(caught.exception.details["id"], recording["steps"][0]["id"])
+
+    def test_verification_promotes_only_a_single_match(self) -> None:
+        recording, _ = convert_events(
+            [event(1, "invoked")], name="demo",
+            recorded_at="2026-08-30T00:00:00Z",
+            window={"class_name": "Notepad"})
+        outcomes = verify_locators(recording, lambda window, locator: 1)
+        self.assertTrue(outcomes[0]["resolved"])
+        self.assertEqual(recording["steps"][0]["disambiguation"],
+                         {"strategy": "unique", "verified": True})
+        compile_recording(recording)
+
+    def test_verification_refuses_an_ambiguous_match(self) -> None:
+        recording, _ = convert_events(
+            [event(1, "invoked")], name="demo",
+            recorded_at="2026-08-30T00:00:00Z")
+        outcomes = verify_locators(recording, lambda window, locator: 2)
+        self.assertFalse(outcomes[0]["resolved"])
+        self.assertEqual(outcomes[0]["matches"], 2)
+        # The recorded strategy is what replay depends on; asserting only on
+        # the returned outcome missed a mutation that marked two matches unique.
+        self.assertEqual(recording["steps"][0]["disambiguation"],
+                         {"strategy": "unresolved", "verified": False})
+        with self.assertRaises(RecordingError):
+            compile_recording(recording)
+
+    def test_verification_refuses_a_missing_match(self) -> None:
+        recording, _ = convert_events(
+            [event(1, "invoked")], name="demo",
+            recorded_at="2026-08-30T00:00:00Z")
+        outcomes = verify_locators(recording, lambda window, locator: 0)
+        self.assertFalse(outcomes[0]["resolved"])
+        self.assertEqual(recording["steps"][0]["disambiguation"],
+                         {"strategy": "unresolved", "verified": False})
+        with self.assertRaises(RecordingError):
+            compile_recording(recording)
+
+    def test_reverification_can_demote_a_previously_unique_locator(self) -> None:
+        # A recording stays editable and the UI changes underneath it, so a
+        # locator that was unique must be able to lose that status.
+        recording = minimal_recording()
+        self.assertEqual(
+            recording["steps"][0]["disambiguation"]["strategy"], "unique")
+        verify_locators(recording, lambda window, locator: 3)
+        self.assertEqual(
+            recording["steps"][0]["disambiguation"]["strategy"], "unresolved")
+
+
+    def test_unclassified_action_is_refused(self) -> None:
+        # Measured: an unknown action used to compile into a nonexistent
+        # driver action granted observe only, which would silently
+        # under-declare permissions for any future writing action.
+        recording = minimal_recording()
+        recording["steps"] = [
+            {
+                "id": "mystery",
+                "kind": "interaction",
+                "action": "drag_and_drop",
+                "locator": {"role": "button", "name": "Save"},
+                "disambiguation": {"strategy": "unique", "verified": True},
+            }
+        ]
+        with self.assertRaises(RecordingError) as caught:
+            compile_recording(recording)
+        self.assertEqual(caught.exception.code, "RECORDING.LOGIC_UNSUPPORTED")
+        self.assertEqual(caught.exception.details["action"], "drag_and_drop")
+
+
+class WindowSelectorTests(unittest.TestCase):
+    """Replay has to name a window, so compiling must insist on one."""
+
+    def test_recording_without_a_window_is_refused(self) -> None:
+        # Measured: the driver rejects {} with DRIVER.INVALID_REQUEST
+        # ("window must contain an exact selector"), so emitting it produces a
+        # workflow that validates and then dies mid-replay.
+        recording, _ = convert_events(
+            [event(1, "invoked")], name="demo",
+            recorded_at="2026-08-30T00:00:00Z")
+        verify_locators(recording, lambda window, locator: 1)
+        with self.assertRaises(RecordingError) as caught:
+            compile_recording(recording)
+        self.assertEqual(caught.exception.code, "RECORDING.WINDOW_UNRESOLVED")
+        self.assertEqual(caught.exception.details["id"],
+                         recording["steps"][0]["id"])
+
+    def test_capture_window_reaches_the_snapshot_step(self) -> None:
+        recording, _ = convert_events(
+            [event(1, "invoked")], name="demo",
+            recorded_at="2026-08-30T00:00:00Z", window={"title": "Editor"})
+        verify_locators(recording, lambda window, locator: 1)
+        workflow = compile_recording(recording)
+        self.assertEqual(workflow["steps"][0]["with"],
+                         {"window": {"title": "Editor"}})
+
+    def test_a_step_can_override_the_capture_window(self) -> None:
+        # A flow that crosses windows needs this; otherwise the capture value
+        # would silently apply to a step belonging to a different window.
+        recording, _ = convert_events(
+            [event(1, "invoked")], name="demo",
+            recorded_at="2026-08-30T00:00:00Z", window={"title": "Editor"})
+        recording["steps"][0]["window"] = {"title": "Save As"}
+        verify_locators(recording, lambda window, locator: 1)
+        workflow = compile_recording(recording)
+        self.assertEqual(workflow["steps"][0]["with"],
+                         {"window": {"title": "Save As"}})
+
+
+class PluginCommandSplitTests(unittest.TestCase):
+    """The CLI could not launch any Windows plugin before this was fixed."""
+
+    def test_windows_paths_survive_splitting(self) -> None:
+        if os.name != "nt":
+            self.skipTest("Windows path semantics")
+        # POSIX splitting turned this into one meaningless token.
+        parts = _split_command(r"plugins\windows_uia\run.cmd")
+        self.assertEqual(len(parts), 1)
+        self.assertIn("\\", parts[0])
+
+    def test_quoted_paths_with_spaces_stay_intact(self) -> None:
+        if os.name != "nt":
+            self.skipTest("Windows path semantics")
+        parts = _split_command('"C:\\Program Files\\py.exe" driver.py')
+        self.assertEqual(parts[0], "C:\\Program Files\\py.exe")
+        self.assertEqual(parts[1], "driver.py")
+
+    def test_surrounding_quotes_are_stripped(self) -> None:
+        if os.name != "nt":
+            self.skipTest("Windows path semantics")
+        # CreateProcess would otherwise treat the quotes as part of the name.
+        parts = _split_command('"python" "driver.py"')
+        self.assertEqual(parts, ["python", "driver.py"])
+
+    def test_plain_commands_are_unaffected(self) -> None:
+        self.assertEqual(_split_command("python driver.py"),
+                         ["python", "driver.py"])
 
 
 if __name__ == "__main__":

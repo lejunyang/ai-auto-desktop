@@ -365,3 +365,60 @@ driver 走 NDJSON 请求/响应，一个长跑的捕获会独占主循环。因�
 真实 fixture 窗口跑通 `捕获 → 转换 → 编译 → 校验`：两次真实交互（invoke 与值变更，均有独立证据）产生 5 个事件，合并后转换为 2 个步骤，编译为 6 个 workflow step，通过未修改的 `compile_descriptor()` 与 CLI `validate`。产物中不含输入的文本。
 
 单元测试 31 项，10 项变异全部被对应测试捕获。其中一项变异最初**存活**：停用「引用不存在的步骤」检查后测试仍然通过，因为「已禁用」分支恰好也能捕获同一输入且返回相同 code。这说明该测试通过的理由并非它所声称的——已改为区分 `reason` 并在测试中断言。
+
+## 13. 回放验证（实测）
+
+用真实录制产物对真实 fixture 跑通 `run`，证明「捕获 → 录制 → 校验 → 编译 → 回放」闭合。
+此前所有产物只经过 `validate`，而 **`validate` 不执行任何回放路径**：它不解析 locator、
+不启动 driver、不检查权限策略。本节四个缺陷全部是「能通过 validate、无法回放」。
+
+### 13.1 判定标准：以应用自身状态为准
+
+回放是否成功**不看 runner 退出码**，只看 fixture 自己的状态标签是否改变
+（`Status: idle` → `Status: invoked`）。fixture 的状态由它自己维护，独立于 UIA，
+因此「runner 报成功但应用没变」与「真的生效」可以区分。
+
+录制在实例 A 上进行，回放针对**新启动的实例 B**。这比复用同一窗口更强：它证明录制的
+locator 在录制时尚不存在的会话里仍能解析。
+
+### 13.2 实测暴露的四个缺陷
+
+| 缺陷 | 现象 | 根因 | 处置 |
+| --- | --- | --- | --- |
+| CLI 无法启动 Windows 插件 | `PLUGIN.START_FAILED [WinError 2]` | `shlex.split` POSIX 模式吞掉反斜杠；README 记录的命令**从来不可能成功** | Windows 改用 `posix=False` 并剥离残留引号 |
+| 编译产物缺权限声明 | `POLICY.DENIED undeclared_permissions: desktop.observe` | 编译器从不写 `requires.permissions` | 按启用步骤的动作推导并声明 |
+| 谎称 locator 唯一 | 回放期 `DRIVER.AMBIGUOUS` | 转换器只有事件、没有快照，却标 `strategy: unique` | 改标 `unresolved`；新增 `verify_locators()` 实解析后才升级 |
+| 空窗口选择器 | driver 报 `DRIVER.INVALID_REQUEST` | 无窗口时编译器输出 `"window": {}` | 编译期报 `RECORDING.WINDOW_UNRESOLVED` 并指名步骤 |
+
+四者共性：**校验通过不等于可运行**。前三个在 `validate` 下完全沉默。
+
+### 13.3 歧义元素：失败发生在何时
+
+fixture 有两个同名按钮（`Duplicate action`，automation_id 1004/1005）。录制其一后回放：
+
+- 修复前：产物标 `unique`，回放期 driver 报 `DRIVER.AMBIGUOUS`，**未点错按钮**（driver 失败关闭，
+  这一点本身是正确的），但操作者要等到回放才知道录制有问题；
+- 修复后：`verify_locators()` 实解析得 `matches=2`，保持 `unresolved`，
+  **编译期**报 `RECORDING.LOCATOR_UNRESOLVED` 并指名 `invoke_duplicate_action`。
+
+失败点从回放期前移到编译期，且携带步骤名。这正是 §7.2 中「约 13% 节点无法靠字段唯一」
+所指的风险在真实链路上的表现。
+
+### 13.4 窗口选择器的归属
+
+录制格式此前**没有任何地方**记录目标窗口：规范顶层表无此字段，示例的步骤也没有，
+手写的 `save-note.compiled.json` 里的 `{"class_name": "Notepad"}` 是凭空写入的。
+现改为 `capture.window`——它是「录了哪个窗口」的事实而非逐步选择；
+步骤级 `window` 保留为**跨窗口流程的覆盖项**。
+
+### 13.5 未分类动作必须拒绝
+
+实测：未知动作会被编译成不存在的 `desktop.windows_uia.snapshot_only@1`，且只声明 observe。
+两个后果同时发生——不存在的 driver 动作进入回放，且未来新增的写动作若忘记登记
+就会**静默少声明权限**。现改为无分类即拒绝编译，`ACTION_PERMISSIONS` 成为唯一登记点。
+
+### 13.6 仍未验证
+
+- 回放只在**单步 invoke** 上跑通；多步、含 `type_text`、含 logic 分支的录制未实跑；
+- 跨应用（非 fixture）回放未验证，locator 稳定性数据来自 Notepad 静态采样而非回放；
+- macOS / Linux 的回放路径完全未测。

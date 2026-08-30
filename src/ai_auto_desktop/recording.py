@@ -26,7 +26,7 @@ Three things this module must do that the existing workflow compiler does not:
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, MutableMapping, Sequence
 import json
 import re
 from typing import Any
@@ -41,6 +41,21 @@ DEFAULT_MAX_DURATION = "5m"
 MIN_EXECUTED_STEPS = 20
 
 STEP_KINDS = frozenset({"interaction", "assertion", "logic"})
+
+# Permissions each recorded action needs at replay.  Every action needs
+# observe, because expansion always performs snapshot and find first; only the
+# ones that actually drive the UI add input.  Declaring input for a read-only
+# recording would ask the operator to grant more than the run requires.
+ACTION_PERMISSIONS = {
+    # Read-only: expansion still snapshots and finds, but nothing is driven.
+    "observe": ("desktop.observe",),
+    "focus": ("desktop.observe", "desktop.input"),
+    "invoke": ("desktop.observe", "desktop.input"),
+    "set_value": ("desktop.observe", "desktop.input"),
+    "type_text": ("desktop.observe", "desktop.input"),
+    "pointer_click": ("desktop.observe", "desktop.input"),
+}
+BASE_PERMISSIONS = ("desktop.observe",)
 DISAMBIGUATION_STRATEGIES = frozenset({"unique", "scoped", "ordinal", "unresolved"})
 
 
@@ -103,6 +118,12 @@ class RecordingCompiler:
     def __init__(self, recording: Mapping[str, Any]) -> None:
         self.recording = _mapping(recording, "recording")
         self.warnings: list[dict[str, Any]] = []
+        # Which window replay should target.  A property of the capture rather
+        # than of any one step, so steps inherit it unless they say otherwise.
+        capture = recording.get("capture")
+        self.window = dict(
+            (capture or {}).get("window") or {}
+        ) if isinstance(capture, Mapping) else {}
 
     # ---- validation -----------------------------------------------------
 
@@ -379,6 +400,10 @@ class RecordingCompiler:
                         "version": f">={driver.get('version', '0.1.0')}",
                     }
                 ],
+                # Without this the run is refused by policy before any step
+                # executes: validate does not enforce policy, so a workflow
+                # missing it looks correct right up until it is run.
+                "permissions": self._required_permissions(all_steps),
             },
             "budgets": {
                 "max_duration": DEFAULT_MAX_DURATION,
@@ -396,6 +421,29 @@ class RecordingCompiler:
             workflow["inputs"] = inputs
         self._check_input_references(workflow, inputs)
         return workflow
+
+    def _required_permissions(
+        self, all_steps: Sequence[Mapping[str, Any]]
+    ) -> list[str]:
+        """Union of what the enabled steps need, and nothing more."""
+
+        needed = set(BASE_PERMISSIONS)
+        for step in all_steps:
+            if not _enabled(step) or step["kind"] != "interaction":
+                continue
+            action = step.get("action")
+            if action not in ACTION_PERMISSIONS:
+                # Falling back to observe would under-declare a writing action
+                # and let a nonexistent driver action reach replay.  Every
+                # action must be classified here before it can be compiled.
+                _fail(
+                    "RECORDING.LOGIC_UNSUPPORTED",
+                    "action has no permission classification",
+                    id=step.get("id"),
+                    action=action,
+                )
+            needed.update(ACTION_PERMISSIONS[action])
+        return sorted(needed)
 
     def _collect_inputs(self, all_steps: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         """Declare an input for every externalized text value.
@@ -481,7 +529,19 @@ class RecordingCompiler:
 
         step_id = step["id"]
         locator = dict(step["locator"])
-        window = dict(step.get("window") or {})
+        # Normally a property of the whole capture; a step overrides it only
+        # when the flow crosses windows.
+        window = dict(step.get("window") or self.window or {})
+        if not window:
+            # An empty selector is refused by the driver at run time
+            # (DRIVER.INVALID_REQUEST: "window must contain an exact selector"),
+            # so emitting one produces a workflow that validates and then dies
+            # mid-replay.  Fail here instead, while the step can still be named.
+            raise RecordingError(
+                "RECORDING.WINDOW_UNRESOLVED",
+                "no window selector: set capture.window, or window on the step",
+                id=step["id"],
+            )
         snapshot_id = f"{step_id}__snapshot"
         find_id = f"{step_id}__find"
 
@@ -489,7 +549,7 @@ class RecordingCompiler:
             "id": snapshot_id,
             "type": "action",
             "uses": f"{driver}.snapshot@1",
-            "with": {"window": window} if window else {"window": {}},
+            "with": {"window": window},
             "effect": {"class": "read_only"},
             "risk": {"category": "observe", "level": "low"},
         }
@@ -790,6 +850,11 @@ class EventConverter:
                 "driver": {"name": self.driver, "version": self.driver_version},
                 "probe": dict(probe or {}),
                 "environment": dict(environment or {}),
+                # Replay has to name a window: the driver rejects an empty
+                # selector with DRIVER.INVALID_REQUEST.  Recorded once here
+                # rather than stamped onto every step, so retargeting a
+                # recording is a single edit.
+                "window": dict(self.window),
             },
             # Values are never captured in the first place, so dropping them is
             # a statement of fact rather than a policy applied after the event.
@@ -833,10 +898,14 @@ class EventConverter:
             "kind": "interaction",
             "action": action,
             "locator": locator,
-            # The recorder has not resolved this against a snapshot yet, so it
-            # must say so: claiming verified uniqueness without checking is the
-            # failure the disambiguation rules exist to prevent.
-            "disambiguation": {"strategy": "unique", "verified": False},
+            # The converter sees events, not a snapshot, so it cannot know
+            # whether this locator is unique.  Measured: recording a click on
+            # one of two identically named buttons produced a locator labelled
+            # "unique" that then failed replay with DRIVER.AMBIGUOUS.  Claiming
+            # a property that was never checked is exactly what the
+            # disambiguation rules exist to prevent, so the honest label is
+            # "unresolved" until something actually resolves it.
+            "disambiguation": {"strategy": "unresolved", "verified": False},
             "observed": {
                 "role": role,
                 "had_value": kind == "value_changed",
@@ -847,8 +916,7 @@ class EventConverter:
                 },
             },
         }
-        if self.window:
-            step["window"] = dict(self.window)
+        # The window lives in capture; a step carries one only to override it.
 
         if action == "type_text":
             # The text itself was never captured, so it becomes an input the
@@ -909,6 +977,41 @@ class EventConverter:
                 "reason": reason,
             }
         )
+
+
+def verify_locators(
+    recording: MutableMapping[str, Any],
+    resolve: "Callable[[Mapping[str, Any], Mapping[str, Any]], int]",
+) -> list[dict[str, Any]]:
+    """Resolve each step's locator and record the outcome truthfully.
+
+    ``resolve`` is given the step's window selector and locator and returns how
+    many nodes matched.  It is injected rather than imported so this stays
+    testable without a live desktop, and so the recorder can supply whatever
+    driver session it already holds.
+
+    Exactly one match upgrades the step to a verified unique locator.  Anything
+    else stays unresolved and is reported: the compiler refuses those, which
+    moves the failure from replay time to compile time where it names the step.
+    """
+
+    outcomes: list[dict[str, Any]] = []
+    for step in _walk(_sequence(recording.get("steps", []), "steps")):
+        if step.get("kind") != "interaction":
+            continue
+        matches = resolve(step.get("window") or {}, step["locator"])
+        disambiguation = dict(step.get("disambiguation") or {})
+        if matches == 1:
+            disambiguation["strategy"] = "unique"
+            disambiguation["verified"] = True
+        else:
+            disambiguation["strategy"] = "unresolved"
+            disambiguation["verified"] = False
+        step["disambiguation"] = disambiguation
+        outcomes.append(
+            {"id": step["id"], "matches": matches, "resolved": matches == 1}
+        )
+    return outcomes
 
 
 def convert_events(

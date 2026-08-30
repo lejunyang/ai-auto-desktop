@@ -223,3 +223,61 @@ fixture 在收到真实指针点击时会更新状态标签，因此「点击是
 即 MTA 下 COM 在独立 RPC 线程投递回调，**不需要**消息泵。既有 driver 在 import comtypes 前设置 `sys.coinit_flags = 0`，因此捕获实现必须按 MTA 处理：不加消息泵，但所有跨线程状态必须加锁。
 
 这条修正的意义在于：若沿用未加限定的「必须泵消息」，会给 MTA driver 加上一个**完全不起作用**的消息泵，并可能因此误以为已经处理了事件投递问题。
+
+## 12. 回放验证实测
+
+### 12.1 录制 A → 回放 B
+
+| 阶段 | 观察 |
+| --- | --- |
+| 录制（实例 A） | `Status: idle` → `Status: invoked`，交互确有发生 |
+| 捕获事件 | `focus_changed`, `invoked` |
+| 转换 | 1 个 interaction 步骤，locator `{role: button, name: Apply fixture value, class_name: Button}` |
+| 校验 | `verify_locators` 实解析 `matches=1` → `strategy: unique, verified: true` |
+| 编译 | 3 个 workflow step（snapshot → find → invoke） |
+| 回放（**新实例 B**） | `exit=0`，`Status: idle` → `Status: invoked` |
+
+判定依据是 **B 自己的状态标签**，不是退出码。
+
+### 12.2 歧义用例
+
+| 阶段 | 观察 |
+| --- | --- |
+| 录制 | 点击两个同名按钮之一，`Status: duplicate invoked` |
+| 校验 | `matches=2` → 保持 `unresolved` |
+| 编译 | 拒绝：`RECORDING.LOCATOR_UNRESOLVED`，`id=invoke_duplicate_action` |
+| 修复前的回放 | `DRIVER.AMBIGUOUS`，应用状态未变（未点错按钮） |
+
+### 12.3 CLI 参数切分实测
+
+| 输入 | `posix=True` | `posix=False` |
+| --- | --- | --- |
+| `plugins\windows_uia\run.cmd` | `['pluginswindows_uiarun.cmd']` | 分隔符保留 |
+| 含空格的解释器路径 | 被拆成 3 段 | 保留（带引号） |
+
+另测得 `.cmd` **必须用反斜杠**：`cmd /c plugins/windows_uia/run.cmd` 会把首段当命令名
+（`'plugins' is not recognized`）。两项要求在 POSIX 规则下互斥，故 Windows 下文档写法
+无论怎么拼都不可能成功。
+
+### 12.4 空窗口选择器
+
+`snapshot` 传 `{"window": {}}` → `DRIVER.INVALID_REQUEST: window must contain an exact
+selector`。对照组：显式 title 正确解析到目标窗口。故 driver 失败关闭正确，编译器不应产出该形态。
+
+### 12.5 一次方法论故障：陈旧字节码
+
+变异测试首轮报「2 项存活」，实为**假阳性**。本机解释器把 `.pyc` 写入项目外的缓存目录，
+恢复源文件不会使其失效，因此变异后的字节码在源文件还原后**仍在执行**。
+反汇编 `verify_locators` 看到 `bool(>=)` 才定位到。清缓存 + `-B` +
+`PYTHONDONTWRITEBYTECODE` 后重跑，并加**无变异对照组**（必须全绿），结果 9/9 全部捕获。
+
+教训与本项目既有原则一致：**任何「不成立」的结论，先证明被测代码真的在运行**。
+
+### 12.6 变异结果
+
+9 项变异全部被对应测试捕获，对照组全绿。其中两项揭示了我自己的测试缺陷：
+
+- 歧义/缺失校验测试只断言返回值，不断言**写回产物的 strategy**，因此漏掉
+  `matches >= 1` 变异（该变异使 2 匹配被标为 unique）。已补断言。
+- 一项名为「只读录制不要求 input」的测试用的是 `focus` 步骤，而 focus 本就需要 input，
+  它**根本无法**检测过度授权。已换成真正只读的动作。
