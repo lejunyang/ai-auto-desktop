@@ -306,16 +306,21 @@ fn a_paused_run_resumes_and_completes_from_its_boundary() {
         .expect("pause");
     assert_eq!(paused.run.status, RunStatus::Paused);
 
-    // Resuming needs intent back at `run`; a resume that ignored intent would
-    // fight the operator's pause forever.
-    store
-        .compare_and_set_desired_state("run-1", DesiredState::Pause, DesiredState::Run, None)
-        .expect("resume intent");
+    // Resume without clearing the pause intent by hand. Asking to resume *is*
+    // asking to run, so the executor must clear it: a resume that left the
+    // request standing would read it at the first boundary and stop again,
+    // leaving the run permanently stuck. (This test previously reset the intent
+    // itself, which hid exactly that bug.)
     let finished = executor
         .resume(&descriptor, "run-1", DurableOptions::default())
         .expect("resume");
 
     assert_eq!(finished.run.status, RunStatus::Succeeded);
+    assert_eq!(
+        finished.run.desired_state,
+        DesiredState::Run,
+        "the standing pause request must be cleared, not left to re-trigger"
+    );
     // All four steps ran exactly once: pausing before any of them lost nothing.
     assert_eq!(
         finished.run.output.as_ref().expect("output")["total"],
@@ -329,6 +334,65 @@ fn a_paused_run_resumes_and_completes_from_its_boundary() {
         .collect();
     assert_eq!(events.iter().filter(|e| *e == "run.segment_entered").count(), 4);
     assert!(events.iter().any(|e| e == "run.resumed"));
+    // Clearing the intent is recorded, so an operator can see why their pause
+    // stopped applying.
+    assert!(
+        events.iter().any(|e| e == "run.resume_requested"),
+        "clearing the pause request must be auditable: {events:?}"
+    );
+}
+
+#[test]
+fn a_resume_does_not_clear_a_pause_on_a_run_it_refuses_to_continue() {
+    // A run that cannot be continued must be refused without quietly rewriting
+    // the operator's recorded intent on the way out.
+    let temp = TempDir::new("refused-keeps-intent");
+    let descriptor = compile(counting_workflow(3));
+    let store = temp.open();
+    let digest = aad_runtime::plan_digest(&descriptor);
+    store
+        .create_run("run-1", "durable.counting", &json!({}), &descriptor.raw, None, Some(&digest), None)
+        .expect("create");
+    let now = aad_runtime::durable::now_seconds();
+    let lease = store.claim_owner("run-1", "dead", 0.4, now).expect("claim");
+    store
+        .set_status(&lease, RunStatus::Pending, RunStatus::Running, None, None, None, None, now)
+        .expect("start");
+    // Interrupted inside a step: unresumable.
+    store
+        .append_event_with_checkpoint(
+            &lease,
+            "run.segment_entered",
+            &json!({"stepId": "step1"}),
+            &json!({
+                "checkpointVersion": 1,
+                "planDigest": digest,
+                "phase": "in_top_level_step",
+                "deadline": now + 300.0,
+                "nextTopLevelIndex": 2,
+                "variables": {"count": 1},
+            }),
+            None,
+            None,
+            now,
+        )
+        .expect("write");
+    store
+        .compare_and_set_desired_state("run-1", DesiredState::Run, DesiredState::Pause, None)
+        .expect("pause");
+    std::thread::sleep(std::time::Duration::from_millis(600));
+
+    let executor = DurableExecutor::new(temp.open());
+    let outcome = executor
+        .resume(&descriptor, "run-1", DurableOptions::default())
+        .expect("reconcile");
+
+    assert_eq!(outcome.run.status, RunStatus::UnknownEffect);
+    assert_eq!(
+        outcome.run.desired_state,
+        DesiredState::Pause,
+        "a refused resume must leave the operator's intent as they set it"
+    );
 }
 
 #[test]
@@ -1014,6 +1078,20 @@ fn a_killed_process_leaves_a_recoverable_journal() {
         .expect("a checkpoint was committed")["nextTopLevelIndex"]
         .as_u64()
         .expect("index");
+    // Which of the two real crash states we landed in. Killing a process cannot
+    // be aimed precisely, so rather than assume one, read what actually happened
+    // and hold that case to its own strict expectation. Both are genuine
+    // outcomes; neither is allowed to replay a step.
+    let interrupted_phase = abandoned.checkpoint.as_ref().expect("checkpoint")["phase"]
+        .as_str()
+        .expect("phase")
+        .to_string();
+    let entered_before = store
+        .list_events("run-1", 0, 5000)
+        .expect("events")
+        .iter()
+        .filter(|event| event.event_type == "run.segment_entered")
+        .count();
 
     // Before the lease lapses the run must stay fenced, whoever asks.
     let contended = DurableExecutor::new(JournalStore::open(&journal_path).expect("open"));
@@ -1041,40 +1119,58 @@ fn a_killed_process_leaves_a_recoverable_journal() {
         )
         .expect("resume from disk after a real crash");
 
-    // The kill landed inside a step -- guaranteed, because every step of this
-    // workflow spins for a while and the parent waited for committed progress
-    // before killing. So the effect is unprovable and the run must say so
-    // rather than guess.
-    assert_eq!(
-        outcome.run.status,
-        RunStatus::UnknownEffect,
-        "an interrupted step must not be silently replayed or reported as failed"
-    );
-    let error = outcome.run.error.as_ref().expect("error");
-    assert_eq!(error["code"], json!("DURABLE.UNKNOWN_EFFECT"));
-    assert_eq!(
-        error["details"]["phase"],
-        json!("in_top_level_step"),
-        "the kill landed inside a step, which is the unprovable case"
-    );
-
-    // Nothing was dispatched during reconciliation: the entered-step events are
-    // exactly the ones the dead process wrote, with none added by recovery.
+    // The kill landed in one of exactly two real states, and each has its own
+    // strict requirement. What is never allowed is re-entering a step that had
+    // already begun.
     let events: Vec<String> = store
         .list_events("run-1", 0, 5000)
         .expect("events")
         .into_iter()
         .map(|event| event.event_type)
         .collect();
-    let entered = events.iter().filter(|e| *e == "run.segment_entered").count() as u64;
-    assert_eq!(
-        entered,
-        interrupted_at + 1,
-        "recovery must not re-enter any step: {entered} entries for index {interrupted_at}"
-    );
+    let entered_after = events.iter().filter(|e| *e == "run.segment_entered").count();
+
+    if interrupted_phase == "in_top_level_step" {
+        // Killed mid-step: whether the effect landed is unknowable, so the run
+        // must say so rather than guess, and must dispatch nothing at all.
+        assert_eq!(
+            outcome.run.status,
+            RunStatus::UnknownEffect,
+            "an interrupted step must not be silently replayed or reported as failed"
+        );
+        let error = outcome.run.error.as_ref().expect("error");
+        assert_eq!(error["code"], json!("DURABLE.UNKNOWN_EFFECT"));
+        assert_eq!(error["details"]["phase"], json!("in_top_level_step"));
+        assert_eq!(
+            entered_after, entered_before,
+            "recovery must not enter any step: {entered_before} before, {entered_after} after"
+        );
+    } else {
+        // Killed cleanly between steps: this is resumable, and the run must
+        // finish the remaining work without repeating what was already done.
+        assert_eq!(
+            interrupted_phase, "between_top_level_steps",
+            "a crash leaves the run either mid-step or at a boundary"
+        );
+        assert_eq!(outcome.run.status, RunStatus::Succeeded);
+        let total = outcome.run.output.as_ref().expect("output")["total"]
+            .as_u64()
+            .expect("total");
+        assert_eq!(total, 40, "every step ran exactly once across the crash");
+        assert_eq!(
+            entered_after, 40,
+            "each of the 40 steps must be entered exactly once, not re-entered"
+        );
+    }
     assert!(
         events.iter().any(|e| e == "run.reclaimed"),
         "taking over a dead runner's run must be recorded: {events:?}"
+    );
+    // `interrupted_at` is the boundary the dead process had reached; recovery
+    // must never rewind behind it.
+    assert!(
+        entered_after >= interrupted_at as usize,
+        "recovery must not lose committed progress"
     );
 }
 

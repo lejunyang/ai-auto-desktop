@@ -57,6 +57,105 @@ enum Command {
     Mcp,
     /// Print the tools exposed over MCP.
     Tools,
+    /// Start a durable run that survives this process exiting.
+    Start(StartArgs),
+    /// Continue a durable run that was paused or whose runner died.
+    Resume(ResumeArgs),
+    /// Report a durable run's status.
+    Status(RunRefArgs),
+    /// Ask a durable run to pause at its next safe point.
+    Pause(RunRefArgs),
+    /// Ask a durable run to stop for good.
+    Cancel(RunRefArgs),
+    /// List durable runs, newest first.
+    List(ListArgs),
+    /// Print a durable run's event history.
+    Events(EventsArgs),
+}
+
+/// Where the durable run store lives.
+///
+/// Deliberately not called `--journal`: `run --journal` writes an NDJSON event
+/// log and truncates the file it is given, so reusing that name would invite
+/// someone to destroy a run store with a typo.
+#[derive(Args)]
+struct StoreArgs {
+    /// The SQLite run store. Created if it does not exist.
+    #[arg(long, value_name = "PATH")]
+    store: PathBuf,
+}
+
+#[derive(Args)]
+struct StartArgs {
+    /// A workflow descriptor in YAML or JSON.
+    file: PathBuf,
+    #[command(flatten)]
+    store: StoreArgs,
+    /// Workflow inputs as a JSON object.
+    #[arg(long, value_name = "JSON")]
+    inputs: Option<String>,
+    /// Use this run id instead of generating one.
+    #[arg(long, value_name = "ID")]
+    run_id: Option<String>,
+    /// Name this process in the run's ownership record.
+    #[arg(long, value_name = "ID")]
+    owner_id: Option<String>,
+    /// Seconds to hold the ownership lease between renewals.
+    #[arg(long, value_name = "SECONDS")]
+    lease_ttl: Option<f64>,
+}
+
+#[derive(Args)]
+struct ResumeArgs {
+    /// The run to continue.
+    run_id: String,
+    /// The same workflow descriptor the run was started from.
+    file: PathBuf,
+    #[command(flatten)]
+    store: StoreArgs,
+    /// Name this process in the run's ownership record.
+    #[arg(long, value_name = "ID")]
+    owner_id: Option<String>,
+    /// Seconds to hold the ownership lease between renewals.
+    #[arg(long, value_name = "SECONDS")]
+    lease_ttl: Option<f64>,
+}
+
+#[derive(Args)]
+struct RunRefArgs {
+    /// The run to act on.
+    run_id: String,
+    #[command(flatten)]
+    store: StoreArgs,
+}
+
+#[derive(Args)]
+struct ListArgs {
+    #[command(flatten)]
+    store: StoreArgs,
+    /// Only list runs with this status.
+    #[arg(long)]
+    status: Option<String>,
+    /// Maximum runs to report.
+    #[arg(long, default_value_t = 100)]
+    limit: i64,
+    /// Skip this many runs before reporting.
+    #[arg(long, default_value_t = 0)]
+    offset: i64,
+}
+
+#[derive(Args)]
+struct EventsArgs {
+    /// The run whose history to print.
+    run_id: String,
+    #[command(flatten)]
+    store: StoreArgs,
+    /// Only report events after this sequence number.
+    #[arg(long, value_name = "SEQ", default_value_t = 0)]
+    after_seq: i64,
+    /// Maximum events to report.
+    #[arg(long, default_value_t = 1000)]
+    limit: i64,
 }
 
 #[derive(Args)]
@@ -209,6 +308,18 @@ fn dispatch(command: &Command) -> (Value, u8) {
         Command::Mcp => (json!({"status": "closed"}), EXIT_OK),
         Command::Validate(args) => validate(&args.file),
         Command::Run(args) => run_workflow(args),
+        Command::Start(args) => start_run(args),
+        Command::Resume(args) => resume_run(args),
+        Command::Status(args) => with_store(&args.store, |store| {
+            store
+                .get_run(&args.run_id)
+                .map(|run| run.to_json())
+                .map_err(journal_failure)
+        }),
+        Command::Pause(args) => control(&args.store, &args.run_id, Intent::Pause),
+        Command::Cancel(args) => control(&args.store, &args.run_id, Intent::Cancel),
+        Command::List(args) => list_runs(args),
+        Command::Events(args) => list_events(args),
         Command::Apps(args) => with_driver(|driver| {
             let mut result = driver
                 .call("list_windows", &json!({}))
@@ -567,6 +678,320 @@ fn run_workflow(args: &RunArgs) -> (Value, u8) {
     (result.summary(), code)
 }
 
+// ------------------------------------------------------------ durable runs
+
+/// Open the run store, reporting an unusable path clearly.
+fn with_store<F>(args: &StoreArgs, action: F) -> (Value, u8)
+where
+    F: FnOnce(&aad_runtime::durable::JournalStore) -> Result<Value, Value>,
+{
+    let store = match aad_runtime::durable::JournalStore::open(&args.store) {
+        Ok(store) => store,
+        Err(error) => {
+            return (
+                failure(
+                    error.code(),
+                    error.message(),
+                    Some(json!({"store": args.store.display().to_string()})),
+                ),
+                EXIT_USAGE,
+            )
+        }
+    };
+    match action(&store) {
+        Ok(payload) => (payload, EXIT_OK),
+        Err(payload) => (payload, EXIT_FAILED),
+    }
+}
+
+fn journal_failure(error: aad_runtime::durable::JournalError) -> Value {
+    failure(error.code(), error.message(), None)
+}
+
+/// Render an `AutomationError` the way the rest of the CLI renders failures.
+fn automation_failure(error: &aad_core::AutomationError) -> Value {
+    let mut payload = json!({
+        "status": "error",
+        "error": {
+            "code": error.code,
+            "message": error.message,
+            "retryable": error.retryable,
+            "effect": error.effect,
+        }
+    });
+    if !error.details.is_empty() {
+        payload["error"]["details"] = Value::Object(error.details.clone());
+    }
+    payload
+}
+
+/// Compile the descriptor a durable command was given.
+fn durable_descriptor(path: &Path) -> Result<aad_core::WorkflowDescriptor, (Value, u8)> {
+    let document = read_descriptor(path).map_err(|payload| (payload, EXIT_USAGE))?;
+    aad_core::compile_descriptor(document, None).map_err(|error| {
+        (
+            json!({
+                "status": "invalid",
+                "error": {
+                    "code": error.code,
+                    "message": error.message,
+                    "issues": error.issues.iter()
+                        .map(|issue| json!({"path": issue.path, "message": issue.message}))
+                        .collect::<Vec<_>>(),
+                }
+            }),
+            EXIT_FAILED,
+        )
+    })
+}
+
+fn durable_options(
+    inputs: Option<&String>,
+    owner_id: Option<&String>,
+    lease_ttl: Option<f64>,
+) -> Result<aad_runtime::durable_exec::DurableOptions, (Value, u8)> {
+    let mut options = aad_runtime::durable_exec::DurableOptions::default();
+    if let Some(text) = inputs {
+        match serde_json::from_str::<Value>(text) {
+            Ok(Value::Object(map)) => options = options.with_inputs(map),
+            Ok(_) => {
+                return Err((
+                    failure("CLI.INVALID_ARGUMENTS", "--inputs must be a JSON object", None),
+                    EXIT_USAGE,
+                ))
+            }
+            Err(error) => {
+                return Err((
+                    failure(
+                        "CLI.INVALID_ARGUMENTS",
+                        &format!("--inputs is not valid JSON: {error}"),
+                        None,
+                    ),
+                    EXIT_USAGE,
+                ))
+            }
+        }
+    }
+    if let Some(owner) = owner_id {
+        options = options.with_owner_id(owner.clone());
+    }
+    if let Some(ttl) = lease_ttl {
+        // Rejected here rather than deeper down, so the message names the flag
+        // the user actually typed.
+        if !(ttl.is_finite() && ttl > 0.0) {
+            return Err((
+                failure(
+                    "CLI.INVALID_ARGUMENTS",
+                    "--lease-ttl must be a positive number of seconds",
+                    None,
+                ),
+                EXIT_USAGE,
+            ));
+        }
+        options = options.with_lease_ttl_seconds(ttl);
+    }
+    Ok(options)
+}
+
+/// The exit code for a durable attempt.
+///
+/// `paused` is a success: the run stopped because it was asked to, and the
+/// caller's request was carried out. Everything else non-terminal-successful is
+/// a failure a script must be able to detect.
+fn durable_code(outcome: &aad_runtime::durable_exec::DurableOutcome) -> u8 {
+    use aad_runtime::durable::RunStatus;
+    match outcome.run.status {
+        RunStatus::Succeeded | RunStatus::Paused => EXIT_OK,
+        _ => EXIT_FAILED,
+    }
+}
+
+fn start_run(args: &StartArgs) -> (Value, u8) {
+    let descriptor = match durable_descriptor(&args.file) {
+        Ok(descriptor) => descriptor,
+        Err(result) => return result,
+    };
+    let options = match durable_options(
+        args.inputs.as_ref(),
+        args.owner_id.as_ref(),
+        args.lease_ttl,
+    ) {
+        Ok(options) => options,
+        Err(result) => return result,
+    };
+
+    // Opened separately from `with_store` because the executor takes ownership
+    // of the connection for the whole run.
+    let store = match aad_runtime::durable::JournalStore::open(&args.store.store) {
+        Ok(store) => store,
+        Err(error) => {
+            return (
+                failure(
+                    error.code(),
+                    error.message(),
+                    Some(json!({"store": args.store.store.display().to_string()})),
+                ),
+                EXIT_USAGE,
+            )
+        }
+    };
+    let executor = aad_runtime::durable_exec::DurableExecutor::new(store);
+    match executor.start(&descriptor, args.run_id.as_deref(), options) {
+        Ok(outcome) => (outcome.to_json(), durable_code(&outcome)),
+        Err(error) => (automation_failure(&error), EXIT_FAILED),
+    }
+}
+
+fn resume_run(args: &ResumeArgs) -> (Value, u8) {
+    let descriptor = match durable_descriptor(&args.file) {
+        Ok(descriptor) => descriptor,
+        Err(result) => return result,
+    };
+    // No `--inputs` here by design: the run's inputs were persisted when it was
+    // created, and letting them be replaced on resume would mean the second half
+    // of a run executed against different values than the first.
+    let options = match durable_options(None, args.owner_id.as_ref(), args.lease_ttl) {
+        Ok(options) => options,
+        Err(result) => return result,
+    };
+
+    let store = match aad_runtime::durable::JournalStore::open(&args.store.store) {
+        Ok(store) => store,
+        Err(error) => {
+            return (
+                failure(
+                    error.code(),
+                    error.message(),
+                    Some(json!({"store": args.store.store.display().to_string()})),
+                ),
+                EXIT_USAGE,
+            )
+        }
+    };
+    let executor = aad_runtime::durable_exec::DurableExecutor::new(store);
+    match executor.resume(&descriptor, &args.run_id, options) {
+        Ok(outcome) => (outcome.to_json(), durable_code(&outcome)),
+        Err(error) => (automation_failure(&error), EXIT_FAILED),
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Intent {
+    Pause,
+    Cancel,
+}
+
+impl Intent {
+    fn desired(self) -> aad_runtime::durable::DesiredState {
+        match self {
+            Intent::Pause => aad_runtime::durable::DesiredState::Pause,
+            Intent::Cancel => aad_runtime::durable::DesiredState::Cancel,
+        }
+    }
+
+    fn event(self) -> &'static str {
+        match self {
+            Intent::Pause => "run.pause_requested",
+            Intent::Cancel => "run.cancel_requested",
+        }
+    }
+}
+
+/// Record operator intent against a run.
+///
+/// This only asks. The runner applies the request at its next safe point, so
+/// the reply reports `desiredState` rather than claiming the run has already
+/// stopped — saying "paused" while a step is still in flight would be a lie the
+/// operator might act on.
+fn control(store: &StoreArgs, run_id: &str, intent: Intent) -> (Value, u8) {
+    use aad_runtime::durable::DesiredState;
+
+    with_store(store, |journal| {
+        let run = journal.get_run(run_id).map_err(journal_failure)?;
+
+        // A terminal run is immutable; pretending to accept the request would
+        // leave the operator waiting for something that will never happen.
+        if run.is_terminal() {
+            return Err(failure(
+                "RUN.TERMINAL",
+                &format!(
+                    "terminal run {run_id} is immutable ({})",
+                    run.status.as_str()
+                ),
+                Some(json!({"status": run.status.as_str()})),
+            ));
+        }
+        // Asking twice is a success, not a conflict: the operator's wish is
+        // already recorded, and an error here would suggest it was not.
+        if run.desired_state == intent.desired() {
+            return Ok(run.to_json());
+        }
+        // Cancel is sticky. Downgrading it to a pause would silently revive a
+        // run somebody has already decided to stop.
+        if run.desired_state == DesiredState::Cancel {
+            return Err(failure(
+                "RUN.CANCEL_PENDING",
+                &format!("run {run_id} already has a sticky cancel request"),
+                Some(json!({"requestedDesiredState": intent.desired().as_str()})),
+            ));
+        }
+
+        let payload = json!({
+            "fromDesiredState": run.desired_state.as_str(),
+            "toDesiredState": intent.desired().as_str(),
+        });
+        journal
+            .compare_and_set_desired_state(
+                run_id,
+                run.desired_state,
+                intent.desired(),
+                Some((intent.event(), &payload)),
+            )
+            .map(|updated| updated.to_json())
+            .map_err(journal_failure)
+    })
+}
+
+fn list_runs(args: &ListArgs) -> (Value, u8) {
+    let status = match &args.status {
+        None => None,
+        Some(text) => match aad_runtime::durable::RunStatus::parse(text) {
+            Ok(status) => Some(status),
+            Err(error) => {
+                return (
+                    failure("CLI.INVALID_ARGUMENTS", error.message(), None),
+                    EXIT_USAGE,
+                )
+            }
+        },
+    };
+    with_store(&args.store, |journal| {
+        let runs = journal
+            .list_runs(status, args.limit, args.offset)
+            .map_err(journal_failure)?;
+        Ok(json!({
+            "count": runs.len(),
+            "runs": runs.iter().map(|run| run.to_json()).collect::<Vec<_>>(),
+        }))
+    })
+}
+
+fn list_events(args: &EventsArgs) -> (Value, u8) {
+    with_store(&args.store, |journal| {
+        let events = journal
+            .list_events(&args.run_id, args.after_seq, args.limit)
+            .map_err(journal_failure)?;
+        // `nextAfterSeq` lets a caller tail the history without re-reading it,
+        // and holds its position when the page came back empty.
+        let next = events.last().map(|event| event.seq).unwrap_or(args.after_seq);
+        Ok(json!({
+            "count": events.len(),
+            "events": events.iter().map(|event| event.to_json()).collect::<Vec<_>>(),
+            "nextAfterSeq": next,
+        }))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -588,7 +1013,7 @@ mod tests {
 
         for expected in [
             "apps", "describe", "snapshot", "find", "do", "probe", "validate", "run", "mcp",
-            "tools",
+            "tools", "start", "resume", "status", "pause", "cancel", "list", "events",
         ] {
             assert!(names.contains(&expected), "missing command {expected}");
         }
@@ -897,5 +1322,531 @@ mod tests {
         assert_eq!(code, EXIT_FAILED);
         assert_eq!(payload["status"], "failed");
         assert_eq!(payload["error"]["code"], "DEMO.STOP");
+    }
+
+    // ------------------------------------------------------- durable commands
+
+    /// A durable-eligible workflow: no action or script steps.
+    const DURABLE_WORKFLOW: &str = concat!(
+        "apiVersion: ai-auto-desktop.dev/v1alpha1\n",
+        "kind: Workflow\n",
+        "metadata:\n  name: durable.demo\n",
+        "budgets:\n  max_duration: 30s\n  max_executed_steps: 50\n",
+        "inputs:\n  label:\n    schema: {type: string}\n    default: hi\n",
+        "variables:\n  count:\n",
+        "    schema: {type: integer}\n    mutable: true\n    initial: 0\n",
+        "steps:\n",
+        "  - id: first\n    type: set\n    assign: {vars.count: '${{ vars.count + 1 }}'}\n",
+        "  - id: second\n    type: set\n    assign: {vars.count: '${{ vars.count + 1 }}'}\n",
+        "outputs:\n",
+        "  total:\n    value: \"${{ vars.count }}\"\n",
+        "  echo:\n    value: \"${{ inputs.label }}\"\n",
+    );
+
+    /// A directory that cleans itself up, so a failed test cannot poison a later
+    /// one through a leftover store.
+    struct TempDir {
+        path: PathBuf,
+    }
+
+    impl TempDir {
+        fn new(name: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "aad-cli-durable-{name}-{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).expect("the temp directory can be created");
+            Self { path }
+        }
+
+        fn store(&self) -> StoreArgs {
+            StoreArgs {
+                store: self.path.join("runs.sqlite3"),
+            }
+        }
+
+        fn workflow(&self) -> PathBuf {
+            let path = self.path.join("workflow.yaml");
+            std::fs::write(&path, DURABLE_WORKFLOW).expect("the fixture can be written");
+            path
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn start_args(temp: &TempDir, run_id: &str, inputs: Option<&str>) -> StartArgs {
+        StartArgs {
+            file: temp.workflow(),
+            store: temp.store(),
+            inputs: inputs.map(str::to_string),
+            run_id: Some(run_id.to_string()),
+            owner_id: Some("test-runner".into()),
+            lease_ttl: None,
+        }
+    }
+
+    #[test]
+    fn a_durable_run_persists_to_disk_and_reports_its_outcome() {
+        let temp = TempDir::new("start");
+
+        let (payload, code) = dispatch(&Command::Start(start_args(
+            &temp,
+            "run-1",
+            Some(r#"{"label":"agent"}"#),
+        )));
+
+        assert_eq!(code, EXIT_OK, "{payload}");
+        assert_eq!(payload["kind"], "Run");
+        assert_eq!(payload["status"], "succeeded");
+        assert_eq!(payload["output"]["total"], 2);
+        assert_eq!(payload["output"]["echo"], "agent");
+        // The store must be a real file, otherwise nothing was durable.
+        assert!(temp.store().store.exists(), "the run store must exist on disk");
+    }
+
+    #[test]
+    fn a_status_query_reads_the_run_back_from_a_separate_open() {
+        let temp = TempDir::new("status");
+        let (_, code) = dispatch(&Command::Start(start_args(&temp, "run-1", None)));
+        assert_eq!(code, EXIT_OK);
+
+        // A fresh open of the store: this is the "come back tomorrow" case.
+        let (payload, code) = dispatch(&Command::Status(RunRefArgs {
+            run_id: "run-1".into(),
+            store: temp.store(),
+        }));
+
+        assert_eq!(code, EXIT_OK, "{payload}");
+        assert_eq!(payload["runId"], "run-1");
+        assert_eq!(payload["status"], "succeeded");
+        // The lease token must never reach a caller.
+        assert!(
+            !payload.to_string().contains("token"),
+            "the bearer token must not be exposed: {payload}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_run_is_reported_as_not_found() {
+        let temp = TempDir::new("missing");
+        // Create the store so the failure is about the run, not the file.
+        let (_, _) = dispatch(&Command::Start(start_args(&temp, "run-1", None)));
+
+        let (payload, code) = dispatch(&Command::Status(RunRefArgs {
+            run_id: "nope".into(),
+            store: temp.store(),
+        }));
+
+        assert_eq!(code, EXIT_FAILED);
+        assert_eq!(payload["error"]["code"], "JOURNAL.RUN_NOT_FOUND");
+    }
+
+    #[test]
+    fn events_are_listed_with_a_cursor_for_tailing() {
+        let temp = TempDir::new("events");
+        let (_, code) = dispatch(&Command::Start(start_args(&temp, "run-1", None)));
+        assert_eq!(code, EXIT_OK);
+
+        let (payload, code) = dispatch(&Command::Events(EventsArgs {
+            run_id: "run-1".into(),
+            store: temp.store(),
+            after_seq: 0,
+            limit: 1000,
+        }));
+
+        assert_eq!(code, EXIT_OK, "{payload}");
+        let events = payload["events"].as_array().expect("events");
+        assert!(!events.is_empty(), "a completed run has a history");
+        assert_eq!(events[0]["kind"], "RunEvent");
+
+        // The cursor must let a caller resume without re-reading.
+        let last = payload["nextAfterSeq"].as_i64().expect("cursor");
+        let (tail, _) = dispatch(&Command::Events(EventsArgs {
+            run_id: "run-1".into(),
+            store: temp.store(),
+            after_seq: last,
+            limit: 1000,
+        }));
+        assert_eq!(tail["count"], 0, "nothing new after the last event");
+        // An empty page must hold its position rather than rewind to zero.
+        assert_eq!(tail["nextAfterSeq"], last);
+    }
+
+    #[test]
+    fn runs_can_be_listed_and_filtered_by_status() {
+        let temp = TempDir::new("list");
+        for id in ["run-1", "run-2"] {
+            let (_, code) = dispatch(&Command::Start(start_args(&temp, id, None)));
+            assert_eq!(code, EXIT_OK);
+        }
+
+        let (payload, code) = dispatch(&Command::List(ListArgs {
+            store: temp.store(),
+            status: None,
+            limit: 100,
+            offset: 0,
+        }));
+        assert_eq!(code, EXIT_OK, "{payload}");
+        assert_eq!(payload["count"], 2);
+
+        let (filtered, _) = dispatch(&Command::List(ListArgs {
+            store: temp.store(),
+            status: Some("succeeded".into()),
+            limit: 100,
+            offset: 0,
+        }));
+        assert_eq!(filtered["count"], 2);
+
+        let (none, _) = dispatch(&Command::List(ListArgs {
+            store: temp.store(),
+            status: Some("running".into()),
+            limit: 100,
+            offset: 0,
+        }));
+        assert_eq!(none["count"], 0, "no run is still running");
+    }
+
+    #[test]
+    fn an_unknown_status_filter_is_a_usage_error() {
+        let temp = TempDir::new("badstatus");
+        let (_, _) = dispatch(&Command::Start(start_args(&temp, "run-1", None)));
+
+        let (payload, code) = dispatch(&Command::List(ListArgs {
+            store: temp.store(),
+            status: Some("wibble".into()),
+            limit: 100,
+            offset: 0,
+        }));
+
+        assert_eq!(code, EXIT_USAGE);
+        assert_eq!(payload["error"]["code"], "CLI.INVALID_ARGUMENTS");
+    }
+
+    #[test]
+    fn a_pause_request_records_intent_without_claiming_it_took_effect() {
+        let temp = TempDir::new("pause");
+        // A pending run: created but not executed, so intent is observable.
+        let store = aad_runtime::durable::JournalStore::open(&temp.store().store)
+            .expect("the store opens");
+        let descriptor = durable_descriptor(&temp.workflow()).expect("compiles");
+        store
+            .create_run(
+                "run-1",
+                &descriptor.name,
+                &json!({}),
+                &descriptor.raw,
+                None,
+                Some(&aad_runtime::plan_digest(&descriptor)),
+                None,
+            )
+            .expect("create");
+        drop(store);
+
+        let (payload, code) = dispatch(&Command::Pause(RunRefArgs {
+            run_id: "run-1".into(),
+            store: temp.store(),
+        }));
+
+        assert_eq!(code, EXIT_OK, "{payload}");
+        assert_eq!(payload["desiredState"], "pause");
+        // Crucially, the run is NOT claimed to be paused: it has not stopped yet.
+        assert_eq!(
+            payload["status"], "pending",
+            "asking for a pause must not fabricate a paused status"
+        );
+
+        // Asking twice is a success, not a conflict.
+        let (again, code) = dispatch(&Command::Pause(RunRefArgs {
+            run_id: "run-1".into(),
+            store: temp.store(),
+        }));
+        assert_eq!(code, EXIT_OK, "repeating a request must be idempotent");
+        assert_eq!(again["desiredState"], "pause");
+    }
+
+    #[test]
+    fn a_cancel_request_is_sticky_and_cannot_be_downgraded_to_a_pause() {
+        let temp = TempDir::new("sticky");
+        let store = aad_runtime::durable::JournalStore::open(&temp.store().store)
+            .expect("the store opens");
+        let descriptor = durable_descriptor(&temp.workflow()).expect("compiles");
+        store
+            .create_run(
+                "run-1",
+                &descriptor.name,
+                &json!({}),
+                &descriptor.raw,
+                None,
+                Some(&aad_runtime::plan_digest(&descriptor)),
+                None,
+            )
+            .expect("create");
+        drop(store);
+
+        let (payload, code) = dispatch(&Command::Cancel(RunRefArgs {
+            run_id: "run-1".into(),
+            store: temp.store(),
+        }));
+        assert_eq!(code, EXIT_OK, "{payload}");
+        assert_eq!(payload["desiredState"], "cancel");
+
+        // Downgrading would silently revive a run someone decided to stop.
+        let (refused, code) = dispatch(&Command::Pause(RunRefArgs {
+            run_id: "run-1".into(),
+            store: temp.store(),
+        }));
+        assert_eq!(code, EXIT_FAILED);
+        assert_eq!(refused["error"]["code"], "RUN.CANCEL_PENDING");
+    }
+
+    #[test]
+    fn controlling_a_finished_run_is_refused_rather_than_silently_accepted() {
+        let temp = TempDir::new("terminal");
+        let (_, code) = dispatch(&Command::Start(start_args(&temp, "run-1", None)));
+        assert_eq!(code, EXIT_OK);
+
+        for command in [
+            Command::Pause(RunRefArgs {
+                run_id: "run-1".into(),
+                store: temp.store(),
+            }),
+            Command::Cancel(RunRefArgs {
+                run_id: "run-1".into(),
+                store: temp.store(),
+            }),
+        ] {
+            let (payload, code) = dispatch(&command);
+            assert_eq!(code, EXIT_FAILED);
+            assert_eq!(
+                payload["error"]["code"], "RUN.TERMINAL",
+                "a finished run cannot accept control requests: {payload}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_cancel_requested_before_execution_stops_the_run_without_running_it() {
+        let temp = TempDir::new("cancelfirst");
+        let store = aad_runtime::durable::JournalStore::open(&temp.store().store)
+            .expect("the store opens");
+        let descriptor = durable_descriptor(&temp.workflow()).expect("compiles");
+        store
+            .create_run(
+                "run-1",
+                &descriptor.name,
+                &json!({}),
+                &descriptor.raw,
+                None,
+                Some(&aad_runtime::plan_digest(&descriptor)),
+                None,
+            )
+            .expect("create");
+        drop(store);
+
+        let (_, code) = dispatch(&Command::Cancel(RunRefArgs {
+            run_id: "run-1".into(),
+            store: temp.store(),
+        }));
+        assert_eq!(code, EXIT_OK);
+
+        // Resuming a run that was cancelled while down must honour the cancel.
+        let (payload, code) = dispatch(&Command::Resume(ResumeArgs {
+            run_id: "run-1".into(),
+            file: temp.workflow(),
+            store: temp.store(),
+            owner_id: Some("test-runner".into()),
+            lease_ttl: None,
+        }));
+
+        assert_eq!(code, EXIT_FAILED, "a cancelled run is not a success");
+        assert_eq!(payload["status"], "cancelled");
+        // Nothing ran: the outputs were never produced.
+        assert!(
+            payload["output"].is_null(),
+            "a cancelled run must not report outputs: {payload}"
+        );
+    }
+
+    #[test]
+    fn a_paused_run_resumes_and_finishes_without_clearing_intent_by_hand() {
+        // The whole point of the durable commands: `aad pause` then `aad resume`
+        // must actually finish the run. An operator has no way to clear the
+        // recorded pause themselves, so resume has to do it.
+        let temp = TempDir::new("pauseresume");
+        let store = aad_runtime::durable::JournalStore::open(&temp.store().store)
+            .expect("the store opens");
+        let descriptor = durable_descriptor(&temp.workflow()).expect("compiles");
+        store
+            .create_run(
+                "run-1",
+                &descriptor.name,
+                &json!({}),
+                &descriptor.raw,
+                None,
+                Some(&aad_runtime::plan_digest(&descriptor)),
+                None,
+            )
+            .expect("create");
+        drop(store);
+
+        let (_, code) = dispatch(&Command::Pause(RunRefArgs {
+            run_id: "run-1".into(),
+            store: temp.store(),
+        }));
+        assert_eq!(code, EXIT_OK);
+
+        // The runner honours the pause before dispatching anything, which is
+        // what leaves a resumable checkpoint behind.
+        let store = aad_runtime::durable::JournalStore::open(&temp.store().store)
+            .expect("the store opens");
+        let paused = aad_runtime::durable_exec::DurableExecutor::new(store)
+            .execute(
+                &descriptor,
+                "run-1",
+                aad_runtime::durable_exec::DurableOptions::default().with_owner_id("first"),
+            )
+            .expect("honour the pause");
+        assert_eq!(paused.run.status, aad_runtime::durable::RunStatus::Paused);
+
+        // Now `aad resume`, with the pause request still standing. Nothing else
+        // can clear it, so resume must -- otherwise the run is stuck forever.
+        let (finished, code) = dispatch(&Command::Resume(ResumeArgs {
+            run_id: "run-1".into(),
+            file: temp.workflow(),
+            store: temp.store(),
+            owner_id: Some("second".into()),
+            lease_ttl: None,
+        }));
+        assert_eq!(code, EXIT_OK, "{finished}");
+        assert_eq!(
+            finished["status"], "succeeded",
+            "resume must make progress, not stop again on the standing request: {finished}"
+        );
+        assert_eq!(finished["output"]["total"], 2);
+        assert_eq!(finished["desiredState"], "run");
+    }
+
+    #[test]
+    fn resuming_a_finished_run_is_refused_rather_than_run_twice() {
+        let temp = TempDir::new("already");
+        let (_, code) = dispatch(&Command::Start(start_args(&temp, "run-1", None)));
+        assert_eq!(code, EXIT_OK);
+
+        let (payload, code) = dispatch(&Command::Resume(ResumeArgs {
+            run_id: "run-1".into(),
+            file: temp.workflow(),
+            store: temp.store(),
+            owner_id: None,
+            lease_ttl: None,
+        }));
+
+        assert_eq!(code, EXIT_FAILED);
+        assert_eq!(payload["error"]["code"], "DURABLE.ALREADY_TERMINAL");
+    }
+
+    #[test]
+    fn a_workflow_with_actions_is_refused_by_name_before_anything_runs() {
+        let temp = TempDir::new("unsupported");
+        let path = temp.path.join("actions.yaml");
+        std::fs::write(
+            &path,
+            concat!(
+                "apiVersion: ai-auto-desktop.dev/v1alpha1\n",
+                "kind: Workflow\n",
+                "metadata:\n  name: durable.actions\n",
+                "budgets:\n  max_duration: 30s\n  max_executed_steps: 10\n",
+                "steps:\n",
+                "  - id: press\n    type: action\n",
+                "    uses: desktop.focus@1\n    with: {target: x}\n",
+            ),
+        )
+        .expect("write");
+
+        let (payload, code) = dispatch(&Command::Start(StartArgs {
+            file: path,
+            store: temp.store(),
+            inputs: None,
+            run_id: Some("run-1".into()),
+            owner_id: None,
+            lease_ttl: None,
+        }));
+
+        assert_eq!(code, EXIT_FAILED);
+        assert_eq!(payload["error"]["code"], "DURABLE.UNSUPPORTED_PLAN");
+        // Naming the step is what makes the refusal actionable.
+        assert_eq!(payload["error"]["details"]["unsupportedSteps"], json!(["press"]));
+    }
+
+    #[test]
+    fn a_resumed_run_reuses_the_persisted_inputs() {
+        // `resume` deliberately takes no --inputs: the second half of a run must
+        // not execute against different values than the first.
+        let command = Cli::command();
+        let resume = command
+            .get_subcommands()
+            .find(|sub| sub.get_name() == "resume")
+            .expect("the resume command");
+        assert!(
+            !resume.get_arguments().any(|arg| arg.get_id() == "inputs"),
+            "resume must not accept --inputs"
+        );
+    }
+
+    #[test]
+    fn the_durable_store_flag_is_not_called_journal() {
+        // `run --journal` truncates the file it is given. If the durable store
+        // used the same flag name, one wrong command would destroy a run store.
+        let command = Cli::command();
+        for name in ["start", "resume", "status", "pause", "cancel", "list", "events"] {
+            let sub = command
+                .get_subcommands()
+                .find(|sub| sub.get_name() == name)
+                .expect("the command exists");
+            let ids: Vec<String> = sub
+                .get_arguments()
+                .map(|arg| arg.get_id().to_string())
+                .collect();
+            assert!(
+                ids.contains(&"store".to_string()),
+                "{name} must take --store"
+            );
+            assert!(
+                !ids.contains(&"journal".to_string()),
+                "{name} must not reuse the truncating --journal flag"
+            );
+        }
+    }
+
+    #[test]
+    fn an_invalid_lease_ttl_is_a_usage_error() {
+        let temp = TempDir::new("ttl");
+        for bad in [0.0, -5.0, f64::NAN] {
+            let (payload, code) = dispatch(&Command::Start(StartArgs {
+                file: temp.workflow(),
+                store: temp.store(),
+                inputs: None,
+                run_id: Some("run-1".into()),
+                owner_id: None,
+                lease_ttl: Some(bad),
+            }));
+            assert_eq!(code, EXIT_USAGE, "{bad} should be rejected");
+            assert_eq!(payload["error"]["code"], "CLI.INVALID_ARGUMENTS");
+        }
+    }
+
+    #[test]
+    fn a_run_id_cannot_be_started_twice() {
+        let temp = TempDir::new("twice");
+        let (_, code) = dispatch(&Command::Start(start_args(&temp, "run-1", None)));
+        assert_eq!(code, EXIT_OK);
+
+        let (payload, code) = dispatch(&Command::Start(start_args(&temp, "run-1", None)));
+        assert_eq!(code, EXIT_FAILED);
+        assert_eq!(payload["error"]["code"], "JOURNAL.CONFLICT", "{payload}");
     }
 }

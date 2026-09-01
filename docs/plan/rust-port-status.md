@@ -58,16 +58,32 @@ Rust 是本项目的主实现，对外提供 **CLI + GUI** 两种形态，CLI �
 
 - `action_intent` v2 受限重放：当前是 `deny` 模式，**拒绝一切 action / script**
   （无 intent 机制就无法证明某次派发可安全重复）。规范另定义 `--durable-actions read-only`。
-- CLI `start` / `resume` / `status` / `list` / `events` / `pause` / `cancel` 七个命令（见 §2.2）。
 - `run_service.py` 的服务层（尚未读）。
+
+CLI 七命令已补齐（`start` / `resume` / `status` / `pause` / `cancel` / `list` / `events`），
+与 Python 的差异是刻意的：
+
+- 存储参数叫 `--store` 而非 `--journal`。`run --journal` 写 NDJSON 并**截断**目标文件，
+  同名会让一次打错毁掉运行库。
+- 未移植 `--plugin` / `--permission` / `--allow-scripts`：durable 目前拒绝 action/script，
+  这三个参数在当前模式下无处生效，接受了却忽略比不提供更糟。
+- 未移植 `--durable-actions`：只有 `deny` 一种模式可选时，提供选项是误导。
+
+**核实方式**：真实二进制跨进程验证过完整链路——`start` 落库后由**另一个进程** `status` /
+`list` / `events` 读回；`pause` 时 `desiredState=pause` 而 `status=running`（不谎称已停），
+runner 在 `nextTopLevelIndex=4` 的段边界停下；换 `--owner-id` 的进程 `resume` 后跑到
+`total=20`，`run.segment_entered` 恰 20 条且 stepId 全不重复（零重放）；`Stop-Process`
+真杀 runner 后 `status=running` + 过期 lease + `phase=in_top_level_step`，`resume` 落
+`unknown_effect` 并带 remedy，再次 `resume` 得 `DURABLE.ALREADY_TERMINAL`。
 
 ### 2.2 CLI 命令差异
 
 **核实方式**：`aad help` 实际输出 vs `cli.py` 的 `add_parser` 调用。
 
-Rust 有：`apps`、`describe`、`snapshot`、`find`、`do`、`probe`、`validate`、`run`、`mcp`、`tools`。
-Python 另有：`start`、`resume`、`status`、`pause`、`cancel`、`list`、`events`（均属 §2.1）、
-以及 `edit`（属 §2.4 的浏览器编辑器，已由 GUI 取代，不再需要）。
+Rust 有：`apps`、`describe`、`snapshot`、`find`、`do`、`probe`、`validate`、`run`、`mcp`、
+`tools`、`start`、`resume`、`status`、`pause`、`cancel`、`list`、`events`（共 17 个）。
+Python 另有 `edit`（属 §2.4 的浏览器编辑器，已由 GUI 取代，不再需要）。
+参数层面的刻意差异见 §2.1 末尾。
 
 ### 2.3 录制规范的完整语义
 

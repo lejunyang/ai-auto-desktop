@@ -386,6 +386,34 @@ impl DurableExecutor {
             return self.finalize_timed_out(run_id, lease, deadline);
         }
 
+        // Asking to resume *is* asking to run, so clear a standing pause request
+        // now. Without this the drive loop reads the still-recorded pause at its
+        // first boundary and stops again immediately, leaving the run unable to
+        // make progress no matter how many times it is resumed.
+        //
+        // Deliberately after the unsafe-recovery and deadline checks above: a run
+        // that cannot be continued must not have its operator's intent quietly
+        // rewritten on the way to being refused. A cancel is never cleared here —
+        // it is sticky, and was already honoured above.
+        let run = if run.desired_state == DesiredState::Pause {
+            self.journal
+                .compare_and_set_desired_state(
+                    run_id,
+                    DesiredState::Pause,
+                    DesiredState::Run,
+                    Some((
+                        "run.resume_requested",
+                        &json!({
+                            "fromDesiredState": DesiredState::Pause.as_str(),
+                            "toDesiredState": DesiredState::Run.as_str(),
+                        }),
+                    )),
+                )
+                .map_err(journal_error)?
+        } else {
+            run
+        };
+
         let run_options = RunOptions::default()
             .with_inputs(as_map(&run.inputs))
             .with_base_directory(options.base_directory.clone());

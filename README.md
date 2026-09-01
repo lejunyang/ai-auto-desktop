@@ -86,6 +86,37 @@ fail-closed 的，并且会一次性收集**全部**问题而不是遇到第一�
 绑定和错误处理器绑定，**禁止一切函数与方法调用**，也不能访问文件、网络、环境变量、时钟或
 随机源。整串单模板保留结果类型，嵌在文本中的表达式转为字符串。
 
+## 持久化运行（可暂停、可恢复、进程崩溃也不丢）
+
+`aad run` 跑在内存里，进程退出即结束。需要一个能跨进程存活的运行时，用 `aad start`：
+状态落在 SQLite 里，另一个进程随时可以查、可以接管。
+
+```powershell
+aad start workflow.yaml --store runs.sqlite3 --run-id job-1
+aad status job-1  --store runs.sqlite3     # 进度、当前状态、检查点
+aad list          --store runs.sqlite3 --status running
+aad events job-1  --store runs.sqlite3 --after-seq 12   # 事件历史，可增量拉取
+aad pause  job-1  --store runs.sqlite3     # 记录意图，runner 到安全点才停
+aad cancel job-1  --store runs.sqlite3     # 粘性，不可被 pause 降级
+aad resume job-1 workflow.yaml --store runs.sqlite3
+```
+
+几个刻意的设计：
+
+- **`--store` 不叫 `--journal`**。`run --journal` 写 NDJSON 日志并且会**截断**给它的文件，
+  两者同名的话打错一个词就会毁掉运行库。
+- **`pause` 只记意图，不谎称已停**。返回里 `desiredState=pause` 而 `status` 可能还是
+  `running`——步骤还在飞就说"已暂停"，是会被操作者当真的谎话。runner 在下一个段边界兑现。
+- **`resume` 不接受 `--inputs`**。输入在创建时就持久化了；允许中途替换，等于让一次运行的
+  后半段跑在与前半段不同的值上。
+- **`cancel` 是吸收态**，之后 `pause` 会被 `RUN.CANCEL_PENDING` 拒绝，不会把已决定停掉的
+  运行悄悄救回来。
+- **崩溃恢复不重放**。进程死在步骤中途时，journal 无法知道副作用是否已经到达桌面，因此落
+  `unknown_effect` 并**零派发**（连 cleanup 也不跑），在 error 里给出 remedy 交给人判断。
+- 只有**不含 `action` / `script`** 的工作流可以持久化运行，否则以 `DURABLE.UNSUPPORTED_PLAN`
+  拒绝并点名具体步骤。原因见 `docs/plan/rust-port-status.md` §2.1：没有 `action_intent`
+  机制就无法证明某次派发可以安全重复。
+
 ## 给 AI 使用（MCP）
 
 ```powershell
