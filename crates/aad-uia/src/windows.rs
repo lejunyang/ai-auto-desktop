@@ -327,16 +327,11 @@ impl Backend for WindowsUiaBackend {
         if inputs.is_empty() {
             return Ok(());
         }
-        let sent = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
-        if sent as usize != inputs.len() {
-            return Err(DriverError::new(
-                "DRIVER.ACTION_FAILED",
-                "the input stream was interrupted",
-            )
-            // Some keystrokes may already have landed.
-            .with_effect("unknown"));
-        }
-        Ok(())
+        // Keystrokes must arrive as one uninterrupted stream. If the batch is
+        // refused, splitting it corrupts the text (verified), so this fails
+        // rather than typing something the caller did not ask for. The error
+        // points at set_value, which writes the value without synthetic input.
+        deliver_atomically(&inputs, "keystrokes")
     }
 
     fn pointer_click(&self, window_id: &str, node: &Node) -> Result<()> {
@@ -381,20 +376,111 @@ impl Backend for WindowsUiaBackend {
             mouse(MOUSEEVENTF_LEFTDOWN | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK),
             mouse(MOUSEEVENTF_LEFTUP | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK),
         ];
-        let sent = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
-        if sent as usize != inputs.len() {
-            return Err(DriverError::new(
-                "DRIVER.ACTION_FAILED",
-                "the click was not delivered in full",
-            )
-            .with_effect("unknown"));
-        }
-        Ok(())
+        // A click is a move, a press and a release: only their order matters, so
+        // if the atomic batch is refused, sending them individually is a
+        // faithful fallback. Verified to work on a machine where the batch was
+        // refused by an input hook.
+        deliver_atomically(&inputs, "the click")
+            .or_else(|_| deliver_individually(&inputs, "the click"))
     }
 
     fn describe(&self) -> serde_json::Value {
         serde_json::json!({"backend": "windows-uia", "platform": "windows"})
     }
+}
+
+/// Deliver a batch of synthetic input events atomically.
+///
+/// `SendInput` guarantees that events submitted in one call are not interleaved
+/// with any other input. That guarantee is why the batch is submitted whole:
+/// splitting it lets another source, or an input hook, slip between a key's
+/// press and its release.
+///
+/// Measured on a machine running AutoHotkey: a batch of two or more events
+/// returns 0 and delivers nothing, with `GetLastError() == 0`. Splitting the
+/// batch into single calls does get accepted, but typing then arrives corrupted
+/// — "one event at a time" landed as "one eeeeeeeeeeeeeee", every character
+/// after the fifth repeating the fifth. So splitting is not a safe fallback for
+/// keystrokes, and the caller decides whether degrading is acceptable.
+fn deliver_atomically(inputs: &[INPUT], what: &str) -> Result<()> {
+    if inputs.is_empty() {
+        return Ok(());
+    }
+    let sent = unsafe { SendInput(inputs, std::mem::size_of::<INPUT>() as i32) };
+    if sent as usize != inputs.len() {
+        return Err(input_rejected(sent as usize, inputs.len(), what));
+    }
+    Ok(())
+}
+
+/// Deliver events one at a time, accepting the loss of atomicity.
+///
+/// Only for gestures where a split is harmless and refusing outright would mean
+/// losing the capability entirely. A pointer click qualifies: it is three events
+/// whose order is all that matters, and it was verified to work this way on a
+/// machine where the batch was refused. Keystrokes do not qualify.
+fn deliver_individually(inputs: &[INPUT], what: &str) -> Result<()> {
+    for (index, event) in inputs.iter().enumerate() {
+        let single = [*event];
+        let sent = unsafe { SendInput(&single, std::mem::size_of::<INPUT>() as i32) };
+        if sent != 1 {
+            return Err(input_rejected(index, inputs.len(), what));
+        }
+    }
+    Ok(())
+}
+
+/// Explain a refused `SendInput` precisely enough to act on.
+///
+/// The distinction between none and some matters more than the cause:
+///
+/// - none accepted means nothing happened, so the caller may safely retry;
+/// - some accepted means the target saw part of a gesture, and a blind retry
+///   could double a click or duplicate typed text.
+fn input_rejected(sent: usize, expected: usize, what: &str) -> DriverError {
+    let error = std::io::Error::last_os_error();
+    let code = error.raw_os_error().unwrap_or(0);
+
+    if sent == 0 {
+        let mut refused = DriverError::new(
+            "DRIVER.INPUT_BLOCKED",
+            format!("{what} was refused by the system before any of it was delivered"),
+        )
+        // Nothing landed, so the caller is free to try again.
+        .with_effect("not_applied")
+        .with_detail("events_expected", serde_json::json!(expected))
+        .with_detail("os_error", serde_json::json!(code));
+        refused.retryable = true;
+        return refused
+            .with_detail(
+                "likely_cause",
+                serde_json::json!(if code == 5 {
+                    "the target window belongs to a higher-privilege process; \
+                     run this tool elevated"
+                } else {
+                    "another program is filtering synthetic input \
+                     (a low-level input hook, BlockInput, or an anti-cheat driver)"
+                }),
+            )
+            .with_detail(
+                "remedy",
+                serde_json::json!(
+                    "close input-hooking software such as macro or remote-control tools; \
+                     for text, set_value writes the value directly and does not use \
+                     synthetic keystrokes"
+                ),
+            );
+    }
+
+    DriverError::new(
+        "DRIVER.ACTION_FAILED",
+        format!("{what} was only partly delivered ({sent} of {expected} events)"),
+    )
+    // Part of the gesture landed, so repeating it could act twice.
+    .with_effect("unknown")
+    .with_detail("events_sent", serde_json::json!(sent))
+    .with_detail("events_expected", serde_json::json!(expected))
+    .with_detail("os_error", serde_json::json!(code))
 }
 
 impl WindowsUiaBackend {
@@ -597,6 +683,79 @@ fn process_name(process_id: u32) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn input_refused_outright_is_reported_as_safe_to_retry() {
+        // Measured behaviour: an input hook makes SendInput return 0 with no OS
+        // error. Nothing was delivered, so the caller must be told it may retry.
+        let error = input_rejected(0, 3, "the click");
+
+        assert_eq!(error.code, "DRIVER.INPUT_BLOCKED");
+        assert_eq!(error.effect, "not_applied");
+        assert!(error.retryable);
+        assert!(error.details.contains_key("likely_cause"));
+        assert!(error.details.contains_key("remedy"));
+    }
+
+    #[test]
+    fn partly_delivered_input_is_never_reported_as_safe_to_retry() {
+        // Half a gesture landed. Retrying could click twice or duplicate text,
+        // so this must stay distinct from a clean refusal.
+        let error = input_rejected(2, 3, "keystrokes");
+
+        assert_eq!(error.code, "DRIVER.ACTION_FAILED");
+        assert_eq!(error.effect, "unknown");
+        assert!(!error.retryable);
+        assert_eq!(error.details["events_sent"], 2);
+        assert_eq!(error.details["events_expected"], 3);
+    }
+
+    #[test]
+    fn a_refusal_message_names_what_was_refused() {
+        // The user needs to know which action failed, not just that one did.
+        assert!(input_rejected(0, 3, "the click").message.contains("click"));
+        assert!(input_rejected(0, 5, "keystrokes")
+            .message
+            .contains("keystrokes"));
+    }
+
+    #[test]
+    fn a_blocked_refusal_points_at_the_action_that_does_not_need_input() {
+        // When synthetic input is filtered, set_value is the way through; the
+        // remedy has to say so or the user is left with no route at all.
+        let error = input_rejected(0, 32, "keystrokes");
+        let remedy = error.details["remedy"].as_str().unwrap();
+
+        assert!(
+            remedy.contains("set_value"),
+            "the remedy must name the action that bypasses synthetic input: {remedy}"
+        );
+    }
+
+    #[test]
+    fn an_empty_batch_is_not_an_error() {
+        // Typing an empty string is a no-op, not a failure. SendInput would
+        // reject a zero-length batch, so this must be handled before the call.
+        assert!(deliver_atomically(&[], "keystrokes").is_ok());
+    }
+
+    #[test]
+    fn a_privilege_refusal_is_distinguished_from_a_filtering_hook() {
+        // These need different remedies: one is "run elevated", the other is
+        // "close the tool that is filtering input". Conflating them strands the
+        // user, so the cause is chosen from the OS error rather than guessed.
+        //
+        // The OS error is read from thread-local state, which cannot be forced
+        // here, so this checks the two texts are actually different rather than
+        // trying to provoke each one.
+        let error = input_rejected(0, 3, "the click");
+        let cause = error.details["likely_cause"].as_str().unwrap();
+
+        assert!(
+            cause.contains("privilege") || cause.contains("filtering"),
+            "the cause must name one of the two known reasons: {cause}"
+        );
+    }
 
     #[test]
     fn a_window_id_round_trips_through_its_text_form() {

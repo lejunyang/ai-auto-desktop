@@ -1,4 +1,4 @@
-//! The desktop shell's backend.
+﻿//! The desktop shell's backend.
 //!
 //! Every command here is a thin, typed wrapper over `aad-uia`. The shell holds
 //! no automation logic of its own: the same driver, the same snapshot store and
@@ -15,33 +15,115 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use std::sync::Arc;
+use std::sync::mpsc::{channel, Sender};
+use std::sync::{Arc, Mutex};
 
 use aad_uia::backend::{default_snapshot_directory, DriverError, SnapshotStore};
 use aad_uia::driver::UiaDriver;
 use serde_json::{json, Map, Value};
 
-/// The driver is shared across commands so snapshots survive between calls.
+/// One driver action and the channel its answer goes back on.
+struct Job {
+    action: String,
+    params: Value,
+    reply: Sender<Result<Value, Value>>,
+}
+
+/// A handle to the driver, which lives on its own thread.
+///
+/// The thread is not an optimisation, it is a requirement, for two measured
+/// reasons.
+///
+/// UI Automation needs a multithreaded COM apartment, while the window toolkit
+/// needs a single-threaded one on the process's main thread, and an apartment
+/// cannot be changed once joined. Creating the driver on the main thread makes
+/// the window fail to open with `RPC_E_CHANGED_MODE`.
+///
+/// Second, enumerating windows reaches the application's own window, and that
+/// crosses back into the main thread's apartment. If the main thread were
+/// waiting for the driver at that moment the two would deadlock and the
+/// interface would hang with no error. Commands are therefore `async`, which
+/// keeps them off the main thread and leaves it free to pump messages.
 struct Shell {
-    driver: UiaDriver,
+    // `Sender` is `Send` but not `Sync`, and Tauri shares state across threads.
+    jobs: Mutex<Sender<Job>>,
 }
 
 impl Shell {
     fn new() -> Result<Self, DriverError> {
-        // The same on-disk store the CLI and MCP server use, so a reference
-        // minted in the GUI stays valid for `aad do` and vice versa.
-        let store = SnapshotStore::default().persisted(default_snapshot_directory());
-        Ok(Self {
-            driver: UiaDriver::with_store(Arc::new(native_backend()?), store),
-        })
+        let (jobs, queue) = channel::<Job>();
+        // The backend is built on the worker thread, so the apartment it joins
+        // is that thread's, never the main thread's.
+        let (ready, started) = channel::<Result<(), DriverError>>();
+
+        std::thread::Builder::new()
+            .name("aad-uia".into())
+            .spawn(move || {
+                let driver = match native_backend() {
+                    Ok(backend) => {
+                        // The same on-disk store the CLI and MCP server use, so
+                        // a reference minted here stays valid for `aad do`.
+                        let store =
+                            SnapshotStore::default().persisted(default_snapshot_directory());
+                        let _ = ready.send(Ok(()));
+                        UiaDriver::with_store(Arc::new(backend), store)
+                    }
+                    Err(error) => {
+                        let _ = ready.send(Err(error));
+                        return;
+                    }
+                };
+
+                // Ends when the last sender drops, i.e. when the app closes.
+                while let Ok(job) = queue.recv() {
+                    let outcome = driver
+                        .call(&job.action, &job.params)
+                        .map_err(|error| error_payload(&error));
+                    let _ = job.reply.send(outcome);
+                }
+            })
+            .map_err(|error| {
+                DriverError::unavailable(format!("cannot start the automation thread: {error}"))
+            })?;
+
+        match started.recv() {
+            Ok(Ok(())) => Ok(Self {
+                jobs: Mutex::new(jobs),
+            }),
+            Ok(Err(error)) => Err(error),
+            Err(_) => Err(DriverError::unavailable(
+                "the automation thread stopped before it was ready",
+            )),
+        }
     }
 
-    /// Run one driver action, translating failures into the wire form.
+    /// Run one driver action on the automation thread and wait for its answer.
     fn dispatch(&self, action: &str, params: Value) -> Result<Value, Value> {
-        self.driver
-            .call(action, &params)
-            .map_err(|error| error_payload(&error))
+        let (reply, answer) = channel();
+        let job = Job {
+            action: action.to_string(),
+            params,
+            reply,
+        };
+        {
+            // The lock is released before waiting, so one slow read cannot
+            // block every other command from being queued.
+            let jobs = self.jobs.lock().map_err(|_| stopped())?;
+            jobs.send(job).map_err(|_| stopped())?;
+        }
+        answer.recv().map_err(|_| stopped())?
     }
+}
+
+/// The automation thread is gone, so nothing can be observed or done.
+fn stopped() -> Value {
+    json!({
+        "code": "GUI.BACKEND_STOPPED",
+        "message": "The automation backend stopped responding.",
+        "retryable": false,
+        "effect": "unknown",
+        "hint": "Restart the application.",
+    })
 }
 
 /// The current platform's backend, or a clear refusal.
@@ -95,12 +177,17 @@ fn recovery_hint(code: &str) -> Option<&'static str> {
             Some("This element does not offer that action. Use one of the actions listed on it.")
         }
         "DRIVER.SNAPSHOT_EXPIRED" => Some("The reading expired. Re-read the window."),
+        "DRIVER.INPUT_BLOCKED" => Some(
+            "Another program is filtering synthetic input, so the click never reached the \
+             window. Close macro or remote-control tools, or use this element's invoke or \
+             set value action instead.",
+        ),
         _ => None,
     }
 }
 
 #[tauri::command]
-fn list_apps(shell: tauri::State<'_, Shell>) -> Result<Value, Value> {
+async fn list_apps(shell: tauri::State<'_, Shell>) -> Result<Value, Value> {
     shell.dispatch("list_windows", json!({}))
 }
 
@@ -109,7 +196,7 @@ fn list_apps(shell: tauri::State<'_, Shell>) -> Result<Value, Value> {
 /// Flattening happens here rather than in the front end so the reference the UI
 /// shows is exactly the one the driver will accept.
 #[tauri::command]
-fn describe_window(
+async fn describe_window(
     shell: tauri::State<'_, Shell>,
     window_id: String,
     limit: Option<usize>,
@@ -175,7 +262,7 @@ fn summarize(node: &Value) -> String {
 
 /// Perform one action against a previously observed element.
 #[tauri::command]
-fn act(
+async fn act(
     shell: tauri::State<'_, Shell>,
     action: String,
     target: String,
@@ -196,7 +283,7 @@ fn act(
 }
 
 #[tauri::command]
-fn probe_environment() -> Value {
+async fn probe_environment() -> Value {
     aad_probe::probe().to_json()
 }
 
@@ -253,6 +340,7 @@ mod tests {
             "DRIVER.AMBIGUOUS_MATCH",
             "DRIVER.ACTION_UNSUPPORTED",
             "DRIVER.SNAPSHOT_EXPIRED",
+            "DRIVER.INPUT_BLOCKED",
         ] {
             assert!(recovery_hint(code).is_some(), "{code} has no hint");
         }
