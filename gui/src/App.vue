@@ -4,7 +4,8 @@ import AppList from "./components/AppList.vue";
 import OutlineView from "./components/OutlineView.vue";
 import StepList from "./components/StepList.vue";
 import FailureBanner from "./components/FailureBanner.vue";
-import { asFailure, bridge, type DriverFailure, type Element, type Outline, type WindowInfo }
+import { asFailure, bridge, type DriverFailure, type Element, type Outline,
+  type SavedRecording, type WindowInfo }
   from "./bridge";
 import { Recording } from "./recording";
 
@@ -15,6 +16,11 @@ const failure = ref<DriverFailure | null>(null);
 const loadingApps = ref(false);
 const loadingOutline = ref(false);
 const exported = ref<string | null>(null);
+const saving = ref(false);
+const saved = ref<string | null>(null);
+const browsing = ref(false);
+const savedRecordings = ref<SavedRecording[]>([]);
+const savedDirectory = ref("");
 
 // Reactive so the step list re-renders when the recording mutates in place.
 const recording = reactive(new Recording()) as Recording;
@@ -58,7 +64,15 @@ function record(element: Element, action: string): void {
   if (!selected.value) {
     return;
   }
-  recording.add({ action, element, window: selected.value });
+  // Pass every open window, so the selector can be checked for uniqueness
+  // against its actual competition. Without this a second window of the same
+  // application would make the recording refuse to replay.
+  recording.add({
+    action,
+    element,
+    window: selected.value,
+    openWindows: windows.value,
+  });
 }
 
 function exportDescriptor(): void {
@@ -71,7 +85,65 @@ async function copyExport(): Promise<void> {
   }
 }
 
-onMounted(refreshApps);
+/**
+ * Write the recording and its compiled workflow to disk.
+ *
+ * The editable source is saved even when it will not compile: refusing would
+ * mean losing work over a step that still needs text typed into it. Only the
+ * runnable workflow requires the recording to be valid.
+ */
+async function save(): Promise<void> {
+  saving.value = true;
+  saved.value = null;
+  await guard(async () => {
+    const workflow = recording.canExport ? recording.toDescriptor(recording.name) : {};
+    const paths = await bridge.saveRecording(
+      recording.name,
+      recording.toDocument(),
+      workflow,
+    );
+    saved.value = recording.canExport
+      ? `Saved. The workflow is at ${paths.workflow_path}`
+      : `Saved the recording, but not a runnable workflow: ${issues.value
+          .filter((issue) => issue.blocking)
+          .map((issue) => issue.message)
+          .join("; ")}`;
+    await refreshSaved();
+  });
+  saving.value = false;
+}
+
+async function refreshSaved(): Promise<void> {
+  await guard(async () => {
+    const listed = await bridge.listRecordings();
+    savedRecordings.value = listed.recordings;
+    savedDirectory.value = listed.directory;
+  });
+}
+
+async function openList(): Promise<void> {
+  await refreshSaved();
+  browsing.value = true;
+}
+
+/** Replace the working recording with a saved one. */
+async function open(entry: SavedRecording): Promise<void> {
+  await guard(async () => {
+    const document = await bridge.loadRecording(entry.path);
+    const reopened = Recording.fromDocument(document);
+    // Mutate in place: the template is bound to this reactive instance, so
+    // reassigning the variable would leave the UI showing the old steps.
+    recording.steps = reopened.steps;
+    recording.name = reopened.name;
+    browsing.value = false;
+    saved.value = `Opened ${reopened.name}`;
+  });
+}
+
+onMounted(async () => {
+  await refreshApps();
+  await refreshSaved();
+});
 </script>
 
 <template>
@@ -79,10 +151,24 @@ onMounted(refreshApps);
     <div class="titlebar">
       <strong>ai-auto-desktop</strong>
       <span class="muted">observe, then act</span>
+      <span class="spacer"></span>
+      <label class="name">
+        <span class="muted">name</span>
+        <input v-model="recording.name" spellcheck="false" />
+      </label>
+      <button @click="save" :disabled="saving || !recording.steps.length">
+        {{ saving ? "Saving…" : "Save" }}
+      </button>
+      <button @click="openList">Open…</button>
     </div>
 
     <div class="banner" v-if="failure">
       <FailureBanner :failure="failure" @dismiss="failure = null" />
+    </div>
+
+    <div class="banner note" v-if="saved">
+      <span>{{ saved }}</span>
+      <button @click="saved = null">Dismiss</button>
     </div>
 
     <main>
@@ -123,6 +209,28 @@ onMounted(refreshApps);
         <pre class="mono">{{ exported }}</pre>
       </div>
     </div>
+
+    <div v-if="browsing" class="overlay" @click.self="browsing = false">
+      <div class="sheet">
+        <header>
+          <h3>Open a recording</h3>
+          <button @click="refreshSaved">Refresh</button>
+          <button @click="browsing = false">Close</button>
+        </header>
+        <ul class="saved" v-if="savedRecordings.length">
+          <li v-for="entry in savedRecordings" :key="entry.path">
+            <button class="row" @click="open(entry)">
+              <strong>{{ entry.name }}</strong>
+              <span class="muted mono">{{ entry.path }}</span>
+            </button>
+          </li>
+        </ul>
+        <p v-else class="empty muted">
+          Nothing saved yet. Recordings are kept in
+          <span class="mono">{{ savedDirectory }}</span>
+        </p>
+      </div>
+    </div>
   </div>
 </template>
 
@@ -144,6 +252,53 @@ onMounted(refreshApps);
 
 .banner {
   padding: 10px 12px 0;
+}
+
+.spacer {
+  flex: 1;
+}
+
+.name {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.name input {
+  width: 220px;
+}
+
+.note {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 13px;
+}
+
+.note span {
+  flex: 1;
+}
+
+.saved {
+  margin: 0;
+  padding: 6px;
+  overflow: auto;
+  list-style: none;
+}
+
+.saved .row {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  width: 100%;
+  padding: 8px 10px;
+  text-align: left;
+}
+
+.empty {
+  padding: 16px 12px;
+  font-size: 13px;
 }
 
 main {

@@ -222,6 +222,14 @@ impl Snapshot {
                     // The reference an agent needs to act on this element,
                     // so the outline is directly actionable.
                     "ref": format!("{}:{}:{}", self.snapshot_id, self.revision, node.node_id),
+                    // A description that outlives this snapshot. The `ref`
+                    // above stops resolving once the snapshot is gone, so
+                    // anything that gets saved has to be described instead;
+                    // null here means the element cannot be told apart from
+                    // its siblings and so cannot be recorded.
+                    "locator": Locator::synthesize(node, &self.nodes)
+                        .map(|locator| locator.to_json())
+                        .unwrap_or(Value::Null),
                     "depth": node.depth,
                     "summary": node.summary(),
                     "actions": node.actions,
@@ -464,6 +472,109 @@ impl Locator {
         }
         true
     }
+
+    /// Build the narrowest locator that identifies `node` uniquely in `nodes`.
+    ///
+    /// A target (`snapshot:revision:node`) is only valid inside the session that
+    /// minted it: clearing the snapshot store makes it fail with
+    /// `DRIVER.STALE_HANDLE` (verified). So anything that has to survive being
+    /// saved and reopened must be described, not referenced.
+    ///
+    /// Fields are added in order of stability and the search stops as soon as
+    /// the match is unique. Continuing past that point does not improve
+    /// uniqueness but does make the locator brittle: every extra field is one
+    /// more thing an unrelated UI change can invalidate.
+    ///
+    /// Returns `None` when no combination is unique, which is a real outcome the
+    /// caller must handle rather than paper over — the recording spec requires
+    /// such a step to be recorded as unresolved and left for a human.
+    pub fn synthesize(node: &Node, nodes: &[Node]) -> Option<Self> {
+        // Ordered by measured stability: role is always present, name is the
+        // strongest single discriminator, the rest are narrowing aids.
+        let mut candidate = Self {
+            role: Some(node.role.clone()),
+            ..Self::empty()
+        };
+        if candidate.unique_for(node, nodes) {
+            return Some(candidate);
+        }
+
+        // Only non-empty values narrow anything; an empty string would match
+        // every node that also lacks the field.
+        let refinements: [fn(&mut Self, &Node); 4] = [
+            |locator, node| locator.name = non_empty(node.name.as_deref()),
+            |locator, node| locator.class_name = non_empty(node.class_name.as_deref()),
+            |locator, node| locator.automation_id = non_empty(node.automation_id.as_deref()),
+            |locator, node| locator.framework_id = non_empty(node.framework_id.as_deref()),
+        ];
+
+        for refine in refinements {
+            refine(&mut candidate, node);
+            if candidate.unique_for(node, nodes) {
+                return Some(candidate);
+            }
+        }
+        None
+    }
+
+    /// A locator with no constraints, for building one field at a time.
+    fn empty() -> Self {
+        Self {
+            role: None,
+            name: None,
+            value: None,
+            automation_id: None,
+            class_name: None,
+            framework_id: None,
+            states: None,
+            actions: None,
+            match_mode: None,
+        }
+    }
+
+    /// Render as JSON, omitting fields this locator does not constrain.
+    ///
+    /// Absent and null are not the same thing here: a null `name` would be read
+    /// back as "the name must be null", which matches different elements.
+    pub fn to_json(&self) -> Value {
+        let mut object = serde_json::Map::new();
+        let mut put = |key: &str, value: &Option<String>| {
+            if let Some(text) = value {
+                object.insert(key.to_string(), json!(text));
+            }
+        };
+        put("role", &self.role);
+        put("name", &self.name);
+        put("value", &self.value);
+        put("automation_id", &self.automation_id);
+        put("class_name", &self.class_name);
+        put("framework_id", &self.framework_id);
+        put("match", &self.match_mode);
+        if let Some(actions) = &self.actions {
+            object.insert("actions".to_string(), json!(actions));
+        }
+        if let Some(states) = &self.states {
+            object.insert("states".to_string(), states.to_json());
+        }
+        Value::Object(object)
+    }
+
+    /// Whether this locator matches `node` and nothing else.
+    ///
+    /// Both halves matter: a locator that is unique but matches a *different*
+    /// node would send the action to the wrong element.
+    fn unique_for(&self, node: &Node, nodes: &[Node]) -> bool {
+        let mut matched = nodes.iter().filter(|other| self.matches(other));
+        matched.next().map(|first| first.node_id == node.node_id) == Some(true)
+            && matched.next().is_none()
+    }
+}
+
+/// Treat an absent field and an empty string alike: neither narrows a search.
+fn non_empty(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::to_string)
+        .filter(|text| !text.trim().is_empty())
 }
 
 #[cfg(test)]
@@ -489,6 +600,148 @@ mod tests {
             parent_id: None,
             children: Vec::new(),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Locator synthesis
+    //
+    // A saved recording holds a locator, never a target: a target stops
+    // resolving once its snapshot is gone (verified against a cleared store).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn a_role_alone_is_enough_when_nothing_else_shares_it() {
+        let nodes = vec![
+            node("e1", "Button", Some("Save")),
+            node("e2", "Edit", Some("Filename")),
+        ];
+
+        let locator = Locator::synthesize(&nodes[0], &nodes).expect("must be unique");
+
+        assert_eq!(locator.role.as_deref(), Some("Button"));
+        // Stopping early matters: an unnecessary name would break if the button
+        // were ever relabelled.
+        assert_eq!(locator.name, None);
+    }
+
+    #[test]
+    fn a_name_is_added_when_the_role_is_shared() {
+        let nodes = vec![
+            node("e1", "Button", Some("Save")),
+            node("e2", "Button", Some("Cancel")),
+        ];
+
+        let locator = Locator::synthesize(&nodes[1], &nodes).expect("must be unique");
+
+        assert_eq!(locator.role.as_deref(), Some("Button"));
+        assert_eq!(locator.name.as_deref(), Some("Cancel"));
+    }
+
+    #[test]
+    fn narrowing_stops_as_soon_as_the_match_is_unique() {
+        // Every field is populated, so a naive implementation would use them
+        // all. Each extra field is another thing a UI change can invalidate.
+        let mut first = node("e1", "Button", Some("Save"));
+        first.class_name = Some("Btn".into());
+        first.automation_id = Some("save-1".into());
+        first.framework_id = Some("Win32".into());
+        let nodes = vec![first, node("e2", "Edit", Some("Filename"))];
+
+        let locator = Locator::synthesize(&nodes[0], &nodes).expect("must be unique");
+
+        assert_eq!(locator.class_name, None);
+        assert_eq!(locator.automation_id, None);
+        assert_eq!(locator.framework_id, None);
+    }
+
+    #[test]
+    fn an_automation_id_settles_elements_that_look_identical() {
+        // Same role, same name, same class: only the id can separate them.
+        let mut first = node("e1", "Button", Some("Open"));
+        first.class_name = Some("Btn".into());
+        first.automation_id = Some("open-a".into());
+        let mut second = node("e2", "Button", Some("Open"));
+        second.class_name = Some("Btn".into());
+        second.automation_id = Some("open-b".into());
+        let nodes = vec![first, second];
+
+        let locator = Locator::synthesize(&nodes[1], &nodes).expect("must be unique");
+
+        assert_eq!(locator.automation_id.as_deref(), Some("open-b"));
+        assert!(locator.unique_for(&nodes[1], &nodes));
+    }
+
+    #[test]
+    fn indistinguishable_elements_yield_no_locator_rather_than_a_wrong_one() {
+        // Two nodes identical in every describable field. Returning a locator
+        // here would mean acting on whichever happened to be enumerated first.
+        let nodes = vec![
+            node("e1", "Button", Some("Item")),
+            node("e2", "Button", Some("Item")),
+        ];
+
+        assert!(Locator::synthesize(&nodes[0], &nodes).is_none());
+    }
+
+    #[test]
+    fn an_empty_field_is_never_used_to_narrow() {
+        // An empty string matches every node that also lacks the field, so
+        // adding it would not narrow anything while looking like it had.
+        let mut first = node("e1", "Button", Some("Save"));
+        first.class_name = Some("   ".into());
+        let mut second = node("e2", "Button", Some("Save"));
+        second.class_name = Some("".into());
+        let nodes = vec![first, second];
+
+        // Neither can be distinguished, so neither gets a locator.
+        assert!(Locator::synthesize(&nodes[0], &nodes).is_none());
+    }
+
+    #[test]
+    fn a_synthesized_locator_actually_resolves_to_its_own_node() {
+        // The property that matters: whatever comes back must select exactly
+        // the element it was built from, not merely something.
+        let mut nodes = Vec::new();
+        for index in 0..6 {
+            let mut item = node(&format!("e{index}"), "Button", Some("Row"));
+            item.automation_id = Some(format!("row-{index}"));
+            nodes.push(item);
+        }
+
+        for target in &nodes {
+            let locator = Locator::synthesize(target, &nodes)
+                .unwrap_or_else(|| panic!("{} should be identifiable", target.node_id));
+            let hits: Vec<&Node> = nodes.iter().filter(|n| locator.matches(n)).collect();
+            assert_eq!(hits.len(), 1, "{} matched {} nodes", target.node_id, hits.len());
+            assert_eq!(hits[0].node_id, target.node_id);
+        }
+    }
+
+    #[test]
+    fn a_locator_omits_the_fields_it_does_not_constrain() {
+        // A null would be read back as "this field must be null", which selects
+        // different elements than "I do not care about this field".
+        let nodes = vec![node("e1", "Button", Some("Save"))];
+        let locator = Locator::synthesize(&nodes[0], &nodes).unwrap();
+
+        let rendered = locator.to_json();
+        let object = rendered.as_object().unwrap();
+        assert!(object.contains_key("role"));
+        assert!(!object.contains_key("name"), "unconstrained fields must be absent");
+        assert!(!object.contains_key("class_name"));
+    }
+
+    #[test]
+    fn a_rendered_locator_can_be_read_back_unchanged() {
+        // Save and reopen is the whole point, so the round trip must hold.
+        let mut first = node("e1", "Button", Some("Save"));
+        first.class_name = Some("Btn".into());
+        let nodes = vec![first, node("e2", "Button", Some("Save"))];
+
+        let locator = Locator::synthesize(&nodes[0], &nodes).expect("must be unique");
+        let reloaded = Locator::from_value(&locator.to_json()).expect("must parse");
+
+        assert!(reloaded.unique_for(&nodes[0], &nodes));
     }
 
     #[test]

@@ -22,6 +22,8 @@ use aad_uia::backend::{default_snapshot_directory, DriverError, SnapshotStore};
 use aad_uia::driver::UiaDriver;
 use serde_json::{json, Map, Value};
 
+pub mod recordings;
+
 /// One driver action and the channel its answer goes back on.
 struct Job {
     action: String,
@@ -182,6 +184,20 @@ fn recovery_hint(code: &str) -> Option<&'static str> {
              window. Close macro or remote-control tools, or use this element's invoke or \
              set value action instead.",
         ),
+        "STORE.NAME_INVALID" => Some(
+            "Choose a name without slashes, colons or other path characters, and not \
+             ending in a dot.",
+        ),
+        "STORE.NOT_FOUND" => Some("The file is no longer there. Refresh the list of recordings."),
+        "STORE.PATH_REFUSED" => {
+            Some("Only files in the recordings folder can be opened. Save a copy there first.")
+        }
+        "STORE.FILE_INVALID" => {
+            Some("The file is not a readable recording. It may have been edited by hand.")
+        }
+        "STORE.WRITE_FAILED" => {
+            Some("The recording could not be written. Check permissions on the folder.")
+        }
         _ => None,
     }
 }
@@ -287,6 +303,55 @@ async fn probe_environment() -> Value {
     aad_probe::probe().to_json()
 }
 
+/// Save the editable recording and its compiled workflow side by side.
+///
+/// Both are written in one command so they cannot drift apart: a workflow whose
+/// recording says something else is a trap for whoever opens it next.
+#[tauri::command]
+async fn save_recording(
+    name: String,
+    document: Value,
+    workflow: Value,
+) -> Result<Value, Value> {
+    let recording_path =
+        recordings::save_recording(&name, &document).map_err(store_error)?;
+    let workflow_path = recordings::save_workflow(&name, &workflow).map_err(store_error)?;
+    Ok(json!({
+        "recording_path": recording_path.to_string_lossy(),
+        "workflow_path": workflow_path.to_string_lossy(),
+    }))
+}
+
+/// Reopen a saved recording for editing.
+#[tauri::command]
+async fn load_recording(path: String) -> Result<Value, Value> {
+    recordings::load_recording(std::path::Path::new(&path)).map_err(store_error)
+}
+
+/// The saved recordings available to open.
+#[tauri::command]
+async fn list_recordings() -> Result<Value, Value> {
+    let found = recordings::list_recordings().map_err(store_error)?;
+    Ok(json!({
+        "recordings": found,
+        "directory": recordings::recordings_dir().to_string_lossy(),
+    }))
+}
+
+/// Render a store failure in the same shape as a driver failure.
+///
+/// The front end already knows how to display one structured error; giving it a
+/// second shape for file problems would mean a second display path that only
+/// gets exercised when something is already going wrong.
+fn store_error(error: recordings::StoreError) -> Value {
+    json!({
+        "code": error.code,
+        "message": error.message,
+        "retryable": false,
+        "hint": recovery_hint(error.code),
+    })
+}
+
 pub fn run() {
     // Failing to construct the driver is fatal and must be visible: a window
     // that silently cannot see the desktop is worse than no window.
@@ -307,7 +372,10 @@ pub fn run() {
             list_apps,
             describe_window,
             act,
-            probe_environment
+            probe_environment,
+            save_recording,
+            load_recording,
+            list_recordings
         ])
         .run(tauri::generate_context!())
         .expect("the desktop shell failed to start");

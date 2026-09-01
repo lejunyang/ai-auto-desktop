@@ -26,6 +26,25 @@ const issuesByStep = computed(() => {
 function needsText(action: string): boolean {
   return (ACTIONS_NEEDING_TEXT as readonly string[]).includes(action);
 }
+
+/**
+ * Show how the step will find its element at replay time.
+ *
+ * This is the durable description rather than a snapshot reference, so it is
+ * what determines whether a reopened recording still works.
+ */
+function describeLocator(step: Step): string {
+  if (!step.locator) {
+    return "cannot be identified — narrow the window or pick another element";
+  }
+  if (!step.window) {
+    return "the window cannot be told apart from another one that was open";
+  }
+  const parts = Object.entries(step.locator)
+    .filter(([, value]) => value !== undefined && value !== null && value !== "")
+    .map(([field, value]) => `${field}=${JSON.stringify(value)}`);
+  return parts.join(" ");
+}
 </script>
 
 <template>
@@ -78,7 +97,7 @@ function needsText(action: string): boolean {
 
         <div class="row second">
           <span class="window mono">{{ step.windowTitle }}</span>
-          <span class="ref mono">{{ step.target }}</span>
+          <span class="ref mono">{{ describeLocator(step) }}</span>
         </div>
 
         <input

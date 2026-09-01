@@ -24,11 +24,28 @@ export interface WindowInfo {
   is_minimized: boolean;
 }
 
+/** A description of an element that stays valid after the snapshot is gone. */
+export interface Locator {
+  role?: string;
+  name?: string;
+  value?: string;
+  automation_id?: string;
+  class_name?: string;
+  framework_id?: string;
+  match?: string;
+}
+
 /** One element in a window outline, already addressable. */
 export interface Element {
   node_id: string;
-  /** The `snapshot:revision:node` reference an action must quote. */
+  /** The `snapshot:revision:node` reference an action must quote right now. */
   ref: string;
+  /**
+   * How to find this element again later, or null when it cannot be told apart
+   * from its siblings. A `ref` dies with its snapshot, so only a locator can be
+   * saved to a file and replayed.
+   */
+  locator: Locator | null;
   depth: number;
   summary: string;
   actions: string[];
@@ -108,6 +125,13 @@ async function call<T>(command: string, args?: Record<string, unknown>): Promise
  * render, rather than surfacing `[object Object]` to the user.
  */
 export function asFailure(raw: unknown): DriverFailure {
+  // A BridgeError already carries a fully-formed failure, so unwrap it before
+  // any structural sniffing. Its `code` and `message` are getters rather than
+  // own properties, so the checks below would not see them and the hint the
+  // backend supplied would be thrown away exactly when it is most needed.
+  if (raw instanceof BridgeError) {
+    return raw.failure;
+  }
   if (typeof raw === "string") {
     try {
       return asFailure(JSON.parse(raw));
@@ -154,4 +178,28 @@ export const bridge = {
     }),
 
   probe: () => call<Record<string, unknown>>("probe_environment"),
+
+  /**
+   * Save the editable recording and its runnable workflow together.
+   *
+   * Both in one call so the two files cannot disagree about what was recorded.
+   */
+  saveRecording: (name: string, document: unknown, workflow: unknown) =>
+    call<{ recording_path: string; workflow_path: string }>("save_recording", {
+      name,
+      document,
+      workflow,
+    }),
+
+  loadRecording: (path: string) => call<unknown>("load_recording", { path }),
+
+  listRecordings: () =>
+    call<{ recordings: SavedRecording[]; directory: string }>("list_recordings"),
 };
+
+/** One saved recording, as offered in the open list. */
+export interface SavedRecording {
+  name: string;
+  path: string;
+  modified: number | null;
+}

@@ -89,10 +89,22 @@ impl UiaDriver {
 
     /// Capture a window's tree and retain it for later targeting.
     fn capture(&self, args: &Value) -> Result<Snapshot> {
-        let window_id = args
-            .get("window_id")
-            .and_then(Value::as_str)
-            .ok_or_else(|| DriverError::invalid("window_id is required"))?;
+        // A live window id is what an interactive caller has. A saved recording
+        // has no such thing -- ids are handles from a previous session -- so a
+        // descriptive selector is accepted in its place and resolved against the
+        // windows that exist right now.
+        let window_id = match args.get("window_id").and_then(Value::as_str) {
+            Some(window_id) => window_id.to_string(),
+            None => match args.get("window") {
+                Some(selector) => self.resolve_window(selector)?,
+                None => {
+                    return Err(DriverError::invalid(
+                        "either window_id or window is required",
+                    ))
+                }
+            },
+        };
+        let window_id = window_id.as_str();
 
         let limits = CaptureLimits {
             max_depth: args
@@ -122,6 +134,79 @@ impl UiaDriver {
 
     fn snapshot(&self, args: &Value) -> Result<Value> {
         Ok(self.capture(args)?.to_json())
+    }
+
+    /// Find the one open window matching a descriptive selector.
+    ///
+    /// Fields are ANDed, and `title` matches by substring because window titles
+    /// commonly carry volatile prefixes such as a modified-file marker, while
+    /// `class_name` and `process_name` are compared exactly.
+    ///
+    /// Ambiguity is a failure, not something to resolve by picking the first
+    /// match: two windows of the same application are exactly the case where
+    /// guessing sends the actions to the wrong one.
+    fn resolve_window(&self, selector: &Value) -> Result<String> {
+        let object = selector
+            .as_object()
+            .ok_or_else(|| DriverError::invalid("window must be an object"))?;
+        if object.is_empty() {
+            return Err(DriverError::invalid(
+                "window must constrain at least one of class_name, process_name or title",
+            ));
+        }
+
+        let field = |key: &str| object.get(key).and_then(Value::as_str).filter(|t| !t.is_empty());
+        let (want_class, want_process, want_title) =
+            (field("class_name"), field("process_name"), field("title"));
+
+        if want_class.is_none() && want_process.is_none() && want_title.is_none() {
+            return Err(DriverError::invalid(
+                "window must constrain at least one of class_name, process_name or title",
+            ));
+        }
+
+        let windows = self.backend.list_windows()?;
+        let matches: Vec<&crate::model::WindowInfo> = windows
+            .iter()
+            .filter(|window| {
+                want_class.is_none_or(|want| window.class_name.as_deref() == Some(want))
+                    && want_process.is_none_or(|want| {
+                        window
+                            .process_name
+                            .as_deref()
+                            .is_some_and(|actual| actual.eq_ignore_ascii_case(want))
+                    })
+                    && want_title.is_none_or(|want| window.title.contains(want))
+            })
+            .collect();
+
+        match matches.as_slice() {
+            [only] => Ok(only.window_id.clone()),
+            [] => Err(DriverError::new(
+                "DRIVER.WINDOW_NOT_FOUND",
+                "no open window matched the selector",
+            )
+            .with_detail("selector", selector.clone())
+            .with_detail("windows_open", json!(windows.len()))),
+            many => Err(DriverError::new(
+                "DRIVER.AMBIGUOUS_MATCH",
+                format!("the window selector matched {} windows", many.len()),
+            )
+            .with_detail("match_count", json!(many.len()))
+            .with_detail(
+                "candidates",
+                json!(many
+                    .iter()
+                    .take(MAX_CANDIDATE_SUMMARIES)
+                    .map(|window| json!({
+                        "window_id": window.window_id,
+                        "title": window.title,
+                        "process_name": window.process_name,
+                        "class_name": window.class_name,
+                    }))
+                    .collect::<Vec<_>>()),
+            )),
+        }
     }
 
     /// A compact, agent-friendly description of a window.
@@ -867,5 +952,225 @@ mod tests {
         let mut sorted = ids.clone();
         sorted.sort();
         assert_eq!(ids, sorted);
+    }
+
+    // -----------------------------------------------------------------------
+    // Resolving a window from a saved selector
+    //
+    // A reopened recording has no live window id: ids are handles from the
+    // session that recorded them. So it describes the window instead, and the
+    // driver has to find it among the windows open now.
+    // -----------------------------------------------------------------------
+
+    /// A backend with several windows, for selector tests.
+    struct ManyWindows(Vec<WindowInfo>);
+
+    impl Backend for ManyWindows {
+        fn list_windows(&self) -> Result<Vec<WindowInfo>> {
+            Ok(self.0.clone())
+        }
+
+        fn capture(&self, window_id: &str, _limits: CaptureLimits) -> Result<CapturedTree> {
+            let window = self
+                .0
+                .iter()
+                .find(|candidate| candidate.window_id == window_id)
+                .cloned()
+                .ok_or_else(|| DriverError::new("DRIVER.WINDOW_NOT_FOUND", "no such window"))?;
+            Ok(CapturedTree {
+                window,
+                nodes: vec![node("e1", "Button", "Save", &["invoke"])],
+                root_id: Some("e1".into()),
+                truncated: false,
+            })
+        }
+
+        fn verify(&self, _window_id: &str, _node: &Node) -> Result<bool> {
+            Ok(true)
+        }
+
+        fn focus(&self, _window_id: &str, _node: &Node) -> Result<()> {
+            Ok(())
+        }
+
+        fn invoke(&self, _window_id: &str, _node: &Node) -> Result<()> {
+            Ok(())
+        }
+
+        fn set_value(&self, _window_id: &str, _node: &Node, _value: &str) -> Result<()> {
+            Ok(())
+        }
+
+        fn type_text(&self, _window_id: &str, _node: &Node, _text: &str) -> Result<()> {
+            Ok(())
+        }
+
+        fn pointer_click(&self, _window_id: &str, _node: &Node) -> Result<()> {
+            Ok(())
+        }
+
+        fn describe(&self) -> Value {
+            json!({"backend": "many-windows"})
+        }
+    }
+
+    fn titled(id: &str, title: &str, process: &str, class: Option<&str>) -> WindowInfo {
+        WindowInfo {
+            window_id: id.into(),
+            title: title.into(),
+            process_id: 1,
+            process_name: Some(process.into()),
+            class_name: class.map(str::to_string),
+            bounds: Some(Bounds { x: 0, y: 0, width: 100, height: 100 }),
+            is_foreground: false,
+            is_minimized: false,
+        }
+    }
+
+    fn many() -> UiaDriver {
+        UiaDriver::new(Arc::new(ManyWindows(vec![
+            titled("w1", "notes.txt - Notepad", "notepad.exe", Some("Notepad")),
+            titled("w2", "Inbox - Mail", "mail.exe", Some("MailWindow")),
+            titled("w3", "budget.xlsx - Excel", "excel.exe", Some("XLMAIN")),
+        ])))
+    }
+
+    #[test]
+    fn a_saved_recording_can_capture_by_describing_its_window() {
+        let driver = many();
+
+        let captured = driver
+            .call("snapshot", &json!({"window": {"class_name": "XLMAIN"}}))
+            .expect("a descriptive selector must work without a window id");
+
+        assert_eq!(captured["window"]["window_id"], "w3");
+    }
+
+    #[test]
+    fn a_window_title_matches_by_substring() {
+        // Titles carry volatile parts -- a modified marker, a changing filename
+        // -- so an exact comparison would break on the next edit.
+        let driver = many();
+
+        let captured = driver
+            .call("snapshot", &json!({"window": {"title": "Notepad"}}))
+            .expect("a partial title must resolve");
+
+        assert_eq!(captured["window"]["window_id"], "w1");
+    }
+
+    #[test]
+    fn several_matching_windows_are_refused_rather_than_guessed() {
+        let driver = UiaDriver::new(Arc::new(ManyWindows(vec![
+            titled("w1", "a.txt - Notepad", "notepad.exe", Some("Notepad")),
+            titled("w2", "b.txt - Notepad", "notepad.exe", Some("Notepad")),
+        ])));
+
+        let error = driver
+            .call("snapshot", &json!({"window": {"class_name": "Notepad"}}))
+            .expect_err("two identical windows must not be silently narrowed to one");
+
+        assert_eq!(error.code, "DRIVER.AMBIGUOUS_MATCH");
+        assert_eq!(error.details["match_count"], 2);
+        // The caller needs to see the options to narrow the selector.
+        assert!(error.details["candidates"].as_array().unwrap().len() == 2);
+    }
+
+    #[test]
+    fn a_selector_that_matches_nothing_says_so() {
+        let driver = many();
+
+        let error = driver
+            .call("snapshot", &json!({"window": {"class_name": "Gone"}}))
+            .expect_err("a closed window must be reported, not invented");
+
+        assert_eq!(error.code, "DRIVER.WINDOW_NOT_FOUND");
+    }
+
+    #[test]
+    fn selector_fields_must_all_hold() {
+        // Fields are ANDed. If they were ORed, naming a process would widen the
+        // search instead of narrowing it.
+        let driver = many();
+
+        let error = driver
+            .call(
+                "snapshot",
+                &json!({"window": {"class_name": "Notepad", "process_name": "excel.exe"}}),
+            )
+            .expect_err("a contradictory selector must match nothing");
+
+        assert_eq!(error.code, "DRIVER.WINDOW_NOT_FOUND");
+    }
+
+    #[test]
+    fn a_process_name_is_compared_without_case_sensitivity() {
+        // Windows reports executable names inconsistently cased, and a recording
+        // saved from one report must still match the other.
+        let driver = many();
+
+        let captured = driver
+            .call("snapshot", &json!({"window": {"process_name": "NOTEPAD.EXE"}}))
+            .expect("case must not decide whether a recording replays");
+
+        assert_eq!(captured["window"]["window_id"], "w1");
+    }
+
+    #[test]
+    fn an_empty_selector_is_rejected_instead_of_matching_everything() {
+        let driver = many();
+
+        for selector in [json!({}), json!({"class_name": ""})] {
+            let error = driver
+                .call("snapshot", &json!({"window": selector}))
+                .expect_err("an unconstrained selector must not pick an arbitrary window");
+            assert_eq!(error.code, "DRIVER.INVALID_REQUEST");
+        }
+    }
+
+    #[test]
+    fn capture_still_requires_one_of_the_two_ways_to_name_a_window() {
+        let driver = many();
+
+        let error = driver
+            .call("snapshot", &json!({}))
+            .expect_err("naming no window at all must fail");
+
+        assert_eq!(error.code, "DRIVER.INVALID_REQUEST");
+    }
+
+    #[test]
+    fn a_window_id_still_takes_precedence_when_both_are_given() {
+        // Interactive callers pass an id; it is the more specific of the two.
+        let driver = many();
+
+        let captured = driver
+            .call(
+                "snapshot",
+                &json!({"window_id": "w2", "window": {"class_name": "Notepad"}}),
+            )
+            .expect("an explicit id must win");
+
+        assert_eq!(captured["window"]["window_id"], "w2");
+    }
+
+    #[test]
+    fn an_outline_carries_a_locator_for_every_element_it_can_identify() {
+        // This is what the GUI saves. Without it a recording could only hold a
+        // reference, which does not survive being written to a file.
+        let driver = many();
+
+        let outline = driver
+            .call("describe", &json!({"window_id": "w1"}))
+            .expect("describe must work");
+
+        let element = &outline["elements"][0];
+        assert!(element["ref"].is_string(), "a live reference is still offered");
+        assert!(
+            element["locator"].is_object(),
+            "a durable locator must accompany it: {}",
+            element
+        );
+        assert_eq!(element["locator"]["role"], "Button");
     }
 }
