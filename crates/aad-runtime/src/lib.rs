@@ -5,6 +5,7 @@
 //! and a [`RunResult`] describing how the run ended.
 
 pub mod durable;
+pub mod durable_exec;
 pub mod engine;
 pub mod journal;
 pub mod provider;

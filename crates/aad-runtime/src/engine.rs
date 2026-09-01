@@ -934,6 +934,278 @@ fn prepare_variables(descriptor: &WorkflowDescriptor) -> Map<String, Value> {
         .collect()
 }
 
+/// A run's resumable state, everything needed to continue after a restart.
+///
+/// Deliberately plain data: it has to survive being written to a journal and
+/// read back by a different process, so it holds no handles, no `Instant` and
+/// nothing tied to this process's lifetime.
+#[derive(Clone, Debug, Default)]
+pub struct SegmentState {
+    pub variables: Map<String, Value>,
+    /// Step outputs visible to expressions as `steps.<id>.output`.
+    pub steps: Map<String, Value>,
+    /// The index of the next top-level step to execute.
+    pub next_index: usize,
+    pub executed_steps: u64,
+    /// Sticky: once an outcome could not be proven it must reach the status.
+    pub unknown_effect: bool,
+    /// Set when a `return` step ended the workflow early.
+    pub returned: Option<Value>,
+}
+
+/// How far a segment got.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Segment {
+    /// A top-level step ran; more may remain.
+    Advanced,
+    /// A `return` ended the workflow body early.
+    Returned,
+    /// Every top-level step has been executed.
+    Exhausted,
+}
+
+/// A run driven one top-level step at a time.
+///
+/// This exists so a durable executor can persist a checkpoint between steps and
+/// resume in a **different process**. It shares the same [`Run`] internals as
+/// [`run`], so a segmented run cannot drift from an ordinary one in how it
+/// resolves scopes, enforces budgets or handles errors.
+pub struct Segmented<'a> {
+    state: Run<'a>,
+    next_index: usize,
+    returned: Option<Value>,
+    started: Instant,
+    started_at: String,
+    digest: String,
+}
+
+impl<'a> Segmented<'a> {
+    /// Begin a run, stopping before the first top-level step.
+    ///
+    /// `deadline_epoch` is wall-clock rather than an `Instant` because the
+    /// budget has to outlive the process: a run paused for an hour has spent an
+    /// hour of it, and resuming must not silently hand it a fresh allowance.
+    pub fn begin(
+        descriptor: &'a WorkflowDescriptor,
+        options: &RunOptions,
+        deadline_epoch: f64,
+    ) -> Result<Self, AutomationError> {
+        let run_id = options
+            .run_id
+            .clone()
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let inputs = prepare_inputs(descriptor, &options.inputs)?;
+        Ok(Self {
+            next_index: 0,
+            returned: None,
+            started: Instant::now(),
+            started_at: now_rfc3339(),
+            digest: plan_digest(descriptor),
+            state: Run {
+                descriptor,
+                providers: options.providers.clone(),
+                journal: Journal::new(run_id, options.sink.clone()),
+                inputs,
+                variables: prepare_variables(descriptor),
+                steps: Map::new(),
+                loop_bindings: Vec::new(),
+                error_bindings: Vec::new(),
+                deadline: deadline_instant(deadline_epoch),
+                executed_steps: 0,
+                max_executed_steps: descriptor.budgets.max_executed_steps,
+                cancel: options.cancel.clone(),
+                base_directory: options.base_directory.clone(),
+                unknown_effect: false,
+            },
+        })
+    }
+
+    /// Restore a run from a checkpoint written by an earlier process.
+    pub fn restore(
+        descriptor: &'a WorkflowDescriptor,
+        options: &RunOptions,
+        deadline_epoch: f64,
+        state: SegmentState,
+    ) -> Result<Self, AutomationError> {
+        let mut resumed = Self::begin(descriptor, options, deadline_epoch)?;
+        resumed.state.variables = state.variables;
+        resumed.state.steps = state.steps;
+        resumed.state.executed_steps = state.executed_steps;
+        // Sticky across restarts: an unprovable effect from before the crash
+        // must still decide the final status.
+        resumed.state.unknown_effect = state.unknown_effect;
+        resumed.next_index = state.next_index;
+        resumed.returned = state.returned;
+        Ok(resumed)
+    }
+
+    /// The state to persist before executing the next segment.
+    pub fn snapshot(&self) -> SegmentState {
+        SegmentState {
+            variables: self.state.variables.clone(),
+            steps: self.state.steps.clone(),
+            next_index: self.next_index,
+            executed_steps: self.state.executed_steps,
+            unknown_effect: self.state.unknown_effect,
+            returned: self.returned.clone(),
+        }
+    }
+
+    pub fn run_id(&self) -> &str {
+        self.state.journal.run_id()
+    }
+
+    pub fn plan_digest(&self) -> &str {
+        &self.digest
+    }
+
+    /// The id of the next top-level step, or `None` when the body is done.
+    pub fn next_step_id(&self) -> Option<&str> {
+        if self.returned.is_some() {
+            return None;
+        }
+        self.ordered()
+            .get(self.next_index)
+            .map(|step| step.id.as_str())
+    }
+
+    /// Top-level steps in the order they will execute.
+    ///
+    /// Resolved the same way as an ordinary run so an index recorded in a
+    /// checkpoint always names the same step.
+    fn ordered(&self) -> Vec<&'a CompiledStep> {
+        order_steps(&self.state.descriptor.steps)
+    }
+
+    /// Execute exactly one top-level step.
+    pub fn run_segment(&mut self) -> Result<Segment, AutomationError> {
+        if self.returned.is_some() {
+            return Ok(Segment::Returned);
+        }
+        let ordered = self.ordered();
+        let Some(step) = ordered.get(self.next_index) else {
+            return Ok(Segment::Exhausted);
+        };
+        // Advance first: a step that panics or whose process dies mid-flight
+        // must not be silently retried as though it had never started. The
+        // durable layer decides what to do with an interrupted segment.
+        self.next_index += 1;
+        match self.state.run_step(step)? {
+            Flow::Next => Ok(Segment::Advanced),
+            Flow::Return(value) => {
+                self.returned = Some(value);
+                Ok(Segment::Returned)
+            }
+        }
+    }
+
+    /// Whether an unprovable effect has been seen.
+    pub fn unknown_effect(&self) -> bool {
+        self.state.unknown_effect
+    }
+
+    pub fn emit(&self, event_type: &str, payload: Value) {
+        self.state.journal.emit(event_type, payload);
+    }
+
+    /// Run the workflow handler and `finally` blocks, then build the result.
+    ///
+    /// `body` is the outcome of the segments so far. Cleanup runs on every path,
+    /// including cancellation, exactly as in an ordinary run.
+    ///
+    /// Takes `&mut self` rather than consuming the run so a caller holding it
+    /// behind a mutable borrow can finalise in place; calling it twice would run
+    /// cleanup twice, so callers must not.
+    pub fn finish(&mut self, body: Result<(), AutomationError>) -> RunResult {
+        let mut outcome = body;
+
+        if let (Err(error), Some(handler)) = (&outcome, &self.state.descriptor.on_error) {
+            if handler.matches(&error.code, &error.category, &error.effect) {
+                let error = error.clone();
+                outcome = self
+                    .state
+                    .run_handler(handler.clone(), error, "$workflow")
+                    .map(|_| ());
+            }
+        }
+
+        if !self.state.descriptor.finally_steps.is_empty() {
+            self.state
+                .journal
+                .emit("cleanup.started", json!({"id": "$workflow"}));
+            let finally_steps = &self.state.descriptor.finally_steps;
+            let cleanup = self.state.run_steps(finally_steps);
+            self.state.journal.emit(
+                "cleanup.finished",
+                json!({"id": "$workflow", "ok": cleanup.is_ok()}),
+            );
+            outcome = match (outcome, cleanup) {
+                (Ok(()), Ok(_)) => Ok(()),
+                (Ok(()), Err(error)) => Err(error),
+                (Err(mut original), Err(cleanup_error)) => {
+                    original.add_suppressed(cleanup_error);
+                    Err(original)
+                }
+                (Err(original), Ok(_)) => Err(original),
+            };
+        }
+
+        let outputs = match &outcome {
+            Ok(()) => self.state.workflow_outputs().unwrap_or_default(),
+            Err(_) => Map::new(),
+        };
+        let (status, error) = match outcome {
+            Ok(()) => (RunStatus::Succeeded, None),
+            Err(error) => {
+                let status = match error.code.as_str() {
+                    "WORKFLOW.TIMEOUT" => RunStatus::TimedOut,
+                    "WORKFLOW.CANCELLED" => RunStatus::Cancelled,
+                    _ if error.effect == "unknown" || self.state.unknown_effect => {
+                        RunStatus::UnknownEffect
+                    }
+                    _ => RunStatus::Failed,
+                };
+                (status, Some(error))
+            }
+        };
+
+        self.state.providers.close_all();
+        RunResult {
+            run_id: self.state.journal.run_id().to_string(),
+            workflow: self.state.descriptor.name.clone(),
+            plan_digest: self.digest.clone(),
+            status,
+            outputs,
+            error,
+            executed_steps: self.state.executed_steps,
+            duration_seconds: self.started.elapsed().as_secs_f64(),
+            started_at: self.started_at.clone(),
+            finished_at: now_rfc3339(),
+            events: self.state.journal.events(),
+        }
+    }
+}
+
+/// Convert an absolute wall-clock deadline into this process's monotonic one.
+///
+/// The stored deadline is wall-clock so it survives a restart; the engine checks
+/// budgets against a monotonic `Instant` so a clock adjustment mid-run cannot
+/// extend or curtail it. This converts once, at the boundary.
+fn deadline_instant(deadline_epoch: f64) -> Instant {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs_f64())
+        .unwrap_or(0.0);
+    let remaining = deadline_epoch - now;
+    if remaining <= 0.0 {
+        // Already spent. Not an error here: the caller reports the timeout with
+        // the context only it has.
+        Instant::now()
+    } else {
+        Instant::now() + Duration::from_secs_f64(remaining)
+    }
+}
+
 /// Execute a compiled workflow to completion.
 pub fn run(descriptor: &WorkflowDescriptor, options: RunOptions) -> RunResult {
     let run_id = options

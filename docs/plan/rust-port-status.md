@@ -30,21 +30,36 @@ Rust 是本项目的主实现，对外提供 **CLI + GUI** 两种形态，CLI �
 
 ## 2. 未移植
 
-### 2.1 持久化执行（最大缺口，进行中）
+### 2.1 持久化执行（进行中）
 
 **Python**：`durable.py`(65KB)、`journal.py`(51KB)、`run_service.py`(26KB)
 **规范**：`docs/architecture/runtime.md` §8.1
-**核实方式**：在 `crates/` 下检索 `durable|resume|owner_lease`，**零匹配**；
-`journal.rs` 的存储是 `Mutex<Vec<RunEvent>>`，进程退出即丢。
 
-缺的内容：
+已完成：
 
-- SQLite 持久化 journal：`runs` / `events` 两表、状态机触发器、WAL + `BEGIN IMMEDIATE`；
-- owner lease fencing：`claim` / `heartbeat` / `release`，token 只存 SHA-256；
-- `desiredState` 与 `status` 分离的 CAS 控制面：`cancel` 是吸收态，终态拒绝后续控制；
-- checkpoint 与 `action_intent` v2：崩溃后只对合法只读 intent 安全重放；
-- 无合法 intent 的 `in_top_level_step` / `finalizing` 必须零 dispatch 落 `UNKNOWN_EFFECT`；
-- CLI `start` / `resume` / `status` / `list` / `events` / `pause` / `cancel`。
+- SQLite 持久化 journal（`crates/aad-runtime/src/durable.rs`，49 测试）：
+  `runs` / `events` 两表、5 个状态机触发器 + 表级 CHECK、WAL + `BEGIN IMMEDIATE`；
+  开库时**验证**而非假定 WAL / `foreign_keys` / `synchronous=FULL` 真生效，不满足即拒绝开库。
+- owner lease fencing：`claim_owner` / `heartbeat_owner` / `release_owner`，token 只存 SHA-256
+  且明文不进 `Debug`；`paused` 与终态在同事务释放 lease。
+- `desiredState` 与 `status` 分离的 CAS 控制面：控制面不检查 lease（操作者可请求但无法伪造写入），
+  `cancel` 是吸收态，终态拒绝后续控制。
+- 分段执行（`engine.rs` 的 `Segmented`）：`SegmentState` 是纯数据，可写进 journal 再被另一进程读回；
+  预算用 wall-clock epoch 而非 `Instant`（暂停一小时就花掉一小时，resume 不重发额度）；
+  `run_segment()` 先 advance index 再执行，崩在步骤中途的段不会被静默重跑。
+- checkpoint 编解码（`durable_exec.rs`）：version 不符 → `CHECKPOINT_UNSUPPORTED`，
+  planDigest 不符 → `PLAN_MISMATCH`，缺 deadline → `CHECKPOINT_INVALID`（不得当成"无限制"）。
+- `in_top_level_step` / `finalizing` 被中断时**零 dispatch** 落 `UNKNOWN_EFFECT`，连 cleanup 也不跑。
+  **核实方式**：`a_killed_process_leaves_a_recoverable_journal` 真的 spawn 一个
+  `crash_runner` 子进程并在它提交进度后 `kill`，再从磁盘恢复；实测在第 4 步被杀，
+  恢复后 `status=unknown_effect`、`run.segment_entered` 计数不增（无重放）。
+
+仍缺：
+
+- `action_intent` v2 受限重放：当前是 `deny` 模式，**拒绝一切 action / script**
+  （无 intent 机制就无法证明某次派发可安全重复）。规范另定义 `--durable-actions read-only`。
+- CLI `start` / `resume` / `status` / `list` / `events` / `pause` / `cancel` 七个命令（见 §2.2）。
+- `run_service.py` 的服务层（尚未读）。
 
 ### 2.2 CLI 命令差异
 
@@ -125,6 +140,10 @@ Python 有 45 个测试文件。针对未移植能力的部分在 Rust 侧没有
 - 受保护窗口返回 `0x80004005`，属 UIPI 正常行为。
 - DPI 与完整性级别探测为 `degraded`。
 - Windows script 沙箱缺网络/文件系统隔离，按 Python 原行为如实上报 `degraded` + `gaps`。
+- `aad-plugin` 的 `a_requested_manifest_completes_the_handshake` 偶发失败（`cargo test --workspace`
+  跑过一次失败，随后单独跑 4/4 通过、在committed 基线上加 4 路 CPU 负载跑 3/3 通过，
+  故非本次改动引入）。fixture 是 Python 子进程，握手默认 30s，怀疑是并行下解释器启动被拖慢。
+  尚未定位，暂记录不掩盖。
 
 ## 4. 不在计划内
 
