@@ -1,0 +1,22 @@
+[package]
+name = "aad-gui"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+license = "Apache-2.0"
+description = "Desktop shell for composing and reviewing ai-auto-desktop recordings"
+publish = false
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+aad-uia = { path = "../../crates/aad-uia" }
+aad-probe = { path = "../../crates/aad-probe" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tauri = { version = "2", features = [] }
+
+[features]
+# Kept for parity with the Tauri template; the shell needs no custom protocol.
+custom-protocol = ["tauri/custom-protocol"]

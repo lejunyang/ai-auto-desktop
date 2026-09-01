@@ -1,0 +1,14 @@
+[package]
+name = "aad-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Descriptor model, expression evaluator and workflow compiler for ai-auto-desktop"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+indexmap = { workspace = true }
+sha2 = { workspace = true }

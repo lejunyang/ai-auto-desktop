@@ -1,0 +1,15 @@
+[package]
+name = "aad-mcp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Model Context Protocol server exposing desktop discovery and automation"
+
+[dependencies]
+aad-core = { workspace = true }
+aad-probe = { workspace = true }
+aad-runtime = { workspace = true }
+aad-uia = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

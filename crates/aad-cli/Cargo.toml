@@ -1,0 +1,23 @@
+[package]
+name = "aad-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Command line interface for ai-auto-desktop"
+
+[[bin]]
+name = "aad"
+path = "src/main.rs"
+
+[dependencies]
+aad-core = { workspace = true }
+aad-mcp = { workspace = true }
+aad-plugin = { workspace = true }
+aad-probe = { workspace = true }
+aad-runtime = { workspace = true }
+aad-uia = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }

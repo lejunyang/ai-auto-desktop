@@ -11,3 +11,12 @@ build/
 artifacts/
 *.log
 
+# Rust build output: large, machine-specific, reproducible from source.
+/target/
+**/target/
+
+# Front-end dependencies and build output for the Tauri shell.
+node_modules/
+/gui/dist/
+# Tauri generates these next to the shell crate.
+/gui/src-tauri/gen/

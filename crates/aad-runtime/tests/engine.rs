@@ -1,0 +1,1243 @@
+//! Behavioural tests for the workflow engine.
+//!
+//! These drive complete descriptors through compilation and execution, so they
+//! assert on what a user actually observes: the run status, the outputs, the
+//! journal, and how many times a provider was really called.
+
+use aad_core::{compile_descriptor, AutomationError, WorkflowDescriptor};
+use aad_plugin::manifest;
+use aad_runtime::provider::Provider;
+use aad_runtime::{run, ProviderRegistry, RunOptions, RunStatus};
+use serde_json::{json, Map, Value};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+// ---------------------------------------------------------------------------
+// Test providers
+// ---------------------------------------------------------------------------
+
+type Handler = Box<dyn Fn(&str, Value, usize) -> Result<Value, AutomationError> + Send + Sync>;
+
+/// A provider whose behaviour is a closure, counting every invocation.
+struct Fake {
+    manifest: aad_plugin::CapabilityManifest,
+    handler: Handler,
+    calls: AtomicUsize,
+    seen: Mutex<Vec<Value>>,
+}
+
+impl Fake {
+    fn build(name: &str, actions: Value, handler: Handler) -> Arc<Self> {
+        let document = manifest::document(
+            name,
+            actions.as_object().cloned().unwrap_or_default(),
+        );
+        Arc::new(Self {
+            manifest: manifest::parse(&document).expect("fixture manifest is valid"),
+            handler,
+            calls: AtomicUsize::new(0),
+            seen: Mutex::new(Vec::new()),
+        })
+    }
+
+    /// Read-only actions that echo their arguments.
+    fn echo(name: &str, actions: &[&str]) -> Arc<Self> {
+        Self::build(
+            name,
+            read_only_actions(actions),
+            Box::new(|_, args, _| Ok(json!({"echo": args}))),
+        )
+    }
+
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+
+    fn arguments(&self) -> Vec<Value> {
+        self.seen.lock().unwrap().clone()
+    }
+}
+
+impl Provider for Fake {
+    fn manifest(&self) -> &aad_plugin::CapabilityManifest {
+        &self.manifest
+    }
+
+    fn invoke(
+        &self,
+        action: &str,
+        args: Value,
+        _timeout: Option<Duration>,
+    ) -> Result<Value, AutomationError> {
+        let attempt = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+        self.seen.lock().unwrap().push(args.clone());
+        (self.handler)(action, args, attempt)
+    }
+}
+
+fn read_only_actions(names: &[&str]) -> Value {
+    let mut actions = Map::new();
+    for name in names {
+        actions.insert(
+            (*name).to_string(),
+            json!({"contract_major": 1, "effect": {"class": "read_only"}}),
+        );
+    }
+    Value::Object(actions)
+}
+
+fn actions_with_effect(names: &[&str], class: &str) -> Value {
+    let mut actions = Map::new();
+    for name in names {
+        actions.insert(
+            (*name).to_string(),
+            json!({"contract_major": 1, "effect": {"class": class}}),
+        );
+    }
+    Value::Object(actions)
+}
+
+// ---------------------------------------------------------------------------
+// Descriptor helpers
+// ---------------------------------------------------------------------------
+
+fn descriptor(body: Value) -> WorkflowDescriptor {
+    let mut document = json!({
+        "apiVersion": "ai-auto-desktop.dev/v1alpha1",
+        "kind": "Workflow",
+        "metadata": {"name": "test.workflow"},
+        "budgets": {"max_duration": "30s", "max_executed_steps": 100}
+    });
+    for (key, value) in body.as_object().expect("body must be an object") {
+        document[key] = value.clone();
+    }
+    compile_descriptor(document, None).expect("the fixture descriptor must compile")
+}
+
+fn registry(providers: Vec<Arc<dyn Provider>>) -> ProviderRegistry {
+    let mut registry = ProviderRegistry::new();
+    for provider in providers {
+        registry.insert(provider);
+    }
+    registry
+}
+
+fn execute(descriptor: &WorkflowDescriptor, providers: ProviderRegistry) -> aad_runtime::RunResult {
+    run(descriptor, RunOptions::default().with_providers(providers))
+}
+
+fn event_types(result: &aad_runtime::RunResult) -> Vec<String> {
+    result
+        .events
+        .iter()
+        .map(|event| event.event_type.clone())
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Basic execution
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_single_action_runs_and_reports_success() {
+    let provider = Fake::echo("fixture", &["ping"]);
+    let workflow = descriptor(json!({
+        "steps": [{"id": "act", "type": "action", "uses": "fixture.ping@1", "with": {"a": 1}}]
+    }));
+
+    let result = execute(&workflow, registry(vec![provider.clone()]));
+
+    assert_eq!(result.status, RunStatus::Succeeded);
+    assert_eq!(provider.calls(), 1);
+    assert_eq!(provider.arguments()[0], json!({"a": 1}));
+    assert_eq!(result.executed_steps, 1);
+}
+
+#[test]
+fn outputs_are_resolved_from_step_results() {
+    let provider = Fake::echo("fixture", &["ping"]);
+    let workflow = descriptor(json!({
+        "steps": [{"id": "act", "type": "action", "uses": "fixture.ping@1", "with": {"a": 7}}],
+        "outputs": {"value": {"value": "${{ steps.act.output.echo.a }}"}}
+    }));
+
+    let result = execute(&workflow, registry(vec![provider]));
+
+    assert_eq!(result.status, RunStatus::Succeeded);
+    assert_eq!(result.outputs["value"], json!(7));
+}
+
+#[test]
+fn an_unknown_action_fails_without_side_effects() {
+    let workflow = descriptor(json!({
+        "steps": [{"id": "act", "type": "action", "uses": "missing.thing@1", "with": {}}]
+    }));
+
+    let result = execute(&workflow, registry(vec![]));
+
+    assert_eq!(result.status, RunStatus::Failed);
+    let error = result.error.expect("an error is reported");
+    assert_eq!(error.code, "ACTION.UNKNOWN");
+    assert_eq!(error.effect, "not_applied");
+}
+
+#[test]
+fn the_journal_records_the_full_lifecycle() {
+    let provider = Fake::echo("fixture", &["ping"]);
+    let workflow = descriptor(json!({
+        "steps": [{"id": "act", "type": "action", "uses": "fixture.ping@1", "with": {}}]
+    }));
+
+    let result = execute(&workflow, registry(vec![provider]));
+    let types = event_types(&result);
+
+    assert_eq!(types.first().map(String::as_str), Some("run.started"));
+    assert_eq!(types.last().map(String::as_str), Some("run.finished"));
+    for expected in ["step.started", "action.started", "action.finished", "step.finished"] {
+        assert!(types.contains(&expected.to_string()), "missing {expected} in {types:?}");
+    }
+    // Sequence numbers must be dense and start at 1.
+    let sequences: Vec<u64> = result.events.iter().map(|event| event.seq).collect();
+    assert_eq!(sequences, (1..=sequences.len() as u64).collect::<Vec<_>>());
+}
+
+// ---------------------------------------------------------------------------
+// Inputs and variables
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_missing_required_input_fails_before_any_action() {
+    let provider = Fake::echo("fixture", &["ping"]);
+    let workflow = descriptor(json!({
+        "inputs": {"name": {"schema": {"type": "string"}, "required": true}},
+        "steps": [{"id": "act", "type": "action", "uses": "fixture.ping@1", "with": {}}]
+    }));
+
+    let result = execute(&workflow, registry(vec![provider.clone()]));
+
+    assert_eq!(result.status, RunStatus::Failed);
+    assert_eq!(result.error.unwrap().code, "INPUT.MISSING");
+    assert_eq!(provider.calls(), 0, "no action may run when inputs are invalid");
+}
+
+#[test]
+fn an_input_default_is_applied_when_the_value_is_omitted() {
+    let provider = Fake::echo("fixture", &["ping"]);
+    let workflow = descriptor(json!({
+        "inputs": {"greeting": {"schema": {"type": "string"}, "default": "hello"}},
+        "steps": [{
+            "id": "act", "type": "action", "uses": "fixture.ping@1",
+            "with": {"text": "${{ inputs.greeting }}"}
+        }]
+    }));
+
+    let result = execute(&workflow, registry(vec![provider.clone()]));
+
+    assert_eq!(result.status, RunStatus::Succeeded);
+    assert_eq!(provider.arguments()[0], json!({"text": "hello"}));
+}
+
+#[test]
+fn an_undeclared_input_is_rejected() {
+    let workflow = descriptor(json!({
+        "steps": [{"id": "done", "type": "return"}]
+    }));
+    let mut inputs = Map::new();
+    inputs.insert("typo".into(), json!(1));
+
+    let result = run(
+        &workflow,
+        RunOptions::default().with_inputs(inputs),
+    );
+
+    assert_eq!(result.status, RunStatus::Failed);
+    assert_eq!(result.error.unwrap().code, "INPUT.UNDECLARED");
+}
+
+#[test]
+fn set_updates_a_mutable_variable_for_later_steps() {
+    let provider = Fake::echo("fixture", &["ping"]);
+    let workflow = descriptor(json!({
+        "variables": {"counter": {"schema": {"type": "integer"}, "mutable": true, "initial": 1}},
+        "steps": [
+            {"id": "bump", "type": "set", "assign": {"vars.counter": "${{ vars.counter + 41 }}"}},
+            {
+                "id": "act", "type": "action", "uses": "fixture.ping@1",
+                "with": {"value": "${{ vars.counter }}"}
+            }
+        ]
+    }));
+
+    let result = execute(&workflow, registry(vec![provider.clone()]));
+
+    assert_eq!(result.status, RunStatus::Succeeded);
+    assert_eq!(provider.arguments()[0], json!({"value": 42}));
+}
+
+// ---------------------------------------------------------------------------
+// Control flow
+// ---------------------------------------------------------------------------
+
+#[test]
+fn an_if_step_takes_only_the_matching_branch() {
+    let provider = Fake::echo("fixture", &["yes", "no"]);
+    let workflow = descriptor(json!({
+        "steps": [{
+            "id": "branch", "type": "if", "condition": "${{ True }}",
+            "then": [{"id": "taken", "type": "action", "uses": "fixture.yes@1", "with": {}}],
+            "else": [{"id": "skipped", "type": "action", "uses": "fixture.no@1", "with": {}}]
+        }]
+    }));
+
+    let result = execute(&workflow, registry(vec![provider.clone()]));
+
+    assert_eq!(result.status, RunStatus::Succeeded);
+    assert_eq!(provider.calls(), 1);
+}
+
+#[test]
+fn a_step_level_if_skips_without_consuming_step_budget() {
+    let provider = Fake::echo("fixture", &["ping"]);
+    let workflow = descriptor(json!({
+        "steps": [{
+            "id": "act", "type": "action", "uses": "fixture.ping@1", "with": {},
+            "if": "${{ False }}"
+        }]
+    }));
+
+    let result = execute(&workflow, registry(vec![provider.clone()]));
+
+    assert_eq!(result.status, RunStatus::Succeeded);
+    assert_eq!(provider.calls(), 0);
+    assert_eq!(result.executed_steps, 0);
+    assert!(event_types(&result).contains(&"step.skipped".to_string()));
+}
+
+#[test]
+fn a_switch_runs_the_first_matching_case_only() {
+    let provider = Fake::echo("fixture", &["a", "b", "c"]);
+    let workflow = descriptor(json!({
+        "steps": [{
+            "id": "pick", "type": "switch",
+            "cases": [
+                {"when": "${{ False }}", "steps": [
+                    {"id": "first", "type": "action", "uses": "fixture.a@1", "with": {}}
+                ]},
+                {"when": "${{ True }}", "steps": [
+                    {"id": "second", "type": "action", "uses": "fixture.b@1", "with": {}}
+                ]},
+                {"when": "${{ True }}", "steps": [
+                    {"id": "third", "type": "action", "uses": "fixture.c@1", "with": {}}
+                ]}
+            ]
+        }]
+    }));
+
+    let result = execute(&workflow, registry(vec![provider.clone()]));
+
+    assert_eq!(result.status, RunStatus::Succeeded);
+    assert_eq!(provider.calls(), 1);
+}
+
+#[test]
+fn a_switch_falls_through_to_default() {
+    let provider = Fake::echo("fixture", &["a", "fallback"]);
+    let workflow = descriptor(json!({
+        "steps": [{
+            "id": "pick", "type": "switch",
+            "cases": [{"when": "${{ False }}", "steps": [
+                {"id": "never", "type": "action", "uses": "fixture.a@1", "with": {}}
+            ]}],
+            "default": [{"id": "chosen", "type": "action", "uses": "fixture.fallback@1", "with": {}}]
+        }]
+    }));
+
+    let result = execute(&workflow, registry(vec![provider.clone()]));
+
+    assert_eq!(result.status, RunStatus::Succeeded);
+    assert_eq!(provider.arguments().len(), 1);
+}
+
+#[test]
+fn foreach_binds_each_item_and_its_index() {
+    let provider = Fake::echo("fixture", &["ping"]);
+    let workflow = descriptor(json!({
+        "steps": [{
+            "id": "loop", "type": "foreach",
+            "items": "${{ ['a', 'b', 'c'] }}",
+            "as": "item", "index_as": "position", "max_items": 10,
+            "steps": [{
+                "id": "act", "type": "action", "uses": "fixture.ping@1",
+                "with": {"item": "${{ item }}", "position": "${{ position }}"}
+            }]
+        }]
+    }));
+
+    let result = execute(&workflow, registry(vec![provider.clone()]));
+
+    assert_eq!(result.status, RunStatus::Succeeded);
+    assert_eq!(
+        provider.arguments(),
+        vec![
+            json!({"item": "a", "position": 0}),
+            json!({"item": "b", "position": 1}),
+            json!({"item": "c", "position": 2}),
+        ]
+    );
+}
+
+#[test]
+fn foreach_refuses_to_exceed_its_declared_bound() {
+    let provider = Fake::echo("fixture", &["ping"]);
+    let workflow = descriptor(json!({
+        "steps": [{
+            "id": "loop", "type": "foreach",
+            "items": "${{ [1, 2, 3, 4] }}", "as": "item", "max_items": 2,
+            "steps": [{"id": "act", "type": "action", "uses": "fixture.ping@1", "with": {}}]
+        }]
+    }));
+
+    let result = execute(&workflow, registry(vec![provider.clone()]));
+
+    assert_eq!(result.status, RunStatus::Failed);
+    assert_eq!(result.error.unwrap().code, "LOOP.MAX_ITEMS_EXCEEDED");
+    assert_eq!(provider.calls(), 0, "the bound is checked before iterating");
+}
+
+#[test]
+fn while_iterates_until_its_condition_is_false() {
+    let workflow = descriptor(json!({
+        "variables": {"count": {"schema": {"type": "integer"}, "mutable": true, "initial": 0}},
+        "steps": [{
+            "id": "loop", "type": "while",
+            "condition": "${{ vars.count < 3 }}", "max_iterations": 10, "timeout": "10s",
+            "steps": [{"id": "bump", "type": "set", "assign": {"vars.count": "${{ vars.count + 1 }}"}}]
+        }],
+        "outputs": {"total": {"value": "${{ vars.count }}"}}
+    }));
+
+    let result = execute(&workflow, registry(vec![]));
+
+    assert_eq!(result.status, RunStatus::Succeeded);
+    assert_eq!(result.outputs["total"], json!(3));
+}
+
+#[test]
+fn while_stops_loudly_when_it_exceeds_its_iteration_bound() {
+    let workflow = descriptor(json!({
+        "variables": {"count": {"schema": {"type": "integer"}, "mutable": true, "initial": 0}},
+        "steps": [{
+            "id": "loop", "type": "while",
+            "condition": "${{ True }}", "max_iterations": 3, "timeout": "10s",
+            "steps": [{"id": "bump", "type": "set", "assign": {"vars.count": "${{ vars.count + 1 }}"}}]
+        }]
+    }));
+
+    let result = execute(&workflow, registry(vec![]));
+
+    // Silently truncating would look like success; it must not.
+    assert_ne!(result.status, RunStatus::Succeeded);
+    assert_eq!(
+        result.error.as_ref().map(|error| error.code.as_str()),
+        Some("LOOP.MAX_ITERATIONS_EXCEEDED")
+    );
+}
+
+#[test]
+fn a_return_inside_a_loop_ends_the_whole_workflow() {
+    let provider = Fake::echo("fixture", &["ping"]);
+    let workflow = descriptor(json!({
+        "steps": [
+            {
+                "id": "loop", "type": "foreach",
+                "items": "${{ [1, 2, 3] }}", "as": "item", "max_items": 10,
+                "steps": [{"id": "stop", "type": "return", "value": "${{ item }}"}]
+            },
+            {"id": "never", "type": "action", "uses": "fixture.ping@1", "with": {}}
+        ]
+    }));
+
+    let result = execute(&workflow, registry(vec![provider.clone()]));
+
+    assert_eq!(result.status, RunStatus::Succeeded);
+    assert_eq!(provider.calls(), 0, "a return exits the loop and the workflow");
+}
+
+#[test]
+fn a_return_step_ends_the_workflow_early() {
+    let provider = Fake::echo("fixture", &["ping"]);
+    let workflow = descriptor(json!({
+        "steps": [
+            {"id": "stop", "type": "return", "value": 1},
+            {"id": "never", "type": "action", "uses": "fixture.ping@1", "with": {}}
+        ]
+    }));
+
+    let result = execute(&workflow, registry(vec![provider.clone()]));
+
+    assert_eq!(result.status, RunStatus::Succeeded);
+    assert_eq!(provider.calls(), 0);
+}
+
+#[test]
+fn a_fail_step_produces_its_declared_error() {
+    let workflow = descriptor(json!({
+        "steps": [{
+            "id": "stop", "type": "fail",
+            "error": {"code": "CUSTOM.STOP", "message": "halted on purpose"}
+        }]
+    }));
+
+    let result = execute(&workflow, registry(vec![]));
+
+    assert_eq!(result.status, RunStatus::Failed);
+    let error = result.error.unwrap();
+    assert_eq!(error.code, "CUSTOM.STOP");
+    assert_eq!(error.message, "halted on purpose");
+}
+
+// ---------------------------------------------------------------------------
+// Dependency ordering
+// ---------------------------------------------------------------------------
+
+#[test]
+fn steps_execute_in_dependency_order_not_declaration_order() {
+    let order = Arc::new(Mutex::new(Vec::new()));
+    let recorder = order.clone();
+    let provider = Fake::build(
+        "fixture",
+        read_only_actions(&["mark"]),
+        Box::new(move |_, args, _| {
+            recorder
+                .lock()
+                .unwrap()
+                .push(args["label"].as_str().unwrap_or_default().to_string());
+            Ok(json!({}))
+        }),
+    );
+
+    let workflow = descriptor(json!({
+        "steps": [
+            {
+                "id": "last", "type": "action", "uses": "fixture.mark@1",
+                "with": {"label": "last"}, "depends_on": ["middle"]
+            },
+            {
+                "id": "first", "type": "action", "uses": "fixture.mark@1",
+                "with": {"label": "first"}, "depends_on": []
+            },
+            {
+                "id": "middle", "type": "action", "uses": "fixture.mark@1",
+                "with": {"label": "middle"}, "depends_on": ["first"]
+            }
+        ]
+    }));
+
+    let result = execute(&workflow, registry(vec![provider]));
+
+    assert_eq!(result.status, RunStatus::Succeeded);
+    assert_eq!(
+        *order.lock().unwrap(),
+        vec!["first".to_string(), "middle".to_string(), "last".to_string()]
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Retry
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_retryable_failure_is_retried_up_to_the_limit_and_can_succeed() {
+    let provider = Fake::build(
+        "fixture",
+        read_only_actions(&["flaky"]),
+        Box::new(|_, _, attempt| {
+            if attempt < 3 {
+                Err(
+                    AutomationError::new("FIXTURE.FLAKY", "transient failure")
+                        .with_retryable(true)
+                        .with_effect("not_applied"),
+                )
+            } else {
+                Ok(json!({"attempt": attempt}))
+            }
+        }),
+    );
+
+    let workflow = descriptor(json!({
+        "steps": [{
+            "id": "act", "type": "action", "uses": "fixture.flaky@1", "with": {},
+            "retry": {"max_attempts": 5, "backoff": {"strategy": "fixed", "initial_delay": "1ms"}}
+        }],
+        "outputs": {"attempt": {"value": "${{ steps.act.output.attempt }}"}}
+    }));
+
+    let result = execute(&workflow, registry(vec![provider.clone()]));
+
+    assert_eq!(result.status, RunStatus::Succeeded);
+    assert_eq!(provider.calls(), 3);
+    assert_eq!(result.outputs["attempt"], json!(3));
+}
+
+#[test]
+fn a_non_retryable_failure_is_attempted_exactly_once() {
+    let provider = Fake::build(
+        "fixture",
+        read_only_actions(&["hard"]),
+        Box::new(|_, _, _| {
+            Err(AutomationError::new("FIXTURE.HARD", "permanent")
+                .with_retryable(false)
+                .with_effect("not_applied"))
+        }),
+    );
+
+    let workflow = descriptor(json!({
+        "steps": [{
+            "id": "act", "type": "action", "uses": "fixture.hard@1", "with": {},
+            "retry": {"max_attempts": 5, "backoff": {"strategy": "fixed", "initial_delay": "1ms"}}
+        }]
+    }));
+
+    let result = execute(&workflow, registry(vec![provider.clone()]));
+
+    assert_eq!(result.status, RunStatus::Failed);
+    assert_eq!(provider.calls(), 1);
+}
+
+#[test]
+fn retry_stops_after_exhausting_its_attempts() {
+    let provider = Fake::build(
+        "fixture",
+        read_only_actions(&["always"]),
+        Box::new(|_, _, _| {
+            Err(AutomationError::new("FIXTURE.ALWAYS", "still failing")
+                .with_retryable(true)
+                .with_effect("not_applied"))
+        }),
+    );
+
+    let workflow = descriptor(json!({
+        "steps": [{
+            "id": "act", "type": "action", "uses": "fixture.always@1", "with": {},
+            "retry": {"max_attempts": 3, "backoff": {"strategy": "fixed", "initial_delay": "1ms"}}
+        }]
+    }));
+
+    let result = execute(&workflow, registry(vec![provider.clone()]));
+
+    assert_eq!(result.status, RunStatus::Failed);
+    assert_eq!(provider.calls(), 3);
+}
+
+#[test]
+fn a_non_idempotent_action_with_an_unknown_effect_is_never_auto_retried() {
+    let provider = Fake::build(
+        "fixture",
+        actions_with_effect(&["charge"], "non_idempotent"),
+        Box::new(|_, _, _| {
+            // The classic ambiguous case: the request went out, the reply did not.
+            Err(AutomationError::new("PLUGIN.HOST_TIMEOUT", "no reply")
+                .with_retryable(true)
+                .with_effect("unknown"))
+        }),
+    );
+
+    let workflow = descriptor(json!({
+        "steps": [{
+            "id": "pay", "type": "action", "uses": "fixture.charge@1", "with": {},
+            "effect": {"class": "non_idempotent"},
+            "retry": {"max_attempts": 5, "backoff": {"strategy": "fixed", "initial_delay": "1ms"}}
+        }]
+    }));
+
+    let result = execute(&workflow, registry(vec![provider.clone()]));
+
+    assert_eq!(
+        provider.calls(),
+        1,
+        "an unprovable non-idempotent action must not be repeated"
+    );
+    assert_eq!(result.status, RunStatus::UnknownEffect);
+}
+
+#[test]
+fn an_idempotent_action_with_an_unknown_effect_may_be_retried() {
+    let provider = Fake::build(
+        "fixture",
+        actions_with_effect(&["put"], "idempotent"),
+        Box::new(|_, _, attempt| {
+            if attempt < 2 {
+                Err(AutomationError::new("PLUGIN.HOST_TIMEOUT", "no reply")
+                    .with_retryable(true)
+                    .with_effect("unknown"))
+            } else {
+                Ok(json!({"ok": true}))
+            }
+        }),
+    );
+
+    let workflow = descriptor(json!({
+        "steps": [{
+            "id": "put", "type": "action", "uses": "fixture.put@1", "with": {},
+            "effect": {"class": "idempotent"},
+            "retry": {"max_attempts": 3, "backoff": {"strategy": "fixed", "initial_delay": "1ms"}}
+        }]
+    }));
+
+    let result = execute(&workflow, registry(vec![provider.clone()]));
+
+    assert_eq!(result.status, RunStatus::Succeeded);
+    assert_eq!(provider.calls(), 2);
+}
+
+#[test]
+fn retry_only_applies_to_matching_error_codes() {
+    let provider = Fake::build(
+        "fixture",
+        read_only_actions(&["mixed"]),
+        Box::new(|_, _, _| {
+            Err(AutomationError::new("OTHER.CODE", "not matched")
+                .with_retryable(true)
+                .with_effect("not_applied"))
+        }),
+    );
+
+    let workflow = descriptor(json!({
+        "steps": [{
+            "id": "act", "type": "action", "uses": "fixture.mixed@1", "with": {},
+            "retry": {
+                "max_attempts": 4,
+                "backoff": {"strategy": "fixed", "initial_delay": "1ms"},
+                "on": {"codes": ["FIXTURE.*"]}
+            }
+        }]
+    }));
+
+    execute(&workflow, registry(vec![provider.clone()]));
+
+    assert_eq!(provider.calls(), 1);
+}
+
+// ---------------------------------------------------------------------------
+// Error handling
+// ---------------------------------------------------------------------------
+
+#[test]
+fn an_on_error_handler_can_absorb_a_failure_and_continue() {
+    let provider = Fake::build(
+        "fixture",
+        read_only_actions(&["broken", "after"]),
+        Box::new(|action, _, _| {
+            if action.contains("broken") {
+                Err(AutomationError::new("FIXTURE.BROKEN", "failed")
+                    .with_effect("not_applied"))
+            } else {
+                Ok(json!({"ran": true}))
+            }
+        }),
+    );
+
+    let workflow = descriptor(json!({
+        "steps": [
+            {
+                "id": "act", "type": "action", "uses": "fixture.broken@1", "with": {},
+                "on_error": {
+                    "match": {"codes": ["FIXTURE.*"]},
+                    "steps": [],
+                    "outcome": {"mode": "continue", "output": {"recovered": true}}
+                }
+            },
+            {"id": "after", "type": "action", "uses": "fixture.after@1", "with": {}}
+        ],
+        "outputs": {"recovered": {"value": "${{ steps.act.output.recovered }}"}}
+    }));
+
+    let result = execute(&workflow, registry(vec![provider]));
+
+    assert_eq!(result.status, RunStatus::Succeeded);
+    assert_eq!(result.outputs["recovered"], json!(true));
+}
+
+#[test]
+fn a_handler_can_bind_the_error_and_inspect_its_code() {
+    let provider = Fake::build(
+        "fixture",
+        read_only_actions(&["broken"]),
+        Box::new(|_, _, _| {
+            Err(AutomationError::new("FIXTURE.BROKEN", "the reason")
+                .with_effect("not_applied"))
+        }),
+    );
+
+    let workflow = descriptor(json!({
+        "steps": [{
+            "id": "act", "type": "action", "uses": "fixture.broken@1", "with": {},
+            "on_error": {
+                "as": "failure",
+                "steps": [],
+                "outcome": {
+                    "mode": "continue",
+                    "output": {"code": "${{ failure.code }}", "message": "${{ failure.message }}"}
+                }
+            }
+        }],
+        "outputs": {"code": {"value": "${{ steps.act.output.code }}"}}
+    }));
+
+    let result = execute(&workflow, registry(vec![provider]));
+
+    assert_eq!(result.status, RunStatus::Succeeded);
+    assert_eq!(result.outputs["code"], json!("FIXTURE.BROKEN"));
+}
+
+#[test]
+fn a_handler_that_does_not_match_leaves_the_error_intact() {
+    let provider = Fake::build(
+        "fixture",
+        read_only_actions(&["broken"]),
+        Box::new(|_, _, _| {
+            Err(AutomationError::new("OTHER.CODE", "unmatched").with_effect("not_applied"))
+        }),
+    );
+
+    let workflow = descriptor(json!({
+        "steps": [{
+            "id": "act", "type": "action", "uses": "fixture.broken@1", "with": {},
+            "on_error": {
+                "match": {"codes": ["FIXTURE.*"]},
+                "steps": [],
+                "outcome": {"mode": "continue"}
+            }
+        }]
+    }));
+
+    let result = execute(&workflow, registry(vec![provider]));
+
+    assert_eq!(result.status, RunStatus::Failed);
+    assert_eq!(result.error.unwrap().code, "OTHER.CODE");
+}
+
+#[test]
+fn a_rethrow_handler_runs_its_steps_and_still_fails() {
+    let provider = Fake::build(
+        "fixture",
+        read_only_actions(&["broken", "log"]),
+        Box::new(|action, _, _| {
+            if action.contains("broken") {
+                Err(AutomationError::new("FIXTURE.BROKEN", "failed")
+                    .with_effect("not_applied"))
+            } else {
+                Ok(json!({}))
+            }
+        }),
+    );
+
+    let workflow = descriptor(json!({
+        "steps": [{
+            "id": "act", "type": "action", "uses": "fixture.broken@1", "with": {},
+            "on_error": {
+                "steps": [{"id": "log", "type": "action", "uses": "fixture.log@1", "with": {}}],
+                "outcome": {"mode": "rethrow"}
+            }
+        }]
+    }));
+
+    let result = execute(&workflow, registry(vec![provider.clone()]));
+
+    assert_eq!(result.status, RunStatus::Failed);
+    assert_eq!(result.error.unwrap().code, "FIXTURE.BROKEN");
+    assert_eq!(provider.calls(), 2, "the handler's own steps still run");
+}
+
+#[test]
+fn the_error_location_records_the_failing_step() {
+    let provider = Fake::build(
+        "fixture",
+        read_only_actions(&["broken"]),
+        Box::new(|_, _, _| {
+            Err(AutomationError::new("FIXTURE.BROKEN", "failed").with_effect("not_applied"))
+        }),
+    );
+
+    let workflow = descriptor(json!({
+        "steps": [{"id": "the_step", "type": "action", "uses": "fixture.broken@1", "with": {}}]
+    }));
+
+    let result = execute(&workflow, registry(vec![provider]));
+    let error = result.error.unwrap();
+
+    assert_eq!(error.location.step_id.as_deref(), Some("the_step"));
+    assert_eq!(error.location.workflow.as_deref(), Some("test.workflow"));
+}
+
+// ---------------------------------------------------------------------------
+// Cleanup
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_finally_block_runs_after_success() {
+    let provider = Fake::echo("fixture", &["work", "cleanup"]);
+    let workflow = descriptor(json!({
+        "steps": [{
+            "id": "outer", "type": "block",
+            "steps": [{"id": "work", "type": "action", "uses": "fixture.work@1", "with": {}}],
+            "finally": [{"id": "cleanup", "type": "action", "uses": "fixture.cleanup@1", "with": {}}]
+        }]
+    }));
+
+    let result = execute(&workflow, registry(vec![provider.clone()]));
+
+    assert_eq!(result.status, RunStatus::Succeeded);
+    assert_eq!(provider.calls(), 2);
+}
+
+#[test]
+fn a_finally_block_still_runs_after_failure() {
+    let cleaned = Arc::new(AtomicUsize::new(0));
+    let counter = cleaned.clone();
+    let provider = Fake::build(
+        "fixture",
+        read_only_actions(&["work", "cleanup"]),
+        Box::new(move |action, _, _| {
+            if action.contains("cleanup") {
+                counter.fetch_add(1, Ordering::SeqCst);
+                Ok(json!({}))
+            } else {
+                Err(AutomationError::new("FIXTURE.BROKEN", "failed")
+                    .with_effect("not_applied"))
+            }
+        }),
+    );
+
+    let workflow = descriptor(json!({
+        "steps": [{
+            "id": "outer", "type": "block",
+            "steps": [{"id": "work", "type": "action", "uses": "fixture.work@1", "with": {}}],
+            "finally": [{"id": "cleanup", "type": "action", "uses": "fixture.cleanup@1", "with": {}}]
+        }]
+    }));
+
+    let result = execute(&workflow, registry(vec![provider]));
+
+    assert_eq!(result.status, RunStatus::Failed);
+    assert_eq!(cleaned.load(Ordering::SeqCst), 1, "cleanup must always run");
+}
+
+#[test]
+fn a_cleanup_failure_is_suppressed_onto_the_original_error() {
+    let provider = Fake::build(
+        "fixture",
+        read_only_actions(&["work", "cleanup"]),
+        Box::new(|action, _, _| {
+            let code = if action.contains("cleanup") {
+                "FIXTURE.CLEANUP_FAILED"
+            } else {
+                "FIXTURE.ORIGINAL"
+            };
+            Err(AutomationError::new(code, "failed").with_effect("not_applied"))
+        }),
+    );
+
+    let workflow = descriptor(json!({
+        "steps": [{
+            "id": "outer", "type": "block",
+            "steps": [{"id": "work", "type": "action", "uses": "fixture.work@1", "with": {}}],
+            "finally": [{"id": "cleanup", "type": "action", "uses": "fixture.cleanup@1", "with": {}}]
+        }]
+    }));
+
+    let result = execute(&workflow, registry(vec![provider]));
+    let error = result.error.expect("an error is reported");
+
+    // The real cause must survive; the cleanup failure rides along.
+    assert_eq!(error.code, "FIXTURE.ORIGINAL");
+    assert_eq!(error.suppressed.len(), 1);
+    assert_eq!(error.suppressed[0].code, "FIXTURE.CLEANUP_FAILED");
+}
+
+#[test]
+fn a_workflow_level_finally_runs_on_the_failure_path() {
+    let cleaned = Arc::new(AtomicUsize::new(0));
+    let counter = cleaned.clone();
+    let provider = Fake::build(
+        "fixture",
+        read_only_actions(&["work", "cleanup"]),
+        Box::new(move |action, _, _| {
+            if action.contains("cleanup") {
+                counter.fetch_add(1, Ordering::SeqCst);
+                Ok(json!({}))
+            } else {
+                Err(AutomationError::new("FIXTURE.BROKEN", "failed")
+                    .with_effect("not_applied"))
+            }
+        }),
+    );
+
+    let workflow = descriptor(json!({
+        "steps": [{"id": "work", "type": "action", "uses": "fixture.work@1", "with": {}}],
+        "finally": [{"id": "cleanup", "type": "action", "uses": "fixture.cleanup@1", "with": {}}]
+    }));
+
+    let result = execute(&workflow, registry(vec![provider]));
+
+    assert_eq!(result.status, RunStatus::Failed);
+    assert_eq!(cleaned.load(Ordering::SeqCst), 1);
+}
+
+// ---------------------------------------------------------------------------
+// Budgets, effects and cancellation
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_step_budget_stops_a_runaway_workflow() {
+    let workflow = {
+        let mut document = json!({
+            "apiVersion": "ai-auto-desktop.dev/v1alpha1",
+            "kind": "Workflow",
+            "metadata": {"name": "test.budget"},
+            "budgets": {"max_duration": "30s", "max_executed_steps": 3},
+            "variables": {"count": {"schema": {"type": "integer"}, "mutable": true, "initial": 0}},
+            "steps": [{
+                "id": "loop", "type": "while",
+                "condition": "${{ True }}", "max_iterations": 1000, "timeout": "10s",
+                "steps": [{"id": "bump", "type": "set", "assign": {"vars.count": "${{ vars.count + 1 }}"}}]
+            }]
+        });
+        document["metadata"]["name"] = json!("test.budget");
+        compile_descriptor(document, None).expect("descriptor compiles")
+    };
+
+    let result = execute(&workflow, registry(vec![]));
+
+    assert_eq!(result.status, RunStatus::Failed);
+    assert_eq!(result.error.unwrap().code, "WORKFLOW.STEP_BUDGET_EXCEEDED");
+    assert!(result.executed_steps <= 4);
+}
+
+#[test]
+fn the_wall_clock_budget_ends_a_slow_run() {
+    let provider = Fake::build(
+        "fixture",
+        read_only_actions(&["slow"]),
+        Box::new(|_, _, _| {
+            std::thread::sleep(Duration::from_millis(120));
+            Ok(json!({}))
+        }),
+    );
+
+    let workflow = descriptor(json!({
+        "steps": [{
+            "id": "loop", "type": "while",
+            "condition": "${{ True }}", "max_iterations": 1000, "timeout": "30s",
+            "steps": [{"id": "act", "type": "action", "uses": "fixture.slow@1", "with": {}}]
+        }]
+    }));
+
+    let started = std::time::Instant::now();
+    let result = run(
+        &workflow,
+        RunOptions {
+            providers: registry(vec![provider]),
+            max_duration: Some(Duration::from_millis(300)),
+            ..Default::default()
+        },
+    );
+
+    assert_eq!(result.status, RunStatus::TimedOut);
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "the budget must actually stop the run"
+    );
+}
+
+#[test]
+fn cancellation_stops_the_run_and_is_reported_as_cancelled() {
+    let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = cancel.clone();
+    let provider = Fake::build(
+        "fixture",
+        read_only_actions(&["tick"]),
+        Box::new(move |_, _, attempt| {
+            if attempt >= 2 {
+                flag.store(true, Ordering::SeqCst);
+            }
+            Ok(json!({}))
+        }),
+    );
+
+    let workflow = descriptor(json!({
+        "steps": [{
+            "id": "loop", "type": "while",
+            "condition": "${{ True }}", "max_iterations": 1000, "timeout": "30s",
+            "steps": [{"id": "act", "type": "action", "uses": "fixture.tick@1", "with": {}}]
+        }]
+    }));
+
+    let result = run(
+        &workflow,
+        RunOptions {
+            providers: registry(vec![provider.clone()]),
+            cancel,
+            ..Default::default()
+        },
+    );
+
+    assert_eq!(result.status, RunStatus::Cancelled);
+    assert!(provider.calls() < 10, "cancellation must take effect promptly");
+}
+
+#[test]
+fn a_read_only_action_never_reports_an_unknown_effect() {
+    let provider = Fake::build(
+        "fixture",
+        read_only_actions(&["look"]),
+        Box::new(|_, _, _| {
+            // Even an ambiguous transport failure cannot have changed anything.
+            Err(AutomationError::new("PLUGIN.HOST_TIMEOUT", "no reply")
+                .with_effect("unknown"))
+        }),
+    );
+
+    let workflow = descriptor(json!({
+        "steps": [{
+            "id": "act", "type": "action", "uses": "fixture.look@1", "with": {},
+            "effect": {"class": "read_only"}
+        }]
+    }));
+
+    let result = execute(&workflow, registry(vec![provider]));
+
+    assert_eq!(result.status, RunStatus::Failed);
+    assert_eq!(result.error.unwrap().effect, "not_applied");
+}
+
+#[test]
+fn a_precondition_failure_prevents_the_action_from_running() {
+    let provider = Fake::echo("fixture", &["act"]);
+    let workflow = descriptor(json!({
+        "steps": [{
+            "id": "act", "type": "action", "uses": "fixture.act@1", "with": {},
+            "precondition": {"condition": "${{ False }}", "message": "not ready"}
+        }]
+    }));
+
+    let result = execute(&workflow, registry(vec![provider.clone()]));
+
+    assert_eq!(result.status, RunStatus::Failed);
+    let error = result.error.unwrap();
+    assert_eq!(error.code, "ACTION.PRECONDITION_FAILED");
+    assert_eq!(error.effect, "not_applied");
+    assert_eq!(provider.calls(), 0);
+}
+
+#[test]
+fn a_postcondition_failure_reports_an_unknown_effect() {
+    let provider = Fake::echo("fixture", &["act"]);
+    let workflow = descriptor(json!({
+        "steps": [{
+            "id": "act", "type": "action", "uses": "fixture.act@1", "with": {},
+            "postcondition": {"condition": "${{ False }}", "message": "did not settle"}
+        }]
+    }));
+
+    let result = execute(&workflow, registry(vec![provider.clone()]));
+
+    // The action ran; only the verification failed, so the effect is unknown.
+    assert_eq!(provider.calls(), 1);
+    assert_eq!(result.status, RunStatus::UnknownEffect);
+    assert_eq!(result.error.unwrap().code, "ACTION.POSTCONDITION_FAILED");
+}
+
+// ---------------------------------------------------------------------------
+// Script steps
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_script_step_runs_and_its_output_is_readable_by_later_steps() {
+    if aad_runtime::script::availability()["state"] == "unavailable" {
+        return;
+    }
+    let workflow = descriptor(json!({
+        "steps": [{
+            "id": "compute", "type": "script",
+            "runtime": "python",
+            "output_schema": {"type": "object"},
+            "source": "import json,sys; data=json.load(sys.stdin); \
+print(json.dumps({'total': data['a'] + data['b']}))",
+            "inputs": {"a": 20, "b": 22}
+        }],
+        "outputs": {"total": {"value": "${{ steps.compute.output.total }}"}}
+    }));
+
+    let result = execute(&workflow, registry(vec![]));
+
+    assert_eq!(result.status, RunStatus::Succeeded, "{:?}", result.error);
+    assert_eq!(result.outputs["total"], json!(42));
+}
+
+#[test]
+fn a_failing_script_step_fails_the_workflow() {
+    if aad_runtime::script::availability()["state"] == "unavailable" {
+        return;
+    }
+    let workflow = descriptor(json!({
+        "steps": [{
+            "id": "boom", "type": "script",
+            "runtime": "python",
+            "output_schema": {"type": "object"},
+            "source": "raise SystemExit(4)"
+        }]
+    }));
+
+    let result = execute(&workflow, registry(vec![]));
+
+    assert_ne!(result.status, RunStatus::Succeeded);
+    assert_eq!(
+        result.error.as_ref().map(|error| error.code.as_str()),
+        Some("SCRIPT.EXIT_NONZERO")
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Determinism
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_plan_digest_is_stable_for_the_same_descriptor() {
+    let workflow = descriptor(json!({
+        "steps": [{"id": "done", "type": "return", "value": 1}]
+    }));
+    let same = descriptor(json!({
+        "steps": [{"id": "done", "type": "return", "value": 1}]
+    }));
+    let different = descriptor(json!({
+        "steps": [{"id": "done", "type": "return", "value": 2}]
+    }));
+
+    assert_eq!(
+        aad_runtime::plan_digest(&workflow),
+        aad_runtime::plan_digest(&same)
+    );
+    assert_ne!(
+        aad_runtime::plan_digest(&workflow),
+        aad_runtime::plan_digest(&different)
+    );
+    assert!(aad_runtime::plan_digest(&workflow).starts_with("sha256:"));
+}
+
+#[test]
+fn a_run_result_serializes_to_the_run_schema_shape() {
+    let workflow = descriptor(json!({
+        "steps": [{"id": "done", "type": "return", "value": 1}]
+    }));
+
+    let document = execute(&workflow, registry(vec![])).to_json();
+
+    assert_eq!(document["apiVersion"], "ai-auto-desktop.dev/v1alpha1");
+    assert_eq!(document["kind"], "Run");
+    assert_eq!(document["status"], "succeeded");
+    assert!(document["runId"].as_str().is_some());
+    assert!(document["workflow"]["planDigest"].as_str().is_some());
+    assert!(document["finishedAt"].as_str().is_some());
+}

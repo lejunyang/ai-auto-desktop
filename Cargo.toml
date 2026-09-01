@@ -1,0 +1,42 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/aad-core",
+    "crates/aad-plugin",
+    "crates/aad-runtime",
+    "crates/aad-probe",
+    "crates/aad-uia",
+    "crates/aad-mcp",
+    "crates/aad-cli",
+    "gui/src-tauri",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+license = "Apache-2.0"
+repository = "https://github.com/ai-auto-desktop/ai-auto-desktop"
+
+[workspace.dependencies]
+aad-core = { path = "crates/aad-core" }
+aad-plugin = { path = "crates/aad-plugin" }
+aad-runtime = { path = "crates/aad-runtime" }
+aad-probe = { path = "crates/aad-probe" }
+aad-uia = { path = "crates/aad-uia" }
+aad-mcp = { path = "crates/aad-mcp" }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+serde_yaml = "0.9"
+indexmap = { version = "2", features = ["serde"] }
+sha2 = "0.10"
+uuid = { version = "1", features = ["v4"] }
+clap = { version = "4", features = ["derive"] }
+jsonschema = { version = "0.18", default-features = false }
+thiserror = "1"
+
+[profile.release]
+opt-level = 2
+lto = "thin"
+strip = true
