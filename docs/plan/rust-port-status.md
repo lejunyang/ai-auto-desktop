@@ -57,8 +57,54 @@ Rust 是本项目的主实现，对外提供 **CLI + GUI** 两种形态，CLI �
 仍缺：
 
 - `action_intent` v2 受限重放：当前是 `deny` 模式，**拒绝一切 action / script**
-  （无 intent 机制就无法证明某次派发可安全重复）。规范另定义 `--durable-actions read-only`。
+  （无 intent 机制就无法证明某次派发可安全重复）。规范另定义 `--durable-actions read-only`，
+  详见下方「§2.1.1 action_intent 待决」。
 - `run_service.py` 的服务层（尚未读）。
+
+#### 2.1.1 action_intent 待决（范围未拍板）
+
+**规范依据**：`docs/architecture/runtime.md` §8.1 第 200–235 行（已逐字读过）。
+
+要解决的问题：durable 现在拒绝一切 action，因为进程死在 dispatch 中途时，journal 无法区分
+「请求还没发出」与「请求已到达桌面、副作用已发生」。重放可能点两次按钮，报失败可能谎称什么
+都没做，所以只能落 `unknown_effect` 让人来判断。`action_intent` 是把**一部分** action 从
+「不可判定」拉回「可判定」的机制——注意是一部分，不是全部。
+
+规范定义的准入条件（全部必须满足，任一不满足即 fail-closed）：
+
+- 只允许**只读** action（provider contract 有效 `read_only`），且必须在**顶层**；
+- 必须是单次 attempt：无 `if`、`precondition`、`postcondition`、retry、step handler、
+  step `finally`；
+- 嵌套 action、写 action、script、声明敏感 input/output 的 workflow 一律仍拒绝；
+- manifest 与 descriptor step 的 input/output/error sensitivity 都必须显式为 `public`；
+- 错误合约必须非空且**全部**为 `not_applied`；
+- manifest 必须给出稳定的 `durability.checkpoint_fields`（每字段：有界 JSON Pointer +
+  schema + 缺失策略）；descriptor 用 `checkpoint.output.mode` 选 `project`（provider
+  白名单字段）或 `omit`（空输出，原始响应不持久化）；
+- **拒绝任何 `artifacts` 契约**——ArtifactRef 是本次 live execution scope 的能力，
+  不能作为跨进程重启的 durable checkpoint（§7 第 168–170 行）。
+
+intent 里记什么：operation、step、已预留 attempt、原始 dispatch deadline，以及
+provider / contract / projection / input binding 的**摘要**——**不记原始 action input**。
+恢复时重新校验这些绑定，只对该只读 intent 安全重放；篡改、过期、不匹配一律在 dispatch 前
+失败关闭。
+
+为什么"只读 + 投影"就够安全：只读 action 重复执行不改变世界，所以重放是安全的；输出经
+`checkpoint_fields` 白名单投影后才进 checkpoint，避免把无界或敏感的 provider 响应写进
+持久存储。两个条件缺一不可。
+
+仍然不变的底线：**没有**合法 `action_intent` 的 `in_top_level_step` / `finalizing` 依旧
+必须零 dispatch 终结为 `UNKNOWN_EFFECT`；进入 workflow finally 前先写 `finalizing`，
+避免崩溃后重复 cleanup。所有边界（intent、dispatch 授权、完成 checkpoint、终态提交）都用
+期望 `desiredState` 做 CAS，pause/cancel 与完成并发时转入控制路径而不覆盖 operator 意图。
+
+**注意规范自己声明的局限**（第 234–235 行）：lease 只在持久边界同步 heartbeat，它保证旧
+owner 不能继续写 journal，但**不等于**能异步强杀已经进入插件或 OS 的调用。
+
+未决：是否实现。做了之后能持久化运行的仍然只是「顶层只读观察 + 纯计算」类工作流；真正的
+写操作（点击、输入）**依然**落 `unknown_effect`，因为写 action 的 reconciliation 规范
+本身也列为 v1 之后的工作（§2 表格「写 action/script reconciliation」）。因此收益是否
+匹配工作量，需要产品判断。
 
 CLI 七命令已补齐（`start` / `resume` / `status` / `pause` / `cancel` / `list` / `events`），
 与 Python 的差异是刻意的：
