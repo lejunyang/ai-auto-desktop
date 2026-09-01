@@ -35,6 +35,9 @@ uuid = { version = "1", features = ["v4"] }
 clap = { version = "4", features = ["derive"] }
 jsonschema = { version = "0.18", default-features = false }
 thiserror = "1"
+# Bundled so the durable journal does not depend on a system SQLite whose
+# version, WAL support or compile options we cannot verify on a user's machine.
+rusqlite = { version = "0.40", features = ["bundled"] }
 
 [profile.release]
 opt-level = 2

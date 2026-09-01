@@ -4,6 +4,7 @@
 //! against a set of providers, producing a journal of everything that happened
 //! and a [`RunResult`] describing how the run ended.
 
+pub mod durable;
 pub mod engine;
 pub mod journal;
 pub mod provider;
