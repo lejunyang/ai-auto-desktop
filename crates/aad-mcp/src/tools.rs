@@ -13,6 +13,7 @@
 
 use aad_uia::UiaDriver;
 use serde_json::{json, Value};
+use std::sync::Arc;
 
 /// One callable tool.
 pub struct Tool {
@@ -286,7 +287,7 @@ pub fn call_without_driver(name: &str, arguments: &Value) -> Result<Value, Strin
 }
 
 /// Execute one tool call against a driver.
-pub fn call(driver: &UiaDriver, name: &str, arguments: &Value) -> Result<Value, String> {
+pub fn call(driver: &Arc<UiaDriver>, name: &str, arguments: &Value) -> Result<Value, String> {
     // These need no desktop, so they answer even when automation is unavailable.
     if matches!(
         name,
@@ -296,7 +297,7 @@ pub fn call(driver: &UiaDriver, name: &str, arguments: &Value) -> Result<Value, 
     }
 
     if name == "run_workflow" {
-        return run_workflow(arguments);
+        return run_workflow(driver, arguments);
     }
 
     let action = match name {
@@ -429,7 +430,12 @@ fn uses_scripts(raw: &Value) -> bool {
 }
 
 /// Run a saved workflow and report its result.
-fn run_workflow(arguments: &Value) -> Result<Value, String> {
+///
+/// Takes the driver because a recorded workflow is made of `action` steps that
+/// dispatch through the desktop provider. Running one without registering that
+/// provider would fail on the first step with a missing-provider error, which
+/// looks like a broken recording rather than a mis-wired caller.
+fn run_workflow(driver: &Arc<UiaDriver>, arguments: &Value) -> Result<Value, String> {
     let (name, descriptor) = compiled_workflow(arguments)?;
 
     // Refused by name before anything runs. A script step executes arbitrary
@@ -458,9 +464,16 @@ by a person: use `aad run <file> --allow-scripts`.",
         }
     };
 
+    // The same registry the CLI builds, so a workflow behaves identically
+    // whether a person ran it or an agent did.
+    let mut providers = aad_runtime::ProviderRegistry::new();
+    providers.insert(driver.clone());
+
     let result = aad_runtime::run(
         &descriptor,
-        aad_runtime::RunOptions::default().with_inputs(inputs),
+        aad_runtime::RunOptions::default()
+            .with_inputs(inputs)
+            .with_providers(providers),
     );
 
     let mut payload = json!({
@@ -654,15 +667,13 @@ mod tests {
 
     #[test]
     fn probing_the_environment_needs_no_desktop() {
-        // The tool must answer even where automation itself cannot run.
-        let driver = aad_uia::native_driver();
-        if let Ok(driver) = driver {
-            let report = call(&driver, "probe_environment", &json!({})).unwrap();
-            assert_eq!(report["kind"], "CapabilityProbe");
-        } else {
-            let report = aad_probe::probe().to_json();
-            assert_eq!(report["kind"], "CapabilityProbe");
-        }
+        // The tool must answer even where automation itself cannot run, so it is
+        // asserted through `call` with a driver and through the no-driver path.
+        let report = call(&stub_driver(), "probe_environment", &json!({})).unwrap();
+        assert_eq!(report["kind"], "CapabilityProbe");
+
+        let offline = call_without_driver("probe_environment", &json!({})).unwrap();
+        assert_eq!(offline["kind"], "CapabilityProbe");
     }
 
     /// Point the recordings store at a scratch directory for one test.
@@ -720,6 +731,102 @@ mod tests {
             }],
             "outputs": {"greeting": {"value": "${{ vars.greeting }}"}}
         })
+    }
+
+    /// A backend with one clickable button, so a recorded `action` step has
+    /// somewhere real to land without touching the actual desktop.
+    struct StubBackend;
+
+    fn stub_window() -> aad_uia::WindowInfo {
+        aad_uia::WindowInfo {
+            window_id: "w1".into(),
+            title: "Fixture".into(),
+            process_id: 7,
+            process_name: Some("fixture.exe".into()),
+            class_name: Some("FixtureClass".into()),
+            bounds: Some(aad_uia::Bounds { x: 0, y: 0, width: 400, height: 300 }),
+            is_foreground: true,
+            is_minimized: false,
+        }
+    }
+
+    fn stub_node() -> aad_uia::Node {
+        aad_uia::Node {
+            node_id: "n1".into(),
+            role: "Button".into(),
+            name: Some("Save".into()),
+            value: None,
+            automation_id: Some("saveButton".into()),
+            class_name: None,
+            framework_id: None,
+            bounds: Some(aad_uia::Bounds { x: 10, y: 10, width: 60, height: 20 }),
+            states: aad_uia::States { enabled: Some(true), ..Default::default() },
+            actions: vec!["invoke".into(), "focus".into()],
+            depth: 1,
+            parent_id: None,
+            children: Vec::new(),
+        }
+    }
+
+    impl aad_uia::Backend for StubBackend {
+        fn list_windows(&self) -> Result<Vec<aad_uia::WindowInfo>, aad_uia::DriverError> {
+            Ok(vec![stub_window()])
+        }
+
+        fn capture(
+            &self,
+            _window_id: &str,
+            _limits: aad_uia::CaptureLimits,
+        ) -> Result<aad_uia::CapturedTree, aad_uia::DriverError> {
+            Ok(aad_uia::CapturedTree {
+                window: stub_window(),
+                root_id: Some("n1".into()),
+                truncated: false,
+                nodes: vec![stub_node()],
+            })
+        }
+
+        fn verify(
+            &self,
+            _window_id: &str,
+            _node: &aad_uia::Node,
+        ) -> Result<bool, aad_uia::DriverError> {
+            Ok(true)
+        }
+
+        fn focus(&self, _w: &str, _n: &aad_uia::Node) -> Result<(), aad_uia::DriverError> {
+            Ok(())
+        }
+        fn invoke(&self, _w: &str, _n: &aad_uia::Node) -> Result<(), aad_uia::DriverError> {
+            Ok(())
+        }
+        fn set_value(
+            &self,
+            _w: &str,
+            _n: &aad_uia::Node,
+            _v: &str,
+        ) -> Result<(), aad_uia::DriverError> {
+            Ok(())
+        }
+        fn type_text(
+            &self,
+            _w: &str,
+            _n: &aad_uia::Node,
+            _t: &str,
+        ) -> Result<(), aad_uia::DriverError> {
+            Ok(())
+        }
+        fn pointer_click(&self, _w: &str, _n: &aad_uia::Node) -> Result<(), aad_uia::DriverError> {
+            Ok(())
+        }
+    }
+
+    /// A driver over the stub backend, with a private snapshot store.
+    fn stub_driver() -> Arc<UiaDriver> {
+        Arc::new(UiaDriver::with_store(
+            Arc::new(StubBackend),
+            aad_uia::SnapshotStore::new(8, std::time::Duration::from_secs(60)),
+        ))
     }
 
     #[test]
@@ -792,11 +899,47 @@ mod tests {
         let store = ScratchStore::new("run");
         store.save("greeter", pure_workflow());
 
-        let result = run_workflow(&json!({"name": "greeter", "inputs": {"who": "agent"}}))
-            .expect("run");
+        let result = run_workflow(
+            &stub_driver(),
+            &json!({"name": "greeter", "inputs": {"who": "agent"}}),
+        )
+        .expect("run");
 
         assert_eq!(result["status"], json!("succeeded"));
         assert_eq!(result["outputs"]["greeting"], json!("agent"));
+        assert_eq!(result["stepsExecuted"], json!(1));
+    }
+
+    #[test]
+    fn a_recorded_workflow_reaches_the_desktop_provider() {
+        // Recordings compile to `action` steps that dispatch through the desktop
+        // provider. If the run is not given that provider, every real recording
+        // fails on its first step -- and it fails looking like a broken
+        // recording rather than a mis-wired caller, which is why this is
+        // asserted with an action step rather than a pure one.
+        let store = ScratchStore::new("action");
+        let mut workflow = pure_workflow();
+        workflow["steps"] = json!([{
+            "id": "press",
+            "type": "action",
+            "uses": "desktop.windows_uia.find@1",
+            "with": {
+                "window": {"class_name": "FixtureClass"},
+                "locator": {"automation_id": "saveButton"}
+            }
+        }]);
+        workflow["variables"] = json!({});
+        workflow["outputs"] = json!({});
+        store.save("recorded", workflow);
+
+        let result =
+            run_workflow(&stub_driver(), &json!({"name": "recorded"})).expect("the run completes");
+
+        assert_eq!(
+            result["status"],
+            json!("succeeded"),
+            "an action step must resolve against the registered provider: {result}"
+        );
         assert_eq!(result["stepsExecuted"], json!(1));
     }
 
@@ -813,7 +956,8 @@ mod tests {
         workflow["outputs"] = json!({});
         store.save("dangerous", workflow);
 
-        let error = run_workflow(&json!({"name": "dangerous"})).expect_err("must be refused");
+        let error = run_workflow(&stub_driver(), &json!({"name": "dangerous"}))
+            .expect_err("must be refused");
         let payload: Value = serde_json::from_str(&error).expect("structured error");
 
         assert_eq!(payload["code"], json!("MCP.SCRIPTS_REFUSED"));
@@ -860,7 +1004,7 @@ mod tests {
 
         // Either the compiler refuses it or the run fails; both must name the
         // problem rather than returning a bare failure.
-        match run_workflow(&json!({"name": "broken"})) {
+        match run_workflow(&stub_driver(), &json!({"name": "broken"})) {
             Ok(result) => {
                 assert_ne!(result["status"], json!("succeeded"));
                 let error = &result["error"];
@@ -882,7 +1026,7 @@ mod tests {
         let store = ScratchStore::new("bad-inputs");
         store.save("greeter", pure_workflow());
 
-        let error = run_workflow(&json!({"name": "greeter", "inputs": "who=agent"}))
+        let error = run_workflow(&stub_driver(), &json!({"name": "greeter", "inputs": "who=agent"}))
             .expect_err("must be refused");
         let payload: Value = serde_json::from_str(&error).unwrap();
 

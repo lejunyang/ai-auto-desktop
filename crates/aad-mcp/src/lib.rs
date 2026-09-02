@@ -22,7 +22,10 @@ pub const PROTOCOL_VERSION: &str = "2024-11-05";
 
 /// Handles MCP requests against a driver.
 pub struct Server {
-    driver: Option<UiaDriver>,
+    /// Held behind an `Arc` because running a saved workflow hands the driver to
+    /// the runtime as a capability provider, which the registry stores by
+    /// reference count.
+    driver: Option<std::sync::Arc<UiaDriver>>,
     /// Why the driver is missing, if it is.
     unavailable: Option<String>,
 }
@@ -37,7 +40,7 @@ impl Server {
     pub fn new() -> Self {
         match aad_uia::native_driver() {
             Ok(driver) => Self {
-                driver: Some(driver),
+                driver: Some(std::sync::Arc::new(driver)),
                 unavailable: None,
             },
             Err(error) => Self {
@@ -49,7 +52,7 @@ impl Server {
 
     pub fn with_driver(driver: UiaDriver) -> Self {
         Self {
-            driver: Some(driver),
+            driver: Some(std::sync::Arc::new(driver)),
             unavailable: None,
         }
     }

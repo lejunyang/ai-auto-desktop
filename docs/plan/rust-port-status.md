@@ -201,6 +201,30 @@ Windows 的受保护 ACL + 单实例 + 双向 PID 校验 named pipe，以及环�
 仍缺：`run_workflow` 走内存 `aad_runtime::run`，未接 `DurableExecutor`——AI 跑长流程时
 进程中断即丢失，接上后才能用 `status` / `resume` 跟进。是否要做未定。
 
+#### 2.6.1 已发现的缺陷：`run_workflow` 未注册桌面 provider（修改已写入，未验证）
+
+准备接持久化时先查了一件事：durable 目前拒绝 `action` 与 `script` 步骤，而录制导出的工作流
+（`gui/src/recording.ts`）**全部是** `action` 步骤（`uses` + `with`）。也就是说接上 durable 后，
+每一个真实录制都会被 `DURABLE.UNSUPPORTED_PLAN` 拒绝——先接 durable 是无用功。
+
+顺着这条线读代码，发现一个更要紧的问题：`run_workflow` 构造的是
+`RunOptions::default().with_inputs(...)`，**没有 `with_providers`**。CLI 的 `run` 路径在
+`crates/aad-cli/src/main.rs:646-651` 明确注册了 `aad_uia::native_driver()`，MCP 这条路径没有。
+后果：AI 通过 MCP 跑任何真实录制，都会在第一个 action 步骤上因找不到 provider 而失败，
+而且失败长得像「录制坏了」而不是「调用方接线错了」。
+
+已写入的修改（**尚未编译验证**，当时 shell 不可用）：
+- `Server.driver` 改为 `Option<Arc<UiaDriver>>`（registry 按引用计数持有 provider）；
+- `tools::call` 与 `run_workflow` 接收 `&Arc<UiaDriver>`，`run_workflow` 内注册
+  `providers.insert(driver.clone())`，与 CLI 构造同一套 registry；
+- `run_workflow` 不在 `NO_DRIVER_NEEDED` 内，仍走需要 driver 的分支（这是对的：它要动桌面）；
+- 新增 `StubBackend` / `stub_driver()` 测试替身，并加
+  `a_recorded_workflow_reaches_the_desktop_provider`——用 **action 步骤**而非纯计算步骤断言，
+  因为纯步骤根本不碰 provider，用它做断言会漏掉这个 bug。
+
+**待验证**：`cargo test -p aad-mcp`、`cargo test --workspace`，以及用
+`E:\tmp\mcp_client.py` 跑一次真机会话（需先 `cargo build -p aad-cli`）。
+
 ### 2.7 其他平台 driver
 
 **核实方式**：`crates/aad-uia` 只有 Windows 实现；`plugins/` 下有 `macos_ax`、`linux_atspi`
