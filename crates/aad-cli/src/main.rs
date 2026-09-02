@@ -261,6 +261,12 @@ struct RunArgs {
     /// Report what would run without executing anything.
     #[arg(long)]
     dry_run: bool,
+    /// Allow `script` steps to execute arbitrary code.
+    ///
+    /// Off by default: a descriptor should not be able to run code on this
+    /// machine just because someone was asked to run the file.
+    #[arg(long)]
+    allow_scripts: bool,
 }
 
 fn main() -> ExitCode {
@@ -646,7 +652,8 @@ fn run_workflow(args: &RunArgs) -> (Value, u8) {
 
     let mut options = aad_runtime::RunOptions::default()
         .with_providers(providers)
-        .with_inputs(inputs);
+        .with_inputs(inputs)
+        .with_scripts_allowed(args.allow_scripts);
 
     if let Some(path) = &args.journal {
         match std::fs::File::create(path) {

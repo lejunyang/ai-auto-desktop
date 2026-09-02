@@ -127,6 +127,11 @@ fn execute(descriptor: &WorkflowDescriptor, providers: ProviderRegistry) -> aad_
     run(descriptor, RunOptions::default().with_providers(providers))
 }
 
+/// Execute with `script` steps permitted, as a trusting caller would.
+fn execute_trusting_scripts(descriptor: &WorkflowDescriptor) -> aad_runtime::RunResult {
+    run(descriptor, RunOptions::default().with_scripts_allowed(true))
+}
+
 fn event_types(result: &aad_runtime::RunResult) -> Vec<String> {
     result
         .events
@@ -1170,7 +1175,7 @@ print(json.dumps({'total': data['a'] + data['b']}))",
         "outputs": {"total": {"value": "${{ steps.compute.output.total }}"}}
     }));
 
-    let result = execute(&workflow, registry(vec![]));
+    let result = execute_trusting_scripts(&workflow);
 
     assert_eq!(result.status, RunStatus::Succeeded, "{:?}", result.error);
     assert_eq!(result.outputs["total"], json!(42));
@@ -1190,13 +1195,96 @@ fn a_failing_script_step_fails_the_workflow() {
         }]
     }));
 
-    let result = execute(&workflow, registry(vec![]));
+    let result = execute_trusting_scripts(&workflow);
 
     assert_ne!(result.status, RunStatus::Succeeded);
     assert_eq!(
         result.error.as_ref().map(|error| error.code.as_str()),
         Some("SCRIPT.EXIT_NONZERO")
     );
+}
+
+#[test]
+fn a_script_step_is_refused_unless_the_caller_opted_in() {
+    // A descriptor is data. Running one must not be enough to make this
+    // process execute code the caller never agreed to run.
+    let workflow = descriptor(json!({
+        "steps": [{
+            "id": "exfiltrate", "type": "script",
+            "runtime": "python",
+            "output_schema": {"type": "object"},
+            "source": "import json; print(json.dumps({'ran': True}))"
+        }],
+        "outputs": {"ran": {"value": "${{ steps.exfiltrate.output.ran }}"}}
+    }));
+
+    let result = execute(&workflow, registry(vec![]));
+
+    assert_eq!(result.status, RunStatus::Failed);
+    let error = result.error.expect("the refusal is reported");
+    assert_eq!(error.code, "SCRIPT.SANDBOX_DENIED");
+    // Nothing ran, so the refusal must not be reported as ambiguous: an
+    // `unknown` effect would send an operator hunting for side effects.
+    assert_eq!(error.effect, "not_applied");
+    assert!(
+        error.details.contains_key("remedy"),
+        "the refusal must say how to proceed deliberately"
+    );
+    assert!(result.outputs.is_empty());
+}
+
+#[test]
+fn a_refused_script_never_reaches_the_interpreter() {
+    // The refusal has to mean *nothing ran*, not merely that the reported
+    // status was a failure. This proves it by observing the filesystem: the
+    // script's only job is to leave a mark, so the mark's absence is direct
+    // evidence no interpreter ever executed the code.
+    if aad_runtime::script::availability()["state"] == "unavailable" {
+        return;
+    }
+    let marker = std::env::temp_dir().join(format!(
+        "aad-script-gate-{}-{:?}.marker",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_file(&marker);
+
+    let body = json!({
+        "steps": [{
+            "id": "mark", "type": "script",
+            "runtime": "python",
+            "output_schema": {"type": "object"},
+            "source": "import json,sys; data=json.load(sys.stdin); \
+open(data['path'],'w').write('ran'); print(json.dumps({}))",
+            "inputs": {"path": marker.to_string_lossy()}
+        }]
+    });
+
+    let refused = execute(&descriptor(body.clone()), registry(vec![]));
+
+    assert_eq!(
+        refused.error.as_ref().map(|error| error.code.as_str()),
+        Some("SCRIPT.SANDBOX_DENIED")
+    );
+    assert!(
+        !marker.exists(),
+        "a refused script must not have executed at all"
+    );
+
+    // And the same descriptor *does* leave the mark once the caller opts in,
+    // so the assertion above is really observing the gate rather than a
+    // script that could never have written the file anyway.
+    let allowed = execute_trusting_scripts(&descriptor(body));
+    assert_eq!(allowed.status, RunStatus::Succeeded, "{:?}", allowed.error);
+    assert!(marker.exists(), "the control case must actually run");
+    let _ = std::fs::remove_file(&marker);
+}
+
+#[test]
+fn the_default_run_options_deny_scripts() {
+    // Stated as its own fact: every caller that does not think about this
+    // gets the safe behaviour, including future ones.
+    assert!(!RunOptions::default().allow_scripts);
 }
 
 // ---------------------------------------------------------------------------

@@ -45,6 +45,14 @@ pub struct RunOptions {
     /// Where a script step's `entrypoint` is resolved from, normally the
     /// directory holding the descriptor.
     pub base_directory: std::path::PathBuf,
+    /// Whether `script` steps may execute at all.
+    ///
+    /// Off by default. A `script` step runs arbitrary code from the descriptor
+    /// with this process's privileges, so executing one has to be a decision the
+    /// caller made deliberately rather than a side effect of the descriptor
+    /// asking for it. A caller that never opts in cannot be talked into running
+    /// code by the contents of a file it was handed.
+    pub allow_scripts: bool,
 }
 
 impl Default for RunOptions {
@@ -57,6 +65,7 @@ impl Default for RunOptions {
             cancel: Arc::new(AtomicBool::new(false)),
             max_duration: None,
             base_directory: std::env::current_dir().unwrap_or_else(|_| ".".into()),
+            allow_scripts: false,
         }
     }
 }
@@ -82,6 +91,14 @@ impl RunOptions {
         self.base_directory = directory;
         self
     }
+
+    /// Permit `script` steps to execute.
+    ///
+    /// Only a caller that trusts the descriptor's code should call this.
+    pub fn with_scripts_allowed(mut self, allowed: bool) -> Self {
+        self.allow_scripts = allowed;
+        self
+    }
 }
 
 /// The mutable state of one run.
@@ -103,6 +120,8 @@ struct Run<'a> {
     cancel: Arc<AtomicBool>,
     /// Where a script step's `entrypoint` is resolved from.
     base_directory: std::path::PathBuf,
+    /// Whether `script` steps may execute; see [`RunOptions::allow_scripts`].
+    allow_scripts: bool,
     /// Set once an action's outcome could not be proven.
     unknown_effect: bool,
 }
@@ -339,6 +358,24 @@ impl<'a> Run<'a> {
 
     /// Run a `script` step in the platform sandbox.
     fn run_script(&mut self, step: &CompiledStep) -> Result<Flow, AutomationError> {
+        // Refused before the step is even parsed, so nothing in the descriptor
+        // influences a run that never agreed to execute code.
+        if !self.allow_scripts {
+            return Err(AutomationError::new(
+                "SCRIPT.SANDBOX_DENIED",
+                "script steps are disabled for this run",
+            )
+            .with_category("script")
+            .with_effect("not_applied")
+            .with_detail(
+                "remedy",
+                Value::String(
+                    "Scripts execute arbitrary code. Re-run with scripts enabled \
+only if you trust this descriptor."
+                        .into(),
+                ),
+            ));
+        }
         let script = crate::script::ScriptStep::from_params(&step.params)?;
 
         // Script inputs are templated like any other step's arguments. The
@@ -1015,6 +1052,7 @@ impl<'a> Segmented<'a> {
                 max_executed_steps: descriptor.budgets.max_executed_steps,
                 cancel: options.cancel.clone(),
                 base_directory: options.base_directory.clone(),
+                allow_scripts: options.allow_scripts,
                 unknown_effect: false,
             },
         })
@@ -1267,6 +1305,7 @@ pub fn run(descriptor: &WorkflowDescriptor, options: RunOptions) -> RunResult {
         max_executed_steps: descriptor.budgets.max_executed_steps,
         cancel: options.cancel.clone(),
         base_directory: options.base_directory.clone(),
+        allow_scripts: options.allow_scripts,
         unknown_effect: false,
     };
 
