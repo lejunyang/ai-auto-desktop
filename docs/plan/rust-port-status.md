@@ -137,11 +137,15 @@ Python 另有 `edit`（属 §2.4 的浏览器编辑器，已由 GUI 取代，不
 **规范**：`docs/spec/recording-session-v1alpha1.md`
 **核实方式**：检索 `redaction|platform_binding|of_step|disambiguation`，**零匹配**。
 
-当前 Rust/GUI 实现的是一个够用的子集：locator + window selector + enabled。规范要求但未实现：
+当前 Rust/GUI 实现的是一个够用的子集：locator + window selector + enabled + 凭据外提。规范要求但未实现：
 
-- `redaction`：**默认行为而非可选项**。默认丢弃节点 `value` 只留 `observed.had_value`；
-  `states.protected` / 密码类不可解除；`type_text` 默认必须外提为 `inputs` 引用；
-  窗口标题默认 `title_policy: drop`；必须声明 `screenshots` 策略。
+- `redaction`：**已按 2026-09-03 修订的 §5 实现凭据部分**。driver 报
+  `states.protected`（`CurrentIsPassword`），outline 同时给结构化字段与可读标记，
+  locator 可按 `protected` 匹配；录制到的凭据外提为 required + sensitive 的 workflow
+  input，`.workflow.json` 与 `.recording.json` 两侧都不落字面量。
+  规范原本要求的「默认丢弃所有 `value`」「`title_policy: drop`」**已撤销**——实测表明
+  平台自己就不给密码值，而丢弃普通值会破坏可判断性。仍未实现：`screenshots` 策略声明
+  （当前根本不截图，等真要截图时再做）、`disclosed` 登记。
 - `assertion` 步骤：`of_step` + `observe`(仅 `find`/`snapshot`) + `expect.mode`，
   且**不得**编译为独立步骤，必须附加为 `postcondition`。
 - `logic` 步骤：人工插入的 `condition`/`loop`/`assign`/`group`/`fail`/`return`/`script`。
@@ -151,6 +155,13 @@ Python 另有 `edit`（属 §2.4 的浏览器编辑器，已由 GUI 取代，不
 - 引用完整性校验：每个 `steps.<id>`、`of_step`、`${{ inputs.X }}` 必须存在且 enabled，
   否则 `RECORDING.ORDER_INVALID`。**现有 workflow 编译器不覆盖这条**。
 - 一整套 `RECORDING.*` 错误码。
+
+**已知测试盲区（变异验证发现）**：把 `windows.rs` 的
+`protected: flag(unsafe { element.CurrentIsPassword() })` 改成 `protected: None`，
+**91 个 aad-uia 单测全部照常通过**——因为它们直接构造 `Node`，从不经过真实 UIA 读取。
+只有真机探针（相邻放一个普通输入框和一个 `UseSystemPasswordChar` 密码框，断言前者
+`protected=false` 且值可读、后者 `protected=true`）能发现这个回归。改动 driver 的属性
+读取后必须跑真机验证，不能只看单测。
 
 ### 2.4 录制捕获（事件驱动）
 

@@ -578,6 +578,10 @@ fn describe_element(
         focusable: flag(unsafe { element.CurrentIsKeyboardFocusable() }),
         focused: flag(unsafe { element.CurrentHasKeyboardFocus() }),
         read_only,
+        // Recorded so the absent value above is explained rather than looking
+        // like a capture failure. UIA withholds a password field's text on its
+        // own; this only reports that it did.
+        protected: flag(unsafe { element.CurrentIsPassword() }),
     };
 
     let mut actions = Vec::new();

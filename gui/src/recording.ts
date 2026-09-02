@@ -41,6 +41,14 @@ export interface Step {
   /** The window's title when recorded, for display only. */
   windowTitle: string;
   argument?: string;
+  /**
+   * The element masks its content, as a password field does.
+   *
+   * Kept on the step because it decides whether `argument` may be written into
+   * the exported file. A recording is a file people copy and share, so a secret
+   * typed here is externalised as a workflow input instead of being baked in.
+   */
+  protected?: boolean;
   enabled: boolean;
 }
 
@@ -160,6 +168,7 @@ export class Recording {
       window,
       windowTitle: draft.window.title,
       argument: draft.argument,
+      protected: draft.element.protected === true,
       // A step that cannot locate its element or its window would fail at
       // replay, so it is recorded but left out of the run until a human
       // resolves it.
@@ -246,7 +255,10 @@ export class Recording {
       }
       if (
         (ACTIONS_NEEDING_TEXT as readonly string[]).includes(step.action) &&
-        !step.argument
+        !step.argument &&
+        // A protected step is not missing anything: its value is supplied at run
+        // time as a workflow input and is deliberately absent from the file.
+        !step.protected
       ) {
         issues.push({
           stepId: step.id,
@@ -292,7 +304,17 @@ export class Recording {
         summary: step.summary,
         window: step.window,
         window_title: step.windowTitle,
-        ...(step.argument === undefined ? {} : { argument: step.argument }),
+        // A protected step's text is deliberately dropped here as well as from
+        // the compiled workflow. Externalising it from one file and writing it
+        // verbatim into the other, in the same directory, would keep the
+        // credential on disk while looking like it had been handled.
+        ...(step.argument === undefined || step.protected
+          ? {}
+          : { argument: step.argument }),
+        // Persisted because it decides whether this step's text may be written
+        // into the compiled workflow. Losing it on reopen would silently start
+        // inlining a credential that was correctly externalised before.
+        protected: step.protected === true,
         enabled: step.enabled,
       })),
     };
@@ -357,6 +379,7 @@ export class Recording {
         window,
         windowTitle: typeof step.window_title === "string" ? step.window_title : "",
         argument: typeof step.argument === "string" ? step.argument : undefined,
+        protected: step.protected === true,
         // Never re-enable a step that cannot be located, whatever the file says.
         enabled:
           step.enabled !== false && (step.locator ?? null) !== null && window !== null,
@@ -381,9 +404,17 @@ export class Recording {
    * forced by the driver's contract — an action needs a reference valid in the
    * current session, and only a locator survives being saved — and it is what
    * makes a reopened recording replayable at all.
+   *
+   * Text typed into an ordinary field is written into the file as-is: it is
+   * usually the point of the recording, and hiding it would make a saved
+   * workflow impossible to read back. Text typed into a *protected* field is
+   * different — it is a credential, and a recording is a file people copy,
+   * commit and share. Those become required workflow inputs, so the value is
+   * supplied at run time and never lands on disk.
    */
   toDescriptor(name = this.name): Record<string, unknown> {
     const steps: Record<string, unknown>[] = [];
+    const inputs: Record<string, unknown> = {};
 
     for (const step of this.enabledSteps) {
       const snapshotId = `${step.id}_window`;
@@ -410,11 +441,23 @@ export class Recording {
         // Consume the reference the find step just produced, not a saved one.
         target: `\${{ steps.${findId}.output.ref }}`,
       };
-      if (step.action === "set_value") {
-        args.value = step.argument ?? "";
-      }
-      if (step.action === "type_text") {
-        args.text = step.argument ?? "";
+      const needsText = (ACTIONS_NEEDING_TEXT as readonly string[]).includes(step.action);
+      if (needsText) {
+        const field = step.action === "set_value" ? "value" : "text";
+        if (step.protected) {
+          // Named after the step so two credentials in one recording stay
+          // separate, and marked required so a missing one fails at the start
+          // rather than halfway through a login.
+          const inputName = `${step.id}_secret`;
+          inputs[inputName] = {
+            schema: { type: "string" },
+            required: true,
+            sensitive: true,
+          };
+          args[field] = `\${{ inputs.${inputName} }}`;
+        } else {
+          args[field] = step.argument ?? "";
+        }
       }
 
       steps.push({
@@ -425,7 +468,7 @@ export class Recording {
       });
     }
 
-    return {
+    const descriptor: Record<string, unknown> = {
       apiVersion: RECORDING_API_VERSION,
       kind: WORKFLOW_KIND,
       metadata: { name },
@@ -437,5 +480,11 @@ export class Recording {
       },
       steps,
     };
+    // Only present when something was actually externalised, so an ordinary
+    // recording keeps the shape it had before.
+    if (Object.keys(inputs).length) {
+      descriptor.inputs = inputs;
+    }
+    return descriptor;
   }
 }

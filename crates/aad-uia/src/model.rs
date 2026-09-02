@@ -41,6 +41,16 @@ pub struct States {
     pub focusable: Option<bool>,
     pub focused: Option<bool>,
     pub read_only: Option<bool>,
+    /// The element masks its content, as a password field does.
+    ///
+    /// This is a label, not a filter. The platform already withholds the value
+    /// of such an element -- measured: an `ES_PASSWORD` edit reports
+    /// `value: null` through UIA while an ordinary edit next to it returns its
+    /// text. Recording it explicitly is what turns that null from something
+    /// that looks like a driver bug into a stated fact, and it tells a caller
+    /// that filling this field in is legitimate but reading it back is not
+    /// possible.
+    pub protected: Option<bool>,
 }
 
 impl States {
@@ -52,6 +62,7 @@ impl States {
             ("focusable", self.focusable),
             ("focused", self.focused),
             ("read_only", self.read_only),
+            ("protected", self.protected),
         ];
         for (name, value) in entries {
             map.insert(
@@ -117,6 +128,11 @@ impl Node {
         if let Some(value) = self.value.as_ref().filter(|text| !text.is_empty()) {
             let clipped: String = value.chars().take(40).collect();
             parts.push(format!("value={clipped:?}"));
+        }
+        // Says why there is no value to show, and that writing to this field is
+        // still the normal way to fill it in.
+        if self.states.protected == Some(true) {
+            parts.push("protected".to_string());
         }
         if self.states.enabled == Some(false) {
             parts.push("disabled".to_string());
@@ -233,6 +249,10 @@ impl Snapshot {
                     "depth": node.depth,
                     "summary": node.summary(),
                     "actions": node.actions,
+                    // A structured flag as well as the word in `summary`, so a
+                    // caller does not have to parse prose to find out that
+                    // this field's content is unreadable by design.
+                    "protected": node.states.protected == Some(true),
                 })
             })
             .collect();
@@ -367,6 +387,9 @@ impl Locator {
                     focusable: flag("focusable"),
                     focused: flag("focused"),
                     read_only: flag("read_only"),
+                    // Matchable, so "the password field in this form" is
+                    // expressible without relying on its label.
+                    protected: flag("protected"),
                 })
             }
             Some(_) => return Err("locator.states must be an object".to_string()),
@@ -456,6 +479,7 @@ impl Locator {
                 (states.focusable, node.states.focusable),
                 (states.focused, node.states.focused),
                 (states.read_only, node.states.read_only),
+                (states.protected, node.states.protected),
             ];
             for (wanted, actual) in pairs {
                 if let Some(wanted) = wanted {
@@ -600,6 +624,61 @@ mod tests {
             parent_id: None,
             children: Vec::new(),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Protected elements
+    //
+    // Measured against a real Win32 password box: UIA reports IsPassword and
+    // withholds the value, while an ordinary edit beside it returns its text.
+    // The flag exists to say which of those happened.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn a_protected_element_says_so_instead_of_looking_empty() {
+        // Without the marker, a password field is indistinguishable from a field
+        // the capture simply failed to read -- and a caller would waste time
+        // treating a deliberate omission as a bug.
+        let mut secret = node("e1", "Edit", Some("Password"));
+        secret.states.protected = Some(true);
+        secret.value = None;
+
+        let summary = secret.summary();
+
+        assert!(summary.contains("protected"), "got {summary:?}");
+        assert_eq!(secret.states.to_json()["protected"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn an_ordinary_value_is_still_reported_in_full() {
+        // The point of the narrow scope: hiding ordinary field contents would
+        // remove the information a caller needs to tell whether a form is
+        // filled in correctly.
+        let mut ordinary = node("e2", "Edit", Some("Search"));
+        ordinary.value = Some("quarterly-report-2026".into());
+
+        let summary = ordinary.summary();
+
+        assert!(summary.contains("quarterly-report-2026"), "got {summary:?}");
+        assert!(!summary.contains("protected"), "got {summary:?}");
+    }
+
+    #[test]
+    fn a_locator_can_pick_out_the_protected_field() {
+        // Filling in a password has to keep working, and the field is often
+        // unlabelled, so being able to match on the marking itself matters.
+        let mut secret = node("e1", "Edit", Some("Password"));
+        secret.states.protected = Some(true);
+        let ordinary = node("e2", "Edit", Some("Password"));
+
+        let locator = Locator::from_value(&serde_json::json!({
+            "role": "Edit",
+            "states": {"protected": true}
+        }))
+        .expect("a states constraint must parse");
+
+        assert!(locator.matches(&secret));
+        assert!(!locator.matches(&ordinary));
     }
 
     // -----------------------------------------------------------------------

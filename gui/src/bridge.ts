@@ -49,6 +49,14 @@ export interface Element {
   depth: number;
   summary: string;
   actions: string[];
+  /**
+   * The element masks its content, as a password field does.
+   *
+   * Reported as a flag rather than left to be parsed out of `summary`. The
+   * platform withholds such an element's value on its own, so this is what
+   * distinguishes "there is nothing here" from "the content is not readable".
+   */
+  protected?: boolean;
 }
 
 export interface Outline {

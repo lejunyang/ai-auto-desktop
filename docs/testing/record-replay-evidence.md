@@ -114,9 +114,24 @@ only_if_requested (if)     depends_on=('enter_note',)
 
 结论：顺序倒置可复用现有校验；**引用完整性必须由录制编译器自行校验**（spec §8 已据此改为规范要求），这也是 UI 默认「禁用」而非「删除」的直接理由。
 
-## 8. 脱敏必要性
+## 8. 脱敏必要性与其边界
 
-一次 `max_nodes=120` 的 Notepad 快照中，`document` 节点的 `value` 字段包含了当前打开文件的**全部正文**；窗口标题包含文件名（`favorite.txt - Notepad`）。语义树带出用户数据是正常行为而非边缘情况，这是 spec §5 要求 `value_policy` 默认 `drop`、`title_policy` 默认 `drop`、`screenshots` 默认 `none` 的依据。
+一次 `max_nodes=120` 的 Notepad 快照中，`document` 节点的 `value` 字段包含了当前打开文件的**全部正文**；窗口标题包含文件名（`favorite.txt - Notepad`）。语义树带出用户数据是正常行为而非边缘情况。
+
+**2026-09-03 修订：该测量原本被用来论证 `value_policy` 默认 `drop`、`title_policy` 默认 `drop`，这个推论过宽，已撤销。** 它证明的是「`document` 这类节点信息量很大」，而不是「所有 `value` 都敏感」。
+
+补测把界划清了。一个真实窗口，普通 `TextBox` 与 `UseSystemPasswordChar = true` 的密码框相邻：
+
+| 控件 | `ValuePattern.CurrentValue` | `IsPassword` |
+| --- | --- | --- |
+| 普通输入框 | `"quarterly-report-2026"` | `false` |
+| 密码框 | **无值（`null`）** | `true` |
+
+即**平台自己就不提供密码值**——原规范防的这件事，操作系统已经做了；而丢弃普通值会直接破坏这套工具的用途（判断表单是否填对、检索词是否正确都要读到值）。
+
+写入方向单独验证过，因为自动登录依赖它：`set_value` 成功写入密码框（以窗口标题回显 `len` 与字符校验和验证，写入 19 字符、`len=19 sum=1868` 吻合），随后仍读不回。结论是**可写不可读**，因此不需要任何「解除」机制。附带发现：`type_text` 走 `SendInput`，在本机被输入过滤软件拦下（`applied: true` 但内容未变），填凭据应优先 `set_value`。
+
+现行要求见 spec §5：默认保留 `value` 与标题；`states.protected` 作为标记而非过滤器；只有录制到的凭据外提为 workflow input，且 `.workflow.json` 与 `.recording.json` 两侧都不得留字面量。`screenshots` 默认 `none` 的结论不变——截图绕过语义树，因此绕过平台的这层保护。
 
 ## 9. 复现方式
 

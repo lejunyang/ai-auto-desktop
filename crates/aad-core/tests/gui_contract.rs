@@ -135,6 +135,37 @@ fn the_compiler_accepts_what_the_desktop_shell_exports() {
 }
 
 #[test]
+fn the_compiler_accepts_a_recording_that_externalises_a_password() {
+    // What the exporter emits when a recorded field was protected: the typed
+    // text becomes a required, sensitive input instead of a literal. Verified
+    // against a real password box -- UIA reports `IsPassword` and withholds the
+    // value, so this shape is what a recorded sign-in actually produces.
+    //
+    // Pinned here because the exporter and the compiler are in different
+    // languages: if the compiler rejected this shape, recording a login would
+    // produce a file that looks saved and refuses to run.
+    let mut descriptor = exported_by_the_gui();
+    descriptor["inputs"] = json!({
+        "step_2_secret": {
+            "schema": {"type": "string"},
+            "required": true,
+            "sensitive": true
+        }
+    });
+    descriptor["steps"][5]["with"]["value"] = json!("${{ inputs.step_2_secret }}");
+
+    let compiled = compile(&descriptor)
+        .expect("an externalised credential must still compile");
+
+    let input = compiled
+        .inputs
+        .get("step_2_secret")
+        .expect("the input the action refers to must exist");
+    assert!(input.required, "a missing credential must fail before the run starts");
+    assert!(input.sensitive, "the value must be marked so it is not echoed");
+}
+
+#[test]
 fn an_action_consumes_the_reference_its_find_step_produced() {
     // This is the whole replay mechanism. If an action quoted a saved reference
     // instead, the recording would work in the session that made it and fail

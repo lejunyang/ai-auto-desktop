@@ -197,8 +197,100 @@ describe("compiling to a workflow", () => {
     expect(action.target).toBe(`\${{ steps.${step.id}_element.output.ref }}`);
   });
 
-  it("searches the snapshot it just captured", () => {
+  it("writes ordinary typed text into the file as it was recorded", () => {
+    // Measured against a real desktop: an ordinary edit reports its value
+    // through UIA, and that text is usually the point of the recording. Hiding
+    // it would make a saved workflow unreadable for no gain in safety.
     const recording = new Recording();
+    recording.add(draft({ action: "type_text", argument: "quarterly-report-2026" }));
+
+    const descriptor = recording.toDescriptor();
+    const steps = descriptor.steps as Record<string, unknown>[];
+
+    expect((steps[2].with as Record<string, unknown>).text).toBe("quarterly-report-2026");
+    // Nothing was externalised, so the descriptor keeps its previous shape.
+    expect(descriptor.inputs).toBeUndefined();
+  });
+
+  it("keeps a password out of the file by turning it into an input", () => {
+    // A recording is a file people copy, commit and share, so a credential
+    // typed into a protected field must not be baked into it.
+    const recording = new Recording();
+    const step = recording.add(
+      draft({
+        action: "type_text",
+        argument: "hunter2-real-secret",
+        element: element({ protected: true }),
+      }),
+    );
+
+    const descriptor = recording.toDescriptor();
+    const steps = descriptor.steps as Record<string, unknown>[];
+    const inputs = descriptor.inputs as Record<string, Record<string, unknown>>;
+
+    expect((steps[2].with as Record<string, unknown>).text).toBe(
+      `\${{ inputs.${step.id}_secret }}`,
+    );
+    expect(inputs[`${step.id}_secret`]).toEqual({
+      schema: { type: "string" },
+      required: true,
+      sensitive: true,
+    });
+    // The decisive check: the secret is nowhere in the saved file.
+    expect(JSON.stringify(descriptor)).not.toContain("hunter2-real-secret");
+  });
+
+  it("keeps a password out of the recording file too", () => {
+    // The compiled workflow and the recording sit in the same directory. Taking
+    // the secret out of one and writing it verbatim into the other would leave
+    // it on disk while looking like it had been handled.
+    const recording = new Recording();
+    recording.add(
+      draft({
+        action: "type_text",
+        argument: "hunter2-real-secret",
+        element: element({ protected: true }),
+      }),
+    );
+
+    const document = recording.toDocument();
+
+    expect(JSON.stringify(document)).not.toContain("hunter2-real-secret");
+    const steps = document.steps as Record<string, unknown>[];
+    expect(steps[0].argument).toBeUndefined();
+    expect(steps[0].protected).toBe(true);
+  });
+
+  it("does not ask for text a protected step is not supposed to store", () => {
+    // Its value arrives at run time as an input, so an empty argument is the
+    // expected state rather than an unfinished step.
+    const recording = new Recording();
+    recording.add(draft({ action: "type_text", element: element({ protected: true }) }));
+
+    expect(recording.validate()).toEqual([]);
+    expect(recording.canExport).toBe(true);
+  });
+
+  it("gives two recorded passwords separate inputs", () => {    // One shared input would silently type the same credential into both
+    // fields, which is wrong for a sign-in that has a password and a
+    // confirmation, or for two different accounts.
+    const recording = new Recording();
+    const first = recording.add(
+      draft({ action: "type_text", argument: "first", element: element({ protected: true }) }),
+    );
+    const second = recording.add(
+      draft({ action: "set_value", argument: "second", element: element({ protected: true }) }),
+    );
+
+    const descriptor = recording.toDescriptor();
+    const inputs = descriptor.inputs as Record<string, unknown>;
+
+    expect(Object.keys(inputs).sort()).toEqual(
+      [`${first.id}_secret`, `${second.id}_secret`].sort(),
+    );
+  });
+
+  it("searches the snapshot it just captured", () => {    const recording = new Recording();
     const step = recording.add(draft());
 
     const steps = recording.toDescriptor().steps as Record<string, unknown>[];
@@ -342,6 +434,30 @@ describe("saving and reopening", () => {
 
     expect(reopened.name).toBe("my-recording");
     expect(reopened.steps).toEqual(recording.steps);
+  });
+
+  it("still keeps a password out of the file after a round trip", () => {
+    // Found by a failing round-trip assertion: the protected marking was not
+    // being saved, so reopening a recording would start inlining a credential
+    // that had correctly been externalised the first time.
+    const recording = new Recording();
+    const step = recording.add(
+      draft({
+        action: "type_text",
+        argument: "hunter2-real-secret",
+        element: element({ protected: true }),
+      }),
+    );
+
+    const reopened = Recording.fromDocument(recording.toDocument());
+    const descriptor = reopened.toDescriptor("fixed");
+    const steps = descriptor.steps as Record<string, unknown>[];
+
+    expect(reopened.steps[0].protected).toBe(true);
+    expect((steps[2].with as Record<string, unknown>).text).toBe(
+      `\${{ inputs.${step.id}_secret }}`,
+    );
+    expect(JSON.stringify(descriptor)).not.toContain("hunter2-real-secret");
   });
 
   it("produces the same workflow after a round trip", () => {

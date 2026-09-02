@@ -76,31 +76,99 @@
 
 `environment` **不得**包含用户名、主机名、路径、窗口标题或任何环境标识值；只允许影响可回放性的派生事实。
 
-## 5. `redaction`：脱敏是默认行为，不是可选项
+## 5. `redaction`：只保护凭据，不牺牲可判断性
 
-录制天然会碰到敏感数据。实测证据：对 Notepad 做一次
-`max_nodes=120` 的快照，`document` 节点的 `value` 字段直接包含了打开文件的**全部正文**。这不是边缘情况，而是语义树的正常行为。
+> **2026-09-03 修订。** 本节此前要求「录制器必须默认丢弃节点 `value`，只保留
+> `observed.had_value` 布尔」。该要求已被撤销：它既牺牲了必要信息，也建立在一个
+> 关于平台行为的错误前提上。修订依据是对真实 Win32 控件的实测，见 §5.1。
+>
+> 撤销的具体条目：默认 `value_policy: drop`、默认 `title_policy: drop`、
+> 以及「保留字面值须逐条登记进 `disclosed`」。保留的条目：密码类元素的值不得进入
+> 产物且不可解除（§5.2），`type_text` 的凭据必须外提为 input（§7.3）。
 
-因此规范要求：
+录制天然会碰到敏感数据，但「敏感」不等于「所有值」。丢弃普通字段的值会直接破坏这套
+工具的用途：判断表单是否填对、检索词是否正确、状态是否符合预期，都依赖读到那个值。
+一份读不到值的录制，操作者无法复核，AI 也无法判断该不该继续。
 
-- 录制器**必须**默认丢弃节点 `value`，只保留「该节点当时是否有值」这一布尔事实（`observed.had_value`）。要保留字面值必须由操作者对**该步骤**显式解除，并在 `redaction.disclosed` 中逐条登记步骤路径与理由。
-- 任何 `states.protected` 为 true、role 属于密码类、或 driver 报 `DRIVER.PROTECTED_ELEMENT` 的节点，其值**不得**以任何形式进入录制产物，且**不得**可解除。
-- `type_text` 录制的击键内容默认必须替换为 workflow `inputs` 引用（见 §7.3），不得内联字面量。
-- 窗口标题常含文件名与路径，默认必须按 §6 的 `title_policy` 处理，默认 `drop`。
-- `redaction` 必须显式声明 `screenshots: none|bounds_only|full`，默认 `none`。选择 `full` 时必须登记理由。
+### 5.1 实测：平台已经划好了这条界
 
-### 5.1 捕获机制约束
+用一个真实窗口测量，其中一个普通 `TextBox`、一个 `UseSystemPasswordChar = true` 的
+密码框，两者相邻：
+
+| 控件 | UIA `ValuePattern.CurrentValue` | `IsPassword` |
+| --- | --- | --- |
+| 普通输入框 | `"quarterly-report-2026"` | `false` |
+| 密码框 | **无值（`null`）** | `true` |
+
+结论有两点，都与原规范的假设相反：
+
+1. **密码值本来就读不出来。** 不是录制器泄露了它，而是平台在 `ValuePattern` 层面
+   就不提供。原规范花力气防的这件事，操作系统已经做了。
+2. **普通值读得出来，且必须保留。** 原规范用「Notepad 的 `document` 节点 `value`
+   含全部正文」论证要一律丢弃——但那说明的是**该节点**信息量大，不是所有 `value`
+   都敏感。按控件类型区分即可，无须全面丢弃。
+
+因此规范改为：**默认保留 `value`；由 `states.protected` 单独标记不可读的元素。**
+
+**写入不受影响，这是必须保住的能力。** 同一实测确认：`set_value` 能成功写入密码框
+（以窗口标题回显 `len` 与字符校验和验证，写入 19 字符、校验和吻合），随后仍无法读回。
+即「可写不可读」，正是自动登录、自动填充凭据需要的语义。所以：
+
+- 录制器与运行时**不得**因 `protected` 为 true 而拒绝写动作。
+- **不需要**为写入密码设计任何「解除」「授权」「例外登记」机制——读取本就不可能，
+  写入本就允许，再加一道门只会阻断正常用途。
+- 实测补记：`type_text` 走 `SendInput`，在装有输入过滤软件的机器上可能被拦
+  （本机即如此，见 README「已知环境限制」）；填凭据**应当**优先用 `set_value`。
+
+### 5.2 `states.protected`：标记，而不是过滤器
+
+driver **必须**为每个元素报告 `states.protected`（Windows 取
+`IUIAutomationElement::CurrentIsPassword`）。它的作用是**说明**，不是删除：
+
+- 它把「这里没有值」与「这里的值不可读」区分开。缺少该标记时，密码框看起来与一个
+  读取失败的字段完全一样，会让调用方去排查一个不存在的故障。
+- 元素描述（`summary` / outline）**必须**同时以结构化字段与可读标记呈现它，使调用方
+  无须解析散文即可判断。
+- locator **必须**支持按 `states.protected` 匹配。密码框常常没有稳定的 name，
+  「本表单里那个密码框」需要可表达。
+
+任何 `states.protected` 为 true 的元素，其值**不得**进入录制产物；该项**不可**解除。
+这是本节唯一保留的硬性禁止——而它成本极低，因为平台本就不提供该值。
+
+### 5.3 `redaction` 对象
+
+```json
+{
+  "screenshots": "none",
+  "disclosed": []
+}
+```
+
+- `screenshots` **必须**显式声明 `none|bounds_only|full`，默认 `none`。选择 `full`
+  时必须登记理由：截图会连带捕获画面上的任何内容，**这是唯一仍需谨慎的默认项**——
+  它绕过了语义树，因此绕过了 §5.1 的平台保护。
+- `value_policy` 与 `title_policy` **已移除**。默认保留值与标题。窗口标题是定位窗口
+  的主要依据之一（§11.4），默认丢弃会让录制无法回放。
+- `disclosed` 保留但语义收窄：不再用于登记「我要保留普通字面值」（那是默认行为），
+  仅用于登记 `screenshots: full` 之类确有风险的显式选择。
+
+### 5.4 录制产物与编译产物必须同时清理
+
+实测教训（本项目自身）：先只修编译产物，`.workflow.json` 已不含凭据，但
+`.recording.json` 仍把它逐字写在 `argument` 字段里——而两个文件在同一目录。
+从一个文件里取走凭据、又写进它旁边的另一个文件，只是让泄露看起来被处理过。
+
+因此：凭据的外提**必须**同时作用于**可再编辑的录制产物**与**编译出的 workflow**。
+录制产物中该步骤的字面量字段必须缺省，`protected` 标记必须随产物持久化——否则
+重新打开一份录制后，编译器会因为不知道该字段是凭据而重新内联它。
+
+### 5.5 捕获机制约束
 
 录制器**不得**安装全局输入钩子（`SetWindowsHookExW`/`WH_KEYBOARD_LL`、`CGEventTap`、X11 `XRecord`）。这类机制会捕获系统内所有按键，包括在与录制目标无关的应用中输入的凭据，等同于系统级键盘记录器。
 
 录制**必须**仅依赖可访问性事件（UIA `AddFocusChangedEventHandler`/`AddPropertyChangedEventHandler`/`AddStructureChangedEventHandler`、AX `AXObserver`、AT-SPI listener）。实测确认这足以合成 locator：未安装任何键盘钩子的情况下，UIA focus 事件已提供完整元素身份（`role`、`name`、`class_name`、`automation_id`、`process_id`）。
 
-由此产生的能力边界必须诚实声明，且**必须区分「观察不到」与「刻意不记录」**：
-
-- **观察不到**：逐键还原按键序列（哪个键、何顺序、何时序）是不可能的，这是放弃钩子的必然代价。
-- **刻意不记录**：但元素**值的变化是可观察的**。实测在输入确实送达控件时会收到 `UIA_Text_TextChangedEventId`(20015) 与 `UIA_ValueValuePropertyId`(30045) 属性变更；录制器**能**读到新值，但**必须**按 §7.4 丢弃它。不得把脱敏决策描述成能力缺失。
-
-文本按 §7.3 外提为 workflow input；需要精确按键序列时由操作者在 UI 中显式添加步骤，不得通过钩子隐式采集。
+由此产生的能力边界必须诚实声明：逐键还原按键序列（哪个键、何顺序、何时序）是不可能的，这是放弃钩子的必然代价。元素**值的变化是可观察的**——实测在输入确实送达控件时会收到 `UIA_Text_TextChangedEventId`(20015) 与 `UIA_ValueValuePropertyId`(30045) 属性变更。普通字段的新值按 §5.1 予以保留；密码框不会产生可读的新值（§5.1 实测）。
 
 **事件投递方式取决于 COM 套间，实现必须显式声明并匹配。** UIA 事件经 COM 回调投递，而回调如何到达取决于订阅线程所在套间，实测两者行为不同：
 
@@ -109,24 +177,14 @@
 | STA（`COINIT_APARTMENTTHREADED`） | **需要**。只 `sleep` 不 dispatch 则回调永不到达 | 订阅线程本身 |
 | MTA（`COINIT_MULTITHREADED`） | **不需要**。仅 `sleep` 也能收到 | COM 的 RPC 工作线程 |
 
-现有 Windows driver 在 import comtypes 之前设置 `sys.coinit_flags = 0`，即运行在 MTA，因此捕获实现**不得**依赖消息泵，而**必须**假定回调在任意 RPC 线程上并发到达：所有跨线程状态**必须**加锁，事件缓冲区**必须**是线程安全的。
+UIA 要求 MTA（Rust 实现实测：在窗口框架所需的 STA 上构造 driver 会得到
+`RPC_E_CHANGED_MODE`，故 driver 运行在独立的 MTA 线程上）。因此捕获实现**不得**依赖消息泵，而**必须**假定回调在任意 RPC 线程上并发到达：所有跨线程状态**必须**加锁，事件缓冲区**必须**是线程安全的。
 
 若某平台实现选择 STA，则**必须**在该线程内运行消息泵，且**不得**以 `sleep` 等待事件——实测缺少消息泵会产生「全部交互 0 事件」的假象，与「用户未操作」在观测上完全无法区分，属于高危假阴性。
 
 **已知盲区必须显式提示，不得静默丢弃。** 实测两类交互不产生任何可访问性事件：（a）点击不可聚焦元素（如原生 `STATIC` 标签）——该元素本身不响应点击；（b）纯 hover 与鼠标移动。命中盲区时录制 UI **必须**告知操作者该位置无可记录交互，**不得**静默忽略，也**不得**退化为坐标点击（§7.1 已禁止坐标进入录制）。
 
-```json
-{
-  "value_policy": "drop",
-  "title_policy": "drop",
-  "screenshots": "none",
-  "disclosed": [
-    {"step": "type_search_term", "field": "text", "reason": "非敏感的固定检索词"}
-  ]
-}
-```
-
-编译期必须校验：`disclosed` 中出现的字段确实存在，且未触碰不可解除类别；否则 `RECORDING.REDACTION_INVALID`。
+编译期必须校验：`disclosed` 中出现的字段确实存在，且未触碰 §5.2 的不可解除类别；否则 `RECORDING.REDACTION_INVALID`。
 
 ## 6. `platform_binding`：录制产物绑定单一平台
 
@@ -165,14 +223,14 @@
   "id": "click_save",
   "kind": "interaction",
   "action": "invoke",
-  "window": {"role": "window", "name_policy": "drop", "class_name": "Notepad"},
+  "window": {"role": "window", "name": "notes.txt - Notepad", "class_name": "Notepad"},
   "locator": {"role": "button", "name": "保存", "class_name": ""},
   "disambiguation": {"strategy": "unique", "verified": true},
   "observed": {
     "role": "button",
-    "had_value": false,
+    "value": null,
     "actions": ["pointer_click", "invoke"],
-    "states": {"enabled": true, "offscreen": false, "focusable": false},
+    "states": {"enabled": true, "offscreen": false, "focusable": false, "protected": false},
     "bounds": {"x": 1113, "y": 176, "width": 47, "height": 28},
     "ancestry": [{"role": "window", "class_name": "Notepad"}],
     "sibling_ordinal": 0,
@@ -212,7 +270,12 @@
 
 ### 7.3 `type_text` 与敏感输入
 
-录制到的文本默认必须外提为 workflow input：
+**2026-09-03 修订。** 此前要求「录制到的文本默认必须外提为 workflow input，录制器不得默认产出 `literal`」。现按 §5 收窄：
+
+- 普通字段录制到的文本**应当**保留为 `literal`。它通常就是录制的目的，外提成 input 会让一份录制无法直接回放，也无法复核录到了什么。
+- **`states.protected` 为 true 的字段，其文本必须外提**，且必须标 `sensitive: true`、`required: true`。凭据不得进入产物（§5.2、§5.4）。
+
+外提后的形态：
 
 ```json
 {
@@ -225,7 +288,9 @@
 }
 ```
 
-`text.source` 为 `input` 时编译为 `${{ inputs.name }}`；为 `literal` 时必须在 `redaction.disclosed` 中登记。录制器**不得**默认产出 `literal`。
+`text.source` 为 `input` 时编译为 `${{ inputs.<name> }}`；为 `literal` 时直接内联。`literal` **不再**需要登记进 `redaction.disclosed`——普通字面量是默认且预期的形态。
+
+输入名**应当**由步骤 id 派生（实现取 `<step_id>_secret`），使同一份录制里的两个凭据不会共用一个 input：登录密码与确认密码共用会静默填入同一个值。
 
 ### 7.4 `assertion`：回放判定的唯一合法形式
 
