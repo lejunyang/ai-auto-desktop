@@ -82,6 +82,10 @@ steps:
 十种步骤。核心对象拒绝未知字段，步骤 ID 在分支、错误处理器和清理步骤中全局唯一。编译是
 fail-closed 的，并且会一次性收集**全部**问题而不是遇到第一个就返回。
 
+其中 `script` 步骤**默认不执行**，需要显式 `aad run <file> --allow-scripts`，否则以
+`SCRIPT.SANDBOX_DENIED`（`effect=not_applied`）拒绝。理由是它以本进程权限运行描述文件里
+的任意代码——「有人让你跑这个文件」不应该等于「有人决定信任这段代码」。
+
 `${{ ... }}` 是只读、确定性、无副作用的表达式，只能访问 `inputs`、`vars`、`steps`、当前控制流
 绑定和错误处理器绑定，**禁止一切函数与方法调用**，也不能访问文件、网络、环境变量、时钟或
 随机源。整串单模板保留结果类型，嵌在文本中的表达式转为字符串。
@@ -123,12 +127,35 @@ aad resume job-1 workflow.yaml --store runs.sqlite3
 aad mcp
 ```
 
-在 stdio 上说 JSON-RPC 2.0，protocolVersion `2024-11-05`。提供 9 个工具：
-`list_apps`、`describe_window`、`find_element`、`focus`、`invoke`、`set_value`、`type_text`、
-`pointer_click`、`probe_environment`。
+在 stdio 上说 JSON-RPC 2.0，protocolVersion `2024-11-05`。提供 12 个工具，分两类：
+
+**看与做**（临场操作）：`list_apps`、`describe_window`、`find_element`、`focus`、`invoke`、
+`set_value`、`type_text`、`pointer_click`、`probe_environment`。
+
+**跑存好的流程**（重复劳动）：`list_workflows`、`describe_workflow`、`run_workflow`。
+录一次、存进 store，之后 AI 按名字跑，比每次重新拼一遍点击序列可靠得多。
+
+```
+list_workflows              → {"count":1,"workflows":[{"name":"greeter"}],"directory":"..."}
+describe_workflow(greeter)  → 步骤数、声明的 inputs/outputs、planDigest、runnable
+run_workflow(greeter, ...)  → {"status":"succeeded","outputs":{...}}
+```
+
+几个刻意的边界：
+
+- **工作流只能按名字从 store 取**，不接受 AI 内联提交描述文件——否则 AI 就能自己编一份
+  工作流让本机执行，等于绕过整套「先观察后行动」的约束。
+- **含 `script` 的工作流按名拒绝**（`MCP.SCRIPTS_REFUSED`），并指明「要跑请人来跑：
+  `aad run <file> --allow-scripts`」。AI 决定运行某个流程，不等于有人决定信任其中的代码。
+- `describe_workflow` 会回报 `runnable`，所以这条限制**从只读调用就能发现**，不必靠一次
+  被拒的运行去踩。
+- `list_workflows` / `describe_workflow` **不需要桌面可用**：它们读的是文件夹。桌面坏了
+  也能回答「有哪些流程」，而真正要动桌面的工具才报 `DRIVER.UNAVAILABLE`。
+- store 与 GUI 共用同一个目录（`AAD_RECORDINGS_DIR` 可覆盖），GUI 里录完存下的东西
+  AI 立刻能看到。
 
 该模式下 stdout 由协议独占，任何诊断信息都走 stderr，客户端解析不会错位。失败会以结构化
-错误返回，并附带可执行的恢复建议（例如界面已变化时提示“重新读取窗口后重试”）。
+错误返回，并附带可执行的恢复建议（例如界面已变化时提示"重新读取窗口后重试"）。
 
 ## 桌面窗口（GUI）
 

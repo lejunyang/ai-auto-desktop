@@ -9,6 +9,7 @@ pub mod durable_exec;
 pub mod engine;
 pub mod journal;
 pub mod provider;
+pub mod recordings;
 pub mod script;
 pub mod template;
 

@@ -34,6 +34,7 @@ name = "aad-gui"
 version = "0.1.0"
 dependencies = [
  "aad-probe",
+ "aad-runtime",
  "aad-uia",
  "serde",
  "serde_json",

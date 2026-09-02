@@ -86,7 +86,11 @@ impl Server {
             "Desktop automation for Windows. Discover applications with list_apps, \
 inspect a window with describe_window, resolve an element with find_element, \
 then act using the target it returns. Targets prove the element was actually \
-observed; if the UI changes, re-observe rather than reusing an old target.",
+observed; if the UI changes, re-observe rather than reusing an old target.\n\n\
+For work that has been recorded before, prefer a saved workflow: list_workflows \
+shows what exists, describe_workflow reports the inputs it takes without running \
+it, and run_workflow runs it. That is more reliable than rebuilding the same \
+sequence of clicks each time.",
         );
         if let Some(reason) = &self.unavailable {
             instructions.push_str(&format!(
@@ -118,9 +122,20 @@ Call probe_environment for details."
 
         let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
 
-        // `probe_environment` deliberately works without a driver.
-        if name == "probe_environment" {
-            return Ok(content(&aad_probe::probe().to_json(), false));
+        // Some tools deliberately work without a driver: `probe_environment`
+        // exists to explain why the desktop is unavailable, and the workflow
+        // tools read the saved store, so listing or inspecting a workflow must
+        // not depend on the desktop being reachable.
+        const NO_DRIVER_NEEDED: &[&str] = &[
+            "probe_environment",
+            "list_workflows",
+            "describe_workflow",
+        ];
+        if NO_DRIVER_NEEDED.contains(&name) {
+            return Ok(match tools::call_without_driver(name, &arguments) {
+                Ok(result) => content(&result, false),
+                Err(payload) => content(&parse_payload(&payload), true),
+            });
         }
 
         let Some(driver) = self.driver.as_ref() else {
@@ -140,11 +155,23 @@ Call probe_environment for details."
         // agent should be able to read it and retry.
         match tools::call(driver, name, &arguments) {
             Ok(result) => Ok(content(&result, false)),
-            Err(payload) => {
-                let value = serde_json::from_str(&payload)
-                    .unwrap_or_else(|_| json!({"message": payload}));
-                Ok(content(&value, true))
-            }
+            Err(payload) => Ok(content(&parse_payload(&payload), true)),
+        }
+    }
+}
+
+/// Recover the structured error a tool returned, falling back to its text.
+fn parse_payload(payload: &str) -> Value {
+    serde_json::from_str(payload).unwrap_or_else(|_| json!({"message": payload}))
+}
+
+#[cfg(test)]
+impl Server {
+    /// A server with no driver, as on a machine where automation cannot run.
+    fn without_driver(reason: &str) -> Self {
+        Self {
+            driver: None,
+            unavailable: Some(reason.to_string()),
         }
     }
 }
@@ -231,6 +258,21 @@ mod tests {
     }
 
     #[test]
+    fn initialize_points_at_saved_workflows_as_the_better_path() {
+        // A capability an agent is never told about may as well not exist: it
+        // would rebuild the same click sequence from scratch every time.
+        let response = server().handle(&request("initialize", json!({}))).unwrap();
+        let instructions = response["result"]["instructions"].as_str().unwrap();
+
+        for expected in ["list_workflows", "describe_workflow", "run_workflow"] {
+            assert!(
+                instructions.contains(expected),
+                "{expected} must be discoverable from initialize: {instructions}"
+            );
+        }
+    }
+
+    #[test]
     fn tools_list_returns_the_full_catalogue() {
         let response = server().handle(&request("tools/list", json!({}))).unwrap();
         let tools = response["result"]["tools"].as_array().unwrap();
@@ -239,6 +281,63 @@ mod tests {
         let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
         assert!(names.contains(&"list_apps"));
         assert!(names.contains(&"invoke"));
+    }
+
+    /// Read the JSON a tool call returned, plus whether it was flagged an error.
+    fn tool_payload(response: &Value) -> (bool, Value) {
+        let result = &response["result"];
+        let text = result["content"][0]["text"].as_str().unwrap_or_default();
+        let payload = serde_json::from_str(text).unwrap_or_else(|_| json!({"raw": text}));
+        (result["isError"].as_bool().unwrap_or(false), payload)
+    }
+
+    #[test]
+    fn the_workflow_tools_answer_even_when_the_desktop_is_unavailable() {
+        // Listing and inspecting saved workflows reads a folder, so it must not
+        // be gated behind a working desktop. An agent on a machine where
+        // automation is broken should still be able to see what exists and
+        // explain the situation, rather than getting DRIVER.UNAVAILABLE for a
+        // question that never needed the driver.
+        let server = Server::without_driver("no UI automation in this session");
+
+        let response = server
+            .handle(&request(
+                "tools/call",
+                json!({"name": "list_workflows", "arguments": {}}),
+            ))
+            .unwrap();
+        let (is_error, payload) = tool_payload(&response);
+
+        assert!(!is_error, "listing needs no driver: {payload}");
+        assert_eq!(payload["kind"], "WorkflowList");
+        assert!(payload["directory"].as_str().is_some());
+    }
+
+    #[test]
+    fn acting_on_the_desktop_without_a_driver_says_so_rather_than_failing_quietly() {
+        // The contrast that makes the test above meaningful: a tool that really
+        // does need the desktop must report the missing driver, and point at the
+        // probe that explains why.
+        let server = Server::without_driver("no UI automation in this session");
+
+        let response = server
+            .handle(&request(
+                "tools/call",
+                json!({"name": "list_apps", "arguments": {}}),
+            ))
+            .unwrap();
+        let (is_error, payload) = tool_payload(&response);
+
+        assert!(is_error);
+        assert_eq!(payload["code"], "DRIVER.UNAVAILABLE");
+        assert!(payload["message"]
+            .as_str()
+            .unwrap()
+            .contains("no UI automation"));
+        assert!(payload["hint"]
+            .as_str()
+            .unwrap()
+            .contains("probe_environment"));
     }
 
     #[test]

@@ -13,6 +13,9 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 aad-uia = { path = "../../crates/aad-uia" }
 aad-probe = { path = "../../crates/aad-probe" }
+# The recordings store lives here so that the GUI, the CLI and the MCP server
+# all read and write the same folder rather than each having its own idea of it.
+aad-runtime = { path = "../../crates/aad-runtime" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tauri = { version = "2", features = [] }

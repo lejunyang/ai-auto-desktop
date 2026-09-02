@@ -170,12 +170,36 @@ COM 套间，现有 driver 在 MTA，故须假定回调在任意 RPC 线程并�
 Windows 的受保护 ACL + 单实例 + 双向 PID 校验 named pipe，以及环境变量
 `AAD_ARTIFACT_CHANNEL_FD` / `AAD_ARTIFACT_PIPE_NAME` / `AAD_ARTIFACT_HOST_PID`。
 
-### 2.6 MCP 无法回放工作流
+### 2.6 MCP 回放工作流（已完成）
 
-**核实方式**：`aad tools` 输出 9 个工具，无 `run_workflow`；
-在 `crates/aad-mcp` 检索 `aad_runtime|run_workflow|validate`，**零匹配**。
+**核实方式**：用真实 `aad mcp` 子进程跑一次 stdio 会话（脚本见提交说明），
+`tools/list` 返回 12 个工具；`list_workflows` → `count=1`；`describe_workflow` →
+`stepCount`/`inputs`/`planDigest`/`runnable`；`run_workflow(who=agent)` →
+`status=succeeded`、`outputs={"greeting":"agent"}`。
 
-AI 目前能一步步观察和操作，但不能执行一个存好的录制或工作流。这是 CLI 与 MCP 之间的能力落差。
+新增三个工具：`list_workflows`、`describe_workflow`、`run_workflow`。AI 现在能跑存好的
+工作流，而不只是一步步临场操作。
+
+刻意的边界（都有测试）：
+
+- **只按名字从 store 取**，不接受内联描述文件。否则 AI 可以自己编一份工作流让本机执行，
+  等于绕过「引用真实观察过的元素」这条主线约束。
+- **含 `script` 的工作流按名拒绝**（`MCP.SCRIPTS_REFUSED`，`effect=not_applied`），
+  并在 hint 里指明由人执行的方式。
+- `describe_workflow` 回报 `runnable`，使该限制可从只读调用发现。
+- `list_workflows` / `describe_workflow` **不需要 driver**（读文件夹即可），
+  真正要动桌面的工具才报 `DRIVER.UNAVAILABLE`。有一对正反测试锁定这条分界。
+- `initialize` 的 instructions 明确引导到这三个工具——**这是跑真机会话才发现的缺口**：
+  单测全绿但 instructions 完全没提它们，AI 可能永远不会用到。
+
+配套改动：recordings store 从 `gui/src-tauri`（它本来零 Tauri 依赖）移到
+`crates/aad-runtime/src/recordings.rs`，GUI / CLI / MCP 共用同一目录，避免各有一套路径逻辑。
+新增 `list_workflows()` 与既有 `list_recordings()` 分工：前者列可运行的编译产物，
+后者列可重新编辑的源——把二者混同会给调用方它跑不了的东西，或藏起它能跑的东西。
+新增 `workflow_path()` 复用同一套 `validate_name`，使「按名查找」与「按名保存」不可能漂移。
+
+仍缺：`run_workflow` 走内存 `aad_runtime::run`，未接 `DurableExecutor`——AI 跑长流程时
+进程中断即丢失，接上后才能用 `status` / `resume` 跟进。是否要做未定。
 
 ### 2.7 其他平台 driver
 

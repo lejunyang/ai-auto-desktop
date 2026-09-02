@@ -105,6 +105,16 @@ pub fn save_workflow(name: &str, descriptor: &Value) -> Result<PathBuf> {
     write_document(name, WORKFLOW_SUFFIX, descriptor)
 }
 
+/// Where the runnable workflow called `name` lives.
+///
+/// Goes through the same validation as saving, so a name that could escape the
+/// store is refused here too and a caller cannot reach a file that `save_workflow`
+/// would never have written.
+pub fn workflow_path(name: &str) -> Result<PathBuf> {
+    let name = validate_name(name)?;
+    Ok(recordings_dir().join(format!("{name}{WORKFLOW_SUFFIX}")))
+}
+
 fn write_document(name: &str, suffix: &str, document: &Value) -> Result<PathBuf> {
     let name = validate_name(name)?;
     let directory = recordings_dir();
@@ -199,7 +209,24 @@ pub struct SavedRecording {
 /// List the saved recordings, most recently changed first.
 ///
 /// A missing store is an empty list, not an error: nothing has been saved yet.
+/// Only the editable sources are listed; compiled workflows are outputs, and
+/// reopening one would not restore an editable session. To list what can be
+/// *run*, use [`list_workflows`].
 pub fn list_recordings() -> Result<Vec<SavedRecording>> {
+    list_by_suffix(RECORDING_SUFFIX)
+}
+
+/// List the saved workflows, most recently changed first.
+///
+/// Distinct from [`list_recordings`] on purpose. That lists the editable sources
+/// the desktop app reopens; this lists the compiled workflows that can actually
+/// be run, which is what a caller wanting to *execute* something by name needs.
+/// A recording with no compiled workflow beside it would be a misleading offer.
+pub fn list_workflows() -> Result<Vec<SavedRecording>> {
+    list_by_suffix(WORKFLOW_SUFFIX)
+}
+
+fn list_by_suffix(suffix: &str) -> Result<Vec<SavedRecording>> {
     let directory = recordings_dir();
     let entries = match fs::read_dir(&directory) {
         Ok(entries) => entries,
@@ -218,11 +245,10 @@ pub fn list_recordings() -> Result<Vec<SavedRecording>> {
         let Some(filename) = path.file_name().and_then(|name| name.to_str()) else {
             continue;
         };
-        // Only the editable sources are offered for opening; compiled workflows
-        // are outputs, and reopening one would not restore an editable session.
-        let Some(name) = filename.strip_suffix(RECORDING_SUFFIX) else {
+        let Some(name) = filename.strip_suffix(suffix) else {
             continue;
         };
+        // A leading dot marks an interrupted save's staging file.
         if name.is_empty() || filename.starts_with('.') {
             continue;
         }
@@ -446,5 +472,73 @@ mod tests {
 
         assert_ne!(recording_path, workflow_path);
         assert_eq!(load_recording(&recording_path).unwrap()["kind"], "Recording");
+    }
+
+    #[test]
+    fn workflow_path_agrees_with_where_saving_puts_the_file() {
+        // Two ways of naming the same file. If they ever disagree, a caller
+        // looking a workflow up by name would miss one that was really saved.
+        let _sandbox = Sandbox::new("path-agrees");
+
+        let saved = save_workflow("checkout", &json!({"kind": "Workflow"})).unwrap();
+        let looked_up = workflow_path("checkout").unwrap();
+
+        assert_eq!(saved, looked_up);
+        assert!(looked_up.exists());
+    }
+
+    #[test]
+    fn a_workflow_name_that_would_escape_the_store_is_refused() {
+        // The name reaches this through a tool call, so it is untrusted input
+        // that becomes a path. It must be refused rather than resolved.
+        let _sandbox = Sandbox::new("path-escape");
+
+        for name in ["../outside", "..\\outside", "nested/name", "nested\\name", "..", ""] {
+            let refused = workflow_path(name);
+            assert!(
+                refused.is_err(),
+                "{name:?} must not resolve to a path"
+            );
+            assert_eq!(refused.unwrap_err().code, "STORE.NAME_INVALID");
+        }
+    }
+
+    #[test]
+    fn listing_workflows_and_listing_recordings_answer_different_questions() {
+        // A recording is editable source; a workflow is what can be run. Mixing
+        // them would offer a caller something it cannot execute, or hide
+        // something it can.
+        let _sandbox = Sandbox::new("two-listings");
+
+        save_recording("draft", &recording("draft")).unwrap();
+        save_workflow("runnable", &json!({"kind": "Workflow"})).unwrap();
+
+        let recordings: Vec<String> =
+            list_recordings().unwrap().into_iter().map(|item| item.name).collect();
+        let workflows: Vec<String> =
+            list_workflows().unwrap().into_iter().map(|item| item.name).collect();
+
+        assert_eq!(recordings, vec!["draft".to_string()]);
+        assert_eq!(workflows, vec!["runnable".to_string()]);
+    }
+
+    #[test]
+    fn an_interrupted_workflow_save_is_not_offered_as_runnable() {
+        // Staging files start with a dot. Listing one would hand out a path to
+        // a half-written file.
+        let _sandbox = Sandbox::new("partial-workflow");
+
+        save_workflow("real", &json!({"kind": "Workflow"})).unwrap();
+        fs::write(
+            recordings_dir().join(format!(".ghost{WORKFLOW_SUFFIX}.partial")),
+            b"{",
+        )
+        .unwrap();
+        fs::write(recordings_dir().join(format!(".ghost{WORKFLOW_SUFFIX}")), b"{").unwrap();
+
+        let names: Vec<String> =
+            list_workflows().unwrap().into_iter().map(|item| item.name).collect();
+
+        assert_eq!(names, vec!["real".to_string()]);
     }
 }

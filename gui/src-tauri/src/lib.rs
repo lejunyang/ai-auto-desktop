@@ -22,7 +22,7 @@ use aad_uia::backend::{default_snapshot_directory, DriverError, SnapshotStore};
 use aad_uia::driver::UiaDriver;
 use serde_json::{json, Map, Value};
 
-pub mod recordings;
+pub use aad_runtime::recordings;
 
 /// One driver action and the channel its answer goes back on.
 struct Job {
