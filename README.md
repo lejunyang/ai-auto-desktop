@@ -90,6 +90,43 @@ fail-closed 的，并且会一次性收集**全部**问题而不是遇到第一�
 绑定和错误处理器绑定，**禁止一切函数与方法调用**，也不能访问文件、网络、环境变量、时钟或
 随机源。整串单模板保留结果类型，嵌在文本中的表达式转为字符串。
 
+## 确认动作真的生效了
+
+派发成功不等于生效。点击落在了空处、表单静默拒绝了输入、对话框始终没弹出——这些在自动化里
+都会报"成功"。给步骤加 `postcondition` 就能让运行时**重新去看一眼**：
+
+```yaml
+steps:
+  - id: fill
+    type: action
+    uses: desktop.windows_uia.set_value@1
+    with:
+      target: ${{ steps.locate.output.target }}
+      value: hello
+    postcondition:
+      condition: ${{ observation.node.value == 'hello' }}
+      observe:                      # 重新读一次，而不是复述已记下的输出
+        uses: desktop.windows_uia.find@1
+        with:
+          window: {title: Notepad}
+          locator: {name: SearchBox}
+      timeout: 3s                   # 界面异步，给它时间
+      poll_interval: 200ms
+      message: 值没有写进去
+```
+
+几点值得说明：
+
+- **`observe` 每轮都真的派发。** 重读已经存下来的 action 输出只会确认已经记下的东西，而那
+  正是被怀疑的对象。观察结果绑定到 `observation` 供条件读取。
+- **不写 `timeout` 就只判一次。** 桌面 UI 是异步的，轮询才让断言可用；但没要求等待却偷偷
+  等，会把一次快速失败变成慢速失败。
+- **观察动作必须是只读的**，否则 `POLICY.DENIED`。会改变被检查对象的断言什么也证明不了。
+- **失败报 `effect=unknown`**，并在 `last_observation` 里附上当时**实际**看到的内容。动作
+  本身成功了、只是预期结果没出现，桌面到底变没变确实不知道；往任何一个方向断言都是猜。
+
+对通过 MCP 使用的 AI 来说这一条尤其要紧：它看不见屏幕，只能拿到那个状态字。
+
 ## 持久化运行（可暂停、可恢复、进程崩溃也不丢）
 
 `aad run` 跑在内存里，进程退出即结束。需要一个能跨进程存活的运行时，用 `aad start`：
@@ -235,8 +272,8 @@ src/            Python 原型（保留备查，不再演进）
 ## 测试
 
 ```powershell
-cargo test --workspace     # 334 个测试
-cd gui; npm run test       # 18 个测试
+cargo test --workspace     # 495 个测试
+cd gui; npm run test       # 47 个测试
 ```
 
 ## Python 原型

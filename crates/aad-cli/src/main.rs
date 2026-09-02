@@ -199,6 +199,18 @@ struct FindArgs {
     /// Match names and ids by substring instead of exactly.
     #[arg(long)]
     contains: bool,
+    /// Match only password fields, or only non-password ones.
+
+    ///
+
+    /// Password fields often carry no stable name, so this is frequently the
+
+    /// only way to address one.
+
+    #[arg(long)]
+
+    protected: Option<bool>,
+
 }
 
 #[derive(Subcommand)]
@@ -376,6 +388,18 @@ fn dispatch(command: &Command) -> (Value, u8) {
             if let Some(id) = &args.automation_id {
                 locator.insert("automation_id".into(), json!(id));
             }
+            if let Some(protected) = args.protected {
+
+                locator.insert(
+
+                    "states".into(),
+
+                    json!({"protected": protected}),
+
+                );
+
+            }
+
             if args.contains {
                 locator.insert("match".into(), json!("contains"));
             }
@@ -383,7 +407,7 @@ fn dispatch(command: &Command) -> (Value, u8) {
                 return (
                     failure(
                         "CLI.INVALID_ARGUMENTS",
-                        "give at least one of --role, --name or --automation-id",
+                        "give at least one of --role, --name, --automation-id or --protected",
                         None,
                     ),
                     EXIT_USAGE,
@@ -1055,10 +1079,30 @@ mod tests {
             name: None,
             automation_id: None,
             contains: false,
+            protected: None,
         }));
 
         assert_eq!(code, EXIT_USAGE);
         assert_eq!(payload["error"]["code"], "CLI.INVALID_ARGUMENTS");
+    }
+
+    #[test]
+    fn matching_a_password_field_alone_is_enough_to_search() {
+        // A password box often exposes no name and no automation id, so
+        // `--protected` has to count as a criterion in its own right. Reaching
+        // the driver is proof enough here: in a test environment the driver is
+        // what fails, not argument validation.
+        let (payload, code) = dispatch(&Command::Find(FindArgs {
+            window_id: "hwnd:1".into(),
+            role: None,
+            name: None,
+            automation_id: None,
+            contains: false,
+            protected: Some(true),
+        }));
+
+        assert_ne!(code, EXIT_USAGE, "protected alone must be a valid criterion");
+        assert_ne!(payload["error"]["code"], "CLI.INVALID_ARGUMENTS");
     }
 
     #[test]

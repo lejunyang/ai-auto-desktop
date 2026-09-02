@@ -58,7 +58,11 @@ fields narrows the result. Matching is exact unless `match` is \"contains\".",
                     "offscreen": {"type": "boolean"},
                     "focusable": {"type": "boolean"},
                     "focused": {"type": "boolean"},
-                    "read_only": {"type": "boolean"}
+                    "read_only": {"type": "boolean"},
+                    "protected": {
+                        "type": "boolean",
+                        "description": "True for password fields. Their value cannot be read back, so this is how to identify one."
+                    }
                 },
                 "additionalProperties": false
             },
@@ -624,6 +628,18 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn a_password_field_can_be_addressed_through_the_schema() {
+        // The driver can match on `protected`, but an agent can only use what
+        // the schema admits: `additionalProperties: false` means an unlisted
+        // field is rejected rather than ignored. Password fields frequently have
+        // no stable name, so without this they cannot be addressed at all.
+        let tool = find("find_element").unwrap();
+        let states = &tool.schema["properties"]["locator"]["properties"]["states"];
+        assert_eq!(states["properties"]["protected"]["type"], json!("boolean"));
+        assert_eq!(states["additionalProperties"], json!(false));
     }
 
     #[test]

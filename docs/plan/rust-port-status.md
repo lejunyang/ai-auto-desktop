@@ -146,8 +146,9 @@ Python 另有 `edit`（属 §2.4 的浏览器编辑器，已由 GUI 取代，不
   规范原本要求的「默认丢弃所有 `value`」「`title_policy: drop`」**已撤销**——实测表明
   平台自己就不给密码值，而丢弃普通值会破坏可判断性。仍未实现：`screenshots` 策略声明
   （当前根本不截图，等真要截图时再做）、`disclosed` 登记。
-- `assertion` 步骤：`of_step` + `observe`(仅 `find`/`snapshot`) + `expect.mode`，
-  且**不得**编译为独立步骤，必须附加为 `postcondition`。
+- `assertion` 步骤：录制侧的 `of_step` + `expect.mode` 语法仍未实现，但它**依赖的执行机制
+  已经具备**——`postcondition` 现在会真正重新观察并轮询（见 §2.10），所以剩下的只是把录制
+  的断言语法编译成 `postcondition`，而不再需要动引擎。
 - `logic` 步骤：人工插入的 `condition`/`loop`/`assign`/`group`/`fail`/`return`/`script`。
 - `disambiguation.strategy` 降级链：`unique` → `scoped` → `ordinal`(必须 `fragile: true`)
   → `unresolved`(必须 `enabled:false`)；已 verified 的步骤重新校验后必须能被降级。
@@ -212,7 +213,7 @@ Windows 的受保护 ACL + 单实例 + 双向 PID 校验 named pipe，以及环�
 仍缺：`run_workflow` 走内存 `aad_runtime::run`，未接 `DurableExecutor`——AI 跑长流程时
 进程中断即丢失，接上后才能用 `status` / `resume` 跟进。是否要做未定。
 
-#### 2.6.1 已发现的缺陷：`run_workflow` 未注册桌面 provider（修改已写入，未验证）
+#### 2.6.1 已发现的缺陷：`run_workflow` 未注册桌面 provider（已修复并验证，提交 0920057）
 
 准备接持久化时先查了一件事：durable 目前拒绝 `action` 与 `script` 步骤，而录制导出的工作流
 （`gui/src/recording.ts`）**全部是** `action` 步骤（`uses` + `with`）。也就是说接上 durable 后，
@@ -224,7 +225,7 @@ Windows 的受保护 ACL + 单实例 + 双向 PID 校验 named pipe，以及环�
 后果：AI 通过 MCP 跑任何真实录制，都会在第一个 action 步骤上因找不到 provider 而失败，
 而且失败长得像「录制坏了」而不是「调用方接线错了」。
 
-已写入的修改（**尚未编译验证**，当时 shell 不可用）：
+修改内容：
 - `Server.driver` 改为 `Option<Arc<UiaDriver>>`（registry 按引用计数持有 provider）；
 - `tools::call` 与 `run_workflow` 接收 `&Arc<UiaDriver>`，`run_workflow` 内注册
   `providers.insert(driver.clone())`，与 CLI 构造同一套 registry；
@@ -233,8 +234,9 @@ Windows 的受保护 ACL + 单实例 + 双向 PID 校验 named pipe，以及环�
   `a_recorded_workflow_reaches_the_desktop_provider`——用 **action 步骤**而非纯计算步骤断言，
   因为纯步骤根本不碰 provider，用它做断言会漏掉这个 bug。
 
-**待验证**：`cargo test -p aad-mcp`、`cargo test --workspace`，以及用
-`E:\tmp\mcp_client.py` 跑一次真机会话（需先 `cargo build -p aad-cli`）。
+**验证结果**：三层都做了。变异验证——去掉 provider 注册后新测试 FAILED，报
+`ACTION.UNKNOWN: no provider offers action "desktop.windows_uia.find@1"`，正是 AI 会撞上的
+那个错；真机 stdio 会话跑 action 步骤工作流得 `status=succeeded`；原有 8 项 MCP 验收全部重跑通过。
 
 ### 2.7 其他平台 driver
 
@@ -252,6 +254,44 @@ Python 浏览器编辑器有、GUI 尚无：插入/编辑 logic 步骤（`/api/l
 Python 有 45 个测试文件。针对未移植能力的部分在 Rust 侧没有对应物，其中较大的有：
 `test_durable_*` 4 个共 106KB、`test_recording_compiler.py`(27KB)、
 `test_macos_ax_driver.py`(84KB)、`test_linux_atspi_driver.py`(115KB)、`test_ocr_plugin.py`(44KB)。
+
+### 2.10 postcondition 真正重新观察（已完成）
+
+**为什么先做这个**：上一步把 `run_workflow` 推给了 AI。如果一个工作流「动作派发了但什么都
+没发生」也报 `succeeded`，AI 会确信任务已完成——它没有眼睛看屏幕，只有这个状态字。
+
+**先量再改**（真机跑 `aad run`，不是读代码）：
+
+| 断言写法 | 改动前实测 | 说明 |
+|---|---|---|
+| `observe` 指向一个不存在的 provider | `status=succeeded` | 说明 `observe` **根本没被派发** |
+| `timeout: 3s` + 永不成立的条件 | 0.02s 就失败 | 说明 `timeout`/`poll_interval` **被忽略** |
+
+编译器一直接受 `observe` / `timeout` / `poll_interval`（`compiler.rs` 的 `assertion()`），
+引擎却只做了一次 `condition` 求值。也就是说这三个字段是**声明了但不生效**的，比不支持更糟：
+写断言的人以为自己有防护。
+
+**改动**：`engine.rs` 的一次性检查换成 `check_postcondition` 轮询循环。
+
+- `observe` 每轮都派发，结果绑定到 `observation` 供条件读取。重读**已存的** action 输出
+  只会确认已经记下来的东西，而那正是被怀疑的对象。
+- 没写 `timeout` 时只求值一次。桌面 UI 是异步的，轮询才让断言可用；但没要求等待却偷偷等，
+  会把快速失败变成慢速失败。
+- 观察 action 必须是 `read_only`（`POLICY.DENIED`）。会改变被检查对象的断言什么也证明不了，
+  而藏在 postcondition 里的写操作还会绕过真实 action 步骤的风险与确认检查。
+- 失败时报 `effect=unknown` 并附 `last_observation`——动作本身成功了，只是预期结果没出现，
+  桌面到底变没变确实不知道，往任何一个方向断言都是猜。
+
+**验证**：改动后同一组真机探针，`observe` 会派发（失败暴露出来）、轮询实际等满 3.05s。
+另做端到端：填一个真实输入框并断言值确实写进去了 → `succeeded`；断言一个没发生的结果 →
+`unknown_effect` + `ACTION.POSTCONDITION_FAILED`，且 `last_observation` 里带着屏幕上**实际**
+的值，不用重跑就能诊断。五个新测试，三个变异验证各自使对应测试失败（4 / 2 / 1 个）。
+
+**顺带补掉的两个缺口**（都是跑真机时才暴露的）：上一阶段加了按 `protected` 匹配 locator，
+但 MCP 的 `find_element` schema 没暴露这个字段，而它是 `additionalProperties: false`——
+AI 传了会被拒绝，等于这个能力对 AI 不存在；`aad find` 同样没有 `--protected`。两处都补了，
+真机确认 `--protected true` 精确命中密码框，`--protected false` 命中 10 个时如实报
+`DRIVER.AMBIGUOUS_MATCH` 而不是猜第一个。
 
 ## 3. 已知环境限制（非缺口，如实记录）
 

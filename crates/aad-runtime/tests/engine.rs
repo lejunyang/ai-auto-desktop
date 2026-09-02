@@ -1154,6 +1154,170 @@ fn a_postcondition_failure_reports_an_unknown_effect() {
     assert_eq!(result.error.unwrap().code, "ACTION.POSTCONDITION_FAILED");
 }
 
+#[test]
+fn a_postcondition_observation_is_dispatched_and_readable() {
+    // The point of `observe`: the condition judges freshly read state, not the
+    // output the action already recorded. Measured against the real binary
+    // before this existed -- an `observe` naming a provider nobody offers still
+    // reported `succeeded`, which means it was never dispatched at all.
+    let provider = Fake::build(
+        "fixture",
+        read_only_actions(&["act", "look"]),
+        Box::new(|action, _, _| {
+            if action == "fixture.look@1" {
+                Ok(json!({"settled": true}))
+            } else {
+                Ok(json!({"dispatched": true}))
+            }
+        }),
+    );
+    let workflow = descriptor(json!({
+        "steps": [{
+            "id": "act", "type": "action", "uses": "fixture.act@1", "with": {},
+            "postcondition": {
+                "condition": "${{ observation.settled }}",
+                "observe": {"uses": "fixture.look@1", "with": {}}
+            }
+        }]
+    }));
+
+    let result = execute(&workflow, registry(vec![provider.clone()]));
+
+    assert_eq!(result.status, RunStatus::Succeeded, "{:?}", result.error);
+    // Two calls: the action, then the observation.
+    assert_eq!(provider.calls(), 2);
+}
+
+#[test]
+fn a_postcondition_polls_until_the_ui_catches_up() {
+    // Desktop UI settles asynchronously: a dialog appears a moment after the
+    // click. Without polling, every such assertion fails on a race and the
+    // feature is unusable for the thing it exists for.
+    let provider = Fake::build(
+        "fixture",
+        read_only_actions(&["act", "look"]),
+        Box::new(|action, _, attempt| {
+            if action == "fixture.look@1" {
+                // Not ready on the first look, ready on the second.
+                Ok(json!({"settled": attempt >= 3}))
+            } else {
+                Ok(json!({"dispatched": true}))
+            }
+        }),
+    );
+    let workflow = descriptor(json!({
+        "steps": [{
+            "id": "act", "type": "action", "uses": "fixture.act@1", "with": {},
+            "postcondition": {
+                "condition": "${{ observation.settled }}",
+                "observe": {"uses": "fixture.look@1", "with": {}},
+                "timeout": "5s",
+                "poll_interval": "10ms"
+            }
+        }]
+    }));
+
+    let result = execute(&workflow, registry(vec![provider.clone()]));
+
+    assert_eq!(result.status, RunStatus::Succeeded, "{:?}", result.error);
+    assert!(
+        provider.calls() >= 3,
+        "the observation must be retried, saw {} call(s)",
+        provider.calls()
+    );
+}
+
+#[test]
+fn a_postcondition_that_never_holds_gives_up_at_its_timeout() {
+    let provider = Fake::build(
+        "fixture",
+        read_only_actions(&["act", "look"]),
+        Box::new(|_, _, _| Ok(json!({"settled": false}))),
+    );
+    let workflow = descriptor(json!({
+        "steps": [{
+            "id": "act", "type": "action", "uses": "fixture.act@1", "with": {},
+            "postcondition": {
+                "condition": "${{ observation.settled }}",
+                "observe": {"uses": "fixture.look@1", "with": {}},
+                "timeout": "300ms",
+                "poll_interval": "10ms",
+                "message": "the dialog never appeared"
+            }
+        }]
+    }));
+
+    let started = std::time::Instant::now();
+    let result = execute(&workflow, registry(vec![provider]));
+    let elapsed = started.elapsed();
+
+    assert_eq!(result.status, RunStatus::UnknownEffect);
+    let error = result.error.expect("a failing postcondition must report");
+    assert_eq!(error.code, "ACTION.POSTCONDITION_FAILED");
+    assert_eq!(error.message, "the dialog never appeared");
+    // What was actually seen, so the failure can be diagnosed without a rerun.
+    assert_eq!(error.details["last_observation"], json!({"settled": false}));
+    assert!(
+        elapsed >= std::time::Duration::from_millis(250),
+        "must wait out its timeout, gave up after {elapsed:?}"
+    );
+}
+
+#[test]
+fn a_postcondition_without_a_timeout_is_judged_once() {
+    // Waiting when no wait was requested would turn a fast, clear failure into
+    // a slow one. Polling has to be opted into.
+    let provider = Fake::echo("fixture", &["act"]);
+    let workflow = descriptor(json!({
+        "steps": [{
+            "id": "act", "type": "action", "uses": "fixture.act@1", "with": {},
+            "postcondition": {"condition": "${{ False }}"}
+        }]
+    }));
+
+    let started = std::time::Instant::now();
+    let result = execute(&workflow, registry(vec![provider]));
+
+    assert_eq!(result.status, RunStatus::UnknownEffect);
+    assert!(
+        started.elapsed() < std::time::Duration::from_millis(200),
+        "must fail immediately without a timeout"
+    );
+}
+
+#[test]
+fn a_postcondition_cannot_observe_with_a_writing_action() {
+    // An assertion that changes what it is checking establishes nothing, and a
+    // write smuggled in here would also skip the risk and confirmation checks
+    // that a real action step goes through.
+    let reader = Fake::echo("fixture", &["act"]);
+    let writer = Fake::build(
+        "writer",
+        actions_with_effect(&["press"], "non_idempotent"),
+        Box::new(|_, _, _| Ok(json!({"pressed": true}))),
+    );
+    let workflow = descriptor(json!({
+        "steps": [{
+            "id": "act", "type": "action", "uses": "fixture.act@1", "with": {},
+            "postcondition": {
+                "condition": "${{ True }}",
+                "observe": {"uses": "writer.press@1", "with": {}}
+            }
+        }]
+    }));
+
+    let result = execute(&workflow, registry(vec![reader, writer.clone()]));
+
+    let error = result.error.expect("a writing observation must be refused");
+    assert_eq!(error.code, "POLICY.DENIED");
+    assert_eq!(error.effect, "not_applied");
+    assert_eq!(
+        writer.calls(),
+        0,
+        "the refusal must happen before the write is dispatched"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Script steps
 // ---------------------------------------------------------------------------

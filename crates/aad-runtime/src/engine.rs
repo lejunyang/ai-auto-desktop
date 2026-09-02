@@ -476,20 +476,7 @@ only if you trust this descriptor."
                 // A postcondition observes the world after the fact; failing it
                 // means the action may well have applied.
                 if let Some(Value::Object(postcondition)) = step.get("postcondition") {
-                    if let Some(condition) = postcondition.get("condition") {
-                        if !template::condition(condition, &self.scope())? {
-                            let message = postcondition
-                                .get("message")
-                                .and_then(Value::as_str)
-                                .unwrap_or("postcondition was not satisfied");
-                            return Err(AutomationError::new(
-                                "ACTION.POSTCONDITION_FAILED",
-                                message,
-                            )
-                            .with_category("action")
-                            .with_effect("unknown"));
-                        }
-                    }
+                    self.check_postcondition(postcondition)?;
                 }
                 Ok(Flow::Next)
             }
@@ -511,6 +498,161 @@ only if you trust this descriptor."
                 Err(error)
             }
         }
+    }
+
+    /// Check an action's postcondition, re-observing the world until it holds.
+    ///
+    /// Without this, "the action was dispatched" and "the action worked" are the
+    /// same answer. A click that landed on nothing, a value that was rejected by
+    /// the form, a dialog that never appeared: all report success. That matters
+    /// most for the MCP caller, which has no eyes on the screen and takes
+    /// `succeeded` at face value.
+    ///
+    /// Two decisions worth stating:
+    ///
+    /// * `observe` is dispatched on every attempt, and its result is bound to
+    ///   `observation` for the condition to read. Re-reading the *stored* output
+    ///   of the action would only ever confirm what was already recorded, which
+    ///   is precisely the thing under suspicion.
+    /// * without a `timeout` the condition is evaluated exactly once. Desktop
+    ///   UI is asynchronous, so polling is what makes an assertion usable at
+    ///   all -- but silently waiting when no wait was asked for would turn a
+    ///   fast failure into a slow one.
+    fn check_postcondition(
+        &mut self,
+        postcondition: &Map<String, Value>,
+    ) -> Result<(), AutomationError> {
+        let Some(condition) = postcondition.get("condition").cloned() else {
+            return Ok(());
+        };
+        let message = postcondition
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("postcondition was not satisfied")
+            .to_string();
+        let observe = postcondition.get("observe").cloned();
+
+        let timeout = postcondition
+            .get("timeout")
+            .and_then(Value::as_str)
+            .and_then(parse_duration)
+            .map(Duration::from_secs_f64);
+        // Matches the Python runtime's default rather than inventing one, so a
+        // descriptor that omits it behaves the same on both.
+        let interval = postcondition
+            .get("poll_interval")
+            .and_then(Value::as_str)
+            .and_then(parse_duration)
+            .map(Duration::from_secs_f64)
+            .unwrap_or_else(|| Duration::from_millis(100));
+
+        // Never poll past the run's own budget.
+        let deadline = timeout.map(|window| {
+            let capped = window.min(self.remaining());
+            Instant::now() + capped
+        });
+
+        let mut last_observation = Value::Null;
+        loop {
+            let scope = match &observe {
+                Some(observe) => {
+                    last_observation = self.observe_for_postcondition(observe)?;
+                    let mut scope = self.scope();
+                    scope.insert("observation".into(), last_observation.clone());
+                    scope
+                }
+                None => self.scope(),
+            };
+
+            if template::condition(&condition, &scope)? {
+                return Ok(());
+            }
+
+            let expired = deadline.is_none_or(|deadline| Instant::now() >= deadline);
+            if expired {
+                let mut error = AutomationError::new("ACTION.POSTCONDITION_FAILED", &message)
+                    .with_category("action")
+                    // The action itself succeeded; only the expected outcome is
+                    // missing. Whether the desktop changed is genuinely unknown,
+                    // and claiming otherwise in either direction would be a guess.
+                    .with_effect("unknown");
+                if observe.is_some() {
+                    error = error.with_detail("last_observation", last_observation);
+                }
+                return Err(error);
+            }
+
+            // Cancellation and budget exhaustion must interrupt a wait, not be
+            // discovered after it.
+            self.check_budget()?;
+            let remaining = deadline
+                .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+                .unwrap_or(interval);
+            std::thread::sleep(interval.min(remaining));
+        }
+    }
+
+    /// Dispatch a postcondition's observation action.
+    ///
+    /// Restricted to read-only actions: an assertion that changes the thing it
+    /// is checking cannot establish anything, and a write hidden in a
+    /// postcondition would also bypass the risk and confirmation checks that
+    /// apply to a real action step.
+    fn observe_for_postcondition(&mut self, observe: &Value) -> Result<Value, AutomationError> {
+        let uses = observe
+            .get("uses")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                AutomationError::new(
+                    "ACTION.POSTCONDITION_INVALID",
+                    "postcondition.observe requires a uses",
+                )
+                .with_category("action")
+                .with_effect("not_applied")
+            })?
+            .to_string();
+
+        let scope = self.scope();
+        let args = match observe.get("with") {
+            Some(value) => template::resolve(value, &scope)?,
+            None => Value::Object(Map::new()),
+        };
+
+        let Some((provider, contract)) = self.providers.resolve(&uses) else {
+            return Err(AutomationError::new(
+                "ACTION.UNKNOWN",
+                format!("no provider offers action {uses:?}"),
+            )
+            .with_category("action")
+            .with_effect("not_applied")
+            .with_detail("uses", Value::String(uses.clone()))
+            .with_detail("available", json!(self.providers.names())));
+        };
+
+        if contract.effect_class.as_deref() != Some("read_only") {
+            return Err(AutomationError::new(
+                "POLICY.DENIED",
+                "postcondition observation must be read-only",
+            )
+            .with_category("policy")
+            .with_effect("not_applied")
+            .with_detail("uses", Value::String(uses.clone()))
+            .with_detail(
+                "effect",
+                contract
+                    .effect_class
+                    .clone()
+                    .map(Value::String)
+                    .unwrap_or(Value::Null),
+            ));
+        }
+
+        let timeout = self.remaining();
+        provider.invoke(&uses, args, Some(timeout)).map_err(|error| {
+            // An observation that failed leaves the caller no worse off: it read
+            // nothing and changed nothing.
+            error.with_effect("not_applied")
+        })
     }
 
     fn record_output(&mut self, step: &CompiledStep, output: Value) {
