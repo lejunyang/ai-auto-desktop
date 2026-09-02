@@ -1216,6 +1216,7 @@ mod tests {
             inputs: None,
             journal: None,
             dry_run: true,
+            allow_scripts: false,
         }));
         let _ = std::fs::remove_file(&path);
 
@@ -1242,6 +1243,7 @@ mod tests {
             inputs: Some(r#"{"who":"agent"}"#.to_string()),
             journal: None,
             dry_run: false,
+            allow_scripts: false,
         }));
         let _ = std::fs::remove_file(&path);
 
@@ -1267,6 +1269,7 @@ mod tests {
                 inputs: Some(bad.to_string()),
                 journal: None,
                 dry_run: false,
+                allow_scripts: false,
             }));
             assert_eq!(code, EXIT_USAGE, "{bad} should be rejected");
             assert_eq!(payload["error"]["code"], "CLI.INVALID_ARGUMENTS");
@@ -1292,6 +1295,7 @@ mod tests {
             inputs: None,
             journal: Some(journal.clone()),
             dry_run: false,
+            allow_scripts: false,
         }));
 
         assert_eq!(code, EXIT_OK);
@@ -1322,6 +1326,7 @@ mod tests {
             inputs: None,
             journal: None,
             dry_run: false,
+            allow_scripts: false,
         }));
         let _ = std::fs::remove_file(&path);
 

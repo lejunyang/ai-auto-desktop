@@ -426,11 +426,25 @@ fn a_pause_requested_partway_stops_at_the_next_boundary_and_keeps_progress() {
         .expect("run until paused or finished");
     let control_result = requested.join().expect("control thread");
 
-    // These steps are fast, so the run may well finish before the request
-    // lands. Both outcomes are correct; what must hold is that the two agree.
+    // These steps are fast, so there are three real interleavings, not two: the
+    // request can land before a boundary, after the run has already committed a
+    // terminal status, or -- the awkward one -- while the run is still `running`
+    // but past its final boundary, where it is accepted and then legitimately
+    // has nothing left to stop. All three are correct outcomes. What must hold
+    // in every one of them is that asking to pause never loses or repeats work.
+    let entered_segments = || -> usize {
+        store
+            .list_events("run-1", 0, 500)
+            .expect("events")
+            .into_iter()
+            .filter(|event| event.event_type == "run.segment_entered")
+            .count()
+    };
+
     match outcome.run.status {
         RunStatus::Paused => {
             assert_eq!(outcome.stopped, Stopped::Paused);
+            assert!(control_result.is_ok(), "the pause is what stopped it");
             let checkpoint = outcome.run.checkpoint.as_ref().expect("checkpoint");
             let done = checkpoint["variables"]["count"].as_u64().expect("count");
             assert_eq!(
@@ -440,10 +454,8 @@ fn a_pause_requested_partway_stops_at_the_next_boundary_and_keeps_progress() {
             );
             assert_eq!(checkpoint["phase"], json!("between_top_level_steps"));
 
-            // And it really can be resumed to completion from there.
-            store
-                .compare_and_set_desired_state("run-1", DesiredState::Pause, DesiredState::Run, None)
-                .expect("resume intent");
+            // And it really can be resumed to completion from there, without
+            // anyone clearing the pause intent by hand: that is `resume`'s job.
             let finished = executor
                 .resume(&descriptor, "run-1", DurableOptions::default())
                 .expect("resume");
@@ -453,18 +465,161 @@ fn a_pause_requested_partway_stops_at_the_next_boundary_and_keeps_progress() {
                 json!(6),
                 "no step was lost or repeated across the pause"
             );
+            assert_eq!(entered_segments(), 6, "each step ran exactly once");
         }
         RunStatus::Succeeded => {
-            // It finished first; the pause request then had to be refused
-            // because a terminal run accepts no further control.
-            assert!(
-                control_result.is_err(),
-                "a finished run must not accept a pause request"
+            // Whichever way the race went, all six steps had already run, so
+            // the run must report all six and have entered each exactly once. A
+            // late pause is recorded, never applied retroactively.
+            assert_eq!(
+                outcome.run.output.as_ref().expect("output")["total"],
+                json!(6),
+                "a late pause must not cost or duplicate work"
             );
+            assert_eq!(entered_segments(), 6, "each step ran exactly once");
+            if control_result.is_err() {
+                // It arrived after the terminal commit, so it had to be
+                // refused: a terminal run accepts no further control.
+                assert_eq!(outcome.run.desired_state, DesiredState::Run);
+            } else {
+                // It arrived while the run was still `running`, so accepting it
+                // was correct -- but the body was already past its last
+                // boundary. The request stands on the record even though there
+                // was nothing left for it to stop.
+                assert_eq!(
+                    outcome.run.desired_state,
+                    DesiredState::Pause,
+                    "an accepted-but-too-late request must not be erased"
+                );
+            }
         }
         other => panic!("unexpected status: {}", other.as_str()),
     }
 }
+
+/// Flipping the operator's intent while a run advances must never surface as
+/// a failure.
+///
+/// The interesting window is a few microseconds wide: it opens when the
+/// runner reads intent at a boundary and closes when it authorises the next
+/// dispatch. A request landing inside it makes the runner lose its dispatch
+/// CAS. That is the fencing mechanism working as designed, so it has to stop
+/// or finish the run -- never report `JOURNAL.CONFLICT`, which would blame
+/// the operator for a request the journal actually granted.
+///
+/// One request cannot be aimed at a window that narrow, so this hammers it
+/// across many boundaries until it lands there.
+#[test]
+fn flipping_intent_while_a_run_advances_never_surfaces_a_conflict() {
+    let temp = TempDir::new("intent-storm");
+    let descriptor = compile(counting_workflow(40));
+    let store = temp.open();
+    let digest = aad_runtime::plan_digest(&descriptor);
+    store
+        .create_run(
+            "run-1",
+            "durable.counting",
+            &json!({}),
+            &descriptor.raw,
+            None,
+            Some(&digest),
+            None,
+        )
+        .expect("create");
+
+    // Open every connection this test needs *before* the storm starts. Opening
+    // a journal validates its pragmas, which needs the write lock; doing that
+    // under a write storm fails on lock contention and says nothing about
+    // intent handling.
+    let executor = DurableExecutor::new(temp.open());
+    let control = temp.open();
+
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flipping = {
+        let stop = stop.clone();
+        std::thread::spawn(move || {
+            // Both directions, as fast as the journal will take them. Every
+            // outcome is legitimate here -- the run may be terminal, or the
+            // intent may already be what we are asking for -- so failures are
+            // deliberately ignored; the runner's behaviour is what is on test.
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let _ = control.compare_and_set_desired_state(
+                    "run-1",
+                    DesiredState::Run,
+                    DesiredState::Pause,
+                    None,
+                );
+                let _ = control.compare_and_set_desired_state(
+                    "run-1",
+                    DesiredState::Pause,
+                    DesiredState::Run,
+                    None,
+                );
+                // Yield rather than sleep: the window being aimed at is only a
+                // few microseconds wide, and sleeping steps right over it.
+                std::thread::yield_now();
+            }
+        })
+    };
+
+    // Drive to a terminal state, resuming through every pause the storm causes.
+    //
+    // The storm is deliberately more aggressive than any real operator, so it
+    // can also exhaust SQLite's own write locks. That is this harness competing
+    // with itself, not the behaviour under test, so it is retried. What is never
+    // tolerated is `JOURNAL.CONFLICT`: that would mean a request the journal
+    // granted came back to the caller as an error.
+    let mut attempt = |first: bool| loop {
+        let result = if first {
+            executor.execute(&descriptor, "run-1", DurableOptions::default())
+        } else {
+            executor.resume(&descriptor, "run-1", DurableOptions::default())
+        };
+        match result {
+            Ok(outcome) => return outcome,
+            Err(error) => {
+                assert_ne!(
+                    error.code, "JOURNAL.CONFLICT",
+                    "a granted pause must stop the run, not fail it: {error:?}"
+                );
+                assert_eq!(
+                    error.code, "JOURNAL.STORAGE_FAILED",
+                    "unexpected failure: {error:?}"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+    };
+
+    let mut outcome = attempt(true);
+    let mut legs = 1;
+    while outcome.stopped == Stopped::Paused {
+        assert!(legs < 200, "resuming should make progress, not spin");
+        legs += 1;
+        outcome = attempt(false);
+    }
+
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    flipping.join().expect("control thread");
+
+    // However many times it stopped and restarted, the work must be exactly
+    // right: all forty steps, each dispatched once.
+    assert_eq!(outcome.run.status, RunStatus::Succeeded);
+    assert_eq!(outcome.run.output.as_ref().expect("output")["total"], json!(40));
+    let entered: Vec<String> = store
+        .list_events("run-1", 0, 5000)
+        .expect("events")
+        .into_iter()
+        .filter(|event| event.event_type == "run.segment_entered")
+        .map(|event| event.payload["stepId"].as_str().unwrap_or_default().to_string())
+        .collect();
+    let mut unique = entered.clone();
+    unique.sort();
+    unique.dedup();
+    assert_eq!(entered.len(), 40, "every step ran");
+    assert_eq!(unique.len(), 40, "and none ran twice: {entered:?}");
+}
+
 
 #[test]
 fn a_cancel_requested_partway_ends_the_run_as_cancelled() {

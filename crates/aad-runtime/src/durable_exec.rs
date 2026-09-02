@@ -509,22 +509,44 @@ impl DurableExecutor {
             // Record that a step is about to run *before* running it. If the
             // process dies now, recovery sees `in_top_level_step` and knows the
             // effect is unproven instead of assuming nothing happened.
-            self.journal
-                .append_event_with_checkpoint(
-                    &lease,
-                    "run.segment_entered",
-                    &json!({"stepId": step_id}),
-                    &encode_checkpoint(
-                        digest,
-                        Phase::InStep,
-                        deadline,
-                        &segmented.snapshot(),
-                    ),
-                    Some(RunStatus::Running),
-                    Some(DesiredState::Run),
-                    durable::now_seconds(),
-                )
-                .map_err(journal_error)?;
+            //
+            // Requiring `desired_state = run` here is what makes this write the
+            // dispatch authorisation: a pause or cancel that arrived since the
+            // read above must not be overtaken by a step going out anyway.
+            let dispatched = self.journal.append_event_with_checkpoint(
+                &lease,
+                "run.segment_entered",
+                &json!({"stepId": step_id}),
+                &encode_checkpoint(digest, Phase::InStep, deadline, &segmented.snapshot()),
+                Some(RunStatus::Running),
+                Some(DesiredState::Run),
+                durable::now_seconds(),
+            );
+            if let Err(JournalError::Conflict(_)) = &dispatched {
+                // Losing that CAS is the mechanism working, not a fault: an
+                // operator asked to stop in the window between the read above and
+                // this write. Route into the control path rather than failing the
+                // run -- the request was granted, so reporting an error would be a
+                // lie, and no step has been dispatched.
+                let current = self.journal.get_run(&run.run_id).map_err(journal_error)?;
+                match current.desired_state {
+                    DesiredState::Pause => {
+                        return self.honour_pause(digest, lease, segmented, deadline);
+                    }
+                    DesiredState::Cancel => {
+                        return self.finalize_cancelled(
+                            &run.run_id,
+                            lease,
+                            "cancelled before the next segment was dispatched",
+                        );
+                    }
+                    // Intent is unchanged, so the conflict was about something
+                    // else -- a status this process no longer agrees with. Not
+                    // ours to absorb.
+                    DesiredState::Run => {}
+                }
+            }
+            dispatched.map_err(journal_error)?;
 
             let outcome = segmented.run_segment();
             let progressed = match outcome {
