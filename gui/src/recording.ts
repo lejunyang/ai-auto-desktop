@@ -121,16 +121,39 @@ export interface WindowSelector {
 }
 
 /**
+ * Class names that are regenerated every time the program starts.
+ *
+ * WinForms builds one per run, so the same window reports
+ * `WindowsForms10.Window.8.app.0.34473a7_r14_ad1` on one launch and
+ * `...0.376a1c9_r8_ad1` on the next -- measured on this machine by restarting a
+ * fixture. Saving one produces a recording that replays perfectly in the session
+ * that made it and matches nothing afterwards, which is the worst way for this
+ * to fail: it looks correct exactly when it is being tested.
+ *
+ * Deliberately narrow. It matches the one shape that has actually been observed
+ * changing; of the twenty windows open on this machine only the WinForms one is
+ * caught, and discarding a stable class name would weaken the selector for no
+ * reason.
+ */
+const VOLATILE_CLASS_NAME = /_r\d+_ad\d+$/;
+
+/** Whether this class name will still mean the same thing after a restart. */
+export function isDurableClassName(className: string | null): boolean {
+  return Boolean(className) && !VOLATILE_CLASS_NAME.test(className as string);
+}
+
+/**
  * Build the narrowest selector that picks `target` out of `open`.
  *
  * Same discipline as element locators, for the same reason: the driver treats an
  * ambiguous window selector as a failure rather than choosing one, so a selector
  * that matched two windows at record time would simply refuse to replay.
  *
- * Ordered by stability. A class name outlives editing; a process name is stable
- * but shared by every window of the app; a title is the least durable because it
- * changes as soon as the document is renamed or modified, so it is used only when
- * nothing else separates the windows.
+ * Ordered by stability. A class name outlives editing -- unless the toolkit
+ * regenerates it per run, in which case it is skipped entirely; a process name is
+ * stable but shared by every window of the app; a title is the least durable
+ * because it changes as soon as the document is renamed or modified, so it is
+ * used only when nothing else separates the windows.
  *
  * Returns null when even a title cannot distinguish the window, which is a real
  * situation the caller has to surface rather than paper over.
@@ -154,8 +177,8 @@ export function selectorFor(
   };
 
   const selector: WindowSelector = {};
-  if (target.class_name) {
-    selector.class_name = target.class_name;
+  if (isDurableClassName(target.class_name)) {
+    selector.class_name = target.class_name as string;
   }
   if (isUnique(selector) && Object.keys(selector).length) {
     return selector;

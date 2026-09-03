@@ -33,6 +33,22 @@ use windows::Win32::UI::Accessibility::{
     UIA_EVENT_ID, UIA_InvokePatternId, UIA_Invoke_InvokedEventId, UIA_LegacyIAccessiblePatternId,
     UIA_PROPERTY_ID, UIA_SelectionItem_ElementSelectedEventId, UIA_TogglePatternId,
     UIA_ToggleToggleStatePropertyId, UIA_ValuePatternId, UIA_ValueValuePropertyId,
+    // Control type ids. A role comes from these rather than from the localized
+    // display string, which changes with the system language.
+    UIA_CONTROLTYPE_ID, UIA_AppBarControlTypeId, UIA_ButtonControlTypeId,
+    UIA_CalendarControlTypeId, UIA_CheckBoxControlTypeId, UIA_ComboBoxControlTypeId,
+    UIA_CustomControlTypeId, UIA_DataGridControlTypeId, UIA_DataItemControlTypeId,
+    UIA_DocumentControlTypeId, UIA_EditControlTypeId, UIA_GroupControlTypeId,
+    UIA_HeaderControlTypeId, UIA_HeaderItemControlTypeId, UIA_HyperlinkControlTypeId,
+    UIA_ImageControlTypeId, UIA_ListControlTypeId, UIA_ListItemControlTypeId,
+    UIA_MenuBarControlTypeId, UIA_MenuControlTypeId, UIA_MenuItemControlTypeId,
+    UIA_PaneControlTypeId, UIA_ProgressBarControlTypeId, UIA_RadioButtonControlTypeId,
+    UIA_ScrollBarControlTypeId, UIA_SemanticZoomControlTypeId, UIA_SeparatorControlTypeId,
+    UIA_SliderControlTypeId, UIA_SpinnerControlTypeId, UIA_SplitButtonControlTypeId,
+    UIA_StatusBarControlTypeId, UIA_TabControlTypeId, UIA_TabItemControlTypeId,
+    UIA_TableControlTypeId, UIA_TextControlTypeId, UIA_ThumbControlTypeId,
+    UIA_TitleBarControlTypeId, UIA_ToolBarControlTypeId, UIA_ToolTipControlTypeId,
+    UIA_TreeControlTypeId, UIA_TreeItemControlTypeId, UIA_WindowControlTypeId,
 };
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Sender};
@@ -655,11 +671,16 @@ fn describe_element(
         result.ok().map(|value| value.as_bool())
     };
 
-    let role = unsafe { element.CurrentLocalizedControlType() }
-        .ok()
-        .map(|value| value.to_string())
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "Unknown".to_string());
+    // From the numeric control type, never the localized one.
+    //
+    // `CurrentLocalizedControlType` is a display string: it follows the system
+    // language, and measurement on this machine caught it mid-flight -- one
+    // snapshot reported 窗口 and 标题栏 for the frame while reporting edit,
+    // button and text for the controls inside it, and an earlier run had those
+    // same controls in Chinese. A locator holding "编辑" stops matching when the
+    // provider decides to say "edit", so a recording made today fails tomorrow
+    // for a reason nobody would think to look for.
+    let role = control_type_name(unsafe { element.CurrentControlType() }.unwrap_or_default());
 
     let value = unsafe { element.GetCurrentPatternAs::<IUIAutomationValuePattern>(UIA_ValuePatternId) }
         .ok()
@@ -1183,6 +1204,61 @@ fn pump(
     });
 }
 
+/// The stable name of a UIA control type.
+///
+/// These names are the contract a saved locator relies on, so they are spelled
+/// out here rather than taken from whatever the platform feels like displaying.
+/// An unrecognised type keeps its number, which is still stable and still
+/// comparable -- much better than collapsing everything unknown into one name
+/// that then matches unrelated elements.
+fn control_type_name(control_type: UIA_CONTROLTYPE_ID) -> String {
+    let name = match control_type {
+        UIA_ButtonControlTypeId => "button",
+        UIA_CalendarControlTypeId => "calendar",
+        UIA_CheckBoxControlTypeId => "check_box",
+        UIA_ComboBoxControlTypeId => "combo_box",
+        UIA_EditControlTypeId => "edit",
+        UIA_HyperlinkControlTypeId => "hyperlink",
+        UIA_ImageControlTypeId => "image",
+        UIA_ListItemControlTypeId => "list_item",
+        UIA_ListControlTypeId => "list",
+        UIA_MenuControlTypeId => "menu",
+        UIA_MenuBarControlTypeId => "menu_bar",
+        UIA_MenuItemControlTypeId => "menu_item",
+        UIA_ProgressBarControlTypeId => "progress_bar",
+        UIA_RadioButtonControlTypeId => "radio_button",
+        UIA_ScrollBarControlTypeId => "scroll_bar",
+        UIA_SliderControlTypeId => "slider",
+        UIA_SpinnerControlTypeId => "spinner",
+        UIA_StatusBarControlTypeId => "status_bar",
+        UIA_TabControlTypeId => "tab",
+        UIA_TabItemControlTypeId => "tab_item",
+        UIA_TextControlTypeId => "text",
+        UIA_ToolBarControlTypeId => "tool_bar",
+        UIA_ToolTipControlTypeId => "tool_tip",
+        UIA_TreeControlTypeId => "tree",
+        UIA_TreeItemControlTypeId => "tree_item",
+        UIA_CustomControlTypeId => "custom",
+        UIA_GroupControlTypeId => "group",
+        UIA_ThumbControlTypeId => "thumb",
+        UIA_DataGridControlTypeId => "data_grid",
+        UIA_DataItemControlTypeId => "data_item",
+        UIA_DocumentControlTypeId => "document",
+        UIA_SplitButtonControlTypeId => "split_button",
+        UIA_WindowControlTypeId => "window",
+        UIA_PaneControlTypeId => "pane",
+        UIA_HeaderControlTypeId => "header",
+        UIA_HeaderItemControlTypeId => "header_item",
+        UIA_TableControlTypeId => "table",
+        UIA_TitleBarControlTypeId => "title_bar",
+        UIA_SeparatorControlTypeId => "separator",
+        UIA_SemanticZoomControlTypeId => "semantic_zoom",
+        UIA_AppBarControlTypeId => "app_bar",
+        _ => return format!("control_type_{}", control_type.0),
+    };
+    name.to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1352,6 +1428,43 @@ mod tests {
     #[test]
     fn a_malformed_window_id_is_rejected() {
         assert!(parse_window_id("hwnd:not-a-number").is_err());
+    }
+
+    #[test]
+    fn a_role_never_depends_on_the_display_language() {
+        // Roles used to come from CurrentLocalizedControlType, and measurement
+        // caught that changing under us: one snapshot of the same window
+        // reported 窗口 and 标题栏 for the frame while reporting edit, button
+        // and text for the controls inside it, and an earlier run had those
+        // controls in Chinese too. A saved locator holding "编辑" silently stops
+        // matching when the provider switches to "edit".
+        for (control_type, expected) in [
+            (UIA_ButtonControlTypeId, "button"),
+            (UIA_EditControlTypeId, "edit"),
+            (UIA_CheckBoxControlTypeId, "check_box"),
+            (UIA_WindowControlTypeId, "window"),
+            (UIA_TitleBarControlTypeId, "title_bar"),
+            (UIA_TextControlTypeId, "text"),
+        ] {
+            let name = control_type_name(control_type);
+            assert_eq!(name, expected);
+            assert!(
+                name.is_ascii(),
+                "a role has to be language-independent, got {name:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unknown_control_type_keeps_its_identity() {
+        // Collapsing everything unrecognised into one name would make unrelated
+        // elements match each other, which is worse than an ugly name: a
+        // locator would start selecting the wrong control rather than failing.
+        let first = control_type_name(UIA_CONTROLTYPE_ID(59999));
+        let second = control_type_name(UIA_CONTROLTYPE_ID(59998));
+
+        assert_ne!(first, second);
+        assert!(first.contains("59999"), "{first}");
     }
 
     #[test]

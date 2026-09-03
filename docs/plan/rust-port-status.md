@@ -683,6 +683,72 @@ CLI 三个入口：`--nth`、`--near/--direction/--within`（常用捷径），`
 
 ---
 
+### 2.21 两个「录制当场能用、重启就失效」的缺陷
+
+接录制链路前先量了一下捕获元素的字段稳定性，顺带挖出两个已经存在、但一直没被
+发现的真缺陷。**共同的成因是：存和放都在同一次会话里做完，没人重启过目标程序。**
+
+#### 缺陷一：窗口选择器用了每次运行都变的 class_name
+
+GUI 的 `selectorFor` 把 `class_name` 排在第一优先（"最像身份"）。但 WinForms 每次
+启动都重新生成它：
+
+```
+WindowsForms10.Window.8.app.0.34473a7_r14_ad1   ← 重启前
+WindowsForms10.Window.8.app.0.376a1c9_r8_ad1    ← 重启后
+```
+
+**已存的每一份录制在目标程序重启后都打不开。**
+
+修法是识别出这个形状就跳过，改用 process_name/title。规则只挡实测过的
+`_r<n>_ad<n>` 后缀——本机 20 个窗口里只有 WinForms 那个命中，`Notepad`、
+`Chrome_WidgetWin_1`、`XLMAIN`、`CabinetWClass` 全部保留（砍掉稳定的 class_name
+只会让选择器更弱）。
+
+#### 缺陷二（更严重）：role 用的是本地化显示串
+
+`role` 取自 `CurrentLocalizedControlType()`——**给人看的显示字符串**。实测抓到它
+正在变：同一个快照里中英混杂，
+
+```
+role=窗口      name=AAD Capture Fixture     ← 中文
+role=edit     name=NameBox                 ← 英文
+role=button   name=SubmitButton            ← 英文
+role=标题栏     name=None                    ← 中文
+```
+
+而更早的测量里这些控件还都是中文（`编辑`/`按钮`/`复选框`）。已存录制记的是
+`role: "编辑"`，现在的快照报 `edit`，**那份录制已经失效了**。
+
+而且 locator 的 role 是精确比较（`eq_ignore_ascii_case` 对中文无效），所以这不是
+"匹配得宽一点"的问题，是完全失配。
+
+修法：role 改取 `CurrentControlType`（数字常量，与语言无关），映射成固定英文名
+（button/edit/check_box/title_bar/...）。未知类型保留数字（`control_type_59999`）
+而不是塌缩成一个名字——塌缩会让不相关的元素互相匹配，比名字难看糟得多。修完：
+
+```
+role=window   role=text   role=edit   role=check_box   role=button   role=title_bar
+```
+
+#### 端到端验证（唯一算数的判据）
+
+单测只能证明选择器不再输出易变字段，证明不了"重启后还能回放"。做了对照实验：
+录一个把 NameBox 填成某值的工作流 → 重启 fixture → 分别用新旧选择器回放。
+
+| | 结果 |
+|---|---|
+| A. 旧行为（class_name 作选择器） | `DRIVER.WINDOW_NOT_FOUND` |
+| B. 新行为（跳过易变字段） | **成功**，fixture 标题变成 `text=new-way` |
+
+两个方向都要看：都成功说明修的不是真问题，都失败说明没修好。
+
+（中途 B 一度也失败，报 `DRIVER.NOT_FOUND`——那是**我的探针**里 locator 还硬编码着
+中文 `编辑`，不是产品的问题。错误码不同（WINDOW_NOT_FOUND vs NOT_FOUND）是分辨这
+两件事的关键，如果只看"成功/失败"就会得出错误结论。）
+
+---
+
 ## 3. 已知环境限制（非缺口，如实记录）
 
 - 本机装有输入过滤软件（AutoHotkey / LogiBolt 一类），`SendInput` 对 ≥2 事件的批次返回

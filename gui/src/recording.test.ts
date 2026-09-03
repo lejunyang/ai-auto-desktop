@@ -5,6 +5,7 @@ import {
   RECORDING_KIND,
   Recording,
   resetIds,
+  selectorFor,
   type StepDraft,
 } from "./recording";
 import { asFailure, BridgeError, bridge, setInvoker } from "./bridge";
@@ -312,6 +313,55 @@ describe("compiling to a workflow", () => {
     const snapshot = steps[0].with as Record<string, unknown>;
 
     expect(snapshot.window).toEqual({ class_name: "EditorClass" });
+  });
+
+  it("skips a class name the toolkit regenerates on every run", () => {
+    // Measured by restarting a WinForms fixture: the same window reported
+    // ...0.34473a7_r14_ad1 and then ...0.376a1c9_r8_ad1. Saving that produced a
+    // recording that replayed in the session that made it and matched nothing
+    // afterwards -- and every recording saved so far had it.
+    const target = windowInfo({
+      class_name: "WindowsForms10.Window.8.app.0.34473a7_r14_ad1",
+      process_name: "fixture.exe",
+      title: "Capture Fixture",
+    });
+
+    const selector = selectorFor(target, [target]);
+
+    expect(selector?.class_name).toBeUndefined();
+    // Something durable has to take its place, or the window is unfindable.
+    expect(selector?.process_name).toBe("fixture.exe");
+  });
+
+  it("still uses a class name that survives a restart", () => {
+    // The other half. Discarding every class name would weaken the selector for
+    // the majority of windows: of twenty open on the test machine, only the
+    // WinForms one was volatile.
+    for (const className of ["Notepad", "Chrome_WidgetWin_1", "XLMAIN", "CabinetWClass"]) {
+      const target = windowInfo({ class_name: className });
+      expect(selectorFor(target, [target])?.class_name).toBe(className);
+    }
+  });
+
+  it("falls through to a title when the class is volatile and the process is shared", () => {
+    // Two windows of the same WinForms app: the class is useless, the process is
+    // identical, so only the title is left.
+    const target = windowInfo({
+      window_id: "hwnd:1",
+      class_name: "WindowsForms10.Window.8.app.0.aaa_r1_ad1",
+      process_name: "app.exe",
+      title: "First",
+    });
+    const rival = windowInfo({
+      window_id: "hwnd:2",
+      class_name: "WindowsForms10.Window.8.app.0.bbb_r2_ad1",
+      process_name: "app.exe",
+      title: "Second",
+    });
+
+    const selector = selectorFor(target, [target, rival]);
+
+    expect(selector).toEqual({ process_name: "app.exe", title: "First" });
   });
 
   it("adds a title only when two windows are otherwise identical", () => {
