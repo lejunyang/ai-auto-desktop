@@ -10,9 +10,12 @@
 
 #![cfg(windows)]
 
+use std::sync::Arc;
+
 use crate::backend::{Backend, CaptureLimits, CapturedTree, DriverError, Result};
+use crate::capture::{CapturedEvent, EventBuffer, EventKind};
 use crate::model::{Bounds, Node, States, WindowInfo};
-use windows::core::{BSTR, PWSTR};
+use windows::core::{implement, BSTR, PWSTR};
 use windows::Win32::Foundation::{CloseHandle, BOOL, HWND, LPARAM, MAX_PATH, RECT, TRUE};
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED,
@@ -22,11 +25,17 @@ use windows::Win32::System::Threading::{
     PROCESS_QUERY_LIMITED_INFORMATION,
 };
 use windows::Win32::UI::Accessibility::{
-    CUIAutomation, IUIAutomation, IUIAutomationElement, IUIAutomationInvokePattern,
+    CUIAutomation, IUIAutomation, IUIAutomationElement, IUIAutomationEventHandler,
+    IUIAutomationEventHandler_Impl, IUIAutomationInvokePattern,
+    IUIAutomationPropertyChangedEventHandler, IUIAutomationPropertyChangedEventHandler_Impl,
     IUIAutomationLegacyIAccessiblePattern, IUIAutomationTogglePattern, IUIAutomationValuePattern,
-    TreeScope_Children, UIA_InvokePatternId, UIA_LegacyIAccessiblePatternId,
-    UIA_TogglePatternId, UIA_ValuePatternId,
+    SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK, TreeScope_Children, TreeScope_Subtree,
+    UIA_EVENT_ID, UIA_InvokePatternId, UIA_Invoke_InvokedEventId, UIA_LegacyIAccessiblePatternId,
+    UIA_PROPERTY_ID, UIA_SelectionItem_ElementSelectedEventId, UIA_TogglePatternId,
+    UIA_ToggleToggleStatePropertyId, UIA_ValuePatternId, UIA_ValueValuePropertyId,
 };
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{channel, Sender};
 use std::time::{Duration, Instant};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     SendInput, INPUT, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_KEYUP,
@@ -34,10 +43,11 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     MOUSEEVENTF_MOVE, MOUSEEVENTF_VIRTUALDESK, MOUSEINPUT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetClassNameW, GetForegroundWindow, GetSystemMetrics, GetWindowRect,
-    GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindowVisible,
-    SetForegroundWindow, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
-    SM_YVIRTUALSCREEN,
+    DispatchMessageW, EnumWindows, GetAncestor, GetClassNameW, GetForegroundWindow,
+    GetSystemMetrics, GetWindowRect, GetWindowTextLengthW, GetWindowTextW,
+    GetWindowThreadProcessId, IsIconic, IsWindowVisible, PeekMessageW, SetForegroundWindow,
+    GA_ROOT, MSG, PM_REMOVE, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
+    SM_YVIRTUALSCREEN, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS,
 };
 
 /// Initialise COM on the calling thread.
@@ -782,6 +792,395 @@ fn process_name(process_id: u32) -> Option<String> {
         let path = String::from_utf16_lossy(&buffer[..size as usize]);
         path.rsplit(['\\', '/']).next().map(str::to_string)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Watching a window for interactions
+//
+// Both native mechanisms are subscribed, because measurement showed each is
+// blind where the other works (docs/plan/rust-port-status.md §2.17-2.18):
+//
+//   WinForms   UIA handlers saw 0 of 2 confirmed clicks; the hook saw 12 events
+//              and resolved each to the exact control.
+//   WebView    UIA handlers reported the button and the edit by name; the hook
+//              could only reach the "Chrome Legacy Window" container.
+//
+// Subscribing to one would silently miss every interaction in a whole class of
+// applications -- the failure this project exists to prevent.
+// ---------------------------------------------------------------------------
+
+/// MSAA event constants, from winuser.h.
+const EVENT_OBJECT_FOCUS: u32 = 0x8005;
+const EVENT_OBJECT_INVOKED: u32 = 0x8012;
+const EVENT_OBJECT_VALUECHANGE: u32 = 0x800E;
+const EVENT_OBJECT_STATECHANGE: u32 = 0x800A;
+const EVENT_OBJECT_SELECTION: u32 = 0x8006;
+
+/// Object ids worth reporting.
+///
+/// Measured: WinForms controls raise their events against OBJID_WINDOW, not
+/// OBJID_CLIENT. A probe that accepted only OBJID_CLIENT discarded every event
+/// and looked exactly like a window nobody had touched.
+const OBJID_WINDOW: i32 = 0;
+const OBJID_CLIENT: i32 = -4;
+
+/// How often the pump wakes to check whether it has been asked to stop.
+const PUMP_TICK: Duration = Duration::from_millis(20);
+
+/// The UI Automation client object is documented as agile, so it may be used
+/// from the callback threads as well as the one that created it.
+struct AgileAutomation(IUIAutomation);
+unsafe impl Send for AgileAutomation {}
+unsafe impl Sync for AgileAutomation {}
+
+/// What a hook callback needs in order to report an event.
+///
+/// A WinEvent hook is a bare function pointer with no user data, so the
+/// callback reaches its session through a thread-local -- set on the pump
+/// thread, which is the only thread the callback runs on.
+struct HookContext {
+    buffer: Arc<EventBuffer>,
+    automation: AgileAutomation,
+    target: isize,
+}
+
+thread_local! {
+    static HOOK_CONTEXT: std::cell::RefCell<Option<HookContext>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Translate an MSAA event into the vocabulary the recorder speaks.
+///
+/// Returns `None` for events that are not interactions. Being explicit about
+/// which are ignored keeps the noise out of recordings: a single click can
+/// raise several focus and repaint notifications.
+fn msaa_event_kind(event: u32) -> Option<EventKind> {
+    match event {
+        EVENT_OBJECT_INVOKED => Some(EventKind::Invoked),
+        EVENT_OBJECT_VALUECHANGE => Some(EventKind::ValueChanged),
+        EVENT_OBJECT_STATECHANGE => Some(EventKind::StateChanged),
+        EVENT_OBJECT_SELECTION => Some(EventKind::StateChanged),
+        EVENT_OBJECT_FOCUS => Some(EventKind::Focused),
+        _ => None,
+    }
+}
+
+/// Whether an event belongs to the window being watched.
+///
+/// The hook is desktop-wide -- there is no per-window variant that also covers
+/// child controls -- so everything else has to be filtered out here.
+fn belongs_to_window(hwnd: HWND, target: isize) -> bool {
+    if hwnd.0 as isize == target {
+        return true;
+    }
+    let root = unsafe { GetAncestor(hwnd, GA_ROOT) };
+    root.0 as isize == target
+}
+
+unsafe extern "system" fn on_win_event(
+    _hook: HWINEVENTHOOK,
+    event: u32,
+    hwnd: HWND,
+    id_object: i32,
+    _id_child: i32,
+    _thread: u32,
+    _time: u32,
+) {
+    // Never let a panic cross back into the operating system's callback.
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if id_object != OBJID_WINDOW && id_object != OBJID_CLIENT {
+            return;
+        }
+        let Some(kind) = msaa_event_kind(event) else {
+            return;
+        };
+        HOOK_CONTEXT.with(|slot| {
+            let borrowed = slot.borrow();
+            let Some(context) = borrowed.as_ref() else {
+                return;
+            };
+            if !belongs_to_window(hwnd, context.target) {
+                return;
+            }
+            // The hook hands over a window handle, not an element. For real
+            // windowed controls this resolves to the control itself; for web
+            // content it reaches only the container, which is why the UIA
+            // handlers are subscribed as well.
+            let node = unsafe { context.automation.0.ElementFromHandle(hwnd) }
+                .ok()
+                .map(|element| describe_element(&element, "captured", 0, None));
+            context.buffer.push(kind, node, "win_event");
+        });
+    }));
+}
+
+#[implement(IUIAutomationEventHandler)]
+struct UiaEventHandler {
+    buffer: Arc<EventBuffer>,
+}
+
+impl IUIAutomationEventHandler_Impl for UiaEventHandler_Impl {
+    fn HandleAutomationEvent(
+        &self,
+        sender: Option<&IUIAutomationElement>,
+        id: UIA_EVENT_ID,
+    ) -> windows::core::Result<()> {
+        let kind = match id {
+            UIA_Invoke_InvokedEventId => EventKind::Invoked,
+            UIA_SelectionItem_ElementSelectedEventId => EventKind::StateChanged,
+            _ => return Ok(()),
+        };
+        let node = sender.map(|element| describe_element(element, "captured", 0, None));
+        self.buffer.push(kind, node, "uia");
+        Ok(())
+    }
+}
+
+#[implement(IUIAutomationPropertyChangedEventHandler)]
+struct UiaPropertyHandler {
+    buffer: Arc<EventBuffer>,
+}
+
+impl IUIAutomationPropertyChangedEventHandler_Impl for UiaPropertyHandler_Impl {
+    fn HandlePropertyChangedEvent(
+        &self,
+        sender: Option<&IUIAutomationElement>,
+        property: UIA_PROPERTY_ID,
+        _value: &windows::core::VARIANT,
+    ) -> windows::core::Result<()> {
+        let kind = match property {
+            UIA_ValueValuePropertyId => EventKind::ValueChanged,
+            UIA_ToggleToggleStatePropertyId => EventKind::StateChanged,
+            _ => return Ok(()),
+        };
+        let node = sender.map(|element| describe_element(element, "captured", 0, None));
+        self.buffer.push(kind, node, "uia");
+        Ok(())
+    }
+}
+
+/// A live subscription to one window's interactions.
+///
+/// Owns a thread because a WinEvent hook is delivered to the message queue of
+/// the thread that installed it, so something has to pump messages for the
+/// lifetime of the subscription. The UIA handlers do not need the pump, but
+/// keeping every subscription on one thread means one place to tear them all
+/// down.
+pub struct CaptureSession {
+    buffer: Arc<EventBuffer>,
+    stop: Arc<AtomicBool>,
+    worker: Option<std::thread::JoinHandle<()>>,
+    /// What the subscription achieved, so a caller can be told when only half
+    /// of it worked rather than being left to wonder why events are missing.
+    pub sources: Vec<&'static str>,
+}
+
+impl CaptureSession {
+    /// Begin watching a window.
+    ///
+    /// Fails only if neither mechanism could be installed. If one succeeds the
+    /// session starts and `sources` says which -- partial coverage is worth
+    /// having, but the caller is told, because a missing source means a whole
+    /// class of interaction will go unrecorded.
+    pub fn start(window_id: &str, limit: usize) -> Result<Self> {
+        let hwnd = parse_window_id(window_id)?;
+        let target = hwnd.0 as isize;
+        let buffer = EventBuffer::new(limit);
+        let stop = Arc::new(AtomicBool::new(false));
+
+        let (ready, started) = channel::<std::result::Result<Vec<&'static str>, String>>();
+        let worker_buffer = Arc::clone(&buffer);
+        let worker_stop = Arc::clone(&stop);
+
+        let worker = std::thread::Builder::new()
+            .name("aad-capture".to_string())
+            .spawn(move || {
+                pump(target, worker_buffer, worker_stop, ready);
+            })
+            .map_err(|error| {
+                DriverError::unavailable(format!("could not start a capture thread: {error}"))
+            })?;
+
+        // Wait for the subscription to be established before returning, so a
+        // caller that starts capturing and immediately interacts does not race
+        // the setup and silently lose those first events.
+        match started.recv_timeout(Duration::from_secs(5)) {
+            Ok(Ok(sources)) => Ok(Self {
+                buffer,
+                stop,
+                worker: Some(worker),
+                sources,
+            }),
+            Ok(Err(message)) => {
+                stop.store(true, Ordering::SeqCst);
+                let _ = worker.join();
+                Err(DriverError::unavailable(message))
+            }
+            Err(_) => {
+                stop.store(true, Ordering::SeqCst);
+                Err(DriverError::unavailable(
+                    "the capture thread did not start watching within five seconds",
+                ))
+            }
+        }
+    }
+
+    /// Take the interactions observed so far, oldest first.
+    pub fn drain(&self, max: usize) -> (Vec<CapturedEvent>, u64) {
+        self.buffer.drain(max)
+    }
+
+    pub fn pending(&self) -> usize {
+        self.buffer.pending()
+    }
+}
+
+impl Drop for CaptureSession {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(worker) = self.worker.take() {
+            // The pump wakes every PUMP_TICK, so this returns promptly. Joining
+            // matters because the hook must be removed before the process that
+            // owns the callback goes away.
+            let _ = worker.join();
+        }
+    }
+}
+
+/// Install both subscriptions, then pump messages until asked to stop.
+fn pump(
+    target: isize,
+    buffer: Arc<EventBuffer>,
+    stop: Arc<AtomicBool>,
+    ready: Sender<std::result::Result<Vec<&'static str>, String>>,
+) {
+    ensure_com();
+    let automation = match automation() {
+        Ok(automation) => automation,
+        Err(error) => {
+            let _ = ready.send(Err(format!("UI Automation is unavailable: {error:?}")));
+            return;
+        }
+    };
+
+    let hwnd = HWND(target as *mut core::ffi::c_void);
+    let mut sources: Vec<&'static str> = Vec::new();
+
+    // --- UI Automation handlers: the only ones that see inside web content ---
+    // Held for the whole function so the subscriptions outlive setup.
+    let mut uia_handlers: Option<(
+        IUIAutomationElement,
+        IUIAutomationEventHandler,
+        IUIAutomationPropertyChangedEventHandler,
+    )> = None;
+
+    if let Ok(root) = unsafe { automation.ElementFromHandle(hwnd) } {
+        let event_handler: IUIAutomationEventHandler = UiaEventHandler {
+            buffer: Arc::clone(&buffer),
+        }
+        .into();
+        let property_handler: IUIAutomationPropertyChangedEventHandler = UiaPropertyHandler {
+            buffer: Arc::clone(&buffer),
+        }
+        .into();
+
+        let mut installed = true;
+        for id in [
+            UIA_Invoke_InvokedEventId,
+            UIA_SelectionItem_ElementSelectedEventId,
+        ] {
+            if unsafe {
+                automation.AddAutomationEventHandler(
+                    id,
+                    &root,
+                    TreeScope_Subtree,
+                    None,
+                    &event_handler,
+                )
+            }
+            .is_err()
+            {
+                installed = false;
+            }
+        }
+        if unsafe {
+            automation.AddPropertyChangedEventHandlerNativeArray(
+                &root,
+                TreeScope_Subtree,
+                None,
+                &property_handler,
+                &[UIA_ValueValuePropertyId, UIA_ToggleToggleStatePropertyId],
+            )
+        }
+        .is_err()
+        {
+            installed = false;
+        }
+
+        if installed {
+            sources.push("uia");
+        }
+        uia_handlers = Some((root, event_handler, property_handler));
+    }
+
+    // --- WinEvent hook: the only one that sees WinForms clicks ---------------
+    HOOK_CONTEXT.with(|slot| {
+        *slot.borrow_mut() = Some(HookContext {
+            buffer: Arc::clone(&buffer),
+            automation: AgileAutomation(automation.clone()),
+            target,
+        });
+    });
+
+    let hook = unsafe {
+        SetWinEventHook(
+            EVENT_OBJECT_FOCUS,
+            EVENT_OBJECT_INVOKED,
+            None,
+            Some(on_win_event),
+            0,
+            0,
+            WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
+        )
+    };
+    if !hook.is_invalid() {
+        sources.push("win_event");
+    }
+
+    if sources.is_empty() {
+        let _ = ready.send(Err(
+            "neither UI Automation events nor WinEvent hooks could be installed for this window"
+                .to_string(),
+        ));
+        return;
+    }
+    let _ = ready.send(Ok(sources));
+
+    // WinEvents are posted to this thread's queue; without a pump they are
+    // never delivered.
+    while !stop.load(Ordering::SeqCst) {
+        let mut message = MSG::default();
+        while unsafe { PeekMessageW(&mut message, None, 0, 0, PM_REMOVE) }.as_bool() {
+            unsafe { DispatchMessageW(&message) };
+        }
+        std::thread::sleep(PUMP_TICK);
+    }
+
+    if !hook.is_invalid() {
+        let _ = unsafe { UnhookWinEvent(hook) };
+    }
+    if let Some((root, event_handler, property_handler)) = uia_handlers {
+        for id in [
+            UIA_Invoke_InvokedEventId,
+            UIA_SelectionItem_ElementSelectedEventId,
+        ] {
+            let _ = unsafe { automation.RemoveAutomationEventHandler(id, &root, &event_handler) };
+        }
+        let _ = unsafe { automation.RemovePropertyChangedEventHandler(&root, &property_handler) };
+    }
+    HOOK_CONTEXT.with(|slot| {
+        *slot.borrow_mut() = None;
+    });
 }
 
 #[cfg(test)]

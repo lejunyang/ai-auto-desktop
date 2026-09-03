@@ -7,9 +7,12 @@
 //! - [`backend`] — the trait an operating system must implement, plus the
 //!   snapshot store that makes handles safe to hold;
 //! - [`driver`] — action dispatch, staleness enforcement and the capability
-//!   manifest, all of which are platform independent and tested everywhere.
+//!   manifest, all of which are platform independent and tested everywhere;
+//! - [`capture`] — turning observed interactions into recordable events, also
+//!   platform independent.
 
 pub mod backend;
+pub mod capture;
 pub mod driver;
 pub mod model;
 
@@ -17,6 +20,7 @@ pub mod model;
 pub mod windows;
 
 pub use backend::{Backend, CaptureLimits, CapturedTree, DriverError, SnapshotStore};
+pub use capture::{coalesce, recordable, CapturedEvent, EventBuffer, EventKind};
 pub use driver::{action_ids, is_node_action, is_write_action, UiaDriver, PROVIDER_NAME};
 pub use model::{Bounds, Locator, Node, Snapshot, States, Target, WindowInfo};
 
