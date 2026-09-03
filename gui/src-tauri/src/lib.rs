@@ -209,71 +209,30 @@ async fn list_apps(shell: tauri::State<'_, Shell>) -> Result<Value, Value> {
 
 /// Read a window's interface and return a flat, addressable outline.
 ///
-/// Flattening happens here rather than in the front end so the reference the UI
-/// shows is exactly the one the driver will accept.
+/// The driver's `describe` already produces exactly this shape, so it is passed
+/// through rather than rebuilt. Rebuilding it here was wrong in two ways at
+/// once: it read a `nodes` key that `describe` does not return, so the list was
+/// always empty and nothing could ever be picked; and it dropped `locator` and
+/// `protected`. The locator is what a saved recording replays from -- a `ref`
+/// stops resolving once its snapshot is gone -- and synthesising one requires
+/// the whole node list to prove uniqueness, which only the driver has.
 #[tauri::command]
 async fn describe_window(
     shell: tauri::State<'_, Shell>,
     window_id: String,
     limit: Option<usize>,
 ) -> Result<Value, Value> {
-    let described = shell.dispatch(
+    // `limit` is the driver's own outline cap, which it clamps to its supported
+    // range; `max_nodes` bounds the capture feeding it.
+    shell.dispatch(
         "describe",
-        json!({"window_id": window_id, "max_nodes": 1000, "max_depth": 32}),
-    )?;
-
-    let snapshot_id = described["snapshot_id"].as_str().unwrap_or_default();
-    let revision = described["revision"].as_u64().unwrap_or_default();
-    let nodes = described["nodes"].as_array().cloned().unwrap_or_default();
-
-    // Only elements that can be acted on or identified are worth listing; the
-    // rest would bury them.
-    let limit = limit.unwrap_or(120).min(1000);
-    let mut elements = Vec::new();
-    for node in &nodes {
-        if elements.len() >= limit {
-            break;
-        }
-        let actions = node["actions"].as_array().cloned().unwrap_or_default();
-        let name = node["name"].as_str().unwrap_or_default();
-        if actions.is_empty() && name.is_empty() {
-            continue;
-        }
-        let node_id = node["node_id"].as_str().unwrap_or_default();
-        elements.push(json!({
-            "node_id": node_id,
-            "ref": format!("{snapshot_id}:{revision}:{node_id}"),
-            "depth": node["depth"].as_u64().unwrap_or_default(),
-            "summary": summarize(node),
-            "actions": actions,
-        }));
-    }
-
-    Ok(json!({
-        "snapshot_id": snapshot_id,
-        "revision": revision,
-        "window": described["window"].clone(),
-        "node_count": nodes.len(),
-        "shown": elements.len(),
-        "truncated": described["truncated"].as_bool().unwrap_or(false),
-        "elements": elements,
-    }))
-}
-
-/// A one-line description of an element, matching what the CLI prints.
-fn summarize(node: &Value) -> String {
-    let role = node["role"].as_str().unwrap_or("unknown");
-    let mut summary = format!("role={role}");
-    if let Some(name) = node["name"].as_str().filter(|name| !name.is_empty()) {
-        summary.push_str(&format!(" name={name:?}"));
-    }
-    if let Some(id) = node["automation_id"]
-        .as_str()
-        .filter(|id| !id.is_empty())
-    {
-        summary.push_str(&format!(" id={id:?}"));
-    }
-    summary
+        json!({
+            "window_id": window_id,
+            "limit": limit.unwrap_or(120),
+            "max_nodes": 1000,
+            "max_depth": 32,
+        }),
+    )
 }
 
 /// Perform one action against a previously observed element.
@@ -384,18 +343,6 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn a_summary_names_the_element_when_it_has_a_name() {
-        let node = json!({"role": "Button", "name": "Save", "automation_id": ""});
-        assert_eq!(summarize(&node), r#"role=Button name="Save""#);
-    }
-
-    #[test]
-    fn a_summary_survives_an_element_with_nothing_but_a_role() {
-        let node = json!({"role": "Pane"});
-        assert_eq!(summarize(&node), "role=Pane");
-    }
 
     #[test]
     fn every_stale_or_missing_failure_tells_the_user_what_to_do() {

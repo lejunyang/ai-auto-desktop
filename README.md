@@ -167,6 +167,9 @@ postcondition:
 
 检查跟着步骤走：删掉或禁用这一步，它的检查也一起走，不会留下指向空处的引用。
 
+在界面上，每个步骤下面有一个 **check it worked** 勾选框，勾上之后选想确认的事、填期望值、
+需要等待的话再填一个时限（比如 `5s`，留空就只查一次）。
+
 对通过 MCP 使用的 AI 来说这一条尤其要紧：它看不见屏幕，只能拿到那个状态字。
 
 ## 持久化运行（可暂停、可恢复、进程崩溃也不丢）
@@ -314,8 +317,8 @@ src/            Python 原型（保留备查，不再演进）
 ## 测试
 
 ```powershell
-cargo test --workspace     # 504 个测试
-cd gui; npm run test       # 59 个测试
+cargo test --workspace     # 507 个测试
+cd gui; npm run test       # 65 个测试
 ```
 
 ## Python 原型

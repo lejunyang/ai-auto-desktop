@@ -293,10 +293,50 @@ impl Backend for WindowsUiaBackend {
                     "the element does not expose a value pattern",
                 )
             })?;
+
+        let before = unsafe { pattern.CurrentValue() }
+            .ok()
+            .map(|value| value.to_string());
+
         unsafe { pattern.SetValue(&BSTR::from(value)) }.map_err(|error| {
             DriverError::new("DRIVER.ACTION_FAILED", format!("set_value failed: {error}"))
                 .with_effect("unknown")
-        })
+        })?;
+
+        // SetValue returning S_OK is not evidence the value changed. Measured
+        // against an HTML <select> in a WebView: it succeeds and the control
+        // keeps its old value. Reporting that as applied is worse than an
+        // error, because an error can be handled and a false success cannot.
+        let after = unsafe { pattern.CurrentValue() }
+            .ok()
+            .map(|value| value.to_string());
+
+        if write_was_refused(before.as_deref(), after.as_deref(), value) {
+            return Err(DriverError::new(
+                "DRIVER.ACTION_FAILED",
+                "the element reported success but its value did not change",
+            )
+            // Nothing landed, so retrying is safe -- but repeating the same
+            // call will fail the same way; the caller needs another route.
+            .with_effect("not_applied")
+            .with_detail("requested", serde_json::json!(value))
+            .with_detail("value", serde_json::json!(after))
+            .with_detail(
+                "likely_cause",
+                serde_json::json!(
+                    "the control accepts the value pattern but ignores writes, \
+                     as a web <select> does"
+                ),
+            )
+            .with_detail(
+                "remedy",
+                serde_json::json!(
+                    "drive this control the way a person would: focus it and \
+                     invoke, or click the option"
+                ),
+            ));
+        }
+        Ok(())
     }
 
     fn type_text(&self, window_id: &str, node: &Node, text: &str) -> Result<()> {
@@ -386,6 +426,27 @@ impl Backend for WindowsUiaBackend {
 
     fn describe(&self) -> serde_json::Value {
         serde_json::json!({"backend": "windows-uia", "platform": "windows"})
+    }
+}
+
+/// Whether a write left the control untouched.
+///
+/// Only an unchanged value counts as a refusal. Controls legitimately normalise
+/// what they are given -- trimming, reformatting, clamping -- and those did
+/// accept the write, so demanding that the value read back exactly would report
+/// them as failures.
+///
+/// Two cases are deliberately not refusals:
+///
+/// - the control already held the requested value, so there was nothing to
+///   change and nothing went wrong;
+/// - the value could not be read before or after, so there is no evidence
+///   either way and inventing a failure would be as wrong as inventing a
+///   success.
+fn write_was_refused(before: Option<&str>, after: Option<&str>, requested: &str) -> bool {
+    match (before, after) {
+        (Some(before), Some(after)) => before == after && before != requested,
+        _ => false,
     }
 }
 
@@ -759,6 +820,54 @@ mod tests {
             cause.contains("privilege") || cause.contains("filtering"),
             "the cause must name one of the two known reasons: {cause}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Confirming a write actually landed
+    //
+    // Measured: SetValue on an HTML <select> in a WebView returns S_OK and
+    // changes nothing. Reporting that as applied is worse than an error --
+    // an error can be handled, a false success cannot.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn a_value_that_did_not_move_is_a_refusal() {
+        // The measured case: asked for one thing, still holds the other.
+        assert!(write_was_refused(
+            Some("something appears"),
+            Some("something appears"),
+            "the value is exactly"
+        ));
+    }
+
+    #[test]
+    fn a_value_that_changed_is_accepted() {
+        assert!(!write_was_refused(Some("old"), Some("new"), "new"));
+    }
+
+    #[test]
+    fn a_control_that_already_held_the_value_has_not_refused_anything() {
+        // Nothing needed to change. Calling this a failure would make writing
+        // the same value twice fail the second time.
+        assert!(!write_was_refused(Some("ready"), Some("ready"), "ready"));
+    }
+
+    #[test]
+    fn a_control_that_normalises_the_value_is_not_treated_as_refusing() {
+        // Trimming, reformatting and clamping are acceptance, not refusal.
+        // Requiring an exact read-back would fail every such control.
+        assert!(!write_was_refused(Some(""), Some("42"), "  42  "));
+        assert!(!write_was_refused(Some("0"), Some("100"), "9999"));
+    }
+
+    #[test]
+    fn an_unreadable_value_is_not_evidence_of_refusal() {
+        // No before or no after means no evidence. Inventing a failure here
+        // would be as wrong as inventing a success -- and would break every
+        // write-only control.
+        assert!(!write_was_refused(None, Some("x"), "x"));
+        assert!(!write_was_refused(Some("x"), None, "y"));
+        assert!(!write_was_refused(None, None, "y"));
     }
 
     #[test]

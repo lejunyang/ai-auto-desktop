@@ -194,6 +194,7 @@ onMounted(async () => {
         @remove="(id) => recording.remove(id)"
         @move="(id, index) => recording.move(id, index)"
         @argument="(id, text) => recording.setArgument(id, text)"
+        @assertion="(id, patch) => recording.setAssertion(id, patch)"
         @clear="recording.steps = []"
         @export="exportDescriptor"
       />

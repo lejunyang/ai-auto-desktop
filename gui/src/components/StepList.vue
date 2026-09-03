@@ -1,6 +1,12 @@
 <script setup lang="ts">
 import { computed } from "vue";
-import { ACTIONS_NEEDING_TEXT, type Step, type ValidationIssue } from "../recording";
+import AssertionEditor from "./AssertionEditor.vue";
+import {
+  ACTIONS_NEEDING_TEXT,
+  type Assertion,
+  type Step,
+  type ValidationIssue,
+} from "../recording";
 
 const props = defineProps<{ steps: Step[]; issues: ValidationIssue[] }>();
 
@@ -9,6 +15,7 @@ defineEmits<{
   remove: [string];
   move: [string, number];
   argument: [string, string];
+  assertion: [string, Partial<Assertion> | null];
   export: [];
   clear: [];
 }>();
@@ -108,6 +115,11 @@ function describeLocator(step: Step): string {
           @input="
             $emit('argument', step.id, ($event.target as HTMLInputElement).value)
           "
+        />
+
+        <AssertionEditor
+          :step="step"
+          @change="(patch) => $emit('assertion', step.id, patch)"
         />
 
         <p

@@ -270,6 +270,45 @@ export class Recording {
   }
 
   /**
+   * Attach, change or remove a step's check.
+   *
+   * Passing null removes it. Partial updates merge into what is already there,
+   * so changing the mode from a dropdown does not silently discard the value
+   * or timeout typed beside it.
+   */
+  setAssertion(stepId: string, assertion: Partial<Assertion> | null): boolean {
+    const step = this.steps.find((candidate) => candidate.id === stepId);
+    if (!step) {
+      return false;
+    }
+    if (assertion === null) {
+      delete step.assertion;
+      return true;
+    }
+    const merged: Assertion = {
+      ...(step.assertion ?? { mode: "exists" }),
+      ...assertion,
+    };
+    // A mode that takes no comparison value must not keep a stale one: it would
+    // be written into the saved file, reappear if the mode changed back, and
+    // read as though it were in force when it is not.
+    if (!MODES_NEEDING_EXPECTED.includes(merged.mode)) {
+      delete merged.expected;
+    }
+    if (merged.mode !== "state_equals") {
+      delete merged.state;
+    } else {
+      // Default both halves, not just the flag. The editor's dropdowns fall
+      // back to `enabled` and `true` for display, so leaving either unset
+      // shows a filled-in form backed by a check that fails validation.
+      merged.state ??= "enabled";
+      merged.expected ??= "true";
+    }
+    step.assertion = merged;
+    return true;
+  }
+
+  /**
    * Move a step to a new position.
    *
    * Reordering is allowed even when it looks questionable: refusing would

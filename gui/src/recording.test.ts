@@ -622,6 +622,74 @@ describe("assertions", () => {
   });
 });
 
+describe("editing a check", () => {
+  beforeEach(() => resetIds());
+
+  it("keeps the value already typed when only the mode changes", () => {
+    // Choosing from a dropdown must not discard what is typed beside it: a
+    // person switching between "is exactly" and "contains" is refining the
+    // same thought, not starting over.
+    const recording = new Recording();
+    const step = recording.add(draft());
+    recording.setAssertion(step.id, { mode: "value_equals", expected: "Saved" });
+
+    recording.setAssertion(step.id, { mode: "value_matches" });
+
+    expect(step.assertion).toMatchObject({ mode: "value_matches", expected: "Saved" });
+  });
+
+  it("drops a comparison value the new mode cannot use", () => {
+    // Left in place it would be written to the saved file and reappear if the
+    // mode changed back, reading as though it were in force when it is not.
+    const recording = new Recording();
+    const step = recording.add(draft());
+    recording.setAssertion(step.id, { mode: "value_equals", expected: "Saved" });
+
+    recording.setAssertion(step.id, { mode: "exists" });
+
+    expect(step.assertion?.expected).toBeUndefined();
+  });
+
+  it("gives a state check a real flag rather than an empty one", () => {
+    // Picking "the state becomes" from a dropdown should produce a check that
+    // works, not a half-filled form that fails validation.
+    const recording = new Recording();
+    const step = recording.add(draft());
+
+    recording.setAssertion(step.id, { mode: "state_equals" });
+
+    expect(step.assertion?.state).toBe("enabled");
+    expect(recording.validate().filter((issue) => issue.blocking)).toEqual([]);
+  });
+
+  it("forgets the state flag once the mode no longer reads one", () => {
+    const recording = new Recording();
+    const step = recording.add(draft());
+    recording.setAssertion(step.id, { mode: "state_equals", state: "focused" });
+
+    recording.setAssertion(step.id, { mode: "exists" });
+
+    expect(step.assertion?.state).toBeUndefined();
+  });
+
+  it("removes the check when asked, leaving no trace in the output", () => {
+    const recording = new Recording();
+    const step = recording.add(draft());
+    recording.setAssertion(step.id, { mode: "exists" });
+
+    recording.setAssertion(step.id, null);
+
+    expect(step.assertion).toBeUndefined();
+    expect(JSON.stringify(recording.toDescriptor())).not.toContain("postcondition");
+  });
+
+  it("says so when the step is gone", () => {
+    const recording = new Recording();
+
+    expect(recording.setAssertion("step_404", { mode: "exists" })).toBe(false);
+  });
+});
+
 describe("saving and reopening", () => {
   beforeEach(() => resetIds());
 
