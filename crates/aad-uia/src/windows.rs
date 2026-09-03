@@ -27,6 +27,7 @@ use windows::Win32::UI::Accessibility::{
     TreeScope_Children, UIA_InvokePatternId, UIA_LegacyIAccessiblePatternId,
     UIA_TogglePatternId, UIA_ValuePatternId,
 };
+use std::time::{Duration, Instant};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     SendInput, INPUT, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_KEYUP,
     KEYEVENTF_UNICODE, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
@@ -307,9 +308,26 @@ impl Backend for WindowsUiaBackend {
         // against an HTML <select> in a WebView: it succeeds and the control
         // keeps its old value. Reporting that as applied is worse than an
         // error, because an error can be handled and a false success cannot.
-        let after = unsafe { pattern.CurrentValue() }
-            .ok()
-            .map(|value| value.to_string());
+        //
+        // The read-back has to wait, though. A control does not have to publish
+        // its new value synchronously: measured on this machine, a native Win32
+        // edit takes about 160 ms and a WebView input about 510 ms. Reading
+        // once, immediately, called every one of those writes a failure.
+        //
+        // Polling costs nothing when the write worked -- it returns as soon as
+        // the value moves -- and the full wait is only paid when the value
+        // really is stuck, which is the case worth being sure about.
+        let mut after = None;
+        let deadline = Instant::now() + VALUE_SETTLE_TIMEOUT;
+        loop {
+            after = unsafe { pattern.CurrentValue() }
+                .ok()
+                .map(|value| value.to_string());
+            if settled(before.as_deref(), after.as_deref(), Instant::now() >= deadline) {
+                break;
+            }
+            std::thread::sleep(VALUE_POLL_INTERVAL);
+        }
 
         if write_was_refused(before.as_deref(), after.as_deref(), value) {
             return Err(DriverError::new(
@@ -427,6 +445,27 @@ impl Backend for WindowsUiaBackend {
     fn describe(&self) -> serde_json::Value {
         serde_json::json!({"backend": "windows-uia", "platform": "windows"})
     }
+}
+
+/// How long to wait for a control to publish the value just written to it.
+///
+/// Measured on this machine: a native Win32 edit republishes in about 160 ms, a
+/// WebView input in about 510 ms. A second is comfortably clear of both while
+/// still bounding the wait for a control that genuinely ignored the write.
+const VALUE_SETTLE_TIMEOUT: Duration = Duration::from_millis(1_000);
+
+/// How often to re-read while waiting. Short enough that a fast control is not
+/// held up, long enough not to spin.
+const VALUE_POLL_INTERVAL: Duration = Duration::from_millis(25);
+
+/// Whether to stop waiting for a written value to appear.
+///
+/// Stop as soon as the value moves -- that is the answer, and a control that
+/// republished quickly should not be made to wait out the timeout. Otherwise
+/// keep looking until the deadline, because an unchanged value is only
+/// meaningful once the control has had time to publish.
+fn settled(before: Option<&str>, after: Option<&str>, expired: bool) -> bool {
+    before != after || expired
 }
 
 /// Whether a write left the control untouched.
@@ -829,6 +868,39 @@ mod tests {
     // changes nothing. Reporting that as applied is worse than an error --
     // an error can be handled, a false success cannot.
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn waiting_stops_the_moment_the_value_changes() {
+        // A control that republishes quickly must not be held to the timeout.
+        assert!(settled(Some("old"), Some("new"), false));
+    }
+
+    #[test]
+    fn waiting_continues_while_the_value_has_not_moved_yet() {
+        // The bug this fixes: reading once, immediately, called a good write a
+        // failure. Measured here, a WebView takes about 510 ms to republish.
+        assert!(!settled(Some("old"), Some("old"), false));
+    }
+
+    #[test]
+    fn waiting_gives_up_once_the_deadline_passes() {
+        // Otherwise a control that genuinely ignores writes would hang forever.
+        assert!(settled(Some("old"), Some("old"), true));
+    }
+
+    #[test]
+    fn a_value_that_appears_from_nothing_counts_as_movement() {
+        // An empty field that becomes readable has changed, even though the
+        // first read returned nothing.
+        assert!(settled(None, Some("new"), false));
+    }
+
+    #[test]
+    fn an_unreadable_value_waits_rather_than_deciding_early() {
+        // No evidence yet is not the same as no change; let the deadline
+        // decide, and `write_was_refused` treats it as not-a-refusal anyway.
+        assert!(!settled(None, None, false));
+    }
 
     #[test]
     fn a_value_that_did_not_move_is_a_refusal() {

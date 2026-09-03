@@ -222,6 +222,15 @@ async fn describe_window(
     window_id: String,
     limit: Option<usize>,
 ) -> Result<Value, Value> {
+    outline_of(&*shell, &window_id, limit)
+}
+
+/// The body of `describe_window`, callable without a Tauri runtime.
+///
+/// Split out so it can be tested: the command itself takes `tauri::State`,
+/// which a unit test cannot construct, and the untestable half is where the
+/// outline bug lived.
+fn outline_of(shell: &Shell, window_id: &str, limit: Option<usize>) -> Result<Value, Value> {
     // `limit` is the driver's own outline cap, which it clamps to its supported
     // range; `max_nodes` bounds the capture feeding it.
     shell.dispatch(
@@ -343,6 +352,107 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // The outline contract
+    //
+    // `describe_window` used to rebuild the driver's outline by hand, reading a
+    // `nodes` key that `describe` does not return. The list was therefore always
+    // empty and nothing could ever be picked -- the GUI could not record a
+    // single step. Every unit test passed the whole time, because they exercise
+    // the recording model and never cross this boundary.
+    // -----------------------------------------------------------------------
+
+    /// Read a window this machine will actually let us inspect.
+    ///
+    /// Not every window can be captured: some belong to elevated processes,
+    /// some vanish between listing and capture. Looking for one that works
+    /// keeps this from being flaky.
+    fn any_outline(shell: &Shell) -> Option<Value> {
+        let listed = shell.dispatch("list_windows", json!({})).ok()?;
+        for window in listed["windows"].as_array()? {
+            let window_id = window["window_id"].as_str()?;
+            // Through the command's own logic, not straight to the driver:
+            // the driver was never the broken part, and testing it instead is
+            // how a first attempt at these tests passed against the bug.
+            if let Ok(outline) = outline_of(shell, window_id, None) {
+                if !outline["elements"].as_array()?.is_empty() {
+                    return Some(outline);
+                }
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn the_outline_actually_lists_the_elements_it_found() {
+        // The regression itself: a window with a populated tree must not come
+        // back as an empty list.
+        let Ok(shell) = Shell::new() else {
+            return;
+        };
+        let Some(outline) = any_outline(&shell) else {
+            panic!("no window on this desktop could be described");
+        };
+
+        let elements = outline["elements"].as_array().expect("elements is a list");
+        assert!(!elements.is_empty(), "the outline came back empty");
+        assert_eq!(
+            outline["shown"].as_u64(),
+            Some(elements.len() as u64),
+            "the count and the list must agree"
+        );
+    }
+
+    #[test]
+    fn every_listed_element_carries_what_recording_a_step_needs() {
+        // `ref` addresses the element now; `locator` is how a saved recording
+        // finds it again in a later session. The hand-rebuilt outline dropped
+        // the locator, which would have made every saved step unreplayable --
+        // and `fromDocument` refuses to re-enable a step whose locator is null,
+        // so the recording would have reopened silently doing nothing.
+        let Ok(shell) = Shell::new() else {
+            return;
+        };
+        let Some(outline) = any_outline(&shell) else {
+            panic!("no window on this desktop could be described");
+        };
+
+        for element in outline["elements"].as_array().unwrap() {
+            assert!(element["node_id"].is_string(), "{element}");
+            assert!(element["ref"].is_string(), "{element}");
+            assert!(element["summary"].is_string(), "{element}");
+            assert!(element["actions"].is_array(), "{element}");
+            // Present but nullable: null is a real answer meaning "cannot be
+            // told apart from its siblings". Absent is not -- that is the bug.
+            assert!(
+                element.get("locator").is_some(),
+                "an element with no locator field cannot be saved: {element}"
+            );
+            // Says a field is masked by design rather than unread.
+            assert!(element.get("protected").is_some(), "{element}");
+        }
+    }
+
+    #[test]
+    fn a_listed_reference_is_one_the_driver_will_accept() {
+        // A reference the UI shows but the driver rejects would fail only at
+        // the moment someone tries to act, which is the worst time to find out.
+        let Ok(shell) = Shell::new() else {
+            return;
+        };
+        let Some(outline) = any_outline(&shell) else {
+            panic!("no window on this desktop could be described");
+        };
+        let first = &outline["elements"].as_array().unwrap()[0];
+        let reference = first["ref"].as_str().expect("a reference");
+
+        let parts: Vec<&str> = reference.split(':').collect();
+        assert_eq!(parts.len(), 3, "expected snapshot:revision:node, got {reference}");
+        assert_eq!(parts[0], outline["snapshot_id"].as_str().unwrap());
+        assert_eq!(parts[1], outline["revision"].as_u64().unwrap().to_string());
+        assert_eq!(parts[2], first["node_id"].as_str().unwrap());
+    }
 
     #[test]
     fn every_stale_or_missing_failure_tells_the_user_what_to_do() {
