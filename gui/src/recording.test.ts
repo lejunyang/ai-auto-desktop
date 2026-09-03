@@ -420,6 +420,208 @@ describe("compiling to a workflow", () => {
   });
 });
 
+describe("assertions", () => {
+  beforeEach(() => resetIds());
+
+  it("attaches the check to the action instead of adding a step", () => {
+    // A check that runs as its own step can report success after the action it
+    // was meant to verify has already failed. Attaching it also keeps the
+    // reference self-contained: deleting or disabling the step takes the check
+    // with it, so `of_step` can never dangle.
+    const recording = new Recording();
+    const step = recording.add(draft());
+    step.assertion = { mode: "exists", locator: { name: "Saved" } };
+
+    const steps = recording.toDescriptor().steps as Record<string, unknown>[];
+
+    expect(steps).toHaveLength(3);
+    const action = steps[2];
+    expect(action.id).toBe(step.id);
+    const postcondition = action.postcondition as Record<string, unknown>;
+    expect(postcondition.condition).toBe("${{ observation.found }}");
+  });
+
+  it("re-observes rather than reusing the snapshot the action was aimed at", () => {
+    // The question is whether the screen changed. A snapshot captured before
+    // the action cannot answer it, however convenient it is to reuse.
+    const recording = new Recording();
+    const step = recording.add(draft());
+    step.assertion = { mode: "exists" };
+
+    const steps = recording.toDescriptor().steps as Record<string, unknown>[];
+    const postcondition = (steps[2] as Record<string, unknown>)
+      .postcondition as Record<string, unknown>;
+    const observe = postcondition.observe as Record<string, unknown>;
+    const observeWith = observe.with as Record<string, unknown>;
+
+    expect(observe.uses).toBe("desktop.windows_uia.find@1");
+    expect(observeWith.snapshot_id).toBeUndefined();
+  });
+
+  it("asks find to tolerate a miss when checking something is gone", () => {
+    // Without this the observation fails with a retryable error, which polling
+    // reads as "not yet" -- so the assertion could never be satisfied, only
+    // time out. Verified on a real window: absent passes in 0.16s with it.
+    const recording = new Recording();
+    const step = recording.add(draft());
+    step.assertion = { mode: "absent", locator: { name: "Spinner" } };
+
+    const steps = recording.toDescriptor().steps as Record<string, unknown>[];
+    const postcondition = (steps[2] as Record<string, unknown>)
+      .postcondition as Record<string, unknown>;
+    const observeWith = (postcondition.observe as Record<string, unknown>)
+      .with as Record<string, unknown>;
+
+    expect(observeWith.expect).toBe("optional");
+    expect(postcondition.condition).toBe("${{ not observation.found }}");
+  });
+
+  it("checks a value by containment, because the evaluator forbids calls", () => {
+    // value_matches is deliberately a substring test, not a regular
+    // expression: the evaluator rejects function and method calls outright, so
+    // there is no matcher to invoke. Measured -- a regex call does not even
+    // validate. Naming it a regex would be a lie the first real pattern finds.
+    const recording = new Recording();
+    const step = recording.add(draft({ action: "set_value" }));
+    recording.setArgument(step.id, "typed");
+    step.assertion = { mode: "value_matches", expected: "ype" };
+
+    const steps = recording.toDescriptor().steps as Record<string, unknown>[];
+    const postcondition = (steps[2] as Record<string, unknown>)
+      .postcondition as Record<string, unknown>;
+
+    expect(postcondition.condition).toBe('${{ "ype" in observation.node.value }}');
+  });
+
+  it("compares a state against a boolean, not the string the form collected", () => {
+    // States arrive as booleans in an observation, so quoting the value would
+    // compare a bool to a string and be false for every input.
+    const recording = new Recording();
+    const step = recording.add(draft());
+    step.assertion = { mode: "state_equals", state: "enabled", expected: "true" };
+
+    const steps = recording.toDescriptor().steps as Record<string, unknown>[];
+    const postcondition = (steps[2] as Record<string, unknown>)
+      .postcondition as Record<string, unknown>;
+
+    expect(postcondition.condition).toBe(
+      "${{ observation.node.states.enabled == True }}",
+    );
+  });
+
+  it("falls back to the step's own element when the check names none", () => {
+    // "Did my typing land?" is the common case and should not require
+    // restating the locator that is already on the step.
+    const recording = new Recording();
+    const step = recording.add(draft({ action: "set_value" }));
+    recording.setArgument(step.id, "text");
+    step.assertion = { mode: "value_equals", expected: "text" };
+
+    expect(recording.validate().filter((issue) => issue.blocking)).toEqual([]);
+
+    const steps = recording.toDescriptor().steps as Record<string, unknown>[];
+    const observeWith = (
+      (steps[2] as Record<string, unknown>).postcondition as Record<string, unknown>
+    );
+    const target = (observeWith.observe as Record<string, unknown>)
+      .with as Record<string, unknown>;
+    expect(target.locator).toEqual(step.locator);
+  });
+
+  it("refuses a comparison with nothing to compare against", () => {
+    // Compiling this anyway yields a comparison against the empty string: a
+    // check that always fails while looking like it is working.
+    const recording = new Recording();
+    const step = recording.add(draft());
+    step.assertion = { mode: "value_equals", expected: "" };
+
+    const issues = recording.validate().filter((issue) => issue.blocking);
+
+    expect(issues).toHaveLength(1);
+    expect(issues[0].message).toContain("needs a value");
+  });
+
+  it("refuses a state that no observation ever carries", () => {
+    // Referencing a missing field fails the whole run with an expression
+    // error, not an assertion failure -- confirmed against a live window.
+    const recording = new Recording();
+    const step = recording.add(draft());
+    step.assertion = { mode: "state_equals", state: "checked", expected: "true" };
+
+    const issues = recording.validate().filter((issue) => issue.blocking);
+
+    expect(issues).toHaveLength(1);
+    expect(issues[0].message).toContain("no checked state");
+  });
+
+  it("keeps the check when the recording is saved and reopened", () => {
+    // A recording that quietly loses its check still replays and still reports
+    // success, having verified nothing.
+    const recording = new Recording();
+    const step = recording.add(draft());
+    step.assertion = {
+      mode: "value_equals",
+      locator: { name: "Status" },
+      expected: "Saved",
+      timeout: "5s",
+      pollInterval: "200ms",
+    };
+
+    const reopened = Recording.fromDocument(
+      JSON.parse(JSON.stringify(recording.toDocument())),
+    );
+
+    expect(reopened.steps[0].assertion).toEqual({
+      mode: "value_equals",
+      locator: { name: "Status" },
+      expected: "Saved",
+      state: undefined,
+      timeout: "5s",
+      pollInterval: "200ms",
+    });
+  });
+
+  it("writes of_step so the file matches the format others read", () => {
+    const recording = new Recording();
+    const step = recording.add(draft());
+    step.assertion = { mode: "exists" };
+
+    const document = recording.toDocument() as Record<string, unknown>;
+    const saved = (document.steps as Record<string, unknown>[])[0];
+    const assertion = saved.assertion as Record<string, unknown>;
+
+    expect(assertion.of_step).toBe(step.id);
+    expect(assertion.kind).toBe("assertion");
+  });
+
+  it("refuses to open a recording whose check it cannot understand", () => {
+    // Dropping the unknown check would leave a recording that looks verified
+    // and is not -- the exact outcome an assertion exists to prevent.
+    const recording = new Recording();
+    const step = recording.add(draft());
+    step.assertion = { mode: "exists" };
+    const document = JSON.parse(JSON.stringify(recording.toDocument()));
+    document.steps[0].assertion.mode = "pixel_perfect";
+
+    expect(() => Recording.fromDocument(document)).toThrow(/cannot check/);
+  });
+
+  it("takes the check away with the step it belongs to", () => {
+    // Why the assertion lives on the step: the saved format's `of_step` is a
+    // cross-step reference, and this arrangement makes a dangling one
+    // unreachable rather than something to validate against.
+    const recording = new Recording();
+    const first = recording.add(draft());
+    first.assertion = { mode: "exists" };
+    recording.add(draft());
+
+    recording.remove(first.id);
+
+    const descriptor = JSON.stringify(recording.toDescriptor());
+    expect(descriptor).not.toContain("postcondition");
+  });
+});
+
 describe("saving and reopening", () => {
   beforeEach(() => resetIds());
 

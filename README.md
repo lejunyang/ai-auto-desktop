@@ -150,6 +150,23 @@ postcondition:
 `optional` 只放宽「没有」，不放宽「有好几个」——匹配到多个仍然报错，因为「在不在」不该被
 答成「给你其中一个」。
 
+录制的时候不用手写这些。给某一步加一个检查，导出时会自动编译成上面的 `postcondition`：
+
+| 想确认的事 | mode | 还要填 |
+|---|---|---|
+| 点完之后某个东西出现了 | `exists` | 看哪个元素（不填就是这步自己的元素） |
+| 某个东西消失了 | `absent` | 同上 |
+| 输入框里就是这个值 | `value_equals` | 期望的值 |
+| 输入框里包含这段文字 | `value_matches` | 期望的子串 |
+| 按钮变成可用 / 只读 / 有焦点 | `state_equals` | 哪个状态 + true 或 false |
+
+`value_matches` 是**子串包含，不是正则**——条件表达式里禁止函数调用，没有 matcher 可用。
+`state_equals` 只能取观察里真实存在的六个状态（`enabled`、`offscreen`、`focusable`、
+`focused`、`read_only`、`protected`）；写错的状态名在导出前就会被拦下，因为引用一个不存在
+的字段会让整个运行以表达式错误失败，那个报错和真正的问题看起来毫不相干。
+
+检查跟着步骤走：删掉或禁用这一步，它的检查也一起走，不会留下指向空处的引用。
+
 对通过 MCP 使用的 AI 来说这一条尤其要紧：它看不见屏幕，只能拿到那个状态字。
 
 ## 持久化运行（可暂停、可恢复、进程崩溃也不丢）
@@ -298,7 +315,7 @@ src/            Python 原型（保留备查，不再演进）
 
 ```powershell
 cargo test --workspace     # 504 个测试
-cd gui; npm run test       # 47 个测试
+cd gui; npm run test       # 59 个测试
 ```
 
 ## Python 原型

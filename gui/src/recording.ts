@@ -50,7 +50,68 @@ export interface Step {
    */
   protected?: boolean;
   enabled: boolean;
+  /**
+   * What must become true for this step to count as having worked.
+   *
+   * Held on the step rather than as a separate entry that points back at one.
+   * The saved format names its subject with `of_step`, which is a cross-step
+   * reference, and this model is otherwise provably incapable of producing a
+   * dangling one -- every reference it emits is derived inside a single step's
+   * own expansion. Keeping the assertion attached preserves that: removing,
+   * disabling or moving a step takes its assertion with it.
+   */
+  assertion?: Assertion;
 }
+
+/** The five ways a recording can state what an action was supposed to achieve. */
+export type AssertionMode =
+  | "exists"
+  | "absent"
+  | "value_equals"
+  | "value_matches"
+  | "state_equals";
+
+export interface Assertion {
+  mode: AssertionMode;
+  /**
+   * What to look at. Defaults to the step's own element, which is what
+   * "did my typing land?" means; give a locator to check something else, such
+   * as the dialog a button opened.
+   */
+  locator?: Locator | null;
+  /** Required by value_equals, value_matches and state_equals. */
+  expected?: string;
+  /** Which state flag state_equals reads, such as `enabled` or `focused`. */
+  state?: string;
+  /** How long to keep re-checking. Absent means check once. */
+  timeout?: string;
+  pollInterval?: string;
+}
+
+/** The state flags an observation actually carries, so a mode cannot name one that never arrives. */
+export const ASSERTABLE_STATES = [
+  "enabled",
+  "offscreen",
+  "focusable",
+  "focused",
+  "read_only",
+  "protected",
+] as const;
+
+/** Modes that compare against `expected`. */
+const MODES_NEEDING_EXPECTED: readonly AssertionMode[] = [
+  "value_equals",
+  "value_matches",
+  "state_equals",
+];
+
+export const ASSERTION_MODES: readonly AssertionMode[] = [
+  "exists",
+  "absent",
+  "value_equals",
+  "value_matches",
+  "state_equals",
+];
 
 /** How to find the window again, without depending on a live handle. */
 export interface WindowSelector {
@@ -266,6 +327,51 @@ export class Recording {
           blocking: true,
         });
       }
+      const assertion = step.assertion;
+      if (assertion) {
+        if (!ASSERTION_MODES.includes(assertion.mode)) {
+          issues.push({
+            stepId: step.id,
+            message: `${assertion.mode} is not something this can check`,
+            blocking: true,
+          });
+        } else if (
+          MODES_NEEDING_EXPECTED.includes(assertion.mode) &&
+          (assertion.expected ?? "") === ""
+        ) {
+          // Compiling this anyway would produce a comparison against the empty
+          // string: a check that always fails while looking like it is working.
+          issues.push({
+            stepId: step.id,
+            message: `${assertion.mode} needs a value to compare against`,
+            blocking: true,
+          });
+        }
+        if (
+          assertion.mode === "state_equals" &&
+          assertion.state !== undefined &&
+          !(ASSERTABLE_STATES as readonly string[]).includes(assertion.state)
+        ) {
+          // A state that never arrives in an observation would make the
+          // condition reference a missing field, which fails the whole run with
+          // an expression error rather than an assertion failure.
+          issues.push({
+            stepId: step.id,
+            message: `there is no ${assertion.state} state to check`,
+            blocking: true,
+          });
+        }
+        // An assertion with no locator of its own falls back to the step's
+        // element, which is what "did my typing land?" means. Only when
+        // neither supplies one is there nothing to look at.
+        if (!(assertion.locator ?? step.locator)) {
+          issues.push({
+            stepId: step.id,
+            message: "this check has no element to look at",
+            blocking: true,
+          });
+        }
+      }
     }
     if (this.enabledSteps.length === 0) {
       issues.push({
@@ -316,6 +422,29 @@ export class Recording {
         // inlining a credential that was correctly externalised before.
         protected: step.protected === true,
         enabled: step.enabled,
+        // Written in the spec's shape, including `of_step`, even though the
+        // model holds it on the step. The format is the contract with anything
+        // else that reads these files; the in-memory arrangement is not.
+        ...(step.assertion
+          ? {
+              assertion: {
+                of_step: step.id,
+                kind: "assertion",
+                mode: step.assertion.mode,
+                ...(step.assertion.locator ? { locator: step.assertion.locator } : {}),
+                ...(step.assertion.expected === undefined
+                  ? {}
+                  : { expected: step.assertion.expected }),
+                ...(step.assertion.state === undefined
+                  ? {}
+                  : { state: step.assertion.state }),
+                ...(step.assertion.timeout ? { timeout: step.assertion.timeout } : {}),
+                ...(step.assertion.pollInterval
+                  ? { poll_interval: step.assertion.pollInterval }
+                  : {}),
+              },
+            }
+          : {}),
       })),
     };
   }
@@ -380,6 +509,7 @@ export class Recording {
         windowTitle: typeof step.window_title === "string" ? step.window_title : "",
         argument: typeof step.argument === "string" ? step.argument : undefined,
         protected: step.protected === true,
+        assertion: readAssertion(step.assertion, step.id),
         // Never re-enable a step that cannot be located, whatever the file says.
         enabled:
           step.enabled !== false && (step.locator ?? null) !== null && window !== null,
@@ -460,12 +590,22 @@ export class Recording {
         }
       }
 
-      steps.push({
+      const action: Record<string, unknown> = {
         id: step.id,
         type: "action",
         uses: `desktop.windows_uia.${step.action}@1`,
         with: args,
-      });
+      };
+
+      // Attached to the action, never a step of its own. A check that runs as
+      // a separate step can report success after the action it was meant to
+      // verify has already failed, which is worse than having no check at all.
+      const postcondition = compileAssertion(step, snapshotId);
+      if (postcondition) {
+        action.postcondition = postcondition;
+      }
+
+      steps.push(action);
     }
 
     const descriptor: Record<string, unknown> = {
@@ -486,5 +626,134 @@ export class Recording {
       descriptor.inputs = inputs;
     }
     return descriptor;
+  }
+}
+
+/**
+ * Rebuild an assertion from its saved form.
+ *
+ * Refuses an unknown mode rather than dropping it. A recording that quietly
+ * loses its check still replays, reports success, and verifies nothing -- the
+ * one outcome an assertion exists to prevent.
+ */
+function readAssertion(raw: unknown, stepId: string): Assertion | undefined {
+  if (raw === undefined || raw === null) {
+    return undefined;
+  }
+  if (typeof raw !== "object") {
+    throw new Error(`step ${JSON.stringify(stepId)} has a malformed assertion`);
+  }
+  const source = raw as Record<string, unknown>;
+  const mode = source.mode;
+  if (typeof mode !== "string" || !ASSERTION_MODES.includes(mode as AssertionMode)) {
+    throw new Error(
+      `step ${JSON.stringify(stepId)} has an assertion this version cannot check: ` +
+        JSON.stringify(mode),
+    );
+  }
+  return {
+    mode: mode as AssertionMode,
+    locator: (source.locator ?? null) as Locator | null,
+    expected: typeof source.expected === "string" ? source.expected : undefined,
+    state: typeof source.state === "string" ? source.state : undefined,
+    timeout: typeof source.timeout === "string" ? source.timeout : undefined,
+    pollInterval:
+      typeof source.poll_interval === "string" ? source.poll_interval : undefined,
+  };
+}
+
+/** Quote a string for embedding in a condition expression. */
+function quote(value: string): string {
+  return JSON.stringify(value);
+}
+
+/**
+ * Turn a step's assertion into a postcondition, or null when it has none.
+ *
+ * The observation always re-runs `find` rather than reusing the snapshot the
+ * action was aimed at: the whole question is whether the screen changed, and a
+ * snapshot taken before the action cannot answer it.
+ */
+function compileAssertion(
+  step: Step,
+  snapshotId: string,
+): Record<string, unknown> | null {
+  const assertion = step.assertion;
+  if (!assertion) {
+    return null;
+  }
+
+  const locator = assertion.locator ?? step.locator;
+  const observeWith: Record<string, unknown> = {
+    window: step.window,
+    locator,
+  };
+
+  let condition: string;
+  switch (assertion.mode) {
+    case "exists":
+      condition = "${{ observation.found }}";
+      break;
+    case "absent":
+      // Without `optional` a miss is a retryable error, which polling reads as
+      // "not yet" -- so this assertion could never be satisfied, only time out.
+      observeWith.expect = "optional";
+      condition = "${{ not observation.found }}";
+      break;
+    case "value_equals":
+      condition = `\${{ observation.node.value == ${quote(assertion.expected ?? "")} }}`;
+      break;
+    case "value_matches":
+      // Substring, not a regular expression. The evaluator refuses function and
+      // method calls, so there is no matcher to call; `in` is the only
+      // containment the grammar has.
+      condition = `\${{ ${quote(assertion.expected ?? "")} in observation.node.value }}`;
+      break;
+    case "state_equals": {
+      const state = assertion.state ?? "enabled";
+      // States are booleans in an observation, so compare against one rather
+      // than the string the UI collected.
+      const wanted = assertion.expected === "false" ? "False" : "True";
+      condition = `\${{ observation.node.states.${state} == ${wanted} }}`;
+      break;
+    }
+  }
+
+  const postcondition: Record<string, unknown> = {
+    condition,
+    observe: {
+      uses: "desktop.windows_uia.find@1",
+      with: observeWith,
+    },
+    message: describeAssertion(assertion, step),
+  };
+  if (assertion.timeout) {
+    postcondition.timeout = assertion.timeout;
+  }
+  if (assertion.pollInterval) {
+    postcondition.poll_interval = assertion.pollInterval;
+  }
+  // Unused today but part of the saved format: `snapshotId` names the capture
+  // this action was aimed at, which is what an editor shows beside a failure.
+  void snapshotId;
+  return postcondition;
+}
+
+/** A sentence a person reads when the assertion fails. */
+export function describeAssertion(assertion: Assertion, step: Step): string {
+  const what = assertion.locator ? "the element it checks" : step.summary || "the element";
+  switch (assertion.mode) {
+    case "exists":
+      return `expected ${what} to be present after ${step.action}`;
+    case "absent":
+      return `expected ${what} to be gone after ${step.action}`;
+    case "value_equals":
+      return `expected ${what} to read ${quote(assertion.expected ?? "")}`;
+    case "value_matches":
+      return `expected ${what} to contain ${quote(assertion.expected ?? "")}`;
+    case "state_equals":
+      return `expected ${what} to be ${assertion.state ?? "enabled"}=${
+        assertion.expected ?? "true"
+      }`;
   }
 }

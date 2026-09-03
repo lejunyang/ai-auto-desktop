@@ -332,6 +332,26 @@ observe:
 `optional` **不放宽歧义**——多个匹配依然报 `DRIVER.AMBIGUOUS_MATCH`。「在不在」和
 「是哪一个」是两个问题，把前者答成"给你其中一个"正是点错按钮的由来。
 
+**`value_matches` 是子串包含，不是正则**（2026-09-03 实测后补）。表达式求值器明确拒绝函数与
+方法调用（`expression.rs`：`function and method calls are not allowed`），所以没有任何 matcher
+可以调用——实测 `value.matches("h.*o")` 和 `value.startswith("he")` 连 `validate` 都过不了。
+语法里唯一的包含运算是 `in`，因此该模式编译为 `${{ "子串" in observation.node.value }}`。
+文档和 UI 都不得把它写成正则：第一个稍复杂的模式就会暴露。
+
+五种模式各自读取的字段（均已在真机观察里确认存在）：
+
+| mode | 条件 |
+|---|---|
+| `exists` | `${{ observation.found }}` |
+| `absent` | `${{ not observation.found }}`，且 observe 必须带 `expect: optional` |
+| `value_equals` | `${{ observation.node.value == "…" }}` |
+| `value_matches` | `${{ "…" in observation.node.value }}` |
+| `state_equals` | `${{ observation.node.states.<flag> == True/False }}` |
+
+`state_equals` 的 flag 只能取 `enabled/offscreen/focusable/focused/read_only/protected`——
+观察里只有这六个。**引用一个不存在的字段不是「条件为假」，而是整个运行以
+`EXPRESSION.EVALUATION_FAILED` 失败**（实测），所以录制侧必须在编译前拦住拼错的 flag。
+
 回放判定语义：**没有 assertion 的 interaction 步骤不构成「回放成功」**。它只证明动作被派发，不证明产生了预期效果。录制器应当为每个写动作自动提议一条 assertion，并在 UI 中标出缺失 assertion 的步骤。
 
 ### 7.5 `logic`：人工插入的自定义逻辑
