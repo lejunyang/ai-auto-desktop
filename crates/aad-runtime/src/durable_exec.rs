@@ -396,20 +396,30 @@ impl DurableExecutor {
         // rewritten on the way to being refused. A cancel is never cleared here —
         // it is sticky, and was already honoured above.
         let run = if run.desired_state == DesiredState::Pause {
-            self.journal
-                .compare_and_set_desired_state(
-                    run_id,
-                    DesiredState::Pause,
-                    DesiredState::Run,
-                    Some((
-                        "run.resume_requested",
-                        &json!({
-                            "fromDesiredState": DesiredState::Pause.as_str(),
-                            "toDesiredState": DesiredState::Run.as_str(),
-                        }),
-                    )),
-                )
-                .map_err(journal_error)?
+            match self.journal.compare_and_set_desired_state(
+                run_id,
+                DesiredState::Pause,
+                DesiredState::Run,
+                Some((
+                    "run.resume_requested",
+                    &json!({
+                        "fromDesiredState": DesiredState::Pause.as_str(),
+                        "toDesiredState": DesiredState::Run.as_str(),
+                    }),
+                )),
+            ) {
+                Ok(run) => run,
+                // Losing this CAS means somebody else cleared the pause between
+                // the read above and this write. The point was for the run not
+                // to be paused, and it is not paused -- so failing here would
+                // report an error for the state the caller asked for and got.
+                // Re-read and carry on; a cancel that arrived instead is still
+                // honoured at the next boundary, where it is checked anyway.
+                Err(JournalError::Conflict(_)) => {
+                    self.journal.get_run(run_id).map_err(journal_error)?
+                }
+                Err(error) => return Err(journal_error(error)),
+            }
         } else {
             run
         };

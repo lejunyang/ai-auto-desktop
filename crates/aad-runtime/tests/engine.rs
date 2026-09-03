@@ -1286,6 +1286,127 @@ fn a_postcondition_without_a_timeout_is_judged_once() {
 }
 
 #[test]
+fn a_postcondition_waits_through_an_observation_that_is_not_ready_yet() {
+    // The commonest assertion of all is "after clicking, a dialog appears".
+    // While waiting, the observation legitimately fails: the thing is not there
+    // yet. Measured against the real binary, this aborted after 0.20s of a 3s
+    // window, which made the timeout unreachable and the feature useless for
+    // the case it exists to serve.
+    let provider = Fake::build(
+        "fixture",
+        read_only_actions(&["act", "look"]),
+        Box::new(|action, _, attempt| {
+            if action != "fixture.look@1" {
+                return Ok(json!({"dispatched": true}));
+            }
+            if attempt < 4 {
+                // Exactly what the driver reports for an element that has not
+                // appeared yet.
+                Err(AutomationError::new("DRIVER.NOT_FOUND", "no element matched")
+                    .with_retryable(true)
+                    .with_effect("not_applied"))
+            } else {
+                Ok(json!({"match_count": 1}))
+            }
+        }),
+    );
+    let workflow = descriptor(json!({
+        "steps": [{
+            "id": "act", "type": "action", "uses": "fixture.act@1", "with": {},
+            "postcondition": {
+                "condition": "${{ observation.match_count > 0 }}",
+                "observe": {"uses": "fixture.look@1", "with": {}},
+                "timeout": "5s",
+                "poll_interval": "10ms"
+            }
+        }]
+    }));
+
+    let result = execute(&workflow, registry(vec![provider.clone()]));
+
+    assert_eq!(result.status, RunStatus::Succeeded, "{:?}", result.error);
+    assert!(provider.calls() >= 4, "must keep looking, saw {}", provider.calls());
+}
+
+#[test]
+fn an_observation_that_cannot_recover_fails_the_postcondition_at_once() {
+    // The counterpart to waiting: a failure that will not fix itself must not
+    // be retried until the timeout, or every genuine misconfiguration turns
+    // into a slow one. `retryable` is what separates the two.
+    let provider = Fake::build(
+        "fixture",
+        read_only_actions(&["act", "look"]),
+        Box::new(|action, _, _| {
+            if action != "fixture.look@1" {
+                return Ok(json!({"dispatched": true}));
+            }
+            Err(AutomationError::new("DRIVER.INVALID_REQUEST", "locator is malformed")
+                .with_effect("not_applied"))
+        }),
+    );
+    let workflow = descriptor(json!({
+        "steps": [{
+            "id": "act", "type": "action", "uses": "fixture.act@1", "with": {},
+            "postcondition": {
+                "condition": "${{ observation.match_count > 0 }}",
+                "observe": {"uses": "fixture.look@1", "with": {}},
+                "timeout": "5s",
+                "poll_interval": "10ms"
+            }
+        }]
+    }));
+
+    let started = std::time::Instant::now();
+    let result = execute(&workflow, registry(vec![provider]));
+
+    let error = result.error.expect("a broken observation must be reported");
+    assert_eq!(error.code, "DRIVER.INVALID_REQUEST");
+    assert!(
+        started.elapsed() < std::time::Duration::from_millis(500),
+        "a permanent failure must not be retried until the timeout"
+    );
+}
+
+#[test]
+fn an_assertion_that_never_observed_anything_reports_why() {
+    // When every round failed there is no observation to show, and a bare
+    // "condition not satisfied" against a null would hide the actual cause.
+    let provider = Fake::build(
+        "fixture",
+        read_only_actions(&["act", "look"]),
+        Box::new(|action, _, _| {
+            if action != "fixture.look@1" {
+                return Ok(json!({"dispatched": true}));
+            }
+            Err(AutomationError::new("DRIVER.WINDOW_NOT_FOUND", "no window matched")
+                .with_retryable(true)
+                .with_effect("not_applied"))
+        }),
+    );
+    let workflow = descriptor(json!({
+        "steps": [{
+            "id": "act", "type": "action", "uses": "fixture.act@1", "with": {},
+            "postcondition": {
+                "condition": "${{ observation.match_count > 0 }}",
+                "observe": {"uses": "fixture.look@1", "with": {}},
+                "timeout": "100ms",
+                "poll_interval": "10ms"
+            }
+        }]
+    }));
+
+    let result = execute(&workflow, registry(vec![provider]));
+
+    let error = result.error.expect("the assertion must fail");
+    assert_eq!(error.code, "ACTION.POSTCONDITION_FAILED");
+    assert_eq!(
+        error.details["last_observation_error"]["code"],
+        json!("DRIVER.WINDOW_NOT_FOUND"),
+        "the reason it kept failing is the actual diagnosis"
+    );
+}
+
+#[test]
 fn a_postcondition_cannot_observe_with_a_writing_action() {
     // An assertion that changes what it is checking establishes nothing, and a
     // write smuggled in here would also skip the risk and confirmation checks

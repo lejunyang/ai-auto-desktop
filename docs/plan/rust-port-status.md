@@ -287,6 +287,26 @@ Python 有 45 个测试文件。针对未移植能力的部分在 Rust 侧没有
 `unknown_effect` + `ACTION.POSTCONDITION_FAILED`，且 `last_observation` 里带着屏幕上**实际**
 的值，不用重跑就能诊断。五个新测试，三个变异验证各自使对应测试失败（4 / 2 / 1 个）。
 
+**改完之后又发现轮询本身是坏的**（还是靠真机探针，不是读代码）：断言「点完之后对话框出现」
+时，`find` 在对话框还没出现的每一轮都报 `DRIVER.NOT_FOUND`，而这个错误**中止了整个等待**——
+3 秒的窗口 0.20 秒就退出。也就是说轮询对**最常见的那类断言**完全不可用，而那正是它存在的理由。
+
+底层其实早就是对的：driver 给 `DRIVER.NOT_FOUND` 标了 `retryable`，这个标记也一路传到引擎，
+只是我的循环没看它。改为：`retryable` 的观察失败算「还没到」，继续等；非 `retryable`（未知
+action、被拒的写、observe 写错）立刻上报，因为它不会自愈，重试只是把失败拖慢。
+
+顺带修了 driver 的一处不一致：`DRIVER.NOT_FOUND`（元素没出现）是 `retryable`，
+`DRIVER.WINDOW_NOT_FOUND`（窗口没出现）却不是。两者一样短暂，后者不标就没法表达「等一个
+对话框弹出来」。
+
+正反两面都在真机上验过，用一个按下按钮 1.2 秒后才开新窗口的 fixture：
+- 永远不出现的东西 → 完整轮询 3.16s 后报断言失败（改之前是 0.20s 中止）；
+- 迟到 1.2 秒才出现的窗口 → 1.37s 成功。**这一条不能省**：只测前者的话，一个「吞掉所有错误、
+  必定超时」的坏实现也能通过。
+
+第一次跑后者时 0.14s 就"成功"了——上一次运行留下的对话框还开着，等待根本没被触发。清干净
+重跑才是真的。
+
 **顺带补掉的两个缺口**（都是跑真机时才暴露的）：上一阶段加了按 `protected` 匹配 locator，
 但 MCP 的 `find_element` schema 没暴露这个字段，而它是 `additionalProperties: false`——
 AI 传了会被拒绝，等于这个能力对 AI 不存在；`aad find` 同样没有 `--protected`。两处都补了，
@@ -302,9 +322,17 @@ AI 传了会被拒绝，等于这个能力对 AI 不存在；`aad find` 同样�
 - DPI 与完整性级别探测为 `degraded`。
 - Windows script 沙箱缺网络/文件系统隔离，按 Python 原行为如实上报 `degraded` + `gaps`。
 - `aad-plugin` 的 `a_requested_manifest_completes_the_handshake` 偶发失败（`cargo test --workspace`
-  跑过一次失败，随后单独跑 4/4 通过、在committed 基线上加 4 路 CPU 负载跑 3/3 通过，
-  故非本次改动引入）。fixture 是 Python 子进程，握手默认 30s，怀疑是并行下解释器启动被拖慢。
+  跑过一次失败，随后单独跑 4/4 通过、在 committed 基线上加 4 路 CPU 负载跑 3/3 通过，
+  故非改动引入）。fixture 是 Python 子进程，握手默认 30s，怀疑是并行下解释器启动被拖慢。
   尚未定位，暂记录不掩盖。
+- ~~`durable_exec` 的 `flipping_intent_while_a_run_advances_never_surfaces_a_conflict` 偶发失败~~
+  **已定位并修复，不是环境问题，是 `resume` 的一个真 bug**。它先读 `desired_state` 看到
+  `pause`，再 CAS `pause -> run`；若这中间有别人清掉了 pause，CAS 落空，整个 resume 以
+  `JOURNAL.CONFLICT` 失败。但目标本来就是「让这个运行不处于暂停」，而它确实不处于暂停——
+  为调用方要到的状态报错是没有道理的。改为落空即重读继续（cancel 仍在下一个段边界照常兑现）。
+  同时修了测试脚手架的一个缺陷：存储失败后重试 `execute`，但失败的那次可能已经把运行推离
+  `pending`，重试于是撞上 `DURABLE.INVALID_STATE`——把脚手架自己的问题报成了产品故障。
+  基线 1/10 失败；两处都修好后 40/40 通过；撤销 driver 侧修复能复现（1/40），确认修复有效。
 
 ## 4. 不在计划内
 

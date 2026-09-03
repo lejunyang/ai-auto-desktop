@@ -124,6 +124,10 @@ steps:
 - **观察动作必须是只读的**，否则 `POLICY.DENIED`。会改变被检查对象的断言什么也证明不了。
 - **失败报 `effect=unknown`**，并在 `last_observation` 里附上当时**实际**看到的内容。动作
   本身成功了、只是预期结果没出现，桌面到底变没变确实不知道；往任何一个方向断言都是猜。
+- **等待期间观察失败是正常的。** 断言「点完之后对话框出现」时，对话框还没出现的那几轮
+  `find` 会报 `DRIVER.NOT_FOUND`——这被当作「还没到」而继续等，不是失败。反过来，不会
+  自愈的错误（未知 action、被拒的写、写错的 `observe`）立即上报，不会拖到超时才说。
+  一轮都没观察成功时，失败里会带 `last_observation_error` 说明它一直在失败什么。
 
 对通过 MCP 使用的 AI 来说这一条尤其要紧：它看不见屏幕，只能拿到那个状态字。
 
@@ -272,7 +276,7 @@ src/            Python 原型（保留备查，不再演进）
 ## 测试
 
 ```powershell
-cargo test --workspace     # 495 个测试
+cargo test --workspace     # 498 个测试
 cd gui; npm run test       # 47 个测试
 ```
 

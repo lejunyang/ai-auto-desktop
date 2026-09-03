@@ -186,6 +186,11 @@ impl UiaDriver {
                 "DRIVER.WINDOW_NOT_FOUND",
                 "no open window matched the selector",
             )
+            // A window that has not opened yet is as transient as an element
+            // that has not appeared yet, which is already retryable. A caller
+            // waiting for a dialog needs this to mean "not yet" rather than
+            // "never", or the wait cannot be expressed at all.
+            .retryable()
             .with_detail("selector", selector.clone())
             .with_detail("windows_open", json!(windows.len()))),
             many => Err(DriverError::new(
@@ -1085,6 +1090,10 @@ mod tests {
             .expect_err("a closed window must be reported, not invented");
 
         assert_eq!(error.code, "DRIVER.WINDOW_NOT_FOUND");
+        // The window may simply not have opened yet. A caller polling for a
+        // dialog needs to tell "not yet" from "never", and this flag is how:
+        // without it, waiting for a window to appear cannot be expressed.
+        assert!(error.retryable);
     }
 
     #[test]

@@ -569,24 +569,36 @@ fn flipping_intent_while_a_run_advances_never_surfaces_a_conflict() {
     // with itself, not the behaviour under test, so it is retried. What is never
     // tolerated is `JOURNAL.CONFLICT`: that would mean a request the journal
     // granted came back to the caller as an error.
-    let mut attempt = |first: bool| loop {
-        let result = if first {
-            executor.execute(&descriptor, "run-1", DurableOptions::default())
-        } else {
-            executor.resume(&descriptor, "run-1", DurableOptions::default())
-        };
-        match result {
-            Ok(outcome) => return outcome,
-            Err(error) => {
-                assert_ne!(
-                    error.code, "JOURNAL.CONFLICT",
-                    "a granted pause must stop the run, not fail it: {error:?}"
-                );
-                assert_eq!(
-                    error.code, "JOURNAL.STORAGE_FAILED",
-                    "unexpected failure: {error:?}"
-                );
-                std::thread::sleep(std::time::Duration::from_millis(5));
+    let mut attempt = |first: bool| {
+        // A storage failure is not necessarily a failure to *start*: the
+        // attempt may have moved the run out of `pending` before losing the
+        // write lock. Retrying `execute` then reports the run is already
+        // running -- a harness bug that looks like a product failure. So once
+        // the run has started, retries resume instead.
+        let mut starting = first;
+        loop {
+            let result = if starting {
+                executor.execute(&descriptor, "run-1", DurableOptions::default())
+            } else {
+                executor.resume(&descriptor, "run-1", DurableOptions::default())
+            };
+            match result {
+                Ok(outcome) => return outcome,
+                Err(error) => {
+                    assert_ne!(
+                        error.code, "JOURNAL.CONFLICT",
+                        "a granted pause must stop the run, not fail it: {error:?}"
+                    );
+                    if starting && error.code == "DURABLE.INVALID_STATE" {
+                        starting = false;
+                        continue;
+                    }
+                    assert_eq!(
+                        error.code, "JOURNAL.STORAGE_FAILED",
+                        "unexpected failure: {error:?}"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
             }
         }
     };

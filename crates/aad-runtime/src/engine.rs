@@ -553,18 +553,38 @@ only if you trust this descriptor."
         });
 
         let mut last_observation = Value::Null;
+        // Kept so a run that only ever failed to observe explains why, rather
+        // than reporting a bare "condition not satisfied" against a null.
+        let mut last_failure: Option<AutomationError> = None;
         loop {
+            let mut observation_failed = false;
             let scope = match &observe {
-                Some(observe) => {
-                    last_observation = self.observe_for_postcondition(observe)?;
-                    let mut scope = self.scope();
-                    scope.insert("observation".into(), last_observation.clone());
-                    scope
-                }
+                Some(observe) => match self.observe_for_postcondition(observe) {
+                    Ok(observation) => {
+                        last_observation = observation.clone();
+                        let mut scope = self.scope();
+                        scope.insert("observation".into(), observation);
+                        scope
+                    }
+                    // "Not there yet" is the normal state while waiting for a
+                    // dialog to open, and the driver already says so with
+                    // `retryable`. Treating it as fatal would make the timeout
+                    // unreachable and break the most common assertion there is:
+                    // wait for something to appear.
+                    Err(error) if error.retryable => {
+                        observation_failed = true;
+                        last_failure = Some(error);
+                        self.scope()
+                    }
+                    // A non-retryable failure -- unknown action, a refused
+                    // write, a malformed observe -- will not fix itself, so
+                    // retrying only delays the report.
+                    Err(error) => return Err(error),
+                },
                 None => self.scope(),
             };
 
-            if template::condition(&condition, &scope)? {
+            if !observation_failed && template::condition(&condition, &scope)? {
                 return Ok(());
             }
 
@@ -578,6 +598,11 @@ only if you trust this descriptor."
                     .with_effect("unknown");
                 if observe.is_some() {
                     error = error.with_detail("last_observation", last_observation);
+                }
+                // When the observation never once succeeded, the reason it kept
+                // failing is the actual diagnosis.
+                if let Some(failure) = last_failure {
+                    error = error.with_detail("last_observation_error", failure.to_json());
                 }
                 return Err(error);
             }
