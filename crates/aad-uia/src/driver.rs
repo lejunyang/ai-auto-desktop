@@ -263,7 +263,26 @@ impl UiaDriver {
             ));
         }
 
+        let expect = args.get("expect").and_then(Value::as_str);
+
         let Some(found) = matches.first() else {
+            // Absence is a legitimate answer when the caller is asking a
+            // question rather than acquiring a target: "has the dialog
+            // closed?", "has the spinner gone?". Without this, such an
+            // assertion cannot be written at all -- the observation fails, so
+            // the condition never gets to run.
+            //
+            // Not the default: a caller who wants an element in order to act on
+            // it is better served by a clear DRIVER.NOT_FOUND here than by an
+            // empty result that fails later as a puzzling missing target.
+            if expect == Some("optional") {
+                return Ok(json!({
+                    "found": false,
+                    "match_count": 0,
+                    "snapshot_id": snapshot.snapshot_id,
+                    "searched_nodes": snapshot.nodes.len(),
+                }));
+            }
             return Err(DriverError::new(
                 "DRIVER.NOT_FOUND",
                 "no element matched the locator",
@@ -279,6 +298,10 @@ impl UiaDriver {
             node_id: found.node_id.clone(),
         };
         Ok(json!({
+            // Always present, so one condition shape works whether or not the
+            // element turned up: a caller polling for a change should not have
+            // to write the test two different ways.
+            "found": true,
             "target": target.to_json(),
             // The compact form survives shell quoting, so it is what a caller
             // can paste straight into the next command.
@@ -967,6 +990,55 @@ mod tests {
     // driver has to find it among the windows open now.
     // -----------------------------------------------------------------------
 
+    /// A window holding two identical buttons, so ambiguity can be exercised.
+    struct TwoButtons;
+
+    impl Backend for TwoButtons {
+        fn list_windows(&self) -> Result<Vec<WindowInfo>> {
+            Ok(vec![titled("w1", "Dialog", "app.exe", Some("Dialog"))])
+        }
+
+        fn capture(&self, _window_id: &str, _limits: CaptureLimits) -> Result<CapturedTree> {
+            Ok(CapturedTree {
+                window: titled("w1", "Dialog", "app.exe", Some("Dialog")),
+                nodes: vec![
+                    node("e1", "Button", "OK", &["invoke"]),
+                    node("e2", "Button", "OK", &["invoke"]),
+                ],
+                root_id: Some("e1".into()),
+                truncated: false,
+            })
+        }
+
+        fn verify(&self, _window_id: &str, _node: &Node) -> Result<bool> {
+            Ok(true)
+        }
+
+        fn focus(&self, _window_id: &str, _node: &Node) -> Result<()> {
+            Ok(())
+        }
+
+        fn invoke(&self, _window_id: &str, _node: &Node) -> Result<()> {
+            Ok(())
+        }
+
+        fn set_value(&self, _window_id: &str, _node: &Node, _value: &str) -> Result<()> {
+            Ok(())
+        }
+
+        fn type_text(&self, _window_id: &str, _node: &Node, _text: &str) -> Result<()> {
+            Ok(())
+        }
+
+        fn pointer_click(&self, _window_id: &str, _node: &Node) -> Result<()> {
+            Ok(())
+        }
+
+        fn describe(&self) -> Value {
+            json!({"backend": "two-buttons"})
+        }
+    }
+
     /// A backend with several windows, for selector tests.
     struct ManyWindows(Vec<WindowInfo>);
 
@@ -1079,6 +1151,105 @@ mod tests {
         assert_eq!(error.details["match_count"], 2);
         // The caller needs to see the options to narrow the selector.
         assert!(error.details["candidates"].as_array().unwrap().len() == 2);
+    }
+
+    #[test]
+    fn tolerating_absence_does_not_tolerate_ambiguity() {
+        // Two different questions. "Is it gone?" must never quietly become
+        // "here is one of the several that matched" -- that is exactly how
+        // automation acts on the wrong element, and an assertion is the last
+        // place it should be introduced.
+        let driver = UiaDriver::new(Arc::new(TwoButtons));
+
+        let error = driver
+            .call(
+                "find",
+                &json!({
+                    "window_id": "w1",
+                    "locator": {"role": "Button"},
+                    "expect": "optional",
+                }),
+            )
+            .expect_err("several matches must still be refused");
+
+        assert_eq!(error.code, "DRIVER.AMBIGUOUS_MATCH");
+        assert_eq!(error.details["match_count"], json!(2));
+    }
+
+    #[test]
+    fn an_optional_find_reports_absence_instead_of_failing() {
+        // Asking "has it gone?" is not the same as asking for it. Without this
+        // an absent-assertion cannot be written at all: the observation fails,
+        // so the condition never runs, and since a retryable failure means
+        // "not yet" the assertion polls its whole timeout and then fails.
+        let driver = many();
+
+        let answer = driver
+            .call(
+                "find",
+                &json!({
+                    "window_id": "w1",
+                    "locator": {"name": "NotOnScreen"},
+                    "expect": "optional",
+                }),
+            )
+            .expect("absence is an answer, not an error");
+
+        assert_eq!(answer["found"], json!(false));
+        assert_eq!(answer["match_count"], json!(0));
+        // No target: there is nothing to act on, and inventing one would be the
+        // whole failure mode the reference discipline exists to prevent.
+        assert!(answer.get("target").is_none());
+    }
+
+    #[test]
+    fn an_optional_find_still_reports_what_it_does_find() {
+        // The counterpart. An implementation that always answered "absent"
+        // would satisfy the test above while making the assertion useless.
+        let driver = many();
+
+        let answer = driver
+            .call(
+                "find",
+                &json!({
+                    "window_id": "w1",
+                    "locator": {"name": "Save"},
+                    "expect": "optional",
+                }),
+            )
+            .expect("a present element is still found");
+
+        assert_eq!(answer["found"], json!(true));
+        assert_eq!(answer["match_count"], json!(1));
+        assert!(answer["ref"].as_str().is_some());
+    }
+
+    #[test]
+    fn find_still_fails_by_default_when_nothing_matches() {
+        // Erroring stays the default. A caller acquiring a target to act on is
+        // better served by a clear not-found here than by an empty result that
+        // fails later as a puzzling missing target.
+        let driver = many();
+
+        let error = driver
+            .call("find", &json!({"window_id": "w1", "locator": {"name": "NotOnScreen"}}))
+            .expect_err("acquiring a missing element must fail");
+
+        assert_eq!(error.code, "DRIVER.NOT_FOUND");
+    }
+
+    #[test]
+    fn a_found_element_always_says_so() {
+        // `found` is present on both paths so one condition shape works either
+        // way: a caller polling for a change should not have to write the test
+        // twice depending on the outcome.
+        let driver = many();
+
+        let answer = driver
+            .call("find", &json!({"window_id": "w1", "locator": {"name": "Save"}}))
+            .expect("the fixture has a Save button");
+
+        assert_eq!(answer["found"], json!(true));
     }
 
     #[test]

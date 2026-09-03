@@ -313,6 +313,91 @@ AI 传了会被拒绝，等于这个能力对 AI 不存在；`aad find` 同样�
 真机确认 `--protected true` 精确命中密码框，`--protected false` 命中 10 个时如实报
 `DRIVER.AMBIGUOUS_MATCH` 而不是猜第一个。
 
+### 2.11 断言：`absent` 之前根本写不出来
+
+上一段修好轮询之后，本来要做录制侧的 `assertion` 语法。动手前先逐个试了规范 §7.4 列的五种
+`expect.mode`，`absent`（「对话框关掉了」「转圈没了」）当场卡住。
+
+原因是两个各自合理的决定叠在一起变成了死结：`find` 在零匹配时报 `DRIVER.NOT_FOUND`，而上一段
+刚把这个错误定义成 `retryable`＝「还没到」。于是 `absent` 断言每一轮都被判定为「再等等」，
+耗尽 timeout，然后失败——**永远无法满足**。这不是慢，是不可能。
+
+Python 侧写的是 `${{ not observation.found }}`，但没有任何 driver 产出过 `found` 这个字段，
+所以那边同样没跑通过。
+
+给 `find` 加了 `expect: "optional"`：零匹配成为普通结果（`found: false`），而不是错误。
+默认仍然报错——为了操作而取元素时，清楚的 `DRIVER.NOT_FOUND` 好过一个空结果在后面以
+"target 不见了"的形式炸开。`found` 在两条路径上都有，所以同一个条件写法两种结果下都成立。
+
+**`optional` 不放宽歧义**：多个匹配依然报 `DRIVER.AMBIGUOUS_MATCH`。这一条是变异测试逼出来的
+——五个变异里前四个都被抓住，唯独"让 optional 也放过歧义匹配"没有任何测试拦得住。行为本身
+当时就是对的（真机上 11 个匹配，两种模式都报歧义），但没有东西把它固定住。补了守卫测试后
+五个变异全部被捕获。
+
+真机验证（`expect.mode: absent` 的两个方向）：
+- 断言一个确实不存在的元素不存在 → 0.16s 通过；
+- 断言一个明明还在的元素不存在 → 2.15s 报 `ACTION.POSTCONDITION_FAILED`，
+  `last_observation.found = true`、`match_count = 1`。
+
+只测前者的话，一个「永远回答 found: false」的桩也能通过——这正是 `always_absent` 变异。
+
+MCP 那一侧也补了：`find_element` 的 schema 是 `additionalProperties: false`，不显式加
+`expect` 的话 agent 根本传不进来，「对话框关了吗」这个问题在 MCP 上无法表达，唯一的回答是
+一个看起来像故障的错误。已通过真实 stdio 协议验过三种情况（在→found:true、
+不在→found:false、默认模式缺失→`DRIVER.NOT_FOUND`）。
+
+规范 §7.4 已补上这个机制，其中的 YAML 示例是从文档里抠出来直接跑过的。
+
+### 2.12 顺带查清的两件事（都不必做）
+
+**`requires.permissions`**：规范 §11.1 说编译产物必须声明它，否则 `validate` 能过但 `run`
+必被策略拒绝。照 `toDescriptor` 的真实输出构造了一份（无 `requires` 块）拿去跑——**直接成功**。
+这条描述的是 Python 运行时，不适用于 Rust 这套。规范该处需要标注适用范围。
+
+**引用完整性**：规范 §8 要求录制编译器自查悬空引用，理由是 workflow 编译器不查——后者确认
+属实（引用不存在的步骤、引用未声明的 input，`validate` 都放行，要到 `run` 才报
+`EXPRESSION.EVALUATION_FAILED`）。但录制侧**产生不出**悬空引用：每个录制动作展开成
+snapshot → find → act 三步，引用只指向同一次展开内部派生的 id，删除/禁用/重排都是整组一起动。
+凭据 input 也是同一个循环里声明和引用的。四种编辑操作各试一遍，悬空引用均为空。
+
+所以现在写这个校验就是**守着一个到不了的状态**——看起来像安全措施的死代码。等 `logic` 步骤
+或跨步骤引用真的进来了再说，那时它才有对象。
+
+### 2.13 那个偶发失败其实有三层，最后一层是测试在自欺
+
+§2.11 做完跑全量，那个测试又红了，但**报的是另一个错**。前后一共三种症状，每次我都只看到
+一层就动手改，改完再跑就换一张脸：
+
+| 症状 | 真正的原因 |
+|---|---|
+| `DURABLE.INVALID_STATE` | 脚手架重试 `execute`，但失败的那次已经把运行推离 `pending` |
+| `JOURNAL.CONFLICT` | **产品 bug**：`resume` 的 TOCTOU（已修，见上一条） |
+| `JOURNAL.LEASE_CONFLICT` | `DurableOptions::default()` 每次生成新 owner id，重试等于换了个人来抢锁 |
+| `UnknownEffect != Succeeded` | 见下 |
+
+第三层我又想当然了：把 owner id 固定成一个，让重试以同一身份回来。结果**更糟**——固定之后
+重试真的抢到了 lease，而那个运行的段是被写锁风暴从中间打断的，`reclaim` 一个段中断的运行
+按设计就要判 `UNKNOWN_EFFECT`（已派发但结果未知的步骤绝不能默默重放）。于是我把「抢不到锁」
+变成了「抢到了锁并宣布这个运行不可恢复」。
+
+**第三次改错之后我停下来加了诊断输出**，让测试把 run 的 error 和最后 12 条事件打出来，而不是
+再猜一次。一次就看清了：`segment_entered step36` 之后没有对应的 `exited`，紧接着 `run.reclaimed`。
+产品侧完全正确（5s busy timeout、WAL、pragma 逐项校验），是**风暴把被测对象饿死了**。
+
+真正的修法是让风暴去输：runner 的 busy timeout 给 30s，风暴那条连接给 50ms。风暴仍然在同样的
+微秒级窗口里翻转 intent，被测性质一个字没改。
+
+**最后一层最难看：这个测试有一半时间在空转。** 修好之后连跑 8 次打印 `legs`（运行被暂停的
+次数），结果是 1,3,1,2,1,2,2,1——**一半的运行压根没被打断过**，没碰到任何段边界，就算 intent
+处理完全坏掉也照样绿。也就是说这个测试长期有一半的通过是假的。
+
+改成：一轮没打断就换个新 run 再来，最多 12 轮，全都打不断才算失败。现在每一次运行都真的
+撞在那个窗口上。效果可测量——撤销 TOCTOU 修复后的检出率从 **1/40 升到 3/25**（约 5 倍）。
+改完连跑 60 次全绿。
+
+教训记在这：**一个偶发失败连续换三张脸，说明每次都只诊断了一层。第三次就该去加诊断输出，
+而不是第三次去猜。**
+
 ## 3. 已知环境限制（非缺口，如实记录）
 
 - 本机装有输入过滤软件（AutoHotkey / LogiBolt 一类），`SendInput` 对 ≥2 事件的批次返回
@@ -326,6 +411,7 @@ AI 传了会被拒绝，等于这个能力对 AI 不存在；`aad find` 同样�
   故非改动引入）。fixture 是 Python 子进程，握手默认 30s，怀疑是并行下解释器启动被拖慢。
   尚未定位，暂记录不掩盖。
 - ~~`durable_exec` 的 `flipping_intent_while_a_run_advances_never_surfaces_a_conflict` 偶发失败~~
+  （下面这条记录了第一次修复；后续又暴露两层，见 §2.13）
   **已定位并修复，不是环境问题，是 `resume` 的一个真 bug**。它先读 `desired_state` 看到
   `pause`，再 CAS `pause -> run`；若这中间有别人清掉了 pause，CAS 落空，整个 resume 以
   `JOURNAL.CONFLICT` 失败。但目标本来就是「让这个运行不处于暂停」，而它确实不处于暂停——

@@ -129,6 +129,27 @@ steps:
   自愈的错误（未知 action、被拒的写、写错的 `observe`）立即上报，不会拖到超时才说。
   一轮都没观察成功时，失败里会带 `last_observation_error` 说明它一直在失败什么。
 
+反过来问「东西没了吗」——对话框关掉了、转圈消失了——要给 `find` 加 `expect: optional`：
+
+```yaml
+postcondition:
+  condition: ${{ not observation.found }}
+  observe:
+    uses: desktop.windows_uia.find@1
+    with:
+      window: { title: "保存" }
+      locator: { name: "正在保存…" }
+      expect: optional      # 少了它，这个断言永远不成立
+  timeout: 5s
+```
+
+没有 `expect: optional` 时，找不到＝报错＝「还没到」，于是断言会一直等到超时再失败。加上之后
+找不到就是一个普通结果（`found: false`），断言才成立。`found` 两种结果下都有，所以条件不用
+写两遍。默认仍然报错：为了操作而取元素时，清楚的「没找到」好过一个空结果在后面炸开。
+
+`optional` 只放宽「没有」，不放宽「有好几个」——匹配到多个仍然报错，因为「在不在」不该被
+答成「给你其中一个」。
+
 对通过 MCP 使用的 AI 来说这一条尤其要紧：它看不见屏幕，只能拿到那个状态字。
 
 ## 持久化运行（可暂停、可恢复、进程崩溃也不丢）
@@ -276,7 +297,7 @@ src/            Python 原型（保留备查，不再演进）
 ## 测试
 
 ```powershell
-cargo test --workspace     # 498 个测试
+cargo test --workspace     # 504 个测试
 cd gui; npm run test       # 47 个测试
 ```
 

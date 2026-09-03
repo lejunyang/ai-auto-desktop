@@ -310,6 +310,28 @@ UIA 要求 MTA（Rust 实现实测：在窗口框架所需的 STA 上构造 driv
 
 `expect.mode` 为 `exists|absent|value_equals|value_matches|state_equals`。编译时映射为宿主 action 的 `postcondition.observe` + `condition`。现有契约要求观察动作必须是 `read_only` 且全部错误为 `not_applied`——`find` 与 `snapshot` 满足，因此 `observe.action` **必须**限定在这两者之内。
 
+**`absent` 需要 `expect: "optional"`**（2026-09-03 实测后补）。`find` 默认在零匹配时报
+`DRIVER.NOT_FOUND`，而该错误是 `retryable`，会被轮询当成「还没到」；于是 `absent` 断言必然
+耗尽 timeout 再失败——**永远无法满足**。`expect: "optional"` 让零匹配成为普通结果
+（`found: false`），`absent` 才写得出来：
+
+```yaml
+condition: ${{ not observation.found }}
+observe:
+  uses: desktop.windows_uia.find@1
+  with:
+    window: { title: "..." }
+    locator: { name: "..." }
+    expect: optional          # 少了这个，断言永远不成立
+```
+
+`found` 在两条路径上都有，所以同一个条件写法在"找到了"和"没找到"两种结果下都成立。
+报错仍是默认行为：为了操作而取元素时，清楚的 `DRIVER.NOT_FOUND` 好过一个空结果在后面
+以"target 不见了"的形式炸开。
+
+`optional` **不放宽歧义**——多个匹配依然报 `DRIVER.AMBIGUOUS_MATCH`。「在不在」和
+「是哪一个」是两个问题，把前者答成"给你其中一个"正是点错按钮的由来。
+
 回放判定语义：**没有 assertion 的 interaction 步骤不构成「回放成功」**。它只证明动作被派发，不证明产生了预期效果。录制器应当为每个写动作自动提议一条 assertion，并在 UI 中标出缺失 assertion 的步骤。
 
 ### 7.5 `logic`：人工插入的自定义逻辑

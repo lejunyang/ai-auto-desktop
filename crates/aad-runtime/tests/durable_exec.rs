@@ -38,6 +38,13 @@ impl TempDir {
     fn open(&self) -> JournalStore {
         JournalStore::open(self.journal_path()).expect("open journal")
     }
+
+    /// Open with an explicit busy timeout, for tests that deliberately contend
+    /// for the write lock and need to control who loses.
+    fn open_with_timeout(&self, busy_timeout_ms: u32) -> JournalStore {
+        JournalStore::open_with_timeout(self.journal_path(), busy_timeout_ms)
+            .expect("open journal")
+    }
 }
 
 impl Drop for TempDir {
@@ -511,7 +518,21 @@ fn a_pause_requested_partway_stops_at_the_next_boundary_and_keeps_progress() {
 /// across many boundaries until it lands there.
 #[test]
 fn flipping_intent_while_a_run_advances_never_surfaces_a_conflict() {
-    let temp = TempDir::new("intent-storm");
+    // A run the storm never manages to interrupt exercises no boundary and
+    // proves nothing -- measured, that is roughly half of them. Repeat on
+    // fresh runs until one is genuinely interrupted, so the assertions inside
+    // always get something to judge.
+    for round in 0..12 {
+        if storm_round(round) {
+            return;
+        }
+    }
+    panic!("the storm never interrupted a run, so nothing about intent was tested");
+}
+
+/// One round. Returns whether the storm actually paused the run.
+fn storm_round(round: usize) -> bool {
+    let temp = TempDir::new(&format!("intent-storm-{round}"));
     let descriptor = compile(counting_workflow(40));
     let store = temp.open();
     let digest = aad_runtime::plan_digest(&descriptor);
@@ -531,8 +552,15 @@ fn flipping_intent_while_a_run_advances_never_surfaces_a_conflict() {
     // a journal validates its pragmas, which needs the write lock; doing that
     // under a write storm fails on lock contention and says nothing about
     // intent handling.
-    let executor = DurableExecutor::new(temp.open());
-    let control = temp.open();
+    // The runner waits far longer for the write lock than the storm does. A
+    // storm that starves the runner *inside* a segment leaves the run
+    // genuinely unrecoverable -- a dispatched step whose outcome is unknown is
+    // correctly refused rather than silently repeated -- and no retry can undo
+    // that. Losing those races must fall on the storm, which is scenery, not on
+    // the runner, which is the subject. The flips still land in the same
+    // microsecond windows either way.
+    let executor = DurableExecutor::new(temp.open_with_timeout(30_000));
+    let control = temp.open_with_timeout(50);
 
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let flipping = {
@@ -616,6 +644,21 @@ fn flipping_intent_while_a_run_advances_never_surfaces_a_conflict() {
 
     // However many times it stopped and restarted, the work must be exactly
     // right: all forty steps, each dispatched once.
+    if outcome.run.status != RunStatus::Succeeded {
+        let events = store.list_events("run-1", 0, 5000).expect("events");
+        let tail: Vec<String> = events
+            .iter()
+            .rev()
+            .take(12)
+            .map(|event| format!("{} {}", event.event_type, event.payload))
+            .collect();
+        panic!(
+            "run ended {:?}\nerror: {:?}\nlegs: {legs}\nlast events (newest first):\n  {}",
+            outcome.run.status,
+            outcome.run.error,
+            tail.join("\n  ")
+        );
+    }
     assert_eq!(outcome.run.status, RunStatus::Succeeded);
     assert_eq!(outcome.run.output.as_ref().expect("output")["total"], json!(40));
     let entered: Vec<String> = store
@@ -630,6 +673,8 @@ fn flipping_intent_while_a_run_advances_never_surfaces_a_conflict() {
     unique.dedup();
     assert_eq!(entered.len(), 40, "every step ran");
     assert_eq!(unique.len(), 40, "and none ran twice: {entered:?}");
+
+    legs > 1
 }
 
 

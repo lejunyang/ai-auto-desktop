@@ -110,7 +110,9 @@ each one. Use this to see what is on screen before acting.",
             name: "find_element",
             description: "Find the single element matching a locator and return a target \
 for it. Fails if the locator matches more than one element, listing the \
-candidates so the locator can be narrowed.",
+candidates so the locator can be narrowed. To check whether something has gone \
+away, pass expect=optional and read `found` instead of treating the miss as an \
+error.",
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -119,7 +121,15 @@ candidates so the locator can be narrowed.",
                         "type": "string",
                         "description": "Search an existing snapshot instead of taking a new one."
                     },
-                    "locator": locator_schema()
+                    "locator": locator_schema(),
+                    "expect": {
+                        "type": "string",
+                        "enum": ["one", "optional"],
+                        "description": "one (default): a miss is an error, which is what \
+you want when acquiring something to act on. optional: a miss is an ordinary \
+result with found=false, for asking whether a dialog has closed or a spinner \
+has gone. Neither one lets an ambiguous match through."
+                    }
                 },
                 "required": ["locator"],
                 "additionalProperties": false
@@ -541,6 +551,34 @@ what it does support.",
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn asking_whether_something_is_gone_is_expressible() {
+        // Without this an agent cannot ask "has the dialog closed?" at all: the
+        // schema is closed, so the parameter would be rejected, and the only
+        // available answer -- an error -- reads like a malfunction rather than
+        // a no.
+        let tool = find("find_element").expect("find_element must exist");
+        let expect = &tool.schema["properties"]["expect"];
+
+        assert!(
+            !expect.is_null(),
+            "find_element must let a caller say a miss is acceptable"
+        );
+
+        let modes: Vec<&str> = expect["enum"]
+            .as_array()
+            .expect("expect must be an enum so the choices are discoverable")
+            .iter()
+            .map(|value| value.as_str().expect("a string mode"))
+            .collect();
+        assert!(modes.contains(&"optional"), "modes were {modes:?}");
+
+        // Ambiguity is not one of the choices. Relaxing "which one did you
+        // mean" is how automation acts on the wrong element, and that must not
+        // be reachable by asking a question about absence.
+        assert!(!modes.contains(&"any"), "modes were {modes:?}");
+    }
 
     #[test]
     fn every_tool_publishes_a_usable_schema() {
