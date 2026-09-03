@@ -183,7 +183,7 @@ struct DescribeArgs {
     max_nodes: Option<u32>,
 }
 
-#[derive(Args)]
+#[derive(Args, Default)]
 struct FindArgs {
     /// The window to search, from `aad apps`.
     window_id: String,
@@ -211,6 +211,36 @@ struct FindArgs {
 
     protected: Option<bool>,
 
+    /// Which one to take when several match: a number from 1, `first` or `last`.
+    ///
+    /// Rows, repeated toolbar buttons and unlabelled fields often share every
+    /// attribute, so counting is the only way to tell them apart. Counted down
+    /// the screen and then across, which is the order they are read in.
+    #[arg(long)]
+    nth: Option<String>,
+
+    /// Find it beside another element, named here.
+    ///
+    /// For a control whose own label is useless or absent: the box next to
+    /// "Username" is describable even when the box itself has no name.
+    #[arg(long, value_name = "NAME")]
+    near: Option<String>,
+
+    /// Which way to look from `--near`: left, right, above, below.
+    #[arg(long, requires = "near")]
+    direction: Option<String>,
+
+    /// Ignore anything further than this many pixels from `--near`.
+    #[arg(long, requires = "near")]
+    within: Option<i32>,
+
+    /// The whole locator as JSON, for what the flags above cannot express.
+    ///
+    /// Anchors can nest -- "the button beside the field beside Username" --
+    /// and that shape does not fit into flags. Given this, the other match
+    /// flags are ignored.
+    #[arg(long, value_name = "JSON", conflicts_with_all = ["role", "name", "automation_id", "nth", "near"])]
+    locator: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -378,6 +408,31 @@ fn dispatch(command: &Command) -> (Value, u8) {
                 .map_err(|error| driver_failure(&error))
         }),
         Command::Find(args) => {
+            // A whole locator as JSON wins outright: it is the escape hatch for
+            // shapes the flags cannot express, so mixing the two would only
+            // raise the question of which half applied.
+            if let Some(raw) = &args.locator {
+                let parsed: Value = match serde_json::from_str(raw) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        return (
+                            failure(
+                                "CLI.INVALID_ARGUMENTS",
+                                &format!("--locator is not valid JSON: {error}"),
+                                None,
+                            ),
+                            EXIT_USAGE,
+                        )
+                    }
+                };
+                let window_id = args.window_id.clone();
+                return with_driver(move |driver| {
+                    driver
+                        .call("find", &json!({"window_id": window_id, "locator": parsed}))
+                        .map_err(|error| driver_failure(&error))
+                });
+            }
+
             let mut locator = serde_json::Map::new();
             if let Some(role) = &args.role {
                 locator.insert("role".into(), json!(role));
@@ -403,11 +458,35 @@ fn dispatch(command: &Command) -> (Value, u8) {
             if args.contains {
                 locator.insert("match".into(), json!("contains"));
             }
+            if let Some(nth) = &args.nth {
+                // A number if it looks like one, otherwise the word, so both
+                // `--nth 2` and `--nth last` reach the driver in the shape it
+                // expects. Validation belongs to the locator parser, which
+                // reports the position rules in one place.
+                locator.insert(
+                    "nth".into(),
+                    match nth.parse::<u64>() {
+                        Ok(index) => json!(index),
+                        Err(_) => json!(nth),
+                    },
+                );
+            }
+            if let Some(near) = &args.near {
+                let mut relation = serde_json::Map::new();
+                relation.insert("anchor".into(), json!({"name": near}));
+                if let Some(direction) = &args.direction {
+                    relation.insert("direction".into(), json!(direction));
+                }
+                if let Some(within) = args.within {
+                    relation.insert("within".into(), json!(within));
+                }
+                locator.insert("near".into(), Value::Object(relation));
+            }
             if locator.is_empty() {
                 return (
                     failure(
                         "CLI.INVALID_ARGUMENTS",
-                        "give at least one of --role, --name, --automation-id or --protected",
+                        "give at least one of --role, --name, --automation-id, --protected, --nth, --near or --locator",
                         None,
                     ),
                     EXIT_USAGE,
@@ -1075,11 +1154,7 @@ mod tests {
     fn a_find_with_no_criteria_is_a_usage_error() {
         let (payload, code) = dispatch(&Command::Find(FindArgs {
             window_id: "hwnd:1".into(),
-            role: None,
-            name: None,
-            automation_id: None,
-            contains: false,
-            protected: None,
+            ..Default::default()
         }));
 
         assert_eq!(code, EXIT_USAGE);
@@ -1094,15 +1169,50 @@ mod tests {
         // what fails, not argument validation.
         let (payload, code) = dispatch(&Command::Find(FindArgs {
             window_id: "hwnd:1".into(),
-            role: None,
-            name: None,
-            automation_id: None,
-            contains: false,
             protected: Some(true),
+            ..Default::default()
         }));
 
         assert_ne!(code, EXIT_USAGE, "protected alone must be a valid criterion");
         assert_ne!(payload["error"]["code"], "CLI.INVALID_ARGUMENTS");
+    }
+
+    #[test]
+    fn a_position_alone_is_enough_to_search() {
+        // "the third button" and "the box next to Username" are whole
+        // descriptions on their own. Requiring an attribute alongside them
+        // would rule out the elements that need them most -- the ones with no
+        // usable attribute at all.
+        for args in [
+            FindArgs {
+                window_id: "hwnd:1".into(),
+                nth: Some("2".into()),
+                ..Default::default()
+            },
+            FindArgs {
+                window_id: "hwnd:1".into(),
+                near: Some("Username".into()),
+                ..Default::default()
+            },
+        ] {
+            let (payload, code) = dispatch(&Command::Find(args));
+            assert_ne!(code, EXIT_USAGE, "a position alone must be a valid criterion");
+            assert_ne!(payload["error"]["code"], "CLI.INVALID_ARGUMENTS");
+        }
+    }
+
+    #[test]
+    fn a_malformed_locator_json_is_a_usage_error() {
+        // The escape hatch is hand-written or agent-written JSON, so a typo in
+        // it has to say so rather than reaching the driver as an empty locator.
+        let (payload, code) = dispatch(&Command::Find(FindArgs {
+            window_id: "hwnd:1".into(),
+            locator: Some("{not json".into()),
+            ..Default::default()
+        }));
+
+        assert_eq!(code, EXIT_USAGE);
+        assert_eq!(payload["error"]["code"], "CLI.INVALID_ARGUMENTS");
     }
 
     #[test]

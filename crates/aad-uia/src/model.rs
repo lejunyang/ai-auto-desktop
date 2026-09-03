@@ -343,13 +343,24 @@ impl Target {
     }
 }
 
+/// How deeply one locator may anchor to another.
+///
+/// Two levels covers "the button next to the field next to Username"; beyond
+/// that the description is harder to follow than a plain attribute, and each
+/// level multiplies the search.
+const MAX_ANCHOR_DEPTH: usize = 3;
+
 /// A declarative element selector.
 ///
 /// Every populated field must match, so adding a field always narrows the
 /// result.  Matching is exact by default; `contains` is opt-in per query
 /// because a substring match that silently picks a different button is exactly
 /// the failure mode this driver exists to prevent.
-#[derive(Clone, Debug, Default, Deserialize)]
+// Deliberately not `Deserialize`: `from_value` is the only way in, because it
+// is where the rules live -- an ordinal of 0, an unknown direction, an anchor
+// nested too deep. A derived implementation would accept all of those, and the
+// checks would then apply only to whichever path happened to call the parser.
+#[derive(Clone, Debug, Default)]
 pub struct Locator {
     pub role: Option<String>,
     pub name: Option<String>,
@@ -361,10 +372,78 @@ pub struct Locator {
     pub actions: Option<Vec<String>>,
     /// `exact` (default) or `contains`.
     pub match_mode: Option<String>,
+    /// Which of the matching elements to take, when several is expected.
+    pub nth: Option<Ordinal>,
+    /// Position relative to another element, itself located by a locator.
+    pub near: Option<Box<Proximity>>,
+}
+
+/// Which one of several matching elements is meant.
+///
+/// Attributes alone cannot express "the third button": that is a property of
+/// the element's position among its peers, not of the element. Rows in a list,
+/// repeated toolbar buttons and unlabelled fields often have no distinguishing
+/// attribute at all, and on some toolkits the ones they do have are unstable --
+/// measured on WinForms, automation_id and class_name both change between runs
+/// of the same program, so a locator built from them works in the session that
+/// recorded it and fails the next day.
+///
+/// Ordering is by position on screen (top to bottom, then left to right)
+/// rather than enumeration order, because that is the order the instruction
+/// "the third button" refers to. Enumeration order is an implementation detail
+/// of the accessibility tree and does not have to agree with what is on screen.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Ordinal {
+    /// 1-based: `first` is 1. Zero is rejected at parse time, since an
+    /// off-by-one here silently acts on the wrong element.
+    Index(usize),
+    Last,
+}
+
+/// A spatial relationship to another element.
+///
+/// "The button next to Username" is how a person describes a control that has
+/// no usable label of its own. The anchor is found first, then candidates are
+/// ranked by distance from it.
+#[derive(Clone, Debug)]
+pub struct Proximity {
+    /// How to find the anchor. Boxed via `Proximity` so an anchor can itself
+    /// be described positionally, though nesting is bounded (see MAX_DEPTH).
+    pub anchor: Locator,
+    pub direction: Direction,
+    /// Ignore anchors further than this, in pixels. Without a bound the
+    /// "nearest" element can be on the far side of the window, which is not
+    /// what "next to" means to anyone.
+    pub within: Option<i32>,
+}
+
+/// Which way to look from the anchor.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Direction {
+    /// Nearest in any direction.
+    Any,
+    Left,
+    Right,
+    Above,
+    Below,
 }
 
 impl Locator {
     pub fn from_value(value: &Value) -> Result<Self, String> {
+        Self::from_value_at(value, 0)
+    }
+
+    /// Parse, tracking how deeply anchors are nested.
+    ///
+    /// An anchor is itself a locator and may have its own anchor. That is
+    /// occasionally useful, but unbounded nesting turns one `find` into an
+    /// exponential search, so the chain is capped rather than trusted.
+    fn from_value_at(value: &Value, depth: usize) -> Result<Self, String> {
+        if depth > MAX_ANCHOR_DEPTH {
+            return Err(format!(
+                "locator.near is nested more than {MAX_ANCHOR_DEPTH} deep"
+            ));
+        }
         let object = value.as_object().ok_or("locator must be an object")?;
         if object.is_empty() {
             return Err("locator must constrain at least one field".to_string());
@@ -414,6 +493,65 @@ impl Locator {
             Some(_) => return Err("locator.actions must be an array".to_string()),
         };
 
+        let nth = match object.get("nth") {
+            None => None,
+            Some(Value::String(word)) => match word.as_str() {
+                "first" => Some(Ordinal::Index(1)),
+                "last" => Some(Ordinal::Last),
+                other => {
+                    return Err(format!(
+                        "locator.nth must be a positive number, \"first\" or \"last\", got {other:?}"
+                    ))
+                }
+            },
+            Some(Value::Number(number)) => {
+                let index = number
+                    .as_u64()
+                    .ok_or("locator.nth must be a whole number")?;
+                if index == 0 {
+                    // Counting from zero here would be a silent off-by-one
+                    // against every human-written instruction.
+                    return Err("locator.nth counts from 1, so 0 is not a position".to_string());
+                }
+                Some(Ordinal::Index(index as usize))
+            }
+            Some(_) => return Err("locator.nth must be a number or a word".to_string()),
+        };
+
+        let near = match object.get("near") {
+            None => None,
+            Some(Value::Object(map)) => {
+                let anchor_value = map
+                    .get("anchor")
+                    .ok_or("locator.near requires an anchor")?;
+                let anchor = Self::from_value_at(anchor_value, depth + 1)?;
+                let direction = match map.get("direction").and_then(Value::as_str) {
+                    None | Some("any") => Direction::Any,
+                    Some("left") => Direction::Left,
+                    Some("right") => Direction::Right,
+                    Some("above") => Direction::Above,
+                    Some("below") => Direction::Below,
+                    Some(other) => {
+                        return Err(format!("locator.near.direction {other:?} is not known"))
+                    }
+                };
+                let within = match map.get("within") {
+                    None => None,
+                    Some(value) => {
+                        let pixels = value
+                            .as_i64()
+                            .ok_or("locator.near.within must be a number of pixels")?;
+                        if pixels <= 0 {
+                            return Err("locator.near.within must be positive".to_string());
+                        }
+                        Some(pixels as i32)
+                    }
+                };
+                Some(Box::new(Proximity { anchor, direction, within }))
+            }
+            Some(_) => return Err("locator.near must be an object".to_string()),
+        };
+
         Ok(Self {
             role: text("role"),
             name: text("name"),
@@ -424,6 +562,8 @@ impl Locator {
             states,
             actions,
             match_mode: Some(match_mode),
+            nth,
+            near,
         })
     }
 
@@ -553,6 +693,8 @@ impl Locator {
             states: None,
             actions: None,
             match_mode: None,
+            nth: None,
+            near: None,
         }
     }
 
@@ -580,7 +722,71 @@ impl Locator {
         if let Some(states) = &self.states {
             object.insert("states".to_string(), states.to_json());
         }
+        if let Some(nth) = &self.nth {
+            object.insert(
+                "nth".to_string(),
+                match nth {
+                    Ordinal::Index(index) => json!(index),
+                    Ordinal::Last => json!("last"),
+                },
+            );
+        }
+        if let Some(near) = &self.near {
+            let mut relation = serde_json::Map::new();
+            relation.insert("anchor".to_string(), near.anchor.to_json());
+            if near.direction != Direction::Any {
+                relation.insert(
+                    "direction".to_string(),
+                    json!(match near.direction {
+                        Direction::Left => "left",
+                        Direction::Right => "right",
+                        Direction::Above => "above",
+                        Direction::Below => "below",
+                        Direction::Any => unreachable!(),
+                    }),
+                );
+            }
+            if let Some(within) = near.within {
+                relation.insert("within".to_string(), json!(within));
+            }
+            object.insert("near".to_string(), Value::Object(relation));
+        }
         Value::Object(object)
+    }
+
+    /// Every element this locator selects, in the order it selects them.
+    ///
+    /// This is the real entry point: `matches` only tests one node against the
+    /// attribute predicates, which cannot answer "the third button" or "the
+    /// field next to Username" -- both are properties of an element's place
+    /// among the others, so they need the whole set.
+    ///
+    /// The order of the three stages is not arbitrary. Attributes narrow to
+    /// candidates, proximity filters those, and only then does an ordinal
+    /// count. Counting first would make "the second button next to Username"
+    /// mean "the second button overall, which happens to be near Username" --
+    /// a different element, and usually none at all.
+    pub fn resolve<'a>(&self, nodes: &'a [Node]) -> Vec<&'a Node> {
+        let mut candidates: Vec<&Node> = nodes.iter().filter(|node| self.matches(node)).collect();
+
+        if let Some(near) = &self.near {
+            candidates = near.filter(candidates, nodes);
+        }
+
+        match self.nth {
+            None => candidates,
+            Some(ordinal) => {
+                // Screen order, not enumeration order: "the third button" means
+                // the third one a person sees, and the accessibility tree does
+                // not promise to enumerate in that order.
+                candidates.sort_by_key(|node| reading_order(node));
+                let picked = match ordinal {
+                    Ordinal::Index(index) => candidates.get(index - 1).copied(),
+                    Ordinal::Last => candidates.last().copied(),
+                };
+                picked.into_iter().collect()
+            }
+        }
     }
 
     /// Whether this locator matches `node` and nothing else.
@@ -588,9 +794,130 @@ impl Locator {
     /// Both halves matter: a locator that is unique but matches a *different*
     /// node would send the action to the wrong element.
     fn unique_for(&self, node: &Node, nodes: &[Node]) -> bool {
-        let mut matched = nodes.iter().filter(|other| self.matches(other));
-        matched.next().map(|first| first.node_id == node.node_id) == Some(true)
-            && matched.next().is_none()
+        // Via `resolve`, so a positional locator is judged by what it actually
+        // selects. Testing the attribute predicates alone would call "the third
+        // button" ambiguous whenever more than one button exists, which is
+        // exactly when it is useful.
+        let selected = self.resolve(nodes);
+        selected.len() == 1 && selected[0].node_id == node.node_id
+    }
+}
+
+impl Proximity {
+    /// Keep the candidates that sit in the requested direction from the anchor,
+    /// nearest first.
+    ///
+    /// Returns nothing when the anchor cannot be found, rather than falling
+    /// back to the unfiltered candidates: "the field next to Username" with no
+    /// Username on screen is a failed lookup, and quietly dropping the
+    /// constraint would act on an arbitrary field instead.
+    fn filter<'a>(&self, candidates: Vec<&'a Node>, nodes: &'a [Node]) -> Vec<&'a Node> {
+        // The anchor is resolved with the full locator machinery, so it can
+        // itself be positional.
+        let anchors = self.anchor.resolve(nodes);
+        // An ambiguous anchor is no anchor: picking one of several would make
+        // the result depend on enumeration order.
+        let [anchor] = anchors[..] else {
+            return Vec::new();
+        };
+        let Some(origin) = anchor.bounds else {
+            return Vec::new();
+        };
+
+        let mut ranked: Vec<(i64, &Node)> = candidates
+            .into_iter()
+            .filter(|node| node.node_id != anchor.node_id)
+            .filter_map(|node| {
+                let bounds = node.bounds?;
+                if !self.direction.holds(&origin, &bounds) {
+                    return None;
+                }
+                let distance = gap(&origin, &bounds);
+                match self.within {
+                    // Squared on this side of the comparison, because `gap`
+                    // returns a squared distance to stay in integers. Comparing
+                    // against the raw limit would quietly square the threshold:
+                    // `within: 40` would mean 6 pixels, and a label 10 pixels
+                    // from its own field would be judged too far away.
+                    Some(limit) => {
+                        let limit = i64::from(limit);
+                        (distance <= limit * limit).then_some((distance, node))
+                    }
+                    None => Some((distance, node)),
+                }
+            })
+            .collect();
+
+        // Nearest first, with reading order breaking ties so the result does
+        // not depend on enumeration order.
+        ranked.sort_by_key(|(distance, node)| (*distance, reading_order(node)));
+        ranked.into_iter().map(|(_, node)| node).collect()
+    }
+}
+
+impl Direction {
+    /// Whether `other` lies this way from `origin`.
+    ///
+    /// Judged by centres, and requiring genuine separation on the axis: two
+    /// controls on the same row are not "above" one another just because a few
+    /// pixels of rounding separate their centres.
+    fn holds(&self, origin: &Bounds, other: &Bounds) -> bool {
+        let (ox, oy) = origin.center();
+        let (tx, ty) = other.center();
+        // Overlapping on an axis means they are aligned along it, which is the
+        // normal case for a label and its field.
+        let vertical_overlap = other.y < origin.y + origin.height && origin.y < other.y + other.height;
+        let horizontal_overlap = other.x < origin.x + origin.width && origin.x < other.x + other.width;
+        match self {
+            Direction::Any => true,
+            // A field to the right of its label is usually on the same row, so
+            // "right" means right-and-roughly-level, not merely right.
+            Direction::Right => tx > ox && vertical_overlap,
+            Direction::Left => tx < ox && vertical_overlap,
+            Direction::Below => ty > oy && horizontal_overlap,
+            Direction::Above => ty < oy && horizontal_overlap,
+        }
+    }
+}
+
+/// Squared distance between the nearest edges of two rectangles.
+///
+/// Squared, not actual: only the ordering matters for ranking, and squaring
+/// avoids a square root and keeps everything in integers. Callers comparing
+/// against a pixel threshold must square the threshold, not this.
+///
+/// Edge distance rather than centre distance: a wide text field beside a short
+/// label is closer to it than centre-to-centre arithmetic suggests, and "next
+/// to" is about the gap between them.
+fn gap(a: &Bounds, b: &Bounds) -> i64 {
+    let dx = if b.x > a.x + a.width {
+        i64::from(b.x - (a.x + a.width))
+    } else if a.x > b.x + b.width {
+        i64::from(a.x - (b.x + b.width))
+    } else {
+        0
+    };
+    let dy = if b.y > a.y + a.height {
+        i64::from(b.y - (a.y + a.height))
+    } else if a.y > b.y + b.height {
+        i64::from(a.y - (b.y + b.height))
+    } else {
+        0
+    };
+    dx * dx + dy * dy
+}
+
+/// A node's place in reading order: down the screen, then across.
+///
+/// Nodes without bounds sort last; they cannot be placed, and putting them
+/// first would shift every position a person counted by eye.
+fn reading_order(node: &Node) -> (i32, i32, i32) {
+    match node.bounds {
+        Some(bounds) => {
+            let (x, y) = bounds.center();
+            (0, y, x)
+        }
+        None => (1, 0, 0),
     }
 }
 
@@ -903,6 +1230,400 @@ mod tests {
         let anonymous = node("n1", "Button", None);
         let locator = Locator::from_value(&json!({"name": "Save"})).unwrap();
         assert!(!locator.matches(&anonymous));
+    }
+
+    // -----------------------------------------------------------------------
+    // Describing an element by where it is
+    //
+    // Attributes cannot say "the third button" or "the box next to Username",
+    // which is how a person -- or an agent taking instructions from one --
+    // actually refers to controls that have no distinguishing label. Measured
+    // on WinForms, the attributes that would otherwise serve (automation_id,
+    // class_name) change between runs of the same program, so a description
+    // built from them holds only for the session that recorded it.
+    // -----------------------------------------------------------------------
+
+    /// A node at a given position, so layout-dependent behaviour is testable.
+    fn placed(id: &str, role: &str, name: Option<&str>, x: i32, y: i32) -> Node {
+        let mut node = node(id, role, name);
+        node.bounds = Some(Bounds { x, y, width: 80, height: 24 });
+        node
+    }
+
+    /// A form: a label with a field to its right, twice, then two buttons.
+    ///
+    /// Deliberately built out of order, so anything that works by accident of
+    /// enumeration order fails here.
+    fn form() -> Vec<Node> {
+        vec![
+            placed("submit", "Button", Some("OK"), 100, 300),
+            placed("user_label", "Text", Some("Username"), 10, 100),
+            placed("pass_field", "Edit", None, 100, 200),
+            placed("cancel", "Button", Some("OK"), 200, 300),
+            placed("user_field", "Edit", None, 100, 100),
+            placed("pass_label", "Text", Some("Password"), 10, 200),
+        ]
+    }
+
+    fn resolve_ids(locator: &Value, nodes: &[Node]) -> Vec<String> {
+        Locator::from_value(locator)
+            .expect("locator must parse")
+            .resolve(nodes)
+            .into_iter()
+            .map(|node| node.node_id.clone())
+            .collect()
+    }
+
+    #[test]
+    fn an_ordinal_picks_the_nth_element_in_reading_order() {
+        // "the second button". The nodes are listed with the second button
+        // first, so enumeration order would give the wrong answer.
+        let nodes = form();
+
+        assert_eq!(
+            resolve_ids(&json!({"role": "Button", "nth": 1}), &nodes),
+            ["submit"]
+        );
+        assert_eq!(
+            resolve_ids(&json!({"role": "Button", "nth": 2}), &nodes),
+            ["cancel"]
+        );
+    }
+
+    #[test]
+    fn reading_order_goes_down_the_screen_before_across_it() {
+        // Two rows of two. A left-to-right-first ordering would number these
+        // 1,3,2,4 and every ordinal after the first would be wrong.
+        let nodes = vec![
+            placed("top_right", "Button", Some("b"), 200, 10),
+            placed("bottom_left", "Button", Some("c"), 10, 200),
+            placed("top_left", "Button", Some("a"), 10, 10),
+            placed("bottom_right", "Button", Some("d"), 200, 200),
+        ];
+
+        let order: Vec<String> = (1..=4)
+            .map(|index| resolve_ids(&json!({"role": "Button", "nth": index}), &nodes)[0].clone())
+            .collect();
+
+        assert_eq!(order, ["top_left", "top_right", "bottom_left", "bottom_right"]);
+    }
+
+    #[test]
+    fn last_names_the_final_element_without_counting_them() {
+        // A list whose length the agent does not know.
+        let nodes = form();
+        assert_eq!(
+            resolve_ids(&json!({"role": "Button", "nth": "last"}), &nodes),
+            ["cancel"]
+        );
+        assert_eq!(
+            resolve_ids(&json!({"role": "Button", "nth": "first"}), &nodes),
+            ["submit"]
+        );
+    }
+
+    #[test]
+    fn an_ordinal_past_the_end_selects_nothing() {
+        // Rather than the last one. Asking for the fifth of three is a mistake
+        // in the instruction, and quietly acting on a different element is how
+        // automation does damage.
+        let nodes = form();
+        assert!(resolve_ids(&json!({"role": "Button", "nth": 5}), &nodes).is_empty());
+    }
+
+    #[test]
+    fn an_ordinal_counts_only_the_matching_elements() {
+        // "the second edit box" must not count the buttons and labels between
+        // them.
+        let nodes = form();
+        assert_eq!(
+            resolve_ids(&json!({"role": "Edit", "nth": 2}), &nodes),
+            ["pass_field"]
+        );
+    }
+
+    #[test]
+    fn an_ordinal_of_zero_is_rejected_at_parse_time() {
+        // Everyone writing the instruction counts from one; accepting 0 here
+        // would silently act one element early.
+        let error = Locator::from_value(&json!({"role": "Button", "nth": 0})).unwrap_err();
+        assert!(error.contains("counts from 1"), "{error}");
+    }
+
+    #[test]
+    fn an_element_can_be_found_by_what_it_sits_next_to() {
+        // "the box next to Username" -- the field itself has no name at all,
+        // which is exactly why this is needed.
+        let nodes = form();
+
+        let found = resolve_ids(
+            &json!({
+                "role": "Edit",
+                "near": {"anchor": {"name": "Username"}, "direction": "right"},
+            }),
+            &nodes,
+        );
+
+        assert_eq!(found, ["user_field"]);
+    }
+
+    #[test]
+    fn proximity_prefers_the_nearer_of_two_candidates() {
+        // Both fields are to the right of Username in the loose sense; only the
+        // one on its row is what a person means.
+        let nodes = form();
+
+        let found = resolve_ids(
+            &json!({"role": "Edit", "near": {"anchor": {"name": "Password"}}}),
+            &nodes,
+        );
+
+        assert_eq!(found[0], "pass_field", "the nearest must come first");
+    }
+
+    #[test]
+    fn a_direction_excludes_what_lies_the_other_way() {
+        // Without direction the nearest edit to Password could be either row.
+        // "left of Password" is nothing here, and must resolve to nothing
+        // rather than to the nearest in some other direction.
+        let nodes = form();
+
+        let found = resolve_ids(
+            &json!({
+                "role": "Edit",
+                "near": {"anchor": {"name": "Password"}, "direction": "left"},
+            }),
+            &nodes,
+        );
+
+        assert!(found.is_empty(), "got {found:?}");
+    }
+
+    #[test]
+    fn a_distance_limit_rejects_something_across_the_window() {
+        // "next to" has to mean near. The nearest edit to the OK button is two
+        // hundred pixels up, which is not next to anything.
+        let nodes = form();
+
+        let unbounded = resolve_ids(
+            &json!({"role": "Edit", "near": {"anchor": {"name": "OK", "nth": 1}}}),
+            &nodes,
+        );
+        assert!(!unbounded.is_empty(), "without a limit something is found");
+
+        let bounded = resolve_ids(
+            &json!({
+                "role": "Edit",
+                "near": {"anchor": {"name": "OK", "nth": 1}, "within": 20},
+            }),
+            &nodes,
+        );
+        assert!(bounded.is_empty(), "got {bounded:?}");
+    }
+
+    #[test]
+    fn a_distance_limit_is_measured_in_pixels() {
+        // Coordinates taken from a real WinForms window: the "Name:" label ends
+        // at x=646 and the field begins at x=656, so they are 10 pixels apart.
+        //
+        // The unit matters. Distances are kept squared internally to stay in
+        // integers, and comparing a pixel threshold against a squared distance
+        // silently squares the threshold -- `within: 40` would have meant 6
+        // pixels, rejecting a label sitting right beside its own field. The
+        // first version of this shipped with exactly that bug, and the earlier
+        // tests missed it because they shared the implementation's assumption.
+        let nodes = vec![
+            {
+                let mut label = node("label", "Text", Some("Name:"));
+                label.bounds = Some(Bounds { x: 566, y: 362, width: 80, height: 22 });
+                label
+            },
+            {
+                let mut field = node("field", "Edit", None);
+                field.bounds = Some(Bounds { x: 656, y: 359, width: 300, height: 21 });
+                field
+            },
+        ];
+
+        let generous = resolve_ids(
+            &json!({"role": "Edit", "near": {"anchor": {"name": "Name:"}, "within": 40}}),
+            &nodes,
+        );
+        assert_eq!(generous, ["field"], "10 pixels is within 40");
+
+        // The other half: a limit that is genuinely too small must still bite,
+        // or "within" would just be decoration.
+        let strict = resolve_ids(
+            &json!({"role": "Edit", "near": {"anchor": {"name": "Name:"}, "within": 5}}),
+            &nodes,
+        );
+        assert!(strict.is_empty(), "10 pixels is not within 5, got {strict:?}");
+    }
+
+    #[test]
+    fn a_missing_anchor_finds_nothing_rather_than_ignoring_the_constraint() {
+        // The dangerous failure: if an unfindable anchor quietly dropped the
+        // constraint, "the field next to Username" on a page with no Username
+        // would type into whatever field came first.
+        let nodes = form();
+
+        let found = resolve_ids(
+            &json!({"role": "Edit", "near": {"anchor": {"name": "Nonexistent"}}}),
+            &nodes,
+        );
+
+        assert!(found.is_empty(), "got {found:?}");
+    }
+
+    #[test]
+    fn an_ambiguous_anchor_finds_nothing_rather_than_guessing() {
+        // Two buttons are both named OK. Choosing one would make the result
+        // depend on enumeration order, which is precisely what an anchor is
+        // supposed to protect against.
+        let nodes = form();
+
+        let found = resolve_ids(
+            &json!({"role": "Edit", "near": {"anchor": {"name": "OK"}}}),
+            &nodes,
+        );
+
+        assert!(found.is_empty(), "got {found:?}");
+    }
+
+    #[test]
+    fn an_anchor_can_itself_be_described_positionally() {
+        // "next to the second OK button" -- the anchor is ambiguous by name, so
+        // it is disambiguated the same way any other element would be.
+        let nodes = form();
+
+        let found = resolve_ids(
+            &json!({
+                "role": "Button",
+                "near": {"anchor": {"name": "OK", "nth": 1}, "direction": "right"},
+            }),
+            &nodes,
+        );
+
+        assert_eq!(found, ["cancel"]);
+    }
+
+    #[test]
+    fn an_element_is_never_found_next_to_itself() {
+        // Distance zero would otherwise make every element its own nearest
+        // neighbour, and the anchor would win its own search.
+        let nodes = form();
+
+        let found = resolve_ids(
+            &json!({"role": "Text", "near": {"anchor": {"name": "Username"}}}),
+            &nodes,
+        );
+
+        assert!(!found.contains(&"user_label".to_string()), "got {found:?}");
+    }
+
+    #[test]
+    fn narrowing_applies_before_counting() {
+        // "the first edit box next to Password". Counting first would give the
+        // first edit box overall (which is not near Password), then filter it
+        // away, leaving nothing -- a subtly different and much less useful
+        // meaning.
+        let nodes = form();
+
+        let found = resolve_ids(
+            &json!({
+                "role": "Edit",
+                "near": {"anchor": {"name": "Password"}, "direction": "right"},
+                "nth": 1,
+            }),
+            &nodes,
+        );
+
+        assert_eq!(found, ["pass_field"]);
+    }
+
+    #[test]
+    fn the_first_focusable_input_is_expressible() {
+        // A whole class of instruction -- "type into the first input" -- with
+        // no reliance on any name at all.
+        let mut nodes = form();
+        for node in &mut nodes {
+            node.states.focusable = Some(node.role == "Edit");
+        }
+
+        let found = resolve_ids(
+            &json!({"role": "Edit", "states": {"focusable": true}, "nth": 1}),
+            &nodes,
+        );
+
+        assert_eq!(found, ["user_field"]);
+    }
+
+    #[test]
+    fn a_positional_locator_survives_being_saved_and_reopened() {
+        // The point of describing rather than referencing: a recording is a
+        // file, and everything in it has to mean the same thing tomorrow.
+        let nodes = form();
+        let original = Locator::from_value(&json!({
+            "role": "Edit",
+            "near": {"anchor": {"name": "Username"}, "direction": "right", "within": 100},
+            "nth": 1,
+        }))
+        .expect("must parse");
+
+        let reloaded = Locator::from_value(&original.to_json()).expect("must re-parse");
+
+        assert_eq!(
+            reloaded.resolve(&nodes)[0].node_id,
+            original.resolve(&nodes)[0].node_id
+        );
+    }
+
+    #[test]
+    fn a_malformed_position_is_rejected_with_a_usable_message() {
+        // These are written by an agent from a person's words, so the error has
+        // to say what was wrong rather than just failing to match.
+        for (locator, expected) in [
+            (json!({"role": "Button", "nth": "middle"}), "first"),
+            (json!({"role": "Button", "nth": -1}), "whole number"),
+            (json!({"role": "Button", "near": {}}), "anchor"),
+            (
+                json!({"role": "Button", "near": {"anchor": {"name": "x"}, "direction": "sideways"}}),
+                "direction",
+            ),
+            (
+                json!({"role": "Button", "near": {"anchor": {"name": "x"}, "within": 0}}),
+                "positive",
+            ),
+        ] {
+            let error = Locator::from_value(&locator).unwrap_err();
+            assert!(error.contains(expected), "{locator} gave {error:?}");
+        }
+    }
+
+    #[test]
+    fn anchors_cannot_be_nested_without_bound() {
+        // Each level multiplies the search, and a description this deep is
+        // harder to follow than the attribute it replaces.
+        let mut locator = json!({"name": "root"});
+        for _ in 0..6 {
+            locator = json!({"role": "Button", "near": {"anchor": locator}});
+        }
+
+        let error = Locator::from_value(&locator).unwrap_err();
+        assert!(error.contains("nested"), "{error}");
+    }
+
+    #[test]
+    fn a_positional_locator_is_unique_even_when_its_attributes_are_not() {
+        // `unique_for` decides whether a step can be recorded. Judged on
+        // attributes alone, "the first of three buttons" looks ambiguous --
+        // which would reject exactly the locators positional syntax exists to
+        // make possible.
+        let nodes = form();
+        let locator = Locator::from_value(&json!({"role": "Button", "nth": 1})).unwrap();
+        let first = nodes.iter().find(|n| n.node_id == "submit").unwrap();
+
+        assert!(locator.unique_for(first, &nodes));
     }
 
     #[test]

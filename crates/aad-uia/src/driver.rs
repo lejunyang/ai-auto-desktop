@@ -239,11 +239,11 @@ impl UiaDriver {
             None => self.capture(args)?,
         };
 
-        let matches: Vec<&Node> = snapshot
-            .nodes
-            .iter()
-            .filter(|node| locator.matches(node))
-            .collect();
+        // `resolve`, not `matches`: an ordinal or a proximity constraint is a
+        // property of the element's place among the others, so it can only be
+        // applied to the whole set. Filtering node by node would silently
+        // ignore both and report every button as ambiguous.
+        let matches: Vec<&Node> = locator.resolve(&snapshot.nodes);
 
         // An ambiguous match is a genuine failure: acting on "the first one"
         // is how automation clicks the wrong button.
