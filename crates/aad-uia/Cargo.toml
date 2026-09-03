@@ -16,7 +16,14 @@ sha2 = { workspace = true }
 uuid = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
+# The #[implement] macro expands to `windows_core::` paths and resolves them at
+# the crate root, so windows-core has to be a dependency in its own right --
+# a `use windows::core as windows_core` alias does not satisfy it.
+windows-core = "0.58"
 windows = { version = "0.58", features = [
+    # Lets the recorder implement UIA's callback interfaces, which is how
+    # events are delivered: UIA calls into objects we hand it.
+    "implement",
     "Win32_Foundation",
     "Win32_System_Com",
     "Win32_System_Threading",

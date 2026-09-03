@@ -499,6 +499,51 @@ input 约 **510 ms**。读一次、立刻读，等于给每个 web UI 都判了�
 
 ---
 
+### 2.17 事件驱动录制：两种机制都得要，缺一种就瞎一半
+
+开工前先量了「Rust 到底能不能收到 UIA 事件」，因为其余部分都是我会写的管道，只有这里
+可能根本走不通。结果比预想的重要得多。
+
+**第一件事：`#[implement]` 需要三处配合。** `windows` crate 要开 `implement` feature；
+宏展开出的是 `windows_core::` 路径，且在 **crate root** 解析，所以 `windows-core` 必须
+是一个独立依赖——`use windows::core as windows_core` 这种别名**不管用**。回调 trait 的
+签名也不是 `i32`，是 `UIA_EVENT_ID` / `UIA_PROPERTY_ID` 这些 newtype，签名从 crate 源码
+里读出来的，没猜。
+
+**第二件事：回调在别的线程上。** 订阅发生在线程 916，回调到达线程 41448。所以事件缓冲
+区从一开始就必须是跨线程安全的，这不是以后再加的优化。
+
+**第三件事，也是真正要紧的：UIA 事件处理器在 WinForms 上是瞎的。**
+
+第一版探针的结论是「按钮点击不产生任何事件」——但那是错的。读了 fixture 自己的标题才
+发现 `clicks=0`，**我合成的鼠标点击根本没落地**，量的是一次失败的点击，不是 UIA。这个
+坑值得记：从探针内部看，「没有事件」和「没有点击」长得一模一样。
+
+改成「一个进程订阅、另一个进程用产品自己的 driver 去点」，并且每次都拿 fixture 的计数
+器确认交互真的生效了。干净的结论：
+
+| | WinForms fixture | Chromium WebView（本项目 GUI） |
+|---|---|---|
+| UIA 事件处理器 | **0 个事件** | 3 个事件（invoked / value） |
+| WinEvent 钩子 | **12 个事件** | 15 个事件 |
+
+两次点击都确认生效（clicks 0→1，checked False→True），UIA 处理器一个都没收到。而 WebView
+上 UIA 处理器是好的——它原生实现 UIA，不走 MSAA 桥。
+
+**所以两种机制都得要，而且不能二选一：**
+
+- 只用 UIA 事件处理器 → WinForms 及一切走 MSAA 桥的老应用，**每一次按钮点击都录不到**；
+- 只用 WinEvent 钩子 → 拿到的是 MSAA 层的粗事件（focus / state_changed 一片），元素身份
+  和语义要另外补，WebView 里 15 个事件里绝大多数是 focus 噪声。
+
+WinEvent 钩子还有个结构性差异：它按**线程消息队列**投递，必须有消息泵；UIA 回调走 COM
+工作线程，不需要。这决定了捕获会话得自己有一个泵消息的线程。
+
+（还有个小事实：CLI 的点击子命令叫 `click`，不叫 `pointer_click` 也不叫 `pointer-click`；
+`aad do --help` 里写着。）
+
+---
+
 ## 3. 已知环境限制（非缺口，如实记录）
 
 - 本机装有输入过滤软件（AutoHotkey / LogiBolt 一类），`SendInput` 对 ≥2 事件的批次返回
