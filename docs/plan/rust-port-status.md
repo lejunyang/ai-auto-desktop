@@ -749,6 +749,93 @@ role=window   role=text   role=edit   role=check_box   role=button   role=title_
 
 ---
 
+## 2.22 录制链路接通：捕获事件 → 可回放步骤
+
+`CaptureSession` 此前只有 example 能用。本轮把它接成完整链路：driver 三个动作
+（`watch` / `collect` / `release`）、CLI 的 `aad record`、以及事件到步骤的合成。
+
+### 为什么 locator 合成要靠一张开始时的快照
+
+`Locator::synthesize` 需要完整节点表判唯一性，而一个捕获事件只带一个元素。三种接法：
+
+| 做法 | 为什么不行 |
+|---|---|
+| 每个事件现场拍快照 | 贵，而且有竞态：拍完 UI 已经动了，刚点掉的对话框可能已经不在 |
+| 只用捕获元素自己的属性 | 无法判唯一性，会产出 `{"role":"button"}` 这种回放时 AMBIGUOUS_MATCH 的 locator |
+| **开始录制时拍一张，把捕获元素匹配回去** | 一次开销，且拿到了判唯一性所需的全集 |
+
+选第三种。代价是录制期间新出现的元素匹配不上——那种情况如实标记 `unresolved`
+让人来补，而不是编一个 locator 出来。匹配用身份（role/name/automation_id/class_name）
+而非值：值在打字过程中一直在变，比较值会导致**任何被编辑过的字段都匹配不上**。
+
+### 为什么 CLI 是一条命令而不是三条
+
+每次 CLI 调用是独立进程，捕获会话活在进程内、订阅挂在后台线程上。拆成
+watch/collect/release 三条命令的话，第一条一退出会话就没了。所以 `aad record`
+一条命令走完：装订阅 → 等操作 → 收步骤 → 拆掉。GUI 那边走 Tauri、进程常驻，
+用的是三个动作。
+
+`record` 内部按 200ms 轮询而非一次性睡到底：缓冲区有界，长时间录制繁忙窗口
+会溢出，丢掉最早的步骤。
+
+### 路上挖出的 synthesize 缺陷
+
+真机录制跑通后，输出暴露一个问题：三个操作录成三步、locator 全部反查成功，但
+第一步是 `{"role":"edit"}` —— `NameBox` 这个稳定的 name 明明存在却没用上。
+
+**先量了这有多严重。** 本机 12 个窗口：
+
+| | 数量 |
+|---|---|
+| 有多个 button 的窗口 | **10 / 12**（msedge 有 28 个） |
+| 有多个 edit 的窗口 | 2 / 12 |
+| 所有 role 中唯一的 | 66 / 141 |
+
+所以 fixture 能通过纯属巧合（它只有一个 edit）。真实程序里这种 locator 一定
+AMBIGUOUS_MATCH，而且问题要到回放时才暴露——又是「录制当场能用、换个环境失效」。
+
+**两个原因叠加：**
+
+1. `synthesize` 一旦发现 role 唯一就返回，而"今天唯一"不等于"明天唯一"。
+   改为：元素有 name 或 automation_id 时不接受纯 role；两者都没有才退回 role
+   （这个兜底必须留，很多元素确实什么身份都没有）。
+2. **真 bug：加一个空字段后碰巧唯一，就停下返回了。** 元素没有 automation_id 时，
+   那一步什么也没加，但循环仍然测了一次唯一性并返回——于是紧接着要试的 name
+   永远试不到。修法是字段没真的加上东西就不算一次收窄机会。
+
+顺带调整了收窄顺序：**automation_id 排到 name 之前**。理由是耐久性——id 写在
+源码里、不面向用户、不会被翻译；name 是控件标签，而标签会被本地化（本 crate
+刚因为 role 从 `按钮` 变成 `button` 修过一次）。
+
+原先有个测试断言"role 唯一就该停，多余的 name 会在改名时失效"。这个顾虑是真的，
+但它选的替代方案更弱。两种失败都是响亮的（不会点错东西），所以按发生频率取舍：
+**多出一个按钮远比改名常见**。测试已改写并留下理由。
+
+### 修复前后对比（同一个 fixture，同样的操作）
+
+| | 第 1 步 locator |
+|---|---|
+| 修复前 | `{"role":"edit"}` |
+| 修复后 | `{"role":"edit","name":"NameBox"}` |
+
+### 端到端验证：录制能否活过目标程序重启
+
+这是唯一算数的判据——本轮修的全是"重启才暴露"的问题，不重启等于没测。
+
+| 阶段 | fixture 标题（真实状态，不看驱动返回） |
+|---|---|
+| 录制时 | `clicks=1 text=restart-proof` |
+| 重启后 | `clicks=0 text=`（全新实例，window_id 从 20581954 变成 20647490） |
+| 回放后 | **`clicks=1 text=restart-proof`** |
+
+`sources = ['uia', 'win_event']`，3 个操作 → 3 步，dropped=0。
+
+中途一次 `status = invalid` 是我凭记忆写错了 workflow 格式（`schema_version` /
+`workflow_id` / `steps[].action` 全是错的，真实格式是 `apiVersion` / `kind` /
+`metadata` / `steps[].{id,type,uses,with}`），不是 locator 失效——**校验错误码
+和回放失败码不同，是分辨这两件事的关键**。
+
+
 ## 3. 已知环境限制（非缺口，如实记录）
 
 - 本机装有输入过滤软件（AutoHotkey / LogiBolt 一类），`SendInput` 对 ≥2 事件的批次返回

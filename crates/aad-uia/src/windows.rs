@@ -1056,6 +1056,16 @@ impl CaptureSession {
     }
 }
 
+impl crate::driver::CaptureSource for CaptureSession {
+    fn drain(&self, max: usize) -> (Vec<CapturedEvent>, u64) {
+        self.buffer.drain(max)
+    }
+
+    fn sources(&self) -> Vec<String> {
+        self.sources.iter().map(|name| name.to_string()).collect()
+    }
+}
+
 impl Drop for CaptureSession {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);

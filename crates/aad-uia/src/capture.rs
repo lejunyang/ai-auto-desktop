@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
-use crate::model::Node;
+use crate::model::{Locator, Node};
 
 /// What a user did, as far as the platform was able to tell us.
 ///
@@ -270,11 +270,371 @@ impl EventBuffer {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Turning captured events into recorded steps
+//
+// A step has to survive being written to a file and reopened tomorrow, so it
+// carries a locator rather than a reference. Synthesising one needs the whole
+// node table to judge uniqueness, but an event carries a single element -- so
+// the caller supplies a snapshot of the window and captured elements are
+// matched back into it.
+// ---------------------------------------------------------------------------
+
+/// One interaction, described so it can be replayed later.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RecordedStep {
+    /// The driver action to replay: `invoke`, `set_value`, `focus`.
+    pub action: &'static str,
+    /// How to find the element again. `None` when it could not be described,
+    /// which is reported rather than guessed at.
+    pub locator: Option<Locator>,
+    /// A human-readable line describing what was interacted with.
+    pub summary: String,
+    /// The text to write, for actions that need one.
+    pub argument: Option<String>,
+    /// True when the element's contents are withheld by the platform.
+    pub protected: bool,
+    /// Why this step cannot replay, when it cannot.
+    pub unresolved: Option<&'static str>,
+}
+
+impl RecordedStep {
+    /// Whether this step could actually run.
+    pub fn is_replayable(&self) -> bool {
+        self.unresolved.is_none() && self.locator.is_some()
+    }
+}
+
+/// Describe captured events as steps, using `nodes` to make locators unique.
+///
+/// `nodes` is normally a snapshot of the window taken when recording started.
+/// Matching against it, rather than snapshotting per event, is what makes this
+/// affordable and free of races: by the time a fresh snapshot came back the UI
+/// would have moved on, and a dialog that was just dismissed would be gone.
+///
+/// Events whose element cannot be found in the snapshot still produce a step,
+/// marked unresolved. Dropping them would be worse: the recording would look
+/// complete while silently missing an interaction, and someone would replay it
+/// expecting the steps they performed.
+pub fn to_steps(events: Vec<CapturedEvent>, nodes: &[Node]) -> Vec<RecordedStep> {
+    coalesce(recordable(events))
+        .into_iter()
+        .filter_map(|event| {
+            // `recordable` already dropped the events that describe context
+            // rather than an action, so anything without one here is a bug.
+            let action = event.kind.action()?;
+            Some(match &event.node {
+                None => RecordedStep {
+                    action,
+                    locator: None,
+                    summary: format!("an unidentified element ({})", event.kind.as_str()),
+                    argument: None,
+                    protected: false,
+                    // The interaction happened; we simply could not say to what.
+                    unresolved: Some("the element could not be identified"),
+                },
+                Some(node) => describe_step(action, node, nodes),
+            })
+        })
+        .collect()
+}
+
+/// Build one step for an interaction with a known element.
+fn describe_step(action: &'static str, node: &Node, nodes: &[Node]) -> RecordedStep {
+    let protected = node.states.protected == Some(true);
+    // The text a write replays. A protected field's contents are deliberately
+    // absent -- the platform withholds them -- so the step records that a value
+    // was entered without inventing one; it becomes a run-time input.
+    let argument = if action == "set_value" && !protected {
+        node.value.clone()
+    } else {
+        None
+    };
+
+    // Match the captured element back into the snapshot. Identity, not the
+    // node_id: the captured element was described independently and its id
+    // belongs to no snapshot.
+    let found = nodes.iter().find(|candidate| same_element(candidate, node));
+
+    let (locator, unresolved) = match found {
+        Some(candidate) => match Locator::synthesize(candidate, nodes) {
+            Some(locator) => (Some(locator), None),
+            // Real outcome: several elements share every durable attribute.
+            None => (
+                None,
+                Some("this element cannot be told apart from its siblings"),
+            ),
+        },
+        None => (
+            None,
+            // Usually means the element appeared after recording started, so it
+            // is not in the snapshot the locators are being judged against.
+            Some("this element was not in the window when recording started"),
+        ),
+    };
+
+    RecordedStep {
+        action,
+        locator,
+        summary: node.summary(),
+        argument,
+        protected,
+        unresolved,
+    }
+}
+
+/// Whether two independently-described nodes are the same element.
+///
+/// Compared on identity rather than on every field, because a value changes as
+/// it is typed into: the element that received the text is the same element it
+/// was before, and requiring the value to match would fail to find any edited
+/// field at all.
+fn same_element(candidate: &Node, captured: &Node) -> bool {
+    candidate.role == captured.role
+        && candidate.name == captured.name
+        && candidate.automation_id == captured.automation_id
+        && candidate.class_name == captured.class_name
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::model::States;
     use std::time::Duration;
+
+    // -----------------------------------------------------------------------
+    // Turning events into replayable steps
+    //
+    // The failure this guards against is a recording that looks complete and
+    // replays nothing: a locator built from a per-run identifier, or a step
+    // whose element was never identified but is marked ready to run.
+    // -----------------------------------------------------------------------
+
+    /// A node as the platform would describe it, with the fields that matter.
+    fn full(
+        id: &str,
+        role: &str,
+        name: Option<&str>,
+        automation_id: Option<&str>,
+        class_name: Option<&str>,
+    ) -> Node {
+        let mut node = node(name.unwrap_or(""), role);
+        node.node_id = id.to_string();
+        node.name = name.map(str::to_string);
+        node.automation_id = automation_id.map(str::to_string);
+        node.class_name = class_name.map(str::to_string);
+        node.actions = vec![
+            "focus".into(),
+            "invoke".into(),
+            "set_value".into(),
+            "type_text".into(),
+        ];
+        node
+    }
+
+    fn captured(kind: EventKind, node: Node) -> CapturedEvent {
+        CapturedEvent {
+            sequence: 0,
+            kind,
+            node: Some(node),
+            source: "test",
+            observed_at: Instant::now(),
+        }
+    }
+
+    #[test]
+    fn an_interaction_becomes_a_step_that_can_find_its_element_again() {
+        let button = full("e1", "button", Some("Submit"), None, None);
+        let nodes = vec![button.clone(), full("e2", "edit", Some("Name"), None, None)];
+
+        let steps = to_steps(vec![captured(EventKind::Invoked, button)], &nodes);
+
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0].action, "invoke");
+        assert!(steps[0].is_replayable());
+        // And the locator has to actually select it, not merely exist.
+        let locator = steps[0].locator.as_ref().expect("a locator");
+        let selected = locator.resolve(&nodes);
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].node_id, "e1");
+    }
+
+    #[test]
+    fn a_locator_never_holds_an_identifier_the_toolkit_regenerates() {
+        // Measured on WinForms: automation_id 7473382 became 15534534 and the
+        // class name's tail changed too, on nothing more than a restart. A step
+        // built from either replays perfectly today and fails tomorrow.
+        //
+        // Two elements alike except for those two fields, so a synthesiser that
+        // reached for them would be able to tell these apart -- and would.
+        let first = full(
+            "e1",
+            "edit",
+            None,
+            Some("7473382"),
+            Some("WindowsForms10.EDIT.app.0.34473a7_r14_ad1"),
+        );
+        let second = full(
+            "e2",
+            "edit",
+            None,
+            Some("9178646"),
+            Some("WindowsForms10.EDIT.app.0.34473a7_r14_ad1"),
+        );
+        let nodes = vec![first.clone(), second];
+
+        let steps = to_steps(vec![captured(EventKind::ValueChanged, first)], &nodes);
+
+        assert_eq!(steps.len(), 1);
+        // Unresolvable is the honest answer here, and it is the right one: the
+        // alternative is a step that quietly stops working.
+        assert!(!steps[0].is_replayable(), "got {:?}", steps[0].locator);
+        assert!(steps[0].unresolved.is_some());
+    }
+
+    #[test]
+    fn an_author_written_identifier_is_still_used() {
+        // The other half. Of the 64 automation ids across the applications open
+        // on this machine, 62 are names like `view_1` and `MenuBar`, and they
+        // showed no drift -- discarding the field wholesale would leave far more
+        // elements undescribable than it protects.
+        let first = full("e1", "edit", None, Some("searchBox"), None);
+        let nodes = vec![first.clone(), full("e2", "edit", None, Some("filterBox"), None)];
+
+        let steps = to_steps(vec![captured(EventKind::ValueChanged, first)], &nodes);
+
+        assert!(steps[0].is_replayable());
+        assert_eq!(
+            steps[0].locator.as_ref().unwrap().automation_id.as_deref(),
+            Some("searchBox")
+        );
+    }
+
+    #[test]
+    fn an_unidentified_interaction_is_recorded_but_not_marked_replayable() {
+        // The interaction happened. Dropping it would leave a recording that
+        // looks complete while missing a step someone performed; marking it
+        // replayable would produce a workflow that fails at run time.
+        let event = CapturedEvent {
+            sequence: 0,
+            kind: EventKind::Invoked,
+            node: None,
+            source: "test",
+            observed_at: Instant::now(),
+        };
+
+        let steps = to_steps(vec![event], &[]);
+
+        assert_eq!(steps.len(), 1, "the interaction must not vanish");
+        assert!(!steps[0].is_replayable());
+        assert!(steps[0].unresolved.is_some());
+    }
+
+    #[test]
+    fn an_element_that_appeared_after_recording_started_says_so() {
+        // Locators are judged against the snapshot taken at the start, so a
+        // control that opened later is genuinely not in it. The distinction
+        // matters to whoever fixes the step.
+        let latecomer = full("e9", "button", Some("Confirm"), None, None);
+        let nodes = vec![full("e1", "button", Some("Open"), None, None)];
+
+        let steps = to_steps(vec![captured(EventKind::Invoked, latecomer)], &nodes);
+
+        assert!(!steps[0].is_replayable());
+        assert!(
+            steps[0].unresolved.unwrap().contains("not in the window"),
+            "{:?}",
+            steps[0].unresolved
+        );
+    }
+
+    #[test]
+    fn typing_records_the_finished_text_not_the_first_keystroke() {
+        // Every keystroke raises its own event. Keeping the first would record
+        // `h` where the user typed `hello` -- and the recording would look fine.
+        let mut field = full("e1", "edit", Some("Name"), None, None);
+        let nodes = vec![field.clone()];
+
+        let mut events = Vec::new();
+        for (index, text) in ["h", "he", "hel", "hell", "hello"].iter().enumerate() {
+            field.value = Some((*text).to_string());
+            events.push(CapturedEvent {
+                sequence: index as u64,
+                kind: EventKind::ValueChanged,
+                node: Some(field.clone()),
+                source: "test",
+                observed_at: Instant::now(),
+            });
+        }
+
+        let steps = to_steps(events, &nodes);
+
+        assert_eq!(steps.len(), 1, "one edit, not one step per keystroke");
+        assert_eq!(steps[0].argument.as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn a_password_is_recorded_as_a_step_without_its_value() {
+        // The field is still worth recording -- automating a login is the point
+        // -- but the text must not land in the file. It becomes a run-time input.
+        let mut secret = full("e1", "edit", Some("Password"), Some("pwd"), None);
+        secret.states.protected = Some(true);
+        secret.value = None;
+        let nodes = vec![secret.clone()];
+
+        let steps = to_steps(vec![captured(EventKind::ValueChanged, secret)], &nodes);
+
+        assert!(steps[0].is_replayable(), "a login step has to be usable");
+        assert!(steps[0].protected);
+        assert_eq!(steps[0].argument, None);
+    }
+
+    #[test]
+    fn an_ordinary_field_keeps_the_text_that_was_typed() {
+        // The counterpart to the password case: withholding ordinary values
+        // would make a recording unable to reproduce what it recorded.
+        let mut field = full("e1", "edit", Some("Search"), Some("search"), None);
+        field.value = Some("quarterly report".into());
+        let nodes = vec![field.clone()];
+
+        let steps = to_steps(vec![captured(EventKind::ValueChanged, field)], &nodes);
+
+        assert_eq!(steps[0].argument.as_deref(), Some("quarterly report"));
+        assert!(!steps[0].protected);
+    }
+
+    #[test]
+    fn an_edited_field_is_still_matched_after_its_value_changed() {
+        // The captured element carries the new text while the start-of-recording
+        // snapshot holds the old. Comparing values when matching would fail to
+        // find any field that was actually typed into -- that is, all of them.
+        let mut before = full("e1", "edit", Some("Name"), Some("nameBox"), None);
+        before.value = Some(String::new());
+        let mut after = before.clone();
+        after.value = Some("Ada".into());
+
+        let steps = to_steps(vec![captured(EventKind::ValueChanged, after)], &[before]);
+
+        assert!(steps[0].is_replayable(), "{:?}", steps[0].unresolved);
+        assert_eq!(steps[0].argument.as_deref(), Some("Ada"));
+    }
+
+    #[test]
+    fn context_events_do_not_become_steps() {
+        // Focus tells us where the user is looking, not what they did. Replaying
+        // it would add clicks nobody made.
+        let field = full("e1", "edit", Some("Name"), None, None);
+        let events = vec![
+            captured(EventKind::Focused, field.clone()),
+            captured(EventKind::Invoked, field.clone()),
+        ];
+
+        let steps = to_steps(events, &[field]);
+
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0].action, "invoke");
+    }
+
 
     fn node(name: &str, role: &str) -> Node {
         Node {

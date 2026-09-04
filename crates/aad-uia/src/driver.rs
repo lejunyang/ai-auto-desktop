@@ -11,12 +11,14 @@
 //! occupies that position.
 
 use crate::backend::{Backend, CaptureLimits, DriverError, Result, SnapshotStore};
+use crate::capture::{self, CapturedEvent};
 use crate::model::{Locator, Node, Snapshot, Target, NODE_ACTIONS};
 use aad_plugin::{manifest, CapabilityManifest};
 use aad_runtime::journal::now_rfc3339;
 use aad_runtime::provider::Provider;
 use serde_json::{json, Map, Value};
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 pub const PROVIDER_NAME: &str = "desktop.windows_uia";
@@ -27,12 +29,20 @@ pub const WRITE_ACTIONS: &[&str] =
 
 const MAX_TYPE_TEXT_CHARS: usize = 1024;
 const MAX_CANDIDATE_SUMMARIES: usize = 10;
+/// How many captured events one `collect` will take at a time.
+const MAX_COLLECTED_EVENTS: usize = 256;
 
 /// A UI Automation driver over some backend.
 pub struct UiaDriver {
     backend: Arc<dyn Backend>,
     snapshots: SnapshotStore,
     manifest: CapabilityManifest,
+    /// Recording sessions in progress.
+    ///
+    /// Capturing is inherently stateful -- a subscription lives on a background
+    /// thread -- while `call` is not, so the sessions live here and the actions
+    /// are just the way in.
+    captures: Mutex<HashMap<String, CaptureHandle>>,
 }
 
 impl UiaDriver {
@@ -50,6 +60,7 @@ impl UiaDriver {
             backend,
             snapshots,
             manifest: manifest::parse(&document).expect("the built-in manifest is valid"),
+            captures: Mutex::new(HashMap::new()),
         }
     }
 
@@ -75,6 +86,9 @@ impl UiaDriver {
             "focus" | "invoke" | "set_value" | "type_text" | "pointer_click" => {
                 self.act(action, &args)
             }
+            "watch" => self.watch(&args),
+            "collect" => self.collect(&args),
+            "release" => self.release(&args),
             other => Err(DriverError::invalid(format!("unknown action {other:?}"))),
         }
     }
@@ -419,6 +433,161 @@ impl UiaDriver {
     }
 }
 
+impl UiaDriver {
+    /// Install a capture session for a window.
+    ///
+    /// The one platform-dependent step. Where capture is not implemented this
+    /// says so rather than starting a session that would never produce a step:
+    /// a recorder that appears to work and records nothing is worse than one
+    /// that refuses.
+    #[cfg(windows)]
+    fn open_capture(&self, window_id: &str, args: &Value) -> Result<Box<dyn CaptureSource>> {
+        let limit = args
+            .get("buffer")
+            .and_then(Value::as_u64)
+            .unwrap_or(512)
+            .clamp(16, 4096) as usize;
+        let session = crate::windows::CaptureSession::start(window_id, limit)?;
+        Ok(Box::new(session))
+    }
+
+    #[cfg(not(windows))]
+    fn open_capture(&self, _window_id: &str, _args: &Value) -> Result<Box<dyn CaptureSource>> {
+        Err(DriverError::new(
+            "DRIVER.ACTION_UNSUPPORTED",
+            "recording interactions is only implemented on Windows so far",
+        ))
+    }
+}
+
+/// A recording session and the snapshot its locators are judged against.
+struct CaptureHandle {
+    session: Box<dyn CaptureSource>,
+    /// The window as it was when recording started.
+    ///
+    /// Locators need the whole node table to be judged unique, and taking a
+    /// fresh snapshot per event would be both expensive and racy: by the time it
+    /// came back the UI would have moved on, and a dialog that was just
+    /// dismissed would no longer be there to describe.
+    baseline: Vec<Node>,
+    window_id: String,
+}
+
+/// Something that can be watched for interactions.
+///
+/// A trait so the driver's own tests can drive this without a desktop; the real
+/// implementation is the native capture session.
+pub trait CaptureSource: Send {
+    /// Take the events observed so far, and how many were dropped.
+    fn drain(&self, max: usize) -> (Vec<CapturedEvent>, u64);
+    /// Which capture mechanisms were installed.
+    fn sources(&self) -> Vec<String>;
+}
+
+impl UiaDriver {
+    /// Start recording a window's interactions.
+    fn watch(&self, args: &Value) -> Result<Value> {
+        // The baseline snapshot doubles as the window lookup: it accepts a live
+        // id or a descriptive selector, exactly like every other action.
+        let snapshot = self.capture(args)?;
+        let window_id = snapshot.window.window_id.clone();
+        let session = self.open_capture(&window_id, args)?;
+        let sources = session.sources();
+
+        let capture_id = uuid::Uuid::new_v4().simple().to_string();
+        let baseline_nodes = snapshot.nodes.len();
+        self.captures.lock().unwrap().insert(
+            capture_id.clone(),
+            CaptureHandle {
+                session,
+                baseline: snapshot.nodes,
+                window_id: window_id.clone(),
+            },
+        );
+
+        Ok(json!({
+            "capture_id": capture_id,
+            "window_id": window_id,
+            // Which mechanisms are listening. Partial coverage is worth having
+            // but the caller has to know: a missing source means a whole class
+            // of interaction will go unrecorded rather than merely be delayed.
+            "sources": sources,
+            "baseline_nodes": baseline_nodes,
+            "snapshot_id": snapshot.snapshot_id,
+        }))
+    }
+
+    /// Take the steps recorded so far, leaving the session running.
+    fn collect(&self, args: &Value) -> Result<Value> {
+        let capture_id = args
+            .get("capture_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| DriverError::invalid("capture_id is required"))?;
+        let max = args
+            .get("max")
+            .and_then(Value::as_u64)
+            .unwrap_or(MAX_COLLECTED_EVENTS as u64)
+            .clamp(1, MAX_COLLECTED_EVENTS as u64) as usize;
+
+        let sessions = self.captures.lock().unwrap();
+        let handle = sessions.get(capture_id).ok_or_else(|| {
+            DriverError::new(
+                "DRIVER.CAPTURE_NOT_FOUND",
+                format!("no recording session {capture_id:?}"),
+            )
+            .with_detail("capture_id", json!(capture_id))
+        })?;
+
+        let (events, dropped) = handle.session.drain(max);
+        let raw_events = events.len();
+        let steps = capture::to_steps(events, &handle.baseline);
+
+        Ok(json!({
+            "capture_id": capture_id,
+            "window_id": handle.window_id,
+            "steps": steps.iter().map(step_to_json).collect::<Vec<_>>(),
+            "count": steps.len(),
+            // Reported rather than swallowed: a silently discarded event is
+            // indistinguishable from the user having done nothing.
+            "dropped": dropped,
+            "raw_events": raw_events,
+        }))
+    }
+
+    /// Stop recording and tear down the subscription.
+    fn release(&self, args: &Value) -> Result<Value> {
+        let capture_id = args
+            .get("capture_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| DriverError::invalid("capture_id is required"))?;
+
+        // Dropping the handle stops the worker thread and removes the hooks.
+        let removed = self.captures.lock().unwrap().remove(capture_id);
+        match removed {
+            Some(_) => Ok(json!({"released": true, "capture_id": capture_id})),
+            None => Err(DriverError::new(
+                "DRIVER.CAPTURE_NOT_FOUND",
+                format!("no recording session {capture_id:?}"),
+            )),
+        }
+    }
+}
+
+/// One recorded step, as JSON.
+fn step_to_json(step: &capture::RecordedStep) -> Value {
+    json!({
+        "action": step.action,
+        "locator": step.locator.as_ref().map(Locator::to_json),
+        "summary": step.summary,
+        "argument": step.argument,
+        "protected": step.protected,
+        // Both are published: `replayable` is the question a caller asks, and
+        // `unresolved` is the reason, which is what a person needs to fix it.
+        "replayable": step.is_replayable(),
+        "unresolved": step.unresolved,
+    })
+}
+
 /// The action contracts this driver publishes in its manifest.
 fn action_contracts() -> Map<String, Value> {
     let mut actions = Map::new();
@@ -445,6 +614,32 @@ fn action_contracts() -> Map<String, Value> {
     actions.insert(
         "find".into(),
         read_only("Find the single element matching a locator."),
+    );
+
+    // Watching changes nothing on the desktop, but it is not `read_only`
+    // either: it installs hooks and holds a session open until released, which
+    // a caller reasoning about effects needs to see.
+    actions.insert(
+        "watch".into(),
+        json!({
+            "contract_major": 1,
+            "summary": "Start recording a window's interactions.",
+            "effect": {"class": "idempotent"},
+            "risk": {"category": "observe", "level": "low"},
+        }),
+    );
+    actions.insert(
+        "collect".into(),
+        read_only("Take the steps recorded so far by a watch session."),
+    );
+    actions.insert(
+        "release".into(),
+        json!({
+            "contract_major": 1,
+            "summary": "Stop a recording session and remove its hooks.",
+            "effect": {"class": "idempotent"},
+            "risk": {"category": "observe", "level": "low"},
+        }),
     );
 
     let write = |summary: &str, category: &str, level: &str, class: &str| {

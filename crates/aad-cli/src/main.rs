@@ -53,6 +53,8 @@ enum Command {
     Validate(FileArgs),
     /// Run a workflow descriptor.
     Run(RunArgs),
+    /// Record what someone does in a window, as replayable steps.
+    Record(RecordArgs),
     /// Serve the Model Context Protocol over stdio, for AI clients.
     Mcp,
     /// Print the tools exposed over MCP.
@@ -241,6 +243,22 @@ struct FindArgs {
     /// flags are ignored.
     #[arg(long, value_name = "JSON", conflicts_with_all = ["role", "name", "automation_id", "nth", "near"])]
     locator: Option<String>,
+}
+
+#[derive(Args)]
+struct RecordArgs {
+    /// The window to watch, from `aad apps`.
+    window_id: String,
+    /// How long to record for, in seconds.
+    ///
+    /// Recording runs for a fixed time because a command-line session has no
+    /// way to be told "stop now": the process has to stay alive to hold the
+    /// subscription, so it waits, then reports.
+    #[arg(long, default_value_t = 15)]
+    seconds: u64,
+    /// Print compact JSON instead of indented JSON.
+    #[arg(long)]
+    compact: bool,
 }
 
 #[derive(Subcommand)]
@@ -500,6 +518,62 @@ fn dispatch(command: &Command) -> (Value, u8) {
                         &json!({"window_id": window_id, "locator": Value::Object(locator)}),
                     )
                     .map_err(|error| driver_failure(&error))
+            })
+        }
+        Command::Record(args) => {
+            let window_id = args.window_id.clone();
+            let seconds = args.seconds.clamp(1, 600);
+            with_driver(move |driver| {
+                let started = driver
+                    .call("watch", &json!({"window_id": window_id}))
+                    .map_err(|error| driver_failure(&error))?;
+                let capture_id = started["capture_id"]
+                    .as_str()
+                    .expect("watch returns a capture id")
+                    .to_string();
+
+                // Poll rather than sleeping the whole time: the buffer is
+                // bounded, so a long recording of a busy window would otherwise
+                // overflow and lose the earliest steps.
+                let deadline =
+                    std::time::Instant::now() + std::time::Duration::from_secs(seconds);
+                let mut steps: Vec<Value> = Vec::new();
+                let mut dropped = 0u64;
+                let mut sources = started["sources"].clone();
+                while std::time::Instant::now() < deadline {
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                    let batch = driver
+                        .call("collect", &json!({"capture_id": capture_id}))
+                        .map_err(|error| driver_failure(&error))?;
+                    if let Some(found) = batch["steps"].as_array() {
+                        steps.extend(found.iter().cloned());
+                    }
+                    dropped += batch["dropped"].as_u64().unwrap_or(0);
+                }
+
+                // Release even if the last collect failed: leaving hooks
+                // installed would outlive the command that asked for them.
+                let release = driver.call("release", &json!({"capture_id": capture_id}));
+                if sources.is_null() {
+                    sources = json!([]);
+                }
+                release.map_err(|error| driver_failure(&error))?;
+
+                let replayable = steps
+                    .iter()
+                    .filter(|step| step["replayable"] == json!(true))
+                    .count();
+                Ok(json!({
+                    "window_id": started["window_id"],
+                    "sources": sources,
+                    "seconds": seconds,
+                    "steps": steps,
+                    "count": steps.len(),
+                    // Split out because the difference is what a caller acts on:
+                    // steps that cannot replay need a person to look at them.
+                    "replayable": replayable,
+                    "dropped": dropped,
+                }))
             })
         }
         Command::Do(action) => {

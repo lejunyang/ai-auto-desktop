@@ -360,7 +360,7 @@ const MAX_ANCHOR_DEPTH: usize = 3;
 // is where the rules live -- an ordinal of 0, an unknown direction, an anchor
 // nested too deep. A derived implementation would accept all of those, and the
 // checks would then apply only to whichever path happened to call the parser.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Locator {
     pub role: Option<String>,
     pub name: Option<String>,
@@ -405,7 +405,7 @@ pub enum Ordinal {
 /// "The button next to Username" is how a person describes a control that has
 /// no usable label of its own. The anchor is found first, then candidates are
 /// ranked by distance from it.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Proximity {
     /// How to find the anchor. Boxed via `Proximity` so an anchor can itself
     /// be described positionally, though nesting is bounded (see MAX_DEPTH).
@@ -659,21 +659,53 @@ impl Locator {
             role: Some(node.role.clone()),
             ..Self::empty()
         };
-        if candidate.unique_for(node, nodes) {
+
+        // Role alone is accepted only when the element has no identity of its
+        // own to offer. It is often unique in the window being recorded and
+        // almost never unique in the application as it grows: of the twelve
+        // windows open on this machine, ten hold more than one button (one holds
+        // twenty-eight), and only 66 of 141 roles are unique. Returning
+        // `{"role": "edit"}` because today's window has a single edit box
+        // produces a locator that works while being recorded and reports
+        // AMBIGUOUS_MATCH once a second field exists -- while the durable name
+        // sitting on the element goes unused.
+        let has_identity = non_empty(node.name.as_deref()).is_some()
+            || durable(node.automation_id.as_deref()).is_some();
+        if !has_identity && candidate.unique_for(node, nodes) {
             return Some(candidate);
         }
 
         // Only non-empty values narrow anything; an empty string would match
-        // every node that also lacks the field.
+        // every node that also lacks the field. And only *durable* values are
+        // used: a field the toolkit regenerates per run would identify the
+        // element perfectly today and match nothing tomorrow.
+        //
+        // automation_id comes before name because it is the more durable of the
+        // two: it is written in the application's source, is never shown to a
+        // user and so is never translated. A name is the label on the control,
+        // and labels get localised -- this very crate had to stop reading role
+        // from a localised string after watching it change from `按钮` to
+        // `button` between runs. Where an author-written id exists it is the
+        // better identity; name remains the fallback, since most elements have
+        // no id at all.
         let refinements: [fn(&mut Self, &Node); 4] = [
+            |locator, node| locator.automation_id = durable(node.automation_id.as_deref()),
             |locator, node| locator.name = non_empty(node.name.as_deref()),
-            |locator, node| locator.class_name = non_empty(node.class_name.as_deref()),
-            |locator, node| locator.automation_id = non_empty(node.automation_id.as_deref()),
+            |locator, node| locator.class_name = durable(node.class_name.as_deref()),
             |locator, node| locator.framework_id = non_empty(node.framework_id.as_deref()),
         ];
 
+        // A refinement that added nothing must not count as an attempt. Where
+        // the element has no automation_id, applying that step leaves the
+        // locator exactly as it was; testing uniqueness again at that point
+        // would return the unchanged `{"role": ...}` and skip the name that was
+        // about to be tried -- the weakest locator, reached by accident.
         for refine in refinements {
+            let before = candidate.clone();
             refine(&mut candidate, node);
+            if candidate == before {
+                continue;
+            }
             if candidate.unique_for(node, nodes) {
                 return Some(candidate);
             }
@@ -921,6 +953,50 @@ fn reading_order(node: &Node) -> (i32, i32, i32) {
     }
 }
 
+/// Keep an identifier only if it will still mean the same thing after a restart.
+///
+/// Some toolkits mint these per run. Measured on this machine by restarting a
+/// WinForms fixture: the same edit box reported automation_id 7473382 and then
+/// 15534534, and class_name `...app.0.34473a7_r14_ad1` then `...376a1c9_r8_ad1`.
+/// A locator built from either identifies the element perfectly in the session
+/// that recorded it and matches nothing afterwards -- the worst failure shape
+/// available, because it looks correct exactly while being tested.
+///
+/// Judged by the shape of the value rather than by which toolkit produced it.
+/// Of the 64 automation ids visible across the applications open on this
+/// machine, 62 are author-written names (`view_1`, `MenuBar`,
+/// `FileExplorerSearchBox`) which showed no drift when re-read, and 2 are bare
+/// numbers. Discarding the whole field would throw away the best identifier
+/// most applications offer.
+fn durable(value: Option<&str>) -> Option<String> {
+    let value = non_empty(value)?;
+    // A bare number is a handle, not a name. Nobody writes `id="7473382"`.
+    if value.chars().all(|character| character.is_ascii_digit()) {
+        return None;
+    }
+    // The WinForms per-run suffix, e.g. `WindowsForms10.EDIT.app.0.34473a7_r14_ad1`.
+    if volatile_suffix(&value) {
+        return None;
+    }
+    Some(value)
+}
+
+/// Whether a name ends in the `_r<n>_ad<n>` suffix WinForms regenerates.
+///
+/// Hand-written rather than a regex, to keep this crate free of a dependency
+/// for one pattern. Deliberately narrow: it matches the one shape actually
+/// observed changing, and of the twenty windows open here only the WinForms one
+/// is caught -- `Notepad`, `Chrome_WidgetWin_1` and `XLMAIN` are all kept.
+fn volatile_suffix(value: &str) -> bool {
+    let Some(rest) = value.rsplit_once("_ad").and_then(|(head, tail)| {
+        tail.chars().all(|c| c.is_ascii_digit()) && !tail.is_empty()
+    }.then_some(head)) else {
+        return false;
+    };
+    matches!(rest.rsplit_once("_r"), Some((_, digits))
+        if !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit()))
+}
+
 /// Treat an absent field and an empty string alike: neither narrows a search.
 fn non_empty(value: Option<&str>) -> Option<String> {
     value
@@ -1016,7 +1092,19 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn a_role_alone_is_enough_when_nothing_else_shares_it() {
+    fn a_role_alone_is_not_trusted_while_the_element_has_a_name() {
+        // This test used to assert the opposite, on the grounds that an
+        // unnecessary name breaks when the button is relabelled. That risk is
+        // real -- labels get localised. But the alternative it chose is weaker
+        // still: role is unique only in the window as it looks today. Of the
+        // twelve windows open on this machine ten hold more than one button, one
+        // holds twenty-eight, and only 66 of 141 roles are unique. A locator of
+        // `{"role": "button"}` therefore works while it is being recorded and
+        // reports AMBIGUOUS_MATCH as soon as a second button exists.
+        //
+        // Both failures are loud, so neither clicks the wrong thing; the choice
+        // is made on which one happens more often, and a second button is far
+        // more common than a rename.
         let nodes = vec![
             node("e1", "Button", Some("Save")),
             node("e2", "Edit", Some("Filename")),
@@ -1025,9 +1113,36 @@ mod tests {
         let locator = Locator::synthesize(&nodes[0], &nodes).expect("must be unique");
 
         assert_eq!(locator.role.as_deref(), Some("Button"));
-        // Stopping early matters: an unnecessary name would break if the button
-        // were ever relabelled.
+        assert_eq!(locator.name.as_deref(), Some("Save"));
+    }
+
+    #[test]
+    fn role_alone_is_still_used_for_an_element_with_no_identity_at_all() {
+        // The fallback has to stay. Plenty of elements carry neither a name nor
+        // an id, and for those a role that happens to be unique is the only
+        // description available -- better than refusing to describe them.
+        let nodes = vec![node("e1", "Button", None), node("e2", "Edit", None)];
+
+        let locator = Locator::synthesize(&nodes[0], &nodes).expect("must be unique");
+
+        assert_eq!(locator.role.as_deref(), Some("Button"));
         assert_eq!(locator.name, None);
+    }
+
+    #[test]
+    fn an_author_written_id_is_preferred_over_a_label_that_could_be_translated() {
+        // Both would make this element unique, so whichever is tried first wins.
+        // The id is the one that survives the application being translated.
+        let mut first = node("e1", "button", Some("OK"));
+        first.automation_id = Some("confirmButton".into());
+        let mut second = node("e2", "button", Some("Cancel"));
+        second.automation_id = Some("cancelButton".into());
+        let nodes = vec![first, second];
+
+        let locator = Locator::synthesize(&nodes[0], &nodes).expect("must be unique");
+
+        assert_eq!(locator.automation_id.as_deref(), Some("confirmButton"));
+        assert_eq!(locator.name, None, "the translatable label is not needed");
     }
 
     #[test]
@@ -1055,8 +1170,12 @@ mod tests {
 
         let locator = Locator::synthesize(&nodes[0], &nodes).expect("must be unique");
 
+        // The automation id identifies it, so nothing further is needed. Which
+        // single field gets used is a separate decision; what this guards is
+        // that only one of them does.
+        assert_eq!(locator.automation_id.as_deref(), Some("save-1"));
+        assert_eq!(locator.name, None);
         assert_eq!(locator.class_name, None);
-        assert_eq!(locator.automation_id, None);
         assert_eq!(locator.framework_id, None);
     }
 
@@ -1127,7 +1246,10 @@ mod tests {
     fn a_locator_omits_the_fields_it_does_not_constrain() {
         // A null would be read back as "this field must be null", which selects
         // different elements than "I do not care about this field".
-        let nodes = vec![node("e1", "Button", Some("Save"))];
+        // A nameless element, so the synthesised locator constrains only role --
+        // this test is about how an unconstrained field is rendered, not about
+        // which fields get chosen.
+        let nodes = vec![node("e1", "Button", None)];
         let locator = Locator::synthesize(&nodes[0], &nodes).unwrap();
 
         let rendered = locator.to_json();
