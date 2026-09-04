@@ -24,7 +24,26 @@ export interface WindowInfo {
   is_minimized: boolean;
 }
 
-/** A description of an element that stays valid after the snapshot is gone. */
+/** Which side of the anchor a proximity constraint looks. */
+export type LocatorDirection = "any" | "left" | "right" | "above" | "below";
+
+/** Find an element by what it sits next to. */
+export interface Proximity {
+  /** A full locator: the anchor can itself be positional or nested. */
+  anchor: Locator;
+  direction?: LocatorDirection;
+  /** Largest gap in pixels between the two elements' edges. */
+  within?: number;
+}
+
+/**
+ * A description of an element that stays valid after the snapshot is gone.
+ *
+ * Attributes identify an element when it has an identity of its own. When it
+ * does not -- or when the one it has keeps changing, as a translated label or a
+ * per-run id does -- the remaining fields describe where it sits instead: which
+ * one of several, and what it is next to.
+ */
 export interface Locator {
   role?: string;
   name?: string;
@@ -33,6 +52,11 @@ export interface Locator {
   class_name?: string;
   framework_id?: string;
   match?: string;
+  /** States that must hold, e.g. `{ focusable: true }`. */
+  states?: Record<string, boolean>;
+  /** 1-based position among the matches, or `"last"`. There is no element zero. */
+  nth?: number | string;
+  near?: Proximity;
 }
 
 /** One element in a window outline, already addressable. */
@@ -202,6 +226,21 @@ export const bridge = {
 
   stopRecording: (captureId: string) =>
     call<{ released: boolean }>("stop_recording", { captureId }),
+
+  /**
+   * Try a locator against a live window and report what it selects.
+   *
+   * Rejects with DRIVER.AMBIGUOUS_MATCH when several elements match, and the
+   * candidates in its details are the point: they are what tells someone how to
+   * narrow the locator. A miss comes back as `found: false` rather than an
+   * error, because a locator being edited matches nothing most of the way.
+   */
+  tryLocator: (windowId: string, locator: Locator) =>
+    call<{
+      found: boolean;
+      node?: Record<string, unknown>;
+      match_count?: number;
+    }>("try_locator", { windowId, locator }),
 
   probe: () => call<Record<string, unknown>>("probe_environment"),
 

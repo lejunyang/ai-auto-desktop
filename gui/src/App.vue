@@ -328,7 +328,9 @@ onBeforeUnmount(() => {
       <StepList
         :steps="recording.steps"
         :issues="issues"
+        :window="selected"
         @toggle="(id, on) => recording.setEnabled(id, on)"
+        @locator="(id, next) => recording.setLocator(id, next)"
         @remove="(id) => recording.remove(id)"
         @move="(id, index) => recording.move(id, index)"
         @argument="(id, text) => recording.setArgument(id, text)"

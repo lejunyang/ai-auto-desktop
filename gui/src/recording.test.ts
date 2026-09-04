@@ -1093,6 +1093,72 @@ describe("addCaptured", () => {
     expect(added[1].enabled).toBe(true);
   });
 
+  it("re-enables a step once its locator is corrected", () => {
+    // The point of correcting a locator. Leaving the step disabled would make
+    // the fix appear to work while the compiled workflow silently omits it.
+    const recording = new Recording();
+    const added = recording.addCaptured([step({ locator: null })], windowOf());
+    expect(added[0].enabled).toBe(false);
+
+    expect(recording.setLocator(added[0].id, { role: "button", nth: 3 })).toBe(true);
+
+    expect(added[0].enabled).toBe(true);
+    expect(added[0].locator).toEqual({ role: "button", nth: 3 });
+    expect(recording.enabledSteps).toHaveLength(1);
+  });
+
+  it("keeps a step disabled when its window is still ambiguous", () => {
+    // A locator is only half of what a step needs. Enabling it on the strength
+    // of the locator alone would produce a workflow the driver refuses.
+    const recording = new Recording();
+    const first = windowOf({ window_id: "hwnd:1", title: "Same" });
+    const second = windowOf({ window_id: "hwnd:2", title: "Same" });
+    const added = recording.addCaptured([step({ locator: null })], first, [first, second]);
+
+    recording.setLocator(added[0].id, { role: "button" });
+
+    expect(added[0].window).toBeNull();
+    expect(added[0].enabled).toBe(false);
+  });
+
+  it("carries a descriptive locator through save and reopen", () => {
+    // A corrected locator is worth nothing if the file loses the parts the
+    // recorder never produced -- position and proximity are exactly those.
+    const recording = new Recording();
+    const added = recording.addCaptured([step()], windowOf());
+    recording.setLocator(added[0].id, {
+      role: "edit",
+      states: { focusable: true },
+      near: { anchor: { name: "Name:", role: "text" }, direction: "right", within: 40 },
+    });
+
+    const reopened = Recording.fromDocument(recording.toDocument());
+
+    expect(reopened.steps[0].locator).toEqual({
+      role: "edit",
+      states: { focusable: true },
+      near: { anchor: { name: "Name:", role: "text" }, direction: "right", within: 40 },
+    });
+    expect(reopened.steps[0].enabled).toBe(true);
+  });
+
+  it("compiles a corrected step into the workflow", () => {
+    // Crossing the whole path: a correction that never reaches the descriptor
+    // has not fixed anything.
+    const recording = new Recording();
+    const added = recording.addCaptured([step({ locator: null })], windowOf());
+    recording.setLocator(added[0].id, { role: "button", nth: "last" });
+
+    const descriptor = recording.toDescriptor("fixed") as Record<string, unknown>;
+    const steps = descriptor.steps as Record<string, unknown>[];
+    const find = steps.find((entry) => String(entry.id).endsWith("_element"));
+
+    expect((find?.with as Record<string, unknown>)?.locator).toEqual({
+      role: "button",
+      nth: "last",
+    });
+  });
+
   it("falls back to the title when the process name alone is shared", () => {
     // Observed while verifying this: a recording came out with just
     // {process_name: "powershell.exe"}, which replayed only because a single

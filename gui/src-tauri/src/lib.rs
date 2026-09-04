@@ -304,6 +304,40 @@ async fn stop_recording(
     shell.dispatch("release", json!({"capture_id": capture_id}))
 }
 
+/// Try a locator against a window right now, and report what it selects.
+///
+/// Editing a locator without this is guesswork, and the way it goes wrong is
+/// quiet: `{"role": "button", "nth": 3}` on the capture fixture selects the
+/// title bar's close button, because title-bar buttons live in the same tree and
+/// sit higher up the screen than the content. Someone who cannot see what was
+/// matched will believe they fixed the step, and find out when the replay closes
+/// the window.
+///
+/// Ambiguity is deliberately left to fail. The candidate list the driver attaches
+/// to DRIVER.AMBIGUOUS_MATCH is the very thing needed to narrow the locator
+/// further, and `expect: "any"` would return only the first match and discard it.
+///
+/// `expect: "optional"` because a locator being edited will usually match nothing
+/// at first. That is a state to display, not an error to raise -- otherwise every
+/// keystroke on the way to a working locator produces a failure banner.
+#[tauri::command]
+async fn try_locator(
+    shell: tauri::State<'_, Shell>,
+    window_id: String,
+    locator: Value,
+) -> Result<Value, Value> {
+    shell.dispatch(
+        "find",
+        json!({
+            "window_id": window_id,
+            "locator": locator,
+            "expect": "optional",
+            "max_nodes": 1000,
+            "max_depth": 32,
+        }),
+    )
+}
+
 #[tauri::command]
 async fn probe_environment() -> Value {
     aad_probe::probe().to_json()
@@ -381,6 +415,7 @@ pub fn run() {
             start_recording,
             collect_recording,
             stop_recording,
+            try_locator,
             probe_environment,
             save_recording,
             load_recording,

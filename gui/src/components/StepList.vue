@@ -1,6 +1,8 @@
 <script setup lang="ts">
-import { computed } from "vue";
+import { computed, ref } from "vue";
 import AssertionEditor from "./AssertionEditor.vue";
+import LocatorEditor from "./LocatorEditor.vue";
+import type { Locator, WindowInfo } from "../bridge";
 import {
   ACTIONS_NEEDING_TEXT,
   type Assertion,
@@ -8,13 +10,22 @@ import {
   type ValidationIssue,
 } from "../recording";
 
-const props = defineProps<{ steps: Step[]; issues: ValidationIssue[] }>();
+const props = defineProps<{
+  steps: Step[];
+  issues: ValidationIssue[];
+  /** The live window locators are tried against. */
+  window?: WindowInfo | null;
+}>();
+
+/** Which step's locator is open for editing, if any. */
+const editing = ref<string | null>(null);
 
 defineEmits<{
   toggle: [string, boolean];
   remove: [string];
   move: [string, number];
   argument: [string, string];
+  locator: [string, Locator];
   assertion: [string, Partial<Assertion> | null];
   export: [];
   clear: [];
@@ -104,8 +115,25 @@ function describeLocator(step: Step): string {
 
         <div class="row second">
           <span class="window mono">{{ step.windowTitle }}</span>
+          <button
+            class="tiny"
+            @click="editing = editing === step.id ? null : step.id"
+            :title="step.locator
+              ? 'Change how this element is found'
+              : 'Describe this element another way so the step can run'"
+          >
+            {{ editing === step.id ? "Cancel" : step.locator ? "Edit" : "Fix" }}
+          </button>
           <span class="ref mono">{{ describeLocator(step) }}</span>
         </div>
+
+        <LocatorEditor
+          v-if="editing === step.id"
+          :locator="step.locator"
+          :window="props.window ?? null"
+          @apply="(next: Locator) => { $emit('locator', step.id, next); editing = null; }"
+          @close="editing = null"
+        />
 
         <input
           v-if="needsText(step.action)"
@@ -233,5 +261,14 @@ li.invalid {
   margin: 5px 0 0;
   color: var(--warn);
   font-size: 12px;
+}
+
+.tiny {
+  padding: 1px 6px;
+  font-size: 11px;
+  /* A long locator must truncate itself rather than push the button out of
+     sight: the panel is narrow, and a step with no visible way to correct it
+     looks like a step that cannot be corrected. */
+  flex: none;
 }
 </style>

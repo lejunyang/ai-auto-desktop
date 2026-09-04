@@ -339,6 +339,30 @@ export class Recording {
     return true;
   }
 
+  /**
+   * Replace a step's locator.
+   *
+   * A step that could not be located becomes runnable again once it has one, so
+   * this re-enables it. That is the whole point of correcting a locator: without
+   * it the step would stay excluded from the run and the correction would appear
+   * to have done nothing.
+   *
+   * Nothing here checks that the locator matches. It cannot -- the model has no
+   * desktop -- and pretending otherwise would be worse than leaving the check
+   * where it belongs, next to the button that tries it.
+   */
+  setLocator(stepId: string, locator: Locator): boolean {
+    const step = this.steps.find((candidate) => candidate.id === stepId);
+    if (!step) {
+      return false;
+    }
+    step.locator = locator;
+    if (step.window !== null) {
+      step.enabled = true;
+    }
+    return true;
+  }
+
   setArgument(stepId: string, argument: string): boolean {
     const step = this.steps.find((candidate) => candidate.id === stepId);
     if (!step) {

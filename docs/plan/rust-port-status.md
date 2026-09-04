@@ -931,3 +931,97 @@ GUI 每 700ms 轮询一次 `collect`，录到的步骤**直接进同一个 recor
 
 - **删除 Python**：保留供查阅。
 - **skills 目录**：等 CLI 能力齐全后再写。
+
+## 2.24 Correcting a locator, with the trying next to it
+
+A recorded locator is a guess made from one moment of one session. It stops
+matching for ordinary reasons -- the label was translated, the field was
+renamed, a second button appeared -- so the recording editor has to let someone
+write a different one. Two things had to be true for that to be worth having.
+
+**The correction has to be able to say more than "another attribute".** When an
+element has no stable name and no author-written id, no combination of
+attributes identifies it. What is left is where it sits: the third button, the
+field beside `Name:`, the first focusable input. The driver already resolved
+those (§2.20), but the front end could not express them -- `bridge.ts`'s
+`Locator` had `role`, `name`, `automation_id`, `class_name`, `framework_id` and
+`match`, and nothing else. `vue-tsc` said so plainly the first time a test
+wrote `nth`: *Property 'nth' does not exist on type 'Locator'*. The type is now
+the whole shape the driver accepts, including `states`, `nth` and `near`.
+
+**The correction has to be verifiable on the spot.** Without that, editing a
+locator is guessing, and the way it goes wrong is quiet. On the capture fixture:
+
+```
+{"role": "button", "nth": 3}   ->   ✓ matched   button "关闭"
+```
+
+Three buttons up from the top of that window is not the submit button; it is the
+title bar's close button, because title-bar buttons live in the same tree and
+sit higher on the screen. Showing only *found* would let someone keep that and
+discover it when a replay closes the window. So `try_locator` reports **what it
+selected**, and the editor prints it.
+
+The same run, seen from the editor:
+
+| locator | what the editor showed |
+|---|---|
+| `{"role":"button","nth":3}` | `✓ matched button "关闭"` |
+| `{"role":"edit","states":{"focusable":true},"nth":1}` | `✓ matched edit "NameBox"` |
+| `{"role":"edit","near":{"anchor":{"name":"Name:"},"direction":"right"}}` | `✓ matched edit "NameBox"` |
+| `{"role":"button"}` | `✗ matched 5 elements` + the five candidates |
+| `{"role":"button","name":"NoSuchButton"}` | `✗ matched nothing in this window` |
+
+`expect` is `optional`, not `any`. A locator being edited matches nothing for
+most of the time it is being typed, and that is a state to show rather than an
+error to raise. Ambiguity is deliberately left to fail: the candidate list the
+driver attaches to `DRIVER.AMBIGUOUS_MATCH` is exactly what tells someone how to
+narrow the locator, and `expect: "any"` would return the first match and throw
+the candidates away.
+
+### The form, and what it refuses
+
+Free-form JSON would have been less work, and it is still there behind
+*Edit as JSON* for shapes the fields cannot hold. But the four descriptions
+above all have a fixed shape, so they get fields -- and the fields can refuse
+what JSON would have accepted silently:
+
+- **Position zero.** The driver rejects `nth: 0` outright, because positions are
+  1-based and reading 0 as "the first" would select a different element than
+  intended. The form says so before it is tried.
+- **A direction or a distance with nothing to be near.** Both are properties of
+  a proximity constraint. Without an anchor they would be dropped on the way to
+  the driver, and the person would believe they had applied them.
+- **A locator that constrains nothing**, which matches every element.
+
+`isBeyondForm` is the other half. A locator whose anchor is itself positional, or
+which requires a state to be *false*, or which uses a field this version does not
+know about, says more than the fields can show -- so it opens in the JSON view
+and stays there. Round-tripping it through the form would return a locator that
+matches something else while looking edited.
+
+### What the real screen taught, again
+
+Neither of these came from a test.
+
+The **Edit button was off screen**. It was placed after the locator text, and
+`role=button name="SubmitButton"` is long enough to push it past the edge of a
+narrow panel. The capability was there and unreachable; a step with no visible
+way to correct it reads as a step that cannot be corrected. The button now comes
+first and does not shrink, and the locator text truncates instead.
+
+**`describe` truncates, and the GUI describing itself is large.** The editor's
+own buttons sit at `e199`-`e211`, past what `--limit 500` returns for a window
+whose outline panel lists a dozen nodes each with three to five action buttons.
+Two probe runs looked like "the button does not exist" when the button was
+simply outside the window that `describe` returns. `find` by name is not subject
+to that.
+
+One more, from the same runs: locating the editor's own `position` field with
+`{"role":"edit","near":{"anchor":{"name":"position","role":"text"},...}}`
+worked, and the same thing for `name` returned `DRIVER.NOT_FOUND` -- there are
+several "name" labels on that screen, and an ambiguous anchor resolves to
+nothing rather than to a guess. That is the designed behaviour (§2.20) meeting
+its own tooling.
+
+**Tests**: 569 Rust, 96 front end (`locator.ts` 14, `setLocator` 4).
