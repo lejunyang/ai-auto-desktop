@@ -215,7 +215,23 @@ before reaching the page. Add a `next to` anchor to count within a region."
               <option v-for="value in DIRECTIONS" :key="value" :value="value">{{ value }}</option>
             </select>
           </label>
-          <label><span>within px</span><input v-model="draft.within" placeholder="40" /></label>
+          <label><span>within px</span><input v-model="draft.nearWithin" placeholder="40" /></label>
+        </div>
+
+        <div class="group">
+          <p class="hint">
+            Or search inside one container. Useful when several elements share a
+            name and only their panel differs — measured here, naming the
+            container cut same-role siblings from a median of 66 to 3.
+          </p>
+          <label>
+            <span>inside element named</span>
+            <input v-model="draft.containerName" placeholder="Terminal actions" />
+          </label>
+          <label>
+            <span>of role</span>
+            <input v-model="draft.containerRole" placeholder="tool_bar" />
+          </label>
         </div>
       </fieldset>
     </div>

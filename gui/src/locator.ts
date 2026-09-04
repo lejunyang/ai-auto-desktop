@@ -39,8 +39,25 @@ export interface LocatorDraft {
   nearName: string;
   nearRole: string;
   direction: Direction;
-  /** Maximum gap in pixels, or empty for no limit. */
-  within: string;
+  /**
+   * Maximum gap in pixels between this element and its anchor, or empty for no
+   * limit.
+   *
+   * Named apart from `containerName` on purpose: the driver calls both of them
+   * `within` -- a number under `near`, an object at the top level -- and a form
+   * cannot bind two fields to one name. Sharing it would send "40" and
+   * "tool_bar" to the same place.
+   */
+  nearWithin: string;
+  /**
+   * The name of the container to search inside, or empty to search the window.
+   *
+   * The reason this exists: of the interactive elements measured on this machine
+   * that no attribute combination could identify, naming a container brought
+   * same-role siblings from a median of 66 down to 3.
+   */
+  containerName: string;
+  containerRole: string;
 }
 
 export function emptyDraft(): LocatorDraft {
@@ -54,7 +71,9 @@ export function emptyDraft(): LocatorDraft {
     nearName: "",
     nearRole: "",
     direction: "any",
-    within: "",
+    nearWithin: "",
+    containerName: "",
+    containerRole: "",
   };
 }
 
@@ -109,8 +128,15 @@ export function toDraft(locator: Locator | null): LocatorDraft {
       draft.direction = direction as Direction;
     }
     if (proximity.within !== undefined && proximity.within !== null) {
-      draft.within = String(proximity.within);
+      draft.nearWithin = String(proximity.within);
     }
+  }
+
+  const container = source.within;
+  if (container && typeof container === "object") {
+    const fields = container as Record<string, unknown>;
+    draft.containerName = asText(fields.name);
+    draft.containerRole = asText(fields.role);
   }
   return draft;
 }
@@ -135,9 +161,21 @@ export function isBeyondForm(locator: Locator | null): boolean {
     "states",
     "nth",
     "near",
+    "within",
   ]);
   if (Object.keys(source).some((key) => !known.has(key))) {
     return true;
+  }
+  const container = source.within;
+  if (container && typeof container === "object") {
+    const fields = Object.keys(container as Record<string, unknown>);
+    // A container identified by anything beyond name and role -- a position, a
+    // container of its own -- which is what synthesis produces for an anonymous
+    // group. Editing that through the form would drop the part that makes it
+    // work.
+    if (fields.some((key) => key !== "name" && key !== "role")) {
+      return true;
+    }
   }
   const states = source.states;
   if (states && typeof states === "object") {
@@ -180,14 +218,21 @@ export function draftProblem(draft: LocatorDraft): string | null {
       }
     }
   }
-  if (draft.within && !draft.nearName) {
+  if (draft.nearWithin && !draft.nearName) {
     return "a distance limit only means something with an element to be near";
   }
-  if (draft.within) {
-    const within = Number(draft.within);
+  if (draft.nearWithin) {
+    const within = Number(draft.nearWithin);
     if (!Number.isFinite(within) || within <= 0) {
       return "a distance is a number of pixels";
     }
+  }
+  if (draft.containerRole.trim() && !draft.containerName.trim()) {
+    // A role alone usually matches several containers, and the driver treats an
+    // ambiguous container as no match -- so this would look like a working
+    // locator that finds nothing. The JSON view can still express it for the
+    // cases where the role really is unique.
+    return "a container needs a name — a role alone usually matches several";
   }
   if (draft.direction !== "any" && !draft.nearName) {
     return "a direction only means something with an element to be near";
@@ -226,10 +271,17 @@ export function fromDraft(draft: LocatorDraft): Locator {
     if (draft.direction !== "any") {
       near.direction = draft.direction;
     }
-    if (draft.within.trim()) {
-      near.within = Number(draft.within.trim());
+    if (draft.nearWithin.trim()) {
+      near.within = Number(draft.nearWithin.trim());
     }
     locator.near = near;
+  }
+  if (draft.containerName.trim()) {
+    const container: Record<string, unknown> = { name: draft.containerName.trim() };
+    if (draft.containerRole.trim()) {
+      container.role = draft.containerRole.trim();
+    }
+    locator.within = container;
   }
   return locator as Locator;
 }
@@ -251,7 +303,13 @@ export function countsAcrossWindow(locator: Locator | null): boolean {
     return false;
   }
   const source = locator as Record<string, unknown>;
-  return source.nth !== undefined && source.nth !== null && source.near === undefined;
+  if (source.nth === undefined || source.nth === null) {
+    return false;
+  }
+  // Either kind of scope makes the count local: an anchor restricts it to what
+  // sits nearby, a container to one subtree. Warning about a scoped position
+  // would train people to ignore the warning.
+  return source.near === undefined && source.within === undefined;
 }
 
 /** A one-line description of what a locator selects, for display. */
@@ -299,6 +357,14 @@ export function describe(locator: Locator | null): string {
     if (proximity.within !== undefined && proximity.within !== null) {
       parts.push(`within ${proximity.within}px`);
     }
+  }
+
+  const container = source.within;
+  if (container && typeof container === "object") {
+    const fields = container as Record<string, unknown>;
+    const label =
+      asText(fields.name) || asText(fields.role) || "an unnamed container";
+    parts.push(`inside ${JSON.stringify(label)}`);
   }
   return parts.join(" ");
 }

@@ -56,6 +56,14 @@ export interface Locator {
   states?: Record<string, boolean>;
   /** 1-based position among the matches, or `"last"`. There is no element zero. */
   nth?: number | string;
+  /**
+   * Restrict the search to one container's subtree.
+   *
+   * A full locator, so the container can itself be positional or
+   * nested. Distinct from `Proximity.within`, which is a distance in
+   * pixels; this one is what holds the element.
+   */
+  within?: Locator;
   near?: Proximity;
 }
 

@@ -317,7 +317,7 @@ src/            Python 原型（保留备查，不再演进）
 ## 测试
 
 ```powershell
-cargo test --workspace     # 573 个测试
+cargo test --workspace     # 586 个测试
 cd gui; npm run test       # 65 个测试
 ```
 

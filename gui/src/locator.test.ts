@@ -82,7 +82,7 @@ group("editing a locator through the form", () => {
     expect(draftProblem(draft({ role: "button", direction: "left" }))).toContain(
       "element to be near",
     );
-    expect(draftProblem(draft({ role: "button", within: "40" }))).toContain(
+    expect(draftProblem(draft({ role: "button", nearWithin: "40" }))).toContain(
       "element to be near",
     );
   });
@@ -187,5 +187,95 @@ group("describing a locator in words", () => {
   it("says plainly when there is no locator at all", () => {
     // This is the state a person has to act on, so it cannot read as empty.
     expect(describeLocator(null)).toContain("could not be identified");
+  });
+});
+
+group("containers", () => {
+  it("carries a container through the form and back", () => {
+    // The round trip is the whole risk: a container that survives display but
+    // not saving turns a working locator into one that matches nothing, and the
+    // form looks like it did the right thing.
+    const original = {
+      role: "button",
+      name: "Close",
+      within: { role: "tool_bar", name: "Terminal actions" },
+      nth: 2,
+    };
+
+    const rebuilt = fromDraft(toDraft(original as never));
+
+    expect(rebuilt).toEqual(original);
+  });
+
+  it("keeps a container that says more than the form can show in the JSON view", () => {
+    // Synthesis produces exactly this for an anonymous group: the container is
+    // itself positioned and scoped. Editing through the form would drop the part
+    // that makes it unique.
+    expect(
+      isBeyondForm({
+        role: "button",
+        within: { role: "group", nth: 1, within: { role: "tool_bar", name: "Actions" } },
+      } as never),
+    ).toBe(true);
+
+    // A plain named container is within reach of the form.
+    expect(
+      isBeyondForm({ role: "button", within: { role: "tool_bar", name: "Actions" } } as never),
+    ).toBe(false);
+  });
+
+  it("refuses a container identified only by its role", () => {
+    // The driver treats an ambiguous container as no match at all, so this would
+    // read as a working locator that finds nothing.
+    expect(draftProblem(draft({ role: "button", containerRole: "tool_bar" }))).toContain(
+      "needs a name",
+    );
+
+    expect(
+      draftProblem(draft({ role: "button", containerName: "Actions", containerRole: "tool_bar" })),
+    ).toBeNull();
+  });
+
+  it("does not warn about counting when a container scopes the count", () => {
+    // A position inside a named container is local, so the warning about
+    // window-wide counting would be wrong here -- and a warning that fires when
+    // it should not teaches people to ignore it.
+    expect(
+      countsAcrossWindow({ role: "button", nth: 3, within: { name: "Actions" } } as never),
+    ).toBe(false);
+
+    // Without a scope it still counts everything, frame included.
+    expect(countsAcrossWindow({ role: "button", nth: 3 } as never)).toBe(true);
+  });
+
+  it("says which container it searches", () => {
+    expect(
+      describeLocator({
+        role: "button",
+        name: "Close",
+        within: { role: "tool_bar", name: "Terminal actions" },
+        nth: 2,
+      } as never),
+    ).toBe('#2 button named "Close" inside "Terminal actions"');
+  });
+
+  it("keeps a distance limit and a container apart", () => {
+    // Both are called `within` by the driver -- a number under `near`, an object
+    // at the top level. Binding them to one field would send "40" and
+    // "tool_bar" to the same place.
+    const built = fromDraft(
+      draft({
+        role: "edit",
+        nearName: "Name:",
+        nearWithin: "40",
+        containerName: "Details",
+      }),
+    );
+
+    expect(built).toEqual({
+      role: "edit",
+      near: { anchor: { name: "Name:" }, within: 40 },
+      within: { name: "Details" },
+    });
   });
 });

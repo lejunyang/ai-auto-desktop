@@ -7,6 +7,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
+use std::collections::HashMap;
 use sha2::{Digest, Sha256};
 
 /// A rectangle in virtual-desktop coordinates.
@@ -350,6 +351,22 @@ impl Target {
 /// level multiplies the search.
 const MAX_ANCHOR_DEPTH: usize = 3;
 
+/// How far up a parent chain to walk before giving up.
+///
+/// Only a guard against a malformed tree whose `parent_id`s form a cycle, which
+/// would otherwise hang the search. Real hierarchies are far shallower: the
+/// deepest node measured on this machine sat at depth 21, in a browser.
+const MAX_ANCESTRY_DEPTH: usize = 64;
+
+/// How many same-role siblings an ordinal is still worth using with.
+///
+/// Beyond this, counting stops being a description a person can verify: nobody
+/// checks that a link is the sixty-fourth, and one inserted row invalidates it
+/// silently. Such an element is reported as unresolved instead, which the
+/// recording surfaces for a human to correct -- measured, that is 26% of the
+/// cases attributes could not identify.
+const MAX_COUNTABLE_SIBLINGS: usize = 10;
+
 /// A declarative element selector.
 ///
 /// Every populated field must match, so adding a field always narrows the
@@ -376,6 +393,22 @@ pub struct Locator {
     pub nth: Option<Ordinal>,
     /// Position relative to another element, itself located by a locator.
     pub near: Option<Box<Proximity>>,
+
+    /// Search only inside the element this describes.
+    ///
+    /// The answer for elements that share every attribute with their siblings:
+    /// seven buttons all named "Close (Ctrl+F4)" are told apart by which toolbar
+    /// they sit in, not by anything they carry themselves. Measured here, of 143
+    /// interactive elements no attribute combination could identify, naming an
+    /// identifiable ancestor brought same-role siblings from a median of 66 down
+    /// to 3, and made 23 of them unique outright.
+    ///
+    /// Distinct from `near`, which is geometric and mutual. This is containment,
+    /// follows the accessibility tree, and scopes everything after it -- an
+    /// ordinal counts inside the container rather than across the window, which
+    /// is what makes an ordinal usable at all: counting across a window, the
+    /// median element has 66 same-role siblings.
+    pub within: Option<Box<Locator>>,
 }
 
 /// Which one of several matching elements is meant.
@@ -552,6 +585,22 @@ impl Locator {
             Some(_) => return Err("locator.near must be an object".to_string()),
         };
 
+        // Shares the nesting budget with `near`, because both are locators that
+        // can nest and both cost the same to resolve. Counting them separately
+        // would double the real limit while guarding against the same thing.
+        let within = match object.get("within") {
+            None => None,
+            Some(value @ Value::Object(_)) => {
+                Some(Box::new(Self::from_value_at(value, depth + 1)?))
+            }
+            Some(_) => {
+                return Err(
+                    "locator.within must be an object describing the containing element"
+                        .to_string(),
+                )
+            }
+        };
+
         Ok(Self {
             role: text("role"),
             name: text("name"),
@@ -564,6 +613,7 @@ impl Locator {
             match_mode: Some(match_mode),
             nth,
             near,
+            within,
         })
     }
 
@@ -710,6 +760,86 @@ impl Locator {
                 return Some(candidate);
             }
         }
+
+        // Attributes are exhausted. What is left is where the element sits, and
+        // measurement says that is worth trying: of 143 interactive elements on
+        // this machine that no attribute combination could identify, naming a
+        // container brought same-role siblings from a median of 66 down to 3.
+        //
+        // Seven buttons all named "Close (Ctrl+F4)" are a real case, and nothing
+        // they carry tells them apart -- only which toolbar they are in does.
+        Self::by_container(node, nodes, &candidate)
+    }
+
+    /// Identify `node` by the container it sits in, and its position inside it.
+    ///
+    /// The container is the nearest ancestor that can itself be identified, not
+    /// simply the parent. A parent is very often an unnamed `group`, and using it
+    /// would move the problem up one level rather than solve it: a locator whose
+    /// container cannot be found resolves to nothing.
+    fn by_container(node: &Node, nodes: &[Node], attributes: &Self) -> Option<Self> {
+        let by_id: HashMap<&str, &Node> = nodes
+            .iter()
+            .map(|other| (other.node_id.as_str(), other))
+            .collect();
+
+        let mut current = node.parent_id.as_deref();
+        let mut steps = 0usize;
+        while let Some(id) = current {
+            steps += 1;
+            if steps > MAX_ANCESTRY_DEPTH {
+                return None;
+            }
+            let Some(ancestor) = by_id.get(id) else {
+                return None;
+            };
+
+            if let Some(container) = Self::synthesize(ancestor, nodes) {
+                let mut candidate = attributes.clone();
+                candidate.within = Some(Box::new(container));
+
+                // The container alone may be enough. 23 of the 143 were unique
+                // once scoped, and a locator without an ordinal survives a
+                // sibling being added or reordered, so it is preferred.
+                if candidate.unique_for(node, nodes) {
+                    return Some(candidate);
+                }
+
+                // Otherwise count inside the container. Deliberately not across
+                // the window: there the median element has 66 same-role
+                // siblings, and "the 66th button" is not a description anyone
+                // can check or that survives a layout change.
+                let inside = candidate.resolve(nodes);
+                if inside.len() <= MAX_COUNTABLE_SIBLINGS {
+                    let mut ordered: Vec<&Node> = inside;
+                    ordered.sort_by_key(|other| reading_order(other));
+                    if let Some(index) =
+                        ordered.iter().position(|other| other.node_id == node.node_id)
+                    {
+                        candidate.nth = Some(Ordinal::Index(index + 1));
+                        if candidate.unique_for(node, nodes) {
+                            return Some(candidate);
+                        }
+                    }
+                } else {
+                    // Too many siblings already, and a higher ancestor holds a
+                    // superset of this subtree -- so every remaining step is
+                    // guaranteed to be worse. Walking on cost 41ms per element
+                    // on a thousand-node page (907ms of a 917ms total spent on
+                    // the 22 elements that were going to fail anyway), all of it
+                    // searching a space that cannot contain an answer.
+                    return None;
+                }
+
+                // This ancestor was identifiable but did not narrow enough.
+                // Keep walking: a higher ancestor can still be the one that
+                // does, and a quarter of the measured sample needed more than
+                // the first.
+                current = ancestor.parent_id.as_deref();
+                continue;
+            }
+            current = ancestor.parent_id.as_deref();
+        }
         None
     }
 
@@ -727,6 +857,7 @@ impl Locator {
             match_mode: None,
             nth: None,
             near: None,
+            within: None,
         }
     }
 
@@ -783,6 +914,9 @@ impl Locator {
             }
             object.insert("near".to_string(), Value::Object(relation));
         }
+        if let Some(container) = &self.within {
+            object.insert("within".to_string(), container.to_json());
+        }
         Value::Object(object)
     }
 
@@ -800,6 +934,16 @@ impl Locator {
     /// a different element, and usually none at all.
     pub fn resolve<'a>(&self, nodes: &'a [Node]) -> Vec<&'a Node> {
         let mut candidates: Vec<&Node> = nodes.iter().filter(|node| self.matches(node)).collect();
+
+        // Before proximity and before counting: `within` is a scope, and both of
+        // the others are meant to apply inside it. "The second Close button in
+        // the tab bar" must count within the tab bar -- counting first and then
+        // checking containment would mean "the second Close button in the
+        // window, if it happens to be in the tab bar", which is a different
+        // element and usually none.
+        if let Some(container) = &self.within {
+            candidates = container.contain(candidates, nodes);
+        }
 
         if let Some(near) = &self.near {
             candidates = near.filter(candidates, nodes);
@@ -819,6 +963,54 @@ impl Locator {
                 picked.into_iter().collect()
             }
         }
+    }
+
+    /// Keep only the candidates that sit inside the element this locator names.
+    ///
+    /// Walks `parent_id` rather than comparing rectangles. Containment in the
+    /// accessibility tree is what the application actually declares; overlapping
+    /// bounds are a consequence of layout and would also catch a tooltip drawn
+    /// over a toolbar, or miss a scrolled-out row that is still a child.
+    ///
+    /// An unresolvable or ambiguous container yields nothing, matching how an
+    /// anchor behaves: "inside the search panel" when there is no search panel,
+    /// or two of them, is a failed lookup. Silently dropping the scope would
+    /// search the whole window and act on some other element entirely.
+    fn contain<'a>(&self, candidates: Vec<&'a Node>, nodes: &[Node]) -> Vec<&'a Node> {
+        let containers = self.resolve(nodes);
+        if containers.len() != 1 {
+            return Vec::new();
+        }
+        let container_id = containers[0].node_id.as_str();
+
+        let by_id: HashMap<&str, &Node> = nodes
+            .iter()
+            .map(|node| (node.node_id.as_str(), node))
+            .collect();
+
+        candidates
+            .into_iter()
+            .filter(|candidate| {
+                // The container is not inside itself: "the button in the toolbar"
+                // should not offer the toolbar.
+                let mut current = candidate.parent_id.as_deref();
+                let mut steps = 0usize;
+                while let Some(id) = current {
+                    // A malformed tree with a parent cycle would otherwise hang
+                    // the search. The depth is generous enough that no real
+                    // hierarchy reaches it.
+                    steps += 1;
+                    if steps > MAX_ANCESTRY_DEPTH {
+                        return false;
+                    }
+                    if id == container_id {
+                        return true;
+                    }
+                    current = by_id.get(id).and_then(|node| node.parent_id.as_deref());
+                }
+                false
+            })
+            .collect()
     }
 
     /// Whether this locator matches `node` and nothing else.
@@ -978,7 +1170,30 @@ fn durable(value: Option<&str>) -> Option<String> {
     if volatile_suffix(&value) {
         return None;
     }
+    // A list of style classes, which a WebView reports as class_name verbatim:
+    // `flex shrink-0 items-center justify-center font-[400] text-[14px] ...`.
+    // Measured here, class_name has a median length of 17 -- author-written names
+    // like `actions-container` -- but 153 values exceed 120 characters and the
+    // longest is 937, every one of them a Tailwind list. Such a value describes
+    // how the element looks, so changing a font size silently unmatches the
+    // locator while the element is still there.
+    if style_list(&value) {
+        return None;
+    }
     Some(value)
+}
+
+/// Whether this looks like a list of style classes rather than one identifier.
+///
+/// Judged by shape, not length: several space-separated tokens is what a class
+/// attribute looks like, and a single long token is usually a control name
+/// (`NonClientVerticalScrollBar`, 26 characters, perfectly usable). The
+/// threshold is deliberately above what a compound name reaches -- `monaco-icon
+/// -label` and `actions-container` carry no spaces at all.
+fn style_list(value: &str) -> bool {
+    // Two would reject legitimate two-word names; the measured style lists all
+    // carry many more.
+    value.split_whitespace().count() > 3
 }
 
 /// Whether a name ends in the `_r<n>_ad<n>` suffix WinForms regenerates.
@@ -1026,6 +1241,322 @@ mod tests {
             depth: 1,
             parent_id: None,
             children: Vec::new(),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Containers (`within`)
+    //
+    // Measured on this machine: of 143 interactive elements that no attribute
+    // combination could identify, naming an identifiable ancestor brought
+    // same-role siblings from a median of 66 down to 3, and made 23 unique
+    // outright. The motivating case was seven buttons all named
+    // "Close (Ctrl+F4)", told apart only by which toolbar held them.
+    // -----------------------------------------------------------------------
+
+    /// Like `node`, but placed in a tree and positioned on screen.
+    fn node_at(
+        id: &str,
+        role: &str,
+        name: Option<&str>,
+        parent: Option<&str>,
+        bounds: Option<Bounds>,
+    ) -> Node {
+        let mut built = node(id, role, name);
+        built.parent_id = parent.map(str::to_string);
+        built.bounds = bounds;
+        built
+    }
+
+    /// Two toolbars, each holding two identically named buttons.
+    fn toolbars() -> Vec<Node> {
+        let mut nodes = vec![node_at("w", "window", Some("App"), None, None)];
+        for (row, (bar_id, bar_name)) in
+            [("t1", "Explorer actions"), ("t2", "Terminal actions")].iter().enumerate()
+        {
+            nodes.push(node_at(bar_id, "tool_bar", Some(bar_name), Some("w"), None));
+            for slot in 0..2i32 {
+                nodes.push(node_at(
+                    &format!("{bar_id}b{slot}"),
+                    "button",
+                    Some("Close"),
+                    Some(bar_id),
+                    Some(Bounds {
+                        x: 100 * slot + 10,
+                        y: 50 * row as i32,
+                        width: 40,
+                        height: 20,
+                    }),
+                ));
+            }
+        }
+        nodes
+    }
+
+    #[test]
+    fn a_container_scopes_the_search_to_its_subtree() {
+        let nodes = toolbars();
+        let locator = Locator::from_value(&json!({
+            "role": "button",
+            "name": "Close",
+            "within": {"role": "tool_bar", "name": "Terminal actions"}
+        }))
+        .expect("a valid locator");
+
+        let found = locator.resolve(&nodes);
+
+        assert_eq!(found.len(), 2, "that toolbar's buttons, and neither of the other's");
+        assert!(found.iter().all(|node| node.node_id.starts_with("t2")));
+    }
+
+    #[test]
+    fn an_ordinal_counts_inside_the_container_not_across_the_window() {
+        // The reason the scope is applied first. Counting across the window would
+        // make this the second Close button anywhere -- which is in the *first*
+        // toolbar, so the action lands on a different control while the locator
+        // reads as though it were scoped.
+        let nodes = toolbars();
+        let locator = Locator::from_value(&json!({
+            "role": "button",
+            "within": {"role": "tool_bar", "name": "Terminal actions"},
+            "nth": 2
+        }))
+        .expect("a valid locator");
+
+        let found = locator.resolve(&nodes);
+
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].node_id, "t2b1", "the second within that toolbar");
+    }
+
+    #[test]
+    fn an_unfindable_container_selects_nothing() {
+        // Not a fallback to the whole window: "the button in the search panel"
+        // with no search panel present is a failed lookup, and quietly dropping
+        // the scope would act on some other button entirely.
+        let nodes = toolbars();
+        let locator = Locator::from_value(&json!({
+            "role": "button",
+            "within": {"role": "tool_bar", "name": "Nothing like this"}
+        }))
+        .expect("a valid locator");
+
+        assert!(locator.resolve(&nodes).is_empty());
+    }
+
+    #[test]
+    fn an_ambiguous_container_selects_nothing() {
+        // Two toolbars match `{"role": "tool_bar"}`. Picking one would be a coin
+        // flip that reads as a definite answer.
+        let nodes = toolbars();
+        let locator = Locator::from_value(&json!({
+            "role": "button",
+            "within": {"role": "tool_bar"}
+        }))
+        .expect("a valid locator");
+
+        assert!(locator.resolve(&nodes).is_empty());
+    }
+
+    #[test]
+    fn containment_follows_the_tree_not_the_rectangles() {
+        // A tooltip drawn over a toolbar overlaps it without being in it, and a
+        // scrolled-out row is still a child. The tree is what the application
+        // declares; overlapping bounds are a consequence of layout.
+        let mut nodes = toolbars();
+        nodes.push(node_at(
+            "tip",
+            "button",
+            Some("Close"),
+            Some("w"),
+            // Sitting exactly over the first toolbar's first button.
+            Some(Bounds { x: 10, y: 0, width: 40, height: 20 }),
+        ));
+
+        let locator = Locator::from_value(&json!({
+            "role": "button",
+            "within": {"role": "tool_bar", "name": "Explorer actions"}
+        }))
+        .expect("a valid locator");
+
+        let found = locator.resolve(&nodes);
+
+        assert_eq!(found.len(), 2, "the overlay is not one of the toolbar's buttons");
+        assert!(found.iter().all(|node| node.node_id.starts_with("t1")));
+    }
+
+    #[test]
+    fn the_container_itself_is_not_one_of_its_contents() {
+        let nodes = toolbars();
+        let locator = Locator::from_value(&json!({
+            "role": "tool_bar",
+            "within": {"role": "tool_bar", "name": "Explorer actions"}
+        }))
+        .expect("a valid locator");
+
+        assert!(locator.resolve(&nodes).is_empty());
+    }
+
+    #[test]
+    fn a_parent_cycle_does_not_hang_the_search() {
+        // A malformed tree, but one that would spin for ever rather than fail.
+        let mut nodes = toolbars();
+        nodes[0].parent_id = Some("t1b0".to_string());
+
+        let locator = Locator::from_value(&json!({
+            "role": "button",
+            "within": {"role": "window", "name": "App"}
+        }))
+        .expect("a valid locator");
+
+        // That it returns at all is the assertion.
+        let _ = locator.resolve(&nodes);
+    }
+
+    #[test]
+    fn synthesize_falls_back_to_the_container_when_attributes_run_out() {
+        let nodes = toolbars();
+        let target = nodes.iter().find(|node| node.node_id == "t2b0").expect("a button");
+
+        let locator = Locator::synthesize(target, &nodes).expect("a container makes it findable");
+        let rendered = locator.to_json();
+
+        assert!(rendered.get("within").is_some(), "got {rendered}");
+        let found = locator.resolve(&nodes);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].node_id, "t2b0");
+    }
+
+    #[test]
+    fn an_anonymous_container_is_itself_described_rather_than_skipped() {
+        // The nearest parent is very often an unnamed group, which cannot be
+        // named directly. Rather than skipping to a higher ancestor, the
+        // container is described the same way anything else is -- "the first
+        // group in the Actions toolbar" -- because the recursion applies to
+        // containers too.
+        //
+        // That is the better of the two: a more local description is unaffected
+        // by an unrelated sibling being added to the toolbar. What must hold is
+        // that the whole chain resolves and selects exactly the target; which
+        // ancestor it settled on is an implementation detail, and pinning it
+        // would turn a future improvement into a failure.
+        let mut nodes = vec![
+            node_at("w", "window", Some("App"), None, None),
+            node_at("bar", "tool_bar", Some("Actions"), Some("w"), None),
+            node_at("g1", "group", None, Some("bar"), None),
+            node_at("g2", "group", None, Some("bar"), None),
+        ];
+        nodes.push(node_at(
+            "b1",
+            "button",
+            Some("Go"),
+            Some("g1"),
+            Some(Bounds { x: 0, y: 0, width: 20, height: 10 }),
+        ));
+        nodes.push(node_at(
+            "b2",
+            "button",
+            Some("Go"),
+            Some("g2"),
+            Some(Bounds { x: 0, y: 40, width: 20, height: 10 }),
+        ));
+
+        let target = nodes.iter().find(|node| node.node_id == "b1").expect("a button");
+        let locator = Locator::synthesize(target, &nodes).expect("a container makes it findable");
+        let rendered = locator.to_json();
+
+        // Scoped somehow -- attributes alone cannot separate the two Go buttons.
+        assert!(rendered.get("within").is_some(), "got {rendered}");
+
+        // And the chain is not decorative: it selects the target and nothing
+        // else. A container that resolves to nothing would make this empty,
+        // which is the failure a nested locator can hide.
+        let found = locator.resolve(&nodes);
+        assert_eq!(found.len(), 1, "selected {found:?} from {rendered}");
+        assert_eq!(found[0].node_id, "b1");
+
+        // The other button must get a different locator, or one of the two
+        // recordings would replay onto the wrong control.
+        let other = nodes.iter().find(|node| node.node_id == "b2").expect("a button");
+        let other_locator =
+            Locator::synthesize(other, &nodes).expect("the sibling is findable too");
+        assert_ne!(other_locator.to_json(), rendered);
+        let found_other = other_locator.resolve(&nodes);
+        assert_eq!(found_other.len(), 1);
+        assert_eq!(found_other[0].node_id, "b2");
+    }
+
+    #[test]
+    fn a_locator_with_a_container_survives_a_round_trip() {
+        // Saved and reopened is the whole point; a container that does not
+        // serialise makes a recording fail at replay rather than at save.
+        let original = Locator::from_value(&json!({
+            "role": "button",
+            "within": {"role": "tool_bar", "name": "Terminal actions"},
+            "nth": 2
+        }))
+        .expect("a valid locator");
+
+        let reparsed = Locator::from_value(&original.to_json()).expect("still valid");
+
+        assert_eq!(reparsed.to_json(), original.to_json());
+    }
+
+    #[test]
+    fn a_container_must_be_an_object() {
+        for bad in [json!("tool_bar"), json!(3), json!([{"role": "tool_bar"}])] {
+            let error = Locator::from_value(&json!({"role": "button", "within": bad}))
+                .expect_err("a non-object container must be rejected");
+            assert!(error.contains("within"), "got {error}");
+        }
+    }
+
+    #[test]
+    fn a_style_class_list_is_not_an_identifier() {
+        // Measured: class_name has a median length of 17 (author-written names
+        // like `actions-container`), but a WebView reports the whole class
+        // attribute -- 153 values over 120 characters, the longest 937, every one
+        // a Tailwind list. Such a locator unmatches when a font size changes,
+        // while the element is still there.
+        let tailwind = "flex shrink-0 items-center justify-center font-[400] text-[14px]";
+        let mut styled = node_at("b", "button", None, Some("w"), None);
+        styled.class_name = Some(tailwind.to_string());
+        let nodes = vec![
+            node_at("w", "window", Some("App"), None, None),
+            styled.clone(),
+            node_at("b2", "button", None, Some("w"), None),
+        ];
+
+        if let Some(locator) = Locator::synthesize(&styled, &nodes) {
+            assert!(
+                locator.to_json().get("class_name").is_none(),
+                "a style list must not be used as an identity: {}",
+                locator.to_json()
+            );
+        }
+    }
+
+    #[test]
+    fn a_compound_class_name_is_still_usable() {
+        // The rule is about shape, not length. `monaco-icon-label` and
+        // `NonClientVerticalScrollBar` are control names and carry no spaces;
+        // rejecting them would throw away a working identifier.
+        for name in ["actions-container", "monaco-icon-label", "NonClientVerticalScrollBar"] {
+            let mut styled = node_at("b", "button", None, Some("w"), None);
+            styled.class_name = Some(name.to_string());
+            let nodes = vec![
+                node_at("w", "window", Some("App"), None, None),
+                styled.clone(),
+                node_at("b2", "button", None, Some("w"), None),
+            ];
+
+            let locator =
+                Locator::synthesize(&styled, &nodes).expect("the class name identifies it");
+
+            assert_eq!(
+                locator.to_json().get("class_name").and_then(Value::as_str),
+                Some(name)
+            );
         }
     }
 

@@ -243,12 +243,34 @@ struct FindArgs {
     #[arg(long, requires = "near")]
     within: Option<i32>,
 
+    /// Search only inside the container with this name.
+    ///
+    /// For elements that share every attribute and differ only in which panel
+    /// holds them. Measured on this machine: of the interactive elements no
+    /// attribute combination could identify, naming the container brought
+    /// same-role siblings from a median of 66 down to 3 -- and it makes `--nth`
+    /// count inside that container rather than across the window.
+    ///
+    /// A container matching nothing, or several things, finds nothing: quietly
+    /// widening the search back to the whole window would act on some unrelated
+    /// element.
+    ///
+    /// Deliberately not `--within`, which is already a distance in pixels from
+    /// `--near`. The driver tells the two apart by nesting; a flag has no
+    /// nesting to rely on.
+    #[arg(long = "in", value_name = "NAME")]
+    inside: Option<String>,
+
+    /// Narrow `--in` to a container of this control type.
+    #[arg(long = "in-role", requires = "inside", value_name = "ROLE")]
+    inside_role: Option<String>,
+
     /// The whole locator as JSON, for what the flags above cannot express.
     ///
     /// Anchors can nest -- "the button beside the field beside Username" --
     /// and that shape does not fit into flags. Given this, the other match
     /// flags are ignored.
-    #[arg(long, value_name = "JSON", conflicts_with_all = ["role", "name", "automation_id", "nth", "near"])]
+    #[arg(long, value_name = "JSON", conflicts_with_all = ["role", "name", "automation_id", "nth", "near", "inside"])]
     locator: Option<String>,
 
     /// Report absence instead of failing: for asking whether something is there.
@@ -557,11 +579,19 @@ fn dispatch(command: &Command) -> (Value, u8) {
                 }
                 locator.insert("near".into(), Value::Object(relation));
             }
+            if let Some(inside) = &args.inside {
+                let mut container = serde_json::Map::new();
+                container.insert("name".into(), json!(inside));
+                if let Some(role) = &args.inside_role {
+                    container.insert("role".into(), json!(role));
+                }
+                locator.insert("within".into(), Value::Object(container));
+            }
             if locator.is_empty() {
                 return (
                     failure(
                         "CLI.INVALID_ARGUMENTS",
-                        "give at least one of --role, --name, --automation-id, --protected, --nth, --near or --locator",
+                        "give at least one of --role, --name, --automation-id, --protected, --nth, --near, --in or --locator",
                         None,
                     ),
                     EXIT_USAGE,
@@ -1334,6 +1364,69 @@ mod tests {
             assert_ne!(code, EXIT_USAGE, "a position alone must be a valid criterion");
             assert_ne!(payload["error"]["code"], "CLI.INVALID_ARGUMENTS");
         }
+    }
+
+    #[test]
+    fn a_container_scopes_the_search_and_the_counting() {
+        // Verified against a real window: `--nth 1` alone selects Minimise,
+        // because the count spans the frame. Scoped to a panel it selects that
+        // panel's first button, and the same number in a different panel selects
+        // a different element -- which is what makes the position usable.
+        let args = Cli::parse_from([
+            "aad",
+            "find",
+            "hwnd:1",
+            "--role",
+            "button",
+            "--in",
+            "Terminal actions",
+            "--nth",
+            "1",
+        ]);
+        let Command::Find(find) = args.command else {
+            panic!("expected find");
+        };
+
+        assert_eq!(find.inside.as_deref(), Some("Terminal actions"));
+        assert_eq!(find.nth.as_deref(), Some("1"));
+    }
+
+    #[test]
+    fn a_container_role_needs_the_container_it_narrows() {
+        // `--in-role tool_bar` on its own would read as "in some toolbar", which
+        // matches several and therefore nothing -- a locator that looks specific
+        // and finds none.
+        let refused = Cli::try_parse_from([
+            "aad", "find", "hwnd:1", "--role", "button", "--in-role", "tool_bar",
+        ]);
+
+        assert!(refused.is_err(), "a container role without a container must be refused");
+    }
+
+    #[test]
+    fn a_distance_and_a_container_are_separate_flags() {
+        // Both are `within` in the driver's JSON -- a number under `near`, an
+        // object at the top level. One flag for both would send `40` and
+        // `tool_bar` to the same place.
+        let args = Cli::parse_from([
+            "aad",
+            "find",
+            "hwnd:1",
+            "--role",
+            "edit",
+            "--near",
+            "Name:",
+            "--within",
+            "40",
+            "--in",
+            "Details",
+        ]);
+        let Command::Find(find) = args.command else {
+            panic!("expected find");
+        };
+
+        assert_eq!(find.within, Some(40), "the pixel distance");
+        assert_eq!(find.inside.as_deref(), Some("Details"), "the container");
     }
 
     #[test]

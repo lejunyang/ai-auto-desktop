@@ -1116,3 +1116,129 @@ it the WebSocket handshake is refused with 403 and the error says exactly which
 flag is missing.
 
 **Tests**: 573 Rust (CLI 40, uia 160), 99 front end.
+
+## 2.26 容器限定（`within`）——把「哪个面板里的」变成可写的定位
+
+### 为什么需要它
+
+用户的方向是让 locator 偏描述性。前面已经有序数（第三个按钮）和邻近（某文本旁边的
+按钮），但真机测量指出一个两者都救不了的形状。
+
+先量清楚，`crates/aad-uia/examples/probe_unresolved.rs`。三轮迭代都推翻了上一轮的
+判据：
+
+1. 统计全部节点：1093/3427 = 31.9% 无法合成 locator。这个数字**虚高**——样本被
+   `role=group` 这类容器主导，那不是用户会点的东西。
+2. 只统计可交互元素（button/edit/check_box/…）：**143/878 = 16.3%**。同时否掉了两条
+   看似可行的路：同 role 兄弟**中位 66 个**（「第 66 个按钮」不是任何人能核对的描述，
+   纯序数救不了）；最近具名元素距离**中位 0px**——那是包含关系（窗口标题包住整个内容
+   区），毫无区分力。
+3. 检查层级才找到答案：`Node` 早就有 `parent_id` 和 `depth`，只是 `Locator` 没用。
+   排除包含关系后真正相邻的距离中位是 6px；而往上找**第一个自身可 synthesize 的祖先**
+   （不是最近的 parent——parent 常常是无名 group，用它等于把问题往上推一层），兄弟数从
+   中位 66 降到**中位 3**。
+
+| 类别 | 数量 | 占比 |
+|---|---|---|
+| 祖先可识别 + 子树内唯一 | 23 | 16% |
+| 祖先可识别 + 子树内 ≤10（需序数） | 83 | 58% |
+| 祖先可识别 + 子树内 >10（序数不实用） | 37 | 26% |
+| 没有可识别的祖先 | **0** | 0% |
+
+原本担心的「容器也同名」不成立：7 个 `关闭 (Ctrl+F4)` 全在同名 `tool_bar "选项卡操作"`
+里，但继续往上走会遇到可识别的更高层祖先。
+
+### 三个设计决定
+
+**`within` 在 resolve 里排在属性筛选之后、proximity 与序数之前。** 它是范围限定，
+proximity 和序数都该在这个范围内工作。先计数再查包含会把「工具栏里的第二个关闭按钮」
+变成「窗口里的第二个关闭按钮且恰好在工具栏里」——通常是另一个元素，或者没有。真机对照
+证实了这点：`--nth 1` 不限定容器时命中的是**「最小化」**；`--in "Terminal actions"
+--nth 1` 命中 e7，`--in "Explorer actions" --nth 1` 命中 e5。
+
+**沿 `parent_id` 走，不比较矩形。** 层级包含是应用自己声明的，重叠边界是布局的副产物。
+按矩形会误抓画在工具栏上的 tooltip，也会漏掉滚出视野但仍是子节点的行。
+
+**容器不可解析或有歧义时返回空**，与锚点行为一致。悄悄丢掉范围会搜遍整个窗口，在另一个
+元素上执行写操作。
+
+### 合成端：一个可以证明不会成功的搜索
+
+`synthesize` 的容器兜底把 unresolved 从 **16.3% 降到 3.3%**（143 → 34）。但第一版慢到
+不能用：合成 254 个元素共 917ms，最慢一次 **44ms**。
+
+分组计时定位到根因：**907ms 花在那 22 个最终失败的元素上**（平均 41ms/个），成功的 232 个
+总共 9ms。失败路径走完整条祖先链，每层做一遍完整 synthesize 加多次 resolve，而单次
+resolve 只要 10-18µs——是调用次数爆炸，不是单次慢。
+
+关键观察：往上走子树只会变大，候选只会变多。一旦某祖先的子树内同类元素已多到序数不可用，
+更高的祖先必然更差。这不是把上限调松或调紧的取舍，而是**砍掉可以证明不会成功的搜索**。
+同一个 1000 节点窗口：**989ms → 23ms，最慢一次 47ms → 0.8ms**。
+
+### 顺带修掉的：样式串被当成标识符
+
+第一版合成出的 locator 里有整串 Tailwind CSS：
+
+```json
+{"role":"button","class_name":"flex shrink-0 items-center justify-center font-[400] whitespace-nowrap select-none [&_svg]:shrink-0 text-[14px] leading-..."}
+```
+
+`durable()` 只拦 WinForms 的 `_r<n>_ad<n>` 后缀，拦不住这个。测量：class_name 中位
+**17 字符**（`actions-container`、`monaco-icon-label`，作者写的名字，正常可用），但
+**432 个超过 60 字符，153 个超过 120，最长 937**，全是 WebView 把 class 属性原样透传。
+
+问题不是长，是它描述的是**外观**：把字号从 14px 改成 16px，locator 就失配，而且失配得
+隐蔽（元素还在，只是找不到了）。判据用形状——多个空格分隔的 token 是 class 属性的样子；
+单个长 token（`NonClientVerticalScrollBar`，26 字符）仍然可用，那是控件名。
+
+### 端到端验证（含一次假通过）
+
+`E:\tmp\container_fixture.ps1`：两个 GroupBox，各含一对 `name="Close"` 的按钮，属性
+完全相同。
+
+- 4 个候选 → `DRIVER.AMBIGUOUS_MATCH`（属性不够）
+- `within` + `nth` → 唯一命中 e8
+- 重启 fixture（window_id 变、四个 automation_id 全是纯数字全部漂移）→ **仍命中 e8**
+
+第一次跑「重启前后标题相同」，看着像通过——但 `last=` 两次都是空，点击根本没落地。
+原因是 fixture 的 `GetNewClosure()` 把 `$script:` 变量捕获进了闭包自己的作用域。改成
+闭包里直接写 `$this.FindForm().Text` 后才拿到真实结果：`last=Terminal actions#1` 两次
+一致。**「两次相同」在这里是假通过**，只读驱动返回或只比对标题都发现不了。
+
+### 命名撞车
+
+`Proximity.within` 是像素距离（number），`Locator.within` 是容器（Locator）。JSON 里靠
+嵌套层级区分，填错会明确报错。但**扁平的表单草稿和命令行 flag 都没有层级可用**，所以：
+
+- 前端草稿：`nearWithin`（距离）与 `containerName`/`containerRole`（容器）
+- CLI：`--within`（距离，`requires = "near"`）与 `--in` / `--in-role`（容器）
+
+沿用一个名字会让「填 40」和「填 tool_bar」落到同一个绑定上。
+
+### 一个测试推翻了我的预期
+
+我断言 `synthesize` 遇到匿名 group 会跳到更高的 tool_bar。实际输出是：
+
+```json
+{"role":"button","name":"Go","within":{"role":"group","nth":1,"within":{"role":"tool_bar","name":"Actions"}}}
+```
+
+递归让匿名容器**自己也被描述**了——「Actions 工具栏里的第一个 group」。这比跳过它更好：
+描述更局部，往 tool_bar 里加一个不相关的兄弟也不影响。断言改成检查真正要紧的事（唯一命中
+目标、兄弟得到不同的 locator），而不是钉死用了哪一层祖先——钉死会让日后合理的改进变成失败。
+
+### 现状
+
+- Rust：586 passed / 0 failed（`aad-uia` 173，`aad-cli` 43）
+- 前端：105 passed
+- CLI：`aad find --in <NAME> [--in-role <ROLE>]`
+- GUI：编辑器里可填「inside element named / of role」，`describe` 会说出 `inside "…"`，
+  带容器的位置不再触发「整窗口计数」提示
+
+### 仍然缺的
+
+- 26%（37/143）的元素因子树内同类元素超过 `MAX_COUNTABLE_SIBLINGS = 10` 被判为
+  unresolved 而非给出一个高序数 locator。这个阈值是启发式。
+- WebView 里的容器效果未单独测量（浏览器的 20 个 button 中 17 个是 chrome，容器限定
+  理应比序数有效得多，但没有数字）。
+- 录制端还没有把合成出的容器 locator 走一遍完整的录制 → 保存 → 重启 → 回放。
