@@ -738,12 +738,35 @@ impl Locator {
         // `button` between runs. Where an author-written id exists it is the
         // better identity; name remains the fallback, since most elements have
         // no id at all.
-        let refinements: [fn(&mut Self, &Node); 4] = [
-            |locator, node| locator.automation_id = durable(node.automation_id.as_deref()),
-            |locator, node| locator.name = non_empty(node.name.as_deref()),
-            |locator, node| locator.class_name = durable(node.class_name.as_deref()),
-            |locator, node| locator.framework_id = non_empty(node.framework_id.as_deref()),
-        ];
+        // An id that is really a slot number is the exception to that preference.
+        // `row-0` identifies the first row rather than the row it holds, so a
+        // locator built on it selects whoever moves into that slot: measured on
+        // the fixture table, the same locator reported `edit:Ada` and then
+        // `edit:New5` after a row was inserted above -- unique and error-free
+        // both times. The row also carries `"Order for Ada"`, which keeps
+        // pointing at Ada, but it was never reached because the id came first
+        // and already resolved uniquely. So a sequential id yields to the name
+        // and is kept only as a last resort.
+        let positional_id = durable(node.automation_id.as_deref())
+            .is_some_and(|id| sequential_identifier(&id, nodes));
+
+        let refinements: [fn(&mut Self, &Node); 5] = if positional_id {
+            [
+                |locator, node| locator.name = non_empty(node.name.as_deref()),
+                |locator, node| locator.class_name = durable(node.class_name.as_deref()),
+                |locator, node| locator.framework_id = non_empty(node.framework_id.as_deref()),
+                |locator, node| locator.automation_id = durable(node.automation_id.as_deref()),
+                |_, _| {},
+            ]
+        } else {
+            [
+                |locator, node| locator.automation_id = durable(node.automation_id.as_deref()),
+                |locator, node| locator.name = non_empty(node.name.as_deref()),
+                |locator, node| locator.class_name = durable(node.class_name.as_deref()),
+                |locator, node| locator.framework_id = non_empty(node.framework_id.as_deref()),
+                |_, _| {},
+            ]
+        };
 
         // A refinement that added nothing must not count as an attempt. Where
         // the element has no automation_id, applying that step leaves the
@@ -777,6 +800,41 @@ impl Locator {
     /// simply the parent. A parent is very often an unnamed `group`, and using it
     /// would move the problem up one level rather than solve it: a locator whose
     /// container cannot be found resolves to nothing.
+    /// Whether this locator leans on where something sits rather than what it is.
+    ///
+    /// The distinction is not cosmetic. Measured on a page whose table can gain a
+    /// row at the top: `within: {automation_id: "row-1"}` selected Ada before the
+    /// insertion and the newly added row afterwards -- unique both times, no
+    /// error either time. A locator that names the row by its content
+    /// (`"Order for Ada"`) kept selecting Ada. So a positional locator is not
+    /// merely weaker; it fails in the one way that cannot be noticed.
+    ///
+    /// Reported for the whole chain, because a container that drifts takes the
+    /// element with it.
+    fn leans_on_position(&self, nodes: &[Node]) -> bool {
+        if self.nth.is_some() {
+            return true;
+        }
+        if self
+            .automation_id
+            .as_deref()
+            .is_some_and(|id| sequential_identifier(id, nodes))
+        {
+            return true;
+        }
+        if let Some(container) = &self.within {
+            if container.leans_on_position(nodes) {
+                return true;
+            }
+        }
+        if let Some(near) = &self.near {
+            if near.anchor.leans_on_position(nodes) {
+                return true;
+            }
+        }
+        false
+    }
+
     fn by_container(node: &Node, nodes: &[Node], attributes: &Self) -> Option<Self> {
         let by_id: HashMap<&str, &Node> = nodes
             .iter()
@@ -785,13 +843,17 @@ impl Locator {
 
         let mut current = node.parent_id.as_deref();
         let mut steps = 0usize;
+        // The best positional candidate seen so far. Something that drifts when
+        // the list changes is still better than nothing, so it is held back
+        // rather than thrown away while a stabler container is looked for.
+        let mut fallback: Option<Self> = None;
         while let Some(id) = current {
             steps += 1;
             if steps > MAX_ANCESTRY_DEPTH {
-                return None;
+                return fallback;
             }
             let Some(ancestor) = by_id.get(id) else {
-                return None;
+                return fallback;
             };
 
             if let Some(container) = Self::synthesize(ancestor, nodes) {
@@ -802,7 +864,25 @@ impl Locator {
                 // once scoped, and a locator without an ordinal survives a
                 // sibling being added or reordered, so it is preferred.
                 if candidate.unique_for(node, nodes) {
-                    return Some(candidate);
+                    // A container identified by its position is worth walking
+                    // past. Measured on a table that can gain a row at the top:
+                    // `within: {automation_id: "row-1"}` selected Ada, then
+                    // selected the newly inserted row after the insertion --
+                    // unique and error-free both times, which is the one failure
+                    // shape nobody notices. One level up, the row carries
+                    // `"Order for Ada"` and keeps selecting Ada.
+                    //
+                    // Kept as a fallback rather than discarded: a positional
+                    // container still beats no locator at all, and some trees
+                    // offer nothing better.
+                    if !candidate.leans_on_position(nodes) {
+                        return Some(candidate);
+                    }
+                    if fallback.is_none() {
+                        fallback = Some(candidate);
+                    }
+                    current = ancestor.parent_id.as_deref();
+                    continue;
                 }
 
                 // Otherwise count inside the container. Deliberately not across
@@ -818,7 +898,14 @@ impl Locator {
                     {
                         candidate.nth = Some(Ordinal::Index(index + 1));
                         if candidate.unique_for(node, nodes) {
-                            return Some(candidate);
+                            // An ordinal is positional by definition, so this is
+                            // only ever a fallback -- but a real one: 58% of the
+                            // measured sample needed it.
+                            if fallback.is_none() {
+                                fallback = Some(candidate);
+                            }
+                            current = ancestor.parent_id.as_deref();
+                            continue;
                         }
                     }
                 } else {
@@ -828,7 +915,7 @@ impl Locator {
                     // on a thousand-node page (907ms of a 917ms total spent on
                     // the 22 elements that were going to fail anyway), all of it
                     // searching a space that cannot contain an answer.
-                    return None;
+                    return fallback;
                 }
 
                 // This ancestor was identifiable but did not narrow enough.
@@ -840,7 +927,9 @@ impl Locator {
             }
             current = ancestor.parent_id.as_deref();
         }
-        None
+        // Nothing stabler turned up on the way to the root, so the positional
+        // candidate is the answer after all.
+        fallback
     }
 
     /// A locator with no constraints, for building one field at a time.
@@ -1160,6 +1249,46 @@ fn reading_order(node: &Node) -> (i32, i32, i32) {
 /// `FileExplorerSearchBox`) which showed no drift when re-read, and 2 are bare
 /// numbers. Discarding the whole field would throw away the best identifier
 /// most applications offer.
+/// Whether an identifier is a position dressed up as a name.
+///
+/// `row-0` and `save-1` are the same shape, and the difference matters: reusing
+/// the first after a row is inserted selects whoever moved into that slot, while
+/// the second names a button that will still be the save button tomorrow.
+///
+/// Shape cannot tell them apart, so this counts instead. Sequential identifiers
+/// arrive as a family -- measured on this machine, `row` had 7 members,
+/// `list_id_2` had 44, `view` had 22 -- whereas an id that merely ends in a digit
+/// stands alone. Two members are enough: an author writing `save-1` with no
+/// `save-2` anywhere is naming a thing, not counting.
+fn sequential_identifier(value: &str, nodes: &[Node]) -> bool {
+    let stem = value.trim_end_matches(|character: char| character.is_ascii_digit());
+    if stem.len() == value.len() {
+        return false;
+    }
+    // A bare number (`"3"`) is a position with the stem left off.
+    if stem.trim_end_matches(['-', '_']).is_empty() {
+        return true;
+    }
+    let mut relatives = 0usize;
+    for node in nodes {
+        let Some(other) = node.automation_id.as_deref() else {
+            continue;
+        };
+        if other == value || !other.starts_with(stem) {
+            continue;
+        }
+        // The remainder has to be the number, not a longer name that happens to
+        // share a prefix: `row-1` is family to `row-2`, not to `row-detail`.
+        if other[stem.len()..].chars().all(|c| c.is_ascii_digit()) {
+            relatives += 1;
+            if relatives > 0 {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 fn durable(value: Option<&str>) -> Option<String> {
     let value = non_empty(value)?;
     // A bare number is a handle, not a name. Nobody writes `id="7473382"`.
@@ -1687,6 +1816,117 @@ mod tests {
 
         assert_eq!(locator.role.as_deref(), Some("Button"));
         assert_eq!(locator.name.as_deref(), Some("Cancel"));
+    }
+
+    /// A table row that can be identified either by its slot or by its content.
+    ///
+    /// Modelled on the measured fixture: the row carries both `row-N` and an
+    /// aria-label naming the customer, and the buttons inside carry nothing that
+    /// tells them apart.
+    fn order_rows() -> Vec<Node> {
+        let mut nodes = Vec::new();
+        let mut table = node("table", "table", None);
+        table.depth = 1;
+        nodes.push(table);
+
+        for (index, customer) in ["Ada", "Brian", "Chen"].iter().enumerate() {
+            let row_id = format!("r{index}");
+            let mut row = node(&row_id, "data_item", Some(&format!("Order for {customer}")));
+            row.automation_id = Some(format!("row-{index}"));
+            row.parent_id = Some("table".into());
+            row.depth = 2;
+            row.bounds = Some(Bounds { x: 0, y: 100 + 34 * index as i32, width: 600, height: 34 });
+            nodes.push(row);
+
+            let mut edit = node(&format!("{row_id}-edit"), "button", Some("Edit"));
+            edit.parent_id = Some(row_id.clone());
+            edit.depth = 3;
+            edit.bounds = Some(Bounds { x: 500, y: 100 + 34 * index as i32, width: 40, height: 20 });
+            nodes.push(edit);
+        }
+        nodes
+    }
+
+    #[test]
+    fn a_row_is_named_by_its_content_rather_than_its_slot() {
+        let nodes = order_rows();
+        let edit = nodes.iter().find(|n| n.node_id == "r0-edit").expect("Ada's Edit");
+
+        let locator = Locator::synthesize(edit, &nodes).expect("identifiable");
+        let container = locator.within.as_deref().expect("scoped to the row");
+
+        // `row-1` would also resolve uniquely, which is exactly why uniqueness is
+        // not the test: after a row is inserted above, it selects the new row.
+        // Verified on the real fixture -- the slot-based locator reported
+        // `edit:Ada` and then `edit:New5`, both times without an error.
+        assert_eq!(container.name.as_deref(), Some("Order for Ada"));
+        assert_eq!(container.automation_id, None, "the slot number must not be used: {container:?}");
+    }
+
+    #[test]
+    fn a_content_named_row_survives_an_insertion_above_it() {
+        let nodes = order_rows();
+        let edit = nodes.iter().find(|n| n.node_id == "r0-edit").expect("Ada's Edit");
+        let locator = Locator::synthesize(edit, &nodes).expect("identifiable");
+
+        // The same tree after a row is prepended: every slot number shifts down
+        // and the node ids are reassigned, as the browser does on a re-render.
+        let mut shifted = Vec::new();
+        let mut table = node("table", "table", None);
+        table.depth = 1;
+        shifted.push(table);
+        for (index, customer) in ["New", "Ada", "Brian", "Chen"].iter().enumerate() {
+            let row_id = format!("s{index}");
+            let mut row = node(&row_id, "data_item", Some(&format!("Order for {customer}")));
+            row.automation_id = Some(format!("row-{index}"));
+            row.parent_id = Some("table".into());
+            row.depth = 2;
+            row.bounds = Some(Bounds { x: 0, y: 100 + 34 * index as i32, width: 600, height: 34 });
+            shifted.push(row);
+            let mut edit = node(&format!("{row_id}-edit"), "button", Some("Edit"));
+            edit.parent_id = Some(row_id.clone());
+            edit.depth = 3;
+            edit.bounds = Some(Bounds { x: 500, y: 100 + 34 * index as i32, width: 40, height: 20 });
+            shifted.push(edit);
+        }
+
+        let hits = locator.resolve(&shifted);
+        assert_eq!(hits.len(), 1, "still unambiguous");
+        // The node id changed; the customer did not. That is the whole point.
+        assert_eq!(hits[0].node_id, "s1-edit");
+        let row = shifted
+            .iter()
+            .find(|n| Some(n.node_id.as_str()) == hits[0].parent_id.as_deref())
+            .expect("its row");
+        assert_eq!(row.name.as_deref(), Some("Order for Ada"));
+    }
+
+    #[test]
+    fn a_lone_numbered_id_is_a_name_not_a_position() {
+        // `save-1` and `row-0` are the same shape. What separates them is that
+        // sequential ids arrive as a family: on this machine `row` had 7 members
+        // and `list_id_2` had 44, while an id that merely ends in a digit stands
+        // alone. Shape alone would discard a perfectly good identifier.
+        let mut button = node("e1", "button", Some("Save"));
+        button.automation_id = Some("save-1".into());
+        let nodes = vec![button, node("e2", "button", Some("Cancel"))];
+
+        let locator = Locator::synthesize(&nodes[0], &nodes).expect("identifiable");
+        assert_eq!(locator.automation_id.as_deref(), Some("save-1"));
+    }
+
+    #[test]
+    fn a_numbered_id_with_siblings_is_a_position() {
+        // The same shape, now with a relative present, so the digit is an index.
+        let mut first = node("e1", "list_item", Some("Inbox"));
+        first.automation_id = Some("item-0".into());
+        let mut second = node("e2", "list_item", Some("Archive"));
+        second.automation_id = Some("item-1".into());
+        let nodes = vec![first, second];
+
+        let locator = Locator::synthesize(&nodes[0], &nodes).expect("identifiable");
+        assert_eq!(locator.name.as_deref(), Some("Inbox"), "the label identifies it");
+        assert_eq!(locator.automation_id, None, "the index does not: {locator:?}");
     }
 
     #[test]

@@ -1398,3 +1398,98 @@ Rust 592 passed / 0 failed（`aad-runtime` 集成测试 59），前端 107 passe
   `MAX_COUNTABLE_SIBLINGS = 10`）会被判 unresolved。
 - WebView 里的录制回放未测（本轮只测了 WinForms）。
 - `run` 的**摘要**里仍然没有每步信息，只有 journal 里有；不带 `--journal` 就仍然是盲的。
+
+## 2.29 复杂 WebView 与内容锚点
+
+### 复杂 fixture 才问得出问题
+
+旧的 WebView fixture 只有 6 个控件。新造一个带真实难点的：列表行里成排的重名按钮
+（`Edit`/`Delete` 各 5 个，无 id、同名同 role，只有所在行不同）、两个结构相同的地址
+面板、动态增删行、模态里另一个 `Save`、iframe 表单、无 label 的输入框。
+
+CDP 作独立事实源与 UIA 对照，测出三件事：
+
+- **iframe 能穿透**（`Coupon`/`Redeem` 出现在快照里）——之前不确定。
+- **`automation_id` 就是 DOM 的 `id`**，所以 `billing-city` 这类反而不难。
+- 36 个 button 里只有 3 个属于页面，其余 33 个是浏览器 chrome。
+
+合成质量本身不错：82 个可交互元素只有 1 个失败，10 个重名按钮全部唯一命中。
+
+### 但"唯一命中"掩盖了一个更坏的失败
+
+合成出的 locator 是 `within: {automation_id: "row-0"}`。fixture 的 `Add row` 会在顶部
+插入一行并重新渲染——`row-0` 那时是新行。
+
+实测（读 fixture 标题确认落地，不信驱动返回）：
+
+```
+第一次           → last=edit:Ada
+插入一行后同一 locator → last=edit:New5
+```
+
+**两次都成功、都唯一命中、零报错。** 这比 unresolved 危险得多：unresolved 会明确失败，
+而这个会安静地对错误的对象执行写操作。
+
+跨全机 1134 个可交互元素量了一遍：35 个（3%）的容器靠位置识别。同时那 39 个仍然
+unresolved 的元素形状是同父兄弟**中位 22 个**、`name=None`、`id=None`——本质上无法描述，
+给它们编一个"第 22 个无名按钮"是把明确失败换成隐蔽错误。**所以要修的是这 35 个，不是
+那 39 个。**
+
+### 三个候选，实测选一个
+
+行的 `name` 是 `Order for Ada`（aria-label 被 UIA 采纳）。插行前后各点一次：
+
+```
+within row-1            edit:Ada → edit:New5   漂了
+within "Order for Ada"  edit:Ada → edit:Ada    稳定
+near Ada, right         edit:Ada → edit:Ada    稳定
+```
+
+后两个都稳。选行的 `name`：不需要新语法，只需要改合成器的偏好。
+
+### 真因不在容器逻辑，在字段顺序
+
+我原以为是 `by_container` 取了不好的祖先，写了"优先找有内容身份的容器"。测试全绿、编译
+通过、**真机行为完全没变**。
+
+让探针逐层报告祖先链才看清：第 2 层祖先的 name 是 `Order for New6`，但 `synthesize`
+只输出了 `{"role":"data_item","automation_id":"row-0"}`——name 被丢了。因为
+`automation_id` 排在 `refinements` 第一位（上次为了"id 不被翻译"特意这么排的），
+`row-0` 已经唯一就提前返回，name 永远试不到。
+
+偏好顺序本身没错，错在它对所有 id 一视同仁。所以位置性的 id 退到 name 之后，
+`billing-panel` 的行为不变。
+
+### 判据：从"看形状"换成"在快照里数"
+
+第一版按形状划线（单个词 + 尾号 = 位置性）。测试立刻抓到反例 **`save-1`**——stem 是
+`save`、有尾号、符合规则，但它显然是"保存按钮"不是"第 1 个槽位"。
+
+真机数据给出了可靠得多的判据：**位置性 id 都成族出现**。
+
+```
+row        7 个   row-0 … row-6
+list_id_2  44 个  list_id_2_0 …
+view       22 个  view_1000 …
+```
+
+而 130 个不带尾号的 id 全是 `AddButton`、`CloseButton` 这类名字，`save-1` 在族里是孤例。
+所以判据是"同一 stem 下同时存在多个兄弟"——不用猜命名习惯，直接在快照里数。
+
+### 结果
+
+| | 改前 | 改后 |
+|---|---|---|
+| 容器是稳定身份 | 190 (17%) | 219 (19%) |
+| 容器靠位置识别 ⚠ | **35 (3%)** | **11 (1%)** |
+| unresolved | 39 (3%) | 35 (3%) |
+
+决定性检验：让合成器自己产出 locator，插一行，再点。`node_id` 从 e122 变成 e128（页面
+确实重排了），但两次都是 `edit:Ada`。
+
+`aad-uia` 177 passed。
+
+### 剩下的 11 个
+
+形状是 `within` 指向一个**和自己同名同 role 的 button**（`win-osdk` 在 `win-osdk` 里）
+——UIA 把可点击容器和内部按钮都报成 button，容器要加 `nth` 才唯一。占 1%，记录不追。
