@@ -1550,3 +1550,69 @@ Order for Chen  → e112  所属行 Order for Chen
 ```
 
 Rust 596 passed，前端 116 passed。
+
+## 2.31 WebView 的录制回放
+
+录三步，覆盖三种难点：写 `billing` 面板的 city（页面上有两个同名 City 输入框）、点
+Ada 那一行的 Edit（内容锚点）、点页面的 Save（模态里还有一个同名的）。
+
+### 第一次跑：locator 里出现了 row-0
+
+改动明明已经验证过了。查时间戳才发现 **`aad.exe` 比 `model.rs` 旧了一小时**——`record`
+是独立进程，我一直在用改动前的二进制录制。`cargo build -p aad-cli` 之后 locator 立刻
+变成了内容锚点。
+
+（`cargo build` 的 warning 会把后续命令的输出淹掉，所以"构建完什么都没打印"看起来像跳过
+了构建，实际是输出被吞了。要判断二进制新旧就直接读时间戳。）
+
+### 第二个问题：每次交互都伴生一个噪音步骤
+
+```
+[1] set_value  billing-city  ✓
+[2] set_value  Chrome Legacy Window  ✗ replayable=false
+```
+
+这不只是碍眼：一次十二秒的录制里，那个不可回放的步骤**挤掉了一次真实的写入**。
+
+先查它是什么，别急着过滤。探针给出关键事实：**这个节点根本不在 UIA 快照里**——它是
+WinEvent 钩子从 Win32 窗口层报的，而快照走 UIA 树，所以 `same_element` 永远找不到它。
+
+第一版判据写"没有可执行动作的目标不是交互"。**测试全绿，真机毫无变化。** 让程序自己报
+出 actions 才看清：它是 `["invoke", "pointer_click"]`，不为空，判据基于错误的假设。
+
+但这个数据顺手给出了对的判据：**事件是 `set_value`，而这个节点不支持 `set_value`**。所以
+它不可能是被写入的那个元素。
+
+判据用能力匹配，不用名字——名字随浏览器、语言、Chromium 版本变，而"一个不支持 set_value
+的元素不是刚被 set_value 的那个"在哪都成立。同时保留录制期间新出现的元素：它支持对应动作，
+只是不在开始时的快照里，丢掉会让录制静默缺步。
+
+改完录到恰好 3 步，全部 replayable。
+
+### 第三个问题：set_value 有时录不到
+
+同一个探针有时录到 3 步有时 2 步。不是随机——**写入的值与当前值相同时，浏览器不发
+`value_changed` 事件**，实测写不同值录到 1 步、写相同值录到 0 步。
+
+平台行为，不是缺陷。但有个真实后果：**用户手动重复输入同一个值时那一步会静默缺失**。
+记录在此。
+
+### 回放
+
+重启浏览器（`hwnd:9178234` → `hwnd:5507890`，页面重新加载、node_id 全部重排），回放
+`succeeded`，journal 逐步可读：
+
+```
+find1 → e89  'City'  容器 = Billing address     ← 不是 Delivery
+find2 → e122 'Edit'  容器 = Order for Ada       ← 内容锚点跨重启成立
+find3 → e76  'Save'  容器 = (顶层)              ← 页面的，不是模态里的
+```
+
+CDP 作独立事实源确认：`billingCity: "City-032428"`（正是录制时的值）、
+`deliveryCity: ""`（同名的另一个没被误写）、`log: "[2] page-save:"`（计数 2，两次点击
+都触发）。
+
+标题末尾 `page-save:` 后为空是**正确的**——fixture 里那个按钮报的是 `#bare` 的值，而
+`#bare` 本来就没填。
+
+Rust 598 passed。

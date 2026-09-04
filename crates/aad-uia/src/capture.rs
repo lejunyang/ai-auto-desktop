@@ -323,6 +323,29 @@ pub fn to_steps(events: Vec<CapturedEvent>, nodes: &[Node]) -> Vec<RecordedStep>
             // `recordable` already dropped the events that describe context
             // rather than an action, so anything without one here is a bug.
             let action = event.kind.action()?;
+
+            // An element that cannot perform the action is not the element the
+            // action happened to. Measured on Chromium: every write produced a
+            // second event aimed at "Chrome Legacy Window", the Win32 host the
+            // WinEvent hook reports, which offers only
+            // `["invoke", "pointer_click"]` and so cannot have been what received
+            // the text. It does not appear in the UI Automation snapshot either,
+            // so it arrived as an unreplayable step beside each real one -- and
+            // in a twelve-second recording one of those displaced a genuine
+            // write.
+            //
+            // Judged on capability rather than on the name: names differ by
+            // browser, by language and by Chromium version, while "an element
+            // that does not support set_value is not the one just written to"
+            // holds everywhere. An element that appeared after recording started
+            // is still kept: it does support the action, it is merely absent from
+            // the snapshot the locators are judged against, and dropping it would
+            // make the recording silently miss a step.
+            if let Some(node) = &event.node {
+                if !node.actions.is_empty() && !node.actions.iter().any(|name| name == action) {
+                    return None;
+                }
+            }
             Some(match &event.node {
                 None => RecordedStep {
                     action,
@@ -440,6 +463,50 @@ mod tests {
             source: "test",
             observed_at: Instant::now(),
         }
+    }
+
+    #[test]
+    fn an_event_aimed_at_something_that_cannot_perform_it_is_not_a_step() {
+        // Measured on Chromium: every write produced a second event aimed at the
+        // Win32 host window, which offers only invoke and pointer_click. It is
+        // not the element that received the text, it is absent from the UI
+        // Automation snapshot, and in a twelve-second recording the unreplayable
+        // step it produced displaced a genuine write.
+        //
+        // The judgement is capability, not the name -- names differ by browser,
+        // language and version.
+        let mut host = full("host", "pane", Some("Chrome Legacy Window"), Some("739"), None);
+        host.actions = vec!["invoke".into(), "pointer_click".into()];
+        let field = full("e1", "edit", Some("City"), Some("billing-city"), None);
+        let nodes = vec![field.clone()];
+
+        let steps = to_steps(
+            vec![
+                captured(EventKind::ValueChanged, field),
+                captured(EventKind::ValueChanged, host),
+            ],
+            &nodes,
+        );
+
+        assert_eq!(steps.len(), 1, "only the write itself: {steps:#?}");
+        assert_eq!(steps[0].action, "set_value");
+        assert!(steps[0].is_replayable());
+    }
+
+    #[test]
+    fn an_element_that_appeared_mid_recording_is_still_recorded() {
+        // It supports the action, so the interaction did happen -- it is simply
+        // missing from the snapshot the locators are judged against. Dropping it
+        // would make the recording silently miss a step, which is the failure
+        // this design exists to prevent, so it is kept and marked instead.
+        let button = full("late", "button", Some("Confirm"), None, None);
+        let nodes = vec![full("e1", "edit", Some("City"), Some("billing-city"), None)];
+
+        let steps = to_steps(vec![captured(EventKind::Invoked, button)], &nodes);
+
+        assert_eq!(steps.len(), 1);
+        assert!(!steps[0].is_replayable());
+        assert!(steps[0].unresolved.is_some(), "the reason has to be stated");
     }
 
     #[test]
