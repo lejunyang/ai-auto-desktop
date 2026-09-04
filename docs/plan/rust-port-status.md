@@ -836,6 +836,75 @@ AMBIGUOUS_MATCH，而且问题要到回放时才暴露——又是「录制当�
 和回放失败码不同，是分辨这两件事的关键**。
 
 
+## 2.23 GUI 录制：边录边改
+
+三个 Tauri 命令（`start_recording` / `collect_recording` / `stop_recording`）走的是
+既有的 `Shell::dispatch`，所以捕获会话建在 driver 那个 worker 线程上——捕获订阅要求
+与 driver 同一个 COM apartment，worker 线程模型天然满足（早前在主线程试过，
+`RPC_E_CHANGED_MODE`）。
+
+### 为什么 GUI 分三个命令而 CLI 只有一条
+
+| | 形态 | 原因 |
+|---|---|---|
+| CLI | `aad record` 一条命令走完 | 进程会退出，会话保不住 |
+| GUI | watch / collect / release 分开 | 进程常驻，前端可按自己节奏取 |
+
+GUI 每 700ms 轮询一次 `collect`，录到的步骤**直接进同一个 recording**，所以它们在
+录制过程中就出现在右侧 StepList 里，能当场改文本、加断言、禁用、删除。没有做单独的
+「录制结果确认页」——那会把「操作一次、更正一次」变成「录完再统一处理」。
+
+`stopCapture` 在 release 之前会再 collect 一次：否则最后一次轮询到按下停止之间的
+操作会丢，而那恰好包含用户决定「做完了」之前刚做的那一下。
+
+### `addCaptured`：为什么不能复用 `add`
+
+`add` 要一个 `Element`，里面含 `ref`——那是用户在大纲里点选元素时才有的。捕获来的
+元素由事件描述，不属于任何快照，只有 locator。两个不能省的点：
+
+- **窗口选择器仍在前端算**。捕获只说「在哪个窗口」，不说「重启后怎么找到它」，而
+  `selectorFor` 需要所有打开的窗口才能证明选择器无歧义，后端并不跟踪这个。
+- **无法回放的步骤要留下并显示**。丢掉的话录制看起来是完整的，实际少了一次操作，
+  而这要到回放时才发现——那时能解释它的会话已经结束了。人得先看见才能修。
+
+### 真机验证：驱动 GUI 自己走完一次录制
+
+单测和类型检查都不碰 Tauri 这条边界（`describe_window` 的 bug 当初就是这样漏过去
+的），所以用 aad 自己的驱动操作 GUI：
+
+| 检查点 | 结果 |
+|---|---|
+| 按钮变成 `■ Stop (2)` | ✓ 实时计数 |
+| 红色录制横幅 | ✓ 右端显示 `uia + win_event` |
+| RECORDING 栏 | ✓ 「2 steps」，参数框里已填着 `gui-recorded` |
+| fixture 标题 | ✓ `text=gui-recorded`，操作真的落地 |
+
+保存到磁盘后的内容：
+
+```
+1. set_value  locator={"role":"edit","name":"NameBox"}     window={"process_name":"powershell.exe"}
+2. invoke     locator={"role":"button","name":"SubmitButton"}
+```
+
+大纲里能看到 `automation_id="15207336"`（纯数字、每次运行都变），**locator 没有用
+它**——上一节的持久字段过滤在真实录制里生效了。
+
+### 端到端：GUI 录的工作流活过目标程序重启
+
+| 阶段 | fixture 标题 |
+|---|---|
+| 录制后 | `clicks=1 text=gui-recorded` |
+| 重启后 | `clicks=0 text=` |
+| 回放后 | **`clicks=1 text=gui-recorded`**，`status = succeeded` |
+
+### 顺带发现的一个隐患
+
+回放成功的那份录制，窗口选择器只有 `{"process_name": "powershell.exe"}`。这次能成
+是因为当时恰好只剩一个 powershell 窗口——而几分钟前我确实同时开着两个 fixture。
+`selectorFor` 本来就会检查唯一性，前提是调用方把所有打开的窗口传给它；已补测试守住
+「候选里真有第二个同进程窗口时，必须退到 title 或禁用该步」。
+
+
 ## 3. 已知环境限制（非缺口，如实记录）
 
 - 本机装有输入过滤软件（AutoHotkey / LogiBolt 一类），`SendInput` 对 ≥2 事件的批次返回

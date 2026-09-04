@@ -214,6 +214,25 @@ export interface StepDraft {
   openWindows?: WindowInfo[];
 }
 
+/**
+ * One step as the backend's capture reported it.
+ *
+ * Distinct from `StepDraft`, which carries an `Element` complete with a `ref`.
+ * A captured element has no reference: it was described by an event, not picked
+ * out of a snapshot the user is looking at. Only the locator survives, which is
+ * all a replay needs anyway.
+ */
+export interface CapturedStep {
+  action: string;
+  locator: Locator | null;
+  summary: string;
+  argument?: string | null;
+  protected?: boolean;
+  /** Why this step cannot replay, when it cannot. */
+  unresolved?: string | null;
+  replayable?: boolean;
+}
+
 export interface ValidationIssue {
   stepId: string;
   message: string;
@@ -260,6 +279,43 @@ export class Recording {
     };
     this.steps.push(step);
     return step;
+  }
+
+  /**
+   * Append the steps a capture session observed.
+   *
+   * Steps that cannot replay are kept, disabled, with the reason attached.
+   * Correcting a recording is only possible for problems a person can see, and
+   * a recording that silently drops an interaction looks complete while missing
+   * one -- which is discovered at replay, by which point the session that could
+   * have explained it is over.
+   *
+   * The window selector is built here rather than taken from the capture,
+   * because capture says which window the interaction happened in and not how to
+   * find that window in a later session. `selectorFor` needs every open window
+   * to prove its selector unambiguous, which the backend does not track.
+   */
+  addCaptured(
+    captured: CapturedStep[],
+    window: WindowInfo,
+    openWindows: WindowInfo[] = [window],
+  ): Step[] {
+    const selector = selectorFor(window, openWindows);
+    return captured.map((source) => {
+      const step: Step = {
+        id: nextId(),
+        action: source.action,
+        locator: source.locator ?? null,
+        summary: source.summary,
+        window: selector,
+        windowTitle: window.title,
+        argument: source.argument ?? undefined,
+        protected: source.protected === true,
+        enabled: (source.locator ?? null) !== null && selector !== null,
+      };
+      this.steps.push(step);
+      return step;
+    });
   }
 
   remove(stepId: string): boolean {

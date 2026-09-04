@@ -7,6 +7,7 @@ import {
   resetIds,
   selectorFor,
   type StepDraft,
+  type CapturedStep,
 } from "./recording";
 import { asFailure, BridgeError, bridge, setInvoker } from "./bridge";
 import type { Element, WindowInfo } from "./bridge";
@@ -971,5 +972,195 @@ describe("the bridge", () => {
     const failure = asFailure(new Error("no window"));
 
     expect(failure.message).toContain("no window");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Adopting steps from a capture session
+//
+// The failure to guard against is a recording that looks complete and replays
+// something else: an interaction silently dropped, or a step that cannot locate
+// its element marked ready to run.
+// ---------------------------------------------------------------------------
+
+describe("addCaptured", () => {
+  const windowOf = (over: Partial<WindowInfo> = {}): WindowInfo => ({
+    window_id: "hwnd:1",
+    title: "Fixture",
+    process_id: 10,
+    process_name: "fixture.exe",
+    class_name: "FixtureClass",
+    bounds: null,
+    is_foreground: true,
+    is_minimized: false,
+    ...over,
+  });
+
+  const step = (over: Partial<CapturedStep> = {}): CapturedStep => ({
+    action: "invoke",
+    locator: { role: "button", name: "Submit" },
+    summary: "button Submit",
+    argument: null,
+    protected: false,
+    replayable: true,
+    unresolved: null,
+    ...over,
+  });
+
+  beforeEach(() => resetIds());
+
+  it("adopts a captured step as a runnable one", () => {
+    const recording = new Recording();
+    const added = recording.addCaptured([step()], windowOf());
+
+    expect(added).toHaveLength(1);
+    expect(added[0].enabled).toBe(true);
+    expect(added[0].locator).toEqual({ role: "button", name: "Submit" });
+    // The window selector is built here, not taken from the capture: capture
+    // says which window, not how to find it next time.
+    expect(added[0].window).not.toBeNull();
+  });
+
+  it("keeps a step it cannot replay, disabled, instead of dropping it", () => {
+    // Dropping it would leave a recording that looks complete while missing an
+    // interaction the user performed -- discovered at replay, long after the
+    // session that could explain it ended. Correcting a recording is only
+    // possible for problems a person can see.
+    const recording = new Recording();
+    const added = recording.addCaptured(
+      [step({ locator: null, replayable: false, unresolved: "cannot be told apart" })],
+      windowOf(),
+    );
+
+    expect(recording.steps).toHaveLength(1);
+    expect(added[0].enabled).toBe(false);
+  });
+
+  it("refuses to enable a step whose element cannot be located", () => {
+    // The recording must not be talked into running something that will fail.
+    const recording = new Recording();
+    const added = recording.addCaptured([step({ locator: null })], windowOf());
+
+    expect(recording.setEnabled(added[0].id, true)).toBe(false);
+    expect(added[0].enabled).toBe(false);
+  });
+
+  it("never writes a class name the toolkit regenerates into the selector", () => {
+    // Measured: WinForms rebuilds this per run, so a recording saved with it
+    // replays in the session that made it and fails ever after.
+    const recording = new Recording();
+    const target = windowOf({
+      class_name: "WindowsForms10.Window.8.app.0.34473a7_r14_ad1",
+    });
+    const added = recording.addCaptured([step()], target, [target]);
+
+    expect(added[0].window?.class_name).toBeUndefined();
+    // And it still found some way to identify the window.
+    expect(added[0].window).not.toBeNull();
+  });
+
+  it("disables every step when two windows of the app cannot be told apart", () => {
+    // The driver refuses an ambiguous window selector rather than picking one,
+    // so enabling these would produce a workflow that cannot run.
+    const recording = new Recording();
+    const first = windowOf({ window_id: "hwnd:1", title: "Same" });
+    const second = windowOf({ window_id: "hwnd:2", title: "Same" });
+    const added = recording.addCaptured([step()], first, [first, second]);
+
+    expect(added[0].window).toBeNull();
+    expect(added[0].enabled).toBe(false);
+  });
+
+  it("carries the typed text through and keeps a protected value out", () => {
+    const recording = new Recording();
+    const added = recording.addCaptured(
+      [
+        step({ action: "set_value", argument: "Ada", locator: { name: "NameBox" } }),
+        step({
+          action: "set_value",
+          argument: null,
+          protected: true,
+          locator: { name: "PasswordBox" },
+        }),
+      ],
+      windowOf(),
+    );
+
+    expect(added[0].argument).toBe("Ada");
+    expect(added[1].argument).toBeUndefined();
+    expect(added[1].protected).toBe(true);
+    // A login step still has to be usable, or automating one is impossible.
+    expect(added[1].enabled).toBe(true);
+  });
+
+  it("falls back to the title when the process name alone is shared", () => {
+    // Observed while verifying this: a recording came out with just
+    // {process_name: "powershell.exe"}, which replayed only because a single
+    // such window happened to be left open. Two were open minutes earlier.
+    const recording = new Recording();
+    const target = windowOf({
+      window_id: "hwnd:1",
+      title: "Fixture | clicks=0",
+      class_name: "WindowsForms10.Window.8.app.0.34473a7_r14_ad1",
+    });
+    const other = windowOf({
+      window_id: "hwnd:2",
+      title: "Something else",
+      class_name: "WindowsForms10.Window.8.app.0.376a1c9_r8_ad1",
+    });
+    const added = recording.addCaptured([step()], target, [target, other]);
+
+    // The class name is volatile so it cannot help, and the process name is
+    // shared, so the title is all that is left.
+    expect(added[0].window?.title).toBe("Fixture | clicks=0");
+    expect(added[0].window?.class_name).toBeUndefined();
+    expect(added[0].enabled).toBe(true);
+  });
+
+  it("appends to what is already there rather than replacing it", () => {
+    // Polling adds a batch at a time, so a second batch must not discard the
+    // first -- and the ids must not collide, because they become workflow step
+    // ids.
+    const recording = new Recording();
+    recording.addCaptured([step()], windowOf());
+    recording.addCaptured([step({ summary: "button Reset" })], windowOf());
+
+    expect(recording.steps).toHaveLength(2);
+    expect(new Set(recording.steps.map((entry) => entry.id)).size).toBe(2);
+  });
+
+  it("produces steps that survive a save and reopen", () => {
+    // The whole point of a locator over a reference: a captured step has to
+    // still work after the file has been closed and opened again.
+    const recording = new Recording();
+    recording.addCaptured(
+      [step({ action: "set_value", argument: "Ada", locator: { name: "NameBox" } })],
+      windowOf(),
+    );
+
+    const reopened = Recording.fromDocument(recording.toDocument());
+
+    expect(reopened.steps).toHaveLength(1);
+    expect(reopened.steps[0].enabled).toBe(true);
+    expect(reopened.steps[0].argument).toBe("Ada");
+    expect(reopened.enabledSteps).toHaveLength(1);
+  });
+
+  it("compiles adopted steps into a runnable workflow", () => {
+    // Adopting a step is only useful if it reaches a descriptor the engine
+    // accepts, so this crosses the whole path rather than stopping at the model.
+    const recording = new Recording();
+    recording.addCaptured(
+      [step({ action: "set_value", argument: "Ada", locator: { name: "NameBox" } })],
+      windowOf(),
+    );
+
+    const descriptor = recording.toDescriptor("adopted") as Record<string, unknown>;
+    const steps = descriptor.steps as Record<string, unknown>[];
+
+    // snapshot, find, act
+    expect(steps).toHaveLength(3);
+    expect(steps[2].uses).toBe("desktop.windows_uia.set_value@1");
+    expect((steps[2].with as Record<string, unknown>).value).toBe("Ada");
   });
 });

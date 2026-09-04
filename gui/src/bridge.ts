@@ -185,6 +185,24 @@ export const bridge = {
       argument: argument ?? null,
     }),
 
+  /**
+   * Begin watching a window, returning a session id and which mechanisms
+   * actually attached.
+   *
+   * `sources` matters to the user, not just to a log: WinForms controls are only
+   * seen by the WinEvent hook and Chromium's are only named by the UIA handler,
+   * so a session with one source silently misses a whole class of interaction.
+   */
+  startRecording: (windowId: string) =>
+    call<CaptureSession>("start_recording", { windowId }),
+
+  /** Take the steps observed since the last call. */
+  collectRecording: (captureId: string) =>
+    call<CaptureBatch>("collect_recording", { captureId }),
+
+  stopRecording: (captureId: string) =>
+    call<{ released: boolean }>("stop_recording", { captureId }),
+
   probe: () => call<Record<string, unknown>>("probe_environment"),
 
   /**
@@ -210,4 +228,42 @@ export interface SavedRecording {
   name: string;
   path: string;
   modified: number | null;
+}
+
+/** A live capture session. */
+export interface CaptureSession {
+  capture_id: string;
+  window_id: string;
+  /** Which capture mechanisms attached, e.g. `uia`, `win_event`. */
+  sources: string[];
+  baseline_nodes: number;
+  snapshot_id: string;
+}
+
+/** One batch of steps taken from a running session. */
+export interface CaptureBatch {
+  capture_id: string;
+  window_id: string;
+  steps: CapturedStepPayload[];
+  count: number;
+  /**
+   * Events the bounded buffer had to discard.
+   *
+   * Surfaced rather than swallowed: a dropped event is indistinguishable from
+   * the user not having done anything, so a recording missing a step would look
+   * like a recording of fewer actions.
+   */
+  dropped: number;
+  raw_events: number;
+}
+
+/** A step as the backend describes it, before the UI adopts it. */
+export interface CapturedStepPayload {
+  action: string;
+  locator: Locator | null;
+  summary: string;
+  argument: string | null;
+  protected: boolean;
+  replayable: boolean;
+  unresolved: string | null;
 }

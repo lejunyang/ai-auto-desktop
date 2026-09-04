@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref, shallowRef } from "vue";
+import { computed, onBeforeUnmount, onMounted, reactive, ref, shallowRef } from "vue";
 import AppList from "./components/AppList.vue";
 import OutlineView from "./components/OutlineView.vue";
 import StepList from "./components/StepList.vue";
@@ -26,6 +26,109 @@ const savedDirectory = ref("");
 const recording = reactive(new Recording()) as Recording;
 
 const issues = computed(() => recording.validate());
+
+// -------------------------------------------------------------------------
+// Live recording
+//
+// Captured steps go straight into the same recording the step list is bound to,
+// so they appear while the user is still working and can be corrected on the
+// spot. A separate "review what was captured" screen would turn correcting a
+// recording as it happens into recording first and sorting it out afterwards.
+// -------------------------------------------------------------------------
+
+interface CaptureState {
+  captureId: string;
+  window: WindowInfo;
+  sources: string[];
+  dropped: number;
+  /** Steps adopted during this session, for the counter. */
+  adopted: number;
+  unresolved: number;
+}
+
+const capture = ref<CaptureState | null>(null);
+const capturing = ref(false);
+let poller: number | null = null;
+
+/** Whether the session is missing a capture mechanism it would normally have. */
+const partialCapture = computed(() => {
+  const sources = capture.value?.sources ?? [];
+  // Both mechanisms are needed for full coverage: WinForms controls are only
+  // seen by the WinEvent hook, and Chromium's are only named by the UIA
+  // handler. One source means a whole class of interaction goes unrecorded,
+  // which is worth saying out loud rather than leaving to be discovered.
+  return sources.length > 0 && sources.length < 2;
+});
+
+async function startCapture(): Promise<void> {
+  if (!selected.value || capture.value) {
+    return;
+  }
+  capturing.value = true;
+  await guard(async () => {
+    const session = await bridge.startRecording(selected.value!.window_id);
+    capture.value = {
+      captureId: session.capture_id,
+      window: selected.value!,
+      sources: session.sources,
+      dropped: 0,
+      adopted: 0,
+      unresolved: 0,
+    };
+    // Poll rather than waiting for the end: the buffer is bounded, and the
+    // point of recording in a window that is still open is seeing the steps
+    // arrive.
+    poller = window.setInterval(pollCapture, 700);
+  });
+  capturing.value = false;
+}
+
+async function pollCapture(): Promise<void> {
+  const session = capture.value;
+  if (!session) {
+    return;
+  }
+  try {
+    const batch = await bridge.collectRecording(session.captureId);
+    session.dropped += batch.dropped;
+    if (batch.steps.length) {
+      const added = recording.addCaptured(
+        batch.steps,
+        session.window,
+        windows.value,
+      );
+      session.adopted += added.length;
+      session.unresolved += added.filter((step) => !step.enabled).length;
+    }
+  } catch (error) {
+    // Stop polling on failure rather than reporting the same problem every
+    // 700ms until someone notices.
+    await stopCapture();
+    failure.value = asFailure(error);
+  }
+}
+
+async function stopCapture(): Promise<void> {
+  const session = capture.value;
+  if (poller !== null) {
+    window.clearInterval(poller);
+    poller = null;
+  }
+  if (!session) {
+    return;
+  }
+  capture.value = null;
+  await guard(async () => {
+    // One last collect before releasing, or the interactions between the final
+    // poll and the stop button would be lost -- which includes whatever the
+    // user did immediately before deciding they were finished.
+    const batch = await bridge.collectRecording(session.captureId);
+    if (batch.steps.length) {
+      recording.addCaptured(batch.steps, session.window, windows.value);
+    }
+    await bridge.stopRecording(session.captureId);
+  });
+}
 
 async function guard(work: () => Promise<void>): Promise<void> {
   try {
@@ -144,6 +247,12 @@ onMounted(async () => {
   await refreshApps();
   await refreshSaved();
 });
+
+// Leaving hooks installed after the window closes would outlive the app that
+// asked for them.
+onBeforeUnmount(() => {
+  void stopCapture();
+});
 </script>
 
 <template>
@@ -156,6 +265,17 @@ onMounted(async () => {
         <span class="muted">name</span>
         <input v-model="recording.name" spellcheck="false" />
       </label>
+      <button
+        v-if="!capture"
+        @click="startCapture"
+        :disabled="capturing || !selected"
+        :title="selected ? 'Record what you do in ' + selected.title : 'Pick a window first'"
+      >
+        {{ capturing ? "Starting…" : "Record" }}
+      </button>
+      <button v-else class="recording" @click="stopCapture">
+        ■ Stop ({{ capture.adopted }})
+      </button>
       <button @click="save" :disabled="saving || !recording.steps.length">
         {{ saving ? "Saving…" : "Save" }}
       </button>
@@ -164,6 +284,24 @@ onMounted(async () => {
 
     <div class="banner" v-if="failure">
       <FailureBanner :failure="failure" @dismiss="failure = null" />
+    </div>
+
+    <div class="banner live" v-if="capture">
+      <span class="dot"></span>
+      <span>
+        Recording <strong>{{ capture.window.title }}</strong> — go and use it.
+        Steps appear on the right as you work and can be corrected there.
+      </span>
+      <span class="muted mono">{{ capture.sources.join(" + ") || "no source" }}</span>
+      <span class="warn" v-if="partialCapture">
+        only one capture mechanism attached, so some interactions may go unrecorded
+      </span>
+      <span class="warn" v-if="capture.unresolved">
+        {{ capture.unresolved }} step(s) need attention
+      </span>
+      <span class="warn" v-if="capture.dropped">
+        {{ capture.dropped }} event(s) dropped
+      </span>
     </div>
 
     <div class="banner note" v-if="saved">
@@ -267,6 +405,41 @@ onMounted(async () => {
 
 .name input {
   width: 220px;
+}
+
+.live {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+  font-size: 13px;
+  background: rgba(220, 60, 60, 0.12);
+  border-bottom: 1px solid var(--line);
+}
+
+.live span:nth-child(2) {
+  flex: 1;
+}
+
+.dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: #e04b4b;
+  animation: pulse 1.4s ease-in-out infinite;
+}
+
+@keyframes pulse {
+  50% { opacity: 0.25; }
+}
+
+.warn {
+  color: #e0a34b;
+}
+
+button.recording {
+  border-color: #e04b4b;
+  color: #e04b4b;
 }
 
 .note {

@@ -266,6 +266,44 @@ async fn act(
     shell.dispatch(&action, Value::Object(params))
 }
 
+/// Begin watching a window for interactions.
+///
+/// The session lives on the automation thread, which is what makes this work at
+/// all: a capture subscription has to be created in the same COM apartment as
+/// the driver, and the worker-thread model already guarantees that. Creating one
+/// from the main thread fails with RPC_E_CHANGED_MODE.
+#[tauri::command]
+async fn start_recording(
+    shell: tauri::State<'_, Shell>,
+    window_id: String,
+) -> Result<Value, Value> {
+    shell.dispatch("watch", json!({"window_id": window_id}))
+}
+
+/// Take the steps recorded since the last call, leaving the session running.
+///
+/// Separate from `start_recording` on purpose, unlike the CLI where recording is
+/// a single command. A CLI process exits and would take the session with it; this
+/// process stays, so the front end can poll at its own pace and show steps as
+/// they arrive -- which is what reviewing and correcting a recording as it
+/// happens requires.
+#[tauri::command]
+async fn collect_recording(
+    shell: tauri::State<'_, Shell>,
+    capture_id: String,
+) -> Result<Value, Value> {
+    shell.dispatch("collect", json!({"capture_id": capture_id}))
+}
+
+/// Stop a recording session and remove its hooks.
+#[tauri::command]
+async fn stop_recording(
+    shell: tauri::State<'_, Shell>,
+    capture_id: String,
+) -> Result<Value, Value> {
+    shell.dispatch("release", json!({"capture_id": capture_id}))
+}
+
 #[tauri::command]
 async fn probe_environment() -> Value {
     aad_probe::probe().to_json()
@@ -340,6 +378,9 @@ pub fn run() {
             list_apps,
             describe_window,
             act,
+            start_recording,
+            collect_recording,
+            stop_recording,
             probe_environment,
             save_recording,
             load_recording,
