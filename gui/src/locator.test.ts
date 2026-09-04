@@ -305,3 +305,90 @@ group("every field the driver reports", () => {
     expect(draftProblem(draft({ frameworkId: "WinForm" }))).toBeNull();
   });
 });
+
+group("a container identified by content", () => {
+  // The shape the synthesiser produces for a button in a table row: the cell is
+  // anonymous across rows, so the row that names the customer is what
+  // distinguishes it.
+  const rowButton = {
+    role: "button",
+    name: "Edit",
+    class_name: "edit",
+    framework_id: "Chrome",
+    within: {
+      role: "data_item",
+      name: "Edit Delete",
+      within: { role: "data_item", name: "Order for Ada" },
+    },
+  } as never;
+
+  it("keeps both levels through the form", () => {
+    // The inner level is the one that does the work. Dropping it leaves a
+    // locator matching all five Edit buttons -- while the editor shows a form
+    // that looks complete and a step that looks edited.
+    const back = fromDraft(toDraft(rowButton));
+    expect(back.within?.name).toBe("Edit Delete");
+    expect(back.within?.within?.name).toBe("Order for Ada");
+  });
+
+  it("can be pointed at a different row", () => {
+    // The point of editing by hand: the recording caught Ada, the user wants
+    // Brian, and no JSON should be involved.
+    const draft = { ...toDraft(rowButton), outerName: "Order for Brian" };
+    expect(fromDraft(draft).within?.within?.name).toBe("Order for Brian");
+  });
+
+  it("is offered as fields rather than json", () => {
+    expect(isBeyondForm(rowButton)).toBe(false);
+  });
+
+  it("reads out every level", () => {
+    // Reporting only the outer level describes a locator that would be
+    // ambiguous. A person checking the step has nothing else to go on.
+    expect(describeLocator(rowButton)).toContain("Order for Ada");
+  });
+});
+
+group("describing a container", () => {
+  it("uses the id when there is no name", () => {
+    // Falling back to the role reported `billing-panel` as "group", naming the
+    // wrong thing entirely -- every panel on that page is a group.
+    const locator = {
+      role: "button",
+      name: "Apply",
+      within: { role: "group", automation_id: "billing-panel" },
+    } as never;
+    expect(describeLocator(locator)).toContain("billing-panel");
+  });
+
+  it("says which one when a container is counted", () => {
+    const locator = { role: "button", within: { role: "tool_bar", nth: 2 } } as never;
+    expect(describeLocator(locator)).toContain("tool_bar #2");
+  });
+});
+
+group("what still belongs in the json view", () => {
+  it("a third level of container", () => {
+    const deep = {
+      role: "button",
+      within: { role: "a", within: { role: "b", within: { role: "c" } } },
+    } as never;
+    expect(isBeyondForm(deep)).toBe(true);
+  });
+
+  it("a container narrowed by position", () => {
+    // The form has no box for this, and inventing one would mean an ordinal
+    // whose scope is invisible in the form.
+    expect(isBeyondForm({ role: "button", within: { role: "group", nth: 2 } } as never)).toBe(true);
+  });
+
+  it("but not a container identified by its id", () => {
+    const single = {
+      role: "button",
+      name: "Apply",
+      within: { role: "group", automation_id: "billing-panel" },
+    } as never;
+    expect(isBeyondForm(single)).toBe(false);
+    expect(fromDraft(toDraft(single)).within?.automation_id).toBe("billing-panel");
+  });
+});

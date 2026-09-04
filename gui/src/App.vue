@@ -481,7 +481,12 @@ main {
   flex: 1;
   min-height: 0;
   display: grid;
-  grid-template-columns: 260px 1fr 380px;
+  /* minmax(0, 1fr) rather than 1fr: a fr track's minimum is its content width,
+     so one long unbreakable string -- the snapshot id on every outline row --
+     pushes the column past the viewport and carries the right-hand panel off
+     screen with it. Measured before the fix: a 1536px viewport, a middle column
+     grown to 1318px, and the Recording panel starting at x=1578. */
+  grid-template-columns: 260px minmax(0, 1fr) 380px;
 }
 
 .overlay {

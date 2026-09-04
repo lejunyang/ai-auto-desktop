@@ -67,6 +67,26 @@ export interface LocatorDraft {
    */
   containerName: string;
   containerRole: string;
+  /**
+   * The container's automation id, when that is what identifies it.
+   *
+   * Without this the whole locator had to stay in the JSON view: measured on the
+   * fixture page, `billing-panel` and `delivery-panel` are two structurally
+   * identical panels whose only distinguishing field is the id.
+   */
+  containerId: string;
+  /**
+   * The container's own container.
+   *
+   * Synthesis nests one level when the immediate container is anonymous, and the
+   * outer level is often the part that distinguishes: a table button comes back
+   * as the cell (four identical siblings across the table) inside the row
+   * ("Order for Ada"). Two levels is what synthesis produces; deeper stays in
+   * the JSON view rather than becoming a form nobody can read.
+   */
+  outerName: string;
+  outerRole: string;
+  outerId: string;
 }
 
 export function emptyDraft(): LocatorDraft {
@@ -84,6 +104,10 @@ export function emptyDraft(): LocatorDraft {
     nearWithin: "",
     containerName: "",
     containerRole: "",
+    containerId: "",
+    outerName: "",
+    outerRole: "",
+    outerId: "",
   };
 }
 
@@ -148,6 +172,14 @@ export function toDraft(locator: Locator | null): LocatorDraft {
     const fields = container as Record<string, unknown>;
     draft.containerName = asText(fields.name);
     draft.containerRole = asText(fields.role);
+    draft.containerId = asText(fields.automation_id);
+    const outer = fields.within;
+    if (outer && typeof outer === "object") {
+      const outerFields = outer as Record<string, unknown>;
+      draft.outerName = asText(outerFields.name);
+      draft.outerRole = asText(outerFields.role);
+      draft.outerId = asText(outerFields.automation_id);
+    }
   }
   return draft;
 }
@@ -178,16 +210,22 @@ export function isBeyondForm(locator: Locator | null): boolean {
   if (Object.keys(source).some((key) => !known.has(key))) {
     return true;
   }
-  const container = source.within;
-  if (container && typeof container === "object") {
-    const fields = Object.keys(container as Record<string, unknown>);
-    // A container identified by anything beyond name and role -- a position, a
-    // container of its own -- which is what synthesis produces for an anonymous
-    // group. Editing that through the form would drop the part that makes it
-    // work.
-    if (fields.some((key) => key !== "name" && key !== "role")) {
+  // The form now holds two levels of container, each identified by name, role or
+  // id -- which is everything synthesis produces. What it still cannot hold is a
+  // third level, or a container narrowed by a position or a state.
+  const containerFields = new Set(["name", "role", "automation_id"]);
+  let container = source.within;
+  let level = 0;
+  while (container && typeof container === "object") {
+    level += 1;
+    if (level > 2) {
       return true;
     }
+    const fields = container as Record<string, unknown>;
+    if (Object.keys(fields).some((key) => key !== "within" && !containerFields.has(key))) {
+      return true;
+    }
+    container = fields.within;
   }
   const states = source.states;
   if (states && typeof states === "object") {
@@ -296,11 +334,38 @@ export function fromDraft(draft: LocatorDraft): Locator {
     }
     locator.near = near;
   }
+  // Built inner-first so the outer level ends up wrapping the inner one, which
+  // is the order the driver walks: contain, then count.
+  const container: Record<string, unknown> = {};
   if (draft.containerName.trim()) {
-    const container: Record<string, unknown> = { name: draft.containerName.trim() };
-    if (draft.containerRole.trim()) {
-      container.role = draft.containerRole.trim();
+    container.name = draft.containerName.trim();
+  }
+  if (draft.containerRole.trim()) {
+    container.role = draft.containerRole.trim();
+  }
+  if (draft.containerId.trim()) {
+    container.automation_id = draft.containerId.trim();
+  }
+  const outer: Record<string, unknown> = {};
+  if (draft.outerName.trim()) {
+    outer.name = draft.outerName.trim();
+  }
+  if (draft.outerRole.trim()) {
+    outer.role = draft.outerRole.trim();
+  }
+  if (draft.outerId.trim()) {
+    outer.automation_id = draft.outerId.trim();
+  }
+  if (Object.keys(outer).length) {
+    // An outer container with no inner one means the user filled the wrong box;
+    // treating it as the container is what they meant.
+    if (Object.keys(container).length) {
+      container.within = outer;
+    } else {
+      Object.assign(container, outer);
     }
+  }
+  if (Object.keys(container).length) {
     locator.within = container;
   }
   return locator as Locator;
@@ -379,14 +444,44 @@ export function describe(locator: Locator | null): string {
     }
   }
 
-  const container = source.within;
-  if (container && typeof container === "object") {
-    const fields = container as Record<string, unknown>;
-    const label =
-      asText(fields.name) || asText(fields.role) || "an unnamed container";
-    parts.push(`inside ${JSON.stringify(label)}`);
+  // Walked to the bottom rather than one level deep. Synthesis nests containers
+  // when the immediate one is anonymous, and the distinguishing part is usually
+  // the innermost: for a table row the outer level is the cell (four identical
+  // siblings across the table) and the inner one names the customer. Reporting
+  // only the outer level describes a locator that would be ambiguous, which is
+  // worse than a long description -- this is what a person checks the locator
+  // against.
+  let container = source.within;
+  let depth = 0;
+  while (container && typeof container === "object" && depth < 4) {
+    parts.push(`inside ${containerLabel(container as Record<string, unknown>)}`);
+    container = (container as Record<string, unknown>).within;
+    depth += 1;
   }
   return parts.join(" ");
+}
+
+/**
+ * How to refer to a container, using whichever field actually identifies it.
+ *
+ * Falling back to the role alone reported `billing-panel` as `"group"`, which
+ * names the wrong thing entirely: every panel on the page is a group.
+ */
+function containerLabel(fields: Record<string, unknown>): string {
+  const name = asText(fields.name);
+  if (name) {
+    return JSON.stringify(name);
+  }
+  const automationId = asText(fields.automation_id);
+  if (automationId) {
+    return `id ${JSON.stringify(automationId)}`;
+  }
+  const role = asText(fields.role);
+  const ordinal = fields.nth;
+  if (role && ordinal !== undefined && ordinal !== null) {
+    return ordinal === "last" ? `the last ${role}` : `${role} #${ordinal}`;
+  }
+  return role ? `the ${role}` : "an unnamed container";
 }
 
 function asText(value: unknown): string {

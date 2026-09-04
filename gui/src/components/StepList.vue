@@ -164,6 +164,9 @@ function describeLocator(step: Step): string {
 
 <style scoped>
 .panel {
+  /* A grid item defaults to min-width: auto, so long content in the
+     outline would widen the column instead of scrolling inside it. */
+  min-width: 0;
   display: flex;
   flex-direction: column;
   min-height: 0;

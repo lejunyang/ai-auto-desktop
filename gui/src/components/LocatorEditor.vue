@@ -117,10 +117,17 @@ async function tryIt(): Promise<void> {
   try {
     const found = await bridge.tryLocator(props.window.window_id, locator);
     const summary = found.node?.summary;
+    const described = typeof summary === "string" ? summary : summarise(found.node);
+    // The element's own id comes along because a summary can be identical for two
+    // different elements: changing the container from one table row to another
+    // produced `matched data_item "Edit Delete"` both times, since every row's
+    // cell carries that name. A trial that cannot distinguish two outcomes is not
+    // a check.
+    const identifier = found.node?.node_id;
     trial.value = found.found
       ? {
           matched: 1,
-          summary: typeof summary === "string" ? summary : summarise(found.node),
+          summary: identifier ? `${described} · ${identifier}` : described,
         }
       : { matched: 0 };
   } catch (error) {
@@ -236,6 +243,32 @@ before reaching the page. Add a `next to` anchor to count within a region."
             <span>of role</span>
             <input v-model="draft.containerRole" placeholder="group" />
           </label>
+          <label>
+            <span>or its id</span>
+            <input v-model="draft.containerId" placeholder="billing-panel" />
+          </label>
+        </div>
+
+        <div class="group">
+          <p class="hint">
+            And which container holds <em>that</em> one. This is where a row goes:
+            a table cell looks the same in every row, so the button is found by
+            naming the row it sits in. Recorded against a slot instead
+            (<code>row-1</code>), the same step selected a different customer once
+            a row was added above.
+          </p>
+          <label>
+            <span>which sits inside</span>
+            <input v-model="draft.outerName" placeholder="Order for Ada" />
+          </label>
+          <label>
+            <span>of role</span>
+            <input v-model="draft.outerRole" placeholder="data_item" />
+          </label>
+          <label>
+            <span>or its id</span>
+            <input v-model="draft.outerId" placeholder="orders" />
+          </label>
         </div>
       </fieldset>
     </div>
@@ -243,8 +276,9 @@ before reaching the page. Add a `next to` anchor to count within a region."
     <div class="body" v-else>
       <textarea v-model="rawText" class="mono" rows="9" spellcheck="false"></textarea>
       <p class="muted small">
-        The fields cannot show every locator — a nested anchor or a state that must
-        be false lives here.
+        The fields cannot show every locator — a third level of container, a
+        container narrowed by position, a nested anchor or a state that must be
+        false lives here.
       </p>
     </div>
 

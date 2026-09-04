@@ -1493,3 +1493,60 @@ view       22 个  view_1000 …
 
 形状是 `within` 指向一个**和自己同名同 role 的 button**（`win-osdk` 在 `win-osdk` 里）
 ——UIA 把可点击容器和内部按钮都报成 button，容器要加 `nth` 才唯一。占 1%，记录不追。
+
+## 2.30 把内容锚点接进 GUI
+
+Rust 侧能产出内容锚点了，但 GUI 能不能用是另一回事。先测，不猜：
+
+```
+isBeyondForm: true                                     ← 只能看 JSON
+describe:  button named "Edit" inside "Edit Delete"    ← 区分行的那层不提
+roundtrip: {... within: {name: "Edit Delete"}}         ← 里层整个丢了
+```
+
+第三条最危险：`toDraft` → `fromDraft` 会**静默降级** locator。`Edit Delete` 有四个同名
+兄弟，所以往返之后「Ada 的 Edit」变成了歧义——而界面看起来像编辑成功了。
+
+单层容器也有问题：`describe` 报 `inside "group"`，把 `billing-panel` 说成了 group，
+而那个页面上每个面板都是 group。
+
+### 三处改动
+
+**describe 走到底，每层报真正识别它的字段。** 描述变长，但这是人判断 locator 对不对的
+唯一依据——短而错不如长而准。上一轮已经吃过一次亏（`describe` 的 limit 截掉了按钮，
+我两轮都以为按钮不存在）。
+
+**表单加四个格子**：容器的 `automation_id`，以及外层容器的 name/role/id。两层是合成器
+实际产出的深度；三层以上仍留在 JSON，那样的表单没人看得懂。
+
+**容器里的 framework_id 不该产出。** 实测 11 个容器里它出现 7 次，**7 次全部与
+name/automation_id 同现，0 次是唯一识别手段**——没有区分力，只是让 locator 在渲染引擎
+变化时失配，还把整个 locator 推出了表单可编辑范围。
+
+### 真机验证暴露两个单测抓不到的缺陷
+
+**Try it 无法区分两个同名元素。** 把容器从 `Order for Ada` 改成 `Order for Brian`，
+两次都显示 `✓ matched data_item "Edit Delete"`——六行的单元格全叫这个名字。用 node_id
+查才知道确实换了元素（e106 → e109）。一个不能区分两次不同结果的验证按钮等于没有验证，
+所以结果里现在带上 node_id。
+
+**最大化后右栏整个在窗口外。** CDP 之前报 `horizontalScroll: false`，但那测的是
+`.editor` 内部——只测局部的检查漏掉了整体溢出，是截图抓到的。量出来：视口 1536，
+UI outline 栏自己撑到 1318px，总宽 1958，Recording 面板从 x=1578 开始。
+
+原因是 grid 的 `1fr` 最小值默认为内容宽度，而每行 outline 都带一个不换行的 snapshot id。
+改成 `minmax(0, 1fr)`，三个 panel 各加 `min-width: 0`。修后 `bodyScrollWidth` 1958 →
+1536，三栏都在视口内。
+
+### 结果
+
+改容器名真的改变所选元素，用 node_id 证明（不用显示名——四个候选同名，比较它什么也不
+证明）：
+
+```
+Order for Ada   → e106  所属行 Order for Ada
+Order for Brian → e109  所属行 Order for Brian
+Order for Chen  → e112  所属行 Order for Chen
+```
+
+Rust 596 passed，前端 116 passed。
