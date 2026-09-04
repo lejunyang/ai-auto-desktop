@@ -469,7 +469,12 @@ only if you trust this descriptor."
             Ok(output) => {
                 self.journal.emit(
                     "action.finished",
-                    json!({"id": step.id, "uses": uses, "duration_seconds": elapsed}),
+                    json!({
+                        "id": step.id,
+                        "uses": uses,
+                        "duration_seconds": elapsed,
+                        "result": summarise_output(&output),
+                    }),
                 );
                 self.record_output(step, output.clone());
 
@@ -956,6 +961,80 @@ impl RetryPolicy {
         delay
     }
 }
+
+/// What an action did, small enough to keep for every step of every run.
+///
+/// The journal recorded only the step id, the capability and the elapsed time,
+/// which makes a replay that clicked the wrong element indistinguishable from a
+/// correct one -- both are five green steps. For a recording played back after a
+/// restart that is the whole question worth asking.
+///
+/// Trimmed by the shape of each value rather than by a list of known
+/// capabilities: a list silently omits anything added later, and the symptom of
+/// omitting something is exactly the blindness this fixes. Measured on a real
+/// window, a snapshot output is 6491 characters of which the node array is 5905;
+/// what remains identifies the window, the revision and the size of the tree.
+fn summarise_output(output: &Value) -> Value {
+    let Value::Object(fields) = output else {
+        // A scalar is already its own summary; a bare array is described rather
+        // than copied, so an unexpected shape cannot bloat the journal.
+        return match output {
+            Value::Array(items) => json!({"count": items.len()}),
+            other => other.clone(),
+        };
+    };
+
+    let mut summary = serde_json::Map::new();
+    for (key, value) in fields {
+        match value {
+            // The bulk: a node tree, a candidate list, a set of windows. The
+            // length is the useful part -- "13 nodes" answers a question, while
+            // the nodes themselves belong in the snapshot store.
+            Value::Array(items) => {
+                summary.insert(format!("{key}_count"), json!(items.len()));
+            }
+            // A nested object is kept only by its identifying fields. `node` is
+            // the one that matters here: node_id, role and name are what tell
+            // two same-named buttons apart.
+            Value::Object(nested) => {
+                let mut kept = serde_json::Map::new();
+                for name in IDENTIFYING_FIELDS {
+                    if let Some(found) = nested.get(*name) {
+                        if !found.is_null() {
+                            kept.insert((*name).to_string(), found.clone());
+                        }
+                    }
+                }
+                if !kept.is_empty() {
+                    summary.insert(key.clone(), Value::Object(kept));
+                }
+            }
+            // Scalars are already small, and they carry the outcome: `found`,
+            // `match_count`, `ref`, `changed`.
+            other => {
+                summary.insert(key.clone(), other.clone());
+            }
+        }
+    }
+    Value::Object(summary)
+}
+
+/// The fields that distinguish one element or window from another.
+///
+/// Deliberately short: a summary that grows with the payload stops being a
+/// summary. `value` is left out -- it can hold a whole document, and a protected
+/// field withholds it anyway.
+const IDENTIFYING_FIELDS: &[&str] = &[
+    "node_id",
+    "role",
+    "name",
+    "automation_id",
+    "window_id",
+    "title",
+    "process_name",
+    "snapshot_id",
+    "revision",
+];
 
 fn retry_policy(step: &CompiledStep, descriptor: &WorkflowDescriptor) -> Option<RetryPolicy> {
     let raw = step

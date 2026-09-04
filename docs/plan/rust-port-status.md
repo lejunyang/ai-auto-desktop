@@ -1309,3 +1309,92 @@ PowerShell 版本上不存在，改用进程级环境变量。）
 ### 现状
 
 Rust 589 passed / 0 failed，前端 107 passed。
+
+## 2.28 录制端的完整链路：录 → 存 → 重启 → 回放
+
+前面验证的容器 locator 都是我手写的。这一轮走真实链路：让**录制端自己合成**，然后重启
+目标程序回放。
+
+### fixture 的选法决定了这次验证有没有意义
+
+用两组同名按钮（四个 `name="Close"`，属性完全无法区分，只有所属 GroupBox 不同）。如果
+录制端只用属性，回放必然报歧义——**失败会明确暴露，而不是碰巧成功**。
+
+交互靠驱动的 `invoke` 触发：本机 SendInput 拒收批次事件，而 `invoke` 走控件自身的默认
+动作，会产生真实的 UIA 事件。
+
+### 录制端合成的结果
+
+点 e8（Terminal 的第 2 个）和 e5（Explorer 的第 1 个），录到：
+
+```json
+{"action":"invoke","locator":{"role":"button","name":"Close","framework_id":"WinForm",
+ "nth":2,"within":{"role":"group","name":"Terminal actions"}}}
+{"action":"invoke","locator":{"role":"button","name":"Close","framework_id":"WinForm",
+ "nth":1,"within":{"role":"group","name":"Explorer actions"}}}
+```
+
+两步都用上了容器，位置也对。`automation_id`（`6491306`、`4066406`，纯数字句柄）被
+`durable()` 正确弃用了——留着它反而会在重启后失配。
+
+`sources: ['uia', 'win_event']`，`dropped: 0`。
+
+### workflow 格式：验证器比我的记忆可靠
+
+第一版凭印象写，六个字段全错，验证器逐条指出：`budgets` 要 `max_duration` 和
+`max_executed_steps`（不是 `wall_clock_seconds`），`uses` 要 `capability.action@major`
+形式。真实形状是三段：`snapshot`（按进程名加标题片段找窗口，不能用 window_id——重启就
+变）→ `find` → 动作。
+
+### 回放结果
+
+重启后 window_id 从 `hwnd:6556602` 变成 `hwnd:3214234`，四个 automation_id 全部漂移。
+回放 `succeeded`，最终标题 `last=Explorer actions#0`。
+
+### 挖出一个实质缺口：回放成功了，但看不见每步做了什么
+
+`aad run` 的返回只有 `executed_steps: 5`；`--journal` 里的 `action.finished` 只记
+`id`、`uses`、`duration_seconds`。**所以整条链路没有任何地方能回答「第一步点了哪个
+元素」。**
+
+这对录制回放很实际：一个点错元素的回放和一个正确的回放，摘要完全一样——都是五步全绿加
+一个 `succeeded`。而"最终标题对"只能证明最后一步对。
+
+（`aad events` 只对持久化 run 有效，而 durable 按用户口径暂不做；内存执行器不落 store。）
+
+修法是让 `action.finished` 带上结果摘要。先量：snapshot 输出 6491 字符，其中 `nodes`
+占 5905；裁掉大数组后剩 575，find 摘成 193。
+
+**按值的形状裁剪，不按 action 名字做白名单。** 白名单会在新增 action 时静默漏掉，而漏掉
+的表现正是这次遇到的"什么都看不到"。规则是：数组换成 `<key>_count`，嵌套对象只留识别性
+字段（`node_id`/`role`/`name`/`automation_id`/`window_id`/`title`/`process_name`/
+`snapshot_id`/`revision`），标量原样保留（`found`、`match_count`、`ref`、`applied` 都在
+这里）。
+
+`value` 刻意不留：它能装下整篇文档，而受保护字段本来就不给读——都不该进一份每次运行都
+保存的日志。
+
+修完之后同一次回放能看清：
+
+```
+win     snapshot@1  {"snapshot_id":"f9638a…","revision":1133,"window":{…},"nodes_count":13}
+find1   find@1      {"found":true,"node":{"node_id":"e8","role":"button","name":"Close"},…}
+        → 命中 e8，属于容器 'Terminal actions'
+act1    invoke@1    {"applied":true,"action":"invoke","node_id":"e8",…}
+find2   find@1      {"found":true,"node":{"node_id":"e5",…}}
+        → 命中 e5，属于容器 'Explorer actions'
+act2    invoke@1    {"applied":true,"action":"invoke","node_id":"e5",…}
+```
+
+journal 总共 6741 字符（5 步，含一次 snapshot）。之前这些信息一条都没有。
+
+### 现状
+
+Rust 592 passed / 0 failed（`aad-runtime` 集成测试 59），前端 107 passed。
+
+### 仍然缺的
+
+- 录制端合成的 locator 用了 `within` 后，仍有 26% 的元素（子树内同类超过
+  `MAX_COUNTABLE_SIBLINGS = 10`）会被判 unresolved。
+- WebView 里的录制回放未测（本轮只测了 WinForms）。
+- `run` 的**摘要**里仍然没有每步信息，只有 journal 里有；不带 `--journal` 就仍然是盲的。

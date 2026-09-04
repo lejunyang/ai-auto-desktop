@@ -207,6 +207,123 @@ fn the_journal_records_the_full_lifecycle() {
     assert_eq!(sequences, (1..=sequences.len() as u64).collect::<Vec<_>>());
 }
 
+#[test]
+fn the_journal_says_which_element_an_action_landed_on() {
+    // Without this a replay that clicked the wrong element is indistinguishable
+    // from a correct one: both are a run of green steps and a `succeeded`. For a
+    // recording played back after a restart, "which of the four same-named
+    // buttons did it pick" is the only question worth asking.
+    let provider = Fake::build(
+        "fixture",
+        read_only_actions(&["find"]),
+        Box::new(|_, _, _| {
+            Ok(json!({
+                "found": true,
+                "match_count": 1,
+                "node": {"node_id": "e8", "role": "button", "name": "Close"},
+                "ref": "snap:1133:e8",
+            }))
+        }),
+    );
+    let workflow = descriptor(json!({
+        "steps": [{"id": "look", "type": "action", "uses": "fixture.find@1", "with": {}}]
+    }));
+
+    let result = execute(&workflow, registry(vec![provider]));
+
+    let finished = result
+        .events
+        .iter()
+        .find(|event| event.event_type == "action.finished")
+        .expect("an action finished");
+    let recorded = &finished.payload["result"];
+
+    assert_eq!(recorded["node"]["node_id"], json!("e8"));
+    assert_eq!(recorded["node"]["name"], json!("Close"));
+    assert_eq!(recorded["found"], json!(true));
+    assert_eq!(recorded["ref"], json!("snap:1133:e8"));
+}
+
+#[test]
+fn a_large_result_is_counted_rather_than_copied_into_the_journal() {
+    // A snapshot output measured on a real window is 6491 characters, of which
+    // the node array is 5905. Copying that for every step would make the journal
+    // unreadable for the sake of data that is already in the snapshot store --
+    // but dropping it entirely is what left a replay unexplainable, so the length
+    // stays.
+    let provider = Fake::build(
+        "fixture",
+        read_only_actions(&["snapshot"]),
+        Box::new(|_, _, _| {
+            let nodes: Vec<Value> = (0..500)
+                .map(|index| json!({"node_id": format!("e{index}"), "role": "button"}))
+                .collect();
+            Ok(json!({
+                "snapshot_id": "abc123",
+                "revision": 7,
+                "nodes": nodes,
+                "window": {"window_id": "hwnd:1", "title": "App", "process_name": "app.exe"},
+            }))
+        }),
+    );
+    let workflow = descriptor(json!({
+        "steps": [{"id": "look", "type": "action", "uses": "fixture.snapshot@1", "with": {}}]
+    }));
+
+    let result = execute(&workflow, registry(vec![provider]));
+
+    let finished = result
+        .events
+        .iter()
+        .find(|event| event.event_type == "action.finished")
+        .expect("an action finished");
+    let recorded = &finished.payload["result"];
+
+    assert_eq!(recorded["nodes_count"], json!(500), "the size is the useful part");
+    assert!(recorded.get("nodes").is_none(), "the nodes themselves must not be copied");
+    // What identifies the observation is still there.
+    assert_eq!(recorded["snapshot_id"], json!("abc123"));
+    assert_eq!(recorded["window"]["title"], json!("App"));
+
+    let rendered = serde_json::to_string(recorded).expect("serialisable");
+    assert!(rendered.len() < 400, "summary grew to {} characters: {rendered}", rendered.len());
+}
+
+#[test]
+fn a_summary_leaves_out_field_contents() {
+    // A value can hold an entire document, and for a protected field it is
+    // withheld on purpose. Neither belongs in a log kept for every run.
+    let provider = Fake::build(
+        "fixture",
+        read_only_actions(&["find"]),
+        Box::new(|_, _, _| {
+            Ok(json!({
+                "node": {
+                    "node_id": "e2",
+                    "role": "edit",
+                    "name": "Notes",
+                    "value": "a very long body of text the user typed",
+                },
+            }))
+        }),
+    );
+    let workflow = descriptor(json!({
+        "steps": [{"id": "look", "type": "action", "uses": "fixture.find@1", "with": {}}]
+    }));
+
+    let result = execute(&workflow, registry(vec![provider]));
+
+    let finished = result
+        .events
+        .iter()
+        .find(|event| event.event_type == "action.finished")
+        .expect("an action finished");
+    let node = &finished.payload["result"]["node"];
+
+    assert_eq!(node["node_id"], json!("e2"), "identity is kept");
+    assert!(node.get("value").is_none(), "contents are not: {node}");
+}
+
 // ---------------------------------------------------------------------------
 // Inputs and variables
 // ---------------------------------------------------------------------------
