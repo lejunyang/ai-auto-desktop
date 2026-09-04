@@ -31,6 +31,15 @@ export interface LocatorDraft {
   name: string;
   automationId: string;
   className: string;
+  /**
+   * The UI toolkit, e.g. `WinForm` or `WPF`.
+   *
+   * Included because synthesis uses it and the driver always reports it. Left
+   * out, a locator carrying one was judged beyond the form -- so the editor
+   * stayed in the JSON view and the "use fields" button did nothing, which
+   * looks like a broken button rather than a missing field.
+   */
+  frameworkId: string;
   /** `focusable`, `enabled` and so on, as a state that must be true. */
   requireState: string;
   /** 1-based position among the matches, or empty for none. Also accepts `last`. */
@@ -66,6 +75,7 @@ export function emptyDraft(): LocatorDraft {
     name: "",
     automationId: "",
     className: "",
+    frameworkId: "",
     requireState: "",
     nth: "",
     nearName: "",
@@ -97,6 +107,7 @@ export function toDraft(locator: Locator | null): LocatorDraft {
   draft.name = asText(source.name);
   draft.automationId = asText(source.automation_id);
   draft.className = asText(source.class_name);
+  draft.frameworkId = asText(source.framework_id);
 
   const states = source.states;
   if (states && typeof states === "object") {
@@ -158,6 +169,7 @@ export function isBeyondForm(locator: Locator | null): boolean {
     "name",
     "automation_id",
     "class_name",
+    "framework_id",
     "states",
     "nth",
     "near",
@@ -203,7 +215,12 @@ export function isBeyondForm(locator: Locator | null): boolean {
 /** What is wrong with a draft, or null when it is usable. */
 export function draftProblem(draft: LocatorDraft): string | null {
   const constrains =
-    draft.role || draft.name || draft.automationId || draft.className || draft.requireState;
+    draft.role ||
+    draft.name ||
+    draft.automationId ||
+    draft.className ||
+    draft.frameworkId ||
+    draft.requireState;
   if (!constrains && !draft.nth && !draft.nearName) {
     return "a locator has to constrain something";
   }
@@ -254,6 +271,9 @@ export function fromDraft(draft: LocatorDraft): Locator {
   }
   if (draft.className.trim()) {
     locator.class_name = draft.className.trim();
+  }
+  if (draft.frameworkId.trim()) {
+    locator.framework_id = draft.frameworkId.trim();
   }
   if (draft.requireState) {
     locator.states = { [draft.requireState]: true };

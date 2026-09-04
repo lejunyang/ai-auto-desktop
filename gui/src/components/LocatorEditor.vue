@@ -185,6 +185,10 @@ function apply(): void {
         <label><span>name</span><input v-model="draft.name" placeholder="the label or text" /></label>
         <label><span>automation id</span><input v-model="draft.automationId" /></label>
         <label><span>class</span><input v-model="draft.className" /></label>
+          <label>
+            <span>toolkit</span>
+            <input v-model="draft.frameworkId" placeholder="WinForm" />
+          </label>
         <label>
           <span>must be</span>
           <select v-model="draft.requireState">
@@ -230,7 +234,7 @@ before reaching the page. Add a `next to` anchor to count within a region."
           </label>
           <label>
             <span>of role</span>
-            <input v-model="draft.containerRole" placeholder="tool_bar" />
+            <input v-model="draft.containerRole" placeholder="group" />
           </label>
         </div>
       </fieldset>
@@ -290,6 +294,9 @@ before reaching the page. Add a `next to` anchor to count within a region."
   display: flex;
   flex-direction: column;
   gap: 8px;
+  /* Without this a grid child can force the flex container wider than its
+     parent, which is how the fields ended up past the panel edge. */
+  min-width: 0;
   padding: 10px;
   border: 1px solid var(--line);
   border-radius: 8px;
@@ -309,7 +316,11 @@ footer {
 
 .grid {
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  /* Falls back to one column when the panel is too narrow for two.
+     Fixed at two columns, the second one pushed its inputs past the right edge
+     of the recording panel -- reachable only by scrolling sideways, and invisible
+     to a UI reader, which treats offscreen elements as absent. */
+  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
   gap: 6px;
 }
 
@@ -321,7 +332,10 @@ label {
 }
 
 label span {
-  width: 88px;
+  /* A floor rather than a fixed width: at 88px the longer labels ("inside
+     element named") wrapped and shoved the input out of the column. */
+  min-width: 72px;
+  max-width: 96px;
   color: var(--muted);
   flex: none;
 }

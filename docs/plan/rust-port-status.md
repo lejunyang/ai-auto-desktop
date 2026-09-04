@@ -1242,3 +1242,70 @@ resolve 只要 10-18µs——是调用次数爆炸，不是单次慢。
 - WebView 里的容器效果未单独测量（浏览器的 20 个 button 中 17 个是 chrome，容器限定
   理应比序数有效得多，但没有数字）。
 - 录制端还没有把合成出的容器 locator 走一遍完整的录制 → 保存 → 重启 → 回放。
+
+## 2.27 GUI 里真的能用吗——两个只有跑起来才看得见的缺陷
+
+`within` 在驱动和 CLI 都验证过了，GUI 侧的字段也加上了、类型检查和单测都过。但这不构成
+「能用」。跑起来发现两个缺陷，测试一个都抓不到。
+
+### 面板把字段挤出了可视区
+
+截图证据：编辑器面板底部出现横向滚动条，`name`、`class`、`position`、`of role`、
+`within px` 的输入框全在可视区之外。
+
+这也解释了探针为什么一直报 `DRIVER.NOT_FOUND`——那些字段的 bounds 落在窗口外，被
+`describe` 的 offscreen 过滤当成不存在。**「字段做出来了但摸不到」和「没做」在用户那里
+是一回事**，对 AI 调用方更是如此：它只能看到 UI 报告的东西。
+
+根因是 `.grid` 固定两列加 `label span` 固定 88px。RECORDING 栏本来就窄，两列各自还要
+88px 标签加输入框，撑不下就往外溢。改成 `repeat(auto-fit, minmax(190px, 1fr))` 随宽度
+回落到单列，标签宽度从固定值改成 `min-width: 72px; max-width: 96px`，并给 `.editor`
+加 `min-width: 0`（没有它，grid 子项能把 flex 容器顶得比父元素还宽）。
+
+### 表单视图永远回不去
+
+编辑器停在 JSON 视图，点 `Use fields` 没反应。看起来像按钮坏了。
+
+CDP 读出 textarea 里的真实内容才看清：
+
+```json
+{"role":"button","name":"Close","framework_id":"WinForm","nth":2,
+ "within":{"role":"group","name":"Terminal actions"}}
+```
+
+`framework_id` 不在 `isBeyondForm` 的 known 集合里，于是整个 locator 被判「超出表单」；
+一切回表单就又被判超出，所以回不去。
+
+**这不是「超出表单」，是表单缺一个字段。** `framework_id` 和 `class_name` 一样是普通标识
+字段，驱动一直会返回它，合成也会用它。少这一个字段就让整个表单不可用，而失效方式很隐蔽。
+加上 `toolkit` 输入框后 `view: "form"`，11 个字段全部可见，`WinForm` 正确回填。
+
+### 这一轮的验证通道：CDP 直连 Tauri 的 WebView
+
+按标签名找 UIA 输入框在这里必然歧义——`of role` 在界面上出现两次（next to 组、container
+组）。而 Tauri 的 WebView 就是 Chromium：用
+`WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--remote-debugging-port=… --remote-allow-origins=*`
+启动，就能在 DOM 层精确取到是哪一个，也能直接读出编辑器当前处于哪个视图、每个输入框的
+placeholder 和 value。**这是把「按钮坏了」定位成「缺一个字段」的关键**。
+
+（端口 9333 被本机另一个进程占用，换到 9411；`Start-Process -Environment` 在本机的
+PowerShell 版本上不存在，改用进程级环境变量。）
+
+### 一次不构成证明的对比
+
+两个容器分别 Try it，都显示 `✓ matched button "Close"`——**这什么也没证明**，四个候选
+同名，看名字分不出选中的是哪一个。改为直接比较 node_id：
+
+| 容器 | 位置 | 命中 | 实际父容器 |
+|---|---|---|---|
+| Explorer actions | #1 | e5 | Explorer actions |
+| Explorer actions | #2 | e6 | Explorer actions |
+| Terminal actions | #1 | e7 | Terminal actions |
+| Terminal actions | #2 | e8 | Terminal actions |
+
+四种组合命中 4 个不同元素，同一个位置在不同容器里命中不同元素，每个命中都落在被指定的
+容器内。这才是证明。
+
+### 现状
+
+Rust 589 passed / 0 failed，前端 107 passed。

@@ -279,3 +279,29 @@ group("containers", () => {
     });
   });
 });
+
+group("every field the driver reports", () => {
+  it("keeps a locator carrying a toolkit inside the form", () => {
+    // Found on a real recording: synthesis produced
+    // {"role":"button","name":"Close","framework_id":"WinForm","nth":2,"within":…}
+    // and framework_id was missing from the form, so the whole locator counted as
+    // beyond it. The editor then stayed in the JSON view and the "use fields"
+    // button did nothing -- which reads as a broken button, not a missing field.
+    const recorded = {
+      role: "button",
+      name: "Close",
+      framework_id: "WinForm",
+      nth: 2,
+      within: { role: "group", name: "Terminal actions" },
+    };
+
+    expect(isBeyondForm(recorded as never)).toBe(false);
+    expect(fromDraft(toDraft(recorded as never))).toEqual(recorded);
+  });
+
+  it("counts a toolkit as constraining something", () => {
+    // Otherwise a locator that names only the toolkit is rejected as empty while
+    // the field visibly holds a value.
+    expect(draftProblem(draft({ frameworkId: "WinForm" }))).toBeNull();
+  });
+});
