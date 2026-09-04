@@ -1,5 +1,6 @@
 import { describe as group, expect, it } from "vitest";
 import {
+  countsAcrossWindow,
   describe as describeLocator,
   draftProblem,
   emptyDraft,
@@ -135,6 +136,34 @@ group("locators the form cannot show", () => {
         near: { anchor: { name: "Name:", role: "text" }, direction: "right", within: 40 },
       } as Locator),
     ).toBe(false);
+  });
+});
+
+group("warning about where a count is measured", () => {
+  it("warns when a position has no region to count in", () => {
+    // Measured on a real browser window: 20 buttons reported for a page
+    // containing three, so #1, #3 and #5 are all toolbar. On a plain window
+    // #3 is the close button. Both are silent wrong answers.
+    expect(countsAcrossWindow({ role: "button", nth: 3 } as Locator)).toBe(true);
+    expect(countsAcrossWindow({ role: "edit", nth: "last" } as Locator)).toBe(true);
+  });
+
+  it("stays quiet when an anchor makes the count local", () => {
+    // "the first button below Username" counts inside the page, which is the
+    // fix rather than the problem -- warning about it would train people to
+    // ignore the warning.
+    expect(
+      countsAcrossWindow({
+        role: "button",
+        nth: 1,
+        near: { anchor: { name: "Username" }, direction: "below" },
+      } as Locator),
+    ).toBe(false);
+  });
+
+  it("stays quiet when nothing is being counted", () => {
+    expect(countsAcrossWindow({ role: "button", name: "Submit" } as Locator)).toBe(false);
+    expect(countsAcrossWindow(null)).toBe(false);
   });
 });
 

@@ -311,7 +311,7 @@ impl UiaDriver {
             revision: snapshot.revision,
             node_id: found.node_id.clone(),
         };
-        Ok(json!({
+        let mut answer = json!({
             // Always present, so one condition shape works whether or not the
             // element turned up: a caller polling for a change should not have
             // to write the test two different ways.
@@ -322,7 +322,21 @@ impl UiaDriver {
             "ref": target.to_ref(),
             "node": found.to_json(),
             "match_count": matches.len(),
-        }))
+        });
+
+        // Several matches, and the caller said to take one anyway. Knowing there
+        // were five is not enough to do anything with: what narrows a locator is
+        // knowing that the other four were the minimise, maximise and close
+        // buttons. The ambiguity error already carries this; a caller who chose
+        // to proceed needs it just as much, and has no error to read it from.
+        if matches.len() > 1 {
+            answer["candidates"] = json!(matches
+                .iter()
+                .take(MAX_CANDIDATE_SUMMARIES)
+                .map(|node| json!({"node_id": node.node_id, "summary": node.summary()}))
+                .collect::<Vec<_>>());
+        }
+        Ok(answer)
     }
 
     /// Resolve a target to a live, re-verified node.
@@ -1346,6 +1360,54 @@ mod tests {
         assert_eq!(error.details["match_count"], 2);
         // The caller needs to see the options to narrow the selector.
         assert!(error.details["candidates"].as_array().unwrap().len() == 2);
+    }
+
+    #[test]
+    fn taking_any_match_still_shows_what_the_others_were() {
+        // A caller who proceeds past ambiguity is usually working out what a
+        // locator selects. `match_count: 5` cannot be acted on; knowing that
+        // three of the five were the window's own title-bar buttons is what
+        // shows which constraint to add next. The ambiguity error carries this
+        // already -- someone who chose to proceed has no error to read it from.
+        let driver = UiaDriver::new(Arc::new(TwoButtons));
+
+        let answer = driver
+            .call(
+                "find",
+                &json!({
+                    "window_id": "w1",
+                    "locator": {"role": "Button"},
+                    "expect": "any",
+                }),
+            )
+            .expect("taking one of several is allowed when asked for");
+
+        assert_eq!(answer["found"], json!(true));
+        assert_eq!(answer["match_count"], json!(2));
+        let candidates = answer["candidates"]
+            .as_array()
+            .expect("the competing elements must be listed, not just counted");
+        assert_eq!(candidates.len(), 2);
+        assert!(
+            candidates
+                .iter()
+                .all(|entry| entry["summary"].as_str().is_some_and(|text| !text.is_empty())),
+            "a candidate without a summary tells the caller nothing"
+        );
+    }
+
+    #[test]
+    fn a_single_match_is_not_cluttered_with_a_candidate_list() {
+        // One match is unambiguous, so a list of one adds nothing and would
+        // suggest a choice was made where none existed.
+        let driver = many();
+
+        let answer = driver
+            .call("find", &json!({"window_id": "w1", "locator": {"name": "Save"}}))
+            .expect("the fixture has a Save button");
+
+        assert_eq!(answer["match_count"], json!(1));
+        assert!(answer.get("candidates").is_none());
     }
 
     #[test]

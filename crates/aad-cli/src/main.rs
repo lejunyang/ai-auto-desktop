@@ -218,6 +218,13 @@ struct FindArgs {
     /// Rows, repeated toolbar buttons and unlabelled fields often share every
     /// attribute, so counting is the only way to tell them apart. Counted down
     /// the screen and then across, which is the order they are read in.
+    ///
+    /// Counting spans the whole window, including its frame -- so on a plain
+    /// window the first button is usually Minimise, and in a browser the count
+    /// runs through the toolbar before reaching the page (measured: 20 buttons
+    /// reported for a page containing 3). Pair it with `--near` to count inside
+    /// a region instead: the first button below "Username" is the page's, the
+    /// third button in the window is not.
     #[arg(long)]
     nth: Option<String>,
 
@@ -243,6 +250,22 @@ struct FindArgs {
     /// flags are ignored.
     #[arg(long, value_name = "JSON", conflicts_with_all = ["role", "name", "automation_id", "nth", "near"])]
     locator: Option<String>,
+
+    /// Report absence instead of failing: for asking whether something is there.
+    ///
+    /// "Has the dialog closed?" cannot be asked otherwise -- the search itself
+    /// fails, so there is no answer to test. Prints `found: false` and exits 0.
+    #[arg(long)]
+    optional: bool,
+
+    /// Take the first match instead of refusing an ambiguous one.
+    ///
+    /// The refusal is the default because acting on "whichever came first" is
+    /// how automation clicks the wrong button. Use this while working out what
+    /// a locator selects: the competing elements are listed alongside, which is
+    /// what shows how to narrow it.
+    #[arg(long, conflicts_with = "optional")]
+    any: bool,
 }
 
 #[derive(Args)]
@@ -359,6 +382,29 @@ fn emit(payload: &Value, compact: bool) {
     let _ = std::io::stdout().flush();
 }
 
+/// How strict a `find` should be, from the flags the caller gave.
+///
+/// `None` means strict: a missing element is an error and an ambiguous one is
+/// refused. That is the default because a caller is usually acquiring something
+/// to act on, and "whichever came first" is how automation clicks the wrong
+/// button.
+fn expectation_for(args: &FindArgs) -> Option<&'static str> {
+    if args.optional {
+        // Asking whether something is there. Absence is the answer, not a
+        // failure -- without this, "has the dialog closed?" cannot be asked at
+        // all, because the search fails before there is anything to test.
+        Some("optional")
+    } else if args.any {
+        // Asking for one of several. Note this does not also relax absence:
+        // with nothing matching there is no "one of them" to return, and
+        // handing back an empty target would fail later as a puzzling missing
+        // element.
+        Some("any")
+    } else {
+        None
+    }
+}
+
 fn dispatch(command: &Command) -> (Value, u8) {
     match command {
         Command::Probe => {
@@ -426,6 +472,10 @@ fn dispatch(command: &Command) -> (Value, u8) {
                 .map_err(|error| driver_failure(&error))
         }),
         Command::Find(args) => {
+            // Worked out once for both routes below. Duplicating it is how
+            // `--optional` ends up silently not applying to `--locator`.
+            let expectation = expectation_for(args);
+
             // A whole locator as JSON wins outright: it is the escape hatch for
             // shapes the flags cannot express, so mixing the two would only
             // raise the question of which half applied.
@@ -446,7 +496,14 @@ fn dispatch(command: &Command) -> (Value, u8) {
                 let window_id = args.window_id.clone();
                 return with_driver(move |driver| {
                     driver
-                        .call("find", &json!({"window_id": window_id, "locator": parsed}))
+                        .call(
+                            "find",
+                            &json!({
+                                "window_id": window_id,
+                                "locator": parsed,
+                                "expect": expectation,
+                            }),
+                        )
                         .map_err(|error| driver_failure(&error))
                 });
             }
@@ -515,7 +572,11 @@ fn dispatch(command: &Command) -> (Value, u8) {
                 driver
                     .call(
                         "find",
-                        &json!({"window_id": window_id, "locator": Value::Object(locator)}),
+                        &json!({
+                            "window_id": window_id,
+                            "locator": Value::Object(locator),
+                            "expect": expectation,
+                        }),
                     )
                     .map_err(|error| driver_failure(&error))
             })
@@ -1273,6 +1334,49 @@ mod tests {
             assert_ne!(code, EXIT_USAGE, "a position alone must be a valid criterion");
             assert_ne!(payload["error"]["code"], "CLI.INVALID_ARGUMENTS");
         }
+    }
+
+    #[test]
+    fn optional_and_any_relax_different_things() {
+        // Two different questions, and swapping them is how automation goes
+        // wrong quietly. `--optional` asks whether something is there, so it
+        // must not also start picking one of several. `--any` asks for one of
+        // several, so it must not also start reporting absence as success --
+        // the caller wants an element to act on and would get nothing.
+        let strict = expectation_for(&FindArgs::default());
+        assert_eq!(strict, None, "the default must refuse both");
+
+        let optional = expectation_for(&FindArgs {
+            optional: true,
+            ..Default::default()
+        });
+        assert_eq!(optional, Some("optional"));
+
+        let any = expectation_for(&FindArgs {
+            any: true,
+            ..Default::default()
+        });
+        assert_eq!(any, Some("any"));
+    }
+
+    #[test]
+    fn the_expectation_reaches_the_driver_through_the_json_route_too() {
+        // `--locator` is a separate code path from the match flags. A caller
+        // who writes a descriptive locator as JSON and adds `--optional` would
+        // otherwise get the strict behaviour, and the flag would look broken
+        // for no visible reason.
+        let (payload, code) = dispatch(&Command::Find(FindArgs {
+            window_id: "hwnd:1".into(),
+            locator: Some(r#"{"role":"button"}"#.into()),
+            optional: true,
+            ..Default::default()
+        }));
+
+        // No desktop here, so the call cannot succeed -- but it must fail for
+        // the reason that proves the argument was accepted and forwarded,
+        // rather than being rejected as a usage error.
+        assert_ne!(code, EXIT_USAGE, "the combination must be valid");
+        assert_ne!(payload["error"]["code"], "CLI.INVALID_ARGUMENTS");
     }
 
     #[test]

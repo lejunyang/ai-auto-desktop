@@ -234,6 +234,26 @@ export function fromDraft(draft: LocatorDraft): Locator {
   return locator as Locator;
 }
 
+/**
+ * Whether a locator counts without saying where to count.
+ *
+ * A position on its own is measured across every element in the window, the
+ * frame included -- so the third button on a plain window is its close button,
+ * and in a browser the first five are all toolbar (measured: 20 buttons reported
+ * for a page containing three). An anchor makes the count local, so only a
+ * position without one is worth warning about.
+ *
+ * Not an error: counting across a whole window is sometimes exactly right, and
+ * refusing it would block a locator that works.
+ */
+export function countsAcrossWindow(locator: Locator | null): boolean {
+  if (!locator) {
+    return false;
+  }
+  const source = locator as Record<string, unknown>;
+  return source.nth !== undefined && source.nth !== null && source.near === undefined;
+}
+
 /** A one-line description of what a locator selects, for display. */
 export function describe(locator: Locator | null): string {
   if (!locator) {

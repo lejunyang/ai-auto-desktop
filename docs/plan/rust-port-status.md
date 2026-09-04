@@ -1025,3 +1025,94 @@ nothing rather than to a guess. That is the designed behaviour (§2.20) meeting
 its own tooling.
 
 **Tests**: 569 Rust, 96 front end (`locator.ts` 14, `setLocator` 4).
+
+## 2.25 The CLI can ask the three questions, and what a browser does to counting
+
+`find` had one behaviour: fail if nothing matched, refuse if several did. That is
+right when acquiring an element to act on, and wrong for the two things a caller
+working out a locator actually needs to ask. The driver had supported all three
+since the beginning; the CLI exposed none of them.
+
+| flag | question | missing | several |
+|---|---|---|---|
+| *(none)* | "give me this element" | `DRIVER.NOT_FOUND` | `DRIVER.AMBIGUOUS_MATCH` |
+| `--optional` | "is it there?" | `found: false`, exit 0 | still refused |
+| `--any` | "give me one of them" | still `NOT_FOUND` | first match **+ candidates** |
+
+The two relaxations are deliberately not the same flag, and neither relaxes both
+things:
+
+- `--optional` must not start picking one of several. "Has the dialog closed?"
+  quietly becoming "here is one of the four that matched" is how an assertion
+  introduces the very wrong-element bug it exists to catch.
+- `--any` must not start reporting absence as success. The caller wants
+  something to act on; an empty target fails later as a puzzling missing
+  element rather than here as a clear one.
+
+They are mutually exclusive at the parser (`exit 2`), and the choice is made
+once in `expectation_for` for both routes -- duplicating it per route is how
+`--optional` ends up silently not applying to `--locator`.
+
+### `--any` had nothing to be useful with
+
+The driver returned the first match and `match_count`, and dropped the rest.
+`match_count: 5` cannot be acted on. What narrows a locator is knowing that three
+of those five were the window's own minimise, maximise and close buttons -- the
+ambiguity *error* has carried that list all along, and a caller who chose to
+proceed had no error to read it from. A successful multi-match now carries
+`candidates` too; a single match does not, because a list of one implies a choice
+where none existed.
+
+### The browser measurement
+
+Tested against a page with three buttons, in Edge, with CDP as an independent
+source of truth for the DOM:
+
+```
+CDP:  3 inputs, 3 buttons
+UIA:  20 buttons  --  17 of them the browser's own
+      {"role":"button","nth":1}  ->  搜索标签页
+      {"role":"button","nth":3}  ->  关闭标签页
+      {"role":"button","nth":5}  ->  最小化
+      {"role":"edit","states":{"focusable":true},"nth":1}  ->  the address bar
+```
+
+Not one of those touched the page. The WinForms lesson (§2.20: the first button
+is Minimise) is mild by comparison -- a browser puts a whole toolbar in front of
+the content. So counting is now documented where it is chosen: in `--nth`'s help,
+and beside the GUI's `position` field, both with the fix rather than just the
+warning. `countsAcrossWindow` drives the GUI hint and is asked of the locator
+rather than of the form fields, so the JSON view and the form cannot disagree.
+
+The fix is an anchor, which makes the count local:
+
+```
+{"role":"button","near":{"anchor":{"name":"Username","role":"text"},
+                         "direction":"below"},"nth":1}   ->  Submit   (1 match)
+```
+
+### What the WebView got right
+
+Worth recording, because it was better than expected and it decides where effort
+goes next:
+
+- **`automation_id` is the DOM `id`** -- `user`, `pass`, `submit`. Author-written
+  names, so durable across restarts by the same test as §2.22.
+- **`<label for>` becomes the accessible name.** CDP shows the `<input>` carrying
+  no text of its own; UIA reports `name="Username"` on it. The label association
+  is resolved for us.
+- **`type="password"` becomes `protected`**, and it is usable as a locator
+  (`{"role":"edit","states":{"protected":true}}` matched the one password field).
+- **The redaction rule holds on a second platform.** `find` reported
+  `value: None` for the password field while `set_value` wrote through it --
+  DOM afterwards: `pass: "secret-123"`. Read-protected, write-usable, which is
+  what automated sign-in needs (§ the value-redaction decision).
+
+Every write in that run was confirmed through CDP rather than from the driver's
+own return: `user: "cdp-verified"`, `clicks` 0 -> 1, `checked` false -> true.
+
+CDP needed `--remote-allow-origins=*` alongside `--remote-debugging-port`; without
+it the WebSocket handshake is refused with 403 and the error says exactly which
+flag is missing.
+
+**Tests**: 573 Rust (CLI 40, uia 160), 99 front end.

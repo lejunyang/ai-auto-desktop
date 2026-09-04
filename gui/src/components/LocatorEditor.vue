@@ -13,6 +13,7 @@ import { asFailure, bridge, type Locator, type WindowInfo } from "../bridge";
 import {
   DIRECTIONS,
   REQUIRABLE_STATES,
+  countsAcrossWindow,
   describe,
   draftProblem,
   fromDraft,
@@ -76,6 +77,11 @@ const problem = computed(() => {
 });
 
 const preview = computed(() => (candidate.value ? describe(candidate.value) : ""));
+
+// Asked of the locator itself rather than of the fields, so the JSON view and
+// the form give the same answer. Two implementations would drift, and the one
+// that drifts is the one nobody looks at.
+const counting = computed(() => countsAcrossWindow(candidate.value));
 
 // A trial describes the locator as it was when it ran, so it stops being true
 // the moment anything changes. Keeping it on screen would show a stale
@@ -188,7 +194,11 @@ function apply(): void {
             </option>
           </select>
         </label>
-        <label>
+        <label
+          title="Counted through the whole window, frame included: the first
+button is often Minimise, and in a browser the count runs through the toolbar
+before reaching the page. Add a `next to` anchor to count within a region."
+        >
           <span>position</span>
           <input v-model="draft.nth" placeholder="1, 2, 3… or last" />
         </label>
@@ -219,6 +229,9 @@ function apply(): void {
     </div>
 
     <p class="preview" v-if="preview">selects {{ preview }}</p>
+    <p class="hint" v-if="counting">
+      Counting spans the whole window, frame included — try it before keeping it.
+    </p>
     <p class="problem" v-if="problem">{{ problem }}</p>
 
     <div class="trial" v-if="trial">
@@ -331,6 +344,12 @@ textarea {
   margin: 0;
   font-size: 12px;
   color: #e0a34b;
+}
+
+.hint {
+  margin: 0;
+  font-size: 11px;
+  color: var(--muted);
 }
 
 .ok {
