@@ -491,6 +491,21 @@ impl Snapshot {
     /// agent that drills into "Billing address" and one that writes
     /// `within: {name: "Billing address"}` are talking about the same thing.
     pub fn outline_of(&self, limit: usize, region: Option<&str>) -> Value {
+        self.outline_within(limit, region, Some(OUTLINE_BUDGET))
+    }
+
+    /// The same listing, stopped by a character budget as well as an element
+    /// count.
+    ///
+    /// `budget` of `None` means no ceiling, which is what writing to a file uses:
+    /// a file has no reason to be trimmed, and trimming it would defeat the point
+    /// of asking for one.
+    pub fn outline_within(
+        &self,
+        limit: usize,
+        region: Option<&str>,
+        budget: Option<usize>,
+    ) -> Value {
         let eligible: Vec<&Node> = self
             .nodes
             .iter()
@@ -510,10 +525,7 @@ impl Snapshot {
         // shown against every node in the tree, so filtering out the parts an
         // agent cannot act on also reported as truncation.
         let matched = eligible.len();
-        let interesting: Vec<Value> = eligible
-            .into_iter()
-            .take(limit)
-            .map(|node| {
+        let described = |node: &Node| -> Value {
                 json!({
                     "node_id": node.node_id,
                     // The reference an agent needs to act on this element,
@@ -535,8 +547,56 @@ impl Snapshot {
                     // this field's content is unreadable by design.
                     "protected": node.states.protected == Some(true),
                 })
-            })
-            .collect();
+        };
+        // The budget covers the whole answer, not just the list. Measured: the
+        // window metadata around the elements ran to about 1900 characters on one
+        // window, so budgeting only the list returned 21213 characters against a
+        // ceiling of 20000 -- a ceiling that is exceeded is no ceiling at all.
+        //
+        // The overhead is measured rather than assumed, because it grows with the
+        // window title and the paths inside it.
+        let overhead = serde_json::to_string(&json!({
+            "snapshot_id": self.snapshot_id,
+            "revision": self.revision,
+            "window": self.window.to_json(),
+            "node_count": self.nodes.len(),
+            "shown": 0,
+            "matched": matched,
+            "truncated": false,
+            "characters": 0,
+            "stopped_by": "characters",
+            "region": region,
+            "elements": [],
+        }))
+        .map(|text| text.chars().count())
+        .unwrap_or(0);
+
+        // Filled one at a time so both ceilings apply: the element count keeps
+        // the list navigable, and the character budget keeps it deliverable.
+        // Elements are never cut open -- a half-serialised element is invalid
+        // JSON, which is worse to receive than a shorter list.
+        let mut interesting: Vec<Value> = Vec::new();
+        let mut spent = 0usize;
+        let mut stopped_on_budget = false;
+        for node in eligible.iter().take(limit) {
+            let rendered = described(node);
+            let cost = serde_json::to_string(&rendered)
+                .map(|text| text.chars().count())
+                .unwrap_or(0);
+            if let Some(ceiling) = budget {
+                // At least one element always comes back. The worst element here
+                // serialises to 4890 characters, so a small budget would
+                // otherwise return an empty list -- and an agent reading that
+                // cannot tell "nothing is here" from "nothing fitted".
+                if !interesting.is_empty() && overhead + spent + cost > ceiling {
+                    stopped_on_budget = true;
+                    break;
+                }
+            }
+            spent += cost;
+            interesting.push(rendered);
+        }
+
 
         let mut answer = json!({
             "snapshot_id": self.snapshot_id,
@@ -548,14 +608,42 @@ impl Snapshot {
             // limit would show more, and by how much.
             "matched": matched,
             "truncated": self.truncated || interesting.len() < matched,
+            // The whole answer's size, so a caller comparing it against the
+            // ceiling it set sees the same number the ceiling governs.
+            "characters": overhead + spent,
             "elements": interesting,
         });
         if let Some(wanted) = region {
             answer["region"] = json!(wanted);
         }
+        // Which ceiling stopped the listing, because the useful next move differs:
+        // raising `limit` helps when the count ran out and does nothing at all
+        // when the characters did.
+        if answer["truncated"] == json!(true) {
+            answer["stopped_by"] = json!(if stopped_on_budget {
+                "characters"
+            } else {
+                "limit"
+            });
+        }
         answer
     }
 }
+
+/// How many characters of outline to return before stopping.
+///
+/// Measured on this desktop: a single element serialises to 277 characters at
+/// the median and 4890 at the worst, and asking for 500 elements produced
+/// 188147 characters on one window. A count of elements does not bound the
+/// answer's size, because the elements are not the same size.
+///
+/// 20000 characters holds about 72 median elements -- slightly tighter than the
+/// default element limit of 80, so this is the bound that usually bites.
+///
+/// Counted in characters rather than bytes: the two differ by only 0% to 12%
+/// here because JSON keys and punctuation dominate, and characters are closer to
+/// what a caller is actually rationing.
+pub const OUTLINE_BUDGET: usize = 20_000;
 
 /// How long a name must be before a shared prefix means anything.
 ///
@@ -2877,6 +2965,110 @@ mod tests {
                 !listed.iter().any(|id| *id == token),
                 "{token} is the text being edited: {listed:?}"
             );
+        }
+    }
+
+    /// A window with enough elements to exceed a small character budget.
+    fn crowded(count: usize) -> Snapshot {
+        let mut nodes = vec![node_at("root", "window", Some("App"), None, None)];
+        for index in 0..count {
+            let mut button = node_at(
+                &format!("b{index}"),
+                "button",
+                Some(&format!("Button number {index}")),
+                Some("root"),
+                None,
+            );
+            button.depth = 1;
+            button.actions = vec!["invoke".into(), "focus".into()];
+            button.automation_id = Some(format!("control_{index}"));
+            nodes.push(button);
+        }
+        windowed(nodes, "App")
+    }
+
+    #[test]
+    fn a_character_budget_bounds_the_answer_where_an_element_count_cannot() {
+        // Elements are not the same size: measured across this desktop they run
+        // from 169 to 4890 characters, so `limit` says how many things come back
+        // but nothing about how much. Asking for 500 produced 188147 characters
+        // on one window.
+        let snapshot = crowded(60);
+
+        let unbounded = snapshot.outline_within(500, None, None);
+        let full_size = serde_json::to_string(&unbounded)
+            .expect("render")
+            .chars()
+            .count();
+        assert_eq!(unbounded["shown"], 61, "all of them, plus the window itself");
+        assert_eq!(unbounded["truncated"], false);
+
+        let bounded = snapshot.outline_within(500, None, Some(full_size / 3));
+        let shown = bounded["shown"].as_u64().expect("shown");
+        assert!(shown > 0 && shown < 61, "cut by size, not by count: {shown}");
+        assert_eq!(bounded["truncated"], true);
+        assert_eq!(
+            bounded["matched"], 61,
+            "and it still says how many there were"
+        );
+
+        // Which ceiling bit, because the useful next move differs: raising
+        // `limit` helps when the count ran out and does nothing when the
+        // characters did.
+        assert_eq!(bounded["stopped_by"], "characters");
+        let by_count = snapshot.outline_within(5, None, None);
+        assert_eq!(by_count["stopped_by"], "limit");
+
+        // The reported spend covers the whole answer, and it is real rather than
+        // an estimate. Budgeting only the element list returned 21213 characters
+        // against a ceiling of 20000 on a real window -- a ceiling that is
+        // exceeded is no ceiling at all.
+        let actual = serde_json::to_string(&bounded)
+            .expect("render")
+            .chars()
+            .count();
+        let claimed = bounded["characters"].as_u64().expect("characters") as usize;
+        assert!(
+            claimed.abs_diff(actual) < 200,
+            "claimed {claimed} against an actual {actual}"
+        );
+
+        let ceiling = full_size / 3;
+        assert!(
+            actual <= ceiling,
+            "the answer must fit the ceiling it was given: {actual} against {ceiling}"
+        );
+    }
+
+    #[test]
+    fn a_budget_too_small_for_one_element_still_returns_one() {
+        // The worst single element here serialises to 4890 characters. Filling
+        // strictly to a budget below that returns an empty list, and an agent
+        // reading an empty list cannot tell "nothing is here" from "nothing
+        // fitted" -- those call for different next steps.
+        let snapshot = crowded(10);
+        let answer = snapshot.outline_within(500, None, Some(1));
+
+        assert_eq!(answer["shown"], 1, "one element always comes back");
+        assert_eq!(answer["truncated"], true);
+        assert_eq!(answer["stopped_by"], "characters");
+        assert_eq!(answer["matched"], 11);
+    }
+
+    #[test]
+    fn elements_are_never_cut_open_to_fit() {
+        // A half-serialised element is invalid JSON, which is worse to receive
+        // than a shorter list: the caller cannot parse it at all.
+        let snapshot = crowded(40);
+        let answer = snapshot.outline_within(500, None, Some(900));
+
+        for element in answer["elements"].as_array().expect("elements") {
+            assert!(
+                element["node_id"].is_string(),
+                "every element that came back is whole: {element}"
+            );
+            assert!(element["ref"].is_string());
+            assert!(element["actions"].is_array());
         }
     }
 

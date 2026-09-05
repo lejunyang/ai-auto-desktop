@@ -12,7 +12,7 @@
 
 use crate::backend::{Backend, CaptureLimits, DriverError, Result, SnapshotStore};
 use crate::capture::{self, CapturedEvent};
-use crate::model::{Locator, Node, Snapshot, Target, NODE_ACTIONS};
+use crate::model::{Locator, Node, Snapshot, Target, NODE_ACTIONS, OUTLINE_BUDGET};
 use aad_plugin::{manifest, CapabilityManifest};
 use aad_runtime::journal::now_rfc3339;
 use aad_runtime::provider::Provider;
@@ -237,8 +237,21 @@ impl UiaDriver {
             .unwrap_or(80)
             .clamp(1, 500) as usize;
         let region = args.get("region").and_then(Value::as_str);
+
+        // An element count does not bound the answer's size: elements run from
+        // 169 to 4890 characters here, and 500 of them reached 188147 on one
+        // window. A caller that has to fit the answer somewhere needs to say so
+        // in the unit it cares about.
+        //
+        // `max_characters: 0` means no ceiling. Spelling it as a value rather
+        // than a separate flag keeps the two ways of asking from disagreeing.
+        let budget = match args.get("max_characters").and_then(Value::as_u64) {
+            Some(0) => None,
+            Some(value) => Some(value as usize),
+            None => Some(OUTLINE_BUDGET),
+        };
         let snapshot = self.capture(args)?;
-        let answer = snapshot.outline_of(limit, region);
+        let answer = snapshot.outline_within(limit, region, budget);
         // A region name that matches nothing is worth reporting: an agent that
         // drilled into a misremembered name would otherwise read an empty list
         // as "that part of the window is empty", which is a different fact.

@@ -198,6 +198,19 @@ struct OutlineArgs {
     /// than one that does not exist.
     #[arg(long)]
     region: Option<String>,
+    /// Stop after roughly this many characters (default 20000, 0 for no limit).
+    ///
+    /// `--limit` counts elements, which does not bound the answer's size:
+    /// elements run from 169 to 4890 characters, and 500 of them reached 188147
+    /// on one window here.
+    #[arg(long)]
+    max_characters: Option<u64>,
+    /// Write the full listing to this file instead of standard output.
+    ///
+    /// No character limit applies: a file has no reason to be trimmed, and
+    /// trimming it would defeat the point of asking for one.
+    #[arg(long)]
+    out: Option<PathBuf>,
 }
 
 #[derive(Args, Default)]
@@ -498,15 +511,37 @@ fn dispatch(command: &Command) -> (Value, u8) {
             }
             Ok(result)
         }),
-        Command::Describe(args) => with_driver(|driver| {
-            let mut arguments = describe_arguments(&args.window);
-            if let Some(region) = args.region.as_deref() {
-                arguments["region"] = json!(region);
+        Command::Describe(args) => {
+            let destination = args.out.clone();
+            let outcome = with_driver(|driver| {
+                let mut arguments = describe_arguments(&args.window);
+                if let Some(region) = args.region.as_deref() {
+                    arguments["region"] = json!(region);
+                }
+                // A file takes everything. Asked for both, the file wins, and the
+                // answer says so rather than leaving the caller to believe the
+                // ceiling applied.
+                let ceiling = if destination.is_some() {
+                    Some(0)
+                } else {
+                    args.max_characters
+                };
+                if let Some(value) = ceiling {
+                    arguments["max_characters"] = json!(value);
+                }
+                driver
+                    .call("describe", &arguments)
+                    .map_err(|error| driver_failure(&error))
+            });
+            match (&outcome, destination) {
+                // Only write when the driver actually answered: writing a failure
+                // payload to the file would look like a listing on next read.
+                ((answer, EXIT_OK), Some(path)) => {
+                    write_listing(answer, &path, args.max_characters)
+                }
+                _ => outcome,
             }
-            driver
-                .call("describe", &arguments)
-                .map_err(|error| driver_failure(&error))
-        }),
+        }
         Command::Overview(args) => with_driver(|driver| {
             driver
                 .call("overview", &describe_arguments(args))
@@ -772,6 +807,70 @@ where
         Ok(result) => (result, EXIT_OK),
         Err(payload) => (payload, EXIT_FAILED),
     }
+}
+
+/// Write a listing to a file, answering with where it went rather than with the
+/// listing itself.
+///
+/// The answer stays small on purpose: a caller that asked for a file wants the
+/// file, and echoing tens of thousands of characters back to the terminal as well
+/// would undo the reason for asking.
+fn write_listing(
+    answer: &Value,
+    path: &std::path::Path,
+    requested_ceiling: Option<u64>,
+) -> (Value, u8) {
+    let rendered = match serde_json::to_string_pretty(answer) {
+        Ok(text) => text,
+        Err(error) => {
+            return (
+                failure(
+                    "CLI.SERIALISE_FAILED",
+                    &format!("could not render the listing: {error}"),
+                    None,
+                ),
+                EXIT_FAILED,
+            )
+        }
+    };
+    if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+        if let Err(error) = std::fs::create_dir_all(parent) {
+            return (
+                failure(
+                    "CLI.WRITE_FAILED",
+                    &format!("could not create {}: {error}", parent.display()),
+                    None,
+                ),
+                EXIT_FAILED,
+            );
+        }
+    }
+    if let Err(error) = std::fs::write(path, &rendered) {
+        return (
+            failure(
+                "CLI.WRITE_FAILED",
+                &format!("could not write {}: {error}", path.display()),
+                None,
+            ),
+            EXIT_FAILED,
+        );
+    }
+
+    let mut summary = json!({
+        "written_to": path.display().to_string(),
+        "characters": rendered.chars().count(),
+        "shown": answer["shown"].clone(),
+        "matched": answer["matched"].clone(),
+        "truncated": answer["truncated"].clone(),
+    });
+    if let Some(region) = answer.get("region") {
+        summary["region"] = region.clone();
+    }
+    if requested_ceiling.is_some() {
+        summary["note"] =
+            json!("--max-characters was ignored: a file is written in full");
+    }
+    (summary, EXIT_OK)
 }
 
 fn driver_failure(error: &aad_uia::DriverError) -> Value {

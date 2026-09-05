@@ -176,6 +176,16 @@ so a region drilled into and a locator written against it agree."
 Check `truncated` and `matched` in the answer: `matched` says how many were \
 eligible, so it tells you whether raising this would show more.",
                         "minimum": 1, "maximum": 500
+                    },
+                    "max_characters": {
+                        "type": "integer",
+                        "description": "Stop after roughly this many characters \
+(default 20000). An element count does not bound the answer's size -- elements \
+run from 169 to 4890 characters here, and 500 of them reached 188147 on one \
+window. When the answer is truncated, `stopped_by` says which ceiling bit: \
+raising `limit` helps when it says `limit` and does nothing when it says \
+`characters`, where narrowing to a region is the way forward.",
+                        "minimum": 500, "maximum": 200000
                     }
                 },
                 "required": ["window_id"],
@@ -636,6 +646,55 @@ what it does support.",
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn an_agent_can_ration_the_answer_by_size_not_only_by_count() {
+        // `limit` counts elements, which says nothing about how much comes back:
+        // elements run from 169 to 4890 characters here, and 500 of them reached
+        // 188147 characters on one window. An agent paying for context needs the
+        // bound in the unit it is actually rationing.
+        let tools = catalogue();
+        let describe = tools
+            .iter()
+            .find(|tool| tool.name == "describe_window")
+            .expect("describe_window");
+        let ceiling = &describe.schema["properties"]["max_characters"];
+        assert!(
+            ceiling.is_object(),
+            "describe_window must accept a size bound"
+        );
+
+        let text = ceiling["description"].as_str().unwrap_or_default();
+        // The description has to say what to do about it, since `limit` and this
+        // one fail in ways that call for opposite responses.
+        assert!(
+            text.contains("stopped_by"),
+            "tell the agent how to learn which ceiling bit: {text:?}"
+        );
+        assert!(
+            text.contains("region"),
+            "and that narrowing is the answer when size ran out: {text:?}"
+        );
+    }
+
+    #[test]
+    fn writing_to_a_file_is_not_offered_over_mcp() {
+        // Reading a window is declared read_only. Landing bytes on disk breaks
+        // that, and an MCP client has no trusted directory convention -- handing
+        // it an arbitrary path puts the permission decision with the party that
+        // has the least context. The CLI is where a person supplies the path.
+        for tool in catalogue() {
+            let properties = tool.schema["properties"].as_object();
+            let Some(properties) = properties else { continue };
+            for forbidden in ["out", "path", "file", "output_path", "written_to"] {
+                assert!(
+                    !properties.contains_key(forbidden),
+                    "{} must not take {forbidden:?}",
+                    tool.name
+                );
+            }
+        }
+    }
 
     #[test]
     fn a_crowded_window_can_be_read_in_two_steps() {
