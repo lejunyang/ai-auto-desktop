@@ -2019,3 +2019,92 @@ AI 省 context 的诉求由 `max_characters` + `region` 下钻满足，实测够
 | 坏路径 | exit 1 `CLI.WRITE_FAILED` |
 | `aad snapshot --out` | **exit 2** |
 | MCP `max_characters=4000` | shown=14 `stopped_by=characters` 消息 6476 字符 |
+
+## 2.37 让 AI 能留下它工作过的成果
+
+### 查实的缺口
+
+MCP 暴露 13 个工具，CLI 有 `record`，但**录制能力一个都没进 MCP**。AI 能看能动，做完一串
+操作后无法把它存成可复用的东西——下次要重做，只能从头再走一遍 `describe` + `find` + act。
+
+### 但方向一开始是错的
+
+我原本打算给 AI 做一套事件捕获会话（`watch`/`collect`/`release`）。量了之后发现前提就不对：
+
+**人是被观察的操作者，AI 自己就是发出动作的那一方。** 它不需要「记录我做了什么」——它已经知道。
+
+而且 `describe`/`find` 返回的每个元素**本来就带 synthesize 出的描述性 locator**（实测样本
+12/12 都有）。所以 AI 手上早就有可重放的描述，缺的只是把它们组装成 workflow 并存下来。
+
+不需要事件捕获，不需要 watch 会话。
+
+### 真正的缺口在 Rust 侧没有组装器
+
+查实：`toDescriptor` **只存在于 GUI 的 TypeScript**，Rust 侧没有对应实现。所以 `aad record`
+只打印录到的步骤，而把「转成 workflow」这件事留给调用方手写。
+
+这解释了一件旧事：上一轮我手写 workflow 时被 `validate` 逐条指出**六处**格式错误。不是记性
+差——**这个能力本来就不存在**，手写是唯一的路。
+
+展开规则不明显，凭印象一定会错：
+
+| 环节 | 规则 |
+| --- | --- |
+| 一个动作 → 三个执行步骤 | `snapshot` → `find` → act，act 消费 find 产出的 ref |
+| ref 从哪来 | 必须是**本次运行**产生的，`snapshot:revision:node` 一过期就失效 |
+| 窗口怎么选 | `process_name` + 标题片段，**绝不能用 window_id** |
+| 预算怎么算 | 按**展开后**的步数，按动作数算会让合法工作流跑一半就超预算 |
+| 密码怎么办 | 外置成 `required` + `sensitive` 的 input，不写进文件 |
+
+### 移植到 `aad-runtime::assemble`，并让它拒绝而不是产出坏东西
+
+五种情况宁可拒绝也不落盘，因为这些错误在**运行时**才暴露的话，调用方已经付了一次运行的代价，
+而从运行失败里看出原因比从这里看难得多：
+
+- `WORKFLOW.WINDOW_ID_NOT_PORTABLE`——按 id 选窗口的工作流**只在录它的那次会话里能用**，之后
+  静默失败，是最难诊断的失败模式
+- `WORKFLOW.LOCATOR_REQUIRED`——`describe` 对分不清的元素报 null locator，组装进去只会在 `find` 挂
+- `WORKFLOW.ARGUMENT_UNUSED`——给 `invoke` 传文本，静默丢弃会让工作流做得比要求的少而无迹可寻
+- `WORKFLOW.NO_STEPS`——空工作流会报成功却什么都没做，正是 AI 唯一分辨不出来的结果
+- `WORKFLOW.NAME_REQUIRED`
+
+组装出的四种真实场景全部通过真实 `validate`（单击、填写+提交、带凭据、带 `within` 的描述性
+locator），密码那份确认明文没落盘。**这一关才是证据**——单测只证明形状符合我的预期，`validate`
+才是引擎的意见。
+
+### MCP `save_workflow` 的三个取舍
+
+1. **先编译再落盘。** 用的是 `run_workflow` 同一个编译器（`compile_descriptor`），所以「存得
+   进去」和「跑得起来」是同一个判断，不是两个愿望。
+
+2. **不收完整 descriptor，只收 `(action, locator, window, argument)`。** 让 AI 交 descriptor
+   等于把三步展开的责任推给它——那正是错六处的地方。它手上有的就是 locator，工具就收这个。
+
+3. **同名默认拒绝。** 静默覆盖会让 AI 攒了两份不同的东西却只剩一份，而它不会知道。要覆盖得明说。
+
+schema 里写清两个「实测踩过」的坑：window id 只能用一次；标题常带打开的文档或实时状态，要取
+不变的那部分。
+
+### 端到端：完全走 MCP 的一次 AI 会话
+
+| 步骤 | 结果 |
+| --- | --- |
+| `describe_window --region "Billing address"` | 6 个元素，拿到 `{"role":"edit","automation_id":"billing-city"}` |
+| `set_value` + `invoke` | 都报 `applied=true` |
+| **CDP 独立核实** | `#billing-city='mcp-7348'`、`#log='[1] page-save:'` |
+| `save_workflow` | `performed_steps=2` → `executed_steps=6` |
+| **杀掉 Edge 重启** | 页面确认为空（`city=''`、`log='ready'`），node_id 全部重排 |
+| `run_workflow` | `status=succeeded`、`stepsExecuted=6` |
+| **CDP 再核实** | `city='mcp-7348'`、`log='[1] page-save:'` |
+
+两次核实都用 CDP 而不看 `applied` 或 `status`——上一轮的教训是驱动报 `applied=true` 时操作
+也可能没落地。
+
+路上有个假疑点：`applied=true` 但 `aad apps` 报的标题仍是 `last=none`。CDP 一查发现操作确实
+落地了，**是我的探针有时序问题**（`aad apps` 是新起进程，标题还没刷新），不是缺陷。分辨这两者
+的唯一办法就是独立事实源。
+
+### 现在闭合了什么
+
+AI 之前能看、能动，但**不能积累**——每次会话结束，探索出来的东西全丢。现在它可以把一段有效的
+操作序列存成命名工作流，下次直接 `run_workflow`，而且这份工作流**活过目标程序重启**。

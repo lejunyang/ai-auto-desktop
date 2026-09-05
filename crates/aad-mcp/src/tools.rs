@@ -296,6 +296,90 @@ what limits apply, such as a remote session or a non-elevated process.",
             mutating: false,
         },
         Tool {
+            name: "save_workflow",
+            description: "Turn actions you have already performed into a named \
+workflow that run_workflow can replay. Give the steps in the order they were done, \
+each with the locator you used to find the element -- describe_window and \
+find_element both return one. The saved workflow re-finds every element as it \
+runs, so it keeps working after the target application restarts, which a target \
+reference does not. Steps are checked before anything is written: a workflow that \
+saves is a workflow that runs.",
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "What to call it. run_workflow and \
+describe_workflow take this name."
+                    },
+                    "steps": {
+                        "type": "array",
+                        "minItems": 1,
+                        "description": "The actions in the order they were performed.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "action": {
+                                    "type": "string",
+                                    "enum": [
+                                        "focus", "invoke", "set_value",
+                                        "type_text", "pointer_click"
+                                    ],
+                                    "description": "What was done to the element."
+                                },
+                                "locator": {
+                                    "type": "object",
+                                    "description": "How to find the element again. \
+Copy the `locator` describe_window or find_element gave for it. An element whose \
+locator came back null cannot be told apart from its siblings and cannot be saved."
+                                },
+                                "window": {
+                                    "type": "object",
+                                    "description": "Which window, by \
+`process_name` and a stable part of `title`. Not a window_id: ids are assigned per \
+session, so a workflow using one works once and then fails.",
+                                    "properties": {
+                                        "process_name": {"type": "string"},
+                                        "title": {
+                                            "type": "string",
+                                            "description": "A part of the title that \
+does not change as the application is used -- many titles carry the open document \
+or a status that varies."
+                                        }
+                                    },
+                                    "required": ["process_name"],
+                                    "additionalProperties": false
+                                },
+                                "argument": {
+                                    "type": "string",
+                                    "description": "The text written or typed. Only \
+for set_value and type_text; giving it for another action is refused rather than \
+ignored."
+                                },
+                                "protected": {
+                                    "type": "boolean",
+                                    "description": "True if the text was a \
+credential. It is then stored as a required input instead of being written into \
+the file, and whoever runs the workflow supplies it."
+                                }
+                            },
+                            "required": ["action", "locator", "window"],
+                            "additionalProperties": false
+                        }
+                    },
+                    "overwrite": {
+                        "type": "boolean",
+                        "description": "Replace an existing workflow of the same \
+name. Without this a name already in use is refused, so two different workflows \
+cannot silently collapse into one."
+                    }
+                },
+                "required": ["name", "steps"],
+                "additionalProperties": false
+            }),
+            mutating: true,
+        },
+        Tool {
             name: "list_workflows",
             description: "List the saved workflows that can be run by name. These are \
 produced by recording a session in the desktop app.",
@@ -401,6 +485,12 @@ pub fn call(driver: &Arc<UiaDriver>, name: &str, arguments: &Value) -> Result<Va
         return run_workflow(driver, arguments);
     }
 
+    // Saving needs no desktop: the steps describe elements rather than reaching
+    // for them, which is what lets a saved workflow outlive the session.
+    if name == "save_workflow" {
+        return save_workflow(arguments);
+    }
+
     let action = match name {
         "list_apps" => "list_windows",
         "overview_window" => "overview",
@@ -428,6 +518,112 @@ fn failure(code: &str, message: &str, hint: Option<&str>) -> String {
         payload["hint"] = json!(hint);
     }
     serde_json::to_string(&payload).unwrap_or_else(|_| message.to_string())
+}
+
+/// Assemble performed actions into a named workflow and save it.
+///
+/// Compiled before it is written. Saving something the engine would reject leaves
+/// an agent believing it has a reusable workflow until the moment it tries to run
+/// it, and the reason is harder to read from a run failure than from here.
+fn save_workflow(arguments: &Value) -> Result<Value, String> {
+    let name = arguments
+        .get("name")
+        .and_then(Value::as_str)
+        .ok_or_else(|| failure("MCP.INVALID_ARGUMENT", "name is required", None))?;
+    let given = arguments
+        .get("steps")
+        .and_then(Value::as_array)
+        .ok_or_else(|| failure("MCP.INVALID_ARGUMENT", "steps is required", None))?;
+
+    let mut performed = Vec::new();
+    for (index, step) in given.iter().enumerate() {
+        let ordinal = index + 1;
+        let action = step
+            .get("action")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                failure(
+                    "MCP.INVALID_ARGUMENT",
+                    &format!("step {ordinal} needs an action"),
+                    None,
+                )
+            })?;
+        performed.push(aad_runtime::assemble::PerformedStep {
+            action: action.to_string(),
+            locator: step.get("locator").cloned().unwrap_or(Value::Null),
+            window: step.get("window").cloned().unwrap_or(Value::Null),
+            argument: step
+                .get("argument")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            protected: step
+                .get("protected")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        });
+    }
+
+    let descriptor = aad_runtime::assemble::assemble(name, &performed)
+        .map_err(|problem| failure(&problem.code, &problem.message, None))?;
+
+    // The same compiler `run_workflow` uses, so "it saved" and "it runs" are the
+    // same claim rather than two hopes.
+    let compiled = aad_core::compiler::compile_descriptor(
+        descriptor.clone(),
+        Some(aad_runtime::recordings::recordings_dir()),
+    )
+    .map_err(|error| {
+        failure(
+            &error.code,
+            &format!("the assembled workflow would not compile: {}", error.message),
+            Some(
+                "This is a defect in how the steps were assembled rather than in \
+what you supplied. Report the steps you passed.",
+            ),
+        )
+    })?;
+
+    let existing = aad_runtime::recordings::workflow_path(name).ok();
+    let replacing = existing.as_ref().is_some_and(|path| path.exists());
+    let overwrite = arguments
+        .get("overwrite")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if replacing && !overwrite {
+        return Err(failure(
+            "WORKFLOW.NAME_IN_USE",
+            &format!("a workflow named {name:?} already exists"),
+            Some(
+                "Pass overwrite: true to replace it, or choose another name. \
+Replacing silently would let two different workflows collapse into one with \
+nothing to show it happened.",
+            ),
+        ));
+    }
+
+    let path = aad_runtime::recordings::save_workflow(name, &descriptor)
+        .map_err(|error| failure(error.code, &error.message, None))?;
+
+    Ok(json!({
+        "kind": "WorkflowSaved",
+        "name": name,
+        "path": path.to_string_lossy(),
+        "performed_steps": performed.len(),
+        // Three executed steps per performed action, so the number a caller sees
+        // in `describe_workflow` matches what it reads here.
+        "executed_steps": compiled
+            .raw
+            .get("steps")
+            .and_then(Value::as_array)
+            .map(Vec::len)
+            .unwrap_or(0),
+        "replaced": replacing,
+        "inputs_required": descriptor
+            .get("inputs")
+            .and_then(Value::as_object)
+            .map(|inputs| inputs.keys().cloned().collect::<Vec<String>>())
+            .unwrap_or_default(),
+    }))
 }
 
 /// The saved workflows, newest first.
@@ -694,6 +890,89 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn an_agent_can_keep_what_it_worked_out() {
+        // Without this an agent explores a window, acts, and loses all of it when
+        // the session ends: the next run starts from describe_window again. The
+        // targets it holds are no help -- a snapshot handle stops resolving once
+        // the snapshot is gone.
+        let tools = catalogue();
+        let saving = tools
+            .iter()
+            .find(|tool| tool.name == "save_workflow")
+            .expect("an agent needs a way to save what it did");
+        assert!(saving.mutating, "it writes a file");
+
+        let properties = &saving.schema["properties"];
+        // It takes the steps, not a descriptor. Expanding one performed action
+        // into snapshot/find/act is exactly what goes wrong when written by hand.
+        assert!(properties.get("steps").is_some());
+        assert!(
+            properties.get("descriptor").is_none() && properties.get("workflow").is_none(),
+            "assembling is this tool's job, not the caller's"
+        );
+
+        let step = &saving.schema["properties"]["steps"]["items"];
+        let required: Vec<&str> = step["required"]
+            .as_array()
+            .expect("required")
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        for field in ["action", "locator", "window"] {
+            assert!(required.contains(&field), "{field} is not optional");
+        }
+    }
+
+    #[test]
+    fn the_schema_warns_against_the_two_things_that_break_replay() {
+        // Both were found the hard way on this desktop: a window id works in the
+        // session that recorded it and never again, and a title carrying the open
+        // document or a live status stops matching as soon as the application is
+        // used.
+        let tools = catalogue();
+        let saving = tools
+            .iter()
+            .find(|tool| tool.name == "save_workflow")
+            .expect("save_workflow");
+        let window = &saving.schema["properties"]["steps"]["items"]["properties"]["window"];
+
+        let described = window["description"].as_str().unwrap_or_default();
+        assert!(
+            described.contains("window_id") || described.contains("ids are assigned"),
+            "say why an id will not do: {described:?}"
+        );
+        assert!(
+            window["properties"].get("window_id").is_none(),
+            "and do not accept one"
+        );
+
+        let title = window["properties"]["title"]["description"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            title.contains("does not change") || title.contains("varies"),
+            "warn that titles move: {title:?}"
+        );
+    }
+
+    #[test]
+    fn a_credential_is_declared_rather_than_written_down() {
+        let tools = catalogue();
+        let saving = tools
+            .iter()
+            .find(|tool| tool.name == "save_workflow")
+            .expect("save_workflow");
+        let protected = saving.schema["properties"]["steps"]["items"]["properties"]["protected"]
+            ["description"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            protected.contains("input") && protected.contains("credential"),
+            "an agent has to know a password is not stored: {protected:?}"
+        );
     }
 
     #[test]
