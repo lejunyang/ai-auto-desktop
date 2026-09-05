@@ -377,7 +377,7 @@ fn describe_step(action: &'static str, node: &Node, nodes: &[Node]) -> RecordedS
     // Match the captured element back into the snapshot. Identity, not the
     // node_id: the captured element was described independently and its id
     // belongs to no snapshot.
-    let found = nodes.iter().find(|candidate| same_element(candidate, node));
+    let found = match_captured(node, nodes);
 
     let (locator, unresolved) = match found {
         Some(candidate) => match Locator::synthesize(candidate, nodes) {
@@ -406,6 +406,59 @@ fn describe_step(action: &'static str, node: &Node, nodes: &[Node]) -> RecordedS
     }
 }
 
+/// Find the snapshot node a captured element refers to.
+///
+/// Identity alone is not always enough. Measured on a table of orders: five
+/// `Edit` buttons share role, name, automation_id and class_name exactly, so
+/// taking the first match recorded a click on the third row as a click on the
+/// first -- and the locator that came out said "Order for Ada" with no error at
+/// all, which is the worst way for this to fail.
+///
+/// Position breaks the tie. Across this desktop, 38 interactive elements collide
+/// with a namesake on all four identity fields and 27 of them sit somewhere
+/// different, so it resolves most of them; the remaining 11 overlap exactly and
+/// were never distinguishable.
+///
+/// Position is deliberately *only* a tie-breaker. A window that has moved or
+/// scrolled invalidates it, so it must not decide whether a match exists -- it
+/// only chooses among candidates that identity already accepted. Verified that
+/// the captured bounds agree with the snapshot: both reported (541, 243) for the
+/// same button.
+fn match_captured<'a>(captured: &Node, nodes: &'a [Node]) -> Option<&'a Node> {
+    let mut candidates = nodes
+        .iter()
+        .filter(|candidate| same_element(candidate, captured));
+    let first = candidates.next()?;
+    let rest: Vec<&Node> = candidates.collect();
+    if rest.is_empty() {
+        return Some(first);
+    }
+
+    // Several namesakes. Without a captured position there is nothing to choose
+    // on, so keep the previous behaviour rather than refusing: a step that might
+    // name the wrong row is still worth more than no step at all, and
+    // `synthesize` reports the ones it cannot tell apart.
+    let Some(origin) = captured.bounds.as_ref() else {
+        return Some(first);
+    };
+
+    // Nearest rather than equal: platform coordinates can differ by a pixel or
+    // two between two independent reads, while genuine namesakes here are a row
+    // apart.
+    std::iter::once(first)
+        .chain(rest)
+        .filter_map(|candidate| {
+            let bounds = candidate.bounds.as_ref()?;
+            let dx = i64::from(bounds.x) - i64::from(origin.x);
+            let dy = i64::from(bounds.y) - i64::from(origin.y);
+            Some((dx * dx + dy * dy, candidate))
+        })
+        .min_by_key(|(distance, _)| *distance)
+        .map(|(_, candidate)| candidate)
+        // Every namesake lacked bounds, so position cannot help either.
+        .or(Some(first))
+}
+
 /// Whether two independently-described nodes are the same element.
 ///
 /// Compared on identity rather than on every field, because a value changes as
@@ -422,7 +475,7 @@ fn same_element(candidate: &Node, captured: &Node) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::States;
+    use crate::model::{Bounds, States};
     use std::time::Duration;
 
     // -----------------------------------------------------------------------
@@ -463,6 +516,76 @@ mod tests {
             source: "test",
             observed_at: Instant::now(),
         }
+    }
+
+    #[test]
+    fn a_click_on_one_of_several_namesakes_records_the_one_that_was_clicked() {
+        // Measured on a table of orders: five `Edit` buttons agree on role, name,
+        // automation_id and class_name, so taking the first match recorded a
+        // click on the third row as a click on the first -- and the locator said
+        // "Order for Ada" with no error, which is the worst way to be wrong.
+        let mut rows = Vec::new();
+        for (index, customer) in ["Ada", "Brian", "Chen"].iter().enumerate() {
+            let y = 175 + (index as i32) * 34;
+            let mut row = full(
+                &format!("row{index}"),
+                "data_item",
+                Some(&format!("Order for {customer}")),
+                None,
+                None,
+            );
+            row.bounds = Some(Bounds { x: 40, y, width: 700, height: 25 });
+            let mut button = full(
+                &format!("edit{index}"),
+                "button",
+                Some("Edit"),
+                None,
+                Some("edit"),
+            );
+            button.parent_id = Some(format!("row{index}"));
+            button.bounds = Some(Bounds { x: 541, y, width: 48, height: 25 });
+            rows.push(row);
+            rows.push(button);
+        }
+
+        // The third row's button, as the platform described it when it fired.
+        let clicked = rows
+            .iter()
+            .find(|n| n.node_id == "edit2")
+            .expect("third button")
+            .clone();
+
+        let steps = to_steps(vec![captured(EventKind::Invoked, clicked)], &rows);
+
+        assert_eq!(steps.len(), 1);
+        let locator = steps[0].locator.as_ref().expect("a locator");
+        let selected = locator.resolve(&rows);
+        assert_eq!(selected.len(), 1, "still has to be unambiguous: {selected:?}");
+        assert_eq!(
+            selected[0].node_id, "edit2",
+            "the row that was clicked, not the first namesake"
+        );
+    }
+
+    #[test]
+    fn a_namesake_without_a_captured_position_is_still_recorded() {
+        // Position is a tie-breaker, not a requirement. Refusing to match would
+        // turn "a step that might name the wrong row" into no step at all, and a
+        // recording that silently misses steps is the failure this design exists
+        // to prevent.
+        let mut first = full("a", "button", Some("Edit"), None, Some("edit"));
+        first.bounds = Some(Bounds { x: 10, y: 10, width: 40, height: 20 });
+        let mut second = full("b", "button", Some("Edit"), None, Some("edit"));
+        second.bounds = Some(Bounds { x: 10, y: 60, width: 40, height: 20 });
+        let nodes = vec![first.clone(), second];
+
+        // Captured with no bounds at all.
+        let mut clicked = first;
+        clicked.bounds = None;
+
+        let steps = to_steps(vec![captured(EventKind::Invoked, clicked)], &nodes);
+
+        assert_eq!(steps.len(), 1, "recorded rather than dropped");
     }
 
     #[test]

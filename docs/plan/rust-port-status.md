@@ -1719,3 +1719,67 @@ Rust 598 passed。
 Rust 598 passed，前端 125 passed。
 
 **留下的疑点**：点了三次只录到两步。选择器的问题已经修完并验证，这条待查。
+
+## 2.34 点第三行录成第一行
+
+三次点击 Ada / Brian / Chen 那三行的 Edit，录出来的三个 locator **一模一样**，容器都写
+`Order for Ada`。回放会连点三次第一行。而且没有任何报错、三步都标 `replayable`——这是最坏
+的失败方式。
+
+根因不在 locator 合成，在**把捕获元素匹配回快照**这一步。`same_element` 比 role、name、
+automation_id、class_name 四个字段，而这五个 Edit 按钮四个字段完全相同：
+
+```
+e122: role=button name='Edit' id=None class='edit'  祖先 Order for Ada
+e124: role=button name='Edit' id=None class='edit'  祖先 Order for Brian
+e126: role=button name='Edit' id=None class='edit'  祖先 Order for Chen
+```
+
+`nodes.iter().find(...)` 取第一个匹配，于是永远是 e122。locator 合成本身有容器逻辑能区分
+它们，只是拿到的已经是错的节点。
+
+### 用位置消歧，但只用作 tie-breaker
+
+先量能不能用：全机 38 个可交互元素与同名者在四个字段上完全相同，其中 **27 个位置各不相同**，
+11 个连位置都重叠（那 11 个本来就无法区分，`synthesize` 会报 unresolved）。五个 Edit 按钮
+一行差 34px。
+
+再验证坐标可信 —— 捕获节点是事件发生时独立描述的，快照是开始录制时拍的，若坐标系不同就
+会换来另一种静默错配。诊断打出来两边都报 `(541, 243)`，一致。
+
+`match_captured` 的三条设计取舍：
+
+- **位置只在身份已相同的候选间挑选**，不作为独立判据。窗口移动或滚动会让它失效，所以不能
+  由它决定"匹配是否存在"。
+- **捕获节点没有 bounds 时退回原行为**（取第一个），不是匹配失败。把"可能说错行"变成"完全
+  录不到"是更坏的交换——录制静默缺步正是整个设计要防的事。
+- **取最近而非要求相等**。两次独立读取的坐标可能差一两像素，而真正的同名兄弟隔着一整行。
+
+修后真机：点 Chen 那一行，录出 `Order for Chen`（改之前是 `Order for Ada`）。重启浏览器
+回放 `succeeded`，journal 显示 `find1 → e124 → Order for Brian`、`find2 → e126 →
+Order for Chen`，各自落在自己那一行。
+
+### 把新测试拿去撞一次旧代码
+
+新测试一次就过，所以临时把 `match_captured` 退回 `find(...)` 验证它真的有效：
+
+```
+assertion `left == right` failed: the row that was clicked, not the first namesake
+  left: "edit0"   right: "edit2"
+```
+
+正是真机上的错配。
+
+### 顺带查清一个假缺陷
+
+过程中出现"三次点击只录到 2 步，丢的是第一步"，且时断时续。间歇丢步比稳定丢步更值得查，
+所以连跑 5 次——全部 3 步、顺序正确（Ada / Brian / Chen）。
+
+差别在于这个探针**每次重新拍快照取目标**，而丢步的两次复用了先前的 ref。页面重排后旧 ref
+指向的已不是原元素，`invoke` 依然报 `applied=true`（它按捕获时的身份字段二次比对，同名按钮
+能通过），实际点到别处。**是探针的问题，不是产品的。**
+
+（早先"CLI 录到 3 步"其实也是错配的产物：三步都匹配到 e122，看着数量对但全说 Ada。位置
+消歧生效后真实情况才暴露出来。）
+
+Rust 600 passed。
