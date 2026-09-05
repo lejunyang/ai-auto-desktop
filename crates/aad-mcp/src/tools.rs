@@ -732,6 +732,244 @@ fn uses_scripts(raw: &Value) -> bool {
 /// Takes the driver because a recorded workflow is made of `action` steps that
 /// dispatch through the desktop provider. Running one without registering that
 /// provider would fail on the first step with a missing-provider error, which
+/// Fold the run's events into one entry per logical step.
+///
+/// A saved action expands into snapshot/find/act, and an agent that saved one step
+/// should read one step back. Only the last of the three says what was done; the
+/// first two are how the element was reached.
+///
+/// Steps that never ran are reported as such rather than omitted. Leaving them out
+/// makes a run that stopped halfway look like a shorter workflow that finished,
+/// which is the reading that leads to a blind retry.
+fn walk_through(result: &aad_runtime::RunResult) -> Vec<Value> {
+    use std::collections::BTreeMap;
+
+    // id -> (status, error), in the order the engine reported them.
+    let mut seen: Vec<String> = Vec::new();
+    let mut states: BTreeMap<String, (String, Option<Value>)> = BTreeMap::new();
+
+    for event in &result.events {
+        if event.event_type != "step.finished" {
+            continue;
+        }
+        let Some(id) = event.payload.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        let status = event
+            .payload
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+            .to_string();
+        let error = event.payload.get("error").cloned();
+        if !states.contains_key(id) {
+            seen.push(id.to_string());
+        }
+        states.insert(id.to_string(), (status, error));
+    }
+
+    // Group the three executed steps back under the action they came from. The
+    // suffixes are the ones `assemble` emits.
+    let mut order: Vec<String> = Vec::new();
+    let mut grouped: BTreeMap<String, Vec<(String, String, Option<Value>)>> = BTreeMap::new();
+    for id in &seen {
+        let logical = id
+            .strip_suffix("_window")
+            .or_else(|| id.strip_suffix("_element"))
+            .unwrap_or(id)
+            .to_string();
+        if !grouped.contains_key(&logical) {
+            order.push(logical.clone());
+        }
+        let (status, error) = states.get(id).cloned().unwrap_or_default();
+        grouped
+            .entry(logical)
+            .or_default()
+            .push((id.clone(), status, error));
+    }
+
+    let mut steps = Vec::new();
+    for logical in order {
+        let parts = grouped.get(&logical).cloned().unwrap_or_default();
+
+        // Failed anywhere in the group means the action did not complete, and the
+        // phase says whether the element was even reached -- "could not find it"
+        // and "found it but the action was refused" call for different next moves.
+        let failing = parts.iter().find(|(_, status, _)| status == "failed");
+        let mut entry = serde_json::Map::new();
+        entry.insert("id".into(), json!(logical));
+
+        match failing {
+            Some((id, _, error)) => {
+                entry.insert("status".into(), json!("failed"));
+                entry.insert(
+                    "phase".into(),
+                    json!(if id.ends_with("_window") {
+                        "locating the window"
+                    } else if id.ends_with("_element") {
+                        "finding the element"
+                    } else {
+                        "performing the action"
+                    }),
+                );
+                if let Some(error) = error {
+                    entry.insert("error".into(), error.clone());
+                }
+            }
+            None => {
+                let done = parts.len() == 3
+                    && parts.iter().all(|(_, status, _)| status == "succeeded");
+                entry.insert(
+                    "status".into(),
+                    json!(if done { "succeeded" } else { "incomplete" }),
+                );
+            }
+        }
+        steps.push(Value::Object(entry));
+    }
+
+    steps
+}
+
+/// Look again at what the failing step was reaching for.
+///
+/// An error code says an action failed; it does not say why. On this desktop a
+/// disabled button reports `0x80040200`, and reading the element back shows
+/// `enabled: false` -- that is the answer, and it is not in the code.
+///
+/// The reading can itself fail: an element removed from the page gives
+/// `DRIVER.NOT_FOUND`, a closed window `DRIVER.WINDOW_NOT_FOUND`. Both were
+/// measured. So a failed look is reported as a failed look and never replaces the
+/// original error -- an agent shown a diagnosis error instead of the real one is
+/// worse off than an agent shown no diagnosis at all.
+fn why_it_failed(
+    driver: &Arc<UiaDriver>,
+    descriptor: &aad_core::WorkflowDescriptor,
+    failing_step: &str,
+) -> Option<Value> {
+    // The window and locator come from the descriptor rather than from the run:
+    // they say what was being reached for, which is what needs looking at again.
+    let steps = descriptor.raw.get("steps")?.as_array()?;
+    let find_id = format!("{failing_step}_element");
+    let window_id = format!("{failing_step}_window");
+
+    let locator = steps
+        .iter()
+        .find(|step| step.get("id").and_then(Value::as_str) == Some(find_id.as_str()))
+        .and_then(|step| step.get("with"))
+        .and_then(|with| with.get("locator"))
+        .cloned();
+    let window = steps
+        .iter()
+        .find(|step| step.get("id").and_then(Value::as_str) == Some(window_id.as_str()))
+        .and_then(|step| step.get("with"))
+        .and_then(|with| with.get("window"))
+        .cloned();
+
+    let mut report = serde_json::Map::new();
+
+    // The window first: minimised or gone explains a whole class of failures, and
+    // it explains them for every element inside it at once.
+    if let Some(window) = &window {
+        match driver.call("list_windows", &json!({})) {
+            Ok(listing) => {
+                let wanted_title = window.get("title").and_then(Value::as_str);
+                let wanted_process = window.get("process_name").and_then(Value::as_str);
+                let found = listing
+                    .get("windows")
+                    .and_then(Value::as_array)
+                    .and_then(|windows| {
+                        windows.iter().find(|candidate| {
+                            let title_matches = wanted_title.is_none_or(|want| {
+                                candidate
+                                    .get("title")
+                                    .and_then(Value::as_str)
+                                    .is_some_and(|title| title.contains(want))
+                            });
+                            let process_matches = wanted_process.is_none_or(|want| {
+                                candidate
+                                    .get("process_name")
+                                    .and_then(Value::as_str)
+                                    .is_some_and(|name| name.eq_ignore_ascii_case(want))
+                            });
+                            title_matches && process_matches
+                        })
+                    });
+                match found {
+                    Some(candidate) => {
+                        report.insert(
+                            "window".into(),
+                            json!({
+                                "present": true,
+                                "title": candidate.get("title").cloned().unwrap_or(Value::Null),
+                                "is_minimized": candidate
+                                    .get("is_minimized")
+                                    .cloned()
+                                    .unwrap_or(Value::Null),
+                                "is_foreground": candidate
+                                    .get("is_foreground")
+                                    .cloned()
+                                    .unwrap_or(Value::Null),
+                            }),
+                        );
+                    }
+                    None => {
+                        report.insert(
+                            "window".into(),
+                            json!({
+                                "present": false,
+                                "note": "The window the step names is not open. It may \
+have been closed, or its title may have changed past the part the workflow matches on."
+                            }),
+                        );
+                    }
+                }
+            }
+            Err(error) => {
+                report.insert("window".into(), json!({"unreadable": error_payload(&error)}));
+            }
+        }
+    }
+
+    // Then the element. `enabled`, `offscreen` and `read_only` are the three states
+    // that turn "the action failed" into a reason.
+    if let (Some(locator), Some(window)) = (&locator, &window) {
+        let request = json!({"window": window, "locator": locator, "expect": "one"});
+        match driver.call("find", &request) {
+            Ok(found) => {
+                let node = found.get("node").cloned().unwrap_or(Value::Null);
+                report.insert(
+                    "element".into(),
+                    json!({
+                        "present": true,
+                        "states": node.get("states").cloned().unwrap_or(Value::Null),
+                        "actions": node.get("actions").cloned().unwrap_or(Value::Null),
+                        "name": node.get("name").cloned().unwrap_or(Value::Null),
+                        "value": node.get("value").cloned().unwrap_or(Value::Null),
+                    }),
+                );
+            }
+            Err(error) => {
+                // Not the original failure -- the original stays where it is. This
+                // only says the element could not be looked at now.
+                report.insert(
+                    "element".into(),
+                    json!({
+                        "present": false,
+                        "looking_failed": error_payload(&error),
+                    }),
+                );
+            }
+        }
+    }
+
+    if report.is_empty() {
+        None
+    } else {
+        Some(Value::Object(report))
+    }
+}
+
 /// looks like a broken recording rather than a mis-wired caller.
 fn run_workflow(driver: &Arc<UiaDriver>, arguments: &Value) -> Result<Value, String> {
     let (name, descriptor) = compiled_workflow(arguments)?;
@@ -774,12 +1012,19 @@ by a person: use `aad run <file> --allow-scripts`.",
             .with_providers(providers),
     );
 
+    let progress = walk_through(&result);
+
     let mut payload = json!({
         "kind": "WorkflowRun",
         "name": name,
         "status": result.status.as_str(),
         "outputs": result.outputs,
         "stepsExecuted": result.executed_steps,
+        // What actually happened, step by step. `stepsExecuted` alone cannot tell
+        // "all six succeeded" from "it reached the sixth and failed there", and
+        // that difference decides whether retrying is safe: a workflow that wrote
+        // a value and failed to submit will write it twice.
+        "steps": progress,
     });
     if let Some(error) = &result.error {
         // Carry the effect through verbatim. Whether a failed step already
@@ -792,6 +1037,25 @@ by a person: use `aad run <file> --allow-scripts`.",
             "stepId": error.location.step_id,
         });
     }
+
+    // Only when something actually failed. A successful run should not pay for a
+    // second look, nor carry one in its answer.
+    if result.error.is_some() {
+        let stumbled = progress.iter().find_map(|step| {
+            (step.get("status").and_then(Value::as_str) == Some("failed"))
+                .then(|| step.get("id").and_then(Value::as_str))
+                .flatten()
+        });
+        if let Some(failing) = stumbled {
+            if let Some(context) = why_it_failed(driver, &descriptor, failing) {
+                // Deliberately beside the error rather than inside it: this is a
+                // fresh reading taken afterwards, not part of what the engine
+                // reported, and conflating the two would misdate it.
+                payload["at_the_time_of_failure"] = context;
+            }
+        }
+    }
+
     Ok(payload)
 }
 
@@ -890,6 +1154,95 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Build a RunResult carrying the events a real run emits, so the folding is
+    /// tested against the shape the engine actually produces rather than a guess.
+    /// Measured on this desktop: 26 events for a two-action workflow, with `id`
+    /// and `status` on `step.finished`.
+    fn run_with(steps: &[(&str, &str)]) -> aad_runtime::RunResult {
+        let events = steps
+            .iter()
+            .enumerate()
+            .map(|(index, (id, status))| aad_runtime::RunEvent {
+                run_id: "r".into(),
+                seq: index as u64 + 1,
+                event_type: "step.finished".into(),
+                payload: json!({"id": id, "status": status}),
+                created_at: "2026-01-01T00:00:00Z".into(),
+            })
+            .collect();
+        aad_runtime::RunResult {
+            run_id: "r".into(),
+            workflow: "w".into(),
+            plan_digest: "d".into(),
+            status: aad_runtime::RunStatus::Failed,
+            outputs: serde_json::Map::new(),
+            error: None,
+            executed_steps: steps.len() as u64,
+            duration_seconds: 0.0,
+            started_at: "2026-01-01T00:00:00Z".into(),
+            finished_at: "2026-01-01T00:00:00Z".into(),
+            events,
+        }
+    }
+
+    #[test]
+    fn a_run_that_stopped_halfway_says_which_step_did_it() {
+        // The problem this solves: `stepsExecuted` alone cannot tell "all of them
+        // succeeded" from "it reached the last one and failed there". An agent
+        // reading the first meaning retries blindly, and a workflow that wrote a
+        // value and failed to submit writes it twice.
+        let result = run_with(&[
+            ("step_1_window", "succeeded"),
+            ("step_1_element", "succeeded"),
+            ("step_1", "succeeded"),
+            ("step_2_window", "succeeded"),
+            ("step_2_element", "succeeded"),
+            ("step_2", "failed"),
+        ]);
+        let steps = walk_through(&result);
+
+        assert_eq!(steps.len(), 2, "two performed actions, not six executed steps");
+        assert_eq!(steps[0]["id"], "step_1");
+        assert_eq!(steps[0]["status"], "succeeded");
+        assert_eq!(steps[1]["id"], "step_2");
+        assert_eq!(steps[1]["status"], "failed");
+    }
+
+    #[test]
+    fn where_it_failed_distinguishes_not_finding_from_not_working() {
+        // "could not find the element" and "found it but the action was refused"
+        // call for different next moves, and the error code alone does not
+        // separate them.
+        let missing = walk_through(&run_with(&[
+            ("step_1_window", "succeeded"),
+            ("step_1_element", "failed"),
+        ]));
+        assert_eq!(missing[0]["phase"], "finding the element");
+
+        let refused = walk_through(&run_with(&[
+            ("step_1_window", "succeeded"),
+            ("step_1_element", "succeeded"),
+            ("step_1", "failed"),
+        ]));
+        assert_eq!(refused[0]["phase"], "performing the action");
+
+        let no_window = walk_through(&run_with(&[("step_1_window", "failed")]));
+        assert_eq!(no_window[0]["phase"], "locating the window");
+    }
+
+    #[test]
+    fn an_action_reported_only_in_part_is_not_called_done() {
+        // A group missing its third entry means the run stopped before the action
+        // itself. Calling that "succeeded" because nothing failed would be the
+        // same false reassurance in a different shape.
+        let steps = walk_through(&run_with(&[
+            ("step_1_window", "succeeded"),
+            ("step_1_element", "succeeded"),
+        ]));
+        assert_eq!(steps[0]["status"], "incomplete");
+        assert!(steps[0].get("error").is_none(), "nothing failed, so no error");
     }
 
     #[test]
