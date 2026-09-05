@@ -1235,7 +1235,19 @@ fn explain_workflow(name: &str) -> (Value, u8) {
         path.parent().map(Into::into),
     );
     let problem = compiled.as_ref().err().map(|error| {
-        json!({"code": error.code, "message": error.message})
+        // I dropped these when this was written, which left the report saying only
+        // "invalid" -- an error nobody can act on. `validate` had them all along.
+        let issues: Vec<Value> = error
+            .issues
+            .iter()
+            .map(|issue| json!({"path": issue.path, "message": issue.message}))
+            .collect();
+        json!({
+            "code": error.code,
+            "message": error.message,
+            "issue_count": issues.len(),
+            "issues": issues,
+        })
     });
 
     let steps = document
@@ -1802,6 +1814,39 @@ fn list_events(args: &EventsArgs) -> (Value, u8) {
 mod tests {
     use super::*;
     use clap::CommandFactory;
+
+    #[test]
+    fn a_workflow_that_will_not_run_says_where_the_problem_is() {
+        // I wrote this report without the issues, which left it saying only
+        // "invalid" -- an error nobody can act on, while `validate` had the paths
+        // all along. Measured: a bad name and a bad step give three located
+        // issues, all of which were being dropped.
+        let folder = std::env::temp_dir().join("aad_issue_report");
+        let _ = std::fs::create_dir_all(&folder);
+        let path = folder.join("broken.json");
+        std::fs::write(
+            &path,
+            r#"{"apiVersion":"ai-auto-desktop.dev/v1alpha1","kind":"Workflow",
+               "metadata":{"name":"BadName"},
+               "budgets":{"max_duration":"1m","max_executed_steps":1},
+               "steps":[{"id":"done","type":"return","value":1}]}"#,
+        )
+        .expect("write");
+
+        let (payload, code) = validate(&path);
+        assert_eq!(code, EXIT_FAILED);
+        let issues = payload["error"]["issues"]
+            .as_array()
+            .expect("issues are reported");
+        assert!(!issues.is_empty(), "an error without a location cannot be fixed");
+        assert!(
+            issues
+                .iter()
+                .any(|issue| issue["path"].as_str().is_some_and(|path| path.contains("name"))),
+            "the offending path is named: {issues:?}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
 
     #[test]
     fn a_path_is_never_overruled_by_a_saved_name() {

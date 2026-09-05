@@ -388,9 +388,11 @@ produced by recording a session in the desktop app.",
         },
         Tool {
             name: "describe_workflow",
-            description: "Check a saved workflow and report what it would do: its steps, \
-the inputs it expects and the outputs it produces. Does not run anything, so use \
-it to understand a workflow before running it.",
+            description: "Report what a saved workflow would do, without running \
+it: each action, the element it finds, the window it acts in, and the text it \
+writes. Any input it needs is named rather than its value shown, so a workflow \
+carrying a credential says what to supply without revealing it. Read this before \
+run_workflow when it matters what gets touched.",
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -573,14 +575,44 @@ fn save_workflow(arguments: &Value) -> Result<Value, String> {
         Some(aad_runtime::recordings::recordings_dir()),
     )
     .map_err(|error| {
-        failure(
-            &error.code,
-            &format!("the assembled workflow would not compile: {}", error.message),
-            Some(
-                "This is a defect in how the steps were assembled rather than in \
-what you supplied. Report the steps you passed.",
-            ),
-        )
+        // The issues carry the path of each problem, and without them the caller
+        // is told only that something is wrong. Measured: a bad name plus a bad
+        // step yields three located issues, all of which used to be dropped.
+        let located: Vec<Value> = error
+            .issues
+            .iter()
+            .map(|issue| json!({"path": issue.path, "message": issue.message}))
+            .collect();
+
+        // Blame follows the path. A problem under $.metadata.name is the name the
+        // caller chose; telling them it is a defect in the assembler would send
+        // them to report a bug instead of renaming. Names must be lower case:
+        // measured, "SubmitButton" and "UPPER" are both refused.
+        let names_the_name = error
+            .issues
+            .iter()
+            .any(|issue| issue.path.starts_with("$.metadata.name"));
+        let hint = if names_the_name {
+            "The name is not allowed. It has to start with a lower-case letter and \
+carry only lower-case letters, digits, and . _ - between them, so \
+\"submit_button\" where \"SubmitButton\" was refused."
+        } else {
+            "This is a defect in how the steps were assembled rather than in what \
+you supplied. Report the steps you passed, and see `issues` for where it went wrong."
+        };
+
+        let mut payload = json!({
+            "code": error.code,
+            "message": format!("the assembled workflow would not compile: {}", error.message),
+            "retryable": false,
+            "effect": "not_applied",
+            "hint": hint,
+            "issues": located,
+        });
+        if payload["issues"].as_array().is_some_and(Vec::is_empty) {
+            payload.as_object_mut().map(|map| map.remove("issues"));
+        }
+        serde_json::to_string(&payload).unwrap_or_else(|_| error.message.clone())
     })?;
 
     let existing = aad_runtime::recordings::workflow_path(name).ok();
@@ -667,11 +699,23 @@ fn compiled_workflow(arguments: &Value) -> Result<(String, aad_core::WorkflowDes
 
     let descriptor = aad_core::compiler::compile_descriptor(document, path.parent().map(Into::into))
         .map_err(|error| {
-            failure(
-                &error.code,
-                &error.message,
-                Some("The saved workflow is not valid. Re-record or repair it in the desktop app."),
-            )
+            // Where each problem is, not just that there is one: "invalid" alone
+            // cannot be acted on, and the paths are what make a repair possible.
+            let located: Vec<Value> = error
+                .issues
+                .iter()
+                .map(|issue| json!({"path": issue.path, "message": issue.message}))
+                .collect();
+            let payload = json!({
+                "code": error.code,
+                "message": error.message,
+                "retryable": false,
+                "effect": "not_applied",
+                "hint": "The saved workflow is not valid. `issues` says where; the \
+desktop app can repair it, or save it again.",
+                "issues": located,
+            });
+            serde_json::to_string(&payload).unwrap_or_else(|_| error.message.clone())
         })?;
     Ok((name.to_string(), descriptor))
 }
@@ -704,10 +748,77 @@ fn describe_workflow(arguments: &Value) -> Result<Value, String> {
         "outputs": raw.get("outputs").cloned().unwrap_or(json!({})),
         "steps": steps,
         "stepCount": steps.len(),
+        // What it will actually touch. Step ids and types do not answer the
+        // question asked before running something, so an agent deciding whether to
+        // run a saved workflow had only its name and a step count to go on.
+        "actions": what_it_does(raw),
         // Stated up front so an agent learns the limit from a read-only call
         // rather than from a refused run.
         "runnable": !uses_scripts(raw),
     }))
+}
+
+/// Fold the executed steps back into the actions they came from.
+///
+/// One saved action expands into snapshot/find/act, so reading a workflow back
+/// step by step shows three entries for every one that was recorded, none of them
+/// naming the element or the window.
+fn what_it_does(raw: &Value) -> Vec<Value> {
+    let Some(steps) = raw.get("steps").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+
+    let mut actions = Vec::new();
+    for step in steps {
+        let id = step.get("id").and_then(Value::as_str).unwrap_or_default();
+        // The suffixes `assemble` emits. A step carrying neither is the action.
+        if id.ends_with("_window") || id.ends_with("_element") {
+            continue;
+        }
+
+        let uses = step.get("uses").and_then(Value::as_str).unwrap_or_default();
+        let action = uses
+            .rsplit_once('.')
+            .map(|(_, tail)| tail.split('@').next().unwrap_or(tail))
+            .unwrap_or(uses);
+
+        let borrowed = |suffix: &str, key: &str| -> Option<Value> {
+            let wanted = format!("{id}{suffix}");
+            steps
+                .iter()
+                .find(|other| other.get("id").and_then(Value::as_str) == Some(wanted.as_str()))
+                .and_then(|other| other.get("with"))
+                .and_then(|with| with.get(key))
+                .cloned()
+        };
+
+        let mut entry = serde_json::Map::new();
+        entry.insert("id".into(), json!(id));
+        entry.insert("action".into(), json!(action));
+        if let Some(window) = borrowed("_window", "window") {
+            entry.insert("window".into(), window);
+        }
+        if let Some(locator) = borrowed("_element", "locator") {
+            entry.insert("finds".into(), locator);
+        }
+
+        let with = step.get("with");
+        for key in ["value", "text"] {
+            let Some(argument) = with.and_then(|with| with.get(key)).and_then(Value::as_str) else {
+                continue;
+            };
+            // A credential is stored as a reference to an input rather than as
+            // text. Reporting the reference says what has to be supplied without
+            // handing the secret to whoever asked what the workflow does.
+            if argument.contains("inputs.") {
+                entry.insert("needsInput".into(), json!(argument));
+            } else {
+                entry.insert("writes".into(), json!(argument));
+            }
+        }
+        actions.push(Value::Object(entry));
+    }
+    actions
 }
 
 /// Whether any step in the document is a script step.
@@ -1243,6 +1354,52 @@ mod tests {
         ]));
         assert_eq!(steps[0]["status"], "incomplete");
         assert!(steps[0].get("error").is_none(), "nothing failed, so no error");
+    }
+
+    #[test]
+    fn reading_a_workflow_back_says_what_it_will_touch() {
+        // Step ids and types do not answer the question asked before running
+        // something. An agent looking at `step_1_window` / `action` has only the
+        // name and a count to decide on, and the three executed steps behind one
+        // recorded action make even the count misleading.
+        let raw = json!({
+            "steps": [
+                {"id": "step_1_window", "uses": "desktop.windows_uia.snapshot@1",
+                 "with": {"window": {"process_name": "msedge.exe", "title": "Fixture"}}},
+                {"id": "step_1_element", "uses": "desktop.windows_uia.find@1",
+                 "with": {"locator": {"role": "edit", "automation_id": "city"}}},
+                {"id": "step_1", "uses": "desktop.windows_uia.set_value@1",
+                 "with": {"value": "Praha"}},
+            ]
+        });
+        let actions = what_it_does(&raw);
+
+        assert_eq!(actions.len(), 1, "one recorded action, not three steps");
+        assert_eq!(actions[0]["action"], "set_value");
+        assert_eq!(actions[0]["window"]["process_name"], "msedge.exe");
+        assert_eq!(actions[0]["finds"]["automation_id"], "city");
+        assert_eq!(actions[0]["writes"], "Praha");
+    }
+
+    #[test]
+    fn a_credential_is_named_rather_than_shown() {
+        // Someone asking what a workflow does is not asking for its password.
+        let raw = json!({
+            "steps": [
+                {"id": "step_1_window", "uses": "desktop.windows_uia.snapshot@1",
+                 "with": {"window": {"process_name": "app.exe"}}},
+                {"id": "step_1_element", "uses": "desktop.windows_uia.find@1",
+                 "with": {"locator": {"role": "edit"}}},
+                {"id": "step_1", "uses": "desktop.windows_uia.set_value@1",
+                 "with": {"value": "${{ inputs.step_1_secret }}"}},
+            ]
+        });
+        let actions = what_it_does(&raw);
+        assert_eq!(actions[0]["needsInput"], "${{ inputs.step_1_secret }}");
+        assert!(
+            actions[0].get("writes").is_none(),
+            "a reference is not a value to write"
+        );
     }
 
     #[test]

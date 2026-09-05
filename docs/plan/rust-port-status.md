@@ -2296,3 +2296,59 @@ invoke     {"role":"button","automation_id":"page-save"}
 
 `list_workflows` 返回 `SavedRecording`（已带 `name`/`path`/`modified`），不是字符串——我原本
 自己去 `stat` 文件并引 `chrono`，都是多余的。CLI 也没有 `chrono` 依赖。
+
+## 2.41 上一轮的反向缺口，与一条误导人的错误消息
+
+### 反向缺口
+
+上一轮给 CLI 做了「说清对哪个窗口做什么」，**MCP 侧没跟上**。实测 AI 调
+`describe_workflow` 只看到：
+
+```
+[{"id": "step_1_window", "type": "action"}, {"id": "step_1_element", "type": "action"}, ...]
+```
+
+决定「要不要跑这个」时手上只有名字和步数，而三步展开还让步数本身有误导性。补上 `actions`
+（保留原有 `steps`，移除会破坏已有客户端）。
+
+### 顺手抓到的三个缺陷
+
+量能力面时看到 `SubmitButton` 报 `stepCount=None`、`runnable=None`——追下去发现三件事。
+
+**第一个是我自己的读法错**：MCP 确实报了 `isError=True` 和错误码，`None` 是我的探针在错误
+载荷里找不到那些键。
+
+**第二个是真缺陷：`issues` 全丢。** `validate` 对一个坏描述符报三条带路径的问题：
+
+```
+$.metadata.name: invalid workflow name
+$.steps[0].type: unsupported step type 'nonsense'
+$.steps: must contain at least one step
+```
+
+而 `save_workflow`、`describe_workflow`、以及**我上一轮刚写的 `explain_workflow`** 都只取了
+code 与 message。`error.issues` 一直都在（`validate` 用着），是三处都把它丢了。**修不了的错误
+报告等于没报。**
+
+**第三个最坏：错误消息把归因说反了。** AI 存一个名字非法的工作流，收到的 hint 是
+
+> 这是组装方式的缺陷，不是你提供的东西的问题，请报告你传的步骤
+
+而真因是 **AI 自己传的名字**。这会让它去报 bug 而不是改名。现在按 issue 的路径归因：
+`$.metadata.name` 下的问题是调用方选的名字，指向名字并给出可行建议——名字规则读
+`is_dotted_name` 得来（小写字母开头，之后只允许小写字母、数字和 `. _ -`，分隔符不相邻不结尾），
+所以建议是具体的：`"submit_button"` 而非 `"SubmitButton"`。
+
+### 一件好消息
+
+同一次实测顺带确认 **`save_workflow` 的「先编译再落盘」正在起作用**：`SubmitButton`、`UPPER`、
+中文名全被拒绝。`SubmitButton` 是历史遗留——GUI 早期存的，那时还没有这道校验。
+
+### 端到端
+
+| 检查 | 结果 |
+| --- | --- |
+| MCP `describe_workflow` | 三个 action 各自带 `finds` / `window` / `writes` |
+| 名字非法的 hint | 指向名字，给出 `submit_button`，**不再让人去报 bug** |
+| `issues` | MCP 保存、MCP 描述、CLI 描述三处都带上了 |
+| 密码 | 仍显示 `needsInput` 而非明文（实测确认） |
