@@ -6,6 +6,7 @@ import {
   Recording,
   resetIds,
   selectorFor,
+  stableTitle,
   type StepDraft,
   type CapturedStep,
 } from "./recording";
@@ -376,11 +377,16 @@ describe("compiling to a workflow", () => {
     recording.add(draft({ window: target, openWindows: [target, rival] }));
 
     const steps = recording.toDescriptor().steps as Record<string, unknown>[];
-    expect((steps[0].with as Record<string, unknown>).window).toEqual({
-      class_name: "EditorClass",
-      process_name: "editor.exe",
-      title: "a.txt - Notepad",
-    });
+    const selector = (steps[0].with as Record<string, unknown>).window as
+      Record<string, string>;
+    expect(selector.class_name).toBe("EditorClass");
+    expect(selector.process_name).toBe("editor.exe");
+    // A title is present and it is what separates the two windows. The exact
+    // fragment is not asserted -- the requirement is that it distinguishes,
+    // and a shorter fragment carries less of whatever the title reports.
+    expect(selector.title).toBeTruthy();
+    expect(target.title.includes(selector.title)).toBe(true);
+    expect(rival.title.includes(selector.title)).toBe(false);
   });
 
   it("distinguishes by process when the class is shared", () => {
@@ -1178,7 +1184,10 @@ describe("addCaptured", () => {
 
     // The class name is volatile so it cannot help, and the process name is
     // shared, so the title is all that is left.
-    expect(added[0].window?.title).toBe("Fixture | clicks=0");
+    const chosen = added[0].window?.title as string;
+    expect(chosen).toBeTruthy();
+    expect(target.title.includes(chosen)).toBe(true);
+    expect(other.title.includes(chosen)).toBe(false);
     expect(added[0].window?.class_name).toBeUndefined();
     expect(added[0].enabled).toBe(true);
   });
@@ -1228,5 +1237,210 @@ describe("addCaptured", () => {
     expect(steps).toHaveLength(3);
     expect(steps[2].uses).toBe("desktop.windows_uia.set_value@1");
     expect((steps[2].with as Record<string, unknown>).value).toBe("Ada");
+  });
+});
+
+describe("a title that carries state", () => {
+  // Replaying with the title as it read at one instant fails with
+  // DRIVER.WINDOW_NOT_FOUND, measured on a fixture whose title reports the last
+  // action. The driver compares with `contains`, so a stable fragment is enough.
+
+  it("keeps only what every observation shared", () => {
+    expect(
+      stableTitle([
+        "AAD Fixture | last=none - Edge",
+        "AAD Fixture | last=save - Edge",
+        "AAD Fixture | last=edit - Edge",
+      ]),
+    ).toBe("AAD Fixture | last=");
+  });
+
+  it("keeps the tail when that is the part that holds still", () => {
+    // The guard against reaching for the first segment: here the first segment
+    // is the file name, which is exactly what changes.
+    const shared = stableTitle([
+      "AGENTS.md - project - Visual Studio Code",
+      "main.rs - project - Visual Studio Code",
+      "Cargo.toml - project - Visual Studio Code",
+    ]);
+    expect(shared).toBe(" - project - Visual Studio Code");
+    expect(shared.startsWith("AGENTS.md")).toBe(false);
+  });
+
+  it("uses the whole title when it never changed", () => {
+    expect(stableTitle(["Calculator", "Calculator"])).toBe("Calculator");
+    expect(stableTitle(["Calculator"])).toBe("Calculator");
+  });
+
+  it("builds the window selector from the shared part", () => {
+    const target = windowInfo({
+      title: "AAD Fixture | last=save - Edge",
+      class_name: "Chrome_WidgetWin_1",
+      process_name: "msedge.exe",
+    });
+    const other = windowInfo({
+      window_id: "hwnd:200",
+      title: "Something else - Edge",
+      class_name: "Chrome_WidgetWin_1",
+      process_name: "msedge.exe",
+    });
+
+    const selector = selectorFor(target, [target, other], [
+      "AAD Fixture | last=none - Edge",
+      "AAD Fixture | last=save - Edge",
+    ]);
+
+    // Both observations shared "AAD Fixture | last=", and within that the
+    // fullest run of whole words that separates the two windows is chosen. The
+    // state was already removed by taking what the observations share, so within
+    // the remainder the fuller phrase is the better name.
+    expect(selector?.title).toBe("AAD Fixture");
+    expect(other.title.includes(selector!.title!)).toBe(false);
+    // The part that was seen changing must not appear at all.
+    expect(selector!.title!.includes("save")).toBe(false);
+    expect(selector!.title!.includes("none")).toBe(false);
+  });
+
+  it("falls back to the full title when the shared part is ambiguous", () => {
+    // Too specific can be corrected by hand; a selector that matches two
+    // windows would act on whichever the platform listed first.
+    const target = windowInfo({ window_id: "hwnd:1", title: "Report - Notes" });
+    const other = windowInfo({ window_id: "hwnd:2", title: "Report - Notes (copy)" });
+
+    const selector = selectorFor(target, [target, other], ["Report", "Report - Notes"]);
+
+    expect(selector).toBeNull();
+  });
+});
+
+describe("restating window selectors when recording stops", () => {
+  beforeEach(() => resetIds());
+
+  it("narrows a selector that was stored before the title had been seen change", () => {
+    // The failure this fixes: the first step of a recording is adopted when only
+    // one title has been observed, so a title carrying state is kept whole and
+    // replay fails with DRIVER.WINDOW_NOT_FOUND.
+    const window = windowInfo({
+      title: "Fixture | last=none - Edge",
+      class_name: "Chrome_WidgetWin_1",
+      process_name: "msedge.exe",
+    });
+    const other = windowInfo({
+      window_id: "hwnd:200",
+      title: "Unrelated - Edge",
+      class_name: "Chrome_WidgetWin_1",
+      process_name: "msedge.exe",
+    });
+    const recording = new Recording();
+    const captured: CapturedStep[] = [
+      { action: "invoke", locator: { role: "button", name: "Save" }, summary: "s" },
+    ];
+
+    // Adopted with a single observation, as really happens.
+    recording.addCaptured(captured, window, [window, other], [window.title], "cap1");
+    expect(recording.steps[0].window?.title).toBe("Fixture | last=none - Edge");
+
+    recording.restateWindows(
+      window,
+      [window, other],
+      ["Fixture | last=none - Edge", "Fixture | last=save - Edge"],
+      "cap1",
+    );
+
+    const narrowed = recording.steps[0].window?.title as string;
+    expect(narrowed).toBe("Fixture");
+    // The state the title reports is gone from the selector, which is the whole
+    // point: replay happens when the window says something else.
+    expect(narrowed.includes("none")).toBe(false);
+    expect(narrowed.includes("save")).toBe(false);
+  });
+
+  it("leaves a hand-corrected step alone", () => {
+    // A step added from the outline carries no recorded title, so there is
+    // nothing to restate and a deliberate choice must not be overwritten.
+    const window = windowInfo({ title: "Fixture - Edge" });
+    const recording = new Recording();
+    recording.add(draft({ window }));
+    const before = recording.steps[0].window;
+
+    recording.restateWindows(
+      window,
+      [window],
+      ["Fixture - Edge", "Other - Edge"],
+      "cap1",
+    );
+
+    expect(recording.steps[0].window).toEqual(before);
+  });
+
+it("leaves steps from an earlier session alone", () => {
+    // Two recordings in one sitting is ordinary. Restating by session marker
+    // rather than by comparing titles is what keeps the earlier one intact --
+    // titles overlap between sessions, session ids do not.
+    // Both windows share class and process so the title is what has to tell
+    // them apart -- otherwise the selector stops at the class name and never
+    // reaches the part under test.
+    const window = windowInfo({
+      title: "Fixture | last=a - Edge",
+      class_name: "Chrome_WidgetWin_1",
+      process_name: "msedge.exe",
+    });
+    const other = windowInfo({
+      window_id: "hwnd:900",
+      title: "Elsewhere - Edge",
+      class_name: "Chrome_WidgetWin_1",
+      process_name: "msedge.exe",
+    });
+    const open = [window, other];
+    const recording = new Recording();
+    const captured: CapturedStep[] = [
+      { action: "invoke", locator: { role: "button", name: "Save" }, summary: "s" },
+    ];
+
+    recording.addCaptured(captured, window, open, [window.title], "first");
+    const untouched = recording.steps[0].window;
+
+    recording.addCaptured(captured, window, open, [window.title], "second");
+    recording.restateWindows(
+      window,
+      open,
+      ["Fixture | last=a - Edge", "Fixture | last=b - Edge"],
+      "second",
+    );
+
+    expect(recording.steps[0].window).toEqual(untouched);
+    expect(recording.steps[1].window?.title).toBe("Fixture");
+  });
+
+  it("disables a step when the window can no longer be told apart", () => {
+    // Measured concern: a window opened during recording can make a selector
+    // that was unambiguous match two windows, and acting on the wrong one is
+    // worse than refusing to run.
+    const window = windowInfo({
+      window_id: "hwnd:1",
+      title: "Report",
+      class_name: null,
+      process_name: "notes.exe",
+    });
+    const twin = windowInfo({
+      window_id: "hwnd:2",
+      title: "Report",
+      class_name: null,
+      process_name: "notes.exe",
+    });
+    const recording = new Recording();
+    recording.addCaptured(
+      [{ action: "invoke", locator: { role: "button", name: "Save" }, summary: "s" }],
+      window,
+      [window],
+      [window.title],
+      "cap1",
+    );
+    expect(recording.steps[0].enabled).toBe(true);
+
+    recording.restateWindows(window, [window, twin], [window.title], "cap1");
+
+    expect(recording.steps[0].window).toBeNull();
+    expect(recording.steps[0].enabled).toBe(false);
   });
 });

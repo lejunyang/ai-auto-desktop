@@ -50,6 +50,13 @@ export interface Step {
    */
   protected?: boolean;
   enabled: boolean;
+  /** The recording session that adopted this step, if it was captured.
+   *
+   * Set only by `addCaptured`. A step added from the outline has none, so
+   * restating a session's window selectors cannot overwrite a deliberate
+   * choice.
+   */
+  capturedIn?: string;
   /**
    * What must become true for this step to count as having worked.
    *
@@ -158,9 +165,82 @@ export function isDurableClassName(className: string | null): boolean {
  * Returns null when even a title cannot distinguish the window, which is a real
  * situation the caller has to surface rather than paper over.
  */
+/** Runs of whole words within a title fragment, shortest first.
+ *
+ * A window selector has to keep working, not merely match right now. Splitting
+ * on whitespace and on the punctuation that titles use as separators keeps
+ * candidates to things a reader would recognise as a name, rather than a letter
+ * that happens to be unique among today's windows.
+ */
+function wordRuns(fragment: string): string[] {
+  // No capture group: the separators are boundaries, not candidates. A run also
+  // has to carry a letter or digit -- "|" on its own distinguishes nothing.
+  const tokens = fragment
+    .split(/[\s|\-–—:：]+/)
+    // A token has to read as a name: it carries a letter or digit and does not
+    // trail off into punctuation. "last=" satisfies neither test in spirit --
+    // it is the prefix of a state label, shared by every observation by
+    // coincidence and worthless for identifying the window.
+    .map((part) => part.replace(/[^\p{L}\p{N}]+$/u, ""))
+    .filter((part) => /[\p{L}\p{N}]/u.test(part));
+  const runs: string[] = [];
+  for (let length = 1; length <= tokens.length; length += 1) {
+    for (let start = 0; start + length <= tokens.length; start += 1) {
+      const run = tokens.slice(start, start + length).join(" ").trim();
+      if (run && fragment.includes(run)) {
+        runs.push(run);
+      }
+    }
+  }
+  // Longest first. Length was tried the other way round and picked "last", a
+  // fragment of a state label that happened to be short -- length says nothing
+  // about identifying value. The reason to prefer a short fragment was to carry
+  // less state, but the caller has already removed the parts observed to change,
+  // so within what remains the fuller phrase is the better name.
+  return runs.sort((a, b) => b.length - a.length);
+}
+
+/** The shortest title fragment every observation shares.
+ *
+ * A window title routinely carries state: the document name and a modified
+ * marker, the page title, an unread count, the last action. Recording the title
+ * as it read at one instant binds the recording to that instant -- measured on
+ * the fixture, replaying with the full title fails with
+ * DRIVER.WINDOW_NOT_FOUND while the stable part succeeds.
+ *
+ * Which part is stable differs by application, so it is observed rather than
+ * guessed. "AGENTS.md - sweepx - Visual Studio Code" keeps its tail and changes
+ * its head; "AAD Complex Fixture | last=save - Edge" keeps its head and changes
+ * its tail. Taking the first segment would pick the file name in the first case,
+ * which is the very part that changes.
+ *
+ * A contiguous run is what is wanted because the driver compares titles with
+ * `contains`.
+ */
+export function stableTitle(observed: string[]): string {
+  const seen = observed.filter((title) => title.length > 0);
+  if (!seen.length) {
+    return "";
+  }
+  if (seen.length === 1) {
+    return seen[0];
+  }
+  const shortest = seen.reduce((a, b) => (a.length <= b.length ? a : b));
+  for (let length = shortest.length; length > 0; length -= 1) {
+    for (let start = 0; start + length <= shortest.length; start += 1) {
+      const candidate = shortest.slice(start, start + length);
+      if (seen.every((title) => title.includes(candidate))) {
+        return candidate;
+      }
+    }
+  }
+  return "";
+}
+
 export function selectorFor(
   target: WindowInfo,
   open: WindowInfo[] = [target],
+  observedTitles: string[] = [],
 ): WindowSelector | null {
   const pool = open.length ? open : [target];
   const matches = (selector: WindowSelector, candidate: WindowInfo): boolean =>
@@ -191,6 +271,42 @@ export function selectorFor(
     return selector;
   }
 
+  // What every observation shared, which bounds how much of the title can be
+  // trusted -- anything outside it was seen to change.
+  const shared = stableTitle(
+    observedTitles.length ? observedTitles : [target.title],
+  );
+
+  // Within that, the shortest run of whole words that still tells this window
+  // from the others. Two failures shape this.
+  //
+  // Taking the longest shared run is wrong: three observations of the fixture
+  // all happened to be edits, so the shared run was
+  // "AAD Complex Fixture | last=edit:", which stopped matching the moment the
+  // window reopened, while "AAD Complex Fixture" kept working and was equally
+  // unambiguous.
+  //
+  // Taking the shortest unique run is also wrong: it picks "F", unique only
+  // because no other window happens to contain that letter today. Whole words
+  // are the boundaries both people and programs recognise, so a fragment is
+  // only considered if it starts and ends on one.
+  // Shortening is only safe once the title has been seen change. With a single
+  // observation nothing is known about which part is state, so guessing short
+  // would be a gamble -- and the two failure modes are not equal: too narrow
+  // fails loudly with DRIVER.WINDOW_NOT_FOUND, whereas a fragment that matches
+  // the wrong window acts on it silently.
+  if (observedTitles.length > 1) {
+    for (const candidate of wordRuns(shared)) {
+      if (isUnique({ ...selector, title: candidate })) {
+        selector.title = candidate;
+        return selector;
+      }
+    }
+  }
+
+  // Nothing within the observed-stable part was enough. Fall back to the full
+  // title: too specific can be corrected by hand, whereas a selector matching
+  // two windows would act on whichever the platform listed first.
   if (target.title) {
     selector.title = target.title;
   }
@@ -299,8 +415,10 @@ export class Recording {
     captured: CapturedStep[],
     window: WindowInfo,
     openWindows: WindowInfo[] = [window],
+    observedTitles: string[] = [],
+    sessionId?: string,
   ): Step[] {
-    const selector = selectorFor(window, openWindows);
+    const selector = selectorFor(window, openWindows, observedTitles);
     return captured.map((source) => {
       const step: Step = {
         id: nextId(),
@@ -312,10 +430,46 @@ export class Recording {
         argument: source.argument ?? undefined,
         protected: source.protected === true,
         enabled: (source.locator ?? null) !== null && selector !== null,
+        // Which recording session adopted this step. `restateWindows` needs to
+        // know that without inferring it from the title, which is exactly the
+        // value that is not stable.
+        capturedIn: sessionId,
       };
       this.steps.push(step);
       return step;
     });
+  }
+
+  /** Rebuild the window selector of every captured step.
+   *
+   * A selector is computed when its step is adopted, which is the moment least
+   * is known: the first step of a recording is stored with a single title
+   * observation, so a title carrying state is kept whole and replay then fails
+   * with DRIVER.WINDOW_NOT_FOUND. The same applies to ambiguity -- a window
+   * opened later can make an earlier selector match two windows.
+   *
+   * Called when recording stops, when the observations are as complete as they
+   * will get.
+   */
+  restateWindows(
+    window: WindowInfo,
+    openWindows: WindowInfo[],
+    observedTitles: string[],
+    sessionId: string,
+  ): void {
+    const selector = selectorFor(window, openWindows, observedTitles);
+    for (const step of this.steps) {
+      // Only the steps this session adopted. Identified by an explicit marker
+      // rather than by comparing titles, since the title is the very thing that
+      // is not stable.
+      if (step.capturedIn !== sessionId) {
+        continue;
+      }
+      step.window = selector;
+      if (selector === null) {
+        step.enabled = false;
+      }
+    }
   }
 
   remove(stepId: string): boolean {

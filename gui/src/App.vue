@@ -44,6 +44,13 @@ interface CaptureState {
   /** Steps adopted during this session, for the counter. */
   adopted: number;
   unresolved: number;
+  /** Every distinct title seen while recording, newest last.
+   *
+   * A title that carries state reveals which part of it is stable only by
+   * changing, so the window selector is built from what the observations share
+   * rather than from the title as it read at one instant.
+   */
+  titles: string[];
 }
 
 const capture = ref<CaptureState | null>(null);
@@ -74,6 +81,11 @@ async function startCapture(): Promise<void> {
       dropped: 0,
       adopted: 0,
       unresolved: 0,
+      // Every poll sees the title again. A title that carries state -- a
+      // document name, an unread count, the last action -- reveals which part
+      // of it is stable only by changing, so the observations are kept and the
+      // window selector is built from what they share.
+      titles: [selected.value!.title],
     };
     // Poll rather than waiting for the end: the buffer is bounded, and the
     // point of recording in a window that is still open is seeing the steps
@@ -91,11 +103,30 @@ async function pollCapture(): Promise<void> {
   try {
     const batch = await bridge.collectRecording(session.captureId);
     session.dropped += batch.dropped;
+    // Read the window list again rather than reusing the one from before
+    // recording started: the title is only observed by looking, and a selector
+    // that was unambiguous then can stop being so once the user opens another
+    // window. `refreshApps` is not reused because it toggles the loading flag,
+    // which would flash a spinner every 700ms.
+    try {
+      windows.value = (await bridge.listApps()).windows;
+    } catch {
+      // A failed refresh is not worth interrupting a recording for; the
+      // observations already gathered still stand.
+    }
+    const live = windows.value.find(
+      (candidate) => candidate.window_id === session.window.window_id,
+    );
+    if (live && !session.titles.includes(live.title)) {
+      session.titles.push(live.title);
+    }
     if (batch.steps.length) {
       const added = recording.addCaptured(
         batch.steps,
         session.window,
         windows.value,
+        session.titles,
+        session.captureId,
       );
       session.adopted += added.length;
       session.unresolved += added.filter((step) => !step.enabled).length;
@@ -124,8 +155,23 @@ async function stopCapture(): Promise<void> {
     // user did immediately before deciding they were finished.
     const batch = await bridge.collectRecording(session.captureId);
     if (batch.steps.length) {
-      recording.addCaptured(batch.steps, session.window, windows.value);
+      recording.addCaptured(
+        batch.steps,
+        session.window,
+        windows.value,
+        session.titles,
+        session.captureId,
+      );
     }
+    // Now that the observations are complete, restate the selectors. The first
+    // step was stored when only one title had been seen, so a title carrying
+    // state was kept whole -- and replaying with it fails outright.
+    recording.restateWindows(
+      session.window,
+      windows.value,
+      session.titles,
+      session.captureId,
+    );
     await bridge.stopRecording(session.captureId);
   });
 }
