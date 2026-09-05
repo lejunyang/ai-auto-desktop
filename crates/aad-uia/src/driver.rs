@@ -82,6 +82,7 @@ impl UiaDriver {
             "list_windows" => self.list_windows(&args),
             "snapshot" => self.snapshot(&args),
             "describe" => self.describe(&args),
+            "overview" => self.overview(&args),
             "find" => self.find(&args),
             "focus" | "invoke" | "set_value" | "type_text" | "pointer_click" => {
                 self.act(action, &args)
@@ -235,7 +236,29 @@ impl UiaDriver {
             .and_then(Value::as_u64)
             .unwrap_or(80)
             .clamp(1, 500) as usize;
-        Ok(self.capture(args)?.outline(limit))
+        let region = args.get("region").and_then(Value::as_str);
+        let snapshot = self.capture(args)?;
+        let answer = snapshot.outline_of(limit, region);
+        // A region name that matches nothing is worth reporting: an agent that
+        // drilled into a misremembered name would otherwise read an empty list
+        // as "that part of the window is empty", which is a different fact.
+        if let Some(wanted) = region {
+            if answer["matched"].as_u64() == Some(0) {
+                let overview = snapshot.overview();
+                return Err(DriverError::new(
+                    "DRIVER.NOT_FOUND",
+                    format!("no region named {wanted:?} in this window"),
+                )
+                .retryable()
+                .with_detail("regions", overview["regions"].clone()));
+            }
+        }
+        Ok(answer)
+    }
+
+    /// The window's regions and their sizes, without listing their contents.
+    fn overview(&self, args: &Value) -> Result<Value> {
+        Ok(self.capture(args)?.overview())
     }
 
     fn find(&self, args: &Value) -> Result<Value> {
@@ -638,6 +661,10 @@ fn action_contracts() -> Map<String, Value> {
     actions.insert(
         "describe".into(),
         read_only("Summarise a window's interactive elements for an agent."),
+    );
+    actions.insert(
+        "overview".into(),
+        read_only("Map a window's regions and their sizes, without their contents."),
     );
     actions.insert(
         "find".into(),

@@ -39,7 +39,9 @@ enum Command {
     /// List running applications and their windows.
     Apps(AppsArgs),
     /// Describe a window's interactive elements.
-    Describe(DescribeArgs),
+    Describe(OutlineArgs),
+    /// Map a window's regions and their sizes, without listing their contents.
+    Overview(DescribeArgs),
     /// Capture a window's full element tree.
     Snapshot(DescribeArgs),
     /// Find the single element matching a locator.
@@ -183,6 +185,19 @@ struct DescribeArgs {
     /// Maximum elements to capture.
     #[arg(long)]
     max_nodes: Option<u32>,
+}
+
+#[derive(Args)]
+struct OutlineArgs {
+    #[command(flatten)]
+    window: DescribeArgs,
+    /// Only list one region, named as `aad overview` reports it.
+    ///
+    /// A separate struct from `snapshot`'s: a region means nothing when asking
+    /// for the whole tree, and a flag that is accepted and then ignored is worse
+    /// than one that does not exist.
+    #[arg(long)]
+    region: Option<String>,
 }
 
 #[derive(Args, Default)]
@@ -484,8 +499,17 @@ fn dispatch(command: &Command) -> (Value, u8) {
             Ok(result)
         }),
         Command::Describe(args) => with_driver(|driver| {
+            let mut arguments = describe_arguments(&args.window);
+            if let Some(region) = args.region.as_deref() {
+                arguments["region"] = json!(region);
+            }
             driver
-                .call("describe", &describe_arguments(args))
+                .call("describe", &arguments)
+                .map_err(|error| driver_failure(&error))
+        }),
+        Command::Overview(args) => with_driver(|driver| {
+            driver
+                .call("overview", &describe_arguments(args))
                 .map_err(|error| driver_failure(&error))
         }),
         Command::Snapshot(args) => with_driver(|driver| {

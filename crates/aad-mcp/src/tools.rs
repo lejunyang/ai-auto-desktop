@@ -135,16 +135,46 @@ Start here: it returns the window_id that every other tool needs.",
             mutating: false,
         },
         Tool {
+            name: "overview_window",
+            description: "Map a window's regions and their sizes without listing \
+their contents. Start here on any window of substance: measured across this \
+desktop, nine windows out of twenty hold more interactive elements than \
+describe_window will return, and the largest holds 367. An overview of a whole \
+window costs about 2000 characters, where listing 500 elements costs 127000. Each \
+region is named as the interface names it -- a file tree, a toolbar, a form panel, \
+a row of a table -- and describe_window takes that name to read one.",
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "window_id": {"type": "string", "description": "From list_apps."}
+                },
+                "required": ["window_id"],
+                "additionalProperties": false
+            }),
+            mutating: false,
+        },
+        Tool {
             name: "describe_window",
             description: "Describe a window's interactive elements, with a target for \
-each one. Use this to see what is on screen before acting.",
+each one. Reading a whole window is only practical when it is small: this returns \
+the first `limit` elements and reports `truncated`, so on a crowded window it \
+shows the top of the tree and never reaches the rest. Call overview_window first \
+and pass one of its regions as `region`.",
             schema: json!({
                 "type": "object",
                 "properties": {
                     "window_id": {"type": "string", "description": "From list_apps."},
+                    "region": {
+                        "type": "string",
+                        "description": "List only this region, named as \
+overview_window reports it. This is the same name a locator carries in `within`, \
+so a region drilled into and a locator written against it agree."
+                    },
                     "limit": {
                         "type": "integer",
-                        "description": "Maximum elements to return (default 80).",
+                        "description": "Maximum elements to return (default 80). \
+Check `truncated` and `matched` in the answer: `matched` says how many were \
+eligible, so it tells you whether raising this would show more.",
                         "minimum": 1, "maximum": 500
                     }
                 },
@@ -363,6 +393,7 @@ pub fn call(driver: &Arc<UiaDriver>, name: &str, arguments: &Value) -> Result<Va
 
     let action = match name {
         "list_apps" => "list_windows",
+        "overview_window" => "overview",
         "describe_window" => "describe",
         "find_element" => "find",
         "focus" | "invoke" | "set_value" | "type_text" | "pointer_click" => name,
@@ -605,6 +636,65 @@ what it does support.",
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_crowded_window_can_be_read_in_two_steps() {
+        let tools = catalogue();
+
+        let overview = tools
+            .iter()
+            .find(|tool| tool.name == "overview_window")
+            .expect("an agent needs a way to see a window's shape before its contents");
+        assert!(!overview.mutating, "mapping a window changes nothing");
+        let properties = &overview.schema["properties"];
+        assert!(
+            properties.get("limit").is_none(),
+            "an overview does not list elements, so a limit would mean nothing"
+        );
+
+        // The description has to carry the reason, because the schema is all an
+        // agent reads. Measured: 9 of 20 windows here exceed the default limit.
+        assert!(
+            overview.description.contains("367") || overview.description.contains("twenty"),
+            "say how crowded real windows get: {:?}",
+            overview.description
+        );
+
+        let describe = tools
+            .iter()
+            .find(|tool| tool.name == "describe_window")
+            .expect("describe_window");
+        assert!(
+            describe.description.contains("overview_window"),
+            "describe_window must point at the overview, or an agent will keep \
+hitting truncation without knowing there is another way: {:?}",
+            describe.description
+        );
+        assert!(
+            describe.schema["properties"].get("region").is_some(),
+            "and it must accept the region name the overview hands out"
+        );
+    }
+
+    #[test]
+    fn a_region_name_means_the_same_thing_everywhere() {
+        // Deliberately not a new selector language: the name the overview reports
+        // is the ancestor name a locator carries in `within`. If the schemas
+        // described these as different things an agent would learn two.
+        let tools = catalogue();
+        let describe = tools
+            .iter()
+            .find(|tool| tool.name == "describe_window")
+            .expect("describe_window");
+        let region = describe.schema["properties"]["region"]["description"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            region.contains("within"),
+            "tell the agent the two agree: {region:?}"
+        );
+    }
+
     use super::*;
 
     #[test]

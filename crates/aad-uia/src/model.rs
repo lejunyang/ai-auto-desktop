@@ -219,12 +219,279 @@ impl Snapshot {
         })
     }
 
+    /// Whether an element is something an agent could choose, rather than a box
+    /// the layout happens to put around one.
+    ///
+    /// The platform marks almost everything actionable: of 131 nodes in one
+    /// window, 124 report `invoke`, including every anonymous `pane` in the
+    /// chain from the root down to the page. Filtering on the action set removes
+    /// nothing at all -- measured, and it was the first thing tried.
+    ///
+    /// What separates a control from a wrapper is whether it can be named. An
+    /// anonymous container cannot be asked for, and does not need to be: its
+    /// children are listed in their own right. Dropping them removes 12% of the
+    /// reported elements across this desktop.
+    ///
+    /// Except when nothing inside survives -- 4 containers here have no nameable
+    /// descendant, and omitting those would leave that part of the window with no
+    /// way in at all. Reachability comes before tidiness.
+    fn worth_offering(&self, node: &Node) -> bool {
+        // Anonymous nodes inside a document or a text field are the content being
+        // edited, not controls: VS Code reports every code token as an actionable
+        // `group`, 47 of them in one window. Judged by where they sit rather than
+        // by role -- on the real web page a `group` is a genuine container, and
+        // excluding the role outright removed nothing there while removing the
+        // controls elsewhere.
+        if node.name.as_deref().unwrap_or("").is_empty() && self.sits_in_content(node) {
+            return false;
+        }
+        if !node.name.as_deref().unwrap_or("").is_empty() {
+            return true;
+        }
+        let children: Vec<&Node> = self
+            .nodes
+            .iter()
+            .filter(|other| other.parent_id.as_deref() == Some(node.node_id.as_str()))
+            .collect();
+        if children.is_empty() {
+            // Anonymous, but the only thing there is. Keeping it is the honest
+            // choice: an agent can still reach it by position or by role.
+            return true;
+        }
+        // A wrapper is only skippable while something inside it can be offered
+        // instead.
+        !self.encloses_anything_offerable(node)
+    }
+
+    /// Whether this node lives inside something whose contents are text.
+    ///
+    /// A document or an editable field holds material the user typed, and its
+    /// internal structure is the renderer's business. The field itself stays
+    /// offerable -- it is named and it accepts `set_value`; what is dropped is
+    /// the anonymous scaffolding beneath it.
+    fn sits_in_content(&self, node: &Node) -> bool {
+        let mut current = node.parent_id.clone();
+        let mut hops = 0usize;
+        while let Some(id) = current {
+            if hops >= MAX_ANCESTRY_DEPTH {
+                break;
+            }
+            hops += 1;
+            let Some(parent) = self.nodes.iter().find(|other| other.node_id == id) else {
+                break;
+            };
+            if matches!(parent.role.as_str(), "document" | "edit") {
+                return true;
+            }
+            current = parent.parent_id.clone();
+        }
+        false
+    }
+
+    /// Whether any descendant of this node would be offered on its own.
+    fn encloses_anything_offerable(&self, node: &Node) -> bool {
+        let mut stack = vec![node.node_id.clone()];
+        let mut seen = 0usize;
+        while let Some(id) = stack.pop() {
+            if seen >= MAX_ANCESTRY_DEPTH * MAX_ANCESTRY_DEPTH {
+                break;
+            }
+            seen += 1;
+            for child in self
+                .nodes
+                .iter()
+                .filter(|other| other.parent_id.as_deref() == Some(id.as_str()))
+            {
+                let usable = !child.actions.is_empty() && child.states.offscreen != Some(true);
+                if usable && !child.name.as_deref().unwrap_or("").is_empty() {
+                    return true;
+                }
+                stack.push(child.node_id.clone());
+            }
+        }
+        false
+    }
+
+    /// How many regions an overview names before folding the rest away.
+    ///
+    /// Measured across ten real windows: the largest four regions hold 54% of the
+    /// interactive elements, eight hold 65%, twelve 70%, and twenty 77%. Twelve
+    /// is where the curve has flattened -- past it each extra region buys about
+    /// one percent, which is not worth the reading.
+    const OVERVIEW_REGIONS: usize = 12;
+
+    /// A map of the window's regions, rather than a list of its elements.
+    ///
+    /// `outline` truncates: it takes the first `limit` elements in tree order, so
+    /// on a window with 367 of them an agent sees the top of the tree and never
+    /// learns the bottom exists. Raising the limit is not the answer either --
+    /// each element costs around 330 characters, so 500 of them is 127KB.
+    ///
+    /// What makes this tractable is that the elements group tightly: naming each
+    /// one by its nearest named ancestor produces regions like "文件资源管理器"
+    /// (35 elements), "活动视图切换器" (23) or "Billing address" (6) -- the names
+    /// the interface itself uses. So an overview names the regions and their
+    /// sizes, and an agent asks for one by name.
+    ///
+    /// The long tail is folded rather than listed: 65% of regions hold a single
+    /// element but only 17% of the elements between them, so spelling them out
+    /// would be mostly noise. They are counted, never silently dropped.
+    pub fn overview(&self) -> Value {
+        let mut regions: Vec<(String, Vec<&Node>)> = Vec::new();
+        let mut index: std::collections::HashMap<String, usize> = Default::default();
+
+        for node in self.nodes.iter().filter(|node| {
+            !node.actions.is_empty()
+                && node.states.offscreen != Some(true)
+                // The window itself is not one of its own elements.
+                && self.root_id.as_deref() != Some(node.node_id.as_str())
+                && self.worth_offering(node)
+        }) {
+            let label = self.region_of(node);
+            match index.get(&label) {
+                Some(at) => regions[*at].1.push(node),
+                None => {
+                    index.insert(label.clone(), regions.len());
+                    regions.push((label, vec![node]));
+                }
+            }
+        }
+
+        // Largest first: an agent scanning this wants the substantial parts of
+        // the window before the incidental ones.
+        regions.sort_by_key(|(_, members)| std::cmp::Reverse(members.len()));
+
+        let (named, folded) = regions.split_at(Self::OVERVIEW_REGIONS.min(regions.len()));
+        let described: Vec<Value> = named
+            .iter()
+            .map(|(label, members)| {
+                let mut roles: std::collections::BTreeMap<&str, usize> = Default::default();
+                for node in members {
+                    *roles.entry(node.role.as_str()).or_default() += 1;
+                }
+                json!({
+                    "region": label,
+                    "elements": members.len(),
+                    // What kind of thing is in there, so an agent can tell a
+                    // toolbar from a list of files without opening it.
+                    "holds": roles
+                        .iter()
+                        .map(|(role, count)| json!({"role": role, "count": count}))
+                        .collect::<Vec<_>>(),
+                })
+            })
+            .collect();
+
+        json!({
+            "snapshot_id": self.snapshot_id,
+            "revision": self.revision,
+            "window": self.window.to_json(),
+            "node_count": self.nodes.len(),
+            "interactive": regions.iter().map(|(_, m)| m.len()).sum::<usize>(),
+            "regions": described,
+            // Named so it is obvious these were not lost. Reading them takes a
+            // second call, which is the point.
+            "folded_regions": folded.len(),
+            "folded_elements": folded.iter().map(|(_, m)| m.len()).sum::<usize>(),
+        })
+    }
+
+    /// Whether a container's name is just the window's title again.
+    ///
+    /// Not equality: a browser appends its brand to the title while the pane
+    /// inside carries the bare version, and an editor prepends the file name, so
+    /// the two differ by a suffix or a prefix in practice. Measured on this
+    /// desktop: Edge reports a window title of "AAD Complex Fixture | last=none
+    /// - 个人 - Microsoft Edge" around a pane named "AAD Complex Fixture |
+    /// last=none".
+    ///
+    /// A floor is still needed, or a two-character region would match any title
+    /// starting with those letters.
+    fn restates_window(&self, name: &str) -> bool {
+        let title = self.window.title.as_str();
+        if name == title {
+            return true;
+        }
+
+        // Substring containment is not enough. Measured on one Edge window, the
+        // same page is announced four ways -- the window adds "- 个人 -
+        // Microsoft<ZWSP> Edge", an inner pane adds "- Microsoft Edge", a tab
+        // item adds "- 内存使用率 - 28.2 MB", and the document adds nothing. Only
+        // the last is a substring of the title; the others each replace the tail.
+        //
+        // What they share is the beginning, which is the same thing the window
+        // selector had to rely on: an application keeps the identifying part in
+        // front and varies what follows.
+        let shared: usize = name
+            .chars()
+            .zip(title.chars())
+            .take_while(|(left, right)| left == right)
+            .count();
+        let shorter = name.chars().count().min(title.chars().count());
+        if shorter < MIN_TITLE_ECHO {
+            return false;
+        }
+        // A proportion rather than a character count: a fixed number is too
+        // strict for short titles and too lax for long ones.
+        shared * 100 >= shorter * TITLE_ECHO_PERCENT
+    }
+
+    /// Which region an element belongs to.
+    ///
+    /// The nearest named ancestor, stopping short of the window itself: the
+    /// window's own title would put everything in one region and say nothing.
+    /// Elements with no named ancestor are grouped under the window, which is
+    /// honest -- they really are loose in it.
+    fn region_of(&self, node: &Node) -> String {
+        let mut current = node.parent_id.clone();
+        let mut hops = 0usize;
+        while let Some(id) = current {
+            if hops >= MAX_ANCESTRY_DEPTH {
+                break;
+            }
+            hops += 1;
+            let Some(parent) = self.nodes.iter().find(|other| other.node_id == id) else {
+                break;
+            };
+            // The root by identity rather than by `depth == 0`: depth is derived
+            // during capture, while `root_id` is what the snapshot actually
+            // recorded. Judging identity from a derived value fails silently
+            // wherever the derivation did not run.
+            if self.root_id.as_deref() == Some(parent.node_id.as_str()) {
+                break;
+            }
+            if let Some(name) = parent.name.as_deref().filter(|text| !text.is_empty()) {
+                // A container repeating the window's own title is the window
+                // under another name, not a region within it. Chromium and VS
+                // Code both hang the title on inner panes and documents, so
+                // skipping only the root node does not catch them -- and a title
+                // often carries changing state, which would make the region name
+                // itself unstable.
+                if !self.restates_window(name) {
+                    return name.to_string();
+                }
+            }
+            current = parent.parent_id.clone();
+        }
+        LOOSE_IN_WINDOW.to_string()
+    }
+
     /// A compact outline for an agent, without the full node payloads.
     ///
     /// Elements that cannot be perceived or acted upon are omitted, because an
     /// agent choosing from this list should only see real options.
     pub fn outline(&self, limit: usize) -> Value {
-        let interesting: Vec<Value> = self
+        self.outline_of(limit, None)
+    }
+
+    /// The same outline, restricted to one region named by `overview`.
+    ///
+    /// Deliberately not a new kind of selector: `overview` names regions by the
+    /// same ancestor name that `synthesize` puts in a locator's `within`, so an
+    /// agent that drills into "Billing address" and one that writes
+    /// `within: {name: "Billing address"}` are talking about the same thing.
+    pub fn outline_of(&self, limit: usize, region: Option<&str>) -> Value {
+        let eligible: Vec<&Node> = self
             .nodes
             .iter()
             .filter(|node| {
@@ -232,6 +499,19 @@ impl Snapshot {
                     || node.name.as_ref().is_some_and(|text| !text.is_empty())
             })
             .filter(|node| node.states.offscreen != Some(true))
+            .filter(|node| self.worth_offering(node))
+            .filter(|node| match region {
+                Some(wanted) => self.region_of(node) == wanted,
+                None => true,
+            })
+            .collect();
+        // Counted before the limit applies, so "there are more" can be told from
+        // "that is all of them" -- the previous calculation compared what was
+        // shown against every node in the tree, so filtering out the parts an
+        // agent cannot act on also reported as truncation.
+        let matched = eligible.len();
+        let interesting: Vec<Value> = eligible
+            .into_iter()
             .take(limit)
             .map(|node| {
                 json!({
@@ -258,17 +538,43 @@ impl Snapshot {
             })
             .collect();
 
-        json!({
+        let mut answer = json!({
             "snapshot_id": self.snapshot_id,
             "revision": self.revision,
             "window": self.window.to_json(),
             "node_count": self.nodes.len(),
             "shown": interesting.len(),
-            "truncated": self.truncated || interesting.len() < self.nodes.len(),
+            // How many were eligible, so a caller can tell whether raising the
+            // limit would show more, and by how much.
+            "matched": matched,
+            "truncated": self.truncated || interesting.len() < matched,
             "elements": interesting,
-        })
+        });
+        if let Some(wanted) = region {
+            answer["region"] = json!(wanted);
+        }
+        answer
     }
 }
+
+/// How long a name must be before a shared prefix means anything.
+///
+/// Short names collide by accident; long ones do not.
+const MIN_TITLE_ECHO: usize = 12;
+
+/// What proportion of the shorter name must match from the start.
+///
+/// The real echoes here share 31 of 48 and 31 of 49 characters -- around 63% --
+/// while genuine regions on the same desktop ("文件资源管理器", "应用栏",
+/// "Billing address") share nothing with their window's title at all. Set below
+/// the observed echoes and far above the genuine regions.
+const TITLE_ECHO_PERCENT: usize = 55;
+
+/// The region an element with no named ancestor is filed under.
+///
+/// Not a real container: these elements sit directly in the window with nothing
+/// naming them. Saying so beats inventing a grouping.
+pub const LOOSE_IN_WINDOW: &str = "(loose in the window)";
 
 /// A reference to one node inside a specific snapshot revision.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -2440,6 +2746,325 @@ mod tests {
         );
 
         assert!(found.is_empty(), "got {found:?}");
+    }
+
+    /// A window shaped like the ones measured here: a few named regions plus a
+    /// container echoing the window's own title.
+    fn windowed(nodes: Vec<Node>, title: &str) -> Snapshot {
+        Snapshot {
+            snapshot_id: "s1".into(),
+            revision: 1,
+            window: WindowInfo {
+                window_id: "w1".into(),
+                title: title.to_string(),
+                process_id: 1,
+                process_name: Some("app.exe".into()),
+                class_name: None,
+                bounds: None,
+                is_foreground: true,
+                is_minimized: false,
+            },
+            nodes,
+            root_id: Some("root".into()),
+            captured_at: "2026-01-01T00:00:00Z".into(),
+            truncated: false,
+        }
+    }
+
+    #[test]
+    fn an_anonymous_wrapper_is_skipped_but_never_at_the_cost_of_reaching_inside() {
+        // The platform marks nearly everything actionable: of 131 nodes in one
+        // window, 124 report `invoke`, so filtering on the action set removes
+        // nothing -- that was tried first and measured at 0%. What separates a
+        // control from a wrapper is whether it can be named at all.
+        let mut nodes = vec![node_at("root", "window", Some("App"), None, None)];
+        let mut wrapper = node_at("wrap", "pane", None, Some("root"), None);
+        wrapper.depth = 1;
+        nodes.push(wrapper);
+        let mut button = node_at("b", "button", Some("Save"), Some("wrap"), None);
+        button.depth = 2;
+        nodes.push(button);
+        let snapshot = windowed(nodes, "App");
+
+        let shown = snapshot.outline(80);
+        let listed: Vec<String> = shown["elements"]
+            .as_array()
+            .expect("elements")
+            .iter()
+            .map(|entry| entry["node_id"].as_str().unwrap_or_default().to_string())
+            .collect();
+        assert!(
+            listed.iter().any(|id| id == "b"),
+            "the button is a real option: {listed:?}"
+        );
+        assert!(
+            !listed.iter().any(|id| id == "wrap"),
+            "the wrapper cannot be asked for and need not be: {listed:?}"
+        );
+
+        // But a wrapper with nothing nameable inside is the only way in, so it
+        // stays. Four such containers exist on this desktop, and omitting them
+        // would leave those parts of the window unreachable.
+        let mut lone = vec![node_at("root", "window", Some("App"), None, None)];
+        let mut sealed = node_at("sealed", "pane", None, Some("root"), None);
+        sealed.depth = 1;
+        lone.push(sealed);
+        let mut inner = node_at("inner", "pane", None, Some("sealed"), None);
+        inner.depth = 2;
+        lone.push(inner);
+
+        let sealed_view = windowed(lone, "App").outline(80);
+        let survivors: Vec<String> = sealed_view["elements"]
+            .as_array()
+            .expect("elements")
+            .iter()
+            .map(|entry| entry["node_id"].as_str().unwrap_or_default().to_string())
+            .collect();
+        assert!(
+            survivors.iter().any(|id| id == "sealed"),
+            "reachability comes before tidiness: {survivors:?}"
+        );
+    }
+
+    #[test]
+    fn the_text_being_edited_is_not_a_list_of_controls() {
+        // VS Code reports every code token inside its editor as an actionable
+        // anonymous `group` -- 47 of them in one window, crowding out the actual
+        // controls. Judged by position, not by role: on the real web page a
+        // `group` is a genuine container, and excluding the role wholesale
+        // removed nothing there while removing controls elsewhere.
+        let mut nodes = vec![node_at("root", "window", Some("Editor"), None, None)];
+        let mut field = node_at("field", "edit", Some("Message"), Some("root"), None);
+        field.depth = 1;
+        field.actions = vec!["set_value".into(), "invoke".into()];
+        nodes.push(field);
+        for index in 0..3 {
+            let mut token = node_at(
+                &format!("tok{index}"),
+                "group",
+                None,
+                Some("field"),
+                None,
+            );
+            token.depth = 2;
+            nodes.push(token);
+        }
+        // A control that happens to be a group, outside any content host.
+        let mut panel = node_at("panel", "group", Some("Options"), Some("root"), None);
+        panel.depth = 1;
+        nodes.push(panel);
+        let snapshot = windowed(nodes, "Editor");
+
+        let shown = snapshot.outline(80);
+        let listed: Vec<String> = shown["elements"]
+            .as_array()
+            .expect("elements")
+            .iter()
+            .map(|entry| entry["node_id"].as_str().unwrap_or_default().to_string())
+            .collect();
+
+        assert!(
+            listed.iter().any(|id| id == "field"),
+            "the field itself is offerable -- it is named and takes a value: {listed:?}"
+        );
+        assert!(
+            listed.iter().any(|id| id == "panel"),
+            "a named group outside a content host is a control: {listed:?}"
+        );
+        for index in 0..3 {
+            let token = format!("tok{index}");
+            assert!(
+                !listed.iter().any(|id| *id == token),
+                "{token} is the text being edited: {listed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_overview_names_regions_instead_of_listing_every_element() {
+        // `outline` takes the first `limit` elements in tree order, so on a
+        // window with 367 of them an agent reads the top of the tree and never
+        // learns the bottom exists. Raising the limit costs 330 characters an
+        // element. Naming the regions costs about 2000 characters for a whole
+        // window.
+        let mut nodes = vec![node_at("root", "window", Some("App"), None, None)];
+        for (region, count) in [("Billing address", 4), ("Delivery address", 3)] {
+            let mut container = node_at(region, "group", Some(region), Some("root"), None);
+            container.depth = 1;
+            // A container, not a control: measured on the real page, the
+            // "Billing address" group carries no actions of its own.
+            container.actions.clear();
+            nodes.push(container);
+            for index in 0..count {
+                let mut field = node_at(
+                    &format!("{region}{index}"),
+                    "edit",
+                    Some("City"),
+                    Some(region),
+                    None,
+                );
+                field.actions = vec!["set_value".into()];
+                field.depth = 2;
+                nodes.push(field);
+            }
+        }
+        let snapshot = windowed(nodes, "App");
+
+        let overview = snapshot.overview();
+        let regions: Vec<(&str, u64)> = overview["regions"]
+            .as_array()
+            .expect("regions")
+            .iter()
+            .map(|entry| {
+                (
+                    entry["region"].as_str().unwrap_or_default(),
+                    entry["elements"].as_u64().unwrap_or_default(),
+                )
+            })
+            .collect();
+
+        // Largest first, so the substantial parts of the window come before the
+        // incidental ones.
+        assert_eq!(
+            regions,
+            vec![("Billing address", 4), ("Delivery address", 3)]
+        );
+        assert_eq!(overview["interactive"], 7);
+    }
+
+    #[test]
+    fn a_container_echoing_the_window_title_is_not_a_region() {
+        // Measured on one Edge window: the same page is announced four ways --
+        // the window adds "- 个人 - Microsoft<ZWSP> Edge", an inner pane adds
+        // "- Microsoft Edge", a tab item adds "- 内存使用率 - 28.2 MB", and the
+        // document adds nothing. Only the document is a substring of the title,
+        // so containment alone let the pane through as a region -- named after a
+        // title that changes with every action.
+        let title = "AAD Complex Fixture | last=none - 个人 - Microsoft Edge";
+        let mut nodes = vec![node_at("root", "window", Some(title), None, None)];
+        let mut pane = node_at(
+            "pane",
+            "pane",
+            Some("AAD Complex Fixture | last=none - Microsoft Edge"),
+            Some("root"),
+            None,
+        );
+        pane.actions.clear();
+        nodes.push(pane);
+        let mut button = node_at("b", "button", Some("Save"), Some("pane"), None);
+        button.actions = vec!["invoke".into()];
+        nodes.push(button);
+        let snapshot = windowed(nodes, title);
+
+        let overview = snapshot.overview();
+        let named: Vec<&str> = overview["regions"]
+            .as_array()
+            .expect("regions")
+            .iter()
+            .map(|entry| entry["region"].as_str().unwrap_or_default())
+            .collect();
+
+        assert_eq!(
+            named,
+            vec![LOOSE_IN_WINDOW],
+            "the pane restates the window, so its element is loose in it"
+        );
+
+        // And a genuine region sharing no prefix with the title stays a region.
+        let mut with_toolbar = snapshot.nodes.clone();
+        let mut bar = node_at("bar", "tool_bar", Some("应用栏"), Some("root"), None);
+        bar.actions.clear();
+        with_toolbar.push(bar);
+        let mut item = node_at("i", "button", Some("New"), Some("bar"), None);
+        item.actions = vec!["invoke".into()];
+        with_toolbar.push(item);
+        let regions = windowed(with_toolbar, title).overview();
+        let names: Vec<&str> = regions["regions"]
+            .as_array()
+            .expect("regions")
+            .iter()
+            .map(|entry| entry["region"].as_str().unwrap_or_default())
+            .collect();
+        assert!(names.contains(&"应用栏"), "got {names:?}");
+    }
+
+    #[test]
+    fn truncation_means_something_was_cut_not_merely_filtered() {
+        // The old calculation compared what was shown against every node in the
+        // tree, so filtering out the parts an agent cannot act on also reported
+        // truncation: a window of 23 nodes showing all 18 of its usable ones
+        // still said truncated. An agent cannot tell "I filtered noise" from "I
+        // cut what you asked for", and those call for different responses.
+        let mut nodes = vec![node_at("root", "window", Some("App"), None, None)];
+        for index in 0..3 {
+            let mut button = node_at(
+                &format!("b{index}"),
+                "button",
+                Some("Go"),
+                Some("root"),
+                None,
+            );
+            button.actions = vec!["invoke".into()];
+            nodes.push(button);
+        }
+        // Something unusable, which should be filtered without counting as a cut.
+        let mut void = node_at("void", "pane", None, Some("root"), None);
+        void.actions.clear();
+        nodes.push(void);
+        let snapshot = windowed(nodes, "App");
+
+        let complete = snapshot.outline(80);
+        assert_eq!(complete["truncated"], false, "nothing was cut: {complete}");
+        assert_eq!(complete["matched"], complete["shown"]);
+
+        let cut = snapshot.outline(2);
+        assert_eq!(cut["truncated"], true);
+        assert_eq!(cut["shown"], 2);
+        assert!(
+            cut["matched"].as_u64().unwrap() > 2,
+            "and it says how many there were"
+        );
+    }
+
+    #[test]
+    fn drilling_into_a_region_reuses_the_name_the_overview_gave() {
+        // Deliberately not a new kind of selector: the region name is the same
+        // ancestor name `synthesize` puts in a locator's `within`, so an agent
+        // that drills into "Billing address" and one that writes
+        // `within: {name: "Billing address"}` mean the same thing.
+        let mut nodes = vec![node_at("root", "window", Some("App"), None, None)];
+        for (region, label) in [("Billing address", "City"), ("Delivery address", "Zip")] {
+            let mut container = node_at(region, "group", Some(region), Some("root"), None);
+            container.actions.clear();
+            nodes.push(container);
+            let mut field = node_at(
+                &format!("{region}f"),
+                "edit",
+                Some(label),
+                Some(region),
+                None,
+            );
+            field.actions = vec!["set_value".into()];
+            nodes.push(field);
+        }
+        let snapshot = windowed(nodes, "App");
+
+        let drilled = snapshot.outline_of(80, Some("Billing address"));
+        assert_eq!(drilled["region"], "Billing address");
+        let names: Vec<&str> = drilled["elements"]
+            .as_array()
+            .expect("elements")
+            .iter()
+            .map(|entry| entry["summary"].as_str().unwrap_or_default())
+            .collect();
+        assert!(
+            names.iter().any(|summary| summary.contains("City")),
+            "got {names:?}"
+        );
+        assert!(
+            !names.iter().any(|summary| summary.contains("Zip")),
+            "the other region's field must not appear: {names:?}"
+        );
     }
 
     #[test]
