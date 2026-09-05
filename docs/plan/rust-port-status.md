@@ -1783,3 +1783,53 @@ assertion `left == right` failed: the row that was clicked, not the first namesa
 消歧生效后真实情况才暴露出来。）
 
 Rust 600 passed。
+
+## 2.35 描述性 locator 对 AI 是不可见的
+
+`within`、`near`、`nth` 在内核、CLI 和 GUI 编辑器里都能用，但 MCP 的 locator schema 里
+没有它们。AI 只能看到 schema，看不到的东西它不会用——所以面对五个同名 `Edit` 按钮，它拿到
+`{role, name}` 的歧义报错，而**收窄所需的字段它并不知道存在**。
+
+先测服务端是否真的拒收，因为这决定要写实现还是写 schema：实测 `within` 与 `nth: 3` 都命中
+e126，功能是好的。**但 schema 上写着 `additionalProperties: false`**，所以任何按 schema
+做校验的客户端会把这些调用整个拒掉——对那类客户端这不是发现性问题而是硬阻断。
+
+### schema 要说的不只是字段名
+
+字段描述按实测数据给出取舍依据，而不是罗列语法：`within` 优先（行的名字跨重启稳定，序数会
+因插入一行而漂）；`nth` 是最后手段（浏览器里 UIA 报的 36 个 button 只有 3 个属于页面）。
+
+一条测试断言这些描述超过 40 字符：一个 AI 无法判断何时该用的字段，就是它会用错的字段。
+
+另加一条：`near.anchor` 与 `within` 接受嵌套 locator，所以刻意开放。既有的
+`no_tool_accepts_raw_screen_coordinates` 只读顶层 properties，放宽嵌套就等于给坐标开了
+后门，于是把这条约束改成递归走完整棵 schema。
+
+### 两处把 AI 引向错误方向的措辞
+
+**歧义 hint 推荐的正是没用的两个字段。** 原文是"加 automation_id 或 role"——而元素之所以
+冲突，通常恰恰因为这两个已经相同：五个 Edit 按钮 role 一样、automation_id 全空。改成按
+"扛不扛得住界面变化"排序推荐 `within` → `near` → `nth`。
+
+原测试断言 hint 含 "narrow" 一词，**旧 hint 也含这个词**，所以它防不住这次的问题。改成断言
+hint 真的提到三种可用手段。
+
+**锚点歧义看起来像目标不存在。** `near` 在锚点歧义、锚点无位置、真的没有邻居三种情况下都
+返回空 `Vec`，驱动一律报 `DRIVER.NOT_FOUND`。这个 fixture 有两个写着 `City` 的标签
+（billing 与 delivery 各一个），在真实界面里再普通不过。AI 收到"没有匹配"会去猜别的
+locator，而它真正该做的是给锚点加个容器。
+
+加 `AnchorProblem` 与 `Proximity::why_empty`，只在失败后单独问一次——`filter` 在每次
+resolve 的热路径上，改它的返回类型会波及所有调用点，而这个解释只在出错时才需要。
+
+现在 AI 收到的是：
+
+```
+no element matched the locator: its anchor matched 2 elements (e88, e94),
+so there is no single place to measure from -- narrow the anchor, for
+instance by putting it inside a container
+```
+
+照这句话给锚点加容器，就分别得到 `billing-city`(e89) 与 `delivery-city`(e95)。
+
+Rust 604 passed。

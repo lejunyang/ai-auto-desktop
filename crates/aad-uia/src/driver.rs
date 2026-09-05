@@ -299,7 +299,21 @@ impl UiaDriver {
             }
             return Err(DriverError::new(
                 "DRIVER.NOT_FOUND",
-                "no element matched the locator",
+                match locator
+                    .near
+                    .as_ref()
+                    .and_then(|near| near.why_empty(&snapshot.nodes))
+                {
+                    // A proximity constraint that found nothing is reported as
+                    // "no element matched", which sends a caller off to guess a
+                    // different locator when the anchor is what needs narrowing.
+                    // A page with a billing and a delivery address has two
+                    // labels reading "City", so this is ordinary.
+                    Some(problem) => {
+                        format!("no element matched the locator: {}", problem.describe())
+                    }
+                    None => "no element matched the locator".to_string(),
+                },
             )
             .retryable()
             .with_detail("snapshot_id", json!(snapshot.snapshot_id))

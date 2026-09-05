@@ -1131,6 +1131,38 @@ impl Locator {
     }
 }
 
+/// What was wrong with a proximity constraint's anchor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AnchorProblem {
+    /// Nothing matched the anchor locator.
+    NotFound,
+    /// Several elements matched, so which one to measure from is undecidable.
+    Ambiguous(Vec<String>),
+    /// The anchor exists but the platform reports no rectangle for it.
+    NoPosition,
+}
+
+impl AnchorProblem {
+    /// Wording aimed at whoever has to fix the locator.
+    pub fn describe(&self) -> String {
+        match self {
+            Self::NotFound => "its anchor matched nothing".to_string(),
+            Self::Ambiguous(ids) => format!(
+                "its anchor matched {} elements ({}), so there is no single \
+place to measure from -- narrow the anchor, for instance by putting it inside a \
+container",
+                ids.len(),
+                ids.join(", ")
+            ),
+            Self::NoPosition => {
+                "its anchor has no position on screen, so nothing can be measured \
+from it"
+                    .to_string()
+            }
+        }
+    }
+}
+
 impl Proximity {
     /// Keep the candidates that sit in the requested direction from the anchor,
     /// nearest first.
@@ -1139,6 +1171,33 @@ impl Proximity {
     /// back to the unfiltered candidates: "the field next to Username" with no
     /// Username on screen is a failed lookup, and quietly dropping the
     /// constraint would act on an arbitrary field instead.
+    /// Why a proximity constraint found nothing, when it found nothing.
+    ///
+    /// `filter` collapses three different situations into an empty result: an
+    /// anchor that matched several elements, an anchor with no position to
+    /// measure from, and an anchor that simply has no neighbour in that
+    /// direction. The caller reports `NOT_FOUND` for all three, which sends an
+    /// agent off to guess a different locator when what it actually needs is to
+    /// narrow the anchor -- a page with a billing and a delivery address has two
+    /// labels reading "City", and that is ordinary rather than unusual.
+    ///
+    /// Kept separate from `filter` rather than changing its return type: it sits
+    /// on the hot path of every resolve, and this explanation is only wanted
+    /// once, after something already went wrong.
+    pub fn why_empty(&self, nodes: &[Node]) -> Option<AnchorProblem> {
+        let anchors = self.anchor.resolve(nodes);
+        match anchors[..] {
+            [] => Some(AnchorProblem::NotFound),
+            [single] => single
+                .bounds
+                .is_none()
+                .then_some(AnchorProblem::NoPosition),
+            ref several => Some(AnchorProblem::Ambiguous(
+                several.iter().map(|node| node.node_id.clone()).collect(),
+            )),
+        }
+    }
+
     fn filter<'a>(&self, candidates: Vec<&'a Node>, nodes: &'a [Node]) -> Vec<&'a Node> {
         // The anchor is resolved with the full locator machinery, so it can
         // itself be positional.
@@ -2381,6 +2440,70 @@ mod tests {
         );
 
         assert!(found.is_empty(), "got {found:?}");
+    }
+
+    #[test]
+    fn an_anchor_that_matched_several_says_so_rather_than_looking_absent() {
+        // These three used to be one empty result, so the caller reported
+        // "no element matched" for all of them and an agent would go off to
+        // guess a different locator. A page with a billing and a delivery
+        // address really does have two labels reading "City".
+        let nodes = vec![
+            node_at("l1", "text", Some("City"), None,
+                    Some(Bounds { x: 10, y: 10, width: 30, height: 15 })),
+            node_at("f1", "edit", None, None,
+                    Some(Bounds { x: 60, y: 10, width: 100, height: 20 })),
+            node_at("l2", "text", Some("City"), None,
+                    Some(Bounds { x: 10, y: 90, width: 30, height: 15 })),
+            node_at("f2", "edit", None, None,
+                    Some(Bounds { x: 60, y: 90, width: 100, height: 20 })),
+        ];
+
+        let ambiguous = Proximity {
+            anchor: Locator {
+                role: Some("text".into()),
+                name: Some("City".into()),
+                ..Locator::default()
+            },
+            direction: Direction::Right,
+            within: None,
+        };
+        match ambiguous.why_empty(&nodes) {
+            Some(AnchorProblem::Ambiguous(ids)) => assert_eq!(ids.len(), 2),
+            other => panic!("expected an ambiguous anchor, got {other:?}"),
+        }
+        assert!(
+            ambiguous
+                .why_empty(&nodes)
+                .unwrap()
+                .describe()
+                .contains("narrow"),
+            "and it has to say what to do about it"
+        );
+
+        let missing = Proximity {
+            anchor: Locator {
+                name: Some("Nothing here".into()),
+                ..Locator::default()
+            },
+            direction: Direction::Any,
+            within: None,
+        };
+        assert_eq!(missing.why_empty(&nodes), Some(AnchorProblem::NotFound));
+
+        // An anchor that resolves cleanly is not a problem, even if the search
+        // then finds no neighbour -- that is a different answer.
+        let mut identified = nodes.clone();
+        identified[0].automation_id = Some("l1".into());
+        let fine = Proximity {
+            anchor: Locator {
+                automation_id: Some("l1".into()),
+                ..Locator::default()
+            },
+            direction: Direction::Right,
+            within: None,
+        };
+        assert_eq!(fine.why_empty(&identified), None);
     }
 
     #[test]

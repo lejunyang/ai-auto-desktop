@@ -43,7 +43,10 @@ fn locator_schema() -> Value {
     json!({
         "type": "object",
         "description": "Element selector. Every field given must match, so adding \
-fields narrows the result. Matching is exact unless `match` is \"contains\".",
+fields narrows the result. Matching is exact unless `match` is \"contains\". \
+When several elements share every attribute -- rows of a table each with their own \
+Edit button, for instance -- narrow with `within`, `near` or `nth` rather than \
+guessing.",
         "properties": {
             "role": {"type": "string", "description": "Control type, e.g. Button, Edit."},
             "name": {"type": "string"},
@@ -70,7 +73,51 @@ fields narrows the result. Matching is exact unless `match` is \"contains\".",
                 "type": "array",
                 "items": {"enum": ["focus", "invoke", "set_value", "type_text", "pointer_click"]}
             },
-            "match": {"enum": ["exact", "contains"], "default": "exact"}
+            "match": {"enum": ["exact", "contains"], "default": "exact"},
+            "within": {
+                "type": "object",
+                "description": "Only match inside the element this describes -- \
+itself a locator, so it can name a container by its own text. Prefer this over \
+`nth` when the container has a name: the row labelled \"Order for Ada\" is still \
+that row after the list is reordered, whereas a position is not.",
+                "properties": {},
+                "additionalProperties": true
+            },
+            "near": {
+                "type": "object",
+                "description": "Only match elements beside another one, for \
+\"the field next to the Password label\".",
+                "properties": {
+                    "anchor": {
+                        "type": "object",
+                        "description": "A locator for the element to measure from.",
+                        "additionalProperties": true
+                    },
+                    "direction": {
+                        "enum": ["any", "left", "right", "above", "below"],
+                        "default": "any",
+                        "description": "Where the wanted element sits relative to \
+the anchor. A direction also requires them to share a row or a column."
+                    },
+                    "within": {
+                        "type": "integer",
+                        "description": "Maximum gap in pixels between their edges."
+                    }
+                },
+                "required": ["anchor"],
+                "additionalProperties": false
+            },
+            "nth": {
+                "description": "Which one to take when several still match, \
+counting from 1 in reading order (top to bottom, then left to right), or \
+\"last\". A last resort: position shifts whenever the interface reflows, and in \
+a browser most of what the platform reports as buttons belongs to the browser \
+itself rather than the page, so counting rarely means what it appears to.",
+                "oneOf": [
+                    {"type": "integer", "minimum": 1},
+                    {"const": "last"}
+                ]
+            }
         },
         "minProperties": 1,
         "additionalProperties": false
@@ -529,8 +576,16 @@ fn error_payload(error: &aad_uia::DriverError) -> Value {
 find_element again to get a fresh target.",
         ),
         "DRIVER.AMBIGUOUS_MATCH" => Some(
-            "The locator matched several elements. Add a field such as \
-automation_id or role to narrow it; the candidates are listed in details.",
+            // Recommending automation_id and role was actively misleading: when
+            // several elements collide it is usually because they already share
+            // both -- five Edit buttons in a table have the same role and no
+            // automation_id at all. Ordered by how well each survives the
+            // interface changing.
+            "The locator matched several elements, listed in details.candidates. \
+Narrow it with `within` to name the container the wanted one sits in -- a row \
+labelled with its own text stays correct after the list reorders -- or with \
+`near` to place it against a neighbouring label. Use `nth` only when nothing \
+distinguishes them but position.",
         ),
         "DRIVER.NOT_FOUND" => Some(
             "No element matched. Call describe_window to see what is actually \
@@ -653,6 +708,75 @@ mod tests {
     }
 
     #[test]
+    fn an_agent_can_express_which_of_several_namesakes_it_means() {
+        // The driver resolves `within`, `near` and `nth` and they were verified
+        // against a real page, but an agent only ever sees the schema -- and with
+        // `additionalProperties: false` a client that validates would reject them
+        // outright. Without these, five identical Edit buttons leave an agent no
+        // way to say which row it means.
+        let find = catalogue()
+            .into_iter()
+            .find(|tool| tool.name == "find_element")
+            .expect("find_element");
+        let locator = &find.schema["properties"]["locator"]["properties"];
+
+        for field in ["within", "near", "nth"] {
+            assert!(
+                locator.get(field).is_some(),
+                "locator schema has to offer {field}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_ways_of_narrowing_are_explained_not_merely_listed() {
+        // A field an agent cannot tell when to use is a field it will misuse.
+        // Measured: content anchors survive a restart while ordinals shift as
+        // soon as a row is inserted, so the schema has to say which to reach for.
+        let find = catalogue()
+            .into_iter()
+            .find(|tool| tool.name == "find_element")
+            .expect("find_element");
+        let locator = &find.schema["properties"]["locator"]["properties"];
+
+        for field in ["within", "near", "nth"] {
+            let described = locator[field]["description"]
+                .as_str()
+                .unwrap_or_default()
+                .len();
+            assert!(
+                described > 40,
+                "{field} needs to say when it applies, not just exist"
+            );
+        }
+    }
+
+    #[test]
+    fn nested_selectors_cannot_smuggle_in_a_coordinate() {
+        // `near.anchor` and `within` accept a nested locator, so they are
+        // deliberately open-ended. That must not become a way around the rule
+        // that an agent never names a point on the screen: the check above only
+        // reads top-level properties.
+        fn walk(schema: &Value, path: &str) {
+            if let Some(properties) = schema["properties"].as_object() {
+                for (key, value) in properties {
+                    for forbidden in ["x", "y", "point", "coordinates", "position"] {
+                        assert_ne!(
+                            key, forbidden,
+                            "{path} must not accept {forbidden}"
+                        );
+                    }
+                    walk(value, &format!("{path}.{key}"));
+                }
+            }
+        }
+
+        for tool in catalogue() {
+            walk(&tool.schema, tool.name);
+        }
+    }
+
+    #[test]
     fn no_tool_accepts_raw_screen_coordinates() {
         // Clicking a coordinate an agent invented is precisely the failure mode
         // the snapshot discipline exists to prevent.
@@ -716,7 +840,20 @@ mod tests {
         let error = aad_uia::DriverError::new("DRIVER.AMBIGUOUS_MATCH", "two matches");
         let payload = error_payload(&error);
 
-        assert!(payload["hint"].as_str().unwrap().contains("narrow"));
+        // Asserting the word "narrow" appeared would not catch the failure that
+        // mattered: the old hint said "narrow" while recommending automation_id
+        // and role, the two fields colliding elements have already exhausted.
+        let hint = payload["hint"].as_str().unwrap();
+        for way in ["within", "near", "nth"] {
+            assert!(
+                hint.contains(way),
+                "the hint has to point at {way}, which can actually separate them"
+            );
+        }
+        assert!(
+            hint.contains("candidates"),
+            "and at the list of what it matched"
+        );
     }
 
     #[test]
