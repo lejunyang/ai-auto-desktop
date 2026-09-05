@@ -2249,3 +2249,50 @@ AAD Complex Fixture | last=page-save: - 个人 - Microsoft Edge
 
 重启这一步才是判据：标题从 `last=page-save:` 变成 `last=none`，收窄错了就会报
 `WINDOW_NOT_FOUND`。
+
+## 2.40 同一个 CLI 里指称工作流的两套说法
+
+### 上一轮 `--save` 留下的裂缝
+
+查实：`aad record --save cli_recorded` 用**名字**存，而 `aad run cli_recorded` 报
+`CLI.FILE_UNREADABLE`——**只接受路径**。同一个会话的两半用不同方式指称同一个工作流。
+
+而且 `aad list` 是列 durable runs，不是列工作流。所以命令行用户存完之后**看不见自己存了什么**，
+想跑得先知道文件路径。MCP 侧有 `list_workflows`/`describe_workflow`，CLI 一个都没有。
+
+### 名字解析的顺序不能颠倒
+
+改在 `read_descriptor` 前加一层 `locate_descriptor`，所以 `run`/`validate`/`start` 一起受益。
+
+**先当路径，路径不存在再当名字。** 反过来是错的：一个恰好与已存工作流同名的本地文件会被无声
+忽略，而用户明明给的是路径。**路径失败是显式的，名字被抢走是静默的。**
+
+再加一条：只有**裸名字**才当名字看——带分隔符或扩展名的一律是路径。否则一个打错的 `missing.json`
+会被答成「没有这个工作流」，把人指向错误的地方。
+
+真机验证了两个反向情况：给出真实路径读到的是本地那份（`the_local_one`，不是 store 里的）；
+`missing.json` 报的是它自己而非 store 路径。
+
+### `describe_workflow` 看不出会做什么
+
+MCP 那版只报 id 与 type（`step_1_window` / `action`）——对「跑之前先看看」没有用。
+
+`aad workflows <name>` 把三步还原成一个动作，说出**对哪个窗口做什么**：
+
+```
+set_value  {"role":"edit","automation_id":"billing-city"} writes='Praha'
+  in {"process_name":"msedge.exe","title":"AAD Complex Fixture"}
+invoke     {"role":"button","automation_id":"page-save"}
+  in {"process_name":"msedge.exe","title":"AAD Complex Fixture"}
+```
+
+**密码不显示值，但显示它需要哪个输入**：`needs_input='${{ inputs.step_1_secret }}'` 加
+`inputs: [{name: step_1_secret, required: true, sensitive: true}]`。跑之前得知道要准备什么，
+而明文不该出现在终端里——实测确认没有。
+
+编译失败时**并列报告而非顶替**：看得见一个坏工作流本来想做什么，才修得了它。
+
+### 两处按真实签名而非猜测改
+
+`list_workflows` 返回 `SavedRecording`（已带 `name`/`path`/`modified`），不是字符串——我原本
+自己去 `stat` 文件并引 `chrono`，都是多余的。CLI 也没有 `chrono` 依赖。

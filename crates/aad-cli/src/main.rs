@@ -51,6 +51,11 @@ enum Command {
     Do(DoCommand),
     /// Check whether this machine can support desktop automation.
     Probe,
+    /// List saved workflows, or show what one of them does.
+    ///
+    /// `aad record --save NAME` and `save_workflow` over MCP both store here, so
+    /// this is how to see what has accumulated without knowing the paths.
+    Workflows(WorkflowsArgs),
     /// Validate a workflow descriptor without running it.
     Validate(FileArgs),
     /// Run a workflow descriptor.
@@ -394,8 +399,17 @@ struct FileArgs {
 }
 
 #[derive(Args)]
+struct WorkflowsArgs {
+    /// A workflow to describe. Without one, every saved workflow is listed.
+    name: Option<String>,
+}
+
+#[derive(Args)]
 struct RunArgs {
-    /// A workflow descriptor in YAML or JSON.
+    /// A descriptor file in YAML or JSON, or the name of a saved workflow.
+    ///
+    /// A path is tried first, so a local file is never passed over in favour of a
+    /// stored workflow of the same name.
     file: PathBuf,
     /// Workflow inputs as a JSON object.
     #[arg(long, value_name = "JSON")]
@@ -480,6 +494,10 @@ fn dispatch(command: &Command) -> (Value, u8) {
         Command::Tools => (aad_mcp::tools::list_payload(), EXIT_OK),
         // Handled in `main`, which hands stdout to the protocol stream.
         Command::Mcp => (json!({"status": "closed"}), EXIT_OK),
+        Command::Workflows(args) => match &args.name {
+            Some(name) => explain_workflow(name),
+            None => list_saved_workflows(),
+        },
         Command::Validate(args) => validate(&args.file),
         Command::Run(args) => run_workflow(args),
         Command::Start(args) => start_run(args),
@@ -1086,13 +1104,52 @@ fn failure(code: &str, message: &str, extra: Option<Value>) -> Value {
     json!({"status": "error", "error": error})
 }
 
+/// Where a descriptor named on the command line actually lives.
+///
+/// A path is tried first and a saved name second, never the other way round: a
+/// local file whose name happens to match a saved workflow must not be quietly
+/// passed over in favour of the stored one. A path that does not exist fails
+/// loudly; a path silently overruled by a name would not.
+///
+/// This exists because `aad record --save NAME` stores under a name while `aad
+/// run` took only a path, so the two halves of the same session referred to a
+/// workflow differently.
+fn locate_descriptor(given: &Path) -> PathBuf {
+    if given.exists() {
+        return given.to_path_buf();
+    }
+    // Only a bare name can be one: anything with a separator or an extension was
+    // meant as a path, and treating it as a name would answer a mistyped path
+    // with a confusing "no such workflow".
+    let bare = given.parent().is_none_or(|parent| parent.as_os_str().is_empty())
+        && given.extension().is_none();
+    if !bare {
+        return given.to_path_buf();
+    }
+    let Some(name) = given.to_str() else {
+        return given.to_path_buf();
+    };
+    match aad_runtime::recordings::workflow_path(name) {
+        Ok(stored) if stored.exists() => stored,
+        // Fall back to the original so the error names what was asked for rather
+        // than a store path the caller never mentioned.
+        _ => given.to_path_buf(),
+    }
+}
+
 /// Read a descriptor from YAML or JSON.
 fn read_descriptor(path: &Path) -> Result<Value, Value> {
+    let path = &locate_descriptor(path);
     let text = std::fs::read_to_string(path).map_err(|error| {
         failure(
             "CLI.FILE_UNREADABLE",
             &format!("{}: {error}", path.display()),
-            None,
+            // Say where saved workflows live, since a bare name that did not
+            // resolve is most likely a workflow the caller thought was saved.
+            Some(json!({
+                "hint": "If you meant a saved workflow, `aad workflows` lists the \
+ones that exist."
+            })),
         )
     })?;
 
@@ -1112,6 +1169,172 @@ fn read_descriptor(path: &Path) -> Result<Value, Value> {
             None,
         )
     })
+}
+
+/// Every saved workflow, newest first.
+fn list_saved_workflows() -> (Value, u8) {
+    let directory = aad_runtime::recordings::recordings_dir();
+    match aad_runtime::recordings::list_workflows() {
+        Ok(saved) => {
+            // The store already reports the path and the modification time, so
+            // the listing does not go back to the filesystem for either.
+            let workflows: Vec<Value> = saved
+                .into_iter()
+                .map(|entry| {
+                    json!({
+                        "name": entry.name,
+                        "modified": entry.modified,
+                        "path": entry.path,
+                    })
+                })
+                .collect();
+            (
+                json!({
+                    "kind": "WorkflowList",
+                    "count": workflows.len(),
+                    "workflows": workflows,
+                    "directory": directory.to_string_lossy(),
+                }),
+                EXIT_OK,
+            )
+        }
+        Err(error) => (
+            failure(error.code, &error.message, None),
+            EXIT_FAILED,
+        ),
+    }
+}
+
+/// What a saved workflow would do, before running it.
+///
+/// The three executed steps behind one recorded action are folded back together,
+/// and the window and argument are named. `describe_workflow` over MCP reports
+/// step ids and types, which does not answer the question someone asks before
+/// running something: what is this going to touch?
+fn explain_workflow(name: &str) -> (Value, u8) {
+    let path = match aad_runtime::recordings::workflow_path(name) {
+        Ok(path) => path,
+        Err(error) => return (failure(error.code, &error.message, None), EXIT_USAGE),
+    };
+    let document = match read_descriptor(&path) {
+        Ok(document) => document,
+        Err(payload) => {
+            // Say which workflows exist: a mistyped name is the likeliest reason
+            // to be here, and the list is one command away.
+            let mut payload = payload;
+            payload["error"]["hint"] =
+                json!("`aad workflows` lists the ones that are saved.");
+            return (payload, EXIT_USAGE);
+        }
+    };
+
+    // Compiled as well as read, so a workflow that would not run says so here
+    // rather than at the moment someone relies on it.
+    let compiled = aad_core::compiler::compile_descriptor(
+        document.clone(),
+        path.parent().map(Into::into),
+    );
+    let problem = compiled.as_ref().err().map(|error| {
+        json!({"code": error.code, "message": error.message})
+    });
+
+    let steps = document
+        .get("steps")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+
+    // Fold on the id suffixes `assemble` emits. A step whose id carries neither
+    // suffix is the action itself.
+    let mut actions: Vec<Value> = Vec::new();
+    for step in &steps {
+        let id = step.get("id").and_then(Value::as_str).unwrap_or_default();
+        if id.ends_with("_window") || id.ends_with("_element") {
+            continue;
+        }
+        let with = step.get("with").cloned().unwrap_or(Value::Null);
+        let uses = step.get("uses").and_then(Value::as_str).unwrap_or_default();
+        let action = uses
+            .rsplit_once('.')
+            .map(|(_, tail)| tail.split('@').next().unwrap_or(tail))
+            .unwrap_or(uses);
+
+        // The window and locator live on the two steps that prepared this one.
+        let window = steps
+            .iter()
+            .find(|other| {
+                other.get("id").and_then(Value::as_str) == Some(&format!("{id}_window"))
+            })
+            .and_then(|other| other.get("with"))
+            .and_then(|with| with.get("window"))
+            .cloned();
+        let locator = steps
+            .iter()
+            .find(|other| {
+                other.get("id").and_then(Value::as_str) == Some(&format!("{id}_element"))
+            })
+            .and_then(|other| other.get("with"))
+            .and_then(|with| with.get("locator"))
+            .cloned();
+
+        let mut entry = serde_json::Map::new();
+        entry.insert("id".into(), json!(id));
+        entry.insert("action".into(), json!(action));
+        if let Some(window) = window {
+            entry.insert("window".into(), window);
+        }
+        if let Some(locator) = locator {
+            entry.insert("finds".into(), locator);
+        }
+
+        // The argument, under whichever key this action uses.
+        for key in ["value", "text"] {
+            if let Some(argument) = with.get(key).and_then(Value::as_str) {
+                // A credential is stored as a reference to an input, never as
+                // text. Showing the reference is the point: it says what has to be
+                // supplied, without printing a password into a terminal.
+                if argument.contains("inputs.") {
+                    entry.insert("needs_input".into(), json!(argument));
+                } else {
+                    entry.insert("writes".into(), json!(argument));
+                }
+            }
+        }
+        actions.push(Value::Object(entry));
+    }
+
+    let inputs = document
+        .get("inputs")
+        .and_then(Value::as_object)
+        .map(|inputs| {
+            inputs
+                .iter()
+                .map(|(key, spec)| {
+                    json!({
+                        "name": key,
+                        "required": spec.get("required").cloned().unwrap_or(json!(false)),
+                        "sensitive": spec.get("sensitive").cloned().unwrap_or(json!(false)),
+                    })
+                })
+                .collect::<Vec<Value>>()
+        })
+        .unwrap_or_default();
+
+    let mut answer = json!({
+        "kind": "WorkflowExplanation",
+        "name": name,
+        "path": path.to_string_lossy(),
+        "actions": actions,
+        "executed_steps": steps.len(),
+        "inputs": inputs,
+    });
+    if let Some(problem) = problem {
+        // Reported alongside rather than instead of: seeing what a broken
+        // workflow meant to do is how it gets repaired.
+        answer["will_not_run"] = problem;
+        return (answer, EXIT_FAILED);
+    }
+    (answer, EXIT_OK)
 }
 
 fn validate(path: &Path) -> (Value, u8) {
@@ -1579,6 +1802,64 @@ fn list_events(args: &EventsArgs) -> (Value, u8) {
 mod tests {
     use super::*;
     use clap::CommandFactory;
+
+    #[test]
+    fn a_path_is_never_overruled_by_a_saved_name() {
+        // `--save NAME` stores under a name, so `run NAME` has to work or the two
+        // halves of one session name a workflow differently. But a local file must
+        // win: a path that does not exist fails loudly, while a path silently
+        // replaced by a stored workflow does not, and the caller would act on a
+        // different workflow than the one they pointed at.
+        let folder = std::env::temp_dir().join("aad_locate_test");
+        let _ = std::fs::create_dir_all(&folder);
+        let local = folder.join("some_name");
+        std::fs::write(&local, "{}").expect("write");
+
+        assert_eq!(
+            locate_descriptor(&local),
+            local,
+            "an existing file is used as given"
+        );
+        let _ = std::fs::remove_file(&local);
+    }
+
+    #[test]
+    fn something_that_reads_as_a_path_stays_a_path() {
+        // Answering a mistyped path with "no such workflow" would send the reader
+        // looking in the wrong place.
+        let with_extension = Path::new("missing.json");
+        assert_eq!(locate_descriptor(with_extension), with_extension);
+
+        let with_directory = Path::new("some/where/missing");
+        assert_eq!(locate_descriptor(with_directory), with_directory);
+    }
+
+    #[test]
+    fn an_unresolved_bare_name_is_reported_as_asked_for() {
+        // Falling back to the store path would name a location the caller never
+        // mentioned; falling back to what they typed keeps the error legible.
+        let name = Path::new("definitely_not_saved_anywhere_12345");
+        let located = locate_descriptor(name);
+        assert!(
+            located == name || located.exists(),
+            "either what was asked for, or something that is really there: {located:?}"
+        );
+    }
+
+    #[test]
+    fn saved_workflows_can_be_listed_and_explained() {
+        // Storing under a name was only half of it: without these, someone who
+        // recorded a workflow cannot see what accumulated, and `aad list` is about
+        // durable runs rather than workflows.
+        let names: Vec<String> = Cli::command()
+            .get_subcommands()
+            .map(|command| command.get_name().to_string())
+            .collect();
+        assert!(
+            names.contains(&"workflows".to_string()),
+            "no way to see saved workflows: {names:?}"
+        );
+    }
 
     #[test]
     fn recording_offers_to_save_what_it_captured() {
