@@ -24,6 +24,12 @@ use serde_json::{json, Map, Value};
 
 pub use aad_runtime::recordings;
 
+/// The job name that means "run a workflow" rather than any driver action.
+///
+/// Spelled with a space so it cannot collide with a real action: the driver's
+/// manifest names are all identifiers.
+const RUN_WORKFLOW: &str = "run workflow";
+
 /// One driver action and the channel its answer goes back on.
 struct Job {
     action: String,
@@ -68,7 +74,11 @@ impl Shell {
                         let store =
                             SnapshotStore::default().persisted(default_snapshot_directory());
                         let _ = ready.send(Ok(()));
-                        UiaDriver::with_store(Arc::new(backend), store)
+                        // Held behind an `Arc` so the workflow engine can be given
+                        // the same driver rather than building a second one. A
+                        // driver built anywhere else joins that thread's apartment,
+                        // and this thread's is the one known to work.
+                        Arc::new(UiaDriver::with_store(Arc::new(backend), store))
                     }
                     Err(error) => {
                         let _ = ready.send(Err(error));
@@ -78,9 +88,17 @@ impl Shell {
 
                 // Ends when the last sender drops, i.e. when the app closes.
                 while let Ok(job) = queue.recv() {
-                    let outcome = driver
-                        .call(&job.action, &job.params)
-                        .map_err(|error| error_payload(&error));
+                    // Running a workflow is not a driver action, so it is answered
+                    // here rather than passed down. It has to happen on this thread
+                    // because the engine drives the same driver, and the apartment
+                    // it was built in is this one.
+                    let outcome = if job.action == RUN_WORKFLOW {
+                        run_here(Arc::clone(&driver), &job.params)
+                    } else {
+                        driver
+                            .call(&job.action, &job.params)
+                            .map_err(|error| error_payload(&error))
+                    };
                     let _ = job.reply.send(outcome);
                 }
             })
@@ -362,6 +380,26 @@ async fn save_recording(
     }))
 }
 
+/// Replay a workflow and report how each step went.
+///
+/// The editor exists so a recording can be corrected, and correcting one means
+/// trying it. Without this the loop breaks at the last step and the only way to
+/// find out whether a recording works is to leave the app for a terminal.
+#[tauri::command]
+async fn run_workflow(
+    shell: tauri::State<'_, Shell>,
+    workflow: Value,
+    inputs: Option<Value>,
+) -> Result<Value, Value> {
+    shell.dispatch(
+        RUN_WORKFLOW,
+        json!({
+            "workflow": workflow,
+            "inputs": inputs.unwrap_or(json!({})),
+        }),
+    )
+}
+
 /// Reopen a saved recording for editing.
 #[tauri::command]
 async fn load_recording(path: String) -> Result<Value, Value> {
@@ -376,6 +414,90 @@ async fn list_recordings() -> Result<Value, Value> {
         "recordings": found,
         "directory": recordings::recordings_dir().to_string_lossy(),
     }))
+}
+
+/// Run a compiled workflow using the driver that is already open.
+///
+/// Called on the driver's own thread. The engine is synchronous and the caller is
+/// waiting on a channel, so nothing else is queued while a run is in progress --
+/// which is what we want: a run and a live capture would fight over the same UI.
+fn run_here(driver: Arc<UiaDriver>, params: &Value) -> Result<Value, Value> {
+    let document = params.get("workflow").cloned().unwrap_or(Value::Null);
+    if document.is_null() {
+        return Err(json!({
+            "code": "GUI.WORKFLOW_MISSING",
+            "message": "no workflow was supplied to run",
+            "retryable": false,
+        }));
+    }
+
+    let descriptor = aad_core::compile_descriptor(document, None).map_err(|error| {
+        // Where each problem is, not just that there is one: the editor can point
+        // at the step that needs fixing only if it is told which one.
+        let issues: Vec<Value> = error
+            .issues
+            .iter()
+            .map(|issue| json!({"path": issue.path, "message": issue.message}))
+            .collect();
+        json!({
+            "code": error.code,
+            "message": error.message,
+            "retryable": false,
+            "issues": issues,
+        })
+    })?;
+
+    let mut providers = aad_runtime::ProviderRegistry::new();
+    providers.insert(driver);
+
+    let inputs = params
+        .get("inputs")
+        .and_then(Value::as_object)
+        .map(|map| map.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+        .unwrap_or_default();
+
+    let options = aad_runtime::RunOptions::default()
+        .with_providers(providers)
+        .with_inputs(inputs);
+
+    let result = aad_runtime::engine::run(&descriptor, options);
+
+    // Every step's outcome, not just the run's. A recording that replays five
+    // steps and clicks the wrong element reports success at the run level, and
+    // the whole point of replaying inside the editor is to catch exactly that.
+    let steps: Vec<Value> = result
+        .events
+        .iter()
+        .filter(|event| event.event_type == "step.finished")
+        .map(|event| {
+            json!({
+                "id": event.payload.get("id").cloned().unwrap_or(Value::Null),
+                "status": event.payload.get("status").cloned().unwrap_or(Value::Null),
+                "error": event.payload.get("error").cloned(),
+            })
+        })
+        .collect();
+
+    let mut answer = json!({
+        "run_id": result.run_id,
+        "workflow": result.workflow,
+        "status": result.status.as_str(),
+        "executed_steps": result.executed_steps,
+        "duration_seconds": result.duration_seconds,
+        "steps": steps,
+    });
+    if let Some(error) = &result.error {
+        // Field by field rather than wholesale: whether a failed step already
+        // changed the desktop is the one thing the editor cannot work out for
+        // itself, so `effect` has to survive the trip.
+        answer["error"] = json!({
+            "code": error.code,
+            "message": error.message,
+            "retryable": error.retryable,
+            "effect": error.effect.as_str(),
+        });
+    }
+    Ok(answer)
 }
 
 /// Render a store failure in the same shape as a driver failure.
@@ -418,6 +540,7 @@ pub fn run() {
             try_locator,
             probe_environment,
             save_recording,
+            run_workflow,
             load_recording,
             list_recordings
         ])

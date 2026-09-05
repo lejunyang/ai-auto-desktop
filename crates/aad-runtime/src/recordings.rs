@@ -16,6 +16,12 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
+/// The `kind` a recording document declares.
+///
+/// Stated here because both the store and the CLI need to agree on it: telling a
+/// recording apart from a workflow by anything else would be two guesses.
+pub const RECORDING_KIND: &str = "Recording";
+
 /// Recordings hold locators, not references, so they stay valid between runs.
 pub const RECORDING_SUFFIX: &str = ".recording.json";
 pub const WORKFLOW_SUFFIX: &str = ".workflow.json";
@@ -91,6 +97,20 @@ fn validate_name(name: &str) -> Result<&str> {
     // the saved file's name differ from the one shown in the UI.
     if trimmed.ends_with('.') {
         return Err(StoreError::new("STORE.NAME_INVALID", "a name may not end with a dot"));
+    }
+    // The two kinds of document are told apart by these suffixes, so a name
+    // ending in one collides with the scheme itself. Measured: "recorded.workflow"
+    // was saved as `recorded.workflow.workflow.json`, sitting next to the
+    // `recorded.workflow.recording.json` that belongs to it, and both listings
+    // then report the same name as two different things.
+    for reserved in [RECORDING_SUFFIX, WORKFLOW_SUFFIX] {
+        let bare = reserved.trim_end_matches(".json");
+        if trimmed.ends_with(bare) {
+            return Err(StoreError::new(
+                "STORE.NAME_INVALID",
+                format!("a name may not end with {bare:?}, which marks which kind of file it is"),
+            ));
+        }
     }
     Ok(trimmed)
 }
@@ -540,5 +560,29 @@ mod tests {
             list_workflows().unwrap().into_iter().map(|item| item.name).collect();
 
         assert_eq!(names, vec!["real".to_string()]);
+    }
+}
+
+#[cfg(test)]
+mod suffix_tests {
+    use super::*;
+
+    #[test]
+    fn a_name_may_not_end_with_the_suffix_that_marks_its_kind() {
+        // Measured: "recorded.workflow" was saved as
+        // `recorded.workflow.workflow.json`, next to the
+        // `recorded.workflow.recording.json` belonging to it, and both listings
+        // then reported the same name as two different kinds of thing.
+        let refused = validate_name("recorded.workflow").expect_err("collides with the scheme");
+        assert_eq!(refused.code, "STORE.NAME_INVALID");
+        assert!(
+            refused.message.contains(".workflow"),
+            "say which ending is the problem: {}",
+            refused.message
+        );
+
+        validate_name("thing.recording").expect_err("the other suffix too");
+        // A dot elsewhere is fine; only the ending carries meaning.
+        validate_name("my.notes.for.later").expect("a dotted name is still a name");
     }
 }

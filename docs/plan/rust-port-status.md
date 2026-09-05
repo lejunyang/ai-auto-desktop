@@ -2352,3 +2352,54 @@ code 与 message。`error.issues` 一直都在（`validate` 用着），是三�
 | 名字非法的 hint | 指向名字，给出 `submit_button`，**不再让人去报 bug** |
 | `issues` | MCP 保存、MCP 描述、CLI 描述三处都带上了 |
 | 密码 | 仍显示 `needsInput` 而非明文（实测确认） |
+
+## 2.42 编辑器里跑不了自己录的东西
+
+### 记忆是错的，列表是对的
+
+对照三个入口的能力面时，我以为 GUI 有 `run_workflow`——实际 Tauri 命令列表里**没有**，
+`lib.rs` 里 `run_workflow` / `run_descriptor` / `aad_runtime::engine` 三个词全是 `False`。
+
+后果是具体的：**编辑器存在的理由是让录制能被修正，而修正一个录制意味着试一遍。** 没有这个
+能力，录制—验证—修正的循环在最后一步断开，想知道录得对不对只能离开界面去开终端。
+
+### 引擎要跑在哪个线程
+
+worker 线程的循环只做 `driver.call(action, params)`——它是纯 driver 分派器。而引擎需要
+`Arc<dyn Provider>`，driver 却是那个线程的局部变量。
+
+取舍是 apartment 决定的：**把引擎搬到 worker 线程上跑，而不是在 Tauri 线程池里另建
+driver。** worker 那个 apartment 已经验证可用，而 async 命令每次可能落在不同线程；CLI 敢
+另建是因为它是单线程进程。driver 因此改为 `Arc` 持有，循环里认一个保留 job 名（写成带空格
+的 `"run workflow"`，与 driver 的标识符名字不可能相撞）。
+
+### 真机结果
+
+`status=succeeded`、6 步全绿，CDP 独立核实 `last=page-save:`、`log=[1] page-save:` 都真落地。
+
+更要紧的是失败场景：让第二步找不到元素，得到 `status=failed`、`executed_steps=5`、失败落在
+`step_2_element`，而 `city='HalfDone'` 证明值已写入但没提交——**这正是决定重试是否安全的
+信息**。描述符不合法时报出三条带路径的 issue，缺工作流时报 `GUI.WORKFLOW_MISSING`。
+
+一处虚警记下来：某次读到 `city='Brnoz'`，多一个 `z`。追下去是我上一轮 CDP 写入的残留——
+`page-save` 的监听器只读 `#bare`，手动重现点击前后都是 `Brno`，连跑三次值全部精确一致。
+**是探针的问题。**
+
+### 顺带两个小修
+
+**误把录制当工作流跑**，实测报 13 条 issue（`budgets` 缺失、`kind` 不对、每步 `type` 缺失），
+**没有一条说这是录制**。被告知给一个从来不该有 budgets 的文件加 budgets，会让人去修错的东西。
+
+这一处修错了两次，都值得记：
+
+1. **放错位置**。我把检查放进 `validate`，而编译入口有三个（`validate` / `run_workflow` /
+   `durable_descriptor`）——`aad run` 照旧报 13 条。移到共同上游 `read_descriptor`，四条路
+   （含 `start`）才一致。**每个调用点各判一次，漏一处就恢复旧行为。**
+2. **判据太宽**。第一版拦下所有非 `Workflow` 的 kind，立刻被既有测试抓到：它用
+   `kind: NotAWorkflow` 触发多问题报告。那是文件里的错值，不是拿错了文件；把它也解释成
+   「你拿错文档」会掩盖编译器正要报的一堆真问题。现在只认 `RECORDING_KIND`。
+
+**名字撞车**：`recorded.workflow` 存出 `recorded.workflow.workflow.json`，与它自己的
+`recorded.workflow.recording.json` 并列。两类文件靠后缀分辨，名字以后缀结尾就与这套方案本身
+相撞，两个列表会把同一个名字报成两种东西。`validate_name` 现在拒绝这种结尾——中间的点仍然
+允许，只有结尾带含义。

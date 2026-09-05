@@ -1159,16 +1159,25 @@ ones that exist."
 
     // YAML is a superset of JSON, so one parser handles both; but JSON gets
     // first refusal so that duplicate-key rejection still applies.
-    if let Ok(value) = serde_json::from_str::<Value>(text) {
-        return Ok(value);
+    let document = if let Ok(value) = serde_json::from_str::<Value>(text) {
+        value
+    } else {
+        serde_yaml::from_str::<Value>(text).map_err(|error| {
+            failure(
+                "CLI.FILE_INVALID",
+                &format!("{} is not valid JSON or YAML: {error}", path.display()),
+                None,
+            )
+        })?
+    };
+
+    // Checked here rather than at each of the three places that compile a
+    // descriptor: missing one of them silently restores the old behaviour, which
+    // is exactly what happened when this lived in `validate` alone.
+    if let Some(problem) = mistaken_for_a_workflow(&document) {
+        return Err(problem);
     }
-    serde_yaml::from_str::<Value>(text).map_err(|error| {
-        failure(
-            "CLI.FILE_INVALID",
-            &format!("{} is not valid JSON or YAML: {error}", path.display()),
-            None,
-        )
-    })
+    Ok(document)
 }
 
 /// Every saved workflow, newest first.
@@ -1347,6 +1356,35 @@ fn explain_workflow(name: &str) -> (Value, u8) {
         return (answer, EXIT_FAILED);
     }
     (answer, EXIT_OK)
+}
+
+/// Say so when the document is a recording rather than a workflow.
+///
+/// Measured: compiling a recording yields thirteen issues -- `budgets` missing,
+/// `kind` wrong, every step's `type` absent -- not one of which says what is
+/// actually wrong. Being told to add budgets to a file that was never meant to
+/// have them sends the reader off repairing the wrong thing.
+///
+/// The two live in the same folder and differ by one field, so mixing them up is
+/// easy; the compiler's answer to one is a list of everything the other kind has.
+fn mistaken_for_a_workflow(document: &Value) -> Option<Value> {
+    // Only the other kind this project actually writes. A `kind` of anything else
+    // is a mistake in the file rather than the wrong file, and answering that with
+    // "you picked the wrong document" would hide the several real problems the
+    // compiler is about to name.
+    let kind = document.get("kind").and_then(Value::as_str)?;
+    if kind != aad_runtime::recordings::RECORDING_KIND {
+        return None;
+    }
+    Some(failure(
+        "CLI.NOT_A_WORKFLOW",
+        &format!("this is a {kind}, not a workflow"),
+        Some(json!({
+            "kind": kind,
+            "hint": "A recording is the editable form. Open it in the desktop app, \
+or run the workflow saved beside it -- `aad workflows` lists those.",
+        })),
+    ))
 }
 
 fn validate(path: &Path) -> (Value, u8) {
@@ -1844,6 +1882,66 @@ mod tests {
                 .iter()
                 .any(|issue| issue["path"].as_str().is_some_and(|path| path.contains("name"))),
             "the offending path is named: {issues:?}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_recording_is_not_reported_as_a_broken_workflow() {
+        // The two kinds live in the same folder and differ by one field. Compiling
+        // a recording lists everything a workflow has that it does not -- thirteen
+        // issues, measured, telling the reader to add budgets to a file that was
+        // never meant to have them.
+        let folder = std::env::temp_dir().join("aad_kind_check");
+        let _ = std::fs::create_dir_all(&folder);
+        let path = folder.join("some.recording.json");
+        std::fs::write(
+            &path,
+            r#"{"apiVersion":"ai-auto-desktop.dev/v1alpha1","kind":"Recording",
+               "metadata":{"name":"SubmitButton"},"steps":[]}"#,
+        )
+        .expect("write");
+
+        let problem = read_descriptor(&path).expect_err("a recording cannot be run");
+        assert_eq!(problem["error"]["code"], "CLI.NOT_A_WORKFLOW");
+        assert_eq!(problem["error"]["kind"], "Recording");
+        let whole = problem.to_string();
+        assert!(
+            !whole.contains("budgets"),
+            "the report should not send the reader after fields this kind never has: {whole}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn every_way_in_agrees_a_recording_is_not_runnable() {
+        // Checked at the shared entry point rather than at each of the three
+        // places that compile a descriptor: putting it in `validate` alone left
+        // `run` reporting the old thirteen issues, which is how this was found.
+        let folder = std::env::temp_dir().join("aad_kind_check_all");
+        let _ = std::fs::create_dir_all(&folder);
+        let path = folder.join("shared.recording.json");
+        std::fs::write(
+            &path,
+            r#"{"apiVersion":"ai-auto-desktop.dev/v1alpha1","kind":"Recording",
+               "metadata":{"name":"x"},"steps":[]}"#,
+        )
+        .expect("write");
+
+        let (from_validate, validate_code) = validate(&path);
+        assert_eq!(validate_code, EXIT_USAGE);
+        assert_eq!(from_validate["error"]["code"], "CLI.NOT_A_WORKFLOW");
+
+        let (from_explain, _) = super::run_workflow(&RunArgs {
+            file: path.clone(),
+            inputs: None,
+            journal: None,
+            dry_run: true,
+            allow_scripts: false,
+        });
+        assert_eq!(
+            from_explain["error"]["code"], "CLI.NOT_A_WORKFLOW",
+            "running one has to say the same thing validating one does"
         );
         let _ = std::fs::remove_file(&path);
     }

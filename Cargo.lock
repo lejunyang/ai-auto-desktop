@@ -33,6 +33,7 @@ dependencies = [
 name = "aad-gui"
 version = "0.1.0"
 dependencies = [
+ "aad-core",
  "aad-probe",
  "aad-runtime",
  "aad-uia",
