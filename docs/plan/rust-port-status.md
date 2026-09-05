@@ -2185,3 +2185,67 @@ AI 之前能看、能动，但**不能积累**——每次会话结束，探索�
 
 **探针放错 crate。** 把它写进 `aad-runtime/examples` 而那个 crate 不依赖 `aad-uia`——分层是对的，
 探针该放在 `aad-uia` 里。
+
+## 2.39 补上 CLI 侧的缺口：录完就能存
+
+### 我自己引入的不对称
+
+上一轮给 MCP 加了 `save_workflow`，AI 因此能把操作存成可复用工作流。但 `aad record --help`
+证实 CLI **只打印步骤**——用命令行的人还得手写描述符，而组装器已经在 Rust 里了。
+
+同一个能力，AI 有，人没有。
+
+### 又一处只存在于 TypeScript 的逻辑
+
+查实：`stableTitle` 和 `selectorFor` 都只在 `gui/src/recording.ts`，Rust 侧没有。跟上一轮
+`toDescriptor` 一样。
+
+### 但先量了一件事，结果改变了移植范围
+
+我打算只移植 `stableTitle`（最长公共子串）。真机量了一次 12 秒录制，观察到两个标题：
+
+```
+AAD Complex Fixture | last=none - 个人 - Microsoft Edge
+AAD Complex Fixture | last=page-save: - 个人 - Microsoft Edge
+```
+
+`stableTitle` 给出 **`'AAD Complex Fixture | last='`**——把会变的状态标签前缀带进来了。这正是
+§2.31 记过的坏结果。
+
+所以必须连 `wordRuns` 一起移植：它才是把候选收窄成**读起来像名字**的词组那一步（要求 token
+含字母数字、不以标点结尾，`last=` 两条都不满足）。只移植前一半会产出**看起来稳定实际不稳定**
+的选择器。
+
+### 路上一个假故障，分辨清楚才没修错东西
+
+第一次量的时候 `count=0` 且标题没变，看着像录制坏了。用 CDP 读页面发现三个输入框**全是空的**
+——操作从没执行。真因是 `aad do invoke` 的 `--target` 是命名参数，我当位置参数用了（`exit 2`
+是 clap 的用法错误）。
+
+**是我的探针问题，不是录制的问题。** 修正后同样的录制拿到 4 步，全部 replayable。
+
+### 衔接处的一个真实取舍
+
+录制**刻意保留** unresolved 步骤（`capture.rs` 的注释：丢掉更糟，录制会看起来完整却静默少了
+一次交互），而组装器**拒绝** null locator（找不到的元素没法回放）。
+
+两边都对。所以衔接处显式报告 `skipped_steps` 与逐条原因，而不是悄悄少存——否则人会以为工作流
+做了他录的全部事。
+
+另外两条：窗口选择器**现算**（`selector_for` 拿录制期间观察到的所有标题去收窄），选择器合成
+**失败就不存**（存一个按 id 选窗口的工作流等于存一个只能用一次的东西）。保存失败时步骤仍然
+留在返回里——录制花了十二秒，不该因为最后一步失败而丢掉。
+
+### 端到端
+
+| 步骤 | 结果 |
+| --- | --- |
+| `aad record <id> --seconds 12 --save cli_recorded` | 3 步全 replayable |
+| 窗口选择器 | `{process_name: "msedge.exe", title: "AAD Complex Fixture"}` |
+| 标题收窄 | `AAD Complex Fixture \| last=page-save: - 个人 - Microsoft Edge` → **`AAD Complex Fixture`** |
+| 杀掉 Edge 重启 | 页面确认为空，标题回到 `last=none` |
+| `aad run` | `succeeded`，9 个执行步骤 |
+| **CDP 独立核实** | `city='Praha'`、`zip='11000'`、`log='[1] page-save:'` |
+
+重启这一步才是判据：标题从 `last=page-save:` 变成 `last=none`，收窄错了就会报
+`WINDOW_NOT_FOUND`。

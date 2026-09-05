@@ -15,6 +15,7 @@ pub mod backend;
 pub mod capture;
 pub mod driver;
 pub mod model;
+pub mod selector;
 
 #[cfg(windows)]
 pub mod windows;
