@@ -243,7 +243,6 @@ struct FindArgs {
     /// only way to address one.
 
     #[arg(long)]
-
     protected: Option<bool>,
 
     /// Which one to take when several match: a number from 1, `first` or `last`.
@@ -528,11 +527,9 @@ fn dispatch(command: &Command) -> (Value, u8) {
                     .filter(|window| {
                         let matches = |field: &str, wanted: &Option<String>| match wanted {
                             None => true,
-                            Some(wanted) => window[field]
-                                .as_str()
-                                .is_some_and(|actual| {
-                                    actual.to_lowercase().contains(&wanted.to_lowercase())
-                                }),
+                            Some(wanted) => window[field].as_str().is_some_and(|actual| {
+                                actual.to_lowercase().contains(&wanted.to_lowercase())
+                            }),
                         };
                         matches("title", &args.title) && matches("process_name", &args.process)
                     })
@@ -630,15 +627,7 @@ fn dispatch(command: &Command) -> (Value, u8) {
                 locator.insert("automation_id".into(), json!(id));
             }
             if let Some(protected) = args.protected {
-
-                locator.insert(
-
-                    "states".into(),
-
-                    json!({"protected": protected}),
-
-                );
-
+                locator.insert("states".into(), json!({"protected": protected}));
             }
 
             if args.contains {
@@ -717,8 +706,7 @@ fn dispatch(command: &Command) -> (Value, u8) {
                 // Poll rather than sleeping the whole time: the buffer is
                 // bounded, so a long recording of a busy window would otherwise
                 // overflow and lose the earliest steps.
-                let deadline =
-                    std::time::Instant::now() + std::time::Duration::from_secs(seconds);
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(seconds);
                 let mut steps: Vec<Value> = Vec::new();
                 let mut dropped = 0u64;
                 let mut sources = started["sources"].clone();
@@ -829,7 +817,7 @@ fn dispatch(command: &Command) -> (Value, u8) {
                                 &format!("--target is not usable: {error}"),
                                 Some(json!({
                                     "hint": "Pass the `ref` printed by `aad find`, \
-for example abc123:1:e9."
+                                for example abc123:1:e9."
                                 })),
                             ),
                             EXIT_USAGE,
@@ -933,7 +921,7 @@ fn keep_recording(
                 "the recorded window is no longer open, so it cannot be named for replay",
                 Some(json!({
                     "hint": "Naming the window needs it open: the selector is checked \
-against the other windows to make sure it picks out one."
+                against the other windows to make sure it picks out one."
                 })),
             )
         })?;
@@ -944,7 +932,7 @@ against the other windows to make sure it picks out one."
             "no selector picks out this window among the ones open",
             Some(json!({
                 "hint": "Another window shares its process and title. Close it, or \
-give the window a distinguishing title, and record again.",
+            give the window a distinguishing title, and record again.",
                 "title": target.title,
                 "process_name": target.process_name,
             })),
@@ -970,7 +958,10 @@ give the window a distinguishing title, and record again.",
             action: action.to_string(),
             locator,
             window: selector.clone(),
-            argument: step.get("argument").and_then(Value::as_str).map(str::to_string),
+            argument: step
+                .get("argument")
+                .and_then(Value::as_str)
+                .map(str::to_string),
             protected: step
                 .get("protected")
                 .and_then(Value::as_bool)
@@ -1036,7 +1027,10 @@ fn write_listing(
             )
         }
     };
-    if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
         if let Err(error) = std::fs::create_dir_all(parent) {
             return (
                 failure(
@@ -1070,8 +1064,7 @@ fn write_listing(
         summary["region"] = region.clone();
     }
     if requested_ceiling.is_some() {
-        summary["note"] =
-            json!("--max-characters was ignored: a file is written in full");
+        summary["note"] = json!("--max-characters was ignored: a file is written in full");
     }
     (summary, EXIT_OK)
 }
@@ -1121,7 +1114,9 @@ fn locate_descriptor(given: &Path) -> PathBuf {
     // Only a bare name can be one: anything with a separator or an extension was
     // meant as a path, and treating it as a name would answer a mistyped path
     // with a confusing "no such workflow".
-    let bare = given.parent().is_none_or(|parent| parent.as_os_str().is_empty())
+    let bare = given
+        .parent()
+        .is_none_or(|parent| parent.as_os_str().is_empty())
         && given.extension().is_none();
     if !bare {
         return given.to_path_buf();
@@ -1148,7 +1143,7 @@ fn read_descriptor(path: &Path) -> Result<Value, Value> {
             // resolve is most likely a workflow the caller thought was saved.
             Some(json!({
                 "hint": "If you meant a saved workflow, `aad workflows` lists the \
-ones that exist."
+            ones that exist."
             })),
         )
     })?;
@@ -1238,10 +1233,7 @@ fn list_saved_workflows() -> (Value, u8) {
                 EXIT_OK,
             )
         }
-        Err(error) => (
-            failure(error.code, &error.message, None),
-            EXIT_FAILED,
-        ),
+        Err(error) => (failure(error.code, &error.message, None), EXIT_FAILED),
     }
 }
 
@@ -1262,18 +1254,15 @@ fn explain_workflow(name: &str) -> (Value, u8) {
             // Say which workflows exist: a mistyped name is the likeliest reason
             // to be here, and the list is one command away.
             let mut payload = payload;
-            payload["error"]["hint"] =
-                json!("`aad workflows` lists the ones that are saved.");
+            payload["error"]["hint"] = json!("`aad workflows` lists the ones that are saved.");
             return (payload, EXIT_USAGE);
         }
     };
 
     // Compiled as well as read, so a workflow that would not run says so here
     // rather than at the moment someone relies on it.
-    let compiled = aad_core::compiler::compile_descriptor(
-        document.clone(),
-        path.parent().map(Into::into),
-    );
+    let compiled =
+        aad_core::compiler::compile_descriptor(document.clone(), path.parent().map(Into::into));
     let problem = compiled.as_ref().err().map(|error| {
         // I dropped these when this was written, which left the report saying only
         // "invalid" -- an error nobody can act on. `validate` had them all along.
@@ -1314,17 +1303,13 @@ fn explain_workflow(name: &str) -> (Value, u8) {
         // The window and locator live on the two steps that prepared this one.
         let window = steps
             .iter()
-            .find(|other| {
-                other.get("id").and_then(Value::as_str) == Some(&format!("{id}_window"))
-            })
+            .find(|other| other.get("id").and_then(Value::as_str) == Some(&format!("{id}_window")))
             .and_then(|other| other.get("with"))
             .and_then(|with| with.get("window"))
             .cloned();
         let locator = steps
             .iter()
-            .find(|other| {
-                other.get("id").and_then(Value::as_str) == Some(&format!("{id}_element"))
-            })
+            .find(|other| other.get("id").and_then(Value::as_str) == Some(&format!("{id}_element")))
             .and_then(|other| other.get("with"))
             .and_then(|with| with.get("locator"))
             .cloned();
@@ -1413,7 +1398,7 @@ fn mistaken_for_a_workflow(document: &Value) -> Option<Value> {
         Some(json!({
             "kind": kind,
             "hint": "A recording is the editable form. Open it in the desktop app, \
-or run the workflow saved beside it -- `aad workflows` lists those.",
+        or run the workflow saved beside it -- `aad workflows` lists those.",
         })),
     ))
 }
@@ -1489,7 +1474,11 @@ fn run_workflow(args: &RunArgs) -> (Value, u8) {
             Ok(Value::Object(map)) => map,
             Ok(_) => {
                 return (
-                    failure("CLI.INVALID_ARGUMENTS", "--inputs must be a JSON object", None),
+                    failure(
+                        "CLI.INVALID_ARGUMENTS",
+                        "--inputs must be a JSON object",
+                        None,
+                    ),
                     EXIT_USAGE,
                 )
             }
@@ -1643,7 +1632,11 @@ fn durable_options(
             Ok(Value::Object(map)) => options = options.with_inputs(map),
             Ok(_) => {
                 return Err((
-                    failure("CLI.INVALID_ARGUMENTS", "--inputs must be a JSON object", None),
+                    failure(
+                        "CLI.INVALID_ARGUMENTS",
+                        "--inputs must be a JSON object",
+                        None,
+                    ),
                     EXIT_USAGE,
                 ))
             }
@@ -1698,14 +1691,11 @@ fn start_run(args: &StartArgs) -> (Value, u8) {
         Ok(descriptor) => descriptor,
         Err(result) => return result,
     };
-    let options = match durable_options(
-        args.inputs.as_ref(),
-        args.owner_id.as_ref(),
-        args.lease_ttl,
-    ) {
-        Ok(options) => options,
-        Err(result) => return result,
-    };
+    let options =
+        match durable_options(args.inputs.as_ref(), args.owner_id.as_ref(), args.lease_ttl) {
+            Ok(options) => options,
+            Err(result) => return result,
+        };
 
     // Opened separately from `with_store` because the executor takes ownership
     // of the connection for the whole run.
@@ -1870,7 +1860,10 @@ fn list_events(args: &EventsArgs) -> (Value, u8) {
             .map_err(journal_failure)?;
         // `nextAfterSeq` lets a caller tail the history without re-reading it,
         // and holds its position when the page came back empty.
-        let next = events.last().map(|event| event.seq).unwrap_or(args.after_seq);
+        let next = events
+            .last()
+            .map(|event| event.seq)
+            .unwrap_or(args.after_seq);
         Ok(json!({
             "count": events.len(),
             "events": events.iter().map(|event| event.to_json()).collect::<Vec<_>>(),
@@ -1907,11 +1900,14 @@ mod tests {
         let issues = payload["error"]["issues"]
             .as_array()
             .expect("issues are reported");
-        assert!(!issues.is_empty(), "an error without a location cannot be fixed");
         assert!(
-            issues
-                .iter()
-                .any(|issue| issue["path"].as_str().is_some_and(|path| path.contains("name"))),
+            !issues.is_empty(),
+            "an error without a location cannot be fixed"
+        );
+        assert!(
+            issues.iter().any(|issue| issue["path"]
+                .as_str()
+                .is_some_and(|path| path.contains("name"))),
             "the offending path is named: {issues:?}"
         );
         let _ = std::fs::remove_file(&path);
@@ -2048,7 +2044,10 @@ mod tests {
             .clone()
             .render_long_help()
             .to_string();
-        assert!(help.contains("--save"), "no way to keep a recording: {help}");
+        assert!(
+            help.contains("--save"),
+            "no way to keep a recording: {help}"
+        );
         assert!(
             help.contains("--overwrite"),
             "replacing has to be asked for: {help}"
@@ -2142,7 +2141,10 @@ mod tests {
             ..Default::default()
         }));
 
-        assert_ne!(code, EXIT_USAGE, "protected alone must be a valid criterion");
+        assert_ne!(
+            code, EXIT_USAGE,
+            "protected alone must be a valid criterion"
+        );
         assert_ne!(payload["error"]["code"], "CLI.INVALID_ARGUMENTS");
     }
 
@@ -2165,7 +2167,10 @@ mod tests {
             },
         ] {
             let (payload, code) = dispatch(&Command::Find(args));
-            assert_ne!(code, EXIT_USAGE, "a position alone must be a valid criterion");
+            assert_ne!(
+                code, EXIT_USAGE,
+                "a position alone must be a valid criterion"
+            );
             assert_ne!(payload["error"]["code"], "CLI.INVALID_ARGUMENTS");
         }
     }
@@ -2201,10 +2206,19 @@ mod tests {
         // matches several and therefore nothing -- a locator that looks specific
         // and finds none.
         let refused = Cli::try_parse_from([
-            "aad", "find", "hwnd:1", "--role", "button", "--in-role", "tool_bar",
+            "aad",
+            "find",
+            "hwnd:1",
+            "--role",
+            "button",
+            "--in-role",
+            "tool_bar",
         ]);
 
-        assert!(refused.is_err(), "a container role without a container must be refused");
+        assert!(
+            refused.is_err(),
+            "a container role without a container must be refused"
+        );
     }
 
     #[test]
@@ -2213,16 +2227,7 @@ mod tests {
         // object at the top level. One flag for both would send `40` and
         // `tool_bar` to the same place.
         let args = Cli::parse_from([
-            "aad",
-            "find",
-            "hwnd:1",
-            "--role",
-            "edit",
-            "--near",
-            "Name:",
-            "--within",
-            "40",
-            "--in",
+            "aad", "find", "hwnd:1", "--role", "edit", "--near", "Name:", "--within", "40", "--in",
             "Details",
         ]);
         let Command::Find(find) = args.command else {
@@ -2298,7 +2303,10 @@ mod tests {
 
         assert_eq!(code, EXIT_USAGE);
         assert_eq!(payload["error"]["code"], "CLI.INVALID_ARGUMENTS");
-        assert!(payload["error"]["hint"].as_str().unwrap().contains("aad find"));
+        assert!(payload["error"]["hint"]
+            .as_str()
+            .unwrap()
+            .contains("aad find"));
     }
 
     #[test]
@@ -2367,7 +2375,10 @@ mod tests {
         assert_eq!(code, EXIT_OK, "{payload}");
         assert_eq!(payload["status"], "valid");
         assert_eq!(payload["workflow"], "demo");
-        assert!(payload["plan_digest"].as_str().unwrap().starts_with("sha256:"));
+        assert!(payload["plan_digest"]
+            .as_str()
+            .unwrap()
+            .starts_with("sha256:"));
     }
 
     #[test]
@@ -2592,10 +2603,8 @@ mod tests {
 
     impl TempDir {
         fn new(name: &str) -> Self {
-            let path = std::env::temp_dir().join(format!(
-                "aad-cli-durable-{name}-{}",
-                std::process::id()
-            ));
+            let path =
+                std::env::temp_dir().join(format!("aad-cli-durable-{name}-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&path);
             std::fs::create_dir_all(&path).expect("the temp directory can be created");
             Self { path }
@@ -2647,7 +2656,10 @@ mod tests {
         assert_eq!(payload["output"]["total"], 2);
         assert_eq!(payload["output"]["echo"], "agent");
         // The store must be a real file, otherwise nothing was durable.
-        assert!(temp.store().store.exists(), "the run store must exist on disk");
+        assert!(
+            temp.store().store.exists(),
+            "the run store must exist on disk"
+        );
     }
 
     #[test]
@@ -2772,8 +2784,8 @@ mod tests {
     fn a_pause_request_records_intent_without_claiming_it_took_effect() {
         let temp = TempDir::new("pause");
         // A pending run: created but not executed, so intent is observable.
-        let store = aad_runtime::durable::JournalStore::open(&temp.store().store)
-            .expect("the store opens");
+        let store =
+            aad_runtime::durable::JournalStore::open(&temp.store().store).expect("the store opens");
         let descriptor = durable_descriptor(&temp.workflow()).expect("compiles");
         store
             .create_run(
@@ -2813,8 +2825,8 @@ mod tests {
     #[test]
     fn a_cancel_request_is_sticky_and_cannot_be_downgraded_to_a_pause() {
         let temp = TempDir::new("sticky");
-        let store = aad_runtime::durable::JournalStore::open(&temp.store().store)
-            .expect("the store opens");
+        let store =
+            aad_runtime::durable::JournalStore::open(&temp.store().store).expect("the store opens");
         let descriptor = durable_descriptor(&temp.workflow()).expect("compiles");
         store
             .create_run(
@@ -2873,8 +2885,8 @@ mod tests {
     #[test]
     fn a_cancel_requested_before_execution_stops_the_run_without_running_it() {
         let temp = TempDir::new("cancelfirst");
-        let store = aad_runtime::durable::JournalStore::open(&temp.store().store)
-            .expect("the store opens");
+        let store =
+            aad_runtime::durable::JournalStore::open(&temp.store().store).expect("the store opens");
         let descriptor = durable_descriptor(&temp.workflow()).expect("compiles");
         store
             .create_run(
@@ -2919,8 +2931,8 @@ mod tests {
         // must actually finish the run. An operator has no way to clear the
         // recorded pause themselves, so resume has to do it.
         let temp = TempDir::new("pauseresume");
-        let store = aad_runtime::durable::JournalStore::open(&temp.store().store)
-            .expect("the store opens");
+        let store =
+            aad_runtime::durable::JournalStore::open(&temp.store().store).expect("the store opens");
         let descriptor = durable_descriptor(&temp.workflow()).expect("compiles");
         store
             .create_run(
@@ -2943,8 +2955,8 @@ mod tests {
 
         // The runner honours the pause before dispatching anything, which is
         // what leaves a resumable checkpoint behind.
-        let store = aad_runtime::durable::JournalStore::open(&temp.store().store)
-            .expect("the store opens");
+        let store =
+            aad_runtime::durable::JournalStore::open(&temp.store().store).expect("the store opens");
         let paused = aad_runtime::durable_exec::DurableExecutor::new(store)
             .execute(
                 &descriptor,
@@ -3020,7 +3032,10 @@ mod tests {
         assert_eq!(code, EXIT_FAILED);
         assert_eq!(payload["error"]["code"], "DURABLE.UNSUPPORTED_PLAN");
         // Naming the step is what makes the refusal actionable.
-        assert_eq!(payload["error"]["details"]["unsupportedSteps"], json!(["press"]));
+        assert_eq!(
+            payload["error"]["details"]["unsupportedSteps"],
+            json!(["press"])
+        );
     }
 
     #[test]
@@ -3043,7 +3058,9 @@ mod tests {
         // `run --journal` truncates the file it is given. If the durable store
         // used the same flag name, one wrong command would destroy a run store.
         let command = Cli::command();
-        for name in ["start", "resume", "status", "pause", "cancel", "list", "events"] {
+        for name in [
+            "start", "resume", "status", "pause", "cancel", "list", "events",
+        ] {
             let sub = command
                 .get_subcommands()
                 .find(|sub| sub.get_name() == name)

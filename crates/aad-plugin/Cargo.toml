@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
 description = "NDJSON subprocess plugin host for ai-auto-desktop"
 
 [dependencies]
@@ -24,3 +25,7 @@ windows-sys = { version = "0.59", features = [
 
 [dev-dependencies]
 serde_json = { workspace = true }
+
+# Inherit the workspace's deliberate lint allowances (see the root Cargo.toml).
+[lints]
+workspace = true

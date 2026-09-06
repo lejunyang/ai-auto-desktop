@@ -18,34 +18,83 @@ pub const KIND: &str = "Workflow";
 pub const MAX_DESCRIPTOR_BYTES: usize = 2 * 1024 * 1024;
 
 const TOP_FIELDS: &[&str] = &[
-    "apiVersion", "kind", "metadata", "requires", "inputs", "variables", "outputs", "defaults",
-    "budgets", "policy", "steps", "on_error", "finally", "extensions",
+    "apiVersion",
+    "kind",
+    "metadata",
+    "requires",
+    "inputs",
+    "variables",
+    "outputs",
+    "defaults",
+    "budgets",
+    "policy",
+    "steps",
+    "on_error",
+    "finally",
+    "extensions",
 ];
 const COMMON_FIELDS: &[&str] = &[
-    "id", "type", "depends_on", "description", "if", "timeout", "attempt_timeout", "retry",
-    "on_error", "finally", "extensions",
+    "id",
+    "type",
+    "depends_on",
+    "description",
+    "if",
+    "timeout",
+    "attempt_timeout",
+    "retry",
+    "on_error",
+    "finally",
+    "extensions",
 ];
 const EFFECT_CLASSES: &[&str] = &["read_only", "idempotent", "non_idempotent", "contextual"];
 const RISK_CATEGORIES: &[&str] = &[
-    "observe", "navigate", "input", "modify", "send", "delete", "purchase", "authorize", "install",
-    "execute_script", "capture_screen", "custom",
+    "observe",
+    "navigate",
+    "input",
+    "modify",
+    "send",
+    "delete",
+    "purchase",
+    "authorize",
+    "install",
+    "execute_script",
+    "capture_screen",
+    "custom",
 ];
 const RISK_LEVELS: &[&str] = &["low", "medium", "high", "critical", "contextual"];
 
 fn type_fields(step_type: &str) -> Option<&'static [&'static str]> {
     Some(match step_type {
         "action" => &[
-            "uses", "with", "effect", "risk", "precondition", "postcondition", "sensitivity",
+            "uses",
+            "with",
+            "effect",
+            "risk",
+            "precondition",
+            "postcondition",
+            "sensitivity",
             "checkpoint",
         ],
         "set" => &["assign"],
         "if" => &["condition", "then", "else"],
         "switch" => &["cases", "default"],
-        "foreach" => &["items", "as", "index_as", "max_items", "concurrency", "steps"],
+        "foreach" => &[
+            "items",
+            "as",
+            "index_as",
+            "max_items",
+            "concurrency",
+            "steps",
+        ],
         "while" => &["condition", "max_iterations", "steps"],
         "block" => &["steps"],
         "script" => &[
-            "runtime", "source", "entrypoint", "inputs", "output_schema", "sandbox",
+            "runtime",
+            "source",
+            "entrypoint",
+            "inputs",
+            "output_schema",
+            "sandbox",
         ],
         "fail" => &["error"],
         "return" => &["value"],
@@ -206,7 +255,11 @@ impl Compiler {
         self.issues.push(DescriptorIssue::new(path, message, code));
     }
 
-    fn object<'a>(&mut self, value: Option<&'a Value>, path: &str) -> Option<&'a Map<String, Value>> {
+    fn object<'a>(
+        &mut self,
+        value: Option<&'a Value>,
+        path: &str,
+    ) -> Option<&'a Map<String, Value>> {
         match value {
             Some(Value::Object(map)) => Some(map),
             _ => {
@@ -249,11 +302,7 @@ impl Compiler {
     fn duration(&mut self, value: Option<&Value>, path: &str) {
         match value.and_then(Value::as_str).and_then(parse_duration) {
             Some(_) => {}
-            None => self.issue(
-                path,
-                "must be a duration such as 250ms or 2s",
-                "format",
-            ),
+            None => self.issue(path, "must be a duration such as 250ms or 2s", "format"),
         }
     }
 
@@ -283,7 +332,11 @@ impl Compiler {
             return;
         };
         let Some(inner) = whole_template(text) else {
-            self.issue(path, "must be one complete expression template", "expression");
+            self.issue(
+                path,
+                "must be one complete expression template",
+                "expression",
+            );
             return;
         };
         if let Err(error) = compile_expression(inner) {
@@ -418,12 +471,18 @@ impl Compiler {
                         continue;
                     }
                     // A sibling that is present is checked for a declared edge.
-                    // One that is absent is a name that resolves to nothing --
-                    // previously it was filtered out here and only surfaced at
-                    // run time as EXPRESSION.EVALUATION_FAILED, by which point
-                    // the earlier steps have already touched the interface. A
-                    // step id known in another scope is not a typo, so it is
-                    // reported the way a cross-scope dependency is.
+                    //
+                    // A step belonging to an enclosing scope is deliberately
+                    // left alone: the spec makes an outer completed step
+                    // visible inside a nested scope, and it needs no
+                    // `depends_on` because the nesting already orders it before
+                    // this step. Reporting it rejected every `if` / `switch`
+                    // branch that reads an earlier top-level step.
+                    //
+                    // A name that matches nothing anywhere is still an error: it
+                    // would otherwise only surface at run time as
+                    // EXPRESSION.EVALUATION_FAILED, by which point the earlier
+                    // steps have already touched the interface.
                     if by_id.contains_key(reference.as_str()) {
                         if !covered.contains(reference) {
                             self.issue(
@@ -434,15 +493,7 @@ impl Compiler {
                                 "uncovered_step_reference",
                             );
                         }
-                    } else if self.ids.contains_key(reference) {
-                        self.issue(
-                            entry.path.clone(),
-                            format!(
-                                "steps reference '{reference}' is outside sibling scope                                  {scope_path}"
-                            ),
-                            "cross_scope_step_reference",
-                        );
-                    } else {
+                    } else if !self.ids.contains_key(reference) {
                         self.issue(
                             entry.path.clone(),
                             format!("steps reference '{reference}' is not a step in this workflow"),
@@ -475,12 +526,20 @@ impl Compiler {
             if let Some(backoff) = self.object(Some(backoff_value), &backoff_path).cloned() {
                 self.unknown(
                     &backoff,
-                    &["strategy", "initial_delay", "max_delay", "multiplier", "jitter"],
+                    &[
+                        "strategy",
+                        "initial_delay",
+                        "max_delay",
+                        "multiplier",
+                        "jitter",
+                    ],
                     &backoff_path,
                 );
                 self.required(&backoff, &["strategy", "initial_delay"], &backoff_path);
-                if !matches!(backoff.get("strategy").and_then(Value::as_str), Some("fixed" | "exponential"))
-                {
+                if !matches!(
+                    backoff.get("strategy").and_then(Value::as_str),
+                    Some("fixed" | "exponential")
+                ) {
                     self.issue(
                         format!("{backoff_path}.strategy"),
                         "must be fixed or exponential",
@@ -555,7 +614,8 @@ impl Compiler {
         {
             self.issue(format!("{path}.level"), "invalid risk level", "enum");
         }
-        if category == Some("custom") && !matches!(object.get("custom_name"), Some(Value::String(_)))
+        if category == Some("custom")
+            && !matches!(object.get("custom_name"), Some(Value::String(_)))
         {
             self.issue(
                 format!("{path}.custom_name"),
@@ -578,7 +638,11 @@ impl Compiler {
         };
         self.unknown(&object, &["uses", "with"], path);
         self.required(&object, &["uses", "with"], path);
-        if !object.get("uses").and_then(Value::as_str).is_some_and(is_uses) {
+        if !object
+            .get("uses")
+            .and_then(Value::as_str)
+            .is_some_and(is_uses)
+        {
             self.issue(
                 format!("{path}.uses"),
                 "must match capability.action@major",
@@ -598,7 +662,13 @@ impl Compiler {
             return;
         };
         let allowed: &[&str] = if post {
-            &["condition", "message", "timeout", "poll_interval", "observe"]
+            &[
+                "condition",
+                "message",
+                "timeout",
+                "poll_interval",
+                "observe",
+            ]
         } else {
             &["condition", "message", "timeout", "poll_interval"]
         };
@@ -607,7 +677,10 @@ impl Compiler {
         if object.contains_key("condition") {
             self.expression(object.get("condition"), &format!("{path}.condition"));
         }
-        if object.get("message").is_some_and(|value| !value.is_string()) {
+        if object
+            .get("message")
+            .is_some_and(|value| !value.is_string())
+        {
             self.issue(format!("{path}.message"), "must be a string", "type");
         }
         if post && object.contains_key("observe") {
@@ -695,7 +768,8 @@ impl Compiler {
                     }
                 }
                 handler.match_codes = string_list(matcher.get("codes")).unwrap_or_default();
-                handler.match_categories = string_list(matcher.get("categories")).unwrap_or_default();
+                handler.match_categories =
+                    string_list(matcher.get("categories")).unwrap_or_default();
                 handler.match_effects = string_list(matcher.get("effects")).unwrap_or_default();
                 if handler.match_codes.is_empty() && matcher.get("codes").is_none() {
                     handler.match_codes = vec!["*".to_string()];
@@ -714,7 +788,11 @@ impl Compiler {
             if let Some(outcome) = self.object(Some(outcome_value), &outcome_path).cloned() {
                 self.unknown(&outcome, &["mode", "output"], &outcome_path);
                 self.required(&outcome, &["mode"], &outcome_path);
-                match outcome.get("mode").and_then(Value::as_str).map(HandlerMode::parse) {
+                match outcome
+                    .get("mode")
+                    .and_then(Value::as_str)
+                    .map(HandlerMode::parse)
+                {
                     Some(Some(mode)) => handler.mode = mode,
                     None => {}
                     Some(None) => self.issue(
@@ -788,7 +866,10 @@ impl Compiler {
         let object = self.object(Some(value), path).cloned()?;
         self.required(&object, &["id", "type"], path);
 
-        let raw_type = object.get("type").and_then(Value::as_str).unwrap_or_default();
+        let raw_type = object
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
         let mut allowed: Vec<&str> = COMMON_FIELDS.to_vec();
         allowed.extend(type_fields(raw_type).unwrap_or(&[]));
         self.unknown(&object, &allowed, path);
@@ -830,7 +911,10 @@ impl Compiler {
             Some(raw) => {
                 let mut built = Vec::new();
                 let mut seen = HashSet::new();
-                if let Some(items) = self.array(Some(raw), &format!("{path}.depends_on")).cloned() {
+                if let Some(items) = self
+                    .array(Some(raw), &format!("{path}.depends_on"))
+                    .cloned()
+                {
                     for (index, dependency) in items.iter().enumerate() {
                         let dependency_path = format!("{path}.depends_on[{index}]");
                         match dependency.as_str() {
@@ -845,11 +929,7 @@ impl Compiler {
                                     built.push(name.to_string());
                                 }
                             }
-                            _ => self.issue(
-                                dependency_path,
-                                "must be a valid step id",
-                                "format",
-                            ),
+                            _ => self.issue(dependency_path, "must be a valid step id", "format"),
                         }
                     }
                 }
@@ -877,7 +957,15 @@ impl Compiler {
         };
 
         const STRUCTURAL: &[&str] = &[
-            "id", "type", "depends_on", "on_error", "finally", "steps", "then", "else", "cases",
+            "id",
+            "type",
+            "depends_on",
+            "on_error",
+            "finally",
+            "steps",
+            "then",
+            "else",
+            "cases",
             "default",
         ];
         let params: Map<String, Value> = object
@@ -907,7 +995,9 @@ impl Compiler {
             }
             StepType::Switch => {
                 self.required(&object, &["cases"], path);
-                if let Some(raw_cases) = self.array(object.get("cases"), &format!("{path}.cases")).cloned()
+                if let Some(raw_cases) = self
+                    .array(object.get("cases"), &format!("{path}.cases"))
+                    .cloned()
                 {
                     for (index, raw_case) in raw_cases.iter().enumerate() {
                         let case_path = format!("{path}.cases[{index}]");
@@ -963,7 +1053,11 @@ impl Compiler {
 
     fn action_step(&mut self, object: &Map<String, Value>, path: &str) {
         self.required(object, &["uses", "with"], path);
-        if !object.get("uses").and_then(Value::as_str).is_some_and(is_uses) {
+        if !object
+            .get("uses")
+            .and_then(Value::as_str)
+            .is_some_and(is_uses)
+        {
             self.issue(
                 format!("{path}.uses"),
                 "must match capability.action@major",
@@ -983,10 +1077,18 @@ impl Compiler {
             self.risk(object.get("risk"), &format!("{path}.risk"));
         }
         if object.contains_key("precondition") {
-            self.assertion(object.get("precondition"), &format!("{path}.precondition"), false);
+            self.assertion(
+                object.get("precondition"),
+                &format!("{path}.precondition"),
+                false,
+            );
         }
         if object.contains_key("postcondition") {
-            self.assertion(object.get("postcondition"), &format!("{path}.postcondition"), true);
+            self.assertion(
+                object.get("postcondition"),
+                &format!("{path}.postcondition"),
+                true,
+            );
         }
         if object.contains_key("sensitivity") {
             self.action_sensitivity(object.get("sensitivity"), &format!("{path}.sensitivity"));
@@ -998,7 +1100,9 @@ impl Compiler {
 
     fn set_step(&mut self, object: &Map<String, Value>, path: &str) {
         self.required(object, &["assign"], path);
-        let Some(assign) = self.object(object.get("assign"), &format!("{path}.assign")).cloned()
+        let Some(assign) = self
+            .object(object.get("assign"), &format!("{path}.assign"))
+            .cloned()
         else {
             return;
         };
@@ -1007,9 +1111,7 @@ impl Compiler {
         }
         for (target, assigned) in &assign {
             // Nested writes such as vars.a.b are deliberately unsupported in v0.
-            let valid = target
-                .strip_prefix("vars.")
-                .is_some_and(is_identifier);
+            let valid = target.strip_prefix("vars.").is_some_and(is_identifier);
             if !valid {
                 self.issue(
                     format!("{path}.assign.{target}"),
@@ -1051,7 +1153,11 @@ impl Compiler {
                 }
             }
         }
-        let limit_key = if is_foreach { "max_items" } else { "max_iterations" };
+        let limit_key = if is_foreach {
+            "max_items"
+        } else {
+            "max_iterations"
+        };
         if !object
             .get(limit_key)
             .and_then(Value::as_u64)
@@ -1168,7 +1274,14 @@ impl Compiler {
         };
         self.unknown(
             &error,
-            &["code", "message", "category", "retryable", "effect", "details"],
+            &[
+                "code",
+                "message",
+                "category",
+                "retryable",
+                "effect",
+                "details",
+            ],
             &error_path,
         );
         self.required(&error, &["code", "message"], &error_path);
@@ -1331,7 +1444,12 @@ impl Compiler {
         };
         self.unknown(
             &budgets_map,
-            &["max_duration", "max_executed_steps", "cleanup_timeout", "max_concurrency"],
+            &[
+                "max_duration",
+                "max_executed_steps",
+                "cleanup_timeout",
+                "max_concurrency",
+            ],
             "$.budgets",
         );
         if root.contains_key("budgets") {
@@ -1418,7 +1536,13 @@ impl Compiler {
         );
         self.unknown(
             &policy,
-            &["allowed_risk", "confirmation", "untrusted_inputs", "screenshots", "desktop"],
+            &[
+                "allowed_risk",
+                "confirmation",
+                "untrusted_inputs",
+                "screenshots",
+                "desktop",
+            ],
             "$.policy",
         );
         for (key, value) in &policy {
@@ -1652,7 +1776,10 @@ fn transitive_dependencies(
 // ---------------------------------------------------------------------------
 
 /// Compile an already-parsed descriptor value.
-pub fn compile_descriptor(descriptor: Value, source: Option<PathBuf>) -> Result<WorkflowDescriptor> {
+pub fn compile_descriptor(
+    descriptor: Value,
+    source: Option<PathBuf>,
+) -> Result<WorkflowDescriptor> {
     Compiler::new(source).compile(descriptor)
 }
 
@@ -1770,13 +1897,18 @@ fn serde_path_to_error_check(
     impl<'de> serde::de::DeserializeSeed<'de> for UniqueKeysSeed {
         type Value = ();
 
-        fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> std::result::Result<(), D::Error> {
+        fn deserialize<D: Deserializer<'de>>(
+            self,
+            deserializer: D,
+        ) -> std::result::Result<(), D::Error> {
             deserializer.deserialize_any(UniqueKeys)
         }
     }
 
     impl<'de> Deserialize<'de> for UniqueKeysSeed {
-        fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        fn deserialize<D: Deserializer<'de>>(
+            deserializer: D,
+        ) -> std::result::Result<Self, D::Error> {
             deserializer.deserialize_any(UniqueKeys)?;
             Ok(UniqueKeysSeed)
         }
@@ -1790,9 +1922,7 @@ fn serde_path_to_error_check(
 /// Read and compile a descriptor from disk.
 pub fn load_descriptor(path: impl AsRef<Path>) -> Result<WorkflowDescriptor> {
     let path = path.as_ref();
-    let resolved = path
-        .canonicalize()
-        .unwrap_or_else(|_| path.to_path_buf());
+    let resolved = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     let text = std::fs::read_to_string(&resolved).map_err(|error| {
         AutomationError::descriptor_with(
             format!("Cannot read descriptor: {error}"),
@@ -1824,7 +1954,11 @@ mod tests {
     }
 
     fn issue_codes(error: &AutomationError) -> Vec<String> {
-        error.issues.iter().map(|issue| issue.code.clone()).collect()
+        error
+            .issues
+            .iter()
+            .map(|issue| issue.code.clone())
+            .collect()
     }
 
     #[test]
@@ -2080,7 +2214,8 @@ mod tests {
     #[test]
     fn budgets_are_mandatory_and_bounded() {
         let mut value = minimal(json!([{"id": "done", "type": "return"}]));
-        value["budgets"] = json!({"max_duration": "30s", "max_executed_steps": 10, "max_concurrency": 65});
+        value["budgets"] =
+            json!({"max_duration": "30s", "max_executed_steps": 10, "max_concurrency": 65});
 
         let error = compile(value).unwrap_err();
         assert!(issue_codes(&error).contains(&"range".to_string()));
@@ -2106,6 +2241,57 @@ mod tests {
             issue_codes(&error).contains(&"unknown_step_reference".to_string()),
             "a reference to a step that does not exist must be refused: {error}"
         );
+    }
+
+    #[test]
+    fn a_nested_step_may_read_an_enclosing_step() {
+        // The spec makes an outer completed step visible inside a nested scope,
+        // and the nesting already orders it before the branch, so no
+        // `depends_on` can or should be declared for it -- `depends_on` only
+        // accepts siblings.
+        //
+        // Regression: treating this as a cross-scope error rejected 6 of the 8
+        // tracked examples, every one of them an `if` / `switch` branch reading
+        // a previous top-level step, and all accepted by the Python compiler.
+        let value = minimal(json!([
+            {"id": "observe", "type": "action", "uses": "desktop.windows_uia.snapshot@1",
+             "with": {}},
+            {"id": "decide", "type": "if",
+             "condition": "${{ steps.observe.status == 'succeeded' }}",
+             "then": [
+                 {"id": "use_it", "type": "return",
+                  "value": "${{ steps.observe.output.snapshot_id }}"}
+             ],
+             "else": [
+                 {"id": "give_up", "type": "return", "value": null}
+             ]}
+        ]));
+
+        compile(value).expect("a nested step must be able to read an enclosing step");
+    }
+
+    #[test]
+    fn a_switch_branch_may_read_an_enclosing_step() {
+        // Same rule through the other branching construct, because `switch`
+        // cases and `default` are each their own scope as well.
+        let value = minimal(json!([
+            {"id": "observe", "type": "action", "uses": "desktop.windows_uia.snapshot@1",
+             "with": {}},
+            {"id": "pick", "type": "switch",
+             "cases": [
+                 {"when": "${{ steps.observe.status == 'succeeded' }}",
+                  "steps": [
+                      {"id": "hit", "type": "return",
+                       "value": "${{ steps.observe.output.snapshot_id }}"}
+                  ]}
+             ],
+             "default": [
+                 {"id": "miss", "type": "return",
+                  "value": "${{ steps.observe.status }}"}
+             ]}
+        ]));
+
+        compile(value).expect("a switch branch must be able to read an enclosing step");
     }
 
     #[test]
@@ -2149,7 +2335,8 @@ mod tests {
     #[test]
     fn a_required_input_cannot_also_have_a_default() {
         let mut value = minimal(json!([{"id": "done", "type": "return"}]));
-        value["inputs"] = json!({"name": {"schema": {"type": "string"}, "required": true, "default": "x"}});
+        value["inputs"] =
+            json!({"name": {"schema": {"type": "string"}, "required": true, "default": "x"}});
 
         let error = compile(value).unwrap_err();
         assert!(issue_codes(&error).contains(&"policy".to_string()));
@@ -2216,7 +2403,10 @@ steps:
     value: 1
 "#;
         let from_yaml = compile(parse_descriptor_text(yaml, "workflow.yaml").unwrap()).unwrap();
-        let from_json = compile(minimal(json!([{"id": "done", "type": "return", "value": 1}]))).unwrap();
+        let from_json = compile(minimal(
+            json!([{"id": "done", "type": "return", "value": 1}]),
+        ))
+        .unwrap();
 
         assert_eq!(from_yaml.name, from_json.name);
         assert_eq!(from_yaml.steps.len(), from_json.steps.len());

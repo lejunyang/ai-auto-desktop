@@ -65,7 +65,9 @@ fn main() {
             let mut current = node.parent_id.clone();
             let mut label = "(窗口本身)".to_string();
             while let Some(id) = current {
-                let Some(parent) = by_id.get(id.as_str()) else { break };
+                let Some(parent) = by_id.get(id.as_str()) else {
+                    break;
+                };
                 if parent.depth == 0 {
                     break;
                 }
@@ -79,7 +81,7 @@ fn main() {
         }
 
         all_groups += groups.len();
-        for (_, count) in groups.iter() {
+        for count in groups.values() {
             group_sizes.push(*count);
             if *count == 1 {
                 singleton_groups += 1;
@@ -105,7 +107,10 @@ fn main() {
         );
     }
 
-    println!("\n=== 汇总（{} 个窗口，{} 个可交互元素）===", windows_seen, totals);
+    println!(
+        "\n=== 汇总（{} 个窗口，{} 个可交互元素）===",
+        windows_seen, totals
+    );
     for (index, n) in [4usize, 8, 12, 16, 20].iter().enumerate() {
         println!(
             "  前 {:>2} 组覆盖 {:.0}%",

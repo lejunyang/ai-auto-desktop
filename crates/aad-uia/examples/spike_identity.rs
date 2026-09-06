@@ -61,7 +61,7 @@ unsafe extern "system" fn on_event(
     // Do not filter by object id yet: which ids these events carry is exactly
     // what is being measured. Filtering on a guess is how the first run of this
     // spike reported "no events" for clicks that the comparison spike saw.
-    
+
     let label = match event {
         EVENT_OBJECT_FOCUS => "focus",
         EVENT_OBJECT_INVOKED => "invoked",
@@ -70,7 +70,9 @@ unsafe extern "system" fn on_event(
         _ => return,
     };
 
-    let Some(automation) = AUTOMATION.get() else { return };
+    let Some(automation) = AUTOMATION.get() else {
+        return;
+    };
 
     // The question: does this hwnd resolve to the *control*, or only to the
     // top-level window? Only the former is usable for recording.
@@ -94,12 +96,9 @@ unsafe extern "system" fn on_event(
         Err(error) => format!("<could not resolve: {error}>"),
     };
 
-    REPORT
-        .lock()
-        .unwrap()
-        .push(format!(
-            "{label} id_object={id_object} id_child={id_child} -> {resolved}"
-        ));
+    REPORT.lock().unwrap().push(format!(
+        "{label} id_object={id_object} id_child={id_child} -> {resolved}"
+    ));
 }
 
 unsafe extern "system" fn enum_window(hwnd: HWND, _param: LPARAM) -> BOOL {
@@ -155,7 +154,10 @@ fn main() -> Result<()> {
             WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
         )
     };
-    println!("LISTENING on {needle:?} (hook_valid={})", !hook.is_invalid());
+    println!(
+        "LISTENING on {needle:?} (hook_valid={})",
+        !hook.is_invalid()
+    );
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(seconds);
     while std::time::Instant::now() < deadline {

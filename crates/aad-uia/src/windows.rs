@@ -15,48 +15,93 @@ use std::sync::Arc;
 use crate::backend::{Backend, CaptureLimits, CapturedTree, DriverError, Result};
 use crate::capture::{CapturedEvent, EventBuffer, EventKind};
 use crate::model::{Bounds, Node, States, WindowInfo};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{channel, Sender};
+use std::time::{Duration, Instant};
 use windows::core::{implement, BSTR, PWSTR};
 use windows::Win32::Foundation::{CloseHandle, BOOL, HWND, LPARAM, MAX_PATH, RECT, TRUE};
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED,
 };
 use windows::Win32::System::Threading::{
-    OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_FORMAT,
-    PROCESS_QUERY_LIMITED_INFORMATION,
+    OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_FORMAT, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 use windows::Win32::UI::Accessibility::{
-    CUIAutomation, IUIAutomation, IUIAutomationElement, IUIAutomationEventHandler,
-    IUIAutomationEventHandler_Impl, IUIAutomationInvokePattern,
-    IUIAutomationPropertyChangedEventHandler, IUIAutomationPropertyChangedEventHandler_Impl,
-    IUIAutomationLegacyIAccessiblePattern, IUIAutomationTogglePattern, IUIAutomationValuePattern,
-    SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK, TreeScope_Children, TreeScope_Subtree,
-    UIA_EVENT_ID, UIA_InvokePatternId, UIA_Invoke_InvokedEventId, UIA_LegacyIAccessiblePatternId,
-    UIA_PROPERTY_ID, UIA_SelectionItem_ElementSelectedEventId, UIA_TogglePatternId,
-    UIA_ToggleToggleStatePropertyId, UIA_ValuePatternId, UIA_ValueValuePropertyId,
+    CUIAutomation,
+    IUIAutomation,
+    IUIAutomationElement,
+    IUIAutomationEventHandler,
+    IUIAutomationEventHandler_Impl,
+    IUIAutomationInvokePattern,
+    IUIAutomationLegacyIAccessiblePattern,
+    IUIAutomationPropertyChangedEventHandler,
+    IUIAutomationPropertyChangedEventHandler_Impl,
+    IUIAutomationTogglePattern,
+    IUIAutomationValuePattern,
+    SetWinEventHook,
+    TreeScope_Children,
+    TreeScope_Subtree,
+    UIA_AppBarControlTypeId,
+    UIA_ButtonControlTypeId,
+    UIA_CalendarControlTypeId,
+    UIA_CheckBoxControlTypeId,
+    UIA_ComboBoxControlTypeId,
+    UIA_CustomControlTypeId,
+    UIA_DataGridControlTypeId,
+    UIA_DataItemControlTypeId,
+    UIA_DocumentControlTypeId,
+    UIA_EditControlTypeId,
+    UIA_GroupControlTypeId,
+    UIA_HeaderControlTypeId,
+    UIA_HeaderItemControlTypeId,
+    UIA_HyperlinkControlTypeId,
+    UIA_ImageControlTypeId,
+    UIA_InvokePatternId,
+    UIA_Invoke_InvokedEventId,
+    UIA_LegacyIAccessiblePatternId,
+    UIA_ListControlTypeId,
+    UIA_ListItemControlTypeId,
+    UIA_MenuBarControlTypeId,
+    UIA_MenuControlTypeId,
+    UIA_MenuItemControlTypeId,
+    UIA_PaneControlTypeId,
+    UIA_ProgressBarControlTypeId,
+    UIA_RadioButtonControlTypeId,
+    UIA_ScrollBarControlTypeId,
+    UIA_SelectionItem_ElementSelectedEventId,
+    UIA_SemanticZoomControlTypeId,
+    UIA_SeparatorControlTypeId,
+    UIA_SliderControlTypeId,
+    UIA_SpinnerControlTypeId,
+    UIA_SplitButtonControlTypeId,
+    UIA_StatusBarControlTypeId,
+    UIA_TabControlTypeId,
+    UIA_TabItemControlTypeId,
+    UIA_TableControlTypeId,
+    UIA_TextControlTypeId,
+    UIA_ThumbControlTypeId,
+    UIA_TitleBarControlTypeId,
+    UIA_TogglePatternId,
+    UIA_ToggleToggleStatePropertyId,
+    UIA_ToolBarControlTypeId,
+    UIA_ToolTipControlTypeId,
+    UIA_TreeControlTypeId,
+    UIA_TreeItemControlTypeId,
+    UIA_ValuePatternId,
+    UIA_ValueValuePropertyId,
+    UIA_WindowControlTypeId,
+    UnhookWinEvent,
+    HWINEVENTHOOK,
     // Control type ids. A role comes from these rather than from the localized
     // display string, which changes with the system language.
-    UIA_CONTROLTYPE_ID, UIA_AppBarControlTypeId, UIA_ButtonControlTypeId,
-    UIA_CalendarControlTypeId, UIA_CheckBoxControlTypeId, UIA_ComboBoxControlTypeId,
-    UIA_CustomControlTypeId, UIA_DataGridControlTypeId, UIA_DataItemControlTypeId,
-    UIA_DocumentControlTypeId, UIA_EditControlTypeId, UIA_GroupControlTypeId,
-    UIA_HeaderControlTypeId, UIA_HeaderItemControlTypeId, UIA_HyperlinkControlTypeId,
-    UIA_ImageControlTypeId, UIA_ListControlTypeId, UIA_ListItemControlTypeId,
-    UIA_MenuBarControlTypeId, UIA_MenuControlTypeId, UIA_MenuItemControlTypeId,
-    UIA_PaneControlTypeId, UIA_ProgressBarControlTypeId, UIA_RadioButtonControlTypeId,
-    UIA_ScrollBarControlTypeId, UIA_SemanticZoomControlTypeId, UIA_SeparatorControlTypeId,
-    UIA_SliderControlTypeId, UIA_SpinnerControlTypeId, UIA_SplitButtonControlTypeId,
-    UIA_StatusBarControlTypeId, UIA_TabControlTypeId, UIA_TabItemControlTypeId,
-    UIA_TableControlTypeId, UIA_TextControlTypeId, UIA_ThumbControlTypeId,
-    UIA_TitleBarControlTypeId, UIA_ToolBarControlTypeId, UIA_ToolTipControlTypeId,
-    UIA_TreeControlTypeId, UIA_TreeItemControlTypeId, UIA_WindowControlTypeId,
+    UIA_CONTROLTYPE_ID,
+    UIA_EVENT_ID,
+    UIA_PROPERTY_ID,
 };
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{channel, Sender};
-use std::time::{Duration, Instant};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    SendInput, INPUT, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_KEYUP,
-    KEYEVENTF_UNICODE, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
-    MOUSEEVENTF_MOVE, MOUSEEVENTF_VIRTUALDESK, MOUSEINPUT,
+    SendInput, INPUT, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE,
+    MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MOVE,
+    MOUSEEVENTF_VIRTUALDESK, MOUSEINPUT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, EnumWindows, GetAncestor, GetClassNameW, GetForegroundWindow,
@@ -90,9 +135,8 @@ fn ensure_com() {
 
 fn automation() -> Result<IUIAutomation> {
     ensure_com();
-    unsafe { CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER) }.map_err(|error| {
-        DriverError::unavailable(format!("UI Automation is unavailable: {error}"))
-    })
+    unsafe { CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER) }
+        .map_err(|error| DriverError::unavailable(format!("UI Automation is unavailable: {error}")))
 }
 
 /// The native Windows backend.
@@ -146,8 +190,7 @@ impl WindowsUiaBackend {
 
             if depth < limits.max_depth {
                 if let Some(condition) = condition.as_ref() {
-                    if let Ok(children) =
-                        unsafe { element.FindAll(TreeScope_Children, condition) }
+                    if let Ok(children) = unsafe { element.FindAll(TreeScope_Children, condition) }
                     {
                         let count = unsafe { children.Length() }.unwrap_or(0);
                         for index in 0..count {
@@ -273,8 +316,9 @@ impl Backend for WindowsUiaBackend {
 
     fn focus(&self, window_id: &str, node: &Node) -> Result<()> {
         let element = self.require(window_id, node)?;
-        unsafe { element.SetFocus() }
-            .map_err(|error| DriverError::new("DRIVER.ACTION_FAILED", format!("focus failed: {error}")))
+        unsafe { element.SetFocus() }.map_err(|error| {
+            DriverError::new("DRIVER.ACTION_FAILED", format!("focus failed: {error}"))
+        })
     }
 
     fn invoke(&self, window_id: &str, node: &Node) -> Result<()> {
@@ -282,13 +326,17 @@ impl Backend for WindowsUiaBackend {
 
         // Prefer a real control pattern: it is far more reliable than input
         // synthesis and does not depend on the window being frontmost.
-        if let Ok(pattern) = unsafe { element.GetCurrentPatternAs::<IUIAutomationInvokePattern>(UIA_InvokePatternId) } {
+        if let Ok(pattern) = unsafe {
+            element.GetCurrentPatternAs::<IUIAutomationInvokePattern>(UIA_InvokePatternId)
+        } {
             return unsafe { pattern.Invoke() }.map_err(|error| {
                 DriverError::new("DRIVER.ACTION_FAILED", format!("invoke failed: {error}"))
                     .with_effect("unknown")
             });
         }
-        if let Ok(pattern) = unsafe { element.GetCurrentPatternAs::<IUIAutomationTogglePattern>(UIA_TogglePatternId) } {
+        if let Ok(pattern) = unsafe {
+            element.GetCurrentPatternAs::<IUIAutomationTogglePattern>(UIA_TogglePatternId)
+        } {
             return unsafe { pattern.Toggle() }.map_err(|error| {
                 DriverError::new("DRIVER.ACTION_FAILED", format!("toggle failed: {error}"))
                     .with_effect("unknown")
@@ -300,8 +348,11 @@ impl Backend for WindowsUiaBackend {
             )
         } {
             return unsafe { pattern.DoDefaultAction() }.map_err(|error| {
-                DriverError::new("DRIVER.ACTION_FAILED", format!("default action failed: {error}"))
-                    .with_effect("unknown")
+                DriverError::new(
+                    "DRIVER.ACTION_FAILED",
+                    format!("default action failed: {error}"),
+                )
+                .with_effect("unknown")
             });
         }
 
@@ -313,13 +364,14 @@ impl Backend for WindowsUiaBackend {
 
     fn set_value(&self, window_id: &str, node: &Node, value: &str) -> Result<()> {
         let element = self.require(window_id, node)?;
-        let pattern = unsafe { element.GetCurrentPatternAs::<IUIAutomationValuePattern>(UIA_ValuePatternId) }
-            .map_err(|_| {
-                DriverError::new(
-                    "DRIVER.ACTION_UNSUPPORTED",
-                    "the element does not expose a value pattern",
-                )
-            })?;
+        let pattern =
+            unsafe { element.GetCurrentPatternAs::<IUIAutomationValuePattern>(UIA_ValuePatternId) }
+                .map_err(|_| {
+                    DriverError::new(
+                        "DRIVER.ACTION_UNSUPPORTED",
+                        "the element does not expose a value pattern",
+                    )
+                })?;
 
         let before = unsafe { pattern.CurrentValue() }
             .ok()
@@ -343,13 +395,19 @@ impl Backend for WindowsUiaBackend {
         // Polling costs nothing when the write worked -- it returns as soon as
         // the value moves -- and the full wait is only paid when the value
         // really is stuck, which is the case worth being sure about.
-        let mut after = None;
+        // Assigned on the first iteration before it is read, so it needs no
+        // initial value of its own.
+        let mut after;
         let deadline = Instant::now() + VALUE_SETTLE_TIMEOUT;
         loop {
             after = unsafe { pattern.CurrentValue() }
                 .ok()
                 .map(|value| value.to_string());
-            if settled(before.as_deref(), after.as_deref(), Instant::now() >= deadline) {
+            if settled(
+                before.as_deref(),
+                after.as_deref(),
+                Instant::now() >= deadline,
+            ) {
                 break;
             }
             std::thread::sleep(VALUE_POLL_INTERVAL);
@@ -648,9 +706,8 @@ impl WindowsUiaBackend {
     }
 
     fn require(&self, window_id: &str, node: &Node) -> Result<IUIAutomationElement> {
-        self.locate(window_id, node)?.ok_or_else(|| {
-            DriverError::stale("the element is no longer present in the window")
-        })
+        self.locate(window_id, node)?
+            .ok_or_else(|| DriverError::stale("the element is no longer present in the window"))
     }
 }
 
@@ -665,7 +722,10 @@ fn describe_element(
     parent_id: Option<String>,
 ) -> Node {
     let text = |result: windows::core::Result<BSTR>| -> Option<String> {
-        result.ok().map(|value| value.to_string()).filter(|value| !value.is_empty())
+        result
+            .ok()
+            .map(|value| value.to_string())
+            .filter(|value| !value.is_empty())
     };
     let flag = |result: windows::core::Result<BOOL>| -> Option<bool> {
         result.ok().map(|value| value.as_bool())
@@ -682,26 +742,30 @@ fn describe_element(
     // for a reason nobody would think to look for.
     let role = control_type_name(unsafe { element.CurrentControlType() }.unwrap_or_default());
 
-    let value = unsafe { element.GetCurrentPatternAs::<IUIAutomationValuePattern>(UIA_ValuePatternId) }
-        .ok()
-        .and_then(|pattern| unsafe { pattern.CurrentValue() }.ok())
-        .map(|value| value.to_string())
-        .filter(|value| !value.is_empty());
+    let value =
+        unsafe { element.GetCurrentPatternAs::<IUIAutomationValuePattern>(UIA_ValuePatternId) }
+            .ok()
+            .and_then(|pattern| unsafe { pattern.CurrentValue() }.ok())
+            .map(|value| value.to_string())
+            .filter(|value| !value.is_empty());
 
-    let read_only = unsafe { element.GetCurrentPatternAs::<IUIAutomationValuePattern>(UIA_ValuePatternId) }
-        .ok()
-        .and_then(|pattern| unsafe { pattern.CurrentIsReadOnly() }.ok())
-        .map(|value| value.as_bool());
+    let read_only =
+        unsafe { element.GetCurrentPatternAs::<IUIAutomationValuePattern>(UIA_ValuePatternId) }
+            .ok()
+            .and_then(|pattern| unsafe { pattern.CurrentIsReadOnly() }.ok())
+            .map(|value| value.as_bool());
 
-    let bounds = unsafe { element.CurrentBoundingRectangle() }.ok().and_then(|rect| {
-        let bounds = Bounds {
-            x: rect.left,
-            y: rect.top,
-            width: rect.right - rect.left,
-            height: rect.bottom - rect.top,
-        };
-        (!bounds.is_empty()).then_some(bounds)
-    });
+    let bounds = unsafe { element.CurrentBoundingRectangle() }
+        .ok()
+        .and_then(|rect| {
+            let bounds = Bounds {
+                x: rect.left,
+                y: rect.top,
+                width: rect.right - rect.left,
+                height: rect.bottom - rect.top,
+            };
+            (!bounds.is_empty()).then_some(bounds)
+        });
 
     let states = States {
         enabled: flag(unsafe { element.CurrentIsEnabled() }),
@@ -1563,7 +1627,11 @@ mod tests {
 
         assert_eq!(captured.root_id.as_deref(), Some("e1"));
         // Parent links must always point at a node in the same capture.
-        let ids: Vec<&str> = captured.nodes.iter().map(|node| node.node_id.as_str()).collect();
+        let ids: Vec<&str> = captured
+            .nodes
+            .iter()
+            .map(|node| node.node_id.as_str())
+            .collect();
         for node in &captured.nodes {
             if let Some(parent) = node.parent_id.as_deref() {
                 assert!(ids.contains(&parent), "dangling parent {parent}");
@@ -1607,7 +1675,10 @@ mod tests {
         let Ok(backend) = WindowsUiaBackend::new() else {
             return;
         };
-        let limits = CaptureLimits { max_depth: 4, max_nodes: 5 };
+        let limits = CaptureLimits {
+            max_depth: 4,
+            max_nodes: 5,
+        };
         let Some((_, captured)) = capturable(&backend, limits) else {
             panic!("no window on this desktop could be captured");
         };

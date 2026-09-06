@@ -21,9 +21,9 @@ use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Accessibility::{
     CUIAutomation, IUIAutomation, IUIAutomationElement, IUIAutomationEventHandler,
     IUIAutomationEventHandler_Impl, IUIAutomationPropertyChangedEventHandler,
-    IUIAutomationPropertyChangedEventHandler_Impl, TreeScope_Subtree, UIA_EVENT_ID,
-    UIA_Invoke_InvokedEventId, UIA_PROPERTY_ID, UIA_SelectionItem_ElementSelectedEventId,
-    UIA_StructureChangedEventId, UIA_ToggleToggleStatePropertyId, UIA_ValueValuePropertyId,
+    IUIAutomationPropertyChangedEventHandler_Impl, TreeScope_Subtree, UIA_Invoke_InvokedEventId,
+    UIA_SelectionItem_ElementSelectedEventId, UIA_StructureChangedEventId,
+    UIA_ToggleToggleStatePropertyId, UIA_ValueValuePropertyId, UIA_EVENT_ID, UIA_PROPERTY_ID,
 };
 use windows::Win32::UI::WindowsAndMessaging::FindWindowW;
 

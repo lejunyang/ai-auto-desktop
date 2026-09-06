@@ -45,13 +45,20 @@ fn main() {
         let by_id: std::collections::HashMap<&str, &Node> =
             nodes.iter().map(|n| (n.node_id.as_str(), n)).collect();
 
-        let child_count = |id: &str| nodes.iter().filter(|n| n.parent_id.as_deref() == Some(id)).count();
+        let child_count = |id: &str| {
+            nodes
+                .iter()
+                .filter(|n| n.parent_id.as_deref() == Some(id))
+                .count()
+        };
         let named = |node: &Node| node.name.as_ref().is_some_and(|t| !t.is_empty());
 
         // 候选：具名的分叉点
         let candidates: Vec<&Node> = nodes
             .iter()
-            .filter(|n| child_count(&n.node_id) >= 2 && named(n) && n.states.offscreen != Some(true))
+            .filter(|n| {
+                child_count(&n.node_id) >= 2 && named(n) && n.states.offscreen != Some(true)
+            })
             .collect();
         let candidate_ids: std::collections::HashSet<&str> =
             candidates.iter().map(|n| n.node_id.as_str()).collect();
@@ -66,7 +73,9 @@ fn main() {
                 }
                 let mut current = node.parent_id.clone();
                 while let Some(id) = current {
-                    if candidate_ids.contains(id.as_str()) && by_id.get(id.as_str()).is_some_and(|n| n.depth > 0) {
+                    if candidate_ids.contains(id.as_str())
+                        && by_id.get(id.as_str()).is_some_and(|n| n.depth > 0)
+                    {
                         return false;
                     }
                     current = by_id.get(id.as_str()).and_then(|n| n.parent_id.clone());

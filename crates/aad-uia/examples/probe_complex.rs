@@ -9,8 +9,17 @@ use serde_json::json;
 fn interactive(node: &Node) -> bool {
     matches!(
         node.role.as_str(),
-        "button" | "edit" | "check_box" | "radio_button" | "combo_box"
-            | "list_item" | "menu_item" | "tab" | "hyperlink" | "tree_item" | "data_item"
+        "button"
+            | "edit"
+            | "check_box"
+            | "radio_button"
+            | "combo_box"
+            | "list_item"
+            | "menu_item"
+            | "tab"
+            | "hyperlink"
+            | "tree_item"
+            | "data_item"
     )
 }
 
@@ -19,7 +28,10 @@ fn main() {
     let windows = driver.call("list_windows", &json!({})).expect("windows");
     let list = windows["windows"].as_array().expect("a list");
     let target = list.iter().find(|window| {
-        window["title"].as_str().unwrap_or_default().contains("Complex Fixture")
+        window["title"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Complex Fixture")
     });
     let Some(window) = target else {
         println!("找不到 Complex Fixture 窗口");
@@ -75,8 +87,10 @@ fn main() {
                     with_container += 1;
                 }
                 // 收集页面上那些重名按钮的样本
-                if matches!(node.name.as_deref(), Some("Edit") | Some("Delete") | Some("Apply") | Some("Save"))
-                    && samples.len() < 10
+                if matches!(
+                    node.name.as_deref(),
+                    Some("Edit") | Some("Delete") | Some("Apply") | Some("Save")
+                ) && samples.len() < 10
                 {
                     let hits = locator.resolve(&nodes);
                     samples.push(format!(

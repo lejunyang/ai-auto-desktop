@@ -37,7 +37,10 @@ fn main() {
         let by_id: std::collections::HashMap<&str, &Node> =
             nodes.iter().map(|n| (n.node_id.as_str(), n)).collect();
 
-        println!("\n===== {} =====", title.chars().take(46).collect::<String>());
+        println!(
+            "\n===== {} =====",
+            title.chars().take(46).collect::<String>()
+        );
 
         // 复现 region_of 的逻辑，找出归到 loose 的元素
         let mut loose = Vec::new();
@@ -48,12 +51,18 @@ fn main() {
             let mut assigned = false;
             let mut chain = Vec::new();
             while let Some(id) = current {
-                let Some(parent) = by_id.get(id.as_str()) else { break };
+                let Some(parent) = by_id.get(id.as_str()) else {
+                    break;
+                };
                 if parent.node_id == root {
                     break;
                 }
                 if let Some(name) = parent.name.as_deref().filter(|t| !t.is_empty()) {
-                    chain.push(format!("{}:{}", parent.role, name.chars().take(26).collect::<String>()));
+                    chain.push(format!(
+                        "{}:{}",
+                        parent.role,
+                        name.chars().take(26).collect::<String>()
+                    ));
                     // 判据：共同前缀
                     let shared = name
                         .chars()
@@ -61,8 +70,7 @@ fn main() {
                         .take_while(|(a, b)| a == b)
                         .count();
                     let shorter = name.chars().count().min(title.chars().count());
-                    let echo = name == title
-                        || (shorter >= 12 && shared * 100 >= shorter * 55);
+                    let echo = name == title || (shorter >= 12 && shared * 100 >= shorter * 55);
                     if !echo {
                         assigned = true;
                         break;
@@ -84,15 +92,26 @@ fn main() {
             .iter()
             .filter(|(_, chain)| chain.iter().any(|entry| !entry.contains("(无名)")))
             .count();
-        println!("  祖先链里有具名容器的: {}（那些名字被当成标题回声排除了）", with_named);
-        println!("  祖先链全是无名容器的: {}（真正散落）", loose.len() - with_named);
+        println!(
+            "  祖先链里有具名容器的: {}（那些名字被当成标题回声排除了）",
+            with_named
+        );
+        println!(
+            "  祖先链全是无名容器的: {}（真正散落）",
+            loose.len() - with_named
+        );
 
         println!("\n  前 8 个 loose 元素的祖先链:");
         for (node, chain) in loose.iter().take(8) {
             println!(
                 "    {:<34} ← {}",
                 node.summary().chars().take(32).collect::<String>(),
-                chain.iter().take(3).cloned().collect::<Vec<_>>().join(" ← ")
+                chain
+                    .iter()
+                    .take(3)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(" ← ")
             );
         }
 

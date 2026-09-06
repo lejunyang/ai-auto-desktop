@@ -105,7 +105,7 @@ impl Report {
             "checks": Value::Object(checks),
             "summary": counts,
             "notice": "Read-only prerequisite observations only; this report does not \
-prove that UI discovery, input, capture, or automation succeeds.",
+        prove that UI discovery, input, capture, or automation succeeds.",
         })
     }
 
@@ -394,8 +394,7 @@ match physical pixels unless the process is DPI aware.",
             let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
             // The reference is dropped at the end of this scope, so the probe
             // owns nothing once it has answered.
-            CoCreateInstance::<_, IUIAutomation>(&CUIAutomation, None, CLSCTX_INPROC_SERVER)
-                .is_ok()
+            CoCreateInstance::<_, IUIAutomation>(&CUIAutomation, None, CLSCTX_INPROC_SERVER).is_ok()
         }
     }
 
@@ -403,9 +402,7 @@ match physical pixels unless the process is DPI aware.",
     fn integrity() -> Check {
         use windows_sys::Win32::Foundation::CloseHandle;
         use windows_sys::Win32::Security::{GetTokenInformation, TokenElevation, TOKEN_QUERY};
-        use windows_sys::Win32::System::Threading::{
-            GetCurrentProcess, OpenProcessToken,
-        };
+        use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
         let elevated = unsafe {
             let mut token = std::ptr::null_mut();
@@ -515,10 +512,7 @@ mod tests {
         names.dedup();
 
         assert_eq!(names.len(), count, "duplicate check names collide in JSON");
-        assert_eq!(
-            report.to_json()["checks"].as_object().unwrap().len(),
-            count
-        );
+        assert_eq!(report.to_json()["checks"].as_object().unwrap().len(), count);
     }
 
     #[test]
@@ -585,8 +579,16 @@ mod tests {
 
         // The shape must not vary between runs, or consumers cannot rely on it.
         assert_eq!(
-            first["checks"].as_object().unwrap().keys().collect::<Vec<_>>(),
-            second["checks"].as_object().unwrap().keys().collect::<Vec<_>>()
+            first["checks"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .collect::<Vec<_>>(),
+            second["checks"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .collect::<Vec<_>>()
         );
         assert!(serde_json::to_string(&first).is_ok());
     }

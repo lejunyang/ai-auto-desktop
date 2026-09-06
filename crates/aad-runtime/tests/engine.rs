@@ -29,10 +29,7 @@ struct Fake {
 
 impl Fake {
     fn build(name: &str, actions: Value, handler: Handler) -> Arc<Self> {
-        let document = manifest::document(
-            name,
-            actions.as_object().cloned().unwrap_or_default(),
-        );
+        let document = manifest::document(name, actions.as_object().cloned().unwrap_or_default());
         Arc::new(Self {
             manifest: manifest::parse(&document).expect("fixture manifest is valid"),
             handler,
@@ -199,8 +196,16 @@ fn the_journal_records_the_full_lifecycle() {
 
     assert_eq!(types.first().map(String::as_str), Some("run.started"));
     assert_eq!(types.last().map(String::as_str), Some("run.finished"));
-    for expected in ["step.started", "action.started", "action.finished", "step.finished"] {
-        assert!(types.contains(&expected.to_string()), "missing {expected} in {types:?}");
+    for expected in [
+        "step.started",
+        "action.started",
+        "action.finished",
+        "step.finished",
+    ] {
+        assert!(
+            types.contains(&expected.to_string()),
+            "missing {expected} in {types:?}"
+        );
     }
     // Sequence numbers must be dense and start at 1.
     let sequences: Vec<u64> = result.events.iter().map(|event| event.seq).collect();
@@ -279,14 +284,25 @@ fn a_large_result_is_counted_rather_than_copied_into_the_journal() {
         .expect("an action finished");
     let recorded = &finished.payload["result"];
 
-    assert_eq!(recorded["nodes_count"], json!(500), "the size is the useful part");
-    assert!(recorded.get("nodes").is_none(), "the nodes themselves must not be copied");
+    assert_eq!(
+        recorded["nodes_count"],
+        json!(500),
+        "the size is the useful part"
+    );
+    assert!(
+        recorded.get("nodes").is_none(),
+        "the nodes themselves must not be copied"
+    );
     // What identifies the observation is still there.
     assert_eq!(recorded["snapshot_id"], json!("abc123"));
     assert_eq!(recorded["window"]["title"], json!("App"));
 
     let rendered = serde_json::to_string(recorded).expect("serialisable");
-    assert!(rendered.len() < 400, "summary grew to {} characters: {rendered}", rendered.len());
+    assert!(
+        rendered.len() < 400,
+        "summary grew to {} characters: {rendered}",
+        rendered.len()
+    );
 }
 
 #[test]
@@ -340,7 +356,11 @@ fn a_missing_required_input_fails_before_any_action() {
 
     assert_eq!(result.status, RunStatus::Failed);
     assert_eq!(result.error.unwrap().code, "INPUT.MISSING");
-    assert_eq!(provider.calls(), 0, "no action may run when inputs are invalid");
+    assert_eq!(
+        provider.calls(),
+        0,
+        "no action may run when inputs are invalid"
+    );
 }
 
 #[test]
@@ -368,10 +388,7 @@ fn an_undeclared_input_is_rejected() {
     let mut inputs = Map::new();
     inputs.insert("typo".into(), json!(1));
 
-    let result = run(
-        &workflow,
-        RunOptions::default().with_inputs(inputs),
-    );
+    let result = run(&workflow, RunOptions::default().with_inputs(inputs));
 
     assert_eq!(result.status, RunStatus::Failed);
     assert_eq!(result.error.unwrap().code, "INPUT.UNDECLARED");
@@ -583,7 +600,11 @@ fn a_return_inside_a_loop_ends_the_whole_workflow() {
     let result = execute(&workflow, registry(vec![provider.clone()]));
 
     assert_eq!(result.status, RunStatus::Succeeded);
-    assert_eq!(provider.calls(), 0, "a return exits the loop and the workflow");
+    assert_eq!(
+        provider.calls(),
+        0,
+        "a return exits the loop and the workflow"
+    );
 }
 
 #[test]
@@ -661,7 +682,11 @@ fn steps_execute_in_dependency_order_not_declaration_order() {
     assert_eq!(result.status, RunStatus::Succeeded);
     assert_eq!(
         *order.lock().unwrap(),
-        vec!["first".to_string(), "middle".to_string(), "last".to_string()]
+        vec![
+            "first".to_string(),
+            "middle".to_string(),
+            "last".to_string()
+        ]
     );
 }
 
@@ -676,11 +701,9 @@ fn a_retryable_failure_is_retried_up_to_the_limit_and_can_succeed() {
         read_only_actions(&["flaky"]),
         Box::new(|_, _, attempt| {
             if attempt < 3 {
-                Err(
-                    AutomationError::new("FIXTURE.FLAKY", "transient failure")
-                        .with_retryable(true)
-                        .with_effect("not_applied"),
-                )
+                Err(AutomationError::new("FIXTURE.FLAKY", "transient failure")
+                    .with_retryable(true)
+                    .with_effect("not_applied"))
             } else {
                 Ok(json!({"attempt": attempt}))
             }
@@ -852,8 +875,7 @@ fn an_on_error_handler_can_absorb_a_failure_and_continue() {
         read_only_actions(&["broken", "after"]),
         Box::new(|action, _, _| {
             if action.contains("broken") {
-                Err(AutomationError::new("FIXTURE.BROKEN", "failed")
-                    .with_effect("not_applied"))
+                Err(AutomationError::new("FIXTURE.BROKEN", "failed").with_effect("not_applied"))
             } else {
                 Ok(json!({"ran": true}))
             }
@@ -887,8 +909,7 @@ fn a_handler_can_bind_the_error_and_inspect_its_code() {
         "fixture",
         read_only_actions(&["broken"]),
         Box::new(|_, _, _| {
-            Err(AutomationError::new("FIXTURE.BROKEN", "the reason")
-                .with_effect("not_applied"))
+            Err(AutomationError::new("FIXTURE.BROKEN", "the reason").with_effect("not_applied"))
         }),
     );
 
@@ -947,8 +968,7 @@ fn a_rethrow_handler_runs_its_steps_and_still_fails() {
         read_only_actions(&["broken", "log"]),
         Box::new(|action, _, _| {
             if action.contains("broken") {
-                Err(AutomationError::new("FIXTURE.BROKEN", "failed")
-                    .with_effect("not_applied"))
+                Err(AutomationError::new("FIXTURE.BROKEN", "failed").with_effect("not_applied"))
             } else {
                 Ok(json!({}))
             }
@@ -1026,8 +1046,7 @@ fn a_finally_block_still_runs_after_failure() {
                 counter.fetch_add(1, Ordering::SeqCst);
                 Ok(json!({}))
             } else {
-                Err(AutomationError::new("FIXTURE.BROKEN", "failed")
-                    .with_effect("not_applied"))
+                Err(AutomationError::new("FIXTURE.BROKEN", "failed").with_effect("not_applied"))
             }
         }),
     );
@@ -1090,8 +1109,7 @@ fn a_workflow_level_finally_runs_on_the_failure_path() {
                 counter.fetch_add(1, Ordering::SeqCst);
                 Ok(json!({}))
             } else {
-                Err(AutomationError::new("FIXTURE.BROKEN", "failed")
-                    .with_effect("not_applied"))
+                Err(AutomationError::new("FIXTURE.BROKEN", "failed").with_effect("not_applied"))
             }
         }),
     );
@@ -1206,7 +1224,10 @@ fn cancellation_stops_the_run_and_is_reported_as_cancelled() {
     );
 
     assert_eq!(result.status, RunStatus::Cancelled);
-    assert!(provider.calls() < 10, "cancellation must take effect promptly");
+    assert!(
+        provider.calls() < 10,
+        "cancellation must take effect promptly"
+    );
 }
 
 #[test]
@@ -1216,8 +1237,7 @@ fn a_read_only_action_never_reports_an_unknown_effect() {
         read_only_actions(&["look"]),
         Box::new(|_, _, _| {
             // Even an ambiguous transport failure cannot have changed anything.
-            Err(AutomationError::new("PLUGIN.HOST_TIMEOUT", "no reply")
-                .with_effect("unknown"))
+            Err(AutomationError::new("PLUGIN.HOST_TIMEOUT", "no reply").with_effect("unknown"))
         }),
     );
 
@@ -1419,9 +1439,11 @@ fn a_postcondition_waits_through_an_observation_that_is_not_ready_yet() {
             if attempt < 4 {
                 // Exactly what the driver reports for an element that has not
                 // appeared yet.
-                Err(AutomationError::new("DRIVER.NOT_FOUND", "no element matched")
-                    .with_retryable(true)
-                    .with_effect("not_applied"))
+                Err(
+                    AutomationError::new("DRIVER.NOT_FOUND", "no element matched")
+                        .with_retryable(true)
+                        .with_effect("not_applied"),
+                )
             } else {
                 Ok(json!({"match_count": 1}))
             }
@@ -1442,7 +1464,11 @@ fn a_postcondition_waits_through_an_observation_that_is_not_ready_yet() {
     let result = execute(&workflow, registry(vec![provider.clone()]));
 
     assert_eq!(result.status, RunStatus::Succeeded, "{:?}", result.error);
-    assert!(provider.calls() >= 4, "must keep looking, saw {}", provider.calls());
+    assert!(
+        provider.calls() >= 4,
+        "must keep looking, saw {}",
+        provider.calls()
+    );
 }
 
 #[test]
@@ -1457,8 +1483,10 @@ fn an_observation_that_cannot_recover_fails_the_postcondition_at_once() {
             if action != "fixture.look@1" {
                 return Ok(json!({"dispatched": true}));
             }
-            Err(AutomationError::new("DRIVER.INVALID_REQUEST", "locator is malformed")
-                .with_effect("not_applied"))
+            Err(
+                AutomationError::new("DRIVER.INVALID_REQUEST", "locator is malformed")
+                    .with_effect("not_applied"),
+            )
         }),
     );
     let workflow = descriptor(json!({
@@ -1495,9 +1523,11 @@ fn an_assertion_that_never_observed_anything_reports_why() {
             if action != "fixture.look@1" {
                 return Ok(json!({"dispatched": true}));
             }
-            Err(AutomationError::new("DRIVER.WINDOW_NOT_FOUND", "no window matched")
-                .with_retryable(true)
-                .with_effect("not_applied"))
+            Err(
+                AutomationError::new("DRIVER.WINDOW_NOT_FOUND", "no window matched")
+                    .with_retryable(true)
+                    .with_effect("not_applied"),
+            )
         }),
     );
     let workflow = descriptor(json!({
@@ -1571,7 +1601,7 @@ fn a_script_step_runs_and_its_output_is_readable_by_later_steps() {
             "runtime": "python",
             "output_schema": {"type": "object"},
             "source": "import json,sys; data=json.load(sys.stdin); \
-print(json.dumps({'total': data['a'] + data['b']}))",
+    print(json.dumps({'total': data['a'] + data['b']}))",
             "inputs": {"a": 20, "b": 22}
         }],
         "outputs": {"total": {"value": "${{ steps.compute.output.total }}"}}
@@ -1657,7 +1687,7 @@ fn a_refused_script_never_reaches_the_interpreter() {
             "runtime": "python",
             "output_schema": {"type": "object"},
             "source": "import json,sys; data=json.load(sys.stdin); \
-open(data['path'],'w').write('ran'); print(json.dumps({}))",
+    open(data['path'],'w').write('ran'); print(json.dumps({}))",
             "inputs": {"path": marker.to_string_lossy()}
         }]
     });
@@ -1730,4 +1760,72 @@ fn a_run_result_serializes_to_the_run_schema_shape() {
     assert!(document["runId"].as_str().is_some());
     assert!(document["workflow"]["planDigest"].as_str().is_some());
     assert!(document["finishedAt"].as_str().is_some());
+}
+
+// ---------------------------------------------------------------------------
+// requires.runtime
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_runtime_requirement_this_build_does_not_satisfy_stops_the_run() {
+    // Regression: the range was compiled into the descriptor and then never
+    // consulted, so the engine executed steps for a runtime the workflow had
+    // explicitly excluded. The Python engine refused the same descriptor, so the
+    // compatibility contract held in one implementation and not in the shipped
+    // one.
+    let workflow = descriptor(json!({
+        "requires": {"runtime": ">=99.0.0"},
+        "steps": [{"id": "done", "type": "return", "value": "reached"}]
+    }));
+
+    let result = execute(&workflow, registry(vec![]));
+
+    assert_eq!(result.status, RunStatus::Failed);
+    let error = result
+        .error
+        .expect("an unsatisfied runtime range must error");
+    assert_eq!(error.code, "DESCRIPTOR.VERSION_UNSUPPORTED");
+    // Nothing may run: the point is to stop before the interface is touched.
+    assert_eq!(result.executed_steps, 0);
+    assert!(
+        result.outputs.is_empty(),
+        "a refused run must not produce outputs: {:?}",
+        result.outputs
+    );
+}
+
+#[test]
+fn a_satisfied_runtime_requirement_runs_normally() {
+    let workflow = descriptor(json!({
+        "requires": {"runtime": ">=0.0.1"},
+        "steps": [{"id": "done", "type": "return", "value": "reached"}]
+    }));
+
+    let result = execute(&workflow, registry(vec![]));
+
+    assert_eq!(result.status, RunStatus::Succeeded);
+}
+
+#[test]
+fn a_descriptor_without_a_runtime_requirement_is_unaffected() {
+    let workflow = descriptor(json!({
+        "steps": [{"id": "done", "type": "return", "value": "reached"}]
+    }));
+
+    let result = execute(&workflow, registry(vec![]));
+
+    assert_eq!(result.status, RunStatus::Succeeded);
+}
+
+#[test]
+fn every_tracked_example_is_accepted_by_the_runtime_it_declares() {
+    // The examples declare a range against the shipped RUNTIME_VERSION, so a
+    // version bump that forgets them must fail here rather than at the moment
+    // someone runs one.
+    for range in [">=0.0.1", "^0.0.1"] {
+        assert!(
+            aad_runtime::version::matches(aad_runtime::RUNTIME_VERSION, range),
+            "the shipped runtime must satisfy {range}, which the tracked examples declare"
+        );
+    }
 }

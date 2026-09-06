@@ -5,7 +5,7 @@ metadata:
   version: 1.0.0
   description: 显式 OCR 步骤后返回确定性的低置信度结构化错误。
 requires:
-  runtime: ">=0.1.0"
+  runtime: ">=0.0.1"
   capabilities:
     - name: fixture
       version: ^1.0.0

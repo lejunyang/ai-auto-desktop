@@ -43,7 +43,11 @@ pub fn availability() -> Value {
     #[cfg(windows)]
     {
         let interpreter = find_interpreter();
-        let state = if interpreter.is_some() { "degraded" } else { "unavailable" };
+        let state = if interpreter.is_some() {
+            "degraded"
+        } else {
+            "unavailable"
+        };
         json!({
             "state": state,
             "mechanism": "windows_job_object",
@@ -59,7 +63,7 @@ pub fn availability() -> Value {
                 "no filesystem isolation: the script can read what the user can read",
             ],
             "summary": "Resource and environment isolation are enforced by a Job \
-Object, but network and filesystem access are not restricted.",
+        Object, but network and filesystem access are not restricted.",
         })
     }
     #[cfg(target_os = "linux")]
@@ -123,7 +127,12 @@ fn find_interpreter() -> Option<PathBuf> {
             }
         }
     }
-    for root in ["C:\\Python313", "C:\\Python312", "C:\\Python311", "C:\\Python310"] {
+    for root in [
+        "C:\\Python313",
+        "C:\\Python312",
+        "C:\\Python311",
+        "C:\\Python310",
+    ] {
         candidates.push(PathBuf::from(root).join("python.exe"));
     }
     if let Some(program_files) = std::env::var_os("ProgramFiles") {
@@ -151,7 +160,9 @@ pub struct ScriptStep<'a> {
 
 impl<'a> ScriptStep<'a> {
     /// Read a script step from its compiled parameters.
-    pub fn from_params(params: &'a serde_json::Map<String, Value>) -> Result<Self, AutomationError> {
+    pub fn from_params(
+        params: &'a serde_json::Map<String, Value>,
+    ) -> Result<Self, AutomationError> {
         let source = params.get("source").and_then(Value::as_str);
         let entrypoint = params.get("entrypoint").and_then(Value::as_str);
         if source.is_none() && entrypoint.is_none() {
@@ -172,7 +183,11 @@ impl<'a> ScriptStep<'a> {
             .and_then(Value::as_u64)
             .unwrap_or(DEFAULT_MAX_OUTPUT_BYTES as u64) as usize;
 
-        Ok(Self { source, entrypoint, max_output_bytes })
+        Ok(Self {
+            source,
+            entrypoint,
+            max_output_bytes,
+        })
     }
 }
 
@@ -248,7 +263,13 @@ pub fn execute(
         .map_err(|value| error("SCRIPT.SANDBOX_UNAVAILABLE", format!("{value}")))?;
 
     let budget = timeout.unwrap_or(DEFAULT_TIMEOUT);
-    run_sandboxed(&source_path, &working, inputs, budget, step.max_output_bytes)
+    run_sandboxed(
+        &source_path,
+        &working,
+        inputs,
+        budget,
+        step.max_output_bytes,
+    )
 }
 
 #[cfg(windows)]
@@ -317,9 +338,8 @@ fn run_sandboxed(
     budget: Duration,
     max_output_bytes: usize,
 ) -> Result<Value, AutomationError> {
-    let bubblewrap = which("bwrap").ok_or_else(|| {
-        error("SCRIPT.SANDBOX_UNAVAILABLE", "bubblewrap is not available")
-    })?;
+    let bubblewrap = which("bwrap")
+        .ok_or_else(|| error("SCRIPT.SANDBOX_UNAVAILABLE", "bubblewrap is not available"))?;
 
     let seconds = budget.as_secs().max(1) + 1;
     let mut child = Command::new(bubblewrap)
@@ -481,10 +501,8 @@ struct TempDirectory(PathBuf);
 
 impl TempDirectory {
     fn new() -> Result<Self, AutomationError> {
-        let path = std::env::temp_dir().join(format!(
-            "aad-script-{}",
-            uuid::Uuid::new_v4().simple()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("aad-script-{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(&path)
             .map_err(|value| error("SCRIPT.SANDBOX_UNAVAILABLE", format!("{value}")))?;
         Ok(Self(path))
@@ -564,25 +582,25 @@ mod tests {
         for hostile in ["../secrets.py", "..\\secrets.py", "a/../../b.py"] {
             let outcome = resolve_entrypoint(&base, hostile);
             assert!(outcome.is_err(), "{hostile:?} must be refused");
-            assert_eq!(
-                outcome.unwrap_err().code,
-                "SCRIPT.ENTRYPOINT_INVALID"
-            );
+            assert_eq!(outcome.unwrap_err().code, "SCRIPT.ENTRYPOINT_INVALID");
         }
     }
 
     #[test]
     fn an_absolute_entrypoint_is_refused() {
         let base = std::env::temp_dir();
-        let absolute = if cfg!(windows) { "C:\\evil.py" } else { "/evil.py" };
+        let absolute = if cfg!(windows) {
+            "C:\\evil.py"
+        } else {
+            "/evil.py"
+        };
 
         assert!(resolve_entrypoint(&base, absolute).is_err());
     }
 
     #[test]
     fn a_missing_entrypoint_is_reported_clearly() {
-        let error = resolve_entrypoint(&std::env::temp_dir(), "definitely-absent.py")
-            .unwrap_err();
+        let error = resolve_entrypoint(&std::env::temp_dir(), "definitely-absent.py").unwrap_err();
         assert_eq!(error.code, "SCRIPT.ENTRYPOINT_INVALID");
     }
 
@@ -654,8 +672,8 @@ mod tests {
             max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
         };
 
-        let value = execute(&step, &std::env::temp_dir(), &json!({}), None)
-            .expect("the script runs");
+        let value =
+            execute(&step, &std::env::temp_dir(), &json!({}), None).expect("the script runs");
 
         assert_eq!(value["answer"], 42);
     }
@@ -691,8 +709,8 @@ print(json.dumps({'doubled': data['n'] * 2}))",
             max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
         };
 
-        let error = execute(&step, &std::env::temp_dir(), &json!({}), None)
-            .expect_err("the script fails");
+        let error =
+            execute(&step, &std::env::temp_dir(), &json!({}), None).expect_err("the script fails");
 
         assert_eq!(error.code, "SCRIPT.EXIT_NONZERO");
         assert_eq!(error.details["returncode"], json!(3));
@@ -742,11 +760,15 @@ os.environ.get('AAD_SANDBOX_LEAK_CHECK')}))",
             max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
         };
 
-        let value = execute(&step, &std::env::temp_dir(), &json!({}), None)
-            .expect("the script runs");
+        let value =
+            execute(&step, &std::env::temp_dir(), &json!({}), None).expect("the script runs");
         std::env::remove_var("AAD_SANDBOX_LEAK_CHECK");
 
-        assert_eq!(value["leaked"], Value::Null, "the host environment leaked in");
+        assert_eq!(
+            value["leaked"],
+            Value::Null,
+            "the host environment leaked in"
+        );
     }
 
     #[test]
@@ -760,8 +782,8 @@ os.environ.get('AAD_SANDBOX_LEAK_CHECK')}))",
             max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
         };
 
-        let value = execute(&step, &std::env::temp_dir(), &json!({}), None)
-            .expect("the script runs");
+        let value =
+            execute(&step, &std::env::temp_dir(), &json!({}), None).expect("the script runs");
 
         assert_eq!(
             value["entries"].as_array().map(Vec::len),

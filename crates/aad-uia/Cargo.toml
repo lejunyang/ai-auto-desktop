@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
 description = "Native Windows UI Automation driver: app discovery, UI description and automation"
 
 [dependencies]
@@ -32,3 +33,7 @@ windows = { version = "0.58", features = [
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_Graphics_Gdi",
 ] }
+
+# Inherit the workspace's deliberate lint allowances (see the root Cargo.toml).
+[lints]
+workspace = true

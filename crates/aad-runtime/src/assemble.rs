@@ -173,7 +173,10 @@ of the title instead."
                         "sensitive": true,
                     }),
                 );
-                arguments.insert(field.into(), json!(format!("${{{{ inputs.{input_name} }}}}")));
+                arguments.insert(
+                    field.into(),
+                    json!(format!("${{{{ inputs.{input_name} }}}}")),
+                );
             } else {
                 arguments.insert(
                     field.into(),

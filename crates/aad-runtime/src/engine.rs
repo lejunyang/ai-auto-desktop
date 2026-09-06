@@ -22,7 +22,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-pub const RUNTIME_VERSION: &str = "0.1.0";
+pub const RUNTIME_VERSION: &str = "0.0.1";
 
 /// How execution should proceed after a step.
 enum Flow {
@@ -154,12 +154,11 @@ impl<'a> Run<'a> {
     /// Stop if the run was cancelled or has exhausted a budget.
     fn check_budget(&self) -> Result<(), AutomationError> {
         if self.cancel.load(Ordering::SeqCst) {
-            return Err(AutomationError::new(
-                "WORKFLOW.CANCELLED",
-                "the run was cancelled",
-            )
-            .with_category("workflow")
-            .with_effect("unknown"));
+            return Err(
+                AutomationError::new("WORKFLOW.CANCELLED", "the run was cancelled")
+                    .with_category("workflow")
+                    .with_effect("unknown"),
+            );
         }
         if self.remaining().is_zero() {
             return Err(AutomationError::new(
@@ -217,15 +216,14 @@ impl<'a> Run<'a> {
 
         // `finally` runs on every exit path, and its own failure is recorded
         // as suppressed rather than replacing the original error.
-        let outcome = match self.run_cleanup(step, outcome) {
-            Ok(flow) => Ok(flow),
-            Err(error) => Err(error),
-        };
+        let outcome = self.run_cleanup(step, outcome);
 
         match outcome {
             Ok(flow) => {
-                self.journal
-                    .emit("step.finished", json!({"id": step.id, "status": "succeeded"}));
+                self.journal.emit(
+                    "step.finished",
+                    json!({"id": step.id, "status": "succeeded"}),
+                );
                 Ok(flow)
             }
             Err(error) => {
@@ -265,8 +263,7 @@ impl<'a> Run<'a> {
         if step.finally_steps.is_empty() {
             return outcome;
         }
-        self.journal
-            .emit("cleanup.started", json!({"id": step.id}));
+        self.journal.emit("cleanup.started", json!({"id": step.id}));
         let cleanup = self.run_steps(&step.finally_steps);
         self.journal.emit(
             "cleanup.finished",
@@ -399,8 +396,7 @@ only if you trust this descriptor."
             None => self.remaining(),
         };
 
-        let value =
-            crate::script::execute(&script, &self.base_directory, &inputs, Some(timeout))?;
+        let value = crate::script::execute(&script, &self.base_directory, &inputs, Some(timeout))?;
         // A script's result is recorded like an action's, so later steps can
         // read it as `steps.<id>.output`.
         self.steps.insert(
@@ -442,10 +438,7 @@ only if you trust this descriptor."
             .with_category("action")
             .with_effect("not_applied")
             .with_detail("uses", Value::String(uses.clone()))
-            .with_detail(
-                "available",
-                json!(self.providers.names()),
-            ));
+            .with_detail("available", json!(self.providers.names())));
         };
         let declared_effect = contract.effect_class.clone();
 
@@ -678,11 +671,13 @@ only if you trust this descriptor."
         }
 
         let timeout = self.remaining();
-        provider.invoke(&uses, args, Some(timeout)).map_err(|error| {
-            // An observation that failed leaves the caller no worse off: it read
-            // nothing and changed nothing.
-            error.with_effect("not_applied")
-        })
+        provider
+            .invoke(&uses, args, Some(timeout))
+            .map_err(|error| {
+                // An observation that failed leaves the caller no worse off: it read
+                // nothing and changed nothing.
+                error.with_effect("not_applied")
+            })
     }
 
     fn record_output(&mut self, step: &CompiledStep, output: Value) {
@@ -755,7 +750,10 @@ only if you trust this descriptor."
         if items.len() as u64 > limit {
             return Err(AutomationError::new(
                 "LOOP.MAX_ITEMS_EXCEEDED",
-                format!("foreach received {} items but max_items is {limit}", items.len()),
+                format!(
+                    "foreach received {} items but max_items is {limit}",
+                    items.len()
+                ),
             )
             .with_category("loop")
             .with_effect("not_applied"));
@@ -816,7 +814,10 @@ only if you trust this descriptor."
 
     fn build_failure(&self, step: &CompiledStep) -> Result<AutomationError, AutomationError> {
         let Some(Value::Object(spec)) = step.get("error") else {
-            return Ok(AutomationError::new("WORKFLOW.FAILED", "the workflow failed"));
+            return Ok(AutomationError::new(
+                "WORKFLOW.FAILED",
+                "the workflow failed",
+            ));
         };
         let scope = self.scope();
         let code = spec
@@ -943,8 +944,7 @@ impl RetryPolicy {
                     None => pattern == error.code,
                 },
             });
-        let category_ok = self.categories.is_empty()
-            || self.categories.iter().any(|value| *value == error.category);
+        let category_ok = self.categories.is_empty() || self.categories.contains(&error.category);
         code_ok && category_ok
     }
 
@@ -1059,7 +1059,10 @@ fn retry_policy(step: &CompiledStep, descriptor: &WorkflowDescriptor) -> Option<
     };
 
     Some(RetryPolicy {
-        max_attempts: policy.get("max_attempts").and_then(Value::as_u64).unwrap_or(1) as u32,
+        max_attempts: policy
+            .get("max_attempts")
+            .and_then(Value::as_u64)
+            .unwrap_or(1) as u32,
         initial_delay: backoff
             .and_then(|value| value.get("initial_delay"))
             .and_then(Value::as_str)
@@ -1122,7 +1125,7 @@ fn order_steps(steps: &[CompiledStep]) -> Vec<&CompiledStep> {
             }
             // Defensive: a cycle should be impossible after compilation.
             None => {
-                ordered.extend(remaining.drain(..));
+                ordered.append(&mut remaining);
             }
         }
     }
@@ -1145,7 +1148,13 @@ fn canonical_json(value: &Value) -> String {
             keys.sort();
             let parts: Vec<String> = keys
                 .iter()
-                .map(|key| format!("{}:{}", Value::String((*key).clone()), canonical_json(&map[*key])))
+                .map(|key| {
+                    format!(
+                        "{}:{}",
+                        Value::String((*key).clone()),
+                        canonical_json(&map[*key])
+                    )
+                })
                 .collect();
             format!("{{{}}}", parts.join(","))
         }
@@ -1490,6 +1499,26 @@ fn deadline_instant(deadline_epoch: f64) -> Instant {
     }
 }
 
+/// Refuse a descriptor whose `requires.runtime` this build does not satisfy.
+///
+/// Only the runtime range is checked here. Platform, permission and capability
+/// requirements are resolved during compilation and provider binding, so
+/// duplicating them would risk two answers to one question.
+fn check_requirements(descriptor: &WorkflowDescriptor) -> Result<(), AutomationError> {
+    let Some(range) = descriptor.requires.get("runtime").and_then(Value::as_str) else {
+        return Ok(());
+    };
+    if crate::version::matches(RUNTIME_VERSION, range) {
+        return Ok(());
+    }
+    Err(AutomationError::new(
+        "DESCRIPTOR.VERSION_UNSUPPORTED",
+        format!("Runtime {RUNTIME_VERSION} does not satisfy '{range}'"),
+    )
+    .with_category("descriptor")
+    .with_effect("not_applied"))
+}
+
 /// Execute a compiled workflow to completion.
 pub fn run(descriptor: &WorkflowDescriptor, options: RunOptions) -> RunResult {
     let run_id = options
@@ -1501,7 +1530,9 @@ pub fn run(descriptor: &WorkflowDescriptor, options: RunOptions) -> RunResult {
     let digest = plan_digest(descriptor);
 
     let budget = Duration::from_secs_f64(descriptor.budgets.max_duration);
-    let budget = options.max_duration.map_or(budget, |limit| limit.min(budget));
+    let budget = options
+        .max_duration
+        .map_or(budget, |limit| limit.min(budget));
 
     let journal = Journal::new(run_id.clone(), options.sink.clone());
     journal.emit(
@@ -1537,6 +1568,27 @@ pub fn run(descriptor: &WorkflowDescriptor, options: RunOptions) -> RunResult {
         }
     };
 
+    // Refuse a descriptor this runtime does not satisfy before any step runs.
+    // Checked here rather than at compile time because it is a property of the
+    // running binary, not of the document: the same descriptor is valid against
+    // a different runtime build.
+    if let Err(error) = check_requirements(descriptor) {
+        journal.emit("run.failed", json!({"error": error.to_json()}));
+        return RunResult {
+            run_id,
+            workflow: descriptor.name.clone(),
+            plan_digest: digest,
+            status: RunStatus::Failed,
+            outputs: Map::new(),
+            error: Some(error),
+            executed_steps: 0,
+            duration_seconds: started.elapsed().as_secs_f64(),
+            started_at,
+            finished_at: now_rfc3339(),
+            events: journal.events(),
+        };
+    }
+
     let mut state = Run {
         descriptor,
         providers: options.providers.clone(),
@@ -1569,7 +1621,9 @@ pub fn run(descriptor: &WorkflowDescriptor, options: RunOptions) -> RunResult {
 
     // Workflow `finally` runs on every path, including cancellation.
     if !descriptor.finally_steps.is_empty() {
-        state.journal.emit("cleanup.started", json!({"id": "$workflow"}));
+        state
+            .journal
+            .emit("cleanup.started", json!({"id": "$workflow"}));
         let cleanup = state.run_steps(&descriptor.finally_steps);
         state.journal.emit(
             "cleanup.finished",
@@ -1598,9 +1652,7 @@ pub fn run(descriptor: &WorkflowDescriptor, options: RunOptions) -> RunResult {
                 "WORKFLOW.TIMEOUT" => RunStatus::TimedOut,
                 "WORKFLOW.CANCELLED" => RunStatus::Cancelled,
                 // An unprovable effect is never reported as a clean failure.
-                _ if error.effect == "unknown" || state.unknown_effect => {
-                    RunStatus::UnknownEffect
-                }
+                _ if error.effect == "unknown" || state.unknown_effect => RunStatus::UnknownEffect,
                 _ => RunStatus::Failed,
             };
             (status, Some(error))

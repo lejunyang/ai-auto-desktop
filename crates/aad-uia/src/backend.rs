@@ -209,7 +209,9 @@ impl SnapshotStore {
         // Reject anything that is not a plain identifier before it reaches the
         // filesystem: a snapshot id arrives from the caller.
         if snapshot_id.is_empty()
-            || !snapshot_id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+            || !snapshot_id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-')
         {
             return None;
         }
@@ -294,7 +296,10 @@ impl SnapshotStore {
     }
 
     pub fn len(&self) -> usize {
-        self.entries.lock().map(|entries| entries.len()).unwrap_or(0)
+        self.entries
+            .lock()
+            .map(|entries| entries.len())
+            .unwrap_or(0)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -315,14 +320,17 @@ impl Default for SnapshotStore {
 pub fn default_snapshot_directory() -> std::path::PathBuf {
     std::env::var_os("AAD_SNAPSHOT_DIR")
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::env::temp_dir().join("ai-auto-desktop").join("snapshots"))
+        .unwrap_or_else(|| {
+            std::env::temp_dir()
+                .join("ai-auto-desktop")
+                .join("snapshots")
+        })
 }
 
 /// Compute a bounding rectangle's centre, refusing empty rectangles.
 pub fn click_point(bounds: Option<Bounds>) -> Result<(i32, i32)> {
-    let bounds = bounds.ok_or_else(|| {
-        DriverError::invalid("the element has no bounding rectangle to click")
-    })?;
+    let bounds = bounds
+        .ok_or_else(|| DriverError::invalid("the element has no bounding rectangle to click"))?;
     if bounds.is_empty() {
         return Err(DriverError::invalid(
             "the element's bounding rectangle has no area",
@@ -387,14 +395,14 @@ mod tests {
         // This is what makes `aad find` followed by `aad do` work at all: the
         // two commands are separate processes.
         let directory = scratch("cross-process");
-        let first = SnapshotStore::new(8, Duration::from_secs(60))
-            .persisted(directory.clone());
+        let first = SnapshotStore::new(8, Duration::from_secs(60)).persisted(directory.clone());
         first.insert(snapshot("abc123", 7));
         drop(first);
 
-        let second = SnapshotStore::new(8, Duration::from_secs(60))
-            .persisted(directory.clone());
-        let found = second.get("abc123").expect("the snapshot is still readable");
+        let second = SnapshotStore::new(8, Duration::from_secs(60)).persisted(directory.clone());
+        let found = second
+            .get("abc123")
+            .expect("the snapshot is still readable");
 
         assert_eq!(found.revision, 7);
         assert_eq!(found.window.window_id, "w1");
@@ -405,13 +413,11 @@ mod tests {
     fn revisions_keep_climbing_past_what_another_process_wrote() {
         // Two processes must not mint the same revision for different trees.
         let directory = scratch("revisions");
-        let first = SnapshotStore::new(8, Duration::from_secs(60))
-            .persisted(directory.clone());
+        let first = SnapshotStore::new(8, Duration::from_secs(60)).persisted(directory.clone());
         first.insert(snapshot("aaa", 5));
         drop(first);
 
-        let second = SnapshotStore::new(8, Duration::from_secs(60))
-            .persisted(directory.clone());
+        let second = SnapshotStore::new(8, Duration::from_secs(60)).persisted(directory.clone());
 
         assert!(
             second.next_revision() > 5,
@@ -423,12 +429,14 @@ mod tests {
     #[test]
     fn a_persisted_snapshot_expires_with_the_ttl() {
         let directory = scratch("expiry");
-        let store = SnapshotStore::new(8, Duration::from_millis(20))
-            .persisted(directory.clone());
+        let store = SnapshotStore::new(8, Duration::from_millis(20)).persisted(directory.clone());
         store.insert(snapshot("bbb", 1));
         std::thread::sleep(Duration::from_millis(50));
 
-        assert!(store.get("bbb").is_none(), "an expired handle must not resolve");
+        assert!(
+            store.get("bbb").is_none(),
+            "an expired handle must not resolve"
+        );
         let _ = std::fs::remove_dir_all(&directory);
     }
 
@@ -436,10 +444,17 @@ mod tests {
     fn a_snapshot_id_can_never_escape_its_directory() {
         // Ids arrive from the caller, so they must not reach the filesystem raw.
         let directory = scratch("traversal");
-        let store = SnapshotStore::new(8, Duration::from_secs(60))
-            .persisted(directory.clone());
+        let store = SnapshotStore::new(8, Duration::from_secs(60)).persisted(directory.clone());
 
-        for hostile in ["../escape", "..\\escape", "a/b", "a\\b", "", "with space", "a:b"] {
+        for hostile in [
+            "../escape",
+            "..\\escape",
+            "a/b",
+            "a\\b",
+            "",
+            "with space",
+            "a:b",
+        ] {
             assert!(
                 store.path_for(hostile).is_none(),
                 "{hostile:?} must be rejected"
@@ -461,7 +476,10 @@ mod tests {
         store.insert(snapshot("s3", 3));
 
         assert_eq!(store.len(), 2);
-        assert!(store.get("s1").is_none(), "the oldest entry is evicted first");
+        assert!(
+            store.get("s1").is_none(),
+            "the oldest entry is evicted first"
+        );
         assert!(store.get("s3").is_some());
     }
 
@@ -476,25 +494,45 @@ mod tests {
 
     #[test]
     fn capture_limits_are_clamped_to_safe_bounds() {
-        let clamped = CaptureLimits { max_depth: 9_999, max_nodes: 999_999 }.clamp();
+        let clamped = CaptureLimits {
+            max_depth: 9_999,
+            max_nodes: 999_999,
+        }
+        .clamp();
         assert_eq!(clamped.max_depth, CaptureLimits::MAX_DEPTH);
         assert_eq!(clamped.max_nodes, CaptureLimits::MAX_NODES);
 
-        let raised = CaptureLimits { max_depth: 0, max_nodes: 0 }.clamp();
+        let raised = CaptureLimits {
+            max_depth: 0,
+            max_nodes: 0,
+        }
+        .clamp();
         assert_eq!(raised.max_depth, 1);
         assert_eq!(raised.max_nodes, 1);
     }
 
     #[test]
     fn a_click_point_is_the_centre_of_a_non_empty_rectangle() {
-        let point = click_point(Some(Bounds { x: 100, y: 200, width: 40, height: 20 })).unwrap();
+        let point = click_point(Some(Bounds {
+            x: 100,
+            y: 200,
+            width: 40,
+            height: 20,
+        }))
+        .unwrap();
         assert_eq!(point, (120, 210));
     }
 
     #[test]
     fn an_empty_or_missing_rectangle_cannot_be_clicked() {
         assert!(click_point(None).is_err());
-        assert!(click_point(Some(Bounds { x: 0, y: 0, width: 0, height: 5 })).is_err());
+        assert!(click_point(Some(Bounds {
+            x: 0,
+            y: 0,
+            width: 0,
+            height: 5
+        }))
+        .is_err());
     }
 
     #[test]
@@ -512,7 +550,11 @@ mod tests {
 
     #[test]
     fn states_serialize_every_field_including_unknowns() {
-        let value = States { enabled: Some(true), ..Default::default() }.to_json();
+        let value = States {
+            enabled: Some(true),
+            ..Default::default()
+        }
+        .to_json();
 
         assert_eq!(value["enabled"], serde_json::json!(true));
         assert_eq!(value["focused"], serde_json::Value::Null);

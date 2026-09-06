@@ -128,7 +128,11 @@ impl AutomationError {
 
     /// Build the `DESCRIPTOR.INVALID` error carrying compile-time issues.
     pub fn descriptor(issues: Vec<DescriptorIssue>) -> Self {
-        Self::descriptor_with("Workflow descriptor is invalid", "DESCRIPTOR.INVALID", issues)
+        Self::descriptor_with(
+            "Workflow descriptor is invalid",
+            "DESCRIPTOR.INVALID",
+            issues,
+        )
     }
 
     pub fn descriptor_with(
@@ -257,7 +261,10 @@ mod tests {
 
     #[test]
     fn category_is_derived_from_the_code_prefix() {
-        assert_eq!(AutomationError::new("ACTION.TIMEOUT", "x").category, "action");
+        assert_eq!(
+            AutomationError::new("ACTION.TIMEOUT", "x").category,
+            "action"
+        );
         assert_eq!(AutomationError::new("", "x").category, "runtime");
     }
 

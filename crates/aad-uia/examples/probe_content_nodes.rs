@@ -41,7 +41,10 @@ fn main() {
         let by_id: std::collections::HashMap<&str, &Node> =
             nodes.iter().map(|n| (n.node_id.as_str(), n)).collect();
 
-        println!("\n===== {} =====", title.chars().take(44).collect::<String>());
+        println!(
+            "\n===== {} =====",
+            title.chars().take(44).collect::<String>()
+        );
 
         let usable: Vec<&Node> = nodes
             .iter()
@@ -58,7 +61,9 @@ fn main() {
                     break;
                 }
                 hops += 1;
-                let Some(parent) = by_id.get(id.as_str()) else { break };
+                let Some(parent) = by_id.get(id.as_str()) else {
+                    break;
+                };
                 if matches!(parent.role.as_str(), "document" | "edit") {
                     return true;
                 }
@@ -112,7 +117,10 @@ fn main() {
 
         // 关键检查：complex fixture 的真控件会不会被误伤
         for probe in ["billing-city", "page-save", "bare"] {
-            if let Some(node) = nodes.iter().find(|n| n.automation_id.as_deref() == Some(probe)) {
+            if let Some(node) = nodes
+                .iter()
+                .find(|n| n.automation_id.as_deref() == Some(probe))
+            {
                 println!(
                     "  控件 {probe}: A={} C={}",
                     by_a.contains(node.node_id.as_str()),

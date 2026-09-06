@@ -18,10 +18,7 @@ struct Fixture {
 impl Fixture {
     fn new(label: &str, source: &str) -> Self {
         let mut path = std::env::temp_dir();
-        path.push(format!(
-            "aad-plugin-{label}-{}.py",
-            uuid_like(),
-        ));
+        path.push(format!("aad-plugin-{label}-{}.py", uuid_like(),));
         let mut file = std::fs::File::create(&path).expect("fixture file");
         file.write_all(source.as_bytes()).expect("write fixture");
         file.flush().expect("flush fixture");
@@ -29,12 +26,9 @@ impl Fixture {
     }
 
     fn spec(&self) -> PluginSpec {
-        PluginSpec::new(vec![
-            python(),
-            self.path.to_string_lossy().into_owned(),
-        ])
-        .with_timeout(Duration::from_secs(10))
-        .with_name("fixture")
+        PluginSpec::new(vec![python(), self.path.to_string_lossy().into_owned()])
+            .with_timeout(Duration::from_secs(10))
+            .with_name("fixture")
     }
 }
 
@@ -202,7 +196,9 @@ fn a_plugin_error_does_not_invalidate_the_process() {
     let fixture = Fixture::new("responsive", RESPONSIVE);
     let mut plugin = start(&fixture);
 
-    plugin.invoke("fixture.boom@1", json!({}), None).unwrap_err();
+    plugin
+        .invoke("fixture.boom@1", json!({}), None)
+        .unwrap_err();
     let result = plugin
         .invoke("fixture.echo@1", json!({"after": "error"}), None)
         .expect("the plugin is still usable after a normal error response");
@@ -223,7 +219,9 @@ fn a_dispatched_error_reports_effect_unknown() {
     let fixture = Fixture::new("responsive", RESPONSIVE);
     let mut plugin = start(&fixture);
 
-    let error = plugin.invoke("fixture.boom@1", json!({}), None).unwrap_err();
+    let error = plugin
+        .invoke("fixture.boom@1", json!({}), None)
+        .unwrap_err();
     let automation = error.into_automation_error();
 
     assert_eq!(automation.effect, "unknown");
@@ -259,7 +257,11 @@ for line in sys.stdin:
 
     let started = Instant::now();
     let error = plugin
-        .invoke("fixture.sleep@1", json!({}), Some(Duration::from_millis(300)))
+        .invoke(
+            "fixture.sleep@1",
+            json!({}),
+            Some(Duration::from_millis(300)),
+        )
         .expect_err("the invocation must time out");
 
     assert_eq!(error.code, "PLUGIN.HOST_TIMEOUT");
@@ -364,7 +366,7 @@ import time; time.sleep(5)
         .expect_err("a mismatched id must fail");
 
     assert_eq!(error.code, "PLUGIN.HOST_PROTOCOL_ERROR");
-    assert_eq!(error.details["expected_id"].is_string(), true);
+    assert!(error.details["expected_id"].is_string());
 }
 
 #[test]
@@ -464,7 +466,11 @@ sys.exit(1)
         .invoke("fixture.noisy@1", json!({}), Some(Duration::from_secs(5)))
         .expect_err("the plugin exits");
 
-    let stderr = error.details.get("stderr").and_then(Value::as_str).unwrap_or("");
+    let stderr = error
+        .details
+        .get("stderr")
+        .and_then(Value::as_str)
+        .unwrap_or("");
     assert!(
         stderr.contains("diagnostic detail"),
         "stderr should be attached, got {stderr:?}"

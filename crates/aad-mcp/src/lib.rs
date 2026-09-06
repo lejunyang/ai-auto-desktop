@@ -117,10 +117,7 @@ Call probe_environment for details."
             .ok_or((protocol::INVALID_PARAMS, "name is required".to_string()))?;
 
         if tools::find(name).is_none() && name != "probe_environment" {
-            return Err((
-                protocol::INVALID_PARAMS,
-                format!("unknown tool {name:?}"),
-            ));
+            return Err((protocol::INVALID_PARAMS, format!("unknown tool {name:?}")));
         }
 
         let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
@@ -129,11 +126,8 @@ Call probe_environment for details."
         // exists to explain why the desktop is unavailable, and the workflow
         // tools read the saved store, so listing or inspecting a workflow must
         // not depend on the desktop being reachable.
-        const NO_DRIVER_NEEDED: &[&str] = &[
-            "probe_environment",
-            "list_workflows",
-            "describe_workflow",
-        ];
+        const NO_DRIVER_NEEDED: &[&str] =
+            &["probe_environment", "list_workflows", "describe_workflow"];
         if NO_DRIVER_NEEDED.contains(&name) {
             return Ok(match tools::call_without_driver(name, &arguments) {
                 Ok(result) => content(&result, false),
@@ -355,7 +349,9 @@ mod tests {
 
     #[test]
     fn an_unknown_method_reports_method_not_found() {
-        let response = server().handle(&request("does/not/exist", json!({}))).unwrap();
+        let response = server()
+            .handle(&request("does/not/exist", json!({})))
+            .unwrap();
 
         assert_eq!(response["error"]["code"], protocol::METHOD_NOT_FOUND);
         assert_eq!(response["id"], json!(1));
@@ -420,7 +416,10 @@ mod tests {
         assert_eq!(response["result"]["isError"], true);
         let text = response["result"]["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("DRIVER.UNAVAILABLE"));
-        assert!(text.contains("probe_environment"), "must say what to do next");
+        assert!(
+            text.contains("probe_environment"),
+            "must say what to do next"
+        );
     }
 
     #[test]

@@ -30,17 +30,26 @@ fn main() {
 
     println!("=== 归到 loose 的 group，它们叫什么 ===");
     let mut shown = 0usize;
-    for node in nodes.iter().filter(|n| n.role == "group" && !n.actions.is_empty()) {
+    for node in nodes
+        .iter()
+        .filter(|n| n.role == "group" && !n.actions.is_empty())
+    {
         // 复现 region_of
         let mut current = node.parent_id.clone();
         let mut region = "(loose)".to_string();
         while let Some(id) = current {
-            let Some(parent) = by_id.get(id.as_str()) else { break };
+            let Some(parent) = by_id.get(id.as_str()) else {
+                break;
+            };
             if parent.node_id == root {
                 break;
             }
             if let Some(name) = parent.name.as_deref().filter(|t| !t.is_empty()) {
-                let shared = name.chars().zip(title.chars()).take_while(|(a, b)| a == b).count();
+                let shared = name
+                    .chars()
+                    .zip(title.chars())
+                    .take_while(|(a, b)| a == b)
+                    .count();
                 let shorter = name.chars().count().min(title.chars().count());
                 if !(name == title || (shorter >= 12 && shared * 100 >= shorter * 55)) {
                     region = name.to_string();
@@ -59,7 +68,12 @@ fn main() {
         println!(
             "  {} name={:?} 子节点={} depth={}",
             node.node_id,
-            node.name.as_deref().unwrap_or("(无名)").chars().take(30).collect::<String>(),
+            node.name
+                .as_deref()
+                .unwrap_or("(无名)")
+                .chars()
+                .take(30)
+                .collect::<String>(),
             children,
             node.depth
         );
@@ -84,6 +98,10 @@ fn main() {
     let mut sorted: Vec<(&&str, &usize)> = names.iter().collect();
     sorted.sort_by_key(|(_, c)| std::cmp::Reverse(**c));
     for (name, count) in sorted.iter().take(8) {
-        println!("    {:<34} ×{}", name.chars().take(32).collect::<String>(), count);
+        println!(
+            "    {:<34} ×{}",
+            name.chars().take(32).collect::<String>(),
+            count
+        );
     }
 }

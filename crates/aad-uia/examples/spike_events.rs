@@ -25,9 +25,9 @@ use windows::Win32::UI::Accessibility::{
     CUIAutomation, IUIAutomation, IUIAutomationElement, IUIAutomationEventHandler,
     IUIAutomationEventHandler_Impl, IUIAutomationFocusChangedEventHandler,
     IUIAutomationFocusChangedEventHandler_Impl, IUIAutomationPropertyChangedEventHandler,
-    IUIAutomationPropertyChangedEventHandler_Impl, TreeScope_Subtree, UIA_EVENT_ID,
-    UIA_InvokePatternId, UIA_Invoke_InvokedEventId, UIA_PROPERTY_ID, UIA_TogglePatternId,
-    UIA_ToggleToggleStatePropertyId, UIA_ValuePatternId, UIA_ValueValuePropertyId,
+    IUIAutomationPropertyChangedEventHandler_Impl, TreeScope_Subtree, UIA_InvokePatternId,
+    UIA_Invoke_InvokedEventId, UIA_TogglePatternId, UIA_ToggleToggleStatePropertyId,
+    UIA_ValuePatternId, UIA_ValueValuePropertyId, UIA_EVENT_ID, UIA_PROPERTY_ID,
 };
 use windows::Win32::UI::WindowsAndMessaging::FindWindowW;
 
@@ -119,8 +119,7 @@ fn main() -> Result<()> {
         )
     }?;
 
-    let value_changed: IUIAutomationPropertyChangedEventHandler =
-        ValueChanged(seen.clone()).into();
+    let value_changed: IUIAutomationPropertyChangedEventHandler = ValueChanged(seen.clone()).into();
     unsafe {
         automation.AddPropertyChangedEventHandlerNativeArray(
             &root,
@@ -152,9 +151,9 @@ fn main() -> Result<()> {
         // A button: should raise Invoked.
         if name.contains("Submit") {
             if let Ok(pattern) = unsafe { element.GetCurrentPattern(UIA_InvokePatternId) } {
-                if let Ok(invoke) = pattern.cast::<
-                    windows::Win32::UI::Accessibility::IUIAutomationInvokePattern,
-                >() {
+                if let Ok(invoke) =
+                    pattern.cast::<windows::Win32::UI::Accessibility::IUIAutomationInvokePattern>()
+                {
                     println!("invoking {name}");
                     let _ = unsafe { invoke.Invoke() };
                     std::thread::sleep(std::time::Duration::from_millis(400));
@@ -165,9 +164,9 @@ fn main() -> Result<()> {
         // An edit: should raise a Value property change.
         if name.contains("NameBox") {
             if let Ok(pattern) = unsafe { element.GetCurrentPattern(UIA_ValuePatternId) } {
-                if let Ok(value) = pattern.cast::<
-                    windows::Win32::UI::Accessibility::IUIAutomationValuePattern,
-                >() {
+                if let Ok(value) =
+                    pattern.cast::<windows::Win32::UI::Accessibility::IUIAutomationValuePattern>()
+                {
                     println!("typing into {name}");
                     let _ = unsafe { value.SetValue(&BSTR::from("hello")) };
                     std::thread::sleep(std::time::Duration::from_millis(400));
@@ -178,9 +177,9 @@ fn main() -> Result<()> {
         // A checkbox: toggling is a different pattern again.
         if name.contains("Subscribe") {
             if let Ok(pattern) = unsafe { element.GetCurrentPattern(UIA_TogglePatternId) } {
-                if let Ok(toggle) = pattern.cast::<
-                    windows::Win32::UI::Accessibility::IUIAutomationTogglePattern,
-                >() {
+                if let Ok(toggle) =
+                    pattern.cast::<windows::Win32::UI::Accessibility::IUIAutomationTogglePattern>()
+                {
                     println!("toggling {name}");
                     let _ = unsafe { toggle.Toggle() };
                     std::thread::sleep(std::time::Duration::from_millis(400));
@@ -192,9 +191,16 @@ fn main() -> Result<()> {
     std::thread::sleep(std::time::Duration::from_secs(3));
 
     let events = seen.lock().unwrap();
-    println!("\n{} events, {} focus changes", events.len(), focus_count.load(Ordering::Relaxed));
+    println!(
+        "\n{} events, {} focus changes",
+        events.len(),
+        focus_count.load(Ordering::Relaxed)
+    );
     for event in events.iter() {
-        println!("  {} name={:?} thread={}", event.kind, event.name, event.thread);
+        println!(
+            "  {} name={:?} thread={}",
+            event.kind, event.name, event.thread
+        );
     }
     Ok(())
 }

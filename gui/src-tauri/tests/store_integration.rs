@@ -33,8 +33,7 @@ fn a_recording_survives_the_real_store() {
     let directory = recordings::recordings_dir();
     println!("store: {}", directory.display());
 
-    let recording_path =
-        recordings::save_recording(name, &recorded()).expect("saving must work");
+    let recording_path = recordings::save_recording(name, &recorded()).expect("saving must work");
     let workflow_path = recordings::save_workflow(name, &json!({"kind": "Workflow"}))
         .expect("saving the workflow must work");
     println!("wrote: {}", recording_path.display());
@@ -42,7 +41,11 @@ fn a_recording_survives_the_real_store() {
     // Reading it back is the claim that matters; a written file that cannot be
     // reopened is not persistence.
     let reloaded = recordings::load_recording(&recording_path).expect("reopening must work");
-    assert_eq!(reloaded, recorded(), "the round trip must not alter anything");
+    assert_eq!(
+        reloaded,
+        recorded(),
+        "the round trip must not alter anything"
+    );
 
     // And it has to be discoverable, or the Open dialog shows nothing.
     let listed = recordings::list_recordings().expect("listing must work");

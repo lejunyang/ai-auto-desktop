@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
 description = "Read-only capability probes for desktop automation prerequisites"
 
 [dependencies]
@@ -25,3 +26,7 @@ windows-sys = { version = "0.59", features = [
     "Win32_UI_HiDpi",
     "Win32_UI_WindowsAndMessaging",
 ] }
+
+# Inherit the workspace's deliberate lint allowances (see the root Cargo.toml).
+[lints]
+workspace = true

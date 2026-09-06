@@ -14,8 +14,17 @@ use serde_json::{json, Value};
 fn interactive(node: &Node) -> bool {
     matches!(
         node.role.as_str(),
-        "button" | "edit" | "check_box" | "radio_button" | "combo_box"
-            | "list_item" | "menu_item" | "tab" | "hyperlink" | "tree_item" | "data_item"
+        "button"
+            | "edit"
+            | "check_box"
+            | "radio_button"
+            | "combo_box"
+            | "list_item"
+            | "menu_item"
+            | "tab"
+            | "hyperlink"
+            | "tree_item"
+            | "data_item"
     )
 }
 
@@ -83,7 +92,9 @@ fn main() {
                     // 同 role 兄弟数与最小容器内同类数
                     let siblings = nodes
                         .iter()
-                        .filter(|other| other.role == node.role && other.parent_id == node.parent_id)
+                        .filter(|other| {
+                            other.role == node.role && other.parent_id == node.parent_id
+                        })
                         .count();
                     let same_role_in_window =
                         nodes.iter().filter(|other| other.role == node.role).count();
@@ -136,11 +147,30 @@ fn main() {
     }
 
     println!("=== 可交互元素 {total} ===");
-    let pct = |part: usize| if total == 0 { 0.0 } else { part as f64 * 100.0 / total as f64 };
-    println!("  无需容器              {no_container:>4}  ({:.0}%)", pct(no_container));
-    println!("  容器是稳定身份        {stable_container:>4}  ({:.0}%)", pct(stable_container));
-    println!("  容器靠位置识别 ⚠      {positional_container:>4}  ({:.0}%)  ← 会安静地指向另一个对象", pct(positional_container));
-    println!("  仍然 unresolved       {:>4}  ({:.0}%)", unresolved.len(), pct(unresolved.len()));
+    let pct = |part: usize| {
+        if total == 0 {
+            0.0
+        } else {
+            part as f64 * 100.0 / total as f64
+        }
+    };
+    println!(
+        "  无需容器              {no_container:>4}  ({:.0}%)",
+        pct(no_container)
+    );
+    println!(
+        "  容器是稳定身份        {stable_container:>4}  ({:.0}%)",
+        pct(stable_container)
+    );
+    println!(
+        "  容器靠位置识别 ⚠      {positional_container:>4}  ({:.0}%)  ← 会安静地指向另一个对象",
+        pct(positional_container)
+    );
+    println!(
+        "  仍然 unresolved       {:>4}  ({:.0}%)",
+        unresolved.len(),
+        pct(unresolved.len())
+    );
 
     println!("\n=== 位置性容器的样本 ===");
     for line in &positional_samples {

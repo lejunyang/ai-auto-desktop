@@ -38,8 +38,7 @@ fn main() {
         }
         let root = captured["root_id"].as_str().unwrap_or_default().to_string();
 
-        let has_children =
-            |id: &str| nodes.iter().any(|n| n.parent_id.as_deref() == Some(id));
+        let has_children = |id: &str| nodes.iter().any(|n| n.parent_id.as_deref() == Some(id));
         let nameless = |node: &Node| node.name.as_deref().unwrap_or("").is_empty();
 
         let interactive: Vec<&Node> = nodes

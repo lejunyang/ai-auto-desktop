@@ -46,7 +46,7 @@ fn word_runs(fragment: &str) -> Vec<String> {
     // length says nothing about identifying value. The parts observed to change
     // have already been removed, so within what remains the fuller phrase is the
     // better name.
-    runs.sort_by(|a, b| b.chars().count().cmp(&a.chars().count()));
+    runs.sort_by_key(|run| std::cmp::Reverse(run.chars().count()));
     runs.dedup();
     runs
 }
@@ -203,10 +203,16 @@ mod tests {
             "AAD Complex Fixture | last=page-save: - Edge".to_string(),
         ];
         let shared = stable_title(&observed);
-        assert!(shared.contains("last="), "the substring really does carry it");
+        assert!(
+            shared.contains("last="),
+            "the substring really does carry it"
+        );
 
         let runs = word_runs(&shared);
-        assert_eq!(runs.first().map(String::as_str), Some("AAD Complex Fixture"));
+        assert_eq!(
+            runs.first().map(String::as_str),
+            Some("AAD Complex Fixture")
+        );
         assert!(
             !runs.iter().any(|run| run.contains("last=")),
             "a run must not end in punctuation: {runs:?}"
@@ -270,7 +276,10 @@ mod tests {
         // Two windows with the same process and the same title. A selector would
         // match both and act on whichever the driver saw first -- silently.
         let target = window("w1", "Document - Editor", "editor.exe");
-        let open = vec![target.clone(), window("w2", "Document - Editor", "editor.exe")];
+        let open = vec![
+            target.clone(),
+            window("w2", "Document - Editor", "editor.exe"),
+        ];
         assert!(selector_for(&target, &open, &[]).is_none());
     }
 

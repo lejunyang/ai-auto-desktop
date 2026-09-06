@@ -30,7 +30,10 @@ fn main() {
     let captured = driver
         .call("snapshot", &json!({"window_id": &window_id}))
         .expect("snap");
-    let snapshot_id = captured["snapshot_id"].as_str().unwrap_or_default().to_string();
+    let snapshot_id = captured["snapshot_id"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
     let revision = captured["revision"].as_u64().unwrap_or_default();
     let nodes: Vec<Node> = captured["nodes"]
         .as_array()
@@ -69,7 +72,9 @@ fn main() {
     let collected = driver
         .call("collect", &json!({"capture_id": &capture_id}))
         .expect("collect");
-    driver.call("release", &json!({"capture_id": &capture_id})).ok();
+    driver
+        .call("release", &json!({"capture_id": &capture_id}))
+        .ok();
 
     // steps 里没有 bounds，但 summary 有。直接看 driver 报的原始事件不可行
     // （collect 返回的是 steps），所以改看 steps 的数量与 summary。
@@ -88,7 +93,11 @@ fn main() {
         let Some(parent) = nodes.iter().find(|n| n.node_id == id) else {
             break;
         };
-        if parent.name.as_deref().is_some_and(|n| n.starts_with("Order for")) {
+        if parent
+            .name
+            .as_deref()
+            .is_some_and(|n| n.starts_with("Order for"))
+        {
             println!("  目标真正所属: {:?}", parent.name);
             break;
         }

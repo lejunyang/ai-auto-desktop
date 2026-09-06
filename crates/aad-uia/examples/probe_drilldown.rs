@@ -61,7 +61,11 @@ fn main() {
         best
     );
 
-    let has_children = |node: &Node| nodes.iter().any(|n| n.parent_id.as_deref() == Some(&node.node_id));
+    let has_children = |node: &Node| {
+        nodes
+            .iter()
+            .any(|n| n.parent_id.as_deref() == Some(&node.node_id))
+    };
 
     // 1&2. 容器视图
     let containers: Vec<&Node> = nodes
@@ -73,7 +77,11 @@ fn main() {
         .filter(|n| n.name.as_ref().is_some_and(|t| !t.is_empty()))
         .collect();
     println!("=== 若顶层只给容器 ===");
-    println!("  容器 {} 个，其中有名字的 {} 个", containers.len(), named.len());
+    println!(
+        "  容器 {} 个，其中有名字的 {} 个",
+        containers.len(),
+        named.len()
+    );
 
     // 3. 每个容器下面多少个（直接子节点 + 全部后代）
     let mut spans: Vec<(usize, usize, &Node)> = containers
@@ -137,10 +145,13 @@ fn main() {
         actions_bytes += json!(node.actions).to_string().len();
         counted += 1;
     }
-    if counted > 0 {
-        println!("  summary  平均 {} 字符", summary_bytes / counted);
-        println!("  locator  平均 {} 字符", locator_bytes / counted);
-        println!("  ref      平均 {} 字符", ref_bytes / counted);
-        println!("  actions  平均 {} 字符", actions_bytes / counted);
+    // checked_div keeps the zero case and the division in one expression;
+    // with no elements there is no average to print.
+    if let Some(divisor) = std::num::NonZeroUsize::new(counted) {
+        let divisor = divisor.get();
+        println!("  summary  平均 {} 字符", summary_bytes / divisor);
+        println!("  locator  平均 {} 字符", locator_bytes / divisor);
+        println!("  ref      平均 {} 字符", ref_bytes / divisor);
+        println!("  actions  平均 {} 字符", actions_bytes / divisor);
     }
 }

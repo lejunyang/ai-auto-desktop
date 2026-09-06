@@ -28,9 +28,9 @@ use windows::Win32::System::Com::{
 use windows::Win32::UI::Accessibility::{
     CUIAutomation, IUIAutomation, IUIAutomationElement, IUIAutomationEventHandler,
     IUIAutomationEventHandler_Impl, IUIAutomationPropertyChangedEventHandler,
-    IUIAutomationPropertyChangedEventHandler_Impl, SetWinEventHook, HWINEVENTHOOK,
-    TreeScope_Subtree, UIA_EVENT_ID, UIA_Invoke_InvokedEventId, UIA_PROPERTY_ID,
-    UIA_ToggleToggleStatePropertyId, UIA_ValueValuePropertyId,
+    IUIAutomationPropertyChangedEventHandler_Impl, SetWinEventHook, TreeScope_Subtree,
+    UIA_Invoke_InvokedEventId, UIA_ToggleToggleStatePropertyId, UIA_ValueValuePropertyId,
+    HWINEVENTHOOK, UIA_EVENT_ID, UIA_PROPERTY_ID,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, FindWindowW, MSG, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS,
@@ -133,11 +133,11 @@ fn find_fixture() -> HWND {
     for clicks in 0..4 {
         for text in ["", "typed", "driven"] {
             for checked in ["False", "True"] {
-                let title =
-                    format!("AAD Capture Fixture | clicks={clicks} text={text} checked={checked}\0");
+                let title = format!(
+                    "AAD Capture Fixture | clicks={clicks} text={text} checked={checked}\0"
+                );
                 let wide: Vec<u16> = title.encode_utf16().collect();
-                if let Ok(hwnd) =
-                    unsafe { FindWindowW(None, windows::core::PCWSTR(wide.as_ptr())) }
+                if let Ok(hwnd) = unsafe { FindWindowW(None, windows::core::PCWSTR(wide.as_ptr())) }
                 {
                     if !hwnd.is_invalid() {
                         return hwnd;
@@ -217,7 +217,6 @@ fn main() -> Result<()> {
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
-
 
     println!("\n=== UIA 事件处理器看到了什么 ===");
     let uia = UIA_SEEN.lock().unwrap();

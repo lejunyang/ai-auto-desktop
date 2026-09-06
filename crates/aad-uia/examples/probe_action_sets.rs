@@ -69,13 +69,19 @@ fn main() {
         .iter()
         .filter(|n| !n.name.as_deref().unwrap_or("").is_empty())
         .count();
-    println!("  可交互 {} 个，其中有名字 {}，无名 {}",
-             actionable.len(), named, actionable.len() - named);
+    println!(
+        "  可交互 {} 个，其中有名字 {}，无名 {}",
+        actionable.len(),
+        named,
+        actionable.len() - named
+    );
     let leaf_named = actionable
         .iter()
         .filter(|n| {
             !n.name.as_deref().unwrap_or("").is_empty()
-                && !nodes.iter().any(|c| c.parent_id.as_deref() == Some(&n.node_id))
+                && !nodes
+                    .iter()
+                    .any(|c| c.parent_id.as_deref() == Some(&n.node_id))
         })
         .count();
     println!("  其中无子节点且有名字（最像'一个控件'）: {leaf_named}");

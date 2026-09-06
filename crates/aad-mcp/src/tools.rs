@@ -28,7 +28,7 @@ fn target_schema() -> Value {
     json!({
         "type": "object",
         "description": "A target obtained from find_element or describe_window. \
-Quoting it proves the element was actually observed.",
+    Quoting it proves the element was actually observed.",
         "properties": {
             "snapshot_id": {"type": "string"},
             "revision": {"type": "integer"},
@@ -43,10 +43,10 @@ fn locator_schema() -> Value {
     json!({
         "type": "object",
         "description": "Element selector. Every field given must match, so adding \
-fields narrows the result. Matching is exact unless `match` is \"contains\". \
-When several elements share every attribute -- rows of a table each with their own \
-Edit button, for instance -- narrow with `within`, `near` or `nth` rather than \
-guessing.",
+    fields narrows the result. Matching is exact unless `match` is \"contains\". \
+    When several elements share every attribute -- rows of a table each with their own \
+    Edit button, for instance -- narrow with `within`, `near` or `nth` rather than \
+    guessing.",
         "properties": {
             "role": {"type": "string", "description": "Control type, e.g. Button, Edit."},
             "name": {"type": "string"},
@@ -77,16 +77,16 @@ guessing.",
             "within": {
                 "type": "object",
                 "description": "Only match inside the element this describes -- \
-itself a locator, so it can name a container by its own text. Prefer this over \
-`nth` when the container has a name: the row labelled \"Order for Ada\" is still \
-that row after the list is reordered, whereas a position is not.",
+    itself a locator, so it can name a container by its own text. Prefer this over \
+    `nth` when the container has a name: the row labelled \"Order for Ada\" is still \
+    that row after the list is reordered, whereas a position is not.",
                 "properties": {},
                 "additionalProperties": true
             },
             "near": {
                 "type": "object",
                 "description": "Only match elements beside another one, for \
-\"the field next to the Password label\".",
+    \"the field next to the Password label\".",
                 "properties": {
                     "anchor": {
                         "type": "object",
@@ -97,7 +97,7 @@ that row after the list is reordered, whereas a position is not.",
                         "enum": ["any", "left", "right", "above", "below"],
                         "default": "any",
                         "description": "Where the wanted element sits relative to \
-the anchor. A direction also requires them to share a row or a column."
+    the anchor. A direction also requires them to share a row or a column."
                     },
                     "within": {
                         "type": "integer",
@@ -109,10 +109,10 @@ the anchor. A direction also requires them to share a row or a column."
             },
             "nth": {
                 "description": "Which one to take when several still match, \
-counting from 1 in reading order (top to bottom, then left to right), or \
-\"last\". A last resort: position shifts whenever the interface reflows, and in \
-a browser most of what the platform reports as buttons belongs to the browser \
-itself rather than the page, so counting rarely means what it appears to.",
+    counting from 1 in reading order (top to bottom, then left to right), or \
+    \"last\". A last resort: position shifts whenever the interface reflows, and in \
+    a browser most of what the platform reports as buttons belongs to the browser \
+    itself rather than the page, so counting rarely means what it appears to.",
                 "oneOf": [
                     {"type": "integer", "minimum": 1},
                     {"const": "last"}
@@ -167,24 +167,24 @@ and pass one of its regions as `region`.",
                     "region": {
                         "type": "string",
                         "description": "List only this region, named as \
-overview_window reports it. This is the same name a locator carries in `within`, \
-so a region drilled into and a locator written against it agree."
+            overview_window reports it. This is the same name a locator carries in `within`, \
+            so a region drilled into and a locator written against it agree."
                     },
                     "limit": {
                         "type": "integer",
                         "description": "Maximum elements to return (default 80). \
-Check `truncated` and `matched` in the answer: `matched` says how many were \
-eligible, so it tells you whether raising this would show more.",
+            Check `truncated` and `matched` in the answer: `matched` says how many were \
+            eligible, so it tells you whether raising this would show more.",
                         "minimum": 1, "maximum": 500
                     },
                     "max_characters": {
                         "type": "integer",
                         "description": "Stop after roughly this many characters \
-(default 20000). An element count does not bound the answer's size -- elements \
-run from 169 to 4890 characters here, and 500 of them reached 188147 on one \
-window. When the answer is truncated, `stopped_by` says which ceiling bit: \
-raising `limit` helps when it says `limit` and does nothing when it says \
-`characters`, where narrowing to a region is the way forward.",
+            (default 20000). An element count does not bound the answer's size -- elements \
+            run from 169 to 4890 characters here, and 500 of them reached 188147 on one \
+            window. When the answer is truncated, `stopped_by` says which ceiling bit: \
+            raising `limit` helps when it says `limit` and does nothing when it says \
+            `characters`, where narrowing to a region is the way forward.",
                         "minimum": 500, "maximum": 200000
                     }
                 },
@@ -213,9 +213,9 @@ error.",
                         "type": "string",
                         "enum": ["one", "optional"],
                         "description": "one (default): a miss is an error, which is what \
-you want when acquiring something to act on. optional: a miss is an ordinary \
-result with found=false, for asking whether a dialog has closed or a spinner \
-has gone. Neither one lets an ambiguous match through."
+            you want when acquiring something to act on. optional: a miss is an ordinary \
+            result with found=false, for asking whether a dialog has closed or a spinner \
+            has gone. Neither one lets an ambiguous match through."
                     }
                 },
                 "required": ["locator"],
@@ -310,7 +310,7 @@ saves is a workflow that runs.",
                     "name": {
                         "type": "string",
                         "description": "What to call it. run_workflow and \
-describe_workflow take this name."
+            describe_workflow take this name."
                     },
                     "steps": {
                         "type": "array",
@@ -330,21 +330,21 @@ describe_workflow take this name."
                                 "locator": {
                                     "type": "object",
                                     "description": "How to find the element again. \
-Copy the `locator` describe_window or find_element gave for it. An element whose \
-locator came back null cannot be told apart from its siblings and cannot be saved."
+            Copy the `locator` describe_window or find_element gave for it. An element whose \
+            locator came back null cannot be told apart from its siblings and cannot be saved."
                                 },
                                 "window": {
                                     "type": "object",
                                     "description": "Which window, by \
-`process_name` and a stable part of `title`. Not a window_id: ids are assigned per \
-session, so a workflow using one works once and then fails.",
+            `process_name` and a stable part of `title`. Not a window_id: ids are assigned per \
+            session, so a workflow using one works once and then fails.",
                                     "properties": {
                                         "process_name": {"type": "string"},
                                         "title": {
                                             "type": "string",
                                             "description": "A part of the title that \
-does not change as the application is used -- many titles carry the open document \
-or a status that varies."
+            does not change as the application is used -- many titles carry the open document \
+            or a status that varies."
                                         }
                                     },
                                     "required": ["process_name"],
@@ -353,14 +353,14 @@ or a status that varies."
                                 "argument": {
                                     "type": "string",
                                     "description": "The text written or typed. Only \
-for set_value and type_text; giving it for another action is refused rather than \
-ignored."
+            for set_value and type_text; giving it for another action is refused rather than \
+            ignored."
                                 },
                                 "protected": {
                                     "type": "boolean",
                                     "description": "True if the text was a \
-credential. It is then stored as a required input instead of being written into \
-the file, and whoever runs the workflow supplies it."
+            credential. It is then stored as a required input instead of being written into \
+            the file, and whoever runs the workflow supplies it."
                                 }
                             },
                             "required": ["action", "locator", "window"],
@@ -370,8 +370,8 @@ the file, and whoever runs the workflow supplies it."
                     "overwrite": {
                         "type": "boolean",
                         "description": "Replace an existing workflow of the same \
-name. Without this a name already in use is refused, so two different workflows \
-cannot silently collapse into one."
+            name. Without this a name already in use is refused, so two different workflows \
+            cannot silently collapse into one."
                     }
                 },
                 "required": ["name", "steps"],
@@ -423,7 +423,7 @@ effect. Workflows containing script steps are refused.",
                     "inputs": {
                         "type": "object",
                         "description": "Values for the workflow's declared inputs, as \
-reported by describe_workflow."
+            reported by describe_workflow."
                     }
                 },
                 "required": ["name"],
@@ -540,16 +540,13 @@ fn save_workflow(arguments: &Value) -> Result<Value, String> {
     let mut performed = Vec::new();
     for (index, step) in given.iter().enumerate() {
         let ordinal = index + 1;
-        let action = step
-            .get("action")
-            .and_then(Value::as_str)
-            .ok_or_else(|| {
-                failure(
-                    "MCP.INVALID_ARGUMENT",
-                    &format!("step {ordinal} needs an action"),
-                    None,
-                )
-            })?;
+        let action = step.get("action").and_then(Value::as_str).ok_or_else(|| {
+            failure(
+                "MCP.INVALID_ARGUMENT",
+                &format!("step {ordinal} needs an action"),
+                None,
+            )
+        })?;
         performed.push(aad_runtime::assemble::PerformedStep {
             action: action.to_string(),
             locator: step.get("locator").cloned().unwrap_or(Value::Null),
@@ -723,26 +720,28 @@ fn compiled_workflow(arguments: &Value) -> Result<(String, aad_core::WorkflowDes
         )
     })?;
 
-    let descriptor = aad_core::compiler::compile_descriptor(document, path.parent().map(Into::into))
-        .map_err(|error| {
-            // Where each problem is, not just that there is one: "invalid" alone
-            // cannot be acted on, and the paths are what make a repair possible.
-            let located: Vec<Value> = error
-                .issues
-                .iter()
-                .map(|issue| json!({"path": issue.path, "message": issue.message}))
-                .collect();
-            let payload = json!({
-                "code": error.code,
-                "message": error.message,
-                "retryable": false,
-                "effect": "not_applied",
-                "hint": "The saved workflow is not valid. `issues` says where; the \
-desktop app can repair it, or save it again.",
-                "issues": located,
-            });
-            serde_json::to_string(&payload).unwrap_or_else(|_| error.message.clone())
-        })?;
+    let descriptor =
+        aad_core::compiler::compile_descriptor(document, path.parent().map(Into::into)).map_err(
+            |error| {
+                // Where each problem is, not just that there is one: "invalid" alone
+                // cannot be acted on, and the paths are what make a repair possible.
+                let located: Vec<Value> = error
+                    .issues
+                    .iter()
+                    .map(|issue| json!({"path": issue.path, "message": issue.message}))
+                    .collect();
+                let payload = json!({
+                    "code": error.code,
+                    "message": error.message,
+                    "retryable": false,
+                    "effect": "not_applied",
+                    "hint": "The saved workflow is not valid. `issues` says where; the \
+                desktop app can repair it, or save it again.",
+                    "issues": located,
+                });
+                serde_json::to_string(&payload).unwrap_or_else(|_| error.message.clone())
+            },
+        )?;
     Ok((name.to_string(), descriptor))
 }
 
@@ -954,8 +953,8 @@ fn walk_through(result: &aad_runtime::RunResult) -> Vec<Value> {
                 }
             }
             None => {
-                let done = parts.len() == 3
-                    && parts.iter().all(|(_, status, _)| status == "succeeded");
+                let done =
+                    parts.len() == 3 && parts.iter().all(|(_, status, _)| status == "succeeded");
                 entry.insert(
                     "status".into(),
                     json!(if done { "succeeded" } else { "incomplete" }),
@@ -1063,7 +1062,10 @@ have been closed, or its title may have changed past the part the workflow match
                 }
             }
             Err(error) => {
-                report.insert("window".into(), json!({"unreadable": error_payload(&error)}));
+                report.insert(
+                    "window".into(),
+                    json!({"unreadable": error_payload(&error)}),
+                );
             }
         }
     }
@@ -1282,7 +1284,9 @@ mod tests {
         // has the least context. The CLI is where a person supplies the path.
         for tool in catalogue() {
             let properties = tool.schema["properties"].as_object();
-            let Some(properties) = properties else { continue };
+            let Some(properties) = properties else {
+                continue;
+            };
             for forbidden in ["out", "path", "file", "output_path", "written_to"] {
                 assert!(
                     !properties.contains_key(forbidden),
@@ -1340,7 +1344,11 @@ mod tests {
         ]);
         let steps = walk_through(&result);
 
-        assert_eq!(steps.len(), 2, "two performed actions, not six executed steps");
+        assert_eq!(
+            steps.len(),
+            2,
+            "two performed actions, not six executed steps"
+        );
         assert_eq!(steps[0]["id"], "step_1");
         assert_eq!(steps[0]["status"], "succeeded");
         assert_eq!(steps[1]["id"], "step_2");
@@ -1379,7 +1387,10 @@ mod tests {
             ("step_1_element", "succeeded"),
         ]));
         assert_eq!(steps[0]["status"], "incomplete");
-        assert!(steps[0].get("error").is_none(), "nothing failed, so no error");
+        assert!(
+            steps[0].get("error").is_none(),
+            "nothing failed, so no error"
+        );
     }
 
     #[test]
@@ -1642,12 +1653,23 @@ hitting truncation without knowing there is another way: {:?}",
                 .unwrap_or_else(|| panic!("missing {key} for {name}"))
         };
 
-        for name in ["list_apps", "describe_window", "find_element", "probe_environment"] {
+        for name in [
+            "list_apps",
+            "describe_window",
+            "find_element",
+            "probe_environment",
+        ] {
             assert!(annotation(name, "readOnlyHint"), "{name} only reads");
         }
         for name in ["invoke", "type_text", "set_value", "pointer_click", "focus"] {
-            assert!(!annotation(name, "readOnlyHint"), "{name} changes the desktop");
-            assert!(annotation(name, "destructiveHint"), "{name} must be flagged");
+            assert!(
+                !annotation(name, "readOnlyHint"),
+                "{name} changes the desktop"
+            );
+            assert!(
+                annotation(name, "destructiveHint"),
+                "{name} must be flagged"
+            );
         }
     }
 
@@ -1664,7 +1686,10 @@ hitting truncation without knowing there is another way: {:?}",
             let target = &tool.schema["properties"]["target"];
             for field in ["snapshot_id", "revision", "node_id"] {
                 assert!(
-                    target["required"].as_array().unwrap().contains(&json!(field)),
+                    target["required"]
+                        .as_array()
+                        .unwrap()
+                        .contains(&json!(field)),
                     "{name} target must require {field}"
                 );
             }
@@ -1725,10 +1750,7 @@ hitting truncation without knowing there is another way: {:?}",
             if let Some(properties) = schema["properties"].as_object() {
                 for (key, value) in properties {
                     for forbidden in ["x", "y", "point", "coordinates", "position"] {
-                        assert_ne!(
-                            key, forbidden,
-                            "{path} must not accept {forbidden}"
-                        );
+                        assert_ne!(key, forbidden, "{path} must not accept {forbidden}");
                     }
                     walk(value, &format!("{path}.{key}"));
                 }
@@ -1854,7 +1876,10 @@ hitting truncation without knowing there is another way: {:?}",
             std::fs::create_dir_all(&directory).expect("scratch store");
             // SAFETY: serialised by STORE_LOCK.
             unsafe { std::env::set_var("AAD_RECORDINGS_DIR", &directory) };
-            Self { directory, _lock: lock }
+            Self {
+                directory,
+                _lock: lock,
+            }
         }
 
         fn save(&self, name: &str, descriptor: Value) {
@@ -1899,7 +1924,12 @@ hitting truncation without knowing there is another way: {:?}",
             process_id: 7,
             process_name: Some("fixture.exe".into()),
             class_name: Some("FixtureClass".into()),
-            bounds: Some(aad_uia::Bounds { x: 0, y: 0, width: 400, height: 300 }),
+            bounds: Some(aad_uia::Bounds {
+                x: 0,
+                y: 0,
+                width: 400,
+                height: 300,
+            }),
             is_foreground: true,
             is_minimized: false,
         }
@@ -1914,8 +1944,16 @@ hitting truncation without knowing there is another way: {:?}",
             automation_id: Some("saveButton".into()),
             class_name: None,
             framework_id: None,
-            bounds: Some(aad_uia::Bounds { x: 10, y: 10, width: 60, height: 20 }),
-            states: aad_uia::States { enabled: Some(true), ..Default::default() },
+            bounds: Some(aad_uia::Bounds {
+                x: 10,
+                y: 10,
+                width: 60,
+                height: 20,
+            }),
+            states: aad_uia::States {
+                enabled: Some(true),
+                ..Default::default()
+            },
             actions: vec!["invoke".into(), "focus".into()],
             depth: 1,
             parent_id: None,
@@ -2002,16 +2040,22 @@ hitting truncation without knowing there is another way: {:?}",
         let store = ScratchStore::new("describe");
         store.save("greeter", pure_workflow());
 
-        let described =
-            call_without_driver("describe_workflow", &json!({"name": "greeter"})).expect("describe");
+        let described = call_without_driver("describe_workflow", &json!({"name": "greeter"}))
+            .expect("describe");
 
         assert_eq!(described["name"], json!("greeter"));
         assert_eq!(described["step_count"], json!(1));
-        assert!(described["inputs"]["who"].is_object(), "declared inputs are reported");
+        assert!(
+            described["inputs"]["who"].is_object(),
+            "declared inputs are reported"
+        );
         assert!(described["outputs"]["greeting"].is_object());
         assert!(described["runnable"].as_bool().unwrap());
         assert!(
-            described["planDigest"].as_str().unwrap().starts_with("sha256:"),
+            described["planDigest"]
+                .as_str()
+                .unwrap()
+                .starts_with("sha256:"),
             "the digest identifies exactly what was inspected"
         );
     }
@@ -2039,11 +2083,12 @@ hitting truncation without knowing there is another way: {:?}",
         // A name is untrusted input that becomes a path. Traversal must be
         // refused by name, not resolved and then read.
         for name in ["../../secrets", "..\\..\\secrets", "a/b", "a\\b"] {
-            let error = call_without_driver("describe_workflow", &json!({"name": name}))
-                .unwrap_err();
+            let error =
+                call_without_driver("describe_workflow", &json!({"name": name})).unwrap_err();
             let payload: Value = serde_json::from_str(&error).unwrap();
             assert_eq!(
-                payload["code"], json!("STORE.NAME_INVALID"),
+                payload["code"],
+                json!("STORE.NAME_INVALID"),
                 "{name:?} must be refused as a name"
             );
         }
@@ -2138,13 +2183,19 @@ hitting truncation without knowing there is another way: {:?}",
         store.save("greeter", pure_workflow());
 
         let described = describe_workflow(&json!({"name": "greeter"})).expect("describe");
-        let ran = run_workflow(&stub_driver(), &json!({"name": "greeter", "inputs": {"who": "a"}}))
-            .expect("run");
+        let ran = run_workflow(
+            &stub_driver(),
+            &json!({"name": "greeter", "inputs": {"who": "a"}}),
+        )
+        .expect("run");
 
         let mut found = Vec::new();
         offenders(&described, "describe_workflow".into(), &mut found);
         offenders(&ran, "run_workflow".into(), &mut found);
-        assert!(found.is_empty(), "these fields are not snake_case: {found:?}");
+        assert!(
+            found.is_empty(),
+            "these fields are not snake_case: {found:?}"
+        );
     }
 
     #[test]
@@ -2168,7 +2219,10 @@ hitting truncation without knowing there is another way: {:?}",
         // Nothing ran, so the refusal must not imply a half-done run.
         assert_eq!(payload["effect"], json!("not_applied"));
         assert!(
-            payload["hint"].as_str().unwrap().contains("--allow-scripts"),
+            payload["hint"]
+                .as_str()
+                .unwrap()
+                .contains("--allow-scripts"),
             "the refusal must say who can run it and how"
         );
     }
@@ -2230,8 +2284,11 @@ hitting truncation without knowing there is another way: {:?}",
         let store = ScratchStore::new("bad-inputs");
         store.save("greeter", pure_workflow());
 
-        let error = run_workflow(&stub_driver(), &json!({"name": "greeter", "inputs": "who=agent"}))
-            .expect_err("must be refused");
+        let error = run_workflow(
+            &stub_driver(),
+            &json!({"name": "greeter", "inputs": "who=agent"}),
+        )
+        .expect_err("must be refused");
         let payload: Value = serde_json::from_str(&error).unwrap();
 
         assert_eq!(payload["code"], json!("MCP.INVALID_ARGUMENT"));

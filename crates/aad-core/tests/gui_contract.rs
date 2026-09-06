@@ -1,4 +1,4 @@
-﻿//! The GUI and the compiler must agree on what a recorded workflow looks like.
+//! The GUI and the compiler must agree on what a recorded workflow looks like.
 //!
 //! The desktop shell builds descriptors in TypeScript while the compiler that
 //! accepts them is here, in Rust. Nothing in either language forces those two
@@ -131,7 +131,11 @@ fn the_compiler_accepts_what_the_desktop_shell_exports() {
         .expect("the GUI's exported descriptor must compile unchanged");
 
     assert_eq!(compiled.name, "exported-by-the-gui");
-    assert_eq!(compiled.steps.len(), 9, "three recorded actions, three steps each");
+    assert_eq!(
+        compiled.steps.len(),
+        9,
+        "three recorded actions, three steps each"
+    );
 }
 
 #[test]
@@ -154,15 +158,20 @@ fn the_compiler_accepts_a_recording_that_externalises_a_password() {
     });
     descriptor["steps"][5]["with"]["value"] = json!("${{ inputs.step_2_secret }}");
 
-    let compiled = compile(&descriptor)
-        .expect("an externalised credential must still compile");
+    let compiled = compile(&descriptor).expect("an externalised credential must still compile");
 
     let input = compiled
         .inputs
         .get("step_2_secret")
         .expect("the input the action refers to must exist");
-    assert!(input.required, "a missing credential must fail before the run starts");
-    assert!(input.sensitive, "the value must be marked so it is not echoed");
+    assert!(
+        input.required,
+        "a missing credential must fail before the run starts"
+    );
+    assert!(
+        input.sensitive,
+        "the value must be marked so it is not echoed"
+    );
 }
 
 #[test]
@@ -249,7 +258,11 @@ fn the_window_is_identified_descriptively_rather_than_by_handle() {
             continue;
         }
         let window = &step.params["with"]["window"];
-        assert!(window.is_object(), "step {} must describe its window", step.id);
+        assert!(
+            window.is_object(),
+            "step {} must describe its window",
+            step.id
+        );
         assert!(
             step.params["with"].get("window_id").is_none(),
             "step {} pins a live handle, which will not survive being saved",

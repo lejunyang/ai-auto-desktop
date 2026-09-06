@@ -44,11 +44,13 @@ fn main() {
         }
         let root = captured["root_id"].as_str().unwrap_or_default().to_string();
 
-        let has_children =
-            |node: &Node| nodes.iter().any(|n| n.parent_id.as_deref() == Some(&node.node_id));
+        let has_children = |node: &Node| {
+            nodes
+                .iter()
+                .any(|n| n.parent_id.as_deref() == Some(&node.node_id))
+        };
         let only_generic = |node: &Node| {
-            !node.actions.is_empty()
-                && node.actions.iter().all(|a| GENERIC.contains(&a.as_str()))
+            !node.actions.is_empty() && node.actions.iter().all(|a| GENERIC.contains(&a.as_str()))
         };
 
         let interactive: Vec<&Node> = nodes
@@ -61,9 +63,7 @@ fn main() {
         let kept: Vec<&&Node> = interactive
             .iter()
             .filter(|n| {
-                !(has_children(n)
-                    && only_generic(n)
-                    && n.name.as_deref().unwrap_or("").is_empty())
+                !(has_children(n) && only_generic(n) && n.name.as_deref().unwrap_or("").is_empty())
             })
             .collect();
 
@@ -75,9 +75,7 @@ fn main() {
             let dropped: Vec<&&Node> = interactive
                 .iter()
                 .filter(|n| {
-                    has_children(n)
-                        && only_generic(n)
-                        && n.name.as_deref().unwrap_or("").is_empty()
+                    has_children(n) && only_generic(n) && n.name.as_deref().unwrap_or("").is_empty()
                 })
                 .collect();
             let mut roles: std::collections::BTreeMap<&str, usize> = Default::default();

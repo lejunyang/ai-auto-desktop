@@ -12,10 +12,17 @@ fn main() {
     let list = windows["windows"].as_array().expect("list");
     let window = list
         .iter()
-        .find(|w| w["title"].as_str().unwrap_or_default().contains("Complex Fixture"))
+        .find(|w| {
+            w["title"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("Complex Fixture")
+        })
         .expect("fixture");
     let window_id = window["window_id"].as_str().unwrap_or_default();
-    let captured = driver.call("snapshot", &json!({"window_id": window_id})).expect("snap");
+    let captured = driver
+        .call("snapshot", &json!({"window_id": window_id}))
+        .expect("snap");
     let nodes: Vec<Node> = captured["nodes"]
         .as_array()
         .expect("nodes")
@@ -25,7 +32,8 @@ fn main() {
 
     println!("=== Chrome Legacy Window 这个节点 ===");
     for node in nodes.iter().filter(|n| {
-        n.name.as_deref() == Some("Chrome Legacy Window") || n.automation_id.as_deref() == Some("739")
+        n.name.as_deref() == Some("Chrome Legacy Window")
+            || n.automation_id.as_deref() == Some("739")
     }) {
         let children = nodes
             .iter()
@@ -33,24 +41,36 @@ fn main() {
             .count();
         println!(
             "  {} role={} name={:?} id={:?} depth={} 子节点={} actions={:?}",
-            node.node_id, node.role, node.name, node.automation_id, node.depth, children, node.actions
+            node.node_id,
+            node.role,
+            node.name,
+            node.automation_id,
+            node.depth,
+            children,
+            node.actions
         );
         println!("    states: {:?}", node.states);
         println!("    bounds: {:?}", node.bounds);
     }
 
     println!("\n=== 对照：一个真实的可交互目标 ===");
-    for node in nodes
-        .iter()
-        .filter(|n| n.automation_id.as_deref() == Some("billing-city") || n.automation_id.as_deref() == Some("page-save"))
-    {
+    for node in nodes.iter().filter(|n| {
+        n.automation_id.as_deref() == Some("billing-city")
+            || n.automation_id.as_deref() == Some("page-save")
+    }) {
         let children = nodes
             .iter()
             .filter(|other| other.parent_id.as_deref() == Some(node.node_id.as_str()))
             .count();
         println!(
             "  {} role={} name={:?} id={:?} depth={} 子节点={} actions={:?}",
-            node.node_id, node.role, node.name, node.automation_id, node.depth, children, node.actions
+            node.node_id,
+            node.role,
+            node.name,
+            node.automation_id,
+            node.depth,
+            children,
+            node.actions
         );
         println!("    states: {:?}", node.states);
     }

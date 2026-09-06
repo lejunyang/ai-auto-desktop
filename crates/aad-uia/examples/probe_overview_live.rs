@@ -19,13 +19,19 @@ fn main() {
             continue;
         };
 
-        println!("\n===== {} =====", title.chars().take(50).collect::<String>());
+        println!(
+            "\n===== {} =====",
+            title.chars().take(50).collect::<String>()
+        );
         println!(
             "{} 节点，{} 可交互",
             overview["node_count"], overview["interactive"]
         );
         let text = overview.to_string();
-        println!("概览输出 {} 字符（对比 outline limit=80 的约 26000）", text.len());
+        println!(
+            "概览输出 {} 字符（对比 outline limit=80 的约 26000）",
+            text.len()
+        );
 
         println!("\n区域:");
         for region in overview["regions"].as_array().unwrap_or(&vec![]) {

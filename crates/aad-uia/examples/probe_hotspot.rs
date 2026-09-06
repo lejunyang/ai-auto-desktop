@@ -12,8 +12,16 @@ use std::time::Instant;
 fn interactive(node: &Node) -> bool {
     matches!(
         node.role.as_str(),
-        "button" | "edit" | "check_box" | "radio_button" | "combo_box"
-            | "list_item" | "menu_item" | "tab" | "hyperlink" | "tree_item"
+        "button"
+            | "edit"
+            | "check_box"
+            | "radio_button"
+            | "combo_box"
+            | "list_item"
+            | "menu_item"
+            | "tab"
+            | "hyperlink"
+            | "tree_item"
     )
 }
 
@@ -37,7 +45,10 @@ fn main() {
             .iter()
             .filter_map(|value| serde_json::from_value(value.clone()).ok())
             .collect();
-        if biggest.as_ref().is_none_or(|(_, existing)| nodes.len() > existing.len()) {
+        if biggest
+            .as_ref()
+            .is_none_or(|(_, existing)| nodes.len() > existing.len())
+        {
             biggest = Some((process.to_string(), nodes));
         }
     }
@@ -54,7 +65,10 @@ fn main() {
     for _ in 0..100 {
         let _ = plain.resolve(&nodes);
     }
-    println!("resolve（纯属性）100 次: {}µs", started.elapsed().as_micros());
+    println!(
+        "resolve（纯属性）100 次: {}µs",
+        started.elapsed().as_micros()
+    );
 
     let scoped = Locator::from_value(&json!({
         "role": "button",
@@ -65,7 +79,10 @@ fn main() {
     for _ in 0..100 {
         let _ = scoped.resolve(&nodes);
     }
-    println!("resolve（带 within）100 次: {}µs  ← 每次要建 HashMap", started.elapsed().as_micros());
+    println!(
+        "resolve（带 within）100 次: {}µs  ← 每次要建 HashMap",
+        started.elapsed().as_micros()
+    );
 
     // 逐个元素测 synthesize，并按耗时排序看分布
     let mut timings: Vec<(u128, String, u32)> = Vec::new();
@@ -76,7 +93,10 @@ fn main() {
             started.elapsed().as_micros(),
             format!(
                 "{} {}",
-                if result.as_ref().is_some_and(|l| l.to_json().get("within").is_some()) {
+                if result
+                    .as_ref()
+                    .is_some_and(|l| l.to_json().get("within").is_some())
+                {
                     "within"
                 } else if result.is_some() {
                     "attrs "
@@ -88,7 +108,7 @@ fn main() {
             node.depth,
         ));
     }
-    timings.sort_by(|a, b| b.0.cmp(&a.0));
+    timings.sort_by_key(|entry| std::cmp::Reverse(entry.0));
 
     let total: u128 = timings.iter().map(|(time, _, _)| time).sum();
     println!("\n合成 {} 个元素，共 {}ms", timings.len(), total / 1000);
@@ -121,7 +141,11 @@ fn main() {
         .map(|(time, _, _)| *time)
         .collect();
 
-    for (name, group) in [("属性即可", &without), ("用到 within", &with_within), ("失败", &failed)] {
+    for (name, group) in [
+        ("属性即可", &without),
+        ("用到 within", &with_within),
+        ("失败", &failed),
+    ] {
         if group.is_empty() {
             continue;
         }

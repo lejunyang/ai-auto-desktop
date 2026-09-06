@@ -162,10 +162,9 @@ pub fn coalesce(events: Vec<CapturedEvent>) -> Vec<CapturedEvent> {
                 EventKind::ValueChanged => true,
                 // Clicking: one click reports several times, but two clicks are
                 // two interactions. Only a tight burst is the former.
-                EventKind::StateChanged => event
-                    .observed_at
-                    .duration_since(previous.observed_at)
-                    <= BURST_WINDOW,
+                EventKind::StateChanged => {
+                    event.observed_at.duration_since(previous.observed_at) <= BURST_WINDOW
+                }
                 _ => false,
             }
         });
@@ -534,7 +533,12 @@ mod tests {
                 None,
                 None,
             );
-            row.bounds = Some(Bounds { x: 40, y, width: 700, height: 25 });
+            row.bounds = Some(Bounds {
+                x: 40,
+                y,
+                width: 700,
+                height: 25,
+            });
             let mut button = full(
                 &format!("edit{index}"),
                 "button",
@@ -543,7 +547,12 @@ mod tests {
                 Some("edit"),
             );
             button.parent_id = Some(format!("row{index}"));
-            button.bounds = Some(Bounds { x: 541, y, width: 48, height: 25 });
+            button.bounds = Some(Bounds {
+                x: 541,
+                y,
+                width: 48,
+                height: 25,
+            });
             rows.push(row);
             rows.push(button);
         }
@@ -560,7 +569,11 @@ mod tests {
         assert_eq!(steps.len(), 1);
         let locator = steps[0].locator.as_ref().expect("a locator");
         let selected = locator.resolve(&rows);
-        assert_eq!(selected.len(), 1, "still has to be unambiguous: {selected:?}");
+        assert_eq!(
+            selected.len(),
+            1,
+            "still has to be unambiguous: {selected:?}"
+        );
         assert_eq!(
             selected[0].node_id, "edit2",
             "the row that was clicked, not the first namesake"
@@ -574,9 +587,19 @@ mod tests {
         // recording that silently misses steps is the failure this design exists
         // to prevent.
         let mut first = full("a", "button", Some("Edit"), None, Some("edit"));
-        first.bounds = Some(Bounds { x: 10, y: 10, width: 40, height: 20 });
+        first.bounds = Some(Bounds {
+            x: 10,
+            y: 10,
+            width: 40,
+            height: 20,
+        });
         let mut second = full("b", "button", Some("Edit"), None, Some("edit"));
-        second.bounds = Some(Bounds { x: 10, y: 60, width: 40, height: 20 });
+        second.bounds = Some(Bounds {
+            x: 10,
+            y: 60,
+            width: 40,
+            height: 20,
+        });
         let nodes = vec![first.clone(), second];
 
         // Captured with no bounds at all.
@@ -598,7 +621,13 @@ mod tests {
         //
         // The judgement is capability, not the name -- names differ by browser,
         // language and version.
-        let mut host = full("host", "pane", Some("Chrome Legacy Window"), Some("739"), None);
+        let mut host = full(
+            "host",
+            "pane",
+            Some("Chrome Legacy Window"),
+            Some("739"),
+            None,
+        );
         host.actions = vec!["invoke".into(), "pointer_click".into()];
         let field = full("e1", "edit", Some("City"), Some("billing-city"), None);
         let nodes = vec![field.clone()];
@@ -689,7 +718,10 @@ mod tests {
         // showed no drift -- discarding the field wholesale would leave far more
         // elements undescribable than it protects.
         let first = full("e1", "edit", None, Some("searchBox"), None);
-        let nodes = vec![first.clone(), full("e2", "edit", None, Some("filterBox"), None)];
+        let nodes = vec![
+            first.clone(),
+            full("e2", "edit", None, Some("filterBox"), None),
+        ];
 
         let steps = to_steps(vec![captured(EventKind::ValueChanged, first)], &nodes);
 
@@ -825,7 +857,6 @@ mod tests {
         assert_eq!(steps[0].action, "invoke");
     }
 
-
     fn node(name: &str, role: &str) -> Node {
         Node {
             node_id: format!("n_{name}"),
@@ -847,7 +878,12 @@ mod tests {
     fn event(sequence: u64, kind: EventKind, name: &str) -> CapturedEvent {
         // Spaced well beyond the burst window, so a test that does not care
         // about timing gets the "separate interactions" reading.
-        at(sequence, kind, name, Duration::from_millis(500) * sequence as u32)
+        at(
+            sequence,
+            kind,
+            name,
+            Duration::from_millis(500) * sequence as u32,
+        )
     }
 
     /// An event observed a given interval after a fixed origin.
@@ -935,8 +971,18 @@ mod tests {
         // Submit button that is three submissions.
         let events = vec![
             at(0, EventKind::StateChanged, "submit", Duration::ZERO),
-            at(1, EventKind::StateChanged, "submit", Duration::from_millis(3)),
-            at(2, EventKind::StateChanged, "submit", Duration::from_millis(7)),
+            at(
+                1,
+                EventKind::StateChanged,
+                "submit",
+                Duration::from_millis(3),
+            ),
+            at(
+                2,
+                EventKind::StateChanged,
+                "submit",
+                Duration::from_millis(7),
+            ),
         ];
         assert_eq!(coalesce(events).len(), 1);
     }
@@ -947,7 +993,12 @@ mod tests {
         // would pass the test above while losing real interactions.
         let events = vec![
             at(0, EventKind::StateChanged, "submit", Duration::ZERO),
-            at(1, EventKind::StateChanged, "submit", Duration::from_millis(400)),
+            at(
+                1,
+                EventKind::StateChanged,
+                "submit",
+                Duration::from_millis(400),
+            ),
         ];
         assert_eq!(coalesce(events).len(), 2);
     }
@@ -958,8 +1009,18 @@ mod tests {
         // burst rule is per element, not per moment.
         let events = vec![
             at(0, EventKind::StateChanged, "submit", Duration::ZERO),
-            at(1, EventKind::StateChanged, "submit", Duration::from_millis(4)),
-            at(2, EventKind::StateChanged, "cancel", Duration::from_millis(8)),
+            at(
+                1,
+                EventKind::StateChanged,
+                "submit",
+                Duration::from_millis(4),
+            ),
+            at(
+                2,
+                EventKind::StateChanged,
+                "cancel",
+                Duration::from_millis(8),
+            ),
         ];
         let collapsed = coalesce(events);
         assert_eq!(collapsed.len(), 2);
@@ -1050,7 +1111,10 @@ mod tests {
         }
         let (events, _) = buffer.drain(10);
         assert_eq!(
-            events.iter().map(|event| event.sequence).collect::<Vec<_>>(),
+            events
+                .iter()
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
             vec![2, 3]
         );
     }

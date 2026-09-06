@@ -259,7 +259,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         options = build_parser().parse_args(argv)
         if options.version:
-            _emit({"status": "version", "program": "ai-auto-desktop", "version": "0.1.0"})
+            _emit({"status": "version", "program": "ai-auto-desktop", "version": "0.0.1"})
             return 0
         if options.command is None:
             raise AutomationError(

@@ -32,7 +32,7 @@ except ImportError:  # pragma: no cover
     jsonschema = None
 
 _TEMPLATE = re.compile(r"\$\{\{(.*?)\}\}", re.DOTALL)
-RUNTIME_VERSION = "0.1.0"
+RUNTIME_VERSION = "0.0.1"
 RUNTIME_STATE_SCHEMA_VERSION = 1
 
 

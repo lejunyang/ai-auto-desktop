@@ -12,8 +12,16 @@ use std::time::Instant;
 fn interactive(node: &Node) -> bool {
     matches!(
         node.role.as_str(),
-        "button" | "edit" | "check_box" | "radio_button" | "combo_box"
-            | "list_item" | "menu_item" | "tab" | "hyperlink" | "tree_item"
+        "button"
+            | "edit"
+            | "check_box"
+            | "radio_button"
+            | "combo_box"
+            | "list_item"
+            | "menu_item"
+            | "tab"
+            | "hyperlink"
+            | "tree_item"
     )
 }
 
@@ -97,10 +105,22 @@ fn main() {
     }
 
     println!("=== 可交互元素 {total} ===");
-    println!("  属性即可识别            {resolved_by_attributes:>4}  ({:.0}%)", pct(resolved_by_attributes, total));
-    println!("  容器即可识别（新增）     {resolved_by_container:>4}  ({:.0}%)", pct(resolved_by_container, total));
-    println!("  容器 + 序数（新增）      {resolved_with_ordinal:>4}  ({:.0}%)", pct(resolved_with_ordinal, total));
-    println!("  仍然无法识别            {still_unresolved:>4}  ({:.0}%)", pct(still_unresolved, total));
+    println!(
+        "  属性即可识别            {resolved_by_attributes:>4}  ({:.0}%)",
+        pct(resolved_by_attributes, total)
+    );
+    println!(
+        "  容器即可识别（新增）     {resolved_by_container:>4}  ({:.0}%)",
+        pct(resolved_by_container, total)
+    );
+    println!(
+        "  容器 + 序数（新增）      {resolved_with_ordinal:>4}  ({:.0}%)",
+        pct(resolved_with_ordinal, total)
+    );
+    println!(
+        "  仍然无法识别            {still_unresolved:>4}  ({:.0}%)",
+        pct(still_unresolved, total)
+    );
     println!(
         "\nunresolved: 改动前 143 (16.3%) → 现在 {still_unresolved} ({:.1}%)",
         pct(still_unresolved, total)
@@ -116,5 +136,9 @@ fn main() {
 }
 
 fn pct(part: usize, whole: usize) -> f64 {
-    if whole == 0 { 0.0 } else { part as f64 * 100.0 / whole as f64 }
+    if whole == 0 {
+        0.0
+    } else {
+        part as f64 * 100.0 / whole as f64
+    }
 }

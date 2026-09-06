@@ -72,7 +72,9 @@ fn main() {
             let mut current = node.parent_id.clone();
             let mut label = None;
             while let Some(id) = current {
-                let Some(parent) = by_id.get(id.as_str()) else { break };
+                let Some(parent) = by_id.get(id.as_str()) else {
+                    break;
+                };
                 if parent.depth == 0 {
                     break;
                 }

@@ -40,7 +40,10 @@ pub struct StoreError {
 
 impl StoreError {
     fn new(code: &'static str, message: impl Into<String>) -> Self {
-        Self { code, message: message.into() }
+        Self {
+            code,
+            message: message.into(),
+        }
     }
 }
 
@@ -66,7 +69,10 @@ pub fn recordings_dir() -> PathBuf {
 fn validate_name(name: &str) -> Result<&str> {
     let trimmed = name.trim();
     if trimmed.is_empty() {
-        return Err(StoreError::new("STORE.NAME_INVALID", "a recording needs a name"));
+        return Err(StoreError::new(
+            "STORE.NAME_INVALID",
+            "a recording needs a name",
+        ));
     }
     if trimmed.chars().count() > MAX_NAME_CHARS {
         return Err(StoreError::new(
@@ -91,12 +97,18 @@ fn validate_name(name: &str) -> Result<&str> {
     }
     // `.` and `..` are directory references, not names.
     if trimmed.chars().all(|c| c == '.') {
-        return Err(StoreError::new("STORE.NAME_INVALID", "a name must have some text in it"));
+        return Err(StoreError::new(
+            "STORE.NAME_INVALID",
+            "a name must have some text in it",
+        ));
     }
     // A trailing dot or space is silently stripped by Windows, which would make
     // the saved file's name differ from the one shown in the UI.
     if trimmed.ends_with('.') {
-        return Err(StoreError::new("STORE.NAME_INVALID", "a name may not end with a dot"));
+        return Err(StoreError::new(
+            "STORE.NAME_INVALID",
+            "a name may not end with a dot",
+        ));
     }
     // The two kinds of document are told apart by these suffixes, so a name
     // ending in one collides with the scheme itself. Measured: "recorded.workflow"
@@ -155,7 +167,10 @@ fn write_document(name: &str, suffix: &str, document: &Value) -> Result<PathBuf>
     // half-written file where a valid recording used to be.
     let staging = directory.join(format!(".{name}{suffix}.partial"));
     fs::write(&staging, serialized.as_bytes()).map_err(|error| {
-        StoreError::new("STORE.WRITE_FAILED", format!("cannot write {}: {error}", staging.display()))
+        StoreError::new(
+            "STORE.WRITE_FAILED",
+            format!("cannot write {}: {error}", staging.display()),
+        )
     })?;
     fs::rename(&staging, &path).map_err(|error| {
         let _ = fs::remove_file(&staging);
@@ -200,7 +215,10 @@ pub fn load_recording(path: &Path) -> Result<Value> {
     if metadata.len() > MAX_FILE_BYTES {
         return Err(StoreError::new(
             "STORE.FILE_TOO_LARGE",
-            format!("{} is larger than {MAX_FILE_BYTES} bytes", resolved.display()),
+            format!(
+                "{} is larger than {MAX_FILE_BYTES} bytes",
+                resolved.display()
+            ),
         ));
     }
 
@@ -285,7 +303,11 @@ fn list_by_suffix(suffix: &str) -> Result<Vec<SavedRecording>> {
         });
     }
 
-    found.sort_by(|a, b| b.modified.cmp(&a.modified).then_with(|| a.name.cmp(&b.name)));
+    found.sort_by(|a, b| {
+        b.modified
+            .cmp(&a.modified)
+            .then_with(|| a.name.cmp(&b.name))
+    });
     Ok(found)
 }
 
@@ -306,12 +328,17 @@ mod tests {
 
     impl Sandbox {
         fn new(label: &str) -> Self {
-            let lock = GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let lock = GUARD
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             let directory = std::env::temp_dir().join(format!("aad-store-{label}"));
             let _ = fs::remove_dir_all(&directory);
             fs::create_dir_all(&directory).unwrap();
             std::env::set_var("AAD_RECORDINGS_DIR", &directory);
-            Self { directory, _lock: lock }
+            Self {
+                directory,
+                _lock: lock,
+            }
         }
     }
 
@@ -346,7 +373,10 @@ mod tests {
         let path = save_recording("demo", &original).expect("must save");
         let reloaded = load_recording(&path).expect("must reload");
 
-        assert_eq!(reloaded, original, "a round trip must not alter the recording");
+        assert_eq!(
+            reloaded, original,
+            "a round trip must not alter the recording"
+        );
     }
 
     #[test]
@@ -387,7 +417,11 @@ mod tests {
     fn reading_outside_the_store_is_refused() {
         let sandbox = Sandbox::new("outside");
         // A real file that exists, just not one the UI should be able to read.
-        let outsider = sandbox.directory.parent().unwrap().join("aad-outsider.json");
+        let outsider = sandbox
+            .directory
+            .parent()
+            .unwrap()
+            .join("aad-outsider.json");
         fs::write(&outsider, "{\"secret\":true}").unwrap();
 
         let error = load_recording(&outsider).expect_err("must refuse a path outside the store");
@@ -399,7 +433,11 @@ mod tests {
     #[test]
     fn traversal_through_the_store_is_refused() {
         let sandbox = Sandbox::new("traverse");
-        let outsider = sandbox.directory.parent().unwrap().join("aad-traversed.json");
+        let outsider = sandbox
+            .directory
+            .parent()
+            .unwrap()
+            .join("aad-traversed.json");
         fs::write(&outsider, "{}").unwrap();
 
         // Starts inside the store but does not stay there.
@@ -453,7 +491,9 @@ mod tests {
         let sandbox = Sandbox::new("absent");
         fs::remove_dir_all(&sandbox.directory).unwrap();
 
-        assert!(list_recordings().expect("nothing saved yet is not a failure").is_empty());
+        assert!(list_recordings()
+            .expect("nothing saved yet is not a failure")
+            .is_empty());
     }
 
     #[test]
@@ -465,7 +505,10 @@ mod tests {
 
         let listed = list_recordings().unwrap();
 
-        assert_eq!(listed[0].name, "newer", "the one just worked on comes first");
+        assert_eq!(
+            listed[0].name, "newer",
+            "the one just worked on comes first"
+        );
     }
 
     #[test]
@@ -491,7 +534,10 @@ mod tests {
         let workflow_path = save_workflow("both", &json!({"kind": "Workflow"})).unwrap();
 
         assert_ne!(recording_path, workflow_path);
-        assert_eq!(load_recording(&recording_path).unwrap()["kind"], "Recording");
+        assert_eq!(
+            load_recording(&recording_path).unwrap()["kind"],
+            "Recording"
+        );
     }
 
     #[test]
@@ -513,12 +559,16 @@ mod tests {
         // that becomes a path. It must be refused rather than resolved.
         let _sandbox = Sandbox::new("path-escape");
 
-        for name in ["../outside", "..\\outside", "nested/name", "nested\\name", "..", ""] {
+        for name in [
+            "../outside",
+            "..\\outside",
+            "nested/name",
+            "nested\\name",
+            "..",
+            "",
+        ] {
             let refused = workflow_path(name);
-            assert!(
-                refused.is_err(),
-                "{name:?} must not resolve to a path"
-            );
+            assert!(refused.is_err(), "{name:?} must not resolve to a path");
             assert_eq!(refused.unwrap_err().code, "STORE.NAME_INVALID");
         }
     }
@@ -533,10 +583,16 @@ mod tests {
         save_recording("draft", &recording("draft")).unwrap();
         save_workflow("runnable", &json!({"kind": "Workflow"})).unwrap();
 
-        let recordings: Vec<String> =
-            list_recordings().unwrap().into_iter().map(|item| item.name).collect();
-        let workflows: Vec<String> =
-            list_workflows().unwrap().into_iter().map(|item| item.name).collect();
+        let recordings: Vec<String> = list_recordings()
+            .unwrap()
+            .into_iter()
+            .map(|item| item.name)
+            .collect();
+        let workflows: Vec<String> = list_workflows()
+            .unwrap()
+            .into_iter()
+            .map(|item| item.name)
+            .collect();
 
         assert_eq!(recordings, vec!["draft".to_string()]);
         assert_eq!(workflows, vec!["runnable".to_string()]);
@@ -554,10 +610,17 @@ mod tests {
             b"{",
         )
         .unwrap();
-        fs::write(recordings_dir().join(format!(".ghost{WORKFLOW_SUFFIX}")), b"{").unwrap();
+        fs::write(
+            recordings_dir().join(format!(".ghost{WORKFLOW_SUFFIX}")),
+            b"{",
+        )
+        .unwrap();
 
-        let names: Vec<String> =
-            list_workflows().unwrap().into_iter().map(|item| item.name).collect();
+        let names: Vec<String> = list_workflows()
+            .unwrap()
+            .into_iter()
+            .map(|item| item.name)
+            .collect();
 
         assert_eq!(names, vec!["real".to_string()]);
     }

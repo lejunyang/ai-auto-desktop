@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
 description = "Descriptor model, expression evaluator and workflow compiler for ai-auto-desktop"
 
 [dependencies]
@@ -12,3 +13,7 @@ serde_json = { workspace = true }
 serde_yaml = { workspace = true }
 indexmap = { workspace = true }
 sha2 = { workspace = true }
+
+# Inherit the workspace's deliberate lint allowances (see the root Cargo.toml).
+[lints]
+workspace = true

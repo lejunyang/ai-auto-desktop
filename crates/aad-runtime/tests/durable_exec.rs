@@ -6,12 +6,12 @@
 //! only prove the code does what I expected; killing a process proves the
 //! *journal on disk* is genuinely sufficient to recover from.
 
+use aad_core::compiler::compile_descriptor;
+use aad_core::WorkflowDescriptor;
 use aad_runtime::durable::{DesiredState, JournalStore, RunStatus};
 use aad_runtime::durable_exec::{
     assert_durable_plan, DurableExecutor, DurableOptions, Phase, Stopped,
 };
-use aad_core::compiler::compile_descriptor;
-use aad_core::WorkflowDescriptor;
 use serde_json::{json, Map, Value};
 
 /// A journal in its own directory, removed on drop.
@@ -42,8 +42,7 @@ impl TempDir {
     /// Open with an explicit busy timeout, for tests that deliberately contend
     /// for the write lock and need to control who loses.
     fn open_with_timeout(&self, busy_timeout_ms: u32) -> JournalStore {
-        JournalStore::open_with_timeout(self.journal_path(), busy_timeout_ms)
-            .expect("open journal")
+        JournalStore::open_with_timeout(self.journal_path(), busy_timeout_ms).expect("open journal")
     }
 }
 
@@ -197,8 +196,17 @@ fn a_durable_run_completes_and_records_every_boundary() {
         .collect();
     // Every step is bracketed, which is what makes recovery able to tell
     // "inside a step" from "between steps".
-    assert_eq!(events.iter().filter(|e| *e == "run.segment_entered").count(), 3);
-    assert_eq!(events.iter().filter(|e| *e == "run.segment_exited").count(), 3);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| *e == "run.segment_entered")
+            .count(),
+        3
+    );
+    assert_eq!(
+        events.iter().filter(|e| *e == "run.segment_exited").count(),
+        3
+    );
     assert_eq!(events.first().expect("first"), "run.created");
     assert_eq!(events.last().expect("last"), "run.finished");
 }
@@ -301,7 +309,15 @@ fn a_paused_run_resumes_and_completes_from_its_boundary() {
     let store = temp.open();
     let digest = aad_runtime::plan_digest(&descriptor);
     store
-        .create_run("run-1", "durable.counting", &json!({}), &descriptor.raw, None, Some(&digest), None)
+        .create_run(
+            "run-1",
+            "durable.counting",
+            &json!({}),
+            &descriptor.raw,
+            None,
+            Some(&digest),
+            None,
+        )
         .expect("create");
     store
         .compare_and_set_desired_state("run-1", DesiredState::Run, DesiredState::Pause, None)
@@ -339,7 +355,13 @@ fn a_paused_run_resumes_and_completes_from_its_boundary() {
         .into_iter()
         .map(|event| event.event_type)
         .collect();
-    assert_eq!(events.iter().filter(|e| *e == "run.segment_entered").count(), 4);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| *e == "run.segment_entered")
+            .count(),
+        4
+    );
     assert!(events.iter().any(|e| e == "run.resumed"));
     // Clearing the intent is recorded, so an operator can see why their pause
     // stopped applying.
@@ -358,12 +380,29 @@ fn a_resume_does_not_clear_a_pause_on_a_run_it_refuses_to_continue() {
     let store = temp.open();
     let digest = aad_runtime::plan_digest(&descriptor);
     store
-        .create_run("run-1", "durable.counting", &json!({}), &descriptor.raw, None, Some(&digest), None)
+        .create_run(
+            "run-1",
+            "durable.counting",
+            &json!({}),
+            &descriptor.raw,
+            None,
+            Some(&digest),
+            None,
+        )
         .expect("create");
     let now = aad_runtime::durable::now_seconds();
     let lease = store.claim_owner("run-1", "dead", 0.4, now).expect("claim");
     store
-        .set_status(&lease, RunStatus::Pending, RunStatus::Running, None, None, None, None, now)
+        .set_status(
+            &lease,
+            RunStatus::Pending,
+            RunStatus::Running,
+            None,
+            None,
+            None,
+            None,
+            now,
+        )
         .expect("start");
     // Interrupted inside a step: unresumable.
     store
@@ -409,7 +448,15 @@ fn a_pause_requested_partway_stops_at_the_next_boundary_and_keeps_progress() {
     let store = temp.open();
     let digest = aad_runtime::plan_digest(&descriptor);
     store
-        .create_run("run-1", "durable.counting", &json!({}), &descriptor.raw, None, Some(&digest), None)
+        .create_run(
+            "run-1",
+            "durable.counting",
+            &json!({}),
+            &descriptor.raw,
+            None,
+            Some(&digest),
+            None,
+        )
         .expect("create");
 
     // Ask for the pause from another connection while the run is in flight. The
@@ -419,12 +466,7 @@ fn a_pause_requested_partway_stops_at_the_next_boundary_and_keeps_progress() {
     let requested = std::thread::spawn(move || {
         // Give the run a moment to get past its first boundary.
         std::thread::sleep(std::time::Duration::from_millis(15));
-        control.compare_and_set_desired_state(
-            "run-1",
-            DesiredState::Run,
-            DesiredState::Pause,
-            None,
-        )
+        control.compare_and_set_desired_state("run-1", DesiredState::Run, DesiredState::Pause, None)
     });
 
     let executor = DurableExecutor::new(temp.open());
@@ -597,7 +639,7 @@ fn storm_round(round: usize) -> bool {
     // with itself, not the behaviour under test, so it is retried. What is never
     // tolerated is `JOURNAL.CONFLICT`: that would mean a request the journal
     // granted came back to the caller as an error.
-    let mut attempt = |first: bool| {
+    let attempt = |first: bool| {
         // A storage failure is not necessarily a failure to *start*: the
         // attempt may have moved the run out of `pending` before losing the
         // write lock. Retrying `execute` then reports the run is already
@@ -660,13 +702,21 @@ fn storm_round(round: usize) -> bool {
         );
     }
     assert_eq!(outcome.run.status, RunStatus::Succeeded);
-    assert_eq!(outcome.run.output.as_ref().expect("output")["total"], json!(40));
+    assert_eq!(
+        outcome.run.output.as_ref().expect("output")["total"],
+        json!(40)
+    );
     let entered: Vec<String> = store
         .list_events("run-1", 0, 5000)
         .expect("events")
         .into_iter()
         .filter(|event| event.event_type == "run.segment_entered")
-        .map(|event| event.payload["stepId"].as_str().unwrap_or_default().to_string())
+        .map(|event| {
+            event.payload["stepId"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        })
         .collect();
     let mut unique = entered.clone();
     unique.sort();
@@ -677,7 +727,6 @@ fn storm_round(round: usize) -> bool {
     legs > 1
 }
 
-
 #[test]
 fn a_cancel_requested_partway_ends_the_run_as_cancelled() {
     let temp = TempDir::new("cancel-partway");
@@ -685,7 +734,15 @@ fn a_cancel_requested_partway_ends_the_run_as_cancelled() {
     let store = temp.open();
     let digest = aad_runtime::plan_digest(&descriptor);
     store
-        .create_run("run-1", "durable.counting", &json!({}), &descriptor.raw, None, Some(&digest), None)
+        .create_run(
+            "run-1",
+            "durable.counting",
+            &json!({}),
+            &descriptor.raw,
+            None,
+            Some(&digest),
+            None,
+        )
         .expect("create");
     store
         .compare_and_set_desired_state("run-1", DesiredState::Run, DesiredState::Cancel, None)
@@ -826,7 +883,10 @@ fn the_checkpoint_records_the_phase_and_survives_reopening() {
     let checkpoint = run.checkpoint.as_ref().expect("checkpoint persisted");
 
     assert_eq!(checkpoint["checkpointVersion"], json!(1));
-    assert_eq!(checkpoint["planDigest"], json!(aad_runtime::plan_digest(&descriptor)));
+    assert_eq!(
+        checkpoint["planDigest"],
+        json!(aad_runtime::plan_digest(&descriptor))
+    );
     // The last checkpoint before finishing is the finalizing one.
     assert_eq!(checkpoint["phase"], json!(Phase::Finalizing.as_str()));
     // The absolute deadline is stored so a resume cannot be handed a fresh
@@ -842,7 +902,15 @@ fn a_checkpoint_from_an_unsupported_version_is_refused() {
     let store = temp.open();
     let digest = aad_runtime::plan_digest(&descriptor);
     store
-        .create_run("run-1", "durable.counting", &json!({}), &descriptor.raw, None, Some(&digest), None)
+        .create_run(
+            "run-1",
+            "durable.counting",
+            &json!({}),
+            &descriptor.raw,
+            None,
+            Some(&digest),
+            None,
+        )
         .expect("create");
     let lease = store
         .claim_owner("run-1", "runner", 60.0, aad_runtime::durable::now_seconds())
@@ -876,7 +944,9 @@ fn a_checkpoint_from_an_unsupported_version_is_refused() {
             aad_runtime::durable::now_seconds(),
         )
         .expect("write checkpoint");
-    store.release_owner(&lease, aad_runtime::durable::now_seconds()).expect("release");
+    store
+        .release_owner(&lease, aad_runtime::durable::now_seconds())
+        .expect("release");
 
     let executor = DurableExecutor::new(temp.open());
     let error = executor
@@ -892,12 +962,31 @@ fn a_checkpoint_without_a_deadline_is_refused_rather_than_treated_as_unlimited()
     let store = temp.open();
     let digest = aad_runtime::plan_digest(&descriptor);
     store
-        .create_run("run-1", "durable.counting", &json!({}), &descriptor.raw, None, Some(&digest), None)
+        .create_run(
+            "run-1",
+            "durable.counting",
+            &json!({}),
+            &descriptor.raw,
+            None,
+            Some(&digest),
+            None,
+        )
         .expect("create");
     let now = aad_runtime::durable::now_seconds();
-    let lease = store.claim_owner("run-1", "runner", 60.0, now).expect("claim");
+    let lease = store
+        .claim_owner("run-1", "runner", 60.0, now)
+        .expect("claim");
     store
-        .set_status(&lease, RunStatus::Pending, RunStatus::Running, None, None, None, None, now)
+        .set_status(
+            &lease,
+            RunStatus::Pending,
+            RunStatus::Running,
+            None,
+            None,
+            None,
+            None,
+            now,
+        )
         .expect("start");
     store
         .append_event_with_checkpoint(
@@ -930,12 +1019,31 @@ fn an_expired_deadline_ends_the_run_as_timed_out_on_resume() {
     let store = temp.open();
     let digest = aad_runtime::plan_digest(&descriptor);
     store
-        .create_run("run-1", "durable.counting", &json!({}), &descriptor.raw, None, Some(&digest), None)
+        .create_run(
+            "run-1",
+            "durable.counting",
+            &json!({}),
+            &descriptor.raw,
+            None,
+            Some(&digest),
+            None,
+        )
         .expect("create");
     let now = aad_runtime::durable::now_seconds();
-    let lease = store.claim_owner("run-1", "runner", 60.0, now).expect("claim");
+    let lease = store
+        .claim_owner("run-1", "runner", 60.0, now)
+        .expect("claim");
     store
-        .set_status(&lease, RunStatus::Pending, RunStatus::Running, None, None, None, None, now)
+        .set_status(
+            &lease,
+            RunStatus::Pending,
+            RunStatus::Running,
+            None,
+            None,
+            None,
+            None,
+            now,
+        )
         .expect("start");
     // Time spent paused still counts, so a resume after the deadline must not
     // get a fresh budget.
@@ -987,14 +1095,33 @@ fn a_run_interrupted_inside_a_step_becomes_unknown_effect_with_no_replay() {
     let store = temp.open();
     let digest = aad_runtime::plan_digest(&descriptor);
     store
-        .create_run("run-1", "durable.counting", &json!({}), &descriptor.raw, None, Some(&digest), None)
+        .create_run(
+            "run-1",
+            "durable.counting",
+            &json!({}),
+            &descriptor.raw,
+            None,
+            Some(&digest),
+            None,
+        )
         .expect("create");
     let now = aad_runtime::durable::now_seconds();
     // A short TTL so the abandoned lease lapses quickly, as it must before any
     // other runner may touch the run.
-    let lease = store.claim_owner("run-1", "runner-dead", 0.4, now).expect("claim");
+    let lease = store
+        .claim_owner("run-1", "runner-dead", 0.4, now)
+        .expect("claim");
     store
-        .set_status(&lease, RunStatus::Pending, RunStatus::Running, None, None, None, None, now)
+        .set_status(
+            &lease,
+            RunStatus::Pending,
+            RunStatus::Running,
+            None,
+            None,
+            None,
+            None,
+            now,
+        )
         .expect("start");
     // Exactly what the drive loop writes before dispatching a step. The runner
     // then "dies" without ever writing the exit boundary.
@@ -1048,7 +1175,10 @@ fn a_run_interrupted_inside_a_step_becomes_unknown_effect_with_no_replay() {
         .map(|event| event.event_type)
         .collect();
     assert_eq!(
-        events.iter().filter(|e| *e == "run.segment_entered").count(),
+        events
+            .iter()
+            .filter(|e| *e == "run.segment_entered")
+            .count(),
         1,
         "the interrupted step must not be re-entered: {events:?}"
     );
@@ -1062,12 +1192,29 @@ fn an_interruption_during_cleanup_is_also_unknown_effect() {
     let store = temp.open();
     let digest = aad_runtime::plan_digest(&descriptor);
     store
-        .create_run("run-1", "durable.counting", &json!({}), &descriptor.raw, None, Some(&digest), None)
+        .create_run(
+            "run-1",
+            "durable.counting",
+            &json!({}),
+            &descriptor.raw,
+            None,
+            Some(&digest),
+            None,
+        )
         .expect("create");
     let now = aad_runtime::durable::now_seconds();
     let lease = store.claim_owner("run-1", "dead", 0.5, now).expect("claim");
     store
-        .set_status(&lease, RunStatus::Pending, RunStatus::Running, None, None, None, None, now)
+        .set_status(
+            &lease,
+            RunStatus::Pending,
+            RunStatus::Running,
+            None,
+            None,
+            None,
+            None,
+            now,
+        )
         .expect("start");
     // Cleanup steps can have effects too, so being interrupted there is just as
     // unprovable as being interrupted in the body.
@@ -1115,7 +1262,15 @@ fn a_live_lease_stops_a_second_runner_from_resuming_the_same_run() {
     let store = temp.open();
     let digest = aad_runtime::plan_digest(&descriptor);
     store
-        .create_run("run-1", "durable.counting", &json!({}), &descriptor.raw, None, Some(&digest), None)
+        .create_run(
+            "run-1",
+            "durable.counting",
+            &json!({}),
+            &descriptor.raw,
+            None,
+            Some(&digest),
+            None,
+        )
         .expect("create");
     let now = aad_runtime::durable::now_seconds();
     // A runner that is very much alive holds the run.
@@ -1123,7 +1278,16 @@ fn a_live_lease_stops_a_second_runner_from_resuming_the_same_run() {
         .claim_owner("run-1", "runner-alive", 600.0, now)
         .expect("claim");
     store
-        .set_status(&held, RunStatus::Pending, RunStatus::Running, None, None, None, None, now)
+        .set_status(
+            &held,
+            RunStatus::Pending,
+            RunStatus::Running,
+            None,
+            None,
+            None,
+            None,
+            now,
+        )
         .expect("start");
 
     let executor = DurableExecutor::new(temp.open());
@@ -1340,7 +1504,10 @@ fn a_killed_process_leaves_a_recoverable_journal() {
         .into_iter()
         .map(|event| event.event_type)
         .collect();
-    let entered_after = events.iter().filter(|e| *e == "run.segment_entered").count();
+    let entered_after = events
+        .iter()
+        .filter(|e| *e == "run.segment_entered")
+        .count();
 
     if interrupted_phase == "in_top_level_step" {
         // Killed mid-step: whether the effect landed is unknowable, so the run
@@ -1422,7 +1589,16 @@ fn inputs_are_restored_from_the_journal_on_resume() {
     let now = aad_runtime::durable::now_seconds();
     let lease = store.claim_owner("run-1", "dead", 0.4, now).expect("claim");
     store
-        .set_status(&lease, RunStatus::Pending, RunStatus::Running, None, None, None, None, now)
+        .set_status(
+            &lease,
+            RunStatus::Pending,
+            RunStatus::Running,
+            None,
+            None,
+            None,
+            None,
+            now,
+        )
         .expect("start");
     store
         .append_event_with_checkpoint(
@@ -1458,4 +1634,3 @@ fn inputs_are_restored_from_the_journal_on_resume() {
         json!("hello!")
     );
 }
-

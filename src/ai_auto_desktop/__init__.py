@@ -17,7 +17,7 @@ from .plugin import PluginError, ProcessPlugin
 from .run_service import DispatchState, RunService, RunServiceError
 from .runtime import WorkflowRunner, run_descriptor
 
-__version__ = "0.1.0"
+__version__ = "0.0.1"
 
 __all__ = [
     "API_VERSION", "KIND", "ArtifactError", "ArtifactHandle", "ArtifactRef",

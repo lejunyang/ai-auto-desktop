@@ -5,7 +5,7 @@ metadata:
   version: 1.0.0
   description: 对调用方预先选定的 KDE/X11 语义目标截图，显式 OCR 后仅返回判断结果。
 requires:
-  runtime: ">=0.1.0"
+  runtime: ">=0.0.1"
   platforms: [linux]
   permissions: [desktop.observe, desktop.capture]
   capabilities:

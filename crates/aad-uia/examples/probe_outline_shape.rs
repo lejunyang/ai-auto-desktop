@@ -39,9 +39,7 @@ fn main() {
         }
         let interesting = nodes
             .iter()
-            .filter(|n| {
-                !n.actions.is_empty() || n.name.as_ref().is_some_and(|t| !t.is_empty())
-            })
+            .filter(|n| !n.actions.is_empty() || n.name.as_ref().is_some_and(|t| !t.is_empty()))
             .filter(|n| n.states.offscreen != Some(true))
             .count();
         totals.push(interesting);
@@ -51,7 +49,7 @@ fn main() {
                 "  超限 {:>4} 条 (总 {:>4})  {}",
                 interesting,
                 nodes.len(),
-                &title.chars().take(42).collect::<String>()
+                title.chars().take(42).collect::<String>()
             );
         }
     }
@@ -88,9 +86,7 @@ fn main() {
             .unwrap_or_default();
         let interesting: Vec<&Node> = nodes
             .iter()
-            .filter(|n| {
-                !n.actions.is_empty() || n.name.as_ref().is_some_and(|t| !t.is_empty())
-            })
+            .filter(|n| !n.actions.is_empty() || n.name.as_ref().is_some_and(|t| !t.is_empty()))
             .filter(|n| n.states.offscreen != Some(true))
             .collect();
         let count = interesting.len();
@@ -104,12 +100,14 @@ fn main() {
     }
 
     if let Some((count, title, nodes)) = biggest {
-        println!("  {}（{} 条可见）", title.chars().take(46).collect::<String>(), count);
+        println!(
+            "  {}（{} 条可见）",
+            title.chars().take(46).collect::<String>(),
+            count
+        );
         let interesting: Vec<&Node> = nodes
             .iter()
-            .filter(|n| {
-                !n.actions.is_empty() || n.name.as_ref().is_some_and(|t| !t.is_empty())
-            })
+            .filter(|n| !n.actions.is_empty() || n.name.as_ref().is_some_and(|t| !t.is_empty()))
             .filter(|n| n.states.offscreen != Some(true))
             .collect();
 

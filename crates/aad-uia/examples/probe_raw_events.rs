@@ -12,7 +12,12 @@ fn main() {
     let list = windows["windows"].as_array().expect("list");
     let window = list
         .iter()
-        .find(|w| w["title"].as_str().unwrap_or_default().contains("Complex Fixture"))
+        .find(|w| {
+            w["title"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("Complex Fixture")
+        })
         .expect("fixture");
     let window_id = window["window_id"].as_str().unwrap_or_default().to_string();
 
@@ -20,7 +25,10 @@ fn main() {
     let captured = driver
         .call("snapshot", &json!({"window_id": &window_id}))
         .expect("snap");
-    let snapshot_id = captured["snapshot_id"].as_str().unwrap_or_default().to_string();
+    let snapshot_id = captured["snapshot_id"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
     let revision = captured["revision"].as_u64().unwrap_or_default();
     let node_id = captured["nodes"]
         .as_array()
@@ -34,7 +42,10 @@ fn main() {
     let session = driver
         .call("watch", &json!({"window_id": &window_id}))
         .expect("watch");
-    let capture_id = session["capture_id"].as_str().expect("capture id").to_string();
+    let capture_id = session["capture_id"]
+        .as_str()
+        .expect("capture id")
+        .to_string();
     println!("watching {capture_id}");
 
     sleep(Duration::from_millis(600));
@@ -48,7 +59,9 @@ fn main() {
     let collected = driver
         .call("collect", &json!({"capture_id": &capture_id}))
         .expect("collect");
-    driver.call("release", &json!({"capture_id": &capture_id})).ok();
+    driver
+        .call("release", &json!({"capture_id": &capture_id}))
+        .ok();
 
     let events = collected["events"].as_array().cloned().unwrap_or_default();
     println!("\n{} 个事件:", events.len());
@@ -70,6 +83,9 @@ fn main() {
             node["automation_id"].as_str(),
             node["actions"]
         );
-        println!("    children={:?} depth={:?}", node["children"], node["depth"]);
+        println!(
+            "    children={:?} depth={:?}",
+            node["children"], node["depth"]
+        );
     }
 }

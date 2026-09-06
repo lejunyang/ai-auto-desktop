@@ -140,10 +140,7 @@ fn tokenize(source: &str) -> Result<Vec<Token>> {
         }
 
         if character.is_ascii_digit()
-            || (character == '.'
-                && characters
-                    .get(index + 1)
-                    .is_some_and(char::is_ascii_digit))
+            || (character == '.' && characters.get(index + 1).is_some_and(char::is_ascii_digit))
         {
             let (token, consumed) = read_number(&characters, index, source, position)?;
             tokens.push(Token {
@@ -211,7 +208,11 @@ fn read_string(
         let character = characters[index];
         if character == '\\' {
             let escaped = characters.get(index + 1).copied().ok_or_else(|| {
-                ExpressionError::at("invalid expression syntax: dangling escape", source, position)
+                ExpressionError::at(
+                    "invalid expression syntax: dangling escape",
+                    source,
+                    position,
+                )
             })?;
             text.push(match escaped {
                 'n' => '\n',
@@ -266,7 +267,10 @@ fn read_number(
             break;
         }
     }
-    let text: String = characters[start..index].iter().filter(|c| **c != '_').collect();
+    let text: String = characters[start..index]
+        .iter()
+        .filter(|c| **c != '_')
+        .collect();
     let token = if is_float {
         Tok::Float(text.parse::<f64>().map_err(|_| {
             ExpressionError::at(
@@ -395,9 +399,7 @@ impl<'a> Parser<'a> {
         if self.eat_op(operator) {
             return Ok(());
         }
-        Err(self.error(format!(
-            "invalid expression syntax: expected {operator:?}"
-        )))
+        Err(self.error(format!("invalid expression syntax: expected {operator:?}")))
     }
 
     fn error(&self, message: impl Into<String>) -> ExpressionError {
@@ -415,9 +417,9 @@ impl<'a> Parser<'a> {
             self.advance();
             let test = self.parse_or()?;
             if !self.eat_keyword("else") {
-                return Err(self.error(
-                    "invalid expression syntax: conditional expression requires else",
-                ));
+                return Err(
+                    self.error("invalid expression syntax: conditional expression requires else")
+                );
             }
             let orelse = self.parse_conditional()?;
             return Ok(Node::IfExp(
@@ -714,9 +716,7 @@ impl<'a> Parser<'a> {
                 return Ok(());
             }
             if !self.eat_op(",") {
-                return Err(self.error(format!(
-                    "invalid expression syntax: expected {closing:?}"
-                )));
+                return Err(self.error(format!("invalid expression syntax: expected {closing:?}")));
             }
             if self.eat_op(closing) {
                 return Ok(());
@@ -949,7 +949,10 @@ impl<'a> Evaluator<'a> {
             }
             Value::Array(items) => {
                 let index = as_i64(key).ok_or_else(|| {
-                    self.error("subscript lookup failed: index must be an integer", position)
+                    self.error(
+                        "subscript lookup failed: index must be an integer",
+                        position,
+                    )
                 })?;
                 let resolved = if index < 0 {
                     items.len() as i64 + index
@@ -964,7 +967,10 @@ impl<'a> Evaluator<'a> {
             Value::String(text) => {
                 let characters: Vec<char> = text.chars().collect();
                 let index = as_i64(key).ok_or_else(|| {
-                    self.error("subscript lookup failed: index must be an integer", position)
+                    self.error(
+                        "subscript lookup failed: index must be an integer",
+                        position,
+                    )
                 })?;
                 let resolved = if index < 0 {
                     characters.len() as i64 + index
@@ -996,9 +1002,9 @@ impl<'a> Evaluator<'a> {
                     if evaluated.is_null() {
                         return Ok(None);
                     }
-                    as_i64(&evaluated).map(Some).ok_or_else(|| {
-                        self.error("slice bounds must be integers", position)
-                    })
+                    as_i64(&evaluated)
+                        .map(Some)
+                        .ok_or_else(|| self.error("slice bounds must be integers", position))
                 }
             }
         };
@@ -1066,10 +1072,8 @@ impl<'a> Evaluator<'a> {
                 position,
             ));
         };
-        let integers = matches!(
-            (as_i64(left), as_i64(right)),
-            (Some(_), Some(_))
-        ) && !matches!(left, Value::Number(n) if n.as_f64().is_some_and(|v| v.fract() != 0.0))
+        let integers = matches!((as_i64(left), as_i64(right)), (Some(_), Some(_)))
+            && !matches!(left, Value::Number(n) if n.as_f64().is_some_and(|v| v.fract() != 0.0))
             && !matches!(right, Value::Number(n) if n.as_f64().is_some_and(|v| v.fract() != 0.0));
 
         match operator {
@@ -1440,7 +1444,11 @@ mod tests {
             ("-(3 + 4)", json!(-7)),
             ("+amount", json!(6)),
         ] {
-            assert_eq!(evaluate(source, variables.clone()).unwrap(), expected, "{source}");
+            assert_eq!(
+                evaluate(source, variables.clone()).unwrap(),
+                expected,
+                "{source}"
+            );
         }
     }
 
@@ -1474,14 +1482,21 @@ mod tests {
         });
 
         assert_eq!(
-            evaluate("enabled and attempts < 3 and role == 'admin'", variables.clone()).unwrap(),
+            evaluate(
+                "enabled and attempts < 3 and role == 'admin'",
+                variables.clone()
+            )
+            .unwrap(),
             json!(true)
         );
         assert_eq!(
             evaluate("disabled or attempts >= 2", variables.clone()).unwrap(),
             json!(true)
         );
-        assert_eq!(evaluate("not disabled", variables.clone()).unwrap(), json!(true));
+        assert_eq!(
+            evaluate("not disabled", variables.clone()).unwrap(),
+            json!(true)
+        );
         assert_eq!(
             evaluate("'allowed' if enabled else 'denied'", variables).unwrap(),
             json!("allowed")
@@ -1490,14 +1505,23 @@ mod tests {
 
     #[test]
     fn boolean_operators_short_circuit_before_unknown_names() {
-        assert_eq!(evaluate("False and unknown_variable", json!({})).unwrap(), json!(false));
-        assert_eq!(evaluate("True or unknown_variable", json!({})).unwrap(), json!(true));
+        assert_eq!(
+            evaluate("False and unknown_variable", json!({})).unwrap(),
+            json!(false)
+        );
+        assert_eq!(
+            evaluate("True or unknown_variable", json!({})).unwrap(),
+            json!(true)
+        );
     }
 
     #[test]
     fn comparison_chaining_evaluates_every_link() {
         let variables = json!({ "value": 5 });
-        assert_eq!(evaluate("1 < value < 10", variables.clone()).unwrap(), json!(true));
+        assert_eq!(
+            evaluate("1 < value < 10", variables.clone()).unwrap(),
+            json!(true)
+        );
         assert_eq!(evaluate("1 < value < 3", variables).unwrap(), json!(false));
     }
 
@@ -1513,25 +1537,43 @@ mod tests {
             "values": [10, 20, 30, 40, 50]
         });
 
-        assert_eq!(evaluate("user.profile.name", variables.clone()).unwrap(), json!("Ada"));
+        assert_eq!(
+            evaluate("user.profile.name", variables.clone()).unwrap(),
+            json!("Ada")
+        );
         assert_eq!(
             evaluate("user['profile'][field]", variables.clone()).unwrap(),
             json!("Ada")
         );
-        assert_eq!(evaluate("user.roles[1]", variables.clone()).unwrap(), json!("editor"));
+        assert_eq!(
+            evaluate("user.roles[1]", variables.clone()).unwrap(),
+            json!("editor")
+        );
         assert_eq!(
             evaluate("user.items", variables.clone()).unwrap(),
             json!("mapping value wins over dict.items")
         );
-        assert_eq!(evaluate("values[1:5:2]", variables).unwrap(), json!([20, 40]));
+        assert_eq!(
+            evaluate("values[1:5:2]", variables).unwrap(),
+            json!([20, 40])
+        );
     }
 
     #[test]
     fn slices_support_open_bounds_and_negative_steps() {
         let variables = json!({ "values": [10, 20, 30, 40, 50] });
-        assert_eq!(evaluate("values[:2]", variables.clone()).unwrap(), json!([10, 20]));
-        assert_eq!(evaluate("values[3:]", variables.clone()).unwrap(), json!([40, 50]));
-        assert_eq!(evaluate("values[-2:]", variables.clone()).unwrap(), json!([40, 50]));
+        assert_eq!(
+            evaluate("values[:2]", variables.clone()).unwrap(),
+            json!([10, 20])
+        );
+        assert_eq!(
+            evaluate("values[3:]", variables.clone()).unwrap(),
+            json!([40, 50])
+        );
+        assert_eq!(
+            evaluate("values[-2:]", variables.clone()).unwrap(),
+            json!([40, 50])
+        );
         assert_eq!(
             evaluate("values[::-1]", variables).unwrap(),
             json!([50, 40, 30, 20, 10])
@@ -1543,17 +1585,35 @@ mod tests {
         let variables = json!({
             "roles": ["admin"], "flags": {"beta": true}, "text": "hello world"
         });
-        assert_eq!(evaluate("'admin' in roles", variables.clone()).unwrap(), json!(true));
-        assert_eq!(evaluate("'beta' in flags", variables.clone()).unwrap(), json!(true));
-        assert_eq!(evaluate("'world' in text", variables.clone()).unwrap(), json!(true));
-        assert_eq!(evaluate("'nope' not in roles", variables).unwrap(), json!(true));
+        assert_eq!(
+            evaluate("'admin' in roles", variables.clone()).unwrap(),
+            json!(true)
+        );
+        assert_eq!(
+            evaluate("'beta' in flags", variables.clone()).unwrap(),
+            json!(true)
+        );
+        assert_eq!(
+            evaluate("'world' in text", variables.clone()).unwrap(),
+            json!(true)
+        );
+        assert_eq!(
+            evaluate("'nope' not in roles", variables).unwrap(),
+            json!(true)
+        );
     }
 
     #[test]
     fn none_comparisons_use_is() {
         let variables = json!({ "value": null });
-        assert_eq!(evaluate("value is None", variables.clone()).unwrap(), json!(true));
-        assert_eq!(evaluate("value is not None", variables).unwrap(), json!(false));
+        assert_eq!(
+            evaluate("value is None", variables.clone()).unwrap(),
+            json!(true)
+        );
+        assert_eq!(
+            evaluate("value is not None", variables).unwrap(),
+            json!(false)
+        );
     }
 
     #[test]
@@ -1573,7 +1633,10 @@ mod tests {
             "len(values)",
             "sorted(values)",
         ] {
-            assert!(evaluate(source, json!({})).is_err(), "{source} must be rejected");
+            assert!(
+                evaluate(source, json!({})).is_err(),
+                "{source} must be rejected"
+            );
         }
     }
 
@@ -1586,7 +1649,10 @@ mod tests {
             "{value: value for value in values}",
             "(value for value in values)",
         ] {
-            assert!(evaluate(source, json!({})).is_err(), "{source} must be rejected");
+            assert!(
+                evaluate(source, json!({})).is_err(),
+                "{source} must be rejected"
+            );
         }
     }
 
@@ -1617,7 +1683,11 @@ mod tests {
     #[test]
     fn division_by_zero_is_a_structured_error() {
         let error = evaluate("1 / 0", json!({})).unwrap_err();
-        assert!(error.message.contains("division by zero"), "{}", error.message);
+        assert!(
+            error.message.contains("division by zero"),
+            "{}",
+            error.message
+        );
     }
 
     #[test]

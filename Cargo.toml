@@ -12,19 +12,22 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.0.1"
 edition = "2021"
 rust-version = "1.82"
 license = "Apache-2.0"
-repository = "https://github.com/ai-auto-desktop/ai-auto-desktop"
+repository = "https://github.com/lejunyang/ai-auto-desktop"
 
 [workspace.dependencies]
-aad-core = { path = "crates/aad-core" }
-aad-plugin = { path = "crates/aad-plugin" }
-aad-runtime = { path = "crates/aad-runtime" }
-aad-probe = { path = "crates/aad-probe" }
-aad-uia = { path = "crates/aad-uia" }
-aad-mcp = { path = "crates/aad-mcp" }
+# `version` alongside `path`: inside the workspace the path wins, but
+# `cargo publish` rejects a path dependency that names no version, and the
+# published crate needs the registry version to resolve for downstream users.
+aad-core = { path = "crates/aad-core", version = "0.0.1" }
+aad-plugin = { path = "crates/aad-plugin", version = "0.0.1" }
+aad-runtime = { path = "crates/aad-runtime", version = "0.0.1" }
+aad-probe = { path = "crates/aad-probe", version = "0.0.1" }
+aad-uia = { path = "crates/aad-uia", version = "0.0.1" }
+aad-mcp = { path = "crates/aad-mcp", version = "0.0.1" }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
@@ -43,3 +46,20 @@ rusqlite = { version = "0.40", features = ["bundled"] }
 opt-level = 2
 lto = "thin"
 strip = true
+
+# Lints clippy raises across this workspace that are deliberately not treated as
+# defects, so CI can gate on the rest with -D warnings. Each is allowed for a
+# stated reason rather than to quieten the build.
+[workspace.lints.clippy]
+# AutomationError carries the whole structured error contract -- code, category,
+# phase, effect, location, details, cause, suppressed and descriptor issues --
+# and is returned by ~135 fallible functions. Boxing it to shrink the Err
+# variant would touch every one of those signatures and every construction site,
+# for a size lint on a path that is not hot.
+result_large_err = "allow"
+
+[workspace.lints.rust]
+# The UIA constants are Windows API names fixed by the platform headers.
+# Renaming them to satisfy Rust casing would break the correspondence to the
+# Microsoft documentation they are read against.
+non_upper_case_globals = "allow"

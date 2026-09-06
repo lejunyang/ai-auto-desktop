@@ -25,9 +25,9 @@ use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Accessibility::{
     CUIAutomation, IUIAutomation, IUIAutomationElement, IUIAutomationEventHandler,
     IUIAutomationEventHandler_Impl, IUIAutomationPropertyChangedEventHandler,
-    IUIAutomationPropertyChangedEventHandler_Impl, TreeScope_Subtree, UIA_EVENT_ID,
-    UIA_Invoke_InvokedEventId, UIA_PROPERTY_ID, UIA_SelectionItem_ElementSelectedEventId,
-    UIA_ToggleToggleStatePropertyId, UIA_ValueValuePropertyId,
+    IUIAutomationPropertyChangedEventHandler_Impl, TreeScope_Subtree, UIA_Invoke_InvokedEventId,
+    UIA_SelectionItem_ElementSelectedEventId, UIA_ToggleToggleStatePropertyId,
+    UIA_ValueValuePropertyId, UIA_EVENT_ID, UIA_PROPERTY_ID,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     SendInput, INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEINPUT,
@@ -38,6 +38,8 @@ use windows::Win32::UI::WindowsAndMessaging::{FindWindowW, SetCursorPos};
 struct Seen {
     kind: String,
     name: String,
+    // Read only through `Debug`, which dead_code does not count as a use.
+    #[allow(dead_code)]
     thread: u32,
 }
 
@@ -119,8 +121,8 @@ fn click_element(element: &IUIAutomationElement) -> Result<()> {
     Ok(())
 }
 
-fn find_by_name<'a>(
-    elements: &'a windows::Win32::UI::Accessibility::IUIAutomationElementArray,
+fn find_by_name(
+    elements: &windows::Win32::UI::Accessibility::IUIAutomationElementArray,
     needle: &str,
 ) -> Option<IUIAutomationElement> {
     let count = unsafe { elements.Length() }.ok()?;
@@ -180,12 +182,13 @@ fn main() -> Result<()> {
 
     // Each interaction is driven, then the events it produced are collected,
     // so an event cannot be attributed to the wrong interaction.
-    let mut take = |label: &str, seen: &Arc<Mutex<Vec<Seen>>>, report: &mut Vec<(String, Vec<Seen>)>| {
-        std::thread::sleep(std::time::Duration::from_millis(900));
-        let mut guard = seen.lock().unwrap();
-        report.push((label.to_string(), guard.clone()));
-        guard.clear();
-    };
+    let take =
+        |label: &str, seen: &Arc<Mutex<Vec<Seen>>>, report: &mut Vec<(String, Vec<Seen>)>| {
+            std::thread::sleep(std::time::Duration::from_millis(900));
+            let mut guard = seen.lock().unwrap();
+            report.push((label.to_string(), guard.clone()));
+            guard.clear();
+        };
 
     if let Some(button) = find_by_name(&all, "Submit") {
         println!("real mouse click on Submit");

@@ -40,8 +40,12 @@ fn main() {
 
         if let Some(elements) = answer["elements"].as_array() {
             for element in elements {
-                all_element_chars
-                    .push(serde_json::to_string(element).unwrap_or_default().chars().count());
+                all_element_chars.push(
+                    serde_json::to_string(element)
+                        .unwrap_or_default()
+                        .chars()
+                        .count(),
+                );
             }
         }
     }
@@ -51,7 +55,10 @@ fn main() {
         return;
     }
     let pick = |p: f64| all_element_chars[((all_element_chars.len() - 1) as f64 * p) as usize];
-    println!("\n单条元素的 JSON 字符数（{} 条样本）:", all_element_chars.len());
+    println!(
+        "\n单条元素的 JSON 字符数（{} 条样本）:",
+        all_element_chars.len()
+    );
     println!(
         "  最小 {}  p25 {}  中位 {}  p75 {}  p90 {}  最大 {}",
         all_element_chars[0],
@@ -82,7 +89,12 @@ fn main() {
         if text.chars().count() > 1200 {
             println!(
                 "  {:<38} {} 字符",
-                window["title"].as_str().unwrap_or_default().chars().take(36).collect::<String>(),
+                window["title"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .chars()
+                    .take(36)
+                    .collect::<String>(),
                 text.chars().count()
             );
         }

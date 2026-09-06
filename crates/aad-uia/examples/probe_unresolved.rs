@@ -14,8 +14,16 @@ use serde_json::json;
 fn interactive(node: &Node) -> bool {
     matches!(
         node.role.as_str(),
-        "button" | "edit" | "check_box" | "radio_button" | "combo_box"
-            | "list_item" | "menu_item" | "tab" | "hyperlink" | "tree_item"
+        "button"
+            | "edit"
+            | "check_box"
+            | "radio_button"
+            | "combo_box"
+            | "list_item"
+            | "menu_item"
+            | "tab"
+            | "hyperlink"
+            | "tree_item"
     )
 }
 
@@ -48,8 +56,10 @@ fn main() {
             continue;
         }
 
-        let by_id: std::collections::HashMap<&str, &Node> =
-            nodes.iter().map(|node| (node.node_id.as_str(), node)).collect();
+        let by_id: std::collections::HashMap<&str, &Node> = nodes
+            .iter()
+            .map(|node| (node.node_id.as_str(), node))
+            .collect();
 
         for node in nodes.iter().filter(|n| interactive(n)) {
             if Locator::synthesize(node, &nodes).is_some() {
@@ -94,7 +104,10 @@ fn main() {
                                     p.role,
                                     p.name
                                         .as_deref()
-                                        .map(|n| format!(" {:?}", n.chars().take(14).collect::<String>()))
+                                        .map(|n| format!(
+                                            " {:?}",
+                                            n.chars().take(14).collect::<String>()
+                                        ))
                                         .unwrap_or_default()
                                 )
                             })
@@ -142,11 +155,23 @@ fn main() {
     }
 
     println!("=== 无法用属性识别的可交互元素: {total} ===\n");
-    println!("A 祖先可识别 + 子树内唯一        {class_a:>4}  ({:.0}%)", pct(class_a, total));
-    println!("B 祖先可识别 + 子树内 ≤10 个     {class_b:>4}  ({:.0}%)  需要序数", pct(class_b, total));
-    println!("  祖先可识别 + 子树内 >10 个     {class_b_long:>4}  ({:.0}%)  序数不实用", pct(class_b_long, total));
-    println!("C 没有可识别的祖先              {class_c:>4}  ({:.0}%)", pct(class_c, total));
-    println!("  根节点（无父）                {no_parent:>4}", );
+    println!(
+        "A 祖先可识别 + 子树内唯一        {class_a:>4}  ({:.0}%)",
+        pct(class_a, total)
+    );
+    println!(
+        "B 祖先可识别 + 子树内 ≤10 个     {class_b:>4}  ({:.0}%)  需要序数",
+        pct(class_b, total)
+    );
+    println!(
+        "  祖先可识别 + 子树内 >10 个     {class_b_long:>4}  ({:.0}%)  序数不实用",
+        pct(class_b_long, total)
+    );
+    println!(
+        "C 没有可识别的祖先              {class_c:>4}  ({:.0}%)",
+        pct(class_c, total)
+    );
+    println!("  根节点（无父）                {no_parent:>4}",);
     println!(
         "\nA+B 可以靠祖先解决: {} / {total}  ({:.0}%)",
         class_a + class_b,

@@ -13,9 +13,8 @@ pub mod provider;
 pub mod recordings;
 pub mod script;
 pub mod template;
+pub mod version;
 
 pub use engine::{plan_digest, run, RunOptions, RUNTIME_VERSION};
-pub use journal::{
-    EventSink, Journal, NdjsonSink, NullSink, RunEvent, RunResult, RunStatus,
-};
+pub use journal::{EventSink, Journal, NdjsonSink, NullSink, RunEvent, RunResult, RunStatus};
 pub use provider::{PluginProvider, Provider, ProviderRegistry};

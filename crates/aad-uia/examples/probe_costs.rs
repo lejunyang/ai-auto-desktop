@@ -10,8 +10,16 @@ use std::time::Instant;
 fn interactive(node: &Node) -> bool {
     matches!(
         node.role.as_str(),
-        "button" | "edit" | "check_box" | "radio_button" | "combo_box"
-            | "list_item" | "menu_item" | "tab" | "hyperlink" | "tree_item"
+        "button"
+            | "edit"
+            | "check_box"
+            | "radio_button"
+            | "combo_box"
+            | "list_item"
+            | "menu_item"
+            | "tab"
+            | "hyperlink"
+            | "tree_item"
     )
 }
 
@@ -72,7 +80,7 @@ fn main() {
         }
     }
 
-    lengths.sort_by(|a, b| b.0.cmp(&a.0));
+    lengths.sort_by_key(|entry| std::cmp::Reverse(entry.0));
     println!("class_name 非空的节点 {} 个", lengths.len());
     if !lengths.is_empty() {
         let median = lengths[lengths.len() / 2].0;
@@ -91,7 +99,7 @@ fn main() {
     }
 
     println!("\n=== 合成耗时（每窗口）===");
-    per_window_timing.sort_by(|a, b| b.2.cmp(&a.2));
+    per_window_timing.sort_by_key(|entry| std::cmp::Reverse(entry.2));
     for (label, count, total_ms, worst_us) in &per_window_timing {
         println!(
             "  {total_ms:>6}ms 合成 {count:>4} 个，最慢一次 {:>7}µs   {label}",

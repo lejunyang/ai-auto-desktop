@@ -96,7 +96,10 @@ pub struct Frame {
 
 impl Frame {
     pub fn frame_type(&self) -> &str {
-        self.header.get("type").and_then(Value::as_str).unwrap_or("")
+        self.header
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or("")
     }
 
     pub fn request_id(&self) -> &str {
@@ -116,7 +119,10 @@ impl Frame {
 // ---------------------------------------------------------------------------
 
 fn is_hex32(value: &str) -> bool {
-    value.len() == 32 && value.chars().all(|c| c.is_ascii_hexdigit() && !c.is_uppercase())
+    value.len() == 32
+        && value
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_uppercase())
 }
 
 fn is_slot(value: &str) -> bool {
@@ -133,7 +139,10 @@ fn is_slot(value: &str) -> bool {
 fn is_digest(value: &str) -> bool {
     match value.strip_prefix("sha256:") {
         Some(hex) => {
-            hex.len() == 64 && hex.chars().all(|c| c.is_ascii_hexdigit() && !c.is_uppercase())
+            hex.len() == 64
+                && hex
+                    .chars()
+                    .all(|c| c.is_ascii_hexdigit() && !c.is_uppercase())
         }
         None => false,
     }
@@ -203,7 +212,9 @@ pub fn validate_header(header: &Map<String, Value>, payload_len: usize) -> Resul
 
     let request_id = text(header, "request_id")?;
     if !is_hex32(request_id) {
-        return Err(ArtifactError::invalid("artifact frame request id is invalid"));
+        return Err(ArtifactError::invalid(
+            "artifact frame request id is invalid",
+        ));
     }
 
     let check_slot_and_token = |header: &Map<String, Value>| -> Result<()> {
@@ -219,7 +230,15 @@ pub fn validate_header(header: &Map<String, Value>, payload_len: usize) -> Resul
     if OPEN_TYPES.contains(&frame_type) {
         require_exact_fields(
             header,
-            &["type", "request_id", "slot", "token", "media_type", "size_bytes", "digest"],
+            &[
+                "type",
+                "request_id",
+                "slot",
+                "token",
+                "media_type",
+                "size_bytes",
+                "digest",
+            ],
         )?;
         check_slot_and_token(header)?;
         let media_type = text(header, "media_type")?;
@@ -240,12 +259,21 @@ pub fn validate_header(header: &Map<String, Value>, payload_len: usize) -> Resul
         check_slot_and_token(header)?;
         // An empty chunk would let a sender stall a transfer indefinitely.
         if payload_len == 0 || payload_len > MAX_FRAME_PAYLOAD_BYTES {
-            return Err(ArtifactError::invalid("artifact chunk payload size is invalid"));
+            return Err(ArtifactError::invalid(
+                "artifact chunk payload size is invalid",
+            ));
         }
     } else if END_TYPES.contains(&frame_type) {
         require_exact_fields(
             header,
-            &["type", "request_id", "slot", "token", "size_bytes", "digest"],
+            &[
+                "type",
+                "request_id",
+                "slot",
+                "token",
+                "size_bytes",
+                "digest",
+            ],
         )?;
         check_slot_and_token(header)?;
         size_of(header)?;
@@ -260,7 +288,9 @@ pub fn validate_header(header: &Map<String, Value>, payload_len: usize) -> Resul
     } else if MARKER_TYPES.contains(&frame_type) {
         require_exact_fields(header, &["type", "request_id"])?;
         if payload_len != 0 {
-            return Err(ArtifactError::invalid("artifact marker must not carry a payload"));
+            return Err(ArtifactError::invalid(
+                "artifact marker must not carry a payload",
+            ));
         }
     } else if frame_type == COMPLETE_TYPE {
         let status = text(header, "status")?;
@@ -280,7 +310,9 @@ pub fn validate_header(header: &Map<String, Value>, payload_len: usize) -> Resul
         } else if status == "ok" {
             require_exact_fields(header, &["type", "request_id", "status"])?;
         } else {
-            return Err(ArtifactError::invalid("artifact completion status is invalid"));
+            return Err(ArtifactError::invalid(
+                "artifact completion status is invalid",
+            ));
         }
         if payload_len != 0 {
             return Err(ArtifactError::invalid(
@@ -332,7 +364,11 @@ fn canonical_json(value: &Value) -> String {
             let body: Vec<String> = sorted
                 .iter()
                 .map(|(key, value)| {
-                    format!("{}:{}", Value::String((*key).clone()), canonical_json(value))
+                    format!(
+                        "{}:{}",
+                        Value::String((*key).clone()),
+                        canonical_json(value)
+                    )
                 })
                 .collect();
             format!("{{{}}}", body.join(","))
@@ -529,7 +565,9 @@ impl Receiver {
             return Err(ArtifactError::invalid("artifact frame slot does not match"));
         }
         if frame.header.get("token").and_then(Value::as_str) != Some(self.token.as_str()) {
-            return Err(ArtifactError::invalid("artifact frame token does not match"));
+            return Err(ArtifactError::invalid(
+                "artifact frame token does not match",
+            ));
         }
 
         if CHUNK_TYPES.contains(&frame.frame_type()) {
@@ -544,7 +582,8 @@ impl Receiver {
             Ok(false)
         } else if END_TYPES.contains(&frame.frame_type()) {
             let declared_end_size = size_of(&frame.header)?;
-            if declared_end_size != self.declared_size || self.bytes.len() as u64 != self.declared_size
+            if declared_end_size != self.declared_size
+                || self.bytes.len() as u64 != self.declared_size
             {
                 return Err(ArtifactError::new(
                     "ARTIFACT_IPC.SIZE_MISMATCH",
@@ -572,7 +611,9 @@ impl Receiver {
     /// The verified artifact, available only once the transfer completed.
     pub fn finish(self) -> Result<Artifact> {
         if !self.finished {
-            return Err(ArtifactError::invalid("the artifact transfer is incomplete"));
+            return Err(ArtifactError::invalid(
+                "the artifact transfer is incomplete",
+            ));
         }
         Ok(Artifact {
             slot: self.slot,
@@ -678,7 +719,9 @@ mod tests {
         let payload = vec![7u8; MAX_FRAME_PAYLOAD_BYTES * 2 + 17];
 
         let mut stream = Vec::new();
-        sender.send(&mut stream, "application/octet-stream", &payload).unwrap();
+        sender
+            .send(&mut stream, "application/octet-stream", &payload)
+            .unwrap();
 
         let mut cursor = std::io::Cursor::new(stream);
         let mut receiver = Receiver::open(&receive_frame(&mut cursor).unwrap()).unwrap();
@@ -937,11 +980,17 @@ mod tests {
         // An error status without an error object must not be accepted.
         assert!(encode(&failed, &[]).is_err());
 
-        failed.insert("error".into(), json!({"code": "PLUGIN.FAILED", "message": "no"}));
+        failed.insert(
+            "error".into(),
+            json!({"code": "PLUGIN.FAILED", "message": "no"}),
+        );
         assert!(encode(&failed, &[]).is_ok());
 
         let mut bad_code = failed.clone();
-        bad_code.insert("error".into(), json!({"code": "lowercase", "message": "no"}));
+        bad_code.insert(
+            "error".into(),
+            json!({"code": "lowercase", "message": "no"}),
+        );
         assert!(encode(&bad_code, &[]).is_err());
     }
 
@@ -957,7 +1006,10 @@ mod tests {
 
         assert_eq!(reference["size_bytes"], 6);
         assert_eq!(reference["digest"], artifact.digest);
-        assert!(reference.get("bytes").is_none(), "bytes must not be inlined");
+        assert!(
+            reference.get("bytes").is_none(),
+            "bytes must not be inlined"
+        );
     }
 
     #[test]

@@ -7,8 +7,8 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
-use std::collections::HashMap;
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 
 /// A rectangle in virtual-desktop coordinates.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -432,7 +432,10 @@ impl Snapshot {
                 folded_roles = held_groups - kept.len();
                 loose_groups = kept;
                 folded_role_elements = held
-                    - loose_groups.iter().map(|(_, members)| members.len()).sum::<usize>();
+                    - loose_groups
+                        .iter()
+                        .map(|(_, members)| members.len())
+                        .sum::<usize>();
             }
         }
 
@@ -491,9 +494,9 @@ impl Snapshot {
     /// Not equality: a browser appends its brand to the title while the pane
     /// inside carries the bare version, and an editor prepends the file name, so
     /// the two differ by a suffix or a prefix in practice. Measured on this
-    /// desktop: Edge reports a window title of "AAD Complex Fixture | last=none
-    /// - 个人 - Microsoft Edge" around a pane named "AAD Complex Fixture |
-    /// last=none".
+    /// desktop: Edge reports a window title of
+    /// `AAD Complex Fixture | last=none - 个人 - Microsoft Edge` around a
+    /// pane named `AAD Complex Fixture | last=none`.
     ///
     /// A floor is still needed, or a two-character region would match any title
     /// starting with those letters.
@@ -650,8 +653,7 @@ impl Snapshot {
             .nodes
             .iter()
             .filter(|node| {
-                !node.actions.is_empty()
-                    || node.name.as_ref().is_some_and(|text| !text.is_empty())
+                !node.actions.is_empty() || node.name.as_ref().is_some_and(|text| !text.is_empty())
             })
             .filter(|node| node.states.offscreen != Some(true))
             .filter(|node| self.worth_offering(node))
@@ -675,27 +677,27 @@ impl Snapshot {
         // agent cannot act on also reported as truncation.
         let matched = eligible.len();
         let described = |node: &Node| -> Value {
-                json!({
-                    "node_id": node.node_id,
-                    // The reference an agent needs to act on this element,
-                    // so the outline is directly actionable.
-                    "ref": format!("{}:{}:{}", self.snapshot_id, self.revision, node.node_id),
-                    // A description that outlives this snapshot. The `ref`
-                    // above stops resolving once the snapshot is gone, so
-                    // anything that gets saved has to be described instead;
-                    // null here means the element cannot be told apart from
-                    // its siblings and so cannot be recorded.
-                    "locator": Locator::synthesize(node, &self.nodes)
-                        .map(|locator| locator.to_json())
-                        .unwrap_or(Value::Null),
-                    "depth": node.depth,
-                    "summary": node.summary(),
-                    "actions": node.actions,
-                    // A structured flag as well as the word in `summary`, so a
-                    // caller does not have to parse prose to find out that
-                    // this field's content is unreadable by design.
-                    "protected": node.states.protected == Some(true),
-                })
+            json!({
+                "node_id": node.node_id,
+                // The reference an agent needs to act on this element,
+                // so the outline is directly actionable.
+                "ref": format!("{}:{}:{}", self.snapshot_id, self.revision, node.node_id),
+                // A description that outlives this snapshot. The `ref`
+                // above stops resolving once the snapshot is gone, so
+                // anything that gets saved has to be described instead;
+                // null here means the element cannot be told apart from
+                // its siblings and so cannot be recorded.
+                "locator": Locator::synthesize(node, &self.nodes)
+                    .map(|locator| locator.to_json())
+                    .unwrap_or(Value::Null),
+                "depth": node.depth,
+                "summary": node.summary(),
+                "actions": node.actions,
+                // A structured flag as well as the word in `summary`, so a
+                // caller does not have to parse prose to find out that
+                // this field's content is unreadable by design.
+                "protected": node.states.protected == Some(true),
+            })
         };
         // The budget covers the whole answer, not just the list. Measured: the
         // window metadata around the elements ran to about 1900 characters on one
@@ -745,7 +747,6 @@ impl Snapshot {
             spent += cost;
             interesting.push(rendered);
         }
-
 
         let mut answer = json!({
             "snapshot_id": self.snapshot_id,
@@ -867,7 +868,9 @@ impl Target {
         if let Some(text) = value.as_str() {
             return Self::parse_ref(text);
         }
-        let object = value.as_object().ok_or("target must be an object or a reference string")?;
+        let object = value
+            .as_object()
+            .ok_or("target must be an object or a reference string")?;
         let snapshot_id = object
             .get("snapshot_id")
             .and_then(Value::as_str)
@@ -1039,6 +1042,11 @@ pub enum Direction {
     Below,
 }
 
+/// One locator refinement: given a node and a callback deciding whether a name
+/// is usable, set a single field. Named because the array of these is otherwise
+/// an unreadable inline type.
+type Refinement<T> = fn(&mut T, &Node, &dyn Fn(&Node) -> Option<String>);
+
 impl Locator {
     pub fn from_value(value: &Value) -> Result<Self, String> {
         Self::from_value_at(value, 0)
@@ -1097,7 +1105,9 @@ impl Locator {
                     .iter()
                     .find(|name| !NODE_ACTIONS.contains(&name.as_str()))
                 {
-                    return Err(format!("locator.actions contains unknown action {unknown:?}"));
+                    return Err(format!(
+                        "locator.actions contains unknown action {unknown:?}"
+                    ));
                 }
                 Some(names)
             }
@@ -1111,8 +1121,8 @@ impl Locator {
                 "last" => Some(Ordinal::Last),
                 other => {
                     return Err(format!(
-                        "locator.nth must be a positive number, \"first\" or \"last\", got {other:?}"
-                    ))
+                    "locator.nth must be a positive number, \"first\" or \"last\", got {other:?}"
+                ))
                 }
             },
             Some(Value::Number(number)) => {
@@ -1132,9 +1142,7 @@ impl Locator {
         let near = match object.get("near") {
             None => None,
             Some(Value::Object(map)) => {
-                let anchor_value = map
-                    .get("anchor")
-                    .ok_or("locator.near requires an anchor")?;
+                let anchor_value = map.get("anchor").ok_or("locator.near requires an anchor")?;
                 let anchor = Self::from_value_at(anchor_value, depth + 1)?;
                 let direction = match map.get("direction").and_then(Value::as_str) {
                     None | Some("any") => Direction::Any,
@@ -1158,7 +1166,11 @@ impl Locator {
                         Some(pixels as i32)
                     }
                 };
-                Some(Box::new(Proximity { anchor, direction, within }))
+                Some(Box::new(Proximity {
+                    anchor,
+                    direction,
+                    within,
+                }))
             }
             Some(_) => return Err("locator.near must be an object".to_string()),
         };
@@ -1353,32 +1365,23 @@ impl Locator {
             }
         };
 
-        let refinements: [fn(&mut Self, &Node, &dyn Fn(&Node) -> Option<String>); 5] =
-            if positional_id {
-                [
-                    |locator, node, usable| locator.name = usable(node),
-                    |locator, node, _| locator.class_name = durable(node.class_name.as_deref()),
-                    |locator, node, _| {
-                        locator.framework_id = non_empty(node.framework_id.as_deref())
-                    },
-                    |locator, node, _| {
-                        locator.automation_id = durable(node.automation_id.as_deref())
-                    },
-                    |_, _, _| {},
-                ]
-            } else {
-                [
-                    |locator, node, _| {
-                        locator.automation_id = durable(node.automation_id.as_deref())
-                    },
-                    |locator, node, usable| locator.name = usable(node),
-                    |locator, node, _| locator.class_name = durable(node.class_name.as_deref()),
-                    |locator, node, _| {
-                        locator.framework_id = non_empty(node.framework_id.as_deref())
-                    },
-                    |_, _, _| {},
-                ]
-            };
+        let refinements: [Refinement<Self>; 5] = if positional_id {
+            [
+                |locator, node, usable| locator.name = usable(node),
+                |locator, node, _| locator.class_name = durable(node.class_name.as_deref()),
+                |locator, node, _| locator.framework_id = non_empty(node.framework_id.as_deref()),
+                |locator, node, _| locator.automation_id = durable(node.automation_id.as_deref()),
+                |_, _, _| {},
+            ]
+        } else {
+            [
+                |locator, node, _| locator.automation_id = durable(node.automation_id.as_deref()),
+                |locator, node, usable| locator.name = usable(node),
+                |locator, node, _| locator.class_name = durable(node.class_name.as_deref()),
+                |locator, node, _| locator.framework_id = non_empty(node.framework_id.as_deref()),
+                |_, _, _| {},
+            ]
+        };
 
         // A refinement that added nothing must not count as an attempt. Where
         // the element has no automation_id, applying that step leaves the
@@ -1520,8 +1523,9 @@ impl Locator {
                 if inside.len() <= MAX_COUNTABLE_SIBLINGS {
                     let mut ordered: Vec<&Node> = inside;
                     ordered.sort_by_key(|other| reading_order(other));
-                    if let Some(index) =
-                        ordered.iter().position(|other| other.node_id == node.node_id)
+                    if let Some(index) = ordered
+                        .iter()
+                        .position(|other| other.node_id == node.node_id)
                     {
                         candidate.nth = Some(Ordinal::Index(index + 1));
                         if candidate.unique_for(node, nodes) {
@@ -1766,11 +1770,9 @@ container",
                 ids.len(),
                 ids.join(", ")
             ),
-            Self::NoPosition => {
-                "its anchor has no position on screen, so nothing can be measured \
+            Self::NoPosition => "its anchor has no position on screen, so nothing can be measured \
 from it"
-                    .to_string()
-            }
+                .to_string(),
         }
     }
 }
@@ -1800,10 +1802,7 @@ impl Proximity {
         let anchors = self.anchor.resolve(nodes);
         match anchors[..] {
             [] => Some(AnchorProblem::NotFound),
-            [single] => single
-                .bounds
-                .is_none()
-                .then_some(AnchorProblem::NoPosition),
+            [single] => single.bounds.is_none().then_some(AnchorProblem::NoPosition),
             ref several => Some(AnchorProblem::Ambiguous(
                 several.iter().map(|node| node.node_id.clone()).collect(),
             )),
@@ -1865,8 +1864,10 @@ impl Direction {
         let (tx, ty) = other.center();
         // Overlapping on an axis means they are aligned along it, which is the
         // normal case for a label and its field.
-        let vertical_overlap = other.y < origin.y + origin.height && origin.y < other.y + other.height;
-        let horizontal_overlap = other.x < origin.x + origin.width && origin.x < other.x + other.width;
+        let vertical_overlap =
+            other.y < origin.y + origin.height && origin.y < other.y + other.height;
+        let horizontal_overlap =
+            other.x < origin.x + origin.width && origin.x < other.x + other.width;
         match self {
             Direction::Any => true,
             // A field to the right of its label is usually on the same row, so
@@ -2019,8 +2020,8 @@ fn style_list(value: &str) -> bool {
 /// is caught -- `Notepad`, `Chrome_WidgetWin_1` and `XLMAIN` are all kept.
 fn volatile_suffix(value: &str) -> bool {
     let Some(rest) = value.rsplit_once("_ad").and_then(|(head, tail)| {
-        tail.chars().all(|c| c.is_ascii_digit()) && !tail.is_empty()
-    }.then_some(head)) else {
+        { tail.chars().all(|c| c.is_ascii_digit()) && !tail.is_empty() }.then_some(head)
+    }) else {
         return false;
     };
     matches!(rest.rsplit_once("_r"), Some((_, digits))
@@ -2047,7 +2048,12 @@ mod tests {
             automation_id: None,
             class_name: None,
             framework_id: None,
-            bounds: Some(Bounds { x: 0, y: 0, width: 10, height: 10 }),
+            bounds: Some(Bounds {
+                x: 0,
+                y: 0,
+                width: 10,
+                height: 10,
+            }),
             states: States {
                 enabled: Some(true),
                 ..Default::default()
@@ -2086,8 +2092,9 @@ mod tests {
     /// Two toolbars, each holding two identically named buttons.
     fn toolbars() -> Vec<Node> {
         let mut nodes = vec![node_at("w", "window", Some("App"), None, None)];
-        for (row, (bar_id, bar_name)) in
-            [("t1", "Explorer actions"), ("t2", "Terminal actions")].iter().enumerate()
+        for (row, (bar_id, bar_name)) in [("t1", "Explorer actions"), ("t2", "Terminal actions")]
+            .iter()
+            .enumerate()
         {
             nodes.push(node_at(bar_id, "tool_bar", Some(bar_name), Some("w"), None));
             for slot in 0..2i32 {
@@ -2120,7 +2127,11 @@ mod tests {
 
         let found = locator.resolve(&nodes);
 
-        assert_eq!(found.len(), 2, "that toolbar's buttons, and neither of the other's");
+        assert_eq!(
+            found.len(),
+            2,
+            "that toolbar's buttons, and neither of the other's"
+        );
         assert!(found.iter().all(|node| node.node_id.starts_with("t2")));
     }
 
@@ -2185,7 +2196,12 @@ mod tests {
             Some("Close"),
             Some("w"),
             // Sitting exactly over the first toolbar's first button.
-            Some(Bounds { x: 10, y: 0, width: 40, height: 20 }),
+            Some(Bounds {
+                x: 10,
+                y: 0,
+                width: 40,
+                height: 20,
+            }),
         ));
 
         let locator = Locator::from_value(&json!({
@@ -2196,7 +2212,11 @@ mod tests {
 
         let found = locator.resolve(&nodes);
 
-        assert_eq!(found.len(), 2, "the overlay is not one of the toolbar's buttons");
+        assert_eq!(
+            found.len(),
+            2,
+            "the overlay is not one of the toolbar's buttons"
+        );
         assert!(found.iter().all(|node| node.node_id.starts_with("t1")));
     }
 
@@ -2231,7 +2251,10 @@ mod tests {
     #[test]
     fn synthesize_falls_back_to_the_container_when_attributes_run_out() {
         let nodes = toolbars();
-        let target = nodes.iter().find(|node| node.node_id == "t2b0").expect("a button");
+        let target = nodes
+            .iter()
+            .find(|node| node.node_id == "t2b0")
+            .expect("a button");
 
         let locator = Locator::synthesize(target, &nodes).expect("a container makes it findable");
         let rendered = locator.to_json();
@@ -2266,17 +2289,30 @@ mod tests {
             "button",
             Some("Go"),
             Some("g1"),
-            Some(Bounds { x: 0, y: 0, width: 20, height: 10 }),
+            Some(Bounds {
+                x: 0,
+                y: 0,
+                width: 20,
+                height: 10,
+            }),
         ));
         nodes.push(node_at(
             "b2",
             "button",
             Some("Go"),
             Some("g2"),
-            Some(Bounds { x: 0, y: 40, width: 20, height: 10 }),
+            Some(Bounds {
+                x: 0,
+                y: 40,
+                width: 20,
+                height: 10,
+            }),
         ));
 
-        let target = nodes.iter().find(|node| node.node_id == "b1").expect("a button");
+        let target = nodes
+            .iter()
+            .find(|node| node.node_id == "b1")
+            .expect("a button");
         let locator = Locator::synthesize(target, &nodes).expect("a container makes it findable");
         let rendered = locator.to_json();
 
@@ -2292,7 +2328,10 @@ mod tests {
 
         // The other button must get a different locator, or one of the two
         // recordings would replay onto the wrong control.
-        let other = nodes.iter().find(|node| node.node_id == "b2").expect("a button");
+        let other = nodes
+            .iter()
+            .find(|node| node.node_id == "b2")
+            .expect("a button");
         let other_locator =
             Locator::synthesize(other, &nodes).expect("the sibling is findable too");
         assert_ne!(other_locator.to_json(), rendered);
@@ -2356,7 +2395,11 @@ mod tests {
         // The rule is about shape, not length. `monaco-icon-label` and
         // `NonClientVerticalScrollBar` are control names and carry no spaces;
         // rejecting them would throw away a working identifier.
-        for name in ["actions-container", "monaco-icon-label", "NonClientVerticalScrollBar"] {
+        for name in [
+            "actions-container",
+            "monaco-icon-label",
+            "NonClientVerticalScrollBar",
+        ] {
             let mut styled = node_at("b", "button", None, Some("w"), None);
             styled.class_name = Some(name.to_string());
             let nodes = vec![
@@ -2395,7 +2438,10 @@ mod tests {
         let summary = secret.summary();
 
         assert!(summary.contains("protected"), "got {summary:?}");
-        assert_eq!(secret.states.to_json()["protected"], serde_json::json!(true));
+        assert_eq!(
+            secret.states.to_json()["protected"],
+            serde_json::json!(true)
+        );
     }
 
     #[test]
@@ -2521,13 +2567,23 @@ mod tests {
             row.automation_id = Some(format!("row-{index}"));
             row.parent_id = Some("table".into());
             row.depth = 2;
-            row.bounds = Some(Bounds { x: 0, y: 100 + 34 * index as i32, width: 600, height: 34 });
+            row.bounds = Some(Bounds {
+                x: 0,
+                y: 100 + 34 * index as i32,
+                width: 600,
+                height: 34,
+            });
             nodes.push(row);
 
             let mut edit = node(&format!("{row_id}-edit"), "button", Some("Edit"));
             edit.parent_id = Some(row_id.clone());
             edit.depth = 3;
-            edit.bounds = Some(Bounds { x: 500, y: 100 + 34 * index as i32, width: 40, height: 20 });
+            edit.bounds = Some(Bounds {
+                x: 500,
+                y: 100 + 34 * index as i32,
+                width: 40,
+                height: 20,
+            });
             nodes.push(edit);
         }
         nodes
@@ -2536,7 +2592,10 @@ mod tests {
     #[test]
     fn a_row_is_named_by_its_content_rather_than_its_slot() {
         let nodes = order_rows();
-        let edit = nodes.iter().find(|n| n.node_id == "r0-edit").expect("Ada's Edit");
+        let edit = nodes
+            .iter()
+            .find(|n| n.node_id == "r0-edit")
+            .expect("Ada's Edit");
 
         let locator = Locator::synthesize(edit, &nodes).expect("identifiable");
         let container = locator.within.as_deref().expect("scoped to the row");
@@ -2546,13 +2605,19 @@ mod tests {
         // Verified on the real fixture -- the slot-based locator reported
         // `edit:Ada` and then `edit:New5`, both times without an error.
         assert_eq!(container.name.as_deref(), Some("Order for Ada"));
-        assert_eq!(container.automation_id, None, "the slot number must not be used: {container:?}");
+        assert_eq!(
+            container.automation_id, None,
+            "the slot number must not be used: {container:?}"
+        );
     }
 
     #[test]
     fn a_content_named_row_survives_an_insertion_above_it() {
         let nodes = order_rows();
-        let edit = nodes.iter().find(|n| n.node_id == "r0-edit").expect("Ada's Edit");
+        let edit = nodes
+            .iter()
+            .find(|n| n.node_id == "r0-edit")
+            .expect("Ada's Edit");
         let locator = Locator::synthesize(edit, &nodes).expect("identifiable");
 
         // The same tree after a row is prepended: every slot number shifts down
@@ -2567,12 +2632,22 @@ mod tests {
             row.automation_id = Some(format!("row-{index}"));
             row.parent_id = Some("table".into());
             row.depth = 2;
-            row.bounds = Some(Bounds { x: 0, y: 100 + 34 * index as i32, width: 600, height: 34 });
+            row.bounds = Some(Bounds {
+                x: 0,
+                y: 100 + 34 * index as i32,
+                width: 600,
+                height: 34,
+            });
             shifted.push(row);
             let mut edit = node(&format!("{row_id}-edit"), "button", Some("Edit"));
             edit.parent_id = Some(row_id.clone());
             edit.depth = 3;
-            edit.bounds = Some(Bounds { x: 500, y: 100 + 34 * index as i32, width: 40, height: 20 });
+            edit.bounds = Some(Bounds {
+                x: 500,
+                y: 100 + 34 * index as i32,
+                width: 40,
+                height: 20,
+            });
             shifted.push(edit);
         }
 
@@ -2611,8 +2686,15 @@ mod tests {
         let nodes = vec![first, second];
 
         let locator = Locator::synthesize(&nodes[0], &nodes).expect("identifiable");
-        assert_eq!(locator.name.as_deref(), Some("Inbox"), "the label identifies it");
-        assert_eq!(locator.automation_id, None, "the index does not: {locator:?}");
+        assert_eq!(
+            locator.name.as_deref(),
+            Some("Inbox"),
+            "the label identifies it"
+        );
+        assert_eq!(
+            locator.automation_id, None,
+            "the index does not: {locator:?}"
+        );
     }
 
     #[test]
@@ -2694,7 +2776,13 @@ mod tests {
             let locator = Locator::synthesize(target, &nodes)
                 .unwrap_or_else(|| panic!("{} should be identifiable", target.node_id));
             let hits: Vec<&Node> = nodes.iter().filter(|n| locator.matches(n)).collect();
-            assert_eq!(hits.len(), 1, "{} matched {} nodes", target.node_id, hits.len());
+            assert_eq!(
+                hits.len(),
+                1,
+                "{} matched {} nodes",
+                target.node_id,
+                hits.len()
+            );
             assert_eq!(hits[0].node_id, target.node_id);
         }
     }
@@ -2712,7 +2800,10 @@ mod tests {
         let rendered = locator.to_json();
         let object = rendered.as_object().unwrap();
         assert!(object.contains_key("role"));
-        assert!(!object.contains_key("name"), "unconstrained fields must be absent");
+        assert!(
+            !object.contains_key("name"),
+            "unconstrained fields must be absent"
+        );
         assert!(!object.contains_key("class_name"));
     }
 
@@ -2731,10 +2822,21 @@ mod tests {
 
     #[test]
     fn bounds_report_their_centre_and_emptiness() {
-        let bounds = Bounds { x: 10, y: 20, width: 100, height: 50 };
+        let bounds = Bounds {
+            x: 10,
+            y: 20,
+            width: 100,
+            height: 50,
+        };
         assert_eq!(bounds.center(), (60, 45));
         assert!(!bounds.is_empty());
-        assert!(Bounds { x: 0, y: 0, width: 0, height: 10 }.is_empty());
+        assert!(Bounds {
+            x: 0,
+            y: 0,
+            width: 0,
+            height: 10
+        }
+        .is_empty());
     }
 
     #[test]
@@ -2752,7 +2854,10 @@ mod tests {
         let button = node("n1", "Button", Some("Save changes"));
 
         let exact = Locator::from_value(&json!({"name": "Save"})).unwrap();
-        assert!(!exact.matches(&button), "exact matching must not match a prefix");
+        assert!(
+            !exact.matches(&button),
+            "exact matching must not match a prefix"
+        );
 
         let contains = Locator::from_value(&json!({"name": "Save", "match": "contains"})).unwrap();
         assert!(contains.matches(&button));
@@ -2769,8 +2874,7 @@ mod tests {
     #[test]
     fn a_role_always_compares_exactly() {
         let button = node("n1", "Button", Some("Save"));
-        let locator =
-            Locator::from_value(&json!({"role": "Butt", "match": "contains"})).unwrap();
+        let locator = Locator::from_value(&json!({"role": "Butt", "match": "contains"})).unwrap();
         assert!(!locator.matches(&button), "a partial role must never match");
     }
 
@@ -2825,7 +2929,12 @@ mod tests {
     /// A node at a given position, so layout-dependent behaviour is testable.
     fn placed(id: &str, role: &str, name: Option<&str>, x: i32, y: i32) -> Node {
         let mut node = node(id, role, name);
-        node.bounds = Some(Bounds { x, y, width: 80, height: 24 });
+        node.bounds = Some(Bounds {
+            x,
+            y,
+            width: 80,
+            height: 24,
+        });
         node
     }
 
@@ -2884,7 +2993,10 @@ mod tests {
             .map(|index| resolve_ids(&json!({"role": "Button", "nth": index}), &nodes)[0].clone())
             .collect();
 
-        assert_eq!(order, ["top_left", "top_right", "bottom_left", "bottom_right"]);
+        assert_eq!(
+            order,
+            ["top_left", "top_right", "bottom_left", "bottom_right"]
+        );
     }
 
     #[test]
@@ -3014,12 +3126,22 @@ mod tests {
         let nodes = vec![
             {
                 let mut label = node("label", "Text", Some("Name:"));
-                label.bounds = Some(Bounds { x: 566, y: 362, width: 80, height: 22 });
+                label.bounds = Some(Bounds {
+                    x: 566,
+                    y: 362,
+                    width: 80,
+                    height: 22,
+                });
                 label
             },
             {
                 let mut field = node("field", "Edit", None);
-                field.bounds = Some(Bounds { x: 656, y: 359, width: 300, height: 21 });
+                field.bounds = Some(Bounds {
+                    x: 656,
+                    y: 359,
+                    width: 300,
+                    height: 21,
+                });
                 field
             },
         ];
@@ -3036,7 +3158,10 @@ mod tests {
             &json!({"role": "Edit", "near": {"anchor": {"name": "Name:"}, "within": 5}}),
             &nodes,
         );
-        assert!(strict.is_empty(), "10 pixels is not within 5, got {strict:?}");
+        assert!(
+            strict.is_empty(),
+            "10 pixels is not within 5, got {strict:?}"
+        );
     }
 
     #[test]
@@ -3145,13 +3270,7 @@ mod tests {
         field.actions = vec!["set_value".into(), "invoke".into()];
         nodes.push(field);
         for index in 0..3 {
-            let mut token = node_at(
-                &format!("tok{index}"),
-                "group",
-                None,
-                Some("field"),
-                None,
-            );
+            let mut token = node_at(&format!("tok{index}"), "group", None, Some("field"), None);
             token.depth = 2;
             nodes.push(token);
         }
@@ -3180,7 +3299,7 @@ mod tests {
         for index in 0..3 {
             let token = format!("tok{index}");
             assert!(
-                !listed.iter().any(|id| *id == token),
+                !listed.contains(&token),
                 "{token} is the text being edited: {listed:?}"
             );
         }
@@ -3218,12 +3337,18 @@ mod tests {
             .expect("render")
             .chars()
             .count();
-        assert_eq!(unbounded["shown"], 61, "all of them, plus the window itself");
+        assert_eq!(
+            unbounded["shown"], 61,
+            "all of them, plus the window itself"
+        );
         assert_eq!(unbounded["truncated"], false);
 
         let bounded = snapshot.outline_within(500, None, Some(full_size / 3));
         let shown = bounded["shown"].as_u64().expect("shown");
-        assert!(shown > 0 && shown < 61, "cut by size, not by count: {shown}");
+        assert!(
+            shown > 0 && shown < 61,
+            "cut by size, not by count: {shown}"
+        );
         assert_eq!(bounded["truncated"], true);
         assert_eq!(
             bounded["matched"], 61,
@@ -3478,12 +3603,13 @@ mod tests {
         // still see only two thirds. A route that does not arrive is worse than
         // no route.
         assert!(
-            names.iter().any(|name| *name
-                == format!("{LOOSE_IN_WINDOW}{REGION_ROLE_SEPARATOR}button")),
+            names
+                .iter()
+                .any(|name| *name == format!("{LOOSE_IN_WINDOW}{REGION_ROLE_SEPARATOR}button")),
             "expected a button group, got {names:?}"
         );
         assert!(
-            !names.iter().any(|name| *name == LOOSE_IN_WINDOW),
+            !names.contains(&LOOSE_IN_WINDOW),
             "the whole region should not be offered next to its split, got {names:?}"
         );
     }
@@ -3532,12 +3658,18 @@ mod tests {
             .map(|entry| entry["region"].as_str().unwrap_or_default())
             .collect();
 
-        let panels = names.iter().filter(|name| name.starts_with("Panel ")).count();
+        let panels = names
+            .iter()
+            .filter(|name| name.starts_with("Panel "))
+            .count();
         let groups = names
             .iter()
             .filter(|name| name.starts_with(LOOSE_IN_WINDOW))
             .count();
-        assert_eq!(panels, 12, "every named container keeps its seat, got {names:?}");
+        assert_eq!(
+            panels, 12,
+            "every named container keeps its seat, got {names:?}"
+        );
         assert!(groups >= 1, "the role groups are listed too, got {names:?}");
     }
 
@@ -3581,8 +3713,9 @@ mod tests {
             .collect();
 
         assert!(
-            names.iter().any(|name| *name
-                == format!("{LOOSE_IN_WINDOW}{REGION_ROLE_SEPARATOR}edit")),
+            names
+                .iter()
+                .any(|name| *name == format!("{LOOSE_IN_WINDOW}{REGION_ROLE_SEPARATOR}edit")),
             "a single text field is still listed, got {names:?}"
         );
 
@@ -3592,7 +3725,11 @@ mod tests {
             Some(&format!("{LOOSE_IN_WINDOW}{REGION_ROLE_SEPARATOR}edit")),
         );
         let elements = listing["elements"].as_array().expect("elements");
-        assert_eq!(elements.len(), 1, "the field is reachable through its group");
+        assert_eq!(
+            elements.len(),
+            1,
+            "the field is reachable through its group"
+        );
         assert_eq!(elements[0]["locator"]["role"], json!("edit"));
     }
 
@@ -3644,14 +3781,54 @@ mod tests {
         // guess a different locator. A page with a billing and a delivery
         // address really does have two labels reading "City".
         let nodes = vec![
-            node_at("l1", "text", Some("City"), None,
-                    Some(Bounds { x: 10, y: 10, width: 30, height: 15 })),
-            node_at("f1", "edit", None, None,
-                    Some(Bounds { x: 60, y: 10, width: 100, height: 20 })),
-            node_at("l2", "text", Some("City"), None,
-                    Some(Bounds { x: 10, y: 90, width: 30, height: 15 })),
-            node_at("f2", "edit", None, None,
-                    Some(Bounds { x: 60, y: 90, width: 100, height: 20 })),
+            node_at(
+                "l1",
+                "text",
+                Some("City"),
+                None,
+                Some(Bounds {
+                    x: 10,
+                    y: 10,
+                    width: 30,
+                    height: 15,
+                }),
+            ),
+            node_at(
+                "f1",
+                "edit",
+                None,
+                None,
+                Some(Bounds {
+                    x: 60,
+                    y: 10,
+                    width: 100,
+                    height: 20,
+                }),
+            ),
+            node_at(
+                "l2",
+                "text",
+                Some("City"),
+                None,
+                Some(Bounds {
+                    x: 10,
+                    y: 90,
+                    width: 30,
+                    height: 15,
+                }),
+            ),
+            node_at(
+                "f2",
+                "edit",
+                None,
+                None,
+                Some(Bounds {
+                    x: 60,
+                    y: 90,
+                    width: 100,
+                    height: 20,
+                }),
+            ),
         ];
 
         let ambiguous = Proximity {
@@ -3883,7 +4060,13 @@ mod tests {
 
     #[test]
     fn a_compact_reference_needs_all_three_parts() {
-        for malformed in ["abc123", "abc123:4", "abc123:4:e9:extra", ":4:e9", "abc123:4:"] {
+        for malformed in [
+            "abc123",
+            "abc123:4",
+            "abc123:4:e9:extra",
+            ":4:e9",
+            "abc123:4:",
+        ] {
             assert!(
                 Target::parse_ref(malformed).is_err(),
                 "{malformed:?} should be rejected"

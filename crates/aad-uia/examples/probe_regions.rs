@@ -37,7 +37,10 @@ fn main() {
             continue;
         }
 
-        println!("\n===== {} =====", title.chars().take(48).collect::<String>());
+        println!(
+            "\n===== {} =====",
+            title.chars().take(48).collect::<String>()
+        );
         println!("{} 节点", nodes.len());
 
         let children_of = |id: &str| -> Vec<&Node> {
@@ -121,7 +124,12 @@ fn main() {
             }
             println!(
                 "    {:<38} {} 个可交互元素",
-                node.name.as_deref().unwrap_or("").chars().take(36).collect::<String>(),
+                node.name
+                    .as_deref()
+                    .unwrap_or("")
+                    .chars()
+                    .take(36)
+                    .collect::<String>(),
                 count
             );
             shown += 1;

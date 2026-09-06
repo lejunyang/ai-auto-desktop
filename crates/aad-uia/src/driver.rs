@@ -24,8 +24,7 @@ use std::time::Duration;
 pub const PROVIDER_NAME: &str = "desktop.windows_uia";
 
 /// Actions that change the state of the desktop.
-pub const WRITE_ACTIONS: &[&str] =
-    &["focus", "invoke", "set_value", "type_text", "pointer_click"];
+pub const WRITE_ACTIONS: &[&str] = &["focus", "invoke", "set_value", "type_text", "pointer_click"];
 
 const MAX_TYPE_TEXT_CHARS: usize = 1024;
 const MAX_CANDIDATE_SUMMARIES: usize = 10;
@@ -129,7 +128,8 @@ impl UiaDriver {
             max_nodes: args
                 .get("max_nodes")
                 .and_then(Value::as_u64)
-                .unwrap_or(CaptureLimits::default().max_nodes as u64) as usize,
+                .unwrap_or(CaptureLimits::default().max_nodes as u64)
+                as usize,
         }
         .clamp();
 
@@ -170,7 +170,12 @@ impl UiaDriver {
             ));
         }
 
-        let field = |key: &str| object.get(key).and_then(Value::as_str).filter(|t| !t.is_empty());
+        let field = |key: &str| {
+            object
+                .get(key)
+                .and_then(Value::as_str)
+                .filter(|t| !t.is_empty())
+        };
         let (want_class, want_process, want_title) =
             (field("class_name"), field("process_name"), field("title"));
 
@@ -401,11 +406,11 @@ impl UiaDriver {
 
         // A revision mismatch means the agent is quoting an older view.
         if snapshot.revision != target.revision {
-            return Err(DriverError::stale(
-                "the snapshot has been superseded by a newer revision",
-            )
-            .with_detail("expected_revision", json!(snapshot.revision))
-            .with_detail("provided_revision", json!(target.revision)));
+            return Err(
+                DriverError::stale("the snapshot has been superseded by a newer revision")
+                    .with_detail("expected_revision", json!(snapshot.revision))
+                    .with_detail("provided_revision", json!(target.revision)),
+            );
         }
 
         let node = snapshot
@@ -420,11 +425,11 @@ impl UiaDriver {
 
         // Finally confirm against the live UI, not just our own record.
         if !self.backend.verify(&snapshot.window.window_id, &node)? {
-            return Err(DriverError::stale(
-                "the element no longer matches the captured snapshot",
-            )
-            .with_detail("node_id", json!(node.node_id))
-            .with_detail("summary", json!(node.summary())));
+            return Err(
+                DriverError::stale("the element no longer matches the captured snapshot")
+                    .with_detail("node_id", json!(node.node_id))
+                    .with_detail("summary", json!(node.summary())),
+            );
         }
         Ok((snapshot.window.window_id.clone(), node))
     }
@@ -720,23 +725,48 @@ fn action_contracts() -> Map<String, Value> {
     };
     actions.insert(
         "focus".into(),
-        write("Give keyboard focus to an element.", "navigate", "low", "idempotent"),
+        write(
+            "Give keyboard focus to an element.",
+            "navigate",
+            "low",
+            "idempotent",
+        ),
     );
     actions.insert(
         "invoke".into(),
-        write("Activate an element's default action.", "input", "medium", "non_idempotent"),
+        write(
+            "Activate an element's default action.",
+            "input",
+            "medium",
+            "non_idempotent",
+        ),
     );
     actions.insert(
         "set_value".into(),
-        write("Replace an element's value.", "input", "medium", "idempotent"),
+        write(
+            "Replace an element's value.",
+            "input",
+            "medium",
+            "idempotent",
+        ),
     );
     actions.insert(
         "type_text".into(),
-        write("Type text into the focused element.", "input", "medium", "non_idempotent"),
+        write(
+            "Type text into the focused element.",
+            "input",
+            "medium",
+            "non_idempotent",
+        ),
     );
     actions.insert(
         "pointer_click".into(),
-        write("Click the centre of an element.", "input", "medium", "non_idempotent"),
+        write(
+            "Click the centre of an element.",
+            "input",
+            "medium",
+            "non_idempotent",
+        ),
     );
     actions
 }
@@ -880,7 +910,12 @@ mod tests {
             process_id: 42,
             process_name: Some("fixture.exe".into()),
             class_name: None,
-            bounds: Some(Bounds { x: 0, y: 0, width: 800, height: 600 }),
+            bounds: Some(Bounds {
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 600,
+            }),
             is_foreground: true,
             is_minimized: false,
         }
@@ -895,8 +930,16 @@ mod tests {
             automation_id: None,
             class_name: None,
             framework_id: None,
-            bounds: Some(Bounds { x: 10, y: 10, width: 80, height: 24 }),
-            states: States { enabled: Some(true), ..Default::default() },
+            bounds: Some(Bounds {
+                x: 10,
+                y: 10,
+                width: 80,
+                height: 24,
+            }),
+            states: States {
+                enabled: Some(true),
+                ..Default::default()
+            },
             actions: actions.iter().map(|value| value.to_string()).collect(),
             depth: 1,
             parent_id: None,
@@ -928,7 +971,9 @@ mod tests {
     #[test]
     fn a_snapshot_carries_an_id_revision_and_nodes() {
         let (driver, _) = driver(vec![node("n1", "Button", "Save", &["invoke"])]);
-        let snapshot = driver.call("snapshot", &json!({"window_id": "w1"})).unwrap();
+        let snapshot = driver
+            .call("snapshot", &json!({"window_id": "w1"}))
+            .unwrap();
 
         assert!(snapshot["snapshot_id"].as_str().is_some());
         assert_eq!(snapshot["revision"], 1);
@@ -939,8 +984,12 @@ mod tests {
     #[test]
     fn each_snapshot_gets_a_fresh_revision() {
         let (driver, _) = driver(vec![node("n1", "Button", "Save", &["invoke"])]);
-        let first = driver.call("snapshot", &json!({"window_id": "w1"})).unwrap();
-        let second = driver.call("snapshot", &json!({"window_id": "w1"})).unwrap();
+        let first = driver
+            .call("snapshot", &json!({"window_id": "w1"}))
+            .unwrap();
+        let second = driver
+            .call("snapshot", &json!({"window_id": "w1"}))
+            .unwrap();
 
         assert_ne!(first["snapshot_id"], second["snapshot_id"]);
         assert!(second["revision"].as_u64() > first["revision"].as_u64());
@@ -961,10 +1010,15 @@ mod tests {
             node("n2", "Button", "Cancel", &["invoke"]),
         ]);
 
-        let outline = driver.call("describe", &json!({"window_id": "w1"})).unwrap();
+        let outline = driver
+            .call("describe", &json!({"window_id": "w1"}))
+            .unwrap();
 
         assert_eq!(outline["shown"], 2);
-        assert!(outline["elements"][0]["summary"].as_str().unwrap().contains("Save"));
+        assert!(outline["elements"][0]["summary"]
+            .as_str()
+            .unwrap()
+            .contains("Save"));
         // The outline must stay small: no full node payloads.
         assert!(outline["elements"][0].get("children").is_none());
     }
@@ -977,7 +1031,10 @@ mod tests {
         ]);
 
         let found = driver
-            .call("find", &json!({"window_id": "w1", "locator": {"name": "Save"}}))
+            .call(
+                "find",
+                &json!({"window_id": "w1", "locator": {"name": "Save"}}),
+            )
             .unwrap();
 
         assert_eq!(found["target"]["node_id"], "n1");
@@ -992,7 +1049,10 @@ mod tests {
         ]);
 
         let error = driver
-            .call("find", &json!({"window_id": "w1", "locator": {"name": "Save"}}))
+            .call(
+                "find",
+                &json!({"window_id": "w1", "locator": {"name": "Save"}}),
+            )
             .unwrap_err();
 
         assert_eq!(error.code, "DRIVER.AMBIGUOUS_MATCH");
@@ -1006,7 +1066,10 @@ mod tests {
         let (driver, _) = driver(vec![node("n1", "Button", "Save", &["invoke"])]);
 
         let error = driver
-            .call("find", &json!({"window_id": "w1", "locator": {"name": "Nope"}}))
+            .call(
+                "find",
+                &json!({"window_id": "w1", "locator": {"name": "Nope"}}),
+            )
             .unwrap_err();
 
         assert_eq!(error.code, "DRIVER.NOT_FOUND");
@@ -1018,7 +1081,10 @@ mod tests {
     fn an_action_applies_to_the_addressed_element() {
         let (driver, backend) = driver(vec![node("n1", "Button", "Save", &["invoke"])]);
         let found = driver
-            .call("find", &json!({"window_id": "w1", "locator": {"name": "Save"}}))
+            .call(
+                "find",
+                &json!({"window_id": "w1", "locator": {"name": "Save"}}),
+            )
             .unwrap();
 
         let result = driver
@@ -1033,7 +1099,10 @@ mod tests {
     fn an_action_is_refused_when_the_element_no_longer_matches() {
         let (driver, backend) = driver(vec![node("n1", "Button", "Save", &["invoke"])]);
         let found = driver
-            .call("find", &json!({"window_id": "w1", "locator": {"name": "Save"}}))
+            .call(
+                "find",
+                &json!({"window_id": "w1", "locator": {"name": "Save"}}),
+            )
             .unwrap();
 
         // The UI moves on between the snapshot and the action.
@@ -1053,12 +1122,17 @@ mod tests {
     fn an_action_is_refused_when_the_revision_is_superseded() {
         let (driver, backend) = driver(vec![node("n1", "Button", "Save", &["invoke"])]);
         let found = driver
-            .call("find", &json!({"window_id": "w1", "locator": {"name": "Save"}}))
+            .call(
+                "find",
+                &json!({"window_id": "w1", "locator": {"name": "Save"}}),
+            )
             .unwrap();
         let mut stale = target_of(&found);
         stale["revision"] = json!(stale["revision"].as_u64().unwrap() - 1);
 
-        let error = driver.call("invoke", &json!({"target": stale})).unwrap_err();
+        let error = driver
+            .call("invoke", &json!({"target": stale}))
+            .unwrap_err();
 
         assert_eq!(error.code, "DRIVER.STALE_HANDLE");
         assert!(backend.performed().is_empty());
@@ -1082,7 +1156,10 @@ mod tests {
     fn an_unsupported_action_is_refused_before_reaching_the_backend() {
         let (driver, backend) = driver(vec![node("n1", "Text", "Label", &[])]);
         let found = driver
-            .call("find", &json!({"window_id": "w1", "locator": {"name": "Label"}}))
+            .call(
+                "find",
+                &json!({"window_id": "w1", "locator": {"name": "Label"}}),
+            )
             .unwrap();
 
         let error = driver
@@ -1097,7 +1174,10 @@ mod tests {
     fn set_value_passes_the_value_through() {
         let (driver, backend) = driver(vec![node("n1", "Edit", "Name", &["set_value"])]);
         let found = driver
-            .call("find", &json!({"window_id": "w1", "locator": {"name": "Name"}}))
+            .call(
+                "find",
+                &json!({"window_id": "w1", "locator": {"name": "Name"}}),
+            )
             .unwrap();
 
         driver
@@ -1116,11 +1196,17 @@ mod tests {
         field.states.read_only = Some(true);
         let (driver, backend) = driver(vec![field]);
         let found = driver
-            .call("find", &json!({"window_id": "w1", "locator": {"name": "Name"}}))
+            .call(
+                "find",
+                &json!({"window_id": "w1", "locator": {"name": "Name"}}),
+            )
             .unwrap();
 
         let error = driver
-            .call("set_value", &json!({"target": target_of(&found), "value": "x"}))
+            .call(
+                "set_value",
+                &json!({"target": target_of(&found), "value": "x"}),
+            )
             .unwrap_err();
 
         assert_eq!(error.code, "DRIVER.INVALID_REQUEST");
@@ -1131,7 +1217,10 @@ mod tests {
     fn type_text_is_bounded() {
         let (driver, _) = driver(vec![node("n1", "Edit", "Name", &["type_text"])]);
         let found = driver
-            .call("find", &json!({"window_id": "w1", "locator": {"name": "Name"}}))
+            .call(
+                "find",
+                &json!({"window_id": "w1", "locator": {"name": "Name"}}),
+            )
             .unwrap();
 
         let error = driver
@@ -1148,7 +1237,10 @@ mod tests {
     fn only_the_left_pointer_button_is_supported() {
         let (driver, _) = driver(vec![node("n1", "Button", "Save", &["pointer_click"])]);
         let found = driver
-            .call("find", &json!({"window_id": "w1", "locator": {"name": "Save"}}))
+            .call(
+                "find",
+                &json!({"window_id": "w1", "locator": {"name": "Save"}}),
+            )
             .unwrap();
 
         let error = driver
@@ -1179,7 +1271,9 @@ mod tests {
     #[test]
     fn find_can_reuse_an_existing_snapshot() {
         let (driver, _) = driver(vec![node("n1", "Button", "Save", &["invoke"])]);
-        let snapshot = driver.call("snapshot", &json!({"window_id": "w1"})).unwrap();
+        let snapshot = driver
+            .call("snapshot", &json!({"window_id": "w1"}))
+            .unwrap();
         let snapshot_id = snapshot["snapshot_id"].as_str().unwrap();
 
         let found = driver
@@ -1361,7 +1455,12 @@ mod tests {
             process_id: 1,
             process_name: Some(process.into()),
             class_name: class.map(str::to_string),
-            bounds: Some(Bounds { x: 0, y: 0, width: 100, height: 100 }),
+            bounds: Some(Bounds {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+            }),
             is_foreground: false,
             is_minimized: false,
         }
@@ -1443,9 +1542,9 @@ mod tests {
             .expect("the competing elements must be listed, not just counted");
         assert_eq!(candidates.len(), 2);
         assert!(
-            candidates
-                .iter()
-                .all(|entry| entry["summary"].as_str().is_some_and(|text| !text.is_empty())),
+            candidates.iter().all(|entry| entry["summary"]
+                .as_str()
+                .is_some_and(|text| !text.is_empty())),
             "a candidate without a summary tells the caller nothing"
         );
     }
@@ -1457,7 +1556,10 @@ mod tests {
         let driver = many();
 
         let answer = driver
-            .call("find", &json!({"window_id": "w1", "locator": {"name": "Save"}}))
+            .call(
+                "find",
+                &json!({"window_id": "w1", "locator": {"name": "Save"}}),
+            )
             .expect("the fixture has a Save button");
 
         assert_eq!(answer["match_count"], json!(1));
@@ -1543,7 +1645,10 @@ mod tests {
         let driver = many();
 
         let error = driver
-            .call("find", &json!({"window_id": "w1", "locator": {"name": "NotOnScreen"}}))
+            .call(
+                "find",
+                &json!({"window_id": "w1", "locator": {"name": "NotOnScreen"}}),
+            )
             .expect_err("acquiring a missing element must fail");
 
         assert_eq!(error.code, "DRIVER.NOT_FOUND");
@@ -1557,7 +1662,10 @@ mod tests {
         let driver = many();
 
         let answer = driver
-            .call("find", &json!({"window_id": "w1", "locator": {"name": "Save"}}))
+            .call(
+                "find",
+                &json!({"window_id": "w1", "locator": {"name": "Save"}}),
+            )
             .expect("the fixture has a Save button");
 
         assert_eq!(answer["found"], json!(true));
@@ -1601,7 +1709,10 @@ mod tests {
         let driver = many();
 
         let captured = driver
-            .call("snapshot", &json!({"window": {"process_name": "NOTEPAD.EXE"}}))
+            .call(
+                "snapshot",
+                &json!({"window": {"process_name": "NOTEPAD.EXE"}}),
+            )
             .expect("case must not decide whether a recording replays");
 
         assert_eq!(captured["window"]["window_id"], "w1");
@@ -1656,7 +1767,10 @@ mod tests {
             .expect("describe must work");
 
         let element = &outline["elements"][0];
-        assert!(element["ref"].is_string(), "a live reference is still offered");
+        assert!(
+            element["ref"].is_string(),
+            "a live reference is still offered"
+        );
         assert!(
             element["locator"].is_object(),
             "a durable locator must accompany it: {}",

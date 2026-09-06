@@ -43,20 +43,24 @@ fn main() {
     collected.extend(events);
     dropped_total += dropped;
 
-    println!("\n=== 原始事件 {} 个（丢弃 {}）===", collected.len(), dropped_total);
+    println!(
+        "\n=== 原始事件 {} 个（丢弃 {}）===",
+        collected.len(),
+        dropped_total
+    );
     for event in collected.iter().take(24) {
         let who = event
             .node
             .as_ref()
-            .map(|node| {
-                format!(
-                    "{} {:?}",
-                    node.role,
-                    node.name.as_deref().unwrap_or("")
-                )
-            })
+            .map(|node| format!("{} {:?}", node.role, node.name.as_deref().unwrap_or("")))
             .unwrap_or_else(|| "<无法定位>".into());
-        println!("  [{}] {} via {} -> {}", event.sequence, event.kind.as_str(), event.source, who);
+        println!(
+            "  [{}] {} via {} -> {}",
+            event.sequence,
+            event.kind.as_str(),
+            event.source,
+            who
+        );
     }
 
     let steps = coalesce(recordable(collected));
@@ -74,10 +78,6 @@ fn main() {
                 )
             })
             .unwrap_or_else(|| "<无法定位>".into());
-        println!(
-            "  {} -> {}",
-            step.kind.action().unwrap_or("?"),
-            who
-        );
+        println!("  {} -> {}", step.kind.action().unwrap_or("?"), who);
     }
 }

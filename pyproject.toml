@@ -2,9 +2,17 @@
 requires = ["setuptools>=65"]
 build-backend = "setuptools.build_meta"
 
+# NOT PUBLISHED. This package is kept installable for local development only:
+# the Rust workspace is the shipped implementation, while `plugins/` (macOS AX,
+# Linux AT-SPI, OCR) still imports `ai_auto_desktop.artifact_ipc` and the 58
+# Python test files remain the behavioural reference for unported semantics.
+# `Private :: Do Not Upload` makes PyPI reject an upload outright, so an
+# accidental `twine upload` fails instead of publishing a package nobody should
+# depend on. See docs/plan/rust-port-status.md for what is still unported.
 [project]
 name = "ai-auto-desktop"
-version = "0.1.0"
+classifiers = ["Private :: Do Not Upload"]
+version = "0.0.1"
 description = "A strict, process-isolated desktop automation workflow runtime"
 readme = "README.md"
 requires-python = ">=3.11"

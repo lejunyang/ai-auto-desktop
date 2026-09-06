@@ -8,10 +8,17 @@ fn main() {
     let list = windows["windows"].as_array().expect("list");
     let window = list
         .iter()
-        .find(|w| w["title"].as_str().unwrap_or_default().contains("Complex Fixture"))
+        .find(|w| {
+            w["title"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("Complex Fixture")
+        })
         .expect("fixture");
     let window_id = window["window_id"].as_str().unwrap_or_default();
-    let captured = driver.call("snapshot", &json!({"window_id": window_id})).expect("snap");
+    let captured = driver
+        .call("snapshot", &json!({"window_id": window_id}))
+        .expect("snap");
     let nodes: Vec<Node> = captured["nodes"]
         .as_array()
         .expect("nodes")
@@ -53,6 +60,9 @@ fn main() {
 
     println!("\n最终合成:");
     if let Some(locator) = Locator::synthesize(edit, &nodes) {
-        println!("  {}", serde_json::to_string(&locator.to_json()).unwrap_or_default());
+        println!(
+            "  {}",
+            serde_json::to_string(&locator.to_json()).unwrap_or_default()
+        );
     }
 }

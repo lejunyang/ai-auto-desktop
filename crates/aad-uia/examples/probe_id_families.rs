@@ -19,13 +19,17 @@ fn main() {
         let Ok(captured) = driver.call("snapshot", &json!({"window_id": window_id})) else {
             continue;
         };
-        let Some(raw) = captured["nodes"].as_array() else { continue };
+        let Some(raw) = captured["nodes"].as_array() else {
+            continue;
+        };
         let nodes: Vec<Node> = raw
             .iter()
             .filter_map(|v| serde_json::from_value(v.clone()).ok())
             .collect();
         for node in &nodes {
-            let Some(id) = node.automation_id.as_deref() else { continue };
+            let Some(id) = node.automation_id.as_deref() else {
+                continue;
+            };
             if id.is_empty() {
                 continue;
             }

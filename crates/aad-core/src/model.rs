@@ -69,13 +69,16 @@ impl Default for ErrorHandler {
 impl ErrorHandler {
     /// Whether this handler claims an error with the given code/category/effect.
     pub fn matches(&self, code: &str, category: &str, effect: &str) -> bool {
-        let code_matches = self.match_codes.iter().any(|pattern| match pattern.as_str() {
-            "*" => true,
-            pattern => match pattern.strip_suffix('*') {
-                Some(prefix) => code.starts_with(prefix),
-                None => pattern == code,
-            },
-        });
+        let code_matches = self
+            .match_codes
+            .iter()
+            .any(|pattern| match pattern.as_str() {
+                "*" => true,
+                pattern => match pattern.strip_suffix('*') {
+                    Some(prefix) => code.starts_with(prefix),
+                    None => pattern == code,
+                },
+            });
         let category_matches =
             self.match_categories.is_empty() || self.match_categories.iter().any(|c| c == category);
         let effect_matches =
@@ -278,10 +281,9 @@ pub fn parse_duration(value: &str) -> Option<f64> {
         (head, 1.0)
     } else if let Some(head) = value.strip_suffix('m') {
         (head, 60.0)
-    } else if let Some(head) = value.strip_suffix('h') {
-        (head, 3600.0)
     } else {
-        return None;
+        let head = value.strip_suffix('h')?;
+        (head, 3600.0)
     };
     if digits.is_empty()
         || !digits.bytes().all(|byte| byte.is_ascii_digit())

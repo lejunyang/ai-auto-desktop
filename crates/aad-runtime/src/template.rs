@@ -133,7 +133,10 @@ mod tests {
 
         assert_eq!(resolve(&json!("${{ count }}"), &scope).unwrap(), json!(3));
         assert_eq!(resolve(&json!("${{ flag }}"), &scope).unwrap(), json!(true));
-        assert_eq!(resolve(&json!("${{ data }}"), &scope).unwrap(), json!({"a": 1}));
+        assert_eq!(
+            resolve(&json!("${{ data }}"), &scope).unwrap(),
+            json!({"a": 1})
+        );
     }
 
     #[test]

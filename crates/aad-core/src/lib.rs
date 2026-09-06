@@ -11,11 +11,11 @@ pub mod errors;
 pub mod expression;
 pub mod model;
 
-pub use compiler::{
-    compile_descriptor, load_descriptor, parse_descriptor_text, API_VERSION, KIND,
-};
+pub use compiler::{compile_descriptor, load_descriptor, parse_descriptor_text, API_VERSION, KIND};
 pub use errors::{AutomationError, DescriptorIssue, ErrorLocation, Result};
-pub use expression::{compile_expression, evaluate_expression, CompiledExpression, ExpressionError};
+pub use expression::{
+    compile_expression, evaluate_expression, CompiledExpression, ExpressionError,
+};
 pub use model::{
     parse_duration, Budgets, CompiledStep, ErrorHandler, HandlerMode, NamedValue, StepType,
     SwitchCase, WorkflowDescriptor,

@@ -1,4 +1,4 @@
-﻿//! The desktop shell's backend.
+//! The desktop shell's backend.
 //!
 //! Every command here is a thin, typed wrapper over `aad-uia`. The shell holds
 //! no automation logic of its own: the same driver, the same snapshot store and
@@ -402,13 +402,8 @@ async fn probe_environment() -> Value {
 /// Both are written in one command so they cannot drift apart: a workflow whose
 /// recording says something else is a trap for whoever opens it next.
 #[tauri::command]
-async fn save_recording(
-    name: String,
-    document: Value,
-    workflow: Value,
-) -> Result<Value, Value> {
-    let recording_path =
-        recordings::save_recording(&name, &document).map_err(store_error)?;
+async fn save_recording(name: String, document: Value, workflow: Value) -> Result<Value, Value> {
+    let recording_path = recordings::save_recording(&name, &document).map_err(store_error)?;
     let workflow_path = recordings::save_workflow(&name, &workflow).map_err(store_error)?;
     Ok(json!({
         "recording_path": recording_path.to_string_lossy(),
@@ -684,7 +679,11 @@ mod tests {
         let reference = first["ref"].as_str().expect("a reference");
 
         let parts: Vec<&str> = reference.split(':').collect();
-        assert_eq!(parts.len(), 3, "expected snapshot:revision:node, got {reference}");
+        assert_eq!(
+            parts.len(),
+            3,
+            "expected snapshot:revision:node, got {reference}"
+        );
         assert_eq!(parts[0], outline["snapshot_id"].as_str().unwrap());
         assert_eq!(parts[1], outline["revision"].as_u64().unwrap().to_string());
         assert_eq!(parts[2], first["node_id"].as_str().unwrap());
@@ -710,8 +709,8 @@ mod tests {
 
     #[test]
     fn an_error_payload_carries_the_contract_fields() {
-        let error = DriverError::new("DRIVER.STALE_HANDLE", "the UI moved on")
-            .with_effect("not_applied");
+        let error =
+            DriverError::new("DRIVER.STALE_HANDLE", "the UI moved on").with_effect("not_applied");
         let payload = error_payload(&error);
 
         assert_eq!(payload["code"], "DRIVER.STALE_HANDLE");

@@ -241,7 +241,11 @@ fn runs_are_listed_newest_first_and_can_be_filtered_by_status() {
     // run_id breaks the tie.
     let first = journal.store.list_runs(None, 2, 0).expect("page 1");
     let second = journal.store.list_runs(None, 2, 2).expect("page 2");
-    let mut seen: Vec<_> = first.iter().chain(second.iter()).map(|r| &r.run_id).collect();
+    let mut seen: Vec<_> = first
+        .iter()
+        .chain(second.iter())
+        .map(|r| &r.run_id)
+        .collect();
     seen.sort();
     seen.dedup();
     assert_eq!(seen.len(), 3, "pages cover every run exactly once");
@@ -285,7 +289,11 @@ fn a_descriptor_declaring_sensitive_data_cannot_be_made_durable() {
         .expect_err("must refuse");
     assert_eq!(error.code(), "JOURNAL.SENSITIVE_REFUSED");
     assert_eq!(
-        journal.store.get_run("run-1").expect_err("not created").code(),
+        journal
+            .store
+            .get_run("run-1")
+            .expect_err("not created")
+            .code(),
         "JOURNAL.RUN_NOT_FOUND"
     );
 }
@@ -349,7 +357,11 @@ fn pending_cannot_jump_straight_to_succeeded_or_unknown_effect() {
 
     // Nothing has been dispatched from `pending`, so the effect is not in doubt
     // and `unknown_effect` would be a false claim.
-    for status in [RunStatus::Succeeded, RunStatus::UnknownEffect, RunStatus::Paused] {
+    for status in [
+        RunStatus::Succeeded,
+        RunStatus::UnknownEffect,
+        RunStatus::Paused,
+    ] {
         let error = journal
             .store
             .set_status(
@@ -837,7 +849,9 @@ fn only_the_hash_of_a_lease_token_is_persisted() {
     // The transport shape must not leak it either.
     let json = journal.store.get_run("run-1").expect("run").to_json();
     assert!(
-        !serde_json::to_string(&json).expect("serialise").contains(lease.token()),
+        !serde_json::to_string(&json)
+            .expect("serialise")
+            .contains(lease.token()),
         "the token must not appear in the transport shape"
     );
     // Nor the debug rendering, which is the other way secrets reach logs.
@@ -912,8 +926,22 @@ fn a_lease_for_one_run_cannot_write_to_another() {
         .expect("run-1 lease untouched");
 
     // run-2's history got exactly the one event; run-1's is unaffected.
-    assert_eq!(journal.store.list_events("run-2", 0, 10).expect("events").len(), 2);
-    assert_eq!(journal.store.list_events("run-1", 0, 10).expect("events").len(), 2);
+    assert_eq!(
+        journal
+            .store
+            .list_events("run-2", 0, 10)
+            .expect("events")
+            .len(),
+        2
+    );
+    assert_eq!(
+        journal
+            .store
+            .list_events("run-1", 0, 10)
+            .expect("events")
+            .len(),
+        2
+    );
 }
 
 // ---------------------------------------------------------------- events
@@ -997,7 +1025,14 @@ fn malformed_event_types_are_rejected() {
     let journal = TempJournal::open();
     let lease = seed_running(&journal, "run-1");
     let now = now_seconds();
-    for candidate in ["Run.Started", "run started", "", "9run", "run..started", "run."] {
+    for candidate in [
+        "Run.Started",
+        "run started",
+        "",
+        "9run",
+        "run..started",
+        "run.",
+    ] {
         let error = journal
             .store
             .append_event(&lease, candidate, &json!({}), now)
@@ -1008,7 +1043,12 @@ fn malformed_event_types_are_rejected() {
             "event type {candidate:?}"
         );
     }
-    for candidate in ["run.started", "step.retry_scheduled", "a", "run.step-1.done"] {
+    for candidate in [
+        "run.started",
+        "step.retry_scheduled",
+        "a",
+        "run.step-1.done",
+    ] {
         journal
             .store
             .append_event(&lease, candidate, &json!({}), now)
@@ -1084,7 +1124,10 @@ fn a_checkpoint_survives_reopening_the_journal() {
     // The whole point: a new process can pick up where the old one stopped.
     let reopened = JournalStore::open(journal.path()).expect("reopen");
     let run = reopened.get_run("run-1").expect("run");
-    assert_eq!(run.checkpoint.expect("checkpoint")["phase"], json!("in_top_level_step"));
+    assert_eq!(
+        run.checkpoint.expect("checkpoint")["phase"],
+        json!("in_top_level_step")
+    );
     assert_eq!(run.status, RunStatus::Running);
 }
 
@@ -1113,7 +1156,12 @@ fn a_lost_lease_cannot_write_a_checkpoint() {
         .expect_err("fenced");
     assert_eq!(error.code(), "JOURNAL.LEASE_LOST");
     assert!(
-        journal.store.get_run("run-1").expect("run").checkpoint.is_none(),
+        journal
+            .store
+            .get_run("run-1")
+            .expect("run")
+            .checkpoint
+            .is_none(),
         "the fenced write left no trace"
     );
 }
@@ -1130,7 +1178,10 @@ fn the_database_itself_refuses_an_illegal_status_transition() {
     let raw = journal.raw();
     // pending -> paused is not a legal edge, and no Rust code is involved here.
     let error = raw
-        .execute("UPDATE runs SET status = 'paused' WHERE run_id = 'run-1'", [])
+        .execute(
+            "UPDATE runs SET status = 'paused' WHERE run_id = 'run-1'",
+            [],
+        )
         .expect_err("trigger must abort");
     assert!(
         error.to_string().contains("invalid run status transition"),
@@ -1149,7 +1200,10 @@ fn the_database_itself_makes_cancel_absorbing() {
     )
     .expect("cancel");
     let error = raw
-        .execute("UPDATE runs SET desired_state = 'run' WHERE run_id = 'run-1'", [])
+        .execute(
+            "UPDATE runs SET desired_state = 'run' WHERE run_id = 'run-1'",
+            [],
+        )
         .expect_err("trigger must abort");
     assert!(
         error.to_string().contains("absorbing"),
@@ -1177,9 +1231,15 @@ fn the_database_itself_freezes_a_terminal_run() {
 
     let raw = journal.raw();
     let error = raw
-        .execute("UPDATE runs SET workflow_name = 'tampered' WHERE run_id = 'run-1'", [])
+        .execute(
+            "UPDATE runs SET workflow_name = 'tampered' WHERE run_id = 'run-1'",
+            [],
+        )
         .expect_err("terminal rows are frozen");
-    assert!(error.to_string().contains("immutable"), "unexpected: {error}");
+    assert!(
+        error.to_string().contains("immutable"),
+        "unexpected: {error}"
+    );
 
     let error = raw
         .execute(
@@ -1189,7 +1249,9 @@ fn the_database_itself_freezes_a_terminal_run() {
         )
         .expect_err("terminal runs accept no events");
     assert!(
-        error.to_string().contains("terminal run cannot accept events")
+        error
+            .to_string()
+            .contains("terminal run cannot accept events")
             || error.to_string().contains("contiguous"),
         "unexpected: {error}"
     );
@@ -1222,7 +1284,10 @@ fn the_database_itself_rejects_a_half_set_lease() {
     // though it did.
     let error = journal
         .raw()
-        .execute("UPDATE runs SET owner_id = 'sneaky' WHERE run_id = 'run-1'", [])
+        .execute(
+            "UPDATE runs SET owner_id = 'sneaky' WHERE run_id = 'run-1'",
+            [],
+        )
         .expect_err("CHECK must abort");
     assert!(
         error.to_string().contains("CHECK") || error.to_string().contains("constraint"),
@@ -1235,8 +1300,11 @@ fn the_database_itself_rejects_output_on_a_failed_run() {
     let journal = TempJournal::open();
     seed(&journal, "run-1");
     let raw = journal.raw();
-    raw.execute("UPDATE runs SET status = 'running' WHERE run_id = 'run-1'", [])
-        .expect("start");
+    raw.execute(
+        "UPDATE runs SET status = 'running' WHERE run_id = 'run-1'",
+        [],
+    )
+    .expect("start");
     let error = raw
         .execute(
             "UPDATE runs SET status = 'failed', output_json = '{\"a\":1}',
@@ -1259,9 +1327,11 @@ fn deleting_a_run_takes_its_events_with_it() {
     raw.execute("DELETE FROM runs WHERE run_id = 'run-1'", [])
         .expect("delete");
     let orphans: i64 = raw
-        .query_row("SELECT COUNT(*) FROM events WHERE run_id = 'run-1'", [], |row| {
-            row.get(0)
-        })
+        .query_row(
+            "SELECT COUNT(*) FROM events WHERE run_id = 'run-1'",
+            [],
+            |row| row.get(0),
+        )
         .expect("count");
     assert_eq!(orphans, 0, "cascade leaves no orphaned history");
 }
@@ -1298,7 +1368,12 @@ fn an_event_transport_shape_matches_the_event_schema() {
     let lease = seed_running(&journal, "run-1");
     let event = journal
         .store
-        .append_event(&lease, "step.started", &json!({"stepId": "click"}), now_seconds())
+        .append_event(
+            &lease,
+            "step.started",
+            &json!({"stepId": "click"}),
+            now_seconds(),
+        )
         .expect("append");
     let json = event.to_json();
 
@@ -1317,7 +1392,11 @@ fn timestamps_are_utc_microsecond_iso_8601() {
     // Lexicographic ordering is what makes `created_at DESC` correct, so the
     // format has to be fixed-width and zero-padded.
     assert_eq!(run.created_at.len(), 32, "got {:?}", run.created_at);
-    assert!(run.created_at.ends_with("+00:00"), "got {:?}", run.created_at);
+    assert!(
+        run.created_at.ends_with("+00:00"),
+        "got {:?}",
+        run.created_at
+    );
     assert_eq!(&run.created_at[4..5], "-");
     assert_eq!(&run.created_at[10..11], "T");
     let year: i32 = run.created_at[0..4].parse().expect("year");
@@ -1388,7 +1467,10 @@ fn concurrent_appends_from_many_threads_produce_no_gaps_or_duplicates() {
         }
     });
 
-    let events = journal.store.list_events("run-1", 0, 1_000).expect("events");
+    let events = journal
+        .store
+        .list_events("run-1", 0, 1_000)
+        .expect("events");
     assert_eq!(events.len(), 22, "2 seeded + 20 appended");
     let sequence: Vec<i64> = events.iter().map(|event| event.seq).collect();
     let expected: Vec<i64> = (1..=22).collect();

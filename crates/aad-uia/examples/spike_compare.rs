@@ -17,17 +17,17 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use windows::core::{implement, Result};
-use windows::Win32::Foundation::{HWND, LPARAM, BOOL, TRUE};
+use windows::Win32::Foundation::{BOOL, HWND, LPARAM, TRUE};
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED,
 };
 use windows::Win32::UI::Accessibility::{
     CUIAutomation, IUIAutomation, IUIAutomationElement, IUIAutomationEventHandler,
     IUIAutomationEventHandler_Impl, IUIAutomationPropertyChangedEventHandler,
-    IUIAutomationPropertyChangedEventHandler_Impl, SetWinEventHook, HWINEVENTHOOK,
-    TreeScope_Subtree, UIA_EVENT_ID, UIA_Invoke_InvokedEventId, UIA_PROPERTY_ID,
-    UIA_SelectionItem_ElementSelectedEventId, UIA_ToggleToggleStatePropertyId,
-    UIA_ValueValuePropertyId,
+    IUIAutomationPropertyChangedEventHandler_Impl, SetWinEventHook, TreeScope_Subtree,
+    UIA_Invoke_InvokedEventId, UIA_SelectionItem_ElementSelectedEventId,
+    UIA_ToggleToggleStatePropertyId, UIA_ValueValuePropertyId, HWINEVENTHOOK, UIA_EVENT_ID,
+    UIA_PROPERTY_ID,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, EnumWindows, GetAncestor, GetWindowTextW, IsWindowVisible, PeekMessageW,
@@ -195,7 +195,10 @@ fn main() -> Result<()> {
             WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
         )
     };
-    println!("LISTENING on {needle:?} (hook_valid={})", !hook.is_invalid());
+    println!(
+        "LISTENING on {needle:?} (hook_valid={})",
+        !hook.is_invalid()
+    );
 
     let seconds: u64 = std::env::args()
         .nth(2)

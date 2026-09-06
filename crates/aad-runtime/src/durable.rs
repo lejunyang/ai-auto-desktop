@@ -74,7 +74,9 @@ impl RunStatus {
             "cancelled" => Self::Cancelled,
             "unknown_effect" => Self::UnknownEffect,
             other => {
-                return Err(JournalError::invalid(format!("invalid run status: {other:?}")))
+                return Err(JournalError::invalid(format!(
+                    "invalid run status: {other:?}"
+                )))
             }
         })
     }
@@ -343,8 +345,7 @@ impl std::fmt::Debug for OwnerLease {
     }
 }
 
-const TERMINAL_SQL: &str =
-    "'succeeded','failed','timed_out','cancelled','unknown_effect'";
+const TERMINAL_SQL: &str = "'succeeded','failed','timed_out','cancelled','unknown_effect'";
 
 /// A run's declared inputs and outputs must all be non-sensitive to be durable.
 ///
@@ -387,7 +388,9 @@ pub struct JournalStore {
 
 impl std::fmt::Debug for JournalStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("JournalStore").field("path", &self.path).finish()
+        f.debug_struct("JournalStore")
+            .field("path", &self.path)
+            .finish()
     }
 }
 
@@ -399,7 +402,10 @@ impl JournalStore {
 
     pub fn open_with_timeout(path: impl AsRef<Path>, busy_timeout_ms: u32) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
-        if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
             std::fs::create_dir_all(parent).map_err(|error| {
                 JournalError::Storage(format!("cannot create {}: {error}", parent.display()))
             })?;
@@ -423,26 +429,26 @@ impl JournalStore {
         self.connection
             .execute_batch("PRAGMA foreign_keys = ON; PRAGMA synchronous = FULL;")?;
 
-        let mode: String =
-            self.connection
-                .query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))?;
+        let mode: String = self
+            .connection
+            .query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))?;
         if !mode.eq_ignore_ascii_case("wal") {
             return Err(JournalError::Storage(format!(
                 "SQLite refused WAL mode and reported {mode:?}; concurrent runners \
                  could not be serialised safely"
             )));
         }
-        let foreign_keys: i64 =
-            self.connection
-                .query_row("PRAGMA foreign_keys", [], |row| row.get(0))?;
+        let foreign_keys: i64 = self
+            .connection
+            .query_row("PRAGMA foreign_keys", [], |row| row.get(0))?;
         if foreign_keys != 1 {
             return Err(JournalError::Storage(
                 "SQLite foreign key enforcement is unavailable".into(),
             ));
         }
-        let synchronous: i64 =
-            self.connection
-                .query_row("PRAGMA synchronous", [], |row| row.get(0))?;
+        let synchronous: i64 = self
+            .connection
+            .query_row("PRAGMA synchronous", [], |row| row.get(0))?;
         if synchronous != 2 {
             return Err(JournalError::Storage(
                 "SQLite synchronous=FULL is unavailable, so a crash could lose \
@@ -457,8 +463,7 @@ impl JournalStore {
     /// several processes racing to open a new journal is safe.
     fn migrate(&self) -> Result<()> {
         let transaction = self.begin()?;
-        let current: i64 =
-            transaction.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        let current: i64 = transaction.query_row("PRAGMA user_version", [], |row| row.get(0))?;
         if current > SCHEMA_VERSION {
             return Err(JournalError::Storage(format!(
                 "journal schema {current} is newer than the supported {SCHEMA_VERSION}"
@@ -505,8 +510,7 @@ impl JournalStore {
     ) -> Result<RunRecord> {
         if !durable_descriptor_eligible(descriptor) {
             return Err(JournalError::Sensitive(
-                "durable runs do not accept descriptors with sensitive inputs or outputs"
-                    .into(),
+                "durable runs do not accept descriptors with sensitive inputs or outputs".into(),
             ));
         }
         bounded(run_id, "run_id", 256)?;
@@ -526,7 +530,14 @@ impl JournalStore {
                  run_id, workflow_name, workflow_version, plan_digest,
                  status, desired_state, inputs_json, created_at, updated_at
              ) VALUES (?1, ?2, ?3, ?4, 'pending', 'run', ?5, ?6, ?6)",
-            params![run_id, workflow_name, workflow_version, plan_digest, inputs_json, now],
+            params![
+                run_id,
+                workflow_name,
+                workflow_version,
+                plan_digest,
+                inputs_json,
+                now
+            ],
         )?;
         if inserted != 1 {
             return Err(JournalError::Conflict(format!(
@@ -542,9 +553,11 @@ impl JournalStore {
 
     pub fn get_run(&self, run_id: &str) -> Result<RunRecord> {
         self.connection
-            .query_row("SELECT * FROM runs WHERE run_id = ?1", params![run_id], |row| {
-                run_from_row(row)
-            })
+            .query_row(
+                "SELECT * FROM runs WHERE run_id = ?1",
+                params![run_id],
+                run_from_row,
+            )
             .optional()?
             .ok_or_else(|| JournalError::NotFound(format!("run not found: {run_id}")))
     }
@@ -568,13 +581,11 @@ impl JournalStore {
         let mut found = Vec::new();
         match status {
             Some(status) => {
-                let mut statement = self.connection.prepare(&format!(
-                    "SELECT * FROM runs WHERE status = ?3 {order}"
-                ))?;
-                let rows = statement.query_map(
-                    params![limit, offset, status.as_str()],
-                    run_from_row,
-                )?;
+                let mut statement = self
+                    .connection
+                    .prepare(&format!("SELECT * FROM runs WHERE status = ?3 {order}"))?;
+                let rows =
+                    statement.query_map(params![limit, offset, status.as_str()], run_from_row)?;
                 for row in rows {
                     found.push(row?);
                 }
@@ -934,7 +945,7 @@ impl JournalStore {
             return Err(JournalError::invalid("limit must be between 1 and 10000"));
         }
         // Distinguish "no such run" from "no new events", which callers polling
-                // for progress need to tell apart.
+        // for progress need to tell apart.
         self.get_run(run_id)?;
         let mut statement = self.connection.prepare(
             "SELECT run_id, seq, event_type, payload_json, created_at
@@ -946,8 +957,7 @@ impl JournalStore {
                 run_id: row.get(0)?,
                 seq: row.get(1)?,
                 event_type: row.get(2)?,
-                payload: serde_json::from_str(&row.get::<_, String>(3)?)
-                    .unwrap_or(Value::Null),
+                payload: serde_json::from_str(&row.get::<_, String>(3)?).unwrap_or(Value::Null),
                 created_at: row.get(4)?,
             })
         })?;
@@ -1128,11 +1138,7 @@ fn append_event(
     })
 }
 
-fn require_live_lease(
-    transaction: &Transaction<'_>,
-    lease: &OwnerLease,
-    now: f64,
-) -> Result<()> {
+fn require_live_lease(transaction: &Transaction<'_>, lease: &OwnerLease, now: f64) -> Result<()> {
     let held: Option<i64> = transaction
         .query_row(
             &format!(
@@ -1140,12 +1146,7 @@ fn require_live_lease(
                  WHERE run_id = ?1 AND owner_id = ?2 AND lease_token_hash = ?3
                    AND lease_expires_at > ?4 AND status NOT IN ({TERMINAL_SQL})"
             ),
-            params![
-                lease.run_id,
-                lease.owner_id,
-                token_hash(&lease.token),
-                now
-            ],
+            params![lease.run_id, lease.owner_id, token_hash(&lease.token), now],
             |row| row.get(0),
         )
         .optional()?;
@@ -1200,16 +1201,18 @@ fn lease_lost(transaction: &Transaction<'_>, run_id: &str) -> JournalError {
             "terminal run {run_id} is immutable ({})",
             run.status.as_str()
         )),
-        Ok(_) => JournalError::LeaseLost(format!(
-            "owner lease is no longer held for run {run_id}"
-        )),
+        Ok(_) => JournalError::LeaseLost(format!("owner lease is no longer held for run {run_id}")),
         Err(error) => error,
     }
 }
 
 fn read_run(transaction: &Transaction<'_>, run_id: &str) -> Result<RunRecord> {
     transaction
-        .query_row("SELECT * FROM runs WHERE run_id = ?1", params![run_id], run_from_row)
+        .query_row(
+            "SELECT * FROM runs WHERE run_id = ?1",
+            params![run_id],
+            run_from_row,
+        )
         .optional()?
         .ok_or_else(|| JournalError::NotFound(format!("run not found: {run_id}")))
 }
@@ -1296,7 +1299,10 @@ fn encode_json(value: &Value, field: &str) -> Result<String> {
     let sorted: std::collections::BTreeMap<String, Value>;
     let canonical = match value {
         Value::Object(entries) => {
-            sorted = entries.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+            sorted = entries
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
             serde_json::to_string(&sorted)
         }
         other => serde_json::to_string(other),
@@ -1324,7 +1330,9 @@ fn is_event_type(value: &str) -> bool {
     let first = segments.next().unwrap_or("");
     let valid = |segment: &str, alpha_first: bool| {
         !segment.is_empty()
-            && segment.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+            && segment
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
             && (!alpha_first || segment.starts_with(|c: char| c.is_ascii_lowercase()))
     };
     valid(first, true) && segments.all(|segment| valid(segment, false))

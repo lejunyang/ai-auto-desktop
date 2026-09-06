@@ -1,4 +1,4 @@
-﻿//! Durable execution: run a workflow so it survives a process restart.
+//! Durable execution: run a workflow so it survives a process restart.
 //!
 //! The executor drives the engine one top-level step at a time, committing a
 //! checkpoint between segments. A crash therefore loses at most the segment in
@@ -278,12 +278,7 @@ impl DurableExecutor {
                 &lease,
                 "run.checkpointed",
                 &json!({"phase": Phase::BetweenSteps.as_str()}),
-                &encode_checkpoint(
-                    digest,
-                    Phase::BetweenSteps,
-                    deadline,
-                    &segmented.snapshot(),
-                ),
+                &encode_checkpoint(digest, Phase::BetweenSteps, deadline, &segmented.snapshot()),
                 Some(RunStatus::Running),
                 None,
                 durable::now_seconds(),
@@ -311,10 +306,7 @@ impl DurableExecutor {
         if run.is_terminal() {
             return Err(durable_error(
                 "DURABLE.ALREADY_TERMINAL",
-                format!(
-                    "run {run_id} already finished as {}",
-                    run.status.as_str()
-                ),
+                format!("run {run_id} already finished as {}", run.status.as_str()),
             )
             .with_detail("status", Value::String(run.status.as_str().into())));
         }
@@ -448,21 +440,10 @@ impl DurableExecutor {
             self.journal.get_run(run_id).map_err(journal_error)?
         };
 
-        self.drive(
-            &digest,
-            running,
-            lease,
-            &mut segmented,
-            deadline,
-            &options,
-        )
+        self.drive(&digest, running, lease, &mut segmented, deadline, &options)
     }
 
-    fn claim(
-        &self,
-        run_id: &str,
-        options: &DurableOptions,
-    ) -> Result<OwnerLease, AutomationError> {
+    fn claim(&self, run_id: &str, options: &DurableOptions) -> Result<OwnerLease, AutomationError> {
         self.journal
             .claim_owner(
                 run_id,
@@ -564,13 +545,7 @@ impl DurableExecutor {
                 Err(error) => {
                     // The step itself failed. That is an ordinary outcome, so
                     // give the workflow's handler and cleanup their chance.
-                    return self.finalize_body(
-                        digest,
-                        lease,
-                        segmented,
-                        deadline,
-                        Err(error),
-                    );
+                    return self.finalize_body(digest, lease, segmented, deadline, Err(error));
                 }
             };
 
@@ -613,12 +588,7 @@ impl DurableExecutor {
                 &lease,
                 "run.checkpointed",
                 &json!({"phase": Phase::BetweenSteps.as_str()}),
-                &encode_checkpoint(
-                    digest,
-                    Phase::BetweenSteps,
-                    deadline,
-                    &segmented.snapshot(),
-                ),
+                &encode_checkpoint(digest, Phase::BetweenSteps, deadline, &segmented.snapshot()),
                 Some(RunStatus::Running),
                 None,
                 durable::now_seconds(),
@@ -666,12 +636,7 @@ impl DurableExecutor {
                 &lease,
                 "run.finalizing",
                 &json!({}),
-                &encode_checkpoint(
-                    digest,
-                    Phase::Finalizing,
-                    deadline,
-                    &segmented.snapshot(),
-                ),
+                &encode_checkpoint(digest, Phase::Finalizing, deadline, &segmented.snapshot()),
                 Some(RunStatus::Running),
                 None,
                 durable::now_seconds(),
@@ -872,18 +837,12 @@ pub fn assert_durable_plan(descriptor: &WorkflowDescriptor) -> Result<(), Automa
             "DURABLE.UNSUPPORTED_PLAN",
             "durable execution requires max_concurrency=1",
         )
-        .with_detail(
-            "max_concurrency",
-            json!(descriptor.budgets.max_concurrency),
-        ));
+        .with_detail("max_concurrency", json!(descriptor.budgets.max_concurrency)));
     }
     // An explicit top-level `depends_on` can reorder steps in ways a single
     // "next index" cannot express.
     if let Some(steps) = descriptor.raw.get("steps").and_then(Value::as_array) {
-        if steps
-            .iter()
-            .any(|step| step.get("depends_on").is_some())
-        {
+        if steps.iter().any(|step| step.get("depends_on").is_some()) {
             return Err(durable_error(
                 "DURABLE.UNSUPPORTED_PLAN",
                 "durable execution requires implicit sequential top-level steps",
@@ -916,10 +875,7 @@ pub fn assert_durable_plan(descriptor: &WorkflowDescriptor) -> Result<(), Automa
 }
 
 fn workflow_version(descriptor: &WorkflowDescriptor) -> Option<&str> {
-    descriptor
-        .metadata
-        .get("version")
-        .and_then(Value::as_str)
+    descriptor.metadata.get("version").and_then(Value::as_str)
 }
 
 /// Serialise the resumable state.
@@ -927,12 +883,7 @@ fn workflow_version(descriptor: &WorkflowDescriptor) -> Option<&str> {
 /// The schema and runtime versions plus the plan digest are recorded so a
 /// checkpoint written by an incompatible build, or against a different
 /// workflow, is detected on read instead of misinterpreted.
-fn encode_checkpoint(
-    digest: &str,
-    phase: Phase,
-    deadline: f64,
-    state: &SegmentState,
-) -> Value {
+fn encode_checkpoint(digest: &str, phase: Phase, deadline: f64, state: &SegmentState) -> Value {
     json!({
         "checkpointVersion": CHECKPOINT_VERSION,
         "runtimeVersion": engine::RUNTIME_VERSION,
@@ -1001,7 +952,10 @@ fn decode_checkpoint(
             .get("nextTopLevelIndex")
             .and_then(Value::as_u64)
             .unwrap_or(0) as usize,
-        executed_steps: raw.get("executedSteps").and_then(Value::as_u64).unwrap_or(0),
+        executed_steps: raw
+            .get("executedSteps")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
         unknown_effect: raw
             .get("unknownEffect")
             .and_then(Value::as_bool)

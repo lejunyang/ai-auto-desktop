@@ -102,7 +102,9 @@ fn slots(
     };
     for (name, raw) in map {
         let Value::Object(slot) = raw else {
-            return Err(format!("action {action}: {direction} slot {name} must be an object"));
+            return Err(format!(
+                "action {action}: {direction} slot {name} must be an object"
+            ));
         };
         let pointer = slot
             .get("pointer")
@@ -329,7 +331,10 @@ mod tests {
         assert_eq!(parsed.name, "fixture");
         assert_eq!(parsed.actions.len(), 1);
         assert_eq!(parsed.actions["ocr"].contract_major, 1);
-        assert_eq!(parsed.actions["ocr"].effect_class.as_deref(), Some("read_only"));
+        assert_eq!(
+            parsed.actions["ocr"].effect_class.as_deref(),
+            Some("read_only")
+        );
     }
 
     #[test]
@@ -460,7 +465,10 @@ mod tests {
 
     #[test]
     fn pointer_tokens_decode_rfc6901_escapes() {
-        assert_eq!(pointer_tokens("/a~1b/c~0d"), vec!["a/b".to_string(), "c~d".to_string()]);
+        assert_eq!(
+            pointer_tokens("/a~1b/c~0d"),
+            vec!["a/b".to_string(), "c~d".to_string()]
+        );
         assert_eq!(pointer_tokens("/image"), vec!["image".to_string()]);
     }
 }

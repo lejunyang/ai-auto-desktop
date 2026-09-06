@@ -134,3 +134,57 @@ jobs:
       - name: Smoke capability probe
         if: success()
         run: python -m ai_auto_desktop probe
+  # The Rust workspace is the shipped implementation, so it is built and tested
+  # on every platform it supports. aad-gui is excluded: it needs the Tauri
+  # system libraries (GTK/WebKit on Linux) and is never published, so its build
+  # is covered by the release workflow's installer job on Windows instead.
+  rust:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      # --locked so a Cargo.lock that no longer matches the manifests fails
+      # here rather than in the middle of a release.
+      - name: Build and test the workspace
+        run: cargo test --workspace --exclude aad-gui --locked
+
+      # -D warnings, or clippy prints a warning and still exits 0, which makes
+      # the step decorative.
+      - name: Lint
+        run: cargo clippy --workspace --exclude aad-gui --locked --all-targets -- -D warnings
+
+      # The Rust CLI is what users actually get, so examples are validated
+      # through it as well: the Python jobs above only prove the Python tree
+      # agrees with the tracked descriptors.
+      #
+      # Enumerated from git rather than hardcoded, so an example added later is
+      # covered without anyone remembering to extend this list.
+      - name: Validate tracked examples through the Rust CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          count=0
+          for descriptor in $(git ls-files 'examples/workflows/*.yaml' 'examples/workflows/*.json'); do
+            echo "validating ${descriptor}"
+            cargo run --locked -p aad-cli -- validate "${descriptor}"
+            count=$((count + 1))
+          done
+          if [ "${count}" -eq 0 ]; then
+            echo "no tracked example descriptors found -- the glob above is wrong" >&2
+            exit 1
+          fi
+          echo "validated ${count} tracked example descriptor(s)"
+
+      - name: Smoke capability probe through the Rust CLI
+        run: cargo run --locked -p aad-cli -- probe

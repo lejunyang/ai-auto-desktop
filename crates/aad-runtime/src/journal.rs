@@ -110,7 +110,10 @@ impl Journal {
     }
 
     pub fn events(&self) -> Vec<RunEvent> {
-        self.events.lock().map(|events| events.clone()).unwrap_or_default()
+        self.events
+            .lock()
+            .map(|events| events.clone())
+            .unwrap_or_default()
     }
 
     pub fn to_json(&self) -> Vec<Value> {
@@ -285,7 +288,10 @@ mod tests {
         journal.emit("a.b", json!({}));
         journal.emit("c.d", json!({}));
 
-        assert_eq!(*sink.0.lock().unwrap(), vec!["a.b".to_string(), "c.d".to_string()]);
+        assert_eq!(
+            *sink.0.lock().unwrap(),
+            vec!["a.b".to_string(), "c.d".to_string()]
+        );
     }
 
     #[test]
@@ -303,7 +309,10 @@ mod tests {
         }
 
         let shared = Arc::new(Mutex::new(Vec::new()));
-        let journal = Journal::new("run-3", Some(Arc::new(NdjsonSink::new(Buffer(shared.clone())))));
+        let journal = Journal::new(
+            "run-3",
+            Some(Arc::new(NdjsonSink::new(Buffer(shared.clone())))),
+        );
         journal.emit("one", json!({}));
         journal.emit("two", json!({}));
 

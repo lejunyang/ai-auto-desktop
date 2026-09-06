@@ -280,11 +280,10 @@ impl ProcessPlugin {
                     job = None;
                 }
             }
-            if job.is_some() || tree_bounded {
-                windows_job::resume(&child);
-            } else {
-                windows_job::resume(&child);
-            }
+            // Unconditional: the worker was spawned suspended, so it has to be
+            // resumed whether or not the Job Object accepted it. The branch that
+            // used to be here ran the same call in both arms.
+            windows_job::resume(&child);
             job
         };
 
@@ -352,7 +351,11 @@ impl ProcessPlugin {
 
     /// The bounded tail of stderr captured so far.
     pub fn stderr(&self) -> String {
-        self.shared.stderr.lock().map(|text| text.clone()).unwrap_or_default()
+        self.shared
+            .stderr
+            .lock()
+            .map(|text| text.clone())
+            .unwrap_or_default()
     }
 
     /// Whether cancelling this worker provably reclaims its descendants.
@@ -412,12 +415,18 @@ impl ProcessPlugin {
     /// The request shape is `{type, id, action, args, deadline_ms}`, where
     /// `deadline_ms` is an absolute Unix timestamp in milliseconds so the
     /// plugin can enforce the same budget the host is enforcing.
-    pub fn invoke(&mut self, action: &str, args: Value, timeout: Option<Duration>) -> Result<Value> {
+    pub fn invoke(
+        &mut self,
+        action: &str,
+        args: Value,
+        timeout: Option<Duration>,
+    ) -> Result<Value> {
         if action.is_empty() {
-            return Err(
-                PluginError::new("PLUGIN.INVALID_REQUEST", "action must be a non-empty string")
-                    .with_dispatched(false),
-            );
+            return Err(PluginError::new(
+                "PLUGIN.INVALID_REQUEST",
+                "action must be a non-empty string",
+            )
+            .with_dispatched(false));
         }
         let deadline = Instant::now() + timeout.unwrap_or(self.timeout);
         let request_id = new_request_id();
@@ -641,13 +650,16 @@ impl ProcessPlugin {
     }
 
     fn write_request(&mut self, request: &Value) -> Result<bool> {
-        let encoded = format!("{}\n", serde_json::to_string(request).map_err(|error| {
-            PluginError::new(
-                "PLUGIN.INVALID_REQUEST",
-                format!("request is not JSON serializable: {error}"),
-            )
-            .with_dispatched(false)
-        })?);
+        let encoded = format!(
+            "{}\n",
+            serde_json::to_string(request).map_err(|error| {
+                PluginError::new(
+                    "PLUGIN.INVALID_REQUEST",
+                    format!("request is not JSON serializable: {error}"),
+                )
+                .with_dispatched(false)
+            })?
+        );
 
         if self.shared.closed.load(Ordering::SeqCst) {
             return Err(self.host_error(
@@ -664,7 +676,10 @@ impl ProcessPlugin {
             ));
         };
 
-        match stdin.write_all(encoded.as_bytes()).and_then(|()| stdin.flush()) {
+        match stdin
+            .write_all(encoded.as_bytes())
+            .and_then(|()| stdin.flush())
+        {
             Ok(()) => Ok(true),
             Err(error) => Err(self
                 .host_error(
@@ -682,9 +697,32 @@ impl ProcessPlugin {
         deadline: Instant,
         allow_timeout: bool,
     ) -> Result<Option<Map<String, Value>>> {
-        loop {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
+        // Not a loop: every path below returns. This reads exactly one message,
+        // and a caller that wants another calls again. (The Python
+        // implementation still wraps the same body in a `while True` that
+        // likewise never reaches a second iteration.)
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            if allow_timeout {
+                return Ok(None);
+            }
+            return Err(self.host_error(
+                "PLUGIN.HOST_TIMEOUT",
+                format!("plugin {:?} did not respond before the deadline", self.name),
+                true,
+            ));
+        }
+
+        let Some(events) = self.events.as_ref() else {
+            return Err(self.host_error(
+                "PLUGIN.HOST_CLOSED",
+                format!("plugin {:?} was closed", self.name),
+                false,
+            ));
+        };
+        let event = match events.recv_timeout(remaining) {
+            Ok(event) => event,
+            Err(RecvTimeoutError::Timeout) => {
                 if allow_timeout {
                     return Ok(None);
                 }
@@ -694,86 +732,62 @@ impl ProcessPlugin {
                     true,
                 ));
             }
+            Err(RecvTimeoutError::Disconnected) => StreamEvent::Eof,
+        };
 
-            let Some(events) = self.events.as_ref() else {
+        let line = match event {
+            StreamEvent::Closed => {
                 return Err(self.host_error(
                     "PLUGIN.HOST_CLOSED",
                     format!("plugin {:?} was closed", self.name),
                     false,
-                ));
-            };
-            let event = match events.recv_timeout(remaining) {
-                Ok(event) => event,
-                Err(RecvTimeoutError::Timeout) => {
-                    if allow_timeout {
-                        return Ok(None);
-                    }
-                    return Err(self.host_error(
-                        "PLUGIN.HOST_TIMEOUT",
-                        format!("plugin {:?} did not respond before the deadline", self.name),
-                        true,
-                    ));
-                }
-                Err(RecvTimeoutError::Disconnected) => StreamEvent::Eof,
-            };
-
-            let line = match event {
-                StreamEvent::Closed => {
-                    return Err(self.host_error(
-                        "PLUGIN.HOST_CLOSED",
-                        format!("plugin {:?} was closed", self.name),
-                        false,
-                    ))
-                }
-                StreamEvent::Eof => {
-                    let returncode = self
-                        .child
-                        .as_mut()
-                        .and_then(|child| child.try_wait().ok().flatten())
-                        .and_then(|status| status.code());
-                    return Err(self
-                        .host_error(
-                            "PLUGIN.HOST_EOF",
-                            format!("plugin {:?} closed stdout unexpectedly", self.name),
-                            true,
-                        )
-                        .with_detail(
-                            "returncode",
-                            returncode.map(Value::from).unwrap_or(Value::Null),
-                        ));
-                }
-                StreamEvent::Error(reason) => {
-                    return Err(self.host_error("PLUGIN.HOST_PROTOCOL_ERROR", reason, false))
-                }
-                StreamEvent::Line(line) => line,
-            };
-
-            let trimmed = line.trim_end_matches(['\r', '\n']);
-            if trimmed.trim().is_empty() {
-                return Err(self.host_error(
-                    "PLUGIN.HOST_PROTOCOL_ERROR",
-                    "plugin emitted an empty stdout line",
-                    false,
-                ));
+                ))
             }
-            return match serde_json::from_str::<Value>(trimmed) {
-                Ok(Value::Object(message)) => Ok(Some(message)),
-                Ok(_) => Err(self.host_error(
-                    "PLUGIN.HOST_PROTOCOL_ERROR",
-                    "plugin response must be a JSON object",
-                    false,
-                )),
-                Err(error) => Err(self
+            StreamEvent::Eof => {
+                let returncode = self
+                    .child
+                    .as_mut()
+                    .and_then(|child| child.try_wait().ok().flatten())
+                    .and_then(|status| status.code());
+                return Err(self
                     .host_error(
-                        "PLUGIN.HOST_PROTOCOL_ERROR",
-                        format!("plugin emitted invalid JSON: {error}"),
-                        false,
+                        "PLUGIN.HOST_EOF",
+                        format!("plugin {:?} closed stdout unexpectedly", self.name),
+                        true,
                     )
                     .with_detail(
-                        "line",
-                        Value::String(trimmed.chars().take(500).collect()),
-                    )),
-            };
+                        "returncode",
+                        returncode.map(Value::from).unwrap_or(Value::Null),
+                    ));
+            }
+            StreamEvent::Error(reason) => {
+                return Err(self.host_error("PLUGIN.HOST_PROTOCOL_ERROR", reason, false))
+            }
+            StreamEvent::Line(line) => line,
+        };
+
+        let trimmed = line.trim_end_matches(['\r', '\n']);
+        if trimmed.trim().is_empty() {
+            return Err(self.host_error(
+                "PLUGIN.HOST_PROTOCOL_ERROR",
+                "plugin emitted an empty stdout line",
+                false,
+            ));
+        }
+        match serde_json::from_str::<Value>(trimmed) {
+            Ok(Value::Object(message)) => Ok(Some(message)),
+            Ok(_) => Err(self.host_error(
+                "PLUGIN.HOST_PROTOCOL_ERROR",
+                "plugin response must be a JSON object",
+                false,
+            )),
+            Err(error) => Err(self
+                .host_error(
+                    "PLUGIN.HOST_PROTOCOL_ERROR",
+                    format!("plugin emitted invalid JSON: {error}"),
+                    false,
+                )
+                .with_detail("line", Value::String(trimmed.chars().take(500).collect()))),
         }
     }
 
@@ -908,8 +922,9 @@ fn read_stdout(
             }
             Err(error) => {
                 if !shared.reader_stop.load(Ordering::SeqCst) {
-                    let _ = sender
-                        .send(StreamEvent::Error(format!("could not read stdout: {error}")));
+                    let _ = sender.send(StreamEvent::Error(format!(
+                        "could not read stdout: {error}"
+                    )));
                 }
                 return;
             }
@@ -972,10 +987,10 @@ pub mod windows_job {
     use std::process::Child;
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
     use windows_sys::Win32::System::JobObjects::{
-        AssignProcessToJobObject, CreateJobObjectW, SetInformationJobObject,
-        JobObjectExtendedLimitInformation, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-        JOB_OBJECT_LIMIT_ACTIVE_PROCESS, JOB_OBJECT_LIMIT_JOB_MEMORY,
-        JOB_OBJECT_LIMIT_JOB_TIME, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, TerminateJobObject,
+        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+        SetInformationJobObject, TerminateJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JOB_OBJECT_LIMIT_ACTIVE_PROCESS, JOB_OBJECT_LIMIT_JOB_MEMORY, JOB_OBJECT_LIMIT_JOB_TIME,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
     };
     use windows_sys::Win32::System::Threading::{
         OpenProcess, OpenThread, ResumeThread, PROCESS_ALL_ACCESS,
