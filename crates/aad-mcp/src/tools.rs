@@ -747,7 +747,7 @@ fn describe_workflow(arguments: &Value) -> Result<Value, String> {
         "inputs": raw.get("inputs").cloned().unwrap_or(json!({})),
         "outputs": raw.get("outputs").cloned().unwrap_or(json!({})),
         "steps": steps,
-        "stepCount": steps.len(),
+        "step_count": steps.len(),
         // What it will actually touch. Step ids and types do not answer the
         // question asked before running something, so an agent deciding whether to
         // run a saved workflow had only its name and a step count to go on.
@@ -1130,8 +1130,8 @@ by a person: use `aad run <file> --allow-scripts`.",
         "name": name,
         "status": result.status.as_str(),
         "outputs": result.outputs,
-        "stepsExecuted": result.executed_steps,
-        // What actually happened, step by step. `stepsExecuted` alone cannot tell
+        "executed_steps": result.executed_steps,
+        // What actually happened, step by step. `executed_steps` alone cannot tell
         // "all six succeeded" from "it reached the sixth and failed there", and
         // that difference decides whether retrying is safe: a workflow that wrote
         // a value and failed to submit will write it twice.
@@ -1300,7 +1300,7 @@ mod tests {
 
     #[test]
     fn a_run_that_stopped_halfway_says_which_step_did_it() {
-        // The problem this solves: `stepsExecuted` alone cannot tell "all of them
+        // The problem this solves: `executed_steps` alone cannot tell "all of them
         // succeeded" from "it reached the last one and failed there". An agent
         // reading the first meaning retries blindly, and a workflow that wrote a
         // value and failed to submit writes it twice.
@@ -1980,7 +1980,7 @@ hitting truncation without knowing there is another way: {:?}",
             call_without_driver("describe_workflow", &json!({"name": "greeter"})).expect("describe");
 
         assert_eq!(described["name"], json!("greeter"));
-        assert_eq!(described["stepCount"], json!(1));
+        assert_eq!(described["step_count"], json!(1));
         assert!(described["inputs"]["who"].is_object(), "declared inputs are reported");
         assert!(described["outputs"]["greeting"].is_object());
         assert!(described["runnable"].as_bool().unwrap());
@@ -2036,7 +2036,7 @@ hitting truncation without knowing there is another way: {:?}",
 
         assert_eq!(result["status"], json!("succeeded"));
         assert_eq!(result["outputs"]["greeting"], json!("agent"));
-        assert_eq!(result["stepsExecuted"], json!(1));
+        assert_eq!(result["executed_steps"], json!(1));
     }
 
     #[test]
@@ -2069,7 +2069,56 @@ hitting truncation without knowing there is another way: {:?}",
             json!("succeeded"),
             "an action step must resolve against the registered provider: {result}"
         );
-        assert_eq!(result["stepsExecuted"], json!(1));
+        assert_eq!(result["executed_steps"], json!(1));
+    }
+
+    #[test]
+    fn the_answers_name_their_fields_one_way() {
+        // Eleven of the fourteen tools answered in snake_case and the workflow
+        // three in camelCase, so the same number carried three names:
+        // `executed_steps` from save_workflow, `stepCount` from
+        // describe_workflow and `stepsExecuted` from run_workflow. An agent that
+        // has read `node_id` and `snapshot_id` will guess `executed_steps`, and
+        // guessing wrong reads as the field being absent rather than misspelt.
+        //
+        // `planDigest` and `apiVersion` are deliberately exempt: they are the
+        // spec's own persisted field names, read back from checkpoints and
+        // workflow documents, so renaming them here would disagree with the files
+        // on disk.
+        const SPEC_FIELDS: [&str; 4] = ["planDigest", "apiVersion", "stepId", "kind"];
+
+        fn offenders(value: &Value, at: String, found: &mut Vec<String>) {
+            match value {
+                Value::Object(fields) => {
+                    for (key, nested) in fields {
+                        if key.chars().any(|c| c.is_uppercase())
+                            && !SPEC_FIELDS.contains(&key.as_str())
+                        {
+                            found.push(format!("{at}.{key}"));
+                        }
+                        offenders(nested, format!("{at}.{key}"), found);
+                    }
+                }
+                Value::Array(items) => {
+                    for (at_index, nested) in items.iter().enumerate() {
+                        offenders(nested, format!("{at}[{at_index}]"), found);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let store = ScratchStore::new("naming");
+        store.save("greeter", pure_workflow());
+
+        let described = describe_workflow(&json!({"name": "greeter"})).expect("describe");
+        let ran = run_workflow(&stub_driver(), &json!({"name": "greeter", "inputs": {"who": "a"}}))
+            .expect("run");
+
+        let mut found = Vec::new();
+        offenders(&described, "describe_workflow".into(), &mut found);
+        offenders(&ran, "run_workflow".into(), &mut found);
+        assert!(found.is_empty(), "these fields are not snake_case: {found:?}");
     }
 
     #[test]

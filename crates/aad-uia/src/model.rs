@@ -498,7 +498,55 @@ impl Snapshot {
     /// A floor is still needed, or a two-character region would match any title
     /// starting with those letters.
     fn restates_window(&self, name: &str) -> bool {
-        let title = self.window.title.as_str();
+        restates_title(name, self.window.title.as_str())
+    }
+}
+
+/// The window's title as the nodes themselves report it.
+///
+/// The root carries it: measured across fourteen windows on this machine, the
+/// node with no parent is named exactly the window's title in thirteen, and the
+/// exception is a `pane` root with no name at all -- which has no title to echo
+/// either. Reading it from the tree rather than taking it as an argument keeps
+/// `synthesize` callable from the three places that have nodes but not always a
+/// `Snapshot`.
+///
+/// A root is recognised by being the *only* parentless node, not by its role. A
+/// caller may pass a flat list of siblings -- several tests and the capture path
+/// do -- and there every entry lacks a parent, so the first one's name would be
+/// read as the window's title and each element would look like an echo of
+/// itself. Requiring exactly one tells the two apart. Role is the wrong test
+/// here: measured on this desktop the root is `window` on most windows but
+/// `pane` on others, and under one of those `pane` roots two labels carrying the
+/// full title went unnoticed.
+///
+/// `except` excludes the element being described: it must never be the thing
+/// that disqualifies its own name, which is what makes the root's own locator
+/// keep the title it needs.
+fn window_title_of<'a>(nodes: &'a [Node], except: &str) -> Option<&'a str> {
+    let mut parentless = nodes.iter().filter(|node| node.parent_id.is_none());
+    let root = parentless.next()?;
+    if parentless.next().is_some() {
+        return None;
+    }
+    if root.node_id == except {
+        return None;
+    }
+    root.name
+        .as_deref()
+        .map(str::trim)
+        .filter(|title| !title.is_empty())
+}
+
+/// Whether a name is the window's title said again.
+///
+/// A free function because two callers need it and they reach it differently:
+/// `Snapshot` has the title to hand, while `Locator::synthesize` has only the
+/// nodes and finds the title on the root. Keeping one judgement rather than two
+/// is the point -- the region names and the locators have to agree about which
+/// names identify something.
+fn restates_title(name: &str, title: &str) -> bool {
+    {
         if name == title {
             return true;
         }
@@ -525,7 +573,9 @@ impl Snapshot {
         // strict for short titles and too lax for long ones.
         shared * 100 >= shorter * TITLE_ECHO_PERCENT
     }
+}
 
+impl Snapshot {
     /// Which region an element belongs to.
     ///
     /// The nearest named ancestor, stopping short of the window itself: the
@@ -1278,23 +1328,57 @@ impl Locator {
         let positional_id = durable(node.automation_id.as_deref())
             .is_some_and(|id| sequential_identifier(&id, nodes));
 
-        let refinements: [fn(&mut Self, &Node); 5] = if positional_id {
-            [
-                |locator, node| locator.name = non_empty(node.name.as_deref()),
-                |locator, node| locator.class_name = durable(node.class_name.as_deref()),
-                |locator, node| locator.framework_id = non_empty(node.framework_id.as_deref()),
-                |locator, node| locator.automation_id = durable(node.automation_id.as_deref()),
-                |_, _| {},
-            ]
-        } else {
-            [
-                |locator, node| locator.automation_id = durable(node.automation_id.as_deref()),
-                |locator, node| locator.name = non_empty(node.name.as_deref()),
-                |locator, node| locator.class_name = durable(node.class_name.as_deref()),
-                |locator, node| locator.framework_id = non_empty(node.framework_id.as_deref()),
-                |_, _| {},
-            ]
+        // A name that only says the window's title again identifies nothing and
+        // stops working the moment the title changes -- which for most
+        // applications is as soon as the open document or a status label does.
+        // Measured on this desktop, 28 elements across 25 windows were given the
+        // full window title as their name and only 2 of them carried an
+        // automation_id to fall back on; changing the title turned a locator that
+        // had just matched into DRIVER.NOT_FOUND, with nothing to say it had been
+        // built on something that varies.
+        //
+        // This is the judgement `region_of` already applies to region names. It
+        // was missing here, so the same echo that was refused as a region name
+        // was accepted as an element's identity.
+        //
+        // The echo is dropped rather than the element: leaving the name out lets
+        // the remaining fields and then `by_container` be tried, whereas
+        // refusing the element outright would leave it with no locator at all.
+        let title = window_title_of(nodes, &node.node_id);
+        let usable_name = |node: &Node| -> Option<String> {
+            let name = non_empty(node.name.as_deref())?;
+            match title {
+                Some(title) if restates_title(&name, title) => None,
+                _ => Some(name),
+            }
         };
+
+        let refinements: [fn(&mut Self, &Node, &dyn Fn(&Node) -> Option<String>); 5] =
+            if positional_id {
+                [
+                    |locator, node, usable| locator.name = usable(node),
+                    |locator, node, _| locator.class_name = durable(node.class_name.as_deref()),
+                    |locator, node, _| {
+                        locator.framework_id = non_empty(node.framework_id.as_deref())
+                    },
+                    |locator, node, _| {
+                        locator.automation_id = durable(node.automation_id.as_deref())
+                    },
+                    |_, _, _| {},
+                ]
+            } else {
+                [
+                    |locator, node, _| {
+                        locator.automation_id = durable(node.automation_id.as_deref())
+                    },
+                    |locator, node, usable| locator.name = usable(node),
+                    |locator, node, _| locator.class_name = durable(node.class_name.as_deref()),
+                    |locator, node, _| {
+                        locator.framework_id = non_empty(node.framework_id.as_deref())
+                    },
+                    |_, _, _| {},
+                ]
+            };
 
         // A refinement that added nothing must not count as an attempt. Where
         // the element has no automation_id, applying that step leaves the
@@ -1303,7 +1387,7 @@ impl Locator {
         // about to be tried -- the weakest locator, reached by accident.
         for refine in refinements {
             let before = candidate.clone();
-            refine(&mut candidate, node);
+            refine(&mut candidate, node, &usable_name);
             if candidate == before {
                 continue;
             }

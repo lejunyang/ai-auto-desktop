@@ -2626,3 +2626,71 @@ Billing address」和「写 `within: {name: "Billing address"}`」说的是同�
 改成 `flex: 1` + `min-height: 0`（后者是关键，否则 flex 子项最小高度是内容高度，永不收缩），
 露出 6 → 18 个。同时把「该点一个分区」这句提示从列表下方挪到上方——列表撑满后，
 它后面的东西会被推出视野。
+
+
+### 2.46 元素 locator 里的窗口标题回声
+
+**先否掉了三件我以为要做的事。** 找下一步时对照 CLI 20 命令、MCP 14 工具、GUI 13 命令，
+六条不对称里五条有正当理由：`try_locator` 就是 `find` + `expect:optional`，MCP 的
+`find_element` 已覆盖；`validate` 的作用被 `save_workflow` 的「先编译再落盘」覆盖；
+durable 用户说不考虑；`snapshot` 是原始树，AI 用 `describe` 更合适。
+
+**我还记错了一件事**：以为 MCP 的 `describe_window` 没有 region 参数。实测它有，
+而且工具描述明确写着「Call overview_window first and pass one of its regions as `region`」。
+按 AI 的真实用法（长驻进程、一轮一个动作）走完七轮——概览、找元素、写值、点击、存、解释、重跑
+——全部通过，CDP 核实写入真落地。**跨框架也全部走通**：Chrome / Win32 / WinForm / XAML /
+DirectUI / 无框架标识六种，`locator` 覆盖 100%，回找全部命中。
+
+**真缺口是在这些排除过程中量出来的**：28 个元素的 locator 把**完整窗口标题**当 name 用，
+而只有 2/28 带 `automation_id` 可兜底。真机验证：改标题前 `found=True`，
+改后 `DRIVER.NOT_FOUND`——**失效时静默**，录制当场能跑，标题一变就废。
+
+**这个判据本来就有，只装了一半。** `region_of` 早就用 `restates_window()` 排除标题回声，
+但那只用于**分区命名**，没用在 **locator 合成**上。所以同一个回声，作为分区名被拒绝，
+作为元素身份被接受。
+
+**不改签名**：`synthesize` 是 `pub` 且有 34 处调用（3 生产 + 20 测试 + 10 examples）。
+实测根节点自己带着标题——14 个窗口里 13 个的无 parent 节点 name 恰好等于窗口标题，
+唯一例外是 `pane` 根且无名（本来也没有标题可回声）。所以从 `nodes` 里读，
+把 `restates_window` 抽成自由函数 `restates_title`，两个调用者共用一个判据。
+
+**取舍：丢的是名字，不是元素。** name 这一步不产出，继续试 class_name / framework_id，
+最后仍能退到 `by_container`。拒绝整个元素会让它完全不可定位，比一个会失效的 locator 更糟。
+
+#### 判据错两次，两次都是测试先抓到
+
+**第一次：** 用「无 parent 的节点」认根，5 个测试立刻失败。查 fixture 才明白——
+`node()` helper 造的节点 `parent_id` 全是 `None`，于是第一个元素自己被当成根，
+`"Save"` 与自己比较必然相等，**正常元素被误伤**。测试在保护正确行为。
+
+**第二次：** 改成「role 为 window 的无 parent 节点」，201 个测试全绿，但真机只清掉 12 个。
+剩下的里有 2 个**真漏判**：`还原页面` 这个窗口的根是 `role=pane`，判据认不出。
+最终判据是「**恰好只有一个**无 parent 的节点时它才是根」——真实快照根唯一，
+而扁平列表里人人无 parent，这条能把两者分开，且不依赖 role。
+
+**`except` 排除自身是必要的**，否则根节点的 locator 会被自己的名字否决。而它的 name
+**必须留着**：实测 4/14 窗口里有 2 个 `role=window` 的节点，
+`{"role":"window"}` 会歧义。**稳定不等于有区分度，这次是反过来——会变的那个字段恰好是唯一有用的。**
+
+**结果**：28 → 18，剩下 18 个全是根节点自身（15 window + 3 pane）。fixture 上 74 个元素
+只剩 1 个（根 `e1`）。真机验证改标题后普通控件仍 `found=True`，整个工作流重跑
+`status=succeeded`、`executed_steps=6`、CDP 核实值真落地。
+
+### 2.47 同一个数，三个名字
+
+量 MCP 返回的命名风格时发现：**11 个工具用 snake_case，工作流那 3 个用 camelCase**，
+而 `describe_workflow` 在同一个返回里混用（`planDigest` 与 `process_name` 并列）。
+
+后果具体：同一个数（三段展开后的 action 数）有三个名字——`save_workflow.executed_steps`、
+`describe_workflow.stepCount`、`run_workflow.stepsExecuted`。**我自己因此读错键三次**，
+而读错的表现是「字段不存在」，不是「拼错了」。AI 读过 `node_id`、`snapshot_id` 之后
+会猜 `executed_steps`。
+
+**`planDigest` / `apiVersion` / `stepId` 故意不动**：它们是规范定义的持久化字段名，
+checkpoint、journal、workflow 文档都按这个名字读写，改这里就会与磁盘上的文件不一致。
+判据是「是不是规范格式」，不是「是不是 camel」。
+
+加了一个递归走完整个返回的测试守住它，`SPEC_FIELDS` 白名单里列出豁免的四个。
+
+**又踩了记过的坑**：改完 `aad-mcp` 只 build 了它，而探针跑的 `aad.exe` 来自 `aad-cli`,
+第一次验证仍报旧键名。
