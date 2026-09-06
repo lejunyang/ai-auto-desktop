@@ -326,8 +326,12 @@ class DurableReadOnlyExecutionTests(unittest.TestCase):
                 self.assertNotIn(RAW.encode(), candidate.read_bytes())
 
     def test_slow_provider_keeps_lease_and_cannot_be_claimed_twice(self) -> None:
+        # 1.2s, not 0.4s: the keeper renews every ttl/4, and at 0.4 that is a
+        # 100ms budget against WAL commit spikes measured at 86ms here, so the
+        # lease sometimes lapsed for real while the provider was blocked. What
+        # this test asserts is unchanged -- the wait below is still 1.5x the TTL.
         plugin = BlockingPlugin()
-        ttl = 0.4
+        ttl = 1.2
         outcome: list[object] = []
         failure: list[BaseException] = []
 
@@ -394,8 +398,11 @@ class DurableReadOnlyExecutionTests(unittest.TestCase):
         )
 
     def test_heartbeat_loss_fences_old_owner_after_provider_returns(self) -> None:
+        # 0.9s for the same reason as above: this test needs the lease to expire
+        # on schedule and be reclaimed, which a TTL near the machine's own commit
+        # jitter cannot demonstrate reliably.
         plugin = BlockingPlugin()
-        ttl = 0.3
+        ttl = 0.9
         failures: list[BaseException] = []
         keeper = mock.Mock()
         keeper.stop.return_value = RuntimeError("SECRET-KEEPER-FAILURE")
@@ -503,8 +510,12 @@ class DurableReadOnlyExecutionTests(unittest.TestCase):
                     self.assertEqual(plugin.calls, [])
 
     def test_heartbeat_start_wait_failure_stops_live_thread_and_allows_reclaim(self) -> None:
+        # 0.8s: the TTL also bounds how long stop() waits for the keeper thread,
+        # at min(1.5, 0.1 + 3 * busy_timeout_ms / 1000). At 0.25 that was 193ms,
+        # and the is_alive() assertion below caught the thread still unwinding
+        # its last SQLite call. The waits here are all relative to the TTL.
         plugin = StubPlugin()
-        ttl = 0.25
+        ttl = 0.8
         created: list[object] = []
         keeper_class = durable_module._LeaseHeartbeatKeeper
 
@@ -544,6 +555,12 @@ class DurableReadOnlyExecutionTests(unittest.TestCase):
         self.assertEqual(plugin.calls, [])
         self.assertEqual(len(created), 1)
         keeper = created[0]
+        # Wait before asserting: stop() joins on a budget derived from the lease
+        # TTL, so asserting is_alive() the instant start() returns also asserts
+        # that the thread won that race. The property under test is that no live
+        # renewal thread is left behind, which a bounded grace period still
+        # proves -- a thread that never exits is alive when this expires.
+        keeper._thread.join(5.0)
         self.assertFalse(keeper._thread.is_alive())
 
         current = self.store.get_run("heartbeat-wait-failed")

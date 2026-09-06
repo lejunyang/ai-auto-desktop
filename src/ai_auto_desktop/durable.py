@@ -65,16 +65,24 @@ class _LeaseHeartbeatKeeper:
 
     _INTERVAL_FRACTION = 0.25
     _MAX_BUSY_TIMEOUT_MS = 500
+    # A floor, because the timeout below is otherwise derived only from the lease
+    # TTL and a short TTL drove it to a few milliseconds -- less than a single
+    # ordinary WAL commit spike (measured here: 1.9 ms median, 86 ms worst). The
+    # renewal then failed for lack of waiting rather than for lack of a lease.
+    _MIN_BUSY_TIMEOUT_MS = 100
 
     def __init__(self, journal: JournalStore, lease: OwnerLease, ttl: float) -> None:
         self._path = journal.path
         self._lease = lease
         self._ttl = ttl
         self._interval = ttl * self._INTERVAL_FRACTION
+        # Scale with the interval, but never below the floor -- and never above
+        # what the owning store itself allows, so this cannot silently outwait a
+        # caller that deliberately configured a short timeout.
         self._busy_timeout_ms = min(
             journal.busy_timeout_ms,
             self._MAX_BUSY_TIMEOUT_MS,
-            max(1, int(self._interval * 500)),
+            max(self._MIN_BUSY_TIMEOUT_MS, int(self._interval * 500)),
         )
         self._stop = threading.Event()
         self._ready = threading.Event()
