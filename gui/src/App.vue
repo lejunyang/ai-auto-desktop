@@ -1,11 +1,12 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, reactive, ref, shallowRef } from "vue";
+import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref,
+  shallowRef, watch } from "vue";
 import AppList from "./components/AppList.vue";
 import OutlineView from "./components/OutlineView.vue";
 import StepList from "./components/StepList.vue";
 import FailureBanner from "./components/FailureBanner.vue";
 import { asFailure, bridge, type DriverFailure, type Element, type Outline,
-  type SavedRecording, type WindowInfo }
+  type RunOutcome, type SavedRecording, type WindowInfo }
   from "./bridge";
 import { Recording } from "./recording";
 
@@ -19,6 +20,8 @@ const exported = ref<string | null>(null);
 const saving = ref(false);
 const saved = ref<string | null>(null);
 const browsing = ref(false);
+const replaying = ref(false);
+const outcome = ref<RunOutcome | null>(null);
 const savedRecordings = ref<SavedRecording[]>([]);
 const savedDirectory = ref("");
 
@@ -262,6 +265,45 @@ async function save(): Promise<void> {
   saving.value = false;
 }
 
+/**
+ * Replay what is being edited, without saving it first.
+ *
+ * The point of this button is trying a correction, and requiring a save for every
+ * attempt would turn one experiment into a trail of files. What runs is the
+ * recording as it stands, compiled the same way saving compiles it.
+ */
+async function replay(): Promise<void> {
+  replaying.value = true;
+  outcome.value = null;
+  await guard(async () => {
+    outcome.value = await bridge.runWorkflow(recording.toDescriptor(recording.name));
+  });
+  replaying.value = false;
+}
+
+/** The step a run stopped at, so the list can point at it. */
+const stumbled = computed(() => {
+  const steps = outcome.value?.steps ?? [];
+  return steps.find((step) => step.status === "failed")?.id ?? null;
+});
+
+/**
+ * Bring the failed step into view.
+ *
+ * The list scrolls once a replay is long enough, and highlighting a row that is
+ * below the fold helps nobody: a twenty-step recording expands to sixty rows, so
+ * the one that matters is usually not among the first twelve.
+ */
+watch(stumbled, async (id) => {
+  if (!id) {
+    return;
+  }
+  await nextTick();
+  document
+    .querySelector(".outcome .steps li.stumbled")
+    ?.scrollIntoView({ block: "nearest" });
+});
+
 async function refreshSaved(): Promise<void> {
   await guard(async () => {
     const listed = await bridge.listRecordings();
@@ -322,6 +364,17 @@ onBeforeUnmount(() => {
       <button v-else class="recording" @click="stopCapture">
         ■ Stop ({{ capture.adopted }})
       </button>
+      <button
+        @click="replay"
+        :disabled="replaying || !recording.canExport"
+        :title="
+          recording.canExport
+            ? 'Run these steps now and report how each one went'
+            : 'Some steps still need work before they can run'
+        "
+      >
+        {{ replaying ? "Running…" : "▶ Try it" }}
+      </button>
       <button @click="save" :disabled="saving || !recording.steps.length">
         {{ saving ? "Saving…" : "Save" }}
       </button>
@@ -330,6 +383,36 @@ onBeforeUnmount(() => {
 
     <div class="banner" v-if="failure">
       <FailureBanner :failure="failure" @dismiss="failure = null" />
+    </div>
+
+    <div class="banner outcome" v-if="outcome" :class="outcome.status">
+      <div class="verdict">
+        <strong>{{ outcome.status === "succeeded" ? "Ran" : "Stopped" }}</strong>
+        <!-- How many ran, not just whether it finished: a run that wrote a value
+             and failed to submit will write it twice if retried blindly. -->
+        <span>{{ outcome.executed_steps }} of {{ outcome.steps.length }} steps</span>
+        <span class="took">{{ outcome.duration_seconds.toFixed(1) }}s</span>
+        <button class="dismiss" @click="outcome = null">Dismiss</button>
+      </div>
+      <p class="why" v-if="outcome.error">
+        {{ outcome.error.message }}
+        <em v-if="outcome.error.effect === 'applied'">
+          — the desktop was already changed, so running this again repeats it
+        </em>
+        <em v-else-if="outcome.error.effect === 'not_applied'">
+          — nothing was changed by the step that failed
+        </em>
+      </p>
+      <ol class="steps">
+        <li
+          v-for="step in outcome.steps"
+          :key="step.id"
+          :class="[step.status, { stumbled: step.id === stumbled }]"
+        >
+          <code>{{ step.id }}</code>
+          <span>{{ step.status }}</span>
+        </li>
+      </ol>
     </div>
 
     <div class="banner live" v-if="capture">
@@ -453,6 +536,62 @@ onBeforeUnmount(() => {
 
 .name input {
   width: 220px;
+}
+
+.outcome {
+  border-left: 3px solid #6b7280;
+  padding: 0.5rem 0.75rem;
+  font-size: 0.85rem;
+}
+.outcome.succeeded {
+  border-left-color: #16a34a;
+}
+.outcome.failed {
+  border-left-color: #dc2626;
+}
+.outcome .verdict {
+  display: flex;
+  gap: 0.75rem;
+  align-items: baseline;
+}
+.outcome .took {
+  color: #6b7280;
+}
+.outcome .dismiss {
+  margin-left: auto;
+}
+.outcome .why {
+  margin: 0.35rem 0;
+}
+.outcome .why em {
+  color: #6b7280;
+  font-style: normal;
+}
+.outcome .steps {
+  margin: 0.35rem 0 0;
+  padding-left: 1.25rem;
+  display: grid;
+  gap: 0.1rem;
+  /* Measured: each row is 15px, so a twenty-step recording expands to sixty
+     executed steps and a panel 107% of the window's height, pushing the three
+     columns off screen entirely. Twelve rows is four recorded actions, enough to
+     see a typical replay whole; beyond that this scrolls and the failed step is
+     brought into view rather than the layout giving way. */
+  max-height: 12rem;
+  overflow-y: auto;
+}
+.outcome .steps li {
+  display: flex;
+  gap: 0.5rem;
+}
+.outcome .steps li.failed span {
+  color: #dc2626;
+  font-weight: 600;
+}
+/* The step it stopped at, so the eye goes there rather than counting down the
+   list to find the one that is not green. */
+.outcome .steps li.stumbled {
+  background: #fef2f2;
 }
 
 .live {

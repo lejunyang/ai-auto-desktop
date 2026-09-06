@@ -264,6 +264,19 @@ export const bridge = {
       workflow,
     }),
 
+  /**
+   * Replay a workflow and report how every step went.
+   *
+   * The per-step outcomes are the point, not the overall status: a replay that
+   * finds the wrong element still reports success at the run level, and catching
+   * exactly that is why one would replay inside the editor. A run that stops
+   * partway says which step failed and how many ran, which is what decides
+   * whether trying again is safe -- a step that wrote a value but never submitted
+   * it will write it twice.
+   */
+  runWorkflow: (workflow: unknown, inputs?: Record<string, unknown>) =>
+    call<RunOutcome>("run_workflow", { workflow, inputs: inputs ?? null }),
+
   loadRecording: (path: string) => call<unknown>("load_recording", { path }),
 
   listRecordings: () =>
@@ -271,6 +284,30 @@ export const bridge = {
 };
 
 /** One saved recording, as offered in the open list. */
+/** How one step of a replay went. */
+export interface StepOutcome {
+  id: string;
+  status: "succeeded" | "failed" | string;
+  error?: { code?: string; message?: string } | null;
+}
+
+/** What came back from replaying a workflow. */
+export interface RunOutcome {
+  run_id: string;
+  workflow: string;
+  status: "succeeded" | "failed" | string;
+  executed_steps: number;
+  duration_seconds: number;
+  steps: StepOutcome[];
+  error?: {
+    code: string;
+    message: string;
+    retryable?: boolean;
+    /** Whether the desktop was already changed; the one thing a reader cannot re-derive. */
+    effect?: string;
+  } | null;
+}
+
 export interface SavedRecording {
   name: string;
   path: string;

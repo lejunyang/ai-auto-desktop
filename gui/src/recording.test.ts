@@ -305,16 +305,20 @@ describe("compiling to a workflow", () => {
     expect(find.locator).toEqual({ role: "Button", name: "Save" });
   });
 
-  it("identifies the window by class rather than by its title", () => {
-    // A title changes as soon as the document is edited or renamed; a window
-    // class does not.
+  it("identifies the window by its process when that is enough", () => {
+    // Not by class. A class name asks the wrong question -- whether the value
+    // survives a restart, which Chrome's does -- when what decides a selector is
+    // whether it tells this window from the others. Measured on this machine: 20
+    // of 24 windows share their class with something else, Chrome_WidgetWin_1
+    // alone covering eight, so a selector built on it acts on whichever the
+    // platform lists first without saying so.
     const recording = new Recording();
     recording.add(draft());
 
     const steps = recording.toDescriptor().steps as Record<string, unknown>[];
     const snapshot = steps[0].with as Record<string, unknown>;
 
-    expect(snapshot.window).toEqual({ class_name: "EditorClass" });
+    expect(snapshot.window).toEqual({ process_name: "editor.exe" });
   });
 
   it("skips a class name the toolkit regenerates on every run", () => {
@@ -335,13 +339,17 @@ describe("compiling to a workflow", () => {
     expect(selector?.process_name).toBe("fixture.exe");
   });
 
-  it("still uses a class name that survives a restart", () => {
-    // The other half. Discarding every class name would weaken the selector for
-    // the majority of windows: of twenty open on the test machine, only the
-    // WinForms one was volatile.
+  it("never names a class, however stable that class looks", () => {
+    // The earlier version of this kept class names that survive a restart, and
+    // that observation still holds: of 24 windows open here only the six WinForms
+    // ones carry a regenerated suffix. But surviving is not the same as
+    // distinguishing, and every name below is shared -- Chrome_WidgetWin_1 by
+    // eight windows, CabinetWClass by two. Dropping them costs nothing that was
+    // measured: not one window on this machine was identifiable by class and by
+    // nothing else.
     for (const className of ["Notepad", "Chrome_WidgetWin_1", "XLMAIN", "CabinetWClass"]) {
       const target = windowInfo({ class_name: className });
-      expect(selectorFor(target, [target])?.class_name).toBe(className);
+      expect(selectorFor(target, [target])).not.toHaveProperty("class_name");
     }
   });
 
@@ -379,7 +387,7 @@ describe("compiling to a workflow", () => {
     const steps = recording.toDescriptor().steps as Record<string, unknown>[];
     const selector = (steps[0].with as Record<string, unknown>).window as
       Record<string, string>;
-    expect(selector.class_name).toBe("EditorClass");
+    expect(selector).not.toHaveProperty("class_name");
     expect(selector.process_name).toBe("editor.exe");
     // A title is present and it is what separates the two windows. The exact
     // fragment is not asserted -- the requirement is that it distinguishes,
@@ -403,7 +411,6 @@ describe("compiling to a workflow", () => {
 
     const steps = recording.toDescriptor().steps as Record<string, unknown>[];
     expect((steps[0].with as Record<string, unknown>).window).toEqual({
-      class_name: "Shared",
       process_name: "editor.exe",
     });
   });
@@ -1442,5 +1449,69 @@ it("leaves steps from an earlier session alone", () => {
 
     expect(recording.steps[0].window).toBeNull();
     expect(recording.steps[0].enabled).toBe(false);
+  });
+});
+
+describe("replaying from the editor", () => {
+  it("hands the compiled workflow to the backend under the name it expects", async () => {
+    // The seam between the button and the command. A wrong parameter name fails
+    // silently -- the backend simply reports no workflow was supplied -- and only
+    // at runtime.
+    const calls: { command: string; args?: Record<string, unknown> }[] = [];
+    setInvoker(async (command, args) => {
+      calls.push({ command, args });
+      return {
+        run_id: "r1",
+        workflow: "demo",
+        status: "succeeded",
+        executed_steps: 3,
+        duration_seconds: 0.5,
+        steps: [{ id: "step_1", status: "succeeded" }],
+      };
+    });
+
+    const recording = new Recording();
+    recording.add(draft());
+    const outcome = await bridge.runWorkflow(recording.toDescriptor("demo"));
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0].command).toBe("run_workflow");
+    expect(calls[0].args).toHaveProperty("workflow");
+    const sent = calls[0].args!.workflow as Record<string, unknown>;
+    expect(sent.kind).toBe("Workflow");
+    expect((sent.metadata as Record<string, string>).name).toBe("demo");
+    expect(outcome.status).toBe("succeeded");
+    setInvoker(null);
+  });
+
+  it("reports every step, not only the overall verdict", async () => {
+    // A replay that finds the wrong element still succeeds at the run level, and
+    // seeing that is the reason to replay inside the editor at all.
+    setInvoker(async () => ({
+      run_id: "r2",
+      workflow: "demo",
+      status: "failed",
+      executed_steps: 5,
+      duration_seconds: 1.2,
+      steps: [
+        { id: "step_1_window", status: "succeeded" },
+        { id: "step_1_element", status: "succeeded" },
+        { id: "step_1", status: "succeeded" },
+        { id: "step_2_window", status: "succeeded" },
+        { id: "step_2_element", status: "failed", error: { code: "DRIVER.NOT_FOUND" } },
+      ],
+      error: { code: "DRIVER.NOT_FOUND", message: "no element matched", effect: "not_applied" },
+    }));
+
+    const outcome = await bridge.runWorkflow({});
+
+    // Which step, and how far it got: a run that wrote a value and failed to
+    // submit writes it twice if retried blindly.
+    expect(outcome.executed_steps).toBe(5);
+    const failed = outcome.steps.filter((step) => step.status === "failed");
+    expect(failed).toHaveLength(1);
+    expect(failed[0].id).toBe("step_2_element");
+    expect(outcome.error?.effect).toBe("not_applied");
+    setInvoker(null);
   });
 });
