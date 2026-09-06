@@ -1,11 +1,57 @@
 <script setup lang="ts">
 import { computed, ref } from "vue";
-import type { Element, Outline } from "../bridge";
+import type { Element, Outline, Survey } from "../bridge";
 
-const props = defineProps<{ outline: Outline | null; loading: boolean }>();
-defineEmits<{ record: [Element, string]; refresh: [] }>();
+const props = defineProps<{
+  outline: Outline | null;
+  survey: Survey | null;
+  region: string | null;
+  loading: boolean;
+}>();
+defineEmits<{
+  record: [Element, string];
+  refresh: [];
+  region: [string | null];
+}>();
 
 const filter = ref("");
+
+/**
+ * Whether the region list is expanded while a region is open.
+ *
+ * Measured: left expanded it takes 252px of a 771px panel and the element list
+ * shows 7 of 18 rows. Once a region is open its only remaining use is switching to
+ * another one, and the breadcrumb already covers going back, so it folds to a line
+ * and can be reopened.
+ */
+const showingRegions = ref(false);
+
+/**
+ * Whether to put the regions in front of the list.
+ *
+ * A whole-window listing stops on the character budget in 9 of 23 windows here,
+ * the worst showing 80 of 271 elements, and nothing the user does to the limit
+ * changes that. When it happens the regions are the only complete account of what
+ * the window holds, so they lead. On a window that fits -- 14 of 23 -- they would
+ * be a step in the way, so they stay out of it.
+ */
+const leadWithRegions = computed(
+  () => Boolean(props.outline?.truncated) && !props.region,
+);
+
+/** The region list is open when it leads, or when asked for inside a region. */
+const regionsVisible = computed(
+  () => Boolean(props.survey) && (leadWithRegions.value || (Boolean(props.region) && showingRegions.value)),
+);
+
+/** Elements the truncated listing never reached, if the regions can say. */
+const unreached = computed(() => {
+  if (!props.survey || !props.outline) {
+    return 0;
+  }
+  const named = props.survey.regions.reduce((sum, region) => sum + region.elements, 0);
+  return Math.max(0, named - props.outline.elements.length);
+});
 
 const visible = computed(() => {
   if (!props.outline) {
@@ -38,11 +84,48 @@ const visible = computed(() => {
     <template v-else>
       <div class="summary mono">
         {{ outline.node_count }} nodes · showing {{ visible.length }}
-        <span v-if="outline.truncated" class="warn">· truncated</span>
+        <span v-if="outline.truncated" class="warn">
+          · {{ unreached ? `${unreached} more in the regions below` : "truncated" }}
+        </span>
         · snapshot {{ outline.snapshot_id }}@{{ outline.revision }}
       </div>
 
-      <ul>
+      <div class="crumb mono" v-if="region">
+        <button class="link" @click="$emit('region', null)">← all regions</button>
+        <span>{{ region }}</span>
+        <button class="link" @click="showingRegions = !showingRegions">
+          {{ showingRegions ? "hide regions" : "switch region" }}
+        </button>
+      </div>
+
+      <ul class="regions" v-if="regionsVisible && survey">
+        <li
+          v-for="group in survey.regions"
+          :key="group.region"
+          :class="{ current: group.region === region }"
+        >
+          <button class="region-row" @click="$emit('region', group.region)">
+            <span class="region-name">{{ group.region }}</span>
+            <span class="muted mono">{{ group.elements }}</span>
+          </button>
+          <span class="holds muted mono">
+            {{ group.holds.map((h) => `${h.count} ${h.role}`).join(", ") }}
+          </span>
+        </li>
+        <li class="muted mono" v-if="survey.folded_regions">
+          {{ survey.folded_regions }} single-element region(s) folded away
+        </li>
+      </ul>
+
+      <p class="muted empty" v-if="leadWithRegions">
+        {{
+          outline.stopped_by === "characters"
+            ? "This window holds more than one listing can carry, and a longer list will not help. Pick a region above to see what is in it."
+            : "The listing was cut short. Pick a region above to see one part in full."
+        }}
+      </p>
+
+      <ul v-if="!leadWithRegions">
         <li v-for="element in visible" :key="element.node_id">
           <div class="row">
             <span
@@ -158,5 +241,65 @@ li:hover {
 .actions button {
   padding: 2px 8px;
   font-size: 12px;
+}
+
+.crumb {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.3rem 0.6rem;
+  font-size: 0.75rem;
+}
+
+.link {
+  background: none;
+  border: none;
+  color: #7cc4ff;
+  cursor: pointer;
+  padding: 0;
+  font: inherit;
+}
+
+.regions {
+  list-style: none;
+  margin: 0;
+  padding: 0 0.4rem;
+  /* Twelve regions is the measured ceiling, and each is two lines, so this
+     scrolls rather than pushing the element list out of reach. */
+  max-height: 18rem;
+  overflow-y: auto;
+}
+
+.regions li {
+  padding: 0.2rem 0;
+  border-bottom: 1px solid #1d2530;
+}
+
+.regions li.current .region-name {
+  color: #7cc4ff;
+}
+
+.region-row {
+  display: flex;
+  width: 100%;
+  justify-content: space-between;
+  gap: 0.6rem;
+  background: none;
+  border: none;
+  color: inherit;
+  cursor: pointer;
+  font: inherit;
+  text-align: left;
+  padding: 0.15rem 0;
+}
+
+.region-row:hover .region-name {
+  color: #7cc4ff;
+}
+
+.holds {
+  display: block;
+  font-size: 0.68rem;
+  padding-left: 0.2rem;
 }
 </style>

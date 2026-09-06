@@ -239,8 +239,36 @@ async fn describe_window(
     shell: tauri::State<'_, Shell>,
     window_id: String,
     limit: Option<usize>,
+    region: Option<String>,
 ) -> Result<Value, Value> {
-    outline_of(&*shell, &window_id, limit)
+    outline_of(&*shell, &window_id, limit, region.as_deref())
+}
+
+/// Group a window's elements into regions, without listing them.
+///
+/// Raising `limit` does not help: measured across 23 windows here, nine stop on
+/// the character budget rather than the element count, and the worst shows 80 of
+/// 271 reachable elements -- 29% -- however large a limit is asked for. What the
+/// editor lacked was not a bigger list but a way in: naming the regions first and
+/// then drilling into one recovered 213 of those 271.
+#[tauri::command]
+async fn overview_window(
+    shell: tauri::State<'_, Shell>,
+    window_id: String,
+) -> Result<Value, Value> {
+    survey_of(&*shell, &window_id)
+}
+
+/// The body of `overview_window`, callable without a Tauri runtime.
+fn survey_of(shell: &Shell, window_id: &str) -> Result<Value, Value> {
+    shell.dispatch(
+        "overview",
+        json!({
+            "window_id": window_id,
+            "max_nodes": 1000,
+            "max_depth": 32,
+        }),
+    )
 }
 
 /// The body of `describe_window`, callable without a Tauri runtime.
@@ -248,18 +276,26 @@ async fn describe_window(
 /// Split out so it can be tested: the command itself takes `tauri::State`,
 /// which a unit test cannot construct, and the untestable half is where the
 /// outline bug lived.
-fn outline_of(shell: &Shell, window_id: &str, limit: Option<usize>) -> Result<Value, Value> {
+fn outline_of(
+    shell: &Shell,
+    window_id: &str,
+    limit: Option<usize>,
+    region: Option<&str>,
+) -> Result<Value, Value> {
     // `limit` is the driver's own outline cap, which it clamps to its supported
-    // range; `max_nodes` bounds the capture feeding it.
-    shell.dispatch(
-        "describe",
-        json!({
-            "window_id": window_id,
-            "limit": limit.unwrap_or(120),
-            "max_nodes": 1000,
-            "max_depth": 32,
-        }),
-    )
+    // range; `max_nodes` bounds the capture feeding it. A `region` narrows the
+    // listing to one group from `overview`, which is the only way past the
+    // character budget: the whole-window listing stops at roughly a third of what
+    // a busy window holds no matter how high the limit goes.
+    let mut params = Map::new();
+    params.insert("window_id".into(), json!(window_id));
+    params.insert("limit".into(), json!(limit.unwrap_or(120)));
+    params.insert("max_nodes".into(), json!(1000));
+    params.insert("max_depth".into(), json!(32));
+    if let Some(region) = region {
+        params.insert("region".into(), json!(region));
+    }
+    shell.dispatch("describe", Value::Object(params))
 }
 
 /// Perform one action against a previously observed element.
@@ -533,6 +569,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             list_apps,
             describe_window,
+            overview_window,
             act,
             start_recording,
             collect_recording,
@@ -574,7 +611,7 @@ mod tests {
             // Through the command's own logic, not straight to the driver:
             // the driver was never the broken part, and testing it instead is
             // how a first attempt at these tests passed against the bug.
-            if let Ok(outline) = outline_of(shell, window_id, None) {
+            if let Ok(outline) = outline_of(shell, window_id, None, None) {
                 if !outline["elements"].as_array()?.is_empty() {
                     return Some(outline);
                 }

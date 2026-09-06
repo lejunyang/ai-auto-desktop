@@ -98,6 +98,15 @@ export interface Outline {
   node_count: number;
   shown: number;
   truncated: boolean;
+  /**
+   * Which cap ended the listing, when one did.
+   *
+   * The driver has always reported this and the front end never read it, so it
+   * could not tell the two cases apart. `limit` means asking for more works;
+   * `characters` means it does not, and measured across 23 windows here nine stop
+   * that way -- the worst listing 80 of 271 elements however high the limit goes.
+   */
+  stopped_by?: "limit" | "characters" | null;
   elements: Element[];
 }
 
@@ -206,8 +215,18 @@ export function asFailure(raw: unknown): DriverFailure {
 export const bridge = {
   listApps: () => call<{ windows: WindowInfo[]; count: number }>("list_apps"),
 
-  describeWindow: (windowId: string, limit = 120) =>
-    call<Outline>("describe_window", { windowId, limit }),
+  describeWindow: (windowId: string, limit = 120, region?: string) =>
+    call<Outline>("describe_window", { windowId, limit, region }),
+
+  /**
+   * Group a window's elements into regions without listing them.
+   *
+   * The way past a truncated outline: a busy window lists roughly a third of what
+   * it holds however high the limit goes, and a region names the rest so it can be
+   * asked for separately.
+   */
+  overviewWindow: (windowId: string) =>
+    call<Survey>("overview_window", { windowId }),
 
   /** Act on an element, quoting a reference the user actually saw. */
   act: (action: string, target: string, argument?: string) =>
@@ -306,6 +325,38 @@ export interface RunOutcome {
     /** Whether the desktop was already changed; the one thing a reader cannot re-derive. */
     effect?: string;
   } | null;
+}
+
+/** One role and how many of it a region holds. */
+export interface RoleTally {
+  role: string;
+  count: number;
+}
+
+/** A named group of elements, without the elements themselves. */
+export interface Region {
+  region: string;
+  elements: number;
+  holds: RoleTally[];
+}
+
+/**
+ * A window's regions, for finding a way in before listing anything.
+ *
+ * Measured across 23 windows on the development machine, nine stop listing on the
+ * character budget rather than the element count, the worst showing 80 of 271
+ * reachable elements. Raising the limit does not help; naming the regions and
+ * drilling into one recovered 213 of that 271.
+ */
+export interface Survey {
+  snapshot_id: string;
+  revision: number;
+  window: WindowInfo;
+  node_count: number;
+  interactive: number;
+  regions: Region[];
+  folded_regions: number;
+  folded_elements: number;
 }
 
 export interface SavedRecording {

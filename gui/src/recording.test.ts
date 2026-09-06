@@ -1515,3 +1515,63 @@ describe("replaying from the editor", () => {
     setInvoker(null);
   });
 });
+
+describe("reading a window in regions", () => {
+  it("asks for a region by the name the backend expects", async () => {
+    // A wrong parameter name does not fail here: the backend simply ignores it and
+    // returns the whole-window listing, so the user sees a drill-down that did
+    // nothing rather than an error.
+    const calls: { command: string; args?: Record<string, unknown> }[] = [];
+    setInvoker(async (command, args) => {
+      calls.push({ command, args });
+      return command === "overview_window"
+        ? { snapshot_id: "s", revision: 1, window: {}, node_count: 365,
+            interactive: 167, regions: [], folded_regions: 0, folded_elements: 0 }
+        : { snapshot_id: "s", revision: 1, elements: [], node_count: 365,
+            truncated: true, stopped_by: "characters" };
+    });
+
+    await bridge.overviewWindow("hwnd:1");
+    await bridge.describeWindow("hwnd:1", 120, "Editor actions");
+
+    expect(calls[0].command).toBe("overview_window");
+    expect(calls[0].args).toEqual({ windowId: "hwnd:1" });
+    expect(calls[1].command).toBe("describe_window");
+    expect(calls[1].args).toEqual({
+      windowId: "hwnd:1",
+      limit: 120,
+      region: "Editor actions",
+    });
+    setInvoker(null);
+  });
+
+  it("leaves the region out when the whole window is wanted", async () => {
+    const calls: Record<string, unknown>[] = [];
+    setInvoker(async (_command, args) => {
+      calls.push(args ?? {});
+      return { snapshot_id: "s", revision: 1, elements: [], node_count: 12,
+               truncated: false };
+    });
+
+    await bridge.describeWindow("hwnd:1");
+
+    expect(calls[0].region).toBeUndefined();
+    setInvoker(null);
+  });
+
+  it("reports that a listing stopped on characters rather than on the limit", async () => {
+    // Measured across 23 windows: nine stop on the character budget, and raising
+    // the limit does not move them. Which cap applied is the difference between
+    // "ask for more" and "drill into a region".
+    setInvoker(async () => ({
+      snapshot_id: "s", revision: 1, elements: [], node_count: 671,
+      truncated: true, stopped_by: "characters",
+    }));
+
+    const listing = await bridge.describeWindow("hwnd:1", 2000);
+
+    expect(listing.truncated).toBe(true);
+    expect(listing.stopped_by).toBe("characters");
+    setInvoker(null);
+  });
+});

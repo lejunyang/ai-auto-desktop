@@ -6,13 +6,15 @@ import OutlineView from "./components/OutlineView.vue";
 import StepList from "./components/StepList.vue";
 import FailureBanner from "./components/FailureBanner.vue";
 import { asFailure, bridge, type DriverFailure, type Element, type Outline,
-  type RunOutcome, type SavedRecording, type WindowInfo }
+  type RunOutcome, type SavedRecording, type Survey, type WindowInfo }
   from "./bridge";
 import { Recording } from "./recording";
 
 const windows = ref<WindowInfo[]>([]);
 const selected = ref<WindowInfo | null>(null);
 const outline = shallowRef<Outline | null>(null);
+const survey = shallowRef<Survey | null>(null);
+const region = ref<string | null>(null);
 const failure = ref<DriverFailure | null>(null);
 const loadingApps = ref(false);
 const loadingOutline = ref(false);
@@ -197,6 +199,9 @@ async function refreshApps(): Promise<void> {
 
 async function select(window: WindowInfo): Promise<void> {
   selected.value = window;
+  // A region name from the previous window means nothing here.
+  region.value = null;
+  survey.value = null;
   await readOutline();
 }
 
@@ -207,9 +212,24 @@ async function readOutline(): Promise<void> {
   loadingOutline.value = true;
   outline.value = null;
   await guard(async () => {
-    outline.value = await bridge.describeWindow(selected.value!.window_id);
+    const id = selected.value!.window_id;
+    // Both at once. Whether a listing is truncated is only known once it comes
+    // back, and asking for the regions at that point would show the user an
+    // incomplete list that then rearranges itself. They read the same capture.
+    const [listing, groups] = await Promise.all([
+      bridge.describeWindow(id, 120, region.value ?? undefined),
+      bridge.overviewWindow(id),
+    ]);
+    outline.value = listing;
+    survey.value = groups;
   });
   loadingOutline.value = false;
+}
+
+/** Narrow the listing to one region, or widen it back to the whole window. */
+async function drillInto(name: string | null): Promise<void> {
+  region.value = name;
+  await readOutline();
 }
 
 function record(element: Element, action: string): void {
@@ -449,9 +469,12 @@ onBeforeUnmount(() => {
 
       <OutlineView
         :outline="outline"
+        :survey="survey"
+        :region="region"
         :loading="loadingOutline"
         @record="record"
         @refresh="readOutline"
+        @region="drillInto"
       />
 
       <StepList
