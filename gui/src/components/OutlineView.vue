@@ -98,6 +98,14 @@ const visible = computed(() => {
         </button>
       </div>
 
+      <p class="muted lead" v-if="leadWithRegions">
+        {{
+          outline.stopped_by === "characters"
+            ? "This window holds more than one listing can carry, and a longer list will not help. Pick a region to see what is in it."
+            : "The listing was cut short. Pick a region to see one part in full."
+        }}
+      </p>
+
       <ul class="regions" v-if="regionsVisible && survey">
         <li
           v-for="group in survey.regions"
@@ -117,13 +125,7 @@ const visible = computed(() => {
         </li>
       </ul>
 
-      <p class="muted empty" v-if="leadWithRegions">
-        {{
-          outline.stopped_by === "characters"
-            ? "This window holds more than one listing can carry, and a longer list will not help. Pick a region above to see what is in it."
-            : "The listing was cut short. Pick a region above to see one part in full."
-        }}
-      </p>
+
 
       <ul v-if="!leadWithRegions">
         <li v-for="element in visible" :key="element.node_id">
@@ -264,10 +266,22 @@ li:hover {
   list-style: none;
   margin: 0;
   padding: 0 0.4rem;
-  /* Twelve regions is the measured ceiling, and each is two lines, so this
-     scrolls rather than pushing the element list out of reach. */
-  max-height: 18rem;
+  /* Takes the space that is there rather than a fixed ceiling. The previous
+     18rem was set when a window offered at most twelve regions; splitting the
+     unattributed one by role takes that to 24, and the fixed height then showed
+     6 of them with 456px of the panel sitting empty below. `min-height: 0` is
+     what lets a flex child shrink at all -- without it the minimum is the
+     content height and the list never scrolls. */
+  flex: 1;
+  min-height: 0;
   overflow-y: auto;
+}
+
+.lead {
+  padding: 0.3rem 0.6rem 0;
+  margin: 0;
+  /* Above the list, not below it: the list now fills the panel, so anything
+     after it is pushed out of sight. */
 }
 
 .regions li {

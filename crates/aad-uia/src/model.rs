@@ -357,42 +357,132 @@ impl Snapshot {
             }
         }
 
+        // The unattributed region has no container name to narrow it, so on a
+        // busy window it grows past what one listing can carry and the tail is
+        // dropped on every read. Measured on three VS Code windows it held 77 to
+        // 90 elements while the listing reached 66 to 68, and every element lost
+        // had a name. Splitting it by role gives groups that each fit, so the
+        // elements at the tail become reachable.
+        //
+        // The whole region is not kept alongside the split: keeping it would keep
+        // the path that truncates, and an agent following it would still see only
+        // two thirds. A route that does not arrive is worse than no route.
+        // The unattributed region has no container name to narrow it, so on a busy
+        // window it outgrows what one listing can carry and the tail is dropped on
+        // every read: measured on three VS Code windows it held 77 to 90 elements
+        // while the listing reached 66 to 68, and every element lost had a name.
+        // Splitting it by role gives groups that each fit.
+        //
+        // The groups are held aside rather than mixed into the competition for the
+        // twelve seats. They are a fallback -- "the rest, grouped by kind" -- not
+        // places in the window, and letting them compete cost both sides: five
+        // groups won seats, four named containers lost theirs, and 28 elements of
+        // the region were still unreachable.
+        let mut loose_groups: Vec<(String, Vec<&Node>)> = Vec::new();
+        let mut folded_roles = 0usize;
+        let mut folded_role_elements = 0usize;
+        if let Some(at) = index.get(LOOSE_IN_WINDOW).copied() {
+            if regions[at].1.len() > SPLIT_LOOSE_ABOVE {
+                let (_, members) = regions.remove(at);
+                let held = members.len();
+                let mut where_role: std::collections::HashMap<&str, usize> = Default::default();
+                for node in members {
+                    let role = node.role.as_str();
+                    match where_role.get(role) {
+                        Some(seat) => loose_groups[*seat].1.push(node),
+                        None => {
+                            where_role.insert(role, loose_groups.len());
+                            loose_groups.push((
+                                format!("{LOOSE_IN_WINDOW}{REGION_ROLE_SEPARATOR}{role}"),
+                                vec![node],
+                            ));
+                        }
+                    }
+                }
+                loose_groups.sort_by_key(|(_, members)| std::cmp::Reverse(members.len()));
+                let held_groups = loose_groups.len();
+                // Enough groups to reach the coverage target, so the tail of
+                // one-element roles folds away without hiding anything sizeable.
+                let mut covered = 0usize;
+                let mut enough = 0usize;
+                for (_, members) in loose_groups.iter() {
+                    enough += 1;
+                    covered += members.len();
+                    if covered * 100 >= held * LOOSE_ROLE_COVERAGE {
+                        break;
+                    }
+                }
+                // Past the coverage point, keep any group that can be typed into
+                // or toggled. Judged by the actions the driver actually found on
+                // the node rather than by a list of role names, which would miss
+                // whatever a platform calls its own controls.
+                let takes_input = |members: &Vec<&Node>| {
+                    members.iter().any(|node| {
+                        node.actions
+                            .iter()
+                            .any(|action| action == "set_value" || action == "type_text")
+                    })
+                };
+                let kept: Vec<(String, Vec<&Node>)> = loose_groups
+                    .drain(..)
+                    .enumerate()
+                    .filter(|(at, (_, members))| *at < enough || takes_input(members))
+                    .map(|(_, group)| group)
+                    .collect();
+                folded_roles = held_groups - kept.len();
+                loose_groups = kept;
+                folded_role_elements = held
+                    - loose_groups.iter().map(|(_, members)| members.len()).sum::<usize>();
+            }
+        }
+
         // Largest first: an agent scanning this wants the substantial parts of
         // the window before the incidental ones.
         regions.sort_by_key(|(_, members)| std::cmp::Reverse(members.len()));
 
         let (named, folded) = regions.split_at(Self::OVERVIEW_REGIONS.min(regions.len()));
+        let describe_region = |label: &String, members: &Vec<&Node>| -> Value {
+            let mut roles: std::collections::BTreeMap<&str, usize> = Default::default();
+            for node in members {
+                *roles.entry(node.role.as_str()).or_default() += 1;
+            }
+            json!({
+                "region": label,
+                "elements": members.len(),
+                // What kind of thing is in there, so an agent can tell a
+                // toolbar from a list of files without opening it.
+                "holds": roles
+                    .iter()
+                    .map(|(role, count)| json!({"role": role, "count": count}))
+                    .collect::<Vec<_>>(),
+            })
+        };
         let described: Vec<Value> = named
             .iter()
-            .map(|(label, members)| {
-                let mut roles: std::collections::BTreeMap<&str, usize> = Default::default();
-                for node in members {
-                    *roles.entry(node.role.as_str()).or_default() += 1;
-                }
-                json!({
-                    "region": label,
-                    "elements": members.len(),
-                    // What kind of thing is in there, so an agent can tell a
-                    // toolbar from a list of files without opening it.
-                    "holds": roles
-                        .iter()
-                        .map(|(role, count)| json!({"role": role, "count": count}))
-                        .collect::<Vec<_>>(),
-                })
-            })
+            .chain(loose_groups.iter())
+            .map(|(label, members)| describe_region(label, members))
             .collect();
+
+        // Everything reachable, counted over both lists: the role groups are
+        // listed, so leaving them out would understate what an agent can get to.
+        let reachable = regions
+            .iter()
+            .chain(loose_groups.iter())
+            .map(|(_, m)| m.len())
+            .sum::<usize>();
 
         json!({
             "snapshot_id": self.snapshot_id,
             "revision": self.revision,
             "window": self.window.to_json(),
             "node_count": self.nodes.len(),
-            "interactive": regions.iter().map(|(_, m)| m.len()).sum::<usize>(),
+            "interactive": reachable,
             "regions": described,
             // Named so it is obvious these were not lost. Reading them takes a
             // second call, which is the point.
-            "folded_regions": folded.len(),
-            "folded_elements": folded.iter().map(|(_, m)| m.len()).sum::<usize>(),
+            "folded_regions": folded.len() + folded_roles,
+            "folded_elements": folded.iter().map(|(_, m)| m.len()).sum::<usize>()
+                + folded_role_elements,
         })
     }
 
@@ -516,7 +606,16 @@ impl Snapshot {
             .filter(|node| node.states.offscreen != Some(true))
             .filter(|node| self.worth_offering(node))
             .filter(|node| match region {
-                Some(wanted) => self.region_of(node) == wanted,
+                // A region may name a role within the unattributed one, which is
+                // how the elements past its truncation point are reached. Split on
+                // the separator rather than matching the whole string, so the
+                // caller does not have to know whether a split happened.
+                Some(wanted) => match wanted.split_once(REGION_ROLE_SEPARATOR) {
+                    Some((outer, role)) if outer == LOOSE_IN_WINDOW => {
+                        self.region_of(node) == outer && node.role == role
+                    }
+                    _ => self.region_of(node) == wanted,
+                },
                 None => true,
             })
             .collect();
@@ -663,6 +762,41 @@ const TITLE_ECHO_PERCENT: usize = 55;
 /// Not a real container: these elements sit directly in the window with nothing
 /// naming them. Saying so beats inventing a grouping.
 pub const LOOSE_IN_WINDOW: &str = "(loose in the window)";
+
+/// The separator between the unattributed region and a role within it.
+///
+/// Visibly not part of a container name. Region names come from the same ancestor
+/// names a locator's `within` uses, so an agent that drills into one can write it
+/// straight into a locator; a role cannot be used that way, and the two must not
+/// look alike.
+pub const REGION_ROLE_SEPARATOR: &str = " / ";
+
+/// How much of the unattributed region its role groups must cover.
+///
+/// The groups are a fallback, not places in the window, so they get their own
+/// seats rather than competing with named containers for the twelve. Measured on
+/// one VS Code window: the region split into 15 groups and only 5 won a seat,
+/// leaving 28 elements unreachable -- among them two edits, three hyperlinks and
+/// seven menu items -- while also pushing four named containers out. Listing the
+/// groups until nine tenths of the region is covered takes 8 or 9 of them, so the
+/// long tail of one-element roles still folds away.
+///
+/// Coverage alone is not enough, because counting puts "few but important" in the
+/// tail: at ninety percent five text fields, a checkbox and two list items were
+/// still folded away across five windows. A group whose members accept input is
+/// therefore always listed, which costs 1.2 groups per window on average.
+const LOOSE_ROLE_COVERAGE: usize = 90;
+
+/// Above this many members, the unattributed region is offered split by role.
+///
+/// Measured on three VS Code windows: the region held 77 to 90 elements while the
+/// listing stopped at 66 to 68, dropping 10 to 22. Every dropped element had a
+/// name and a third were directly actionable -- edits, hyperlinks, list items --
+/// and all of them sat at the tail, so the same ones were lost on every read.
+/// Splitting by role produced 13 to 15 groups, none over the budget, the largest
+/// at 36% of it. Below this size the region lists whole and a split would be a
+/// step in the way.
+const SPLIT_LOOSE_ABOVE: usize = 40;
 
 /// A reference to one node inside a specific snapshot revision.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -3216,6 +3350,166 @@ mod tests {
             cut["matched"].as_u64().unwrap() > 2,
             "and it says how many there were"
         );
+    }
+
+    #[test]
+    fn a_crowded_unattributed_region_is_offered_split_by_role() {
+        // The region has no container name to narrow it, so on a busy window it
+        // outgrows one listing and the tail is dropped on every read. Measured on
+        // three VS Code windows it held 77 to 90 elements while the listing
+        // reached 66 to 68, and every element lost had a name.
+        let mut nodes = vec![node_at("root", "window", Some("App"), None, None)];
+        // A container whose name only repeats the window's, so everything under
+        // it lands in the unattributed region -- which is what the real windows
+        // did: 67 of 68 elements were there for exactly this reason.
+        let mut shell = node_at("shell", "pane", Some("App"), Some("root"), None);
+        shell.actions.clear();
+        shell.depth = 1;
+        nodes.push(shell);
+        for (role, count) in [("button", 25), ("list_item", 20)] {
+            for index in 0..count {
+                let mut item = node_at(
+                    &format!("{role}{index}"),
+                    role,
+                    Some(&format!("{role} {index}")),
+                    Some("shell"),
+                    None,
+                );
+                item.depth = 2;
+                nodes.push(item);
+            }
+        }
+        let snapshot = windowed(nodes, "App");
+
+        let overview = snapshot.overview();
+        let names: Vec<&str> = overview["regions"]
+            .as_array()
+            .expect("regions")
+            .iter()
+            .map(|entry| entry["region"].as_str().unwrap_or_default())
+            .collect();
+
+        // Split by role, and the whole region is not offered alongside: keeping it
+        // would keep the path that truncates, and an agent following it would
+        // still see only two thirds. A route that does not arrive is worse than
+        // no route.
+        assert!(
+            names.iter().any(|name| *name
+                == format!("{LOOSE_IN_WINDOW}{REGION_ROLE_SEPARATOR}button")),
+            "expected a button group, got {names:?}"
+        );
+        assert!(
+            !names.iter().any(|name| *name == LOOSE_IN_WINDOW),
+            "the whole region should not be offered next to its split, got {names:?}"
+        );
+    }
+
+    #[test]
+    fn the_role_groups_do_not_take_seats_from_named_containers() {
+        // Letting them compete cost both sides: measured on one VS Code window,
+        // five groups won seats, four named containers lost theirs, and 28
+        // elements of the region were still unreachable. The groups are a
+        // fallback -- "the rest, by kind" -- not places in the window.
+        let mut nodes = vec![node_at("root", "window", Some("App"), None, None)];
+        // Twelve named containers, which is exactly the number of seats.
+        for slot in 0..12 {
+            let name = format!("Panel {slot}");
+            let mut container = node_at(&name, "group", Some(&name), Some("root"), None);
+            container.actions.clear();
+            container.depth = 1;
+            nodes.push(container);
+            let mut item = node_at(&format!("p{slot}"), "button", Some("Go"), Some(&name), None);
+            item.depth = 2;
+            nodes.push(item);
+        }
+        // Plus a crowded unattributed region, under a title echo as before.
+        let mut shell = node_at("shell", "pane", Some("App"), Some("root"), None);
+        shell.actions.clear();
+        shell.depth = 1;
+        nodes.push(shell);
+        for index in 0..45 {
+            let mut item = node_at(
+                &format!("loose{index}"),
+                "menu_item",
+                Some(&format!("Item {index}")),
+                Some("shell"),
+                None,
+            );
+            item.depth = 2;
+            nodes.push(item);
+        }
+        let snapshot = windowed(nodes, "App");
+
+        let overview = snapshot.overview();
+        let names: Vec<&str> = overview["regions"]
+            .as_array()
+            .expect("regions")
+            .iter()
+            .map(|entry| entry["region"].as_str().unwrap_or_default())
+            .collect();
+
+        let panels = names.iter().filter(|name| name.starts_with("Panel ")).count();
+        let groups = names
+            .iter()
+            .filter(|name| name.starts_with(LOOSE_IN_WINDOW))
+            .count();
+        assert_eq!(panels, 12, "every named container keeps its seat, got {names:?}");
+        assert!(groups >= 1, "the role groups are listed too, got {names:?}");
+    }
+
+    #[test]
+    fn a_group_that_takes_input_is_listed_however_small() {
+        // Coverage by count puts "few but important" in the tail: at ninety
+        // percent, five text fields, a checkbox and two list items were folded
+        // away across five windows. Judged by the actions the driver found rather
+        // than by a list of role names, which would miss whatever a platform
+        // calls its own controls.
+        let mut nodes = vec![node_at("root", "window", Some("App"), None, None)];
+        let mut shell = node_at("shell", "pane", Some("App"), Some("root"), None);
+        shell.actions.clear();
+        shell.depth = 1;
+        nodes.push(shell);
+        // A crowd of buttons, so the coverage target is met long before the edit.
+        for index in 0..60 {
+            let mut item = node_at(
+                &format!("b{index}"),
+                "button",
+                Some(&format!("Button {index}")),
+                Some("shell"),
+                None,
+            );
+            item.depth = 2;
+            nodes.push(item);
+        }
+        // One field, which the count would bury.
+        let mut field = node_at("field", "edit", Some("Search"), Some("shell"), None);
+        field.actions = vec!["set_value".into()];
+        field.depth = 2;
+        nodes.push(field);
+        let snapshot = windowed(nodes, "App");
+
+        let overview = snapshot.overview();
+        let names: Vec<&str> = overview["regions"]
+            .as_array()
+            .expect("regions")
+            .iter()
+            .map(|entry| entry["region"].as_str().unwrap_or_default())
+            .collect();
+
+        assert!(
+            names.iter().any(|name| *name
+                == format!("{LOOSE_IN_WINDOW}{REGION_ROLE_SEPARATOR}edit")),
+            "a single text field is still listed, got {names:?}"
+        );
+
+        // And it can actually be reached through that name.
+        let listing = snapshot.outline_of(
+            50,
+            Some(&format!("{LOOSE_IN_WINDOW}{REGION_ROLE_SEPARATOR}edit")),
+        );
+        let elements = listing["elements"].as_array().expect("elements");
+        assert_eq!(elements.len(), 1, "the field is reachable through its group");
+        assert_eq!(elements[0]["locator"]["role"], json!("edit"));
     }
 
     #[test]
