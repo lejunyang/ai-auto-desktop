@@ -1309,61 +1309,84 @@ impl CompiledExpression {
     /// output it reads; dynamic keys cannot be proven here and are checked at
     /// run time instead.
     pub fn step_references(&self) -> Vec<String> {
+        self.references_to("steps")
+    }
+
+    /// Statically visible `inputs.<name>` and `inputs["name"]` references.
+    ///
+    /// Same shape as [`Self::step_references`], and used for the same reason: a
+    /// name that was never declared can be seen here rather than at run time,
+    /// where the step reading it has usually already changed the interface.
+    pub fn input_references(&self) -> Vec<String> {
+        self.references_to("inputs")
+    }
+
+    /// The attribute and constant-subscript names read off one scope root.
+    ///
+    /// Only `steps` and `inputs` are worth asking about. The other roots the
+    /// engine puts in scope cannot be checked statically: `vars` is spelled
+    /// differently from its `$.variables` declaration, `observation` exists only
+    /// inside a postcondition, `failure` only inside `on_error`, and a `foreach`
+    /// binding is named by that step's own `as` and `index_as`, so the set of
+    /// legal names depends on where the expression sits. Reporting those would
+    /// refuse workflows that run correctly, which is worse than the run-time
+    /// error this check replaces.
+    fn references_to(&self, scope: &str) -> Vec<String> {
         let mut found = Vec::new();
-        collect_step_references(&self.tree, &mut found);
+        collect_references(&self.tree, scope, &mut found);
         found.sort();
         found.dedup();
         found
     }
 }
 
-fn collect_step_references(node: &Node, found: &mut Vec<String>) {
+fn collect_references(node: &Node, scope: &str, found: &mut Vec<String>) {
     match node {
         Node::Attribute(target, attribute, _) => {
-            if matches!(target.as_ref(), Node::Name(name, _) if name == "steps") {
+            if matches!(target.as_ref(), Node::Name(name, _) if name == scope) {
                 found.push(attribute.clone());
             }
-            collect_step_references(target, found);
+            collect_references(target, scope, found);
         }
         Node::Subscript(target, index, _) => {
-            if matches!(target.as_ref(), Node::Name(name, _) if name == "steps") {
+            if matches!(target.as_ref(), Node::Name(name, _) if name == scope) {
                 if let Node::Constant(Value::String(key)) = index.as_ref() {
                     found.push(key.clone());
                 }
             }
-            collect_step_references(target, found);
-            collect_step_references(index, found);
+            collect_references(target, scope, found);
+            collect_references(index, scope, found);
         }
         Node::Slice(lower, upper, step, _) => {
             for part in [lower, upper, step].into_iter().flatten() {
-                collect_step_references(part, found);
+                collect_references(part, scope, found);
             }
         }
         Node::List(elements) => elements
             .iter()
-            .for_each(|element| collect_step_references(element, found)),
+            .for_each(|element| collect_references(element, scope, found)),
         Node::Dict(entries, _) => entries.iter().for_each(|(key, value)| {
-            collect_step_references(key, found);
-            collect_step_references(value, found);
+            collect_references(key, scope, found);
+            collect_references(value, scope, found);
         }),
         Node::And(values, _) | Node::Or(values, _) => values
             .iter()
-            .for_each(|value| collect_step_references(value, found)),
-        Node::Not(inner, _) | Node::Unary(_, inner, _) => collect_step_references(inner, found),
+            .for_each(|value| collect_references(value, scope, found)),
+        Node::Not(inner, _) | Node::Unary(_, inner, _) => collect_references(inner, scope, found),
         Node::Binary(_, left, right, _) => {
-            collect_step_references(left, found);
-            collect_step_references(right, found);
+            collect_references(left, scope, found);
+            collect_references(right, scope, found);
         }
         Node::Compare(left, comparators, _) => {
-            collect_step_references(left, found);
+            collect_references(left, scope, found);
             comparators
                 .iter()
-                .for_each(|(_, node)| collect_step_references(node, found));
+                .for_each(|(_, node)| collect_references(node, scope, found));
         }
         Node::IfExp(test, body, orelse, _) => {
-            collect_step_references(test, found);
-            collect_step_references(body, found);
-            collect_step_references(orelse, found);
+            collect_references(test, scope, found);
+            collect_references(body, scope, found);
+            collect_references(orelse, scope, found);
         }
         Node::Constant(_) | Node::Name(_, _) => {}
     }

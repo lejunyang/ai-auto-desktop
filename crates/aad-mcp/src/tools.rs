@@ -662,9 +662,35 @@ nothing to show it happened.",
 fn list_workflows() -> Result<Value, String> {
     let saved = aad_runtime::recordings::list_workflows()
         .map_err(|error| failure(error.code, &error.message, None))?;
+    // Whether each one would run belongs here rather than one describe call
+    // later: an agent picks from this list, and a workflow that cannot run is
+    // indistinguishable from one that can until it is tried. Compiling all of
+    // them costs about 2ms each. The issues themselves stay in
+    // `describe_workflow` -- a listing is for choosing, not for repairing.
     let workflows: Vec<Value> = saved
         .into_iter()
-        .map(|entry| json!({"name": entry.name, "modified": entry.modified}))
+        .map(|entry| {
+            let mut row = json!({"name": entry.name, "modified": entry.modified});
+            match std::fs::read_to_string(&entry.path)
+                .ok()
+                .and_then(|body| serde_json::from_str::<Value>(&body).ok())
+            {
+                Some(document) => {
+                    let directory = std::path::Path::new(&entry.path)
+                        .parent()
+                        .map(std::path::Path::to_path_buf);
+                    match aad_core::compiler::compile_descriptor(document, directory) {
+                        Ok(_) => row["runnable"] = json!(true),
+                        Err(error) => {
+                            row["runnable"] = json!(false);
+                            row["issue_count"] = json!(error.issues.len());
+                        }
+                    }
+                }
+                None => row["runnable"] = json!(false),
+            }
+            row
+        })
         .collect();
     Ok(json!({
         "kind": "WorkflowList",

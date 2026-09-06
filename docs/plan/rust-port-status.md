@@ -2694,3 +2694,83 @@ checkpoint、journal、workflow 文档都按这个名字读写，改这里就会
 
 **又踩了记过的坑**：改完 `aad-mcp` 只 build 了它，而探针跑的 `aad.exe` 来自 `aad-cli`,
 第一次验证仍报旧键名。
+
+
+### 2.48 引用一个不存在的名字，先改界面再失败
+
+**先量了三条候选，两条被自己的测量否掉。**
+
+*被否的一条*：规范要求靠序数定位的 locator 标 `fragile: true`。真机 630 个元素里含
+`nth` 的 37 个（5%），**没有 name 也没有 automation_id、只能靠 nth 的 11 个（1%），
+且全部是 `pane`，可交互控件 0 个**。AI 不会拿 `pane` 写工作流，而 `nth` 字段本来就在
+locator 里看得见。加标记是给一个不存在的问题加字段。
+
+*另一条查清了但没做*：`assemble` 不产出断言。引擎侧**完整可用**——手写一个带
+`postcondition` 的工作流，写对时 `succeeded`，故意写错期望值时报
+`ACTION.POSTCONDITION_FAILED` + `effect=unknown` + `status=unknown_effect`。
+GUI 侧五种模式也齐。缺的只是 Rust 组装器不生成它，价值待定。
+
+#### 真缺口：静态可查的错，留到运行时才炸
+
+实测三种坏引用，结果不一致：
+
+| 情况 | 改前的 `validate` |
+|---|---|
+| 前向引用 | `invalid`（`depends_on` 检查生效） |
+| 引用不存在的**步骤** | **`valid`** |
+| 引用不存在的 **input** | **`valid`** |
+
+**部分覆盖比全不覆盖更容易误判**：查得住前向引用，查不住打错字。
+
+危害是量出来的，不是推出来的：把第二个逻辑步骤的 window 引用打错一个字，跑完
+`bare` 从 `BEFORE` 变成 `AfterAB`、`executed_steps=5` 才失败。**值写进去了但没提交，
+重试会写第二遍。** 运行时错误本身很清楚（带表达式、缺失键名、行列、`effect=not_applied`），
+所以问题不是报得不明白，而是这种错完全可以静态查出来——步骤 id、引用到的步骤、
+声明的 inputs、引用到的 inputs 全在文件里。
+
+**根因是一行 filter**：`validate_scopes` 里 `.filter(|r| by_id.contains_key(...))`
+把不存在的引用整个滤掉了，只留存在的去查 `depends_on` 覆盖。改成分流：存在的照原样查，
+不存在的报 `unknown_step_reference`，而存在于别的作用域的报
+`cross_scope_step_reference`——已有的 `depends_on` 检查就是这样区分的，
+**引用一个别处的步骤不是打错字**。
+
+#### 只检查 inputs 和 steps，其余故意不查
+
+量了引擎放进作用域的根名，纠正了我两个假设：**变量引用写 `vars`，而声明处是
+`$.variables`**（名字不同）；另有 `runtime`、`observation`、`failure`，以及 `foreach`
+的绑定——**它的名字由那个步骤自己的 `as` / `index_as` 决定**，编译期没有固定集合。
+
+所以只有 `inputs` 与 `steps` 能静态查。**错报比漏报更糟**：漏报只是维持现状，
+错报会拦下能正常跑的工作流。加了一个测试专门说明这件事
+（`the_other_scope_roots_are_left_alone`）。
+
+`collect_step_references` 参数化成认任意根名，而不是复制一份 inputs 版——
+那个 walker 有十几个分支，复制容易漏。
+
+**测试 fixture 写错两处，验证器逐条指出**：`variables` 用 `initial` 不是 `default`，
+`foreach` 必须有 `max_items`。四条错误里**没有一条是引用问题**，这本身就印证了
+`vars` 与循环绑定确实没被检查。
+
+#### 结果
+
+坏引用现在报 `invalid` 并给出路径与名字，`run` 直接拒绝，**界面保持 `UNTOUCHED`**
+（改前是 `AfterAB`）。10 个既有工作流零误报，已声明的 input 仍合法，正常工作流仍
+`succeeded`。MCP 的 `describe_workflow` 与 `run_workflow` 同样拦住，
+带 `effect=not_applied`。
+
+#### 顺带补上列表里的另一半
+
+同一个缺口还有一半：坏引用现在查得出，但只在主动 validate 单个文件时。
+`aad workflows` 与 MCP `list_workflows` 都只报 name/modified/path，
+**跑不了的和跑得了的长得一样**。
+
+**代价先量再改**：编译净耗时 **2.1ms/个**，10 个共 21ms（基线 13ms），实测改后稳态
+**22ms**。列表只放 `runnable` 与 `issue_count`，issues 本身留在 `validate` 与
+`describe_workflow`——列表是拿来选的，不是拿来修的，十个坏文件的 issues 会把列表淹掉。
+读不出文件与内容非法分开报（`unreadable` vs `issue_count`），因为一个是文件问题、
+一个是内容问题。
+
+三个类型错误都是我照错了：`entry.path` 是 `String` 不是 `PathBuf`，
+`read_descriptor` 要 `&Path` 且它的 `Err` 是给用户看的 `Value` 载荷而非结构体。
+**又踩了那个坑**：改完 `aad-core` 只跑测试没重编 `aad-cli`，第一次真机验证
+`validate` 仍报 `valid`，比对时间戳发现 `aad.exe` 旧了 51 分钟。

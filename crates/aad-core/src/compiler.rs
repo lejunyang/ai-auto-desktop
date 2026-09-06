@@ -338,6 +338,26 @@ impl Compiler {
         }
     }
 
+    /// Statically resolvable `inputs.<name>` references inside any value.
+    fn input_references(&self, value: &Value, found: &mut BTreeSet<String>) {
+        match value {
+            Value::String(text) => {
+                for (_, _, inner) in template_spans(text) {
+                    if let Ok(expression) = compile_expression(inner.trim()) {
+                        found.extend(expression.input_references());
+                    }
+                }
+            }
+            Value::Object(map) => map
+                .values()
+                .for_each(|item| self.input_references(item, found)),
+            Value::Array(items) => items
+                .iter()
+                .for_each(|item| self.input_references(item, found)),
+            _ => {}
+        }
+    }
+
     // -- scope validation ---------------------------------------------------
 
     /// Validate every DAG scope: unknown/self/cross-scope dependencies, cycles,
@@ -393,21 +413,42 @@ impl Compiler {
             for entry in entries {
                 let covered =
                     transitive_dependencies(&entry.id, &by_id, &mut resolved, &mut HashSet::new());
-                let uncovered: Vec<String> = entry
-                    .references
-                    .iter()
-                    .filter(|reference| by_id.contains_key(reference.as_str()))
-                    .filter(|reference| {
-                        !covered.contains(*reference) && *reference != &entry.id
-                    })
-                    .cloned()
-                    .collect();
-                for reference in uncovered {
-                    self.issue(
-                        entry.path.clone(),
-                        format!("steps reference '{reference}' is not covered by depends_on"),
-                        "uncovered_step_reference",
-                    );
+                for reference in &entry.references {
+                    if reference == &entry.id {
+                        continue;
+                    }
+                    // A sibling that is present is checked for a declared edge.
+                    // One that is absent is a name that resolves to nothing --
+                    // previously it was filtered out here and only surfaced at
+                    // run time as EXPRESSION.EVALUATION_FAILED, by which point
+                    // the earlier steps have already touched the interface. A
+                    // step id known in another scope is not a typo, so it is
+                    // reported the way a cross-scope dependency is.
+                    if by_id.contains_key(reference.as_str()) {
+                        if !covered.contains(reference) {
+                            self.issue(
+                                entry.path.clone(),
+                                format!(
+                                    "steps reference '{reference}' is not covered by depends_on"
+                                ),
+                                "uncovered_step_reference",
+                            );
+                        }
+                    } else if self.ids.contains_key(reference) {
+                        self.issue(
+                            entry.path.clone(),
+                            format!(
+                                "steps reference '{reference}' is outside sibling scope                                  {scope_path}"
+                            ),
+                            "cross_scope_step_reference",
+                        );
+                    } else {
+                        self.issue(
+                            entry.path.clone(),
+                            format!("steps reference '{reference}' is not a step in this workflow"),
+                            "unknown_step_reference",
+                        );
+                    }
                 }
             }
         }
@@ -1442,6 +1483,45 @@ impl Compiler {
         }
         self.issues.extend(assignment_issues);
 
+        // Every `${{ inputs.<name> }}` must name a declared input. Like an
+        // unknown step reference this used to surface only at run time, as
+        // EXPRESSION.EVALUATION_FAILED raised by whichever step read it -- and
+        // measured on a real recording that step was the fifth of six, so the
+        // interface had already been written to before the run stopped. The
+        // information needed to catch it is entirely in the document.
+        //
+        // Only `inputs` is checked. The engine also puts `vars`, `runtime`,
+        // `observation`, `failure` and a `foreach` binding in scope, and none of
+        // those can be resolved from the document alone: `vars` is spelled
+        // differently from its `$.variables` declaration, two of them exist only
+        // inside a particular step, and a loop binding is named by that step's
+        // own `as`. Reporting them would refuse workflows that run.
+        let mut input_issues = Vec::new();
+        for step in walk_all(&steps, on_error.as_ref(), &finally_steps) {
+            let mut wanted = BTreeSet::new();
+            self.input_references(&Value::Object(step.params.clone()), &mut wanted);
+            for case in &step.cases {
+                if let Some(when) = &case.when {
+                    self.input_references(when, &mut wanted);
+                }
+            }
+            if let Some(handler) = &step.on_error {
+                if let Some(output) = &handler.output {
+                    self.input_references(output, &mut wanted);
+                }
+            }
+            for name in wanted {
+                if !inputs.contains_key(&name) {
+                    input_issues.push(DescriptorIssue::new(
+                        step.path.clone(),
+                        format!("inputs reference '{name}' is not a declared input"),
+                        "unknown_input_reference",
+                    ));
+                }
+            }
+        }
+        self.issues.extend(input_issues);
+
         if !self.issues.is_empty() {
             return Err(AutomationError::descriptor(self.issues));
         }
@@ -2004,6 +2084,66 @@ mod tests {
 
         let error = compile(value).unwrap_err();
         assert!(issue_codes(&error).contains(&"range".to_string()));
+    }
+
+    #[test]
+    fn a_step_reference_that_names_nothing_is_refused() {
+        // Previously this filtered out: only references to steps that exist were
+        // checked for a declared edge, so a typo passed validation and failed at
+        // run time as EXPRESSION.EVALUATION_FAILED. Measured on a real recording
+        // the failing step was the fifth of six, so the field had already been
+        // written before the run stopped.
+        let error = compile(minimal(json!([
+            {"id": "first", "type": "action", "uses": "desktop.windows_uia.snapshot@1",
+             "with": {}},
+            {"id": "second", "type": "action", "uses": "desktop.windows_uia.find@1",
+             "depends_on": ["first"],
+             "with": {"snapshot_id": "${{ steps.typo_first.output.snapshot_id }}"}}
+        ])))
+        .unwrap_err();
+
+        assert!(
+            issue_codes(&error).contains(&"unknown_step_reference".to_string()),
+            "a reference to a step that does not exist must be refused: {error}"
+        );
+    }
+
+    #[test]
+    fn an_input_reference_that_names_nothing_is_refused() {
+        let error = compile(minimal(json!([
+            {"id": "act", "type": "action", "uses": "desktop.windows_uia.set_value@1",
+             "with": {"target": "x", "value": "${{ inputs.never_declared }}"}}
+        ])))
+        .unwrap_err();
+
+        assert!(
+            issue_codes(&error).contains(&"unknown_input_reference".to_string()),
+            "a reference to an input that was never declared must be refused: {error}"
+        );
+    }
+
+    #[test]
+    fn the_other_scope_roots_are_left_alone() {
+        // `vars`, `observation`, `failure` and a loop binding cannot be resolved
+        // from the document: `vars` is spelled differently from its
+        // `$.variables` declaration, two exist only inside one step, and a
+        // `foreach` binding is named by that step's own `as`. Checking them would
+        // refuse workflows that run correctly, so they are deliberately not
+        // checked -- and this test is what says so.
+        let mut value = minimal(json!([
+            {"id": "loop", "type": "foreach", "items": "${{ vars.rows }}", "as": "row",
+             "max_items": 10,
+             "steps": [
+                 {"id": "act", "type": "action", "uses": "desktop.windows_uia.set_value@1",
+                  "with": {"target": "${{ row.ref }}", "value": "${{ vars.text }}"}}
+             ]}
+        ]));
+        value["variables"] = json!({
+            "rows": {"schema": {"type": "array"}, "initial": []},
+            "text": {"schema": {"type": "string"}, "initial": "x"}
+        });
+
+        compile(value).expect("references to other scope roots must be left alone");
     }
 
     #[test]

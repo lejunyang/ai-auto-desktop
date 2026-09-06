@@ -1187,14 +1187,45 @@ fn list_saved_workflows() -> (Value, u8) {
         Ok(saved) => {
             // The store already reports the path and the modification time, so
             // the listing does not go back to the filesystem for either.
+            // Whether each one would run is worth the 2ms it costs to compile:
+            // a listing is what someone reads before picking one, and a workflow
+            // that cannot run looks exactly like one that can until it is tried.
+            // Only the verdict and a count go here -- `aad validate` and
+            // `describe_workflow` report the issues themselves, and ten broken
+            // files would otherwise bury the listing.
             let workflows: Vec<Value> = saved
                 .into_iter()
                 .map(|entry| {
-                    json!({
+                    let mut row = json!({
                         "name": entry.name,
                         "modified": entry.modified,
                         "path": entry.path,
-                    })
+                    });
+                    let path = Path::new(&entry.path);
+                    match read_descriptor(path) {
+                        Ok(document) => {
+                            let directory = path.parent().map(Path::to_path_buf);
+                            match aad_core::compiler::compile_descriptor(document, directory) {
+                                Ok(_) => {
+                                    row["runnable"] = json!(true);
+                                }
+                                Err(error) => {
+                                    row["runnable"] = json!(false);
+                                    row["issue_count"] = json!(error.issues.len());
+                                }
+                            }
+                        }
+                        // A file that cannot be read is a different problem from
+                        // one whose contents are wrong, and saying which saves
+                        // looking in the wrong place. `read_descriptor` already
+                        // returns the user-facing failure payload, so it is
+                        // carried through rather than rebuilt.
+                        Err(failure) => {
+                            row["runnable"] = json!(false);
+                            row["unreadable"] = failure;
+                        }
+                    }
+                    row
                 })
                 .collect();
             (
