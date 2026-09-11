@@ -152,7 +152,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Install Linux native driver test dependencies
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends xvfb xauth dbus-x11 at-spi2-core python3-gi gir1.2-gtk-3.0 g++ pkg-config libx11-dev libxtst-dev
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends xvfb xauth dbus-x11 at-spi2-core g++ pkg-config qtbase5-dev libx11-dev libxtst-dev
       - name: Build Linux native input and capture helpers
         if: runner.os == 'Linux'
         run: |

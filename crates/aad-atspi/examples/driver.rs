@@ -56,13 +56,17 @@ fn main() {
                             "expand" | "collapse" => {
                                 ("toggle_button", "Expand fixture details")
                             }
-                            _ => ("push_button", "Invoke fixture button"),
+                            _ => ("push_button", "Invoke Qt fixture button"),
                         };
                         (action, json!({"role": role, "name": name}), extra)
                     } else {
                         let text = arguments.next().unwrap_or_else(|| "Rust AT-SPI".into());
                         let action = if command == "type-text" { "type_text" } else { "set_text" };
-                        let name = if command == "type-text" { "Fixture XTest text entry" } else { "Fixture text entry" };
+                        let name = if command == "type-text" {
+                            "Qt fixture XTest text entry"
+                        } else {
+                            "Qt fixture text entry"
+                        };
                         (
                             action,
                             json!({"role": "text", "name": name}),
