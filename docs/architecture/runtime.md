@@ -227,12 +227,16 @@ provider/contract/projection/input binding 摘要，不记录原始 action input
 成功后，表达式上下文、checkpoint 与最终输出只能看到 `project` 选中的字段；`omit` 产生空输出，
 原始 provider 响应不会持久化。
 
-没有合法 `action_intent` 的 `in_top_level_step` 或 `finalizing` 仍不得重放，必须零 dispatch 地
-终结为 `UNKNOWN_EFFECT`；进入 workflow finally 前也先写 `finalizing`，避免崩溃后重复 cleanup。
-action intent、dispatch 授权、完成 checkpoint 与终态提交都用期望 `desiredState` 做 CAS。若
-pause/cancel 与完成并发，CAS 冲突会转入相应控制路径，不覆盖 operator 意图，也不会为已完成的
-只读 observation 再次 dispatch。lease 目前只在这些持久边界同步 heartbeat；它保证旧 owner 不能
-继续写 journal，但不等于能异步强杀已经进入插件或 OS 的调用。
+没有合法 `action_intent` 的 `in_top_level_step` 仍不得重放，必须零 dispatch 地终结为
+`UNKNOWN_EFFECT`。checkpoint v2 的 workflow cleanup 使用 finalization v1 三阶段 payload：`intent` 固定正文结果且
+证明 cleanup 尚未开始，可以在恢复时执行一次；`started` 说明 cleanup 可能已产生效果，恢复时不得
+重放并落 `UNKNOWN_EFFECT`；`result` 已保存完整终态，可在恢复时只补交终态。checkpoint v1
+继续兼容安全的 step 边界；旧版只有裸
+`finalizing` phase 的 checkpoint 继续按不安全状态处理。action intent、dispatch 授权、完成 checkpoint
+与终态提交都用期望 `desiredState` 做 CAS。若 pause/cancel 与完成并发，CAS 冲突会转入相应控制路径，
+不覆盖 operator 意图，也不会为已完成的只读 observation 或 cleanup 再次 dispatch。lease 目前只在
+这些持久边界同步 heartbeat；它保证旧 owner 不能继续写 journal，但不等于能异步强杀已经进入插件
+或 OS 的调用。
 
 ## 9. 状态与结构化错误
 

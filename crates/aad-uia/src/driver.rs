@@ -664,7 +664,7 @@ fn action_contracts() -> Map<String, Value> {
         json!({
             "contract_major": 1,
             "summary": summary,
-            "effect": {"class": "read_only"},
+            "effect": {"default_class": "read_only"},
             "risk": {"category": "observe", "level": "low"},
         })
     };
@@ -697,7 +697,7 @@ fn action_contracts() -> Map<String, Value> {
         json!({
             "contract_major": 1,
             "summary": "Start recording a window's interactions.",
-            "effect": {"class": "idempotent"},
+            "effect": {"default_class": "idempotent"},
             "risk": {"category": "observe", "level": "low"},
         }),
     );
@@ -710,7 +710,7 @@ fn action_contracts() -> Map<String, Value> {
         json!({
             "contract_major": 1,
             "summary": "Stop a recording session and remove its hooks.",
-            "effect": {"class": "idempotent"},
+            "effect": {"default_class": "idempotent"},
             "risk": {"category": "observe", "level": "low"},
         }),
     );
@@ -719,7 +719,7 @@ fn action_contracts() -> Map<String, Value> {
         json!({
             "contract_major": 1,
             "summary": summary,
-            "effect": {"class": class},
+            "effect": {"default_class": class},
             "risk": {"category": category, "level": level},
         })
     };

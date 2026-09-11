@@ -24,7 +24,7 @@
 | 脚本执行 | `script.py`；Linux 仅在 bubblewrap + prlimit 可用时启用，其他平台失败关闭 | v0 边界内已验证 |
 | 超时、错误和清理 | 绝对 deadline、父子 deadline、结构化 `AutomationError`、`on_error/finally`、`UNKNOWN_EFFECT` | 已验证 |
 | 可恢复 run 与日志 | SQLite WAL journal、owner lease、`DurableExecutor`、JSON-only `start/resume/status/list/events/pause/cancel`；action 默认 deny，CLI 可显式选择 `--durable-actions read-only` | 受限 v0 已验证 |
-| 安全恢复 | 普通计划从 `between_top_level_steps` 恢复；合法 `action_intent` v2 可在重新校验绑定后重放只读 action；其他 `in_top_level_step/finalizing` 零重放并终结为 `unknown_effect` | 已验证 |
+| 安全恢复 | 普通计划从 `between_top_level_steps` 恢复；合法 `action_intent` v2 可在重新校验绑定后重放只读 action；checkpoint v2 的 finalization `intent/started/result` 分别对应安全执行 cleanup、零重放落 `unknown_effect`、只提交已持久化终态；旧版裸 `finalizing` 和其他 `in_top_level_step` 仍零重放 | 已验证 |
 | durable 只读 action 边界 | 仅顶层隐式串行、无 `if`/pre/post/retry/handler/finally 的单次 `read_only` action；provider 与 descriptor input/output/error 均须为 `public`，provider 声明稳定 `checkpoint_fields`，descriptor 显式 `project|omit` | 已验证；写 action 与复杂控制流 reconciliation 待后续 |
 | durable 最小持久化 | run 创建前验证 manifest/effect/errors/sensitivity/projection/static policy，但不预求值引用前序 step 的动态输入；dispatch 前持久化不含原始输入的 intent v2，完成后只保存批准的投影，原始 provider 响应不落 journal | 已验证 |
 | durable 控制竞态 | pause/cancel 请求与 action intent、dispatch 授权、完成 checkpoint、终态提交均以 `desiredState` CAS 协调 | 已验证；不会丢失控制意图或重复派发已完成读操作 |

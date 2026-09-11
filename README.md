@@ -197,11 +197,15 @@ aad resume job-1 workflow.yaml --store runs.sqlite3
   后半段跑在与前半段不同的值上。
 - **`cancel` 是吸收态**，之后 `pause` 会被 `RUN.CANCEL_PENDING` 拒绝，不会把已决定停掉的
   运行悄悄救回来。
-- **崩溃恢复不重放**。进程死在步骤中途时，journal 无法知道副作用是否已经到达桌面，因此落
-  `unknown_effect` 并**零派发**（连 cleanup 也不跑），在 error 里给出 remedy 交给人判断。
-- 只有**不含 `action` / `script`** 的工作流可以持久化运行，否则以 `DURABLE.UNSUPPORTED_PLAN`
-  拒绝并点名具体步骤。原因见 `docs/plan/rust-port-status.md` §2.1：没有 `action_intent`
-  机制就无法证明某次派发可以安全重复。
+- **默认不重放 action**。进程死在普通步骤或 cleanup 中途时，journal 无法证明副作用是否已经
+  到达桌面，因此落 `unknown_effect` 并**零派发**，在 error 里给出 remedy 交给人判断。
+- 默认的 `--durable-actions deny` 只接受不含 `action` / `script` 的工作流。需要持久化只读观察时，
+  显式传 `--durable-actions read-only`，并用 `--plugin NAME=COMMAND` 注册 provider、用
+  `--permission` 授权；运行时只接受具备 public sensitivity、`not_applied` 错误合约和输出白名单
+  投影的顶层单次只读 action。它会在派发前写入 `action_intent`，崩溃后重新校验绑定再安全重放。
+  写 action、嵌套 action 和 `script` 仍然拒绝。完整边界见 `docs/plan/rust-port-status.md` §2.1。
+- workflow cleanup 使用三阶段 checkpoint：`finalization intent` 之前崩溃可安全执行 cleanup，
+  `started` 之后崩溃保守落 `unknown_effect`，cleanup 完成后的 `result` 可只补交终态而不重放。
 
 ## 给 AI 使用（MCP）
 

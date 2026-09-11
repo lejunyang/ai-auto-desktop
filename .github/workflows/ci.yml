@@ -159,6 +159,13 @@ jobs:
       - name: Build and test the workspace
         run: cargo test --workspace --exclude aad-gui --locked
 
+      # The UIA research probes call Win32 APIs directly. They are excluded
+      # from automatic example discovery on other hosts, but still need to be
+      # compile-checked where those APIs exist.
+      - name: Check Windows-native UIA examples
+        if: runner.os == 'Windows'
+        run: cargo check --locked -p aad-uia --examples --features windows-native-examples
+
       # -D warnings, or clippy prints a warning and still exits 0, which makes
       # the step decorative.
       - name: Lint

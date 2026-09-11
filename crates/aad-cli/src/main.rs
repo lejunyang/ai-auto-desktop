@@ -5,7 +5,7 @@
 //! exit code carries the outcome: `0` success, `1` a failed run or workflow
 //! error, `2` a usage or input error.
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde_json::{json, Value};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -112,6 +112,8 @@ struct StartArgs {
     /// Seconds to hold the ownership lease between renewals.
     #[arg(long, value_name = "SECONDS")]
     lease_ttl: Option<f64>,
+    #[command(flatten)]
+    execution: DurableExecutionArgs,
 }
 
 #[derive(Args)]
@@ -128,6 +130,28 @@ struct ResumeArgs {
     /// Seconds to hold the ownership lease between renewals.
     #[arg(long, value_name = "SECONDS")]
     lease_ttl: Option<f64>,
+    #[command(flatten)]
+    execution: DurableExecutionArgs,
+}
+
+#[derive(Clone, Copy, Debug, Default, ValueEnum)]
+enum DurableActions {
+    #[default]
+    Deny,
+    ReadOnly,
+}
+
+#[derive(Args, Default)]
+struct DurableExecutionArgs {
+    /// Register a process plugin as NAME=COMMAND. Repeat for multiple providers.
+    #[arg(long = "plugin", value_name = "NAME=COMMAND")]
+    plugins: Vec<String>,
+    /// Grant a permission declared by the workflow/provider.
+    #[arg(long = "permission")]
+    permissions: Vec<String>,
+    /// Permit strictly validated top-level read-only actions in durable runs.
+    #[arg(long, value_enum, default_value_t)]
+    durable_actions: DurableActions,
 }
 
 #[derive(Args)]
@@ -425,6 +449,12 @@ struct RunArgs {
     /// machine just because someone was asked to run the file.
     #[arg(long)]
     allow_scripts: bool,
+    /// Register a process plugin as NAME=COMMAND. Repeat for multiple providers.
+    #[arg(long = "plugin", value_name = "NAME=COMMAND")]
+    plugins: Vec<String>,
+    /// Grant a permission declared by the workflow/provider.
+    #[arg(long = "permission")]
+    permissions: Vec<String>,
 }
 
 fn main() -> ExitCode {
@@ -1512,7 +1542,10 @@ fn run_workflow(args: &RunArgs) -> (Value, u8) {
         );
     }
 
-    let mut providers = aad_runtime::ProviderRegistry::new();
+    let mut providers = match provider_registry(&args.plugins) {
+        Ok(providers) => providers,
+        Err(error) => return (automation_failure(&error), EXIT_USAGE),
+    };
     // The desktop driver is always offered; a workflow that never uses it pays
     // nothing, and one that does should not need extra configuration.
     if let Ok(driver) = aad_uia::native_driver() {
@@ -1522,7 +1555,8 @@ fn run_workflow(args: &RunArgs) -> (Value, u8) {
     let mut options = aad_runtime::RunOptions::default()
         .with_providers(providers)
         .with_inputs(inputs)
-        .with_scripts_allowed(args.allow_scripts);
+        .with_scripts_allowed(args.allow_scripts)
+        .with_granted_permissions(args.permissions.clone());
 
     if let Some(path) = &args.journal {
         match std::fs::File::create(path) {
@@ -1625,6 +1659,7 @@ fn durable_options(
     inputs: Option<&String>,
     owner_id: Option<&String>,
     lease_ttl: Option<f64>,
+    execution: &DurableExecutionArgs,
 ) -> Result<aad_runtime::durable_exec::DurableOptions, (Value, u8)> {
     let mut options = aad_runtime::durable_exec::DurableOptions::default();
     if let Some(text) = inputs {
@@ -1670,7 +1705,92 @@ fn durable_options(
         }
         options = options.with_lease_ttl_seconds(ttl);
     }
+    let mut providers = provider_registry(&execution.plugins)
+        .map_err(|error| (automation_failure(&error), EXIT_USAGE))?;
+    if let Ok(driver) = aad_uia::native_driver() {
+        providers.insert(std::sync::Arc::new(driver));
+    }
+    let mode = match execution.durable_actions {
+        DurableActions::Deny => aad_runtime::durable_exec::DurableActionMode::Deny,
+        DurableActions::ReadOnly => aad_runtime::durable_exec::DurableActionMode::ReadOnly,
+    };
+    options = options
+        .with_providers(providers)
+        .with_granted_permissions(execution.permissions.clone())
+        .with_action_mode(mode);
     Ok(options)
+}
+
+fn provider_registry(
+    values: &[String],
+) -> Result<aad_runtime::ProviderRegistry, aad_core::AutomationError> {
+    let mut providers = aad_runtime::ProviderRegistry::new();
+    let mut names = std::collections::BTreeSet::new();
+    for raw in values {
+        let Some((name, command)) = raw.split_once('=') else {
+            return Err(aad_core::AutomationError::new(
+                "CLI.INVALID_ARGUMENT",
+                "--plugin must use NAME=COMMAND",
+            )
+            .with_category("cli")
+            .with_effect("not_applied"));
+        };
+        if name.is_empty() {
+            return Err(aad_core::AutomationError::new(
+                "CLI.INVALID_ARGUMENT",
+                "--plugin name is empty",
+            )
+            .with_category("cli")
+            .with_effect("not_applied"));
+        }
+        if !names.insert(name.to_string()) {
+            return Err(aad_core::AutomationError::new(
+                "CLI.INVALID_ARGUMENT",
+                format!("plugin {name:?} is repeated"),
+            )
+            .with_category("cli")
+            .with_effect("not_applied"));
+        }
+        let argv = split_plugin_command(command).ok_or_else(|| {
+            aad_core::AutomationError::new(
+                "CLI.INVALID_ARGUMENT",
+                format!("plugin {name:?} command has invalid quoting"),
+            )
+            .with_category("cli")
+            .with_effect("not_applied")
+        })?;
+        if argv.is_empty() {
+            return Err(aad_core::AutomationError::new(
+                "CLI.INVALID_ARGUMENT",
+                format!("plugin {name:?} command is empty"),
+            )
+            .with_category("cli")
+            .with_effect("not_applied"));
+        }
+        aad_runtime::register_process_plugin(&mut providers, name, argv)?;
+    }
+    Ok(providers)
+}
+
+/// Split a plugin command without treating Windows path separators as escapes.
+///
+/// The CLI accepts one command string for parity with the Python frontend. On
+/// Windows, doubling backslashes before POSIX-style tokenisation preserves both
+/// ordinary drive paths and UNC paths while retaining useful quote validation.
+fn split_plugin_command(command: &str) -> Option<Vec<String>> {
+    #[cfg(windows)]
+    let command = command.replace('\\', "\\\\");
+    #[cfg(windows)]
+    let command = command.as_str();
+    shlex::split(command)
+}
+
+#[cfg(all(test, target_os = "linux"))]
+fn workspace_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()
+        .unwrap_or_else(|_| PathBuf::from("."))
 }
 
 /// The exit code for a durable attempt.
@@ -1691,11 +1811,15 @@ fn start_run(args: &StartArgs) -> (Value, u8) {
         Ok(descriptor) => descriptor,
         Err(result) => return result,
     };
-    let options =
-        match durable_options(args.inputs.as_ref(), args.owner_id.as_ref(), args.lease_ttl) {
-            Ok(options) => options,
-            Err(result) => return result,
-        };
+    let options = match durable_options(
+        args.inputs.as_ref(),
+        args.owner_id.as_ref(),
+        args.lease_ttl,
+        &args.execution,
+    ) {
+        Ok(options) => options,
+        Err(result) => return result,
+    };
 
     // Opened separately from `with_store` because the executor takes ownership
     // of the connection for the whole run.
@@ -1727,7 +1851,12 @@ fn resume_run(args: &ResumeArgs) -> (Value, u8) {
     // No `--inputs` here by design: the run's inputs were persisted when it was
     // created, and letting them be replaced on resume would mean the second half
     // of a run executed against different values than the first.
-    let options = match durable_options(None, args.owner_id.as_ref(), args.lease_ttl) {
+    let options = match durable_options(
+        None,
+        args.owner_id.as_ref(),
+        args.lease_ttl,
+        &args.execution,
+    ) {
         Ok(options) => options,
         Err(result) => return result,
     };
@@ -1965,6 +2094,8 @@ mod tests {
             journal: None,
             dry_run: true,
             allow_scripts: false,
+            plugins: Vec::new(),
+            permissions: Vec::new(),
         });
         assert_eq!(
             from_explain["error"]["code"], "CLI.NOT_A_WORKFLOW",
@@ -2457,6 +2588,8 @@ mod tests {
             journal: None,
             dry_run: true,
             allow_scripts: false,
+            plugins: Vec::new(),
+            permissions: Vec::new(),
         }));
         let _ = std::fs::remove_file(&path);
 
@@ -2484,6 +2617,8 @@ mod tests {
             journal: None,
             dry_run: false,
             allow_scripts: false,
+            plugins: Vec::new(),
+            permissions: Vec::new(),
         }));
         let _ = std::fs::remove_file(&path);
 
@@ -2510,6 +2645,8 @@ mod tests {
                 journal: None,
                 dry_run: false,
                 allow_scripts: false,
+                plugins: Vec::new(),
+                permissions: Vec::new(),
             }));
             assert_eq!(code, EXIT_USAGE, "{bad} should be rejected");
             assert_eq!(payload["error"]["code"], "CLI.INVALID_ARGUMENTS");
@@ -2536,6 +2673,8 @@ mod tests {
             journal: Some(journal.clone()),
             dry_run: false,
             allow_scripts: false,
+            plugins: Vec::new(),
+            permissions: Vec::new(),
         }));
 
         assert_eq!(code, EXIT_OK);
@@ -2567,6 +2706,8 @@ mod tests {
             journal: None,
             dry_run: false,
             allow_scripts: false,
+            plugins: Vec::new(),
+            permissions: Vec::new(),
         }));
         let _ = std::fs::remove_file(&path);
 
@@ -2637,6 +2778,7 @@ mod tests {
             run_id: Some(run_id.to_string()),
             owner_id: Some("test-runner".into()),
             lease_ttl: None,
+            execution: DurableExecutionArgs::default(),
         }
     }
 
@@ -2914,6 +3056,7 @@ mod tests {
             store: temp.store(),
             owner_id: Some("test-runner".into()),
             lease_ttl: None,
+            execution: DurableExecutionArgs::default(),
         }));
 
         assert_eq!(code, EXIT_FAILED, "a cancelled run is not a success");
@@ -2974,6 +3117,7 @@ mod tests {
             store: temp.store(),
             owner_id: Some("second".into()),
             lease_ttl: None,
+            execution: DurableExecutionArgs::default(),
         }));
         assert_eq!(code, EXIT_OK, "{finished}");
         assert_eq!(
@@ -2996,6 +3140,7 @@ mod tests {
             store: temp.store(),
             owner_id: None,
             lease_ttl: None,
+            execution: DurableExecutionArgs::default(),
         }));
 
         assert_eq!(code, EXIT_FAILED);
@@ -3027,6 +3172,7 @@ mod tests {
             run_id: Some("run-1".into()),
             owner_id: None,
             lease_ttl: None,
+            execution: DurableExecutionArgs::default(),
         }));
 
         assert_eq!(code, EXIT_FAILED);
@@ -3035,6 +3181,86 @@ mod tests {
         assert_eq!(
             payload["error"]["details"]["unsupportedSteps"],
             json!(["press"])
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_cli_runs_a_durable_read_only_process_plugin() {
+        let temp = TempDir::new("readonly-plugin");
+        let path = temp.path.join("readonly.yaml");
+        std::fs::write(
+            &path,
+            concat!(
+                "apiVersion: ai-auto-desktop.dev/v1alpha1\n",
+                "kind: Workflow\n",
+                "metadata:\n  name: durable.readonly\n",
+                "requires:\n  platforms: [linux]\n  permissions: [desktop.observe]\n",
+                "budgets:\n  max_duration: 10s\n  max_executed_steps: 2\n",
+                "outputs:\n  backend:\n    value: '${{ steps.inspect.output.backend }}'\n",
+                "steps:\n",
+                "  - id: inspect\n    type: action\n",
+                "    uses: desktop.linux_atspi.inspect_session@1\n",
+                "    with: {}\n",
+                "    effect: {class: read_only}\n",
+                "    risk: {category: observe, level: low}\n",
+                "    sensitivity: {input: public, output: public, error: public}\n",
+                "    checkpoint:\n      output:\n        mode: project\n",
+                "        fields: [backend]\n",
+            ),
+        )
+        .unwrap();
+        let plugin = workspace_root()
+            .join("plugins/linux_atspi/run.sh")
+            .display()
+            .to_string();
+
+        let (payload, code) = dispatch(&Command::Start(StartArgs {
+            file: path,
+            store: temp.store(),
+            inputs: None,
+            run_id: Some("run-1".into()),
+            owner_id: Some("test-runner".into()),
+            lease_ttl: None,
+            execution: DurableExecutionArgs {
+                plugins: vec![format!("desktop.linux_atspi={plugin}")],
+                permissions: vec!["desktop.observe".into()],
+                durable_actions: DurableActions::ReadOnly,
+            },
+        }));
+
+        assert_eq!(code, EXIT_OK, "{payload}");
+        assert_eq!(payload["status"], "succeeded");
+        assert!(payload["output"]["backend"].is_string());
+    }
+
+    #[test]
+    fn plugin_commands_preserve_arguments_and_reject_unclosed_quotes() {
+        assert_eq!(
+            split_plugin_command(r#"python "driver with spaces.py" --mode inspect"#),
+            Some(vec![
+                "python".to_string(),
+                "driver with spaces.py".to_string(),
+                "--mode".to_string(),
+                "inspect".to_string(),
+            ])
+        );
+        assert_eq!(split_plugin_command("python 'unterminated"), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn plugin_commands_preserve_windows_path_separators() {
+        assert_eq!(
+            split_plugin_command(r#""C:\Program Files\Python\python.exe" driver.py"#),
+            Some(vec![
+                r"C:\Program Files\Python\python.exe".to_string(),
+                "driver.py".to_string(),
+            ])
+        );
+        assert_eq!(
+            split_plugin_command(r"plugins\windows_uia\run.cmd"),
+            Some(vec![r"plugins\windows_uia\run.cmd".to_string()])
         );
     }
 
@@ -3091,6 +3317,7 @@ mod tests {
                 run_id: Some("run-1".into()),
                 owner_id: None,
                 lease_ttl: Some(bad),
+                execution: DurableExecutionArgs::default(),
             }));
             assert_eq!(code, EXIT_USAGE, "{bad} should be rejected");
             assert_eq!(payload["error"]["code"], "CLI.INVALID_ARGUMENTS");

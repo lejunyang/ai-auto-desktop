@@ -78,7 +78,7 @@ fn read_only_actions(names: &[&str]) -> Value {
     for name in names {
         actions.insert(
             (*name).to_string(),
-            json!({"contract_major": 1, "effect": {"class": "read_only"}}),
+            json!({"contract_major": 1, "effect": {"default_class": "read_only"}}),
         );
     }
     Value::Object(actions)
@@ -89,7 +89,7 @@ fn actions_with_effect(names: &[&str], class: &str) -> Value {
     for name in names {
         actions.insert(
             (*name).to_string(),
-            json!({"contract_major": 1, "effect": {"class": class}}),
+            json!({"contract_major": 1, "effect": {"default_class": class}}),
         );
     }
     Value::Object(actions)
@@ -1125,6 +1125,32 @@ fn a_workflow_level_finally_runs_on_the_failure_path() {
     assert_eq!(cleaned.load(Ordering::SeqCst), 1);
 }
 
+#[test]
+fn a_workflow_finally_failure_on_success_has_a_stable_wrapper() {
+    let provider = Fake::build(
+        "fixture",
+        read_only_actions(&["cleanup"]),
+        Box::new(|_, _, _| {
+            Err(
+                AutomationError::new("FIXTURE.CLEANUP_FAILED", "cleanup failed")
+                    .with_effect("not_applied"),
+            )
+        }),
+    );
+    let workflow = descriptor(json!({
+        "steps": [{"id": "work", "type": "return", "value": null}],
+        "finally": [{"id": "cleanup", "type": "action", "uses": "fixture.cleanup@1", "with": {}}]
+    }));
+
+    let result = execute(&workflow, registry(vec![provider]));
+    let error = result.error.expect("cleanup failure");
+
+    assert_eq!(result.status, RunStatus::Failed);
+    assert_eq!(error.code, "WORKFLOW.FINALLY_FAILED");
+    assert_eq!(error.phase.as_deref(), Some("cleanup"));
+    assert_eq!(error.cause.unwrap().code, "FIXTURE.CLEANUP_FAILED");
+}
+
 // ---------------------------------------------------------------------------
 // Budgets, effects and cancellation
 // ---------------------------------------------------------------------------
@@ -1667,29 +1693,22 @@ fn a_script_step_is_refused_unless_the_caller_opted_in() {
 
 #[test]
 fn a_refused_script_never_reaches_the_interpreter() {
-    // The refusal has to mean *nothing ran*, not merely that the reported
-    // status was a failure. This proves it by observing the filesystem: the
-    // script's only job is to leave a mark, so the mark's absence is direct
-    // evidence no interpreter ever executed the code.
+    // The refusal has to happen before interpreting the body. Use a program
+    // that would return an unmistakable value when allowed; writing a marker
+    // into the host's temp directory is not a valid control because the Linux
+    // sandbox deliberately gives the script a private, empty /tmp.
     if aad_runtime::script::availability()["state"] == "unavailable" {
         return;
     }
-    let marker = std::env::temp_dir().join(format!(
-        "aad-script-gate-{}-{:?}.marker",
-        std::process::id(),
-        std::thread::current().id()
-    ));
-    let _ = std::fs::remove_file(&marker);
 
     let body = json!({
         "steps": [{
             "id": "mark", "type": "script",
             "runtime": "python",
             "output_schema": {"type": "object"},
-            "source": "import json,sys; data=json.load(sys.stdin); \
-    open(data['path'],'w').write('ran'); print(json.dumps({}))",
-            "inputs": {"path": marker.to_string_lossy()}
-        }]
+            "source": "import json; print(json.dumps({'ran': True}))"
+        }],
+        "outputs": {"ran": {"value": "${{ steps.mark.output.ran }}"}}
     });
 
     let refused = execute(&descriptor(body.clone()), registry(vec![]));
@@ -1699,8 +1718,8 @@ fn a_refused_script_never_reaches_the_interpreter() {
         Some("SCRIPT.SANDBOX_DENIED")
     );
     assert!(
-        !marker.exists(),
-        "a refused script must not have executed at all"
+        refused.outputs.is_empty(),
+        "a refused script produced output"
     );
 
     // And the same descriptor *does* leave the mark once the caller opts in,
@@ -1708,8 +1727,7 @@ fn a_refused_script_never_reaches_the_interpreter() {
     // script that could never have written the file anyway.
     let allowed = execute_trusting_scripts(&descriptor(body));
     assert_eq!(allowed.status, RunStatus::Succeeded, "{:?}", allowed.error);
-    assert!(marker.exists(), "the control case must actually run");
-    let _ = std::fs::remove_file(&marker);
+    assert_eq!(allowed.outputs["ran"], json!(true));
 }
 
 #[test]
@@ -1815,6 +1833,84 @@ fn a_descriptor_without_a_runtime_requirement_is_unaffected() {
     let result = execute(&workflow, registry(vec![]));
 
     assert_eq!(result.status, RunStatus::Succeeded);
+}
+
+#[test]
+fn workflow_platform_and_permission_requirements_fail_before_dispatch() {
+    let provider = Fake::echo("fixture", &["ping"]);
+    let other_platform = if cfg!(target_os = "windows") {
+        "linux"
+    } else {
+        "windows"
+    };
+    let unsupported = descriptor(json!({
+        "requires": {"platforms": [other_platform]},
+        "steps": [{"id": "act", "type": "action", "uses": "fixture.ping@1", "with": {}}]
+    }));
+    let result = execute(&unsupported, registry(vec![provider.clone()]));
+    assert_eq!(
+        result.error.unwrap().code,
+        "CAPABILITY.PLATFORM_UNSUPPORTED"
+    );
+    assert_eq!(provider.calls(), 0);
+
+    let permission = descriptor(json!({
+        "requires": {"permissions": ["desktop.observe"]},
+        "steps": [{"id": "act", "type": "action", "uses": "fixture.ping@1", "with": {}}]
+    }));
+    let denied = execute(&permission, registry(vec![provider.clone()]));
+    assert_eq!(denied.error.unwrap().code, "POLICY.DENIED");
+    assert_eq!(provider.calls(), 0);
+
+    let allowed = run(
+        &permission,
+        RunOptions::default()
+            .with_providers(registry(vec![provider.clone()]))
+            .with_granted_permissions(["desktop.observe"]),
+    );
+    assert_eq!(allowed.status, RunStatus::Succeeded, "{:?}", allowed.error);
+    assert_eq!(provider.calls(), 1);
+}
+
+#[test]
+fn action_input_and_output_schemas_are_enforced_around_dispatch() {
+    let input_provider = Fake::build(
+        "fixture",
+        json!({
+            "typed": {
+                "contract_major": 1,
+                "effect": {"default_class": "read_only"},
+                "input_schema": {"type": "object", "required": ["value"], "properties": {"value": {"type": "string"}}},
+                "output_schema": {"type": "object", "required": ["ok"], "properties": {"ok": {"type": "boolean"}}}
+            }
+        }),
+        Box::new(|_, _, _| Ok(json!({"ok": true}))),
+    );
+    let invalid_input = descriptor(json!({
+        "steps": [{"id": "act", "type": "action", "uses": "fixture.typed@1", "with": {"value": 7}}]
+    }));
+    let result = execute(&invalid_input, registry(vec![input_provider.clone()]));
+    assert_eq!(result.error.unwrap().code, "ACTION.INPUT_INVALID");
+    assert_eq!(input_provider.calls(), 0);
+
+    let output_provider = Fake::build(
+        "fixture",
+        json!({
+            "typed": {
+                "contract_major": 1,
+                "effect": {"default_class": "read_only"},
+                "input_schema": {"type": "object"},
+                "output_schema": {"type": "object", "required": ["ok"], "properties": {"ok": {"type": "boolean"}}}
+            }
+        }),
+        Box::new(|_, _, _| Ok(json!({"ok": "not-a-boolean"}))),
+    );
+    let invalid_output = descriptor(json!({
+        "steps": [{"id": "act", "type": "action", "uses": "fixture.typed@1", "with": {}}]
+    }));
+    let result = execute(&invalid_output, registry(vec![output_provider.clone()]));
+    assert_eq!(result.error.unwrap().code, "ACTION.OUTPUT_INVALID");
+    assert_eq!(output_provider.calls(), 1);
 }
 
 #[test]

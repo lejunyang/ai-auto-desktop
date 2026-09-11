@@ -27,8 +27,10 @@ pub const DEFAULT_MAX_OUTPUT_BYTES: usize = 1024 * 1024;
 const MAX_STDERR_BYTES: usize = 64 * 1024;
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 /// Matches the Linux `--as` limit, so both platforms cap memory alike.
+#[cfg(windows)]
 const MEMORY_LIMIT_BYTES: u64 = 536_870_912;
 /// The interpreter plus a small margin.
+#[cfg(windows)]
 const MAX_ACTIVE_PROCESSES: u32 = 8;
 
 fn error(code: &str, message: impl Into<String>) -> AutomationError {
@@ -340,12 +342,33 @@ fn run_sandboxed(
 ) -> Result<Value, AutomationError> {
     let bubblewrap = which("bwrap")
         .ok_or_else(|| error("SCRIPT.SANDBOX_UNAVAILABLE", "bubblewrap is not available"))?;
+    // `/usr/bin/python3` is a symlink on Debian and Ubuntu (including GitHub's
+    // runners). Binding the symlink alone into a fresh mount namespace leaves
+    // its target absent, so bwrap starts successfully and then reports the
+    // misleading `execvp ... No such file or directory`. Resolve the trusted,
+    // fixed path on the host and bind the actual executable at the canonical
+    // in-sandbox name.
+    let interpreter = Path::new("/usr/bin/python3")
+        .canonicalize()
+        .map_err(|value| error("SCRIPT.SANDBOX_UNAVAILABLE", format!("{value}")))?;
 
     let seconds = budget.as_secs().max(1) + 1;
-    let mut child = Command::new(bubblewrap)
+    let mut command = Command::new(bubblewrap);
+    command
         .args(["--unshare-all", "--die-with-parent", "--new-session"])
-        .args(["--ro-bind", "/usr/bin/python3", "/usr/bin/python3"])
-        .args(["--ro-bind", "/usr/lib", "/usr/lib"])
+        .arg("--ro-bind")
+        .arg(interpreter)
+        .arg("/usr/bin/python3")
+        .args(["--ro-bind", "/usr/lib", "/usr/lib"]);
+    // Dynamic loaders live under /lib or /lib64 depending on the distribution.
+    // They are outside /usr/lib on GitHub's Ubuntu runners, so the interpreter
+    // exists in the sandbox but cannot be executed unless these roots follow it.
+    for library_root in ["/lib", "/lib64"] {
+        if Path::new(library_root).exists() {
+            command.args(["--ro-bind", library_root, library_root]);
+        }
+    }
+    let mut child = command
         .args(["--ro-bind", &source.display().to_string(), "/script.py"])
         .args(["--tmpfs", "/tmp", "--chdir", "/tmp"])
         .args(["--proc", "/proc", "--dev", "/dev"])

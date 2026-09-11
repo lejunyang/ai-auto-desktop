@@ -36,6 +36,7 @@ indexmap = { version = "2", features = ["serde"] }
 sha2 = "0.10"
 uuid = { version = "1", features = ["v4"] }
 clap = { version = "4", features = ["derive"] }
+shlex = "1"
 jsonschema = { version = "0.18", default-features = false }
 thiserror = "1"
 # Bundled so the durable journal does not depend on a system SQLite whose

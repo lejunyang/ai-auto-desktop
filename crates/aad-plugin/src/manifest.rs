@@ -35,6 +35,11 @@ pub struct ActionContract {
     pub effect_class: Option<String>,
     pub risk_category: Option<String>,
     pub risk_level: Option<String>,
+    pub permissions: Vec<String>,
+    pub timeout: Option<String>,
+    pub errors: Vec<Value>,
+    pub sensitivity: Option<Value>,
+    pub durability: Option<Value>,
     pub input_schema: Option<Value>,
     pub output_schema: Option<Value>,
     pub artifact_inputs: BTreeMap<String, ArtifactSlot>,
@@ -55,6 +60,7 @@ pub struct CapabilityManifest {
     pub version: Option<String>,
     pub description: Option<String>,
     pub platforms: Vec<String>,
+    pub permissions: Vec<String>,
     pub actions: BTreeMap<String, ActionContract>,
     pub raw: Value,
 }
@@ -216,7 +222,7 @@ pub fn parse(raw: &Value) -> std::result::Result<CapabilityManifest, String> {
         let effect_class = action
             .get("effect")
             .and_then(Value::as_object)
-            .and_then(|effect| effect.get("class"))
+            .and_then(|effect| effect.get("default_class").or_else(|| effect.get("class")))
             .and_then(Value::as_str)
             .map(str::to_string);
         let risk = action.get("risk").and_then(Value::as_object);
@@ -262,6 +268,18 @@ pub fn parse(raw: &Value) -> std::result::Result<CapabilityManifest, String> {
                     .and_then(|value| value.get("level"))
                     .and_then(Value::as_str)
                     .map(str::to_string),
+                permissions: string_array(action.get("permissions")),
+                timeout: action
+                    .get("timeout")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                errors: action
+                    .get("errors")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default(),
+                sensitivity: action.get("sensitivity").cloned(),
+                durability: action.get("durability").cloned(),
                 input_schema: action.get("input_schema").cloned(),
                 output_schema: action.get("output_schema").cloned(),
                 artifact_inputs,
@@ -282,19 +300,27 @@ pub fn parse(raw: &Value) -> std::result::Result<CapabilityManifest, String> {
             .and_then(Value::as_str)
             .map(str::to_string),
         platforms: root
-            .get("platforms")
-            .and_then(Value::as_array)
-            .map(|items| {
-                items
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .map(str::to_string)
-                    .collect()
-            })
-            .unwrap_or_default(),
+            .get("runtime")
+            .and_then(Value::as_object)
+            .and_then(|runtime| runtime.get("platforms"))
+            .map_or_else(Vec::new, |value| string_array(Some(value))),
+        permissions: string_array(root.get("permissions")),
         actions: parsed_actions,
         raw: raw.clone(),
     })
+}
+
+fn string_array(value: Option<&Value>) -> Vec<String> {
+    value
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Build a manifest document, used by tests and by native in-process drivers.
@@ -324,7 +350,7 @@ mod tests {
     #[test]
     fn a_minimal_manifest_parses() {
         let parsed = parse(&manifest(json!({
-            "ocr": {"contract_major": 1, "effect": {"class": "read_only"}}
+            "ocr": {"contract_major": 1, "effect": {"default_class": "read_only"}}
         })))
         .expect("manifest should parse");
 

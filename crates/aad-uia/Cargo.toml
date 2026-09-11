@@ -7,6 +7,13 @@ license.workspace = true
 repository.workspace = true
 description = "Native Windows UI Automation driver: app discovery, UI description and automation"
 
+[features]
+# These executables are investigation tools that call Win32/UIA APIs directly.
+# Keeping them behind an explicit feature prevents Cargo's automatic example
+# discovery from trying to build Windows binaries on Linux and macOS. CI turns
+# the feature on in its Windows job so they are still compilation-checked.
+windows-native-examples = []
+
 [dependencies]
 aad-core = { workspace = true }
 aad-plugin = { workspace = true }
@@ -37,3 +44,35 @@ windows = { version = "0.58", features = [
 # Inherit the workspace's deliberate lint allowances (see the root Cargo.toml).
 [lints]
 workspace = true
+
+[[example]]
+name = "capture_fields"
+required-features = ["windows-native-examples"]
+
+[[example]]
+name = "capture_probe"
+required-features = ["windows-native-examples"]
+
+[[example]]
+name = "spike_compare"
+required-features = ["windows-native-examples"]
+
+[[example]]
+name = "spike_events"
+required-features = ["windows-native-examples"]
+
+[[example]]
+name = "spike_identity"
+required-features = ["windows-native-examples"]
+
+[[example]]
+name = "spike_listen"
+required-features = ["windows-native-examples"]
+
+[[example]]
+name = "spike_which_events"
+required-features = ["windows-native-examples"]
+
+[[example]]
+name = "spike_winevent"
+required-features = ["windows-native-examples"]

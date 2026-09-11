@@ -131,6 +131,30 @@ impl ProviderRegistry {
     }
 }
 
+/// Start a named subprocess plugin and add it to a registry.
+pub fn register_process_plugin(
+    registry: &mut ProviderRegistry,
+    name: &str,
+    command: Vec<String>,
+) -> Result<(), AutomationError> {
+    let plugin = ProcessPlugin::start(aad_plugin::PluginSpec::new(command).with_name(name))
+        .map_err(PluginError::into_automation_error)?;
+    let provider = PluginProvider::new(plugin).map_err(PluginError::into_automation_error)?;
+    if provider.manifest().name != name {
+        return Err(AutomationError::new(
+            "CAPABILITY.MISSING",
+            format!(
+                "plugin {name:?} advertised itself as {:?}",
+                provider.manifest().name
+            ),
+        )
+        .with_category("capability")
+        .with_effect("not_applied"));
+    }
+    registry.insert(Arc::new(provider));
+    Ok(())
+}
+
 impl std::fmt::Debug for ProviderRegistry {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -165,7 +189,7 @@ pub(crate) mod testing {
             for action in actions {
                 declared.insert(
                     (*action).to_string(),
-                    json!({"contract_major": 1, "effect": {"class": "read_only"}}),
+                    json!({"contract_major": 1, "effect": {"default_class": "read_only"}}),
                 );
             }
             let document = manifest::document(name, declared);

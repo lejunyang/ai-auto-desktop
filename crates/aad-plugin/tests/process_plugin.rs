@@ -66,8 +66,8 @@ MANIFEST = {
     "kind": "CapabilityManifest",
     "metadata": {"name": "fixture"},
     "actions": {
-        "echo": {"contract_major": 1, "effect": {"class": "read_only"}},
-        "boom": {"contract_major": 1, "effect": {"class": "read_only"}},
+        "echo": {"contract_major": 1, "effect": {"default_class": "read_only"}},
+        "boom": {"contract_major": 1, "effect": {"default_class": "read_only"}},
     },
 }
 

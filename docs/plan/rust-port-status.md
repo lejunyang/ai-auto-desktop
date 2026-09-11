@@ -1,6 +1,6 @@
 # Rust 移植状态跟踪
 
-> 基线日期 2026-09-01。本文记录 Python v0 已有、但 Rust 尚未实现的能力，用于跟踪重构进度。
+> 基线日期 2026-09-11。本文记录 Python v0 已有、但 Rust 尚未实现的能力，用于跟踪重构进度。
 >
 > 本文只记录**经代码核实**的状态，不记录推测。每一条"未移植"都在写入前用检索或运行验证过；
 > 核实方式写在条目里，便于后续复核。核实结论会随代码变化过期，改动相关模块时应重新核对。
@@ -24,13 +24,13 @@ Rust 是本项目的主实现，对外提供 **CLI + GUI** 两种形态，CLI �
 | AADF 制品线格式 | `crates/aad-plugin/src/artifact.rs` | 帧编解码完整，**但未接入宿主主流程**，见 §2.5 |
 | Windows UIA driver | `crates/aad-uia` | 发现、描述、locator 合成、控制、staleness 校验 |
 | 能力探测 | `crates/aad-probe` | 只读 |
-| MCP server | `crates/aad-mcp` | 9 个工具，见 §2.6 |
-| CLI | `crates/aad-cli` | 11 个子命令，见 §2.2 |
-| 录制存取（子集） | `gui/src-tauri/src/recordings.rs`、`gui/src/recording.ts` | 存 locator 而非 target，见 §2.4 |
+| MCP server | `crates/aad-mcp` | 14 个工具，见 §2.6 |
+| CLI | `crates/aad-cli` | 20 个子命令，见 §2.2 |
+| 录制存取（子集） | `crates/aad-runtime/src/recordings.rs`、`gui/src/recording.ts` | 存 locator 而非 target，见 §2.4 |
 
 ## 2. 未移植
 
-### 2.1 持久化执行（进行中）
+### 2.1 持久化执行（受限能力已完成）
 
 **Python**：`durable.py`(65KB)、`journal.py`(51KB)、`run_service.py`(26KB)
 **规范**：`docs/architecture/runtime.md` §8.1
@@ -49,23 +49,32 @@ Rust 是本项目的主实现，对外提供 **CLI + GUI** 两种形态，CLI �
   `run_segment()` 先 advance index 再执行，崩在步骤中途的段不会被静默重跑。
 - checkpoint 编解码（`durable_exec.rs`）：version 不符 → `CHECKPOINT_UNSUPPORTED`，
   planDigest 不符 → `PLAN_MISMATCH`，缺 deadline → `CHECKPOINT_INVALID`（不得当成"无限制"）。
-- `in_top_level_step` / `finalizing` 被中断时**零 dispatch** 落 `UNKNOWN_EFFECT`，连 cleanup 也不跑。
+- `action_intent` v2 受限重放：默认仍为 `deny`；显式指定 `--durable-actions read-only` 后，
+  支持具备稳定 provider/contract/projection/input 摘要和 public 输出投影的顶层单次只读 action。
+  intent 在 dispatch 前持久化并预留 attempt，恢复时重新校验全部绑定；无效、过期或被篡改的
+  intent 在 dispatch 前失败关闭。provider 调用期间由独立连接持续续租，首次续租成功才允许派发。
+- `run` / `start` / `resume` 已支持 `--plugin NAME=COMMAND` 与 `--permission`；`start` / `resume`
+  已支持 `--durable-actions deny|read-only`。Linux AT-SPI 真实 subprocess provider 已从 Rust CLI
+  端到端验证，会产生 `run.action_intent`、`run.action_dispatch_authorized` 和完成 checkpoint。
+- checkpoint v2 的 finalization v1 三阶段恢复：`intent` 可安全执行 cleanup 一次；`started` 零重放并落
+  `UNKNOWN_EFFECT`；`result` 只提交已持久化的终态，不再创建 runner 或重放 cleanup。旧版裸
+  `finalizing` checkpoint 仍保守处理；checkpoint v1 的安全 step 边界保持可恢复。
+- `in_top_level_step` 被中断时**零 dispatch** 落 `UNKNOWN_EFFECT`，连 cleanup 也不跑。
   **核实方式**：`a_killed_process_leaves_a_recoverable_journal` 真的 spawn 一个
   `crash_runner` 子进程并在它提交进度后 `kill`，再从磁盘恢复；实测在第 4 步被杀，
   恢复后 `status=unknown_effect`、`run.segment_entered` 计数不增（无重放）。
 
-仍缺：
+没有继续照搬为新实现的部分：
 
-- `action_intent` v2 受限重放：当前是 `deny` 模式，**拒绝一切 action / script**
-  （无 intent 机制就无法证明某次派发可安全重复）。规范另定义 `--durable-actions read-only`，
-  详见下方「§2.1.1 action_intent 待决」。
-- `run_service.py` 的服务层（尚未读）。
+- Python `RunService` 的独立服务门面没有另建一层；Rust 直接组合公开的 `DurableExecutor` 与
+  `JournalStore`，CLI 命令能力已经覆盖。除非后续出现第二个需要统一策略的宿主，再抽 service
+  facade 只会制造一层转发，不是当前产品能力缺口。
 
-#### 2.1.1 action_intent 待决（范围未拍板）
+#### 2.1.1 action_intent（已完成）
 
 **规范依据**：`docs/architecture/runtime.md` §8.1 第 200–235 行（已逐字读过）。
 
-要解决的问题：durable 现在拒绝一切 action，因为进程死在 dispatch 中途时，journal 无法区分
+解决的问题：durable 默认拒绝一切 action，因为进程死在 dispatch 中途时，journal 无法区分
 「请求还没发出」与「请求已到达桌面、副作用已发生」。重放可能点两次按钮，报失败可能谎称什么
 都没做，所以只能落 `unknown_effect` 让人来判断。`action_intent` 是把**一部分** action 从
 「不可判定」拉回「可判定」的机制——注意是一部分，不是全部。
@@ -93,27 +102,26 @@ provider / contract / projection / input binding 的**摘要**——**不记原�
 `checkpoint_fields` 白名单投影后才进 checkpoint，避免把无界或敏感的 provider 响应写进
 持久存储。两个条件缺一不可。
 
-仍然不变的底线：**没有**合法 `action_intent` 的 `in_top_level_step` / `finalizing` 依旧
-必须零 dispatch 终结为 `UNKNOWN_EFFECT`；进入 workflow finally 前先写 `finalizing`，
-避免崩溃后重复 cleanup。所有边界（intent、dispatch 授权、完成 checkpoint、终态提交）都用
-期望 `desiredState` 做 CAS，pause/cancel 与完成并发时转入控制路径而不覆盖 operator 意图。
+仍然不变的底线：**没有**合法 `action_intent` 的 `in_top_level_step` 依旧必须零 dispatch 终结为
+`UNKNOWN_EFFECT`；workflow finally 由三阶段 finalization checkpoint 区分「尚未开始」「可能已开始」
+和「结果已落盘」。所有边界（intent、dispatch 授权、完成 checkpoint、终态提交）都用期望
+`desiredState` 做 CAS，pause/cancel 与完成并发时转入控制路径而不覆盖 operator 意图。
 
 **注意规范自己声明的局限**（第 234–235 行）：lease 只在持久边界同步 heartbeat，它保证旧
 owner 不能继续写 journal，但**不等于**能异步强杀已经进入插件或 OS 的调用。
 
-未决：是否实现。做了之后能持久化运行的仍然只是「顶层只读观察 + 纯计算」类工作流；真正的
+实现后的范围仍然只是「顶层只读观察 + 纯计算」类工作流；真正的
 写操作（点击、输入）**依然**落 `unknown_effect`，因为写 action 的 reconciliation 规范
-本身也列为 v1 之后的工作（§2 表格「写 action/script reconciliation」）。因此收益是否
-匹配工作量，需要产品判断。
+本身也列为 v1 之后的工作（§2 表格「写 action/script reconciliation」）。
 
 CLI 七命令已补齐（`start` / `resume` / `status` / `pause` / `cancel` / `list` / `events`），
 与 Python 的差异是刻意的：
 
 - 存储参数叫 `--store` 而非 `--journal`。`run --journal` 写 NDJSON 并**截断**目标文件，
   同名会让一次打错毁掉运行库。
-- 未移植 `--plugin` / `--permission` / `--allow-scripts`：durable 目前拒绝 action/script，
-  这三个参数在当前模式下无处生效，接受了却忽略比不提供更糟。
-- 未移植 `--durable-actions`：只有 `deny` 一种模式可选时，提供选项是误导。
+- `run`、`start`、`resume` 均支持 `--plugin` / `--permission`；后两者支持
+  `--durable-actions deny|read-only`，默认仍是 `deny`。
+- `start` / `resume` 不提供 `--allow-scripts`：durable script reconciliation 尚未定义，因此始终拒绝。
 
 **核实方式**：真实二进制跨进程验证过完整链路——`start` 落库后由**另一个进程** `status` /
 `list` / `events` 读回；`pause` 时 `desiredState=pause` 而 `status=running`（不谎称已停），
@@ -126,8 +134,9 @@ runner 在 `nextTopLevelIndex=4` 的段边界停下；换 `--owner-id` 的进程
 
 **核实方式**：`aad help` 实际输出 vs `cli.py` 的 `add_parser` 调用。
 
-Rust 有：`apps`、`describe`、`snapshot`、`find`、`do`、`probe`、`validate`、`run`、`mcp`、
-`tools`、`start`、`resume`、`status`、`pause`、`cancel`、`list`、`events`（共 17 个）。
+Rust 有：`apps`、`describe`、`overview`、`snapshot`、`find`、`do`、`probe`、`workflows`、
+`validate`、`run`、`record`、`mcp`、`tools`、`start`、`resume`、`status`、`pause`、`cancel`、
+`list`、`events`（共 20 个）。
 Python 另有 `edit`（属 §2.4 的浏览器编辑器，已由 GUI 取代，不再需要）。
 参数层面的刻意差异见 §2.1 末尾。
 
@@ -185,7 +194,7 @@ Windows 的受保护 ACL + 单实例 + 双向 PID 校验 named pipe，以及环�
 ### 2.6 MCP 回放工作流（已完成）
 
 **核实方式**：用真实 `aad mcp` 子进程跑一次 stdio 会话（脚本见提交说明），
-`tools/list` 返回 12 个工具；`list_workflows` → `count=1`；`describe_workflow` →
+`tools/list` 返回 14 个工具；`list_workflows` → `count=1`；`describe_workflow` →
 `stepCount`/`inputs`/`planDigest`/`runnable`；`run_workflow(who=agent)` →
 `status=succeeded`、`outputs={"greeting":"agent"}`。
 
@@ -215,9 +224,10 @@ Windows 的受保护 ACL + 单实例 + 双向 PID 校验 named pipe，以及环�
 
 #### 2.6.1 已发现的缺陷：`run_workflow` 未注册桌面 provider（已修复并验证，提交 0920057）
 
-准备接持久化时先查了一件事：durable 目前拒绝 `action` 与 `script` 步骤，而录制导出的工作流
-（`gui/src/recording.ts`）**全部是** `action` 步骤（`uses` + `with`）。也就是说接上 durable 后，
-每一个真实录制都会被 `DURABLE.UNSUPPORTED_PLAN` 拒绝——先接 durable 是无用功。
+当时准备接持久化时先查了一件事：durable 尚未实现 `action_intent`，会拒绝 `action` 与
+`script` 步骤，而录制导出的工作流（`gui/src/recording.ts`）**全部是** `action` 步骤
+（`uses` + `with`）。这段记录描述的是该节修复 MCP provider 接线时的历史前提；当前 Rust durable
+已支持显式 opt-in 的顶层只读 action，写 action 与 script 仍拒绝。
 
 顺着这条线读代码，发现一个更要紧的问题：`run_workflow` 构造的是
 `RunOptions::default().with_inputs(...)`，**没有 `with_providers`**。CLI 的 `run` 路径在

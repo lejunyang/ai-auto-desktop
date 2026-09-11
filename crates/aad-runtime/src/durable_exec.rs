@@ -5,19 +5,22 @@
 //! flight, and a later process can resume from the last committed boundary.
 //!
 //! The safety rule that shapes everything here: **an interrupted segment is not
-//! replayed.** When a process dies inside a step, the journal cannot know
-//! whether the step's side effect reached the desktop. Retrying might click a
-//! button twice; reporting failure might claim nothing happened when something
-//! did. So a run interrupted mid-step is finalised as `UNKNOWN_EFFECT` with zero
-//! further dispatch, and a human decides. That is why this module currently
-//! accepts only workflows with no actions at all (`deny` mode): without the
-//! `action_intent` machinery there is no way to prove a dispatch was safe to
-//! repeat.
+//! replayed unless a validated intent proves that replay is safe.** When a
+//! process dies inside an ordinary step, the journal cannot know whether the
+//! step's side effect reached the desktop. Retrying might click a button twice;
+//! reporting failure might claim nothing happened when something did. Such a
+//! run is finalised as `UNKNOWN_EFFECT` with zero further dispatch. The explicit
+//! `read-only` mode is the narrow exception: a top-level observation with a
+//! durable `action_intent` and public output projection can be validated and
+//! safely replayed after a crash.
 //!
 //! Control is cooperative and honoured only at segment boundaries, which are the
 //! points where the run's state is known and recorded.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
+use std::sync::mpsc;
+use std::time::Duration;
 
 use aad_core::{AutomationError, WorkflowDescriptor};
 use serde_json::{json, Map, Value};
@@ -25,12 +28,14 @@ use serde_json::{json, Map, Value};
 use crate::durable::{
     self, DesiredState, JournalError, JournalStore, OwnerLease, RunRecord, RunStatus,
 };
-use crate::engine::{self, RunOptions, Segment, SegmentState, Segmented};
+use crate::engine::{self, FinalizationIntent, RunOptions, Segment, SegmentState, Segmented};
 use crate::journal::RunStatus as EngineStatus;
+use crate::provider::ProviderRegistry;
 
 /// The checkpoint format. Bumped when its meaning changes, so a checkpoint
 /// written by an incompatible version is refused rather than misread.
-pub const CHECKPOINT_VERSION: u32 = 1;
+pub const CHECKPOINT_VERSION: u32 = 2;
+const LEGACY_CHECKPOINT_VERSION: u32 = 1;
 
 /// How long a lease is held before it must be renewed.
 ///
@@ -48,6 +53,8 @@ pub enum Phase {
     InStep,
     /// No step was in flight; the next one has not begun.
     BetweenSteps,
+    /// A read-only action has a durable, validated dispatch intent.
+    ActionIntent,
     /// Workflow cleanup was running.
     Finalizing,
 }
@@ -57,6 +64,7 @@ impl Phase {
         match self {
             Self::InStep => "in_top_level_step",
             Self::BetweenSteps => "between_top_level_steps",
+            Self::ActionIntent => "action_intent",
             Self::Finalizing => "finalizing",
         }
     }
@@ -65,6 +73,7 @@ impl Phase {
         match value {
             "in_top_level_step" => Some(Self::InStep),
             "between_top_level_steps" => Some(Self::BetweenSteps),
+            "action_intent" => Some(Self::ActionIntent),
             "finalizing" => Some(Self::Finalizing),
             _ => None,
         }
@@ -104,6 +113,42 @@ pub struct DurableOptions {
     pub owner_id: String,
     pub lease_ttl_seconds: f64,
     pub base_directory: PathBuf,
+    pub providers: ProviderRegistry,
+    pub granted_permissions: BTreeSet<String>,
+    pub action_mode: DurableActionMode,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DurableActionMode {
+    #[default]
+    Deny,
+    ReadOnly,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FinalizationStage {
+    Intent,
+    Started,
+    Result,
+}
+
+impl FinalizationStage {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "intent" => Some(Self::Intent),
+            "started" => Some(Self::Started),
+            "result" => Some(Self::Result),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct FinalizedRun {
+    status: RunStatus,
+    output: Option<Value>,
+    error: Option<Value>,
+    executed_steps: u64,
 }
 
 impl Default for DurableOptions {
@@ -115,6 +160,9 @@ impl Default for DurableOptions {
             owner_id: format!("runner-{}", uuid::Uuid::new_v4().simple()),
             lease_ttl_seconds: DEFAULT_LEASE_TTL_SECONDS,
             base_directory: std::env::current_dir().unwrap_or_else(|_| ".".into()),
+            providers: ProviderRegistry::new(),
+            granted_permissions: BTreeSet::new(),
+            action_mode: DurableActionMode::Deny,
         }
     }
 }
@@ -143,6 +191,44 @@ impl DurableOptions {
         self.base_directory = directory;
         self
     }
+
+    pub fn with_providers(mut self, providers: ProviderRegistry) -> Self {
+        self.providers = providers;
+        self
+    }
+
+    pub fn with_granted_permissions<I, S>(mut self, permissions: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.granted_permissions = permissions.into_iter().map(Into::into).collect();
+        self
+    }
+
+    pub fn with_action_mode(mut self, mode: DurableActionMode) -> Self {
+        self.action_mode = mode;
+        self
+    }
+}
+
+#[derive(Clone, Debug)]
+struct DurableBinding {
+    contract: aad_plugin::manifest::ActionContract,
+    provider_digest: String,
+    contract_digest: String,
+    projection_digest: String,
+    selected: Vec<String>,
+    definitions: BTreeMap<String, Value>,
+}
+
+#[derive(Clone, Debug)]
+struct PreparedAction {
+    step: aad_core::model::CompiledStep,
+    binding: DurableBinding,
+    binding_digest: String,
+    args: Value,
+    dispatch_deadline_ms: u64,
 }
 
 /// Drives durable runs against a journal.
@@ -166,7 +252,9 @@ impl DurableExecutor {
         run_id: Option<&str>,
         options: DurableOptions,
     ) -> Result<DurableOutcome, AutomationError> {
-        assert_durable_plan(descriptor)?;
+        assert_durable_plan_with_mode(descriptor, options.action_mode)?;
+        self.require_file_journal(descriptor, options.action_mode)?;
+        preflight_actions(descriptor, &options)?;
 
         let run_id = run_id
             .map(str::to_string)
@@ -201,7 +289,8 @@ impl DurableExecutor {
         run_id: &str,
         options: DurableOptions,
     ) -> Result<DurableOutcome, AutomationError> {
-        assert_durable_plan(descriptor)?;
+        assert_durable_plan_with_mode(descriptor, options.action_mode)?;
+        self.require_file_journal(descriptor, options.action_mode)?;
         let run = self.journal.get_run(run_id).map_err(journal_error)?;
         if run.status != RunStatus::Pending {
             return Err(durable_error(
@@ -213,25 +302,18 @@ impl DurableExecutor {
             )
             .with_detail("status", Value::String(run.status.as_str().into())));
         }
+        preflight_actions(descriptor, &options)?;
         let digest = engine::plan_digest(descriptor);
-        if let Some(recorded) = &run.plan_digest {
-            if recorded != &digest {
-                return Err(durable_error(
-                    "DURABLE.PLAN_MISMATCH",
-                    "the descriptor does not match the plan this run was created from",
-                )
-                .with_detail("expected", Value::String(recorded.clone()))
-                .with_detail("actual", Value::String(digest)));
-            }
+        if run.plan_digest.as_deref() != Some(digest.as_str()) {
+            return Err(durable_error(
+                "DURABLE.PLAN_MISMATCH",
+                "the descriptor does not match the plan this run was created from",
+            )
+            .with_detail("expected", json!(run.plan_digest))
+            .with_detail("actual", json!(digest)));
         }
 
         let lease = self.claim(run_id, &options)?;
-
-        // A cancel recorded before execution began means nothing should be
-        // dispatched at all, so honour it from `pending` directly.
-        if run.desired_state == DesiredState::Cancel {
-            return self.finalize_cancelled(run_id, lease, "cancelled before execution began");
-        }
 
         let inputs = as_map(&run.inputs);
         self.launch(descriptor, &digest, run_id, lease, inputs, options)
@@ -257,7 +339,9 @@ impl DurableExecutor {
 
         let run_options = RunOptions::default()
             .with_inputs(inputs)
-            .with_base_directory(options.base_directory.clone());
+            .with_base_directory(options.base_directory.clone())
+            .with_providers(options.providers.clone())
+            .with_granted_permissions(options.granted_permissions.clone());
         let mut segmented = Segmented::begin(descriptor, &run_options, deadline)?;
 
         let started = self
@@ -285,6 +369,15 @@ impl DurableExecutor {
             )
             .map_err(journal_error)?;
 
+        if started.desired_state == DesiredState::Cancel {
+            return self.finalize_body(
+                digest,
+                lease,
+                &mut segmented,
+                deadline,
+                Err(cancelled_error("cancelled before execution began")),
+            );
+        }
         let _ = run_id;
         self.drive(digest, started, lease, &mut segmented, deadline, &options)
     }
@@ -300,7 +393,8 @@ impl DurableExecutor {
         run_id: &str,
         options: DurableOptions,
     ) -> Result<DurableOutcome, AutomationError> {
-        assert_durable_plan(descriptor)?;
+        assert_durable_plan_with_mode(descriptor, options.action_mode)?;
+        self.require_file_journal(descriptor, options.action_mode)?;
         let run = self.journal.get_run(run_id).map_err(journal_error)?;
 
         if run.is_terminal() {
@@ -310,20 +404,17 @@ impl DurableExecutor {
             )
             .with_detail("status", Value::String(run.status.as_str().into())));
         }
-
         // The plan must be the one that was checkpointed. Resuming a changed
         // workflow from an old checkpoint would execute a step the recorded
         // state never described.
         let digest = engine::plan_digest(descriptor);
-        if let Some(recorded) = &run.plan_digest {
-            if recorded != &digest {
-                return Err(durable_error(
-                    "DURABLE.PLAN_MISMATCH",
-                    "the descriptor does not match the plan this run was created from",
-                )
-                .with_detail("expected", Value::String(recorded.clone()))
-                .with_detail("actual", Value::String(digest)));
-            }
+        if run.plan_digest.as_deref() != Some(digest.as_str()) {
+            return Err(durable_error(
+                "DURABLE.PLAN_MISMATCH",
+                "the descriptor does not match the plan this run was created from",
+            )
+            .with_detail("expected", json!(run.plan_digest))
+            .with_detail("actual", json!(digest)));
         }
 
         // Claim before inspecting the checkpoint. Ownership is the more
@@ -349,44 +440,45 @@ impl DurableExecutor {
                 .map_err(journal_error)?;
         }
 
-        // Intent first among the things this runner may now decide: a cancel
-        // requested while the run was down is honoured without executing
-        // anything further.
-        if run.desired_state == DesiredState::Cancel {
-            return self.finalize_cancelled(run_id, lease, "cancelled before resuming");
-        }
-
-        let Some(raw) = &run.checkpoint else {
+        let Some(raw) = run.checkpoint.clone() else {
+            if run.desired_state == DesiredState::Cancel {
+                return self.finalize_cancelled(run_id, lease, "cancelled before resuming");
+            }
             return Err(durable_error(
                 "DURABLE.NO_CHECKPOINT",
                 format!("run {run_id} has no checkpoint to resume from"),
             ));
         };
-        let (phase, deadline, state) = decode_checkpoint(raw, &digest)?;
+        let (phase, deadline, state) = decode_checkpoint(&raw, &digest)?;
+        let finalization = finalization_stage(&raw)?;
+
+        // A completed finalization is already a durable terminal decision. No
+        // runner or provider is needed, and cleanup must not be replayed.
+        if finalization == Some(FinalizationStage::Result) {
+            let result = decode_finalized_run(&raw, state.executed_steps)?;
+            return self.commit_finalized(run_id, lease, result);
+        }
+        // Once cleanup may have started, its effect is as unknowable as an
+        // interrupted body step. A concurrent cancel must not disguise that.
+        if finalization == Some(FinalizationStage::Started) {
+            return self.finalize_unknown_effect(run_id, lease, "finalization_started", &state);
+        }
 
         // A run interrupted inside a step, or during cleanup, cannot be
         // continued: whether its side effect landed is unknowable from here.
         // Finalise it as UNKNOWN_EFFECT with no further dispatch and let a
         // person decide, rather than guessing on their behalf.
-        if !phase.is_resumable() {
-            return self.finalize_unknown_effect(run_id, lease, phase, &state);
+        if !phase.is_resumable()
+            && phase != Phase::ActionIntent
+            && finalization != Some(FinalizationStage::Intent)
+        {
+            return self.finalize_unknown_effect(run_id, lease, phase.as_str(), &state);
+        }
+        if run.desired_state == DesiredState::Cancel && phase == Phase::ActionIntent {
+            return self.finalize_cancelled(run_id, lease, "cancelled before resuming");
         }
 
-        // Resuming does not reset the budget; the original deadline stands and
-        // may already have passed.
-        if deadline <= durable::now_seconds() {
-            return self.finalize_timed_out(run_id, lease, deadline);
-        }
-
-        // Asking to resume *is* asking to run, so clear a standing pause request
-        // now. Without this the drive loop reads the still-recorded pause at its
-        // first boundary and stops again immediately, leaving the run unable to
-        // make progress no matter how many times it is resumed.
-        //
-        // Deliberately after the unsafe-recovery and deadline checks above: a run
-        // that cannot be continued must not have its operator's intent quietly
-        // rewritten on the way to being refused. A cancel is never cleared here —
-        // it is sticky, and was already honoured above.
+        // Asking to resume is asking to run, so clear a standing pause request.
         let run = if run.desired_state == DesiredState::Pause {
             match self.journal.compare_and_set_desired_state(
                 run_id,
@@ -418,7 +510,10 @@ impl DurableExecutor {
 
         let run_options = RunOptions::default()
             .with_inputs(as_map(&run.inputs))
-            .with_base_directory(options.base_directory.clone());
+            .with_base_directory(options.base_directory.clone())
+            .with_providers(options.providers.clone())
+            .with_granted_permissions(options.granted_permissions.clone());
+        preflight_actions(descriptor, &options)?;
         let mut segmented = Segmented::restore(descriptor, &run_options, deadline, state)?;
 
         let running = if run.status == RunStatus::Paused {
@@ -440,6 +535,54 @@ impl DurableExecutor {
             self.journal.get_run(run_id).map_err(journal_error)?
         };
 
+        if finalization == Some(FinalizationStage::Intent) {
+            let intent = decode_finalization_intent(&raw)?;
+            if intent.error.is_none() && segmented.next_step().is_some() {
+                return Err(durable_error(
+                    "DURABLE.CHECKPOINT_INVALID",
+                    "successful finalization intent still has unexecuted steps",
+                ));
+            }
+            return self.finalize_prepared(
+                &digest,
+                &running.run_id,
+                lease,
+                &mut segmented,
+                deadline,
+                intent,
+            );
+        }
+        if running.desired_state == DesiredState::Cancel {
+            return self.finalize_body(
+                &digest,
+                lease,
+                &mut segmented,
+                deadline,
+                Err(cancelled_error("cancelled before resuming")),
+            );
+        }
+        // Resuming does not reset the body budget. A persisted finalization
+        // intent has already crossed into cleanup, which has its own deadline.
+        if finalization.is_none() && deadline <= durable::now_seconds() {
+            return self.finalize_body(
+                &digest,
+                lease,
+                &mut segmented,
+                deadline,
+                Err(workflow_timeout_error(deadline)),
+            );
+        }
+        if phase == Phase::ActionIntent {
+            return self.resume_action_intent(
+                &digest,
+                running,
+                lease,
+                &mut segmented,
+                deadline,
+                &options,
+                &raw,
+            );
+        }
         self.drive(&digest, running, lease, &mut segmented, deadline, &options)
     }
 
@@ -452,6 +595,26 @@ impl DurableExecutor {
                 durable::now_seconds(),
             )
             .map_err(journal_error)
+    }
+
+    fn require_file_journal(
+        &self,
+        descriptor: &WorkflowDescriptor,
+        mode: DurableActionMode,
+    ) -> Result<(), AutomationError> {
+        if mode == DurableActionMode::ReadOnly
+            && descriptor
+                .steps
+                .iter()
+                .any(|step| step.step_type == aad_core::model::StepType::Action)
+            && self.journal.path == std::path::Path::new(":memory:")
+        {
+            return Err(durable_error(
+                "DURABLE.UNSUPPORTED_JOURNAL",
+                "durable read-only actions require a file-backed journal for lease heartbeats",
+            ));
+        }
+        Ok(())
     }
 
     /// Execute segments until the run finishes or stops cooperatively.
@@ -481,12 +644,14 @@ impl DurableExecutor {
                     return self.honour_pause(digest, lease, segmented, deadline);
                 }
                 DesiredState::Cancel => {
-                    // Nothing is in flight here, so the cancellation is clean
-                    // and can be reported as such.
-                    return self.finalize_cancelled(
-                        &run.run_id,
+                    // Nothing is in flight here. Preserve ordinary runtime
+                    // semantics by running workflow-level cleanup durably.
+                    return self.finalize_body(
+                        digest,
                         lease,
-                        "cancelled at a segment boundary",
+                        segmented,
+                        deadline,
+                        Err(cancelled_error("cancelled at a segment boundary")),
                     );
                 }
                 DesiredState::Run => {}
@@ -496,6 +661,13 @@ impl DurableExecutor {
             let Some(step_id) = segmented.next_step_id().map(str::to_string) else {
                 return self.finalize_body(digest, lease, segmented, deadline, Ok(()));
             };
+            if segmented
+                .next_step()
+                .is_some_and(|step| step.step_type == aad_core::model::StepType::Action)
+            {
+                return self
+                    .dispatch_read_only_action(digest, run, lease, segmented, deadline, options);
+            }
 
             // Record that a step is about to run *before* running it. If the
             // process dies now, recovery sees `in_top_level_step` and knows the
@@ -573,6 +745,275 @@ impl DurableExecutor {
         }
     }
 
+    fn dispatch_read_only_action(
+        &self,
+        digest: &str,
+        run: RunRecord,
+        lease: OwnerLease,
+        segmented: &mut Segmented<'_>,
+        deadline: f64,
+        options: &DurableOptions,
+    ) -> Result<DurableOutcome, AutomationError> {
+        let prepared = match prepare_action(segmented, deadline) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                let safe = AutomationError::new(
+                    "DURABLE.ACTION_PREPARATION_FAILED",
+                    "durable action preparation failed before dispatch",
+                )
+                .with_category("durable")
+                .with_effect("not_applied")
+                .with_detail("stepId", json!(segmented.next_step_id()))
+                .with_detail("reason", json!(error.code));
+                return self.finalize_body(digest, lease, segmented, deadline, Err(safe));
+            }
+        };
+        let state = segmented.reserve_action_attempt()?;
+        let operation_id = uuid::Uuid::new_v4().simple().to_string();
+        let checkpoint = encode_action_intent(digest, deadline, &state, &prepared, &operation_id);
+        let persisted = self.journal.append_event_with_checkpoint(
+            &lease,
+            "run.action_intent",
+            &json!({"stepId": prepared.step.id, "operationId": operation_id}),
+            &checkpoint,
+            Some(RunStatus::Running),
+            Some(DesiredState::Run),
+            durable::now_seconds(),
+        );
+        if let Err(JournalError::Conflict(_)) = persisted {
+            segmented.release_action_attempt()?;
+            let current = self.journal.get_run(&run.run_id).map_err(journal_error)?;
+            return match current.desired_state {
+                DesiredState::Pause => self.honour_pause(digest, lease, segmented, deadline),
+                DesiredState::Cancel => self.finalize_cancelled(
+                    &run.run_id,
+                    lease,
+                    "cancelled before a read-only action was dispatched",
+                ),
+                DesiredState::Run => Err(durable_error(
+                    "DURABLE.STATE_CONFLICT",
+                    "action dispatch authorization lost its expected state",
+                )),
+            };
+        }
+        persisted.map_err(journal_error)?;
+        self.authorize_and_run_action(
+            digest, run, lease, segmented, deadline, options, prepared, checkpoint,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn authorize_and_run_action(
+        &self,
+        digest: &str,
+        run: RunRecord,
+        mut lease: OwnerLease,
+        segmented: &mut Segmented<'_>,
+        deadline: f64,
+        options: &DurableOptions,
+        prepared: PreparedAction,
+        checkpoint: Value,
+    ) -> Result<DurableOutcome, AutomationError> {
+        let operation_id = checkpoint["actionIntent"]["operationId"].clone();
+        let authorized = self.journal.append_event_with_checkpoint(
+            &lease,
+            "run.action_dispatch_authorized",
+            &json!({"stepId": prepared.step.id, "operationId": operation_id}),
+            &checkpoint,
+            Some(RunStatus::Running),
+            Some(DesiredState::Run),
+            durable::now_seconds(),
+        );
+        if let Err(JournalError::Conflict(_)) = authorized {
+            let current = self.journal.get_run(&run.run_id).map_err(journal_error)?;
+            return match current.desired_state {
+                DesiredState::Pause => {
+                    let paused = self
+                        .journal
+                        .set_status(
+                            &lease,
+                            RunStatus::Running,
+                            RunStatus::Paused,
+                            Some(("run.paused", &json!({"nextStepId": prepared.step.id}))),
+                            None,
+                            None,
+                            Some(DesiredState::Pause),
+                            durable::now_seconds(),
+                        )
+                        .map_err(journal_error)?;
+                    Ok(DurableOutcome {
+                        run: paused,
+                        stopped: Stopped::Paused,
+                    })
+                }
+                DesiredState::Cancel => self.finalize_cancelled(
+                    &run.run_id,
+                    lease,
+                    "cancelled before a read-only action was dispatched",
+                ),
+                DesiredState::Run => Err(durable_error(
+                    "DURABLE.STATE_CONFLICT",
+                    "action dispatch authorization lost its expected state",
+                )),
+            };
+        }
+        authorized.map_err(journal_error)?;
+
+        let result = self.invoke_with_lease_heartbeat(segmented, &prepared, &lease, options);
+        lease = self
+            .journal
+            .heartbeat_owner(&lease, options.lease_ttl_seconds, durable::now_seconds())
+            .map_err(|_| {
+                AutomationError::new(
+                    "DURABLE.LEASE_HEARTBEAT_FAILED",
+                    "durable action lease was lost after provider completion",
+                )
+                .with_category("durable")
+                .with_effect("unknown")
+            })?;
+        let progressed = match segmented.run_reserved_action(result) {
+            Ok(segment) => segment,
+            Err(error) => {
+                return self.finalize_body(digest, lease, segmented, deadline, Err(error));
+            }
+        };
+        let boundary =
+            encode_checkpoint(digest, Phase::BetweenSteps, deadline, &segmented.snapshot());
+        self.journal
+            .append_event_with_checkpoint(
+                &lease,
+                "run.segment_exited",
+                &json!({
+                    "stepId": prepared.step.id,
+                    "operationId": operation_id,
+                }),
+                &boundary,
+                Some(RunStatus::Running),
+                None,
+                durable::now_seconds(),
+            )
+            .map_err(journal_error)?;
+        let intent = self.journal.get_run(&run.run_id).map_err(journal_error)?;
+        if intent.desired_state == DesiredState::Pause {
+            return self.honour_pause(digest, lease, segmented, deadline);
+        }
+        if intent.desired_state == DesiredState::Cancel {
+            return self.finalize_cancelled(
+                &run.run_id,
+                lease,
+                "cancelled after a read-only action completed",
+            );
+        }
+        if progressed != Segment::Advanced {
+            return self.finalize_body(digest, lease, segmented, deadline, Ok(()));
+        }
+        self.drive(digest, run, lease, segmented, deadline, options)
+    }
+
+    fn invoke_with_lease_heartbeat(
+        &self,
+        segmented: &Segmented<'_>,
+        prepared: &PreparedAction,
+        lease: &OwnerLease,
+        options: &DurableOptions,
+    ) -> Result<Value, AutomationError> {
+        let path = self.journal.path.clone();
+        let held = lease.clone();
+        let ttl = options.lease_ttl_seconds;
+        let (stop_sender, stop_receiver) = mpsc::channel();
+        let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
+        let keeper = std::thread::spawn(move || -> Result<(), JournalError> {
+            let journal = match JournalStore::open_with_timeout(&path, 500) {
+                Ok(journal) => journal,
+                Err(error) => {
+                    let _ = ready_sender.send(false);
+                    return Err(error);
+                }
+            };
+            if let Err(error) = journal.heartbeat_owner(&held, ttl, durable::now_seconds()) {
+                let _ = ready_sender.send(false);
+                return Err(error);
+            }
+            let _ = ready_sender.send(true);
+            let interval = Duration::from_secs_f64((ttl / 4.0).max(0.05));
+            loop {
+                match stop_receiver.recv_timeout(interval) {
+                    Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        journal.heartbeat_owner(&held, ttl, durable::now_seconds())?;
+                    }
+                }
+            }
+        });
+        let ready_timeout = Duration::from_secs_f64((ttl / 2.0).clamp(0.05, 1.0));
+        if ready_receiver.recv_timeout(ready_timeout) != Ok(true) {
+            let _ = stop_sender.send(());
+            let _ = keeper.join();
+            return Err(AutomationError::new(
+                "DURABLE.LEASE_HEARTBEAT_FAILED",
+                "durable action lease heartbeat failed before dispatch",
+            )
+            .with_category("durable")
+            .with_effect("not_applied"));
+        }
+        let result = invoke_durable_action(segmented, prepared);
+        let _ = stop_sender.send(());
+        let heartbeat = keeper.join().map_err(|_| {
+            durable_error(
+                "DURABLE.LEASE_HEARTBEAT_FAILED",
+                "durable action lease heartbeat thread failed",
+            )
+        })?;
+        if heartbeat.is_err() {
+            // The caller performs a synchronous fenced heartbeat immediately
+            // after this returns. Preserve the provider result if that succeeds:
+            // a temporary keeper-connection failure does not make a read-only
+            // observation ambiguous. This marker is diagnostic-only.
+            let _ = self.journal.append_event(
+                lease,
+                "run.lease_heartbeat_failed",
+                &json!({"recovered": true}),
+                durable::now_seconds(),
+            );
+        }
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn resume_action_intent(
+        &self,
+        digest: &str,
+        run: RunRecord,
+        lease: OwnerLease,
+        segmented: &mut Segmented<'_>,
+        deadline: f64,
+        options: &DurableOptions,
+        checkpoint: &Value,
+    ) -> Result<DurableOutcome, AutomationError> {
+        let mut prepared = prepare_action(segmented, deadline)?;
+        prepared.dispatch_deadline_ms = checkpoint
+            .get("actionIntent")
+            .and_then(|value| value.get("dispatchDeadlineEpochMs"))
+            .and_then(Value::as_u64)
+            .ok_or_else(|| {
+                durable_error(
+                    "DURABLE.CHECKPOINT_INVALID",
+                    "action intent dispatch deadline is invalid",
+                )
+            })?;
+        validate_action_intent(checkpoint, &prepared, segmented.snapshot().executed_steps)?;
+        self.authorize_and_run_action(
+            digest,
+            run,
+            lease,
+            segmented,
+            deadline,
+            options,
+            prepared,
+            checkpoint.clone(),
+        )
+    }
+
     /// Stop at a boundary, leaving the run resumable.
     fn honour_pause(
         &self,
@@ -619,7 +1060,8 @@ impl DurableExecutor {
         })
     }
 
-    /// Run workflow cleanup and commit the terminal status.
+    /// Persist the pre-cleanup boundary, run cleanup once, persist its result,
+    /// and then commit the terminal status.
     #[allow(clippy::too_many_arguments)]
     fn finalize_body(
         &self,
@@ -629,14 +1071,51 @@ impl DurableExecutor {
         deadline: f64,
         body: Result<(), AutomationError>,
     ) -> Result<DurableOutcome, AutomationError> {
-        // Cleanup can itself be interrupted, and its steps may have effects, so
-        // the phase is recorded before it starts.
+        let intent = segmented.prepare_finalization(body);
+        let run_id = lease.run_id.clone();
+        self.finalize_prepared(digest, &run_id, lease, segmented, deadline, intent)
+    }
+
+    fn finalize_prepared(
+        &self,
+        digest: &str,
+        run_id: &str,
+        lease: OwnerLease,
+        segmented: &mut Segmented<'_>,
+        deadline: f64,
+        intent: FinalizationIntent,
+    ) -> Result<DurableOutcome, AutomationError> {
+        let intent_checkpoint = encode_finalization_intent(
+            digest,
+            deadline,
+            &segmented.snapshot(),
+            &intent,
+            FinalizationStage::Intent,
+        );
         self.journal
             .append_event_with_checkpoint(
                 &lease,
-                "run.finalizing",
+                "run.finalization_intent",
                 &json!({}),
-                &encode_checkpoint(digest, Phase::Finalizing, deadline, &segmented.snapshot()),
+                &intent_checkpoint,
+                Some(RunStatus::Running),
+                None,
+                durable::now_seconds(),
+            )
+            .map_err(journal_error)?;
+        let started_checkpoint = encode_finalization_intent(
+            digest,
+            deadline,
+            &segmented.snapshot(),
+            &intent,
+            FinalizationStage::Started,
+        );
+        self.journal
+            .append_event_with_checkpoint(
+                &lease,
+                "run.finalization_started",
+                &json!({}),
+                &started_checkpoint,
                 Some(RunStatus::Running),
                 None,
                 durable::now_seconds(),
@@ -645,44 +1124,107 @@ impl DurableExecutor {
 
         // The engine owns handler and cleanup semantics; duplicating them here
         // would let durable and ordinary runs drift apart.
-        let result = segmented.finish(body);
+        let result = segmented.finish_prepared(intent);
+        let finalized = finalized_run(&result);
+        let result_checkpoint =
+            encode_finalization_result(digest, deadline, &segmented.snapshot(), &finalized);
+        let completed = self.journal.append_event_with_checkpoint(
+            &lease,
+            "run.finalization_completed",
+            &json!({"status": finalized.status.as_str()}),
+            &result_checkpoint,
+            Some(RunStatus::Running),
+            Some(DesiredState::Run),
+            durable::now_seconds(),
+        );
+        if let Err(JournalError::Conflict(_)) = completed {
+            // A pause/cancel can arrive after cleanup has completed. Persist the
+            // definitive result before applying that intent, so a later resume
+            // never repeats cleanup.
+            self.journal
+                .append_event_with_checkpoint(
+                    &lease,
+                    "run.finalization_completed",
+                    &json!({"status": finalized.status.as_str()}),
+                    &result_checkpoint,
+                    Some(RunStatus::Running),
+                    None,
+                    durable::now_seconds(),
+                )
+                .map_err(journal_error)?;
+        } else {
+            completed.map_err(journal_error)?;
+        }
+        self.commit_finalized(run_id, lease, finalized)
+    }
 
-        let status = match result.status {
-            EngineStatus::Succeeded => RunStatus::Succeeded,
-            EngineStatus::Failed => RunStatus::Failed,
-            EngineStatus::TimedOut => RunStatus::TimedOut,
-            EngineStatus::Cancelled => RunStatus::Cancelled,
-            // Never folded into a plain failure: the caller must be able to see
-            // that a side effect may have happened.
-            EngineStatus::UnknownEffect => RunStatus::UnknownEffect,
-        };
-        let error = result
-            .error
-            .as_ref()
-            .map(AutomationError::to_json)
-            .unwrap_or_else(|| json!({"code": "RUNTIME.UNSPECIFIED"}));
-        let output = Value::Object(result.outputs.clone());
+    fn commit_finalized(
+        &self,
+        run_id: &str,
+        lease: OwnerLease,
+        finalized: FinalizedRun,
+    ) -> Result<DurableOutcome, AutomationError> {
+        for _ in 0..16 {
+            let current = self.journal.get_run(run_id).map_err(journal_error)?;
+            if current.is_terminal() {
+                return Err(durable_error(
+                    "DURABLE.ALREADY_TERMINAL",
+                    format!(
+                        "run {run_id} already finished as {}",
+                        current.status.as_str()
+                    ),
+                ));
+            }
 
-        let run = self
-            .journal
-            .set_status(
-                &lease,
-                RunStatus::Running,
-                status,
-                Some((
+            let (status, output, error, event_type, payload) = if current.desired_state
+                == DesiredState::Cancel
+                && finalized.status == RunStatus::Succeeded
+            {
+                let error =
+                    cancelled_error("cancelled after workflow finalization completed").to_json();
+                (
+                    RunStatus::Cancelled,
+                    None,
+                    Some(error),
+                    "run.cancelled",
+                    json!({"reason": "cancelled after workflow finalization completed"}),
+                )
+            } else {
+                (
+                    finalized.status,
+                    finalized.output.clone(),
+                    finalized.error.clone(),
                     "run.finished",
-                    &json!({"status": status.as_str(), "executedSteps": result.executed_steps}),
-                )),
-                (status == RunStatus::Succeeded).then_some(&output),
-                (status != RunStatus::Succeeded).then_some(&error),
-                None,
+                    json!({
+                        "status": finalized.status.as_str(),
+                        "executedSteps": finalized.executed_steps,
+                    }),
+                )
+            };
+            match self.journal.set_status(
+                &lease,
+                current.status,
+                status,
+                Some((event_type, &payload)),
+                output.as_ref(),
+                error.as_ref(),
+                Some(current.desired_state),
                 durable::now_seconds(),
-            )
-            .map_err(journal_error)?;
-        Ok(DurableOutcome {
-            run,
-            stopped: Stopped::Finished,
-        })
+            ) {
+                Ok(run) => {
+                    return Ok(DurableOutcome {
+                        run,
+                        stopped: Stopped::Finished,
+                    });
+                }
+                Err(JournalError::Conflict(_)) => continue,
+                Err(error) => return Err(journal_error(error)),
+            }
+        }
+        Err(durable_error(
+            "DURABLE.STATE_CONFLICT",
+            "control state did not stabilize during terminal commit",
+        ))
     }
 
     /// Finalise a run whose in-flight effect cannot be established.
@@ -693,20 +1235,20 @@ impl DurableExecutor {
         &self,
         run_id: &str,
         lease: OwnerLease,
-        phase: Phase,
+        phase: &str,
         state: &SegmentState,
     ) -> Result<DurableOutcome, AutomationError> {
         let error = json!({
             "code": "DURABLE.UNKNOWN_EFFECT",
             "message": format!(
                 "the run was interrupted during {} and its effect cannot be established",
-                phase.as_str()
+                phase
             ),
             "category": "durable",
             "effect": "unknown",
             "retryable": false,
             "details": {
-                "phase": phase.as_str(),
+                "phase": phase,
                 "nextTopLevelIndex": state.next_index,
                 "remedy": "inspect the target application and decide whether to \
                            repeat the interrupted step",
@@ -716,7 +1258,7 @@ impl DurableExecutor {
             run_id,
             lease,
             RunStatus::UnknownEffect,
-            ("run.unknown_effect", json!({"phase": phase.as_str()})),
+            ("run.unknown_effect", json!({"phase": phase})),
             error,
         )
     }
@@ -745,29 +1287,6 @@ impl DurableExecutor {
             lease,
             RunStatus::Cancelled,
             ("run.cancelled", json!({"reason": reason})),
-            error,
-        )
-    }
-
-    fn finalize_timed_out(
-        &self,
-        run_id: &str,
-        lease: OwnerLease,
-        deadline: f64,
-    ) -> Result<DurableOutcome, AutomationError> {
-        let error = json!({
-            "code": "WORKFLOW.TIMEOUT",
-            "message": "the run exceeded its maximum duration",
-            "category": "workflow",
-            "effect": "not_applied",
-            "retryable": false,
-            "details": {"deadline": deadline},
-        });
-        self.terminate(
-            run_id,
-            lease,
-            RunStatus::TimedOut,
-            ("run.timed_out", json!({"deadline": deadline})),
             error,
         )
     }
@@ -818,12 +1337,835 @@ impl DurableExecutor {
     }
 }
 
+fn prepare_action(
+    segmented: &Segmented<'_>,
+    workflow_deadline: f64,
+) -> Result<PreparedAction, AutomationError> {
+    let step = segmented
+        .next_step()
+        .cloned()
+        .ok_or_else(|| durable_error("DURABLE.INVALID_STATE", "no durable action is ready"))?;
+    let binding = durable_binding(
+        segmented.descriptor(),
+        segmented.providers(),
+        segmented.granted_permissions(),
+        &step,
+    )?;
+    let args = match step.get("with") {
+        Some(value) => crate::template::resolve(value, &segmented.scope())?,
+        None => Value::Object(Map::new()),
+    };
+    engine::validate_schema(
+        &args,
+        binding.contract.input_schema.as_ref(),
+        "ACTION.INPUT_INVALID",
+        step.get_str("uses").unwrap_or_default(),
+        true,
+    )?;
+    let dispatch_deadline_ms = action_deadline_ms(&step, &binding.contract, workflow_deadline);
+    let binding_digest = engine::digest_json(&json!({
+        "uses": step.get_str("uses"),
+        "input": args,
+        "providerDigest": binding.provider_digest,
+        "contractDigest": binding.contract_digest,
+        "projectionDigest": binding.projection_digest,
+    }));
+    Ok(PreparedAction {
+        step,
+        binding,
+        binding_digest,
+        args,
+        dispatch_deadline_ms,
+    })
+}
+
+fn durable_binding(
+    descriptor: &WorkflowDescriptor,
+    providers: &ProviderRegistry,
+    granted_permissions: &BTreeSet<String>,
+    step: &aad_core::model::CompiledStep,
+) -> Result<DurableBinding, AutomationError> {
+    let uses = step.get_str("uses").unwrap_or_default();
+    let Some((_, contract)) = providers.resolve(uses) else {
+        return Err(durable_error(
+            "CAPABILITY.MISSING",
+            format!("no provider offers action {uses:?}"),
+        ));
+    };
+    let provider_name = uses
+        .rsplit_once('.')
+        .map(|(provider, _)| provider)
+        .unwrap_or_default();
+    let provider = providers.get(provider_name).ok_or_else(|| {
+        durable_error(
+            "CAPABILITY.MISSING",
+            format!("provider {provider_name:?} is missing"),
+        )
+    })?;
+    engine::enforce_action_policy(
+        // The descriptor is already represented by the action and its provider
+        // inside Segmented; use the workflow reached through the step's policy
+        // checks in the ordinary engine.
+        descriptor,
+        granted_permissions,
+        provider.manifest(),
+        contract,
+        step,
+    )?;
+    if contract.has_artifacts() {
+        return Err(durable_error(
+            "DURABLE.UNSUPPORTED_PLAN",
+            "durable actions cannot use ephemeral artifact transport",
+        )
+        .with_detail("uses", json!(uses)));
+    }
+    let descriptor_effect = step
+        .get("effect")
+        .and_then(Value::as_object)
+        .and_then(|effect| effect.get("class"))
+        .and_then(Value::as_str);
+    if contract.effect_class.as_deref() != Some("read_only")
+        || descriptor_effect.is_some_and(|effect| effect != "read_only")
+    {
+        return Err(durable_error(
+            "DURABLE.UNSUPPORTED_PLAN",
+            "durable action must be explicitly read-only in both contracts",
+        )
+        .with_detail("uses", json!(uses)));
+    }
+    if contract.errors.is_empty()
+        || contract
+            .errors
+            .iter()
+            .any(|error| error.get("effect").and_then(Value::as_str) != Some("not_applied"))
+    {
+        return Err(durable_error(
+            "DURABLE.UNSUPPORTED_PLAN",
+            "durable action errors must be non-empty and not_applied",
+        )
+        .with_detail("uses", json!(uses)));
+    }
+    let public = |value: Option<&Value>| {
+        value.and_then(Value::as_object).is_some_and(|map| {
+            ["input", "output", "error"]
+                .iter()
+                .all(|field| map.get(*field).and_then(Value::as_str) == Some("public"))
+        })
+    };
+    if !public(contract.sensitivity.as_ref()) || !public(step.get("sensitivity")) {
+        return Err(durable_error(
+            "DURABLE.SENSITIVE_ACTION",
+            "durable action input, output, and error must be explicitly public",
+        )
+        .with_detail("uses", json!(uses)));
+    }
+    let provider_fields = contract
+        .durability
+        .as_ref()
+        .and_then(|value| value.get("checkpoint_fields"))
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            durable_error(
+                "DURABLE.UNSUPPORTED_PLAN",
+                "durable action provider has no checkpoint field whitelist",
+            )
+        })?;
+    if provider_fields.len() > 128 {
+        return Err(durable_error(
+            "DURABLE.UNSUPPORTED_PLAN",
+            "durable action declares too many checkpoint fields",
+        ));
+    }
+    let mut pointers = BTreeSet::new();
+    for (alias, definition) in provider_fields {
+        if !valid_identifier(alias) {
+            return Err(durable_error(
+                "DURABLE.UNSUPPORTED_PLAN",
+                "durable checkpoint field alias is invalid",
+            )
+            .with_detail("field", json!(alias)));
+        }
+        let definition = definition.as_object().ok_or_else(|| {
+            durable_error(
+                "DURABLE.UNSUPPORTED_PLAN",
+                "durable checkpoint field is invalid",
+            )
+        })?;
+        if !definition.contains_key("schema")
+            || definition
+                .keys()
+                .any(|key| !matches!(key.as_str(), "pointer" | "schema" | "missing"))
+        {
+            return Err(durable_error(
+                "DURABLE.UNSUPPORTED_PLAN",
+                "durable checkpoint field shape is invalid",
+            )
+            .with_detail("field", json!(alias)));
+        }
+        let pointer = definition
+            .get("pointer")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                durable_error(
+                    "DURABLE.UNSUPPORTED_PLAN",
+                    "durable checkpoint field pointer is missing",
+                )
+            })?;
+        if !valid_json_pointer(pointer) || pointer.len() > 1024 || !pointers.insert(pointer) {
+            return Err(durable_error(
+                "DURABLE.UNSUPPORTED_PLAN",
+                "durable checkpoint pointers must be unique, non-root, and bounded",
+            )
+            .with_detail("field", json!(alias)));
+        }
+        let missing = definition
+            .get("missing")
+            .and_then(Value::as_str)
+            .unwrap_or("error");
+        if !matches!(missing, "error" | "omit" | "null") {
+            return Err(durable_error(
+                "DURABLE.UNSUPPORTED_PLAN",
+                "durable checkpoint missing policy is invalid",
+            )
+            .with_detail("field", json!(alias)));
+        }
+        if missing == "null" {
+            engine::validate_schema(
+                &Value::Null,
+                definition.get("schema"),
+                "DURABLE.UNSUPPORTED_PLAN",
+                alias,
+                true,
+            )?;
+        }
+    }
+    let checkpoint = step
+        .get("checkpoint")
+        .and_then(Value::as_object)
+        .and_then(|value| value.get("output"))
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            durable_error(
+                "DURABLE.UNSUPPORTED_PLAN",
+                "durable action checkpoint output must be explicit",
+            )
+        })?;
+    let mode = checkpoint.get("mode").and_then(Value::as_str);
+    let selected = match mode {
+        Some("omit") => Vec::new(),
+        Some("project") => {
+            let fields: Vec<String> = checkpoint
+                .get("fields")
+                .and_then(Value::as_array)
+                .map(|fields| {
+                    fields
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default();
+            if fields.is_empty()
+                || fields
+                    .iter()
+                    .any(|field| !provider_fields.contains_key(field))
+            {
+                return Err(durable_error(
+                    "DURABLE.UNSUPPORTED_PLAN",
+                    "durable action projection is not provider-approved",
+                ));
+            }
+            fields
+        }
+        _ => {
+            return Err(durable_error(
+                "DURABLE.UNSUPPORTED_PLAN",
+                "durable action projection is not provider-approved",
+            ));
+        }
+    };
+    let definitions: BTreeMap<String, Value> = selected
+        .iter()
+        .map(|field| (field.clone(), provider_fields[field].clone()))
+        .collect();
+    let projection = json!({
+        "mode": mode, "fields": selected, "definitions": definitions
+    });
+    Ok(DurableBinding {
+        contract: contract.clone(),
+        provider_digest: engine::digest_json(&provider.manifest().raw),
+        contract_digest: engine::digest_json(&contract.raw),
+        projection_digest: engine::digest_json(&projection),
+        selected,
+        definitions,
+    })
+}
+
+fn valid_identifier(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= 128
+        && (bytes[0].is_ascii_alphabetic() || bytes[0] == b'_')
+        && bytes
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+}
+
+fn valid_json_pointer(value: &str) -> bool {
+    if value.is_empty() || !value.starts_with('/') || value.len() > 1024 {
+        return false;
+    }
+    let tokens: Vec<&str> = value.split('/').skip(1).collect();
+    if tokens.len() > 64 {
+        return false;
+    }
+    tokens.iter().all(|token| {
+        let bytes = token.as_bytes();
+        let mut index = 0;
+        while index < bytes.len() {
+            if bytes[index] == b'~' {
+                if index + 1 >= bytes.len() || !matches!(bytes[index + 1], b'0' | b'1') {
+                    return false;
+                }
+                index += 2;
+            } else {
+                index += 1;
+            }
+        }
+        true
+    })
+}
+
+fn preflight_actions(
+    descriptor: &WorkflowDescriptor,
+    options: &DurableOptions,
+) -> Result<(), AutomationError> {
+    if options.action_mode != DurableActionMode::ReadOnly {
+        return Ok(());
+    }
+    for step in &descriptor.steps {
+        if step.step_type == aad_core::model::StepType::Action {
+            durable_binding(
+                descriptor,
+                &options.providers,
+                &options.granted_permissions,
+                step,
+            )
+            .map_err(|error| {
+                durable_error(
+                    "DURABLE.ACTION_PREFLIGHT_FAILED",
+                    "durable action provider preflight failed",
+                )
+                .with_detail("stepId", json!(step.id))
+                .with_detail("reason", json!(error.code))
+            })?;
+        }
+    }
+    Ok(())
+}
+
+fn action_deadline_ms(
+    step: &aad_core::model::CompiledStep,
+    contract: &aad_plugin::manifest::ActionContract,
+    workflow_deadline: f64,
+) -> u64 {
+    let now = durable::now_seconds();
+    let mut deadline = workflow_deadline;
+    for text in [
+        step.get_str("timeout"),
+        step.get_str("attempt_timeout"),
+        contract.timeout.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if let Some(seconds) = aad_core::parse_duration(text) {
+            deadline = deadline.min(now + seconds);
+        }
+    }
+    (deadline.max(0.0) * 1000.0) as u64
+}
+
+fn invoke_durable_action(
+    segmented: &Segmented<'_>,
+    prepared: &PreparedAction,
+) -> Result<Value, AutomationError> {
+    let uses = prepared.step.get_str("uses").unwrap_or_default();
+    let Some((provider, _)) = segmented.providers().resolve(uses) else {
+        return Err(durable_error(
+            "CAPABILITY.MISSING",
+            "durable action provider disappeared",
+        ));
+    };
+    let now_ms = (durable::now_seconds() * 1000.0) as u64;
+    if prepared.dispatch_deadline_ms <= now_ms {
+        return Err(AutomationError::new(
+            "ACTION.TIMEOUT",
+            "durable action deadline expired before dispatch",
+        )
+        .with_category("action")
+        .with_effect("not_applied"));
+    }
+    let timeout = Duration::from_millis(prepared.dispatch_deadline_ms - now_ms);
+    let output = provider
+        .invoke(uses, prepared.args.clone(), Some(timeout))
+        .map_err(|error| {
+            if error.code == "PLUGIN.HOST_TIMEOUT" {
+                return AutomationError::new(
+                    "ACTION.TIMEOUT",
+                    "durable read-only action timed out",
+                )
+                .with_category("action")
+                .with_effect("not_applied");
+            }
+            let declared =
+                prepared.binding.contract.errors.iter().any(|item| {
+                    item.get("code").and_then(Value::as_str) == Some(error.code.as_str())
+                });
+            if declared {
+                AutomationError::new(
+                    error.code,
+                    "durable action failed with a declared provider error",
+                )
+                .with_category("action")
+                .with_effect("not_applied")
+            } else {
+                AutomationError::new(
+                    "ACTION.UNDECLARED_ERROR",
+                    "durable action returned an undeclared error",
+                )
+                .with_category("action")
+                .with_effect("unknown")
+            }
+        })?;
+    engine::validate_schema(
+        &output,
+        prepared.binding.contract.output_schema.as_ref(),
+        "ACTION.OUTPUT_INVALID",
+        uses,
+        true,
+    )?;
+    project_output(&prepared.binding, &output)
+}
+
+fn project_output(binding: &DurableBinding, output: &Value) -> Result<Value, AutomationError> {
+    if binding.selected.is_empty() {
+        return Ok(Value::Null);
+    }
+    let mut projected = Map::new();
+    for field in &binding.selected {
+        let definition = binding
+            .definitions
+            .get(field)
+            .and_then(Value::as_object)
+            .ok_or_else(|| {
+                durable_error(
+                    "DURABLE.BINDING_MISMATCH",
+                    "checkpoint field definition is invalid",
+                )
+            })?;
+        let pointer = definition
+            .get("pointer")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                durable_error(
+                    "DURABLE.BINDING_MISMATCH",
+                    "checkpoint field pointer is invalid",
+                )
+            })?;
+        let value = match output.pointer(pointer) {
+            Some(value) => value.clone(),
+            None if definition.get("missing").and_then(Value::as_str) == Some("omit") => continue,
+            None if definition.get("missing").and_then(Value::as_str) == Some("null") => {
+                Value::Null
+            }
+            None => {
+                return Err(AutomationError::new(
+                    "ACTION.OUTPUT_INVALID",
+                    "durable checkpoint field is missing",
+                )
+                .with_category("action")
+                .with_effect("not_applied"))
+            }
+        };
+        engine::validate_schema(
+            &value,
+            definition.get("schema"),
+            "ACTION.OUTPUT_INVALID",
+            field,
+            true,
+        )?;
+        projected.insert(field.clone(), value);
+    }
+    Ok(Value::Object(projected))
+}
+
+fn encode_action_intent(
+    digest: &str,
+    deadline: f64,
+    state: &SegmentState,
+    prepared: &PreparedAction,
+    operation_id: &str,
+) -> Value {
+    let mut checkpoint = encode_checkpoint(digest, Phase::ActionIntent, deadline, state);
+    checkpoint["actionIntent"] = json!({
+        "version": 2,
+        "operationId": operation_id,
+        "stepId": prepared.step.id,
+        "reservationOrdinal": state.executed_steps,
+        "attempt": 1,
+        "dispatchDeadlineEpochMs": prepared.dispatch_deadline_ms,
+        "providerDigest": prepared.binding.provider_digest,
+        "contractDigest": prepared.binding.contract_digest,
+        "projectionDigest": prepared.binding.projection_digest,
+        "bindingDigest": prepared.binding_digest,
+    });
+    checkpoint
+}
+
+fn encode_finalization_intent(
+    digest: &str,
+    deadline: f64,
+    state: &SegmentState,
+    intent: &FinalizationIntent,
+    stage: FinalizationStage,
+) -> Value {
+    let mut checkpoint = encode_checkpoint(digest, Phase::Finalizing, deadline, state);
+    checkpoint["finalization"] = json!({
+        "version": 1,
+        "stage": match stage {
+            FinalizationStage::Intent => "intent",
+            FinalizationStage::Started => "started",
+            FinalizationStage::Result => "result",
+        },
+        "outputSet": intent.error.is_none(),
+        "output": if intent.error.is_none() {
+            Value::Object(intent.outputs.clone())
+        } else {
+            Value::Null
+        },
+        "error": intent
+            .error
+            .as_ref()
+            .map(AutomationError::to_json)
+            .unwrap_or(Value::Null),
+    });
+    checkpoint
+}
+
+fn finalized_run(result: &crate::journal::RunResult) -> FinalizedRun {
+    let status = match result.status {
+        EngineStatus::Succeeded => RunStatus::Succeeded,
+        EngineStatus::Failed => RunStatus::Failed,
+        EngineStatus::TimedOut => RunStatus::TimedOut,
+        EngineStatus::Cancelled => RunStatus::Cancelled,
+        EngineStatus::UnknownEffect => RunStatus::UnknownEffect,
+    };
+    let error = if status == RunStatus::Succeeded {
+        None
+    } else {
+        Some(
+            result
+                .error
+                .as_ref()
+                .map(AutomationError::to_json)
+                .unwrap_or_else(|| {
+                    durable_error(
+                        "DURABLE.TERMINAL",
+                        format!("workflow ended as {}", status.as_str()),
+                    )
+                    .to_json()
+                }),
+        )
+    };
+    FinalizedRun {
+        status,
+        output: (status == RunStatus::Succeeded).then(|| Value::Object(result.outputs.clone())),
+        error,
+        executed_steps: result.executed_steps,
+    }
+}
+
+fn encode_finalization_result(
+    digest: &str,
+    deadline: f64,
+    state: &SegmentState,
+    result: &FinalizedRun,
+) -> Value {
+    let mut checkpoint = encode_checkpoint(digest, Phase::Finalizing, deadline, state);
+    checkpoint["finalization"] = json!({
+        "version": 1,
+        "stage": "result",
+        "result": {
+            "status": result.status.as_str(),
+            "output": result.output,
+            "error": result.error,
+            "executedSteps": result.executed_steps,
+        },
+    });
+    checkpoint
+}
+
+fn finalization_stage(checkpoint: &Value) -> Result<Option<FinalizationStage>, AutomationError> {
+    let Some(finalization) = checkpoint.get("finalization") else {
+        return Ok(None);
+    };
+    let finalization = finalization.as_object().ok_or_else(|| {
+        durable_error(
+            "DURABLE.CHECKPOINT_INVALID",
+            "finalization payload must be an object",
+        )
+    })?;
+    if finalization.get("version").and_then(Value::as_u64) != Some(1) {
+        return Err(durable_error(
+            "DURABLE.CHECKPOINT_INVALID",
+            "finalization payload version is unsupported",
+        ));
+    }
+    let stage = finalization
+        .get("stage")
+        .and_then(Value::as_str)
+        .and_then(FinalizationStage::parse)
+        .ok_or_else(|| {
+            durable_error(
+                "DURABLE.CHECKPOINT_INVALID",
+                "finalization stage is invalid",
+            )
+        })?;
+    Ok(Some(stage))
+}
+
+fn decode_finalization_intent(checkpoint: &Value) -> Result<FinalizationIntent, AutomationError> {
+    let finalization = checkpoint["finalization"].as_object().ok_or_else(|| {
+        durable_error(
+            "DURABLE.CHECKPOINT_INVALID",
+            "finalization intent payload is missing",
+        )
+    })?;
+    let expected: BTreeSet<&str> = ["version", "stage", "outputSet", "output", "error"]
+        .into_iter()
+        .collect();
+    if finalization
+        .keys()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>()
+        != expected
+        || finalization.get("stage").and_then(Value::as_str) != Some("intent")
+    {
+        return Err(durable_error(
+            "DURABLE.CHECKPOINT_INVALID",
+            "finalization intent fields are invalid",
+        ));
+    }
+    let output_set = finalization
+        .get("outputSet")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| {
+            durable_error(
+                "DURABLE.CHECKPOINT_INVALID",
+                "finalization outputSet must be a boolean",
+            )
+        })?;
+    let output = finalization.get("output").cloned().unwrap_or(Value::Null);
+    let error = decode_optional_error(finalization.get("error"))?;
+    if !output_set && !output.is_null() || output_set != error.is_none() {
+        return Err(durable_error(
+            "DURABLE.CHECKPOINT_INVALID",
+            "finalization intent output and error are inconsistent",
+        ));
+    }
+    let outputs = if output_set {
+        output.as_object().cloned().ok_or_else(|| {
+            durable_error(
+                "DURABLE.CHECKPOINT_INVALID",
+                "finalization output must be an object",
+            )
+        })?
+    } else {
+        Map::new()
+    };
+    Ok(FinalizationIntent { outputs, error })
+}
+
+fn decode_finalized_run(
+    checkpoint: &Value,
+    fallback_executed_steps: u64,
+) -> Result<FinalizedRun, AutomationError> {
+    let result = checkpoint["finalization"]["result"]
+        .as_object()
+        .ok_or_else(|| {
+            durable_error(
+                "DURABLE.CHECKPOINT_INVALID",
+                "finalization result payload is missing",
+            )
+        })?;
+    let expected: BTreeSet<&str> = ["status", "output", "error", "executedSteps"]
+        .into_iter()
+        .collect();
+    if result.keys().map(String::as_str).collect::<BTreeSet<_>>() != expected {
+        return Err(durable_error(
+            "DURABLE.CHECKPOINT_INVALID",
+            "finalization result fields are invalid",
+        ));
+    }
+    let status = match result.get("status").and_then(Value::as_str) {
+        Some("succeeded") => RunStatus::Succeeded,
+        Some("failed") => RunStatus::Failed,
+        Some("timed_out") => RunStatus::TimedOut,
+        Some("cancelled") => RunStatus::Cancelled,
+        Some("unknown_effect") => RunStatus::UnknownEffect,
+        _ => {
+            return Err(durable_error(
+                "DURABLE.CHECKPOINT_INVALID",
+                "finalization result status is invalid",
+            ));
+        }
+    };
+    let output = result
+        .get("output")
+        .cloned()
+        .filter(|value| !value.is_null());
+    let error = result
+        .get("error")
+        .cloned()
+        .filter(|value| !value.is_null());
+    if status == RunStatus::Succeeded {
+        if error.is_some() || output.as_ref().is_none_or(|value| !value.is_object()) {
+            return Err(durable_error(
+                "DURABLE.CHECKPOINT_INVALID",
+                "successful finalization result is invalid",
+            ));
+        }
+    } else if output.is_some() || error.as_ref().is_none_or(|value| !valid_error_json(value)) {
+        return Err(durable_error(
+            "DURABLE.CHECKPOINT_INVALID",
+            "failed finalization result is invalid",
+        ));
+    }
+    let executed_steps = result
+        .get("executedSteps")
+        .and_then(Value::as_u64)
+        .filter(|value| *value == fallback_executed_steps)
+        .ok_or_else(|| {
+            durable_error(
+                "DURABLE.CHECKPOINT_INVALID",
+                "finalization result attempt count does not match its checkpoint",
+            )
+        })?;
+    Ok(FinalizedRun {
+        status,
+        output,
+        error,
+        executed_steps,
+    })
+}
+
+fn decode_optional_error(
+    value: Option<&Value>,
+) -> Result<Option<AutomationError>, AutomationError> {
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => AutomationError::from_json(value).map(Some).ok_or_else(|| {
+            durable_error(
+                "DURABLE.CHECKPOINT_INVALID",
+                "finalization error payload is invalid",
+            )
+        }),
+    }
+}
+
+fn valid_error_json(value: &Value) -> bool {
+    AutomationError::from_json(value).is_some()
+}
+
+fn validate_action_intent(
+    checkpoint: &Value,
+    prepared: &PreparedAction,
+    executed_steps: u64,
+) -> Result<(), AutomationError> {
+    let intent = checkpoint
+        .get("actionIntent")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            durable_error(
+                "DURABLE.CHECKPOINT_INVALID",
+                "action intent payload is missing",
+            )
+        })?;
+    let expected_fields: BTreeSet<&str> = [
+        "version",
+        "operationId",
+        "stepId",
+        "reservationOrdinal",
+        "attempt",
+        "dispatchDeadlineEpochMs",
+        "providerDigest",
+        "contractDigest",
+        "projectionDigest",
+        "bindingDigest",
+    ]
+    .into_iter()
+    .collect();
+    let actual_fields: BTreeSet<&str> = intent.keys().map(String::as_str).collect();
+    let digest = |name: &str| {
+        intent
+            .get(name)
+            .and_then(Value::as_str)
+            .is_some_and(|value| {
+                value.len() == 71
+                    && value.starts_with("sha256:")
+                    && value[7..]
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            })
+    };
+    let matches = intent.get("version").and_then(Value::as_u64) == Some(2)
+        && actual_fields == expected_fields
+        && intent
+            .get("operationId")
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.is_empty() && value.len() <= 128)
+        && digest("providerDigest")
+        && digest("contractDigest")
+        && digest("projectionDigest")
+        && digest("bindingDigest")
+        && intent.get("stepId").and_then(Value::as_str) == Some(prepared.step.id.as_str())
+        && intent.get("reservationOrdinal").and_then(Value::as_u64) == Some(executed_steps)
+        && intent.get("attempt").and_then(Value::as_u64) == Some(1)
+        && intent
+            .get("dispatchDeadlineEpochMs")
+            .and_then(Value::as_u64)
+            == Some(prepared.dispatch_deadline_ms)
+        && intent.get("providerDigest").and_then(Value::as_str)
+            == Some(prepared.binding.provider_digest.as_str())
+        && intent.get("contractDigest").and_then(Value::as_str)
+            == Some(prepared.binding.contract_digest.as_str())
+        && intent.get("projectionDigest").and_then(Value::as_str)
+            == Some(prepared.binding.projection_digest.as_str())
+        && intent.get("bindingDigest").and_then(Value::as_str)
+            == Some(prepared.binding_digest.as_str());
+    if !matches {
+        return Err(durable_error(
+            "DURABLE.BINDING_MISMATCH",
+            "action intent no longer matches its provider, projection, or input",
+        ));
+    }
+    Ok(())
+}
+
 /// Whether this workflow can be executed durably at all.
 ///
 /// Conservative by design. Every rejection here is a case where the executor
 /// could not honestly account for what happened after a crash, so refusing up
 /// front is better than discovering it mid-run.
 pub fn assert_durable_plan(descriptor: &WorkflowDescriptor) -> Result<(), AutomationError> {
+    assert_durable_plan_with_mode(descriptor, DurableActionMode::Deny)
+}
+
+pub fn assert_durable_plan_with_mode(
+    descriptor: &WorkflowDescriptor,
+    action_mode: DurableActionMode,
+) -> Result<(), AutomationError> {
     if !durable::durable_descriptor_eligible(&descriptor.raw) {
         return Err(durable_error(
             "DURABLE.SENSITIVE_DESCRIPTOR",
@@ -850,26 +2192,55 @@ pub fn assert_durable_plan(descriptor: &WorkflowDescriptor) -> Result<(), Automa
         }
     }
 
-    // Actions and scripts have effects this mode cannot reason about after an
-    // interruption. Naming them is what makes the refusal actionable.
+    let top_level: std::collections::HashSet<*const aad_core::model::CompiledStep> =
+        descriptor.steps.iter().map(std::ptr::from_ref).collect();
+    // Scripts and nested actions have effects this mode cannot reason about
+    // after an interruption. Top-level actions are considered further only in
+    // the explicitly requested read-only mode.
     let unsupported: Vec<String> = descriptor
         .all_steps()
         .iter()
         .filter(|step| {
-            matches!(
-                step.step_type,
-                aad_core::model::StepType::Action | aad_core::model::StepType::Script
-            )
+            step.step_type == aad_core::model::StepType::Script
+                || (step.step_type == aad_core::model::StepType::Action
+                    && (action_mode != DurableActionMode::ReadOnly
+                        || !top_level.contains(&std::ptr::from_ref(**step))))
         })
         .map(|step| step.id.clone())
         .collect();
     if !unsupported.is_empty() {
         return Err(durable_error(
             "DURABLE.UNSUPPORTED_PLAN",
-            "durable execution currently rejects action and script steps because an \
-             interrupted dispatch cannot be proven safe to repeat",
+            "durable execution rejects scripts and non-opted-in or nested actions",
         )
         .with_detail("unsupportedSteps", json!(unsupported)));
+    }
+    if action_mode == DurableActionMode::ReadOnly {
+        for step in &descriptor.steps {
+            if step.step_type != aad_core::model::StepType::Action {
+                continue;
+            }
+            let retry = step
+                .get("retry")
+                .or_else(|| descriptor.defaults.get("retry"))
+                .and_then(Value::as_object);
+            let attempts = retry
+                .and_then(|value| value.get("max_attempts"))
+                .and_then(Value::as_u64)
+                .unwrap_or(1);
+            if step.get("if").is_some()
+                || step.get("precondition").is_some()
+                || step.get("postcondition").is_some()
+                || step.on_error.is_some()
+                || !step.finally_steps.is_empty()
+                || attempts != 1
+            {
+                return Err(durable_error(
+                    "DURABLE.UNSUPPORTED_PLAN",
+                    "durable read-only actions require one unconditional top-level attempt without handlers",
+                ).with_detail("stepId", json!(step.id)));
+            }
+        }
     }
     Ok(())
 }
@@ -908,24 +2279,31 @@ fn decode_checkpoint(
         .get("checkpointVersion")
         .and_then(Value::as_u64)
         .unwrap_or(0);
-    if version != CHECKPOINT_VERSION as u64 {
+    if version != LEGACY_CHECKPOINT_VERSION as u64 && version != CHECKPOINT_VERSION as u64 {
         return Err(durable_error(
             "DURABLE.CHECKPOINT_UNSUPPORTED",
             format!(
                 "checkpoint version {version} cannot be read by this build \
-                 (expected {CHECKPOINT_VERSION})"
+                 (expected {LEGACY_CHECKPOINT_VERSION} or {CHECKPOINT_VERSION})"
             ),
         ));
     }
-    if let Some(digest) = raw.get("planDigest").and_then(Value::as_str) {
-        if digest != expected_digest {
-            return Err(durable_error(
-                "DURABLE.PLAN_MISMATCH",
-                "the checkpoint was written against a different plan",
+    let digest = raw
+        .get("planDigest")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            durable_error(
+                "DURABLE.CHECKPOINT_INVALID",
+                "the checkpoint plan digest is missing or invalid",
             )
-            .with_detail("expected", Value::String(digest.into()))
-            .with_detail("actual", Value::String(expected_digest.into())));
-        }
+        })?;
+    if digest != expected_digest {
+        return Err(durable_error(
+            "DURABLE.PLAN_MISMATCH",
+            "the checkpoint was written against a different plan",
+        )
+        .with_detail("expected", Value::String(digest.into()))
+        .with_detail("actual", Value::String(expected_digest.into())));
     }
     let phase = raw
         .get("phase")
@@ -937,6 +2315,89 @@ fn decode_checkpoint(
                 "the checkpoint does not record a recognised phase",
             )
         })?;
+    if phase == Phase::ActionIntent {
+        validate_action_intent_shape(raw)?;
+    } else if raw.get("actionIntent").is_some() {
+        return Err(durable_error(
+            "DURABLE.CHECKPOINT_INVALID",
+            "action intent is present outside the action_intent phase",
+        ));
+    }
+    if raw.get("finalization").is_some() {
+        if version != CHECKPOINT_VERSION as u64 || phase != Phase::Finalizing {
+            return Err(durable_error(
+                "DURABLE.CHECKPOINT_INVALID",
+                "finalization payload requires the current checkpoint version and finalizing phase",
+            ));
+        }
+        validate_finalization_shape(raw)?;
+    } else if version == CHECKPOINT_VERSION as u64 && phase == Phase::Finalizing {
+        return Err(durable_error(
+            "DURABLE.CHECKPOINT_INVALID",
+            "current finalizing checkpoint is missing its finalization payload",
+        ));
+    }
+    let base_fields: BTreeSet<&str> = [
+        "checkpointVersion",
+        "runtimeVersion",
+        "planDigest",
+        "phase",
+        "deadline",
+        "nextTopLevelIndex",
+        "executedSteps",
+        "unknownEffect",
+        "variables",
+        "steps",
+        "returned",
+    ]
+    .into_iter()
+    .collect();
+    let allowed_fields: BTreeSet<&str> = base_fields
+        .into_iter()
+        .chain(raw.get("actionIntent").map(|_| "actionIntent"))
+        .chain(raw.get("finalization").map(|_| "finalization"))
+        .collect();
+    let actual_fields = raw
+        .as_object()
+        .map(|map| map.keys().map(String::as_str).collect::<BTreeSet<_>>())
+        .ok_or_else(|| {
+            durable_error("DURABLE.CHECKPOINT_INVALID", "checkpoint must be an object")
+        })?;
+    let missing_required = [
+        "checkpointVersion",
+        "planDigest",
+        "phase",
+        "deadline",
+        "nextTopLevelIndex",
+    ]
+    .into_iter()
+    .any(|field| !actual_fields.contains(field));
+    if missing_required
+        || actual_fields
+            .iter()
+            .any(|field| !allowed_fields.contains(field))
+    {
+        return Err(durable_error(
+            "DURABLE.CHECKPOINT_INVALID",
+            "checkpoint fields do not match the supported schema",
+        ));
+    }
+    if version == CHECKPOINT_VERSION as u64
+        && (raw.get("runtimeVersion").and_then(Value::as_str) != Some(engine::RUNTIME_VERSION)
+            || raw.get("executedSteps").and_then(Value::as_u64).is_none()
+            || !raw.get("variables").is_some_and(Value::is_object)
+            || !raw.get("steps").is_some_and(Value::is_object)
+            || !raw.get("unknownEffect").is_some_and(Value::is_boolean)
+            // A return value may be any JSON value, including null. Presence is
+            // therefore the only meaningful shape check, but it must not be
+            // confused with an omitted field from a truncated checkpoint.
+            || raw.get("returned").is_none())
+    {
+        return Err(durable_error(
+            "DURABLE.CHECKPOINT_INVALID",
+            "current checkpoint runtime or state fields are invalid",
+        ));
+    }
     // A missing deadline must not become "no limit"; refuse instead.
     let deadline = raw.get("deadline").and_then(Value::as_f64).ok_or_else(|| {
         durable_error(
@@ -951,10 +2412,19 @@ fn decode_checkpoint(
         next_index: raw
             .get("nextTopLevelIndex")
             .and_then(Value::as_u64)
-            .unwrap_or(0) as usize,
+            .and_then(|value| usize::try_from(value).ok())
+            .ok_or_else(|| {
+                durable_error(
+                    "DURABLE.CHECKPOINT_INVALID",
+                    "checkpoint next top-level index is invalid",
+                )
+            })?,
         executed_steps: raw
             .get("executedSteps")
             .and_then(Value::as_u64)
+            // Legacy v1 checkpoints predate the complete-state requirement.
+            // Current v2 checkpoints were rejected above if this is absent or
+            // malformed.
             .unwrap_or(0),
         unknown_effect: raw
             .get("unknownEffect")
@@ -968,8 +2438,102 @@ fn decode_checkpoint(
     Ok((phase, deadline, state))
 }
 
+fn validate_action_intent_shape(raw: &Value) -> Result<(), AutomationError> {
+    let intent = raw
+        .get("actionIntent")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            durable_error(
+                "DURABLE.CHECKPOINT_INVALID",
+                "action intent payload is missing",
+            )
+        })?;
+    let fields: BTreeSet<&str> = intent.keys().map(String::as_str).collect();
+    let expected: BTreeSet<&str> = [
+        "version",
+        "operationId",
+        "stepId",
+        "reservationOrdinal",
+        "attempt",
+        "dispatchDeadlineEpochMs",
+        "providerDigest",
+        "contractDigest",
+        "projectionDigest",
+        "bindingDigest",
+    ]
+    .into_iter()
+    .collect();
+    let valid = fields == expected
+        && intent.get("version").and_then(Value::as_u64) == Some(2)
+        && intent.get("attempt").and_then(Value::as_u64) == Some(1)
+        && intent
+            .get("reservationOrdinal")
+            .and_then(Value::as_u64)
+            .is_some()
+        && intent
+            .get("dispatchDeadlineEpochMs")
+            .and_then(Value::as_u64)
+            .is_some()
+        && intent
+            .get("operationId")
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.is_empty())
+        && intent
+            .get("stepId")
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.is_empty());
+    if !valid {
+        return Err(durable_error(
+            "DURABLE.CHECKPOINT_INVALID",
+            "action intent fields are invalid",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_finalization_shape(raw: &Value) -> Result<(), AutomationError> {
+    let stage = finalization_stage(raw)?.ok_or_else(|| {
+        durable_error(
+            "DURABLE.CHECKPOINT_INVALID",
+            "finalization payload is missing",
+        )
+    })?;
+    match stage {
+        FinalizationStage::Intent => {
+            decode_finalization_intent(raw)?;
+        }
+        FinalizationStage::Started => {
+            let mut intent = raw.clone();
+            intent["finalization"]["stage"] = json!("intent");
+            decode_finalization_intent(&intent)?;
+        }
+        FinalizationStage::Result => {
+            decode_finalized_run(
+                raw,
+                raw.get("executedSteps")
+                    .and_then(Value::as_u64)
+                    .unwrap_or_default(),
+            )?;
+        }
+    }
+    Ok(())
+}
+
 fn as_map(value: &Value) -> Map<String, Value> {
     value.as_object().cloned().unwrap_or_default()
+}
+
+fn workflow_timeout_error(deadline: f64) -> AutomationError {
+    AutomationError::new("WORKFLOW.TIMEOUT", "the run exceeded its maximum duration")
+        .with_category("workflow")
+        .with_effect("not_applied")
+        .with_detail("deadline", json!(deadline))
+}
+
+fn cancelled_error(reason: &str) -> AutomationError {
+    AutomationError::new("WORKFLOW.CANCELLED", reason)
+        .with_category("workflow")
+        .with_effect("not_applied")
 }
 
 fn durable_error(code: &str, message: impl Into<String>) -> AutomationError {

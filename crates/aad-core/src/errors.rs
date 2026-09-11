@@ -243,6 +243,86 @@ impl AutomationError {
         }
         Value::Object(map)
     }
+
+    /// Rebuild a structured error from its stable v1 JSON representation.
+    pub fn from_json(value: &Value) -> Option<Self> {
+        let map = value.as_object()?;
+        if map.get("schema_version").and_then(Value::as_str) != Some("1") {
+            return None;
+        }
+        let code = map.get("code")?.as_str()?;
+        let category = map.get("category")?.as_str()?;
+        let message = map.get("message")?.as_str()?;
+        let retryable = map.get("retryable")?.as_bool()?;
+        let effect = map.get("effect")?.as_str()?;
+        let details = map.get("details")?.as_object()?.clone();
+        let suppressed = map
+            .get("suppressed")?
+            .as_array()?
+            .iter()
+            .map(Self::from_json)
+            .collect::<Option<Vec<_>>>()?;
+        let (cause, raw_cause) = match map.get("cause") {
+            None | Some(Value::Null) => (None, None),
+            Some(value) => match Self::from_json(value) {
+                Some(error) => (Some(Box::new(error)), None),
+                None => (None, Some(value.clone())),
+            },
+        };
+        let location = match map.get("location") {
+            None => ErrorLocation::default(),
+            Some(Value::Object(location)) => ErrorLocation {
+                workflow: optional_string(location, "workflow")?,
+                step_path: optional_string(location, "step_path")?,
+                step_id: optional_string(location, "step_id")?,
+                attempt: match location.get("attempt") {
+                    None => None,
+                    Some(value) => Some(u32::try_from(value.as_u64()?).ok()?),
+                },
+            },
+            Some(_) => return None,
+        };
+        let allowed: std::collections::BTreeSet<&str> = [
+            "schema_version",
+            "code",
+            "category",
+            "message",
+            "retryable",
+            "effect",
+            "details",
+            "cause",
+            "suppressed",
+            "phase",
+            "location",
+        ]
+        .into_iter()
+        .collect();
+        if map.keys().any(|key| !allowed.contains(key.as_str())) {
+            return None;
+        }
+        Some(Self {
+            code: code.to_string(),
+            message: message.to_string(),
+            category: category.to_string(),
+            phase: optional_string(map, "phase")?,
+            retryable,
+            effect: effect.to_string(),
+            location,
+            details,
+            cause,
+            raw_cause,
+            suppressed,
+            issues: Vec::new(),
+        })
+    }
+}
+
+fn optional_string(map: &Map<String, Value>, key: &str) -> Option<Option<String>> {
+    match map.get(key) {
+        None => Some(None),
+        Some(Value::String(value)) => Some(Some(value.clone())),
+        Some(_) => None,
+    }
 }
 
 impl std::fmt::Display for AutomationError {
@@ -286,6 +366,31 @@ mod tests {
         assert_eq!(value["location"]["attempt"], 1);
         assert_eq!(value["cause"], Value::Null);
         assert_eq!(value["suppressed"], json!([]));
+    }
+
+    #[test]
+    fn a_serialized_error_round_trips_for_durable_recovery() {
+        let mut error = AutomationError::new("TEST.FAIL", "root")
+            .with_category("test")
+            .with_phase("execute")
+            .with_retryable(true)
+            .with_effect("not_applied")
+            .with_detail("field", json!("value"))
+            .with_cause(AutomationError::new("TEST.CAUSE", "cause"))
+            .at_step("step", Some("$.steps[0]"), Some(2), Some("workflow"));
+        error.add_suppressed(AutomationError::new("TEST.CLEANUP", "cleanup"));
+        let value = error.to_json();
+
+        let restored = AutomationError::from_json(&value).expect("valid v1 error");
+
+        assert_eq!(restored.to_json(), value);
+    }
+
+    #[test]
+    fn malformed_serialized_errors_are_rejected() {
+        let mut value = AutomationError::new("TEST.FAIL", "root").to_json();
+        value["retryable"] = json!("yes");
+        assert!(AutomationError::from_json(&value).is_none());
     }
 
     #[test]

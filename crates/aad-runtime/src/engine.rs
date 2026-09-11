@@ -53,6 +53,8 @@ pub struct RunOptions {
     /// asking for it. A caller that never opts in cannot be talked into running
     /// code by the contents of a file it was handed.
     pub allow_scripts: bool,
+    /// Host permissions explicitly granted for this invocation.
+    pub granted_permissions: std::collections::BTreeSet<String>,
 }
 
 impl Default for RunOptions {
@@ -66,6 +68,7 @@ impl Default for RunOptions {
             max_duration: None,
             base_directory: std::env::current_dir().unwrap_or_else(|_| ".".into()),
             allow_scripts: false,
+            granted_permissions: std::collections::BTreeSet::new(),
         }
     }
 }
@@ -99,6 +102,15 @@ impl RunOptions {
         self.allow_scripts = allowed;
         self
     }
+
+    pub fn with_granted_permissions<I, S>(mut self, permissions: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.granted_permissions = permissions.into_iter().map(Into::into).collect();
+        self
+    }
 }
 
 /// The mutable state of one run.
@@ -122,6 +134,7 @@ struct Run<'a> {
     base_directory: std::path::PathBuf,
     /// Whether `script` steps may execute; see [`RunOptions::allow_scripts`].
     allow_scripts: bool,
+    granted_permissions: std::collections::BTreeSet<String>,
     /// Set once an action's outcome could not be proven.
     unknown_effect: bool,
 }
@@ -273,7 +286,12 @@ impl<'a> Run<'a> {
         match (outcome, cleanup) {
             (Ok(flow), Ok(_)) => Ok(flow),
             // Cleanup failing on a successful path is itself the failure.
-            (Ok(_), Err(error)) => Err(error),
+            (Ok(_), Err(error)) => Err(AutomationError::new(
+                "WORKFLOW.FINALLY_FAILED",
+                "workflow cleanup failed",
+            )
+            .with_phase("cleanup")
+            .with_cause(error)),
             // Cleanup failing on an error path must not hide the real cause.
             (Err(mut original), Err(cleanup_error)) => {
                 original.add_suppressed(cleanup_error);
@@ -409,10 +427,6 @@ only if you trust this descriptor."
     fn run_action(&mut self, step: &CompiledStep, attempt: u32) -> Result<Flow, AutomationError> {
         let uses = step.get_str("uses").unwrap_or_default().to_string();
         let scope = self.scope();
-        let args = match step.get("with") {
-            Some(value) => template::resolve(value, &scope)?,
-            None => Value::Object(Map::new()),
-        };
 
         // A precondition is checked before the action is dispatched, so a
         // failure here provably has not applied anything.
@@ -441,6 +455,24 @@ only if you trust this descriptor."
             .with_detail("available", json!(self.providers.names())));
         };
         let declared_effect = contract.effect_class.clone();
+        enforce_action_policy(
+            self.descriptor,
+            &self.granted_permissions,
+            provider.manifest(),
+            contract,
+            step,
+        )?;
+        let args = match step.get("with") {
+            Some(value) => template::resolve(value, &scope)?,
+            None => Value::Object(Map::new()),
+        };
+        validate_schema(
+            &args,
+            contract.input_schema.as_ref(),
+            "ACTION.INPUT_INVALID",
+            &uses,
+            false,
+        )?;
 
         let timeout = step
             .get_str("attempt_timeout")
@@ -460,6 +492,13 @@ only if you trust this descriptor."
 
         match result {
             Ok(output) => {
+                validate_schema(
+                    &output,
+                    contract.output_schema.as_ref(),
+                    "ACTION.OUTPUT_INVALID",
+                    &uses,
+                    false,
+                )?;
                 self.journal.emit(
                     "action.finished",
                     json!({
@@ -1166,6 +1205,193 @@ fn canonical_json(value: &Value) -> String {
     }
 }
 
+pub(crate) fn digest_json(value: &Value) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(canonical_json(value).as_bytes());
+    format!("sha256:{:x}", hasher.finalize())
+}
+
+fn strings_from(value: Option<&Value>) -> Vec<String> {
+    value
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+pub(crate) fn validate_schema(
+    value: &Value,
+    schema: Option<&Value>,
+    code: &str,
+    name: &str,
+    redact: bool,
+) -> Result<(), AutomationError> {
+    let Some(schema) = schema else { return Ok(()) };
+    if schema == &Value::Bool(true) {
+        return Ok(());
+    }
+    let compiled = jsonschema::JSONSchema::compile(schema).map_err(|_| {
+        AutomationError::new(code, format!("schema for {name:?} is invalid"))
+            .with_effect("not_applied")
+    })?;
+    if let Err(errors) = compiled.validate(value) {
+        let mut error = AutomationError::new(code, format!("{name:?} does not satisfy its schema"))
+            .with_effect("not_applied");
+        if !redact {
+            error = error.with_detail(
+                "validation",
+                Value::String(
+                    errors
+                        .map(|issue| issue.to_string())
+                        .collect::<Vec<_>>()
+                        .join("; "),
+                ),
+            );
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn risk_rank(level: Option<&str>) -> u8 {
+    match level {
+        Some("low") => 0,
+        Some("medium") => 1,
+        Some("high") => 2,
+        Some("critical") => 3,
+        Some("contextual") => 4,
+        _ => u8::MAX,
+    }
+}
+
+pub(crate) fn enforce_action_policy(
+    descriptor: &WorkflowDescriptor,
+    granted_permissions: &std::collections::BTreeSet<String>,
+    manifest: &aad_plugin::CapabilityManifest,
+    contract: &aad_plugin::manifest::ActionContract,
+    step: &CompiledStep,
+) -> Result<(), AutomationError> {
+    if !manifest.platforms.is_empty()
+        && !manifest
+            .platforms
+            .iter()
+            .any(|platform| platform == std::env::consts::OS)
+    {
+        return Err(AutomationError::new(
+            "CAPABILITY.PLATFORM_UNSUPPORTED",
+            format!(
+                "capability is unavailable on platform {:?}",
+                std::env::consts::OS
+            ),
+        )
+        .with_category("capability")
+        .with_effect("not_applied"));
+    }
+    let declared: std::collections::BTreeSet<String> =
+        strings_from(descriptor.requires.get("permissions"))
+            .into_iter()
+            .collect();
+    let required: std::collections::BTreeSet<String> = manifest
+        .permissions
+        .iter()
+        .chain(contract.permissions.iter())
+        .cloned()
+        .collect();
+    let undeclared: Vec<String> = required.difference(&declared).cloned().collect();
+    if !undeclared.is_empty() {
+        return Err(AutomationError::new(
+            "POLICY.DENIED",
+            "action permissions were not declared by the workflow",
+        )
+        .with_category("policy")
+        .with_effect("not_applied")
+        .with_detail("undeclared_permissions", json!(undeclared)));
+    }
+    let missing: Vec<String> = required.difference(granted_permissions).cloned().collect();
+    if !missing.is_empty() {
+        return Err(
+            AutomationError::new("POLICY.DENIED", "action permissions were not granted")
+                .with_category("policy")
+                .with_effect("not_applied")
+                .with_detail("missing_permissions", json!(missing)),
+        );
+    }
+
+    let declared_risk = step.get("risk").and_then(Value::as_object);
+    let risks = [
+        (
+            contract.risk_category.as_deref(),
+            contract.risk_level.as_deref(),
+        ),
+        (
+            declared_risk
+                .and_then(|risk| risk.get("category"))
+                .and_then(Value::as_str),
+            declared_risk
+                .and_then(|risk| risk.get("level"))
+                .and_then(Value::as_str),
+        ),
+    ];
+    let policy = &descriptor.policy;
+    if let Some(allowed) = policy.get("allowed_risk").and_then(Value::as_object) {
+        let categories = strings_from(allowed.get("categories"));
+        if let Some(category) = risks.iter().filter_map(|risk| risk.0).find(|category| {
+            !categories.is_empty() && !categories.iter().any(|allowed| allowed == category)
+        }) {
+            return Err(AutomationError::new(
+                "POLICY.DENIED",
+                format!("risk category {category:?} is not allowed"),
+            )
+            .with_category("policy")
+            .with_effect("not_applied"));
+        }
+        if let Some(maximum) = allowed.get("max_level").and_then(Value::as_str) {
+            if let Some(level) = risks
+                .iter()
+                .filter_map(|risk| risk.1)
+                .max_by_key(|level| risk_rank(Some(level)))
+            {
+                if risk_rank(Some(level)) > risk_rank(Some(maximum)) {
+                    return Err(AutomationError::new(
+                        "POLICY.DENIED",
+                        format!("risk level {level:?} exceeds {maximum:?}"),
+                    )
+                    .with_category("policy")
+                    .with_effect("not_applied"));
+                }
+            }
+        }
+    }
+    if let Some(required) = policy
+        .get("confirmation")
+        .and_then(Value::as_object)
+        .and_then(|value| value.get("required_for"))
+        .and_then(Value::as_object)
+    {
+        let categories = strings_from(required.get("categories"));
+        let minimum = required.get("min_level").and_then(Value::as_str);
+        if risks.iter().any(|(category, level)| {
+            category.is_some_and(|category| categories.iter().any(|item| item == category))
+                || minimum.is_some_and(|minimum| {
+                    level.is_some_and(|level| risk_rank(Some(level)) >= risk_rank(Some(minimum)))
+                })
+        }) {
+            return Err(AutomationError::new(
+                "POLICY.CONFIRMATION_REQUIRED",
+                "this action requires a bound confirmation token, which v0 cannot verify",
+            )
+            .with_category("policy")
+            .with_effect("not_applied"));
+        }
+    }
+    Ok(())
+}
+
 /// Prepare inputs by applying declared defaults and rejecting missing ones.
 fn prepare_inputs(
     descriptor: &WorkflowDescriptor,
@@ -1256,6 +1482,17 @@ pub enum Segment {
     Exhausted,
 }
 
+/// Terminal-ready data captured before workflow-level cleanup begins.
+///
+/// Durable execution persists this value before entering `finally`, which makes
+/// it safe to retry cleanup after a crash that occurred before the cleanup
+/// dispatch boundary.
+#[derive(Clone, Debug)]
+pub struct FinalizationIntent {
+    pub outputs: Map<String, Value>,
+    pub error: Option<AutomationError>,
+}
+
 /// A run driven one top-level step at a time.
 ///
 /// This exists so a durable executor can persist a checkpoint between steps and
@@ -1282,6 +1519,7 @@ impl<'a> Segmented<'a> {
         options: &RunOptions,
         deadline_epoch: f64,
     ) -> Result<Self, AutomationError> {
+        check_requirements(descriptor, &options.providers, &options.granted_permissions)?;
         let run_id = options
             .run_id
             .clone()
@@ -1308,6 +1546,7 @@ impl<'a> Segmented<'a> {
                 cancel: options.cancel.clone(),
                 base_directory: options.base_directory.clone(),
                 allow_scripts: options.allow_scripts,
+                granted_permissions: options.granted_permissions.clone(),
                 unknown_effect: false,
             },
         })
@@ -1362,6 +1601,126 @@ impl<'a> Segmented<'a> {
             .map(|step| step.id.as_str())
     }
 
+    pub fn next_step(&self) -> Option<&'a CompiledStep> {
+        if self.returned.is_some() {
+            return None;
+        }
+        self.ordered().get(self.next_index).copied()
+    }
+
+    pub fn scope(&self) -> Map<String, Value> {
+        self.state.scope()
+    }
+
+    pub fn remaining(&self) -> Duration {
+        self.state.remaining()
+    }
+
+    pub fn providers(&self) -> &ProviderRegistry {
+        &self.state.providers
+    }
+
+    pub fn descriptor(&self) -> &WorkflowDescriptor {
+        self.state.descriptor
+    }
+
+    pub fn granted_permissions(&self) -> &std::collections::BTreeSet<String> {
+        &self.state.granted_permissions
+    }
+
+    pub fn reserve_action_attempt(&mut self) -> Result<SegmentState, AutomationError> {
+        let Some(step) = self.next_step().cloned() else {
+            return Err(
+                AutomationError::new("DURABLE.INVALID_STATE", "no action is ready")
+                    .with_category("durable")
+                    .with_effect("not_applied"),
+            );
+        };
+        if step.step_type != StepType::Action {
+            return Err(AutomationError::new(
+                "DURABLE.INVALID_STATE",
+                "the next step is not an action",
+            )
+            .with_category("durable")
+            .with_effect("not_applied"));
+        }
+        self.state.check_budget()?;
+        self.state.executed_steps += 1;
+        Ok(self.snapshot())
+    }
+
+    pub fn release_action_attempt(&mut self) -> Result<SegmentState, AutomationError> {
+        if self.state.executed_steps == 0 {
+            return Err(AutomationError::new(
+                "DURABLE.INVALID_STATE",
+                "no durable action attempt is reserved",
+            )
+            .with_category("durable")
+            .with_effect("not_applied"));
+        }
+        self.state.executed_steps -= 1;
+        Ok(self.snapshot())
+    }
+
+    pub fn run_reserved_action(
+        &mut self,
+        output: Result<Value, AutomationError>,
+    ) -> Result<Segment, AutomationError> {
+        let Some(step) = self.next_step().cloned() else {
+            return Err(
+                AutomationError::new("DURABLE.INVALID_STATE", "no action is ready")
+                    .with_category("durable")
+                    .with_effect("not_applied"),
+            );
+        };
+        if step.step_type != StepType::Action {
+            return Err(AutomationError::new(
+                "DURABLE.INVALID_STATE",
+                "the next step is not an action",
+            )
+            .with_category("durable")
+            .with_effect("not_applied"));
+        }
+        self.state.journal.emit(
+            "step.started",
+            json!({
+                "id": step.id, "type": "action", "path": step.path
+            }),
+        );
+        match output {
+            Ok(output) => {
+                self.state.record_output(&step, output);
+                self.state.journal.emit(
+                    "step.finished",
+                    json!({
+                        "id": step.id, "status": "succeeded"
+                    }),
+                );
+                self.next_index += 1;
+                Ok(if self.next_index == self.ordered().len() {
+                    Segment::Exhausted
+                } else {
+                    Segment::Advanced
+                })
+            }
+            Err(error) => {
+                let error = error.at_step(
+                    &step.id,
+                    Some(&step.path),
+                    Some(1),
+                    Some(&self.state.descriptor.name),
+                );
+                self.state.journal.emit(
+                    "step.finished",
+                    json!({
+                        "id": step.id, "status": "failed", "error": error.to_json()
+                    }),
+                );
+                Err(error)
+            }
+        }
+    }
+
     /// Top-level steps in the order they will execute.
     ///
     /// Resolved the same way as an ordinary run so an index recorded in a
@@ -1401,40 +1760,74 @@ impl<'a> Segmented<'a> {
         self.state.journal.emit(event_type, payload);
     }
 
-    /// Run the workflow handler and `finally` blocks, then build the result.
+    /// Resolve the workflow-level handler and outputs before cleanup begins.
     ///
-    /// `body` is the outcome of the segments so far. Cleanup runs on every path,
-    /// including cancellation, exactly as in an ordinary run.
-    ///
-    /// Takes `&mut self` rather than consuming the run so a caller holding it
-    /// behind a mutable borrow can finalise in place; calling it twice would run
-    /// cleanup twice, so callers must not.
-    pub fn finish(&mut self, body: Result<(), AutomationError>) -> RunResult {
+    /// Keeping this boundary separate lets a durable caller persist everything
+    /// needed to finish before any `finally` step is dispatched.
+    pub fn prepare_finalization(
+        &mut self,
+        body: Result<(), AutomationError>,
+    ) -> FinalizationIntent {
         let mut outcome = body;
 
         if let (Err(error), Some(handler)) = (&outcome, &self.state.descriptor.on_error) {
             if handler.matches(&error.code, &error.category, &error.effect) {
                 let error = error.clone();
-                outcome = self
-                    .state
-                    .run_handler(handler.clone(), error, "$workflow")
-                    .map(|_| ());
+                outcome = match self.state.run_handler(handler.clone(), error, "$workflow") {
+                    Ok(Flow::Return(value)) => {
+                        self.returned = Some(value);
+                        Ok(())
+                    }
+                    Ok(Flow::Next) => Ok(()),
+                    Err(error) => Err(error),
+                };
             }
         }
 
+        let mut outputs = Map::new();
+        if outcome.is_ok() {
+            match self.state.workflow_outputs() {
+                Ok(resolved) => outputs = resolved,
+                Err(error) => outcome = Err(error),
+            }
+        }
+        FinalizationIntent {
+            outputs,
+            error: outcome.err(),
+        }
+    }
+
+    /// Run workflow `finally` from a previously captured intent.
+    ///
+    /// This must be called at most once for a given persisted `started` marker.
+    /// The caller owns that invariant; this method owns the ordinary runtime's
+    /// handler, cleanup, error and terminal-status semantics.
+    pub fn finish_prepared(&mut self, intent: FinalizationIntent) -> RunResult {
+        let mut outcome = intent.error.map_or(Ok(()), Err);
+        let outputs = intent.outputs;
+
         if !self.state.descriptor.finally_steps.is_empty() {
+            let original_deadline = self.state.deadline;
+            let cleanup_timeout = self.state.descriptor.budgets.cleanup_timeout.unwrap_or(5.0);
+            self.state.deadline = Instant::now() + Duration::from_secs_f64(cleanup_timeout);
             self.state
                 .journal
                 .emit("cleanup.started", json!({"id": "$workflow"}));
             let finally_steps = &self.state.descriptor.finally_steps;
             let cleanup = self.state.run_steps(finally_steps);
+            self.state.deadline = original_deadline;
             self.state.journal.emit(
                 "cleanup.finished",
                 json!({"id": "$workflow", "ok": cleanup.is_ok()}),
             );
             outcome = match (outcome, cleanup) {
                 (Ok(()), Ok(_)) => Ok(()),
-                (Ok(()), Err(error)) => Err(error),
+                (Ok(()), Err(error)) => Err(AutomationError::new(
+                    "WORKFLOW.FINALLY_FAILED",
+                    "workflow cleanup failed",
+                )
+                .with_phase("cleanup")
+                .with_cause(error)),
                 (Err(mut original), Err(cleanup_error)) => {
                     original.add_suppressed(cleanup_error);
                     Err(original)
@@ -1443,15 +1836,14 @@ impl<'a> Segmented<'a> {
             };
         }
 
-        let outputs = match &outcome {
-            Ok(()) => self.state.workflow_outputs().unwrap_or_default(),
-            Err(_) => Map::new(),
-        };
+        let outputs = if outcome.is_ok() { outputs } else { Map::new() };
         let (status, error) = match outcome {
             Ok(()) => (RunStatus::Succeeded, None),
             Err(error) => {
                 let status = match error.code.as_str() {
-                    "WORKFLOW.TIMEOUT" => RunStatus::TimedOut,
+                    "WORKFLOW.TIMEOUT" | "ACTION.TIMEOUT" | "STEP.TIMEOUT" | "SCRIPT.TIMEOUT" => {
+                        RunStatus::TimedOut
+                    }
                     "WORKFLOW.CANCELLED" => RunStatus::Cancelled,
                     _ if error.effect == "unknown" || self.state.unknown_effect => {
                         RunStatus::UnknownEffect
@@ -1476,6 +1868,15 @@ impl<'a> Segmented<'a> {
             finished_at: now_rfc3339(),
             events: self.state.journal.events(),
         }
+    }
+
+    /// Run the workflow handler and `finally` blocks, then build the result.
+    ///
+    /// `body` is the outcome of the segments so far. Cleanup runs on every path,
+    /// including cancellation, exactly as in an ordinary run.
+    pub fn finish(&mut self, body: Result<(), AutomationError>) -> RunResult {
+        let intent = self.prepare_finalization(body);
+        self.finish_prepared(intent)
     }
 }
 
@@ -1504,19 +1905,107 @@ fn deadline_instant(deadline_epoch: f64) -> Instant {
 /// Only the runtime range is checked here. Platform, permission and capability
 /// requirements are resolved during compilation and provider binding, so
 /// duplicating them would risk two answers to one question.
-fn check_requirements(descriptor: &WorkflowDescriptor) -> Result<(), AutomationError> {
-    let Some(range) = descriptor.requires.get("runtime").and_then(Value::as_str) else {
-        return Ok(());
-    };
-    if crate::version::matches(RUNTIME_VERSION, range) {
-        return Ok(());
+fn check_requirements(
+    descriptor: &WorkflowDescriptor,
+    providers: &ProviderRegistry,
+    granted_permissions: &std::collections::BTreeSet<String>,
+) -> Result<(), AutomationError> {
+    if let Some(range) = descriptor.requires.get("runtime").and_then(Value::as_str) {
+        if !crate::version::matches(RUNTIME_VERSION, range) {
+            return Err(AutomationError::new(
+                "DESCRIPTOR.VERSION_UNSUPPORTED",
+                format!("Runtime {RUNTIME_VERSION} does not satisfy '{range}'"),
+            )
+            .with_category("descriptor")
+            .with_effect("not_applied"));
+        }
     }
-    Err(AutomationError::new(
-        "DESCRIPTOR.VERSION_UNSUPPORTED",
-        format!("Runtime {RUNTIME_VERSION} does not satisfy '{range}'"),
-    )
-    .with_category("descriptor")
-    .with_effect("not_applied"))
+    if let Some(platforms) = descriptor
+        .requires
+        .get("platforms")
+        .and_then(Value::as_array)
+    {
+        if !platforms
+            .iter()
+            .any(|value| value.as_str() == Some(std::env::consts::OS))
+        {
+            return Err(AutomationError::new(
+                "CAPABILITY.PLATFORM_UNSUPPORTED",
+                format!(
+                    "workflow does not support platform {:?}",
+                    std::env::consts::OS
+                ),
+            )
+            .with_category("capability")
+            .with_effect("not_applied"));
+        }
+    }
+    let missing: Vec<String> = strings_from(descriptor.requires.get("permissions"))
+        .into_iter()
+        .filter(|permission| !granted_permissions.contains(permission))
+        .collect();
+    if !missing.is_empty() {
+        return Err(
+            AutomationError::new("POLICY.DENIED", "workflow permissions were not granted")
+                .with_category("policy")
+                .with_effect("not_applied")
+                .with_detail("missing_permissions", json!(missing)),
+        );
+    }
+    if let Some(capabilities) = descriptor
+        .requires
+        .get("capabilities")
+        .and_then(Value::as_array)
+    {
+        for required in capabilities {
+            let Some(required) = required.as_object() else {
+                continue;
+            };
+            let Some(name) = required.get("name").and_then(Value::as_str) else {
+                continue;
+            };
+            let Some(provider) = providers.get(name) else {
+                if required.get("optional").and_then(Value::as_bool) == Some(true) {
+                    continue;
+                }
+                return Err(AutomationError::new(
+                    "CAPABILITY.MISSING",
+                    format!("required capability {name:?} is not registered"),
+                )
+                .with_category("capability")
+                .with_effect("not_applied"));
+            };
+            if let Some(range) = required.get("version").and_then(Value::as_str) {
+                let compatible = provider
+                    .manifest()
+                    .version
+                    .as_deref()
+                    .is_some_and(|version| crate::version::matches(version, range));
+                if !compatible {
+                    return Err(AutomationError::new(
+                        "CAPABILITY.VERSION_INCOMPATIBLE",
+                        format!("capability {name:?} does not satisfy {range:?}"),
+                    )
+                    .with_category("capability")
+                    .with_effect("not_applied"));
+                }
+            }
+            let missing_actions: Vec<String> = strings_from(required.get("actions"))
+                .into_iter()
+                .filter(|action| !provider.manifest().actions.contains_key(action))
+                .collect();
+            if !missing_actions.is_empty() {
+                return Err(AutomationError::new(
+                    "CAPABILITY.MISSING",
+                    format!("capability {name:?} is missing required actions"),
+                )
+                .with_category("capability")
+                .with_effect("not_applied")
+                .with_detail("actions", json!(missing_actions)));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Execute a compiled workflow to completion.
@@ -1572,7 +2061,9 @@ pub fn run(descriptor: &WorkflowDescriptor, options: RunOptions) -> RunResult {
     // Checked here rather than at compile time because it is a property of the
     // running binary, not of the document: the same descriptor is valid against
     // a different runtime build.
-    if let Err(error) = check_requirements(descriptor) {
+    if let Err(error) =
+        check_requirements(descriptor, &options.providers, &options.granted_permissions)
+    {
         journal.emit("run.failed", json!({"error": error.to_json()}));
         return RunResult {
             run_id,
@@ -1604,6 +2095,7 @@ pub fn run(descriptor: &WorkflowDescriptor, options: RunOptions) -> RunResult {
         cancel: options.cancel.clone(),
         base_directory: options.base_directory.clone(),
         allow_scripts: options.allow_scripts,
+        granted_permissions: options.granted_permissions.clone(),
         unknown_effect: false,
     };
 
@@ -1631,7 +2123,12 @@ pub fn run(descriptor: &WorkflowDescriptor, options: RunOptions) -> RunResult {
         );
         outcome = match (outcome, cleanup) {
             (Ok(()), Ok(_)) => Ok(()),
-            (Ok(()), Err(error)) => Err(error),
+            (Ok(()), Err(error)) => Err(AutomationError::new(
+                "WORKFLOW.FINALLY_FAILED",
+                "workflow cleanup failed",
+            )
+            .with_phase("cleanup")
+            .with_cause(error)),
             (Err(mut original), Err(cleanup_error)) => {
                 original.add_suppressed(cleanup_error);
                 Err(original)
@@ -1649,7 +2146,9 @@ pub fn run(descriptor: &WorkflowDescriptor, options: RunOptions) -> RunResult {
         Ok(()) => (RunStatus::Succeeded, None),
         Err(error) => {
             let status = match error.code.as_str() {
-                "WORKFLOW.TIMEOUT" => RunStatus::TimedOut,
+                "WORKFLOW.TIMEOUT" | "ACTION.TIMEOUT" | "STEP.TIMEOUT" | "SCRIPT.TIMEOUT" => {
+                    RunStatus::TimedOut
+                }
                 "WORKFLOW.CANCELLED" => RunStatus::Cancelled,
                 // An unprovable effect is never reported as a clean failure.
                 _ if error.effect == "unknown" || state.unknown_effect => RunStatus::UnknownEffect,

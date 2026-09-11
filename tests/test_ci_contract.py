@@ -12,6 +12,19 @@ WINDOWS_RESULT_PATH = "artifacts/windows-native-fixture-result.json"
 
 
 class CiTriggerContractTests(unittest.TestCase):
+    def test_windows_only_rust_examples_are_checked_only_on_windows(self) -> None:
+        source = CI_WORKFLOW.read_text(encoding="utf-8")
+
+        self.assertRegex(
+            source,
+            re.compile(
+                r"- name: Check Windows-native UIA examples\n"
+                r"\s+if: runner\.os == 'Windows'\n"
+                r"\s+run: cargo check --locked -p aad-uia --examples "
+                r"--features windows-native-examples"
+            ),
+        )
+
     def test_automatic_contract_jobs_install_declared_optional_dependencies(
         self,
     ) -> None:

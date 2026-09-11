@@ -8,11 +8,81 @@
 
 use aad_core::compiler::compile_descriptor;
 use aad_core::WorkflowDescriptor;
+use aad_plugin::{manifest, CapabilityManifest};
 use aad_runtime::durable::{DesiredState, JournalStore, RunStatus};
 use aad_runtime::durable_exec::{
-    assert_durable_plan, DurableExecutor, DurableOptions, Phase, Stopped,
+    assert_durable_plan, DurableActionMode, DurableExecutor, DurableOptions, Phase, Stopped,
 };
+use aad_runtime::provider::{Provider, ProviderRegistry};
 use serde_json::{json, Map, Value};
+use sha2::{Digest, Sha256};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
+struct ReadOnlyProvider {
+    manifest: CapabilityManifest,
+    calls: AtomicUsize,
+    failure: Option<aad_core::AutomationError>,
+}
+
+impl ReadOnlyProvider {
+    fn new() -> Arc<Self> {
+        let raw = json!({
+            "apiVersion": "ai-auto-desktop.dev/v1alpha1",
+            "kind": "CapabilityManifest",
+            "metadata": {"name": "fixture", "version": "1.0.0"},
+            "actions": {
+                "read": {
+                    "contract_major": 1,
+                    "effect": {"default_class": "read_only"},
+                    "risk": {"category": "observe", "level": "low"},
+                    "input_schema": {"type": "object"},
+                    "output_schema": {"type": "object"},
+                    "errors": [{"code": "FIXTURE.FAIL", "retryable": false, "effect": "not_applied"}],
+                    "sensitivity": {"input": "public", "output": "public", "error": "public"},
+                    "durability": {"checkpoint_fields": {
+                        "title": {"pointer": "/safe/title", "schema": {"type": "string"}}
+                    }}
+                }
+            }
+        });
+        Arc::new(Self {
+            manifest: manifest::parse(&raw).expect("valid provider"),
+            calls: AtomicUsize::new(0),
+            failure: None,
+        })
+    }
+
+    fn failing(code: &str, message: &str) -> Arc<Self> {
+        let mut provider = Arc::try_unwrap(Self::new()).ok().expect("new provider");
+        provider.failure = Some(
+            aad_core::AutomationError::new(code, message)
+                .with_retryable(true)
+                .with_effect("unknown"),
+        );
+        Arc::new(provider)
+    }
+}
+
+impl Provider for ReadOnlyProvider {
+    fn manifest(&self) -> &CapabilityManifest {
+        &self.manifest
+    }
+
+    fn invoke(
+        &self,
+        _action: &str,
+        _args: Value,
+        _timeout: Option<Duration>,
+    ) -> Result<Value, aad_core::AutomationError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        if let Some(error) = &self.failure {
+            return Err(error.clone());
+        }
+        Ok(json!({"safe": {"title": "ok"}, "secret": "must-not-persist"}))
+    }
+}
 
 /// A journal in its own directory, removed on drop.
 struct TempDir {
@@ -95,6 +165,288 @@ fn counting_workflow(steps: usize) -> Value {
             "steps": body,
         }),
     )
+}
+
+fn cleanup_workflow() -> WorkflowDescriptor {
+    compile(document(
+        "durable.cleanup",
+        json!({
+            "variables": {"count": counter(0)},
+            "outputs": {"total": {"value": "${{ vars.count }}"}},
+            "steps": [
+                {"id": "work", "type": "set", "assign": {"vars.count": 1}}
+            ],
+            "finally": [
+                {"id": "cleanup", "type": "set", "assign": {"vars.count": 7}}
+            ]
+        }),
+    ))
+}
+
+fn seed_running_checkpoint(
+    store: &JournalStore,
+    descriptor: &WorkflowDescriptor,
+    checkpoint: &Value,
+) {
+    let digest = aad_runtime::plan_digest(descriptor);
+    store
+        .create_run(
+            "run-1",
+            &descriptor.name,
+            &json!({}),
+            &descriptor.raw,
+            None,
+            Some(&digest),
+            None,
+        )
+        .expect("create");
+    let lease = store.claim_owner("run-1", "dead", 1.0, 1.0).expect("claim");
+    store
+        .set_status(
+            &lease,
+            RunStatus::Pending,
+            RunStatus::Running,
+            None,
+            None,
+            None,
+            None,
+            1.1,
+        )
+        .expect("start");
+    store
+        .append_event_with_checkpoint(
+            &lease,
+            "test.checkpoint",
+            &json!({}),
+            checkpoint,
+            None,
+            None,
+            1.2,
+        )
+        .expect("checkpoint");
+}
+
+fn read_only_workflow() -> WorkflowDescriptor {
+    compile(document(
+        "durable.read-only",
+        json!({
+            "outputs": {"title": {"value": "${{ steps.observe.output.title }}"}},
+            "steps": [{
+                "id": "observe",
+                "type": "action",
+                "uses": "fixture.read@1",
+                "with": {"query": "public"},
+                "effect": {"class": "read_only"},
+                "risk": {"category": "observe", "level": "low"},
+                "sensitivity": {"input": "public", "output": "public", "error": "public"},
+                "checkpoint": {"output": {"mode": "project", "fields": ["title"]}}
+            }]
+        }),
+    ))
+}
+
+fn read_only_options(provider: Arc<ReadOnlyProvider>) -> DurableOptions {
+    let mut providers = ProviderRegistry::new();
+    providers.insert(provider);
+    DurableOptions::default()
+        .with_providers(providers)
+        .with_action_mode(DurableActionMode::ReadOnly)
+}
+
+fn canonical_json(value: &Value) -> String {
+    match value {
+        Value::Object(map) => {
+            let mut keys: Vec<_> = map.keys().collect();
+            keys.sort();
+            format!(
+                "{{{}}}",
+                keys.into_iter()
+                    .map(|key| format!("{}:{}", json!(key), canonical_json(&map[key])))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )
+        }
+        Value::Array(items) => format!(
+            "[{}]",
+            items
+                .iter()
+                .map(canonical_json)
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+        other => other.to_string(),
+    }
+}
+
+fn digest_json(value: &Value) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(canonical_json(value));
+    format!("sha256:{:x}", hasher.finalize())
+}
+
+#[test]
+fn a_read_only_action_persists_only_its_projection() {
+    let temp = TempDir::new("read-only-action");
+    let provider = ReadOnlyProvider::new();
+    let outcome = DurableExecutor::new(temp.open())
+        .start(
+            &read_only_workflow(),
+            Some("run-1"),
+            read_only_options(provider.clone()),
+        )
+        .expect("the durable observation completes");
+
+    assert_eq!(outcome.run.status, RunStatus::Succeeded);
+    assert_eq!(outcome.run.output, Some(json!({"title": "ok"})));
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+    let persisted = serde_json::to_string(&outcome.run.to_json()).unwrap();
+    assert!(!persisted.contains("must-not-persist"));
+    let events = temp.open().list_events("run-1", 0, 100).unwrap();
+    assert!(events
+        .iter()
+        .any(|event| event.event_type == "run.action_intent"));
+    assert!(events
+        .iter()
+        .any(|event| event.event_type == "run.action_dispatch_authorized"));
+    assert!(events
+        .iter()
+        .any(|event| event.event_type == "run.finalization_completed"));
+}
+
+#[test]
+fn read_only_actions_still_require_explicit_opt_in() {
+    let temp = TempDir::new("read-only-denied");
+    let provider = ReadOnlyProvider::new();
+    let mut providers = ProviderRegistry::new();
+    providers.insert(provider.clone());
+    let error = DurableExecutor::new(temp.open())
+        .start(
+            &read_only_workflow(),
+            Some("run-1"),
+            DurableOptions::default().with_providers(providers),
+        )
+        .expect_err("the default mode must reject actions");
+    assert_eq!(error.code, "DURABLE.UNSUPPORTED_PLAN");
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn a_durable_plugin_timeout_is_redacted_and_reported_as_timed_out() {
+    let temp = TempDir::new("read-only-timeout");
+    let provider = ReadOnlyProvider::failing("PLUGIN.HOST_TIMEOUT", "secret transport detail");
+    let outcome = DurableExecutor::new(temp.open())
+        .start(
+            &read_only_workflow(),
+            Some("run-1"),
+            read_only_options(provider.clone()),
+        )
+        .expect("the provider timeout is a terminal run outcome");
+
+    assert_eq!(outcome.run.status, RunStatus::TimedOut);
+    let error = outcome.run.error.expect("timeout has an error");
+    assert_eq!(error["code"], "ACTION.TIMEOUT");
+    assert!(!error.to_string().contains("secret transport detail"));
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn an_action_intent_can_be_recovered_and_replayed_once() {
+    let temp = TempDir::new("read-only-recovery");
+    let workflow = read_only_workflow();
+    let provider = ReadOnlyProvider::new();
+    let store = temp.open();
+    let plan_digest = aad_runtime::plan_digest(&workflow);
+    store
+        .create_run(
+            "run-1",
+            &workflow.name,
+            &json!({}),
+            &workflow.raw,
+            None,
+            Some(&plan_digest),
+            None,
+        )
+        .unwrap();
+    let old = store.claim_owner("run-1", "dead", 1.0, 1.0).unwrap();
+    store
+        .set_status(
+            &old,
+            RunStatus::Pending,
+            RunStatus::Running,
+            None,
+            None,
+            None,
+            None,
+            1.1,
+        )
+        .unwrap();
+
+    let step = &workflow.steps[0];
+    let contract = &provider.manifest.actions["read"];
+    let projection = json!({
+        "mode": "project",
+        "fields": ["title"],
+        "definitions": {
+            "title": {"pointer": "/safe/title", "schema": {"type": "string"}}
+        }
+    });
+    let provider_digest = digest_json(&provider.manifest.raw);
+    let contract_digest = digest_json(&contract.raw);
+    let projection_digest = digest_json(&projection);
+    let binding_digest = digest_json(&json!({
+        "uses": "fixture.read@1",
+        "input": {"query": "public"},
+        "providerDigest": provider_digest,
+        "contractDigest": contract_digest,
+        "projectionDigest": projection_digest,
+    }));
+    let deadline = aad_runtime::durable::now_seconds() + 30.0;
+    let dispatch_deadline = (deadline * 1000.0) as u64;
+    let checkpoint = json!({
+        "checkpointVersion": 1,
+        "runtimeVersion": aad_runtime::RUNTIME_VERSION,
+        "planDigest": plan_digest,
+        "phase": "action_intent",
+        "deadline": deadline,
+        "nextTopLevelIndex": 0,
+        "executedSteps": 1,
+        "unknownEffect": false,
+        "variables": {},
+        "steps": {},
+        "returned": null,
+        "actionIntent": {
+            "version": 2,
+            "operationId": "recover-operation",
+            "stepId": step.id,
+            "reservationOrdinal": 1,
+            "attempt": 1,
+            "dispatchDeadlineEpochMs": dispatch_deadline,
+            "providerDigest": provider_digest,
+            "contractDigest": contract_digest,
+            "projectionDigest": projection_digest,
+            "bindingDigest": binding_digest,
+        }
+    });
+    store
+        .append_event_with_checkpoint(
+            &old,
+            "run.action_intent",
+            &json!({}),
+            &checkpoint,
+            Some(RunStatus::Running),
+            None,
+            1.2,
+        )
+        .unwrap();
+    drop(store);
+
+    let outcome = DurableExecutor::new(temp.open())
+        .resume(&workflow, "run-1", read_only_options(provider.clone()))
+        .expect("a read-only intent is safe to replay");
+
+    assert_eq!(outcome.run.status, RunStatus::Succeeded);
+    assert_eq!(outcome.run.output, Some(json!({"title": "ok"})));
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
 }
 
 // ---------------------------------------------------------------- plan gating
@@ -209,6 +561,15 @@ fn a_durable_run_completes_and_records_every_boundary() {
     );
     assert_eq!(events.first().expect("first"), "run.created");
     assert_eq!(events.last().expect("last"), "run.finished");
+    assert_eq!(
+        &events[events.len() - 4..],
+        &[
+            "run.finalization_intent",
+            "run.finalization_started",
+            "run.finalization_completed",
+            "run.finished",
+        ]
+    );
 }
 
 #[test]
@@ -763,6 +1124,42 @@ fn a_cancel_requested_partway_ends_the_run_as_cancelled() {
 }
 
 #[test]
+fn a_cancel_before_execution_still_runs_workflow_cleanup() {
+    let temp = TempDir::new("cancel-before-cleanup");
+    let descriptor = cleanup_workflow();
+    let store = temp.open();
+    let digest = aad_runtime::plan_digest(&descriptor);
+    store
+        .create_run(
+            "run-1",
+            &descriptor.name,
+            &json!({}),
+            &descriptor.raw,
+            None,
+            Some(&digest),
+            None,
+        )
+        .expect("create");
+    store
+        .compare_and_set_desired_state("run-1", DesiredState::Run, DesiredState::Cancel, None)
+        .expect("cancel");
+
+    let outcome = DurableExecutor::new(temp.open())
+        .execute(&descriptor, "run-1", DurableOptions::default())
+        .expect("honour cancel through durable finalization");
+
+    assert_eq!(outcome.run.status, RunStatus::Cancelled);
+    assert_eq!(
+        outcome.run.checkpoint.as_ref().unwrap()["variables"]["count"],
+        7
+    );
+    let events = temp.open().list_events("run-1", 0, 100).unwrap();
+    assert!(events
+        .iter()
+        .any(|event| event.event_type == "run.finalization_completed"));
+}
+
+#[test]
 fn executing_a_run_that_is_not_pending_is_refused() {
     let temp = TempDir::new("not-pending");
     let executor = DurableExecutor::new(temp.open());
@@ -882,13 +1279,15 @@ fn the_checkpoint_records_the_phase_and_survives_reopening() {
     let run = reopened.get_run("run-1").expect("run");
     let checkpoint = run.checkpoint.as_ref().expect("checkpoint persisted");
 
-    assert_eq!(checkpoint["checkpointVersion"], json!(1));
+    assert_eq!(checkpoint["checkpointVersion"], json!(2));
     assert_eq!(
         checkpoint["planDigest"],
         json!(aad_runtime::plan_digest(&descriptor))
     );
-    // The last checkpoint before finishing is the finalizing one.
+    // The last checkpoint before terminal commit contains the completed
+    // finalization result, so recovery can commit without replaying cleanup.
     assert_eq!(checkpoint["phase"], json!(Phase::Finalizing.as_str()));
+    assert_eq!(checkpoint["finalization"]["stage"], json!("result"));
     // The absolute deadline is stored so a resume cannot be handed a fresh
     // budget.
     assert!(checkpoint["deadline"].as_f64().expect("deadline") > 0.0);
@@ -953,6 +1352,395 @@ fn a_checkpoint_from_an_unsupported_version_is_refused() {
         .resume(&descriptor, "run-1", DurableOptions::default())
         .expect_err("must refuse");
     assert_eq!(error.code, "DURABLE.CHECKPOINT_UNSUPPORTED");
+}
+
+#[test]
+fn a_legacy_v1_boundary_checkpoint_remains_resumable() {
+    let temp = TempDir::new("legacy-v1");
+    let descriptor = compile(counting_workflow(2));
+    let digest = aad_runtime::plan_digest(&descriptor);
+    let store = temp.open();
+    seed_running_checkpoint(
+        &store,
+        &descriptor,
+        &json!({
+            "checkpointVersion": 1,
+            "runtimeVersion": aad_runtime::RUNTIME_VERSION,
+            "planDigest": digest,
+            "phase": "between_top_level_steps",
+            "deadline": aad_runtime::durable::now_seconds() + 60.0,
+            "nextTopLevelIndex": 1,
+            "executedSteps": 1,
+            "unknownEffect": false,
+            "variables": {"count": 1},
+            "steps": {},
+            "returned": null,
+        }),
+    );
+    drop(store);
+
+    let outcome = DurableExecutor::new(temp.open())
+        .resume(
+            &descriptor,
+            "run-1",
+            DurableOptions::default().with_owner_id("recovery"),
+        )
+        .expect("v1 checkpoint remains readable");
+    assert_eq!(outcome.run.status, RunStatus::Succeeded);
+    assert_eq!(outcome.run.output, Some(json!({"total": 2})));
+}
+
+#[test]
+fn a_finalization_intent_resumes_cleanup_exactly_once() {
+    let temp = TempDir::new("finalization-intent");
+    let descriptor = cleanup_workflow();
+    let digest = aad_runtime::plan_digest(&descriptor);
+    let store = temp.open();
+    seed_running_checkpoint(
+        &store,
+        &descriptor,
+        &json!({
+            "checkpointVersion": 2,
+            "runtimeVersion": aad_runtime::RUNTIME_VERSION,
+            "planDigest": digest,
+            "phase": "finalizing",
+            "deadline": aad_runtime::durable::now_seconds() + 60.0,
+            "nextTopLevelIndex": 1,
+            "executedSteps": 1,
+            "unknownEffect": false,
+            "variables": {"count": 1},
+            "steps": {},
+            "returned": null,
+            "finalization": {
+                "version": 1,
+                "stage": "intent",
+                "outputSet": true,
+                "output": {"total": 1},
+                "error": null,
+            },
+        }),
+    );
+    drop(store);
+
+    let journal = temp.open();
+    let outcome = DurableExecutor::new(journal)
+        .resume(
+            &descriptor,
+            "run-1",
+            DurableOptions::default().with_owner_id("recovery"),
+        )
+        .expect("cleanup intent is replay-safe");
+    assert_eq!(outcome.run.status, RunStatus::Succeeded);
+    assert_eq!(outcome.run.output, Some(json!({"total": 1})));
+    assert_eq!(
+        outcome.run.checkpoint.as_ref().unwrap()["variables"]["count"],
+        7
+    );
+    let events = temp.open().list_events("run-1", 0, 100).unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.event_type == "run.finalization_started")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn a_finalization_started_checkpoint_never_replays_cleanup() {
+    let temp = TempDir::new("finalization-started");
+    let descriptor = cleanup_workflow();
+    let digest = aad_runtime::plan_digest(&descriptor);
+    let store = temp.open();
+    seed_running_checkpoint(
+        &store,
+        &descriptor,
+        &json!({
+            "checkpointVersion": 2,
+            "runtimeVersion": aad_runtime::RUNTIME_VERSION,
+            "planDigest": digest,
+            "phase": "finalizing",
+            "deadline": aad_runtime::durable::now_seconds() + 60.0,
+            "nextTopLevelIndex": 1,
+            "executedSteps": 1,
+            "unknownEffect": false,
+            "variables": {"count": 1},
+            "steps": {},
+            "returned": null,
+            "finalization": {
+                "version": 1,
+                "stage": "started",
+                "outputSet": true,
+                "output": {"total": 1},
+                "error": null,
+            },
+        }),
+    );
+    drop(store);
+
+    let outcome = DurableExecutor::new(temp.open())
+        .resume(
+            &descriptor,
+            "run-1",
+            DurableOptions::default().with_owner_id("recovery"),
+        )
+        .expect("started cleanup is reconciled conservatively");
+    assert_eq!(outcome.run.status, RunStatus::UnknownEffect);
+    assert_eq!(
+        outcome.run.error.as_ref().unwrap()["details"]["phase"],
+        "finalization_started"
+    );
+    let events = temp.open().list_events("run-1", 0, 100).unwrap();
+    assert!(!events
+        .iter()
+        .any(|event| event.event_type == "run.finalization_completed"));
+}
+
+#[test]
+fn a_finalization_result_commits_without_replaying_cleanup() {
+    let temp = TempDir::new("finalization-result");
+    let descriptor = cleanup_workflow();
+    let digest = aad_runtime::plan_digest(&descriptor);
+    let store = temp.open();
+    seed_running_checkpoint(
+        &store,
+        &descriptor,
+        &json!({
+            "checkpointVersion": 2,
+            "runtimeVersion": aad_runtime::RUNTIME_VERSION,
+            "planDigest": digest,
+            "phase": "finalizing",
+            "deadline": aad_runtime::durable::now_seconds() + 60.0,
+            "nextTopLevelIndex": 1,
+            "executedSteps": 2,
+            "unknownEffect": false,
+            "variables": {"count": 7},
+            "steps": {},
+            "returned": null,
+            "finalization": {
+                "version": 1,
+                "stage": "result",
+                "result": {
+                    "status": "succeeded",
+                    "output": {"total": 1},
+                    "error": null,
+                    "executedSteps": 2,
+                },
+            },
+        }),
+    );
+    drop(store);
+
+    let outcome = DurableExecutor::new(temp.open())
+        .resume(
+            &descriptor,
+            "run-1",
+            DurableOptions::default().with_owner_id("recovery"),
+        )
+        .expect("completed cleanup only needs terminal commit");
+    assert_eq!(outcome.run.status, RunStatus::Succeeded);
+    assert_eq!(outcome.run.output, Some(json!({"total": 1})));
+    let events = temp.open().list_events("run-1", 0, 100).unwrap();
+    assert!(!events
+        .iter()
+        .any(|event| event.event_type == "run.finalization_started"));
+    assert_eq!(events.last().unwrap().event_type, "run.finished");
+}
+
+#[test]
+fn a_finalization_intent_preserves_a_body_failure_through_cleanup() {
+    let temp = TempDir::new("finalization-failure");
+    let descriptor = cleanup_workflow();
+    let digest = aad_runtime::plan_digest(&descriptor);
+    let failure = aad_core::AutomationError::new("TEST.FAIL", "body failed")
+        .with_effect("not_applied")
+        .at_step("work", Some("$.steps[0]"), Some(1), Some(&descriptor.name));
+    let store = temp.open();
+    seed_running_checkpoint(
+        &store,
+        &descriptor,
+        &json!({
+            "checkpointVersion": 2,
+            "runtimeVersion": aad_runtime::RUNTIME_VERSION,
+            "planDigest": digest,
+            "phase": "finalizing",
+            "deadline": aad_runtime::durable::now_seconds() + 60.0,
+            "nextTopLevelIndex": 1,
+            "executedSteps": 1,
+            "unknownEffect": false,
+            "variables": {"count": 1},
+            "steps": {},
+            "returned": null,
+            "finalization": {
+                "version": 1,
+                "stage": "intent",
+                "outputSet": false,
+                "output": null,
+                "error": failure.to_json(),
+            },
+        }),
+    );
+    drop(store);
+
+    let outcome = DurableExecutor::new(temp.open())
+        .resume(
+            &descriptor,
+            "run-1",
+            DurableOptions::default().with_owner_id("recovery"),
+        )
+        .expect("body failure remains a terminal result");
+    assert_eq!(outcome.run.status, RunStatus::Failed);
+    assert_eq!(outcome.run.error.as_ref().unwrap()["code"], "TEST.FAIL");
+    assert_eq!(
+        outcome.run.error.as_ref().unwrap()["location"]["step_id"],
+        "work"
+    );
+    assert_eq!(
+        outcome.run.checkpoint.as_ref().unwrap()["variables"]["count"],
+        7
+    );
+}
+
+#[test]
+fn a_completed_success_honours_a_sticky_cancel_without_replaying_cleanup() {
+    let temp = TempDir::new("finalization-result-cancel");
+    let descriptor = cleanup_workflow();
+    let digest = aad_runtime::plan_digest(&descriptor);
+    let store = temp.open();
+    seed_running_checkpoint(
+        &store,
+        &descriptor,
+        &json!({
+            "checkpointVersion": 2,
+            "runtimeVersion": aad_runtime::RUNTIME_VERSION,
+            "planDigest": digest,
+            "phase": "finalizing",
+            "deadline": aad_runtime::durable::now_seconds() + 60.0,
+            "nextTopLevelIndex": 1,
+            "executedSteps": 2,
+            "unknownEffect": false,
+            "variables": {"count": 7},
+            "steps": {},
+            "returned": null,
+            "finalization": {
+                "version": 1,
+                "stage": "result",
+                "result": {
+                    "status": "succeeded",
+                    "output": {"total": 1},
+                    "error": null,
+                    "executedSteps": 2,
+                },
+            },
+        }),
+    );
+    store
+        .compare_and_set_desired_state("run-1", DesiredState::Run, DesiredState::Cancel, None)
+        .unwrap();
+    drop(store);
+
+    let outcome = DurableExecutor::new(temp.open())
+        .resume(
+            &descriptor,
+            "run-1",
+            DurableOptions::default().with_owner_id("recovery"),
+        )
+        .expect("sticky cancel supersedes a successful result");
+    assert_eq!(outcome.run.status, RunStatus::Cancelled);
+    assert!(outcome.run.output.is_none());
+    let events = temp.open().list_events("run-1", 0, 100).unwrap();
+    assert!(!events
+        .iter()
+        .any(|event| event.event_type == "run.finalization_started"));
+}
+
+#[test]
+fn a_malformed_finalization_checkpoint_is_rejected_before_cleanup() {
+    let temp = TempDir::new("malformed-finalization");
+    let descriptor = cleanup_workflow();
+    let digest = aad_runtime::plan_digest(&descriptor);
+    let store = temp.open();
+    seed_running_checkpoint(
+        &store,
+        &descriptor,
+        &json!({
+            "checkpointVersion": 2,
+            "runtimeVersion": aad_runtime::RUNTIME_VERSION,
+            "planDigest": digest,
+            "phase": "finalizing",
+            "deadline": aad_runtime::durable::now_seconds() + 60.0,
+            "nextTopLevelIndex": 1,
+            "executedSteps": 1,
+            "unknownEffect": false,
+            "variables": {"count": 1},
+            "steps": {},
+            "returned": null,
+            "finalization": {
+                "version": 1,
+                "stage": "intent",
+                "outputSet": true,
+                "output": {"total": 1},
+                "error": null,
+                "unexpected": true,
+            },
+        }),
+    );
+    drop(store);
+
+    let error = DurableExecutor::new(temp.open())
+        .resume(
+            &descriptor,
+            "run-1",
+            DurableOptions::default().with_owner_id("recovery"),
+        )
+        .expect_err("unknown checkpoint fields must fail closed");
+    assert_eq!(error.code, "DURABLE.CHECKPOINT_INVALID");
+    let current = temp.open().get_run("run-1").unwrap();
+    assert_eq!(current.checkpoint.unwrap()["variables"]["count"], 1);
+}
+
+#[test]
+fn a_current_checkpoint_requires_complete_typed_segment_state() {
+    let descriptor = compile(counting_workflow(2));
+    let digest = aad_runtime::plan_digest(&descriptor);
+    let base = json!({
+        "checkpointVersion": 2,
+        "runtimeVersion": aad_runtime::RUNTIME_VERSION,
+        "planDigest": digest,
+        "phase": "between_top_level_steps",
+        "deadline": aad_runtime::durable::now_seconds() + 60.0,
+        "nextTopLevelIndex": 1,
+        "executedSteps": 1,
+        "unknownEffect": false,
+        "variables": {"count": 1},
+        "steps": {},
+        "returned": null,
+    });
+
+    for (label, field, replacement) in [
+        ("missing-executed-steps", "executedSteps", None),
+        ("invalid-executed-steps", "executedSteps", Some(json!("1"))),
+        ("missing-returned", "returned", None),
+    ] {
+        let temp = TempDir::new(label);
+        let mut checkpoint = base.clone();
+        let object = checkpoint.as_object_mut().unwrap();
+        if let Some(value) = replacement {
+            object.insert(field.into(), value);
+        } else {
+            object.remove(field);
+        }
+        seed_running_checkpoint(&temp.open(), &descriptor, &checkpoint);
+
+        let error = DurableExecutor::new(temp.open())
+            .resume(
+                &descriptor,
+                "run-1",
+                DurableOptions::default().with_owner_id("recovery"),
+            )
+            .expect_err("an incomplete current checkpoint must fail closed");
+        assert_eq!(error.code, "DURABLE.CHECKPOINT_INVALID", "{label}");
+    }
 }
 
 #[test]
