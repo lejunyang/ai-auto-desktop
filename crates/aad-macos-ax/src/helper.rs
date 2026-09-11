@@ -48,18 +48,27 @@ impl SwiftHelperBackend {
         let bundle = helper_bundle(&helper)?;
         validate_bundle(&bundle)?;
         verify_signature(&bundle)?;
-        let mut child = Command::new(&helper)
+        let mut command = Command::new(&helper);
+        command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .map_err(|error| {
-                driver_error(
-                    "DRIVER.UNAVAILABLE",
-                    "signed macOS AX helper could not be started",
-                )
-                .with_detail("cause", json!(error.to_string()))
-            })?;
+            .stderr(Stdio::inherit());
+        use std::os::unix::process::CommandExt;
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = command.spawn().map_err(|error| {
+            driver_error(
+                "DRIVER.UNAVAILABLE",
+                "signed macOS AX helper could not be started",
+            )
+            .with_detail("cause", json!(error.to_string()))
+        })?;
         let stdin = child.stdin.take().expect("helper stdin is piped");
         let stdout = child.stdout.take().expect("helper stdout is piped");
         let backend = Self {
@@ -315,6 +324,17 @@ impl SwiftHelperBackend {
             ));
         }
         Ok(result)
+    }
+}
+
+impl Drop for SwiftHelperBackend {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.state.lock() {
+            if let Some(state) = state.as_mut() {
+                terminate_state(state, false);
+            }
+            *state = None;
+        }
     }
 }
 
@@ -576,13 +596,21 @@ fn read_line(state: &mut HelperState, deadline: Instant) -> Result<Vec<u8>, Auto
 }
 
 fn terminate_state(state: &mut HelperState, force: bool) {
-    if force {
-        let _ = state.child.kill();
-    } else {
-        unsafe {
-            libc::kill(state.child.id() as i32, libc::SIGTERM);
-        }
+    let signal = if force { libc::SIGKILL } else { libc::SIGTERM };
+    unsafe {
+        libc::kill(-(state.child.id() as i32), signal);
     }
+    let grace = Instant::now() + Duration::from_millis(200);
+    while Instant::now() < grace {
+        if state.child.try_wait().ok().flatten().is_some() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    unsafe {
+        libc::kill(-(state.child.id() as i32), libc::SIGKILL);
+    }
+    let _ = state.child.kill();
     let _ = state.child.wait();
 }
 fn channel_error(
@@ -716,5 +744,126 @@ fn verify_signature(bundle: &Path) -> Result<(), AutomationError> {
             "DRIVER.UNAVAILABLE",
             "macOS AX helper signature verification failed",
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    struct Fixture {
+        root: PathBuf,
+        executable: PathBuf,
+    }
+
+    impl Fixture {
+        fn new(body: &str) -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "aad-macos-helper-test-{}",
+                uuid::Uuid::new_v4().simple()
+            ));
+            let executable = root
+                .join(HELPER_BUNDLE_NAME)
+                .join("Contents/MacOS")
+                .join(HELPER_EXECUTABLE_NAME);
+            std::fs::create_dir_all(executable.parent().unwrap()).unwrap();
+            std::fs::write(&executable, body).unwrap();
+            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+            Self { root, executable }
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn backend(fixture: &Fixture) -> SwiftHelperBackend {
+        let mut child = Command::new("sh")
+            .arg(&fixture.executable)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdin = child.stdin.take().unwrap();
+        let stdout = child.stdout.take().unwrap();
+        SwiftHelperBackend {
+            state: Mutex::new(Some(HelperState {
+                child,
+                stdin,
+                stdout,
+                buffer: Vec::new(),
+                request_number: 0,
+            })),
+            helper_source: "fixture".into(),
+        }
+    }
+
+    #[test]
+    fn protocol_round_trips_results_and_progress() {
+        let script = r#"#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+  printf '{"id":"%s","progress":{"phase":"keyboard_dispatch","keyboard_dispatch_started":true,"focus_changed":true}}\n' "$id"
+  printf '{"id":"%s","result":{"native_operation":"CGEventKeyboardSetUnicodeString","submitted":true,"keyboard_dispatch_started":true,"focus_changed":true,"phase":"submitted"}}\n' "$id"
+done
+"#;
+        let fixture = Fixture::new(script);
+        let backend = backend(&fixture);
+        let result = backend
+            .rpc(
+                "type_text",
+                json!({"native_token": "n", "text": "hi"}),
+                Instant::now() + Duration::from_secs(2),
+                true,
+            )
+            .unwrap();
+        assert_eq!(result["submitted"], true);
+    }
+
+    #[test]
+    fn helper_errors_keep_pre_dispatch_effect() {
+        let script = r#"#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+  printf '{"id":"%s","error":{"code":"DRIVER.PROTECTED_ELEMENT","message":"blocked","retryable":false,"data":{"keyboard_dispatch_started":false,"focus_changed":false}}}\n' "$id"
+done
+"#;
+        let fixture = Fixture::new(script);
+        let backend = backend(&fixture);
+        let error = backend
+            .rpc(
+                "type_text",
+                json!({}),
+                Instant::now() + Duration::from_secs(2),
+                true,
+            )
+            .unwrap_err();
+        assert_eq!(error.code, "DRIVER.PROTECTED_ELEMENT");
+        assert_eq!(error.effect, "not_applied");
+    }
+
+    #[test]
+    fn native_dispatch_progress_turns_channel_loss_into_unknown_effect() {
+        let script = r#"#!/bin/sh
+IFS= read -r line
+id=$(printf '%s' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+printf '{"id":"%s","progress":{"phase":"pointer_dispatch","pointer_dispatch_started":true}}\n' "$id"
+exit 1
+"#;
+        let fixture = Fixture::new(script);
+        let backend = backend(&fixture);
+        let error = backend
+            .rpc(
+                "pointer_click",
+                json!({}),
+                Instant::now() + Duration::from_secs(2),
+                true,
+            )
+            .unwrap_err();
+        assert_eq!(error.code, "DRIVER.UNAVAILABLE");
+        assert_eq!(error.effect, "unknown");
     }
 }

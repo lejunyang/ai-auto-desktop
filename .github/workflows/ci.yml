@@ -43,6 +43,9 @@ jobs:
       - name: Check Rust macOS AX adapter against the native SDK
         if: runner.os == 'macOS'
         run: cargo check --locked -p aad-macos-ax --all-targets
+      - name: Smoke Rust adapter against the signed macOS AX helper
+        if: runner.os == 'macOS'
+        run: cargo run --locked -q -p aad-macos-ax --example list_apps
       - name: Build macOS AX fixture test kit
         if: runner.os == 'macOS'
         run: tests/macos/build.sh
