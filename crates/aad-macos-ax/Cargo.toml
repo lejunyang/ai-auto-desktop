@@ -1,0 +1,20 @@
+[package]
+name = "aad-macos-ax"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Native Rust adapter for the macOS Accessibility provider"
+
+[dependencies]
+aad-core = { workspace = true }
+aad-plugin = { workspace = true }
+aad-runtime = { workspace = true }
+libc = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+uuid = { workspace = true }
+
+[lints]
+workspace = true

@@ -24,6 +24,7 @@ Rust 是本项目的主实现，对外提供 **CLI + GUI** 两种形态，CLI �
 | Run-scoped 制品 | `crates/aad-runtime/src/artifacts.rs` | Rust 内置 provider 共享闭合 `ArtifactRef` 和有界不可变 bytes；不暴露 Host 路径，见 §2.5 |
 | Tesseract OCR | `crates/aad-ocr` | Rust 内置 `vision.ocr` provider；路径输入和 Host-managed ArtifactRef 均已端到端验证 |
 | Linux AT-SPI driver | `crates/aad-atspi` | Rust/zbus 直连 accessibility bus；语义读写、XTest 输入与 X11 target capture 已在私有 Xvfb/AT-SPI 会话验证 |
+| macOS AX adapter | `crates/aad-macos-ax` | Rust adapter 负责协议、契约、快照/locator/stale 规则；代码签名 Swift helper 保留为 AX/TCC 原生边界 |
 | Windows UIA driver | `crates/aad-uia` | 发现、描述、locator 合成、控制、staleness 校验 |
 | 能力探测 | `crates/aad-probe` | 只读 |
 | MCP server | `crates/aad-mcp` | 14 个工具，见 §2.6 |
@@ -258,11 +259,11 @@ socketpair 与 Windows 受保护 named pipe 尚未接入 Rust 进程插件宿主
 
 ### 2.7 其他平台 driver
 
-**核实方式**：Windows 使用 `crates/aad-uia`，Linux 使用 `crates/aad-atspi`；`plugins/` 下仍保留
-macOS AX Python adapter，以及 Linux/OCR 的旧 Python 文件作为迁移期间差分参考。Rust CLI 已自动
-注册 OCR 和 Linux AT-SPI，不再通过 Python worker 获得这两组生产能力。
+**核实方式**：Windows 使用 `crates/aad-uia`，Linux 使用 `crates/aad-atspi`，macOS 的 protocol/
+state adapter 使用 `crates/aad-macos-ax`，后者直接管理代码签名 Swift helper。`plugins/` 下的旧
+Python provider 只在最终差分验收前保留为参考，不再是 Rust CLI 的生产入口。
 
-macOS AX 尚未移植。规范要求三端分别实现和发布，不按 OS 猜能力。
+三端 provider 已有 Rust 实现；尚需完成 macOS CI 构建/fixture 验证后才能删除旧 Python 参考实现。
 
 Rust OCR 的 `recognize@1` / `recognize_artifact@1` 保持原 action contract：Tesseract TSV
 解析、字符加权 confidence、literal match 与 Unicode character span、region 坐标回映、图片
@@ -273,6 +274,11 @@ Rust Linux AT-SPI 保持原 13 个 action contract：`inspect_session`、`list_a
 `type_text`、`toggle`、`expand`、`collapse`。驱动核心会在写操作前重抓快照，并同时比较 D-Bus
 对象身份与语义指纹；截断、歧义、失配和 protected 内容均失败关闭。AT-SPI 调用已改为 pure-Rust
 `zbus`；既有 X11 C++ helper 继续只承担 XTest 和安全截图这两项底层原生操作，不再经过 Python。
+
+Rust macOS adapter 保持原 8 个 action contract：`list_apps`、`snapshot`、`find`、`focus`、
+`invoke`、`pointer_click`、`set_value`、`type_text`。Swift helper 的 bundle/signature 校验、协议 v2
+握手、进度帧与 unknown-effect 边界由 Rust 管理；原生 AX/CGEvent 调用仍留在代码签名 `.app` 中，
+从而保持稳定 TCC 身份，仓库无需为该能力保留 Python。
 
 ### 2.8 GUI 编辑能力
 

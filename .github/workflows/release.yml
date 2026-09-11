@@ -150,6 +150,10 @@ jobs:
           plugins/linux_atspi/build_x11_xtest_helper.sh
           plugins/linux_atspi/build_x11_capture_helper.sh
 
+      - name: Build macOS AX helper
+        if: runner.os == 'macOS'
+        run: plugins/macos_ax/build.sh
+
       # Packaged as an archive rather than a bare binary so the executable bit
       # survives the download on Unix, and named with the target so four
       # uploads cannot collide on one release.
@@ -169,6 +173,9 @@ jobs:
             if [ '${{ runner.os }}' = 'Linux' ]; then
               cp plugins/linux_atspi/.build/x11_xtest_helper "dist/$staging/aad-linux-xtest-helper"
               cp plugins/linux_atspi/.build/x11_capture_helper "dist/$staging/aad-linux-capture-helper"
+            fi
+            if [ '${{ runner.os }}' = 'macOS' ]; then
+              cp -R plugins/macos_ax/.build/MacOSAXHelper.app "dist/$staging/"
             fi
           fi
           cp README.md "dist/$staging/"
@@ -306,8 +313,9 @@ jobs:
           body: |
             Released from ${{ github.sha }}.
 
-            **crates.io** — `aad-core`, `aad-plugin`, `aad-runtime`, `aad-probe`,
-            `aad-uia`, `aad-mcp`, `aad-cli` at `${{ needs.gate.outputs.version }}`.
+            **crates.io** — `aad-core`, `aad-plugin`, `aad-runtime`, `aad-ocr`,
+            `aad-atspi`, `aad-macos-ax`, `aad-probe`, `aad-uia`, `aad-mcp`,
+            `aad-cli` at `${{ needs.gate.outputs.version }}`.
 
             **CLI** — `aad` for Linux (x86_64), Windows (x86_64) and macOS
             (aarch64, x86_64). Unpack the archive for your platform.

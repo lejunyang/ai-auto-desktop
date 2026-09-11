@@ -1558,6 +1558,12 @@ fn run_workflow(args: &RunArgs) -> (Value, u8) {
             providers.insert(std::sync::Arc::new(provider));
         }
     }
+    #[cfg(target_os = "macos")]
+    if !providers.names().contains(&aad_macos_ax::PROVIDER_NAME) {
+        if let Ok(provider) = aad_macos_ax::native_provider() {
+            providers.insert(std::sync::Arc::new(provider));
+        }
+    }
     // The desktop driver is always offered; a workflow that never uses it pays
     // nothing, and one that does should not need extra configuration.
     if let Ok(driver) = aad_uia::native_driver() {
@@ -1727,6 +1733,12 @@ fn durable_options(
     #[cfg(target_os = "linux")]
     if !providers.names().contains(&aad_atspi::PROVIDER_NAME) {
         if let Ok(provider) = aad_atspi::native_provider() {
+            providers.insert(std::sync::Arc::new(provider));
+        }
+    }
+    #[cfg(target_os = "macos")]
+    if !providers.names().contains(&aad_macos_ax::PROVIDER_NAME) {
+        if let Ok(provider) = aad_macos_ax::native_provider() {
             providers.insert(std::sync::Arc::new(provider));
         }
     }

@@ -40,6 +40,9 @@ jobs:
       - name: Build production macOS AX helper
         if: runner.os == 'macOS'
         run: plugins/macos_ax/build.sh
+      - name: Check Rust macOS AX adapter against the native SDK
+        if: runner.os == 'macOS'
+        run: cargo check --locked -p aad-macos-ax --all-targets
       - name: Build macOS AX fixture test kit
         if: runner.os == 'macOS'
         run: tests/macos/build.sh

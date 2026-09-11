@@ -23,6 +23,7 @@ version = "0.0.1"
 dependencies = [
  "aad-atspi",
  "aad-core",
+ "aad-macos-ax",
  "aad-mcp",
  "aad-ocr",
  "aad-plugin",
@@ -59,6 +60,19 @@ dependencies = [
  "serde_json",
  "tauri",
  "tauri-build",
+]
+
+[[package]]
+name = "aad-macos-ax"
+version = "0.0.1"
+dependencies = [
+ "aad-core",
+ "aad-plugin",
+ "aad-runtime",
+ "libc",
+ "serde_json",
+ "sha2",
+ "uuid",
 ]
 
 [[package]]
