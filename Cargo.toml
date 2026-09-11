@@ -5,6 +5,7 @@ members = [
     "crates/aad-plugin",
     "crates/aad-runtime",
     "crates/aad-ocr",
+    "crates/aad-atspi",
     "crates/aad-probe",
     "crates/aad-uia",
     "crates/aad-mcp",
@@ -27,6 +28,7 @@ aad-core = { path = "crates/aad-core", version = "0.0.1" }
 aad-plugin = { path = "crates/aad-plugin", version = "0.0.1" }
 aad-runtime = { path = "crates/aad-runtime", version = "0.0.1" }
 aad-ocr = { path = "crates/aad-ocr", version = "0.0.1" }
+aad-atspi = { path = "crates/aad-atspi", version = "0.0.1" }
 aad-probe = { path = "crates/aad-probe", version = "0.0.1" }
 aad-uia = { path = "crates/aad-uia", version = "0.0.1" }
 aad-mcp = { path = "crates/aad-mcp", version = "0.0.1" }
@@ -43,6 +45,8 @@ csv = "1.3.1"
 shlex = "1"
 jsonschema = { version = "0.18", default-features = false }
 image = { version = "0.24.9", default-features = false, features = ["png", "jpeg", "gif", "tiff", "bmp", "webp", "pnm"] }
+atspi = { version = "=0.27.0", default-features = false, features = ["proxies"] }
+zbus = { version = "=5.12.0", default-features = true }
 thiserror = "1"
 # Bundled so the durable journal does not depend on a system SQLite whose
 # version, WAL support or compile options we cannot verify on a user's machine.

@@ -1552,6 +1552,12 @@ fn run_workflow(args: &RunArgs) -> (Value, u8) {
             return (automation_failure(&error), EXIT_USAGE);
         }
     }
+    #[cfg(target_os = "linux")]
+    if !providers.names().contains(&aad_atspi::PROVIDER_NAME) {
+        if let Ok(provider) = aad_atspi::native_provider() {
+            providers.insert(std::sync::Arc::new(provider));
+        }
+    }
     // The desktop driver is always offered; a workflow that never uses it pays
     // nothing, and one that does should not need extra configuration.
     if let Ok(driver) = aad_uia::native_driver() {
@@ -1718,6 +1724,12 @@ fn durable_options(
         aad_ocr::register(&mut providers)
             .map_err(|error| (automation_failure(&error), EXIT_USAGE))?;
     }
+    #[cfg(target_os = "linux")]
+    if !providers.names().contains(&aad_atspi::PROVIDER_NAME) {
+        if let Ok(provider) = aad_atspi::native_provider() {
+            providers.insert(std::sync::Arc::new(provider));
+        }
+    }
     if let Ok(driver) = aad_uia::native_driver() {
         providers.insert(std::sync::Arc::new(driver));
     }
@@ -1794,14 +1806,6 @@ fn split_plugin_command(command: &str) -> Option<Vec<String>> {
     #[cfg(windows)]
     let command = command.as_str();
     shlex::split(command)
-}
-
-#[cfg(all(test, target_os = "linux"))]
-fn workspace_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .canonicalize()
-        .unwrap_or_else(|_| PathBuf::from("."))
 }
 
 /// The exit code for a durable attempt.
@@ -3197,7 +3201,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn the_cli_runs_a_durable_read_only_process_plugin() {
+    fn the_cli_runs_the_native_linux_atspi_provider_durably() {
         let temp = TempDir::new("readonly-plugin");
         let path = temp.path.join("readonly.yaml");
         std::fs::write(
@@ -3221,11 +3225,6 @@ mod tests {
             ),
         )
         .unwrap();
-        let plugin = workspace_root()
-            .join("plugins/linux_atspi/run.sh")
-            .display()
-            .to_string();
-
         let (payload, code) = dispatch(&Command::Start(StartArgs {
             file: path,
             store: temp.store(),
@@ -3234,7 +3233,7 @@ mod tests {
             owner_id: Some("test-runner".into()),
             lease_ttl: None,
             execution: DurableExecutionArgs {
-                plugins: vec![format!("desktop.linux_atspi={plugin}")],
+                plugins: Vec::new(),
                 permissions: vec!["desktop.observe".into()],
                 durable_actions: DurableActions::ReadOnly,
             },

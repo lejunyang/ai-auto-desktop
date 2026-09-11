@@ -140,6 +140,16 @@ jobs:
       - name: Build the aad binary
         run: cargo build --release --locked -p aad-cli --target ${{ matrix.target }}
 
+      - name: Install Linux helper build dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends g++ pkg-config libx11-dev libxtst-dev
+
+      - name: Build Linux native input and capture helpers
+        if: runner.os == 'Linux'
+        run: |
+          plugins/linux_atspi/build_x11_xtest_helper.sh
+          plugins/linux_atspi/build_x11_capture_helper.sh
+
       # Packaged as an archive rather than a bare binary so the executable bit
       # survives the download on Unix, and named with the target so four
       # uploads cannot collide on one release.
@@ -156,6 +166,10 @@ jobs:
             cp "target/$target/release/aad.exe" "dist/$staging/"
           else
             cp "target/$target/release/aad" "dist/$staging/"
+            if [ '${{ runner.os }}' = 'Linux' ]; then
+              cp plugins/linux_atspi/.build/x11_xtest_helper "dist/$staging/aad-linux-xtest-helper"
+              cp plugins/linux_atspi/.build/x11_capture_helper "dist/$staging/aad-linux-capture-helper"
+            fi
           fi
           cp README.md "dist/$staging/"
           cd dist

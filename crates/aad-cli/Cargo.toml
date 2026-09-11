@@ -15,6 +15,7 @@ path = "src/main.rs"
 aad-core = { workspace = true }
 aad-mcp = { workspace = true }
 aad-ocr = { workspace = true }
+aad-atspi = { workspace = true }
 aad-plugin = { workspace = true }
 aad-probe = { workspace = true }
 aad-runtime = { workspace = true }

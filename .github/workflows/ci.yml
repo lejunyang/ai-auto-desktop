@@ -150,6 +150,14 @@ jobs:
         with:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
+      - name: Install Linux native driver test dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends xvfb xauth dbus-x11 at-spi2-core python3-gi gir1.2-gtk-3.0 g++ pkg-config libx11-dev libxtst-dev
+      - name: Build Linux native input and capture helpers
+        if: runner.os == 'Linux'
+        run: |
+          plugins/linux_atspi/build_x11_xtest_helper.sh
+          plugins/linux_atspi/build_x11_capture_helper.sh
 
       - name: Check formatting
         run: cargo fmt --all --check
@@ -195,3 +203,7 @@ jobs:
 
       - name: Smoke capability probe through the Rust CLI
         run: cargo run --locked -p aad-cli -- probe
+
+      - name: Run Rust Linux AT-SPI fixture
+        if: runner.os == 'Linux'
+        run: tests/linux/run-rust-atspi-fixture.sh
