@@ -14,6 +14,7 @@
 use crate::journal::{now_rfc3339, EventSink, Journal, RunResult, RunStatus};
 use crate::provider::ProviderRegistry;
 use crate::template;
+use crate::ArtifactStore;
 use aad_core::model::{CompiledStep, ErrorHandler, HandlerMode, StepType};
 use aad_core::{parse_duration, AutomationError, WorkflowDescriptor};
 use serde_json::{json, Map, Value};
@@ -55,6 +56,8 @@ pub struct RunOptions {
     pub allow_scripts: bool,
     /// Host permissions explicitly granted for this invocation.
     pub granted_permissions: std::collections::BTreeSet<String>,
+    /// Immutable, run-scoped bytes shared by trusted in-process providers.
+    pub artifacts: Option<Arc<ArtifactStore>>,
 }
 
 impl Default for RunOptions {
@@ -69,6 +72,7 @@ impl Default for RunOptions {
             base_directory: std::env::current_dir().unwrap_or_else(|_| ".".into()),
             allow_scripts: false,
             granted_permissions: std::collections::BTreeSet::new(),
+            artifacts: None,
         }
     }
 }
@@ -111,12 +115,18 @@ impl RunOptions {
         self.granted_permissions = permissions.into_iter().map(Into::into).collect();
         self
     }
+
+    pub fn with_artifacts(mut self, artifacts: Arc<ArtifactStore>) -> Self {
+        self.artifacts = Some(artifacts);
+        self
+    }
 }
 
 /// The mutable state of one run.
 struct Run<'a> {
     descriptor: &'a WorkflowDescriptor,
     providers: ProviderRegistry,
+    artifacts: Option<Arc<ArtifactStore>>,
     journal: Journal,
     inputs: Map<String, Value>,
     variables: Map<String, Value>,
@@ -487,7 +497,19 @@ only if you trust this descriptor."
             json!({"id": step.id, "uses": uses, "attempt": attempt}),
         );
         let started = Instant::now();
-        let result = provider.invoke(&uses, args, Some(timeout));
+        let result = if contract.has_artifacts() {
+            let artifacts = self.artifacts.as_deref().ok_or_else(|| {
+                AutomationError::new(
+                    "ARTIFACT.STORE_UNAVAILABLE",
+                    "artifact action requires a run-scoped artifact store",
+                )
+                .with_category("artifact")
+                .with_effect("not_applied")
+            })?;
+            provider.invoke_with_artifacts(&uses, args, Some(timeout), artifacts)
+        } else {
+            provider.invoke(&uses, args, Some(timeout))
+        };
         let elapsed = started.elapsed().as_secs_f64();
 
         match result {
@@ -1490,6 +1512,7 @@ pub enum Segment {
 #[derive(Clone, Debug)]
 pub struct FinalizationIntent {
     pub outputs: Map<String, Value>,
+    pub return_value: Option<Value>,
     pub error: Option<AutomationError>,
 }
 
@@ -1534,6 +1557,7 @@ impl<'a> Segmented<'a> {
             state: Run {
                 descriptor,
                 providers: options.providers.clone(),
+                artifacts: options.artifacts.clone(),
                 journal: Journal::new(run_id, options.sink.clone()),
                 inputs,
                 variables: prepare_variables(descriptor),
@@ -1793,6 +1817,7 @@ impl<'a> Segmented<'a> {
         }
         FinalizationIntent {
             outputs,
+            return_value: self.returned.clone(),
             error: outcome.err(),
         }
     }
@@ -1841,9 +1866,7 @@ impl<'a> Segmented<'a> {
             Ok(()) => (RunStatus::Succeeded, None),
             Err(error) => {
                 let status = match error.code.as_str() {
-                    "WORKFLOW.TIMEOUT" | "ACTION.TIMEOUT" | "STEP.TIMEOUT" | "SCRIPT.TIMEOUT" => {
-                        RunStatus::TimedOut
-                    }
+                    code if code.ends_with(".TIMEOUT") => RunStatus::TimedOut,
                     "WORKFLOW.CANCELLED" => RunStatus::Cancelled,
                     _ if error.effect == "unknown" || self.state.unknown_effect => {
                         RunStatus::UnknownEffect
@@ -1861,12 +1884,14 @@ impl<'a> Segmented<'a> {
             plan_digest: self.digest.clone(),
             status,
             outputs,
+            return_value: intent.return_value,
             error,
             executed_steps: self.state.executed_steps,
             duration_seconds: self.started.elapsed().as_secs_f64(),
             started_at: self.started_at.clone(),
             finished_at: now_rfc3339(),
             events: self.state.journal.events(),
+            artifacts: self.state.artifacts.clone(),
         }
     }
 
@@ -2047,12 +2072,14 @@ pub fn run(descriptor: &WorkflowDescriptor, options: RunOptions) -> RunResult {
                 plan_digest: digest,
                 status: RunStatus::Failed,
                 outputs: Map::new(),
+                return_value: None,
                 error: Some(error),
                 executed_steps: 0,
                 duration_seconds: started.elapsed().as_secs_f64(),
                 started_at,
                 finished_at: now_rfc3339(),
                 events: journal.events(),
+                artifacts: options.artifacts.clone(),
             };
         }
     };
@@ -2071,12 +2098,14 @@ pub fn run(descriptor: &WorkflowDescriptor, options: RunOptions) -> RunResult {
             plan_digest: digest,
             status: RunStatus::Failed,
             outputs: Map::new(),
+            return_value: None,
             error: Some(error),
             executed_steps: 0,
             duration_seconds: started.elapsed().as_secs_f64(),
             started_at,
             finished_at: now_rfc3339(),
             events: journal.events(),
+            artifacts: options.artifacts.clone(),
         };
     }
 
@@ -2096,10 +2125,16 @@ pub fn run(descriptor: &WorkflowDescriptor, options: RunOptions) -> RunResult {
         base_directory: options.base_directory.clone(),
         allow_scripts: options.allow_scripts,
         granted_permissions: options.granted_permissions.clone(),
+        artifacts: options.artifacts.clone(),
         unknown_effect: false,
     };
 
-    let mut outcome = state.run_steps(&descriptor.steps).map(|_| ());
+    let body = state.run_steps(&descriptor.steps);
+    let mut returned = match &body {
+        Ok(Flow::Return(value)) => Some(value.clone()),
+        _ => None,
+    };
+    let mut outcome = body.map(|_| ());
 
     // A workflow-level handler gets the same chance as a step-level one.
     if let (Err(error), Some(handler)) = (&outcome, &descriptor.on_error) {
@@ -2107,7 +2142,11 @@ pub fn run(descriptor: &WorkflowDescriptor, options: RunOptions) -> RunResult {
             let error = error.clone();
             outcome = state
                 .run_handler(handler.clone(), error, "$workflow")
-                .map(|_| ());
+                .map(|flow| {
+                    if let Flow::Return(value) = flow {
+                        returned = Some(value);
+                    }
+                });
         }
     }
 
@@ -2146,9 +2185,7 @@ pub fn run(descriptor: &WorkflowDescriptor, options: RunOptions) -> RunResult {
         Ok(()) => (RunStatus::Succeeded, None),
         Err(error) => {
             let status = match error.code.as_str() {
-                "WORKFLOW.TIMEOUT" | "ACTION.TIMEOUT" | "STEP.TIMEOUT" | "SCRIPT.TIMEOUT" => {
-                    RunStatus::TimedOut
-                }
+                code if code.ends_with(".TIMEOUT") => RunStatus::TimedOut,
                 "WORKFLOW.CANCELLED" => RunStatus::Cancelled,
                 // An unprovable effect is never reported as a clean failure.
                 _ if error.effect == "unknown" || state.unknown_effect => RunStatus::UnknownEffect,
@@ -2175,11 +2212,13 @@ pub fn run(descriptor: &WorkflowDescriptor, options: RunOptions) -> RunResult {
         plan_digest: digest,
         status,
         outputs,
+        return_value: returned,
         error,
         executed_steps: state.executed_steps,
         duration_seconds: started.elapsed().as_secs_f64(),
         started_at,
         finished_at: now_rfc3339(),
         events: state.journal.events(),
+        artifacts: options.artifacts,
     }
 }

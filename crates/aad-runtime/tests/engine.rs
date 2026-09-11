@@ -624,6 +624,25 @@ fn a_return_step_ends_the_workflow_early() {
 }
 
 #[test]
+fn an_object_return_is_the_run_output() {
+    let workflow = descriptor(json!({
+        "outputs": {"ignored": {"value": false}},
+        "steps": [{"id": "done", "type": "return", "value": {"decision": "respond"}}]
+    }));
+
+    let result = execute(&workflow, registry(vec![]));
+
+    assert_eq!(result.status, RunStatus::Succeeded);
+    assert_eq!(
+        result.outputs,
+        Map::from_iter([("ignored".into(), json!(false))])
+    );
+    assert_eq!(result.return_value, Some(json!({"decision": "respond"})));
+    assert_eq!(result.summary()["output"], json!({"decision": "respond"}));
+    assert_eq!(result.summary()["outputs"], json!({"ignored": false}));
+}
+
+#[test]
 fn a_fail_step_produces_its_declared_error() {
     let workflow = descriptor(json!({
         "steps": [{

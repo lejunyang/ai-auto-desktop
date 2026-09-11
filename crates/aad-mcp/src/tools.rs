@@ -1319,12 +1319,14 @@ mod tests {
             plan_digest: "d".into(),
             status: aad_runtime::RunStatus::Failed,
             outputs: serde_json::Map::new(),
+            return_value: None,
             error: None,
             executed_steps: steps.len() as u64,
             duration_seconds: 0.0,
             started_at: "2026-01-01T00:00:00Z".into(),
             finished_at: "2026-01-01T00:00:00Z".into(),
             events,
+            artifacts: None,
         }
     }
 

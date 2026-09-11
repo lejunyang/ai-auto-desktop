@@ -1542,10 +1542,16 @@ fn run_workflow(args: &RunArgs) -> (Value, u8) {
         );
     }
 
+    let artifacts = std::sync::Arc::new(aad_runtime::ArtifactStore::default());
     let mut providers = match provider_registry(&args.plugins) {
         Ok(providers) => providers,
         Err(error) => return (automation_failure(&error), EXIT_USAGE),
     };
+    if !providers.names().contains(&aad_ocr::PROVIDER_NAME) {
+        if let Err(error) = aad_ocr::register(&mut providers) {
+            return (automation_failure(&error), EXIT_USAGE);
+        }
+    }
     // The desktop driver is always offered; a workflow that never uses it pays
     // nothing, and one that does should not need extra configuration.
     if let Ok(driver) = aad_uia::native_driver() {
@@ -1555,6 +1561,7 @@ fn run_workflow(args: &RunArgs) -> (Value, u8) {
     let mut options = aad_runtime::RunOptions::default()
         .with_providers(providers)
         .with_inputs(inputs)
+        .with_artifacts(artifacts)
         .with_scripts_allowed(args.allow_scripts)
         .with_granted_permissions(args.permissions.clone());
 
@@ -1707,6 +1714,10 @@ fn durable_options(
     }
     let mut providers = provider_registry(&execution.plugins)
         .map_err(|error| (automation_failure(&error), EXIT_USAGE))?;
+    if !providers.names().contains(&aad_ocr::PROVIDER_NAME) {
+        aad_ocr::register(&mut providers)
+            .map_err(|error| (automation_failure(&error), EXIT_USAGE))?;
+    }
     if let Ok(driver) = aad_uia::native_driver() {
         providers.insert(std::sync::Arc::new(driver));
     }

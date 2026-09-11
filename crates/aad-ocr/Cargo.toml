@@ -1,24 +1,22 @@
 [package]
-name = "aad-runtime"
+name = "aad-ocr"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Workflow execution engine for ai-auto-desktop"
+description = "Native Tesseract OCR provider for ai-auto-desktop"
 
 [dependencies]
 aad-core = { workspace = true }
 aad-plugin = { workspace = true }
-serde = { workspace = true }
+aad-runtime = { workspace = true }
+csv = { workspace = true }
+image = { workspace = true }
+libc = { workspace = true }
 serde_json = { workspace = true }
-indexmap = { workspace = true }
 sha2 = { workspace = true }
 uuid = { workspace = true }
-rusqlite = { workspace = true }
-jsonschema = { workspace = true }
-image = { workspace = true }
 
-# Inherit the workspace's deliberate lint allowances (see the root Cargo.toml).
 [lints]
 workspace = true

@@ -1,6 +1,6 @@
 # Rust 移植状态跟踪
 
-> 基线日期 2026-09-11。本文记录 Python v0 已有、但 Rust 尚未实现的能力，用于跟踪重构进度。
+> 基线日期 2026-09-12。本文记录 Python v0 已有、但 Rust 尚未实现的能力，用于跟踪重构进度。
 >
 > 本文只记录**经代码核实**的状态，不记录推测。每一条"未移植"都在写入前用检索或运行验证过；
 > 核实方式写在条目里，便于后续复核。核实结论会随代码变化过期，改动相关模块时应重新核对。
@@ -21,7 +21,8 @@ Rust 是本项目的主实现，对外提供 **CLI + GUI** 两种形态，CLI �
 | 内存 journal | `crates/aad-runtime/src/journal.rs` | 见 §2.1：**不持久化** |
 | 脚本沙箱 | `crates/aad-runtime/src/script.rs` | 已接入引擎；Windows 缺网络/文件系统隔离，如实上报 `degraded` |
 | NDJSON 插件宿主 | `crates/aad-plugin` | stdio 控制面、manifest 校验、Job Object 限额 |
-| AADF 制品线格式 | `crates/aad-plugin/src/artifact.rs` | 帧编解码完整，**但未接入宿主主流程**，见 §2.5 |
+| Run-scoped 制品 | `crates/aad-runtime/src/artifacts.rs` | Rust 内置 provider 共享闭合 `ArtifactRef` 和有界不可变 bytes；不暴露 Host 路径，见 §2.5 |
+| Tesseract OCR | `crates/aad-ocr` | Rust 内置 `vision.ocr` provider；路径输入和 Host-managed ArtifactRef 均已端到端验证 |
 | Windows UIA driver | `crates/aad-uia` | 发现、描述、locator 合成、控制、staleness 校验 |
 | 能力探测 | `crates/aad-probe` | 只读 |
 | MCP server | `crates/aad-mcp` | 14 个工具，见 §2.6 |
@@ -182,14 +183,20 @@ Python 另有 `edit`（属 §2.4 的浏览器编辑器，已由 GUI 取代，不
 COM 套间，现有 driver 在 MTA，故须假定回调在任意 RPC 线程并发到达；已知盲区
 （点击不可聚焦元素、纯 hover）必须显式提示，不得静默丢弃或退化为坐标点击。
 
-### 2.5 制品侧信道接入
+### 2.5 制品边界（内置 provider 已完成）
 
 **Python**：`artifact_ipc.py`(40KB)、`_win_named_pipe.py`(19KB)
 **核实方式**：检索 `ArtifactReceiver|Receiver::`，仅命中 `artifact.rs` 自身测试与一处 re-export。
 
-`artifact.rs` 的帧编解码有 24 个测试且全部通过，但通道建立未移植：POSIX 的 socketpair、
-Windows 的受保护 ACL + 单实例 + 双向 PID 校验 named pipe，以及环境变量
-`AAD_ARTIFACT_CHANNEL_FD` / `AAD_ARTIFACT_PIPE_NAME` / `AAD_ARTIFACT_HOST_PID`。
+Rust 内置 provider 已使用 `ArtifactStore` 接入宿主主流程：一个普通 run 共享同一不可变、
+有配额和 TTL 的内存 scope，公开值只携带闭合 `ArtifactRef`；跨 scope、摘要/媒体类型篡改、
+多帧图片、解码失败、尺寸/像素/总量超限均 fail closed。`RunResult` 在结果生命周期内保留 scope，
+因此调用方可显式解析返回的 ArtifactRef，而 provider 之间无需临时路径或第二语言 side channel。
+durable 执行仍拒绝 artifact contract，因为 v1 尚未定义重启后加密持久化与 taint 策略。
+
+`aad-plugin/src/artifact.rs` 的 AADF 帧编解码仍保留给将来的第三方进程 provider；POSIX
+socketpair 与 Windows 受保护 named pipe 尚未接入 Rust 进程插件宿主。这不再阻塞 OCR 或后续
+内置平台 provider，但若以后允许第三方进程生产/消费 ArtifactRef，仍须实现该通道。
 
 ### 2.6 MCP 回放工作流（已完成）
 
@@ -250,10 +257,15 @@ Windows 的受保护 ACL + 单实例 + 双向 PID 校验 named pipe，以及环�
 
 ### 2.7 其他平台 driver
 
-**核实方式**：`crates/aad-uia` 只有 Windows 实现；`plugins/` 下有 `macos_ax`、`linux_atspi`
-（含 X11 helper 的 C++ 源码）、`ocr_tesseract`，均为 Python。
+**核实方式**：`crates/aad-uia` 只有 Windows 实现；`plugins/` 下仍有 `macos_ax`、`linux_atspi`
+（含 X11 helper 的 C++ 源码）Python provider。OCR 已迁移到 Rust，旧 Python 文件仅在剩余
+平台迁移期间保留作差分参考，不再是 CLI 运行依赖。
 
-macOS AX、Linux AT-SPI、OCR 插件都未移植。规范要求三端分别实现和发布，不按 OS 猜能力。
+macOS AX、Linux AT-SPI 尚未移植。规范要求三端分别实现和发布，不按 OS 猜能力。
+
+Rust OCR 的 `recognize@1` / `recognize_artifact@1` 保持原 action contract：Tesseract TSV
+解析、字符加权 confidence、literal match 与 Unicode character span、region 坐标回映、图片
+和输出上限、进程树 timeout/overflow 回收均有 Rust 测试；真实 Tesseract 和 CLI workflow 已 smoke。
 
 ### 2.8 GUI 编辑能力
 

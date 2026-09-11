@@ -156,15 +156,38 @@ pub struct RunResult {
     pub plan_digest: String,
     pub status: RunStatus,
     pub outputs: Map<String, Value>,
+    /// Value supplied by an explicit `return` step, if one ended the workflow.
+    pub return_value: Option<Value>,
     pub error: Option<aad_core::AutomationError>,
     pub executed_steps: u64,
     pub duration_seconds: f64,
     pub started_at: String,
     pub finished_at: String,
     pub events: Vec<RunEvent>,
+    /// Keeps run-scoped artifact capabilities alive for the result consumer.
+    pub artifacts: Option<Arc<crate::artifacts::ArtifactStore>>,
 }
 
 impl RunResult {
+    /// Resolve an ArtifactRef returned by this run without exposing a host path.
+    pub fn resolve_artifact(
+        &self,
+        reference: &Value,
+    ) -> Result<Vec<u8>, aad_core::AutomationError> {
+        self.artifacts
+            .as_ref()
+            .ok_or_else(|| {
+                aad_core::AutomationError::new(
+                    "ARTIFACT.SCOPE_MISMATCH",
+                    "this run has no live artifact execution scope",
+                )
+                .with_category("artifact")
+                .with_phase("artifact")
+                .with_effect("not_applied")
+            })?
+            .resolve(reference)
+    }
+
     /// The `Run` document, matching the runtime schema.
     pub fn to_json(&self) -> Value {
         json!({
@@ -175,7 +198,7 @@ impl RunResult {
             "status": self.status.as_str(),
             "desiredState": "run",
             "inputs": {},
-            "output": Value::Object(self.outputs.clone()),
+            "output": self.return_value.clone().unwrap_or_else(|| Value::Object(self.outputs.clone())),
             "error": self
                 .error
                 .as_ref()
@@ -195,6 +218,7 @@ impl RunResult {
             "plan_digest": self.plan_digest,
             "status": self.status.as_str(),
             "outputs": Value::Object(self.outputs.clone()),
+            "output": self.return_value.clone().unwrap_or_else(|| Value::Object(self.outputs.clone())),
             "error": self
                 .error
                 .as_ref()

@@ -1447,6 +1447,48 @@ fn a_finalization_intent_resumes_cleanup_exactly_once() {
 }
 
 #[test]
+fn an_explicit_return_survives_finalization_recovery() {
+    let temp = TempDir::new("finalization-return");
+    let descriptor = cleanup_workflow();
+    let digest = aad_runtime::plan_digest(&descriptor);
+    seed_running_checkpoint(
+        &temp.open(),
+        &descriptor,
+        &json!({
+            "checkpointVersion": 2,
+            "runtimeVersion": aad_runtime::RUNTIME_VERSION,
+            "planDigest": digest,
+            "phase": "finalizing",
+            "deadline": aad_runtime::durable::now_seconds() + 60.0,
+            "nextTopLevelIndex": 1,
+            "executedSteps": 1,
+            "unknownEffect": false,
+            "variables": {"count": 1},
+            "steps": {},
+            "returned": {"decision": "respond"},
+            "finalization": {
+                "version": 2,
+                "stage": "intent",
+                "outputSet": true,
+                "output": {"decision": "respond"},
+                "returned": true,
+                "error": null,
+            },
+        }),
+    );
+
+    let outcome = DurableExecutor::new(temp.open())
+        .resume(
+            &descriptor,
+            "run-1",
+            DurableOptions::default().with_owner_id("recovery"),
+        )
+        .expect("return value survives recovery and cleanup");
+    assert_eq!(outcome.run.status, RunStatus::Succeeded);
+    assert_eq!(outcome.run.output, Some(json!({"decision": "respond"})));
+}
+
+#[test]
 fn a_finalization_started_checkpoint_never_replays_cleanup() {
     let temp = TempDir::new("finalization-started");
     let descriptor = cleanup_workflow();

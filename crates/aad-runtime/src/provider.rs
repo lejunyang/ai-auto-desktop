@@ -25,6 +25,16 @@ pub trait Provider: Send + Sync {
         timeout: Option<Duration>,
     ) -> Result<Value, AutomationError>;
 
+    fn invoke_with_artifacts(
+        &self,
+        action: &str,
+        args: Value,
+        timeout: Option<Duration>,
+        _artifacts: &crate::artifacts::ArtifactStore,
+    ) -> Result<Value, AutomationError> {
+        self.invoke(action, args, timeout)
+    }
+
     /// Release any resources; called once when the run finishes.
     fn close(&self) {}
 }

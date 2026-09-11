@@ -1832,7 +1832,7 @@ fn encode_finalization_intent(
 ) -> Value {
     let mut checkpoint = encode_checkpoint(digest, Phase::Finalizing, deadline, state);
     checkpoint["finalization"] = json!({
-        "version": 1,
+        "version": 2,
         "stage": match stage {
             FinalizationStage::Intent => "intent",
             FinalizationStage::Started => "started",
@@ -1840,10 +1840,11 @@ fn encode_finalization_intent(
         },
         "outputSet": intent.error.is_none(),
         "output": if intent.error.is_none() {
-            Value::Object(intent.outputs.clone())
+            intent.return_value.clone().unwrap_or_else(|| Value::Object(intent.outputs.clone()))
         } else {
             Value::Null
         },
+        "returned": intent.return_value.is_some(),
         "error": intent
             .error
             .as_ref()
@@ -1880,7 +1881,12 @@ fn finalized_run(result: &crate::journal::RunResult) -> FinalizedRun {
     };
     FinalizedRun {
         status,
-        output: (status == RunStatus::Succeeded).then(|| Value::Object(result.outputs.clone())),
+        output: (status == RunStatus::Succeeded).then(|| {
+            result
+                .return_value
+                .clone()
+                .unwrap_or_else(|| Value::Object(result.outputs.clone()))
+        }),
         error,
         executed_steps: result.executed_steps,
     }
@@ -1916,7 +1922,10 @@ fn finalization_stage(checkpoint: &Value) -> Result<Option<FinalizationStage>, A
             "finalization payload must be an object",
         )
     })?;
-    if finalization.get("version").and_then(Value::as_u64) != Some(1) {
+    if !matches!(
+        finalization.get("version").and_then(Value::as_u64),
+        Some(1 | 2)
+    ) {
         return Err(durable_error(
             "DURABLE.CHECKPOINT_INVALID",
             "finalization payload version is unsupported",
@@ -1942,9 +1951,23 @@ fn decode_finalization_intent(checkpoint: &Value) -> Result<FinalizationIntent, 
             "finalization intent payload is missing",
         )
     })?;
-    let expected: BTreeSet<&str> = ["version", "stage", "outputSet", "output", "error"]
+    let version = finalization.get("version").and_then(Value::as_u64);
+    let expected: BTreeSet<&str> = match version {
+        Some(1) => ["version", "stage", "outputSet", "output", "error"]
+            .into_iter()
+            .collect(),
+        Some(2) => [
+            "version",
+            "stage",
+            "outputSet",
+            "output",
+            "returned",
+            "error",
+        ]
         .into_iter()
-        .collect();
+        .collect(),
+        _ => BTreeSet::new(),
+    };
     if finalization
         .keys()
         .map(String::as_str)
@@ -1974,17 +1997,34 @@ fn decode_finalization_intent(checkpoint: &Value) -> Result<FinalizationIntent, 
             "finalization intent output and error are inconsistent",
         ));
     }
-    let outputs = if output_set {
+    let returned = match version {
+        Some(1) => false,
+        Some(2) => finalization
+            .get("returned")
+            .and_then(Value::as_bool)
+            .ok_or_else(|| {
+                durable_error(
+                    "DURABLE.CHECKPOINT_INVALID",
+                    "finalization returned flag must be a boolean",
+                )
+            })?,
+        _ => unreachable!("version was checked above"),
+    };
+    let outputs = if output_set && !returned {
         output.as_object().cloned().ok_or_else(|| {
             durable_error(
                 "DURABLE.CHECKPOINT_INVALID",
-                "finalization output must be an object",
+                "workflow output must be an object",
             )
         })?
     } else {
         Map::new()
     };
-    Ok(FinalizationIntent { outputs, error })
+    Ok(FinalizationIntent {
+        outputs,
+        return_value: (output_set && returned).then_some(output),
+        error,
+    })
 }
 
 fn decode_finalized_run(
@@ -2021,16 +2061,18 @@ fn decode_finalized_run(
             ));
         }
     };
-    let output = result
-        .get("output")
-        .cloned()
-        .filter(|value| !value.is_null());
+    let output = result.get("output").cloned();
     let error = result
         .get("error")
         .cloned()
         .filter(|value| !value.is_null());
     if status == RunStatus::Succeeded {
-        if error.is_some() || output.as_ref().is_none_or(|value| !value.is_object()) {
+        let legacy_non_object = checkpoint["finalization"]
+            .get("version")
+            .and_then(Value::as_u64)
+            == Some(1)
+            && output.as_ref().is_none_or(|value| !value.is_object());
+        if error.is_some() || output.is_none() || legacy_non_object {
             return Err(durable_error(
                 "DURABLE.CHECKPOINT_INVALID",
                 "successful finalization result is invalid",
