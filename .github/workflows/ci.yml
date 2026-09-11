@@ -40,12 +40,6 @@ jobs:
       - name: Build production macOS AX helper
         if: runner.os == 'macOS'
         run: plugins/macos_ax/build.sh
-      - name: Check Rust macOS AX adapter against the native SDK
-        if: runner.os == 'macOS'
-        run: cargo check --locked -p aad-macos-ax --all-targets
-      - name: Smoke Rust adapter against the signed macOS AX helper
-        if: runner.os == 'macOS'
-        run: cargo run --locked -q -p aad-macos-ax --example list_apps
       - name: Build macOS AX fixture test kit
         if: runner.os == 'macOS'
         run: tests/macos/build.sh
@@ -164,6 +158,12 @@ jobs:
         run: |
           plugins/linux_atspi/build_x11_xtest_helper.sh
           plugins/linux_atspi/build_x11_capture_helper.sh
+      - name: Build production macOS AX helper
+        if: runner.os == 'macOS'
+        run: plugins/macos_ax/build.sh
+      - name: Smoke Rust adapter against the signed macOS AX helper
+        if: runner.os == 'macOS'
+        run: cargo run --locked -q -p aad-macos-ax --example list_apps
 
       - name: Check formatting
         run: cargo fmt --all --check
