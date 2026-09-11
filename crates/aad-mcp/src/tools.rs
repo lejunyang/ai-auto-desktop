@@ -465,6 +465,7 @@ pub fn call_without_driver(name: &str, arguments: &Value) -> Result<Value, Strin
         "probe_environment" => Ok(aad_probe::probe().to_json()),
         "list_workflows" => list_workflows(),
         "describe_workflow" => describe_workflow(arguments),
+        "save_workflow" => save_workflow(arguments),
         other => Err(failure(
             "MCP.DRIVER_REQUIRED",
             &format!("tool {other:?} needs the desktop driver"),
@@ -484,7 +485,7 @@ pub fn call(driver: &Arc<UiaDriver>, name: &str, arguments: &Value) -> Result<Va
     }
 
     if name == "run_workflow" {
-        return run_workflow(driver, arguments);
+        return run_workflow(Some(driver), arguments);
     }
 
     // Saving needs no desktop: the steps describe elements rather than reaching
@@ -1110,7 +1111,10 @@ have been closed, or its title may have changed past the part the workflow match
 }
 
 /// looks like a broken recording rather than a mis-wired caller.
-fn run_workflow(driver: &Arc<UiaDriver>, arguments: &Value) -> Result<Value, String> {
+pub(crate) fn run_workflow(
+    driver: Option<&Arc<UiaDriver>>,
+    arguments: &Value,
+) -> Result<Value, String> {
     let (name, descriptor) = compiled_workflow(arguments)?;
 
     // Refused by name before anything runs. A script step executes arbitrary
@@ -1142,13 +1146,27 @@ by a person: use `aad run <file> --allow-scripts`.",
     // The same registry the CLI builds, so a workflow behaves identically
     // whether a person ran it or an agent did.
     let mut providers = aad_runtime::ProviderRegistry::new();
-    providers.insert(driver.clone());
+    if let Some(driver) = driver {
+        providers.insert(driver.clone());
+    }
+    aad_ocr::register(&mut providers)
+        .map_err(|error| failure(&error.code, &error.message, None))?;
+    #[cfg(target_os = "linux")]
+    if let Ok(provider) = aad_atspi::native_provider() {
+        providers.insert(Arc::new(provider));
+    }
+    #[cfg(target_os = "macos")]
+    if let Ok(provider) = aad_macos_ax::native_provider() {
+        providers.insert(Arc::new(provider));
+    }
+    let artifacts = Arc::new(aad_runtime::ArtifactStore::default());
 
     let result = aad_runtime::run(
         &descriptor,
         aad_runtime::RunOptions::default()
             .with_inputs(inputs)
-            .with_providers(providers),
+            .with_providers(providers)
+            .with_artifacts(artifacts),
     );
 
     let progress = walk_through(&result);
@@ -1185,7 +1203,7 @@ by a person: use `aad run <file> --allow-scripts`.",
                 .then(|| step.get("id").and_then(Value::as_str))
                 .flatten()
         });
-        if let Some(failing) = stumbled {
+        if let (Some(failing), Some(driver)) = (stumbled, driver) {
             if let Some(context) = why_it_failed(driver, &descriptor, failing) {
                 // Deliberately beside the error rather than inside it: this is a
                 // fresh reading taken afterwards, not part of what the engine
@@ -2102,7 +2120,7 @@ hitting truncation without knowing there is another way: {:?}",
         store.save("greeter", pure_workflow());
 
         let result = run_workflow(
-            &stub_driver(),
+            Some(&stub_driver()),
             &json!({"name": "greeter", "inputs": {"who": "agent"}}),
         )
         .expect("run");
@@ -2134,8 +2152,8 @@ hitting truncation without knowing there is another way: {:?}",
         workflow["outputs"] = json!({});
         store.save("recorded", workflow);
 
-        let result =
-            run_workflow(&stub_driver(), &json!({"name": "recorded"})).expect("the run completes");
+        let result = run_workflow(Some(&stub_driver()), &json!({"name": "recorded"}))
+            .expect("the run completes");
 
         assert_eq!(
             result["status"],
@@ -2186,7 +2204,7 @@ hitting truncation without knowing there is another way: {:?}",
 
         let described = describe_workflow(&json!({"name": "greeter"})).expect("describe");
         let ran = run_workflow(
-            &stub_driver(),
+            Some(&stub_driver()),
             &json!({"name": "greeter", "inputs": {"who": "a"}}),
         )
         .expect("run");
@@ -2213,7 +2231,7 @@ hitting truncation without knowing there is another way: {:?}",
         workflow["outputs"] = json!({});
         store.save("dangerous", workflow);
 
-        let error = run_workflow(&stub_driver(), &json!({"name": "dangerous"}))
+        let error = run_workflow(Some(&stub_driver()), &json!({"name": "dangerous"}))
             .expect_err("must be refused");
         let payload: Value = serde_json::from_str(&error).expect("structured error");
 
@@ -2264,7 +2282,7 @@ hitting truncation without knowing there is another way: {:?}",
 
         // Either the compiler refuses it or the run fails; both must name the
         // problem rather than returning a bare failure.
-        match run_workflow(&stub_driver(), &json!({"name": "broken"})) {
+        match run_workflow(Some(&stub_driver()), &json!({"name": "broken"})) {
             Ok(result) => {
                 assert_ne!(result["status"], json!("succeeded"));
                 let error = &result["error"];
@@ -2287,7 +2305,7 @@ hitting truncation without knowing there is another way: {:?}",
         store.save("greeter", pure_workflow());
 
         let error = run_workflow(
-            &stub_driver(),
+            Some(&stub_driver()),
             &json!({"name": "greeter", "inputs": "who=agent"}),
         )
         .expect_err("must be refused");

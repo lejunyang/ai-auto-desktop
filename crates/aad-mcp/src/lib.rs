@@ -86,7 +86,7 @@ impl Server {
 
     fn initialize(&self) -> Value {
         let mut instructions = String::from(
-            "Desktop automation for Windows. Discover applications with list_apps, \
+            "Desktop automation. On Windows, discover applications with list_apps, \
 inspect a window with describe_window, resolve an element with find_element, \
 then act using the target it returns. Targets prove the element was actually \
 observed; if the UI changes, re-observe rather than reusing an old target.\n\n\
@@ -126,13 +126,25 @@ Call probe_environment for details."
         // exists to explain why the desktop is unavailable, and the workflow
         // tools read the saved store, so listing or inspecting a workflow must
         // not depend on the desktop being reachable.
-        const NO_DRIVER_NEEDED: &[&str] =
-            &["probe_environment", "list_workflows", "describe_workflow"];
+        const NO_DRIVER_NEEDED: &[&str] = &[
+            "probe_environment",
+            "list_workflows",
+            "describe_workflow",
+            "save_workflow",
+        ];
         if NO_DRIVER_NEEDED.contains(&name) {
             return Ok(match tools::call_without_driver(name, &arguments) {
                 Ok(result) => content(&result, false),
                 Err(payload) => content(&parse_payload(&payload), true),
             });
+        }
+        if name == "run_workflow" {
+            return Ok(
+                match tools::run_workflow(self.driver.as_ref(), &arguments) {
+                    Ok(result) => content(&result, false),
+                    Err(payload) => content(&parse_payload(&payload), true),
+                },
+            );
         }
 
         let Some(driver) = self.driver.as_ref() else {
