@@ -8,10 +8,9 @@ name: Release
 # Cargo.toml and refuses to run when that version is already published or
 # already tagged, which is the check a tag would otherwise stand in for.
 #
-# Python is deliberately not published. The Rust workspace is the shipped
-# implementation; the Python tree is kept as the behavioural reference for
-# unported semantics and as the import target for the plugins under plugins/.
-# See docs/plan/rust-port-status.md.
+# The Rust workspace is the shipped implementation. Native platform helpers
+# are built and packaged beside the CLI where their OS security model requires
+# a separate executable. See docs/plan/rust-port-status.md.
 on:
   push:
     branches: [main]
@@ -40,8 +39,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          version="$(cargo metadata --no-deps --format-version 1 \
-            | python3 -c 'import json,sys; pkgs=json.load(sys.stdin)["packages"]; print(next(p["version"] for p in pkgs if p["name"]=="aad-core"))')"
+          version="$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = \"\([^\"]*\)\"/\1/p' Cargo.toml)"
+          [ -n "$version" ]
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "releasing v$version"
 
@@ -65,7 +64,7 @@ jobs:
             echo "crates.io returned HTTP $code; refusing to guess" >&2
             exit 1
           fi
-          if python3 -c 'import json,sys; data=json.load(open("/tmp/core.json")); sys.exit(0 if any(v["num"]==sys.argv[1] for v in data.get("versions",[])) else 1)' "$version"
+          if jq -e --arg version "$version" '.versions[]? | select(.num == $version)' /tmp/core.json >/dev/null
           then
             echo "aad-core $version is already published; bump the version first" >&2
             exit 1
@@ -85,7 +84,7 @@ jobs:
 
   # ---------------------------------------------------------------------------
   # Tests. A release must not be the first time the Rust code is compiled and
-  # tested. ci.yml only exercises the Python tree, so the Rust suite runs here.
+  # tested. CI and release both exercise the Rust workspace.
   # ---------------------------------------------------------------------------
   test:
     needs: gate
@@ -98,12 +97,58 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        if: runner.os == 'Windows'
+        id: python
+        with:
+          python-version: "3.11"
+      - name: Pin the optional script interpreter
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          "AAD_SCRIPT_PYTHON=${{ steps.python.outputs.python-path }}" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Enforce the single Rust implementation
+        shell: bash
+        run: |
+          set -euo pipefail
+          test ! -f pyproject.toml
+          if git ls-files '*.py' '*.pyi' | grep -q .; then
+            echo "tracked Python implementation files remain" >&2
+            git ls-files '*.py' '*.pyi' >&2
+            exit 1
+          fi
+
+      - name: Install Linux native driver test dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends xvfb xauth dbus-x11 at-spi2-core g++ pkg-config qtbase5-dev libx11-dev libxtst-dev
+
+      - name: Build Linux native input and capture helpers
+        if: runner.os == 'Linux'
+        run: |
+          plugins/linux_atspi/build_x11_xtest_helper.sh
+          plugins/linux_atspi/build_x11_capture_helper.sh
+
+      - name: Build production macOS AX helper
+        if: runner.os == 'macOS'
+        run: plugins/macos_ax/build.sh
 
       # aad-gui pulls in the Tauri system libraries, which are irrelevant to the
       # crates being published. It is excluded rather than installing GTK/WebKit
       # on every runner just to compile a shell that is never published.
       - name: Build and test the publishable crates
         run: cargo test --workspace --exclude aad-gui --locked
+
+      - name: Test the Rust subprocess plugin fixture
+        run: cargo test --locked -p aad-plugin --features test-fixture --test process_plugin
+
+      - name: Run Rust Linux AT-SPI fixture
+        if: runner.os == 'Linux'
+        run: tests/linux/run-rust-atspi-fixture.sh
+
+      - name: Smoke Rust adapter against the signed macOS AX helper
+        if: runner.os == 'macOS'
+        run: cargo run --locked -q -p aad-macos-ax --example list_apps
 
       - name: Reject a Cargo.lock that the manifests no longer agree with
         run: cargo metadata --locked --format-version 1 > /dev/null

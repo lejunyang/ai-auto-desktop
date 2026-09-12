@@ -5,10 +5,9 @@ metadata:
   version: 0.1.0
   description: >-
     参考录制产物。展示三种步骤类型、locator 消歧策略与脱敏声明。
-    本文件由 ai_auto_desktop.recording.compile_recording() 编译，
-    产物等价于同目录 save-note.compiled.json，并通过
-    workflow.schema.json 与 ai_auto_desktop.compiler.compile_descriptor()。
-    两者的一致性由 tests/test_recording_compiler.py 守护。
+    本文件可由 Rust 录制编译链路转换为 workflow。
+    产物等价于同目录 save-note.compiled.json，并通过 canonical
+    workflow.schema.json 与 aad-core 编译器；一致性由 Rust 回归测试守护。
   annotations:
     ai-auto-desktop.dev/recorded-order: focus_editor,enter_note,note_present,only_if_requested
 

@@ -1,5 +1,8 @@
 2026-08-29，Windows 11 26200 / AMD64 / Python 3.13.13 / 250% 缩放 / medium integrity / Session 1。
 
+> 这是迁移前实验记录。Python/comtypes 与 `.cmd` 内容解释当时的测量环境，不是当前
+> 产品依赖；现行实现和持续回归位于 Rust `aad-uia`。
+
 本文记录录制回放设计（`docs/spec/recording-session-v1alpha1.md`、`docs/architecture/record-replay.md`）所依据的实测数据。设计中每一处「实测」表述都对应本文的一项测量。记录目的是让结论可复核、可在其他环境重测，而不是让读者相信设计文档的断言。
 
 ## 1. locator 唯一性与跨会话稳定性
@@ -270,9 +273,9 @@ fixture 在收到真实指针点击时会更新状态标签，因此「点击是
 | `plugins\windows_uia\run.cmd` | `['pluginswindows_uiarun.cmd']` | 分隔符保留 |
 | 含空格的解释器路径 | 被拆成 3 段 | 保留（带引号） |
 
-另测得 `.cmd` **必须用反斜杠**：`cmd /c plugins/windows_uia/run.cmd` 会把首段当命令名
-（`'plugins' is not recognized`）。两项要求在 POSIX 规则下互斥，故 Windows 下文档写法
-无论怎么拼都不可能成功。
+这一段记录的是已删除的 Python process-plugin launcher 的历史问题；当前 Windows UIA 由
+Rust CLI/MCP 进程内注册，不再经过 `.cmd`。通用 `--plugin NAME=COMMAND` 仍保留给第三方
+扩展，并由 Rust 参数切分测试覆盖。
 
 ### 12.4 空窗口选择器
 

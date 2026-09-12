@@ -2,6 +2,9 @@
 
 状态：Draft，2026-08-29。数据契约见 `docs/spec/recording-session-v1alpha1.md`。本文档说明进程结构、UI 形态、捕获机制与回放判定，并逐条说明**为什么**这样选，以及在本机实测得到的约束。
 
+> 本文前半部分保留迁移前的调研叙事；当前实现是 Rust UIA/runtime 与 Tauri/TypeScript GUI，
+> 不再使用其中提到的 Python/comtypes/browser-server 原型。现行入口见 §14。
+
 ## 1. 设计出发点：三条实测约束
 
 设计不是从「录制器一般怎么做」出发，而是从本项目已有契约的实测事实出发。
@@ -313,7 +316,8 @@ driver 走 NDJSON 请求/响应，一个长跑的捕获会独占主循环。因�
 
 ## 12. 事件流到录制产物（已实现）
 
-`src/ai_auto_desktop/recording.py` 打通了「捕获 → 录制产物 → workflow」。此前 `.recording.yaml` 与 `.compiled.json` 都是手写的，**没有任何代码读取它们**；本节记录实现，以及实现过程中被暴露出来的既有缺陷。
+当前 Rust runtime、UIA capture 与 TypeScript GUI 已打通「捕获 → 录制产物 → workflow」。
+旧 Python 原型曾用于验证这一链路，现已删除；本节保留迁移过程中得到的设计证据。
 
 ### 12.1 一次编辑产生两个事件，必须合并
 
@@ -425,9 +429,9 @@ fixture 有两个同名按钮（`Duplicate action`，automation_id 1004/1005）�
 
 ## 14. 编辑 UI 的落地与设计偏离
 
-§5 是设计，本节记录**实现**。三个新文件：`recording_editor.py`（编辑核心）、
-`editor_server.py`（回环 HTTP 服务）、`editor_page.py`（单页界面）。
-入口为 `ai-auto-desktop edit <recording>`。
+§5 是设计，本节记录**实现**。当前编辑核心位于 `gui/src/recording.ts`，Tauri 命令桥位于
+`gui/src-tauri/src/lib.rs`，Vue 组件负责交互界面；CLI 的 `record` 命令和 MCP 也能组装并保存
+录制。以下 HTTP/Python 文件名是旧原型的历史记录，现已删除。
 
 ### 14.1 saveable ≠ compilable（对 §5 的实质偏离）
 

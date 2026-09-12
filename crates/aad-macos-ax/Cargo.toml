@@ -12,8 +12,11 @@ aad-core = { workspace = true }
 aad-plugin = { workspace = true }
 aad-runtime = { workspace = true }
 libc = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
+crc32fast = { workspace = true }
+flate2 = { workspace = true }
 uuid = { workspace = true }
 
 [lints]

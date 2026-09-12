@@ -310,22 +310,20 @@ crates/
   aad-core      描述文件模型、严格编译器、表达式求值器
   aad-plugin    NDJSON over stdio 插件宿主、AADF 制品侧信道
   aad-runtime   工作流引擎、模板、journal、沙箱脚本
+  aad-ocr       原生 Tesseract OCR 与图片输入校验
+  aad-atspi     Linux AT-SPI / X11 驱动
+  aad-macos-ax  macOS AX 的 Rust adapter 与 Swift helper 协议
   aad-uia       原生 UI Automation：发现、描述、控制
   aad-probe     只读能力探测
   aad-mcp       stdio 上的 MCP server
   aad-cli       aad 可执行文件
 gui/            Tauri + Vue 桌面窗口
-src/            Python 原型（保留备查，不再演进）
+plugins/        Linux C++ 与 macOS Swift 原生 helper 源码
 ```
 
 ## 测试
 
 ```powershell
-cargo test --workspace     # 658 个测试
-cd gui; npm run test       # 65 个测试
+cargo test --workspace --exclude aad-gui
+cd gui; npm run test       # 130 个测试
 ```
-
-## Python 原型
-
-`src/ai_auto_desktop/` 是先前的 Python 实现，**保留供查阅，不再继续演进**；新功能一律进
-Rust。历史文档见 `docs/`。

@@ -145,7 +145,7 @@ cd macos-ax-testkit
 接收方无需安装本项目或 Python。发布负责人应从待交付的 clean Git revision 生成源码包。
 命令会输出源码 revision、worktree 状态、源码内容 SHA-256（即 package digest）和外层源码
 归档 SHA-256；至少把 revision 与源码内容 SHA-256 通过独立可信渠道交给结果验真方。外层
-源码归档 hash 适合传输完整性复核，但结果 verifier 绑定的是不依赖 gzip/tar 表示的内容
+源码归档 hash 适合传输完整性复核，但 Rust 结果 verifier 绑定的是不依赖 gzip/tar 表示的内容
 digest。
 
 默认命令会拒绝白名单文件存在未提交改动。仅用于开发测试时可显式生成 dirty 包：

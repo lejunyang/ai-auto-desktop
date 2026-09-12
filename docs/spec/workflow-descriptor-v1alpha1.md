@@ -191,9 +191,11 @@ Manifest 使用相同 `apiVersion`，`kind: CapabilityManifest`，并包含：
 
 每项 error contract 的 `effect` 为 `not_applied|applied|unknown`。Manifest 只声明能力，不授予权限；workflow 声明、manifest、provider 动态判断和 trusted host policy 必须全部允许。第三方 native provider 必须进程外运行，不能 import/dlopen 到 trusted host。
 
-## 9. v0.x Python 运行时支持矩阵
+## 9. v0.x Rust 运行时支持矩阵
 
-本规范定义目标语义，不表示当前实现已覆盖全部能力。当前 Python-first v0.x 以 mock/fixture 的闭环集成为目标，Rust-ready 指稳定边界使用 JSON、版本化 action contract 和进程协议，不表示已经存在 Rust core。
+本规范定义目标语义，不表示当前实现已覆盖全部能力。当前 v0.x 由 Rust core 实现，并以
+mock/fixture 与各平台原生 CI 闭环验证；用户 workflow 的 `runtime: python` script 是独立的
+沙箱执行能力，不是仓库产品实现语言。
 
 | 能力 | v0.x | v1alpha1 目标 |
 | --- | --- | --- |
@@ -204,9 +206,9 @@ Manifest 使用相同 `apiVersion`，`kind: CapabilityManifest`，并包含：
 | `script` | 默认关闭；仅接受 `runtime: python`、deny-only sandbox，并且只在 Linux bubblewrap + prlimit 可用时执行 | 三端独立进程和 deny-by-default sandbox |
 | retry/on_error/finally | 支持基础语义、父子 deadline、合作式取消、unknown effect，以及受限串行计划的顶层安全点恢复 | action/script reconciliation 与协议级取消 |
 | budgets、risk/permission/confirmation policy | 支持执行预算、SQLite journal/lease 与 fail-closed 前置检查 | 跨进程 single-writer、真实确认 token 与完整 taint enforcement |
-| Windows UIA | 进程 driver：list/snapshot/find/focus/invoke/set_value/type_text/pointer_click；待 Windows 真机资格测试 | 完整 driver |
-| macOS AX | 已实现进程 driver、显式 type_text/pointer_click 与自包含真机测试包；真实 Mac TCC 结果待回传 | 签名稳定且经过应用矩阵验证的正式 driver |
-| Linux AT-SPI | KDE/X11 driver；本机 GTK3 与 Qt 5 Widgets 自有 fixture 已验证语义读取、写动作、显式 XTEST type_text 与 pointer_click；Dolphin、Konsole、System Settings 和 QML fixture 初始窗口只读矩阵已通过 | 按 desktop/session profile 扩展更多 QML 页面、多窗口、动态页面与受控真实应用写动作 |
+| Windows UIA | Rust driver：list/snapshot/find/focus/invoke/set_value/type_text/pointer_click；Rust Win32 fixture 纳入 Windows CI | 扩展真实应用矩阵 |
+| macOS AX | Rust adapter + 签名 Swift helper、显式 type_text/pointer_click 与自包含真机测试包；完整 TCC 结果待回传 | 签名稳定且经过应用矩阵验证的正式 driver |
+| Linux AT-SPI | Rust/zbus KDE/X11 driver；Qt 5 fixture 验证语义读取、写动作、显式 XTEST type_text/pointer_click/capture | 按 desktop/session profile 扩展 QML、多窗口、动态页面与受控真实应用写动作 |
 | durable execution | JSON-only CLI 支持 start/resume/status/list/events/pause/cancel；默认拒绝 action，显式 `--durable-actions read-only` 后仅允许顶层隐式串行、无条件、无 pre/post/retry/handler/finally 的单次只读 action。双方 sensitivity 必须为 public，输出须按 provider `checkpoint_fields` 做 `project|omit`；`action_intent` v2 在 dispatch 前持久化并可安全重放。script、写 action、敏感值和复杂 action 控制流仍拒绝 | 写 action reconciliation、完整 taint tracking 与更通用的恢复 |
 | OCR engine | 显式 Tesseract 图片 provider；不自行截图 | 受控 frame/capture provenance |
 

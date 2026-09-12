@@ -39,7 +39,7 @@ vmx/svm 标志：均不存在
 3. 切换到裸机 Linux 宿主并启用 VT-x/VT-d。
 4. 仅在必要时使用 QEMU TCG 软件模拟；它理论可行但会非常慢，不适合持续的桌面自动化测试。
 
-真实 Windows runner 应覆盖 UIAutomationCore、comtypes、UIA tree/pattern、UIPI、UAC、安全桌面、Job Object、DPI、多显示器和真实应用矩阵。
+真实 Windows runner 应覆盖 UIAutomationCore、Rust UIA binding、UIA tree/pattern、UIPI、UAC、安全桌面、Job Object、DPI、多显示器和真实应用矩阵。
 
 ## macOS 测试方案
 

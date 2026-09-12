@@ -514,11 +514,11 @@ fn dispatch(command: &Command) -> (Value, u8) {
     match command {
         Command::Probe => {
             let report = aad_probe::probe();
-            let code = match report.worst() {
-                aad_probe::State::Unavailable => EXIT_FAILED,
-                _ => EXIT_OK,
-            };
-            (report.to_json(), code)
+            // Missing desktop capabilities are the result of a successful
+            // read-only probe, not a failure to run the probe itself. Callers
+            // gate on `checks.*.state`; a non-zero exit is reserved for usage
+            // or internal probe failures. This also makes headless CI useful.
+            (report.to_json(), EXIT_OK)
         }
         Command::Tools => (aad_mcp::tools::list_payload(), EXIT_OK),
         // Handled in `main`, which hands stdout to the protocol stream.
@@ -1809,7 +1809,7 @@ fn provider_registry(
 
 /// Split a plugin command without treating Windows path separators as escapes.
 ///
-/// The CLI accepts one command string for parity with the Python frontend. On
+/// The CLI accepts one command string as its stable plugin interface. On
 /// Windows, doubling backslashes before POSIX-style tokenisation preserves both
 /// ordinary drive paths and UNC paths while retaining useful quote validation.
 fn split_plugin_command(command: &str) -> Option<Vec<String>> {
@@ -2487,9 +2487,7 @@ mod tests {
         let (payload, code) = dispatch(&Command::Probe);
 
         assert_eq!(payload["kind"], "CapabilityProbe");
-        if cfg!(windows) {
-            assert_eq!(code, EXIT_OK, "a Windows desktop should be usable");
-        }
+        assert_eq!(code, EXIT_OK, "the probe completed and reported its state");
     }
 
     #[test]
@@ -3259,30 +3257,30 @@ mod tests {
     #[test]
     fn plugin_commands_preserve_arguments_and_reject_unclosed_quotes() {
         assert_eq!(
-            split_plugin_command(r#"python "driver with spaces.py" --mode inspect"#),
+            split_plugin_command(r#"worker "driver with spaces" --mode inspect"#),
             Some(vec![
-                "python".to_string(),
-                "driver with spaces.py".to_string(),
+                "worker".to_string(),
+                "driver with spaces".to_string(),
                 "--mode".to_string(),
                 "inspect".to_string(),
             ])
         );
-        assert_eq!(split_plugin_command("python 'unterminated"), None);
+        assert_eq!(split_plugin_command("worker 'unterminated"), None);
     }
 
     #[cfg(windows)]
     #[test]
     fn plugin_commands_preserve_windows_path_separators() {
         assert_eq!(
-            split_plugin_command(r#""C:\Program Files\Python\python.exe" driver.py"#),
+            split_plugin_command(r#""C:\Program Files\AAD\worker.exe" fixture"#),
             Some(vec![
-                r"C:\Program Files\Python\python.exe".to_string(),
-                "driver.py".to_string(),
+                r"C:\Program Files\AAD\worker.exe".to_string(),
+                "fixture".to_string(),
             ])
         );
         assert_eq!(
-            split_plugin_command(r"plugins\windows_uia\run.cmd"),
-            Some(vec![r"plugins\windows_uia\run.cmd".to_string()])
+            split_plugin_command(r"C:\tools\aad-worker.exe"),
+            Some(vec![r"C:\tools\aad-worker.exe".to_string()])
         );
     }
 

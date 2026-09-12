@@ -13,6 +13,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+pub mod result_verifier;
+
 pub const PROVIDER_NAME: &str = "desktop.macos_ax";
 pub const PROVIDER_VERSION: &str = "0.1.0";
 const MAX_FIELD_CHARS: usize = 4096;

@@ -43,7 +43,7 @@ runner 由 LaunchServices 以固定 `.app` 身份启动，并将报告原子写�
   `codesign --verify --strict --test-requirement "=expression"` 回验对应 app；缺失、重复、
   空值、畸形或回验失败都会以稳定阶段码 fail closed。ad-hoc（`ephemeral`）构建必须是
   implicit；固定签名身份可为 explicit 或 implicit。新的 `passed` 归档必须携带 origin，
-  缺失该字段的旧 `passed` 归档不再被当前 verifier 接受。
+  缺失该字段的旧 `passed` 归档不再被 Rust verifier 接受。
 - 源码包注入规范化 `SOURCE_MANIFEST.txt`：包含 Git commit SHA、clean/dirty 状态，并固定
   除自身外每个白名单成员的 mode 和 SHA-256。`source_package_digest` 是该 manifest 的
   SHA-256，以此避开自引用 hash；Mac 在构建前重算并验证，随后将 revision、worktree 与
@@ -67,7 +67,7 @@ runner 由 LaunchServices 以固定 `.app` 身份启动，并将报告原子写�
 前，仍不能把它写成已经通过资格验证。验证只需 Accessibility，不请求 Screen Recording；
 pointer click 是显式动作，不作为 `set_value`、`invoke` 或其他动作的自动 fallback。fixture、runner 与说明均已纳入
 `tests/macos/SOURCE_PACKAGE_FILES.txt` 白名单。
-passed 报告还必须包含并通过 `pointer_click_and_reread`；本地 verifier 缺少该 check 时以
+passed 报告还必须包含并通过 `pointer_click_and_reread`；Rust verifier 缺少该 check 时以
 `missing_required_checks` fail closed。新增 case 不改变 source provenance：report/identity 仍须
 一致携带 revision、worktree 与 package digest，资格认定仍要求独立可信的归档 hash 与 clean
 source pins。
@@ -93,7 +93,9 @@ source pins。
 收到 `macos-ax-test-result.tar.gz` 后，不要直接解压或据文件名人工判断。请在本仓库执行：
 
 ```sh
-tests/macos/verify-result.sh /absolute/path/macos-ax-test-result.tar.gz
+cargo run --locked -q -p aad-macos-ax \
+  --bin aad-macos-result-verifier -- \
+  /absolute/path/macos-ax-test-result.tar.gz
 ```
 
 验真器不向磁盘提取任何成员，并对压缩输入、解压后的 tar、单个成员和成员总量设置硬上限。
@@ -110,7 +112,8 @@ stdout 始终只有一个 JSON 文档。`archive_valid`（兼容别名 `verified
 若测试请求方已经通过与归档回传通道独立的可信渠道取得完整归档 SHA-256，可执行：
 
 ```sh
-tests/macos/verify-result.sh \
+cargo run --locked -q -p aad-macos-ax \
+  --bin aad-macos-result-verifier -- \
   --expected-archive-sha256 <independently-trusted-64-hex> \
   --expected-source-revision <independently-trusted-git-commit-sha> \
   --expected-source-package-digest <independently-trusted-64-hex> \

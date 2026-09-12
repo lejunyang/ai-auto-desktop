@@ -4,7 +4,7 @@
 
 ## 目标与调用
 
-运行 `ai-auto-desktop probe` 或 `python -m ai_auto_desktop probe`，stdout 只输出一行 JSON，探测本身完成时退出码为 `0`。能力缺失、权限未授予或环境不完整属于报告内容，不会让命令以错误退出；参数错误或探测器自身未处理的错误仍遵循 CLI 的结构化错误与非零退出约定。
+运行 `aad probe`，stdout 只输出一行 JSON，探测本身完成时退出码为 `0`。能力缺失、权限未授予或环境不完整属于报告内容，不会让命令以错误退出；参数错误或探测器自身未处理的错误仍遵循 CLI 的结构化错误与非零退出约定。
 
 探针不执行以下操作：请求系统权限、弹出 TCC 或 portal 对话框、创建 Wayland RemoteDesktop 会话、打开 `/dev/uinput`、注入键鼠、截图、枚举窗口、读取 accessibility tree 或执行 UI action。Linux 辅助命令只从固定系统目录解析，使用最小化环境启动；不会信任调用者的 `PATH`，也不会把无关环境变量传给子进程。
 

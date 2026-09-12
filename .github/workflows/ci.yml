@@ -6,134 +6,12 @@ on:
   workflow_dispatch:
     inputs:
       run_windows_native:
-        description: "运行 Windows UIA 原生 fixture"
+        description: "运行 Rust Windows UIA 原生 fixture"
         required: false
         default: false
         type: boolean
 
 jobs:
-  test:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            python-version: "3.11"
-            install-target: .
-          - os: macos-latest
-            python-version: "3.11"
-            install-target: .
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: ${{ matrix.python-version }}
-          cache: pip
-      - name: Install project and contract test dependencies
-        run: python -m pip install wheel "${{ matrix.install-target }}[ocr]"
-      - name: Install Linux X11 capture test dependencies
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends xvfb libx11-dev pkg-config g++
-      - name: Run contract tests
-        run: python -m unittest discover -s tests -v
-      - name: Build production macOS AX helper
-        if: runner.os == 'macOS'
-        run: plugins/macos_ax/build.sh
-      - name: Build macOS AX fixture test kit
-        if: runner.os == 'macOS'
-        run: tests/macos/build.sh
-      - name: Validate canonical example
-        if: success()
-        run: python -m ai_auto_desktop validate examples/workflows/ocr-error-response.json
-      - name: Gate tracked workflow examples
-        if: success()
-        run: python -m unittest tests.test_examples -v
-      - name: Smoke capability probe
-        if: success()
-        run: python -m ai_auto_desktop probe
-
-  windows-contracts:
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-          cache: pip
-      - name: Install project and Windows contract dependencies
-        run: python -m pip install wheel ".[ocr,windows-uia]"
-      - name: Run Windows ArtifactStore and named-pipe contracts
-        run: >-
-          python -m unittest -v
-          tests.test_artifacts
-          tests.test_artifact_ipc
-          tests.test_windows_artifact_pipe_contract
-          tests.test_plugin_artifact_transport
-          tests.test_runtime_artifacts
-          tests.test_ocr_plugin
-          tests.test_package_resources
-      - name: Run portable Windows driver and runtime contracts
-        run: >-
-          python -m unittest -v
-          tests.test_plugin
-          tests.test_runtime
-          tests.test_windows_uia_driver
-          tests.test_windows_uia_capture
-          tests.test_recording_compiler
-          tests.test_recording_editor
-      - name: Run Windows kernel confinement contracts
-        run: >-
-          python -m unittest -v
-          tests.test_windows_job_supervisor
-          tests.test_windows_script_sandbox
-          tests.test_windows_probe
-          tests.test_script_contracts
-          tests.test_probe
-      - name: Validate canonical example
-        if: success()
-        run: python -m ai_auto_desktop validate examples/workflows/ocr-error-response.json
-      - name: Gate tracked workflow examples
-        if: success()
-        run: python -m unittest tests.test_examples -v
-      - name: Smoke capability probe
-        if: success()
-        run: python -m ai_auto_desktop probe
-
-  windows-native:
-    if: >-
-      (github.event_name == 'workflow_dispatch' && inputs.run_windows_native == true) ||
-      (github.event_name == 'push' && contains(github.event.head_commit.message, '[windows-native]'))
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-          cache: pip
-      - name: Install project with Windows UIA support
-        run: python -m pip install ".[windows-uia]"
-      - name: Run Windows native fixture and write result
-        id: windows-native-fixture
-        shell: pwsh
-        run: ./tests/windows/run-native-fixture.ps1 -OutputPath artifacts/windows-native-fixture-result.json
-      - name: Upload Windows native fixture result
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: windows-native-fixture-result-${{ github.run_id }}-${{ github.run_attempt }}
-          path: artifacts/windows-native-fixture-result.json
-          if-no-files-found: error
-          retention-days: 30
-      - name: Validate canonical example
-        if: success()
-        run: python -m ai_auto_desktop validate examples/workflows/ocr-error-response.json
-      - name: Gate tracked workflow examples
-        if: success()
-        run: python -m unittest tests.test_examples -v
-      - name: Smoke capability probe
-        if: success()
-        run: python -m ai_auto_desktop probe
   # The Rust workspace is the shipped implementation, so it is built and tested
   # on every platform it supports. aad-gui is excluded: it needs the Tauri
   # system libraries (GTK/WebKit on Linux) and is never published, so its build
@@ -150,6 +28,26 @@ jobs:
         with:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        if: runner.os == 'Windows'
+        id: python
+        with:
+          python-version: "3.11"
+      - name: Pin the optional script interpreter
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          "AAD_SCRIPT_PYTHON=${{ steps.python.outputs.python-path }}" | Out-File -FilePath $env:GITHUB_ENV -Append
+      - name: Enforce the single Rust implementation
+        shell: bash
+        run: |
+          set -euo pipefail
+          test ! -f pyproject.toml
+          if git ls-files '*.py' '*.pyi' | grep -q .; then
+            echo "tracked Python implementation files remain" >&2
+            git ls-files '*.py' '*.pyi' >&2
+            exit 1
+          fi
       - name: Install Linux native driver test dependencies
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends xvfb xauth dbus-x11 at-spi2-core g++ pkg-config qtbase5-dev libx11-dev libxtst-dev
@@ -164,6 +62,22 @@ jobs:
       - name: Smoke Rust adapter against the signed macOS AX helper
         if: runner.os == 'macOS'
         run: cargo run --locked -q -p aad-macos-ax --example list_apps
+      - name: Exercise the Rust macOS result verifier
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          result_root="$(mktemp -d)"
+          trap 'rm -rf -- "$result_root"' EXIT
+          status=0
+          tests/macos/run.sh --output "$result_root" --build-dir "$result_root/build" || status=$?
+          [ "$status" -eq 3 ]
+          archive="$(find "$result_root" -type f -name macos-ax-test-result.tar.gz -print -quit)"
+          [ -n "$archive" ]
+          verify_status=0
+          cargo run --locked -q -p aad-macos-ax \
+            --bin aad-macos-result-verifier -- "$archive" || verify_status=$?
+          [ "$verify_status" -eq 1 ]
 
       - name: Check formatting
         run: cargo fmt --all --check
@@ -172,6 +86,8 @@ jobs:
       # here rather than in the middle of a release.
       - name: Build and test the workspace
         run: cargo test --workspace --exclude aad-gui --locked
+      - name: Test the Rust subprocess plugin fixture
+        run: cargo test --locked -p aad-plugin --features test-fixture --test process_plugin
 
       # The UIA research probes call Win32 APIs directly. They are excluded
       # from automatic example discovery on other hosts, but still need to be
@@ -180,14 +96,22 @@ jobs:
         if: runner.os == 'Windows'
         run: cargo check --locked -p aad-uia --examples --features windows-native-examples
 
+      - name: Run Rust Windows UIA fixture
+        if: >-
+          runner.os == 'Windows' &&
+          ((github.event_name == 'workflow_dispatch' && inputs.run_windows_native == true) ||
+           (github.event_name == 'push' && contains(github.event.head_commit.message, '[windows-native]')))
+        run: cargo test --locked -p aad-uia --test windows_native -- --ignored
+
       # -D warnings, or clippy prints a warning and still exits 0, which makes
       # the step decorative.
       - name: Lint
         run: cargo clippy --workspace --exclude aad-gui --locked --all-targets -- -D warnings
+      - name: Lint the Rust subprocess plugin fixture
+        run: cargo clippy --locked -p aad-plugin --features test-fixture --all-targets -- -D warnings
 
       # The Rust CLI is what users actually get, so examples are validated
-      # through it as well: the Python jobs above only prove the Python tree
-      # agrees with the tracked descriptors.
+      # through the same binary shipped to users.
       #
       # Enumerated from git rather than hardcoded, so an example added later is
       # covered without anyone remembering to extend this list.

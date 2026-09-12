@@ -1,5 +1,8 @@
 # 脚本执行现状与启用路径
 
+> 当前实现位于 `crates/aad-runtime/src/script.rs`。本文中的旧 Python 模块/测试名仅保留为
+> 迁移历史；工作流仍可运行显式 Python script，但仓库不再用 Python 实现 runtime/provider。
+
 状态：Draft，2026-08-29。本文回答：脚本能执行什么、会传入什么、各平台沙箱强制了哪些边界、又有哪些边界**没有**强制。Linux 使用 bubblewrap，状态为 `available`；Windows 使用 Job Object，状态为 `degraded`（网络与文件系统未隔离）；macOS 仍 fail-closed。所有结论均为本机实测，并有回归测试覆盖，不是读码推断。
 
 ## 1. 能执行什么
@@ -13,7 +16,8 @@
 | `source` | 内联脚本正文 | `maxLength: 1048576`（1 MiB） |
 | `entrypoint` | 脚本文件路径 | `maxLength: 4096`，相对路径按 descriptor 所在目录解析 |
 
-`entrypoint` 经 `resolve_entrypoint()` 处理：`resolve(strict=True)` 后必须是**常规文件**，否则 `SCRIPT.START_FAILED`。`source` 则写入临时目录的 `script.py`。
+`entrypoint` 经 Rust `resolve_entrypoint()` 处理：canonicalize 后必须是 workflow 目录内的
+**常规文件**，否则 `SCRIPT.ENTRYPOINT_INVALID`。`source` 则写入临时目录的 `script.py`。
 
 两种来源最终都以**只读绑定**挂进沙箱的 `/workflow/script.py`，并用 `python3 -I` 执行（`-I` = isolated 模式：忽略 `PYTHONPATH`、用户 site-packages 与环境变量）。
 
@@ -23,20 +27,10 @@
 
 **输入通过 stdin 传入，是一个 JSON 值；不是命令行参数，也不是环境变量。**
 
-`runtime.py` 的调用点：
+Rust runtime 会先求值 `inputs`，再调用脚本执行器：
 
-```python
-result = execute_python_script(
-    self.descriptor, step,
-    self._evaluate(thaw(step.params.get("inputs", {}))),   # 先求值表达式
-    timeout,
-)
-self._validate_schema(result, step.params["output_schema"], "SCRIPT.OUTPUT_INVALID", step.id)
-```
-
-因此 `inputs` 里的 `${{ }}` 表达式在**宿主侧**求值，脚本收到的是求值后的字面数据。传递方式为
-`process.communicate(json.dumps(inputs, ensure_ascii=False, allow_nan=False))`——注意
-`allow_nan=False`，即 `NaN`/`Infinity` 会导致序列化失败而非静默传入。
+因此 `inputs` 里的 `${{ }}` 表达式在**宿主侧**求值，脚本收到的是求值后的字面 JSON。
+非有限数值不能被 JSON 序列化，会在执行前失败而非静默传入。
 
 脚本侧的契约：
 
@@ -60,7 +54,7 @@ stdout 必须是**恰好一个** UTF-8 JSON 值，否则 `SCRIPT.OUTPUT_INVALID`
 `prlimit` 施加：`--fsize=max_output_bytes`、`--as=536870912`（512 MiB 地址空间）、
 `--cpu=ceil(timeout)+1`、`--nofile=64`、`--core=0`。
 
-超时走 `process.communicate(timeout=...)`，超时后 `_kill_process_group()` 先 `SIGTERM` 再 `SIGKILL`（默认 30s）。
+Rust supervisor 同时 drain stdout/stderr 并轮询绝对 deadline；超时后终止进程组（默认 30s）。
 
 ## 4. 平台支持：Linux 完整，Windows degraded
 
@@ -84,7 +78,7 @@ macOS 仍然 fail-closed：没有实现等价隔离之前，宁可拒绝执行�
 
 ### 4.1 Windows 沙箱强制了什么（实测）
 
-复用已有的 `_win_job.WindowsJob`，为其加上可选的资源上限；进程先以 `CREATE_SUSPENDED` 创建、**assign 进 job 之后才 resume**，因此脚本不存在「先于 job 成员身份运行」的窗口，也无法把子进程放到 job 之外。
+Rust runtime 使用 `aad-plugin` 的 Windows Job Object supervisor 设置资源上限并回收后代进程。
 
 以下每一项都由「尝试违反 → 确认被拦」验证，而不是只跑通顺利路径：
 
@@ -100,7 +94,10 @@ macOS 仍然 fail-closed：没有实现等价隔离之前，宁可拒绝执行�
 | 隔离解释器 | `-I -B -E -s -S` | `sys.flags.isolated` 与 `no_user_site` 均为真 |
 | 输出契约 | 与 Linux 共用 `_decode_script_result()` | 超限 / 非 JSON / 非零退出分别报对应错误码 |
 
-解释器路径必须显式解析并固定（Linux 硬编码 `/usr/bin/python3`，Windows 无等价固定路径），且拒绝 `py.exe` 启动器——沙箱必须确切知道自己执行的是哪个二进制。**探针只报告「已解析到解释器」这一布尔事实，不报告路径**：用户目录下的解释器路径含账号名，而探针报告不得携带环境标识值。
+解释器路径必须显式解析并固定（Linux 使用 `/usr/bin/python3`；Windows 可由操作者通过
+`AAD_SCRIPT_PYTHON` 指定绝对路径，否则只检查固定安装目录），且拒绝 `py.exe` 启动器——
+沙箱必须确切知道自己执行的是哪个二进制。**探针只报告「已解析到解释器」这一布尔事实，
+不报告路径**：用户目录下的解释器路径含账号名，而探针报告不得携带环境标识值。
 
 ### 4.2 Windows 沙箱没有强制什么（必须如实说明）
 
@@ -159,7 +156,8 @@ Windows 没有 per-process 网络命名空间，也没有 mount 命名空间，�
 
 ## 6. 后续工作
 
-Windows 沙箱已落地并有回归测试（`tests/test_windows_script_sandbox.py`，22 项，其中 2 项在非 Windows 上跳过），并已纳入 CI：`windows-contracts` job 每次 push 都在真机 Windows 上运行沙箱、Job Object 与探针契约，`tests/test_ci_contract.py` 反过来断言该 gate 不会被悄悄移除。
+Windows 沙箱已落地并由 `aad-runtime`、`aad-plugin` 的 Rust 测试覆盖，workspace 测试在每次
+Windows CI 运行；Linux 侧同样覆盖输入输出、超时和 sandbox policy。
 
 剩余工作及其真实状态：
 

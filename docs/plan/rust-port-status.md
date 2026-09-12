@@ -1,6 +1,6 @@
 # Rust 移植状态跟踪
 
-> 基线日期 2026-09-12。本文记录 Python v0 已有、但 Rust 尚未实现的能力，用于跟踪重构进度。
+> 基线日期 2026-09-12。本文记录 Rust 迁移结果、已知边界与后续候选能力。
 >
 > 本文只记录**经代码核实**的状态，不记录推测。每一条"未移植"都在写入前用检索或运行验证过；
 > 核实方式写在条目里，便于后续复核。核实结论会随代码变化过期，改动相关模块时应重新核对。
@@ -8,8 +8,8 @@
 ## 0. 项目定位
 
 Rust 是本项目的主实现，对外提供 **CLI + GUI** 两种形态，CLI 同时通过 skills + MCP 供 AI 使用。
-`src/ai_auto_desktop/` 的 Python 实现**保留供查阅，不再继续演进**；它仍是行为语义的参考来源，
-因为规范文档与它一致，而 Rust 尚未覆盖全部语义。
+旧 Python runtime 和 provider 已在 Rust 等价能力与回归测试建立后删除；规范、历史文档和
+Git 历史保留迁移依据。仓库内不再维护第二套 Python 产品实现。
 
 ## 1. 已移植（Rust 中可用）
 
@@ -31,7 +31,7 @@ Rust 是本项目的主实现，对外提供 **CLI + GUI** 两种形态，CLI �
 | CLI | `crates/aad-cli` | 20 个子命令，见 §2.2 |
 | 录制存取（子集） | `crates/aad-runtime/src/recordings.rs`、`gui/src/recording.ts` | 存 locator 而非 target，见 §2.4 |
 
-## 2. 未移植
+## 2. 已知剩余范围
 
 ### 2.1 持久化执行（受限能力已完成）
 
@@ -261,9 +261,11 @@ socketpair 与 Windows 受保护 named pipe 尚未接入 Rust 进程插件宿主
 
 **核实方式**：Windows 使用 `crates/aad-uia`，Linux 使用 `crates/aad-atspi`，macOS 的 protocol/
 state adapter 使用 `crates/aad-macos-ax`，后者直接管理代码签名 Swift helper。`plugins/` 下的旧
-Python provider 只在最终差分验收前保留为参考，不再是 Rust CLI 的生产入口。
+原 Python provider 已在 manifest、错误和真机/fixture 差分验收完成后删除，不再是任何
+生产或测试入口。
 
-三端 provider 已有 Rust 实现；尚需完成 macOS CI 构建/fixture 验证后才能删除旧 Python 参考实现。
+三端 provider 已有 Rust 实现，旧 Python 参考实现已经删除。macOS CI 构建并签名 Swift
+helper 后执行 Rust adapter smoke；更完整的 TCC/写动作资格仍由真机套件单独验证。
 
 Rust OCR 的 `recognize@1` / `recognize_artifact@1` 保持原 action contract：Tesseract TSV
 解析、字符加权 confidence、literal match 与 Unicode character span、region 坐标回映、图片
@@ -282,13 +284,14 @@ Rust macOS adapter 保持原 8 个 action contract：`list_apps`、`snapshot`、
 
 ### 2.8 GUI 编辑能力
 
-Python 浏览器编辑器有、GUI 尚无：插入/编辑 logic 步骤（`/api/logic`）、撤销（`/api/undo`）。
+旧浏览器编辑器具备而当前 GUI 尚无：插入/编辑 logic 步骤、撤销。旧实现已删除；若产品
+目标仍需要这些交互，应在现有 TypeScript/Tauri GUI 中补齐，而不是恢复第二套编辑器。
 
 ### 2.9 测试覆盖
 
-Python 有 45 个测试文件。针对未移植能力的部分在 Rust 侧没有对应物，其中较大的有：
-`test_durable_*` 4 个共 106KB、`test_recording_compiler.py`(27KB)、
-`test_macos_ax_driver.py`(84KB)、`test_linux_atspi_driver.py`(115KB)、`test_ocr_plugin.py`(44KB)。
+Python 回归套件已在对应 Rust 单元、集成和平台 fixture 建立后删除。Linux provider 使用
+私有 Xvfb + AT-SPI bus 的 Rust fixture；macOS adapter 在跨平台假 helper 上校验协议与
+unknown-effect 边界，并在 macOS CI 构建/签名真实 Swift helper 后执行握手和应用枚举。
 
 ### 2.10 postcondition 真正重新观察（已完成）
 
@@ -947,11 +950,7 @@ GUI 每 700ms 轮询一次 `collect`，录到的步骤**直接进同一个 recor
   （拆批会导致文字错乱：目标会 latch 前一字符）。
 - 受保护窗口返回 `0x80004005`，属 UIPI 正常行为。
 - DPI 与完整性级别探测为 `degraded`。
-- Windows script 沙箱缺网络/文件系统隔离，按 Python 原行为如实上报 `degraded` + `gaps`。
-- `aad-plugin` 的 `a_requested_manifest_completes_the_handshake` 偶发失败（`cargo test --workspace`
-  跑过一次失败，随后单独跑 4/4 通过、在 committed 基线上加 4 路 CPU 负载跑 3/3 通过，
-  故非改动引入）。fixture 是 Python 子进程，握手默认 30s，怀疑是并行下解释器启动被拖慢。
-  尚未定位，暂记录不掩盖。
+- Windows script 沙箱缺网络/文件系统隔离，Rust probe 如实上报 `degraded` + `gaps`。
 - ~~`durable_exec` 的 `flipping_intent_while_a_run_advances_never_surfaces_a_conflict` 偶发失败~~
   （下面这条记录了第一次修复；后续又暴露两层，见 §2.13）
   **已定位并修复，不是环境问题，是 `resume` 的一个真 bug**。它先读 `desired_state` 看到
@@ -964,7 +963,8 @@ GUI 每 700ms 轮询一次 `collect`，录到的步骤**直接进同一个 recor
 
 ## 4. 不在计划内
 
-- **删除 Python**：保留供查阅。
+- **移除用户工作流里的 Python script runtime**：它是受限脚本功能，不是仓库实现语言；若要删除，
+  需要另行定义兼容替代 runtime，不能与本次 provider/core 迁移混为一谈。
 - **skills 目录**：等 CLI 能力齐全后再写。
 
 ## 2.24 Correcting a locator, with the trying next to it

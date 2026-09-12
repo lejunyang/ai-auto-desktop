@@ -1,6 +1,7 @@
-# Python 优先、Rust 就绪的分阶段路线图
+# Rust 运行时分阶段路线图
 
-> 基线日期：2026-08-24。路线图以当前 Python v0 纵向切片为起点，不把 fixture、mock OCR 或研究结论记作真实平台能力。里程碑按退出门槛推进，不按日期自动宣告完成。
+> 初始基线日期：2026-08-24；Rust 迁移状态更新于 2026-09-12。不把 fixture、mock OCR
+> 或研究结论记作真实平台能力。里程碑按退出门槛推进，不按日期自动宣告完成。
 
 ## 1. 交付原则
 
@@ -8,25 +9,26 @@
 - Accessibility-first 的确定性路径先于像素路径；OCR 只作为 descriptor 中显式的 perception step。
 - Windows、macOS、Linux 共用 contract suite，但平台资格分别统计和发布。
 - 一个 desktop session 只有一个 writer；规划器、OCR 和 script worker 无权绕开 Trusted Host。
-- 只有证据证明 Python 常驻核心成为瓶颈、且语义已稳定后，才进入 Rust 迁移。
+- 产品实现保持单一 Rust 主线；平台原生 helper 只在 OS 安全/ABI 边界确有必要时保留。
 
-## 2. 当前基线：Python v0
+## 2. 当前基线：Rust v0
 
-当前 v0 已形成可执行的运行语义原型，并已加入显式 Tesseract OCR provider 与只读三端能力探针：
+当前 v0 已形成 Rust 可执行运行时、显式 Tesseract OCR provider 与只读三端能力探针：
 
 - JSON/YAML 归一到 `apiVersion: ai-auto-desktop.dev/v1alpha1`、`kind: Workflow` 与 `metadata.name`，再严格编译和冻结；step ID 在全部分支、handler、`finally` 中全局唯一。
-- 只读白名单 AST 表达式，不使用 `eval/exec`，禁止所有函数和方法调用。
+- 只读白名单表达式 parser/evaluator，不使用宿主语言求值，禁止所有函数和方法调用。
 - `action/set/block/fail/return/script`、`if/switch/foreach/while`、声明式 error handler 与 `finally`；循环有显式上限。
 - 结构化 `AutomationError`；内存 runtime 已统一 `succeeded/failed/timed_out/cancelled/unknown_effect`，`skipped` 作为 step 状态。
-- stdio NDJSON 长驻 process plugin 和确定性 fixture，用于成功、retryable error、永久失败、睡眠、mock OCR 与 mock desktop invoke；另有真实 Tesseract process provider，只接受调用方显式提供的图片。
+- Rust 内置 provider 与可选 NDJSON 扩展 plugin 共享 manifest/action contract；真实 Tesseract provider 只接受调用方显式提供的图片。
 - Host 已有无路径的 `ArtifactRef` 图片数据面：声明 slot 的 action 在 POSIX 通过私有 Unix socket、在 Windows 通过受保护且双向 PID 校验的 named pipe，按 deadline 传原始字节；Host 校验摘要、MIME、大小和图片结构，并以 batch 原子发布全部输出。Windows 使用 run-scoped immutable 内存 store，POSIX 使用 fd-relative 私有目录；durable 模式暂时显式拒绝该临时资源。
 - `probe` 命令只读检查 Windows UIA、macOS Accessibility/Screen Capture 和 Linux AT-SPI/X11/Wayland/portal/libei/uinput 前置条件，不请求权限、不截图、不注入输入。
-- script 默认拒绝；`--allow-scripts` 显式启用后仅在具备 bubblewrap + `prlimit` 的 Linux 上运行，其他平台返回 `SCRIPT.SANDBOX_UNAVAILABLE`。
+- script 默认拒绝；`--allow-scripts` 显式启用后，Linux 在 bubblewrap + `prlimit` 下运行，
+  Windows 在 Job Object 下以 degraded 隔离运行，macOS 返回 `SCRIPT.SANDBOX_UNAVAILABLE`。
 - SQLite journal、owner lease 和受限 durable executor 已串通：`start/resume/status/list/events/pause/cancel` 使用 JSON-only CLI。action 默认拒绝；`start` 和 `resume` 仅在显式使用 `--durable-actions read-only` 时接受顶层、隐式串行、无条件、无 pre/postcondition、无 retry/handler/finally 的单次 `read_only` action。provider 与 descriptor 必须把 input/output/error 声明为 `public`，并通过 provider `checkpoint_fields` 与 descriptor `project|omit` 只持久化批准的投影。dispatch 前持久化 `action_intent` v2，恢复时校验绑定后可安全重放只读 action；其他不安全阶段仍恢复为 `UNKNOWN_EFFECT`。script、写 action 与敏感数据继续拒绝。
 
 尚未实现或尚未证明：Windows/macOS 真机执行结果与真实应用矩阵、任意 KDE/QML 应用资格；可靠的 Windows 后代进程树终止；完整 wire 协议版本协商；Windows Artifact 磁盘 spill/重启恢复；跨进程 single-writer session manager；写 action、script、敏感值和复杂控制流的通用持久恢复与 reconciliation；系统 secret store；签名插件；taint tracking、确认 token 与完整 policy enforcement；安装器和权限引导。当前已有 Windows Win32 fixture/手动 CI 入口、macOS AX driver/真机回传包，以及 Linux KDE/X11 AT-SPI driver；三端均已实现只允许 fresh 语义节点中心点的显式 `pointer_click`，但 Windows/macOS 仍待真机证据。本机已用自有 GTK3、Qt 5 Widgets 与 Qt Quick/QML fixture 验证语义树，其中 GTK3/Qt Widgets 还验证了语义写动作、显式 XTEST 文本输入和 pointer click；发行版 KCalc 22.12.3 还在私有 Xvfb/KWin/总线和临时配置中分别通过 exact AT-SPI `Press` 与显式中心点 `pointer_click` 完成 `1+2=3`，并由 fresh snapshot 回读同一显示控件。Host/plugin 的 POSIX Unix socket 与 Windows named pipe 无路径图片通道、KDE/X11 bounded target capture、frame provenance 与显式 ArtifactRef OCR 已接通；但 Windows 内容通道仍需真实 GitHub Windows runner 证据，真实 KWin compositor 下的截图和截图→OCR 也需专门资格验证，不能外推为任意应用视觉闭环。M0 已具备 manifest/action contract、`postcondition.observe` 和基础 action risk policy 校验，其任务是继续把 v0 收敛成可验证基线，而不是扩大产品宣称。
 
-## 3. M0：冻结 Python 运行时 v0 合约
+## 3. M0：冻结运行时 v0 合约（已完成并迁移到 Rust）
 
 ### 范围
 
@@ -36,7 +38,7 @@
 - 定义绝对 deadline、父子取消、retry eligibility 和 `SUCCEEDED/FAILED/TIMED_OUT/CANCELLED/UNKNOWN_EFFECT/SKIPPED`。
 - 固化 NDJSON v0：manifest、invoke、request ID、绝对 `deadline_ms`、structured result/error；stdout 只输出协议/CLI JSON，日志走 stderr。
 - capability/driver/script 都遵守进程外 worker 边界；process plugin 支持长驻复用、输出上限、非法帧、EOF、超时、崩溃和 transient error 故障注入。
-- 建立 CLI `validate` / `run` 与 Python API 的同一错误模型。
+- 建立 CLI `validate` / `run` 与核心库的同一错误模型。
 - 写明 OCR 只能作为显式 step；用 fixture 测试 `ocr → condition/switch → desktop action`，并证明普通 resolve 失败不会自动触发 OCR。
 
 ### 退出门槛
@@ -109,10 +111,13 @@
 - Windows x64 首发，按证据增加 ARM64；签名安装器、权限/提权诊断、Job Object 回归和杀软兼容测试。
 - macOS `.app` 内嵌固定 bundle ID 的 helper，完成 hardened runtime、codesign、notarization、staple 与升级后 TCC 回归。
 - Linux 先发布经资格验证的 KDE Plasma/X11 `.deb` 与诊断包；GNOME 与 Wayland 达到各自门槛后再增加对应 capability/profile，不宣称一包覆盖任意发行版。
-- Python 使用锁定 wheelhouse/哈希与可复现构建，优先 onedir/内嵌 runtime；原生 helper、OCR 模型和浏览器依赖分层打包。
+- Rust 二进制、原生 helper、OCR 模型和浏览器依赖分层打包并保留可复现 hash。
 - 系统 secret store、确认 UI、policy 管理、审计完整性/保留/导出、截图 TTL 与隐私擦除。
 - 录制回放编排（契约见 `docs/spec/recording-session-v1alpha1.md`，架构见 `docs/architecture/record-replay.md`）：基于可访问性事件的录制、locator 唯一性合成与验证、stdlib 本地 UI 的编辑/重排、编译到 workflow、回放判定与失败归因。按平台分期：Windows 先行，Linux 次之，macOS 受 TCC 约束最后。
-- Windows 脚本沙箱（已实现并纳入 CI，现状见 `docs/architecture/script-execution.md`）：复用 `_win_job` 的 Job Object 强制内存/CPU/进程数上限与进程树回收，配合空环境、隔离 cwd 与隔离解释器；探针以 `script.sandbox` 报告为 `degraded`，因为 Windows 无 per-process 网络/mount 命名空间，`network` 与 `filesystem` 仍未隔离。升级到 `available` 的 AppContainer 路线**已实测受阻**：容器令牌无用户 SID，本机各 Python 解释器均缺 `ALL APPLICATION PACKAGES` 授权，绕过需持久修改用户文件 ACL 或每次复制 79.9 MiB runtime，均不可接受；需先找到无副作用的解释器可达方案。
+- Windows 脚本沙箱（现状见 `docs/architecture/script-execution.md`）：Rust runtime 使用 Job
+  Object 强制内存/CPU/进程数上限与进程树回收，配合空环境、隔离 cwd 与隔离解释器；探针
+  仍报告 `degraded`，因为 Windows 无 per-process 网络/mount 命名空间。升级到 `available`
+  的 AppContainer 路线受解释器 ACL 可达性阻塞，不能通过持久修改用户文件 ACL 绕过。
 - 崩溃报告和 telemetry 默认脱敏、可关闭；建立真实应用 qualification matrix、SLO 和回归实验室。
 
 ### 退出门槛
@@ -128,15 +133,15 @@
 
 用“单文件”掩盖模型/helper/native dependency，或在没有资格测试时承诺任意三端应用。
 
-## 7. M4：按门槛迁移 Rust 可信核心
+## 7. M4：Rust 可信核心迁移（已完成）
 
 ### 启动门槛
 
-只有以下条件同时满足才开始迁移：
+迁移启动时使用了以下门槛：
 
 1. descriptor/plan、NDJSON、错误、状态、effect、deadline 和 journal 已有稳定版本与 conformance suite；
-2. M1–M3 数据证明 Python Host 在常驻内存、启动/延迟、进程治理、安全加固或分发上存在值得迁移的瓶颈；
-3. Python 与 Rust 能消费同一 fixture、golden plan 和协议测试，且有逐组件回滚方案；
+2. M1–M3 数据证明旧 Host 在常驻内存、启动/延迟、进程治理、安全加固或分发上存在值得迁移的瓶颈；
+3. 旧实现与 Rust 能消费同一 fixture、golden plan 和协议测试，且有逐组件回滚方案；
 4. 团队具备三平台 Rust CI、签名发布和 incident debugging 能力。
 
 ### 迁移顺序
@@ -145,15 +150,15 @@
 2. 迁移 worker supervisor、IPC framing、输出限额、process-tree cancellation 和 health/circuit breaker。
 3. 迁移 absolute deadline scheduler、bounded control flow、retry gate 和 single-writer lease。
 4. 迁移 policy、secret broker、journal/audit；对每步做 shadow/replay 对比。
-5. 评估将 Windows/Linux driver 移入 Rust sidecar；macOS 可长期保留签名 Swift helper，Python 可长期承载 OCR/ML 与快速插件。
+5. Windows/Linux driver 与 OCR 已移入 Rust；macOS 长期保留签名 Swift helper。
 6. NDJSON 与新 Protobuf/CBOR transport 双栈一段版本窗口，确认兼容后再退役 v0 transport。
 
 ### 退出门槛
 
-- Python/Rust 对同一 plan 产生相同的 step 顺序、终态、结构化错误、deadline 传播和 audit digest；差异均有显式版本说明。
+- 迁移差分对同一 plan 产生相同的 step 顺序、终态、结构化错误、deadline 传播和 audit digest；差异均有显式版本说明。
 - fault suite 覆盖 worker hang/crash/partial frame、dispatch 后 EOF、取消竞态、Host restart 和 secret redaction。
 - Rust Host 在真实 qualification matrix 上不降低任务成功率或安全拒绝率，且性能/资源或部署指标达到预设收益。
-- 支持组件级回滚；不要求一次性删除 Python，也不把 OCR/ML 重写作为完成条件。
+- Rust 入口、provider、OCR 与平台 fixture 已接管，旧 Python 产品副本可删除；用户 workflow 的 Python script runtime 是独立兼容能力。
 
 ## 8. 跨阶段质量门
 

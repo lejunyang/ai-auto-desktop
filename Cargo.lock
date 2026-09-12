@@ -69,7 +69,10 @@ dependencies = [
  "aad-core",
  "aad-plugin",
  "aad-runtime",
+ "crc32fast",
+ "flate2",
  "libc",
+ "serde",
  "serde_json",
  "sha2",
  "uuid",
@@ -121,6 +124,8 @@ dependencies = [
 name = "aad-probe"
 version = "0.0.1"
 dependencies = [
+ "aad-plugin",
+ "libc",
  "serde",
  "serde_json",
  "windows 0.58.0",

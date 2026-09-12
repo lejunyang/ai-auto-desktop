@@ -1,3 +1,5 @@
+#![cfg(target_os = "linux")]
+
 use aad_core::compile_descriptor;
 use aad_plugin::{manifest, CapabilityManifest};
 use aad_runtime::{run, ArtifactStore, Provider, ProviderRegistry, RunOptions, RunStatus};

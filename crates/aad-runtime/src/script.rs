@@ -45,7 +45,15 @@ pub fn availability() -> Value {
     #[cfg(windows)]
     {
         let interpreter = find_interpreter();
-        let state = if interpreter.is_some() {
+        let job_object = aad_plugin::windows_job::Job::create();
+        let job_limits = job_object.as_ref().is_some_and(|job| {
+            job.set_limits(
+                MEMORY_LIMIT_BYTES,
+                DEFAULT_TIMEOUT.as_secs() + 1,
+                MAX_ACTIVE_PROCESSES,
+            )
+        });
+        let state = if interpreter.is_some() && job_limits {
             "degraded"
         } else {
             "unavailable"
@@ -54,6 +62,7 @@ pub fn availability() -> Value {
             "state": state,
             "mechanism": "windows_job_object",
             "interpreter": interpreter.map(|path| path.display().to_string()),
+            "job_object_limits_available": job_limits,
             "enforced": [
                 "memory_limit", "cpu_time_limit", "process_count_limit",
                 "process_tree_reclamation", "empty_environment",
@@ -71,8 +80,17 @@ pub fn availability() -> Value {
     #[cfg(target_os = "linux")]
     {
         let bubblewrap = which("bwrap");
+        let prlimit = which("prlimit");
         let python = PathBuf::from("/usr/bin/python3");
-        let usable = bubblewrap.is_some() && python.is_file();
+        let usable = bubblewrap.is_some() && prlimit.is_some() && python.is_file();
+        let missing = [
+            bubblewrap.is_none().then_some("bwrap"),
+            prlimit.is_none().then_some("prlimit"),
+            (!python.is_file()).then_some("/usr/bin/python3"),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
         json!({
             "state": if usable { "available" } else { "unavailable" },
             "mechanism": "bubblewrap",
@@ -84,10 +102,11 @@ pub fn availability() -> Value {
                 "network_namespace", "pid_namespace", "filesystem_namespace",
             ],
             "gaps": [],
+            "missing": missing,
             "summary": if usable {
                 "Full namespace isolation is enforced by bubblewrap."
             } else {
-                "bubblewrap or /usr/bin/python3 is missing."
+                "bubblewrap, prlimit, or /usr/bin/python3 is missing."
             },
         })
     }
@@ -105,11 +124,10 @@ pub fn availability() -> Value {
 
 #[cfg(unix)]
 fn which(command: &str) -> Option<PathBuf> {
-    std::env::var_os("PATH").and_then(|paths| {
-        std::env::split_paths(&paths)
-            .map(|directory| directory.join(command))
-            .find(|candidate| candidate.is_file())
-    })
+    ["/usr/bin", "/bin", "/usr/sbin", "/sbin"]
+        .into_iter()
+        .map(|directory| Path::new(directory).join(command))
+        .find(|candidate| candidate.is_file())
 }
 
 /// Locate an interpreter without trusting the caller's `PATH`.
@@ -118,9 +136,20 @@ fn which(command: &str) -> Option<PathBuf> {
 /// let an attacker-controlled entry decide what runs.
 #[cfg(windows)]
 fn find_interpreter() -> Option<PathBuf> {
-    // The running interpreter's own location is the most trustworthy hint we
-    // have; fall back to fixed install roots.
+    // The operator may pin an exact executable. Never resolve a bare name from
+    // PATH: a script interpreter is executable code.
     let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Some(configured) = std::env::var_os("AAD_SCRIPT_PYTHON") {
+        let configured = PathBuf::from(configured);
+        if configured.is_absolute()
+            && !matches!(
+                configured.file_name().and_then(|name| name.to_str()),
+                Some(name) if name.eq_ignore_ascii_case("py.exe") || name.eq_ignore_ascii_case("pyw.exe")
+            )
+        {
+            candidates.push(configured);
+        }
+    }
     if let Some(local) = std::env::var_os("LOCALAPPDATA") {
         let root = PathBuf::from(local).join("Programs").join("Python");
         if let Ok(entries) = std::fs::read_dir(&root) {
@@ -342,6 +371,8 @@ fn run_sandboxed(
 ) -> Result<Value, AutomationError> {
     let bubblewrap = which("bwrap")
         .ok_or_else(|| error("SCRIPT.SANDBOX_UNAVAILABLE", "bubblewrap is not available"))?;
+    let prlimit = which("prlimit")
+        .ok_or_else(|| error("SCRIPT.SANDBOX_UNAVAILABLE", "prlimit is not available"))?;
     // `/usr/bin/python3` is a symlink on Debian and Ubuntu (including GitHub's
     // runners). Binding the symlink alone into a fresh mount namespace leaves
     // its target absent, so bwrap starts successfully and then reports the
@@ -355,10 +386,19 @@ fn run_sandboxed(
     let seconds = budget.as_secs().max(1) + 1;
     let mut command = Command::new(bubblewrap);
     command
-        .args(["--unshare-all", "--die-with-parent", "--new-session"])
+        .args([
+            "--unshare-all",
+            "--die-with-parent",
+            "--new-session",
+            "--cap-drop",
+            "ALL",
+        ])
         .arg("--ro-bind")
         .arg(interpreter)
         .arg("/usr/bin/python3")
+        .arg("--ro-bind")
+        .arg(&prlimit)
+        .arg("/usr/bin/prlimit")
         .args(["--ro-bind", "/usr/lib", "/usr/lib"]);
     // Dynamic loaders live under /lib or /lib64 depending on the distribution.
     // They are outside /usr/lib on GitHub's Ubuntu runners, so the interpreter
@@ -369,11 +409,25 @@ fn run_sandboxed(
         }
     }
     let mut child = command
-        .args(["--ro-bind", &source.display().to_string(), "/script.py"])
+        .args(["--dir", "/workflow"])
+        .args([
+            "--ro-bind",
+            &source.display().to_string(),
+            "/workflow/script.py",
+        ])
         .args(["--tmpfs", "/tmp", "--chdir", "/tmp"])
         .args(["--proc", "/proc", "--dev", "/dev"])
         .arg("--clearenv")
-        .args(["/usr/bin/python3", "-I", "-B", "/script.py"])
+        .args(["--setenv", "PATH", "/usr/bin:/bin"])
+        .args(["--setenv", "PYTHONIOENCODING", "utf-8"])
+        .arg("/usr/bin/prlimit")
+        .arg(format!("--fsize={max_output_bytes}"))
+        .arg("--as=536870912")
+        .arg(format!("--cpu={seconds}"))
+        .arg("--nofile=64")
+        .arg("--core=0")
+        .arg("--")
+        .args(["/usr/bin/python3", "-I", "-B", "/workflow/script.py"])
         .current_dir(working)
         .env_clear()
         .stdin(Stdio::piped())
@@ -382,7 +436,6 @@ fn run_sandboxed(
         .spawn()
         .map_err(|value| error("SCRIPT.SANDBOX_UNAVAILABLE", format!("{value}")))?;
 
-    let _ = seconds;
     finish(&mut child, inputs, budget, max_output_bytes, true)
 }
 
@@ -575,6 +628,19 @@ mod tests {
                 "partial isolation must not be reported as full"
             );
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_availability_checks_every_required_executable() {
+        let report = availability();
+        assert_eq!(
+            report["state"] == "available",
+            which("bwrap").is_some()
+                && which("prlimit").is_some()
+                && Path::new("/usr/bin/python3").is_file()
+        );
+        assert!(report["missing"].is_array());
     }
 
     #[test]

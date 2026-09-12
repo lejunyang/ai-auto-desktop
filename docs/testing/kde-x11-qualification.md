@@ -34,7 +34,12 @@ fresh snapshot 读取同一显示控件的 `3`。这不改变上表四应用只�
 
 ## 安全和隔离
 
-入口是 `tests/linux/kde_app_qualifier.py`。外层恢复当前用户的 KDE/X11 display 后，
+> 本节及后续复测记录描述迁移前的历史 qualification harness。对应 Python runner 已在
+> Rust provider 与非 Python Qt fixture 建立后删除，不再是当前 CI 或发布入口。当前自动回归
+> 使用 `tests/linux/run-rust-atspi-fixture.sh`；如需恢复旧真实应用矩阵，应以 Rust 编写新的
+> qualifier，而不是恢复第二套 Python provider/runtime。
+
+历史入口曾由 Python qualifier 提供。它在外层恢复当前用户的 KDE/X11 display 后，
 通过 `dbus-run-session` 创建私有 session bus；AT-SPI bus 也由该私有会话按需启动。
 `HOME`、XDG config/cache/data/state/runtime 均为临时目录，因此不会加载或修改用户配置。
 
@@ -69,21 +74,17 @@ PID、进程组和 Linux `/proc` starttime 有界清理已观测到的自有进�
 `--app` 子集运行可用于定向诊断并照常写 JSON，但不是完整矩阵，因此 qualifier 和严格
 验真器都会返回非 0，不能将子集误当成整套资格通过。
 
-运行：
+上述历史 qualifier 与验真器已随 Python 副本删除。当前可重复的自动测试命令是：
 
 ```bash
-PYTHONPATH=src python tests/linux/kde_app_qualifier.py \
-  --output artifacts/kde-x11-qualification.json
+tests/linux/run-rust-atspi-fixture.sh
 ```
 
-报告需要作为门禁输入时，再运行本地验真器：
-
-```bash
-tests/linux/verify-kde-result.sh artifacts/kde-x11-qualification.json
-```
+它生成私有 Xvfb/AT-SPI 会话并运行 Rust driver；若要重新建立 KDE 真实应用矩阵，需新增
+Rust qualifier 和结果验真器。
 
 验真器只读取不超过 1 MiB 的普通 JSON 文件，拒绝 symlink、非普通文件、重复 JSON key、
-非有限数值与不支持的 schema。它从同版本 `kde_app_qualifier.py` 的 `APP_SPECS` 字面量读取
+非有限数值与不支持的 schema。历史实现从同版本的应用清单常量读取
 必选应用集合（因此 Dolphin、QML fixture 或后续新增项不会被静态名单漏掉），并核对顶层与
 summary 一致性、应用唯一性和完整性、`support_level`、snapshot bounds/`truncated`、
 launch/AT-SPI/snapshot 的 exact PID、聚合且无 UI 文本的 content retention、安全隔离字段、
@@ -91,12 +92,10 @@ cleanup 证明以及零写动作。通过时输出 verifier schema
 `ai-auto-desktop.kde-x11-result-verifier/v1`、`qualified=true` 并返回 0；格式有效但资格不通过
 以及格式不可信时均 fail closed、输出机器可读错误并返回非 0。
 
-确定性契约测试不启动 GUI：
+当前 Rust provider 的确定性契约测试不启动 GUI：
 
 ```bash
-PYTHONPATH=src python -m unittest \
-  tests.test_linux_kde_qualification \
-  tests.test_linux_kde_result_verifier -v
+cargo test --locked -p aad-atspi
 ```
 
 ## 本机原生复测记录
@@ -121,30 +120,8 @@ PYTHONPATH=src python -m unittest \
   注入按键。`XTEST` 扩展可见不等于锁屏后的应用能够接收事件，因此本轮不能声明
   已解锁 KDE 桌面的 `type_text` 端到端通过。
 
-定向命令与输出摘要：
-
-```bash
-# 安装本轮唯一缺少的测试入口；其余 GTK/Qt/AT-SPI/X11 开发依赖均已存在
-sudo -n apt-get install -y --no-install-recommends python3-pytest
-# 结果：0 upgraded, 7 newly installed；python3-pytest 7.2.1-2
-
-PYTHONPATH=src /usr/bin/python3 -m pytest -q \
-  tests/test_linux_atspi_driver.py tests/test_linux_kde_qualification.py
-# 结果：36 passed in 0.70s
-
-sh plugins/linux_atspi/build_x11_xtest_helper.sh
-# 结果：生成 .build/x11_xtest_helper；链接 libX11.so.6 与 libXtst.so.6
-
-PYTHONPATH=src PYTHONDONTWRITEBYTECODE=1 /usr/bin/python3 -m unittest -q \
-  tests.test_linux_atspi_native
-# 结果：20 tests，OK（skipped=6）；其中 NativeIsolatedX11ActionTests 为 12 tests，
-# OK（skipped=1）。KCalc 的 semantic/pointer 两条 1+2=3 与 QML Press 均由 fresh
-# snapshot 验证
-
-PYTHONPATH=src /usr/bin/python3 tests/linux/kde_app_qualifier.py \
-  --output artifacts/kde-x11-qualification.json
-# 结果：4 supported, 0 unsupported, 0 error；总耗时 7600.11 ms
-```
+当时的定向命令和计数属于历史证据，不再作为当前仓库可执行说明。Rust 迁移后的复测记录
+以 `cargo test --workspace --exclude aad-gui --locked` 和上面的 native fixture 为准。
 
 native suite 的五个 skip 均有明确边界：Atspi typelib 已安装而无需测试 Gio
 fallback；长期桌面 registry 当时没有应用，两个基础设施 smoke 因此跳过；System

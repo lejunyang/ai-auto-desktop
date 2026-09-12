@@ -1,35 +1,39 @@
 # 桌面自动化运行时架构
 
-> 状态：目标架构草案，基线日期 2026-08-24。本文区分当前 Python v0 纵向切片与面向产品的目标架构；未完成项不构成能力承诺。
+> 状态：Rust 实现与后续目标架构，更新于 2026-09-12。未完成项不构成能力承诺。
 
 ## 1. 设计目标与边界
 
-本项目采用 **Python-first、Rust-ready** 路线：先用 Python 验证描述符、控制流、超时、错误与进程插件边界，待协议和运行语义经真实平台验证后，再把可信常驻核心逐步迁移到 Rust。Python 不是临时随手脚本，Rust 也不是为了语言而重写；二者必须共享语言无关的计划模型、错误模型和进程协议。
+本项目已经完成 **Rust 可信核心**迁移：描述符、表达式、调度、持久化、provider host、OCR
+和三端 platform adapter 都由 Rust 维护。macOS 保留签名 Swift helper，Linux 保留最小 C++
+X11 helper；仓库不再维护第二套 Python 产品实现。工作流 `script` 仍可显式调用用户机器上的
+Python 解释器，这是受限运行能力，不是项目实现依赖。
 
 运行时负责把已经声明的工作流可靠地执行出来，不负责相信或延续规划器的自由推理。核心原则是：
 
 - LLM / Planner 是不可信输入源，只能提交声明式 descriptor、locator、action 和期望结果。
 - Trusted Host 负责编译、校验、策略判定、能力授权、调度、取消、结果核验和审计；规划器不能直接取得平台句柄、进程权限或 secret 明文。
-- 第三方能力、平台 driver、OCR 和任意 script 都是进程外 worker，不以内嵌 Python import、动态库或 `eval/exec` 作为安全边界。
+- 第三方能力可作为进程外 worker；内置平台 driver 和 OCR 通过 Rust trait 边界注册。任意
+  script 必须在受限子进程中运行，不能以内嵌解释器或语言级限制冒充安全边界。
 - 三端共用计划 IR、协议和策略语义，但 Windows UIA、macOS AX、Linux AT-SPI/Wayland 必须分别实现和发布。
 - Accessibility 和确定性接口优先；视觉与 OCR 只能由 descriptor 显式请求，不能在失败后偷偷扫描整屏。
 - 对未知应用只提供 best effort；登录、锁屏、UAC、凭据界面等安全桌面默认拒绝。
 
 ## 2. 当前 v0 与目标态
 
-| 方面 | 当前 Python v0 子集 | 目标态 |
+| 方面 | 当前 Rust 实现 | 目标态 |
 |---|---|---|
 | 描述符 | JSON/YAML 都归一到唯一形状：`apiVersion: ai-auto-desktop.dev/v1alpha1`、`kind: Workflow`、`metadata.name`；严格校验并编译为冻结模型 | 版本化 canonical schema、迁移工具、签名与兼容策略 |
-| 表达式 | 白名单 Python AST 的只读解释器，不使用 `eval/exec`，禁止所有函数和方法调用 | 保持无 I/O、有限成本、跨语言一致的表达式语义与测试向量 |
+| 表达式 | Rust 白名单 parser/evaluator，不使用宿主语言求值，禁止所有函数和方法调用 | 保持无 I/O、有限成本和稳定语义与测试向量 |
 | 步骤与控制流 | `action/set/block/fail/return/script`、`if/switch/foreach/while`、`on_error/finally`；sibling DAG 已支持有界只读并发；受限串行计划支持顶层安全点恢复，显式 opt-in 后支持具备投影契约的顶层只读 action 与 `action_intent` v2 重放；script 默认拒绝 | 写 action/script reconciliation 与更通用的可恢复计划状态机 |
 | 状态 | run 结果为 `succeeded/failed/timed_out/cancelled/unknown_effect`，step 另有 `skipped` | 冻结跨语言状态兼容与迁移规则 |
-| 执行能力 | 已有 Windows UIA、macOS AX、Linux KDE/X11 AT-SPI 进程 driver、三端显式文本输入、受限中心点左键 `pointer_click` 和显式图片 OCR；资格范围分别记录 | 真实应用矩阵、受控截图与应用专用 adapter |
+| 执行能力 | Rust Windows UIA、Linux AT-SPI、macOS AX adapter、三端显式输入、Linux 目标截图与 Rust Tesseract OCR；资格范围分别记录 | 扩展真实应用矩阵、受控截图与应用专用 adapter |
 | IPC | stdio NDJSON v0 控制面；声明图片 slot 的 action 使用 AADF v1 私有数据面：POSIX 为 Unix socket，Windows 为受保护 ACL、单实例、双向 PID 校验的 named pipe；已校验 manifest、action major、token、摘要、大小和原子发布，尚无完整 wire 协商 | 保留语义兼容层，迁移到 Protobuf/CBOR 等 IDL + named pipe/Unix socket |
-| 隔离 | process plugin 使用 POSIX 进程组；Linux script 使用 bubblewrap + prlimit，其他平台 fail-closed | Windows Job Object/restricted token；macOS 受控 helper；Linux bubblewrap/OCI；资源与 capability 限额 |
+| 隔离 | process plugin 使用进程组/Windows Job Object；Linux script 使用 bubblewrap + prlimit，Windows script 使用 Job Object 但因无网络/文件系统隔离标为 degraded，macOS fail-closed | Windows restricted token/AppContainer；macOS 受控 helper；资源与 capability 限额 |
 | 安全 | 结构化错误、script fail-closed、action risk policy、manifest 与 action I/O schema 校验；确认 token/taint 等尚未实现 | 签名插件、系统 secret store、确认 token、完整 taint enforcement、审计与更新回滚 |
-| 平台能力 | 已有只读三端 probe、Windows UIA 与 macOS AX process driver，以及 Linux KDE/X11 AT-SPI 纵向切片；Linux 自有 GTK3/Qt5 fixture 已通过，Windows/macOS 真机结果待回传 | 各平台按真实应用矩阵分级支持 |
+| 平台能力 | 三端只读 probe 和原生 provider；Linux Qt fixture 本机通过，Windows Rust fixture 在 CI 编译并可显式执行，macOS 构建/握手由 macOS CI 执行 | 各平台按真实应用矩阵分级支持 |
 
-v0 的价值是锁定运行语义并建立故障测试夹具。Windows UIA driver 已开始调用真实原生接口，但在真实 Windows runner 的 fixture app、UIPI 与权限矩阵通过前，仍不能把跨平台 contract 测试当作产品成功率。
+现有 fixture 用于锁定运行语义与故障边界，不能替代第三方应用成功率。
 
 ## 3. 信任与进程边界
 
@@ -86,9 +90,11 @@ Host 还应维护全局 `max_steps`、`max_events`、`max_output_bytes` 等防�
 
 ## 5. 调度、单写者与确定性回退
 
-一个物理 desktop session 同时只发放一个 writer lease。所有可能改变窗口、焦点、键鼠或剪贴板的步骤串行进入 writer；纯 snapshot、OCR 和无副作用计算只有在声明为 read-only 且不会读取不一致前台状态时才可并发。检测到用户键鼠介入、session 切换、锁屏或 driver generation 变化时，暂停新写入并重新观察。
+目标态要求一个物理 desktop session 同时只发放一个 writer lease。当前实现尚未提供跨进程
+desktop writer coordinator；单个 workflow 内的写步骤会串行，但两个独立 `aad` 进程仍可能竞争
+同一桌面。用户介入检测也尚未实现。达成这两项前不能把“单 writer / 自动暂停”当成已交付保证。
 
-当前 Python v0 调度器已经按每个 sibling scope 的 `depends_on` 拓扑调度，声明顺序只用于稳定选择和确定性合并。省略依赖的 legacy step 在编译期形成链，因此保持串行；显式 `depends_on: []` 才能建立独立分支。首版并发面刻意收窄为经 provider contract 确认为 `read_only`、没有 retry/handler/finally、也不请求 `desktop.input` 的 action。`set`、script、控制流容器、return/fail 及任何非只读 action 都是全局独占屏障，必须等已在途读取完成后才能运行。
+当前 Rust 调度器已经按每个 sibling scope 的 `depends_on` 拓扑调度，声明顺序只用于稳定选择和确定性合并。省略依赖的 legacy step 在编译期形成链，因此保持串行；显式 `depends_on: []` 才能建立独立分支。首版并发面刻意收窄为经 provider contract 确认为 `read_only`、没有 retry/handler/finally、也不请求 `desktop.input` 的 action。`set`、script、控制流容器、return/fail 及任何非只读 action 都是全局独占屏障，必须等已在途读取完成后才能运行。
 
 并发 action 各自在隔离的 context/variable snapshot 上求值；事件通过线程安全出口按实际发生顺序实时发布，主调度线程在整批结束后再按 descriptor 顺序提交 `steps.<id>` 结果。只读 worker 若改写 variables、非 step context、已有 step 记录或其他 step 的结果，运行时以 `RUNTIME.CONTEXT_CONFLICT` 失败关闭。guard 为 false 的 `SKIPPED` step 只有在自身 `finally` 完成后才满足依赖；`SUCCEEDED` 和 handler `continue` 同样满足依赖。首个未处理失败、return 或取消一旦被观察到，调度器不再启动新 step：尚未派发的 step 记录为 `scope_terminated`；已派发的 peer 保留真实终态和事件，并以 `discarded_due_to_scope_termination` 标明其结果不再对后续步骤可见。运行时等待所有已派发 action 返回后再进入外层 handler/finally。`max_executed_steps` 的 attempt 预留在线程间原子执行，workflow deadline 与每个 worker 的父 deadline snapshot 共同约束并发任务；取消和 deadline unwind 时，step/workflow `finally` 使用独立的 cleanup deadline。
 
@@ -115,13 +121,16 @@ observe → resolve → precondition → policy/confirm → dispatch
 
 ## 6. 工作进程与平台驱动
 
-### 6.1 公共工作进程契约
+### 6.1 Provider 与工作进程契约
 
-capability、driver、OCR 与 script worker 都是长驻或按步启动的子进程，stdout 仅承载协议帧，诊断只写 stderr。Host 必须持续 drain 两条管道、限制单帧和总输出、检测重复/未知 request ID、处理半帧与非法 JSON，并对崩溃实施熔断，而不是无限重启。
+内置 driver/OCR 通过 Rust `Provider` trait 调用；外部 capability plugin 与 script worker
+仍是长驻或按步启动的子进程。外部协议 stdout 仅承载协议帧，诊断只写 stderr。Host 必须持续
+drain 两条管道、限制单帧和总输出、检测重复/未知 request ID、处理半帧与非法 JSON，并对崩溃
+实施熔断，而不是无限重启。
 
 - Capability worker：对应用业务 API、浏览器 DOM、文件/数据转换等窄能力做进程外适配，只能调用 manifest 声明且经 policy 授权的 action。
-- Driver worker：窗口枚举、snapshot、语义动作、输入与截图；不负责 workflow 控制流。
-- OCR worker：输入由 Host 获取且带 frame/region provenance 的图像，输出文本、bounds、language、confidence；不产生或执行点击。
+- 内置 Driver provider：窗口枚举、snapshot、语义动作、输入与截图；不负责 workflow 控制流。macOS AX helper 是单独的 TCC/ABI 边界。
+- 内置 OCR provider：输入由 Host 获取且带 frame/region provenance 的图像；Tesseract 引擎仍在受限子进程中运行，输出文本、bounds、language、confidence，不产生或执行点击。
 - Script worker：v0 默认禁用；显式 `--allow-scripts` 后仅在具备 bubblewrap 和 `prlimit` 的 Linux 上运行，使用私有网络/PID namespace、空环境、无 host home/`/etc` 挂载及 CPU/内存/输出限制；其他平台 fail-closed。后续增加 Windows restricted token + Job Object 和 macOS 受控 helper。
 
 ### 6.2 平台拆分
@@ -171,7 +180,7 @@ checkpoint，因此 durable action 在预检阶段拒绝任何 `artifacts` 契�
 
 Host 写入并 flush 请求成功后，将插件错误、timeout、EOF 和协议错误标记为 `details.dispatched=true`；写前失败则为 false 或缺省。当前每个进程只允许一个 in-flight 请求，没有 streaming、请求级 cancel、自动重启或进程池；timeout/EOF/协议错误会 fail-stop 并回收整个插件进程。stderr 只保留有界 tail，stdout 行与内部队列也必须有界。
 
-NDJSON v0 是 bootstrap transport，不是长期 ABI。目标协议要补齐 major/minor 协商、最大帧、显式 cancel、ready/accepted 边界、capability、心跳和敏感字段标记。迁移到 Protobuf/CBOR 等语言无关 IDL 与 Unix domain socket / Windows named pipe 时，应保持 request/result/error/deadline/capability 的领域语义，并用双栈契约测试完成滚动迁移。Python、Rust、Swift 和将来的其他 worker 不共享内存布局，也不暴露语言对象序列化。
+NDJSON v0 是 bootstrap transport，不是长期 ABI。目标协议要补齐 major/minor 协商、最大帧、显式 cancel、ready/accepted 边界、capability、心跳和敏感字段标记。迁移到 Protobuf/CBOR 等语言无关 IDL 与 Unix domain socket / Windows named pipe 时，应保持 request/result/error/deadline/capability 的领域语义，并用双栈契约测试完成滚动迁移。Rust、Swift 和将来的其他 worker 不共享内存布局，也不暴露语言对象序列化。
 
 ## 8. 截止时间、取消、重试与效果不确定性
 
@@ -185,7 +194,8 @@ workflow deadline
 
 墙钟时间只用于审计展示；调度判断使用 monotonic clock，wire 中的 epoch deadline 由发送端在边界处换算并保留剩余预算。取消顺序为：停止调度和 retry timer → 发协议 cancel（协议支持后）→ 关闭能力与 stdin → 宽限期 → 终止进程树 → 释放 writer lease → 尽可能重新 observe/reconcile。
 
-POSIX worker 使用独立 session/process group，先 `SIGTERM`、宽限期后 `SIGKILL`。当前纯标准库 Windows v0 只能创建新 process group 后对直接进程 terminate/kill，**不能保证终止任意 descendant tree**；正式桌面写能力上线前必须由 Job Object 或等价 supervisor 补齐。取消 Python future 或杀掉父 PID 都不足以证明工作已停止。
+POSIX worker 使用独立 session/process group，先 `SIGTERM`、宽限期后 `SIGKILL`。Windows
+script 子进程使用 Job Object 限制并回收整棵进程树。只终止直接父 PID 不足以证明工作已停止。
 
 retry 需要同时满足：错误 `retryable=true`、step 被声明为 `read_only` 或 `idempotent`、deadline 尚有预算。非幂等的 click/invoke/send/delete/pay/install 在 dispatch 后超时、worker EOF 或 driver 崩溃时返回 `UNKNOWN_EFFECT`，禁止自动重放；Host 只能在重新观察并证明未生效后，由明确策略决定后续动作。
 
@@ -261,8 +271,12 @@ Run 和 step 的终态统一使用：
 - 审计记录 descriptor/plan digest、actor、worker build/hash、capability、deadline、locator、候选决策、确认、dispatch/accepted/terminal、postcondition、状态和错误；secret 明文、受保护文本和未经许可的截图不入日志。
 - 截图默认本地、短 TTL、区域最小化；上传或长期保留需独立授权。审计存储需要访问控制、完整性校验、保留策略和可追踪删除。
 
-## 11. Rust 迁移约束
+## 11. Rust 迁移状态
 
-满足以下条件前不迁移核心：descriptor/plan schema 已有版本策略；NDJSON v0 契约测试稳定；真实 driver 给出了性能与可靠性瓶颈证据；取消、错误、effect 与 journal 语义已经冻结；Python 与 Rust 可运行同一批 conformance fixtures。
+Rust 迁移启动时要求 descriptor/plan schema 有版本策略、NDJSON v0 契约稳定、真实 driver
+给出性能与可靠性依据，并用同一批 conformance fixtures 固定取消、错误、effect 与 journal
+语义。
 
-迁移顺序优先为协议类型/错误模型 → supervisor 与进程树治理 → deadline/scheduler/single-writer → policy/secret/audit。OCR/ML 和快速生态插件可以长期留在 Python worker。迁移期间由同一计划摘要、测试向量和 wire contract 保证行为等价，不做一次性全量重写。
+迁移已按协议类型/错误模型 → supervisor → deadline/scheduler → platform provider → OCR
+完成。后续重心是 single-writer、policy/secret/audit 和真实应用资格，不再维护 Python
+runtime/provider 副本。

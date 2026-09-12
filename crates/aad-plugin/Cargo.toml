@@ -6,6 +6,10 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "NDJSON subprocess plugin host for ai-auto-desktop"
+autobins = false
+
+[features]
+test-fixture = []
 
 [dependencies]
 aad-core = { workspace = true }
@@ -29,3 +33,15 @@ serde_json = { workspace = true }
 # Inherit the workspace's deliberate lint allowances (see the root Cargo.toml).
 [lints]
 workspace = true
+
+[[bin]]
+name = "aad-plugin-fixture"
+path = "src/bin/aad-plugin-fixture.rs"
+required-features = ["test-fixture"]
+test = false
+bench = false
+
+[[test]]
+name = "process_plugin"
+path = "tests/process_plugin.rs"
+required-features = ["test-fixture"]

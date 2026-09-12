@@ -18,8 +18,11 @@ Wine 可以作为补充测试环境，但不能代替 Windows 真机或 Windows 
 
 ## 适合放进 Wine CI 的测试
 
+> 下列启动器/comtypes 项是迁移前的历史测试建议。当前生产实现为 Rust，Windows
+> native fixture 已直接进入 Windows CI；Wine 仍只能作为较低层兼容性补充。
+
 1. 交叉编译并启动最小 PE 控制台程序。
-2. 验证 `run.cmd` 的路径引用、参数转发和退出码。
+2. 验证 Rust Windows 可执行文件的启动、参数转发和退出码。
 3. 验证 NDJSON 编解码、孤立代理项、超大帧和结构化错误。
 4. 验证 Win32 `EnumWindows`、窗口标题、类名和进程 ID 等基础元数据。
 5. 验证 Windows 路径、反斜杠、盘符、临时目录和 Unicode 文件名。
@@ -29,7 +32,7 @@ Wine 可以作为补充测试环境，但不能代替 Windows 真机或 Windows 
 
 ## 必须在真实 Windows 上测试的内容
 
-- `CUIAutomation` COM 激活与 `comtypes` 类型库生成。
+- `CUIAutomation` COM 激活与 Rust `windows` binding。
 - 真实 UIA Control View 遍历、RuntimeId、`CompareElements`。
 - `InvokePattern`、`ValuePattern`、`SetFocus` 及动作后的重新观察。
 - Windows 10/11、不同架构、32/64 位目标应用组合。
@@ -47,15 +50,16 @@ Linux 普通 CI
   └─ OCR 固定样例
 
 Linux + Wine + Xvfb
-  ├─ Windows 启动器与 PE smoke
+  ├─ Windows Rust 可执行文件与 PE smoke
   ├─ NDJSON / 路径 / UTF-8 / 退出码
   └─ Win32 窗口枚举
 
 真实 Windows runner 或 VM
-  ├─ UIAutomationCore + comtypes
+  ├─ UIAutomationCore + Rust windows binding
   ├─ fixture app 全动作闭环
   ├─ 权限、UIPI、Job Object、DPI
   └─ 真实应用资格矩阵
 ```
 
-下一步应优先增加真实 Windows CI runner 和一个标准库 Win32 fixture app；Wine smoke 可同时加入，但应作为较低层的兼容性门，而不是 Windows 驱动的发布门。
+当前 Windows CI 已包含 Rust Win32 fixture；Wine smoke 可作为较低层的兼容性门，但不能替代
+真实 Windows driver 测试。
