@@ -119,6 +119,57 @@ impl CaptureLimits {
     }
 }
 
+/// Which mouse button a pointer gesture uses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum PointerButton {
+    #[default]
+    Left,
+    Right,
+    Middle,
+}
+
+/// A scroll direction. Named rather than a signed delta, so the caller states
+/// intent ("scroll down") and never a screen quantity that could stand in for a
+/// coordinate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScrollDirection {
+    Up,
+    Down,
+    Left,
+    Right,
+}
+
+/// A scroll request: which way, and how many notches (a notch is one wheel
+/// detent, WHEEL_DELTA).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScrollSpec {
+    pub direction: ScrollDirection,
+    pub notches: u32,
+}
+
+/// Everything a pointer gesture beyond a plain left click needs.
+///
+/// The point acted on is always derived inside the backend from the element's
+/// bounds and `fraction`; a caller never supplies a screen coordinate, which is
+/// what keeps the "observe first" rule intact for pointer actions too.
+#[derive(Clone, Debug, Default)]
+pub struct PointerGesture {
+    /// Which button. Defaults to the left button.
+    pub button: PointerButton,
+    /// 1 for a single click, 2 for a double click.
+    pub count: u8,
+    /// Where inside the first (or only) element to act, as (fx, fy) each in
+    /// 0.0..=1.0. `None` means the centre, matching a plain click.
+    pub fraction: Option<(f64, f64)>,
+    /// Where inside the destination element to release a drag. `None` means its
+    /// centre. Ignored by single-element gestures.
+    pub to_fraction: Option<(f64, f64)>,
+    /// When set, the gesture is a scroll rather than a click.
+    pub scroll: Option<ScrollSpec>,
+    /// When set, the gesture hovers: move to the point and dwell this long.
+    pub hover_ms: Option<u64>,
+}
+
 /// The operations a platform backend must provide.
 pub trait Backend: Send + Sync {
     /// Enumerate top-level windows that a user could interact with.
@@ -154,6 +205,42 @@ pub trait Backend: Send + Sync {
         Err(DriverError::new(
             "DRIVER.ACTION_UNSUPPORTED",
             "sending key combinations is not implemented on this platform yet",
+        ))
+    }
+
+    /// Perform a pointer gesture on a single element: a right or middle click, a
+    /// double click, a scroll, a hover, or a click at a fraction of the element
+    /// rather than its centre. The point is computed from the element's bounds,
+    /// never given by the caller.
+    ///
+    /// Defaulted to a clear refusal so a backend that lacks it still compiles.
+    fn pointer_gesture(
+        &self,
+        _window_id: &str,
+        _node: &Node,
+        _gesture: &PointerGesture,
+    ) -> Result<()> {
+        Err(DriverError::new(
+            "DRIVER.ACTION_UNSUPPORTED",
+            "pointer gestures are not implemented on this platform yet",
+        ))
+    }
+
+    /// Drag from one element to another: press at the first, move across, and
+    /// release at the second. Both ends are observed elements; the path between
+    /// them is interpolated, so no leg of the drag is a caller-supplied point.
+    ///
+    /// Defaulted to a clear refusal so a backend that lacks it still compiles.
+    fn drag(
+        &self,
+        _window_id: &str,
+        _from: &Node,
+        _to: &Node,
+        _gesture: &PointerGesture,
+    ) -> Result<()> {
+        Err(DriverError::new(
+            "DRIVER.ACTION_UNSUPPORTED",
+            "drag is not implemented on this platform yet",
         ))
     }
 

@@ -71,7 +71,7 @@ fn locator_schema() -> Value {
             },
             "actions": {
                 "type": "array",
-                "items": {"enum": ["focus", "invoke", "set_value", "type_text", "pointer_click", "key_chord"]}
+                "items": {"enum": ["focus", "invoke", "set_value", "type_text", "pointer_click", "key_chord", "pointer_gesture", "drag"]}
             },
             "match": {"enum": ["exact", "contains"], "default": "exact"},
             "within": {
@@ -303,9 +303,9 @@ focuses it first.",
                     "keys": {
                         "type": "array",
                         "description": "The combination, e.g. [\"ctrl\",\"c\"], \
-[\"f5\"], [\"shift\",\"end\"]. Modifiers: ctrl, shift, alt, win. Main keys: letters, \
-digits, f1-f12, enter, tab, esc, space, backspace, delete, insert, home, end, \
-pageup, pagedown, and the arrow keys. At most one non-modifier key.",
+            [\"f5\"], [\"shift\",\"end\"]. Modifiers: ctrl, shift, alt, win. Main keys: letters, \
+            digits, f1-f12, enter, tab, esc, space, backspace, delete, insert, home, end, \
+            pageup, pagedown, and the arrow keys. At most one non-modifier key.",
                         "items": {"type": "string"},
                         "minItems": 1,
                         "maxItems": 6
@@ -317,7 +317,110 @@ pageup, pagedown, and the arrow keys. At most one non-modifier key.",
             mutating: true,
         },
         Tool {
+            name: "pointer_gesture",
+            description: "Right-click, middle-click, double-click, scroll or hover on an \
+element. Prefer invoke or pointer_click for a plain activation; use this for a \
+context menu (right button), a double activation, a wheel scroll, or a hover \
+that reveals a tooltip or menu. The element is always the anchor -- the point \
+acted on is derived from it, never given as a screen coordinate.",
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "target": target_schema(),
+                    "button": {
+                        "enum": ["left", "right", "middle"],
+                        "description": "Which button. Defaults to left."
+                    },
+                    "count": {
+                        "type": "integer",
+                        "enum": [1, 2],
+                        "description": "1 for a single click, 2 for a double click. Defaults to 1."
+                    },
+                    "fraction": {
+                        "type": "object",
+                        "description": "Where inside the element to act, as a fraction of its \
+            box: fx and fy each from 0.0 (left/top) to 1.0 (right/bottom). Omit for the centre. This is a \
+            position within the observed element, not a screen location.",
+                        "properties": {
+                            "fx": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+                            "fy": {"type": "number", "minimum": 0.0, "maximum": 1.0}
+                        },
+                        "required": ["fx", "fy"],
+                        "additionalProperties": false
+                    },
+                    "scroll": {
+                        "type": "object",
+                        "description": "Scroll over the element instead of clicking. Give a \
+            direction and how many notches.",
+                        "properties": {
+                            "direction": {"enum": ["up", "down", "left", "right"]},
+                            "notches": {
+                                "type": "integer", "minimum": 1, "maximum": 30,
+                                "description": "Wheel detents to scroll. Defaults to 3."
+                            }
+                        },
+                        "required": ["direction"],
+                        "additionalProperties": false
+                    },
+                    "hover_ms": {
+                        "type": "integer",
+                        "minimum": 1, "maximum": 5000,
+                        "description": "Hover: move to the element and dwell this many \
+            milliseconds, e.g. to raise a tooltip. Mutually exclusive with a click."
+                    }
+                },
+                "required": ["target"],
+                "additionalProperties": false
+            }),
+            mutating: true,
+        },
+        Tool {
+            name: "drag",
+            description: "Drag from one element to another: press on the first, glide across, \
+release on the second. Both ends are observed elements, given as targets; the \
+path between them is filled in, so no part of the drag is a raw coordinate. Use \
+for reordering a list, moving an item between panes, or a slider handle to a \
+second element.",
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "target": target_schema(),
+                    "to": target_schema(),
+                    "button": {
+                        "enum": ["left", "right", "middle"],
+                        "description": "Which button to hold during the drag. Defaults to left."
+                    },
+                    "fraction": {
+                        "type": "object",
+                        "description": "Where inside the source element to grab, as a \
+            fraction (fx, fy in 0.0..1.0). Omit for its centre.",
+                        "properties": {
+                            "fx": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+                            "fy": {"type": "number", "minimum": 0.0, "maximum": 1.0}
+                        },
+                        "required": ["fx", "fy"],
+                        "additionalProperties": false
+                    },
+                    "to_fraction": {
+                        "type": "object",
+                        "description": "Where inside the destination element to release. \
+            Omit for its centre.",
+                        "properties": {
+                            "fx": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+                            "fy": {"type": "number", "minimum": 0.0, "maximum": 1.0}
+                        },
+                        "required": ["fx", "fy"],
+                        "additionalProperties": false
+                    }
+                },
+                "required": ["target", "to"],
+                "additionalProperties": false
+            }),
+            mutating: true,
+        },
+        Tool {
             name: "probe_environment",
+
             description: "Report whether this machine can support desktop automation, and \
 what limits apply, such as a remote session or a non-elevated process.",
             schema: json!({"type": "object", "properties": {}, "additionalProperties": false}),
@@ -527,7 +630,8 @@ pub fn call(driver: &Arc<UiaDriver>, name: &str, arguments: &Value) -> Result<Va
         "overview_window" => "overview",
         "describe_window" => "describe",
         "find_element" => "find",
-        "focus" | "invoke" | "set_value" | "type_text" | "pointer_click" | "key_chord" => name,
+        "focus" | "invoke" | "set_value" | "type_text" | "pointer_click" | "key_chord"
+        | "pointer_gesture" | "drag" => name,
         other => return Err(format!("unknown tool {other:?}")),
     };
 

@@ -388,6 +388,10 @@ enum DoCommand {
     TypeText(TextArgs),
     /// Press a key combination on an element, e.g. Ctrl+C or F5.
     KeyChord(ChordArgs),
+    /// Right/middle/double click, scroll or hover on an element.
+    Gesture(GestureArgs),
+    /// Drag from one element to another.
+    Drag(DragArgs),
 }
 
 #[derive(Args)]
@@ -426,6 +430,59 @@ struct ChordArgs {
     /// `ctrl,c`, `f5`, `shift,end`.
     #[arg(long, value_name = "KEYS")]
     keys: String,
+}
+
+#[derive(Args)]
+struct GestureArgs {
+    /// The element to act on, as printed by `aad find`.
+    #[arg(long, value_name = "REF")]
+    target: String,
+    /// Which button: left, right or middle. Defaults to left.
+    #[arg(long, conflicts_with_all = ["scroll", "hover_ms"])]
+    button: Option<String>,
+    /// Click count: 1 or 2 (double click). Defaults to 1.
+    #[arg(long, conflicts_with_all = ["scroll", "hover_ms"])]
+    count: Option<u64>,
+    /// Scroll direction: up, down, left or right. Makes this a scroll.
+    #[arg(long, value_name = "DIR", conflicts_with = "hover_ms")]
+    scroll: Option<String>,
+    /// Scroll notches (with --scroll). Defaults to 3.
+    #[arg(long, requires = "scroll")]
+    notches: Option<u64>,
+    /// Hover this many milliseconds instead of clicking.
+    #[arg(long, value_name = "MS", conflicts_with = "scroll")]
+    hover_ms: Option<u64>,
+    /// Horizontal position inside the element, 0.0..1.0 (with --fy).
+    #[arg(long, requires = "fy")]
+    fx: Option<f64>,
+    /// Vertical position inside the element, 0.0..1.0 (with --fx).
+    #[arg(long, requires = "fx")]
+    fy: Option<f64>,
+}
+
+#[derive(Args)]
+struct DragArgs {
+    /// The element to drag from, as printed by `aad find`.
+    #[arg(long, value_name = "REF")]
+    target: String,
+    /// The element to drag to, as printed by `aad find`.
+    #[arg(long, value_name = "REF")]
+    to: String,
+    /// Which button to hold during the drag. Defaults to left.
+    #[arg(long)]
+    button: Option<String>,
+    /// Horizontal grab position inside the source, 0.0..1.0 (with --fy).
+    #[arg(long, requires = "fy")]
+    fx: Option<f64>,
+    /// Vertical grab position inside the source, 0.0..1.0 (with --fx).
+    #[arg(long, requires = "fx")]
+    fy: Option<f64>,
+    /// Horizontal release position inside the destination, 0.0..1.0 (with --to-fy).
+    #[arg(long, requires = "to_fy")]
+    to_fx: Option<f64>,
+    /// Vertical release position inside the destination, 0.0..1.0 (with --to-fx).
+    #[arg(long, requires = "to_fx")]
+    to_fy: Option<f64>,
 }
 
 #[derive(Args)]
@@ -857,6 +914,60 @@ fn dispatch(command: &Command) -> (Value, u8) {
                         .map(str::to_string)
                         .collect();
                     ("key_chord", &args.target, json!({ "keys": keys }))
+                }
+                DoCommand::Gesture(args) => {
+                    let mut extra = serde_json::Map::new();
+                    if let Some(button) = &args.button {
+                        extra.insert("button".into(), json!(button));
+                    }
+                    if let Some(count) = args.count {
+                        extra.insert("count".into(), json!(count));
+                    }
+                    if let Some(dir) = &args.scroll {
+                        let mut scroll = serde_json::Map::new();
+                        scroll.insert("direction".into(), json!(dir));
+                        if let Some(notches) = args.notches {
+                            scroll.insert("notches".into(), json!(notches));
+                        }
+                        extra.insert("scroll".into(), Value::Object(scroll));
+                    }
+                    if let Some(ms) = args.hover_ms {
+                        extra.insert("hover_ms".into(), json!(ms));
+                    }
+                    if let (Some(fx), Some(fy)) = (args.fx, args.fy) {
+                        extra.insert("fraction".into(), json!({ "fx": fx, "fy": fy }));
+                    }
+                    ("pointer_gesture", &args.target, Value::Object(extra))
+                }
+                DoCommand::Drag(args) => {
+                    // The destination is a second reference; resolve it the same
+                    // way the primary target is resolved below, so both accept a
+                    // compact ref or raw JSON.
+                    let to: Value = match serde_json::from_str::<Value>(&args.to) {
+                        Ok(value) if value.is_object() => value,
+                        _ => match aad_uia::Target::parse_ref(&args.to) {
+                            Ok(target) => target.to_json(),
+                            Err(error) => {
+                                return (
+                                    json!({"code": "CLI.INVALID_ARGUMENT",
+                                           "message": format!("bad --to reference: {error}")}),
+                                    EXIT_USAGE,
+                                );
+                            }
+                        },
+                    };
+                    let mut extra = serde_json::Map::new();
+                    extra.insert("to".into(), to);
+                    if let Some(button) = &args.button {
+                        extra.insert("button".into(), json!(button));
+                    }
+                    if let (Some(fx), Some(fy)) = (args.fx, args.fy) {
+                        extra.insert("fraction".into(), json!({ "fx": fx, "fy": fy }));
+                    }
+                    if let (Some(fx), Some(fy)) = (args.to_fx, args.to_fy) {
+                        extra.insert("to_fraction".into(), json!({ "fx": fx, "fy": fy }));
+                    }
+                    ("drag", &args.target, Value::Object(extra))
                 }
             };
 
@@ -2300,6 +2411,49 @@ mod tests {
             let has_target = sub.get_arguments().any(|arg| arg.get_id() == "target");
             assert!(has_target, "{} must take a target", sub.get_name());
         }
+    }
+
+    #[test]
+    fn pointer_arguments_fail_closed_before_reaching_the_driver() {
+        for args in [
+            vec!["aad", "do", "gesture", "--target", "a:1:b", "--fx", "0.5"],
+            vec![
+                "aad", "do", "gesture", "--target", "a:1:b", "--scroll", "down", "--count", "2",
+            ],
+            vec![
+                "aad",
+                "do",
+                "gesture",
+                "--target",
+                "a:1:b",
+                "--notches",
+                "3",
+            ],
+            vec![
+                "aad", "do", "drag", "--target", "a:1:b", "--to", "c:2:d", "--to-fx", "0.8",
+            ],
+        ] {
+            assert!(
+                Cli::try_parse_from(args).is_err(),
+                "an incomplete or conflicting pointer request must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn drag_accepts_independent_source_and_destination_fractions() {
+        let parsed = Cli::try_parse_from([
+            "aad", "do", "drag", "--target", "a:1:b", "--to", "c:2:d", "--fx", "0.1", "--fy",
+            "0.2", "--to-fx", "0.8", "--to-fy", "0.9",
+        ])
+        .unwrap();
+        let Command::Do(DoCommand::Drag(args)) = parsed.command else {
+            panic!("expected drag command");
+        };
+        assert_eq!(args.fx, Some(0.1));
+        assert_eq!(args.fy, Some(0.2));
+        assert_eq!(args.to_fx, Some(0.8));
+        assert_eq!(args.to_fy, Some(0.9));
     }
 
     #[test]

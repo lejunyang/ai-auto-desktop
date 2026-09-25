@@ -12,7 +12,10 @@
 
 use std::sync::Arc;
 
-use crate::backend::{Backend, CaptureLimits, CapturedTree, DriverError, Result};
+use crate::backend::{
+    Backend, CaptureLimits, CapturedTree, DriverError, PointerButton, PointerGesture, Result,
+    ScrollDirection, ScrollSpec,
+};
 use crate::capture::{CapturedEvent, EventBuffer, EventKind};
 use crate::model::{Bounds, Node, States, WindowInfo};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -101,17 +104,19 @@ use windows::Win32::UI::Accessibility::{
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     MapVirtualKeyW, SendInput, INPUT, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_KEYUP,
     KEYEVENTF_SCANCODE, KEYEVENTF_UNICODE, MAPVK_VK_TO_VSC, MOUSEEVENTF_ABSOLUTE,
-    MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_VIRTUALDESK, MOUSEINPUT,
-    VIRTUAL_KEY, VK_BACK, VK_CONTROL, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_F1, VK_F10, VK_F11,
-    VK_F12, VK_F2, VK_F3, VK_F4, VK_F5, VK_F6, VK_F7, VK_F8, VK_F9, VK_HOME, VK_INSERT, VK_LEFT,
-    VK_LWIN, VK_MENU, VK_NEXT, VK_PRIOR, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_SPACE, VK_TAB, VK_UP,
+    MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN,
+    MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP,
+    MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL, MOUSEINPUT, VIRTUAL_KEY, VK_BACK, VK_CONTROL,
+    VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_F1, VK_F10, VK_F11, VK_F12, VK_F2, VK_F3, VK_F4,
+    VK_F5, VK_F6, VK_F7, VK_F8, VK_F9, VK_HOME, VK_INSERT, VK_LEFT, VK_LWIN, VK_MENU, VK_NEXT,
+    VK_PRIOR, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_SPACE, VK_TAB, VK_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, EnumWindows, GetAncestor, GetClassNameW, GetForegroundWindow,
     GetSystemMetrics, GetWindowRect, GetWindowTextLengthW, GetWindowTextW,
     GetWindowThreadProcessId, IsIconic, IsWindowVisible, PeekMessageW, SetForegroundWindow,
     GA_ROOT, MSG, PM_REMOVE, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
-    SM_YVIRTUALSCREEN, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS,
+    SM_YVIRTUALSCREEN, WHEEL_DELTA, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS,
 };
 
 /// Initialise COM on the calling thread.
@@ -551,8 +556,88 @@ impl Backend for WindowsUiaBackend {
         // if the atomic batch is refused, sending them individually is a
         // faithful fallback. Verified to work on a machine where the batch was
         // refused by an input hook.
-        deliver_atomically(&inputs, "the click")
-            .or_else(|_| deliver_individually(&inputs, "the click"))
+        deliver_with_safe_fallback(&inputs, "the click")
+    }
+
+    fn pointer_gesture(
+        &self,
+        window_id: &str,
+        node: &Node,
+        gesture: &PointerGesture,
+    ) -> Result<()> {
+        let (handle, _) = self.element_for(window_id)?;
+        let point = element_point(node.bounds, gesture.fraction)?;
+
+        // Same reasoning as pointer_click: a background window would misroute
+        // the event, so raise the target first.
+        unsafe {
+            let _ = SetForegroundWindow(handle);
+        }
+        let absolute = to_absolute(point)?;
+
+        if let Some(scroll) = gesture.scroll {
+            return deliver_scroll(absolute, scroll);
+        }
+        if let Some(dwell_ms) = gesture.hover_ms {
+            // Hover is a move and a wait: the point must be reached, then held
+            // long enough for a tooltip or hover menu to appear.
+            let move_to = [mouse_event(absolute, MOUSEEVENTF_MOVE)];
+            deliver_atomically(&move_to, "the hover move")?;
+            std::thread::sleep(Duration::from_millis(dwell_ms.min(MAX_HOVER_MS)));
+            return Ok(());
+        }
+
+        let (down, up) = button_events(gesture.button);
+        let clicks = gesture.count.max(1);
+        let mut inputs = vec![mouse_event(absolute, MOUSEEVENTF_MOVE)];
+        for _ in 0..clicks {
+            inputs.push(mouse_event(absolute, down));
+            inputs.push(mouse_event(absolute, up));
+        }
+        // A click is a move plus ordered press/release pairs; if the atomic
+        // batch is refused, sending the events in order is a faithful fallback,
+        // as with pointer_click.
+        deliver_with_safe_fallback(&inputs, "the pointer gesture")
+    }
+
+    fn drag(
+        &self,
+        window_id: &str,
+        from: &Node,
+        to: &Node,
+        gesture: &PointerGesture,
+    ) -> Result<()> {
+        let (handle, _) = self.element_for(window_id)?;
+        let start = to_absolute(element_point(from.bounds, gesture.fraction)?)?;
+        let end = to_absolute(element_point(to.bounds, gesture.to_fraction)?)?;
+
+        unsafe {
+            let _ = SetForegroundWindow(handle);
+        }
+        let (down, up) = button_events(gesture.button);
+
+        // Press at the start, glide across in interpolated steps, release at the
+        // end. The intermediate points are derived here, never supplied: many
+        // targets only recognise a drag if the pointer visibly travels rather
+        // than teleporting from press to release.
+        let mut inputs = vec![
+            mouse_event(start, MOUSEEVENTF_MOVE),
+            mouse_event(start, down),
+        ];
+        for step in 1..DRAG_STEPS {
+            let t = step as f64 / DRAG_STEPS as f64;
+            let x = start.0 + ((end.0 - start.0) as f64 * t).round() as i32;
+            let y = start.1 + ((end.1 - start.1) as f64 * t).round() as i32;
+            inputs.push(mouse_event((x, y), MOUSEEVENTF_MOVE));
+        }
+        inputs.push(mouse_event(end, MOUSEEVENTF_MOVE));
+        inputs.push(mouse_event(end, up));
+
+        // Prefer one atomic batch. On this machine an input hook rejects every
+        // multi-event batch before delivering anything, so a clean refusal may
+        // degrade to ordered single events. Any partial failure triggers a
+        // best-effort button release and remains effect=unknown.
+        deliver_drag(&inputs, end, up)
     }
 
     fn describe(&self) -> serde_json::Value {
@@ -623,14 +708,15 @@ impl Chord {
     /// got wrong rather than something to guess at.
     fn parse(keys: &[String]) -> Result<Self> {
         if keys.is_empty() {
-            return Err(DriverError::invalid("a key combination needs at least one key"));
+            return Err(DriverError::invalid(
+                "a key combination needs at least one key",
+            ));
         }
         let mut modifiers = Vec::new();
         let mut main: Option<VIRTUAL_KEY> = None;
         for name in keys {
-            let vk = key_name_to_vk(name).ok_or_else(|| {
-                DriverError::invalid(format!("unknown key {name:?}"))
-            })?;
+            let vk = key_name_to_vk(name)
+                .ok_or_else(|| DriverError::invalid(format!("unknown key {name:?}")))?;
             if is_modifier(vk) {
                 if !modifiers.contains(&vk) {
                     modifiers.push(vk);
@@ -689,7 +775,11 @@ impl Chord {
 /// virtual key is what ordinary applications act on.
 fn key_event(vk: VIRTUAL_KEY, up: bool) -> INPUT {
     let scan = unsafe { MapVirtualKeyW(vk.0 as u32, MAPVK_VK_TO_VSC) } as u16;
-    let mut flags = if up { KEYEVENTF_KEYUP } else { Default::default() };
+    let mut flags = if up {
+        KEYEVENTF_KEYUP
+    } else {
+        Default::default()
+    };
     if scan != 0 {
         flags |= KEYEVENTF_SCANCODE;
     }
@@ -776,6 +866,129 @@ fn key_name_to_vk(name: &str) -> Option<VIRTUAL_KEY> {
     Some(vk)
 }
 
+/// How many interpolated moves a drag glides through between press and release.
+/// Enough that targets see real travel, few enough to stay one tight batch.
+const DRAG_STEPS: i32 = 12;
+
+/// Upper bound on a hover dwell, so a caller cannot park the pointer for minutes.
+const MAX_HOVER_MS: u64 = 5_000;
+
+/// Compute a point inside the element's half-open bounding rectangle.
+///
+/// UI Automation bounds cover x..x+width and y..y+height, so the last pixel is
+/// width-1 / height-1. Mapping 1.0 to the exclusive edge would target the next
+/// control (or empty desktop) while still claiming the element was the anchor.
+fn element_point(
+    bounds: Option<crate::model::Bounds>,
+    fraction: Option<(f64, f64)>,
+) -> Result<(i32, i32)> {
+    let bounds = bounds
+        .ok_or_else(|| DriverError::invalid("the element has no bounding rectangle to act on"))?;
+    if bounds.is_empty() {
+        return Err(DriverError::invalid(
+            "the element's bounding rectangle has no area",
+        ));
+    }
+    match fraction {
+        None => Ok(bounds.center()),
+        Some((fx, fy)) => {
+            let x = bounds.x + (((bounds.width - 1) as f64) * fx).round() as i32;
+            let y = bounds.y + (((bounds.height - 1) as f64) * fy).round() as i32;
+            Ok((x, y))
+        }
+    }
+}
+
+/// Convert a virtual-screen point to the 0..65535 absolute coordinates SendInput
+/// expects with MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK.
+fn to_absolute(point: (i32, i32)) -> Result<(i32, i32)> {
+    let (origin_x, origin_y, width, height) = unsafe {
+        (
+            GetSystemMetrics(SM_XVIRTUALSCREEN),
+            GetSystemMetrics(SM_YVIRTUALSCREEN),
+            GetSystemMetrics(SM_CXVIRTUALSCREEN),
+            GetSystemMetrics(SM_CYVIRTUALSCREEN),
+        )
+    };
+    if width <= 1 || height <= 1 {
+        return Err(DriverError::unavailable(
+            "the virtual screen has no usable extent",
+        ));
+    }
+    let max_x = width - 1;
+    let max_y = height - 1;
+    let x = (point.0 - origin_x).clamp(0, max_x);
+    let y = (point.1 - origin_y).clamp(0, max_y);
+    let ax = (x as f64 * 65_535.0 / max_x as f64).round() as i32;
+    let ay = (y as f64 * 65_535.0 / max_y as f64).round() as i32;
+    Ok((ax, ay))
+}
+
+/// One mouse INPUT at an absolute point with the given flags.
+fn mouse_event(
+    absolute: (i32, i32),
+    flags: windows::Win32::UI::Input::KeyboardAndMouse::MOUSE_EVENT_FLAGS,
+) -> INPUT {
+    INPUT {
+        r#type: INPUT_MOUSE,
+        Anonymous: windows::Win32::UI::Input::KeyboardAndMouse::INPUT_0 {
+            mi: MOUSEINPUT {
+                dx: absolute.0,
+                dy: absolute.1,
+                mouseData: 0,
+                dwFlags: flags | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
+                time: 0,
+                dwExtraInfo: 0,
+            },
+        },
+    }
+}
+
+/// The down/up flag pair for a button.
+fn button_events(
+    button: PointerButton,
+) -> (
+    windows::Win32::UI::Input::KeyboardAndMouse::MOUSE_EVENT_FLAGS,
+    windows::Win32::UI::Input::KeyboardAndMouse::MOUSE_EVENT_FLAGS,
+) {
+    match button {
+        PointerButton::Left => (MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP),
+        PointerButton::Right => (MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP),
+        PointerButton::Middle => (MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP),
+    }
+}
+
+/// Deliver a scroll: one wheel event per notch, at the target point.
+///
+/// mouseData carries WHEEL_DELTA per notch; up and right are positive, down and
+/// left negative, matching the Win32 wheel convention.
+fn deliver_scroll(absolute: (i32, i32), scroll: ScrollSpec) -> Result<()> {
+    let (flags, sign) = match scroll.direction {
+        ScrollDirection::Up => (MOUSEEVENTF_WHEEL, 1),
+        ScrollDirection::Down => (MOUSEEVENTF_WHEEL, -1),
+        ScrollDirection::Right => (MOUSEEVENTF_HWHEEL, 1),
+        ScrollDirection::Left => (MOUSEEVENTF_HWHEEL, -1),
+    };
+    let delta = sign * WHEEL_DELTA as i32;
+    let mut inputs = vec![mouse_event(absolute, MOUSEEVENTF_MOVE)];
+    for _ in 0..scroll.notches.max(1) {
+        inputs.push(INPUT {
+            r#type: INPUT_MOUSE,
+            Anonymous: windows::Win32::UI::Input::KeyboardAndMouse::INPUT_0 {
+                mi: MOUSEINPUT {
+                    dx: absolute.0,
+                    dy: absolute.1,
+                    mouseData: delta as u32,
+                    dwFlags: flags | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
+                    time: 0,
+                    dwExtraInfo: 0,
+                },
+            },
+        });
+    }
+    deliver_with_safe_fallback(&inputs, "the scroll")
+}
+
 /// Deliver a batch of synthetic input events atomically.
 ///
 /// `SendInput` guarantees that events submitted in one call are not interleaved
@@ -798,6 +1011,55 @@ fn deliver_atomically(inputs: &[INPUT], what: &str) -> Result<()> {
         return Err(input_rejected(sent as usize, inputs.len(), what));
     }
     Ok(())
+}
+
+/// Retry a pointer gesture one event at a time only when the atomic attempt
+/// delivered nothing. Once any event landed, replaying the full gesture could
+/// duplicate a click or wheel notch and must be refused conservatively.
+fn fallback_is_safe(error: &DriverError) -> bool {
+    error.effect == "not_applied"
+}
+
+fn deliver_with_safe_fallback(inputs: &[INPUT], what: &str) -> Result<()> {
+    match deliver_atomically(inputs, what) {
+        Ok(()) => Ok(()),
+        Err(error) if fallback_is_safe(&error) => deliver_individually(inputs, what),
+        Err(error) => Err(error),
+    }
+}
+
+/// Deliver a drag, falling back to ordered events only after a clean refusal.
+fn deliver_drag(
+    inputs: &[INPUT],
+    end: (i32, i32),
+    release: windows::Win32::UI::Input::KeyboardAndMouse::MOUSE_EVENT_FLAGS,
+) -> Result<()> {
+    match deliver_atomically(inputs, "the drag") {
+        Ok(()) => Ok(()),
+        Err(error) if fallback_is_safe(&error) => {
+            for (index, event) in inputs.iter().enumerate() {
+                let sent = unsafe { SendInput(&[*event], std::mem::size_of::<INPUT>() as i32) };
+                if sent != 1 {
+                    let mut failure = input_rejected(index, inputs.len(), "the drag");
+                    if index > 1 {
+                        let released =
+                            deliver_atomically(&[mouse_event(end, release)], "the drag recovery")
+                                .is_ok();
+                        failure = failure
+                            .with_detail("residual_state_cleared", serde_json::json!(released));
+                    }
+                    return Err(failure);
+                }
+            }
+            Ok(())
+        }
+        Err(mut error) => {
+            let released =
+                deliver_atomically(&[mouse_event(end, release)], "the drag recovery").is_ok();
+            error = error.with_detail("residual_state_cleared", serde_json::json!(released));
+            Err(error)
+        }
+    }
 }
 
 /// Deliver events one at a time, accepting the loss of atomicity.
@@ -999,6 +1261,11 @@ fn describe_element(
     }
     if bounds.is_some() && states.offscreen != Some(true) {
         actions.push("pointer_click".to_string());
+        // Anything clickable can also take the richer pointer gestures (right
+        // and middle click, double click, scroll, hover) and be a drag endpoint
+        // -- all reach the same on-screen point the same way a click does.
+        actions.push("pointer_gesture".to_string());
+        actions.push("drag".to_string());
     }
 
     Node {
@@ -1544,6 +1811,31 @@ mod tests {
     use super::*;
 
     #[test]
+    fn fraction_one_stays_inside_the_element() {
+        let bounds = Bounds {
+            x: 100,
+            y: 200,
+            width: 10,
+            height: 20,
+        };
+
+        assert_eq!(
+            element_point(Some(bounds), Some((0.0, 0.0))).unwrap(),
+            (100, 200)
+        );
+        assert_eq!(
+            element_point(Some(bounds), Some((1.0, 1.0))).unwrap(),
+            (109, 219)
+        );
+    }
+
+    #[test]
+    fn only_a_clean_input_refusal_is_safe_to_retry_individually() {
+        assert!(fallback_is_safe(&input_rejected(0, 3, "the click")));
+        assert!(!fallback_is_safe(&input_rejected(1, 3, "the click")));
+    }
+
+    #[test]
     fn input_refused_outright_is_reported_as_safe_to_retry() {
         // Measured behaviour: an input hook makes SendInput return 0 with no OS
         // error. Nothing was delivered, so the caller must be told it may retry.
@@ -1605,7 +1897,9 @@ mod tests {
         // "Control" and "ctrl", "ESC" and "escape" name the same keys; a caller
         // should not have to guess the one spelling that works.
         assert_eq!(
-            Chord::parse(&["Control".into(), "A".into()]).unwrap().modifiers,
+            Chord::parse(&["Control".into(), "A".into()])
+                .unwrap()
+                .modifiers,
             vec![VK_CONTROL]
         );
         assert_eq!(Chord::parse(&["ESC".into()]).unwrap().key, VK_ESCAPE);
@@ -1640,7 +1934,11 @@ mod tests {
         // reverse, so nothing is left held.
         let chord = Chord::parse(&["ctrl".into(), "c".into()]).unwrap();
         let inputs = chord.to_inputs();
-        assert_eq!(inputs.len(), 4, "two events for the modifier, two for the key");
+        assert_eq!(
+            inputs.len(),
+            4,
+            "two events for the modifier, two for the key"
+        );
         // First event presses Ctrl, last releases it.
         let first = unsafe { inputs[0].Anonymous.ki };
         let last = unsafe { inputs[3].Anonymous.ki };

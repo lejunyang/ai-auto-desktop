@@ -10,7 +10,10 @@
 //! is refused with `DRIVER.STALE_HANDLE` rather than applied to whatever now
 //! occupies that position.
 
-use crate::backend::{Backend, CaptureLimits, DriverError, Result, SnapshotStore};
+use crate::backend::{
+    Backend, CaptureLimits, DriverError, PointerButton, PointerGesture, Result, ScrollDirection,
+    ScrollSpec, SnapshotStore,
+};
 use crate::capture::{self, CapturedEvent};
 use crate::model::{Locator, Node, Snapshot, Target, NODE_ACTIONS, OUTLINE_BUDGET};
 use aad_plugin::{manifest, CapabilityManifest};
@@ -24,8 +27,16 @@ use std::time::Duration;
 pub const PROVIDER_NAME: &str = "desktop.windows_uia";
 
 /// Actions that change the state of the desktop.
-pub const WRITE_ACTIONS: &[&str] =
-    &["focus", "invoke", "set_value", "type_text", "pointer_click", "key_chord"];
+pub const WRITE_ACTIONS: &[&str] = &[
+    "focus",
+    "invoke",
+    "set_value",
+    "type_text",
+    "pointer_click",
+    "key_chord",
+    "pointer_gesture",
+    "drag",
+];
 
 const MAX_TYPE_TEXT_CHARS: usize = 1024;
 
@@ -88,9 +99,8 @@ impl UiaDriver {
             "describe" => self.describe(&args),
             "overview" => self.overview(&args),
             "find" => self.find(&args),
-            "focus" | "invoke" | "set_value" | "type_text" | "pointer_click" | "key_chord" => {
-                self.act(action, &args)
-            }
+            "focus" | "invoke" | "set_value" | "type_text" | "pointer_click" | "key_chord"
+            | "pointer_gesture" | "drag" => self.act(action, &args),
             "watch" => self.watch(&args),
             "collect" => self.collect(&args),
             "release" => self.release(&args),
@@ -518,6 +528,35 @@ impl UiaDriver {
                 }
                 self.backend.key_chord(&window_id, &node, &keys)?
             }
+            "pointer_gesture" => {
+                let gesture = parse_pointer_gesture(args)?;
+                self.backend.pointer_gesture(&window_id, &node, &gesture)?
+            }
+            "drag" => {
+                // Drag needs a second observed element as its destination. It is
+                // resolved the same way as the first, and must live in the same
+                // window -- a drag across windows is not something this expresses.
+                let to_value = args
+                    .get("to")
+                    .ok_or_else(|| DriverError::invalid("drag requires a `to` target"))?;
+                let to_target = Target::from_value(to_value).map_err(DriverError::invalid)?;
+                let (to_window, to_node) = self.resolve(&to_target)?;
+                if to_window != window_id {
+                    return Err(DriverError::invalid(
+                        "drag start and end must be in the same window",
+                    ));
+                }
+                if !to_node.actions.iter().any(|name| name == "drag") {
+                    return Err(DriverError::new(
+                        "DRIVER.ACTION_UNSUPPORTED",
+                        "the drag destination does not support `drag`",
+                    )
+                    .with_detail("node_id", json!(to_node.node_id))
+                    .with_detail("supported", json!(to_node.actions)));
+                }
+                let gesture = parse_drag_gesture(args)?;
+                self.backend.drag(&window_id, &node, &to_node, &gesture)?
+            }
             other => return Err(DriverError::invalid(format!("unknown action {other:?}"))),
         }
 
@@ -686,6 +725,160 @@ fn step_to_json(step: &capture::RecordedStep) -> Value {
 }
 
 /// The action contracts this driver publishes in its manifest.
+/// The largest scroll a single request may ask for, in notches. Enough to page
+/// through a long list, bounded so one call cannot spin the wheel indefinitely.
+const MAX_SCROLL_NOTCHES: u32 = 30;
+
+/// Parse a fraction inside an observed element.
+fn parse_fraction(args: &Value, name: &str) -> Result<Option<(f64, f64)>> {
+    let Some(value) = args.get(name) else {
+        return Ok(None);
+    };
+    let fx = value
+        .get("fx")
+        .and_then(Value::as_f64)
+        .ok_or_else(|| DriverError::invalid(format!("{name} needs a numeric fx")))?;
+    let fy = value
+        .get("fy")
+        .and_then(Value::as_f64)
+        .ok_or_else(|| DriverError::invalid(format!("{name} needs a numeric fy")))?;
+    if !fx.is_finite()
+        || !fy.is_finite()
+        || !(0.0..=1.0).contains(&fx)
+        || !(0.0..=1.0).contains(&fy)
+    {
+        return Err(DriverError::invalid(format!(
+            "{name} fx and fy must be finite numbers between 0.0 and 1.0"
+        )));
+    }
+    Ok(Some((fx, fy)))
+}
+
+fn parse_button(args: &Value) -> Result<PointerButton> {
+    match args.get("button") {
+        None => Ok(PointerButton::Left),
+        Some(Value::String(value)) if value == "left" => Ok(PointerButton::Left),
+        Some(Value::String(value)) if value == "right" => Ok(PointerButton::Right),
+        Some(Value::String(value)) if value == "middle" => Ok(PointerButton::Middle),
+        Some(Value::String(value)) => Err(DriverError::invalid(format!(
+            "unknown pointer button {value:?}; use left, right or middle"
+        ))),
+        Some(_) => Err(DriverError::invalid("pointer button must be a string")),
+    }
+}
+
+fn parse_pointer_gesture(args: &Value) -> Result<PointerGesture> {
+    let button = parse_button(args)?;
+    let count = match args.get("count") {
+        None => 1,
+        Some(Value::Number(number)) if number.as_u64() == Some(1) => 1,
+        Some(Value::Number(number)) if number.as_u64() == Some(2) => 2,
+        Some(Value::Number(number)) => {
+            return Err(DriverError::invalid(format!(
+                "click count must be 1 or 2, not {number}"
+            )))
+        }
+        Some(_) => return Err(DriverError::invalid("click count must be an integer")),
+    };
+
+    let scroll = match args.get("scroll") {
+        None => None,
+        Some(value) if value.is_object() => {
+            let direction = match value.get("direction") {
+                Some(Value::String(value)) if value == "up" => ScrollDirection::Up,
+                Some(Value::String(value)) if value == "down" => ScrollDirection::Down,
+                Some(Value::String(value)) if value == "left" => ScrollDirection::Left,
+                Some(Value::String(value)) if value == "right" => ScrollDirection::Right,
+                _ => {
+                    return Err(DriverError::invalid(
+                        "scroll needs a direction: up, down, left or right",
+                    ))
+                }
+            };
+            let notches = match value.get("notches") {
+                None => 3,
+                Some(Value::Number(number)) => number
+                    .as_u64()
+                    .and_then(|value| u32::try_from(value).ok())
+                    .ok_or_else(|| {
+                        DriverError::invalid(format!(
+                            "scroll notches must be an integer between 1 and {MAX_SCROLL_NOTCHES}"
+                        ))
+                    })?,
+                Some(_) => {
+                    return Err(DriverError::invalid(
+                        "scroll notches must be a positive integer",
+                    ))
+                }
+            };
+            if notches == 0 || notches > MAX_SCROLL_NOTCHES {
+                return Err(DriverError::invalid(format!(
+                    "scroll notches must be between 1 and {MAX_SCROLL_NOTCHES}"
+                )));
+            }
+            Some(ScrollSpec { direction, notches })
+        }
+        Some(_) => return Err(DriverError::invalid("scroll must be an object")),
+    };
+
+    let hover_ms = match args.get("hover_ms") {
+        None => None,
+        Some(Value::Number(number)) => {
+            let value = number
+                .as_u64()
+                .ok_or_else(|| DriverError::invalid("hover_ms must be a positive integer"))?;
+            if !(1..=5_000).contains(&value) {
+                return Err(DriverError::invalid("hover_ms must be between 1 and 5000"));
+            }
+            Some(value)
+        }
+        Some(_) => return Err(DriverError::invalid("hover_ms must be a positive integer")),
+    };
+
+    if scroll.is_some() && hover_ms.is_some() {
+        return Err(DriverError::invalid(
+            "scroll and hover_ms are mutually exclusive",
+        ));
+    }
+    if scroll.is_some() && (args.get("button").is_some() || args.get("count").is_some()) {
+        return Err(DriverError::invalid(
+            "a scroll cannot also specify a pointer button or click count",
+        ));
+    }
+    if hover_ms.is_some() && (args.get("button").is_some() || args.get("count").is_some()) {
+        return Err(DriverError::invalid(
+            "a hover cannot also specify a pointer button or click count",
+        ));
+    }
+
+    Ok(PointerGesture {
+        button,
+        count,
+        fraction: parse_fraction(args, "fraction")?,
+        to_fraction: None,
+        scroll,
+        hover_ms,
+    })
+}
+
+fn parse_drag_gesture(args: &Value) -> Result<PointerGesture> {
+    for forbidden in ["count", "scroll", "hover_ms"] {
+        if args.get(forbidden).is_some() {
+            return Err(DriverError::invalid(format!(
+                "drag does not accept {forbidden}"
+            )));
+        }
+    }
+    Ok(PointerGesture {
+        button: parse_button(args)?,
+        count: 1,
+        fraction: parse_fraction(args, "fraction")?,
+        to_fraction: parse_fraction(args, "to_fraction")?,
+        scroll: None,
+        hover_ms: None,
+    })
+}
+
 fn action_contracts() -> Map<String, Value> {
     let mut actions = Map::new();
     let read_only = |summary: &str| {
@@ -791,6 +984,24 @@ fn action_contracts() -> Map<String, Value> {
         "key_chord".into(),
         write(
             "Press a key combination on the focused element, e.g. Ctrl+C or F5.",
+            "input",
+            "medium",
+            "non_idempotent",
+        ),
+    );
+    actions.insert(
+        "pointer_gesture".into(),
+        write(
+            "Right/middle/double click, scroll or hover on an element.",
+            "input",
+            "medium",
+            "non_idempotent",
+        ),
+    );
+    actions.insert(
+        "drag".into(),
+        write(
+            "Drag from one element to another.",
             "input",
             "medium",
             "non_idempotent",
@@ -943,6 +1154,30 @@ mod tests {
             self.record(&format!("key_chord:{}:{}", node.node_id, keys.join("+")));
             Ok(())
         }
+
+        fn pointer_gesture(
+            &self,
+            _window_id: &str,
+            node: &Node,
+            gesture: &PointerGesture,
+        ) -> Result<()> {
+            self.record(&format!(
+                "pointer_gesture:{}:{:?}x{}",
+                node.node_id, gesture.button, gesture.count
+            ));
+            Ok(())
+        }
+
+        fn drag(
+            &self,
+            _window_id: &str,
+            from: &Node,
+            to: &Node,
+            _gesture: &PointerGesture,
+        ) -> Result<()> {
+            self.record(&format!("drag:{}->{}", from.node_id, to.node_id));
+            Ok(())
+        }
     }
 
     fn window() -> WindowInfo {
@@ -999,6 +1234,78 @@ mod tests {
 
     fn target_of(found: &Value) -> Value {
         found["target"].clone()
+    }
+
+    #[test]
+    fn pointer_gesture_rejects_conflicting_modes() {
+        for arguments in [
+            json!({"scroll": {"direction": "down"}, "hover_ms": 100}),
+            json!({"scroll": {"direction": "down"}, "button": "left"}),
+            json!({"hover_ms": 100, "count": 2}),
+        ] {
+            let error = parse_pointer_gesture(&arguments).unwrap_err();
+            assert_eq!(error.code, "DRIVER.INVALID_REQUEST");
+        }
+    }
+
+    #[test]
+    fn pointer_gesture_rejects_values_it_cannot_honour() {
+        for arguments in [
+            json!({"count": "2"}),
+            json!({"hover_ms": 0}),
+            json!({"scroll": {"direction": "down", "notches": 31}}),
+            json!({"fraction": {"fx": 1.1, "fy": 0.5}}),
+        ] {
+            let error = parse_pointer_gesture(&arguments).unwrap_err();
+            assert_eq!(error.code, "DRIVER.INVALID_REQUEST");
+        }
+    }
+
+    #[test]
+    fn drag_keeps_source_and_destination_fractions_separate() {
+        let gesture = parse_drag_gesture(&json!({
+            "button": "right",
+            "fraction": {"fx": 0.1, "fy": 0.2},
+            "to_fraction": {"fx": 0.8, "fy": 0.9}
+        }))
+        .unwrap();
+
+        assert_eq!(gesture.button, PointerButton::Right);
+        assert_eq!(gesture.fraction, Some((0.1, 0.2)));
+        assert_eq!(gesture.to_fraction, Some((0.8, 0.9)));
+    }
+
+    #[test]
+    fn drag_requires_both_observed_elements_to_support_it() {
+        let (driver, backend) = driver(vec![
+            node("n1", "ListItem", "Source", &["drag"]),
+            node("n2", "Text", "Destination", &["pointer_gesture"]),
+        ]);
+        let source = driver
+            .call(
+                "find",
+                &json!({"window_id": "w1", "locator": {"name": "Source"}}),
+            )
+            .unwrap();
+        let destination = driver
+            .call(
+                "find",
+                &json!({"window_id": "w1", "locator": {"name": "Destination"}}),
+            )
+            .unwrap();
+
+        let error = driver
+            .call(
+                "drag",
+                &json!({
+                    "target": target_of(&source),
+                    "to": target_of(&destination)
+                }),
+            )
+            .unwrap_err();
+
+        assert_eq!(error.code, "DRIVER.ACTION_UNSUPPORTED");
+        assert!(backend.performed().is_empty());
     }
 
     #[test]
