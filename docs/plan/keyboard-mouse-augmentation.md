@@ -1,20 +1,21 @@
 # 键鼠补全设计（Windows P0）
 
-> 状态：`key_chord`（组合键/功能键）**已实现并通过真机验证**；右键/双击/滚轮/悬停/拖拽为后续增量。目标是把现有 `SendInput` 通道"用满"，补齐 L0 语义动作表达不了的键鼠能力，同时**不破坏项目的安全不变量**（禁裸坐标、写操作必须锚定已校验元素）。
+> 状态：`key_chord`（组合键/功能键）与 Windows 指针手势（右键/中键/双击、横纵滚轮、悬停、拖拽、元素内归一化位置）**已实现并通过隔离真机验证**；剩余 P0 是 `type_text` 的 keys 模式。目标是把现有 `SendInput` 通道"用满"，补齐 L0 语义动作表达不了的键鼠能力，同时**不破坏项目的安全不变量**（禁裸坐标、写操作必须锚定已校验元素）。
 >
 > 依据：上一轮真机实测（见 `input-synthesis-and-background-execution.md` §6）。核心结论——虚拟键/扫描码对三通道全可见，`KEYEVENTF_UNICODE` 对 Raw Input 不可见；修饰键泄漏不自愈。
 
-## 交付进度（2026-09-25）
+## 交付进度（2026-09-26）
 
 | 动作 | 状态 | 验证 |
 |---|---|---|
 | `key_chord`（组合键/功能键） | ✅ 已交付 | 单元测试 8 项 + 真机端到端：记事本 Ctrl+A 全选 23/23 字符生效；无修饰键泄漏 |
-| 右键/双击/中键 | ⏳ 后续增量 | — |
-| `scroll` / `hover` | ⏳ 后续增量 | — |
-| `drag` | ⏳ 后续增量 | — |
+| 右键/双击/中键 | ✅ 已交付 | 隔离 Win32 探针经 `find → target → do` 回读 Raw Input，完整观察到对应 down/up 序列 |
+| 纵向/横向 `scroll` | ✅ 已交付 | 隔离探针分别观察到 3 个竖向、2 个横向 wheel detent |
+| `hover` | ✅ 已交付 | 光标落在被观察元素内部，且 350 ms 停留已兑现 |
+| `drag` | ✅ 已交付 | 起终点均为已观察 target；探针观察到 left-down → move → left-up 完整序列 |
 | `type_text` 的 keys 模式 | ⏳ 后续增量 | — |
 
-已改动文件：`aad-uia/src/backend.rs`（trait + 默认降级）、`aad-uia/src/windows.rs`（Chord 实现 + derive 标注 + 8 单测）、`aad-uia/src/driver.rs`（WRITE_ACTIONS/dispatch/act/契约/mock）、`aad-mcp/src/tools.rs`（key_chord 工具 + 分发 + locator enum）、`aad-cli/src/main.rs`（`do key-chord` 子命令）。验证脚本：`tests/windows/verify_key_chord_e2e.py`、`verify_key_chord_effect.py`。
+指针改动文件：`aad-uia/src/backend.rs`（手势模型 + 非 Windows 默认拒绝）、`aad-uia/src/windows.rs`（SendInput 手势实现、边界内缩、失败恢复）、`aad-uia/src/driver.rs`（双 target 校验、参数互斥与范围校验）、`aad-mcp/src/tools.rs`（`pointer_gesture` / `drag` schema）、`aad-cli/src/main.rs`（`do gesture` / `do drag`）。隔离真机脚本：`tests/windows/verify_pointer_gesture_effect.py`；共享 Raw Input 探针的 `RAWMOUSE` 联合体对齐也已修正。
 
 > 注：`key_chord` 暂不进 `save_workflow` 可保存动作——workflow 的 `assemble.rs` 用单个 `argument` 字符串表达参数，而 keys 是数组，接入需改动 workflow 序列化格式，留待后续。即时调用（CLI `do` / MCP 工具）已完全可用。
 
@@ -51,24 +52,33 @@
   - `SendInput` 部分失败时，错误 detail 里加 `residual_state` 字段说明可能残留，`effect` 保持保守（`unknown`）。
 - **扫描码模式**作为显式可选项（`encoding: scancode`），不设默认——扫描码在非 US 布局下按键位而非字符，对普通应用是错的。
 
+## 3b. 指针动作的接入方式（第二档）
+
+现有 pointer_click(window_id, node) 是无参的“左键单击中心”，已被 mock/driver/mcp/cli 多处引用。为向后兼容，不改它的签名，而是新增带默认降级的 trait 方法，参数用一个结构体承载：PointerGesture { button(Left|Right|Middle，默认 Left)、count(1|2 双击，默认 1)、fraction(元素内归一化位置 0..1，默认中心)、scroll(Some 时为滚轮：方向 up/down/left/right + 档数)、hover_ms(Some 时为悬停：移动到点并停留) }。
+
+- pointer_gesture(window_id, node, &PointerGesture)：右键/双击/中键/滚轮/悬停/元素内定位，锚定单个元素。
+- drag(window_id, from, to, &PointerGesture)：拖拽，锚定起点+终点两个元素；中间路径由插值派生。
+
+两个方法都 default 返回 ACTION_UNSUPPORTED，非 Windows 后端不必立刻实现。坐标一律由 node.bounds + fraction 在 backend 内部算出，调用方永远给不了屏幕坐标——这是禁裸坐标不变量在指针动作上的落点。滚轮方向用枚举 + 档数（正整数），不暴露 delta 数字。
+
 ## 4. 分层改动清单
 
 | 层 | 文件 | 改动 |
 |---|---|---|
-| Backend trait | `aad-uia/src/backend.rs` | 加 `key_chord` / `scroll` / `hover` / `drag` 方法；`pointer_click` 扩展签名（button/count/fraction） |
-| Windows 实现 | `aad-uia/src/windows.rs` | 用 SendInput 实现上述；键名映射表；修饰键影子状态；`derive` 里标注新动作 |
-| 其他后端 | `aad-atspi`、`aad-macos-ax` | 返回 `ACTION_UNSUPPORTED` 降级（本轮不实现，保持可编译） |
-| Dispatch | `aad-uia/src/driver.rs` | `WRITE_ACTIONS` 加项；`act` match 加分支 + 参数解析 + 校验；`action_contracts` 加契约 |
-| MCP schema | `aad-mcp/src/tools.rs` | 加动作工具 schema（用 fraction 不用坐标）；dispatch 映射；坐标禁令测试必须仍绿 |
-| CLI | `aad-cli/src/main.rs` | `DoCommand` 加子命令变体（每个都带 target）；dispatch 映射 |
-| 验证 | `tests/windows/` | 复用 input_channel_probe 分通道回读；扩展 fixture |
+| Backend trait | `aad-uia/src/backend.rs` | `key_chord`、`pointer_gesture`、`drag`；指针参数由 `PointerGesture` 承载 |
+| Windows 实现 | `aad-uia/src/windows.rs` | SendInput 实现组合键与全部指针手势；derive 标注动作；部分投递时释放修饰键/鼠标键 |
+| 其他后端 | `aad-atspi`、`aad-macos-ax` | trait 默认返回 `ACTION_UNSUPPORTED`，保持可编译 |
+| Dispatch | `aad-uia/src/driver.rs` | `WRITE_ACTIONS`、dispatch、双 target resolve/verify、参数互斥与范围校验、动作契约 |
+| MCP schema | `aad-mcp/src/tools.rs` | `key_chord` / `pointer_gesture` / `drag` 工具；仅暴露 fraction，不暴露坐标；递归禁坐标测试保持全绿 |
+| CLI | `aad-cli/src/main.rs` | `do key-chord` / `do gesture` / `do drag`，成对参数与互斥参数由 clap 提前拒绝 |
+| 验证 | `tests/windows/` | 隔离 Win32 探针分通道回读；不操作用户已有窗口 |
 
 ## 5. 实现顺序
 
-1. `key_chord`（最高价值：组合键/功能键是"无法用元素描述"的最大一类）+ 修饰键泄漏防护
-2. `pointer_click` 扩展（右键/双击/中键 + 归一化位置）
-3. `scroll` / `hover`
-4. `drag`
-5. `type_text` 的 keys 模式（修 Raw Input 盲区）
+1. `key_chord`（✅ 已完成）
+2. `pointer_gesture`：右键/中键/双击 + 元素内归一化位置（✅ 已完成）
+3. 纵向/横向滚轮与悬停（✅ 已完成）
+4. 双 target 拖拽与失败释放恢复（✅ 已完成）
+5. `type_text` 的 keys 模式（下一步；修 Raw Input 盲区）
 
-每完成一项，本地 cargo test + clippy 全绿再进行下一项。全部完成、真机回读验证通过后统一交付，不擅自 push。
+每完成一项，本地 cargo test + clippy 全绿再进行下一项。真机验证必须使用脚本自行创建和销毁的隔离窗口，不得选择桌面上既有的用户窗口。全部完成后本地提交，不擅自 push。

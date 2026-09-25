@@ -46,6 +46,11 @@ aad do invoke    --target abc123:4:e9      # 触发默认动作
 aad do click     --target abc123:4:e9      # 点击元素中心
 aad do set-value --target abc123:4:e9 --value "写入的内容"
 aad do type-text --target abc123:4:e9 --text "逐字输入"
+aad do key-chord --target abc123:4:e9 --keys ctrl,a
+# 右键/双击/滚轮/悬停：位置只能是元素内的 0..1 比例，不接受屏幕坐标
+aad do gesture --target abc123:4:e9 --button right
+# 拖拽的起点与终点都必须是已观察并二次校验过的元素
+aad do drag --target abc123:4:e9 --to def456:5:e12
 aad do focus     --target abc123:4:e9
 ```
 
@@ -213,10 +218,10 @@ aad resume job-1 workflow.yaml --store runs.sqlite3
 aad mcp
 ```
 
-在 stdio 上说 JSON-RPC 2.0，protocolVersion `2024-11-05`。提供 12 个工具，分两类：
+在 stdio 上说 JSON-RPC 2.0，protocolVersion `2024-11-05`。提供 14 个工具，分两类：
 
 **看与做**（临场操作）：`list_apps`、`describe_window`、`find_element`、`focus`、`invoke`、
-`set_value`、`type_text`、`pointer_click`、`probe_environment`。
+`set_value`、`type_text`、`key_chord`、`pointer_click`、`pointer_gesture`、`drag`、`probe_environment`。
 
 **跑存好的流程**（重复劳动）：`list_workflows`、`describe_workflow`、`run_workflow`。
 录一次、存进 store，之后 AI 按名字跑，比每次重新拼一遍点击序列可靠得多。
