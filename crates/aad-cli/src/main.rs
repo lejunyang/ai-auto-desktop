@@ -386,6 +386,8 @@ enum DoCommand {
     SetValue(ValueArgs),
     /// Type text into an element.
     TypeText(TextArgs),
+    /// Press a key combination on an element, e.g. Ctrl+C or F5.
+    KeyChord(ChordArgs),
 }
 
 #[derive(Args)]
@@ -413,6 +415,17 @@ struct TextArgs {
     /// The text to type.
     #[arg(long)]
     text: String,
+}
+
+#[derive(Args)]
+struct ChordArgs {
+    /// The element to act on, as printed by `aad find`.
+    #[arg(long, value_name = "REF")]
+    target: String,
+    /// The combination, comma-separated: modifiers then one key, e.g.
+    /// `ctrl,c`, `f5`, `shift,end`.
+    #[arg(long, value_name = "KEYS")]
+    keys: String,
 }
 
 #[derive(Args)]
@@ -831,6 +844,19 @@ fn dispatch(command: &Command) -> (Value, u8) {
                 }
                 DoCommand::TypeText(args) => {
                     ("type_text", &args.target, json!({"text": args.text}))
+                }
+                DoCommand::KeyChord(args) => {
+                    // Comma-separated on the command line, an array to the driver.
+                    // Empty segments are dropped so a stray comma is not read as a
+                    // blank key the driver would then reject.
+                    let keys: Vec<String> = args
+                        .keys
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|part| !part.is_empty())
+                        .map(str::to_string)
+                        .collect();
+                    ("key_chord", &args.target, json!({ "keys": keys }))
                 }
             };
 

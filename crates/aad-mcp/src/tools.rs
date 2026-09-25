@@ -71,7 +71,7 @@ fn locator_schema() -> Value {
             },
             "actions": {
                 "type": "array",
-                "items": {"enum": ["focus", "invoke", "set_value", "type_text", "pointer_click"]}
+                "items": {"enum": ["focus", "invoke", "set_value", "type_text", "pointer_click", "key_chord"]}
             },
             "match": {"enum": ["exact", "contains"], "default": "exact"},
             "within": {
@@ -289,6 +289,34 @@ Use only when the element exposes no invokable pattern.",
             mutating: true,
         },
         Tool {
+            name: "key_chord",
+            description: "Press a key combination on an element, after focusing it. \
+This is how you send shortcuts and function keys that no text can express -- \
+Ctrl+C, Ctrl+Z, F5, Tab, Escape, Shift+End. keys lists the combination: any \
+modifiers (ctrl, shift, alt, win) followed by exactly one main key. Like \
+type_text, the keys go wherever focus lands, so it targets an element and \
+focuses it first.",
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "target": target_schema(),
+                    "keys": {
+                        "type": "array",
+                        "description": "The combination, e.g. [\"ctrl\",\"c\"], \
+[\"f5\"], [\"shift\",\"end\"]. Modifiers: ctrl, shift, alt, win. Main keys: letters, \
+digits, f1-f12, enter, tab, esc, space, backspace, delete, insert, home, end, \
+pageup, pagedown, and the arrow keys. At most one non-modifier key.",
+                        "items": {"type": "string"},
+                        "minItems": 1,
+                        "maxItems": 6
+                    }
+                },
+                "required": ["target", "keys"],
+                "additionalProperties": false
+            }),
+            mutating: true,
+        },
+        Tool {
             name: "probe_environment",
             description: "Report whether this machine can support desktop automation, and \
 what limits apply, such as a remote session or a non-elevated process.",
@@ -499,7 +527,7 @@ pub fn call(driver: &Arc<UiaDriver>, name: &str, arguments: &Value) -> Result<Va
         "overview_window" => "overview",
         "describe_window" => "describe",
         "find_element" => "find",
-        "focus" | "invoke" | "set_value" | "type_text" | "pointer_click" => name,
+        "focus" | "invoke" | "set_value" | "type_text" | "pointer_click" | "key_chord" => name,
         other => return Err(format!("unknown tool {other:?}")),
     };
 

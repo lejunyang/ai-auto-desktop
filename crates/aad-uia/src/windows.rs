@@ -99,9 +99,12 @@ use windows::Win32::UI::Accessibility::{
     UIA_PROPERTY_ID,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    SendInput, INPUT, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE,
-    MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MOVE,
-    MOUSEEVENTF_VIRTUALDESK, MOUSEINPUT,
+    MapVirtualKeyW, SendInput, INPUT, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_KEYUP,
+    KEYEVENTF_SCANCODE, KEYEVENTF_UNICODE, MAPVK_VK_TO_VSC, MOUSEEVENTF_ABSOLUTE,
+    MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_VIRTUALDESK, MOUSEINPUT,
+    VIRTUAL_KEY, VK_BACK, VK_CONTROL, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_F1, VK_F10, VK_F11,
+    VK_F12, VK_F2, VK_F3, VK_F4, VK_F5, VK_F6, VK_F7, VK_F8, VK_F9, VK_HOME, VK_INSERT, VK_LEFT,
+    VK_LWIN, VK_MENU, VK_NEXT, VK_PRIOR, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_SPACE, VK_TAB, VK_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, EnumWindows, GetAncestor, GetClassNameW, GetForegroundWindow,
@@ -476,6 +479,32 @@ impl Backend for WindowsUiaBackend {
         deliver_atomically(&inputs, "keystrokes")
     }
 
+    fn key_chord(&self, window_id: &str, node: &Node, keys: &[String]) -> Result<()> {
+        // A chord lands on whatever holds focus, exactly like typing, so the
+        // element is focused first. Without this a shortcut meant for one field
+        // would fire against wherever focus happened to be.
+        let element = self.require(window_id, node)?;
+        unsafe { element.SetFocus() }.map_err(|error| {
+            DriverError::new("DRIVER.ACTION_FAILED", format!("focus failed: {error}"))
+        })?;
+
+        let chord = Chord::parse(keys)?;
+        let inputs = chord.to_inputs();
+
+        // Press-and-release must arrive as one stream: splitting it lets another
+        // source slip between a modifier going down and the key it modifies. And
+        // if the batch is refused, releasing the modifiers already pressed is not
+        // optional -- a latched Ctrl silently turns the user's next keystrokes
+        // into shortcuts, an effect that outlives this action (measured: it does
+        // not self-heal). So a refusal is followed by a best-effort release of
+        // every modifier the chord holds, and reported with that residual noted.
+        deliver_atomically(&inputs, "the key combination").map_err(|mut error| {
+            let released = chord.release_modifiers();
+            error = error.with_detail("residual_state_cleared", serde_json::json!(released));
+            error
+        })
+    }
+
     fn pointer_click(&self, window_id: &str, node: &Node) -> Result<()> {
         let (handle, _) = self.element_for(window_id)?;
         let (x, y) = crate::backend::click_point(node.bounds)?;
@@ -571,6 +600,180 @@ fn write_was_refused(before: Option<&str>, after: Option<&str>, requested: &str)
         (Some(before), Some(after)) => before == after && before != requested,
         _ => false,
     }
+}
+
+/// A parsed key combination: the modifiers to hold and the main key to press.
+///
+/// Names are matched case-insensitively and mapped to virtual-key codes, not
+/// scan codes: a virtual key means the logical key (VK_RETURN is Enter whatever
+/// the layout), which is what a shortcut like Ctrl+C is written against. Scan
+/// codes describe a physical position and would send the wrong character under
+/// a non-US layout, so they are deliberately not the default here.
+#[derive(Debug)]
+struct Chord {
+    modifiers: Vec<VIRTUAL_KEY>,
+    key: VIRTUAL_KEY,
+}
+
+impl Chord {
+    /// Parse `["ctrl", "c"]`, `["f5"]`, `["shift", "end"]` into a chord.
+    ///
+    /// Exactly one non-modifier key is required: a chord is "modifiers plus a
+    /// key", and either zero keys or several main keys is a request the caller
+    /// got wrong rather than something to guess at.
+    fn parse(keys: &[String]) -> Result<Self> {
+        if keys.is_empty() {
+            return Err(DriverError::invalid("a key combination needs at least one key"));
+        }
+        let mut modifiers = Vec::new();
+        let mut main: Option<VIRTUAL_KEY> = None;
+        for name in keys {
+            let vk = key_name_to_vk(name).ok_or_else(|| {
+                DriverError::invalid(format!("unknown key {name:?}"))
+            })?;
+            if is_modifier(vk) {
+                if !modifiers.contains(&vk) {
+                    modifiers.push(vk);
+                }
+            } else if main.is_some() {
+                return Err(DriverError::invalid(
+                    "a key combination may hold several modifiers but only one main key",
+                ));
+            } else {
+                main = Some(vk);
+            }
+        }
+        let key = main.ok_or_else(|| {
+            DriverError::invalid("a key combination needs a non-modifier key, e.g. \"c\" in Ctrl+C")
+        })?;
+        Ok(Self { modifiers, key })
+    }
+
+    /// The full press/release sequence: modifiers down, key down, key up,
+    /// modifiers up in reverse. Reverse release mirrors how a person lifts keys
+    /// and avoids leaving a modifier down past the key it applied to.
+    fn to_inputs(&self) -> Vec<INPUT> {
+        let mut inputs = Vec::with_capacity((self.modifiers.len() + 1) * 2);
+        for &modifier in &self.modifiers {
+            inputs.push(key_event(modifier, false));
+        }
+        inputs.push(key_event(self.key, false));
+        inputs.push(key_event(self.key, true));
+        for &modifier in self.modifiers.iter().rev() {
+            inputs.push(key_event(modifier, true));
+        }
+        inputs
+    }
+
+    /// Best-effort release of every modifier this chord holds.
+    ///
+    /// Called only after a failed delivery, to undo a modifier that may have
+    /// gone down before the batch was refused. Returns the names released so the
+    /// caller can report what it tried to clean up. Individual releases, because
+    /// atomicity no longer matters once we are just tidying up.
+    fn release_modifiers(&self) -> Vec<String> {
+        let mut released = Vec::new();
+        for &modifier in self.modifiers.iter().rev() {
+            let up = [key_event(modifier, true)];
+            let _ = unsafe { SendInput(&up, std::mem::size_of::<INPUT>() as i32) };
+            released.push(vk_label(modifier).to_string());
+        }
+        released
+    }
+}
+
+/// Build one keyboard event for a virtual key, pressed or released.
+///
+/// The scan code is filled in from the virtual key so consumers that read scan
+/// codes (some games, some remapping layers) still see a plausible event; the
+/// virtual key is what ordinary applications act on.
+fn key_event(vk: VIRTUAL_KEY, up: bool) -> INPUT {
+    let scan = unsafe { MapVirtualKeyW(vk.0 as u32, MAPVK_VK_TO_VSC) } as u16;
+    let mut flags = if up { KEYEVENTF_KEYUP } else { Default::default() };
+    if scan != 0 {
+        flags |= KEYEVENTF_SCANCODE;
+    }
+    INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: windows::Win32::UI::Input::KeyboardAndMouse::INPUT_0 {
+            ki: KEYBDINPUT {
+                wVk: vk,
+                wScan: scan,
+                dwFlags: flags,
+                time: 0,
+                dwExtraInfo: 0,
+            },
+        },
+    }
+}
+
+fn is_modifier(vk: VIRTUAL_KEY) -> bool {
+    matches!(vk, VK_CONTROL | VK_SHIFT | VK_MENU | VK_LWIN)
+}
+
+fn vk_label(vk: VIRTUAL_KEY) -> &'static str {
+    match vk {
+        VK_CONTROL => "ctrl",
+        VK_SHIFT => "shift",
+        VK_MENU => "alt",
+        VK_LWIN => "win",
+        _ => "key",
+    }
+}
+
+/// Map a key name to its virtual-key code.
+///
+/// Covers the keys a shortcut actually uses: letters, digits, function keys,
+/// navigation, whitespace and editing keys, and the four modifiers. Unknown
+/// names return `None` so the caller can refuse rather than silently drop a key.
+fn key_name_to_vk(name: &str) -> Option<VIRTUAL_KEY> {
+    let lower = name.trim().to_ascii_lowercase();
+    // Single letters and digits map to their ASCII/VK codes directly: VK_A is
+    // 0x41 == b'A', VK_0 is 0x30 == b'0'.
+    if lower.len() == 1 {
+        let ch = lower.as_bytes()[0];
+        if ch.is_ascii_lowercase() {
+            return Some(VIRTUAL_KEY((ch.to_ascii_uppercase()) as u16));
+        }
+        if ch.is_ascii_digit() {
+            return Some(VIRTUAL_KEY(ch as u16));
+        }
+    }
+    let vk = match lower.as_str() {
+        "ctrl" | "control" => VK_CONTROL,
+        "shift" => VK_SHIFT,
+        "alt" | "menu" => VK_MENU,
+        "win" | "super" | "meta" | "cmd" => VK_LWIN,
+        "enter" | "return" => VK_RETURN,
+        "tab" => VK_TAB,
+        "esc" | "escape" => VK_ESCAPE,
+        "space" | "spacebar" => VK_SPACE,
+        "backspace" | "back" => VK_BACK,
+        "delete" | "del" => VK_DELETE,
+        "insert" | "ins" => VK_INSERT,
+        "home" => VK_HOME,
+        "end" => VK_END,
+        "pageup" | "pgup" => VK_PRIOR,
+        "pagedown" | "pgdn" => VK_NEXT,
+        "up" => VK_UP,
+        "down" => VK_DOWN,
+        "left" => VK_LEFT,
+        "right" => VK_RIGHT,
+        "f1" => VK_F1,
+        "f2" => VK_F2,
+        "f3" => VK_F3,
+        "f4" => VK_F4,
+        "f5" => VK_F5,
+        "f6" => VK_F6,
+        "f7" => VK_F7,
+        "f8" => VK_F8,
+        "f9" => VK_F9,
+        "f10" => VK_F10,
+        "f11" => VK_F11,
+        "f12" => VK_F12,
+        _ => return None,
+    };
+    Some(vk)
 }
 
 /// Deliver a batch of synthetic input events atomically.
@@ -782,6 +985,9 @@ fn describe_element(
     let mut actions = Vec::new();
     if states.focusable == Some(true) {
         actions.push("focus".to_string());
+        // A key combination goes to whatever holds focus, so anything focusable
+        // can receive one -- the same gate as ocus itself.
+        actions.push("key_chord".to_string());
     }
     let has = |id| unsafe { element.GetCurrentPattern(id) }.is_ok();
     if has(UIA_InvokePatternId) || has(UIA_TogglePatternId) || has(UIA_LegacyIAccessiblePatternId) {
@@ -1370,6 +1576,78 @@ mod tests {
         assert!(input_rejected(0, 5, "keystrokes")
             .message
             .contains("keystrokes"));
+    }
+
+    #[test]
+    fn a_chord_parses_modifiers_and_one_key() {
+        let chord = Chord::parse(&["ctrl".into(), "c".into()]).unwrap();
+        assert_eq!(chord.modifiers, vec![VK_CONTROL]);
+        assert_eq!(chord.key, VIRTUAL_KEY(b'C' as u16));
+    }
+
+    #[test]
+    fn a_lone_function_key_is_a_valid_chord() {
+        // The whole point over type_text: F5 is a key no character can express.
+        let chord = Chord::parse(&["f5".into()]).unwrap();
+        assert!(chord.modifiers.is_empty());
+        assert_eq!(chord.key, VK_F5);
+    }
+
+    #[test]
+    fn several_modifiers_are_all_held() {
+        let chord = Chord::parse(&["ctrl".into(), "shift".into(), "left".into()]).unwrap();
+        assert_eq!(chord.modifiers, vec![VK_CONTROL, VK_SHIFT]);
+        assert_eq!(chord.key, VK_LEFT);
+    }
+
+    #[test]
+    fn a_chord_is_case_and_alias_insensitive() {
+        // "Control" and "ctrl", "ESC" and "escape" name the same keys; a caller
+        // should not have to guess the one spelling that works.
+        assert_eq!(
+            Chord::parse(&["Control".into(), "A".into()]).unwrap().modifiers,
+            vec![VK_CONTROL]
+        );
+        assert_eq!(Chord::parse(&["ESC".into()]).unwrap().key, VK_ESCAPE);
+        assert_eq!(Chord::parse(&["escape".into()]).unwrap().key, VK_ESCAPE);
+    }
+
+    #[test]
+    fn a_chord_with_no_main_key_is_refused() {
+        // Modifiers alone are not a shortcut; refusing beats sending half of one.
+        let error = Chord::parse(&["ctrl".into(), "shift".into()]).unwrap_err();
+        assert_eq!(error.code, "DRIVER.INVALID_REQUEST");
+    }
+
+    #[test]
+    fn a_chord_with_two_main_keys_is_refused() {
+        // "a and b at once" is not a combination any shortcut means.
+        let error = Chord::parse(&["a".into(), "b".into()]).unwrap_err();
+        assert_eq!(error.code, "DRIVER.INVALID_REQUEST");
+    }
+
+    #[test]
+    fn an_unknown_key_name_is_refused_not_dropped() {
+        // Silently dropping a key would send a different chord than asked for.
+        let error = Chord::parse(&["ctrl".into(), "nope".into()]).unwrap_err();
+        assert_eq!(error.code, "DRIVER.INVALID_REQUEST");
+        assert!(error.message.contains("nope"));
+    }
+
+    #[test]
+    fn a_chord_expands_to_a_symmetric_press_release_sequence() {
+        // ctrl down, c down, c up, ctrl up: modifiers wrap the key, released in
+        // reverse, so nothing is left held.
+        let chord = Chord::parse(&["ctrl".into(), "c".into()]).unwrap();
+        let inputs = chord.to_inputs();
+        assert_eq!(inputs.len(), 4, "two events for the modifier, two for the key");
+        // First event presses Ctrl, last releases it.
+        let first = unsafe { inputs[0].Anonymous.ki };
+        let last = unsafe { inputs[3].Anonymous.ki };
+        assert_eq!(first.wVk, VK_CONTROL);
+        assert!(!first.dwFlags.contains(KEYEVENTF_KEYUP));
+        assert_eq!(last.wVk, VK_CONTROL);
+        assert!(last.dwFlags.contains(KEYEVENTF_KEYUP));
     }
 
     #[test]

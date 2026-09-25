@@ -139,6 +139,24 @@ pub trait Backend: Send + Sync {
     fn type_text(&self, window_id: &str, node: &Node, text: &str) -> Result<()>;
     fn pointer_click(&self, window_id: &str, node: &Node) -> Result<()>;
 
+    /// Press a key combination while the element holds focus.
+    ///
+    /// Unlike [`type_text`], which can only deliver characters, this expresses
+    /// shortcuts and function keys — Ctrl+C, F5, Shift+End — that no amount of
+    /// text can. `keys` is a chord: every modifier is held down, the main key is
+    /// pressed and released, then the modifiers are released in reverse. The
+    /// element is focused first, exactly like `type_text`, so the chord lands
+    /// where the caller aimed it rather than wherever focus happened to be.
+    ///
+    /// Defaulted so a backend that has not implemented it degrades to a clear
+    /// refusal rather than failing to compile.
+    fn key_chord(&self, _window_id: &str, _node: &Node, _keys: &[String]) -> Result<()> {
+        Err(DriverError::new(
+            "DRIVER.ACTION_UNSUPPORTED",
+            "sending key combinations is not implemented on this platform yet",
+        ))
+    }
+
     /// A human-readable description of this backend, for diagnostics.
     fn describe(&self) -> serde_json::Value {
         serde_json::json!({"backend": "unknown"})

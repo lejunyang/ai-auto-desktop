@@ -24,9 +24,14 @@ use std::time::Duration;
 pub const PROVIDER_NAME: &str = "desktop.windows_uia";
 
 /// Actions that change the state of the desktop.
-pub const WRITE_ACTIONS: &[&str] = &["focus", "invoke", "set_value", "type_text", "pointer_click"];
+pub const WRITE_ACTIONS: &[&str] =
+    &["focus", "invoke", "set_value", "type_text", "pointer_click", "key_chord"];
 
 const MAX_TYPE_TEXT_CHARS: usize = 1024;
+
+/// A chord is a handful of modifiers plus one key; anything longer is a caller
+/// error, not a combination any application listens for.
+const MAX_CHORD_KEYS: usize = 6;
 const MAX_CANDIDATE_SUMMARIES: usize = 10;
 /// How many captured events one `collect` will take at a time.
 const MAX_COLLECTED_EVENTS: usize = 256;
@@ -83,7 +88,7 @@ impl UiaDriver {
             "describe" => self.describe(&args),
             "overview" => self.overview(&args),
             "find" => self.find(&args),
-            "focus" | "invoke" | "set_value" | "type_text" | "pointer_click" => {
+            "focus" | "invoke" | "set_value" | "type_text" | "pointer_click" | "key_chord" => {
                 self.act(action, &args)
             }
             "watch" => self.watch(&args),
@@ -490,6 +495,29 @@ impl UiaDriver {
                 }
                 self.backend.type_text(&window_id, &node, text)?
             }
+            "key_chord" => {
+                let keys: Vec<String> = args
+                    .get("keys")
+                    .and_then(Value::as_array)
+                    .ok_or_else(|| DriverError::invalid("keys is required"))?
+                    .iter()
+                    .map(|value| {
+                        value
+                            .as_str()
+                            .map(str::to_string)
+                            .ok_or_else(|| DriverError::invalid("every key must be a string"))
+                    })
+                    .collect::<Result<_>>()?;
+                if keys.is_empty() {
+                    return Err(DriverError::invalid("keys must not be empty"));
+                }
+                if keys.len() > MAX_CHORD_KEYS {
+                    return Err(DriverError::invalid(format!(
+                        "a key combination may hold at most {MAX_CHORD_KEYS} keys"
+                    )));
+                }
+                self.backend.key_chord(&window_id, &node, &keys)?
+            }
             other => return Err(DriverError::invalid(format!("unknown action {other:?}"))),
         }
 
@@ -760,6 +788,15 @@ fn action_contracts() -> Map<String, Value> {
         ),
     );
     actions.insert(
+        "key_chord".into(),
+        write(
+            "Press a key combination on the focused element, e.g. Ctrl+C or F5.",
+            "input",
+            "medium",
+            "non_idempotent",
+        ),
+    );
+    actions.insert(
         "pointer_click".into(),
         write(
             "Click the centre of an element.",
@@ -899,6 +936,11 @@ mod tests {
 
         fn pointer_click(&self, _window_id: &str, node: &Node) -> Result<()> {
             self.record(&format!("pointer_click:{}", node.node_id));
+            Ok(())
+        }
+
+        fn key_chord(&self, _window_id: &str, node: &Node, keys: &[String]) -> Result<()> {
+            self.record(&format!("key_chord:{}:{}", node.node_id, keys.join("+")));
             Ok(())
         }
     }
