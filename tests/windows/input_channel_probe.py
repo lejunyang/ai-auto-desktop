@@ -85,11 +85,26 @@ class RAWKEYBOARD(ctypes.Structure):
     ]
 
 
-class RAWMOUSE(ctypes.Structure):
+class RAWMOUSEBUTTONPAIR(ctypes.Structure):
     _fields_ = [
-        ("usFlags", wintypes.USHORT),
         ("usButtonFlags", wintypes.USHORT),
         ("usButtonData", wintypes.USHORT),
+    ]
+
+
+class RAWMOUSEBUTTONS(ctypes.Union):
+    _anonymous_ = ("pair",)
+    _fields_ = [("ulButtons", wintypes.ULONG), ("pair", RAWMOUSEBUTTONPAIR)]
+
+
+class RAWMOUSE(ctypes.Structure):
+    _anonymous_ = ("buttons",)
+    _fields_ = [
+        ("usFlags", wintypes.USHORT),
+        # RAWMOUSE aligns this union to a 4-byte boundary. Modelling the two
+        # USHORTs directly puts them at offsets 2/4, shifting every button flag
+        # into usButtonData. The real union starts at offset 4.
+        ("buttons", RAWMOUSEBUTTONS),
         ("ulRawButtons", wintypes.ULONG),
         ("lLastX", wintypes.LONG),
         ("lLastY", wintypes.LONG),
