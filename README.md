@@ -45,7 +45,9 @@ aad find hwnd:12454104 --name "保存"      # 精确定位，返回 ref
 aad do invoke    --target abc123:4:e9      # 触发默认动作
 aad do click     --target abc123:4:e9      # 点击元素中心
 aad do set-value --target abc123:4:e9 --value "写入的内容"
-aad do type-text --target abc123:4:e9 --text "逐字输入"
+aad do type-text --target abc123:4:e9 --text "逐字输入"            # 默认 Unicode
+# Raw Input 应用使用 keys；字符必须能由目标键盘布局表达，IME 开启时会明确拒绝
+aad do type-text --target abc123:4:e9 --text "aA1!" --mode keys
 aad do key-chord --target abc123:4:e9 --keys ctrl,a
 # 右键/双击/滚轮/悬停：位置只能是元素内的 0..1 比例，不接受屏幕坐标
 aad do gesture --target abc123:4:e9 --button right

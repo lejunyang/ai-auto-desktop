@@ -1,6 +1,6 @@
 # 键鼠补全设计（Windows P0）
 
-> 状态：`key_chord`（组合键/功能键）与 Windows 指针手势（右键/中键/双击、横纵滚轮、悬停、拖拽、元素内归一化位置）**已实现并通过隔离真机验证**；剩余 P0 是 `type_text` 的 keys 模式。目标是把现有 `SendInput` 通道"用满"，补齐 L0 语义动作表达不了的键鼠能力，同时**不破坏项目的安全不变量**（禁裸坐标、写操作必须锚定已校验元素）。
+> 状态：`key_chord`、Windows 指针手势与 `type_text` 的 layout-aware keys 模式均**已实现并通过隔离真机验证**。Windows P0 键鼠表达力补全完成。目标是把现有 `SendInput` 通道"用满"，补齐 L0 语义动作表达不了的键鼠能力，同时**不破坏项目的安全不变量**（禁裸坐标、写操作必须锚定已校验元素）。
 >
 > 依据：上一轮真机实测（见 `input-synthesis-and-background-execution.md` §6）。核心结论——虚拟键/扫描码对三通道全可见，`KEYEVENTF_UNICODE` 对 Raw Input 不可见；修饰键泄漏不自愈。
 
@@ -13,7 +13,7 @@
 | 纵向/横向 `scroll` | ✅ 已交付 | 隔离探针分别观察到 3 个竖向、2 个横向 wheel detent |
 | `hover` | ✅ 已交付 | 光标落在被观察元素内部，且 350 ms 停留已兑现 |
 | `drag` | ✅ 已交付 | 起终点均为已观察 target；探针观察到 left-down → move → left-up 完整序列 |
-| `type_text` 的 keys 模式 | ⏳ 后续增量 | — |
+| `type_text` 的 keys 模式 | ✅ 已交付 | 英文目标布局下 `aA1!` 精确落入 Edit；Raw Input 收到 12 个非零 VK 事件；emoji 整段零输入拒绝；IME 打开时 `DRIVER.INPUT_METHOD_ACTIVE` 且 0 事件 |
 
 指针改动文件：`aad-uia/src/backend.rs`（手势模型 + 非 Windows 默认拒绝）、`aad-uia/src/windows.rs`（SendInput 手势实现、边界内缩、失败恢复）、`aad-uia/src/driver.rs`（双 target 校验、参数互斥与范围校验）、`aad-mcp/src/tools.rs`（`pointer_gesture` / `drag` schema）、`aad-cli/src/main.rs`（`do gesture` / `do drag`）。隔离真机脚本：`tests/windows/verify_pointer_gesture_effect.py`；共享 Raw Input 探针的 `RAWMOUSE` 联合体对齐也已修正。
 
@@ -37,7 +37,7 @@
 | `drag` | 起点元素 + 终点元素 | 两端都需 `bounds && !offscreen` | `to`: 终点 target；两端可各带 `fraction` |
 
 设计取舍：
-- **不新增 `type_text` 的裸替换**，而是给它加一个 `mode` 选项（`unicode` 默认 / `keys`），修掉 Raw Input 盲区——但这属于对现有动作的增强，放在 key_chord 之后做，避免一次改太多。
+- `type_text` 新增 `mode`：`unicode` 保持默认，支持任意 Unicode；`keys` 按目标窗口线程的键盘布局用 `VkKeyScanExW` 映射为虚拟键，Raw Input 可见。整段先映射再发送；任何字符不可表达则零输入拒绝。目标输入法处于打开状态时同样拒绝，避免 IME 把按键改写成另一段文本。
 - **拖拽的中间路径**用插值（起点→终点若干 move 事件），只有起点和终点锚定元素；中间点是派生的，不是调用方给的，符合不变量。
 - **`scroll` 的方向**用语义值而非 delta 数字，避免"滚动量"变成变相坐标。
 
@@ -79,6 +79,6 @@
 2. `pointer_gesture`：右键/中键/双击 + 元素内归一化位置（✅ 已完成）
 3. 纵向/横向滚轮与悬停（✅ 已完成）
 4. 双 target 拖拽与失败释放恢复（✅ 已完成）
-5. `type_text` 的 keys 模式（下一步；修 Raw Input 盲区）
+5. `type_text` 的 keys 模式（✅ 已完成：目标布局映射、Caps Lock 修正、IME fail-closed、Raw Input 真机验证）
 
 每完成一项，本地 cargo test + clippy 全绿再进行下一项。真机验证必须使用脚本自行创建和销毁的隔离窗口，不得选择桌面上既有的用户窗口。全部完成后本地提交，不擅自 push。
