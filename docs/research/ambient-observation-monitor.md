@@ -215,7 +215,7 @@ node_id 只在单次快照内稳定，不能跨快照用。跨快照身份需要
 | --- | --- | --- |
 | W1 | ~root 级事件 spike：foreground 切换、root structure/focus/property 的事件率与噪声~ **已完成，证据见 §8**；下一阶段按 §5.1 的"前台 pid 过滤"方案落地 | ~~在真实桌面切应用、切浏览器 tab、开关对话框均收到事件；输出事件量统计；结论回写本文~~ 已完成 |
 | W2 | ~Windows 观察会话：常驻 root 订阅 + foreground_changed + 有界缓冲/丢失计数 + `aad watch`~ 常驻会话与 `observe_start/poll/stop` 已完成并真机验证（§8.1）；**`aad watch` 入口与 trigger 聚合归 W3** | ~~连续运行 ≥10 分钟无订阅泄漏；切换 5 个应用全部产生且仅产生一条切换记录；dropped 可见~~ 20 秒 3 切换精确、0 丢弃、后台 pid 过滤为 0；10 分钟长稳在 W3 入口完成后补测 |
-| W3 | 树 diff 与增量 ChangeSet（含 value/states/结构增删），轮询兜底 | fixture 改值/开关控件/增删节点 diff 结果与人工核对一致；浏览器 tab 切换产出 added/removed；静默窗口零输出 |
+| W3 | ~树 diff 与增量 ChangeSet（含 value/states/结构增删），轮询兜底~ **已完成并真机验证（§8.2）：`aad watch` JSONL + trigger 聚合 + 树 diff + 1Hz 兜底 + 顶层窗口归属过滤** | ~~fixture 改值/开关控件/增删节点 diff 与人工核对一致；浏览器 tab 切换产出 added/removed；静默窗口零输出~~ 真实 Edge/Notepad/VS Code 端到端通过；单测覆盖 diff/身份/聚合；浏览器大变化降维留 W4 |
 | W4 | 资源约束、按应用静音配置、截图/OCR 兜底接入 | 长时运行内存有界；密码字段不出现在任何输出；截图仅在语义缺口时触发 |
 | M1 | macOS AXObserver + NSWorkspace，复用 diff 层 | 真机 Mac：应用/窗口切换、Safari/Chrome tab、文本值变化可观察；TCC 状态诚实上报 |
 
@@ -247,6 +247,20 @@ node_id 只在单次快照内稳定，不能跨快照用。跨快照身份需要
 实测暴露、留给 W3 消化的一点：**前台应用自身的 structure 噪声仍很密**——切回 VS Code 后 6 秒内 225 条，全部来自其语言服务器状态条。这不是过滤问题（它确实是前台应用），而是"事件不能直接当内容"的又一证据：W3 的 `aad watch` 必须用 `observe::triggers` 把同一 (窗口, 类型) 的爆发聚成一次重拍，再由快照 diff 产出 ChangeSet，而不是逐条转发。
 
 另：探针把 stdout 重定向到文件时中文窗口标题出现乱码，是重定向时代码页（非 UTF-8）所致的探针展示问题；`aad watch` 落 JSONL 时统一写 UTF-8，不复现。
+
+### 8.2 W3 增量管线与 `aad watch` 真机证据（2026-09-26）
+
+实现：`aad watch` CLI（JSONL），平台无关的 `observe::triggers`（按窗口+类型、静默窗口聚爆发）与 `observe::diff_trees`（跨快照身份匹配与 added/removed/changed），事件可经 serde 往返。循环严格采用 §4.2 的"事件叫醒、快照作证"：每批事件先聚合，再对**当前前台窗口**重拍一次快照、与该窗口上一次基线 diff，只输出增量；另有默认 1 Hz 的前台轮询兜底（可关）。
+
+真机 22 秒编排 Edge →（Ctrl+Tab）→ 记事本 → VS Code（`--full`，落 UTF-8 JSONL 文件），最终干净输出 9 行：
+
+- 3 条精确 `foreground_changed`；每个真实顶层窗口恰好一条 `window_baseline`（Code 368 节点、Edge 1000（触顶 truncated 如实标记）、Notepad 45）；切走 Edge 后其 tab 切换产出 `window_changes +670 -748 ~1`；全程 `dropped_events=0`、退出码 0。
+- 迭代中实测并修掉两个归属陷阱，值得记录：
+  1. **UIA 事件不能在回调里取窗口标题/句柄**。`CurrentNativeWindowHandle` 常指向内部渲染/弹窗（"Chrome Legacy Window"），对它拍快照只得到 1 个无用节点还会顶掉真窗口基线；而在 poll 时读前台标题又可能已切换。定稿：UIA 事件**只带 pid**，由消费侧按本批前台窗口（校验 pid 一致）归属。
+  2. **必须拒绝把内部/无标题/最小化窗口当目标**。定稿：只对真实、有标题、可见的顶层窗口拍快照，其余事件跳过，避免噪声与基线驱逐。
+- `--full` 基线含整树，单条 JSONL 较大（Edge 约 170KB），默认不带 `--full` 时首见窗口静默建立基线、只发增量，才是长期监控的形态。
+
+待办（如实记录）：`window_changes` 在浏览器这类整树随滚动/动画变化的应用上 added/removed 量仍偏大（数百），W4 需要对"子树整体替换 vs 内容滚动"再降维（如区域级/可视区域 diff、按 fingerprint 配对 moved）；macOS 仍未开工。
 
 由此把以下假设从"待验证"转为"已实测"：
 
