@@ -220,12 +220,13 @@ aad resume job-1 workflow.yaml --store runs.sqlite3
 aad mcp
 ```
 
-在 stdio 上说 JSON-RPC 2.0，protocolVersion `2024-11-05`。提供 14 个工具，分两类：
+在 stdio 上说 JSON-RPC 2.0，protocolVersion `2024-11-05`。提供 17 个工具，分两类：
 
-**看与做**（临场操作）：`list_apps`、`describe_window`、`find_element`、`focus`、`invoke`、
+**看与做**（临场操作）：`list_apps`、`overview_window`、`describe_window`、`find_element`、`focus`、`invoke`、
 `set_value`、`type_text`、`key_chord`、`pointer_click`、`pointer_gesture`、`drag`、`probe_environment`。
 
-**跑存好的流程**（重复劳动）：`list_workflows`、`describe_workflow`、`run_workflow`。
+**保存与运行流程**（重复劳动）：`save_workflow`、`list_workflows`、`describe_workflow`、`run_workflow`。
+`save_workflow` 可保留 layout-aware 文本、组合键、指针手势和双端点拖拽参数；每次回放都重新 snapshot 并从描述性 locator 定位。
 录一次、存进 store，之后 AI 按名字跑，比每次重新拼一遍点击序列可靠得多。
 
 ```

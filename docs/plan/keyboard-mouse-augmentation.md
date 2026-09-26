@@ -17,7 +17,7 @@
 
 指针改动文件：`aad-uia/src/backend.rs`（手势模型 + 非 Windows 默认拒绝）、`aad-uia/src/windows.rs`（SendInput 手势实现、边界内缩、失败恢复）、`aad-uia/src/driver.rs`（双 target 校验、参数互斥与范围校验）、`aad-mcp/src/tools.rs`（`pointer_gesture` / `drag` schema）、`aad-cli/src/main.rs`（`do gesture` / `do drag`）。隔离真机脚本：`tests/windows/verify_pointer_gesture_effect.py`；共享 Raw Input 探针的 `RAWMOUSE` 联合体对齐也已修正。
 
-> 注：`key_chord` 暂不进 `save_workflow` 可保存动作——workflow 的 `assemble.rs` 用单个 `argument` 字符串表达参数，而 keys 是数组，接入需改动 workflow 序列化格式，留待后续。即时调用（CLI `do` / MCP 工具）已完全可用。
+> 录制/回放闭环：`save_workflow` 与 GUI Recording 现已无损保存 `type_text.mode`、`key_chord.keys`、指针手势参数和 drag 的第二个描述性 locator；回放时两个端点都从 fresh snapshot 重新定位。可访问性事件仍不会自动推断原始快捷键、纯 hover 或 drag 路径，这些动作由操作者/agent 显式添加，而不是靠全局输入钩子偷录。
 
 ## 1. 不变量（实现全程不得违反）
 
