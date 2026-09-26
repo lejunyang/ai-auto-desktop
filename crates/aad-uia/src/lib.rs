@@ -30,6 +30,10 @@ pub mod observer_win;
 
 pub use backend::{Backend, CaptureLimits, CapturedTree, DriverError, SnapshotStore};
 pub use capture::{coalesce, recordable, CapturedEvent, EventBuffer, EventKind};
+pub use observe::{
+    diff_trees, triggers as fold_triggers, ChangeSet, EventElement, EventWindow, ObservationBuffer,
+    ObservationKind, ObservedEvent, Trigger,
+};
 pub use driver::{action_ids, is_node_action, is_write_action, UiaDriver, PROVIDER_NAME};
 pub use model::{Bounds, Locator, Node, Snapshot, States, Target, WindowInfo};
 

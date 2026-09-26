@@ -62,6 +62,12 @@ enum Command {
     Run(RunArgs),
     /// Record what someone does in a window, as replayable steps.
     Record(RecordArgs),
+    /// Continuously observe foreground app switches and in-app changes.
+    ///
+    /// Streams one JSON object per line (JSONL). Unlike `record`, it is not
+    /// anchored to one window: it follows the foreground application and
+    /// reports incremental snapshot diffs rather than replayable steps.
+    Watch(WatchArgs),
     /// Serve the Model Context Protocol over stdio, for AI clients.
     Mcp,
     /// Print the tools exposed over MCP.
@@ -372,6 +378,39 @@ struct RecordArgs {
     /// Print compact JSON instead of indented JSON.
     #[arg(long)]
     compact: bool,
+}
+
+#[derive(Args)]
+struct WatchArgs {
+    /// Stop after this many seconds; 0 runs until interrupted (Ctrl+C).
+    #[arg(long, default_value_t = 0)]
+    seconds: u64,
+    /// Only observe this window, from `aad apps` (default: follow foreground).
+    #[arg(long)]
+    window: Option<String>,
+    /// Also emit the full first snapshot of each newly focused window.
+    ///
+    /// Without it the first sighting of a window establishes a silent
+    /// baseline and only later changes are emitted, which is the point of an
+    /// incremental log.
+    #[arg(long)]
+    full: bool,
+    /// Poll the foreground window for changes at this rate even when no
+    /// events arrived, covering applications whose accessibility events are
+    /// missing or partial (WinForms, some Electron, remote desktops). 0
+    /// disables the fallback and trusts events alone.
+    #[arg(long, default_value_t = 1.0)]
+    poll_fallback_hz: f64,
+    /// Maximum nodes captured per re-snapshot.
+    #[arg(long, default_value_t = 1000)]
+    max_nodes: u32,
+    /// Write the JSONL stream to this file as UTF-8 instead of stdout.
+    #[arg(long)]
+    out: Option<PathBuf>,
+    /// Fold a burst of the same trigger within this many milliseconds into
+    /// one re-snapshot.
+    #[arg(long, default_value_t = 300)]
+    debounce_ms: u64,
 }
 
 #[derive(Subcommand)]
@@ -894,6 +933,7 @@ fn dispatch(command: &Command) -> (Value, u8) {
                 Ok(answer)
             })
         }
+        Command::Watch(args) => run_watch(args),
         Command::Do(action) => {
             let (name, raw_target, extra) = match action {
                 DoCommand::Focus(args) => ("focus", &args.target, json!({})),
@@ -1020,6 +1060,326 @@ fn describe_arguments(args: &DescribeArgs) -> Value {
         arguments.insert("max_nodes".into(), json!(nodes));
     }
     Value::Object(arguments)
+}
+
+/// Stream ambient observations as JSONL: one JSON object per line.
+///
+/// The loop is "events wake, snapshots tell the truth": native events are
+/// folded into per-window triggers, and each trigger causes one fresh
+/// foreground snapshot which is diffed against that window's previous
+/// snapshot. Only the incremental ChangeSet is emitted. A low-frequency poll
+/// covers applications whose events do not arrive.
+fn run_watch(args: &WatchArgs) -> (Value, u8) {
+    let driver = match aad_uia::native_driver() {
+        Ok(driver) => driver,
+        Err(error) => {
+            return (
+                failure(
+                    &error.code,
+                    &error.message,
+                    Some(json!({"hint": "Run `aad probe` to see what is missing."})),
+                ),
+                EXIT_FAILED,
+            )
+        }
+    };
+
+    // JSONL goes to a file or stdout. Every line is a complete, self-contained
+    // JSON object; diagnostics still go to stderr so the stream stays parseable.
+    let mut sink: Box<dyn std::io::Write> = match &args.out {
+        Some(path) => match std::fs::File::create(path) {
+            Ok(file) => Box::new(std::io::BufWriter::new(file)),
+            Err(error) => {
+                return (
+                    failure("AAD.CANNOT_OPEN_OUTPUT", &error.to_string(), None),
+                    EXIT_FAILED,
+                )
+            }
+        },
+        None => Box::new(std::io::stdout().lock()),
+    };
+    let emit = |sink: &mut Box<dyn std::io::Write>, mut object: Value| {
+        object["emitted_at"] = json!(aad_runtime::journal::now_rfc3339());
+        // Compact on purpose: one object per line is the JSONL contract.
+        let line = serde_json::to_string(&object).unwrap_or_else(|_| "{}".to_string());
+        let _ = writeln!(sink, "{line}");
+        let _ = sink.flush();
+    };
+
+    let started = match driver.call("observe_start", &json!({})) {
+        Ok(value) => value,
+        Err(error) => return (driver_failure(&error), EXIT_FAILED),
+    };
+    let observe_id = started["observe_id"]
+        .as_str()
+        .expect("observe_start returns an observe id")
+        .to_string();
+    emit(
+        &mut sink,
+        json!({"kind": "session_started", "sources": started["sources"], "observe_id": observe_id}),
+    );
+
+    // Per-window baseline snapshots, keyed by the backend's window id. A
+    // window revisited after being closed is a new baseline either way, which
+    // re-keying by the current window id naturally expresses.
+    let mut baselines: std::collections::HashMap<String, aad_uia::Snapshot> =
+        std::collections::HashMap::new();
+
+    let started_at = std::time::Instant::now();
+    let deadline = if args.seconds == 0 {
+        None
+    } else {
+        Some(started_at + std::time::Duration::from_secs(args.seconds))
+    };
+    let quiet = std::time::Duration::from_millis(args.debounce_ms.max(1));
+    let fallback_interval = if args.poll_fallback_hz > 0.0 {
+        Some(std::time::Duration::from_secs_f64(1.0 / args.poll_fallback_hz))
+    } else {
+        None
+    };
+    let tick = std::time::Duration::from_millis(100);
+    let mut last_fallback = std::time::Instant::now();
+    let mut total_dropped: u64 = 0;
+
+    let finish = |sink: &mut Box<dyn std::io::Write>,
+                  driver: &aad_uia::UiaDriver,
+                  observe_id: &str,
+                  total_dropped: u64,
+                  stopped_early: bool| {
+        let _ = driver.call("observe_stop", &json!({"observe_id": observe_id}));
+        let mut summary = json!({
+            "kind": "session_ended",
+            "dropped_events": total_dropped,
+        });
+        summary["stopped_early"] = json!(stopped_early);
+        emit(sink, summary);
+    };
+
+    loop {
+        if let Some(deadline) = deadline {
+            if std::time::Instant::now() >= deadline {
+                finish(&mut sink, &driver, &observe_id, total_dropped, false);
+                return (json!({"watched": true, "dropped_events": total_dropped}), EXIT_OK);
+            }
+        }
+        std::thread::sleep(tick);
+
+        let polled = match driver.call("observe_poll", &json!({"observe_id": observe_id})) {
+            Ok(value) => value,
+            // The session vanished (e.g. driver error): report and stop rather
+            // than spinning on a dead subscription.
+            Err(error) => {
+                finish(&mut sink, &driver, &observe_id, total_dropped, true);
+                return (driver_failure(&error), EXIT_FAILED);
+            }
+        };
+        total_dropped += polled["dropped_events"].as_u64().unwrap_or(0);
+        let events_json = polled["events"].as_array().cloned().unwrap_or_default();
+        let mut events: Vec<aad_uia::ObservedEvent> = events_json
+            .iter()
+            .filter_map(|value| serde_json::from_value(value.clone()).ok())
+            .collect();
+
+        // Fallback: even with no events, periodically re-look at the foreground
+        // window so applications with a missing event surface cannot hide a
+        // change forever.
+        let fallback_due = fallback_interval
+            .is_some_and(|interval| last_fallback.elapsed() >= interval);
+        if fallback_due {
+            last_fallback = std::time::Instant::now();
+            events.push(aad_uia::ObservedEvent {
+                sequence: u64::MAX,
+                kind: aad_uia::ObservationKind::Other,
+                source: "poll_fallback".to_string(),
+                window: aad_uia::EventWindow::unknown(),
+                element: None,
+                observed_at: std::time::Instant::now(),
+            });
+        }
+
+        if events.is_empty() {
+            continue;
+        }
+
+        // Fold the raw burst into a few (window, kind) re-snapshot triggers.
+        let triggers = aad_uia::fold_triggers(&events, quiet);
+
+        // Resolve the current foreground window once for this batch. UIA
+        // events only carry a pid, and a foreground switch that is still
+        // settling can outrun a title read: attributing the whole batch to one
+        // window snapshot is both correct and cheap.
+        let foreground_id = if args.window.is_some() {
+            args.window.clone()
+        } else {
+            current_foreground_id(&driver)
+        };
+        let foreground_listing = foreground_id
+            .as_ref()
+            .and_then(|id| window_listing(&driver, id));
+
+        let mut targets: Vec<Option<String>> = Vec::new();
+        let mut switches: Vec<&aad_uia::ObservedEvent> = Vec::new();
+        for trigger in &triggers {
+            if trigger.kind == aad_uia::ObservationKind::ForegroundChanged {
+                if let Some(event) = events
+                    .iter()
+                    .find(|event| event.kind == aad_uia::ObservationKind::ForegroundChanged)
+                {
+                    switches.push(event);
+                }
+                targets.push(trigger.window.window_id.clone());
+            } else {
+                // pid-only UIA events belong to the foreground window when the
+                // process matches; attributed WinEvent events name their own
+                // window. Internal popups/renderers are excluded below.
+                let candidate = match &trigger.window.window_id {
+                    Some(id) => Some(id.clone()),
+                    None => foreground_listing.as_ref().map(|info| info.window_id.clone()),
+                };
+                if let Some(id) = candidate {
+                    let placeable = match window_listing(&driver, &id) {
+                        // Snapshot real, titled, visible top-level windows only.
+                        // WinEvent/UIA attribute an internal renderer or popup
+                        // ("Chrome Legacy Window", a 1-node hidden helper);
+                        // walking it produces noise and, worse, evicts the real
+                        // window's baseline.
+                        Some(info) => info.process_id == trigger.window.process_id
+                            && !info.title.is_empty()
+                            && !info.is_minimized,
+                        None => false,
+                    };
+                    if placeable {
+                        targets.push(Some(id));
+                    }
+                }
+            }
+        }
+        // A pure fallback tick (folded away as nothing new) still re-looks at
+        // the foreground once.
+        if triggers.is_empty() && fallback_due {
+            targets.push(foreground_id.clone());
+        }
+
+        for switch in switches {
+            emit(
+                &mut sink,
+                json!({
+                    "kind": "foreground_changed",
+                    "source": switch.source,
+                    "window": serde_json::to_value(&switch.window).unwrap_or(Value::Null),
+                }),
+            );
+        }
+
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for target in targets {
+            let Some(window_id) = target else { continue };
+            if !seen.insert(window_id.clone()) {
+                continue;
+            }
+            if let Some(only) = &args.window {
+                if only != &window_id {
+                    continue;
+                }
+            }
+            if let Err(error) = resnapshot_and_diff(
+                &driver,
+                &mut sink,
+                &mut baselines,
+                &window_id,
+                args.max_nodes,
+                args.full,
+                &emit,
+            ) {
+                // A window closing mid-switch is normal: skip it this round,
+                // keep watching. Persistent errors still surface on stderr.
+                eprintln!("watch: snapshot of {window_id} skipped: {}", error.message);
+            }
+        }
+    }
+}
+
+/// Resolve one window id to its current listing, or None when it is gone.
+fn window_listing(driver: &aad_uia::UiaDriver, window_id: &str) -> Option<aad_uia::WindowInfo> {
+    let listing = driver.call("list_windows", &json!({})).ok()?;
+    listing["windows"]
+        .as_array()?
+        .iter()
+        .filter_map(|value| serde_json::from_value::<aad_uia::WindowInfo>(value.clone()).ok())
+        .find(|window| window.window_id == window_id)
+}
+
+/// The foreground window's id, or None when it cannot be determined.
+fn current_foreground_id(driver: &aad_uia::UiaDriver) -> Option<String> {
+    let listing = driver.call("list_windows", &json!({})).ok()?;
+    listing["windows"]
+        .as_array()?
+        .iter()
+        .find(|window| window["is_foreground"] == json!(true))
+        .and_then(|window| window["window_id"].as_str())
+        .map(str::to_string)
+}
+
+/// Capture one window, diff against its stored baseline, emit the ChangeSet,
+/// and roll the baseline forward. The first capture of a window becomes a
+/// baseline (and, with --full, an emitted snapshot).
+fn resnapshot_and_diff(
+    driver: &aad_uia::UiaDriver,
+    sink: &mut Box<dyn std::io::Write>,
+    baselines: &mut std::collections::HashMap<String, aad_uia::Snapshot>,
+    window_id: &str,
+    max_nodes: u32,
+    full_first: bool,
+    emit: &impl Fn(&mut Box<dyn std::io::Write>, Value),
+) -> Result<(), aad_uia::DriverError> {
+    let captured = driver.call(
+        "snapshot",
+        &json!({"window_id": window_id, "max_nodes": max_nodes}),
+    )?;
+    let snapshot: aad_uia::Snapshot = serde_json::from_value(captured.clone())
+        .map_err(|error| aad_uia::DriverError::invalid(format!("bad snapshot json: {error}")))?;
+
+    match baselines.get(window_id) {
+        None => {
+            if full_first {
+                emit(
+                    sink,
+                    json!({
+                        "kind": "window_baseline",
+                        "window": captured["window"].clone(),
+                        "revision": snapshot.revision,
+                        "node_count": snapshot.nodes.len(),
+                        "snapshot": captured,
+                    }),
+                );
+            }
+            baselines.insert(window_id.to_string(), snapshot);
+        }
+        Some(previous) => {
+            let changes = aad_uia::diff_trees(previous, &snapshot);
+            if !changes.is_empty() {
+                let (added, removed, changed) = changes.counts();
+                emit(
+                    sink,
+                    json!({
+                        "kind": "window_changes",
+                        "window": captured["window"].clone(),
+                        "baseline_revision": previous.revision,
+                        "revision": snapshot.revision,
+                        "added": serde_json::to_value(&changes.added).unwrap_or(Value::Null),
+                        "removed": serde_json::to_value(&changes.removed).unwrap_or(Value::Null),
+                        "changed": serde_json::to_value(&changes.changed).unwrap_or(Value::Null),
+                        "added_count": added,
+                        "removed_count": removed,
+                        "changed_count": changed,
+                        "truncated": snapshot.truncated,
+                    }),
+                );
+            }
+            baselines.insert(window_id.to_string(), snapshot);
+        }
+    }
+    Ok(())
 }
 
 /// Run a closure against the native driver, reporting a missing driver clearly.

@@ -17,7 +17,7 @@
 //! `docs/research/ambient-observation-monitor.md` §8).
 
 use crate::model::{Node, Snapshot};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -28,7 +28,7 @@ use std::time::Instant;
 /// Smaller than the raw platform vocabulary: Win32 and UI Automation each emit
 /// dozens of notification ids, many of them repaint noise. Only the families
 /// that answer "what is the user doing / what changed" survive.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ObservationKind {
     /// The foreground window changed to another top-level window.
@@ -68,7 +68,7 @@ impl ObservationKind {
 /// for), so this carries only what the native callback already knows: the
 /// window handle as an opaque id plus pid/title. Resolution into a full
 /// [`WindowInfo`] happens when the event is consumed.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EventWindow {
     /// The backend's window id (`hwnd:<isize>` on Windows). `None` when the
     /// event could not be attributed to a window.
@@ -95,7 +95,7 @@ impl EventWindow {
 /// every property inside a callback is expensive and racy. The fields here are
 /// the ones the native event can report without a tree walk; the authoritative
 /// element state comes from the follow-up snapshot diff.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct EventElement {
     pub role: Option<String>,
     pub name: Option<String>,
@@ -104,19 +104,27 @@ pub struct EventElement {
 }
 
 /// One ambient observation, as a log entry.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ObservedEvent {
     /// Position in observed order, unique for the session. Gaps mean events
     /// were dropped under pressure (reported separately via the drop count).
     pub sequence: u64,
     pub kind: ObservationKind,
     /// Which native mechanism saw it (`winevent` / `uia`), for gap diagnosis.
-    pub source: &'static str,
+    pub source: String,
+    /// Window attribution. For UIA foreground-filtered events this is
+    /// deliberately left as the process id only: the sender's native handle can
+    /// be an internal renderer/popup ("Chrome Legacy Window"), and resolving
+    /// the title against the foreground window at *poll* time is wrong too (the
+    /// foreground may already have moved on). The consumer attributes the event
+    /// to the foreground window of its batch, keyed on process id.
     pub window: EventWindow,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none", default)]
     pub element: Option<EventElement>,
-    /// Monotonic session time; the consumer stamps wall-clock time.
-    #[serde(skip)]
+    /// Monotonic session time; not serialised across processes. A value
+    /// reconstructed on the consumer side is stamped with the current time —
+    /// the consumer folds bursts over wall-clock gaps anyway.
+    #[serde(skip, default = "Instant::now")]
     pub observed_at: Instant,
 }
 
@@ -159,7 +167,7 @@ impl ObservationBuffer {
     pub fn push(
         &self,
         kind: ObservationKind,
-        source: &'static str,
+        source: impl Into<String>,
         window: EventWindow,
         element: Option<EventElement>,
     ) {
@@ -171,7 +179,7 @@ impl ObservationBuffer {
         state.events.push_back(ObservedEvent {
             sequence,
             kind,
-            source,
+            source: source.into(),
             window,
             element,
             observed_at: Instant::now(),
@@ -216,8 +224,7 @@ impl ObservationBuffer {
 /// `quiet` defines how long the same *(window, kind)* must be silent before it
 /// counts as a new trigger: back-to-back value events while typing collapse
 /// into one; a second edit seconds later is a new trigger.
-pub fn triggers(events: &[ObservedEvent], quiet: std::time::Duration) -> Vec<Trigger> {
-    // Indexed by (window_id, kind) so the same signal from two windows of one
+pub fn triggers(events: &[ObservedEvent], quiet: std::time::Duration) -> Vec<Trigger> {    // Indexed by (window_id, kind) so the same signal from two windows of one
     // process (two editor windows, two browser windows) stays distinct.
     let mut by_key: HashMap<(Option<String>, ObservationKind), usize> = HashMap::new();
     let mut out: Vec<Trigger> = Vec::new();
@@ -250,6 +257,7 @@ pub struct Trigger {
     pub window: EventWindow,
     /// How many raw events were folded into this trigger.
     pub count: u64,
+    pub source: String,
     pub last_at: Instant,
 }
 
@@ -259,6 +267,7 @@ impl Trigger {
             kind: event.kind,
             window: event.window.clone(),
             count: 1,
+            source: event.source.clone(),
             last_at: event.observed_at,
         }
     }
@@ -578,7 +587,7 @@ mod tests {
         ObservedEvent {
             sequence: 0,
             kind,
-            source: "test",
+            source: "test".to_string(),
             window: EventWindow {
                 window_id: window.map(str::to_string),
                 process_id: 1,
@@ -596,7 +605,7 @@ mod tests {
         for _ in 0..3 {
             buffer.push(
                 ObservationKind::FocusChanged,
-                "test",
+                "test".to_string(),
                 EventWindow::unknown(),
                 None,
             );

@@ -219,7 +219,7 @@ mod tests {
         ObservedEvent {
             sequence: 0,
             kind,
-            source: "fake",
+            source: "fake".to_string(),
             window: EventWindow::unknown(),
             element: None,
             observed_at: Instant::now(),

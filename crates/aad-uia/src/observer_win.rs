@@ -185,7 +185,7 @@ unsafe extern "system" fn on_observe_win_event(
                 shared.foreground_pid.store(pid, Ordering::SeqCst);
                 shared
                     .buffer
-                    .push(kind, "winevent", event_window(hwnd), None);
+                    .push(kind, "winevent".to_string(), event_window(hwnd), None);
                 return;
             }
 
@@ -196,7 +196,7 @@ unsafe extern "system" fn on_observe_win_event(
             }
             shared
                 .buffer
-                .push(kind, "winevent", event_window(hwnd), None);
+                .push(kind, "winevent".to_string(), event_window(hwnd), None);
         });
     }));
 }
@@ -226,12 +226,14 @@ impl IUIAutomationFocusChangedEventHandler_Impl for ObserveFocusHandler_Impl {
         if !self.shared.is_foreground_pid(pid) {
             return Ok(());
         }
-        self.shared.buffer.push(
-            ObservationKind::FocusChanged,
-            "uia",
-            window_from_pid(pid, sender),
-            element_summary(sender),
-        );
+        self.shared
+            .buffer
+            .push(
+                ObservationKind::FocusChanged,
+                "uia".to_string(),
+                window_from_pid(pid, sender),
+                element_summary(sender),
+            );
         Ok(())
     }
 }
@@ -264,7 +266,12 @@ impl IUIAutomationEventHandler_Impl for ObserveAutomationHandler_Impl {
         };
         self.shared
             .buffer
-            .push(kind, "uia", window_from_pid(pid, sender), element_summary(sender));
+            .push(
+            kind,
+            "uia".to_string(),
+            window_from_pid(pid, sender),
+            element_summary(sender),
+        );
         Ok(())
     }
 }
@@ -296,31 +303,36 @@ impl IUIAutomationPropertyChangedEventHandler_Impl for ObservePropertyHandler_Im
         };
         self.shared
             .buffer
-            .push(kind, "uia", window_from_pid(pid, sender), element_summary(sender));
+            .push(
+            kind,
+            "uia".to_string(),
+            window_from_pid(pid, sender),
+            element_summary(sender),
+        );
         Ok(())
     }
 }
 
-/// Build window attribution for a UIA sender. UIA gives a pid directly; the
-/// title comes from the foreground window, since the filtered event is by
-/// definition foreground.
-fn window_from_pid(pid: u32, sender: Option<&IUIAutomationElement>) -> EventWindow {
-    let foreground = unsafe { GetForegroundWindow() };
-    let mut window = event_window(foreground);
-    if window.process_id != pid {
-        // The sender is foreground-pid but not the foreground top-level window
-        // (a child window / popup): trust the sender's pid and keep whatever
-        // title is available, rather than misattributing to another process.
-        window = EventWindow {
-            window_id: sender
-                .and_then(|element| unsafe { element.CurrentNativeWindowHandle() }.ok())
-                .map(|handle| format!("hwnd:{}", handle.0 as isize)),
-            process_id: pid,
-            process_name: process_name(pid),
-            title: None,
-        };
+/// Window attribution for a UIA sender.
+///
+/// Only the process is reported. Two measured failures argue against doing
+/// more inside the callback:
+///
+/// - `CurrentNativeWindowHandle` frequently returns an internal renderer or
+///   popup ("Chrome Legacy Window"), not the top-level window the user thinks
+///   of; snapshotting it yields a useless 1-node tree;
+/// - reading the foreground window's title here is racy, because by the time
+///   the event is drained the foreground may already have changed.
+///
+/// The consumer attributes a pid-only event to the foreground window of its
+/// own batch, which is the window the user was actually looking at.
+fn window_from_pid(pid: u32, _sender: Option<&IUIAutomationElement>) -> EventWindow {
+    EventWindow {
+        window_id: None,
+        process_id: pid,
+        process_name: process_name(pid),
+        title: None,
     }
-    window
 }
 
 /// A live, desktop-wide observation session.
