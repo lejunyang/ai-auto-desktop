@@ -411,6 +411,16 @@ struct WatchArgs {
     /// one re-snapshot.
     #[arg(long, default_value_t = 300)]
     debounce_ms: u64,
+    /// Print the full structural ChangeSet instead of the filtered digest.
+    ///
+    /// Default is the content-first digest: anonymous structural noise is
+    /// counted, only readable text and named controls are listed, and
+    /// empty-value repaint churn is dropped.
+    #[arg(long)]
+    raw: bool,
+    /// Maximum items kept per digest category.
+    #[arg(long, default_value_t = 40)]
+    max_items: usize,
 }
 
 #[derive(Subcommand)]
@@ -1289,6 +1299,8 @@ fn run_watch(args: &WatchArgs) -> (Value, u8) {
                 &window_id,
                 args.max_nodes,
                 args.full,
+                args.raw,
+                args.max_items,
                 &emit,
             ) {
                 // A window closing mid-switch is normal: skip it this round,
@@ -1330,6 +1342,8 @@ fn resnapshot_and_diff(
     window_id: &str,
     max_nodes: u32,
     full_first: bool,
+    raw: bool,
+    max_items: usize,
     emit: &impl Fn(&mut Box<dyn std::io::Write>, Value),
 ) -> Result<(), aad_uia::DriverError> {
     let captured = driver.call(
@@ -1357,7 +1371,11 @@ fn resnapshot_and_diff(
         }
         Some(previous) => {
             let changes = aad_uia::diff_trees(previous, &snapshot);
-            if !changes.is_empty() {
+            if changes.is_empty() {
+                baselines.insert(window_id.to_string(), snapshot);
+                return Ok(());
+            }
+            if raw {
                 let (added, removed, changed) = changes.counts();
                 emit(
                     sink,
@@ -1375,6 +1393,30 @@ fn resnapshot_and_diff(
                         "truncated": snapshot.truncated,
                     }),
                 );
+            } else {
+                let digest = aad_uia::digest(
+                    &changes,
+                    &aad_uia::DigestOptions { max_items, include_states: true },
+                );
+                // A digest with no content is pure structural churn: skip it so
+                // an idle Electron workbench stays silent.
+                if !digest.is_empty() {
+                    emit(
+                        sink,
+                        json!({
+                            "kind": "window_activity",
+                            "window": captured["window"].clone(),
+                            "baseline_revision": previous.revision,
+                            "revision": snapshot.revision,
+                            "appeared": serde_json::to_value(&digest.appeared).unwrap_or(Value::Null),
+                            "disappeared": serde_json::to_value(&digest.disappeared).unwrap_or(Value::Null),
+                            "text_changes": serde_json::to_value(&digest.text_changes).unwrap_or(Value::Null),
+                            "state_changes": serde_json::to_value(&digest.state_changes).unwrap_or(Value::Null),
+                            "structural_noise": digest.structural_noise,
+                            "truncated": digest.truncated || snapshot.truncated,
+                        }),
+                    );
+                }
             }
             baselines.insert(window_id.to_string(), snapshot);
         }

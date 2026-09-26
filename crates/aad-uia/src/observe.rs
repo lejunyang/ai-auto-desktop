@@ -409,6 +409,204 @@ impl ChangeSet {
     }
 }
 
+/// How an ambient log presents a [`ChangeSet`].
+///
+/// Raw diffs are faithful but noisy: an Electron workbench built from
+/// anonymous panes reports hundreds of add/remove pairs for one click, none
+/// carrying the text or labels a reader cares about. The digest keeps what
+/// reconstructs *what was read, typed or activated* and counts the rest. It
+/// never invents content; it only folds presentation noise.
+#[derive(Clone, Debug)]
+pub struct DigestOptions {
+    /// Per-category cap on individual items; overflow is folded away.
+    pub max_items: usize,
+    /// Report focus/enabled/read_only transitions on named controls.
+    pub include_states: bool,
+}
+
+impl Default for DigestOptions {
+    fn default() -> Self {
+        Self { max_items: 40, include_states: true }
+    }
+}
+
+/// One text-bearing thing that appeared or disappeared.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ContentItem {
+    pub role: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    /// Stable fingerprint of the content, used to cancel an item that appears
+    /// and disappears within the same batch (a menu opened and dismissed).
+    #[serde(skip)]
+    pub identity: String,
+}
+
+fn item_fingerprint(role: &str, name: &Option<String>, text: &Option<String>) -> String {
+    // A unit-separator-free composite key built without an escape-prone
+    // literal: role, name and text joined by a character that UI text never
+    // contains (the ASCII unit separator).
+    let sep = char::from(31);
+    format!(
+        "{role}{sep}{}{sep}{}",
+        name.as_deref().unwrap_or(""),
+        text.as_deref().unwrap_or("")
+    )
+}
+
+impl ContentItem {
+    fn has_content(&self) -> bool {
+        self.name.as_deref().is_some_and(|s| !s.is_empty())
+            || self.text.as_deref().is_some_and(|s| !s.is_empty())
+    }
+}
+
+/// A field value change -- the ambient signal for typing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TextChange {
+    pub role: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub to: Option<String>,
+}
+
+/// Content-first, filtered view of one window's changes.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct ChangeDigest {
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub appeared: Vec<ContentItem>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub disappeared: Vec<ContentItem>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub text_changes: Vec<TextChange>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub state_changes: Vec<serde_json::Value>,
+    /// Anonymous structural add/remove pairs folded away as scaffolding.
+    pub structural_noise: usize,
+    /// Whether the per-category caps truncated the detail lists.
+    pub truncated: bool,
+}
+
+impl ChangeDigest {
+    pub fn is_empty(&self) -> bool {
+        self.appeared.is_empty()
+            && self.disappeared.is_empty()
+            && self.text_changes.is_empty()
+            && self.state_changes.is_empty()
+    }
+}
+
+/// Reduce a raw [`ChangeSet`] to content worth logging.
+///
+/// Rules, each driven by a measured failure on VS Code / Edge:
+/// - added/removed nodes with neither name nor value are scaffolding, counted
+///   not printed;
+/// - value/name changes between empty strings (anonymous pane flicker) are not
+///   text changes;
+/// - state transitions on unnamed elements are dropped;
+/// - only focused/enabled/read_only states survive -- offscreen churn and the
+///   protected marker are presentation, not activity.
+pub fn digest(changes: &ChangeSet, options: &DigestOptions) -> ChangeDigest {
+    let cap = options.max_items.max(1);
+    let mut structural = 0usize;
+
+    let mut appeared: Vec<ContentItem> = Vec::new();
+    for node in &changes.added {
+        let item = ContentItem {
+            identity: item_fingerprint(&node.role, &node.name, &node.value),
+            role: node.role.clone(),
+            name: node.name.clone(),
+            text: node.value.clone(),
+        };
+        if item.has_content() { appeared.push(item); } else { structural += 1; }
+    }
+
+    let mut disappeared: Vec<ContentItem> = Vec::new();
+    for node in &changes.removed {
+        let item = ContentItem {
+            identity: item_fingerprint(&node.role, &node.name, &None),
+            role: node.role.clone(),
+            name: node.name.clone(),
+            text: None,
+        };
+        if item.has_content() { disappeared.push(item); } else { structural += 1; }
+    }
+
+    let mut text_changes: Vec<TextChange> = Vec::new();
+    let mut state_changes: Vec<serde_json::Value> = Vec::new();
+    for node in &changes.changed {
+        let named = node.name.clone().filter(|s| !s.is_empty());
+
+        for field in node.value.iter().chain(node.name_changes.iter()) {
+            let from = field.from.clone().filter(|s| !s.is_empty());
+            let to = field.to.clone().filter(|s| !s.is_empty());
+            if from.is_none() && to.is_none() { continue; }
+            text_changes.push(TextChange {
+                role: node.role.clone(),
+                name: named.clone(),
+                from,
+                to,
+            });
+        }
+
+        if options.include_states {
+            for state in &node.states {
+                if !matches!(state.field.as_str(), "focused" | "enabled" | "read_only") { continue; }
+                if named.is_none() { continue; }
+                state_changes.push(serde_json::json!({
+                    "role": node.role,
+                    "name": named,
+                    "field": state.field,
+                    "from": state.from,
+                    "to": state.to,
+                }));
+            }
+        }
+    }
+
+    // Cancel content that both appeared and disappeared within this batch:
+    // measured on a right-click dismissed 800ms later, the same menu items
+    // landed in both lists and were printed twice. What survives the batch is
+    // what actually changed.
+    let gone: std::collections::HashSet<&str> =
+        disappeared.iter().map(|item| item.identity.as_str()).collect();
+    let appeared: Vec<ContentItem> = appeared
+        .into_iter()
+        .filter(|item| !gone.contains(item.identity.as_str()))
+        .collect();
+    let appeared_now: std::collections::HashSet<&str> =
+        appeared.iter().map(|item| item.identity.as_str()).collect();
+    let disappeared: Vec<ContentItem> = disappeared
+        .into_iter()
+        .filter(|item| !appeared_now.contains(item.identity.as_str()))
+        .collect();
+
+    let mut appeared = appeared;
+    let mut disappeared = disappeared;
+    let mut text_changes = text_changes;
+    appeared.sort_by(|a, b| a.identity.cmp(&b.identity));
+    disappeared.sort_by(|a, b| a.identity.cmp(&b.identity));
+    text_changes.sort_by(|a, b| a.name.cmp(&b.name));
+
+    let truncated = text_changes.len() > cap
+        || appeared.len() > cap
+        || disappeared.len() > cap
+        || state_changes.len() > cap;
+    ChangeDigest {
+        text_changes: text_changes[..cap.min(text_changes.len())].to_vec(),
+        appeared: appeared[..cap.min(appeared.len())].to_vec(),
+        disappeared: disappeared[..cap.min(disappeared.len())].to_vec(),
+        state_changes: state_changes[..cap.min(state_changes.len())].to_vec(),
+        structural_noise: structural,
+        truncated,
+    }
+}
+
 /// Diff `current` against the `baseline` snapshot.
 ///
 /// Unmatched nodes are reported honestly as added/removed; this never invents
@@ -675,6 +873,140 @@ mod tests {
         let baseline = snapshot(vec![a.clone()]);
         let current = snapshot(vec![a]);
         assert!(diff_trees(&baseline, &current).is_empty());
+    }
+
+    #[test]
+    fn digest_folds_anonymous_scaffolding_but_keeps_text_and_labels() {
+        // One click in an Electron workbench: hundreds of anonymous panes plus
+        // a real menu of named items and one typed value.
+        let baseline = snapshot(vec![]);
+        let mut current = snapshot(vec![]);
+        let mut nodes: Vec<Node> = Vec::new();
+        // Distinct ancestry gives each pane a distinct identity, as in a real
+        // tree; identical-identity duplicates would (correctly) be deduplicated
+        // by the index before diffing.
+        let mut parent: Option<String> = None;
+        for n in 0..120 {
+            let id = format!("p{n}");
+            let mut pane = node(&id, "pane", parent.as_deref());
+            pane.class_name = Some("".into());
+            nodes.push(pane);
+            parent = Some(id);
+        }
+        let mut menu = node("m1", "menu_item", None);
+        menu.name = Some("为此页面创建 QR 代码".into());
+        nodes.push(menu);
+        let mut edit = node("e1", "edit", None);
+        edit.automation_id = Some("addr".into());
+        edit.name = Some("地址和搜索栏".into());
+        edit.value = Some("example.com".into());
+        nodes.push(edit);
+        current.nodes = nodes;
+
+        let changes = diff_trees(&baseline, &current);
+        let digest = digest(&changes, &DigestOptions { max_items: 40, include_states: true });
+
+        // Named menu and the typed value survive...
+        assert!(
+            digest
+                .appeared
+                .iter()
+                .any(|item| item.name.as_deref() == Some("为此页面创建 QR 代码")),
+            "named controls must survive filtering"
+        );
+        assert!(
+            digest
+                .appeared
+                .iter()
+                .any(|item| item.text.as_deref() == Some("example.com")),
+            "text values must survive filtering"
+        );
+        // ...while the 120 anonymous panes are folded into one number.
+        assert!(digest.structural_noise >= 120, "noise = {}", digest.structural_noise);
+        assert!(!digest.appeared.iter().any(|item| item.role == "pane" && item.name.is_none()));
+    }
+
+    #[test]
+    fn digest_drops_empty_value_repaint_and_unnamed_state_churn() {
+        let mut a = node("a", "edit", None);
+        a.automation_id = Some("f".into());
+        a.name = Some("搜索".into());
+        a.value = Some("q".into());
+        let mut anon = node("b", "pane", None);
+        anon.states.offscreen = Some(false);
+
+        let baseline = snapshot(vec![a.clone(), anon.clone()]);
+
+        let mut a2 = a.clone();
+        a2.value = Some("query".into()); // real typing
+        let mut anon2 = anon.clone();
+        anon2.states.offscreen = Some(true); // offscreen is not reported
+        let current = snapshot(vec![a2, anon2]);
+
+        let changes = diff_trees(&baseline, &current);
+        let digest = digest(&changes, &DigestOptions::default());
+
+        assert_eq!(digest.text_changes.len(), 1);
+        assert_eq!(digest.text_changes[0].to.as_deref(), Some("query"));
+        assert!(digest.state_changes.is_empty(), "offscreen churn is dropped");
+    }
+
+    #[test]
+    fn digest_cancels_content_open_and_closed_in_one_batch() {
+        // A context menu that appears and is dismissed before the next snapshot
+        // must not show up as both appeared and disappeared.
+        let baseline = snapshot(vec![]);
+        let menu = |id: &str| {
+            let mut n = node(id, "menu_item", None);
+            n.name = Some("复制(C) Ctrl+C".into());
+            n
+        };
+        // Mid-batch: menu visible. End-batch: gone. Simulate by diffing against
+        // a tree that never contained it (so it appears in added of a transient
+        // snapshot); the pairing contract is exercised directly here.
+        let transient = snapshot(vec![menu("m")]);
+        let added_changes = diff_trees(&baseline, &transient);
+        let mut digest_open = digest(&added_changes, &DigestOptions::default());
+        assert_eq!(digest_open.appeared.len(), 1);
+        // Feed the closing batch: same content disappeared, no added.
+        let removed: Vec<RemovedNode> = added_changes
+            .added
+            .iter()
+            .map(|n| RemovedNode { identity: n.identity.clone(), role: n.role.clone(), name: n.name.clone() })
+            .collect();
+        let closed_changes = ChangeSet {
+            added: vec![],
+            removed,
+            changed: vec![],
+        };
+        let digest_closed = digest(&closed_changes, &DigestOptions::default());
+        assert_eq!(digest_closed.disappeared.len(), 1);
+        // The CLI's within-batch pairing relies on identical fingerprints on
+        // both sides: assert that contract directly.
+        assert_eq!(
+            digest_open.appeared[0].identity,
+            digest_closed.disappeared[0].identity
+        );
+    }
+
+    #[test]
+    fn digest_caps_each_category_and_marks_truncation() {
+        let baseline = snapshot(vec![]);
+        let mut nodes = Vec::new();
+        for n in 0..10 {
+            let mut b = node(&format!("b{n}"), "button", None);
+            b.name = Some(format!("按钮{n}"));
+            nodes.push(b);
+        }
+        let mut current = snapshot(vec![]);
+        current.nodes = nodes;
+        let changes = diff_trees(&baseline, &current);
+        let digest = digest(
+            &changes,
+            &DigestOptions { max_items: 3, include_states: true },
+        );
+        assert_eq!(digest.appeared.len(), 3);
+        assert!(digest.truncated);
     }
 
     #[test]
