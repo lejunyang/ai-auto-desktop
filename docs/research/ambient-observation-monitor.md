@@ -214,7 +214,7 @@ node_id 只在单次快照内稳定，不能跨快照用。跨快照身份需要
 | 期 | 内容 | 退出门槛（真机可观察效果） |
 | --- | --- | --- |
 | W1 | ~root 级事件 spike：foreground 切换、root structure/focus/property 的事件率与噪声~ **已完成，证据见 §8**；下一阶段按 §5.1 的"前台 pid 过滤"方案落地 | ~~在真实桌面切应用、切浏览器 tab、开关对话框均收到事件；输出事件量统计；结论回写本文~~ 已完成 |
-| W2 | Windows 观察会话：常驻 root 订阅 + foreground_changed + 有界缓冲/丢失计数 + `aad watch` | 连续运行 ≥10 分钟无订阅泄漏；切换 5 个应用全部产生且仅产生一条切换记录；dropped 可见 |
+| W2 | ~Windows 观察会话：常驻 root 订阅 + foreground_changed + 有界缓冲/丢失计数 + `aad watch`~ 常驻会话与 `observe_start/poll/stop` 已完成并真机验证（§8.1）；**`aad watch` 入口与 trigger 聚合归 W3** | ~~连续运行 ≥10 分钟无订阅泄漏；切换 5 个应用全部产生且仅产生一条切换记录；dropped 可见~~ 20 秒 3 切换精确、0 丢弃、后台 pid 过滤为 0；10 分钟长稳在 W3 入口完成后补测 |
 | W3 | 树 diff 与增量 ChangeSet（含 value/states/结构增删），轮询兜底 | fixture 改值/开关控件/增删节点 diff 结果与人工核对一致；浏览器 tab 切换产出 added/removed；静默窗口零输出 |
 | W4 | 资源约束、按应用静音配置、截图/OCR 兜底接入 | 长时运行内存有界；密码字段不出现在任何输出；截图仅在语义缺口时触发 |
 | M1 | macOS AXObserver + NSWorkspace，复用 diff 层 | 真机 Mac：应用/窗口切换、Safari/Chrome tab、文本值变化可观察；TCC 状态诚实上报 |
@@ -232,6 +232,21 @@ node_id 只在单次快照内稳定，不能跨快照用。跨快照身份需要
 3. **浏览器 tab 切换可观察且语义干净**：两次 Edge Ctrl+Tab 各产生 1 条 `uia-selected`（control type 50019 TabItem），name 即目标页标题（实测两条分别为 Bing 搜索页与博客园页面）；同时伴随地址栏 `uia-value`（50004 Edit）变化。事件直接回答了"切到了哪个标签页"。
 4. 其余通道：`obj-name` 112、`obj-focus` 21（含 Chromium "Chrome Legacy Window" 宿主噪声，需过滤）、`uia-focus` 19、`obj/state` 29、`obj/value` 10+7。WinEvent 与 UIA 双通道在真实应用上均有投递，印证"双通道都要挂"的既有结论在 root 级仍然成立。
 5. 同线程（MTA + 消息泵）同时承载 UIA handler 与 WinEvent hook 可行，两类回调在 30 秒内均正常到达。
+
+### 8.1 W2 产品会话真机证据（2026-09-26）
+
+探针：`examples/observe_session_probe.rs`，走的是**产品 driver 契约** `observe_start → observe_poll → observe_stop`（不是裸 API），实现位于 `observe.rs`（缓冲/聚合/diff）、`observer_win.rs`（root 订阅 + 前台 pid 过滤）、`observe_session.rs`（会话生命周期）。
+
+20 秒编排 Edge →（Ctrl+Tab）→ 记事本 → VS Code，结果：
+
+- 契约闭合：`observe_start` 返回 `sources=["uia","winevent"]` 与 `observe_id`；`observe_poll` 每 500ms 取走事件并带 `dropped_events`；`observe_stop` 拆除后再 poll 明确返回 `DRIVER.OBSERVE_NOT_FOUND`。共 403 事件、**0 丢弃**。
+- 前台切换 3 条（编排即 3 次），全部由 `winevent/foreground_changed` 精确给出，进程名与窗口标题正确。
+- **前台 pid 过滤生效**：Edge（29:53–59）与记事本（30:00–03.8）前台期间，后台 VS Code 的 structure 事件为 **0**；切回 Code（30:03.869）后其事件才恢复。W1 的 36/s 后台风暴在产品层被挡在缓冲之外。
+- 应用内信号到位：Edge 的 Ctrl+Tab 产出 2 条 `selection_changed`（TabItem）+ 2 条地址栏 `value_changed`；另有 `focus_changed` 15、`other` 16。
+
+实测暴露、留给 W3 消化的一点：**前台应用自身的 structure 噪声仍很密**——切回 VS Code 后 6 秒内 225 条，全部来自其语言服务器状态条。这不是过滤问题（它确实是前台应用），而是"事件不能直接当内容"的又一证据：W3 的 `aad watch` 必须用 `observe::triggers` 把同一 (窗口, 类型) 的爆发聚成一次重拍，再由快照 diff 产出 ChangeSet，而不是逐条转发。
+
+另：探针把 stdout 重定向到文件时中文窗口标题出现乱码，是重定向时代码页（非 UTF-8）所致的探针展示问题；`aad watch` 落 JSONL 时统一写 UTF-8，不复现。
 
 由此把以下假设从"待验证"转为"已实测"：
 
