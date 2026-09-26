@@ -460,17 +460,12 @@ saves is a workflow that runs.",
                                 "action": {
                                     "type": "string",
                                     "enum": [
-                                        "focus", "invoke", "set_value",
-                                        "type_text", "pointer_click"
+                                        "focus", "invoke", "set_value", "type_text",
+                                        "pointer_click", "key_chord", "pointer_gesture", "drag"
                                     ],
                                     "description": "What was done to the element."
                                 },
-                                "locator": {
-                                    "type": "object",
-                                    "description": "How to find the element again. \
-            Copy the `locator` describe_window or find_element gave for it. An element whose \
-            locator came back null cannot be told apart from its siblings and cannot be saved."
-                                },
+                                "locator": locator_schema(),
                                 "window": {
                                     "type": "object",
                                     "description": "Which window, by \
@@ -499,7 +494,52 @@ saves is a workflow that runs.",
                                     "description": "True if the text was a \
             credential. It is then stored as a required input instead of being written into \
             the file, and whoever runs the workflow supplies it."
-                                }
+                                },
+                                "parameters": {
+                                    "type": "object",
+                                    "description": "Durable action options. Use mode for \
+            type_text, keys for key_chord, gesture fields for pointer_gesture, and drag fields \
+            for drag. Runtime targets are never stored here.",
+                                    "properties": {
+                                        "mode": {"enum": ["unicode", "keys"]},
+                                        "keys": {
+                                            "type": "array", "items": {"type": "string"},
+                                            "minItems": 1, "maxItems": 6
+                                        },
+                                        "button": {"enum": ["left", "right", "middle"]},
+                                        "count": {"type": "integer", "enum": [1, 2]},
+                                        "fraction": {
+                                            "type": "object",
+                                            "properties": {
+                                                "fx": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+                                                "fy": {"type": "number", "minimum": 0.0, "maximum": 1.0}
+                                            },
+                                            "required": ["fx", "fy"],
+                                            "additionalProperties": false
+                                        },
+                                        "scroll": {
+                                            "type": "object",
+                                            "properties": {
+                                                "direction": {"enum": ["up", "down", "left", "right"]},
+                                                "notches": {"type": "integer", "minimum": 1, "maximum": 30}
+                                            },
+                                            "required": ["direction"],
+                                            "additionalProperties": false
+                                        },
+                                        "hover_ms": {"type": "integer", "minimum": 1, "maximum": 5000},
+                                        "to_fraction": {
+                                            "type": "object",
+                                            "properties": {
+                                                "fx": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+                                                "fy": {"type": "number", "minimum": 0.0, "maximum": 1.0}
+                                            },
+                                            "required": ["fx", "fy"],
+                                            "additionalProperties": false
+                                        }
+                                    },
+                                    "additionalProperties": false
+                                },
+                                "destination": locator_schema()
                             },
                             "required": ["action", "locator", "window"],
                             "additionalProperties": false
@@ -695,6 +735,12 @@ fn save_workflow(arguments: &Value) -> Result<Value, String> {
                 .get("argument")
                 .and_then(Value::as_str)
                 .map(str::to_string),
+            parameters: step
+                .get("parameters")
+                .and_then(Value::as_object)
+                .cloned()
+                .unwrap_or_default(),
+            destination: step.get("destination").cloned(),
             protected: step
                 .get("protected")
                 .and_then(Value::as_bool)
@@ -778,8 +824,8 @@ nothing to show it happened.",
         "name": name,
         "path": path.to_string_lossy(),
         "performed_steps": performed.len(),
-        // Three executed steps per performed action, so the number a caller sees
-        // in `describe_workflow` matches what it reads here.
+        // Report the actual expanded count: ordinary actions use three steps,
+        // while drag uses a second find and therefore uses four.
         "executed_steps": compiled
             .raw
             .get("steps")
@@ -937,7 +983,7 @@ fn what_it_does(raw: &Value) -> Vec<Value> {
     for step in steps {
         let id = step.get("id").and_then(Value::as_str).unwrap_or_default();
         // The suffixes `assemble` emits. A step carrying neither is the action.
-        if id.ends_with("_window") || id.ends_with("_element") {
+        if id.ends_with("_window") || id.ends_with("_element") || id.ends_with("_destination") {
             continue;
         }
 
@@ -966,8 +1012,21 @@ fn what_it_does(raw: &Value) -> Vec<Value> {
         if let Some(locator) = borrowed("_element", "locator") {
             entry.insert("finds".into(), locator);
         }
+        if let Some(locator) = borrowed("_destination", "locator") {
+            entry.insert("destination".into(), locator);
+        }
 
         let with = step.get("with");
+        if let Some(with) = with.and_then(Value::as_object) {
+            let parameters: serde_json::Map<String, Value> = with
+                .iter()
+                .filter(|(key, _)| !matches!(key.as_str(), "target" | "to" | "value" | "text"))
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect();
+            if !parameters.is_empty() {
+                entry.insert("parameters".into(), Value::Object(parameters));
+            }
+        }
         for key in ["value", "text"] {
             let Some(argument) = with.and_then(|with| with.get(key)).and_then(Value::as_str) else {
                 continue;
@@ -1044,14 +1103,16 @@ fn walk_through(result: &aad_runtime::RunResult) -> Vec<Value> {
         states.insert(id.to_string(), (status, error));
     }
 
-    // Group the three executed steps back under the action they came from. The
-    // suffixes are the ones `assemble` emits.
+    // Group the executed helper steps back under the action they came from. Most
+    // actions expand to snapshot/find/act; drag has a second find for its
+    // destination and therefore expands to four.
     let mut order: Vec<String> = Vec::new();
     let mut grouped: BTreeMap<String, Vec<(String, String, Option<Value>)>> = BTreeMap::new();
     for id in &seen {
         let logical = id
             .strip_suffix("_window")
             .or_else(|| id.strip_suffix("_element"))
+            .or_else(|| id.strip_suffix("_destination"))
             .unwrap_or(id)
             .to_string();
         if !grouped.contains_key(&logical) {
@@ -1084,6 +1145,8 @@ fn walk_through(result: &aad_runtime::RunResult) -> Vec<Value> {
                         "locating the window"
                     } else if id.ends_with("_element") {
                         "finding the element"
+                    } else if id.ends_with("_destination") {
+                        "finding the drag destination"
                     } else {
                         "performing the action"
                     }),
@@ -1093,8 +1156,14 @@ fn walk_through(result: &aad_runtime::RunResult) -> Vec<Value> {
                 }
             }
             None => {
-                let done =
-                    parts.len() == 3 && parts.iter().all(|(_, status, _)| status == "succeeded");
+                let expected = if parts.iter().any(|(id, _, _)| id.ends_with("_destination")) {
+                    4
+                } else {
+                    3
+                };
+                let done = parts.len() == expected
+                    && parts.iter().any(|(id, _, _)| id == &logical)
+                    && parts.iter().all(|(_, status, _)| status == "succeeded");
                 entry.insert(
                     "status".into(),
                     json!(if done { "succeeded" } else { "incomplete" }),
@@ -1537,6 +1606,27 @@ mod tests {
     }
 
     #[test]
+    fn a_drag_run_is_reported_as_one_four_phase_action() {
+        let steps = walk_through(&run_with(&[
+            ("step_1_window", "succeeded"),
+            ("step_1_element", "succeeded"),
+            ("step_1_destination", "succeeded"),
+            ("step_1", "succeeded"),
+        ]));
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0]["id"], "step_1");
+        assert_eq!(steps[0]["status"], "succeeded");
+
+        let failed = walk_through(&run_with(&[
+            ("step_1_window", "succeeded"),
+            ("step_1_element", "succeeded"),
+            ("step_1_destination", "failed"),
+        ]));
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0]["phase"], "finding the drag destination");
+    }
+
+    #[test]
     fn an_action_reported_only_in_part_is_not_called_done() {
         // A group missing its third entry means the run stopped before the action
         // itself. Calling that "succeeded" because nothing failed would be the
@@ -1575,6 +1665,35 @@ mod tests {
         assert_eq!(actions[0]["window"]["process_name"], "msedge.exe");
         assert_eq!(actions[0]["finds"]["automation_id"], "city");
         assert_eq!(actions[0]["writes"], "Praha");
+    }
+
+    #[test]
+    fn structured_actions_are_described_without_helper_steps() {
+        let raw = json!({
+            "steps": [
+                {"id": "step_1_window", "uses": "desktop.windows_uia.snapshot@1",
+                 "with": {"window": {"process_name": "app.exe"}}},
+                {"id": "step_1_element", "uses": "desktop.windows_uia.find@1",
+                 "with": {"locator": {"role": "listitem", "name": "Todo"}}},
+                {"id": "step_1_destination", "uses": "desktop.windows_uia.find@1",
+                 "with": {"locator": {"role": "listitem", "name": "Done"}}},
+                {"id": "step_1", "uses": "desktop.windows_uia.drag@1",
+                 "with": {
+                    "target": "${{ steps.step_1_element.output.ref }}",
+                    "to": "${{ steps.step_1_destination.output.ref }}",
+                    "button": "left",
+                    "fraction": {"fx": 0.8, "fy": 0.5}
+                 }},
+            ]
+        });
+        let actions = what_it_does(&raw);
+        assert_eq!(actions.len(), 1, "helper finds must not look like actions");
+        assert_eq!(actions[0]["action"], "drag");
+        assert_eq!(actions[0]["destination"]["name"], "Done");
+        assert_eq!(actions[0]["parameters"]["button"], "left");
+        assert_eq!(actions[0]["parameters"]["fraction"]["fx"], 0.8);
+        assert!(actions[0]["parameters"].get("target").is_none());
+        assert!(actions[0]["parameters"].get("to").is_none());
     }
 
     #[test]
@@ -1630,6 +1749,16 @@ mod tests {
         for field in ["action", "locator", "window"] {
             assert!(required.contains(&field), "{field} is not optional");
         }
+        let actions = step["properties"]["action"]["enum"].as_array().unwrap();
+        for action in ["key_chord", "pointer_gesture", "drag"] {
+            assert!(
+                actions.iter().any(|value| value == action),
+                "{action} must be savable"
+            );
+        }
+        assert!(step["properties"]["parameters"].is_object());
+        assert!(step["properties"]["destination"].is_object());
+        assert_eq!(step["properties"]["locator"]["additionalProperties"], false);
     }
 
     #[test]
@@ -2184,6 +2313,58 @@ hitting truncation without knowing there is another way: {:?}",
             Arc::new(StubBackend),
             aad_uia::SnapshotStore::new(8, std::time::Duration::from_secs(60)),
         ))
+    }
+
+    #[test]
+    fn structured_actions_survive_the_mcp_save_and_describe_round_trip() {
+        let store = ScratchStore::new("structured-save");
+        let saved = call_without_driver(
+            "save_workflow",
+            &json!({
+                "name": "structured_actions",
+                "steps": [
+                    {
+                        "action": "key_chord",
+                        "locator": {"role": "edit", "name": "Editor"},
+                        "window": {"process_name": "fixture.exe"},
+                        "parameters": {"keys": ["ctrl", "a"]}
+                    },
+                    {
+                        "action": "drag",
+                        "locator": {"role": "listitem", "name": "Todo"},
+                        "destination": {"role": "listitem", "name": "Done"},
+                        "window": {"process_name": "fixture.exe"},
+                        "parameters": {
+                            "button": "left",
+                            "fraction": {"fx": 0.8, "fy": 0.5},
+                            "to_fraction": {"fx": 0.2, "fy": 0.5}
+                        }
+                    }
+                ]
+            }),
+        )
+        .expect("save structured actions");
+        assert_eq!(saved["performed_steps"], 2);
+        assert_eq!(saved["executed_steps"], 7);
+
+        let stored: Value = serde_json::from_str(
+            &std::fs::read_to_string(store.directory.join("structured_actions.workflow.json"))
+                .expect("read saved workflow"),
+        )
+        .expect("parse saved workflow");
+        assert_eq!(stored["steps"][2]["with"]["keys"], json!(["ctrl", "a"]));
+        assert_eq!(stored["steps"][5]["id"], "step_2_destination");
+        assert_eq!(stored["steps"][6]["with"]["to_fraction"]["fx"], 0.2);
+
+        let described =
+            call_without_driver("describe_workflow", &json!({"name": "structured_actions"}))
+                .expect("describe structured actions");
+        assert_eq!(described["actions"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            described["actions"][0]["parameters"]["keys"],
+            json!(["ctrl", "a"])
+        );
+        assert_eq!(described["actions"][1]["destination"]["name"], "Done");
     }
 
     #[test]

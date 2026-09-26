@@ -30,7 +30,27 @@ const savedDirectory = ref("");
 // Reactive so the step list re-renders when the recording mutates in place.
 const recording = reactive(new Recording()) as Recording;
 
+const invalidParameterSteps = ref<Set<string>>(new Set());
+const stepListRevision = ref(0);
 const issues = computed(() => recording.validate());
+
+function markParametersValid(id: string, valid: boolean): void {
+  const next = new Set(invalidParameterSteps.value);
+  if (valid) next.delete(id);
+  else next.add(id);
+  invalidParameterSteps.value = next;
+}
+
+function removeStep(id: string): void {
+  recording.remove(id);
+  markParametersValid(id, true);
+}
+
+function clearSteps(): void {
+  recording.steps = [];
+  invalidParameterSteps.value = new Set();
+  stepListRevision.value += 1;
+}
 
 // -------------------------------------------------------------------------
 // Live recording
@@ -268,18 +288,20 @@ async function save(): Promise<void> {
   saving.value = true;
   saved.value = null;
   await guard(async () => {
-    const workflow = recording.canExport ? recording.toDescriptor(recording.name) : {};
+    const workflow = recording.canExport ? recording.toDescriptor(recording.name) : undefined;
     const paths = await bridge.saveRecording(
       recording.name,
       recording.toDocument(),
       workflow,
     );
-    saved.value = recording.canExport
+    saved.value = paths.workflow_path
       ? `Saved. The workflow is at ${paths.workflow_path}`
-      : `Saved the recording, but not a runnable workflow: ${issues.value
-          .filter((issue) => issue.blocking)
-          .map((issue) => issue.message)
-          .join("; ")}`;
+      : paths.workflow_error
+        ? `Saved the recording, but the workflow compiler refused it: ${paths.workflow_error.message}`
+        : `Saved the recording, but not a runnable workflow: ${issues.value
+            .filter((issue) => issue.blocking)
+            .map((issue) => issue.message)
+            .join("; ")}`;
     await refreshSaved();
   });
   saving.value = false;
@@ -346,6 +368,8 @@ async function open(entry: SavedRecording): Promise<void> {
     // reassigning the variable would leave the UI showing the old steps.
     recording.steps = reopened.steps;
     recording.name = reopened.name;
+    invalidParameterSteps.value = new Set();
+    stepListRevision.value += 1;
     browsing.value = false;
     saved.value = `Opened ${reopened.name}`;
   });
@@ -386,7 +410,7 @@ onBeforeUnmount(() => {
       </button>
       <button
         @click="replay"
-        :disabled="replaying || !recording.canExport"
+        :disabled="replaying || !recording.canExport || invalidParameterSteps.size > 0"
         :title="
           recording.canExport
             ? 'Run these steps now and report how each one went'
@@ -395,7 +419,10 @@ onBeforeUnmount(() => {
       >
         {{ replaying ? "Running…" : "▶ Try it" }}
       </button>
-      <button @click="save" :disabled="saving || !recording.steps.length">
+      <button
+        @click="save"
+        :disabled="saving || !recording.steps.length || invalidParameterSteps.size > 0"
+      >
         {{ saving ? "Saving…" : "Save" }}
       </button>
       <button @click="openList">Open…</button>
@@ -478,16 +505,20 @@ onBeforeUnmount(() => {
       />
 
       <StepList
+        :key="stepListRevision"
         :steps="recording.steps"
         :issues="issues"
         :window="selected"
         @toggle="(id, on) => recording.setEnabled(id, on)"
         @locator="(id, next) => recording.setLocator(id, next)"
-        @remove="(id) => recording.remove(id)"
+        @remove="removeStep"
         @move="(id, index) => recording.move(id, index)"
         @argument="(id, text) => recording.setArgument(id, text)"
+        @parameters="(id, parameters) => recording.setParameters(id, parameters)"
+        @parameters-valid="markParametersValid"
+        @destination="(id, destination) => recording.setDestination(id, destination)"
         @assertion="(id, patch) => recording.setAssertion(id, patch)"
-        @clear="recording.steps = []"
+        @clear="clearSteps"
         @export="exportDescriptor"
       />
     </main>

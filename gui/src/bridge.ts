@@ -276,8 +276,12 @@ export const bridge = {
    *
    * Both in one call so the two files cannot disagree about what was recorded.
    */
-  saveRecording: (name: string, document: unknown, workflow: unknown) =>
-    call<{ recording_path: string; workflow_path: string }>("save_recording", {
+  saveRecording: (name: string, document: unknown, workflow?: unknown) =>
+    call<{
+      recording_path: string;
+      workflow_path: string | null;
+      workflow_error?: { code: string; message: string; issues?: unknown[] };
+    }>("save_recording", {
       name,
       document,
       workflow,

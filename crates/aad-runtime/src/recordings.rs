@@ -147,6 +147,23 @@ pub fn workflow_path(name: &str) -> Result<PathBuf> {
     Ok(recordings_dir().join(format!("{name}{WORKFLOW_SUFFIX}")))
 }
 
+/// Remove the runnable derivative for `name`, leaving its editable recording.
+///
+/// Used when a previously valid recording is saved in a state that cannot be
+/// compiled. Keeping the old workflow would make the store advertise behaviour
+/// that no longer matches the source shown in the editor.
+pub fn remove_workflow(name: &str) -> Result<bool> {
+    let path = workflow_path(name)?;
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(StoreError::new(
+            "STORE.WRITE_FAILED",
+            format!("cannot remove stale {}: {error}", path.display()),
+        )),
+    }
+}
+
 fn write_document(name: &str, suffix: &str, document: &Value) -> Result<PathBuf> {
     let name = validate_name(name)?;
     let directory = recordings_dir();
@@ -538,6 +555,18 @@ mod tests {
             load_recording(&recording_path).unwrap()["kind"],
             "Recording"
         );
+    }
+
+    #[test]
+    fn removing_a_workflow_leaves_the_editable_recording() {
+        let _sandbox = Sandbox::new("remove-workflow");
+        let recording_path = save_recording("draft", &recording("draft")).unwrap();
+        let workflow_path = save_workflow("draft", &json!({"kind": "Workflow"})).unwrap();
+
+        assert!(remove_workflow("draft").unwrap());
+        assert!(recording_path.exists());
+        assert!(!workflow_path.exists());
+        assert!(!remove_workflow("draft").unwrap(), "missing is idempotent");
     }
 
     #[test]

@@ -26,3 +26,7 @@ tauri = { version = "2", features = [] }
 [features]
 # Kept for parity with the Tauri template; the shell needs no custom protocol.
 custom-protocol = ["tauri/custom-protocol"]
+
+# Inherit the workspace's deliberate lint allowances (see the root Cargo.toml).
+[lints]
+workspace = true

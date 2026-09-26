@@ -41,6 +41,10 @@ export interface Step {
   /** The window's title when recorded, for display only. */
   windowTitle: string;
   argument?: string;
+  /** Durable action options, never a live target reference. */
+  parameters?: Record<string, unknown>;
+  /** The durable destination locator used only by drag. */
+  destination?: Locator | null;
   /**
    * The element masks its content, as a password field does.
    *
@@ -316,6 +320,8 @@ export interface StepDraft {
   element: Element;
   window: WindowInfo;
   argument?: string;
+  parameters?: Record<string, unknown>;
+  destination?: Locator | null;
   /**
    * Every window open at record time.
    *
@@ -341,6 +347,8 @@ export interface CapturedStep {
   locator: Locator | null;
   summary: string;
   argument?: string | null;
+  parameters?: Record<string, unknown>;
+  destination?: Locator | null;
   protected?: boolean;
   /** Why this step cannot replay, when it cannot. */
   unresolved?: string | null;
@@ -385,6 +393,8 @@ export class Recording {
       window,
       windowTitle: draft.window.title,
       argument: draft.argument,
+      parameters: draft.parameters ? structuredClone(draft.parameters) : undefined,
+      destination: draft.destination ? structuredClone(draft.destination) : undefined,
       protected: draft.element.protected === true,
       // A step that cannot locate its element or its window would fail at
       // replay, so it is recorded but left out of the run until a human
@@ -426,6 +436,8 @@ export class Recording {
         window: selector,
         windowTitle: window.title,
         argument: source.argument ?? undefined,
+        parameters: source.parameters ? structuredClone(source.parameters) : undefined,
+        destination: source.destination ? structuredClone(source.destination) : undefined,
         protected: source.protected === true,
         enabled: (source.locator ?? null) !== null && selector !== null,
         // Which recording session adopted this step. `restateWindows` needs to
@@ -524,6 +536,24 @@ export class Recording {
     return true;
   }
 
+  setParameters(stepId: string, parameters: Record<string, unknown>): boolean {
+    const step = this.steps.find((candidate) => candidate.id === stepId);
+    if (!step) {
+      return false;
+    }
+    step.parameters = structuredClone(parameters);
+    return true;
+  }
+
+  setDestination(stepId: string, destination: Locator): boolean {
+    const step = this.steps.find((candidate) => candidate.id === stepId);
+    if (!step || step.action !== "drag") {
+      return false;
+    }
+    step.destination = structuredClone(destination);
+    return true;
+  }
+
   /**
    * Attach, change or remove a step's check.
    *
@@ -607,6 +637,30 @@ export class Recording {
       }
       if (!step.enabled) {
         continue;
+      }
+      if (step.action === "drag" && !step.destination) {
+        issues.push({
+          stepId: step.id,
+          message: "drag needs a destination locator before it can replay",
+          blocking: true,
+        });
+      }
+      if (step.action !== "drag" && step.destination) {
+        issues.push({
+          stepId: step.id,
+          message: `${step.action} cannot use a drag destination`,
+          blocking: true,
+        });
+      }
+      if (step.action === "key_chord") {
+        const keys = step.parameters?.keys;
+        if (!Array.isArray(keys) || keys.length === 0) {
+          issues.push({
+            stepId: step.id,
+            message: "key_chord needs at least one key",
+            blocking: true,
+          });
+        }
       }
       if (
         (ACTIONS_NEEDING_TEXT as readonly string[]).includes(step.action) &&
@@ -711,6 +765,10 @@ export class Recording {
         ...(step.argument === undefined || step.protected
           ? {}
           : { argument: step.argument }),
+        ...(step.parameters && Object.keys(step.parameters).length
+          ? { parameters: structuredClone(step.parameters) }
+          : {}),
+        ...(step.destination ? { destination: structuredClone(step.destination) } : {}),
         // Persisted because it decides whether this step's text may be written
         // into the compiled workflow. Losing it on reopen would silently start
         // inlining a credential that was correctly externalised before.
@@ -802,6 +860,14 @@ export class Recording {
         window,
         windowTitle: typeof step.window_title === "string" ? step.window_title : "",
         argument: typeof step.argument === "string" ? step.argument : undefined,
+        parameters:
+          step.parameters && typeof step.parameters === "object" && !Array.isArray(step.parameters)
+            ? structuredClone(step.parameters as Record<string, unknown>)
+            : undefined,
+        destination:
+          step.destination && typeof step.destination === "object" && !Array.isArray(step.destination)
+            ? structuredClone(step.destination as Locator)
+            : undefined,
         protected: step.protected === true,
         assertion: readAssertion(step.assertion, step.id),
         // Never re-enable a step that cannot be located, whatever the file says.
@@ -843,6 +909,7 @@ export class Recording {
     for (const step of this.enabledSteps) {
       const snapshotId = `${step.id}_window`;
       const findId = `${step.id}_element`;
+      const destinationFindId = `${step.id}_destination`;
 
       steps.push({
         id: snapshotId,
@@ -861,10 +928,26 @@ export class Recording {
         },
       });
 
+      if (step.destination) {
+        steps.push({
+          id: destinationFindId,
+          type: "action",
+          uses: "desktop.windows_uia.find@1",
+          with: {
+            snapshot_id: `\${{ steps.${snapshotId}.output.snapshot_id }}`,
+            locator: step.destination,
+          },
+        });
+      }
+
       const args: Record<string, unknown> = {
-        // Consume the reference the find step just produced, not a saved one.
+        ...(step.parameters ? structuredClone(step.parameters) : {}),
+        // Consume references produced by this replay, never saved targets.
         target: `\${{ steps.${findId}.output.ref }}`,
       };
+      if (step.destination) {
+        args.to = `\${{ steps.${destinationFindId}.output.ref }}`;
+      }
       const needsText = (ACTIONS_NEEDING_TEXT as readonly string[]).includes(step.action);
       if (needsText) {
         const field = step.action === "set_value" ? "value" : "text";

@@ -241,7 +241,7 @@ async fn describe_window(
     limit: Option<usize>,
     region: Option<String>,
 ) -> Result<Value, Value> {
-    outline_of(&*shell, &window_id, limit, region.as_deref())
+    outline_of(&shell, &window_id, limit, region.as_deref())
 }
 
 /// Group a window's elements into regions, without listing them.
@@ -256,7 +256,7 @@ async fn overview_window(
     shell: tauri::State<'_, Shell>,
     window_id: String,
 ) -> Result<Value, Value> {
-    survey_of(&*shell, &window_id)
+    survey_of(&shell, &window_id)
 }
 
 /// The body of `overview_window`, callable without a Tauri runtime.
@@ -402,9 +402,47 @@ async fn probe_environment() -> Value {
 /// Both are written in one command so they cannot drift apart: a workflow whose
 /// recording says something else is a trap for whoever opens it next.
 #[tauri::command]
-async fn save_recording(name: String, document: Value, workflow: Value) -> Result<Value, Value> {
-    let recording_path = recordings::save_recording(&name, &document).map_err(store_error)?;
-    let workflow_path = recordings::save_workflow(&name, &workflow).map_err(store_error)?;
+async fn save_recording(
+    name: String,
+    document: Value,
+    workflow: Option<Value>,
+) -> Result<Value, Value> {
+    save_documents(&name, &document, workflow.as_ref())
+}
+
+/// Save the editable source, and only advertise a runnable derivative after the
+/// same compiler used by replay accepts it.
+fn save_documents(name: &str, document: &Value, workflow: Option<&Value>) -> Result<Value, Value> {
+    let recording_path = recordings::save_recording(name, document).map_err(store_error)?;
+    let Some(workflow) = workflow else {
+        let removed = recordings::remove_workflow(name).map_err(store_error)?;
+        return Ok(json!({
+            "recording_path": recording_path.to_string_lossy(),
+            "workflow_path": Value::Null,
+            "removed_stale_workflow": removed,
+        }));
+    };
+
+    if let Err(error) = aad_core::compile_descriptor(workflow.clone(), None) {
+        let removed = recordings::remove_workflow(name).map_err(store_error)?;
+        let issues: Vec<Value> = error
+            .issues
+            .iter()
+            .map(|issue| json!({"path": issue.path, "message": issue.message}))
+            .collect();
+        return Ok(json!({
+            "recording_path": recording_path.to_string_lossy(),
+            "workflow_path": Value::Null,
+            "removed_stale_workflow": removed,
+            "workflow_error": {
+                "code": error.code,
+                "message": error.message,
+                "issues": issues,
+            },
+        }));
+    }
+
+    let workflow_path = recordings::save_workflow(name, workflow).map_err(store_error)?;
     Ok(json!({
         "recording_path": recording_path.to_string_lossy(),
         "workflow_path": workflow_path.to_string_lossy(),
@@ -583,6 +621,81 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    static STORE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn saving_an_unfinished_recording_removes_its_stale_workflow() {
+        let _guard = STORE.lock().unwrap_or_else(|error| error.into_inner());
+        let directory = std::env::temp_dir().join(format!("aad-gui-save-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        unsafe { std::env::set_var("AAD_RECORDINGS_DIR", &directory) };
+
+        recordings::save_workflow("draft", &json!({"kind": "Workflow"})).unwrap();
+        let result = save_documents("draft", &json!({"kind": "Recording", "steps": []}), None)
+            .expect("save source only");
+
+        assert!(result["recording_path"].as_str().is_some());
+        assert!(result["workflow_path"].is_null());
+        assert_eq!(result["removed_stale_workflow"], true);
+        assert!(!recordings::workflow_path("draft").unwrap().exists());
+        unsafe { std::env::remove_var("AAD_RECORDINGS_DIR") };
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn a_compile_failure_removes_the_stale_workflow() {
+        let _guard = STORE.lock().unwrap_or_else(|error| error.into_inner());
+        let directory =
+            std::env::temp_dir().join(format!("aad-gui-invalid-save-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        unsafe { std::env::set_var("AAD_RECORDINGS_DIR", &directory) };
+        recordings::save_workflow("invalid", &json!({"kind": "Workflow"})).unwrap();
+
+        let result = save_documents(
+            "invalid",
+            &json!({"kind": "Recording", "steps": []}),
+            Some(&json!({"kind": "Workflow"})),
+        )
+        .expect("save editable source and report compiler refusal");
+
+        assert!(result["workflow_error"].is_object());
+        assert_eq!(result["removed_stale_workflow"], true);
+        assert!(!recordings::workflow_path("invalid").unwrap().exists());
+        unsafe { std::env::remove_var("AAD_RECORDINGS_DIR") };
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn saving_a_runnable_recording_compiles_before_writing_the_workflow() {
+        let _guard = STORE.lock().unwrap_or_else(|error| error.into_inner());
+        let directory =
+            std::env::temp_dir().join(format!("aad-gui-valid-save-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        unsafe { std::env::set_var("AAD_RECORDINGS_DIR", &directory) };
+        let workflow = json!({
+            "apiVersion": "ai-auto-desktop.dev/v1alpha1",
+            "kind": "Workflow",
+            "metadata": {"name": "valid"},
+            "budgets": {"max_duration": "30s", "max_executed_steps": 10},
+            "steps": [{"id": "done", "type": "return", "value": true}]
+        });
+
+        let result = save_documents(
+            "valid",
+            &json!({"kind": "Recording", "steps": []}),
+            Some(&workflow),
+        )
+        .expect("save both");
+
+        assert!(result["workflow_path"].as_str().is_some());
+        assert!(recordings::workflow_path("valid").unwrap().exists());
+        unsafe { std::env::remove_var("AAD_RECORDINGS_DIR") };
+        let _ = std::fs::remove_dir_all(directory);
+    }
 
     // -----------------------------------------------------------------------
     // The outline contract

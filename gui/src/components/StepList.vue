@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref } from "vue";
+import { computed, ref, watch } from "vue";
 import AssertionEditor from "./AssertionEditor.vue";
 import LocatorEditor from "./LocatorEditor.vue";
 import type { Locator, WindowInfo } from "../bridge";
@@ -19,17 +19,35 @@ const props = defineProps<{
 
 /** Which step's locator is open for editing, if any. */
 const editing = ref<string | null>(null);
+const editingDestination = ref<string | null>(null);
+const parameterErrors = ref<Record<string, string>>({});
 
-defineEmits<{
+const emit = defineEmits<{
   toggle: [string, boolean];
   remove: [string];
   move: [string, number];
   argument: [string, string];
+  parameters: [string, Record<string, unknown>];
+  parametersValid: [string, boolean];
   locator: [string, Locator];
+  destination: [string, Locator];
   assertion: [string, Partial<Assertion> | null];
   export: [];
   clear: [];
 }>();
+
+watch(
+  () => props.steps.map((step) => step.id),
+  (ids) => {
+    const present = new Set(ids);
+    for (const id of Object.keys(parameterErrors.value)) {
+      if (!present.has(id)) {
+        delete parameterErrors.value[id];
+        emit("parametersValid", id, true);
+      }
+    }
+  },
+);
 
 const issuesByStep = computed(() => {
   const map = new Map<string, string[]>();
@@ -43,6 +61,29 @@ const issuesByStep = computed(() => {
 
 function needsText(action: string): boolean {
   return (ACTIONS_NEEDING_TEXT as readonly string[]).includes(action);
+}
+
+function hasParameters(action: string): boolean {
+  return ["type_text", "key_chord", "pointer_gesture", "drag"].includes(action);
+}
+
+function parameterPlaceholder(action: string): string {
+  return action === "key_chord" ? '{"keys":["ctrl","a"]}' : "{}";
+}
+
+function updateParameters(step: Step, raw: string): void {
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw new Error("parameters must be a JSON object");
+    }
+    delete parameterErrors.value[step.id];
+    emit("parameters", step.id, parsed as Record<string, unknown>);
+    emit("parametersValid", step.id, true);
+  } catch (error) {
+    parameterErrors.value[step.id] = error instanceof Error ? error.message : String(error);
+    emit("parametersValid", step.id, false);
+  }
 }
 
 /**
@@ -73,7 +114,7 @@ function describeLocator(step: Step): string {
       <button :disabled="!steps.length" @click="$emit('clear')">Clear</button>
       <button
         class="primary"
-        :disabled="!steps.length || issues.length > 0"
+        :disabled="!steps.length || issues.length > 0 || Object.keys(parameterErrors).length > 0"
         @click="$emit('export')"
       >
         Export
@@ -143,6 +184,32 @@ function describeLocator(step: Step): string {
           @input="
             $emit('argument', step.id, ($event.target as HTMLInputElement).value)
           "
+        />
+
+        <textarea
+          v-if="hasParameters(step.action)"
+          class="argument mono"
+          :value="JSON.stringify(step.parameters ?? {})"
+          :placeholder="parameterPlaceholder(step.action)"
+          @change="updateParameters(step, ($event.target as HTMLTextAreaElement).value)"
+        />
+        <p v-if="parameterErrors[step.id]" class="issue">{{ parameterErrors[step.id] }}</p>
+
+        <div v-if="step.action === 'drag'" class="row second">
+          <button
+            class="tiny"
+            @click="editingDestination = editingDestination === step.id ? null : step.id"
+          >
+            {{ editingDestination === step.id ? "Cancel destination" : step.destination ? "Edit destination" : "Set destination" }}
+          </button>
+          <span class="ref mono">{{ step.destination ? JSON.stringify(step.destination) : "destination not set" }}</span>
+        </div>
+        <LocatorEditor
+          v-if="step.action === 'drag' && editingDestination === step.id"
+          :locator="step.destination ?? null"
+          :window="props.window ?? null"
+          @apply="(next: Locator) => { $emit('destination', step.id, next); editingDestination = null; }"
+          @close="editingDestination = null"
         />
 
         <AssertionEditor

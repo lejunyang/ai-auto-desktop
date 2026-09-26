@@ -1134,6 +1134,12 @@ fn keep_recording(
                 .get("argument")
                 .and_then(Value::as_str)
                 .map(str::to_string),
+            parameters: step
+                .get("parameters")
+                .and_then(Value::as_object)
+                .cloned()
+                .unwrap_or_default(),
+            destination: step.get("destination").cloned(),
             protected: step
                 .get("protected")
                 .and_then(Value::as_bool)
@@ -1409,12 +1415,71 @@ fn list_saved_workflows() -> (Value, u8) {
     }
 }
 
+/// Fold generated snapshot/find helpers back into one entry per recorded action.
+fn logical_actions(steps: &[Value]) -> Vec<Value> {
+    let mut actions = Vec::new();
+    for step in steps {
+        let id = step.get("id").and_then(Value::as_str).unwrap_or_default();
+        if id.ends_with("_window") || id.ends_with("_element") || id.ends_with("_destination") {
+            continue;
+        }
+        let with = step.get("with").cloned().unwrap_or(Value::Null);
+        let uses = step.get("uses").and_then(Value::as_str).unwrap_or_default();
+        let action = uses
+            .rsplit_once('.')
+            .map(|(_, tail)| tail.split('@').next().unwrap_or(tail))
+            .unwrap_or(uses);
+        let borrowed = |suffix: &str, key: &str| -> Option<Value> {
+            let wanted = format!("{id}{suffix}");
+            steps
+                .iter()
+                .find(|other| other.get("id").and_then(Value::as_str) == Some(wanted.as_str()))
+                .and_then(|other| other.get("with"))
+                .and_then(|with| with.get(key))
+                .cloned()
+        };
+
+        let mut entry = serde_json::Map::new();
+        entry.insert("id".into(), json!(id));
+        entry.insert("action".into(), json!(action));
+        if let Some(window) = borrowed("_window", "window") {
+            entry.insert("window".into(), window);
+        }
+        if let Some(locator) = borrowed("_element", "locator") {
+            entry.insert("finds".into(), locator);
+        }
+        if let Some(locator) = borrowed("_destination", "locator") {
+            entry.insert("destination".into(), locator);
+        }
+        if let Some(with) = with.as_object() {
+            let parameters: serde_json::Map<String, Value> = with
+                .iter()
+                .filter(|(key, _)| !matches!(key.as_str(), "target" | "to" | "value" | "text"))
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect();
+            if !parameters.is_empty() {
+                entry.insert("parameters".into(), Value::Object(parameters));
+            }
+        }
+        for key in ["value", "text"] {
+            if let Some(argument) = with.get(key).and_then(Value::as_str) {
+                if argument.contains("inputs.") {
+                    entry.insert("needs_input".into(), json!(argument));
+                } else {
+                    entry.insert("writes".into(), json!(argument));
+                }
+            }
+        }
+        actions.push(Value::Object(entry));
+    }
+    actions
+}
 /// What a saved workflow would do, before running it.
 ///
-/// The three executed steps behind one recorded action are folded back together,
-/// and the window and argument are named. `describe_workflow` over MCP reports
-/// step ids and types, which does not answer the question someone asks before
-/// running something: what is this going to touch?
+/// Most saved actions expand to snapshot/find/act; drag expands to
+/// snapshot/source-find/destination-find/act. Those helper steps are folded back
+/// together here, and the window, locators, arguments, and durable parameters are
+/// named. `describe_workflow` over MCP follows the same logical-action view.
 fn explain_workflow(name: &str) -> (Value, u8) {
     let path = match aad_runtime::recordings::workflow_path(name) {
         Ok(path) => path,
@@ -1457,61 +1522,7 @@ fn explain_workflow(name: &str) -> (Value, u8) {
         .cloned()
         .unwrap_or_default();
 
-    // Fold on the id suffixes `assemble` emits. A step whose id carries neither
-    // suffix is the action itself.
-    let mut actions: Vec<Value> = Vec::new();
-    for step in &steps {
-        let id = step.get("id").and_then(Value::as_str).unwrap_or_default();
-        if id.ends_with("_window") || id.ends_with("_element") {
-            continue;
-        }
-        let with = step.get("with").cloned().unwrap_or(Value::Null);
-        let uses = step.get("uses").and_then(Value::as_str).unwrap_or_default();
-        let action = uses
-            .rsplit_once('.')
-            .map(|(_, tail)| tail.split('@').next().unwrap_or(tail))
-            .unwrap_or(uses);
-
-        // The window and locator live on the two steps that prepared this one.
-        let window = steps
-            .iter()
-            .find(|other| other.get("id").and_then(Value::as_str) == Some(&format!("{id}_window")))
-            .and_then(|other| other.get("with"))
-            .and_then(|with| with.get("window"))
-            .cloned();
-        let locator = steps
-            .iter()
-            .find(|other| other.get("id").and_then(Value::as_str) == Some(&format!("{id}_element")))
-            .and_then(|other| other.get("with"))
-            .and_then(|with| with.get("locator"))
-            .cloned();
-
-        let mut entry = serde_json::Map::new();
-        entry.insert("id".into(), json!(id));
-        entry.insert("action".into(), json!(action));
-        if let Some(window) = window {
-            entry.insert("window".into(), window);
-        }
-        if let Some(locator) = locator {
-            entry.insert("finds".into(), locator);
-        }
-
-        // The argument, under whichever key this action uses.
-        for key in ["value", "text"] {
-            if let Some(argument) = with.get(key).and_then(Value::as_str) {
-                // A credential is stored as a reference to an input, never as
-                // text. Showing the reference is the point: it says what has to be
-                // supplied, without printing a password into a terminal.
-                if argument.contains("inputs.") {
-                    entry.insert("needs_input".into(), json!(argument));
-                } else {
-                    entry.insert("writes".into(), json!(argument));
-                }
-            }
-        }
-        actions.push(Value::Object(entry));
-    }
-
+    let actions = logical_actions(&steps);
     let inputs = document
         .get("inputs")
         .and_then(Value::as_object)
@@ -2316,6 +2327,57 @@ mod tests {
         );
     }
 
+    #[test]
+    fn workflow_explanation_folds_drag_helpers_and_keeps_parameters() {
+        let steps = vec![
+            aad_runtime::assemble::PerformedStep {
+                action: "key_chord".into(),
+                locator: json!({"automation_id": "1001"}),
+                window: json!({"process_name": "fixture.exe"}),
+                argument: None,
+                parameters: serde_json::from_value(json!({"keys": ["ctrl", "a"]})).unwrap(),
+                destination: None,
+                protected: false,
+            },
+            aad_runtime::assemble::PerformedStep {
+                action: "drag".into(),
+                locator: json!({"automation_id": "1002"}),
+                window: json!({"process_name": "fixture.exe"}),
+                argument: None,
+                parameters: serde_json::from_value(json!({
+                    "button": "left",
+                    "fraction": {"fx": 0.4, "fy": 0.5},
+                    "to_fraction": {"fx": 0.6, "fy": 0.5}
+                }))
+                .unwrap(),
+                destination: Some(json!({"automation_id": "1001"})),
+                protected: false,
+            },
+        ];
+        let workflow = aad_runtime::assemble::assemble("explain_drag", &steps).unwrap();
+        let expanded = workflow["steps"].as_array().unwrap();
+
+        let actions = logical_actions(expanded);
+
+        assert_eq!(expanded.len(), 7);
+        assert_eq!(actions.len(), 2, "destination find is not a logical action");
+        assert_eq!(actions[0]["parameters"]["keys"], json!(["ctrl", "a"]));
+        assert_eq!(actions[1]["destination"], json!({"automation_id": "1001"}));
+        assert_eq!(
+            actions[1]["parameters"]["fraction"],
+            json!({"fx": 0.4, "fy": 0.5})
+        );
+        assert_eq!(
+            actions[1]["parameters"]["to_fraction"],
+            json!({"fx": 0.6, "fy": 0.5})
+        );
+        assert!(actions
+            .iter()
+            .all(|action| action["parameters"].get("target").is_none()));
+        assert!(actions
+            .iter()
+            .all(|action| action["parameters"].get("to").is_none()));
+    }
     #[test]
     fn saved_workflows_can_be_listed_and_explained() {
         // Storing under a name was only half of it: without these, someone who

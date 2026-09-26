@@ -10,20 +10,302 @@
 //! The shape it produces is fixed by what the engine accepts, verified against
 //! real descriptors on disk rather than recalled:
 //!
-//! - Each performed action becomes **three** executed steps: snapshot the
-//!   window, find the element by locator, then act on the reference that find
-//!   produced. The reference has to come from the run, not from the recording:
-//!   a `snapshot:revision:node` handle stops resolving the moment the snapshot
-//!   is gone.
+//! - Each performed action snapshots the window, resolves every durable locator,
+//!   then acts on references produced by that same run. Most actions expand to
+//!   three executed steps; drag expands to four because both source and
+//!   destination must be resolved from the fresh snapshot. A
+//!   `snapshot:revision:node` handle stops resolving when its snapshot is gone.
 //! - The window is named by `process_name`, never by `window_id`. Window ids do
 //!   not survive a restart of the target.
 //! - A protected value becomes a required, sensitive input rather than a literal.
 
 use serde_json::{json, Map, Value};
+use std::collections::BTreeSet;
 
 /// The descriptor dialect the engine accepts.
 const API_VERSION: &str = "ai-auto-desktop.dev/v1alpha1";
 const WORKFLOW_KIND: &str = "Workflow";
+
+/// The parameters a recorded action is allowed to persist.
+///
+/// Runtime references (`target` and drag's `to`) are deliberately absent: they
+/// are rebuilt from durable locators during every replay. Text is also kept out
+/// of this map because protected fields externalise it as a sensitive input.
+fn parameter_names(action: &str) -> Option<&'static [&'static str]> {
+    match action {
+        "focus" | "invoke" | "pointer_click" | "set_value" => Some(&[]),
+        "type_text" => Some(&["mode"]),
+        "key_chord" => Some(&["keys"]),
+        "pointer_gesture" => Some(&["button", "count", "fraction", "scroll", "hover_ms"]),
+        "drag" => Some(&["button", "fraction", "to_fraction"]),
+        _ => None,
+    }
+}
+
+fn invalid_parameter(ordinal: usize, action: &str, message: impl Into<String>) -> AssemblyProblem {
+    AssemblyProblem::new(
+        "WORKFLOW.PARAMETER_INVALID",
+        format!(
+            "step {ordinal} gives {action:?} invalid parameters: {}",
+            message.into()
+        ),
+    )
+}
+
+fn validate_fraction(
+    ordinal: usize,
+    action: &str,
+    name: &str,
+    value: Option<&Value>,
+) -> Result<(), AssemblyProblem> {
+    let Some(value) = value else { return Ok(()) };
+    let Some(object) = value.as_object() else {
+        return Err(invalid_parameter(
+            ordinal,
+            action,
+            format!("{name} must be an object"),
+        ));
+    };
+    if object.len() != 2 || !object.contains_key("fx") || !object.contains_key("fy") {
+        return Err(invalid_parameter(
+            ordinal,
+            action,
+            format!("{name} must contain only fx and fy"),
+        ));
+    }
+    for axis in ["fx", "fy"] {
+        let Some(number) = object.get(axis).and_then(Value::as_f64) else {
+            return Err(invalid_parameter(
+                ordinal,
+                action,
+                format!("{name}.{axis} must be a number"),
+            ));
+        };
+        if !number.is_finite() || !(0.0..=1.0).contains(&number) {
+            return Err(invalid_parameter(
+                ordinal,
+                action,
+                format!("{name}.{axis} must be between 0.0 and 1.0"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Validate the durable portion of an action before writing it down.
+///
+/// The workflow compiler validates descriptor shape, not provider arguments. If
+/// this layer merely copied arbitrary JSON, `save_workflow` could report success
+/// for a workflow that the driver deterministically refuses on replay.
+fn validate_parameters(
+    ordinal: usize,
+    action: &str,
+    parameters: &Map<String, Value>,
+) -> Result<(), AssemblyProblem> {
+    match action {
+        "focus" | "invoke" | "pointer_click" | "set_value" => {}
+        "type_text" => {
+            if let Some(mode) = parameters.get("mode") {
+                if !matches!(mode.as_str(), Some("unicode" | "keys")) {
+                    return Err(invalid_parameter(
+                        ordinal,
+                        action,
+                        "mode must be unicode or keys",
+                    ));
+                }
+            }
+        }
+        "key_chord" => {
+            let Some(keys) = parameters.get("keys").and_then(Value::as_array) else {
+                return Err(invalid_parameter(ordinal, action, "keys is required"));
+            };
+            if keys.is_empty() || keys.len() > 6 {
+                return Err(invalid_parameter(
+                    ordinal,
+                    action,
+                    "keys must contain between 1 and 6 entries",
+                ));
+            }
+            let mut main_keys = 0usize;
+            for key in keys {
+                let Some(key) = key.as_str() else {
+                    return Err(invalid_parameter(
+                        ordinal,
+                        action,
+                        "every key must be a string",
+                    ));
+                };
+                let normalized = key.trim().to_ascii_lowercase();
+                let modifier = matches!(
+                    normalized.as_str(),
+                    "ctrl"
+                        | "control"
+                        | "shift"
+                        | "alt"
+                        | "menu"
+                        | "win"
+                        | "super"
+                        | "meta"
+                        | "cmd"
+                );
+                let alphanumeric = normalized.len() == 1
+                    && normalized
+                        .as_bytes()
+                        .first()
+                        .is_some_and(u8::is_ascii_alphanumeric);
+                let named = matches!(
+                    normalized.as_str(),
+                    "enter"
+                        | "return"
+                        | "tab"
+                        | "esc"
+                        | "escape"
+                        | "space"
+                        | "spacebar"
+                        | "backspace"
+                        | "back"
+                        | "delete"
+                        | "del"
+                        | "insert"
+                        | "ins"
+                        | "home"
+                        | "end"
+                        | "pageup"
+                        | "pgup"
+                        | "pagedown"
+                        | "pgdn"
+                        | "up"
+                        | "down"
+                        | "left"
+                        | "right"
+                        | "f1"
+                        | "f2"
+                        | "f3"
+                        | "f4"
+                        | "f5"
+                        | "f6"
+                        | "f7"
+                        | "f8"
+                        | "f9"
+                        | "f10"
+                        | "f11"
+                        | "f12"
+                );
+                if !modifier && !alphanumeric && !named {
+                    return Err(invalid_parameter(
+                        ordinal,
+                        action,
+                        format!("unknown key {key:?}"),
+                    ));
+                }
+                if !modifier {
+                    main_keys += 1;
+                }
+            }
+            if main_keys != 1 {
+                return Err(invalid_parameter(
+                    ordinal,
+                    action,
+                    "a chord needs exactly one non-modifier key",
+                ));
+            }
+        }
+        "pointer_gesture" => {
+            if let Some(button) = parameters.get("button") {
+                if !matches!(button.as_str(), Some("left" | "right" | "middle")) {
+                    return Err(invalid_parameter(
+                        ordinal,
+                        action,
+                        "button must be left, right or middle",
+                    ));
+                }
+            }
+            if let Some(count) = parameters.get("count") {
+                if !matches!(count.as_u64(), Some(1 | 2)) {
+                    return Err(invalid_parameter(ordinal, action, "count must be 1 or 2"));
+                }
+            }
+            validate_fraction(ordinal, action, "fraction", parameters.get("fraction"))?;
+            if let Some(scroll) = parameters.get("scroll") {
+                let Some(scroll) = scroll.as_object() else {
+                    return Err(invalid_parameter(
+                        ordinal,
+                        action,
+                        "scroll must be an object",
+                    ));
+                };
+                if scroll
+                    .keys()
+                    .any(|key| key != "direction" && key != "notches")
+                {
+                    return Err(invalid_parameter(
+                        ordinal,
+                        action,
+                        "scroll accepts only direction and notches",
+                    ));
+                }
+                if !matches!(
+                    scroll.get("direction").and_then(Value::as_str),
+                    Some("up" | "down" | "left" | "right")
+                ) {
+                    return Err(invalid_parameter(
+                        ordinal,
+                        action,
+                        "scroll.direction must be up, down, left or right",
+                    ));
+                }
+                if let Some(notches) = scroll.get("notches") {
+                    if !matches!(notches.as_u64(), Some(1..=30)) {
+                        return Err(invalid_parameter(
+                            ordinal,
+                            action,
+                            "scroll.notches must be between 1 and 30",
+                        ));
+                    }
+                }
+            }
+            if let Some(hover_ms) = parameters.get("hover_ms") {
+                if !matches!(hover_ms.as_u64(), Some(1..=5_000)) {
+                    return Err(invalid_parameter(
+                        ordinal,
+                        action,
+                        "hover_ms must be between 1 and 5000",
+                    ));
+                }
+            }
+            let scroll = parameters.contains_key("scroll");
+            let hover = parameters.contains_key("hover_ms");
+            let click = parameters.contains_key("button") || parameters.contains_key("count");
+            if (scroll && hover) || ((scroll || hover) && click) {
+                return Err(invalid_parameter(
+                    ordinal,
+                    action,
+                    "scroll, hover and click parameters are mutually exclusive",
+                ));
+            }
+        }
+        "drag" => {
+            if let Some(button) = parameters.get("button") {
+                if !matches!(button.as_str(), Some("left" | "right" | "middle")) {
+                    return Err(invalid_parameter(
+                        ordinal,
+                        action,
+                        "button must be left, right or middle",
+                    ));
+                }
+            }
+            validate_fraction(ordinal, action, "fraction", parameters.get("fraction"))?;
+            validate_fraction(
+                ordinal,
+                action,
+                "to_fraction",
+                parameters.get("to_fraction"),
+            )?;
+        }
+        _ => unreachable!("action was checked before parameter validation"),
+    }
+    Ok(())
+}
 
 /// Actions that carry text, and the argument each one expects.
 ///
@@ -46,8 +328,13 @@ pub struct PerformedStep {
     pub locator: Value,
     /// Which window it was in, as a selector rather than an id.
     pub window: Value,
-    /// The text that was typed or written, when the action carries any.
+    /// The legacy text field used by recordings created before structured
+    /// parameters existed. Kept so old files reopen and compile unchanged.
     pub argument: Option<String>,
+    /// Durable action parameters, excluding runtime target references and text.
+    pub parameters: Map<String, Value>,
+    /// The durable destination locator for a drag. No other action accepts it.
+    pub destination: Option<Value>,
     /// Whether that text was a credential, which must not be written down.
     pub protected: bool,
 }
@@ -95,6 +382,7 @@ pub fn assemble(name: &str, steps: &[PerformedStep]) -> Result<Value, AssemblyPr
         let step_id = format!("step_{ordinal}");
         let snapshot_id = format!("{step_id}_window");
         let find_id = format!("{step_id}_element");
+        let destination_find_id = format!("{step_id}_destination");
 
         if step.action.trim().is_empty() {
             return Err(AssemblyProblem::new(
@@ -136,6 +424,53 @@ of the title instead."
             ));
         }
 
+        let allowed = parameter_names(&step.action).ok_or_else(|| {
+            AssemblyProblem::new(
+                "WORKFLOW.ACTION_UNSUPPORTED",
+                format!("step {ordinal} uses unsupported action {:?}", step.action),
+            )
+        })?;
+        let allowed: BTreeSet<&str> = allowed.iter().copied().collect();
+        let unknown: Vec<&str> = step
+            .parameters
+            .keys()
+            .map(String::as_str)
+            .filter(|name| !allowed.contains(name))
+            .collect();
+        if !unknown.is_empty() {
+            return Err(AssemblyProblem::new(
+                "WORKFLOW.PARAMETER_UNSUPPORTED",
+                format!(
+                    "step {ordinal} gives {:?} parameter(s) {:?}; accepted parameters are {:?}",
+                    step.action, unknown, allowed
+                ),
+            ));
+        }
+        validate_parameters(ordinal, &step.action, &step.parameters)?;
+        match (&*step.action, &step.destination) {
+            ("drag", Some(destination))
+                if destination.is_object()
+                    && destination
+                        .as_object()
+                        .is_some_and(|value| !value.is_empty()) => {}
+            ("drag", _) => {
+                return Err(AssemblyProblem::new(
+                    "WORKFLOW.DESTINATION_REQUIRED",
+                    format!("step {ordinal} is a drag but has no durable destination locator"),
+                ))
+            }
+            (_, Some(_)) => {
+                return Err(AssemblyProblem::new(
+                    "WORKFLOW.DESTINATION_UNUSED",
+                    format!(
+                        "step {ordinal} is {:?}, so a drag destination would be ignored",
+                        step.action
+                    ),
+                ))
+            }
+            (_, None) => {}
+        }
+
         expanded.push(json!({
             "id": snapshot_id,
             "type": "action",
@@ -151,13 +486,30 @@ of the title instead."
                 "locator": step.locator,
             },
         }));
+        if let Some(destination) = &step.destination {
+            expanded.push(json!({
+                "id": destination_find_id,
+                "type": "action",
+                "uses": "desktop.windows_uia.find@1",
+                "with": {
+                    "snapshot_id": format!("${{{{ steps.{snapshot_id}.output.snapshot_id }}}}"),
+                    "locator": destination,
+                },
+            }));
+        }
 
-        let mut arguments = Map::new();
-        // The reference this run produced, not one saved at record time.
+        let mut arguments = step.parameters.clone();
+        // The references this run produced, never ones saved at record time.
         arguments.insert(
             "target".into(),
             json!(format!("${{{{ steps.{find_id}.output.ref }}}}")),
         );
+        if step.destination.is_some() {
+            arguments.insert(
+                "to".into(),
+                json!(format!("${{{{ steps.{destination_find_id}.output.ref }}}}")),
+            );
+        }
 
         if let Some(field) = text_field(&step.action) {
             if step.protected {
@@ -233,6 +585,8 @@ mod tests {
             locator: json!({"role": "button", "name": "Save"}),
             window: json!({"process_name": "app.exe", "title": "Editor"}),
             argument: None,
+            parameters: Map::new(),
+            destination: None,
             protected: false,
         }
     }
@@ -366,5 +720,102 @@ mod tests {
         typing.argument = Some("hello".into());
         let typed = assemble("t", &[typing]).expect("assembled");
         assert_eq!(typed["steps"][2]["with"]["text"], "hello");
+    }
+
+    #[test]
+    fn structured_parameters_are_preserved_for_each_action() {
+        let mut typing = step("type_text");
+        typing.argument = Some("hello".into());
+        typing.parameters.insert("mode".into(), json!("keys"));
+        let typed = assemble("keys", &[typing]).expect("assembled");
+        assert_eq!(typed["steps"][2]["with"]["mode"], "keys");
+
+        let mut chord = step("key_chord");
+        chord.parameters.insert("keys".into(), json!(["CTRL", "A"]));
+        let chord = assemble("chord", &[chord]).expect("assembled");
+        assert_eq!(chord["steps"][2]["with"]["keys"], json!(["CTRL", "A"]));
+
+        let mut gesture = step("pointer_gesture");
+        gesture.parameters.insert("button".into(), json!("right"));
+        gesture
+            .parameters
+            .insert("fraction".into(), json!({"fx": 0.25, "fy": 0.75}));
+        let gesture = assemble("gesture", &[gesture]).expect("assembled");
+        assert_eq!(gesture["steps"][2]["with"]["button"], "right");
+        assert_eq!(gesture["steps"][2]["with"]["fraction"]["fx"], 0.25);
+    }
+
+    #[test]
+    fn drag_refinds_both_endpoints_from_one_snapshot() {
+        let mut drag = step("drag");
+        drag.destination = Some(json!({"role": "listitem", "name": "Done"}));
+        drag.parameters
+            .insert("fraction".into(), json!({"fx": 0.9, "fy": 0.5}));
+        drag.parameters
+            .insert("to_fraction".into(), json!({"fx": 0.1, "fy": 0.5}));
+
+        let descriptor = assemble("move", &[drag]).expect("assembled");
+        let steps = descriptor["steps"].as_array().expect("steps");
+        assert_eq!(steps.len(), 4);
+        assert_eq!(steps[2]["id"], "step_1_destination");
+        assert_eq!(
+            steps[2]["with"]["snapshot_id"],
+            "${{ steps.step_1_window.output.snapshot_id }}"
+        );
+        assert_eq!(steps[3]["uses"], "desktop.windows_uia.drag@1");
+        assert_eq!(
+            steps[3]["with"]["to"],
+            "${{ steps.step_1_destination.output.ref }}"
+        );
+    }
+
+    #[test]
+    fn invalid_structured_parameters_are_refused_before_saving() {
+        let mut chord = step("key_chord");
+        chord.parameters.insert("keys".into(), json!([]));
+        let problem = assemble("empty_chord", &[chord]).expect_err("empty chord must fail");
+        assert_eq!(problem.code, "WORKFLOW.PARAMETER_INVALID");
+
+        let mut chord = step("key_chord");
+        chord
+            .parameters
+            .insert("keys".into(), json!(["ctrl", "nope"]));
+        let problem = assemble("unknown_key", &[chord]).expect_err("unknown key must fail");
+        assert_eq!(problem.code, "WORKFLOW.PARAMETER_INVALID");
+
+        let mut chord = step("key_chord");
+        chord.parameters.insert("keys".into(), json!(["a", "b"]));
+        let problem = assemble("two_keys", &[chord]).expect_err("two main keys must fail");
+        assert_eq!(problem.code, "WORKFLOW.PARAMETER_INVALID");
+
+        let mut gesture = step("pointer_gesture");
+        gesture
+            .parameters
+            .insert("scroll".into(), json!({"direction": "down"}));
+        gesture.parameters.insert("button".into(), json!("left"));
+        let problem = assemble("mixed_gesture", &[gesture]).expect_err("mixed gesture must fail");
+        assert_eq!(problem.code, "WORKFLOW.PARAMETER_INVALID");
+
+        let mut drag = step("drag");
+        drag.destination = Some(json!({"role": "listitem", "name": "Done"}));
+        drag.parameters
+            .insert("to_fraction".into(), json!({"fx": 1.2, "fy": 0.5}));
+        let problem = assemble("outside", &[drag]).expect_err("out of range must fail");
+        assert_eq!(problem.code, "WORKFLOW.PARAMETER_INVALID");
+    }
+
+    #[test]
+    fn unknown_parameters_and_runtime_references_are_refused() {
+        let mut chord = step("key_chord");
+        chord
+            .parameters
+            .insert("target".into(), json!("saved:1:e9"));
+        let problem = assemble("unsafe", &[chord]).expect_err("must refuse");
+        assert_eq!(problem.code, "WORKFLOW.PARAMETER_UNSUPPORTED");
+
+        let mut click = step("invoke");
+        click.destination = Some(json!({"role": "button", "name": "Other"}));
+        let problem = assemble("unused", &[click]).expect_err("must refuse");
+        assert_eq!(problem.code, "WORKFLOW.DESTINATION_UNUSED");
     }
 }

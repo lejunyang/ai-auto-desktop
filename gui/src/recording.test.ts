@@ -200,6 +200,69 @@ describe("compiling to a workflow", () => {
     expect(action.target).toBe(`\${{ steps.${step.id}_element.output.ref }}`);
   });
 
+  it("preserves structured keyboard and pointer actions through save and reopen", () => {
+    const source = Recording.fromDocument({
+      apiVersion: RECORDING_API_VERSION,
+      kind: RECORDING_KIND,
+      metadata: { name: "structured" },
+      steps: [
+        {
+          id: "keys",
+          action: "key_chord",
+          locator: { role: "edit", name: "Editor" },
+          summary: "Editor",
+          window: { process_name: "fixture.exe" },
+          window_title: "Fixture",
+          parameters: { keys: ["ctrl", "a"] },
+          enabled: true,
+        },
+        {
+          id: "move",
+          action: "drag",
+          locator: { role: "listitem", name: "Todo" },
+          destination: { role: "listitem", name: "Done" },
+          summary: "Todo",
+          window: { process_name: "fixture.exe" },
+          window_title: "Fixture",
+          parameters: {
+            button: "left",
+            fraction: { fx: 0.8, fy: 0.5 },
+            to_fraction: { fx: 0.2, fy: 0.5 },
+          },
+          enabled: true,
+        },
+      ],
+    });
+
+    const document = source.toDocument();
+    const reopened = Recording.fromDocument(JSON.parse(JSON.stringify(document)));
+    expect(reopened.steps[0].parameters).toEqual({ keys: ["ctrl", "a"] });
+    expect(reopened.steps[1].destination).toEqual({ role: "listitem", name: "Done" });
+
+    const steps = reopened.toDescriptor("structured").steps as Record<string, unknown>[];
+    expect(steps).toHaveLength(7);
+    expect((steps[2].with as Record<string, unknown>).keys).toEqual(["ctrl", "a"]);
+    expect(steps[5].id).toBe("move_destination");
+    expect((steps[5].with as Record<string, unknown>).locator).toEqual({
+      role: "listitem",
+      name: "Done",
+    });
+    const drag = steps[6].with as Record<string, unknown>;
+    expect(drag.to).toBe("${{ steps.move_destination.output.ref }}");
+    expect(drag.to_fraction).toEqual({ fx: 0.2, fy: 0.5 });
+  });
+
+  it("refuses structured actions that lack their required durable data", () => {
+    const recording = new Recording();
+    const chord = recording.add(draft({ action: "key_chord" }));
+    const drag = recording.add(draft({ action: "drag" }));
+
+    const problems = recording.validate();
+    expect(problems.find((issue) => issue.stepId === chord.id)?.message).toContain("key");
+    expect(problems.find((issue) => issue.stepId === drag.id)?.message).toContain("destination");
+    expect(recording.canExport).toBe(false);
+  });
+
   it("writes ordinary typed text into the file as it was recorded", () => {
     // Measured against a real desktop: an ordinary edit reports its value
     // through UIA, and that text is usually the point of the recording. Hiding
