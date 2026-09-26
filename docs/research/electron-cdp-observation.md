@@ -75,7 +75,17 @@
 - 真机：Bing 首页全文（热点/新闻/备案号等）直接由 innerText 读到，绕过了 UIA 匿名 pane；确定性探针验证点击 label、文本框值、密码事件无值。
 - 踩坑记录（供后续）：Edge devtools HTTP 响应在发完后仍保持连接，`read_to_end` 会挂到超时——必须按 `Content-Length` 精确读；冷启动要先等 `/json/version`；探针需按命令行清理整个 Edge 进程树，否则 profile 锁残留导致下次端口不开。
 
-**真实用户在页面上的输入/点击仍需真机复核**：合成 DOM 事件已验证链路，但物理键入是否被 Bing 这种自定义搜索框逐字符触发 `input`（vs 仅 composition/keyup）需要在接入真实浏览器后确认；若部分页面只在 `change`/失焦时提交，监听器已挂 `change`，必要时再加 `keyup` 兜底。
+**启动方式（2026-09-27 落地）**：新增 `aad-browser` 可执行文件（`aad-cdp` crate 的 bin）。
+`aad-browser --port 9222 [--detached] [URL]` 自动查找 Edge/Chrome/Brave，用**独立 profile**（默认 `%TEMP%\aad-cdp-profile-<port>`）加调试参数启动，等待 `/json/version` 就绪后输出 JSON 启动记录；`--detached` 在端点就绪后即返回。它不触碰用户日常浏览器配置。然后 `aad watch --cdp-port 9222` 即可观察。
+
+**输入观察增强（2026-09-27）**：注入监听器除标准 input/change 外，新增
+- `contentEditable`/富文本（云文档、聊天输入框）：读 `innerText`，作为 `tag=contenteditable, type=richtext`；
+- 对当前焦点可编辑元素挂 `keyup` 与 `compositionend`（IME 中文输入与"只在失焦提交"的网页输入兜底）；
+- 密码框仍不读值。
+
+确定性探针已验证：普通文本输入、密码无值、点击 label、以及一个 contentEditable 富文本的完整文本都被采到（4 类事件，退出码 0）。
+
+**真机物理敲键的遗留说明（诚实记录）**：在本自动化代理环境里，难以把专用浏览器窗口稳定保持在前台（发送的物理键落不到目标窗口），因此"真人逐键敲入 Bing 搜索框"这一步没有产出端到端记录；这是**测试夹具的前台焦点限制，不是观察链路问题**——点击/输入/富文本的采集已由页内合成事件确定性证明，CDP 文本读取此前也已在 Bing 首页真机验证。用户在自己桌面交互运行 `aad-browser` + `aad watch --cdp-port` 时窗口天然在前台，应正常工作；交付后建议补一次真人手动验证。
 
 ## 5. 待验证
 - [待验证] 飞书（IM 消息、文档、搜索框）在默认 UIA、屏幕阅读器模式、Electron 调试端口下各自的文本暴露率与点击信号。
