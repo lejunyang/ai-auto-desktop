@@ -72,6 +72,10 @@ name = "spike_listen"
 required-features = ["windows-native-examples"]
 
 [[example]]
+name = "spike_root_observe"
+required-features = ["windows-native-examples"]
+
+[[example]]
 name = "spike_which_events"
 required-features = ["windows-native-examples"]
 

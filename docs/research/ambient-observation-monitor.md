@@ -160,7 +160,7 @@ node_id 只在单次快照内稳定，不能跨快照用。跨快照身份需要
 - `src/windows.rs`：新增 root 级订阅函数：
   - WinEvent：`EVENT_SYSTEM_FOREGROUND`、`EVENT_OBJECT_FOCUS`、`EVENT_OBJECT_NAMECHANGE`、`EVENT_OBJECT_VALUECHANGE`(若可用) 、`EVENT_OBJECT_INVOKED/SELECTION`，继续 `WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS`。
   - UIA（桌面 root element，`GetRootElement`）：`StructureChangedEventId`、`FocusChangedEventId`（需专用 `AddFocusChangedEventHandler`）、`SelectionItem_ElementSelected`、Value/Toggle PropertyChanged。
-  - root 级事件量级必须先由 spike 测量（§7.1），据此决定 UIA 订阅是全时开还是仅对前台进程 hwnd 动态挂载。
+  - **root UIA subtree 全时订阅不可行（W1 已实测，见 §8）**：空闲桌面基线约 36 events/s，一次 30 秒会话 1972 个事件中 1760 个（89%）是后台进程的 structure 噪声（实测主要噪声源为 VS Code 的语言服务器状态条）。定稿：WinEvent 全局挂（成本低、天然带 hwnd）；UIA handler 挂 root 但**回调内第一时间按 `CurrentProcessId`（必要时加 `CurrentNativeWindowHandle`）与前台进程比对，非前台直接丢弃**，不进缓冲。相比"切应用时动态 remove/add 某 hwnd 的 subtree 订阅"，这样没有切换瞬间的订阅空窗；回调只做一次整数 pid 比较，开销可忽略，正式实现仍需长时 profiling 复核。
 - 订阅线程模型沿用现有结论：root UIA handler 在 MTA 无需消息泵；WinEvent 回调投递到安装线程的队列，需要一个持续 pump 的专用线程（现有 `pump` 已证明此模式）。
 
 ### 5.2 生命周期与入口
@@ -213,7 +213,7 @@ node_id 只在单次快照内稳定，不能跨快照用。跨快照身份需要
 
 | 期 | 内容 | 退出门槛（真机可观察效果） |
 | --- | --- | --- |
-| W1 | root 级事件 spike：foreground 切换、root structure/focus/property 的事件率与噪声 | 在真实桌面切应用、切浏览器 tab、开关对话框均收到事件；输出事件量统计；结论回写本文 |
+| W1 | ~root 级事件 spike：foreground 切换、root structure/focus/property 的事件率与噪声~ **已完成，证据见 §8**；下一阶段按 §5.1 的"前台 pid 过滤"方案落地 | ~~在真实桌面切应用、切浏览器 tab、开关对话框均收到事件；输出事件量统计；结论回写本文~~ 已完成 |
 | W2 | Windows 观察会话：常驻 root 订阅 + foreground_changed + 有界缓冲/丢失计数 + `aad watch` | 连续运行 ≥10 分钟无订阅泄漏；切换 5 个应用全部产生且仅产生一条切换记录；dropped 可见 |
 | W3 | 树 diff 与增量 ChangeSet（含 value/states/结构增删），轮询兜底 | fixture 改值/开关控件/增删节点 diff 结果与人工核对一致；浏览器 tab 切换产出 added/removed；静默窗口零输出 |
 | W4 | 资源约束、按应用静音配置、截图/OCR 兜底接入 | 长时运行内存有界；密码字段不出现在任何输出；截图仅在语义缺口时触发 |
@@ -221,10 +221,32 @@ node_id 只在单次快照内稳定，不能跨快照用。跨快照身份需要
 
 每期完成即按仓库 Conventional Commits 单独提交（实现/测试/文档分离）。
 
-## 8. 待验证假设汇总
+## 8. 实测证据（W1，2026-09-26）与待验证假设
 
-- [待验证] Windows root（桌面）级 StructureChanged 事件率：是否形成持续风暴、需要何种节流（W1 测量）。
-- [待验证] Chromium tab 切换在 root 订阅下的事件形态与去抖窗口（W1/W3）。
+探针：`crates/aad-uia/examples/spike_root_observe.rs`（`--features windows-native-examples`）。桌面 root 同时挂 UIA focus/automation/property handler 与全范围 WinEvent 钩子，有界采样 4000 条，只计数不注入任何输入。真机编排脚本在 30 秒内依次切换 VS Code → Edge →（两次 Ctrl+Tab）→ 记事本 → Windows Terminal → 设置 → Edge →（Ctrl+Tab）→ VS Code。
+
+结果（1972 条，0 溢出）：
+
+1. **前台切换权威可靠**：6 次编排的切换产生恰好 6 条 `EVENT_SYSTEM_FOREGROUND`，每条都带正确的进程名与窗口标题（如 `Code.exe / README.md - … - Visual Studio Code`、`msedge.exe / …`、`Notepad.exe`、`WindowsTerminal.exe`）。无重影、无丢失。
+2. **root StructureChanged 是持续风暴，不能直接消费**：1760/1972（89%）为 `uia-structure`；**无任何交互时也有约 36 条/秒**，样本显示噪声源是后台 VS Code 的"Initializing Gradle Language Server"状态条反复结构变更。切换瞬间出现 364/秒、143/秒的峰值。
+3. **浏览器 tab 切换可观察且语义干净**：两次 Edge Ctrl+Tab 各产生 1 条 `uia-selected`（control type 50019 TabItem），name 即目标页标题（实测两条分别为 Bing 搜索页与博客园页面）；同时伴随地址栏 `uia-value`（50004 Edit）变化。事件直接回答了"切到了哪个标签页"。
+4. 其余通道：`obj-name` 112、`obj-focus` 21（含 Chromium "Chrome Legacy Window" 宿主噪声，需过滤）、`uia-focus` 19、`obj/state` 29、`obj/value` 10+7。WinEvent 与 UIA 双通道在真实应用上均有投递，印证"双通道都要挂"的既有结论在 root 级仍然成立。
+5. 同线程（MTA + 消息泵）同时承载 UIA handler 与 WinEvent hook 可行，两类回调在 30 秒内均正常到达。
+
+由此把以下假设从"待验证"转为"已实测"：
+
+- ~~[待验证] root 级 StructureChanged 是否风暴~~ → **是，空闲 ~36/s，需前台 pid 过滤**（方案见 §5.1）。
+- ~~[待验证] Chromium tab 切换事件形态~~ → **`uia-selected`(TabItem, name=页标题)，可直接作为切换信号**；去抖窗口取 200–300ms 足够（两次 Ctrl+Tab 间隔 1.5s 均独立成条）。
+
+仍待验证：
+
 - [待验证] 仅靠事件、关闭周期轮询时，在 WinForms/Electron/远程桌面/提权应用上的漏报率（决定兜底轮询默认频率）。
+- [待验证] 前台 pid 过滤方案在多窗口同进程（如多个 Edge 窗口、多个 VS Code 窗口）间是否需要进一步用 native window handle 收敛。
 - [待验证] 自动化 ID 缺失时身份键（祖先链+兄弟序号）在动态列表（虚拟列表回收）下的误判率。
 - [待验证] macOS AX 各通知在主流浏览器与 Electron 上的投递率（M1）。
+
+## 9. 相关文档
+
+- `docs/architecture/record-replay.md`：单窗口录制管线的机制、盲区与工程约束，观察者继承其工程模式但不继承事件契约。
+- `docs/spec/recording-session-v1alpha1.md`：脱敏边界（§5）与三端能力不对称（§1）的实测依据。
+- `docs/plan/phased-roadmap.md`：M3 中的录制回放分期与感知门（显式视觉、禁止隐式 fallback）。
