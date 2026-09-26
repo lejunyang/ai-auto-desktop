@@ -419,6 +419,9 @@ struct TextArgs {
     /// The text to type.
     #[arg(long)]
     text: String,
+    /// Input encoding: unicode (default) or layout-aware keys.
+    #[arg(long, value_parser = ["unicode", "keys"], default_value = "unicode")]
+    mode: String,
 }
 
 #[derive(Args)]
@@ -899,9 +902,11 @@ fn dispatch(command: &Command) -> (Value, u8) {
                 DoCommand::SetValue(args) => {
                     ("set_value", &args.target, json!({"value": args.value}))
                 }
-                DoCommand::TypeText(args) => {
-                    ("type_text", &args.target, json!({"text": args.text}))
-                }
+                DoCommand::TypeText(args) => (
+                    "type_text",
+                    &args.target,
+                    json!({"text": args.text, "mode": args.mode}),
+                ),
                 DoCommand::KeyChord(args) => {
                     // Comma-separated on the command line, an array to the driver.
                     // Empty segments are dropped so a stray comma is not read as a
@@ -2411,6 +2416,37 @@ mod tests {
             let has_target = sub.get_arguments().any(|arg| arg.get_id() == "target");
             assert!(has_target, "{} must take a target", sub.get_name());
         }
+    }
+
+    #[test]
+    fn type_text_mode_defaults_to_unicode_and_rejects_unknown_values() {
+        let parsed = Cli::try_parse_from([
+            "aad",
+            "do",
+            "type-text",
+            "--target",
+            "a:1:b",
+            "--text",
+            "hello",
+        ])
+        .unwrap();
+        let Command::Do(DoCommand::TypeText(args)) = parsed.command else {
+            panic!("expected type-text command");
+        };
+        assert_eq!(args.mode, "unicode");
+
+        assert!(Cli::try_parse_from([
+            "aad",
+            "do",
+            "type-text",
+            "--target",
+            "a:1:b",
+            "--text",
+            "hello",
+            "--mode",
+            "guess",
+        ])
+        .is_err());
     }
 
     #[test]

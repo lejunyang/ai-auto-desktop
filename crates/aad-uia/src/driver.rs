@@ -503,7 +503,21 @@ impl UiaDriver {
                 if node.states.read_only == Some(true) {
                     return Err(DriverError::invalid("the element is read-only"));
                 }
-                self.backend.type_text(&window_id, &node, text)?
+                match args.get("mode") {
+                    None => self.backend.type_text(&window_id, &node, text)?,
+                    Some(Value::String(mode)) if mode == "unicode" => {
+                        self.backend.type_text(&window_id, &node, text)?
+                    }
+                    Some(Value::String(mode)) if mode == "keys" => {
+                        self.backend.type_text_keys(&window_id, &node, text)?
+                    }
+                    Some(Value::String(mode)) => {
+                        return Err(DriverError::invalid(format!(
+                            "unknown type_text mode {mode:?}; use unicode or keys"
+                        )))
+                    }
+                    Some(_) => return Err(DriverError::invalid("type_text mode must be a string")),
+                }
             }
             "key_chord" => {
                 let keys: Vec<String> = args
@@ -1145,6 +1159,11 @@ mod tests {
             Ok(())
         }
 
+        fn type_text_keys(&self, _window_id: &str, node: &Node, text: &str) -> Result<()> {
+            self.record(&format!("type_text_keys:{}:{text}", node.node_id));
+            Ok(())
+        }
+
         fn pointer_click(&self, _window_id: &str, node: &Node) -> Result<()> {
             self.record(&format!("pointer_click:{}", node.node_id));
             Ok(())
@@ -1559,6 +1578,55 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(error.code, "DRIVER.INVALID_REQUEST");
+        assert!(backend.performed().is_empty());
+    }
+
+    #[test]
+    fn type_text_defaults_to_unicode_and_can_select_keys_mode() {
+        let (driver, backend) = driver(vec![node("n1", "Edit", "Name", &["type_text"])]);
+        let found = driver
+            .call(
+                "find",
+                &json!({"window_id": "w1", "locator": {"name": "Name"}}),
+            )
+            .unwrap();
+        let target = target_of(&found);
+
+        driver
+            .call("type_text", &json!({"target": target, "text": "a"}))
+            .unwrap();
+        driver
+            .call(
+                "type_text",
+                &json!({"target": target_of(&found), "text": "b", "mode": "keys"}),
+            )
+            .unwrap();
+
+        assert_eq!(
+            backend.performed(),
+            vec!["type_text:n1:a", "type_text_keys:n1:b"]
+        );
+    }
+
+    #[test]
+    fn type_text_rejects_an_unknown_or_non_string_mode() {
+        let (driver, backend) = driver(vec![node("n1", "Edit", "Name", &["type_text"])]);
+        let found = driver
+            .call(
+                "find",
+                &json!({"window_id": "w1", "locator": {"name": "Name"}}),
+            )
+            .unwrap();
+
+        for mode in [json!("guess"), json!(7)] {
+            let error = driver
+                .call(
+                    "type_text",
+                    &json!({"target": target_of(&found), "text": "x", "mode": mode}),
+                )
+                .unwrap_err();
+            assert_eq!(error.code, "DRIVER.INVALID_REQUEST");
+        }
         assert!(backend.performed().is_empty());
     }
 

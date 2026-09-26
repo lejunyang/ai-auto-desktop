@@ -101,22 +101,25 @@ use windows::Win32::UI::Accessibility::{
     UIA_EVENT_ID,
     UIA_PROPERTY_ID,
 };
+use windows::Win32::UI::Input::Ime::ImmGetDefaultIMEWnd;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    MapVirtualKeyW, SendInput, INPUT, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_KEYUP,
-    KEYEVENTF_SCANCODE, KEYEVENTF_UNICODE, MAPVK_VK_TO_VSC, MOUSEEVENTF_ABSOLUTE,
-    MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN,
-    MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP,
-    MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL, MOUSEINPUT, VIRTUAL_KEY, VK_BACK, VK_CONTROL,
-    VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_F1, VK_F10, VK_F11, VK_F12, VK_F2, VK_F3, VK_F4,
-    VK_F5, VK_F6, VK_F7, VK_F8, VK_F9, VK_HOME, VK_INSERT, VK_LEFT, VK_LWIN, VK_MENU, VK_NEXT,
-    VK_PRIOR, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_SPACE, VK_TAB, VK_UP,
+    GetKeyState, GetKeyboardLayout, MapVirtualKeyW, SendInput, VkKeyScanExW, INPUT, INPUT_KEYBOARD,
+    INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, KEYEVENTF_UNICODE,
+    MAPVK_VK_TO_VSC, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN,
+    MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE,
+    MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL,
+    MOUSEINPUT, VIRTUAL_KEY, VK_BACK, VK_CAPITAL, VK_CONTROL, VK_DELETE, VK_DOWN, VK_END,
+    VK_ESCAPE, VK_F1, VK_F10, VK_F11, VK_F12, VK_F2, VK_F3, VK_F4, VK_F5, VK_F6, VK_F7, VK_F8,
+    VK_F9, VK_HOME, VK_INSERT, VK_LEFT, VK_LWIN, VK_MENU, VK_NEXT, VK_PRIOR, VK_RETURN, VK_RIGHT,
+    VK_SHIFT, VK_SPACE, VK_TAB, VK_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, EnumWindows, GetAncestor, GetClassNameW, GetForegroundWindow,
-    GetSystemMetrics, GetWindowRect, GetWindowTextLengthW, GetWindowTextW,
-    GetWindowThreadProcessId, IsIconic, IsWindowVisible, PeekMessageW, SetForegroundWindow,
-    GA_ROOT, MSG, PM_REMOVE, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
-    SM_YVIRTUALSCREEN, WHEEL_DELTA, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS,
+    GetGUIThreadInfo, GetSystemMetrics, GetWindowRect, GetWindowTextLengthW, GetWindowTextW,
+    GetWindowThreadProcessId, IsIconic, IsWindowVisible, PeekMessageW, SendMessageW,
+    SetForegroundWindow, GA_ROOT, GUITHREADINFO, MSG, PM_REMOVE, SM_CXVIRTUALSCREEN,
+    SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, WHEEL_DELTA, WINEVENT_OUTOFCONTEXT,
+    WINEVENT_SKIPOWNPROCESS,
 };
 
 /// Initialise COM on the calling thread.
@@ -484,6 +487,70 @@ impl Backend for WindowsUiaBackend {
         deliver_atomically(&inputs, "keystrokes")
     }
 
+    fn type_text_keys(&self, window_id: &str, node: &Node, text: &str) -> Result<()> {
+        // Build the complete sequence before focusing or sending anything. An
+        // unsupported character therefore fails with effect=not_applied rather
+        // than leaving a valid prefix in the target.
+        let top_level = parse_window_id(window_id)?;
+        let element = self.require(window_id, node)?;
+        let input_window = unsafe { element.CurrentNativeWindowHandle() }
+            .ok()
+            .filter(|handle| !handle.0.is_null())
+            .unwrap_or(top_level);
+        let thread_id = unsafe { GetWindowThreadProcessId(input_window, None) };
+        if thread_id == 0 {
+            return Err(DriverError::unavailable(
+                "the target element has no owning input thread",
+            ));
+        }
+        let layout = unsafe { GetKeyboardLayout(thread_id) };
+        let caps_lock_on = unsafe { GetKeyState(VK_CAPITAL.0 as i32) } & 1 != 0;
+        let sequence = KeyTextSequence::parse(text, layout, caps_lock_on)?;
+        unsafe { element.SetFocus() }.map_err(|error| {
+            DriverError::new("DRIVER.ACTION_FAILED", format!("focus failed: {error}"))
+        })?;
+
+        // UIA elements in hosted controls often report the top-level HWND, not
+        // the child that owns the caret. After SetFocus, GetGUIThreadInfo is the
+        // authoritative source for which HWND will receive keyboard input.
+        let mut gui = GUITHREADINFO {
+            cbSize: std::mem::size_of::<GUITHREADINFO>() as u32,
+            ..Default::default()
+        };
+        let focus_window = if unsafe { GetGUIThreadInfo(thread_id, &mut gui) }.is_ok()
+            && !gui.hwndFocus.0.is_null()
+        {
+            gui.hwndFocus
+        } else {
+            input_window
+        };
+        if ime_is_open(focus_window) {
+            return Err(DriverError::new(
+                "DRIVER.INPUT_METHOD_ACTIVE",
+                "keys mode cannot guarantee exact text while the target input method is open",
+            )
+            // Focus changed, but no key was sent.
+            .with_effect("contextual")
+            .with_detail(
+                "remedy",
+                serde_json::json!(
+                    "switch the target input method to direct/English mode, or use mode=unicode/set_value"
+                ),
+            ));
+        }
+
+        deliver_atomically(&sequence.inputs, "layout-aware keystrokes").map_err(|mut error| {
+            let sent = error
+                .details
+                .get("events_sent")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0) as usize;
+            let released = release_pressed_prefix(&sequence.inputs, sent);
+            error = error.with_detail("residual_state_cleared", serde_json::json!(released));
+            error
+        })
+    }
+
     fn key_chord(&self, window_id: &str, node: &Node, keys: &[String]) -> Result<()> {
         // A chord lands on whatever holds focus, exactly like typing, so the
         // element is focused first. Without this a shortcut meant for one field
@@ -685,6 +752,160 @@ fn write_was_refused(before: Option<&str>, after: Option<&str>, requested: &str)
         (Some(before), Some(after)) => before == after && before != requested,
         _ => false,
     }
+}
+
+fn ime_is_open(window: HWND) -> bool {
+    // ImmGetContext cannot retrieve another process's context. The default IME
+    // window is explicitly the cross-process query path: ask it for open status.
+    const WM_IME_CONTROL: u32 = 0x0283;
+    const IMC_GETOPENSTATUS: usize = 0x0005;
+    let ime = unsafe { ImmGetDefaultIMEWnd(window) };
+    if ime.0.is_null() {
+        return false;
+    }
+    unsafe {
+        SendMessageW(
+            ime,
+            WM_IME_CONTROL,
+            windows::Win32::Foundation::WPARAM(IMC_GETOPENSTATUS),
+            windows::Win32::Foundation::LPARAM(0),
+        )
+        .0 != 0
+    }
+}
+
+/// A complete, layout-aware sequence for text typed as real virtual keys.
+struct KeyTextSequence {
+    inputs: Vec<INPUT>,
+}
+
+impl KeyTextSequence {
+    fn parse(
+        text: &str,
+        layout: windows::Win32::UI::Input::KeyboardAndMouse::HKL,
+        caps_lock_on: bool,
+    ) -> Result<Self> {
+        let mut inputs = Vec::new();
+        let mut chars = text.chars().peekable();
+        while let Some(character) = chars.next() {
+            let (key, modifiers) = match character {
+                '\r' => {
+                    if chars.peek() == Some(&'\n') {
+                        chars.next();
+                    }
+                    (VK_RETURN, Vec::new())
+                }
+                '\n' => (VK_RETURN, Vec::new()),
+                '\t' => (VK_TAB, Vec::new()),
+                '\u{8}' => (VK_BACK, Vec::new()),
+                character => map_character(character, layout, caps_lock_on)?,
+            };
+            for &modifier in &modifiers {
+                inputs.push(virtual_key_event(modifier, false));
+            }
+            inputs.push(virtual_key_event(key, false));
+            inputs.push(virtual_key_event(key, true));
+            for &modifier in modifiers.iter().rev() {
+                inputs.push(virtual_key_event(modifier, true));
+            }
+        }
+        Ok(Self { inputs })
+    }
+}
+
+fn map_character(
+    character: char,
+    layout: windows::Win32::UI::Input::KeyboardAndMouse::HKL,
+    caps_lock_on: bool,
+) -> Result<(VIRTUAL_KEY, Vec<VIRTUAL_KEY>)> {
+    let mut utf16 = [0u16; 2];
+    let encoded = character.encode_utf16(&mut utf16);
+    if encoded.len() != 1 {
+        return Err(unmappable_character(character));
+    }
+    let mapped = unsafe { VkKeyScanExW(encoded[0], layout) };
+    if mapped == -1 {
+        return Err(unmappable_character(character));
+    }
+    let raw = mapped as u16;
+    let key = VIRTUAL_KEY(raw & 0x00ff);
+    let shift_state = (raw >> 8) as u8;
+    if shift_state & !0x07 != 0 {
+        return Err(DriverError::invalid(format!(
+            "character {character:?} requires an unsupported keyboard shift state"
+        )));
+    }
+    let mut modifiers = Vec::new();
+    let layout_needs_shift = shift_state & 0x01 != 0;
+    let is_letter = (b'A' as u16..=b'Z' as u16).contains(&key.0);
+    if layout_needs_shift ^ (caps_lock_on && is_letter) {
+        modifiers.push(VK_SHIFT);
+    }
+    if shift_state & 0x02 != 0 {
+        modifiers.push(VK_CONTROL);
+    }
+    if shift_state & 0x04 != 0 {
+        modifiers.push(VK_MENU);
+    }
+    Ok((key, modifiers))
+}
+
+fn unmappable_character(character: char) -> DriverError {
+    DriverError::invalid(format!(
+        "character {character:?} cannot be typed as keys with the target window's keyboard layout; use mode=unicode or set_value"
+    ))
+    .with_detail("character", serde_json::json!(character.to_string()))
+}
+
+/// A logical virtual-key event. No SCANCODE flag: the key was chosen using the
+/// target window's layout, so Windows must translate that logical VK through the
+/// target input queue rather than reinterpret a physical key position.
+fn virtual_key_event(vk: VIRTUAL_KEY, up: bool) -> INPUT {
+    INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: windows::Win32::UI::Input::KeyboardAndMouse::INPUT_0 {
+            ki: KEYBDINPUT {
+                wVk: vk,
+                wScan: 0,
+                dwFlags: if up {
+                    KEYEVENTF_KEYUP
+                } else {
+                    Default::default()
+                },
+                time: 0,
+                dwExtraInfo: 0,
+            },
+        },
+    }
+}
+
+/// Release exactly the keys still down after a partially delivered prefix.
+fn pressed_keys_after_prefix(inputs: &[INPUT], sent: usize) -> Vec<VIRTUAL_KEY> {
+    let mut pressed: Vec<VIRTUAL_KEY> = Vec::new();
+    for input in inputs.iter().take(sent) {
+        if input.r#type != INPUT_KEYBOARD {
+            continue;
+        }
+        let keyboard = unsafe { input.Anonymous.ki };
+        if keyboard.dwFlags.contains(KEYEVENTF_KEYUP) {
+            if let Some(index) = pressed.iter().rposition(|key| *key == keyboard.wVk) {
+                pressed.remove(index);
+            }
+        } else {
+            pressed.push(keyboard.wVk);
+        }
+    }
+    pressed
+}
+
+fn release_pressed_prefix(inputs: &[INPUT], sent: usize) -> Vec<u16> {
+    let mut released = Vec::new();
+    for key in pressed_keys_after_prefix(inputs, sent).into_iter().rev() {
+        let event = [virtual_key_event(key, true)];
+        let _ = unsafe { SendInput(&event, std::mem::size_of::<INPUT>() as i32) };
+        released.push(key.0);
+    }
+    released
 }
 
 /// A parsed key combination: the modifiers to hold and the main key to press.
@@ -1868,6 +2089,78 @@ mod tests {
         assert!(input_rejected(0, 5, "keystrokes")
             .message
             .contains("keystrokes"));
+    }
+
+    #[test]
+    fn key_text_uses_real_keys_and_shift_for_uppercase() {
+        let layout = unsafe { GetKeyboardLayout(0) };
+        let sequence = KeyTextSequence::parse("aA1\n", layout, false).unwrap();
+        let events: Vec<KEYBDINPUT> = sequence
+            .inputs
+            .iter()
+            .map(|input| unsafe { input.Anonymous.ki })
+            .collect();
+
+        assert!(events.iter().all(|event| event.wVk.0 != 0));
+        assert!(events
+            .iter()
+            .all(|event| !event.dwFlags.contains(KEYEVENTF_UNICODE)));
+        assert!(events
+            .iter()
+            .any(|event| { event.wVk == VK_SHIFT && !event.dwFlags.contains(KEYEVENTF_KEYUP) }));
+        assert!(events
+            .iter()
+            .any(|event| { event.wVk == VK_RETURN && !event.dwFlags.contains(KEYEVENTF_KEYUP) }));
+    }
+
+    #[test]
+    fn caps_lock_inverts_shift_only_for_letters() {
+        let layout = unsafe { GetKeyboardLayout(0) };
+        let (_, lower_without_caps) = map_character('a', layout, false).unwrap();
+        let (_, lower_with_caps) = map_character('a', layout, true).unwrap();
+        let (_, upper_without_caps) = map_character('A', layout, false).unwrap();
+        let (_, upper_with_caps) = map_character('A', layout, true).unwrap();
+        let (_, punctuation_without_caps) = map_character('!', layout, false).unwrap();
+        let (_, punctuation_with_caps) = map_character('!', layout, true).unwrap();
+
+        assert!(!lower_without_caps.contains(&VK_SHIFT));
+        assert!(lower_with_caps.contains(&VK_SHIFT));
+        assert!(upper_without_caps.contains(&VK_SHIFT));
+        assert!(!upper_with_caps.contains(&VK_SHIFT));
+        assert_eq!(punctuation_without_caps, punctuation_with_caps);
+    }
+
+    #[test]
+    fn key_text_normalises_crlf_to_one_enter() {
+        let layout = unsafe { GetKeyboardLayout(0) };
+        let sequence = KeyTextSequence::parse("\r\n", layout, false).unwrap();
+        assert_eq!(sequence.inputs.len(), 2);
+    }
+
+    #[test]
+    fn key_text_rejects_a_character_the_layout_cannot_express() {
+        let layout = unsafe { GetKeyboardLayout(0) };
+        let error = match KeyTextSequence::parse("😀", layout, false) {
+            Err(error) => error,
+            Ok(_) => panic!("the active layout must not invent a key for an emoji"),
+        };
+        assert_eq!(error.code, "DRIVER.INVALID_REQUEST");
+        assert_eq!(error.effect, "not_applied");
+    }
+
+    #[test]
+    fn partial_key_prefix_tracks_every_still_pressed_key() {
+        let inputs = [
+            virtual_key_event(VK_SHIFT, false),
+            virtual_key_event(VIRTUAL_KEY(b'A' as u16), false),
+            virtual_key_event(VIRTUAL_KEY(b'A' as u16), true),
+            virtual_key_event(VK_SHIFT, true),
+        ];
+        assert_eq!(
+            pressed_keys_after_prefix(&inputs, 2),
+            vec![VK_SHIFT, VIRTUAL_KEY(b'A' as u16)]
+        );
+        assert!(pressed_keys_after_prefix(&inputs, 4).is_empty());
     }
 
     #[test]

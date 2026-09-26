@@ -269,7 +269,14 @@ Use only when set_value is unsupported, since keystrokes go wherever focus lands
                 "type": "object",
                 "properties": {
                     "target": target_schema(),
-                    "text": {"type": "string", "maxLength": 1024}
+                    "text": {"type": "string", "maxLength": 1024},
+                    "mode": {
+                        "enum": ["unicode", "keys"],
+                        "default": "unicode",
+                        "description": "unicode types arbitrary text through VK_PACKET. keys maps \
+            characters through the target window's keyboard layout into virtual-key presses, which Raw Input \
+            consumers can see; it rejects characters the layout cannot express."
+                    }
                 },
                 "required": ["target", "text"],
                 "additionalProperties": false
@@ -1946,6 +1953,11 @@ hitting truncation without knowing there is another way: {:?}",
     fn text_input_is_bounded_in_the_schema() {
         let tool = find("type_text").unwrap();
         assert_eq!(tool.schema["properties"]["text"]["maxLength"], json!(1024));
+        assert_eq!(
+            tool.schema["properties"]["mode"]["enum"],
+            json!(["unicode", "keys"])
+        );
+        assert_eq!(tool.schema["properties"]["mode"]["default"], "unicode");
     }
 
     #[test]

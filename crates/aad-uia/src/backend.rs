@@ -188,6 +188,19 @@ pub trait Backend: Send + Sync {
     fn invoke(&self, window_id: &str, node: &Node) -> Result<()>;
     fn set_value(&self, window_id: &str, node: &Node, value: &str) -> Result<()>;
     fn type_text(&self, window_id: &str, node: &Node, text: &str) -> Result<()>;
+
+    /// Type text as layout-aware virtual-key presses rather than Unicode packets.
+    ///
+    /// This is visible to Raw Input consumers, but can represent only characters
+    /// the target window's active keyboard layout maps to physical keys. Backends
+    /// without such a path fail explicitly; they must not silently fall back to
+    /// Unicode because that would change the visibility the caller requested.
+    fn type_text_keys(&self, _window_id: &str, _node: &Node, _text: &str) -> Result<()> {
+        Err(DriverError::new(
+            "DRIVER.ACTION_UNSUPPORTED",
+            "layout-aware key typing is not implemented on this platform yet",
+        ))
+    }
     fn pointer_click(&self, window_id: &str, node: &Node) -> Result<()>;
 
     /// Press a key combination while the element holds focus.
