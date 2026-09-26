@@ -16,6 +16,7 @@ use crate::backend::{
 };
 use crate::capture::{self, CapturedEvent};
 use crate::model::{Locator, Node, Snapshot, Target, NODE_ACTIONS, OUTLINE_BUDGET};
+use crate::observe_session::{ObserveManager, ObserveSource};
 use aad_plugin::{manifest, CapabilityManifest};
 use aad_runtime::journal::now_rfc3339;
 use aad_runtime::provider::Provider;
@@ -58,6 +59,9 @@ pub struct UiaDriver {
     /// thread -- while `call` is not, so the sessions live here and the actions
     /// are just the way in.
     captures: Mutex<HashMap<String, CaptureHandle>>,
+    /// Long-running, system-wide observation sessions, separate from the
+    /// single-window recording captures.
+    observations: ObserveManager,
 }
 
 impl UiaDriver {
@@ -76,6 +80,7 @@ impl UiaDriver {
             snapshots,
             manifest: manifest::parse(&document).expect("the built-in manifest is valid"),
             captures: Mutex::new(HashMap::new()),
+            observations: ObserveManager::new(),
         }
     }
 
@@ -104,6 +109,9 @@ impl UiaDriver {
             "watch" => self.watch(&args),
             "collect" => self.collect(&args),
             "release" => self.release(&args),
+            "observe_start" => self.observe_start(&args),
+            "observe_poll" => self.observations.poll(&args),
+            "observe_stop" => self.observations.stop(&args),
             other => Err(DriverError::invalid(format!("unknown action {other:?}"))),
         }
     }
@@ -608,6 +616,34 @@ impl UiaDriver {
             "recording interactions is only implemented on Windows so far",
         ))
     }
+
+    /// Start a desktop-wide observation session.
+    ///
+    /// Unlike `watch`, this is not anchored to a window: the native session
+    /// subscribes at the desktop root and reports foreground switches itself.
+    fn observe_start(&self, args: &Value) -> Result<Value> {
+        let limit = args
+            .get("buffer")
+            .and_then(Value::as_u64)
+            .unwrap_or(4_096)
+            .clamp(64, 65_536) as usize;
+        let session = self.open_observation(limit)?;
+        Ok(self.observations.start(session))
+    }
+
+    #[cfg(windows)]
+    fn open_observation(&self, limit: usize) -> Result<Box<dyn ObserveSource>> {
+        let session = crate::observer_win::ObserverSession::start(limit)?;
+        Ok(Box::new(session))
+    }
+
+    #[cfg(not(windows))]
+    fn open_observation(&self, _limit: usize) -> Result<Box<dyn ObserveSource>> {
+        Err(DriverError::new(
+            "DRIVER.ACTION_UNSUPPORTED",
+            "ambient observation is only implemented on Windows so far",
+        ))
+    }
 }
 
 /// A recording session and the snapshot its locators are judged against.
@@ -1030,6 +1066,7 @@ fn action_contracts() -> Map<String, Value> {
             "non_idempotent",
         ),
     );
+    crate::observe_session::contracts(&mut actions);
     actions
 }
 

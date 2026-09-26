@@ -10,15 +10,23 @@
 //!   manifest, all of which are platform independent and tested everywhere;
 //! - [`capture`] — turning observed interactions into recordable events, also
 //!   platform independent.
+//! - [`observe`] — long-running, system-wide ambient observation (foreground
+//!   switches and incremental change triggers), platform independent apart
+//!   from the native subscription in [`windows`].
 
 pub mod backend;
 pub mod capture;
 pub mod driver;
 pub mod model;
+pub mod observe;
+pub mod observe_session;
 pub mod selector;
 
 #[cfg(windows)]
 pub mod windows;
+
+#[cfg(windows)]
+pub mod observer_win;
 
 pub use backend::{Backend, CaptureLimits, CapturedTree, DriverError, SnapshotStore};
 pub use capture::{coalesce, recordable, CapturedEvent, EventBuffer, EventKind};
