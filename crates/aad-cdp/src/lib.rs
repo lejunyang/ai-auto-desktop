@@ -300,18 +300,21 @@ const INSTALL_JS: &str = r#"
     }
     return el;
   };
-  document.addEventListener('click', (e) => {
+  // Capture phase so framework routers (React/Vue) that stopPropagation still
+  // get observed; resolve to the nearest clickable ancestor for a label.
+  const onClick = (e) => {
     const el = clickable(e.target);
     q.push({
       kind: 'click',
       tag: el.tagName ? el.tagName.toLowerCase() : null,
       label: labelOf(el),
-      href: el.href || null,
+      href: el.href || el.closest && el.closest('a') ? (el.closest('a') || {}).href || null : null,
       value: null,
       type: null,
       url: location.href,
     });
-  }, true);
+  };
+  document.addEventListener('click', onClick, true);
   const onInput = (e) => {
     const el = e.target;
     if (!el || !el.tagName) return;
@@ -338,7 +341,24 @@ const INSTALL_JS: &str = r#"
 const DRAIN_JS: &str = r#"
 (() => {
   if (!window.__aadCdp) return [];
-  return window.__aadCdp.take();
+  const raw = window.__aadCdp.take();
+  // Coalesce the per-keystroke 'input' storm into one event per field,
+  // keeping the latest value; de-duplicate identical click events.
+  const byField = new Map();
+  const clicks = [];
+  const seenClick = new Set();
+  for (const e of raw) {
+    if (e.kind === 'input') {
+      const key = (e.tag||'') + '|' + (e.type||'') + '|' + (e.label||'') + '|' + (e.url||'');
+      byField.set(key, e);
+    } else if (e.kind === 'click') {
+      const key = (e.tag||'') + '|' + (e.label||'') + '|' + (e.href||'');
+      if (!seenClick.has(key)) { seenClick.add(key); clicks.push(e); }
+    } else {
+      clicks.push(e);
+    }
+  }
+  return clicks.concat(Array.from(byField.values()));
 })()
 "#;
 

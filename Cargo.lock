@@ -32,6 +32,7 @@ name = "aad-cli"
 version = "0.0.1"
 dependencies = [
  "aad-atspi",
+ "aad-cdp",
  "aad-core",
  "aad-macos-ax",
  "aad-mcp",

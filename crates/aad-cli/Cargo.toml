@@ -21,6 +21,7 @@ aad-plugin = { workspace = true }
 aad-probe = { workspace = true }
 aad-runtime = { workspace = true }
 aad-uia = { workspace = true }
+aad-cdp = { workspace = true }
 clap = { workspace = true }
 shlex = { workspace = true }
 serde = { workspace = true }

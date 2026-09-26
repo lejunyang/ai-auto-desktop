@@ -6,6 +6,9 @@
 //! error, `2` a usage or input error.
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
+
+mod cdp_watch;
+
 use serde_json::{json, Value};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -421,6 +424,12 @@ struct WatchArgs {
     /// Maximum items kept per digest category.
     #[arg(long, default_value_t = 40)]
     max_items: usize,
+    /// Use the Chrome DevTools Protocol for a debug-enabled Chromium browser
+    /// on this port (started with --remote-debugging-port). When the
+    /// foreground is a browser, rendered text and click/input are read from
+    /// the page instead of the UIA tree. 0 disables CDP and uses UIA only.
+    #[arg(long, default_value_t = 0)]
+    cdp_port: u16,
 }
 
 #[derive(Subcommand)]
@@ -1151,6 +1160,14 @@ fn run_watch(args: &WatchArgs) -> (Value, u8) {
     let mut last_fallback = std::time::Instant::now();
     let mut total_dropped: u64 = 0;
 
+    // Optional CDP source for Chromium browsers. Constructed once; each poll
+    // decides whether the foreground is actually a browser on the port.
+    let mut cdp = if args.cdp_port != 0 {
+        Some(cdp_watch::CdpWatcher::new())
+    } else {
+        None
+    };
+
     let finish = |sink: &mut Box<dyn std::io::Write>,
                   driver: &aad_uia::UiaDriver,
                   observe_id: &str,
@@ -1185,6 +1202,57 @@ fn run_watch(args: &WatchArgs) -> (Value, u8) {
         };
         total_dropped += polled["dropped_events"].as_u64().unwrap_or(0);
         let events_json = polled["events"].as_array().cloned().unwrap_or_default();
+
+        // CDP takes the foreground when enabled and the current window is a
+        // Chromium browser on the debug port. It reads rendered text and
+        // in-page activity directly; UIA still supplies app switches.
+        if let Some(watcher) = cdp.as_mut() {
+            if args.window.is_none() {
+                if let Some(id) = current_foreground_id(&driver) {
+                    let Some(window) = window_listing(&driver, &id) else {
+                        std::thread::sleep(tick);
+                        continue;
+                    };
+                    let process = window
+                        .process_name
+                        .clone()
+                        .unwrap_or_default()
+                        .to_ascii_lowercase();
+                    let is_chromium = matches!(
+                        process.as_str(),
+                        "msedge.exe" | "chrome.exe" | "brave.exe" | "vivaldi.exe"
+                    );
+                    if is_chromium
+                        && cdp_watch::CdpWatcher::available(args.cdp_port)
+                    {
+                        if let Some(observation) =
+                            watcher.observe(args.cdp_port, &window.title)
+                        {
+                            let any = !observation.activity.is_empty()
+                                || !observation.added_lines.is_empty()
+                                || !observation.removed_lines.is_empty();
+                            if any {
+                                emit(
+                                    &mut sink,
+                                    json!({
+                                        "kind": "page_activity",
+                                        "source": "cdp",
+                                        "title": observation.title,
+                                        "url": observation.url,
+                                        "activity": serde_json::to_value(&observation.activity).unwrap_or(Value::Null),
+                                        "added_text": observation.added_lines,
+                                        "removed_text": observation.removed_lines,
+                                    }),
+                                );
+                            }
+                            // CDP already described this window's content; skip
+                            // the UIA snapshot for it this tick.
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
         let mut events: Vec<aad_uia::ObservedEvent> = events_json
             .iter()
             .filter_map(|value| serde_json::from_value(value.clone()).ok())
