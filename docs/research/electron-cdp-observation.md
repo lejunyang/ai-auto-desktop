@@ -65,6 +65,18 @@
 4. **飞书**：先做一次 W1 式实测（默认 UIA / 无障碍开关 / Electron 调试端口三路），再决定走 B 还是 C。
 5. **过滤可配置**：进程黑名单（密码管理器/银行/飞书私聊窗口静音）、字段 denylist（git 状态/行列号/时间戳）、只看 edit 值变化等，作为 watch 的 profile。
 
+### 2.3 CDP 已落地（2026-09-26）
+
+新增只读 `aad-cdp` crate 并接入 `aad watch --cdp-port <port>`：
+
+- 纯标准库实现 127.0.0.1 HTTP 发现（`/json/version`、`/json/list`）与手写 WebSocket/1.1（握手/掩码/分片），无 TLS；只读，从不 `Page.navigate`、从不注入输入。
+- `state()` 直接取 `document.body.innerText`（渲染后纯文本）；注入的被动监听器用**捕获阶段**（React/Vue stopPropagation 也能看到）上报点击与输入，drain 时按字段合并逐键 input、去重点击；**密码框值永不上报**。
+- watch 循环：前台是 msedge/chrome/brave/vivaldi 且端口在听时，走 CDP 产出 `page_activity`（标题/URL + 新增/消失文本行 + 点击/输入活动），并跳过该标签的 UIA 快照；切到非浏览器应用自动回退 UIA；不传 `--cdp-port` 行为不变。
+- 真机：Bing 首页全文（热点/新闻/备案号等）直接由 innerText 读到，绕过了 UIA 匿名 pane；确定性探针验证点击 label、文本框值、密码事件无值。
+- 踩坑记录（供后续）：Edge devtools HTTP 响应在发完后仍保持连接，`read_to_end` 会挂到超时——必须按 `Content-Length` 精确读；冷启动要先等 `/json/version`；探针需按命令行清理整个 Edge 进程树，否则 profile 锁残留导致下次端口不开。
+
+**真实用户在页面上的输入/点击仍需真机复核**：合成 DOM 事件已验证链路，但物理键入是否被 Bing 这种自定义搜索框逐字符触发 `input`（vs 仅 composition/keyup）需要在接入真实浏览器后确认；若部分页面只在 `change`/失焦时提交，监听器已挂 `change`，必要时再加 `keyup` 兜底。
+
 ## 5. 待验证
 - [待验证] 飞书（IM 消息、文档、搜索框）在默认 UIA、屏幕阅读器模式、Electron 调试端口下各自的文本暴露率与点击信号。
 - [待验证] 连接用户日常 Edge/Chrome 配置（非独立 user-data-dir）开 CDP 的企业策略与稳定性；多 profile/多窗口 target 归属。
