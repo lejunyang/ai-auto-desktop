@@ -128,6 +128,15 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--title", required=True)
     parser.add_argument("--log", required=True)
+    parser.add_argument(
+        "--keyboard-layout",
+        help="activate this KLID on the probe thread only, e.g. 00000409",
+    )
+    parser.add_argument(
+        "--ime-open",
+        action="store_true",
+        help="open the IME context on the probe's own edit control",
+    )
     args = parser.parse_args()
 
     user32 = ctypes.WinDLL("user32", use_last_error=True)
@@ -185,6 +194,21 @@ def main() -> int:
         ctypes.POINTER(wintypes.UINT), wintypes.UINT,
     ]
     user32.GetRawInputData.restype = wintypes.UINT
+    user32.LoadKeyboardLayoutW.argtypes = [wintypes.LPCWSTR, wintypes.UINT]
+    user32.LoadKeyboardLayoutW.restype = wintypes.HANDLE
+    user32.ActivateKeyboardLayout.argtypes = [wintypes.HANDLE, wintypes.UINT]
+    user32.ActivateKeyboardLayout.restype = wintypes.HANDLE
+    user32.GetKeyboardLayout.argtypes = [wintypes.DWORD]
+    user32.GetKeyboardLayout.restype = wintypes.HANDLE
+    imm32 = ctypes.WinDLL("imm32", use_last_error=True)
+    imm32.ImmGetContext.argtypes = [wintypes.HWND]
+    imm32.ImmGetContext.restype = wintypes.HANDLE
+    imm32.ImmGetOpenStatus.argtypes = [wintypes.HANDLE]
+    imm32.ImmGetOpenStatus.restype = wintypes.BOOL
+    imm32.ImmSetOpenStatus.argtypes = [wintypes.HANDLE, wintypes.BOOL]
+    imm32.ImmSetOpenStatus.restype = wintypes.BOOL
+    imm32.ImmReleaseContext.argtypes = [wintypes.HWND, wintypes.HANDLE]
+    imm32.ImmReleaseContext.restype = wintypes.BOOL
     user32.GetAsyncKeyState.argtypes = [ctypes.c_int]
     user32.GetAsyncKeyState.restype = ctypes.c_short
     user32.GetKeyState.argtypes = [ctypes.c_int]
@@ -267,6 +291,14 @@ def main() -> int:
             return 0
         return int(user32.DefWindowProcW(hwnd, message, raw_wparam, raw_lparam))
 
+    active_layout = None
+    if args.keyboard_layout:
+        KLF_ACTIVATE = 0x00000001
+        loaded = user32.LoadKeyboardLayoutW(args.keyboard_layout, KLF_ACTIVATE)
+        if not loaded:
+            raise ctypes.WinError(ctypes.get_last_error())
+        active_layout = int(user32.ActivateKeyboardLayout(loaded, 0))
+
     instance = kernel32.GetModuleHandleW(None)
     class_name = f"AadInputProbe_{os.getpid()}"
     window_class = WNDCLASSEXW(
@@ -295,6 +327,15 @@ def main() -> int:
         0, "BUTTON", "Probe target", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
         24, 72, 200, 36, hwnd, wintypes.HMENU(1002), instance, None,
     )
+
+    ime_context = imm32.ImmGetContext(edit_handle)
+    ime_opened = False
+    if ime_context:
+        if args.ime_open:
+            if not imm32.ImmSetOpenStatus(ime_context, True):
+                raise ctypes.WinError(ctypes.get_last_error())
+        ime_opened = bool(imm32.ImmGetOpenStatus(ime_context))
+        imm32.ImmReleaseContext(edit_handle, ime_context)
 
     # INPUTSINK: deliver raw input even when this window is not foreground,
     # which is exactly the case being tested on a hidden desktop.
@@ -344,6 +385,11 @@ def main() -> int:
                 "edit_handle": int(edit_handle),
                 "button_handle": int(button_handle),
                 "raw_input_registered": raw_input_registered,
+                "keyboard_layout": args.keyboard_layout,
+                "previous_keyboard_layout": active_layout,
+                "active_keyboard_layout": int(user32.GetKeyboardLayout(0)),
+                "ime_open_requested": args.ime_open,
+                "ime_opened": ime_opened,
                 "log": os.path.abspath(args.log),
             },
             sort_keys=True,
