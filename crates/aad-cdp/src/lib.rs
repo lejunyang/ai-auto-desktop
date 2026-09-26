@@ -315,24 +315,45 @@ const INSTALL_JS: &str = r#"
     });
   };
   document.addEventListener('click', onClick, true);
+  // contentEditable / rich-text editors (docs, chat composers) do not expose
+  // a form .value; read their text content instead.
+  const editorValue = (el) => {
+    if (el.isContentEditable) return (el.innerText || el.textContent || '');
+    return el.value != null ? String(el.value) : (el.textContent || '');
+  };
   const onInput = (e) => {
     const el = e.target;
     if (!el || !el.tagName) return;
     const tag = el.tagName.toLowerCase();
-    if (!['input','textarea','select'].includes(tag)) return;
-    const isPassword = (el.type || '').toLowerCase() === 'password';
+    const editable = ['input','textarea','select'].includes(tag) || el.isContentEditable;
+    if (!editable) return;
+    const isPassword = tag === 'input' && (el.type || '').toLowerCase() === 'password';
     q.push({
       kind: 'input',
-      tag,
+      tag: el.isContentEditable ? 'contenteditable' : tag,
       label: labelOf(el),
       href: null,
-      value: isPassword ? null : (el.value != null ? String(el.value).slice(0, 500) : null),
-      type: el.type || (tag === 'textarea' ? 'textarea' : null),
+      value: isPassword ? null : editorValue(el).slice(0, 500),
+      type: tag === 'input' ? (el.type || null)
+            : tag === 'textarea' ? 'textarea' : 'richtext',
       url: location.href,
     });
   };
   document.addEventListener('input', onInput, true);
   document.addEventListener('change', onInput, true);
+
+  // Some web inputs and IME composition omit per-keystroke 'input' or commit
+  // only at the end; read the focused editable on keyup / compositionend.
+  const readActive = () => {
+    const el = document.activeElement;
+    if (el && (el.isContentEditable ||
+        ['INPUT','TEXTAREA','SELECT'].includes(el.tagName))) {
+      onInput({target: el});
+    }
+  };
+  document.addEventListener('keyup', readActive, true);
+  document.addEventListener('compositionend', readActive, true);
+
   window.__aadCdp = { installed: true, take: () => q.splice(0, q.length) };
   return 1;
 })()

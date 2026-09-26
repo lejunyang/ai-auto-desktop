@@ -158,6 +158,11 @@ fn run(port: u16) -> Result<(), Box<dyn std::error::Error>> {
     let input = events.iter().any(|event| event.kind == "input");
     assert!(click, "a click activity must be observed");
     assert!(input, "an input activity must be observed");
+    let rich = events
+        .iter()
+        .find(|event| event.tag.as_deref() == Some("contenteditable"))
+        .expect("a contentEditable composer value must be observed");
+    assert_eq!(rich.value.as_deref(), Some("hello rich editor"));
 
     // Password fields must not leak a value.
     let leaked = events
@@ -179,10 +184,16 @@ const SELF_TEST: &str = r#"
   const link = document.createElement('a');
   link.href = 'https://example.com/next'; link.innerText = 'Next';
   const button = document.createElement('button'); button.innerText = 'HiBtn';
-  form.append(input, secret, link, button);
+  // contentEditable rich-text composer (docs/chat style): read via innerText.
+  const rich = document.createElement('div');
+  rich.contentEditable = 'true';
+  rich.setAttribute('aria-label', 'rich composer');
+  rich.innerText = 'hello rich editor';
+  form.append(input, secret, link, button, rich);
   document.body.append(form);
   input.dispatchEvent(new Event('input', {bubbles:true}));
   secret.dispatchEvent(new Event('input', {bubbles:true}));
+  rich.dispatchEvent(new Event('input', {bubbles:true}));
   // HTMLElement.click() dispatches a bubbling click (a plain dispatched
   // MouseEvent on an <a> is not guaranteed to run the capture listener).
   button.click();
