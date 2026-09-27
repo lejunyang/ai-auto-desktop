@@ -8,6 +8,7 @@
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
 mod cdp_watch;
+mod browser_launch;
 
 use serde_json::{json, Value};
 use std::io::Write;
@@ -430,6 +431,15 @@ struct WatchArgs {
     /// the page instead of the UIA tree. 0 disables CDP and uses UIA only.
     #[arg(long, default_value_t = 0)]
     cdp_port: u16,
+    /// Auto-launch a debug-enabled browser if no CDP endpoint is listening,
+    /// rather than silently falling back to UIA.
+    ///
+    /// `edge|chrome|brave` starts that browser with a dedicated logged-out
+    /// profile; `edge-login|chrome-login|brave-login` carries existing site
+    /// logins over via a copy of the real profile's credential files (the
+    /// browser is restarted once; the real profile is never modified).
+    #[arg(long, value_name = "BROWSER")]
+    browser: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -1160,9 +1170,43 @@ fn run_watch(args: &WatchArgs) -> (Value, u8) {
     let mut last_fallback = std::time::Instant::now();
     let mut total_dropped: u64 = 0;
 
+    // Resolve the effective CDP port and an optional auto-launched browser.
+    let cdp_launch = match args.browser.as_deref().map(browser_launch::parse) {
+        Some(Some(launch)) => Some(launch),
+        Some(None) => {
+            return (
+                failure(
+                    "CLI.INVALID_ARGUMENTS",
+                    "--browser expects edge, chrome, brave or an *-login variant",
+                    None,
+                ),
+                EXIT_USAGE,
+            );
+        }
+        None => None,
+    };
+    let cdp_port = match (args.cdp_port, &cdp_launch) {
+        (0, Some(_)) => 9222,
+        (port, _) => port,
+    };
+    if let Some(launch) = &cdp_launch {
+        if !browser_launch::ensure_browser(cdp_port, launch) {
+            emit(
+                &mut sink,
+                json!({"kind": "cdp_unavailable", "browser": launch.browser, "port": cdp_port}),
+            );
+        } else {
+            emit(
+                &mut sink,
+                json!({"kind": "cdp_ready", "browser": launch.browser, "port": cdp_port,
+                       "login_copy": launch.copy_login}),
+            );
+        }
+    }
+
     // Optional CDP source for Chromium browsers. Constructed once; each poll
     // decides whether the foreground is actually a browser on the port.
-    let mut cdp = if args.cdp_port != 0 {
+    let mut cdp = if cdp_port != 0 {
         Some(cdp_watch::CdpWatcher::new())
     } else {
         None
@@ -1222,11 +1266,18 @@ fn run_watch(args: &WatchArgs) -> (Value, u8) {
                         process.as_str(),
                         "msedge.exe" | "chrome.exe" | "brave.exe" | "vivaldi.exe"
                     );
+                    // Restrict to the launched browser when one was requested,
+                    // so another Chromium app does not get CDP-read by mistake.
+                    let browser_matches = cdp_launch
+                        .as_ref()
+                        .map(|launch| browser_launch::matches_process(launch, &process))
+                        .unwrap_or(true);
                     if is_chromium
-                        && cdp_watch::CdpWatcher::available(args.cdp_port)
+                        && browser_matches
+                        && cdp_watch::CdpWatcher::available(cdp_port)
                     {
                         if let Some(observation) =
-                            watcher.observe(args.cdp_port, &window.title)
+                            watcher.observe(cdp_port, &window.title)
                         {
                             let any = !observation.activity.is_empty()
                                 || !observation.added_lines.is_empty()

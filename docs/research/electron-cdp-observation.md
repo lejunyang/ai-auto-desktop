@@ -98,6 +98,20 @@
 - **成本/注意**：Edge 首次在副本目录启动会引导组件缓存（实测副本膨胀到约 160MB），复用同一副本（`--keep-copy` 或固定 `--profile-dir`）可避免重复引导；复制期间浏览器必须关闭（cookie 文件被锁），即"复用登录态"是以**重启一次浏览器**为代价，不能在不打断当前浏览会话的情况下热附加；企业策略/DPAPI 跨用户场景不适用。
 - 安全：副本含可解密的凭据，应放在用户目录、用完即删（已默认处理）；不要放到共享/同步目录。
 
+### 4.2 一条命令：`aad watch --browser`（2026-09-27 真机验证）
+
+`aad watch` 新增 `--browser`，在没有 CDP 端点时自动拉起可观察浏览器，无需先手动开 `aad-browser`：
+
+```
+aad watch --browser edge --out today.jsonl           # 隔离专用 profile（干净、未登录）
+aad watch --browser edge-login --out today.jsonl     # 复用现有网站登录态（关一次 Edge，复制登录子集）
+# 也支持 chrome / chrome-login / brave / brave-login；默认端口 9222，--cdp-port 可覆盖
+```
+
+- 启动阶段：端口已在听则直接用；否则定位同目录 `aad-browser` 并 detached 拉起（dedicated 或 login-copy），就绪后日志先发一条 `cdp_ready`（带 `browser/port/login_copy`），失败发 `cdp_unavailable` 并回退 UIA。
+- 循环里只对"被请求的那个浏览器进程"（edge→msedge.exe 等）走 CDP，避免把别的 Chromium 应用误读；手动给 `--cdp-port` 不带 `--browser` 时则对任意 Chromium 生效。
+- 真机（dedicated，端口 9620）：自动拉起 16 个隔离 msedge 进程、端口 LISTEN、`cdp_ready` 落日志、前台切到该专用窗口记录精确；用户日常 Edge（独立 profile）全程未受影响。空白 about:blank 无 innerText/活动时不产 `page_activity`（符合预期）。**真人逐键输入的 `page_activity` 端到端仍受本代理环境前台焦点限制，需用户在自己桌面手动复核**（CDP innerText 读取与页内点击/输入探针此前已确定性验证）。
+
 ## 5. 待验证
 - [待验证] 飞书（IM 消息、文档、搜索框）在默认 UIA、屏幕阅读器模式、Electron 调试端口下各自的文本暴露率与点击信号。
 - [待验证] 连接用户日常 Edge/Chrome 配置（非独立 user-data-dir）开 CDP 的企业策略与稳定性；多 profile/多窗口 target 归属。
