@@ -12,6 +12,11 @@ ai-auto-desktop 让人和 AI 用同一套能力观察并操作桌面：**发现�
 
 三者驱动的是同一个 driver，因此安全模型完全一致，不存在“GUI 能点、CLI 不能点”这类差异。
 
+当前交互式 CLI/MCP/GUI 的 driver 是 Windows UIA。Linux AT-SPI 与 macOS AX 已有独立的
+workflow provider，但尚未接入这三个交互入口；CDP 目前提供浏览器观察，完整 browser-use
+动作接口仍待实现。远程 stdio 示例、统一合约提案与功能缺口见
+[控制能力审视](docs/research/control-audit-2026-10-17.md)。
+
 ## 安全模型：先观察，才能操作
 
 这是整个项目的主轴，也是与“坐标点击”类工具的根本区别。

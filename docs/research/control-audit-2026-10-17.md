@@ -11,6 +11,7 @@
 | P0 | 较早 [34699693104](https://github.com/lejunyang/ai-auto-desktop/actions/runs/34699693104) 仅 macOS helper smoke 失败，结构化错误为 `DRIVER.TIMEOUT`、`dispatch_started=false`。Swift `serve` 用 `readData(ofLength: 65_536)` 读取持久 stdin 管道，短请求可能等待填满或 EOF。 | 使用 `availableData`；新增 `helper_protocol` 原生回归，连续两次请求并保持输入管道打开。由 macOS CI 验证，不修改超时或绕过 smoke。 |
 | P0 | [`aad-cdp/src/ws.rs`](../../crates/aad-cdp/src/ws.rs) 直接连接 discovery 返回的任意主机，与只连接回环的文档约束矛盾；路径未防 HTTP 请求注入。 | 只接受显式回环 IP / `localhost`，不进行 DNS 解析，拒绝控制字符；nonce 使用随机 16 字节、每帧随机 mask。mock 回归拒绝远端/伪装域名/注入。 |
 | P1 | 同文件：重组分片时错误使用最后一帧 continuation opcode，导致 `Client::send` 丢弃合法文本响应并超时；此前仅限制单帧大小。 | 保留首帧 opcode，校验 continuation 顺序，限制完整消息总长度；回归覆盖分片响应和非法顺序。 |
+| P1 | [`aad-browser.rs`](../../crates/aad-cdp/src/bin/aad-browser.rs) 的登录复制先递归删除调用方指定的工作目录，可能误删原 profile 或其他数据；detached 临时复制在启动器退出时还会关闭刚启动的浏览器。 | 仅原子创建新目录，拒绝原 profile 内部路径及已存在目录，失败只清理本次新建目录。detached 登录复制要求显式保留或指定新目录，否则在副作用前拒绝；foreground 保持自动清理。临时假文件回归，无真实登录资料。 |
 | P1 | [`aad-mcp/src/lib.rs`](../../crates/aad-mcp/src/lib.rs) 过去使用 `native_driver()` 的共享磁盘快照，连接之间能读取对方引用。 | MCP 使用连接私有内存快照；CLI 保留跨进程引用。mock 验证另一 session 的引用被拒且零写入。此隔离不是同一 OS 账号内恶意进程的安全边界。 |
 | P1 | [`aad-uia/src/lib.rs`](../../crates/aad-uia/src/lib.rs) 的 `native_driver` 只有 Windows；[`aad-mcp/src/lib.rs`](../../crates/aad-mcp/src/lib.rs)、CLI `apps/describe/find/do` 都绑定 UiaDriver。Linux AT-SPI 与 macOS AX provider 是单独运行时能力。 | 统一交互 facade 尚未实现，README 所述“三入口同 driver”只适用于 Windows UIA。下一步先定义 provider 无关合约，再接入现有两种 provider。 |
 | P1 | [`aad-cdp/src/lib.rs`](../../crates/aad-cdp/src/lib.rs) 是页面文本与活动观察客户端；未公开 observe/find/act 浏览器工具，没有 DOM 元素引用、导航/点击/输入动作或浏览器 provider manifest。 | 目前不能称为完整 browser-use。应新增受观察引用约束的 browser provider，复用合约，而非把任意 `Runtime.evaluate` 暴露为 AI 工具。 |
@@ -72,7 +73,13 @@ Linux/macOS 当前只能通过各自 provider 工作流运行，不能借 SSH �
 云端 Linux 无真实桌面、macOS AX 或 Windows UIA；新增协议/driver 测试用 loopback mock、
 临时目录、fake backend。Windows/macOS 原生结果以本分支 CI 为准，真机键鼠、TCC、
 Wayland、Electron、登录 profile 复制与跨机 SSH 均 `[待验证]`，需要独立授权测试环境。
-本环境安装了 bwrap/prlimit，但容器禁止用户命名空间，完整测试中 6 个 Python 脚本沙箱
+本环境安装了 bwrap/prlimit，但容器禁止用户命名空间，完整测试中 8 个 Python 脚本沙箱
 效果用例报 `bwrap: setting up uid map: Read-only file system`，未放宽隔离或修改测试。
 
-本次的精确测试结果和最终 CI 链接记录在 PR 描述中；本报告中的能力缺口不应被解读为已实现功能。
+云端 `cargo test --workspace --exclude aad-gui --locked --no-fail-fast`：712 passed、8 failed，
+8 个失败均来自上述沙箱环境限制；并非绿灯。`cargo test --locked -p aad-plugin --features
+test-fixture --test process_plugin`：14 passed。`cargo clippy --workspace --exclude aad-gui
+--locked --all-targets -- -D warnings`：通过，未添加 lint 豁免。macOS CI 第一轮已通过
+签名 helper smoke 与完整 workspace 测试，确认管道读取修复；该轮随后被旧代码 Clippy
+错误拦下，已另行修正。最终三平台 CI 链接记录在 PR 描述中；本报告中的能力缺口不应被
+解读为已实现功能。
