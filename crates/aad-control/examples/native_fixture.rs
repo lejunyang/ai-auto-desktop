@@ -59,6 +59,30 @@ fn main() {
         )
     };
     let first = observe();
+    let reset = request(
+        endpoint.as_ref(),
+        Operation::Find {
+            observation_id: first["observation_id"].as_str().unwrap().into(),
+            locator: Locator {
+                role: Some("push_button".into()),
+                name: Some("Reset Qt fixture status".into()),
+                ..Default::default()
+            },
+        },
+    );
+    request(
+        endpoint.as_ref(),
+        Operation::Act {
+            target: serde_json::from_value(reset["target"].clone()).unwrap(),
+            action: Action::Invoke {},
+        },
+    );
+    let first = observe();
+    assert!(first["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|n| n["name"] == "Qt fixture status idle"));
     let found = request(
         endpoint.as_ref(),
         Operation::Find {

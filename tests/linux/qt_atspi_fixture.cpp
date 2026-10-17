@@ -57,6 +57,14 @@ int main(int argc, char **argv) {
         status->setAccessibleName(kStatusInvoked);
     });
 
+    auto *reset = new QPushButton("Reset status", &window);
+    reset->setAccessibleName("Reset Qt fixture status");
+    layout->addWidget(reset);
+    QObject::connect(reset, &QPushButton::clicked, status, [status]() {
+        status->setText(kStatusInitial);
+        status->setAccessibleName(kStatusInitial);
+    });
+
     window.show();
     window.raise();
     window.activateWindow();

@@ -32,8 +32,6 @@ if [ "${1:-}" = --inside-session ]; then
     sleep 0.1
   done
   [ "$found" = true ]
-  cargo build --locked -q -p aad-cli
-  AAD_CONTROL_CLI="$root/target/debug/aad" cargo run --locked -q -p aad-control --example native_fixture -- "$fixture_pid"
   cargo run --locked -q -p aad-atspi --example driver -- set-text "$fixture_pid" "Rust native changed" >/dev/null
   cargo run --locked -q -p aad-atspi --example driver -- snapshot "$fixture_pid" \
     | jq -e '.nodes[] | select(.name == "Qt fixture text entry" and .value == "Rust native changed")' >/dev/null
@@ -45,6 +43,8 @@ if [ "${1:-}" = --inside-session ]; then
     | jq -e '.nodes[] | select(.name == "Qt fixture status invoked")' >/dev/null
   cargo run --locked -q -p aad-atspi --example driver -- capture "$fixture_pid" \
     | jq -e '.frame.kind == "ArtifactRef" and .frame.mediaType == "image/png"' >/dev/null
+  cargo build --locked -q -p aad-cli
+  AAD_CONTROL_CLI="$root/target/debug/aad" cargo run --locked -q -p aad-control --example native_fixture -- "$fixture_pid"
   printf '%s\n' 'Rust Linux AT-SPI fixture passed'
   exit 0
 fi
