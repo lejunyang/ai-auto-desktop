@@ -91,6 +91,19 @@ fn write_response(output: &mut impl Write, response: &Response) -> io::Result<()
     output.flush()
 }
 
+fn terminal(response: &Response) -> bool {
+    response.error.as_ref().is_some_and(|error| {
+        matches!(
+            error["code"].as_str(),
+            Some("CONTROL.SESSION_CLOSED" | "CONTROL.SESSION_LIMIT")
+        )
+    }) || (response.error.is_none()
+        && response
+            .data
+            .as_ref()
+            .is_some_and(|data| data["closed"] == true))
+}
+
 /// Cancellation and close bypass the action worker gate. At most eight request
 /// workers and sixteen unread input frames exist. Disconnect cancels all work;
 /// no action is retried, and an interrupted write's effect stays unknown.
@@ -183,6 +196,11 @@ pub fn serve(
             if write_response(&mut *output.lock().unwrap(), &response).is_err() {
                 io_failed.store(true, Ordering::SeqCst);
                 endpoint.disconnect();
+            }
+            // Expiry/quota are terminal authority boundaries. Do not keep a
+            // closed server process alive solely on client heartbeat requests.
+            if terminal(&response) {
+                io_failed.store(true, Ordering::SeqCst);
             }
             active.fetch_sub(1, Ordering::SeqCst);
         });
@@ -287,8 +305,12 @@ impl RemoteClient {
                 {
                     break;
                 }
+                let terminal = terminal(&response);
                 if let Some(sender) = waiting.lock().unwrap().remove(&response.request_id) {
                     let _ = sender.send(response);
+                }
+                if terminal {
+                    break;
                 }
             }
             dead.store(true, Ordering::SeqCst);

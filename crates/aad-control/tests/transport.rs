@@ -54,6 +54,9 @@ struct Harness {
 }
 impl Harness {
     fn new(input: bool, delay: Duration, slow_writer: bool) -> Self {
+        Self::with_budget(input, delay, slow_writer, 10_000)
+    }
+    fn with_budget(input: bool, delay: Duration, slow_writer: bool, max_requests: usize) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let socket = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         let (server, _) = listener.accept().unwrap();
@@ -61,13 +64,21 @@ impl Harness {
             writes: AtomicUsize::new(0),
             delay,
         });
-        let endpoint = Arc::new(Session::new(
-            vec![backend.clone()],
-            Policy {
-                allow_input: input,
-                ..Default::default()
-            },
-        ));
+        let endpoint = Arc::new(
+            Session::new(
+                vec![backend.clone()],
+                Policy {
+                    allow_input: input,
+                    ..Default::default()
+                },
+            )
+            .with_limits(
+                Duration::from_secs(3600),
+                Duration::from_secs(300),
+                max_requests,
+            )
+            .unwrap(),
+        );
         let input = server.try_clone().unwrap();
         let server = std::thread::spawn(move || {
             let _ = transport::serve(input, server, endpoint);
@@ -106,6 +117,25 @@ impl Harness {
             .data
             .unwrap();
         serde_json::from_value(observation["nodes"][0]["target"].clone()).unwrap()
+    }
+}
+
+#[test]
+fn terminal_session_budget_closes_the_transport_instead_of_heartbeating_forever() {
+    let h = Harness::with_budget(false, Duration::ZERO, false, 2);
+    assert!(h.call(Operation::Capabilities {}).error.is_none());
+    let response = h.call(Operation::Capabilities {});
+    assert_eq!(response.commit_state, CommitState::NotCommitted);
+    assert_eq!(response.error.unwrap()["code"], "CONTROL.SESSION_LIMIT");
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let response = h.call(Operation::Capabilities {});
+        assert_eq!(response.commit_state, CommitState::NotCommitted);
+        if response.error.unwrap()["code"] == "CONTROL.DISCONNECTED" {
+            break;
+        }
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(5));
     }
 }
 impl Drop for Harness {
