@@ -213,7 +213,7 @@ impl Backend for BrowserBackend {
         let frame_id = selector["frame_id"].as_str().unwrap();
         self.with_page(page_id,deadline.saturating_duration_since(Instant::now()),|client|{
             let frame=current_frame(client,frame_id)?;
-            let context=command(client,"Runtime.createIsolatedWorld",json!({"frameId":frame_id,"worldName":self.world,"grantUniveralAccess":false}))?["executionContextId"].as_i64()
+            let context=command(client,"Page.createIsolatedWorld",json!({"frameId":frame_id,"worldName":self.world,"grantUniveralAccess":false}))?["executionContextId"].as_i64()
                 .ok_or_else(||error("BROWSER.BAD_RESULT","frame did not provide an isolated context"))?;
             let nonce=serde_json::to_string(&uuid::Uuid::new_v4().to_string()).unwrap();
             eval(client,context,include_str!("browser.js").replace("NONCE",&nonce))?;
@@ -321,6 +321,34 @@ fn key_chord(keys: &[String]) -> Result<(String, String, u32, u32)> {
     }
     let key =
         primary.ok_or_else(|| error("CONTROL.INVALID_REQUEST", "key requires a primary key"))?;
+    // Keep browser/OS navigation shortcuts out of an element-scoped action.
+    // Only editing combinations have a meaningful anchored target.
+    let lower = key.to_ascii_lowercase();
+    if modifiers & 1 != 0
+        || (modifiers & (2 | 4) != 0
+            && !matches!(
+                lower.as_str(),
+                "a" | "z"
+                    | "y"
+                    | "home"
+                    | "end"
+                    | "arrowleft"
+                    | "left"
+                    | "arrowright"
+                    | "right"
+                    | "arrowup"
+                    | "up"
+                    | "arrowdown"
+                    | "down"
+                    | "backspace"
+                    | "delete"
+            ))
+    {
+        return Err(error(
+            "CONTROL.ACTION_UNSUPPORTED",
+            "browser or global shortcuts are not element-scoped editing actions",
+        ));
+    }
     let (name, code, vk) = match key.to_ascii_lowercase().as_str() {
         "enter" => ("Enter", "Enter", 13),
         "tab" => ("Tab", "Tab", 9),
@@ -369,5 +397,7 @@ mod tests {
         assert_eq!(key_chord(&["Enter".into()]).unwrap().2, 13);
         assert!(key_chord(&["a".into()]).is_err());
         assert!(key_chord(&["Enter".into(), "Tab".into()]).is_err());
+        assert!(key_chord(&["ctrl".into(), "Tab".into()]).is_err());
+        assert!(key_chord(&["alt".into(), "ArrowLeft".into()]).is_err());
     }
 }
