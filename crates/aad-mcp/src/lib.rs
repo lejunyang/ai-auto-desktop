@@ -38,7 +38,10 @@ impl Server {
     /// discover *why* automation is unavailable instead of seeing a process
     /// that refuses to start.
     pub fn new() -> Self {
-        match aad_uia::native_driver() {
+        // References are session capabilities. Do not load handles minted by a
+        // CLI invocation or another MCP connection from the shared disk cache.
+        let snapshots = aad_uia::SnapshotStore::new(16, std::time::Duration::from_secs(300));
+        match aad_uia::native_driver_with_store(snapshots) {
             Ok(driver) => Self {
                 driver: Some(std::sync::Arc::new(driver)),
                 unavailable: None,

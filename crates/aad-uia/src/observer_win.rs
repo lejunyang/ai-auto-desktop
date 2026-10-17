@@ -43,8 +43,8 @@ use windows::Win32::UI::Accessibility::{
     UnhookWinEvent, HWINEVENTHOOK, UIA_EVENT_ID, UIA_PROPERTY_ID,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    DispatchMessageW, GetForegroundWindow, GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible,
-    PeekMessageW, MSG, PM_REMOVE, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS,
+    DispatchMessageW, GetForegroundWindow, GetWindowTextW, GetWindowThreadProcessId,
+    IsWindowVisible, PeekMessageW, MSG, PM_REMOVE, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS,
 };
 
 // WinEvent families the observer consumes.
@@ -121,7 +121,9 @@ fn element_summary(sender: Option<&IUIAutomationElement>) -> Option<EventElement
     Some(EventElement {
         role: Some(format!(
             "control_type_{}",
-            unsafe { element.CurrentControlType() }.map(|id| id.0).unwrap_or(0)
+            unsafe { element.CurrentControlType() }
+                .map(|id| id.0)
+                .unwrap_or(0)
         )),
         name: text(unsafe { element.CurrentName() }),
         automation_id: text(unsafe { element.CurrentAutomationId() }),
@@ -226,14 +228,12 @@ impl IUIAutomationFocusChangedEventHandler_Impl for ObserveFocusHandler_Impl {
         if !self.shared.is_foreground_pid(pid) {
             return Ok(());
         }
-        self.shared
-            .buffer
-            .push(
-                ObservationKind::FocusChanged,
-                "uia".to_string(),
-                window_from_pid(pid, sender),
-                element_summary(sender),
-            );
+        self.shared.buffer.push(
+            ObservationKind::FocusChanged,
+            "uia".to_string(),
+            window_from_pid(pid, sender),
+            element_summary(sender),
+        );
         Ok(())
     }
 }
@@ -264,9 +264,7 @@ impl IUIAutomationEventHandler_Impl for ObserveAutomationHandler_Impl {
         } else {
             ObservationKind::Other
         };
-        self.shared
-            .buffer
-            .push(
+        self.shared.buffer.push(
             kind,
             "uia".to_string(),
             window_from_pid(pid, sender),
@@ -301,9 +299,7 @@ impl IUIAutomationPropertyChangedEventHandler_Impl for ObservePropertyHandler_Im
         } else {
             return Ok(());
         };
-        self.shared
-            .buffer
-            .push(
+        self.shared.buffer.push(
             kind,
             "uia".to_string(),
             window_from_pid(pid, sender),
@@ -463,7 +459,13 @@ fn observe_pump(
             UIA_Invoke_InvokedEventId,
         ] {
             if unsafe {
-                automation.AddAutomationEventHandler(id, root, TreeScope_Subtree, None, &automation_handler)
+                automation.AddAutomationEventHandler(
+                    id,
+                    root,
+                    TreeScope_Subtree,
+                    None,
+                    &automation_handler,
+                )
             }
             .is_err()
             {
@@ -519,7 +521,7 @@ fn observe_pump(
     while !stop.load(Ordering::SeqCst) {
         let mut message = MSG::default();
         while unsafe { PeekMessageW(&mut message, None, 0, 0, PM_REMOVE) }.as_bool() {
-            unsafe { DispatchMessageW(&mut message) };
+            unsafe { DispatchMessageW(&message) };
         }
         std::thread::sleep(PUMP_TICK);
     }
@@ -537,9 +539,8 @@ fn observe_pump(
             UIA_SelectionItem_ElementSelectedEventId,
             UIA_Invoke_InvokedEventId,
         ] {
-            let _ = unsafe {
-                automation.RemoveAutomationEventHandler(id, root, &automation_handler)
-            };
+            let _ =
+                unsafe { automation.RemoveAutomationEventHandler(id, root, &automation_handler) };
         }
         let _ = unsafe { automation.RemovePropertyChangedEventHandler(root, &property_handler) };
     }

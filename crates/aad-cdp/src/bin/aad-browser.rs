@@ -93,7 +93,10 @@ fn real_user_data(browser: &str) -> Option<PathBuf> {
     let path = match browser.to_ascii_lowercase().as_str() {
         "edge" | "msedge" => local.join("Microsoft").join("Edge").join("User Data"),
         "chrome" | "googlechrome" => local.join("Google").join("Chrome").join("User Data"),
-        "brave" => local.join("BraveSoftware").join("Brave-Browser").join("User Data"),
+        "brave" => local
+            .join("BraveSoftware")
+            .join("Brave-Browser")
+            .join("User Data"),
         _ => return None,
     };
     path.exists().then_some(path)
@@ -115,8 +118,29 @@ const AUTH_FILES: &[&str] = &[
 ];
 
 fn copy_login_profile(real: &Path, work: &Path) -> Result<(), String> {
-    let _ = std::fs::remove_dir_all(work);
-    std::fs::create_dir_all(work).map_err(|e| e.to_string())?;
+    let real = real.canonicalize().map_err(|e| e.to_string())?;
+    let parent = work
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+        .canonicalize()
+        .map_err(|e| e.to_string())?;
+    if parent.starts_with(&real) {
+        return Err("the working profile must be outside the real profile".into());
+    }
+    // Atomically claim a NEW directory. Never recursively delete a path supplied
+    // by the caller: it may contain unrelated data or be the real profile itself.
+    std::fs::create_dir(work)
+        .map_err(|e| format!("working profile must be a new directory: {e}"))?;
+    let result = copy_login_files(&real, work);
+    if result.is_err() {
+        // This invocation created the directory, so partial copies are ours.
+        let _ = std::fs::remove_dir_all(work);
+    }
+    result
+}
+
+fn copy_login_files(real: &Path, work: &Path) -> Result<(), String> {
     let mut copied = 0usize;
     for relative in AUTH_FILES {
         let source = real.join(relative);
@@ -185,6 +209,10 @@ fn close_browser(exe: &Path) {
 
 fn main() {
     let args = parse_args();
+    if args.detached && args.copy_login.is_some() && !args.keep_copy && args.profile_dir.is_none() {
+        eprintln!("detached login copies require --keep-copy or an explicit NEW --profile-dir; otherwise use foreground mode for automatic cleanup");
+        std::process::exit(2);
+    }
     let exe = browser_exe().unwrap_or_else(|| {
         eprintln!("no Edge/Chrome/Brave executable found");
         std::process::exit(2);
@@ -197,11 +225,14 @@ fn main() {
                 eprintln!("unknown browser or no installed profile for '{browser}'");
                 std::process::exit(2);
             });
-            println!("{{\"stage\":\"closing_browser\",\"browser\":\"{}\"}}", browser);
+            println!(
+                "{{\"stage\":\"closing_browser\",\"browser\":\"{}\"}}",
+                browser
+            );
             close_browser(&exe);
-            let work = explicit
-                .clone()
-                .unwrap_or_else(|| std::env::temp_dir().join(format!("aad-cdp-login-{}", args.port)));
+            let work = explicit.clone().unwrap_or_else(|| {
+                std::env::temp_dir().join(format!("aad-cdp-login-{}", args.port))
+            });
             if let Err(error) = copy_login_profile(&real, &work) {
                 eprintln!("login copy failed: {error}");
                 std::process::exit(1);
@@ -222,6 +253,7 @@ fn main() {
     command
         .args([
             format!("--remote-debugging-port={}", args.port),
+            "--remote-debugging-address=127.0.0.1".to_string(),
             format!("--user-data-dir={}", profile_dir.display()),
             "--no-first-run".to_string(),
             "--no-default-browser-check".to_string(),
@@ -253,7 +285,11 @@ fn main() {
         std::thread::sleep(std::time::Duration::from_millis(300));
     }
 
-    let mode = if args.copy_login.is_some() { "login-copy" } else { "dedicated" };
+    let mode = if args.copy_login.is_some() {
+        "login-copy"
+    } else {
+        "dedicated"
+    };
     println!(
         "{{\"browser\":\"{}\",\"port\":{},\"profile_dir\":\"{}\",\"mode\":\"{}\",\"ready\":{},\"pid\":{}}}",
         exe.display(),
@@ -268,7 +304,12 @@ fn main() {
         eprintln!("warning: debug endpoint did not answer in time");
         std::process::exit(1);
     }
-    if !args.detached {
+    if args.detached {
+        // The launcher now exits, handing the browser to the OS. Explicitly
+        // release its handle instead of retaining an un-waited child in a
+        // long-lived launcher. Login temp copies require explicit retention.
+        drop(child);
+    } else {
         let _ = child.wait_with_output();
     }
 
@@ -278,5 +319,49 @@ fn main() {
             close_browser(&exe);
             let _ = std::fs::remove_dir_all(copy);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn copying_a_profile_never_deletes_existing_or_source_directories() {
+        let root = std::env::temp_dir().join(format!("aad-profile-test-{}", uuid::Uuid::new_v4()));
+        let real = root.join("real");
+        let existing = root.join("existing");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::create_dir(&existing).unwrap();
+        std::fs::write(real.join("Local State"), b"dummy fixture").unwrap();
+        std::fs::write(existing.join("important.txt"), b"keep me").unwrap();
+
+        for work in [&real, &existing, &root, &real.join("nested")] {
+            assert!(copy_login_profile(&real, work).is_err());
+            assert_eq!(
+                std::fs::read(real.join("Local State")).unwrap(),
+                b"dummy fixture"
+            );
+            assert_eq!(
+                std::fs::read(existing.join("important.txt")).unwrap(),
+                b"keep me"
+            );
+        }
+
+        let copy = root.join("new-copy");
+        copy_login_profile(&real, &copy).unwrap();
+        assert_eq!(
+            std::fs::read(copy.join("Local State")).unwrap(),
+            b"dummy fixture"
+        );
+        let empty = root.join("empty-source");
+        std::fs::create_dir(&empty).unwrap();
+        let failed = root.join("failed-copy");
+        assert!(copy_login_profile(&empty, &failed).is_err());
+        assert!(
+            !failed.exists(),
+            "a failed copy must clean its own directory"
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

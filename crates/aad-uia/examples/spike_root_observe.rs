@@ -35,8 +35,8 @@ use windows::Win32::UI::Accessibility::{
     HWINEVENTHOOK, UIA_EVENT_ID, UIA_PROPERTY_ID,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    DispatchMessageW, GetForegroundWindow, GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible,
-    MSG, PM_REMOVE, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS,
+    DispatchMessageW, GetForegroundWindow, GetWindowTextW, GetWindowThreadProcessId,
+    IsWindowVisible, MSG, PM_REMOVE, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS,
 };
 
 // WinEvent range of interest for an ambient monitor.
@@ -120,7 +120,10 @@ fn hwnd_detail(hwnd: HWND, id_object: i32) -> String {
     unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
     let title = window_title(hwnd);
     let clipped: String = title.chars().take(48).collect();
-    format!("obj={id_object:#x} proc={} title={clipped:?}", process_name(pid))
+    format!(
+        "obj={id_object:#x} proc={} title={clipped:?}",
+        process_name(pid)
+    )
 }
 
 // --- WinEvent: foreground switches and MSAA-level activity -----------------
@@ -159,7 +162,9 @@ fn element_detail(sender: Option<&IUIAutomationElement>) -> String {
     let name = unsafe { element.CurrentName() }
         .map(|value| value.to_string())
         .unwrap_or_default();
-    let control = unsafe { element.CurrentControlType() }.map(|id| id.0).unwrap_or(0);
+    let control = unsafe { element.CurrentControlType() }
+        .map(|id| id.0)
+        .unwrap_or(0);
     let pid = unsafe { element.CurrentProcessId() }.unwrap_or(0) as u32;
     let clipped: String = name.chars().take(48).collect();
     format!("type={control} proc={} name={clipped:?}", process_name(pid))
@@ -243,7 +248,13 @@ fn main() -> Result<()> {
         UIA_Invoke_InvokedEventId,
     ] {
         unsafe {
-            automation.AddAutomationEventHandler(id, &root, TreeScope_Subtree, None, &automation_handler)
+            automation.AddAutomationEventHandler(
+                id,
+                &root,
+                TreeScope_Subtree,
+                None,
+                &automation_handler,
+            )
         }?;
     }
     let property_handler: IUIAutomationPropertyChangedEventHandler = PropertyHandler.into();
@@ -306,13 +317,9 @@ fn main() -> Result<()> {
         UIA_SelectionItem_ElementSelectedEventId,
         UIA_Invoke_InvokedEventId,
     ] {
-        let _ = unsafe {
-            automation.RemoveAutomationEventHandler(id, &root, &automation_handler)
-        };
+        let _ = unsafe { automation.RemoveAutomationEventHandler(id, &root, &automation_handler) };
     }
-    let _ = unsafe {
-        automation.RemovePropertyChangedEventHandler(&root, &property_handler)
-    };
+    let _ = unsafe { automation.RemovePropertyChangedEventHandler(&root, &property_handler) };
 
     // --- Report -------------------------------------------------------------
     let samples = std::mem::take(&mut *SAMPLES.lock().unwrap());
@@ -329,7 +336,10 @@ fn main() -> Result<()> {
         }
     }
 
-    println!("\n== totals ({} kept, {overflow} overflowed) ==", samples.len());
+    println!(
+        "\n== totals ({} kept, {overflow} overflowed) ==",
+        samples.len()
+    );
     for (kind, count) in &by_kind {
         println!("  {kind:<14} {count}");
     }
@@ -348,7 +358,11 @@ fn main() -> Result<()> {
 
     // Show a few samples of the noisiest kinds so tab switches etc. are visible.
     for wanted in ["uia-selected", "uia-structure", "obj-focus", "uia-value"] {
-        let lines: Vec<&Sample> = samples.iter().filter(|s| s.kind == wanted).take(8).collect();
+        let lines: Vec<&Sample> = samples
+            .iter()
+            .filter(|s| s.kind == wanted)
+            .take(8)
+            .collect();
         if !lines.is_empty() {
             println!("\n== sample {wanted} (up to 8) ==");
             for sample in lines {

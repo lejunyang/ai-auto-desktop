@@ -7,8 +7,8 @@
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
-mod cdp_watch;
 mod browser_launch;
+mod cdp_watch;
 
 use serde_json::{json, Value};
 use std::io::Write;
@@ -1162,7 +1162,9 @@ fn run_watch(args: &WatchArgs) -> (Value, u8) {
     };
     let quiet = std::time::Duration::from_millis(args.debounce_ms.max(1));
     let fallback_interval = if args.poll_fallback_hz > 0.0 {
-        Some(std::time::Duration::from_secs_f64(1.0 / args.poll_fallback_hz))
+        Some(std::time::Duration::from_secs_f64(
+            1.0 / args.poll_fallback_hz,
+        ))
     } else {
         None
     };
@@ -1230,7 +1232,10 @@ fn run_watch(args: &WatchArgs) -> (Value, u8) {
         if let Some(deadline) = deadline {
             if std::time::Instant::now() >= deadline {
                 finish(&mut sink, &driver, &observe_id, total_dropped, false);
-                return (json!({"watched": true, "dropped_events": total_dropped}), EXIT_OK);
+                return (
+                    json!({"watched": true, "dropped_events": total_dropped}),
+                    EXIT_OK,
+                );
             }
         }
         std::thread::sleep(tick);
@@ -1272,13 +1277,9 @@ fn run_watch(args: &WatchArgs) -> (Value, u8) {
                         .as_ref()
                         .map(|launch| browser_launch::matches_process(launch, &process))
                         .unwrap_or(true);
-                    if is_chromium
-                        && browser_matches
-                        && cdp_watch::CdpWatcher::available(cdp_port)
+                    if is_chromium && browser_matches && cdp_watch::CdpWatcher::available(cdp_port)
                     {
-                        if let Some(observation) =
-                            watcher.observe(cdp_port, &window.title)
-                        {
+                        if let Some(observation) = watcher.observe(cdp_port, &window.title) {
                             let any = !observation.activity.is_empty()
                                 || !observation.added_lines.is_empty()
                                 || !observation.removed_lines.is_empty();
@@ -1312,8 +1313,8 @@ fn run_watch(args: &WatchArgs) -> (Value, u8) {
         // Fallback: even with no events, periodically re-look at the foreground
         // window so applications with a missing event surface cannot hide a
         // change forever.
-        let fallback_due = fallback_interval
-            .is_some_and(|interval| last_fallback.elapsed() >= interval);
+        let fallback_due =
+            fallback_interval.is_some_and(|interval| last_fallback.elapsed() >= interval);
         if fallback_due {
             last_fallback = std::time::Instant::now();
             events.push(aad_uia::ObservedEvent {
@@ -1363,7 +1364,9 @@ fn run_watch(args: &WatchArgs) -> (Value, u8) {
                 // window. Internal popups/renderers are excluded below.
                 let candidate = match &trigger.window.window_id {
                     Some(id) => Some(id.clone()),
-                    None => foreground_listing.as_ref().map(|info| info.window_id.clone()),
+                    None => foreground_listing
+                        .as_ref()
+                        .map(|info| info.window_id.clone()),
                 };
                 if let Some(id) = candidate {
                     let placeable = match window_listing(&driver, &id) {
@@ -1372,9 +1375,11 @@ fn run_watch(args: &WatchArgs) -> (Value, u8) {
                         // ("Chrome Legacy Window", a 1-node hidden helper);
                         // walking it produces noise and, worse, evicts the real
                         // window's baseline.
-                        Some(info) => info.process_id == trigger.window.process_id
-                            && !info.title.is_empty()
-                            && !info.is_minimized,
+                        Some(info) => {
+                            info.process_id == trigger.window.process_id
+                                && !info.title.is_empty()
+                                && !info.is_minimized
+                        }
                         None => false,
                     };
                     if placeable {
@@ -1411,17 +1416,9 @@ fn run_watch(args: &WatchArgs) -> (Value, u8) {
                     continue;
                 }
             }
-            if let Err(error) = resnapshot_and_diff(
-                &driver,
-                &mut sink,
-                &mut baselines,
-                &window_id,
-                args.max_nodes,
-                args.full,
-                args.raw,
-                args.max_items,
-                &emit,
-            ) {
+            if let Err(error) =
+                resnapshot_and_diff(&driver, &mut sink, &mut baselines, &window_id, args, &emit)
+            {
                 // A window closing mid-switch is normal: skip it this round,
                 // keep watching. Persistent errors still surface on stderr.
                 eprintln!("watch: snapshot of {window_id} skipped: {}", error.message);
@@ -1459,22 +1456,19 @@ fn resnapshot_and_diff(
     sink: &mut Box<dyn std::io::Write>,
     baselines: &mut std::collections::HashMap<String, aad_uia::Snapshot>,
     window_id: &str,
-    max_nodes: u32,
-    full_first: bool,
-    raw: bool,
-    max_items: usize,
+    args: &WatchArgs,
     emit: &impl Fn(&mut Box<dyn std::io::Write>, Value),
 ) -> Result<(), aad_uia::DriverError> {
     let captured = driver.call(
         "snapshot",
-        &json!({"window_id": window_id, "max_nodes": max_nodes}),
+        &json!({"window_id": window_id, "max_nodes": args.max_nodes}),
     )?;
     let snapshot: aad_uia::Snapshot = serde_json::from_value(captured.clone())
         .map_err(|error| aad_uia::DriverError::invalid(format!("bad snapshot json: {error}")))?;
 
     match baselines.get(window_id) {
         None => {
-            if full_first {
+            if args.full {
                 emit(
                     sink,
                     json!({
@@ -1494,7 +1488,7 @@ fn resnapshot_and_diff(
                 baselines.insert(window_id.to_string(), snapshot);
                 return Ok(());
             }
-            if raw {
+            if args.raw {
                 let (added, removed, changed) = changes.counts();
                 emit(
                     sink,
@@ -1515,7 +1509,10 @@ fn resnapshot_and_diff(
             } else {
                 let digest = aad_uia::digest(
                     &changes,
-                    &aad_uia::DigestOptions { max_items, include_states: true },
+                    &aad_uia::DigestOptions {
+                        max_items: args.max_items,
+                        include_states: true,
+                    },
                 );
                 // A digest with no content is pure structural churn: skip it so
                 // an idle Electron workbench stays silent.

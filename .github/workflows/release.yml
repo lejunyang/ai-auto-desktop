@@ -113,11 +113,17 @@ jobs:
         run: |
           set -euo pipefail
           test ! -f pyproject.toml
-          if git ls-files '*.py' '*.pyi' | grep -q .; then
+          # Retain Windows hardware test harnesses; forbid a second shipped
+          # Python implementation everywhere else, as in the CI gate.
+          if git ls-files '*.py' '*.pyi' ':!:tests/windows/*.py' | grep -q .; then
             echo "tracked Python implementation files remain" >&2
-            git ls-files '*.py' '*.pyi' >&2
+            git ls-files '*.py' '*.pyi' ':!:tests/windows/*.py' >&2
             exit 1
           fi
+
+      - name: Check retained Windows hardware probes
+        if: runner.os == 'Windows'
+        run: python -m compileall -q tests/windows
 
       - name: Install Linux native driver test dependencies
         if: runner.os == 'Linux'

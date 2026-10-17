@@ -12,6 +12,11 @@ ai-auto-desktop 让人和 AI 用同一套能力观察并操作桌面：**发现�
 
 三者驱动的是同一个 driver，因此安全模型完全一致，不存在“GUI 能点、CLI 不能点”这类差异。
 
+当前交互式 CLI/MCP/GUI 的 driver 是 Windows UIA。Linux AT-SPI 与 macOS AX 已有独立的
+workflow provider，但尚未接入这三个交互入口；CDP 目前提供浏览器观察，完整 browser-use
+动作接口仍待实现。远程 stdio 示例、统一合约提案与功能缺口见
+[控制能力审视](docs/research/control-audit-2026-10-17.md)。
+
 ## 安全模型：先观察，才能操作
 
 这是整个项目的主轴，也是与“坐标点击”类工具的根本区别。
@@ -25,6 +30,23 @@ ai-auto-desktop 让人和 AI 用同一套能力观察并操作桌面：**发现�
 MCP 工具 schema **不接受任何** `x` / `y` / `point` / `coordinates` / `position` 字段，并有测试守住这一点：AI 无法绕过观察直接点坐标。
 
 ## 快速开始
+
+开发环境可使用已发布的 one-sdk 0.0.6（无需依赖 one-sdk 的草稿 PR）：
+
+```powershell
+osdk install                    # Rust 1.98.0 + rustfmt/clippy
+osdk task list
+osdk run fmt-check
+osdk run test                   # 不包含需要 Tauri 系统依赖的 GUI
+osdk run clippy
+osdk run plugin-test
+osdk run ci --dry-run           # 查看聚合检查；原生 fixture 仍需各平台环境
+```
+
+`osdk.lock` 只记录实际解析过的平台，首次在其他平台执行 `osdk lock` 后应提交该平台
+产生的锁条目。Linux 脚本测试还要求可用的 bubblewrap 用户命名空间、prlimit 与
+`/usr/bin/python3`；仅安装命令并不代表容器允许创建沙箱。GUI 开发另需 Node/npm
+和平台的 Tauri 系统库，不由这些 Rust 任务隐式安装。
 
 ```powershell
 cargo build --release
