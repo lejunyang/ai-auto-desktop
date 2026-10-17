@@ -1026,7 +1026,10 @@ private func serve(_ service: AXService) {
     var buffer = Data()
     var discardingOversizedFrame = false
     while true {
-        let chunk = input.readData(ofLength: 65_536)
+        // A pipe request is usually much smaller than 64 KiB and the client
+        // keeps stdin open for the next RPC. readData(ofLength:) may wait to
+        // fill that length, deadlocking both sides until the RPC deadline.
+        let chunk = input.availableData
         if chunk.isEmpty { return }
         if discardingOversizedFrame {
             if let newline = chunk.firstIndex(of: 0x0A) {
