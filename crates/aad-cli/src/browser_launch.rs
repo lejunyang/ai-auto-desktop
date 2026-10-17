@@ -36,7 +36,11 @@ impl BrowserLaunch {
 fn helper_exe() -> Option<PathBuf> {
     let mut path = std::env::current_exe().ok()?;
     path.pop(); // drop aad.exe
-    let candidate = path.join(if cfg!(windows) { "aad-browser.exe" } else { "aad-browser" });
+    let candidate = path.join(if cfg!(windows) {
+        "aad-browser.exe"
+    } else {
+        "aad-browser"
+    });
     candidate.exists().then_some(candidate)
 }
 
@@ -103,7 +107,6 @@ pub fn parse(value: &str) -> Option<BrowserLaunch> {
     BrowserLaunch::parse(value)
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -112,11 +115,17 @@ mod tests {
     fn parses_browser_and_login_variants() {
         assert_eq!(
             parse("edge"),
-            Some(BrowserLaunch { browser: "edge".into(), copy_login: false })
+            Some(BrowserLaunch {
+                browser: "edge".into(),
+                copy_login: false
+            })
         );
         assert_eq!(
             parse("Chrome-Login"),
-            Some(BrowserLaunch { browser: "chrome".into(), copy_login: true })
+            Some(BrowserLaunch {
+                browser: "chrome".into(),
+                copy_login: true
+            })
         );
         assert_eq!(parse("firefox"), None);
         assert!(matches_process(&parse("brave").unwrap(), "brave.exe"));

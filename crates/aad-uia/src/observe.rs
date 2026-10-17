@@ -224,7 +224,8 @@ impl ObservationBuffer {
 /// `quiet` defines how long the same *(window, kind)* must be silent before it
 /// counts as a new trigger: back-to-back value events while typing collapse
 /// into one; a second edit seconds later is a new trigger.
-pub fn triggers(events: &[ObservedEvent], quiet: std::time::Duration) -> Vec<Trigger> {    // Indexed by (window_id, kind) so the same signal from two windows of one
+pub fn triggers(events: &[ObservedEvent], quiet: std::time::Duration) -> Vec<Trigger> {
+    // Indexed by (window_id, kind) so the same signal from two windows of one
     // process (two editor windows, two browser windows) stays distinct.
     let mut by_key: HashMap<(Option<String>, ObservationKind), usize> = HashMap::new();
     let mut out: Vec<Trigger> = Vec::new();
@@ -426,7 +427,10 @@ pub struct DigestOptions {
 
 impl Default for DigestOptions {
     fn default() -> Self {
-        Self { max_items: 40, include_states: true }
+        Self {
+            max_items: 40,
+            include_states: true,
+        }
     }
 }
 
@@ -523,7 +527,11 @@ pub fn digest(changes: &ChangeSet, options: &DigestOptions) -> ChangeDigest {
             name: node.name.clone(),
             text: node.value.clone(),
         };
-        if item.has_content() { appeared.push(item); } else { structural += 1; }
+        if item.has_content() {
+            appeared.push(item);
+        } else {
+            structural += 1;
+        }
     }
 
     let mut disappeared: Vec<ContentItem> = Vec::new();
@@ -534,7 +542,11 @@ pub fn digest(changes: &ChangeSet, options: &DigestOptions) -> ChangeDigest {
             name: node.name.clone(),
             text: None,
         };
-        if item.has_content() { disappeared.push(item); } else { structural += 1; }
+        if item.has_content() {
+            disappeared.push(item);
+        } else {
+            structural += 1;
+        }
     }
 
     let mut text_changes: Vec<TextChange> = Vec::new();
@@ -545,7 +557,9 @@ pub fn digest(changes: &ChangeSet, options: &DigestOptions) -> ChangeDigest {
         for field in node.value.iter().chain(node.name_changes.iter()) {
             let from = field.from.clone().filter(|s| !s.is_empty());
             let to = field.to.clone().filter(|s| !s.is_empty());
-            if from.is_none() && to.is_none() { continue; }
+            if from.is_none() && to.is_none() {
+                continue;
+            }
             text_changes.push(TextChange {
                 role: node.role.clone(),
                 name: named.clone(),
@@ -556,8 +570,12 @@ pub fn digest(changes: &ChangeSet, options: &DigestOptions) -> ChangeDigest {
 
         if options.include_states {
             for state in &node.states {
-                if !matches!(state.field.as_str(), "focused" | "enabled" | "read_only") { continue; }
-                if named.is_none() { continue; }
+                if !matches!(state.field.as_str(), "focused" | "enabled" | "read_only") {
+                    continue;
+                }
+                if named.is_none() {
+                    continue;
+                }
                 state_changes.push(serde_json::json!({
                     "role": node.role,
                     "name": named,
@@ -573,8 +591,10 @@ pub fn digest(changes: &ChangeSet, options: &DigestOptions) -> ChangeDigest {
     // measured on a right-click dismissed 800ms later, the same menu items
     // landed in both lists and were printed twice. What survives the batch is
     // what actually changed.
-    let gone: std::collections::HashSet<&str> =
-        disappeared.iter().map(|item| item.identity.as_str()).collect();
+    let gone: std::collections::HashSet<&str> = disappeared
+        .iter()
+        .map(|item| item.identity.as_str())
+        .collect();
     let appeared: Vec<ContentItem> = appeared
         .into_iter()
         .filter(|item| !gone.contains(item.identity.as_str()))
@@ -682,15 +702,30 @@ fn diff_node(identity: &NodeIdentity, old: &Node, now: &Node) -> Option<NodeChan
     }
 
     let mut states = Vec::new();
-    diff_state(&mut states, "enabled", old.states.enabled, now.states.enabled);
-    diff_state(&mut states, "focused", old.states.focused, now.states.focused);
+    diff_state(
+        &mut states,
+        "enabled",
+        old.states.enabled,
+        now.states.enabled,
+    );
+    diff_state(
+        &mut states,
+        "focused",
+        old.states.focused,
+        now.states.focused,
+    );
     diff_state(
         &mut states,
         "focusable",
         old.states.focusable,
         now.states.focusable,
     );
-    diff_state(&mut states, "offscreen", old.states.offscreen, now.states.offscreen);
+    diff_state(
+        &mut states,
+        "offscreen",
+        old.states.offscreen,
+        now.states.offscreen,
+    );
     diff_state(
         &mut states,
         "read_only",
@@ -862,7 +897,10 @@ mod tests {
         assert_eq!(added, 1, "the list is new: {changes:?}");
         assert_eq!(removed, 1, "the button is gone");
         assert_eq!(changed, 1, "typing is a value change, not add/remove");
-        assert_eq!(changes.changed[0].value[0].to.as_deref(), Some("hello world"));
+        assert_eq!(
+            changes.changed[0].value[0].to.as_deref(),
+            Some("hello world")
+        );
         assert_eq!(changes.added[0].identity, "aid:Win32:list:results");
     }
 
@@ -904,7 +942,13 @@ mod tests {
         current.nodes = nodes;
 
         let changes = diff_trees(&baseline, &current);
-        let digest = digest(&changes, &DigestOptions { max_items: 40, include_states: true });
+        let digest = digest(
+            &changes,
+            &DigestOptions {
+                max_items: 40,
+                include_states: true,
+            },
+        );
 
         // Named menu and the typed value survive...
         assert!(
@@ -922,8 +966,15 @@ mod tests {
             "text values must survive filtering"
         );
         // ...while the 120 anonymous panes are folded into one number.
-        assert!(digest.structural_noise >= 120, "noise = {}", digest.structural_noise);
-        assert!(!digest.appeared.iter().any(|item| item.role == "pane" && item.name.is_none()));
+        assert!(
+            digest.structural_noise >= 120,
+            "noise = {}",
+            digest.structural_noise
+        );
+        assert!(!digest
+            .appeared
+            .iter()
+            .any(|item| item.role == "pane" && item.name.is_none()));
     }
 
     #[test]
@@ -948,7 +999,10 @@ mod tests {
 
         assert_eq!(digest.text_changes.len(), 1);
         assert_eq!(digest.text_changes[0].to.as_deref(), Some("query"));
-        assert!(digest.state_changes.is_empty(), "offscreen churn is dropped");
+        assert!(
+            digest.state_changes.is_empty(),
+            "offscreen churn is dropped"
+        );
     }
 
     #[test]
@@ -972,7 +1026,11 @@ mod tests {
         let removed: Vec<RemovedNode> = added_changes
             .added
             .iter()
-            .map(|n| RemovedNode { identity: n.identity.clone(), role: n.role.clone(), name: n.name.clone() })
+            .map(|n| RemovedNode {
+                identity: n.identity.clone(),
+                role: n.role.clone(),
+                name: n.name.clone(),
+            })
             .collect();
         let closed_changes = ChangeSet {
             added: vec![],
@@ -1003,7 +1061,10 @@ mod tests {
         let changes = diff_trees(&baseline, &current);
         let digest = digest(
             &changes,
-            &DigestOptions { max_items: 3, include_states: true },
+            &DigestOptions {
+                max_items: 3,
+                include_states: true,
+            },
         );
         assert_eq!(digest.appeared.len(), 3);
         assert!(digest.truncated);

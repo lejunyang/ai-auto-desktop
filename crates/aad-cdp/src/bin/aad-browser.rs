@@ -93,7 +93,10 @@ fn real_user_data(browser: &str) -> Option<PathBuf> {
     let path = match browser.to_ascii_lowercase().as_str() {
         "edge" | "msedge" => local.join("Microsoft").join("Edge").join("User Data"),
         "chrome" | "googlechrome" => local.join("Google").join("Chrome").join("User Data"),
-        "brave" => local.join("BraveSoftware").join("Brave-Browser").join("User Data"),
+        "brave" => local
+            .join("BraveSoftware")
+            .join("Brave-Browser")
+            .join("User Data"),
         _ => return None,
     };
     path.exists().then_some(path)
@@ -197,11 +200,14 @@ fn main() {
                 eprintln!("unknown browser or no installed profile for '{browser}'");
                 std::process::exit(2);
             });
-            println!("{{\"stage\":\"closing_browser\",\"browser\":\"{}\"}}", browser);
+            println!(
+                "{{\"stage\":\"closing_browser\",\"browser\":\"{}\"}}",
+                browser
+            );
             close_browser(&exe);
-            let work = explicit
-                .clone()
-                .unwrap_or_else(|| std::env::temp_dir().join(format!("aad-cdp-login-{}", args.port)));
+            let work = explicit.clone().unwrap_or_else(|| {
+                std::env::temp_dir().join(format!("aad-cdp-login-{}", args.port))
+            });
             if let Err(error) = copy_login_profile(&real, &work) {
                 eprintln!("login copy failed: {error}");
                 std::process::exit(1);
@@ -253,7 +259,11 @@ fn main() {
         std::thread::sleep(std::time::Duration::from_millis(300));
     }
 
-    let mode = if args.copy_login.is_some() { "login-copy" } else { "dedicated" };
+    let mode = if args.copy_login.is_some() {
+        "login-copy"
+    } else {
+        "dedicated"
+    };
     println!(
         "{{\"browser\":\"{}\",\"port\":{},\"profile_dir\":\"{}\",\"mode\":\"{}\",\"ready\":{},\"pid\":{}}}",
         exe.display(),

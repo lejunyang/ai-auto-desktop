@@ -75,7 +75,9 @@ impl ObserveManager {
             .clamp(1, MAX_POLLED_EVENTS as u64) as usize;
 
         let sessions = self.sessions.lock().unwrap();
-        let session = sessions.get(&observe_id).ok_or_else(|| not_found(&observe_id))?;
+        let session = sessions
+            .get(&observe_id)
+            .ok_or_else(|| not_found(&observe_id))?;
         let (events, dropped) = session.drain(max);
         let sources = self
             .metadata

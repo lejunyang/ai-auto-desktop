@@ -78,7 +78,9 @@ fn kill_profile_edge(profile: &std::path::Path) {
          Where-Object {{ $_.CommandLine -like '*{needle}*' }} | \
          ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }}"
     );
-    let _ = Command::new("powershell").args(["-NoProfile", "-Command", &script]).output();
+    let _ = Command::new("powershell")
+        .args(["-NoProfile", "-Command", &script])
+        .output();
     std::thread::sleep(Duration::from_millis(500));
     let _ = std::fs::remove_dir_all(profile);
 }
@@ -125,8 +127,14 @@ fn run(port: u16) -> Result<(), Box<dyn std::error::Error>> {
     std::thread::sleep(Duration::from_secs(2));
     let PageState { title, url, text } = client.state()?;
     println!("STATE title={title:?}\n      url={url}");
-    println!("TEXT_HEAD: {}", text.lines().take(3).collect::<Vec<_>>().join(" | "));
-    assert!(text.contains("Example Domain"), "rendered text must be readable");
+    println!(
+        "TEXT_HEAD: {}",
+        text.lines().take(3).collect::<Vec<_>>().join(" | ")
+    );
+    assert!(
+        text.contains("Example Domain"),
+        "rendered text must be readable"
+    );
 
     // Install listeners and synthesize in-page activity via evaluation ONLY:
     // we do not drive Input.* (this is an observer, not an automator). The

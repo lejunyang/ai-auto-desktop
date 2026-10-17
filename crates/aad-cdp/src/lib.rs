@@ -77,9 +77,8 @@ impl Client {
     /// listening on `port`, so callers can fall back to UIA.
     pub fn list_targets(port: u16) -> Result<Vec<Target>, CdpError> {
         let body = http_get(port, "/json/list")?;
-        let targets: Vec<Target> = serde_json::from_str(&body).map_err(|error| {
-            CdpError::protocol(format!("could not parse /json/list: {error}"))
-        })?;
+        let targets: Vec<Target> = serde_json::from_str(&body)
+            .map_err(|error| CdpError::protocol(format!("could not parse /json/list: {error}")))?;
         Ok(targets
             .into_iter()
             .filter(|target| target.kind == "page" && !target.webSocketDebuggerUrl.is_empty())
@@ -111,7 +110,11 @@ impl Client {
         Ok(client)
     }
 
-    fn send(&mut self, method: &str, params: serde_json::Value) -> Result<serde_json::Value, CdpError> {
+    fn send(
+        &mut self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, CdpError> {
         self.next_id += 1;
         let id = self.next_id;
         let message = serde_json::json!({"id": id, "method": method, "params": params});
@@ -134,7 +137,10 @@ impl Client {
                 if let Some(error) = value.get("error") {
                     return Err(CdpError::protocol(error.to_string()));
                 }
-                return Ok(value.get("result").cloned().unwrap_or(serde_json::Value::Null));
+                return Ok(value
+                    .get("result")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null));
             }
             // An event while waiting on a response: ignore here; the poll loop
             // reads events explicitly after draining responses.
@@ -174,7 +180,8 @@ impl Client {
             .and_then(|result| result.get("value"))
             .cloned()
             .unwrap_or(serde_json::Value::Null);
-        serde_json::from_value(raw).map_err(|error| CdpError::protocol(format!("bad state: {error}")))
+        serde_json::from_value(raw)
+            .map_err(|error| CdpError::protocol(format!("bad state: {error}")))
     }
 
     /// Evaluate an expression and return its value (returnByValue).
@@ -199,19 +206,14 @@ fn http_get(port: u16, path: &str) -> Result<String, CdpError> {
     // socket nonblocking on Windows, which made the subsequent HTTP read fail
     // (measured: plain TcpStream::connect succeeds where the timeout form
     // timed out). Cold-start waiting is the caller's job (Client::version).
-    let mut stream =
-        TcpStream::connect(format!("127.0.0.1:{port}")).map_err(|error| {
-            CdpError::connect(format!("port {port}: {error}"))
-        })?;
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{port}"))
+        .map_err(|error| CdpError::connect(format!("port {port}: {error}")))?;
     stream
         .set_read_timeout(Some(Duration::from_secs(3)))
         .map_err(|error| CdpError::io(error))?;
-    let request = format!(
-        "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
-    );
-    stream
-        .write_all(request.as_bytes())
-        .map_err(CdpError::io)?;
+    let request =
+        format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n");
+    stream.write_all(request.as_bytes()).map_err(CdpError::io)?;
 
     // The devtools server is authoritative about the body length; read exactly
     // Content-Length rather than read_to_end, which blocked until timeout when
@@ -239,13 +241,11 @@ fn http_get(port: u16, path: &str) -> Result<String, CdpError> {
                         header_text.lines().next().unwrap_or("")
                     )));
                 }
-                content_length = header_text
-                    .lines()
-                    .find_map(|line| {
-                        line.to_ascii_lowercase()
-                            .strip_prefix("content-length:")
-                            .and_then(|value| value.trim().parse::<usize>().ok())
-                    });
+                content_length = header_text.lines().find_map(|line| {
+                    line.to_ascii_lowercase()
+                        .strip_prefix("content-length:")
+                        .and_then(|value| value.trim().parse::<usize>().ok())
+                });
             }
         }
         if let Some(length) = content_length {
