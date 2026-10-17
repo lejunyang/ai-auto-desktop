@@ -50,6 +50,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "aad-control"
+version = "0.0.1"
+dependencies = [
+ "aad-atspi",
+ "aad-cdp",
+ "aad-core",
+ "aad-macos-ax",
+ "aad-runtime",
+ "aad-uia",
+ "serde",
+ "serde_json",
+ "sha2",
+ "uuid",
+]
+
+[[package]]
 name = "aad-core"
 version = "0.0.1"
 dependencies = [
