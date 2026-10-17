@@ -660,6 +660,29 @@ impl Session {
     }
 }
 
+fn validate_action(action: &Action) -> Result<()> {
+    let text = match action {
+        Action::Fill { value } => Some(value),
+        Action::TypeText { text } => Some(text),
+        _ => None,
+    };
+    if text.is_some_and(|s| s.len() > 4096 || s.contains('\0')) {
+        return Err(error(
+            "CONTROL.INVALID_REQUEST",
+            "input text must be bounded and contain no NUL",
+        ));
+    }
+    if let Action::Key { keys } = action {
+        if keys.is_empty() || keys.len() > 6 || keys.iter().any(|s| s.is_empty() || s.len() > 32) {
+            return Err(error(
+                "CONTROL.INVALID_REQUEST",
+                "key chord is outside the allowed limits",
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod admission_tests {
     use super::*;
@@ -688,27 +711,4 @@ mod admission_tests {
         assert_eq!(response.commit_state, CommitState::NotCommitted);
         assert_eq!(response.error.unwrap()["code"], "CONTROL.CANCELLED");
     }
-}
-
-fn validate_action(action: &Action) -> Result<()> {
-    let text = match action {
-        Action::Fill { value } => Some(value),
-        Action::TypeText { text } => Some(text),
-        _ => None,
-    };
-    if text.is_some_and(|s| s.len() > 4096 || s.contains('\0')) {
-        return Err(error(
-            "CONTROL.INVALID_REQUEST",
-            "input text must be bounded and contain no NUL",
-        ));
-    }
-    if let Action::Key { keys } = action {
-        if keys.is_empty() || keys.len() > 6 || keys.iter().any(|s| s.is_empty() || s.len() > 32) {
-            return Err(error(
-                "CONTROL.INVALID_REQUEST",
-                "key chord is outside the allowed limits",
-            ));
-        }
-    }
-    Ok(())
 }
