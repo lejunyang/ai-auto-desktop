@@ -126,7 +126,7 @@ fn locator_schema() -> Value {
 
 /// Every tool this server publishes.
 pub fn catalogue() -> Vec<Tool> {
-    vec![
+    let mut tools = vec![
         Tool {
             name: "list_apps",
             description: "List the running applications and their top-level windows. \
@@ -609,7 +609,9 @@ effect. Workflows containing script steps are refused.",
             }),
             mutating: true,
         },
-    ]
+    ];
+    tools.extend(crate::control_tools::catalogue());
+    tools
 }
 
 /// The `tools/list` payload.

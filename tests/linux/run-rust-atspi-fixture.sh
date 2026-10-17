@@ -32,6 +32,8 @@ if [ "${1:-}" = --inside-session ]; then
     sleep 0.1
   done
   [ "$found" = true ]
+  cargo build --locked -q -p aad-cli
+  AAD_CONTROL_CLI="$root/target/debug/aad" cargo run --locked -q -p aad-control --example native_fixture -- "$fixture_pid"
   cargo run --locked -q -p aad-atspi --example driver -- set-text "$fixture_pid" "Rust native changed" >/dev/null
   cargo run --locked -q -p aad-atspi --example driver -- snapshot "$fixture_pid" \
     | jq -e '.nodes[] | select(.name == "Qt fixture text entry" and .value == "Rust native changed")' >/dev/null

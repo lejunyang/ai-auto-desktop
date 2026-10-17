@@ -97,6 +97,15 @@ jobs:
       - name: Test the Rust subprocess plugin fixture
         run: cargo test --locked -p aad-plugin --features test-fixture --test process_plugin
 
+      - name: Test browser control with isolated sandboxed Chromium
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          export AAD_TEST_CHROME="$(command -v google-chrome || command -v chromium)"
+          test -n "$AAD_TEST_CHROME"
+          cargo test --locked -p aad-control --test browser_e2e -- --ignored
+
       # The UIA research probes call Win32 APIs directly. They are excluded
       # from automatic example discovery on other hosts, but still need to be
       # compile-checked where those APIs exist.

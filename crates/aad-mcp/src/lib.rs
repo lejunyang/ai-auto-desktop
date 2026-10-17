@@ -6,14 +6,19 @@
 //! The [`tools`] module documents the safety model: an agent must observe an
 //! element before it can act on it.
 
+pub mod control_tools;
 pub mod protocol;
 pub mod tools;
 
 pub use protocol::Request;
 
+use aad_control::transport::Endpoint;
 use aad_uia::UiaDriver;
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
 use std::io::{BufRead, Write};
+use std::io::{BufReader, Read};
+use std::sync::{Arc, Mutex};
 
 pub const SERVER_NAME: &str = "ai-auto-desktop";
 pub const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -28,6 +33,12 @@ pub struct Server {
     driver: Option<std::sync::Arc<UiaDriver>>,
     /// Why the driver is missing, if it is.
     unavailable: Option<String>,
+    control: Option<Arc<dyn Endpoint>>,
+    local_session: Option<Arc<aad_control::Session>>,
+    unified_only: bool,
+    read_only: bool,
+    active_control: Mutex<BTreeMap<String, String>>,
+    legacy_gate: Arc<Mutex<()>>,
 }
 
 impl Server {
@@ -38,6 +49,24 @@ impl Server {
     /// discover *why* automation is unavailable instead of seeing a process
     /// that refuses to start.
     pub fn new() -> Self {
+        Self::with_options(
+            aad_control::Policy {
+                allow_input: true,
+                ..Default::default()
+            },
+            None,
+        )
+    }
+
+    pub fn with_options(policy: aad_control::Policy, browser_port: Option<u16>) -> Self {
+        let read_only = !policy.allow_input;
+        let unified_only = !policy.providers.is_empty() || policy.resources.is_some();
+        let legacy_gate = Arc::new(Mutex::new(()));
+        let local_session = Arc::new(
+            aad_control::Session::native_with_browser(policy, browser_port)
+                .with_gate(legacy_gate.clone()),
+        );
+        let control = Some(local_session.clone() as Arc<dyn Endpoint>);
         // References are session capabilities. Do not load handles minted by a
         // CLI invocation or another MCP connection from the shared disk cache.
         let snapshots = aad_uia::SnapshotStore::new(16, std::time::Duration::from_secs(300));
@@ -45,24 +74,100 @@ impl Server {
             Ok(driver) => Self {
                 driver: Some(std::sync::Arc::new(driver)),
                 unavailable: None,
+                control,
+                local_session: Some(local_session),
+                unified_only,
+                read_only,
+                active_control: Mutex::new(BTreeMap::new()),
+                legacy_gate,
             },
             Err(error) => Self {
                 driver: None,
                 unavailable: Some(error.message),
+                control,
+                local_session: Some(local_session),
+                unified_only,
+                read_only,
+                active_control: Mutex::new(BTreeMap::new()),
+                legacy_gate,
             },
         }
     }
 
     pub fn with_driver(driver: UiaDriver) -> Self {
+        let driver = Arc::new(driver);
+        let backend = aad_control::native::NativeBackend::new(
+            driver.clone(),
+            aad_control::native::Flavor::Windows,
+        );
+        let legacy_gate = Arc::new(Mutex::new(()));
+        let local_session = Arc::new(
+            aad_control::Session::new(
+                vec![Arc::new(backend)],
+                aad_control::Policy {
+                    allow_input: true,
+                    ..Default::default()
+                },
+            )
+            .with_gate(legacy_gate.clone()),
+        );
+        let control = Some(local_session.clone() as Arc<dyn Endpoint>);
         Self {
-            driver: Some(std::sync::Arc::new(driver)),
+            driver: Some(driver),
             unavailable: None,
+            control,
+            local_session: Some(local_session),
+            unified_only: false,
+            read_only: false,
+            active_control: Mutex::new(BTreeMap::new()),
+            legacy_gate,
+        }
+    }
+
+    pub fn with_control(control: Arc<dyn Endpoint>) -> Self {
+        Self {
+            driver: None,
+            unavailable: Some("use provider-independent control tools".into()),
+            control: Some(control),
+            local_session: None,
+            unified_only: true,
+            read_only: false,
+            active_control: Mutex::new(BTreeMap::new()),
+            legacy_gate: Arc::new(Mutex::new(())),
+        }
+    }
+
+    pub fn disconnect(&self) {
+        if let Some(control) = &self.control {
+            control.disconnect();
+        }
+    }
+
+    fn cancel_rpc(&self, id: &Value) {
+        if let (Some(control), Some(request_id)) = (
+            &self.control,
+            self.active_control
+                .lock()
+                .unwrap()
+                .get(&id.to_string())
+                .cloned(),
+        ) {
+            let request = aad_control::Request::new(
+                Some(control.session_id().into()),
+                aad_control::Operation::Cancel { request_id },
+            );
+            control.request(&request);
         }
     }
 
     /// Handle one request, returning a response unless it was a notification.
     pub fn handle(&self, request: &Request) -> Option<Value> {
         if request.is_notification() {
+            if request.method == "notifications/cancelled" {
+                if let Some(id) = request.params.get("requestId") {
+                    self.cancel_rpc(id);
+                }
+            }
             return None;
         }
         let id = request.id.clone();
@@ -70,8 +175,18 @@ impl Server {
         let outcome = match request.method.as_str() {
             "initialize" => Ok(self.initialize()),
             "ping" => Ok(json!({})),
-            "tools/list" => Ok(tools::list_payload()),
-            "tools/call" => self.call_tool(&request.params),
+            "tools/list" => {
+                let mut payload = tools::list_payload();
+                if self.unified_only {
+                    payload["tools"].as_array_mut().unwrap().retain(|tool| {
+                        tool["name"]
+                            .as_str()
+                            .is_some_and(|name| name.starts_with("control_"))
+                    });
+                }
+                Ok(payload)
+            }
+            "tools/call" => self.call_tool(&request.params, request.id.as_ref()),
             other => {
                 return Some(protocol::error_response(
                     id,
@@ -89,7 +204,7 @@ impl Server {
 
     fn initialize(&self) -> Value {
         let mut instructions = String::from(
-            "Desktop automation. On Windows, discover applications with list_apps, \
+            "Use control_capabilities, control_targets, control_observe and control_find for native desktop and explicitly enabled browser resources. Use control_act only with returned session-bound targets and negotiated capabilities. Input is subject to server-side grants. On cancellation or disconnect an input may have unknown effect; never automatically retry. Observe again after any input.\n\nLegacy Windows tools: discover applications with list_apps, \
 inspect a window with describe_window, resolve an element with find_element, \
 then act using the target it returns. Targets prove the element was actually \
 observed; if the UI changes, re-observe rather than reusing an old target.\n\n\
@@ -99,10 +214,15 @@ it, and run_workflow runs it. That is more reliable than rebuilding the same \
 sequence of clicks each time.",
         );
         if let Some(reason) = &self.unavailable {
-            instructions.push_str(&format!(
-                "\n\nAutomation is currently unavailable: {reason} \
-Call probe_environment for details."
-            ));
+            if !self.unified_only {
+                instructions.push_str(&format!(
+                    "\n\nLegacy Windows tools are unavailable: {reason}. \
+Use control_capabilities for other providers, or probe_environment for details."
+                ));
+            }
+        }
+        if self.unified_only {
+            instructions="Use control_capabilities, control_targets, control_observe, control_find and control_act. This connection exposes one granted, persistent remote/unified session only. Respect negotiated capabilities and server-side input grants. Targets are session/resource/observation bound. Re-observe after input; never automatically retry unknown effects. Use notifications/cancelled to request cancellation of an in-flight JSON-RPC request.".into();
         }
 
         json!({
@@ -113,7 +233,7 @@ Call probe_environment for details."
         })
     }
 
-    fn call_tool(&self, params: &Value) -> Result<Value, (i64, String)> {
+    fn call_tool(&self, params: &Value, rpc_id: Option<&Value>) -> Result<Value, (i64, String)> {
         let name = params
             .get("name")
             .and_then(Value::as_str)
@@ -124,6 +244,58 @@ Call probe_environment for details."
         }
 
         let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
+        if name.starts_with("control_") {
+            let control = self.control.as_ref().ok_or((
+                protocol::INTERNAL_ERROR,
+                "control endpoint is unavailable".into(),
+            ))?;
+            let request = control_tools::prepare(name, &arguments, control.as_ref())
+                .map_err(|e| (protocol::INVALID_PARAMS, e))?;
+            let key = rpc_id
+                .map(Value::to_string)
+                .unwrap_or_else(|| request.request_id.clone());
+            {
+                let mut active = self.active_control.lock().unwrap();
+                if active.contains_key(&key) {
+                    return Err((
+                        protocol::INVALID_REQUEST,
+                        "duplicate in-flight JSON-RPC id".into(),
+                    ));
+                }
+                active.insert(key.clone(), request.request_id.clone());
+            }
+            let response = control.request(&request);
+            self.active_control.lock().unwrap().remove(&key);
+            let is_error = response.error.is_some();
+            return Ok(content(&control_tools::payload(response), is_error));
+        }
+        if self.unified_only {
+            return Err((
+                protocol::INVALID_PARAMS,
+                "this connection exposes only its granted control session".into(),
+            ));
+        }
+        if self.read_only
+            && (tools::find(name).is_some_and(|tool| tool.mutating) || name == "save_workflow")
+        {
+            return Ok(content(
+                &json!({"code":"POLICY.DENIED","effect":"not_applied","message":"read-only MCP connection"}),
+                true,
+            ));
+        }
+        let _legacy = self.legacy_gate.lock().unwrap();
+        let _input_lease = if tools::find(name).is_some_and(|tool| tool.mutating) {
+            if let Some(session) = &self.local_session {
+                match session.input_lease("desktop-input") {
+                    Ok(lease) => Some(lease),
+                    Err(error) => return Ok(content(&error.to_json(), true)),
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
 
         // Some tools deliberately work without a driver: `probe_environment`
         // exists to explain why the desktop is unavailable, and the workflow
@@ -184,6 +356,12 @@ impl Server {
         Self {
             driver: None,
             unavailable: Some(reason.to_string()),
+            control: None,
+            local_session: None,
+            unified_only: false,
+            read_only: false,
+            active_control: Mutex::new(BTreeMap::new()),
+            legacy_gate: Arc::new(Mutex::new(())),
         }
     }
 }
@@ -228,9 +406,90 @@ pub fn serve(input: impl BufRead, mut output: impl Write) -> std::io::Result<()>
 
 /// Serve MCP over this process's stdio.
 pub fn serve_stdio() -> std::io::Result<()> {
-    let stdin = std::io::stdin();
-    let stdout = std::io::stdout();
-    serve(stdin.lock(), stdout.lock())
+    serve_stdio_with(Server::new())
+}
+
+pub fn serve_stdio_with(server: Server) -> std::io::Result<()> {
+    serve_concurrent(std::io::stdin(), std::io::stdout(), server)
+}
+
+/// Production stdio loop: a cancellation notification can be read while a
+/// control action is in flight. Legacy operations share the native action gate.
+pub fn serve_concurrent(
+    input: impl Read,
+    output: impl Write + Send + 'static,
+    server: Server,
+) -> std::io::Result<()> {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
+    let server = Arc::new(server);
+    let output = Arc::new(Mutex::new(output));
+    let active = Arc::new(AtomicUsize::new(0));
+    let failed = Arc::new(AtomicBool::new(false));
+    let mut input = BufReader::new(input);
+    loop {
+        if failed.load(Ordering::SeqCst) {
+            break;
+        }
+        let frame = match aad_control::transport::read_frame(&mut input, 8 * 1024 * 1024) {
+            Ok(Some(frame)) => frame,
+            Ok(None) => break,
+            Err(e) => {
+                server.disconnect();
+                return Err(e);
+            }
+        };
+        let request = match protocol::parse(std::str::from_utf8(&frame).unwrap_or("")) {
+            Ok(request) => request,
+            Err(response) => {
+                writeln!(&mut *output.lock().unwrap(), "{response}")?;
+                output.lock().unwrap().flush()?;
+                continue;
+            }
+        };
+        if request.is_notification() {
+            server.handle(&request);
+            continue;
+        }
+        if active.load(Ordering::SeqCst) >= 8 {
+            let response = protocol::error_response(
+                request.id,
+                protocol::INTERNAL_ERROR,
+                "too many in-flight MCP requests",
+            );
+            writeln!(&mut *output.lock().unwrap(), "{response}")?;
+            output.lock().unwrap().flush()?;
+            continue;
+        }
+        active.fetch_add(1, Ordering::SeqCst);
+        let (server, output, active, failed) = (
+            server.clone(),
+            output.clone(),
+            active.clone(),
+            failed.clone(),
+        );
+        std::thread::spawn(move || {
+            if let Some(response) = server.handle(&request) {
+                let mut output = output.lock().unwrap();
+                if writeln!(&mut *output, "{response}")
+                    .and_then(|()| output.flush())
+                    .is_err()
+                {
+                    failed.store(true, Ordering::SeqCst);
+                    server.disconnect();
+                }
+            }
+            active.fetch_sub(1, Ordering::SeqCst);
+        });
+    }
+    server.disconnect();
+    // EOF ends authority to dispatch input. Allow bounded time to flush already
+    // completed read-only replies, then let the CLI reclaim its private workers.
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while active.load(Ordering::SeqCst) > 0 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -395,10 +654,7 @@ mod tests {
 
     #[test]
     fn probe_environment_answers_even_without_a_driver() {
-        let offline = Server {
-            driver: None,
-            unavailable: Some("no backend on this platform".to_string()),
-        };
+        let offline = Server::without_driver("no backend on this platform");
 
         let response = offline
             .handle(&request(
@@ -414,10 +670,7 @@ mod tests {
 
     #[test]
     fn an_unavailable_driver_yields_an_actionable_error_not_a_crash() {
-        let offline = Server {
-            driver: None,
-            unavailable: Some("UI automation requires Windows".to_string()),
-        };
+        let offline = Server::without_driver("UI automation requires Windows");
 
         let response = offline
             .handle(&request(
@@ -439,10 +692,7 @@ mod tests {
 
     #[test]
     fn an_unavailable_driver_is_announced_at_initialize() {
-        let offline = Server {
-            driver: None,
-            unavailable: Some("UI automation requires Windows".to_string()),
-        };
+        let offline = Server::without_driver("UI automation requires Windows");
 
         let response = offline.handle(&request("initialize", json!({}))).unwrap();
         let instructions = response["result"]["instructions"].as_str().unwrap();
