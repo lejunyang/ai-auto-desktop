@@ -26,6 +26,23 @@ MCP 工具 schema **不接受任何** `x` / `y` / `point` / `coordinates` / `pos
 
 ## 快速开始
 
+开发环境可使用已发布的 one-sdk 0.0.6（无需依赖 one-sdk 的草稿 PR）：
+
+```powershell
+osdk install                    # Rust 1.98.0 + rustfmt/clippy
+osdk task list
+osdk run fmt-check
+osdk run test                   # 不包含需要 Tauri 系统依赖的 GUI
+osdk run clippy
+osdk run plugin-test
+osdk run ci --dry-run           # 查看聚合检查；原生 fixture 仍需各平台环境
+```
+
+`osdk.lock` 只记录实际解析过的平台，首次在其他平台执行 `osdk lock` 后应提交该平台
+产生的锁条目。Linux 脚本测试还要求可用的 bubblewrap 用户命名空间、prlimit 与
+`/usr/bin/python3`；仅安装命令并不代表容器允许创建沙箱。GUI 开发另需 Node/npm
+和平台的 Tauri 系统库，不由这些 Rust 任务隐式安装。
+
 ```powershell
 cargo build --release
 ```

@@ -1,5 +1,12 @@
 schema = 4
 
+[platforms.linux-x64.tools.rust]
+request = "1.98.0"
+version = "1.98.0"
+
+[platforms.linux-x64.tools.rust.options]
+components = "rustfmt,clippy"
+
 [platforms.windows-x64.tools.rust]
 request = "1.98.0"
 version = "1.98.0"
