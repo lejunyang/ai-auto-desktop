@@ -1293,6 +1293,24 @@ mod tests {
     }
 
     #[test]
+    fn a_target_from_another_session_cannot_authorize_a_write() {
+        let nodes = vec![node("n1", "Button", "Save", &["invoke"])];
+        let (first, _) = driver(nodes.clone());
+        let (second, backend) = driver(nodes);
+        let found = first
+            .call(
+                "find",
+                &json!({"window_id": "w1", "locator": {"name": "Save"}}),
+            )
+            .unwrap();
+        let arguments = json!({"target": target_of(&found)});
+        let error = second.call("invoke", &arguments).unwrap_err();
+        assert_eq!(error.code, "DRIVER.STALE_HANDLE");
+        assert!(backend.performed.lock().unwrap().is_empty());
+        first.call("invoke", &arguments).unwrap();
+    }
+
+    #[test]
     fn pointer_gesture_rejects_conflicting_modes() {
         for arguments in [
             json!({"scroll": {"direction": "down"}, "hover_ms": 100}),

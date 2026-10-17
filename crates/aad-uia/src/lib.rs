@@ -30,13 +30,13 @@ pub mod observer_win;
 
 pub use backend::{Backend, CaptureLimits, CapturedTree, DriverError, SnapshotStore};
 pub use capture::{coalesce, recordable, CapturedEvent, EventBuffer, EventKind};
+pub use driver::{action_ids, is_node_action, is_write_action, UiaDriver, PROVIDER_NAME};
+pub use model::{Bounds, Locator, Node, Snapshot, States, Target, WindowInfo};
 pub use observe::{
-    digest, diff_trees, triggers as fold_triggers, ChangeDigest, ChangeSet, ContentItem,
+    diff_trees, digest, triggers as fold_triggers, ChangeDigest, ChangeSet, ContentItem,
     DigestOptions, EventElement, EventWindow, ObservationBuffer, ObservationKind, ObservedEvent,
     TextChange, Trigger,
 };
-pub use driver::{action_ids, is_node_action, is_write_action, UiaDriver, PROVIDER_NAME};
-pub use model::{Bounds, Locator, Node, Snapshot, States, Target, WindowInfo};
 
 #[cfg(windows)]
 use std::sync::Arc;
@@ -46,13 +46,20 @@ use std::sync::Arc;
 /// Returns a clear, actionable error on platforms with no backend rather than
 /// silently offering a driver that cannot do anything.
 pub fn native_driver() -> Result<UiaDriver, DriverError> {
+    native_driver_with_store(SnapshotStore::default())
+}
+
+/// Build a native driver with an explicit handle scope. Long-lived protocol
+/// sessions use an in-memory store; standalone CLI calls keep the disk cache.
+pub fn native_driver_with_store(snapshots: SnapshotStore) -> Result<UiaDriver, DriverError> {
     #[cfg(windows)]
     {
         let backend = windows::WindowsUiaBackend::new()?;
-        Ok(UiaDriver::new(Arc::new(backend)))
+        Ok(UiaDriver::with_store(Arc::new(backend), snapshots))
     }
     #[cfg(not(windows))]
     {
+        let _ = snapshots;
         Err(DriverError::unavailable(
             "UI automation currently requires Windows; \
              no backend is available on this platform",
