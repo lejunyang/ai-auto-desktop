@@ -10,12 +10,13 @@ ai-auto-desktop 让人和 AI 用同一套能力观察并操作桌面：**发现�
 | **MCP** | `aad mcp`（stdio 上的 JSON-RPC） | 给 AI agent 调用 |
 | **GUI** | Tauri + Vue 桌面窗口 | 可视化查看界面、录制并编排步骤 |
 
-三者驱动的是同一个 driver，因此安全模型完全一致，不存在“GUI 能点、CLI 不能点”这类差异。
+统一控制入口是 `aad control serve` 和 MCP 的 `control_*` 工具：Windows UIA、Linux AT-SPI、
+macOS AX 与显式启用的 Chromium CDP 共用会话、资源、观察引用和类型化动作。
+`aad mcp --connect` 可通过已有的认证 SSH 连接控制远程环境；服务端默认只读，授权由服务端启动参数决定。
+详见[统一控制与远程会话](docs/control-sessions.md)。
 
-当前交互式 CLI/MCP/GUI 的 driver 是 Windows UIA。Linux AT-SPI 与 macOS AX 已有独立的
-workflow provider，但尚未接入这三个交互入口；CDP 目前提供浏览器观察，完整 browser-use
-动作接口仍待实现。远程 stdio 示例、统一合约提案与功能缺口见
-[控制能力审视](docs/research/control-audit-2026-10-17.md)。
+原有 `apps/describe/find/do` CLI、旧 MCP 工具和 GUI 仍主要使用 Windows UIA。
+GUI 尚未迁入新会话层；录制、回放和事件观察的限制见[控制能力审视](docs/research/control-audit-2026-10-17.md)。
 
 ## 安全模型：先观察，才能操作
 
@@ -31,7 +32,8 @@ MCP 工具 schema **不接受任何** `x` / `y` / `point` / `coordinates` / `pos
 
 ## 快速开始
 
-开发环境可使用已发布的 one-sdk 0.0.6（无需依赖 one-sdk 的草稿 PR）：
+开发环境使用正式发布的 one-sdk（无需依赖草稿 PR）；CI 使用官方
+`lejunyang/one-sdk@main` Action，显式设置 `version: latest`，Rust 仍由项目配置固定：
 
 ```powershell
 osdk install                    # Rust 1.98.0 + rustfmt/clippy
@@ -40,6 +42,7 @@ osdk run fmt-check
 osdk run test                   # 不包含需要 Tauri 系统依赖的 GUI
 osdk run clippy
 osdk run plugin-test
+osdk run control-test           # 统一控制、传输与 MCP/CLI 回归
 osdk run ci --dry-run           # 查看聚合检查；原生 fixture 仍需各平台环境
 ```
 
