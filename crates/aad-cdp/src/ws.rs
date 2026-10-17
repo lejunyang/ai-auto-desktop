@@ -70,11 +70,20 @@ const MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
 
 impl WebSocket {
     /// Connect to a `ws://host:port/path` URL.
+    #[cfg(test)]
     pub fn connect_url(url: &str) -> Result<Self, CdpError> {
+        Self::connect_until(url, Instant::now() + std::time::Duration::from_secs(10))
+    }
+
+    pub fn connect_until(url: &str, deadline: Instant) -> Result<Self, CdpError> {
         let (address, path) = local_endpoint(url)?;
         let host_port = address.to_string();
-        let mut stream = TcpStream::connect(address)
+        let timeout = deadline
+            .checked_duration_since(Instant::now())
+            .ok_or_else(|| CdpError::connect("deadline elapsed"))?;
+        let mut stream = TcpStream::connect_timeout(&address, timeout)
             .map_err(|error| CdpError::connect(format!("{host_port}: {error}")))?;
+        stream.set_nonblocking(false).map_err(CdpError::io)?;
         stream
             .set_read_timeout(Some(std::time::Duration::from_secs(10)))
             .map_err(CdpError::io)?;
@@ -98,6 +107,13 @@ impl WebSocket {
         let mut response = Vec::new();
         let mut byte = [0u8; 1];
         loop {
+            stream
+                .set_read_timeout(Some(
+                    deadline
+                        .checked_duration_since(Instant::now())
+                        .ok_or_else(|| CdpError::connect("handshake timed out"))?,
+                ))
+                .map_err(CdpError::io)?;
             stream.read_exact(&mut byte).map_err(CdpError::io)?;
             response.push(byte[0]);
             if response.ends_with(b"\r\n\r\n") {
@@ -123,13 +139,25 @@ impl WebSocket {
         Ok(WebSocket { stream })
     }
 
+    pub fn set_write_deadline(&self, deadline: Instant) -> Result<(), CdpError> {
+        self.stream
+            .set_write_timeout(Some(
+                deadline
+                    .checked_duration_since(Instant::now())
+                    .ok_or_else(|| CdpError::connect("deadline elapsed"))?,
+            ))
+            .map_err(CdpError::io)
+    }
+
     /// Send a client text frame, masked per RFC 6455.
     pub fn send_text(&mut self, text: &str) -> Result<(), CdpError> {
-        let payload = text.as_bytes();
+        self.send_frame(1, text.as_bytes())
+    }
+    fn send_frame(&mut self, opcode: u8, payload: &[u8]) -> Result<(), CdpError> {
         let random = uuid::Uuid::new_v4();
         let mask: [u8; 4] = random.as_bytes()[..4].try_into().unwrap();
         let mut frame = Vec::with_capacity(payload.len() + 14);
-        frame.push(0x81); // FIN + text
+        frame.push(0x80 | opcode);
         let len = payload.len();
         if len < 126 {
             frame.push(0x80 | len as u8);
@@ -158,10 +186,14 @@ impl WebSocket {
                 .set_read_timeout(Some(remaining))
                 .map_err(CdpError::io)?;
 
-            let frame = self.read_frame()?;
+            let frame = self.read_frame(deadline)?;
             match frame.opcode {
                 0x8 => return Err(CdpError::protocol("connection closed by peer")),
-                0x9 | 0xA => continue, // ping/pong: ignore (we never ping)
+                0x9 => {
+                    self.send_frame(0xA, &frame.payload)?;
+                    continue;
+                }
+                0xA => continue,
                 _ => {}
             }
 
@@ -197,37 +229,54 @@ impl WebSocket {
         }
     }
 
-    fn read_frame(&mut self) -> Result<Frame, CdpError> {
+    fn read_exact_until(
+        &mut self,
+        mut bytes: &mut [u8],
+        deadline: Instant,
+    ) -> Result<(), CdpError> {
+        while !bytes.is_empty() {
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .ok_or_else(|| CdpError::connect("cdp read timed out"))?;
+            self.stream
+                .set_read_timeout(Some(remaining))
+                .map_err(CdpError::io)?;
+            let count = self.stream.read(bytes).map_err(CdpError::io)?;
+            if count == 0 {
+                return Err(CdpError::protocol("unexpected end of websocket frame"));
+            }
+            bytes = &mut bytes[count..];
+        }
+        Ok(())
+    }
+    fn read_frame(&mut self, deadline: Instant) -> Result<Frame, CdpError> {
         let mut head = [0u8; 2];
-        self.stream.read_exact(&mut head).map_err(CdpError::io)?;
+        self.read_exact_until(&mut head, deadline)?;
         let fin = head[0] & 0x80 != 0;
         let opcode = head[0] & 0x0F;
         let masked = head[1] & 0x80 != 0;
+        if head[0] & 0x70 != 0 || masked || !matches!(opcode, 0 | 1 | 2 | 8 | 9 | 10) {
+            return Err(CdpError::protocol("invalid server frame"));
+        }
         let mut len = (head[1] & 0x7F) as u64;
         if len == 126 {
             let mut ext = [0u8; 2];
-            self.stream.read_exact(&mut ext).map_err(CdpError::io)?;
+            self.read_exact_until(&mut ext, deadline)?;
             len = u16::from_be_bytes(ext) as u64;
         } else if len == 127 {
             let mut ext = [0u8; 8];
-            self.stream.read_exact(&mut ext).map_err(CdpError::io)?;
+            self.read_exact_until(&mut ext, deadline)?;
             len = u64::from_be_bytes(ext);
         }
         // Cap a single message generously: CDP dumps can be large.
         if len > MAX_MESSAGE_BYTES as u64 {
             return Err(CdpError::protocol("frame too large"));
         }
-        let mut mask = [0u8; 4];
-        if masked {
-            self.stream.read_exact(&mut mask).map_err(CdpError::io)?;
+        if opcode >= 8 && (!fin || len > 125) {
+            return Err(CdpError::protocol("invalid control frame"));
         }
         let mut payload = vec![0u8; len as usize];
-        self.stream.read_exact(&mut payload).map_err(CdpError::io)?;
-        if masked {
-            for (index, byte) in payload.iter_mut().enumerate() {
-                *byte ^= mask[index % 4];
-            }
-        }
+        self.read_exact_until(&mut payload, deadline)?;
         Ok(Frame {
             fin,
             opcode,
@@ -293,6 +342,52 @@ mod tests {
     fn invalid_continuation_sequences_are_rejected() {
         assert!(receive(&[0x80, 0]).is_err());
         assert!(receive(&[0x01, 0, 0x81, 0]).is_err());
+    }
+
+    #[test]
+    fn a_trickling_frame_cannot_reset_the_absolute_deadline() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let stream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut peer, _) = listener.accept().unwrap();
+        let writer = std::thread::spawn(move || {
+            peer.write_all(&[0x81, 4]).unwrap();
+            for byte in b"test" {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+                if peer.write_all(&[*byte]).is_err() {
+                    break;
+                }
+            }
+        });
+        let mut client = WebSocket { stream };
+        let started = Instant::now();
+        assert!(client
+            .recv_until(started + std::time::Duration::from_millis(60))
+            .is_err());
+        assert!(started.elapsed() < std::time::Duration::from_millis(300));
+        drop(client);
+        writer.join().unwrap();
+    }
+    #[test]
+    fn ping_is_answered_with_a_masked_pong_while_waiting_for_cdp() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let stream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut peer, _) = listener.accept().unwrap();
+        peer.set_read_timeout(Some(std::time::Duration::from_secs(1)))
+            .unwrap();
+        peer.write_all(&[0x89, 1, b'p', 0x81, 2, b'{', b'}'])
+            .unwrap();
+        let mut client = WebSocket { stream };
+        assert_eq!(
+            client
+                .recv_until(Instant::now() + std::time::Duration::from_secs(1))
+                .unwrap()
+                .as_text(),
+            "{}"
+        );
+        let mut reply = [0; 7];
+        peer.read_exact(&mut reply).unwrap();
+        assert_eq!(&reply[..2], &[0x8A, 0x81]);
+        assert_eq!(reply[6] ^ reply[2], b'p');
     }
 
     #[test]

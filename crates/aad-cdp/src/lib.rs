@@ -6,8 +6,9 @@
 //! See `docs/research/electron-cdp-observation.md`.
 //!
 //! Security posture:
-//! - only connects to `127.0.0.1:<port>`; never opens the browser, never
-//!   navigates or dispatches input (no `Input.*`, no `Page.navigate`);
+//! - only connects to loopback; the ambient observer never opens the browser,
+//!   navigates or dispatches input. `aad-control` uses the trusted low-level
+//!   command primitive for separately authorized, observed-element actions;
 //! - the browser must already be running with `--remote-debugging-port`;
 //! - the injected script only attaches passive listeners and queues events;
 //!   it is removed by a page reload/navigation and re-installed by
@@ -70,13 +71,20 @@ pub struct PageState {
 pub struct Client {
     ws: ws::WebSocket,
     next_id: u64,
+    deadline: Option<std::time::Instant>,
 }
 
 impl Client {
     /// List debuggable targets over HTTP. Returns an error when no browser is
     /// listening on `port`, so callers can fall back to UIA.
     pub fn list_targets(port: u16) -> Result<Vec<Target>, CdpError> {
-        let body = http_get(port, "/json/list")?;
+        Self::list_targets_until(port, std::time::Instant::now() + Duration::from_secs(3))
+    }
+    pub fn list_targets_until(
+        port: u16,
+        deadline: std::time::Instant,
+    ) -> Result<Vec<Target>, CdpError> {
+        let body = http_get_until(port, "/json/list", deadline)?;
         let targets: Vec<Target> = serde_json::from_str(&body)
             .map_err(|error| CdpError::protocol(format!("could not parse /json/list: {error}")))?;
         Ok(targets
@@ -104,10 +112,33 @@ impl Client {
 
     /// Attach to one page target over its WebSocket URL.
     pub fn attach(target: &Target) -> Result<Self, CdpError> {
-        let ws = ws::WebSocket::connect_url(&target.webSocketDebuggerUrl)?;
-        let mut client = Client { ws, next_id: 0 };
+        Self::attach_until(target, std::time::Instant::now() + Duration::from_secs(10))
+    }
+
+    pub fn attach_until(target: &Target, deadline: std::time::Instant) -> Result<Self, CdpError> {
+        let ws = ws::WebSocket::connect_until(&target.webSocketDebuggerUrl, deadline)?;
+        let mut client = Client {
+            ws,
+            next_id: 0,
+            deadline: Some(deadline),
+        };
         client.enable_runtime()?;
+        client.deadline = None;
         Ok(client)
+    }
+
+    /// Deadline for a trusted application's sequence of CDP calls. This is a
+    /// library primitive, never a pass-through method exposed to AI clients.
+    pub fn set_deadline(&mut self, deadline: std::time::Instant) {
+        self.deadline = Some(deadline);
+    }
+
+    pub fn command(
+        &mut self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, CdpError> {
+        self.send(method, params)
     }
 
     fn send(
@@ -118,12 +149,15 @@ impl Client {
         self.next_id += 1;
         let id = self.next_id;
         let message = serde_json::json!({"id": id, "method": method, "params": params});
+        let deadline = self
+            .deadline
+            .unwrap_or_else(|| std::time::Instant::now() + Duration::from_secs(8));
+        self.ws.set_write_deadline(deadline)?;
         self.ws
             .send_text(&serde_json::to_string(&message).unwrap())?;
 
         // Read until the matching response, queuing any unrelated frames to the
         // internal buffer (handled by the WebSocket itself).
-        let deadline = std::time::Instant::now() + Duration::from_secs(8);
         loop {
             let frame = self.ws.recv_until(deadline)?;
             if !frame.is_text() {
@@ -202,14 +236,25 @@ impl Client {
 }
 
 fn http_get(port: u16, path: &str) -> Result<String, CdpError> {
-    // A plain blocking connect. An earlier connect_timeout form left the
-    // socket nonblocking on Windows, which made the subsequent HTTP read fail
-    // (measured: plain TcpStream::connect succeeds where the timeout form
-    // timed out). Cold-start waiting is the caller's job (Client::version).
-    let mut stream = TcpStream::connect(format!("127.0.0.1:{port}"))
+    http_get_until(
+        port,
+        path,
+        std::time::Instant::now() + Duration::from_secs(3),
+    )
+}
+fn http_get_until(port: u16, path: &str, deadline: std::time::Instant) -> Result<String, CdpError> {
+    let remaining = || {
+        deadline
+            .checked_duration_since(std::time::Instant::now())
+            .ok_or_else(|| CdpError::connect("HTTP deadline elapsed"))
+    };
+    let address = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let mut stream = TcpStream::connect_timeout(&address, remaining()?)
         .map_err(|error| CdpError::connect(format!("port {port}: {error}")))?;
+    // Explicitly restore blocking mode after connect_timeout, including Windows.
+    stream.set_nonblocking(false).map_err(CdpError::io)?;
     stream
-        .set_read_timeout(Some(Duration::from_secs(3)))
+        .set_write_timeout(Some(remaining()?))
         .map_err(CdpError::io)?;
     let request =
         format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n");
@@ -221,18 +266,23 @@ fn http_get(port: u16, path: &str) -> Result<String, CdpError> {
     let mut raw = Vec::new();
     let mut chunk = [0u8; 4096];
     let mut content_length: Option<usize> = None;
+    let mut header_end = None;
     loop {
+        stream
+            .set_read_timeout(Some(remaining()?))
+            .map_err(CdpError::io)?;
         let read = stream.read(&mut chunk).map_err(CdpError::io)?;
         if read == 0 {
             break;
         }
         raw.extend_from_slice(&chunk[..read]);
-        if content_length.is_none() {
+        if header_end.is_none() {
             if let Some(headers) = raw
                 .windows(4)
                 .position(|window| window == b"\r\n\r\n")
                 .map(|split| split + 4)
             {
+                header_end = Some(headers);
                 let header_text = String::from_utf8_lossy(&raw[..headers]);
                 let status_ok = header_text.starts_with("HTTP/1.1 200");
                 if !status_ok {
@@ -241,20 +291,28 @@ fn http_get(port: u16, path: &str) -> Result<String, CdpError> {
                         header_text.lines().next().unwrap_or("")
                     )));
                 }
-                content_length = header_text.lines().find_map(|line| {
-                    line.to_ascii_lowercase()
-                        .strip_prefix("content-length:")
-                        .and_then(|value| value.trim().parse::<usize>().ok())
-                });
+                for line in header_text.lines() {
+                    let line = line.to_ascii_lowercase();
+                    if let Some(value) = line.strip_prefix("content-length:") {
+                        let value = value
+                            .trim()
+                            .parse::<usize>()
+                            .map_err(|_| CdpError::protocol("invalid content length"))?;
+                        if value > 16 * 1024 * 1024 {
+                            return Err(CdpError::protocol("http response too large"));
+                        }
+                        content_length = Some(value);
+                    }
+                }
+            } else if raw.len() > 16384 {
+                return Err(CdpError::protocol("http header too large"));
             }
         }
-        if let Some(length) = content_length {
-            if let Some(headers_end) = raw.windows(4).position(|window| window == b"\r\n\r\n") {
-                let body_start = headers_end + 4;
-                if raw.len() >= body_start + length {
-                    raw.truncate(body_start + length);
-                    break;
-                }
+        if let (Some(length), Some(body_start)) = (content_length, header_end) {
+            let end = body_start + length;
+            if raw.len() >= end {
+                raw.truncate(end);
+                break;
             }
         }
         if raw.len() > 16 * 1024 * 1024 {
@@ -262,13 +320,12 @@ fn http_get(port: u16, path: &str) -> Result<String, CdpError> {
         }
     }
 
-    let text = String::from_utf8_lossy(&raw);
-    let body = text
-        .split_once("\r\n\r\n")
-        .map(|(_, body)| body)
-        .unwrap_or("")
-        .to_string();
-    Ok(body)
+    let start = header_end.ok_or_else(|| CdpError::protocol("incomplete HTTP header"))?;
+    if content_length.is_some_and(|length| raw.len() - start != length) {
+        return Err(CdpError::protocol("incomplete HTTP body"));
+    }
+    String::from_utf8(raw[start..].to_vec())
+        .map_err(|_| CdpError::protocol("HTTP body is not UTF-8"))
 }
 
 /// Script installed into every observed page.
@@ -390,3 +447,59 @@ const STATE_JS: &str = r#"
   text: (document.body ? document.body.innerText : "").slice(0, 200000),
 }))()
 "#;
+
+#[cfg(test)]
+mod http_tests {
+    use super::*;
+    use std::net::TcpListener;
+    use std::time::Instant;
+    fn server(response: Vec<u8>, trickle: bool) -> (u16, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let worker = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
+            let mut request = [0; 1024];
+            let _ = stream.read(&mut request);
+            if trickle {
+                for byte in response {
+                    std::thread::sleep(Duration::from_millis(15));
+                    if stream.write_all(&[byte]).is_err() {
+                        break;
+                    }
+                }
+            } else {
+                let _ = stream.write_all(&response);
+            }
+        });
+        (port, worker)
+    }
+    #[test]
+    fn malicious_content_length_is_rejected_without_integer_overflow() {
+        let (port, worker) = server(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n[]",
+                usize::MAX
+            )
+            .into_bytes(),
+            false,
+        );
+        assert!(
+            http_get_until(port, "/json/list", Instant::now() + Duration::from_secs(1)).is_err()
+        );
+        worker.join().unwrap();
+    }
+    #[test]
+    fn discovery_uses_the_request_deadline_even_when_headers_trickle() {
+        let (port, worker) = server(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n[]".to_vec(),
+            true,
+        );
+        let start = Instant::now();
+        assert!(Client::list_targets_until(port, start + Duration::from_millis(60)).is_err());
+        assert!(start.elapsed() < Duration::from_millis(300));
+        worker.join().unwrap();
+    }
+}
