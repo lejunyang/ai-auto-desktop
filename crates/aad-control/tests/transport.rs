@@ -234,9 +234,14 @@ fn disconnect_during_input_is_unknown_and_never_retried() {
         assert!(Instant::now() < deadline);
         std::thread::yield_now();
     }
+    // Use the public close operation to wake pending callers deterministically.
+    // TCP shutdown on Windows may still deliver the server's cancellation reply
+    // through a cloned handle; both paths must retain an unknown input outcome.
+    h.client.disconnect();
     h.socket.shutdown(Shutdown::Both).unwrap();
     let response = worker.join().unwrap();
     assert_eq!(response.effect, "unknown");
+    assert_eq!(response.commit_state, CommitState::Unknown);
     assert_eq!(response.error.unwrap()["code"], "CONTROL.DISCONNECTED");
     assert_eq!(h.backend.writes.load(Ordering::SeqCst), 1);
 }
