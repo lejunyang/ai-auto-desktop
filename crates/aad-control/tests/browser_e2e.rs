@@ -29,6 +29,7 @@ struct Fixture {
     server: Option<std::thread::JoinHandle<()>>,
     port: u16,
     url: String,
+    page_id: String,
 }
 impl Fixture {
     fn new() -> Self {
@@ -99,6 +100,7 @@ impl Fixture {
             server: Some(server),
             port: 0,
             url,
+            page_id: String::new(),
         };
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {
@@ -115,14 +117,27 @@ impl Fixture {
             assert!(Instant::now() < deadline, "Chromium startup timed out");
             std::thread::sleep(Duration::from_millis(25));
         }
+        // Bind the raw verifier to one explicit page identity. URL discovery is
+        // only for initial startup; navigation can temporarily publish an empty
+        // URL and must never redirect this verifier to another page.
+        loop {
+            if let Ok(targets) = aad_cdp::Client::list_targets(fixture.port) {
+                if let Some(target) = targets.iter().find(|t| t.url.starts_with(&fixture.url)) {
+                    fixture.page_id = target.id.clone();
+                    break;
+                }
+            }
+            assert!(Instant::now() < deadline, "fixture page startup timed out");
+            std::thread::sleep(Duration::from_millis(20));
+        }
         fixture
     }
     fn client(&self) -> aad_cdp::Client {
         let target = aad_cdp::Client::list_targets(self.port)
             .unwrap()
             .into_iter()
-            .find(|t| t.url.starts_with(&self.url))
-            .unwrap();
+            .find(|t| t.id == self.page_id)
+            .expect("the fixture's explicit page target disappeared");
         aad_cdp::Client::attach(&target).unwrap()
     }
 }
