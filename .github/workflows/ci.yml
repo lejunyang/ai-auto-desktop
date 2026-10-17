@@ -24,9 +24,12 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      # Branch refs default to the latest osdk release; explicit for clarity.
+      # Rust and its components remain pinned by osdk.toml/osdk.lock.
+      - uses: lejunyang/one-sdk@main
         with:
-          components: clippy, rustfmt
+          version: latest
+          install-deps: false
       - uses: Swatinem/rust-cache@v2
       - uses: actions/setup-python@v5
         if: runner.os == 'Windows'

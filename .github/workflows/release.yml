@@ -95,7 +95,10 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: lejunyang/one-sdk@main
+        with:
+          version: latest
+          install-deps: false
       - uses: Swatinem/rust-cache@v2
       - uses: actions/setup-python@v5
         if: runner.os == 'Windows'
@@ -181,9 +184,12 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: lejunyang/one-sdk@main
         with:
-          targets: ${{ matrix.target }}
+          version: latest
+          install-deps: false
+      - name: Install the release compilation target
+        run: rustup target add ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
@@ -273,7 +279,10 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: lejunyang/one-sdk@main
+        with:
+          version: latest
+          install-deps: false
       - uses: Swatinem/rust-cache@v2
         with:
           key: tauri-windows
@@ -317,7 +326,10 @@ jobs:
     environment: release
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: lejunyang/one-sdk@main
+        with:
+          version: latest
+          install-deps: false
       - uses: Swatinem/rust-cache@v2
 
       - name: Dry-run the publish
