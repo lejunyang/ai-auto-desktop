@@ -14,7 +14,10 @@ impl InputLease {
         Self::in_directory(&directory(), key)
     }
     fn in_directory(directory: &Path, key: &str) -> Result<Self> {
+        #[cfg(unix)]
         let mut builder = std::fs::DirBuilder::new();
+        #[cfg(not(unix))]
+        let builder = std::fs::DirBuilder::new();
         #[cfg(unix)]
         {
             use std::os::unix::fs::DirBuilderExt;
