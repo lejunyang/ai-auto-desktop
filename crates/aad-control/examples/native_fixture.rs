@@ -5,6 +5,7 @@ use aad_control::{
 };
 use serde_json::Value;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 fn data(response: Response) -> Value {
     assert!(response.error.is_none(), "{response:?}");
@@ -58,6 +59,22 @@ fn main() {
             },
         )
     };
+    // AT-SPI acknowledges dispatch before Qt's event loop necessarily updates
+    // the accessible tree. Poll actual observations, never the action reply.
+    let observe_until = |expected: &dyn Fn(&Value) -> bool| {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let observation = observe();
+            if expected(&observation) {
+                break observation;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "GUI postcondition timed out: {observation}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
     let first = observe();
     let reset = request(
         endpoint.as_ref(),
@@ -77,12 +94,13 @@ fn main() {
             action: Action::Invoke {},
         },
     );
-    let first = observe();
-    assert!(first["nodes"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|n| n["name"] == "Qt fixture status idle"));
+    let first = observe_until(&|observation| {
+        observation["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|n| n["name"] == "Qt fixture status idle")
+    });
     let found = request(
         endpoint.as_ref(),
         Operation::Find {
@@ -103,12 +121,12 @@ fn main() {
             },
         },
     );
-    let after = observe();
-    assert!(after["nodes"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|n| n["name"] == "Qt fixture text entry" && n["value"] == "Unified native control"));
+    let after =
+        observe_until(&|observation| {
+            observation["nodes"].as_array().unwrap().iter().any(|n| {
+                n["name"] == "Qt fixture text entry" && n["value"] == "Unified native control"
+            })
+        });
     let found = request(
         endpoint.as_ref(),
         Operation::Find {
@@ -127,12 +145,13 @@ fn main() {
             action: Action::Invoke {},
         },
     );
-    let after = observe();
-    assert!(after["nodes"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|n| n["name"] == "Qt fixture status invoked"));
+    observe_until(&|observation| {
+        observation["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|n| n["name"] == "Qt fixture status invoked")
+    });
     request(endpoint.as_ref(), Operation::Close {});
     println!("Unified CLI/native/remote-session fixture passed");
 }
