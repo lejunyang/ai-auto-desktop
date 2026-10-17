@@ -3,6 +3,21 @@
 范围：云端隔离 checkout，main `255070a`；未连接用户 Mac、Windows 桌面或移动设备。
 本次修复故障与现有安全边界，不实现新的公网控制服务，不更改工作流版本。
 
+后续实现见 [PR #2](https://github.com/lejunyang/ai-auto-desktop/pull/2) 与
+[统一控制与远程会话](../control-sessions.md)：`aad-control/1` 已接入三平台原生 provider、
+browser observe/find/click/fill/key，以及 CLI/MCP 的持久 stdio/SSH 会话。
+下面的原始表格描述 `255070a` 的审视结果；其中“尚未实现”的 P1 合约、交互 facade、
+浏览器动作和远程会话现由后续 PR 处理。CI/release 也已改用官方 one-sdk Action 的最新正式 osdk。
+
+当前剩余优先级：
+
+| 优先级 | 剩余范围 | 已有边界 / 证据 |
+| --- | --- | --- |
+| P1 | Windows 输入桌面、macOS TCC 及真实跨机器 SSH 的效果验证 | 新路由有三平台 adapter mock、真实子进程 stdio 与严格 CI；不把 mock 或只读探针等同于真机输入成功。 |
+| P1 | 远端进程与 GUI 用户环境的部署 | 已有 SSH 负责认证/加密；服务端固定 provider/resource/input 授权。仍需在部署机器验证显示服务、DBus 或 TCC 环境；没有公网监听或凭证创建。 |
+| P2 | Android wire adapter、跨平台统一 key、浏览器 OOPIF/原生指针 | 对齐 session/resource/target 与 commit_state；当前 provider 明确报告支持集合，无不安全 fallback。 |
+| P2 | GUI 迁移、录制/回放和事件完整性 | GUI/旧 CLI 仍主要为 Windows；下面列出的观察丢失、顺序与录制限制尚未扩展，不能声称统一无损回放。 |
+
 ## 优先级与现状
 
 | 优先级 | 结论 / 证据 | 本次处理 / 后续 |
