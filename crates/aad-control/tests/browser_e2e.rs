@@ -162,18 +162,19 @@ fn observe(session: &Session, resource: &str) -> Value {
     assert!(response.error.is_none(), "{response:?}");
     response.data.unwrap()
 }
-fn find(session: &Session, observation: &Value, name: &str) -> Target {
+fn find(session: &Session, observation: &Value, role: &str, name: &str) -> Target {
     let response = call(
         session,
         Operation::Find {
             observation_id: observation["observation_id"].as_str().unwrap().into(),
             locator: Locator {
                 name: Some(name.into()),
+                role: Some(role.into()),
                 ..Default::default()
             },
         },
     );
-    assert!(response.error.is_none(), "{response:?}");
+    assert!(response.error.is_none(), "find {role}/{name}: {response:?}");
     serde_json::from_value(response.data.unwrap()["target"].clone()).unwrap()
 }
 fn act(session: &Session, target: Target, action: Action) -> Response {
@@ -233,7 +234,7 @@ fn browser_actions_are_observed_document_bound_and_have_real_page_effects() {
         .as_str()
         .unwrap();
     let first = observe(&session, main);
-    let target = find(&session, &first, "Name");
+    let target = find(&session, &first, "textbox", "Name");
     // A read-only peer must have its own isolated world, not overwrite this
     // connection's node/observation map merely by observing the same document.
     let reader = Session::new(
@@ -276,7 +277,7 @@ fn browser_actions_are_observed_document_bound_and_have_real_page_effects() {
     .is_none());
     let observed = observe(&session, main);
     assert_eq!(status(&observed), "fill:hello from fixture");
-    let target = find(&session, &observed, "Name");
+    let target = find(&session, &observed, "textbox", "Name");
     let result = act(
         &session,
         target,
@@ -287,11 +288,11 @@ fn browser_actions_are_observed_document_bound_and_have_real_page_effects() {
     assert!(result.error.is_none(), "{result:?}");
     let observed = observe(&session, main);
     assert_eq!(status(&observed), "key:true");
-    let target = find(&session, &observed, "Save");
+    let target = find(&session, &observed, "button", "Save");
     assert!(act(&session, target, Action::Click {}).error.is_none());
     let observed = observe(&session, main);
     assert_eq!(status(&observed), "clicked:false");
-    let target = find(&session, &observed, "Save");
+    let target = find(&session, &observed, "button", "Save");
     fixture
         .client()
         .eval("document.getElementById('save').setAttribute('aria-label','Replaced')")
@@ -300,7 +301,7 @@ fn browser_actions_are_observed_document_bound_and_have_real_page_effects() {
     assert_eq!(stale.effect, "not_applied");
     assert_eq!(stale.error.unwrap()["code"], "CONTROL.STALE_TARGET");
     let observed = observe(&session, frame);
-    let frame_target = find(&session, &observed, "FrameInput");
+    let frame_target = find(&session, &observed, "textbox", "FrameInput");
     let mut forged = frame_target.clone();
     forged.resource_id = main.into();
     assert_eq!(
@@ -334,7 +335,7 @@ fn browser_actions_are_observed_document_bound_and_have_real_page_effects() {
             .unwrap()["value"],
         "inside frame"
     );
-    let old_frame_target = find(&session, &observed, "FrameInput");
+    let old_frame_target = find(&session, &observed, "textbox", "FrameInput");
     let old_frame = resources["resources"]
         .as_array()
         .unwrap()
@@ -365,7 +366,7 @@ fn browser_actions_are_observed_document_bound_and_have_real_page_effects() {
     assert_eq!(stale.commit_state, CommitState::NotCommitted);
     assert_eq!(stale.error.unwrap()["code"], "CONTROL.STALE_TARGET");
     let observed = observe(&session, main);
-    let target = find(&session, &observed, "Name");
+    let target = find(&session, &observed, "textbox", "Name");
     fixture
         .client()
         .command(
