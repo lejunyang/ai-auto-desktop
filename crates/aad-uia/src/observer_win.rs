@@ -521,7 +521,7 @@ fn observe_pump(
     while !stop.load(Ordering::SeqCst) {
         let mut message = MSG::default();
         while unsafe { PeekMessageW(&mut message, None, 0, 0, PM_REMOVE) }.as_bool() {
-            unsafe { DispatchMessageW(&mut message) };
+            unsafe { DispatchMessageW(&message) };
         }
         std::thread::sleep(PUMP_TICK);
     }
