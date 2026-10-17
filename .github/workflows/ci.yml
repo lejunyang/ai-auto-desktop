@@ -43,11 +43,16 @@ jobs:
         run: |
           set -euo pipefail
           test ! -f pyproject.toml
-          if git ls-files '*.py' '*.pyi' | grep -q .; then
+          # Windows hardware probes are test harnesses, not a second shipped
+          # implementation. Keep them, while still rejecting Python elsewhere.
+          if git ls-files '*.py' '*.pyi' ':!:tests/windows/*.py' | grep -q .; then
             echo "tracked Python implementation files remain" >&2
-            git ls-files '*.py' '*.pyi' >&2
+            git ls-files '*.py' '*.pyi' ':!:tests/windows/*.py' >&2
             exit 1
           fi
+      - name: Check retained Windows hardware probes
+        if: runner.os == 'Windows'
+        run: python -m compileall -q tests/windows
       - name: Install Linux native driver test dependencies
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends xvfb xauth dbus-x11 at-spi2-core g++ pkg-config qtbase5-dev libx11-dev libxtst-dev
