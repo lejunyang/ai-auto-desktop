@@ -210,7 +210,7 @@ fn http_get(port: u16, path: &str) -> Result<String, CdpError> {
         .map_err(|error| CdpError::connect(format!("port {port}: {error}")))?;
     stream
         .set_read_timeout(Some(Duration::from_secs(3)))
-        .map_err(|error| CdpError::io(error))?;
+        .map_err(CdpError::io)?;
     let request =
         format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n");
     stream.write_all(request.as_bytes()).map_err(CdpError::io)?;

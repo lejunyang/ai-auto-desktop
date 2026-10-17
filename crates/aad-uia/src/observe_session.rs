@@ -127,7 +127,7 @@ impl Default for ObserveManager {
     }
 }
 
-fn required<'a>(args: &'a Value, name: &str) -> Result<String> {
+fn required(args: &Value, name: &str) -> Result<String> {
     args.get(name)
         .and_then(Value::as_str)
         .map(str::to_string)

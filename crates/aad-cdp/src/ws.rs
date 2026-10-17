@@ -2,7 +2,7 @@
 //!
 //! Just enough to talk to a local CDP endpoint: connect with the required key
 //! handshake, send unmasked/masked text frames, and reassemble fragmented or
-//! >64KiB responses. No TLS (CDP here is 127.0.0.1 plaintext only), no
+//! responses larger than 64 KiB. No TLS (CDP here is loopback plaintext only), no
 //! extensions, no server role.
 
 use base64::Engine;
@@ -261,6 +261,14 @@ fn local_endpoint(url: &str) -> Result<(SocketAddr, &str), CdpError> {
     Ok((address, path))
 }
 
+fn websocket_accept(key: &str) -> String {
+    let mut hasher = Sha1::new();
+    hasher.update(key.as_bytes());
+    hasher.update(b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
+    let digest = hasher.finalize();
+    base64::engine::general_purpose::STANDARD.encode(digest)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -319,12 +327,4 @@ mod tests {
             assert!(path.starts_with("/devtools/page/1"));
         }
     }
-}
-
-fn websocket_accept(key: &str) -> String {
-    let mut hasher = Sha1::new();
-    hasher.update(key.as_bytes());
-    hasher.update(b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
-    let digest = hasher.finalize();
-    base64::engine::general_purpose::STANDARD.encode(digest)
 }

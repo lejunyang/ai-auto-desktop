@@ -1416,17 +1416,9 @@ fn run_watch(args: &WatchArgs) -> (Value, u8) {
                     continue;
                 }
             }
-            if let Err(error) = resnapshot_and_diff(
-                &driver,
-                &mut sink,
-                &mut baselines,
-                &window_id,
-                args.max_nodes,
-                args.full,
-                args.raw,
-                args.max_items,
-                &emit,
-            ) {
+            if let Err(error) =
+                resnapshot_and_diff(&driver, &mut sink, &mut baselines, &window_id, args, &emit)
+            {
                 // A window closing mid-switch is normal: skip it this round,
                 // keep watching. Persistent errors still surface on stderr.
                 eprintln!("watch: snapshot of {window_id} skipped: {}", error.message);
@@ -1464,22 +1456,19 @@ fn resnapshot_and_diff(
     sink: &mut Box<dyn std::io::Write>,
     baselines: &mut std::collections::HashMap<String, aad_uia::Snapshot>,
     window_id: &str,
-    max_nodes: u32,
-    full_first: bool,
-    raw: bool,
-    max_items: usize,
+    args: &WatchArgs,
     emit: &impl Fn(&mut Box<dyn std::io::Write>, Value),
 ) -> Result<(), aad_uia::DriverError> {
     let captured = driver.call(
         "snapshot",
-        &json!({"window_id": window_id, "max_nodes": max_nodes}),
+        &json!({"window_id": window_id, "max_nodes": args.max_nodes}),
     )?;
     let snapshot: aad_uia::Snapshot = serde_json::from_value(captured.clone())
         .map_err(|error| aad_uia::DriverError::invalid(format!("bad snapshot json: {error}")))?;
 
     match baselines.get(window_id) {
         None => {
-            if full_first {
+            if args.full {
                 emit(
                     sink,
                     json!({
@@ -1499,7 +1488,7 @@ fn resnapshot_and_diff(
                 baselines.insert(window_id.to_string(), snapshot);
                 return Ok(());
             }
-            if raw {
+            if args.raw {
                 let (added, removed, changed) = changes.counts();
                 emit(
                     sink,
@@ -1521,7 +1510,7 @@ fn resnapshot_and_diff(
                 let digest = aad_uia::digest(
                     &changes,
                     &aad_uia::DigestOptions {
-                        max_items,
+                        max_items: args.max_items,
                         include_states: true,
                     },
                 );

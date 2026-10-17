@@ -56,7 +56,7 @@ impl CdpWatcher {
         // Attach lazily and reuse the WebSocket; re-pick if a stored client
         // died (target navigated/reloaded changes target ids anyway).
         if !self.clients.contains_key(&target_id) {
-            let client = Client::attach(&target).ok()?;
+            let client = Client::attach(target).ok()?;
             self.clients.insert(
                 target_id.clone(),
                 AttachedPage {

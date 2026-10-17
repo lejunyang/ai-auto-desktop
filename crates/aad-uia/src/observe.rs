@@ -608,7 +608,6 @@ pub fn digest(changes: &ChangeSet, options: &DigestOptions) -> ChangeDigest {
 
     let mut appeared = appeared;
     let mut disappeared = disappeared;
-    let mut text_changes = text_changes;
     appeared.sort_by(|a, b| a.identity.cmp(&b.identity));
     disappeared.sort_by(|a, b| a.identity.cmp(&b.identity));
     text_changes.sort_by(|a, b| a.name.cmp(&b.name));
@@ -1020,7 +1019,7 @@ mod tests {
         // snapshot); the pairing contract is exercised directly here.
         let transient = snapshot(vec![menu("m")]);
         let added_changes = diff_trees(&baseline, &transient);
-        let mut digest_open = digest(&added_changes, &DigestOptions::default());
+        let digest_open = digest(&added_changes, &DigestOptions::default());
         assert_eq!(digest_open.appeared.len(), 1);
         // Feed the closing batch: same content disappeared, no added.
         let removed: Vec<RemovedNode> = added_changes
