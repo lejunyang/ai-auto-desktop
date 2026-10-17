@@ -115,10 +115,30 @@ pub struct Response {
     pub request_id: String,
     pub session_id: String,
     pub effect: String,
+    pub commit_state: CommitState,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub data: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<Value>,
+}
+
+/// Shared with mobile control. Native effect details remain in `effect` and
+/// the structured error; this coarse state must never enable unknown retries.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CommitState {
+    NotCommitted,
+    Committed,
+    Unknown,
+}
+impl CommitState {
+    pub fn from_effect(effect: &str) -> Self {
+        match effect {
+            "not_applied" => Self::NotCommitted,
+            "applied" | "contextual" => Self::Committed,
+            _ => Self::Unknown,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

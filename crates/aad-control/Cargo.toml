@@ -18,6 +18,11 @@ serde.workspace = true
 serde_json.workspace = true
 uuid.workspace = true
 sha2.workspace = true
+fs2 = "0.4"
+libc.workspace = true
+
+[dev-dependencies]
+aad-plugin.workspace = true
 
 [lints]
 workspace = true

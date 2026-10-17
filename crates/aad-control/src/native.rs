@@ -53,6 +53,32 @@ pub fn resource_id(provider: &str, selector: &Value) -> String {
 }
 
 impl Backend for NativeBackend {
+    fn node_capabilities(&self, node: &Value) -> Vec<String> {
+        let actions = [
+            Action::Focus {},
+            Action::Invoke {},
+            Action::Click {},
+            Action::Fill {
+                value: String::new(),
+            },
+            Action::TypeText {
+                text: String::new(),
+            },
+            Action::Key { keys: Vec::new() },
+        ];
+        actions
+            .iter()
+            .filter(|action| {
+                node["actions"]
+                    .as_array()
+                    .is_some_and(|native| native.iter().any(|v| v == self.native_action(action)))
+            })
+            .map(|action| action.name().to_string())
+            .collect()
+    }
+    fn lease_key(&self, _snapshot: &Value) -> Option<String> {
+        Some("desktop-input".into())
+    }
     fn name(&self) -> &str {
         &self.provider.manifest().name
     }
@@ -131,7 +157,7 @@ impl Backend for NativeBackend {
         snapshot: &Value,
         node: &Value,
         action: &Action,
-        timeout: Duration,
+        context: &crate::Context,
     ) -> Result<Value> {
         let native = self.native_action(action);
         if !node["actions"]
@@ -176,7 +202,7 @@ impl Backend for NativeBackend {
             Action::Key { keys } => args["keys"] = json!(keys),
             _ => {}
         }
-        self.invoke(native, args, timeout)
+        self.invoke(native, args, context.commit()?)
     }
 }
 
