@@ -340,10 +340,15 @@ impl Session {
                 "session is closed or expired",
             ));
         }
+        // Register the replay guard and cancellation context under the same
+        // admission lock. Otherwise cancel could see a seen ID with no active
+        // context and incorrectly treat an admitted request as already finished.
+        let mut active = self.active.lock().unwrap();
         {
             let mut state = self.state.lock().unwrap();
             if state.requests.len() >= self.max_requests {
                 drop(state);
+                drop(active);
                 self.close();
                 return Err(error(
                     "CONTROL.SESSION_LIMIT",
@@ -359,15 +364,16 @@ impl Session {
         }
         match &request.operation {
             Operation::Cancel { request_id } => {
-                return Ok(json!({"cancellation_requested": self.cancel(request_id)}))
+                drop(active);
+                return Ok(json!({"cancellation_requested": self.cancel(request_id)}));
             }
             Operation::Close {} => {
+                drop(active);
                 self.close();
                 return Ok(json!({"closed": true}));
             }
             _ => {}
         }
-        let mut active = self.active.lock().unwrap();
         let cancelled = self
             .state
             .lock()
@@ -651,6 +657,36 @@ impl Session {
                     "observation expired or is no longer current",
                 )
             })
+    }
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::*;
+
+    #[test]
+    fn cancellation_cannot_fall_between_replay_guard_and_context_registration() {
+        let session = Arc::new(Session::new(Vec::new(), Policy::default()));
+        // Keep execution queued, then pause admission at its state update.
+        let gate = session.gate.lock().unwrap();
+        let state = session.state.lock().unwrap();
+        let request = Request::new(None, Operation::Capabilities {});
+        let id = request.request_id.clone();
+        let running = session.clone();
+        let worker = std::thread::spawn(move || running.execute(&request));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while session.active.try_lock().is_ok() {
+            assert!(Instant::now() < deadline, "admission did not begin");
+            std::thread::yield_now();
+        }
+        let cancelling = session.clone();
+        let cancel = std::thread::spawn(move || cancelling.cancel(&id));
+        drop(state);
+        assert!(cancel.join().unwrap(), "queued request must be cancellable");
+        drop(gate);
+        let response = worker.join().unwrap();
+        assert_eq!(response.commit_state, CommitState::NotCommitted);
+        assert_eq!(response.error.unwrap()["code"], "CONTROL.CANCELLED");
     }
 }
 
