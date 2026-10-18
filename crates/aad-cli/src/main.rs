@@ -9,6 +9,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 
 mod browser_launch;
 mod cdp_watch;
+mod control;
 
 use serde_json::{json, Value};
 use std::io::Write;
@@ -73,7 +74,10 @@ enum Command {
     /// reports incremental snapshot diffs rather than replayable steps.
     Watch(WatchArgs),
     /// Serve the Model Context Protocol over stdio, for AI clients.
-    Mcp,
+    Mcp(control::McpArgs),
+    /// Persistent unified desktop/browser control, locally or over SSH stdio.
+    #[command(subcommand)]
+    Control(control::ControlCommand),
     /// Print the tools exposed over MCP.
     Tools,
     /// Start a durable run that survives this process exiting.
@@ -603,11 +607,20 @@ fn main() -> ExitCode {
 
     // The MCP server owns stdout for the whole session: it is a protocol
     // stream, so printing anything else onto it would desynchronise the client.
-    if matches!(cli.command, Command::Mcp) {
-        return match aad_mcp::serve_stdio() {
+    if let Command::Mcp(args) = &cli.command {
+        return match control::mcp(args) {
             Ok(()) => ExitCode::from(EXIT_OK),
             Err(error) => {
                 eprintln!("aad mcp: {error}");
+                ExitCode::from(EXIT_FAILED)
+            }
+        };
+    }
+    if let Command::Control(command) = &cli.command {
+        return match control::run(command) {
+            Ok(()) => ExitCode::from(EXIT_OK),
+            Err(error) => {
+                eprintln!("aad control: {error}");
                 ExitCode::from(EXIT_FAILED)
             }
         };
@@ -663,7 +676,7 @@ fn dispatch(command: &Command) -> (Value, u8) {
         }
         Command::Tools => (aad_mcp::tools::list_payload(), EXIT_OK),
         // Handled in `main`, which hands stdout to the protocol stream.
-        Command::Mcp => (json!({"status": "closed"}), EXIT_OK),
+        Command::Mcp(_) | Command::Control(_) => (json!({"status": "closed"}), EXIT_OK),
         Command::Workflows(args) => match &args.name {
             Some(name) => explain_workflow(name),
             None => list_saved_workflows(),

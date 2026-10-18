@@ -9,6 +9,7 @@ description = "Model Context Protocol server exposing desktop discovery and auto
 
 [dependencies]
 aad-core = { workspace = true }
+aad-control = { workspace = true }
 aad-atspi = { workspace = true }
 aad-macos-ax = { workspace = true }
 aad-ocr = { workspace = true }

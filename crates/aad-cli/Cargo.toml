@@ -13,6 +13,7 @@ path = "src/main.rs"
 
 [dependencies]
 aad-core = { workspace = true }
+aad-control = { workspace = true }
 aad-mcp = { workspace = true }
 aad-ocr = { workspace = true }
 aad-atspi = { workspace = true }

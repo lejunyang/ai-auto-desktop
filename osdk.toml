@@ -1,7 +1,8 @@
 [tools]
 rust = { version = "1.98.0", components = "rustfmt,clippy" }
 
-# These tasks use released osdk 0.0.6 semantics. Native GUI fixtures remain
+# These tasks use released osdk semantics. CI installs the latest release via
+# the official one-sdk Action. Native GUI fixtures remain
 # explicit: they require a display and platform development packages.
 [tasks]
 fmt = "cargo fmt --all"
@@ -9,6 +10,7 @@ fmt-check = "cargo fmt --all --check"
 test = "cargo test --workspace --exclude aad-gui --locked"
 clippy = "cargo clippy --workspace --exclude aad-gui --locked --all-targets -- -D warnings"
 plugin-test = "cargo test --locked -p aad-plugin --features test-fixture --test process_plugin"
+control-test = "cargo test --locked -p aad-control -p aad-cdp -p aad-mcp -p aad-cli"
 probe = "cargo run --locked -p aad-cli -- probe"
 
 [tasks.ci]

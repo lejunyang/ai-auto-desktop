@@ -43,6 +43,8 @@ if [ "${1:-}" = --inside-session ]; then
     | jq -e '.nodes[] | select(.name == "Qt fixture status invoked")' >/dev/null
   cargo run --locked -q -p aad-atspi --example driver -- capture "$fixture_pid" \
     | jq -e '.frame.kind == "ArtifactRef" and .frame.mediaType == "image/png"' >/dev/null
+  cargo build --locked -q -p aad-cli
+  AAD_CONTROL_CLI="$root/target/debug/aad" cargo run --locked -q -p aad-control --example native_fixture -- "$fixture_pid"
   printf '%s\n' 'Rust Linux AT-SPI fixture passed'
   exit 0
 fi

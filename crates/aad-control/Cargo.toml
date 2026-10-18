@@ -1,0 +1,28 @@
+[package]
+name = "aad-control"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Session-scoped desktop and browser control with authenticated stdio transport"
+
+[dependencies]
+aad-core.workspace = true
+aad-runtime.workspace = true
+aad-uia.workspace = true
+aad-atspi.workspace = true
+aad-macos-ax.workspace = true
+aad-cdp.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+sha2.workspace = true
+fs2 = "0.4"
+libc.workspace = true
+
+[dev-dependencies]
+aad-plugin.workspace = true
+
+[lints]
+workspace = true

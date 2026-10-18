@@ -24,9 +24,12 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      # Branch refs default to the latest osdk release; explicit for clarity.
+      # Rust and its components remain pinned by osdk.toml/osdk.lock.
+      - uses: lejunyang/one-sdk@main
         with:
-          components: clippy, rustfmt
+          version: latest
+          install-deps: false
       - uses: Swatinem/rust-cache@v2
       - uses: actions/setup-python@v5
         if: runner.os == 'Windows'
@@ -93,6 +96,15 @@ jobs:
         run: cargo test --workspace --exclude aad-gui --locked
       - name: Test the Rust subprocess plugin fixture
         run: cargo test --locked -p aad-plugin --features test-fixture --test process_plugin
+
+      - name: Test browser control with isolated sandboxed Chromium
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          export AAD_TEST_CHROME="$(command -v google-chrome || command -v chromium)"
+          test -n "$AAD_TEST_CHROME"
+          cargo test --locked -p aad-control --test browser_e2e -- --ignored
 
       # The UIA research probes call Win32 APIs directly. They are excluded
       # from automatic example discovery on other hosts, but still need to be
