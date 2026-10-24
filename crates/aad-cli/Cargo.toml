@@ -28,6 +28,7 @@ shlex = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
+ctrlc = { version = "3.5", features = ["termination"] }
 
 # Inherit the workspace's deliberate lint allowances (see the root Cargo.toml).
 [lints]

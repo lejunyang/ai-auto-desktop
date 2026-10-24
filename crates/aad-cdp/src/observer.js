@@ -73,8 +73,12 @@
       while ((el=walker.nextNode())) {
         if (++scanned > 10000) { truncated=true; break; }
         if (el.shadowRoot) roots.push(el.shadowRoot);
-        if (!el.matches('button,a,input,textarea,select,[role],[aria-live],dialog,output,h1,h2,h3,img,canvas,td,th,dt,dd,label')) continue;
+        const semantic=el.matches('button,a,input,textarea,select,[role],[aria-live],dialog,output,h1,h2,h3,img,canvas,td,th,dt,dd,label,p,[data-testid]');
+        const leaf=!el.children.length && !['SCRIPT','STYLE','NOSCRIPT','OPTION'].includes(el.tagName) && (el.textContent || '').trim();
+        if (!semantic && !leaf) continue;
         if (!el.getClientRects().length || getComputedStyle(el).visibility === 'hidden') continue;
+        const rect=el.getBoundingClientRect();
+        if (rect.bottom<0 || rect.right<0 || rect.top>innerHeight || rect.left>innerWidth) continue;
         if (nodes.length >= 100) { truncated=true; break; }
         nodes.push(element(el));
       }

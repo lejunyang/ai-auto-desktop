@@ -16,12 +16,12 @@ export async function connect(url) {
   await new Promise((resolve,reject)=>{ws.onopen=resolve;ws.onerror=reject;});
   return {
     events, close:()=>ws.close(),
-    async call(method,params={}) {
+    async call(method,params={},sessionId) {
       const id=++sequence;
       return new Promise((resolve,reject)=>{
         const timer=setTimeout(()=>{pending.delete(id);reject(new Error(`Timed out: ${method}`));},10000);
         pending.set(id,message=>{clearTimeout(timer);message.error?reject(new Error(JSON.stringify(message.error))):resolve(message.result);});
-        ws.send(JSON.stringify({id,method,params}));
+        ws.send(JSON.stringify({id,method,params,...(sessionId?{sessionId}:{})}));
       });
     },
     async eval(expression) {

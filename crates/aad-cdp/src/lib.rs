@@ -20,6 +20,7 @@ use std::net::TcpStream;
 use std::time::Duration;
 
 mod connection;
+pub mod recording;
 mod ws;
 
 pub use connection::EventBatch;
@@ -159,6 +160,24 @@ impl Client {
         params: serde_json::Value,
     ) -> Result<serde_json::Value, CdpError> {
         self.send(method, params)
+    }
+
+    /// Trusted internal primitive for a flattened child target session.
+    pub fn session_command(
+        &mut self,
+        session: Option<&str>,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, CdpError> {
+        self.next_id += 1;
+        let mut message = serde_json::json!({"id":self.next_id,"method":method,"params":params});
+        if let Some(session) = session {
+            message["sessionId"] = serde_json::json!(session);
+        }
+        let deadline = self
+            .deadline
+            .unwrap_or_else(|| std::time::Instant::now() + Duration::from_secs(8));
+        self.connection.command(self.next_id, &message, deadline)
     }
 
     /// Events are received continuously, including while the caller is idle.

@@ -8,6 +8,7 @@
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
 mod browser_launch;
+mod browser_record;
 mod cdp_watch;
 mod control;
 
@@ -73,6 +74,9 @@ enum Command {
     /// anchored to one window: it follows the foreground application and
     /// reports incremental snapshot diffs rather than replayable steps.
     Watch(WatchArgs),
+    /// Record browser task evidence: actions, network, semantic changes and screenshots.
+    #[command(subcommand)]
+    BrowserRecord(browser_record::Command),
     /// Serve the Model Context Protocol over stdio, for AI clients.
     Mcp(control::McpArgs),
     /// Persistent unified desktop/browser control, locally or over SSH stdio.
@@ -976,6 +980,13 @@ fn dispatch(command: &Command) -> (Value, u8) {
             })
         }
         Command::Watch(args) => run_watch(args),
+        Command::BrowserRecord(command) => match browser_record::run(command) {
+            Ok(value) => (value, EXIT_OK),
+            Err(error) => (
+                failure("BROWSER.RECORDING_FAILED", &error.to_string(), None),
+                EXIT_FAILED,
+            ),
+        },
         Command::Do(action) => {
             let (name, raw_target, extra) = match action {
                 DoCommand::Focus(args) => ("focus", &args.target, json!({})),

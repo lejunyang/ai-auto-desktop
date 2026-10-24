@@ -13,6 +13,8 @@ serde_json = { workspace = true }
 sha1 = { version = "0.10", default-features = false }
 base64 = "0.22"
 uuid = { workspace = true }
+sha2 = { workspace = true }
+url = "2"
 
 [lints]
 workspace = true
