@@ -19,8 +19,10 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::time::Duration;
 
+mod connection;
 mod ws;
 
+pub use connection::EventBatch;
 pub use ws::CdpError;
 
 /// A page/frame target exposed at `/json/list`. The websocket field keeps the
@@ -69,7 +71,7 @@ pub struct PageState {
 
 /// A connected CDP page session.
 pub struct Client {
-    ws: ws::WebSocket,
+    connection: connection::Connection,
     next_id: u64,
     deadline: Option<std::time::Instant>,
 }
@@ -118,7 +120,7 @@ impl Client {
     pub fn attach_until(target: &Target, deadline: std::time::Instant) -> Result<Self, CdpError> {
         let ws = ws::WebSocket::connect_until(&target.webSocketDebuggerUrl, deadline)?;
         let mut client = Client {
-            ws,
+            connection: connection::Connection::new(ws)?,
             next_id: 0,
             deadline: Some(deadline),
         };
@@ -141,6 +143,11 @@ impl Client {
         self.send(method, params)
     }
 
+    /// Events are received continuously, including while the caller is idle.
+    pub fn drain_events(&self) -> EventBatch {
+        self.connection.drain()
+    }
+
     fn send(
         &mut self,
         method: &str,
@@ -152,33 +159,7 @@ impl Client {
         let deadline = self
             .deadline
             .unwrap_or_else(|| std::time::Instant::now() + Duration::from_secs(8));
-        self.ws.set_write_deadline(deadline)?;
-        self.ws
-            .send_text(&serde_json::to_string(&message).unwrap())?;
-
-        // Read until the matching response, queuing any unrelated frames to the
-        // internal buffer (handled by the WebSocket itself).
-        loop {
-            let frame = self.ws.recv_until(deadline)?;
-            if !frame.is_text() {
-                continue;
-            }
-            let value: serde_json::Value = match serde_json::from_str(&frame.as_text()) {
-                Ok(value) => value,
-                Err(_) => continue,
-            };
-            if value.get("id").and_then(serde_json::Value::as_u64) == Some(id) {
-                if let Some(error) = value.get("error") {
-                    return Err(CdpError::protocol(error.to_string()));
-                }
-                return Ok(value
-                    .get("result")
-                    .cloned()
-                    .unwrap_or(serde_json::Value::Null));
-            }
-            // An event while waiting on a response: ignore here; the poll loop
-            // reads events explicitly after draining responses.
-        }
+        self.connection.command(id, &message, deadline)
     }
 
     fn enable_runtime(&mut self) -> Result<(), CdpError> {
@@ -202,8 +183,8 @@ impl Client {
             .and_then(|result| result.get("value"))
             .cloned()
             .unwrap_or(serde_json::Value::Null);
-        let activities: Vec<ObservedActivity> = serde_json::from_value(value).unwrap_or_default();
-        Ok(activities)
+        serde_json::from_value(value)
+            .map_err(|error| CdpError::protocol(format!("bad activity: {error}")))
     }
 
     /// Current title/url/rendered text.
@@ -224,14 +205,18 @@ impl Client {
     /// `Page.navigate`. Public so the CLI watch loop can also run the
     /// install/drain/state scripts.
     pub fn eval(&mut self, expression: &str) -> Result<serde_json::Value, CdpError> {
-        self.send(
+        let result = self.send(
             "Runtime.evaluate",
             serde_json::json!({
                 "expression": expression,
                 "returnByValue": true,
                 "awaitPromise": true,
             }),
-        )
+        )?;
+        if let Some(error) = result.get("exceptionDetails") {
+            return Err(CdpError::protocol(format!("evaluation failed: {error}")));
+        }
+        Ok(result)
     }
 }
 

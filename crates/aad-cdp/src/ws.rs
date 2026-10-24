@@ -9,9 +9,10 @@ use base64::Engine;
 use sha1::{Digest, Sha1};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum CdpError {
     Connect(String),
     Protocol(String),
@@ -64,6 +65,7 @@ impl Frame {
 
 pub struct WebSocket {
     stream: TcpStream,
+    writer: Arc<Mutex<TcpStream>>,
 }
 
 const MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
@@ -136,7 +138,24 @@ impl WebSocket {
             return Err(CdpError::protocol("accept key mismatch"));
         }
 
-        Ok(WebSocket { stream })
+        Self::from_stream(stream)
+    }
+
+    pub(crate) fn from_stream(stream: TcpStream) -> Result<Self, CdpError> {
+        let writer = Arc::new(Mutex::new(stream.try_clone().map_err(CdpError::io)?));
+        Ok(Self { stream, writer })
+    }
+
+    /// Exactly one clone may read. Writers (including pong) share a frame lock.
+    pub fn reader(&self) -> Result<Self, CdpError> {
+        Ok(Self {
+            stream: self.stream.try_clone().map_err(CdpError::io)?,
+            writer: self.writer.clone(),
+        })
+    }
+
+    pub fn shutdown(&self) {
+        let _ = self.stream.shutdown(std::net::Shutdown::Both);
     }
 
     pub fn set_write_deadline(&self, deadline: Instant) -> Result<(), CdpError> {
@@ -172,7 +191,11 @@ impl WebSocket {
         for (index, byte) in payload.iter().enumerate() {
             frame.push(byte ^ mask[index % 4]);
         }
-        self.stream.write_all(&frame).map_err(CdpError::io)
+        self.writer
+            .lock()
+            .unwrap()
+            .write_all(&frame)
+            .map_err(CdpError::io)
     }
 
     /// Receive one complete (possibly fragmented) message with a deadline.
@@ -327,7 +350,7 @@ mod tests {
         let stream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         let (mut peer, _) = listener.accept().unwrap();
         peer.write_all(bytes).unwrap();
-        let mut client = WebSocket { stream };
+        let mut client = WebSocket::from_stream(stream).unwrap();
         client.recv_until(Instant::now() + std::time::Duration::from_secs(1))
     }
 
@@ -358,7 +381,7 @@ mod tests {
                 }
             }
         });
-        let mut client = WebSocket { stream };
+        let mut client = WebSocket::from_stream(stream).unwrap();
         let started = Instant::now();
         assert!(client
             .recv_until(started + std::time::Duration::from_millis(60))
@@ -376,7 +399,7 @@ mod tests {
             .unwrap();
         peer.write_all(&[0x89, 1, b'p', 0x81, 2, b'{', b'}'])
             .unwrap();
-        let mut client = WebSocket { stream };
+        let mut client = WebSocket::from_stream(stream).unwrap();
         assert_eq!(
             client
                 .recv_until(Instant::now() + std::time::Duration::from_secs(1))
