@@ -18,7 +18,7 @@ macOS AX 与显式启用的 Chromium CDP 共用会话、资源、观察引用和
 原有 `apps/describe/find/do` CLI、旧 MCP 工具和 GUI 仍主要使用 Windows UIA。
 GUI 尚未迁入新会话层；录制、回放和事件观察的限制见[控制能力审视](docs/research/control-audit-2026-10-17.md)。
 
-浏览器任务观测使用 `aad browser-record`：记录操作、关键元素变化、网络请求和截图，生成给 AI 编写 skill 的步骤说明。**网络默认保留原值，`--redact-network` 才开启脱敏**。详见[浏览器任务录制](docs/browser-recording.md)。
+浏览器任务观测使用 `aad browser-record`：记录操作、关键元素变化、网络请求和截图，生成给 AI 编写 skill 的步骤说明。`aad browser-record start --browser edge --url 'https://example.com' --out ./recording` 自动启动并录制，可用 `--profile-dir` 复用工作 profile，或用 `--browser edge-login` 复制登录资料。**网络默认保留原值，`--redact-network` 才开启脱敏**。详见[浏览器任务录制](docs/browser-recording.md)。
 
 ## 安全模型：先观察，才能操作
 

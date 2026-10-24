@@ -1,29 +1,42 @@
 # 浏览器任务录制：给 AI 编写 skill 的操作证据
 
-`aad browser-record` 记录选定页面中的操作、关键元素与状态变化、网络请求和关键截图，结束后生成简短的 `walkthrough.md`。它独立于 Windows UIA，不需要先启动桌面 `watch`，也不会替用户操作页面、重启浏览器或复制日常登录凭据。
+`aad browser-record` 记录选定页面中的操作、关键元素与状态变化、网络请求和关键截图，结束后生成简短的 `walkthrough.md`。它独立于 Windows UIA，不需要先启动桌面 `watch`。可以由 AAD 自动启动浏览器、开启 CDP 并录制，也可以附加到已开启 CDP 的指定页面。
 
 **网络默认不脱敏。** 默认保留采集到的 URL 参数、请求头（包括 Cookie/Authorization）、请求体及响应体原值。只有显式传入 `--redact-network` 才过滤常见敏感字段。正文大小限制、静态资源过滤和重复请求归并是体积策略，与脱敏开关独立。
 
 ## 开始录制
 
-先用独立、可复用的 profile 启动支持 CDP 的浏览器，在其中打开要操作的网站。只需首次在该 profile 登录；录制登录流程时从未登录状态开始即可。以下为 PowerShell 示例，浏览器路径按本机调整：
+直接启动并录制，不必手动传浏览器调试参数、查端口或复制 page ID。以下为 PowerShell 示例：
 
 ```powershell
-# Windows Edge；使用独立目录，不关闭或修改日常浏览器 profile。
-& 'C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe' `
-  --remote-debugging-port=9222 --remote-debugging-address=127.0.0.1 `
-  "--user-data-dir=$env:LOCALAPPDATA\aad\recording-profile"
+# 新 profile：适合从未登录状态记录完整登录流程。
+aad browser-record start --browser edge --url 'https://example.com/login' --out ./login-recording
 
-# Linux（在 PowerShell 7 中执行）
-microsoft-edge --remote-debugging-port=9222 --remote-debugging-address=127.0.0.1 `
-  "--user-data-dir=$env:HOME/.local/share/aad/recording-profile"
+# 可复用的工作 profile：第一次创建，以后使用相同目录保留登录状态。
+aad browser-record start --browser chrome --profile-dir ./browser-profile `
+  --url 'https://example.com' --out ./task-recording
+
+# 复制日常 Edge 的登录资料；先关闭使用源 profile 的浏览器。
+aad browser-record start --browser edge-login --url 'https://example.com' --out ./login-copy-recording
 ```
 
-用当前仓库构建 CLI；以下命令中的 `aad` 指该构建产物或已安装的同版本可执行文件。
+支持 Edge、Chrome、Brave；`edge-login` 等价于 `--browser edge --copy-login`。自动选择空闲 CDP 端口，创建明确的新标签，安装监听后才打开 `--url`，因此能记录目标页面首次加载时的请求。省略 URL 时打开空白页，随后自行访问网站。只需构建 `aad-cli`，不依赖旁边另装 `aad-browser`；浏览器发现与登录资料复制复用已有启动器的共享实现。
+
+停止时关闭本次启动的浏览器。默认新 profile 与临时登录副本随后清理；显式指定的 `--profile-dir` 保留。附加模式不关闭用户已有浏览器。当前不提供录制结束后保持新启动窗口的参数。
+
+`--profile-dir` 是完整的 **user-data-dir**（包含 `Local State`、`Default` 等），不是其中的 `Default` 子目录，也不应直接指向日常默认数据目录。已有工作 profile 必须先关闭才能启动；正在使用的 CDP profile 应改用下面的附加模式。不会自动强制结束日常浏览器。异常强杀录制器可能留下进程、临时目录或 `.aad-recording.lock`；确认对应进程已退出后再清理，正常 Ctrl+C/stop 会自动收尾。
+
+复制模式沿用原有的 `Default` 登录文件集合，并非完整 profile 克隆，不包含其他命名 profile、localStorage/IndexedDB。自定义来源可用 `--copy-profile-from <closed-user-data-dir>`；结合 `--profile-dir <new-working-dir>` 可保留副本，目标目录必须尚不存在、父目录已存在。现代浏览器加密、站点存储和企业策略可能令登录不能迁移；不能保证复制 Cookie 就必然登录。需要完整保留站点状态时，使用同一个工作 profile 登录一次、后续直接复用。
+
+用当前仓库构建 CLI；文中的 `aad` 指该构建产物或已安装的同版本可执行文件：
 
 ```powershell
 osdk exec --tool rust -- cargo build --locked -p aad-cli
+```
 
+已有浏览器开启 CDP 时，仍可直接附加。`--page` 与 `--browser` 互斥：
+
+```powershell
 # 先列出标签。复制目标页面的 id；不按标题猜测，也不会取第一个标签。
 aad browser-record targets --cdp-port 9222
 
@@ -44,8 +57,15 @@ aad browser-record stop --out ./login-recording
 
 | 参数 | 默认 | 含义 |
 | --- | --- | --- |
-| `--cdp-port` | `9222` | 连接已经显式开启的本机调试端口 |
-| `--page` | 必填 | 精确 page ID |
+| `--browser` | 不启动 | `edge/chrome/brave` 自动启动；`*-login` 复制登录资料；与 `--page` 二选一 |
+| `--url` | 空白页 | 自动启动时在监听就绪后打开的网址 |
+| `--profile-dir` | 新临时目录 | 创建/复用并保留工作 profile；复制模式要求新目录 |
+| `--copy-login` | 关闭 | 从所选浏览器已关闭的日常 profile 复制 Default 登录资料 |
+| `--copy-profile-from` | 无 | 指定已关闭的登录资料来源 user-data-dir，与 `--copy-login` 互斥 |
+| `--browser-executable` | 自动发现 | 指定浏览器可执行文件，配合 `--browser` |
+| `--headless` | 关闭 | 无可见窗口启动，主要用于测试 |
+| `--cdp-port` | `9222` | 仅附加模式；启动模式自动分配端口 |
+| `--page` | 无 | 附加模式的精确 page ID |
 | `--out` | 必填 | 新目录，不覆盖旧记录 |
 | `--seconds` | `0` | 0 表示持续到 Ctrl+C 或 stop |
 | `--redact-network` | **关闭** | 开启后按字段名过滤 Cookie/Authorization、密码、token/ticket 等；JSON 保留业务字段，无法解析的正文省略为占位符 |
@@ -120,7 +140,7 @@ aad browser-record export --out ./login-recording
 - 同进程 iframe 与跨进程 iframe 有独立上下文归属。跨进程 frame 附加前的短暂空窗会写 health；登录 popup 每秒按 opener 关系发现，初始请求可能早于附加，记录明确的 gap。无 opener 关系的新标签、其他已有标签不在范围内。
 - 不独立附加 service worker；不是“全浏览器所有网络”。Canvas 内部独立重绘靠检查点截图，不具备持续像素变化检测。
 - UI 证据按采样时状态记录，多个快速操作之间的短暂界面可能未被拍到。网络与动作的对应是时间/frame 关联推断，不是因果证明。
-- 标准录制是只读采集，不安装 fetch 拦截，不禁用缓存、不重发请求，不增加接受裸坐标或任意 JS 的 MCP 工具。
+- 采集本身只读，不安装 fetch 拦截，不禁用缓存、不重发请求，不增加接受裸坐标或任意 JS 的 MCP 工具。显式 `--browser` 的启动阶段会创建新标签，并在安装监听后导航到 `--url`。
 
 ## 验证
 
@@ -132,6 +152,7 @@ aad browser-record export --out ./login-recording
 - 四次状态轮询形成两组（3 waiting + 1 confirmed），服务端独立请求计数核对通过。
 - 同源 iframe、跨域 OOPIF、整页导航前点击、关联 popup 的操作与关闭、无关标签隔离。
 - mark、stop、Ctrl+C、停止后移除监听、旧产物拒绝覆盖、断连标记 incomplete。
+- CLI 自动启动、首次 Document/XHR 请求捕获、自动分配端口和明确页面选择、临时 profile 清理、工作 profile 重启后的 Cookie/localStorage 保留、从已关闭的测试 profile 复制 Cookie、拒绝同 profile 并发使用且不关闭原浏览器。
 
 一次该测试夹具的默认原值录制：7 步、4 张去重截图，`walkthrough.md` 为 3138 字节，全部产物约 80KiB。这是本地 fixture 的实测体积，不是实际网站的压缩率或容量保证。
 
@@ -143,7 +164,7 @@ osdk exec --tool rust -- cargo test --locked -p aad-cdp -p aad-cli
 osdk exec --tool rust -- cargo clippy --locked -p aad-cdp -p aad-cli --all-targets -- -D warnings
 $env:AAD_TEST_CHROME = '/usr/bin/microsoft-edge'
 # Windows 需另外设置 AAD_TEST_CLI 指向 target/debug/aad.exe；当前 fixture 清理主要针对 Linux。
-node --test --test-concurrency=1 tests/browser/observer.test.mjs tests/browser/recording.test.mjs
+node --test --test-concurrency=1 tests/browser/launch.test.mjs tests/browser/observer.test.mjs tests/browser/recording.test.mjs
 ```
 
 `[待验证]` Windows/macOS 的目标浏览器、真人中文 IME/物理点击、真实站点 SSO/扫码、企业策略，以及至少 30 分钟的性能与容量基准。当前结果不代表这些环境均已通过。

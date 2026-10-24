@@ -9,7 +9,8 @@
 //! - only connects to loopback; the ambient observer never opens the browser,
 //!   navigates or dispatches input. `aad-control` uses the trusted low-level
 //!   command primitive for separately authorized, observed-element actions;
-//! - the browser must already be running with `--remote-debugging-port`;
+//! - attaching requires an existing debug endpoint; explicit [`launch`] callers
+//!   can start an owned browser and open a URL after recording is installed;
 //! - the injected script only attaches passive listeners and queues events;
 //!   it is removed by a page reload/navigation and re-installed by
 //!   [`Client::ensure_installed`].

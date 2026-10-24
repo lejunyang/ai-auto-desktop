@@ -7,10 +7,9 @@
 //! - `--copy-login <browser>`: close that browser, copy ONLY the
 //!   credential-bearing files (Local State, Cookies, Login Data, Web Data,
 //!   Preferences; a few MB) from the real profile into a non-default working
-//!   dir, then launch there with the port. Same Windows user => the DPAPI
-//!   cookie key still decrypts, so site logins carry over without pointing the
-//!   port at or modifying the real multi-GB profile. A temp login copy is
-//!   removed after the session unless `--keep-copy` is set.
+//!   dir, then launch there with the port. Login reuse depends on browser
+//!   encryption, policies and site storage; copying does not guarantee login.
+//!   A temp login copy is removed after the session unless `--keep-copy` is set.
 
 use aad_cdp::launch::{browser_exe, copy_login_profile, real_user_data};
 use std::path::{Path, PathBuf};
@@ -62,6 +61,7 @@ fn print_help() {
         "aad-browser: launch Edge/Chrome with a CDP debug port\n\n\
 USAGE:\n  aad-browser [--port 9222] [URL]\n  aad-browser --copy-login edge [--keep-copy] [--port 9222] [URL]\n\n\
   --port         CDP remote-debugging port (default 9222)\n\
+  --browser      select edge|chrome|brave (default: first installed)\n\
   --profile-dir  explicit working user-data-dir (default: a temp dir)\n\
   --copy-login BROWSER  carry logins in by copying the real profile's\n                 credential files (edge|chrome|brave); closes the browser;\n\
                  the real profile is never modified\n\
