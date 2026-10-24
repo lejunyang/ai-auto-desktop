@@ -19,6 +19,7 @@ struct AttachedPage {
     client: Client,
     /// Lines seen on the previous read, for an incremental text diff.
     previous_lines: Vec<String>,
+    previous_page: Option<(String, String)>,
 }
 
 /// One CDP observation result for a poll: foreground page metadata, new
@@ -29,6 +30,9 @@ pub struct CdpObservation {
     pub activity: Vec<ObservedActivity>,
     pub added_lines: Vec<String>,
     pub removed_lines: Vec<String>,
+    pub dropped_events: u64,
+    pub truncated: bool,
+    pub page_changed: bool,
 }
 
 impl CdpWatcher {
@@ -62,6 +66,7 @@ impl CdpWatcher {
                 AttachedPage {
                     client,
                     previous_lines: Vec::new(),
+                    previous_page: None,
                 },
             );
             // Drop sessions for targets that no longer exist, to bound memory
@@ -72,9 +77,26 @@ impl CdpWatcher {
         }
 
         let attached = self.clients.get_mut(&target_id)?;
-        attached.client.ensure_installed().ok()?;
-        let PageState { title, url, text } = attached.client.state().ok()?;
-        let activity = attached.client.drain_activity().unwrap_or_default();
+        if let Err(error) = attached.client.ensure_installed() {
+            eprintln!("watch: CDP gap for {target_id}: {error}; reconnecting on next poll");
+            self.clients.remove(&target_id);
+            return None;
+        }
+        let PageState {
+            title,
+            url,
+            text,
+            truncated,
+        } = attached.client.state().ok()?;
+        let report = match attached.client.drain_activity_report() {
+            Ok(report) => report,
+            Err(error) => {
+                eprintln!("watch: CDP activity gap: {error}");
+                return None;
+            }
+        };
+        let page_changed = attached.previous_page.as_ref() != Some(&(title.clone(), url.clone()));
+        attached.previous_page = Some((title.clone(), url.clone()));
 
         let current_lines: Vec<String> = text
             .lines()
@@ -106,9 +128,12 @@ impl CdpWatcher {
         Some(CdpObservation {
             title,
             url,
-            activity,
+            activity: report.events,
             added_lines,
             removed_lines,
+            dropped_events: report.dropped,
+            truncated,
+            page_changed,
         })
     }
 }
@@ -123,26 +148,34 @@ impl Default for CdpWatcher {
 ///
 /// Prefer a page whose title/url matches the UIA foreground window title
 /// (browsers put the page title in the tab/window title); otherwise take the
-/// most recently active page — devtools lists targets in activity order, so
-/// the first page is the best heuristic.
+/// only a single eligible page is safe as a fallback. Ambiguity is not focus.
 fn pick_page<'a>(targets: &'a [Target], title_hint: &str) -> Option<&'a Target> {
     let hint = title_hint.trim();
     if !hint.is_empty() {
         // Window title is usually "<page title> - <browser name>"; match when
         // the hint starts with or contains the page title.
-        if let Some(exact) = targets
+        let matches: Vec<_> = targets
             .iter()
             .filter(|target| target.kind == "page")
-            .find(|target| !target.title.is_empty() && hint.starts_with(&target.title))
-        {
-            return Some(exact);
+            .filter(|target| !target.title.is_empty() && hint.starts_with(&target.title))
+            .collect();
+        if matches.len() == 1 {
+            return Some(matches[0]);
+        }
+        if matches.len() > 1 {
+            return None;
         }
     }
-    targets
+    let pages: Vec<_> = targets
         .iter()
         .filter(|target| target.kind == "page" && !target.url.starts_with("edge://"))
-        .find(|target| !target.url.starts_with("chrome://"))
-        .or_else(|| targets.iter().find(|target| target.kind == "page"))
+        .filter(|target| !target.url.starts_with("chrome://"))
+        .collect();
+    if pages.len() == 1 {
+        Some(pages[0])
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -179,5 +212,15 @@ mod tests {
             target("web", "page", "Example", "https://example.com/"),
         ];
         assert_eq!(pick_page(&targets, "").unwrap().id, "web");
+    }
+
+    #[test]
+    fn ambiguous_pages_are_not_attributed_to_the_first_tab() {
+        let targets = vec![
+            target("a", "page", "Login", "https://a.example"),
+            target("b", "page", "Login", "https://b.example"),
+        ];
+        assert!(pick_page(&targets, "Login - Chrome").is_none());
+        assert!(pick_page(&targets, "").is_none());
     }
 }

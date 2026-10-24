@@ -125,7 +125,9 @@ fn run(port: u16) -> Result<(), Box<dyn std::error::Error>> {
 
     // Give example.com time to render, then read text.
     std::thread::sleep(Duration::from_secs(2));
-    let PageState { title, url, text } = client.state()?;
+    let PageState {
+        title, url, text, ..
+    } = client.state()?;
     println!("STATE title={title:?}\n      url={url}");
     println!(
         "TEXT_HEAD: {}",

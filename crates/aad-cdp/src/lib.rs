@@ -58,6 +58,8 @@ pub struct ObservedActivity {
     pub input_type: Option<String>,
     /// URL of the page when it happened.
     pub url: String,
+    #[serde(flatten)]
+    pub metadata: serde_json::Map<String, serde_json::Value>,
 }
 
 /// A point-in-time reading of a tab.
@@ -67,6 +69,22 @@ pub struct PageState {
     pub url: String,
     /// Rendered visible text (`document.body.innerText`).
     pub text: String,
+    #[serde(default)]
+    pub truncated: bool,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct ActivityReport {
+    pub events: Vec<ObservedActivity>,
+    pub dropped: u64,
+}
+
+/// Shared passive observer. A nonempty binding streams actions to the host.
+pub fn observer_script(binding: &str) -> String {
+    include_str!("observer.js").replace(
+        "'__AAD_BINDING__'",
+        &serde_json::to_string(binding).unwrap(),
+    )
 }
 
 /// A connected CDP page session.
@@ -170,14 +188,20 @@ impl Client {
     /// Install the passive observation listeners into the current page if they
     /// are not already present. Idempotent; re-run after every navigation.
     pub fn ensure_installed(&mut self) -> Result<(), CdpError> {
-        self.eval(INSTALL_JS)?;
+        self.eval(&observer_script(""))?;
         Ok(())
     }
 
     /// Read and clear the queue of activity events collected on the page.
     pub fn drain_activity(&mut self) -> Result<Vec<ObservedActivity>, CdpError> {
+        Ok(self.drain_activity_report()?.events)
+    }
+
+    pub fn drain_activity_report(&mut self) -> Result<ActivityReport, CdpError> {
         // The injected code keeps a global array; return it and reset.
-        let result = self.eval(DRAIN_JS)?;
+        let result = self.eval(
+            "globalThis.__aadCdp ? globalThis.__aadCdp.takeReport() : {events:[],dropped:0}",
+        )?;
         let value = result
             .get("result")
             .and_then(|result| result.get("value"))
@@ -313,123 +337,12 @@ fn http_get_until(port: u16, path: &str, deadline: std::time::Instant) -> Result
         .map_err(|_| CdpError::protocol("HTTP body is not UTF-8"))
 }
 
-/// Script installed into every observed page.
-///
-/// Passive, namespaced under `window.__aadCdp`, no input/navigation. Captures
-/// clicks (resolved to the nearest clickable ancestor) and input/change
-/// values. Password fields contribute an event with no value. A per-element
-/// micro-coalescence keeps typing from flooding the queue.
-const INSTALL_JS: &str = r#"
-(() => {
-  if (window.__aadCdp && window.__aadCdp.installed) return 1;
-  const q = [];
-  const labelOf = (el) => {
-    if (!el || el === document) return null;
-    const a = el.getAttribute && (el.getAttribute('aria-label') || el.getAttribute('title'));
-    if (a) return a;
-    const t = (el.innerText || el.textContent || '').trim().replace(/\s+/g, ' ');
-    if (t) return t.slice(0, 120);
-    if (el.id) return '#' + el.id;
-    return null;
-  };
-  const clickable = (el) => {
-    let n = el;
-    for (let i = 0; i < 4 && n; i++) {
-      const tag = (n.tagName || '').toLowerCase();
-      if (['a','button','[role=button]'].includes(tag) || n.getAttribute('role') === 'button' ||
-          n.onclick || n.tabIndex >= 0) return n;
-      n = n.parentElement;
-    }
-    return el;
-  };
-  // Capture phase so framework routers (React/Vue) that stopPropagation still
-  // get observed; resolve to the nearest clickable ancestor for a label.
-  const onClick = (e) => {
-    const el = clickable(e.target);
-    q.push({
-      kind: 'click',
-      tag: el.tagName ? el.tagName.toLowerCase() : null,
-      label: labelOf(el),
-      href: el.href || el.closest && el.closest('a') ? (el.closest('a') || {}).href || null : null,
-      value: null,
-      type: null,
-      url: location.href,
-    });
-  };
-  document.addEventListener('click', onClick, true);
-  // contentEditable / rich-text editors (docs, chat composers) do not expose
-  // a form .value; read their text content instead.
-  const editorValue = (el) => {
-    if (el.isContentEditable) return (el.innerText || el.textContent || '');
-    return el.value != null ? String(el.value) : (el.textContent || '');
-  };
-  const onInput = (e) => {
-    const el = e.target;
-    if (!el || !el.tagName) return;
-    const tag = el.tagName.toLowerCase();
-    const editable = ['input','textarea','select'].includes(tag) || el.isContentEditable;
-    if (!editable) return;
-    const isPassword = tag === 'input' && (el.type || '').toLowerCase() === 'password';
-    q.push({
-      kind: 'input',
-      tag: el.isContentEditable ? 'contenteditable' : tag,
-      label: labelOf(el),
-      href: null,
-      value: isPassword ? null : editorValue(el).slice(0, 500),
-      type: tag === 'input' ? (el.type || null)
-            : tag === 'textarea' ? 'textarea' : 'richtext',
-      url: location.href,
-    });
-  };
-  document.addEventListener('input', onInput, true);
-  document.addEventListener('change', onInput, true);
-
-  // Some web inputs and IME composition omit per-keystroke 'input' or commit
-  // only at the end; read the focused editable on keyup / compositionend.
-  const readActive = () => {
-    const el = document.activeElement;
-    if (el && (el.isContentEditable ||
-        ['INPUT','TEXTAREA','SELECT'].includes(el.tagName))) {
-      onInput({target: el});
-    }
-  };
-  document.addEventListener('keyup', readActive, true);
-  document.addEventListener('compositionend', readActive, true);
-
-  window.__aadCdp = { installed: true, take: () => q.splice(0, q.length) };
-  return 1;
-})()
-"#;
-
-const DRAIN_JS: &str = r#"
-(() => {
-  if (!window.__aadCdp) return [];
-  const raw = window.__aadCdp.take();
-  // Coalesce the per-keystroke 'input' storm into one event per field,
-  // keeping the latest value; de-duplicate identical click events.
-  const byField = new Map();
-  const clicks = [];
-  const seenClick = new Set();
-  for (const e of raw) {
-    if (e.kind === 'input') {
-      const key = (e.tag||'') + '|' + (e.type||'') + '|' + (e.label||'') + '|' + (e.url||'');
-      byField.set(key, e);
-    } else if (e.kind === 'click') {
-      const key = (e.tag||'') + '|' + (e.label||'') + '|' + (e.href||'');
-      if (!seenClick.has(key)) { seenClick.add(key); clicks.push(e); }
-    } else {
-      clicks.push(e);
-    }
-  }
-  return clicks.concat(Array.from(byField.values()));
-})()
-"#;
-
 const STATE_JS: &str = r#"
 (() => ({
   title: document.title || "",
   url: location.href || "",
   text: (document.body ? document.body.innerText : "").slice(0, 200000),
+  truncated: (document.body ? document.body.innerText.length : 0) > 200000,
 }))()
 "#;
 

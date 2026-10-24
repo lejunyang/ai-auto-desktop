@@ -1295,7 +1295,9 @@ fn run_watch(args: &WatchArgs) -> (Value, u8) {
                         if let Some(observation) = watcher.observe(cdp_port, &window.title) {
                             let any = !observation.activity.is_empty()
                                 || !observation.added_lines.is_empty()
-                                || !observation.removed_lines.is_empty();
+                                || !observation.removed_lines.is_empty()
+                                || observation.page_changed
+                                || observation.dropped_events > 0;
                             if any {
                                 emit(
                                     &mut sink,
@@ -1307,6 +1309,8 @@ fn run_watch(args: &WatchArgs) -> (Value, u8) {
                                         "activity": serde_json::to_value(&observation.activity).unwrap_or(Value::Null),
                                         "added_text": observation.added_lines,
                                         "removed_text": observation.removed_lines,
+                                        "dropped_events": observation.dropped_events,
+                                        "truncated": observation.truncated,
                                     }),
                                 );
                             }
