@@ -14,7 +14,7 @@ pub enum Command {
         #[arg(long, default_value_t = 9222)]
         cdp_port: u16,
     },
-    /// Record an explicit page and related frames/popups until stop or Ctrl+C.
+    /// Launch a browser or attach to an explicit page and record until stop/Ctrl+C.
     Start(Start),
     /// Request a graceful stop from another terminal.
     Stop {
@@ -37,11 +37,32 @@ pub enum Command {
 
 #[derive(Args)]
 pub struct Start {
-    #[arg(long, default_value_t = 9222)]
+    #[arg(long, default_value_t = 9222, conflicts_with = "browser")]
     cdp_port: u16,
     /// Exact page ID returned by browser-record targets. Never guessed by title.
-    #[arg(long)]
-    page: String,
+    #[arg(long, required_unless_present = "browser", conflicts_with = "browser")]
+    page: Option<String>,
+    /// Start a browser with CDP automatically. -login copies the closed daily profile.
+    #[arg(long, value_parser = ["edge", "chrome", "brave", "edge-login", "chrome-login", "brave-login"])]
+    browser: Option<String>,
+    /// Open this URL AFTER recording listeners are installed.
+    #[arg(long, requires = "browser")]
+    url: Option<String>,
+    /// Reuse/create a persistent working user-data directory; default is fresh/temp.
+    #[arg(long, requires = "browser")]
+    profile_dir: Option<PathBuf>,
+    /// Copy login files from the chosen browser's closed default profile.
+    #[arg(long, requires = "browser", conflicts_with = "copy_profile_from")]
+    copy_login: bool,
+    /// Copy login files from a closed user-data directory into a NEW working profile.
+    #[arg(long, requires = "browser")]
+    copy_profile_from: Option<PathBuf>,
+    /// Override executable discovery (use the matching --browser family).
+    #[arg(long, requires = "browser")]
+    browser_executable: Option<PathBuf>,
+    /// Launch without a visible window, mainly for automated fixtures.
+    #[arg(long, requires = "browser")]
+    headless: bool,
     /// New directory; existing paths are never overwritten.
     #[arg(long)]
     out: PathBuf,
@@ -71,12 +92,47 @@ pub fn run(command: &Command) -> recording::Result<Value> {
             json!({"pages":aad_cdp::Client::list_targets(*cdp_port)?.iter().map(|p|json!({"id":p.id,"title":p.title,"url":p.url})).collect::<Vec<_>>()}),
         ),
         Command::Start(args) => {
+            if args.out.exists() {
+                return Err("recording output must be a new directory".into());
+            }
             let cancel = Arc::new(AtomicBool::new(false));
             let signal = cancel.clone();
             ctrlc::set_handler(move || signal.store(true, Ordering::SeqCst))?;
+            let browser = if let Some(name) = &args.browser {
+                let choice = crate::browser_launch::parse(name).ok_or("unsupported browser")?;
+                if choice.copy_login && args.copy_profile_from.is_some() {
+                    return Err(
+                        "use either a -login browser or --copy-profile-from, not both".into(),
+                    );
+                }
+                let source = if choice.copy_login || args.copy_login {
+                    Some(aad_cdp::launch::real_user_data(&choice.browser).ok_or("daily browser profile not found; use --copy-profile-from for a custom user-data directory")?)
+                } else {
+                    args.copy_profile_from.clone()
+                };
+                Some(aad_cdp::launch::Browser::start(aad_cdp::launch::Options {
+                    browser: choice.browser,
+                    executable: args.browser_executable.clone(),
+                    profile_dir: args.profile_dir.clone(),
+                    copy_from: source,
+                    headless: args.headless,
+                })?)
+            } else {
+                None
+            };
+            let (port, page) = match &browser {
+                Some(browser) => {
+                    eprintln!("Started browser on port {} with profile {}; it closes when recording ends.", browser.port, browser.profile_dir().display());
+                    (browser.port, browser.page.clone())
+                }
+                None => (
+                    args.cdp_port,
+                    args.page.clone().ok_or("--page or --browser is required")?,
+                ),
+            };
             let recorder = recording::Recorder::start(Options {
-                port: args.cdp_port,
-                page: args.page.clone(),
+                port,
+                page: page.clone(),
                 out: args.out.clone(),
                 seconds: args.seconds,
                 redact_network: args.redact_network,
@@ -85,8 +141,13 @@ pub fn run(command: &Command) -> recording::Result<Value> {
                 max_bytes: args.max_bytes,
                 follow_popups: !args.no_follow_popups,
             })?;
-            eprintln!("Recording page {} into {}; Ctrl+C or browser-record stop finishes the walkthrough.",args.page,args.out.display());
-            recorder.run(&cancel)
+            if let (Some(browser), Some(url)) = (&browser, &args.url) {
+                browser.open_url(url)?;
+            }
+            eprintln!("Recording page {} into {}; Ctrl+C or browser-record stop finishes the walkthrough.",page,args.out.display());
+            let result = recorder.run(&cancel);
+            drop(browser);
+            result
         }
         Command::Stop { out } => {
             recording::control(out, "stop", None)?;

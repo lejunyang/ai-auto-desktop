@@ -20,6 +20,7 @@ use std::net::TcpStream;
 use std::time::Duration;
 
 mod connection;
+pub mod launch;
 pub mod recording;
 mod ws;
 

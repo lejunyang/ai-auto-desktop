@@ -61,6 +61,7 @@ pub fn ensure_browser(port: u16, launch: &BrowserLaunch) -> bool {
 
     let mut command = Command::new(helper);
     command.arg("--port").arg(port.to_string());
+    command.arg("--browser").arg(&launch.browser);
     command.arg("--detached");
     if launch.copy_login {
         command.arg("--copy-login").arg(&launch.browser);
