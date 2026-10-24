@@ -89,6 +89,8 @@
 
 ### 2.4 复用登录态：profile 登录副本（2026-09-27 实测）
 
+2026-10-24 接口更新：以下记录为历史实验。当前不再默认关闭占用浏览器，改为独立 `--existing-profile [ID]` 选择已有资料；只有一个时省略 ID，多个时必须选择。占用时提示 `--kill-browser`，显式传入才按资料目录确认并关闭。当前用法与验证边界见 [浏览器任务录制](../browser-recording.md)。
+
 用户痛点：专用 profile 要重新登录所有网站。真机结论与方案：
 
 - **直接对真实默认 profile 开调试端口不可行**（铁证）：Chromium 出于安全考虑，对"默认数据目录"忽略 `--remote-debugging-port`——无论浏览器是否在运行、是否完全退出后冷启动，真实 `%LOCALAPPDATA%\Microsoft\Edge\User Data` 上都不开端口；事后附加运行中实例同样不可能。
@@ -104,8 +106,9 @@
 
 ```
 aad watch --browser edge --out today.jsonl           # 隔离专用 profile（干净、未登录）
-aad watch --browser edge-login --out today.jsonl     # 复用现有网站登录态（关一次 Edge，复制登录子集）
-# 也支持 chrome / chrome-login / brave / brave-login；默认端口 9222，--cdp-port 可覆盖
+aad watch --browser edge --existing-profile 'Profile 1' --profile-dir ./new-login-copy --out today.jsonl
+# 也支持 chrome / brave；默认端口 9222，--cdp-port 可覆盖
+# 被占用时默认提示；明确需要关闭并启动才加 --kill-browser
 ```
 
 - 启动阶段：端口已在听则直接用；否则定位同目录 `aad-browser` 并 detached 拉起（dedicated 或 login-copy），就绪后日志先发一条 `cdp_ready`（带 `browser/port/login_copy`），失败发 `cdp_unavailable` 并回退 UIA。

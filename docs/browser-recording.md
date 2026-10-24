@@ -16,17 +16,32 @@ aad browser-record start --browser edge --url 'https://example.com/login' --out 
 aad browser-record start --browser chrome --profile-dir ./browser-profile `
   --url 'https://example.com' --out ./task-recording
 
-# 复制日常 Edge 的登录资料；先关闭使用源 profile 的浏览器。
-aad browser-record start --browser edge-login --url 'https://example.com' --out ./login-copy-recording
+# 只有一个已有 profile 时，不必填写 ID。
+aad browser-record start --browser edge --existing-profile --url 'https://example.com' --out ./login-copy-recording
+
+# 查看多个已有 profile 的目录 ID 和显示名称，再明确选择。
+aad browser-record profiles --browser edge
+aad browser-record start --browser edge --existing-profile 'Profile 1' `
+  --url 'https://example.com' --out ./work-recording
+
+# 被占用时默认报错。确认需要关闭占用浏览器并重新启动，再显式加此参数。
+aad browser-record start --browser edge --existing-profile 'Profile 1' --kill-browser `
+  --url 'https://example.com' --out ./restart-recording
 ```
 
-支持 Edge、Chrome、Brave；`edge-login` 等价于 `--browser edge --copy-login`。自动选择空闲 CDP 端口，创建明确的新标签，安装监听后才打开 `--url`，因此能记录目标页面首次加载时的请求。省略 URL 时打开空白页，随后自行访问网站。只需构建 `aad-cli`，不依赖旁边另装 `aad-browser`；浏览器发现与登录资料复制复用已有启动器的共享实现。
+`--browser` 只选择 Edge、Chrome、Brave，不再接受 `*-login` 后缀。`--existing-profile [ID]` 独立选择日常已有 profile：不填 ID 且只有一个时自动选择；有多个时列出候选并报错；没有时也报错，不会退回新 profile 或猜测 `Default`。ID 是 `Default`、`Profile 1` 等目录名，不是可能重复的显示名称。`--profile-source <user-data-dir>` 可以覆盖日常资料来源，`profiles` 和 `start` 使用相同参数。
+
+自动选择空闲 CDP 端口，创建明确的新标签，安装监听后才打开 `--url`，因此能记录目标页面首次加载时的请求。省略 URL 时打开空白页，随后自行访问网站。只需构建 `aad-cli`，不依赖旁边另装 `aad-browser`；浏览器发现与登录资料复制复用已有启动器的共享实现。
 
 停止时关闭本次启动的浏览器。默认新 profile 与临时登录副本随后清理；显式指定的 `--profile-dir` 保留。附加模式不关闭用户已有浏览器。当前不提供录制结束后保持新启动窗口的参数。
 
-`--profile-dir` 是完整的 **user-data-dir**（包含 `Local State`、`Default` 等），不是其中的 `Default` 子目录，也不应直接指向日常默认数据目录。已有工作 profile 必须先关闭才能启动；正在使用的 CDP profile 应改用下面的附加模式。不会自动强制结束日常浏览器。异常强杀录制器可能留下进程、临时目录或 `.aad-recording.lock`；确认对应进程已退出后再清理，正常 Ctrl+C/stop 会自动收尾。
+`--profile-dir` 是完整的工作 **user-data-dir**（包含 `Local State`、`Default` 等），不是其中的 `Default` 子目录，也不应直接指向日常默认数据目录。源目录或工作目录被占用时，提示占用进程和 `--kill-browser`，默认不会关闭任何已有浏览器。显式加 `--kill-browser` 后，按当前用户、浏览器可执行文件、资料目录及进程身份确认归属后结束该浏览器进程树；其他资料目录的浏览器保持运行。**同一 user-data-dir 中多个 profile 可能共用浏览器进程，这些窗口会一起关闭**。无法验证归属时，即使指定该参数也要求手动处理，不按进程名称批量结束。
 
-复制模式沿用原有的 `Default` 登录文件集合，并非完整 profile 克隆，不包含其他命名 profile、localStorage/IndexedDB。自定义来源可用 `--copy-profile-from <closed-user-data-dir>`；结合 `--profile-dir <new-working-dir>` 可保留副本，目标目录必须尚不存在、父目录已存在。现代浏览器加密、站点存储和企业策略可能令登录不能迁移；不能保证复制 Cookie 就必然登录。需要完整保留站点状态时，使用同一个工作 profile 登录一次、后续直接复用。
+正在使用的 CDP profile 也可以直接用下面的附加模式。异常强杀录制器可能留下进程、临时目录或 `.aad-recording.lock`；确认对应进程已退出后再清理，正常 Ctrl+C/stop 会自动收尾。
+
+已有 profile 通过登录资料副本参与录制：复制公共 `Local State` 和**选中的** profile 的 Cookies、Preferences、Login Data、Web Data 等，不混入其他 profile 的登录文件，也不包含 localStorage/IndexedDB。副本统一放入工作目录的 `Default`，后续直接用 `--profile-dir` 即可复用。结合 `--profile-dir <new-working-dir>` 可保留副本，目标目录必须尚不存在、父目录已存在。现代浏览器加密、站点存储和企业策略可能令登录不能迁移；不能保证复制 Cookie 就必然登录。需要完整保留站点状态时，使用同一个工作 profile 登录一次、后续直接复用。
+
+旧参数迁移：`--browser edge-login` 或 `--copy-login` 改为 `--browser edge --existing-profile [ID]`；`--copy-profile-from DIR` 改为 `--existing-profile [ID] --profile-source DIR`。`aad-browser` 与 `aad watch --browser` 同样使用独立的 profile 参数和显式 `--kill-browser`。`watch` 的 detached 登录副本必须指定新 `--profile-dir` 以明确保留位置；占用的 CDP 端口不会被 profile 参数覆盖，应换端口或使用 `browser-record` 自动分配。
 
 用当前仓库构建 CLI；文中的 `aad` 指该构建产物或已安装的同版本可执行文件：
 
@@ -57,11 +72,12 @@ aad browser-record stop --out ./login-recording
 
 | 参数 | 默认 | 含义 |
 | --- | --- | --- |
-| `--browser` | 不启动 | `edge/chrome/brave` 自动启动；`*-login` 复制登录资料；与 `--page` 二选一 |
+| `--browser` | 不启动 | `edge/chrome/brave` 自动启动；与 `--page` 二选一 |
 | `--url` | 空白页 | 自动启动时在监听就绪后打开的网址 |
 | `--profile-dir` | 新临时目录 | 创建/复用并保留工作 profile；复制模式要求新目录 |
-| `--copy-login` | 关闭 | 从所选浏览器已关闭的日常 profile 复制 Default 登录资料 |
-| `--copy-profile-from` | 无 | 指定已关闭的登录资料来源 user-data-dir，与 `--copy-login` 互斥 |
+| `--existing-profile [ID]` | 不使用日常 profile | 使用已有 profile 的登录副本；省略 ID 时必须只有一个候选 |
+| `--profile-source` | 日常资料目录 | 已有 profile 的来源 user-data-dir；start 需配合 `--existing-profile` |
+| `--kill-browser` | 关闭 | 明确允许结束占用源/工作目录的浏览器并启动；不影响其他资料目录的浏览器 |
 | `--browser-executable` | 自动发现 | 指定浏览器可执行文件，配合 `--browser` |
 | `--headless` | 关闭 | 无可见窗口启动，主要用于测试 |
 | `--cdp-port` | `9222` | 仅附加模式；启动模式自动分配端口 |
@@ -153,13 +169,14 @@ aad browser-record export --out ./login-recording
 - 同源 iframe、跨域 OOPIF、整页导航前点击、关联 popup 的操作与关闭、无关标签隔离。
 - mark、stop、Ctrl+C、停止后移除监听、旧产物拒绝覆盖、断连标记 incomplete。
 - CLI 自动启动、首次 Document/XHR 请求捕获、自动分配端口和明确页面选择、临时 profile 清理、工作 profile 重启后的 Cookie/localStorage 保留、从已关闭的测试 profile 复制 Cookie、拒绝同 profile 并发使用且不关闭原浏览器。
+- 唯一 profile 自动选择、多 profile 列表与歧义拒绝、重复显示名称按目录 ID 区分、选择非 Default profile 的文件复制；无 CDP 的占用浏览器默认保留，显式 `--kill-browser` 后重启，错误 profile/复制目标不触发关闭，另一个资料目录的浏览器仍可正常读取。
 
 一次该测试夹具的默认原值录制：7 步、4 张去重截图，`walkthrough.md` 为 3138 字节，全部产物约 80KiB。这是本地 fixture 的实测体积，不是实际网站的压缩率或容量保证。
 
 复现命令（按本机路径设置浏览器；GUI/浏览器实测串行）：
 
 ```powershell
-osdk exec --tool rust -- cargo build --locked -p aad-cli
+osdk exec --tool rust -- cargo build --locked -p aad-cli -p aad-cdp
 osdk exec --tool rust -- cargo test --locked -p aad-cdp -p aad-cli
 osdk exec --tool rust -- cargo clippy --locked -p aad-cdp -p aad-cli --all-targets -- -D warnings
 $env:AAD_TEST_CHROME = '/usr/bin/microsoft-edge'
