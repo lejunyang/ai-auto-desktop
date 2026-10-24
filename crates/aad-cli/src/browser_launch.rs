@@ -12,22 +12,23 @@ use std::process::{Command, Stdio};
 pub struct BrowserLaunch {
     /// Browser id passed to aad-browser: edge / chrome / brave.
     pub browser: String,
-    /// Carry existing logins over (login-copy mode).
-    pub copy_login: bool,
+    pub existing_profile: Option<Option<String>>,
+    pub profile_source: Option<PathBuf>,
+    pub profile_dir: Option<PathBuf>,
+    pub kill_browser: bool,
 }
 
 impl BrowserLaunch {
-    /// Parse `edge`, `chrome`, `brave`, or their `-login` variants.
+    /// Browser family only; profile selection is independent.
     pub fn parse(value: &str) -> Option<Self> {
         let value = value.trim().to_ascii_lowercase();
-        let (browser, copy_login) = if let Some(base) = value.strip_suffix("-login") {
-            (base.to_string(), true)
-        } else {
-            (value, false)
-        };
+        let browser = value;
         matches!(browser.as_str(), "edge" | "chrome" | "brave").then_some(Self {
             browser,
-            copy_login,
+            existing_profile: None,
+            profile_source: None,
+            profile_dir: None,
+            kill_browser: false,
         })
     }
 }
@@ -50,6 +51,11 @@ fn helper_exe() -> Option<PathBuf> {
 /// listening, or a browser was started and confirmed ready).
 pub fn ensure_browser(port: u16, launch: &BrowserLaunch) -> bool {
     if aad_cdp::Client::available(port) {
+        if launch.existing_profile.is_some() || launch.profile_dir.is_some() || launch.kill_browser
+        {
+            eprintln!("warning: CDP port already in use; cannot apply profile selection to it. Use another --cdp-port or browser-record start");
+            return false;
+        }
         return true;
     }
     let Some(helper) = helper_exe() else {
@@ -63,8 +69,20 @@ pub fn ensure_browser(port: u16, launch: &BrowserLaunch) -> bool {
     command.arg("--port").arg(port.to_string());
     command.arg("--browser").arg(&launch.browser);
     command.arg("--detached");
-    if launch.copy_login {
-        command.arg("--copy-login").arg(&launch.browser);
+    if let Some(id) = &launch.existing_profile {
+        command.arg("--existing-profile");
+        if let Some(id) = id {
+            command.arg(id);
+        }
+    }
+    if let Some(source) = &launch.profile_source {
+        command.arg("--profile-source").arg(source);
+    }
+    if let Some(work) = &launch.profile_dir {
+        command.arg("--profile-dir").arg(work);
+    }
+    if launch.kill_browser {
+        command.arg("--kill-browser");
     }
     command
         .stdin(Stdio::null())
@@ -113,21 +131,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_browser_and_login_variants() {
-        assert_eq!(
-            parse("edge"),
-            Some(BrowserLaunch {
-                browser: "edge".into(),
-                copy_login: false
-            })
-        );
-        assert_eq!(
-            parse("Chrome-Login"),
-            Some(BrowserLaunch {
-                browser: "chrome".into(),
-                copy_login: true
-            })
-        );
+    fn browser_selection_does_not_imply_profile_selection() {
+        assert_eq!(parse("edge").unwrap().browser, "edge");
+        assert!(parse("edge").unwrap().existing_profile.is_none());
+        assert_eq!(parse("Chrome").unwrap().browser, "chrome");
+        assert_eq!(parse("Chrome-Login"), None);
         assert_eq!(parse("firefox"), None);
         assert!(matches_process(&parse("brave").unwrap(), "brave.exe"));
         assert!(!matches_process(&parse("edge").unwrap(), "chrome.exe"));

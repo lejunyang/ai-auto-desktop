@@ -1,219 +1,146 @@
-//! Launch a Chromium browser with a CDP debug port.
-//!
-//! Chromium refuses `--remote-debugging-port` on the browser's DEFAULT
-//! user-data-dir (a security measure) and cannot attach to a running instance.
-//! Modes:
-//! - dedicated (default): isolated temp profile, clean but logged out;
-//! - `--copy-login <browser>`: close that browser, copy ONLY the
-//!   credential-bearing files (Local State, Cookies, Login Data, Web Data,
-//!   Preferences; a few MB) from the real profile into a non-default working
-//!   dir, then launch there with the port. Login reuse depends on browser
-//!   encryption, policies and site storage; copying does not guarantee login.
-//!   A temp login copy is removed after the session unless `--keep-copy` is set.
-
-use aad_cdp::launch::{browser_exe, copy_login_profile, real_user_data};
-use std::path::{Path, PathBuf};
+//! Standalone startup for legacy watch users, with explicit profile selection.
+use aad_cdp::launch::{
+    browser_exe, copy_selected_profile, ensure_available, list_profiles, real_user_data,
+    select_profile,
+};
+use clap::Parser;
+use serde_json::json;
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
+#[derive(Parser)]
+#[command(about = "Launch a Chromium browser with CDP; occupied profiles require --kill-browser")]
 struct Args {
-    browser: Option<String>,
+    #[arg(long, default_value = "edge", value_parser = ["edge", "chrome", "brave"])]
+    browser: String,
+    #[arg(long, default_value_t = 9222)]
     port: u16,
+    /// Persistent working user-data directory (must be new when copying).
+    #[arg(long)]
     profile_dir: Option<PathBuf>,
-    url: Option<String>,
+    /// Copy the selected profile's login files. Omit ID only when exactly one exists.
+    #[arg(long, num_args = 0..=1, value_name = "ID")]
+    existing_profile: Option<Option<String>>,
+    /// Custom source user-data directory.
+    #[arg(long)]
+    profile_source: Option<PathBuf>,
+    /// List available profile IDs and names without starting a browser.
+    #[arg(long)]
+    profiles: bool,
+    /// Explicitly close the browser occupying the selected user-data directory.
+    #[arg(long)]
+    kill_browser: bool,
+    #[arg(long)]
     detached: bool,
-    copy_login: Option<String>,
+    #[arg(long)]
     keep_copy: bool,
+    url: Option<String>,
 }
 
-fn parse_args() -> Args {
-    let mut args = Args {
-        browser: None,
-        port: 9222,
-        profile_dir: None,
-        url: None,
-        detached: false,
-        copy_login: None,
-        keep_copy: false,
+fn run(args: Args) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let source = if args.existing_profile.is_some() || args.profiles {
+        Some(
+            args.profile_source
+                .clone()
+                .or_else(|| real_user_data(&args.browser))
+                .ok_or("browser profile source not found; use --profile-source")?,
+        )
+    } else {
+        if args.profile_source.is_some() {
+            return Err("--profile-source requires --existing-profile or --profiles".into());
+        }
+        None
     };
-    let mut rest = Vec::new();
-    let mut iter = std::env::args().skip(1);
-    while let Some(arg) = iter.next() {
-        match arg.as_str() {
-            "--browser" => args.browser = iter.next(),
-            "--port" => args.port = iter.next().and_then(|v| v.parse().ok()).unwrap_or(9222),
-            "--profile-dir" => args.profile_dir = iter.next().map(PathBuf::from),
-            "--detached" => args.detached = true,
-            "--copy-login" => args.copy_login = iter.next(),
-            "--keep-copy" => args.keep_copy = true,
-            "-h" | "--help" => {
-                print_help();
-                std::process::exit(0);
-            }
-            other => rest.push(other.to_string()),
-        }
+    if args.profiles {
+        let source = source.unwrap();
+        println!(
+            "{}",
+            json!({"browser":args.browser,"profile_source":source,"profiles":list_profiles(&source)?})
+        );
+        return Ok(());
     }
-    args.url = rest.into_iter().next();
-    args
-}
-
-fn print_help() {
-    println!(
-        "aad-browser: launch Edge/Chrome with a CDP debug port\n\n\
-USAGE:\n  aad-browser [--port 9222] [URL]\n  aad-browser --copy-login edge [--keep-copy] [--port 9222] [URL]\n\n\
-  --port         CDP remote-debugging port (default 9222)\n\
-  --browser      select edge|chrome|brave (default: first installed)\n\
-  --profile-dir  explicit working user-data-dir (default: a temp dir)\n\
-  --copy-login BROWSER  carry logins in by copying the real profile's\n                 credential files (edge|chrome|brave); closes the browser;\n\
-                 the real profile is never modified\n\
-  --keep-copy    keep the copied working profile after exit (otherwise the\n                 temp copy, which contains credentials, is deleted)\n\
-  --detached     return once the endpoint is ready\n\
-  URL            first page to open (default about:blank)"
-    );
-}
-
-#[cfg(windows)]
-fn close_browser(exe: &Path) {
-    let image = exe
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("msedge.exe");
-    let _ = Command::new("taskkill")
-        .args(["/F", "/IM", image, "/T"])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
-    for _ in 0..30 {
-        let still = Command::new("tasklist")
-            .args(["/FI", &format!("IMAGENAME eq {image}")])
-            .output()
-            .map(|o| String::from_utf8_lossy(&o.stdout).contains(image))
-            .unwrap_or(false);
-        if !still {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(300));
+    if args.detached && source.is_some() && !args.keep_copy && args.profile_dir.is_none() {
+        return Err("detached login copies require --keep-copy or an explicit NEW --profile-dir; use foreground mode for automatic cleanup".into());
     }
-}
-
-#[cfg(not(windows))]
-fn close_browser(exe: &Path) {
-    if let Some(image) = exe.file_name().and_then(|n| n.to_str()) {
-        let _ = Command::new("pkill").arg("-x").arg(image).status();
+    if args.port == 0 {
+        return Err("aad-browser requires an explicit nonzero port; browser-record automatically allocates a port".into());
     }
-}
-
-fn main() {
-    let args = parse_args();
-    if args.detached && args.copy_login.is_some() && !args.keep_copy && args.profile_dir.is_none() {
-        eprintln!("detached login copies require --keep-copy or an explicit NEW --profile-dir; otherwise use foreground mode for automatic cleanup");
-        std::process::exit(2);
+    if aad_cdp::Client::available(args.port) {
+        return Err(
+            "CDP port is already occupied; choose another port (no browser was closed)".into(),
+        );
     }
-    let exe =
-        browser_exe(args.browser.as_deref().or(args.copy_login.as_deref())).unwrap_or_else(|| {
-            eprintln!("no Edge/Chrome/Brave executable found");
-            std::process::exit(2);
-        });
-
-    let mut temp_copy: Option<PathBuf> = None;
-    let profile_dir = match (&args.copy_login, &args.profile_dir) {
-        (Some(browser), explicit) => {
-            let real = real_user_data(browser).unwrap_or_else(|| {
-                eprintln!("unknown browser or no installed profile for '{browser}'");
-                std::process::exit(2);
-            });
-            println!(
-                "{{\"stage\":\"closing_browser\",\"browser\":\"{}\"}}",
-                browser
-            );
-            close_browser(&exe);
-            let work = explicit.clone().unwrap_or_else(|| {
-                std::env::temp_dir().join(format!("aad-cdp-login-{}", args.port))
-            });
-            if let Err(error) = copy_login_profile(&real, &work) {
-                eprintln!("login copy failed: {error}");
-                std::process::exit(1);
-            }
-            if args.profile_dir.is_none() {
-                temp_copy = Some(work.clone());
-            }
-            work
-        }
-        (None, Some(explicit)) => explicit.clone(),
-        (None, None) => std::env::temp_dir().join(format!("aad-cdp-profile-{}", args.port)),
-    };
-    std::fs::create_dir_all(&profile_dir).expect("create profile dir");
-
-    let url = args.url.unwrap_or_else(|| "about:blank".to_string());
-
-    let mut command = Command::new(&exe);
+    let exe = browser_exe(Some(&args.browser)).ok_or("selected browser executable not found")?;
+    let work = args.profile_dir.clone().unwrap_or_else(|| {
+        std::env::temp_dir().join(format!("aad-cdp-profile-{}", uuid::Uuid::new_v4()))
+    });
+    if let Some(source) = &source {
+        let id = select_profile(
+            source,
+            args.existing_profile.as_ref().and_then(|id| id.as_deref()),
+        )?;
+        aad_cdp::launch::validate_copy_destination(source, &work)?;
+        ensure_available(source, &args.browser, args.kill_browser)?;
+        copy_selected_profile(source, &work, &id)?;
+        eprintln!("Using existing profile {id} via a working login copy.");
+    } else {
+        std::fs::create_dir_all(&work)?;
+    }
+    ensure_available(&work, &args.browser, args.kill_browser)?;
+    let mut command = Command::new(exe);
     command
         .args([
             format!("--remote-debugging-port={}", args.port),
-            "--remote-debugging-address=127.0.0.1".to_string(),
-            format!("--user-data-dir={}", profile_dir.display()),
-            "--no-first-run".to_string(),
-            "--no-default-browser-check".to_string(),
-            "--new-window".to_string(),
-            url,
+            "--remote-debugging-address=127.0.0.1".into(),
+            format!("--user-data-dir={}", work.canonicalize()?.display()),
+            "--profile-directory=Default".into(),
+            "--no-first-run".into(),
+            "--no-default-browser-check".into(),
+            "--new-window".into(),
+            args.url.unwrap_or_else(|| "about:blank".into()),
         ])
-        .stderr(Stdio::null())
-        .stdout(Stdio::null());
-
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
     #[cfg(windows)]
     if args.detached {
         use std::os::windows::process::CommandExt;
-        const FLAGS: u32 = 0x0000_0200 | 0x0000_0008;
-        command.creation_flags(FLAGS);
+        command.creation_flags(0x0000_0200 | 0x0000_0008);
     }
-
-    let child = command.spawn().unwrap_or_else(|error| {
-        eprintln!("failed to start {}: {error}", exe.display());
-        std::process::exit(1);
-    });
-
+    let mut child = command.spawn()?;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
     let mut ready = false;
     while std::time::Instant::now() < deadline {
+        if child.try_wait()?.is_some() {
+            break;
+        }
         if aad_cdp::Client::available(args.port) {
             ready = true;
             break;
         }
-        std::thread::sleep(std::time::Duration::from_millis(300));
+        std::thread::sleep(std::time::Duration::from_millis(100));
     }
-
-    let mode = if args.copy_login.is_some() {
-        "login-copy"
-    } else {
-        "dedicated"
-    };
     println!(
-        "{{\"browser\":\"{}\",\"port\":{},\"profile_dir\":\"{}\",\"mode\":\"{}\",\"ready\":{},\"pid\":{}}}",
-        exe.display(),
-        args.port,
-        profile_dir.display(),
-        mode,
-        ready,
-        child.id()
+        "{}",
+        json!({"browser":args.browser,"port":args.port,"profile_dir":work,"ready":ready,"pid":child.id()})
     );
-
     if !ready {
-        eprintln!("warning: debug endpoint did not answer in time");
-        std::process::exit(1);
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err("debug endpoint did not start; browser may already use this profile; retry with --kill-browser or choose another profile".into());
     }
     if args.detached {
-        // The launcher now exits, handing the browser to the OS. Explicitly
-        // release its handle instead of retaining an un-waited child in a
-        // long-lived launcher. Login temp copies require explicit retention.
         drop(child);
     } else {
-        let _ = child.wait_with_output();
-    }
-
-    // Do not leave a credential-bearing temp copy on disk.
-    if let Some(copy) = temp_copy {
-        if !args.keep_copy {
-            close_browser(&exe);
-            let _ = std::fs::remove_dir_all(copy);
+        let _ = child.wait();
+        if args.profile_dir.is_none() && !args.keep_copy {
+            let _ = std::fs::remove_dir_all(work);
         }
+    }
+    Ok(())
+}
+fn main() {
+    if let Err(error) = run(Args::parse()) {
+        eprintln!("{error}");
+        std::process::exit(1);
     }
 }

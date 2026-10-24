@@ -1,5 +1,92 @@
 use std::path::{Path, PathBuf};
 
+#[derive(serde::Serialize)]
+pub struct ProfileInfo {
+    pub id: String,
+    pub name: String,
+    pub path: PathBuf,
+}
+
+/// Directory IDs are the stable selection keys. Display names may be duplicated.
+pub fn list_profiles(root: &Path) -> Result<Vec<ProfileInfo>, String> {
+    let state: serde_json::Value = match std::fs::read(root.join("Local State")) {
+        Ok(bytes) => {
+            serde_json::from_slice(&bytes).map_err(|e| format!("invalid Local State: {e}"))?
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::Value::Null,
+        Err(e) => return Err(e.to_string()),
+    };
+    let mut profiles = Vec::new();
+    for entry in std::fs::read_dir(root).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let Some(id) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if validate_profile_id(&id).is_err() || !entry.path().join("Preferences").is_file() {
+            continue;
+        }
+        let path = selected_profile(root, &id)?;
+        let name = state["profile"]["info_cache"][&id]["name"]
+            .as_str()
+            .unwrap_or(&id)
+            .to_string();
+        profiles.push(ProfileInfo { id, name, path });
+    }
+    profiles.sort_by(|a, b| a.id.cmp(&b.id));
+    Ok(profiles)
+}
+
+pub fn validate_profile_id(id: &str) -> Result<(), String> {
+    if id.is_empty()
+        || id == "."
+        || id == ".."
+        || id.contains(['/', '\\', ':'])
+        || id.chars().any(char::is_control)
+    {
+        return Err(
+            "profile must be a directory ID such as Default or 'Profile 1', not a path".into(),
+        );
+    }
+    Ok(())
+}
+
+pub fn select_profile(root: &Path, requested: Option<&str>) -> Result<String, String> {
+    if let Some(id) = requested {
+        selected_profile(root, id)?;
+        return Ok(id.into());
+    }
+    let profiles = list_profiles(root)?;
+    if profiles.len() == 1 {
+        return Ok(profiles[0].id.clone());
+    }
+    if profiles.is_empty() {
+        return Err("no existing browser profiles found in the selected source".into());
+    }
+    let choices = profiles
+        .iter()
+        .map(|p| format!("{} ({})", p.id, p.name))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(format!(
+        "multiple profiles found: {choices}; specify --existing-profile <ID>"
+    ))
+}
+
+pub fn selected_profile(root: &Path, id: &str) -> Result<PathBuf, String> {
+    validate_profile_id(id)?;
+    let root = root.canonicalize().map_err(|e| e.to_string())?;
+    let selected = root.join(id).canonicalize().map_err(|_| {
+        format!("profile '{id}' not found; run browser-record profiles to list directory IDs")
+    })?;
+    if selected.parent() != Some(root.as_path()) || !selected.join("Preferences").is_file() {
+        return Err(format!(
+            "'{id}' is not a browser profile inside {}",
+            root.display()
+        ));
+    }
+    Ok(selected)
+}
+
 pub fn browser_exe(browser: Option<&str>) -> Option<PathBuf> {
     let names: &[&str] = match browser {
         Some("edge") => &["edge"],
@@ -119,6 +206,27 @@ const AUTH_FILES: &[&str] = &[
 ];
 
 pub fn copy_login_profile(real: &Path, work: &Path) -> Result<(), String> {
+    copy_selected_profile(real, work, "Default")
+}
+
+pub fn copy_selected_profile(real: &Path, work: &Path, id: &str) -> Result<(), String> {
+    selected_profile(real, id)?;
+    validate_copy_destination(real, work)?;
+    let real = real.canonicalize().map_err(|e| e.to_string())?;
+    // Atomically claim a NEW directory. Never remove caller-owned directories.
+    std::fs::create_dir(work)
+        .map_err(|e| format!("working profile must be a new directory: {e}"))?;
+    let result = copy_login_files(&real, work, id);
+    if result.is_err() {
+        let _ = std::fs::remove_dir_all(work);
+    }
+    result
+}
+
+pub fn validate_copy_destination(real: &Path, work: &Path) -> Result<(), String> {
+    if work.exists() {
+        return Err("copy destination --profile-dir must be a NEW directory".into());
+    }
     let real = real.canonicalize().map_err(|e| e.to_string())?;
     let parent = work
         .parent()
@@ -129,26 +237,23 @@ pub fn copy_login_profile(real: &Path, work: &Path) -> Result<(), String> {
     if parent.starts_with(&real) {
         return Err("the working profile must be outside the real profile".into());
     }
-    // Atomically claim a NEW directory. Never recursively delete a path supplied
-    // by the caller: it may contain unrelated data or be the real profile itself.
-    std::fs::create_dir(work)
-        .map_err(|e| format!("working profile must be a new directory: {e}"))?;
-    let result = copy_login_files(&real, work);
-    if result.is_err() {
-        // This invocation created the directory, so partial copies are ours.
-        let _ = std::fs::remove_dir_all(work);
-    }
-    result
+    Ok(())
 }
 
-fn copy_login_files(real: &Path, work: &Path) -> Result<(), String> {
+fn copy_login_files(real: &Path, work: &Path, id: &str) -> Result<(), String> {
     let mut copied = 0usize;
     for relative in AUTH_FILES {
-        let source = real.join(relative);
+        // Keep working copies under Default so later --profile-dir reuse needs
+        // no source selection and never opens an empty sibling profile.
+        let destination = work.join(relative);
+        let relative = relative
+            .strip_prefix("Default/")
+            .map(|tail| PathBuf::from(id).join(tail))
+            .unwrap_or_else(|| PathBuf::from(relative));
+        let source = real.join(&relative);
         if !source.exists() {
             continue;
         }
-        let destination = work.join(relative);
         if let Some(parent) = destination.parent() {
             std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
@@ -169,7 +274,8 @@ fn copy_login_files(real: &Path, work: &Path) -> Result<(), String> {
         }
         if let Some(e) = last_error {
             return Err(format!(
-                "could not copy {relative}: {e}; close the source browser before copying"
+                "could not copy {}: {e}; close the source browser before copying",
+                relative.display()
             ));
         }
     }
@@ -184,6 +290,56 @@ mod tests {
     use super::*;
 
     #[test]
+    fn profile_selection_is_explicit_when_ambiguous_and_copies_only_selected_files() {
+        let root = std::env::temp_dir().join(format!("aad-profiles-{}", uuid::Uuid::new_v4()));
+        let source = root.join("source");
+        std::fs::create_dir_all(source.join("Profile 1")).unwrap();
+        std::fs::write(
+            source.join("Profile 1/Preferences"),
+            br#"{"marker":"selected"}"#,
+        )
+        .unwrap();
+        std::fs::write(source.join("Local State"), br#"{"profile":{"info_cache":{"Default":{"name":"Work"},"Profile 1":{"name":"Work"},"Profile 2":{"name":"Stale"}}}}"#).unwrap();
+        assert_eq!(select_profile(&source, None).unwrap(), "Profile 1");
+        std::fs::create_dir(source.join("Default")).unwrap();
+        std::fs::write(source.join("Default/Preferences"), b"wrong profile").unwrap();
+        let listed = list_profiles(&source).unwrap();
+        assert_eq!(
+            listed.len(),
+            2,
+            "stale metadata must not count as a usable profile"
+        );
+        assert_eq!(
+            listed[0].name, listed[1].name,
+            "display names are not selection IDs"
+        );
+        assert!(select_profile(&source, None)
+            .unwrap_err()
+            .contains("multiple profiles"));
+        for invalid in [
+            "..",
+            "../Default",
+            "Profile 9",
+            "C:\\Default",
+            "Default/sub",
+            "Work",
+        ] {
+            assert!(select_profile(&source, Some(invalid)).is_err());
+        }
+        let copied = root.join("copy");
+        copy_selected_profile(&source, &copied, "Profile 1").unwrap();
+        assert_eq!(
+            std::fs::read(copied.join("Default/Preferences")).unwrap(),
+            br#"{"marker":"selected"}"#
+        );
+        assert!(
+            !copied.join("Profile 1").exists(),
+            "working copies consistently use Default"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn copying_a_profile_never_deletes_existing_or_source_directories() {
         let root = std::env::temp_dir().join(format!("aad-profile-test-{}", uuid::Uuid::new_v4()));
         let real = root.join("real");
@@ -191,6 +347,8 @@ mod tests {
         std::fs::create_dir_all(&real).unwrap();
         std::fs::create_dir(&existing).unwrap();
         std::fs::write(real.join("Local State"), b"dummy fixture").unwrap();
+        std::fs::create_dir(real.join("Default")).unwrap();
+        std::fs::write(real.join("Default/Preferences"), b"{}").unwrap();
         std::fs::write(existing.join("important.txt"), b"keep me").unwrap();
 
         for work in [&real, &existing, &root, &real.join("nested")] {

@@ -1,7 +1,12 @@
 //! Explicit browser startup shared with aad-browser. Recording owns only the
 //! process/profile it launches; attaching to an existing page stays separate.
+mod occupancy;
 mod profile;
-pub use profile::{browser_exe, copy_login_profile, real_user_data};
+pub use occupancy::ensure_available;
+pub use profile::{
+    browser_exe, copy_login_profile, copy_selected_profile, list_profiles, real_user_data,
+    select_profile, selected_profile, validate_copy_destination,
+};
 
 use crate::{connection::Connection, ws::WebSocket, Client};
 use serde_json::json;
@@ -19,6 +24,8 @@ pub struct Options {
     pub profile_dir: Option<PathBuf>,
     /// Copy login files from this CLOSED user-data directory into a new profile.
     pub copy_from: Option<PathBuf>,
+    pub profile_id: String,
+    pub kill_browser: bool,
     pub headless: bool,
 }
 
@@ -34,25 +41,29 @@ impl Profile {
             std::env::temp_dir().join(format!("aad-record-profile-{}", uuid::Uuid::new_v4()))
         });
         if let Some(source) = &options.copy_from {
-            ensure_closed(source)?;
-            copy_login_profile(source, &path)?;
+            selected_profile(source, &options.profile_id)?;
+            profile::validate_copy_destination(source, &path)?;
+            ensure_available(source, &options.browser, options.kill_browser)?;
+            copy_selected_profile(source, &path, &options.profile_id)?;
         } else {
             fs::create_dir_all(&path)?;
         }
         let path = path.canonicalize()?;
-        let lock = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(path.join(".aad-recording.lock"))
-            .map_err(|e| {
-                format!("profile already in use by AAD (or stale .aad-recording.lock): {e}")
-            })?;
-        let profile = Self {
+        let mut profile = Self {
             path,
             temporary: options.profile_dir.is_none(),
-            lock: Some(lock),
+            lock: None,
         };
-        ensure_closed(&profile.path)?;
+        ensure_available(&profile.path, &options.browser, options.kill_browser)?;
+        profile.lock = Some(
+            OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(profile.path.join(".aad-recording.lock"))
+                .map_err(|e| {
+                    format!("profile already in use by AAD (or stale .aad-recording.lock): {e}")
+                })?,
+        );
         // A new launch must write a fresh endpoint file. Never attach to a stale
         // port or assume that a pre-existing endpoint belongs to this process.
         let active = profile.path.join("DevToolsActivePort");
@@ -63,25 +74,12 @@ impl Profile {
     }
 }
 
-fn ensure_closed(path: &Path) -> Result<()> {
-    #[cfg(unix)]
-    if fs::symlink_metadata(path.join("SingletonLock")).is_ok() {
-        return Err("profile is in use (SingletonLock exists); close that browser before reusing/copying it".into());
-    }
-    if let Ok(contents) = fs::read_to_string(path.join("DevToolsActivePort")) {
-        if let Some(port) = contents.lines().next().and_then(|s| s.parse().ok()) {
-            if Client::available(port) {
-                return Err("profile has a running CDP browser; attach with --page, or close it before launching".into());
-            }
-        }
-    }
-    Ok(())
-}
-
 impl Drop for Profile {
     fn drop(&mut self) {
-        drop(self.lock.take());
-        let _ = fs::remove_file(self.path.join(".aad-recording.lock"));
+        if let Some(lock) = self.lock.take() {
+            drop(lock);
+            let _ = fs::remove_file(self.path.join(".aad-recording.lock"));
+        }
         if self.temporary {
             for _ in 0..20 {
                 if fs::remove_dir_all(&self.path).is_ok() || !self.path.exists() {
@@ -130,6 +128,7 @@ impl Browser {
                 "--no-startup-window",
             ])
             .arg(format!("--user-data-dir={}", profile.path.display()))
+            .arg("--profile-directory=Default")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());

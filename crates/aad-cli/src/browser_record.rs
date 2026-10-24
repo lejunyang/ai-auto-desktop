@@ -9,6 +9,14 @@ use std::sync::{
 
 #[derive(Subcommand)]
 pub enum Command {
+    /// List existing browser profile directory IDs and their display names.
+    Profiles {
+        #[arg(long, value_parser = ["edge", "chrome", "brave"])]
+        browser: String,
+        /// Custom source user-data directory; default is this browser's daily data.
+        #[arg(long)]
+        profile_source: Option<PathBuf>,
+    },
     /// List pages for explicit selection (does not start or restart a browser).
     Targets {
         #[arg(long, default_value_t = 9222)]
@@ -42,8 +50,8 @@ pub struct Start {
     /// Exact page ID returned by browser-record targets. Never guessed by title.
     #[arg(long, required_unless_present = "browser", conflicts_with = "browser")]
     page: Option<String>,
-    /// Start a browser with CDP automatically. -login copies the closed daily profile.
-    #[arg(long, value_parser = ["edge", "chrome", "brave", "edge-login", "chrome-login", "brave-login"])]
+    /// Browser family. Select an existing profile separately with --existing-profile.
+    #[arg(long, value_parser = ["edge", "chrome", "brave"])]
     browser: Option<String>,
     /// Open this URL AFTER recording listeners are installed.
     #[arg(long, requires = "browser")]
@@ -51,12 +59,15 @@ pub struct Start {
     /// Reuse/create a persistent working user-data directory; default is fresh/temp.
     #[arg(long, requires = "browser")]
     profile_dir: Option<PathBuf>,
-    /// Copy login files from the chosen browser's closed default profile.
-    #[arg(long, requires = "browser", conflicts_with = "copy_profile_from")]
-    copy_login: bool,
-    /// Copy login files from a closed user-data directory into a NEW working profile.
+    /// Copy an existing profile's login files. Omit ID only when exactly one exists.
+    #[arg(long, requires = "browser", num_args = 0..=1, value_name = "ID")]
+    existing_profile: Option<Option<String>>,
+    /// Source user-data directory; defaults to the selected browser's daily data.
+    #[arg(long, requires = "existing_profile")]
+    profile_source: Option<PathBuf>,
+    /// If occupied, close the browser using this user-data directory before starting.
     #[arg(long, requires = "browser")]
-    copy_profile_from: Option<PathBuf>,
+    kill_browser: bool,
     /// Override executable discovery (use the matching --browser family).
     #[arg(long, requires = "browser")]
     browser_executable: Option<PathBuf>,
@@ -88,6 +99,15 @@ pub struct Start {
 
 pub fn run(command: &Command) -> recording::Result<Value> {
     match command {
+        Command::Profiles {
+            browser,
+            profile_source,
+        } => {
+            let root = source_root(browser, profile_source)?;
+            Ok(
+                json!({"browser":browser,"profile_source":root,"profiles":aad_cdp::launch::list_profiles(&root)?}),
+            )
+        }
         Command::Targets { cdp_port } => Ok(
             json!({"pages":aad_cdp::Client::list_targets(*cdp_port)?.iter().map(|p|json!({"id":p.id,"title":p.title,"url":p.url})).collect::<Vec<_>>()}),
         ),
@@ -95,26 +115,35 @@ pub fn run(command: &Command) -> recording::Result<Value> {
             if args.out.exists() {
                 return Err("recording output must be a new directory".into());
             }
+            if args.body_limit > 1024 * 1024 || args.max_bytes < 1024 * 1024 {
+                return Err("body limit must be <= 1 MiB; session budget must be >= 1 MiB".into());
+            }
             let cancel = Arc::new(AtomicBool::new(false));
             let signal = cancel.clone();
             ctrlc::set_handler(move || signal.store(true, Ordering::SeqCst))?;
             let browser = if let Some(name) = &args.browser {
-                let choice = crate::browser_launch::parse(name).ok_or("unsupported browser")?;
-                if choice.copy_login && args.copy_profile_from.is_some() {
-                    return Err(
-                        "use either a -login browser or --copy-profile-from, not both".into(),
+                let source = if args.existing_profile.is_some() {
+                    Some(source_root(name, &args.profile_source)?)
+                } else {
+                    None
+                };
+                let profile_id = match (&source, &args.existing_profile) {
+                    (Some(root), Some(id)) => aad_cdp::launch::select_profile(root, id.as_deref())?,
+                    _ => "Default".into(),
+                };
+                if let Some(root) = &source {
+                    eprintln!(
+                        "Using existing profile {profile_id} from {} via a working login copy.",
+                        root.display()
                     );
                 }
-                let source = if choice.copy_login || args.copy_login {
-                    Some(aad_cdp::launch::real_user_data(&choice.browser).ok_or("daily browser profile not found; use --copy-profile-from for a custom user-data directory")?)
-                } else {
-                    args.copy_profile_from.clone()
-                };
                 Some(aad_cdp::launch::Browser::start(aad_cdp::launch::Options {
-                    browser: choice.browser,
+                    browser: name.clone(),
                     executable: args.browser_executable.clone(),
                     profile_dir: args.profile_dir.clone(),
                     copy_from: source,
+                    profile_id,
+                    kill_browser: args.kill_browser,
                     headless: args.headless,
                 })?)
             } else {
@@ -162,4 +191,13 @@ pub fn run(command: &Command) -> recording::Result<Value> {
             Ok(json!({"exported":true,"out":out.join("walkthrough.md")}))
         }
     }
+}
+
+fn source_root(browser: &str, explicit: &Option<PathBuf>) -> recording::Result<PathBuf> {
+    explicit
+        .clone()
+        .or_else(|| aad_cdp::launch::real_user_data(browser))
+        .ok_or_else(|| {
+            "browser profile source not found; use --profile-source <user-data-dir>".into()
+        })
 }

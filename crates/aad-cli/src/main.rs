@@ -442,12 +442,20 @@ struct WatchArgs {
     /// Auto-launch a debug-enabled browser if no CDP endpoint is listening,
     /// rather than silently falling back to UIA.
     ///
-    /// `edge|chrome|brave` starts that browser with a dedicated logged-out
-    /// profile; `edge-login|chrome-login|brave-login` carries existing site
-    /// logins over via a copy of the real profile's credential files (the
-    /// browser is restarted once; the real profile is never modified).
-    #[arg(long, value_name = "BROWSER")]
+    /// Select profile separately using --existing-profile or --profile-dir.
+    #[arg(long, value_name = "BROWSER", value_parser = ["edge", "chrome", "brave"])]
     browser: Option<String>,
+    /// Copy an existing profile; omit ID only when exactly one exists.
+    #[arg(long, requires = "browser", num_args = 0..=1, value_name = "ID")]
+    existing_profile: Option<Option<String>>,
+    #[arg(long, requires = "existing_profile")]
+    profile_source: Option<PathBuf>,
+    /// Working profile directory; required for retaining a detached login copy.
+    #[arg(long, requires = "browser")]
+    profile_dir: Option<PathBuf>,
+    /// Explicitly close the browser occupying the selected user-data directory.
+    #[arg(long, requires = "browser")]
+    kill_browser: bool,
 }
 
 #[derive(Subcommand)]
@@ -1198,12 +1206,18 @@ fn run_watch(args: &WatchArgs) -> (Value, u8) {
 
     // Resolve the effective CDP port and an optional auto-launched browser.
     let cdp_launch = match args.browser.as_deref().map(browser_launch::parse) {
-        Some(Some(launch)) => Some(launch),
+        Some(Some(mut launch)) => {
+            launch.existing_profile = args.existing_profile.clone();
+            launch.profile_source = args.profile_source.clone();
+            launch.profile_dir = args.profile_dir.clone();
+            launch.kill_browser = args.kill_browser;
+            Some(launch)
+        }
         Some(None) => {
             return (
                 failure(
                     "CLI.INVALID_ARGUMENTS",
-                    "--browser expects edge, chrome, brave or an *-login variant",
+                    "--browser expects edge, chrome or brave; use --existing-profile to choose a profile",
                     None,
                 ),
                 EXIT_USAGE,
@@ -1225,7 +1239,7 @@ fn run_watch(args: &WatchArgs) -> (Value, u8) {
             emit(
                 &mut sink,
                 json!({"kind": "cdp_ready", "browser": launch.browser, "port": cdp_port,
-                       "login_copy": launch.copy_login}),
+                       "login_copy": launch.existing_profile.is_some()}),
             );
         }
     }
