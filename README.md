@@ -10,13 +10,14 @@ ai-auto-desktop 让人和 AI 用同一套能力观察并操作桌面：**发现�
 | **MCP** | `aad mcp`（stdio 上的 JSON-RPC） | 给 AI agent 调用 |
 | **GUI** | Tauri + Vue 桌面窗口 | 可视化查看界面、录制并编排步骤 |
 
-统一控制入口是 `aad control serve` 和 MCP 的 `control_*` 工具：Windows UIA、Linux AT-SPI、
+AI 只有一套入口：`aad control serve`（NDJSON）和 MCP 的 `control_*` 工具。Windows UIA、Linux AT-SPI、
 macOS AX 与显式启用的 Chromium CDP 共用会话、资源、观察引用和类型化动作。
-`aad mcp --connect` 可通过已有的认证 SSH 连接控制远程环境；服务端默认只读，授权由服务端启动参数决定。
+`aad mcp` 与 `aad control serve` 默认都只读，输入由启动参数 `--allow-input` 授予；
+`aad mcp --connect` 可通过已有的认证 SSH 连接控制远程环境，授权由远端服务的启动参数决定。
 详见[统一控制与远程会话](docs/control-sessions.md)。
 
-原有 `apps/describe/find/do` CLI、旧 MCP 工具和 GUI 仍主要使用 Windows UIA。
-GUI 尚未迁入新会话层；录制、回放和事件观察的限制见[控制能力审视](docs/research/control-audit-2026-10-17.md)。
+给人用的 `apps/describe/find/do` CLI 和 GUI 仍直接使用 Windows UIA，引用形如下文的 `snapshot:revision:node`。
+GUI 尚未迁入会话层；录制、回放和事件观察的限制见[控制能力审视](docs/research/control-audit-2026-10-17.md)。
 
 浏览器任务观测使用 `aad browser-record`：记录操作、关键元素变化、网络请求和截图，生成给 AI 编写 skill 的步骤说明。`aad browser-record start --browser edge --url 'https://example.com' --out ./recording` 自动启动并录制，可用 `--profile-dir` 复用工作 profile，或用 `--existing-profile [ID]` 选择日常已有 profile（只有一个时无需填 ID）。占用时默认提示，显式 `--kill-browser` 才结束占用浏览器并启动。**网络默认保留原值，`--redact-network` 才开启脱敏**。详见[浏览器任务录制](docs/browser-recording.md)。
 
@@ -24,7 +25,8 @@ GUI 尚未迁入新会话层；录制、回放和事件观察的限制见[控制
 
 这是整个项目的主轴，也是与“坐标点击”类工具的根本区别。
 
-**任何写操作都必须引用一个真实观察过的元素**，引用形如 `snapshot:revision:node`（例如 `a2466628:10:e68`）。执行前 driver 会用捕获时记录的 role / name / automation_id / class_name 与当前活动界面二次比对：
+**任何写操作都必须引用一个真实观察过的元素**。给 AI 的会话里，引用是 `session_id + resource_id + observation_id + node_id`，
+只在本会话、本次观察内有效；给人用的 CLI 里是紧凑的 `snapshot:revision:node`（例如 `a2466628:10:e68`）。执行前 driver 会用捕获时记录的 role / name / automation_id / class_name 与当前活动界面二次比对：
 
 - 界面变了 → 返回 `DRIVER.STALE_HANDLE` 并**拒绝执行**，而不是打到别的元素上；
 - 定位命中多个 → 返回 `DRIVER.AMBIGUOUS_MATCH` 并列出候选，绝不“取第一个”；
@@ -244,17 +246,29 @@ aad resume job-1 workflow.yaml --store runs.sqlite3
 ## 给 AI 使用（MCP）
 
 ```powershell
-aad mcp
+aad mcp                  # 只读：能看，不能动
+aad mcp --allow-input    # 由启动它的人授予输入
 ```
 
-在 stdio 上说 JSON-RPC 2.0，protocolVersion `2024-11-05`。提供 17 个工具，分两类：
+在 stdio 上说 JSON-RPC 2.0，protocolVersion `2024-11-05`。工具分两类：
 
-**看与做**（临场操作）：`list_apps`、`overview_window`、`describe_window`、`find_element`、`focus`、`invoke`、
-`set_value`、`type_text`、`key_chord`、`pointer_click`、`pointer_gesture`、`drag`、`probe_environment`。
+**看与做**：`control_capabilities`、`control_targets`、`control_observe`、`control_find`、`control_act`、
+`control_cancel`、`control_close`，另有不需要桌面的 `probe_environment`。
+
+- `control_targets` 列出窗口、应用和浏览器页面；`control_observe` 默认返回有上限的 outline（可操作或有名字的元素，
+  按 `limit` 与 `max_characters` 截断，`stopped_by` 说明是哪个上限）。窗口很大时先用 `view.mode=overview`
+  看区域划分，再用 `view.region` 读其中一块。区域只在 Windows 上计算，其他平台用 outline。
+- `control_find` 只返回唯一一个节点；匹配多个时报错并列出候选。定位器支持 role、name、node_id，
+  Windows 上还支持 automation_id、class_name、value、states、`match: contains`、`within`、`near`、`nth`；
+  其他平台遇到这些字段会明确拒绝，不会忽略。`expect: optional` 用来问"这个东西没了吗"。
+- `control_act` 的动作：focus、invoke、click（可选 button、count、元素内 fraction）、fill、type_text（unicode/keys）、
+  key、scroll、hover、drag（终点必须是同一次观察里的另一个节点）。位置只能是元素内 0..1 的比例。
+  以观察结果里每个节点的 `capabilities` 为准：浏览器只支持普通 click、fill、key、focus。
+- 失败以结构化错误返回，并附 `hint` 说明怎样恢复（例如界面变了要重新 observe，匹配多个要用 `within` 收窄）。
 
 **保存与运行流程**（重复劳动）：`save_workflow`、`list_workflows`、`describe_workflow`、`run_workflow`。
-`save_workflow` 可保留 layout-aware 文本、组合键、指针手势和双端点拖拽参数；每次回放都重新 snapshot 并从描述性 locator 定位。
-录一次、存进 store，之后 AI 按名字跑，比每次重新拼一遍点击序列可靠得多。
+`save_workflow` 可保留 layout-aware 文本、组合键、指针手势和双端点拖拽参数；每次回放都重新 snapshot 并从描述性 locator 定位，
+outline 里每个 Windows 元素都带一个可直接保存的 `locator`。录一次、存进 store，之后 AI 按名字跑，比每次重新拼一遍操作序列可靠得多。
 
 ```
 list_workflows              → {"count":1,"workflows":[{"name":"greeter"}],"directory":"..."}
@@ -271,7 +285,10 @@ run_workflow(greeter, ...)  → {"status":"succeeded","outputs":{...}}
 - `describe_workflow` 会回报 `runnable`，所以这条限制**从只读调用就能发现**，不必靠一次
   被拒的运行去踩。
 - `list_workflows` / `describe_workflow` **不需要桌面可用**：它们读的是文件夹。桌面坏了
-  也能回答「有哪些流程」，而真正要动桌面的工具才报 `DRIVER.UNAVAILABLE`。
+  也能回答「有哪些流程」；`control_targets` 则在 `unavailable` 里说明桌面为什么不可用。
+- **`run_workflow` 与 `control_act` 走同一个会话**：同一个原生 driver、同一把串行锁、同一份输入租约，
+  只读服务器上它和 `save_workflow` 一样被拒（`POLICY.DENIED`）。限定了 `--provider` 或 `--resource` 时
+  不提供工作流工具：工作流按窗口名自己找窗口，这类授权管不住它。
 - store 与 GUI 共用同一个目录（`AAD_RECORDINGS_DIR` 可覆盖），GUI 里录完存下的东西
   AI 立刻能看到。
 

@@ -8,31 +8,58 @@
 
 | provider | 类型化动作 | 实际语义 / 限制 |
 | --- | --- | --- |
-| `desktop.windows_uia` | focus, invoke, click, fill, type_text, key | UIA + 原生输入；节点必须暴露对应能力 |
-| `desktop.linux_atspi` | focus, invoke, click, fill, type_text | AT-SPI；指针/输入依赖已有 X11 helper；没有统一 key 适配 |
-| `desktop.macos_ax` | focus, invoke, click, fill, type_text | AX helper；需要同一登录用户的辅助功能权限；没有统一 key 适配 |
-| `browser.cdp` | focus, click, fill, key | click 为 `HTMLElement.click()` 的 DOM 激活；fill 为 DOM 值及 input/change 事件；key 为主 frame 的 CDP Input |
+| `desktop.windows_uia` | focus, invoke, click, fill, type_text, key, scroll, hover, drag | UIA + 原生输入；click 带 button/count/fraction 时走原生手势；节点必须暴露对应能力 |
+| `desktop.linux_atspi` | focus, invoke, click, fill, type_text | AT-SPI；指针/输入依赖已有 X11 helper；只有普通左键 click，没有统一 key 与手势适配 |
+| `desktop.macos_ax` | focus, invoke, click, fill, type_text | AX helper；需要同一登录用户的辅助功能权限；只有普通左键 click，没有统一 key 与手势适配 |
+| `browser.cdp` | focus, click, fill, key | click 为 `HTMLElement.click()` 的 DOM 激活，不接受 button/count/fraction；fill 为 DOM 值及 input/change 事件；key 为主 frame 的 CDP Input |
 
 以 `capabilities` 和观察节点的 `capabilities` 为准。可列出 provider 不表示当前 OS 已授予
 桌面权限。启动失败或不可用原因在 `unavailable` 中返回。浏览器 key 只支持列出的导航/编辑键
 和有限编辑组合，普通文本使用 fill。子 frame 不宣传 key；OOPIF 等不支持路径明确报错。
 DOM click/fill 的事件 `isTrusted=false`，并不等价于原生指针或真实逐键输入。
 
+动作参数：`click` 可带 `button`（left/right/middle）、`count`（1/2）、`fraction`；`type_text` 可带
+`mode`（unicode/keys）；`scroll` 要 `direction`，可带 `notches`（1..30）、`fraction`；`hover` 可带
+`ms`（1..5000，默认 500）、`fraction`；`drag` 要 `to`（同一次观察里另一个节点的 target），可带
+`button`、`fraction`、`to_fraction`。`fraction` 是元素框内 0..1 的比例，不是屏幕坐标。
+
+## 观察视图与定位器
+
+`observe` 总是保留完整捕获（`max_nodes` 上限 2000），`view` 只决定返回什么，不影响哪些节点可以 find/act：
+
+| `view.mode` | 返回 | 适用 |
+| --- | --- | --- |
+| `nodes`（协议默认） | 全部节点 | 需要原始树的程序 |
+| `outline`（MCP 默认） | 可操作或有名字、不在屏幕外的节点，按 `limit`（默认 80，≤500）与 `max_characters`（默认 20000）截断；回报 `matched`、`shown`、`stopped_by` | AI 阅读 |
+| `overview` | 区域及其大小，不列内容 | 大窗口先看结构；只有 Windows 计算区域，其他平台返回 `CONTROL.VIEW_UNSUPPORTED` |
+
+`view.region` 只用于 outline，取 overview 报出的区域名，与定位器 `within` 用的名字一致。
+Windows 的 outline 和 overview 直接复用本次观察的 driver 快照，不会另拍一张。
+
+`find` 的定位器：`role`、`name`、`node_id` 在所有 provider 上精确匹配；`value`、`automation_id`、
+`class_name`、`framework_id`、`states`、`match`（exact/contains）、`within`、`near`、`nth` 由 Windows
+driver 求值，其他 provider 返回 `CONTROL.LOCATOR_UNSUPPORTED`，不会悄悄忽略。匹配多个时返回
+`CONTROL.AMBIGUOUS`（Windows 为 `DRIVER.AMBIGUOUS_MATCH`）并在 `details.candidates` 列出候选；
+`expect: optional` 时找不到返回 `found: false` 而不是错误，多个匹配仍然报错。
+
 CLI 的持久协议入口在三平台均可用：
 
 ```powershell
 aad control serve                       # 一个只读会话，stdin/stdout NDJSON
 aad control serve --allow-input          # 由可信操作者明确授予输入
-aad mcp --read-only                      # 本机 MCP，只读
-aad mcp --provider desktop.linux_atspi    # 限定 provider，并只暴露统一工具
+aad mcp                                  # 本机 MCP，默认只读
+aad mcp --allow-input                    # 本机 MCP，授予输入与工作流写入/运行
+aad mcp --provider desktop.linux_atspi    # 限定 provider，不提供工作流工具
 aad mcp --browser-port 9222              # 显式连接本机已有的隔离 CDP 实例
 ```
 
 MCP 工具为 `control_capabilities`, `control_targets`, `control_observe`, `control_find`,
-`control_act`, `control_cancel`, `control_close`。每次调用可带 `request_id` 与 `timeout_ms`。
-`control_cancel` 的被取消请求字段名为 `target_request_id`；MCP cancellation notification 也能取消
-仍在执行的统一操作。无参数 `aad mcp` 为兼容本机使用仍允许输入，远程服务 `control serve` 默认只读。
-原有 Windows CLI/MCP 工具继续保留；远程 MCP 或指定 provider/resource 时只暴露统一工具，避免绕过授权。
+`control_act`, `control_cancel`, `control_close`，本机未限定授权时另有 `probe_environment` 与四个工作流工具。
+每次调用可带 `request_id` 与 `timeout_ms`。`control_cancel` 的被取消请求字段名为 `target_request_id`；
+MCP cancellation notification 也能取消仍在执行的统一操作。错误响应带 `hint`，说明可行的恢复方式。
+原先按动作拆开的 Windows MCP 工具（`list_apps`、`describe_window`、`find_element`、`invoke` 等）已移除，
+能力并入上述工具；`run_workflow` 与 `control_act` 共用会话的 driver、串行锁和输入租约。
+远程 MCP 或指定 provider/resource 时只暴露统一工具，避免绕过授权。
 
 ## 引用、期限与结果
 
@@ -41,7 +68,7 @@ MCP 工具为 `control_capabilities`, `control_targets`, `control_observe`, `con
 ```json
 {"request_id":"c1","operation":{"method":"capabilities"}}
 {"request_id":"t1","session_id":"<returned-session-id>","operation":{"method":"targets"}}
-{"request_id":"o1","session_id":"<returned-session-id>","operation":{"method":"observe","resource_id":"<returned-resource-id>","max_nodes":1000}}
+{"request_id":"o1","session_id":"<returned-session-id>","operation":{"method":"observe","resource_id":"<returned-resource-id>","max_nodes":1000,"view":{"mode":"outline"}}}
 {"request_id":"f1","session_id":"<returned-session-id>","operation":{"method":"find","observation_id":"<returned-observation-id>","locator":{"name":"Save","role":"button"}}}
 {"request_id":"a1","session_id":"<returned-session-id>","timeout_ms":3000,"operation":{"method":"act","target":{"session_id":"<returned-session-id>","resource_id":"<returned-resource-id>","observation_id":"<returned-observation-id>","node_id":"<returned-node-id>"},"action":{"type":"click"}}}
 ```
@@ -112,6 +139,7 @@ Linux CI 另外运行带沙箱的空白 Chromium fixture，检查 DOM/可信键�
 CI 和 release 工作流使用官方 one-sdk Action 最新正式版本，不依赖 pending one-sdk PR。
 
 [待验证] 本云容器不能启动本机 Chromium 沙箱，浏览器实际效果由 GitHub Linux CI 验证。
+[待验证] 统一会话里 Windows 的 scroll、hover、drag 和带选项的 click 只经过 mock 路由测试，复用的是旧工具已实测过的 driver 动作；经会话派发的真机效果需要在 Windows 桌面上串行验证。
 Windows/macOS 的新适配路由在 CI 以 mock 编译/测试；Windows 的输入桌面、macOS TCC 和跨机器 SSH
 未在真实设备验证。Wayland 原生输入、完整 OOPIF、原生浏览器指针、通用跨平台 key、GUI 迁移、结果缓存、
 自动重放与统一 Android wire adapter 均不在本次范围。录制/回放及事件观察保持已有实现，不提升其可靠性声明。
