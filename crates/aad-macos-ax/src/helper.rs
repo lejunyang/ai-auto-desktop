@@ -309,7 +309,10 @@ impl SwiftHelperBackend {
         args: Value,
         deadline: Instant,
     ) -> Result<Value, AutomationError> {
-        let track = matches!(operation, "type_text" | "pointer_click");
+        let track = matches!(
+            operation,
+            "type_text" | "pointer_click" | "pointer_gesture" | "drag" | "key_chord"
+        );
         let result = self.rpc(operation, args, deadline, track)?;
         let expected = if track { "submitted" } else { "accepted" };
         if result.get(expected) != Some(&Value::Bool(true))
@@ -458,6 +461,40 @@ impl AxBackend for SwiftHelperBackend {
         self.write(
             "type_text",
             json!({"native_token": token, "text": text}),
+            deadline,
+        )
+    }
+    fn pointer_gesture(
+        &self,
+        token: &str,
+        gesture: &Value,
+        deadline: Instant,
+    ) -> Result<Value, AutomationError> {
+        let mut args = gesture.clone();
+        args["native_token"] = json!(token);
+        self.write("pointer_gesture", args, deadline)
+    }
+    fn drag(
+        &self,
+        token: &str,
+        to_token: &str,
+        request: &Value,
+        deadline: Instant,
+    ) -> Result<Value, AutomationError> {
+        let mut args = request.clone();
+        args["native_token"] = json!(token);
+        args["to_token"] = json!(to_token);
+        self.write("drag", args, deadline)
+    }
+    fn key_chord(
+        &self,
+        token: &str,
+        keys: &[String],
+        deadline: Instant,
+    ) -> Result<Value, AutomationError> {
+        self.write(
+            "key_chord",
+            json!({"native_token": token, "keys": keys}),
             deadline,
         )
     }

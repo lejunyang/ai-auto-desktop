@@ -91,7 +91,7 @@ aad do focus     99e160f2 --role Edit
 定位参数：`--role`、`--name` 在所有平台精确匹配；`--automation-id`、`--contains`、`--protected`、
 `--nth`、`--near`（配 `--side`、`--within`）、`--in`（配 `--in-role`）和 `--locator <JSON>` 由 Windows driver 求值，
 其他平台会明确拒绝。匹配多个时报错并列出候选，不会“取第一个”；`find --optional` 用来问“它还在吗”。
-Linux（KDE/X11）上 key、scroll、hover、drag 和带选项的 click 经 XTest helper 执行；macOS 上 click 只有普通左键，没有 key、scroll、hover、drag。
+Linux（KDE/X11）上 key、scroll、hover、drag 和带选项的 click 经 XTest helper 执行；macOS 上经签名的 AX helper 用 CGEvent 执行，要求目标应用在前台（macOS 部分尚未在真机验证）。
 
 ## 运行工作流
 

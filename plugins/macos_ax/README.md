@@ -35,9 +35,14 @@ provider 只静默检查权限，不主动弹出 TCC 请求。
 ## 能力与边界
 
 公开动作是 `list_apps`、`snapshot`、`find`、`focus`、`invoke`、`set_value`、显式
-`type_text` 和显式 `pointer_click`。写动作必须带当前快照的 target 与精确 locator；Rust
+`type_text`、`pointer_click`、`pointer_gesture`（右键、中键、双击、滚轮、悬停，位置是元素内比例）、
+`drag`（同一应用内，起止两点都做 AX 命中检查）和 `key_chord`（ctrl、shift、alt、cmd 加一个主键，
+按美式键位的虚拟键码，名称按字面映射：`ctrl` 就是 Control，全选要写 `cmd,a`）。写动作必须带当前快照的 target 与精确 locator；Rust
 adapter 重新抓取 AX 树，helper 用 `CFEqual` 核对原生对象。protected、截断、多义、身份
 漂移与未授权状态均失败关闭。
+
+指针动作的落点必须经 `AXUIElementCopyElementAtPosition` 命中目标或其子元素，事件只投递给
+目标进程（`postToPid`），不做全局注入；跨应用拖放因此不支持。
 
 键鼠输入不会作为其他动作的自动 fallback。helper 在首个 CGEvent 前发送独立 progress
 marker；越过该边界后的 timeout、EOF 或协议失败归一为不可重试的

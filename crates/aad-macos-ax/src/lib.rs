@@ -24,7 +24,25 @@ const DEFAULT_MAX_DEPTH: u32 = 32;
 const DEFAULT_MAX_NODES: usize = 1000;
 const MAX_DEPTH: u32 = 128;
 const MAX_NODES: usize = 5000;
-const WRITE_ACTIONS: &[&str] = &["focus", "invoke", "pointer_click", "set_value", "type_text"];
+const WRITE_ACTIONS: &[&str] = &[
+    "focus",
+    "invoke",
+    "pointer_click",
+    "pointer_gesture",
+    "drag",
+    "key_chord",
+    "set_value",
+    "type_text",
+];
+/// Writes that send synthetic input and so are never offered on protected elements.
+const INPUT_ACTIONS: &[&str] = &[
+    "pointer_click",
+    "pointer_gesture",
+    "drag",
+    "key_chord",
+    "set_value",
+    "type_text",
+];
 const STATE_NAMES: &[&str] = &["enabled", "focused", "focusable", "editable", "protected"];
 const TYPE_TEXT_ROLES: &[&str] = &["AXTextField", "AXTextArea", "AXComboBox"];
 
@@ -107,6 +125,43 @@ pub trait AxBackend: Send + Sync {
         text: &str,
         deadline: Instant,
     ) -> Result<Value, AutomationError>;
+    /// `gesture` is already validated: `mode` click, wheel or hover with its
+    /// fields, plus `fx`/`fy` inside the element.
+    fn pointer_gesture(
+        &self,
+        _token: &str,
+        _gesture: &Value,
+        _deadline: Instant,
+    ) -> Result<Value, AutomationError> {
+        Err(driver_error(
+            "DRIVER.ACTION_UNSUPPORTED",
+            "this backend has no pointer gestures",
+        ))
+    }
+    /// `request` holds `button`, `fx`, `fy`, `to_fx` and `to_fy`.
+    fn drag(
+        &self,
+        _token: &str,
+        _to_token: &str,
+        _request: &Value,
+        _deadline: Instant,
+    ) -> Result<Value, AutomationError> {
+        Err(driver_error(
+            "DRIVER.ACTION_UNSUPPORTED",
+            "this backend has no drag",
+        ))
+    }
+    fn key_chord(
+        &self,
+        _token: &str,
+        _keys: &[String],
+        _deadline: Instant,
+    ) -> Result<Value, AutomationError> {
+        Err(driver_error(
+            "DRIVER.ACTION_UNSUPPORTED",
+            "this backend has no key chords",
+        ))
+    }
     fn close(&self) {}
 }
 
@@ -287,10 +342,7 @@ impl MacOSAxProvider {
                 .actions
                 .into_iter()
                 .filter(|action| WRITE_ACTIONS.contains(&action.as_str()))
-                .filter(|action| {
-                    !protected
-                        || !matches!(action.as_str(), "pointer_click" | "set_value" | "type_text")
-                })
+                .filter(|action| !protected || !INPUT_ACTIONS.contains(&action.as_str()))
                 .collect::<BTreeSet<_>>()
                 .into_iter()
                 .collect::<Vec<_>>();
@@ -439,10 +491,27 @@ impl MacOSAxProvider {
         if action == "type_text" {
             allowed.push("text");
         }
-        if action == "pointer_click" {
-            allowed.extend(["button", "position"]);
+        match action {
+            "pointer_click" => allowed.extend(["button", "position"]),
+            "pointer_gesture" => {
+                allowed.extend(["button", "count", "fraction", "scroll", "hover_ms"])
+            }
+            "drag" => allowed.extend(["to", "to_locator", "button", "fraction", "to_fraction"]),
+            "key_chord" => allowed.push("keys"),
+            _ => {}
         }
         only_keys(args, &allowed)?;
+        // Validated before anything is captured, so a malformed request costs nothing.
+        let gesture = match action {
+            "pointer_gesture" => Some(gesture_request(args)?),
+            "drag" => Some(drag_request(args)?),
+            _ => None,
+        };
+        let keys = if action == "key_chord" {
+            Some(key_names(args.get("keys"))?)
+        } else {
+            None
+        };
         let value = if action == "set_value" {
             Some(bounded_text(args.get("value"), false)?)
         } else {
@@ -453,12 +522,16 @@ impl MacOSAxProvider {
         } else {
             None
         };
-        let button = enum_value(args.get("button"), "left", "button")?;
-        let position = enum_value(args.get("position"), "center", "position")?;
+        let (button, position) = if action == "pointer_click" {
+            (
+                enum_value(args.get("button"), "left", "button")?,
+                enum_value(args.get("position"), "center", "position")?,
+            )
+        } else {
+            ("left", "center")
+        };
         let (fresh, fresh_id, node, token) = self.fresh_target(args, deadline)?;
-        if matches!(action, "pointer_click" | "set_value" | "type_text")
-            && node["states"]["protected"] == true
-        {
+        if INPUT_ACTIONS.contains(&action) && node["states"]["protected"] == true {
             return Err(driver_error(
                 "DRIVER.PROTECTED_ELEMENT",
                 format!("protected element forbids {action}"),
@@ -473,12 +546,41 @@ impl MacOSAxProvider {
                 "type_text requires a proven non-protected text target",
             ));
         }
-        if action == "pointer_click" && parse_bounds(node.get("bounds")).is_err() {
+        if matches!(action, "pointer_click" | "pointer_gesture" | "drag")
+            && parse_bounds(node.get("bounds")).is_err()
+        {
             return Err(driver_error(
                 "DRIVER.ACTION_UNSUPPORTED",
-                "pointer_click requires positive-area bounds",
+                format!("{action} requires positive-area bounds"),
             ));
         }
+        // The destination of a drag is re-verified exactly like the source.
+        let destination = if action == "drag" {
+            let mut to_args = Map::new();
+            to_args.insert(
+                "target".into(),
+                args.get("to").cloned().unwrap_or(Value::Null),
+            );
+            to_args.insert(
+                "locator".into(),
+                args.get("to_locator").cloned().unwrap_or(Value::Null),
+            );
+            let (_, to_id, to_node, to_token) = self.fresh_target(&to_args, deadline)?;
+            if to_id == fresh_id {
+                return Err(invalid("drag needs a destination other than its source"));
+            }
+            if to_node["states"]["protected"] == true
+                || parse_bounds(to_node.get("bounds")).is_err()
+            {
+                return Err(driver_error(
+                    "DRIVER.ACTION_UNSUPPORTED",
+                    "drag destination must be unprotected with positive-area bounds",
+                ));
+            }
+            Some(to_token)
+        } else {
+            None
+        };
         if !node["actions"]
             .as_array()
             .expect("actions")
@@ -504,6 +606,21 @@ impl MacOSAxProvider {
             "type_text" => self
                 .backend
                 .type_text(&token, text.expect("text validated"), deadline),
+            "pointer_gesture" => self.backend.pointer_gesture(
+                &token,
+                gesture.as_ref().expect("gesture validated"),
+                deadline,
+            ),
+            "drag" => self.backend.drag(
+                &token,
+                destination.as_deref().expect("destination verified"),
+                gesture.as_ref().expect("drag validated"),
+                deadline,
+            ),
+            "key_chord" => {
+                self.backend
+                    .key_chord(&token, keys.as_deref().expect("keys validated"), deadline)
+            }
             _ => unreachable!(),
         };
         let backend_result = match result {
@@ -512,7 +629,15 @@ impl MacOSAxProvider {
                 value
             }
             Err(error) if error.code == "DRIVER.UNKNOWN_EFFECT" => return Err(error),
-            Err(error) if matches!(action, "type_text" | "pointer_click") => return Err(error),
+            // The helper reports how far input got, so its own effect stands.
+            Err(error)
+                if matches!(
+                    action,
+                    "type_text" | "pointer_click" | "pointer_gesture" | "drag" | "key_chord"
+                ) =>
+            {
+                return Err(error)
+            }
             Err(error)
                 if matches!(
                     error.code.as_str(),
@@ -649,6 +774,116 @@ impl AxBackend for UnavailableBackend {
     ) -> Result<Value, AutomationError> {
         self.unavailable()
     }
+}
+
+fn fraction_pair(value: Option<&Value>) -> Result<(f64, f64), AutomationError> {
+    match value {
+        None | Some(Value::Null) => Ok((0.5, 0.5)),
+        Some(value) => {
+            let object = value
+                .as_object()
+                .ok_or_else(|| invalid("fraction must be an object"))?;
+            only_keys(object, &["fx", "fy"])?;
+            let part = |name: &str| {
+                object
+                    .get(name)
+                    .and_then(Value::as_f64)
+                    .filter(|f| (0.0..=1.0).contains(f))
+                    .ok_or_else(|| invalid("fraction.fx and fraction.fy must lie in 0..1"))
+            };
+            Ok((part("fx")?, part("fy")?))
+        }
+    }
+}
+
+fn button_name(value: Option<&Value>) -> Result<&'static str, AutomationError> {
+    match value {
+        None | Some(Value::Null) => Ok("left"),
+        Some(value) => match value.as_str() {
+            Some("left") => Ok("left"),
+            Some("right") => Ok("right"),
+            Some("middle") => Ok("middle"),
+            _ => Err(invalid("button must be left, right or middle")),
+        },
+    }
+}
+
+/// The Windows driver's request shape, normalised for the Swift helper.
+fn gesture_request(args: &Map<String, Value>) -> Result<Value, AutomationError> {
+    let given = |name: &str| args.get(name).is_some_and(|value| !value.is_null());
+    let (fx, fy) = fraction_pair(args.get("fraction"))?;
+    let mut request = if let Some(scroll) = args.get("scroll").filter(|v| !v.is_null()) {
+        if given("button") || given("count") || given("hover_ms") {
+            return Err(invalid("a scroll takes no button, count or hover_ms"));
+        }
+        let scroll = scroll
+            .as_object()
+            .ok_or_else(|| invalid("scroll must be an object"))?;
+        only_keys(scroll, &["direction", "notches"])?;
+        let direction = scroll
+            .get("direction")
+            .and_then(Value::as_str)
+            .filter(|d| matches!(*d, "up" | "down" | "left" | "right"))
+            .ok_or_else(|| invalid("scroll.direction must be up, down, left or right"))?;
+        let notches = match scroll.get("notches") {
+            None | Some(Value::Null) => 3,
+            Some(value) => value
+                .as_u64()
+                .filter(|n| (1..=30).contains(n))
+                .ok_or_else(|| invalid("scroll.notches must be 1..30"))?,
+        };
+        json!({"mode": "wheel", "direction": direction, "notches": notches})
+    } else if let Some(ms) = args.get("hover_ms").filter(|v| !v.is_null()) {
+        if given("button") || given("count") {
+            return Err(invalid("a hover takes no button or count"));
+        }
+        let ms = ms
+            .as_u64()
+            .filter(|ms| (1..=5000).contains(ms))
+            .ok_or_else(|| invalid("hover_ms must be 1..5000"))?;
+        json!({"mode": "hover", "hover_ms": ms})
+    } else {
+        let count = match args.get("count") {
+            None | Some(Value::Null) => 1,
+            Some(value) => value
+                .as_u64()
+                .filter(|n| matches!(n, 1 | 2))
+                .ok_or_else(|| invalid("count must be 1 or 2"))?,
+        };
+        json!({"mode": "click", "button": button_name(args.get("button"))?, "count": count})
+    };
+    request["fx"] = json!(fx);
+    request["fy"] = json!(fy);
+    Ok(request)
+}
+
+fn drag_request(args: &Map<String, Value>) -> Result<Value, AutomationError> {
+    let (fx, fy) = fraction_pair(args.get("fraction"))?;
+    let (to_fx, to_fy) = fraction_pair(args.get("to_fraction"))?;
+    Ok(
+        json!({"button": button_name(args.get("button"))?, "fx": fx, "fy": fy, "to_fx": to_fx, "to_fy": to_fy}),
+    )
+}
+
+fn key_names(value: Option<&Value>) -> Result<Vec<String>, AutomationError> {
+    let keys = value
+        .and_then(Value::as_array)
+        .ok_or_else(|| invalid("keys must be an array"))?;
+    if keys.is_empty() || keys.len() > 6 {
+        return Err(invalid("keys must hold 1..6 names"));
+    }
+    keys.iter()
+        .map(|key| {
+            key.as_str()
+                .filter(|key| {
+                    !key.is_empty()
+                        && key.len() <= 32
+                        && key.chars().all(|c| c.is_ascii_alphanumeric())
+                })
+                .map(str::to_string)
+                .ok_or_else(|| invalid("each key is a short alphanumeric name"))
+        })
+        .collect()
 }
 
 fn bounded_string(value: Option<String>) -> Value {
@@ -1092,6 +1327,21 @@ fn manifest_document() -> Value {
         );
     }
     actions.insert("pointer_click".into(), contract("重新验证目标后，仅按元素正面积 bounds 的中心点显式派发左键 pointer click。", "non_idempotent", "modify", "high", &["desktop.observe", "desktop.input"], json!({"type": "object", "required": ["target", "locator"], "properties": {"target": target_schema(), "locator": locator_schema(), "button": {"enum": ["left"]}, "position": {"enum": ["center"]}}, "additionalProperties": false}), write_output(), true, true));
+    let point_input = |extra: Value, required: &[&str]| {
+        let mut properties = json!({"target": target_schema(), "locator": locator_schema()});
+        properties
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        let mut all = vec!["target", "locator"];
+        all.extend_from_slice(required);
+        json!({"type": "object", "required": all, "properties": properties, "additionalProperties": false})
+    };
+    let fraction = json!({"type": "object", "required": ["fx", "fy"], "properties": {"fx": {"type": "number", "minimum": 0, "maximum": 1}, "fy": {"type": "number", "minimum": 0, "maximum": 1}}, "additionalProperties": false});
+    let button = json!({"enum": ["left", "middle", "right"]});
+    actions.insert("pointer_gesture".into(), contract("重新验证目标后，在元素 bounds 内的比例位置、经 AX 命中检查后向前台应用派发右键/中键/双击、滚轮或悬停。", "non_idempotent", "modify", "high", &["desktop.observe", "desktop.input"], point_input(json!({"button": button, "count": {"enum": [1, 2]}, "fraction": fraction, "scroll": {"type": "object", "required": ["direction"], "properties": {"direction": {"enum": ["up", "down", "left", "right"]}, "notches": {"type": "integer", "minimum": 1, "maximum": 30}}, "additionalProperties": false}, "hover_ms": {"type": "integer", "minimum": 1, "maximum": 5000}}), &[]), write_output(), true, true));
+    actions.insert("drag".into(), contract("分别重新验证起点与终点并做 AX 命中检查后，在同一前台应用内按下、分步拖动并在终点释放。", "non_idempotent", "modify", "high", &["desktop.observe", "desktop.input"], point_input(json!({"to": target_schema(), "to_locator": locator_schema(), "button": button, "fraction": fraction, "to_fraction": fraction}), &["to", "to_locator"]), write_output(), true, true));
+    actions.insert("key_chord".into(), contract("重新验证并聚焦非受保护目标后，按下修饰键（ctrl、shift、alt、cmd）加一个主键；名称按字面映射，不在平台间互换。", "non_idempotent", "input", "high", &["desktop.observe", "desktop.input"], point_input(json!({"keys": {"type": "array", "minItems": 1, "maxItems": 6, "items": {"type": "string", "minLength": 1, "maxLength": 32}}}), &["keys"]), write_output(), true, true));
     for (name, field, description) in [
         (
             "set_value",
@@ -1166,7 +1416,13 @@ mod tests {
                     width: 120,
                     height: 30,
                 }),
-                actions: vec!["focus".into(), "invoke".into(), "pointer_click".into()],
+                actions: vec![
+                    "focus".into(),
+                    "invoke".into(),
+                    "pointer_click".into(),
+                    "pointer_gesture".into(),
+                    "key_chord".into(),
+                ],
                 provenance: Map::from_iter([
                     ("identifier".into(), json!("save")),
                     ("process_id".into(), json!(7)),
@@ -1253,6 +1509,26 @@ mod tests {
             self.writes.fetch_add(1, Ordering::SeqCst);
             Ok(json!({"native_operation": "CGEventKeyboardSetUnicodeString", "submitted": true}))
         }
+        fn pointer_gesture(
+            &self,
+            _token: &str,
+            gesture: &Value,
+            _deadline: Instant,
+        ) -> Result<Value, AutomationError> {
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            Ok(
+                json!({"native_operation": "CGEventPointerGesture", "submitted": true, "sent": gesture}),
+            )
+        }
+        fn key_chord(
+            &self,
+            _token: &str,
+            keys: &[String],
+            _deadline: Instant,
+        ) -> Result<Value, AutomationError> {
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            Ok(json!({"native_operation": "CGEventKeyChord", "submitted": true, "sent": keys}))
+        }
     }
 
     fn take_snapshot(provider: &MacOSAxProvider) -> Value {
@@ -1278,6 +1554,9 @@ mod tests {
             "focus",
             "invoke",
             "pointer_click",
+            "pointer_gesture",
+            "drag",
+            "key_chord",
             "set_value",
             "type_text",
         ] {
@@ -1326,6 +1605,74 @@ mod tests {
         let error = provider.invoke("desktop.macos_ax.invoke@1", json!({"target": {"snapshot_id": snapshot["snapshot_id"], "revision": snapshot["revision"], "node_id": "n0"}, "locator": locator()}), Some(Duration::from_secs(2))).unwrap_err();
         assert_eq!(error.code, "DRIVER.STALE_SNAPSHOT");
         assert_eq!(backend.writes.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn gestures_and_chords_are_normalised_for_the_helper() {
+        let backend = Arc::new(FakeBackend::default());
+        let provider = MacOSAxProvider::new(backend.clone()).unwrap();
+        let invoke = |action: &str, extra: Value| {
+            let snapshot = take_snapshot(&provider);
+            let mut args = json!({"target": {"snapshot_id": snapshot["snapshot_id"], "revision": snapshot["revision"], "node_id": "n0"}, "locator": locator()});
+            args.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            provider.invoke(
+                &format!("desktop.macos_ax.{action}@1"),
+                args,
+                Some(Duration::from_secs(2)),
+            )
+        };
+        let sent = |result: Value| result["backend_result"]["sent"].clone();
+        assert_eq!(
+            sent(invoke("pointer_gesture", json!({"button": "right", "count": 2})).unwrap()),
+            json!({"mode": "click", "button": "right", "count": 2, "fx": 0.5, "fy": 0.5})
+        );
+        assert_eq!(
+            sent(
+                invoke(
+                    "pointer_gesture",
+                    json!({"scroll": {"direction": "down"}, "fraction": {"fx": 0.1, "fy": 0.9}})
+                )
+                .unwrap()
+            ),
+            json!({"mode": "wheel", "direction": "down", "notches": 3, "fx": 0.1, "fy": 0.9})
+        );
+        assert_eq!(
+            sent(invoke("pointer_gesture", json!({"hover_ms": 250})).unwrap()),
+            json!({"mode": "hover", "hover_ms": 250, "fx": 0.5, "fy": 0.5})
+        );
+        assert_eq!(
+            sent(invoke("key_chord", json!({"keys": ["cmd", "a"]})).unwrap()),
+            json!(["cmd", "a"])
+        );
+        assert_eq!(backend.writes.load(Ordering::SeqCst), 4);
+        for (action, extra) in [
+            (
+                "pointer_gesture",
+                json!({"scroll": {"direction": "down"}, "button": "left"}),
+            ),
+            ("pointer_gesture", json!({"count": 3})),
+            (
+                "pointer_gesture",
+                json!({"fraction": {"fx": -0.1, "fy": 0.5}}),
+            ),
+            ("key_chord", json!({"keys": ["cmd", "a b"]})),
+            (
+                "drag",
+                json!({"to": {"snapshot_id": "x", "revision": 1, "node_id": "n0"}, "to_locator": locator(), "button": "side"}),
+            ),
+        ] {
+            assert!(
+                invoke(action, extra.clone()).is_err(),
+                "{action} {extra} must be refused"
+            );
+        }
+        assert_eq!(
+            backend.writes.load(Ordering::SeqCst),
+            4,
+            "nothing refused reached the helper"
+        );
     }
 
     #[test]
