@@ -304,13 +304,17 @@ notifications/cancelled to request cancellation of an in-flight JSON-RPC request
 
         // A workflow drives the desktop like control_act does: one gate, one
         // input owner, the session's own provider instances.
+        let through_session = match tools::steps_through_session(&arguments) {
+            Ok(steps) => steps,
+            Err(payload) => return Ok(content(&parse_payload(&payload), true)),
+        };
         let gate = session.gate();
-        let _serialized = gate.lock().unwrap();
+        let _serialized = (!through_session).then(|| gate.lock().unwrap());
         let _lease = match session.input_lease("desktop-input") {
             Ok(lease) => lease,
             Err(error) => return Ok(content(&error.to_json(), true)),
         };
-        Ok(match tools::run_workflow(session.providers(), &arguments) {
+        Ok(match tools::run_workflow(session, &arguments) {
             Ok(result) => content(&result, false),
             Err(payload) => content(&parse_payload(&payload), true),
         })

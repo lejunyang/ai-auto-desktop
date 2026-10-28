@@ -1680,22 +1680,25 @@ fn run_workflow(args: &RunArgs) -> (Value, u8) {
             return (automation_failure(&error), EXIT_USAGE);
         }
     }
-    #[cfg(target_os = "linux")]
-    if !providers.names().contains(&aad_atspi::PROVIDER_NAME) {
-        if let Ok(provider) = aad_atspi::native_provider() {
-            providers.insert(std::sync::Arc::new(provider));
+    // The native providers come from one control session, which also runs
+    // saved control steps, so both kinds of workflow drive the same driver.
+    // Input is still gated by the workflow's declared permissions.
+    let session = std::sync::Arc::new(aad_control::Session::native(aad_control::Policy {
+        allow_input: true,
+        ..Default::default()
+    }));
+    for provider in session.providers() {
+        if !providers
+            .names()
+            .contains(&provider.manifest().name.as_str())
+        {
+            providers.insert(provider.clone());
         }
     }
-    #[cfg(target_os = "macos")]
-    if !providers.names().contains(&aad_macos_ax::PROVIDER_NAME) {
-        if let Ok(provider) = aad_macos_ax::native_provider() {
-            providers.insert(std::sync::Arc::new(provider));
-        }
-    }
-    // The desktop driver is always offered; a workflow that never uses it pays
-    // nothing, and one that does should not need extra configuration.
-    if let Ok(driver) = aad_uia::native_driver() {
-        providers.insert(std::sync::Arc::new(driver));
+    if !providers.names().contains(&aad_control::steps::PROVIDER) {
+        providers.insert(std::sync::Arc::new(aad_control::steps::StepProvider::new(
+            session,
+        )));
     }
 
     let mut options = aad_runtime::RunOptions::default()

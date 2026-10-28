@@ -19,7 +19,7 @@ pub struct Target {
 /// Every given field must match. `role`, `name` and `node_id` work on every
 /// provider; the rest are provider extensions and are refused, not ignored,
 /// where the provider cannot evaluate them.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Locator {
     #[serde(default, skip_serializing_if = "Option::is_none")]

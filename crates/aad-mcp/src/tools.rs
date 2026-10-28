@@ -964,8 +964,46 @@ have been closed, or its title may have changed past the part the workflow match
 }
 
 /// looks like a broken recording rather than a mis-wired caller.
+/// Every `uses` in a descriptor, nested steps included.
+fn uses_of(value: &Value, found: &mut Vec<String>) {
+    match value {
+        Value::Object(map) => {
+            if let Some(uses) = map.get("uses").and_then(Value::as_str) {
+                found.push(uses.to_string());
+            }
+            map.values().for_each(|child| uses_of(child, found));
+        }
+        Value::Array(items) => items.iter().for_each(|child| uses_of(child, found)),
+        _ => {}
+    }
+}
+
+/// Whether a workflow drives the desktop only through saved control steps.
+///
+/// Those steps go through the session, which serialises each request itself,
+/// so the caller must not hold the session's gate around the run; a workflow
+/// calling the native drivers directly needs the caller to hold it. One that
+/// does both cannot be serialised either way and is refused.
+pub(crate) fn steps_through_session(arguments: &Value) -> Result<bool, String> {
+    let (name, descriptor) = compiled_workflow(arguments)?;
+    let mut uses = Vec::new();
+    uses_of(&descriptor.raw, &mut uses);
+    let steps = uses
+        .iter()
+        .any(|u| u.starts_with(&format!("{}.", aad_control::steps::PROVIDER)));
+    let native = uses.iter().any(|u| u.starts_with("desktop."));
+    if steps && native {
+        return Err(failure(
+            "MCP.MIXED_WORKFLOW",
+            &format!("workflow {name:?} mixes saved control steps with direct driver actions"),
+            Some("Save it again as control steps only, or as driver actions only."),
+        ));
+    }
+    Ok(steps)
+}
+
 pub(crate) fn run_workflow(
-    native: &[Arc<dyn Provider>],
+    session: &Arc<aad_control::Session>,
     arguments: &Value,
 ) -> Result<Value, String> {
     let (name, descriptor) = compiled_workflow(arguments)?;
@@ -1001,9 +1039,12 @@ by a person: use `aad run <file> --allow-scripts`.",
     let mut providers = aad_runtime::ProviderRegistry::new();
     // The session's own native instances, so a workflow shares the snapshot
     // store and input serialisation of the tools that observed the desktop.
-    for provider in native {
+    for provider in session.providers() {
         providers.insert(provider.clone());
     }
+    providers.insert(Arc::new(aad_control::steps::StepProvider::new(
+        session.clone(),
+    )));
     aad_ocr::register(&mut providers)
         .map_err(|error| failure(&error.code, &error.message, None))?;
     let artifacts = Arc::new(aad_runtime::ArtifactStore::default());
@@ -1013,7 +1054,9 @@ by a person: use `aad run <file> --allow-scripts`.",
         aad_runtime::RunOptions::default()
             .with_inputs(inputs)
             .with_providers(providers)
-            .with_artifacts(artifacts),
+            .with_artifacts(artifacts)
+            // Only reached when whoever started the server granted input.
+            .with_granted_permissions(["desktop.input", "desktop.observe"]),
     );
 
     let progress = walk_through(&result);
@@ -1050,7 +1093,8 @@ by a person: use `aad run <file> --allow-scripts`.",
                 .then(|| step.get("id").and_then(Value::as_str))
                 .flatten()
         });
-        let windows = native
+        let windows = session
+            .providers()
             .iter()
             .find(|provider| provider.manifest().name == "desktop.windows_uia");
         if let (Some(failing), Some(driver)) = (stumbled, windows) {
@@ -1645,6 +1689,14 @@ mod tests {
     }
 
     /// A driver over the stub backend, with a private snapshot store.
+    /// A session whose only native provider is the stub driver.
+    fn stub_session() -> Arc<aad_control::Session> {
+        Arc::new(
+            aad_control::Session::new(Vec::new(), aad_control::Policy::default())
+                .with_providers(vec![stub_driver()]),
+        )
+    }
+
     fn stub_driver() -> Arc<dyn Provider> {
         Arc::new(aad_uia::UiaDriver::with_store(
             Arc::new(StubBackend),
@@ -1782,7 +1834,7 @@ mod tests {
         store.save("greeter", pure_workflow());
 
         let result = run_workflow(
-            &[stub_driver()],
+            &stub_session(),
             &json!({"name": "greeter", "inputs": {"who": "agent"}}),
         )
         .expect("run");
@@ -1814,7 +1866,7 @@ mod tests {
         workflow["outputs"] = json!({});
         store.save("recorded", workflow);
 
-        let result = run_workflow(&[stub_driver()], &json!({"name": "recorded"}))
+        let result = run_workflow(&stub_session(), &json!({"name": "recorded"}))
             .expect("the run completes");
 
         assert_eq!(
@@ -1866,7 +1918,7 @@ mod tests {
 
         let described = describe_workflow(&json!({"name": "greeter"})).expect("describe");
         let ran = run_workflow(
-            &[stub_driver()],
+            &stub_session(),
             &json!({"name": "greeter", "inputs": {"who": "a"}}),
         )
         .expect("run");
@@ -1893,7 +1945,7 @@ mod tests {
         workflow["outputs"] = json!({});
         store.save("dangerous", workflow);
 
-        let error = run_workflow(&[stub_driver()], &json!({"name": "dangerous"}))
+        let error = run_workflow(&stub_session(), &json!({"name": "dangerous"}))
             .expect_err("must be refused");
         let payload: Value = serde_json::from_str(&error).expect("structured error");
 
@@ -1944,7 +1996,7 @@ mod tests {
 
         // Either the compiler refuses it or the run fails; both must name the
         // problem rather than returning a bare failure.
-        match run_workflow(&[stub_driver()], &json!({"name": "broken"})) {
+        match run_workflow(&stub_session(), &json!({"name": "broken"})) {
             Ok(result) => {
                 assert_ne!(result["status"], json!("succeeded"));
                 let error = &result["error"];
@@ -1967,7 +2019,7 @@ mod tests {
         store.save("greeter", pure_workflow());
 
         let error = run_workflow(
-            &[stub_driver()],
+            &stub_session(),
             &json!({"name": "greeter", "inputs": "who=agent"}),
         )
         .expect_err("must be refused");

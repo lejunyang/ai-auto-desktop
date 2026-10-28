@@ -5,6 +5,7 @@ pub mod browser;
 pub mod lease;
 pub mod model;
 pub mod native;
+pub mod steps;
 pub mod transport;
 pub use model::*;
 
