@@ -1583,10 +1583,14 @@ impl LinuxBackend {
             "/org/a11y/atspi/registry",
             "org.a11y.atspi.Registry",
         ) {
+            // GTK's bridge reads the libatspi spelling; Qt 5 only recognises
+            // the D-Bus one ("Object:TextChanged") and ignores the other.
             for event in [
                 "object:text-changed",
                 "object:state-changed:checked",
                 "object:state-changed:focused",
+                "Object:TextChanged",
+                "Object:StateChanged",
             ] {
                 if registry
                     .call_method("RegisterEvent", &(event, Vec::<String>::new(), ""))
