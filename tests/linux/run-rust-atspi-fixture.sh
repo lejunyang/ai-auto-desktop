@@ -93,6 +93,7 @@ if [ "${1:-}" = --inside-session ]; then
   act click "$resource" --role push_button --name "Invoke Qt fixture button"
   act fill "$resource" --role text --name "Qt fixture text entry" --value "recorded"
   wait "$recorder"
+  jq -e '.' "$recorded" >&2 || cat "$recorded" >&2
   jq -e '[.steps[].action.type] | (index("click") != null) and (index("fill") != null)' "$recorded" >/dev/null
   refused=$("$aad" --compact find "$resource" --role push_button --nth 1 || true)
   printf '%s' "$refused" | jq -e '.error.code == "CONTROL.LOCATOR_UNSUPPORTED"' >/dev/null
