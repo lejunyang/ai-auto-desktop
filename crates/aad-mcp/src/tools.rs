@@ -1,17 +1,13 @@
-//! The tools this server exposes to an AI agent.
+//! Saved-workflow tools and the shared schemas the MCP server publishes.
 //!
-//! The tool set is deliberately shaped around the safe workflow rather than
-//! around the driver's internals:
-//!
-//! 1. `list_apps` — discover what is running;
-//! 2. `describe_window` — read a window's interactive elements;
-//! 3. `find_element` — resolve a locator to a single addressable target;
-//! 4. the action tools — act on a target that was actually observed.
-//!
-//! Acting requires a target obtained from step 2 or 3, so an agent cannot
-//! click at a guessed coordinate or address an element it never saw.
+//! Looking at and acting on the desktop goes through the session tools in
+//! [`crate::control_tools`]: an agent lists targets, observes one, finds an
+//! element and acts on the session-bound target it was given. The tools here
+//! need no live target: they probe the environment and manage workflows saved
+//! by name, which re-find every element as they run.
 
-use aad_uia::UiaDriver;
+use aad_core::AutomationError;
+use aad_runtime::Provider;
 use serde_json::{json, Value};
 use std::sync::Arc;
 
@@ -24,22 +20,7 @@ pub struct Tool {
     pub mutating: bool,
 }
 
-fn target_schema() -> Value {
-    json!({
-        "type": "object",
-        "description": "A target obtained from find_element or describe_window. \
-    Quoting it proves the element was actually observed.",
-        "properties": {
-            "snapshot_id": {"type": "string"},
-            "revision": {"type": "integer"},
-            "node_id": {"type": "string"}
-        },
-        "required": ["snapshot_id", "revision", "node_id"],
-        "additionalProperties": false
-    })
-}
-
-fn locator_schema() -> Value {
+pub(crate) fn locator_schema() -> Value {
     json!({
         "type": "object",
         "description": "Element selector. Every field given must match, so adding \
@@ -68,10 +49,6 @@ fn locator_schema() -> Value {
                     }
                 },
                 "additionalProperties": false
-            },
-            "actions": {
-                "type": "array",
-                "items": {"enum": ["focus", "invoke", "set_value", "type_text", "pointer_click", "key_chord", "pointer_gesture", "drag"]}
             },
             "match": {"enum": ["exact", "contains"], "default": "exact"},
             "within": {
@@ -128,304 +105,6 @@ fn locator_schema() -> Value {
 pub fn catalogue() -> Vec<Tool> {
     let mut tools = vec![
         Tool {
-            name: "list_apps",
-            description: "List the running applications and their top-level windows. \
-Start here: it returns the window_id that every other tool needs.",
-            schema: json!({"type": "object", "properties": {}, "additionalProperties": false}),
-            mutating: false,
-        },
-        Tool {
-            name: "overview_window",
-            description: "Map a window's regions and their sizes without listing \
-their contents. Start here on any window of substance: measured across this \
-desktop, nine windows out of twenty hold more interactive elements than \
-describe_window will return, and the largest holds 367. An overview of a whole \
-window costs about 2000 characters, where listing 500 elements costs 127000. Each \
-region is named as the interface names it -- a file tree, a toolbar, a form panel, \
-a row of a table -- and describe_window takes that name to read one.",
-            schema: json!({
-                "type": "object",
-                "properties": {
-                    "window_id": {"type": "string", "description": "From list_apps."}
-                },
-                "required": ["window_id"],
-                "additionalProperties": false
-            }),
-            mutating: false,
-        },
-        Tool {
-            name: "describe_window",
-            description: "Describe a window's interactive elements, with a target for \
-each one. Reading a whole window is only practical when it is small: this returns \
-the first `limit` elements and reports `truncated`, so on a crowded window it \
-shows the top of the tree and never reaches the rest. Call overview_window first \
-and pass one of its regions as `region`.",
-            schema: json!({
-                "type": "object",
-                "properties": {
-                    "window_id": {"type": "string", "description": "From list_apps."},
-                    "region": {
-                        "type": "string",
-                        "description": "List only this region, named as \
-            overview_window reports it. This is the same name a locator carries in `within`, \
-            so a region drilled into and a locator written against it agree."
-                    },
-                    "limit": {
-                        "type": "integer",
-                        "description": "Maximum elements to return (default 80). \
-            Check `truncated` and `matched` in the answer: `matched` says how many were \
-            eligible, so it tells you whether raising this would show more.",
-                        "minimum": 1, "maximum": 500
-                    },
-                    "max_characters": {
-                        "type": "integer",
-                        "description": "Stop after roughly this many characters \
-            (default 20000). An element count does not bound the answer's size -- elements \
-            run from 169 to 4890 characters here, and 500 of them reached 188147 on one \
-            window. When the answer is truncated, `stopped_by` says which ceiling bit: \
-            raising `limit` helps when it says `limit` and does nothing when it says \
-            `characters`, where narrowing to a region is the way forward.",
-                        "minimum": 500, "maximum": 200000
-                    }
-                },
-                "required": ["window_id"],
-                "additionalProperties": false
-            }),
-            mutating: false,
-        },
-        Tool {
-            name: "find_element",
-            description: "Find the single element matching a locator and return a target \
-for it. Fails if the locator matches more than one element, listing the \
-candidates so the locator can be narrowed. To check whether something has gone \
-away, pass expect=optional and read `found` instead of treating the miss as an \
-error.",
-            schema: json!({
-                "type": "object",
-                "properties": {
-                    "window_id": {"type": "string"},
-                    "snapshot_id": {
-                        "type": "string",
-                        "description": "Search an existing snapshot instead of taking a new one."
-                    },
-                    "locator": locator_schema(),
-                    "expect": {
-                        "type": "string",
-                        "enum": ["one", "optional"],
-                        "description": "one (default): a miss is an error, which is what \
-            you want when acquiring something to act on. optional: a miss is an ordinary \
-            result with found=false, for asking whether a dialog has closed or a spinner \
-            has gone. Neither one lets an ambiguous match through."
-                    }
-                },
-                "required": ["locator"],
-                "additionalProperties": false
-            }),
-            mutating: false,
-        },
-        Tool {
-            name: "focus",
-            description: "Give keyboard focus to an element.",
-            schema: json!({
-                "type": "object",
-                "properties": {"target": target_schema()},
-                "required": ["target"],
-                "additionalProperties": false
-            }),
-            mutating: true,
-        },
-        Tool {
-            name: "invoke",
-            description: "Activate an element's default action, such as pressing a button. \
-Prefer this over pointer_click: it does not depend on window position or z-order.",
-            schema: json!({
-                "type": "object",
-                "properties": {"target": target_schema()},
-                "required": ["target"],
-                "additionalProperties": false
-            }),
-            mutating: true,
-        },
-        Tool {
-            name: "set_value",
-            description: "Replace an element's value directly. Prefer this over type_text \
-for text fields: it is atomic and does not depend on focus.",
-            schema: json!({
-                "type": "object",
-                "properties": {
-                    "target": target_schema(),
-                    "value": {"type": "string"}
-                },
-                "required": ["target", "value"],
-                "additionalProperties": false
-            }),
-            mutating: true,
-        },
-        Tool {
-            name: "type_text",
-            description: "Type text as keystrokes into an element, after focusing it. \
-Use only when set_value is unsupported, since keystrokes go wherever focus lands.",
-            schema: json!({
-                "type": "object",
-                "properties": {
-                    "target": target_schema(),
-                    "text": {"type": "string", "maxLength": 1024},
-                    "mode": {
-                        "enum": ["unicode", "keys"],
-                        "default": "unicode",
-                        "description": "unicode types arbitrary text through VK_PACKET. keys maps \
-            characters through the target window's keyboard layout into virtual-key presses, which Raw Input \
-            consumers can see; it rejects characters the layout cannot express."
-                    }
-                },
-                "required": ["target", "text"],
-                "additionalProperties": false
-            }),
-            mutating: true,
-        },
-        Tool {
-            name: "pointer_click",
-            description: "Click the centre of an element, raising its window first. \
-Use only when the element exposes no invokable pattern.",
-            schema: json!({
-                "type": "object",
-                "properties": {"target": target_schema()},
-                "required": ["target"],
-                "additionalProperties": false
-            }),
-            mutating: true,
-        },
-        Tool {
-            name: "key_chord",
-            description: "Press a key combination on an element, after focusing it. \
-This is how you send shortcuts and function keys that no text can express -- \
-Ctrl+C, Ctrl+Z, F5, Tab, Escape, Shift+End. keys lists the combination: any \
-modifiers (ctrl, shift, alt, win) followed by exactly one main key. Like \
-type_text, the keys go wherever focus lands, so it targets an element and \
-focuses it first.",
-            schema: json!({
-                "type": "object",
-                "properties": {
-                    "target": target_schema(),
-                    "keys": {
-                        "type": "array",
-                        "description": "The combination, e.g. [\"ctrl\",\"c\"], \
-            [\"f5\"], [\"shift\",\"end\"]. Modifiers: ctrl, shift, alt, win. Main keys: letters, \
-            digits, f1-f12, enter, tab, esc, space, backspace, delete, insert, home, end, \
-            pageup, pagedown, and the arrow keys. At most one non-modifier key.",
-                        "items": {"type": "string"},
-                        "minItems": 1,
-                        "maxItems": 6
-                    }
-                },
-                "required": ["target", "keys"],
-                "additionalProperties": false
-            }),
-            mutating: true,
-        },
-        Tool {
-            name: "pointer_gesture",
-            description: "Right-click, middle-click, double-click, scroll or hover on an \
-element. Prefer invoke or pointer_click for a plain activation; use this for a \
-context menu (right button), a double activation, a wheel scroll, or a hover \
-that reveals a tooltip or menu. The element is always the anchor -- the point \
-acted on is derived from it, never given as a screen coordinate.",
-            schema: json!({
-                "type": "object",
-                "properties": {
-                    "target": target_schema(),
-                    "button": {
-                        "enum": ["left", "right", "middle"],
-                        "description": "Which button. Defaults to left."
-                    },
-                    "count": {
-                        "type": "integer",
-                        "enum": [1, 2],
-                        "description": "1 for a single click, 2 for a double click. Defaults to 1."
-                    },
-                    "fraction": {
-                        "type": "object",
-                        "description": "Where inside the element to act, as a fraction of its \
-            box: fx and fy each from 0.0 (left/top) to 1.0 (right/bottom). Omit for the centre. This is a \
-            position within the observed element, not a screen location.",
-                        "properties": {
-                            "fx": {"type": "number", "minimum": 0.0, "maximum": 1.0},
-                            "fy": {"type": "number", "minimum": 0.0, "maximum": 1.0}
-                        },
-                        "required": ["fx", "fy"],
-                        "additionalProperties": false
-                    },
-                    "scroll": {
-                        "type": "object",
-                        "description": "Scroll over the element instead of clicking. Give a \
-            direction and how many notches.",
-                        "properties": {
-                            "direction": {"enum": ["up", "down", "left", "right"]},
-                            "notches": {
-                                "type": "integer", "minimum": 1, "maximum": 30,
-                                "description": "Wheel detents to scroll. Defaults to 3."
-                            }
-                        },
-                        "required": ["direction"],
-                        "additionalProperties": false
-                    },
-                    "hover_ms": {
-                        "type": "integer",
-                        "minimum": 1, "maximum": 5000,
-                        "description": "Hover: move to the element and dwell this many \
-            milliseconds, e.g. to raise a tooltip. Mutually exclusive with a click."
-                    }
-                },
-                "required": ["target"],
-                "additionalProperties": false
-            }),
-            mutating: true,
-        },
-        Tool {
-            name: "drag",
-            description: "Drag from one element to another: press on the first, glide across, \
-release on the second. Both ends are observed elements, given as targets; the \
-path between them is filled in, so no part of the drag is a raw coordinate. Use \
-for reordering a list, moving an item between panes, or a slider handle to a \
-second element.",
-            schema: json!({
-                "type": "object",
-                "properties": {
-                    "target": target_schema(),
-                    "to": target_schema(),
-                    "button": {
-                        "enum": ["left", "right", "middle"],
-                        "description": "Which button to hold during the drag. Defaults to left."
-                    },
-                    "fraction": {
-                        "type": "object",
-                        "description": "Where inside the source element to grab, as a \
-            fraction (fx, fy in 0.0..1.0). Omit for its centre.",
-                        "properties": {
-                            "fx": {"type": "number", "minimum": 0.0, "maximum": 1.0},
-                            "fy": {"type": "number", "minimum": 0.0, "maximum": 1.0}
-                        },
-                        "required": ["fx", "fy"],
-                        "additionalProperties": false
-                    },
-                    "to_fraction": {
-                        "type": "object",
-                        "description": "Where inside the destination element to release. \
-            Omit for its centre.",
-                        "properties": {
-                            "fx": {"type": "number", "minimum": 0.0, "maximum": 1.0},
-                            "fy": {"type": "number", "minimum": 0.0, "maximum": 1.0}
-                        },
-                        "required": ["fx", "fy"],
-                        "additionalProperties": false
-                    }
-                },
-                "required": ["target", "to"],
-                "additionalProperties": false
-            }),
-            mutating: true,
-        },
-        Tool {
             name: "probe_environment",
 
             description: "Report whether this machine can support desktop automation, and \
@@ -437,8 +116,10 @@ what limits apply, such as a remote session or a non-elevated process.",
             name: "save_workflow",
             description: "Turn actions you have already performed into a named \
 workflow that run_workflow can replay. Give the steps in the order they were done, \
-each with the locator you used to find the element -- describe_window and \
-find_element both return one. The saved workflow re-finds every element as it \
+each with the locator you used to find the element -- an outline from \
+control_observe carries one per element. Action names are the Windows provider's: \
+click is pointer_click (or pointer_gesture with a button, count or position), fill \
+is set_value, key is key_chord, scroll and hover are pointer_gesture. The saved workflow re-finds every element as it \
 runs, so it keeps working after the target application restarts, which a target \
 reference does not. Steps are checked before anything is written: a workflow that \
 saves is a workflow that runs.",
@@ -652,41 +333,6 @@ pub fn call_without_driver(name: &str, arguments: &Value) -> Result<Value, Strin
             None,
         )),
     }
-}
-
-/// Execute one tool call against a driver.
-pub fn call(driver: &Arc<UiaDriver>, name: &str, arguments: &Value) -> Result<Value, String> {
-    // These need no desktop, so they answer even when automation is unavailable.
-    if matches!(
-        name,
-        "probe_environment" | "list_workflows" | "describe_workflow"
-    ) {
-        return call_without_driver(name, arguments);
-    }
-
-    if name == "run_workflow" {
-        return run_workflow(Some(driver), arguments);
-    }
-
-    // Saving needs no desktop: the steps describe elements rather than reaching
-    // for them, which is what lets a saved workflow outlive the session.
-    if name == "save_workflow" {
-        return save_workflow(arguments);
-    }
-
-    let action = match name {
-        "list_apps" => "list_windows",
-        "overview_window" => "overview",
-        "describe_window" => "describe",
-        "find_element" => "find",
-        "focus" | "invoke" | "set_value" | "type_text" | "pointer_click" | "key_chord"
-        | "pointer_gesture" | "drag" => name,
-        other => return Err(format!("unknown tool {other:?}")),
-    };
-
-    driver
-        .call(action, arguments)
-        .map_err(|error| serde_json::to_string(&error_payload(&error)).unwrap_or(error.message))
 }
 
 /// Render a structured failure the same way driver errors are rendered, so an
@@ -1190,7 +836,7 @@ fn walk_through(result: &aad_runtime::RunResult) -> Vec<Value> {
 /// original error -- an agent shown a diagnosis error instead of the real one is
 /// worse off than an agent shown no diagnosis at all.
 fn why_it_failed(
-    driver: &Arc<UiaDriver>,
+    driver: &Arc<dyn Provider>,
     descriptor: &aad_core::WorkflowDescriptor,
     failing_step: &str,
 ) -> Option<Value> {
@@ -1218,7 +864,7 @@ fn why_it_failed(
     // The window first: minimised or gone explains a whole class of failures, and
     // it explains them for every element inside it at once.
     if let Some(window) = &window {
-        match driver.call("list_windows", &json!({})) {
+        match driver.invoke("desktop.windows_uia.list_windows@1", json!({}), None) {
             Ok(listing) => {
                 let wanted_title = window.get("title").and_then(Value::as_str);
                 let wanted_process = window.get("process_name").and_then(Value::as_str);
@@ -1273,10 +919,7 @@ have been closed, or its title may have changed past the part the workflow match
                 }
             }
             Err(error) => {
-                report.insert(
-                    "window".into(),
-                    json!({"unreadable": error_payload(&error)}),
-                );
+                report.insert("window".into(), json!({"unreadable": brief(&error)}));
             }
         }
     }
@@ -1285,7 +928,7 @@ have been closed, or its title may have changed past the part the workflow match
     // that turn "the action failed" into a reason.
     if let (Some(locator), Some(window)) = (&locator, &window) {
         let request = json!({"window": window, "locator": locator, "expect": "one"});
-        match driver.call("find", &request) {
+        match driver.invoke("desktop.windows_uia.find@1", request, None) {
             Ok(found) => {
                 let node = found.get("node").cloned().unwrap_or(Value::Null);
                 report.insert(
@@ -1306,7 +949,7 @@ have been closed, or its title may have changed past the part the workflow match
                     "element".into(),
                     json!({
                         "present": false,
-                        "looking_failed": error_payload(&error),
+                        "looking_failed": brief(&error),
                     }),
                 );
             }
@@ -1322,7 +965,7 @@ have been closed, or its title may have changed past the part the workflow match
 
 /// looks like a broken recording rather than a mis-wired caller.
 pub(crate) fn run_workflow(
-    driver: Option<&Arc<UiaDriver>>,
+    native: &[Arc<dyn Provider>],
     arguments: &Value,
 ) -> Result<Value, String> {
     let (name, descriptor) = compiled_workflow(arguments)?;
@@ -1356,19 +999,13 @@ by a person: use `aad run <file> --allow-scripts`.",
     // The same registry the CLI builds, so a workflow behaves identically
     // whether a person ran it or an agent did.
     let mut providers = aad_runtime::ProviderRegistry::new();
-    if let Some(driver) = driver {
-        providers.insert(driver.clone());
+    // The session's own native instances, so a workflow shares the snapshot
+    // store and input serialisation of the tools that observed the desktop.
+    for provider in native {
+        providers.insert(provider.clone());
     }
     aad_ocr::register(&mut providers)
         .map_err(|error| failure(&error.code, &error.message, None))?;
-    #[cfg(target_os = "linux")]
-    if let Ok(provider) = aad_atspi::native_provider() {
-        providers.insert(Arc::new(provider));
-    }
-    #[cfg(target_os = "macos")]
-    if let Ok(provider) = aad_macos_ax::native_provider() {
-        providers.insert(Arc::new(provider));
-    }
     let artifacts = Arc::new(aad_runtime::ArtifactStore::default());
 
     let result = aad_runtime::run(
@@ -1413,7 +1050,10 @@ by a person: use `aad run <file> --allow-scripts`.",
                 .then(|| step.get("id").and_then(Value::as_str))
                 .flatten()
         });
-        if let (Some(failing), Some(driver)) = (stumbled, driver) {
+        let windows = native
+            .iter()
+            .find(|provider| provider.manifest().name == "desktop.windows_uia");
+        if let (Some(failing), Some(driver)) = (stumbled, windows) {
             if let Some(context) = why_it_failed(driver, &descriptor, failing) {
                 // Deliberately beside the error rather than inside it: this is a
                 // fresh reading taken afterwards, not part of what the engine
@@ -1426,8 +1066,8 @@ by a person: use `aad run <file> --allow-scripts`.",
     Ok(payload)
 }
 
-/// Shape a driver error so an agent can act on it.
-fn error_payload(error: &aad_uia::DriverError) -> Value {
+/// The parts of a provider error a caller acts on.
+fn brief(error: &AutomationError) -> Value {
     let mut payload = json!({
         "code": error.code,
         "message": error.message,
@@ -1437,72 +1077,11 @@ fn error_payload(error: &aad_uia::DriverError) -> Value {
     if !error.details.is_empty() {
         payload["details"] = Value::Object(error.details.clone());
     }
-    // Point the agent at the recovery that actually works for this failure.
-    let hint = match error.code.as_str() {
-        "DRIVER.STALE_HANDLE" => Some(
-            "The UI changed since it was observed. Call describe_window or \
-find_element again to get a fresh target.",
-        ),
-        "DRIVER.AMBIGUOUS_MATCH" => Some(
-            // Recommending automation_id and role was actively misleading: when
-            // several elements collide it is usually because they already share
-            // both -- five Edit buttons in a table have the same role and no
-            // automation_id at all. Ordered by how well each survives the
-            // interface changing.
-            "The locator matched several elements, listed in details.candidates. \
-Narrow it with `within` to name the container the wanted one sits in -- a row \
-labelled with its own text stays correct after the list reorders -- or with \
-`near` to place it against a neighbouring label. Use `nth` only when nothing \
-distinguishes them but position.",
-        ),
-        "DRIVER.NOT_FOUND" => Some(
-            "No element matched. Call describe_window to see what is actually \
-present, or wait if the element may still be appearing.",
-        ),
-        "DRIVER.ACTION_UNSUPPORTED" => Some(
-            "This element does not support that action; details.supported lists \
-what it does support.",
-        ),
-        _ => None,
-    };
-    if let Some(hint) = hint {
-        payload["hint"] = json!(hint);
-    }
     payload
 }
 
 #[cfg(test)]
 mod tests {
-
-    #[test]
-    fn an_agent_can_ration_the_answer_by_size_not_only_by_count() {
-        // `limit` counts elements, which says nothing about how much comes back:
-        // elements run from 169 to 4890 characters here, and 500 of them reached
-        // 188147 characters on one window. An agent paying for context needs the
-        // bound in the unit it is actually rationing.
-        let tools = catalogue();
-        let describe = tools
-            .iter()
-            .find(|tool| tool.name == "describe_window")
-            .expect("describe_window");
-        let ceiling = &describe.schema["properties"]["max_characters"];
-        assert!(
-            ceiling.is_object(),
-            "describe_window must accept a size bound"
-        );
-
-        let text = ceiling["description"].as_str().unwrap_or_default();
-        // The description has to say what to do about it, since `limit` and this
-        // one fail in ways that call for opposite responses.
-        assert!(
-            text.contains("stopped_by"),
-            "tell the agent how to learn which ceiling bit: {text:?}"
-        );
-        assert!(
-            text.contains("region"),
-            "and that narrowing is the answer when size ran out: {text:?}"
-        );
-    }
 
     #[test]
     fn writing_to_a_file_is_not_offered_over_mcp() {
@@ -1722,7 +1301,7 @@ mod tests {
     #[test]
     fn an_agent_can_keep_what_it_worked_out() {
         // Without this an agent explores a window, acts, and loses all of it when
-        // the session ends: the next run starts from describe_window again. The
+        // the session ends: the next run starts from control_observe again. The
         // targets it holds are no help -- a snapshot handle stops resolving once
         // the snapshot is gone.
         let tools = catalogue();
@@ -1812,93 +1391,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_crowded_window_can_be_read_in_two_steps() {
-        let tools = catalogue();
-
-        let overview = tools
-            .iter()
-            .find(|tool| tool.name == "overview_window")
-            .expect("an agent needs a way to see a window's shape before its contents");
-        assert!(!overview.mutating, "mapping a window changes nothing");
-        let properties = &overview.schema["properties"];
-        assert!(
-            properties.get("limit").is_none(),
-            "an overview does not list elements, so a limit would mean nothing"
-        );
-
-        // The description has to carry the reason, because the schema is all an
-        // agent reads. Measured: 9 of 20 windows here exceed the default limit.
-        assert!(
-            overview.description.contains("367") || overview.description.contains("twenty"),
-            "say how crowded real windows get: {:?}",
-            overview.description
-        );
-
-        let describe = tools
-            .iter()
-            .find(|tool| tool.name == "describe_window")
-            .expect("describe_window");
-        assert!(
-            describe.description.contains("overview_window"),
-            "describe_window must point at the overview, or an agent will keep \
-hitting truncation without knowing there is another way: {:?}",
-            describe.description
-        );
-        assert!(
-            describe.schema["properties"].get("region").is_some(),
-            "and it must accept the region name the overview hands out"
-        );
-    }
-
-    #[test]
-    fn a_region_name_means_the_same_thing_everywhere() {
-        // Deliberately not a new selector language: the name the overview reports
-        // is the ancestor name a locator carries in `within`. If the schemas
-        // described these as different things an agent would learn two.
-        let tools = catalogue();
-        let describe = tools
-            .iter()
-            .find(|tool| tool.name == "describe_window")
-            .expect("describe_window");
-        let region = describe.schema["properties"]["region"]["description"]
-            .as_str()
-            .unwrap_or_default();
-        assert!(
-            region.contains("within"),
-            "tell the agent the two agree: {region:?}"
-        );
-    }
-
     use super::*;
-
-    #[test]
-    fn asking_whether_something_is_gone_is_expressible() {
-        // Without this an agent cannot ask "has the dialog closed?" at all: the
-        // schema is closed, so the parameter would be rejected, and the only
-        // available answer -- an error -- reads like a malfunction rather than
-        // a no.
-        let tool = find("find_element").expect("find_element must exist");
-        let expect = &tool.schema["properties"]["expect"];
-
-        assert!(
-            !expect.is_null(),
-            "find_element must let a caller say a miss is acceptable"
-        );
-
-        let modes: Vec<&str> = expect["enum"]
-            .as_array()
-            .expect("expect must be an enum so the choices are discoverable")
-            .iter()
-            .map(|value| value.as_str().expect("a string mode"))
-            .collect();
-        assert!(modes.contains(&"optional"), "modes were {modes:?}");
-
-        // Ambiguity is not one of the choices. Relaxing "which one did you
-        // mean" is how automation acts on the wrong element, and that must not
-        // be reachable by asking a question about absence.
-        assert!(!modes.contains(&"any"), "modes were {modes:?}");
-    }
 
     #[test]
     fn every_tool_publishes_a_usable_schema() {
@@ -1928,106 +1421,6 @@ hitting truncation without knowing there is another way: {:?}",
         names.sort_unstable();
         names.dedup();
         assert_eq!(names.len(), count);
-    }
-
-    #[test]
-    fn discovery_tools_are_marked_read_only_and_actions_are_not() {
-        let payload = list_payload();
-        let tools = payload["tools"].as_array().unwrap();
-
-        let annotation = |name: &str, key: &str| -> bool {
-            tools
-                .iter()
-                .find(|tool| tool["name"] == name)
-                .and_then(|tool| tool["annotations"][key].as_bool())
-                .unwrap_or_else(|| panic!("missing {key} for {name}"))
-        };
-
-        for name in [
-            "list_apps",
-            "describe_window",
-            "find_element",
-            "probe_environment",
-        ] {
-            assert!(annotation(name, "readOnlyHint"), "{name} only reads");
-        }
-        for name in ["invoke", "type_text", "set_value", "pointer_click", "focus"] {
-            assert!(
-                !annotation(name, "readOnlyHint"),
-                "{name} changes the desktop"
-            );
-            assert!(
-                annotation(name, "destructiveHint"),
-                "{name} must be flagged"
-            );
-        }
-    }
-
-    #[test]
-    fn every_action_tool_requires_an_observed_target() {
-        // This is the invariant that stops an agent acting on a guess.
-        for name in ["focus", "invoke", "set_value", "type_text", "pointer_click"] {
-            let tool = find(name).expect(name);
-            let required = tool.schema["required"].as_array().expect(name);
-            assert!(
-                required.contains(&json!("target")),
-                "{name} must require a target"
-            );
-            let target = &tool.schema["properties"]["target"];
-            for field in ["snapshot_id", "revision", "node_id"] {
-                assert!(
-                    target["required"]
-                        .as_array()
-                        .unwrap()
-                        .contains(&json!(field)),
-                    "{name} target must require {field}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn an_agent_can_express_which_of_several_namesakes_it_means() {
-        // The driver resolves `within`, `near` and `nth` and they were verified
-        // against a real page, but an agent only ever sees the schema -- and with
-        // `additionalProperties: false` a client that validates would reject them
-        // outright. Without these, five identical Edit buttons leave an agent no
-        // way to say which row it means.
-        let find = catalogue()
-            .into_iter()
-            .find(|tool| tool.name == "find_element")
-            .expect("find_element");
-        let locator = &find.schema["properties"]["locator"]["properties"];
-
-        for field in ["within", "near", "nth"] {
-            assert!(
-                locator.get(field).is_some(),
-                "locator schema has to offer {field}"
-            );
-        }
-    }
-
-    #[test]
-    fn the_ways_of_narrowing_are_explained_not_merely_listed() {
-        // A field an agent cannot tell when to use is a field it will misuse.
-        // Measured: content anchors survive a restart while ordinals shift as
-        // soon as a row is inserted, so the schema has to say which to reach for.
-        let find = catalogue()
-            .into_iter()
-            .find(|tool| tool.name == "find_element")
-            .expect("find_element");
-        let locator = &find.schema["properties"]["locator"]["properties"];
-
-        for field in ["within", "near", "nth"] {
-            let described = locator[field]["description"]
-                .as_str()
-                .unwrap_or_default()
-                .len();
-            assert!(
-                described > 40,
-                "{field} needs to say when it applies, not just exist"
-            );
-        }
     }
 
     #[test]
@@ -2069,29 +1462,6 @@ hitting truncation without knowing there is another way: {:?}",
     }
 
     #[test]
-    fn a_password_field_can_be_addressed_through_the_schema() {
-        // The driver can match on `protected`, but an agent can only use what
-        // the schema admits: `additionalProperties: false` means an unlisted
-        // field is rejected rather than ignored. Password fields frequently have
-        // no stable name, so without this they cannot be addressed at all.
-        let tool = find("find_element").unwrap();
-        let states = &tool.schema["properties"]["locator"]["properties"]["states"];
-        assert_eq!(states["properties"]["protected"]["type"], json!("boolean"));
-        assert_eq!(states["additionalProperties"], json!(false));
-    }
-
-    #[test]
-    fn text_input_is_bounded_in_the_schema() {
-        let tool = find("type_text").unwrap();
-        assert_eq!(tool.schema["properties"]["text"]["maxLength"], json!(1024));
-        assert_eq!(
-            tool.schema["properties"]["mode"]["enum"],
-            json!(["unicode", "keys"])
-        );
-        assert_eq!(tool.schema["properties"]["mode"]["default"], "unicode");
-    }
-
-    #[test]
     fn an_unknown_tool_is_reported_rather_than_guessed() {
         let error = find("teleport");
         assert!(error.is_none());
@@ -2107,43 +1477,8 @@ hitting truncation without knowing there is another way: {:?}",
     }
 
     #[test]
-    fn a_stale_handle_error_tells_the_agent_how_to_recover() {
-        let error = aad_uia::DriverError::stale("out of date");
-        let payload = error_payload(&error);
-
-        assert_eq!(payload["code"], "DRIVER.STALE_HANDLE");
-        let hint = payload["hint"].as_str().expect("a recovery hint");
-        assert!(hint.contains("find_element") || hint.contains("describe_window"));
-    }
-
-    #[test]
-    fn an_ambiguous_match_error_explains_how_to_narrow_it() {
-        let error = aad_uia::DriverError::new("DRIVER.AMBIGUOUS_MATCH", "two matches");
-        let payload = error_payload(&error);
-
-        // Asserting the word "narrow" appeared would not catch the failure that
-        // mattered: the old hint said "narrow" while recommending automation_id
-        // and role, the two fields colliding elements have already exhausted.
-        let hint = payload["hint"].as_str().unwrap();
-        for way in ["within", "near", "nth"] {
-            assert!(
-                hint.contains(way),
-                "the hint has to point at {way}, which can actually separate them"
-            );
-        }
-        assert!(
-            hint.contains("candidates"),
-            "and at the list of what it matched"
-        );
-    }
-
-    #[test]
     fn probing_the_environment_needs_no_desktop() {
-        // The tool must answer even where automation itself cannot run, so it is
-        // asserted through `call` with a driver and through the no-driver path.
-        let report = call(&stub_driver(), "probe_environment", &json!({})).unwrap();
-        assert_eq!(report["kind"], "CapabilityProbe");
-
+        // The tool must answer even where automation itself cannot run.
         let offline = call_without_driver("probe_environment", &json!({})).unwrap();
         assert_eq!(offline["kind"], "CapabilityProbe");
     }
@@ -2310,8 +1645,8 @@ hitting truncation without knowing there is another way: {:?}",
     }
 
     /// A driver over the stub backend, with a private snapshot store.
-    fn stub_driver() -> Arc<UiaDriver> {
-        Arc::new(UiaDriver::with_store(
+    fn stub_driver() -> Arc<dyn Provider> {
+        Arc::new(aad_uia::UiaDriver::with_store(
             Arc::new(StubBackend),
             aad_uia::SnapshotStore::new(8, std::time::Duration::from_secs(60)),
         ))
@@ -2447,7 +1782,7 @@ hitting truncation without knowing there is another way: {:?}",
         store.save("greeter", pure_workflow());
 
         let result = run_workflow(
-            Some(&stub_driver()),
+            &[stub_driver()],
             &json!({"name": "greeter", "inputs": {"who": "agent"}}),
         )
         .expect("run");
@@ -2479,7 +1814,7 @@ hitting truncation without knowing there is another way: {:?}",
         workflow["outputs"] = json!({});
         store.save("recorded", workflow);
 
-        let result = run_workflow(Some(&stub_driver()), &json!({"name": "recorded"}))
+        let result = run_workflow(&[stub_driver()], &json!({"name": "recorded"}))
             .expect("the run completes");
 
         assert_eq!(
@@ -2531,7 +1866,7 @@ hitting truncation without knowing there is another way: {:?}",
 
         let described = describe_workflow(&json!({"name": "greeter"})).expect("describe");
         let ran = run_workflow(
-            Some(&stub_driver()),
+            &[stub_driver()],
             &json!({"name": "greeter", "inputs": {"who": "a"}}),
         )
         .expect("run");
@@ -2558,7 +1893,7 @@ hitting truncation without knowing there is another way: {:?}",
         workflow["outputs"] = json!({});
         store.save("dangerous", workflow);
 
-        let error = run_workflow(Some(&stub_driver()), &json!({"name": "dangerous"}))
+        let error = run_workflow(&[stub_driver()], &json!({"name": "dangerous"}))
             .expect_err("must be refused");
         let payload: Value = serde_json::from_str(&error).expect("structured error");
 
@@ -2609,7 +1944,7 @@ hitting truncation without knowing there is another way: {:?}",
 
         // Either the compiler refuses it or the run fails; both must name the
         // problem rather than returning a bare failure.
-        match run_workflow(Some(&stub_driver()), &json!({"name": "broken"})) {
+        match run_workflow(&[stub_driver()], &json!({"name": "broken"})) {
             Ok(result) => {
                 assert_ne!(result["status"], json!("succeeded"));
                 let error = &result["error"];
@@ -2632,7 +1967,7 @@ hitting truncation without knowing there is another way: {:?}",
         store.save("greeter", pure_workflow());
 
         let error = run_workflow(
-            Some(&stub_driver()),
+            &[stub_driver()],
             &json!({"name": "greeter", "inputs": "who=agent"}),
         )
         .expect_err("must be refused");

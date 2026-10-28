@@ -36,11 +36,15 @@ impl Grants {
 pub struct McpArgs {
     #[command(flatten)]
     grants: Grants,
-    /// Deny input and saved-workflow writes, including through legacy tools.
+    /// Explicit grant for control_act, save_workflow and run_workflow.
+    /// Without it the server only observes.
+    #[arg(long, conflicts_with = "read_only")]
+    allow_input: bool,
+    /// The default; accepted so existing configurations keep working.
     #[arg(long)]
     read_only: bool,
     /// Trusted argv as a JSON array, e.g. an existing authenticated ssh -T command.
-    /// This connection exposes only remote control tools; no local legacy bypass.
+    /// This connection exposes only remote control tools, no local workflow tools.
     #[arg(long, value_name = "JSON_ARGV")]
     connect: Option<String>,
 }
@@ -86,6 +90,7 @@ fn invalid(error: impl std::fmt::Display) -> std::io::Error {
 pub fn mcp(args: &McpArgs) -> std::io::Result<()> {
     let server = if let Some(raw) = &args.connect {
         if args.read_only
+            || args.allow_input
             || !args.grants.providers.is_empty()
             || !args.grants.resources.is_empty()
             || args.grants.browser_port.is_some()
@@ -96,7 +101,7 @@ pub fn mcp(args: &McpArgs) -> std::io::Result<()> {
         aad_mcp::Server::with_control(Arc::new(client))
     } else {
         aad_mcp::Server::with_options(
-            args.grants.policy(!args.read_only),
+            args.grants.policy(args.allow_input),
             args.grants.browser_port,
         )
     };

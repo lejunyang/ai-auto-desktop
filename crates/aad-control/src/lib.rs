@@ -180,6 +180,8 @@ pub struct Session {
     observation_ttl: Duration,
     max_requests: usize,
     leases: Mutex<BTreeMap<String, Arc<lease::InputLease>>>,
+    /// The native providers behind this session, for saved workflows.
+    providers: Vec<Arc<dyn aad_runtime::Provider>>,
 }
 
 impl Session {
@@ -201,6 +203,7 @@ impl Session {
             observation_ttl: Duration::from_secs(300),
             max_requests: 10_000,
             leases: Mutex::new(BTreeMap::new()),
+            providers: Vec::new(),
         }
     }
 
@@ -209,8 +212,10 @@ impl Session {
     }
 
     pub fn native_with_browser(policy: Policy, browser_port: Option<u16>) -> Self {
-        let (backends, failures) = native::backends();
-        let mut session = Self::new(backends, policy);
+        let (natives, failures) = native::backends();
+        let providers = natives.iter().map(|b| b.provider()).collect();
+        let backends = natives.into_iter().map(|b| b as Arc<dyn Backend>).collect();
+        let mut session = Self::new(backends, policy).with_providers(providers);
         if let Some(port) = browser_port {
             session.backends.insert(
                 browser::PROVIDER.into(),
@@ -219,6 +224,33 @@ impl Session {
         }
         session.failures = failures;
         session
+    }
+
+    /// Native providers that saved workflows may drive. They must be the
+    /// instances behind this session's backends, so a workflow shares their
+    /// snapshot stores rather than opening a second driver.
+    pub fn with_providers(mut self, providers: Vec<Arc<dyn aad_runtime::Provider>>) -> Self {
+        self.providers = providers;
+        self
+    }
+    pub fn providers(&self) -> &[Arc<dyn aad_runtime::Provider>] {
+        &self.providers
+    }
+    pub fn policy(&self) -> &Policy {
+        &self.policy
+    }
+    /// Providers that could not start, keyed by kind, with their structured errors.
+    pub fn unavailable(&self) -> &BTreeMap<String, Value> {
+        &self.failures
+    }
+    /// Report providers that a host tried and failed to start.
+    pub fn with_unavailable(mut self, failures: BTreeMap<String, Value>) -> Self {
+        self.failures = failures;
+        self
+    }
+    /// The serialisation gate shared by everything that drives this desktop.
+    pub fn gate(&self) -> Arc<Mutex<()>> {
+        self.gate.clone()
     }
 
     pub fn id(&self) -> &str {

@@ -325,8 +325,8 @@ impl Backend for NativeBackend {
     }
 }
 
-pub fn backends() -> (Vec<Arc<dyn Backend>>, BTreeMap<String, Value>) {
-    let mut backends: Vec<Arc<dyn Backend>> = Vec::new();
+pub fn backends() -> (Vec<Arc<NativeBackend>>, BTreeMap<String, Value>) {
+    let mut backends = Vec::new();
     let mut failures = BTreeMap::new();
     #[cfg(windows)]
     let native: Result<NativeBackend> = aad_uia::native_driver_with_store(
