@@ -8,6 +8,7 @@
 //! it, and input is granted by whoever starts the server, never by the client.
 //! Saved workflows run on the same session's providers, gate and input lease.
 
+pub mod browser_tools;
 pub mod control_tools;
 pub mod protocol;
 pub mod tools;
@@ -44,6 +45,8 @@ pub struct Server {
     /// Why no native desktop provider is available, if none is.
     unavailable: Option<String>,
     active_control: Mutex<BTreeMap<String, String>>,
+    /// The browser and recording started through the browser tools.
+    browsers: browser_tools::Browsers,
 }
 
 impl Server {
@@ -79,6 +82,7 @@ impl Server {
             local: Some(session),
             unavailable,
             active_control: Mutex::new(BTreeMap::new()),
+            browsers: browser_tools::Browsers::default(),
         }
     }
 
@@ -109,7 +113,15 @@ impl Server {
             local: None,
             unavailable: None,
             active_control: Mutex::new(BTreeMap::new()),
+            browsers: browser_tools::Browsers::default(),
         }
+    }
+
+    /// Let browser_open copy an existing profile's logins, as
+    /// `aad mcp --allow-profile-copy` does.
+    pub fn allow_profile_copy(mut self) -> Self {
+        self.browsers.allow_profile_copy = true;
+        self
     }
 
     pub fn disconnect(&self) {
@@ -123,7 +135,7 @@ impl Server {
         if name.starts_with("control_") {
             return true;
         }
-        LOCAL_TOOLS.contains(&name)
+        (LOCAL_TOOLS.contains(&name) || browser_tools::NAMES.contains(&name))
             && self.local.as_ref().is_some_and(|session| {
                 let policy = session.policy();
                 policy.providers.is_empty() && policy.resources.is_none()
@@ -274,7 +286,11 @@ notifications/cancelled to request cancellation of an in-flight JSON-RPC request
             let response = self.control.request(&request);
             self.active_control.lock().unwrap().remove(&key);
             let is_error = response.error.is_some();
-            return Ok(content(&control_tools::payload(response), is_error));
+            let mut payload = control_tools::payload(response);
+            if name == "control_capture" && !is_error {
+                return Ok(image_content(&mut payload));
+            }
+            return Ok(content(&payload, is_error));
         }
 
         // Local tools only from here on; `offers` guaranteed a local session.
@@ -282,7 +298,9 @@ notifications/cancelled to request cancellation of an in-flight JSON-RPC request
             .local
             .as_ref()
             .expect("local tools need a local session");
-        if matches!(name, "save_workflow" | "run_workflow") && !self.allows_input() {
+        let writes = matches!(name, "save_workflow" | "run_workflow")
+            || (browser_tools::NAMES.contains(&name) && name != "browser_profiles");
+        if writes && !self.allows_input() {
             return Ok(content(
                 &json!({
                     "code": "POLICY.DENIED",
@@ -292,6 +310,12 @@ notifications/cancelled to request cancellation of an in-flight JSON-RPC request
                 }),
                 true,
             ));
+        }
+        if browser_tools::NAMES.contains(&name) {
+            return Ok(match self.browsers.call(session, name, &arguments) {
+                Ok(result) => content(&result, false),
+                Err(payload) => content(&payload, true),
+            });
         }
         if name != "run_workflow" {
             // These need no desktop: `probe_environment` exists to explain why
@@ -348,6 +372,22 @@ impl Default for Server {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// A screenshot as an MCP image, with what was said about it beside it.
+fn image_content(payload: &mut Value) -> Value {
+    let data = payload["data"]["data"].take();
+    let mime = format!(
+        "image/{}",
+        payload["data"]["format"].as_str().unwrap_or("png")
+    );
+    json!({
+        "content": [
+            {"type": "image", "data": data, "mimeType": mime},
+            {"type": "text", "text": serde_json::to_string_pretty(payload).unwrap_or_default()},
+        ],
+        "isError": false,
+    })
 }
 
 /// Wrap a value as MCP tool content.

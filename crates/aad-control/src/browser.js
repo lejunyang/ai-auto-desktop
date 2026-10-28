@@ -4,9 +4,9 @@
   let observation = null;
   let nodes = new Map();
   const inputRole = el => ({checkbox:'checkbox',radio:'radio',button:'button',submit:'button',reset:'button',range:'slider'}[(el.type||'').toLowerCase()] || 'textbox');
-  const roleOf = el => el.getAttribute('role') || (el.tagName==='INPUT' ? inputRole(el) : ({TEXTAREA:'textbox',BUTTON:'button',A:'link',SELECT:'combobox',BODY:'document'}[el.tagName] || 'generic'));
+  const roleOf = el => el.getAttribute('role') || (el.tagName==='INPUT' ? inputRole(el) : ({TEXTAREA:'textbox',BUTTON:'button',A:'link',SELECT:'combobox',BODY:'document',IMG:'img',CANVAS:'canvas',SVG:'img',LI:'listitem',UL:'list',OL:'list',TABLE:'table',TR:'row',TD:'cell',TH:'columnheader',H1:'heading',H2:'heading',H3:'heading',H4:'heading',H5:'heading',H6:'heading',DIALOG:'dialog',FORM:'form'}[el.tagName.toUpperCase()] || 'generic'));
   const textOf = el => {let text='',i=0;const walker=document.createTreeWalker(el,NodeFilter.SHOW_TEXT);let node;while(text.length<256 && i++<32 && (node=walker.nextNode()))text+=(node.nodeValue||'').slice(0,256-text.length);return text;};
-  const labelOf = el => (el.getAttribute('aria-label') || (el.labels && Array.from(el.labels).slice(0,8).map(textOf).join(' ')) || el.getAttribute('title') || el.getAttribute('placeholder') || (['INPUT','TEXTAREA','SELECT'].includes(el.tagName) ? el.id : textOf(el)) || '').trim().slice(0,256);
+  const labelOf = el => (el.getAttribute('aria-label') || (el.labels && Array.from(el.labels).slice(0,8).map(textOf).join(' ')) || el.getAttribute('alt') || el.getAttribute('title') || el.getAttribute('placeholder') || (['INPUT','TEXTAREA','SELECT'].includes(el.tagName) ? el.id : textOf(el)) || '').trim().slice(0,256);
   const protectedNode = el => el.tagName === 'INPUT' && ['password','file','hidden'].includes((el.type||'').toLowerCase());
   const visible = el => el.isConnected && el.ownerDocument === document && el.getClientRects().length > 0 && getComputedStyle(el).visibility !== 'hidden';
   const enabled = el => !el.disabled && !el.closest('[inert]') && el.getAttribute('aria-disabled') !== 'true';
@@ -101,6 +101,17 @@
     confirm: args => {
       const found=check(args); if(found.error) return found;
       return {ok:true};
+    },
+    // The element's box in page CSS pixels, scrolled into view, for a screenshot.
+    rect: args => {
+      if (args.document_token!==documentToken || args.observation!==observation) return {error:'CONTROL.STALE_TARGET'};
+      const found=nodes.get(args.node_id);
+      if (!found || !visible(found.el) || fingerprint(found.el)!==found.fingerprint) return {error:'CONTROL.STALE_TARGET'};
+      if (protectedNode(found.el)) return {error:'CONTROL.ACTION_UNSUPPORTED'};
+      found.el.scrollIntoView({block:'nearest',inline:'nearest'});
+      const box=found.el.getBoundingClientRect();
+      if (box.width<1 || box.height<1) return {error:'CONTROL.OCCLUDED'};
+      return {x:box.left+scrollX,y:box.top+scrollY,width:box.width,height:box.height};
     },
     // Where trusted pointer input should land, in this frame's CSS pixels. The
     // point must hit the observed element, so nothing laid over it is clicked.

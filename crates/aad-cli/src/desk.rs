@@ -273,12 +273,21 @@ struct Desk {
 }
 
 impl Desk {
+    /// With `AAD_CDP_PORT` set, the browser on that loopback debug port is a
+    /// target too, e.g. one `aad browser-record start --browser` launched.
     fn open(allow_input: bool) -> Self {
+        let port = std::env::var("AAD_CDP_PORT")
+            .ok()
+            .and_then(|port| port.trim().parse::<u16>().ok())
+            .filter(|port| *port != 0);
         Self {
-            session: Session::native(Policy {
-                allow_input,
-                ..Default::default()
-            }),
+            session: Session::native_with_browser(
+                Policy {
+                    allow_input,
+                    ..Default::default()
+                },
+                port,
+            ),
         }
     }
 
@@ -582,6 +591,71 @@ pub fn find(args: &FindArgs) -> (Value, u8) {
                 found
             }),
     )
+}
+
+#[derive(Args)]
+pub struct CaptureArgs {
+    #[command(flatten)]
+    pick: Pick,
+    /// Where to write the PNG.
+    #[arg(long, value_name = "FILE")]
+    out: std::path::PathBuf,
+}
+
+/// Write a PNG of one element; `digest` changes when what it shows changes.
+pub fn capture(args: &CaptureArgs) -> (Value, u8) {
+    let locator = match args.pick.locator.build() {
+        Ok(locator) => locator,
+        Err(failed) => return failed,
+    };
+    let desk = Desk::open(false);
+    finish(
+        desk.observe(&args.pick.at, View::default())
+            .and_then(|observed| desk.find(&observed, locator, Expect::One))
+            .and_then(|found| {
+                let target = serde_json::from_value(found["target"].clone())
+                    .map_err(|e| usage(format!("no target: {e}")))?;
+                desk.call(Operation::Capture { target })
+            })
+            .and_then(|mut shot| {
+                let data = shot
+                    .as_object_mut()
+                    .and_then(|fields| fields.remove("data"))
+                    .unwrap_or_default();
+                let bytes = decode_base64(data.as_str().unwrap_or_default())
+                    .ok_or_else(|| usage("the screenshot was not valid base64"))?;
+                std::fs::write(&args.out, bytes)
+                    .map_err(|e| usage(format!("could not write {}: {e}", args.out.display())))?;
+                shot["path"] = json!(args.out.display().to_string());
+                Ok(shot)
+            }),
+    )
+}
+
+fn decode_base64(text: &str) -> Option<Vec<u8>> {
+    let value = |c: u8| match c {
+        b'A'..=b'Z' => Some(c - b'A'),
+        b'a'..=b'z' => Some(c - b'a' + 26),
+        b'0'..=b'9' => Some(c - b'0' + 52),
+        b'+' => Some(62),
+        b'/' => Some(63),
+        _ => None,
+    };
+    let clean: Vec<u8> = text.bytes().filter(|c| !c.is_ascii_whitespace()).collect();
+    let mut bytes = Vec::with_capacity(clean.len() / 4 * 3);
+    for chunk in clean.chunks(4) {
+        let digits: Vec<u8> = chunk
+            .iter()
+            .take_while(|c| **c != b'=')
+            .map(|c| value(*c))
+            .collect::<Option<_>>()?;
+        let mut word = 0u32;
+        for (index, digit) in digits.iter().enumerate() {
+            word |= u32::from(*digit) << (18 - 6 * index);
+        }
+        bytes.extend_from_slice(&word.to_be_bytes()[1..digits.len().max(1)]);
+    }
+    Some(bytes)
 }
 
 /// The action and the element it applies to, still to be resolved.

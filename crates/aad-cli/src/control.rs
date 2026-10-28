@@ -40,6 +40,9 @@ pub struct McpArgs {
     /// Without it the server only observes.
     #[arg(long)]
     allow_input: bool,
+    /// Let browser_open start from a copy of an existing browser profile's logins.
+    #[arg(long, requires = "allow_input")]
+    allow_profile_copy: bool,
     /// Trusted argv as a JSON array, e.g. an existing authenticated ssh -T command.
     /// This connection exposes only remote control tools, no local workflow tools.
     #[arg(long, value_name = "JSON_ARGV")]
@@ -96,10 +99,15 @@ pub fn mcp(args: &McpArgs) -> std::io::Result<()> {
         let client = RemoteClient::spawn(&command(raw)?).map_err(|e| invalid(e.message))?;
         aad_mcp::Server::with_control(Arc::new(client))
     } else {
-        aad_mcp::Server::with_options(
+        let server = aad_mcp::Server::with_options(
             args.grants.policy(args.allow_input),
             args.grants.browser_port,
-        )
+        );
+        if args.allow_profile_copy {
+            server.allow_profile_copy()
+        } else {
+            server
+        }
     };
     aad_mcp::serve_stdio_with(server)
 }

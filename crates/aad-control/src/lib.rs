@@ -50,6 +50,13 @@ pub trait Backend: Send + Sync {
     fn lease_key(&self, _snapshot: &Value) -> Option<String> {
         None
     }
+    /// A PNG of an observed node: `{"format": "png", "data": base64, "width", "height"}`.
+    fn capture(&self, _snapshot: &Value, _node: &Value, _timeout: Duration) -> Result<Value> {
+        Err(error(
+            "CONTROL.ACTION_UNSUPPORTED",
+            "this provider cannot take screenshots",
+        ))
+    }
     fn resources(&self, timeout: Duration) -> Result<Vec<BackendResource>>;
     fn observe(&self, selector: &Value, max_nodes: usize, timeout: Duration) -> Result<Value>;
     /// Shape a retained snapshot for the caller. `None` uses the portable
@@ -184,6 +191,8 @@ pub struct Session {
     leases: Mutex<BTreeMap<String, Arc<lease::InputLease>>>,
     /// The native providers behind this session, for saved workflows.
     providers: Vec<Arc<dyn aad_runtime::Provider>>,
+    /// The browser provider, which can be pointed at a browser later.
+    browser: Option<Arc<browser::BrowserBackend>>,
 }
 
 impl Session {
@@ -206,6 +215,7 @@ impl Session {
             max_requests: 10_000,
             leases: Mutex::new(BTreeMap::new()),
             providers: Vec::new(),
+            browser: None,
         }
     }
 
@@ -218,12 +228,12 @@ impl Session {
         let providers = natives.iter().map(|b| b.provider()).collect();
         let backends = natives.into_iter().map(|b| b as Arc<dyn Backend>).collect();
         let mut session = Self::new(backends, policy).with_providers(providers);
-        if let Some(port) = browser_port {
-            session.backends.insert(
-                browser::PROVIDER.into(),
-                Arc::new(browser::BrowserBackend::new(port)),
-            );
-        }
+        // Always present, so a browser started later can be attached.
+        let browser = Arc::new(browser::BrowserBackend::new(browser_port.unwrap_or(0)));
+        session
+            .backends
+            .insert(browser::PROVIDER.into(), browser.clone());
+        session.browser = Some(browser);
         session.failures = failures;
         session
     }
@@ -231,6 +241,29 @@ impl Session {
     /// Native providers that saved workflows may drive. They must be the
     /// instances behind this session's backends, so a workflow shares their
     /// snapshot stores rather than opening a second driver.
+    /// Point the browser provider at the CDP endpoint on this loopback port.
+    /// Earlier browser observations stop resolving.
+    pub fn attach_browser(&self, port: u16) -> Result<()> {
+        let browser = self.browser.as_ref().ok_or_else(|| {
+            error(
+                "BROWSER.NOT_CONNECTED",
+                "this session has no browser provider",
+            )
+        })?;
+        browser.attach(port);
+        self.state
+            .lock()
+            .unwrap()
+            .observations
+            .retain(|_, old| old.provider != browser::PROVIDER);
+        Ok(())
+    }
+
+    /// The CDP port the browser provider works with, if one is attached.
+    pub fn browser_port(&self) -> Option<u16> {
+        self.browser.as_ref().and_then(|b| b.attached_port())
+    }
+
     pub fn with_providers(mut self, providers: Vec<Arc<dyn aad_runtime::Provider>>) -> Self {
         self.providers = providers;
         self
@@ -754,6 +787,48 @@ impl Session {
                 Ok(
                     json!({"submitted": true, "provider": observation.provider, "operation": action.name(), "backend_result": value, "requires_fresh_observation": true}),
                 )
+            }
+            Operation::Capture { target } => {
+                if target.session_id != self.id {
+                    return Err(error(
+                        "CONTROL.SESSION_MISMATCH",
+                        "target belongs to another session",
+                    ));
+                }
+                let observation = self.observation(&target.observation_id)?;
+                if target.resource_id != observation.resource_id
+                    || !self.allowed_resource(&target.resource_id)
+                {
+                    return Err(error(
+                        "POLICY.DENIED",
+                        "target is outside the resource grant",
+                    ));
+                }
+                let node = observation.raw["nodes"]
+                    .as_array()
+                    .and_then(|nodes| {
+                        nodes
+                            .iter()
+                            .find(|n| n["node_id"] == target.node_id.as_str())
+                    })
+                    .ok_or_else(|| error("CONTROL.STALE_TARGET", "node was not observed"))?;
+                let backend = &self.backends[&observation.provider];
+                let mut shot = backend.capture(&observation.raw, node, context.remaining()?)?;
+                // Compared across captures to tell whether what is shown changed,
+                // e.g. a login code that refreshes, without reading the image.
+                let digest = shot["data"]
+                    .as_str()
+                    .map(|data| {
+                        use sha2::Digest;
+                        sha2::Sha256::digest(data.as_bytes())
+                            .iter()
+                            .map(|b| format!("{b:02x}"))
+                            .collect::<String>()
+                    })
+                    .unwrap_or_default();
+                shot["digest"] = json!(digest);
+                shot["provider"] = json!(observation.provider);
+                Ok(shot)
             }
             Operation::Cancel { .. } | Operation::Close {} => unreachable!(),
         }

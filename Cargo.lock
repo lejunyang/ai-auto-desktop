@@ -120,6 +120,7 @@ name = "aad-mcp"
 version = "0.0.1"
 dependencies = [
  "aad-atspi",
+ "aad-cdp",
  "aad-control",
  "aad-core",
  "aad-macos-ax",
@@ -129,6 +130,7 @@ dependencies = [
  "aad-uia",
  "serde",
  "serde_json",
+ "uuid",
 ]
 
 [[package]]

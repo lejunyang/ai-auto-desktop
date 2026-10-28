@@ -53,6 +53,10 @@ enum Command {
     Snapshot(desk::ResourceArgs),
     /// Find the single element matching a locator.
     Find(desk::FindArgs),
+    /// Write a PNG screenshot of one element (browser pages).
+    ///
+    /// Compare `digest` between captures to tell whether what it shows changed.
+    Capture(desk::CaptureArgs),
     /// Find one element and act on it, in one step.
     #[command(subcommand)]
     Do(desk::DoCommand),
@@ -394,6 +398,7 @@ fn dispatch(command: &Command) -> (Value, u8) {
         Command::Snapshot(args) => desk::snapshot(args),
         Command::Find(args) => desk::find(args),
         Command::Do(command) => desk::act(command),
+        Command::Capture(args) => desk::capture(args),
         Command::Record(args) => desk::record(args),
         Command::Watch(args) => run_watch(args),
         Command::BrowserRecord(command) => match browser_record::run(command) {

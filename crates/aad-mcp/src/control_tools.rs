@@ -280,6 +280,13 @@ unknown-effect write automatically.",
             true,
         ),
         (
+            "control_capture",
+            "Take a PNG screenshot of one observed element, e.g. a login QR code to show a person, or the page body for the whole page. Read-only. The answer carries the image and a `digest` of it: capture again later and compare digests to tell whether what is shown has changed (a QR code that refreshed) without looking at the image. Browser pages only for now; password fields are refused.",
+            json!({"target": target_schema()}),
+            vec!["target"],
+            false,
+        ),
+        (
             "control_cancel",
             "Request cancellation of an in-flight control request. If input was already \
 dispatched, its effect is unknown; cancellation never means rollback.",

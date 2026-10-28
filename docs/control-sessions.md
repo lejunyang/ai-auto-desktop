@@ -58,7 +58,15 @@ aad mcp                                  # 本机 MCP，默认只读
 aad mcp --allow-input                    # 本机 MCP，授予输入与工作流写入/运行
 aad mcp --provider desktop.linux_atspi    # 限定 provider，不提供工作流工具
 aad mcp --browser-port 9222              # 显式连接本机已有的隔离 CDP 实例
+aad mcp --allow-input --allow-profile-copy  # browser_open 可以复制已有 profile 的登录
 ```
+
+会话总带一个浏览器 provider，没连接时没有页面；`Session::attach_browser(port)` 之后换成那个浏览器
+（旧的浏览器观察作废）。MCP 的 `browser_open` 用 `aad_cdp::launch` 启动浏览器后就这样接上，
+`browser_record_*` 复用 `aad_cdp::recording` 写到存储目录的 `browser/<时间>-<id>/`。
+`Capture { target }` 是只读操作：浏览器把元素滚进视口后用 `Page.captureScreenshot` 按元素框裁剪
+（最大 4096×8192，超出时 `clipped: true`），会话加上 PNG 的 sha256 作为 `digest`。只支持主框架；
+其他 provider 返回 `CONTROL.ACTION_UNSUPPORTED`。
 
 MCP 工具为 `control_capabilities`, `control_targets`, `control_observe`, `control_find`,
 `control_act`, `control_cancel`, `control_close`，本机未限定授权时另有 `probe_environment` 与四个工作流工具。

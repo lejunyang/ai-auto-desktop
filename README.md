@@ -270,7 +270,7 @@ aad mcp --allow-input    # 由启动它的人授予输入
 在 stdio 上说 JSON-RPC 2.0，protocolVersion `2024-11-05`。工具分两类：
 
 **看与做**：`control_capabilities`、`control_targets`、`control_observe`、`control_find`、`control_act`、
-`control_cancel`、`control_close`，另有不需要桌面的 `probe_environment`。
+`control_capture`、`control_cancel`、`control_close`，另有不需要桌面的 `probe_environment`。
 
 - `control_targets` 列出窗口、应用和浏览器页面；`control_observe` 默认返回有上限的 outline（可操作或有名字的元素，
   按 `limit` 与 `max_characters` 截断，`stopped_by` 说明是哪个上限）。窗口很大时先用 `view.mode=overview`
@@ -283,6 +283,24 @@ aad mcp --allow-input    # 由启动它的人授予输入
   以及浏览器页面的 navigate（只限 http/https）、back、forward、reload。位置只能是元素内 0..1 的比例。
   以观察结果里每个节点的 `capabilities` 为准。浏览器里普通 click 是 DOM 激活；带位置、按键或双击时改发可信的指针事件，
   落点被别的元素盖住时拒绝（`CONTROL.OCCLUDED`），不会点到盖在上面的东西。
+- `control_capture` 给一个观察到的元素截 PNG（目前限浏览器页面，密码框拒绝），同时返回 `digest`：
+  隔一会儿再截一次比对 digest，就知道显示的内容变没变（例如登录二维码刷新了），不用每次看图。
+
+**浏览器**（需要 `--allow-input`，`browser_profiles` 只读）：`browser_open` 启动一个浏览器并把会话接到它上面，
+之后 `control_targets` 就能列出它的页面。用户目录三选一：不给（临时目录，关掉即删）、`profile_dir`（工作目录，
+登录一次之后一直保留）、`copy_profile`（复制已有 profile 的登录文件，要启动服务时加 `--allow-profile-copy`；
+`browser_profiles` 列出可选的 profile）。占用中的浏览器只有传 `close_running` 才会被关掉。
+`browser_record_start` / `browser_record_stop` 记录一个页面：页面上的动作和引起的变化、网络请求与响应正文
+（默认保留原值，`redact_network` 才抹掉敏感字段）、WebSocket 消息和关键时刻的截图，停止时给出写入的目录和文件。
+`browser_open` 带 `record` 时在打开网址之前就开始记录。这些是过程数据，据此写技能、筛接口由 Agent 自己做。
+
+一个例子：打开浏览器到登录页 → `control_capture` 二维码发给人扫 → 隔几秒比对 digest，变了就重发 →
+登录后在页面上操作 → `browser_record_stop` → 读 `evidence/network.jsonl` 找到返回订单数据的接口。
+`tests/browser/verify_mcp_browser_session.py` 用本机的假站点在真实 Chrome 里走完这一遍。
+
+命令行同样能操作浏览器：设置 `AAD_CDP_PORT=<端口>` 后，`aad apps`、`aad describe`、`aad do`、`aad capture`
+都会把这个调试端口上的浏览器页面算进来，例如 `aad browser-record start --browser chrome` 启动时打印的端口。
+`aad capture <页面> --role img --name 登录二维码 --out code.png` 把元素截图写到文件。
 - 失败以结构化错误返回，并附 `hint` 说明怎样恢复（例如界面变了要重新 observe，匹配多个要用 `within` 收窄）。
 
 **保存与运行流程**（重复劳动）：`save_workflow`、`list_workflows`、`describe_workflow`、`run_workflow`。

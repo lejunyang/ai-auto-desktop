@@ -293,6 +293,10 @@ pub enum Operation {
         target: Target,
         action: Action,
     },
+    /// A PNG of one observed element, read-only.
+    Capture {
+        target: Target,
+    },
     Cancel {
         request_id: String,
     },

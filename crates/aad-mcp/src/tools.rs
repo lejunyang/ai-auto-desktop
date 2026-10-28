@@ -290,6 +290,7 @@ effect. Workflows containing script steps are refused.",
         },
     ];
     tools.extend(crate::control_tools::catalogue());
+    tools.extend(crate::browser_tools::catalogue());
     tools
 }
 

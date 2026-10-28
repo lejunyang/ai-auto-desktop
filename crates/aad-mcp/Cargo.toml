@@ -10,6 +10,7 @@ description = "Model Context Protocol server exposing desktop discovery and auto
 [dependencies]
 aad-core = { workspace = true }
 aad-control = { workspace = true }
+aad-cdp = { workspace = true }
 aad-atspi = { workspace = true }
 aad-macos-ax = { workspace = true }
 aad-ocr = { workspace = true }
@@ -18,6 +19,7 @@ aad-runtime = { workspace = true }
 aad-uia = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+uuid = { workspace = true }
 
 # Inherit the workspace's deliberate lint allowances (see the root Cargo.toml).
 [lints]
