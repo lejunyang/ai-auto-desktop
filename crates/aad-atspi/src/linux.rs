@@ -1583,10 +1583,14 @@ impl LinuxBackend {
             "/org/a11y/atspi/registry",
             "org.a11y.atspi.Registry",
         ) {
+            // GTK's bridge reads the libatspi spelling; Qt 5 only recognises
+            // the D-Bus one ("Object:TextChanged") and ignores the other.
             for event in [
                 "object:text-changed",
                 "object:state-changed:checked",
                 "object:state-changed:focused",
+                "Object:TextChanged",
+                "Object:StateChanged",
             ] {
                 if registry
                     .call_method("RegisterEvent", &(event, Vec::<String>::new(), ""))
@@ -1630,12 +1634,22 @@ impl LinuxBackend {
                 std::collections::HashMap<String, zbus::zvariant::OwnedValue>,
             )>() {
                 Ok(fields) => (fields.0, fields.1),
-                Err(_) => {
-                    match body.deserialize::<(String, i32, i32, zbus::zvariant::OwnedValue)>() {
-                        Ok(fields) => (fields.0, fields.1),
-                        Err(_) => continue,
+                // Qt 5 ends the body with the application's root reference.
+                Err(_) => match body.deserialize::<(
+                    String,
+                    i32,
+                    i32,
+                    zbus::zvariant::OwnedValue,
+                    (String, zbus::zvariant::OwnedObjectPath),
+                )>() {
+                    Ok(fields) => (fields.0, fields.1),
+                    Err(_) => {
+                        match body.deserialize::<(String, i32, i32, zbus::zvariant::OwnedValue)>() {
+                            Ok(fields) => (fields.0, fields.1),
+                            Err(_) => continue,
+                        }
                     }
-                }
+                },
             };
             let at_ms = monotonic_ms();
             match (member.as_str(), kind.as_str()) {

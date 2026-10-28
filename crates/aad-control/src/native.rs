@@ -286,7 +286,18 @@ impl Backend for NativeBackend {
             ),
             Action::TypeText { text, mode } => {
                 set("text", json!(text));
-                set("mode", serde_json::to_value(mode).unwrap());
+                // Only UI Automation offers a choice; AT-SPI and AX always
+                // type Unicode and refuse a `mode` argument.
+                match (self.flavor, mode) {
+                    (Flavor::Windows, _) => set("mode", serde_json::to_value(mode).unwrap()),
+                    (_, Some(crate::model::TypeMode::Keys)) => {
+                        return Err(error(
+                            "CONTROL.ACTION_UNSUPPORTED",
+                            "layout-aware key typing is available on Windows only",
+                        ))
+                    }
+                    _ => {}
+                }
             }
             Action::Key { keys } => set("keys", json!(keys)),
             Action::Click {

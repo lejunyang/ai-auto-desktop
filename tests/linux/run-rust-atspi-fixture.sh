@@ -16,7 +16,14 @@ if [ "${1:-}" = --inside-session ]; then
     wait "$fixture_pid" 2>/dev/null || true
   }
   trap finish_fixture EXIT HUP INT TERM
-  for _ in $(seq 1 50); do
+  # Output is mostly sent to /dev/null or jq; say which step stopped the run.
+  report_failure() {
+    printf 'AT-SPI fixture failed at line %s: %s\n' "$1" "$2" >&2
+    sed 's/^/fixture: /' "$fixture_log" >&2 || true
+  }
+  trap 'report_failure "$LINENO" "$BASH_COMMAND"' ERR
+  # A cold Qt start on a busy runner can take several seconds.
+  for _ in $(seq 1 200); do
     grep -q READY "$fixture_log" && break
     sleep 0.1
   done
@@ -47,26 +54,47 @@ if [ "${1:-}" = --inside-session ]; then
   AAD_CONTROL_CLI="$root/target/debug/aad" cargo run --locked -q -p aad-control --example native_fixture -- "$fixture_pid"
   # The commands a person runs go through the same session, one process each.
   aad="$root/target/debug/aad"
+  # Run one action; keep its answer quiet unless it fails.
+  act() {
+    local answer
+    if ! answer=$("$aad" --compact do "$@"); then
+      printf 'aad do %s:
+%s
+' "$*" "$answer" >&2
+      return 1
+    fi
+  }
+  # Invoke and XTest input reach Qt asynchronously; look again until the effect shows.
+  eventually() {
+    local filter=$1; shift
+    for _ in $(seq 1 50); do
+      "$aad" --compact find "$resource" "$@" | jq -e "$filter" >/dev/null && return 0
+      sleep 0.1
+    done
+    "$aad" --compact find "$resource" "$@" >&2
+    return 1
+  }
   resource=$("$aad" --compact apps | jq -r --argjson pid "$fixture_pid"     '.apps[] | select(.metadata.process_id == $pid and .metadata.toolkit_name == "Qt") | .resource_id')
   [ -n "$resource" ]
-  "$aad" --compact do fill "$resource" --role text --name "Qt fixture text entry" --value "CLI session fill" >/dev/null
-  "$aad" --compact find "$resource" --role text --name "Qt fixture text entry"     | jq -e '.found and .node.value == "CLI session fill"' >/dev/null
-  "$aad" --compact do invoke "$resource" --role push_button --name "Reset Qt fixture status" >/dev/null
-  "$aad" --compact find "$resource" --name "Qt fixture status idle" | jq -e '.found' >/dev/null
+  act fill "$resource" --role text --name "Qt fixture text entry" --value "CLI session fill"
+  eventually '.found and .node.value == "CLI session fill"' --role text --name "Qt fixture text entry"
+  act invoke "$resource" --role push_button --name "Reset Qt fixture status"
+  eventually '.found' --name "Qt fixture status idle"
   # Gestures and chords go through the XTest helper's new commands.
-  "$aad" --compact do click "$resource" --role push_button --name "Invoke Qt fixture button" --count 2 >/dev/null
-  "$aad" --compact find "$resource" --name "Qt fixture status invoked" | jq -e '.found' >/dev/null
-  "$aad" --compact do key "$resource" --role text --name "Qt fixture text entry" --keys ctrl,a >/dev/null
-  "$aad" --compact do type-text "$resource" --role text --name "Qt fixture text entry" --text "chord" >/dev/null
-  "$aad" --compact find "$resource" --role text --name "Qt fixture text entry"     | jq -e '.node.value == "chord"' >/dev/null
+  act click "$resource" --role push_button --name "Invoke Qt fixture button" --count 2
+  eventually '.found' --name "Qt fixture status invoked"
+  act key "$resource" --role text --name "Qt fixture text entry" --keys ctrl,a
+  act type-text "$resource" --role text --name "Qt fixture text entry" --text "chord"
+  eventually '.node.value == "chord"' --role text --name "Qt fixture text entry"
   # Recording: XRecord sees the XTest click, AT-SPI reports the text change.
   recorded=${TMPDIR:-/tmp}/aad-rust-atspi-recording.json
   "$aad" --compact record "$resource" --seconds 6 >"$recorded" &
   recorder=$!
   sleep 2
-  "$aad" --compact do click "$resource" --role push_button --name "Invoke Qt fixture button" >/dev/null
-  "$aad" --compact do fill "$resource" --role text --name "Qt fixture text entry" --value "recorded" >/dev/null
+  act click "$resource" --role push_button --name "Invoke Qt fixture button"
+  act fill "$resource" --role text --name "Qt fixture text entry" --value "recorded"
   wait "$recorder"
+  jq -e '.' "$recorded" >&2 || cat "$recorded" >&2
   jq -e '[.steps[].action.type] | (index("click") != null) and (index("fill") != null)' "$recorded" >/dev/null
   refused=$("$aad" --compact find "$resource" --role push_button --nth 1 || true)
   printf '%s' "$refused" | jq -e '.error.code == "CONTROL.LOCATOR_UNSUPPORTED"' >/dev/null
