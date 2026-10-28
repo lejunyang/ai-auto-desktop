@@ -35,6 +35,8 @@ base64 = "0.22"
 
 [target.'cfg(windows)'.dependencies]
 image = { workspace = true }
+# Lossy WebP for the desktop stream (libwebp, built from source).
+webp = { version = "0.3", default-features = false }
 windows = { version = "0.58", features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
