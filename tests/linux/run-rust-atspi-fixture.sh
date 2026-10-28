@@ -16,6 +16,12 @@ if [ "${1:-}" = --inside-session ]; then
     wait "$fixture_pid" 2>/dev/null || true
   }
   trap finish_fixture EXIT HUP INT TERM
+  # Output is mostly sent to /dev/null or jq; say which step stopped the run.
+  report_failure() {
+    printf 'AT-SPI fixture failed at line %s: %s\n' "$1" "$2" >&2
+    sed 's/^/fixture: /' "$fixture_log" >&2 || true
+  }
+  trap 'report_failure "$LINENO" "$BASH_COMMAND"' ERR
   for _ in $(seq 1 50); do
     grep -q READY "$fixture_log" && break
     sleep 0.1
