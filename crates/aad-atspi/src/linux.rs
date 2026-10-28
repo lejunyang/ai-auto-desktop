@@ -1,6 +1,6 @@
 use super::{
     driver_error, remaining, AtspiBackend, AutomationError, BackendNode, BackendSnapshot, Bounds,
-    Map, NativeRef, Value, MAX_FIELD_CHARS, MAX_NODES,
+    Gesture, Map, NativeRef, Value, MAX_FIELD_CHARS, MAX_NODES,
 };
 use atspi::proxy::accessible::AccessibleProxy;
 use atspi::proxy::action::ActionProxy;
@@ -236,6 +236,37 @@ impl LinuxBackend {
             .unwrap_or_default()
     }
 
+    /// Focus the target, then run one XTest helper command against it.
+    fn run_input(
+        &self,
+        target: &NativeRef,
+        mut args: Vec<String>,
+        minimum_events: u64,
+        process_id: u32,
+        deadline: Instant,
+    ) -> Result<Value, AutomationError> {
+        let path = self.helper(HelperKind::Input)?;
+        let focus = self.focus(target, deadline)?;
+        std::thread::sleep(Duration::from_millis(50).min(remaining(deadline, true)?));
+        args.extend([
+            "--deadline-monotonic-ns".into(),
+            monotonic_deadline_ns(deadline)?.to_string(),
+        ]);
+        let output = run_helper(
+            &path,
+            &args,
+            None,
+            deadline,
+            XTEST_OUTPUT_LIMIT,
+            XTEST_OUTPUT_LIMIT,
+        )
+        .map_err(after_focus)?;
+        let mut input = parse_input_helper(output, "input_dispatch", minimum_events, process_id)
+            .map_err(after_focus)?;
+        input["focus"] = focus;
+        Ok(input)
+    }
+
     fn helper(&self, kind: HelperKind) -> Result<PathBuf, AutomationError> {
         let (environment, file_name, repository_name) = match kind {
             HelperKind::Input => (
@@ -398,7 +429,9 @@ impl LinuxBackend {
             && bounds.is_some_and(|bounds| bounds.width > 0 && bounds.height > 0)
             && !protected
         {
-            actions.push("pointer_click".into());
+            actions.extend(
+                ["pointer_click", "pointer_gesture", "drag", "key_chord"].map(String::from),
+            );
         }
         let gtk3 = toolkit == Some("gtk") && toolkit_version.starts_with("3.");
         if gtk3
@@ -773,6 +806,113 @@ impl AtspiBackend for LinuxBackend {
         }
         Ok(
             json!({"native_interface": "Component.grab_focus -> XTEST", "focus": focus, "input": result, "synthetic_input": true, "button": "left", "position": "center", "click_point": {"x": point.0, "y": point.1}}),
+        )
+    }
+
+    fn pointer_gesture(
+        &self,
+        target: &NativeRef,
+        point: (i32, i32),
+        gesture: Gesture,
+        process_id: u32,
+        deadline: Instant,
+    ) -> Result<Value, AutomationError> {
+        let mut args = vec![
+            "pointer-gesture".to_string(),
+            "--expected-pid".into(),
+            process_id.to_string(),
+            "--x".into(),
+            point.0.to_string(),
+            "--y".into(),
+            point.1.to_string(),
+        ];
+        let minimum = match gesture {
+            Gesture::Click { button, count } => {
+                args.extend([
+                    "--mode".into(),
+                    "click".into(),
+                    "--button".into(),
+                    button.to_string(),
+                    "--count".into(),
+                    count.to_string(),
+                ]);
+                1 + 2 * u64::from(count)
+            }
+            Gesture::Wheel { button, notches } => {
+                args.extend([
+                    "--mode".into(),
+                    "wheel".into(),
+                    "--button".into(),
+                    button.to_string(),
+                    "--notches".into(),
+                    notches.to_string(),
+                ]);
+                1 + 2 * u64::from(notches)
+            }
+            Gesture::Hover { ms } => {
+                args.extend([
+                    "--mode".into(),
+                    "hover".into(),
+                    "--hover-ms".into(),
+                    ms.to_string(),
+                ]);
+                1
+            }
+        };
+        let input = self.run_input(target, args, minimum, process_id, deadline)?;
+        Ok(
+            json!({"native_interface": "Component.grab_focus -> XTEST", "input": input, "synthetic_input": true, "point": {"x": point.0, "y": point.1}}),
+        )
+    }
+
+    fn drag(
+        &self,
+        target: &NativeRef,
+        from: (i32, i32),
+        to: (i32, i32),
+        button: u8,
+        process_id: u32,
+        deadline: Instant,
+    ) -> Result<Value, AutomationError> {
+        let args = vec![
+            "drag".to_string(),
+            "--expected-pid".into(),
+            process_id.to_string(),
+            "--x".into(),
+            from.0.to_string(),
+            "--y".into(),
+            from.1.to_string(),
+            "--to-x".into(),
+            to.0.to_string(),
+            "--to-y".into(),
+            to.1.to_string(),
+            "--button".into(),
+            button.to_string(),
+        ];
+        let input = self.run_input(target, args, 3, process_id, deadline)?;
+        Ok(
+            json!({"native_interface": "Component.grab_focus -> XTEST", "input": input, "synthetic_input": true, "from": {"x": from.0, "y": from.1}, "to": {"x": to.0, "y": to.1}}),
+        )
+    }
+
+    fn key_chord(
+        &self,
+        target: &NativeRef,
+        keys: &[String],
+        process_id: u32,
+        deadline: Instant,
+    ) -> Result<Value, AutomationError> {
+        let args = vec![
+            "key-chord".to_string(),
+            "--expected-pid".into(),
+            process_id.to_string(),
+            "--keys".into(),
+            keys.join(","),
+        ];
+        let minimum = 2 * keys.len() as u64;
+        let input = self.run_input(target, args, minimum, process_id, deadline)?;
+        Ok(
+            json!({"native_interface": "Component.grab_focus -> XTEST", "input": input, "synthetic_input": true, "keys": keys}),
         )
     }
 

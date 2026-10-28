@@ -53,6 +53,12 @@ if [ "${1:-}" = --inside-session ]; then
   "$aad" --compact find "$resource" --role text --name "Qt fixture text entry"     | jq -e '.found and .node.value == "CLI session fill"' >/dev/null
   "$aad" --compact do invoke "$resource" --role push_button --name "Reset Qt fixture status" >/dev/null
   "$aad" --compact find "$resource" --name "Qt fixture status idle" | jq -e '.found' >/dev/null
+  # Gestures and chords go through the XTest helper's new commands.
+  "$aad" --compact do click "$resource" --role push_button --name "Invoke Qt fixture button" --count 2 >/dev/null
+  "$aad" --compact find "$resource" --name "Qt fixture status invoked" | jq -e '.found' >/dev/null
+  "$aad" --compact do key "$resource" --role text --name "Qt fixture text entry" --keys ctrl,a >/dev/null
+  "$aad" --compact do type-text "$resource" --role text --name "Qt fixture text entry" --text "chord" >/dev/null
+  "$aad" --compact find "$resource" --role text --name "Qt fixture text entry"     | jq -e '.node.value == "chord"' >/dev/null
   refused=$("$aad" --compact find "$resource" --role push_button --nth 1 || true)
   printf '%s' "$refused" | jq -e '.error.code == "CONTROL.LOCATOR_UNSUPPORTED"' >/dev/null
   printf '%s\n' 'Rust Linux AT-SPI fixture passed'

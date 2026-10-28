@@ -9,7 +9,7 @@
 | provider | 类型化动作 | 实际语义 / 限制 |
 | --- | --- | --- |
 | `desktop.windows_uia` | focus, invoke, click, fill, type_text, key, scroll, hover, drag | UIA + 原生输入；click 带 button/count/fraction 时走原生手势；节点必须暴露对应能力 |
-| `desktop.linux_atspi` | focus, invoke, click, fill, type_text | AT-SPI；指针/输入依赖已有 X11 helper；只有普通左键 click，没有统一 key 与手势适配 |
+| `desktop.linux_atspi` | focus, invoke, click, fill, type_text, key, scroll, hover, drag | AT-SPI；指针/键盘经 X11 XTest helper，只支持 KDE/X11 会话；派发前核对焦点、PID 与落点，drag 起止两点都核对 |
 | `desktop.macos_ax` | focus, invoke, click, fill, type_text | AX helper；需要同一登录用户的辅助功能权限；只有普通左键 click，没有统一 key 与手势适配 |
 | `browser.cdp` | focus, click, fill, key, scroll, hover, select, check, navigate, back, forward, reload | 普通 click 为 `HTMLElement.click()` 的 DOM 激活；带 button/count/fraction 的 click、scroll、hover 为主 frame 的可信 CDP Input，落点先在页面里命中检查；fill/select 为 DOM 值及 input/change 事件；check 已是目标状态时不点击；key 为主 frame 的 CDP Input；navigate/back/forward/reload 在 body 节点上，只限主 frame；没有 drag |
 
@@ -150,7 +150,8 @@ Windows 上 `tests/windows/verify_*_effect.py` 用自建的隔离探针窗口，
 CI 和 release 工作流使用官方 one-sdk Action 最新正式版本，不依赖 pending one-sdk PR。
 
 [待验证] 本云容器不能启动本机 Chromium 沙箱，浏览器实际效果由 GitHub Linux CI 验证。
-[待验证] Linux 上新的 CLI 段只在 CI 的 Xvfb 环境里跑，本机没有跑过。
+[待验证] Linux 上新的 CLI 段、双击和 Ctrl+A 只在 CI 的 Xvfb 环境里跑，本机只编译了 helper 并跑了单元测试；
+右键、滚轮、悬停、拖拽在 Linux 上还没有观察效果的 fixture。
 Windows/macOS 的新适配路由在 CI 以 mock 编译/测试；Windows 的输入桌面、macOS TCC 和跨机器 SSH
 未在真实设备验证。Wayland 原生输入、完整 OOPIF、浏览器拖拽与新标签页、通用跨平台 key、GUI 迁移、结果缓存、
 自动重放与统一 Android wire adapter 均不在本次范围。录制/回放及事件观察保持已有实现，不提升其可靠性声明。

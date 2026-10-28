@@ -244,7 +244,10 @@ impl Backend for NativeBackend {
         }
         let target_of = |node_id: &Value| json!({"snapshot_id": snapshot["snapshot_id"], "revision": snapshot["revision"], "node_id": node_id});
         let mut args = json!({"target": target_of(&node["node_id"])});
-        if !matches!(self.flavor, Flavor::Windows) {
+        // AT-SPI and AX re-resolve every target from a descriptive locator
+        // before acting, so each end of an action carries one.
+        let portable = !matches!(self.flavor, Flavor::Windows);
+        let locator_of = |node: &Value| {
             let mut locator = Map::new();
             locator.insert("role".into(), node["role"].clone());
             for field in ["name", "description"] {
@@ -262,7 +265,10 @@ impl Backend for NativeBackend {
             } else if !node["subrole"].is_null() {
                 locator.insert("subrole".into(), node["subrole"].clone());
             }
-            args["locator"] = Value::Object(locator);
+            Value::Object(locator)
+        };
+        if portable {
+            args["locator"] = locator_of(node);
         }
         let mut set = |key: &str, value: Value| {
             if !value.is_null() {
@@ -315,6 +321,18 @@ impl Backend for NativeBackend {
                 to_fraction,
             } => {
                 set("to", target_of(&json!(to.node_id)));
+                if portable {
+                    let destination = snapshot["nodes"]
+                        .as_array()
+                        .and_then(|nodes| nodes.iter().find(|n| n["node_id"] == to.node_id))
+                        .ok_or_else(|| {
+                            error(
+                                "CONTROL.STALE_TARGET",
+                                "drag destination is not in the snapshot",
+                            )
+                        })?;
+                    set("to_locator", locator_of(destination));
+                }
                 set("button", serde_json::to_value(button).unwrap());
                 set("fraction", fraction(from_at));
                 set("to_fraction", fraction(to_fraction));
