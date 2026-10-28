@@ -162,6 +162,30 @@ pub trait AxBackend: Send + Sync {
             "this backend has no key chords",
         ))
     }
+    /// Start watching what a person does in the application with this process id.
+    fn start_recording(
+        &self,
+        _process_id: u32,
+        _deadline: Instant,
+    ) -> Result<Value, AutomationError> {
+        Err(driver_error(
+            "DRIVER.ACTION_UNSUPPORTED",
+            "this backend cannot record",
+        ))
+    }
+    /// The raw events seen since the last call: `{events, dropped}`.
+    fn collect_recording(&self, _id: &str, _deadline: Instant) -> Result<Value, AutomationError> {
+        Err(driver_error(
+            "DRIVER.ACTION_UNSUPPORTED",
+            "this backend cannot record",
+        ))
+    }
+    fn stop_recording(&self, _id: &str, _deadline: Instant) -> Result<(), AutomationError> {
+        Err(driver_error(
+            "DRIVER.ACTION_UNSUPPORTED",
+            "this backend cannot record",
+        ))
+    }
     fn close(&self) {}
 }
 
@@ -225,6 +249,32 @@ impl MacOSAxProvider {
             "list_apps" => self.list_apps(args, deadline),
             "snapshot" => self.snapshot(args, deadline),
             "find" => self.find(args, deadline),
+            "watch" => {
+                only_keys(args, &["app"])?;
+                let app = app_selector(args.get("app"))?;
+                let process_id = app
+                    .get("process_id")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| invalid("watch.app needs a process_id"))?;
+                let started = self.backend.start_recording(process_id as u32, deadline)?;
+                Ok(
+                    json!({"capture_id": started["recording_id"], "pointer_watch": started["pointer_watch"]}),
+                )
+            }
+            "collect" | "release" => {
+                only_keys(args, &["capture_id"])?;
+                let id = args
+                    .get("capture_id")
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.is_empty() && id.len() <= 64)
+                    .ok_or_else(|| invalid("capture_id is required"))?;
+                if short == "collect" {
+                    self.backend.collect_recording(id, deadline)
+                } else {
+                    self.backend.stop_recording(id, deadline)?;
+                    Ok(json!({"released": true}))
+                }
+            }
             action if WRITE_ACTIONS.contains(&action) => self.write(action, args, deadline),
             _ => Err(invalid("unknown macOS AX action")),
         }
@@ -1342,6 +1392,36 @@ fn manifest_document() -> Value {
     actions.insert("pointer_gesture".into(), contract("重新验证目标后，在元素 bounds 内的比例位置、经 AX 命中检查后向前台应用派发右键/中键/双击、滚轮或悬停。", "non_idempotent", "modify", "high", &["desktop.observe", "desktop.input"], point_input(json!({"button": button, "count": {"enum": [1, 2]}, "fraction": fraction, "scroll": {"type": "object", "required": ["direction"], "properties": {"direction": {"enum": ["up", "down", "left", "right"]}, "notches": {"type": "integer", "minimum": 1, "maximum": 30}}, "additionalProperties": false}, "hover_ms": {"type": "integer", "minimum": 1, "maximum": 5000}}), &[]), write_output(), true, true));
     actions.insert("drag".into(), contract("分别重新验证起点与终点并做 AX 命中检查后，在同一前台应用内按下、分步拖动并在终点释放。", "non_idempotent", "modify", "high", &["desktop.observe", "desktop.input"], point_input(json!({"to": target_schema(), "to_locator": locator_schema(), "button": button, "fraction": fraction, "to_fraction": fraction}), &["to", "to_locator"]), write_output(), true, true));
     actions.insert("key_chord".into(), contract("重新验证并聚焦非受保护目标后，按下修饰键（ctrl、shift、alt、cmd）加一个主键；名称按字面映射，不在平台间互换。", "non_idempotent", "input", "high", &["desktop.observe", "desktop.input"], point_input(json!({"keys": {"type": "array", "minItems": 1, "maxItems": 6, "items": {"type": "string", "minLength": 1, "maxLength": 32}}}), &["keys"]), write_output(), true, true));
+    let capture_id = json!({"type": "object", "required": ["capture_id"], "properties": {"capture_id": {"type": "string", "minLength": 1, "maxLength": 64}}, "additionalProperties": false});
+    actions.insert("watch".into(), contract("开始记录本人在一个应用里的点击、滚轮、组合键、文本修改和勾选（AXObserver + 只监听的事件 tap），不注入输入。", "idempotent", "observe", "medium", &["desktop.observe"], json!({"type": "object", "required": ["app"], "properties": {"app": app_schema()}, "additionalProperties": false}), json!({"type": "object"}), false, false));
+    actions.insert(
+        "collect".into(),
+        contract(
+            "取走上次以来记录到的原始交互事件。",
+            "read_only",
+            "observe",
+            "low",
+            &["desktop.observe"],
+            capture_id.clone(),
+            json!({"type": "object"}),
+            false,
+            false,
+        ),
+    );
+    actions.insert(
+        "release".into(),
+        contract(
+            "停止记录，移除观察者和事件 tap。",
+            "idempotent",
+            "observe",
+            "low",
+            &["desktop.observe"],
+            capture_id,
+            json!({"type": "object"}),
+            false,
+            false,
+        ),
+    );
     for (name, field, description) in [
         (
             "set_value",
@@ -1529,6 +1609,27 @@ mod tests {
             self.writes.fetch_add(1, Ordering::SeqCst);
             Ok(json!({"native_operation": "CGEventKeyChord", "submitted": true, "sent": keys}))
         }
+        fn start_recording(
+            &self,
+            process_id: u32,
+            _deadline: Instant,
+        ) -> Result<Value, AutomationError> {
+            assert_eq!(process_id, 4242);
+            Ok(json!({"recording_id": "r1", "pointer_watch": false}))
+        }
+        fn collect_recording(
+            &self,
+            id: &str,
+            _deadline: Instant,
+        ) -> Result<Value, AutomationError> {
+            assert_eq!(id, "r1");
+            Ok(
+                json!({"events": [{"kind": "text", "node": {"role": "AXTextField", "name": "Note", "value": "hi"}}], "dropped": 0}),
+            )
+        }
+        fn stop_recording(&self, _id: &str, _deadline: Instant) -> Result<(), AutomationError> {
+            Ok(())
+        }
     }
 
     fn take_snapshot(provider: &MacOSAxProvider) -> Value {
@@ -1672,6 +1773,36 @@ mod tests {
             backend.writes.load(Ordering::SeqCst),
             4,
             "nothing refused reached the helper"
+        );
+    }
+
+    #[test]
+    fn watching_reports_whether_pointer_input_is_seen() {
+        let provider = MacOSAxProvider::new(Arc::new(FakeBackend::default())).unwrap();
+        let call = |action: &str, args: Value| {
+            provider.invoke(
+                &format!("desktop.macos_ax.{action}@1"),
+                args,
+                Some(Duration::from_secs(2)),
+            )
+        };
+        let started = call("watch", json!({"app": {"process_id": 4242}})).unwrap();
+        assert_eq!(started["capture_id"], "r1");
+        assert_eq!(
+            started["pointer_watch"], false,
+            "no Input Monitoring: say so"
+        );
+        assert_eq!(
+            call("collect", json!({"capture_id": "r1"})).unwrap()["events"][0]["kind"],
+            "text"
+        );
+        assert_eq!(
+            call("release", json!({"capture_id": "r1"})).unwrap()["released"],
+            true
+        );
+        assert!(
+            call("watch", json!({"app": {"name": "Notes"}})).is_err(),
+            "a process id is required"
         );
     }
 

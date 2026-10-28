@@ -41,6 +41,10 @@ provider 只静默检查权限，不主动弹出 TCC 请求。
 adapter 重新抓取 AX 树，helper 用 `CFEqual` 核对原生对象。protected、截断、多义、身份
 漂移与未授权状态均失败关闭。
 
+录制用 `watch` / `collect` / `release`（helper 的 `record_start` / `record_collect` / `record_stop`）：
+AXObserver 报告值变化和焦点，只监听的 CGEvent tap 报告点击、滚轮和组合键，需要“输入监控”权限，
+没有时只记录值变化并在结果里给出 `pointer_watch: false`。
+
 指针动作的落点必须经 `AXUIElementCopyElementAtPosition` 命中目标或其子元素，事件只投递给
 目标进程（`postToPid`），不做全局注入；跨应用拖放因此不支持。
 

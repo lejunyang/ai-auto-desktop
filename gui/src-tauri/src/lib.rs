@@ -20,6 +20,7 @@ use std::sync::mpsc::{channel, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use aad_control::recording::{self, Recording};
 use aad_control::steps::{self, App, Step};
 use aad_control::{Expect, Locator, Operation, Policy, Request, Session, View};
 use aad_core::AutomationError;
@@ -27,7 +28,6 @@ use serde_json::{json, Map, Value};
 
 pub use aad_runtime::recordings;
 
-const WINDOWS_DRIVER: &str = "desktop.windows_uia";
 const STEP_TIMEOUT: Duration = Duration::from_secs(30);
 
 type Reply = Result<Value, Value>;
@@ -37,16 +37,9 @@ type Job = Box<dyn FnOnce(&mut Desk) + Send>;
 struct Desk {
     session: Arc<Session>,
     browser_port: Option<u16>,
-    capture: Option<Capture>,
+    capture: Option<Recording>,
     /// Numbers the ids of recorded steps, across recordings in one run.
     recorded: usize,
-}
-
-/// A recording in progress: the Windows driver's capture and the window it
-/// is anchored to, named as saved steps name it.
-struct Capture {
-    id: String,
-    app: App,
 }
 
 /// A handle to the automation thread.
@@ -90,7 +83,7 @@ impl Shell {
                 while let Ok(job) = queue.recv() {
                     job(&mut desk);
                 }
-                desk.stop_capture();
+                let _ = desk.stop_capture();
             })
             .expect("the automation thread can be started");
         Self {
@@ -149,8 +142,11 @@ fn hint(code: &str) -> Option<&'static str> {
         "STEP.APP_AMBIGUOUS" => "有多个窗口符合步骤的应用条件。给步骤加上窗口标题。",
         "STEP.CHECK_FAILED" => "等待的元素状态没有出现。延长等待时间，或检查定位条件。",
         "STEP.INVALID" => "步骤本身不完整，按提示修改后再试。",
-        "GUI.RECORDING_UNAVAILABLE" => {
-            "自动录制目前只在 Windows 上可用；其他平台用“添加步骤”逐步搭建。"
+        "RECORDING.UNSUPPORTED" => {
+            "这个窗口不能自动录制（浏览器页面用 aad browser-record），可以用“添加步骤”逐步搭建。"
+        }
+        "DRIVER.UNAVAILABLE" => {
+            "需要的系统组件不可用：Linux 要 KDE/X11 和 XTest helper，macOS 要辅助功能授权。"
         }
         "STORE.NAME_INVALID" => "换一个名字：不要斜杠、冒号等路径字符，也不要以点结尾。",
         "STORE.NOT_FOUND" => "文件已经不在了，刷新列表。",
@@ -219,13 +215,14 @@ impl Desk {
             .map(|resource| {
                 let mut resource = resource.clone();
                 resource["app"] = json!(steps::describe(&resource, &all));
+                resource["recordable"] = json!(recording::supported(&self.session, &resource));
                 resource
             })
             .collect();
         Ok(json!({
             "resources": resources,
             "unavailable": listed["unavailable"],
-            "recording_supported": cfg!(windows),
+            "recording_supported": resources.iter().any(|r| r["recordable"] == true),
             "browser_port": self.browser_port,
         }))
     }
@@ -294,90 +291,38 @@ impl Desk {
         Ok(found)
     }
 
-    fn windows_driver(&self) -> Result<Arc<dyn aad_runtime::Provider>, Value> {
-        self.session
-            .providers()
-            .iter()
-            .find(|p| p.manifest().name == WINDOWS_DRIVER)
-            .cloned()
-            .ok_or_else(|| {
-                payload(
-                    "GUI.RECORDING_UNAVAILABLE",
-                    "这个平台还不能自动录制",
-                    "not_applied",
-                    None,
-                )
-            })
-    }
-
     fn start_capture(&mut self, resource_id: &str) -> Reply {
-        self.stop_capture();
+        let _ = self.stop_capture();
         let resource = self.resource(resource_id)?;
-        let driver = self.windows_driver()?;
-        let window_id = resource["metadata"]["window_id"].clone();
-        if resource["provider"] != WINDOWS_DRIVER || window_id.is_null() {
-            return Err(payload(
-                "GUI.RECORDING_UNAVAILABLE",
-                "只能录制桌面窗口",
-                "not_applied",
-                None,
-            ));
-        }
-        let started = driver
-            .invoke(
-                &format!("{WINDOWS_DRIVER}.watch@1"),
-                json!({"window_id": window_id}),
-                Some(STEP_TIMEOUT),
-            )
+        let app: App = serde_json::from_value(resource["app"].clone()).unwrap_or_default();
+        let started = Recording::start(&self.session, &resource, app, self.recorded + 1)
             .map_err(|e| failure(&e))?;
-        let id = started["capture_id"]
-            .as_str()
-            .ok_or_else(|| invalid("录制没有返回编号"))?
-            .to_string();
-        let app = serde_json::from_value(resource["app"].clone()).unwrap_or_default();
-        self.capture = Some(Capture { id, app });
-        Ok(json!({"recording": true, "sources": started["sources"]}))
+        self.capture = Some(started);
+        Ok(json!({"recording": true}))
     }
 
     /// The steps recorded since the last call, already in the saved format.
     fn collect(&mut self) -> Reply {
-        let Some(capture) = &self.capture else {
+        let Some(capture) = self.capture.as_mut() else {
             return Ok(json!({"steps": [], "skipped": [], "recording": false}));
         };
-        let driver = self.windows_driver()?;
-        let batch = driver
-            .invoke(
-                &format!("{WINDOWS_DRIVER}.collect@1"),
-                json!({"capture_id": capture.id}),
-                Some(STEP_TIMEOUT),
-            )
-            .map_err(|e| failure(&e))?;
-        let app = capture.app.clone();
-        let mut converted = Vec::new();
-        let mut skipped = Vec::new();
-        for raw in batch["steps"].as_array().cloned().unwrap_or_default() {
-            self.recorded += 1;
-            match steps::from_windows_capture(&format!("rec{}", self.recorded), &app, &raw) {
-                Ok(step) => converted.push(json!(step)),
-                Err(reason) => skipped.push(json!({"reason": reason, "summary": raw["summary"]})),
-            }
-        }
-        Ok(json!({
-            "steps": converted,
-            "skipped": skipped,
-            "dropped": batch["dropped"],
-            "recording": true,
-        }))
+        let batch = capture.collect().map_err(|e| failure(&e))?;
+        self.recorded = capture.next_id() - 1;
+        let mut answer = batch.to_json();
+        answer["recording"] = json!(true);
+        Ok(answer)
     }
 
-    fn stop_capture(&mut self) {
-        if let (Some(capture), Ok(driver)) = (self.capture.take(), self.windows_driver()) {
-            let _ = driver.invoke(
-                &format!("{WINDOWS_DRIVER}.release@1"),
-                json!({"capture_id": capture.id}),
-                Some(STEP_TIMEOUT),
-            );
-        }
+    /// Stop recording, with whatever was recorded since the last collection.
+    fn stop_capture(&mut self) -> Reply {
+        let Some(capture) = self.capture.take() else {
+            return Ok(json!({"steps": [], "skipped": [], "recording": false}));
+        };
+        self.recorded = capture.next_id() - 1;
+        let batch = capture.stop().map_err(|e| failure(&e))?;
+        let mut answer = batch.to_json();
+        answer["recording"] = json!(false);
+        Ok(answer)
     }
 
     fn perform(&self, step: &Step, inputs: &Map<String, Value>) -> Reply {
@@ -506,17 +451,13 @@ async fn collect_recording(shell: tauri::State<'_, Shell>) -> Reply {
 
 #[tauri::command]
 async fn stop_recording(shell: tauri::State<'_, Shell>) -> Reply {
-    shell.run(|desk| {
-        let last = desk.collect();
-        desk.stop_capture();
-        last
-    })
+    shell.run(|desk| desk.stop_capture())
 }
 
 #[tauri::command]
 async fn connect_browser(shell: tauri::State<'_, Shell>, port: Option<u16>) -> Reply {
     shell.run(move |desk| {
-        desk.stop_capture();
+        let _ = desk.stop_capture();
         desk.session.close();
         desk.session = open(port);
         desk.browser_port = port;

@@ -11,6 +11,10 @@ server，不再通过 Python/NDJSON worker 注册。Rust provider 使用 `atspi`
 `desktop.input`、`desktop.capture` 权限控制。所有写动作都基于未截断快照中的 target，
 派发前重新抓树并核对原生 identity 与语义 fingerprint；多义、过期或无法验证时失败关闭。
 
+录制用 `watch` / `collect` / `release`：AT-SPI 信号报告文本修改、勾选和焦点，XTest helper 的
+`record-input` 用 XRecord 报告落在目标进程窗口上的点击、滚轮和按键（只读，不注入），合成步骤见
+[统一控制与远程会话](../../docs/control-sessions.md#录制)。
+
 ## 原生 helper
 
 AT-SPI 语义动作在 Rust 进程内直接调用。X11 键鼠输入和截图保留最小 C++ helper，因为它们

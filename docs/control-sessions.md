@@ -151,6 +151,23 @@ CDP 仅接受 loopback 调试地址，显式 `--browser-port` 才启用；不会
 （每个请求自己取锁），把步骤和直接 driver 动作混在一起的工作流会被 MCP 拒绝。
 Windows 的 UIA 录制结果由 `steps::from_windows_capture` 转成这种格式，无法回放的动作返回原因。
 
+## 录制
+
+能录制的 provider 提供 `watch` / `collect` / `release`，`aad_control::recording::Recording` 统一驱动，
+GUI 和 `aad record` 都用它。Windows driver 返回自己的录制步骤；AT-SPI 和 AX 返回同一种原始事件
+（click、wheel、key、text、toggle，元素按各自快照的方式描述），由 `recording::from_events` 转成步骤：
+连续文本合并为一次 fill，500 ms 内同一元素的两次点击是双击，连续滚轮累计格数，
+紧接着引起勾选或文本修改的那次左键点击并入该修改，按键落到最近获得焦点的元素上。
+
+- Linux：AT-SPI 的 `object:text-changed`、`object:state-changed:checked/focused` 信号，加上 XTest helper 的
+  `record-input`（XRecord，只报告落在目标进程窗口上的点击、滚轮和目标进程有焦点时的按键）。
+  点击发生后才按坐标查元素，界面在点击时立即变化（例如对话框关闭）会让该点击无法识别。
+- macOS：Swift helper 的 AXObserver（值变化、焦点）与只监听的 CGEvent tap（需要“输入监控”权限，
+  没有时 `pointer_watch: false`，只记录值变化）。
+
+[待验证] Linux 录制只在 CI 的 Qt fixture 里检查点击和填写；macOS 录制的 Swift 代码未编译。
+停止录制后，Linux 的 AT-SPI 信号线程要等到下一个信号才退出。
+
 ## 验证与剩余范围
 
 `osdk run control-test` 跑纯逻辑、真实子进程 stdio、三平台原生适配 mock 和 MCP 回归。
@@ -171,5 +188,5 @@ CI 和 release 工作流使用官方 one-sdk Action 最新正式版本，不依�
 `aad do click <id> --role AXTextArea --button right` 弹出菜单；`aad do scroll <id> --role AXTextArea --direction down`
 在长文档里滚动；在“访达”列表里 `aad do drag` 把文件拖进文件夹。
 Windows/macOS 的新适配路由在 CI 以 mock 编译/测试；Windows 的输入桌面、macOS TCC 和跨机器 SSH
-未在真实设备验证。Wayland 原生输入、完整 OOPIF、浏览器拖拽与新标签页、Linux/macOS 的自动录制、结果缓存、
+未在真实设备验证。Wayland 原生输入、完整 OOPIF、浏览器拖拽与新标签页、结果缓存、
 自动重放与统一 Android wire adapter 均不在本次范围。录制/回放及事件观察保持已有实现，不提升其可靠性声明。

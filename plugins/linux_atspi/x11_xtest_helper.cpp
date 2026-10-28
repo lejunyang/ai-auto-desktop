@@ -1,7 +1,10 @@
 #include <X11/Xatom.h>
 #include <X11/Xlib.h>
 #include <X11/keysym.h>
+#include <X11/XKBlib.h>
+#include <X11/Xproto.h>
 #include <X11/extensions/XTest.h>
+#include <X11/extensions/record.h>
 
 #include <algorithm>
 #include <cctype>
@@ -14,6 +17,7 @@
 #include <iostream>
 #include <limits>
 #include <optional>
+#include <poll.h>
 #include <string>
 #include <string_view>
 #include <sys/stat.h>
@@ -696,6 +700,142 @@ std::optional<GestureRequest> ParseGesture(std::string_view command, int argc, c
     return request;
 }
 
+// Watching: report the person's clicks, wheel turns and key presses on the
+// expected process, one JSON line each, until stdin closes or the deadline.
+// Read-only: nothing is injected, and input elsewhere is not reported.
+struct RecordState {
+    Display *control = nullptr;
+    unsigned long pid = 0;
+    Atom pid_atom = None;
+};
+RecordState g_record;
+
+std::uint64_t NowMs() {
+    return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                          std::chrono::steady_clock::now().time_since_epoch())
+                                          .count());
+}
+
+bool IsModifierKeysym(KeySym symbol) {
+    return symbol == XK_Shift_L || symbol == XK_Shift_R || symbol == XK_Control_L ||
+           symbol == XK_Control_R || symbol == XK_Alt_L || symbol == XK_Alt_R ||
+           symbol == XK_Super_L || symbol == XK_Super_R || symbol == XK_Meta_L ||
+           symbol == XK_Meta_R || symbol == XK_ISO_Level3_Shift || symbol == XK_Caps_Lock;
+}
+
+void OnRecorded(XPointer, XRecordInterceptData *data) {
+    if (data->category == XRecordFromServer && data->data_len * 4 >= sizeof(xEvent)) {
+        const auto *event = reinterpret_cast<const xEvent *>(data->data);
+        const int type = event->u.u.type & 0x7f;
+        const unsigned detail = event->u.u.detail;
+        const int x = event->u.keyButtonPointer.rootX;
+        const int y = event->u.keyButtonPointer.rootY;
+        const unsigned state = event->u.keyButtonPointer.state;
+        if (type == ButtonPress && detail >= 1 && detail <= 7 &&
+            WindowAtPointBelongsToPid(g_record.control, x, y, g_record.pid, g_record.pid_atom)) {
+            std::cout << "{\"event\":\"button\",\"button\":" << detail << ",\"x\":" << x
+                      << ",\"y\":" << y << ",\"at_ms\":" << NowMs() << "}" << std::endl;
+        } else if (type == KeyPress &&
+                   FocusBelongsToPid(g_record.control, g_record.pid, g_record.pid_atom)) {
+            const KeySym symbol =
+                XkbKeycodeToKeysym(g_record.control, static_cast<KeyCode>(detail), 0, 0);
+            const char *name = symbol == NoSymbol ? nullptr : XKeysymToString(symbol);
+            bool plain = name != nullptr && name[0] != '\0' && std::strlen(name) <= 32;
+            for (const char *c = name; plain && *c; ++c) {
+                plain = std::isalnum(static_cast<unsigned char>(*c)) || *c == '_';
+            }
+            if (plain && !IsModifierKeysym(symbol)) {
+                std::cout << "{\"event\":\"key\",\"key\":\"" << name
+                          << "\",\"ctrl\":" << ((state & ControlMask) ? "true" : "false")
+                          << ",\"shift\":" << ((state & ShiftMask) ? "true" : "false")
+                          << ",\"alt\":" << ((state & Mod1Mask) ? "true" : "false")
+                          << ",\"super\":" << ((state & Mod4Mask) ? "true" : "false")
+                          << ",\"at_ms\":" << NowMs() << "}" << std::endl;
+            }
+        }
+    }
+    XRecordFreeData(data);
+}
+
+int RunRecordInput(int argc, char **argv) {
+    const auto pairs = ParsePairs(argc, argv, {"expected-pid", "deadline-monotonic-ns"});
+    if (!pairs.has_value()) {
+        EmitError("invalid_arguments", "arguments", false);
+        return kExitInvalid;
+    }
+    const auto pid = ParseUnsigned(Pair(*pairs, "expected-pid").value_or(""));
+    const auto deadline = ParseUnsigned(Pair(*pairs, "deadline-monotonic-ns").value_or(""));
+    if (!pid.has_value() || pid.value() == 0 ||
+        pid.value() > static_cast<std::uint64_t>(INT_MAX) || !deadline.has_value()) {
+        EmitError("invalid_arguments", "arguments", false);
+        return kExitInvalid;
+    }
+    if (!SessionIsQualified()) {
+        EmitError("unsupported_session", "session_preflight", false);
+        return kExitUnavailable;
+    }
+    if (!PidBelongsToCurrentUser(static_cast<unsigned long>(pid.value()))) {
+        EmitError("untrusted_process", "target_preflight", false);
+        return kExitTargetMismatch;
+    }
+    XSetErrorHandler(HandleXError);
+    Display *control = XOpenDisplay(nullptr);
+    Display *data = XOpenDisplay(nullptr);
+    if (control == nullptr || data == nullptr) {
+        if (control != nullptr) XCloseDisplay(control);
+        if (data != nullptr) XCloseDisplay(data);
+        EmitError("display_unavailable", "x11_preflight", false);
+        return kExitUnavailable;
+    }
+    int major = 0;
+    int minor = 0;
+    const Atom pid_atom = XInternAtom(control, "_NET_WM_PID", True);
+    if (!XRecordQueryVersion(control, &major, &minor) || pid_atom == None) {
+        XCloseDisplay(control);
+        XCloseDisplay(data);
+        EmitError("xrecord_unavailable", "x11_preflight", false);
+        return kExitUnavailable;
+    }
+    g_record = {control, static_cast<unsigned long>(pid.value()), pid_atom};
+    XRecordRange *range = XRecordAllocRange();
+    if (range == nullptr) {
+        XCloseDisplay(control);
+        XCloseDisplay(data);
+        EmitError("xrecord_unavailable", "x11_preflight", false);
+        return kExitUnavailable;
+    }
+    range->device_events.first = KeyPress;
+    range->device_events.last = ButtonPress;
+    XRecordClientSpec clients = XRecordAllClients;
+    const XRecordContext context = XRecordCreateContext(control, 0, &clients, 1, &range, 1);
+    XSync(control, False);
+    if (context == 0 || !XRecordEnableContextAsync(data, context, OnRecorded, nullptr)) {
+        XFree(range);
+        XCloseDisplay(control);
+        XCloseDisplay(data);
+        EmitError("xrecord_unavailable", "x11_preflight", false);
+        return kExitUnavailable;
+    }
+    std::cout << "{\"event\":\"ready\"}" << std::endl;
+    while (!DeadlineExpired(deadline.value())) {
+        pollfd fds[2] = {{ConnectionNumber(data), POLLIN, 0}, {0, POLLIN, 0}};
+        poll(fds, 2, 100);
+        if (fds[1].revents & (POLLIN | POLLHUP | POLLERR)) {
+            char ignored = 0;
+            if (read(0, &ignored, 1) <= 0) break;
+        }
+        XRecordProcessReplies(data);
+    }
+    XRecordDisableContext(control, context);
+    XRecordFreeContext(control, context);
+    XSync(control, False);
+    XFree(range);
+    XCloseDisplay(data);
+    XCloseDisplay(control);
+    std::cout << "{\"event\":\"stopped\"}" << std::endl;
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char **argv) {
@@ -704,6 +844,9 @@ int main(int argc, char **argv) {
         return kExitInvalid;
     }
     const std::string_view command(argv[1]);
+    if (command == "record-input") {
+        return RunRecordInput(argc, argv);
+    }
     std::optional<std::uint64_t> expected_pid;
     std::optional<std::uint64_t> deadline_ns;
     std::optional<int> click_x;

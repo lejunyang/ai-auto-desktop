@@ -271,13 +271,11 @@ function startOver(): void {
   name.value = "新录制";
 }
 
-const canRecord = computed(
-  () => !!targets.value?.recording_supported && resource.value?.provider === "desktop.windows_uia",
-);
+const canRecord = computed(() => !!resource.value?.recordable);
 const recordTitle = computed(() =>
-  !targets.value?.recording_supported
-    ? "这个平台还不能自动录制，请用“添加步骤”"
-    : canRecord.value ? "开始录制你在这个窗口里的操作" : "先在左侧选一个桌面窗口",
+  canRecord.value
+    ? "开始录制你在这个窗口里的操作"
+    : resource.value ? "这个窗口不能自动录制，请用“添加步骤”" : "先在左侧选一个桌面窗口",
 );
 
 onMounted(refresh);

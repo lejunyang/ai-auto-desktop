@@ -171,8 +171,242 @@ private final class TokenStore {
     }
 }
 
+// MARK: Watching a person work
+
+/// Records what a person does in one application as raw events in the shape
+/// `aad_control::recording` turns into steps. Read-only: the event tap only
+/// listens, and nothing is posted.
+private final class Recorder {
+    let pid: pid_t
+    let describe: (AXUIElement) -> [String: Any]
+    private let lock = NSLock()
+    private var events: [[String: Any]] = []
+    private var dropped = 0
+    private var focused: [String: Any]?
+    private var observer: AXObserver?
+    private(set) var tap: CFMachPort?
+    private var runLoop: CFRunLoop?
+
+    init(pid: pid_t, describe: @escaping (AXUIElement) -> [String: Any]) {
+        self.pid = pid
+        self.describe = describe
+    }
+
+    private func now() -> UInt64 { UInt64(ProcessInfo.processInfo.systemUptime * 1000) }
+
+    private func push(_ event: [String: Any]) {
+        lock.lock()
+        defer { lock.unlock() }
+        if events.count >= 2_000 {
+            events.removeFirst()
+            dropped += 1
+        }
+        events.append(event)
+    }
+
+    func drain() -> [String: Any] {
+        lock.lock()
+        defer { lock.unlock() }
+        let taken = events
+        let lost = dropped
+        events = []
+        dropped = 0
+        return ["events": taken, "dropped": lost]
+    }
+
+    /// Install the observer and the tap on a thread of their own and run it.
+    func start() throws {
+        var created: AXObserver?
+        let error = AXObserverCreate(pid, recorderAXCallback, &created)
+        guard error == .success, let created else {
+            throw HelperFailure("DRIVER.ACTION_FAILED", "cannot observe the application",
+                                data: ["ax_error": Int(error.rawValue)])
+        }
+        observer = created
+        let application = AXUIElementCreateApplication(pid)
+        let context = Unmanaged.passUnretained(self).toOpaque()
+        for notification in [kAXValueChangedNotification, kAXFocusedUIElementChangedNotification] {
+            AXObserverAddNotification(created, application, notification as CFString, context)
+        }
+        let mask = (1 << CGEventType.leftMouseDown.rawValue)
+            | (1 << CGEventType.rightMouseDown.rawValue)
+            | (1 << CGEventType.otherMouseDown.rawValue)
+            | (1 << CGEventType.scrollWheel.rawValue)
+            | (1 << CGEventType.keyDown.rawValue)
+        // Without Input Monitoring permission there is no tap; value changes
+        // are still recorded, and the caller is told pointer input is not.
+        tap = CGEvent.tapCreate(
+            tap: .cgSessionEventTap, place: .headInsertEventTap, options: .listenOnly,
+            eventsOfInterest: CGEventMask(mask), callback: recorderTapCallback, userInfo: context
+        )
+        let ready = DispatchSemaphore(value: 0)
+        let thread = Thread { [self] in
+            let loop = CFRunLoopGetCurrent()
+            runLoop = loop
+            CFRunLoopAddSource(loop, AXObserverGetRunLoopSource(created), .defaultMode)
+            if let tap {
+                let source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
+                CFRunLoopAddSource(loop, source, .defaultMode)
+                CGEvent.tapEnable(tap: tap, enable: true)
+            }
+            ready.signal()
+            CFRunLoopRun()
+        }
+        thread.name = "aad-recorder"
+        thread.start()
+        ready.wait()
+    }
+
+    func stop() {
+        if let tap { CGEvent.tapEnable(tap: tap, enable: false) }
+        if let runLoop { CFRunLoopStop(runLoop) }
+        tap = nil
+        observer = nil
+    }
+
+    func notified(element: AXUIElement, notification: String) {
+        let node = describe(element)
+        if notification == kAXFocusedUIElementChangedNotification as String {
+            lock.lock()
+            focused = node
+            lock.unlock()
+            return
+        }
+        let role = node["role"] as? String ?? ""
+        if role == "AXCheckBox" || role == "AXRadioButton" || role == "AXSwitch" {
+            let value = (copyValue(element) as? NSNumber)?.intValue
+            push(["kind": "toggle", "checked": value == 1, "at_ms": now(), "node": node])
+        } else if ["AXTextField", "AXTextArea", "AXComboBox", "AXSearchField", "AXSecureTextField"].contains(role) {
+            push(["kind": "text", "at_ms": now(), "node": node])
+        }
+    }
+
+    private func copyValue(_ element: AXUIElement) -> CFTypeRef? {
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, kAXValueAttribute as CFString, &value) == .success
+        else { return nil }
+        return value
+    }
+
+    /// The element under a point, if it belongs to the watched application.
+    private func element(at point: CGPoint) -> AXUIElement? {
+        var hit: AXUIElement?
+        let error = AXUIElementCopyElementAtPosition(
+            AXUIElementCreateSystemWide(), Float(point.x), Float(point.y), &hit
+        )
+        guard error == .success, let hit else { return nil }
+        var owner = pid_t(0)
+        guard AXUIElementGetPid(hit, &owner) == .success, owner == pid else { return nil }
+        return hit
+    }
+
+    /// Names the control protocol uses for keys whose code is not a character.
+    private static let namedKeys: [Int64: String] = [
+        36: "enter", 48: "tab", 49: "space", 51: "backspace", 53: "escape", 117: "delete",
+        115: "home", 119: "end", 116: "pageup", 121: "pagedown", 123: "left", 124: "right",
+        125: "down", 126: "up", 122: "f1", 120: "f2", 99: "f3", 118: "f4", 96: "f5", 97: "f6",
+        98: "f7", 100: "f8", 101: "f9", 109: "f10", 103: "f11", 111: "f12",
+    ]
+    private static let characterKeys: [Int64: String] = [
+        0: "a", 1: "s", 2: "d", 3: "f", 4: "h", 5: "g", 6: "z", 7: "x", 8: "c", 9: "v",
+        11: "b", 12: "q", 13: "w", 14: "e", 15: "r", 16: "y", 17: "t", 18: "1", 19: "2",
+        20: "3", 21: "4", 22: "6", 23: "5", 25: "9", 26: "7", 28: "8", 29: "0", 31: "o",
+        32: "u", 34: "i", 35: "p", 37: "l", 38: "j", 40: "k", 45: "n", 46: "m",
+    ]
+
+    func tapped(type: CGEventType, event: CGEvent) {
+        if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
+            if let tap { CGEvent.tapEnable(tap: tap, enable: true) }
+            return
+        }
+        switch type {
+        case .leftMouseDown, .rightMouseDown, .otherMouseDown:
+            guard let element = element(at: event.location) else { return }
+            let button = type == .leftMouseDown ? "left" : type == .rightMouseDown ? "right" : "middle"
+            push(["kind": "click", "button": button, "at_ms": now(), "node": describe(element)])
+        case .scrollWheel:
+            guard let element = element(at: event.location) else { return }
+            let vertical = event.getIntegerValueField(.scrollWheelEventDeltaAxis1)
+            let horizontal = event.getIntegerValueField(.scrollWheelEventDeltaAxis2)
+            let direction = vertical > 0 ? "up" : vertical < 0 ? "down"
+                : horizontal > 0 ? "left" : horizontal < 0 ? "right" : ""
+            guard !direction.isEmpty else { return }
+            push(["kind": "wheel", "direction": direction, "at_ms": now(), "node": describe(element)])
+        case .keyDown:
+            guard NSWorkspace.shared.frontmostApplication?.processIdentifier == pid else { return }
+            let code = event.getIntegerValueField(.keyboardEventKeycode)
+            let flags = event.flags
+            let named = Self.namedKeys[code]
+            guard let key = named ?? Self.characterKeys[code] else { return }
+            let held = flags.contains(.maskCommand) || flags.contains(.maskControl)
+                || flags.contains(.maskAlternate)
+            // Plain typing is recorded as the text it made.
+            guard held || ["enter", "tab", "escape"].contains(key) || key.hasPrefix("f") && key.count > 1
+            else { return }
+            var keys: [String] = []
+            if flags.contains(.maskCommand) { keys.append("cmd") }
+            if flags.contains(.maskControl) { keys.append("ctrl") }
+            if flags.contains(.maskShift) { keys.append("shift") }
+            if flags.contains(.maskAlternate) { keys.append("alt") }
+            keys.append(key)
+            lock.lock()
+            let node = focused
+            lock.unlock()
+            push(["kind": "key", "keys": keys, "at_ms": now(), "node": node ?? NSNull()])
+        default:
+            return
+        }
+    }
+}
+
+private func recorderAXCallback(
+    _ observer: AXObserver, _ element: AXUIElement, _ notification: CFString,
+    _ refcon: UnsafeMutableRawPointer?
+) {
+    guard let refcon else { return }
+    Unmanaged<Recorder>.fromOpaque(refcon).takeUnretainedValue()
+        .notified(element: element, notification: notification as String)
+}
+
+private func recorderTapCallback(
+    _ proxy: CGEventTapProxy, _ type: CGEventType, _ event: CGEvent,
+    _ refcon: UnsafeMutableRawPointer?
+) -> Unmanaged<CGEvent>? {
+    if let refcon {
+        Unmanaged<Recorder>.fromOpaque(refcon).takeUnretainedValue().tapped(type: type, event: event)
+    }
+    return Unmanaged.passUnretained(event)
+}
+
 private final class AXService {
     private let tokens = TokenStore()
+    private var recorders: [String: Recorder] = [:]
+
+    /// An element as recorded events describe it, matching how a snapshot
+    /// names it: the raw AX role, and the title or else the description.
+    private func recordedNode(_ element: AXUIElement) -> [String: Any] {
+        let role = stringAttribute(element, kAXRoleAttribute as CFString) ?? ""
+        let subrole = stringAttribute(element, kAXSubroleAttribute as CFString)
+        let protected = role == "AXSecureTextField" || subrole == "AXSecureTextField"
+        let name = stringAttribute(element, kAXTitleAttribute as CFString)
+            ?? stringAttribute(element, kAXDescriptionAttribute as CFString)
+        var node: [String: Any] = [
+            "role": bounded(role), "name": name.map(bounded) ?? "", "protected": protected,
+        ]
+        if !protected, let value = scalarStringAttribute(element, kAXValueAttribute as CFString) {
+            node["value"] = value
+        }
+        return node
+    }
+
+    private func recording(_ arguments: Arguments) throws -> (String, Recorder) {
+        try arguments.only(["recording_id"])
+        let id = try arguments.string("recording_id")!
+        guard let recorder = recorders[id] else {
+            throw HelperFailure("DRIVER.NOT_FOUND", "no such recording")
+        }
+        return (id, recorder)
+    }
 
     func execute(
         operation: String, args: [String: Any], deadlineMS: Double?,
@@ -219,6 +453,23 @@ private final class AXService {
                 args: Arguments(values: args), deadlineMS: deadlineMS,
                 requestID: requestID, progress: progress
             )
+        case "record_start":
+            let arguments = Arguments(values: args)
+            try arguments.only(["process_id"])
+            try requireTrusted()
+            let pid = pid_t(try arguments.integer("process_id", minimum: 1, maximum: Int(Int32.max)))
+            let recorder = Recorder(pid: pid) { [unowned self] element in self.recordedNode(element) }
+            try recorder.start()
+            let id = UUID().uuidString
+            recorders[id] = recorder
+            return ["recording_id": id, "pointer_watch": recorder.tap != nil]
+        case "record_collect":
+            return try recording(Arguments(values: args)).1.drain()
+        case "record_stop":
+            let (id, recorder) = try recording(Arguments(values: args))
+            recorder.stop()
+            recorders.removeValue(forKey: id)
+            return ["stopped": true]
         case "set_value":
             return try setValue(args: Arguments(values: args), deadlineMS: deadlineMS)
         case "type_text":

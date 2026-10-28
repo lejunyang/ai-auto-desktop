@@ -71,6 +71,8 @@ export interface Resource {
   metadata: Record<string, unknown>;
   /** The name a saved step would give this window. */
   app: App;
+  /** Whether what a person does here can be recorded. */
+  recordable?: boolean;
 }
 
 export interface Targets {

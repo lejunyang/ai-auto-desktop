@@ -8,7 +8,7 @@ const windows: Resource[] = [
   {
     resource_id: "demo:notes", provider: "desktop.windows_uia", kind: "desktop",
     name: "便签 - 记事本", capabilities: [], metadata: { process_name: "notepad.exe", window_id: "hwnd:1" },
-    app: { provider: "desktop.windows_uia", process: "notepad.exe" },
+    app: { provider: "desktop.windows_uia", process: "notepad.exe" }, recordable: true,
   },
   {
     resource_id: "demo:settings", provider: "desktop.windows_uia", kind: "desktop",

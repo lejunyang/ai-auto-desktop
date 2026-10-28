@@ -703,6 +703,122 @@ pub fn act(command: &DoCommand) -> (Value, u8) {
     finish(outcome)
 }
 
+#[derive(Args)]
+pub struct RecordArgs {
+    /// The window or application to watch, as for `aad describe`.
+    resource: String,
+    /// How long to record for, in seconds (1..600).
+    ///
+    /// Recording runs for a fixed time because a command-line session has no
+    /// way to be told "stop now": the process stays alive to hold the watch,
+    /// then reports.
+    #[arg(long, default_value_t = 15)]
+    seconds: u64,
+    /// Save the steps as a named recording and workflow, ready for `aad run`.
+    ///
+    /// The steps name the application by process or title and each element by
+    /// locator, never by an id that only exists in this session, so the saved
+    /// workflow replays later, on this or another machine of the same kind.
+    #[arg(long, value_name = "NAME")]
+    save: Option<String>,
+    /// Replace an existing recording of that name.
+    #[arg(long)]
+    overwrite: bool,
+}
+
+fn automation(error: aad_core::AutomationError) -> (Value, u8) {
+    let mut error = error.to_json();
+    if let Some(hint) = error["code"].as_str().and_then(hint) {
+        error["hint"] = json!(hint);
+    }
+    (json!({"status": "error", "error": error}), EXIT_FAILED)
+}
+
+/// Watch a window for a while and report, or save, what was done in it.
+pub fn record(args: &RecordArgs) -> (Value, u8) {
+    use aad_control::{recording::Recording, steps};
+    use aad_runtime::recordings;
+    let desk = Desk::open(false);
+    let outcome = (|| {
+        if let Some(name) = &args.save {
+            let existing = recordings::workflow_path(name).map_err(|e| usage(e.message))?;
+            if existing.exists() && !args.overwrite {
+                return Err(usage(format!(
+                    "a recording called {name:?} exists; pass --overwrite to replace it"
+                )));
+            }
+        }
+        let resource_id = desk.resolve(&args.resource)?;
+        let listed = desk.targets()?;
+        let all = listed["resources"].as_array().cloned().unwrap_or_default();
+        let resource = all
+            .iter()
+            .find(|r| r["resource_id"] == resource_id.as_str())
+            .cloned()
+            .ok_or_else(|| usage("the window closed"))?;
+        let app = steps::describe(&resource, &all);
+        let seconds = args.seconds.clamp(1, 600);
+        let mut recording =
+            Recording::start(&desk.session, &resource, app.clone(), 1).map_err(automation)?;
+        eprintln!(
+            "recording {} for {seconds}s…",
+            resource["name"].as_str().unwrap_or("the window")
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(seconds);
+        let (mut recorded, mut skipped, mut dropped) = (Vec::new(), Vec::new(), 0);
+        // Collected as it goes: the providers buffer a bounded number of events.
+        while std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            let batch = recording.collect().map_err(automation)?;
+            recorded.extend(batch.steps);
+            skipped.extend(batch.skipped);
+            dropped += batch.dropped;
+        }
+        let batch = recording.stop().map_err(automation)?;
+        recorded.extend(batch.steps);
+        skipped.extend(batch.skipped);
+        dropped += batch.dropped;
+        let mut answer = json!({
+            "app": app,
+            "seconds": seconds,
+            "count": recorded.len(),
+            "steps": recorded,
+            "skipped": skipped,
+            "dropped": dropped,
+        });
+        if let Some(name) = &args.save {
+            answer["saved"] = if recorded.is_empty() {
+                json!({"failed": "nothing replayable was recorded"})
+            } else {
+                match steps::workflow(name, &recorded) {
+                    Err(error) => json!({"failed": error.message}),
+                    Ok(workflow) => {
+                        let written =
+                            recordings::save_recording(name, &steps::recording(name, &recorded))
+                                .and_then(|recording| {
+                                    recordings::save_workflow(name, &workflow)
+                                        .map(|w| (recording, w))
+                                });
+                        match written {
+                            Ok((recording, workflow)) => json!({
+                                "recording_path": recording.display().to_string(),
+                                "workflow_path": workflow.display().to_string(),
+                                "run": format!(
+                                    "aad run {} --permission desktop.input --permission desktop.observe",
+                                    workflow.display()
+                                ),
+                            }),
+                            Err(error) => json!({"failed": error.message}),
+                        }
+                    }
+                }
+            };
+        }
+        Ok(answer)
+    })();
+    finish(outcome)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

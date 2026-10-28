@@ -59,6 +59,15 @@ if [ "${1:-}" = --inside-session ]; then
   "$aad" --compact do key "$resource" --role text --name "Qt fixture text entry" --keys ctrl,a >/dev/null
   "$aad" --compact do type-text "$resource" --role text --name "Qt fixture text entry" --text "chord" >/dev/null
   "$aad" --compact find "$resource" --role text --name "Qt fixture text entry"     | jq -e '.node.value == "chord"' >/dev/null
+  # Recording: XRecord sees the XTest click, AT-SPI reports the text change.
+  recorded=${TMPDIR:-/tmp}/aad-rust-atspi-recording.json
+  "$aad" --compact record "$resource" --seconds 6 >"$recorded" &
+  recorder=$!
+  sleep 2
+  "$aad" --compact do click "$resource" --role push_button --name "Invoke Qt fixture button" >/dev/null
+  "$aad" --compact do fill "$resource" --role text --name "Qt fixture text entry" --value "recorded" >/dev/null
+  wait "$recorder"
+  jq -e '[.steps[].action.type] | (index("click") != null) and (index("fill") != null)' "$recorded" >/dev/null
   refused=$("$aad" --compact find "$resource" --role push_button --nth 1 || true)
   printf '%s' "$refused" | jq -e '.error.code == "CONTROL.LOCATOR_UNSUPPORTED"' >/dev/null
   printf '%s\n' 'Rust Linux AT-SPI fixture passed'

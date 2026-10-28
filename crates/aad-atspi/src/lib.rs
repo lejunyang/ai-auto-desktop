@@ -204,6 +204,30 @@ pub trait AtspiBackend: Send + Sync {
             "native key_chord helper is unavailable",
         ))
     }
+    /// Start watching what a person does in an application.
+    fn start_recording(
+        &self,
+        _application: &Map<String, Value>,
+        _deadline: Instant,
+    ) -> Result<String, AutomationError> {
+        Err(driver_error(
+            "DRIVER.ACTION_UNSUPPORTED",
+            "this backend cannot record",
+        ))
+    }
+    /// The raw events seen since the last call: `{events, dropped}`.
+    fn collect_recording(&self, _id: &str) -> Result<Value, AutomationError> {
+        Err(driver_error(
+            "DRIVER.ACTION_UNSUPPORTED",
+            "this backend cannot record",
+        ))
+    }
+    fn stop_recording(&self, _id: &str) -> Result<(), AutomationError> {
+        Err(driver_error(
+            "DRIVER.ACTION_UNSUPPORTED",
+            "this backend cannot record",
+        ))
+    }
     fn accessible_at_point(
         &self,
         _root: &NativeRef,
@@ -312,6 +336,28 @@ impl AtspiProvider {
             "snapshot" => self.snapshot(args, deadline),
             "find" => self.find(args, deadline),
             "capture_target" => self.capture_target(args, deadline, artifacts),
+            "watch" => {
+                only_keys(args, &["application"])?;
+                let application = args
+                    .get("application")
+                    .and_then(Value::as_object)
+                    .ok_or_else(|| invalid("watch.application must be an object"))?;
+                let id = self.backend.start_recording(application, deadline)?;
+                Ok(json!({"capture_id": id}))
+            }
+            "collect" | "release" => {
+                only_keys(args, &["capture_id"])?;
+                let id = args
+                    .get("capture_id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| invalid("capture_id is required"))?;
+                if short == "collect" {
+                    self.backend.collect_recording(id)
+                } else {
+                    self.backend.stop_recording(id)?;
+                    Ok(json!({"released": true}))
+                }
+            }
             action if WRITE_ACTIONS.contains(&action) => self.write(action, args, deadline),
             _ => Err(invalid("unknown AT-SPI action")),
         }
@@ -1837,6 +1883,36 @@ fn manifest_document() -> Value {
     actions.insert("pointer_gesture".into(), contract("重新验证目标后，仅在明确的 KDE/X11 会话中，通过固定路径 XTest helper 在目标 bounds 内的比例位置执行右键/中键/双击、滚轮或悬停。", "non_idempotent", "modify", "high", &["desktop.observe", "desktop.input"], point_input(json!({"button": button, "count": {"enum": [1, 2]}, "fraction": fraction, "scroll": {"type": "object", "required": ["direction"], "properties": {"direction": {"enum": ["up", "down", "left", "right"]}, "notches": {"type": "integer", "minimum": 1, "maximum": 30}}, "additionalProperties": false}, "hover_ms": {"type": "integer", "minimum": 1, "maximum": 5000}}), &[]), write_output(), true, true));
     actions.insert("drag".into(), contract("分别重新验证起点与终点后，通过固定路径 XTest helper 按下、分步移动并在终点释放。", "non_idempotent", "modify", "high", &["desktop.observe", "desktop.input"], point_input(json!({"to": target_schema(), "to_locator": locator_schema(), "button": button, "fraction": fraction, "to_fraction": fraction}), &["to", "to_locator"]), write_output(), true, true));
     actions.insert("key_chord".into(), contract("重新验证并聚焦目标后，通过固定路径 XTest helper 按下修饰键加一个主键的组合。", "non_idempotent", "input", "high", &["desktop.observe", "desktop.input"], point_input(json!({"keys": {"type": "array", "minItems": 1, "maxItems": 6, "items": {"type": "string", "minLength": 1, "maxLength": 32}}}), &["keys"]), write_output(), true, true));
+    let capture_id = json!({"type": "object", "required": ["capture_id"], "properties": {"capture_id": {"type": "string", "minLength": 1, "maxLength": 64}}, "additionalProperties": false});
+    actions.insert("watch".into(), contract("开始记录本人在一个应用里的点击、滚轮、组合键、文本修改和勾选（AT-SPI 事件 + XRecord），只读，不注入输入。", "idempotent", "observe", "medium", &["desktop.observe"], json!({"type": "object", "required": ["application"], "properties": {"application": {"type": "object"}}, "additionalProperties": false}), json!({"type": "object"}), false, false));
+    actions.insert(
+        "collect".into(),
+        contract(
+            "取走上次以来记录到的原始交互事件。",
+            "read_only",
+            "observe",
+            "low",
+            &["desktop.observe"],
+            capture_id.clone(),
+            json!({"type": "object"}),
+            false,
+            false,
+        ),
+    );
+    actions.insert(
+        "release".into(),
+        contract(
+            "停止记录并结束输入监听 helper。",
+            "idempotent",
+            "observe",
+            "low",
+            &["desktop.observe"],
+            capture_id,
+            json!({"type": "object"}),
+            false,
+            false,
+        ),
+    );
     let capture_provenance = json!({"type": "object", "required": ["capture_method", "snapshot_id", "revision", "node_id", "application_process_id", "format", "mime_type", "target_process_id", "target_window", "target_top_level_window", "root_window", "bounds", "root_size", "cursor_included", "occlusion_checked", "same_euid_verified", "scene_stable"], "properties": {
         "capture_method": {"const": "x11_root_xgetimage"}, "snapshot_id": {"type": "string", "minLength": 1}, "revision": {"type": "integer", "minimum": 1}, "node_id": {"type": "string", "minLength": 1}, "application_process_id": {"type": "integer", "minimum": 1},
         "format": {"const": "png"}, "mime_type": {"const": "image/png"}, "target_process_id": {"type": "integer", "minimum": 1}, "target_window": {"type": "integer", "minimum": 1}, "target_top_level_window": {"type": "integer", "minimum": 1}, "root_window": {"type": "integer", "minimum": 1},
@@ -2025,6 +2101,23 @@ mod tests {
         ) -> Result<Value, AutomationError> {
             self.writes.fetch_add(1, Ordering::SeqCst);
             Ok(json!({"keys": keys}))
+        }
+        fn start_recording(
+            &self,
+            application: &Map<String, Value>,
+            _deadline: Instant,
+        ) -> Result<String, AutomationError> {
+            assert_eq!(application.get("bus_name"), Some(&json!(":1.42")));
+            Ok("watch-1".into())
+        }
+        fn collect_recording(&self, id: &str) -> Result<Value, AutomationError> {
+            assert_eq!(id, "watch-1");
+            Ok(
+                json!({"events": [{"kind": "click", "button": "left", "node": {"role": "push_button", "name": "Save"}}], "dropped": 0}),
+            )
+        }
+        fn stop_recording(&self, _id: &str) -> Result<(), AutomationError> {
+            Ok(())
         }
         fn accessible_at_point(
             &self,
@@ -2231,6 +2324,28 @@ mod tests {
             4,
             "nothing refused reached input"
         );
+    }
+
+    #[test]
+    fn watching_is_routed_to_the_backend_and_validated() {
+        let provider = AtspiProvider::new(Arc::new(FakeBackend::default())).unwrap();
+        let call = |action: &str, args: Value| {
+            provider.invoke(
+                &format!("desktop.linux_atspi.{action}@1"),
+                args,
+                Some(Duration::from_secs(2)),
+            )
+        };
+        let started = call("watch", json!({"application": {"bus_name": ":1.42"}})).unwrap();
+        assert_eq!(started["capture_id"], "watch-1");
+        let collected = call("collect", json!({"capture_id": "watch-1"})).unwrap();
+        assert_eq!(collected["events"][0]["kind"], "click");
+        assert_eq!(
+            call("release", json!({"capture_id": "watch-1"})).unwrap()["released"],
+            true
+        );
+        assert!(call("watch", json!({"application": "x"})).is_err());
+        assert!(call("collect", json!({"capture_id": "watch-1", "extra": 1})).is_err());
     }
 
     #[test]

@@ -464,6 +464,38 @@ impl AxBackend for SwiftHelperBackend {
             deadline,
         )
     }
+    fn start_recording(
+        &self,
+        process_id: u32,
+        deadline: Instant,
+    ) -> Result<Value, AutomationError> {
+        let started = self.rpc(
+            "record_start",
+            json!({"process_id": process_id}),
+            deadline,
+            false,
+        )?;
+        if !started["recording_id"].is_string() {
+            return Err(protocol_error("record_start returned no recording id"));
+        }
+        Ok(started)
+    }
+    fn collect_recording(&self, id: &str, deadline: Instant) -> Result<Value, AutomationError> {
+        let batch = self.rpc(
+            "record_collect",
+            json!({"recording_id": id}),
+            deadline,
+            false,
+        )?;
+        if !batch["events"].is_array() {
+            return Err(protocol_error("record_collect returned no events"));
+        }
+        Ok(batch)
+    }
+    fn stop_recording(&self, id: &str, deadline: Instant) -> Result<(), AutomationError> {
+        self.rpc("record_stop", json!({"recording_id": id}), deadline, false)?;
+        Ok(())
+    }
     fn pointer_gesture(
         &self,
         token: &str,

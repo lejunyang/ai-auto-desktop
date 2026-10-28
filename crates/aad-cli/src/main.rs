@@ -67,8 +67,8 @@ enum Command {
     Validate(FileArgs),
     /// Run a workflow descriptor.
     Run(RunArgs),
-    /// Record what someone does in a window, as replayable steps.
-    Record(RecordArgs),
+    /// Record what someone does in a window, as steps that replay on any platform.
+    Record(desk::RecordArgs),
     /// Continuously observe foreground app switches and in-app changes.
     ///
     /// Streams one JSON object per line (JSONL). Unlike `record`, it is not
@@ -208,34 +208,6 @@ struct EventsArgs {
     /// Maximum events to report.
     #[arg(long, default_value_t = 1000)]
     limit: i64,
-}
-
-#[derive(Args)]
-struct RecordArgs {
-    /// The window to watch, from `aad apps`.
-    window_id: String,
-    /// How long to record for, in seconds.
-    ///
-    /// Recording runs for a fixed time because a command-line session has no
-    /// way to be told "stop now": the process has to stay alive to hold the
-    /// subscription, so it waits, then reports.
-    #[arg(long, default_value_t = 15)]
-    seconds: u64,
-    /// Save the recording as a named workflow, ready for `aad run`.
-    ///
-    /// Without this the command prints the steps and leaves assembling a
-    /// workflow to whoever reads them, which is error-prone: one recorded action
-    /// becomes three executed steps, the element has to be found during the run
-    /// rather than reused from the recording, and the window has to be named by
-    /// process rather than by the id that only exists in this session.
-    #[arg(long, value_name = "NAME")]
-    save: Option<String>,
-    /// Replace an existing workflow of that name.
-    #[arg(long)]
-    overwrite: bool,
-    /// Print compact JSON instead of indented JSON.
-    #[arg(long)]
-    compact: bool,
 }
 
 #[derive(Args)]
@@ -422,108 +394,7 @@ fn dispatch(command: &Command) -> (Value, u8) {
         Command::Snapshot(args) => desk::snapshot(args),
         Command::Find(args) => desk::find(args),
         Command::Do(command) => desk::act(command),
-        Command::Record(args) => {
-            let window_id = args.window_id.clone();
-            let seconds = args.seconds.clamp(1, 600);
-            let save_as = args.save.clone();
-            let overwrite = args.overwrite;
-            with_driver(move |driver| {
-                let started = driver
-                    .call("watch", &json!({"window_id": window_id}))
-                    .map_err(|error| driver_failure(&error))?;
-                let capture_id = started["capture_id"]
-                    .as_str()
-                    .expect("watch returns a capture id")
-                    .to_string();
-
-                // Poll rather than sleeping the whole time: the buffer is
-                // bounded, so a long recording of a busy window would otherwise
-                // overflow and lose the earliest steps.
-                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(seconds);
-                let mut steps: Vec<Value> = Vec::new();
-                let mut dropped = 0u64;
-                let mut sources = started["sources"].clone();
-                // Titles are collected as the recording runs, not read once at
-                // the end. Which part of a title is stable can only be told by
-                // seeing it change, and a title read at one instant binds the
-                // workflow to that instant: measured on the fixture, the full
-                // title fails with DRIVER.WINDOW_NOT_FOUND on replay.
-                let mut titles: Vec<String> = Vec::new();
-                while std::time::Instant::now() < deadline {
-                    std::thread::sleep(std::time::Duration::from_millis(200));
-                    let batch = driver
-                        .call("collect", &json!({"capture_id": capture_id}))
-                        .map_err(|error| driver_failure(&error))?;
-                    if let Some(found) = batch["steps"].as_array() {
-                        steps.extend(found.iter().cloned());
-                    }
-                    dropped += batch["dropped"].as_u64().unwrap_or(0);
-
-                    if let Ok(listing) = driver.call("list_windows", &json!({})) {
-                        if let Some(windows) = listing["windows"].as_array() {
-                            if let Some(seen) = windows
-                                .iter()
-                                .find(|candidate| candidate["window_id"] == started["window_id"])
-                                .and_then(|candidate| candidate["title"].as_str())
-                            {
-                                if !seen.is_empty() && !titles.iter().any(|held| held == seen) {
-                                    titles.push(seen.to_string());
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // Release even if the last collect failed: leaving hooks
-                // installed would outlive the command that asked for them.
-                let release = driver.call("release", &json!({"capture_id": capture_id}));
-                if sources.is_null() {
-                    sources = json!([]);
-                }
-                release.map_err(|error| driver_failure(&error))?;
-
-                let replayable = steps
-                    .iter()
-                    .filter(|step| step["replayable"] == json!(true))
-                    .count();
-                let mut answer = json!({
-                    "window_id": started["window_id"],
-                    "sources": sources,
-                    "seconds": seconds,
-                    "steps": steps,
-                    "count": steps.len(),
-                    // Split out because the difference is what a caller acts on:
-                    // steps that cannot replay need a person to look at them.
-                    "replayable": replayable,
-                    "dropped": dropped,
-                });
-
-                if let Some(name) = &save_as {
-                    let saved = keep_recording(
-                        driver,
-                        name,
-                        overwrite,
-                        &steps,
-                        &titles,
-                        started["window_id"].as_str().unwrap_or_default(),
-                    );
-                    match saved {
-                        Ok(report) => {
-                            answer["saved"] = report;
-                        }
-                        Err(problem) => {
-                            // The steps stay in the answer. A recording that
-                            // could not be saved is still worth reading, and
-                            // discarding it because the last stage failed would
-                            // throw away the part that took twelve seconds.
-                            answer["saved"] = json!({"failed": problem});
-                        }
-                    }
-                }
-
-                Ok(answer)
-            })
-        }
+        Command::Record(args) => desk::record(args),
         Command::Watch(args) => run_watch(args),
         Command::BrowserRecord(command) => match browser_record::run(command) {
             Ok(value) => (value, EXIT_OK),
@@ -994,170 +865,11 @@ fn resnapshot_and_diff(
     Ok(())
 }
 
-/// Run a closure against the native driver, reporting a missing driver clearly.
-fn with_driver<F>(action: F) -> (Value, u8)
-where
-    F: FnOnce(&aad_uia::UiaDriver) -> Result<Value, Value>,
-{
-    let driver = match aad_uia::native_driver() {
-        Ok(driver) => driver,
-        Err(error) => {
-            return (
-                failure(
-                    &error.code,
-                    &error.message,
-                    Some(json!({"hint": "Run `aad probe` to see what is missing."})),
-                ),
-                EXIT_FAILED,
-            )
-        }
-    };
-    match action(&driver) {
-        Ok(result) => (result, EXIT_OK),
-        Err(payload) => (payload, EXIT_FAILED),
-    }
-}
-
 /// Write a listing to a file, answering with where it went rather than with the
 /// listing itself.
 ///
 /// The answer stays small on purpose: a caller that asked for a file wants the
 /// file, and echoing tens of thousands of characters back to the terminal as well
-/// Assemble a recording into a workflow and write it under its name.
-///
-/// The window is named by process and a stable part of its title rather than by
-/// the id that was watched: an id belongs to this session, so a workflow using one
-/// runs once and then reports WINDOW_NOT_FOUND with nothing to explain it.
-fn keep_recording(
-    driver: &aad_uia::UiaDriver,
-    name: &str,
-    overwrite: bool,
-    steps: &[Value],
-    titles: &[String],
-    window_id: &str,
-) -> Result<Value, Value> {
-    // Steps that could not be described are skipped, and the count is reported.
-    // Recording keeps them on purpose -- dropping an interaction silently would
-    // make the recording look complete -- while assembling refuses a null
-    // locator, since a workflow cannot find what cannot be described. Both are
-    // right; what would be wrong is saying nothing about the difference.
-    let mut performed = Vec::new();
-    let mut skipped = Vec::new();
-
-    let listing = driver
-        .call("list_windows", &json!({}))
-        .map_err(|error| driver_failure(&error))?;
-    let windows: Vec<aad_uia::WindowInfo> = listing["windows"]
-        .as_array()
-        .map(|found| {
-            found
-                .iter()
-                .filter_map(|value| serde_json::from_value(value.clone()).ok())
-                .collect()
-        })
-        .unwrap_or_default();
-    let target = windows
-        .iter()
-        .find(|candidate| candidate.window_id == window_id)
-        .ok_or_else(|| {
-            failure(
-                "RECORDING.WINDOW_GONE",
-                "the recorded window is no longer open, so it cannot be named for replay",
-                Some(json!({
-                    "hint": "Naming the window needs it open: the selector is checked \
-                against the other windows to make sure it picks out one."
-                })),
-            )
-        })?;
-
-    let selector = aad_uia::selector::selector_for(target, &windows, titles).ok_or_else(|| {
-        failure(
-            "RECORDING.WINDOW_NOT_DISTINGUISHABLE",
-            "no selector picks out this window among the ones open",
-            Some(json!({
-                "hint": "Another window shares its process and title. Close it, or \
-            give the window a distinguishing title, and record again.",
-                "title": target.title,
-                "process_name": target.process_name,
-            })),
-        )
-    })?;
-
-    for (index, step) in steps.iter().enumerate() {
-        let action = step["action"].as_str().unwrap_or_default();
-        let locator = step.get("locator").cloned().unwrap_or(Value::Null);
-        if locator.is_null() {
-            skipped.push(json!({
-                "position": index + 1,
-                "action": action,
-                "summary": step.get("summary").cloned().unwrap_or(Value::Null),
-                "why": step
-                    .get("unresolved")
-                    .cloned()
-                    .unwrap_or_else(|| json!("the element could not be described")),
-            }));
-            continue;
-        }
-        performed.push(aad_runtime::assemble::PerformedStep {
-            action: action.to_string(),
-            locator,
-            window: selector.clone(),
-            argument: step
-                .get("argument")
-                .and_then(Value::as_str)
-                .map(str::to_string),
-            parameters: step
-                .get("parameters")
-                .and_then(Value::as_object)
-                .cloned()
-                .unwrap_or_default(),
-            destination: step.get("destination").cloned(),
-            protected: step
-                .get("protected")
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
-        });
-    }
-
-    let descriptor = aad_runtime::assemble::assemble(name, &performed).map_err(|problem| {
-        failure(
-            &problem.code,
-            &problem.message,
-            Some(json!({"skipped": skipped.clone()})),
-        )
-    })?;
-
-    let path = aad_runtime::recordings::workflow_path(name)
-        .map_err(|error| failure(error.code, &error.message, None))?;
-    if path.exists() && !overwrite {
-        return Err(failure(
-            "WORKFLOW.NAME_IN_USE",
-            &format!("a workflow named {name:?} already exists"),
-            Some(json!({
-                "hint": "Pass --overwrite to replace it, or choose another name.",
-                "path": path.to_string_lossy(),
-            })),
-        ));
-    }
-
-    let written = aad_runtime::recordings::save_workflow(name, &descriptor)
-        .map_err(|error| failure(error.code, &error.message, None))?;
-
-    let mut report = json!({
-        "name": name,
-        "path": written.to_string_lossy(),
-        "window": selector,
-        "performed_steps": performed.len(),
-    });
-    if !skipped.is_empty() {
-        // Named so it cannot be mistaken for a detail: the workflow does less
-        // than was recorded.
-        report["skipped_steps"] = json!(skipped.len());
-        report["skipped"] = json!(skipped);
-    }
-    Ok(report)
-}
-
 /// would undo the reason for asking.
 fn write_listing(
     answer: &Value,
@@ -2372,11 +2084,7 @@ mod tests {
     }
 
     #[test]
-    fn recording_offers_to_save_what_it_captured() {
-        // Without this the command prints steps and leaves assembling a workflow
-        // to whoever reads them -- and that is the part that goes wrong by hand:
-        // one action becomes three executed steps, and the window has to be named
-        // by process rather than by an id that only exists in this session.
+    fn recording_saves_steps_that_replay_anywhere() {
         let help = Cli::command()
             .get_subcommands()
             .find(|command| command.get_name() == "record")
@@ -2392,25 +2100,8 @@ mod tests {
             help.contains("--overwrite"),
             "replacing has to be asked for: {help}"
         );
-    }
-
-    #[test]
-    fn saving_explains_why_it_is_not_left_to_the_reader() {
-        // The help has to say what is hard about doing it by hand, or --save reads
-        // like a convenience and someone will keep hand-writing descriptors.
-        let help = Cli::command()
-            .get_subcommands()
-            .find(|command| command.get_name() == "record")
-            .expect("record exists")
-            .clone()
-            .render_long_help()
-            .to_string();
         assert!(
-            help.contains("three executed steps"),
-            "say that one action expands: {help}"
-        );
-        assert!(
-            help.contains("only exists in this session") || help.contains("named by\nprocess"),
+            help.contains("only exists in this session"),
             "say why an id will not do: {help}"
         );
     }

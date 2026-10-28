@@ -17,7 +17,9 @@ macOS AX 与显式启用的 Chromium CDP 共用会话、资源、观察引用和
 详见[统一控制与远程会话](docs/control-sessions.md)。
 
 给人用的 `apps/describe/overview/snapshot/find/do` 命令也走同一个会话层，三个平台都能用。
-GUI 也走同一个会话，三个平台都能查看界面、搭建和回放步骤；自动录制人的操作（GUI 的“录制”、`aad record`、`aad watch`）目前只在 Windows 上可用。
+GUI 也走同一个会话，三个平台都能查看界面、搭建、录制和回放步骤。录制人的操作（GUI 的“录制”、`aad record`）
+在 Windows（UIA 事件）、Linux（AT-SPI 事件 + XRecord，KDE/X11）和 macOS（AXObserver + 只监听的事件 tap）上都可用，
+产出同一种平台无关的步骤；`aad watch` 仍只在 Windows 上。
 录制、回放和事件观察的限制见[控制能力审视](docs/research/control-audit-2026-10-17.md)。
 
 浏览器任务观测使用 `aad browser-record`：记录操作、关键元素变化、网络请求和截图，生成给 AI 编写 skill 的步骤说明。`aad browser-record start --browser edge --url 'https://example.com' --out ./recording` 自动启动并录制，可用 `--profile-dir` 复用工作 profile，或用 `--existing-profile [ID]` 选择日常已有 profile（只有一个时无需填 ID）。占用时默认提示，显式 `--kill-browser` 才结束占用浏览器并启动。**网络默认保留原值，`--redact-network` 才开启脱敏**。详见[浏览器任务录制](docs/browser-recording.md)。
@@ -93,6 +95,18 @@ aad do focus     99e160f2 --role Edit
 `--nth`、`--near`（配 `--side`、`--within`）、`--in`（配 `--in-role`）和 `--locator <JSON>` 由 Windows driver 求值，
 其他平台会明确拒绝。匹配多个时报错并列出候选，不会“取第一个”；`find --optional` 用来问“它还在吗”。
 Linux（KDE/X11）上 key、scroll、hover、drag 和带选项的 click 经 XTest helper 执行；macOS 上经签名的 AX helper 用 CGEvent 执行，要求目标应用在前台（macOS 部分尚未在真机验证）。
+
+## 录制操作
+
+```powershell
+aad record 99e160f2 --seconds 20 --save 报销填写   # 在这段时间里操作那个窗口
+aad run <输出里的 workflow_path> --permission desktop.input --permission desktop.observe
+```
+
+记录点击（含右键、双击）、滚轮、带 Ctrl/Alt/Cmd 的组合键和 Enter/Tab/Esc/F 键、文本修改和勾选。
+连续输入合并成一次“填写”，点进输入框或点勾选框的那一下并入它引起的修改；普通打字记成最终文本，
+密码框的内容不保存，改成运行时输入。无法识别元素的动作不会被猜成步骤，而是列在 `skipped` 里。
+macOS 记点击和按键需要“输入监控”权限；没有时只记录文本和勾选的变化。
 
 ## 运行工作流
 
@@ -314,7 +328,7 @@ npm run tauri build    # 打包
 
 - **搭建步骤**：在中间点一个元素，选它支持的操作（触发、点击、填写、按键、滚动、拖到……，
   或“等它出现 / 消失”），“添加”或“添加并执行”。三个平台都可用。
-- **录制**（Windows）：点“录制”后直接操作窗口，步骤实时出现在右侧；无法回放的动作会被略过并提示。
+- **录制**：点“录制”后直接操作窗口，步骤实时出现在右侧；无法回放的动作会被略过并提示。Windows、Linux（KDE/X11）、macOS 都可用。
 - **编辑与回放**：每一步可单独执行、改定位条件和应用条件（“测试定位”立即看匹配结果）、调序、删除；
   “运行全部”经工作流引擎逐步回放，失败的步骤标红并给出恢复建议。
 - **保存**：录制文件和工作流都存进录制目录。步骤是平台无关的格式（`control-steps/1`）：
