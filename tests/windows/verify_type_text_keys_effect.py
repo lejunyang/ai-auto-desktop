@@ -55,10 +55,7 @@ def edit_text(hwnd: int) -> str:
     return buffer.value
 
 
-def target_ref(window_id: str) -> str:
-    found, _ = aad("find", window_id, "--role", "edit")
-    target = found["target"]
-    return f"{target['snapshot_id']}:{target['revision']}:{target['node_id']}"
+EDIT = ["--role", "edit"]
 
 
 def main() -> int:
@@ -89,13 +86,11 @@ def main() -> int:
             raise RuntimeError(probe.stderr.read())
         ready = json.loads(ready_line)
         window_id = f"hwnd:{ready['window_handle']}"
-        ref = target_ref(window_id)
-
-        aad("do", "set-value", "--target", ref, "--value", "")
+        aad("do", "fill", window_id, *EDIT, "--value", "")
         before = len(read_log(log_path))
         sample = "aA1!"
         response, code = aad(
-            "do", "type-text", "--target", ref, "--text", sample, "--mode", "keys",
+            "do", "type-text", window_id, *EDIT, "--text", sample, "--mode", "keys",
             expect_ok=False,
         )
         time.sleep(0.6)
@@ -105,11 +100,10 @@ def main() -> int:
 
         # The mapper must reject the whole string before focusing or sending if
         # one character cannot be represented by the target layout.
-        ref = target_ref(window_id)
-        aad("do", "set-value", "--target", ref, "--value", "")
+        aad("do", "fill", window_id, *EDIT, "--value", "")
         before_bad = len(read_log(log_path))
         bad, bad_code = aad(
-            "do", "type-text", "--target", ref, "--text", "a😀", "--mode", "keys",
+            "do", "type-text", window_id, *EDIT, "--text", "a😀", "--mode", "keys",
             expect_ok=False,
         )
         time.sleep(0.3)
@@ -121,7 +115,8 @@ def main() -> int:
             "isolated_probe": True,
             "probe_keyboard_layout": ready.get("active_keyboard_layout"),
             "keys_exit_code": code,
-            "keys_applied": response.get("applied") is True,
+            "keys_applied": response.get("result", {}).get("backend_result", {}).get("applied")
+            is True,
             "expected_text": sample,
             "actual_text": actual,
             "text_exact": actual == sample,

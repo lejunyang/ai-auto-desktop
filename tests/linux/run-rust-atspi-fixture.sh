@@ -45,6 +45,16 @@ if [ "${1:-}" = --inside-session ]; then
     | jq -e '.frame.kind == "ArtifactRef" and .frame.mediaType == "image/png"' >/dev/null
   cargo build --locked -q -p aad-cli
   AAD_CONTROL_CLI="$root/target/debug/aad" cargo run --locked -q -p aad-control --example native_fixture -- "$fixture_pid"
+  # The commands a person runs go through the same session, one process each.
+  aad="$root/target/debug/aad"
+  resource=$("$aad" --compact apps | jq -r --argjson pid "$fixture_pid"     '.apps[] | select(.metadata.process_id == $pid and .metadata.toolkit_name == "Qt") | .resource_id')
+  [ -n "$resource" ]
+  "$aad" --compact do fill "$resource" --role text --name "Qt fixture text entry" --value "CLI session fill" >/dev/null
+  "$aad" --compact find "$resource" --role text --name "Qt fixture text entry"     | jq -e '.found and .node.value == "CLI session fill"' >/dev/null
+  "$aad" --compact do invoke "$resource" --role push_button --name "Reset Qt fixture status" >/dev/null
+  "$aad" --compact find "$resource" --name "Qt fixture status idle" | jq -e '.found' >/dev/null
+  refused=$("$aad" --compact find "$resource" --role push_button --nth 1 || true)
+  printf '%s' "$refused" | jq -e '.error.code == "CONTROL.LOCATOR_UNSUPPORTED"' >/dev/null
   printf '%s\n' 'Rust Linux AT-SPI fixture passed'
   exit 0
 fi

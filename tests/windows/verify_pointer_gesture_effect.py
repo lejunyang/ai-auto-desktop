@@ -2,7 +2,7 @@
 """Verify pointer gestures through aad against an isolated Win32 input probe.
 
 The probe is created and destroyed by this script. Each action goes through the
-real aad path (find -> observed target -> do), then this script independently
+real aad path (one `aad do` observes, finds and acts in a control session), then this script independently
 reads Raw Input records from the probe's JSONL log. It never touches an existing
 application window.
 """
@@ -62,17 +62,7 @@ def raw_mouse(entries: list[dict]) -> list[dict]:
     return [entry for entry in entries if entry.get("channel") == "raw_input_mouse"]
 
 
-def observed_ref(window_id: str, *, role: str | None = None, name: str | None = None) -> str:
-    args = ["find", window_id]
-    if role:
-        args += ["--role", role]
-    if name:
-        args += ["--name", name]
-    found = aad(*args)
-    target = found.get("target")
-    if not target:
-        raise RuntimeError(f"target not found: {found}")
-    return f"{target['snapshot_id']}:{target['revision']}:{target['node_id']}"
+BUTTON = ["--role", "button", "--name", "Probe target"]
 
 
 def main() -> int:
@@ -93,8 +83,8 @@ def main() -> int:
             raise RuntimeError(f"probe failed to start: {probe.stderr.read()}")
         ready = json.loads(ready_line)
         window_id = f"hwnd:{ready['window_handle']}"
-        button_ref = observed_ref(window_id, role="button", name="Probe target")
-        edit_ref = observed_ref(window_id, role="edit")
+        aad("find", window_id, *BUTTON)
+        aad("find", window_id, "--role", "edit")
         time.sleep(0.3)
 
         findings: dict[str, object] = {
@@ -104,13 +94,15 @@ def main() -> int:
 
         def perform(name: str, *args: str) -> list[dict]:
             before = len(read_log(log_path))
-            response = aad("do", *args)
+            response = aad("do", args[0], window_id, *BUTTON, *args[1:])
             time.sleep(0.45)
-            findings[f"{name}_applied"] = response.get("applied") is True
+            findings[f"{name}_applied"] = (
+                response.get("result", {}).get("backend_result", {}).get("applied") is True
+            )
             return raw_mouse(read_log(log_path)[before:])
 
         right = perform(
-            "right_click", "gesture", "--target", button_ref, "--button", "right"
+            "right_click", "click", "--button", "right"
         )
         right_flags = [entry.get("button_flags", 0) for entry in right]
         findings["right_click_seen"] = (
@@ -119,7 +111,7 @@ def main() -> int:
         )
 
         middle = perform(
-            "middle_click", "gesture", "--target", button_ref, "--button", "middle"
+            "middle_click", "click", "--button", "middle"
         )
         middle_flags = [entry.get("button_flags", 0) for entry in middle]
         findings["middle_click_seen"] = (
@@ -128,7 +120,7 @@ def main() -> int:
         )
 
         double = perform(
-            "double_click", "gesture", "--target", button_ref, "--count", "2"
+            "double_click", "click", "--count", "2"
         )
         double_flags = [entry.get("button_flags", 0) for entry in double]
         findings["double_click_seen"] = (
@@ -137,8 +129,7 @@ def main() -> int:
         )
 
         wheel = perform(
-            "vertical_scroll", "gesture", "--target", button_ref,
-            "--scroll", "down", "--notches", "3",
+            "vertical_scroll", "scroll", "--direction", "down", "--notches", "3",
         )
         wheel_entries = [
             entry for entry in wheel if entry.get("button_flags", 0) & RI_MOUSE_WHEEL
@@ -149,8 +140,7 @@ def main() -> int:
         )
 
         horizontal = perform(
-            "horizontal_scroll", "gesture", "--target", button_ref,
-            "--scroll", "right", "--notches", "2",
+            "horizontal_scroll", "scroll", "--direction", "right", "--notches", "2",
         )
         horizontal_entries = [
             entry for entry in horizontal if entry.get("button_flags", 0) & RI_MOUSE_HWHEEL
@@ -159,7 +149,7 @@ def main() -> int:
 
         started = time.perf_counter()
         hover = perform(
-            "hover", "gesture", "--target", button_ref, "--hover-ms", "350"
+            "hover", "hover", "--ms", "350"
         )
         elapsed_ms = (time.perf_counter() - started) * 1000
         rect = wintypes.RECT()
@@ -175,7 +165,7 @@ def main() -> int:
         findings["hover_dwelled"] = elapsed_ms >= 300
 
         drag = perform(
-            "drag", "drag", "--target", button_ref, "--to", edit_ref,
+            "drag", "drag", "--to-role", "edit",
             "--fx", "0.5", "--fy", "0.5", "--to-fx", "0.5", "--to-fy", "0.5",
         )
         drag_flags = [entry.get("button_flags", 0) for entry in drag]

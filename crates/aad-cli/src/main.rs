@@ -11,6 +11,7 @@ mod browser_launch;
 mod browser_record;
 mod cdp_watch;
 mod control;
+mod desk;
 
 use serde_json::{json, Value};
 use std::io::Write;
@@ -42,19 +43,19 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// List running applications and their windows.
-    Apps(AppsArgs),
+    /// List the windows and applications that can be read and driven.
+    Apps(desk::AppsArgs),
     /// Describe a window's interactive elements.
-    Describe(OutlineArgs),
-    /// Map a window's regions and their sizes, without listing their contents.
-    Overview(DescribeArgs),
+    Describe(desk::OutlineArgs),
+    /// Map a window's regions and their sizes, without listing their contents (Windows).
+    Overview(desk::ResourceArgs),
     /// Capture a window's full element tree.
-    Snapshot(DescribeArgs),
+    Snapshot(desk::ResourceArgs),
     /// Find the single element matching a locator.
-    Find(FindArgs),
-    /// Act on an element that was found or described.
+    Find(desk::FindArgs),
+    /// Find one element and act on it, in one step.
     #[command(subcommand)]
-    Do(DoCommand),
+    Do(desk::DoCommand),
     /// Check whether this machine can support desktop automation.
     Probe,
     /// List saved workflows, or show what one of them does.
@@ -210,161 +211,6 @@ struct EventsArgs {
 }
 
 #[derive(Args)]
-struct AppsArgs {
-    /// Only list windows whose title contains this text.
-    #[arg(long)]
-    title: Option<String>,
-    /// Only list windows belonging to this process name.
-    #[arg(long)]
-    process: Option<String>,
-}
-
-#[derive(Args)]
-struct DescribeArgs {
-    /// The window to inspect, from `aad apps`.
-    window_id: String,
-    /// Maximum elements to report.
-    #[arg(long, default_value_t = 80)]
-    limit: u32,
-    /// Maximum tree depth to walk.
-    #[arg(long)]
-    max_depth: Option<u32>,
-    /// Maximum elements to capture.
-    #[arg(long)]
-    max_nodes: Option<u32>,
-}
-
-#[derive(Args)]
-struct OutlineArgs {
-    #[command(flatten)]
-    window: DescribeArgs,
-    /// Only list one region, named as `aad overview` reports it.
-    ///
-    /// A separate struct from `snapshot`'s: a region means nothing when asking
-    /// for the whole tree, and a flag that is accepted and then ignored is worse
-    /// than one that does not exist.
-    #[arg(long)]
-    region: Option<String>,
-    /// Stop after roughly this many characters (default 20000, 0 for no limit).
-    ///
-    /// `--limit` counts elements, which does not bound the answer's size:
-    /// elements run from 169 to 4890 characters, and 500 of them reached 188147
-    /// on one window here.
-    #[arg(long)]
-    max_characters: Option<u64>,
-    /// Write the full listing to this file instead of standard output.
-    ///
-    /// No character limit applies: a file has no reason to be trimmed, and
-    /// trimming it would defeat the point of asking for one.
-    #[arg(long)]
-    out: Option<PathBuf>,
-}
-
-#[derive(Args, Default)]
-struct FindArgs {
-    /// The window to search, from `aad apps`.
-    window_id: String,
-    /// Match the element's control type, for example Button.
-    #[arg(long)]
-    role: Option<String>,
-    /// Match the element's name.
-    #[arg(long)]
-    name: Option<String>,
-    /// Match the element's automation id.
-    #[arg(long)]
-    automation_id: Option<String>,
-    /// Match names and ids by substring instead of exactly.
-    #[arg(long)]
-    contains: bool,
-    /// Match only password fields, or only non-password ones.
-
-    ///
-
-    /// Password fields often carry no stable name, so this is frequently the
-
-    /// only way to address one.
-
-    #[arg(long)]
-    protected: Option<bool>,
-
-    /// Which one to take when several match: a number from 1, `first` or `last`.
-    ///
-    /// Rows, repeated toolbar buttons and unlabelled fields often share every
-    /// attribute, so counting is the only way to tell them apart. Counted down
-    /// the screen and then across, which is the order they are read in.
-    ///
-    /// Counting spans the whole window, including its frame -- so on a plain
-    /// window the first button is usually Minimise, and in a browser the count
-    /// runs through the toolbar before reaching the page (measured: 20 buttons
-    /// reported for a page containing 3). Pair it with `--near` to count inside
-    /// a region instead: the first button below "Username" is the page's, the
-    /// third button in the window is not.
-    #[arg(long)]
-    nth: Option<String>,
-
-    /// Find it beside another element, named here.
-    ///
-    /// For a control whose own label is useless or absent: the box next to
-    /// "Username" is describable even when the box itself has no name.
-    #[arg(long, value_name = "NAME")]
-    near: Option<String>,
-
-    /// Which way to look from `--near`: left, right, above, below.
-    #[arg(long, requires = "near")]
-    direction: Option<String>,
-
-    /// Ignore anything further than this many pixels from `--near`.
-    #[arg(long, requires = "near")]
-    within: Option<i32>,
-
-    /// Search only inside the container with this name.
-    ///
-    /// For elements that share every attribute and differ only in which panel
-    /// holds them. Measured on this machine: of the interactive elements no
-    /// attribute combination could identify, naming the container brought
-    /// same-role siblings from a median of 66 down to 3 -- and it makes `--nth`
-    /// count inside that container rather than across the window.
-    ///
-    /// A container matching nothing, or several things, finds nothing: quietly
-    /// widening the search back to the whole window would act on some unrelated
-    /// element.
-    ///
-    /// Deliberately not `--within`, which is already a distance in pixels from
-    /// `--near`. The driver tells the two apart by nesting; a flag has no
-    /// nesting to rely on.
-    #[arg(long = "in", value_name = "NAME")]
-    inside: Option<String>,
-
-    /// Narrow `--in` to a container of this control type.
-    #[arg(long = "in-role", requires = "inside", value_name = "ROLE")]
-    inside_role: Option<String>,
-
-    /// The whole locator as JSON, for what the flags above cannot express.
-    ///
-    /// Anchors can nest -- "the button beside the field beside Username" --
-    /// and that shape does not fit into flags. Given this, the other match
-    /// flags are ignored.
-    #[arg(long, value_name = "JSON", conflicts_with_all = ["role", "name", "automation_id", "nth", "near", "inside"])]
-    locator: Option<String>,
-
-    /// Report absence instead of failing: for asking whether something is there.
-    ///
-    /// "Has the dialog closed?" cannot be asked otherwise -- the search itself
-    /// fails, so there is no answer to test. Prints `found: false` and exits 0.
-    #[arg(long)]
-    optional: bool,
-
-    /// Take the first match instead of refusing an ambiguous one.
-    ///
-    /// The refusal is the default because acting on "whichever came first" is
-    /// how automation clicks the wrong button. Use this while working out what
-    /// a locator selects: the competing elements are listed alongside, which is
-    /// what shows how to narrow it.
-    #[arg(long, conflicts_with = "optional")]
-    any: bool,
-}
-
-#[derive(Args)]
 struct RecordArgs {
     /// The window to watch, from `aad apps`.
     window_id: String,
@@ -458,120 +304,6 @@ struct WatchArgs {
     kill_browser: bool,
 }
 
-#[derive(Subcommand)]
-enum DoCommand {
-    /// Give an element keyboard focus.
-    Focus(TargetArgs),
-    /// Activate an element's default action.
-    Invoke(TargetArgs),
-    /// Click the centre of an element.
-    Click(TargetArgs),
-    /// Replace an element's value.
-    SetValue(ValueArgs),
-    /// Type text into an element.
-    TypeText(TextArgs),
-    /// Press a key combination on an element, e.g. Ctrl+C or F5.
-    KeyChord(ChordArgs),
-    /// Right/middle/double click, scroll or hover on an element.
-    Gesture(GestureArgs),
-    /// Drag from one element to another.
-    Drag(DragArgs),
-}
-
-#[derive(Args)]
-struct TargetArgs {
-    /// The element to act on, as printed by `aad find` (`snapshot:revision:node`).
-    #[arg(long, value_name = "REF")]
-    target: String,
-}
-
-#[derive(Args)]
-struct ValueArgs {
-    /// The element to act on, as printed by `aad find`.
-    #[arg(long, value_name = "REF")]
-    target: String,
-    /// The value to set.
-    #[arg(long)]
-    value: String,
-}
-
-#[derive(Args)]
-struct TextArgs {
-    /// The element to act on, as printed by `aad find`.
-    #[arg(long, value_name = "REF")]
-    target: String,
-    /// The text to type.
-    #[arg(long)]
-    text: String,
-    /// Input encoding: unicode (default) or layout-aware keys.
-    #[arg(long, value_parser = ["unicode", "keys"], default_value = "unicode")]
-    mode: String,
-}
-
-#[derive(Args)]
-struct ChordArgs {
-    /// The element to act on, as printed by `aad find`.
-    #[arg(long, value_name = "REF")]
-    target: String,
-    /// The combination, comma-separated: modifiers then one key, e.g.
-    /// `ctrl,c`, `f5`, `shift,end`.
-    #[arg(long, value_name = "KEYS")]
-    keys: String,
-}
-
-#[derive(Args)]
-struct GestureArgs {
-    /// The element to act on, as printed by `aad find`.
-    #[arg(long, value_name = "REF")]
-    target: String,
-    /// Which button: left, right or middle. Defaults to left.
-    #[arg(long, conflicts_with_all = ["scroll", "hover_ms"])]
-    button: Option<String>,
-    /// Click count: 1 or 2 (double click). Defaults to 1.
-    #[arg(long, conflicts_with_all = ["scroll", "hover_ms"])]
-    count: Option<u64>,
-    /// Scroll direction: up, down, left or right. Makes this a scroll.
-    #[arg(long, value_name = "DIR", conflicts_with = "hover_ms")]
-    scroll: Option<String>,
-    /// Scroll notches (with --scroll). Defaults to 3.
-    #[arg(long, requires = "scroll")]
-    notches: Option<u64>,
-    /// Hover this many milliseconds instead of clicking.
-    #[arg(long, value_name = "MS", conflicts_with = "scroll")]
-    hover_ms: Option<u64>,
-    /// Horizontal position inside the element, 0.0..1.0 (with --fy).
-    #[arg(long, requires = "fy")]
-    fx: Option<f64>,
-    /// Vertical position inside the element, 0.0..1.0 (with --fx).
-    #[arg(long, requires = "fx")]
-    fy: Option<f64>,
-}
-
-#[derive(Args)]
-struct DragArgs {
-    /// The element to drag from, as printed by `aad find`.
-    #[arg(long, value_name = "REF")]
-    target: String,
-    /// The element to drag to, as printed by `aad find`.
-    #[arg(long, value_name = "REF")]
-    to: String,
-    /// Which button to hold during the drag. Defaults to left.
-    #[arg(long)]
-    button: Option<String>,
-    /// Horizontal grab position inside the source, 0.0..1.0 (with --fy).
-    #[arg(long, requires = "fy")]
-    fx: Option<f64>,
-    /// Vertical grab position inside the source, 0.0..1.0 (with --fx).
-    #[arg(long, requires = "fx")]
-    fy: Option<f64>,
-    /// Horizontal release position inside the destination, 0.0..1.0 (with --to-fy).
-    #[arg(long, requires = "to_fy")]
-    to_fx: Option<f64>,
-    /// Vertical release position inside the destination, 0.0..1.0 (with --to-fx).
-    #[arg(long, requires = "to_fx")]
-    to_fy: Option<f64>,
-}
-
 #[derive(Args)]
 struct FileArgs {
     /// A workflow descriptor in YAML or JSON.
@@ -653,29 +385,6 @@ fn emit(payload: &Value, compact: bool) {
     let _ = std::io::stdout().flush();
 }
 
-/// How strict a `find` should be, from the flags the caller gave.
-///
-/// `None` means strict: a missing element is an error and an ambiguous one is
-/// refused. That is the default because a caller is usually acquiring something
-/// to act on, and "whichever came first" is how automation clicks the wrong
-/// button.
-fn expectation_for(args: &FindArgs) -> Option<&'static str> {
-    if args.optional {
-        // Asking whether something is there. Absence is the answer, not a
-        // failure -- without this, "has the dialog closed?" cannot be asked at
-        // all, because the search fails before there is anything to test.
-        Some("optional")
-    } else if args.any {
-        // Asking for one of several. Note this does not also relax absence:
-        // with nothing matching there is no "one of them" to return, and
-        // handing back an empty target would fail later as a puzzling missing
-        // element.
-        Some("any")
-    } else {
-        None
-    }
-}
-
 fn dispatch(command: &Command) -> (Value, u8) {
     match command {
         Command::Probe => {
@@ -707,184 +416,12 @@ fn dispatch(command: &Command) -> (Value, u8) {
         Command::Cancel(args) => control(&args.store, &args.run_id, Intent::Cancel),
         Command::List(args) => list_runs(args),
         Command::Events(args) => list_events(args),
-        Command::Apps(args) => with_driver(|driver| {
-            let mut result = driver
-                .call("list_windows", &json!({}))
-                .map_err(|error| driver_failure(&error))?;
-
-            // Filtering here keeps the common "find the app I mean" case to a
-            // single command rather than a pipeline.
-            if args.title.is_some() || args.process.is_some() {
-                let windows: Vec<Value> = result["windows"]
-                    .as_array()
-                    .cloned()
-                    .unwrap_or_default()
-                    .into_iter()
-                    .filter(|window| {
-                        let matches = |field: &str, wanted: &Option<String>| match wanted {
-                            None => true,
-                            Some(wanted) => window[field].as_str().is_some_and(|actual| {
-                                actual.to_lowercase().contains(&wanted.to_lowercase())
-                            }),
-                        };
-                        matches("title", &args.title) && matches("process_name", &args.process)
-                    })
-                    .collect();
-                result = json!({"count": windows.len(), "windows": windows});
-            }
-            Ok(result)
-        }),
-        Command::Describe(args) => {
-            let destination = args.out.clone();
-            let outcome = with_driver(|driver| {
-                let mut arguments = describe_arguments(&args.window);
-                if let Some(region) = args.region.as_deref() {
-                    arguments["region"] = json!(region);
-                }
-                // A file takes everything. Asked for both, the file wins, and the
-                // answer says so rather than leaving the caller to believe the
-                // ceiling applied.
-                let ceiling = if destination.is_some() {
-                    Some(0)
-                } else {
-                    args.max_characters
-                };
-                if let Some(value) = ceiling {
-                    arguments["max_characters"] = json!(value);
-                }
-                driver
-                    .call("describe", &arguments)
-                    .map_err(|error| driver_failure(&error))
-            });
-            match (&outcome, destination) {
-                // Only write when the driver actually answered: writing a failure
-                // payload to the file would look like a listing on next read.
-                ((answer, EXIT_OK), Some(path)) => {
-                    write_listing(answer, &path, args.max_characters)
-                }
-                _ => outcome,
-            }
-        }
-        Command::Overview(args) => with_driver(|driver| {
-            driver
-                .call("overview", &describe_arguments(args))
-                .map_err(|error| driver_failure(&error))
-        }),
-        Command::Snapshot(args) => with_driver(|driver| {
-            driver
-                .call("snapshot", &describe_arguments(args))
-                .map_err(|error| driver_failure(&error))
-        }),
-        Command::Find(args) => {
-            // Worked out once for both routes below. Duplicating it is how
-            // `--optional` ends up silently not applying to `--locator`.
-            let expectation = expectation_for(args);
-
-            // A whole locator as JSON wins outright: it is the escape hatch for
-            // shapes the flags cannot express, so mixing the two would only
-            // raise the question of which half applied.
-            if let Some(raw) = &args.locator {
-                let parsed: Value = match serde_json::from_str(raw) {
-                    Ok(value) => value,
-                    Err(error) => {
-                        return (
-                            failure(
-                                "CLI.INVALID_ARGUMENTS",
-                                &format!("--locator is not valid JSON: {error}"),
-                                None,
-                            ),
-                            EXIT_USAGE,
-                        )
-                    }
-                };
-                let window_id = args.window_id.clone();
-                return with_driver(move |driver| {
-                    driver
-                        .call(
-                            "find",
-                            &json!({
-                                "window_id": window_id,
-                                "locator": parsed,
-                                "expect": expectation,
-                            }),
-                        )
-                        .map_err(|error| driver_failure(&error))
-                });
-            }
-
-            let mut locator = serde_json::Map::new();
-            if let Some(role) = &args.role {
-                locator.insert("role".into(), json!(role));
-            }
-            if let Some(name) = &args.name {
-                locator.insert("name".into(), json!(name));
-            }
-            if let Some(id) = &args.automation_id {
-                locator.insert("automation_id".into(), json!(id));
-            }
-            if let Some(protected) = args.protected {
-                locator.insert("states".into(), json!({"protected": protected}));
-            }
-
-            if args.contains {
-                locator.insert("match".into(), json!("contains"));
-            }
-            if let Some(nth) = &args.nth {
-                // A number if it looks like one, otherwise the word, so both
-                // `--nth 2` and `--nth last` reach the driver in the shape it
-                // expects. Validation belongs to the locator parser, which
-                // reports the position rules in one place.
-                locator.insert(
-                    "nth".into(),
-                    match nth.parse::<u64>() {
-                        Ok(index) => json!(index),
-                        Err(_) => json!(nth),
-                    },
-                );
-            }
-            if let Some(near) = &args.near {
-                let mut relation = serde_json::Map::new();
-                relation.insert("anchor".into(), json!({"name": near}));
-                if let Some(direction) = &args.direction {
-                    relation.insert("direction".into(), json!(direction));
-                }
-                if let Some(within) = args.within {
-                    relation.insert("within".into(), json!(within));
-                }
-                locator.insert("near".into(), Value::Object(relation));
-            }
-            if let Some(inside) = &args.inside {
-                let mut container = serde_json::Map::new();
-                container.insert("name".into(), json!(inside));
-                if let Some(role) = &args.inside_role {
-                    container.insert("role".into(), json!(role));
-                }
-                locator.insert("within".into(), Value::Object(container));
-            }
-            if locator.is_empty() {
-                return (
-                    failure(
-                        "CLI.INVALID_ARGUMENTS",
-                        "give at least one of --role, --name, --automation-id, --protected, --nth, --near, --in or --locator",
-                        None,
-                    ),
-                    EXIT_USAGE,
-                );
-            }
-            let window_id = args.window_id.clone();
-            with_driver(move |driver| {
-                driver
-                    .call(
-                        "find",
-                        &json!({
-                            "window_id": window_id,
-                            "locator": Value::Object(locator),
-                            "expect": expectation,
-                        }),
-                    )
-                    .map_err(|error| driver_failure(&error))
-            })
-        }
+        Command::Apps(args) => desk::apps(args),
+        Command::Describe(args) => desk::describe(args),
+        Command::Overview(args) => desk::overview(args),
+        Command::Snapshot(args) => desk::snapshot(args),
+        Command::Find(args) => desk::find(args),
+        Command::Do(command) => desk::act(command),
         Command::Record(args) => {
             let window_id = args.window_id.clone();
             let seconds = args.seconds.clamp(1, 600);
@@ -995,132 +532,7 @@ fn dispatch(command: &Command) -> (Value, u8) {
                 EXIT_FAILED,
             ),
         },
-        Command::Do(action) => {
-            let (name, raw_target, extra) = match action {
-                DoCommand::Focus(args) => ("focus", &args.target, json!({})),
-                DoCommand::Invoke(args) => ("invoke", &args.target, json!({})),
-                DoCommand::Click(args) => ("pointer_click", &args.target, json!({})),
-                DoCommand::SetValue(args) => {
-                    ("set_value", &args.target, json!({"value": args.value}))
-                }
-                DoCommand::TypeText(args) => (
-                    "type_text",
-                    &args.target,
-                    json!({"text": args.text, "mode": args.mode}),
-                ),
-                DoCommand::KeyChord(args) => {
-                    // Comma-separated on the command line, an array to the driver.
-                    // Empty segments are dropped so a stray comma is not read as a
-                    // blank key the driver would then reject.
-                    let keys: Vec<String> = args
-                        .keys
-                        .split(',')
-                        .map(str::trim)
-                        .filter(|part| !part.is_empty())
-                        .map(str::to_string)
-                        .collect();
-                    ("key_chord", &args.target, json!({ "keys": keys }))
-                }
-                DoCommand::Gesture(args) => {
-                    let mut extra = serde_json::Map::new();
-                    if let Some(button) = &args.button {
-                        extra.insert("button".into(), json!(button));
-                    }
-                    if let Some(count) = args.count {
-                        extra.insert("count".into(), json!(count));
-                    }
-                    if let Some(dir) = &args.scroll {
-                        let mut scroll = serde_json::Map::new();
-                        scroll.insert("direction".into(), json!(dir));
-                        if let Some(notches) = args.notches {
-                            scroll.insert("notches".into(), json!(notches));
-                        }
-                        extra.insert("scroll".into(), Value::Object(scroll));
-                    }
-                    if let Some(ms) = args.hover_ms {
-                        extra.insert("hover_ms".into(), json!(ms));
-                    }
-                    if let (Some(fx), Some(fy)) = (args.fx, args.fy) {
-                        extra.insert("fraction".into(), json!({ "fx": fx, "fy": fy }));
-                    }
-                    ("pointer_gesture", &args.target, Value::Object(extra))
-                }
-                DoCommand::Drag(args) => {
-                    // The destination is a second reference; resolve it the same
-                    // way the primary target is resolved below, so both accept a
-                    // compact ref or raw JSON.
-                    let to: Value = match serde_json::from_str::<Value>(&args.to) {
-                        Ok(value) if value.is_object() => value,
-                        _ => match aad_uia::Target::parse_ref(&args.to) {
-                            Ok(target) => target.to_json(),
-                            Err(error) => {
-                                return (
-                                    json!({"code": "CLI.INVALID_ARGUMENT",
-                                           "message": format!("bad --to reference: {error}")}),
-                                    EXIT_USAGE,
-                                );
-                            }
-                        },
-                    };
-                    let mut extra = serde_json::Map::new();
-                    extra.insert("to".into(), to);
-                    if let Some(button) = &args.button {
-                        extra.insert("button".into(), json!(button));
-                    }
-                    if let (Some(fx), Some(fy)) = (args.fx, args.fy) {
-                        extra.insert("fraction".into(), json!({ "fx": fx, "fy": fy }));
-                    }
-                    if let (Some(fx), Some(fy)) = (args.to_fx, args.to_fy) {
-                        extra.insert("to_fraction".into(), json!({ "fx": fx, "fy": fy }));
-                    }
-                    ("drag", &args.target, Value::Object(extra))
-                }
-            };
-
-            // Accept the compact reference and raw JSON alike: the reference is
-            // what survives shell quoting, but JSON is what a script may hold.
-            let target: Value = match serde_json::from_str::<Value>(raw_target) {
-                Ok(value) if value.is_object() => value,
-                _ => match aad_uia::Target::parse_ref(raw_target) {
-                    Ok(target) => target.to_json(),
-                    Err(error) => {
-                        return (
-                            failure(
-                                "CLI.INVALID_ARGUMENTS",
-                                &format!("--target is not usable: {error}"),
-                                Some(json!({
-                                    "hint": "Pass the `ref` printed by `aad find`, \
-                                for example abc123:1:e9."
-                                })),
-                            ),
-                            EXIT_USAGE,
-                        );
-                    }
-                },
-            };
-
-            let mut arguments = extra.as_object().cloned().unwrap_or_default();
-            arguments.insert("target".into(), target);
-            with_driver(move |driver| {
-                driver
-                    .call(name, &Value::Object(arguments))
-                    .map_err(|error| driver_failure(&error))
-            })
-        }
     }
-}
-
-fn describe_arguments(args: &DescribeArgs) -> Value {
-    let mut arguments = serde_json::Map::new();
-    arguments.insert("window_id".into(), json!(args.window_id));
-    arguments.insert("limit".into(), json!(args.limit));
-    if let Some(depth) = args.max_depth {
-        arguments.insert("max_depth".into(), json!(depth));
-    }
-    if let Some(nodes) = args.max_nodes {
-        arguments.insert("max_nodes".into(), json!(nodes));
-    }
-    Value::Object(arguments)
 }
 
 /// Stream ambient observations as JSONL: one JSON object per line.
@@ -1750,7 +1162,7 @@ fn keep_recording(
 fn write_listing(
     answer: &Value,
     path: &std::path::Path,
-    requested_ceiling: Option<u64>,
+    requested_ceiling: Option<usize>,
 ) -> (Value, u8) {
     let rendered = match serde_json::to_string_pretty(answer) {
         Ok(text) => text,
@@ -1796,13 +1208,16 @@ fn write_listing(
         "characters": rendered.chars().count(),
         "shown": answer["shown"].clone(),
         "matched": answer["matched"].clone(),
-        "truncated": answer["truncated"].clone(),
+        "stopped_by": answer["stopped_by"].clone(),
+        "outline_truncated": answer["outline_truncated"].clone(),
     });
     if let Some(region) = answer.get("region") {
         summary["region"] = region.clone();
     }
     if requested_ceiling.is_some() {
-        summary["note"] = json!("--max-characters was ignored: a file is written in full");
+        summary["note"] = json!(
+            "--max-characters was ignored: a file gets the largest limits the session allows"
+        );
     }
     (summary, EXIT_OK)
 }
@@ -3024,300 +2439,6 @@ mod tests {
                 sub.get_name()
             );
         }
-    }
-
-    #[test]
-    fn the_action_subcommands_all_require_a_target() {
-        let command = Cli::command();
-        let action = command
-            .get_subcommands()
-            .find(|sub| sub.get_name() == "do")
-            .expect("the do command");
-
-        for sub in action.get_subcommands() {
-            let has_target = sub.get_arguments().any(|arg| arg.get_id() == "target");
-            assert!(has_target, "{} must take a target", sub.get_name());
-        }
-    }
-
-    #[test]
-    fn type_text_mode_defaults_to_unicode_and_rejects_unknown_values() {
-        let parsed = Cli::try_parse_from([
-            "aad",
-            "do",
-            "type-text",
-            "--target",
-            "a:1:b",
-            "--text",
-            "hello",
-        ])
-        .unwrap();
-        let Command::Do(DoCommand::TypeText(args)) = parsed.command else {
-            panic!("expected type-text command");
-        };
-        assert_eq!(args.mode, "unicode");
-
-        assert!(Cli::try_parse_from([
-            "aad",
-            "do",
-            "type-text",
-            "--target",
-            "a:1:b",
-            "--text",
-            "hello",
-            "--mode",
-            "guess",
-        ])
-        .is_err());
-    }
-
-    #[test]
-    fn pointer_arguments_fail_closed_before_reaching_the_driver() {
-        for args in [
-            vec!["aad", "do", "gesture", "--target", "a:1:b", "--fx", "0.5"],
-            vec![
-                "aad", "do", "gesture", "--target", "a:1:b", "--scroll", "down", "--count", "2",
-            ],
-            vec![
-                "aad",
-                "do",
-                "gesture",
-                "--target",
-                "a:1:b",
-                "--notches",
-                "3",
-            ],
-            vec![
-                "aad", "do", "drag", "--target", "a:1:b", "--to", "c:2:d", "--to-fx", "0.8",
-            ],
-        ] {
-            assert!(
-                Cli::try_parse_from(args).is_err(),
-                "an incomplete or conflicting pointer request must be rejected"
-            );
-        }
-    }
-
-    #[test]
-    fn drag_accepts_independent_source_and_destination_fractions() {
-        let parsed = Cli::try_parse_from([
-            "aad", "do", "drag", "--target", "a:1:b", "--to", "c:2:d", "--fx", "0.1", "--fy",
-            "0.2", "--to-fx", "0.8", "--to-fy", "0.9",
-        ])
-        .unwrap();
-        let Command::Do(DoCommand::Drag(args)) = parsed.command else {
-            panic!("expected drag command");
-        };
-        assert_eq!(args.fx, Some(0.1));
-        assert_eq!(args.fy, Some(0.2));
-        assert_eq!(args.to_fx, Some(0.8));
-        assert_eq!(args.to_fy, Some(0.9));
-    }
-
-    #[test]
-    fn a_find_with_no_criteria_is_a_usage_error() {
-        let (payload, code) = dispatch(&Command::Find(FindArgs {
-            window_id: "hwnd:1".into(),
-            ..Default::default()
-        }));
-
-        assert_eq!(code, EXIT_USAGE);
-        assert_eq!(payload["error"]["code"], "CLI.INVALID_ARGUMENTS");
-    }
-
-    #[test]
-    fn matching_a_password_field_alone_is_enough_to_search() {
-        // A password box often exposes no name and no automation id, so
-        // `--protected` has to count as a criterion in its own right. Reaching
-        // the driver is proof enough here: in a test environment the driver is
-        // what fails, not argument validation.
-        let (payload, code) = dispatch(&Command::Find(FindArgs {
-            window_id: "hwnd:1".into(),
-            protected: Some(true),
-            ..Default::default()
-        }));
-
-        assert_ne!(
-            code, EXIT_USAGE,
-            "protected alone must be a valid criterion"
-        );
-        assert_ne!(payload["error"]["code"], "CLI.INVALID_ARGUMENTS");
-    }
-
-    #[test]
-    fn a_position_alone_is_enough_to_search() {
-        // "the third button" and "the box next to Username" are whole
-        // descriptions on their own. Requiring an attribute alongside them
-        // would rule out the elements that need them most -- the ones with no
-        // usable attribute at all.
-        for args in [
-            FindArgs {
-                window_id: "hwnd:1".into(),
-                nth: Some("2".into()),
-                ..Default::default()
-            },
-            FindArgs {
-                window_id: "hwnd:1".into(),
-                near: Some("Username".into()),
-                ..Default::default()
-            },
-        ] {
-            let (payload, code) = dispatch(&Command::Find(args));
-            assert_ne!(
-                code, EXIT_USAGE,
-                "a position alone must be a valid criterion"
-            );
-            assert_ne!(payload["error"]["code"], "CLI.INVALID_ARGUMENTS");
-        }
-    }
-
-    #[test]
-    fn a_container_scopes_the_search_and_the_counting() {
-        // Verified against a real window: `--nth 1` alone selects Minimise,
-        // because the count spans the frame. Scoped to a panel it selects that
-        // panel's first button, and the same number in a different panel selects
-        // a different element -- which is what makes the position usable.
-        let args = Cli::parse_from([
-            "aad",
-            "find",
-            "hwnd:1",
-            "--role",
-            "button",
-            "--in",
-            "Terminal actions",
-            "--nth",
-            "1",
-        ]);
-        let Command::Find(find) = args.command else {
-            panic!("expected find");
-        };
-
-        assert_eq!(find.inside.as_deref(), Some("Terminal actions"));
-        assert_eq!(find.nth.as_deref(), Some("1"));
-    }
-
-    #[test]
-    fn a_container_role_needs_the_container_it_narrows() {
-        // `--in-role tool_bar` on its own would read as "in some toolbar", which
-        // matches several and therefore nothing -- a locator that looks specific
-        // and finds none.
-        let refused = Cli::try_parse_from([
-            "aad",
-            "find",
-            "hwnd:1",
-            "--role",
-            "button",
-            "--in-role",
-            "tool_bar",
-        ]);
-
-        assert!(
-            refused.is_err(),
-            "a container role without a container must be refused"
-        );
-    }
-
-    #[test]
-    fn a_distance_and_a_container_are_separate_flags() {
-        // Both are `within` in the driver's JSON -- a number under `near`, an
-        // object at the top level. One flag for both would send `40` and
-        // `tool_bar` to the same place.
-        let args = Cli::parse_from([
-            "aad", "find", "hwnd:1", "--role", "edit", "--near", "Name:", "--within", "40", "--in",
-            "Details",
-        ]);
-        let Command::Find(find) = args.command else {
-            panic!("expected find");
-        };
-
-        assert_eq!(find.within, Some(40), "the pixel distance");
-        assert_eq!(find.inside.as_deref(), Some("Details"), "the container");
-    }
-
-    #[test]
-    fn optional_and_any_relax_different_things() {
-        // Two different questions, and swapping them is how automation goes
-        // wrong quietly. `--optional` asks whether something is there, so it
-        // must not also start picking one of several. `--any` asks for one of
-        // several, so it must not also start reporting absence as success --
-        // the caller wants an element to act on and would get nothing.
-        let strict = expectation_for(&FindArgs::default());
-        assert_eq!(strict, None, "the default must refuse both");
-
-        let optional = expectation_for(&FindArgs {
-            optional: true,
-            ..Default::default()
-        });
-        assert_eq!(optional, Some("optional"));
-
-        let any = expectation_for(&FindArgs {
-            any: true,
-            ..Default::default()
-        });
-        assert_eq!(any, Some("any"));
-    }
-
-    #[test]
-    fn the_expectation_reaches_the_driver_through_the_json_route_too() {
-        // `--locator` is a separate code path from the match flags. A caller
-        // who writes a descriptive locator as JSON and adds `--optional` would
-        // otherwise get the strict behaviour, and the flag would look broken
-        // for no visible reason.
-        let (payload, code) = dispatch(&Command::Find(FindArgs {
-            window_id: "hwnd:1".into(),
-            locator: Some(r#"{"role":"button"}"#.into()),
-            optional: true,
-            ..Default::default()
-        }));
-
-        // No desktop here, so the call cannot succeed -- but it must fail for
-        // the reason that proves the argument was accepted and forwarded,
-        // rather than being rejected as a usage error.
-        assert_ne!(code, EXIT_USAGE, "the combination must be valid");
-        assert_ne!(payload["error"]["code"], "CLI.INVALID_ARGUMENTS");
-    }
-
-    #[test]
-    fn a_malformed_locator_json_is_a_usage_error() {
-        // The escape hatch is hand-written or agent-written JSON, so a typo in
-        // it has to say so rather than reaching the driver as an empty locator.
-        let (payload, code) = dispatch(&Command::Find(FindArgs {
-            window_id: "hwnd:1".into(),
-            locator: Some("{not json".into()),
-            ..Default::default()
-        }));
-
-        assert_eq!(code, EXIT_USAGE);
-        assert_eq!(payload["error"]["code"], "CLI.INVALID_ARGUMENTS");
-    }
-
-    #[test]
-    fn a_malformed_target_is_a_usage_error_with_a_hint() {
-        let (payload, code) = dispatch(&Command::Do(DoCommand::Invoke(TargetArgs {
-            target: "not a target".into(),
-        })));
-
-        assert_eq!(code, EXIT_USAGE);
-        assert_eq!(payload["error"]["code"], "CLI.INVALID_ARGUMENTS");
-        assert!(payload["error"]["hint"]
-            .as_str()
-            .unwrap()
-            .contains("aad find"));
-    }
-
-    #[test]
-    fn a_compact_reference_is_accepted_where_a_target_is_required() {
-        // A reference for a snapshot that does not exist must fail on the
-        // lookup, not on parsing: that proves the reference itself was read.
-        let (payload, code) = dispatch(&Command::Do(DoCommand::Invoke(TargetArgs {
-            target: "deadbeef:1:e9".into(),
-        })));
-
-        assert_ne!(
-            payload["error"]["code"], "CLI.INVALID_ARGUMENTS",
-            "a well-formed reference must not be a usage error: {payload}"
-        );
-        assert_eq!(code, EXIT_FAILED);
     }
 
     #[test]

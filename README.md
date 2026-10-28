@@ -16,8 +16,8 @@ macOS AX 与显式启用的 Chromium CDP 共用会话、资源、观察引用和
 `aad mcp --connect` 可通过已有的认证 SSH 连接控制远程环境，授权由远端服务的启动参数决定。
 详见[统一控制与远程会话](docs/control-sessions.md)。
 
-给人用的 `apps/describe/find/do` CLI 和 GUI 仍直接使用 Windows UIA，引用形如下文的 `snapshot:revision:node`。
-GUI 尚未迁入会话层；录制、回放和事件观察的限制见[控制能力审视](docs/research/control-audit-2026-10-17.md)。
+给人用的 `apps/describe/overview/snapshot/find/do` 命令也走同一个会话层，三个平台都能用。
+GUI、`aad record` 和 `aad watch` 仍直接使用 Windows UIA；录制、回放和事件观察的限制见[控制能力审视](docs/research/control-audit-2026-10-17.md)。
 
 浏览器任务观测使用 `aad browser-record`：记录操作、关键元素变化、网络请求和截图，生成给 AI 编写 skill 的步骤说明。`aad browser-record start --browser edge --url 'https://example.com' --out ./recording` 自动启动并录制，可用 `--profile-dir` 复用工作 profile，或用 `--existing-profile [ID]` 选择日常已有 profile（只有一个时无需填 ID）。占用时默认提示，显式 `--kill-browser` 才结束占用浏览器并启动。**网络默认保留原值，`--redact-network` 才开启脱敏**。详见[浏览器任务录制](docs/browser-recording.md)。
 
@@ -25,8 +25,8 @@ GUI 尚未迁入会话层；录制、回放和事件观察的限制见[控制能
 
 这是整个项目的主轴，也是与“坐标点击”类工具的根本区别。
 
-**任何写操作都必须引用一个真实观察过的元素**。给 AI 的会话里，引用是 `session_id + resource_id + observation_id + node_id`，
-只在本会话、本次观察内有效；给人用的 CLI 里是紧凑的 `snapshot:revision:node`（例如 `a2466628:10:e68`）。执行前 driver 会用捕获时记录的 role / name / automation_id / class_name 与当前活动界面二次比对：
+**任何写操作都必须引用一个真实观察过的元素**。引用是 `session_id + resource_id + observation_id + node_id`，
+只在本会话、本次观察内有效；给人用的 `aad do` 在同一个进程里先观察、再定位、再操作，不跨进程传引用。执行前 driver 会用捕获时记录的 role / name / automation_id / class_name 与当前活动界面二次比对：
 
 - 界面变了 → 返回 `DRIVER.STALE_HANDLE` 并**拒绝执行**，而不是打到别的元素上；
 - 定位命中多个 → 返回 `DRIVER.AMBIGUOUS_MATCH` 并列出候选，绝不“取第一个”；
@@ -63,33 +63,35 @@ cargo build --release
 
 ```powershell
 aad probe                      # 只读检查环境是否具备自动化前置条件
-aad apps                       # 列出当前所有可见窗口
-aad describe hwnd:12454104     # 读出某个窗口的界面结构
+aad apps                       # 列出可读、可操作的窗口和应用，每个带 resource_id
+aad describe 99e160f2          # 读出界面结构；resource_id、其哈希的唯一前缀或 Windows 的 hwnd:… 都行
+aad overview 99e160f2          # 只看区域划分（Windows）；再用 describe --region 读其中一块
+aad find 99e160f2 --name "保存"  # 确认定位器恰好选中一个元素
 ```
 
-`describe` 的每个元素都带一个 `ref` 字段，直接拿它操作：
+`aad do` 接受与 `find` 相同的定位参数，在一个进程里观察、定位、操作：
 
 ```powershell
-aad find hwnd:12454104 --name "保存"      # 精确定位，返回 ref
-aad do invoke    --target abc123:4:e9      # 触发默认动作
-aad do click     --target abc123:4:e9      # 点击元素中心
-aad do set-value --target abc123:4:e9 --value "写入的内容"
-aad do type-text --target abc123:4:e9 --text "逐字输入"            # 默认 Unicode
+aad do invoke    99e160f2 --name "保存"            # 触发默认动作
+aad do click     99e160f2 --name "保存"            # 点击元素中心
+aad do click     99e160f2 --name "文件" --button right
+aad do fill      99e160f2 --role Edit --value "写入的内容"
+aad do type-text 99e160f2 --role Edit --text "逐字输入"            # 默认 Unicode
 # Raw Input 应用使用 keys；字符必须能由目标键盘布局表达，IME 开启时会明确拒绝
-aad do type-text --target abc123:4:e9 --text "aA1!" --mode keys
-aad do key-chord --target abc123:4:e9 --keys ctrl,a
-# 右键/双击/滚轮/悬停：位置只能是元素内的 0..1 比例，不接受屏幕坐标
-aad do gesture --target abc123:4:e9 --button right
-# 拖拽的起点与终点都必须是已观察并二次校验过的元素
-aad do drag --target abc123:4:e9 --to def456:5:e12
-aad do focus     --target abc123:4:e9
+aad do type-text 99e160f2 --role Edit --text "aA1!" --mode keys
+aad do key       99e160f2 --role Edit --keys ctrl,a
+# 滚轮/悬停/元素内位置：位置只能是元素内的 0..1 比例，不接受屏幕坐标
+aad do scroll    99e160f2 --role List --direction down --notches 3
+aad do hover     99e160f2 --name "帮助" --ms 400
+# 拖拽的起点与终点都必须是同一次观察里的元素
+aad do drag      99e160f2 --name "a.txt" --to-name "回收站"
+aad do focus     99e160f2 --role Edit
 ```
 
-引用可跨进程使用：一个进程 `find` 得到的 `ref`，另一个进程可以直接 `do`。快照默认落在
-`%TEMP%/ai-auto-desktop/snapshots`，可用 `AAD_SNAPSHOT_DIR` 覆盖。
-
-> PowerShell 会吞掉命令行参数里的内层引号，因此 `--target` 优先使用紧凑引用
-> `snapshot:revision:node`；它也接受等价的 JSON 对象形式。
+定位参数：`--role`、`--name` 在所有平台精确匹配；`--automation-id`、`--contains`、`--protected`、
+`--nth`、`--near`（配 `--side`、`--within`）、`--in`（配 `--in-role`）和 `--locator <JSON>` 由 Windows driver 求值，
+其他平台会明确拒绝。匹配多个时报错并列出候选，不会“取第一个”；`find --optional` 用来问“它还在吗”。
+在 Linux 和 macOS 上，click 只有普通左键，没有 key、scroll、hover、drag。
 
 ## 运行工作流
 

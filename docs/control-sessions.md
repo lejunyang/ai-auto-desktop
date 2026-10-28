@@ -42,6 +42,9 @@ driver 求值，其他 provider 返回 `CONTROL.LOCATOR_UNSUPPORTED`，不会悄
 `CONTROL.AMBIGUOUS`（Windows 为 `DRIVER.AMBIGUOUS_MATCH`）并在 `details.candidates` 列出候选；
 `expect: optional` 时找不到返回 `found: false` 而不是错误，多个匹配仍然报错。
 
+给人用的 `aad apps/describe/overview/snapshot/find/do` 也走这个会话：每条命令一个进程、一个会话，
+`aad do` 在同一个进程里观察、定位、操作，接受与 `aad find` 相同的定位参数，不跨进程传引用。
+
 CLI 的持久协议入口在三平台均可用：
 
 ```powershell
@@ -135,11 +138,13 @@ CDP 仅接受 loopback 调试地址，显式 `--browser-port` 才启用；不会
 
 `osdk run control-test` 跑纯逻辑、真实子进程 stdio、三平台原生适配 mock 和 MCP 回归。
 Linux CI 另外运行带沙箱的空白 Chromium fixture，检查 DOM/可信键盘的实际结果及导航/frame/节点过期；
-隔离 Qt/AT-SPI fixture 通过真实 CLI 子进程检查 fill/invoke 后的界面状态。所有 GUI fixture 串行执行。
+隔离 Qt/AT-SPI fixture 通过真实 CLI 子进程（`aad control serve`，以及 `aad apps`、`aad do`、`aad find`）检查 fill/invoke 后的界面状态。
+Windows 上 `tests/windows/verify_*_effect.py` 用自建的隔离探针窗口，经 `aad do` 检查右键、中键、双击、两个方向的滚轮、悬停、拖拽、
+按键输入和保存的工作流，由 Raw Input 日志独立确认。所有 GUI fixture 串行执行。
 CI 和 release 工作流使用官方 one-sdk Action 最新正式版本，不依赖 pending one-sdk PR。
 
 [待验证] 本云容器不能启动本机 Chromium 沙箱，浏览器实际效果由 GitHub Linux CI 验证。
-[待验证] 统一会话里 Windows 的 scroll、hover、drag 和带选项的 click 只经过 mock 路由测试，复用的是旧工具已实测过的 driver 动作；经会话派发的真机效果需要在 Windows 桌面上串行验证。
+[待验证] Linux 上新的 CLI 段只在 CI 的 Xvfb 环境里跑，本机没有跑过。
 Windows/macOS 的新适配路由在 CI 以 mock 编译/测试；Windows 的输入桌面、macOS TCC 和跨机器 SSH
 未在真实设备验证。Wayland 原生输入、完整 OOPIF、原生浏览器指针、通用跨平台 key、GUI 迁移、结果缓存、
 自动重放与统一 Android wire adapter 均不在本次范围。录制/回放及事件观察保持已有实现，不提升其可靠性声明。
