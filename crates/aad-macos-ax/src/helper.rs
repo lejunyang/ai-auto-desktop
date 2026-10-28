@@ -309,7 +309,10 @@ impl SwiftHelperBackend {
         args: Value,
         deadline: Instant,
     ) -> Result<Value, AutomationError> {
-        let track = matches!(operation, "type_text" | "pointer_click");
+        let track = matches!(
+            operation,
+            "type_text" | "pointer_click" | "pointer_gesture" | "drag" | "key_chord"
+        );
         let result = self.rpc(operation, args, deadline, track)?;
         let expected = if track { "submitted" } else { "accepted" };
         if result.get(expected) != Some(&Value::Bool(true))
@@ -458,6 +461,72 @@ impl AxBackend for SwiftHelperBackend {
         self.write(
             "type_text",
             json!({"native_token": token, "text": text}),
+            deadline,
+        )
+    }
+    fn start_recording(
+        &self,
+        process_id: u32,
+        deadline: Instant,
+    ) -> Result<Value, AutomationError> {
+        let started = self.rpc(
+            "record_start",
+            json!({"process_id": process_id}),
+            deadline,
+            false,
+        )?;
+        if !started["recording_id"].is_string() {
+            return Err(protocol_error("record_start returned no recording id"));
+        }
+        Ok(started)
+    }
+    fn collect_recording(&self, id: &str, deadline: Instant) -> Result<Value, AutomationError> {
+        let batch = self.rpc(
+            "record_collect",
+            json!({"recording_id": id}),
+            deadline,
+            false,
+        )?;
+        if !batch["events"].is_array() {
+            return Err(protocol_error("record_collect returned no events"));
+        }
+        Ok(batch)
+    }
+    fn stop_recording(&self, id: &str, deadline: Instant) -> Result<(), AutomationError> {
+        self.rpc("record_stop", json!({"recording_id": id}), deadline, false)?;
+        Ok(())
+    }
+    fn pointer_gesture(
+        &self,
+        token: &str,
+        gesture: &Value,
+        deadline: Instant,
+    ) -> Result<Value, AutomationError> {
+        let mut args = gesture.clone();
+        args["native_token"] = json!(token);
+        self.write("pointer_gesture", args, deadline)
+    }
+    fn drag(
+        &self,
+        token: &str,
+        to_token: &str,
+        request: &Value,
+        deadline: Instant,
+    ) -> Result<Value, AutomationError> {
+        let mut args = request.clone();
+        args["native_token"] = json!(token);
+        args["to_token"] = json!(to_token);
+        self.write("drag", args, deadline)
+    }
+    fn key_chord(
+        &self,
+        token: &str,
+        keys: &[String],
+        deadline: Instant,
+    ) -> Result<Value, AutomationError> {
+        self.write(
+            "key_chord",
+            json!({"native_token": token, "keys": keys}),
             deadline,
         )
     }

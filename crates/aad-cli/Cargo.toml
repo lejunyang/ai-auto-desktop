@@ -29,6 +29,18 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
 ctrlc = { version = "3.5", features = ["termination"] }
+uuid = { workspace = true }
+sha1 = "0.10"
+base64 = "0.22"
+
+[target.'cfg(windows)'.dependencies]
+image = { workspace = true }
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+] }
 
 # Inherit the workspace's deliberate lint allowances (see the root Cargo.toml).
 [lints]

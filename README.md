@@ -10,13 +10,17 @@ ai-auto-desktop 让人和 AI 用同一套能力观察并操作桌面：**发现�
 | **MCP** | `aad mcp`（stdio 上的 JSON-RPC） | 给 AI agent 调用 |
 | **GUI** | Tauri + Vue 桌面窗口 | 可视化查看界面、录制并编排步骤 |
 
-统一控制入口是 `aad control serve` 和 MCP 的 `control_*` 工具：Windows UIA、Linux AT-SPI、
+AI 只有一套入口：`aad control serve`（NDJSON）和 MCP 的 `control_*` 工具。Windows UIA、Linux AT-SPI、
 macOS AX 与显式启用的 Chromium CDP 共用会话、资源、观察引用和类型化动作。
-`aad mcp --connect` 可通过已有的认证 SSH 连接控制远程环境；服务端默认只读，授权由服务端启动参数决定。
+`aad mcp` 与 `aad control serve` 默认都只读，输入由启动参数 `--allow-input` 授予；
+`aad mcp --connect` 可通过已有的认证 SSH 连接控制远程环境，授权由远端服务的启动参数决定。
 详见[统一控制与远程会话](docs/control-sessions.md)。
 
-原有 `apps/describe/find/do` CLI、旧 MCP 工具和 GUI 仍主要使用 Windows UIA。
-GUI 尚未迁入新会话层；录制、回放和事件观察的限制见[控制能力审视](docs/research/control-audit-2026-10-17.md)。
+给人用的 `apps/describe/overview/snapshot/find/do` 命令也走同一个会话层，三个平台都能用。
+GUI 也走同一个会话，三个平台都能查看界面、搭建、录制和回放步骤。录制人的操作（GUI 的“录制”、`aad record`）
+在 Windows（UIA 事件）、Linux（AT-SPI 事件 + XRecord，KDE/X11）和 macOS（AXObserver + 只监听的事件 tap）上都可用，
+产出同一种平台无关的步骤；`aad watch` 仍只在 Windows 上。
+录制、回放和事件观察的限制见[控制能力审视](docs/research/control-audit-2026-10-17.md)。
 
 浏览器任务观测使用 `aad browser-record`：记录操作、关键元素变化、网络请求和截图，生成给 AI 编写 skill 的步骤说明。`aad browser-record start --browser edge --url 'https://example.com' --out ./recording` 自动启动并录制，可用 `--profile-dir` 复用工作 profile，或用 `--existing-profile [ID]` 选择日常已有 profile（只有一个时无需填 ID）。占用时默认提示，显式 `--kill-browser` 才结束占用浏览器并启动。**网络默认保留原值，`--redact-network` 才开启脱敏**。详见[浏览器任务录制](docs/browser-recording.md)。
 
@@ -24,7 +28,8 @@ GUI 尚未迁入新会话层；录制、回放和事件观察的限制见[控制
 
 这是整个项目的主轴，也是与“坐标点击”类工具的根本区别。
 
-**任何写操作都必须引用一个真实观察过的元素**，引用形如 `snapshot:revision:node`（例如 `a2466628:10:e68`）。执行前 driver 会用捕获时记录的 role / name / automation_id / class_name 与当前活动界面二次比对：
+**任何写操作都必须引用一个真实观察过的元素**。引用是 `session_id + resource_id + observation_id + node_id`，
+只在本会话、本次观察内有效；给人用的 `aad do` 在同一个进程里先观察、再定位、再操作，不跨进程传引用。执行前 driver 会用捕获时记录的 role / name / automation_id / class_name 与当前活动界面二次比对：
 
 - 界面变了 → 返回 `DRIVER.STALE_HANDLE` 并**拒绝执行**，而不是打到别的元素上；
 - 定位命中多个 → 返回 `DRIVER.AMBIGUOUS_MATCH` 并列出候选，绝不“取第一个”；
@@ -61,33 +66,47 @@ cargo build --release
 
 ```powershell
 aad probe                      # 只读检查环境是否具备自动化前置条件
-aad apps                       # 列出当前所有可见窗口
-aad describe hwnd:12454104     # 读出某个窗口的界面结构
+aad apps                       # 列出可读、可操作的窗口和应用，每个带 resource_id
+aad describe 99e160f2          # 读出界面结构；resource_id、其哈希的唯一前缀或 Windows 的 hwnd:… 都行
+aad overview 99e160f2          # 只看区域划分（Windows）；再用 describe --region 读其中一块
+aad find 99e160f2 --name "保存"  # 确认定位器恰好选中一个元素
 ```
 
-`describe` 的每个元素都带一个 `ref` 字段，直接拿它操作：
+`aad do` 接受与 `find` 相同的定位参数，在一个进程里观察、定位、操作：
 
 ```powershell
-aad find hwnd:12454104 --name "保存"      # 精确定位，返回 ref
-aad do invoke    --target abc123:4:e9      # 触发默认动作
-aad do click     --target abc123:4:e9      # 点击元素中心
-aad do set-value --target abc123:4:e9 --value "写入的内容"
-aad do type-text --target abc123:4:e9 --text "逐字输入"            # 默认 Unicode
+aad do invoke    99e160f2 --name "保存"            # 触发默认动作
+aad do click     99e160f2 --name "保存"            # 点击元素中心
+aad do click     99e160f2 --name "文件" --button right
+aad do fill      99e160f2 --role Edit --value "写入的内容"
+aad do type-text 99e160f2 --role Edit --text "逐字输入"            # 默认 Unicode
 # Raw Input 应用使用 keys；字符必须能由目标键盘布局表达，IME 开启时会明确拒绝
-aad do type-text --target abc123:4:e9 --text "aA1!" --mode keys
-aad do key-chord --target abc123:4:e9 --keys ctrl,a
-# 右键/双击/滚轮/悬停：位置只能是元素内的 0..1 比例，不接受屏幕坐标
-aad do gesture --target abc123:4:e9 --button right
-# 拖拽的起点与终点都必须是已观察并二次校验过的元素
-aad do drag --target abc123:4:e9 --to def456:5:e12
-aad do focus     --target abc123:4:e9
+aad do type-text 99e160f2 --role Edit --text "aA1!" --mode keys
+aad do key       99e160f2 --role Edit --keys ctrl,a
+# 滚轮/悬停/元素内位置：位置只能是元素内的 0..1 比例，不接受屏幕坐标
+aad do scroll    99e160f2 --role List --direction down --notches 3
+aad do hover     99e160f2 --name "帮助" --ms 400
+# 拖拽的起点与终点都必须是同一次观察里的元素
+aad do drag      99e160f2 --name "a.txt" --to-name "回收站"
+aad do focus     99e160f2 --role Edit
 ```
 
-引用可跨进程使用：一个进程 `find` 得到的 `ref`，另一个进程可以直接 `do`。快照默认落在
-`%TEMP%/ai-auto-desktop/snapshots`，可用 `AAD_SNAPSHOT_DIR` 覆盖。
+定位参数：`--role`、`--name` 在所有平台精确匹配；`--automation-id`、`--contains`、`--protected`、
+`--nth`、`--near`（配 `--side`、`--within`）、`--in`（配 `--in-role`）和 `--locator <JSON>` 由 Windows driver 求值，
+其他平台会明确拒绝。匹配多个时报错并列出候选，不会“取第一个”；`find --optional` 用来问“它还在吗”。
+Linux（KDE/X11）上 key、scroll、hover、drag 和带选项的 click 经 XTest helper 执行；macOS 上经签名的 AX helper 用 CGEvent 执行，要求目标应用在前台（macOS 部分尚未在真机验证）。
 
-> PowerShell 会吞掉命令行参数里的内层引号，因此 `--target` 优先使用紧凑引用
-> `snapshot:revision:node`；它也接受等价的 JSON 对象形式。
+## 录制操作
+
+```powershell
+aad record 99e160f2 --seconds 20 --save 报销填写   # 在这段时间里操作那个窗口
+aad run <输出里的 workflow_path> --permission desktop.input --permission desktop.observe
+```
+
+记录点击（含右键、双击）、滚轮、带 Ctrl/Alt/Cmd 的组合键和 Enter/Tab/Esc/F 键、文本修改和勾选。
+连续输入合并成一次“填写”，点进输入框或点勾选框的那一下并入它引起的修改；普通打字记成最终文本，
+密码框的内容不保存，改成运行时输入。无法识别元素的动作不会被猜成步骤，而是列在 `skipped` 里。
+macOS 记点击和按键需要“输入监控”权限；没有时只记录文本和勾选的变化。
 
 ## 运行工作流
 
@@ -244,17 +263,52 @@ aad resume job-1 workflow.yaml --store runs.sqlite3
 ## 给 AI 使用（MCP）
 
 ```powershell
-aad mcp
+aad mcp                  # 只读：能看，不能动
+aad mcp --allow-input    # 由启动它的人授予输入
 ```
 
-在 stdio 上说 JSON-RPC 2.0，protocolVersion `2024-11-05`。提供 17 个工具，分两类：
+在 stdio 上说 JSON-RPC 2.0，protocolVersion `2024-11-05`。工具分两类：
 
-**看与做**（临场操作）：`list_apps`、`overview_window`、`describe_window`、`find_element`、`focus`、`invoke`、
-`set_value`、`type_text`、`key_chord`、`pointer_click`、`pointer_gesture`、`drag`、`probe_environment`。
+**看与做**：`control_capabilities`、`control_targets`、`control_observe`、`control_find`、`control_act`、
+`control_capture`、`control_cancel`、`control_close`，另有不需要桌面的 `probe_environment`。
+
+- `control_targets` 列出窗口、应用和浏览器页面；`control_observe` 默认返回有上限的 outline（可操作或有名字的元素，
+  按 `limit` 与 `max_characters` 截断，`stopped_by` 说明是哪个上限）。窗口很大时先用 `view.mode=overview`
+  看区域划分，再用 `view.region` 读其中一块。区域只在 Windows 上计算，其他平台用 outline。
+- `control_find` 只返回唯一一个节点；匹配多个时报错并列出候选。定位器支持 role、name、node_id，
+  Windows 上还支持 automation_id、class_name、value、states、`match: contains`、`within`、`near`、`nth`；
+  其他平台遇到这些字段会明确拒绝，不会忽略。`expect: optional` 用来问"这个东西没了吗"。
+- `control_act` 的动作：focus、invoke、click（可选 button、count、元素内 fraction）、fill、type_text（unicode/keys）、
+  key、scroll、hover、drag（终点必须是同一次观察里的另一个节点）、select（列表框选项）、check（复选框、开关、单选），
+  以及浏览器页面的 navigate（只限 http/https）、back、forward、reload。位置只能是元素内 0..1 的比例。
+  以观察结果里每个节点的 `capabilities` 为准。浏览器里普通 click 是 DOM 激活；带位置、按键或双击时改发可信的指针事件，
+  落点被别的元素盖住时拒绝（`CONTROL.OCCLUDED`），不会点到盖在上面的东西。
+- `control_capture` 给一个观察到的元素截 PNG（目前限浏览器页面，密码框拒绝），同时返回 `digest`：
+  隔一会儿再截一次比对 digest，就知道显示的内容变没变（例如登录二维码刷新了），不用每次看图。
+
+**浏览器**（需要 `--allow-input`，`browser_profiles` 只读）：`browser_open` 启动一个浏览器并把会话接到它上面，
+之后 `control_targets` 就能列出它的页面。用户目录三选一：不给（临时目录，关掉即删）、`profile_dir`（工作目录，
+登录一次之后一直保留）、`copy_profile`（复制已有 profile 的登录文件，要启动服务时加 `--allow-profile-copy`；
+`browser_profiles` 列出可选的 profile）。占用中的浏览器只有传 `close_running` 才会被关掉。
+`browser_record_start` / `browser_record_stop` 记录一个页面：页面上的动作和引起的变化、网络请求与响应正文
+（默认保留原值，`redact_network` 才抹掉敏感字段）、WebSocket 消息和关键时刻的截图，停止时给出写入的目录和文件。
+`browser_open` 带 `record` 时在打开网址之前就开始记录。这些是过程数据，据此写技能、筛接口由 Agent 自己做。
+
+一个例子：打开浏览器到登录页 → `control_capture` 二维码发给人扫 → 隔几秒比对 digest，变了就重发 →
+登录后在页面上操作 → `browser_record_stop` → 读 `evidence/network.jsonl` 找到返回订单数据的接口。
+`tests/browser/verify_mcp_browser_session.py` 用本机的假站点在真实 Chrome 里走完这一遍。
+
+命令行同样能操作浏览器：设置 `AAD_CDP_PORT=<端口>` 后，`aad apps`、`aad describe`、`aad do`、`aad capture`
+都会把这个调试端口上的浏览器页面算进来，例如 `aad browser-record start --browser chrome` 启动时打印的端口。
+`aad capture <页面> --role img --name 登录二维码 --out code.png` 把元素截图写到文件。
+- 失败以结构化错误返回，并附 `hint` 说明怎样恢复（例如界面变了要重新 observe，匹配多个要用 `within` 收窄）。
 
 **保存与运行流程**（重复劳动）：`save_workflow`、`list_workflows`、`describe_workflow`、`run_workflow`。
-`save_workflow` 可保留 layout-aware 文本、组合键、指针手势和双端点拖拽参数；每次回放都重新 snapshot 并从描述性 locator 定位。
-录一次、存进 store，之后 AI 按名字跑，比每次重新拼一遍点击序列可靠得多。
+`save_workflow` 收的是和 `aad record`、GUI 相同的平台无关步骤（`control-steps/1`）：每步写应用（provider、进程名、
+标题里不变的部分或网址前缀）、`locator`（照抄 outline 里每个元素带的 `locator`）和 `control_act` 用过的动作（去掉 target，
+drag 的终点写在 `to`），也可以是等元素出现或消失的 `check`。Windows、Linux、macOS 和浏览器页面都能存、都能回放；
+不收 `node_id` 这类只在一次会话里有效的引用。密码等用 `input` 声明，文字不落盘，运行时传入。
+同名还会存一份录制文档，GUI 能打开继续编辑。录一次、存进 store，之后 AI 按名字跑，比每次重新拼一遍操作序列可靠得多。
 
 ```
 list_workflows              → {"count":1,"workflows":[{"name":"greeter"}],"directory":"..."}
@@ -271,12 +325,33 @@ run_workflow(greeter, ...)  → {"status":"succeeded","outputs":{...}}
 - `describe_workflow` 会回报 `runnable`，所以这条限制**从只读调用就能发现**，不必靠一次
   被拒的运行去踩。
 - `list_workflows` / `describe_workflow` **不需要桌面可用**：它们读的是文件夹。桌面坏了
-  也能回答「有哪些流程」，而真正要动桌面的工具才报 `DRIVER.UNAVAILABLE`。
+  也能回答「有哪些流程」；`control_targets` 则在 `unavailable` 里说明桌面为什么不可用。
+- **`run_workflow` 与 `control_act` 走同一个会话**：同一个原生 driver、同一把串行锁、同一份输入租约，
+  只读服务器上它和 `save_workflow` 一样被拒（`POLICY.DENIED`）。限定了 `--provider` 或 `--resource` 时
+  不提供工作流工具：工作流按窗口名自己找窗口，这类授权管不住它。
 - store 与 GUI 共用同一个目录（`AAD_RECORDINGS_DIR` 可覆盖），GUI 里录完存下的东西
   AI 立刻能看到。
 
 该模式下 stdout 由协议独占，任何诊断信息都走 stderr，客户端解析不会错位。失败会以结构化
 错误返回，并附带可执行的恢复建议（例如界面已变化时提示"重新读取窗口后重试"）。
+
+## 请人协助（aad assist）
+
+Agent 遇到自己做不了的事（扫码之外的登录、验证码、需要人拿主意的地方）时，把屏幕交给人：
+
+```powershell
+aad assist --browser-port 9222            # 分享一个浏览器页面（CDP screencast）
+aad assist --desktop                      # 分享整个桌面（目前只有 Windows）
+aad assist --desktop --view-only          # 只给看，不接收鼠标键盘
+```
+
+启动后在 stdout 打印一行 JSON：`url`（自带的查看页）、`websocket`、`token`。只监听本机回环地址，
+每个连接都要带 token；omem 这类宿主把 WebSocket 代理到自己的网页上渲染。消息都是 JSON 文本帧：
+服务端发 `ready` 和 `frame`（JPEG，base64，带宽高），查看端发 `mouse`（move/down/up/wheel，位置是画面内 0..1 的比例）、
+`key`（Enter、方向键、F1–F12、修饰键等非文字按键）和 `text`（输入的文字）。浏览器画面的输入用 CDP `Input.*`
+发给页面，桌面用 `SendInput`。这是给人用的通道，按屏幕位置操作，所以不通过 MCP 提供给 Agent。
+`tests/assist/verify_assist.py` 用真实 Chrome（加 `--desktop` 再测 Windows 桌面）检查画面送达、点击和输入生效、
+错误 token 被拒绝。Linux 和 macOS 的整桌面分享还没有做。
 
 ## 桌面窗口（GUI）
 
@@ -287,11 +362,20 @@ npm run tauri dev      # 开发模式
 npm run tauri build    # 打包
 ```
 
-三栏布局：左侧是正在运行的程序，中间是所选窗口的界面结构（可过滤、显示每个元素支持的
-动作），右侧是录制出的步骤序列，可启用/禁用、上下调序、补填文本、导出。
+三栏布局：左侧是窗口和浏览器页面（底部可填浏览器调试端口），中间是所选窗口的元素
+（可筛选；Windows 上可按区域查看），右侧是步骤。
 
-导出结果就是 `aad validate` 能直接接受的工作流描述文件——GUI 产出的和 CLI 运行的是同一
-份契约，且有测试锁定二者不会漂移。
+- **搭建步骤**：在中间点一个元素，选它支持的操作（触发、点击、填写、按键、滚动、拖到……，
+  或“等它出现 / 消失”），“添加”或“添加并执行”。三个平台都可用。
+- **录制**：点“录制”后直接操作窗口，步骤实时出现在右侧；无法回放的动作会被略过并提示。Windows、Linux（KDE/X11）、macOS 都可用。
+- **编辑与回放**：每一步可单独执行、改定位条件和应用条件（“测试定位”立即看匹配结果）、调序、删除；
+  “运行全部”经工作流引擎逐步回放，失败的步骤标红并给出恢复建议。
+- **保存**：录制文件和工作流都存进录制目录。步骤是平台无关的格式（`control-steps/1`）：
+  应用按进程/应用名、标题片段或网址前缀命名，元素用定位器，动作用会话的类型化动作，
+  不保存任何会话内引用，所以同一份录制可以在 `aad run`、MCP 的 `run_workflow` 和 GUI 里回放。
+  回放要授予工作流声明的权限：`aad run x.workflow.json --permission desktop.input --permission desktop.observe`。
+
+`npm run dev` 在普通浏览器里打开界面时没有后台，会用虚构的演示数据，便于调界面。
 
 ### 密码框：可写不可读
 

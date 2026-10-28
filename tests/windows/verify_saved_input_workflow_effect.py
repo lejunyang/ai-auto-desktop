@@ -51,7 +51,7 @@ user32.SendMessageW.restype = ctypes.c_ssize_t
 def aad(*args: str, env: dict[str, str] | None = None) -> dict:
     prefix = [str(AAD), "--compact"] if args[0] in {"apps", "find", "run", "workflows"} else [str(AAD)]
     result = subprocess.run(
-        [*prefix, *args], capture_output=True, text=True, timeout=60, env=env
+        [*prefix, *args], capture_output=True, text=True, encoding="utf-8", timeout=60, env=env
     )
     try:
         payload = json.loads(result.stdout.strip())
@@ -102,7 +102,7 @@ def find(window_id: str, *, role: str, name: str | None = None) -> dict:
     if name:
         args += ["--name", name]
     found = aad(*args)
-    if not found.get("found") or not found.get("target"):
+    if not found.get("found") or not found.get("node"):
         raise RuntimeError(f"element was not observed: {found}")
     return found
 
@@ -118,9 +118,9 @@ def durable_locator(found: dict) -> dict:
 
 def observed_window(window_id: str) -> dict:
     listing = aad("apps")
-    for window in listing.get("windows", []):
-        if window.get("window_id") == window_id:
-            return window
+    for app in listing.get("apps", []):
+        if app.get("metadata", {}).get("window_id") == window_id:
+            return app["metadata"]
     raise RuntimeError(f"observed window {window_id} disappeared")
 
 
@@ -132,7 +132,7 @@ def save_via_mcp(arguments: dict, env: dict[str, str]) -> dict:
         "params": {"name": "save_workflow", "arguments": arguments},
     }
     result = subprocess.run(
-        [str(AAD), "mcp"],
+        [str(AAD), "mcp", "--allow-input"],
         input=json.dumps(request, separators=(",", ":")) + "\n",
         capture_output=True,
         text=True,
@@ -302,8 +302,8 @@ def main() -> int:
             "executed_steps": saved.get("executed_steps"),
             "logical_actions_described": len(actions),
             "target_restarted": second_ready["window_handle"] != old_handle,
-            "old_target_not_persisted": edit_found["ref"] not in workflow_text
-            and button_found["ref"] not in workflow_text,
+            "old_target_not_persisted": first_window_id not in workflow_text
+            and "observation_id" not in workflow_text,
             "run_status": run.get("status"),
             "run_succeeded": run.get("status") == "succeeded",
             "expected_text": "aA1!",

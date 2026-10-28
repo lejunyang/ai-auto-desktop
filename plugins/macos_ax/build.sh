@@ -24,7 +24,8 @@ if ! sdk_path=$(xcrun --sdk macosx --show-sdk-path 2>/dev/null); then
     echo "缺少 macOS SDK" >&2
     exit 3
 fi
-arch=$(uname -m)
+# AAD_MACOS_ARCH builds for the other architecture, as the release does for x86_64.
+arch=${AAD_MACOS_ARCH:-$(uname -m)}
 case $arch in
     arm64|x86_64) target="$arch-apple-macos11.0" ;;
     *)

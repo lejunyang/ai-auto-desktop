@@ -1,133 +1,104 @@
 //! The desktop shell's backend.
 //!
-//! Every command here is a thin, typed wrapper over `aad-uia`. The shell holds
-//! no automation logic of its own: the same driver, the same snapshot store and
-//! the same staleness rules serve the GUI, the CLI and the MCP server, so what
-//! a user records in the GUI behaves identically when the CLI replays it.
+//! Every command goes through one control session, the same one `aad control
+//! serve`, the CLI and the MCP tools use, so the shell works wherever the
+//! session does: Windows UIA, Linux AT-SPI, macOS AX and an explicitly
+//! connected browser. The shell holds no automation logic of its own.
 //!
 //! Two invariants are load-bearing:
 //!
-//! 1. The front end may only act on an element it has observed. Commands accept
-//!    a `snapshot:revision:node` reference produced by a previous `describe`,
-//!    never coordinates, so a write cannot land on an element nobody saw.
-//! 2. Failures cross the boundary as the structured error contract rather than
-//!    as prose, so the UI can distinguish "retry is safe" from "the UI moved".
+//! 1. Steps are saved in the platform-neutral format of `aad_control::steps`:
+//!    an application named as a person would, a locator and a control action.
+//!    Nothing session-bound is stored, so a recording replays tomorrow, on
+//!    another machine, through `aad run` as well as here.
+//! 2. Failures cross the boundary as structured errors with a hint, so the UI
+//!    can tell "retry is safe" from "the interface moved".
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::sync::mpsc::{channel, Sender};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
-use aad_uia::backend::{default_snapshot_directory, DriverError, SnapshotStore};
-use aad_uia::driver::UiaDriver;
+use aad_control::recording::{self, Recording};
+use aad_control::steps::{self, App, Step};
+use aad_control::{Expect, Locator, Operation, Policy, Request, Session, View};
+use aad_core::AutomationError;
 use serde_json::{json, Map, Value};
 
 pub use aad_runtime::recordings;
 
-/// The job name that means "run a workflow" rather than any driver action.
-///
-/// Spelled with a space so it cannot collide with a real action: the driver's
-/// manifest names are all identifiers.
-const RUN_WORKFLOW: &str = "run workflow";
+const STEP_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// One driver action and the channel its answer goes back on.
-struct Job {
-    action: String,
-    params: Value,
-    reply: Sender<Result<Value, Value>>,
+type Reply = Result<Value, Value>;
+type Job = Box<dyn FnOnce(&mut Desk) + Send>;
+
+/// What the automation thread owns.
+struct Desk {
+    session: Arc<Session>,
+    browser_port: Option<u16>,
+    capture: Option<Recording>,
+    /// Numbers the ids of recorded steps, across recordings in one run.
+    recorded: usize,
 }
 
-/// A handle to the driver, which lives on its own thread.
+/// A handle to the automation thread.
 ///
-/// The thread is not an optimisation, it is a requirement, for two measured
-/// reasons.
-///
-/// UI Automation needs a multithreaded COM apartment, while the window toolkit
-/// needs a single-threaded one on the process's main thread, and an apartment
-/// cannot be changed once joined. Creating the driver on the main thread makes
-/// the window fail to open with `RPC_E_CHANGED_MODE`.
-///
-/// Second, enumerating windows reaches the application's own window, and that
-/// crosses back into the main thread's apartment. If the main thread were
-/// waiting for the driver at that moment the two would deadlock and the
-/// interface would hang with no error. Commands are therefore `async`, which
-/// keeps them off the main thread and leaves it free to pump messages.
+/// The thread is a requirement, not an optimisation. UI Automation needs a
+/// multithreaded COM apartment while the window toolkit needs a
+/// single-threaded one on the main thread, and an apartment cannot be changed
+/// once joined; the session is therefore built, and always used, on its own
+/// thread. Enumerating windows also reaches this application's own window,
+/// which crosses back into the main thread: commands are `async` so the main
+/// thread stays free to pump messages while it waits.
 struct Shell {
     // `Sender` is `Send` but not `Sync`, and Tauri shares state across threads.
     jobs: Mutex<Sender<Job>>,
 }
 
+fn open(browser_port: Option<u16>) -> Arc<Session> {
+    // A person at the window is the one asking for input.
+    Arc::new(Session::native_with_browser(
+        Policy {
+            allow_input: true,
+            ..Default::default()
+        },
+        browser_port,
+    ))
+}
+
 impl Shell {
-    fn new() -> Result<Self, DriverError> {
+    fn new() -> Self {
         let (jobs, queue) = channel::<Job>();
-        // The backend is built on the worker thread, so the apartment it joins
-        // is that thread's, never the main thread's.
-        let (ready, started) = channel::<Result<(), DriverError>>();
-
         std::thread::Builder::new()
-            .name("aad-uia".into())
+            .name("aad-session".into())
             .spawn(move || {
-                let driver = match native_backend() {
-                    Ok(backend) => {
-                        // The same on-disk store the CLI and MCP server use, so
-                        // a reference minted here stays valid for `aad do`.
-                        let store =
-                            SnapshotStore::default().persisted(default_snapshot_directory());
-                        let _ = ready.send(Ok(()));
-                        // Held behind an `Arc` so the workflow engine can be given
-                        // the same driver rather than building a second one. A
-                        // driver built anywhere else joins that thread's apartment,
-                        // and this thread's is the one known to work.
-                        Arc::new(UiaDriver::with_store(Arc::new(backend), store))
-                    }
-                    Err(error) => {
-                        let _ = ready.send(Err(error));
-                        return;
-                    }
+                let mut desk = Desk {
+                    session: open(None),
+                    browser_port: None,
+                    capture: None,
+                    recorded: 0,
                 };
-
                 // Ends when the last sender drops, i.e. when the app closes.
                 while let Ok(job) = queue.recv() {
-                    // Running a workflow is not a driver action, so it is answered
-                    // here rather than passed down. It has to happen on this thread
-                    // because the engine drives the same driver, and the apartment
-                    // it was built in is this one.
-                    let outcome = if job.action == RUN_WORKFLOW {
-                        run_here(Arc::clone(&driver), &job.params)
-                    } else {
-                        driver
-                            .call(&job.action, &job.params)
-                            .map_err(|error| error_payload(&error))
-                    };
-                    let _ = job.reply.send(outcome);
+                    job(&mut desk);
                 }
+                let _ = desk.stop_capture();
             })
-            .map_err(|error| {
-                DriverError::unavailable(format!("cannot start the automation thread: {error}"))
-            })?;
-
-        match started.recv() {
-            Ok(Ok(())) => Ok(Self {
-                jobs: Mutex::new(jobs),
-            }),
-            Ok(Err(error)) => Err(error),
-            Err(_) => Err(DriverError::unavailable(
-                "the automation thread stopped before it was ready",
-            )),
+            .expect("the automation thread can be started");
+        Self {
+            jobs: Mutex::new(jobs),
         }
     }
 
-    /// Run one driver action on the automation thread and wait for its answer.
-    fn dispatch(&self, action: &str, params: Value) -> Result<Value, Value> {
+    /// Run `work` on the automation thread and wait for its answer.
+    fn run(&self, work: impl FnOnce(&mut Desk) -> Reply + Send + 'static) -> Reply {
         let (reply, answer) = channel();
-        let job = Job {
-            action: action.to_string(),
-            params,
-            reply,
-        };
+        let job: Job = Box::new(move |desk| {
+            let _ = reply.send(work(desk));
+        });
         {
-            // The lock is released before waiting, so one slow read cannot
-            // block every other command from being queued.
+            // Released before waiting, so one slow read does not block queuing.
             let jobs = self.jobs.lock().map_err(|_| stopped())?;
             jobs.send(job).map_err(|_| stopped())?;
         }
@@ -135,349 +106,377 @@ impl Shell {
     }
 }
 
-/// The automation thread is gone, so nothing can be observed or done.
 fn stopped() -> Value {
     json!({
         "code": "GUI.BACKEND_STOPPED",
-        "message": "The automation backend stopped responding.",
+        "message": "自动化后台已停止响应。",
         "retryable": false,
         "effect": "unknown",
-        "hint": "Restart the application.",
+        "hint": "重新启动应用。",
     })
 }
 
-/// The current platform's backend, or a clear refusal.
-fn native_backend() -> Result<impl aad_uia::Backend, DriverError> {
-    #[cfg(windows)]
-    {
-        aad_uia::windows::WindowsUiaBackend::new()
-    }
-    #[cfg(not(windows))]
-    {
-        Err::<aad_uia::backend::NullBackend, _>(DriverError::unavailable(
-            "UI automation currently requires Windows",
-        ))
-    }
+/// What a person can do about a failure. Codes are stable, so the advice
+/// lives next to them rather than in each component.
+fn hint(code: &str) -> Option<&'static str> {
+    Some(match code {
+        "CONTROL.STALE_TARGET" | "DRIVER.STALE_HANDLE" | "DRIVER.STALE_SNAPSHOT" => {
+            "界面在读取之后变了。重新读取窗口再试。"
+        }
+        "CONTROL.AMBIGUOUS" | "DRIVER.AMBIGUOUS_MATCH" | "DRIVER.AMBIGUOUS" => {
+            "定位条件匹配到多个元素。用“所在容器”或“旁边的文字”收窄，最后才用“第几个”。"
+        }
+        "CONTROL.NOT_FOUND" | "DRIVER.NOT_FOUND" => "没有匹配的元素。重新读取窗口，检查定位条件。",
+        "CONTROL.ACTION_UNSUPPORTED" | "DRIVER.ACTION_UNSUPPORTED" => {
+            "这个元素不支持这个操作，换一个它列出的操作。"
+        }
+        "CONTROL.LOCATOR_UNSUPPORTED" => "这个平台只按角色和名称精确匹配，去掉其他条件。",
+        "CONTROL.VIEW_UNSUPPORTED" => "只有 Windows 会划分区域，直接看元素列表。",
+        "CONTROL.OCCLUDED" => "有别的东西盖在元素上（对话框、横幅、菜单），先处理它。",
+        "CONTROL.OBSERVATION_TRUNCATED" => "窗口元素太多，没法确认唯一。换一个更小的窗口。",
+        "DRIVER.PROTECTED_ELEMENT" => "这是受保护的输入框（如密码），值不会被读取或保存。",
+        "DRIVER.INPUT_BLOCKED" => {
+            "有程序在拦截模拟输入。关掉宏或远程控制工具，或改用这个元素的“触发”或“填写”。"
+        }
+        "STEP.APP_NOT_FOUND" => "找不到这个步骤的窗口。先打开它，或在步骤里改应用条件。",
+        "STEP.APP_AMBIGUOUS" => "有多个窗口符合步骤的应用条件。给步骤加上窗口标题。",
+        "STEP.CHECK_FAILED" => "等待的元素状态没有出现。延长等待时间，或检查定位条件。",
+        "STEP.INVALID" => "步骤本身不完整，按提示修改后再试。",
+        "RECORDING.UNSUPPORTED" => {
+            "这个窗口不能自动录制（浏览器页面用 aad browser-record），可以用“添加步骤”逐步搭建。"
+        }
+        "DRIVER.UNAVAILABLE" => {
+            "需要的系统组件不可用：Linux 要 KDE/X11 和 XTest helper，macOS 要辅助功能授权。"
+        }
+        "STORE.NAME_INVALID" => "换一个名字：不要斜杠、冒号等路径字符，也不要以点结尾。",
+        "STORE.NOT_FOUND" => "文件已经不在了，刷新列表。",
+        "STORE.PATH_REFUSED" => "只能打开录制文件夹里的文件。",
+        "STORE.FILE_INVALID" => "这不是可读的录制文件，可能被手工改坏了。",
+        "STORE.WRITE_FAILED" => "写不进录制文件夹，检查它的权限。",
+        _ => return None,
+    })
 }
 
-/// Render a driver error as the payload the front end knows how to display.
-fn error_payload(error: &DriverError) -> Value {
-    let mut payload = json!({
-        "code": error.code,
-        "message": error.message,
-        "retryable": error.retryable,
-        "effect": error.effect,
-    });
-    if !error.details.is_empty() {
-        payload["details"] = Value::Object(error.details.clone());
+fn payload(code: &str, message: &str, effect: &str, details: Option<Value>) -> Value {
+    let mut payload = json!({"code": code, "message": message, "effect": effect});
+    if let Some(details) = details.filter(|d| d.as_object().is_some_and(|d| !d.is_empty())) {
+        payload["details"] = details;
     }
-    if let Some(hint) = recovery_hint(&error.code) {
+    if let Some(hint) = hint(code) {
         payload["hint"] = json!(hint);
     }
     payload
 }
 
-/// What the user can actually do about a failure.
-///
-/// The codes are stable, so the advice belongs next to them rather than being
-/// re-invented in each surface.
-fn recovery_hint(code: &str) -> Option<&'static str> {
-    match code {
-        "DRIVER.STALE_HANDLE" => {
-            Some("The interface changed after it was read. Re-read the window, then retry.")
+fn failure(error: &AutomationError) -> Value {
+    let mut value = payload(
+        &error.code,
+        &error.message,
+        &error.effect,
+        Some(Value::Object(error.details.clone())),
+    );
+    value["retryable"] = json!(error.retryable);
+    value
+}
+
+fn store_error(error: recordings::StoreError) -> Value {
+    payload(error.code, &error.message, "not_applied", None)
+}
+
+fn invalid(message: impl AsRef<str>) -> Value {
+    payload("GUI.INVALID_REQUEST", message.as_ref(), "not_applied", None)
+}
+
+impl Desk {
+    fn call(&self, operation: Operation) -> Reply {
+        let mut request = Request::new(Some(self.session.id().to_string()), operation);
+        request.timeout_ms = aad_control::MAX_TIMEOUT_MS;
+        let response = self.session.execute(&request);
+        match (response.data, response.error) {
+            (Some(data), _) => Ok(data),
+            (None, error) => {
+                let error = error.unwrap_or_default();
+                Err(payload(
+                    error["code"].as_str().unwrap_or("CONTROL.FAILED"),
+                    error["message"].as_str().unwrap_or("操作被拒绝"),
+                    &response.effect,
+                    error.get("details").cloned(),
+                ))
+            }
         }
-        "DRIVER.WINDOW_NOT_FOUND" => {
-            Some("The window has closed. Refresh the list of running apps.")
-        }
-        "DRIVER.NOT_FOUND" => Some("Nothing matched. Re-read the window and check the filter."),
-        "DRIVER.AMBIGUOUS_MATCH" => {
-            Some("Several elements matched. Narrow the filter until one remains.")
-        }
-        "DRIVER.ACTION_UNSUPPORTED" => {
-            Some("This element does not offer that action. Use one of the actions listed on it.")
-        }
-        "DRIVER.SNAPSHOT_EXPIRED" => Some("The reading expired. Re-read the window."),
-        "DRIVER.INPUT_BLOCKED" => Some(
-            "Another program is filtering synthetic input, so the click never reached the \
-             window. Close macro or remote-control tools, or use this element's invoke or \
-             set value action instead.",
-        ),
-        "STORE.NAME_INVALID" => Some(
-            "Choose a name without slashes, colons or other path characters, and not \
-             ending in a dot.",
-        ),
-        "STORE.NOT_FOUND" => Some("The file is no longer there. Refresh the list of recordings."),
-        "STORE.PATH_REFUSED" => {
-            Some("Only files in the recordings folder can be opened. Save a copy there first.")
-        }
-        "STORE.FILE_INVALID" => {
-            Some("The file is not a readable recording. It may have been edited by hand.")
-        }
-        "STORE.WRITE_FAILED" => {
-            Some("The recording could not be written. Check permissions on the folder.")
-        }
-        _ => None,
     }
-}
 
-#[tauri::command]
-async fn list_apps(shell: tauri::State<'_, Shell>) -> Result<Value, Value> {
-    shell.dispatch("list_windows", json!({}))
-}
-
-/// Read a window's interface and return a flat, addressable outline.
-///
-/// The driver's `describe` already produces exactly this shape, so it is passed
-/// through rather than rebuilt. Rebuilding it here was wrong in two ways at
-/// once: it read a `nodes` key that `describe` does not return, so the list was
-/// always empty and nothing could ever be picked; and it dropped `locator` and
-/// `protected`. The locator is what a saved recording replays from -- a `ref`
-/// stops resolving once its snapshot is gone -- and synthesising one requires
-/// the whole node list to prove uniqueness, which only the driver has.
-#[tauri::command]
-async fn describe_window(
-    shell: tauri::State<'_, Shell>,
-    window_id: String,
-    limit: Option<usize>,
-    region: Option<String>,
-) -> Result<Value, Value> {
-    outline_of(&shell, &window_id, limit, region.as_deref())
-}
-
-/// Group a window's elements into regions, without listing them.
-///
-/// Raising `limit` does not help: measured across 23 windows here, nine stop on
-/// the character budget rather than the element count, and the worst shows 80 of
-/// 271 reachable elements -- 29% -- however large a limit is asked for. What the
-/// editor lacked was not a bigger list but a way in: naming the regions first and
-/// then drilling into one recovered 213 of those 271.
-#[tauri::command]
-async fn overview_window(
-    shell: tauri::State<'_, Shell>,
-    window_id: String,
-) -> Result<Value, Value> {
-    survey_of(&shell, &window_id)
-}
-
-/// The body of `overview_window`, callable without a Tauri runtime.
-fn survey_of(shell: &Shell, window_id: &str) -> Result<Value, Value> {
-    shell.dispatch(
-        "overview",
-        json!({
-            "window_id": window_id,
-            "max_nodes": 1000,
-            "max_depth": 32,
-        }),
-    )
-}
-
-/// The body of `describe_window`, callable without a Tauri runtime.
-///
-/// Split out so it can be tested: the command itself takes `tauri::State`,
-/// which a unit test cannot construct, and the untestable half is where the
-/// outline bug lived.
-fn outline_of(
-    shell: &Shell,
-    window_id: &str,
-    limit: Option<usize>,
-    region: Option<&str>,
-) -> Result<Value, Value> {
-    // `limit` is the driver's own outline cap, which it clamps to its supported
-    // range; `max_nodes` bounds the capture feeding it. A `region` narrows the
-    // listing to one group from `overview`, which is the only way past the
-    // character budget: the whole-window listing stops at roughly a third of what
-    // a busy window holds no matter how high the limit goes.
-    let mut params = Map::new();
-    params.insert("window_id".into(), json!(window_id));
-    params.insert("limit".into(), json!(limit.unwrap_or(120)));
-    params.insert("max_nodes".into(), json!(1000));
-    params.insert("max_depth".into(), json!(32));
-    if let Some(region) = region {
-        params.insert("region".into(), json!(region));
-    }
-    shell.dispatch("describe", Value::Object(params))
-}
-
-/// Perform one action against a previously observed element.
-#[tauri::command]
-async fn act(
-    shell: tauri::State<'_, Shell>,
-    action: String,
-    target: String,
-    argument: Option<String>,
-) -> Result<Value, Value> {
-    let mut params = Map::new();
-    params.insert("target".into(), json!(target));
-    match action.as_str() {
-        "set_value" => {
-            params.insert("value".into(), json!(argument.unwrap_or_default()));
-        }
-        "type_text" => {
-            params.insert("text".into(), json!(argument.unwrap_or_default()));
-        }
-        _ => {}
-    }
-    shell.dispatch(&action, Value::Object(params))
-}
-
-/// Begin watching a window for interactions.
-///
-/// The session lives on the automation thread, which is what makes this work at
-/// all: a capture subscription has to be created in the same COM apartment as
-/// the driver, and the worker-thread model already guarantees that. Creating one
-/// from the main thread fails with RPC_E_CHANGED_MODE.
-#[tauri::command]
-async fn start_recording(
-    shell: tauri::State<'_, Shell>,
-    window_id: String,
-) -> Result<Value, Value> {
-    shell.dispatch("watch", json!({"window_id": window_id}))
-}
-
-/// Take the steps recorded since the last call, leaving the session running.
-///
-/// Separate from `start_recording` on purpose, unlike the CLI where recording is
-/// a single command. A CLI process exits and would take the session with it; this
-/// process stays, so the front end can poll at its own pace and show steps as
-/// they arrive -- which is what reviewing and correcting a recording as it
-/// happens requires.
-#[tauri::command]
-async fn collect_recording(
-    shell: tauri::State<'_, Shell>,
-    capture_id: String,
-) -> Result<Value, Value> {
-    shell.dispatch("collect", json!({"capture_id": capture_id}))
-}
-
-/// Stop a recording session and remove its hooks.
-#[tauri::command]
-async fn stop_recording(
-    shell: tauri::State<'_, Shell>,
-    capture_id: String,
-) -> Result<Value, Value> {
-    shell.dispatch("release", json!({"capture_id": capture_id}))
-}
-
-/// Try a locator against a window right now, and report what it selects.
-///
-/// Editing a locator without this is guesswork, and the way it goes wrong is
-/// quiet: `{"role": "button", "nth": 3}` on the capture fixture selects the
-/// title bar's close button, because title-bar buttons live in the same tree and
-/// sit higher up the screen than the content. Someone who cannot see what was
-/// matched will believe they fixed the step, and find out when the replay closes
-/// the window.
-///
-/// Ambiguity is deliberately left to fail. The candidate list the driver attaches
-/// to DRIVER.AMBIGUOUS_MATCH is the very thing needed to narrow the locator
-/// further, and `expect: "any"` would return only the first match and discard it.
-///
-/// `expect: "optional"` because a locator being edited will usually match nothing
-/// at first. That is a state to display, not an error to raise -- otherwise every
-/// keystroke on the way to a working locator produces a failure banner.
-#[tauri::command]
-async fn try_locator(
-    shell: tauri::State<'_, Shell>,
-    window_id: String,
-    locator: Value,
-) -> Result<Value, Value> {
-    shell.dispatch(
-        "find",
-        json!({
-            "window_id": window_id,
-            "locator": locator,
-            "expect": "optional",
-            "max_nodes": 1000,
-            "max_depth": 32,
-        }),
-    )
-}
-
-#[tauri::command]
-async fn probe_environment() -> Value {
-    aad_probe::probe().to_json()
-}
-
-/// Save the editable recording and its compiled workflow side by side.
-///
-/// Both are written in one command so they cannot drift apart: a workflow whose
-/// recording says something else is a trap for whoever opens it next.
-#[tauri::command]
-async fn save_recording(
-    name: String,
-    document: Value,
-    workflow: Option<Value>,
-) -> Result<Value, Value> {
-    save_documents(&name, &document, workflow.as_ref())
-}
-
-/// Save the editable source, and only advertise a runnable derivative after the
-/// same compiler used by replay accepts it.
-fn save_documents(name: &str, document: &Value, workflow: Option<&Value>) -> Result<Value, Value> {
-    let recording_path = recordings::save_recording(name, document).map_err(store_error)?;
-    let Some(workflow) = workflow else {
-        let removed = recordings::remove_workflow(name).map_err(store_error)?;
-        return Ok(json!({
-            "recording_path": recording_path.to_string_lossy(),
-            "workflow_path": Value::Null,
-            "removed_stale_workflow": removed,
-        }));
-    };
-
-    if let Err(error) = aad_core::compile_descriptor(workflow.clone(), None) {
-        let removed = recordings::remove_workflow(name).map_err(store_error)?;
-        let issues: Vec<Value> = error
-            .issues
+    /// Every window and page, each with the name a saved step would use.
+    fn targets(&self) -> Reply {
+        let listed = self.call(Operation::Targets {})?;
+        let all = listed["resources"].as_array().cloned().unwrap_or_default();
+        let resources: Vec<Value> = all
             .iter()
-            .map(|issue| json!({"path": issue.path, "message": issue.message}))
+            .map(|resource| {
+                let mut resource = resource.clone();
+                resource["app"] = json!(steps::describe(&resource, &all));
+                resource["recordable"] = json!(recording::supported(&self.session, &resource));
+                resource
+            })
             .collect();
-        return Ok(json!({
-            "recording_path": recording_path.to_string_lossy(),
-            "workflow_path": Value::Null,
-            "removed_stale_workflow": removed,
-            "workflow_error": {
-                "code": error.code,
-                "message": error.message,
-                "issues": issues,
-            },
-        }));
+        Ok(json!({
+            "resources": resources,
+            "unavailable": listed["unavailable"],
+            "recording_supported": resources.iter().any(|r| r["recordable"] == true),
+            "browser_port": self.browser_port,
+        }))
     }
 
-    let workflow_path = recordings::save_workflow(name, workflow).map_err(store_error)?;
+    fn resource(&self, resource_id: &str) -> Reply {
+        let listed = self.targets()?;
+        listed["resources"]
+            .as_array()
+            .and_then(|all| all.iter().find(|r| r["resource_id"] == resource_id))
+            .cloned()
+            .ok_or_else(|| {
+                payload(
+                    "STEP.APP_NOT_FOUND",
+                    "这个窗口已经关闭了",
+                    "not_applied",
+                    None,
+                )
+            })
+    }
+
+    fn observe(&self, resource_id: &str, view: View) -> Reply {
+        let resource = self.resource(resource_id)?;
+        let mut observed = self.call(Operation::Observe {
+            resource_id: resource_id.into(),
+            max_nodes: aad_control::MAX_NODES,
+            view,
+        })?;
+        // The locator a step would save, worked out once by the backend so the
+        // front end never invents one.
+        if let Some(nodes) = observed["nodes"].as_array_mut() {
+            for node in nodes {
+                node["step_locator"] = json!(steps::locator_for(node));
+                if let Some(object) = node.as_object_mut() {
+                    object.remove("target");
+                }
+            }
+        }
+        observed["app"] = resource["app"].clone();
+        Ok(observed)
+    }
+
+    /// What a locator selects in a window right now. A locator that matches
+    /// nothing is a state to show while it is being edited, not an error.
+    fn try_locator(&self, resource_id: &str, locator: Locator) -> Reply {
+        self.resource(resource_id)?;
+        let observed = self.call(Operation::Observe {
+            resource_id: resource_id.into(),
+            max_nodes: aad_control::MAX_NODES,
+            view: View::default(),
+        })?;
+        let mut found = self.call(Operation::Find {
+            observation_id: observed["observation_id"]
+                .as_str()
+                .unwrap_or_default()
+                .into(),
+            locator: Box::new(locator),
+            expect: Expect::Optional,
+        })?;
+        if let Some(node) = found.get_mut("node").and_then(Value::as_object_mut) {
+            node.remove("target");
+        }
+        if let Some(object) = found.as_object_mut() {
+            object.remove("target");
+            object.remove("observation_id");
+        }
+        Ok(found)
+    }
+
+    fn start_capture(&mut self, resource_id: &str) -> Reply {
+        let _ = self.stop_capture();
+        let resource = self.resource(resource_id)?;
+        let app: App = serde_json::from_value(resource["app"].clone()).unwrap_or_default();
+        let started = Recording::start(&self.session, &resource, app, self.recorded + 1)
+            .map_err(|e| failure(&e))?;
+        self.capture = Some(started);
+        Ok(json!({"recording": true}))
+    }
+
+    /// The steps recorded since the last call, already in the saved format.
+    fn collect(&mut self) -> Reply {
+        let Some(capture) = self.capture.as_mut() else {
+            return Ok(json!({"steps": [], "skipped": [], "recording": false}));
+        };
+        let batch = capture.collect().map_err(|e| failure(&e))?;
+        self.recorded = capture.next_id() - 1;
+        let mut answer = batch.to_json();
+        answer["recording"] = json!(true);
+        Ok(answer)
+    }
+
+    /// Stop recording, with whatever was recorded since the last collection.
+    fn stop_capture(&mut self) -> Reply {
+        let Some(capture) = self.capture.take() else {
+            return Ok(json!({"steps": [], "skipped": [], "recording": false}));
+        };
+        self.recorded = capture.next_id() - 1;
+        let batch = capture.stop().map_err(|e| failure(&e))?;
+        let mut answer = batch.to_json();
+        answer["recording"] = json!(false);
+        Ok(answer)
+    }
+
+    fn perform(&self, step: &Step, inputs: &Map<String, Value>) -> Reply {
+        steps::perform(&self.session, step, inputs, STEP_TIMEOUT).map_err(|e| failure(&e))
+    }
+
+    /// Replay steps through the workflow engine, exactly as `aad run` would.
+    fn replay(&self, name: &str, steps: &[Step], inputs: Map<String, Value>) -> Reply {
+        let document = steps::workflow(name, steps).map_err(|e| failure(&e))?;
+        let descriptor = aad_core::compile_descriptor(document, None).map_err(|e| failure(&e))?;
+        let mut providers = aad_runtime::ProviderRegistry::new();
+        providers.insert(Arc::new(steps::StepProvider::new(self.session.clone())));
+        let result = aad_runtime::engine::run(
+            &descriptor,
+            aad_runtime::RunOptions::default()
+                .with_providers(providers)
+                .with_inputs(inputs.into_iter().collect())
+                // Pressing Run is the person's grant.
+                .with_granted_permissions(["desktop.input", "desktop.observe"]),
+        );
+        let outcomes: Vec<Value> = result
+            .events
+            .iter()
+            .filter(|event| event.event_type == "step.finished")
+            .map(|event| {
+                let error = event.payload.get("error").cloned().filter(|e| !e.is_null());
+                json!({
+                    "id": event.payload.get("id"),
+                    "status": event.payload.get("status"),
+                    "error": error.map(|e| {
+                        let code = e["code"].as_str().unwrap_or("STEP.FAILED").to_string();
+                        payload(
+                            &code,
+                            e["message"].as_str().unwrap_or_default(),
+                            e["effect"].as_str().unwrap_or("unknown"),
+                            e.get("details").cloned(),
+                        )
+                    }),
+                })
+            })
+            .collect();
+        Ok(json!({
+            "status": result.status.as_str(),
+            "steps": outcomes,
+            "error": result.error.as_ref().map(failure),
+            "duration_seconds": result.duration_seconds,
+        }))
+    }
+}
+
+fn parse_steps(value: Value) -> Result<Vec<Step>, Value> {
+    serde_json::from_value(value).map_err(|e| invalid(format!("步骤无法读取：{e}")))
+}
+
+fn save(name: &str, steps: &[Step]) -> Reply {
+    for step in steps {
+        step.validate().map_err(|e| failure(&e))?;
+    }
+    let workflow = steps::workflow(name, steps).map_err(|e| failure(&e))?;
+    let recording_path =
+        recordings::save_recording(name, &steps::recording(name, steps)).map_err(store_error)?;
+    let workflow_path = recordings::save_workflow(name, &workflow).map_err(store_error)?;
     Ok(json!({
         "recording_path": recording_path.to_string_lossy(),
         "workflow_path": workflow_path.to_string_lossy(),
     }))
 }
 
-/// Replay a workflow and report how each step went.
-///
-/// The editor exists so a recording can be corrected, and correcting one means
-/// trying it. Without this the loop breaks at the last step and the only way to
-/// find out whether a recording works is to leave the app for a terminal.
+fn open_saved(path: &str) -> Reply {
+    let document = recordings::load_recording(std::path::Path::new(path)).map_err(store_error)?;
+    let steps = steps::steps_of(&document).map_err(|e| failure(&e))?;
+    Ok(json!({"name": document["metadata"]["name"], "steps": steps}))
+}
+
 #[tauri::command]
-async fn run_workflow(
+async fn list_targets(shell: tauri::State<'_, Shell>) -> Reply {
+    shell.run(|desk| desk.targets())
+}
+
+#[tauri::command]
+async fn observe(shell: tauri::State<'_, Shell>, resource_id: String, view: Value) -> Reply {
+    let view: View = serde_json::from_value(view).map_err(|e| invalid(e.to_string()))?;
+    shell.run(move |desk| desk.observe(&resource_id, view))
+}
+
+#[tauri::command]
+async fn try_locator(shell: tauri::State<'_, Shell>, resource_id: String, locator: Value) -> Reply {
+    let locator: Locator =
+        serde_json::from_value(locator).map_err(|e| invalid(format!("定位条件无法读取：{e}")))?;
+    shell.run(move |desk| desk.try_locator(&resource_id, locator))
+}
+
+#[tauri::command]
+async fn perform_step(shell: tauri::State<'_, Shell>, step: Value, inputs: Option<Value>) -> Reply {
+    let step: Step =
+        serde_json::from_value(step).map_err(|e| invalid(format!("步骤无法读取：{e}")))?;
+    let inputs = inputs
+        .and_then(|i| i.as_object().cloned())
+        .unwrap_or_default();
+    shell.run(move |desk| desk.perform(&step, &inputs))
+}
+
+#[tauri::command]
+async fn run_steps(
     shell: tauri::State<'_, Shell>,
-    workflow: Value,
+    name: String,
+    steps: Value,
     inputs: Option<Value>,
-) -> Result<Value, Value> {
-    shell.dispatch(
-        RUN_WORKFLOW,
-        json!({
-            "workflow": workflow,
-            "inputs": inputs.unwrap_or(json!({})),
-        }),
-    )
+) -> Reply {
+    let steps = parse_steps(steps)?;
+    let inputs = inputs
+        .and_then(|i| i.as_object().cloned())
+        .unwrap_or_default();
+    shell.run(move |desk| desk.replay(&name, &steps, inputs))
 }
 
-/// Reopen a saved recording for editing.
 #[tauri::command]
-async fn load_recording(path: String) -> Result<Value, Value> {
-    recordings::load_recording(std::path::Path::new(&path)).map_err(store_error)
+async fn start_recording(shell: tauri::State<'_, Shell>, resource_id: String) -> Reply {
+    shell.run(move |desk| desk.start_capture(&resource_id))
 }
 
-/// The saved recordings available to open.
 #[tauri::command]
-async fn list_recordings() -> Result<Value, Value> {
+async fn collect_recording(shell: tauri::State<'_, Shell>) -> Reply {
+    shell.run(|desk| desk.collect())
+}
+
+#[tauri::command]
+async fn stop_recording(shell: tauri::State<'_, Shell>) -> Reply {
+    shell.run(|desk| desk.stop_capture())
+}
+
+#[tauri::command]
+async fn connect_browser(shell: tauri::State<'_, Shell>, port: Option<u16>) -> Reply {
+    shell.run(move |desk| {
+        let _ = desk.stop_capture();
+        desk.session.close();
+        desk.session = open(port);
+        desk.browser_port = port;
+        desk.targets()
+    })
+}
+
+#[tauri::command]
+async fn save_recording(name: String, steps: Value) -> Reply {
+    save(&name, &parse_steps(steps)?)
+}
+
+#[tauri::command]
+async fn open_recording(path: String) -> Reply {
+    open_saved(&path)
+}
+
+#[tauri::command]
+async fn list_recordings() -> Reply {
     let found = recordings::list_recordings().map_err(store_error)?;
     Ok(json!({
         "recordings": found,
@@ -485,134 +484,28 @@ async fn list_recordings() -> Result<Value, Value> {
     }))
 }
 
-/// Run a compiled workflow using the driver that is already open.
-///
-/// Called on the driver's own thread. The engine is synchronous and the caller is
-/// waiting on a channel, so nothing else is queued while a run is in progress --
-/// which is what we want: a run and a live capture would fight over the same UI.
-fn run_here(driver: Arc<UiaDriver>, params: &Value) -> Result<Value, Value> {
-    let document = params.get("workflow").cloned().unwrap_or(Value::Null);
-    if document.is_null() {
-        return Err(json!({
-            "code": "GUI.WORKFLOW_MISSING",
-            "message": "no workflow was supplied to run",
-            "retryable": false,
-        }));
-    }
-
-    let descriptor = aad_core::compile_descriptor(document, None).map_err(|error| {
-        // Where each problem is, not just that there is one: the editor can point
-        // at the step that needs fixing only if it is told which one.
-        let issues: Vec<Value> = error
-            .issues
-            .iter()
-            .map(|issue| json!({"path": issue.path, "message": issue.message}))
-            .collect();
-        json!({
-            "code": error.code,
-            "message": error.message,
-            "retryable": false,
-            "issues": issues,
-        })
-    })?;
-
-    let mut providers = aad_runtime::ProviderRegistry::new();
-    providers.insert(driver);
-
-    let inputs = params
-        .get("inputs")
-        .and_then(Value::as_object)
-        .map(|map| map.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
-        .unwrap_or_default();
-
-    let options = aad_runtime::RunOptions::default()
-        .with_providers(providers)
-        .with_inputs(inputs);
-
-    let result = aad_runtime::engine::run(&descriptor, options);
-
-    // Every step's outcome, not just the run's. A recording that replays five
-    // steps and clicks the wrong element reports success at the run level, and
-    // the whole point of replaying inside the editor is to catch exactly that.
-    let steps: Vec<Value> = result
-        .events
-        .iter()
-        .filter(|event| event.event_type == "step.finished")
-        .map(|event| {
-            json!({
-                "id": event.payload.get("id").cloned().unwrap_or(Value::Null),
-                "status": event.payload.get("status").cloned().unwrap_or(Value::Null),
-                "error": event.payload.get("error").cloned(),
-            })
-        })
-        .collect();
-
-    let mut answer = json!({
-        "run_id": result.run_id,
-        "workflow": result.workflow,
-        "status": result.status.as_str(),
-        "executed_steps": result.executed_steps,
-        "duration_seconds": result.duration_seconds,
-        "steps": steps,
-    });
-    if let Some(error) = &result.error {
-        // Field by field rather than wholesale: whether a failed step already
-        // changed the desktop is the one thing the editor cannot work out for
-        // itself, so `effect` has to survive the trip.
-        answer["error"] = json!({
-            "code": error.code,
-            "message": error.message,
-            "retryable": error.retryable,
-            "effect": error.effect.as_str(),
-        });
-    }
-    Ok(answer)
-}
-
-/// Render a store failure in the same shape as a driver failure.
-///
-/// The front end already knows how to display one structured error; giving it a
-/// second shape for file problems would mean a second display path that only
-/// gets exercised when something is already going wrong.
-fn store_error(error: recordings::StoreError) -> Value {
-    json!({
-        "code": error.code,
-        "message": error.message,
-        "retryable": false,
-        "hint": recovery_hint(error.code),
-    })
+#[tauri::command]
+async fn probe_environment() -> Value {
+    aad_probe::probe().to_json()
 }
 
 pub fn run() {
-    // Failing to construct the driver is fatal and must be visible: a window
-    // that silently cannot see the desktop is worse than no window.
-    let shell = match Shell::new() {
-        Ok(shell) => shell,
-        Err(error) => {
-            eprintln!(
-                "ai-auto-desktop: cannot start the UI automation backend: {}",
-                error.message
-            );
-            std::process::exit(1);
-        }
-    };
-
     tauri::Builder::default()
-        .manage(shell)
+        .manage(Shell::new())
         .invoke_handler(tauri::generate_handler![
-            list_apps,
-            describe_window,
-            overview_window,
-            act,
+            list_targets,
+            observe,
+            try_locator,
+            perform_step,
+            run_steps,
             start_recording,
             collect_recording,
             stop_recording,
-            try_locator,
-            probe_environment,
+            connect_browser,
             save_recording,
-            run_workflow,
-            load_recording,
-            list_recordings
+            open_recording,
+            list_recordings,
+            probe_environment
         ])
         .run(tauri::generate_context!())
         .expect("the desktop shell failed to start");
@@ -621,214 +514,62 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aad_control::steps::Check;
 
-    static STORE: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    #[test]
-    fn saving_an_unfinished_recording_removes_its_stale_workflow() {
-        let _guard = STORE.lock().unwrap_or_else(|error| error.into_inner());
-        let directory = std::env::temp_dir().join(format!("aad-gui-save-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&directory);
-        std::fs::create_dir_all(&directory).unwrap();
-        unsafe { std::env::set_var("AAD_RECORDINGS_DIR", &directory) };
-
-        recordings::save_workflow("draft", &json!({"kind": "Workflow"})).unwrap();
-        let result = save_documents("draft", &json!({"kind": "Recording", "steps": []}), None)
-            .expect("save source only");
-
-        assert!(result["recording_path"].as_str().is_some());
-        assert!(result["workflow_path"].is_null());
-        assert_eq!(result["removed_stale_workflow"], true);
-        assert!(!recordings::workflow_path("draft").unwrap().exists());
-        unsafe { std::env::remove_var("AAD_RECORDINGS_DIR") };
-        let _ = std::fs::remove_dir_all(directory);
+    fn step(id: &str) -> Step {
+        Step {
+            id: id.into(),
+            app: App {
+                process: Some("notepad.exe".into()),
+                ..Default::default()
+            },
+            locator: Locator {
+                role: Some("Button".into()),
+                name: Some("Save".into()),
+                ..Default::default()
+            },
+            action: Some(json!({"type": "invoke"})),
+            to: None,
+            check: None,
+            input: None,
+            note: None,
+        }
     }
 
     #[test]
-    fn a_compile_failure_removes_the_stale_workflow() {
-        let _guard = STORE.lock().unwrap_or_else(|error| error.into_inner());
-        let directory =
-            std::env::temp_dir().join(format!("aad-gui-invalid-save-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&directory);
-        std::fs::create_dir_all(&directory).unwrap();
-        unsafe { std::env::set_var("AAD_RECORDINGS_DIR", &directory) };
-        recordings::save_workflow("invalid", &json!({"kind": "Workflow"})).unwrap();
-
-        let result = save_documents(
-            "invalid",
-            &json!({"kind": "Recording", "steps": []}),
-            Some(&json!({"kind": "Workflow"})),
-        )
-        .expect("save editable source and report compiler refusal");
-
-        assert!(result["workflow_error"].is_object());
-        assert_eq!(result["removed_stale_workflow"], true);
-        assert!(!recordings::workflow_path("invalid").unwrap().exists());
-        unsafe { std::env::remove_var("AAD_RECORDINGS_DIR") };
-        let _ = std::fs::remove_dir_all(directory);
+    fn failures_carry_a_hint_a_person_can_act_on() {
+        let error = AutomationError::new("STEP.APP_AMBIGUOUS", "two windows")
+            .with_effect("not_applied")
+            .with_detail("candidates", json!([{"name": "a"}]));
+        let value = failure(&error);
+        assert_eq!(value["code"], "STEP.APP_AMBIGUOUS");
+        assert!(value["hint"].as_str().unwrap().contains("窗口标题"));
+        assert_eq!(value["details"]["candidates"][0]["name"], "a");
+        assert!(payload("SOMETHING.ELSE", "x", "unknown", None)
+            .get("hint")
+            .is_none());
     }
 
     #[test]
-    fn saving_a_runnable_recording_compiles_before_writing_the_workflow() {
-        let _guard = STORE.lock().unwrap_or_else(|error| error.into_inner());
-        let directory =
-            std::env::temp_dir().join(format!("aad-gui-valid-save-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&directory);
-        std::fs::create_dir_all(&directory).unwrap();
-        unsafe { std::env::set_var("AAD_RECORDINGS_DIR", &directory) };
-        let workflow = json!({
-            "apiVersion": "ai-auto-desktop.dev/v1alpha1",
-            "kind": "Workflow",
-            "metadata": {"name": "valid"},
-            "budgets": {"max_duration": "30s", "max_executed_steps": 10},
-            "steps": [{"id": "done", "type": "return", "value": true}]
+    fn invalid_steps_are_refused_before_anything_is_written() {
+        let mut broken = step("bad");
+        broken.action = None;
+        let refused = save("never-written", &[broken]).unwrap_err();
+        assert_eq!(refused["code"], "STEP.INVALID");
+        let mut check = step("wait");
+        check.action = None;
+        check.check = Some(Check {
+            present: true,
+            within_ms: 1000,
         });
-
-        let result = save_documents(
-            "valid",
-            &json!({"kind": "Recording", "steps": []}),
-            Some(&workflow),
-        )
-        .expect("save both");
-
-        assert!(result["workflow_path"].as_str().is_some());
-        assert!(recordings::workflow_path("valid").unwrap().exists());
-        unsafe { std::env::remove_var("AAD_RECORDINGS_DIR") };
-        let _ = std::fs::remove_dir_all(directory);
-    }
-
-    // -----------------------------------------------------------------------
-    // The outline contract
-    //
-    // `describe_window` used to rebuild the driver's outline by hand, reading a
-    // `nodes` key that `describe` does not return. The list was therefore always
-    // empty and nothing could ever be picked -- the GUI could not record a
-    // single step. Every unit test passed the whole time, because they exercise
-    // the recording model and never cross this boundary.
-    // -----------------------------------------------------------------------
-
-    /// Read a window this machine will actually let us inspect.
-    ///
-    /// Not every window can be captured: some belong to elevated processes,
-    /// some vanish between listing and capture. Looking for one that works
-    /// keeps this from being flaky.
-    fn any_outline(shell: &Shell) -> Option<Value> {
-        let listed = shell.dispatch("list_windows", json!({})).ok()?;
-        for window in listed["windows"].as_array()? {
-            let window_id = window["window_id"].as_str()?;
-            // Through the command's own logic, not straight to the driver:
-            // the driver was never the broken part, and testing it instead is
-            // how a first attempt at these tests passed against the bug.
-            if let Ok(outline) = outline_of(shell, window_id, None, None) {
-                if !outline["elements"].as_array()?.is_empty() {
-                    return Some(outline);
-                }
-            }
-        }
-        None
+        assert!(steps::workflow("ok", &[step("one"), check]).is_ok());
     }
 
     #[test]
-    fn the_outline_actually_lists_the_elements_it_found() {
-        // The regression itself: a window with a populated tree must not come
-        // back as an empty list.
-        let Ok(shell) = Shell::new() else {
-            return;
-        };
-        let Some(outline) = any_outline(&shell) else {
-            panic!("no window on this desktop could be described");
-        };
-
-        let elements = outline["elements"].as_array().expect("elements is a list");
-        assert!(!elements.is_empty(), "the outline came back empty");
-        assert_eq!(
-            outline["shown"].as_u64(),
-            Some(elements.len() as u64),
-            "the count and the list must agree"
-        );
-    }
-
-    #[test]
-    fn every_listed_element_carries_what_recording_a_step_needs() {
-        // `ref` addresses the element now; `locator` is how a saved recording
-        // finds it again in a later session. The hand-rebuilt outline dropped
-        // the locator, which would have made every saved step unreplayable --
-        // and `fromDocument` refuses to re-enable a step whose locator is null,
-        // so the recording would have reopened silently doing nothing.
-        let Ok(shell) = Shell::new() else {
-            return;
-        };
-        let Some(outline) = any_outline(&shell) else {
-            panic!("no window on this desktop could be described");
-        };
-
-        for element in outline["elements"].as_array().unwrap() {
-            assert!(element["node_id"].is_string(), "{element}");
-            assert!(element["ref"].is_string(), "{element}");
-            assert!(element["summary"].is_string(), "{element}");
-            assert!(element["actions"].is_array(), "{element}");
-            // Present but nullable: null is a real answer meaning "cannot be
-            // told apart from its siblings". Absent is not -- that is the bug.
-            assert!(
-                element.get("locator").is_some(),
-                "an element with no locator field cannot be saved: {element}"
-            );
-            // Says a field is masked by design rather than unread.
-            assert!(element.get("protected").is_some(), "{element}");
-        }
-    }
-
-    #[test]
-    fn a_listed_reference_is_one_the_driver_will_accept() {
-        // A reference the UI shows but the driver rejects would fail only at
-        // the moment someone tries to act, which is the worst time to find out.
-        let Ok(shell) = Shell::new() else {
-            return;
-        };
-        let Some(outline) = any_outline(&shell) else {
-            panic!("no window on this desktop could be described");
-        };
-        let first = &outline["elements"].as_array().unwrap()[0];
-        let reference = first["ref"].as_str().expect("a reference");
-
-        let parts: Vec<&str> = reference.split(':').collect();
-        assert_eq!(
-            parts.len(),
-            3,
-            "expected snapshot:revision:node, got {reference}"
-        );
-        assert_eq!(parts[0], outline["snapshot_id"].as_str().unwrap());
-        assert_eq!(parts[1], outline["revision"].as_u64().unwrap().to_string());
-        assert_eq!(parts[2], first["node_id"].as_str().unwrap());
-    }
-
-    #[test]
-    fn every_stale_or_missing_failure_tells_the_user_what_to_do() {
-        // These are the failures a recording session actually hits, so leaving
-        // any of them without advice would strand the user.
-        for code in [
-            "DRIVER.STALE_HANDLE",
-            "DRIVER.WINDOW_NOT_FOUND",
-            "DRIVER.NOT_FOUND",
-            "DRIVER.AMBIGUOUS_MATCH",
-            "DRIVER.ACTION_UNSUPPORTED",
-            "DRIVER.SNAPSHOT_EXPIRED",
-            "DRIVER.INPUT_BLOCKED",
-        ] {
-            assert!(recovery_hint(code).is_some(), "{code} has no hint");
-        }
-        assert!(recovery_hint("DRIVER.SOMETHING_NEW").is_none());
-    }
-
-    #[test]
-    fn an_error_payload_carries_the_contract_fields() {
-        let error =
-            DriverError::new("DRIVER.STALE_HANDLE", "the UI moved on").with_effect("not_applied");
-        let payload = error_payload(&error);
-
-        assert_eq!(payload["code"], "DRIVER.STALE_HANDLE");
-        assert_eq!(payload["effect"], "not_applied");
-        assert_eq!(payload["retryable"], false);
-        assert!(payload["hint"].is_string());
+    fn steps_from_the_front_end_parse_or_fail_as_usage_errors() {
+        let parsed = parse_steps(json!([step("one")])).unwrap();
+        assert_eq!(parsed[0].id, "one");
+        let refused = parse_steps(json!([{"id": "x"}])).unwrap_err();
+        assert_eq!(refused["code"], "GUI.INVALID_REQUEST");
     }
 }

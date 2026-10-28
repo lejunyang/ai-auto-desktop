@@ -278,7 +278,7 @@ impl UiaDriver {
             Some(value) => Some(value as usize),
             None => Some(OUTLINE_BUDGET),
         };
-        let snapshot = self.capture(args)?;
+        let snapshot = self.quoted_or_fresh(args)?;
         let answer = snapshot.outline_within(limit, region, budget);
         // A region name that matches nothing is worth reporting: an agent that
         // drilled into a misremembered name would otherwise read an empty list
@@ -299,7 +299,18 @@ impl UiaDriver {
 
     /// The window's regions and their sizes, without listing their contents.
     fn overview(&self, args: &Value) -> Result<Value> {
-        Ok(self.capture(args)?.overview())
+        Ok(self.quoted_or_fresh(args)?.overview())
+    }
+
+    /// The snapshot a caller quotes, or a fresh capture when none is quoted.
+    /// Reusing it lets a session shape the very tree whose nodes it authorises.
+    fn quoted_or_fresh(&self, args: &Value) -> Result<Snapshot> {
+        match args.get("snapshot_id").and_then(Value::as_str) {
+            Some(snapshot_id) => self.snapshots.get(snapshot_id).ok_or_else(|| {
+                DriverError::stale(format!("snapshot {snapshot_id:?} is unknown or expired"))
+            }),
+            None => self.capture(args),
+        }
     }
 
     fn find(&self, args: &Value) -> Result<Value> {
@@ -310,12 +321,7 @@ impl UiaDriver {
 
         // Reuse an existing snapshot when one is quoted, so `find` can run
         // against exactly the tree the agent already reasoned about.
-        let snapshot = match args.get("snapshot_id").and_then(Value::as_str) {
-            Some(snapshot_id) => self.snapshots.get(snapshot_id).ok_or_else(|| {
-                DriverError::stale(format!("snapshot {snapshot_id:?} is unknown or expired"))
-            })?,
-            None => self.capture(args)?,
-        };
+        let snapshot = self.quoted_or_fresh(args)?;
 
         // `resolve`, not `matches`: an ordinal or a proximity constraint is a
         // property of the element's place among the others, so it can only be
@@ -1757,6 +1763,31 @@ mod tests {
 
         assert_eq!(found["target"]["snapshot_id"], snapshot_id);
         assert_eq!(found["target"]["revision"], snapshot["revision"]);
+    }
+
+    #[test]
+    fn describe_and_overview_can_shape_an_existing_snapshot() {
+        let (driver, _) = driver(vec![node("n1", "Button", "Save", &["invoke"])]);
+        let snapshot = driver
+            .call("snapshot", &json!({"window_id": "w1"}))
+            .unwrap();
+        let snapshot_id = snapshot["snapshot_id"].as_str().unwrap();
+
+        let outline = driver
+            .call("describe", &json!({"snapshot_id": snapshot_id}))
+            .unwrap();
+        // The same snapshot, not a fresh capture with a newer revision.
+        assert_eq!(outline["snapshot_id"], snapshot_id);
+        assert_eq!(outline["revision"], snapshot["revision"]);
+        let overview = driver
+            .call("overview", &json!({"snapshot_id": snapshot_id}))
+            .unwrap();
+        assert!(overview["regions"].is_array());
+
+        let stale = driver
+            .call("describe", &json!({"snapshot_id": "gone"}))
+            .unwrap_err();
+        assert_eq!(stale.code, "DRIVER.STALE_HANDLE");
     }
 
     #[test]

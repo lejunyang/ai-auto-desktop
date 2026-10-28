@@ -10,6 +10,7 @@ description = "Session-scoped desktop and browser control with authenticated std
 [dependencies]
 aad-core.workspace = true
 aad-runtime.workspace = true
+aad-plugin.workspace = true
 aad-uia.workspace = true
 aad-atspi.workspace = true
 aad-macos-ax.workspace = true
@@ -22,7 +23,6 @@ fs2 = "0.4"
 libc.workspace = true
 
 [dev-dependencies]
-aad-plugin.workspace = true
 
 [lints]
 workspace = true

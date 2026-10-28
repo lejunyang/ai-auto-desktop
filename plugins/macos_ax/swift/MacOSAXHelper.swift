@@ -13,6 +13,9 @@ private let maximumTypeTextUTF16Units = maximumTypeTextScalars * 2
 private let maximumUnicodeUnitsPerEvent = 20
 private let maximumDepth = 128
 private let maximumNodes = 5_000
+/// Operations whose failures report how far keyboard or pointer dispatch got.
+private let keyboardOperations: Set<String> = ["type_text", "key_chord"]
+private let pointerOperations: Set<String> = ["pointer_click", "pointer_gesture", "drag"]
 
 private struct HelperFailure: Error {
     let code: String
@@ -105,6 +108,14 @@ private struct Arguments {
         return value
     }
 
+    func fraction(_ name: String) throws -> Double {
+        guard let number = values[name] as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID(),
+              number.doubleValue.isFinite, (0.0...1.0).contains(number.doubleValue) else {
+            throw HelperFailure("DRIVER.INVALID_REQUEST", "helper args.\(name) must be a fraction in 0..1")
+        }
+        return number.doubleValue
+    }
+
     func object(_ name: String) throws -> [String: Any] {
         guard let value = values[name] as? [String: Any] else {
             throw HelperFailure("DRIVER.INVALID_REQUEST", "helper args.\(name) must be an object")
@@ -160,8 +171,242 @@ private final class TokenStore {
     }
 }
 
+// MARK: Watching a person work
+
+/// Records what a person does in one application as raw events in the shape
+/// `aad_control::recording` turns into steps. Read-only: the event tap only
+/// listens, and nothing is posted.
+private final class Recorder {
+    let pid: pid_t
+    let describe: (AXUIElement) -> [String: Any]
+    private let lock = NSLock()
+    private var events: [[String: Any]] = []
+    private var dropped = 0
+    private var focused: [String: Any]?
+    private var observer: AXObserver?
+    private(set) var tap: CFMachPort?
+    private var runLoop: CFRunLoop?
+
+    init(pid: pid_t, describe: @escaping (AXUIElement) -> [String: Any]) {
+        self.pid = pid
+        self.describe = describe
+    }
+
+    private func now() -> UInt64 { UInt64(ProcessInfo.processInfo.systemUptime * 1000) }
+
+    private func push(_ event: [String: Any]) {
+        lock.lock()
+        defer { lock.unlock() }
+        if events.count >= 2_000 {
+            events.removeFirst()
+            dropped += 1
+        }
+        events.append(event)
+    }
+
+    func drain() -> [String: Any] {
+        lock.lock()
+        defer { lock.unlock() }
+        let taken = events
+        let lost = dropped
+        events = []
+        dropped = 0
+        return ["events": taken, "dropped": lost]
+    }
+
+    /// Install the observer and the tap on a thread of their own and run it.
+    func start() throws {
+        var created: AXObserver?
+        let error = AXObserverCreate(pid, recorderAXCallback, &created)
+        guard error == .success, let created else {
+            throw HelperFailure("DRIVER.ACTION_FAILED", "cannot observe the application",
+                                data: ["ax_error": Int(error.rawValue)])
+        }
+        observer = created
+        let application = AXUIElementCreateApplication(pid)
+        let context = Unmanaged.passUnretained(self).toOpaque()
+        for notification in [kAXValueChangedNotification, kAXFocusedUIElementChangedNotification] {
+            AXObserverAddNotification(created, application, notification as CFString, context)
+        }
+        let mask = (1 << CGEventType.leftMouseDown.rawValue)
+            | (1 << CGEventType.rightMouseDown.rawValue)
+            | (1 << CGEventType.otherMouseDown.rawValue)
+            | (1 << CGEventType.scrollWheel.rawValue)
+            | (1 << CGEventType.keyDown.rawValue)
+        // Without Input Monitoring permission there is no tap; value changes
+        // are still recorded, and the caller is told pointer input is not.
+        tap = CGEvent.tapCreate(
+            tap: .cgSessionEventTap, place: .headInsertEventTap, options: .listenOnly,
+            eventsOfInterest: CGEventMask(mask), callback: recorderTapCallback, userInfo: context
+        )
+        let ready = DispatchSemaphore(value: 0)
+        let thread = Thread { [self] in
+            let loop = CFRunLoopGetCurrent()
+            runLoop = loop
+            CFRunLoopAddSource(loop, AXObserverGetRunLoopSource(created), .defaultMode)
+            if let tap {
+                let source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
+                CFRunLoopAddSource(loop, source, .defaultMode)
+                CGEvent.tapEnable(tap: tap, enable: true)
+            }
+            ready.signal()
+            CFRunLoopRun()
+        }
+        thread.name = "aad-recorder"
+        thread.start()
+        ready.wait()
+    }
+
+    func stop() {
+        if let tap { CGEvent.tapEnable(tap: tap, enable: false) }
+        if let runLoop { CFRunLoopStop(runLoop) }
+        tap = nil
+        observer = nil
+    }
+
+    func notified(element: AXUIElement, notification: String) {
+        let node = describe(element)
+        if notification == kAXFocusedUIElementChangedNotification as String {
+            lock.lock()
+            focused = node
+            lock.unlock()
+            return
+        }
+        let role = node["role"] as? String ?? ""
+        if role == "AXCheckBox" || role == "AXRadioButton" || role == "AXSwitch" {
+            let value = (copyValue(element) as? NSNumber)?.intValue
+            push(["kind": "toggle", "checked": value == 1, "at_ms": now(), "node": node])
+        } else if ["AXTextField", "AXTextArea", "AXComboBox", "AXSearchField", "AXSecureTextField"].contains(role) {
+            push(["kind": "text", "at_ms": now(), "node": node])
+        }
+    }
+
+    private func copyValue(_ element: AXUIElement) -> CFTypeRef? {
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, kAXValueAttribute as CFString, &value) == .success
+        else { return nil }
+        return value
+    }
+
+    /// The element under a point, if it belongs to the watched application.
+    private func element(at point: CGPoint) -> AXUIElement? {
+        var hit: AXUIElement?
+        let error = AXUIElementCopyElementAtPosition(
+            AXUIElementCreateSystemWide(), Float(point.x), Float(point.y), &hit
+        )
+        guard error == .success, let hit else { return nil }
+        var owner = pid_t(0)
+        guard AXUIElementGetPid(hit, &owner) == .success, owner == pid else { return nil }
+        return hit
+    }
+
+    /// Names the control protocol uses for keys whose code is not a character.
+    private static let namedKeys: [Int64: String] = [
+        36: "enter", 48: "tab", 49: "space", 51: "backspace", 53: "escape", 117: "delete",
+        115: "home", 119: "end", 116: "pageup", 121: "pagedown", 123: "left", 124: "right",
+        125: "down", 126: "up", 122: "f1", 120: "f2", 99: "f3", 118: "f4", 96: "f5", 97: "f6",
+        98: "f7", 100: "f8", 101: "f9", 109: "f10", 103: "f11", 111: "f12",
+    ]
+    private static let characterKeys: [Int64: String] = [
+        0: "a", 1: "s", 2: "d", 3: "f", 4: "h", 5: "g", 6: "z", 7: "x", 8: "c", 9: "v",
+        11: "b", 12: "q", 13: "w", 14: "e", 15: "r", 16: "y", 17: "t", 18: "1", 19: "2",
+        20: "3", 21: "4", 22: "6", 23: "5", 25: "9", 26: "7", 28: "8", 29: "0", 31: "o",
+        32: "u", 34: "i", 35: "p", 37: "l", 38: "j", 40: "k", 45: "n", 46: "m",
+    ]
+
+    func tapped(type: CGEventType, event: CGEvent) {
+        if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
+            if let tap { CGEvent.tapEnable(tap: tap, enable: true) }
+            return
+        }
+        switch type {
+        case .leftMouseDown, .rightMouseDown, .otherMouseDown:
+            guard let element = element(at: event.location) else { return }
+            let button = type == .leftMouseDown ? "left" : type == .rightMouseDown ? "right" : "middle"
+            push(["kind": "click", "button": button, "at_ms": now(), "node": describe(element)])
+        case .scrollWheel:
+            guard let element = element(at: event.location) else { return }
+            let vertical = event.getIntegerValueField(.scrollWheelEventDeltaAxis1)
+            let horizontal = event.getIntegerValueField(.scrollWheelEventDeltaAxis2)
+            let direction = vertical > 0 ? "up" : vertical < 0 ? "down"
+                : horizontal > 0 ? "left" : horizontal < 0 ? "right" : ""
+            guard !direction.isEmpty else { return }
+            push(["kind": "wheel", "direction": direction, "at_ms": now(), "node": describe(element)])
+        case .keyDown:
+            guard NSWorkspace.shared.frontmostApplication?.processIdentifier == pid else { return }
+            let code = event.getIntegerValueField(.keyboardEventKeycode)
+            let flags = event.flags
+            let named = Self.namedKeys[code]
+            guard let key = named ?? Self.characterKeys[code] else { return }
+            let held = flags.contains(.maskCommand) || flags.contains(.maskControl)
+                || flags.contains(.maskAlternate)
+            // Plain typing is recorded as the text it made.
+            guard held || ["enter", "tab", "escape"].contains(key) || key.hasPrefix("f") && key.count > 1
+            else { return }
+            var keys: [String] = []
+            if flags.contains(.maskCommand) { keys.append("cmd") }
+            if flags.contains(.maskControl) { keys.append("ctrl") }
+            if flags.contains(.maskShift) { keys.append("shift") }
+            if flags.contains(.maskAlternate) { keys.append("alt") }
+            keys.append(key)
+            lock.lock()
+            let node = focused
+            lock.unlock()
+            push(["kind": "key", "keys": keys, "at_ms": now(), "node": node ?? NSNull()])
+        default:
+            return
+        }
+    }
+}
+
+private func recorderAXCallback(
+    _ observer: AXObserver, _ element: AXUIElement, _ notification: CFString,
+    _ refcon: UnsafeMutableRawPointer?
+) {
+    guard let refcon else { return }
+    Unmanaged<Recorder>.fromOpaque(refcon).takeUnretainedValue()
+        .notified(element: element, notification: notification as String)
+}
+
+private func recorderTapCallback(
+    _ proxy: CGEventTapProxy, _ type: CGEventType, _ event: CGEvent,
+    _ refcon: UnsafeMutableRawPointer?
+) -> Unmanaged<CGEvent>? {
+    if let refcon {
+        Unmanaged<Recorder>.fromOpaque(refcon).takeUnretainedValue().tapped(type: type, event: event)
+    }
+    return Unmanaged.passUnretained(event)
+}
+
 private final class AXService {
     private let tokens = TokenStore()
+    private var recorders: [String: Recorder] = [:]
+
+    /// An element as recorded events describe it, matching how a snapshot
+    /// names it: the raw AX role, and the title or else the description.
+    private func recordedNode(_ element: AXUIElement) -> [String: Any] {
+        let role = stringAttribute(element, kAXRoleAttribute as CFString) ?? ""
+        let subrole = stringAttribute(element, kAXSubroleAttribute as CFString)
+        let protected = role == "AXSecureTextField" || subrole == "AXSecureTextField"
+        let name = stringAttribute(element, kAXTitleAttribute as CFString)
+            ?? stringAttribute(element, kAXDescriptionAttribute as CFString)
+        var node: [String: Any] = [
+            "role": bounded(role), "name": name.map(bounded) ?? "", "protected": protected,
+        ]
+        if !protected, let value = scalarStringAttribute(element, kAXValueAttribute as CFString) {
+            node["value"] = value
+        }
+        return node
+    }
+
+    private func recording(_ arguments: Arguments) throws -> (String, Recorder) {
+        try arguments.only(["recording_id"])
+        let id = try arguments.string("recording_id")!
+        guard let recorder = recorders[id] else {
+            throw HelperFailure("DRIVER.NOT_FOUND", "no such recording")
+        }
+        return (id, recorder)
+    }
 
     func execute(
         operation: String, args: [String: Any], deadlineMS: Double?,
@@ -193,6 +438,38 @@ private final class AXService {
                 args: Arguments(values: args), deadlineMS: deadlineMS,
                 requestID: requestID, progress: progress
             )
+        case "pointer_gesture":
+            return try pointerGesture(
+                args: Arguments(values: args), deadlineMS: deadlineMS,
+                requestID: requestID, progress: progress
+            )
+        case "drag":
+            return try drag(
+                args: Arguments(values: args), deadlineMS: deadlineMS,
+                requestID: requestID, progress: progress
+            )
+        case "key_chord":
+            return try keyChord(
+                args: Arguments(values: args), deadlineMS: deadlineMS,
+                requestID: requestID, progress: progress
+            )
+        case "record_start":
+            let arguments = Arguments(values: args)
+            try arguments.only(["process_id"])
+            try requireTrusted()
+            let pid = pid_t(try arguments.integer("process_id", minimum: 1, maximum: Int(Int32.max)))
+            let recorder = Recorder(pid: pid) { [unowned self] element in self.recordedNode(element) }
+            try recorder.start()
+            let id = UUID().uuidString
+            recorders[id] = recorder
+            return ["recording_id": id, "pointer_watch": recorder.tap != nil]
+        case "record_collect":
+            return try recording(Arguments(values: args)).1.drain()
+        case "record_stop":
+            let (id, recorder) = try recording(Arguments(values: args))
+            recorder.stop()
+            recorders.removeValue(forKey: id)
+            return ["stopped": true]
         case "set_value":
             return try setValue(args: Arguments(values: args), deadlineMS: deadlineMS)
         case "type_text":
@@ -396,8 +673,9 @@ private final class AXService {
         if focusSettable && enabled != false { actions.append("focus") }
         if let bounds = normalizedBounds, bounds["width", default: 0] > 0, bounds["height", default: 0] > 0,
            enabled != false && !protected {
-            actions.append("pointer_click")
+            actions.append(contentsOf: ["pointer_click", "pointer_gesture", "drag"])
         }
+        if focusSettable && enabled != false && !protected { actions.append("key_chord") }
         if actionNames.contains(kAXPressAction as String) && enabled != false { actions.append("invoke") }
         if valueSettable && !protected && enabled != false { actions.append("set_value") }
         if isKeyboardTextTarget(role: role) && focusSettable && !protected && enabled != false {
@@ -615,6 +893,395 @@ private final class AXService {
             "native_operation": "CGEventLeftClick",
             "submitted": true,
             "pointer_dispatch_started": progress.pointerDispatchStarted,
+            "phase": "submitted",
+        ]
+    }
+
+    // MARK: Gestures, drags and key chords
+
+    private struct PointerTarget {
+        let pid: pid_t
+        let point: CGPoint
+    }
+
+    /// A point inside an enabled, unprotected element of the frontmost
+    /// application, confirmed by AX hit testing to land on that element or
+    /// one of its descendants.
+    private func pointerTarget(
+        token: String, fx: Double, fy: Double, operation: String,
+        deadlineMS: Double?, progress: RequestProgress
+    ) throws -> PointerTarget {
+        let element = try tokens.resolve(token)
+        try configureTimeout(element, deadlineMS: deadlineMS)
+        let role = stringAttribute(element, kAXRoleAttribute as CFString)
+        let subrole = stringAttribute(element, kAXSubroleAttribute as CFString)
+        guard role != "AXSecureTextField", subrole != "AXSecureTextField" else {
+            throw HelperFailure(
+                "DRIVER.PROTECTED_ELEMENT",
+                "protected element does not permit \(operation)",
+                data: progress.pointerMetadata(phase: "target_preflight")
+            )
+        }
+        guard boolAttribute(element, kAXEnabledAttribute as CFString) != false else {
+            throw HelperFailure(
+                "DRIVER.ACTION_UNSUPPORTED",
+                "pointer target is disabled",
+                data: progress.pointerMetadata(phase: "target_preflight")
+            )
+        }
+        guard let bounds = copyBounds(element),
+              bounds["width", default: 0] > 0, bounds["height", default: 0] > 0 else {
+            throw HelperFailure(
+                "DRIVER.ACTION_UNSUPPORTED",
+                "pointer target has no positive-area bounds",
+                data: progress.pointerMetadata(phase: "bounds_preflight")
+            )
+        }
+        var targetPID = pid_t(0)
+        try requireSuccess(AXUIElementGetPid(element, &targetPID), operation: "AXUIElementGetPid")
+        guard targetPID > 0 else {
+            throw HelperFailure("DRIVER.ACTION_FAILED", "pointer target has no valid process id")
+        }
+        try requireFrontmost(targetPID, operation: operation)
+        // One point in from each edge, so the hit lands inside the element.
+        func along(_ start: Int, _ size: Int, _ fraction: Double) -> CGFloat {
+            let extent = Double(size)
+            let offset = extent < 3 ? extent / 2 : min(max(extent * fraction, 1), extent - 1)
+            return CGFloat(Double(start) + offset)
+        }
+        let point = CGPoint(
+            x: along(bounds["x", default: 0], bounds["width", default: 0], fx),
+            y: along(bounds["y", default: 0], bounds["height", default: 0], fy)
+        )
+        let application = AXUIElementCreateApplication(targetPID)
+        try configureTimeout(application, deadlineMS: deadlineMS)
+        var hitElement: AXUIElement?
+        let hitError = AXUIElementCopyElementAtPosition(
+            application, Float(point.x), Float(point.y), &hitElement
+        )
+        try requireSuccess(hitError, operation: "AXUIElementCopyElementAtPosition")
+        guard let hitElement, isSelfOrDescendant(hitElement, of: element) else {
+            throw HelperFailure(
+                "DRIVER.ACTION_FAILED",
+                "pointer hit test does not land on the target element",
+                data: progress.pointerMetadata(phase: "hit_test_verification")
+            )
+        }
+        return PointerTarget(pid: targetPID, point: point)
+    }
+
+    private func isSelfOrDescendant(_ candidate: AXUIElement, of ancestor: AXUIElement) -> Bool {
+        var current = candidate
+        for _ in 0..<maximumDepth {
+            if CFEqual(current, ancestor) { return true }
+            var parent: CFTypeRef?
+            let error = AXUIElementCopyAttributeValue(current, kAXParentAttribute as CFString, &parent)
+            guard error == .success, let parent, CFGetTypeID(parent) == AXUIElementGetTypeID() else {
+                return false
+            }
+            current = unsafeBitCast(parent, to: AXUIElement.self)
+        }
+        return false
+    }
+
+    private func mouseTypes(_ button: String) throws -> (
+        down: CGEventType, up: CGEventType, dragged: CGEventType, button: CGMouseButton
+    ) {
+        switch button {
+        case "left": return (.leftMouseDown, .leftMouseUp, .leftMouseDragged, .left)
+        case "right": return (.rightMouseDown, .rightMouseUp, .rightMouseDragged, .right)
+        case "middle": return (.otherMouseDown, .otherMouseUp, .otherMouseDragged, .center)
+        default:
+            throw HelperFailure(
+                "DRIVER.INVALID_REQUEST", "helper args.button must be left, right or middle"
+            )
+        }
+    }
+
+    private func mouseEvent(
+        _ type: CGEventType, at point: CGPoint, button: CGMouseButton, clicks: Int64 = 1
+    ) throws -> CGEvent {
+        guard let event = CGEvent(
+            mouseEventSource: nil, mouseType: type, mouseCursorPosition: point, mouseButton: button
+        ) else {
+            throw HelperFailure("DRIVER.ACTION_FAILED", "could not create pointer events")
+        }
+        event.setIntegerValueField(.mouseEventClickState, value: clicks)
+        return event
+    }
+
+    private func startPointerDispatch(requestID: String, progress: RequestProgress) {
+        if !progress.pointerDispatchStarted {
+            progress.markPointerDispatchStarted()
+            emitPointerProgress(id: requestID, pointerDispatchStarted: true)
+        }
+    }
+
+    /// Rest for a while, but never past the request's deadline.
+    private func dwell(milliseconds: Int, deadlineMS: Double?) {
+        var until = Date().addingTimeInterval(Double(milliseconds) / 1000)
+        if let deadlineMS {
+            until = min(until, Date(timeIntervalSince1970: deadlineMS / 1000))
+        }
+        while Date() < until { usleep(10_000) }
+    }
+
+    private func pointerGesture(
+        args: Arguments, deadlineMS: Double?, requestID: String,
+        progress: RequestProgress
+    ) throws -> [String: Any] {
+        try args.only([
+            "native_token", "mode", "button", "count", "direction", "notches", "hover_ms", "fx", "fy",
+        ])
+        try requireTrusted()
+        let mode = try args.string("mode")!
+        let target = try pointerTarget(
+            token: try args.string("native_token")!,
+            fx: try args.fraction("fx"), fy: try args.fraction("fy"),
+            operation: "pointer_gesture", deadlineMS: deadlineMS, progress: progress
+        )
+        var events = [try mouseEvent(.mouseMoved, at: target.point, button: .left)]
+        var dwellMS = 0
+        switch mode {
+        case "click":
+            try args.only(["native_token", "mode", "button", "count", "fx", "fy"])
+            let types = try mouseTypes(try args.string("button")!)
+            let count = try args.integer("count", minimum: 1, maximum: 2)
+            for click in 1...count {
+                events.append(try mouseEvent(
+                    types.down, at: target.point, button: types.button, clicks: Int64(click)
+                ))
+                events.append(try mouseEvent(
+                    types.up, at: target.point, button: types.button, clicks: Int64(click)
+                ))
+            }
+        case "wheel":
+            try args.only(["native_token", "mode", "direction", "notches", "fx", "fy"])
+            let notches = Int32(try args.integer("notches", minimum: 1, maximum: 30))
+            // Positive wheel1 scrolls up, positive wheel2 scrolls left.
+            let delta: (vertical: Int32, horizontal: Int32)
+            switch try args.string("direction")! {
+            case "up": delta = (notches, 0)
+            case "down": delta = (-notches, 0)
+            case "left": delta = (0, notches)
+            case "right": delta = (0, -notches)
+            default:
+                throw HelperFailure(
+                    "DRIVER.INVALID_REQUEST",
+                    "helper args.direction must be up, down, left or right"
+                )
+            }
+            guard let wheel = CGEvent(
+                scrollWheelEvent2Source: nil, units: .line, wheelCount: 2,
+                wheel1: delta.vertical, wheel2: delta.horizontal, wheel3: 0
+            ) else {
+                throw HelperFailure("DRIVER.ACTION_FAILED", "could not create a scroll event")
+            }
+            wheel.location = target.point
+            events.append(wheel)
+        case "hover":
+            try args.only(["native_token", "mode", "hover_ms", "fx", "fy"])
+            dwellMS = try args.integer("hover_ms", minimum: 1, maximum: 5_000)
+        default:
+            throw HelperFailure("DRIVER.INVALID_REQUEST", "helper args.mode must be click, wheel or hover")
+        }
+        try requireFrontmost(target.pid, operation: "pointer_gesture")
+        try checkDeadline(deadlineMS)
+        startPointerDispatch(requestID: requestID, progress: progress)
+        for event in events { event.postToPid(target.pid) }
+        if dwellMS > 0 { dwell(milliseconds: dwellMS, deadlineMS: deadlineMS) }
+        return [
+            "native_operation": "CGEventPointerGesture",
+            "submitted": true,
+            "pointer_dispatch_started": progress.pointerDispatchStarted,
+            "phase": "submitted",
+        ]
+    }
+
+    private func drag(
+        args: Arguments, deadlineMS: Double?, requestID: String,
+        progress: RequestProgress
+    ) throws -> [String: Any] {
+        try args.only(["native_token", "to_token", "button", "fx", "fy", "to_fx", "to_fy"])
+        try requireTrusted()
+        let types = try mouseTypes(try args.string("button")!)
+        let from = try pointerTarget(
+            token: try args.string("native_token")!,
+            fx: try args.fraction("fx"), fy: try args.fraction("fy"),
+            operation: "drag", deadlineMS: deadlineMS, progress: progress
+        )
+        let to = try pointerTarget(
+            token: try args.string("to_token")!,
+            fx: try args.fraction("to_fx"), fy: try args.fraction("to_fy"),
+            operation: "drag", deadlineMS: deadlineMS, progress: progress
+        )
+        guard from.pid == to.pid else {
+            throw HelperFailure("DRIVER.INVALID_REQUEST", "a drag must stay within one application")
+        }
+        var events = [
+            try mouseEvent(.mouseMoved, at: from.point, button: types.button),
+            try mouseEvent(types.down, at: from.point, button: types.button),
+        ]
+        // Glide in steps: many controls only begin a drag after the pointer
+        // has moved a few points with the button held.
+        let steps = 12
+        for step in 1...steps {
+            let progressAlong = CGFloat(step) / CGFloat(steps)
+            let point = CGPoint(
+                x: from.point.x + (to.point.x - from.point.x) * progressAlong,
+                y: from.point.y + (to.point.y - from.point.y) * progressAlong
+            )
+            events.append(try mouseEvent(types.dragged, at: point, button: types.button))
+        }
+        events.append(try mouseEvent(types.up, at: to.point, button: types.button))
+        try requireFrontmost(from.pid, operation: "drag")
+        try checkDeadline(deadlineMS)
+        startPointerDispatch(requestID: requestID, progress: progress)
+        for (index, event) in events.enumerated() {
+            event.postToPid(from.pid)
+            if index >= 1 { usleep(15_000) }
+        }
+        return [
+            "native_operation": "CGEventDrag",
+            "submitted": true,
+            "pointer_dispatch_started": progress.pointerDispatchStarted,
+            "phase": "submitted",
+        ]
+    }
+
+    /// US ANSI virtual key codes for the key names the control protocol uses.
+    private static let keyCodes: [String: CGKeyCode] = [
+        "a": 0, "s": 1, "d": 2, "f": 3, "h": 4, "g": 5, "z": 6, "x": 7, "c": 8, "v": 9,
+        "b": 11, "q": 12, "w": 13, "e": 14, "r": 15, "y": 16, "t": 17, "1": 18, "2": 19,
+        "3": 20, "4": 21, "6": 22, "5": 23, "9": 25, "7": 26, "8": 28, "0": 29, "o": 31,
+        "u": 32, "i": 34, "p": 35, "l": 37, "j": 38, "k": 40, "n": 45, "m": 46,
+        "enter": 36, "return": 36, "tab": 48, "space": 49, "backspace": 51, "escape": 53,
+        "esc": 53, "delete": 117, "home": 115, "end": 119, "pageup": 116, "pagedown": 121,
+        "left": 123, "right": 124, "down": 125, "up": 126,
+        "f1": 122, "f2": 120, "f3": 99, "f4": 118, "f5": 96, "f6": 97, "f7": 98, "f8": 100,
+        "f9": 101, "f10": 109, "f11": 103, "f12": 111, "f13": 105, "f14": 107, "f15": 113,
+        "f16": 106, "f17": 64, "f18": 79, "f19": 80, "f20": 90,
+    ]
+
+    /// `ctrl` is Control and `cmd` (or `meta`, `win`, `super`) is Command:
+    /// names are taken literally, never translated between platforms.
+    private static let modifierKeys: [String: (code: CGKeyCode, flag: CGEventFlags)] = [
+        "ctrl": (59, .maskControl), "control": (59, .maskControl),
+        "shift": (56, .maskShift),
+        "alt": (58, .maskAlternate), "option": (58, .maskAlternate),
+        "cmd": (55, .maskCommand), "command": (55, .maskCommand), "meta": (55, .maskCommand),
+        "win": (55, .maskCommand), "super": (55, .maskCommand),
+    ]
+
+    private func keyEvent(_ code: CGKeyCode, down: Bool, flags: CGEventFlags) throws -> CGEvent {
+        guard let event = CGEvent(keyboardEventSource: nil, virtualKey: code, keyDown: down) else {
+            throw HelperFailure("DRIVER.ACTION_FAILED", "could not create key events")
+        }
+        event.flags = flags
+        return event
+    }
+
+    private func keyChord(
+        args: Arguments, deadlineMS: Double?, requestID: String,
+        progress: RequestProgress
+    ) throws -> [String: Any] {
+        try args.only(["native_token", "keys"])
+        try requireTrusted()
+        guard let raw = args.values["keys"] as? [String], (1...6).contains(raw.count) else {
+            throw HelperFailure("DRIVER.INVALID_REQUEST", "helper args.keys must hold 1..6 names")
+        }
+        let names = raw.map { $0.lowercased() }
+        var modifiers: [(code: CGKeyCode, flag: CGEventFlags)] = []
+        for name in names.dropLast() {
+            guard let modifier = Self.modifierKeys[name] else {
+                throw HelperFailure(
+                    "DRIVER.INVALID_REQUEST", "only modifiers may precede the main key",
+                    data: ["key": name]
+                )
+            }
+            modifiers.append(modifier)
+        }
+        guard let main = Self.keyCodes[names[names.count - 1]] else {
+            throw HelperFailure(
+                "DRIVER.ACTION_UNSUPPORTED", "the main key has no macOS key code here",
+                data: ["key": names[names.count - 1]]
+            )
+        }
+        let element = try tokens.resolve(try args.string("native_token")!)
+        try configureTimeout(element, deadlineMS: deadlineMS)
+        let role = stringAttribute(element, kAXRoleAttribute as CFString)
+        let subrole = stringAttribute(element, kAXSubroleAttribute as CFString)
+        if role == "AXSecureTextField" || subrole == "AXSecureTextField" {
+            throw HelperFailure("DRIVER.PROTECTED_ELEMENT", "keyboard input target is protected")
+        }
+        guard boolAttribute(element, kAXEnabledAttribute as CFString) != false else {
+            throw HelperFailure(
+                "DRIVER.ACTION_UNSUPPORTED", "keyboard input target is disabled",
+                data: progress.keyboardMetadata(phase: "target_preflight")
+            )
+        }
+        guard !secureEventInputIsEnabled(IsSecureEventInputEnabled()) else {
+            throw HelperFailure(
+                "DRIVER.PROTECTED_ELEMENT", "macOS Secure Event Input is enabled",
+                data: progress.keyboardMetadata(phase: "secure_event_input_preflight")
+            )
+        }
+        guard isSettable(element, kAXFocusedAttribute as CFString) else {
+            throw HelperFailure(
+                "DRIVER.ACTION_UNSUPPORTED", "AXFocused is not settable",
+                data: progress.keyboardMetadata(phase: "focus_preflight")
+            )
+        }
+        var targetPID = pid_t(0)
+        try requireSuccess(AXUIElementGetPid(element, &targetPID), operation: "AXUIElementGetPid")
+        guard targetPID > 0 else {
+            throw HelperFailure("DRIVER.ACTION_FAILED", "keyboard input target has no valid process id")
+        }
+        try requireFrontmost(targetPID, operation: "key_chord")
+        try checkDeadline(deadlineMS)
+        progress.markFocusChanged()
+        emitKeyboardFocusProgress(id: requestID, focusChanged: true)
+        let focusError = AXUIElementSetAttributeValue(
+            element, kAXFocusedAttribute as CFString, kCFBooleanTrue
+        )
+        try requireSuccess(focusError, operation: "AXUIElementSetAttributeValue(AXFocused)")
+        guard boolAttribute(element, kAXFocusedAttribute as CFString) == true else {
+            throw HelperFailure(
+                "DRIVER.ACTION_FAILED", "AX target did not become focused",
+                data: progress.keyboardMetadata(phase: "focus_verification")
+            )
+        }
+        var flags = CGEventFlags()
+        var events: [CGEvent] = []
+        for modifier in modifiers {
+            flags.insert(modifier.flag)
+            events.append(try keyEvent(modifier.code, down: true, flags: flags))
+        }
+        events.append(try keyEvent(main, down: true, flags: flags))
+        events.append(try keyEvent(main, down: false, flags: flags))
+        for modifier in modifiers.reversed() {
+            flags.remove(modifier.flag)
+            events.append(try keyEvent(modifier.code, down: false, flags: flags))
+        }
+        try requireFrontmost(targetPID, operation: "key_chord")
+        guard !secureEventInputIsEnabled(IsSecureEventInputEnabled()) else {
+            throw HelperFailure(
+                "DRIVER.PROTECTED_ELEMENT",
+                "macOS Secure Event Input became enabled before keyboard dispatch",
+                data: progress.keyboardMetadata(phase: "secure_event_input_preflight")
+            )
+        }
+        try checkDeadline(deadlineMS)
+        progress.markKeyboardDispatchStarted()
+        emitKeyboardDispatchProgress(
+            id: requestID, keyboardDispatchStarted: true, focusChanged: progress.focusChanged
+        )
+        for event in events { event.postToPid(targetPID) }
+        return [
+            "native_operation": "CGEventKeyChord",
+            "submitted": true,
+            "keyboard_dispatch_started": progress.keyboardDispatchStarted,
+            "focus_changed": progress.focusChanged,
             "phase": "submitted",
         ]
     }
@@ -1104,9 +1771,10 @@ private func handleFrame(_ data: Data, service: AXService) {
             )
             emit(["id": identifier, "result": result])
         } catch let failure as HelperFailure {
-            guard operation == "type_text" || operation == "pointer_click" else { throw failure }
+            guard keyboardOperations.contains(operation) || pointerOperations.contains(operation)
+            else { throw failure }
             var data = failure.data
-            let defaults = operation == "type_text"
+            let defaults = keyboardOperations.contains(operation)
                 ? progress.keyboardMetadata(phase: data["phase"] as? String ?? "pre_dispatch")
                 : progress.pointerMetadata(phase: data["phase"] as? String ?? "pre_dispatch")
             for (key, value) in defaults where data[key] == nil { data[key] = value }
@@ -1114,14 +1782,15 @@ private func handleFrame(_ data: Data, service: AXService) {
                 failure.code, failure.message, retryable: failure.retryable, data: data
             )
         } catch {
-            guard operation == "type_text" || operation == "pointer_click" else { throw error }
+            guard keyboardOperations.contains(operation) || pointerOperations.contains(operation)
+            else { throw error }
             let phase = progress.keyboardDispatchStarted
                 ? "keyboard_dispatch"
                 : progress.pointerDispatchStarted
                 ? "pointer_dispatch"
                 : "pre_dispatch"
             var data: [String: Any] = ["exception_type": String(describing: type(of: error))]
-            if operation == "type_text" {
+            if keyboardOperations.contains(operation) {
                 data.merge(progress.keyboardMetadata(phase: phase)) { current, _ in current }
             } else {
                 data.merge(progress.pointerMetadata(phase: phase)) { current, _ in current }

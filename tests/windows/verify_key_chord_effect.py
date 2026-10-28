@@ -32,7 +32,7 @@ EM_SETSEL = 0x00B1
 
 def aad(*args: str) -> dict:
     prefix = [AAD, "--compact"] if args[0] in {"find", "do"} else [AAD]
-    result = subprocess.run([*prefix, *args], capture_output=True, text=True, timeout=30)
+    result = subprocess.run([*prefix, *args], capture_output=True, text=True, encoding="utf-8", timeout=30)
     try:
         return json.loads(result.stdout.strip())
     except json.JSONDecodeError:
@@ -46,7 +46,7 @@ def main() -> int:
     time.sleep(1.5)
     try:
         apps = aad("apps")
-        windows = apps.get("windows", []) if isinstance(apps, dict) else []
+        windows = [app.get("metadata", {}) for app in apps.get("apps", [])]
         window_id = None
         for w in windows:
             proc = str(w.get("process_name", "")).lower()
@@ -61,23 +61,22 @@ def main() -> int:
             return 1
 
         # The editable document area.
-        found = aad("find", window_id, "--role", "Edit")
-        if not found.get("target"):
-            found = aad("find", window_id, "--role", "Document")
-        target = found.get("target")
-        findings["target_found"] = bool(target)
-        if not target:
+        role = "Edit"
+        found = aad("find", window_id, "--role", role)
+        if not found.get("found"):
+            role = "Document"
+            found = aad("find", window_id, "--role", role)
+        findings["target_found"] = bool(found.get("found"))
+        if not found.get("found"):
             findings["error"] = "no edit/document element in notepad"
             findings["find"] = found
             print(json.dumps(findings, indent=2, ensure_ascii=False))
             return 1
-        ref = f"{target['snapshot_id']}:{target['revision']}:{target['node_id']}"
-
         # Put known text in, via the driver's own set_value (no synthetic input),
         # so the starting state does not depend on typing working.
         sample = "select all of this text"
-        set_result = aad("do", "set-value", "--target", ref, "--value", sample)
-        findings["set_value_applied"] = set_result.get("applied", set_result)
+        set_result = aad("do", "fill", window_id, "--role", role, "--value", sample)
+        findings["set_value_applied"] = set_result["result"]["backend_result"].get("applied", set_result)
         time.sleep(0.4)
 
         # Locate the EDIT hwnd to read its selection directly.
@@ -90,8 +89,8 @@ def main() -> int:
         time.sleep(0.2)
 
         # The real test: Ctrl+A through the whole aad stack.
-        chord = aad("do", "key-chord", "--target", ref, "--keys", "ctrl,a")
-        findings["ctrl_a_applied"] = chord.get("applied", chord)
+        chord = aad("do", "key", window_id, "--role", role, "--keys", "ctrl,a")
+        findings["ctrl_a_applied"] = chord["result"]["backend_result"].get("applied", chord)
         time.sleep(0.5)
 
         if edit_hwnd:

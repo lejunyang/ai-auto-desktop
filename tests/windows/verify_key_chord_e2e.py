@@ -31,7 +31,7 @@ VK = {"A": 65, "F5": 0x74, "HOME": 0x24, "LEFT": 0x25, "CONTROL": 0x11, "SHIFT":
 def aad(*args: str) -> dict:
     result = subprocess.run(
         [AAD, "--compact", *args] if args and args[0] in {"find", "do"} else [AAD, *args],
-        capture_output=True, text=True, timeout=30,
+        capture_output=True, text=True, encoding="utf-8", timeout=30,
     )
     text = result.stdout.strip()
     try:
@@ -69,9 +69,9 @@ def main() -> int:
         # element that key_chord can be anchored to.
         apps = aad("apps")
         window_id = None
-        for window in apps.get("windows", apps if isinstance(apps, list) else []):
-            if isinstance(window, dict) and title in str(window.get("title", "")):
-                window_id = window.get("window_id")
+        for app in apps.get("apps", []):
+            if title in str(app.get("name", "")):
+                window_id = app["resource_id"]
                 break
         findings["window_id"] = window_id
         if not window_id:
@@ -79,18 +79,16 @@ def main() -> int:
             findings["apps_raw"] = apps
             return finish(probe, findings, log_path, 1)
 
-        found = aad("find", window_id, "--role", "Edit")
-        target = found.get("target")
-        if not target:
+        role = "Edit"
+        found = aad("find", window_id, "--role", role)
+        if not found.get("found"):
             # Fall back to the window itself if the EDIT is not addressable.
-            found = aad("find", window_id, "--role", "Window")
-            target = found.get("target")
+            role = "Window"
+            found = aad("find", window_id, "--role", role)
         findings["find"] = found
-        if not target:
+        if not found.get("found"):
             findings["error"] = "no focusable element found"
             return finish(probe, findings, log_path, 1)
-
-        target_ref = f"{target['snapshot_id']}:{target['revision']}:{target['node_id']}"
 
         # Each chord: send it, then read what the probe recorded for it.
         for label, keys, expect_vk, expect_mods in [
@@ -100,7 +98,7 @@ def main() -> int:
             ("ctrl_shift_left", "ctrl,shift,left", VK["LEFT"], {"ctrl", "shift"}),
         ]:
             before = len(read_log(log_path))
-            result = aad("do", "key-chord", "--target", target_ref, "--keys", keys)
+            result = aad("do", "key", window_id, "--role", role, "--keys", keys)
             time.sleep(0.5)
             entries = read_log(log_path)[before:]
 
@@ -127,7 +125,7 @@ def main() -> int:
 
             findings["steps"].append({
                 "label": label, "keys": keys,
-                "command_applied": result.get("applied", result),
+                "command_applied": result.get("result", {}).get("backend_result", {}).get("applied", result),
                 "raw_input_saw_key": len(raw_down) > 0,
                 "window_msg_saw_key": len(win_down) > 0,
                 "modifiers_expected": sorted(expect_mods),

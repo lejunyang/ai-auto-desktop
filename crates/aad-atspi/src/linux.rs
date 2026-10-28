@@ -1,6 +1,6 @@
 use super::{
     driver_error, remaining, AtspiBackend, AutomationError, BackendNode, BackendSnapshot, Bounds,
-    Map, NativeRef, Value, MAX_FIELD_CHARS, MAX_NODES,
+    Gesture, Map, NativeRef, Value, MAX_FIELD_CHARS, MAX_NODES,
 };
 use atspi::proxy::accessible::AccessibleProxy;
 use atspi::proxy::action::ActionProxy;
@@ -14,7 +14,9 @@ use std::collections::{BTreeMap, VecDeque};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use zbus::blocking::{connection, Connection, Proxy};
 
@@ -30,6 +32,7 @@ type ApplicationEntry = (NativeRef, Map<String, Value>);
 
 pub struct LinuxBackend {
     connection: Connection,
+    recordings: Mutex<BTreeMap<String, LinuxRecorder>>,
 }
 
 impl LinuxBackend {
@@ -51,7 +54,10 @@ impl LinuxBackend {
             .map_err(|error| {
                 unavailable("AT-SPI accessibility bus is unavailable", &session, error)
             })?;
-        let backend = Self { connection };
+        let backend = Self {
+            connection,
+            recordings: Mutex::new(BTreeMap::new()),
+        };
         backend.children(&Self::root_ref(), Instant::now() + Duration::from_secs(3))?;
         Ok(backend)
     }
@@ -236,6 +242,37 @@ impl LinuxBackend {
             .unwrap_or_default()
     }
 
+    /// Focus the target, then run one XTest helper command against it.
+    fn run_input(
+        &self,
+        target: &NativeRef,
+        mut args: Vec<String>,
+        minimum_events: u64,
+        process_id: u32,
+        deadline: Instant,
+    ) -> Result<Value, AutomationError> {
+        let path = self.helper(HelperKind::Input)?;
+        let focus = self.focus(target, deadline)?;
+        std::thread::sleep(Duration::from_millis(50).min(remaining(deadline, true)?));
+        args.extend([
+            "--deadline-monotonic-ns".into(),
+            monotonic_deadline_ns(deadline)?.to_string(),
+        ]);
+        let output = run_helper(
+            &path,
+            &args,
+            None,
+            deadline,
+            XTEST_OUTPUT_LIMIT,
+            XTEST_OUTPUT_LIMIT,
+        )
+        .map_err(after_focus)?;
+        let mut input = parse_input_helper(output, "input_dispatch", minimum_events, process_id)
+            .map_err(after_focus)?;
+        input["focus"] = focus;
+        Ok(input)
+    }
+
     fn helper(&self, kind: HelperKind) -> Result<PathBuf, AutomationError> {
         let (environment, file_name, repository_name) = match kind {
             HelperKind::Input => (
@@ -398,7 +435,9 @@ impl LinuxBackend {
             && bounds.is_some_and(|bounds| bounds.width > 0 && bounds.height > 0)
             && !protected
         {
-            actions.push("pointer_click".into());
+            actions.extend(
+                ["pointer_click", "pointer_gesture", "drag", "key_chord"].map(String::from),
+            );
         }
         let gtk3 = toolkit == Some("gtk") && toolkit_version.starts_with("3.");
         if gtk3
@@ -511,6 +550,19 @@ impl LinuxBackend {
 }
 
 impl AtspiBackend for LinuxBackend {
+    fn start_recording(
+        &self,
+        application: &Map<String, Value>,
+        deadline: Instant,
+    ) -> Result<String, AutomationError> {
+        self.start_watch(application, deadline)
+    }
+    fn collect_recording(&self, id: &str) -> Result<Value, AutomationError> {
+        self.collect_watch(id)
+    }
+    fn stop_recording(&self, id: &str) -> Result<(), AutomationError> {
+        self.stop_watch(id)
+    }
     fn name(&self) -> &str {
         "rust_atspi"
     }
@@ -773,6 +825,113 @@ impl AtspiBackend for LinuxBackend {
         }
         Ok(
             json!({"native_interface": "Component.grab_focus -> XTEST", "focus": focus, "input": result, "synthetic_input": true, "button": "left", "position": "center", "click_point": {"x": point.0, "y": point.1}}),
+        )
+    }
+
+    fn pointer_gesture(
+        &self,
+        target: &NativeRef,
+        point: (i32, i32),
+        gesture: Gesture,
+        process_id: u32,
+        deadline: Instant,
+    ) -> Result<Value, AutomationError> {
+        let mut args = vec![
+            "pointer-gesture".to_string(),
+            "--expected-pid".into(),
+            process_id.to_string(),
+            "--x".into(),
+            point.0.to_string(),
+            "--y".into(),
+            point.1.to_string(),
+        ];
+        let minimum = match gesture {
+            Gesture::Click { button, count } => {
+                args.extend([
+                    "--mode".into(),
+                    "click".into(),
+                    "--button".into(),
+                    button.to_string(),
+                    "--count".into(),
+                    count.to_string(),
+                ]);
+                1 + 2 * u64::from(count)
+            }
+            Gesture::Wheel { button, notches } => {
+                args.extend([
+                    "--mode".into(),
+                    "wheel".into(),
+                    "--button".into(),
+                    button.to_string(),
+                    "--notches".into(),
+                    notches.to_string(),
+                ]);
+                1 + 2 * u64::from(notches)
+            }
+            Gesture::Hover { ms } => {
+                args.extend([
+                    "--mode".into(),
+                    "hover".into(),
+                    "--hover-ms".into(),
+                    ms.to_string(),
+                ]);
+                1
+            }
+        };
+        let input = self.run_input(target, args, minimum, process_id, deadline)?;
+        Ok(
+            json!({"native_interface": "Component.grab_focus -> XTEST", "input": input, "synthetic_input": true, "point": {"x": point.0, "y": point.1}}),
+        )
+    }
+
+    fn drag(
+        &self,
+        target: &NativeRef,
+        from: (i32, i32),
+        to: (i32, i32),
+        button: u8,
+        process_id: u32,
+        deadline: Instant,
+    ) -> Result<Value, AutomationError> {
+        let args = vec![
+            "drag".to_string(),
+            "--expected-pid".into(),
+            process_id.to_string(),
+            "--x".into(),
+            from.0.to_string(),
+            "--y".into(),
+            from.1.to_string(),
+            "--to-x".into(),
+            to.0.to_string(),
+            "--to-y".into(),
+            to.1.to_string(),
+            "--button".into(),
+            button.to_string(),
+        ];
+        let input = self.run_input(target, args, 3, process_id, deadline)?;
+        Ok(
+            json!({"native_interface": "Component.grab_focus -> XTEST", "input": input, "synthetic_input": true, "from": {"x": from.0, "y": from.1}, "to": {"x": to.0, "y": to.1}}),
+        )
+    }
+
+    fn key_chord(
+        &self,
+        target: &NativeRef,
+        keys: &[String],
+        process_id: u32,
+        deadline: Instant,
+    ) -> Result<Value, AutomationError> {
+        let args = vec![
+            "key-chord".to_string(),
+            "--expected-pid".into(),
+            process_id.to_string(),
+            "--keys".into(),
+            keys.join(","),
+        ];
+        let minimum = 2 * keys.len() as u64;
+        let input = self.run_input(target, args, minimum, process_id, deadline)?;
+        Ok(
+            json!({"native_interface": "Component.grab_focus -> XTEST", "input": input, "synthetic_input": true, "keys": keys}),
         )
     }
 
@@ -1281,4 +1440,400 @@ fn native_failure(
     .with_detail("bus_name", json!(target.bus_name))
     .with_detail("object_path", json!(target.object_path))
     .with_detail("cause", json!(error.to_string()))
+}
+
+// ---------------------------------------------------------------------------
+// Watching a person work
+//
+// Two sources feed one buffer of raw events in the shared shape that
+// `aad_control::recording` turns into steps: AT-SPI signals from the watched
+// application (text edits, checked state, focus), and the XTest helper's
+// `record-input`, which reports clicks, wheel turns and key presses landing on
+// that application's windows. Elements are described through `read_node`, so
+// a recorded locator matches what a snapshot shows.
+// ---------------------------------------------------------------------------
+
+const MAX_WATCHED: usize = 2_000;
+const WATCH_LIFETIME: Duration = Duration::from_secs(3_600);
+
+#[derive(Default)]
+struct Watched {
+    events: VecDeque<Value>,
+    dropped: u64,
+    /// The element that last took focus, for key presses.
+    focused: Option<Value>,
+}
+
+impl Watched {
+    fn push(&mut self, event: Value) {
+        if self.events.len() >= MAX_WATCHED {
+            self.events.pop_front();
+            self.dropped += 1;
+        }
+        self.events.push_back(event);
+    }
+}
+
+pub(crate) struct LinuxRecorder {
+    stop: Arc<AtomicBool>,
+    buffer: Arc<Mutex<Watched>>,
+    input: Child,
+}
+
+/// Milliseconds on the same clock as the helper's `steady_clock`.
+fn monotonic_ms() -> u64 {
+    let mut clock = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut clock) };
+    u64::try_from(clock.tv_sec).unwrap_or(0) * 1_000
+        + u64::try_from(clock.tv_nsec).unwrap_or(0) / 1_000_000
+}
+
+/// A key press worth a step: a combination with ctrl, alt or super, or a key
+/// no text change would show. Plain typing is recorded as the text it made.
+fn chord(value: &Value) -> Option<Vec<String>> {
+    let raw = value["key"].as_str()?;
+    let key = match raw {
+        "Return" | "KP_Enter" => "enter".to_string(),
+        "Tab" | "ISO_Left_Tab" => "tab".into(),
+        "Escape" => "escape".into(),
+        "BackSpace" => "backspace".into(),
+        "Delete" => "delete".into(),
+        "Prior" => "pageup".into(),
+        "Next" => "pagedown".into(),
+        "Home" | "End" | "Left" | "Right" | "Up" | "Down" | "Insert" => raw.to_lowercase(),
+        "space" => "space".into(),
+        other if other.len() == 1 => other.to_lowercase(),
+        other
+            if other.starts_with('F')
+                && other[1..]
+                    .parse::<u8>()
+                    .is_ok_and(|n| (1..=24).contains(&n)) =>
+        {
+            other.to_lowercase()
+        }
+        _ => return None,
+    };
+    let held = |name: &str| value[name] == true;
+    let named =
+        matches!(key.as_str(), "enter" | "tab" | "escape") || key.starts_with('f') && key.len() > 1;
+    if !(held("ctrl") || held("alt") || held("super") || named) {
+        return None;
+    }
+    let mut keys = Vec::new();
+    for (flag, name) in [
+        ("ctrl", "ctrl"),
+        ("shift", "shift"),
+        ("alt", "alt"),
+        ("super", "super"),
+    ] {
+        if held(flag) {
+            keys.push(name.to_string());
+        }
+    }
+    keys.push(key);
+    Some(keys)
+}
+
+impl LinuxBackend {
+    /// An element as the watched events carry it.
+    fn describe(&self, target: &NativeRef, info: &Map<String, Value>) -> Option<Value> {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let (node, _) = self.read_node(target.clone(), None, info, deadline).ok()?;
+        let protected = node.states.get("protected").copied().flatten() == Some(true);
+        Some(json!({
+            "role": node.role,
+            "name": node.name.unwrap_or_default(),
+            "protected": protected,
+            "value": if protected { Value::Null } else { json!(node.value) },
+        }))
+    }
+
+    /// The deepest element of the application under a screen point.
+    fn element_at(&self, root: &NativeRef, point: (i32, i32)) -> Option<NativeRef> {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        for window in self.children(root, deadline).ok()? {
+            let Ok(Some(mut current)) = self.accessible_at_point(&window, point, deadline) else {
+                continue;
+            };
+            for _ in 0..32 {
+                match self.accessible_at_point(&current, point, deadline) {
+                    Ok(Some(next)) if next != current => current = next,
+                    _ => break,
+                }
+            }
+            return Some(current);
+        }
+        None
+    }
+
+    fn watch_signals(
+        self,
+        root: NativeRef,
+        info: Map<String, Value>,
+        stop: Arc<AtomicBool>,
+        buffer: Arc<Mutex<Watched>>,
+    ) {
+        // Applications only emit what someone has asked the registry for.
+        if let Ok(registry) = Proxy::new(
+            &self.connection,
+            REGISTRY_NAME,
+            "/org/a11y/atspi/registry",
+            "org.a11y.atspi.Registry",
+        ) {
+            for event in [
+                "object:text-changed",
+                "object:state-changed:checked",
+                "object:state-changed:focused",
+            ] {
+                if registry
+                    .call_method("RegisterEvent", &(event, Vec::<String>::new(), ""))
+                    .is_err()
+                {
+                    let _ = registry.call_method("RegisterEvent", &(event,));
+                }
+            }
+        }
+        let rule = zbus::MatchRule::builder()
+            .msg_type(zbus::message::Type::Signal)
+            .sender(root.bus_name.as_str())
+            .and_then(|builder| builder.interface("org.a11y.atspi.Event.Object"))
+            .map(|builder| builder.build());
+        let Ok(rule) = rule else { return };
+        let Ok(messages) =
+            zbus::blocking::MessageIterator::for_match_rule(rule, &self.connection, Some(256))
+        else {
+            return;
+        };
+        for message in messages {
+            if stop.load(Ordering::SeqCst) {
+                break;
+            }
+            let Ok(message) = message else { continue };
+            let header = message.header();
+            let (Some(member), Some(path)) = (header.member(), header.path()) else {
+                continue;
+            };
+            let member = member.to_string();
+            let target = NativeRef {
+                bus_name: root.bus_name.clone(),
+                object_path: path.to_string(),
+            };
+            let body = message.body();
+            let (kind, detail) = match body.deserialize::<(
+                String,
+                i32,
+                i32,
+                zbus::zvariant::OwnedValue,
+                std::collections::HashMap<String, zbus::zvariant::OwnedValue>,
+            )>() {
+                Ok(fields) => (fields.0, fields.1),
+                Err(_) => {
+                    match body.deserialize::<(String, i32, i32, zbus::zvariant::OwnedValue)>() {
+                        Ok(fields) => (fields.0, fields.1),
+                        Err(_) => continue,
+                    }
+                }
+            };
+            let at_ms = monotonic_ms();
+            match (member.as_str(), kind.as_str()) {
+                ("TextChanged", _) => {
+                    if let Some(node) = self.describe(&target, &info) {
+                        buffer
+                            .lock()
+                            .unwrap()
+                            .push(json!({"kind": "text", "at_ms": at_ms, "node": node}));
+                    }
+                }
+                ("StateChanged", "checked") => {
+                    if let Some(node) = self.describe(&target, &info) {
+                        buffer.lock().unwrap().push(
+                            json!({"kind": "toggle", "checked": detail == 1, "at_ms": at_ms, "node": node}),
+                        );
+                    }
+                }
+                ("StateChanged", "focused") if detail == 1 => {
+                    let node = self.describe(&target, &info);
+                    buffer.lock().unwrap().focused = node;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn watch_input(
+        self,
+        root: NativeRef,
+        info: Map<String, Value>,
+        output: std::process::ChildStdout,
+        buffer: Arc<Mutex<Watched>>,
+    ) {
+        use std::io::BufRead;
+        for line in std::io::BufReader::new(output).lines() {
+            let Ok(line) = line else { break };
+            let Ok(value) = serde_json::from_str::<Value>(&line) else {
+                continue;
+            };
+            let at_ms = value["at_ms"].as_u64().unwrap_or_else(monotonic_ms);
+            match value["event"].as_str() {
+                Some("button") => {
+                    let point = (
+                        value["x"].as_i64().unwrap_or(0) as i32,
+                        value["y"].as_i64().unwrap_or(0) as i32,
+                    );
+                    let node = self
+                        .element_at(&root, point)
+                        .and_then(|target| self.describe(&target, &info))
+                        .unwrap_or(Value::Null);
+                    let event = match value["button"].as_u64() {
+                        Some(1) => json!({"kind": "click", "button": "left"}),
+                        Some(2) => json!({"kind": "click", "button": "middle"}),
+                        Some(3) => json!({"kind": "click", "button": "right"}),
+                        Some(4) => json!({"kind": "wheel", "direction": "up"}),
+                        Some(5) => json!({"kind": "wheel", "direction": "down"}),
+                        Some(6) => json!({"kind": "wheel", "direction": "left"}),
+                        Some(7) => json!({"kind": "wheel", "direction": "right"}),
+                        _ => continue,
+                    };
+                    let mut event = event;
+                    event["at_ms"] = json!(at_ms);
+                    event["node"] = node;
+                    buffer.lock().unwrap().push(event);
+                }
+                Some("key") => {
+                    if let Some(keys) = chord(&value) {
+                        let mut buffer = buffer.lock().unwrap();
+                        let node = buffer.focused.clone().unwrap_or(Value::Null);
+                        buffer.push(
+                            json!({"kind": "key", "keys": keys, "at_ms": at_ms, "node": node}),
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn start_watch(
+        &self,
+        application: &Map<String, Value>,
+        deadline: Instant,
+    ) -> Result<String, AutomationError> {
+        let (root, info) = self.resolve_application(application, deadline)?;
+        let process_id = info
+            .get("process_id")
+            .and_then(Value::as_u64)
+            .or_else(|| self.process_id(&root.bus_name).map(u64::from))
+            .ok_or_else(|| {
+                driver_error(
+                    "DRIVER.ACTION_UNSUPPORTED",
+                    "the application has no process id",
+                )
+            })?;
+        let helper = self.helper(HelperKind::Input)?;
+        let mut command = Command::new(&helper);
+        helper_environment(&mut command);
+        command
+            .args([
+                "record-input".to_string(),
+                "--expected-pid".into(),
+                process_id.to_string(),
+                "--deadline-monotonic-ns".into(),
+                monotonic_deadline_ns(Instant::now() + WATCH_LIFETIME)?.to_string(),
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        let mut input = command.spawn().map_err(|error| {
+            driver_error(
+                "DRIVER.UNAVAILABLE",
+                format!("cannot start the input watcher: {error}"),
+            )
+        })?;
+        let output = input.stdout.take().expect("stdout is piped");
+        let stop = Arc::new(AtomicBool::new(false));
+        let buffer = Arc::new(Mutex::new(Watched::default()));
+        // Each source gets its own connection, so a slow element read in one
+        // never holds up the other or the provider's own requests.
+        let signals = LinuxBackend::new()?;
+        let pointer = LinuxBackend::new()?;
+        {
+            let (root, info, stop, buffer) =
+                (root.clone(), info.clone(), stop.clone(), buffer.clone());
+            std::thread::spawn(move || signals.watch_signals(root, info, stop, buffer));
+        }
+        {
+            let buffer = buffer.clone();
+            std::thread::spawn(move || pointer.watch_input(root, info, output, buffer));
+        }
+        let id = uuid::Uuid::new_v4().simple().to_string();
+        self.recordings.lock().unwrap().insert(
+            id.clone(),
+            LinuxRecorder {
+                stop,
+                buffer,
+                input,
+            },
+        );
+        Ok(id)
+    }
+
+    fn collect_watch(&self, id: &str) -> Result<Value, AutomationError> {
+        let recordings = self.recordings.lock().unwrap();
+        let recorder = recordings
+            .get(id)
+            .ok_or_else(|| driver_error("DRIVER.NOT_FOUND", "no such recording"))?;
+        let mut buffer = recorder.buffer.lock().unwrap();
+        let mut events: Vec<Value> = buffer.events.drain(..).collect();
+        events.sort_by_key(|event| event["at_ms"].as_u64().unwrap_or(0));
+        let dropped = std::mem::take(&mut buffer.dropped);
+        Ok(json!({"events": events, "dropped": dropped}))
+    }
+
+    fn stop_watch(&self, id: &str) -> Result<(), AutomationError> {
+        let Some(mut recorder) = self.recordings.lock().unwrap().remove(id) else {
+            return Err(driver_error("DRIVER.NOT_FOUND", "no such recording"));
+        };
+        recorder.stop.store(true, Ordering::SeqCst);
+        // Closing stdin tells the helper to stop; it checks every 100 ms.
+        drop(recorder.input.stdin.take());
+        let until = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < until {
+            if matches!(recorder.input.try_wait(), Ok(Some(_))) {
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let _ = recorder.input.kill();
+        let _ = recorder.input.wait();
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod watching {
+    use super::*;
+
+    #[test]
+    fn only_chords_and_named_keys_become_steps() {
+        let key = |name: &str, ctrl: bool| json!({"key": name, "ctrl": ctrl, "shift": false, "alt": false, "super": false});
+        assert_eq!(
+            chord(&key("s", true)),
+            Some(vec!["ctrl".to_string(), "s".to_string()])
+        );
+        assert_eq!(
+            chord(&key("Return", false)),
+            Some(vec!["enter".to_string()])
+        );
+        assert_eq!(chord(&key("F5", false)), Some(vec!["f5".to_string()]));
+        assert_eq!(
+            chord(&key("a", false)),
+            None,
+            "plain typing is recorded as text"
+        );
+        assert_eq!(chord(&key("Left", false)), None);
+        assert_eq!(chord(&key("dead_acute", true)), None);
+    }
 }

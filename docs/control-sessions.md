@@ -8,31 +8,73 @@
 
 | provider | 类型化动作 | 实际语义 / 限制 |
 | --- | --- | --- |
-| `desktop.windows_uia` | focus, invoke, click, fill, type_text, key | UIA + 原生输入；节点必须暴露对应能力 |
-| `desktop.linux_atspi` | focus, invoke, click, fill, type_text | AT-SPI；指针/输入依赖已有 X11 helper；没有统一 key 适配 |
-| `desktop.macos_ax` | focus, invoke, click, fill, type_text | AX helper；需要同一登录用户的辅助功能权限；没有统一 key 适配 |
-| `browser.cdp` | focus, click, fill, key | click 为 `HTMLElement.click()` 的 DOM 激活；fill 为 DOM 值及 input/change 事件；key 为主 frame 的 CDP Input |
+| `desktop.windows_uia` | focus, invoke, click, fill, type_text, key, scroll, hover, drag | UIA + 原生输入；click 带 button/count/fraction 时走原生手势；节点必须暴露对应能力 |
+| `desktop.linux_atspi` | focus, invoke, click, fill, type_text, key, scroll, hover, drag | AT-SPI；指针/键盘经 X11 XTest helper，只支持 KDE/X11 会话；派发前核对焦点、PID 与落点，drag 起止两点都核对 |
+| `desktop.macos_ax` | focus, invoke, click, fill, type_text, key, scroll, hover, drag | AX helper；需要同一登录用户的辅助功能权限；指针动作要求目标应用在前台并经 AX 命中检查，事件只投递给目标进程；key 名称按字面（`ctrl` 是 Control，`cmd` 是 Command） |
+| `browser.cdp` | focus, click, fill, key, scroll, hover, select, check, navigate, back, forward, reload | 普通 click 为 `HTMLElement.click()` 的 DOM 激活；带 button/count/fraction 的 click、scroll、hover 为主 frame 的可信 CDP Input，落点先在页面里命中检查；fill/select 为 DOM 值及 input/change 事件；check 已是目标状态时不点击；key 为主 frame 的 CDP Input；navigate/back/forward/reload 在 body 节点上，只限主 frame；没有 drag |
 
 以 `capabilities` 和观察节点的 `capabilities` 为准。可列出 provider 不表示当前 OS 已授予
 桌面权限。启动失败或不可用原因在 `unavailable` 中返回。浏览器 key 只支持列出的导航/编辑键
-和有限编辑组合，普通文本使用 fill。子 frame 不宣传 key；OOPIF 等不支持路径明确报错。
-DOM click/fill 的事件 `isTrusted=false`，并不等价于原生指针或真实逐键输入。
+和有限编辑组合，普通文本使用 fill。子 frame 不宣传 key、scroll、hover 和页面动作；OOPIF 等不支持路径明确报错。
+DOM click/fill 的事件 `isTrusted=false`，并不等价于原生指针或真实逐键输入；需要 `isTrusted=true` 的页面，
+给 click 一个 `fraction`（例如 0.5/0.5）走可信指针。可信指针先把元素滚进视口，再用 `elementFromPoint`
+确认落点命中该元素，盖着别的元素时返回 `CONTROL.OCCLUDED` 且不发送任何输入。`navigate` 只接受 http/https，
+不能打开 `file:`、`javascript:` 等地址；新开标签页尚未支持。
+
+动作参数：`click` 可带 `button`（left/right/middle）、`count`（1/2）、`fraction`；`type_text` 可带
+`mode`（unicode/keys）；`scroll` 要 `direction`，可带 `notches`（1..30）、`fraction`；`hover` 可带
+`ms`（1..5000，默认 500）、`fraction`；`drag` 要 `to`（同一次观察里另一个节点的 target），可带
+`button`、`fraction`、`to_fraction`；`select` 要 `option`（选项文字或值，观察节点的 `options` 列出文字）；
+`check` 要 `checked`；`navigate` 要 `url`。`fraction` 是元素框内 0..1 的比例，不是屏幕坐标。
+
+## 观察视图与定位器
+
+`observe` 总是保留完整捕获（`max_nodes` 上限 2000），`view` 只决定返回什么，不影响哪些节点可以 find/act：
+
+| `view.mode` | 返回 | 适用 |
+| --- | --- | --- |
+| `nodes`（协议默认） | 全部节点 | 需要原始树的程序 |
+| `outline`（MCP 默认） | 可操作或有名字、不在屏幕外的节点，按 `limit`（默认 80，≤500）与 `max_characters`（默认 20000）截断；回报 `matched`、`shown`、`stopped_by` | AI 阅读 |
+| `overview` | 区域及其大小，不列内容 | 大窗口先看结构；只有 Windows 计算区域，其他平台返回 `CONTROL.VIEW_UNSUPPORTED` |
+
+`view.region` 只用于 outline，取 overview 报出的区域名，与定位器 `within` 用的名字一致。
+Windows 的 outline 和 overview 直接复用本次观察的 driver 快照，不会另拍一张。
+
+`find` 的定位器：`role`、`name`、`node_id` 在所有 provider 上精确匹配；`value`、`automation_id`、
+`class_name`、`framework_id`、`states`、`match`（exact/contains）、`within`、`near`、`nth` 由 Windows
+driver 求值，其他 provider 返回 `CONTROL.LOCATOR_UNSUPPORTED`，不会悄悄忽略。匹配多个时返回
+`CONTROL.AMBIGUOUS`（Windows 为 `DRIVER.AMBIGUOUS_MATCH`）并在 `details.candidates` 列出候选；
+`expect: optional` 时找不到返回 `found: false` 而不是错误，多个匹配仍然报错。
+
+给人用的 `aad apps/describe/overview/snapshot/find/do` 也走这个会话：每条命令一个进程、一个会话，
+`aad do` 在同一个进程里观察、定位、操作，接受与 `aad find` 相同的定位参数，不跨进程传引用。
 
 CLI 的持久协议入口在三平台均可用：
 
 ```powershell
 aad control serve                       # 一个只读会话，stdin/stdout NDJSON
 aad control serve --allow-input          # 由可信操作者明确授予输入
-aad mcp --read-only                      # 本机 MCP，只读
-aad mcp --provider desktop.linux_atspi    # 限定 provider，并只暴露统一工具
+aad mcp                                  # 本机 MCP，默认只读
+aad mcp --allow-input                    # 本机 MCP，授予输入与工作流写入/运行
+aad mcp --provider desktop.linux_atspi    # 限定 provider，不提供工作流工具
 aad mcp --browser-port 9222              # 显式连接本机已有的隔离 CDP 实例
+aad mcp --allow-input --allow-profile-copy  # browser_open 可以复制已有 profile 的登录
 ```
 
+会话总带一个浏览器 provider，没连接时没有页面；`Session::attach_browser(port)` 之后换成那个浏览器
+（旧的浏览器观察作废）。MCP 的 `browser_open` 用 `aad_cdp::launch` 启动浏览器后就这样接上，
+`browser_record_*` 复用 `aad_cdp::recording` 写到存储目录的 `browser/<时间>-<id>/`。
+`Capture { target }` 是只读操作：浏览器把元素滚进视口后用 `Page.captureScreenshot` 按元素框裁剪
+（最大 4096×8192，超出时 `clipped: true`），会话加上 PNG 的 sha256 作为 `digest`。只支持主框架；
+其他 provider 返回 `CONTROL.ACTION_UNSUPPORTED`。
+
 MCP 工具为 `control_capabilities`, `control_targets`, `control_observe`, `control_find`,
-`control_act`, `control_cancel`, `control_close`。每次调用可带 `request_id` 与 `timeout_ms`。
-`control_cancel` 的被取消请求字段名为 `target_request_id`；MCP cancellation notification 也能取消
-仍在执行的统一操作。无参数 `aad mcp` 为兼容本机使用仍允许输入，远程服务 `control serve` 默认只读。
-原有 Windows CLI/MCP 工具继续保留；远程 MCP 或指定 provider/resource 时只暴露统一工具，避免绕过授权。
+`control_act`, `control_cancel`, `control_close`，本机未限定授权时另有 `probe_environment` 与四个工作流工具。
+每次调用可带 `request_id` 与 `timeout_ms`。`control_cancel` 的被取消请求字段名为 `target_request_id`；
+MCP cancellation notification 也能取消仍在执行的统一操作。错误响应带 `hint`，说明可行的恢复方式。
+原先按动作拆开的 Windows MCP 工具（`list_apps`、`describe_window`、`find_element`、`invoke` 等）已移除，
+能力并入上述工具；`run_workflow` 与 `control_act` 共用会话的 driver、串行锁和输入租约。
+远程 MCP 或指定 provider/resource 时只暴露统一工具，避免绕过授权。
 
 ## 引用、期限与结果
 
@@ -41,7 +83,7 @@ MCP 工具为 `control_capabilities`, `control_targets`, `control_observe`, `con
 ```json
 {"request_id":"c1","operation":{"method":"capabilities"}}
 {"request_id":"t1","session_id":"<returned-session-id>","operation":{"method":"targets"}}
-{"request_id":"o1","session_id":"<returned-session-id>","operation":{"method":"observe","resource_id":"<returned-resource-id>","max_nodes":1000}}
+{"request_id":"o1","session_id":"<returned-session-id>","operation":{"method":"observe","resource_id":"<returned-resource-id>","max_nodes":1000,"view":{"mode":"outline"}}}
 {"request_id":"f1","session_id":"<returned-session-id>","operation":{"method":"find","observation_id":"<returned-observation-id>","locator":{"name":"Save","role":"button"}}}
 {"request_id":"a1","session_id":"<returned-session-id>","timeout_ms":3000,"operation":{"method":"act","target":{"session_id":"<returned-session-id>","resource_id":"<returned-resource-id>","observation_id":"<returned-observation-id>","node_id":"<returned-node-id>"},"action":{"type":"click"}}}
 ```
@@ -104,14 +146,60 @@ CDP 仅接受 loopback 调试地址，显式 `--browser-port` 才启用；不会
 独占 device lease，视觉观察按其当前规则撤销，WebView 不等于这里的通用 CDP DOM。
 上层可统一编排生命周期和不确定结果处理，不能假定两个 provider 的全部动作、观察租期或引用格式可直接互换。
 
+## 保存的步骤
+
+`aad_control::steps` 定义平台无关的步骤：`app`（provider、进程或应用名、标题片段、网址前缀，
+必须恰好匹配一个目标）、`locator`、`action`（不含会话引用；drag 的终点写在 `to`）或 `check`
+（`present` 与 `within_ms`），以及可选的 `input`（fill/type_text 的文字运行时传入，敏感值不落盘）。
+回放时列目标 → 选出唯一的应用 → observe → find → act，每次都重新定位。
+
+录制文档是 `kind: Recording`、`format: control-steps/1`；编译出的工作流只用
+`control.session.act@1` / `check@1`，声明 `desktop.input`、`desktop.observe` 权限。
+`aad run` 和 MCP `run_workflow` 都注册这个 provider。只含步骤的工作流不在会话串行锁下运行
+（每个请求自己取锁），把步骤和直接 driver 动作混在一起的工作流会被 MCP 拒绝。
+Windows 的 UIA 录制结果由 `steps::from_windows_capture` 转成这种格式，无法回放的动作返回原因。
+MCP `save_workflow` 直接收这种步骤（`id` 可省，按 s1、s2 编号），拒绝 locator 里的 `node_id`；
+带 `input` 的步骤会丢掉动作里的文字。工作流和同名录制文档一起写入，`describe_workflow` 逐步列出应用、
+定位、动作和要传入的 input。旧的 Windows 动作格式（`set_value`、`window` 等）不再接受，
+已保存的旧工作流仍可运行。实测（Windows）：`tests/windows/verify_mcp_saved_steps.py` 经 MCP 保存
+fill 与 check，清空后 `run_workflow` 回放，文字由 WM_GETTEXT 独立读回。
+
+## 录制
+
+能录制的 provider 提供 `watch` / `collect` / `release`，`aad_control::recording::Recording` 统一驱动，
+GUI 和 `aad record` 都用它。Windows driver 返回自己的录制步骤；AT-SPI 和 AX 返回同一种原始事件
+（click、wheel、key、text、toggle，元素按各自快照的方式描述），由 `recording::from_events` 转成步骤：
+连续文本合并为一次 fill，500 ms 内同一元素的两次点击是双击，连续滚轮累计格数，
+紧接着引起勾选或文本修改的那次左键点击并入该修改，按键落到最近获得焦点的元素上。
+
+- Linux：AT-SPI 的 `object:text-changed`、`object:state-changed:checked/focused` 信号，加上 XTest helper 的
+  `record-input`（XRecord，只报告落在目标进程窗口上的点击、滚轮和目标进程有焦点时的按键）。
+  点击发生后才按坐标查元素，界面在点击时立即变化（例如对话框关闭）会让该点击无法识别。
+- macOS：Swift helper 的 AXObserver（值变化、焦点）与只监听的 CGEvent tap（需要“输入监控”权限，
+  没有时 `pointer_watch: false`，只记录值变化）。
+
+[待验证] Linux 录制只在 CI 的 Qt fixture 里检查点击和填写；macOS 录制的 Swift 代码未编译。
+停止录制后，Linux 的 AT-SPI 信号线程要等到下一个信号才退出。
+
 ## 验证与剩余范围
 
 `osdk run control-test` 跑纯逻辑、真实子进程 stdio、三平台原生适配 mock 和 MCP 回归。
-Linux CI 另外运行带沙箱的空白 Chromium fixture，检查 DOM/可信键盘的实际结果及导航/frame/节点过期；
-隔离 Qt/AT-SPI fixture 通过真实 CLI 子进程检查 fill/invoke 后的界面状态。所有 GUI fixture 串行执行。
+Linux CI 另外运行带沙箱的空白 Chromium fixture，检查 DOM/可信键盘、可信指针（右键、双击、悬停、滚轮、被遮挡时拒绝）、
+select/check、navigate/back/forward/reload 的实际结果及导航/frame/节点过期；同一个测试在 Windows 上用本机 Chrome 跑过
+（`AAD_TEST_CHROME` 指向 chrome.exe，临时空白 profile；本机的 Edge 用同样参数启动后立即退出，原因未查）。
+隔离 Qt/AT-SPI fixture 通过真实 CLI 子进程（`aad control serve`，以及 `aad apps`、`aad do`、`aad find`）检查 fill/invoke 后的界面状态。
+Windows 上 `tests/windows/verify_*_effect.py` 用自建的隔离探针窗口，经 `aad do` 检查右键、中键、双击、两个方向的滚轮、悬停、拖拽、
+按键输入和保存的工作流，由 Raw Input 日志独立确认。所有 GUI fixture 串行执行。
 CI 和 release 工作流使用官方 one-sdk Action 最新正式版本，不依赖 pending one-sdk PR。
 
 [待验证] 本云容器不能启动本机 Chromium 沙箱，浏览器实际效果由 GitHub Linux CI 验证。
+[待验证] Linux 上新的 CLI 段、双击和 Ctrl+A 只在 CI 的 Xvfb 环境里跑，本机只编译了 helper 并跑了单元测试；
+右键、滚轮、悬停、拖拽在 Linux 上还没有观察效果的 fixture。
+[待验证] macOS 的 pointer_gesture、drag、key_chord：Swift 代码没有在本机编译过，Rust 侧只跑了单元测试。
+在 Mac 上依次验证：`plugins/macos_ax/build.sh` 能编译签名；打开“文本编辑”，`aad apps` 取得它的 resource id 后，
+`aad do key <id> --role AXTextArea --keys cmd,a`、`aad do type-text ... --text x` 替换全文；
+`aad do click <id> --role AXTextArea --button right` 弹出菜单；`aad do scroll <id> --role AXTextArea --direction down`
+在长文档里滚动；在“访达”列表里 `aad do drag` 把文件拖进文件夹。
 Windows/macOS 的新适配路由在 CI 以 mock 编译/测试；Windows 的输入桌面、macOS TCC 和跨机器 SSH
-未在真实设备验证。Wayland 原生输入、完整 OOPIF、原生浏览器指针、通用跨平台 key、GUI 迁移、结果缓存、
+未在真实设备验证。Wayland 原生输入、完整 OOPIF、浏览器拖拽与新标签页、结果缓存、
 自动重放与统一 Android wire adapter 均不在本次范围。录制/回放及事件观察保持已有实现，不提升其可靠性声明。

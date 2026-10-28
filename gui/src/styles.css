@@ -1,48 +1,79 @@
 :root {
-  --bg: #14161a;
-  --panel: #1b1e24;
-  --panel-2: #21252c;
-  --line: #2c313a;
-  --text: #e6e8ec;
-  --muted: #99a1ad;
-  --accent: #4c8dff;
-  --danger: #ff6b6b;
-  --ok: #3ecf8e;
-  --warn: #ffb454;
+  --bg: #f6f7f9;
+  --surface: #ffffff;
+  --surface-2: #f0f2f5;
+  --line: #e2e5ea;
+  --text: #1c2026;
+  --muted: #6b7380;
+  --accent: #2f6fed;
+  --accent-soft: #e8efff;
+  --on-accent: #ffffff;
+  --danger: #d6453d;
+  --danger-soft: #fdeceb;
+  --ok: #1f9d62;
+  --ok-soft: #e6f6ee;
+  --warn: #b7791f;
+  --record: #e5484d;
+  --radius: 10px;
+  --shadow: 0 1px 2px rgb(16 24 40 / 6%), 0 1px 3px rgb(16 24 40 / 8%);
 
-  color-scheme: dark;
-  font-family: ui-sans-serif, system-ui, "Segoe UI", "Microsoft YaHei", sans-serif;
-  font-size: 14px;
+  color-scheme: light;
+  font-family: ui-sans-serif, system-ui, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #111317;
+    --surface: #181b20;
+    --surface-2: #1f2329;
+    --line: #2a2f37;
+    --text: #e7e9ed;
+    --muted: #8d95a1;
+    --accent: #6d9bff;
+    --accent-soft: #1d2a44;
+    --on-accent: #0b1220;
+    --danger: #ff7b72;
+    --danger-soft: #3a1d1c;
+    --ok: #45c48a;
+    --ok-soft: #16322a;
+    --warn: #e3b341;
+    --shadow: none;
+    color-scheme: dark;
+  }
 }
 
 * {
   box-sizing: border-box;
 }
 
-body {
+html,
+body,
+#app {
+  height: 100%;
   margin: 0;
-  background: var(--bg);
-  color: var(--text);
-  height: 100vh;
-  overflow: hidden;
 }
 
-#app {
-  height: 100vh;
+body {
+  background: var(--bg);
+  color: var(--text);
+  overflow: hidden;
 }
 
 button {
   font: inherit;
   color: var(--text);
-  background: var(--panel-2);
+  background: var(--surface);
   border: 1px solid var(--line);
-  border-radius: 6px;
-  padding: 5px 10px;
+  border-radius: 7px;
+  padding: 5px 11px;
   cursor: pointer;
+  white-space: nowrap;
 }
 
 button:hover:not(:disabled) {
-  border-color: var(--accent);
+  background: var(--surface-2);
 }
 
 button:disabled {
@@ -53,24 +84,62 @@ button:disabled {
 button.primary {
   background: var(--accent);
   border-color: var(--accent);
-  color: #06101f;
+  color: var(--on-accent);
   font-weight: 600;
 }
 
+button.primary:hover:not(:disabled) {
+  filter: brightness(1.06);
+  background: var(--accent);
+}
+
+button.ghost {
+  background: transparent;
+  border-color: transparent;
+}
+
+button.ghost:hover:not(:disabled) {
+  background: var(--surface-2);
+}
+
+button.danger {
+  color: var(--danger);
+}
+
 input,
-select {
+select,
+textarea {
   font: inherit;
   color: var(--text);
-  background: var(--bg);
+  background: var(--surface);
   border: 1px solid var(--line);
-  border-radius: 6px;
+  border-radius: 7px;
   padding: 5px 8px;
+  min-width: 0;
 }
 
 input:focus,
-select:focus {
+select:focus,
+textarea:focus {
   outline: none;
   border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
+label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+label.inline {
+  flex-direction: row;
+  align-items: center;
+  gap: 6px;
+  color: var(--text);
+  font-size: 13px;
 }
 
 .muted {
@@ -80,4 +149,74 @@ select:focus {
 .mono {
   font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
   font-size: 12px;
+}
+
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 1px 7px;
+  border-radius: 999px;
+  background: var(--surface-2);
+  color: var(--muted);
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.chip.accent {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.panel {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  overflow: hidden;
+}
+
+.panel-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--line);
+  font-weight: 600;
+}
+
+.panel-head .spacer {
+  flex: 1;
+}
+
+.panel-body {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+}
+
+.empty {
+  padding: 28px 16px;
+  text-align: center;
+  color: var(--muted);
+}
+
+.row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.grow {
+  flex: 1;
+  min-width: 0;
+}
+
+.ellipsis {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }

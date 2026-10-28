@@ -6,9 +6,14 @@ server，不再通过 Python/NDJSON worker 注册。Rust provider 使用 `atspi`
 
 公开动作包括 `inspect_session`、`list_applications`、`snapshot`、`find`、`focus`、
 `invoke`、`set_text`、`toggle`、`expand`、`collapse`，以及显式的 `type_text`、
-`pointer_click`、`capture_target`。观察、输入、截图分别受 `desktop.observe`、
+`pointer_click`、`pointer_gesture`（右键、中键、双击、滚轮、悬停，位置是元素内比例）、`drag`、
+`key_chord`、`capture_target`。观察、输入、截图分别受 `desktop.observe`、
 `desktop.input`、`desktop.capture` 权限控制。所有写动作都基于未截断快照中的 target，
 派发前重新抓树并核对原生 identity 与语义 fingerprint；多义、过期或无法验证时失败关闭。
+
+录制用 `watch` / `collect` / `release`：AT-SPI 信号报告文本修改、勾选和焦点，XTest helper 的
+`record-input` 用 XRecord 报告落在目标进程窗口上的点击、滚轮和按键（只读，不注入），合成步骤见
+[统一控制与远程会话](../../docs/control-sessions.md#录制)。
 
 ## 原生 helper
 
@@ -25,8 +30,10 @@ Debian/Ubuntu 构建依赖为 `g++ pkg-config libx11-dev libxtst-dev`。CLI 默�
 `AAD_LINUX_CAPTURE_HELPER` 指定可信路径。helper 不调用 shell、`xdotool`、剪贴板或
 `uinput`。
 
-`type_text` 和 `pointer_click` 仅支持 KDE/X11 profile，并在派发前检查焦点、PID 与
-AT-SPI element-at-point；首个输入事件后的失败一律报告 `DRIVER.UNKNOWN_EFFECT`。
+`type_text`、`pointer_click`、`pointer_gesture`、`drag`、`key_chord` 仅支持 KDE/X11 profile，
+并在派发前检查焦点、PID 与 AT-SPI element-at-point（`drag` 起点终点都查）；首个输入事件后的失败
+一律报告 `DRIVER.UNKNOWN_EFFECT`，helper 失败时会先松开已按下的键和按钮。`key_chord` 只接受
+修饰键（ctrl、shift、alt、super）加一个主键（字母数字、F1–F24、方向、Enter、Tab、Esc 等命名键）。
 `capture_target` 只截取 fresh 语义 target 的可见区域，经 Host 的 run-scoped
 `ArtifactStore` 返回 PNG，不接受任意坐标或全屏截图，也不会隐式调用 OCR。
 
@@ -34,7 +41,7 @@ AT-SPI element-at-point；首个输入事件后的失败一律报告 `DRIVER.UNK
 
 CI 使用纯 Rust driver 和 [`qt_atspi_fixture.cpp`](../../tests/linux/qt_atspi_fixture.cpp)，
 在私有 Xvfb/session bus/AT-SPI bus 中验证应用枚举、snapshot/find、语义写值、XTest
-Unicode 输入、中心点点击和目标截图：
+Unicode 输入、中心点点击和目标截图，并经 `aad do` 验证双击和 Ctrl+A 后输入：
 
 ```sh
 tests/linux/run-rust-atspi-fixture.sh

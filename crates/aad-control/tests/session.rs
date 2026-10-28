@@ -54,6 +54,7 @@ fn observed(session: &Session) -> Target {
         Operation::Observe {
             resource_id: "fixture:window".into(),
             max_nodes: 10,
+            view: Default::default(),
         },
     )
     .data
@@ -88,7 +89,7 @@ fn targets_are_session_bound_consumed_and_not_replayable() {
             &b,
             Operation::Act {
                 target: target.clone(),
-                action: Action::Click {}
+                action: Action::click()
             }
         )
         .error
@@ -99,7 +100,7 @@ fn targets_are_session_bound_consumed_and_not_replayable() {
         Some(a.id().into()),
         Operation::Act {
             target: target.clone(),
-            action: Action::Click {},
+            action: Action::click(),
         },
     );
     assert!(a.execute(&request).error.is_none());
@@ -112,7 +113,7 @@ fn targets_are_session_bound_consumed_and_not_replayable() {
             &a,
             Operation::Act {
                 target,
-                action: Action::Click {}
+                action: Action::click()
             }
         )
         .error
@@ -130,7 +131,7 @@ fn policy_and_unsupported_actions_do_not_dispatch() {
             &session,
             Operation::Act {
                 target,
-                action: Action::Click {}
+                action: Action::click()
             }
         )
         .effect,
@@ -163,7 +164,7 @@ fn cancellation_after_dispatch_reports_unknown_and_does_not_retry() {
         Some(session.id().into()),
         Operation::Act {
             target,
-            action: Action::Click {},
+            action: Action::click(),
         },
     );
     let id = request.request_id.clone();
@@ -192,7 +193,7 @@ fn cancellation_before_worker_admission_prevents_dispatch() {
         Some(session.id().into()),
         Operation::Act {
             target,
-            action: Action::Click {},
+            action: Action::click(),
         },
     );
     assert!(session.cancel(&request.request_id));
@@ -222,7 +223,7 @@ fn cancellation_during_preflight_wins_before_the_atomic_commit_boundary() {
         Some(session.id().into()),
         Operation::Act {
             target,
-            action: Action::Click {},
+            action: Action::click(),
         },
     );
     let id = request.request_id.clone();
@@ -268,7 +269,7 @@ fn deadline_before_and_after_commit_has_distinct_effects() {
             Some(session.id().into()),
             Operation::Act {
                 target,
-                action: Action::Click {},
+                action: Action::click(),
             },
         );
         request.timeout_ms = 100;
@@ -295,7 +296,7 @@ fn close_expiry_and_bounded_replay_guard_revoke_observations() {
         &session,
         Operation::Act {
             target,
-            action: Action::Click {},
+            action: Action::click(),
         },
     );
     assert_eq!(response.error.unwrap()["code"], "CONTROL.SESSION_CLOSED");
@@ -313,10 +314,11 @@ fn close_expiry_and_bounded_replay_guard_revoke_observations() {
             &session,
             Operation::Find {
                 observation_id: target.observation_id,
-                locator: Locator {
+                locator: Box::new(Locator {
                     node_id: Some("n".into()),
                     ..Default::default()
-                }
+                }),
+                expect: Default::default(),
             }
         )
         .error

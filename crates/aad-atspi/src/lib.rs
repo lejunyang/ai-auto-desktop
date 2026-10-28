@@ -25,10 +25,13 @@ const MAX_NODES: usize = 5000;
 const MAX_CANDIDATE_SUMMARIES: usize = 10;
 const WRITE_ACTIONS: &[&str] = &[
     "collapse",
+    "drag",
     "expand",
     "focus",
     "invoke",
+    "key_chord",
     "pointer_click",
+    "pointer_gesture",
     "set_text",
     "toggle",
     "type_text",
@@ -75,6 +78,24 @@ pub struct BackendSnapshot {
     pub application: Map<String, Value>,
     pub nodes: Vec<BackendNode>,
     pub truncated: bool,
+}
+
+/// A pointer gesture, already validated, in X11's own button numbering.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Gesture {
+    /// Button 1 left, 2 middle, 3 right; one or two clicks.
+    Click {
+        button: u8,
+        count: u8,
+    },
+    /// Button 4 up, 5 down, 6 left, 7 right; one press per notch.
+    Wheel {
+        button: u8,
+        notches: u8,
+    },
+    Hover {
+        ms: u32,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -141,6 +162,70 @@ pub trait AtspiBackend: Send + Sync {
         Err(driver_error(
             "DRIVER.ACTION_UNSUPPORTED",
             "native pointer_click helper is unavailable",
+        ))
+    }
+    fn pointer_gesture(
+        &self,
+        _target: &NativeRef,
+        _point: (i32, i32),
+        _gesture: Gesture,
+        _process_id: u32,
+        _deadline: Instant,
+    ) -> Result<Value, AutomationError> {
+        Err(driver_error(
+            "DRIVER.ACTION_UNSUPPORTED",
+            "native pointer_gesture helper is unavailable",
+        ))
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn drag(
+        &self,
+        _target: &NativeRef,
+        _from: (i32, i32),
+        _to: (i32, i32),
+        _button: u8,
+        _process_id: u32,
+        _deadline: Instant,
+    ) -> Result<Value, AutomationError> {
+        Err(driver_error(
+            "DRIVER.ACTION_UNSUPPORTED",
+            "native drag helper is unavailable",
+        ))
+    }
+    fn key_chord(
+        &self,
+        _target: &NativeRef,
+        _keys: &[String],
+        _process_id: u32,
+        _deadline: Instant,
+    ) -> Result<Value, AutomationError> {
+        Err(driver_error(
+            "DRIVER.ACTION_UNSUPPORTED",
+            "native key_chord helper is unavailable",
+        ))
+    }
+    /// Start watching what a person does in an application.
+    fn start_recording(
+        &self,
+        _application: &Map<String, Value>,
+        _deadline: Instant,
+    ) -> Result<String, AutomationError> {
+        Err(driver_error(
+            "DRIVER.ACTION_UNSUPPORTED",
+            "this backend cannot record",
+        ))
+    }
+    /// The raw events seen since the last call: `{events, dropped}`.
+    fn collect_recording(&self, _id: &str) -> Result<Value, AutomationError> {
+        Err(driver_error(
+            "DRIVER.ACTION_UNSUPPORTED",
+            "this backend cannot record",
+        ))
+    }
+    fn stop_recording(&self, _id: &str) -> Result<(), AutomationError> {
+        Err(driver_error(
+            "DRIVER.ACTION_UNSUPPORTED",
+            "this backend cannot record",
         ))
     }
     fn accessible_at_point(
@@ -251,6 +336,28 @@ impl AtspiProvider {
             "snapshot" => self.snapshot(args, deadline),
             "find" => self.find(args, deadline),
             "capture_target" => self.capture_target(args, deadline, artifacts),
+            "watch" => {
+                only_keys(args, &["application"])?;
+                let application = args
+                    .get("application")
+                    .and_then(Value::as_object)
+                    .ok_or_else(|| invalid("watch.application must be an object"))?;
+                let id = self.backend.start_recording(application, deadline)?;
+                Ok(json!({"capture_id": id}))
+            }
+            "collect" | "release" => {
+                only_keys(args, &["capture_id"])?;
+                let id = args
+                    .get("capture_id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| invalid("capture_id is required"))?;
+                if short == "collect" {
+                    self.backend.collect_recording(id)
+                } else {
+                    self.backend.stop_recording(id)?;
+                    Ok(json!({"released": true}))
+                }
+            }
             action if WRITE_ACTIONS.contains(&action) => self.write(action, args, deadline),
             _ => Err(invalid("unknown AT-SPI action")),
         }
@@ -351,7 +458,15 @@ impl AtspiProvider {
                 .filter(|action| WRITE_ACTIONS.contains(&action.as_str()))
                 .filter(|action| {
                     !protected
-                        || !matches!(action.as_str(), "pointer_click" | "set_text" | "type_text")
+                        || !matches!(
+                            action.as_str(),
+                            "pointer_click"
+                                | "pointer_gesture"
+                                | "drag"
+                                | "key_chord"
+                                | "set_text"
+                                | "type_text"
+                        )
                 })
                 .collect::<BTreeSet<_>>()
                 .into_iter()
@@ -513,10 +628,21 @@ impl AtspiProvider {
         if matches!(action, "set_text" | "type_text") {
             allowed.push("text");
         }
-        if action == "pointer_click" {
-            allowed.extend(["button", "position"]);
+        match action {
+            "pointer_click" => allowed.extend(["button", "position"]),
+            "pointer_gesture" => {
+                allowed.extend(["button", "count", "fraction", "scroll", "hover_ms"])
+            }
+            "drag" => allowed.extend(["to", "to_locator", "button", "fraction", "to_fraction"]),
+            "key_chord" => allowed.push("keys"),
+            _ => {}
         }
         only_keys(args, &allowed)?;
+        let gesture = if action == "pointer_gesture" {
+            Some(parse_gesture(args)?)
+        } else {
+            None
+        };
         if action == "pointer_click"
             && (args.get("button").is_some_and(|value| value != "left")
                 || args.get("position").is_some_and(|value| value != "center"))
@@ -562,6 +688,45 @@ impl AtspiProvider {
                 }));
             }
         }
+        // The destination of a drag is re-verified exactly like the source.
+        let destination = if action == "drag" {
+            let mut to_args = Map::new();
+            to_args.insert(
+                "target".into(),
+                args.get("to").cloned().unwrap_or(Value::Null),
+            );
+            to_args.insert(
+                "locator".into(),
+                args.get("to_locator").cloned().unwrap_or(Value::Null),
+            );
+            let (to_fresh, to_id, to_node, _) = self.fresh_target(&to_args, deadline)?;
+            if to_id == fresh_id {
+                return Err(invalid("drag needs a destination other than its source"));
+            }
+            let to_point = point_in(
+                parse_bounds(to_node.get("bounds"))?,
+                parse_fraction(args.get("to_fraction"))?,
+            )?;
+            self.validate_point(&to_fresh, &to_id, to_point, deadline)?;
+            Some(to_point)
+        } else {
+            None
+        };
+        let pointer = if matches!(action, "pointer_gesture" | "drag") {
+            let point = point_in(
+                parse_bounds(node.get("bounds"))?,
+                parse_fraction(args.get("fraction"))?,
+            )?;
+            self.validate_point(&fresh, &fresh_id, point, deadline)?;
+            Some(point)
+        } else {
+            None
+        };
+        let keys = if action == "key_chord" {
+            Some(parse_keys(args.get("keys"))?)
+        } else {
+            None
+        };
         remaining(deadline, false)?;
         let mut dispatched = false;
         let result = (|| {
@@ -591,6 +756,44 @@ impl AtspiProvider {
                     self.validate_point(&fresh, &fresh_id, point, deadline)?;
                     self.backend
                         .pointer_click(&native, point, process, deadline)
+                }
+                "pointer_gesture" => {
+                    let process = process_id(&node, &fresh)?;
+                    self.backend.pointer_gesture(
+                        &native,
+                        pointer.expect("computed above"),
+                        gesture.expect("parsed above"),
+                        process,
+                        deadline,
+                    )
+                }
+                "drag" => {
+                    let process = process_id(&node, &fresh)?;
+                    let button = match args.get("button").and_then(Value::as_str) {
+                        None | Some("left") => 1,
+                        Some("middle") => 2,
+                        Some("right") => 3,
+                        Some(_) => {
+                            return Err(invalid("drag.button must be left, middle or right"))
+                        }
+                    };
+                    self.backend.drag(
+                        &native,
+                        pointer.expect("computed above"),
+                        destination.expect("computed above"),
+                        button,
+                        process,
+                        deadline,
+                    )
+                }
+                "key_chord" => {
+                    let process = process_id(&node, &fresh)?;
+                    self.backend.key_chord(
+                        &native,
+                        keys.as_deref().expect("parsed above"),
+                        process,
+                        deadline,
+                    )
                 }
                 "toggle" => self.backend.named_action(&native, "click", deadline),
                 "expand" | "collapse" => self.backend.named_action(&native, "activate", deadline),
@@ -1255,6 +1458,129 @@ fn process_id(node: &Value, record: &Record) -> Result<u32, AutomationError> {
     Ok(process as u32)
 }
 
+/// The same request shape the Windows driver takes, mapped to X11 buttons.
+fn parse_gesture(args: &Map<String, Value>) -> Result<Gesture, AutomationError> {
+    let given = |name: &str| args.get(name).is_some_and(|value| !value.is_null());
+    if let Some(scroll) = args.get("scroll").filter(|value| !value.is_null()) {
+        if given("button") || given("count") || given("hover_ms") {
+            return Err(invalid("a scroll takes no button, count or hover_ms"));
+        }
+        let scroll = scroll
+            .as_object()
+            .ok_or_else(|| invalid("scroll must be an object"))?;
+        only_keys(scroll, &["direction", "notches"])?;
+        let button = match scroll.get("direction").and_then(Value::as_str) {
+            Some("up") => 4,
+            Some("down") => 5,
+            Some("left") => 6,
+            Some("right") => 7,
+            _ => return Err(invalid("scroll.direction must be up, down, left or right")),
+        };
+        let notches = match scroll.get("notches") {
+            None | Some(Value::Null) => 3,
+            Some(value) => value
+                .as_u64()
+                .filter(|n| (1..=30).contains(n))
+                .ok_or_else(|| invalid("scroll.notches must be 1..30"))?
+                as u8,
+        };
+        return Ok(Gesture::Wheel { button, notches });
+    }
+    if let Some(ms) = args.get("hover_ms").filter(|value| !value.is_null()) {
+        if given("button") || given("count") {
+            return Err(invalid("a hover takes no button or count"));
+        }
+        let ms = ms
+            .as_u64()
+            .filter(|ms| (1..=5000).contains(ms))
+            .ok_or_else(|| invalid("hover_ms must be 1..5000"))? as u32;
+        return Ok(Gesture::Hover { ms });
+    }
+    let button = match args.get("button") {
+        None | Some(Value::Null) => 1,
+        Some(value) => match value.as_str() {
+            Some("left") => 1,
+            Some("middle") => 2,
+            Some("right") => 3,
+            _ => return Err(invalid("button must be left, middle or right")),
+        },
+    };
+    let count = match args.get("count") {
+        None | Some(Value::Null) => 1,
+        Some(value) => value
+            .as_u64()
+            .filter(|n| matches!(n, 1 | 2))
+            .ok_or_else(|| invalid("count must be 1 or 2"))? as u8,
+    };
+    Ok(Gesture::Click { button, count })
+}
+
+fn parse_fraction(value: Option<&Value>) -> Result<Option<(f64, f64)>, AutomationError> {
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => {
+            let object = value
+                .as_object()
+                .ok_or_else(|| invalid("fraction must be an object"))?;
+            only_keys(object, &["fx", "fy"])?;
+            let part = |name: &str| {
+                object
+                    .get(name)
+                    .and_then(Value::as_f64)
+                    .filter(|f| (0.0..=1.0).contains(f))
+                    .ok_or_else(|| invalid("fraction.fx and fraction.fy must lie in 0..1"))
+            };
+            Ok(Some((part("fx")?, part("fy")?)))
+        }
+    }
+}
+
+/// A point inside the element, one pixel in from its edges so the hit lands
+/// on the element rather than on its border.
+fn point_in(bounds: Bounds, fraction: Option<(f64, f64)>) -> Result<(i32, i32), AutomationError> {
+    if bounds.width <= 0 || bounds.height <= 0 {
+        return Err(driver_error(
+            "DRIVER.ACTION_UNSUPPORTED",
+            "target has no positive-area bounds",
+        ));
+    }
+    let (fx, fy) = fraction.unwrap_or((0.5, 0.5));
+    let along = |start: i32, size: i32, f: f64| {
+        let offset = (f64::from(size) * f).round() as i32;
+        start
+            + if size < 3 {
+                size / 2
+            } else {
+                offset.clamp(1, size - 2)
+            }
+    };
+    Ok((
+        along(bounds.x, bounds.width, fx),
+        along(bounds.y, bounds.height, fy),
+    ))
+}
+
+fn parse_keys(value: Option<&Value>) -> Result<Vec<String>, AutomationError> {
+    let keys = value
+        .and_then(Value::as_array)
+        .ok_or_else(|| invalid("keys must be an array"))?;
+    if keys.is_empty() || keys.len() > 6 {
+        return Err(invalid("keys must hold 1..6 names"));
+    }
+    keys.iter()
+        .map(|key| {
+            key.as_str()
+                .filter(|key| {
+                    !key.is_empty()
+                        && key.len() <= 32
+                        && key.chars().all(|c| c.is_ascii_alphanumeric())
+                })
+                .map(str::to_string)
+                .ok_or_else(|| invalid("each key is a short alphanumeric name"))
+        })
+        .collect()
+}
+
 fn parse_bounds(value: Option<&Value>) -> Result<Bounds, AutomationError> {
     let value = value
         .and_then(Value::as_object)
@@ -1542,6 +1868,51 @@ fn manifest_document() -> Value {
         }
     }
     actions.insert("pointer_click".into(), contract("重新验证目标后，仅在明确的 KDE/X11 会话中，通过固定路径 XTest helper 按目标 bounds 中心点显式执行左键单击。", "non_idempotent", "modify", "high", &["desktop.observe", "desktop.input"], json!({"type": "object", "required": ["target", "locator"], "properties": {"target": target_schema(), "locator": locator_schema(), "button": {"enum": ["left"]}, "position": {"enum": ["center"]}}, "additionalProperties": false}), write_output(), true, true));
+    let point_input = |extra: Value, required: &[&str]| {
+        let mut properties = json!({"target": target_schema(), "locator": locator_schema()});
+        properties
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        let mut all = vec!["target", "locator"];
+        all.extend_from_slice(required);
+        json!({"type": "object", "required": all, "properties": properties, "additionalProperties": false})
+    };
+    let fraction = json!({"type": "object", "required": ["fx", "fy"], "properties": {"fx": {"type": "number", "minimum": 0, "maximum": 1}, "fy": {"type": "number", "minimum": 0, "maximum": 1}}, "additionalProperties": false});
+    let button = json!({"enum": ["left", "middle", "right"]});
+    actions.insert("pointer_gesture".into(), contract("重新验证目标后，仅在明确的 KDE/X11 会话中，通过固定路径 XTest helper 在目标 bounds 内的比例位置执行右键/中键/双击、滚轮或悬停。", "non_idempotent", "modify", "high", &["desktop.observe", "desktop.input"], point_input(json!({"button": button, "count": {"enum": [1, 2]}, "fraction": fraction, "scroll": {"type": "object", "required": ["direction"], "properties": {"direction": {"enum": ["up", "down", "left", "right"]}, "notches": {"type": "integer", "minimum": 1, "maximum": 30}}, "additionalProperties": false}, "hover_ms": {"type": "integer", "minimum": 1, "maximum": 5000}}), &[]), write_output(), true, true));
+    actions.insert("drag".into(), contract("分别重新验证起点与终点后，通过固定路径 XTest helper 按下、分步移动并在终点释放。", "non_idempotent", "modify", "high", &["desktop.observe", "desktop.input"], point_input(json!({"to": target_schema(), "to_locator": locator_schema(), "button": button, "fraction": fraction, "to_fraction": fraction}), &["to", "to_locator"]), write_output(), true, true));
+    actions.insert("key_chord".into(), contract("重新验证并聚焦目标后，通过固定路径 XTest helper 按下修饰键加一个主键的组合。", "non_idempotent", "input", "high", &["desktop.observe", "desktop.input"], point_input(json!({"keys": {"type": "array", "minItems": 1, "maxItems": 6, "items": {"type": "string", "minLength": 1, "maxLength": 32}}}), &["keys"]), write_output(), true, true));
+    let capture_id = json!({"type": "object", "required": ["capture_id"], "properties": {"capture_id": {"type": "string", "minLength": 1, "maxLength": 64}}, "additionalProperties": false});
+    actions.insert("watch".into(), contract("开始记录本人在一个应用里的点击、滚轮、组合键、文本修改和勾选（AT-SPI 事件 + XRecord），只读，不注入输入。", "idempotent", "observe", "medium", &["desktop.observe"], json!({"type": "object", "required": ["application"], "properties": {"application": {"type": "object"}}, "additionalProperties": false}), json!({"type": "object"}), false, false));
+    actions.insert(
+        "collect".into(),
+        contract(
+            "取走上次以来记录到的原始交互事件。",
+            "read_only",
+            "observe",
+            "low",
+            &["desktop.observe"],
+            capture_id.clone(),
+            json!({"type": "object"}),
+            false,
+            false,
+        ),
+    );
+    actions.insert(
+        "release".into(),
+        contract(
+            "停止记录并结束输入监听 helper。",
+            "idempotent",
+            "observe",
+            "low",
+            &["desktop.observe"],
+            capture_id,
+            json!({"type": "object"}),
+            false,
+            false,
+        ),
+    );
     let capture_provenance = json!({"type": "object", "required": ["capture_method", "snapshot_id", "revision", "node_id", "application_process_id", "format", "mime_type", "target_process_id", "target_window", "target_top_level_window", "root_window", "bounds", "root_size", "cursor_included", "occlusion_checked", "same_euid_verified", "scene_stable"], "properties": {
         "capture_method": {"const": "x11_root_xgetimage"}, "snapshot_id": {"type": "string", "minLength": 1}, "revision": {"type": "integer", "minimum": 1}, "node_id": {"type": "string", "minLength": 1}, "application_process_id": {"type": "integer", "minimum": 1},
         "format": {"const": "png"}, "mime_type": {"const": "image/png"}, "target_process_id": {"type": "integer", "minimum": 1}, "target_window": {"type": "integer", "minimum": 1}, "target_top_level_window": {"type": "integer", "minimum": 1}, "root_window": {"type": "integer", "minimum": 1},
@@ -1613,7 +1984,13 @@ mod tests {
                     width: 40,
                     height: 20,
                 }),
-                actions: vec!["focus".into(), "invoke".into(), "pointer_click".into()],
+                actions: vec![
+                    "focus".into(),
+                    "invoke".into(),
+                    "pointer_click".into(),
+                    "pointer_gesture".into(),
+                    "key_chord".into(),
+                ],
                 provenance: Map::from_iter([
                     ("bus_name".into(), json!(":1.42")),
                     ("object_path".into(), json!(object_path)),
@@ -1704,6 +2081,44 @@ mod tests {
                 json!({"submitted": true, "click_point": {"x": point.0, "y": point.1}, "expected_process_id": process_id}),
             )
         }
+        fn pointer_gesture(
+            &self,
+            _target: &NativeRef,
+            point: (i32, i32),
+            gesture: Gesture,
+            _process_id: u32,
+            _deadline: Instant,
+        ) -> Result<Value, AutomationError> {
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            Ok(json!({"point": {"x": point.0, "y": point.1}, "gesture": format!("{gesture:?}")}))
+        }
+        fn key_chord(
+            &self,
+            _target: &NativeRef,
+            keys: &[String],
+            _process_id: u32,
+            _deadline: Instant,
+        ) -> Result<Value, AutomationError> {
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            Ok(json!({"keys": keys}))
+        }
+        fn start_recording(
+            &self,
+            application: &Map<String, Value>,
+            _deadline: Instant,
+        ) -> Result<String, AutomationError> {
+            assert_eq!(application.get("bus_name"), Some(&json!(":1.42")));
+            Ok("watch-1".into())
+        }
+        fn collect_recording(&self, id: &str) -> Result<Value, AutomationError> {
+            assert_eq!(id, "watch-1");
+            Ok(
+                json!({"events": [{"kind": "click", "button": "left", "node": {"role": "push_button", "name": "Save"}}], "dropped": 0}),
+            )
+        }
+        fn stop_recording(&self, _id: &str) -> Result<(), AutomationError> {
+            Ok(())
+        }
         fn accessible_at_point(
             &self,
             root: &NativeRef,
@@ -1766,6 +2181,9 @@ mod tests {
             "focus",
             "invoke",
             "pointer_click",
+            "pointer_gesture",
+            "drag",
+            "key_chord",
             "set_text",
             "type_text",
             "toggle",
@@ -1835,6 +2253,99 @@ mod tests {
         let error = provider.invoke("desktop.linux_atspi.invoke@1", json!({"target": {"snapshot_id": snapshot["snapshot_id"], "revision": snapshot["revision"], "node_id": "n0"}, "locator": locator()}), Some(Duration::from_secs(2))).unwrap_err();
         assert_eq!(error.code, "DRIVER.STALE_SNAPSHOT");
         assert_eq!(backend.writes.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn gestures_and_chords_are_reverified_and_mapped_to_x11_buttons() {
+        let backend = Arc::new(FakeBackend::default());
+        let provider = AtspiProvider::new(backend.clone()).unwrap();
+        let invoke = |action: &str, extra: Value| {
+            let snapshot = take_snapshot(&provider);
+            let mut args = json!({"target": {"snapshot_id": snapshot["snapshot_id"], "revision": snapshot["revision"], "node_id": "n0"}, "locator": locator()});
+            args.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            provider.invoke(
+                &format!("desktop.linux_atspi.{action}@1"),
+                args,
+                Some(Duration::from_secs(2)),
+            )
+        };
+        // Bounds are 10,20 40x20: a quarter across lands at x 20, the bottom edge is inset.
+        let right = invoke(
+            "pointer_gesture",
+            json!({"button": "right", "fraction": {"fx": 0.25, "fy": 1.0}}),
+        )
+        .unwrap();
+        assert_eq!(right["backend_result"]["point"], json!({"x": 20, "y": 38}));
+        assert_eq!(
+            right["backend_result"]["gesture"],
+            "Click { button: 3, count: 1 }"
+        );
+        let wheel = invoke(
+            "pointer_gesture",
+            json!({"scroll": {"direction": "left", "notches": 2}}),
+        )
+        .unwrap();
+        assert_eq!(
+            wheel["backend_result"]["gesture"],
+            "Wheel { button: 6, notches: 2 }"
+        );
+        let hover = invoke("pointer_gesture", json!({"hover_ms": 300})).unwrap();
+        assert_eq!(hover["backend_result"]["gesture"], "Hover { ms: 300 }");
+        let chord = invoke("key_chord", json!({"keys": ["ctrl", "a"]})).unwrap();
+        assert_eq!(chord["backend_result"]["keys"], json!(["ctrl", "a"]));
+        assert_eq!(backend.writes.load(Ordering::SeqCst), 4);
+
+        for (action, extra) in [
+            (
+                "pointer_gesture",
+                json!({"scroll": {"direction": "down"}, "count": 2}),
+            ),
+            ("pointer_gesture", json!({"hover_ms": 9000})),
+            (
+                "pointer_gesture",
+                json!({"fraction": {"fx": 1.5, "fy": 0.5}}),
+            ),
+            ("key_chord", json!({"keys": ["ctrl", "a;rm"]})),
+            ("key_chord", json!({"keys": []})),
+            (
+                "drag",
+                json!({"to": {"snapshot_id": "x", "revision": 1, "node_id": "n0"}, "to_locator": locator(), "button": "side"}),
+            ),
+        ] {
+            assert!(
+                invoke(action, extra.clone()).is_err(),
+                "{action} {extra} must be refused"
+            );
+        }
+        assert_eq!(
+            backend.writes.load(Ordering::SeqCst),
+            4,
+            "nothing refused reached input"
+        );
+    }
+
+    #[test]
+    fn watching_is_routed_to_the_backend_and_validated() {
+        let provider = AtspiProvider::new(Arc::new(FakeBackend::default())).unwrap();
+        let call = |action: &str, args: Value| {
+            provider.invoke(
+                &format!("desktop.linux_atspi.{action}@1"),
+                args,
+                Some(Duration::from_secs(2)),
+            )
+        };
+        let started = call("watch", json!({"application": {"bus_name": ":1.42"}})).unwrap();
+        assert_eq!(started["capture_id"], "watch-1");
+        let collected = call("collect", json!({"capture_id": "watch-1"})).unwrap();
+        assert_eq!(collected["events"][0]["kind"], "click");
+        assert_eq!(
+            call("release", json!({"capture_id": "watch-1"})).unwrap()["released"],
+            true
+        );
+        assert!(call("watch", json!({"application": "x"})).is_err());
+        assert!(call("collect", json!({"capture_id": "watch-1", "extra": 1})).is_err());
     }
 
     #[test]

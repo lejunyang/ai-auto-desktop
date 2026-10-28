@@ -56,6 +56,7 @@ fn main() {
             Operation::Observe {
                 resource_id: id.into(),
                 max_nodes: 128,
+                view: Default::default(),
             },
         )
     };
@@ -80,11 +81,12 @@ fn main() {
         endpoint.as_ref(),
         Operation::Find {
             observation_id: first["observation_id"].as_str().unwrap().into(),
-            locator: Locator {
+            locator: Box::new(Locator {
                 role: Some("push_button".into()),
                 name: Some("Reset Qt fixture status".into()),
                 ..Default::default()
-            },
+            }),
+            expect: Default::default(),
         },
     );
     request(
@@ -105,11 +107,12 @@ fn main() {
         endpoint.as_ref(),
         Operation::Find {
             observation_id: first["observation_id"].as_str().unwrap().into(),
-            locator: Locator {
+            locator: Box::new(Locator {
                 role: Some("text".into()),
                 name: Some("Qt fixture text entry".into()),
                 ..Default::default()
-            },
+            }),
+            expect: Default::default(),
         },
     );
     request(
@@ -131,11 +134,12 @@ fn main() {
         endpoint.as_ref(),
         Operation::Find {
             observation_id: after["observation_id"].as_str().unwrap().into(),
-            locator: Locator {
+            locator: Box::new(Locator {
                 role: Some("push_button".into()),
                 name: Some("Invoke Qt fixture button".into()),
                 ..Default::default()
-            },
+            }),
+            expect: Default::default(),
         },
     );
     request(

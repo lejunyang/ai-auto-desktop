@@ -13,16 +13,13 @@ fn recorded() -> serde_json::Value {
     json!({
         "apiVersion": "ai-auto-desktop.dev/v1alpha1",
         "kind": "Recording",
+        "format": "control-steps/1",
         "metadata": {"name": "integration-check"},
         "steps": [{
-            "id": "step_1",
-            "action": "set_value",
+            "id": "step1",
+            "app": {"provider": "desktop.windows_uia", "process": "notepad.exe"},
             "locator": {"role": "Edit", "name": "Body"},
-            "summary": "role=Edit name=\"Body\"",
-            "window": {"class_name": "Notepad", "process_name": "notepad.exe"},
-            "window_title": "notes.txt - Notepad",
-            "argument": "written by the recording",
-            "enabled": true
+            "action": {"type": "fill", "value": "written by the recording"}
         }]
     })
 }
