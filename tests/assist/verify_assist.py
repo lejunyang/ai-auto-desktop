@@ -72,7 +72,19 @@ class Viewer:
         elif length == 127:
             length = struct.unpack(">Q", self.exact(8))[0]
         payload = self.exact(length)
-        return json.loads(payload) if first & 0x0F == 1 else None
+        opcode = first & 0x0F
+        if opcode == 1:
+            return json.loads(payload)
+        if opcode == 2:
+            # aad-frame/1: version, codec, flags, reserved, width, height, header length, reserved, timestamp
+            version, codec, flags, _, width, height, skip, _, at = struct.unpack(">BBBBIIHHQ", payload[:24])
+            return {"type": "frame", "version": version, "codec": {1: "jpeg", 2: "webp"}.get(codec, codec),
+                    "keyframe": bool(flags & 1), "width": width, "height": height, "at_ms": at,
+                    "data": payload[skip:]}
+        return None
+
+    def close(self):
+        self.sock.close()
 
     def send(self, message):
         payload = json.dumps(message).encode()
@@ -132,7 +144,7 @@ def browser_check():
             viewer = Viewer(announce["websocket"])
             frame = viewer.frame()
             width, height = frame["width"], frame["height"]
-            jpeg = base64.b64decode(frame["data"])[:3] == b"\xff\xd8\xff"
+            webp = frame["codec"] == "webp" and frame["data"][:4] == b"RIFF" and frame["data"][8:12] == b"WEBP"
             viewer.click(140 / width, 70 / height)
             viewer.click(140 / width, 70 / height)
             viewer.click(190 / width, 180 / height)
@@ -145,7 +157,19 @@ def browser_check():
             described = json.loads(subprocess.run([AAD, "--compact", "describe", page["resource_id"]],
                                                   capture_output=True, text=True, encoding="utf-8", env=env).stdout)
             text = json.dumps(described, ensure_ascii=False)
-            result = {"frame_is_jpeg": jpeg, "frame_size": [width, height],
+            viewer.close()
+            time.sleep(0.5)
+            # A viewer that can only draw JPEG says so, and gets JPEG.
+            fallback = Viewer(announce["websocket"])
+            fallback.send({"type": "hello", "accept": ["jpeg"]})
+            jpeg_frame = fallback.frame()
+            while jpeg_frame["codec"] != "jpeg":
+                jpeg_frame = fallback.frame()
+            fallback.close()
+            result = {"default_frame_is_webp": webp, "webp_bytes": len(frame["data"]),
+                      "jpeg_on_request": jpeg_frame["data"][:3] == b"\xff\xd8\xff",
+                      "jpeg_bytes": len(jpeg_frame["data"]),
+                      "keyframe": frame["keyframe"], "frame_size": [width, height],
                       "button_pressed_twice": "pressed 2" in text,
                       "text_typed": "typed through assist" in text,
                       "wrong_token_refused": forbidden_without_token(announce)}
@@ -156,7 +180,7 @@ def browser_check():
         server.shutdown()
         time.sleep(1)
         shutil.rmtree(profile, ignore_errors=True)
-    result["passed"] = all(v for k, v in result.items() if k != "frame_size")
+    result["passed"] = all(v for k, v in result.items() if k not in ("frame_size", "webp_bytes", "jpeg_bytes"))
     return result
 
 
@@ -182,17 +206,21 @@ def desktop_check():
             frame = viewer.frame()
             viewer.click(x, y)
             viewer.send({"type": "text", "text": "desktop assist"})
-            time.sleep(0.5)
             buffer = ctypes.create_unicode_buffer(256)
-            user32.SendMessageW(ready["edit_handle"], 0x000D, 256, buffer)
-            result = {"frame_is_jpeg": base64.b64decode(frame["data"])[:3] == b"\xff\xd8\xff",
+            for _ in range(50):
+                time.sleep(0.1)
+                user32.SendMessageW(ready["edit_handle"], 0x000D, 256, buffer)
+                if "desktop assist" in buffer.value:
+                    break
+            result = {"frame_is_webp": frame["codec"] == "webp" and frame["data"][8:12] == b"WEBP",
+                      "webp_bytes": len(frame["data"]),
                       "frame_size": [frame["width"], frame["height"]],
                       "edit_text": buffer.value}
         finally:
             assist.terminate()
     finally:
         probe.terminate()
-    result["passed"] = result["frame_is_jpeg"] and "desktop assist" in result["edit_text"]
+    result["passed"] = result["frame_is_webp"] and "desktop assist" in result["edit_text"]
     return result
 
 

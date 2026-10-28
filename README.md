@@ -345,13 +345,25 @@ aad assist --desktop                      # 分享整个桌面（目前只有 Wi
 aad assist --desktop --view-only          # 只给看，不接收鼠标键盘
 ```
 
-启动后在 stdout 打印一行 JSON：`url`（自带的查看页）、`websocket`、`token`。只监听本机回环地址，
-每个连接都要带 token；omem 这类宿主把 WebSocket 代理到自己的网页上渲染。消息都是 JSON 文本帧：
-服务端发 `ready` 和 `frame`（JPEG，base64，带宽高），查看端发 `mouse`（move/down/up/wheel，位置是画面内 0..1 的比例）、
-`key`（Enter、方向键、F1–F12、修饰键等非文字按键）和 `text`（输入的文字）。浏览器画面的输入用 CDP `Input.*`
-发给页面，桌面用 `SendInput`。这是给人用的通道，按屏幕位置操作，所以不通过 MCP 提供给 Agent。
-`tests/assist/verify_assist.py` 用真实 Chrome（加 `--desktop` 再测 Windows 桌面）检查画面送达、点击和输入生效、
-错误 token 被拒绝。Linux 和 macOS 的整桌面分享还没有做。
+启动后在 stdout 打印一行 JSON：`url`（自带的查看页，可选）、`websocket`、`token`。只监听本机回环地址，
+每个连接都要带 token。主要产物是 WebSocket 上的帧流，由 omem 这类宿主自己渲染：
+
+- 画面是二进制消息，一帧一张图：24 字节大端头（版本、编码、标志位 bit0 = 关键帧、宽、高、头长度、
+  从开始算起的毫秒时间戳），之后是图片本身。读的一方按“头长度”跳过头，以后加字段不影响旧的读法；
+  不认识的编码跳过不画。
+- 编码默认 WebP（有损，`--quality` 默认 70），比同质量 JPEG 小得多；查看端可以先发
+  `{"type":"hello","accept":["webp","jpeg"]}` 按偏好选编码，只认 JPEG 的就只收 JPEG。
+  浏览器的 WebP 用 `Page.captureScreenshot` 按 `--fps` 取图（screencast 只给 JPEG），没变化不发；
+  桌面用 libwebp 编码。现在每帧都是完整的图（都是关键帧）；以后加 H.264 等视频编码只需新增一种编码值，
+  头里已有关键帧标志和时间戳。
+- 控制消息是 JSON 文本：服务端发 `ready`（含 `frames.codecs`）和 `error`，查看端发 `hello`、
+  `mouse`（move/down/up/wheel，位置是画面内 0..1 的比例）、`key`（Enter、方向键、F1–F12、修饰键等非文字按键）
+  和 `text`（输入的文字）。
+
+浏览器画面的输入用 CDP `Input.*` 发给页面，桌面用 `SendInput`。这是给人用的通道，按屏幕位置操作，
+所以不通过 MCP 提供给 Agent。
+`tests/assist/verify_assist.py` 用真实 Chrome（加 `--desktop` 再测 Windows 桌面）检查默认收到 WebP、
+声明只要 JPEG 时收到 JPEG、点击和输入生效、错误 token 被拒绝。Linux 和 macOS 的整桌面分享还没有做。
 
 ## 桌面窗口（GUI）
 

@@ -60,6 +60,11 @@ thiserror = "1"
 # version, WAL support or compile options we cannot verify on a user's machine.
 rusqlite = { version = "0.40", features = ["bundled"] }
 
+# The assist stream encodes a desktop picture per frame; unoptimised libwebp
+# takes long enough in debug builds to hold up the viewer's input.
+[profile.dev.package.libwebp-sys]
+opt-level = 3
+
 [profile.release]
 opt-level = 2
 lto = "thin"
