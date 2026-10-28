@@ -22,7 +22,8 @@ if [ "${1:-}" = --inside-session ]; then
     sed 's/^/fixture: /' "$fixture_log" >&2 || true
   }
   trap 'report_failure "$LINENO" "$BASH_COMMAND"' ERR
-  for _ in $(seq 1 50); do
+  # A cold Qt start on a busy runner can take several seconds.
+  for _ in $(seq 1 200); do
     grep -q READY "$fixture_log" && break
     sleep 0.1
   done
