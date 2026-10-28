@@ -150,6 +150,11 @@ CDP 仅接受 loopback 调试地址，显式 `--browser-port` 才启用；不会
 `aad run` 和 MCP `run_workflow` 都注册这个 provider。只含步骤的工作流不在会话串行锁下运行
 （每个请求自己取锁），把步骤和直接 driver 动作混在一起的工作流会被 MCP 拒绝。
 Windows 的 UIA 录制结果由 `steps::from_windows_capture` 转成这种格式，无法回放的动作返回原因。
+MCP `save_workflow` 直接收这种步骤（`id` 可省，按 s1、s2 编号），拒绝 locator 里的 `node_id`；
+带 `input` 的步骤会丢掉动作里的文字。工作流和同名录制文档一起写入，`describe_workflow` 逐步列出应用、
+定位、动作和要传入的 input。旧的 Windows 动作格式（`set_value`、`window` 等）不再接受，
+已保存的旧工作流仍可运行。实测（Windows）：`tests/windows/verify_mcp_saved_steps.py` 经 MCP 保存
+fill 与 check，清空后 `run_workflow` 回放，文字由 WM_GETTEXT 独立读回。
 
 ## 录制
 

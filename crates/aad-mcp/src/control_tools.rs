@@ -131,6 +131,36 @@ fn action_schema() -> Value {
     ]})
 }
 
+/// A control action as a saved step stores it: a drag names its destination
+/// in the step's `to` locator instead of a session-bound target.
+pub(crate) fn saved_action_schema() -> Value {
+    let mut schema = action_schema();
+    for variant in schema["oneOf"].as_array_mut().into_iter().flatten() {
+        // The text may come from the step's `input` instead.
+        if matches!(
+            variant["properties"]["type"]["const"].as_str(),
+            Some("fill" | "type_text")
+        ) {
+            variant["required"] = json!(["type"]);
+        }
+        if variant["properties"]["type"]["const"] == "drag" {
+            if let Some(properties) = variant["properties"].as_object_mut() {
+                properties.remove("to");
+            }
+            variant["required"] = json!(["type"]);
+            variant["description"] = json!(
+                "Press on the element, glide, and release on the element the step's \
+    `to` locator finds in the same application."
+            );
+        }
+    }
+    schema["description"] = json!(
+        "The control_act action you performed, without its target. For fill and \
+    type_text with an `input`, leave the text out."
+    );
+    schema
+}
+
 fn view_schema() -> Value {
     json!({
         "type": "object",

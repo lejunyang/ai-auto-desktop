@@ -114,115 +114,113 @@ what limits apply, such as a remote session or a non-elevated process.",
         },
         Tool {
             name: "save_workflow",
-            description: "Turn actions you have already performed into a named \
-workflow that run_workflow can replay. Give the steps in the order they were done, \
-each with the locator you used to find the element -- an outline from \
-control_observe carries one per element. Action names are the Windows provider's: \
-click is pointer_click (or pointer_gesture with a button, count or position), fill \
-is set_value, key is key_chord, scroll and hover are pointer_gesture. The saved workflow re-finds every element as it \
-runs, so it keeps working after the target application restarts, which a target \
-reference does not. Steps are checked before anything is written: a workflow that \
-saves is a workflow that runs.",
+            description: "Save actions you have performed as a named workflow that \
+run_workflow replays, here or on another machine with the same application. These \
+are the same steps `aad record` and the desktop app save, and they run on every \
+provider: Windows, Linux, macOS and browser pages. Give the steps in the order they \
+were done. Each names its application, the element by locator -- copy the `locator` \
+an outline from control_observe gives each element, narrowed with within, near or nth \
+where several match -- and the control_act action you used, without its target. A drag names its destination in \
+`to`. A step may instead be a check that waits until an element appears or goes \
+away. Nothing session-bound is stored: replaying lists the targets again, picks the \
+one application the step names, observes it and finds the element, so the workflow \
+keeps working after the application restarts. Steps are checked before anything is \
+written: a workflow that saves is a workflow that runs.",
             schema: json!({
                 "type": "object",
                 "properties": {
                     "name": {
                         "type": "string",
-                        "description": "What to call it. run_workflow and \
-            describe_workflow take this name."
+                        "description": "What to call it: a lower-case letter, then \
+            lower-case letters, digits and . _ -. run_workflow and describe_workflow take \
+            this name."
                     },
                     "steps": {
                         "type": "array",
                         "minItems": 1,
+                        "maxItems": 500,
                         "description": "The actions in the order they were performed.",
                         "items": {
                             "type": "object",
+                            "description": "One action on an element, or one check. \
+            Give exactly one of action and check.",
                             "properties": {
-                                "action": {
+                                "id": {
                                     "type": "string",
-                                    "enum": [
-                                        "focus", "invoke", "set_value", "type_text",
-                                        "pointer_click", "key_chord", "pointer_gesture", "drag"
-                                    ],
-                                    "description": "What was done to the element."
+                                    "pattern": "^[A-Za-z0-9_-]{1,64}$",
+                                    "description": "Optional. Steps are numbered s1, \
+            s2, ... when left out."
                                 },
-                                "locator": locator_schema(),
-                                "window": {
+                                "app": {
                                     "type": "object",
-                                    "description": "Which window, by \
-            `process_name` and a stable part of `title`. Not a window_id: ids are assigned per \
+                                    "description": "Which application or page, as \
+            control_targets lists it. Every field given must match, and exactly one target \
+            may match when it runs. Not a resource_id or window id: ids are assigned per \
             session, so a workflow using one works once and then fails.",
                                     "properties": {
-                                        "process_name": {"type": "string"},
+                                        "provider": {
+                                            "type": "string",
+                                            "description": "The target's provider, \
+            e.g. desktop.windows_uia or browser.cdp."
+                                        },
+                                        "process": {
+                                            "type": "string",
+                                            "description": "Process, application or \
+            bundle name, compared case-insensitively."
+                                        },
                                         "title": {
                                             "type": "string",
-                                            "description": "A part of the title that \
-            does not change as the application is used -- many titles carry the open document \
-            or a status that varies."
+                                            "description": "Text the window title \
+            contains. Choose a part that does not change as the application is used -- \
+            many titles carry the open document or a status that varies."
+                                        },
+                                        "url": {
+                                            "type": "string",
+                                            "description": "What a page's address \
+            starts with."
                                         }
                                     },
-                                    "required": ["process_name"],
+                                    "minProperties": 1,
                                     "additionalProperties": false
                                 },
-                                "argument": {
-                                    "type": "string",
-                                    "description": "The text written or typed. Only \
-            for set_value and type_text; giving it for another action is refused rather than \
-            ignored."
-                                },
-                                "protected": {
-                                    "type": "boolean",
-                                    "description": "True if the text was a \
-            credential. It is then stored as a required input instead of being written into \
-            the file, and whoever runs the workflow supplies it."
-                                },
-                                "parameters": {
+                                "locator": locator_schema(),
+                                "action": crate::control_tools::saved_action_schema(),
+                                "to": locator_schema(),
+                                "check": {
                                     "type": "object",
-                                    "description": "Durable action options. Use mode for \
-            type_text, keys for key_chord, gesture fields for pointer_gesture, and drag fields \
-            for drag. Runtime targets are never stored here.",
+                                    "description": "Instead of an action: wait until \
+            the element is there (present true) or gone (present false).",
                                     "properties": {
-                                        "mode": {"enum": ["unicode", "keys"]},
-                                        "keys": {
-                                            "type": "array", "items": {"type": "string"},
-                                            "minItems": 1, "maxItems": 6
-                                        },
-                                        "button": {"enum": ["left", "right", "middle"]},
-                                        "count": {"type": "integer", "enum": [1, 2]},
-                                        "fraction": {
-                                            "type": "object",
-                                            "properties": {
-                                                "fx": {"type": "number", "minimum": 0.0, "maximum": 1.0},
-                                                "fy": {"type": "number", "minimum": 0.0, "maximum": 1.0}
-                                            },
-                                            "required": ["fx", "fy"],
-                                            "additionalProperties": false
-                                        },
-                                        "scroll": {
-                                            "type": "object",
-                                            "properties": {
-                                                "direction": {"enum": ["up", "down", "left", "right"]},
-                                                "notches": {"type": "integer", "minimum": 1, "maximum": 30}
-                                            },
-                                            "required": ["direction"],
-                                            "additionalProperties": false
-                                        },
-                                        "hover_ms": {"type": "integer", "minimum": 1, "maximum": 5000},
-                                        "to_fraction": {
-                                            "type": "object",
-                                            "properties": {
-                                                "fx": {"type": "number", "minimum": 0.0, "maximum": 1.0},
-                                                "fy": {"type": "number", "minimum": 0.0, "maximum": 1.0}
-                                            },
-                                            "required": ["fx", "fy"],
-                                            "additionalProperties": false
+                                        "present": {"type": "boolean"},
+                                        "within_ms": {
+                                            "type": "integer", "minimum": 1, "maximum": 30000,
+                                            "description": "How long to wait. Defaults \
+            to 5000."
                                         }
                                     },
+                                    "required": ["present"],
                                     "additionalProperties": false
                                 },
-                                "destination": locator_schema()
+                                "input": {
+                                    "type": "object",
+                                    "description": "For fill and type_text: take the \
+            text from this workflow input when it runs instead of storing it. Use it for a \
+            credential or anything else that must not be written down; the text in the \
+            action is then dropped, and whoever runs the workflow supplies it.",
+                                    "properties": {
+                                        "name": {"type": "string", "pattern": "^[A-Za-z0-9_-]{1,64}$"},
+                                        "sensitive": {
+                                            "type": "boolean",
+                                            "description": "True for a password or \
+            other secret, so it is never echoed."
+                                        }
+                                    },
+                                    "required": ["name"],
+                                    "additionalProperties": false
+                                },
+                                "note": {"type": "string", "maxLength": 500}
                             },
-                            "required": ["action", "locator", "window"],
+                            "required": ["app", "locator"],
                             "additionalProperties": false
                         }
                     },
@@ -240,8 +238,8 @@ saves is a workflow that runs.",
         },
         Tool {
             name: "list_workflows",
-            description: "List the saved workflows that can be run by name. These are \
-produced by recording a session in the desktop app.",
+            description: "List the saved workflows that can be run by name: saved with \
+save_workflow, with `aad record --save`, or in the desktop app.",
             schema: json!({"type": "object", "properties": {}, "additionalProperties": false}),
             mutating: false,
         },
@@ -350,12 +348,13 @@ fn failure(code: &str, message: &str, hint: Option<&str>) -> String {
     serde_json::to_string(&payload).unwrap_or_else(|_| message.to_string())
 }
 
-/// Assemble performed actions into a named workflow and save it.
+/// Save performed actions as a named workflow of control steps.
 ///
 /// Compiled before it is written. Saving something the engine would reject leaves
 /// an agent believing it has a reusable workflow until the moment it tries to run
 /// it, and the reason is harder to read from a run failure than from here.
 fn save_workflow(arguments: &Value) -> Result<Value, String> {
+    use aad_control::steps::{self, Step};
     let name = arguments
         .get("name")
         .and_then(Value::as_str)
@@ -365,39 +364,51 @@ fn save_workflow(arguments: &Value) -> Result<Value, String> {
         .and_then(Value::as_array)
         .ok_or_else(|| failure("MCP.INVALID_ARGUMENT", "steps is required", None))?;
 
-    let mut performed = Vec::new();
-    for (index, step) in given.iter().enumerate() {
+    let mut saved = Vec::new();
+    for (index, given) in given.iter().enumerate() {
         let ordinal = index + 1;
-        let action = step.get("action").and_then(Value::as_str).ok_or_else(|| {
+        let mut step = given.clone();
+        if !step.is_object() {
+            return Err(failure(
+                "STEP.INVALID",
+                &format!("step {ordinal} is not an object"),
+                None,
+            ));
+        }
+        if step.get("id").is_none() {
+            step["id"] = json!(format!("s{ordinal}"));
+        }
+        // A node_id names an element of one observation in one session; saved,
+        // it would find nothing the next time.
+        if names_a_node(&step["locator"]) || names_a_node(&step["to"]) {
+            return Err(failure(
+                "STEP.INVALID",
+                &format!("step {ordinal} finds its element by node_id"),
+                Some(
+                    "A node_id lasts one observation. Use the element's role and name \
+instead, narrowed with within, near or nth if several match.",
+                ),
+            ));
+        }
+        // Text that comes from an input is not written down, whatever was typed.
+        if step.get("input").is_some() {
+            if let Some(action) = step.get_mut("action").and_then(Value::as_object_mut) {
+                action.remove("value");
+                action.remove("text");
+            }
+        }
+        let step: Step = serde_json::from_value(step).map_err(|error| {
             failure(
-                "MCP.INVALID_ARGUMENT",
-                &format!("step {ordinal} needs an action"),
+                "STEP.INVALID",
+                &format!("step {ordinal} is not a saved step: {error}"),
                 None,
             )
         })?;
-        performed.push(aad_runtime::assemble::PerformedStep {
-            action: action.to_string(),
-            locator: step.get("locator").cloned().unwrap_or(Value::Null),
-            window: step.get("window").cloned().unwrap_or(Value::Null),
-            argument: step
-                .get("argument")
-                .and_then(Value::as_str)
-                .map(str::to_string),
-            parameters: step
-                .get("parameters")
-                .and_then(Value::as_object)
-                .cloned()
-                .unwrap_or_default(),
-            destination: step.get("destination").cloned(),
-            protected: step
-                .get("protected")
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
-        });
+        saved.push(step);
     }
 
-    let descriptor = aad_runtime::assemble::assemble(name, &performed)
-        .map_err(|problem| failure(&problem.code, &problem.message, None))?;
+    let descriptor = steps::workflow(name, &saved)
+        .map_err(|error| failure(&error.code, &error.message, None))?;
 
     // The same compiler `run_workflow` uses, so "it saved" and "it runs" are the
     // same claim rather than two hopes.
@@ -406,19 +417,13 @@ fn save_workflow(arguments: &Value) -> Result<Value, String> {
         Some(aad_runtime::recordings::recordings_dir()),
     )
     .map_err(|error| {
-        // The issues carry the path of each problem, and without them the caller
-        // is told only that something is wrong. Measured: a bad name plus a bad
-        // step yields three located issues, all of which used to be dropped.
         let located: Vec<Value> = error
             .issues
             .iter()
             .map(|issue| json!({"path": issue.path, "message": issue.message}))
             .collect();
-
         // Blame follows the path. A problem under $.metadata.name is the name the
-        // caller chose; telling them it is a defect in the assembler would send
-        // them to report a bug instead of renaming. Names must be lower case:
-        // measured, "SubmitButton" and "UPPER" are both refused.
+        // caller chose; anything else is a defect in how the steps were compiled.
         let names_the_name = error
             .issues
             .iter()
@@ -428,13 +433,12 @@ fn save_workflow(arguments: &Value) -> Result<Value, String> {
 carry only lower-case letters, digits, and . _ - between them, so \
 \"submit_button\" where \"SubmitButton\" was refused."
         } else {
-            "This is a defect in how the steps were assembled rather than in what \
+            "This is a defect in how the steps were compiled rather than in what \
 you supplied. Report the steps you passed, and see `issues` for where it went wrong."
         };
-
         let mut payload = json!({
             "code": error.code,
-            "message": format!("the assembled workflow would not compile: {}", error.message),
+            "message": format!("the workflow would not compile: {}", error.message),
             "retryable": false,
             "effect": "not_applied",
             "hint": hint,
@@ -464,6 +468,9 @@ nothing to show it happened.",
         ));
     }
 
+    // The recording beside it is what the desktop app opens to edit the steps.
+    let recording = aad_runtime::recordings::save_recording(name, &steps::recording(name, &saved))
+        .map_err(|error| failure(error.code, &error.message, None))?;
     let path = aad_runtime::recordings::save_workflow(name, &descriptor)
         .map_err(|error| failure(error.code, &error.message, None))?;
 
@@ -471,9 +478,7 @@ nothing to show it happened.",
         "kind": "WorkflowSaved",
         "name": name,
         "path": path.to_string_lossy(),
-        "performed_steps": performed.len(),
-        // Report the actual expanded count: ordinary actions use three steps,
-        // while drag uses a second find and therefore uses four.
+        "recording_path": recording.to_string_lossy(),
         "executed_steps": compiled
             .raw
             .get("steps")
@@ -487,6 +492,17 @@ nothing to show it happened.",
             .map(|inputs| inputs.keys().cloned().collect::<Vec<String>>())
             .unwrap_or_default(),
     }))
+}
+
+/// Whether a locator, or any locator nested in it, names a session-bound node.
+fn names_a_node(locator: &Value) -> bool {
+    match locator {
+        Value::Object(fields) => {
+            fields.contains_key("node_id") || fields.values().any(names_a_node)
+        }
+        Value::Array(items) => items.iter().any(names_a_node),
+        _ => false,
+    }
 }
 
 /// The saved workflows, newest first.
@@ -630,12 +646,16 @@ fn what_it_does(raw: &Value) -> Vec<Value> {
     let mut actions = Vec::new();
     for step in steps {
         let id = step.get("id").and_then(Value::as_str).unwrap_or_default();
+        let uses = step.get("uses").and_then(Value::as_str).unwrap_or_default();
+        if uses.starts_with(&format!("{}.", aad_control::steps::PROVIDER)) {
+            actions.push(saved_step(id, &step["with"]));
+            continue;
+        }
         // The suffixes `assemble` emits. A step carrying neither is the action.
         if id.ends_with("_window") || id.ends_with("_element") || id.ends_with("_destination") {
             continue;
         }
 
-        let uses = step.get("uses").and_then(Value::as_str).unwrap_or_default();
         let action = uses
             .rsplit_once('.')
             .map(|(_, tail)| tail.split('@').next().unwrap_or(tail))
@@ -691,6 +711,35 @@ fn what_it_does(raw: &Value) -> Vec<Value> {
         actions.push(Value::Object(entry));
     }
     actions
+}
+
+/// What one saved control step does, in the shape `what_it_does` reports.
+fn saved_step(id: &str, with: &Value) -> Value {
+    let step = &with["step"];
+    let mut entry = json!({"id": id, "app": step["app"], "finds": step["locator"]});
+    if let Some(check) = step.get("check") {
+        entry["action"] = json!("check");
+        entry["parameters"] = check.clone();
+        return entry;
+    }
+    let mut action = step["action"].as_object().cloned().unwrap_or_default();
+    entry["action"] = action.remove("type").unwrap_or(Value::Null);
+    if let Some(to) = step.get("to") {
+        entry["destination"] = to.clone();
+    }
+    if let Some(input) = step["input"]["name"].as_str() {
+        // Named, never its value: a credential stays with whoever runs it.
+        entry["needsInput"] = json!(format!("${{{{ inputs.{input} }}}}"));
+    }
+    for key in ["value", "text"] {
+        if let Some(text) = action.remove(key) {
+            entry["writes"] = text;
+        }
+    }
+    if !action.is_empty() {
+        entry["parameters"] = Value::Object(action);
+    }
+    entry
 }
 
 /// Whether any step in the document is a script step.
@@ -1357,33 +1406,36 @@ mod tests {
 
         let properties = &saving.schema["properties"];
         // It takes the steps, not a descriptor. Expanding one performed action
-        // into snapshot/find/act is exactly what goes wrong when written by hand.
+        // into engine steps is exactly what goes wrong when written by hand.
         assert!(properties.get("steps").is_some());
         assert!(
             properties.get("descriptor").is_none() && properties.get("workflow").is_none(),
-            "assembling is this tool's job, not the caller's"
+            "compiling is this tool's job, not the caller's"
         );
 
         let step = &saving.schema["properties"]["steps"]["items"];
-        let required: Vec<&str> = step["required"]
-            .as_array()
-            .expect("required")
-            .iter()
-            .filter_map(Value::as_str)
-            .collect();
-        for field in ["action", "locator", "window"] {
-            assert!(required.contains(&field), "{field} is not optional");
-        }
-        let actions = step["properties"]["action"]["enum"].as_array().unwrap();
-        for action in ["key_chord", "pointer_gesture", "drag"] {
+        assert_eq!(step["required"], json!(["app", "locator"]));
+        assert_eq!(step["additionalProperties"], false);
+        assert_eq!(step["properties"]["locator"]["additionalProperties"], false);
+        // The actions are control_act's, so every provider's can be saved.
+        let variants = step["properties"]["action"]["oneOf"].as_array().unwrap();
+        for action in aad_control::ACTION_NAMES {
             assert!(
-                actions.iter().any(|value| value == action),
+                variants
+                    .iter()
+                    .any(|variant| variant["properties"]["type"]["const"] == *action),
                 "{action} must be savable"
             );
         }
-        assert!(step["properties"]["parameters"].is_object());
-        assert!(step["properties"]["destination"].is_object());
-        assert_eq!(step["properties"]["locator"]["additionalProperties"], false);
+        let drag = variants
+            .iter()
+            .find(|variant| variant["properties"]["type"]["const"] == "drag")
+            .unwrap();
+        assert!(
+            drag["properties"].get("to").is_none(),
+            "a saved drag names its destination by locator, in the step's `to`"
+        );
+        assert!(step["properties"]["to"].is_object());
     }
 
     #[test]
@@ -1397,19 +1449,22 @@ mod tests {
             .iter()
             .find(|tool| tool.name == "save_workflow")
             .expect("save_workflow");
-        let window = &saving.schema["properties"]["steps"]["items"]["properties"]["window"];
+        let app = &saving.schema["properties"]["steps"]["items"]["properties"]["app"];
 
-        let described = window["description"].as_str().unwrap_or_default();
+        let described = app["description"].as_str().unwrap_or_default();
         assert!(
-            described.contains("window_id") || described.contains("ids are assigned"),
+            described.contains("ids are assigned"),
             "say why an id will not do: {described:?}"
         );
-        assert!(
-            window["properties"].get("window_id").is_none(),
-            "and do not accept one"
-        );
+        for id in ["window_id", "resource_id"] {
+            assert!(
+                app["properties"].get(id).is_none(),
+                "and do not accept a {id}"
+            );
+        }
+        assert_eq!(app["additionalProperties"], false);
 
-        let title = window["properties"]["title"]["description"]
+        let title = app["properties"]["title"]["description"]
             .as_str()
             .unwrap_or_default();
         assert!(
@@ -1425,13 +1480,13 @@ mod tests {
             .iter()
             .find(|tool| tool.name == "save_workflow")
             .expect("save_workflow");
-        let protected = saving.schema["properties"]["steps"]["items"]["properties"]["protected"]
+        let input = saving.schema["properties"]["steps"]["items"]["properties"]["input"]
             ["description"]
             .as_str()
             .unwrap_or_default();
         assert!(
-            protected.contains("input") && protected.contains("credential"),
-            "an agent has to know a password is not stored: {protected:?}"
+            input.contains("input") && input.contains("credential"),
+            "an agent has to know a password is not stored: {input:?}"
         );
     }
 
@@ -1707,53 +1762,159 @@ mod tests {
     #[test]
     fn structured_actions_survive_the_mcp_save_and_describe_round_trip() {
         let store = ScratchStore::new("structured-save");
+        let app = json!({"provider": "desktop.windows_uia", "process": "fixture.exe"});
         let saved = call_without_driver(
             "save_workflow",
             &json!({
                 "name": "structured_actions",
                 "steps": [
                     {
-                        "action": "key_chord",
+                        "app": app,
                         "locator": {"role": "edit", "name": "Editor"},
-                        "window": {"process_name": "fixture.exe"},
-                        "parameters": {"keys": ["ctrl", "a"]}
+                        "action": {"type": "key", "keys": ["ctrl", "a"]}
                     },
                     {
-                        "action": "drag",
+                        "app": app,
                         "locator": {"role": "listitem", "name": "Todo"},
-                        "destination": {"role": "listitem", "name": "Done"},
-                        "window": {"process_name": "fixture.exe"},
-                        "parameters": {
+                        "action": {
+                            "type": "drag",
                             "button": "left",
                             "fraction": {"fx": 0.8, "fy": 0.5},
                             "to_fraction": {"fx": 0.2, "fy": 0.5}
-                        }
+                        },
+                        "to": {"role": "listitem", "name": "Done"}
+                    },
+                    {
+                        "app": app,
+                        "locator": {"role": "text", "name": "Moved"},
+                        "check": {"present": true, "within_ms": 2000}
                     }
                 ]
             }),
         )
         .expect("save structured actions");
-        assert_eq!(saved["performed_steps"], 2);
-        assert_eq!(saved["executed_steps"], 7);
+        assert_eq!(saved["executed_steps"], 3);
+        assert!(saved["recording_path"].is_string());
 
         let stored: Value = serde_json::from_str(
             &std::fs::read_to_string(store.directory.join("structured_actions.workflow.json"))
                 .expect("read saved workflow"),
         )
         .expect("parse saved workflow");
-        assert_eq!(stored["steps"][2]["with"]["keys"], json!(["ctrl", "a"]));
-        assert_eq!(stored["steps"][5]["id"], "step_2_destination");
-        assert_eq!(stored["steps"][6]["with"]["to_fraction"]["fx"], 0.2);
+        assert_eq!(stored["steps"][0]["id"], "s1");
+        assert_eq!(stored["steps"][0]["uses"], "control.session.act@1");
+        assert_eq!(stored["steps"][2]["uses"], "control.session.check@1");
+        assert_eq!(
+            stored["steps"][1]["with"]["step"]["action"]["to_fraction"]["fx"],
+            0.2
+        );
+
+        // The recording beside it is what the desktop app and `aad record` use.
+        let recording: Value = serde_json::from_str(
+            &std::fs::read_to_string(saved["recording_path"].as_str().unwrap())
+                .expect("read saved recording"),
+        )
+        .expect("parse saved recording");
+        assert_eq!(
+            aad_control::steps::steps_of(&recording)
+                .expect("steps")
+                .len(),
+            3
+        );
 
         let described =
             call_without_driver("describe_workflow", &json!({"name": "structured_actions"}))
                 .expect("describe structured actions");
-        assert_eq!(described["actions"].as_array().unwrap().len(), 2);
+        let actions = described["actions"].as_array().unwrap();
+        assert_eq!(actions.len(), 3);
+        assert_eq!(actions[0]["action"], "key");
+        assert_eq!(actions[0]["app"]["process"], "fixture.exe");
+        assert_eq!(actions[0]["parameters"]["keys"], json!(["ctrl", "a"]));
+        assert_eq!(actions[1]["finds"]["name"], "Todo");
+        assert_eq!(actions[1]["destination"]["name"], "Done");
+        assert_eq!(actions[2]["action"], "check");
+    }
+
+    #[test]
+    fn saved_text_from_an_input_is_not_written_down() {
+        let store = ScratchStore::new("input-save");
+        let saved = call_without_driver(
+            "save_workflow",
+            &json!({
+                "name": "sign_in",
+                "steps": [{
+                    "app": {"process": "fixture.exe"},
+                    "locator": {"role": "edit", "states": {"protected": true}},
+                    "action": {"type": "fill", "value": "hunter2"},
+                    "input": {"name": "password", "sensitive": true}
+                }]
+            }),
+        )
+        .expect("save");
+        assert_eq!(saved["inputs_required"], json!(["password"]));
+        for file in ["sign_in.workflow.json", "sign_in.recording.json"] {
+            let body = std::fs::read_to_string(store.directory.join(file)).unwrap_or_default();
+            assert!(!body.is_empty(), "{file} was written");
+            assert!(!body.contains("hunter2"), "{file} must not hold the secret");
+        }
+        let described = call_without_driver("describe_workflow", &json!({"name": "sign_in"}))
+            .expect("describe");
         assert_eq!(
-            described["actions"][0]["parameters"]["keys"],
-            json!(["ctrl", "a"])
+            described["actions"][0]["needsInput"],
+            "${{ inputs.password }}"
         );
-        assert_eq!(described["actions"][1]["destination"]["name"], "Done");
+        assert!(described["actions"][0].get("writes").is_none());
+    }
+
+    #[test]
+    fn session_bound_and_malformed_steps_are_refused_before_writing() {
+        let store = ScratchStore::new("bad-steps");
+        let app = json!({"process": "fixture.exe"});
+        for (step, code) in [
+            (
+                json!({"app": app, "locator": {"node_id": "n4"}, "action": {"type": "invoke"}}),
+                "STEP.INVALID",
+            ),
+            (
+                json!({"app": app, "locator": {"role": "button", "within": {"node_id": "n1"}}, "action": {"type": "invoke"}}),
+                "STEP.INVALID",
+            ),
+            (
+                json!({"app": app, "locator": {"role": "button"}}),
+                "STEP.INVALID",
+            ),
+            (
+                json!({"app": app, "locator": {"role": "edit"}, "action": {"type": "fill"}}),
+                "STEP.INVALID",
+            ),
+            (
+                json!({"app": {}, "locator": {"role": "button"}, "action": {"type": "invoke"}}),
+                "STEP.INVALID",
+            ),
+            (
+                json!({"app": app, "locator": {"role": "item"}, "action": {"type": "drag"}}),
+                "STEP.INVALID",
+            ),
+            (
+                json!({"app": {"window_id": "hwnd:1"}, "locator": {"role": "button"}, "action": {"type": "invoke"}}),
+                "STEP.INVALID",
+            ),
+        ] {
+            let refused = call_without_driver(
+                "save_workflow",
+                &json!({"name": "refused", "steps": [step]}),
+            )
+            .expect_err("refused");
+            let payload: Value = serde_json::from_str(&refused).expect("structured");
+            assert_eq!(payload["code"], code, "{step}: {payload}");
+        }
+        assert!(
+            std::fs::read_dir(&store.directory)
+                .unwrap()
+                .next()
+                .is_none(),
+            "nothing is written for a refused workflow"
+        );
     }
 
     #[test]

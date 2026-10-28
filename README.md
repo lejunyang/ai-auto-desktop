@@ -286,8 +286,11 @@ aad mcp --allow-input    # 由启动它的人授予输入
 - 失败以结构化错误返回，并附 `hint` 说明怎样恢复（例如界面变了要重新 observe，匹配多个要用 `within` 收窄）。
 
 **保存与运行流程**（重复劳动）：`save_workflow`、`list_workflows`、`describe_workflow`、`run_workflow`。
-`save_workflow` 可保留 layout-aware 文本、组合键、指针手势和双端点拖拽参数；每次回放都重新 snapshot 并从描述性 locator 定位，
-outline 里每个 Windows 元素都带一个可直接保存的 `locator`。录一次、存进 store，之后 AI 按名字跑，比每次重新拼一遍操作序列可靠得多。
+`save_workflow` 收的是和 `aad record`、GUI 相同的平台无关步骤（`control-steps/1`）：每步写应用（provider、进程名、
+标题里不变的部分或网址前缀）、`locator`（照抄 outline 里每个元素带的 `locator`）和 `control_act` 用过的动作（去掉 target，
+drag 的终点写在 `to`），也可以是等元素出现或消失的 `check`。Windows、Linux、macOS 和浏览器页面都能存、都能回放；
+不收 `node_id` 这类只在一次会话里有效的引用。密码等用 `input` 声明，文字不落盘，运行时传入。
+同名还会存一份录制文档，GUI 能打开继续编辑。录一次、存进 store，之后 AI 按名字跑，比每次重新拼一遍操作序列可靠得多。
 
 ```
 list_workflows              → {"count":1,"workflows":[{"name":"greeter"}],"directory":"..."}
