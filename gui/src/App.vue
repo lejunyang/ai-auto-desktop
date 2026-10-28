@@ -1,769 +1,485 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref,
-  shallowRef, watch } from "vue";
-import AppList from "./components/AppList.vue";
-import OutlineView from "./components/OutlineView.vue";
-import StepList from "./components/StepList.vue";
-import FailureBanner from "./components/FailureBanner.vue";
-import { asFailure, bridge, type DriverFailure, type Element, type Outline,
-  type RunOutcome, type SavedRecording, type Survey, type WindowInfo }
-  from "./bridge";
-import { Recording } from "./recording";
+import { computed, onBeforeUnmount, onMounted, ref, shallowRef } from "vue";
+import TargetList from "./components/TargetList.vue";
+import ElementList from "./components/ElementList.vue";
+import StepComposer from "./components/StepComposer.vue";
+import StepCard, { type Status } from "./components/StepCard.vue";
+import Modal from "./components/Modal.vue";
+import {
+  api, asFailure, type ElementNode, type Failure, type Found, type Locator, type Observation,
+  type Region, type Resource, type SavedRecording, type Step, type Targets,
+} from "./api";
+import { appMatches, inputsNeeded, move, nextId, toStep, type Draft } from "./steps";
 
-const windows = ref<WindowInfo[]>([]);
-const selected = ref<WindowInfo | null>(null);
-const outline = shallowRef<Outline | null>(null);
-const survey = shallowRef<Survey | null>(null);
+const targets = shallowRef<Targets | null>(null);
+const resource = shallowRef<Resource | null>(null);
+const observation = shallowRef<Observation | null>(null);
+const regions = ref<Region[]>([]);
 const region = ref<string | null>(null);
-const failure = ref<DriverFailure | null>(null);
-const loadingApps = ref(false);
-const loadingOutline = ref(false);
-const exported = ref<string | null>(null);
-const saving = ref(false);
-const saved = ref<string | null>(null);
-const browsing = ref(false);
-const replaying = ref(false);
-const outcome = ref<RunOutcome | null>(null);
-const savedRecordings = ref<SavedRecording[]>([]);
-const savedDirectory = ref("");
+const node = shallowRef<ElementNode | null>(null);
+const picking = ref(false);
+const destination = ref<Locator | null>(null);
 
-// Reactive so the step list re-renders when the recording mutates in place.
-const recording = reactive(new Recording()) as Recording;
+const name = ref("新录制");
+const steps = ref<Step[]>([]);
+const statuses = ref<Record<string, { status: Status; error?: Failure | null }>>({});
+const tried = ref<Record<string, Found | Failure | null>>({});
 
-const invalidParameterSteps = ref<Set<string>>(new Set());
-const stepListRevision = ref(0);
-const issues = computed(() => recording.validate());
+const loadingTargets = ref(false);
+const loadingElements = ref(false);
+const busy = ref(false);
+const recording = ref(false);
+const skipped = ref(0);
+let poll: number | undefined;
 
-function markParametersValid(id: string, valid: boolean): void {
-  const next = new Set(invalidParameterSteps.value);
-  if (valid) next.delete(id);
-  else next.add(id);
-  invalidParameterSteps.value = next;
+const notice = ref<{ kind: "error" | "ok"; text: string; hint?: string } | null>(null);
+const asking = ref<{ inputs: ReturnType<typeof inputsNeeded>; then: (values: Record<string, string>) => void } | null>(null);
+const values = ref<Record<string, string>>({});
+const browsing = ref<{ recordings: SavedRecording[]; directory: string } | null>(null);
+
+function fail(error: unknown): void {
+  const failure = asFailure(error);
+  notice.value = { kind: "error", text: failure.message, hint: failure.hint };
+}
+function tell(text: string): void {
+  notice.value = { kind: "ok", text };
+  window.setTimeout(() => notice.value?.kind === "ok" && (notice.value = null), 3000);
 }
 
-function removeStep(id: string): void {
-  recording.remove(id);
-  markParametersValid(id, true);
-}
-
-function clearSteps(): void {
-  recording.steps = [];
-  invalidParameterSteps.value = new Set();
-  stepListRevision.value += 1;
-}
-
-// -------------------------------------------------------------------------
-// Live recording
-//
-// Captured steps go straight into the same recording the step list is bound to,
-// so they appear while the user is still working and can be corrected on the
-// spot. A separate "review what was captured" screen would turn correcting a
-// recording as it happens into recording first and sorting it out afterwards.
-// -------------------------------------------------------------------------
-
-interface CaptureState {
-  captureId: string;
-  window: WindowInfo;
-  sources: string[];
-  dropped: number;
-  /** Steps adopted during this session, for the counter. */
-  adopted: number;
-  unresolved: number;
-  /** Every distinct title seen while recording, newest last.
-   *
-   * A title that carries state reveals which part of it is stable only by
-   * changing, so the window selector is built from what the observations share
-   * rather than from the title as it read at one instant.
-   */
-  titles: string[];
-}
-
-const capture = ref<CaptureState | null>(null);
-const capturing = ref(false);
-let poller: number | null = null;
-
-/** Whether the session is missing a capture mechanism it would normally have. */
-const partialCapture = computed(() => {
-  const sources = capture.value?.sources ?? [];
-  // Both mechanisms are needed for full coverage: WinForms controls are only
-  // seen by the WinEvent hook, and Chromium's are only named by the UIA
-  // handler. One source means a whole class of interaction goes unrecorded,
-  // which is worth saying out loud rather than leaving to be discovered.
-  return sources.length > 0 && sources.length < 2;
-});
-
-async function startCapture(): Promise<void> {
-  if (!selected.value || capture.value) {
-    return;
-  }
-  capturing.value = true;
-  await guard(async () => {
-    const session = await bridge.startRecording(selected.value!.window_id);
-    capture.value = {
-      captureId: session.capture_id,
-      window: selected.value!,
-      sources: session.sources,
-      dropped: 0,
-      adopted: 0,
-      unresolved: 0,
-      // Every poll sees the title again. A title that carries state -- a
-      // document name, an unread count, the last action -- reveals which part
-      // of it is stable only by changing, so the observations are kept and the
-      // window selector is built from what they share.
-      titles: [selected.value!.title],
-    };
-    // Poll rather than waiting for the end: the buffer is bounded, and the
-    // point of recording in a window that is still open is seeing the steps
-    // arrive.
-    poller = window.setInterval(pollCapture, 700);
-  });
-  capturing.value = false;
-}
-
-async function pollCapture(): Promise<void> {
-  const session = capture.value;
-  if (!session) {
-    return;
-  }
+async function refresh(): Promise<void> {
+  loadingTargets.value = true;
   try {
-    const batch = await bridge.collectRecording(session.captureId);
-    session.dropped += batch.dropped;
-    // Read the window list again rather than reusing the one from before
-    // recording started: the title is only observed by looking, and a selector
-    // that was unambiguous then can stop being so once the user opens another
-    // window. `refreshApps` is not reused because it toggles the loading flag,
-    // which would flash a spinner every 700ms.
-    try {
-      windows.value = (await bridge.listApps()).windows;
-    } catch {
-      // A failed refresh is not worth interrupting a recording for; the
-      // observations already gathered still stand.
-    }
-    const live = windows.value.find(
-      (candidate) => candidate.window_id === session.window.window_id,
-    );
-    if (live && !session.titles.includes(live.title)) {
-      session.titles.push(live.title);
-    }
-    if (batch.steps.length) {
-      const added = recording.addCaptured(
-        batch.steps,
-        session.window,
-        windows.value,
-        session.titles,
-        session.captureId,
-      );
-      session.adopted += added.length;
-      session.unresolved += added.filter((step) => !step.enabled).length;
-    }
+    targets.value = await api.targets();
   } catch (error) {
-    // Stop polling on failure rather than reporting the same problem every
-    // 700ms until someone notices.
-    await stopCapture();
-    failure.value = asFailure(error);
+    fail(error);
+  } finally {
+    loadingTargets.value = false;
   }
 }
 
-async function stopCapture(): Promise<void> {
-  const session = capture.value;
-  if (poller !== null) {
-    window.clearInterval(poller);
-    poller = null;
-  }
-  if (!session) {
-    return;
-  }
-  capture.value = null;
-  await guard(async () => {
-    // One last collect before releasing, or the interactions between the final
-    // poll and the stop button would be lost -- which includes whatever the
-    // user did immediately before deciding they were finished.
-    const batch = await bridge.collectRecording(session.captureId);
-    if (batch.steps.length) {
-      recording.addCaptured(
-        batch.steps,
-        session.window,
-        windows.value,
-        session.titles,
-        session.captureId,
-      );
-    }
-    // Now that the observations are complete, restate the selectors. The first
-    // step was stored when only one title had been seen, so a title carrying
-    // state was kept whole -- and replaying with it fails outright.
-    recording.restateWindows(
-      session.window,
-      windows.value,
-      session.titles,
-      session.captureId,
-    );
-    await bridge.stopRecording(session.captureId);
-  });
-}
-
-async function guard(work: () => Promise<void>): Promise<void> {
+async function connect(port: number | null): Promise<void> {
+  loadingTargets.value = true;
   try {
-    await work();
+    targets.value = await api.connectBrowser(port);
+    tell(port ? `已连接浏览器端口 ${port}` : "已断开浏览器");
   } catch (error) {
-    failure.value = asFailure(error);
+    fail(error);
+  } finally {
+    loadingTargets.value = false;
   }
 }
 
-async function refreshApps(): Promise<void> {
-  loadingApps.value = true;
-  await guard(async () => {
-    windows.value = (await bridge.listApps()).windows;
-  });
-  loadingApps.value = false;
-}
-
-async function select(window: WindowInfo): Promise<void> {
-  selected.value = window;
-  // A region name from the previous window means nothing here.
+async function select(next: Resource): Promise<void> {
+  resource.value = next;
   region.value = null;
-  survey.value = null;
-  await readOutline();
+  regions.value = [];
+  node.value = null;
+  picking.value = false;
+  await read();
+  if (next.provider === "desktop.windows_uia") {
+    api.observe(next.resource_id, { mode: "overview" })
+      .then((overview) => (regions.value = overview.regions ?? []))
+      .catch(() => (regions.value = []));
+  }
 }
 
-async function readOutline(): Promise<void> {
-  if (!selected.value) {
+async function read(): Promise<void> {
+  if (!resource.value) return;
+  loadingElements.value = true;
+  try {
+    observation.value = await api.observe(resource.value.resource_id, {
+      mode: "outline", limit: 500, max_characters: 200000,
+      ...(region.value ? { region: region.value } : {}),
+    });
+  } catch (error) {
+    observation.value = null;
+    fail(error);
+  } finally {
+    loadingElements.value = false;
+  }
+}
+
+async function chooseRegion(next: string | null): Promise<void> {
+  region.value = next;
+  await read();
+}
+
+function pick(next: ElementNode): void {
+  if (picking.value) {
+    destination.value = next.step_locator;
+    picking.value = false;
     return;
   }
-  loadingOutline.value = true;
-  outline.value = null;
-  await guard(async () => {
-    const id = selected.value!.window_id;
-    // Both at once. Whether a listing is truncated is only known once it comes
-    // back, and asking for the regions at that point would show the user an
-    // incomplete list that then rearranges itself. They read the same capture.
-    const [listing, groups] = await Promise.all([
-      bridge.describeWindow(id, 120, region.value ?? undefined),
-      bridge.overviewWindow(id),
-    ]);
-    outline.value = listing;
-    survey.value = groups;
-  });
-  loadingOutline.value = false;
+  node.value = next;
+  destination.value = null;
 }
 
-/** Narrow the listing to one region, or widen it back to the whole window. */
-async function drillInto(name: string | null): Promise<void> {
-  region.value = name;
-  await readOutline();
+/** Ask for run-time inputs when the steps need any, then continue. */
+function withInputs(needed: Step[], then: (values: Record<string, string>) => void): void {
+  const inputs = inputsNeeded(needed);
+  if (!inputs.length) return then({});
+  values.value = Object.fromEntries(inputs.map((input) => [input.name, values.value[input.name] ?? ""]));
+  asking.value = { inputs, then };
 }
 
-function record(element: Element, action: string): void {
-  if (!selected.value) {
-    return;
+function confirmInputs(): void {
+  const pending = asking.value;
+  asking.value = null;
+  pending?.then({ ...values.value });
+}
+
+async function performOne(step: Step, inputs: Record<string, string>): Promise<void> {
+  statuses.value = { ...statuses.value, [step.id]: { status: "running" } };
+  try {
+    await api.perform(step, inputs);
+    statuses.value = { ...statuses.value, [step.id]: { status: "succeeded" } };
+  } catch (error) {
+    statuses.value = { ...statuses.value, [step.id]: { status: "failed", error: asFailure(error) } };
   }
-  // Pass every open window, so the selector can be checked for uniqueness
-  // against its actual competition. Without this a second window of the same
-  // application would make the recording refuse to replay.
-  recording.add({
-    action,
-    element,
-    window: selected.value,
-    openWindows: windows.value,
-  });
+  await read();
 }
 
-function exportDescriptor(): void {
-  exported.value = JSON.stringify(recording.toDescriptor(), null, 2);
+async function add(draft: Draft, perform: boolean): Promise<void> {
+  if (!node.value || !observation.value) return;
+  const step = toStep(draft, observation.value.app, node.value.step_locator, steps.value);
+  steps.value = [...steps.value, step];
+  destination.value = null;
+  if (perform) withInputs([step], (inputs) => performOne(step, inputs));
 }
 
-async function copyExport(): Promise<void> {
-  if (exported.value) {
-    await navigator.clipboard.writeText(exported.value);
+function update(index: number, step: Step): void {
+  const next = [...steps.value];
+  next[index] = step;
+  steps.value = next;
+}
+
+function remove(index: number): void {
+  steps.value = steps.value.filter((_, i) => i !== index);
+}
+
+async function test(step: Step, locator: Locator): Promise<void> {
+  const window = targets.value?.resources.find((r) => appMatches(step.app, r)) ?? resource.value;
+  if (!window) return fail({ code: "STEP.APP_NOT_FOUND", message: "找不到这个步骤的窗口" });
+  try {
+    tried.value = { ...tried.value, [step.id]: await api.tryLocator(window.resource_id, locator) };
+  } catch (error) {
+    tried.value = { ...tried.value, [step.id]: asFailure(error) };
   }
 }
 
-/**
- * Write the recording and its compiled workflow to disk.
- *
- * The editable source is saved even when it will not compile: refusing would
- * mean losing work over a step that still needs text typed into it. Only the
- * runnable workflow requires the recording to be valid.
- */
+function runAll(): void {
+  withInputs(steps.value, async (inputs) => {
+    busy.value = true;
+    statuses.value = Object.fromEntries(steps.value.map((s) => [s.id, { status: "running" as Status }]));
+    try {
+      const result = await api.run(name.value || "录制", steps.value, inputs);
+      const next: typeof statuses.value = {};
+      for (const step of steps.value) next[step.id] = { status: "skipped" };
+      for (const outcome of result.steps) {
+        next[outcome.id] = { status: outcome.status === "succeeded" ? "succeeded" : "failed", error: outcome.error };
+      }
+      statuses.value = next;
+      if (result.status === "succeeded") tell(`全部 ${steps.value.length} 步已完成`);
+      else if (result.error) fail(result.error);
+    } catch (error) {
+      statuses.value = {};
+      fail(error);
+    } finally {
+      busy.value = false;
+      await read();
+    }
+  });
+}
+
+function append(batch: { steps: Step[]; skipped: unknown[] }): void {
+  const added: Step[] = [];
+  for (const step of batch.steps) {
+    const taken = [...steps.value, ...added];
+    added.push(taken.some((s) => s.id === step.id) ? { ...step, id: nextId(taken, "rec") } : step);
+  }
+  steps.value = [...steps.value, ...added];
+  skipped.value += batch.skipped.length;
+}
+
+async function startRecording(): Promise<void> {
+  if (!resource.value) return;
+  try {
+    await api.startRecording(resource.value.resource_id);
+    recording.value = true;
+    skipped.value = 0;
+    poll = window.setInterval(async () => {
+      try {
+        append(await api.collect());
+      } catch (error) {
+        fail(error);
+        await stopRecording();
+      }
+    }, 800);
+  } catch (error) {
+    fail(error);
+  }
+}
+
+async function stopRecording(): Promise<void> {
+  window.clearInterval(poll);
+  poll = undefined;
+  if (!recording.value) return;
+  recording.value = false;
+  try {
+    append(await api.stopRecording());
+    tell(skipped.value ? `录制结束，${skipped.value} 个动作无法回放，已略过` : "录制结束");
+  } catch (error) {
+    fail(error);
+  }
+}
+
 async function save(): Promise<void> {
-  saving.value = true;
-  saved.value = null;
-  await guard(async () => {
-    const workflow = recording.canExport ? recording.toDescriptor(recording.name) : undefined;
-    const paths = await bridge.saveRecording(
-      recording.name,
-      recording.toDocument(),
-      workflow,
-    );
-    saved.value = paths.workflow_path
-      ? `Saved. The workflow is at ${paths.workflow_path}`
-      : paths.workflow_error
-        ? `Saved the recording, but the workflow compiler refused it: ${paths.workflow_error.message}`
-        : `Saved the recording, but not a runnable workflow: ${issues.value
-            .filter((issue) => issue.blocking)
-            .map((issue) => issue.message)
-            .join("; ")}`;
-    await refreshSaved();
-  });
-  saving.value = false;
-}
-
-/**
- * Replay what is being edited, without saving it first.
- *
- * The point of this button is trying a correction, and requiring a save for every
- * attempt would turn one experiment into a trail of files. What runs is the
- * recording as it stands, compiled the same way saving compiles it.
- */
-async function replay(): Promise<void> {
-  replaying.value = true;
-  outcome.value = null;
-  await guard(async () => {
-    outcome.value = await bridge.runWorkflow(recording.toDescriptor(recording.name));
-  });
-  replaying.value = false;
-}
-
-/** The step a run stopped at, so the list can point at it. */
-const stumbled = computed(() => {
-  const steps = outcome.value?.steps ?? [];
-  return steps.find((step) => step.status === "failed")?.id ?? null;
-});
-
-/**
- * Bring the failed step into view.
- *
- * The list scrolls once a replay is long enough, and highlighting a row that is
- * below the fold helps nobody: a twenty-step recording expands to sixty rows, so
- * the one that matters is usually not among the first twelve.
- */
-watch(stumbled, async (id) => {
-  if (!id) {
-    return;
+  busy.value = true;
+  try {
+    const saved = await api.save(name.value.trim(), steps.value);
+    tell(`已保存：${saved.recording_path}`);
+  } catch (error) {
+    fail(error);
+  } finally {
+    busy.value = false;
   }
-  await nextTick();
-  document
-    .querySelector(".outcome .steps li.stumbled")
-    ?.scrollIntoView({ block: "nearest" });
-});
-
-async function refreshSaved(): Promise<void> {
-  await guard(async () => {
-    const listed = await bridge.listRecordings();
-    savedRecordings.value = listed.recordings;
-    savedDirectory.value = listed.directory;
-  });
 }
 
-async function openList(): Promise<void> {
-  await refreshSaved();
-  browsing.value = true;
+async function browse(): Promise<void> {
+  try {
+    browsing.value = await api.saved();
+  } catch (error) {
+    fail(error);
+  }
 }
 
-/** Replace the working recording with a saved one. */
-async function open(entry: SavedRecording): Promise<void> {
-  await guard(async () => {
-    const document = await bridge.loadRecording(entry.path);
-    const reopened = Recording.fromDocument(document);
-    // Mutate in place: the template is bound to this reactive instance, so
-    // reassigning the variable would leave the UI showing the old steps.
-    recording.steps = reopened.steps;
-    recording.name = reopened.name;
-    invalidParameterSteps.value = new Set();
-    stepListRevision.value += 1;
-    browsing.value = false;
-    saved.value = `Opened ${reopened.name}`;
-  });
+async function openSaved(path: string): Promise<void> {
+  try {
+    const opened = await api.open(path);
+    name.value = opened.name;
+    steps.value = opened.steps;
+    statuses.value = {};
+    browsing.value = null;
+  } catch (error) {
+    fail(error);
+  }
 }
 
-onMounted(async () => {
-  await refreshApps();
-  await refreshSaved();
-});
+function startOver(): void {
+  steps.value = [];
+  statuses.value = {};
+  name.value = "新录制";
+}
 
-// Leaving hooks installed after the window closes would outlive the app that
-// asked for them.
-onBeforeUnmount(() => {
-  void stopCapture();
-});
+const canRecord = computed(
+  () => !!targets.value?.recording_supported && resource.value?.provider === "desktop.windows_uia",
+);
+const recordTitle = computed(() =>
+  !targets.value?.recording_supported
+    ? "这个平台还不能自动录制，请用“添加步骤”"
+    : canRecord.value ? "开始录制你在这个窗口里的操作" : "先在左侧选一个桌面窗口",
+);
+
+onMounted(refresh);
+onBeforeUnmount(() => window.clearInterval(poll));
 </script>
 
 <template>
   <div class="shell">
-    <div class="titlebar">
-      <strong>ai-auto-desktop</strong>
-      <span class="muted">observe, then act</span>
-      <span class="spacer"></span>
-      <label class="name">
-        <span class="muted">name</span>
-        <input v-model="recording.name" spellcheck="false" />
-      </label>
-      <button
-        v-if="!capture"
-        @click="startCapture"
-        :disabled="capturing || !selected"
-        :title="selected ? 'Record what you do in ' + selected.title : 'Pick a window first'"
-      >
-        {{ capturing ? "Starting…" : "Record" }}
+    <header class="bar">
+      <div class="brand">aad</div>
+      <input v-model="name" class="name" placeholder="录制名称" />
+      <span class="spacer" />
+      <button v-if="!recording" class="record" :disabled="!canRecord" :title="recordTitle" @click="startRecording">
+        <span class="dot" /> 录制
       </button>
-      <button v-else class="recording" @click="stopCapture">
-        ■ Stop ({{ capture.adopted }})
-      </button>
-      <button
-        @click="replay"
-        :disabled="replaying || !recording.canExport || invalidParameterSteps.size > 0"
-        :title="
-          recording.canExport
-            ? 'Run these steps now and report how each one went'
-            : 'Some steps still need work before they can run'
-        "
-      >
-        {{ replaying ? "Running…" : "▶ Try it" }}
-      </button>
-      <button
-        @click="save"
-        :disabled="saving || !recording.steps.length || invalidParameterSteps.size > 0"
-      >
-        {{ saving ? "Saving…" : "Save" }}
-      </button>
-      <button @click="openList">Open…</button>
+      <button v-else class="record live" @click="stopRecording"><span class="dot" /> 停止录制</button>
+      <button class="primary" :disabled="!steps.length || busy || recording" @click="runAll">▶ 运行全部</button>
+      <button :disabled="!steps.length || busy || !name.trim()" @click="save">保存</button>
+      <button @click="browse">打开…</button>
+      <button class="ghost" :disabled="!steps.length" title="清空步骤" @click="startOver">新建</button>
+    </header>
+
+    <div v-if="notice" class="notice" :class="notice.kind">
+      <span class="grow">{{ notice.text }}<span v-if="notice.hint" class="hint"> · {{ notice.hint }}</span></span>
+      <button class="ghost" @click="notice = null">✕</button>
     </div>
 
-    <div class="banner" v-if="failure">
-      <FailureBanner :failure="failure" @dismiss="failure = null" />
-    </div>
-
-    <div class="banner outcome" v-if="outcome" :class="outcome.status">
-      <div class="verdict">
-        <strong>{{ outcome.status === "succeeded" ? "Ran" : "Stopped" }}</strong>
-        <!-- How many ran, not just whether it finished: a run that wrote a value
-             and failed to submit will write it twice if retried blindly. -->
-        <span>{{ outcome.executed_steps }} of {{ outcome.steps.length }} steps</span>
-        <span class="took">{{ outcome.duration_seconds.toFixed(1) }}s</span>
-        <button class="dismiss" @click="outcome = null">Dismiss</button>
-      </div>
-      <p class="why" v-if="outcome.error">
-        {{ outcome.error.message }}
-        <em v-if="outcome.error.effect === 'applied'">
-          — the desktop was already changed, so running this again repeats it
-        </em>
-        <em v-else-if="outcome.error.effect === 'not_applied'">
-          — nothing was changed by the step that failed
-        </em>
-      </p>
-      <ol class="steps">
-        <li
-          v-for="step in outcome.steps"
-          :key="step.id"
-          :class="[step.status, { stumbled: step.id === stumbled }]"
-        >
-          <code>{{ step.id }}</code>
-          <span>{{ step.status }}</span>
-        </li>
-      </ol>
-    </div>
-
-    <div class="banner live" v-if="capture">
-      <span class="dot"></span>
-      <span>
-        Recording <strong>{{ capture.window.title }}</strong> — go and use it.
-        Steps appear on the right as you work and can be corrected there.
-      </span>
-      <span class="muted mono">{{ capture.sources.join(" + ") || "no source" }}</span>
-      <span class="warn" v-if="partialCapture">
-        only one capture mechanism attached, so some interactions may go unrecorded
-      </span>
-      <span class="warn" v-if="capture.unresolved">
-        {{ capture.unresolved }} step(s) need attention
-      </span>
-      <span class="warn" v-if="capture.dropped">
-        {{ capture.dropped }} event(s) dropped
-      </span>
-    </div>
-
-    <div class="banner note" v-if="saved">
-      <span>{{ saved }}</span>
-      <button @click="saved = null">Dismiss</button>
-    </div>
-
-    <main>
-      <AppList
-        :windows="windows"
-        :selected="selected?.window_id ?? null"
-        :loading="loadingApps"
+    <main class="columns">
+      <TargetList
+        :targets="targets"
+        :selected="resource?.resource_id ?? null"
+        :loading="loadingTargets"
         @select="select"
-        @refresh="refreshApps"
+        @refresh="refresh"
+        @connect="connect"
       />
-
-      <OutlineView
-        :outline="outline"
-        :survey="survey"
+      <ElementList
+        :observation="observation"
+        :regions="regions"
         :region="region"
-        :loading="loadingOutline"
-        @record="record"
-        @refresh="readOutline"
-        @region="drillInto"
+        :selected="node?.node_id ?? null"
+        :loading="loadingElements"
+        :picking="picking"
+        :title="resource?.name ?? ''"
+        @pick="pick"
+        @region="chooseRegion"
+        @reload="read"
       />
-
-      <StepList
-        :key="stepListRevision"
-        :steps="recording.steps"
-        :issues="issues"
-        :window="selected"
-        @toggle="(id, on) => recording.setEnabled(id, on)"
-        @locator="(id, next) => recording.setLocator(id, next)"
-        @remove="removeStep"
-        @move="(id, index) => recording.move(id, index)"
-        @argument="(id, text) => recording.setArgument(id, text)"
-        @parameters="(id, parameters) => recording.setParameters(id, parameters)"
-        @parameters-valid="markParametersValid"
-        @destination="(id, destination) => recording.setDestination(id, destination)"
-        @assertion="(id, patch) => recording.setAssertion(id, patch)"
-        @clear="clearSteps"
-        @export="exportDescriptor"
-      />
+      <section class="panel">
+        <header class="panel-head">
+          步骤
+          <span class="chip">{{ steps.length }}</span>
+          <span v-if="recording" class="chip live-chip">● 录制中</span>
+        </header>
+        <StepComposer
+          v-if="node"
+          :node="node"
+          :destination="destination"
+          :busy="busy"
+          @add="add"
+          @pick-destination="picking = true"
+          @close="node = null"
+        />
+        <div class="panel-body">
+          <div v-if="!steps.length" class="empty">
+            <p>还没有步骤。</p>
+            <p class="muted">在中间选一个元素来添加步骤{{ targets?.recording_supported ? "，或点“录制”后直接操作窗口" : "" }}。</p>
+          </div>
+          <StepCard
+            v-for="(step, index) in steps"
+            :key="step.id"
+            :step="step"
+            :index="index"
+            :last="index === steps.length - 1"
+            :status="statuses[step.id]?.status"
+            :error="statuses[step.id]?.error"
+            :tried="tried[step.id]"
+            @perform="withInputs([step], (inputs) => performOne(step, inputs))"
+            @remove="remove(index)"
+            @move="(by) => (steps = move(steps, index, by))"
+            @update="(next) => update(index, next)"
+            @test="(locator) => test(step, locator)"
+          />
+        </div>
+      </section>
     </main>
 
-    <div v-if="exported" class="overlay" @click.self="exported = null">
-      <div class="sheet">
-        <header>
-          <h3>Workflow descriptor</h3>
-          <button @click="copyExport">Copy</button>
-          <button @click="exported = null">Close</button>
-        </header>
-        <pre class="mono">{{ exported }}</pre>
-      </div>
-    </div>
+    <Modal v-if="asking" title="运行时输入" @close="asking = null">
+      <p class="muted">这些值只用于这次运行，不会保存。</p>
+      <label v-for="input in asking.inputs" :key="input.name">
+        {{ input.step }}
+        <input v-model="values[input.name]" :type="input.sensitive ? 'password' : 'text'" />
+      </label>
+      <template #actions>
+        <button class="ghost" @click="asking = null">取消</button>
+        <button class="primary" @click="confirmInputs">继续</button>
+      </template>
+    </Modal>
 
-    <div v-if="browsing" class="overlay" @click.self="browsing = false">
-      <div class="sheet">
-        <header>
-          <h3>Open a recording</h3>
-          <button @click="refreshSaved">Refresh</button>
-          <button @click="browsing = false">Close</button>
-        </header>
-        <ul class="saved" v-if="savedRecordings.length">
-          <li v-for="entry in savedRecordings" :key="entry.path">
-            <button class="row" @click="open(entry)">
-              <strong>{{ entry.name }}</strong>
-              <span class="muted mono">{{ entry.path }}</span>
-            </button>
-          </li>
-        </ul>
-        <p v-else class="empty muted">
-          Nothing saved yet. Recordings are kept in
-          <span class="mono">{{ savedDirectory }}</span>
-        </p>
-      </div>
-    </div>
+    <Modal v-if="browsing" title="打开录制" @close="browsing = null">
+      <p class="muted mono">{{ browsing.directory }}</p>
+      <div v-if="!browsing.recordings.length" class="empty">还没有保存过录制</div>
+      <button
+        v-for="saved in browsing.recordings"
+        :key="saved.path"
+        class="saved"
+        @click="openSaved(saved.path)"
+      >
+        <span class="grow ellipsis">{{ saved.name }}</span>
+        <span class="muted">{{ saved.modified ?? "" }}</span>
+      </button>
+    </Modal>
   </div>
 </template>
 
 <style scoped>
 .shell {
+  height: 100%;
   display: flex;
   flex-direction: column;
-  height: 100vh;
 }
-
-.titlebar {
-  display: flex;
-  align-items: baseline;
-  gap: 10px;
-  padding: 8px 12px;
-  border-bottom: 1px solid var(--line);
-  background: var(--panel);
-}
-
-.banner {
-  padding: 10px 12px 0;
-}
-
-.spacer {
-  flex: 1;
-}
-
-.name {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-}
-
-.name input {
-  width: 220px;
-}
-
-.outcome {
-  border-left: 3px solid #6b7280;
-  padding: 0.5rem 0.75rem;
-  font-size: 0.85rem;
-}
-.outcome.succeeded {
-  border-left-color: #16a34a;
-}
-.outcome.failed {
-  border-left-color: #dc2626;
-}
-.outcome .verdict {
-  display: flex;
-  gap: 0.75rem;
-  align-items: baseline;
-}
-.outcome .took {
-  color: #6b7280;
-}
-.outcome .dismiss {
-  margin-left: auto;
-}
-.outcome .why {
-  margin: 0.35rem 0;
-}
-.outcome .why em {
-  color: #6b7280;
-  font-style: normal;
-}
-.outcome .steps {
-  margin: 0.35rem 0 0;
-  padding-left: 1.25rem;
-  display: grid;
-  gap: 0.1rem;
-  /* Measured: each row is 15px, so a twenty-step recording expands to sixty
-     executed steps and a panel 107% of the window's height, pushing the three
-     columns off screen entirely. Twelve rows is four recorded actions, enough to
-     see a typical replay whole; beyond that this scrolls and the failed step is
-     brought into view rather than the layout giving way. */
-  max-height: 12rem;
-  overflow-y: auto;
-}
-.outcome .steps li {
-  display: flex;
-  gap: 0.5rem;
-}
-.outcome .steps li.failed span {
-  color: #dc2626;
-  font-weight: 600;
-}
-/* The step it stopped at, so the eye goes there rather than counting down the
-   list to find the one that is not green. */
-.outcome .steps li.stumbled {
-  background: #fef2f2;
-}
-
-.live {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 8px 12px;
-  font-size: 13px;
-  background: rgba(220, 60, 60, 0.12);
-  border-bottom: 1px solid var(--line);
-}
-
-.live span:nth-child(2) {
-  flex: 1;
-}
-
-.dot {
-  width: 9px;
-  height: 9px;
-  border-radius: 50%;
-  background: #e04b4b;
-  animation: pulse 1.4s ease-in-out infinite;
-}
-
-@keyframes pulse {
-  50% { opacity: 0.25; }
-}
-
-.warn {
-  color: #e0a34b;
-}
-
-button.recording {
-  border-color: #e04b4b;
-  color: #e04b4b;
-}
-
-.note {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  font-size: 13px;
-}
-
-.note span {
-  flex: 1;
-}
-
-.saved {
-  margin: 0;
-  padding: 6px;
-  overflow: auto;
-  list-style: none;
-}
-
-.saved .row {
-  display: flex;
-  flex-direction: column;
-  align-items: flex-start;
-  gap: 2px;
-  width: 100%;
-  padding: 8px 10px;
-  text-align: left;
-}
-
-.empty {
-  padding: 16px 12px;
-  font-size: 13px;
-}
-
-main {
-  flex: 1;
-  min-height: 0;
-  display: grid;
-  /* minmax(0, 1fr) rather than 1fr: a fr track's minimum is its content width,
-     so one long unbreakable string -- the snapshot id on every outline row --
-     pushes the column past the viewport and carries the right-hand panel off
-     screen with it. Measured before the fix: a 1536px viewport, a middle column
-     grown to 1318px, and the Recording panel starting at x=1578. */
-  grid-template-columns: 260px minmax(0, 1fr) 380px;
-}
-
-.overlay {
-  position: fixed;
-  inset: 0;
-  background: rgba(0, 0, 0, 0.6);
-  display: grid;
-  place-items: center;
-}
-
-.sheet {
-  width: min(760px, 90vw);
-  max-height: 80vh;
-  display: flex;
-  flex-direction: column;
-  background: var(--panel);
-  border: 1px solid var(--line);
-  border-radius: 10px;
-  overflow: hidden;
-}
-
-.sheet header {
+.bar {
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 10px 12px;
+  padding: 10px 14px;
+  background: var(--surface);
   border-bottom: 1px solid var(--line);
 }
-
-.sheet h3 {
-  margin: 0;
-  flex: 1;
-  font-size: 14px;
+.brand {
+  font-weight: 800;
+  letter-spacing: 0.02em;
+  padding: 2px 8px;
+  border-radius: 6px;
+  background: var(--accent);
+  color: var(--on-accent);
 }
-
-pre {
-  margin: 0;
+.name {
+  width: 240px;
+  font-weight: 600;
+  border-color: transparent;
+  background: transparent;
+}
+.name:hover {
+  border-color: var(--line);
+}
+.spacer {
+  flex: 1;
+}
+.record .dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  margin-right: 4px;
+  border-radius: 50%;
+  background: var(--record);
+}
+.record.live {
+  border-color: var(--record);
+  color: var(--record);
+}
+.record.live .dot {
+  animation: pulse 1s infinite;
+}
+@keyframes pulse {
+  50% {
+    opacity: 0.25;
+  }
+}
+.live-chip {
+  color: var(--record);
+}
+.notice {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 14px;
+  border-bottom: 1px solid var(--line);
+}
+.notice.error {
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+.notice.ok {
+  background: var(--ok-soft);
+  color: var(--ok);
+}
+.hint {
+  color: var(--text);
+}
+.columns {
+  flex: 1;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: 260px minmax(320px, 1fr) minmax(360px, 440px);
+  gap: 12px;
   padding: 12px;
-  overflow: auto;
+}
+.saved {
+  display: flex;
+  gap: 10px;
+  width: 100%;
+  text-align: left;
 }
 </style>

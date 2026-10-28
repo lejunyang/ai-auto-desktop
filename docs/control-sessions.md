@@ -138,6 +138,19 @@ CDP 仅接受 loopback 调试地址，显式 `--browser-port` 才启用；不会
 独占 device lease，视觉观察按其当前规则撤销，WebView 不等于这里的通用 CDP DOM。
 上层可统一编排生命周期和不确定结果处理，不能假定两个 provider 的全部动作、观察租期或引用格式可直接互换。
 
+## 保存的步骤
+
+`aad_control::steps` 定义平台无关的步骤：`app`（provider、进程或应用名、标题片段、网址前缀，
+必须恰好匹配一个目标）、`locator`、`action`（不含会话引用；drag 的终点写在 `to`）或 `check`
+（`present` 与 `within_ms`），以及可选的 `input`（fill/type_text 的文字运行时传入，敏感值不落盘）。
+回放时列目标 → 选出唯一的应用 → observe → find → act，每次都重新定位。
+
+录制文档是 `kind: Recording`、`format: control-steps/1`；编译出的工作流只用
+`control.session.act@1` / `check@1`，声明 `desktop.input`、`desktop.observe` 权限。
+`aad run` 和 MCP `run_workflow` 都注册这个 provider。只含步骤的工作流不在会话串行锁下运行
+（每个请求自己取锁），把步骤和直接 driver 动作混在一起的工作流会被 MCP 拒绝。
+Windows 的 UIA 录制结果由 `steps::from_windows_capture` 转成这种格式，无法回放的动作返回原因。
+
 ## 验证与剩余范围
 
 `osdk run control-test` 跑纯逻辑、真实子进程 stdio、三平台原生适配 mock 和 MCP 回归。
@@ -158,5 +171,5 @@ CI 和 release 工作流使用官方 one-sdk Action 最新正式版本，不依�
 `aad do click <id> --role AXTextArea --button right` 弹出菜单；`aad do scroll <id> --role AXTextArea --direction down`
 在长文档里滚动；在“访达”列表里 `aad do drag` 把文件拖进文件夹。
 Windows/macOS 的新适配路由在 CI 以 mock 编译/测试；Windows 的输入桌面、macOS TCC 和跨机器 SSH
-未在真实设备验证。Wayland 原生输入、完整 OOPIF、浏览器拖拽与新标签页、通用跨平台 key、GUI 迁移、结果缓存、
+未在真实设备验证。Wayland 原生输入、完整 OOPIF、浏览器拖拽与新标签页、Linux/macOS 的自动录制、结果缓存、
 自动重放与统一 Android wire adapter 均不在本次范围。录制/回放及事件观察保持已有实现，不提升其可靠性声明。

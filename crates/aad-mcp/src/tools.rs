@@ -1866,8 +1866,8 @@ mod tests {
         workflow["outputs"] = json!({});
         store.save("recorded", workflow);
 
-        let result = run_workflow(&stub_session(), &json!({"name": "recorded"}))
-            .expect("the run completes");
+        let result =
+            run_workflow(&stub_session(), &json!({"name": "recorded"})).expect("the run completes");
 
         assert_eq!(
             result["status"],

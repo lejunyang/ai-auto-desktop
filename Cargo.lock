@@ -89,10 +89,10 @@ dependencies = [
 name = "aad-gui"
 version = "0.0.1"
 dependencies = [
+ "aad-control",
  "aad-core",
  "aad-probe",
  "aad-runtime",
- "aad-uia",
  "serde",
  "serde_json",
  "tauri",

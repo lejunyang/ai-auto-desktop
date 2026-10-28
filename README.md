@@ -17,7 +17,8 @@ macOS AX 与显式启用的 Chromium CDP 共用会话、资源、观察引用和
 详见[统一控制与远程会话](docs/control-sessions.md)。
 
 给人用的 `apps/describe/overview/snapshot/find/do` 命令也走同一个会话层，三个平台都能用。
-GUI、`aad record` 和 `aad watch` 仍直接使用 Windows UIA；录制、回放和事件观察的限制见[控制能力审视](docs/research/control-audit-2026-10-17.md)。
+GUI 也走同一个会话，三个平台都能查看界面、搭建和回放步骤；自动录制人的操作（GUI 的“录制”、`aad record`、`aad watch`）目前只在 Windows 上可用。
+录制、回放和事件观察的限制见[控制能力审视](docs/research/control-audit-2026-10-17.md)。
 
 浏览器任务观测使用 `aad browser-record`：记录操作、关键元素变化、网络请求和截图，生成给 AI 编写 skill 的步骤说明。`aad browser-record start --browser edge --url 'https://example.com' --out ./recording` 自动启动并录制，可用 `--profile-dir` 复用工作 profile，或用 `--existing-profile [ID]` 选择日常已有 profile（只有一个时无需填 ID）。占用时默认提示，显式 `--kill-browser` 才结束占用浏览器并启动。**网络默认保留原值，`--redact-network` 才开启脱敏**。详见[浏览器任务录制](docs/browser-recording.md)。
 
@@ -308,11 +309,20 @@ npm run tauri dev      # 开发模式
 npm run tauri build    # 打包
 ```
 
-三栏布局：左侧是正在运行的程序，中间是所选窗口的界面结构（可过滤、显示每个元素支持的
-动作），右侧是录制出的步骤序列，可启用/禁用、上下调序、补填文本、导出。
+三栏布局：左侧是窗口和浏览器页面（底部可填浏览器调试端口），中间是所选窗口的元素
+（可筛选；Windows 上可按区域查看），右侧是步骤。
 
-导出结果就是 `aad validate` 能直接接受的工作流描述文件——GUI 产出的和 CLI 运行的是同一
-份契约，且有测试锁定二者不会漂移。
+- **搭建步骤**：在中间点一个元素，选它支持的操作（触发、点击、填写、按键、滚动、拖到……，
+  或“等它出现 / 消失”），“添加”或“添加并执行”。三个平台都可用。
+- **录制**（Windows）：点“录制”后直接操作窗口，步骤实时出现在右侧；无法回放的动作会被略过并提示。
+- **编辑与回放**：每一步可单独执行、改定位条件和应用条件（“测试定位”立即看匹配结果）、调序、删除；
+  “运行全部”经工作流引擎逐步回放，失败的步骤标红并给出恢复建议。
+- **保存**：录制文件和工作流都存进录制目录。步骤是平台无关的格式（`control-steps/1`）：
+  应用按进程/应用名、标题片段或网址前缀命名，元素用定位器，动作用会话的类型化动作，
+  不保存任何会话内引用，所以同一份录制可以在 `aad run`、MCP 的 `run_workflow` 和 GUI 里回放。
+  回放要授予工作流声明的权限：`aad run x.workflow.json --permission desktop.input --permission desktop.observe`。
+
+`npm run dev` 在普通浏览器里打开界面时没有后台，会用虚构的演示数据，便于调界面。
 
 ### 密码框：可写不可读
 
