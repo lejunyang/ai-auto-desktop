@@ -335,6 +335,24 @@ run_workflow(greeter, ...)  → {"status":"succeeded","outputs":{...}}
 该模式下 stdout 由协议独占，任何诊断信息都走 stderr，客户端解析不会错位。失败会以结构化
 错误返回，并附带可执行的恢复建议（例如界面已变化时提示"重新读取窗口后重试"）。
 
+## 请人协助（aad assist）
+
+Agent 遇到自己做不了的事（扫码之外的登录、验证码、需要人拿主意的地方）时，把屏幕交给人：
+
+```powershell
+aad assist --browser-port 9222            # 分享一个浏览器页面（CDP screencast）
+aad assist --desktop                      # 分享整个桌面（目前只有 Windows）
+aad assist --desktop --view-only          # 只给看，不接收鼠标键盘
+```
+
+启动后在 stdout 打印一行 JSON：`url`（自带的查看页）、`websocket`、`token`。只监听本机回环地址，
+每个连接都要带 token；omem 这类宿主把 WebSocket 代理到自己的网页上渲染。消息都是 JSON 文本帧：
+服务端发 `ready` 和 `frame`（JPEG，base64，带宽高），查看端发 `mouse`（move/down/up/wheel，位置是画面内 0..1 的比例）、
+`key`（Enter、方向键、F1–F12、修饰键等非文字按键）和 `text`（输入的文字）。浏览器画面的输入用 CDP `Input.*`
+发给页面，桌面用 `SendInput`。这是给人用的通道，按屏幕位置操作，所以不通过 MCP 提供给 Agent。
+`tests/assist/verify_assist.py` 用真实 Chrome（加 `--desktop` 再测 Windows 桌面）检查画面送达、点击和输入生效、
+错误 token 被拒绝。Linux 和 macOS 的整桌面分享还没有做。
+
 ## 桌面窗口（GUI）
 
 ```powershell

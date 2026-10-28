@@ -7,6 +7,7 @@
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
+mod assist;
 mod browser_launch;
 mod browser_record;
 mod cdp_watch;
@@ -82,6 +83,11 @@ enum Command {
     /// Record browser task evidence: actions, network, semantic changes and screenshots.
     #[command(subcommand)]
     BrowserRecord(browser_record::Command),
+    /// Share a browser page or the desktop with a person, who can use it remotely.
+    ///
+    /// Prints a loopback URL with a token, then streams the screen over a
+    /// WebSocket and passes the viewer's mouse and keyboard on until Ctrl+C.
+    Assist(assist::AssistArgs),
     /// Serve the Model Context Protocol over stdio, for AI clients.
     Mcp(control::McpArgs),
     /// Persistent unified desktop/browser control, locally or over SSH stdio.
@@ -399,6 +405,13 @@ fn dispatch(command: &Command) -> (Value, u8) {
         Command::Find(args) => desk::find(args),
         Command::Do(command) => desk::act(command),
         Command::Capture(args) => desk::capture(args),
+        Command::Assist(args) => match assist::run(args) {
+            Ok(value) => (value, EXIT_OK),
+            Err(message) => (
+                json!({"status": "error", "error": {"code": "ASSIST.FAILED", "message": message}}),
+                EXIT_FAILED,
+            ),
+        },
         Command::Record(args) => desk::record(args),
         Command::Watch(args) => run_watch(args),
         Command::BrowserRecord(command) => match browser_record::run(command) {
