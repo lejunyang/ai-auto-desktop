@@ -53,18 +53,28 @@ if [ "${1:-}" = --inside-session ]; then
   AAD_CONTROL_CLI="$root/target/debug/aad" cargo run --locked -q -p aad-control --example native_fixture -- "$fixture_pid"
   # The commands a person runs go through the same session, one process each.
   aad="$root/target/debug/aad"
+  # Invoke and XTest input reach Qt asynchronously; look again until the effect shows.
+  eventually() {
+    local filter=$1; shift
+    for _ in $(seq 1 50); do
+      "$aad" --compact find "$resource" "$@" | jq -e "$filter" >/dev/null && return 0
+      sleep 0.1
+    done
+    "$aad" --compact find "$resource" "$@" >&2
+    return 1
+  }
   resource=$("$aad" --compact apps | jq -r --argjson pid "$fixture_pid"     '.apps[] | select(.metadata.process_id == $pid and .metadata.toolkit_name == "Qt") | .resource_id')
   [ -n "$resource" ]
   "$aad" --compact do fill "$resource" --role text --name "Qt fixture text entry" --value "CLI session fill" >/dev/null
-  "$aad" --compact find "$resource" --role text --name "Qt fixture text entry"     | jq -e '.found and .node.value == "CLI session fill"' >/dev/null
+  eventually '.found and .node.value == "CLI session fill"' --role text --name "Qt fixture text entry"
   "$aad" --compact do invoke "$resource" --role push_button --name "Reset Qt fixture status" >/dev/null
-  "$aad" --compact find "$resource" --name "Qt fixture status idle" | jq -e '.found' >/dev/null
+  eventually '.found' --name "Qt fixture status idle"
   # Gestures and chords go through the XTest helper's new commands.
   "$aad" --compact do click "$resource" --role push_button --name "Invoke Qt fixture button" --count 2 >/dev/null
-  "$aad" --compact find "$resource" --name "Qt fixture status invoked" | jq -e '.found' >/dev/null
+  eventually '.found' --name "Qt fixture status invoked"
   "$aad" --compact do key "$resource" --role text --name "Qt fixture text entry" --keys ctrl,a >/dev/null
   "$aad" --compact do type-text "$resource" --role text --name "Qt fixture text entry" --text "chord" >/dev/null
-  "$aad" --compact find "$resource" --role text --name "Qt fixture text entry"     | jq -e '.node.value == "chord"' >/dev/null
+  eventually '.node.value == "chord"' --role text --name "Qt fixture text entry"
   # Recording: XRecord sees the XTest click, AT-SPI reports the text change.
   recorded=${TMPDIR:-/tmp}/aad-rust-atspi-recording.json
   "$aad" --compact record "$resource" --seconds 6 >"$recorded" &
