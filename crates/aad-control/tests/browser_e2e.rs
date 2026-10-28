@@ -1,9 +1,13 @@
-#![cfg(target_os = "linux")]
+#![cfg(any(target_os = "linux", windows))]
 //! Real, sandboxed Chromium against a private loopback page and empty profile.
+//!
+//! Linux CI points AAD_TEST_CHROME at a sandboxed Chromium; on Windows any
+//! installed Chrome or Edge works, since the profile is a fresh temporary one.
 use aad_control::{browser::BrowserBackend, *};
 use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::net::TcpListener;
+#[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -19,6 +23,13 @@ const PAGE: &str = r#"<!doctype html><html><body>
 <output id="status" aria-label="Status">ready</output>
 <input id="protected" aria-label="Protected" type="password" value="redacted-fixture">
 <button aria-label="Duplicate">a</button><button aria-label="Duplicate">b</button>
+<select aria-label="Size" onchange="document.getElementById('status').value='size:'+this.value"><option value="s">Small</option><option value="l">Large</option></select>
+<input type="checkbox" aria-label="Agree" onchange="document.getElementById('status').value='agree:'+this.checked">
+<input type="radio" name="tier" aria-label="Basic" checked><input type="radio" name="tier" aria-label="Pro">
+<button aria-label="Pointer" onmousedown="document.getElementById('status').value='down:'+event.button+':'+event.isTrusted" ondblclick="document.getElementById('status').value='dbl:'+event.isTrusted" onmouseenter="document.getElementById('status').value='hover:'+event.isTrusted">Pointer</button>
+<div aria-label="Log" style="height:40px;overflow:auto" onscroll="document.getElementById('status').value='scrolled:'+(this.scrollTop>0)"><div style="height:400px">rows</div></div>
+<div style="position:relative"><button aria-label="Covered">Covered</button><div style="position:absolute;inset:0;background:white"></div></div>
+<a href="/second" aria-label="Second page">second</a>
 <iframe src="/frame"></iframe>
 </body></html>"#;
 
@@ -51,10 +62,11 @@ impl Fixture {
                             .unwrap();
                         let mut bytes = [0u8; 8192];
                         let count = stream.read(&mut bytes).unwrap_or(0);
-                        let frame =
-                            String::from_utf8_lossy(&bytes[..count]).starts_with("GET /frame");
-                        let body = if frame {
-                            "<!doctype html><input aria-label='FrameInput'>"
+                        let request = String::from_utf8_lossy(&bytes[..count]);
+                        let body = if request.starts_with("GET /frame") {
+                            "<!doctype html><input aria-label='FrameInput'><div style='height:900px'></div>"
+                        } else if request.starts_with("GET /second") {
+                            "<!doctype html><title>Second</title><body><p aria-label='Second marker'>second</p></body>"
                         } else {
                             PAGE
                         };
@@ -83,6 +95,7 @@ impl Fixture {
             .stdout(Stdio::null())
             .stderr(Stdio::inherit());
         // Reclaim only this fixture's own process group, never all Chrome processes.
+        #[cfg(unix)]
         unsafe {
             command.pre_exec(|| {
                 if libc::setsid() == -1 {
@@ -143,6 +156,7 @@ impl Fixture {
 }
 impl Drop for Fixture {
     fn drop(&mut self) {
+        #[cfg(unix)]
         unsafe {
             libc::kill(-(self.child.id() as i32), libc::SIGTERM);
         }
@@ -150,6 +164,7 @@ impl Drop for Fixture {
         while self.child.try_wait().ok().flatten().is_none() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(20));
         }
+        #[cfg(unix)]
         unsafe {
             libc::kill(-(self.child.id() as i32), libc::SIGKILL);
         }
@@ -194,8 +209,34 @@ fn find(session: &Session, observation: &Value, role: &str, name: &str) -> Targe
     assert!(response.error.is_none(), "find {role}/{name}: {response:?}");
     serde_json::from_value(response.data.unwrap()["target"].clone()).unwrap()
 }
+fn document(session: &Session, observation: &Value) -> Target {
+    let response = call(
+        session,
+        Operation::Find {
+            observation_id: observation["observation_id"].as_str().unwrap().into(),
+            locator: Box::new(Locator {
+                role: Some("document".into()),
+                ..Default::default()
+            }),
+            expect: Default::default(),
+        },
+    );
+    assert!(response.error.is_none(), "find document: {response:?}");
+    serde_json::from_value(response.data.unwrap()["target"].clone()).unwrap()
+}
 fn act(session: &Session, target: Target, action: Action) -> Response {
     call(session, Operation::Act { target, action })
+}
+fn node<'a>(observation: &'a Value, name: &str) -> &'a Value {
+    observation["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|node| node["name"] == name)
+        .unwrap_or_else(|| panic!("no node named {name}"))
+}
+fn actions(observation: &Value, name: &str) -> Vec<String> {
+    serde_json::from_value(node(observation, name)["actions"].clone()).unwrap()
 }
 fn status(observation: &Value) -> &str {
     observation["nodes"]
@@ -310,6 +351,152 @@ fn browser_actions_are_observed_document_bound_and_have_real_page_effects() {
     assert!(act(&session, target, Action::click()).error.is_none());
     let observed = observe(&session, main);
     assert_eq!(status(&observed), "clicked:false");
+    // Choices: a list box by label or value, a checkbox both ways, a radio only on.
+    let target = find(&session, &observed, "combobox", "Size");
+    assert_eq!(
+        node(&observed, "Size")["options"],
+        json!(["Small", "Large"])
+    );
+    let result = act(
+        &session,
+        target,
+        Action::Select {
+            option: "Large".into(),
+        },
+    );
+    assert!(result.error.is_none(), "{result:?}");
+    let observed = observe(&session, main);
+    assert_eq!(status(&observed), "size:l");
+    let target = find(&session, &observed, "combobox", "Size");
+    let missing = act(
+        &session,
+        target,
+        Action::Select {
+            option: "Huge".into(),
+        },
+    );
+    assert_eq!(missing.error.unwrap()["code"], "CONTROL.OPTION_NOT_FOUND");
+    let observed = observe(&session, main);
+    let target = find(&session, &observed, "checkbox", "Agree");
+    assert_eq!(node(&observed, "Agree")["states"]["checked"], false);
+    assert!(act(&session, target, Action::Check { checked: true })
+        .error
+        .is_none());
+    let observed = observe(&session, main);
+    assert_eq!(status(&observed), "agree:true");
+    let target = find(&session, &observed, "checkbox", "Agree");
+    let unchanged = act(&session, target, Action::Check { checked: true });
+    assert_eq!(unchanged.data.unwrap()["backend_result"]["unchanged"], true);
+    let observed = observe(&session, main);
+    let target = find(&session, &observed, "radio", "Basic");
+    assert_eq!(
+        act(&session, target, Action::Check { checked: false })
+            .error
+            .unwrap()["code"],
+        "CONTROL.ACTION_UNSUPPORTED",
+        "a radio is cleared by checking another"
+    );
+
+    // Trusted pointer input: right button, double click, hover and the wheel.
+    let observed = observe(&session, main);
+    let target = find(&session, &observed, "button", "Pointer");
+    let right = act(
+        &session,
+        target,
+        Action::Click {
+            button: Some(Button::Right),
+            count: None,
+            fraction: None,
+        },
+    );
+    assert!(right.error.is_none(), "{right:?}");
+    let observed = observe(&session, main);
+    assert_eq!(status(&observed), "down:2:true");
+    let target = find(&session, &observed, "button", "Pointer");
+    assert!(act(
+        &session,
+        target,
+        Action::Click {
+            button: None,
+            count: Some(2),
+            fraction: None
+        }
+    )
+    .error
+    .is_none());
+    let observed = observe(&session, main);
+    assert_eq!(status(&observed), "dbl:true");
+    fixture
+        .client()
+        .eval("document.getElementById('status').value='ready'")
+        .unwrap();
+    let observed = observe(&session, main);
+    let target = find(&session, &observed, "textbox", "Name");
+    // Move the pointer off the button so entering it again is observable.
+    assert!(act(
+        &session,
+        target,
+        Action::Hover {
+            ms: Some(1),
+            fraction: None
+        }
+    )
+    .error
+    .is_none());
+    let observed = observe(&session, main);
+    let target = find(&session, &observed, "button", "Pointer");
+    assert!(act(
+        &session,
+        target,
+        Action::Hover {
+            ms: Some(50),
+            fraction: None
+        }
+    )
+    .error
+    .is_none());
+    let observed = observe(&session, main);
+    assert_eq!(status(&observed), "hover:true");
+    assert!(actions(&observed, "Log").contains(&"scroll".to_string()));
+    let target = find(&session, &observed, "generic", "Log");
+    let wheel = act(
+        &session,
+        target,
+        Action::Scroll {
+            direction: Direction::Down,
+            notches: Some(2),
+            fraction: None,
+        },
+    );
+    assert!(wheel.error.is_none(), "{wheel:?}");
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let observed = observe(&session, main);
+        if status(&observed) == "scrolled:true" {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the wheel did not scroll the log"
+        );
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    // A point that lands on something laid over the element is refused, not clicked.
+    let observed = observe(&session, main);
+    let target = find(&session, &observed, "button", "Covered");
+    let covered = act(
+        &session,
+        target,
+        Action::Click {
+            button: None,
+            count: None,
+            fraction: Some(Fraction { fx: 0.5, fy: 0.5 }),
+        },
+    );
+    assert_eq!(covered.effect, "not_applied");
+    assert_eq!(covered.error.unwrap()["code"], "CONTROL.OCCLUDED");
+
+    let observed = observe(&session, main);
     let target = find(&session, &observed, "button", "Save");
     fixture
         .client()
@@ -319,6 +506,18 @@ fn browser_actions_are_observed_document_bound_and_have_real_page_effects() {
     assert_eq!(stale.effect, "not_applied");
     assert_eq!(stale.error.unwrap()["code"], "CONTROL.STALE_TARGET");
     let observed = observe(&session, frame);
+    for name in [
+        "key", "scroll", "hover", "navigate", "back", "forward", "reload",
+    ] {
+        assert!(
+            observed["nodes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|n| !n["actions"].as_array().unwrap().iter().any(|a| a == name)),
+            "{name} must not be offered inside a frame"
+        );
+    }
     let frame_target = find(&session, &observed, "textbox", "FrameInput");
     let mut forged = frame_target.clone();
     forged.resource_id = main.into();
@@ -409,4 +608,55 @@ fn browser_actions_are_observed_document_bound_and_have_real_page_effects() {
     );
     assert_eq!(stale.effect, "not_applied");
     assert_eq!(stale.error.unwrap()["code"], "CONTROL.STALE_TARGET");
+
+    // Page actions live on the document node and address the main frame.
+    let wait_for = |session: &Session, suffix: &str| {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if fixture.client().state().unwrap().url.ends_with(suffix) {
+                // Let the new document finish building before it is observed.
+                std::thread::sleep(Duration::from_millis(100));
+                return observe(session, main);
+            }
+            assert!(Instant::now() < deadline, "did not reach {suffix}");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+    let observed = wait_for(&session, "/other");
+    let body = document(&session, &observed);
+    let refused = act(
+        &session,
+        body,
+        Action::Navigate {
+            url: "file:///etc/passwd".into(),
+        },
+    );
+    assert_eq!(refused.error.unwrap()["code"], "CONTROL.INVALID_REQUEST");
+    let observed = observe(&session, main);
+    let body = document(&session, &observed);
+    let url = format!("{}second", fixture.url);
+    assert!(act(&session, body, Action::Navigate { url })
+        .error
+        .is_none());
+    let observed = wait_for(&session, "/second");
+    assert!(observed["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|n| n["name"] == "Second marker"));
+    let body = document(&session, &observed);
+    assert!(act(&session, body, Action::Back {}).error.is_none());
+    let observed = wait_for(&session, "/other");
+    let body = document(&session, &observed);
+    assert!(act(&session, body, Action::Forward {}).error.is_none());
+    let observed = wait_for(&session, "/second");
+    let body = document(&session, &observed);
+    let reload = act(&session, body, Action::Reload {});
+    assert!(reload.error.is_none(), "{reload:?}");
+    let observed = wait_for(&session, "/second");
+    let body = document(&session, &observed);
+    assert!(
+        act(&session, body, Action::Forward {}).error.unwrap()["code"]
+            == "CONTROL.ACTION_UNSUPPORTED"
+    );
 }

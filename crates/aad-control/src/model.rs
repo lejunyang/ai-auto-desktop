@@ -192,9 +192,24 @@ pub enum Action {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         to_fraction: Option<Fraction>,
     },
+    /// Choose one option of a list box by its label or value.
+    Select {
+        option: String,
+    },
+    /// Set a checkbox, switch or radio button to this state.
+    Check {
+        checked: bool,
+    },
+    /// Load an http(s) address in the observed page.
+    Navigate {
+        url: String,
+    },
+    Back {},
+    Forward {},
+    Reload {},
 }
 
-pub const ACTION_NAMES: [&str; 9] = [
+pub const ACTION_NAMES: [&str; 15] = [
     "focus",
     "invoke",
     "click",
@@ -204,7 +219,16 @@ pub const ACTION_NAMES: [&str; 9] = [
     "scroll",
     "hover",
     "drag",
+    "select",
+    "check",
+    "navigate",
+    "back",
+    "forward",
+    "reload",
 ];
+
+/// Actions on the page as a whole, offered on its document node.
+pub const PAGE_ACTIONS: [&str; 4] = ["navigate", "back", "forward", "reload"];
 
 impl Action {
     /// A plain left click.
@@ -226,6 +250,12 @@ impl Action {
             Self::Scroll { .. } => "scroll",
             Self::Hover { .. } => "hover",
             Self::Drag { .. } => "drag",
+            Self::Select { .. } => "select",
+            Self::Check { .. } => "check",
+            Self::Navigate { .. } => "navigate",
+            Self::Back {} => "back",
+            Self::Forward {} => "forward",
+            Self::Reload {} => "reload",
         }
     }
     /// A left single click at the centre needs nothing beyond a plain click.

@@ -264,8 +264,10 @@ aad mcp --allow-input    # 由启动它的人授予输入
   Windows 上还支持 automation_id、class_name、value、states、`match: contains`、`within`、`near`、`nth`；
   其他平台遇到这些字段会明确拒绝，不会忽略。`expect: optional` 用来问"这个东西没了吗"。
 - `control_act` 的动作：focus、invoke、click（可选 button、count、元素内 fraction）、fill、type_text（unicode/keys）、
-  key、scroll、hover、drag（终点必须是同一次观察里的另一个节点）。位置只能是元素内 0..1 的比例。
-  以观察结果里每个节点的 `capabilities` 为准：浏览器只支持普通 click、fill、key、focus。
+  key、scroll、hover、drag（终点必须是同一次观察里的另一个节点）、select（列表框选项）、check（复选框、开关、单选），
+  以及浏览器页面的 navigate（只限 http/https）、back、forward、reload。位置只能是元素内 0..1 的比例。
+  以观察结果里每个节点的 `capabilities` 为准。浏览器里普通 click 是 DOM 激活；带位置、按键或双击时改发可信的指针事件，
+  落点被别的元素盖住时拒绝（`CONTROL.OCCLUDED`），不会点到盖在上面的东西。
 - 失败以结构化错误返回，并附 `hint` 说明怎样恢复（例如界面变了要重新 observe，匹配多个要用 `within` 收窄）。
 
 **保存与运行流程**（重复劳动）：`save_workflow`、`list_workflows`、`describe_workflow`、`run_workflow`。

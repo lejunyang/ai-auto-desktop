@@ -65,8 +65,10 @@ fn action_schema() -> Value {
     button. Prefer this over click where offered: it does not depend on window position or \
     z-order.", json!({}), &[]),
         variant("click", "Click the element. A plain left click unless a button, a double \
-    click or a position is given; those need a provider that offers gestures. In a browser \
-    this is DOM activation and takes no options.", json!({
+    click or a position is given; those need a provider that offers gestures. In a browser a \
+    plain click is DOM activation (isTrusted false, works in frames); giving a position, a \
+    button or a count sends trusted pointer input instead, main frame only, and is refused if \
+    something else covers the element.", json!({
             "button": button_schema(),
             "count": {"type": "integer", "enum": [1, 2], "description": "1 for a single click, 2 for a double click."},
             "fraction": fraction_schema("Where inside the element to click")
@@ -92,7 +94,8 @@ fn action_schema() -> Value {
     navigation and editing keys.", json!({
             "keys": {"type": "array", "items": {"type": "string", "maxLength": 32}, "minItems": 1, "maxItems": 6}
         }), &["keys"]),
-        variant("scroll", "Scroll the wheel over the element.", json!({
+        variant("scroll", "Scroll the wheel over the element. In a browser, offered on the \
+    page body and on scrollable containers of the main frame.", json!({
             "direction": {"enum": ["up", "down", "left", "right"]},
             "notches": {"type": "integer", "minimum": 1, "maximum": 30, "description": "Wheel detents. Defaults to 3."},
             "fraction": fraction_schema("Where inside the element to scroll")
@@ -109,6 +112,22 @@ fn action_schema() -> Value {
             "fraction": fraction_schema("Where inside the source element to grab"),
             "to_fraction": fraction_schema("Where inside the destination element to release")
         }), &["to"]),
+        variant("select", "Choose one option of a list box (a browser <select>), by its \
+    label as the observation lists it in `options`, or by its value.", json!({
+            "option": {"type": "string", "minLength": 1, "maxLength": 1024}
+        }), &["option"]),
+        variant("check", "Set a checkbox, switch or radio button to checked or unchecked. \
+    Nothing is clicked when it is already in that state; a radio button is cleared by checking \
+    another one.", json!({
+            "checked": {"type": "boolean"}
+        }), &["checked"]),
+        variant("navigate", "Load an http or https address in the observed browser page. \
+    Offered on the page's document node of the main frame.", json!({
+            "url": {"type": "string", "minLength": 8, "maxLength": 2048}
+        }), &["url"]),
+        variant("back", "Go back one page in the observed browser page's history.", json!({}), &[]),
+        variant("forward", "Go forward one page in the observed browser page's history.", json!({}), &[]),
+        variant("reload", "Reload the observed browser page.", json!({}), &[]),
     ]})
 }
 
@@ -347,6 +366,12 @@ or take the node_id from an outline."
         "CONTROL.VIEW_UNSUPPORTED" => {
             "Regions are computed for Windows windows only. Observe with view mode outline."
         }
+        "CONTROL.OCCLUDED" => {
+            "Something is laid over the element, such as a dialog, a banner or a menu, so pointer input would land on that instead. Observe again and deal with what covers it, or use a plain click (DOM activation) if that is enough."
+        }
+        "CONTROL.OPTION_NOT_FOUND" => {
+            "No option has that label or value. The observation lists the labels in the node's `options`."
+        }
         "CONTROL.TARGET_UNKNOWN" => {
             "Call control_targets first, then observe a resource_id it returned."
         }
@@ -417,6 +442,9 @@ mod tests {
                     "value" | "text" => json!("x"),
                     "keys" => json!(["enter"]),
                     "direction" => json!("down"),
+                    "option" => json!("x"),
+                    "checked" => json!(true),
+                    "url" => json!("https://example.com/"),
                     "to" => {
                         json!({"session_id":"s","resource_id":"r","observation_id":"o","node_id":"n"})
                     }

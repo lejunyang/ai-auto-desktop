@@ -1,5 +1,8 @@
 //! Explicit CDP page/frame resources. No arbitrary evaluation in the public API.
-use crate::{error, native::resource_id, Action, Backend, BackendResource, Resource, Result};
+use crate::{
+    error, native::resource_id, Action, Backend, BackendResource, Button, Direction, Resource,
+    Result, PAGE_ACTIONS,
+};
 use aad_cdp::{Client, Target};
 use aad_core::AutomationError;
 use serde_json::{json, Value};
@@ -9,6 +12,12 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 pub const PROVIDER: &str = "browser.cdp";
+
+/// CDP `Input` and page navigation address the page, not a frame, so they are
+/// offered only where the observed frame is the main one.
+const MAIN_FRAME_ONLY: [&str; 7] = [
+    "key", "scroll", "hover", "navigate", "back", "forward", "reload",
+];
 
 struct Page {
     client: Client,
@@ -171,7 +180,12 @@ impl Backend for BrowserBackend {
         PROVIDER
     }
     fn capabilities(&self) -> Vec<String> {
-        vec!["focus".into(), "click".into(), "fill".into(), "key".into()]
+        [
+            "focus", "click", "fill", "key", "scroll", "hover", "select", "check", "navigate",
+            "back", "forward", "reload",
+        ]
+        .map(String::from)
+        .to_vec()
     }
     fn resources(&self, timeout: Duration) -> Result<Vec<BackendResource>> {
         let deadline = Instant::now() + timeout;
@@ -190,12 +204,12 @@ impl Backend for BrowserBackend {
                 let main = frame["id"] == root;
                 let mut capabilities = self.capabilities();
                 // CDP Input targets the page's focused frame. Until cross-process
-                // frame routing is implemented, keyboard input is main-frame only.
+                // frame routing is implemented, input and navigation are main-frame only.
                 if !main {
-                    capabilities.retain(|s| s != "key");
+                    capabilities.retain(|s| !MAIN_FRAME_ONLY.contains(&s.as_str()));
                 }
                 resources.push(BackendResource {resource:Resource {resource_id:resource_id(PROVIDER,&selector),provider:PROVIDER.into(),kind:"browser".into(),
-                    name:target.title.clone(),capabilities,metadata:json!({"page_id":target.id,"frame_id":frame["id"],"url":frame["url"],"main_frame":main,"click_semantics":"dom_activation","fill_semantics":"dom_value_and_events","key_semantics":"cdp_input_main_frame"})},selector});
+                    name:target.title.clone(),capabilities,metadata:json!({"page_id":target.id,"frame_id":frame["id"],"url":frame["url"],"main_frame":main,"click_semantics":"dom_activation; trusted cdp input with button, count or fraction","fill_semantics":"dom_value_and_events","key_semantics":"cdp_input_main_frame","pointer_semantics":"cdp_input_main_frame"})},selector});
             }
         }
         if self.closed.load(Ordering::SeqCst) {
@@ -221,7 +235,7 @@ impl Backend for BrowserBackend {
             *self.last_context.lock().unwrap()=Some((page_id.into(),context));
             let mut result=eval(client,context,format!("globalThis.__aadControlV1.observe({}, {})",serde_json::to_string(&observation).unwrap(),max_nodes))?;
             let main=frame.get("parentId").is_none();
-            if !main {if let Some(nodes)=result["nodes"].as_array_mut(){for node in nodes {if let Some(actions)=node["actions"].as_array_mut(){actions.retain(|v|v!="key");}}}}
+            if !main {if let Some(nodes)=result["nodes"].as_array_mut(){for node in nodes {if let Some(actions)=node["actions"].as_array_mut(){actions.retain(|v|!MAIN_FRAME_ONLY.iter().any(|name|v==name));}}}}
             result["snapshot_id"]=json!(observation);
             result["metadata"]=json!({"page_id":page_id,"frame_id":frame_id,"loader_id":frame["loaderId"],"context_id":context,"main_frame":main});
             Ok(result)
@@ -235,13 +249,6 @@ impl Backend for BrowserBackend {
         action_context: &crate::Context,
     ) -> Result<Value> {
         let meta = &snapshot["metadata"];
-        // DOM activation has no button, count or position to honour.
-        if matches!(action, Action::Click { .. }) && !action.plain_click() {
-            return Err(error(
-                "CONTROL.ACTION_UNSUPPORTED",
-                "browser click supports only a plain activation",
-            ));
-        }
         if !node["actions"]
             .as_array()
             .is_some_and(|a| a.iter().any(|v| v == action.name()))
@@ -251,13 +258,38 @@ impl Backend for BrowserBackend {
                 "node does not support this browser operation",
             ));
         }
+        // A plain click is DOM activation and works in any frame; a button, a
+        // count or a position needs trusted input, which addresses the page.
+        let trusted = match action {
+            Action::Click { .. } => !action.plain_click(),
+            Action::Scroll { .. } | Action::Hover { .. } => true,
+            _ => false,
+        };
+        if trusted && meta["main_frame"] != true {
+            return Err(error(
+                "CONTROL.ACTION_UNSUPPORTED",
+                "trusted pointer input is supported only for the main frame",
+            ));
+        }
         let page_id = meta["page_id"].as_str().unwrap();
         let frame_id = meta["frame_id"].as_str().unwrap();
         self.with_page(page_id,action_context.remaining()?,|client|{
             if current_frame(client,frame_id)?["loaderId"]!=meta["loader_id"] {return Err(error("CONTROL.STALE_TARGET","browser document navigated"));}
             let context=meta["context_id"].as_i64().unwrap();
             let mut args=json!({"document_token":snapshot["document_token"],"observation":snapshot["snapshot_id"],"node_id":node["node_id"],"action":action.name()});
-            if let Action::Fill {value}=action {args["value"]=json!(value);}
+            match action {
+                Action::Fill {value}=>args["value"]=json!(value),
+                Action::Select {option}=>args["option"]=json!(option),
+                Action::Check {checked}=>args["checked"]=json!(checked),
+                Action::Click {fraction:Some(f),..}|Action::Scroll {fraction:Some(f),..}|Action::Hover {fraction:Some(f),..}=>args["fraction"]=json!({"fx":f.fx,"fy":f.fy}),
+                _=>{}
+            }
+            if trusted {
+                return pointer(client,context,&args,action,action_context);
+            }
+            if PAGE_ACTIONS.contains(&action.name()) {
+                return page(client,context,&args,action,action_context);
+            }
             if let Action::Key {keys}=action {
                 if meta["main_frame"]!=true {return Err(error("CONTROL.ACTION_UNSUPPORTED","keyboard input is supported only for the main frame"));}
                 let (key,code,virtual_key,modifiers)=key_chord(keys)?;
@@ -283,6 +315,135 @@ impl Backend for BrowserBackend {
             }
         })
     }
+}
+
+fn mouse(client: &mut Client, params: Value) -> Result<Value> {
+    command(client, "Input.dispatchMouseEvent", params).map_err(|e| e.with_effect("unknown"))
+}
+
+/// Trusted pointer input at a point the page confirmed lands on the node.
+fn pointer(
+    client: &mut Client,
+    context: i64,
+    args: &Value,
+    action: &Action,
+    action_context: &crate::Context,
+) -> Result<Value> {
+    let point = checked(eval(
+        client,
+        context,
+        format!("globalThis.__aadControlV1.point({args})"),
+    )?)?;
+    let (Some(x), Some(y)) = (point["x"].as_f64(), point["y"].as_f64()) else {
+        return Err(error("BROWSER.BAD_RESULT", "page did not report a point"));
+    };
+    action_context.commit()?;
+    mouse(client, json!({"type": "mouseMoved", "x": x, "y": y}))?;
+    match action {
+        Action::Click { button, count, .. } => {
+            let (name, mask) = match button {
+                None | Some(Button::Left) => ("left", 1),
+                Some(Button::Right) => ("right", 2),
+                Some(Button::Middle) => ("middle", 4),
+            };
+            for click in 1..=count.unwrap_or(1) {
+                mouse(
+                    client,
+                    json!({"type": "mousePressed", "x": x, "y": y, "button": name, "buttons": mask, "clickCount": click}),
+                )?;
+                mouse(
+                    client,
+                    json!({"type": "mouseReleased", "x": x, "y": y, "button": name, "buttons": 0, "clickCount": click}),
+                )?;
+            }
+        }
+        Action::Scroll {
+            direction, notches, ..
+        } => {
+            let distance = 100.0 * f64::from(notches.unwrap_or(3));
+            let (dx, dy) = match direction {
+                Direction::Up => (0.0, -distance),
+                Direction::Down => (0.0, distance),
+                Direction::Left => (-distance, 0.0),
+                Direction::Right => (distance, 0.0),
+            };
+            mouse(
+                client,
+                json!({"type": "mouseWheel", "x": x, "y": y, "deltaX": dx, "deltaY": dy}),
+            )?;
+        }
+        Action::Hover { ms, .. } => {
+            let dwell = Duration::from_millis(u64::from(ms.unwrap_or(500)));
+            std::thread::sleep(dwell.min(action_context.remaining()?));
+        }
+        _ => unreachable!("only pointer actions are trusted"),
+    }
+    Ok(
+        json!({"submitted": true, "native_operation": "Input.dispatchMouseEvent", "trusted_event": true}),
+    )
+}
+
+/// Navigation of the observed page, after confirming the document is the one observed.
+fn page(
+    client: &mut Client,
+    context: i64,
+    args: &Value,
+    action: &Action,
+    action_context: &crate::Context,
+) -> Result<Value> {
+    checked(eval(
+        client,
+        context,
+        format!("globalThis.__aadControlV1.confirm({args})"),
+    )?)?;
+    let step = match action {
+        Action::Back {} => Some(-1),
+        Action::Forward {} => Some(1),
+        _ => None,
+    };
+    let entry = match step {
+        Some(step) => {
+            let history = command(client, "Page.getNavigationHistory", json!({}))?;
+            let index = history["currentIndex"].as_i64().unwrap_or(0) + step;
+            let entry = usize::try_from(index)
+                .ok()
+                .and_then(|index| history["entries"].as_array()?.get(index).cloned());
+            Some(entry.ok_or_else(|| {
+                error(
+                    "CONTROL.ACTION_UNSUPPORTED",
+                    "there is no page in that direction of the history",
+                )
+            })?)
+        }
+        None => None,
+    };
+    action_context.commit()?;
+    let unknown = |e: AutomationError| e.with_effect("unknown");
+    let operation = match action {
+        Action::Navigate { url } => {
+            let result = command(client, "Page.navigate", json!({"url": url})).map_err(unknown)?;
+            if let Some(text) = result["errorText"].as_str().filter(|t| !t.is_empty()) {
+                return Err(error("BROWSER.NAVIGATION_FAILED", text).with_effect("contextual"));
+            }
+            "Page.navigate"
+        }
+        Action::Back {} | Action::Forward {} => {
+            let entry = entry.expect("looked up above");
+            command(
+                client,
+                "Page.navigateToHistoryEntry",
+                json!({"entryId": entry["id"]}),
+            )
+            .map_err(unknown)?;
+            "Page.navigateToHistoryEntry"
+        }
+        Action::Reload {} => {
+            command(client, "Page.reload", json!({})).map_err(unknown)?;
+            "Page.reload"
+        }
+        _ => unreachable!("only page actions reach here"),
+    };
+    Ok(json!({"submitted": true, "native_operation": operation}))
 }
 
 impl Drop for BrowserBackend {

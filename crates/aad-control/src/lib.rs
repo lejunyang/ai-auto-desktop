@@ -778,8 +778,23 @@ fn validate_action(action: &Action) -> Result<()> {
     let text = match action {
         Action::Fill { value } => Some(value),
         Action::TypeText { text, .. } => Some(text),
+        Action::Select { option } => Some(option),
         _ => None,
     };
+    if let Action::Navigate { url } = action {
+        let scheme = url
+            .split_once("://")
+            .map(|(scheme, _)| scheme.to_ascii_lowercase());
+        if url.len() > 2048
+            || url.chars().any(char::is_control)
+            || !matches!(scheme.as_deref(), Some("http" | "https"))
+        {
+            return Err(error(
+                "CONTROL.INVALID_REQUEST",
+                "navigate takes an http or https address of at most 2048 characters",
+            ));
+        }
+    }
     if text.is_some_and(|s| s.len() > 4096 || s.contains('\0')) {
         return Err(error(
             "CONTROL.INVALID_REQUEST",
