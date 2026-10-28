@@ -296,7 +296,7 @@ aad mcp --allow-input    # 由启动它的人授予输入
 
 一个例子：打开浏览器到登录页 → `control_capture` 二维码发给人扫 → 隔几秒比对 digest，变了就重发 →
 登录后在页面上操作 → `browser_record_stop` → 读 `evidence/network.jsonl` 找到返回订单数据的接口。
-`tests/browser/verify_mcp_browser_session.py` 用本机的假站点在真实 Chrome 里走完这一遍。
+`tests/windows/verify_mcp_browser_session.py` 用本机的假站点在真实 Chrome 里走完这一遍。
 
 命令行同样能操作浏览器：设置 `AAD_CDP_PORT=<端口>` 后，`aad apps`、`aad describe`、`aad do`、`aad capture`
 都会把这个调试端口上的浏览器页面算进来，例如 `aad browser-record start --browser chrome` 启动时打印的端口。
@@ -362,7 +362,7 @@ aad assist --desktop --view-only          # 只给看，不接收鼠标键盘
 
 浏览器画面的输入用 CDP `Input.*` 发给页面，桌面用 `SendInput`。这是给人用的通道，按屏幕位置操作，
 所以不通过 MCP 提供给 Agent。
-`tests/assist/verify_assist.py` 用真实 Chrome（加 `--desktop` 再测 Windows 桌面）检查默认收到 WebP、
+`tests/windows/verify_assist.py` 用真实 Chrome（加 `--desktop` 再测 Windows 桌面）检查默认收到 WebP、
 声明只要 JPEG 时收到 JPEG、点击和输入生效、错误 token 被拒绝。Linux 和 macOS 的整桌面分享还没有做。
 
 ## 桌面窗口（GUI）
