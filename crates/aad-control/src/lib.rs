@@ -50,6 +50,22 @@ pub trait Backend: Send + Sync {
     }
     fn resources(&self, timeout: Duration) -> Result<Vec<BackendResource>>;
     fn observe(&self, selector: &Value, max_nodes: usize, timeout: Duration) -> Result<Value>;
+    /// Shape a retained snapshot for the caller. `None` uses the portable
+    /// outline; a provider answers with `nodes` keyed by `node_id`, or `regions`.
+    fn view(&self, _snapshot: &Value, _view: &View, _timeout: Duration) -> Result<Option<Value>> {
+        Ok(None)
+    }
+    /// Resolve a locator inside a retained snapshot, answering
+    /// `{"found", "node_id", "match_count"}`. `None` uses the portable exact matcher.
+    fn find(
+        &self,
+        _snapshot: &Value,
+        _locator: &Locator,
+        _expect: Expect,
+        _timeout: Duration,
+    ) -> Result<Option<Value>> {
+        Ok(None)
+    }
     fn act(
         &self,
         snapshot: &Value,
@@ -74,6 +90,8 @@ struct Observation {
     provider: String,
     resource_id: String,
     raw: Value,
+    /// The captured nodes with session targets and negotiated capabilities.
+    nodes: Vec<Value>,
     created: Instant,
 }
 
@@ -451,6 +469,7 @@ impl Session {
             Operation::Observe {
                 resource_id,
                 max_nodes,
+                view,
             } => {
                 if *max_nodes == 0 || *max_nodes > MAX_NODES {
                     return Err(error(
@@ -458,6 +477,7 @@ impl Session {
                         "max_nodes must be in 1..2000",
                     ));
                 }
+                validate_view(view)?;
                 let item = self
                     .state
                     .lock()
@@ -517,21 +537,59 @@ impl Session {
                         provider: item.resource.provider,
                         resource_id: resource_id.clone(),
                         raw: raw.clone(),
+                        nodes: nodes.clone(),
                         created: Instant::now(),
                     },
                 );
-                Ok(
-                    json!({"observation_id": observation_id, "resource_id": resource_id, "nodes": nodes, "truncated": raw["truncated"] == true, "metadata": raw.get("metadata").cloned().unwrap_or(Value::Null)}),
-                )
+                drop(state);
+                let mut answer = json!({"observation_id": observation_id, "resource_id": resource_id, "node_count": nodes.len(), "truncated": raw["truncated"] == true, "metadata": raw.get("metadata").cloned().unwrap_or(Value::Null)});
+                match view.mode {
+                    ViewMode::Nodes => answer["nodes"] = json!(nodes),
+                    ViewMode::Outline | ViewMode::Overview => {
+                        let shaped = match backend.view(&raw, view, context.remaining()?)? {
+                            Some(shaped) => shaped,
+                            None => portable_view(&nodes, view)?,
+                        };
+                        context.remaining()?;
+                        let Value::Object(shaped) = shaped else {
+                            return Err(error(
+                                "CONTROL.BAD_PROVIDER_OUTPUT",
+                                "view was not an object",
+                            ));
+                        };
+                        for (key, value) in shaped {
+                            answer[key] = value;
+                        }
+                        // Provider views name nodes; targets and negotiated
+                        // capabilities always come from the retained capture.
+                        if let Some(shown) = answer["nodes"].as_array_mut() {
+                            for item in shown {
+                                let full = item["node_id"]
+                                    .as_str()
+                                    .and_then(|id| nodes.iter().find(|n| n["node_id"] == id));
+                                let Some(full) = full else {
+                                    return Err(error(
+                                        "CONTROL.BAD_PROVIDER_OUTPUT",
+                                        "view named a node outside the observation",
+                                    ));
+                                };
+                                item["capabilities"] = full["capabilities"].clone();
+                                item["target"] = full["target"].clone();
+                            }
+                        }
+                    }
+                }
+                Ok(answer)
             }
             Operation::Find {
                 observation_id,
                 locator,
+                expect,
             } => {
-                if locator.name.is_none() && locator.role.is_none() && locator.node_id.is_none() {
+                if locator.is_empty() {
                     return Err(error(
                         "CONTROL.INVALID_REQUEST",
-                        "find requires at least one exact condition",
+                        "find requires at least one condition",
                     ));
                 }
                 let observation = self.observation(observation_id)?;
@@ -541,28 +599,29 @@ impl Session {
                         "truncated observation cannot prove uniqueness",
                     ));
                 }
-                let nodes = observation.raw["nodes"].as_array().unwrap();
-                let matching: Vec<_> = nodes
-                    .iter()
-                    .filter(|n| {
-                        locator.name.as_ref().is_none_or(|v| n["name"] == *v)
-                            && locator.role.as_ref().is_none_or(|v| n["role"] == *v)
-                            && locator.node_id.as_ref().is_none_or(|v| n["node_id"] == *v)
-                    })
-                    .collect();
-                if matching.len() != 1 {
-                    return Err(error(
-                        if matching.is_empty() {
-                            "CONTROL.NOT_FOUND"
-                        } else {
-                            "CONTROL.AMBIGUOUS"
-                        },
-                        "find must resolve exactly one observed node",
-                    ));
+                let backend = &self.backends[&observation.provider];
+                let resolved =
+                    match backend.find(&observation.raw, locator, *expect, context.remaining()?)? {
+                        Some(resolved) => resolved,
+                        None => portable_find(&observation.nodes, locator, *expect)?,
+                    };
+                context.remaining()?;
+                if resolved["found"] != true {
+                    return Ok(
+                        json!({"found": false, "match_count": 0, "observation_id": observation_id}),
+                    );
                 }
-                let node = matching[0];
+                let node = resolved["node_id"]
+                    .as_str()
+                    .and_then(|id| observation.nodes.iter().find(|n| n["node_id"] == id))
+                    .ok_or_else(|| {
+                        error(
+                            "CONTROL.BAD_PROVIDER_OUTPUT",
+                            "find named a node outside the observation",
+                        )
+                    })?;
                 Ok(
-                    json!({"node": node, "target": Target { session_id: self.id.clone(), resource_id: observation.resource_id, observation_id: observation_id.clone(), node_id: node["node_id"].as_str().unwrap().into() }}),
+                    json!({"found": true, "match_count": resolved["match_count"].as_u64().unwrap_or(1), "node": node, "target": node["target"]}),
                 )
             }
             Operation::Act { target, action } => {
@@ -594,12 +653,35 @@ impl Session {
                     ));
                 }
                 validate_action(action)?;
-                let node = observation.raw["nodes"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .find(|n| n["node_id"] == target.node_id)
-                    .ok_or_else(|| error("CONTROL.STALE_TARGET", "node was not observed"))?;
+                let observed = |id: &str| {
+                    observation.raw["nodes"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .find(|n| n["node_id"] == id)
+                        .ok_or_else(|| error("CONTROL.STALE_TARGET", "node was not observed"))
+                };
+                let node = observed(&target.node_id)?;
+                if let Action::Drag { to, .. } = action {
+                    // Both ends must come from the same view of the same resource,
+                    // so one live revalidation covers the whole gesture.
+                    if to.session_id != target.session_id
+                        || to.resource_id != target.resource_id
+                        || to.observation_id != target.observation_id
+                    {
+                        return Err(error(
+                            "CONTROL.INVALID_REQUEST",
+                            "drag destination must belong to the same observation",
+                        ));
+                    }
+                    if to.node_id == target.node_id {
+                        return Err(error(
+                            "CONTROL.INVALID_REQUEST",
+                            "drag destination must be a different node",
+                        ));
+                    }
+                    observed(&to.node_id)?;
+                }
                 let backend = &self.backends[&observation.provider];
                 if !backend
                     .capabilities()
@@ -663,7 +745,7 @@ impl Session {
 fn validate_action(action: &Action) -> Result<()> {
     let text = match action {
         Action::Fill { value } => Some(value),
-        Action::TypeText { text } => Some(text),
+        Action::TypeText { text, .. } => Some(text),
         _ => None,
     };
     if text.is_some_and(|s| s.len() > 4096 || s.contains('\0')) {
@@ -680,7 +762,149 @@ fn validate_action(action: &Action) -> Result<()> {
             ));
         }
     }
+    let invalid = |message: &str| Err(error("CONTROL.INVALID_REQUEST", message.to_string()));
+    let fractions: Vec<&Fraction> = match action {
+        Action::Click { fraction, .. }
+        | Action::Scroll { fraction, .. }
+        | Action::Hover { fraction, .. } => fraction.iter().collect(),
+        Action::Drag {
+            fraction,
+            to_fraction,
+            ..
+        } => fraction.iter().chain(to_fraction.iter()).collect(),
+        _ => Vec::new(),
+    };
+    if fractions
+        .iter()
+        .any(|f| !(0.0..=1.0).contains(&f.fx) || !(0.0..=1.0).contains(&f.fy))
+    {
+        return invalid("fraction must lie within the element: fx and fy in 0..1");
+    }
+    match action {
+        Action::Click { count: Some(c), .. } if !matches!(c, 1 | 2) => {
+            invalid("click count must be 1 or 2")
+        }
+        Action::Scroll {
+            notches: Some(n), ..
+        } if !(1..=30).contains(n) => invalid("scroll notches must be in 1..30"),
+        Action::Hover { ms: Some(ms), .. } if !(1..=5000).contains(ms) => {
+            invalid("hover ms must be in 1..5000")
+        }
+        _ => Ok(()),
+    }
+}
+
+fn validate_view(view: &View) -> Result<()> {
+    if view
+        .limit
+        .is_some_and(|limit| limit == 0 || limit > MAX_OUTLINE_LIMIT)
+        || view.max_characters.is_some_and(|chars| {
+            !(MIN_OUTLINE_CHARACTERS..=MAX_OUTLINE_CHARACTERS).contains(&chars)
+        })
+    {
+        return Err(error(
+            "CONTROL.INVALID_REQUEST",
+            "view limit must be in 1..500 and max_characters in 500..200000",
+        ));
+    }
+    if view.mode != ViewMode::Outline
+        && (view.region.is_some() || view.limit.is_some() || view.max_characters.is_some())
+    {
+        return Err(error(
+            "CONTROL.INVALID_REQUEST",
+            "region, limit and max_characters shape an outline view only",
+        ));
+    }
     Ok(())
+}
+
+/// Elements a caller can act on or read, in capture order, within both the
+/// element and character ceilings. Providers with richer structure override it.
+fn portable_view(nodes: &[Value], view: &View) -> Result<Value> {
+    if view.mode == ViewMode::Overview || view.region.is_some() {
+        return Err(error(
+            "CONTROL.VIEW_UNSUPPORTED",
+            "this provider has no region overview; observe with an outline view",
+        ));
+    }
+    let limit = view.limit.unwrap_or(DEFAULT_OUTLINE_LIMIT);
+    let budget = view.max_characters.unwrap_or(DEFAULT_OUTLINE_CHARACTERS);
+    let eligible: Vec<&Value> = nodes
+        .iter()
+        .filter(|n| {
+            n["capabilities"].as_array().is_some_and(|c| !c.is_empty())
+                || n["name"].as_str().is_some_and(|s| !s.is_empty())
+        })
+        .filter(|n| n["states"]["offscreen"] != true)
+        .collect();
+    let mut shown = Vec::new();
+    let mut characters = 0;
+    let mut stopped_by = Value::Null;
+    for node in &eligible {
+        if shown.len() >= limit {
+            stopped_by = json!("limit");
+            break;
+        }
+        let size = serde_json::to_string(node).map(|s| s.len()).unwrap_or(0);
+        if characters + size > budget {
+            stopped_by = json!("characters");
+            break;
+        }
+        characters += size;
+        shown.push((*node).clone());
+    }
+    Ok(json!({
+        "nodes": shown,
+        "shown": shown.len(),
+        "matched": eligible.len(),
+        "outline_truncated": shown.len() < eligible.len(),
+        "stopped_by": stopped_by,
+    }))
+}
+
+/// Exact `role` / `name` / `node_id` matching, the subset every provider shares.
+fn portable_find(nodes: &[Value], locator: &Locator, expect: Expect) -> Result<Value> {
+    if locator.extended() {
+        return Err(error(
+            "CONTROL.LOCATOR_UNSUPPORTED",
+            "this provider matches only role, name and node_id exactly",
+        ));
+    }
+    let matching: Vec<_> = nodes
+        .iter()
+        .filter(|n| {
+            locator.name.as_ref().is_none_or(|v| n["name"] == *v)
+                && locator.role.as_ref().is_none_or(|v| n["role"] == *v)
+                && locator.node_id.as_ref().is_none_or(|v| n["node_id"] == *v)
+        })
+        .collect();
+    match matching.as_slice() {
+        [] if expect == Expect::Optional => Ok(json!({"found": false})),
+        [] => Err(error(
+            "CONTROL.NOT_FOUND",
+            "find must resolve exactly one observed node",
+        )
+        .with_retryable(true)),
+        [only] => Ok(json!({"found": true, "node_id": only["node_id"], "match_count": 1})),
+        many => {
+            let mut failure = error(
+                "CONTROL.AMBIGUOUS",
+                format!("the locator matched {} observed nodes", many.len()),
+            );
+            failure
+                .details
+                .insert("match_count".into(), json!(many.len()));
+            failure.details.insert(
+                "candidates".into(),
+                json!(many
+                    .iter()
+                    .take(10)
+                    .map(|n| json!({"node_id": n["node_id"], "role": n["role"], "name": n["name"]}))
+                    .collect::<Vec<_>>()),
+            );
+            Err(failure)
+        }
+    }
 }
 
 #[cfg(test)]

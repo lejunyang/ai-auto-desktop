@@ -172,6 +172,7 @@ fn observe(session: &Session, resource: &str) -> Value {
         Operation::Observe {
             resource_id: resource.into(),
             max_nodes: 500,
+            view: Default::default(),
         },
     );
     assert!(response.error.is_none(), "{response:?}");
@@ -182,11 +183,12 @@ fn find(session: &Session, observation: &Value, role: &str, name: &str) -> Targe
         session,
         Operation::Find {
             observation_id: observation["observation_id"].as_str().unwrap().into(),
-            locator: Locator {
+            locator: Box::new(Locator {
                 name: Some(name.into()),
                 role: Some(role.into()),
                 ..Default::default()
-            },
+            }),
+            expect: Default::default(),
         },
     );
     assert!(response.error.is_none(), "find {role}/{name}: {response:?}");
@@ -271,10 +273,11 @@ fn browser_actions_are_observed_document_bound_and_have_real_page_effects() {
             &session,
             Operation::Find {
                 observation_id: first["observation_id"].as_str().unwrap().into(),
-                locator: Locator {
+                locator: Box::new(Locator {
                     name: Some("Duplicate".into()),
                     ..Default::default()
-                }
+                }),
+                expect: Default::default(),
             }
         )
         .error
@@ -304,7 +307,7 @@ fn browser_actions_are_observed_document_bound_and_have_real_page_effects() {
     let observed = observe(&session, main);
     assert_eq!(status(&observed), "key:true");
     let target = find(&session, &observed, "button", "Save");
-    assert!(act(&session, target, Action::Click {}).error.is_none());
+    assert!(act(&session, target, Action::click()).error.is_none());
     let observed = observe(&session, main);
     assert_eq!(status(&observed), "clicked:false");
     let target = find(&session, &observed, "button", "Save");
@@ -312,7 +315,7 @@ fn browser_actions_are_observed_document_bound_and_have_real_page_effects() {
         .client()
         .eval("document.getElementById('save').setAttribute('aria-label','Replaced')")
         .unwrap();
-    let stale = act(&session, target, Action::Click {});
+    let stale = act(&session, target, Action::click());
     assert_eq!(stale.effect, "not_applied");
     assert_eq!(stale.error.unwrap()["code"], "CONTROL.STALE_TARGET");
     let observed = observe(&session, frame);

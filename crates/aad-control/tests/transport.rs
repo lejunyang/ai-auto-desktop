@@ -113,6 +113,7 @@ impl Harness {
             .call(Operation::Observe {
                 resource_id: "fixture:one".into(),
                 max_nodes: 10,
+                view: Default::default(),
             })
             .data
             .unwrap();
@@ -169,10 +170,11 @@ fn persistent_session_negotiates_targets_observes_finds_and_acts() {
     let target = h.target();
     let found = h.call(Operation::Find {
         observation_id: target.observation_id.clone(),
-        locator: Locator {
+        locator: Box::new(Locator {
             name: Some("Save".into()),
             ..Default::default()
-        },
+        }),
+        expect: Default::default(),
     });
     assert_eq!(
         found.data.unwrap()["target"],
@@ -181,7 +183,7 @@ fn persistent_session_negotiates_targets_observes_finds_and_acts() {
     assert!(h
         .call(Operation::Act {
             target,
-            action: Action::Click {}
+            action: Action::click()
         })
         .error
         .is_none());
@@ -198,7 +200,7 @@ fn client_cannot_elevate_server_grants_or_cross_session_targets() {
         read_only
             .call(Operation::Act {
                 target: target.clone(),
-                action: Action::Click {}
+                action: Action::click()
             })
             .error
             .unwrap()["code"],
@@ -210,7 +212,7 @@ fn client_cannot_elevate_server_grants_or_cross_session_targets() {
         other
             .call(Operation::Act {
                 target,
-                action: Action::Click {}
+                action: Action::click()
             })
             .error
             .unwrap()["code"],
@@ -225,7 +227,7 @@ fn cancellation_is_processed_during_an_in_flight_write() {
         None,
         Operation::Act {
             target,
-            action: Action::Click {},
+            action: Action::click(),
         },
     );
     let id = request.request_id.clone();
@@ -255,7 +257,7 @@ fn disconnect_during_input_is_unknown_and_never_retried() {
             None,
             Operation::Act {
                 target,
-                action: Action::Click {},
+                action: Action::click(),
             },
         ))
     });
@@ -304,7 +306,7 @@ fn reconnect_never_replays_pending_input_or_accepts_old_targets() {
             None,
             Operation::Act {
                 target,
-                action: Action::Click {},
+                action: Action::click(),
             },
         ))
     });
@@ -320,7 +322,7 @@ fn reconnect_never_replays_pending_input_or_accepts_old_targets() {
     assert_eq!(new.backend.writes.load(Ordering::SeqCst), 0);
     let rejected = new.call(Operation::Act {
         target: old_target,
-        action: Action::Click {},
+        action: Action::click(),
     });
     assert_eq!(rejected.commit_state, CommitState::NotCommitted);
     assert_eq!(rejected.error.unwrap()["code"], "CONTROL.SESSION_MISMATCH");

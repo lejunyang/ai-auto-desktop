@@ -116,3 +116,154 @@ fn platform_specific_selectors_actions_and_capabilities_are_not_conflated() {
         );
     }
 }
+
+#[test]
+fn windows_gestures_views_and_rich_locators_route_to_the_driver() {
+    struct Windows {
+        manifest: CapabilityManifest,
+        calls: Mutex<Vec<(String, Value)>>,
+    }
+    impl Provider for Windows {
+        fn manifest(&self) -> &CapabilityManifest {
+            &self.manifest
+        }
+        fn invoke(&self, action: &str, args: Value, _: Option<Duration>) -> Result<Value> {
+            self.calls.lock().unwrap().push((action.into(), args));
+            Ok(match action.rsplit('.').next().unwrap_or_default() {
+                "describe@1" => {
+                    json!({"elements":[{"node_id":"n","ref":"s:1:n","summary":"Button Save"}],"shown":1,"matched":1,"truncated":false})
+                }
+                "overview@1" => json!({"regions":[{"name":"toolbar","elements":4}]}),
+                "find@1" => json!({"found":true,"target":{"node_id":"n"},"match_count":1}),
+                _ => json!({"ok":true}),
+            })
+        }
+    }
+    let mut actions = Map::new();
+    for action in ["snapshot", "pointer_click", "pointer_gesture", "drag"] {
+        actions.insert(action.into(), json!({"contract_major":1}));
+    }
+    let provider = Arc::new(Windows {
+        manifest: manifest::parse(&manifest::document("desktop.windows_uia", actions)).unwrap(),
+        calls: Mutex::new(Vec::new()),
+    });
+    let backend = NativeBackend::new(provider.clone(), Flavor::Windows);
+    assert_eq!(
+        backend.capabilities(),
+        vec!["click", "scroll", "hover", "drag"]
+    );
+    let node = json!({"node_id":"n","actions":["pointer_click","pointer_gesture","drag"]});
+    assert_eq!(
+        backend.node_capabilities(&node),
+        vec!["click", "scroll", "hover", "drag"]
+    );
+    let snapshot = json!({"snapshot_id":"s","revision":1});
+    let context = || Context::new(Duration::from_secs(1), true);
+    let last = || provider.calls.lock().unwrap().last().cloned().unwrap();
+
+    backend
+        .act(&snapshot, &node, &Action::click(), &context())
+        .unwrap();
+    assert_eq!(last().0, "desktop.windows_uia.pointer_click@1");
+    let right = Action::Click {
+        button: Some(Button::Right),
+        count: None,
+        fraction: Some(Fraction { fx: 0.25, fy: 0.5 }),
+    };
+    backend.act(&snapshot, &node, &right, &context()).unwrap();
+    let (called, args) = last();
+    assert_eq!(called, "desktop.windows_uia.pointer_gesture@1");
+    assert_eq!(args["button"], "right");
+    assert_eq!(args["fraction"], json!({"fx":0.25,"fy":0.5}));
+    assert!(args.get("count").is_none());
+    let scroll = Action::Scroll {
+        direction: Direction::Down,
+        notches: Some(5),
+        fraction: None,
+    };
+    backend.act(&snapshot, &node, &scroll, &context()).unwrap();
+    assert_eq!(last().1["scroll"], json!({"direction":"down","notches":5}));
+    let drag = Action::Drag {
+        to: Target {
+            session_id: "x".into(),
+            resource_id: "r".into(),
+            observation_id: "o".into(),
+            node_id: "m".into(),
+        },
+        button: None,
+        fraction: None,
+        to_fraction: None,
+    };
+    backend.act(&snapshot, &node, &drag, &context()).unwrap();
+    let (called, args) = last();
+    assert_eq!(called, "desktop.windows_uia.drag@1");
+    assert_eq!(
+        args["to"],
+        json!({"snapshot_id":"s","revision":1,"node_id":"m"})
+    );
+
+    let outline = backend
+        .view(
+            &snapshot,
+            &View {
+                mode: ViewMode::Outline,
+                region: Some("toolbar".into()),
+                ..Default::default()
+            },
+            Duration::from_secs(1),
+        )
+        .unwrap()
+        .unwrap();
+    let (called, args) = last();
+    assert_eq!(called, "desktop.windows_uia.describe@1");
+    assert_eq!(args["snapshot_id"], "s");
+    assert_eq!(args["region"], "toolbar");
+    assert_eq!(outline["nodes"][0]["summary"], "Button Save");
+    assert!(outline["nodes"][0].get("ref").is_none());
+    let overview = backend
+        .view(
+            &snapshot,
+            &View {
+                mode: ViewMode::Overview,
+                ..Default::default()
+            },
+            Duration::from_secs(1),
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(overview["regions"][0]["name"], "toolbar");
+
+    let found = backend
+        .find(
+            &snapshot,
+            &Locator {
+                automation_id: Some("save".into()),
+                ..Default::default()
+            },
+            Expect::Optional,
+            Duration::from_secs(1),
+        )
+        .unwrap()
+        .unwrap();
+    let (called, args) = last();
+    assert_eq!(called, "desktop.windows_uia.find@1");
+    assert_eq!(args["locator"], json!({"automation_id":"save"}));
+    assert_eq!(args["expect"], "optional");
+    assert_eq!(found["node_id"], "n");
+
+    let linux = NativeBackend::new(
+        Fixture::new("desktop.linux_atspi", Flavor::Linux),
+        Flavor::Linux,
+    );
+    assert!(linux
+        .view(
+            &snapshot,
+            &View {
+                mode: ViewMode::Outline,
+                ..Default::default()
+            },
+            Duration::from_secs(1)
+        )
+        .unwrap()
+        .is_none());
+}

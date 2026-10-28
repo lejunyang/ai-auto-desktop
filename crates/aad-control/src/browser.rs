@@ -235,6 +235,13 @@ impl Backend for BrowserBackend {
         action_context: &crate::Context,
     ) -> Result<Value> {
         let meta = &snapshot["metadata"];
+        // DOM activation has no button, count or position to honour.
+        if matches!(action, Action::Click { .. }) && !action.plain_click() {
+            return Err(error(
+                "CONTROL.ACTION_UNSUPPORTED",
+                "browser click supports only a plain activation",
+            ));
+        }
         if !node["actions"]
             .as_array()
             .is_some_and(|a| a.iter().any(|v| v == action.name()))
