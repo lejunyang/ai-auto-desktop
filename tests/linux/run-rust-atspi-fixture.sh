@@ -86,6 +86,14 @@ if [ "${1:-}" = --inside-session ]; then
   act key "$resource" --role text --name "Qt fixture text entry" --keys ctrl,a
   act type-text "$resource" --role text --name "Qt fixture text entry" --text "chord"
   eventually '.node.value == "chord"' --role text --name "Qt fixture text entry"
+  # Both drag endpoints must be revalidated against one fresh tree. Checking
+  # them with two captures used to invalidate the destination before dispatch.
+  act fill "$resource" --name "Qt fixture text entry" --value "Drag across fields"
+  act fill "$resource" --name "Qt fixture XTest text entry" --value ""
+  act key "$resource" --name "Qt fixture text entry" --keys ctrl,a
+  act drag "$resource" --name "Qt fixture text entry" \
+    --to-name "Qt fixture XTest text entry" --fx 0.1 --fy 0.5 --to-fx 0.25 --to-fy 0.5
+  eventually '.node.value == "Drag across fields"' --name "Qt fixture XTest text entry"
   # Recording: XRecord sees the XTest click, AT-SPI reports the text change.
   recorded=${TMPDIR:-/tmp}/aad-rust-atspi-recording.json
   "$aad" --compact record "$resource" --seconds 6 >"$recorded" &

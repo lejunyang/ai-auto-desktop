@@ -551,11 +551,7 @@ impl AtspiProvider {
         Ok(json!({"target": target(&record, node_id), "node": node}))
     }
 
-    fn fresh_target(
-        &self,
-        args: &Map<String, Value>,
-        deadline: Instant,
-    ) -> Result<(Record, String, Value, NativeRef), AutomationError> {
+    fn observed_record(&self, args: &Map<String, Value>) -> Result<Record, AutomationError> {
         let target_value = args
             .get("target")
             .ok_or_else(|| invalid("target is required"))?;
@@ -563,10 +559,28 @@ impl AtspiProvider {
             .as_object()
             .ok_or_else(|| invalid("target must be an object"))?;
         only_keys(target_object, &["snapshot_id", "revision", "node_id"])?;
-        let record = self.current_record(
+        self.current_record(
             target_object.get("snapshot_id").unwrap_or(&Value::Null),
             target_object.get("revision").unwrap_or(&Value::Null),
-        )?;
+        )
+    }
+
+    fn revalidate_target(
+        args: &Map<String, Value>,
+        record: &Record,
+        fresh: &Record,
+        deadline: Instant,
+    ) -> Result<(String, Value, NativeRef), AutomationError> {
+        let target_object = args
+            .get("target")
+            .and_then(Value::as_object)
+            .ok_or_else(|| invalid("target must be an object"))?;
+        only_keys(target_object, &["snapshot_id", "revision", "node_id"])?;
+        if target_object.get("snapshot_id") != record.public.get("snapshot_id")
+            || target_object.get("revision") != record.public.get("revision")
+        {
+            return Err(stale("target does not belong to the observed snapshot"));
+        }
         if record.public["truncated"] == true {
             return Err(driver_error(
                 "DRIVER.SNAPSHOT_TRUNCATED",
@@ -579,24 +593,18 @@ impl AtspiProvider {
         )?
         .to_string();
         let locator = parse_locator(args.get("locator"))?;
-        let expected = resolve(&record, &locator, deadline)?;
+        let expected = resolve(record, &locator, deadline)?;
         if expected["node_id"] != node_id || !record.handles.contains_key(&node_id) {
             return Err(stale("target does not match the snapshot locator result"));
         }
         let expected_fingerprint = record.fingerprints[&node_id].clone();
-        let fresh = self.capture(
-            &record.application_selector,
-            record.max_depth,
-            record.max_nodes,
-            deadline,
-        )?;
         if fresh.public["truncated"] == true {
             return Err(driver_error(
                 "DRIVER.SNAPSHOT_TRUNCATED",
                 "fresh action snapshot is truncated",
             ));
         }
-        let resolved = resolve(&fresh, &locator, deadline).map_err(|error| {
+        let resolved = resolve(fresh, &locator, deadline).map_err(|error| {
             if matches!(error.code.as_str(), "DRIVER.NOT_FOUND" | "DRIVER.AMBIGUOUS") {
                 stale("locator no longer resolves to its original unique target").with_cause(error)
             } else {
@@ -615,7 +623,27 @@ impl AtspiProvider {
                 "locator resolved to a different native or semantic target",
             ));
         }
-        Ok((fresh, fresh_id, resolved, fresh_native))
+        Ok((fresh_id, resolved, fresh_native))
+    }
+
+    fn fresh_target(
+        &self,
+        args: &Map<String, Value>,
+        deadline: Instant,
+    ) -> Result<(Record, String, Value, NativeRef), AutomationError> {
+        let record = self.observed_record(args)?;
+        // Reject invalid observed references before asking the backend for a
+        // fresh tree. Both checks use the same identity/fingerprint rules.
+        Self::revalidate_target(args, &record, &record, deadline)?;
+        let fresh = self.capture(
+            &record.application_selector,
+            record.max_depth,
+            record.max_nodes,
+            deadline,
+        )?;
+        let (fresh_id, resolved, native) =
+            Self::revalidate_target(args, &record, &fresh, deadline)?;
+        Ok((fresh, fresh_id, resolved, native))
     }
 
     fn write(
@@ -649,6 +677,14 @@ impl AtspiProvider {
         {
             return Err(invalid("pointer_click supports only left/center"));
         }
+        // Refresh once for a drag. Refreshing the source already replaces the
+        // current snapshot; refreshing its destination separately would reject
+        // every valid destination as stale and could mix two different trees.
+        let drag_observation = if action == "drag" {
+            Some(self.observed_record(args)?)
+        } else {
+            None
+        };
         let (fresh, fresh_id, node, native) = self.fresh_target(args, deadline)?;
         let available = node["actions"].as_array().expect("normalized action array");
         if !available.iter().any(|value| value == action) {
@@ -699,7 +735,12 @@ impl AtspiProvider {
                 "locator".into(),
                 args.get("to_locator").cloned().unwrap_or(Value::Null),
             );
-            let (to_fresh, to_id, to_node, _) = self.fresh_target(&to_args, deadline)?;
+            let (to_id, to_node, _) = Self::revalidate_target(
+                &to_args,
+                drag_observation.as_ref().expect("captured for drag"),
+                &fresh,
+                deadline,
+            )?;
             if to_id == fresh_id {
                 return Err(invalid("drag needs a destination other than its source"));
             }
@@ -707,7 +748,7 @@ impl AtspiProvider {
                 parse_bounds(to_node.get("bounds"))?,
                 parse_fraction(args.get("to_fraction"))?,
             )?;
-            self.validate_point(&to_fresh, &to_id, to_point, deadline)?;
+            self.validate_point(&fresh, &to_id, to_point, deadline)?;
             Some(to_point)
         } else {
             None

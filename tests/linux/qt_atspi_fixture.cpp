@@ -31,6 +31,7 @@ int main(int argc, char **argv) {
     auto *layout = new QVBoxLayout(&window);
 
     auto *entry = new QLineEdit(&window);
+    entry->setDragEnabled(true);
     entry->setText("Qt fixture initial text");
     entry->setAccessibleName(kEntryName);
     entry->setObjectName("qt-fixture-entry");
