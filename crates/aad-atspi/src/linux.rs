@@ -30,7 +30,45 @@ const CAPTURE_OUTPUT_LIMIT: usize = 64 * 1024 * 1024;
 const CAPTURE_METADATA_LIMIT: usize = 64 * 1024;
 type ApplicationEntry = (NativeRef, Map<String, Value>);
 
+fn check_fcitx_text_input(session: &Connection) -> Result<(), AutomationError> {
+    let query_error = |error: zbus::Error| {
+        driver_error(
+            "DRIVER.INPUT_METHOD_UNVERIFIED",
+            "cannot verify the focused Fcitx5 input method before typing; use set_text/fill",
+        )
+        .with_detail("reason", json!(error.to_string()))
+        .with_detail("input_dispatched", json!(false))
+    };
+    let bus = Proxy::new(session, DBUS_NAME, DBUS_PATH, DBUS_INTERFACE).map_err(query_error)?;
+    let running: bool = bus
+        .call("NameHasOwner", &("org.fcitx.Fcitx5",))
+        .map_err(query_error)?;
+    if !running {
+        return Ok(());
+    }
+    let controller = Proxy::new(
+        session,
+        "org.fcitx.Fcitx5",
+        "/controller",
+        "org.fcitx.Fcitx.Controller1",
+    )
+    .map_err(query_error)?;
+    let method: String = controller
+        .call("CurrentInputMethod", &())
+        .map_err(query_error)?;
+    if !method.starts_with("keyboard-") || method == "keyboard-" {
+        return Err(driver_error(
+            "DRIVER.INPUT_METHOD_ACTIVE",
+            "Fcitx5 may compose synthetic keystrokes; switch the target to a keyboard input method or use set_text/fill",
+        )
+        .with_detail("input_method", json!(method))
+        .with_detail("input_dispatched", json!(false)));
+    }
+    Ok(())
+}
+
 pub struct LinuxBackend {
+    session_bus: Connection,
     connection: Connection,
     recordings: Mutex<BTreeMap<String, LinuxRecorder>>,
 }
@@ -55,6 +93,7 @@ impl LinuxBackend {
                 unavailable("AT-SPI accessibility bus is unavailable", &session, error)
             })?;
         let backend = Self {
+            session_bus,
             connection,
             recordings: Mutex::new(BTreeMap::new()),
         };
@@ -67,6 +106,13 @@ impl LinuxBackend {
             bus_name: REGISTRY_NAME.into(),
             object_path: REGISTRY_PATH.into(),
         }
+    }
+
+    fn check_text_input_method(&self, deadline: Instant) -> Result<(), AutomationError> {
+        remaining(deadline, false)?;
+        check_fcitx_text_input(&self.session_bus)?;
+        remaining(deadline, false)?;
+        Ok(())
     }
 
     fn native(reference: ObjectRef) -> NativeRef {
@@ -765,6 +811,11 @@ impl AtspiBackend for LinuxBackend {
         let path = self.helper(HelperKind::Input)?;
         let focus = self.focus(target, deadline)?;
         std::thread::sleep(Duration::from_millis(50).min(remaining(deadline, true)?));
+        // The input method is per focused context. Query after grab_focus, before
+        // any key or keyboard mapping is sent; XTest text can otherwise be
+        // consumed as composition and still report a successful dispatch.
+        self.check_text_input_method(deadline)
+            .map_err(after_focus)?;
         let args = [
             "type-text".to_string(),
             "--expected-pid".into(),
