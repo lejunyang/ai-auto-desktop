@@ -100,12 +100,18 @@ if { [ -e "$output" ] || [ -L "$output" ]; } &&
     printf '%s\n' '既有 helper 目标身份不可信。' >&2
     exit 72
 fi
-set -- $(pkg-config --cflags --libs x11)
+link_mode=-pie
+if [ "${AAD_LINUX_STATIC:-0}" = 1 ]; then
+    set -- $(pkg-config --static --cflags --libs x11)
+    link_mode=-static-pie
+else
+    set -- $(pkg-config --cflags --libs x11)
+fi
 temporary=$(mktemp "$build_dir/.x11_capture_helper.XXXXXX")
 trap 'rm -f -- "$temporary"' EXIT HUP INT TERM
 g++ -std=c++17 -O2 -Wall -Wextra -Werror -fPIE -D_FORTIFY_SOURCE=2 \
     "$script_dir/x11_capture_helper.cpp" -o "$temporary" "$@" \
-    -pie -Wl,-z,relro,-z,now
+    "$link_mode" -Wl,-z,relro,-z,now
 chmod 0755 "$temporary"
 mv -- "$temporary" "$output"
 trap - EXIT HUP INT TERM

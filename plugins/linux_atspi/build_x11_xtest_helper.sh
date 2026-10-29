@@ -18,7 +18,11 @@ if ! pkg-config --exists x11 xtst; then
     exit 71
 fi
 mkdir -p "$build_dir"
-set -- $(pkg-config --cflags --libs x11 xtst)
+if [ "${AAD_LINUX_STATIC:-0}" = 1 ]; then
+    set -- $(pkg-config --static --cflags --libs x11 xtst) -static-pie -fPIE
+else
+    set -- $(pkg-config --cflags --libs x11 xtst)
+fi
 g++ -std=c++17 -O2 -Wall -Wextra -Werror \
     "$script_dir/x11_xtest_helper.cpp" -o "$output" "$@"
 chmod 0755 "$output"
