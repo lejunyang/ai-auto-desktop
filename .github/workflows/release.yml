@@ -170,118 +170,9 @@ jobs:
   # ---------------------------------------------------------------------------
   binaries:
     needs: [gate, test]
-    strategy:
-      fail-fast: true
-      matrix:
-        include:
-          # Keep the GNU archive usable on glibc 2.35+ (including Debian 12).
-          # ubuntu-latest moves the required symbol versions with the runner.
-          - os: ubuntu-22.04
-            target: x86_64-unknown-linux-gnu
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-          - os: macos-latest
-            target: aarch64-apple-darwin
-          - os: macos-latest
-            target: x86_64-apple-darwin
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: lejunyang/one-sdk@main
-        with:
-          version: latest
-          install-deps: false
-      - name: Install the release compilation target
-        run: rustup target add ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: ${{ matrix.target }}
-
-      - name: Build the aad binary
-        run: cargo build --release --locked -p aad-cli --target ${{ matrix.target }}
-
-      - name: Install Linux helper build dependencies
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends g++ pkg-config libx11-dev libxtst-dev
-
-      - name: Build Linux native input and capture helpers
-        if: runner.os == 'Linux'
-        run: |
-          plugins/linux_atspi/build_x11_xtest_helper.sh
-          plugins/linux_atspi/build_x11_capture_helper.sh
-
-      # Built for the package's architecture, not the runner's: the x86_64
-      # package is cross-compiled on an arm64 runner.
-      - name: Build macOS AX helper
-        if: runner.os == 'macOS'
-        run: |
-          case '${{ matrix.target }}' in
-            aarch64-*) AAD_MACOS_ARCH=arm64 plugins/macos_ax/build.sh ;;
-            x86_64-*) AAD_MACOS_ARCH=x86_64 plugins/macos_ax/build.sh ;;
-          esac
-
-      # Packaged as an archive rather than a bare binary so the executable bit
-      # survives the download on Unix, and named with the target so four
-      # uploads cannot collide on one release.
-      - name: Package the binary
-        id: package
-        shell: bash
-        run: |
-          set -euo pipefail
-          version='${{ needs.gate.outputs.version }}'
-          target='${{ matrix.target }}'
-          staging="aad-$version-$target"
-          mkdir -p "dist/$staging"
-          if [ '${{ runner.os }}' = 'Windows' ]; then
-            cp "target/$target/release/aad.exe" "dist/$staging/"
-          else
-            cp "target/$target/release/aad" "dist/$staging/"
-            if [ '${{ runner.os }}' = 'Linux' ]; then
-              cp plugins/linux_atspi/.build/x11_xtest_helper "dist/$staging/aad-linux-xtest-helper"
-              cp plugins/linux_atspi/.build/x11_capture_helper "dist/$staging/aad-linux-capture-helper"
-            fi
-            if [ '${{ runner.os }}' = 'macOS' ]; then
-              cp -R plugins/macos_ax/.build/MacOSAXHelper.app "dist/$staging/"
-            fi
-          fi
-          cp README.md "dist/$staging/"
-          cd dist
-          if [ '${{ runner.os }}' = 'Windows' ]; then
-            7z a -tzip "$staging.zip" "$staging" > /dev/null
-            echo "asset=dist/$staging.zip" >> "$GITHUB_OUTPUT"
-          else
-            tar -czf "$staging.tar.gz" "$staging"
-            echo "asset=dist/$staging.tar.gz" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Verify the Linux archive and its glibc baseline
-        if: runner.os == 'Linux'
-        shell: pwsh
-        run: ./tests/linux/verify-release.ps1 -Archive '${{ steps.package.outputs.asset }}' -Version '${{ needs.gate.outputs.version }}'
-
-      # Verified by running the binary that is about to ship, because a build
-      # that links but reports the wrong version would otherwise be released.
-      # Skipped when cross-compiling, where the host cannot execute the output.
-      - name: Check the built binary reports the release version
-        if: matrix.target != 'x86_64-apple-darwin'
-        shell: bash
-        run: |
-          set -euo pipefail
-          version='${{ needs.gate.outputs.version }}'
-          if [ '${{ runner.os }}' = 'Windows' ]; then
-            actual="$(./target/${{ matrix.target }}/release/aad.exe --version)"
-          else
-            actual="$(./target/${{ matrix.target }}/release/aad --version)"
-          fi
-          echo "binary reports: $actual"
-          [ "$actual" = "aad $version" ]
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: aad-${{ matrix.target }}
-          path: ${{ steps.package.outputs.asset }}
-          if-no-files-found: error
-          retention-days: 7
+    uses: ./.github/workflows/cli-packages.yml
+    with:
+      version: ${{ needs.gate.outputs.version }}
 
   # ---------------------------------------------------------------------------
   # Windows GUI installers. Separate from `binaries` because only Windows is
@@ -462,10 +353,11 @@ jobs:
             `aad-atspi`, `aad-macos-ax`, `aad-probe`, `aad-uia`, `aad-cdp`,
             `aad-control`, `aad-mcp`, `aad-cli` at `${{ needs.gate.outputs.version }}`.
 
-            **CLI** — `aad` for Linux (x86_64), Windows (x86_64) and macOS
-            (aarch64, x86_64). Unpack the archive for your platform and keep
-            its files together: on Linux the XTest and capture helpers, on
-            macOS `MacOSAXHelper.app`, are found next to `aad`.
+            **CLI** — x64 and ARM64 archives for Linux, Windows and macOS.
+            Linux provides both GNU (glibc 2.35+) and fully static musl builds.
+            Each archive includes `aad-browser`; Linux also includes XTest and
+            capture helpers, and macOS includes the signed `MacOSAXHelper.app`.
+            Keep the extracted files together. SHA256 sidecars accompany every archive.
 
             **GUI** — Windows `.msi` and NSIS `.exe` installers.
 

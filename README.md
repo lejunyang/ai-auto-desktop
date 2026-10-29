@@ -39,6 +39,29 @@ MCP 工具 schema **不接受任何** `x` / `y` / `point` / `coordinates` / `pos
 
 ## 快速开始
 
+CLI 发布流程提供以下 8 种归档，每种附带 SHA256 校验文件：
+
+| 系统 | x64 target | ARM64 target |
+| --- | --- | --- |
+| Linux GNU，glibc 2.35+ 构建基线 | `x86_64-unknown-linux-gnu` | `aarch64-unknown-linux-gnu` |
+| Linux musl，静态程序 | `x86_64-unknown-linux-musl` | `aarch64-unknown-linux-musl` |
+| Windows | `x86_64-pc-windows-msvc` | `aarch64-pc-windows-msvc` |
+| macOS | `x86_64-apple-darwin` | `aarch64-apple-darwin` |
+
+Windows 使用 `.zip`，其他平台使用 `.tar.gz`。归档包含 `aad`、`aad-browser` 和平台 helper，
+解压后保持文件在一起。musl 归档中的四个可执行文件均静态链接；OCR、脚本和浏览器功能仍需要
+相应的 Tesseract、Python/bubblewrap 或 Chromium 安装，以及桌面会话权限。
+
+[CLI packages 工作流](.github/workflows/cli-packages.yml) 可手动构建全部归档而不发布版本；
+正式 release 复用同一流程。各目标使用本架构 runner，打包后解压执行，并检查 ELF/PE/Mach-O 架构；
+Linux musl 额外检查无动态加载器、共享库依赖和 GLIBC 符号，并在空文件系统中启动。
+
+osdk 0.0.7 同时遇到 GNU/musl 资产时不会可靠地按 libc 选包。安装时可指定模板，例如发布相应版本后：
+
+```powershell
+osdk use --global github:lejunyang/ai-auto-desktop@0.0.2 -o 'asset-template=aad-{version}-x86_64-unknown-linux-musl.tar.gz'
+```
+
 开发环境使用正式发布的 one-sdk（无需依赖草稿 PR）；CI 使用官方
 `lejunyang/one-sdk@main` Action，显式设置 `version: latest`，Rust 仍由项目配置固定：
 

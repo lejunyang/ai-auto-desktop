@@ -1,0 +1,132 @@
+name: CLI packages
+
+# Build/test all CLI archives without publishing a version. The release calls
+# exactly this workflow, so manual validation and release packaging cannot drift.
+on:
+  workflow_call:
+    inputs:
+      version:
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version in Cargo.toml (leave empty to read it)
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  packages:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-musl
+          - os: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-musl
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+          - os: macos-15
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v4
+      - uses: lejunyang/one-sdk@main
+        with:
+          version: latest
+          install-deps: false
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: cli-${{ matrix.target }}
+
+      - name: Resolve the workspace version
+        id: version
+        env:
+          REQUESTED_VERSION: ${{ inputs.version }}
+        run: |
+          $metadata = cargo metadata --locked --no-deps --format-version 1 | ConvertFrom-Json
+          if ($LASTEXITCODE) { throw 'Cannot read workspace metadata' }
+          $version = ($metadata.packages | Where-Object name -eq 'aad-cli').version
+          if (-not $version -or ($env:REQUESTED_VERSION -and $env:REQUESTED_VERSION -cne $version)) {
+            throw 'Requested version does not match aad-cli'
+          }
+          "version=$version" | Add-Content $env:GITHUB_OUTPUT
+
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          if ($LASTEXITCODE) { throw 'apt update failed' }
+          sudo apt-get install -y --no-install-recommends g++ pkg-config libx11-dev libxtst-dev musl-tools bubblewrap
+          if ($LASTEXITCODE) { throw 'Linux build dependency installation failed' }
+
+      - name: Build the CLI with the osdk-selected Rust toolchain
+        run: |
+          $target = '${{ matrix.target }}'
+          rustup target add $target
+          if ($LASTEXITCODE) { throw 'Rust target installation failed' }
+          if ($target.EndsWith('-musl')) {
+            # cc-rs needs musl headers for bundled SQLite. Keep Rust's default
+            # linker: musl-gcc itself mislinks static PIE on some GNU hosts.
+            [Environment]::SetEnvironmentVariable(('CC_' + $target.Replace('-', '_')), 'musl-gcc')
+          }
+          cargo build --release --locked -p aad-cli -p aad-cdp --bins --target $target
+          if ($LASTEXITCODE) { throw 'CLI build failed' }
+
+      - name: Build GNU Linux helpers
+        if: endsWith(matrix.target, '-linux-gnu')
+        run: |
+          $env:AI_AUTO_DESKTOP_LINUX_ATSPI_BUILD_DIR = Join-Path $pwd 'plugins/linux_atspi/.build-${{ matrix.target }}'
+          sh plugins/linux_atspi/build_x11_xtest_helper.sh
+          if ($LASTEXITCODE) { throw 'XTest helper build failed' }
+          sh plugins/linux_atspi/build_x11_capture_helper.sh
+          if ($LASTEXITCODE) { throw 'Capture helper build failed' }
+
+      - name: Build static musl Linux helpers
+        if: endsWith(matrix.target, '-linux-musl')
+        run: ./scripts/release/build-musl-helpers.ps1 -Target '${{ matrix.target }}' -OutputDirectory 'plugins/linux_atspi/.build-${{ matrix.target }}'
+
+      - name: Build the signed macOS AX helper
+        if: runner.os == 'macOS'
+        run: |
+          $env:AAD_MACOS_ARCH = 'x86_64'
+          if ('${{ matrix.target }}'.StartsWith('aarch64-')) { $env:AAD_MACOS_ARCH = 'arm64' }
+          sh plugins/macos_ax/build.sh
+          if ($LASTEXITCODE) { throw 'macOS helper build failed' }
+
+      - name: Package and execute the extracted CLI
+        id: package
+        run: |
+          $version = '${{ steps.version.outputs.version }}'
+          $target = '${{ matrix.target }}'
+          $archive = ./scripts/release/package-cli.ps1 -Target $target -Version $version
+          if ($IsLinux) {
+            ./tests/linux/verify-release.ps1 -Archive $archive -Version $version -Target $target
+          }
+          "asset=$archive" | Add-Content $env:GITHUB_OUTPUT
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: aad-${{ matrix.target }}
+          path: |
+            ${{ steps.package.outputs.asset }}
+            ${{ steps.package.outputs.asset }}.sha256
+          if-no-files-found: error
+          retention-days: 7
