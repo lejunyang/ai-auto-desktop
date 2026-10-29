@@ -23,7 +23,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-pub const RUNTIME_VERSION: &str = "0.0.1";
+pub const RUNTIME_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// How execution should proceed after a step.
 enum Flow {

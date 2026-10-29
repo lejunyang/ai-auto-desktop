@@ -1833,14 +1833,22 @@ fn a_runtime_requirement_this_build_does_not_satisfy_stops_the_run() {
 
 #[test]
 fn a_satisfied_runtime_requirement_runs_normally() {
-    let workflow = descriptor(json!({
-        "requires": {"runtime": ">=0.0.1"},
-        "steps": [{"id": "done", "type": "return", "value": "reached"}]
-    }));
-
-    let result = execute(&workflow, registry(vec![]));
-
-    assert_eq!(result.status, RunStatus::Succeeded);
+    for range in [
+        ">=0.0.1".to_string(),
+        format!("={}", env!("CARGO_PKG_VERSION")),
+    ] {
+        let workflow = descriptor(json!({
+            "requires": {"runtime": range},
+            "steps": [{"id": "done", "type": "return", "value": "reached"}]
+        }));
+        let result = execute(&workflow, registry(vec![]));
+        assert_eq!(
+            result.status,
+            RunStatus::Succeeded,
+            "{range}: {:?}",
+            result.error
+        );
+    }
 }
 
 #[test]
@@ -1937,10 +1945,29 @@ fn every_tracked_example_is_accepted_by_the_runtime_it_declares() {
     // The examples declare a range against the shipped RUNTIME_VERSION, so a
     // version bump that forgets them must fail here rather than at the moment
     // someone runs one.
-    for range in [">=0.0.1", "^0.0.1"] {
-        assert!(
-            aad_runtime::version::matches(aad_runtime::RUNTIME_VERSION, range),
-            "the shipped runtime must satisfy {range}, which the tracked examples declare"
-        );
+    let directory =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/workflows");
+    let mut checked = 0;
+    for entry in std::fs::read_dir(directory).unwrap() {
+        let path = entry.unwrap().path();
+        if !matches!(
+            path.extension().and_then(|value| value.to_str()),
+            Some("json" | "yaml")
+        ) {
+            continue;
+        }
+        let workflow = aad_core::load_descriptor(&path).unwrap();
+        if let Some(range) = workflow.requires.get("runtime").and_then(Value::as_str) {
+            assert!(
+                aad_runtime::version::matches(aad_runtime::RUNTIME_VERSION, range),
+                "the shipped runtime must satisfy {range}, declared by {}",
+                path.display()
+            );
+            checked += 1;
+        }
     }
+    assert!(
+        checked > 0,
+        "expected tracked examples with runtime requirements"
+    );
 }
