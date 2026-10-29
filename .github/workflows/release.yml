@@ -174,7 +174,9 @@ jobs:
       fail-fast: true
       matrix:
         include:
-          - os: ubuntu-latest
+          # Keep the GNU archive usable on glibc 2.35+ (including Debian 12).
+          # ubuntu-latest moves the required symbol versions with the runner.
+          - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
           - os: windows-latest
             target: x86_64-pc-windows-msvc
@@ -251,6 +253,11 @@ jobs:
             tar -czf "$staging.tar.gz" "$staging"
             echo "asset=dist/$staging.tar.gz" >> "$GITHUB_OUTPUT"
           fi
+
+      - name: Verify the Linux archive and its glibc baseline
+        if: runner.os == 'Linux'
+        shell: pwsh
+        run: ./tests/linux/verify-release.ps1 -Archive '${{ steps.package.outputs.asset }}' -Version '${{ needs.gate.outputs.version }}'
 
       # Verified by running the binary that is about to ship, because a build
       # that links but reports the wrong version would otherwise be released.
