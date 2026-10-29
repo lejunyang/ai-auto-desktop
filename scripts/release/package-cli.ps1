@@ -39,11 +39,11 @@ try {
         # than the requested architecture before it enters the archive.
         $architecture = 'x86_64'
         if ($Target.StartsWith('aarch64-')) { $architecture = 'arm64' }
-        & lipo -verify_arch $architecture (Join-Path $helper 'Contents/MacOS/MacOSAXHelper')
+        & lipo (Join-Path $helper 'Contents/MacOS/MacOSAXHelper') -verify_arch $architecture
         if ($LASTEXITCODE) { throw 'macOS helper architecture mismatch' }
-        & lipo -verify_arch $architecture (Join-Path $staging $executable)
+        & lipo (Join-Path $staging $executable) -verify_arch $architecture
         if ($LASTEXITCODE) { throw 'macOS CLI architecture mismatch' }
-        & lipo -verify_arch $architecture (Join-Path $staging $browserHelper)
+        & lipo (Join-Path $staging $browserHelper) -verify_arch $architecture
         if ($LASTEXITCODE) { throw 'macOS browser helper architecture mismatch' }
         & cp -R $helper $staging
         if ($LASTEXITCODE) { throw 'Cannot copy signed macOS helper' }
