@@ -47,6 +47,14 @@ document.addEventListener('mousemove',()=>{if(held)moves++;});
 document.addEventListener('mouseup',e=>{if(!held)return;const over=document.elementFromPoint(e.clientX,e.clientY);const li=over&&over.closest('#sortable li');
 if(li&&li!==held)li.after(held);document.getElementById('status').value='sorted:'+Array.from(list.children).map(l=>l.textContent).join(',')+':'+(moves>4)+':'+e.isTrusted;held=null;});
 </script>
+<x-search></x-search><x-card><button slot="action" aria-label="Slotted" onclick="document.getElementById('status').value='slotted'">Slotted</button></x-card><x-closed></x-closed>
+<script>
+customElements.define('x-search',class extends HTMLElement{constructor(){super();const r=this.attachShadow({mode:'open'});
+r.innerHTML='<label>Query <input id=q></label><button id=go>Go</button>';
+r.getElementById('go').addEventListener('click',e=>{document.getElementById('status').value='shadow:'+r.getElementById('q').value+':'+e.isTrusted;});}});
+customElements.define('x-card',class extends HTMLElement{constructor(){super();this.attachShadow({mode:'open'}).innerHTML='<div><b>Card title</b><slot name=action></slot></div>';}});
+customElements.define('x-closed',class extends HTMLElement{constructor(){super();this.attachShadow({mode:'closed'}).innerHTML='<button>Hidden inside</button>';}});
+</script>
 <iframe src="/frame"></iframe>
 </body></html>"#;
 
@@ -509,6 +517,92 @@ fn drags_move_pointer_sortables_and_html5_draggables() {
     );
     assert_eq!(covered.error.unwrap()["code"], "CONTROL.OCCLUDED");
     assert_eq!(status(&observe(&session, &main)), "dropped:card:true");
+}
+
+#[test]
+#[ignore = "requires isolated Chromium with its sandbox enabled; CI runs it explicitly"]
+fn controls_inside_open_shadow_roots_are_observed_and_operated() {
+    let _serial = serial();
+    let fixture = Fixture::new();
+    let (session, _) = session_for(&fixture);
+    let main = main_of(&session, &fixture.page_id);
+    let loaded = wait_until(&session, &main, "Go", WaitCondition::Appears);
+    assert!(loaded.error.is_none(), "{loaded:?}");
+    let observed = observe(&session, &main);
+    let query = |observed: &Value| {
+        observed["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|n| n["role"] == "textbox" && n["name"] == "Query")
+            .cloned()
+            .expect("the shadow field is observed")
+    };
+    assert!(query(&observed)["actions"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("fill")));
+    // Slotted content shows once, where it is slotted; a closed root stays shut.
+    let slotted = observed["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|n| n["name"] == "Slotted" && n["role"] == "button")
+        .count();
+    assert_eq!(slotted, 1);
+    assert!(observed["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|n| n["name"] != "Hidden inside"));
+    let filled = act_on(
+        &session,
+        &main,
+        "textbox",
+        "Query",
+        Action::Fill { value: "ab".into() },
+    );
+    assert!(filled.error.is_none(), "{filled:?}");
+    // Focus inside the shadow root is the field's own: typing reaches it.
+    let typed = act_on(
+        &session,
+        &main,
+        "textbox",
+        "Query",
+        type_text("c", Some(TypeMode::Keys)),
+    );
+    assert!(typed.error.is_none(), "{typed:?}");
+    let observed = observe(&session, &main);
+    assert_eq!(query(&observed)["value"], "abc");
+    assert_eq!(query(&observed)["states"]["focused"], true);
+    // A trusted click is hit-tested through the shadow host to the button.
+    let clicked = act_on(
+        &session,
+        &main,
+        "button",
+        "Go",
+        Action::Click {
+            button: None,
+            count: None,
+            fraction: Some(Fraction { fx: 0.5, fy: 0.5 }),
+        },
+    );
+    assert!(clicked.error.is_none(), "{clicked:?}");
+    assert_eq!(status(&observe(&session, &main)), "shadow:abc:true");
+    let clicked = act_on(&session, &main, "button", "Slotted", Action::click());
+    assert!(clicked.error.is_none(), "{clicked:?}");
+    assert_eq!(status(&observe(&session, &main)), "slotted");
+    // A shadow control that changes after it was observed is stale.
+    let observed = observe(&session, &main);
+    let go = find(&session, &observed, "button", "Go");
+    fixture
+        .client()
+        .eval(
+            "document.querySelector('x-search').shadowRoot.getElementById('go').textContent='Went'",
+        )
+        .unwrap();
+    let stale = act(&session, go, Action::click());
+    assert_eq!(stale.error.unwrap()["code"], "CONTROL.STALE_TARGET");
 }
 
 #[test]

@@ -20,6 +20,10 @@
   const radio = el => (el.type||'').toLowerCase()==='radio' || el.getAttribute('role')==='radio';
   // The focused element itself, inside any open shadow roots on the way.
   const activeElement = () => {let a=document.activeElement;while(a && a.shadowRoot && a.shadowRoot.activeElement)a=a.shadowRoot.activeElement;return a;};
+  // What is really under a point: elementFromPoint stops at a shadow host.
+  const deepHit = (x,y) => {let hit=document.elementFromPoint(x,y);while(hit && hit.shadowRoot){const inner=hit.shadowRoot.elementFromPoint(x,y);if(!inner||inner===hit)break;hit=inner;}return hit;};
+  // Containment across shadow boundaries.
+  const inside = (el,hit) => {for(let n=hit;n;n=n.parentNode||n.host){if(n===el)return true;}return false;};
   const scrollable = el => el===document.body || ((el.scrollHeight>el.clientHeight+1 || el.scrollWidth>el.clientWidth+1) && /(auto|scroll|overlay)/.test(getComputedStyle(el).overflow+getComputedStyle(el).overflowY+getComputedStyle(el).overflowX));
   // What a person could pick up: HTML5 draggables, items of lists and grids,
   // and whatever shows a grab cursor.
@@ -51,9 +55,17 @@
     observe: (id,limit) => {
       observation=id; nodes=new Map();
       const items=[];
-      const walker=document.body?document.createTreeWalker(document.body,NodeFilter.SHOW_ELEMENT):null;
-      let el=document.body,scanned=0;
-      while(el && items.length<=limit && scanned++<20000) {if(present(el))items.push(el);el=walker.nextNode();}
+      // Depth first through the page and every open shadow root: a host's
+      // shadow tree first, then its light children, which show only where
+      // slotted. Closed shadow roots cannot be entered from script.
+      const stack=document.body?[document.body]:[];
+      let scanned=0;
+      while(stack.length && items.length<=limit && scanned++<20000) {
+        const el=stack.pop();
+        if(present(el))items.push(el);
+        const children=el.shadowRoot?[...el.shadowRoot.children,...el.children]:el.children;
+        for(let i=children.length-1;i>=0;i--)stack.push(children[i]);
+      }
       const result=items.slice(0,limit).map((el,index)=>{
         const node_id='n'+index;
         nodes.set(node_id,{el,fingerprint:fingerprint(el)});
@@ -65,7 +77,7 @@
         if (el.tagName==='SELECT') node.options=Array.from(el.options).slice(0,100).map(o=>o.label.trim().slice(0,256));
         return node;
       });
-      return {document_token:documentToken,nodes:result,truncated:items.length>limit||el!==null};
+      return {document_token:documentToken,nodes:result,truncated:items.length>limit||stack.length>0};
     },
     act: args => {
       const found=check(args); if(found.error) return found;
@@ -144,8 +156,7 @@
       const at=(start,size,f)=>Math.min(start+size-1,Math.max(start+1,start+size*f));
       const fx=args.fraction?args.fraction.fx:0.5, fy=args.fraction?args.fraction.fy:0.5;
       const x=at(left,width,fx), y=at(top,height,fy);
-      const hit=document.elementFromPoint(x,y);
-      if(!hit || !(hit===el || el.contains(hit))) return {error:'CONTROL.OCCLUDED'};
+      if(!inside(el,deepHit(x,y))) return {error:'CONTROL.OCCLUDED'};
       return {x,y};
     }
   };
