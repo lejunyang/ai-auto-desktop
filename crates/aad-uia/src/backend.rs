@@ -170,6 +170,29 @@ pub struct PointerGesture {
     pub hover_ms: Option<u64>,
 }
 
+/// The pixels of one captured element, top-down RGBA rows.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Pixels {
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Vec<u8>,
+    /// The element was larger than the capture ceiling and was cut.
+    pub clipped: bool,
+}
+
+impl Pixels {
+    /// The colour at a pixel, for tests and checks.
+    pub fn at(&self, x: u32, y: u32) -> Option<[u8; 4]> {
+        if x >= self.width || y >= self.height {
+            return None;
+        }
+        let index = ((y * self.width + x) * 4) as usize;
+        self.rgba
+            .get(index..index + 4)
+            .map(|p| [p[0], p[1], p[2], p[3]])
+    }
+}
+
 /// The operations a platform backend must provide.
 pub trait Backend: Send + Sync {
     /// Enumerate top-level windows that a user could interact with.
@@ -254,6 +277,23 @@ pub trait Backend: Send + Sync {
         Err(DriverError::new(
             "DRIVER.ACTION_UNSUPPORTED",
             "drag is not implemented on this platform yet",
+        ))
+    }
+
+    /// The pixels the live element shows, cut to its bounds; the whole window
+    /// (without its invisible resize border) when `whole_window` is set.
+    ///
+    /// Read-only. The element must still match the snapshot; the backend reads
+    /// its bounds live rather than trusting the captured ones.
+    fn capture_pixels(
+        &self,
+        _window_id: &str,
+        _node: &Node,
+        _whole_window: bool,
+    ) -> Result<Pixels> {
+        Err(DriverError::new(
+            "DRIVER.ACTION_UNSUPPORTED",
+            "screenshots are not implemented on this platform yet",
         ))
     }
 

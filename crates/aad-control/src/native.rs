@@ -70,7 +70,44 @@ fn fraction(value: &Option<crate::Fraction>) -> Value {
     value.map_or(Value::Null, |f| json!({"fx": f.fx, "fy": f.fy}))
 }
 
+impl NativeBackend {
+    /// Whether the driver publishes this native operation.
+    fn offers(&self, native: &str) -> bool {
+        self.provider.manifest().actions.contains_key(native)
+    }
+    fn target_of(snapshot: &Value, node_id: &Value) -> Value {
+        json!({"snapshot_id": snapshot["snapshot_id"], "revision": snapshot["revision"], "node_id": node_id})
+    }
+}
+
 impl Backend for NativeBackend {
+    fn reads(&self) -> Vec<String> {
+        // Only the Windows driver captures directly; AT-SPI's capture goes
+        // through the host artifact store and is not wired here yet.
+        ["capture"]
+            .into_iter()
+            .filter(|read| matches!(self.flavor, Flavor::Windows) && self.offers(read))
+            .map(str::to_string)
+            .collect()
+    }
+    fn capture(&self, snapshot: &Value, node: &Value, timeout: Duration) -> Result<Value> {
+        if !self.reads().iter().any(|read| read == "capture") {
+            return Err(error(
+                "CONTROL.ACTION_UNSUPPORTED",
+                "this provider cannot take screenshots",
+            ));
+        }
+        let shot = self.invoke(
+            "capture",
+            json!({"target": Self::target_of(snapshot, &node["node_id"])}),
+            timeout,
+        )?;
+        let mut answer = Map::new();
+        for key in ["format", "data", "width", "height", "clipped"] {
+            answer.insert(key.into(), shot[key].clone());
+        }
+        Ok(Value::Object(answer))
+    }
     fn node_capabilities(&self, node: &Value) -> Vec<String> {
         ACTION_NAMES
             .iter()
@@ -242,7 +279,7 @@ impl Backend for NativeBackend {
                 "observed node does not support this native operation",
             ));
         }
-        let target_of = |node_id: &Value| json!({"snapshot_id": snapshot["snapshot_id"], "revision": snapshot["revision"], "node_id": node_id});
+        let target_of = |node_id: &Value| Self::target_of(snapshot, node_id);
         let mut args = json!({"target": target_of(&node["node_id"])});
         // AT-SPI and AX re-resolve every target from a descriptive locator
         // before acting, so each end of an action carries one.

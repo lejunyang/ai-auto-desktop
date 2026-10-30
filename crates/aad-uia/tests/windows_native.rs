@@ -8,19 +8,23 @@
 
 use aad_uia::{native_driver, UiaDriver};
 use serde_json::{json, Value};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
-use windows::Win32::Graphics::Gdi::{UpdateWindow, COLOR_WINDOW, HBRUSH};
+use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Graphics::Gdi::{CreateSolidBrush, UpdateWindow, COLOR_WINDOW, HBRUSH};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::UI::HiDpi::{
+    GetDpiForSystem, SetThreadDpiAwarenessContext, DPI_AWARENESS_CONTEXT_UNAWARE,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DispatchMessageW, GetDlgItem, GetMessageW, PostMessageW,
     PostQuitMessage, RegisterClassExW, SetWindowTextW, ShowWindow, TranslateMessage, BN_CLICKED,
-    CW_USEDEFAULT, ES_AUTOHSCROLL, HMENU, MSG, SHOW_WINDOW_CMD, WINDOW_EX_STYLE, WINDOW_STYLE,
-    WM_CLOSE, WM_COMMAND, WM_DESTROY, WNDCLASSEXW, WS_BORDER, WS_CHILD, WS_OVERLAPPEDWINDOW,
-    WS_TABSTOP, WS_VISIBLE,
+    CW_USEDEFAULT, ES_AUTOHSCROLL, ES_PASSWORD, HMENU, MSG, SHOW_WINDOW_CMD, WINDOW_EX_STYLE,
+    WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_LBUTTONDOWN, WNDCLASSEXW, WS_BORDER,
+    WS_CHILD, WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE,
 };
 
 const EDIT_ID: i32 = 1001;
@@ -120,7 +124,13 @@ fn run_fixture(
     title: String,
     ready: mpsc::SyncSender<Result<FixtureReady, String>>,
 ) -> Result<(), String> {
-    let result = unsafe { create_fixture(&title) };
+    // Laid out in 96-DPI pixels: an unaware window is scaled as a whole, so
+    // its controls stay inside it whatever the display scale, and whether or
+    // not the driver already made this process DPI aware.
+    let result = unsafe {
+        SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_UNAWARE);
+        create_fixture(&title)
+    };
     let hwnd = match result {
         Ok(hwnd) => hwnd,
         Err(error) => {
@@ -366,7 +376,8 @@ fn wait_for_value(driver: &UiaDriver, window_id: &str, value: &str) -> Value {
         }
         assert!(
             Instant::now() < deadline,
-            "fresh snapshot never observed edit value {value:?}"
+            "fresh snapshot never observed edit value {value:?}: {}",
+            edit["node"]
         );
         thread::sleep(Duration::from_millis(50));
     }
@@ -455,4 +466,295 @@ fn native_driver_observes_and_operates_real_win32_controls() {
         .expect("click a real Win32 button through SendInput");
     captured = wait_for_node(&driver, &window_id, "text", POINTER_STATUS);
     assert!(has_node(&captured, "text", POINTER_STATUS));
+}
+
+// ---------------------------------------------------------------------------
+// A window of known pixels, for screenshots
+// ---------------------------------------------------------------------------
+
+/// The swatch colour, chosen so no theme or font smoothing produces it.
+const SWATCH: [u8; 3] = [18, 201, 77];
+const SWATCH_NAME: &str = "Swatch green";
+/// The swatch's size in the window's own (logical, for an unaware window) pixels.
+const SWATCH_SIZE: (i32, i32) = (120, 80);
+
+unsafe extern "system" fn plain_window_proc(
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    if message == WM_DESTROY {
+        PostQuitMessage(0);
+        return LRESULT(0);
+    }
+    DefWindowProcW(hwnd, message, wparam, lparam)
+}
+
+type WindowProc = unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT;
+
+/// Left-button presses the swatch received.
+static SWATCH_CLICKS: AtomicUsize = AtomicUsize::new(0);
+
+unsafe extern "system" fn swatch_window_proc(
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    if message == WM_LBUTTONDOWN {
+        SWATCH_CLICKS.fetch_add(1, Ordering::SeqCst);
+    }
+    DefWindowProcW(hwnd, message, wparam, lparam)
+}
+
+/// A top-level window holding a solid swatch and a password edit, on its own
+/// thread. `unaware` creates it DPI-unaware, so Windows bitmap-scales it on a
+/// scaled display while the driver works in physical pixels.
+fn start_swatch(title: String, unaware: bool) -> Result<Fixture, String> {
+    spawn_window(move || unsafe {
+        if unaware {
+            SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_UNAWARE);
+        }
+        create_swatch(&title)
+    })
+}
+
+/// Run a window created by `create` on its own thread with a message loop.
+fn spawn_window(
+    create: impl FnOnce() -> Result<HWND, String> + Send + 'static,
+) -> Result<Fixture, String> {
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let thread = thread::spawn(move || {
+        let created = create();
+        let hwnd = match created {
+            Ok(hwnd) => hwnd,
+            Err(error) => {
+                let _ = sender.send(Err(error.clone()));
+                return Err(error);
+            }
+        };
+        let _ = sender.send(Ok(FixtureReady { hwnd }));
+        let mut message = MSG::default();
+        loop {
+            match unsafe { GetMessageW(&mut message, None, 0, 0) }.0 {
+                -1 => return Err("GetMessageW failed".to_string()),
+                0 => return Ok(()),
+                _ => unsafe {
+                    let _ = TranslateMessage(&message);
+                    DispatchMessageW(&message);
+                },
+            }
+        }
+    });
+    let ready = receiver
+        .recv_timeout(Duration::from_secs(10))
+        .map_err(|error| format!("swatch fixture did not become ready: {error}"))??;
+    Ok(Fixture {
+        hwnd: ready.hwnd,
+        thread: Some(thread),
+    })
+}
+
+unsafe fn create_swatch(title: &str) -> Result<HWND, String> {
+    let module = GetModuleHandleW(None).map_err(|error| error.to_string())?;
+    let instance = HINSTANCE(module.0);
+    let suffix = format!("{}_{}", std::process::id(), uuid::Uuid::new_v4().simple());
+    let frame_class = wide(&format!("AadCaptureFrame_{suffix}"));
+    let swatch_class = wide(&format!("AadCaptureSwatch_{suffix}"));
+    let colour =
+        COLORREF(u32::from(SWATCH[0]) | (u32::from(SWATCH[1]) << 8) | (u32::from(SWATCH[2]) << 16));
+    for (class_name, brush, procedure) in [
+        (
+            &frame_class,
+            HBRUSH((COLOR_WINDOW.0 + 1) as usize as *mut std::ffi::c_void),
+            plain_window_proc as WindowProc,
+        ),
+        (&swatch_class, CreateSolidBrush(colour), swatch_window_proc),
+    ] {
+        let class = WNDCLASSEXW {
+            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+            lpfnWndProc: Some(procedure),
+            hInstance: instance,
+            hbrBackground: brush,
+            lpszClassName: PCWSTR(class_name.as_ptr()),
+            ..Default::default()
+        };
+        if RegisterClassExW(&class) == 0 {
+            return Err(windows::core::Error::from_win32().to_string());
+        }
+    }
+    let title = wide(title);
+    let hwnd = CreateWindowExW(
+        WINDOW_EX_STYLE::default(),
+        PCWSTR(frame_class.as_ptr()),
+        PCWSTR(title.as_ptr()),
+        WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+        CW_USEDEFAULT,
+        CW_USEDEFAULT,
+        420,
+        260,
+        None,
+        None,
+        instance,
+        None,
+    )
+    .map_err(|error| error.to_string())?;
+    let swatch_text = wide(SWATCH_NAME);
+    CreateWindowExW(
+        WINDOW_EX_STYLE::default(),
+        PCWSTR(swatch_class.as_ptr()),
+        PCWSTR(swatch_text.as_ptr()),
+        WS_CHILD | WS_VISIBLE,
+        30,
+        20,
+        SWATCH_SIZE.0,
+        SWATCH_SIZE.1,
+        hwnd,
+        HMENU(1 as *mut std::ffi::c_void),
+        instance,
+        None,
+    )
+    .map_err(|error| error.to_string())?;
+    create_control(
+        hwnd,
+        instance,
+        "EDIT",
+        "",
+        WS_TABSTOP | WS_BORDER | WINDOW_STYLE(ES_PASSWORD as u32),
+        30,
+        130,
+        200,
+        28,
+        2,
+    )?;
+    let _ = ShowWindow(hwnd, SHOW_WINDOW_CMD(5));
+    let _ = UpdateWindow(hwnd);
+    Ok(hwnd)
+}
+
+fn capture(driver: &UiaDriver, target: &Value) -> Result<(Value, image::RgbImage), String> {
+    let shot = driver
+        .call("capture", &json!({"target": target}))
+        .map_err(|error| error.code)?;
+    use base64::Engine as _;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(shot["data"].as_str().expect("png data"))
+        .expect("valid base64");
+    let image = image::load_from_memory_with_format(&bytes, image::ImageFormat::Png)
+        .expect("a decodable PNG")
+        .to_rgb8();
+    assert_eq!(shot["width"], image.width());
+    assert_eq!(shot["height"], image.height());
+    Ok((shot, image))
+}
+
+fn swatch_pixels(image: &image::RgbImage) -> usize {
+    image.pixels().filter(|pixel| pixel.0 == SWATCH).count()
+}
+
+fn system_scale() -> f64 {
+    f64::from(unsafe { GetDpiForSystem() }) / 96.0
+}
+
+#[test]
+#[ignore = "requires an interactive Windows desktop; CI opts in explicitly"]
+fn a_capture_returns_the_pixels_the_element_shows() {
+    // The driver first: it makes the process per-monitor DPI aware, so this
+    // window is too and its sizes are physical pixels.
+    let driver = native_driver().expect("create native UIA driver");
+    let title = format!("AI Auto Desktop capture fixture {}", uuid::Uuid::new_v4());
+    let fixture = start_swatch(title.clone(), false).expect("start swatch fixture");
+    let window_id = wait_for_window(&driver, &title);
+    assert_eq!(window_id, format!("hwnd:{}", fixture.hwnd.0 as isize));
+    let captured = wait_for_node(&driver, &window_id, "pane", SWATCH_NAME);
+
+    let swatch = find(
+        &driver,
+        &captured,
+        json!({"role": "pane", "name": SWATCH_NAME}),
+    );
+    let (shot, image) = capture(&driver, &swatch["target"]).expect("capture the swatch");
+    assert_eq!(shot["format"], "png");
+    assert_eq!(shot["clipped"], false);
+    assert_eq!(
+        (image.width(), image.height()),
+        (SWATCH_SIZE.0 as u32, SWATCH_SIZE.1 as u32)
+    );
+    assert_eq!(swatch_pixels(&image), image.pixels().count(), "every pixel");
+
+    // The window's root node is the whole window: the swatch sits inside it,
+    // unscaled, and the window's background around it.
+    let root = captured["nodes"][0].clone();
+    assert!(root["parent_id"].is_null());
+    let target = json!({"snapshot_id": captured["snapshot_id"], "revision": captured["revision"], "node_id": root["node_id"]});
+    let (_, window) = capture(&driver, &target).expect("capture the window");
+    assert!(window.width() > SWATCH_SIZE.0 as u32 && window.height() > SWATCH_SIZE.1 as u32);
+    assert_eq!(
+        swatch_pixels(&window),
+        (SWATCH_SIZE.0 * SWATCH_SIZE.1) as usize
+    );
+
+    // The same pixels give the same PNG, so its digest tells change apart.
+    let (again, _) = capture(&driver, &swatch["target"]).expect("capture again");
+    assert_eq!(again["data"], shot["data"]);
+
+    let secret = find(
+        &driver,
+        &captured,
+        json!({"role": "edit", "states": {"protected": true}}),
+    );
+    assert_eq!(
+        capture(&driver, &secret["target"]).unwrap_err(),
+        "DRIVER.PROTECTED_ELEMENT"
+    );
+
+    unsafe {
+        // SW_SHOWMINNOACTIVE: leave activation alone for the tests after this.
+        let _ = ShowWindow(fixture.hwnd, SHOW_WINDOW_CMD(7));
+    }
+    thread::sleep(Duration::from_millis(300));
+    assert_eq!(
+        capture(&driver, &swatch["target"]).unwrap_err(),
+        "DRIVER.WINDOW_MINIMIZED"
+    );
+}
+
+#[test]
+#[ignore = "requires an interactive Windows desktop; CI opts in explicitly"]
+fn a_dpi_unaware_window_is_captured_in_physical_pixels() {
+    let driver = native_driver().expect("create native UIA driver");
+    let title = format!("AI Auto Desktop unaware fixture {}", uuid::Uuid::new_v4());
+    let _fixture = start_swatch(title.clone(), true).expect("start unaware fixture");
+    let window_id = wait_for_window(&driver, &title);
+    let captured = wait_for_node(&driver, &window_id, "pane", SWATCH_NAME);
+    let swatch = find(
+        &driver,
+        &captured,
+        json!({"role": "pane", "name": SWATCH_NAME}),
+    );
+    // UIA reports the scaled, physical box, and the capture matches it.
+    let bounds = &swatch["node"]["bounds"];
+    let scale = system_scale();
+    let expected = (
+        (f64::from(SWATCH_SIZE.0) * scale).round() as i64,
+        (f64::from(SWATCH_SIZE.1) * scale).round() as i64,
+    );
+    assert!(
+        (bounds["width"].as_i64().unwrap() - expected.0).abs() <= 1
+            && (bounds["height"].as_i64().unwrap() - expected.1).abs() <= 1,
+        "bounds {bounds} at scale {scale}"
+    );
+    let (_, image) = capture(&driver, &swatch["target"]).expect("capture the swatch");
+    assert_eq!(i64::from(image.width()), bounds["width"].as_i64().unwrap());
+    assert_eq!(
+        i64::from(image.height()),
+        bounds["height"].as_i64().unwrap()
+    );
+    // Scaling blends the outermost pixels; the inside is the exact colour.
+    let (w, h) = (image.width(), image.height());
+    for (x, y) in [(w / 2, h / 2), (w / 4, h / 4), (w * 3 / 4, h * 3 / 4)] {
+        assert_eq!(image.get_pixel(x, y).0, SWATCH, "pixel {x},{y} of {w}x{h}");
+    }
+    assert!(swatch_pixels(&image) * 10 >= (w * h) as usize * 8);
 }

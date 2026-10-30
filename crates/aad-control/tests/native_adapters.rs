@@ -135,12 +135,21 @@ fn windows_gestures_views_and_rich_locators_route_to_the_driver() {
                 }
                 "overview@1" => json!({"regions":[{"name":"toolbar","elements":4}]}),
                 "find@1" => json!({"found":true,"target":{"node_id":"n"},"match_count":1}),
+                "capture@1" => {
+                    json!({"format":"png","data":"aGk=","width":2,"height":1,"clipped":false,"node_id":"n"})
+                }
                 _ => json!({"ok":true}),
             })
         }
     }
     let mut actions = Map::new();
-    for action in ["snapshot", "pointer_click", "pointer_gesture", "drag"] {
+    for action in [
+        "snapshot",
+        "pointer_click",
+        "pointer_gesture",
+        "drag",
+        "capture",
+    ] {
         actions.insert(action.into(), json!({"contract_major":1}));
     }
     let provider = Arc::new(Windows {
@@ -251,9 +260,33 @@ fn windows_gestures_views_and_rich_locators_route_to_the_driver() {
     assert_eq!(args["expect"], "optional");
     assert_eq!(found["node_id"], "n");
 
+    // A screenshot is of the quoted, revalidated node, in the browser's shape.
+    assert_eq!(backend.reads(), vec!["capture"]);
+    let shot = backend
+        .capture(&snapshot, &node, Duration::from_secs(1))
+        .unwrap();
+    let (called, args) = last();
+    assert_eq!(called, "desktop.windows_uia.capture@1");
+    assert_eq!(
+        args["target"],
+        json!({"snapshot_id":"s","revision":1,"node_id":"n"})
+    );
+    assert_eq!(
+        shot,
+        json!({"format":"png","data":"aGk=","width":2,"height":1,"clipped":false})
+    );
+
     let linux = NativeBackend::new(
         Fixture::new("desktop.linux_atspi", Flavor::Linux),
         Flavor::Linux,
+    );
+    assert!(linux.reads().is_empty());
+    assert_eq!(
+        linux
+            .capture(&snapshot, &node, Duration::from_secs(1))
+            .unwrap_err()
+            .code,
+        "CONTROL.ACTION_UNSUPPORTED"
     );
     assert!(linux
         .view(

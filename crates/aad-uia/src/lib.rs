@@ -28,7 +28,7 @@ pub mod windows;
 #[cfg(windows)]
 pub mod observer_win;
 
-pub use backend::{Backend, CaptureLimits, CapturedTree, DriverError, SnapshotStore};
+pub use backend::{Backend, CaptureLimits, CapturedTree, DriverError, Pixels, SnapshotStore};
 pub use capture::{coalesce, recordable, CapturedEvent, EventBuffer, EventKind};
 pub use driver::{action_ids, is_node_action, is_write_action, UiaDriver, PROVIDER_NAME};
 pub use model::{Bounds, Locator, Node, Snapshot, States, Target, WindowInfo};

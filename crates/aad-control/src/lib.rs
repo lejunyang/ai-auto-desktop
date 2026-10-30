@@ -50,6 +50,11 @@ pub trait Backend: Send + Sync {
     fn lease_key(&self, _snapshot: &Value) -> Option<String> {
         None
     }
+    /// Read-only operations beyond observe and find this provider offers,
+    /// such as `capture`; listed by `capabilities` so none is guessed at.
+    fn reads(&self) -> Vec<String> {
+        Vec::new()
+    }
     /// A PNG of an observed node: `{"format": "png", "data": base64, "width", "height"}`.
     fn capture(&self, _snapshot: &Value, _node: &Value, _timeout: Duration) -> Result<Value> {
         Err(error(
@@ -501,7 +506,7 @@ impl Session {
                 json!({"session_id": self.id, "protocol_version": PROTOCOL_VERSION,
                 "expires_in_ms": self.lifetime.saturating_sub(self.created.elapsed()).as_millis(),
                 "allow_input": self.policy.allow_input,"observation_retention":"until_next_observation_or_input_attempt","observation_ttl_ms":self.observation_ttl.as_millis(),"max_requests":self.max_requests,"input_lease":"exclusive_cooperating_session","input_lease_scope":"os_user","providers": self.backends.values().filter(|b| self.allowed_provider(b.name()))
-                    .map(|b| json!({"provider": b.name(), "actions": b.capabilities()})).collect::<Vec<_>>(),
+                    .map(|b| json!({"provider": b.name(), "actions": b.capabilities(), "reads": b.reads()})).collect::<Vec<_>>(),
                 "unavailable": self.failures}),
             ),
             Operation::Targets {} => {

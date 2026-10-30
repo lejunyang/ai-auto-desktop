@@ -197,6 +197,9 @@ impl Backend for BrowserBackend {
     fn capture(&self, snapshot: &Value, node: &Value, timeout: Duration) -> Result<Value> {
         self.capture_node(snapshot, node, timeout)
     }
+    fn reads(&self) -> Vec<String> {
+        vec!["capture".into()]
+    }
     fn lease_key(&self, _snapshot: &Value) -> Option<String> {
         // UIA/AX/AT-SPI can also operate a browser. Share one cooperating
         // input owner rather than pretending these are disjoint devices.

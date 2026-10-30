@@ -201,6 +201,8 @@ dependencies = [
  "aad-core",
  "aad-plugin",
  "aad-runtime",
+ "base64 0.22.1",
+ "image",
  "serde",
  "serde_json",
  "sha2",

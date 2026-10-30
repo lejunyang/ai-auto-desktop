@@ -11,8 +11,8 @@
 //! occupies that position.
 
 use crate::backend::{
-    Backend, CaptureLimits, DriverError, PointerButton, PointerGesture, Result, ScrollDirection,
-    ScrollSpec, SnapshotStore,
+    Backend, CaptureLimits, DriverError, Pixels, PointerButton, PointerGesture, Result,
+    ScrollDirection, ScrollSpec, SnapshotStore,
 };
 use crate::capture::{self, CapturedEvent};
 use crate::model::{Locator, Node, Snapshot, Target, NODE_ACTIONS, OUTLINE_BUDGET};
@@ -20,6 +20,7 @@ use crate::observe_session::{ObserveManager, ObserveSource};
 use aad_plugin::{manifest, CapabilityManifest};
 use aad_runtime::journal::now_rfc3339;
 use aad_runtime::provider::Provider;
+use base64::Engine as _;
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -104,6 +105,7 @@ impl UiaDriver {
             "describe" => self.describe(&args),
             "overview" => self.overview(&args),
             "find" => self.find(&args),
+            "capture" => self.capture_element(&args),
             "focus" | "invoke" | "set_value" | "type_text" | "pointer_click" | "key_chord"
             | "pointer_gesture" | "drag" => self.act(action, &args),
             "watch" => self.watch(&args),
@@ -463,6 +465,45 @@ impl UiaDriver {
         Ok((snapshot.window.window_id.clone(), node))
     }
 
+    /// The live pixels of an observed, revalidated element.
+    ///
+    /// Read-only, but anchored like a write: the target must still match the
+    /// live UI, so a screenshot is always of the element the caller observed.
+    /// A password field is refused outright.
+    fn element_pixels(&self, args: &Value) -> Result<(Node, Pixels)> {
+        let target = args
+            .get("target")
+            .ok_or_else(|| DriverError::invalid("target is required"))
+            .and_then(|value| Target::from_value(value).map_err(DriverError::invalid))?;
+        let (window_id, node) = self.resolve(&target)?;
+        if node.states.protected == Some(true) {
+            return Err(DriverError::new(
+                "DRIVER.PROTECTED_ELEMENT",
+                "a password or otherwise protected element is never captured",
+            )
+            .with_detail("node_id", json!(node.node_id)));
+        }
+        // The window's own root node captures the whole window.
+        let whole_window = node.parent_id.is_none();
+        let pixels = self
+            .backend
+            .capture_pixels(&window_id, &node, whole_window)?;
+        Ok((node, pixels))
+    }
+
+    fn capture_element(&self, args: &Value) -> Result<Value> {
+        let (node, pixels) = self.element_pixels(args)?;
+        let png = encode_png(&pixels)?;
+        Ok(json!({
+            "format": "png",
+            "data": base64::engine::general_purpose::STANDARD.encode(png),
+            "width": pixels.width,
+            "height": pixels.height,
+            "clipped": pixels.clipped,
+            "node_id": node.node_id,
+        }))
+    }
+
     fn act(&self, action: &str, args: &Value) -> Result<Value> {
         let target = args
             .get("target")
@@ -780,6 +821,35 @@ fn step_to_json(step: &capture::RecordedStep) -> Value {
     })
 }
 
+/// Encode captured pixels as an opaque PNG. Deterministic: the same pixels
+/// always give the same bytes, so a digest of the PNG tells change apart.
+pub fn encode_png(pixels: &Pixels) -> Result<Vec<u8>> {
+    let expected = pixels.width as usize * pixels.height as usize * 4;
+    if pixels.width == 0 || pixels.height == 0 || pixels.rgba.len() != expected {
+        return Err(DriverError::new(
+            "DRIVER.ACTION_FAILED",
+            "the captured image has no area or a malformed pixel buffer",
+        ));
+    }
+    let rgb: Vec<u8> = pixels
+        .rgba
+        .chunks_exact(4)
+        .flat_map(|p| [p[0], p[1], p[2]])
+        .collect();
+    let image = image::RgbImage::from_raw(pixels.width, pixels.height, rgb)
+        .ok_or_else(|| DriverError::new("DRIVER.ACTION_FAILED", "malformed pixel buffer"))?;
+    let mut png = Vec::new();
+    image
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .map_err(|error| {
+            DriverError::new(
+                "DRIVER.ACTION_FAILED",
+                format!("PNG encoding failed: {error}"),
+            )
+        })?;
+    Ok(png)
+}
+
 /// The action contracts this driver publishes in its manifest.
 /// The largest scroll a single request may ask for, in notches. Enough to page
 /// through a long list, bounded so one call cannot spin the wheel indefinitely.
@@ -964,6 +1034,10 @@ fn action_contracts() -> Map<String, Value> {
     actions.insert(
         "find".into(),
         read_only("Find the single element matching a locator."),
+    );
+    actions.insert(
+        "capture".into(),
+        read_only("Take a PNG of one observed element, or of its whole window."),
     );
 
     // Watching changes nothing on the desktop, but it is not `read_only`

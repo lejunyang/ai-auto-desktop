@@ -281,7 +281,7 @@ unknown-effect write automatically.",
         ),
         (
             "control_capture",
-            "Take a PNG screenshot of one observed element, e.g. a login QR code to show a person, or the page body for the whole page. Read-only. The answer carries the image and a `digest` of it: capture again later and compare digests to tell whether what is shown has changed (a QR code that refreshed) without looking at the image. Browser pages only for now; password fields are refused.",
+            "Take a PNG screenshot of one observed element, e.g. a login QR code to show a person, the page body for the whole page, or a Windows window's root node for the whole window. Read-only. The answer carries the image and a `digest` of it: capture again later and compare digests to tell whether what is shown has changed (a QR code that refreshed) without looking at the image. Browser pages and Windows desktop windows (providers listing `capture` under `reads` in control_capabilities); password fields are refused, and a minimized window must be restored first.",
             json!({"target": target_schema()}),
             vec!["target"],
             false,
@@ -405,6 +405,14 @@ or take the node_id from an outline."
         }
         "CONTROL.OCCLUDED" => {
             "Something is laid over the element, such as a dialog, a banner or a menu, so pointer input would land on that instead. Observe again and deal with what covers it, or use a plain click (DOM activation) if that is enough."
+        }
+        "DRIVER.PROTECTED_ELEMENT" => {
+            "Password and other protected fields are never captured or read. Capture an \
+element around it, or ask the person you are helping."
+        }
+        "DRIVER.WINDOW_MINIMIZED" => {
+            "The window is minimized, so it shows nothing. Restore it (the window node's \
+`restore` action, where offered), observe again and retry."
         }
         "CONTROL.OPTION_NOT_FOUND" => {
             "No option has that label or value. The observation lists the labels in the node's `options`."

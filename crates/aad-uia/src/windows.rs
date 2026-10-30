@@ -13,8 +13,8 @@
 use std::sync::Arc;
 
 use crate::backend::{
-    Backend, CaptureLimits, CapturedTree, DriverError, PointerButton, PointerGesture, Result,
-    ScrollDirection, ScrollSpec,
+    Backend, CaptureLimits, CapturedTree, DriverError, Pixels, PointerButton, PointerGesture,
+    Result, ScrollDirection, ScrollSpec,
 };
 use crate::capture::{CapturedEvent, EventBuffer, EventKind};
 use crate::model::{Bounds, Node, States, WindowInfo};
@@ -23,6 +23,12 @@ use std::sync::mpsc::{channel, Sender};
 use std::time::{Duration, Instant};
 use windows::core::{implement, BSTR, PWSTR};
 use windows::Win32::Foundation::{CloseHandle, BOOL, HWND, LPARAM, MAX_PATH, RECT, TRUE};
+use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_EXTENDED_FRAME_BOUNDS};
+use windows::Win32::Graphics::Gdi::{
+    CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC, GetDIBits,
+    ReleaseDC, SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS,
+};
+use windows::Win32::Storage::Xps::{PrintWindow, PRINT_WINDOW_FLAGS};
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED,
 };
@@ -103,8 +109,9 @@ use windows::Win32::UI::Accessibility::{
 };
 use windows::Win32::UI::HiDpi::{
     GetAwarenessFromDpiAwarenessContext, GetThreadDpiAwarenessContext,
-    SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
-    DPI_AWARENESS_PER_MONITOR_AWARE, DPI_AWARENESS_SYSTEM_AWARE, DPI_AWARENESS_UNAWARE,
+    GetWindowDpiAwarenessContext, SetProcessDpiAwarenessContext, SetThreadDpiAwarenessContext,
+    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, DPI_AWARENESS_PER_MONITOR_AWARE,
+    DPI_AWARENESS_SYSTEM_AWARE, DPI_AWARENESS_UNAWARE,
 };
 use windows::Win32::UI::Input::Ime::ImmGetDefaultIMEWnd;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -122,9 +129,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, EnumWindows, GetAncestor, GetClassNameW, GetForegroundWindow,
     GetGUIThreadInfo, GetSystemMetrics, GetWindowRect, GetWindowTextLengthW, GetWindowTextW,
     GetWindowThreadProcessId, IsIconic, IsWindowVisible, PeekMessageW, SendMessageW,
-    SetForegroundWindow, GA_ROOT, GUITHREADINFO, MSG, PM_REMOVE, SM_CXVIRTUALSCREEN,
-    SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, WHEEL_DELTA, WINEVENT_OUTOFCONTEXT,
-    WINEVENT_SKIPOWNPROCESS,
+    SetForegroundWindow, GA_ROOT, GUITHREADINFO, MSG, PM_REMOVE, PW_RENDERFULLCONTENT,
+    SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, WHEEL_DELTA,
+    WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS,
 };
 
 /// Initialise COM on the calling thread.
@@ -689,8 +696,10 @@ impl Backend for WindowsUiaBackend {
         gesture: &PointerGesture,
     ) -> Result<()> {
         let (handle, _) = self.element_for(window_id)?;
-        let start = to_absolute(element_point(from.bounds, gesture.fraction)?)?;
-        let end = to_absolute(element_point(to.bounds, gesture.to_fraction)?)?;
+        let start_point = element_point(from.bounds, gesture.fraction)?;
+        let end_point = element_point(to.bounds, gesture.to_fraction)?;
+        let start = to_absolute(start_point)?;
+        let end = to_absolute(end_point)?;
 
         unsafe {
             let _ = SetForegroundWindow(handle);
@@ -719,6 +728,54 @@ impl Backend for WindowsUiaBackend {
         // degrade to ordered single events. Any partial failure triggers a
         // best-effort button release and remains effect=unknown.
         deliver_drag(&inputs, end, up)
+    }
+
+    fn capture_pixels(&self, window_id: &str, node: &Node, whole_window: bool) -> Result<Pixels> {
+        let handle = parse_window_id(window_id)?;
+        if unsafe { IsIconic(handle) }.as_bool() {
+            return Err(DriverError::new(
+                "DRIVER.WINDOW_MINIMIZED",
+                "a minimized window has nothing on screen to capture; restore it first",
+            ));
+        }
+        let element = self.require(window_id, node)?;
+        if unsafe { element.CurrentIsPassword() }.is_ok_and(|value| value.as_bool()) {
+            return Err(DriverError::new(
+                "DRIVER.PROTECTED_ELEMENT",
+                "a password or otherwise protected element is never captured",
+            ));
+        }
+        if !whole_window
+            && unsafe { element.CurrentIsOffscreen() }.is_ok_and(|value| value.as_bool())
+        {
+            return Err(DriverError::new(
+                "DRIVER.ACTION_UNSUPPORTED",
+                "the element is scrolled or hidden out of view; bring it into view and observe again",
+            ));
+        }
+        let mut window = RECT::default();
+        unsafe { GetWindowRect(handle, &mut window) }.map_err(|error| {
+            DriverError::new(
+                "DRIVER.WINDOW_NOT_FOUND",
+                format!("the window rectangle could not be read: {error}"),
+            )
+        })?;
+        // Bounds are read live: the window may have moved since the snapshot.
+        let wanted = if whole_window {
+            extended_frame(handle).unwrap_or(window)
+        } else {
+            unsafe { element.CurrentBoundingRectangle() }.map_err(|error| {
+                DriverError::stale(format!("the element's bounds could not be read: {error}"))
+            })?
+        };
+        let region = intersect(wanted, window).ok_or_else(|| {
+            DriverError::new(
+                "DRIVER.ACTION_UNSUPPORTED",
+                "the element lies outside its window's area and shows nothing to capture",
+            )
+        })?;
+        let full = print_window(handle, &window)?;
+        Ok(crop(&full, &window, &region))
     }
 
     fn describe(&self) -> serde_json::Value {
@@ -1529,6 +1586,180 @@ fn describe_element(
         depth,
         parent_id,
         children: Vec::new(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Screenshots
+// ---------------------------------------------------------------------------
+
+/// The largest capture returned on either side, in physical pixels.
+const MAX_CAPTURE_SIDE: i32 = 8_192;
+/// A window larger than this is refused rather than buffered whole.
+const MAX_WINDOW_PIXELS: i64 = 64 * 1024 * 1024;
+
+/// A window's visible frame, without the invisible resize border Windows 10+
+/// adds outside it (which `GetWindowRect` includes).
+fn extended_frame(handle: HWND) -> Option<RECT> {
+    let mut frame = RECT::default();
+    unsafe {
+        DwmGetWindowAttribute(
+            handle,
+            DWMWA_EXTENDED_FRAME_BOUNDS,
+            (&mut frame as *mut RECT).cast(),
+            std::mem::size_of::<RECT>() as u32,
+        )
+    }
+    .ok()?;
+    (frame.right > frame.left && frame.bottom > frame.top).then_some(frame)
+}
+
+fn intersect(a: RECT, b: RECT) -> Option<RECT> {
+    let rect = RECT {
+        left: a.left.max(b.left),
+        top: a.top.max(b.top),
+        right: a.right.min(b.right),
+        bottom: a.bottom.min(b.bottom),
+    };
+    (rect.right > rect.left && rect.bottom > rect.top).then_some(rect)
+}
+
+/// The whole window as top-down BGRA, rendered by the window itself.
+///
+/// `PrintWindow` with `PW_RENDERFULLCONTENT` asks the window (and DWM, for
+/// DirectComposition and GPU content) to render into our bitmap. Unlike a
+/// copy of the screen it never contains another window laid over the target,
+/// so a screenshot cannot leak what some other application shows, and it does
+/// not need the target in front. The price: a minimized window renders
+/// nothing (refused before this), and an application that ignores the request
+/// renders black.
+///
+/// A DPI-virtualised window (unaware, or system aware on a monitor of another
+/// scale) renders at its own logical size while Windows shows it stretched.
+/// Its rendering is scaled to the physical window size the same way, so the
+/// capture lines up with the physical bounds UIA reports. Such a capture is
+/// as soft as what is on screen, no sharper.
+fn print_window(handle: HWND, window: &RECT) -> Result<Vec<u8>> {
+    let width = window.right - window.left;
+    let height = window.bottom - window.top;
+    if width <= 0 || height <= 0 {
+        return Err(DriverError::new(
+            "DRIVER.ACTION_UNSUPPORTED",
+            "the window has no area to capture",
+        ));
+    }
+    if i64::from(width) * i64::from(height) > MAX_WINDOW_PIXELS {
+        return Err(DriverError::new(
+            "DRIVER.ACTION_UNSUPPORTED",
+            "the window is larger than a capture may buffer",
+        ));
+    }
+    let (own_width, own_height) = own_window_size(handle)
+        .filter(|&(w, h)| w > 0 && h > 0 && i64::from(w) * i64::from(h) <= MAX_WINDOW_PIXELS)
+        .unwrap_or((width, height));
+    let rendered = render_window(handle, own_width, own_height)?;
+    if (own_width, own_height) == (width, height) {
+        return Ok(rendered);
+    }
+    let image = image::RgbaImage::from_raw(own_width as u32, own_height as u32, rendered)
+        .ok_or_else(|| DriverError::new("DRIVER.ACTION_FAILED", "malformed window rendering"))?;
+    Ok(image::imageops::resize(
+        &image,
+        width as u32,
+        height as u32,
+        image::imageops::FilterType::Triangle,
+    )
+    .into_raw())
+}
+
+/// The window's size in its own DPI space: what `PrintWindow` renders.
+fn own_window_size(handle: HWND) -> Option<(i32, i32)> {
+    let mut rect = RECT::default();
+    unsafe {
+        let previous = SetThreadDpiAwarenessContext(GetWindowDpiAwarenessContext(handle));
+        let read = GetWindowRect(handle, &mut rect);
+        if !previous.0.is_null() {
+            SetThreadDpiAwarenessContext(previous);
+        }
+        read.ok()?;
+    }
+    Some((rect.right - rect.left, rect.bottom - rect.top))
+}
+
+/// `PrintWindow` into a bitmap of the given size, read back as BGRA.
+fn render_window(handle: HWND, width: i32, height: i32) -> Result<Vec<u8>> {
+    let mut bgra = vec![0u8; width as usize * height as usize * 4];
+    unsafe {
+        let screen = GetDC(HWND::default());
+        let memory = CreateCompatibleDC(screen);
+        let bitmap = CreateCompatibleBitmap(screen, width, height);
+        let old = SelectObject(memory, bitmap);
+        let printed = PrintWindow(handle, memory, PRINT_WINDOW_FLAGS(PW_RENDERFULLCONTENT));
+        // GetDIBits wants the bitmap out of any DC.
+        SelectObject(memory, old);
+        let mut info = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: width,
+                biHeight: -height,
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let lines = GetDIBits(
+            memory,
+            bitmap,
+            0,
+            height as u32,
+            Some(bgra.as_mut_ptr().cast()),
+            &mut info,
+            DIB_RGB_COLORS,
+        );
+        let _ = DeleteObject(bitmap);
+        let _ = DeleteDC(memory);
+        ReleaseDC(HWND::default(), screen);
+        if !printed.as_bool() {
+            return Err(DriverError::new(
+                "DRIVER.ACTION_FAILED",
+                "the window did not render itself for the screenshot",
+            ));
+        }
+        if lines != height {
+            return Err(DriverError::new(
+                "DRIVER.ACTION_FAILED",
+                "the rendered window could not be read back",
+            ));
+        }
+    }
+    Ok(bgra)
+}
+
+/// Cut `region` (screen pixels) out of a window-sized BGRA buffer as RGBA,
+/// keeping at most MAX_CAPTURE_SIDE on each side from the top-left.
+fn crop(bgra: &[u8], window: &RECT, region: &RECT) -> Pixels {
+    let stride = (window.right - window.left) as usize * 4;
+    let full_width = region.right - region.left;
+    let full_height = region.bottom - region.top;
+    let width = full_width.min(MAX_CAPTURE_SIDE);
+    let height = full_height.min(MAX_CAPTURE_SIDE);
+    let left = (region.left - window.left) as usize;
+    let top = (region.top - window.top) as usize;
+    let mut rgba = Vec::with_capacity(width as usize * height as usize * 4);
+    for row in 0..height as usize {
+        let start = (top + row) * stride + left * 4;
+        for pixel in bgra[start..start + width as usize * 4].chunks_exact(4) {
+            // PrintWindow leaves alpha undefined; the image is opaque.
+            rgba.extend_from_slice(&[pixel[2], pixel[1], pixel[0], 255]);
+        }
+    }
+    Pixels {
+        width: width as u32,
+        height: height as u32,
+        rgba,
+        clipped: width < full_width || height < full_height,
     }
 }
 
