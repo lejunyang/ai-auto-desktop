@@ -208,7 +208,10 @@ operator 不持有 runner 的 bearer token，也不应为提交控制意图而�
 JournalStore 只执行调用方给出的敏感标记和存储不变量，不通过内容猜测 secret。RunService 是可信持久化入口：它必须按 descriptor 的 input/output `sensitive` 声明显式传递标记并 fail closed。当前机制不是完整 taint tracking；未实现跨变量、插件响应与派生值的自动敏感传播前，不得宣称能自动防止所有 secret 泄漏。
 
 当前 durable executor 默认使用 `deny` 模式；CLI 只有在 `start` 与 `resume` 显式传入
-`--durable-actions read-only` 时才启用受限 action 通道。两种模式都只接受
+`--durable-actions read-only` 时才启用受限 action 通道，MCP 对应 `run_workflow`（`durable: true`）
+与 `workflow_run_resume` 的 `durable_actions: "read_only"`。两个入口默认共用每用户运行库
+（`AAD_RUN_STORE`，否则 `~/.ai-auto-desktop/runs.sqlite3`）；MCP 服务器在后台线程驱动执行器，
+断开时请求 pause，进程死亡后按租约过期 + resume 的同一套规则恢复。两种模式都只接受
 `max_concurrency=1` 且顶层未显式声明 `depends_on` 的 legacy 串行计划，其他 DAG 在创建 run 前
 失败关闭。opt-in action 只能位于顶层，必须有效为 `read_only`，并且是无 `if`、
 `precondition`、`postcondition`、retry、step handler 或 step `finally` 的单次 attempt。嵌套

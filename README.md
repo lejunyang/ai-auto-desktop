@@ -253,6 +253,9 @@ postcondition:
 `aad run` 跑在内存里，进程退出即结束。需要一个能跨进程存活的运行时，用 `aad start`：
 状态落在 SQLite 里，另一个进程随时可以查、可以接管。
 
+`--store` 可省略：默认是每用户一份的 `~/.ai-auto-desktop/runs.sqlite3`（`AAD_RUN_STORE` 可覆盖），
+MCP 的 `run_workflow` 持久模式也写这里，所以 AI 起的运行能直接用 `aad status` / `aad resume` 跟进。
+
 ```powershell
 aad start workflow.yaml --store runs.sqlite3 --run-id job-1
 aad status job-1  --store runs.sqlite3     # 进度、当前状态、检查点
@@ -354,6 +357,22 @@ run_workflow(greeter, ...)  → {"status":"succeeded","outputs":{...}}
   不提供工作流工具：工作流按窗口名自己找窗口，这类授权管不住它。
 - store 与 GUI 共用同一个目录（`AAD_RECORDINGS_DIR` 可覆盖），GUI 里录完存下的东西
   AI 立刻能看到。
+
+**持久运行**（长流程、要跨进程跟进的）：`run_workflow` 传 `durable: true`（显式开启，默认仍是内存运行），
+经 `DurableExecutor` 写入与 `aad start` 相同的每用户运行库；随后用 `workflow_run_status`（状态、当前步骤、
+输出或错误、`unknown_effect` 详情与下一步建议）、`workflow_run_list`、`workflow_run_events`（`after_seq` +
+`limit` 分页）跟进，用 `workflow_run_pause` / `workflow_run_cancel` / `workflow_run_resume` 控制
+（这三个是写操作，只读服务器上被拒）。
+
+- **持久模式的限制原样保留**：拒绝 `script`、写 action、敏感输入输出；顶层只读 action 需要显式
+  `durable_actions: "read_only"`。被拒时返回 `DURABLE.*` 错误（`run_created=false`，什么都没执行），
+  **不会悄悄改成内存运行**——只有调用方传 `fallback_in_memory: true` 才回退，并在 `durable_refusal` 里说明原因。
+- **长流程不阻塞调用**：执行器在服务器后台线程里跑，调用最多等 `wait_ms`（默认 20 秒，上限 120 秒），
+  超时就返回 `run_id` 与 `status=running`。
+- **服务器退出时**：客户端断开会对正在跑的运行请求 pause 并等待约 2 秒，处于步骤边界的运行干净地停成 `paused`；
+  进程直接死掉时运行保持 `running`，租约（默认 60 秒）过期后 `workflow_run_resume` 或 `aad resume` 才能接管。
+  停在步骤之间的从检查点继续；死在步骤中途的落 `unknown_effect`，**不会自动重放**。
+- `workflow_run_resume` 需要原工作流名；工作流改过（plan digest 不同）会被拒。输入沿用创建时持久化的值。
 
 该模式下 stdout 由协议独占，任何诊断信息都走 stderr，客户端解析不会错位。失败会以结构化
 错误返回，并附带可执行的恢复建议（例如界面已变化时提示"重新读取窗口后重试"）。
