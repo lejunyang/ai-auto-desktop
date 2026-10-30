@@ -37,6 +37,16 @@ const PAGE: &str = r#"<!doctype html><html><body>
 <input type="file" aria-label="Attachment" onchange="document.getElementById('status').value='files:'+Array.from(this.files).map(f=>f.name+':'+f.size).join(',')">
 <input type="file" aria-label="Hidden upload" multiple style="display:none" onchange="document.getElementById('status').value='hidden:'+Array.from(this.files).map(f=>f.name).join(',')">
 <input id="typed" aria-label="Typed" onkeydown="document.getElementById('keylog').value+='d:'+event.key+':'+event.isTrusted+' '" onkeypress="document.getElementById('keylog').value+='p:'+event.key+' '"><output id="keylog" aria-label="Key log"></output>
+<ul id="sortable" aria-label="Sortable"><li aria-label="One" style="cursor:grab">One</li><li aria-label="Two" style="cursor:grab">Two</li><li aria-label="Three" style="cursor:grab">Three</li></ul>
+<div style="display:flex;gap:20px"><div draggable="true" aria-label="Card" style="width:80px;height:30px" ondragstart="event.dataTransfer.setData('text/plain','card')">Card</div>
+<div aria-label="Bin" style="width:120px;height:40px;border:1px solid" ondragover="event.preventDefault()" ondrop="event.preventDefault();document.getElementById('status').value='dropped:'+event.dataTransfer.getData('text/plain')+':'+event.isTrusted">Bin</div></div>
+<script>
+let held=null,moves=0;const list=document.getElementById('sortable');
+list.addEventListener('mousedown',e=>{held=e.target.closest('li');moves=0;e.preventDefault();});
+document.addEventListener('mousemove',()=>{if(held)moves++;});
+document.addEventListener('mouseup',e=>{if(!held)return;const over=document.elementFromPoint(e.clientX,e.clientY);const li=over&&over.closest('#sortable li');
+if(li&&li!==held)li.after(held);document.getElementById('status').value='sorted:'+Array.from(list.children).map(l=>l.textContent).join(',')+':'+(moves>4)+':'+e.isTrusted;held=null;});
+</script>
 <iframe src="/frame"></iframe>
 </body></html>"#;
 
@@ -430,6 +440,75 @@ fn typing_sends_trusted_keystrokes_and_shortcuts_stay_on_the_focused_field() {
         1,
         "no tab was opened"
     );
+}
+
+fn drag_to(session: &Session, main: &str, from: &str, (role, to): (&str, &str)) -> Response {
+    let observed = observe(session, main);
+    let source = find(session, &observed, "listitem", from);
+    let to = find(session, &observed, role, to);
+    act(
+        session,
+        source,
+        Action::Drag {
+            to,
+            button: None,
+            fraction: None,
+            to_fraction: Some(Fraction { fx: 0.5, fy: 0.8 }),
+        },
+    )
+}
+
+#[test]
+#[ignore = "requires isolated Chromium with its sandbox enabled; CI runs it explicitly"]
+fn drags_move_pointer_sortables_and_html5_draggables() {
+    let _serial = serial();
+    let fixture = Fixture::new();
+    let (session, _) = session_for(&fixture);
+    let main = main_of(&session, &fixture.page_id);
+    assert!(wait_until(&session, &main, "Bin", WaitCondition::Appears)
+        .error
+        .is_none());
+    let observed = observe(&session, &main);
+    for name in ["One", "Card"] {
+        assert!(
+            actions(&observed, name).contains(&"drag".to_string()),
+            "{name}"
+        );
+    }
+    // A pointer-driven sortable: press, glide, release, all trusted.
+    let dragged = drag_to(&session, &main, "One", ("listitem", "Three"));
+    assert!(dragged.error.is_none(), "{dragged:?}");
+    assert_eq!(dragged.data.unwrap()["backend_result"]["html5_drag"], false);
+    assert_eq!(
+        status(&observe(&session, &main)),
+        "sorted:Two,Three,One:true:true"
+    );
+    // An HTML5 draggable reaches its drop target with its data.
+    let observed = observe(&session, &main);
+    let card: Target = serde_json::from_value(node(&observed, "Card")["target"].clone()).unwrap();
+    let bin: Target = serde_json::from_value(node(&observed, "Bin")["target"].clone()).unwrap();
+    let dropped = act(
+        &session,
+        card,
+        Action::Drag {
+            to: bin,
+            button: None,
+            fraction: None,
+            to_fraction: None,
+        },
+    );
+    assert!(dropped.error.is_none(), "{dropped:?}");
+    assert_eq!(dropped.data.unwrap()["backend_result"]["html5_drag"], true);
+    assert_eq!(status(&observe(&session, &main)), "dropped:card:true");
+    // A destination something else covers is refused before anything is pressed.
+    let covered = drag_to(&session, &main, "Two", ("button", "Covered"));
+    assert_eq!(
+        covered.commit_state,
+        CommitState::NotCommitted,
+        "{covered:?}"
+    );
+    assert_eq!(covered.error.unwrap()["code"], "CONTROL.OCCLUDED");
+    assert_eq!(status(&observe(&session, &main)), "dropped:card:true");
 }
 
 #[test]

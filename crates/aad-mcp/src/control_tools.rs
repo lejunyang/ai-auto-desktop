@@ -112,7 +112,11 @@ fn action_schema() -> Value {
             "fraction": fraction_schema("Where inside the element to hover")
         }), &[]),
         variant("drag", "Press on the element, glide, release on another element of the \
-    same observation. Use for reordering a list or moving an item between panes.", json!({
+    same observation. Use for reordering a list or moving an item between panes. In a browser \
+    it is trusted pointer input (offered on draggable elements, list items and grab cursors; \
+    the destination may be any observed element); both ends must be in view together and \
+    unobstructed, and an HTML5 drag (draggable, dragstart/drop) is completed with drag \
+    events carrying its data.", json!({
             "to": target_schema(),
             "button": button_schema(),
             "fraction": fraction_schema("Where inside the source element to grab"),

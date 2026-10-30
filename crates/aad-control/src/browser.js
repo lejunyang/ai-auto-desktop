@@ -21,6 +21,9 @@
   // The focused element itself, inside any open shadow roots on the way.
   const activeElement = () => {let a=document.activeElement;while(a && a.shadowRoot && a.shadowRoot.activeElement)a=a.shadowRoot.activeElement;return a;};
   const scrollable = el => el===document.body || ((el.scrollHeight>el.clientHeight+1 || el.scrollWidth>el.clientWidth+1) && /(auto|scroll|overlay)/.test(getComputedStyle(el).overflow+getComputedStyle(el).overflowY+getComputedStyle(el).overflowX));
+  // What a person could pick up: HTML5 draggables, items of lists and grids,
+  // and whatever shows a grab cursor.
+  const draggable = el => el!==document.body && (el.draggable || ['listitem','option','row','treeitem'].includes(roleOf(el)) || /^(grab|grabbing|move)$/.test(getComputedStyle(el).cursor));
   const actions = el => {
     if (!enabled(el) || protectedNode(el)) return [];
     if (fileInput(el)) return ['upload'];
@@ -31,6 +34,7 @@
     if (el.tagName==='SELECT' && !el.multiple) result.push('select');
     if (checkable(el)) result.push('check');
     if (scrollable(el)) result.push('scroll');
+    if (draggable(el)) result.push('drag');
     if (el===document.body) result.push('navigate','back','forward','reload','open_tab','activate_page','close_page');
     return result;
   };
@@ -39,7 +43,8 @@
     const found=nodes.get(args.node_id);
     if (!found || !present(found.el) || fingerprint(found.el)!==found.fingerprint) return {error:'CONTROL.STALE_TARGET'};
     if (!enabled(found.el) || protectedNode(found.el)) return {error:'CONTROL.ACTION_UNSUPPORTED'};
-    if (!actions(found.el).includes(args.action)) return {error:'CONTROL.ACTION_UNSUPPORTED'};
+    // A drag's destination is any observed element; everything else needs its action.
+    if (args.action!==null && !actions(found.el).includes(args.action)) return {error:'CONTROL.ACTION_UNSUPPORTED'};
     return found;
   };
   globalThis.__aadControlV1 = {
@@ -130,7 +135,7 @@
     point: args => {
       const found=check(args); if(found.error) return found;
       const el=found.el;
-      el.scrollIntoView({block:'nearest',inline:'nearest'});
+      if(!args.noscroll) el.scrollIntoView({block:'nearest',inline:'nearest'});
       const box=el.getBoundingClientRect();
       // Only the part inside the viewport can receive input; the body of a long page is mostly outside it.
       const left=Math.max(box.left,0), top=Math.max(box.top,0);

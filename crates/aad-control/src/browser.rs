@@ -15,8 +15,9 @@ pub const PROVIDER: &str = "browser.cdp";
 
 /// CDP `Input` and page navigation address the page, not a frame, so they are
 /// offered only where the observed frame is the main one.
-const MAIN_FRAME_ONLY: [&str; 11] = [
+const MAIN_FRAME_ONLY: [&str; 12] = [
     "key",
+    "drag",
     "type_text",
     "scroll",
     "hover",
@@ -170,6 +171,7 @@ impl Downloads {
     }
 }
 const DIALOG_CLOSED: &str = "Page.javascriptDialogClosed";
+const DRAG_INTERCEPTED: &str = "Input.dragIntercepted";
 
 struct Page {
     client: Client,
@@ -178,6 +180,8 @@ struct Page {
     dialog: Option<Value>,
     /// The main frame id the last frame tree reported.
     main_frame: Option<String>,
+    /// The drag data of an HTML5 drag the browser intercepted, while one is in flight.
+    drag: Option<Value>,
 }
 
 impl Page {
@@ -201,6 +205,7 @@ impl Page {
                     }));
                 }
                 Some(DIALOG_CLOSED) => self.dialog = None,
+                Some(DRAG_INTERCEPTED) => self.drag = Some(event["params"]["data"].clone()),
                 _ => {}
             }
         }
@@ -358,7 +363,10 @@ impl BrowserBackend {
                 }
             }
             let mut client = Client::attach_bare_until(target, deadline).map_err(cdp_error)?;
-            client.filter_events(&[DIALOG_OPENING, DIALOG_CLOSED], &[DIALOG_OPENING]);
+            client.filter_events(
+                &[DIALOG_OPENING, DIALOG_CLOSED, DRAG_INTERCEPTED],
+                &[DIALOG_OPENING],
+            );
             // Dialog events need the Page domain. Enabling it waits for the
             // renderer, which a dialog opened before this connection blocks
             // for good: the browser only lets the connection that saw a
@@ -387,6 +395,7 @@ impl BrowserBackend {
                     websocket: target.webSocketDebuggerUrl.clone(),
                     dialog: None,
                     main_frame: None,
+                    drag: None,
                 },
             );
         }
@@ -628,6 +637,7 @@ impl Backend for BrowserBackend {
             "key",
             "scroll",
             "hover",
+            "drag",
             "select",
             "check",
             "navigate",
@@ -772,7 +782,7 @@ impl Backend for BrowserBackend {
         // count or a position needs trusted input, which addresses the page.
         let trusted = match action {
             Action::Click { .. } => !action.plain_click(),
-            Action::Scroll { .. } | Action::Hover { .. } => true,
+            Action::Scroll { .. } | Action::Hover { .. } | Action::Drag { .. } => true,
             _ => false,
         };
         if trusted && meta["main_frame"] != true {
@@ -790,7 +800,16 @@ impl Backend for BrowserBackend {
         }
         let page_id = meta["page_id"].as_str().unwrap();
         let frame_id = meta["frame_id"].as_str().unwrap();
-        let result = self.with_page(page_id,action_context.remaining()?,|client|{
+        let result = self.with_page_state(page_id,action_context.remaining()?,|state|{
+            if let Some(dialog)=&state.dialog {return Err(dialog_open(dialog));}
+            if let Action::Drag {to,fraction,to_fraction,button}=action {
+                let observed=|node_id:&str,fraction:&Option<crate::Fraction>,action:Value|{let mut args=json!({"document_token":snapshot["document_token"],"observation":snapshot["snapshot_id"],"node_id":node_id,"action":action});if let Some(f)=fraction{args["fraction"]=json!({"fx":f.fx,"fy":f.fy});}args};
+                if current_frame(&mut state.client,frame_id)?["loaderId"]!=meta["loader_id"] {return Err(error("CONTROL.STALE_TARGET","browser document navigated"));}
+                let from=observed(node["node_id"].as_str().unwrap_or_default(),fraction,json!("drag"));
+                let onto=observed(&to.node_id,to_fraction,Value::Null);
+                return drag(state,meta["context_id"].as_i64().unwrap(),&from,&onto,*button,action_context);
+            }
+            let client=&mut state.client;
             if current_frame(client,frame_id)?["loaderId"]!=meta["loader_id"] {return Err(error("CONTROL.STALE_TARGET","browser document navigated"));}
             let context=meta["context_id"].as_i64().unwrap();
             let mut args=json!({"document_token":snapshot["document_token"],"observation":snapshot["snapshot_id"],"node_id":node["node_id"],"action":action.name()});
@@ -1011,6 +1030,137 @@ fn pointer(
     Ok(
         json!({"submitted": true, "native_operation": "Input.dispatchMouseEvent", "trusted_event": true}),
     )
+}
+
+/// Where the page confirmed pointer input lands on an observed node.
+fn landing(client: &mut Client, context: i64, args: &Value) -> Result<(f64, f64)> {
+    let point = checked(eval(
+        client,
+        context,
+        format!("globalThis.__aadControlV1.point({args})"),
+    )?)?;
+    match (point["x"].as_f64(), point["y"].as_f64()) {
+        (Some(x), Some(y)) => Ok((x, y)),
+        _ => Err(error("BROWSER.BAD_RESULT", "page did not report a point")),
+    }
+}
+
+/// Mouse moves between press and release, so pointer handlers see a glide.
+const DRAG_STEPS: u32 = 12;
+/// How long an HTML5 drag may take to reach the browser after the last move.
+const DRAG_SETTLE: Duration = Duration::from_millis(150);
+
+/// Press on one observed node, glide, release on another. Both ends are hit
+/// tested while both are in view. An HTML5 drag (draggable, dragstart/drop)
+/// is intercepted by the browser and finished with drag events at the
+/// destination, since headless Chrome has no OS drag loop to run it.
+fn drag(
+    page: &mut Page,
+    context: i64,
+    from: &Value,
+    onto: &Value,
+    button: Option<Button>,
+    action_context: &crate::Context,
+) -> Result<Value> {
+    let client = &mut page.client;
+    landing(client, context, from)?;
+    landing(client, context, onto)?;
+    // Bringing the destination into view may have moved the source: both
+    // must be hit where they are now, without scrolling again.
+    let still = |args: &Value| {
+        let mut args = args.clone();
+        args["noscroll"] = json!(true);
+        args
+    };
+    let start = landing(client, context, &still(from)).map_err(|e| {
+        if e.code == "CONTROL.OCCLUDED" {
+            error(
+                "CONTROL.OCCLUDED",
+                "the drag's source and destination cannot both be in view, or something covers one",
+            )
+        } else {
+            e
+        }
+    })?;
+    let end = landing(client, context, &still(onto))?;
+    let (name, mask) = match button {
+        None | Some(Button::Left) => ("left", 1),
+        Some(Button::Right) => ("right", 2),
+        Some(Button::Middle) => ("middle", 4),
+    };
+    page.sync_dialog();
+    page.drag = None;
+    action_context.commit()?;
+    let client = &mut page.client;
+    command(
+        client,
+        "Input.setInterceptDrags",
+        json!({"enabled": name == "left"}),
+    )
+    .map_err(|e| e.with_effect("unknown"))?;
+    let mut result = || -> Result<Value> {
+        mouse(
+            &mut page.client,
+            json!({"type": "mouseMoved", "x": start.0, "y": start.1}),
+        )?;
+        mouse(
+            &mut page.client,
+            json!({"type": "mousePressed", "x": start.0, "y": start.1, "button": name, "buttons": mask, "clickCount": 1}),
+        )?;
+        let mut intercepted = None;
+        for step in 1..=DRAG_STEPS {
+            let f = f64::from(step) / f64::from(DRAG_STEPS);
+            let (x, y) = (
+                start.0 + (end.0 - start.0) * f,
+                start.1 + (end.1 - start.1) * f,
+            );
+            mouse(
+                &mut page.client,
+                json!({"type": "mouseMoved", "x": x, "y": y, "button": name, "buttons": mask}),
+            )?;
+            page.sync_dialog();
+            if let Some(data) = page.drag.take() {
+                intercepted = Some(data);
+                break;
+            }
+        }
+        let settle = Instant::now() + DRAG_SETTLE;
+        while intercepted.is_none() && name == "left" && Instant::now() < settle {
+            std::thread::sleep(Duration::from_millis(10));
+            page.sync_dialog();
+            intercepted = page.drag.take();
+        }
+        let client = &mut page.client;
+        let operation = match &intercepted {
+            Some(data) => {
+                for kind in ["dragEnter", "dragOver", "drop"] {
+                    command(
+                        client,
+                        "Input.dispatchDragEvent",
+                        json!({"type": kind, "x": end.0, "y": end.1, "data": data}),
+                    )
+                    .map_err(|e| e.with_effect("unknown"))?;
+                }
+                "Input.dispatchDragEvent"
+            }
+            None => "Input.dispatchMouseEvent",
+        };
+        mouse(
+            client,
+            json!({"type": "mouseReleased", "x": end.0, "y": end.1, "button": name, "buttons": 0, "clickCount": 1}),
+        )?;
+        Ok(
+            json!({"submitted": true, "native_operation": operation, "trusted_event": true,
+                "html5_drag": intercepted.is_some(), "steps": DRAG_STEPS}),
+        )
+    };
+    let result = result();
+    let _ = command(
+        &mut page.client,
+        "Input.setInterceptDrags",
+        json!({"enabled": false}),
+    );
+    result
 }
 
 /// Files into the observed file input. The session has already resolved the
