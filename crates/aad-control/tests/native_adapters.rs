@@ -260,6 +260,37 @@ fn windows_gestures_views_and_rich_locators_route_to_the_driver() {
     assert_eq!(args["expect"], "optional");
     assert_eq!(found["node_id"], "n");
 
+    // Window actions are typed only where the driver labelled the node.
+    let window = json!({"node_id":"root","actions":["activate","close_window","minimize"]});
+    let mut windowed = Map::new();
+    for action in [
+        "snapshot",
+        "activate",
+        "close_window",
+        "minimize",
+        "maximize",
+        "restore",
+    ] {
+        windowed.insert(action.into(), json!({"contract_major":1}));
+    }
+    let provider_with_windows = Arc::new(Windows {
+        manifest: manifest::parse(&manifest::document("desktop.windows_uia", windowed)).unwrap(),
+        calls: Mutex::new(Vec::new()),
+    });
+    let window_backend = NativeBackend::new(provider_with_windows.clone(), Flavor::Windows);
+    assert_eq!(
+        window_backend.node_capabilities(&window),
+        vec!["minimize", "close_window", "activate"]
+    );
+    window_backend
+        .act(&snapshot, &window, &Action::Activate {}, &context())
+        .unwrap();
+    let calls = provider_with_windows.calls.lock().unwrap();
+    let (called, args) = calls.last().unwrap();
+    assert_eq!(called, "desktop.windows_uia.activate@1");
+    assert_eq!(args["target"]["node_id"], "root");
+    drop(calls);
+
     // A screenshot is of the quoted, revalidated node, in the browser's shape.
     assert_eq!(backend.reads(), vec!["capture"]);
     let shot = backend

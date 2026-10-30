@@ -23,12 +23,12 @@ use windows::Win32::UI::HiDpi::{
     GetDpiForSystem, SetThreadDpiAwarenessContext, DPI_AWARENESS_CONTEXT_UNAWARE,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DispatchMessageW, GetDlgItem, GetMessageW, PostMessageW,
-    PostQuitMessage, RegisterClassExW, SetWindowTextW, ShowWindow, TranslateMessage, BN_CLICKED,
-    CW_USEDEFAULT, ES_AUTOHSCROLL, ES_PASSWORD, HMENU, MSG, SHOW_WINDOW_CMD, WINDOW_EX_STYLE,
-    WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_LBUTTONDOWN, WM_PAINT, WNDCLASSEXW,
-    WS_BORDER, WS_CHILD, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_OVERLAPPEDWINDOW,
-    WS_POPUP, WS_TABSTOP, WS_VISIBLE,
+    CreateWindowExW, DefWindowProcW, DispatchMessageW, GetDlgItem, GetForegroundWindow,
+    GetMessageW, IsIconic, IsWindow, IsZoomed, PostMessageW, PostQuitMessage, RegisterClassExW,
+    SetWindowTextW, ShowWindow, TranslateMessage, BN_CLICKED, CW_USEDEFAULT, ES_AUTOHSCROLL,
+    ES_PASSWORD, HMENU, MSG, SHOW_WINDOW_CMD, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_COMMAND,
+    WM_DESTROY, WM_LBUTTONDOWN, WM_PAINT, WNDCLASSEXW, WS_BORDER, WS_CHILD, WS_EX_NOACTIVATE,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_OVERLAPPEDWINDOW, WS_POPUP, WS_TABSTOP, WS_VISIBLE,
 };
 
 const EDIT_ID: i32 = 1001;
@@ -896,6 +896,88 @@ fn a_click_on_a_covered_element_is_refused_and_sends_nothing() {
         thread::sleep(Duration::from_millis(20));
     }
     assert_eq!(COVER_CLICKS.load(Ordering::SeqCst), 0);
+}
+
+fn root_target(captured: &Value) -> (Value, Vec<String>) {
+    let root = &captured["nodes"][0];
+    assert!(root["parent_id"].is_null());
+    let actions = root["actions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a.as_str().unwrap().to_string())
+        .collect();
+    (
+        json!({"snapshot_id": captured["snapshot_id"], "revision": captured["revision"], "node_id": root["node_id"]}),
+        actions,
+    )
+}
+
+#[test]
+#[ignore = "requires an interactive Windows desktop; CI opts in explicitly"]
+fn window_actions_change_only_the_observed_window_and_offer_what_fits_its_state() {
+    let driver = native_driver().expect("create native UIA driver");
+    let title = format!("AI Auto Desktop window fixture {}", uuid::Uuid::new_v4());
+    let fixture = start_swatch(title.clone(), false).expect("start fixture");
+    let hwnd = fixture.hwnd;
+    let window_id = wait_for_window(&driver, &title);
+    let state = || unsafe {
+        if !IsWindow(hwnd).as_bool() {
+            "closed"
+        } else if IsIconic(hwnd).as_bool() {
+            "minimized"
+        } else if IsZoomed(hwnd).as_bool() {
+            "maximized"
+        } else {
+            "normal"
+        }
+    };
+    let act = |action: &str| {
+        let captured = snapshot(&driver, &window_id);
+        let (target, offered) = root_target(&captured);
+        assert!(
+            offered.iter().any(|a| a == action),
+            "{action} not offered in {offered:?}"
+        );
+        driver
+            .call(action, &json!({"target": target}))
+            .unwrap_or_else(|e| panic!("{action}: {e:?}"))
+    };
+
+    let (_, offered) = root_target(&snapshot(&driver, &window_id));
+    for expected in ["activate", "close_window", "minimize", "maximize"] {
+        assert!(offered.iter().any(|a| a == expected), "{offered:?}");
+    }
+    assert!(
+        !offered.iter().any(|a| a == "restore"),
+        "normal: {offered:?}"
+    );
+    // Only the window's own node stands for the window.
+    let captured = snapshot(&driver, &window_id);
+    let swatch = find(
+        &driver,
+        &captured,
+        json!({"role": "pane", "name": SWATCH_NAME}),
+    );
+    assert!(!swatch["node"]["actions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|a| a == "minimize"));
+
+    assert_eq!(act("maximize")["window"]["state"], "maximized");
+    assert_eq!(state(), "maximized");
+    assert_eq!(act("restore")["window"]["state"], "normal");
+    assert_eq!(state(), "normal");
+    assert_eq!(act("minimize")["window"]["state"], "minimized");
+    assert_eq!(state(), "minimized");
+    // Activating a minimized window restores it and brings it forward.
+    let activated = act("activate");
+    assert_eq!(activated["window"]["state"], "normal");
+    assert_eq!(unsafe { GetForegroundWindow() }, hwnd);
+    let closed = act("close_window");
+    assert_eq!(closed["window"]["closed"], true);
+    assert_eq!(state(), "closed");
 }
 
 #[test]

@@ -207,9 +207,18 @@ pub enum Action {
     Back {},
     Forward {},
     Reload {},
+    /// Window actions, offered on an observed top-level window's own node.
+    Minimize {},
+    Maximize {},
+    /// Back to the normal size from minimized or maximized.
+    Restore {},
+    /// Ask the window to close, as its close button would; it may prompt.
+    CloseWindow {},
+    /// Bring the window to the foreground, restoring it if minimized.
+    Activate {},
 }
 
-pub const ACTION_NAMES: [&str; 15] = [
+pub const ACTION_NAMES: [&str; 20] = [
     "focus",
     "invoke",
     "click",
@@ -225,10 +234,24 @@ pub const ACTION_NAMES: [&str; 15] = [
     "back",
     "forward",
     "reload",
+    "minimize",
+    "maximize",
+    "restore",
+    "close_window",
+    "activate",
 ];
 
 /// Actions on the page as a whole, offered on its document node.
 pub const PAGE_ACTIONS: [&str; 4] = ["navigate", "back", "forward", "reload"];
+
+/// Actions on a desktop window as a whole, offered on its own node.
+pub const WINDOW_ACTIONS: [&str; 5] = [
+    "minimize",
+    "maximize",
+    "restore",
+    "close_window",
+    "activate",
+];
 
 impl Action {
     /// A plain left click.
@@ -256,6 +279,11 @@ impl Action {
             Self::Back {} => "back",
             Self::Forward {} => "forward",
             Self::Reload {} => "reload",
+            Self::Minimize {} => "minimize",
+            Self::Maximize {} => "maximize",
+            Self::Restore {} => "restore",
+            Self::CloseWindow {} => "close_window",
+            Self::Activate {} => "activate",
         }
     }
     /// A left single click at the centre needs nothing beyond a plain click.

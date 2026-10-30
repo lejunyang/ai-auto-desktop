@@ -27,7 +27,9 @@ use windows::Globalization::Language;
 use windows::Graphics::Imaging::{BitmapPixelFormat, SoftwareBitmap};
 use windows::Media::Ocr::OcrEngine;
 use windows::Storage::Streams::DataWriter;
-use windows::Win32::Foundation::{CloseHandle, BOOL, HWND, LPARAM, MAX_PATH, POINT, RECT, TRUE};
+use windows::Win32::Foundation::{
+    CloseHandle, BOOL, HWND, LPARAM, MAX_PATH, POINT, RECT, TRUE, WPARAM,
+};
 use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_EXTENDED_FRAME_BOUNDS};
 use windows::Win32::Graphics::Gdi::{
     CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC, GetDIBits,
@@ -53,6 +55,7 @@ use windows::Win32::UI::Accessibility::{
     IUIAutomationPropertyChangedEventHandler_Impl,
     IUIAutomationTogglePattern,
     IUIAutomationValuePattern,
+    IUIAutomationWindowPattern,
     SetWinEventHook,
     TreeScope_Children,
     TreeScope_Subtree,
@@ -105,7 +108,12 @@ use windows::Win32::UI::Accessibility::{
     UIA_ValuePatternId,
     UIA_ValueValuePropertyId,
     UIA_WindowControlTypeId,
+    UIA_WindowPatternId,
     UnhookWinEvent,
+    WindowVisualState,
+    WindowVisualState_Maximized,
+    WindowVisualState_Minimized,
+    WindowVisualState_Normal,
     HWINEVENTHOOK,
     // Control type ids. A role comes from these rather than from the localized
     // display string, which changes with the system language.
@@ -138,6 +146,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SendMessageW, SetForegroundWindow, GA_ROOT, GUITHREADINFO, MSG, PM_REMOVE,
     PW_RENDERFULLCONTENT, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
     SM_YVIRTUALSCREEN, WHEEL_DELTA, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS,
+};
+use windows::Win32::UI::WindowsAndMessaging::{
+    GetWindowLongW, IsWindow, IsZoomed, PostMessageW, ShowWindow, GWL_STYLE, SHOW_WINDOW_CMD,
+    SW_MAXIMIZE, SW_MINIMIZE, SW_RESTORE, WM_CLOSE, WS_MAXIMIZEBOX, WS_MINIMIZEBOX,
 };
 
 /// Initialise COM on the calling thread.
@@ -780,6 +792,15 @@ impl Backend for WindowsUiaBackend {
         })?;
         let full = print_window(handle, &window)?;
         Ok(crop(&full, &window, &region))
+    }
+
+    fn window_action(
+        &self,
+        window_id: &str,
+        node: &Node,
+        action: &str,
+    ) -> Result<serde_json::Value> {
+        self.act_on_window(window_id, node, action)
     }
 
     fn recognize_text(&self, pixels: &Pixels, language: Option<&str>) -> Result<Recognition> {
@@ -1629,6 +1650,11 @@ fn describe_element(
         actions.push("set_value".to_string());
         actions.push("type_text".to_string());
     }
+    // The captured window's own node stands for the window. Its actions follow
+    // what the window allows and the state it is in now.
+    if depth == 0 && parent_id.is_none() {
+        actions.extend(window_actions(element));
+    }
     if bounds.is_some() && states.offscreen != Some(true) {
         actions.push("pointer_click".to_string());
         // Anything clickable can also take the richer pointer gestures (right
@@ -2006,6 +2032,197 @@ fn recognize(pixels: &Pixels, language: Option<&str>) -> Result<Recognition> {
         language,
         lines,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Window actions
+// ---------------------------------------------------------------------------
+
+/// What a top-level window can do and where it stands, from UIA's
+/// WindowPattern where the window has one and its Win32 styles otherwise.
+struct WindowAbilities {
+    can_minimize: bool,
+    can_maximize: bool,
+    state: WindowVisualState,
+}
+
+fn window_abilities(element: &IUIAutomationElement, handle: HWND) -> WindowAbilities {
+    let pattern =
+        unsafe { element.GetCurrentPatternAs::<IUIAutomationWindowPattern>(UIA_WindowPatternId) }
+            .ok();
+    let style = unsafe { GetWindowLongW(handle, GWL_STYLE) } as u32;
+    let state = if unsafe { IsIconic(handle) }.as_bool() {
+        WindowVisualState_Minimized
+    } else if unsafe { IsZoomed(handle) }.as_bool() {
+        WindowVisualState_Maximized
+    } else {
+        WindowVisualState_Normal
+    };
+    let pattern_says = |read: &dyn Fn(&IUIAutomationWindowPattern) -> Option<bool>| {
+        pattern.as_ref().and_then(read)
+    };
+    WindowAbilities {
+        can_minimize: pattern_says(&|p| {
+            unsafe { p.CurrentCanMinimize() }.ok().map(|v| v.as_bool())
+        })
+        .unwrap_or(style & WS_MINIMIZEBOX.0 != 0),
+        can_maximize: pattern_says(&|p| {
+            unsafe { p.CurrentCanMaximize() }.ok().map(|v| v.as_bool())
+        })
+        .unwrap_or(style & WS_MAXIMIZEBOX.0 != 0),
+        state,
+    }
+}
+
+/// The window actions a captured window's root node offers.
+fn window_actions(element: &IUIAutomationElement) -> Vec<String> {
+    let Ok(handle) = (unsafe { element.CurrentNativeWindowHandle() }) else {
+        return Vec::new();
+    };
+    if handle.0.is_null() || unsafe { GetAncestor(handle, GA_ROOT) } != handle {
+        return Vec::new();
+    }
+    let abilities = window_abilities(element, handle);
+    let mut actions = vec!["activate".to_string(), "close_window".to_string()];
+    if abilities.can_minimize && abilities.state != WindowVisualState_Minimized {
+        actions.push("minimize".into());
+    }
+    if abilities.can_maximize && abilities.state != WindowVisualState_Maximized {
+        actions.push("maximize".into());
+    }
+    if abilities.state != WindowVisualState_Normal {
+        actions.push("restore".into());
+    }
+    actions
+}
+
+fn window_state_name(handle: HWND) -> &'static str {
+    unsafe {
+        if !IsWindow(handle).as_bool() {
+            "closed"
+        } else if IsIconic(handle).as_bool() {
+            "minimized"
+        } else if IsZoomed(handle).as_bool() {
+            "maximized"
+        } else {
+            "normal"
+        }
+    }
+}
+
+/// How long a window action may take to show in the window's state.
+const WINDOW_SETTLE: Duration = Duration::from_millis(1_500);
+
+impl WindowsUiaBackend {
+    fn act_on_window(
+        &self,
+        window_id: &str,
+        node: &Node,
+        action: &str,
+    ) -> Result<serde_json::Value> {
+        let handle = parse_window_id(window_id)?;
+        let element = self.require(window_id, node)?;
+        let live = unsafe { element.CurrentNativeWindowHandle() }.unwrap_or_default();
+        if live != handle {
+            return Err(DriverError::stale(
+                "the observed node no longer stands for its window",
+            ));
+        }
+        let pattern = unsafe {
+            element.GetCurrentPatternAs::<IUIAutomationWindowPattern>(UIA_WindowPatternId)
+        }
+        .ok();
+        let failed = |what: &str, error: windows::core::Error| {
+            DriverError::new("DRIVER.ACTION_FAILED", format!("{what} failed: {error}"))
+                .with_effect("unknown")
+        };
+        // UIA's WindowPattern first, as the window's own accessibility
+        // contract; Win32 on the anchored HWND for windows without one.
+        let visual = |state: WindowVisualState, command: SHOW_WINDOW_CMD| -> Result<()> {
+            match &pattern {
+                Some(pattern) => unsafe { pattern.SetWindowVisualState(state) }
+                    .map_err(|error| failed("changing the window state", error)),
+                None => {
+                    unsafe {
+                        let _ = ShowWindow(handle, command);
+                    }
+                    Ok(())
+                }
+            }
+        };
+        let reached: Box<dyn Fn() -> bool> = match action {
+            "minimize" => {
+                visual(WindowVisualState_Minimized, SW_MINIMIZE)?;
+                Box::new(|| unsafe { IsIconic(handle) }.as_bool())
+            }
+            "maximize" => {
+                visual(WindowVisualState_Maximized, SW_MAXIMIZE)?;
+                Box::new(|| unsafe { IsZoomed(handle) }.as_bool())
+            }
+            "restore" => {
+                visual(WindowVisualState_Normal, SW_RESTORE)?;
+                Box::new(|| unsafe { !IsIconic(handle).as_bool() && !IsZoomed(handle).as_bool() })
+            }
+            "close_window" => {
+                match &pattern {
+                    Some(pattern) => unsafe { pattern.Close() }
+                        .map_err(|error| failed("closing the window", error))?,
+                    None => unsafe { PostMessageW(handle, WM_CLOSE, WPARAM(0), LPARAM(0)) }
+                        .map_err(|error| failed("closing the window", error))?,
+                }
+                // A window may legitimately stay: "save changes?" is the
+                // application's answer, not a failure of the request.
+                let deadline = Instant::now() + WINDOW_SETTLE;
+                while unsafe { IsWindow(handle) }.as_bool() && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+                let closed = !unsafe { IsWindow(handle) }.as_bool();
+                return Ok(serde_json::json!({
+                    "state": window_state_name(handle),
+                    "closed": closed,
+                    "note": if closed { serde_json::Value::Null } else {
+                        serde_json::json!("the window is still open; it may be asking to save or confirm -- observe it")
+                    },
+                }));
+            }
+            "activate" => {
+                if unsafe { IsIconic(handle) }.as_bool() {
+                    visual(WindowVisualState_Normal, SW_RESTORE)?;
+                }
+                if !bring_to_front(handle) {
+                    return Err(DriverError::new(
+                        "DRIVER.ACTIVATION_REFUSED",
+                        "Windows did not let this process bring the window to the foreground",
+                    )
+                    // Restoring from minimized may have happened.
+                    .with_effect("unknown")
+                    .with_detail("state", serde_json::json!(window_state_name(handle))));
+                }
+                Box::new(|| unsafe { GetForegroundWindow() } == handle)
+            }
+            other => {
+                return Err(DriverError::invalid(format!(
+                    "unknown window action {other:?}"
+                )))
+            }
+        };
+        let deadline = Instant::now() + WINDOW_SETTLE;
+        while !reached() {
+            if Instant::now() >= deadline {
+                return Err(DriverError::new(
+                    "DRIVER.ACTION_FAILED",
+                    format!("the window did not reach the requested state after {action}"),
+                )
+                .with_effect("unknown")
+                .with_detail("state", serde_json::json!(window_state_name(handle))));
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        Ok(serde_json::json!({
+            "state": window_state_name(handle),
+            "foreground": unsafe { GetForegroundWindow() } == handle,
+        }))
+    }
 }
 
 // ---------------------------------------------------------------------------

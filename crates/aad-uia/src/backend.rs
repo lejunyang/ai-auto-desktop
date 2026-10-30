@@ -322,6 +322,20 @@ pub trait Backend: Send + Sync {
         ))
     }
 
+    /// Minimize, maximize, restore, close or activate the observed window,
+    /// `node` being its own (root) node. Answers the window's state after.
+    fn window_action(
+        &self,
+        _window_id: &str,
+        _node: &Node,
+        _action: &str,
+    ) -> Result<serde_json::Value> {
+        Err(DriverError::new(
+            "DRIVER.ACTION_UNSUPPORTED",
+            "window actions are not implemented on this platform yet",
+        ))
+    }
+
     /// Recognise the text an image shows, with the platform's own OCR.
     /// `language` is a BCP-47 tag; `None` takes the user's languages.
     fn recognize_text(&self, _pixels: &Pixels, _language: Option<&str>) -> Result<Recognition> {

@@ -47,6 +47,11 @@ impl NativeBackend {
             "key" => "key_chord",
             "scroll" | "hover" => "pointer_gesture",
             "drag" => "drag",
+            "minimize" => "minimize",
+            "maximize" => "maximize",
+            "restore" => "restore",
+            "close_window" => "close_window",
+            "activate" => "activate",
             _ => "",
         }
     }

@@ -128,6 +128,18 @@ fn action_schema() -> Value {
         variant("back", "Go back one page in the observed browser page's history.", json!({}), &[]),
         variant("forward", "Go forward one page in the observed browser page's history.", json!({}), &[]),
         variant("reload", "Reload the observed browser page.", json!({}), &[]),
+        variant("minimize", "Minimize the observed desktop window. Offered on the \
+    window's own node (its root) when the window can be minimized and is not already.", json!({}), &[]),
+        variant("maximize", "Maximize the observed desktop window. Offered on its root \
+    node when the window can be maximized and is not already.", json!({}), &[]),
+        variant("restore", "Return the observed desktop window to its normal size from \
+    minimized or maximized. Offered on its root node when it is one of those.", json!({}), &[]),
+        variant("close_window", "Ask the observed desktop window to close, as its close \
+    button would. The application may refuse or ask to save first; the answer says whether \
+    the window closed. Offered on its root node.", json!({}), &[]),
+        variant("activate", "Bring the observed desktop window to the foreground, restoring \
+    it first if minimized. Refused with DRIVER.ACTIVATION_REFUSED when Windows will not let \
+    this process take the foreground. Offered on its root node.", json!({}), &[]),
     ]})
 }
 
@@ -433,6 +445,11 @@ or take the node_id from an outline."
         "DRIVER.PROTECTED_ELEMENT" => {
             "Password and other protected fields are never captured or read. Capture an \
 element around it, or ask the person you are helping."
+        }
+        "DRIVER.ACTIVATION_REFUSED" => {
+            "Windows' foreground lock kept this window from coming forward. Actions that do \
+not need the foreground (invoke, fill) still work; otherwise ask the person to click the \
+window once, then observe again."
         }
         "DRIVER.OCR_UNAVAILABLE" => {
             "No Windows OCR language pack for that language is installed; \

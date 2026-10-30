@@ -38,6 +38,11 @@ pub const WRITE_ACTIONS: &[&str] = &[
     "key_chord",
     "pointer_gesture",
     "drag",
+    "minimize",
+    "maximize",
+    "restore",
+    "close_window",
+    "activate",
 ];
 
 const MAX_TYPE_TEXT_CHARS: usize = 1024;
@@ -108,7 +113,8 @@ impl UiaDriver {
             "capture" => self.capture_element(&args),
             "read_text" => self.read_text(&args),
             "focus" | "invoke" | "set_value" | "type_text" | "pointer_click" | "key_chord"
-            | "pointer_gesture" | "drag" => self.act(action, &args),
+            | "pointer_gesture" | "drag" | "minimize" | "maximize" | "restore" | "close_window"
+            | "activate" => self.act(action, &args),
             "watch" => self.watch(&args),
             "collect" => self.collect(&args),
             "release" => self.release(&args),
@@ -669,6 +675,24 @@ impl UiaDriver {
                 let gesture = parse_drag_gesture(args)?;
                 self.backend.drag(&window_id, &node, &to_node, &gesture)?
             }
+            "minimize" | "maximize" | "restore" | "close_window" | "activate" => {
+                // Only the window's own node stands for the window: a node
+                // inside it cannot be minimized or closed on its behalf.
+                if node.parent_id.is_some() {
+                    return Err(DriverError::new(
+                        "DRIVER.ACTION_UNSUPPORTED",
+                        "window actions apply to the observed window's own node",
+                    ));
+                }
+                let state = self.backend.window_action(&window_id, &node, action)?;
+                return Ok(json!({
+                    "applied": true,
+                    "action": action,
+                    "node_id": node.node_id,
+                    "window_id": window_id,
+                    "window": state,
+                }));
+            }
             other => return Err(DriverError::invalid(format!("unknown action {other:?}"))),
         }
 
@@ -1190,6 +1214,26 @@ fn action_contracts() -> Map<String, Value> {
             "Click the centre of an element.",
             "input",
             "medium",
+            "non_idempotent",
+        ),
+    );
+    for (name, summary) in [
+        ("minimize", "Minimize the observed window."),
+        ("maximize", "Maximize the observed window."),
+        (
+            "restore",
+            "Restore the observed window from minimized or maximized.",
+        ),
+        ("activate", "Bring the observed window to the foreground."),
+    ] {
+        actions.insert(name.into(), write(summary, "navigate", "low", "idempotent"));
+    }
+    actions.insert(
+        "close_window".into(),
+        write(
+            "Ask the observed window to close, as its close button would.",
+            "modify",
+            "high",
             "non_idempotent",
         ),
     );
