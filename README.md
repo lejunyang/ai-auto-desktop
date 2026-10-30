@@ -292,7 +292,7 @@ aad mcp --allow-input    # 由启动它的人授予输入
 
 在 stdio 上说 JSON-RPC 2.0，protocolVersion `2024-11-05`。工具分两类：
 
-**看与做**：`control_capabilities`、`control_targets`、`control_observe`、`control_find`、`control_act`、
+**看与做**：`control_capabilities`、`control_targets`、`control_observe`、`control_find`、`control_wait`、`control_act`、
 `control_capture`、`control_cancel`、`control_close`，另有不需要桌面的 `probe_environment`。
 
 - `control_targets` 列出窗口、应用和浏览器页面；`control_observe` 默认返回有上限的 outline（可操作或有名字的元素，
@@ -301,9 +301,13 @@ aad mcp --allow-input    # 由启动它的人授予输入
 - `control_find` 只返回唯一一个节点；匹配多个时报错并列出候选。定位器支持 role、name、node_id，
   Windows 上还支持 automation_id、class_name、value、states、`match: contains`、`within`、`near`、`nth`；
   其他平台遇到这些字段会明确拒绝，不会忽略。`expect: optional` 用来问"这个东西没了吗"。
+- `control_wait` 反复观察一个目标，直到定位到的元素出现（`appears`）、消失（`disappears`）或达到给定 `states`（`state`），
+  或 `timeout_ms` 用完（`CONTROL.WAIT_TIMEOUT`）；出现时直接返回可以 act 的 target。所有 provider 都有，多个匹配不算找到。
 - `control_act` 的动作：focus、invoke、click（可选 button、count、元素内 fraction）、fill、type_text（unicode/keys）、
   key、scroll、hover、drag（终点必须是同一次观察里的另一个节点）、select（列表框选项）、check（复选框、开关、单选），
-  以及浏览器页面的 navigate（只限 http/https）、back、forward、reload。位置只能是元素内 0..1 的比例。
+  以及浏览器页面的 navigate（只限 http/https）、back、forward、reload，标签页的 open_tab、activate_page、close_page，
+  JavaScript 对话框的 accept（prompt 可带 text）、dismiss，文件框的 upload（只能读启动时 `--allow-upload-dir` 给出的目录）。
+  页面打开的弹窗在 `control_targets` 里带 `metadata.opener_page_id`。位置只能是元素内 0..1 的比例。
   以观察结果里每个节点的 `capabilities` 为准。浏览器里普通 click 是 DOM 激活；带位置、按键或双击时改发可信的指针事件，
   落点被别的元素盖住时拒绝（`CONTROL.OCCLUDED`），不会点到盖在上面的东西。
 - `control_capture` 给一个观察到的元素截 PNG（目前限浏览器页面，密码框拒绝），同时返回 `digest`：
@@ -316,6 +320,7 @@ aad mcp --allow-input    # 由启动它的人授予输入
 `browser_record_start` / `browser_record_stop` 记录一个页面：页面上的动作和引起的变化、网络请求与响应正文
 （默认保留原值，`redact_network` 才抹掉敏感字段）、WebSocket 消息和关键时刻的截图，停止时给出写入的目录和文件。
 `browser_open` 带 `record` 时在打开网址之前就开始记录。这些是过程数据，据此写技能、筛接口由 Agent 自己做。
+`browser_downloads`（只读）列出浏览器下载到本会话专用目录的文件：网址、建议文件名、状态、字节数和保存路径。
 
 一个例子：打开浏览器到登录页 → `control_capture` 二维码发给人扫 → 隔几秒比对 digest，变了就重发 →
 登录后在页面上操作 → `browser_record_stop` → 读 `evidence/network.jsonl` 找到返回订单数据的接口。
