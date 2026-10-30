@@ -15,20 +15,7 @@ pub const PROVIDER: &str = "browser.cdp";
 
 /// CDP `Input` and page navigation address the page, not a frame, so they are
 /// offered only where the observed frame is the main one.
-const MAIN_FRAME_ONLY: [&str; 12] = [
-    "key",
-    "drag",
-    "type_text",
-    "scroll",
-    "hover",
-    "navigate",
-    "back",
-    "forward",
-    "reload",
-    "open_tab",
-    "activate_page",
-    "close_page",
-];
+const MAIN_FRAME_ONLY: [&str; 7] = PAGE_ACTIONS;
 
 /// How long a newly attached page may take to answer before it counts as blocked.
 const RESPONSIVE: Duration = Duration::from_secs(2);
@@ -172,6 +159,10 @@ impl Downloads {
 }
 const DIALOG_CLOSED: &str = "Page.javascriptDialogClosed";
 const DRAG_INTERCEPTED: &str = "Input.dragIntercepted";
+const ATTACHED: &str = "Target.attachedToTarget";
+const DETACHED: &str = "Target.detachedFromTarget";
+/// Out-of-process frames followed per page.
+const MAX_CHILD_FRAMES: usize = 64;
 
 struct Page {
     client: Client,
@@ -182,9 +173,32 @@ struct Page {
     main_frame: Option<String>,
     /// The drag data of an HTML5 drag the browser intercepted, while one is in flight.
     drag: Option<Value>,
+    /// Out-of-process frames attached to this connection: CDP session id to frame id.
+    children: BTreeMap<String, String>,
+    /// Children not yet asked to attach their own out-of-process frames.
+    fresh: Vec<String>,
 }
 
+static AUTO_ATTACH: std::sync::LazyLock<Value> = std::sync::LazyLock::new(
+    || json!({"autoAttach": true, "waitForDebuggerOnStart": false, "flatten": true}),
+);
+
 impl Page {
+    /// Let newly attached out-of-process frames attach their own. Best effort:
+    /// a frame that went away meanwhile is dropped by its detach event.
+    fn adopt(&mut self) {
+        for session in std::mem::take(&mut self.fresh) {
+            if self.children.contains_key(&session) {
+                let _ = self.client.session_command(
+                    Some(&session),
+                    "Target.setAutoAttach",
+                    AUTO_ATTACH.clone(),
+                );
+            }
+        }
+        self.sync_dialog();
+    }
+
     /// Apply the dialog events received since the last look.
     fn sync_dialog(&mut self) {
         for event in self.client.drain_events().events {
@@ -206,6 +220,23 @@ impl Page {
                 }
                 Some(DIALOG_CLOSED) => self.dialog = None,
                 Some(DRAG_INTERCEPTED) => self.drag = Some(event["params"]["data"].clone()),
+                Some(ATTACHED) if event["params"]["targetInfo"]["type"] == "iframe" => {
+                    let params = &event["params"];
+                    if let (Some(session), Some(frame)) = (
+                        params["sessionId"].as_str(),
+                        params["targetInfo"]["targetId"].as_str(),
+                    ) {
+                        if self.children.len() < MAX_CHILD_FRAMES {
+                            self.children.insert(session.into(), frame.into());
+                            self.fresh.push(session.into());
+                        }
+                    }
+                }
+                Some(DETACHED) => {
+                    if let Some(session) = event["params"]["sessionId"].as_str() {
+                        self.children.remove(session);
+                    }
+                }
                 _ => {}
             }
         }
@@ -265,7 +296,7 @@ pub struct BrowserBackend {
     browser: Mutex<Option<Client>>,
     downloads: Mutex<Downloads>,
     world: String,
-    last_context: Mutex<Option<(String, i64)>>,
+    last_context: Mutex<Option<(String, Ctx)>>,
     closed: AtomicBool,
 }
 
@@ -364,7 +395,13 @@ impl BrowserBackend {
             }
             let mut client = Client::attach_bare_until(target, deadline).map_err(cdp_error)?;
             client.filter_events(
-                &[DIALOG_OPENING, DIALOG_CLOSED, DRAG_INTERCEPTED],
+                &[
+                    DIALOG_OPENING,
+                    DIALOG_CLOSED,
+                    DRAG_INTERCEPTED,
+                    ATTACHED,
+                    DETACHED,
+                ],
                 &[DIALOG_OPENING],
             );
             // Dialog events need the Page domain. Enabling it waits for the
@@ -388,6 +425,9 @@ impl BrowserBackend {
             }
             client.set_deadline(deadline);
             command(&mut client, "Runtime.enable", json!({}))?;
+            // Cross-origin frames run in their own renderer: follow them as
+            // flattened child sessions on this connection.
+            command(&mut client, "Target.setAutoAttach", AUTO_ATTACH.clone())?;
             pages.insert(
                 target.id.clone(),
                 Page {
@@ -396,12 +436,15 @@ impl BrowserBackend {
                     dialog: None,
                     main_frame: None,
                     drag: None,
+                    children: BTreeMap::new(),
+                    fresh: Vec::new(),
                 },
             );
         }
         let page = pages.get_mut(&target.id).unwrap();
         page.client.set_deadline(deadline);
         page.sync_dialog();
+        page.adopt();
         Ok(page)
     }
 
@@ -550,7 +593,7 @@ impl BrowserBackend {
                 page.client.set_deadline(deadline);
                 let _ = eval(
                     &mut page.client,
-                    context,
+                    &context,
                     "delete globalThis.__aadControlV1".into(),
                 );
             }
@@ -570,11 +613,12 @@ fn cdp_error(e: aad_cdp::CdpError) -> AutomationError {
 fn command(client: &mut Client, method: &str, params: Value) -> Result<Value> {
     client.command(method, params).map_err(cdp_error)
 }
-fn eval(client: &mut Client, context: i64, expression: String) -> Result<Value> {
-    let raw = command(
+fn eval(client: &mut Client, context: &Ctx, expression: String) -> Result<Value> {
+    let raw = run(
         client,
+        context.session.as_deref(),
         "Runtime.evaluate",
-        json!({"expression":expression,"contextId":context,"returnByValue":true,"awaitPromise":false}),
+        json!({"expression":expression,"contextId":context.id,"returnByValue":true,"awaitPromise":false}),
     )?;
     if raw.get("exceptionDetails").is_some() {
         return Err(error(
@@ -602,11 +646,266 @@ fn frames(tree: &Value) -> Vec<Value> {
     }
     result
 }
-fn current_frame(client: &mut Client, frame_id: &str) -> Result<Value> {
-    frames(&command(client, "Page.getFrameTree", json!({}))?["frameTree"])
+/// The frame as the session running it reports it now.
+fn current_frame(client: &mut Client, session: Option<&str>, frame_id: &str) -> Result<Value> {
+    frames(&run(client, session, "Page.getFrameTree", json!({}))?["frameTree"])
         .into_iter()
         .find(|frame| frame["id"] == frame_id)
         .ok_or_else(|| error("CONTROL.STALE_TARGET", "browser frame was detached"))
+}
+
+/// A command on the page's own session (`None`) or an out-of-process frame's.
+fn run(client: &mut Client, session: Option<&str>, method: &str, params: Value) -> Result<Value> {
+    client
+        .session_command(session, method, params)
+        .map_err(cdp_error)
+}
+
+/// An isolated world: the CDP session whose renderer runs the frame, and the
+/// world's execution context there.
+#[derive(Clone, Debug)]
+struct Ctx {
+    session: Option<String>,
+    id: i64,
+}
+
+/// Where a frame lives: the CDP session that runs it (`None`: the page's
+/// own renderer), its frame record, its parent, and whether it is the root of
+/// that session -- an out-of-process frame, or the main frame.
+#[derive(Clone, Debug)]
+struct FrameEntry {
+    session: Option<String>,
+    frame: Value,
+    parent: Option<String>,
+    root: bool,
+}
+
+impl FrameEntry {
+    fn main(&self) -> bool {
+        self.session.is_none() && self.parent.is_none()
+    }
+}
+
+fn tree_entries(tree: &Value, session: Option<&str>, out: &mut Vec<(String, FrameEntry)>) {
+    let mut pending = vec![(tree, None::<String>, true)];
+    while let Some((tree, parent, root)) = pending.pop() {
+        let Some(id) = tree["frame"]["id"].as_str().map(str::to_string) else {
+            continue;
+        };
+        if out.len() >= 4096 {
+            break;
+        }
+        let parent = parent.or_else(|| tree["frame"]["parentId"].as_str().map(str::to_string));
+        for child in tree["childFrames"].as_array().into_iter().flatten().rev() {
+            pending.push((child, Some(id.clone()), false));
+        }
+        out.push((
+            id,
+            FrameEntry {
+                session: session.map(str::to_string),
+                frame: tree["frame"].clone(),
+                parent,
+                root,
+            },
+        ));
+    }
+}
+
+/// Every frame of a page, in tree order, each with the session that runs it.
+/// A frame an out-of-process session runs is taken from that session, keeping
+/// the parent the page's own tree knows it by.
+fn frame_map(page: &mut Page) -> Result<Vec<(String, FrameEntry)>> {
+    let mut all = Vec::new();
+    let tree = run(&mut page.client, None, "Page.getFrameTree", json!({}))?;
+    tree_entries(&tree["frameTree"], None, &mut all);
+    let sessions: Vec<String> = page.children.keys().cloned().collect();
+    for session in sessions {
+        // A frame that is going away answers with an error; its detach event follows.
+        let Ok(tree) = run(
+            &mut page.client,
+            Some(&session),
+            "Page.getFrameTree",
+            json!({}),
+        ) else {
+            continue;
+        };
+        let mut own = Vec::new();
+        tree_entries(&tree["frameTree"], Some(&session), &mut own);
+        merge_frames(&mut all, own);
+    }
+    Ok(all)
+}
+
+/// Fold an out-of-process session's frames into the page's: the session
+/// runs them, so its records win, keeping the parent the page knew.
+fn merge_frames(all: &mut Vec<(String, FrameEntry)>, own: Vec<(String, FrameEntry)>) {
+    for (id, mut entry) in own {
+        match all.iter_mut().find(|(known, _)| *known == id) {
+            Some((_, existing)) => {
+                if entry.parent.is_none() {
+                    entry.parent = existing.parent.take();
+                }
+                *existing = entry;
+            }
+            None => all.push((id, entry)),
+        }
+    }
+}
+
+fn locate(page: &mut Page, frame_id: &str) -> Result<FrameEntry> {
+    frame_map(page)?
+        .into_iter()
+        .find(|(id, _)| id == frame_id)
+        .map(|(_, entry)| entry)
+        .ok_or_else(|| error("CONTROL.STALE_TARGET", "browser frame was detached"))
+}
+
+/// What a browser-level hit test must find at one step out of a frame.
+#[derive(Clone, Debug)]
+enum Expect {
+    /// A node of this frame: no same-process frame or element covers it.
+    Frame(String),
+    /// The element that hosts the out-of-process frame below, or that frame:
+    /// hit-testing in the parent renderer reports the remote frame's node.
+    Owner(i64, String),
+}
+
+/// One step from a frame towards the main frame: the frame owner element in
+/// the session that holds it, and what hit-testing there must find.
+#[derive(Clone, Debug)]
+struct Level {
+    session: Option<String>,
+    owner: i64,
+    expect: Expect,
+}
+
+/// How a point in a frame's viewport reaches the page. Trusted input goes to
+/// the page's own session in its main-frame coordinates; the browser routes
+/// it into same-process and out-of-process frames alike.
+#[derive(Clone, Debug, Default)]
+struct Route {
+    levels: Vec<Level>,
+}
+
+impl Route {
+    /// The owner elements between `frame_id` and the main frame, scrolled
+    /// into view from the outermost in.
+    fn to(page: &mut Page, frame_id: &str) -> Result<Self> {
+        let map = frame_map(page)?;
+        let entry = |id: &str| {
+            map.iter()
+                .find(|(known, _)| known == id)
+                .map(|(_, entry)| entry.clone())
+                .ok_or_else(|| error("CONTROL.STALE_TARGET", "browser frame was detached"))
+        };
+        let owner = |client: &mut Client, session: Option<&str>, frame: &str| -> Result<i64> {
+            run(
+                client,
+                session,
+                "DOM.getFrameOwner",
+                json!({"frameId": frame}),
+            )?["backendNodeId"]
+                .as_i64()
+                .ok_or_else(|| error("BROWSER.BAD_RESULT", "frame owner has no node"))
+        };
+        let mut levels = Vec::new();
+        let mut current = entry(frame_id)?;
+        if !current.root {
+            let session = current.session.clone();
+            levels.push(Level {
+                owner: owner(&mut page.client, session.as_deref(), frame_id)?,
+                session,
+                expect: Expect::Frame(frame_id.to_string()),
+            });
+        }
+        while let Some(session) = current.session.clone() {
+            if levels.len() >= 16 {
+                return Err(error(
+                    "CONTROL.ACTION_UNSUPPORTED",
+                    "the frame is nested too deeply for trusted input",
+                ));
+            }
+            let root = page
+                .children
+                .get(&session)
+                .cloned()
+                .ok_or_else(|| error("CONTROL.STALE_TARGET", "browser frame was detached"))?;
+            let parent = entry(&root)?
+                .parent
+                .ok_or_else(|| error("BROWSER.BAD_RESULT", "out-of-process frame has no parent"))?;
+            current = entry(&parent)?;
+            let id = owner(&mut page.client, current.session.as_deref(), &root)?;
+            levels.push(Level {
+                session: current.session.clone(),
+                owner: id,
+                expect: Expect::Owner(id, root.clone()),
+            });
+        }
+        for level in levels.iter().rev() {
+            run(
+                &mut page.client,
+                level.session.as_deref(),
+                "DOM.scrollIntoViewIfNeeded",
+                json!({"backendNodeId": level.owner}),
+            )?;
+        }
+        Ok(Self { levels })
+    }
+
+    /// The frame point in main-frame coordinates, after hit-testing every step
+    /// out: an element or frame laid over the way in makes it `CONTROL.OCCLUDED`.
+    fn page_point(&self, client: &mut Client, point: (f64, f64)) -> Result<(f64, f64)> {
+        let (mut x, mut y) = point;
+        for level in &self.levels {
+            let model = run(
+                client,
+                level.session.as_deref(),
+                "DOM.getBoxModel",
+                json!({"backendNodeId": level.owner}),
+            )?;
+            let content = &model["model"]["content"];
+            let (Some(left), Some(top)) = (content[0].as_f64(), content[1].as_f64()) else {
+                return Err(error("CONTROL.OCCLUDED", "the frame is not laid out"));
+            };
+            x += left;
+            y += top;
+            // Box models are in viewport coordinates; hit-testing takes document
+            // coordinates, so the scroll offset of that renderer's root is added.
+            let metrics = run(
+                client,
+                level.session.as_deref(),
+                "Page.getLayoutMetrics",
+                json!({}),
+            )?;
+            let scrolled = &metrics["cssLayoutViewport"];
+            let (sx, sy) = (
+                scrolled["pageX"].as_f64().unwrap_or_default(),
+                scrolled["pageY"].as_f64().unwrap_or_default(),
+            );
+            let hit = run(
+                client,
+                level.session.as_deref(),
+                "DOM.getNodeForLocation",
+                json!({"x": (x + sx).round() as i64, "y": (y + sy).round() as i64,
+                    "includeUserAgentShadowDOM": false, "ignorePointerEventsNone": false}),
+            )
+            .map_err(|_| error("CONTROL.OCCLUDED", "nothing of the frame is at that point"))?;
+            let found = match &level.expect {
+                Expect::Frame(frame) => hit["frameId"] == frame.as_str(),
+                Expect::Owner(owner, frame) => {
+                    hit["backendNodeId"].as_i64() == Some(*owner)
+                        || hit["frameId"] == frame.as_str()
+                }
+            };
+            if !found {
+                return Err(error(
+                    "CONTROL.OCCLUDED",
+                    "something in an enclosing frame covers the element",
+                ));
+            }
+        }
+        Ok((x, y))
+    }
 }
 
 impl Backend for BrowserBackend {
@@ -709,22 +1008,41 @@ impl Backend for BrowserBackend {
                 });
                 continue;
             }
-            let tree = command(&mut page.client, "Page.getFrameTree", json!({}))?;
-            let root = tree["frameTree"]["frame"]["id"]
-                .as_str()
+            let map = frame_map(page)?;
+            let root = map
+                .iter()
+                .find(|(_, entry)| entry.main())
+                .map(|(id, _)| id.clone())
                 .ok_or_else(|| error("BROWSER.BAD_RESULT", "missing main frame"))?;
-            page.main_frame = Some(root.to_string());
-            for frame in frames(&tree["frameTree"]).into_iter().take(64) {
-                let selector = json!({"page_id":target.id,"frame_id":frame["id"]});
-                let main = frame["id"] == root;
+            page.main_frame = Some(root.clone());
+            for (id, entry) in map.into_iter().take(64) {
+                let selector = json!({"page_id": target.id, "frame_id": id});
+                let main = id == root;
                 let mut capabilities = self.capabilities();
-                // CDP Input targets the page's focused frame. Until cross-process
-                // frame routing is implemented, input and navigation are main-frame only.
+                // Navigation and tabs address the page, not a frame.
                 if !main {
                     capabilities.retain(|s| !MAIN_FRAME_ONLY.contains(&s.as_str()));
                 }
-                resources.push(BackendResource {resource:Resource {resource_id:resource_id(PROVIDER,&selector),provider:PROVIDER.into(),kind:"browser".into(),
-                    name:target.title.clone(),capabilities,metadata:json!({"page_id":target.id,"frame_id":frame["id"],"url":frame["url"],"main_frame":main,"opener_page_id":openers.get(&target.id),"click_semantics":"dom_activation; trusted cdp input with button, count or fraction","fill_semantics":"dom_value_and_events","key_semantics":"cdp_input_focused_element_main_frame","type_text_semantics":"cdp_insert_text_or_us_key_events","pointer_semantics":"cdp_input_main_frame"})},selector});
+                resources.push(BackendResource {
+                    resource: Resource {
+                        resource_id: resource_id(PROVIDER, &selector),
+                        provider: PROVIDER.into(),
+                        kind: "browser".into(),
+                        name: target.title.clone(),
+                        capabilities,
+                        metadata: json!({"page_id": target.id, "frame_id": id,
+                            "url": entry.frame["url"], "main_frame": main,
+                            "parent_frame_id": entry.parent,
+                            "out_of_process": entry.session.is_some(),
+                            "opener_page_id": openers.get(&target.id),
+                            "click_semantics": "dom_activation; trusted cdp input with button, count or fraction",
+                            "fill_semantics": "dom_value_and_events",
+                            "key_semantics": "cdp_input_to_the_focused_element",
+                            "type_text_semantics": "cdp_insert_text_or_us_key_events",
+                            "pointer_semantics": "cdp_input_in_page_coordinates_hit_tested_through_frames"}),
+                    },
+                    selector,
+                });
             }
         }
         if self.closed.load(Ordering::SeqCst) {
@@ -745,19 +1063,22 @@ impl Backend for BrowserBackend {
                 let main=page.main_frame.as_deref().is_none_or(|main|main==frame_id);
                 return Ok(dialog_snapshot(page_id,frame_id,main,dialog));
             }
+            let entry=locate(page,frame_id)?;
+            let frame=entry.frame.clone();
+            let session=entry.session.clone();
             let client=&mut page.client;
-            let frame=current_frame(client,frame_id)?;
-            let context=command(client,"Page.createIsolatedWorld",json!({"frameId":frame_id,"worldName":self.world,"grantUniveralAccess":false}))?["executionContextId"].as_i64()
+            let context=run(client,session.as_deref(),"Page.createIsolatedWorld",json!({"frameId":frame_id,"worldName":self.world,"grantUniveralAccess":false}))?["executionContextId"].as_i64()
                 .ok_or_else(||error("BROWSER.BAD_RESULT","frame did not provide an isolated context"))?;
+            let context=Ctx{session:session.clone(),id:context};
             let nonce=serde_json::to_string(&uuid::Uuid::new_v4().to_string()).unwrap();
-            eval(client,context,include_str!("browser.js").replace("NONCE",&nonce))?;
+            eval(client,&context,include_str!("browser.js").replace("NONCE",&nonce))?;
             let observation=uuid::Uuid::new_v4().to_string();
-            *self.last_context.lock().unwrap()=Some((page_id.into(),context));
-            let mut result=eval(client,context,format!("globalThis.__aadControlV1.observe({}, {})",serde_json::to_string(&observation).unwrap(),max_nodes))?;
-            let main=frame.get("parentId").is_none();
+            *self.last_context.lock().unwrap()=Some((page_id.into(),context.clone()));
+            let mut result=eval(client,&context,format!("globalThis.__aadControlV1.observe({}, {})",serde_json::to_string(&observation).unwrap(),max_nodes))?;
+            let main=entry.main();
             if !main {if let Some(nodes)=result["nodes"].as_array_mut(){for node in nodes {if let Some(actions)=node["actions"].as_array_mut(){actions.retain(|v|!MAIN_FRAME_ONLY.iter().any(|name|v==name));}}}}
             result["snapshot_id"]=json!(observation);
-            result["metadata"]=json!({"page_id":page_id,"frame_id":frame_id,"loader_id":frame["loaderId"],"context_id":context,"main_frame":main});
+            result["metadata"]=json!({"page_id":page_id,"frame_id":frame_id,"loader_id":frame["loaderId"],"context_id":context.id,"main_frame":main,"parent_frame_id":entry.parent,"out_of_process":session.is_some()});
             Ok(result)
         })
     }
@@ -785,12 +1106,6 @@ impl Backend for BrowserBackend {
             Action::Scroll { .. } | Action::Hover { .. } | Action::Drag { .. } => true,
             _ => false,
         };
-        if trusted && meta["main_frame"] != true {
-            return Err(error(
-                "CONTROL.ACTION_UNSUPPORTED",
-                "trusted pointer input is supported only for the main frame",
-            ));
-        }
         if self.downloads.lock().unwrap().launched {
             // A click may start a download: make sure it lands in the session directory.
             let _ = self.with_browser(Instant::now() + action_context.remaining()?, |_| Ok(()));
@@ -802,16 +1117,19 @@ impl Backend for BrowserBackend {
         let frame_id = meta["frame_id"].as_str().unwrap();
         let result = self.with_page_state(page_id,action_context.remaining()?,|state|{
             if let Some(dialog)=&state.dialog {return Err(dialog_open(dialog));}
+            let entry=locate(state,frame_id)?;
+            if entry.frame["loaderId"]!=meta["loader_id"] {return Err(error("CONTROL.STALE_TARGET","browser document navigated"));}
+            let context=Ctx{session:entry.session.clone(),id:meta["context_id"].as_i64().unwrap_or_default()};
+            // Trusted pointer input is addressed to the page; the owner
+            // elements of enclosing frames are brought into view first.
+            let route=if trusted {Route::to(state,frame_id)?} else {Route::default()};
             if let Action::Drag {to,fraction,to_fraction,button}=action {
                 let observed=|node_id:&str,fraction:&Option<crate::Fraction>,action:Value|{let mut args=json!({"document_token":snapshot["document_token"],"observation":snapshot["snapshot_id"],"node_id":node_id,"action":action});if let Some(f)=fraction{args["fraction"]=json!({"fx":f.fx,"fy":f.fy});}args};
-                if current_frame(&mut state.client,frame_id)?["loaderId"]!=meta["loader_id"] {return Err(error("CONTROL.STALE_TARGET","browser document navigated"));}
                 let from=observed(node["node_id"].as_str().unwrap_or_default(),fraction,json!("drag"));
                 let onto=observed(&to.node_id,to_fraction,Value::Null);
-                return drag(state,meta["context_id"].as_i64().unwrap(),&from,&onto,*button,action_context);
+                return drag(state,&context,&route,&from,&onto,*button,action_context);
             }
             let client=&mut state.client;
-            if current_frame(client,frame_id)?["loaderId"]!=meta["loader_id"] {return Err(error("CONTROL.STALE_TARGET","browser document navigated"));}
-            let context=meta["context_id"].as_i64().unwrap();
             let mut args=json!({"document_token":snapshot["document_token"],"observation":snapshot["snapshot_id"],"node_id":node["node_id"],"action":action.name()});
             match action {
                 Action::Fill {value}=>args["value"]=json!(value),
@@ -821,28 +1139,27 @@ impl Backend for BrowserBackend {
                 _=>{}
             }
             if trusted {
-                return pointer(client,context,&args,action,action_context);
+                return pointer(client,&context,&route,&args,action,action_context);
             }
             if let Action::Upload {files}=action {
-                return upload(client,context,&args,node,files,action_context);
+                return upload(client,&context,&args,node,files,action_context);
             }
             if TAB_ACTIONS.contains(&action.name()) {
                 // Anchored like navigation: the observed document must still be there.
-                checked(eval(client,context,format!("globalThis.__aadControlV1.confirm({args})"))?)?;
+                checked(eval(client,&context,format!("globalThis.__aadControlV1.confirm({args})"))?)?;
                 action_context.commit()?;
                 return self.tab(page_id,action,Instant::now()+action_context.remaining()?);
             }
             if PAGE_ACTIONS.contains(&action.name()) {
-                return page(client,context,&args,action,action_context);
+                return page(client,&context,&args,action,action_context);
             }
             if matches!(action,Action::Key {..}|Action::TypeText {..}) {
-                if meta["main_frame"]!=true {return Err(error("CONTROL.ACTION_UNSUPPORTED","keyboard input is supported only for the main frame"));}
-                keyboard(client,context,&args,frame_id,&meta["loader_id"],action,action_context)
+                keyboard(client,&context,&args,frame_id,&meta["loader_id"],action,action_context)
             } else {
                 // Verification and DOM activation/fill happen in one JS turn in
                 // the observed isolated world, preventing a navigation redirect.
                 action_context.commit()?;
-                let result=eval(client,context,format!("globalThis.__aadControlV1.act({args})")).map_err(|e|e.with_effect("unknown"))?;
+                let result=eval(client,&context,format!("globalThis.__aadControlV1.act({args})")).map_err(|e|e.with_effect("unknown"))?;
                 checked(result)
             }
         });
@@ -931,14 +1248,17 @@ impl BrowserBackend {
         let page_id = meta["page_id"].as_str().unwrap_or_default();
         let frame_id = meta["frame_id"].as_str().unwrap_or_default();
         self.with_page(page_id, timeout, |client| {
-            if current_frame(client, frame_id)?["loaderId"] != meta["loader_id"] {
+            if current_frame(client, None, frame_id)?["loaderId"] != meta["loader_id"] {
                 return Err(error("CONTROL.STALE_TARGET", "browser document navigated"));
             }
-            let context = meta["context_id"].as_i64().unwrap_or_default();
+            let context = Ctx {
+                session: None,
+                id: meta["context_id"].as_i64().unwrap_or_default(),
+            };
             let args = json!({"document_token": snapshot["document_token"], "observation": snapshot["snapshot_id"], "node_id": node["node_id"]});
             let rect = checked(eval(
                 client,
-                context,
+                &context,
                 format!("globalThis.__aadControlV1.rect({args})"),
             )?)?;
             let number = |key: &str| rect[key].as_f64().unwrap_or_default();
@@ -973,21 +1293,16 @@ fn mouse(client: &mut Client, params: Value) -> Result<Value> {
 /// Trusted pointer input at a point the page confirmed lands on the node.
 fn pointer(
     client: &mut Client,
-    context: i64,
+    context: &Ctx,
+    route: &Route,
     args: &Value,
     action: &Action,
     action_context: &crate::Context,
 ) -> Result<Value> {
-    let point = checked(eval(
-        client,
-        context,
-        format!("globalThis.__aadControlV1.point({args})"),
-    )?)?;
-    let (Some(x), Some(y)) = (point["x"].as_f64(), point["y"].as_f64()) else {
-        return Err(error("BROWSER.BAD_RESULT", "page did not report a point"));
-    };
+    let point = landing(client, context, args)?;
+    let (x, y) = route.page_point(client, point)?;
     action_context.commit()?;
-    mouse(client, json!({"type": "mouseMoved", "x": x, "y": y}))?;
+    arrive(client, context, route, args, (x, y), action_context)?;
     match action {
         Action::Click { button, count, .. } => {
             let (name, mask) = match button {
@@ -1033,7 +1348,7 @@ fn pointer(
 }
 
 /// Where the page confirmed pointer input lands on an observed node.
-fn landing(client: &mut Client, context: i64, args: &Value) -> Result<(f64, f64)> {
+fn landing(client: &mut Client, context: &Ctx, args: &Value) -> Result<(f64, f64)> {
     let point = checked(eval(
         client,
         context,
@@ -1042,6 +1357,50 @@ fn landing(client: &mut Client, context: i64, args: &Value) -> Result<(f64, f64)
     match (point["x"].as_f64(), point["y"].as_f64()) {
         (Some(x), Some(y)) => Ok((x, y)),
         _ => Err(error("BROWSER.BAD_RESULT", "page did not report a point")),
+    }
+}
+
+/// How long the browser may take to route the pointer into a frame.
+const ROUTING: Duration = Duration::from_millis(1500);
+
+/// Move the pointer onto the point. Inside a frame, the browser routes input
+/// by compositor hit-test data that lags behind scrolling, so the move is
+/// repeated until the frame itself reports the element under the pointer
+/// (`:hover`); only then may a button go down.
+fn arrive(
+    client: &mut Client,
+    context: &Ctx,
+    route: &Route,
+    args: &Value,
+    (x, y): (f64, f64),
+    action_context: &crate::Context,
+) -> Result<()> {
+    mouse(client, json!({"type": "mouseMoved", "x": x, "y": y}))?;
+    if route.levels.is_empty() {
+        return Ok(());
+    }
+    let until = Instant::now() + ROUTING.min(action_context.remaining()?);
+    loop {
+        let hovered = eval(
+            client,
+            context,
+            format!("globalThis.__aadControlV1.hovered({args})"),
+        )
+        .map_err(|e| e.with_effect("contextual"))?;
+        if hovered["ok"] == true {
+            return Ok(());
+        }
+        if Instant::now() >= until {
+            return Err(error(
+                "CONTROL.OCCLUDED",
+                "the browser did not route the pointer into the frame's element",
+            )
+            .with_effect("contextual"));
+        }
+        std::thread::sleep(Duration::from_millis(25));
+        // A move to the same point is not delivered again; nudge and return.
+        mouse(client, json!({"type": "mouseMoved", "x": x + 0.5, "y": y}))?;
+        mouse(client, json!({"type": "mouseMoved", "x": x, "y": y}))?;
     }
 }
 
@@ -1054,9 +1413,11 @@ const DRAG_SETTLE: Duration = Duration::from_millis(150);
 /// tested while both are in view. An HTML5 drag (draggable, dragstart/drop)
 /// is intercepted by the browser and finished with drag events at the
 /// destination, since headless Chrome has no OS drag loop to run it.
+#[allow(clippy::too_many_arguments)]
 fn drag(
     page: &mut Page,
-    context: i64,
+    context: &Ctx,
+    route: &Route,
     from: &Value,
     onto: &Value,
     button: Option<Button>,
@@ -1072,7 +1433,7 @@ fn drag(
         args["noscroll"] = json!(true);
         args
     };
-    let start = landing(client, context, &still(from)).map_err(|e| {
+    let both = |e: AutomationError| {
         if e.code == "CONTROL.OCCLUDED" {
             error(
                 "CONTROL.OCCLUDED",
@@ -1081,8 +1442,11 @@ fn drag(
         } else {
             e
         }
-    })?;
+    };
+    let start = landing(client, context, &still(from)).map_err(both)?;
+    let start = route.page_point(client, start)?;
     let end = landing(client, context, &still(onto))?;
+    let end = route.page_point(client, end)?;
     let (name, mask) = match button {
         None | Some(Button::Left) => ("left", 1),
         Some(Button::Right) => ("right", 2),
@@ -1099,9 +1463,13 @@ fn drag(
     )
     .map_err(|e| e.with_effect("unknown"))?;
     let mut result = || -> Result<Value> {
-        mouse(
+        arrive(
             &mut page.client,
-            json!({"type": "mouseMoved", "x": start.0, "y": start.1}),
+            context,
+            route,
+            from,
+            start,
+            action_context,
         )?;
         mouse(
             &mut page.client,
@@ -1167,7 +1535,7 @@ fn drag(
 /// paths under the server's upload grant; the page never names a path.
 fn upload(
     client: &mut Client,
-    context: i64,
+    context: &Ctx,
     args: &Value,
     node: &Value,
     files: &[String],
@@ -1184,11 +1552,13 @@ fn upload(
         context,
         format!("globalThis.__aadControlV1.confirm({args})"),
     )?)?;
-    let element = command(
+    let session = context.session.as_deref();
+    let element = run(
         client,
+        session,
         "Runtime.evaluate",
         json!({"expression": format!("globalThis.__aadControlV1.element({args})"),
-               "contextId": context, "returnByValue": false}),
+               "contextId": context.id, "returnByValue": false}),
     )?;
     let object = element["result"]["objectId"]
         .as_str()
@@ -1196,13 +1566,19 @@ fn upload(
         .ok_or_else(|| error("CONTROL.STALE_TARGET", "the file input was replaced"))?
         .to_string();
     action_context.commit()?;
-    let result = command(
+    let result = run(
         client,
+        session,
         "DOM.setFileInputFiles",
         json!({"files": files, "objectId": object}),
     )
     .map_err(|e| e.with_effect("unknown"));
-    let _ = command(client, "Runtime.releaseObject", json!({"objectId": object}));
+    let _ = run(
+        client,
+        session,
+        "Runtime.releaseObject",
+        json!({"objectId": object}),
+    );
     result?;
     Ok(
         json!({"submitted": true, "native_operation": "DOM.setFileInputFiles", "files": files.len()}),
@@ -1212,7 +1588,7 @@ fn upload(
 /// Navigation of the observed page, after confirming the document is the one observed.
 fn page(
     client: &mut Client,
-    context: i64,
+    context: &Ctx,
     args: &Value,
     action: &Action,
     action_context: &crate::Context,
@@ -1578,7 +1954,7 @@ fn keystrokes(text: &str, mode: Option<crate::TypeMode>) -> Result<Keystrokes> {
 /// send a chord or type text, re-confirming focus between characters.
 fn keyboard(
     client: &mut Client,
-    context: i64,
+    context: &Ctx,
     args: &Value,
     frame_id: &str,
     loader: &Value,
@@ -1607,7 +1983,8 @@ fn keyboard(
         )
         .map_err(|e| e.with_effect(effect))?;
         if verify["ok"] != true
-            || current_frame(client, frame_id).map_err(|e| e.with_effect(effect))?["loaderId"]
+            || current_frame(client, context.session.as_deref(), frame_id)
+                .map_err(|e| e.with_effect(effect))?["loaderId"]
                 != *loader
         {
             return Err(error(
@@ -1779,6 +2156,38 @@ mod tests {
         }
         assert!(chord(&["Enter", "Tab"]).is_err());
         assert!(chord(&["ctrl"]).is_err());
+    }
+
+    #[test]
+    fn frames_of_child_sessions_join_the_page_tree_with_their_parents() {
+        let tree = json!({"frame": {"id": "main", "loaderId": "l"}, "childFrames": [
+            {"frame": {"id": "a", "parentId": "main"}, "childFrames": [{"frame": {"id": "a1", "parentId": "a"}}]},
+            {"frame": {"id": "b", "parentId": "main"}},
+        ]});
+        let mut all = Vec::new();
+        tree_entries(&tree, None, &mut all);
+        let ids: Vec<_> = all.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(ids, ["main", "a", "a1", "b"]);
+        assert!(all[0].1.main() && all[0].1.root);
+        assert_eq!(all[2].1.parent.as_deref(), Some("a"));
+        assert!(!all[1].1.root);
+        // An out-of-process frame's own tree names no parent for its root;
+        // the page's record of it does. Its child is new to the page.
+        let child = json!({"frame": {"id": "b", "url": "http://other.test/"}, "childFrames": [
+            {"frame": {"id": "b1", "parentId": "b"}}]});
+        let mut own = Vec::new();
+        tree_entries(&child, Some("S1"), &mut own);
+        merge_frames(&mut all, own);
+        let b = &all.iter().find(|(id, _)| id == "b").unwrap().1;
+        assert_eq!(b.session.as_deref(), Some("S1"));
+        assert_eq!(b.parent.as_deref(), Some("main"));
+        assert!(b.root && !b.main());
+        let b1 = &all.iter().find(|(id, _)| id == "b1").unwrap().1;
+        assert_eq!(
+            (b1.session.as_deref(), b1.parent.as_deref(), b1.root),
+            (Some("S1"), Some("b"), false)
+        );
+        assert_eq!(all.len(), 5);
     }
 
     #[test]

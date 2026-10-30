@@ -55,8 +55,10 @@ r.getElementById('go').addEventListener('click',e=>{document.getElementById('sta
 customElements.define('x-card',class extends HTMLElement{constructor(){super();this.attachShadow({mode:'open'}).innerHTML='<div><b>Card title</b><slot name=action></slot></div>';}});
 customElements.define('x-closed',class extends HTMLElement{constructor(){super();this.attachShadow({mode:'closed'}).innerHTML='<button>Hidden inside</button>';}});
 </script>
-<iframe src="/frame"></iframe>
+<iframe src="/frame"></iframe><iframe src="XFRAME_URL"></iframe>
 </body></html>"#;
+/// A host name the fixture browser maps to loopback: a different site from 127.0.0.1.
+const CROSS_SITE: &str = "cross-site.test";
 
 struct Fixture {
     child: Child,
@@ -75,6 +77,14 @@ impl Fixture {
         std::fs::create_dir(&root).unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}/", listener.local_addr().unwrap());
+        // Another site on the same server, so its frame runs out of process.
+        let page = PAGE.replace(
+            "XFRAME_URL",
+            &format!(
+                "http://{CROSS_SITE}:{}/xframe",
+                listener.local_addr().unwrap().port()
+            ),
+        );
         listener.set_nonblocking(true).unwrap();
         let stop = Arc::new(AtomicBool::new(false));
         let stopped = stop.clone();
@@ -93,11 +103,13 @@ impl Fixture {
                             headers = "Content-Type: application/octet-stream\r\nContent-Disposition: attachment; filename=\"report.txt\"";
                             "downloaded body"
                         } else if request.starts_with("GET /frame") {
-                            "<!doctype html><input aria-label='FrameInput'><div style='height:900px'></div>"
+                            "<!doctype html><input aria-label='FrameInput' onkeydown=\"document.getElementById('fs').value='key:'+event.key+':'+event.isTrusted\"><button aria-label='FrameButton' onmousedown=\"document.getElementById('fs').value='down:'+event.isTrusted\">Press</button><output id='fs' aria-label='FrameStatus'>ready</output><div style='height:900px'></div>"
+                        } else if request.starts_with("GET /xframe") {
+                            "<!doctype html><body style='margin:0'><input aria-label='CrossInput' onkeydown=\"document.getElementById('cs').value='key:'+event.key+':'+event.isTrusted\"><button aria-label='CrossButton' onmousedown=\"document.getElementById('cs').value='down:'+event.button+':'+event.isTrusted\">Press</button><output id='cs' aria-label='CrossStatus'>ready</output><div style='height:900px'></div></body>"
                         } else if request.starts_with("GET /second") {
                             "<!doctype html><title>Second</title><body><p aria-label='Second marker'>second</p></body>"
                         } else {
-                            PAGE
+                            &page
                         };
                         let response=format!("HTTP/1.1 200 OK\r\n{headers}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len());
                         let _ = stream.write_all(response.as_bytes());
@@ -117,7 +129,9 @@ impl Fixture {
                 "--remote-debugging-port=0",
                 "--no-first-run",
                 "--no-default-browser-check",
+                "--site-per-process",
             ])
+            .arg(format!("--host-resolver-rules=MAP {CROSS_SITE} 127.0.0.1"))
             .arg(format!("--user-data-dir={}", root.display()))
             .arg(&url)
             .stdin(Stdio::null())
@@ -603,6 +617,135 @@ fn controls_inside_open_shadow_roots_are_observed_and_operated() {
         .unwrap();
     let stale = act(&session, go, Action::click());
     assert_eq!(stale.error.unwrap()["code"], "CONTROL.STALE_TARGET");
+}
+
+/// The resource of the frame whose metadata satisfies `wanted`, once listed.
+fn frame_of(session: &Session, wanted: impl Fn(&Value) -> bool) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(found) = targets(session)
+            .into_iter()
+            .find(|r| r["metadata"]["main_frame"] == false && wanted(&r["metadata"]))
+        {
+            return found;
+        }
+        assert!(Instant::now() < deadline, "the frame was not listed");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+fn trusted_click() -> Action {
+    Action::Click {
+        button: None,
+        count: None,
+        fraction: Some(Fraction { fx: 0.5, fy: 0.5 }),
+    }
+}
+
+#[test]
+#[ignore = "requires isolated Chromium with its sandbox enabled; CI runs it explicitly"]
+fn frames_in_and_out_of_process_take_trusted_pointer_and_keyboard_input() {
+    let _serial = serial();
+    let fixture = Fixture::new();
+    let (session, _) = session_for(&fixture);
+    let main = main_of(&session, &fixture.page_id);
+    let main_frame = targets(&session)
+        .into_iter()
+        .find(|r| r["resource_id"] == main.as_str())
+        .unwrap()["metadata"]["frame_id"]
+        .clone();
+    // The cross-site frame runs in its own renderer and is listed with its parent.
+    let cross = frame_of(&session, |m| m["out_of_process"] == true);
+    assert_eq!(cross["metadata"]["parent_frame_id"], main_frame);
+    assert!(cross["metadata"]["url"]
+        .as_str()
+        .unwrap()
+        .contains(CROSS_SITE));
+    let cross = cross["resource_id"].as_str().unwrap().to_string();
+    let local = frame_of(&session, |m| m["out_of_process"] == false);
+    let local = local["resource_id"].as_str().unwrap().to_string();
+    let loaded = wait_until(&session, &cross, "CrossButton", WaitCondition::Appears);
+    assert!(loaded.error.is_none(), "{loaded:?}");
+
+    // Out of process: pointer, keyboard and typing reach the frame's elements.
+    let clicked = act_on(&session, &cross, "button", "CrossButton", trusted_click());
+    assert!(clicked.error.is_none(), "{clicked:?}");
+    assert_eq!(
+        value(&observe(&session, &cross), "CrossStatus"),
+        "down:0:true"
+    );
+    let right = act_on(
+        &session,
+        &cross,
+        "button",
+        "CrossButton",
+        Action::Click {
+            button: Some(Button::Right),
+            count: None,
+            fraction: None,
+        },
+    );
+    assert!(right.error.is_none(), "{right:?}");
+    assert_eq!(
+        value(&observe(&session, &cross), "CrossStatus"),
+        "down:2:true"
+    );
+    let typed = act_on(
+        &session,
+        &cross,
+        "textbox",
+        "CrossInput",
+        type_text("hi", Some(TypeMode::Keys)),
+    );
+    assert!(typed.error.is_none(), "{typed:?}");
+    let observed = observe(&session, &cross);
+    assert_eq!(value(&observed, "CrossInput"), "hi");
+    assert_eq!(value(&observed, "CrossStatus"), "key:i:true");
+    let pressed = act_on(&session, &cross, "textbox", "CrossInput", keys(&["Enter"]));
+    assert!(pressed.error.is_none(), "{pressed:?}");
+    assert_eq!(
+        value(&observe(&session, &cross), "CrossStatus"),
+        "key:Enter:true"
+    );
+
+    // In process: the frame's offset in the page is applied.
+    let clicked = act_on(&session, &local, "button", "FrameButton", trusted_click());
+    assert!(clicked.error.is_none(), "{clicked:?}");
+    assert_eq!(
+        value(&observe(&session, &local), "FrameStatus"),
+        "down:true"
+    );
+    let typed = act_on(
+        &session,
+        &local,
+        "textbox",
+        "FrameInput",
+        type_text("ok", None),
+    );
+    assert!(typed.error.is_none(), "{typed:?}");
+    assert_eq!(value(&observe(&session, &local), "FrameInput"), "ok");
+
+    // Something the page lays over a frame is hit, not the frame's element.
+    fixture
+        .client()
+        .eval(
+            "const veil=document.createElement('div'); veil.style='position:fixed;inset:0;z-index:9'; \
+             document.body.appendChild(veil); true",
+        )
+        .unwrap();
+    for frame in [&cross, &local] {
+        let name = if frame == &cross {
+            "CrossButton"
+        } else {
+            "FrameButton"
+        };
+        let covered = act_on(&session, frame, "button", name, trusted_click());
+        assert_eq!(
+            covered.commit_state,
+            CommitState::NotCommitted,
+            "{covered:?}"
+        );
+        assert_eq!(covered.error.unwrap()["code"], "CONTROL.OCCLUDED");
+    }
 }
 
 #[test]
@@ -1364,7 +1507,12 @@ fn browser_actions_are_observed_document_bound_and_have_real_page_effects() {
     assert_eq!(stale.error.unwrap()["code"], "CONTROL.STALE_TARGET");
     let observed = observe(&session, frame);
     for name in [
-        "key", "scroll", "hover", "navigate", "back", "forward", "reload",
+        "navigate",
+        "back",
+        "forward",
+        "reload",
+        "open_tab",
+        "close_page",
     ] {
         assert!(
             observed["nodes"]
@@ -1374,6 +1522,9 @@ fn browser_actions_are_observed_document_bound_and_have_real_page_effects() {
                 .all(|n| !n["actions"].as_array().unwrap().iter().any(|a| a == name)),
             "{name} must not be offered inside a frame"
         );
+    }
+    for name in ["key", "type_text", "fill"] {
+        assert!(actions(&observed, "FrameInput").contains(&name.to_string()));
     }
     let frame_target = find(&session, &observed, "textbox", "FrameInput");
     let mut forged = frame_target.clone();

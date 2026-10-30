@@ -67,8 +67,8 @@ fn action_schema() -> Value {
         variant("click", "Click the element. A plain left click unless a button, a double \
     click or a position is given; those need a provider that offers gestures. In a browser a \
     plain click is DOM activation (isTrusted false, works in frames); giving a position, a \
-    button or a count sends trusted pointer input instead, main frame only, and is refused if \
-    something else covers the element.", json!({
+    button or a count sends trusted pointer input instead, also inside frames (cross-origin \
+    ones included), and is refused if something else covers the element or its frame.", json!({
             "button": button_schema(),
             "count": {"type": "integer", "enum": [1, 2], "description": "1 for a single click, 2 for a double click."},
             "fraction": fraction_schema("Where inside the element to click")
@@ -101,7 +101,7 @@ fn action_schema() -> Value {
             "keys": {"type": "array", "items": {"type": "string", "maxLength": 32}, "minItems": 1, "maxItems": 6}
         }), &["keys"]),
         variant("scroll", "Scroll the wheel over the element. In a browser, offered on the \
-    page body and on scrollable containers of the main frame.", json!({
+    page body and on scrollable containers, in any frame.", json!({
             "direction": {"enum": ["up", "down", "left", "right"]},
             "notches": {"type": "integer", "minimum": 1, "maximum": 30, "description": "Wheel detents. Defaults to 3."},
             "fraction": fraction_schema("Where inside the element to scroll")

@@ -123,6 +123,11 @@
       const found=check(args); if(found.error) return found;
       return {ok:activeElement()===found.el && document.hasFocus()};
     },
+    // Whether the pointer is over the observed element, as this frame sees it.
+    hovered: args => {
+      const found=check(args); if(found.error) return found;
+      return {ok:found.el.matches(':hover')};
+    },
     confirm: args => {
       const found=check(args); if(found.error) return found;
       return {ok:true};
