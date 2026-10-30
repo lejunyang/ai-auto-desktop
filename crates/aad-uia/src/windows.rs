@@ -101,6 +101,11 @@ use windows::Win32::UI::Accessibility::{
     UIA_EVENT_ID,
     UIA_PROPERTY_ID,
 };
+use windows::Win32::UI::HiDpi::{
+    GetAwarenessFromDpiAwarenessContext, GetThreadDpiAwarenessContext,
+    SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+    DPI_AWARENESS_PER_MONITOR_AWARE, DPI_AWARENESS_SYSTEM_AWARE, DPI_AWARENESS_UNAWARE,
+};
 use windows::Win32::UI::Input::Ime::ImmGetDefaultIMEWnd;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, GetKeyboardLayout, MapVirtualKeyW, SendInput, VkKeyScanExW, INPUT, INPUT_KEYBOARD,
@@ -144,7 +149,40 @@ fn ensure_com() {
     });
 }
 
+/// Make this process per-monitor (v2) DPI aware, once.
+///
+/// Every coordinate this backend handles -- UIA bounding rectangles, window
+/// rectangles, the virtual-screen extent SendInput normalises against, and the
+/// pixels a capture reads -- must be in one space. A DPI-unaware process gets
+/// each of those virtualised to 96 DPI by a different rule: on a scaled display
+/// a point is quantised (one logical pixel covers several physical ones), and
+/// with monitors of different scales the virtualised rectangles of a window on
+/// a secondary monitor no longer line up with the virtualised screen. Physical
+/// pixels everywhere are the only space in which bounds, input and pixels agree.
+///
+/// The process-wide call fails harmlessly when awareness was already fixed (an
+/// application manifest, or a host that set it first); [`dpi_awareness`] reports
+/// what is actually in force.
+fn ensure_dpi_awareness() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| unsafe {
+        let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    });
+}
+
+/// The DPI awareness this thread runs under, by name.
+fn dpi_awareness() -> &'static str {
+    let awareness = unsafe { GetAwarenessFromDpiAwarenessContext(GetThreadDpiAwarenessContext()) };
+    match awareness {
+        DPI_AWARENESS_PER_MONITOR_AWARE => "per_monitor",
+        DPI_AWARENESS_SYSTEM_AWARE => "system",
+        DPI_AWARENESS_UNAWARE => "unaware",
+        _ => "unknown",
+    }
+}
+
 fn automation() -> Result<IUIAutomation> {
+    ensure_dpi_awareness();
     ensure_com();
     unsafe { CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER) }
         .map_err(|error| DriverError::unavailable(format!("UI Automation is unavailable: {error}")))
@@ -587,37 +625,13 @@ impl Backend for WindowsUiaBackend {
             let _ = SetForegroundWindow(handle);
         }
 
-        let (origin_x, origin_y, width, height) = unsafe {
-            (
-                GetSystemMetrics(SM_XVIRTUALSCREEN),
-                GetSystemMetrics(SM_YVIRTUALSCREEN),
-                GetSystemMetrics(SM_CXVIRTUALSCREEN),
-                GetSystemMetrics(SM_CYVIRTUALSCREEN),
-            )
-        };
-        if width <= 0 || height <= 0 {
-            return Err(DriverError::unavailable("the virtual screen has no extent"));
-        }
-        let absolute_x = ((x - origin_x) as f64 * 65_535.0 / width as f64).round() as i32;
-        let absolute_y = ((y - origin_y) as f64 * 65_535.0 / height as f64).round() as i32;
-
-        let mouse = |flags| INPUT {
-            r#type: INPUT_MOUSE,
-            Anonymous: windows::Win32::UI::Input::KeyboardAndMouse::INPUT_0 {
-                mi: MOUSEINPUT {
-                    dx: absolute_x,
-                    dy: absolute_y,
-                    mouseData: 0,
-                    dwFlags: flags,
-                    time: 0,
-                    dwExtraInfo: 0,
-                },
-            },
-        };
+        // The same normalisation every other gesture uses. This path used to
+        // scale by the full width, which lands one pixel up/left of the point.
+        let absolute = to_absolute((x, y))?;
         let inputs = [
-            mouse(MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK),
-            mouse(MOUSEEVENTF_LEFTDOWN | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK),
-            mouse(MOUSEEVENTF_LEFTUP | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK),
+            mouse_event(absolute, MOUSEEVENTF_MOVE),
+            mouse_event(absolute, MOUSEEVENTF_LEFTDOWN),
+            mouse_event(absolute, MOUSEEVENTF_LEFTUP),
         ];
         // A click is a move, a press and a release: only their order matters, so
         // if the atomic batch is refused, sending them individually is a
@@ -708,7 +722,11 @@ impl Backend for WindowsUiaBackend {
     }
 
     fn describe(&self) -> serde_json::Value {
-        serde_json::json!({"backend": "windows-uia", "platform": "windows"})
+        serde_json::json!({
+            "backend": "windows-uia",
+            "platform": "windows",
+            "dpi_awareness": dpi_awareness(),
+        })
     }
 }
 
@@ -1136,13 +1154,21 @@ fn to_absolute(point: (i32, i32)) -> Result<(i32, i32)> {
             "the virtual screen has no usable extent",
         ));
     }
-    let max_x = width - 1;
-    let max_y = height - 1;
-    let x = (point.0 - origin_x).clamp(0, max_x);
-    let y = (point.1 - origin_y).clamp(0, max_y);
-    let ax = (x as f64 * 65_535.0 / max_x as f64).round() as i32;
-    let ay = (y as f64 * 65_535.0 / max_y as f64).round() as i32;
-    Ok((ax, ay))
+    Ok((
+        normalise(point.0, origin_x, width),
+        normalise(point.1, origin_y, height),
+    ))
+}
+
+/// One axis of a virtual-screen pixel as a 0..=65535 absolute coordinate.
+///
+/// Windows maps an absolute coordinate back with `pixel = origin + dx * extent
+/// / 65536` (rounded down), so the coordinate chosen is the middle of the band
+/// that maps back onto the pixel: exact for every pixel, at any extent, and
+/// for an origin left of or above the primary monitor (negative offsets).
+fn normalise(pixel: i32, origin: i32, extent: i32) -> i32 {
+    let offset = i64::from((pixel - origin).clamp(0, extent - 1));
+    ((offset * 65_536 + 32_768) / i64::from(extent)).min(65_535) as i32
 }
 
 /// One mouse INPUT at an absolute point with the given flags.
@@ -2048,6 +2074,50 @@ mod tests {
             element_point(Some(bounds), Some((1.0, 1.0))).unwrap(),
             (109, 219)
         );
+    }
+
+    /// How Windows turns an absolute coordinate back into a virtual-screen pixel.
+    fn denormalise(absolute: i32, origin: i32, extent: i32) -> i32 {
+        origin + ((i64::from(absolute) * i64::from(extent)) >> 16) as i32
+    }
+
+    #[test]
+    fn every_pixel_round_trips_through_absolute_coordinates() {
+        // Primary-only, a secondary monitor left of the primary (negative
+        // origin), one above it, and an odd 3-monitor span.
+        for (origin, extent) in [
+            (0, 1536),
+            (0, 2560),
+            (-1920, 4480),
+            (-1200, 3360),
+            (0, 5761),
+        ] {
+            for pixel in origin..origin + extent {
+                let absolute = normalise(pixel, origin, extent);
+                assert!((0..=65_535).contains(&absolute));
+                assert_eq!(
+                    denormalise(absolute, origin, extent),
+                    pixel,
+                    "origin {origin} extent {extent}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_point_off_the_virtual_screen_is_clamped_to_its_edge() {
+        assert_eq!(
+            denormalise(normalise(-5000, -1920, 4480), -1920, 4480),
+            -1920
+        );
+        assert_eq!(denormalise(normalise(9000, -1920, 4480), -1920, 4480), 2559);
+    }
+
+    #[test]
+    fn the_backend_runs_per_monitor_dpi_aware() {
+        // Bounds, input and captured pixels only agree in physical pixels.
+        let _backend = WindowsUiaBackend::new().expect("UIA is available");
+        assert_eq!(dpi_awareness(), "per_monitor");
     }
 
     #[test]
