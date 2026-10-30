@@ -1292,8 +1292,17 @@ mod tests {
             .contains("workflow_run_status"));
 
         // The client goes away: the run stops at a boundary and lets go.
+        // shutdown waits only briefly; on a loaded machine the runner may reach
+        // its next step boundary after that, and pauses there all the same.
         runs.shutdown();
-        let status = call(&runs, "workflow_run_status", json!({"run_id": run_id})).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let status = loop {
+            let status = call(&runs, "workflow_run_status", json!({"run_id": run_id})).unwrap();
+            if status["status"] == json!("paused") || std::time::Instant::now() > deadline {
+                break status;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        };
         assert_eq!(status["status"], json!("paused"), "{status}");
         assert_eq!(status["attached"], json!(false));
         assert_eq!(status["owner"], Value::Null, "pausing releases the lease");

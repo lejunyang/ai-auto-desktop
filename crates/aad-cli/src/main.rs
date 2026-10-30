@@ -2635,8 +2635,8 @@ mod tests {
     fn a_pause_request_records_intent_without_claiming_it_took_effect() {
         let temp = TempDir::new("pause");
         // A pending run: created but not executed, so intent is observable.
-        let store = aad_runtime::durable::JournalStore::open(temp.store().path())
-            .expect("the store opens");
+        let store =
+            aad_runtime::durable::JournalStore::open(temp.store().path()).expect("the store opens");
         let descriptor = durable_descriptor(&temp.workflow()).expect("compiles");
         store
             .create_run(
@@ -2676,8 +2676,8 @@ mod tests {
     #[test]
     fn a_cancel_request_is_sticky_and_cannot_be_downgraded_to_a_pause() {
         let temp = TempDir::new("sticky");
-        let store = aad_runtime::durable::JournalStore::open(temp.store().path())
-            .expect("the store opens");
+        let store =
+            aad_runtime::durable::JournalStore::open(temp.store().path()).expect("the store opens");
         let descriptor = durable_descriptor(&temp.workflow()).expect("compiles");
         store
             .create_run(
@@ -2736,8 +2736,8 @@ mod tests {
     #[test]
     fn a_cancel_requested_before_execution_stops_the_run_without_running_it() {
         let temp = TempDir::new("cancelfirst");
-        let store = aad_runtime::durable::JournalStore::open(temp.store().path())
-            .expect("the store opens");
+        let store =
+            aad_runtime::durable::JournalStore::open(temp.store().path()).expect("the store opens");
         let descriptor = durable_descriptor(&temp.workflow()).expect("compiles");
         store
             .create_run(
@@ -2783,8 +2783,8 @@ mod tests {
         // must actually finish the run. An operator has no way to clear the
         // recorded pause themselves, so resume has to do it.
         let temp = TempDir::new("pauseresume");
-        let store = aad_runtime::durable::JournalStore::open(temp.store().path())
-            .expect("the store opens");
+        let store =
+            aad_runtime::durable::JournalStore::open(temp.store().path()).expect("the store opens");
         let descriptor = durable_descriptor(&temp.workflow()).expect("compiles");
         store
             .create_run(
@@ -2807,8 +2807,8 @@ mod tests {
 
         // The runner honours the pause before dispatching anything, which is
         // what leaves a resumable checkpoint behind.
-        let store = aad_runtime::durable::JournalStore::open(temp.store().path())
-            .expect("the store opens");
+        let store =
+            aad_runtime::durable::JournalStore::open(temp.store().path()).expect("the store opens");
         let paused = aad_runtime::durable_exec::DurableExecutor::new(store)
             .execute(
                 &descriptor,
