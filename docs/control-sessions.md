@@ -1,7 +1,7 @@
 # 统一控制与远程会话
 
 `aad-control/1` 为 computer-use 与 browser-use 提供同一组操作：
-`capabilities → targets → observe → find → act`，另有 `cancel` 和 `close`。
+`capabilities → targets → observe → find → act`，另有 `wait`、`cancel` 和 `close`。
 它不依赖模型厂商的控制 API。平台适配器继续执行自己的实时元素校验；不支持的动作明确拒绝。
 
 ## 支持的动作与入口
@@ -46,6 +46,13 @@ driver 求值，其他 provider 返回 `CONTROL.LOCATOR_UNSUPPORTED`，不会悄
 `CONTROL.AMBIGUOUS`（Windows 为 `DRIVER.AMBIGUOUS_MATCH`）并在 `details.candidates` 列出候选；
 `expect: optional` 时找不到返回 `found: false` 而不是错误，多个匹配仍然报错。
 
+`wait` 由会话用 observe 与 find 反复实现，不依赖 provider，所以桌面与浏览器都有：给 `resource_id`、`locator` 和
+`condition`（`appears` 恰好一个匹配；`disappears` 没有匹配；`state` 恰好一个匹配且其 `states` 等于给出的
+`states` 对象），每隔 `interval_ms`（50..5000，默认 250）观察一次，直到满足或 `timeout_ms` 用完
+（`CONTROL.WAIT_TIMEOUT`，`details` 带 `polls` 与最后一次是否存在）。多个匹配永远不算找到：一直歧义到超时返回
+`CONTROL.AMBIGUOUS`。满足时返回最后一次的 `observation_id`，`appears`/`state` 还带该节点的 `target`，这次观察仍是当前观察，
+可以直接 act。等待期间占用会话串行锁（单请求上限 30 秒），`cancel` 可以中止，结果为 `not_committed`。
+
 给人用的 `aad apps/describe/overview/snapshot/find/do` 也走这个会话：每条命令一个进程、一个会话，
 `aad do` 在同一个进程里观察、定位、操作，接受与 `aad find` 相同的定位参数，不跨进程传引用。
 
@@ -69,7 +76,7 @@ aad mcp --allow-input --allow-profile-copy  # browser_open 可以复制已有 pr
 其他 provider 返回 `CONTROL.ACTION_UNSUPPORTED`。
 
 MCP 工具为 `control_capabilities`, `control_targets`, `control_observe`, `control_find`,
-`control_act`, `control_cancel`, `control_close`，本机未限定授权时另有 `probe_environment` 与四个工作流工具。
+`control_wait`, `control_act`, `control_cancel`, `control_close`，本机未限定授权时另有 `probe_environment` 与四个工作流工具。
 每次调用可带 `request_id` 与 `timeout_ms`。`control_cancel` 的被取消请求字段名为 `target_request_id`；
 MCP cancellation notification 也能取消仍在执行的统一操作。错误响应带 `hint`，说明可行的恢复方式。
 原先按动作拆开的 Windows MCP 工具（`list_apps`、`describe_window`、`find_element`、`invoke` 等）已移除，

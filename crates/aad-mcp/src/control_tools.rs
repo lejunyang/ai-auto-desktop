@@ -270,6 +270,38 @@ the first one. To ask whether something has gone away, pass expect: optional and
             false,
         ),
         (
+            "control_wait",
+            "Wait for something to happen on one resource from control_targets: observe it \
+again and again (every interval_ms) until the locator's element appears, disappears, or \
+reaches the given states, or timeout_ms runs out (CONTROL.WAIT_TIMEOUT). Use it after an \
+action that loads, opens or closes something, instead of observing in a loop yourself. \
+When the element is found the answer carries its target, from an observation that stays \
+current, so control_act can use it directly. Several matches are never treated as found; \
+narrow the locator. control_cancel stops a wait.",
+            json!({
+                "resource_id": {"type": "string"},
+                "locator": locator_schema(),
+                "condition": {
+                    "enum": ["appears", "disappears", "state"],
+                    "description": "appears: exactly one element matches. disappears: none \
+            matches. state: exactly one matches and its `states` equal those given in `states`."
+                },
+                "states": {
+                    "type": "object",
+                    "description": "For condition state: state names and values the element \
+            must show, as observations report them in `states`, e.g. {\"enabled\": true} or \
+            {\"checked\": true}.",
+                    "minProperties": 1,
+                    "maxProperties": 16,
+                    "additionalProperties": {"type": ["boolean", "string", "number"]}
+                },
+                "max_nodes": {"type": "integer", "minimum": 1, "maximum": 2000, "description": "Capture budget of each observation (default 1000)."},
+                "interval_ms": {"type": "integer", "minimum": 50, "maximum": 5000, "description": "Pause between observations (default 250)."}
+            }),
+            vec!["resource_id", "locator", "condition"],
+            false,
+        ),
+        (
             "control_act",
             "Perform a typed action on an observed, freshly revalidated target. Every \
 attempt consumes that provider's observation, so observe again before the next one. \
@@ -409,6 +441,11 @@ or take the node_id from an outline."
         "CONTROL.OPTION_NOT_FOUND" => {
             "No option has that label or value. The observation lists the labels in the node's `options`."
         }
+        "CONTROL.WAIT_TIMEOUT" => {
+            "The condition did not hold before timeout_ms ran out; details.present says \
+whether the element was there at the last look. Observe an outline to see what the page or \
+window shows now, or wait again with a longer timeout_ms (up to 30000)."
+        }
         "CONTROL.TARGET_UNKNOWN" => {
             "Call control_targets first, then observe a resource_id it returned."
         }
@@ -545,6 +582,41 @@ mod tests {
             raw.operation,
             Operation::Observe { view, .. } if view.mode == aad_control::ViewMode::Nodes
         ));
+    }
+
+    #[test]
+    fn waiting_is_a_read_only_tool_that_parses_into_the_protocol() {
+        let wait = tool("control_wait");
+        assert!(!wait.mutating);
+        assert_eq!(
+            wait.schema["properties"]["condition"]["enum"],
+            json!(["appears", "disappears", "state"])
+        );
+        let session = aad_control::Session::new(Vec::new(), Default::default());
+        let request = prepare(
+            "control_wait",
+            &json!({"resource_id": "r", "locator": {"name": "Done"}, "condition": "state",
+                    "states": {"enabled": true}, "interval_ms": 100, "timeout_ms": 5000}),
+            &session,
+        )
+        .unwrap();
+        assert!(!request.mutating());
+        assert_eq!(request.timeout_ms, 5000);
+        match request.operation {
+            Operation::Wait {
+                condition, states, ..
+            } => {
+                assert_eq!(condition, aad_control::WaitCondition::State);
+                assert_eq!(states, Some(json!({"enabled": true})));
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(prepare(
+            "control_wait",
+            &json!({"resource_id": "r", "locator": {"name": "Done"}, "condition": "loaded"}),
+            &session,
+        )
+        .is_err());
     }
 
     #[test]

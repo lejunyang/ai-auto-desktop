@@ -249,9 +249,128 @@ fn status(observation: &Value) -> &str {
         .unwrap()
 }
 
+/// Sessions hold the per-user input lease until they close, so the browser
+/// tests take turns instead of refusing each other with RESOURCE_BUSY.
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+}
+fn session_for(fixture: &Fixture) -> (Session, Arc<BrowserBackend>) {
+    let backend = Arc::new(BrowserBackend::new(fixture.port));
+    let session = Session::new(
+        vec![backend.clone()],
+        Policy {
+            allow_input: true,
+            ..Default::default()
+        },
+    );
+    (session, backend)
+}
+/// The resources listed now, after control_targets.
+fn targets(session: &Session) -> Vec<Value> {
+    let response = call(session, Operation::Targets {});
+    assert!(response.error.is_none(), "{response:?}");
+    response.data.unwrap()["resources"]
+        .as_array()
+        .unwrap()
+        .clone()
+}
+/// The main frame of the page with this id.
+fn main_of(session: &Session, page_id: &str) -> String {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(found) = targets(session)
+            .iter()
+            .find(|r| r["metadata"]["page_id"] == page_id && r["metadata"]["main_frame"] == true)
+        {
+            return found["resource_id"].as_str().unwrap().to_string();
+        }
+        assert!(Instant::now() < deadline, "page {page_id} was not listed");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+fn call_within(session: &Session, op: Operation, timeout_ms: u64) -> Response {
+    let mut request = Request::new(Some(session.id().into()), op);
+    request.timeout_ms = timeout_ms;
+    session.execute(&request)
+}
+fn wait_until(session: &Session, resource: &str, name: &str, condition: WaitCondition) -> Response {
+    call_within(
+        session,
+        Operation::Wait {
+            resource_id: resource.into(),
+            locator: Box::new(Locator {
+                name: Some(name.into()),
+                ..Default::default()
+            }),
+            condition,
+            states: None,
+            max_nodes: 500,
+            interval_ms: Some(100),
+        },
+        10_000,
+    )
+}
+
+#[test]
+#[ignore = "requires isolated Chromium with its sandbox enabled; CI runs it explicitly"]
+fn wait_returns_an_element_that_appears_after_a_timer_ready_to_act_on() {
+    let _serial = serial();
+    let fixture = Fixture::new();
+    let (session, _) = session_for(&fixture);
+    let main = main_of(&session, &fixture.page_id);
+    // The fixture may still be committing its first document; a timer set in
+    // the outgoing one would never fire.
+    let loaded = wait_until(&session, &main, "Name", WaitCondition::Appears);
+    assert!(loaded.error.is_none(), "{loaded:?}");
+    fixture
+        .client()
+        .eval(
+            "setTimeout(() => { const b = document.createElement('button'); \
+             b.setAttribute('aria-label', 'Late'); b.textContent = 'Late'; \
+             b.onclick = () => document.getElementById('status').value = 'late:clicked'; \
+             document.body.appendChild(b); }, 700); true",
+        )
+        .unwrap();
+    let started = Instant::now();
+    let response = wait_until(&session, &main, "Late", WaitCondition::Appears);
+    assert!(response.error.is_none(), "{response:?}");
+    let data = response.data.unwrap();
+    assert!(started.elapsed() >= Duration::from_millis(500));
+    assert!(data["polls"].as_u64().unwrap() >= 2, "{data}");
+    assert_eq!(data["node"]["role"], "button");
+    let target: Target = serde_json::from_value(data["target"].clone()).unwrap();
+    let clicked = act(&session, target, Action::click());
+    assert!(clicked.error.is_none(), "{clicked:?}");
+    assert_eq!(status(&observe(&session, &main)), "late:clicked");
+    fixture
+        .client()
+        .eval("setTimeout(() => document.querySelector('[aria-label=Late]').remove(), 500); true")
+        .unwrap();
+    let gone = wait_until(&session, &main, "Late", WaitCondition::Disappears);
+    assert_eq!(gone.data.unwrap()["satisfied"], true);
+    let never = call_within(
+        &session,
+        Operation::Wait {
+            resource_id: main.clone(),
+            locator: Box::new(Locator {
+                name: Some("Never there".into()),
+                ..Default::default()
+            }),
+            condition: WaitCondition::Appears,
+            states: None,
+            max_nodes: 500,
+            interval_ms: Some(100),
+        },
+        1_000,
+    );
+    assert_eq!(never.error.unwrap()["code"], "CONTROL.WAIT_TIMEOUT");
+}
+
 #[test]
 #[ignore = "requires isolated Chromium with its sandbox enabled; CI runs it explicitly"]
 fn browser_actions_are_observed_document_bound_and_have_real_page_effects() {
+    let _serial = serial();
     let fixture = Fixture::new();
     let session = Session::new(
         vec![Arc::new(BrowserBackend::new(fixture.port))],

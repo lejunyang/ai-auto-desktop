@@ -297,11 +297,42 @@ pub enum Operation {
     Capture {
         target: Target,
     },
+    /// Observe a resource repeatedly until a locator's element appears,
+    /// disappears or reaches the given states, within the request deadline.
+    Wait {
+        resource_id: String,
+        locator: Box<Locator>,
+        condition: WaitCondition,
+        /// For `state`: every key must equal the found node's `states` value.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        states: Option<Value>,
+        #[serde(default = "default_nodes")]
+        max_nodes: usize,
+        /// Pause between observations; defaults to 250 ms.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        interval_ms: Option<u64>,
+    },
     Cancel {
         request_id: String,
     },
     Close {},
 }
+
+/// What `wait` waits for. An ambiguous match is never "found".
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WaitCondition {
+    /// Exactly one node matches.
+    Appears,
+    /// No node matches.
+    Disappears,
+    /// Exactly one node matches and its states equal the given ones.
+    State,
+}
+
+pub const DEFAULT_WAIT_INTERVAL_MS: u64 = 250;
+pub const MIN_WAIT_INTERVAL_MS: u64 = 50;
+pub const MAX_WAIT_INTERVAL_MS: u64 = 5_000;
 
 fn default_nodes() -> usize {
     1_000
