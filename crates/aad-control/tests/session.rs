@@ -287,6 +287,330 @@ fn deadline_before_and_after_commit_has_distinct_effects() {
     }
 }
 
+/// A window whose contents change as it is observed again and again.
+struct Changing {
+    observed: AtomicUsize,
+    acted: AtomicUsize,
+}
+impl Backend for Changing {
+    fn name(&self) -> &str {
+        "changing"
+    }
+    fn capabilities(&self) -> Vec<String> {
+        vec!["click".into()]
+    }
+    fn resources(&self, _: Duration) -> Result<Vec<BackendResource>> {
+        Ok(vec![BackendResource {
+            resource: Resource {
+                resource_id: "changing:window".into(),
+                provider: "changing".into(),
+                kind: "desktop".into(),
+                name: "changing".into(),
+                capabilities: self.capabilities(),
+                metadata: json!({}),
+            },
+            selector: json!({}),
+        }])
+    }
+    fn observe(&self, _: &Value, _: usize, _: Duration) -> Result<Value> {
+        let poll = self.observed.fetch_add(1, Ordering::SeqCst) + 1;
+        let mut nodes = vec![
+            json!({"node_id":"save", "role":"button", "name":"Save"}),
+            json!({"node_id":"t1", "role":"button", "name":"Twin"}),
+            json!({"node_id":"t2", "role":"button", "name":"Twin"}),
+            json!({"node_id":"toggle", "role":"checkbox", "name":"Agree", "states": {"checked": poll >= 3, "enabled": true}}),
+        ];
+        if poll >= 3 {
+            nodes.push(json!({"node_id":"done", "role":"button", "name":"Done"}));
+        } else {
+            nodes.push(json!({"node_id":"spinner", "role":"progressbar", "name":"Loading"}));
+        }
+        Ok(json!({"nodes": nodes, "truncated": false}))
+    }
+    fn act(&self, _: &Value, node: &Value, _: &Action, context: &Context) -> Result<Value> {
+        context.commit()?;
+        self.acted.fetch_add(1, Ordering::SeqCst);
+        Ok(json!({"clicked": node["node_id"]}))
+    }
+}
+fn changing() -> (Arc<Session>, Arc<Changing>) {
+    let backend = Arc::new(Changing {
+        observed: AtomicUsize::new(0),
+        acted: AtomicUsize::new(0),
+    });
+    let session = Arc::new(Session::new(
+        vec![backend.clone()],
+        Policy {
+            allow_input: true,
+            ..Default::default()
+        },
+    ));
+    assert!(call(&session, Operation::Targets {}).error.is_none());
+    (session, backend)
+}
+fn wait_for(name: &str, condition: WaitCondition, states: Option<Value>) -> Operation {
+    Operation::Wait {
+        resource_id: "changing:window".into(),
+        locator: Box::new(Locator {
+            name: Some(name.into()),
+            ..Default::default()
+        }),
+        condition,
+        states,
+        max_nodes: 50,
+        interval_ms: Some(50),
+    }
+}
+
+#[test]
+fn wait_returns_an_actionable_target_once_the_element_appears() {
+    let (session, backend) = changing();
+    let response = call(&session, wait_for("Done", WaitCondition::Appears, None));
+    assert_eq!(response.commit_state, CommitState::NotCommitted);
+    let data = response
+        .data
+        .expect("the element appears on the third look");
+    assert_eq!(data["satisfied"], true);
+    assert_eq!(data["polls"], 3);
+    assert_eq!(data["node"]["name"], "Done");
+    assert_eq!(backend.observed.load(Ordering::SeqCst), 3);
+    // The last observation stays current: the target is acted on directly.
+    let target: Target = serde_json::from_value(data["target"].clone()).unwrap();
+    assert_eq!(target.observation_id, data["observation_id"]);
+    let acted = call(
+        &session,
+        Operation::Act {
+            target,
+            action: Action::click(),
+        },
+    );
+    assert!(acted.error.is_none(), "{acted:?}");
+    assert_eq!(acted.data.unwrap()["backend_result"]["clicked"], "done");
+    assert_eq!(backend.acted.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn wait_sees_an_element_go_and_a_state_arrive() {
+    let (session, _) = changing();
+    let gone = call(
+        &session,
+        wait_for("Loading", WaitCondition::Disappears, None),
+    );
+    let data = gone.data.unwrap();
+    assert_eq!(data["satisfied"], true);
+    assert!(data.get("target").is_none());
+    let (session, _) = changing();
+    let checked = call(
+        &session,
+        wait_for(
+            "Agree",
+            WaitCondition::State,
+            Some(json!({"checked": true})),
+        ),
+    );
+    let data = checked.data.unwrap();
+    assert_eq!(data["node"]["states"]["checked"], true);
+    assert_eq!(data["polls"], 3);
+}
+
+#[test]
+fn wait_never_counts_an_ambiguous_match_and_reports_a_timeout() {
+    let (session, _) = changing();
+    let mut request = Request::new(
+        Some(session.id().into()),
+        wait_for("Twin", WaitCondition::Appears, None),
+    );
+    request.timeout_ms = 600;
+    let response = session.execute(&request);
+    assert_eq!(response.error.unwrap()["code"], "CONTROL.AMBIGUOUS");
+    // Two of them are still something present: they have not disappeared.
+    let mut request = Request::new(
+        Some(session.id().into()),
+        wait_for("Twin", WaitCondition::Disappears, None),
+    );
+    request.timeout_ms = 600;
+    assert_eq!(
+        session.execute(&request).error.unwrap()["code"],
+        "CONTROL.AMBIGUOUS"
+    );
+    let mut request = Request::new(
+        Some(session.id().into()),
+        wait_for("Never", WaitCondition::Appears, None),
+    );
+    request.timeout_ms = 600;
+    let response = session.execute(&request);
+    assert_eq!(response.commit_state, CommitState::NotCommitted);
+    let failure = response.error.unwrap();
+    assert_eq!(failure["code"], "CONTROL.WAIT_TIMEOUT");
+    assert!(failure["details"]["polls"].as_u64().unwrap() >= 2);
+    let refused = call(&session, wait_for("Agree", WaitCondition::State, None));
+    assert_eq!(refused.error.unwrap()["code"], "CONTROL.INVALID_REQUEST");
+    let refused = call(
+        &session,
+        wait_for(
+            "Agree",
+            WaitCondition::Appears,
+            Some(json!({"checked": true})),
+        ),
+    );
+    assert_eq!(refused.error.unwrap()["code"], "CONTROL.INVALID_REQUEST");
+}
+
+#[test]
+fn a_wait_in_progress_can_be_cancelled() {
+    let (session, backend) = changing();
+    let mut request = Request::new(
+        Some(session.id().into()),
+        wait_for("Never", WaitCondition::Appears, None),
+    );
+    request.timeout_ms = 20_000;
+    let id = request.request_id.clone();
+    let running = session.clone();
+    let started = std::time::Instant::now();
+    let worker = std::thread::spawn(move || running.execute(&request));
+    while backend.observed.load(Ordering::SeqCst) < 2 {
+        assert!(started.elapsed() < Duration::from_secs(5));
+        std::thread::yield_now();
+    }
+    assert!(session.cancel(&id));
+    let response = worker.join().unwrap();
+    assert_eq!(response.error.unwrap()["code"], "CONTROL.CANCELLED");
+    assert_eq!(response.commit_state, CommitState::NotCommitted);
+    assert!(started.elapsed() < Duration::from_secs(5));
+}
+
+/// Remembers the files each upload handed it.
+struct Uploader {
+    files: std::sync::Mutex<Vec<Vec<String>>>,
+}
+impl Backend for Uploader {
+    fn name(&self) -> &str {
+        "uploader"
+    }
+    fn capabilities(&self) -> Vec<String> {
+        vec!["upload".into()]
+    }
+    fn resources(&self, _: Duration) -> Result<Vec<BackendResource>> {
+        Ok(vec![BackendResource {
+            resource: Resource {
+                resource_id: "uploader:page".into(),
+                provider: "uploader".into(),
+                kind: "browser".into(),
+                name: "form".into(),
+                capabilities: self.capabilities(),
+                metadata: json!({}),
+            },
+            selector: json!({}),
+        }])
+    }
+    fn observe(&self, _: &Value, _: usize, _: Duration) -> Result<Value> {
+        Ok(
+            json!({"nodes": [{"node_id":"file", "role":"button", "name":"Attach", "actions":["upload"]}], "truncated": false}),
+        )
+    }
+    fn act(&self, _: &Value, _: &Value, action: &Action, context: &Context) -> Result<Value> {
+        context.commit()?;
+        if let Action::Upload { files } = action {
+            self.files.lock().unwrap().push(files.clone());
+        }
+        Ok(json!({}))
+    }
+}
+
+#[test]
+fn uploads_name_only_existing_files_under_the_server_grant() {
+    let allowed = std::env::temp_dir().join(format!("aad-grant-{}", uuid::Uuid::new_v4()));
+    let outside = std::env::temp_dir().join(format!("aad-outside-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(allowed.join("sub")).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(allowed.join("sub").join("a.txt"), "a").unwrap();
+    std::fs::write(outside.join("b.txt"), "b").unwrap();
+    let backend = Arc::new(Uploader {
+        files: Default::default(),
+    });
+    let session = |roots: Vec<std::path::PathBuf>| {
+        let session = Session::new(
+            vec![backend.clone()],
+            Policy {
+                allow_input: true,
+                upload_roots: roots,
+                ..Default::default()
+            },
+        );
+        assert!(call(&session, Operation::Targets {}).error.is_none());
+        session
+    };
+    let upload = |session: &Session, files: Vec<String>| {
+        let observed = call(
+            session,
+            Operation::Observe {
+                resource_id: "uploader:page".into(),
+                max_nodes: 10,
+                view: Default::default(),
+            },
+        )
+        .data
+        .unwrap();
+        let target: Target =
+            serde_json::from_value(observed["nodes"][0]["target"].clone()).unwrap();
+        call(
+            session,
+            Operation::Act {
+                target,
+                action: Action::Upload { files },
+            },
+        )
+    };
+    let inside = allowed.join("sub").join("a.txt").display().to_string();
+    // No grant: nothing is uploaded, however plain the path.
+    let none = session(Vec::new());
+    assert_eq!(
+        upload(&none, vec![inside.clone()]).error.unwrap()["code"],
+        "POLICY.DENIED"
+    );
+    let granted = session(vec![allowed.clone()]);
+    let escape = allowed
+        .join("sub")
+        .join("..")
+        .join("..")
+        .join(outside.file_name().unwrap())
+        .join("b.txt")
+        .display()
+        .to_string();
+    for (files, code) in [
+        (vec![escape], "POLICY.DENIED"),
+        (
+            vec![outside.join("b.txt").display().to_string()],
+            "POLICY.DENIED",
+        ),
+        (vec!["sub/a.txt".to_string()], "CONTROL.INVALID_REQUEST"),
+        (
+            vec![allowed.join("sub").display().to_string()],
+            "CONTROL.FILE_NOT_FOUND",
+        ),
+        (vec![], "CONTROL.INVALID_REQUEST"),
+    ] {
+        let response = upload(&granted, files);
+        assert_eq!(response.commit_state, CommitState::NotCommitted);
+        assert_eq!(response.error.unwrap()["code"], code);
+    }
+    assert!(backend.files.lock().unwrap().is_empty());
+    assert!(upload(&granted, vec![inside]).error.is_none());
+    let handed = backend.files.lock().unwrap()[0][0].clone();
+    // The provider gets the resolved path, in a form a browser accepts.
+    assert!(!handed.starts_with(r"\\?\"), "{handed}");
+    assert_eq!(
+        std::fs::canonicalize(&handed).unwrap(),
+        std::fs::canonicalize(allowed.join("sub").join("a.txt")).unwrap()
+    );
+    assert_eq!(
+        call(&granted, Operation::Capabilities {}).data.unwrap()["upload_dirs"][0],
+        json!(allowed)
+    );
+    let _ = std::fs::remove_dir_all(allowed);
+    let _ = std::fs::remove_dir_all(outside);
+}
+
 #[test]
 fn close_expiry_and_bounded_replay_guard_revoke_observations() {
     let (session, backend) = fixture(true, Duration::ZERO);

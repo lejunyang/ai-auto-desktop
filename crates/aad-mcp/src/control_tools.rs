@@ -129,9 +129,10 @@ fn action_schema() -> Value {
         variant("forward", "Go forward one page in the observed browser page's history.", json!({}), &[]),
         variant("reload", "Reload the observed browser page.", json!({}), &[]),
         variant("paste", "Paste text into a focusable text element through the clipboard: \
-    the clipboard briefly offers the text (marked to stay out of clipboard history, cloud sync \
-    and clipboard managers, which are refused if they ask), the element is focused, Ctrl+V \
-    is sent, and the clipboard is put back as it was. Use it where an application handles \
+    the clipboard briefly offers the text -- to the target application only: clipboard \
+    history, managers and sync tools that ask are refused -- the element is focused and told \
+    to paste (a classic Win32 edit by WM_PASTE, anything else by Ctrl+V), and the clipboard is \
+    put back as it was. Use it where an application handles \
     pasted text better than typed keys (rich editors, fields that filter keystrokes); prefer \
     fill where offered. Never offered on password fields.", json!({
             "text": {"type": "string", "minLength": 1, "maxLength": 4096}
@@ -148,6 +149,33 @@ fn action_schema() -> Value {
         variant("activate", "Bring the observed desktop window to the foreground, restoring \
     it first if minimized. Refused with DRIVER.ACTIVATION_REFUSED when Windows will not let \
     this process take the foreground. Offered on its root node.", json!({}), &[]),
+        variant("open_tab", "Open an http or https address in a new tab of the observed \
+    page's browser. Offered on the page's document node. The answer names the new page_id; \
+    call control_targets to observe it.", json!({
+            "url": {"type": "string", "minLength": 8, "maxLength": 2048}
+        }), &["url"]),
+        variant("activate_page", "Bring the observed browser page (tab) to the front. \
+    Offered on the page's document node.", json!({}), &[]),
+        variant("close_page", "Close the observed browser page (tab or popup). Offered on \
+    the page's document node; its targets stop resolving.", json!({}), &[]),
+        variant("accept", "Accept (OK) the JavaScript dialog -- alert, confirm, prompt or \
+    leave-page -- that blocks a browser page. While one is open, observing the page shows \
+    only that dialog, as a node with role alertdialog. A prompt takes the answer as `text`; \
+    without it the prompt's default is used.", json!({
+            "text": {"type": "string", "maxLength": 4096}
+        }), &[]),
+        variant("dismiss", "Dismiss (Cancel) the JavaScript dialog that blocks a browser \
+    page, observed as an alertdialog node.", json!({}), &[]),
+        variant("upload", "Put local files into a browser file input (<input type=file>, \
+    offered even when the page hides it behind a styled button), firing its change event; no \
+    file chooser opens. Absolute paths of existing files under a directory the server \
+    operator allowed (control_capabilities lists them as upload_dirs); anything else is \
+    refused. Several files only where the input takes several.", json!({
+            "files": {
+                "type": "array", "minItems": 1, "maxItems": 32,
+                "items": {"type": "string", "minLength": 1, "maxLength": 4096}
+            }
+        }), &["files"]),
     ]})
 }
 
@@ -249,7 +277,10 @@ server operator granted input. Unsupported capabilities are never synthesized.",
         (
             "control_targets",
             "List the desktop windows or applications and the browser pages or frames this \
-session may observe. Resource IDs are chosen by the server, not given as OS handles or URLs.",
+session may observe. Resource IDs are chosen by the server, not given as OS handles or URLs. \
+Browser pages carry metadata.page_id; a tab or popup the page opened (window.open, \
+target=_blank, a sign-in popup) carries metadata.opener_page_id naming its opener. Call \
+this again after an action may have opened or closed a page.",
             json!({}),
             vec![],
             false,
@@ -287,6 +318,38 @@ the first one. To ask whether something has gone away, pass expect: optional and
                 }
             }),
             vec!["observation_id", "locator"],
+            false,
+        ),
+        (
+            "control_wait",
+            "Wait for something to happen on one resource from control_targets: observe it \
+again and again (every interval_ms) until the locator's element appears, disappears, or \
+reaches the given states, or timeout_ms runs out (CONTROL.WAIT_TIMEOUT). Use it after an \
+action that loads, opens or closes something, instead of observing in a loop yourself. \
+When the element is found the answer carries its target, from an observation that stays \
+current, so control_act can use it directly. Several matches are never treated as found; \
+narrow the locator. control_cancel stops a wait.",
+            json!({
+                "resource_id": {"type": "string"},
+                "locator": locator_schema(),
+                "condition": {
+                    "enum": ["appears", "disappears", "state"],
+                    "description": "appears: exactly one element matches. disappears: none \
+            matches. state: exactly one matches and its `states` equal those given in `states`."
+                },
+                "states": {
+                    "type": "object",
+                    "description": "For condition state: state names and values the element \
+            must show, as observations report them in `states`, e.g. {\"enabled\": true} or \
+            {\"checked\": true}.",
+                    "minProperties": 1,
+                    "maxProperties": 16,
+                    "additionalProperties": {"type": ["boolean", "string", "number"]}
+                },
+                "max_nodes": {"type": "integer", "minimum": 1, "maximum": 2000, "description": "Capture budget of each observation (default 1000)."},
+                "interval_ms": {"type": "integer", "minimum": 50, "maximum": 5000, "description": "Pause between observations (default 250)."}
+            }),
+            vec!["resource_id", "locator", "condition"],
             false,
         ),
         (
@@ -573,17 +636,38 @@ a very small or very large element reads poorly -- try its container or a smalle
         "CONTROL.OPTION_NOT_FOUND" => {
             "No option has that label or value. The observation lists the labels in the node's `options`."
         }
+        "CONTROL.DIALOG_OPEN" => {
+            "A JavaScript dialog (alert, confirm, prompt or leave-page) blocks this browser \
+page, so nothing else on it can be done. Call control_observe on the page: it shows the \
+dialog as an alertdialog node with its message; control_act accept (with `text` for a \
+prompt) or dismiss on it, then observe again."
+        }
+        "BROWSER.PAGE_UNRESPONSIVE" => {
+            "The browser page does not answer, usually because a JavaScript dialog opened \
+before this session first looked at it; such a dialog cannot be answered from here. Ask the \
+person to close it in the browser, then call control_targets again."
+        }
+        "CONTROL.WAIT_TIMEOUT" => {
+            "The condition did not hold before timeout_ms ran out; details.present says \
+whether the element was there at the last look. Observe an outline to see what the page or \
+window shows now, or wait again with a longer timeout_ms (up to 30000)."
+        }
         "CONTROL.TARGET_UNKNOWN" => {
             "Call control_targets first, then observe a resource_id it returned."
         }
         "POLICY.DENIED" => {
-            "Whoever started this server did not grant this (input needs aad mcp \
---allow-input; desktop_launch also an --allow-launch entry for the program). Do not look \
-for another way to act; ask the person you are helping."
+            "Whoever started this server did not grant this: input needs aad mcp \
+--allow-input; desktop_launch also an --allow-launch entry for the program; a file upload \
+needs the file under a directory given with --allow-upload-dir (control_capabilities lists \
+them as upload_dirs). Do not look for another way to act; ask the person you are helping."
         }
         "CONTROL.LAUNCH_FAILED" => {
             "The allowlisted program could not be found or started; details name it. Ask \
 the person running the server to check the --allow-launch entry."
+        }
+        "CONTROL.FILE_NOT_FOUND" => {
+            "No regular file exists at that path. Upload takes absolute paths of existing \
+files; check the name, or ask the person where the file is."
         }
         _ => return None,
     })
@@ -651,6 +735,7 @@ mod tests {
                     "option" => json!("x"),
                     "checked" => json!(true),
                     "url" => json!("https://example.com/"),
+                    "files" => json!(["C:/upload/report.txt"]),
                     "to" => {
                         json!({"session_id":"s","resource_id":"r","observation_id":"o","node_id":"n"})
                     }
@@ -714,6 +799,41 @@ mod tests {
             raw.operation,
             Operation::Observe { view, .. } if view.mode == aad_control::ViewMode::Nodes
         ));
+    }
+
+    #[test]
+    fn waiting_is_a_read_only_tool_that_parses_into_the_protocol() {
+        let wait = tool("control_wait");
+        assert!(!wait.mutating);
+        assert_eq!(
+            wait.schema["properties"]["condition"]["enum"],
+            json!(["appears", "disappears", "state"])
+        );
+        let session = aad_control::Session::new(Vec::new(), Default::default());
+        let request = prepare(
+            "control_wait",
+            &json!({"resource_id": "r", "locator": {"name": "Done"}, "condition": "state",
+                    "states": {"enabled": true}, "interval_ms": 100, "timeout_ms": 5000}),
+            &session,
+        )
+        .unwrap();
+        assert!(!request.mutating());
+        assert_eq!(request.timeout_ms, 5000);
+        match request.operation {
+            Operation::Wait {
+                condition, states, ..
+            } => {
+                assert_eq!(condition, aad_control::WaitCondition::State);
+                assert_eq!(states, Some(json!({"enabled": true})));
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(prepare(
+            "control_wait",
+            &json!({"resource_id": "r", "locator": {"name": "Done"}, "condition": "loaded"}),
+            &session,
+        )
+        .is_err());
     }
 
     #[test]

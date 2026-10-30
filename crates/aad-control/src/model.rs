@@ -221,9 +221,31 @@ pub enum Action {
     Paste {
         text: String,
     },
+    /// Open an http(s) address in a new tab of the observed page's browser.
+    OpenTab {
+        url: String,
+    },
+    /// Bring the observed page to the front.
+    ActivatePage {},
+    /// Close the observed page.
+    ClosePage {},
+    /// Accept the JavaScript dialog an observation shows; a prompt takes `text`.
+    Accept {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        text: Option<String>,
+    },
+    /// Dismiss (cancel) the JavaScript dialog an observation shows.
+    Dismiss {},
+    /// Put these local files into a file input. Absolute paths under a
+    /// directory the server operator allowed; nothing else is readable.
+    Upload {
+        files: Vec<String>,
+    },
 }
 
-pub const ACTION_NAMES: [&str; 21] = [
+pub const MAX_UPLOAD_FILES: usize = 32;
+
+pub const ACTION_NAMES: [&str; 27] = [
     "focus",
     "invoke",
     "click",
@@ -245,10 +267,27 @@ pub const ACTION_NAMES: [&str; 21] = [
     "close_window",
     "activate",
     "paste",
+    "open_tab",
+    "activate_page",
+    "close_page",
+    "accept",
+    "dismiss",
+    "upload",
 ];
 
 /// Actions on the page as a whole, offered on its document node.
-pub const PAGE_ACTIONS: [&str; 4] = ["navigate", "back", "forward", "reload"];
+pub const PAGE_ACTIONS: [&str; 7] = [
+    "navigate",
+    "back",
+    "forward",
+    "reload",
+    "open_tab",
+    "activate_page",
+    "close_page",
+];
+
+/// Page actions that address the browser's tabs rather than one document.
+pub const TAB_ACTIONS: [&str; 3] = ["open_tab", "activate_page", "close_page"];
 
 /// Actions on a desktop window as a whole, offered on its own node.
 pub const WINDOW_ACTIONS: [&str; 5] = [
@@ -291,6 +330,12 @@ impl Action {
             Self::CloseWindow {} => "close_window",
             Self::Activate {} => "activate",
             Self::Paste { .. } => "paste",
+            Self::OpenTab { .. } => "open_tab",
+            Self::ActivatePage {} => "activate_page",
+            Self::ClosePage {} => "close_page",
+            Self::Accept { .. } => "accept",
+            Self::Dismiss {} => "dismiss",
+            Self::Upload { .. } => "upload",
         }
     }
     /// A left single click at the centre needs nothing beyond a plain click.
@@ -362,11 +407,42 @@ pub enum Operation {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         max_characters: Option<usize>,
     },
+    /// Observe a resource repeatedly until a locator's element appears,
+    /// disappears or reaches the given states, within the request deadline.
+    Wait {
+        resource_id: String,
+        locator: Box<Locator>,
+        condition: WaitCondition,
+        /// For `state`: every key must equal the found node's `states` value.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        states: Option<Value>,
+        #[serde(default = "default_nodes")]
+        max_nodes: usize,
+        /// Pause between observations; defaults to 250 ms.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        interval_ms: Option<u64>,
+    },
     Cancel {
         request_id: String,
     },
     Close {},
 }
+
+/// What `wait` waits for. An ambiguous match is never "found".
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WaitCondition {
+    /// Exactly one node matches.
+    Appears,
+    /// No node matches.
+    Disappears,
+    /// Exactly one node matches and its states equal the given ones.
+    State,
+}
+
+pub const DEFAULT_WAIT_INTERVAL_MS: u64 = 250;
+pub const MIN_WAIT_INTERVAL_MS: u64 = 50;
+pub const MAX_WAIT_INTERVAL_MS: u64 = 5_000;
 
 fn default_nodes() -> usize {
     1_000

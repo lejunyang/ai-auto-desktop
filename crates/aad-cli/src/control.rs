@@ -20,11 +20,7 @@ pub struct Grants {
     /// Let desktop_launch start this program: an absolute path or a bare
     /// name on PATH, started directly (never through a shell). Repeat for
     /// more. Shells, script hosts and association launchers are refused.
-    #[arg(
-        long = "allow-launch",
-        value_name = "PROGRAM",
-        requires = "allow_input"
-    )]
+    #[arg(long = "allow-launch", value_name = "PROGRAM")]
     allow_launch: Vec<String>,
     /// Let clipboard_read return the clipboard's text. Off by default: the
     /// clipboard often holds passwords and private text.
@@ -32,8 +28,12 @@ pub struct Grants {
     allow_clipboard_read: bool,
     /// Let control_global_key press key combinations anchored on no element
     /// (Win+D, Alt+Tab), wherever focus is. Off by default.
-    #[arg(long, requires = "allow_input")]
+    #[arg(long)]
     allow_global_keys: bool,
+    /// Let browser uploads read files under this directory. Repeat to allow more than one.
+    /// Without it every upload is refused.
+    #[arg(long = "allow-upload-dir", value_name = "DIR")]
+    upload_dirs: Vec<std::path::PathBuf>,
 }
 impl Grants {
     fn policy(&self, allow_input: bool) -> Policy {
@@ -48,7 +48,18 @@ impl Grants {
             launch: self.allow_launch.iter().cloned().collect(),
             allow_clipboard_read: self.allow_clipboard_read,
             allow_global_keys: self.allow_global_keys,
+            upload_roots: self.upload_dirs.clone(),
         }
+    }
+    /// Launching and global keys are input: refuse them without the input grant
+    /// rather than start a server that would refuse every such request.
+    fn check(&self, allow_input: bool) -> std::io::Result<()> {
+        if !allow_input && (!self.allow_launch.is_empty() || self.allow_global_keys) {
+            return Err(invalid(
+                "--allow-launch and --allow-global-keys need --allow-input",
+            ));
+        }
+        Ok(())
     }
     /// Whether any grant was given that only the remote server may hold.
     fn any(&self) -> bool {
@@ -58,6 +69,7 @@ impl Grants {
             || !self.allow_launch.is_empty()
             || self.allow_clipboard_read
             || self.allow_global_keys
+            || !self.upload_dirs.is_empty()
     }
 }
 
@@ -124,6 +136,7 @@ pub fn mcp(args: &McpArgs) -> std::io::Result<()> {
         let client = RemoteClient::spawn(&command(raw)?).map_err(|e| invalid(e.message))?;
         aad_mcp::Server::with_control(Arc::new(client))
     } else {
+        args.grants.check(args.allow_input)?;
         let server = aad_mcp::Server::with_options(
             args.grants.policy(args.allow_input),
             args.grants.browser_port,
@@ -139,10 +152,13 @@ pub fn mcp(args: &McpArgs) -> std::io::Result<()> {
 
 pub fn run(command_args: &ControlCommand) -> std::io::Result<()> {
     let endpoint: Arc<dyn Endpoint> = match command_args {
-        ControlCommand::Serve(args) => Arc::new(Session::native_with_browser(
-            args.grants.policy(args.allow_input),
-            args.grants.browser_port,
-        )),
+        ControlCommand::Serve(args) => {
+            args.grants.check(args.allow_input)?;
+            Arc::new(Session::native_with_browser(
+                args.grants.policy(args.allow_input),
+                args.grants.browser_port,
+            ))
+        }
         ControlCommand::Connect(args) => {
             Arc::new(RemoteClient::spawn(&command(&args.command)?).map_err(|e| invalid(e.message))?)
         }
@@ -153,6 +169,50 @@ pub fn run(command_args: &ControlCommand) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn input_only_grants_need_the_input_grant() {
+        #[derive(clap::Parser)]
+        struct Cli {
+            #[command(flatten)]
+            grants: Grants,
+        }
+        use clap::Parser;
+        let launch = Cli::try_parse_from(["aad", "--allow-launch", "notepad.exe"]).unwrap();
+        assert!(launch.grants.check(false).is_err());
+        assert!(launch.grants.check(true).is_ok());
+        assert_eq!(launch.grants.policy(true).launch.len(), 1);
+        let keys = Cli::try_parse_from(["aad", "--allow-global-keys"]).unwrap();
+        assert!(keys.grants.check(false).is_err());
+        let clipboard = Cli::try_parse_from(["aad", "--allow-clipboard-read"]).unwrap();
+        assert!(clipboard.grants.check(false).is_ok());
+        assert!(clipboard.grants.policy(false).allow_clipboard_read);
+    }
+    #[test]
+    fn uploads_are_refused_unless_the_operator_names_directories() {
+        #[derive(clap::Parser)]
+        struct Cli {
+            #[command(flatten)]
+            grants: Grants,
+        }
+        use clap::Parser;
+        let none = Cli::try_parse_from(["aad"]).unwrap();
+        assert!(none.grants.policy(true).upload_roots.is_empty());
+        let two = Cli::try_parse_from([
+            "aad",
+            "--allow-upload-dir",
+            "C:/uploads",
+            "--allow-upload-dir",
+            "D:/more",
+        ])
+        .unwrap();
+        assert_eq!(
+            two.grants.policy(true).upload_roots,
+            vec![
+                std::path::PathBuf::from("C:/uploads"),
+                std::path::PathBuf::from("D:/more")
+            ]
+        );
+    }
     #[test]
     fn transport_commands_are_argv_not_shell_fragments() {
         assert!(command("[]").is_err());

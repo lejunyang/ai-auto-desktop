@@ -30,8 +30,96 @@ const PAGE: &str = r#"<!doctype html><html><body>
 <div aria-label="Log" style="height:40px;overflow:auto" onscroll="document.getElementById('status').value='scrolled:'+(this.scrollTop>0)"><div style="height:400px">rows</div></div>
 <div style="position:relative"><button aria-label="Covered">Covered</button><div style="position:absolute;inset:0;background:white"></div></div>
 <a href="/second" aria-label="Second page">second</a>
+<a href="/download" aria-label="Get report">report</a>
+<button aria-label="Popup" onclick="window.open('/second','_blank','popup')">Popup</button>
+<button aria-label="Ask" onclick="document.getElementById('status').value='answer:'+prompt('Your name?','guest')">Ask</button>
+<button aria-label="Sure" onclick="document.getElementById('status').value='confirm:'+confirm('Sure?')">Sure</button>
+<input type="file" aria-label="Attachment" onchange="document.getElementById('status').value='files:'+Array.from(this.files).map(f=>f.name+':'+f.size).join(',')">
+<input type="file" aria-label="Hidden upload" multiple style="display:none" onchange="document.getElementById('status').value='hidden:'+Array.from(this.files).map(f=>f.name).join(',')">
 <iframe src="/frame"></iframe>
 </body></html>"#;
+
+/// Answer one fixture request, or nothing. Browsers open sockets before they
+/// have a request to send (preconnects). Answering such a socket with the
+/// default page before its request arrives makes the browser read that page as
+/// the reply to whatever it asks next -- a new tab at /second showing the
+/// fixture page -- so only a complete request line is ever answered.
+fn respond(mut stream: std::net::TcpStream) {
+    // Accepted sockets may inherit the listener's non-blocking mode.
+    if stream.set_nonblocking(false).is_err() {
+        return;
+    }
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut bytes = Vec::new();
+    let mut chunk = [0u8; 8192];
+    while !bytes.windows(4).any(|w| w == b"\r\n\r\n") {
+        match stream.read(&mut chunk) {
+            Ok(0) => return,
+            Ok(count) => bytes.extend_from_slice(&chunk[..count]),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) && Instant::now() < deadline => {}
+            Err(_) => return,
+        }
+        if bytes.len() > 65536 {
+            return;
+        }
+    }
+    let request = String::from_utf8_lossy(&bytes);
+    let mut headers = "Content-Type: text/html; charset=utf-8";
+    let body = if request.starts_with("GET /download") {
+        headers = "Content-Type: application/octet-stream\r\nContent-Disposition: attachment; filename=\"report.txt\"";
+        "downloaded body"
+    } else if request.starts_with("GET /frame") {
+        "<!doctype html><input aria-label='FrameInput'><div style='height:900px'></div>"
+    } else if request.starts_with("GET /second") {
+        "<!doctype html><title>Second</title><body><p aria-label='Second marker'>second</p></body>"
+    } else {
+        PAGE
+    };
+    let response = format!(
+        "HTTP/1.1 200 OK\r\n{headers}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let _ = stream.write_all(response.as_bytes());
+}
+
+#[test]
+fn the_fixture_server_answers_only_requests_it_has_read() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let accept = || loop {
+        match listener.accept() {
+            Ok((stream, _)) => return stream,
+            Err(_) => std::thread::sleep(Duration::from_millis(5)),
+        }
+    };
+    // A preconnected socket whose request comes late gets that request's page.
+    let mut client = std::net::TcpStream::connect(address).unwrap();
+    let server = accept();
+    let worker = std::thread::spawn(move || respond(server));
+    std::thread::sleep(Duration::from_millis(1500));
+    client
+        .write_all(b"GET /second HTTP/1.1\r\nHost: x\r\n\r\n")
+        .unwrap();
+    let mut answer = String::new();
+    client.read_to_string(&mut answer).unwrap();
+    worker.join().unwrap();
+    assert!(answer.contains("Second marker"), "{answer}");
+    // One that never sends a request is closed without an answer.
+    let mut idle = std::net::TcpStream::connect(address).unwrap();
+    let server = accept();
+    let worker = std::thread::spawn(move || respond(server));
+    idle.shutdown(std::net::Shutdown::Write).unwrap();
+    let mut answer = String::new();
+    idle.read_to_string(&mut answer).unwrap();
+    worker.join().unwrap();
+    assert_eq!(answer, "");
+}
 
 struct Fixture {
     child: Child,
@@ -56,22 +144,10 @@ impl Fixture {
         let server = std::thread::spawn(move || {
             while !stopped.load(Ordering::SeqCst) {
                 match listener.accept() {
-                    Ok((mut stream, _)) => {
-                        stream
-                            .set_read_timeout(Some(Duration::from_secs(1)))
-                            .unwrap();
-                        let mut bytes = [0u8; 8192];
-                        let count = stream.read(&mut bytes).unwrap_or(0);
-                        let request = String::from_utf8_lossy(&bytes[..count]);
-                        let body = if request.starts_with("GET /frame") {
-                            "<!doctype html><input aria-label='FrameInput'><div style='height:900px'></div>"
-                        } else if request.starts_with("GET /second") {
-                            "<!doctype html><title>Second</title><body><p aria-label='Second marker'>second</p></body>"
-                        } else {
-                            PAGE
-                        };
-                        let response=format!("HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len());
-                        let _ = stream.write_all(response.as_bytes());
+                    Ok((stream, _)) => {
+                        // One thread per connection: a socket the browser opens
+                        // ahead of time must not hold up the next request.
+                        std::thread::spawn(move || respond(stream));
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                         std::thread::sleep(Duration::from_millis(5))
@@ -249,9 +325,573 @@ fn status(observation: &Value) -> &str {
         .unwrap()
 }
 
+/// Sessions hold the per-user input lease until they close, so the browser
+/// tests take turns instead of refusing each other with RESOURCE_BUSY.
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+}
+fn session_for(fixture: &Fixture) -> (Session, Arc<BrowserBackend>) {
+    let backend = Arc::new(BrowserBackend::new(fixture.port));
+    let session = Session::new(
+        vec![backend.clone()],
+        Policy {
+            allow_input: true,
+            ..Default::default()
+        },
+    );
+    (session, backend)
+}
+/// The resources listed now, after control_targets.
+fn targets(session: &Session) -> Vec<Value> {
+    let response = call(session, Operation::Targets {});
+    assert!(response.error.is_none(), "{response:?}");
+    response.data.unwrap()["resources"]
+        .as_array()
+        .unwrap()
+        .clone()
+}
+/// The main frame of the page with this id.
+fn main_of(session: &Session, page_id: &str) -> String {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(found) = targets(session)
+            .iter()
+            .find(|r| r["metadata"]["page_id"] == page_id && r["metadata"]["main_frame"] == true)
+        {
+            return found["resource_id"].as_str().unwrap().to_string();
+        }
+        assert!(Instant::now() < deadline, "page {page_id} was not listed");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+fn call_within(session: &Session, op: Operation, timeout_ms: u64) -> Response {
+    let mut request = Request::new(Some(session.id().into()), op);
+    request.timeout_ms = timeout_ms;
+    session.execute(&request)
+}
+fn wait_until(session: &Session, resource: &str, name: &str, condition: WaitCondition) -> Response {
+    call_within(
+        session,
+        Operation::Wait {
+            resource_id: resource.into(),
+            locator: Box::new(Locator {
+                name: Some(name.into()),
+                ..Default::default()
+            }),
+            condition,
+            states: None,
+            max_nodes: 500,
+            interval_ms: Some(100),
+        },
+        10_000,
+    )
+}
+
+#[test]
+#[ignore = "requires isolated Chromium with its sandbox enabled; CI runs it explicitly"]
+fn wait_returns_an_element_that_appears_after_a_timer_ready_to_act_on() {
+    let _serial = serial();
+    let fixture = Fixture::new();
+    let (session, _) = session_for(&fixture);
+    let main = main_of(&session, &fixture.page_id);
+    // The fixture may still be committing its first document; a timer set in
+    // the outgoing one would never fire.
+    let loaded = wait_until(&session, &main, "Name", WaitCondition::Appears);
+    assert!(loaded.error.is_none(), "{loaded:?}");
+    fixture
+        .client()
+        .eval(
+            "setTimeout(() => { const b = document.createElement('button'); \
+             b.setAttribute('aria-label', 'Late'); b.textContent = 'Late'; \
+             b.onclick = () => document.getElementById('status').value = 'late:clicked'; \
+             document.body.appendChild(b); }, 700); true",
+        )
+        .unwrap();
+    let started = Instant::now();
+    let response = wait_until(&session, &main, "Late", WaitCondition::Appears);
+    assert!(response.error.is_none(), "{response:?}");
+    let data = response.data.unwrap();
+    assert!(started.elapsed() >= Duration::from_millis(500));
+    assert!(data["polls"].as_u64().unwrap() >= 2, "{data}");
+    assert_eq!(data["node"]["role"], "button");
+    let target: Target = serde_json::from_value(data["target"].clone()).unwrap();
+    let clicked = act(&session, target, Action::click());
+    assert!(clicked.error.is_none(), "{clicked:?}");
+    assert_eq!(status(&observe(&session, &main)), "late:clicked");
+    fixture
+        .client()
+        .eval("setTimeout(() => document.querySelector('[aria-label=Late]').remove(), 500); true")
+        .unwrap();
+    let gone = wait_until(&session, &main, "Late", WaitCondition::Disappears);
+    assert_eq!(gone.data.unwrap()["satisfied"], true);
+    let never = call_within(
+        &session,
+        Operation::Wait {
+            resource_id: main.clone(),
+            locator: Box::new(Locator {
+                name: Some("Never there".into()),
+                ..Default::default()
+            }),
+            condition: WaitCondition::Appears,
+            states: None,
+            max_nodes: 500,
+            interval_ms: Some(100),
+        },
+        1_000,
+    );
+    assert_eq!(never.error.unwrap()["code"], "CONTROL.WAIT_TIMEOUT");
+}
+
+fn visibility(fixture: &Fixture, page_id: &str) -> String {
+    let target = aad_cdp::Client::list_targets(fixture.port)
+        .unwrap()
+        .into_iter()
+        .find(|t| t.id == page_id)
+        .expect("page is listed");
+    aad_cdp::Client::attach(&target)
+        .unwrap()
+        .eval("document.visibilityState")
+        .unwrap()["result"]["value"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+#[test]
+#[ignore = "requires isolated Chromium with its sandbox enabled; CI runs it explicitly"]
+fn tabs_open_front_and_close_and_popups_name_their_opener() {
+    let _serial = serial();
+    let fixture = Fixture::new();
+    let (session, _) = session_for(&fixture);
+    let main = main_of(&session, &fixture.page_id);
+    assert!(wait_until(&session, &main, "Name", WaitCondition::Appears)
+        .error
+        .is_none());
+    let observed = observe(&session, &main);
+    let offered = &observed["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|n| n["role"] == "document")
+        .unwrap()["capabilities"];
+    for action in ["open_tab", "activate_page", "close_page"] {
+        assert!(
+            offered.as_array().unwrap().iter().any(|a| a == action),
+            "{action} on the document: {offered}"
+        );
+    }
+    let body = document(&session, &observed);
+    let refused = act(
+        &session,
+        body,
+        Action::OpenTab {
+            url: "javascript:alert(1)".into(),
+        },
+    );
+    assert_eq!(refused.error.unwrap()["code"], "CONTROL.INVALID_REQUEST");
+    let body = document(&session, &observe(&session, &main));
+    let opened = act(
+        &session,
+        body,
+        Action::OpenTab {
+            url: format!("{}second", fixture.url),
+        },
+    );
+    assert!(opened.error.is_none(), "{opened:?}");
+    let tab = opened.data.unwrap()["backend_result"]["page_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_ne!(tab, fixture.page_id);
+    let second = main_of(&session, &tab);
+    let arrived = wait_until(&session, &second, "Second marker", WaitCondition::Appears);
+    assert!(arrived.error.is_none(), "{arrived:?}");
+    assert_eq!(visibility(&fixture, &tab), "visible");
+    assert_eq!(visibility(&fixture, &fixture.page_id), "hidden");
+
+    // Front the first page again, then close the tab from its own document.
+    let body = document(&session, &observe(&session, &main));
+    let fronted = act(&session, body, Action::ActivatePage {});
+    assert!(fronted.error.is_none(), "{fronted:?}");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while visibility(&fixture, &fixture.page_id) != "visible" {
+        assert!(
+            Instant::now() < deadline,
+            "activate_page did not front the page"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let body = document(&session, &observe(&session, &second));
+    let closed = act(&session, body, Action::ClosePage {});
+    assert!(closed.error.is_none(), "{closed:?}");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while targets(&session)
+        .iter()
+        .any(|r| r["metadata"]["page_id"] == tab.as_str())
+    {
+        assert!(Instant::now() < deadline, "close_page left the tab open");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // A popup the page opens is listed with the page that opened it. A
+    // popup needs a user gesture, so the click is trusted pointer input.
+    let observed = observe(&session, &main);
+    let popup = find(&session, &observed, "button", "Popup");
+    let clicked = act(
+        &session,
+        popup,
+        Action::Click {
+            button: None,
+            count: None,
+            fraction: Some(Fraction { fx: 0.5, fy: 0.5 }),
+        },
+    );
+    assert!(clicked.error.is_none(), "{clicked:?}");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let popup = loop {
+        if let Some(found) = targets(&session).into_iter().find(|r| {
+            r["metadata"]["opener_page_id"] == fixture.page_id.as_str()
+                && r["metadata"]["main_frame"] == true
+        }) {
+            break found;
+        }
+        assert!(Instant::now() < deadline, "the popup was not listed");
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let resource = popup["resource_id"].as_str().unwrap();
+    let arrived = wait_until(&session, resource, "Second marker", WaitCondition::Appears);
+    assert!(arrived.error.is_none(), "{arrived:?}");
+    // The opener itself was opened by nobody.
+    assert!(targets(&session)
+        .iter()
+        .filter(|r| r["metadata"]["page_id"] == fixture.page_id.as_str())
+        .all(|r| r["metadata"]["opener_page_id"].is_null()));
+}
+
+#[test]
+#[ignore = "requires isolated Chromium with its sandbox enabled; CI runs it explicitly"]
+fn uploads_reach_file_inputs_only_from_allowed_directories() {
+    let _serial = serial();
+    let fixture = Fixture::new();
+    let allowed = std::env::temp_dir().join(format!("aad-upload-{}", uuid::Uuid::new_v4()));
+    let outside = std::env::temp_dir().join(format!("aad-upload-out-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&allowed).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(allowed.join("report.txt"), "hello").unwrap();
+    std::fs::write(allowed.join("notes.txt"), "n").unwrap();
+    std::fs::write(outside.join("secret.txt"), "secret").unwrap();
+    let path = |dir: &PathBuf, name: &str| dir.join(name).display().to_string();
+    let session = Session::new(
+        vec![Arc::new(BrowserBackend::new(fixture.port))],
+        Policy {
+            allow_input: true,
+            upload_roots: vec![allowed.clone()],
+            ..Default::default()
+        },
+    );
+    let main = main_of(&session, &fixture.page_id);
+    assert!(wait_until(&session, &main, "Name", WaitCondition::Appears)
+        .error
+        .is_none());
+    let observed = observe(&session, &main);
+    // A file input takes files and nothing else.
+    assert_eq!(actions(&observed, "Attachment"), vec!["upload".to_string()]);
+    assert_eq!(node(&observed, "Hidden upload")["states"]["hidden"], true);
+    let input = find(&session, &observed, "button", "Attachment");
+    let fill = act(
+        &session,
+        input,
+        Action::Fill {
+            value: "C:\\fakepath".into(),
+        },
+    );
+    assert_eq!(fill.error.unwrap()["code"], "CONTROL.ACTION_UNSUPPORTED");
+    for (files, code) in [
+        (vec![path(&outside, "secret.txt")], "POLICY.DENIED"),
+        (vec!["report.txt".to_string()], "CONTROL.INVALID_REQUEST"),
+        (
+            vec![path(&allowed, "missing.txt")],
+            "CONTROL.FILE_NOT_FOUND",
+        ),
+        (
+            vec![path(&allowed, "report.txt"), path(&allowed, "notes.txt")],
+            "CONTROL.INVALID_REQUEST",
+        ),
+    ] {
+        let observed = observe(&session, &main);
+        let input = find(&session, &observed, "button", "Attachment");
+        let refused = act(&session, input, Action::Upload { files });
+        assert_eq!(refused.commit_state, CommitState::NotCommitted);
+        assert_eq!(refused.error.unwrap()["code"], code);
+    }
+    assert_eq!(status(&observe(&session, &main)), "ready");
+    let observed = observe(&session, &main);
+    let input = find(&session, &observed, "button", "Attachment");
+    let uploaded = act(
+        &session,
+        input,
+        Action::Upload {
+            files: vec![path(&allowed, "report.txt")],
+        },
+    );
+    assert!(uploaded.error.is_none(), "{uploaded:?}");
+    let observed = observe(&session, &main);
+    assert_eq!(status(&observed), "files:report.txt:5");
+    assert_eq!(
+        node(&observed, "Attachment")["files"],
+        json!(["report.txt"])
+    );
+    // A hidden input behind a styled button still takes several files.
+    let input = find(&session, &observed, "button", "Hidden upload");
+    let uploaded = act(
+        &session,
+        input,
+        Action::Upload {
+            files: vec![path(&allowed, "report.txt"), path(&allowed, "notes.txt")],
+        },
+    );
+    assert!(uploaded.error.is_none(), "{uploaded:?}");
+    assert_eq!(
+        status(&observe(&session, &main)),
+        "hidden:report.txt,notes.txt"
+    );
+    drop(session);
+    // Without a grant every upload is refused.
+    let (session, _) = session_for(&fixture);
+    let main = main_of(&session, &fixture.page_id);
+    let observed = observe(&session, &main);
+    let input = find(&session, &observed, "button", "Attachment");
+    let refused = act(
+        &session,
+        input,
+        Action::Upload {
+            files: vec![path(&allowed, "report.txt")],
+        },
+    );
+    assert_eq!(refused.error.unwrap()["code"], "POLICY.DENIED");
+    let _ = std::fs::remove_dir_all(&allowed);
+    let _ = std::fs::remove_dir_all(&outside);
+}
+
+#[test]
+#[ignore = "requires isolated Chromium with its sandbox enabled; CI runs it explicitly"]
+fn downloads_land_in_the_session_directory_and_are_listed() {
+    let _serial = serial();
+    let fixture = Fixture::new();
+    // A browser attached by port is somebody's own: its downloads stay put.
+    {
+        let (session, backend) = session_for(&fixture);
+        targets(&session);
+        let attached = backend.downloads(Duration::from_secs(5)).unwrap();
+        assert_eq!(attached["tracking"], false, "{attached}");
+        assert_eq!(
+            attached["reason"],
+            "attached browser: downloads are not redirected"
+        );
+    }
+    // The fixture launched this one, so the session routes its downloads.
+    // Chromium resets the download setting when any browser-level DevTools
+    // client goes away, here the one above; the session sets it again.
+    let backend = Arc::new(BrowserBackend::launched(fixture.port));
+    let session = Session::new(
+        vec![backend.clone()],
+        Policy {
+            allow_input: true,
+            ..Default::default()
+        },
+    );
+    let main = main_of(&session, &fixture.page_id);
+    assert!(wait_until(&session, &main, "Name", WaitCondition::Appears)
+        .error
+        .is_none());
+    let before = backend.downloads(Duration::from_secs(5)).unwrap();
+    assert_eq!(before["tracking"], true, "{before}");
+    assert_eq!(before["downloads"], json!([]));
+    let observed = observe(&session, &main);
+    let link = find(&session, &observed, "link", "Get report");
+    assert!(act(&session, link, Action::click()).error.is_none());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let item = loop {
+        let listed = backend.downloads(Duration::from_secs(5)).unwrap();
+        if let Some(done) = listed["downloads"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|d| d["state"] == "completed")
+        {
+            break done.clone();
+        }
+        assert!(Instant::now() < deadline, "no completed download: {listed}");
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    assert_eq!(item["suggested_filename"], "report.txt");
+    assert!(item["url"].as_str().unwrap().ends_with("/download"));
+    assert_eq!(item["received_bytes"], 15);
+    let saved = PathBuf::from(item["path"].as_str().unwrap());
+    assert!(saved.starts_with(before["directory"].as_str().unwrap()));
+    assert_eq!(std::fs::read_to_string(&saved).unwrap(), "downloaded body");
+    // The page itself stayed where it was.
+    assert_eq!(status(&observe(&session, &main)), "ready");
+    // Releasing hands the browser its own setting back; nothing is routed after.
+    backend.release_downloads();
+    let released = backend.downloads(Duration::from_secs(5)).unwrap();
+    assert_eq!(released["tracking"], false, "{released}");
+    assert_eq!(released["downloads"].as_array().unwrap().len(), 1);
+    let _ = std::fs::remove_dir_all(before["directory"].as_str().unwrap());
+}
+
+fn only_dialog(observed: &Value) -> &Value {
+    let nodes = observed["nodes"].as_array().unwrap();
+    assert_eq!(
+        nodes.len(),
+        1,
+        "a blocked page shows only its dialog: {observed}"
+    );
+    assert_eq!(nodes[0]["role"], "alertdialog");
+    &nodes[0]
+}
+
+#[test]
+#[ignore = "requires isolated Chromium with its sandbox enabled; CI runs it explicitly"]
+fn dialogs_block_the_page_until_accepted_or_dismissed() {
+    let _serial = serial();
+    let fixture = Fixture::new();
+    let (session, _) = session_for(&fixture);
+    let main = main_of(&session, &fixture.page_id);
+    assert!(wait_until(&session, &main, "Name", WaitCondition::Appears)
+        .error
+        .is_none());
+
+    // A click that opens a prompt is delivered; the page then shows the prompt.
+    let observed = observe(&session, &main);
+    let ask = find(&session, &observed, "button", "Ask");
+    let started = Instant::now();
+    let clicked = act(&session, ask, Action::click());
+    assert!(clicked.error.is_none(), "{clicked:?}");
+    assert!(started.elapsed() < Duration::from_secs(5));
+    assert_eq!(
+        clicked.data.unwrap()["backend_result"]["dialog_opened"],
+        true
+    );
+    let listed = targets(&session);
+    let page = listed
+        .iter()
+        .find(|r| r["metadata"]["page_id"] == fixture.page_id.as_str())
+        .unwrap();
+    assert_eq!(page["metadata"]["dialog"]["type"], "prompt", "{page}");
+    assert_eq!(page["resource_id"], main.as_str());
+    let blocked = observe(&session, &main);
+    let dialog = only_dialog(&blocked);
+    assert_eq!(dialog["name"], "Your name?");
+    assert_eq!(dialog["value"], "guest");
+    assert_eq!(dialog["dialog"]["type"], "prompt");
+    assert_eq!(dialog["capabilities"], json!(["accept", "dismiss"]));
+    let target = find(&session, &blocked, "alertdialog", "Your name?");
+    let capture = call(
+        &session,
+        Operation::Capture {
+            target: target.clone(),
+        },
+    );
+    assert_eq!(capture.error.unwrap()["code"], "CONTROL.DIALOG_OPEN");
+    let accepted = act(
+        &session,
+        target,
+        Action::Accept {
+            text: Some("Ada".into()),
+        },
+    );
+    assert!(accepted.error.is_none(), "{accepted:?}");
+    assert_eq!(status(&observe(&session, &main)), "answer:Ada");
+
+    // A confirm: text is refused, dismiss answers false.
+    let observed = observe(&session, &main);
+    let sure = find(&session, &observed, "button", "Sure");
+    assert!(act(&session, sure, Action::click()).error.is_none());
+    let blocked = observe(&session, &main);
+    assert_eq!(only_dialog(&blocked)["dialog"]["type"], "confirm");
+    let target = find(&session, &blocked, "alertdialog", "Sure?");
+    let refused = act(
+        &session,
+        target,
+        Action::Accept {
+            text: Some("no".into()),
+        },
+    );
+    assert_eq!(refused.error.unwrap()["code"], "CONTROL.INVALID_REQUEST");
+    let blocked = observe(&session, &main);
+    let target = find(&session, &blocked, "alertdialog", "Sure?");
+    assert!(act(&session, target, Action::Dismiss {}).error.is_none());
+    assert_eq!(status(&observe(&session, &main)), "confirm:false");
+
+    // A dialog a timer opens: acting on an earlier target is refused at
+    // once instead of timing out, and nothing reaches the page.
+    fixture
+        .client()
+        .eval("setTimeout(() => alert('Timer fired'), 300); true")
+        .unwrap();
+    let observed = observe(&session, &main);
+    let name = find(&session, &observed, "textbox", "Name");
+    std::thread::sleep(Duration::from_millis(800));
+    let started = Instant::now();
+    let refused = act(
+        &session,
+        name,
+        Action::Fill {
+            value: "must not land".into(),
+        },
+    );
+    assert!(started.elapsed() < Duration::from_secs(3));
+    assert_eq!(refused.commit_state, CommitState::NotCommitted);
+    let failure = refused.error.unwrap();
+    assert_eq!(failure["code"], "CONTROL.DIALOG_OPEN");
+    assert_eq!(failure["details"]["dialog"]["message"], "Timer fired");
+    let blocked = observe(&session, &main);
+    assert_eq!(only_dialog(&blocked)["dialog"]["type"], "alert");
+    let target = find(&session, &blocked, "alertdialog", "Timer fired");
+    assert!(act(&session, target, Action::Accept { text: None })
+        .error
+        .is_none());
+    let observed = observe(&session, &main);
+    assert_ne!(node(&observed, "Name")["value"], "must not land");
+
+    // A dialog that opened before a session ever looked at the page cannot be
+    // answered through CDP: the browser lets only a connection that saw it
+    // open handle it, and the blocked renderer never answers a new one. It is
+    // listed as unresponsive, quickly, rather than hanging the listing.
+    drop(session);
+    fixture
+        .client()
+        .eval("setTimeout(() => alert('Early'), 200); true")
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(700));
+    let (late, _) = session_for(&fixture);
+    let started = Instant::now();
+    let listed = targets(&late);
+    assert!(started.elapsed() < Duration::from_secs(6));
+    let page = listed
+        .iter()
+        .find(|r| r["metadata"]["page_id"] == fixture.page_id.as_str())
+        .unwrap();
+    assert_eq!(page["metadata"]["responsive"], false, "{page}");
+    assert_eq!(page["capabilities"], json!([]));
+    let seen = call_within(
+        &late,
+        Operation::Observe {
+            resource_id: page["resource_id"].as_str().unwrap().into(),
+            max_nodes: 500,
+            view: Default::default(),
+        },
+        10_000,
+    );
+    assert_eq!(seen.error.unwrap()["code"], "BROWSER.PAGE_UNRESPONSIVE");
+}
+
 #[test]
 #[ignore = "requires isolated Chromium with its sandbox enabled; CI runs it explicitly"]
 fn browser_actions_are_observed_document_bound_and_have_real_page_effects() {
+    let _serial = serial();
     let fixture = Fixture::new();
     let session = Session::new(
         vec![Arc::new(BrowserBackend::new(fixture.port))],

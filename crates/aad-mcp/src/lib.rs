@@ -10,6 +10,7 @@
 
 pub mod browser_tools;
 pub mod control_tools;
+pub mod durable_tools;
 pub mod protocol;
 pub mod tools;
 
@@ -47,6 +48,8 @@ pub struct Server {
     active_control: Mutex<BTreeMap<String, String>>,
     /// The browser and recording started through the browser tools.
     browsers: browser_tools::Browsers,
+    /// Durable workflow runs this server started or resumed.
+    runs: durable_tools::Runs,
 }
 
 impl Server {
@@ -83,6 +86,7 @@ impl Server {
             unavailable,
             active_control: Mutex::new(BTreeMap::new()),
             browsers: browser_tools::Browsers::default(),
+            runs: durable_tools::Runs::default(),
         }
     }
 
@@ -114,6 +118,7 @@ impl Server {
             unavailable: None,
             active_control: Mutex::new(BTreeMap::new()),
             browsers: browser_tools::Browsers::default(),
+            runs: durable_tools::Runs::default(),
         }
     }
 
@@ -124,8 +129,23 @@ impl Server {
         self
     }
 
+    /// Keep durable runs in this store instead of the per-user default.
+    pub fn with_run_store(mut self, path: std::path::PathBuf) -> Self {
+        self.runs = std::mem::take(&mut self.runs).with_store(path);
+        self
+    }
+
+    /// Hold durable run leases this long between renewals.
+    pub fn with_run_lease_ttl_seconds(mut self, seconds: f64) -> Self {
+        self.runs = std::mem::take(&mut self.runs).with_lease_ttl_seconds(seconds);
+        self
+    }
+
     pub fn disconnect(&self) {
         self.control.disconnect();
+        // Durable runs ask to pause at their next step boundary; whatever is
+        // still inside a step when the process exits is left for resume.
+        self.runs.shutdown();
     }
 
     /// Local tools are offered only to an unrestricted local session: a
@@ -139,7 +159,9 @@ impl Server {
                 .as_ref()
                 .is_none_or(|session| control_tools::granted(name, session.policy()));
         }
-        (LOCAL_TOOLS.contains(&name) || browser_tools::NAMES.contains(&name))
+        (LOCAL_TOOLS.contains(&name)
+            || durable_tools::NAMES.contains(&name)
+            || browser_tools::NAMES.contains(&name))
             && self.local.as_ref().is_some_and(|session| {
                 let policy = session.policy();
                 policy.providers.is_empty() && policy.resources.is_none()
@@ -224,7 +246,10 @@ effect; never retry it automatically.",
                 "\n\nFor work that has been recorded before, prefer a saved workflow: \
 list_workflows shows what exists, describe_workflow reports the inputs it takes without \
 running it, and run_workflow runs it. That is more reliable than rebuilding the same \
-sequence of actions each time.",
+sequence of actions each time. A long workflow can run with durable: true, which \
+journals it so it survives this server exiting; follow it with workflow_run_status and \
+workflow_run_events, and stop or continue it with workflow_run_pause, \
+workflow_run_cancel and workflow_run_resume.",
             );
         }
         if self.offers("desktop_launch") && self.local.is_some() {
@@ -311,7 +336,8 @@ notifications/cancelled to request cancellation of an in-flight JSON-RPC request
             .as_ref()
             .expect("local tools need a local session");
         let writes = matches!(name, "save_workflow" | "run_workflow")
-            || (browser_tools::NAMES.contains(&name) && name != "browser_profiles");
+            || durable_tools::MUTATING.contains(&name)
+            || (browser_tools::NAMES.contains(&name) && !browser_tools::READ_ONLY.contains(&name));
         if writes && !self.allows_input() {
             return Ok(content(
                 &json!({
@@ -329,6 +355,12 @@ notifications/cancelled to request cancellation of an in-flight JSON-RPC request
                 Err(payload) => content(&payload, true),
             });
         }
+        if durable_tools::NAMES.contains(&name) {
+            return Ok(match self.runs.call(session, name, &arguments) {
+                Ok(result) => content(&result, false),
+                Err(payload) => content(&parse_payload(&payload), true),
+            });
+        }
         if name != "run_workflow" {
             // These need no desktop: `probe_environment` exists to explain why
             // the desktop is unavailable, and the workflow tools read the store.
@@ -338,22 +370,52 @@ notifications/cancelled to request cancellation of an in-flight JSON-RPC request
             });
         }
 
-        // A workflow drives the desktop like control_act does: one gate, one
-        // input owner, the session's own provider instances.
-        let through_session = match tools::steps_through_session(&arguments) {
-            Ok(steps) => steps,
-            Err(payload) => return Ok(content(&parse_payload(&payload), true)),
-        };
-        let gate = session.gate();
-        let _serialized = (!through_session).then(|| gate.lock().unwrap());
-        let _lease = match session.input_lease("desktop-input") {
-            Ok(lease) => lease,
-            Err(error) => return Ok(content(&error.to_json(), true)),
-        };
-        Ok(match tools::run_workflow(session, &arguments) {
+        if !tools::wants_durable(&arguments) {
+            let (payload, is_error) = run_in_memory(session, &arguments);
+            return Ok(content(&payload, is_error));
+        }
+        Ok(match self.runs.start(session, &arguments) {
             Ok(result) => content(&result, false),
-            Err(payload) => content(&parse_payload(&payload), true),
+            Err(durable_tools::StartError::Failed(payload)) => {
+                content(&parse_payload(&payload), true)
+            }
+            Err(durable_tools::StartError::Refused(refusal)) => {
+                // Falling back is the caller's decision, never ours: an
+                // in-memory run cannot be followed up or resumed.
+                if arguments.get("fallback_in_memory").and_then(Value::as_bool) != Some(true) {
+                    return Ok(content(&refusal, true));
+                }
+                let memory = json!({
+                    "name": arguments.get("name").cloned().unwrap_or(Value::Null),
+                    "inputs": arguments.get("inputs").cloned().unwrap_or(Value::Null),
+                });
+                let (mut payload, is_error) = run_in_memory(session, &memory);
+                payload["durable"] = json!(false);
+                payload["durable_refusal"] = refusal;
+                content(&payload, is_error)
+            }
         })
+    }
+}
+
+/// Run a saved workflow in memory, as `run_workflow` without `durable` does.
+///
+/// A workflow drives the desktop like control_act does: one gate, one input
+/// owner, the session's own provider instances.
+fn run_in_memory(session: &Arc<aad_control::Session>, arguments: &Value) -> (Value, bool) {
+    let through_session = match tools::steps_through_session(arguments) {
+        Ok(steps) => steps,
+        Err(payload) => return (parse_payload(&payload), true),
+    };
+    let gate = session.gate();
+    let _serialized = (!through_session).then(|| gate.lock().unwrap());
+    let _lease = match session.input_lease("desktop-input") {
+        Ok(lease) => lease,
+        Err(error) => return (error.to_json(), true),
+    };
+    match tools::run_workflow(session, arguments) {
+        Ok(result) => (result, false),
+        Err(payload) => (parse_payload(&payload), true),
     }
 }
 
@@ -672,6 +734,30 @@ mod tests {
             assert!(is_error, "{name}");
             assert_eq!(payload["code"], "POLICY.DENIED", "{name}");
         }
+    }
+
+    #[test]
+    fn listing_downloads_is_read_only_and_says_when_no_browser_is_attached() {
+        let server = Server::without_driver("no desktop");
+        let listed = server.handle(&request("tools/list", json!({}))).unwrap();
+        let tool = listed["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == "browser_downloads")
+            .cloned()
+            .expect("offered on a local session");
+        assert_eq!(tool["inputSchema"]["additionalProperties"], false);
+        let response = server
+            .handle(&request(
+                "tools/call",
+                json!({"name": "browser_downloads", "arguments": {}}),
+            ))
+            .unwrap();
+        let (is_error, payload) = tool_payload(&response);
+        assert!(is_error);
+        // Not refused as a write on this read-only server: there is just no browser.
+        assert_eq!(payload["code"], "BROWSER.NOT_CONNECTED", "{payload}");
     }
 
     #[test]

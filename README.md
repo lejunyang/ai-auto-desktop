@@ -253,6 +253,9 @@ postcondition:
 `aad run` 跑在内存里，进程退出即结束。需要一个能跨进程存活的运行时，用 `aad start`：
 状态落在 SQLite 里，另一个进程随时可以查、可以接管。
 
+`--store` 可省略：默认是每用户一份的 `~/.ai-auto-desktop/runs.sqlite3`（`AAD_RUN_STORE` 可覆盖），
+MCP 的 `run_workflow` 持久模式也写这里，所以 AI 起的运行能直接用 `aad status` / `aad resume` 跟进。
+
 ```powershell
 aad start workflow.yaml --store runs.sqlite3 --run-id job-1
 aad status job-1  --store runs.sqlite3     # 进度、当前状态、检查点
@@ -292,7 +295,7 @@ aad mcp --allow-input    # 由启动它的人授予输入
 
 在 stdio 上说 JSON-RPC 2.0，protocolVersion `2024-11-05`。工具分两类：
 
-**看与做**：`control_capabilities`、`control_targets`、`control_observe`、`control_find`、`control_act`、
+**看与做**：`control_capabilities`、`control_targets`、`control_observe`、`control_find`、`control_wait`、`control_act`、
 `control_capture`、`control_cancel`、`control_close`，另有不需要桌面的 `probe_environment`。
 
 - `control_targets` 列出窗口、应用和浏览器页面；`control_observe` 默认返回有上限的 outline（可操作或有名字的元素，
@@ -301,9 +304,13 @@ aad mcp --allow-input    # 由启动它的人授予输入
 - `control_find` 只返回唯一一个节点；匹配多个时报错并列出候选。定位器支持 role、name、node_id，
   Windows 上还支持 automation_id、class_name、value、states、`match: contains`、`within`、`near`、`nth`；
   其他平台遇到这些字段会明确拒绝，不会忽略。`expect: optional` 用来问"这个东西没了吗"。
+- `control_wait` 反复观察一个目标，直到定位到的元素出现（`appears`）、消失（`disappears`）或达到给定 `states`（`state`），
+  或 `timeout_ms` 用完（`CONTROL.WAIT_TIMEOUT`）；出现时直接返回可以 act 的 target。所有 provider 都有，多个匹配不算找到。
 - `control_act` 的动作：focus、invoke、click（可选 button、count、元素内 fraction）、fill、type_text（unicode/keys）、
   key、scroll、hover、drag（终点必须是同一次观察里的另一个节点）、select（列表框选项）、check（复选框、开关、单选），
-  以及浏览器页面的 navigate（只限 http/https）、back、forward、reload。位置只能是元素内 0..1 的比例。
+  以及浏览器页面的 navigate（只限 http/https）、back、forward、reload，标签页的 open_tab、activate_page、close_page，
+  JavaScript 对话框的 accept（prompt 可带 text）、dismiss，文件框的 upload（只能读启动时 `--allow-upload-dir` 给出的目录）。
+  页面打开的弹窗在 `control_targets` 里带 `metadata.opener_page_id`。位置只能是元素内 0..1 的比例。
   以观察结果里每个节点的 `capabilities` 为准。浏览器里普通 click 是 DOM 激活；带位置、按键或双击时改发可信的指针事件，
   落点被别的元素盖住时拒绝（`CONTROL.OCCLUDED`），不会点到盖在上面的东西。
 - `control_capture` 给一个观察到的元素截 PNG（目前限浏览器页面，密码框拒绝），同时返回 `digest`：
@@ -316,6 +323,7 @@ aad mcp --allow-input    # 由启动它的人授予输入
 `browser_record_start` / `browser_record_stop` 记录一个页面：页面上的动作和引起的变化、网络请求与响应正文
 （默认保留原值，`redact_network` 才抹掉敏感字段）、WebSocket 消息和关键时刻的截图，停止时给出写入的目录和文件。
 `browser_open` 带 `record` 时在打开网址之前就开始记录。这些是过程数据，据此写技能、筛接口由 Agent 自己做。
+`browser_downloads`（只读）列出浏览器下载到本会话专用目录的文件：网址、建议文件名、状态、字节数和保存路径。
 
 一个例子：打开浏览器到登录页 → `control_capture` 二维码发给人扫 → 隔几秒比对 digest，变了就重发 →
 登录后在页面上操作 → `browser_record_stop` → 读 `evidence/network.jsonl` 找到返回订单数据的接口。
@@ -354,6 +362,22 @@ run_workflow(greeter, ...)  → {"status":"succeeded","outputs":{...}}
   不提供工作流工具：工作流按窗口名自己找窗口，这类授权管不住它。
 - store 与 GUI 共用同一个目录（`AAD_RECORDINGS_DIR` 可覆盖），GUI 里录完存下的东西
   AI 立刻能看到。
+
+**持久运行**（长流程、要跨进程跟进的）：`run_workflow` 传 `durable: true`（显式开启，默认仍是内存运行），
+经 `DurableExecutor` 写入与 `aad start` 相同的每用户运行库；随后用 `workflow_run_status`（状态、当前步骤、
+输出或错误、`unknown_effect` 详情与下一步建议）、`workflow_run_list`、`workflow_run_events`（`after_seq` +
+`limit` 分页）跟进，用 `workflow_run_pause` / `workflow_run_cancel` / `workflow_run_resume` 控制
+（这三个是写操作，只读服务器上被拒）。
+
+- **持久模式的限制原样保留**：拒绝 `script`、写 action、敏感输入输出；顶层只读 action 需要显式
+  `durable_actions: "read_only"`。被拒时返回 `DURABLE.*` 错误（`run_created=false`，什么都没执行），
+  **不会悄悄改成内存运行**——只有调用方传 `fallback_in_memory: true` 才回退，并在 `durable_refusal` 里说明原因。
+- **长流程不阻塞调用**：执行器在服务器后台线程里跑，调用最多等 `wait_ms`（默认 20 秒，上限 120 秒），
+  超时就返回 `run_id` 与 `status=running`。
+- **服务器退出时**：客户端断开会对正在跑的运行请求 pause 并等待约 2 秒，处于步骤边界的运行干净地停成 `paused`；
+  进程直接死掉时运行保持 `running`，租约（默认 60 秒）过期后 `workflow_run_resume` 或 `aad resume` 才能接管。
+  停在步骤之间的从检查点继续；死在步骤中途的落 `unknown_effect`，**不会自动重放**。
+- `workflow_run_resume` 需要原工作流名；工作流改过（plan digest 不同）会被拒。输入沿用创建时持久化的值。
 
 该模式下 stdout 由协议独占，任何诊断信息都走 stderr，客户端解析不会错位。失败会以结构化
 错误返回，并附带可执行的恢复建议（例如界面已变化时提示"重新读取窗口后重试"）。
