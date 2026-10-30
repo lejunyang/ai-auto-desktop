@@ -434,6 +434,8 @@ README 里写得很硬：MCP 工具 schema **不接受任何** `x`/`y`/`point`/`
 
 **全局快捷键是唯一真正的例外**，因为它按定义不属于任何元素（Win+D、Cmd+Space、Alt+Tab）。建议：单独一个 action 类型、单独一条 policy 开关、默认关闭，并且在 workflow descriptor 里必须显式声明。**不要为了它把整套锚定机制放松。**
 
+> 实现状态（Windows）：已按此落地为 `control_global_key` / 协议操作 `global_key`，独立的 `--allow-global-keys` 开关（还需 `--allow-input`），默认关闭，只在授权时出现在 `control_capabilities`；复用原子 chord 与修饰键清理，拒绝 Ctrl+Alt+Del、Win+L 和安全桌面，成功时 commit_state 为 `unknown`。详见 `docs/control-sessions.md`。保存的工作流步骤尚不能包含它（未做 descriptor 显式声明）。
+
 ### 4.3 effect 语义要更保守
 
 项目现有的 `effect` 三态（`not_applied` / `contextual` / `unknown`）在这里要用得更严：

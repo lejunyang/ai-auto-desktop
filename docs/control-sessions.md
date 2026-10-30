@@ -8,7 +8,7 @@
 
 | provider | 类型化动作 | 实际语义 / 限制 |
 | --- | --- | --- |
-| `desktop.windows_uia` | focus, invoke, click, fill, type_text, key, scroll, hover, drag | UIA + 原生输入；click 带 button/count/fraction 时走原生手势；节点必须暴露对应能力 |
+| `desktop.windows_uia` | focus, invoke, click, fill, type_text, key, scroll, hover, drag, paste, minimize, maximize, restore, close_window, activate | UIA + 原生输入；click 带 button/count/fraction 时走原生手势；节点必须暴露对应能力。指针动作先对落点做 UIA 命中检查，键盘动作先证明窗口在前台、焦点在元素内（见下文）。另有只读的 capture / read_text，以及需单独授权的 launch、clipboard_read、global_key |
 | `desktop.linux_atspi` | focus, invoke, click, fill, type_text, key, scroll, hover, drag | AT-SPI；指针/键盘经 X11 XTest helper，只支持 KDE/X11 会话；派发前核对焦点、PID 与落点，drag 起止两点都核对 |
 | `desktop.macos_ax` | focus, invoke, click, fill, type_text, key, scroll, hover, drag | AX helper；需要同一登录用户的辅助功能权限；指针动作要求目标应用在前台并经 AX 命中检查，事件只投递给目标进程；key 名称按字面（`ctrl` 是 Control，`cmd` 是 Command） |
 | `browser.cdp` | focus, click, fill, key, scroll, hover, select, check, navigate, back, forward, reload | 普通 click 为 `HTMLElement.click()` 的 DOM 激活；带 button/count/fraction 的 click、scroll、hover 为主 frame 的可信 CDP Input，落点先在页面里命中检查；fill/select 为 DOM 值及 input/change 事件；check 已是目标状态时不点击；key 为主 frame 的 CDP Input；navigate/back/forward/reload 在 body 节点上，只限主 frame；没有 drag |
@@ -25,7 +25,83 @@ DOM click/fill 的事件 `isTrusted=false`，并不等价于原生指针或真�
 `mode`（unicode/keys）；`scroll` 要 `direction`，可带 `notches`（1..30）、`fraction`；`hover` 可带
 `ms`（1..5000，默认 500）、`fraction`；`drag` 要 `to`（同一次观察里另一个节点的 target），可带
 `button`、`fraction`、`to_fraction`；`select` 要 `option`（选项文字或值，观察节点的 `options` 列出文字）；
-`check` 要 `checked`；`navigate` 要 `url`。`fraction` 是元素框内 0..1 的比例，不是屏幕坐标。
+`check` 要 `checked`；`navigate` 要 `url`；`paste` 要 `text`（1..4096）。`fraction` 是元素框内 0..1 的比例，不是屏幕坐标。
+`capabilities` 每个 provider 另列 `reads`（`capture`、`read_text`），并只在授权时列出 `launch`（允许启动的程序）、
+`clipboard_read: true`、`global_keys: true`。
+
+## 桌面截图、OCR、窗口、启动、剪贴板与全局快捷键（Windows）
+
+| 能力 | 入口 | 授权 | 语义 |
+| --- | --- | --- | --- |
+| 截图 | `capture` / MCP `control_capture` | 只读 | 观察过的节点重新校验后按实时边界裁剪；窗口自身的根节点截整个窗口（去掉不可见的缩放边框）。回答与浏览器相同：`format`/`data`/`width`/`height`/`clipped` + 会话加的 `digest` |
+| OCR | `read_text` / MCP `control_read_text` | 只读 | 对 capture 的同一批像素跑 Windows.Media.Ocr，回答 `text`、`lines`（含 `words`），位置是元素框内比例 `box: {fx, fy, fw, fh}`，并带同一 `digest`；可选 `language`（BCP-47） |
+| 窗口动作 | `act` 的 minimize / maximize / restore / close_window / activate | `--allow-input` | 只在窗口根节点上提供，按窗口当前状态与能力标注；先 UIA WindowPattern，没有时对锚定的 HWND 用 ShowWindow / WM_CLOSE；等待（有上限）状态真的达到，否则 effect unknown |
+| 粘贴 | `act` 的 `paste` | `--allow-input` | 可聚焦、可写、非密码元素；见下文 |
+| 启动程序 | `launch` / MCP `desktop_launch` | `--allow-input` + `--allow-launch <程序>`（可重复） | 只能启动白名单里逐字列出的程序，参数作为 argv 传入；等待（有上限）新窗口并作为 resource 返回 |
+| 读剪贴板 | `clipboard_read` / MCP `clipboard_read` | `--allow-clipboard-read`（与输入授权分开，默认关） | 只读文本，`max_characters` 1..65536（默认 16384），回报完整长度；来源标了 `ExcludeClipboardContentFromMonitorProcessing`（密码管理器）时拒绝 `DRIVER.CLIPBOARD_PROTECTED` |
+| 全局快捷键 | `global_key` / MCP `control_global_key` | `--allow-input` + `--allow-global-keys`（默认关） | 唯一不锚定元素的输入；见下文 |
+
+```powershell
+aad mcp --allow-input --allow-launch notepad.exe --allow-launch "C:\Tools\app.exe"
+aad mcp --allow-clipboard-read                 # 只读剪贴板，不授予输入
+aad mcp --allow-input --allow-global-keys      # 允许 Win+D、Alt+Tab 一类
+```
+
+未授权时本机 MCP 不在 `tools/list` 列出 `desktop_launch`、`clipboard_read`、`control_global_key`，
+调用仍会到达会话并以 `POLICY.DENIED` 拒绝；远程连接总列出它们，由远端服务的授权决定。
+
+**截图方法。** 用 `PrintWindow(PW_RENDERFULLCONTENT)` 让窗口自己渲染，而不是从屏幕 BitBlt：截图里永远不会
+出现盖在目标上的其他应用窗口（不泄露别的程序的内容），目标也不必在前台。代价：最小化窗口没有画面
+（拒绝 `DRIVER.WINDOW_MINIMIZED`，先 `restore`），不响应该请求的应用会渲染成黑色。密码元素拒绝
+`DRIVER.PROTECTED_ELEMENT`；被滚出视野（offscreen）的元素拒绝。单边最多 8192 像素（超出 `clipped: true`）。
+PNG 编码是确定的：同样的像素得到同样的 digest。
+
+**DPI 与多显示器。** Windows 后端在第一次 UIA 调用前把进程设为 Per-Monitor v2 DPI aware：UIA 边界、窗口矩形、
+SendInput 归一化用的虚拟屏幕范围和截图像素全部是物理像素。此前进程是 DPI unaware，缩放屏上落点被量化，
+混合 DPI 多显示器时副屏窗口的虚拟化矩形与虚拟屏幕对不上。DPI 虚拟化的窗口（unaware，或另一缩放比的
+system aware）只按逻辑尺寸渲染，截图会按物理窗口尺寸缩放，与 UIA 报告的物理边界对齐（清晰度与屏幕上一致）。
+所有指针手势共用一个归一化函数，单元测试覆盖了每个像素（含负原点的虚拟屏幕）往返一致；原先 `pointer_click`
+按整宽归一化，会落到左上一像素。
+
+**指针与键盘的落点证明。** 抬窗口到前台可能被前台锁拒绝，此前仍照样发送输入，点击会落到盖在那里的东西上
+（实测 fixture 的一次点击落到了 fixture 外面）。现在：指针手势发送前用 UIA `ElementFromPoint` 命中检查落点，
+必须是该元素、其内部或其容器（不是桌面、兄弟或别的窗口），否则 `DRIVER.OCCLUDED`、effect not_applied，
+且不说出遮挡者是谁（可能属于别的应用）；键盘（type_text、key、paste 的 Ctrl+V）发送前证明窗口在前台、
+焦点在元素内，否则 `DRIVER.FOCUS_LOST`，一个键也不发。前台切换失败时退而 `AttachThreadInput` 到前台线程，不合成任何输入。
+
+**OCR。** Windows 自带的 Windows.Media.Ocr：离线、无需安装引擎，每个已安装的 OCR 语言包一个识别器
+（本机：en-US、ja、zh-Hans-CN）。没有对应语言包时 `DRIVER.OCR_UNAVAILABLE` 并在 `details.available_languages`
+列出已装的。没有用 `aad-ocr`：它驱动 Tesseract，默认未安装，且在 Windows 上没有资源沙箱时拒绝运行。
+识别出的行是只读输出，不是 act 的目标：要对某个词操作，就对它所在的元素 `click` 并给出该词中心的
+`fraction`（fx + fw/2, fy + fh/2），这仍锚定在被观察、被重新校验的元素上；内容可能已移动时先重新读。
+OCR 会混淆 I 与 l 等字符。其他 provider 明确拒绝。
+
+**粘贴。** 先复制剪贴板里所有内存型格式（GDI 句柄格式如位图、图元文件除外，位图仍以 CF_DIB 保存；超过 32 MiB
+时拒绝 `DRIVER.CLIPBOARD_TOO_LARGE`，不丢用户的内容），再以延迟渲染提供文字：只有目标进程来取时才给出，
+剪贴板历史、剪贴板管理器、同步工具来取一律拒绝，并带 `ExcludeClipboardContentFromMonitorProcessing`、
+`CanIncludeInClipboardHistory=0`、`CanUploadToCloudClipboard=0` 让守规矩的监视者（包括 Windows 剪贴板历史）不来取。
+经典 Win32 Edit/RichEdit 直接向该控件窗口发 `WM_PASTE`（消息，不受键盘钩子影响、不需前台）；其他控件在证明焦点后发
+Ctrl+V。目标真正来取时才算粘贴完成，之后恢复原剪贴板；1 秒内若有同步工具把提供时的标记重新发布回来，再恢复一次。
+目标始终没来取：`DRIVER.PASTE_NOT_CONSUMED`、effect unknown（快捷键已送到元素）。任何出口都会恢复剪贴板。
+注意：恢复是把原内容重新写入，会成为一次新的剪贴板变更（原主程序的延迟格式此时被渲染成数据）。
+实测（本机运行着 AutoHotkey、SnipDo、一个远程剪贴板同步和厂商 PC 管家）：Ctrl+V 只有约三分之一到达聚焦的 fixture Edit，
+`WM_PASTE` 每次都到；同步工具曾在恢复后把提供时的标记回写，现由回写检查修复。
+
+**启动程序。** 不经 shell、`start` 或文件/URL 关联：可执行文件以 argv 直接启动，标准流与服务（可能承载协议本身）分离，
+Windows 上控制台程序得到自己的控制台。只接受 `.exe`（`.bat/.cmd/.lnk` 等会经 cmd 或关联）；shell、脚本宿主和关联启动器
+（cmd、powershell、pwsh、explorer、rundll32、mshta、wscript、sh、bash、xdg-open、open……）即使在白名单里也拒绝，因为它们的参数
+会把这些都带回来。白名单项可以是绝对路径或 PATH 上的裸名；客户端必须逐字给出某一项。白名单里放解释器（python 等）
+等于授予任意代码执行，由操作者负责。等待新进程的窗口（或同一映像的新窗口——启动器把工作交给另一个进程时），
+返回的 resource 可直接 observe。
+
+**全局快捷键。** 唯一不锚定元素的输入，独立动作、独立授权、默认关闭。复用 `key` 的原子 SendInput 和修饰键泄漏清理，
+取输入租约，并使已有观察失效。成功时 effect 为 `dispatched`、commit_state `unknown`、`verified: false`：按键落在当时
+的焦点上，没有锚定也无法验证，调用者必须重新观察，不能盲目重复。拒绝 Ctrl+Alt+Del（不能合成）与 Win+L（会锁住所有人），
+输入桌面不是用户桌面（UAC 提示、锁屏）时 `DRIVER.SECURE_DESKTOP`、什么也不发。
+
+**不支持。** UAC / 安全桌面自动化一律拒绝。窗口的 resize / move 需要坐标，不提供。Linux AT-SPI 与 macOS AX 不提供
+capture、read_text、窗口动作、paste、clipboard_read、global_key，明确返回 `CONTROL.ACTION_UNSUPPORTED`
+（AT-SPI 已有经宿主 artifact store 的 `capture_target`，尚未接入 `control_capture`）。
 
 ## 观察视图与定位器
 
@@ -66,10 +142,11 @@ aad mcp --allow-input --allow-profile-copy  # browser_open 可以复制已有 pr
 `browser_record_*` 复用 `aad_cdp::recording` 写到存储目录的 `browser/<时间>-<id>/`。
 `Capture { target }` 是只读操作：浏览器把元素滚进视口后用 `Page.captureScreenshot` 按元素框裁剪
 （最大 4096×8192，超出时 `clipped: true`），会话加上 PNG 的 sha256 作为 `digest`。只支持主框架；
-其他 provider 返回 `CONTROL.ACTION_UNSUPPORTED`。
+Windows 桌面窗口见上文；其他 provider 返回 `CONTROL.ACTION_UNSUPPORTED`。
 
 MCP 工具为 `control_capabilities`, `control_targets`, `control_observe`, `control_find`,
-`control_act`, `control_cancel`, `control_close`，本机未限定授权时另有 `probe_environment` 与四个工作流工具。
+`control_act`, `control_capture`, `control_read_text`, `control_cancel`, `control_close`，
+授权时另有 `desktop_launch`、`clipboard_read`、`control_global_key`；本机未限定授权时另有 `probe_environment` 与四个工作流工具。
 每次调用可带 `request_id` 与 `timeout_ms`。`control_cancel` 的被取消请求字段名为 `target_request_id`；
 MCP cancellation notification 也能取消仍在执行的统一操作。错误响应带 `hint`，说明可行的恢复方式。
 原先按动作拆开的 Windows MCP 工具（`list_apps`、`describe_window`、`find_element`、`invoke` 等）已移除，
@@ -150,7 +227,8 @@ CDP 仅接受 loopback 调试地址，显式 `--browser-port` 才启用；不会
 
 `aad_control::steps` 定义平台无关的步骤：`app`（provider、进程或应用名、标题片段、网址前缀，
 必须恰好匹配一个目标）、`locator`、`action`（不含会话引用；drag 的终点写在 `to`）或 `check`
-（`present` 与 `within_ms`），以及可选的 `input`（fill/type_text 的文字运行时传入，敏感值不落盘）。
+（`present` 与 `within_ms`），以及可选的 `input`（fill/type_text/paste 的文字运行时传入，敏感值不落盘）。
+窗口动作也可以保存为步骤（定位窗口根节点）。
 回放时列目标 → 选出唯一的应用 → observe → find → act，每次都重新定位。
 
 录制文档是 `kind: Recording`、`format: control-steps/1`；编译出的工作流只用
@@ -192,6 +270,20 @@ Windows 上 `tests/windows/verify_*_effect.py` 用自建的隔离探针窗口，
 按键输入和保存的工作流，由 Raw Input 日志独立确认。所有 GUI fixture 串行执行。
 CI 和 release 工作流使用官方 one-sdk Action 最新正式版本，不依赖 pending one-sdk PR。
 
+Windows 真机（Windows 11、单显示器 3840×2400、250% 缩放）上，`cargo test -p aad-uia --test windows_native -- --ignored --test-threads=1`
+用测试自建、自毁的窗口检查可观察效果：纯色色块截出恰好 120×80 个已知颜色像素，根节点截图包含未缩放的色块，
+DPI unaware 窗口的色块截成其 300×200 物理边界；被置顶窗口盖住的元素点击被拒绝且遮挡窗口没有收到点击；
+GDI 画出的 "Invoice 4217"（UIA 只看到窗口文字）被 OCR 读成一行两个词且位置正确；maximize/restore/minimize/activate/close_window
+各自达到 IsZoomed/IsIconic/GetForegroundWindow/IsWindow 读回的状态；paste 后 Edit 的值由 ValuePattern 读回、剪贴板文字与之前一致；
+activate 后 Shift+F9 以 F9 加 Shift 到达 fixture 窗口，Shift 随后松开。
+`cargo test -p aad-control --test windows_control -- --ignored --test-threads=1` 让测试程序启动自身的一个副本：
+其窗口作为 resource 返回，经会话 observe、capture 后 close_window 关闭；cmd.exe、不在白名单、只读会话的启动都被拒绝。
+
+[待验证] 混合 DPI 的多显示器（以及虚拟屏幕负原点的真实副屏）：只有单显示器可测，归一化往返由单元测试覆盖。
+[待验证] paste 的 Ctrl+V 路径（非经典控件，如 WPF、Chromium、UWP 文本框）未在真实目标上验证；本机的键盘钩子工具使 Ctrl+V 不可靠。
+[待验证] `desktop_launch` 在 Linux/macOS：会话层代码可移植（`launch.rs` 已为 linux-gnu 与 apple-darwin 目标做类型检查），
+按 `metadata.process_id` 匹配新的 AT-SPI 应用 / AX 应用，但未在这两个平台运行；Windows 11 记事本这类把工作交给另一进程的启动器
+只按映像名匹配新窗口，未用真实应用验证。
 [待验证] 本云容器不能启动本机 Chromium 沙箱，浏览器实际效果由 GitHub Linux CI 验证。
 [待验证] Linux 上新的 CLI 段、双击和 Ctrl+A 只在 CI 的 Xvfb 环境里跑，本机只编译了 helper 并跑了单元测试；
 右键、滚轮、悬停、拖拽在 Linux 上还没有观察效果的 fixture。
