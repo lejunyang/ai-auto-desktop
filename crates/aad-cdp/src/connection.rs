@@ -144,6 +144,49 @@ impl Connection {
         result
     }
 
+    /// Send several commands before waiting for any reply, so a run of
+    /// independent calls costs one round trip instead of one each. Replies
+    /// come back in the order the commands were given.
+    pub fn pipeline(
+        &mut self,
+        messages: &[(u64, Value)],
+        deadline: Instant,
+    ) -> Vec<Result<Value, CdpError>> {
+        let mut waiting = Vec::with_capacity(messages.len());
+        {
+            let mut state = self.inbox.lock().unwrap();
+            if let Some(error) = &state.failure {
+                return messages.iter().map(|_| Err(error.clone())).collect();
+            }
+            for (id, _) in messages {
+                let (send, recv) = mpsc::sync_channel(1);
+                state.pending.insert(*id, send);
+                waiting.push(recv);
+            }
+        }
+        let sent = (|| {
+            self.socket.set_write_deadline(deadline)?;
+            for (_, message) in messages {
+                self.socket.send_text(&message.to_string())?;
+            }
+            Ok::<(), CdpError>(())
+        })();
+        let results = waiting
+            .into_iter()
+            .map(|recv| match &sent {
+                Err(error) => Err(error.clone()),
+                Ok(()) => recv
+                    .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                    .map_err(|_| CdpError::protocol("command deadline elapsed"))?,
+            })
+            .collect();
+        let mut state = self.inbox.lock().unwrap();
+        for (id, _) in messages {
+            state.pending.remove(id);
+        }
+        results
+    }
+
     /// Queue only `keep` events (all when `None`), and abandon waiting
     /// commands when an `interrupt` event arrives.
     pub fn filter(&self, keep: Option<&[&str]>, interrupt: &[&str]) {
@@ -257,6 +300,40 @@ mod tests {
         assert_eq!(events.len(), 1, "{events:?}");
         assert_eq!(events[0]["params"]["type"], "alert");
         worker.join().unwrap();
+    }
+
+    #[test]
+    fn pipelined_commands_are_all_sent_before_replies_and_answered_in_order() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let stream = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut peer, _) = listener.accept().unwrap();
+        let mut connection = Connection::new(WebSocket::from_stream(stream).unwrap()).unwrap();
+        let worker = std::thread::spawn(move || {
+            // Read all three requests before answering any, in reverse order.
+            for _ in 0..3 {
+                let mut header = [0; 2];
+                peer.read_exact(&mut header).unwrap();
+                let mut payload = vec![0; (header[1] & 127) as usize + 4];
+                peer.read_exact(&mut payload).unwrap();
+            }
+            for text in [
+                r#"{"id":3,"result":{"n":3}}"#,
+                r#"{"id":1,"result":{"n":1}}"#,
+                r#"{"id":2,"error":{"message":"no"}}"#,
+            ] {
+                peer.write_all(&[0x81, text.len() as u8]).unwrap();
+                peer.write_all(text.as_bytes()).unwrap();
+            }
+        });
+        let messages: Vec<(u64, Value)> = (1..=3)
+            .map(|id| (id, serde_json::json!({"id": id, "method": "m"})))
+            .collect();
+        let results = connection.pipeline(&messages, Instant::now() + Duration::from_secs(2));
+        worker.join().unwrap();
+        assert_eq!(results[0].as_ref().unwrap()["n"], 1);
+        assert!(results[1].is_err());
+        assert_eq!(results[2].as_ref().unwrap()["n"], 3);
+        assert!(connection.inbox.lock().unwrap().pending.is_empty());
     }
 
     #[test]

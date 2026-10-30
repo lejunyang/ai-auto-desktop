@@ -212,6 +212,31 @@ impl Client {
         self.connection.command(self.next_id, &message, deadline)
     }
 
+    /// Trusted internal primitive: several commands on one (child) session,
+    /// all sent before any reply is awaited. Replies are in command order.
+    pub fn session_pipeline(
+        &mut self,
+        session: Option<&str>,
+        commands: &[(&str, serde_json::Value)],
+    ) -> Vec<Result<serde_json::Value, CdpError>> {
+        let messages: Vec<(u64, serde_json::Value)> = commands
+            .iter()
+            .map(|(method, params)| {
+                self.next_id += 1;
+                let mut message =
+                    serde_json::json!({"id": self.next_id, "method": method, "params": params});
+                if let Some(session) = session {
+                    message["sessionId"] = serde_json::json!(session);
+                }
+                (self.next_id, message)
+            })
+            .collect();
+        let deadline = self
+            .deadline
+            .unwrap_or_else(|| std::time::Instant::now() + Duration::from_secs(8));
+        self.connection.pipeline(&messages, deadline)
+    }
+
     /// Queue only the `keep` event methods from now on, dropping others
     /// already queued, and abandon any command waiting for its reply with
     /// [`CdpError::Interrupted`] when an `interrupt` event arrives -- e.g. a
