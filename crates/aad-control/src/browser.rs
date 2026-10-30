@@ -450,6 +450,7 @@ impl Backend for BrowserBackend {
             "close_page",
             "accept",
             "dismiss",
+            "upload",
         ]
         .map(String::from)
         .to_vec()
@@ -609,6 +610,9 @@ impl Backend for BrowserBackend {
             }
             if trusted {
                 return pointer(client,context,&args,action,action_context);
+            }
+            if let Action::Upload {files}=action {
+                return upload(client,context,&args,node,files,action_context);
             }
             if TAB_ACTIONS.contains(&action.name()) {
                 // Anchored like navigation: the observed document must still be there.
@@ -826,6 +830,52 @@ fn pointer(
     }
     Ok(
         json!({"submitted": true, "native_operation": "Input.dispatchMouseEvent", "trusted_event": true}),
+    )
+}
+
+/// Files into the observed file input. The session has already resolved the
+/// paths under the server's upload grant; the page never names a path.
+fn upload(
+    client: &mut Client,
+    context: i64,
+    args: &Value,
+    node: &Value,
+    files: &[String],
+    action_context: &crate::Context,
+) -> Result<Value> {
+    if files.len() > 1 && node["multiple"] != true {
+        return Err(error(
+            "CONTROL.INVALID_REQUEST",
+            "this file input takes one file",
+        ));
+    }
+    checked(eval(
+        client,
+        context,
+        format!("globalThis.__aadControlV1.confirm({args})"),
+    )?)?;
+    let element = command(
+        client,
+        "Runtime.evaluate",
+        json!({"expression": format!("globalThis.__aadControlV1.element({args})"),
+               "contextId": context, "returnByValue": false}),
+    )?;
+    let object = element["result"]["objectId"]
+        .as_str()
+        .filter(|_| element["result"]["subtype"] == "node")
+        .ok_or_else(|| error("CONTROL.STALE_TARGET", "the file input was replaced"))?
+        .to_string();
+    action_context.commit()?;
+    let result = command(
+        client,
+        "DOM.setFileInputFiles",
+        json!({"files": files, "objectId": object}),
+    )
+    .map_err(|e| e.with_effect("unknown"));
+    let _ = command(client, "Runtime.releaseObject", json!({"objectId": object}));
+    result?;
+    Ok(
+        json!({"submitted": true, "native_operation": "DOM.setFileInputFiles", "files": files.len()}),
     )
 }
 

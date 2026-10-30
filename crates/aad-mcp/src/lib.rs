@@ -670,6 +670,7 @@ mod tests {
                 allow_input: true,
                 providers: ["desktop.linux_atspi".to_string()].into(),
                 resources: None,
+                ..Default::default()
             },
         ));
         let listed = restricted

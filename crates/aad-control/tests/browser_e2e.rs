@@ -33,6 +33,8 @@ const PAGE: &str = r#"<!doctype html><html><body>
 <button aria-label="Popup" onclick="window.open('/second','_blank','popup')">Popup</button>
 <button aria-label="Ask" onclick="document.getElementById('status').value='answer:'+prompt('Your name?','guest')">Ask</button>
 <button aria-label="Sure" onclick="document.getElementById('status').value='confirm:'+confirm('Sure?')">Sure</button>
+<input type="file" aria-label="Attachment" onchange="document.getElementById('status').value='files:'+Array.from(this.files).map(f=>f.name+':'+f.size).join(',')">
+<input type="file" aria-label="Hidden upload" multiple style="display:none" onchange="document.getElementById('status').value='hidden:'+Array.from(this.files).map(f=>f.name).join(',')">
 <iframe src="/frame"></iframe>
 </body></html>"#;
 
@@ -494,6 +496,111 @@ fn tabs_open_front_and_close_and_popups_name_their_opener() {
         .iter()
         .filter(|r| r["metadata"]["page_id"] == fixture.page_id.as_str())
         .all(|r| r["metadata"]["opener_page_id"].is_null()));
+}
+
+#[test]
+#[ignore = "requires isolated Chromium with its sandbox enabled; CI runs it explicitly"]
+fn uploads_reach_file_inputs_only_from_allowed_directories() {
+    let _serial = serial();
+    let fixture = Fixture::new();
+    let allowed = std::env::temp_dir().join(format!("aad-upload-{}", uuid::Uuid::new_v4()));
+    let outside = std::env::temp_dir().join(format!("aad-upload-out-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&allowed).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(allowed.join("report.txt"), "hello").unwrap();
+    std::fs::write(allowed.join("notes.txt"), "n").unwrap();
+    std::fs::write(outside.join("secret.txt"), "secret").unwrap();
+    let path = |dir: &PathBuf, name: &str| dir.join(name).display().to_string();
+    let session = Session::new(
+        vec![Arc::new(BrowserBackend::new(fixture.port))],
+        Policy {
+            allow_input: true,
+            upload_roots: vec![allowed.clone()],
+            ..Default::default()
+        },
+    );
+    let main = main_of(&session, &fixture.page_id);
+    assert!(wait_until(&session, &main, "Name", WaitCondition::Appears)
+        .error
+        .is_none());
+    let observed = observe(&session, &main);
+    // A file input takes files and nothing else.
+    assert_eq!(actions(&observed, "Attachment"), vec!["upload".to_string()]);
+    assert_eq!(node(&observed, "Hidden upload")["states"]["hidden"], true);
+    let input = find(&session, &observed, "button", "Attachment");
+    let fill = act(
+        &session,
+        input,
+        Action::Fill {
+            value: "C:\\fakepath".into(),
+        },
+    );
+    assert_eq!(fill.error.unwrap()["code"], "CONTROL.ACTION_UNSUPPORTED");
+    for (files, code) in [
+        (vec![path(&outside, "secret.txt")], "POLICY.DENIED"),
+        (vec!["report.txt".to_string()], "CONTROL.INVALID_REQUEST"),
+        (
+            vec![path(&allowed, "missing.txt")],
+            "CONTROL.FILE_NOT_FOUND",
+        ),
+        (
+            vec![path(&allowed, "report.txt"), path(&allowed, "notes.txt")],
+            "CONTROL.INVALID_REQUEST",
+        ),
+    ] {
+        let observed = observe(&session, &main);
+        let input = find(&session, &observed, "button", "Attachment");
+        let refused = act(&session, input, Action::Upload { files });
+        assert_eq!(refused.commit_state, CommitState::NotCommitted);
+        assert_eq!(refused.error.unwrap()["code"], code);
+    }
+    assert_eq!(status(&observe(&session, &main)), "ready");
+    let observed = observe(&session, &main);
+    let input = find(&session, &observed, "button", "Attachment");
+    let uploaded = act(
+        &session,
+        input,
+        Action::Upload {
+            files: vec![path(&allowed, "report.txt")],
+        },
+    );
+    assert!(uploaded.error.is_none(), "{uploaded:?}");
+    let observed = observe(&session, &main);
+    assert_eq!(status(&observed), "files:report.txt:5");
+    assert_eq!(
+        node(&observed, "Attachment")["files"],
+        json!(["report.txt"])
+    );
+    // A hidden input behind a styled button still takes several files.
+    let input = find(&session, &observed, "button", "Hidden upload");
+    let uploaded = act(
+        &session,
+        input,
+        Action::Upload {
+            files: vec![path(&allowed, "report.txt"), path(&allowed, "notes.txt")],
+        },
+    );
+    assert!(uploaded.error.is_none(), "{uploaded:?}");
+    assert_eq!(
+        status(&observe(&session, &main)),
+        "hidden:report.txt,notes.txt"
+    );
+    drop(session);
+    // Without a grant every upload is refused.
+    let (session, _) = session_for(&fixture);
+    let main = main_of(&session, &fixture.page_id);
+    let observed = observe(&session, &main);
+    let input = find(&session, &observed, "button", "Attachment");
+    let refused = act(
+        &session,
+        input,
+        Action::Upload {
+            files: vec![path(&allowed, "report.txt")],
+        },
+    );
+    assert_eq!(refused.error.unwrap()["code"], "POLICY.DENIED");
+    let _ = std::fs::remove_dir_all(&allowed);
+    let _ = std::fs::remove_dir_all(&outside);
 }
 
 fn only_dialog(observed: &Value) -> &Value {

@@ -92,6 +92,9 @@ pub struct Policy {
     pub providers: BTreeSet<String>,
     /// Optional server-owned allowlist; a client cannot extend it.
     pub resources: Option<BTreeSet<String>>,
+    /// Directories whose files an `upload` may hand to a page. Empty refuses
+    /// every upload; a client can neither extend nor see past them.
+    pub upload_roots: Vec<std::path::PathBuf>,
 }
 
 #[derive(Clone)]
@@ -500,7 +503,7 @@ impl Session {
             Operation::Capabilities {} => Ok(
                 json!({"session_id": self.id, "protocol_version": PROTOCOL_VERSION,
                 "expires_in_ms": self.lifetime.saturating_sub(self.created.elapsed()).as_millis(),
-                "allow_input": self.policy.allow_input,"observation_retention":"until_next_observation_or_input_attempt","observation_ttl_ms":self.observation_ttl.as_millis(),"max_requests":self.max_requests,"input_lease":"exclusive_cooperating_session","input_lease_scope":"os_user","providers": self.backends.values().filter(|b| self.allowed_provider(b.name()))
+                "allow_input": self.policy.allow_input,"upload_dirs": self.policy.upload_roots,"observation_retention":"until_next_observation_or_input_attempt","observation_ttl_ms":self.observation_ttl.as_millis(),"max_requests":self.max_requests,"input_lease":"exclusive_cooperating_session","input_lease_scope":"os_user","providers": self.backends.values().filter(|b| self.allowed_provider(b.name()))
                     .map(|b| json!({"provider": b.name(), "actions": b.capabilities()})).collect::<Vec<_>>(),
                 "unavailable": self.failures}),
             ),
@@ -647,6 +650,18 @@ impl Session {
                     ));
                 }
                 validate_action(action)?;
+                // Upload paths are resolved here, under the server's grant, so
+                // no provider ever sees a path outside it.
+                let resolved;
+                let action = match action {
+                    Action::Upload { files } => {
+                        resolved = Action::Upload {
+                            files: self.upload_files(files)?,
+                        };
+                        &resolved
+                    }
+                    other => other,
+                };
                 let observed = |id: &str| {
                     observation.raw["nodes"]
                         .as_array()
@@ -1013,6 +1028,52 @@ impl Session {
         }
     }
 
+    /// Each file as an existing regular file under an allowed directory, by
+    /// its resolved path, so a link cannot lead outside the grant.
+    fn upload_files(&self, files: &[String]) -> Result<Vec<String>> {
+        if self.policy.upload_roots.is_empty() {
+            return Err(error(
+                "POLICY.DENIED",
+                "file uploads were not allowed by whoever started this server",
+            ));
+        }
+        let roots: Vec<std::path::PathBuf> = self
+            .policy
+            .upload_roots
+            .iter()
+            .filter_map(|root| root.canonicalize().ok())
+            .collect();
+        files
+            .iter()
+            .map(|file| {
+                let path = std::path::Path::new(file);
+                if !path.is_absolute() {
+                    return Err(error(
+                        "CONTROL.INVALID_REQUEST",
+                        "upload takes absolute file paths",
+                    ));
+                }
+                let real = path
+                    .canonicalize()
+                    .ok()
+                    .filter(|real| real.is_file())
+                    .ok_or_else(|| {
+                        error(
+                            "CONTROL.FILE_NOT_FOUND",
+                            format!("no regular file at {file}"),
+                        )
+                    })?;
+                if !roots.iter().any(|root| real.starts_with(root)) {
+                    return Err(error(
+                        "POLICY.DENIED",
+                        format!("{file} is outside the directories allowed for uploads"),
+                    ));
+                }
+                Ok(plain_path(&real))
+            })
+            .collect()
+    }
+
     fn observation(&self, id: &str) -> Result<Observation> {
         self.state
             .lock()
@@ -1058,6 +1119,19 @@ fn validate_action(action: &Action) -> Result<()> {
             "input text must be bounded and contain no NUL",
         ));
     }
+    if let Action::Upload { files } = action {
+        if files.is_empty()
+            || files.len() > MAX_UPLOAD_FILES
+            || files
+                .iter()
+                .any(|f| f.is_empty() || f.len() > 4096 || f.chars().any(char::is_control))
+        {
+            return Err(error(
+                "CONTROL.INVALID_REQUEST",
+                "upload takes 1..32 file paths of at most 4096 characters",
+            ));
+        }
+    }
     if let Action::Key { keys } = action {
         if keys.is_empty() || keys.len() > 6 || keys.iter().any(|s| s.is_empty() || s.len() > 32) {
             return Err(error(
@@ -1095,6 +1169,19 @@ fn validate_action(action: &Action) -> Result<()> {
             invalid("hover ms must be in 1..5000")
         }
         _ => Ok(()),
+    }
+}
+
+/// A resolved path as browsers accept it: without the Windows `\\?\` prefix.
+fn plain_path(path: &std::path::Path) -> String {
+    let text = path.display().to_string();
+    match text.strip_prefix(r"\\?\") {
+        Some(rest) if rest.as_bytes().get(1) == Some(&b':') => rest.to_string(),
+        Some(rest) => match rest.strip_prefix("UNC\\") {
+            Some(share) => format!(r"\\{share}"),
+            None => text,
+        },
+        None => text,
     }
 }
 

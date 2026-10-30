@@ -145,6 +145,16 @@ fn action_schema() -> Value {
         }), &[]),
         variant("dismiss", "Dismiss (Cancel) the JavaScript dialog that blocks a browser \
     page, observed as an alertdialog node.", json!({}), &[]),
+        variant("upload", "Put local files into a browser file input (<input type=file>, \
+    offered even when the page hides it behind a styled button), firing its change event; no \
+    file chooser opens. Absolute paths of existing files under a directory the server \
+    operator allowed (control_capabilities lists them as upload_dirs); anything else is \
+    refused. Several files only where the input takes several.", json!({
+            "files": {
+                "type": "array", "minItems": 1, "maxItems": 32,
+                "items": {"type": "string", "minLength": 1, "maxLength": 4096}
+            }
+        }), &["files"]),
     ]})
 }
 
@@ -481,8 +491,14 @@ window shows now, or wait again with a longer timeout_ms (up to 30000)."
             "Call control_targets first, then observe a resource_id it returned."
         }
         "POLICY.DENIED" => {
-            "Whoever started this server did not grant input (aad mcp --allow-input). Do \
-not look for another way to act; ask the person you are helping."
+            "Whoever started this server did not grant this: input needs aad mcp \
+--allow-input, a file upload needs the file under a directory given with --allow-upload-dir \
+(control_capabilities lists them as upload_dirs). Do not look for another way to act; ask \
+the person you are helping."
+        }
+        "CONTROL.FILE_NOT_FOUND" => {
+            "No regular file exists at that path. Upload takes absolute paths of existing \
+files; check the name, or ask the person where the file is."
         }
         _ => return None,
     })
@@ -550,6 +566,7 @@ mod tests {
                     "option" => json!("x"),
                     "checked" => json!(true),
                     "url" => json!("https://example.com/"),
+                    "files" => json!(["C:/upload/report.txt"]),
                     "to" => {
                         json!({"session_id":"s","resource_id":"r","observation_id":"o","node_id":"n"})
                     }

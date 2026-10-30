@@ -222,9 +222,16 @@ pub enum Action {
     },
     /// Dismiss (cancel) the JavaScript dialog an observation shows.
     Dismiss {},
+    /// Put these local files into a file input. Absolute paths under a
+    /// directory the server operator allowed; nothing else is readable.
+    Upload {
+        files: Vec<String>,
+    },
 }
 
-pub const ACTION_NAMES: [&str; 20] = [
+pub const MAX_UPLOAD_FILES: usize = 32;
+
+pub const ACTION_NAMES: [&str; 21] = [
     "focus",
     "invoke",
     "click",
@@ -245,6 +252,7 @@ pub const ACTION_NAMES: [&str; 20] = [
     "close_page",
     "accept",
     "dismiss",
+    "upload",
 ];
 
 /// Actions on the page as a whole, offered on its document node.
@@ -292,6 +300,7 @@ impl Action {
             Self::ClosePage {} => "close_page",
             Self::Accept { .. } => "accept",
             Self::Dismiss {} => "dismiss",
+            Self::Upload { .. } => "upload",
         }
     }
     /// A left single click at the centre needs nothing beyond a plain click.

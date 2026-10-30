@@ -11,7 +11,7 @@
 | `desktop.windows_uia` | focus, invoke, click, fill, type_text, key, scroll, hover, drag | UIA + 原生输入；click 带 button/count/fraction 时走原生手势；节点必须暴露对应能力 |
 | `desktop.linux_atspi` | focus, invoke, click, fill, type_text, key, scroll, hover, drag | AT-SPI；指针/键盘经 X11 XTest helper，只支持 KDE/X11 会话；派发前核对焦点、PID 与落点，drag 起止两点都核对 |
 | `desktop.macos_ax` | focus, invoke, click, fill, type_text, key, scroll, hover, drag | AX helper；需要同一登录用户的辅助功能权限；指针动作要求目标应用在前台并经 AX 命中检查，事件只投递给目标进程；key 名称按字面（`ctrl` 是 Control，`cmd` 是 Command） |
-| `browser.cdp` | focus, click, fill, key, scroll, hover, select, check, navigate, back, forward, reload, open_tab, activate_page, close_page, accept, dismiss | 普通 click 为 `HTMLElement.click()` 的 DOM 激活；带 button/count/fraction 的 click、scroll、hover 为主 frame 的可信 CDP Input，落点先在页面里命中检查；fill/select 为 DOM 值及 input/change 事件；check 已是目标状态时不点击；key 为主 frame 的 CDP Input；navigate/back/forward/reload 与标签页动作 open_tab/activate_page/close_page 在 body 节点上，只限主 frame；accept/dismiss 只在 JavaScript 对话框节点上；没有 drag |
+| `browser.cdp` | focus, click, fill, key, scroll, hover, select, check, navigate, back, forward, reload, open_tab, activate_page, close_page, accept, dismiss, upload | 普通 click 为 `HTMLElement.click()` 的 DOM 激活；带 button/count/fraction 的 click、scroll、hover 为主 frame 的可信 CDP Input，落点先在页面里命中检查；fill/select 为 DOM 值及 input/change 事件；check 已是目标状态时不点击；key 为主 frame 的 CDP Input；navigate/back/forward/reload 与标签页动作 open_tab/activate_page/close_page 在 body 节点上，只限主 frame；accept/dismiss 只在 JavaScript 对话框节点上；upload 只在文件框上，路径受 `--allow-upload-dir` 限制；没有 drag |
 
 以 `capabilities` 和观察节点的 `capabilities` 为准。可列出 provider 不表示当前 OS 已授予
 桌面权限。启动失败或不可用原因在 `unavailable` 中返回。浏览器 key 只支持列出的导航/编辑键
@@ -48,6 +48,16 @@ JavaScript 对话框（alert/confirm/prompt/beforeunload）：会话连接每个
 实测（Windows，本机 Chrome headless，`dialogs_block_the_page_until_accepted_or_dismissed`）：prompt 带 text 接受后
 页面读到答案，confirm dismiss 得 false，计时器弹出的 alert 使 fill 在 3 秒内被拒且未写入，会话前已打开的 alert 被标为无响应。
 [待验证] Edge 与有界面（非 headless）浏览器的对话框行为；beforeunload 对话框只按同一事件路径处理，没有专门的 fixture。
+
+文件上传：`<input type=file>` 只提供 `upload`（要 `files`，1..32 个绝对路径），不提供 fill/click，不会弹出文件选择框；
+被页面用 `display:none` 藏在样式按钮后面的文件框也会出现在观察里（`states.hidden: true`），节点的 `files` 列出已选文件名。
+路径由会话在服务端授权下解析：服务启动时用 `--allow-upload-dir <DIR>`（可重复，`aad mcp` 与 `aad control serve` 都有，
+`--connect` 远程时只能在远端配置）给出允许的目录，没给时一律 `POLICY.DENIED`；每个文件必须存在且是普通文件，
+按解析后的真实路径（符号链接、`..` 都先展开）判断是否落在允许目录下，否则 `POLICY.DENIED`，相对路径 `CONTROL.INVALID_REQUEST`，
+不存在 `CONTROL.FILE_NOT_FOUND`；单选框给多个文件 `CONTROL.INVALID_REQUEST`。`capabilities` 的 `upload_dirs` 列出允许目录。
+浏览器侧先在隔离 world 里核对节点，再取该元素的对象引用调用 `DOM.setFileInputFiles`，页面收到 input/change 事件。
+实测（Windows，本机 Chrome headless，`uploads_reach_file_inputs_only_from_allowed_directories`）：允许目录内的文件上传后
+页面读到文件名和大小，隐藏的多选文件框收到两个文件；目录外、相对路径、不存在、单选多文件和未授权会话均被拒且页面无变化。
 
 动作参数：`click` 可带 `button`（left/right/middle）、`count`（1/2）、`fraction`；`type_text` 可带
 `mode`（unicode/keys）；`scroll` 要 `direction`，可带 `notches`（1..30）、`fraction`；`hover` 可带
@@ -94,6 +104,7 @@ aad mcp --allow-input                    # 本机 MCP，授予输入与工作流
 aad mcp --provider desktop.linux_atspi    # 限定 provider，不提供工作流工具
 aad mcp --browser-port 9222              # 显式连接本机已有的隔离 CDP 实例
 aad mcp --allow-input --allow-profile-copy  # browser_open 可以复制已有 profile 的登录
+aad mcp --allow-input --allow-upload-dir D:\to-upload  # 浏览器 upload 只能读这个目录下的文件
 ```
 
 会话总带一个浏览器 provider，没连接时没有页面；`Session::attach_browser(port)` 之后换成那个浏览器

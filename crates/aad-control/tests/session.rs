@@ -479,6 +479,138 @@ fn a_wait_in_progress_can_be_cancelled() {
     assert!(started.elapsed() < Duration::from_secs(5));
 }
 
+/// Remembers the files each upload handed it.
+struct Uploader {
+    files: std::sync::Mutex<Vec<Vec<String>>>,
+}
+impl Backend for Uploader {
+    fn name(&self) -> &str {
+        "uploader"
+    }
+    fn capabilities(&self) -> Vec<String> {
+        vec!["upload".into()]
+    }
+    fn resources(&self, _: Duration) -> Result<Vec<BackendResource>> {
+        Ok(vec![BackendResource {
+            resource: Resource {
+                resource_id: "uploader:page".into(),
+                provider: "uploader".into(),
+                kind: "browser".into(),
+                name: "form".into(),
+                capabilities: self.capabilities(),
+                metadata: json!({}),
+            },
+            selector: json!({}),
+        }])
+    }
+    fn observe(&self, _: &Value, _: usize, _: Duration) -> Result<Value> {
+        Ok(
+            json!({"nodes": [{"node_id":"file", "role":"button", "name":"Attach", "actions":["upload"]}], "truncated": false}),
+        )
+    }
+    fn act(&self, _: &Value, _: &Value, action: &Action, context: &Context) -> Result<Value> {
+        context.commit()?;
+        if let Action::Upload { files } = action {
+            self.files.lock().unwrap().push(files.clone());
+        }
+        Ok(json!({}))
+    }
+}
+
+#[test]
+fn uploads_name_only_existing_files_under_the_server_grant() {
+    let allowed = std::env::temp_dir().join(format!("aad-grant-{}", uuid::Uuid::new_v4()));
+    let outside = std::env::temp_dir().join(format!("aad-outside-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(allowed.join("sub")).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(allowed.join("sub").join("a.txt"), "a").unwrap();
+    std::fs::write(outside.join("b.txt"), "b").unwrap();
+    let backend = Arc::new(Uploader {
+        files: Default::default(),
+    });
+    let session = |roots: Vec<std::path::PathBuf>| {
+        let session = Session::new(
+            vec![backend.clone()],
+            Policy {
+                allow_input: true,
+                upload_roots: roots,
+                ..Default::default()
+            },
+        );
+        assert!(call(&session, Operation::Targets {}).error.is_none());
+        session
+    };
+    let upload = |session: &Session, files: Vec<String>| {
+        let observed = call(
+            session,
+            Operation::Observe {
+                resource_id: "uploader:page".into(),
+                max_nodes: 10,
+                view: Default::default(),
+            },
+        )
+        .data
+        .unwrap();
+        let target: Target =
+            serde_json::from_value(observed["nodes"][0]["target"].clone()).unwrap();
+        call(
+            session,
+            Operation::Act {
+                target,
+                action: Action::Upload { files },
+            },
+        )
+    };
+    let inside = allowed.join("sub").join("a.txt").display().to_string();
+    // No grant: nothing is uploaded, however plain the path.
+    let none = session(Vec::new());
+    assert_eq!(
+        upload(&none, vec![inside.clone()]).error.unwrap()["code"],
+        "POLICY.DENIED"
+    );
+    let granted = session(vec![allowed.clone()]);
+    let escape = allowed
+        .join("sub")
+        .join("..")
+        .join("..")
+        .join(outside.file_name().unwrap())
+        .join("b.txt")
+        .display()
+        .to_string();
+    for (files, code) in [
+        (vec![escape], "POLICY.DENIED"),
+        (
+            vec![outside.join("b.txt").display().to_string()],
+            "POLICY.DENIED",
+        ),
+        (vec!["sub/a.txt".to_string()], "CONTROL.INVALID_REQUEST"),
+        (
+            vec![allowed.join("sub").display().to_string()],
+            "CONTROL.FILE_NOT_FOUND",
+        ),
+        (vec![], "CONTROL.INVALID_REQUEST"),
+    ] {
+        let response = upload(&granted, files);
+        assert_eq!(response.commit_state, CommitState::NotCommitted);
+        assert_eq!(response.error.unwrap()["code"], code);
+    }
+    assert!(backend.files.lock().unwrap().is_empty());
+    assert!(upload(&granted, vec![inside]).error.is_none());
+    let handed = backend.files.lock().unwrap()[0][0].clone();
+    // The provider gets the resolved path, in a form a browser accepts.
+    assert!(!handed.starts_with(r"\\?\"), "{handed}");
+    assert_eq!(
+        std::fs::canonicalize(&handed).unwrap(),
+        std::fs::canonicalize(allowed.join("sub").join("a.txt")).unwrap()
+    );
+    assert_eq!(
+        call(&granted, Operation::Capabilities {}).data.unwrap()["upload_dirs"][0],
+        json!(allowed)
+    );
+    let _ = std::fs::remove_dir_all(allowed);
+    let _ = std::fs::remove_dir_all(outside);
+}
+
 #[test]
 fn close_expiry_and_bounded_replay_guard_revoke_observations() {
     let (session, backend) = fixture(true, Duration::ZERO);

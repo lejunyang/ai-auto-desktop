@@ -17,6 +17,10 @@ pub struct Grants {
     /// Enable CDP only on this loopback port. Never launches a real browser or copies logins.
     #[arg(long)]
     browser_port: Option<u16>,
+    /// Let browser uploads read files under this directory. Repeat to allow more than one.
+    /// Without it every upload is refused.
+    #[arg(long = "allow-upload-dir", value_name = "DIR")]
+    upload_dirs: Vec<std::path::PathBuf>,
 }
 impl Grants {
     fn policy(&self, allow_input: bool) -> Policy {
@@ -28,6 +32,7 @@ impl Grants {
             } else {
                 Some(self.resources.iter().cloned().collect::<BTreeSet<_>>())
             },
+            upload_roots: self.upload_dirs.clone(),
         }
     }
 }
@@ -93,6 +98,7 @@ pub fn mcp(args: &McpArgs) -> std::io::Result<()> {
             || !args.grants.providers.is_empty()
             || !args.grants.resources.is_empty()
             || args.grants.browser_port.is_some()
+            || !args.grants.upload_dirs.is_empty()
         {
             return Err(invalid("remote grants must be configured on the remote server; local flags cannot replace them"));
         }
@@ -128,6 +134,32 @@ pub fn run(command_args: &ControlCommand) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn uploads_are_refused_unless_the_operator_names_directories() {
+        #[derive(clap::Parser)]
+        struct Cli {
+            #[command(flatten)]
+            grants: Grants,
+        }
+        use clap::Parser;
+        let none = Cli::try_parse_from(["aad"]).unwrap();
+        assert!(none.grants.policy(true).upload_roots.is_empty());
+        let two = Cli::try_parse_from([
+            "aad",
+            "--allow-upload-dir",
+            "C:/uploads",
+            "--allow-upload-dir",
+            "D:/more",
+        ])
+        .unwrap();
+        assert_eq!(
+            two.grants.policy(true).upload_roots,
+            vec![
+                std::path::PathBuf::from("C:/uploads"),
+                std::path::PathBuf::from("D:/more")
+            ]
+        );
+    }
     #[test]
     fn transport_commands_are_argv_not_shell_fragments() {
         assert!(command("[]").is_err());
