@@ -118,9 +118,19 @@ enum Command {
 /// someone to destroy a run store with a typo.
 #[derive(Args)]
 struct StoreArgs {
-    /// The SQLite run store. Created if it does not exist.
+    /// The SQLite run store. Created if it does not exist. Defaults to the
+    /// per-user store (`AAD_RUN_STORE`, else `~/.ai-auto-desktop/runs.sqlite3`),
+    /// which is also where MCP `run_workflow` with `durable` records its runs.
     #[arg(long, value_name = "PATH")]
-    store: PathBuf,
+    store: Option<PathBuf>,
+}
+
+impl StoreArgs {
+    fn path(&self) -> PathBuf {
+        self.store
+            .clone()
+            .unwrap_or_else(aad_runtime::durable::default_store_path)
+    }
 }
 
 #[derive(Args)]
@@ -1475,14 +1485,15 @@ fn with_store<F>(args: &StoreArgs, action: F) -> (Value, u8)
 where
     F: FnOnce(&aad_runtime::durable::JournalStore) -> Result<Value, Value>,
 {
-    let store = match aad_runtime::durable::JournalStore::open(&args.store) {
+    let path = args.path();
+    let store = match aad_runtime::durable::JournalStore::open(&path) {
         Ok(store) => store,
         Err(error) => {
             return (
                 failure(
                     error.code(),
                     error.message(),
-                    Some(json!({"store": args.store.display().to_string()})),
+                    Some(json!({"store": path.display().to_string()})),
                 ),
                 EXIT_USAGE,
             )
@@ -1711,14 +1722,15 @@ fn start_run(args: &StartArgs) -> (Value, u8) {
 
     // Opened separately from `with_store` because the executor takes ownership
     // of the connection for the whole run.
-    let store = match aad_runtime::durable::JournalStore::open(&args.store.store) {
+    let path = args.store.path();
+    let store = match aad_runtime::durable::JournalStore::open(&path) {
         Ok(store) => store,
         Err(error) => {
             return (
                 failure(
                     error.code(),
                     error.message(),
-                    Some(json!({"store": args.store.store.display().to_string()})),
+                    Some(json!({"store": path.display().to_string()})),
                 ),
                 EXIT_USAGE,
             )
@@ -1749,14 +1761,15 @@ fn resume_run(args: &ResumeArgs) -> (Value, u8) {
         Err(result) => return result,
     };
 
-    let store = match aad_runtime::durable::JournalStore::open(&args.store.store) {
+    let path = args.store.path();
+    let store = match aad_runtime::durable::JournalStore::open(&path) {
         Ok(store) => store,
         Err(error) => {
             return (
                 failure(
                     error.code(),
                     error.message(),
-                    Some(json!({"store": args.store.store.display().to_string()})),
+                    Some(json!({"store": path.display().to_string()})),
                 ),
                 EXIT_USAGE,
             )
@@ -2449,7 +2462,7 @@ mod tests {
 
         fn store(&self) -> StoreArgs {
             StoreArgs {
-                store: self.path.join("runs.sqlite3"),
+                store: Some(self.path.join("runs.sqlite3")),
             }
         }
 
@@ -2495,7 +2508,7 @@ mod tests {
         assert_eq!(payload["output"]["echo"], "agent");
         // The store must be a real file, otherwise nothing was durable.
         assert!(
-            temp.store().store.exists(),
+            temp.store().path().exists(),
             "the run store must exist on disk"
         );
     }
@@ -2622,8 +2635,8 @@ mod tests {
     fn a_pause_request_records_intent_without_claiming_it_took_effect() {
         let temp = TempDir::new("pause");
         // A pending run: created but not executed, so intent is observable.
-        let store =
-            aad_runtime::durable::JournalStore::open(&temp.store().store).expect("the store opens");
+        let store = aad_runtime::durable::JournalStore::open(temp.store().path())
+            .expect("the store opens");
         let descriptor = durable_descriptor(&temp.workflow()).expect("compiles");
         store
             .create_run(
@@ -2663,8 +2676,8 @@ mod tests {
     #[test]
     fn a_cancel_request_is_sticky_and_cannot_be_downgraded_to_a_pause() {
         let temp = TempDir::new("sticky");
-        let store =
-            aad_runtime::durable::JournalStore::open(&temp.store().store).expect("the store opens");
+        let store = aad_runtime::durable::JournalStore::open(temp.store().path())
+            .expect("the store opens");
         let descriptor = durable_descriptor(&temp.workflow()).expect("compiles");
         store
             .create_run(
@@ -2723,8 +2736,8 @@ mod tests {
     #[test]
     fn a_cancel_requested_before_execution_stops_the_run_without_running_it() {
         let temp = TempDir::new("cancelfirst");
-        let store =
-            aad_runtime::durable::JournalStore::open(&temp.store().store).expect("the store opens");
+        let store = aad_runtime::durable::JournalStore::open(temp.store().path())
+            .expect("the store opens");
         let descriptor = durable_descriptor(&temp.workflow()).expect("compiles");
         store
             .create_run(
@@ -2770,8 +2783,8 @@ mod tests {
         // must actually finish the run. An operator has no way to clear the
         // recorded pause themselves, so resume has to do it.
         let temp = TempDir::new("pauseresume");
-        let store =
-            aad_runtime::durable::JournalStore::open(&temp.store().store).expect("the store opens");
+        let store = aad_runtime::durable::JournalStore::open(temp.store().path())
+            .expect("the store opens");
         let descriptor = durable_descriptor(&temp.workflow()).expect("compiles");
         store
             .create_run(
@@ -2794,8 +2807,8 @@ mod tests {
 
         // The runner honours the pause before dispatching anything, which is
         // what leaves a resumable checkpoint behind.
-        let store =
-            aad_runtime::durable::JournalStore::open(&temp.store().store).expect("the store opens");
+        let store = aad_runtime::durable::JournalStore::open(temp.store().path())
+            .expect("the store opens");
         let paused = aad_runtime::durable_exec::DurableExecutor::new(store)
             .execute(
                 &descriptor,
@@ -2995,6 +3008,27 @@ mod tests {
                 "{name} must not reuse the truncating --journal flag"
             );
         }
+    }
+
+    #[test]
+    fn the_durable_commands_default_to_the_per_user_store() {
+        // Without a default, a run started over MCP could only be followed up
+        // by someone who knew which file the server had picked.
+        let parsed = Cli::try_parse_from(["aad", "status", "run-1"]).expect("--store is optional");
+        let Command::Status(args) = parsed.command else {
+            panic!("parsed as status");
+        };
+        assert!(args.store.store.is_none());
+        assert_eq!(
+            args.store.path(),
+            aad_runtime::durable::default_store_path()
+        );
+        let named = Cli::try_parse_from(["aad", "status", "run-1", "--store", "x.sqlite3"])
+            .expect("--store still accepted");
+        let Command::Status(args) = named.command else {
+            panic!("parsed as status");
+        };
+        assert_eq!(args.store.path(), PathBuf::from("x.sqlite3"));
     }
 
     #[test]

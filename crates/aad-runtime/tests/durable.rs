@@ -204,6 +204,40 @@ fn a_missing_run_is_reported_as_not_found() {
 }
 
 #[test]
+fn recent_events_are_the_newest_page_in_order() {
+    let journal = TempJournal::open();
+    let lease = seed_running(&journal, "run-1");
+    for index in 0..5 {
+        journal
+            .store
+            .append_event(&lease, "test.tick", &json!({"index": index}), now_seconds())
+            .expect("append");
+    }
+
+    let recent = journal
+        .store
+        .list_recent_events("run-1", 2)
+        .expect("recent");
+    let seqs: Vec<i64> = recent.iter().map(|event| event.seq).collect();
+    let all = journal.store.list_events("run-1", 0, 100).expect("all");
+    let last = all.last().expect("events exist").seq;
+    // The newest two, but still oldest first so they read as a history.
+    assert_eq!(seqs, vec![last - 1, last]);
+    assert_eq!(recent[1].payload["index"], json!(4));
+
+    // A missing run is not the same as a run with no events.
+    assert_eq!(
+        journal
+            .store
+            .list_recent_events("ghost", 2)
+            .expect_err("no run")
+            .code(),
+        "JOURNAL.RUN_NOT_FOUND"
+    );
+    assert!(journal.store.list_recent_events("run-1", 0).is_err());
+}
+
+#[test]
 fn runs_are_listed_newest_first_and_can_be_filtered_by_status() {
     let journal = TempJournal::open();
     for index in 0..3 {
