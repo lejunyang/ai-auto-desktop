@@ -15,8 +15,9 @@ pub const PROVIDER: &str = "browser.cdp";
 
 /// CDP `Input` and page navigation address the page, not a frame, so they are
 /// offered only where the observed frame is the main one.
-const MAIN_FRAME_ONLY: [&str; 10] = [
+const MAIN_FRAME_ONLY: [&str; 11] = [
     "key",
+    "type_text",
     "scroll",
     "hover",
     "navigate",
@@ -623,6 +624,7 @@ impl Backend for BrowserBackend {
             "focus",
             "click",
             "fill",
+            "type_text",
             "key",
             "scroll",
             "hover",
@@ -712,7 +714,7 @@ impl Backend for BrowserBackend {
                     capabilities.retain(|s| !MAIN_FRAME_ONLY.contains(&s.as_str()));
                 }
                 resources.push(BackendResource {resource:Resource {resource_id:resource_id(PROVIDER,&selector),provider:PROVIDER.into(),kind:"browser".into(),
-                    name:target.title.clone(),capabilities,metadata:json!({"page_id":target.id,"frame_id":frame["id"],"url":frame["url"],"main_frame":main,"opener_page_id":openers.get(&target.id),"click_semantics":"dom_activation; trusted cdp input with button, count or fraction","fill_semantics":"dom_value_and_events","key_semantics":"cdp_input_main_frame","pointer_semantics":"cdp_input_main_frame"})},selector});
+                    name:target.title.clone(),capabilities,metadata:json!({"page_id":target.id,"frame_id":frame["id"],"url":frame["url"],"main_frame":main,"opener_page_id":openers.get(&target.id),"click_semantics":"dom_activation; trusted cdp input with button, count or fraction","fill_semantics":"dom_value_and_events","key_semantics":"cdp_input_focused_element_main_frame","type_text_semantics":"cdp_insert_text_or_us_key_events","pointer_semantics":"cdp_input_main_frame"})},selector});
             }
         }
         if self.closed.load(Ordering::SeqCst) {
@@ -814,22 +816,9 @@ impl Backend for BrowserBackend {
             if PAGE_ACTIONS.contains(&action.name()) {
                 return page(client,context,&args,action,action_context);
             }
-            if let Action::Key {keys}=action {
+            if matches!(action,Action::Key {..}|Action::TypeText {..}) {
                 if meta["main_frame"]!=true {return Err(error("CONTROL.ACTION_UNSUPPORTED","keyboard input is supported only for the main frame"));}
-                let (key,code,virtual_key,modifiers)=key_chord(keys)?;
-                action_context.commit()?;
-                let focus=eval(client,context,format!("globalThis.__aadControlV1.act({args})")).map_err(|e|e.with_effect("unknown"))?;
-                checked(focus)?;
-                let verify=eval(client,context,format!("globalThis.__aadControlV1.verify({args})")).map_err(|e|e.with_effect("contextual"))?;
-                if verify["ok"]!=true || current_frame(client,frame_id).map_err(|e|e.with_effect("contextual"))?["loaderId"]!=meta["loader_id"] {return Err(error("CONTROL.STALE_TARGET","keyboard focus or document changed").with_effect("contextual"));}
-                // Once Input is submitted, transport/context failure is ambiguous.
-                let text=if key=="Enter" && modifiers==0 {"\r"} else {""};
-                action_context.commit()?;
-                let down=command(client,"Input.dispatchKeyEvent",json!({"type":"keyDown","key":key,"code":code,"windowsVirtualKeyCode":virtual_key,"modifiers":modifiers,"text":text}));
-                down.map_err(|e|e.with_effect("unknown"))?;
-                if current_frame(client,frame_id).map_err(|e|e.with_effect("unknown"))?["loaderId"]!=meta["loader_id"] {return Err(error("CONTROL.STALE_TARGET","document changed after keydown").with_effect("unknown"));}
-                command(client,"Input.dispatchKeyEvent",json!({"type":"keyUp","key":key,"code":code,"windowsVirtualKeyCode":virtual_key,"modifiers":modifiers})).map_err(|e|e.with_effect("unknown"))?;
-                Ok(json!({"submitted":true,"native_operation":"Input.dispatchKeyEvent"}))
+                keyboard(client,context,&args,frame_id,&meta["loader_id"],action,action_context)
             } else {
                 // Verification and DOM activation/fill happen in one JS turn in
                 // the observed isolated world, preventing a navigation redirect.
@@ -1155,15 +1144,114 @@ fn checked(value: Value) -> Result<Value> {
     }
 }
 
-fn key_chord(keys: &[String]) -> Result<(String, String, u32, u32)> {
-    let mut modifiers = 0;
+const ALT: u32 = 1;
+const CTRL: u32 = 2;
+const META: u32 = 4;
+const SHIFT: u32 = 8;
+
+/// One key press as CDP dispatches it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct KeyPress {
+    key: String,
+    code: String,
+    virtual_key: u32,
+    modifiers: u32,
+    /// What the key types, if anything: a keypress and an input event follow.
+    text: Option<String>,
+}
+
+/// The key a US layout types `character` with, and whether it needs Shift.
+fn us_key(character: char) -> Option<(String, String, u32, bool)> {
+    const SHIFTED_DIGITS: &str = ")!@#$%^&*(";
+    const PUNCTUATION: [(char, char, &str, u32); 11] = [
+        ('-', '_', "Minus", 189),
+        ('=', '+', "Equal", 187),
+        ('[', '{', "BracketLeft", 219),
+        (']', '}', "BracketRight", 221),
+        ('\\', '|', "Backslash", 220),
+        (';', ':', "Semicolon", 186),
+        ('\'', '"', "Quote", 222),
+        (',', '<', "Comma", 188),
+        ('.', '>', "Period", 190),
+        ('/', '?', "Slash", 191),
+        ('`', '~', "Backquote", 192),
+    ];
+    let named = |key: &str, code: &str, vk: u32, shift: bool| {
+        Some((key.to_string(), code.to_string(), vk, shift))
+    };
+    match character {
+        'a'..='z' => {
+            let upper = character.to_ascii_uppercase();
+            named(
+                &character.to_string(),
+                &format!("Key{upper}"),
+                upper as u32,
+                false,
+            )
+        }
+        'A'..='Z' => named(
+            &character.to_string(),
+            &format!("Key{character}"),
+            character as u32,
+            true,
+        ),
+        '0'..='9' => named(
+            &character.to_string(),
+            &format!("Digit{character}"),
+            character as u32,
+            false,
+        ),
+        ' ' => named(" ", "Space", 32, false),
+        '\n' | '\r' => named("Enter", "Enter", 13, false),
+        '\t' => named("Tab", "Tab", 9, false),
+        _ => {
+            if let Some(digit) = SHIFTED_DIGITS.find(character) {
+                return named(
+                    &character.to_string(),
+                    &format!("Digit{digit}"),
+                    '0' as u32 + digit as u32,
+                    true,
+                );
+            }
+            PUNCTUATION
+                .iter()
+                .find(|(plain, shifted, _, _)| *plain == character || *shifted == character)
+                .and_then(|(plain, _, code, vk)| {
+                    named(&character.to_string(), code, *vk, *plain != character)
+                })
+        }
+    }
+}
+
+/// The press that types `character` on a US layout, with its text.
+fn typed_key(character: char) -> Option<KeyPress> {
+    let (key, code, virtual_key, shift) = us_key(character)?;
+    let text = match character {
+        '\n' | '\r' => Some("\r".to_string()),
+        '\t' => None,
+        other => Some(other.to_string()),
+    };
+    Some(KeyPress {
+        key,
+        code,
+        virtual_key,
+        modifiers: if shift { SHIFT } else { 0 },
+        text,
+    })
+}
+
+/// A chord for the focused element. Shortcuts the browser itself acts on --
+/// new or closed tabs and windows, history, devtools, find, reload, zoom --
+/// are refused: CDP hands keys the page does not consume back to the browser.
+fn key_chord(keys: &[String]) -> Result<KeyPress> {
+    let mut modifiers: u32 = 0;
     let mut primary = None;
     for key in keys {
         match key.to_ascii_lowercase().as_str() {
-            "ctrl" | "control" => modifiers |= 2,
-            "alt" => modifiers |= 1,
-            "meta" | "command" => modifiers |= 4,
-            "shift" => modifiers |= 8,
+            "ctrl" | "control" => modifiers |= CTRL,
+            "alt" | "option" => modifiers |= ALT,
+            "meta" | "command" | "cmd" | "win" | "super" => modifiers |= META,
+            "shift" => modifiers |= SHIFT,
             _ => {
                 if primary.replace(key.as_str()).is_some() {
                     return Err(error(
@@ -1176,68 +1264,233 @@ fn key_chord(keys: &[String]) -> Result<(String, String, u32, u32)> {
     }
     let key =
         primary.ok_or_else(|| error("CONTROL.INVALID_REQUEST", "key requires a primary key"))?;
-    // Keep browser/OS navigation shortcuts out of an element-scoped action.
-    // Only editing combinations have a meaningful anchored target.
     let lower = key.to_ascii_lowercase();
-    if modifiers & 1 != 0
-        || (modifiers & (2 | 4) != 0
-            && !matches!(
-                lower.as_str(),
-                "a" | "z"
-                    | "y"
-                    | "home"
-                    | "end"
-                    | "arrowleft"
-                    | "left"
-                    | "arrowright"
-                    | "right"
-                    | "arrowup"
-                    | "up"
-                    | "arrowdown"
-                    | "down"
-                    | "backspace"
-                    | "delete"
-            ))
-    {
-        return Err(error(
-            "CONTROL.ACTION_UNSUPPORTED",
-            "browser or global shortcuts are not element-scoped editing actions",
-        ));
-    }
-    let (name, code, vk) = match key.to_ascii_lowercase().as_str() {
-        "enter" => ("Enter", "Enter", 13),
-        "tab" => ("Tab", "Tab", 9),
-        "escape" | "esc" => ("Escape", "Escape", 27),
-        "backspace" => ("Backspace", "Backspace", 8),
-        "delete" => ("Delete", "Delete", 46),
-        "arrowleft" | "left" => ("ArrowLeft", "ArrowLeft", 37),
-        "arrowright" | "right" => ("ArrowRight", "ArrowRight", 39),
-        "arrowup" | "up" => ("ArrowUp", "ArrowUp", 38),
-        "arrowdown" | "down" => ("ArrowDown", "ArrowDown", 40),
-        "home" => ("Home", "Home", 36),
-        "end" => ("End", "End", 35),
-        "pageup" => ("PageUp", "PageUp", 33),
-        "pagedown" => ("PageDown", "PageDown", 34),
-        _ => {
-            if matches!(key.to_ascii_lowercase().as_str(), "a" | "z" | "y")
-                && modifiers & (2 | 4) != 0
-                && modifiers & 1 == 0
-            {
-                let upper = key.to_ascii_uppercase();
-                return Ok((
-                    key.to_ascii_lowercase(),
-                    format!("Key{upper}"),
-                    upper.as_bytes()[0] as u32,
-                    modifiers,
-                ));
-            }
-            return Err(error(
-                "CONTROL.ACTION_UNSUPPORTED",
-                "use fill for text; unsupported key chord",
-            ));
-        }
+    let named: Option<(&str, u32)> = match lower.as_str() {
+        "enter" | "return" => Some(("Enter", 13)),
+        "tab" => Some(("Tab", 9)),
+        "escape" | "esc" => Some(("Escape", 27)),
+        "backspace" => Some(("Backspace", 8)),
+        "delete" | "del" => Some(("Delete", 46)),
+        "insert" => Some(("Insert", 45)),
+        "arrowleft" | "left" => Some(("ArrowLeft", 37)),
+        "arrowright" | "right" => Some(("ArrowRight", 39)),
+        "arrowup" | "up" => Some(("ArrowUp", 38)),
+        "arrowdown" | "down" => Some(("ArrowDown", 40)),
+        "home" => Some(("Home", 36)),
+        "end" => Some(("End", 35)),
+        "pageup" => Some(("PageUp", 33)),
+        "pagedown" => Some(("PageDown", 34)),
+        "space" | "spacebar" => Some((" ", 32)),
+        // F2 edits a grid cell; every other function key is the browser's.
+        "f2" => Some(("F2", 113)),
+        _ => None,
     };
-    Ok((name.into(), code.into(), vk, modifiers))
+    let character = (key.chars().count() == 1)
+        .then(|| key.chars().next().unwrap())
+        .filter(|c| us_key(*c).is_some() && !c.is_control());
+    let refuse = || {
+        Err(error(
+            "CONTROL.ACTION_UNSUPPORTED",
+            format!(
+                "{} is a browser-global shortcut or not an element-scoped key; only editing \
+                 and navigation keys for the focused element are sent",
+                keys.join("+")
+            ),
+        ))
+    };
+    if modifiers & (ALT | META) != 0 {
+        return refuse();
+    }
+    let navigation = matches!(
+        named.map(|(k, _)| k),
+        Some("ArrowLeft" | "ArrowRight" | "ArrowUp" | "ArrowDown" | "Home" | "End")
+    );
+    let allowed = match (modifiers & CTRL != 0, modifiers & SHIFT != 0) {
+        (false, _) => named.is_some() || character.is_some(),
+        // Ctrl+Tab and Ctrl+PageUp/PageDown switch tabs.
+        (true, false) => {
+            navigation
+                || matches!(
+                    named.map(|(k, _)| k),
+                    Some("Enter" | "Backspace" | "Delete" | " ")
+                )
+                || matches!(
+                    lower.as_str(),
+                    "a" | "c" | "v" | "x" | "z" | "y" | "b" | "i"
+                )
+        }
+        // Ctrl+Shift opens windows, devtools and history; selection and redo stay.
+        (true, true) => navigation || lower == "z",
+    };
+    if !allowed {
+        return refuse();
+    }
+    if let Some((name, vk)) = named {
+        let code = if name == " " { "Space" } else { name };
+        let text = (modifiers & CTRL == 0)
+            .then(|| match name {
+                "Enter" => Some("\r".to_string()),
+                " " => Some(" ".to_string()),
+                _ => None,
+            })
+            .flatten();
+        return Ok(KeyPress {
+            key: name.into(),
+            code: code.into(),
+            virtual_key: vk,
+            modifiers,
+            text,
+        });
+    }
+    let character = character.expect("allowed keys are named or typed");
+    // With Ctrl, a letter names its key: Ctrl+A is Ctrl+a, not Ctrl+Shift+a.
+    let character = if modifiers & CTRL != 0 {
+        character.to_ascii_lowercase()
+    } else {
+        character
+    };
+    let (mut key, code, virtual_key, shift) = us_key(character).unwrap();
+    if shift {
+        modifiers |= SHIFT;
+    }
+    if modifiers & SHIFT != 0 && !shift {
+        // Shift+1 types "!": the key's shifted character, as the layout has it.
+        if let Some(shifted) = (' '..='~').find(|c| {
+            us_key(*c).is_some_and(|(_, other, _, needs_shift)| other == code && needs_shift)
+        }) {
+            key = shifted.to_string();
+        }
+    }
+    let text = (modifiers & CTRL == 0).then(|| key.clone());
+    Ok(KeyPress {
+        key,
+        code,
+        virtual_key,
+        modifiers,
+        text,
+    })
+}
+
+/// Press and release one key. The document must still be the observed one
+/// between the two halves.
+fn press(client: &mut Client, press: &KeyPress) -> Result<()> {
+    let mut down = json!({"type": if press.text.is_some() {"keyDown"} else {"rawKeyDown"},
+        "key": press.key, "code": press.code, "windowsVirtualKeyCode": press.virtual_key,
+        "nativeVirtualKeyCode": press.virtual_key, "modifiers": press.modifiers});
+    if let Some(text) = &press.text {
+        down["text"] = json!(text);
+        down["unmodifiedText"] = json!(text);
+    }
+    command(client, "Input.dispatchKeyEvent", down).map_err(|e| e.with_effect("unknown"))?;
+    command(
+        client,
+        "Input.dispatchKeyEvent",
+        json!({"type": "keyUp", "key": press.key, "code": press.code,
+            "windowsVirtualKeyCode": press.virtual_key, "nativeVirtualKeyCode": press.virtual_key,
+            "modifiers": press.modifiers}),
+    )
+    .map_err(|e| e.with_effect("unknown"))?;
+    Ok(())
+}
+
+/// What a typing request sends, character by character, checked before
+/// anything is sent: a character a US layout cannot type refuses the whole text.
+enum Keystrokes {
+    Presses(Vec<KeyPress>),
+    Text(Vec<String>),
+}
+
+fn keystrokes(text: &str, mode: Option<crate::TypeMode>) -> Result<Keystrokes> {
+    match mode {
+        None | Some(crate::TypeMode::Unicode) => Ok(Keystrokes::Text(
+            text.chars().map(|c| c.to_string()).collect(),
+        )),
+        Some(crate::TypeMode::Keys) => text
+            .chars()
+            .map(|character| {
+                typed_key(character).ok_or_else(|| {
+                    error(
+                        "CONTROL.INVALID_REQUEST",
+                        format!(
+                            "character {character:?} has no key on a US layout; use mode \
+                             unicode or fill"
+                        ),
+                    )
+                    .with_detail("character", json!(character.to_string()))
+                })
+            })
+            .collect::<Result<Vec<_>>>()
+            .map(Keystrokes::Presses),
+    }
+}
+
+/// Focus the observed element, confirm the keystrokes would reach it, then
+/// send a chord or type text, re-confirming focus between characters.
+fn keyboard(
+    client: &mut Client,
+    context: i64,
+    args: &Value,
+    frame_id: &str,
+    loader: &Value,
+    action: &Action,
+    action_context: &crate::Context,
+) -> Result<Value> {
+    let strokes = match action {
+        Action::Key { keys } => Keystrokes::Presses(vec![key_chord(keys)?]),
+        Action::TypeText { text, mode } => keystrokes(text, *mode)?,
+        _ => unreachable!("only keyboard actions reach here"),
+    };
+    action_context.commit()?;
+    checked(
+        eval(
+            client,
+            context,
+            format!("globalThis.__aadControlV1.act({args})"),
+        )
+        .map_err(|e| e.with_effect("unknown"))?,
+    )?;
+    let focused = |client: &mut Client, effect: &str| -> Result<()> {
+        let verify = eval(
+            client,
+            context,
+            format!("globalThis.__aadControlV1.verify({args})"),
+        )
+        .map_err(|e| e.with_effect(effect))?;
+        if verify["ok"] != true
+            || current_frame(client, frame_id).map_err(|e| e.with_effect(effect))?["loaderId"]
+                != *loader
+        {
+            return Err(error(
+                "CONTROL.FOCUS_LOST",
+                "keyboard focus left the observed element, or its document changed",
+            )
+            .with_effect(effect));
+        }
+        Ok(())
+    };
+    focused(client, "contextual")?;
+    let (count, operation) = match &strokes {
+        Keystrokes::Presses(presses) => (presses.len(), "Input.dispatchKeyEvent"),
+        Keystrokes::Text(chunks) => (chunks.len(), "Input.insertText"),
+    };
+    for index in 0..count {
+        if index > 0 {
+            // Typing stops where focus moved: later keys would land elsewhere.
+            focused(client, "contextual").map_err(|e| e.with_detail("typed", json!(index)))?;
+        }
+        action_context.commit()?;
+        match &strokes {
+            Keystrokes::Presses(presses) => press(client, &presses[index])?,
+            Keystrokes::Text(chunks) => {
+                command(client, "Input.insertText", json!({"text": chunks[index]}))
+                    .map_err(|e| e.with_effect("unknown"))?;
+            }
+        }
+    }
+    Ok(
+        json!({"submitted": true, "native_operation": operation, "trusted_event": true,
+        "keystrokes": count}),
+    )
 }
 
 #[cfg(test)]
@@ -1319,14 +1572,97 @@ mod tests {
     }
     #[test]
     fn keys_are_allowlisted_without_arbitrary_cdp_parameters() {
+        let chord =
+            |keys: &[&str]| key_chord(&keys.iter().map(|k| k.to_string()).collect::<Vec<_>>());
         assert_eq!(
-            key_chord(&["ctrl".into(), "a".into()]).unwrap(),
-            ("a".into(), "KeyA".into(), 65, 2)
+            chord(&["ctrl", "a"]).unwrap(),
+            KeyPress {
+                key: "a".into(),
+                code: "KeyA".into(),
+                virtual_key: 65,
+                modifiers: CTRL,
+                text: None
+            }
         );
-        assert_eq!(key_chord(&["Enter".into()]).unwrap().2, 13);
-        assert!(key_chord(&["a".into()]).is_err());
-        assert!(key_chord(&["Enter".into(), "Tab".into()]).is_err());
-        assert!(key_chord(&["ctrl".into(), "Tab".into()]).is_err());
-        assert!(key_chord(&["alt".into(), "ArrowLeft".into()]).is_err());
+        let enter = chord(&["Enter"]).unwrap();
+        assert_eq!((enter.virtual_key, enter.text.as_deref()), (13, Some("\r")));
+        // Editing shortcuts scoped to the focused element.
+        for keys in [
+            &["ctrl", "c"][..],
+            &["ctrl", "v"],
+            &["ctrl", "x"],
+            &["ctrl", "z"],
+            &["ctrl", "shift", "z"],
+            &["shift", "ArrowLeft"],
+            &["ctrl", "shift", "End"],
+            &["shift", "Tab"],
+            &["a"],
+            &["shift", "1"],
+            &["F2"],
+        ] {
+            assert!(chord(keys).is_ok(), "{keys:?}");
+        }
+        let bang = chord(&["shift", "1"]).unwrap();
+        assert_eq!((bang.key.as_str(), bang.text.as_deref()), ("!", Some("!")));
+        let shifted = chord(&["shift", "a"]).unwrap();
+        assert_eq!((shifted.key.as_str(), shifted.modifiers), ("A", SHIFT));
+        // Shortcuts the browser itself acts on are refused.
+        for keys in [
+            &["ctrl", "t"][..],
+            &["ctrl", "w"],
+            &["ctrl", "n"],
+            &["ctrl", "l"],
+            &["ctrl", "u"],
+            &["ctrl", "Tab"],
+            &["ctrl", "PageDown"],
+            &["ctrl", "shift", "t"],
+            &["ctrl", "shift", "i"],
+            &["F12"],
+            &["F5"],
+            &["alt", "F4"],
+            &["alt", "ArrowLeft"],
+            &["meta", "a"],
+        ] {
+            let refused = chord(keys).unwrap_err();
+            assert_eq!(refused.code, "CONTROL.ACTION_UNSUPPORTED", "{keys:?}");
+            assert!(refused.message.contains("browser-global"), "{keys:?}");
+        }
+        assert!(chord(&["Enter", "Tab"]).is_err());
+        assert!(chord(&["ctrl"]).is_err());
+    }
+
+    #[test]
+    fn typing_in_keys_mode_needs_a_us_key_for_every_character() {
+        let Keystrokes::Presses(presses) =
+            keystrokes("Hi, 9!\n", Some(crate::TypeMode::Keys)).unwrap()
+        else {
+            panic!("keys mode presses keys")
+        };
+        let summary: Vec<_> = presses
+            .iter()
+            .map(|p| (p.code.as_str(), p.modifiers, p.text.as_deref()))
+            .collect();
+        assert_eq!(
+            summary,
+            [
+                ("KeyH", SHIFT, Some("H")),
+                ("KeyI", 0, Some("i")),
+                ("Comma", 0, Some(",")),
+                ("Space", 0, Some(" ")),
+                ("Digit9", 0, Some("9")),
+                ("Digit1", SHIFT, Some("!")),
+                ("Enter", 0, Some("\r")),
+            ]
+        );
+        let refused = keystrokes("café", Some(crate::TypeMode::Keys))
+            .err()
+            .unwrap();
+        assert_eq!(refused.code, "CONTROL.INVALID_REQUEST");
+        assert_eq!(refused.details["character"], "é");
+        // Unicode mode inserts any text, one character at a time.
+        let Keystrokes::Text(chunks) = keystrokes("日本é", None).unwrap() else {
+            panic!("unicode mode inserts text")
+        };
+        assert_eq!(chunks, ["日", "本", "é"]);
     }
 }

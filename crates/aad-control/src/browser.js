@@ -18,6 +18,8 @@
   const checkable = el => (el.tagName==='INPUT' && ['checkbox','radio'].includes((el.type||'').toLowerCase())) || ['checkbox','switch','radio'].includes(el.getAttribute('role'));
   const checkedOf = el => el.tagName==='INPUT' ? !!el.checked : el.getAttribute('aria-checked')==='true';
   const radio = el => (el.type||'').toLowerCase()==='radio' || el.getAttribute('role')==='radio';
+  // The focused element itself, inside any open shadow roots on the way.
+  const activeElement = () => {let a=document.activeElement;while(a && a.shadowRoot && a.shadowRoot.activeElement)a=a.shadowRoot.activeElement;return a;};
   const scrollable = el => el===document.body || ((el.scrollHeight>el.clientHeight+1 || el.scrollWidth>el.clientWidth+1) && /(auto|scroll|overlay)/.test(getComputedStyle(el).overflow+getComputedStyle(el).overflowY+getComputedStyle(el).overflowX));
   const actions = el => {
     if (!enabled(el) || protectedNode(el)) return [];
@@ -25,7 +27,7 @@
     const result=[];
     if (typeof el.focus==='function') result.push('focus','key');
     if ((['BUTTON','A','INPUT','SELECT'].includes(el.tagName) || el.onclick || roleOf(el)==='button' || checkable(el)) && typeof el.click==='function') result.push('click','hover');
-    if (editable(el)) result.push('fill');
+    if (editable(el)) result.push('fill','type_text');
     if (el.tagName==='SELECT' && !el.multiple) result.push('select');
     if (checkable(el)) result.push('check');
     if (scrollable(el)) result.push('scroll');
@@ -52,7 +54,7 @@
         nodes.set(node_id,{el,fingerprint:fingerprint(el)});
         const node={node_id,role:roleOf(el),name:labelOf(el),tag:el.tagName.toLowerCase(),
           value:protectedNode(el)?null:(('value' in el)?String(el.value).slice(0,4096):null),
-          states:{enabled:enabled(el),protected:protectedNode(el),read_only:!!el.readOnly,focused:document.activeElement===el},actions:actions(el)};
+          states:{enabled:enabled(el),protected:protectedNode(el),read_only:!!el.readOnly,focused:activeElement()===el},actions:actions(el)};
         if (checkable(el)) node.states.checked=checkedOf(el);
         if (fileInput(el)) { node.states.hidden=!visible(el); node.files=Array.from(el.files||[]).slice(0,32).map(f=>f.name.slice(0,256)); node.multiple=!!el.multiple; }
         if (el.tagName==='SELECT') node.options=Array.from(el.options).slice(0,100).map(o=>o.label.trim().slice(0,256));
@@ -92,16 +94,17 @@
         if(checkedOf(el)!==args.checked) return {error:'CONTROL.STATE_UNCHANGED',effect:'contextual'};
         return {submitted:true,native_operation:'HTMLElement.click',checked:args.checked};
       }
-      if(args.action==='focus'||args.action==='key') {
-        el.focus({preventScroll:true});
-        if(document.activeElement!==el) return {error:'CONTROL.FOCUS_FAILED',effect:'contextual'};
+      if(args.action==='focus'||args.action==='key'||args.action==='type_text') {
+        if(activeElement()!==el) el.focus({preventScroll:true});
+        if(activeElement()!==el) return {error:'CONTROL.FOCUS_FAILED',effect:'contextual'};
         return {submitted:true,native_operation:'HTMLElement.focus'};
       }
       return {error:'CONTROL.ACTION_UNSUPPORTED'};
     },
+    // Keystrokes go wherever focus is: only to the observed element, in a focused document.
     verify: args => {
       const found=check(args); if(found.error) return found;
-      return {ok:document.activeElement===found.el};
+      return {ok:activeElement()===found.el && document.hasFocus()};
     },
     confirm: args => {
       const found=check(args); if(found.error) return found;

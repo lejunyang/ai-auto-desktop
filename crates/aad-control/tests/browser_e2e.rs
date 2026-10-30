@@ -36,6 +36,7 @@ const PAGE: &str = r#"<!doctype html><html><body>
 <button aria-label="Sure" onclick="document.getElementById('status').value='confirm:'+confirm('Sure?')">Sure</button>
 <input type="file" aria-label="Attachment" onchange="document.getElementById('status').value='files:'+Array.from(this.files).map(f=>f.name+':'+f.size).join(',')">
 <input type="file" aria-label="Hidden upload" multiple style="display:none" onchange="document.getElementById('status').value='hidden:'+Array.from(this.files).map(f=>f.name).join(',')">
+<input id="typed" aria-label="Typed" onkeydown="document.getElementById('keylog').value+='d:'+event.key+':'+event.isTrusted+' '" onkeypress="document.getElementById('keylog').value+='p:'+event.key+' '"><output id="keylog" aria-label="Key log"></output>
 <iframe src="/frame"></iframe>
 </body></html>"#;
 
@@ -320,6 +321,115 @@ fn wait_until(session: &Session, resource: &str, name: &str, condition: WaitCond
         },
         10_000,
     )
+}
+
+fn value<'a>(observation: &'a Value, name: &str) -> &'a str {
+    node(observation, name)["value"]
+        .as_str()
+        .unwrap_or_default()
+}
+/// Observe the main frame and act on the node with this role and name.
+fn act_on(session: &Session, main: &str, role: &str, name: &str, action: Action) -> Response {
+    let observed = observe(session, main);
+    let target = find(session, &observed, role, name);
+    act(session, target, action)
+}
+fn keys(keys: &[&str]) -> Action {
+    Action::Key {
+        keys: keys.iter().map(|k| k.to_string()).collect(),
+    }
+}
+fn type_text(text: &str, mode: Option<TypeMode>) -> Action {
+    Action::TypeText {
+        text: text.into(),
+        mode,
+    }
+}
+
+#[test]
+#[ignore = "requires isolated Chromium with its sandbox enabled; CI runs it explicitly"]
+fn typing_sends_trusted_keystrokes_and_shortcuts_stay_on_the_focused_field() {
+    let _serial = serial();
+    let fixture = Fixture::new();
+    let (session, _) = session_for(&fixture);
+    let main = main_of(&session, &fixture.page_id);
+    assert!(wait_until(&session, &main, "Typed", WaitCondition::Appears)
+        .error
+        .is_none());
+    let observed = observe(&session, &main);
+    assert!(actions(&observed, "Typed").contains(&"type_text".to_string()));
+    assert!(!actions(&observed, "Save").contains(&"type_text".to_string()));
+    // Keys mode: real key events with key, code and the text they type.
+    let typed = act_on(
+        &session,
+        &main,
+        "textbox",
+        "Typed",
+        type_text("Ab1!", Some(TypeMode::Keys)),
+    );
+    assert!(typed.error.is_none(), "{typed:?}");
+    assert_eq!(typed.data.unwrap()["backend_result"]["keystrokes"], 4);
+    let observed = observe(&session, &main);
+    assert_eq!(value(&observed, "Typed"), "Ab1!");
+    assert_eq!(
+        value(&observed, "Key log"),
+        "d:A:true p:A d:b:true p:b d:1:true p:1 d:!:true p:! "
+    );
+    // A character a US layout has no key for is refused before anything is sent.
+    let refused = act_on(
+        &session,
+        &main,
+        "textbox",
+        "Typed",
+        type_text("é", Some(TypeMode::Keys)),
+    );
+    assert_eq!(refused.commit_state, CommitState::NotCommitted);
+    assert_eq!(refused.error.unwrap()["code"], "CONTROL.INVALID_REQUEST");
+    // Ctrl+A selects the field's text, so typing replaces it; unicode mode
+    // inserts any character.
+    let selected = act_on(&session, &main, "textbox", "Typed", keys(&["ctrl", "a"]));
+    assert!(selected.error.is_none(), "{selected:?}");
+    let typed = act_on(&session, &main, "textbox", "Typed", type_text("Zé日", None));
+    assert!(typed.error.is_none(), "{typed:?}");
+    assert_eq!(value(&observe(&session, &main), "Typed"), "Zé日");
+    // Shift+Arrow extends the selection; Backspace removes it.
+    for chord in [
+        &["shift", "ArrowLeft"][..],
+        &["shift", "ArrowLeft"],
+        &["Backspace"],
+    ] {
+        let pressed = act_on(&session, &main, "textbox", "Typed", keys(chord));
+        assert!(pressed.error.is_none(), "{chord:?}: {pressed:?}");
+    }
+    assert_eq!(value(&observe(&session, &main), "Typed"), "Z");
+    // Undo brings the deleted text back.
+    let undone = act_on(&session, &main, "textbox", "Typed", keys(&["ctrl", "z"]));
+    assert!(undone.error.is_none(), "{undone:?}");
+    assert_eq!(value(&observe(&session, &main), "Typed"), "Zé日");
+    // Shortcuts the browser itself would act on never reach the page.
+    for chord in [
+        &["ctrl", "t"][..],
+        &["ctrl", "w"],
+        &["F12"],
+        &["alt", "F4"],
+        &["ctrl", "shift", "n"],
+    ] {
+        let refused = act_on(&session, &main, "textbox", "Typed", keys(chord));
+        assert_eq!(refused.commit_state, CommitState::NotCommitted, "{chord:?}");
+        assert_eq!(
+            refused.error.unwrap()["code"],
+            "CONTROL.ACTION_UNSUPPORTED",
+            "{chord:?}"
+        );
+    }
+    assert_eq!(
+        targets(&session)
+            .iter()
+            .filter(|r| r["metadata"]["main_frame"] == true)
+            .count(),
+        1,
+        "no tab was opened"
+    );
 }
 
 #[test]

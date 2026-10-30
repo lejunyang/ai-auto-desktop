@@ -85,13 +85,19 @@ fn action_schema() -> Value {
                 "default": "unicode",
                 "description": "unicode types arbitrary text. keys maps characters through \
     the target window's keyboard layout into virtual-key presses, which Raw Input consumers \
-    can see; it rejects characters the layout cannot express."
+    can see; it rejects characters the layout cannot express. In a browser both are trusted \
+    input to the focused field, one character at a time: unicode inserts text (input events, \
+    no key events); keys sends keydown/keypress/keyup with key and code on a US layout and \
+    rejects other characters. Typing stops with CONTROL.FOCUS_LOST if focus moves away."
             }
         }), &["text"]),
         variant("key", "Press a key combination on the element after focusing it: \
     shortcuts and keys no text can express, such as Ctrl+Z, F5, Tab or Escape. Modifiers \
-    (ctrl, shift, alt, win) followed by exactly one main key. Browsers accept only \
-    navigation and editing keys.", json!({
+    (ctrl, shift, alt, win) followed by exactly one main key. Browsers accept editing and \
+    navigation keys for the focused element -- Enter, Tab, Escape, arrows, Home/End, \
+    Backspace, a single character, ctrl+a/c/v/x/z/y, ctrl+shift+z, shift or ctrl+shift with \
+    arrows -- and refuse browser-global shortcuts (ctrl+t/w/n/l, ctrl+tab, other \
+    ctrl+shift chords, alt chords, function keys but F2).", json!({
             "keys": {"type": "array", "items": {"type": "string", "maxLength": 32}, "minItems": 1, "maxItems": 6}
         }), &["keys"]),
         variant("scroll", "Scroll the wheel over the element. In a browser, offered on the \
@@ -467,6 +473,11 @@ or take the node_id from an outline."
         }
         "CONTROL.OCCLUDED" => {
             "Something is laid over the element, such as a dialog, a banner or a menu, so pointer input would land on that instead. Observe again and deal with what covers it, or use a plain click (DOM activation) if that is enough."
+        }
+        "CONTROL.FOCUS_LOST" | "CONTROL.FOCUS_FAILED" => {
+            "Keyboard focus is not (or no longer) on the observed element, so further keys \
+would land elsewhere; details.typed says how many characters were sent. Observe again, \
+check the field's value, and continue with fill or type_text on the field's new target."
         }
         "CONTROL.OPTION_NOT_FOUND" => {
             "No option has that label or value. The observation lists the labels in the node's `options`."
