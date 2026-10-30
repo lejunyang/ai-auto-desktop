@@ -11,7 +11,7 @@
 | `desktop.windows_uia` | focus, invoke, click, fill, type_text, key, scroll, hover, drag | UIA + 原生输入；click 带 button/count/fraction 时走原生手势；节点必须暴露对应能力 |
 | `desktop.linux_atspi` | focus, invoke, click, fill, type_text, key, scroll, hover, drag | AT-SPI；指针/键盘经 X11 XTest helper，只支持 KDE/X11 会话；派发前核对焦点、PID 与落点，drag 起止两点都核对 |
 | `desktop.macos_ax` | focus, invoke, click, fill, type_text, key, scroll, hover, drag | AX helper；需要同一登录用户的辅助功能权限；指针动作要求目标应用在前台并经 AX 命中检查，事件只投递给目标进程；key 名称按字面（`ctrl` 是 Control，`cmd` 是 Command） |
-| `browser.cdp` | focus, click, fill, key, scroll, hover, select, check, navigate, back, forward, reload, open_tab, activate_page, close_page | 普通 click 为 `HTMLElement.click()` 的 DOM 激活；带 button/count/fraction 的 click、scroll、hover 为主 frame 的可信 CDP Input，落点先在页面里命中检查；fill/select 为 DOM 值及 input/change 事件；check 已是目标状态时不点击；key 为主 frame 的 CDP Input；navigate/back/forward/reload 与标签页动作 open_tab/activate_page/close_page 在 body 节点上，只限主 frame；没有 drag |
+| `browser.cdp` | focus, click, fill, key, scroll, hover, select, check, navigate, back, forward, reload, open_tab, activate_page, close_page, accept, dismiss | 普通 click 为 `HTMLElement.click()` 的 DOM 激活；带 button/count/fraction 的 click、scroll、hover 为主 frame 的可信 CDP Input，落点先在页面里命中检查；fill/select 为 DOM 值及 input/change 事件；check 已是目标状态时不点击；key 为主 frame 的 CDP Input；navigate/back/forward/reload 与标签页动作 open_tab/activate_page/close_page 在 body 节点上，只限主 frame；accept/dismiss 只在 JavaScript 对话框节点上；没有 drag |
 
 以 `capabilities` 和观察节点的 `capabilities` 为准。可列出 provider 不表示当前 OS 已授予
 桌面权限。启动失败或不可用原因在 `unavailable` 中返回。浏览器 key 只支持列出的导航/编辑键
@@ -32,11 +32,28 @@ OAuth 登录弹窗）在 `targets` 里与其他页面一样列出，`metadata.op
 open_tab 后新页 `visibilityState` 为 visible、原页 hidden，activate_page 后原页回到 visible，close_page 后
 `targets` 不再列出该页，可信 click 触发的 `window.open` 弹窗带正确的 `opener_page_id`。
 
+JavaScript 对话框（alert/confirm/prompt/beforeunload）：会话连接每个页面时先开 `Page` 域，只缓冲
+`Page.javascriptDialogOpening/Closed` 两种事件。对话框打开后页面渲染进程被阻塞：`targets` 仍列出该页
+（`metadata.dialog` 给出类型与文字，能力只有 accept/dismiss），`observe` 只返回一个 `role: alertdialog` 的节点，
+`name` 是对话框文字，prompt 的 `value` 是默认答案，`dialog` 字段含 `type`/`message`/`default_prompt`/`url`；
+在它上面 `accept`（prompt 可带 `text`，其他类型带 `text` 返回 `CONTROL.INVALID_REQUEST`）或 `dismiss`，
+经 `Page.handleJavaScriptDialog` 处理；对话框已换成另一个或已关闭时返回 `CONTROL.STALE_TARGET`。
+同一页面上的其他 act 与 capture 立即返回 `CONTROL.DIALOG_OPEN`（`not_committed`，`details.dialog` 带类型与文字），
+不会等到超时。动作本身弹出对话框时（例如 click 的处理函数里调用 `prompt`），等待中的 CDP 命令被对话框事件
+中断，动作按已派发返回，`backend_result.dialog_opened: true`；可信指针的 mouseReleased、按键的 keyUp 在这种情况下不再发送。
+限制：会话连上页面之前就已打开的对话框无法经 CDP 处理——浏览器只允许看到它打开的那个连接应答，
+被阻塞的页面也不响应新连接的 `Page.enable`。这种页面 2 秒内判定为无响应，`targets` 里标 `metadata.responsive: false`、
+不提供能力，`observe` 返回 `BROWSER.PAGE_UNRESPONSIVE`，而不是让整个列表挂到超时；需要人手关闭对话框。
+会话在 `targets` 时连接全部页面，所以之后打开的对话框都能处理；一个新弹窗如果在下一次 `targets` 之前就弹出对话框，属于上述限制。
+实测（Windows，本机 Chrome headless，`dialogs_block_the_page_until_accepted_or_dismissed`）：prompt 带 text 接受后
+页面读到答案，confirm dismiss 得 false，计时器弹出的 alert 使 fill 在 3 秒内被拒且未写入，会话前已打开的 alert 被标为无响应。
+[待验证] Edge 与有界面（非 headless）浏览器的对话框行为；beforeunload 对话框只按同一事件路径处理，没有专门的 fixture。
+
 动作参数：`click` 可带 `button`（left/right/middle）、`count`（1/2）、`fraction`；`type_text` 可带
 `mode`（unicode/keys）；`scroll` 要 `direction`，可带 `notches`（1..30）、`fraction`；`hover` 可带
 `ms`（1..5000，默认 500）、`fraction`；`drag` 要 `to`（同一次观察里另一个节点的 target），可带
 `button`、`fraction`、`to_fraction`；`select` 要 `option`（选项文字或值，观察节点的 `options` 列出文字）；
-`check` 要 `checked`；`navigate` 与 `open_tab` 要 `url`。`fraction` 是元素框内 0..1 的比例，不是屏幕坐标。
+`check` 要 `checked`；`navigate` 与 `open_tab` 要 `url`；`accept` 可带 `text`（≤4096）。`fraction` 是元素框内 0..1 的比例，不是屏幕坐标。
 
 ## 观察视图与定位器
 

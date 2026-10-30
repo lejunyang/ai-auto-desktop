@@ -18,6 +18,9 @@ pub enum CdpError {
     Protocol(String),
     Io(String),
     BadUrl,
+    /// A command was abandoned because this event arrived while it waited,
+    /// e.g. a JavaScript dialog that blocks the page until it is handled.
+    Interrupted(String),
 }
 
 impl CdpError {
@@ -33,6 +36,13 @@ impl CdpError {
     pub fn io(error: std::io::Error) -> Self {
         CdpError::Io(error.to_string())
     }
+    /// The event method that interrupted a command, if one did.
+    pub fn interrupted_by(&self) -> Option<&str> {
+        match self {
+            CdpError::Interrupted(method) => Some(method),
+            _ => None,
+        }
+    }
 }
 
 impl std::fmt::Display for CdpError {
@@ -42,6 +52,7 @@ impl std::fmt::Display for CdpError {
             CdpError::Protocol(message) => write!(formatter, "cdp protocol: {message}"),
             CdpError::Io(message) => write!(formatter, "cdp io: {message}"),
             CdpError::BadUrl => write!(formatter, "cdp: unsupported websocket url"),
+            CdpError::Interrupted(method) => write!(formatter, "cdp: interrupted by {method}"),
         }
     }
 }

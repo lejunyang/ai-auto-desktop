@@ -137,6 +137,14 @@ fn action_schema() -> Value {
     Offered on the page's document node.", json!({}), &[]),
         variant("close_page", "Close the observed browser page (tab or popup). Offered on \
     the page's document node; its targets stop resolving.", json!({}), &[]),
+        variant("accept", "Accept (OK) the JavaScript dialog -- alert, confirm, prompt or \
+    leave-page -- that blocks a browser page. While one is open, observing the page shows \
+    only that dialog, as a node with role alertdialog. A prompt takes the answer as `text`; \
+    without it the prompt's default is used.", json!({
+            "text": {"type": "string", "maxLength": 4096}
+        }), &[]),
+        variant("dismiss", "Dismiss (Cancel) the JavaScript dialog that blocks a browser \
+    page, observed as an alertdialog node.", json!({}), &[]),
     ]})
 }
 
@@ -452,6 +460,17 @@ or take the node_id from an outline."
         }
         "CONTROL.OPTION_NOT_FOUND" => {
             "No option has that label or value. The observation lists the labels in the node's `options`."
+        }
+        "CONTROL.DIALOG_OPEN" => {
+            "A JavaScript dialog (alert, confirm, prompt or leave-page) blocks this browser \
+page, so nothing else on it can be done. Call control_observe on the page: it shows the \
+dialog as an alertdialog node with its message; control_act accept (with `text` for a \
+prompt) or dismiss on it, then observe again."
+        }
+        "BROWSER.PAGE_UNRESPONSIVE" => {
+            "The browser page does not answer, usually because a JavaScript dialog opened \
+before this session first looked at it; such a dialog cannot be answered from here. Ask the \
+person to close it in the browser, then call control_targets again."
         }
         "CONTROL.WAIT_TIMEOUT" => {
             "The condition did not hold before timeout_ms ran out; details.present says \

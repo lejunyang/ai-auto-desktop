@@ -28,9 +28,91 @@ const MAIN_FRAME_ONLY: [&str; 10] = [
     "close_page",
 ];
 
+/// How long a newly attached page may take to answer before it counts as blocked.
+const RESPONSIVE: Duration = Duration::from_secs(2);
+const DIALOG_OPENING: &str = "Page.javascriptDialogOpening";
+const DIALOG_CLOSED: &str = "Page.javascriptDialogClosed";
+
 struct Page {
     client: Client,
     websocket: String,
+    /// The JavaScript dialog blocking this page, as the browser announced it.
+    dialog: Option<Value>,
+    /// The main frame id the last frame tree reported.
+    main_frame: Option<String>,
+}
+
+impl Page {
+    /// Apply the dialog events received since the last look.
+    fn sync_dialog(&mut self) {
+        for event in self.client.drain_events().events {
+            match event["method"].as_str() {
+                Some(DIALOG_OPENING) => {
+                    let params = &event["params"];
+                    let text = |key: &str| {
+                        params[key]
+                            .as_str()
+                            .map(|s| s.chars().take(4096).collect::<String>())
+                    };
+                    self.dialog = Some(json!({
+                        "dialog_id": uuid::Uuid::new_v4().to_string(),
+                        "type": text("type").unwrap_or_else(|| "alert".into()),
+                        "message": text("message").unwrap_or_default(),
+                        "default_prompt": text("defaultPrompt"),
+                        "url": text("url"),
+                    }));
+                }
+                Some(DIALOG_CLOSED) => self.dialog = None,
+                _ => {}
+            }
+        }
+    }
+}
+
+fn dialog_open(dialog: &Value) -> AutomationError {
+    error(
+        "CONTROL.DIALOG_OPEN",
+        format!(
+            "a JavaScript {} dialog blocks this page",
+            dialog["type"].as_str().unwrap_or("alert")
+        ),
+    )
+    .with_detail(
+        "dialog",
+        json!({"type": dialog["type"], "message": dialog["message"]}),
+    )
+}
+
+/// What an observation of a page blocked by a dialog shows: the dialog alone.
+fn dialog_snapshot(page_id: &str, frame_id: &str, main: bool, dialog: &Value) -> Value {
+    let prompt = dialog["type"] == "prompt";
+    json!({
+        "snapshot_id": uuid::Uuid::new_v4().to_string(),
+        "document_token": null,
+        "truncated": false,
+        "nodes": [{
+            "node_id": "dialog",
+            "role": "alertdialog",
+            "name": dialog["message"],
+            "tag": null,
+            "value": if prompt { dialog["default_prompt"].clone() } else { Value::Null },
+            "states": {"enabled": true, "modal": true, "focused": true},
+            "actions": ["accept", "dismiss"],
+            "dialog": {
+                "type": dialog["type"],
+                "message": dialog["message"],
+                "default_prompt": dialog["default_prompt"],
+                "url": dialog["url"],
+            },
+        }],
+        "metadata": {
+            "page_id": page_id,
+            "frame_id": frame_id,
+            "main_frame": main,
+            "dialog_id": dialog["dialog_id"],
+            "dialog": dialog["type"],
+        },
+    })
 }
 pub struct BrowserBackend {
     /// The loopback CDP port; 0 until a browser is attached.
@@ -83,7 +165,7 @@ impl BrowserBackend {
         pages: &'a mut BTreeMap<String, Page>,
         target: &Target,
         deadline: Instant,
-    ) -> Result<&'a mut Client> {
+    ) -> Result<&'a mut Page> {
         if pages
             .get(&target.id)
             .is_some_and(|page| page.websocket != target.webSocketDebuggerUrl)
@@ -92,29 +174,61 @@ impl BrowserBackend {
         }
         if !pages.contains_key(&target.id) {
             if pages.len() >= 64 {
-                if let Some(id) = pages.keys().next().cloned() {
+                // Never evict a page with an open dialog: reattaching to a
+                // blocked page waits for the dialog to go.
+                if let Some(id) = pages
+                    .iter()
+                    .find(|(_, page)| page.dialog.is_none())
+                    .map(|(id, _)| id.clone())
+                {
                     pages.remove(&id);
                 }
             }
-            let client = Client::attach_until(target, deadline).map_err(cdp_error)?;
+            let mut client = Client::attach_bare_until(target, deadline).map_err(cdp_error)?;
+            client.filter_events(&[DIALOG_OPENING, DIALOG_CLOSED], &[DIALOG_OPENING]);
+            // Dialog events need the Page domain. Enabling it waits for the
+            // renderer, which a dialog opened before this connection blocks
+            // for good: the browser only lets the connection that saw a
+            // dialog open answer it. Fail fast rather than hang.
+            let patience = deadline.min(Instant::now() + RESPONSIVE);
+            client.set_deadline(patience);
+            if let Err(e) = client.command("Page.enable", json!({})) {
+                return Err(
+                    if e.interrupted_by().is_none() && Instant::now() < deadline {
+                        error(
+                            "BROWSER.PAGE_UNRESPONSIVE",
+                            "the page did not answer: a JavaScript dialog that opened before this \
+                         session attached, or a busy script, blocks it",
+                        )
+                    } else {
+                        cdp_error(e)
+                    },
+                );
+            }
+            client.set_deadline(deadline);
+            command(&mut client, "Runtime.enable", json!({}))?;
             pages.insert(
                 target.id.clone(),
                 Page {
                     client,
                     websocket: target.webSocketDebuggerUrl.clone(),
+                    dialog: None,
+                    main_frame: None,
                 },
             );
         }
-        let client = &mut pages.get_mut(&target.id).unwrap().client;
-        client.set_deadline(deadline);
-        Ok(client)
+        let page = pages.get_mut(&target.id).unwrap();
+        page.client.set_deadline(deadline);
+        page.sync_dialog();
+        Ok(page)
     }
 
-    fn with_page<T>(
+    /// Work on one page's connection with its dialog state up to date.
+    fn with_page_state<T>(
         &self,
         page_id: &str,
         timeout: Duration,
-        f: impl FnOnce(&mut Client) -> Result<T>,
+        f: impl FnOnce(&mut Page) -> Result<T>,
     ) -> Result<T> {
         let deadline = Instant::now() + timeout;
         if self.closed.load(Ordering::SeqCst) {
@@ -135,10 +249,28 @@ impl BrowserBackend {
         if self.closed.load(Ordering::SeqCst) {
             self.clear_context(&mut pages, Instant::now() + Duration::from_millis(100));
         }
-        if result.is_err() {
-            pages.remove(page_id);
+        if let Some(page) = pages.get_mut(page_id) {
+            page.sync_dialog();
+            // A fresh connection on the next call recovers from a broken one,
+            // but not while a dialog blocks the page: attaching would hang.
+            if result.is_err() && page.dialog.is_none() {
+                pages.remove(page_id);
+            }
         }
         result
+    }
+
+    /// Work on a page that must not be blocked by a JavaScript dialog.
+    fn with_page<T>(
+        &self,
+        page_id: &str,
+        timeout: Duration,
+        f: impl FnOnce(&mut Client) -> Result<T>,
+    ) -> Result<T> {
+        self.with_page_state(page_id, timeout, |page| match &page.dialog {
+            Some(dialog) => Err(dialog_open(dialog)),
+            None => f(&mut page.client),
+        })
     }
 
     /// Run commands on the browser-level connection, opening it when needed.
@@ -217,7 +349,8 @@ impl BrowserBackend {
 
     fn clear_context(&self, pages: &mut BTreeMap<String, Page>, deadline: Instant) {
         if let Some((page, context)) = self.last_context.lock().unwrap().take() {
-            if let Some(page) = pages.get_mut(&page) {
+            // A page blocked by a dialog cannot evaluate; its world goes with the document.
+            if let Some(page) = pages.get_mut(&page).filter(|page| page.dialog.is_none()) {
                 page.client.set_deadline(deadline);
                 let _ = eval(
                     &mut page.client,
@@ -230,6 +363,12 @@ impl BrowserBackend {
 }
 
 fn cdp_error(e: aad_cdp::CdpError) -> AutomationError {
+    if e.interrupted_by() == Some(DIALOG_OPENING) {
+        return error(
+            "CONTROL.DIALOG_OPEN",
+            "a JavaScript dialog opened and blocks the page",
+        );
+    }
     error("BROWSER.CDP_ERROR", e.to_string())
 }
 fn command(client: &mut Client, method: &str, params: Value) -> Result<Value> {
@@ -309,6 +448,8 @@ impl Backend for BrowserBackend {
             "open_tab",
             "activate_page",
             "close_page",
+            "accept",
+            "dismiss",
         ]
         .map(String::from)
         .to_vec()
@@ -326,11 +467,53 @@ impl Backend for BrowserBackend {
         pages.retain(|id, _| targets.iter().any(|target| target.id == *id));
         let mut resources = Vec::new();
         for target in targets.iter().take(64) {
-            let client = self.page(&mut pages, target, deadline)?;
-            let tree = command(client, "Page.getFrameTree", json!({}))?;
+            let page = match self.page(&mut pages, target, deadline) {
+                Ok(page) => page,
+                Err(e) if e.code == "BROWSER.PAGE_UNRESPONSIVE" => {
+                    // Listed, so a person can be told, but nothing is offered on it.
+                    let selector = json!({"page_id": target.id, "frame_id": target.id});
+                    resources.push(BackendResource {
+                        resource: Resource {
+                            resource_id: resource_id(PROVIDER, &selector),
+                            provider: PROVIDER.into(),
+                            kind: "browser".into(),
+                            name: target.title.clone(),
+                            capabilities: Vec::new(),
+                            metadata: json!({"page_id": target.id, "frame_id": target.id,
+                                "url": target.url, "main_frame": true, "responsive": false,
+                                "opener_page_id": openers.get(&target.id)}),
+                        },
+                        selector,
+                    });
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
+            if let Some(dialog) = &page.dialog {
+                // The renderer is blocked: list the page by its last known
+                // main frame without asking it for its frames.
+                let frame_id = page.main_frame.clone().unwrap_or_else(|| target.id.clone());
+                let selector = json!({"page_id": target.id, "frame_id": frame_id});
+                resources.push(BackendResource {
+                    resource: Resource {
+                        resource_id: resource_id(PROVIDER, &selector),
+                        provider: PROVIDER.into(),
+                        kind: "browser".into(),
+                        name: target.title.clone(),
+                        capabilities: vec!["accept".into(), "dismiss".into()],
+                        metadata: json!({"page_id": target.id, "frame_id": frame_id, "url": target.url,
+                            "main_frame": true, "opener_page_id": openers.get(&target.id),
+                            "dialog": {"type": dialog["type"], "message": dialog["message"]}}),
+                    },
+                    selector,
+                });
+                continue;
+            }
+            let tree = command(&mut page.client, "Page.getFrameTree", json!({}))?;
             let root = tree["frameTree"]["frame"]["id"]
                 .as_str()
                 .ok_or_else(|| error("BROWSER.BAD_RESULT", "missing main frame"))?;
+            page.main_frame = Some(root.to_string());
             for frame in frames(&tree["frameTree"]).into_iter().take(64) {
                 let selector = json!({"page_id":target.id,"frame_id":frame["id"]});
                 let main = frame["id"] == root;
@@ -357,7 +540,12 @@ impl Backend for BrowserBackend {
         );
         let page_id = selector["page_id"].as_str().unwrap();
         let frame_id = selector["frame_id"].as_str().unwrap();
-        self.with_page(page_id,deadline.saturating_duration_since(Instant::now()),|client|{
+        self.with_page_state(page_id,deadline.saturating_duration_since(Instant::now()),|page|{
+            if let Some(dialog)=&page.dialog {
+                let main=page.main_frame.as_deref().is_none_or(|main|main==frame_id);
+                return Ok(dialog_snapshot(page_id,frame_id,main,dialog));
+            }
+            let client=&mut page.client;
             let frame=current_frame(client,frame_id)?;
             let context=command(client,"Page.createIsolatedWorld",json!({"frameId":frame_id,"worldName":self.world,"grantUniveralAccess":false}))?["executionContextId"].as_i64()
                 .ok_or_else(||error("BROWSER.BAD_RESULT","frame did not provide an isolated context"))?;
@@ -403,9 +591,12 @@ impl Backend for BrowserBackend {
                 "trusted pointer input is supported only for the main frame",
             ));
         }
+        if matches!(action, Action::Accept { .. } | Action::Dismiss {}) {
+            return self.answer_dialog(snapshot, action, action_context);
+        }
         let page_id = meta["page_id"].as_str().unwrap();
         let frame_id = meta["frame_id"].as_str().unwrap();
-        self.with_page(page_id,action_context.remaining()?,|client|{
+        let result = self.with_page(page_id,action_context.remaining()?,|client|{
             if current_frame(client,frame_id)?["loaderId"]!=meta["loader_id"] {return Err(error("CONTROL.STALE_TARGET","browser document navigated"));}
             let context=meta["context_id"].as_i64().unwrap();
             let mut args=json!({"document_token":snapshot["document_token"],"observation":snapshot["snapshot_id"],"node_id":node["node_id"],"action":action.name()});
@@ -451,6 +642,67 @@ impl Backend for BrowserBackend {
                 let result=eval(client,context,format!("globalThis.__aadControlV1.act({args})")).map_err(|e|e.with_effect("unknown"))?;
                 checked(result)
             }
+        });
+        match result {
+            // The input was delivered and the page answered it with a dialog,
+            // which now blocks it: the next observation shows the dialog.
+            Err(e) if e.code == "CONTROL.DIALOG_OPEN" && e.effect != "not_applied" => Ok(
+                json!({"submitted": true, "native_operation": action.name(), "dialog_opened": true}),
+            ),
+            other => other,
+        }
+    }
+}
+
+impl BrowserBackend {
+    /// Accept or dismiss the dialog the observation showed, if it is still the one open.
+    fn answer_dialog(
+        &self,
+        snapshot: &Value,
+        action: &Action,
+        action_context: &crate::Context,
+    ) -> Result<Value> {
+        let meta = &snapshot["metadata"];
+        let expected = meta["dialog_id"].as_str().ok_or_else(|| {
+            error(
+                "CONTROL.ACTION_UNSUPPORTED",
+                "only an observed dialog can be accepted or dismissed",
+            )
+        })?;
+        let page_id = meta["page_id"].as_str().unwrap_or_default();
+        self.with_page_state(page_id, action_context.remaining()?, |page| {
+            let dialog = page
+                .dialog
+                .clone()
+                .filter(|dialog| dialog["dialog_id"] == expected)
+                .ok_or_else(|| {
+                    error(
+                        "CONTROL.STALE_TARGET",
+                        "the dialog was already closed or replaced",
+                    )
+                })?;
+            let (accept, text) = match action {
+                Action::Accept { text } => (true, text.clone()),
+                _ => (false, None),
+            };
+            if text.is_some() && dialog["type"] != "prompt" {
+                return Err(error(
+                    "CONTROL.INVALID_REQUEST",
+                    "only a prompt dialog takes text",
+                ));
+            }
+            let mut params = json!({"accept": accept});
+            if let Some(text) = &text {
+                params["promptText"] = json!(text);
+            }
+            action_context.commit()?;
+            command(&mut page.client, "Page.handleJavaScriptDialog", params)
+                .map_err(|e| e.with_effect("unknown"))?;
+            page.dialog = None;
+            Ok(
+                json!({"submitted": true, "native_operation": "Page.handleJavaScriptDialog",
+                "accepted": accept, "dialog_type": dialog["type"]}),
+            )
         })
     }
 }
@@ -750,6 +1002,34 @@ fn key_chord(keys: &[String]) -> Result<(String, String, u32, u32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn a_blocked_page_shows_only_its_dialog_and_offers_only_answers() {
+        let dialog = json!({"dialog_id": "d1", "type": "prompt", "message": "Your name?",
+            "default_prompt": "guest", "url": "http://127.0.0.1/"});
+        let snapshot = dialog_snapshot("p", "f", true, &dialog);
+        let nodes = snapshot["nodes"].as_array().unwrap();
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0]["role"], "alertdialog");
+        assert_eq!(nodes[0]["value"], "guest");
+        assert_eq!(nodes[0]["actions"], json!(["accept", "dismiss"]));
+        assert_eq!(snapshot["metadata"]["dialog_id"], "d1");
+        assert_eq!(snapshot["truncated"], false);
+        let alert = dialog_snapshot(
+            "p",
+            "f",
+            true,
+            &json!({"dialog_id": "d2", "type": "alert", "message": "Hi", "default_prompt": ""}),
+        );
+        assert!(alert["nodes"][0]["value"].is_null());
+        let refused = dialog_open(&dialog);
+        assert_eq!(refused.code, "CONTROL.DIALOG_OPEN");
+        assert_eq!(refused.effect, "not_applied");
+        assert_eq!(refused.details["dialog"]["message"], "Your name?");
+        assert_eq!(
+            cdp_error(aad_cdp::CdpError::Interrupted(DIALOG_OPENING.into())).code,
+            "CONTROL.DIALOG_OPEN"
+        );
+    }
     #[test]
     fn keys_are_allowlisted_without_arbitrary_cdp_parameters() {
         assert_eq!(

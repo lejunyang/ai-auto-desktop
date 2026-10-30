@@ -215,9 +215,16 @@ pub enum Action {
     ActivatePage {},
     /// Close the observed page.
     ClosePage {},
+    /// Accept the JavaScript dialog an observation shows; a prompt takes `text`.
+    Accept {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        text: Option<String>,
+    },
+    /// Dismiss (cancel) the JavaScript dialog an observation shows.
+    Dismiss {},
 }
 
-pub const ACTION_NAMES: [&str; 18] = [
+pub const ACTION_NAMES: [&str; 20] = [
     "focus",
     "invoke",
     "click",
@@ -236,6 +243,8 @@ pub const ACTION_NAMES: [&str; 18] = [
     "open_tab",
     "activate_page",
     "close_page",
+    "accept",
+    "dismiss",
 ];
 
 /// Actions on the page as a whole, offered on its document node.
@@ -281,6 +290,8 @@ impl Action {
             Self::OpenTab { .. } => "open_tab",
             Self::ActivatePage {} => "activate_page",
             Self::ClosePage {} => "close_page",
+            Self::Accept { .. } => "accept",
+            Self::Dismiss {} => "dismiss",
         }
     }
     /// A left single click at the centre needs nothing beyond a plain click.

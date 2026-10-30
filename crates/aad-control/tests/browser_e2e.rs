@@ -31,6 +31,8 @@ const PAGE: &str = r#"<!doctype html><html><body>
 <div style="position:relative"><button aria-label="Covered">Covered</button><div style="position:absolute;inset:0;background:white"></div></div>
 <a href="/second" aria-label="Second page">second</a>
 <button aria-label="Popup" onclick="window.open('/second','_blank','popup')">Popup</button>
+<button aria-label="Ask" onclick="document.getElementById('status').value='answer:'+prompt('Your name?','guest')">Ask</button>
+<button aria-label="Sure" onclick="document.getElementById('status').value='confirm:'+confirm('Sure?')">Sure</button>
 <iframe src="/frame"></iframe>
 </body></html>"#;
 
@@ -492,6 +494,153 @@ fn tabs_open_front_and_close_and_popups_name_their_opener() {
         .iter()
         .filter(|r| r["metadata"]["page_id"] == fixture.page_id.as_str())
         .all(|r| r["metadata"]["opener_page_id"].is_null()));
+}
+
+fn only_dialog(observed: &Value) -> &Value {
+    let nodes = observed["nodes"].as_array().unwrap();
+    assert_eq!(
+        nodes.len(),
+        1,
+        "a blocked page shows only its dialog: {observed}"
+    );
+    assert_eq!(nodes[0]["role"], "alertdialog");
+    &nodes[0]
+}
+
+#[test]
+#[ignore = "requires isolated Chromium with its sandbox enabled; CI runs it explicitly"]
+fn dialogs_block_the_page_until_accepted_or_dismissed() {
+    let _serial = serial();
+    let fixture = Fixture::new();
+    let (session, _) = session_for(&fixture);
+    let main = main_of(&session, &fixture.page_id);
+    assert!(wait_until(&session, &main, "Name", WaitCondition::Appears)
+        .error
+        .is_none());
+
+    // A click that opens a prompt is delivered; the page then shows the prompt.
+    let observed = observe(&session, &main);
+    let ask = find(&session, &observed, "button", "Ask");
+    let started = Instant::now();
+    let clicked = act(&session, ask, Action::click());
+    assert!(clicked.error.is_none(), "{clicked:?}");
+    assert!(started.elapsed() < Duration::from_secs(5));
+    assert_eq!(
+        clicked.data.unwrap()["backend_result"]["dialog_opened"],
+        true
+    );
+    let listed = targets(&session);
+    let page = listed
+        .iter()
+        .find(|r| r["metadata"]["page_id"] == fixture.page_id.as_str())
+        .unwrap();
+    assert_eq!(page["metadata"]["dialog"]["type"], "prompt", "{page}");
+    assert_eq!(page["resource_id"], main.as_str());
+    let blocked = observe(&session, &main);
+    let dialog = only_dialog(&blocked);
+    assert_eq!(dialog["name"], "Your name?");
+    assert_eq!(dialog["value"], "guest");
+    assert_eq!(dialog["dialog"]["type"], "prompt");
+    assert_eq!(dialog["capabilities"], json!(["accept", "dismiss"]));
+    let target = find(&session, &blocked, "alertdialog", "Your name?");
+    let capture = call(
+        &session,
+        Operation::Capture {
+            target: target.clone(),
+        },
+    );
+    assert_eq!(capture.error.unwrap()["code"], "CONTROL.DIALOG_OPEN");
+    let accepted = act(
+        &session,
+        target,
+        Action::Accept {
+            text: Some("Ada".into()),
+        },
+    );
+    assert!(accepted.error.is_none(), "{accepted:?}");
+    assert_eq!(status(&observe(&session, &main)), "answer:Ada");
+
+    // A confirm: text is refused, dismiss answers false.
+    let observed = observe(&session, &main);
+    let sure = find(&session, &observed, "button", "Sure");
+    assert!(act(&session, sure, Action::click()).error.is_none());
+    let blocked = observe(&session, &main);
+    assert_eq!(only_dialog(&blocked)["dialog"]["type"], "confirm");
+    let target = find(&session, &blocked, "alertdialog", "Sure?");
+    let refused = act(
+        &session,
+        target,
+        Action::Accept {
+            text: Some("no".into()),
+        },
+    );
+    assert_eq!(refused.error.unwrap()["code"], "CONTROL.INVALID_REQUEST");
+    let blocked = observe(&session, &main);
+    let target = find(&session, &blocked, "alertdialog", "Sure?");
+    assert!(act(&session, target, Action::Dismiss {}).error.is_none());
+    assert_eq!(status(&observe(&session, &main)), "confirm:false");
+
+    // A dialog a timer opens: acting on an earlier target is refused at
+    // once instead of timing out, and nothing reaches the page.
+    fixture
+        .client()
+        .eval("setTimeout(() => alert('Timer fired'), 300); true")
+        .unwrap();
+    let observed = observe(&session, &main);
+    let name = find(&session, &observed, "textbox", "Name");
+    std::thread::sleep(Duration::from_millis(800));
+    let started = Instant::now();
+    let refused = act(
+        &session,
+        name,
+        Action::Fill {
+            value: "must not land".into(),
+        },
+    );
+    assert!(started.elapsed() < Duration::from_secs(3));
+    assert_eq!(refused.commit_state, CommitState::NotCommitted);
+    let failure = refused.error.unwrap();
+    assert_eq!(failure["code"], "CONTROL.DIALOG_OPEN");
+    assert_eq!(failure["details"]["dialog"]["message"], "Timer fired");
+    let blocked = observe(&session, &main);
+    assert_eq!(only_dialog(&blocked)["dialog"]["type"], "alert");
+    let target = find(&session, &blocked, "alertdialog", "Timer fired");
+    assert!(act(&session, target, Action::Accept { text: None })
+        .error
+        .is_none());
+    let observed = observe(&session, &main);
+    assert_ne!(node(&observed, "Name")["value"], "must not land");
+
+    // A dialog that opened before a session ever looked at the page cannot be
+    // answered through CDP: the browser lets only a connection that saw it
+    // open handle it, and the blocked renderer never answers a new one. It is
+    // listed as unresponsive, quickly, rather than hanging the listing.
+    drop(session);
+    fixture
+        .client()
+        .eval("setTimeout(() => alert('Early'), 200); true")
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(700));
+    let (late, _) = session_for(&fixture);
+    let started = Instant::now();
+    let listed = targets(&late);
+    assert!(started.elapsed() < Duration::from_secs(6));
+    let page = listed
+        .iter()
+        .find(|r| r["metadata"]["page_id"] == fixture.page_id.as_str())
+        .unwrap();
+    assert_eq!(page["metadata"]["responsive"], false, "{page}");
+    assert_eq!(page["capabilities"], json!([]));
+    let seen = call_within(
+        &late,
+        Operation::Observe {
+            resource_id: page["resource_id"].as_str().unwrap().into(),
+            max_nodes: 500,
+            view: Default::default(),
+        },
+        10_000,
+    );
+    assert_eq!(seen.error.unwrap()["code"], "BROWSER.PAGE_UNRESPONSIVE");
 }
 
 #[test]

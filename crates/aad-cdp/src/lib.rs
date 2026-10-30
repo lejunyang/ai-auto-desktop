@@ -150,6 +150,20 @@ impl Client {
         Ok(client)
     }
 
+    /// Attach to a page without enabling any domain. Unlike [`Client::attach_until`]
+    /// this answers even while a JavaScript dialog blocks the page's renderer.
+    pub fn attach_bare_until(
+        target: &Target,
+        deadline: std::time::Instant,
+    ) -> Result<Self, CdpError> {
+        let ws = ws::WebSocket::connect_until(&target.webSocketDebuggerUrl, deadline)?;
+        Ok(Client {
+            connection: connection::Connection::new(ws)?,
+            next_id: 0,
+            deadline: None,
+        })
+    }
+
     /// Attach to the browser itself rather than one page, for the `Target`
     /// and `Browser` domains. The endpoint comes from `/json/version` and is
     /// always reached on loopback at `port`, whatever host the browser names.
@@ -196,6 +210,14 @@ impl Client {
             .deadline
             .unwrap_or_else(|| std::time::Instant::now() + Duration::from_secs(8));
         self.connection.command(self.next_id, &message, deadline)
+    }
+
+    /// Queue only the `keep` event methods from now on, dropping others
+    /// already queued, and abandon any command waiting for its reply with
+    /// [`CdpError::Interrupted`] when an `interrupt` event arrives -- e.g. a
+    /// JavaScript dialog, which blocks the page until it is handled.
+    pub fn filter_events(&self, keep: &[&str], interrupt: &[&str]) {
+        self.connection.filter(Some(keep), interrupt);
     }
 
     /// Events are received continuously, including while the caller is idle.

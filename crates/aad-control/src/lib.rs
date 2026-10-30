@@ -1035,6 +1035,7 @@ fn validate_action(action: &Action) -> Result<()> {
         Action::Fill { value } => Some(value),
         Action::TypeText { text, .. } => Some(text),
         Action::Select { option } => Some(option),
+        Action::Accept { text } => text.as_ref(),
         _ => None,
     };
     if let Action::Navigate { url } | Action::OpenTab { url } = action {
