@@ -360,7 +360,8 @@ fn wait_for_value(driver: &UiaDriver, window_id: &str, value: &str) -> Value {
     loop {
         let captured = snapshot(driver, window_id);
         let edit = find(driver, &captured, json!({"role": "edit"}));
-        if edit["node"]["value"] == value {
+        // The driver reports an empty value as absent, not as "".
+        if edit["node"]["value"].as_str().unwrap_or_default() == value {
             return captured;
         }
         assert!(
