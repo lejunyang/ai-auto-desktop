@@ -14,7 +14,10 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
-use windows::Win32::Graphics::Gdi::{CreateSolidBrush, UpdateWindow, COLOR_WINDOW, HBRUSH};
+use windows::Win32::Graphics::Gdi::{
+    BeginPaint, CreateFontW, CreateSolidBrush, DeleteObject, EndPaint, SelectObject, SetBkMode,
+    TextOutW, UpdateWindow, COLOR_WINDOW, HBRUSH, PAINTSTRUCT, TRANSPARENT,
+};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{
     GetDpiForSystem, SetThreadDpiAwarenessContext, DPI_AWARENESS_CONTEXT_UNAWARE,
@@ -23,9 +26,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DispatchMessageW, GetDlgItem, GetMessageW, PostMessageW,
     PostQuitMessage, RegisterClassExW, SetWindowTextW, ShowWindow, TranslateMessage, BN_CLICKED,
     CW_USEDEFAULT, ES_AUTOHSCROLL, ES_PASSWORD, HMENU, MSG, SHOW_WINDOW_CMD, WINDOW_EX_STYLE,
-    WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_LBUTTONDOWN, WNDCLASSEXW, WS_BORDER,
-    WS_CHILD, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_OVERLAPPEDWINDOW, WS_POPUP,
-    WS_TABSTOP, WS_VISIBLE,
+    WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_LBUTTONDOWN, WM_PAINT, WNDCLASSEXW,
+    WS_BORDER, WS_CHILD, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_OVERLAPPEDWINDOW,
+    WS_POPUP, WS_TABSTOP, WS_VISIBLE,
 };
 
 const EDIT_ID: i32 = 1001;
@@ -494,6 +497,48 @@ unsafe extern "system" fn plain_window_proc(
 
 type WindowProc = unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT;
 
+/// Text that exists only as pixels: UIA sees an unnamed-by-it pane.
+const DRAWN_TEXT: &str = "Invoice 4217";
+const DRAWN_NAME: &str = "Drawn label";
+
+unsafe extern "system" fn drawn_window_proc(
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    if message == WM_PAINT {
+        let mut paint = PAINTSTRUCT::default();
+        let dc = BeginPaint(hwnd, &mut paint);
+        let face = wide("Segoe UI");
+        let font = CreateFontW(
+            -40,
+            0,
+            0,
+            0,
+            400,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            5,
+            0,
+            PCWSTR(face.as_ptr()),
+        );
+        let old = SelectObject(dc, font);
+        SetBkMode(dc, TRANSPARENT);
+        let text: Vec<u16> = DRAWN_TEXT.encode_utf16().collect();
+        let _ = TextOutW(dc, 16, 12, &text);
+        SelectObject(dc, old);
+        let _ = DeleteObject(font);
+        let _ = EndPaint(hwnd, &paint);
+        return LRESULT(0);
+    }
+    DefWindowProcW(hwnd, message, wparam, lparam)
+}
+
 /// Left-button presses the swatch and the cover window received.
 static SWATCH_CLICKS: AtomicUsize = AtomicUsize::new(0);
 static COVER_CLICKS: AtomicUsize = AtomicUsize::new(0);
@@ -621,6 +666,7 @@ unsafe fn create_swatch(title: &str) -> Result<HWND, String> {
     let suffix = format!("{}_{}", std::process::id(), uuid::Uuid::new_v4().simple());
     let frame_class = wide(&format!("AadCaptureFrame_{suffix}"));
     let swatch_class = wide(&format!("AadCaptureSwatch_{suffix}"));
+    let drawn_class = wide(&format!("AadCaptureDrawn_{suffix}"));
     let colour =
         COLORREF(u32::from(SWATCH[0]) | (u32::from(SWATCH[1]) << 8) | (u32::from(SWATCH[2]) << 16));
     for (class_name, brush, procedure) in [
@@ -630,6 +676,11 @@ unsafe fn create_swatch(title: &str) -> Result<HWND, String> {
             plain_window_proc as WindowProc,
         ),
         (&swatch_class, CreateSolidBrush(colour), swatch_window_proc),
+        (
+            &drawn_class,
+            HBRUSH((COLOR_WINDOW.0 + 1) as usize as *mut std::ffi::c_void),
+            drawn_window_proc,
+        ),
     ] {
         let class = WNDCLASSEXW {
             cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
@@ -651,8 +702,8 @@ unsafe fn create_swatch(title: &str) -> Result<HWND, String> {
         WS_OVERLAPPEDWINDOW | WS_VISIBLE,
         CW_USEDEFAULT,
         CW_USEDEFAULT,
-        420,
-        260,
+        640,
+        300,
         None,
         None,
         instance,
@@ -671,6 +722,22 @@ unsafe fn create_swatch(title: &str) -> Result<HWND, String> {
         SWATCH_SIZE.1,
         hwnd,
         HMENU(1 as *mut std::ffi::c_void),
+        instance,
+        None,
+    )
+    .map_err(|error| error.to_string())?;
+    let drawn_text = wide(DRAWN_NAME);
+    CreateWindowExW(
+        WINDOW_EX_STYLE::default(),
+        PCWSTR(drawn_class.as_ptr()),
+        PCWSTR(drawn_text.as_ptr()),
+        WS_CHILD | WS_VISIBLE,
+        170,
+        20,
+        400,
+        70,
+        hwnd,
+        HMENU(3 as *mut std::ffi::c_void),
         instance,
         None,
     )
@@ -829,6 +896,59 @@ fn a_click_on_a_covered_element_is_refused_and_sends_nothing() {
         thread::sleep(Duration::from_millis(20));
     }
     assert_eq!(COVER_CLICKS.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+#[ignore = "requires an interactive Windows desktop and a Windows OCR language pack"]
+fn text_that_exists_only_as_pixels_is_read_with_its_position() {
+    let driver = native_driver().expect("create native UIA driver");
+    let title = format!("AI Auto Desktop OCR fixture {}", uuid::Uuid::new_v4());
+    let _fixture = start_swatch(title.clone(), false).expect("start fixture");
+    let window_id = wait_for_window(&driver, &title);
+    let captured = wait_for_node(&driver, &window_id, "pane", DRAWN_NAME);
+    // UIA knows the pane only by its window text, never by what it draws.
+    assert!(!captured.to_string().contains("4217"));
+    let drawn = find(
+        &driver,
+        &captured,
+        json!({"role": "pane", "name": DRAWN_NAME}),
+    );
+    let read = driver
+        .call("read_text", &json!({"target": drawn["target"]}))
+        .expect("read the drawn text");
+    assert_eq!(read["engine"], "windows.media.ocr");
+    let lines = read["lines"].as_array().expect("lines");
+    let line = lines
+        .iter()
+        .find(|line| line["text"].as_str().unwrap_or_default().contains("4217"))
+        .unwrap_or_else(|| panic!("no line reads 4217: {lines:?}"));
+    // OCR may read the capital I as a lower-case l; the rest is exact.
+    assert!(line["text"].as_str().unwrap().contains("nvoice"), "{line}");
+    // Drawn at (16, 12) of a 400x70 pane: the box starts near the top left.
+    let bounds = &line["bounds"];
+    let (width, height) = (
+        read["width"].as_f64().unwrap(),
+        read["height"].as_f64().unwrap(),
+    );
+    assert_eq!((width, height), (400.0, 70.0));
+    let x = bounds["x"].as_f64().unwrap();
+    let y = bounds["y"].as_f64().unwrap();
+    assert!(
+        (8.0..40.0).contains(&x) && (2.0..30.0).contains(&y),
+        "{bounds}"
+    );
+    assert!(x + bounds["width"].as_f64().unwrap() <= width);
+    assert_eq!(line["words"].as_array().unwrap().len(), 2, "{line}");
+
+    // An unknown language is refused with the ones that are installed.
+    let refused = driver
+        .call(
+            "read_text",
+            &json!({"target": drawn["target"], "language": "tlh"}),
+        )
+        .expect_err("no Klingon OCR pack");
+    assert_eq!(refused.code, "DRIVER.OCR_UNAVAILABLE");
+    assert!(refused.details["available_languages"].is_array());
 }
 
 #[test]

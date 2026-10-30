@@ -106,6 +106,7 @@ impl UiaDriver {
             "overview" => self.overview(&args),
             "find" => self.find(&args),
             "capture" => self.capture_element(&args),
+            "read_text" => self.read_text(&args),
             "focus" | "invoke" | "set_value" | "type_text" | "pointer_click" | "key_chord"
             | "pointer_gesture" | "drag" => self.act(action, &args),
             "watch" => self.watch(&args),
@@ -495,6 +496,48 @@ impl UiaDriver {
         let (node, pixels) = self.element_pixels(args)?;
         let png = encode_png(&pixels)?;
         Ok(json!({
+            "format": "png",
+            "data": base64::engine::general_purpose::STANDARD.encode(png),
+            "width": pixels.width,
+            "height": pixels.height,
+            "clipped": pixels.clipped,
+            "node_id": node.node_id,
+        }))
+    }
+
+    /// OCR over the same pixels `capture` returns, with pixel boxes.
+    ///
+    /// The PNG travels with the answer so the session can digest exactly the
+    /// image that was read; the session drops it before answering a caller.
+    fn read_text(&self, args: &Value) -> Result<Value> {
+        let language = match args.get("language") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(tag))
+                if !tag.is_empty()
+                    && tag.len() <= 35
+                    && tag.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') =>
+            {
+                Some(tag.as_str())
+            }
+            Some(_) => return Err(DriverError::invalid("language must be a BCP-47 tag")),
+        };
+        let (node, pixels) = self.element_pixels(args)?;
+        let recognition = self.backend.recognize_text(&pixels, language)?;
+        let span = |span: &crate::backend::TextSpan| {
+            json!({"text": span.text, "bounds": {
+                "x": span.bounds.x, "y": span.bounds.y,
+                "width": span.bounds.width, "height": span.bounds.height,
+            }})
+        };
+        let png = encode_png(&pixels)?;
+        Ok(json!({
+            "engine": recognition.engine,
+            "language": recognition.language,
+            "lines": recognition.lines.iter().map(|(line, words)| {
+                let mut line = span(line);
+                line["words"] = json!(words.iter().map(span).collect::<Vec<_>>());
+                line
+            }).collect::<Vec<_>>(),
             "format": "png",
             "data": base64::engine::general_purpose::STANDARD.encode(png),
             "width": pixels.width,
@@ -1038,6 +1081,10 @@ fn action_contracts() -> Map<String, Value> {
     actions.insert(
         "capture".into(),
         read_only("Take a PNG of one observed element, or of its whole window."),
+    );
+    actions.insert(
+        "read_text".into(),
+        read_only("Recognise the text one observed element shows, with Windows OCR."),
     );
 
     // Watching changes nothing on the desktop, but it is not `read_only`

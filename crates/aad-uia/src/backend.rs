@@ -193,6 +193,31 @@ impl Pixels {
     }
 }
 
+/// A box inside a captured image, in its pixels.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ImageBox {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+}
+
+/// One recognised word or line.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TextSpan {
+    pub text: String,
+    pub bounds: ImageBox,
+}
+
+/// What OCR read from an image.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Recognition {
+    pub engine: String,
+    pub language: String,
+    /// Each line with its words.
+    pub lines: Vec<(TextSpan, Vec<TextSpan>)>,
+}
+
 /// The operations a platform backend must provide.
 pub trait Backend: Send + Sync {
     /// Enumerate top-level windows that a user could interact with.
@@ -294,6 +319,15 @@ pub trait Backend: Send + Sync {
         Err(DriverError::new(
             "DRIVER.ACTION_UNSUPPORTED",
             "screenshots are not implemented on this platform yet",
+        ))
+    }
+
+    /// Recognise the text an image shows, with the platform's own OCR.
+    /// `language` is a BCP-47 tag; `None` takes the user's languages.
+    fn recognize_text(&self, _pixels: &Pixels, _language: Option<&str>) -> Result<Recognition> {
+        Err(DriverError::new(
+            "DRIVER.ACTION_UNSUPPORTED",
+            "text recognition is not implemented on this platform yet",
         ))
     }
 

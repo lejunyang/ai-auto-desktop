@@ -84,7 +84,7 @@ impl Backend for NativeBackend {
     fn reads(&self) -> Vec<String> {
         // Only the Windows driver captures directly; AT-SPI's capture goes
         // through the host artifact store and is not wired here yet.
-        ["capture"]
+        ["capture", "read_text"]
             .into_iter()
             .filter(|read| matches!(self.flavor, Flavor::Windows) && self.offers(read))
             .map(str::to_string)
@@ -107,6 +107,25 @@ impl Backend for NativeBackend {
             answer.insert(key.into(), shot[key].clone());
         }
         Ok(Value::Object(answer))
+    }
+    fn read_text(
+        &self,
+        snapshot: &Value,
+        node: &Value,
+        language: Option<&str>,
+        timeout: Duration,
+    ) -> Result<Value> {
+        if !self.reads().iter().any(|read| read == "read_text") {
+            return Err(error(
+                "CONTROL.ACTION_UNSUPPORTED",
+                "this provider cannot read text from pixels",
+            ));
+        }
+        let mut args = json!({"target": Self::target_of(snapshot, &node["node_id"])});
+        if let Some(language) = language {
+            args["language"] = json!(language);
+        }
+        self.invoke("read_text", args, timeout)
     }
     fn node_capabilities(&self, node: &Value) -> Vec<String> {
         ACTION_NAMES

@@ -297,6 +297,14 @@ pub enum Operation {
     Capture {
         target: Target,
     },
+    /// The text one observed element shows, read by OCR from its pixels.
+    /// Read-only; recognised lines are not targets.
+    ReadText {
+        target: Target,
+        /// A BCP-47 tag naming the OCR language; the user's languages otherwise.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        language: Option<String>,
+    },
     Cancel {
         request_id: String,
     },

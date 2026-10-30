@@ -345,3 +345,112 @@ fn close_expiry_and_bounded_replay_guard_revoke_observations() {
         "CONTROL.SESSION_CLOSED"
     );
 }
+
+struct Reader;
+impl Backend for Reader {
+    fn name(&self) -> &str {
+        "fixture"
+    }
+    fn capabilities(&self) -> Vec<String> {
+        vec!["click".into()]
+    }
+    fn reads(&self) -> Vec<String> {
+        vec!["capture".into(), "read_text".into()]
+    }
+    fn resources(&self, timeout: Duration) -> Result<Vec<BackendResource>> {
+        Fake {
+            calls: AtomicUsize::new(0),
+            delay: Duration::ZERO,
+            before_commit: Duration::ZERO,
+            entered: std::sync::atomic::AtomicBool::new(false),
+        }
+        .resources(timeout)
+    }
+    fn observe(&self, _: &Value, _: usize, _: Duration) -> Result<Value> {
+        Ok(json!({"nodes": [{"node_id":"n", "role":"pane", "name":"Canvas"}], "truncated":false}))
+    }
+    fn capture(&self, _: &Value, _: &Value, _: Duration) -> Result<Value> {
+        Ok(json!({"format":"png","data":"cGl4ZWxz","width":200,"height":50}))
+    }
+    fn read_text(
+        &self,
+        _: &Value,
+        node: &Value,
+        language: Option<&str>,
+        _: Duration,
+    ) -> Result<Value> {
+        assert_eq!(node["node_id"], "n");
+        Ok(json!({
+            "engine": "fixture-ocr",
+            "language": language.unwrap_or("en-US"),
+            "format": "png", "data": "cGl4ZWxz", "width": 200, "height": 50,
+            "lines": [{"text": "Total 42", "bounds": {"x": 20, "y": 10, "width": 100, "height": 25},
+                "words": [{"text": "Total", "bounds": {"x": 20, "y": 10, "width": 60, "height": 25}},
+                          {"text": "42", "bounds": {"x": 90, "y": 10, "width": 30, "height": 25}}]}],
+        }))
+    }
+    fn act(&self, _: &Value, _: &Value, _: &Action, _: &Context) -> Result<Value> {
+        unreachable!("reading never acts")
+    }
+}
+
+#[test]
+fn recognised_text_comes_back_as_element_fractions_with_the_capture_digest() {
+    // Read-only: no input grant needed, and the observation stays usable.
+    let session = Session::new(vec![Arc::new(Reader)], Policy::default());
+    let target = observed(&session);
+    let read = call(
+        &session,
+        Operation::ReadText {
+            target: target.clone(),
+            language: None,
+        },
+    );
+    assert_eq!(read.commit_state, CommitState::NotCommitted);
+    let read = read.data.unwrap();
+    assert_eq!(read["text"], "Total 42");
+    assert_eq!(read["read_only"], true);
+    assert_eq!(
+        read["lines"][0]["box"],
+        json!({"fx": 0.1, "fy": 0.2, "fw": 0.5, "fh": 0.5})
+    );
+    assert_eq!(read["lines"][0]["words"][1]["box"]["fx"], 0.45);
+    // Neither the image nor any pixel or screen coordinate is handed out.
+    let text = read.to_string();
+    for absent in ["\"data\"", "\"x\"", "\"y\"", "\"bounds\""] {
+        assert!(!text.contains(absent), "{absent} in {text}");
+    }
+    // The digest is the one a capture of the same pixels carries.
+    let shot = call(
+        &session,
+        Operation::Capture {
+            target: target.clone(),
+        },
+    )
+    .data
+    .unwrap();
+    assert_eq!(read["digest"], shot["digest"]);
+
+    let refused = call(
+        &session,
+        Operation::ReadText {
+            target,
+            language: Some("en US; rm".into()),
+        },
+    );
+    assert_eq!(refused.error.unwrap()["code"], "CONTROL.INVALID_REQUEST");
+}
+
+#[test]
+fn a_provider_without_ocr_refuses_to_read_text() {
+    let (session, _) = fixture(true, Duration::ZERO);
+    let target = observed(&session);
+    let refused = call(
+        &session,
+        Operation::ReadText {
+            target,
+            language: None,
+        },
+    );
+    assert_eq!(refused.error.unwrap()["code"], "CONTROL.ACTION_UNSUPPORTED");
+}

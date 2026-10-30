@@ -62,6 +62,21 @@ pub trait Backend: Send + Sync {
             "this provider cannot take screenshots",
         ))
     }
+    /// OCR over the node's pixels: the PNG read (`format`, `data`, `width`,
+    /// `height`), the `engine` and `language`, and `lines` of `{text, bounds,
+    /// words}` with bounds in that image's pixels.
+    fn read_text(
+        &self,
+        _snapshot: &Value,
+        _node: &Value,
+        _language: Option<&str>,
+        _timeout: Duration,
+    ) -> Result<Value> {
+        Err(error(
+            "CONTROL.ACTION_UNSUPPORTED",
+            "this provider cannot read text from pixels",
+        ))
+    }
     fn resources(&self, timeout: Duration) -> Result<Vec<BackendResource>>;
     fn observe(&self, selector: &Value, max_nodes: usize, timeout: Duration) -> Result<Value>;
     /// Shape a retained snapshot for the caller. `None` uses the portable
@@ -794,49 +809,66 @@ impl Session {
                 )
             }
             Operation::Capture { target } => {
-                if target.session_id != self.id {
-                    return Err(error(
-                        "CONTROL.SESSION_MISMATCH",
-                        "target belongs to another session",
-                    ));
-                }
-                let observation = self.observation(&target.observation_id)?;
-                if target.resource_id != observation.resource_id
-                    || !self.allowed_resource(&target.resource_id)
-                {
-                    return Err(error(
-                        "POLICY.DENIED",
-                        "target is outside the resource grant",
-                    ));
-                }
-                let node = observation.raw["nodes"]
-                    .as_array()
-                    .and_then(|nodes| {
-                        nodes
-                            .iter()
-                            .find(|n| n["node_id"] == target.node_id.as_str())
-                    })
-                    .ok_or_else(|| error("CONTROL.STALE_TARGET", "node was not observed"))?;
+                let (observation, node) = self.observed_node(target)?;
                 let backend = &self.backends[&observation.provider];
-                let mut shot = backend.capture(&observation.raw, node, context.remaining()?)?;
-                // Compared across captures to tell whether what is shown changed,
-                // e.g. a login code that refreshes, without reading the image.
-                let digest = shot["data"]
-                    .as_str()
-                    .map(|data| {
-                        use sha2::Digest;
-                        sha2::Sha256::digest(data.as_bytes())
-                            .iter()
-                            .map(|b| format!("{b:02x}"))
-                            .collect::<String>()
-                    })
-                    .unwrap_or_default();
-                shot["digest"] = json!(digest);
+                let mut shot = backend.capture(&observation.raw, &node, context.remaining()?)?;
+                shot["digest"] = json!(digest_of(&shot));
                 shot["provider"] = json!(observation.provider);
                 Ok(shot)
             }
+            Operation::ReadText { target, language } => {
+                if language.as_ref().is_some_and(|tag| {
+                    tag.is_empty()
+                        || tag.len() > 35
+                        || !tag.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+                }) {
+                    return Err(error(
+                        "CONTROL.INVALID_REQUEST",
+                        "language must be a BCP-47 tag such as en-US",
+                    ));
+                }
+                let (observation, node) = self.observed_node(target)?;
+                let backend = &self.backends[&observation.provider];
+                let read = backend.read_text(
+                    &observation.raw,
+                    &node,
+                    language.as_deref(),
+                    context.remaining()?,
+                )?;
+                context.remaining()?;
+                Ok(text_answer(&read, &observation.provider))
+            }
             Operation::Cancel { .. } | Operation::Close {} => unreachable!(),
         }
+    }
+
+    /// The retained observation and raw node a read-only target names.
+    fn observed_node(&self, target: &Target) -> Result<(Observation, Value)> {
+        if target.session_id != self.id {
+            return Err(error(
+                "CONTROL.SESSION_MISMATCH",
+                "target belongs to another session",
+            ));
+        }
+        let observation = self.observation(&target.observation_id)?;
+        if target.resource_id != observation.resource_id
+            || !self.allowed_resource(&target.resource_id)
+        {
+            return Err(error(
+                "POLICY.DENIED",
+                "target is outside the resource grant",
+            ));
+        }
+        let node = observation.raw["nodes"]
+            .as_array()
+            .and_then(|nodes| {
+                nodes
+                    .iter()
+                    .find(|n| n["node_id"] == target.node_id.as_str())
+            })
+            .cloned()
+            .ok_or_else(|| error("CONTROL.STALE_TARGET", "node was not observed"))?;
+        Ok((observation, node))
     }
 
     fn observation(&self, id: &str) -> Result<Observation> {
@@ -854,6 +886,74 @@ impl Session {
                 )
             })
     }
+}
+
+/// The sha256 of a screenshot's base64 PNG. Compared across captures to tell
+/// whether what is shown changed, e.g. a login code that refreshes, without
+/// reading the image; a read_text of the same pixels carries the same digest.
+fn digest_of(shot: &Value) -> String {
+    use sha2::Digest;
+    shot["data"]
+        .as_str()
+        .map(|data| {
+            sha2::Sha256::digest(data.as_bytes())
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// A provider's OCR answer as callers see it: positions as fractions of the
+/// element's box (never screen or image coordinates), the image's digest
+/// instead of the image.
+fn text_answer(read: &Value, provider: &str) -> Value {
+    let width = read["width"].as_f64().filter(|w| *w > 0.0).unwrap_or(1.0);
+    let height = read["height"].as_f64().filter(|h| *h > 0.0).unwrap_or(1.0);
+    let round = |value: f64| (value.clamp(0.0, 1.0) * 10_000.0).round() / 10_000.0;
+    let shape = |span: &Value| {
+        let number = |key: &str| span["bounds"][key].as_f64().unwrap_or_default();
+        json!({
+            "text": span["text"],
+            "box": {
+                "fx": round(number("x") / width),
+                "fy": round(number("y") / height),
+                "fw": round(number("width") / width),
+                "fh": round(number("height") / height),
+            },
+        })
+    };
+    let lines: Vec<Value> = read["lines"]
+        .as_array()
+        .map(|lines| {
+            lines
+                .iter()
+                .map(|line| {
+                    let mut shaped = shape(line);
+                    shaped["words"] = json!(line["words"]
+                        .as_array()
+                        .map(|words| words.iter().map(shape).collect::<Vec<_>>())
+                        .unwrap_or_default());
+                    shaped
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let text = lines
+        .iter()
+        .filter_map(|line| line["text"].as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    json!({
+        "provider": provider,
+        "engine": read["engine"],
+        "language": read["language"],
+        "text": text,
+        "lines": lines,
+        "digest": digest_of(read),
+        "clipped": read["clipped"] == true,
+        "read_only": true,
+    })
 }
 
 fn validate_action(action: &Action) -> Result<()> {

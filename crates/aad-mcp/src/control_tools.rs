@@ -287,6 +287,30 @@ unknown-effect write automatically.",
             false,
         ),
         (
+            "control_read_text",
+            "Read the text an observed element shows by running OCR on its pixels -- for \
+canvases, custom-drawn controls and windows whose accessibility tree is empty or unnamed, \
+where control_observe finds nothing to read. Read-only. Answers `text`, and `lines` each \
+with `words`, every one with a `box` of fx/fy/fw/fh: fractions of the element's box, not \
+screen positions. The lines are not targets: to act on a word, click the element it was \
+read from with `fraction` at the word's centre (fx + fw/2, fy + fh/2), which is anchored \
+and revalidated on that element -- read again first if the content may have moved. \
+`digest` equals control_capture's for the same pixels. Windows desktop windows only \
+(providers listing `read_text` under `reads`); OCR can misread characters such as I and l.",
+            json!({
+                "target": target_schema(),
+                "language": {
+                    "type": "string", "minLength": 1, "maxLength": 35,
+                    "pattern": "^[A-Za-z0-9-]+$",
+                    "description": "BCP-47 tag of the OCR language, e.g. en-US or zh-Hans-CN. \
+Defaults to the user's languages; a language without an installed OCR pack is refused with \
+the installed ones listed."
+                }
+            }),
+            vec!["target"],
+            false,
+        ),
+        (
             "control_cancel",
             "Request cancellation of an in-flight control request. If input was already \
 dispatched, its effect is unknown; cancellation never means rollback.",
@@ -409,6 +433,15 @@ or take the node_id from an outline."
         "DRIVER.PROTECTED_ELEMENT" => {
             "Password and other protected fields are never captured or read. Capture an \
 element around it, or ask the person you are helping."
+        }
+        "DRIVER.OCR_UNAVAILABLE" => {
+            "No Windows OCR language pack for that language is installed; \
+details.available_languages lists the ones that are. Pass one of those, or omit language. \
+Packs are added in Settings > Time & language by whoever administers the machine."
+        }
+        "DRIVER.OCR_FAILED" => {
+            "Windows OCR could not read the image. Capture the element to see what it shows; \
+a very small or very large element reads poorly -- try its container or a smaller part."
         }
         "DRIVER.WINDOW_MINIMIZED" => {
             "The window is minimized, so it shows nothing. Restore it (the window node's \
@@ -553,6 +586,35 @@ mod tests {
             raw.operation,
             Operation::Observe { view, .. } if view.mode == aad_control::ViewMode::Nodes
         ));
+    }
+
+    #[test]
+    fn reading_text_is_a_read_only_request_on_an_observed_target() {
+        let tool = tool("control_read_text");
+        assert!(!tool.mutating);
+        assert!(tool.description.contains("fraction"));
+        let session = aad_control::Session::new(Vec::new(), Default::default());
+        let target = json!({"session_id":"s","resource_id":"r","observation_id":"o","node_id":"n"});
+        let request = prepare(
+            "control_read_text",
+            &json!({"target": target, "language": "en-US"}),
+            &session,
+        )
+        .unwrap();
+        assert!(!request.mutating());
+        match request.operation {
+            Operation::ReadText { target, language } => {
+                assert_eq!(target.node_id, "n");
+                assert_eq!(language.as_deref(), Some("en-US"));
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(prepare(
+            "control_read_text",
+            &json!({"target": target, "region": "x"}),
+            &session
+        )
+        .is_err());
     }
 
     #[test]
