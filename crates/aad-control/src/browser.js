@@ -3,14 +3,17 @@
   const documentToken = NONCE;
   let observation = null;
   let nodes = new Map();
-  const inputRole = el => ({checkbox:'checkbox',radio:'radio',button:'button',submit:'button',reset:'button',range:'slider'}[(el.type||'').toLowerCase()] || 'textbox');
+  const inputRole = el => ({checkbox:'checkbox',radio:'radio',button:'button',submit:'button',reset:'button',range:'slider',file:'button'}[(el.type||'').toLowerCase()] || 'textbox');
   const roleOf = el => el.getAttribute('role') || (el.tagName==='INPUT' ? inputRole(el) : ({TEXTAREA:'textbox',BUTTON:'button',A:'link',SELECT:'combobox',BODY:'document',IMG:'img',CANVAS:'canvas',SVG:'img',LI:'listitem',UL:'list',OL:'list',TABLE:'table',TR:'row',TD:'cell',TH:'columnheader',H1:'heading',H2:'heading',H3:'heading',H4:'heading',H5:'heading',H6:'heading',DIALOG:'dialog',FORM:'form'}[el.tagName.toUpperCase()] || 'generic'));
   const textOf = el => {let text='',i=0;const walker=document.createTreeWalker(el,NodeFilter.SHOW_TEXT);let node;while(text.length<256 && i++<32 && (node=walker.nextNode()))text+=(node.nodeValue||'').slice(0,256-text.length);return text;};
   const labelOf = el => (el.getAttribute('aria-label') || (el.labels && Array.from(el.labels).slice(0,8).map(textOf).join(' ')) || el.getAttribute('alt') || el.getAttribute('title') || el.getAttribute('placeholder') || (['INPUT','TEXTAREA','SELECT'].includes(el.tagName) ? el.id : textOf(el)) || '').trim().slice(0,256);
-  const protectedNode = el => el.tagName === 'INPUT' && ['password','file','hidden'].includes((el.type||'').toLowerCase());
+  const protectedNode = el => el.tagName === 'INPUT' && ['password','hidden'].includes((el.type||'').toLowerCase());
+  // A file input only ever takes files, through upload; often it is hidden behind a styled button.
+  const fileInput = el => el.tagName === 'INPUT' && (el.type||'').toLowerCase() === 'file';
+  const present = el => visible(el) || (fileInput(el) && el.isConnected && el.ownerDocument === document);
   const visible = el => el.isConnected && el.ownerDocument === document && el.getClientRects().length > 0 && getComputedStyle(el).visibility !== 'hidden';
   const enabled = el => !el.disabled && !el.closest('[inert]') && el.getAttribute('aria-disabled') !== 'true';
-  const editable = el => (['INPUT','TEXTAREA'].includes(el.tagName) || el.isContentEditable) && !el.readOnly && !protectedNode(el);
+  const editable = el => (['INPUT','TEXTAREA'].includes(el.tagName) || el.isContentEditable) && !el.readOnly && !protectedNode(el) && !fileInput(el);
   const fingerprint = el => JSON.stringify([el.tagName,el.id,el.type||'',roleOf(el),labelOf(el),el.getAttribute('name'),el.getAttribute('href'),!!el.isContentEditable]);
   const checkable = el => (el.tagName==='INPUT' && ['checkbox','radio'].includes((el.type||'').toLowerCase())) || ['checkbox','switch','radio'].includes(el.getAttribute('role'));
   const checkedOf = el => el.tagName==='INPUT' ? !!el.checked : el.getAttribute('aria-checked')==='true';
@@ -18,6 +21,7 @@
   const scrollable = el => el===document.body || ((el.scrollHeight>el.clientHeight+1 || el.scrollWidth>el.clientWidth+1) && /(auto|scroll|overlay)/.test(getComputedStyle(el).overflow+getComputedStyle(el).overflowY+getComputedStyle(el).overflowX));
   const actions = el => {
     if (!enabled(el) || protectedNode(el)) return [];
+    if (fileInput(el)) return ['upload'];
     const result=[];
     if (typeof el.focus==='function') result.push('focus','key');
     if ((['BUTTON','A','INPUT','SELECT'].includes(el.tagName) || el.onclick || roleOf(el)==='button' || checkable(el)) && typeof el.click==='function') result.push('click','hover');
@@ -25,13 +29,13 @@
     if (el.tagName==='SELECT' && !el.multiple) result.push('select');
     if (checkable(el)) result.push('check');
     if (scrollable(el)) result.push('scroll');
-    if (el===document.body) result.push('navigate','back','forward','reload');
+    if (el===document.body) result.push('navigate','back','forward','reload','open_tab','activate_page','close_page');
     return result;
   };
   const check = args => {
     if (args.document_token!==documentToken || args.observation!==observation) return {error:'CONTROL.STALE_TARGET'};
     const found=nodes.get(args.node_id);
-    if (!found || !visible(found.el) || fingerprint(found.el)!==found.fingerprint) return {error:'CONTROL.STALE_TARGET'};
+    if (!found || !present(found.el) || fingerprint(found.el)!==found.fingerprint) return {error:'CONTROL.STALE_TARGET'};
     if (!enabled(found.el) || protectedNode(found.el)) return {error:'CONTROL.ACTION_UNSUPPORTED'};
     if (!actions(found.el).includes(args.action)) return {error:'CONTROL.ACTION_UNSUPPORTED'};
     return found;
@@ -42,7 +46,7 @@
       const items=[];
       const walker=document.body?document.createTreeWalker(document.body,NodeFilter.SHOW_ELEMENT):null;
       let el=document.body,scanned=0;
-      while(el && items.length<=limit && scanned++<20000) {if(visible(el))items.push(el);el=walker.nextNode();}
+      while(el && items.length<=limit && scanned++<20000) {if(present(el))items.push(el);el=walker.nextNode();}
       const result=items.slice(0,limit).map((el,index)=>{
         const node_id='n'+index;
         nodes.set(node_id,{el,fingerprint:fingerprint(el)});
@@ -50,6 +54,7 @@
           value:protectedNode(el)?null:(('value' in el)?String(el.value).slice(0,4096):null),
           states:{enabled:enabled(el),protected:protectedNode(el),read_only:!!el.readOnly,focused:document.activeElement===el},actions:actions(el)};
         if (checkable(el)) node.states.checked=checkedOf(el);
+        if (fileInput(el)) { node.states.hidden=!visible(el); node.files=Array.from(el.files||[]).slice(0,32).map(f=>f.name.slice(0,256)); node.multiple=!!el.multiple; }
         if (el.tagName==='SELECT') node.options=Array.from(el.options).slice(0,100).map(o=>o.label.trim().slice(0,256));
         return node;
       });
@@ -101,6 +106,10 @@
     confirm: args => {
       const found=check(args); if(found.error) return found;
       return {ok:true};
+    },
+    // The checked element itself, by reference, for a protocol call that needs the node.
+    element: args => {
+      const found=check(args); return found.error ? null : found.el;
     },
     // The element's box in page CSS pixels, scrolled into view, for a screenshot.
     rect: args => {

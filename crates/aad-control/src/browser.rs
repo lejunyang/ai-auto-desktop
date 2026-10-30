@@ -1,7 +1,7 @@
 //! Explicit CDP page/frame resources. No arbitrary evaluation in the public API.
 use crate::{
     error, native::resource_id, Action, Backend, BackendResource, Button, Direction, Resource,
-    Result, PAGE_ACTIONS,
+    Result, PAGE_ACTIONS, TAB_ACTIONS,
 };
 use aad_cdp::{Client, Target};
 use aad_core::AutomationError;
@@ -15,18 +15,249 @@ pub const PROVIDER: &str = "browser.cdp";
 
 /// CDP `Input` and page navigation address the page, not a frame, so they are
 /// offered only where the observed frame is the main one.
-const MAIN_FRAME_ONLY: [&str; 7] = [
-    "key", "scroll", "hover", "navigate", "back", "forward", "reload",
+const MAIN_FRAME_ONLY: [&str; 10] = [
+    "key",
+    "scroll",
+    "hover",
+    "navigate",
+    "back",
+    "forward",
+    "reload",
+    "open_tab",
+    "activate_page",
+    "close_page",
 ];
+
+/// How long a newly attached page may take to answer before it counts as blocked.
+const RESPONSIVE: Duration = Duration::from_secs(2);
+const DIALOG_OPENING: &str = "Page.javascriptDialogOpening";
+const DOWNLOAD_BEGIN: &str = "Browser.downloadWillBegin";
+const DOWNLOAD_PROGRESS: &str = "Browser.downloadProgress";
+/// Downloads remembered per session; the oldest are forgotten first.
+const MAX_DOWNLOADS: usize = 200;
+
+/// Downloads go to a directory of this session's own, and are tracked from
+/// the browser's events -- only for a browser this server launched. A
+/// person's own browser, attached by port, keeps its download settings.
+#[derive(Default)]
+struct Downloads {
+    /// Whether the attached browser is one this server launched.
+    launched: bool,
+    /// Whether the current browser connection redirected downloads.
+    routed: bool,
+    /// Downloads were handed back, as the session or the browser closes.
+    released: bool,
+    directory: Option<std::path::PathBuf>,
+    /// Why downloads could not be routed to the directory, if they could not.
+    failure: Option<String>,
+    items: Vec<Value>,
+}
+
+impl Downloads {
+    /// Route this browser's downloads into the session directory. A browser
+    /// that refuses still works; the answer then says why nothing is tracked.
+    fn configure(&mut self, client: &mut Client) {
+        if !self.launched || self.released {
+            return;
+        }
+        let directory = self.directory.get_or_insert_with(|| {
+            std::env::temp_dir().join(format!("aad-downloads-{}", uuid::Uuid::new_v4()))
+        });
+        self.failure = std::fs::create_dir_all(&*directory)
+            .map_err(|e| e.to_string())
+            .and_then(|()| {
+                client
+                    .command(
+                        "Browser.setDownloadBehavior",
+                        json!({"behavior": "allow", "downloadPath": directory, "eventsEnabled": true}),
+                    )
+                    .map(|_| ())
+                    .map_err(|e| e.to_string())
+            })
+            .err();
+        self.routed = self.failure.is_none();
+    }
+
+    /// Hand downloads back to the browser's own setting. Best effort: the
+    /// browser may already be gone.
+    fn reset(&mut self, client: &mut Client) {
+        self.released = self.launched;
+        if self.routed {
+            client.set_deadline(Instant::now() + Duration::from_secs(1));
+            let _ = client.command(
+                "Browser.setDownloadBehavior",
+                json!({"behavior": "default", "eventsEnabled": false}),
+            );
+            self.routed = false;
+        }
+    }
+
+    fn track(&mut self, client: &Client) {
+        for event in client.drain_events().events {
+            self.apply(&event);
+        }
+    }
+
+    fn apply(&mut self, event: &Value) {
+        let params = &event["params"];
+        let Some(guid) = params["guid"].as_str() else {
+            return;
+        };
+        match event["method"].as_str() {
+            Some(DOWNLOAD_BEGIN) => {
+                if self.items.len() >= MAX_DOWNLOADS {
+                    self.items.remove(0);
+                }
+                self.items.push(json!({
+                    "guid": guid,
+                    "url": params["url"],
+                    "suggested_filename": params["suggestedFilename"],
+                    "state": "in_progress",
+                    "received_bytes": 0,
+                    "total_bytes": null,
+                    "path": null,
+                }));
+            }
+            Some(DOWNLOAD_PROGRESS) => {
+                let directory = self.directory.clone();
+                let Some(item) = self.items.iter_mut().find(|item| item["guid"] == guid) else {
+                    return;
+                };
+                item["received_bytes"] = params["receivedBytes"].clone();
+                if params["totalBytes"]
+                    .as_f64()
+                    .is_some_and(|total| total > 0.0)
+                {
+                    item["total_bytes"] = params["totalBytes"].clone();
+                }
+                item["state"] = json!(match params["state"].as_str() {
+                    Some("completed") => "completed",
+                    Some("canceled") => "canceled",
+                    _ => "in_progress",
+                });
+                if params["state"] == "completed" {
+                    // Newer browsers say where; otherwise the suggested name
+                    // in the directory, when that file is there.
+                    let path = params["filePath"]
+                        .as_str()
+                        .map(std::path::PathBuf::from)
+                        .or_else(|| {
+                            Some(directory?.join(item["suggested_filename"].as_str()?))
+                                .filter(|path| path.is_file())
+                        });
+                    item["path"] = json!(path);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn answer(&self) -> Value {
+        let reason = if !self.launched {
+            Some("attached browser: downloads are not redirected".to_string())
+        } else if self.released {
+            Some("downloads were handed back to the browser's own setting".to_string())
+        } else {
+            self.failure.clone()
+        };
+        json!({
+            "directory": self.directory,
+            "tracking": self.launched && self.routed && !self.released,
+            "reason": reason,
+            "downloads": self.items,
+        })
+    }
+}
+const DIALOG_CLOSED: &str = "Page.javascriptDialogClosed";
 
 struct Page {
     client: Client,
     websocket: String,
+    /// The JavaScript dialog blocking this page, as the browser announced it.
+    dialog: Option<Value>,
+    /// The main frame id the last frame tree reported.
+    main_frame: Option<String>,
+}
+
+impl Page {
+    /// Apply the dialog events received since the last look.
+    fn sync_dialog(&mut self) {
+        for event in self.client.drain_events().events {
+            match event["method"].as_str() {
+                Some(DIALOG_OPENING) => {
+                    let params = &event["params"];
+                    let text = |key: &str| {
+                        params[key]
+                            .as_str()
+                            .map(|s| s.chars().take(4096).collect::<String>())
+                    };
+                    self.dialog = Some(json!({
+                        "dialog_id": uuid::Uuid::new_v4().to_string(),
+                        "type": text("type").unwrap_or_else(|| "alert".into()),
+                        "message": text("message").unwrap_or_default(),
+                        "default_prompt": text("defaultPrompt"),
+                        "url": text("url"),
+                    }));
+                }
+                Some(DIALOG_CLOSED) => self.dialog = None,
+                _ => {}
+            }
+        }
+    }
+}
+
+fn dialog_open(dialog: &Value) -> AutomationError {
+    error(
+        "CONTROL.DIALOG_OPEN",
+        format!(
+            "a JavaScript {} dialog blocks this page",
+            dialog["type"].as_str().unwrap_or("alert")
+        ),
+    )
+    .with_detail(
+        "dialog",
+        json!({"type": dialog["type"], "message": dialog["message"]}),
+    )
+}
+
+/// What an observation of a page blocked by a dialog shows: the dialog alone.
+fn dialog_snapshot(page_id: &str, frame_id: &str, main: bool, dialog: &Value) -> Value {
+    let prompt = dialog["type"] == "prompt";
+    json!({
+        "snapshot_id": uuid::Uuid::new_v4().to_string(),
+        "document_token": null,
+        "truncated": false,
+        "nodes": [{
+            "node_id": "dialog",
+            "role": "alertdialog",
+            "name": dialog["message"],
+            "tag": null,
+            "value": if prompt { dialog["default_prompt"].clone() } else { Value::Null },
+            "states": {"enabled": true, "modal": true, "focused": true},
+            "actions": ["accept", "dismiss"],
+            "dialog": {
+                "type": dialog["type"],
+                "message": dialog["message"],
+                "default_prompt": dialog["default_prompt"],
+                "url": dialog["url"],
+            },
+        }],
+        "metadata": {
+            "page_id": page_id,
+            "frame_id": frame_id,
+            "main_frame": main,
+            "dialog_id": dialog["dialog_id"],
+            "dialog": dialog["type"],
+        },
+    })
 }
 pub struct BrowserBackend {
     /// The loopback CDP port; 0 until a browser is attached.
     port: AtomicU16,
     pages: Mutex<BTreeMap<String, Page>>,
+    /// The browser-level connection, for tabs and downloads; opened when first needed.
+    browser: Mutex<Option<Client>>,
+    downloads: Mutex<Downloads>,
     world: String,
     last_context: Mutex<Option<(String, i64)>>,
     closed: AtomicBool,
@@ -37,15 +268,51 @@ impl BrowserBackend {
         Self {
             port: AtomicU16::new(port),
             pages: Mutex::new(BTreeMap::new()),
+            browser: Mutex::new(None),
+            downloads: Mutex::new(Downloads::default()),
             world: format!("aad-control-{}", uuid::Uuid::new_v4()),
             last_context: Mutex::new(None),
             closed: AtomicBool::new(false),
         }
     }
 
-    /// Work with the browser on `port` from now on, e.g. one this session started.
+    /// A provider for a browser this server launched on `port`: its
+    /// downloads go to the session's directory and are listed.
+    pub fn launched(port: u16) -> Self {
+        let backend = Self::new(port);
+        backend.downloads.lock().unwrap().launched = true;
+        backend
+    }
+
+    /// Work with a browser someone else started on `port` from now on. Its
+    /// download settings are left alone.
     pub fn attach(&self, port: u16) {
+        self.switch(port, false);
+    }
+
+    /// Work with a browser this server launched on `port` from now on.
+    pub fn attach_launched(&self, port: u16) {
+        self.switch(port, true);
+    }
+
+    /// Give the current launched browser its own download setting back.
+    pub fn release_downloads(&self) {
+        if let Ok(mut slot) = self.browser.try_lock() {
+            if let Some(client) = slot.as_mut() {
+                self.downloads.lock().unwrap().reset(client);
+            }
+        }
+    }
+
+    fn switch(&self, port: u16, launched: bool) {
+        self.release_downloads();
+        {
+            let mut downloads = self.downloads.lock().unwrap();
+            downloads.launched = launched;
+            downloads.released = false;
+        }
         self.pages.lock().unwrap().clear();
+        *self.browser.lock().unwrap() = None;
         *self.last_context.lock().unwrap() = None;
         self.port.store(port, Ordering::SeqCst);
     }
@@ -70,7 +337,7 @@ impl BrowserBackend {
         pages: &'a mut BTreeMap<String, Page>,
         target: &Target,
         deadline: Instant,
-    ) -> Result<&'a mut Client> {
+    ) -> Result<&'a mut Page> {
         if pages
             .get(&target.id)
             .is_some_and(|page| page.websocket != target.webSocketDebuggerUrl)
@@ -79,29 +346,61 @@ impl BrowserBackend {
         }
         if !pages.contains_key(&target.id) {
             if pages.len() >= 64 {
-                if let Some(id) = pages.keys().next().cloned() {
+                // Never evict a page with an open dialog: reattaching to a
+                // blocked page waits for the dialog to go.
+                if let Some(id) = pages
+                    .iter()
+                    .find(|(_, page)| page.dialog.is_none())
+                    .map(|(id, _)| id.clone())
+                {
                     pages.remove(&id);
                 }
             }
-            let client = Client::attach_until(target, deadline).map_err(cdp_error)?;
+            let mut client = Client::attach_bare_until(target, deadline).map_err(cdp_error)?;
+            client.filter_events(&[DIALOG_OPENING, DIALOG_CLOSED], &[DIALOG_OPENING]);
+            // Dialog events need the Page domain. Enabling it waits for the
+            // renderer, which a dialog opened before this connection blocks
+            // for good: the browser only lets the connection that saw a
+            // dialog open answer it. Fail fast rather than hang.
+            let patience = deadline.min(Instant::now() + RESPONSIVE);
+            client.set_deadline(patience);
+            if let Err(e) = client.command("Page.enable", json!({})) {
+                return Err(
+                    if e.interrupted_by().is_none() && Instant::now() < deadline {
+                        error(
+                            "BROWSER.PAGE_UNRESPONSIVE",
+                            "the page did not answer: a JavaScript dialog that opened before this \
+                         session attached, or a busy script, blocks it",
+                        )
+                    } else {
+                        cdp_error(e)
+                    },
+                );
+            }
+            client.set_deadline(deadline);
+            command(&mut client, "Runtime.enable", json!({}))?;
             pages.insert(
                 target.id.clone(),
                 Page {
                     client,
                     websocket: target.webSocketDebuggerUrl.clone(),
+                    dialog: None,
+                    main_frame: None,
                 },
             );
         }
-        let client = &mut pages.get_mut(&target.id).unwrap().client;
-        client.set_deadline(deadline);
-        Ok(client)
+        let page = pages.get_mut(&target.id).unwrap();
+        page.client.set_deadline(deadline);
+        page.sync_dialog();
+        Ok(page)
     }
 
-    fn with_page<T>(
+    /// Work on one page's connection with its dialog state up to date.
+    fn with_page_state<T>(
         &self,
         page_id: &str,
         timeout: Duration,
-        f: impl FnOnce(&mut Client) -> Result<T>,
+        f: impl FnOnce(&mut Page) -> Result<T>,
     ) -> Result<T> {
         let deadline = Instant::now() + timeout;
         if self.closed.load(Ordering::SeqCst) {
@@ -122,15 +421,122 @@ impl BrowserBackend {
         if self.closed.load(Ordering::SeqCst) {
             self.clear_context(&mut pages, Instant::now() + Duration::from_millis(100));
         }
-        if result.is_err() {
-            pages.remove(page_id);
+        if let Some(page) = pages.get_mut(page_id) {
+            page.sync_dialog();
+            // A fresh connection on the next call recovers from a broken one,
+            // but not while a dialog blocks the page: attaching would hang.
+            if result.is_err() && page.dialog.is_none() {
+                pages.remove(page_id);
+            }
         }
         result
     }
 
+    /// Work on a page that must not be blocked by a JavaScript dialog.
+    fn with_page<T>(
+        &self,
+        page_id: &str,
+        timeout: Duration,
+        f: impl FnOnce(&mut Client) -> Result<T>,
+    ) -> Result<T> {
+        self.with_page_state(page_id, timeout, |page| match &page.dialog {
+            Some(dialog) => Err(dialog_open(dialog)),
+            None => f(&mut page.client),
+        })
+    }
+
+    /// Run commands on the browser-level connection, opening it when needed.
+    /// A failure drops it, so the next call reconnects to the current browser.
+    fn with_browser<T>(
+        &self,
+        deadline: Instant,
+        f: impl FnOnce(&mut Client) -> Result<T>,
+    ) -> Result<T> {
+        let port = self.port()?;
+        let mut slot = self.browser.lock().unwrap();
+        if slot.is_none() {
+            let client = Client::browser_until(port, deadline).map_err(cdp_error)?;
+            client.filter_events(&[DOWNLOAD_BEGIN, DOWNLOAD_PROGRESS], &[]);
+            *slot = Some(client);
+        }
+        let client = slot.as_mut().unwrap();
+        client.set_deadline(deadline);
+        // Chromium drops the download setting whenever any browser-level
+        // DevTools client detaches, so a launched browser gets it every time.
+        self.downloads.lock().unwrap().configure(client);
+        client.set_deadline(deadline);
+        let result = f(client);
+        self.downloads.lock().unwrap().track(client);
+        if result.is_err() {
+            *slot = None;
+        }
+        result
+    }
+
+    /// What the browser downloaded since this session first connected to it:
+    /// each by guid, address, suggested name, state, bytes and saved path.
+    pub fn downloads(&self, timeout: Duration) -> Result<Value> {
+        self.with_browser(Instant::now() + timeout, |_| Ok(()))?;
+        Ok(self.downloads.lock().unwrap().answer())
+    }
+
+    /// Which page opened each page, by target id, as the browser reports it.
+    fn openers(&self, deadline: Instant) -> BTreeMap<String, String> {
+        self.with_browser(deadline, |client| {
+            command(client, "Target.getTargets", json!({}))
+        })
+        .map(|answer| {
+            answer["targetInfos"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|info| {
+                    Some((
+                        info["targetId"].as_str()?.to_string(),
+                        info["openerId"].as_str()?.to_string(),
+                    ))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+    }
+
+    /// Open, front or close a tab after the observed document was confirmed.
+    fn tab(&self, page_id: &str, action: &Action, deadline: Instant) -> Result<Value> {
+        let unknown = |e: AutomationError| e.with_effect("unknown");
+        self.with_browser(deadline, |client| match action {
+            Action::OpenTab { url } => {
+                let created = command(client, "Target.createTarget", json!({"url": url}))
+                    .map_err(unknown)?;
+                let id = created["targetId"].as_str().ok_or_else(|| {
+                    error("BROWSER.BAD_RESULT", "the browser named no new page").with_effect("unknown")
+                })?;
+                Ok(json!({"submitted": true, "native_operation": "Target.createTarget", "page_id": id, "opener_page_id": page_id}))
+            }
+            Action::ActivatePage {} => {
+                command(client, "Target.activateTarget", json!({"targetId": page_id}))
+                    .map_err(unknown)?;
+                Ok(json!({"submitted": true, "native_operation": "Target.activateTarget", "page_id": page_id}))
+            }
+            Action::ClosePage {} => {
+                let closed = command(client, "Target.closeTarget", json!({"targetId": page_id}))
+                    .map_err(unknown)?;
+                // Chromium reports `success: false` when the page refused, e.g.
+                // it no longer exists; older versions omit the field.
+                if closed["success"] == false {
+                    return Err(error("BROWSER.CLOSE_REFUSED", "the browser did not close the page")
+                        .with_effect("unknown"));
+                }
+                Ok(json!({"submitted": true, "native_operation": "Target.closeTarget", "page_id": page_id}))
+            }
+            _ => unreachable!("only tab actions reach here"),
+        })
+    }
+
     fn clear_context(&self, pages: &mut BTreeMap<String, Page>, deadline: Instant) {
         if let Some((page, context)) = self.last_context.lock().unwrap().take() {
-            if let Some(page) = pages.get_mut(&page) {
+            // A page blocked by a dialog cannot evaluate; its world goes with the document.
+            if let Some(page) = pages.get_mut(&page).filter(|page| page.dialog.is_none()) {
                 page.client.set_deadline(deadline);
                 let _ = eval(
                     &mut page.client,
@@ -143,6 +549,12 @@ impl BrowserBackend {
 }
 
 fn cdp_error(e: aad_cdp::CdpError) -> AutomationError {
+    if e.interrupted_by() == Some(DIALOG_OPENING) {
+        return error(
+            "CONTROL.DIALOG_OPEN",
+            "a JavaScript dialog opened and blocks the page",
+        );
+    }
     error("BROWSER.CDP_ERROR", e.to_string())
 }
 fn command(client: &mut Client, method: &str, params: Value) -> Result<Value> {
@@ -189,6 +601,7 @@ fn current_frame(client: &mut Client, frame_id: &str) -> Result<Value> {
 
 impl Backend for BrowserBackend {
     fn close(&self) {
+        self.release_downloads();
         self.closed.store(true, Ordering::SeqCst);
         if let Ok(mut pages) = self.pages.try_lock() {
             self.clear_context(&mut pages, Instant::now() + Duration::from_millis(100));
@@ -207,8 +620,24 @@ impl Backend for BrowserBackend {
     }
     fn capabilities(&self) -> Vec<String> {
         [
-            "focus", "click", "fill", "key", "scroll", "hover", "select", "check", "navigate",
-            "back", "forward", "reload",
+            "focus",
+            "click",
+            "fill",
+            "key",
+            "scroll",
+            "hover",
+            "select",
+            "check",
+            "navigate",
+            "back",
+            "forward",
+            "reload",
+            "open_tab",
+            "activate_page",
+            "close_page",
+            "accept",
+            "dismiss",
+            "upload",
         ]
         .map(String::from)
         .to_vec()
@@ -219,15 +648,60 @@ impl Backend for BrowserBackend {
         }
         let deadline = Instant::now() + timeout;
         let targets = Client::list_targets_until(self.port()?, deadline).map_err(cdp_error)?;
+        // Best effort: without the browser connection pages are still listed,
+        // just without who opened them.
+        let openers = self.openers(deadline);
         let mut pages = self.pages.lock().unwrap();
         pages.retain(|id, _| targets.iter().any(|target| target.id == *id));
         let mut resources = Vec::new();
         for target in targets.iter().take(64) {
-            let client = self.page(&mut pages, target, deadline)?;
-            let tree = command(client, "Page.getFrameTree", json!({}))?;
+            let page = match self.page(&mut pages, target, deadline) {
+                Ok(page) => page,
+                Err(e) if e.code == "BROWSER.PAGE_UNRESPONSIVE" => {
+                    // Listed, so a person can be told, but nothing is offered on it.
+                    let selector = json!({"page_id": target.id, "frame_id": target.id});
+                    resources.push(BackendResource {
+                        resource: Resource {
+                            resource_id: resource_id(PROVIDER, &selector),
+                            provider: PROVIDER.into(),
+                            kind: "browser".into(),
+                            name: target.title.clone(),
+                            capabilities: Vec::new(),
+                            metadata: json!({"page_id": target.id, "frame_id": target.id,
+                                "url": target.url, "main_frame": true, "responsive": false,
+                                "opener_page_id": openers.get(&target.id)}),
+                        },
+                        selector,
+                    });
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
+            if let Some(dialog) = &page.dialog {
+                // The renderer is blocked: list the page by its last known
+                // main frame without asking it for its frames.
+                let frame_id = page.main_frame.clone().unwrap_or_else(|| target.id.clone());
+                let selector = json!({"page_id": target.id, "frame_id": frame_id});
+                resources.push(BackendResource {
+                    resource: Resource {
+                        resource_id: resource_id(PROVIDER, &selector),
+                        provider: PROVIDER.into(),
+                        kind: "browser".into(),
+                        name: target.title.clone(),
+                        capabilities: vec!["accept".into(), "dismiss".into()],
+                        metadata: json!({"page_id": target.id, "frame_id": frame_id, "url": target.url,
+                            "main_frame": true, "opener_page_id": openers.get(&target.id),
+                            "dialog": {"type": dialog["type"], "message": dialog["message"]}}),
+                    },
+                    selector,
+                });
+                continue;
+            }
+            let tree = command(&mut page.client, "Page.getFrameTree", json!({}))?;
             let root = tree["frameTree"]["frame"]["id"]
                 .as_str()
                 .ok_or_else(|| error("BROWSER.BAD_RESULT", "missing main frame"))?;
+            page.main_frame = Some(root.to_string());
             for frame in frames(&tree["frameTree"]).into_iter().take(64) {
                 let selector = json!({"page_id":target.id,"frame_id":frame["id"]});
                 let main = frame["id"] == root;
@@ -238,7 +712,7 @@ impl Backend for BrowserBackend {
                     capabilities.retain(|s| !MAIN_FRAME_ONLY.contains(&s.as_str()));
                 }
                 resources.push(BackendResource {resource:Resource {resource_id:resource_id(PROVIDER,&selector),provider:PROVIDER.into(),kind:"browser".into(),
-                    name:target.title.clone(),capabilities,metadata:json!({"page_id":target.id,"frame_id":frame["id"],"url":frame["url"],"main_frame":main,"click_semantics":"dom_activation; trusted cdp input with button, count or fraction","fill_semantics":"dom_value_and_events","key_semantics":"cdp_input_main_frame","pointer_semantics":"cdp_input_main_frame"})},selector});
+                    name:target.title.clone(),capabilities,metadata:json!({"page_id":target.id,"frame_id":frame["id"],"url":frame["url"],"main_frame":main,"opener_page_id":openers.get(&target.id),"click_semantics":"dom_activation; trusted cdp input with button, count or fraction","fill_semantics":"dom_value_and_events","key_semantics":"cdp_input_main_frame","pointer_semantics":"cdp_input_main_frame"})},selector});
             }
         }
         if self.closed.load(Ordering::SeqCst) {
@@ -254,7 +728,12 @@ impl Backend for BrowserBackend {
         );
         let page_id = selector["page_id"].as_str().unwrap();
         let frame_id = selector["frame_id"].as_str().unwrap();
-        self.with_page(page_id,deadline.saturating_duration_since(Instant::now()),|client|{
+        self.with_page_state(page_id,deadline.saturating_duration_since(Instant::now()),|page|{
+            if let Some(dialog)=&page.dialog {
+                let main=page.main_frame.as_deref().is_none_or(|main|main==frame_id);
+                return Ok(dialog_snapshot(page_id,frame_id,main,dialog));
+            }
+            let client=&mut page.client;
             let frame=current_frame(client,frame_id)?;
             let context=command(client,"Page.createIsolatedWorld",json!({"frameId":frame_id,"worldName":self.world,"grantUniveralAccess":false}))?["executionContextId"].as_i64()
                 .ok_or_else(||error("BROWSER.BAD_RESULT","frame did not provide an isolated context"))?;
@@ -300,9 +779,16 @@ impl Backend for BrowserBackend {
                 "trusted pointer input is supported only for the main frame",
             ));
         }
+        if self.downloads.lock().unwrap().launched {
+            // A click may start a download: make sure it lands in the session directory.
+            let _ = self.with_browser(Instant::now() + action_context.remaining()?, |_| Ok(()));
+        }
+        if matches!(action, Action::Accept { .. } | Action::Dismiss {}) {
+            return self.answer_dialog(snapshot, action, action_context);
+        }
         let page_id = meta["page_id"].as_str().unwrap();
         let frame_id = meta["frame_id"].as_str().unwrap();
-        self.with_page(page_id,action_context.remaining()?,|client|{
+        let result = self.with_page(page_id,action_context.remaining()?,|client|{
             if current_frame(client,frame_id)?["loaderId"]!=meta["loader_id"] {return Err(error("CONTROL.STALE_TARGET","browser document navigated"));}
             let context=meta["context_id"].as_i64().unwrap();
             let mut args=json!({"document_token":snapshot["document_token"],"observation":snapshot["snapshot_id"],"node_id":node["node_id"],"action":action.name()});
@@ -315,6 +801,15 @@ impl Backend for BrowserBackend {
             }
             if trusted {
                 return pointer(client,context,&args,action,action_context);
+            }
+            if let Action::Upload {files}=action {
+                return upload(client,context,&args,node,files,action_context);
+            }
+            if TAB_ACTIONS.contains(&action.name()) {
+                // Anchored like navigation: the observed document must still be there.
+                checked(eval(client,context,format!("globalThis.__aadControlV1.confirm({args})"))?)?;
+                action_context.commit()?;
+                return self.tab(page_id,action,Instant::now()+action_context.remaining()?);
             }
             if PAGE_ACTIONS.contains(&action.name()) {
                 return page(client,context,&args,action,action_context);
@@ -342,6 +837,67 @@ impl Backend for BrowserBackend {
                 let result=eval(client,context,format!("globalThis.__aadControlV1.act({args})")).map_err(|e|e.with_effect("unknown"))?;
                 checked(result)
             }
+        });
+        match result {
+            // The input was delivered and the page answered it with a dialog,
+            // which now blocks it: the next observation shows the dialog.
+            Err(e) if e.code == "CONTROL.DIALOG_OPEN" && e.effect != "not_applied" => Ok(
+                json!({"submitted": true, "native_operation": action.name(), "dialog_opened": true}),
+            ),
+            other => other,
+        }
+    }
+}
+
+impl BrowserBackend {
+    /// Accept or dismiss the dialog the observation showed, if it is still the one open.
+    fn answer_dialog(
+        &self,
+        snapshot: &Value,
+        action: &Action,
+        action_context: &crate::Context,
+    ) -> Result<Value> {
+        let meta = &snapshot["metadata"];
+        let expected = meta["dialog_id"].as_str().ok_or_else(|| {
+            error(
+                "CONTROL.ACTION_UNSUPPORTED",
+                "only an observed dialog can be accepted or dismissed",
+            )
+        })?;
+        let page_id = meta["page_id"].as_str().unwrap_or_default();
+        self.with_page_state(page_id, action_context.remaining()?, |page| {
+            let dialog = page
+                .dialog
+                .clone()
+                .filter(|dialog| dialog["dialog_id"] == expected)
+                .ok_or_else(|| {
+                    error(
+                        "CONTROL.STALE_TARGET",
+                        "the dialog was already closed or replaced",
+                    )
+                })?;
+            let (accept, text) = match action {
+                Action::Accept { text } => (true, text.clone()),
+                _ => (false, None),
+            };
+            if text.is_some() && dialog["type"] != "prompt" {
+                return Err(error(
+                    "CONTROL.INVALID_REQUEST",
+                    "only a prompt dialog takes text",
+                ));
+            }
+            let mut params = json!({"accept": accept});
+            if let Some(text) = &text {
+                params["promptText"] = json!(text);
+            }
+            action_context.commit()?;
+            command(&mut page.client, "Page.handleJavaScriptDialog", params)
+                .map_err(|e| e.with_effect("unknown"))?;
+            page.dialog = None;
+            Ok(
+                json!({"submitted": true, "native_operation": "Page.handleJavaScriptDialog",
+                "accepted": accept, "dialog_type": dialog["type"]}),
+            )
         })
     }
 }
@@ -465,6 +1021,52 @@ fn pointer(
     }
     Ok(
         json!({"submitted": true, "native_operation": "Input.dispatchMouseEvent", "trusted_event": true}),
+    )
+}
+
+/// Files into the observed file input. The session has already resolved the
+/// paths under the server's upload grant; the page never names a path.
+fn upload(
+    client: &mut Client,
+    context: i64,
+    args: &Value,
+    node: &Value,
+    files: &[String],
+    action_context: &crate::Context,
+) -> Result<Value> {
+    if files.len() > 1 && node["multiple"] != true {
+        return Err(error(
+            "CONTROL.INVALID_REQUEST",
+            "this file input takes one file",
+        ));
+    }
+    checked(eval(
+        client,
+        context,
+        format!("globalThis.__aadControlV1.confirm({args})"),
+    )?)?;
+    let element = command(
+        client,
+        "Runtime.evaluate",
+        json!({"expression": format!("globalThis.__aadControlV1.element({args})"),
+               "contextId": context, "returnByValue": false}),
+    )?;
+    let object = element["result"]["objectId"]
+        .as_str()
+        .filter(|_| element["result"]["subtype"] == "node")
+        .ok_or_else(|| error("CONTROL.STALE_TARGET", "the file input was replaced"))?
+        .to_string();
+    action_context.commit()?;
+    let result = command(
+        client,
+        "DOM.setFileInputFiles",
+        json!({"files": files, "objectId": object}),
+    )
+    .map_err(|e| e.with_effect("unknown"));
+    let _ = command(client, "Runtime.releaseObject", json!({"objectId": object}));
+    result?;
+    Ok(
+        json!({"submitted": true, "native_operation": "DOM.setFileInputFiles", "files": files.len()}),
     )
 }
 
@@ -641,6 +1243,80 @@ fn key_chord(keys: &[String]) -> Result<(String, String, u32, u32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn downloads_follow_the_browser_events_and_stay_bounded() {
+        let directory = std::env::temp_dir().join(format!("aad-dl-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join("report.txt"), "body").unwrap();
+        let mut downloads = Downloads {
+            launched: true,
+            routed: true,
+            directory: Some(directory.clone()),
+            ..Default::default()
+        };
+        assert_eq!(downloads.answer()["tracking"], true);
+        let attached = Downloads::default();
+        assert_eq!(attached.answer()["tracking"], false);
+        assert_eq!(
+            attached.answer()["reason"],
+            "attached browser: downloads are not redirected"
+        );
+        downloads.apply(&json!({"method": DOWNLOAD_BEGIN, "params": {"guid": "g1",
+            "url": "http://127.0.0.1/download", "suggestedFilename": "report.txt"}}));
+        downloads.apply(
+            &json!({"method": DOWNLOAD_PROGRESS, "params": {"guid": "g1",
+            "receivedBytes": 2, "totalBytes": 4, "state": "inProgress"}}),
+        );
+        assert_eq!(downloads.items[0]["state"], "in_progress");
+        assert!(downloads.items[0]["path"].is_null());
+        downloads.apply(
+            &json!({"method": DOWNLOAD_PROGRESS, "params": {"guid": "g1",
+            "receivedBytes": 4, "totalBytes": 4, "state": "completed"}}),
+        );
+        let item = &downloads.answer()["downloads"][0];
+        assert_eq!(item["state"], "completed");
+        assert_eq!(item["received_bytes"], 4);
+        assert_eq!(item["path"], json!(directory.join("report.txt")));
+        // A progress event for an unknown download is ignored.
+        downloads.apply(
+            &json!({"method": DOWNLOAD_PROGRESS, "params": {"guid": "nope", "state": "completed"}}),
+        );
+        for n in 0..MAX_DOWNLOADS + 5 {
+            downloads
+                .apply(&json!({"method": DOWNLOAD_BEGIN, "params": {"guid": format!("x{n}")}}));
+        }
+        assert_eq!(downloads.items.len(), MAX_DOWNLOADS);
+        assert_ne!(downloads.items[0]["guid"], "g1");
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+    #[test]
+    fn a_blocked_page_shows_only_its_dialog_and_offers_only_answers() {
+        let dialog = json!({"dialog_id": "d1", "type": "prompt", "message": "Your name?",
+            "default_prompt": "guest", "url": "http://127.0.0.1/"});
+        let snapshot = dialog_snapshot("p", "f", true, &dialog);
+        let nodes = snapshot["nodes"].as_array().unwrap();
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0]["role"], "alertdialog");
+        assert_eq!(nodes[0]["value"], "guest");
+        assert_eq!(nodes[0]["actions"], json!(["accept", "dismiss"]));
+        assert_eq!(snapshot["metadata"]["dialog_id"], "d1");
+        assert_eq!(snapshot["truncated"], false);
+        let alert = dialog_snapshot(
+            "p",
+            "f",
+            true,
+            &json!({"dialog_id": "d2", "type": "alert", "message": "Hi", "default_prompt": ""}),
+        );
+        assert!(alert["nodes"][0]["value"].is_null());
+        let refused = dialog_open(&dialog);
+        assert_eq!(refused.code, "CONTROL.DIALOG_OPEN");
+        assert_eq!(refused.effect, "not_applied");
+        assert_eq!(refused.details["dialog"]["message"], "Your name?");
+        assert_eq!(
+            cdp_error(aad_cdp::CdpError::Interrupted(DIALOG_OPENING.into())).code,
+            "CONTROL.DIALOG_OPEN"
+        );
+    }
     #[test]
     fn keys_are_allowlisted_without_arbitrary_cdp_parameters() {
         assert_eq!(

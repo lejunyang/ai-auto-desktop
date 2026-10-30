@@ -150,6 +150,36 @@ impl Client {
         Ok(client)
     }
 
+    /// Attach to a page without enabling any domain. Unlike [`Client::attach_until`]
+    /// this answers even while a JavaScript dialog blocks the page's renderer.
+    pub fn attach_bare_until(
+        target: &Target,
+        deadline: std::time::Instant,
+    ) -> Result<Self, CdpError> {
+        let ws = ws::WebSocket::connect_until(&target.webSocketDebuggerUrl, deadline)?;
+        Ok(Client {
+            connection: connection::Connection::new(ws)?,
+            next_id: 0,
+            deadline: None,
+        })
+    }
+
+    /// Attach to the browser itself rather than one page, for the `Target`
+    /// and `Browser` domains. The endpoint comes from `/json/version` and is
+    /// always reached on loopback at `port`, whatever host the browser names.
+    pub fn browser_until(port: u16, deadline: std::time::Instant) -> Result<Self, CdpError> {
+        let body = http_get_until(port, "/json/version", deadline)?;
+        let value: serde_json::Value =
+            serde_json::from_str(&body).map_err(|error| CdpError::protocol(error.to_string()))?;
+        let endpoint = browser_endpoint(port, value["webSocketDebuggerUrl"].as_str())?;
+        let ws = ws::WebSocket::connect_until(&endpoint, deadline)?;
+        Ok(Client {
+            connection: connection::Connection::new(ws)?,
+            next_id: 0,
+            deadline: None,
+        })
+    }
+
     /// Deadline for a trusted application's sequence of CDP calls. This is a
     /// library primitive, never a pass-through method exposed to AI clients.
     pub fn set_deadline(&mut self, deadline: std::time::Instant) {
@@ -180,6 +210,14 @@ impl Client {
             .deadline
             .unwrap_or_else(|| std::time::Instant::now() + Duration::from_secs(8));
         self.connection.command(self.next_id, &message, deadline)
+    }
+
+    /// Queue only the `keep` event methods from now on, dropping others
+    /// already queued, and abandon any command waiting for its reply with
+    /// [`CdpError::Interrupted`] when an `interrupt` event arrives -- e.g. a
+    /// JavaScript dialog, which blocks the page until it is handled.
+    pub fn filter_events(&self, keep: &[&str], interrupt: &[&str]) {
+        self.connection.filter(Some(keep), interrupt);
     }
 
     /// Events are received continuously, including while the caller is idle.
@@ -263,6 +301,20 @@ impl Client {
         }
         Ok(result)
     }
+}
+
+/// The loopback browser endpoint for the id `/json/version` reported.
+fn browser_endpoint(port: u16, reported: Option<&str>) -> Result<String, CdpError> {
+    let id = reported
+        .and_then(|url| url.split_once("/devtools/browser/"))
+        .map(|(_, id)| id)
+        .filter(|id| {
+            !id.is_empty()
+                && id.len() <= 128
+                && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        })
+        .ok_or_else(CdpError::bad_url)?;
+    Ok(format!("ws://127.0.0.1:{port}/devtools/browser/{id}"))
 }
 
 fn http_get(port: u16, path: &str) -> Result<String, CdpError> {
@@ -394,6 +446,26 @@ mod http_tests {
             }
         });
         (port, worker)
+    }
+    #[test]
+    fn the_browser_endpoint_stays_on_loopback_and_takes_only_an_id() {
+        assert_eq!(
+            browser_endpoint(
+                9222,
+                Some("ws://example.com:1/devtools/browser/8f18-4c01-ad0f")
+            )
+            .unwrap(),
+            "ws://127.0.0.1:9222/devtools/browser/8f18-4c01-ad0f"
+        );
+        for bad in [
+            None,
+            Some("ws://127.0.0.1:9222/devtools/page/abc"),
+            Some("ws://127.0.0.1:9222/devtools/browser/"),
+            Some("ws://127.0.0.1:9222/devtools/browser/a/../b"),
+            Some("ws://127.0.0.1:9222/devtools/browser/a?b"),
+        ] {
+            assert!(browser_endpoint(9222, bad).is_err(), "{bad:?}");
+        }
     }
     #[test]
     fn malicious_content_length_is_rejected_without_integer_overflow() {
