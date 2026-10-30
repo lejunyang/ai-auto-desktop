@@ -1,7 +1,7 @@
 //! Explicit CDP page/frame resources. No arbitrary evaluation in the public API.
 use crate::{
     error, native::resource_id, Action, Backend, BackendResource, Button, Direction, Resource,
-    Result, PAGE_ACTIONS,
+    Result, PAGE_ACTIONS, TAB_ACTIONS,
 };
 use aad_cdp::{Client, Target};
 use aad_core::AutomationError;
@@ -15,8 +15,17 @@ pub const PROVIDER: &str = "browser.cdp";
 
 /// CDP `Input` and page navigation address the page, not a frame, so they are
 /// offered only where the observed frame is the main one.
-const MAIN_FRAME_ONLY: [&str; 7] = [
-    "key", "scroll", "hover", "navigate", "back", "forward", "reload",
+const MAIN_FRAME_ONLY: [&str; 10] = [
+    "key",
+    "scroll",
+    "hover",
+    "navigate",
+    "back",
+    "forward",
+    "reload",
+    "open_tab",
+    "activate_page",
+    "close_page",
 ];
 
 struct Page {
@@ -27,6 +36,8 @@ pub struct BrowserBackend {
     /// The loopback CDP port; 0 until a browser is attached.
     port: AtomicU16,
     pages: Mutex<BTreeMap<String, Page>>,
+    /// The browser-level connection, for tabs; opened when first needed.
+    browser: Mutex<Option<Client>>,
     world: String,
     last_context: Mutex<Option<(String, i64)>>,
     closed: AtomicBool,
@@ -37,6 +48,7 @@ impl BrowserBackend {
         Self {
             port: AtomicU16::new(port),
             pages: Mutex::new(BTreeMap::new()),
+            browser: Mutex::new(None),
             world: format!("aad-control-{}", uuid::Uuid::new_v4()),
             last_context: Mutex::new(None),
             closed: AtomicBool::new(false),
@@ -46,6 +58,7 @@ impl BrowserBackend {
     /// Work with the browser on `port` from now on, e.g. one this session started.
     pub fn attach(&self, port: u16) {
         self.pages.lock().unwrap().clear();
+        *self.browser.lock().unwrap() = None;
         *self.last_context.lock().unwrap() = None;
         self.port.store(port, Ordering::SeqCst);
     }
@@ -128,6 +141,80 @@ impl BrowserBackend {
         result
     }
 
+    /// Run commands on the browser-level connection, opening it when needed.
+    /// A failure drops it, so the next call reconnects to the current browser.
+    fn with_browser<T>(
+        &self,
+        deadline: Instant,
+        f: impl FnOnce(&mut Client) -> Result<T>,
+    ) -> Result<T> {
+        let port = self.port()?;
+        let mut slot = self.browser.lock().unwrap();
+        if slot.is_none() {
+            *slot = Some(Client::browser_until(port, deadline).map_err(cdp_error)?);
+        }
+        let client = slot.as_mut().unwrap();
+        client.set_deadline(deadline);
+        let result = f(client);
+        if result.is_err() {
+            *slot = None;
+        }
+        result
+    }
+
+    /// Which page opened each page, by target id, as the browser reports it.
+    fn openers(&self, deadline: Instant) -> BTreeMap<String, String> {
+        self.with_browser(deadline, |client| {
+            command(client, "Target.getTargets", json!({}))
+        })
+        .map(|answer| {
+            answer["targetInfos"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|info| {
+                    Some((
+                        info["targetId"].as_str()?.to_string(),
+                        info["openerId"].as_str()?.to_string(),
+                    ))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+    }
+
+    /// Open, front or close a tab after the observed document was confirmed.
+    fn tab(&self, page_id: &str, action: &Action, deadline: Instant) -> Result<Value> {
+        let unknown = |e: AutomationError| e.with_effect("unknown");
+        self.with_browser(deadline, |client| match action {
+            Action::OpenTab { url } => {
+                let created = command(client, "Target.createTarget", json!({"url": url}))
+                    .map_err(unknown)?;
+                let id = created["targetId"].as_str().ok_or_else(|| {
+                    error("BROWSER.BAD_RESULT", "the browser named no new page").with_effect("unknown")
+                })?;
+                Ok(json!({"submitted": true, "native_operation": "Target.createTarget", "page_id": id, "opener_page_id": page_id}))
+            }
+            Action::ActivatePage {} => {
+                command(client, "Target.activateTarget", json!({"targetId": page_id}))
+                    .map_err(unknown)?;
+                Ok(json!({"submitted": true, "native_operation": "Target.activateTarget", "page_id": page_id}))
+            }
+            Action::ClosePage {} => {
+                let closed = command(client, "Target.closeTarget", json!({"targetId": page_id}))
+                    .map_err(unknown)?;
+                // Chromium reports `success: false` when the page refused, e.g.
+                // it no longer exists; older versions omit the field.
+                if closed["success"] == false {
+                    return Err(error("BROWSER.CLOSE_REFUSED", "the browser did not close the page")
+                        .with_effect("unknown"));
+                }
+                Ok(json!({"submitted": true, "native_operation": "Target.closeTarget", "page_id": page_id}))
+            }
+            _ => unreachable!("only tab actions reach here"),
+        })
+    }
+
     fn clear_context(&self, pages: &mut BTreeMap<String, Page>, deadline: Instant) {
         if let Some((page, context)) = self.last_context.lock().unwrap().take() {
             if let Some(page) = pages.get_mut(&page) {
@@ -207,8 +294,21 @@ impl Backend for BrowserBackend {
     }
     fn capabilities(&self) -> Vec<String> {
         [
-            "focus", "click", "fill", "key", "scroll", "hover", "select", "check", "navigate",
-            "back", "forward", "reload",
+            "focus",
+            "click",
+            "fill",
+            "key",
+            "scroll",
+            "hover",
+            "select",
+            "check",
+            "navigate",
+            "back",
+            "forward",
+            "reload",
+            "open_tab",
+            "activate_page",
+            "close_page",
         ]
         .map(String::from)
         .to_vec()
@@ -219,6 +319,9 @@ impl Backend for BrowserBackend {
         }
         let deadline = Instant::now() + timeout;
         let targets = Client::list_targets_until(self.port()?, deadline).map_err(cdp_error)?;
+        // Best effort: without the browser connection pages are still listed,
+        // just without who opened them.
+        let openers = self.openers(deadline);
         let mut pages = self.pages.lock().unwrap();
         pages.retain(|id, _| targets.iter().any(|target| target.id == *id));
         let mut resources = Vec::new();
@@ -238,7 +341,7 @@ impl Backend for BrowserBackend {
                     capabilities.retain(|s| !MAIN_FRAME_ONLY.contains(&s.as_str()));
                 }
                 resources.push(BackendResource {resource:Resource {resource_id:resource_id(PROVIDER,&selector),provider:PROVIDER.into(),kind:"browser".into(),
-                    name:target.title.clone(),capabilities,metadata:json!({"page_id":target.id,"frame_id":frame["id"],"url":frame["url"],"main_frame":main,"click_semantics":"dom_activation; trusted cdp input with button, count or fraction","fill_semantics":"dom_value_and_events","key_semantics":"cdp_input_main_frame","pointer_semantics":"cdp_input_main_frame"})},selector});
+                    name:target.title.clone(),capabilities,metadata:json!({"page_id":target.id,"frame_id":frame["id"],"url":frame["url"],"main_frame":main,"opener_page_id":openers.get(&target.id),"click_semantics":"dom_activation; trusted cdp input with button, count or fraction","fill_semantics":"dom_value_and_events","key_semantics":"cdp_input_main_frame","pointer_semantics":"cdp_input_main_frame"})},selector});
             }
         }
         if self.closed.load(Ordering::SeqCst) {
@@ -315,6 +418,12 @@ impl Backend for BrowserBackend {
             }
             if trusted {
                 return pointer(client,context,&args,action,action_context);
+            }
+            if TAB_ACTIONS.contains(&action.name()) {
+                // Anchored like navigation: the observed document must still be there.
+                checked(eval(client,context,format!("globalThis.__aadControlV1.confirm({args})"))?)?;
+                action_context.commit()?;
+                return self.tab(page_id,action,Instant::now()+action_context.remaining()?);
             }
             if PAGE_ACTIONS.contains(&action.name()) {
                 return page(client,context,&args,action,action_context);

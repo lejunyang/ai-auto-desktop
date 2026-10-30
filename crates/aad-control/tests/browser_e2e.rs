@@ -30,6 +30,7 @@ const PAGE: &str = r#"<!doctype html><html><body>
 <div aria-label="Log" style="height:40px;overflow:auto" onscroll="document.getElementById('status').value='scrolled:'+(this.scrollTop>0)"><div style="height:400px">rows</div></div>
 <div style="position:relative"><button aria-label="Covered">Covered</button><div style="position:absolute;inset:0;background:white"></div></div>
 <a href="/second" aria-label="Second page">second</a>
+<button aria-label="Popup" onclick="window.open('/second','_blank','popup')">Popup</button>
 <iframe src="/frame"></iframe>
 </body></html>"#;
 
@@ -365,6 +366,132 @@ fn wait_returns_an_element_that_appears_after_a_timer_ready_to_act_on() {
         1_000,
     );
     assert_eq!(never.error.unwrap()["code"], "CONTROL.WAIT_TIMEOUT");
+}
+
+fn visibility(fixture: &Fixture, page_id: &str) -> String {
+    let target = aad_cdp::Client::list_targets(fixture.port)
+        .unwrap()
+        .into_iter()
+        .find(|t| t.id == page_id)
+        .expect("page is listed");
+    aad_cdp::Client::attach(&target)
+        .unwrap()
+        .eval("document.visibilityState")
+        .unwrap()["result"]["value"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+#[test]
+#[ignore = "requires isolated Chromium with its sandbox enabled; CI runs it explicitly"]
+fn tabs_open_front_and_close_and_popups_name_their_opener() {
+    let _serial = serial();
+    let fixture = Fixture::new();
+    let (session, _) = session_for(&fixture);
+    let main = main_of(&session, &fixture.page_id);
+    assert!(wait_until(&session, &main, "Name", WaitCondition::Appears)
+        .error
+        .is_none());
+    let observed = observe(&session, &main);
+    let offered = &observed["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|n| n["role"] == "document")
+        .unwrap()["capabilities"];
+    for action in ["open_tab", "activate_page", "close_page"] {
+        assert!(
+            offered.as_array().unwrap().iter().any(|a| a == action),
+            "{action} on the document: {offered}"
+        );
+    }
+    let body = document(&session, &observed);
+    let refused = act(
+        &session,
+        body,
+        Action::OpenTab {
+            url: "javascript:alert(1)".into(),
+        },
+    );
+    assert_eq!(refused.error.unwrap()["code"], "CONTROL.INVALID_REQUEST");
+    let body = document(&session, &observe(&session, &main));
+    let opened = act(
+        &session,
+        body,
+        Action::OpenTab {
+            url: format!("{}second", fixture.url),
+        },
+    );
+    assert!(opened.error.is_none(), "{opened:?}");
+    let tab = opened.data.unwrap()["backend_result"]["page_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_ne!(tab, fixture.page_id);
+    let second = main_of(&session, &tab);
+    let arrived = wait_until(&session, &second, "Second marker", WaitCondition::Appears);
+    assert!(arrived.error.is_none(), "{arrived:?}");
+    assert_eq!(visibility(&fixture, &tab), "visible");
+    assert_eq!(visibility(&fixture, &fixture.page_id), "hidden");
+
+    // Front the first page again, then close the tab from its own document.
+    let body = document(&session, &observe(&session, &main));
+    let fronted = act(&session, body, Action::ActivatePage {});
+    assert!(fronted.error.is_none(), "{fronted:?}");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while visibility(&fixture, &fixture.page_id) != "visible" {
+        assert!(
+            Instant::now() < deadline,
+            "activate_page did not front the page"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let body = document(&session, &observe(&session, &second));
+    let closed = act(&session, body, Action::ClosePage {});
+    assert!(closed.error.is_none(), "{closed:?}");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while targets(&session)
+        .iter()
+        .any(|r| r["metadata"]["page_id"] == tab.as_str())
+    {
+        assert!(Instant::now() < deadline, "close_page left the tab open");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // A popup the page opens is listed with the page that opened it. A
+    // popup needs a user gesture, so the click is trusted pointer input.
+    let observed = observe(&session, &main);
+    let popup = find(&session, &observed, "button", "Popup");
+    let clicked = act(
+        &session,
+        popup,
+        Action::Click {
+            button: None,
+            count: None,
+            fraction: Some(Fraction { fx: 0.5, fy: 0.5 }),
+        },
+    );
+    assert!(clicked.error.is_none(), "{clicked:?}");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let popup = loop {
+        if let Some(found) = targets(&session).into_iter().find(|r| {
+            r["metadata"]["opener_page_id"] == fixture.page_id.as_str()
+                && r["metadata"]["main_frame"] == true
+        }) {
+            break found;
+        }
+        assert!(Instant::now() < deadline, "the popup was not listed");
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let resource = popup["resource_id"].as_str().unwrap();
+    let arrived = wait_until(&session, resource, "Second marker", WaitCondition::Appears);
+    assert!(arrived.error.is_none(), "{arrived:?}");
+    // The opener itself was opened by nobody.
+    assert!(targets(&session)
+        .iter()
+        .filter(|r| r["metadata"]["page_id"] == fixture.page_id.as_str())
+        .all(|r| r["metadata"]["opener_page_id"].is_null()));
 }
 
 #[test]

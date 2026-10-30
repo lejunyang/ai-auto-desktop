@@ -1037,7 +1037,7 @@ fn validate_action(action: &Action) -> Result<()> {
         Action::Select { option } => Some(option),
         _ => None,
     };
-    if let Action::Navigate { url } = action {
+    if let Action::Navigate { url } | Action::OpenTab { url } = action {
         let scheme = url
             .split_once("://")
             .map(|(scheme, _)| scheme.to_ascii_lowercase());
@@ -1047,7 +1047,7 @@ fn validate_action(action: &Action) -> Result<()> {
         {
             return Err(error(
                 "CONTROL.INVALID_REQUEST",
-                "navigate takes an http or https address of at most 2048 characters",
+                "navigate and open_tab take an http or https address of at most 2048 characters",
             ));
         }
     }
@@ -1213,6 +1213,22 @@ fn portable_find(nodes: &[Value], locator: &Locator, expect: Expect) -> Result<V
 #[cfg(test)]
 mod admission_tests {
     use super::*;
+
+    #[test]
+    fn new_tabs_open_only_web_addresses() {
+        for url in ["http://127.0.0.1/", "https://example.com/a?b"] {
+            assert!(validate_action(&Action::OpenTab { url: url.into() }).is_ok());
+        }
+        for url in [
+            "javascript:alert(1)",
+            "file:///etc/passwd",
+            "chrome://settings",
+            "https://example.com/\n",
+        ] {
+            assert!(validate_action(&Action::OpenTab { url: url.into() }).is_err());
+        }
+        assert!(validate_action(&Action::ClosePage {}).is_ok());
+    }
 
     #[test]
     fn cancellation_cannot_fall_between_replay_guard_and_context_registration() {

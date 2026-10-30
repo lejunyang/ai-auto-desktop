@@ -128,6 +128,15 @@ fn action_schema() -> Value {
         variant("back", "Go back one page in the observed browser page's history.", json!({}), &[]),
         variant("forward", "Go forward one page in the observed browser page's history.", json!({}), &[]),
         variant("reload", "Reload the observed browser page.", json!({}), &[]),
+        variant("open_tab", "Open an http or https address in a new tab of the observed \
+    page's browser. Offered on the page's document node. The answer names the new page_id; \
+    call control_targets to observe it.", json!({
+            "url": {"type": "string", "minLength": 8, "maxLength": 2048}
+        }), &["url"]),
+        variant("activate_page", "Bring the observed browser page (tab) to the front. \
+    Offered on the page's document node.", json!({}), &[]),
+        variant("close_page", "Close the observed browser page (tab or popup). Offered on \
+    the page's document node; its targets stop resolving.", json!({}), &[]),
     ]})
 }
 
@@ -229,7 +238,10 @@ server operator granted input. Unsupported capabilities are never synthesized.",
         (
             "control_targets",
             "List the desktop windows or applications and the browser pages or frames this \
-session may observe. Resource IDs are chosen by the server, not given as OS handles or URLs.",
+session may observe. Resource IDs are chosen by the server, not given as OS handles or URLs. \
+Browser pages carry metadata.page_id; a tab or popup the page opened (window.open, \
+target=_blank, a sign-in popup) carries metadata.opener_page_id naming its opener. Call \
+this again after an action may have opened or closed a page.",
             json!({}),
             vec![],
             false,

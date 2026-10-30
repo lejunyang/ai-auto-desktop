@@ -11,7 +11,7 @@
 | `desktop.windows_uia` | focus, invoke, click, fill, type_text, key, scroll, hover, drag | UIA + 原生输入；click 带 button/count/fraction 时走原生手势；节点必须暴露对应能力 |
 | `desktop.linux_atspi` | focus, invoke, click, fill, type_text, key, scroll, hover, drag | AT-SPI；指针/键盘经 X11 XTest helper，只支持 KDE/X11 会话；派发前核对焦点、PID 与落点，drag 起止两点都核对 |
 | `desktop.macos_ax` | focus, invoke, click, fill, type_text, key, scroll, hover, drag | AX helper；需要同一登录用户的辅助功能权限；指针动作要求目标应用在前台并经 AX 命中检查，事件只投递给目标进程；key 名称按字面（`ctrl` 是 Control，`cmd` 是 Command） |
-| `browser.cdp` | focus, click, fill, key, scroll, hover, select, check, navigate, back, forward, reload | 普通 click 为 `HTMLElement.click()` 的 DOM 激活；带 button/count/fraction 的 click、scroll、hover 为主 frame 的可信 CDP Input，落点先在页面里命中检查；fill/select 为 DOM 值及 input/change 事件；check 已是目标状态时不点击；key 为主 frame 的 CDP Input；navigate/back/forward/reload 在 body 节点上，只限主 frame；没有 drag |
+| `browser.cdp` | focus, click, fill, key, scroll, hover, select, check, navigate, back, forward, reload, open_tab, activate_page, close_page | 普通 click 为 `HTMLElement.click()` 的 DOM 激活；带 button/count/fraction 的 click、scroll、hover 为主 frame 的可信 CDP Input，落点先在页面里命中检查；fill/select 为 DOM 值及 input/change 事件；check 已是目标状态时不点击；key 为主 frame 的 CDP Input；navigate/back/forward/reload 与标签页动作 open_tab/activate_page/close_page 在 body 节点上，只限主 frame；没有 drag |
 
 以 `capabilities` 和观察节点的 `capabilities` 为准。可列出 provider 不表示当前 OS 已授予
 桌面权限。启动失败或不可用原因在 `unavailable` 中返回。浏览器 key 只支持列出的导航/编辑键
@@ -19,13 +19,24 @@
 DOM click/fill 的事件 `isTrusted=false`，并不等价于原生指针或真实逐键输入；需要 `isTrusted=true` 的页面，
 给 click 一个 `fraction`（例如 0.5/0.5）走可信指针。可信指针先把元素滚进视口，再用 `elementFromPoint`
 确认落点命中该元素，盖着别的元素时返回 `CONTROL.OCCLUDED` 且不发送任何输入。`navigate` 只接受 http/https，
-不能打开 `file:`、`javascript:` 等地址；新开标签页尚未支持。
+不能打开 `file:`、`javascript:` 等地址。
+
+标签页与弹窗：`open_tab`（要 `url`，同样只接受 http/https）在浏览器里新开一个标签页，答复里带新页面的 `page_id`；
+`activate_page` 把被观察的页面切到前台，`close_page` 关闭它。三者都先在观察到的文档里确认 body 节点仍有效，
+再经浏览器级连接（`/json/version` 给出的 `/devtools/browser/<id>`，固定连 127.0.0.1）发送 `Target.createTarget`、
+`Target.activateTarget`、`Target.closeTarget`。页面自己打开的标签页或弹窗（`window.open`、`target=_blank`、
+OAuth 登录弹窗）在 `targets` 里与其他页面一样列出，`metadata.opener_page_id` 取自 `Target.getTargets` 的
+`openerId`，指向打开它的页面；不是被打开的页面该字段为 null。动作可能新开或关掉页面后要重新 `targets`。
+弹窗通常需要用户手势，DOM 激活（`isTrusted=false`）的 click 会被弹窗拦截，用带 `fraction` 的可信 click。
+实测（Windows，本机 Chrome headless，`browser_e2e` 的 `tabs_open_front_and_close_and_popups_name_their_opener`）：
+open_tab 后新页 `visibilityState` 为 visible、原页 hidden，activate_page 后原页回到 visible，close_page 后
+`targets` 不再列出该页，可信 click 触发的 `window.open` 弹窗带正确的 `opener_page_id`。
 
 动作参数：`click` 可带 `button`（left/right/middle）、`count`（1/2）、`fraction`；`type_text` 可带
 `mode`（unicode/keys）；`scroll` 要 `direction`，可带 `notches`（1..30）、`fraction`；`hover` 可带
 `ms`（1..5000，默认 500）、`fraction`；`drag` 要 `to`（同一次观察里另一个节点的 target），可带
 `button`、`fraction`、`to_fraction`；`select` 要 `option`（选项文字或值，观察节点的 `options` 列出文字）；
-`check` 要 `checked`；`navigate` 要 `url`。`fraction` 是元素框内 0..1 的比例，不是屏幕坐标。
+`check` 要 `checked`；`navigate` 与 `open_tab` 要 `url`。`fraction` 是元素框内 0..1 的比例，不是屏幕坐标。
 
 ## 观察视图与定位器
 
@@ -208,5 +219,5 @@ CI 和 release 工作流使用官方 one-sdk Action 最新正式版本，不依�
 `aad do click <id> --role AXTextArea --button right` 弹出菜单；`aad do scroll <id> --role AXTextArea --direction down`
 在长文档里滚动；在“访达”列表里 `aad do drag` 把文件拖进文件夹。
 Windows/macOS 的新适配路由在 CI 以 mock 编译/测试；Windows 的输入桌面、macOS TCC 和跨机器 SSH
-未在真实设备验证。Wayland 原生输入、完整 OOPIF、浏览器拖拽与新标签页、结果缓存、
+未在真实设备验证。Wayland 原生输入、完整 OOPIF、浏览器拖拽、结果缓存、
 自动重放与统一 Android wire adapter 均不在本次范围。录制/回放及事件观察保持已有实现，不提升其可靠性声明。

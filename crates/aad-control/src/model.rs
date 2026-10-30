@@ -207,9 +207,17 @@ pub enum Action {
     Back {},
     Forward {},
     Reload {},
+    /// Open an http(s) address in a new tab of the observed page's browser.
+    OpenTab {
+        url: String,
+    },
+    /// Bring the observed page to the front.
+    ActivatePage {},
+    /// Close the observed page.
+    ClosePage {},
 }
 
-pub const ACTION_NAMES: [&str; 15] = [
+pub const ACTION_NAMES: [&str; 18] = [
     "focus",
     "invoke",
     "click",
@@ -225,10 +233,24 @@ pub const ACTION_NAMES: [&str; 15] = [
     "back",
     "forward",
     "reload",
+    "open_tab",
+    "activate_page",
+    "close_page",
 ];
 
 /// Actions on the page as a whole, offered on its document node.
-pub const PAGE_ACTIONS: [&str; 4] = ["navigate", "back", "forward", "reload"];
+pub const PAGE_ACTIONS: [&str; 7] = [
+    "navigate",
+    "back",
+    "forward",
+    "reload",
+    "open_tab",
+    "activate_page",
+    "close_page",
+];
+
+/// Page actions that address the browser's tabs rather than one document.
+pub const TAB_ACTIONS: [&str; 3] = ["open_tab", "activate_page", "close_page"];
 
 impl Action {
     /// A plain left click.
@@ -256,6 +278,9 @@ impl Action {
             Self::Back {} => "back",
             Self::Forward {} => "forward",
             Self::Reload {} => "reload",
+            Self::OpenTab { .. } => "open_tab",
+            Self::ActivatePage {} => "activate_page",
+            Self::ClosePage {} => "close_page",
         }
     }
     /// A left single click at the centre needs nothing beyond a plain click.

@@ -25,7 +25,7 @@
     if (el.tagName==='SELECT' && !el.multiple) result.push('select');
     if (checkable(el)) result.push('check');
     if (scrollable(el)) result.push('scroll');
-    if (el===document.body) result.push('navigate','back','forward','reload');
+    if (el===document.body) result.push('navigate','back','forward','reload','open_tab','activate_page','close_page');
     return result;
   };
   const check = args => {
