@@ -586,7 +586,7 @@ mod tests {
         let tools = response["result"]["tools"].as_array().unwrap();
 
         // Everything but the tools whose extra grant this server lacks.
-        let ungranted = ["desktop_launch", "clipboard_read"];
+        let ungranted = ["desktop_launch", "clipboard_read", "control_global_key"];
         assert_eq!(tools.len(), tools::catalogue().len() - ungranted.len());
         let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
         assert!(names.contains(&"control_observe"));
@@ -761,6 +761,48 @@ mod tests {
             payload["error"]["details"]["allowlist"],
             json!(["notepad.exe"])
         );
+    }
+
+    #[test]
+    fn global_keys_and_the_clipboard_are_listed_only_with_their_own_grants() {
+        let input_only = Server::local(aad_control::Session::new(
+            Vec::new(),
+            aad_control::Policy {
+                allow_input: true,
+                ..Default::default()
+            },
+        ));
+        let names = listed(&input_only);
+        for hidden in ["control_global_key", "clipboard_read"] {
+            assert!(!names.contains(&hidden.to_string()), "{hidden}");
+        }
+        for (name, arguments) in [
+            ("control_global_key", json!({"keys": ["win", "d"]})),
+            ("clipboard_read", json!({})),
+        ] {
+            let response = input_only
+                .handle(&request(
+                    "tools/call",
+                    json!({"name": name, "arguments": arguments}),
+                ))
+                .unwrap();
+            let (is_error, payload) = tool_payload(&response);
+            assert!(is_error, "{name}");
+            assert_eq!(payload["error"]["code"], "POLICY.DENIED", "{name}");
+        }
+        let granted = Server::local(aad_control::Session::new(
+            Vec::new(),
+            aad_control::Policy {
+                allow_input: true,
+                allow_global_keys: true,
+                allow_clipboard_read: true,
+                ..Default::default()
+            },
+        ));
+        let names = listed(&granted);
+        for shown in ["control_global_key", "clipboard_read"] {
+            assert!(names.contains(&shown.to_string()), "{shown}");
+        }
     }
 
     #[test]

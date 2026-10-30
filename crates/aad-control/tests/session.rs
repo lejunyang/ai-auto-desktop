@@ -522,3 +522,85 @@ fn the_clipboard_is_read_only_with_its_own_grant() {
     );
     assert_eq!(bounded.error.unwrap()["code"], "CONTROL.INVALID_REQUEST");
 }
+
+#[test]
+fn global_keys_need_both_grants_and_never_claim_a_verified_effect() {
+    struct Keys(AtomicUsize);
+    impl Backend for Keys {
+        fn name(&self) -> &str {
+            "fixture"
+        }
+        fn capabilities(&self) -> Vec<String> {
+            vec!["key".into()]
+        }
+        fn offers_global_keys(&self) -> bool {
+            true
+        }
+        fn global_key(&self, keys: &[String], context: &Context) -> Result<Value> {
+            context.commit()?;
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(json!({"keys": keys}))
+        }
+        fn resources(&self, _: Duration) -> Result<Vec<BackendResource>> {
+            Ok(Vec::new())
+        }
+        fn observe(&self, _: &Value, _: usize, _: Duration) -> Result<Value> {
+            unreachable!()
+        }
+        fn act(&self, _: &Value, _: &Value, _: &Action, _: &Context) -> Result<Value> {
+            unreachable!()
+        }
+    }
+    let press = || Operation::GlobalKey {
+        keys: vec!["win".into(), "d".into()],
+    };
+    for policy in [
+        Policy::default(),
+        Policy {
+            allow_input: true,
+            ..Default::default()
+        },
+        Policy {
+            allow_global_keys: true,
+            ..Default::default()
+        },
+    ] {
+        let backend = Arc::new(Keys(AtomicUsize::new(0)));
+        let session = Session::new(vec![backend.clone()], policy);
+        let refused = call(&session, press());
+        assert_eq!(refused.error.unwrap()["code"], "POLICY.DENIED");
+        assert_eq!(refused.commit_state, CommitState::NotCommitted);
+        assert_eq!(backend.0.load(Ordering::SeqCst), 0);
+        assert!(call(&session, Operation::Capabilities {})
+            .data
+            .unwrap()
+            .get("global_keys")
+            .is_none());
+    }
+    let backend = Arc::new(Keys(AtomicUsize::new(0)));
+    let session = Session::new(
+        vec![backend.clone()],
+        Policy {
+            allow_input: true,
+            allow_global_keys: true,
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        call(&session, Operation::Capabilities {}).data.unwrap()["global_keys"],
+        true
+    );
+    let pressed = call(&session, press());
+    assert!(pressed.error.is_none(), "{:?}", pressed.error);
+    assert_eq!(pressed.effect, "dispatched");
+    assert_eq!(pressed.commit_state, CommitState::Unknown);
+    assert_eq!(pressed.data.unwrap()["verified"], false);
+    assert_eq!(backend.0.load(Ordering::SeqCst), 1);
+    let malformed = call(
+        &session,
+        Operation::GlobalKey {
+            keys: vec!["x".into(); 7],
+        },
+    );
+    assert_eq!(malformed.error.unwrap()["code"], "CONTROL.INVALID_REQUEST");
+}

@@ -352,6 +352,22 @@ process (a launcher stub) is matched by its image name among new windows.",
             true,
         ),
         (
+            "control_global_key",
+            "Press a key combination wherever keyboard focus is -- system shortcuts such as \
+Win+D (show desktop) or Alt+Tab -- anchored on no observed element. Offered only when the \
+server operator granted it (aad mcp --allow-input --allow-global-keys). Prefer control_act's \
+`key` on an observed element: that one is anchored and focus is checked. This one is not: \
+the keys go to whatever holds focus, so the answer's commit_state is `unknown` even when \
+delivered; observe again to learn what happened and never repeat it blindly. Modifiers \
+(ctrl, shift, alt, win) then exactly one main key. Ctrl+Alt+Del and Win+L are refused, and \
+nothing is sent while a UAC prompt or the lock screen owns the input desktop.",
+            json!({
+                "keys": {"type": "array", "items": {"type": "string", "maxLength": 32}, "minItems": 1, "maxItems": 6}
+            }),
+            vec!["keys"],
+            true,
+        ),
+        (
             "clipboard_read",
             "Read the desktop clipboard's text. Read-only, but offered only when the server \
 operator granted it (aad mcp --allow-clipboard-read): the clipboard often holds passwords \
@@ -418,6 +434,7 @@ pub fn granted(name: &str, policy: &aad_control::Policy) -> bool {
     match name {
         "desktop_launch" => policy.allow_input && !policy.launch.is_empty(),
         "clipboard_read" => policy.allow_clipboard_read,
+        "control_global_key" => policy.allow_input && policy.allow_global_keys,
         _ => true,
     }
 }
@@ -504,6 +521,14 @@ or take the node_id from an outline."
         "DRIVER.PROTECTED_ELEMENT" => {
             "Password and other protected fields are never captured or read. Capture an \
 element around it, or ask the person you are helping."
+        }
+        "DRIVER.SECURE_DESKTOP" => {
+            "A UAC prompt or the lock screen owns input; automation never reaches it. Ask \
+the person you are helping to deal with it, then observe again."
+        }
+        "DRIVER.KEY_RESERVED" => {
+            "Ctrl+Alt+Del and Win+L are never pressed: the first cannot be synthesized and \
+the second would lock everyone out. Ask the person you are helping."
         }
         "DRIVER.CLIPBOARD_PROTECTED" => {
             "What is on the clipboard was marked by its source (e.g. a password manager) as \

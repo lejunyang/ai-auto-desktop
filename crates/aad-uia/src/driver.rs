@@ -44,6 +44,7 @@ pub const WRITE_ACTIONS: &[&str] = &[
     "close_window",
     "activate",
     "paste",
+    "global_key",
 ];
 
 const MAX_TYPE_TEXT_CHARS: usize = 1024;
@@ -119,6 +120,26 @@ impl UiaDriver {
             "capture" => self.capture_element(&args),
             "read_text" => self.read_text(&args),
             "clipboard_read" => self.clipboard_read(&args),
+            "global_key" => {
+                let keys: Vec<String> = args
+                    .get("keys")
+                    .and_then(Value::as_array)
+                    .ok_or_else(|| DriverError::invalid("keys is required"))?
+                    .iter()
+                    .map(|key| {
+                        key.as_str()
+                            .map(str::to_string)
+                            .ok_or_else(|| DriverError::invalid("every key must be a string"))
+                    })
+                    .collect::<Result<_>>()?;
+                if keys.is_empty() || keys.len() > MAX_CHORD_KEYS {
+                    return Err(DriverError::invalid(format!(
+                        "a key combination holds 1..{MAX_CHORD_KEYS} keys"
+                    )));
+                }
+                let sent = self.backend.global_key(&keys)?;
+                Ok(json!({"applied": true, "action": "global_key", "keys": keys, "focus": sent}))
+            }
             "focus" | "invoke" | "set_value" | "type_text" | "pointer_click" | "key_chord"
             | "pointer_gesture" | "drag" | "minimize" | "maximize" | "restore" | "close_window"
             | "activate" | "paste" => self.act(action, &args),
@@ -1290,6 +1311,15 @@ fn action_contracts() -> Map<String, Value> {
     ] {
         actions.insert(name.into(), write(summary, "navigate", "low", "idempotent"));
     }
+    actions.insert(
+        "global_key".into(),
+        write(
+            "Press a key combination wherever focus is, anchored on no element.",
+            "input",
+            "high",
+            "non_idempotent",
+        ),
+    );
     actions.insert(
         "paste".into(),
         write(

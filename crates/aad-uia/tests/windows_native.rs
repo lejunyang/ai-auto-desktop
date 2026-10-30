@@ -22,13 +22,15 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{
     GetDpiForSystem, SetThreadDpiAwarenessContext, DPI_AWARENESS_CONTEXT_UNAWARE,
 };
+use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, GetKeyState};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DispatchMessageW, GetDlgItem, GetForegroundWindow,
     GetMessageW, IsIconic, IsWindow, IsZoomed, PostMessageW, PostQuitMessage, RegisterClassExW,
     SetWindowTextW, ShowWindow, TranslateMessage, BN_CLICKED, CW_USEDEFAULT, ES_AUTOHSCROLL,
     ES_PASSWORD, HMENU, MSG, SHOW_WINDOW_CMD, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_COMMAND,
-    WM_DESTROY, WM_LBUTTONDOWN, WM_PAINT, WNDCLASSEXW, WS_BORDER, WS_CHILD, WS_EX_NOACTIVATE,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_OVERLAPPEDWINDOW, WS_POPUP, WS_TABSTOP, WS_VISIBLE,
+    WM_DESTROY, WM_KEYDOWN, WM_LBUTTONDOWN, WM_PAINT, WNDCLASSEXW, WS_BORDER, WS_CHILD,
+    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_OVERLAPPEDWINDOW, WS_POPUP, WS_TABSTOP,
+    WS_VISIBLE,
 };
 
 const EDIT_ID: i32 = 1001;
@@ -953,6 +955,109 @@ fn a_paste_lands_in_the_element_and_leaves_the_clipboard_as_it_was() {
     assert!(driver
         .call("clipboard_read", &json!({"max_characters": 0}))
         .is_err());
+}
+
+/// The last key the key fixture saw go down, with 0x10000 set if Shift was held.
+static KEY_SEEN: AtomicUsize = AtomicUsize::new(0);
+
+unsafe extern "system" fn key_window_proc(
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    match message {
+        // The main key, not the modifiers that go down before it.
+        WM_KEYDOWN if !matches!(wparam.0, 0x10..=0x12 | 0x5B) => {
+            let shift = (GetKeyState(0x10) as u16 & 0x8000) != 0;
+            KEY_SEEN.store(wparam.0 | if shift { 0x10000 } else { 0 }, Ordering::SeqCst);
+            return LRESULT(0);
+        }
+        WM_DESTROY => {
+            PostQuitMessage(0);
+            return LRESULT(0);
+        }
+        _ => {}
+    }
+    DefWindowProcW(hwnd, message, wparam, lparam)
+}
+
+unsafe fn create_key_window(title: &str) -> Result<HWND, String> {
+    let module = GetModuleHandleW(None).map_err(|error| error.to_string())?;
+    let instance = HINSTANCE(module.0);
+    let class_name = wide(&format!(
+        "AadKeyFixture_{}_{}",
+        std::process::id(),
+        uuid::Uuid::new_v4().simple()
+    ));
+    let class = WNDCLASSEXW {
+        cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+        lpfnWndProc: Some(key_window_proc),
+        hInstance: instance,
+        hbrBackground: HBRUSH((COLOR_WINDOW.0 + 1) as usize as *mut std::ffi::c_void),
+        lpszClassName: PCWSTR(class_name.as_ptr()),
+        ..Default::default()
+    };
+    if RegisterClassExW(&class) == 0 {
+        return Err(windows::core::Error::from_win32().to_string());
+    }
+    let title = wide(title);
+    CreateWindowExW(
+        WINDOW_EX_STYLE::default(),
+        PCWSTR(class_name.as_ptr()),
+        PCWSTR(title.as_ptr()),
+        WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+        CW_USEDEFAULT,
+        CW_USEDEFAULT,
+        400,
+        240,
+        None,
+        None,
+        instance,
+        None,
+    )
+    .map_err(|error| error.to_string())
+}
+
+#[test]
+#[ignore = "requires an interactive Windows desktop; sends a key only to its own window"]
+fn a_global_key_reaches_whatever_holds_focus_through_the_chord_path() {
+    let driver = native_driver().expect("create native UIA driver");
+    let title = format!("AI Auto Desktop key fixture {}", uuid::Uuid::new_v4());
+    let owned = title.clone();
+    let fixture = spawn_window(move || unsafe { create_key_window(&owned) }).expect("key fixture");
+    let window_id = wait_for_window(&driver, &title);
+    // Bring our own window forward with the anchored action first...
+    let (target, _) = root_target(&snapshot(&driver, &window_id));
+    driver
+        .call("activate", &json!({"target": target}))
+        .expect("activate the key fixture");
+    // ...and never send the un-anchored key unless it is what holds focus.
+    assert_eq!(
+        unsafe { GetForegroundWindow() },
+        fixture.hwnd,
+        "the fixture is not in front; no key was sent"
+    );
+    KEY_SEEN.store(0, Ordering::SeqCst);
+    let sent = driver
+        .call("global_key", &json!({"keys": ["shift", "f9"]}))
+        .expect("press the global key");
+    assert_eq!(sent["applied"], true);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while KEY_SEEN.load(Ordering::SeqCst) == 0 {
+        assert!(Instant::now() < deadline, "the key never arrived");
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(KEY_SEEN.load(Ordering::SeqCst), 0x78 | 0x10000, "Shift+F9");
+    // The modifier was released with the chord: nothing is left held.
+    assert_eq!(unsafe { GetAsyncKeyState(0x10) } as u16 & 0x8000, 0);
+
+    for reserved in [json!(["ctrl", "alt", "delete"]), json!(["win", "l"])] {
+        let refused = driver
+            .call("global_key", &json!({"keys": reserved}))
+            .expect_err("reserved chords are refused");
+        assert_eq!(refused.code, "DRIVER.KEY_RESERVED");
+    }
 }
 
 fn root_target(captured: &Value) -> (Value, Vec<String>) {

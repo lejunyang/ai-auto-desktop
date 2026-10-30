@@ -78,6 +78,17 @@ pub trait Backend: Send + Sync {
             "this provider cannot read text from pixels",
         ))
     }
+    /// Whether this provider can press a key chord anchored on nothing.
+    fn offers_global_keys(&self) -> bool {
+        false
+    }
+    /// Press a key chord wherever keyboard focus is, anchored on nothing.
+    fn global_key(&self, _keys: &[String], _context: &Context) -> Result<Value> {
+        Err(error(
+            "CONTROL.ACTION_UNSUPPORTED",
+            "this provider cannot press global keys",
+        ))
+    }
     /// The desktop clipboard's text: `{"has_text", "text", "characters",
     /// "truncated"}`. Not anchored; the session checks its own grant first.
     fn clipboard_read(&self, _max_characters: Option<usize>, _timeout: Duration) -> Result<Value> {
@@ -128,6 +139,9 @@ pub struct Policy {
     /// Whether `clipboard_read` may return the clipboard's text. Separate from
     /// input and off by default: the clipboard often holds secrets.
     pub allow_clipboard_read: bool,
+    /// Whether global_key may press keys anchored on no element. Needs
+    /// llow_input as well; off by default.
+    pub allow_global_keys: bool,
 }
 
 #[derive(Clone)]
@@ -416,7 +430,11 @@ impl Session {
             Ok(value) => (
                 Some(value),
                 None,
-                if request.mutating() {
+                if matches!(request.operation, Operation::GlobalKey { .. }) {
+                    // Delivered to whatever held focus: nothing anchors or
+                    // verifies it, so the commit state stays unknown.
+                    "dispatched".to_string()
+                } else if request.mutating() {
                     "applied".to_string()
                 } else {
                     "not_applied".to_string()
@@ -859,6 +877,36 @@ impl Session {
                 args,
                 wait_ms,
             } => self.launch(program, args, *wait_ms, context),
+            Operation::GlobalKey { keys } => {
+                if !self.policy.allow_input || !self.policy.allow_global_keys {
+                    return Err(error(
+                        "POLICY.DENIED",
+                        "global keys were not granted by the server operator",
+                    ));
+                }
+                validate_action(&Action::Key { keys: keys.clone() })?;
+                let backend = self
+                    .backends
+                    .values()
+                    .find(|b| {
+                        b.name() != browser::PROVIDER
+                            && self.allowed_provider(b.name())
+                            && b.offers_global_keys()
+                    })
+                    .cloned()
+                    .ok_or_else(|| {
+                        error(
+                            "CONTROL.ACTION_UNSUPPORTED",
+                            "no provider in this session can press global keys",
+                        )
+                    })?;
+                let _lease = self.input_lease("desktop-input")?;
+                context.remaining()?;
+                let sent = backend.global_key(keys, context)?;
+                // Whatever was observed may have changed under the keys.
+                self.state.lock().unwrap().observations.clear();
+                Ok(json!({"submitted": true, "provider": backend.name(), "operation": "global_key", "backend_result": sent, "verified": false, "requires_fresh_observation": true}))
+            }
             Operation::ClipboardRead { max_characters } => {
                 if !self.policy.allow_clipboard_read {
                     return Err(error(
@@ -905,6 +953,9 @@ impl Session {
         }
         if self.policy.allow_clipboard_read {
             answer["clipboard_read"] = json!(true);
+        }
+        if self.policy.allow_input && self.policy.allow_global_keys {
+            answer["global_keys"] = json!(true);
         }
         answer
     }

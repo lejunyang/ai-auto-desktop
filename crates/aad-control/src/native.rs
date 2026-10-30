@@ -114,6 +114,18 @@ impl Backend for NativeBackend {
         }
         Ok(Value::Object(answer))
     }
+    fn offers_global_keys(&self) -> bool {
+        matches!(self.flavor, Flavor::Windows) && self.offers("global_key")
+    }
+    fn global_key(&self, keys: &[String], context: &crate::Context) -> Result<Value> {
+        if !self.offers_global_keys() {
+            return Err(error(
+                "CONTROL.ACTION_UNSUPPORTED",
+                "this provider cannot press global keys",
+            ));
+        }
+        self.invoke("global_key", json!({"keys": keys}), context.commit()?)
+    }
     fn clipboard_read(&self, max_characters: Option<usize>, timeout: Duration) -> Result<Value> {
         if !matches!(self.flavor, Flavor::Windows) || !self.offers("clipboard_read") {
             return Err(error(

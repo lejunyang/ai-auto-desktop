@@ -350,6 +350,12 @@ pub enum Operation {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         wait_ms: Option<u64>,
     },
+    /// Press a key combination wherever keyboard focus is -- Win+D, Alt+Tab --
+    /// anchored on no observed element. The one un-anchored input, refused
+    /// unless the operator granted it separately; its effect is never verified.
+    GlobalKey {
+        keys: Vec<String>,
+    },
     /// The clipboard's text, bounded. Read-only, but refused unless the server
     /// operator granted it separately: the clipboard often holds secrets.
     ClipboardRead {
@@ -393,7 +399,7 @@ impl Request {
     pub fn mutating(&self) -> bool {
         matches!(
             self.operation,
-            Operation::Act { .. } | Operation::Launch { .. }
+            Operation::Act { .. } | Operation::Launch { .. } | Operation::GlobalKey { .. }
         )
     }
 }

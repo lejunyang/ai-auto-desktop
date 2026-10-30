@@ -49,6 +49,10 @@ use windows::Win32::System::DataExchange::{
 use windows::Win32::System::Memory::{
     GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, GMEM_MOVEABLE,
 };
+use windows::Win32::System::StationsAndDesktops::{
+    CloseDesktop, GetUserObjectInformationW, OpenInputDesktop, DESKTOP_CONTROL_FLAGS,
+    DESKTOP_READOBJECTS, UOI_NAME,
+};
 use windows::Win32::System::Threading::{
     AttachThreadInput, GetCurrentThreadId, OpenProcess, QueryFullProcessImageNameW,
     PROCESS_NAME_FORMAT, PROCESS_QUERY_LIMITED_INFORMATION,
@@ -824,6 +828,33 @@ impl Backend for WindowsUiaBackend {
 
     fn clipboard_text(&self, max_chars: usize) -> Result<(Option<String>, usize)> {
         read_clipboard_text(max_chars)
+    }
+
+    fn global_key(&self, keys: &[String]) -> Result<serde_json::Value> {
+        let chord = Chord::parse(keys)?;
+        refuse_reserved_chord(&chord)?;
+        // UAC prompts and the lock screen run on the secure desktop, which
+        // synthetic input cannot and must not reach.
+        if !on_default_desktop() {
+            return Err(DriverError::new(
+                "DRIVER.SECURE_DESKTOP",
+                "the input desktop is not the user's desktop (a UAC prompt or the lock screen); nothing was sent",
+            ));
+        }
+        let foreground = unsafe { GetForegroundWindow() };
+        let mut process = 0u32;
+        unsafe { GetWindowThreadProcessId(foreground, Some(&mut process)) };
+        // The same atomic chord path and modifier-leak cleanup as `key`.
+        deliver_atomically(&chord.to_inputs(), "the global key combination").map_err(
+            |mut error| {
+                let released = chord.release_modifiers();
+                error = error.with_detail("residual_state_cleared", serde_json::json!(released));
+                error
+            },
+        )?;
+        Ok(serde_json::json!({
+            "foreground_process_id": process,
+        }))
     }
 
     fn paste(&self, window_id: &str, node: &Node, text: &str) -> Result<serde_json::Value> {
@@ -1737,6 +1768,46 @@ fn focus_for_keys(handle: HWND, element: &IUIAutomationElement) -> Result<()> {
         }
         std::thread::sleep(Duration::from_millis(20));
     }
+}
+
+/// Chords a global key must never press: Ctrl+Alt+Del is the secure attention
+/// sequence (Windows ignores it from SendInput, so pressing it would only
+/// mislead), and Win+L locks the workstation, after which nothing -- not
+/// even the person -- can be driven until someone signs in again.
+fn refuse_reserved_chord(chord: &Chord) -> Result<()> {
+    let has = |vk: VIRTUAL_KEY| chord.modifiers.contains(&vk);
+    let reserved = (has(VK_CONTROL) && has(VK_MENU) && chord.key == VK_DELETE)
+        || (has(VK_LWIN) && chord.key == VIRTUAL_KEY(b'L' as u16));
+    if reserved {
+        return Err(DriverError::new(
+            "DRIVER.KEY_RESERVED",
+            "Ctrl+Alt+Del and Win+L are never pressed",
+        ));
+    }
+    Ok(())
+}
+
+/// Whether input currently goes to the interactive user's own desktop.
+fn on_default_desktop() -> bool {
+    let Ok(desktop) =
+        (unsafe { OpenInputDesktop(DESKTOP_CONTROL_FLAGS(0), false, DESKTOP_READOBJECTS) })
+    else {
+        // The secure desktop cannot be opened from a user process.
+        return false;
+    };
+    let mut name = [0u16; 64];
+    let mut needed = 0u32;
+    let read = unsafe {
+        GetUserObjectInformationW(
+            HANDLE(desktop.0),
+            UOI_NAME,
+            Some(name.as_mut_ptr().cast()),
+            (name.len() * 2) as u32,
+            Some(&mut needed),
+        )
+    };
+    let _ = unsafe { CloseDesktop(desktop) };
+    read.is_ok() && String::from_utf16_lossy(&name).trim_end_matches('\0') == "Default"
 }
 
 /// Make `handle` the foreground window, reporting whether it is.
@@ -3381,6 +3452,27 @@ mod tests {
             -1920
         );
         assert_eq!(denormalise(normalise(9000, -1920, 4480), -1920, 4480), 2559);
+    }
+
+    #[test]
+    fn the_secure_attention_sequence_and_locking_are_never_pressed() {
+        let chord = |keys: &[&str]| {
+            Chord::parse(&keys.iter().map(|k| k.to_string()).collect::<Vec<_>>()).unwrap()
+        };
+        for reserved in [&["ctrl", "alt", "delete"][..], &["win", "l"], &["Win", "L"]] {
+            assert_eq!(
+                refuse_reserved_chord(&chord(reserved)).unwrap_err().code,
+                "DRIVER.KEY_RESERVED"
+            );
+        }
+        for allowed in [
+            &["win", "d"][..],
+            &["alt", "tab"],
+            &["ctrl", "delete"],
+            &["l"],
+        ] {
+            assert!(refuse_reserved_chord(&chord(allowed)).is_ok());
+        }
     }
 
     #[test]

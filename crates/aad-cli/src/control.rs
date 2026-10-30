@@ -30,6 +30,10 @@ pub struct Grants {
     /// clipboard often holds passwords and private text.
     #[arg(long)]
     allow_clipboard_read: bool,
+    /// Let control_global_key press key combinations anchored on no element
+    /// (Win+D, Alt+Tab), wherever focus is. Off by default.
+    #[arg(long, requires = "allow_input")]
+    allow_global_keys: bool,
 }
 impl Grants {
     fn policy(&self, allow_input: bool) -> Policy {
@@ -43,6 +47,7 @@ impl Grants {
             },
             launch: self.allow_launch.iter().cloned().collect(),
             allow_clipboard_read: self.allow_clipboard_read,
+            allow_global_keys: self.allow_global_keys,
         }
     }
     /// Whether any grant was given that only the remote server may hold.
@@ -52,6 +57,7 @@ impl Grants {
             || self.browser_port.is_some()
             || !self.allow_launch.is_empty()
             || self.allow_clipboard_read
+            || self.allow_global_keys
     }
 }
 

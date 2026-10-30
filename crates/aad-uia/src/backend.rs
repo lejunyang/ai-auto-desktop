@@ -347,6 +347,16 @@ pub trait Backend: Send + Sync {
         ))
     }
 
+    /// Press a key chord wherever keyboard focus is, anchored on no element.
+    /// The one un-anchored input; hosts gate it behind a grant of its own.
+    /// Answers what little can be said: where focus was when it was sent.
+    fn global_key(&self, _keys: &[String]) -> Result<serde_json::Value> {
+        Err(DriverError::new(
+            "DRIVER.ACTION_UNSUPPORTED",
+            "global keys are not implemented on this platform yet",
+        ))
+    }
+
     /// Paste `text` into the element through the clipboard (focus, Ctrl+V),
     /// leaving the clipboard as it was. Answers whether the element took it.
     fn paste(&self, _window_id: &str, _node: &Node, _text: &str) -> Result<serde_json::Value> {
