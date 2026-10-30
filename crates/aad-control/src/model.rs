@@ -333,6 +333,16 @@ pub enum Operation {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         language: Option<String>,
     },
+    /// Start a program the server operator allowlisted, then wait (bounded)
+    /// for its windows and answer them as targets. Never through a shell.
+    Launch {
+        program: String,
+        #[serde(default)]
+        args: Vec<String>,
+        /// How long to wait for a window, at most the request's timeout.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        wait_ms: Option<u64>,
+    },
     Cancel {
         request_id: String,
     },
@@ -368,7 +378,10 @@ impl Request {
         }
     }
     pub fn mutating(&self) -> bool {
-        matches!(self.operation, Operation::Act { .. })
+        matches!(
+            self.operation,
+            Operation::Act { .. } | Operation::Launch { .. }
+        )
     }
 }
 

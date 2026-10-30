@@ -17,6 +17,15 @@ pub struct Grants {
     /// Enable CDP only on this loopback port. Never launches a real browser or copies logins.
     #[arg(long)]
     browser_port: Option<u16>,
+    /// Let desktop_launch start this program: an absolute path or a bare
+    /// name on PATH, started directly (never through a shell). Repeat for
+    /// more. Shells, script hosts and association launchers are refused.
+    #[arg(
+        long = "allow-launch",
+        value_name = "PROGRAM",
+        requires = "allow_input"
+    )]
+    allow_launch: Vec<String>,
 }
 impl Grants {
     fn policy(&self, allow_input: bool) -> Policy {
@@ -28,7 +37,15 @@ impl Grants {
             } else {
                 Some(self.resources.iter().cloned().collect::<BTreeSet<_>>())
             },
+            launch: self.allow_launch.iter().cloned().collect(),
         }
+    }
+    /// Whether any grant was given that only the remote server may hold.
+    fn any(&self) -> bool {
+        !self.providers.is_empty()
+            || !self.resources.is_empty()
+            || self.browser_port.is_some()
+            || !self.allow_launch.is_empty()
     }
 }
 
@@ -89,11 +106,7 @@ fn invalid(error: impl std::fmt::Display) -> std::io::Error {
 
 pub fn mcp(args: &McpArgs) -> std::io::Result<()> {
     let server = if let Some(raw) = &args.connect {
-        if args.allow_input
-            || !args.grants.providers.is_empty()
-            || !args.grants.resources.is_empty()
-            || args.grants.browser_port.is_some()
-        {
+        if args.allow_input || args.grants.any() {
             return Err(invalid("remote grants must be configured on the remote server; local flags cannot replace them"));
         }
         let client = RemoteClient::spawn(&command(raw)?).map_err(|e| invalid(e.message))?;

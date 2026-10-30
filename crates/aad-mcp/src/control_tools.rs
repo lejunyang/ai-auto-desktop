@@ -323,6 +323,27 @@ the installed ones listed."
             false,
         ),
         (
+            "desktop_launch",
+            "Start a program the server operator allowlisted (aad mcp --allow-input \
+--allow-launch PROGRAM), with arguments, then wait for its windows and answer them as \
+`resources`, ready for control_observe. `program` must name an allowlist entry exactly; \
+control_capabilities lists them under `launch` when granted. The program is started \
+directly -- never through a shell, `start`, or a file/URL association -- and shells or \
+script hosts are refused even if allowlisted. A program that hands over to another \
+process (a launcher stub) is matched by its image name among new windows.",
+            json!({
+                "program": {"type": "string", "minLength": 1, "maxLength": 260,
+                    "description": "An allowlisted program, exactly as listed."},
+                "args": {"type": "array", "maxItems": 32,
+                    "items": {"type": "string", "maxLength": 1024},
+                    "description": "Arguments passed as an argv, not interpreted by any shell."},
+                "wait_ms": {"type": "integer", "minimum": 0, "maximum": 30000, "default": 10000,
+                    "description": "How long to wait for a window; bounded by timeout_ms."}
+            }),
+            vec!["program"],
+            true,
+        ),
+        (
             "control_cancel",
             "Request cancellation of an in-flight control request. If input was already \
 dispatched, its effect is unknown; cancellation never means rollback.",
@@ -361,6 +382,23 @@ cancellation of all in-flight work.",
         .collect()
 }
 
+/// The protocol method a session tool calls, or `None` for other tools.
+pub fn method(name: &str) -> Option<&str> {
+    match name {
+        "desktop_launch" => Some("launch"),
+        other => other.strip_prefix("control_"),
+    }
+}
+
+/// Session tools that need a grant beyond input. A local server lists one
+/// only when its operator granted it; a remote session refuses on its side.
+pub fn granted(name: &str, policy: &aad_control::Policy) -> bool {
+    match name {
+        "desktop_launch" => policy.allow_input && !policy.launch.is_empty(),
+        _ => true,
+    }
+}
+
 pub fn prepare(name: &str, arguments: &Value, endpoint: &dyn Endpoint) -> Result<Request, String> {
     let mut args = arguments
         .as_object()
@@ -379,9 +417,7 @@ pub fn prepare(name: &str, arguments: &Value, endpoint: &dyn Endpoint) -> Result
     if let Some(timeout) = args.remove("timeout_ms") {
         request.timeout_ms = timeout.as_u64().ok_or("timeout_ms must be an integer")?;
     }
-    let method = name
-        .strip_prefix("control_")
-        .ok_or("unknown control tool")?;
+    let method = method(name).ok_or("unknown control tool")?;
     if method == "cancel" {
         let id = args
             .remove("target_request_id")
@@ -471,8 +507,13 @@ a very small or very large element reads poorly -- try its container or a smalle
             "Call control_targets first, then observe a resource_id it returned."
         }
         "POLICY.DENIED" => {
-            "Whoever started this server did not grant input (aad mcp --allow-input). Do \
-not look for another way to act; ask the person you are helping."
+            "Whoever started this server did not grant this (input needs aad mcp \
+--allow-input; desktop_launch also an --allow-launch entry for the program). Do not look \
+for another way to act; ask the person you are helping."
+        }
+        "CONTROL.LAUNCH_FAILED" => {
+            "The allowlisted program could not be found or started; details name it. Ask \
+the person running the server to check the --allow-launch entry."
         }
         _ => return None,
     })

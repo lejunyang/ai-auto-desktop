@@ -2,6 +2,7 @@
 //! No network listener: remote sessions inherit an authenticated SSH stdio pipe.
 
 pub mod browser;
+pub mod launch;
 pub mod lease;
 pub mod model;
 pub mod native;
@@ -112,6 +113,10 @@ pub struct Policy {
     pub providers: BTreeSet<String>,
     /// Optional server-owned allowlist; a client cannot extend it.
     pub resources: Option<BTreeSet<String>>,
+    /// Programs `launch` may start, as the operator named them (an absolute
+    /// path or a bare name on PATH). Empty: launching is refused. Needs
+    /// `allow_input` as well.
+    pub launch: BTreeSet<String>,
 }
 
 #[derive(Clone)]
@@ -517,13 +522,13 @@ impl Session {
 
     fn dispatch(&self, operation: &Operation, context: &Context) -> Result<Value> {
         match operation {
-            Operation::Capabilities {} => Ok(
+            Operation::Capabilities {} => Ok(self.with_grants(
                 json!({"session_id": self.id, "protocol_version": PROTOCOL_VERSION,
                 "expires_in_ms": self.lifetime.saturating_sub(self.created.elapsed()).as_millis(),
                 "allow_input": self.policy.allow_input,"observation_retention":"until_next_observation_or_input_attempt","observation_ttl_ms":self.observation_ttl.as_millis(),"max_requests":self.max_requests,"input_lease":"exclusive_cooperating_session","input_lease_scope":"os_user","providers": self.backends.values().filter(|b| self.allowed_provider(b.name()))
                     .map(|b| json!({"provider": b.name(), "actions": b.capabilities(), "reads": b.reads()})).collect::<Vec<_>>(),
                 "unavailable": self.failures}),
-            ),
+            )),
             Operation::Targets {} => {
                 let mut resources = BTreeMap::new();
                 let mut unavailable = self.failures.clone();
@@ -838,8 +843,127 @@ impl Session {
                 context.remaining()?;
                 Ok(text_answer(&read, &observation.provider))
             }
+            Operation::Launch {
+                program,
+                args,
+                wait_ms,
+            } => self.launch(program, args, *wait_ms, context),
             Operation::Cancel { .. } | Operation::Close {} => unreachable!(),
         }
+    }
+
+    /// Add the operator's extra grants to a capabilities answer. Each appears
+    /// only when granted, so a client never learns of a refused ability by
+    /// seeing it listed.
+    fn with_grants(&self, mut answer: Value) -> Value {
+        if self.policy.allow_input && !self.policy.launch.is_empty() {
+            answer["launch"] = json!(self.policy.launch);
+        }
+        answer
+    }
+
+    /// Start an allowlisted program and answer the windows it opens.
+    fn launch(
+        &self,
+        program: &str,
+        args: &[String],
+        wait_ms: Option<u64>,
+        context: &Context,
+    ) -> Result<Value> {
+        if !self.policy.allow_input || self.policy.launch.is_empty() {
+            return Err(error(
+                "POLICY.DENIED",
+                "launching programs was not granted by the server operator",
+            ));
+        }
+        launch::validate_args(program, args)?;
+        if !launch::allowed(&self.policy.launch, program) {
+            return Err(error(
+                "POLICY.DENIED",
+                "that program is not on the server's launch allowlist",
+            )
+            .with_detail("allowlist", json!(self.policy.launch)));
+        }
+        let path = launch::resolve(program)?;
+        let image = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let desktops: Vec<Arc<dyn Backend>> = self
+            .backends
+            .values()
+            .filter(|b| b.name() != browser::PROVIDER && self.allowed_provider(b.name()))
+            .cloned()
+            .collect();
+        let listed = |timeout: Duration| -> Vec<BackendResource> {
+            desktops
+                .iter()
+                .filter_map(|backend| backend.resources(timeout).ok())
+                .flatten()
+                .collect()
+        };
+        let before: BTreeSet<String> = listed(context.remaining()?)
+            .into_iter()
+            .map(|item| item.resource.resource_id)
+            .collect();
+        let _lease = self.input_lease("desktop-input")?;
+        let remaining = context.commit()?;
+        let process_id = launch::spawn(&path, args)?;
+        // Stop waiting early enough to answer inside the request's deadline:
+        // the process has started, so running out of time would turn a
+        // committed launch into an unknown one.
+        let wait = Duration::from_millis(wait_ms.unwrap_or(10_000).min(MAX_TIMEOUT_MS))
+            .min(remaining.saturating_sub(Duration::from_millis(500)));
+        let until = Instant::now() + wait;
+        let mut found: Vec<BackendResource>;
+        loop {
+            let now = listed(
+                until
+                    .saturating_duration_since(Instant::now())
+                    .max(Duration::from_millis(200)),
+            );
+            let by_process: Vec<BackendResource> = now
+                .iter()
+                .filter(|item| item.resource.metadata["process_id"] == json!(process_id))
+                .cloned()
+                .collect();
+            // A launcher stub may hand over to another process of the same
+            // program (and exit): new windows of that image count too.
+            found = if by_process.is_empty() {
+                now.into_iter()
+                    .filter(|item| {
+                        !before.contains(&item.resource.resource_id)
+                            && item.resource.metadata["process_name"]
+                                .as_str()
+                                .is_some_and(|name| name.eq_ignore_ascii_case(&image))
+                    })
+                    .collect()
+            } else {
+                by_process
+            };
+            if !found.is_empty() || Instant::now() >= until {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let mut state = self.state.lock().unwrap();
+        let resources: Vec<Resource> = found
+            .into_iter()
+            .filter(|item| self.allowed_resource(&item.resource.resource_id))
+            .map(|item| {
+                let public = item.resource.clone();
+                state.resources.insert(public.resource_id.clone(), item);
+                public
+            })
+            .collect();
+        drop(state);
+        Ok(json!({
+            "process_id": process_id,
+            "program": path.display().to_string(),
+            "window_appeared": !resources.is_empty(),
+            "resources": resources,
+        }))
     }
 
     /// The retained observation and raw node a read-only target names.
