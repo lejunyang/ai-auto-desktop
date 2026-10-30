@@ -90,6 +90,9 @@ pub enum ViewMode {
     Outline,
     /// Regions and their sizes without their contents.
     Overview,
+    /// The visible text of the page or of one region, with tables as rows.
+    /// Read-only; bounded by max_characters.
+    Text,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -97,7 +100,7 @@ pub enum ViewMode {
 pub struct View {
     #[serde(default)]
     pub mode: ViewMode,
-    /// Outline only: a region named by an overview.
+    /// Outline or text: a region named by an overview.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub region: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

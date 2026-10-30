@@ -55,6 +55,11 @@ r.getElementById('go').addEventListener('click',e=>{document.getElementById('sta
 customElements.define('x-card',class extends HTMLElement{constructor(){super();this.attachShadow({mode:'open'}).innerHTML='<div><b>Card title</b><slot name=action></slot></div>';}});
 customElements.define('x-closed',class extends HTMLElement{constructor(){super();this.attachShadow({mode:'closed'}).innerHTML='<button>Hidden inside</button>';}});
 </script>
+<nav aria-label="Primary"><a href="?home" aria-label="Home link">Home</a> <a href="?docs">Docs</a></nav>
+<main><section aria-label="Results"><table aria-label="Prices"><tr><th>Item</th><th>Cost</th></tr><tr><td>Tea</td><td>3</td></tr><tr><td>Cake</td><td>5</td></tr></table>
+<button onclick="document.getElementById('status').value='buy:results'">Buy</button></section>
+<section aria-label="Other"><button onclick="document.getElementById('status').value='buy:other'">Buy</button></section></main>
+<button aria-labelledby="buyer">x</button><span id="buyer">Labelled elsewhere</span><input type="search" aria-label="Find">
 <iframe src="/frame"></iframe><iframe src="XFRAME_URL"></iframe>
 </body></html>"#;
 /// A host name the fixture browser maps to loopback: a different site from 127.0.0.1.
@@ -746,6 +751,211 @@ fn frames_in_and_out_of_process_take_trusted_pointer_and_keyboard_input() {
         );
         assert_eq!(covered.error.unwrap()["code"], "CONTROL.OCCLUDED");
     }
+}
+
+fn observe_view(session: &Session, resource: &str, view: View) -> Response {
+    call(
+        session,
+        Operation::Observe {
+            resource_id: resource.into(),
+            max_nodes: 2000,
+            view,
+        },
+    )
+}
+fn locate(session: &Session, observation: &Value, locator: Value) -> Response {
+    call(
+        session,
+        Operation::Find {
+            observation_id: observation["observation_id"].as_str().unwrap().into(),
+            locator: Box::new(serde_json::from_value(locator).unwrap()),
+            expect: Default::default(),
+        },
+    )
+}
+
+#[test]
+#[ignore = "requires isolated Chromium with its sandbox enabled; CI runs it explicitly"]
+fn pages_read_as_regions_text_and_accessible_names_and_locators_narrow() {
+    let _serial = serial();
+    let fixture = Fixture::new();
+    let (session, _) = session_for(&fixture);
+    let main = main_of(&session, &fixture.page_id);
+    let loaded = wait_until(&session, &main, "Find", WaitCondition::Appears);
+    assert!(loaded.error.is_none(), "{loaded:?}");
+    // Roles and names from the browser's accessibility tree.
+    let observed = observe(&session, &main);
+    let accessibility = &observed["metadata"]["accessibility"];
+    assert_eq!(accessibility["applied"], true, "{accessibility}");
+    eprintln!(
+        "accessibility: {} nodes in {} ms",
+        accessibility["nodes"], accessibility["ms"]
+    );
+    assert_eq!(node(&observed, "Find")["role"], "searchbox");
+    assert_eq!(node(&observed, "Labelled elsewhere")["role"], "button");
+    assert_eq!(node(&observed, "Status")["role"], "status");
+    assert!(observed["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|n| n["role"] == "document"));
+
+    // An overview names the landmarks; an outline drills into one.
+    let overview = observe_view(
+        &session,
+        &main,
+        View {
+            mode: ViewMode::Overview,
+            ..Default::default()
+        },
+    );
+    assert!(overview.error.is_none(), "{overview:?}");
+    let regions: Vec<String> = overview.data.unwrap()["regions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["region"].as_str().unwrap().to_string())
+        .collect();
+    for region in ["Primary", "Results", "Other", "(loose in the page)"] {
+        assert!(
+            regions.contains(&region.to_string()),
+            "{region}: {regions:?}"
+        );
+    }
+    let outline = observe_view(
+        &session,
+        &main,
+        View {
+            mode: ViewMode::Outline,
+            region: Some("Results".into()),
+            ..Default::default()
+        },
+    )
+    .data
+    .unwrap();
+    assert_eq!(outline["region"], "Results");
+    let names: Vec<&str> = outline["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| n["name"].as_str().unwrap())
+        .collect();
+    assert!(
+        names.contains(&"Buy") && names.contains(&"Tea"),
+        "{names:?}"
+    );
+    assert!(!names.contains(&"Home link"), "{names:?}");
+    let missing = observe_view(
+        &session,
+        &main,
+        View {
+            mode: ViewMode::Outline,
+            region: Some("Nowhere".into()),
+            ..Default::default()
+        },
+    );
+    let failure = missing.error.unwrap();
+    assert_eq!(failure["code"], "CONTROL.NOT_FOUND");
+    assert!(failure["details"]["regions"].as_array().unwrap().len() >= 3);
+
+    // Text: the region's words and its table as rows; the page bounded.
+    let text = observe_view(
+        &session,
+        &main,
+        View {
+            mode: ViewMode::Text,
+            region: Some("Results".into()),
+            ..Default::default()
+        },
+    );
+    assert!(text.error.is_none(), "{text:?}");
+    let text = text.data.unwrap();
+    assert!(text["text"].as_str().unwrap().contains("Buy"), "{text}");
+    assert!(!text["text"].as_str().unwrap().contains("Home"), "{text}");
+    assert_eq!(text["tables"][0]["name"], "Prices");
+    assert_eq!(
+        text["tables"][0]["rows"],
+        json!([["Item", "Cost"], ["Tea", "3"], ["Cake", "5"]])
+    );
+    fixture
+        .client()
+        .eval("const notes=document.createElement('p'); notes.textContent='word '.repeat(300); document.body.appendChild(notes); true")
+        .unwrap();
+    let page = observe_view(
+        &session,
+        &main,
+        View {
+            mode: ViewMode::Text,
+            max_characters: Some(500),
+            ..Default::default()
+        },
+    )
+    .data
+    .unwrap();
+    assert_eq!(page["text_truncated"], true, "{page}");
+    assert_eq!(page["text"].as_str().unwrap().chars().count(), 500);
+    assert!(page["characters"].as_u64().unwrap() > 500);
+
+    // Locators: within a region, the nth on screen, a contained name.
+    let observed = observe(&session, &main);
+    let ambiguous = locate(
+        &session,
+        &observed,
+        json!({"role": "button", "name": "Buy"}),
+    );
+    assert_eq!(ambiguous.error.unwrap()["code"], "CONTROL.AMBIGUOUS");
+    let other = locate(
+        &session,
+        &observed,
+        json!({"role": "button", "name": "Buy", "within": {"name": "Other"}}),
+    );
+    assert!(other.error.is_none(), "{other:?}");
+    let first = locate(
+        &session,
+        &observed,
+        json!({"role": "button", "name": "Buy", "nth": 1}),
+    );
+    let first: Target = serde_json::from_value(first.data.unwrap()["target"].clone()).unwrap();
+    let contained = locate(
+        &session,
+        &observed,
+        json!({"name": "home", "match": "contains"}),
+    );
+    assert_eq!(contained.data.unwrap()["node"]["name"], "Home link");
+    let refused = locate(&session, &observed, json!({"automation_id": "x"}));
+    assert_eq!(
+        refused.error.unwrap()["code"],
+        "CONTROL.LOCATOR_UNSUPPORTED"
+    );
+    assert!(act(&session, first, Action::click()).error.is_none());
+    assert_eq!(status(&observe(&session, &main)), "buy:results");
+    let observed = observe(&session, &main);
+    let last = locate(
+        &session,
+        &observed,
+        json!({"role": "button", "name": "Buy", "nth": "last"}),
+    );
+    let last: Target = serde_json::from_value(last.data.unwrap()["target"].clone()).unwrap();
+    assert!(act(&session, last, Action::click()).error.is_none());
+    assert_eq!(status(&observe(&session, &main)), "buy:other");
+
+    // Cost of the accessibility pass on a crowded page.
+    fixture
+        .client()
+        .eval(
+            "const many=document.createElement('div'); for (let i=0;i<500;i++) { \
+             const b=document.createElement('button'); b.textContent='Item '+i; many.appendChild(b); } \
+             document.body.appendChild(many); true",
+        )
+        .unwrap();
+    let started = Instant::now();
+    let crowded = observe_view(&session, &main, View::default()).data.unwrap();
+    eprintln!(
+        "crowded page: {} nodes observed in {} ms, accessibility {}",
+        crowded["node_count"],
+        started.elapsed().as_millis(),
+        crowded["metadata"]["accessibility"]
+    );
 }
 
 #[test]
@@ -1505,6 +1715,9 @@ fn browser_actions_are_observed_document_bound_and_have_real_page_effects() {
     let stale = act(&session, target, Action::click());
     assert_eq!(stale.effect, "not_applied");
     assert_eq!(stale.error.unwrap()["code"], "CONTROL.STALE_TARGET");
+    // The frame is listed as soon as it exists; its document may still be loading.
+    let loaded = wait_until(&session, frame, "FrameInput", WaitCondition::Appears);
+    assert!(loaded.error.is_none(), "{loaded:?}");
     let observed = observe(&session, frame);
     for name in [
         "navigate",

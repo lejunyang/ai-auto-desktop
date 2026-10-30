@@ -587,7 +587,7 @@ impl Session {
                 let mut answer = json!({"observation_id": observation_id, "resource_id": resource_id, "node_count": nodes.len(), "truncated": raw["truncated"] == true, "metadata": raw.get("metadata").cloned().unwrap_or(Value::Null)});
                 match view.mode {
                     ViewMode::Nodes => answer["nodes"] = json!(nodes),
-                    ViewMode::Outline | ViewMode::Overview => {
+                    ViewMode::Outline | ViewMode::Overview | ViewMode::Text => {
                         let shaped = match backend.view(&raw, view, context.remaining()?)? {
                             Some(shaped) => shaped,
                             None => portable_view(&nodes, view)?,
@@ -1230,12 +1230,15 @@ fn validate_view(view: &View) -> Result<()> {
             "view limit must be in 1..500 and max_characters in 500..200000",
         ));
     }
-    if view.mode != ViewMode::Outline
-        && (view.region.is_some() || view.limit.is_some() || view.max_characters.is_some())
-    {
+    let shaped = match view.mode {
+        ViewMode::Outline => true,
+        ViewMode::Text => view.limit.is_none(),
+        _ => false,
+    };
+    if !shaped && (view.region.is_some() || view.limit.is_some() || view.max_characters.is_some()) {
         return Err(error(
             "CONTROL.INVALID_REQUEST",
-            "region, limit and max_characters shape an outline view only",
+            "region and max_characters shape an outline or text view; limit an outline only",
         ));
     }
     Ok(())
@@ -1243,16 +1246,31 @@ fn validate_view(view: &View) -> Result<()> {
 
 /// Elements a caller can act on or read, in capture order, within both the
 /// element and character ceilings. Providers with richer structure override it.
+///
+/// A provider that reports a `region` on its nodes (the name of the landmark
+/// a node sits in, null outside any) also gets the overview and the outline
+/// of one region.
 fn portable_view(nodes: &[Value], view: &View) -> Result<Value> {
-    if view.mode == ViewMode::Overview || view.region.is_some() {
+    if view.mode == ViewMode::Text {
+        return Err(error(
+            "CONTROL.VIEW_UNSUPPORTED",
+            "this provider has no text view; observe with an outline view",
+        ));
+    }
+    let regional = nodes.iter().any(|n| n.get("region").is_some());
+    if !regional && (view.mode == ViewMode::Overview || view.region.is_some()) {
         return Err(error(
             "CONTROL.VIEW_UNSUPPORTED",
             "this provider has no region overview; observe with an outline view",
         ));
     }
+    let region_of = |n: &Value| n["region"].as_str().unwrap_or(LOOSE_REGION).to_string();
+    if view.mode == ViewMode::Overview {
+        return Ok(portable_overview(nodes, region_of));
+    }
     let limit = view.limit.unwrap_or(DEFAULT_OUTLINE_LIMIT);
     let budget = view.max_characters.unwrap_or(DEFAULT_OUTLINE_CHARACTERS);
-    let eligible: Vec<&Value> = nodes
+    let mut eligible: Vec<&Value> = nodes
         .iter()
         .filter(|n| {
             n["capabilities"].as_array().is_some_and(|c| !c.is_empty())
@@ -1260,6 +1278,21 @@ fn portable_view(nodes: &[Value], view: &View) -> Result<Value> {
         })
         .filter(|n| n["states"]["offscreen"] != true)
         .collect();
+    if let Some(region) = &view.region {
+        eligible.retain(|n| region_of(n) == *region);
+        if eligible.is_empty() {
+            // Not an empty region: a misremembered name is a different fact.
+            return Err(error(
+                "CONTROL.NOT_FOUND",
+                format!("no region named {region:?} here"),
+            )
+            .with_retryable(true)
+            .with_detail(
+                "regions",
+                portable_overview(nodes, region_of)["regions"].clone(),
+            ));
+        }
+    }
     let mut shown = Vec::new();
     let mut characters = 0;
     let mut stopped_by = Value::Null;
@@ -1276,13 +1309,61 @@ fn portable_view(nodes: &[Value], view: &View) -> Result<Value> {
         characters += size;
         shown.push((*node).clone());
     }
-    Ok(json!({
+    let mut answer = json!({
         "nodes": shown,
         "shown": shown.len(),
         "matched": eligible.len(),
         "outline_truncated": shown.len() < eligible.len(),
         "stopped_by": stopped_by,
-    }))
+    });
+    if let Some(region) = &view.region {
+        answer["region"] = json!(region);
+    }
+    Ok(answer)
+}
+
+/// The region of a node outside every landmark.
+pub const LOOSE_REGION: &str = "(loose in the page)";
+/// Regions an overview names; the rest are counted as folded.
+const OVERVIEW_REGIONS: usize = 12;
+
+/// Regions by how many actionable elements each holds, largest first, with
+/// what kind of thing is in them.
+fn portable_overview(nodes: &[Value], region_of: impl Fn(&Value) -> String) -> Value {
+    let mut regions: Vec<(String, Vec<&Value>)> = Vec::new();
+    for node in nodes.iter().filter(|n| {
+        n["capabilities"].as_array().is_some_and(|c| !c.is_empty())
+            && n["states"]["offscreen"] != true
+    }) {
+        let label = region_of(node);
+        match regions.iter_mut().find(|(known, _)| *known == label) {
+            Some((_, members)) => members.push(node),
+            None => regions.push((label, vec![node])),
+        }
+    }
+    regions.sort_by_key(|(_, members)| std::cmp::Reverse(members.len()));
+    let interactive: usize = regions.iter().map(|(_, m)| m.len()).sum();
+    let (named, folded) = regions.split_at(OVERVIEW_REGIONS.min(regions.len()));
+    let described: Vec<Value> = named
+        .iter()
+        .map(|(label, members)| {
+            let mut roles: BTreeMap<&str, usize> = BTreeMap::new();
+            for node in members {
+                *roles.entry(node["role"].as_str().unwrap_or("")).or_default() += 1;
+            }
+            json!({
+                "region": label,
+                "elements": members.len(),
+                "holds": roles.iter().map(|(role, count)| json!({"role": role, "count": count})).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    json!({
+        "regions": described,
+        "interactive": interactive,
+        "folded_regions": folded.len(),
+        "folded_elements": folded.iter().map(|(_, m)| m.len()).sum::<usize>(),
+    })
 }
 
 /// Exact `role` / `name` / `node_id` matching, the subset every provider shares.

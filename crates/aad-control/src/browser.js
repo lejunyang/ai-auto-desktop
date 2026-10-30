@@ -4,9 +4,12 @@
   let observation = null;
   let nodes = new Map();
   const inputRole = el => ({checkbox:'checkbox',radio:'radio',button:'button',submit:'button',reset:'button',range:'slider',file:'button'}[(el.type||'').toLowerCase()] || 'textbox');
-  const roleOf = el => el.getAttribute('role') || (el.tagName==='INPUT' ? inputRole(el) : ({TEXTAREA:'textbox',BUTTON:'button',A:'link',SELECT:'combobox',BODY:'document',IMG:'img',CANVAS:'canvas',SVG:'img',LI:'listitem',UL:'list',OL:'list',TABLE:'table',TR:'row',TD:'cell',TH:'columnheader',H1:'heading',H2:'heading',H3:'heading',H4:'heading',H5:'heading',H6:'heading',DIALOG:'dialog',FORM:'form'}[el.tagName.toUpperCase()] || 'generic'));
+  const roleOf = el => el.getAttribute('role') || (el.tagName==='INPUT' ? inputRole(el) : ({TEXTAREA:'textbox',BUTTON:'button',A:'link',SELECT:'combobox',BODY:'document',IMG:'img',CANVAS:'canvas',SVG:'img',LI:'listitem',UL:'list',OL:'list',TABLE:'table',TR:'row',TD:'cell',TH:'columnheader',H1:'heading',H2:'heading',H3:'heading',H4:'heading',H5:'heading',H6:'heading',DIALOG:'dialog',FORM:'form',HEADER:'banner',NAV:'navigation',MAIN:'main',ASIDE:'complementary',FOOTER:'contentinfo',SECTION:'region',OUTPUT:'status'}[el.tagName.toUpperCase()] || 'generic'));
   const textOf = el => {let text='',i=0;const walker=document.createTreeWalker(el,NodeFilter.SHOW_TEXT);let node;while(text.length<256 && i++<32 && (node=walker.nextNode()))text+=(node.nodeValue||'').slice(0,256-text.length);return text;};
   const labelOf = el => (el.getAttribute('aria-label') || (el.labels && Array.from(el.labels).slice(0,8).map(textOf).join(' ')) || el.getAttribute('alt') || el.getAttribute('title') || el.getAttribute('placeholder') || (['INPUT','TEXTAREA','SELECT'].includes(el.tagName) ? el.id : textOf(el)) || '').trim().slice(0,256);
+  // Landmarks a page is divided into, as an overview names its regions.
+  const LANDMARK_ROLES = ['banner','navigation','main','complementary','contentinfo','form','search','dialog','alertdialog','region'];
+  const landmark = el => el!==document.body && (el.getAttribute('role') ? LANDMARK_ROLES.includes(el.getAttribute('role')) : (['HEADER','NAV','MAIN','ASIDE','FOOTER','FORM','DIALOG'].includes(el.tagName) || (el.tagName==='SECTION' && !!(el.getAttribute('aria-label')||el.getAttribute('aria-labelledby')))));
   const protectedNode = el => el.tagName === 'INPUT' && ['password','hidden'].includes((el.type||'').toLowerCase());
   // A file input only ever takes files, through upload; often it is hidden behind a styled button.
   const fileInput = el => el.tagName === 'INPUT' && (el.type||'').toLowerCase() === 'file';
@@ -66,18 +69,56 @@
         const children=el.shadowRoot?[...el.shadowRoot.children,...el.children]:el.children;
         for(let i=children.length-1;i>=0;i--)stack.push(children[i]);
       }
-      const result=items.slice(0,limit).map((el,index)=>{
+      const ids=new Map();
+      const kept=items.slice(0,limit);
+      kept.forEach((el,index)=>ids.set(el,'n'+index));
+      // The nearest observed ancestor, across shadow hosts.
+      const parentOf=el=>{for(let n=el.parentNode||el.host;n;n=n.parentNode||n.host){if(ids.has(n))return ids.get(n);}return null;};
+      const result=kept.map((el,index)=>{
         const node_id='n'+index;
         nodes.set(node_id,{el,fingerprint:fingerprint(el)});
         const node={node_id,role:roleOf(el),name:labelOf(el),tag:el.tagName.toLowerCase(),
           value:protectedNode(el)?null:(('value' in el)?String(el.value).slice(0,4096):null),
-          states:{enabled:enabled(el),protected:protectedNode(el),read_only:!!el.readOnly,focused:activeElement()===el},actions:actions(el)};
+          states:{enabled:enabled(el),protected:protectedNode(el),read_only:!!el.readOnly,focused:activeElement()===el},actions:actions(el),parent:parentOf(el)};
+        if (landmark(el)) node.landmark=true;
         if (checkable(el)) node.states.checked=checkedOf(el);
         if (fileInput(el)) { node.states.hidden=!visible(el); node.files=Array.from(el.files||[]).slice(0,32).map(f=>f.name.slice(0,256)); node.multiple=!!el.multiple; }
         if (el.tagName==='SELECT') node.options=Array.from(el.options).slice(0,100).map(o=>o.label.trim().slice(0,256));
         return node;
       });
-      return {document_token:documentToken,nodes:result,truncated:items.length>limit||stack.length>0};
+      // Top to bottom, then left to right: the order "the third button" means.
+      const order=kept.map((el,index)=>{const box=el.getBoundingClientRect();return [Math.round(box.top+scrollY),Math.round(box.left+scrollX),index];})
+        .sort((a,b)=>a[0]-b[0]||a[1]-b[1]||a[2]-b[2]).map(entry=>'n'+entry[2]);
+      return {document_token:documentToken,nodes:result,order,truncated:items.length>limit||stack.length>0};
+    },
+    // The observed elements in node order, for the browser's accessibility tree.
+    elements: () => Array.from(nodes.values()).map(found=>found.el),
+    // What the page, or one observed region of it, shows as text, with tables
+    // as rows of cells. Each part stops at max_characters.
+    text: args => {
+      if (args.document_token!==documentToken || args.observation!==observation) return {error:'CONTROL.STALE_TARGET'};
+      let root=document.body;
+      if (args.node_id) {
+        const found=nodes.get(args.node_id);
+        if (!found || !found.el.isConnected || fingerprint(found.el)!==found.fingerprint) return {error:'CONTROL.STALE_TARGET'};
+        root=found.el;
+      }
+      const max=args.max_characters;
+      const full=root ? (root.innerText||'') : '';
+      const ids=new Map(); nodes.forEach((found,id)=>ids.set(found.el,id));
+      let budget=max, cut=false;
+      const cell=c=>{const text=(c.innerText||'').trim().slice(0,500);if(text.length>budget){cut=true;const part=text.slice(0,Math.max(budget,0));budget=0;return part;}budget-=text.length;return text;};
+      const all=root ? Array.from(root.querySelectorAll('table')).filter(visible) : [];
+      const tables=[];
+      for (const table of all.slice(0,20)) {
+        if (budget<=0) {cut=true;break;}
+        const rows=Array.from(table.rows);
+        const shown=[];
+        for (const row of rows.slice(0,200)) {if(budget<=0){cut=true;break;}shown.push(Array.from(row.cells).slice(0,50).map(cell));}
+        tables.push({node_id:ids.get(table)||null,name:(table.getAttribute('aria-label')||(table.caption?table.caption.innerText:'')||'').trim().slice(0,256),
+          row_count:rows.length,rows:shown,truncated:shown.length<rows.length});
+      }
+      return {text:full.slice(0,max),characters:full.length,text_truncated:full.length>max,tables,table_count:all.length,tables_truncated:cut||all.length>tables.length};
     },
     act: args => {
       const found=check(args); if(found.error) return found;

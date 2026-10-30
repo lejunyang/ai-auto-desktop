@@ -760,6 +760,353 @@ fn locate(page: &mut Page, frame_id: &str) -> Result<FrameEntry> {
         .ok_or_else(|| error("CONTROL.STALE_TARGET", "browser frame was detached"))
 }
 
+/// Captures larger than this keep their heuristic roles and names: the
+/// browser's accessibility tree is asked once per node.
+const MAX_ACCESSIBLE_NODES: usize = 2_000;
+/// Accessibility queries sent before their replies are awaited.
+const AX_PIPELINE: usize = 200;
+
+/// Roles and names as the browser's accessibility tree has them, for each
+/// observed element. An element the tree ignores, an internal role
+/// (`StaticText`, `LabelText`, ...) or an empty name keeps the heuristic
+/// value; the page body stays `document`, where page actions live.
+fn accessibility(client: &mut Client, context: &Ctx, nodes: &mut [Value]) -> Result<Value> {
+    let started = Instant::now();
+    if nodes.len() > MAX_ACCESSIBLE_NODES {
+        return Ok(json!({"applied": false, "reason": "too many nodes", "nodes": nodes.len()}));
+    }
+    let session = context.session.as_deref();
+    const GROUP: &str = "aad-control-accessibility";
+    let list = run(
+        client,
+        session,
+        "Runtime.evaluate",
+        json!({"expression": "globalThis.__aadControlV1.elements()", "contextId": context.id,
+            "returnByValue": false, "objectGroup": GROUP}),
+    )?;
+    let result = (|| -> Result<usize> {
+        let array = list["result"]["objectId"]
+            .as_str()
+            .ok_or_else(|| error("BROWSER.BAD_RESULT", "no element list"))?;
+        let properties = run(
+            client,
+            session,
+            "Runtime.getProperties",
+            json!({"objectId": array, "ownProperties": true}),
+        )?;
+        let elements: Vec<(usize, String)> = properties["result"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|property| {
+                Some((
+                    property["name"].as_str()?.parse::<usize>().ok()?,
+                    property["value"]["objectId"].as_str()?.to_string(),
+                ))
+            })
+            .filter(|(index, _)| *index < nodes.len())
+            .collect();
+        let mut applied = 0;
+        // One element per call, many calls in flight: the round trips, not
+        // the browser's work, dominate a sequential pass.
+        for chunk in elements.chunks(AX_PIPELINE) {
+            let calls: Vec<(&str, Value)> = chunk
+                .iter()
+                .map(|(_, object)| {
+                    (
+                        "Accessibility.getPartialAXTree",
+                        json!({"objectId": object, "fetchRelatives": false}),
+                    )
+                })
+                .collect();
+            for ((index, _), tree) in chunk.iter().zip(client.session_pipeline(session, &calls)) {
+                let tree = tree.map_err(cdp_error)?;
+                let Some(ax) = tree["nodes"].as_array().and_then(|n| n.first()) else {
+                    continue;
+                };
+                if apply_accessibility(&mut nodes[*index], ax) {
+                    applied += 1;
+                }
+            }
+        }
+        Ok(applied)
+    })();
+    let _ = run(
+        client,
+        session,
+        "Runtime.releaseObjectGroup",
+        json!({"objectGroup": GROUP}),
+    );
+    Ok(
+        json!({"applied": true, "nodes": nodes.len(), "from_tree": result?,
+        "ms": started.elapsed().as_millis() as u64}),
+    )
+}
+
+/// Take the accessibility tree's role and name where it has meaningful ones.
+fn apply_accessibility(node: &mut Value, ax: &Value) -> bool {
+    if ax["ignored"] == true || node["role"] == "document" {
+        return false;
+    }
+    let mut changed = false;
+    if let Some(role) = ax["role"]["value"].as_str().filter(|role| {
+        role.chars().next().is_some_and(|c| c.is_ascii_lowercase()) && *role != "none"
+    }) {
+        changed |= node["role"] != role;
+        node["role"] = json!(role);
+    }
+    if let Some(name) = ax["name"]["value"]
+        .as_str()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+    {
+        let name: String = name.chars().take(256).collect();
+        changed |= node["name"] != name.as_str();
+        node["name"] = json!(name);
+    }
+    changed
+}
+
+/// Name every landmark's region -- its name, else its role, numbered when
+/// repeated -- and give each node the region it sits in (null outside any).
+fn regions(nodes: &mut [Value]) {
+    let mut labels: BTreeMap<String, String> = BTreeMap::new();
+    let mut used: BTreeMap<String, usize> = BTreeMap::new();
+    for node in nodes.iter_mut() {
+        if node["landmark"] != true {
+            continue;
+        }
+        let base = node["name"]
+            .as_str()
+            .filter(|name| !name.is_empty())
+            .or_else(|| node["role"].as_str())
+            .unwrap_or("region")
+            .to_string();
+        let count = used.entry(base.clone()).or_default();
+        *count += 1;
+        let label = if *count == 1 {
+            base
+        } else {
+            format!("{base} ({count})")
+        };
+        node["landmark"] = json!(label);
+        labels.insert(node["node_id"].as_str().unwrap_or_default().into(), label);
+    }
+    let parents: BTreeMap<String, Option<String>> = nodes
+        .iter()
+        .map(|n| {
+            (
+                n["node_id"].as_str().unwrap_or_default().to_string(),
+                n["parent"].as_str().map(str::to_string),
+            )
+        })
+        .collect();
+    for node in nodes.iter_mut() {
+        let mut at = node["parent"].as_str().map(str::to_string);
+        let mut region = Value::Null;
+        for _ in 0..parents.len() {
+            let Some(id) = at else { break };
+            if let Some(label) = labels.get(&id) {
+                region = json!(label);
+                break;
+            }
+            at = parents.get(&id).cloned().flatten();
+        }
+        node["region"] = region;
+    }
+}
+
+/// Resolve a locator in a browser capture: role, name, node_id, value and
+/// states, `match: contains` (case-insensitive, for name and value), `within`
+/// a container another locator names (an overview's region name works as its
+/// `name`), and `nth` counted top to bottom, then left to right.
+fn browser_find(
+    snapshot: &Value,
+    locator: &crate::Locator,
+    expect: crate::Expect,
+) -> Result<Value> {
+    let nodes = snapshot["nodes"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    let candidates = matching(nodes, locator, 0)?;
+    let order: Vec<&str> = snapshot["order"]
+        .as_array()
+        .map(|o| o.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    let mut candidates = candidates;
+    candidates.sort_by_key(|n| {
+        let id = n["node_id"].as_str().unwrap_or_default();
+        order.iter().position(|o| *o == id).unwrap_or(usize::MAX)
+    });
+    let total = candidates.len();
+    if let Some(nth) = &locator.nth {
+        let index = match nth {
+            Value::String(word) if word == "first" => Some(0),
+            Value::String(word) if word == "last" => total.checked_sub(1),
+            Value::Number(n) => match n.as_u64() {
+                Some(0) | None => {
+                    return Err(error(
+                        "CONTROL.INVALID_REQUEST",
+                        "nth counts from 1, or is \"first\" or \"last\"",
+                    ))
+                }
+                Some(n) => Some(n as usize - 1).filter(|i| *i < total),
+            },
+            _ => {
+                return Err(error(
+                    "CONTROL.INVALID_REQUEST",
+                    "nth is a positive number, \"first\" or \"last\"",
+                ))
+            }
+        };
+        candidates = index.map(|i| vec![candidates[i]]).unwrap_or_default();
+    }
+    match candidates.as_slice() {
+        [] if expect == crate::Expect::Optional => Ok(json!({"found": false})),
+        [] => Err(error(
+            "CONTROL.NOT_FOUND",
+            "find must resolve exactly one observed node",
+        )
+        .with_retryable(true)),
+        [only] => Ok(json!({"found": true, "node_id": only["node_id"], "match_count": total})),
+        many => Err(error(
+            "CONTROL.AMBIGUOUS",
+            format!("the locator matched {} observed nodes", many.len()),
+        )
+        .with_detail("match_count", json!(many.len()))
+        .with_detail(
+            "candidates",
+            json!(many
+                .iter()
+                .take(10)
+                .map(
+                    |n| json!({"node_id": n["node_id"], "role": n["role"], "name": n["name"],
+                    "region": n["region"]})
+                )
+                .collect::<Vec<_>>()),
+        )),
+    }
+}
+
+fn matching<'a>(
+    nodes: &'a [Value],
+    locator: &crate::Locator,
+    depth: usize,
+) -> Result<Vec<&'a Value>> {
+    let unsupported: Vec<&str> = [
+        ("automation_id", locator.automation_id.is_some()),
+        ("class_name", locator.class_name.is_some()),
+        ("framework_id", locator.framework_id.is_some()),
+        ("near", locator.near.is_some()),
+    ]
+    .iter()
+    .filter(|(_, present)| *present)
+    .map(|(name, _)| *name)
+    .collect();
+    if !unsupported.is_empty() {
+        return Err(error(
+            "CONTROL.LOCATOR_UNSUPPORTED",
+            format!(
+                "browser pages do not match {}; use role, name, value, states, match, within or nth",
+                unsupported.join(", ")
+            ),
+        ));
+    }
+    if depth > 4 {
+        return Err(error(
+            "CONTROL.INVALID_REQUEST",
+            "within is nested too deeply",
+        ));
+    }
+    let contains = match locator.match_mode.as_deref() {
+        None | Some("exact") => false,
+        Some("contains") => true,
+        Some(_) => {
+            return Err(error(
+                "CONTROL.INVALID_REQUEST",
+                "match is exact or contains",
+            ))
+        }
+    };
+    let text = |expected: &str, actual: &Value| {
+        actual.as_str().is_some_and(|actual| {
+            if contains {
+                actual.to_lowercase().contains(&expected.to_lowercase())
+            } else {
+                actual == expected
+            }
+        })
+    };
+    let states = match &locator.states {
+        None => serde_json::Map::new(),
+        Some(Value::Object(states)) => states.clone(),
+        Some(_) => {
+            return Err(error(
+                "CONTROL.INVALID_REQUEST",
+                "states is an object of state names and values",
+            ))
+        }
+    };
+    let container = match &locator.within {
+        None => None,
+        Some(within) => {
+            let within: crate::Locator = serde_json::from_value(within.clone()).map_err(|e| {
+                error(
+                    "CONTROL.INVALID_REQUEST",
+                    format!("within is a locator: {e}"),
+                )
+            })?;
+            let found = browser_find_in(nodes, &within, depth + 1)?;
+            Some(found)
+        }
+    };
+    let parents: BTreeMap<&str, &str> = nodes
+        .iter()
+        .filter_map(|n| Some((n["node_id"].as_str()?, n["parent"].as_str()?)))
+        .collect();
+    let inside = |node: &Value, container: &str| {
+        let mut at = node["parent"].as_str();
+        for _ in 0..nodes.len() {
+            match at {
+                Some(id) if id == container => return true,
+                Some(id) => at = parents.get(id).copied(),
+                None => return false,
+            }
+        }
+        false
+    };
+    Ok(nodes
+        .iter()
+        .filter(|n| {
+            locator.role.as_ref().is_none_or(|v| n["role"] == *v)
+                && locator.name.as_ref().is_none_or(|v| text(v, &n["name"]))
+                && locator.node_id.as_ref().is_none_or(|v| n["node_id"] == *v)
+                && locator.value.as_ref().is_none_or(|v| text(v, &n["value"]))
+                && states.iter().all(|(key, value)| n["states"][key] == *value)
+                && container.as_deref().is_none_or(|c| inside(n, c))
+        })
+        .collect())
+}
+
+/// The one container a `within` names.
+fn browser_find_in(nodes: &[Value], locator: &crate::Locator, depth: usize) -> Result<String> {
+    let found = matching(nodes, locator, depth)?;
+    match found.as_slice() {
+        [only] => Ok(only["node_id"].as_str().unwrap_or_default().to_string()),
+        [] => Err(error(
+            "CONTROL.NOT_FOUND",
+            "the container `within` names is not in this observation",
+        )
+        .with_retryable(true)),
+        many => Err(error(
+            "CONTROL.AMBIGUOUS",
+            format!("`within` matched {} containers; name one", many.len()),
+        )
+        .with_detail("match_count", json!(many.len()))),
+    }
+}
+
 /// What a browser-level hit test must find at one step out of a frame.
 #[derive(Clone, Debug)]
 enum Expect {
@@ -918,6 +1265,33 @@ impl Backend for BrowserBackend {
     }
     fn capture(&self, snapshot: &Value, node: &Value, timeout: Duration) -> Result<Value> {
         self.capture_node(snapshot, node, timeout)
+    }
+    fn view(
+        &self,
+        snapshot: &Value,
+        view: &crate::View,
+        timeout: Duration,
+    ) -> Result<Option<Value>> {
+        if view.mode != crate::ViewMode::Text {
+            // Outline and overview come from the capture's regions.
+            return Ok(None);
+        }
+        if snapshot["metadata"]["dialog_id"].is_string() {
+            return Err(error(
+                "CONTROL.DIALOG_OPEN",
+                "a JavaScript dialog blocks this page; its message is in the observation",
+            ));
+        }
+        self.text(snapshot, view, timeout).map(Some)
+    }
+    fn find(
+        &self,
+        snapshot: &Value,
+        locator: &crate::Locator,
+        expect: crate::Expect,
+        _timeout: Duration,
+    ) -> Result<Option<Value>> {
+        browser_find(snapshot, locator, expect).map(Some)
     }
     fn lease_key(&self, _snapshot: &Value) -> Option<String> {
         // UIA/AX/AT-SPI can also operate a browser. Share one cooperating
@@ -1078,7 +1452,13 @@ impl Backend for BrowserBackend {
             let main=entry.main();
             if !main {if let Some(nodes)=result["nodes"].as_array_mut(){for node in nodes {if let Some(actions)=node["actions"].as_array_mut(){actions.retain(|v|!MAIN_FRAME_ONLY.iter().any(|name|v==name));}}}}
             result["snapshot_id"]=json!(observation);
-            result["metadata"]=json!({"page_id":page_id,"frame_id":frame_id,"loader_id":frame["loaderId"],"context_id":context.id,"main_frame":main,"parent_frame_id":entry.parent,"out_of_process":session.is_some()});
+            // Roles and names as the browser's accessibility tree has them; a
+            // failure there leaves the heuristic ones rather than failing the look.
+            let mut nodes=result["nodes"].as_array().cloned().unwrap_or_default();
+            let accessible=accessibility(client,&context,&mut nodes).unwrap_or_else(|e|json!({"applied":false,"reason":e.message}));
+            regions(&mut nodes);
+            result["nodes"]=json!(nodes);
+            result["metadata"]=json!({"page_id":page_id,"frame_id":frame_id,"loader_id":frame["loaderId"],"context_id":context.id,"main_frame":main,"parent_frame_id":entry.parent,"out_of_process":session.is_some(),"accessibility":accessible});
             Ok(result)
         })
     }
@@ -1223,6 +1603,65 @@ impl BrowserBackend {
                 json!({"submitted": true, "native_operation": "Page.handleJavaScriptDialog",
                 "accepted": accept, "dialog_type": dialog["type"]}),
             )
+        })
+    }
+}
+
+impl BrowserBackend {
+    /// The observed page's or region's visible text, with its tables as rows.
+    fn text(&self, snapshot: &Value, view: &crate::View, timeout: Duration) -> Result<Value> {
+        let meta = &snapshot["metadata"];
+        let page_id = meta["page_id"].as_str().unwrap_or_default();
+        let frame_id = meta["frame_id"].as_str().unwrap_or_default();
+        let nodes = snapshot["nodes"]
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let region = match &view.region {
+            None => Value::Null,
+            Some(region) => nodes
+                .iter()
+                .find(|n| n["landmark"] == region.as_str())
+                .map(|n| n["node_id"].clone())
+                .ok_or_else(|| {
+                    let names: Vec<&Value> = nodes
+                        .iter()
+                        .filter(|n| n["landmark"].is_string())
+                        .map(|n| &n["landmark"])
+                        .collect();
+                    error(
+                        "CONTROL.NOT_FOUND",
+                        format!("no region named {region:?} on this page"),
+                    )
+                    .with_detail("regions", json!(names))
+                })?,
+        };
+        let max = view
+            .max_characters
+            .unwrap_or(crate::DEFAULT_OUTLINE_CHARACTERS);
+        self.with_page_state(page_id, timeout, |page| {
+            if let Some(dialog) = &page.dialog {
+                return Err(dialog_open(dialog));
+            }
+            let entry = locate(page, frame_id)?;
+            if entry.frame["loaderId"] != meta["loader_id"] {
+                return Err(error("CONTROL.STALE_TARGET", "browser document navigated"));
+            }
+            let context = Ctx {
+                session: entry.session,
+                id: meta["context_id"].as_i64().unwrap_or_default(),
+            };
+            let args = json!({"document_token": snapshot["document_token"],
+                "observation": snapshot["snapshot_id"], "node_id": region, "max_characters": max});
+            let mut answer = checked(eval(
+                &mut page.client,
+                &context,
+                format!("globalThis.__aadControlV1.text({args})"),
+            )?)?;
+            if let Some(region) = &view.region {
+                answer["region"] = json!(region);
+            }
+            Ok(answer)
         })
     }
 }
@@ -2188,6 +2627,128 @@ mod tests {
             (Some("S1"), Some("b"), false)
         );
         assert_eq!(all.len(), 5);
+    }
+
+    #[test]
+    fn accessible_roles_and_names_win_unless_internal_ignored_or_empty() {
+        let mut node = json!({"role": "textbox", "name": "q"});
+        assert!(apply_accessibility(
+            &mut node,
+            &json!({"role": {"value": "searchbox"}, "name": {"value": "Search"}})
+        ));
+        assert_eq!(node, json!({"role": "searchbox", "name": "Search"}));
+        let mut label = json!({"role": "generic", "name": "Query"});
+        assert!(!apply_accessibility(
+            &mut label,
+            &json!({"role": {"value": "LabelText"}, "name": {"value": ""}})
+        ));
+        assert_eq!(label, json!({"role": "generic", "name": "Query"}));
+        let mut hidden = json!({"role": "button", "name": "x"});
+        assert!(!apply_accessibility(
+            &mut hidden,
+            &json!({"ignored": true, "role": {"value": "none"}})
+        ));
+        let mut body = json!({"role": "document", "name": ""});
+        apply_accessibility(&mut body, &json!({"role": {"value": "generic"}}));
+        assert_eq!(body["role"], "document");
+    }
+
+    fn capture() -> Value {
+        let mut nodes = vec![
+            json!({"node_id": "n0", "role": "document", "name": "", "parent": null}),
+            json!({"node_id": "n1", "role": "navigation", "name": "", "parent": "n0", "landmark": true}),
+            json!({"node_id": "n2", "role": "link", "name": "Home", "parent": "n1"}),
+            json!({"node_id": "n3", "role": "region", "name": "Results", "parent": "n0", "landmark": true}),
+            json!({"node_id": "n4", "role": "generic", "name": "", "parent": "n3"}),
+            json!({"node_id": "n5", "role": "button", "name": "Buy now", "parent": "n4", "states": {"enabled": true}}),
+            json!({"node_id": "n6", "role": "region", "name": "Other", "parent": "n0", "landmark": true}),
+            json!({"node_id": "n7", "role": "button", "name": "Buy now", "parent": "n6", "states": {"enabled": false}}),
+            json!({"node_id": "n8", "role": "navigation", "name": "", "parent": "n0", "landmark": true}),
+        ];
+        regions(&mut nodes);
+        // Screen order puts Other's button above Results'.
+        json!({"nodes": nodes, "order": ["n0", "n1", "n2", "n6", "n7", "n3", "n4", "n5", "n8"]})
+    }
+
+    #[test]
+    fn landmarks_name_regions_and_nodes_know_theirs() {
+        let snapshot = capture();
+        let nodes = snapshot["nodes"].as_array().unwrap();
+        assert_eq!(nodes[1]["landmark"], "navigation");
+        assert_eq!(nodes[8]["landmark"], "navigation (2)");
+        assert_eq!(nodes[2]["region"], "navigation");
+        assert_eq!(nodes[5]["region"], "Results");
+        assert_eq!(nodes[7]["region"], "Other");
+        assert!(nodes[0]["region"].is_null() && nodes[3]["region"].is_null());
+    }
+
+    #[test]
+    fn browser_locators_narrow_by_container_position_text_and_state() {
+        let snapshot = capture();
+        let find = |locator: Value, expect: crate::Expect| {
+            browser_find(&snapshot, &serde_json::from_value(locator).unwrap(), expect)
+        };
+        let one = crate::Expect::One;
+        let ambiguous = find(json!({"role": "button", "name": "Buy now"}), one).unwrap_err();
+        assert_eq!(ambiguous.code, "CONTROL.AMBIGUOUS");
+        assert_eq!(ambiguous.details["candidates"][0]["region"], "Other");
+        let within = find(
+            json!({"role": "button", "within": {"name": "Results"}}),
+            one,
+        )
+        .unwrap();
+        assert_eq!(within["node_id"], "n5");
+        // nth counts top to bottom, so the first is Other's.
+        let first = find(json!({"role": "button", "nth": 1}), one).unwrap();
+        assert_eq!(
+            (first["node_id"].as_str(), first["match_count"].as_u64()),
+            (Some("n7"), Some(2))
+        );
+        assert_eq!(
+            find(json!({"role": "button", "nth": "last"}), one).unwrap()["node_id"],
+            "n5"
+        );
+        assert_eq!(
+            find(json!({"role": "button", "nth": 3}), crate::Expect::Optional).unwrap()["found"],
+            false
+        );
+        assert_eq!(
+            find(json!({"role": "button", "nth": 0}), one)
+                .unwrap_err()
+                .code,
+            "CONTROL.INVALID_REQUEST"
+        );
+        assert_eq!(
+            find(
+                json!({"name": "buy", "match": "contains", "states": {"enabled": false}}),
+                one
+            )
+            .unwrap()["node_id"],
+            "n7"
+        );
+        assert_eq!(
+            find(json!({"name": "buy"}), crate::Expect::Optional).unwrap()["found"],
+            false
+        );
+        assert_eq!(
+            find(
+                json!({"role": "link", "within": {"role": "navigation"}}),
+                one
+            )
+            .unwrap_err()
+            .code,
+            "CONTROL.AMBIGUOUS",
+            "two navigation landmarks: within must name one"
+        );
+        for field in [
+            json!({"automation_id": "x"}),
+            json!({"near": {"anchor": {"name": "a"}}}),
+        ] {
+            assert_eq!(
+                find(field, one).unwrap_err().code,
+                "CONTROL.LOCATOR_UNSUPPORTED"
+            );
+        }
     }
 
     #[test]

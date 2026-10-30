@@ -205,19 +205,23 @@ fn view_schema() -> Value {
     either way, so any node of it can be found or acted on.",
         "properties": {
             "mode": {
-                "enum": ["outline", "overview", "nodes"],
+                "enum": ["outline", "overview", "text", "nodes"],
                 "default": "outline",
                 "description": "outline (default): elements you can act on or read, \
     bounded by limit and max_characters. overview: the window's regions and their sizes \
     without their contents -- start here on any window of substance. Measured across one \
     desktop, nine windows out of twenty held more interactive elements than an outline \
     returns, the largest 367; an overview cost about 2000 characters where listing 500 \
-    elements cost 127000. Regions are computed for Windows windows; elsewhere use outline. \
-    nodes: every captured node, for callers that need the raw tree."
+    elements cost 127000. Regions are computed for Windows windows and for browser pages \
+    (their landmarks: header, nav, main, aside, footer, form, dialog, named sections and \
+    role=region, named by their accessible name or else their role); elsewhere use outline. \
+    text (browser pages): read-only, the visible text of the page or of one region, cut \
+    at max_characters, with its tables as rows of cells -- for reading content rather \
+    than names. nodes: every captured node, for callers that need the raw tree."
             },
             "region": {
                 "type": "string",
-                "description": "Outline only: list just this region, named as the overview \
+                "description": "Outline or text: list or read just this region, named as the overview \
     reports it. It is the same name a locator carries in `within`, so a region drilled into \
     and a locator written against it agree."
             },
@@ -228,8 +232,8 @@ fn view_schema() -> Value {
             },
             "max_characters": {
                 "type": "integer", "minimum": 500, "maximum": 200000,
-                "description": "Outline only: stop after roughly this many characters \
-    (default 20000). An element count does not bound the size -- elements ran from 169 to \
+                "description": "Outline or text: stop after roughly this many characters \
+    (default 20000; for text, the text and the tables each). An element count does not bound the size -- elements ran from 169 to \
     4890 characters, and 500 of them reached 188147 on one window. When the outline is cut, \
     `stopped_by` says which ceiling bit: raising `limit` helps when it says `limit` and does \
     nothing when it says `characters`, where narrowing to a region is the way forward."
@@ -246,8 +250,10 @@ fn locator_schema() -> Value {
         "description": "A node_id from this observation. Works on every provider."
     });
     locator["description"] = json!(format!(
-        "{} role, name and node_id work on every provider; the other fields are \
-evaluated by the Windows provider and refused elsewhere.",
+        "{} role, name and node_id work on every provider. Windows evaluates every \
+field; browser pages also take value, states, match, within (a container, or a region name \
+from the overview) and nth (counted top to bottom, then left to right), and refuse \
+automation_id, class_name, framework_id and near.",
         locator["description"].as_str().unwrap_or_default()
     ));
     locator
@@ -469,11 +475,12 @@ list what it does."
 max_nodes (up to 2000) or observe a smaller window."
         }
         "CONTROL.LOCATOR_UNSUPPORTED" => {
-            "This provider matches role, name and node_id exactly. Drop the other fields, \
-or take the node_id from an outline."
+            "This provider does not evaluate one of the locator's fields (the message names \
+it). Drop it, narrow with the fields it does take, or take the node_id from an outline."
         }
         "CONTROL.VIEW_UNSUPPORTED" => {
-            "Regions are computed for Windows windows only. Observe with view mode outline."
+            "Regions are computed for Windows windows and browser pages, and the text view for \
+browser pages. Observe with view mode outline."
         }
         "CONTROL.OCCLUDED" => {
             "Something is laid over the element, such as a dialog, a banner or a menu, so pointer input would land on that instead. Observe again and deal with what covers it, or use a plain click (DOM activation) if that is enough."
@@ -612,7 +619,7 @@ mod tests {
         let view = &observe.schema["properties"]["view"]["properties"];
         assert_eq!(
             view["mode"]["enum"],
-            json!(["outline", "overview", "nodes"])
+            json!(["outline", "overview", "text", "nodes"])
         );
         assert!(view["mode"]["description"]
             .as_str()

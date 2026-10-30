@@ -153,7 +153,7 @@ impl Backend for NativeBackend {
         }
         let mut args = json!({"snapshot_id": snapshot["snapshot_id"]});
         match view.mode {
-            ViewMode::Nodes => Ok(None),
+            ViewMode::Nodes | ViewMode::Text => Ok(None),
             ViewMode::Overview => {
                 let overview = self.invoke("overview", args, timeout)?;
                 Ok(Some(json!({"regions": overview["regions"]})))
