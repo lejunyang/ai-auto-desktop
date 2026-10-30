@@ -30,6 +30,7 @@ const PAGE: &str = r#"<!doctype html><html><body>
 <div aria-label="Log" style="height:40px;overflow:auto" onscroll="document.getElementById('status').value='scrolled:'+(this.scrollTop>0)"><div style="height:400px">rows</div></div>
 <div style="position:relative"><button aria-label="Covered">Covered</button><div style="position:absolute;inset:0;background:white"></div></div>
 <a href="/second" aria-label="Second page">second</a>
+<a href="/download" aria-label="Get report">report</a>
 <button aria-label="Popup" onclick="window.open('/second','_blank','popup')">Popup</button>
 <button aria-label="Ask" onclick="document.getElementById('status').value='answer:'+prompt('Your name?','guest')">Ask</button>
 <button aria-label="Sure" onclick="document.getElementById('status').value='confirm:'+confirm('Sure?')">Sure</button>
@@ -68,14 +69,18 @@ impl Fixture {
                         let mut bytes = [0u8; 8192];
                         let count = stream.read(&mut bytes).unwrap_or(0);
                         let request = String::from_utf8_lossy(&bytes[..count]);
-                        let body = if request.starts_with("GET /frame") {
+                        let mut headers = "Content-Type: text/html; charset=utf-8";
+                        let body = if request.starts_with("GET /download") {
+                            headers = "Content-Type: application/octet-stream\r\nContent-Disposition: attachment; filename=\"report.txt\"";
+                            "downloaded body"
+                        } else if request.starts_with("GET /frame") {
                             "<!doctype html><input aria-label='FrameInput'><div style='height:900px'></div>"
                         } else if request.starts_with("GET /second") {
                             "<!doctype html><title>Second</title><body><p aria-label='Second marker'>second</p></body>"
                         } else {
                             PAGE
                         };
-                        let response=format!("HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len());
+                        let response=format!("HTTP/1.1 200 OK\r\n{headers}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len());
                         let _ = stream.write_all(response.as_bytes());
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -601,6 +606,47 @@ fn uploads_reach_file_inputs_only_from_allowed_directories() {
     assert_eq!(refused.error.unwrap()["code"], "POLICY.DENIED");
     let _ = std::fs::remove_dir_all(&allowed);
     let _ = std::fs::remove_dir_all(&outside);
+}
+
+#[test]
+#[ignore = "requires isolated Chromium with its sandbox enabled; CI runs it explicitly"]
+fn downloads_land_in_the_session_directory_and_are_listed() {
+    let _serial = serial();
+    let fixture = Fixture::new();
+    let (session, backend) = session_for(&fixture);
+    let main = main_of(&session, &fixture.page_id);
+    assert!(wait_until(&session, &main, "Name", WaitCondition::Appears)
+        .error
+        .is_none());
+    let before = backend.downloads(Duration::from_secs(5)).unwrap();
+    assert_eq!(before["tracking"], true, "{before}");
+    assert_eq!(before["downloads"], json!([]));
+    let observed = observe(&session, &main);
+    let link = find(&session, &observed, "link", "Get report");
+    assert!(act(&session, link, Action::click()).error.is_none());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let item = loop {
+        let listed = backend.downloads(Duration::from_secs(5)).unwrap();
+        if let Some(done) = listed["downloads"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|d| d["state"] == "completed")
+        {
+            break done.clone();
+        }
+        assert!(Instant::now() < deadline, "no completed download: {listed}");
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    assert_eq!(item["suggested_filename"], "report.txt");
+    assert!(item["url"].as_str().unwrap().ends_with("/download"));
+    assert_eq!(item["received_bytes"], 15);
+    let saved = PathBuf::from(item["path"].as_str().unwrap());
+    assert!(saved.starts_with(before["directory"].as_str().unwrap()));
+    assert_eq!(std::fs::read_to_string(&saved).unwrap(), "downloaded body");
+    // The page itself stayed where it was.
+    assert_eq!(status(&observe(&session, &main)), "ready");
+    let _ = std::fs::remove_dir_all(before["directory"].as_str().unwrap());
 }
 
 fn only_dialog(observed: &Value) -> &Value {

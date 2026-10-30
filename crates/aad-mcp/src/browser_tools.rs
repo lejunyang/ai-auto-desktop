@@ -22,7 +22,11 @@ pub const NAMES: &[&str] = &[
     "browser_close",
     "browser_record_start",
     "browser_record_stop",
+    "browser_downloads",
 ];
+
+/// Browser tools that only read.
+pub const READ_ONLY: &[&str] = &["browser_profiles", "browser_downloads"];
 
 const BROWSERS: [&str; 3] = ["chrome", "edge", "brave"];
 
@@ -137,6 +141,16 @@ it lists.",
 evidence/network-streams.jsonl (WebSocket and event-stream messages) and screenshots.",
             schema: json!({"type": "object", "properties": {}, "additionalProperties": false}),
             mutating: true,
+        },
+        Tool {
+            name: "browser_downloads",
+            description: "List what the attached browser downloaded since this session \
+connected to it (control_targets connects): each download's guid, url, suggested \
+filename, state (in_progress, completed or canceled), bytes received and total, and the \
+path it was saved to. Downloads go to a directory of this session's own, given as \
+`directory`. Read-only; read the files from `path`.",
+            schema: json!({"type": "object", "properties": {}, "additionalProperties": false}),
+            mutating: false,
         },
     ]
 }
@@ -256,6 +270,17 @@ impl Browsers {
                 Ok(json!({"recording": true, "out": out}))
             }
             "browser_record_stop" => self.stop_recording(),
+            "browser_downloads" => session
+                .browser_downloads(std::time::Duration::from_secs(5))
+                .map_err(|e| {
+                    let mut payload = e.to_json();
+                    if payload["code"] == "BROWSER.NOT_CONNECTED" {
+                        payload["hint"] = json!(
+                            "Start one with browser_open, or start the server with --browser-port."
+                        );
+                    }
+                    payload
+                }),
             other => Err(refused(
                 "MCP.INVALID_ARGUMENT",
                 format!("unknown tool {other}"),

@@ -31,6 +31,111 @@ const MAIN_FRAME_ONLY: [&str; 10] = [
 /// How long a newly attached page may take to answer before it counts as blocked.
 const RESPONSIVE: Duration = Duration::from_secs(2);
 const DIALOG_OPENING: &str = "Page.javascriptDialogOpening";
+const DOWNLOAD_BEGIN: &str = "Browser.downloadWillBegin";
+const DOWNLOAD_PROGRESS: &str = "Browser.downloadProgress";
+/// Downloads remembered per session; the oldest are forgotten first.
+const MAX_DOWNLOADS: usize = 200;
+
+/// Downloads go to a directory of this session's own, and are tracked from
+/// the browser's events.
+#[derive(Default)]
+struct Downloads {
+    directory: Option<std::path::PathBuf>,
+    /// Why downloads could not be routed to the directory, if they could not.
+    failure: Option<String>,
+    items: Vec<Value>,
+}
+
+impl Downloads {
+    /// Route this browser's downloads into the session directory. A browser
+    /// that refuses still works; the answer then says why nothing is tracked.
+    fn configure(&mut self, client: &mut Client) {
+        let directory = self.directory.get_or_insert_with(|| {
+            std::env::temp_dir().join(format!("aad-downloads-{}", uuid::Uuid::new_v4()))
+        });
+        self.failure = std::fs::create_dir_all(&*directory)
+            .map_err(|e| e.to_string())
+            .and_then(|()| {
+                client
+                    .command(
+                        "Browser.setDownloadBehavior",
+                        json!({"behavior": "allow", "downloadPath": directory, "eventsEnabled": true}),
+                    )
+                    .map(|_| ())
+                    .map_err(|e| e.to_string())
+            })
+            .err();
+    }
+
+    fn track(&mut self, client: &Client) {
+        for event in client.drain_events().events {
+            self.apply(&event);
+        }
+    }
+
+    fn apply(&mut self, event: &Value) {
+        let params = &event["params"];
+        let Some(guid) = params["guid"].as_str() else {
+            return;
+        };
+        match event["method"].as_str() {
+            Some(DOWNLOAD_BEGIN) => {
+                if self.items.len() >= MAX_DOWNLOADS {
+                    self.items.remove(0);
+                }
+                self.items.push(json!({
+                    "guid": guid,
+                    "url": params["url"],
+                    "suggested_filename": params["suggestedFilename"],
+                    "state": "in_progress",
+                    "received_bytes": 0,
+                    "total_bytes": null,
+                    "path": null,
+                }));
+            }
+            Some(DOWNLOAD_PROGRESS) => {
+                let directory = self.directory.clone();
+                let Some(item) = self.items.iter_mut().find(|item| item["guid"] == guid) else {
+                    return;
+                };
+                item["received_bytes"] = params["receivedBytes"].clone();
+                if params["totalBytes"]
+                    .as_f64()
+                    .is_some_and(|total| total > 0.0)
+                {
+                    item["total_bytes"] = params["totalBytes"].clone();
+                }
+                item["state"] = json!(match params["state"].as_str() {
+                    Some("completed") => "completed",
+                    Some("canceled") => "canceled",
+                    _ => "in_progress",
+                });
+                if params["state"] == "completed" {
+                    // Newer browsers say where; otherwise the suggested name
+                    // in the directory, when that file is there.
+                    let path = params["filePath"]
+                        .as_str()
+                        .map(std::path::PathBuf::from)
+                        .or_else(|| {
+                            Some(directory?.join(item["suggested_filename"].as_str()?))
+                                .filter(|path| path.is_file())
+                        });
+                    item["path"] = json!(path);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn answer(&self) -> Value {
+        json!({
+            "directory": self.directory,
+            "tracking": self.failure.is_none() && self.directory.is_some(),
+            "failure": self.failure,
+            "downloads": self.items,
+        })
+    }
+}
 const DIALOG_CLOSED: &str = "Page.javascriptDialogClosed";
 
 struct Page {
@@ -118,8 +223,9 @@ pub struct BrowserBackend {
     /// The loopback CDP port; 0 until a browser is attached.
     port: AtomicU16,
     pages: Mutex<BTreeMap<String, Page>>,
-    /// The browser-level connection, for tabs; opened when first needed.
+    /// The browser-level connection, for tabs and downloads; opened when first needed.
     browser: Mutex<Option<Client>>,
+    downloads: Mutex<Downloads>,
     world: String,
     last_context: Mutex<Option<(String, i64)>>,
     closed: AtomicBool,
@@ -131,6 +237,7 @@ impl BrowserBackend {
             port: AtomicU16::new(port),
             pages: Mutex::new(BTreeMap::new()),
             browser: Mutex::new(None),
+            downloads: Mutex::new(Downloads::default()),
             world: format!("aad-control-{}", uuid::Uuid::new_v4()),
             last_context: Mutex::new(None),
             closed: AtomicBool::new(false),
@@ -283,15 +390,27 @@ impl BrowserBackend {
         let port = self.port()?;
         let mut slot = self.browser.lock().unwrap();
         if slot.is_none() {
-            *slot = Some(Client::browser_until(port, deadline).map_err(cdp_error)?);
+            let mut client = Client::browser_until(port, deadline).map_err(cdp_error)?;
+            client.filter_events(&[DOWNLOAD_BEGIN, DOWNLOAD_PROGRESS], &[]);
+            client.set_deadline(deadline);
+            self.downloads.lock().unwrap().configure(&mut client);
+            *slot = Some(client);
         }
         let client = slot.as_mut().unwrap();
         client.set_deadline(deadline);
         let result = f(client);
+        self.downloads.lock().unwrap().track(client);
         if result.is_err() {
             *slot = None;
         }
         result
+    }
+
+    /// What the browser downloaded since this session first connected to it:
+    /// each by guid, address, suggested name, state, bytes and saved path.
+    pub fn downloads(&self, timeout: Duration) -> Result<Value> {
+        self.with_browser(Instant::now() + timeout, |_| Ok(()))?;
+        Ok(self.downloads.lock().unwrap().answer())
     }
 
     /// Which page opened each page, by target id, as the browser reports it.
@@ -1052,6 +1171,43 @@ fn key_chord(keys: &[String]) -> Result<(String, String, u32, u32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn downloads_follow_the_browser_events_and_stay_bounded() {
+        let directory = std::env::temp_dir().join(format!("aad-dl-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join("report.txt"), "body").unwrap();
+        let mut downloads = Downloads {
+            directory: Some(directory.clone()),
+            ..Default::default()
+        };
+        downloads.apply(&json!({"method": DOWNLOAD_BEGIN, "params": {"guid": "g1",
+            "url": "http://127.0.0.1/download", "suggestedFilename": "report.txt"}}));
+        downloads.apply(
+            &json!({"method": DOWNLOAD_PROGRESS, "params": {"guid": "g1",
+            "receivedBytes": 2, "totalBytes": 4, "state": "inProgress"}}),
+        );
+        assert_eq!(downloads.items[0]["state"], "in_progress");
+        assert!(downloads.items[0]["path"].is_null());
+        downloads.apply(
+            &json!({"method": DOWNLOAD_PROGRESS, "params": {"guid": "g1",
+            "receivedBytes": 4, "totalBytes": 4, "state": "completed"}}),
+        );
+        let item = &downloads.answer()["downloads"][0];
+        assert_eq!(item["state"], "completed");
+        assert_eq!(item["received_bytes"], 4);
+        assert_eq!(item["path"], json!(directory.join("report.txt")));
+        // A progress event for an unknown download is ignored.
+        downloads.apply(
+            &json!({"method": DOWNLOAD_PROGRESS, "params": {"guid": "nope", "state": "completed"}}),
+        );
+        for n in 0..MAX_DOWNLOADS + 5 {
+            downloads
+                .apply(&json!({"method": DOWNLOAD_BEGIN, "params": {"guid": format!("x{n}")}}));
+        }
+        assert_eq!(downloads.items.len(), MAX_DOWNLOADS);
+        assert_ne!(downloads.items[0]["guid"], "g1");
+        std::fs::remove_dir_all(directory).unwrap();
+    }
     #[test]
     fn a_blocked_page_shows_only_its_dialog_and_offers_only_answers() {
         let dialog = json!({"dialog_id": "d1", "type": "prompt", "message": "Your name?",

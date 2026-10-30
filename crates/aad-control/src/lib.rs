@@ -262,6 +262,20 @@ impl Session {
         Ok(())
     }
 
+    /// What the attached browser downloaded into this session's directory. Read-only.
+    pub fn browser_downloads(&self, timeout: Duration) -> Result<Value> {
+        if self.closed.load(Ordering::SeqCst) {
+            return Err(error("CONTROL.SESSION_CLOSED", "session is closed"));
+        }
+        let browser = self.browser.as_ref().ok_or_else(|| {
+            error(
+                "BROWSER.NOT_CONNECTED",
+                "this session has no browser provider",
+            )
+        })?;
+        browser.downloads(timeout)
+    }
+
     /// The CDP port the browser provider works with, if one is attached.
     pub fn browser_port(&self) -> Option<u16> {
         self.browser.as_ref().and_then(|b| b.attached_port())

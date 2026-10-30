@@ -299,7 +299,7 @@ notifications/cancelled to request cancellation of an in-flight JSON-RPC request
             .as_ref()
             .expect("local tools need a local session");
         let writes = matches!(name, "save_workflow" | "run_workflow")
-            || (browser_tools::NAMES.contains(&name) && name != "browser_profiles");
+            || (browser_tools::NAMES.contains(&name) && !browser_tools::READ_ONLY.contains(&name));
         if writes && !self.allows_input() {
             return Ok(content(
                 &json!({
@@ -658,6 +658,30 @@ mod tests {
             assert!(is_error, "{name}");
             assert_eq!(payload["code"], "POLICY.DENIED", "{name}");
         }
+    }
+
+    #[test]
+    fn listing_downloads_is_read_only_and_says_when_no_browser_is_attached() {
+        let server = Server::without_driver("no desktop");
+        let listed = server.handle(&request("tools/list", json!({}))).unwrap();
+        let tool = listed["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == "browser_downloads")
+            .cloned()
+            .expect("offered on a local session");
+        assert_eq!(tool["inputSchema"]["additionalProperties"], false);
+        let response = server
+            .handle(&request(
+                "tools/call",
+                json!({"name": "browser_downloads", "arguments": {}}),
+            ))
+            .unwrap();
+        let (is_error, payload) = tool_payload(&response);
+        assert!(is_error);
+        // Not refused as a write on this read-only server: there is just no browser.
+        assert_eq!(payload["code"], "BROWSER.NOT_CONNECTED", "{payload}");
     }
 
     #[test]
