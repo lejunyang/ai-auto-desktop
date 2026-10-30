@@ -22,7 +22,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Sender};
 use std::time::{Duration, Instant};
 use windows::core::{implement, BSTR, PWSTR};
-use windows::Win32::Foundation::{CloseHandle, BOOL, HWND, LPARAM, MAX_PATH, RECT, TRUE};
+use windows::Win32::Foundation::{CloseHandle, BOOL, HWND, LPARAM, MAX_PATH, POINT, RECT, TRUE};
 use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_EXTENDED_FRAME_BOUNDS};
 use windows::Win32::Graphics::Gdi::{
     CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC, GetDIBits,
@@ -33,7 +33,8 @@ use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED,
 };
 use windows::Win32::System::Threading::{
-    OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_FORMAT, PROCESS_QUERY_LIMITED_INFORMATION,
+    AttachThreadInput, GetCurrentThreadId, OpenProcess, QueryFullProcessImageNameW,
+    PROCESS_NAME_FORMAT, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 use windows::Win32::UI::Accessibility::{
     CUIAutomation,
@@ -126,12 +127,12 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     VK_SHIFT, VK_SPACE, VK_TAB, VK_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    DispatchMessageW, EnumWindows, GetAncestor, GetClassNameW, GetForegroundWindow,
-    GetGUIThreadInfo, GetSystemMetrics, GetWindowRect, GetWindowTextLengthW, GetWindowTextW,
-    GetWindowThreadProcessId, IsIconic, IsWindowVisible, PeekMessageW, SendMessageW,
-    SetForegroundWindow, GA_ROOT, GUITHREADINFO, MSG, PM_REMOVE, PW_RENDERFULLCONTENT,
-    SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, WHEEL_DELTA,
-    WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS,
+    BringWindowToTop, DispatchMessageW, EnumWindows, GetAncestor, GetClassNameW,
+    GetForegroundWindow, GetGUIThreadInfo, GetSystemMetrics, GetWindowRect, GetWindowTextLengthW,
+    GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindowVisible, PeekMessageW,
+    SendMessageW, SetForegroundWindow, GA_ROOT, GUITHREADINFO, MSG, PM_REMOVE,
+    PW_RENDERFULLCONTENT, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
+    SM_YVIRTUALSCREEN, WHEEL_DELTA, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS,
 };
 
 /// Initialise COM on the calling thread.
@@ -628,9 +629,8 @@ impl Backend for WindowsUiaBackend {
 
         // Clicking a background window would deliver the click to whatever is
         // actually in front, so raise the target first.
-        unsafe {
-            let _ = SetForegroundWindow(handle);
-        }
+        bring_to_front(handle);
+        self.ensure_hits(window_id, node, (x, y))?;
 
         // The same normalisation every other gesture uses. This path used to
         // scale by the full width, which lands one pixel up/left of the point.
@@ -658,9 +658,8 @@ impl Backend for WindowsUiaBackend {
 
         // Same reasoning as pointer_click: a background window would misroute
         // the event, so raise the target first.
-        unsafe {
-            let _ = SetForegroundWindow(handle);
-        }
+        bring_to_front(handle);
+        self.ensure_hits(window_id, node, point)?;
         let absolute = to_absolute(point)?;
 
         if let Some(scroll) = gesture.scroll {
@@ -701,9 +700,9 @@ impl Backend for WindowsUiaBackend {
         let start = to_absolute(start_point)?;
         let end = to_absolute(end_point)?;
 
-        unsafe {
-            let _ = SetForegroundWindow(handle);
-        }
+        bring_to_front(handle);
+        self.ensure_hits(window_id, from, start_point)?;
+        self.ensure_hits(window_id, to, end_point)?;
         let (down, up) = button_events(gesture.button);
 
         // Press at the start, glide across in interpolated steps, release at the
@@ -1478,6 +1477,64 @@ impl WindowsUiaBackend {
         self.locate(window_id, node)?
             .ok_or_else(|| DriverError::stale("the element is no longer present in the window"))
     }
+
+    /// Refuse pointer input at `point` unless it would land on the element.
+    ///
+    /// Raising the window is best effort: Windows' foreground lock can refuse
+    /// it, and then another window -- or a dialog, menu or overlay of the same
+    /// application -- may cover the point. Sending the click anyway delivers
+    /// it to whatever is there, which may be another application entirely
+    /// (observed: a fixture click landed elsewhere after the foreground moved
+    /// on). So the point is hit-tested first: what UIA finds there must be the
+    /// element, something inside it, or a container of it (a label inside a
+    /// button is often not hit-testable itself), never something beside it.
+    fn ensure_hits(&self, window_id: &str, node: &Node, point: (i32, i32)) -> Result<()> {
+        let target = self.require(window_id, node)?;
+        let occluded = |what: &str| {
+            DriverError::new(
+                "DRIVER.OCCLUDED",
+                format!("pointer input would land on {what}, not on the observed element"),
+            )
+            .with_detail("node_id", serde_json::json!(node.node_id))
+        };
+        let Ok(hit) = (unsafe {
+            self.automation.ElementFromPoint(POINT {
+                x: point.0,
+                y: point.1,
+            })
+        }) else {
+            return Err(occluded("nothing UI Automation can identify"));
+        };
+        let walker = unsafe { self.automation.RawViewWalker() }
+            .map_err(|error| DriverError::unavailable(format!("no tree walker: {error}")))?;
+        let same = |a: &IUIAutomationElement, b: &IUIAutomationElement| {
+            unsafe { self.automation.CompareElements(a, b) }.is_ok_and(|same| same.as_bool())
+        };
+        // Is the hit the element or inside it?
+        let mut current = Some(hit.clone());
+        for _ in 0..CaptureLimits::MAX_DEPTH {
+            let Some(element) = current else { break };
+            if same(&element, &target) {
+                return Ok(());
+            }
+            current = unsafe { walker.GetParentElement(&element) }.ok();
+        }
+        // Is the hit a container of the element (but not the desktop itself)?
+        let desktop = unsafe { self.automation.GetRootElement() }.ok();
+        let mut current = unsafe { walker.GetParentElement(&target) }.ok();
+        for _ in 0..CaptureLimits::MAX_DEPTH {
+            let Some(element) = current else { break };
+            if desktop.as_ref().is_some_and(|root| same(&element, root)) {
+                break;
+            }
+            if same(&element, &hit) {
+                return Ok(());
+            }
+            current = unsafe { walker.GetParentElement(&element) }.ok();
+        }
+        // What covers it is not named: it may belong to another application.
+        Err(occluded("another element"))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1586,6 +1643,37 @@ fn describe_element(
         depth,
         parent_id,
         children: Vec::new(),
+    }
+}
+
+/// Make `handle` the foreground window, reporting whether it is.
+///
+/// `SetForegroundWindow` alone is refused by the foreground lock whenever this
+/// process did not receive the last input event -- for instance after another
+/// window closed and activation moved to some other application. Attaching to
+/// the foreground thread's input state for the duration of the call is the
+/// documented way a process that legitimately acts for the user hands focus
+/// over; it sends no input. It can still fail (another integrity level, a
+/// full-screen exclusive application), which the caller must handle.
+fn bring_to_front(handle: HWND) -> bool {
+    unsafe {
+        if GetForegroundWindow() == handle {
+            return true;
+        }
+        if SetForegroundWindow(handle).as_bool() && GetForegroundWindow() == handle {
+            return true;
+        }
+        let foreground = GetForegroundWindow();
+        let theirs = GetWindowThreadProcessId(foreground, None);
+        let ours = GetCurrentThreadId();
+        let attached =
+            theirs != 0 && theirs != ours && AttachThreadInput(ours, theirs, TRUE).as_bool();
+        let _ = BringWindowToTop(handle);
+        let _ = SetForegroundWindow(handle);
+        if attached {
+            let _ = AttachThreadInput(ours, theirs, BOOL(0));
+        }
+        GetForegroundWindow() == handle
     }
 }
 

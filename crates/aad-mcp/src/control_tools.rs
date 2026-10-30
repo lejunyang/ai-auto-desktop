@@ -403,8 +403,8 @@ or take the node_id from an outline."
         "CONTROL.VIEW_UNSUPPORTED" => {
             "Regions are computed for Windows windows only. Observe with view mode outline."
         }
-        "CONTROL.OCCLUDED" => {
-            "Something is laid over the element, such as a dialog, a banner or a menu, so pointer input would land on that instead. Observe again and deal with what covers it, or use a plain click (DOM activation) if that is enough."
+        "CONTROL.OCCLUDED" | "DRIVER.OCCLUDED" => {
+            "Something is laid over the element, such as a dialog, a banner or a menu, so pointer input would land on that instead; nothing was sent. Observe again and deal with what covers it, or use invoke (desktop) or a plain click (browser DOM activation), which do not depend on what is on top."
         }
         "DRIVER.PROTECTED_ELEMENT" => {
             "Password and other protected fields are never captured or read. Capture an \

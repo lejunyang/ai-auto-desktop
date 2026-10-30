@@ -24,7 +24,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     PostQuitMessage, RegisterClassExW, SetWindowTextW, ShowWindow, TranslateMessage, BN_CLICKED,
     CW_USEDEFAULT, ES_AUTOHSCROLL, ES_PASSWORD, HMENU, MSG, SHOW_WINDOW_CMD, WINDOW_EX_STYLE,
     WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_LBUTTONDOWN, WNDCLASSEXW, WS_BORDER,
-    WS_CHILD, WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE,
+    WS_CHILD, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_OVERLAPPEDWINDOW, WS_POPUP,
+    WS_TABSTOP, WS_VISIBLE,
 };
 
 const EDIT_ID: i32 = 1001;
@@ -493,8 +494,9 @@ unsafe extern "system" fn plain_window_proc(
 
 type WindowProc = unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT;
 
-/// Left-button presses the swatch received.
+/// Left-button presses the swatch and the cover window received.
 static SWATCH_CLICKS: AtomicUsize = AtomicUsize::new(0);
+static COVER_CLICKS: AtomicUsize = AtomicUsize::new(0);
 
 unsafe extern "system" fn swatch_window_proc(
     hwnd: HWND,
@@ -506,6 +508,63 @@ unsafe extern "system" fn swatch_window_proc(
         SWATCH_CLICKS.fetch_add(1, Ordering::SeqCst);
     }
     DefWindowProcW(hwnd, message, wparam, lparam)
+}
+
+unsafe extern "system" fn cover_window_proc(
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    match message {
+        WM_LBUTTONDOWN => {
+            COVER_CLICKS.fetch_add(1, Ordering::SeqCst);
+        }
+        WM_DESTROY => {
+            PostQuitMessage(0);
+            return LRESULT(0);
+        }
+        _ => {}
+    }
+    DefWindowProcW(hwnd, message, wparam, lparam)
+}
+
+/// A topmost, never-activated popup over a screen rectangle (physical pixels).
+unsafe fn create_cover(left: i32, top: i32, width: i32, height: i32) -> Result<HWND, String> {
+    let module = GetModuleHandleW(None).map_err(|error| error.to_string())?;
+    let instance = HINSTANCE(module.0);
+    let class_name = wide(&format!(
+        "AadCaptureCover_{}_{}",
+        std::process::id(),
+        uuid::Uuid::new_v4().simple()
+    ));
+    let class = WNDCLASSEXW {
+        cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+        lpfnWndProc: Some(cover_window_proc),
+        hInstance: instance,
+        hbrBackground: HBRUSH((COLOR_WINDOW.0 + 1) as usize as *mut std::ffi::c_void),
+        lpszClassName: PCWSTR(class_name.as_ptr()),
+        ..Default::default()
+    };
+    if RegisterClassExW(&class) == 0 {
+        return Err(windows::core::Error::from_win32().to_string());
+    }
+    let title = wide("AI Auto Desktop cover");
+    CreateWindowExW(
+        WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
+        PCWSTR(class_name.as_ptr()),
+        PCWSTR(title.as_ptr()),
+        WS_POPUP | WS_VISIBLE,
+        left,
+        top,
+        width,
+        height,
+        None,
+        None,
+        instance,
+        None,
+    )
+    .map_err(|error| error.to_string())
 }
 
 /// A top-level window holding a solid swatch and a password edit, on its own
@@ -718,6 +777,58 @@ fn a_capture_returns_the_pixels_the_element_shows() {
         capture(&driver, &swatch["target"]).unwrap_err(),
         "DRIVER.WINDOW_MINIMIZED"
     );
+}
+
+#[test]
+#[ignore = "requires an interactive Windows desktop; CI opts in explicitly"]
+fn a_click_on_a_covered_element_is_refused_and_sends_nothing() {
+    let driver = native_driver().expect("create native UIA driver");
+    let title = format!("AI Auto Desktop cover fixture {}", uuid::Uuid::new_v4());
+    let _fixture = start_swatch(title.clone(), false).expect("start swatch fixture");
+    let window_id = wait_for_window(&driver, &title);
+    let captured = wait_for_node(&driver, &window_id, "pane", SWATCH_NAME);
+    let swatch = find(
+        &driver,
+        &captured,
+        json!({"role": "pane", "name": SWATCH_NAME}),
+    );
+    let bounds = swatch["node"]["bounds"].clone();
+    let int = move |key: &str| bounds[key].as_i64().unwrap() as i32;
+    SWATCH_CLICKS.store(0, Ordering::SeqCst);
+    COVER_CLICKS.store(0, Ordering::SeqCst);
+
+    // Another (topmost) window over the swatch: the click must not go there.
+    let cover = spawn_window(move || unsafe {
+        create_cover(int("x"), int("y"), int("width"), int("height"))
+    })
+    .expect("start cover window");
+    thread::sleep(Duration::from_millis(200));
+    let refused = driver
+        .call("pointer_click", &json!({"target": swatch["target"]}))
+        .expect_err("a covered element must not be clicked");
+    assert_eq!(refused.code, "DRIVER.OCCLUDED");
+    assert_eq!(refused.effect, "not_applied");
+    thread::sleep(Duration::from_millis(200));
+    assert_eq!(COVER_CLICKS.load(Ordering::SeqCst), 0, "nothing was sent");
+    assert_eq!(SWATCH_CLICKS.load(Ordering::SeqCst), 0);
+
+    drop(cover);
+    thread::sleep(Duration::from_millis(200));
+    let captured = snapshot(&driver, &window_id);
+    let swatch = find(
+        &driver,
+        &captured,
+        json!({"role": "pane", "name": SWATCH_NAME}),
+    );
+    driver
+        .call("pointer_click", &json!({"target": swatch["target"]}))
+        .expect("the uncovered swatch is clicked");
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while SWATCH_CLICKS.load(Ordering::SeqCst) == 0 {
+        assert!(Instant::now() < deadline, "the swatch never saw the click");
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(COVER_CLICKS.load(Ordering::SeqCst), 0);
 }
 
 #[test]
