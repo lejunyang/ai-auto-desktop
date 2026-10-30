@@ -216,9 +216,14 @@ pub enum Action {
     CloseWindow {},
     /// Bring the window to the foreground, restoring it if minimized.
     Activate {},
+    /// Paste text through the clipboard into a focusable element, then put
+    /// the clipboard back as it was.
+    Paste {
+        text: String,
+    },
 }
 
-pub const ACTION_NAMES: [&str; 20] = [
+pub const ACTION_NAMES: [&str; 21] = [
     "focus",
     "invoke",
     "click",
@@ -239,6 +244,7 @@ pub const ACTION_NAMES: [&str; 20] = [
     "restore",
     "close_window",
     "activate",
+    "paste",
 ];
 
 /// Actions on the page as a whole, offered on its document node.
@@ -284,6 +290,7 @@ impl Action {
             Self::Restore {} => "restore",
             Self::CloseWindow {} => "close_window",
             Self::Activate {} => "activate",
+            Self::Paste { .. } => "paste",
         }
     }
     /// A left single click at the centre needs nothing beyond a plain click.
@@ -342,6 +349,12 @@ pub enum Operation {
         /// How long to wait for a window, at most the request's timeout.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         wait_ms: Option<u64>,
+    },
+    /// The clipboard's text, bounded. Read-only, but refused unless the server
+    /// operator granted it separately: the clipboard often holds secrets.
+    ClipboardRead {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_characters: Option<usize>,
     },
     Cancel {
         request_id: String,

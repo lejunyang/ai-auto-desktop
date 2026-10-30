@@ -81,7 +81,7 @@ pub struct Step {
     pub to: Option<Locator>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub check: Option<Check>,
-    /// For fill and type_text: take the text from this workflow input.
+    /// For fill, type_text and paste: take the text from this workflow input.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input: Option<Input>,
     /// What a person wrote about the step.
@@ -146,9 +146,9 @@ impl Step {
                     self.id
                 )));
             }
-            if self.input.is_some() && !matches!(name, "fill" | "type_text") {
+            if self.input.is_some() && !matches!(name, "fill" | "type_text" | "paste") {
                 return Err(invalid(format!(
-                    "step {}: only fill and type_text take an input",
+                    "step {}: only fill, type_text and paste take an input",
                     self.id
                 )));
             }

@@ -43,9 +43,15 @@ pub const WRITE_ACTIONS: &[&str] = &[
     "restore",
     "close_window",
     "activate",
+    "paste",
 ];
 
 const MAX_TYPE_TEXT_CHARS: usize = 1024;
+/// Clipboard text returned by default, and at most.
+const DEFAULT_CLIPBOARD_CHARS: usize = 16_384;
+const MAX_CLIPBOARD_CHARS: usize = 65_536;
+/// The most text one paste carries.
+const MAX_PASTE_CHARS: usize = 4_096;
 
 /// A chord is a handful of modifiers plus one key; anything longer is a caller
 /// error, not a combination any application listens for.
@@ -112,9 +118,10 @@ impl UiaDriver {
             "find" => self.find(&args),
             "capture" => self.capture_element(&args),
             "read_text" => self.read_text(&args),
+            "clipboard_read" => self.clipboard_read(&args),
             "focus" | "invoke" | "set_value" | "type_text" | "pointer_click" | "key_chord"
             | "pointer_gesture" | "drag" | "minimize" | "maximize" | "restore" | "close_window"
-            | "activate" => self.act(action, &args),
+            | "activate" | "paste" => self.act(action, &args),
             "watch" => self.watch(&args),
             "collect" => self.collect(&args),
             "release" => self.release(&args),
@@ -553,6 +560,27 @@ impl UiaDriver {
         }))
     }
 
+    /// The clipboard's text, bounded. Not anchored on any element: whether a
+    /// caller may read it at all is the host's policy, decided before this.
+    fn clipboard_read(&self, args: &Value) -> Result<Value> {
+        let max = match args.get("max_characters") {
+            None | Some(Value::Null) => DEFAULT_CLIPBOARD_CHARS,
+            Some(value) => value
+                .as_u64()
+                .filter(|max| (1..=MAX_CLIPBOARD_CHARS as u64).contains(max))
+                .ok_or_else(|| {
+                    DriverError::invalid(format!("max_characters must be 1..{MAX_CLIPBOARD_CHARS}"))
+                })? as usize,
+        };
+        let (text, total) = self.backend.clipboard_text(max)?;
+        Ok(json!({
+            "has_text": text.is_some(),
+            "text": text,
+            "characters": total,
+            "truncated": total > max,
+        }))
+    }
+
     fn act(&self, action: &str, args: &Value) -> Result<Value> {
         let target = args
             .get("target")
@@ -674,6 +702,30 @@ impl UiaDriver {
                 }
                 let gesture = parse_drag_gesture(args)?;
                 self.backend.drag(&window_id, &node, &to_node, &gesture)?
+            }
+            "paste" => {
+                let text = args
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| DriverError::invalid("text is required"))?;
+                if text.is_empty() || text.chars().count() > MAX_PASTE_CHARS {
+                    return Err(DriverError::invalid(format!(
+                        "paste takes 1..{MAX_PASTE_CHARS} characters"
+                    )));
+                }
+                if node.states.read_only == Some(true) || node.states.protected == Some(true) {
+                    return Err(DriverError::invalid(
+                        "the element is read-only or protected",
+                    ));
+                }
+                let pasted = self.backend.paste(&window_id, &node, text)?;
+                return Ok(json!({
+                    "applied": true,
+                    "action": action,
+                    "node_id": node.node_id,
+                    "window_id": window_id,
+                    "paste": pasted,
+                }));
             }
             "minimize" | "maximize" | "restore" | "close_window" | "activate" => {
                 // Only the window's own node stands for the window: a node
@@ -1106,6 +1158,16 @@ fn action_contracts() -> Map<String, Value> {
         "capture".into(),
         read_only("Take a PNG of one observed element, or of its whole window."),
     );
+    // Changes nothing, but sensitive: hosts gate it behind its own grant.
+    actions.insert(
+        "clipboard_read".into(),
+        json!({
+            "contract_major": 1,
+            "summary": "Read the clipboard's text, bounded.",
+            "effect": {"default_class": "read_only"},
+            "risk": {"category": "observe", "level": "high"},
+        }),
+    );
     actions.insert(
         "read_text".into(),
         read_only("Recognise the text one observed element shows, with Windows OCR."),
@@ -1228,6 +1290,15 @@ fn action_contracts() -> Map<String, Value> {
     ] {
         actions.insert(name.into(), write(summary, "navigate", "low", "idempotent"));
     }
+    actions.insert(
+        "paste".into(),
+        write(
+            "Paste text into an element through the clipboard, restoring the clipboard after.",
+            "input",
+            "medium",
+            "non_idempotent",
+        ),
+    );
     actions.insert(
         "close_window".into(),
         write(

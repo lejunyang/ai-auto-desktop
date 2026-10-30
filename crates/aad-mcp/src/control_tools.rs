@@ -128,6 +128,14 @@ fn action_schema() -> Value {
         variant("back", "Go back one page in the observed browser page's history.", json!({}), &[]),
         variant("forward", "Go forward one page in the observed browser page's history.", json!({}), &[]),
         variant("reload", "Reload the observed browser page.", json!({}), &[]),
+        variant("paste", "Paste text into a focusable text element through the clipboard: \
+    the clipboard briefly offers the text (marked to stay out of clipboard history, cloud sync \
+    and clipboard managers, which are refused if they ask), the element is focused, Ctrl+V \
+    is sent, and the clipboard is put back as it was. Use it where an application handles \
+    pasted text better than typed keys (rich editors, fields that filter keystrokes); prefer \
+    fill where offered. Never offered on password fields.", json!({
+            "text": {"type": "string", "minLength": 1, "maxLength": 4096}
+        }), &["text"]),
         variant("minimize", "Minimize the observed desktop window. Offered on the \
     window's own node (its root) when the window can be minimized and is not already.", json!({}), &[]),
         variant("maximize", "Maximize the observed desktop window. Offered on its root \
@@ -151,7 +159,7 @@ pub(crate) fn saved_action_schema() -> Value {
         // The text may come from the step's `input` instead.
         if matches!(
             variant["properties"]["type"]["const"].as_str(),
-            Some("fill" | "type_text")
+            Some("fill" | "type_text" | "paste")
         ) {
             variant["required"] = json!(["type"]);
         }
@@ -344,6 +352,19 @@ process (a launcher stub) is matched by its image name among new windows.",
             true,
         ),
         (
+            "clipboard_read",
+            "Read the desktop clipboard's text. Read-only, but offered only when the server \
+operator granted it (aad mcp --allow-clipboard-read): the clipboard often holds passwords \
+and private text. Content that its source marked as not for clipboard readers (password \
+managers do) is refused. Text only; at most max_characters are returned, with the full \
+length in `characters`.",
+            json!({
+                "max_characters": {"type": "integer", "minimum": 1, "maximum": 65536, "default": 16384}
+            }),
+            vec![],
+            false,
+        ),
+        (
             "control_cancel",
             "Request cancellation of an in-flight control request. If input was already \
 dispatched, its effect is unknown; cancellation never means rollback.",
@@ -386,6 +407,7 @@ cancellation of all in-flight work.",
 pub fn method(name: &str) -> Option<&str> {
     match name {
         "desktop_launch" => Some("launch"),
+        "clipboard_read" => Some("clipboard_read"),
         other => other.strip_prefix("control_"),
     }
 }
@@ -395,6 +417,7 @@ pub fn method(name: &str) -> Option<&str> {
 pub fn granted(name: &str, policy: &aad_control::Policy) -> bool {
     match name {
         "desktop_launch" => policy.allow_input && !policy.launch.is_empty(),
+        "clipboard_read" => policy.allow_clipboard_read,
         _ => true,
     }
 }
@@ -481,6 +504,28 @@ or take the node_id from an outline."
         "DRIVER.PROTECTED_ELEMENT" => {
             "Password and other protected fields are never captured or read. Capture an \
 element around it, or ask the person you are helping."
+        }
+        "DRIVER.CLIPBOARD_PROTECTED" => {
+            "What is on the clipboard was marked by its source (e.g. a password manager) as \
+not for clipboard readers. It is not read; ask the person you are helping if you need it."
+        }
+        "DRIVER.CLIPBOARD_BUSY" => {
+            "Another application held the clipboard open. Nothing was pasted or read; try \
+again shortly."
+        }
+        "DRIVER.CLIPBOARD_TOO_LARGE" => {
+            "The clipboard holds more than a paste can preserve, so nothing was pasted rather \
+than lose it. Use fill or type_text instead."
+        }
+        "DRIVER.PASTE_NOT_CONSUMED" => {
+            "Ctrl+V reached the element but it never asked for the text, so it does not \
+paste plain text (or used the shortcut for something else). Observe to see what happened, \
+then use fill or type_text. The clipboard was put back."
+        }
+        "DRIVER.FOCUS_LOST" => {
+            "The element's window could not be brought to the keyboard, so no key was sent \
+(it would have gone to another application). Use activate on the window's node, observe \
+again and retry, or prefer fill, which needs no focus."
         }
         "DRIVER.ACTIVATION_REFUSED" => {
             "Windows' foreground lock kept this window from coming forward. Actions that do \

@@ -52,6 +52,7 @@ impl NativeBackend {
             "restore" => "restore",
             "close_window" => "close_window",
             "activate" => "activate",
+            "paste" => "paste",
             _ => "",
         }
     }
@@ -112,6 +113,19 @@ impl Backend for NativeBackend {
             answer.insert(key.into(), shot[key].clone());
         }
         Ok(Value::Object(answer))
+    }
+    fn clipboard_read(&self, max_characters: Option<usize>, timeout: Duration) -> Result<Value> {
+        if !matches!(self.flavor, Flavor::Windows) || !self.offers("clipboard_read") {
+            return Err(error(
+                "CONTROL.ACTION_UNSUPPORTED",
+                "this provider cannot read the clipboard",
+            ));
+        }
+        let mut args = json!({});
+        if let Some(max) = max_characters {
+            args["max_characters"] = json!(max);
+        }
+        self.invoke("clipboard_read", args, timeout)
     }
     fn read_text(
         &self,
@@ -361,6 +375,7 @@ impl Backend for NativeBackend {
                 }
             }
             Action::Key { keys } => set("keys", json!(keys)),
+            Action::Paste { text } => set("text", json!(text)),
             Action::Click {
                 button,
                 count,

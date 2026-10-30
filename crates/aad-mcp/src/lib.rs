@@ -586,7 +586,7 @@ mod tests {
         let tools = response["result"]["tools"].as_array().unwrap();
 
         // Everything but the tools whose extra grant this server lacks.
-        let ungranted = ["desktop_launch"];
+        let ungranted = ["desktop_launch", "clipboard_read"];
         assert_eq!(tools.len(), tools::catalogue().len() - ungranted.len());
         let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
         assert!(names.contains(&"control_observe"));

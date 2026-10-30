@@ -135,7 +135,10 @@ fn a_launched_program_answers_its_window_which_can_be_observed_captured_and_clos
         launch: [program.clone()].into(),
         ..Default::default()
     });
-    assert_eq!(code(run(&read_only, launch(&program), 5_000)), "POLICY.DENIED");
+    assert_eq!(
+        code(run(&read_only, launch(&program), 5_000)),
+        "POLICY.DENIED"
+    );
     assert!(data(run(&read_only, Operation::Capabilities {}, 5_000))
         .get("launch")
         .is_none());
@@ -143,7 +146,10 @@ fn a_launched_program_answers_its_window_which_can_be_observed_captured_and_clos
         allow_input: true,
         ..Default::default()
     });
-    assert_eq!(code(run(&unlisted, launch(&program), 5_000)), "POLICY.DENIED");
+    assert_eq!(
+        code(run(&unlisted, launch(&program), 5_000)),
+        "POLICY.DENIED"
+    );
     // A shell is refused even when the operator allowlisted it.
     let shell = Session::native(Policy {
         allow_input: true,
@@ -215,7 +221,10 @@ fn a_launched_program_answers_its_window_which_can_be_observed_captured_and_clos
         },
         10_000,
     ));
-    assert_eq!(closed["backend_result"]["window"]["closed"], true, "{closed}");
+    assert_eq!(
+        closed["backend_result"]["window"]["closed"], true,
+        "{closed}"
+    );
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let targets = data(run(&session, Operation::Targets {}, 10_000));

@@ -46,6 +46,8 @@ windows = { version = "0.58", features = [
     "Win32_UI_HiDpi",
     "Win32_Storage_Xps",
     "Win32_Graphics_Dwm",
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
     # Windows' built-in OCR for control_read_text.
     "Foundation",
     "Foundation_Collections",

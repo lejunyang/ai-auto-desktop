@@ -454,3 +454,71 @@ fn a_provider_without_ocr_refuses_to_read_text() {
     );
     assert_eq!(refused.error.unwrap()["code"], "CONTROL.ACTION_UNSUPPORTED");
 }
+
+#[test]
+fn the_clipboard_is_read_only_with_its_own_grant() {
+    struct Clipboard;
+    impl Backend for Clipboard {
+        fn name(&self) -> &str {
+            "fixture"
+        }
+        fn capabilities(&self) -> Vec<String> {
+            vec!["paste".into()]
+        }
+        fn clipboard_read(&self, max: Option<usize>, _: Duration) -> Result<Value> {
+            Ok(
+                json!({"has_text": true, "text": "copied", "characters": 6, "truncated": max == Some(1)}),
+            )
+        }
+        fn resources(&self, _: Duration) -> Result<Vec<BackendResource>> {
+            Ok(Vec::new())
+        }
+        fn observe(&self, _: &Value, _: usize, _: Duration) -> Result<Value> {
+            unreachable!()
+        }
+        fn act(&self, _: &Value, _: &Value, _: &Action, _: &Context) -> Result<Value> {
+            unreachable!()
+        }
+    }
+    let read = Operation::ClipboardRead {
+        max_characters: None,
+    };
+    // Input alone does not grant it, and it is not advertised without the grant.
+    let input_only = Session::new(
+        vec![Arc::new(Clipboard)],
+        Policy {
+            allow_input: true,
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        call(&input_only, read.clone()).error.unwrap()["code"],
+        "POLICY.DENIED"
+    );
+    assert!(call(&input_only, Operation::Capabilities {})
+        .data
+        .unwrap()
+        .get("clipboard_read")
+        .is_none());
+    let granted = Session::new(
+        vec![Arc::new(Clipboard)],
+        Policy {
+            allow_clipboard_read: true,
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        call(&granted, Operation::Capabilities {}).data.unwrap()["clipboard_read"],
+        true
+    );
+    let answer = call(&granted, read);
+    assert_eq!(answer.commit_state, CommitState::NotCommitted);
+    assert_eq!(answer.data.unwrap()["text"], "copied");
+    let bounded = call(
+        &granted,
+        Operation::ClipboardRead {
+            max_characters: Some(0),
+        },
+    );
+    assert_eq!(bounded.error.unwrap()["code"], "CONTROL.INVALID_REQUEST");
+}

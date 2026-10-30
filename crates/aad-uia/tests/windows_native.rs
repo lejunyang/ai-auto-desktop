@@ -163,7 +163,11 @@ fn run_fixture(
 unsafe fn create_fixture(title: &str) -> Result<HWND, String> {
     let module = GetModuleHandleW(None).map_err(|error| error.to_string())?;
     let instance = HINSTANCE(module.0);
-    let class_name = wide(&format!("AiAutoDesktopRustFixture_{}", std::process::id()));
+    let class_name = wide(&format!(
+        "AiAutoDesktopRustFixture_{}_{}",
+        std::process::id(),
+        uuid::Uuid::new_v4().simple()
+    ));
     let class = WNDCLASSEXW {
         cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
         lpfnWndProc: Some(fixture_window_proc),
@@ -896,6 +900,59 @@ fn a_click_on_a_covered_element_is_refused_and_sends_nothing() {
         thread::sleep(Duration::from_millis(20));
     }
     assert_eq!(COVER_CLICKS.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+#[ignore = "requires an interactive Windows desktop; uses and restores the clipboard"]
+fn a_paste_lands_in_the_element_and_leaves_the_clipboard_as_it_was() {
+    let driver = native_driver().expect("create native UIA driver");
+    let title = format!("AI Auto Desktop paste fixture {}", uuid::Uuid::new_v4());
+    let _fixture = Fixture::start(title.clone()).expect("start Win32 fixture");
+    let window_id = wait_for_window(&driver, &title);
+    let before = driver
+        .call("clipboard_read", &json!({}))
+        .expect("read the clipboard");
+
+    let captured = snapshot(&driver, &window_id);
+    let edit = find(&driver, &captured, json!({"role": "edit"}));
+    assert!(edit["node"]["actions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|a| a == "paste"));
+    driver
+        .call("set_value", &json!({"target": edit["target"], "value": ""}))
+        .expect("clear the edit");
+    let captured = wait_for_value(&driver, &window_id, "");
+    let edit = find(&driver, &captured, json!({"role": "edit"}));
+    let text = "Pasted 粘贴 text";
+    let pasted = driver
+        .call("paste", &json!({"target": edit["target"], "text": text}))
+        .expect("paste into the edit");
+    assert_eq!(pasted["paste"]["consumed"], true, "{pasted}");
+    assert_eq!(pasted["paste"]["clipboard_restored"], true, "{pasted}");
+    // A classic edit is told to paste by message, not by a keystroke.
+    assert_eq!(pasted["paste"]["via"], "wm_paste", "{pasted}");
+    wait_for_value(&driver, &window_id, text);
+
+    // Whatever the person had copied is back, not the pasted text.
+    let after = driver
+        .call("clipboard_read", &json!({}))
+        .expect("read the clipboard again");
+    assert_eq!(after["text"], before["text"]);
+    assert_eq!(after["has_text"], before["has_text"]);
+    assert_ne!(after["text"], text);
+
+    // Reading is bounded.
+    let short = driver
+        .call("clipboard_read", &json!({"max_characters": 1}))
+        .expect("bounded read");
+    assert!(short["text"]
+        .as_str()
+        .is_none_or(|t| t.chars().count() <= 1));
+    assert!(driver
+        .call("clipboard_read", &json!({"max_characters": 0}))
+        .is_err());
 }
 
 fn root_target(captured: &Value) -> (Value, Vec<String>) {

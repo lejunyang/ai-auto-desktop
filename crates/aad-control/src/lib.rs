@@ -78,6 +78,14 @@ pub trait Backend: Send + Sync {
             "this provider cannot read text from pixels",
         ))
     }
+    /// The desktop clipboard's text: `{"has_text", "text", "characters",
+    /// "truncated"}`. Not anchored; the session checks its own grant first.
+    fn clipboard_read(&self, _max_characters: Option<usize>, _timeout: Duration) -> Result<Value> {
+        Err(error(
+            "CONTROL.ACTION_UNSUPPORTED",
+            "this provider cannot read the clipboard",
+        ))
+    }
     fn resources(&self, timeout: Duration) -> Result<Vec<BackendResource>>;
     fn observe(&self, selector: &Value, max_nodes: usize, timeout: Duration) -> Result<Value>;
     /// Shape a retained snapshot for the caller. `None` uses the portable
@@ -117,6 +125,9 @@ pub struct Policy {
     /// path or a bare name on PATH). Empty: launching is refused. Needs
     /// `allow_input` as well.
     pub launch: BTreeSet<String>,
+    /// Whether `clipboard_read` may return the clipboard's text. Separate from
+    /// input and off by default: the clipboard often holds secrets.
+    pub allow_clipboard_read: bool,
 }
 
 #[derive(Clone)]
@@ -848,6 +859,39 @@ impl Session {
                 args,
                 wait_ms,
             } => self.launch(program, args, *wait_ms, context),
+            Operation::ClipboardRead { max_characters } => {
+                if !self.policy.allow_clipboard_read {
+                    return Err(error(
+                        "POLICY.DENIED",
+                        "reading the clipboard was not granted by the server operator",
+                    ));
+                }
+                if max_characters.is_some_and(|max| max == 0 || max > 65_536) {
+                    return Err(error(
+                        "CONTROL.INVALID_REQUEST",
+                        "max_characters must be in 1..65536",
+                    ));
+                }
+                let mut last = error(
+                    "CONTROL.ACTION_UNSUPPORTED",
+                    "no provider in this session can read the clipboard",
+                );
+                for backend in self
+                    .backends
+                    .values()
+                    .filter(|b| b.name() != browser::PROVIDER && self.allowed_provider(b.name()))
+                {
+                    match backend.clipboard_read(*max_characters, context.remaining()?) {
+                        Ok(mut read) => {
+                            read["provider"] = json!(backend.name());
+                            return Ok(read);
+                        }
+                        Err(e) if e.code == "CONTROL.ACTION_UNSUPPORTED" => last = e,
+                        Err(e) => return Err(e),
+                    }
+                }
+                Err(last)
+            }
             Operation::Cancel { .. } | Operation::Close {} => unreachable!(),
         }
     }
@@ -858,6 +902,9 @@ impl Session {
     fn with_grants(&self, mut answer: Value) -> Value {
         if self.policy.allow_input && !self.policy.launch.is_empty() {
             answer["launch"] = json!(self.policy.launch);
+        }
+        if self.policy.allow_clipboard_read {
+            answer["clipboard_read"] = json!(true);
         }
         answer
     }
@@ -1084,6 +1131,7 @@ fn validate_action(action: &Action) -> Result<()> {
     let text = match action {
         Action::Fill { value } => Some(value),
         Action::TypeText { text, .. } => Some(text),
+        Action::Paste { text } => Some(text),
         Action::Select { option } => Some(option),
         _ => None,
     };
@@ -1106,6 +1154,9 @@ fn validate_action(action: &Action) -> Result<()> {
             "CONTROL.INVALID_REQUEST",
             "input text must be bounded and contain no NUL",
         ));
+    }
+    if matches!(action, Action::Paste { text } if text.is_empty()) {
+        return Err(error("CONTROL.INVALID_REQUEST", "paste needs some text"));
     }
     if let Action::Key { keys } = action {
         if keys.is_empty() || keys.len() > 6 || keys.iter().any(|s| s.is_empty() || s.len() > 32) {

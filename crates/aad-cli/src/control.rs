@@ -26,6 +26,10 @@ pub struct Grants {
         requires = "allow_input"
     )]
     allow_launch: Vec<String>,
+    /// Let clipboard_read return the clipboard's text. Off by default: the
+    /// clipboard often holds passwords and private text.
+    #[arg(long)]
+    allow_clipboard_read: bool,
 }
 impl Grants {
     fn policy(&self, allow_input: bool) -> Policy {
@@ -38,6 +42,7 @@ impl Grants {
                 Some(self.resources.iter().cloned().collect::<BTreeSet<_>>())
             },
             launch: self.allow_launch.iter().cloned().collect(),
+            allow_clipboard_read: self.allow_clipboard_read,
         }
     }
     /// Whether any grant was given that only the remote server may hold.
@@ -46,6 +51,7 @@ impl Grants {
             || !self.resources.is_empty()
             || self.browser_port.is_some()
             || !self.allow_launch.is_empty()
+            || self.allow_clipboard_read
     }
 }
 

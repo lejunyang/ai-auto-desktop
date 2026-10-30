@@ -336,6 +336,26 @@ pub trait Backend: Send + Sync {
         ))
     }
 
+    /// The clipboard's text, at most `max_chars` characters of it, with the
+    /// full length. `None` when the clipboard holds no text. Content that its
+    /// source marked as excluded from clipboard monitors (password managers do)
+    /// is refused rather than read.
+    fn clipboard_text(&self, _max_chars: usize) -> Result<(Option<String>, usize)> {
+        Err(DriverError::new(
+            "DRIVER.ACTION_UNSUPPORTED",
+            "reading the clipboard is not implemented on this platform yet",
+        ))
+    }
+
+    /// Paste `text` into the element through the clipboard (focus, Ctrl+V),
+    /// leaving the clipboard as it was. Answers whether the element took it.
+    fn paste(&self, _window_id: &str, _node: &Node, _text: &str) -> Result<serde_json::Value> {
+        Err(DriverError::new(
+            "DRIVER.ACTION_UNSUPPORTED",
+            "pasting is not implemented on this platform yet",
+        ))
+    }
+
     /// Recognise the text an image shows, with the platform's own OCR.
     /// `language` is a BCP-47 tag; `None` takes the user's languages.
     fn recognize_text(&self, _pixels: &Pixels, _language: Option<&str>) -> Result<Recognition> {
