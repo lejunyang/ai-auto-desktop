@@ -147,8 +147,10 @@ evidence/network-streams.jsonl (WebSocket and event-stream messages) and screens
             description: "List what the attached browser downloaded since this session \
 connected to it (control_targets connects): each download's guid, url, suggested \
 filename, state (in_progress, completed or canceled), bytes received and total, and the \
-path it was saved to. Downloads go to a directory of this session's own, given as \
-`directory`. Read-only; read the files from `path`.",
+path it was saved to. Only for a browser browser_open started: its downloads go to a \
+directory of this session's own, given as `directory`. A browser attached by port keeps \
+its own download setting, and the answer says tracking: false with the reason. \
+Read-only; read the files from `path`.",
             schema: json!({"type": "object", "properties": {}, "additionalProperties": false}),
             mutating: false,
         },
@@ -239,6 +241,7 @@ impl Browsers {
             "browser_open" => self.open(session, arguments),
             "browser_close" => {
                 let recording = self.stop_recording().ok();
+                session.release_browser_downloads();
                 let closed = self.opened.lock().unwrap().take().is_some();
                 Ok(json!({"closed": closed, "recording": recording}))
             }
@@ -328,6 +331,7 @@ impl Browsers {
         };
         // One browser per server: the session works with one at a time.
         let _ = self.stop_recording();
+        session.release_browser_downloads();
         self.opened.lock().unwrap().take();
         let started = Browser::start(launch::Options {
             browser: browser.clone(),
@@ -346,7 +350,7 @@ impl Browsers {
             )
         })?;
         session
-            .attach_browser(started.port)
+            .attach_launched_browser(started.port)
             .map_err(|e| e.to_json())?;
         let mut answer = json!({
             "browser": browser,

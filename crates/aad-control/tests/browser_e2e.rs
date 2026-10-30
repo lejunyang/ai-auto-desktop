@@ -613,7 +613,28 @@ fn uploads_reach_file_inputs_only_from_allowed_directories() {
 fn downloads_land_in_the_session_directory_and_are_listed() {
     let _serial = serial();
     let fixture = Fixture::new();
-    let (session, backend) = session_for(&fixture);
+    // A browser attached by port is somebody's own: its downloads stay put.
+    {
+        let (session, backend) = session_for(&fixture);
+        targets(&session);
+        let attached = backend.downloads(Duration::from_secs(5)).unwrap();
+        assert_eq!(attached["tracking"], false, "{attached}");
+        assert_eq!(
+            attached["reason"],
+            "attached browser: downloads are not redirected"
+        );
+    }
+    // The fixture launched this one, so the session routes its downloads.
+    // Chromium resets the download setting when any browser-level DevTools
+    // client goes away, here the one above; the session sets it again.
+    let backend = Arc::new(BrowserBackend::launched(fixture.port));
+    let session = Session::new(
+        vec![backend.clone()],
+        Policy {
+            allow_input: true,
+            ..Default::default()
+        },
+    );
     let main = main_of(&session, &fixture.page_id);
     assert!(wait_until(&session, &main, "Name", WaitCondition::Appears)
         .error
@@ -646,6 +667,11 @@ fn downloads_land_in_the_session_directory_and_are_listed() {
     assert_eq!(std::fs::read_to_string(&saved).unwrap(), "downloaded body");
     // The page itself stayed where it was.
     assert_eq!(status(&observe(&session, &main)), "ready");
+    // Releasing hands the browser its own setting back; nothing is routed after.
+    backend.release_downloads();
+    let released = backend.downloads(Duration::from_secs(5)).unwrap();
+    assert_eq!(released["tracking"], false, "{released}");
+    assert_eq!(released["downloads"].as_array().unwrap().len(), 1);
     let _ = std::fs::remove_dir_all(before["directory"].as_str().unwrap());
 }
 

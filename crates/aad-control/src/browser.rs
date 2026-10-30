@@ -37,9 +37,16 @@ const DOWNLOAD_PROGRESS: &str = "Browser.downloadProgress";
 const MAX_DOWNLOADS: usize = 200;
 
 /// Downloads go to a directory of this session's own, and are tracked from
-/// the browser's events.
+/// the browser's events -- only for a browser this server launched. A
+/// person's own browser, attached by port, keeps its download settings.
 #[derive(Default)]
 struct Downloads {
+    /// Whether the attached browser is one this server launched.
+    launched: bool,
+    /// Whether the current browser connection redirected downloads.
+    routed: bool,
+    /// Downloads were handed back, as the session or the browser closes.
+    released: bool,
     directory: Option<std::path::PathBuf>,
     /// Why downloads could not be routed to the directory, if they could not.
     failure: Option<String>,
@@ -50,6 +57,9 @@ impl Downloads {
     /// Route this browser's downloads into the session directory. A browser
     /// that refuses still works; the answer then says why nothing is tracked.
     fn configure(&mut self, client: &mut Client) {
+        if !self.launched || self.released {
+            return;
+        }
         let directory = self.directory.get_or_insert_with(|| {
             std::env::temp_dir().join(format!("aad-downloads-{}", uuid::Uuid::new_v4()))
         });
@@ -65,6 +75,21 @@ impl Downloads {
                     .map_err(|e| e.to_string())
             })
             .err();
+        self.routed = self.failure.is_none();
+    }
+
+    /// Hand downloads back to the browser's own setting. Best effort: the
+    /// browser may already be gone.
+    fn reset(&mut self, client: &mut Client) {
+        self.released = self.launched;
+        if self.routed {
+            client.set_deadline(Instant::now() + Duration::from_secs(1));
+            let _ = client.command(
+                "Browser.setDownloadBehavior",
+                json!({"behavior": "default", "eventsEnabled": false}),
+            );
+            self.routed = false;
+        }
     }
 
     fn track(&mut self, client: &Client) {
@@ -128,10 +153,17 @@ impl Downloads {
     }
 
     fn answer(&self) -> Value {
+        let reason = if !self.launched {
+            Some("attached browser: downloads are not redirected".to_string())
+        } else if self.released {
+            Some("downloads were handed back to the browser's own setting".to_string())
+        } else {
+            self.failure.clone()
+        };
         json!({
             "directory": self.directory,
-            "tracking": self.failure.is_none() && self.directory.is_some(),
-            "failure": self.failure,
+            "tracking": self.launched && self.routed && !self.released,
+            "reason": reason,
             "downloads": self.items,
         })
     }
@@ -244,8 +276,41 @@ impl BrowserBackend {
         }
     }
 
-    /// Work with the browser on `port` from now on, e.g. one this session started.
+    /// A provider for a browser this server launched on `port`: its
+    /// downloads go to the session's directory and are listed.
+    pub fn launched(port: u16) -> Self {
+        let backend = Self::new(port);
+        backend.downloads.lock().unwrap().launched = true;
+        backend
+    }
+
+    /// Work with a browser someone else started on `port` from now on. Its
+    /// download settings are left alone.
     pub fn attach(&self, port: u16) {
+        self.switch(port, false);
+    }
+
+    /// Work with a browser this server launched on `port` from now on.
+    pub fn attach_launched(&self, port: u16) {
+        self.switch(port, true);
+    }
+
+    /// Give the current launched browser its own download setting back.
+    pub fn release_downloads(&self) {
+        if let Ok(mut slot) = self.browser.try_lock() {
+            if let Some(client) = slot.as_mut() {
+                self.downloads.lock().unwrap().reset(client);
+            }
+        }
+    }
+
+    fn switch(&self, port: u16, launched: bool) {
+        self.release_downloads();
+        {
+            let mut downloads = self.downloads.lock().unwrap();
+            downloads.launched = launched;
+            downloads.released = false;
+        }
         self.pages.lock().unwrap().clear();
         *self.browser.lock().unwrap() = None;
         *self.last_context.lock().unwrap() = None;
@@ -390,13 +455,15 @@ impl BrowserBackend {
         let port = self.port()?;
         let mut slot = self.browser.lock().unwrap();
         if slot.is_none() {
-            let mut client = Client::browser_until(port, deadline).map_err(cdp_error)?;
+            let client = Client::browser_until(port, deadline).map_err(cdp_error)?;
             client.filter_events(&[DOWNLOAD_BEGIN, DOWNLOAD_PROGRESS], &[]);
-            client.set_deadline(deadline);
-            self.downloads.lock().unwrap().configure(&mut client);
             *slot = Some(client);
         }
         let client = slot.as_mut().unwrap();
+        client.set_deadline(deadline);
+        // Chromium drops the download setting whenever any browser-level
+        // DevTools client detaches, so a launched browser gets it every time.
+        self.downloads.lock().unwrap().configure(client);
         client.set_deadline(deadline);
         let result = f(client);
         self.downloads.lock().unwrap().track(client);
@@ -534,6 +601,7 @@ fn current_frame(client: &mut Client, frame_id: &str) -> Result<Value> {
 
 impl Backend for BrowserBackend {
     fn close(&self) {
+        self.release_downloads();
         self.closed.store(true, Ordering::SeqCst);
         if let Ok(mut pages) = self.pages.try_lock() {
             self.clear_context(&mut pages, Instant::now() + Duration::from_millis(100));
@@ -710,6 +778,10 @@ impl Backend for BrowserBackend {
                 "CONTROL.ACTION_UNSUPPORTED",
                 "trusted pointer input is supported only for the main frame",
             ));
+        }
+        if self.downloads.lock().unwrap().launched {
+            // A click may start a download: make sure it lands in the session directory.
+            let _ = self.with_browser(Instant::now() + action_context.remaining()?, |_| Ok(()));
         }
         if matches!(action, Action::Accept { .. } | Action::Dismiss {}) {
             return self.answer_dialog(snapshot, action, action_context);
@@ -1177,9 +1249,18 @@ mod tests {
         std::fs::create_dir_all(&directory).unwrap();
         std::fs::write(directory.join("report.txt"), "body").unwrap();
         let mut downloads = Downloads {
+            launched: true,
+            routed: true,
             directory: Some(directory.clone()),
             ..Default::default()
         };
+        assert_eq!(downloads.answer()["tracking"], true);
+        let attached = Downloads::default();
+        assert_eq!(attached.answer()["tracking"], false);
+        assert_eq!(
+            attached.answer()["reason"],
+            "attached browser: downloads are not redirected"
+        );
         downloads.apply(&json!({"method": DOWNLOAD_BEGIN, "params": {"guid": "g1",
             "url": "http://127.0.0.1/download", "suggestedFilename": "report.txt"}}));
         downloads.apply(

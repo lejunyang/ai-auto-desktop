@@ -61,13 +61,18 @@ JavaScript 对话框（alert/confirm/prompt/beforeunload）：会话连接每个
 
 下载：浏览器级连接建立时（第一次 `targets` 或标签页动作）用 `Browser.setDownloadBehavior`（`allow`，`eventsEnabled`）
 把下载放进本会话专用的临时目录 `aad-downloads-<uuid>`，并只缓冲 `Browser.downloadWillBegin/downloadProgress` 事件。
-MCP `browser_downloads`（只读，`--allow-input` 不需要）列出 `directory`、`tracking`（目录是否设置成功，失败原因在 `failure`）
+MCP `browser_downloads`（只读，`--allow-input` 不需要）列出 `directory`、`tracking`（是否正在把下载放进该目录，否则原因在 `reason`）
 和每个下载的 `guid`、`url`、`suggested_filename`、`state`（in_progress/completed/canceled）、`received_bytes`、`total_bytes`、
 `path`（浏览器报告的 `filePath`，没有时取目录下的建议文件名）；最多记住最近 200 个。文件在会话结束后保留。
-注意：连接的是用户自己的浏览器（`--browser-port`）时，这个设置同样会把它的下载改到该目录，直到连接断开。
+只对本服务启动的浏览器（`browser_open`）这样做：经 `--browser-port` 等方式连上的用户自己的浏览器不调用
+`setDownloadBehavior`，下载设置保持原样，`browser_downloads` 回答 `tracking: false`、
+`reason: "attached browser: downloads are not redirected"`。`browser_close`、再次 `browser_open` 和会话关闭时，
+先尽力把启动的浏览器恢复为 `behavior: "default"`，之后 `tracking: false` 并说明已交还。
+实测 Chromium 在任何浏览器级 DevTools 客户端断开时都会清掉这个设置（连已断开的那个客户端从没设置过也一样），
+所以对启动的浏览器，会话在每次用浏览器级连接和每次 act 之前重新设置一次。
 实测（Windows，本机 Chrome headless，`downloads_land_in_the_session_directory_and_are_listed`）：点击带
 `Content-Disposition: attachment` 的链接后列表出现 completed 的 `report.txt`，路径在会话目录下，内容与服务端一致。
-[待验证] 有界面浏览器与 Edge 的下载行为；连接断开后浏览器是否恢复原下载设置未单独验证。
+[待验证] 有界面浏览器与 Edge 的下载行为；恢复为 default 后浏览器的实际下载位置未单独验证（测试只核对会话不再路由）。
 
 动作参数：`click` 可带 `button`（left/right/middle）、`count`（1/2）、`fraction`；`type_text` 可带
 `mode`（unicode/keys）；`scroll` 要 `direction`，可带 `notches`（1..30）、`fraction`；`hover` 可带

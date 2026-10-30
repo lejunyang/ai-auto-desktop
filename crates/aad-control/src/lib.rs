@@ -262,6 +262,24 @@ impl Session {
         Ok(())
     }
 
+    /// Point the browser provider at a browser this server launched on `port`:
+    /// unlike [`Session::attach_browser`], its downloads are redirected to the
+    /// session's directory and tracked.
+    pub fn attach_launched_browser(&self, port: u16) -> Result<()> {
+        self.attach_browser(port)?;
+        if let Some(browser) = &self.browser {
+            browser.attach_launched(port);
+        }
+        Ok(())
+    }
+
+    /// Give a launched browser its own download setting back, e.g. before closing it.
+    pub fn release_browser_downloads(&self) {
+        if let Some(browser) = &self.browser {
+            browser.release_downloads();
+        }
+    }
+
     /// What the attached browser downloaded into this session's directory. Read-only.
     pub fn browser_downloads(&self, timeout: Duration) -> Result<Value> {
         if self.closed.load(Ordering::SeqCst) {
