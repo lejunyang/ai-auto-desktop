@@ -536,11 +536,10 @@ impl Backend for WindowsUiaBackend {
 
     fn type_text(&self, window_id: &str, node: &Node, text: &str) -> Result<()> {
         let element = self.require(window_id, node)?;
-        // Typing goes to whatever holds focus, so focus must be established
-        // first or the keystrokes land in the wrong place.
-        unsafe { element.SetFocus() }.map_err(|error| {
-            DriverError::new("DRIVER.ACTION_FAILED", format!("focus failed: {error}"))
-        })?;
+        // Typing goes to whatever holds focus, so focus must be established --
+        // and proven, window in front and element focused -- or the keystrokes
+        // land in another application.
+        focus_for_keys(&self.automation, parse_window_id(window_id)?, &element)?;
 
         let mut inputs: Vec<INPUT> = Vec::new();
         for unit in text.encode_utf16() {
@@ -588,9 +587,7 @@ impl Backend for WindowsUiaBackend {
         let layout = unsafe { GetKeyboardLayout(thread_id) };
         let caps_lock_on = unsafe { GetKeyState(VK_CAPITAL.0 as i32) } & 1 != 0;
         let sequence = KeyTextSequence::parse(text, layout, caps_lock_on)?;
-        unsafe { element.SetFocus() }.map_err(|error| {
-            DriverError::new("DRIVER.ACTION_FAILED", format!("focus failed: {error}"))
-        })?;
+        focus_for_keys(&self.automation, top_level, &element)?;
 
         // UIA elements in hosted controls often report the top-level HWND, not
         // the child that owns the caret. After SetFocus, GetGUIThreadInfo is the
@@ -638,11 +635,8 @@ impl Backend for WindowsUiaBackend {
         // element is focused first. Without this a shortcut meant for one field
         // would fire against wherever focus happened to be.
         let element = self.require(window_id, node)?;
-        unsafe { element.SetFocus() }.map_err(|error| {
-            DriverError::new("DRIVER.ACTION_FAILED", format!("focus failed: {error}"))
-        })?;
-
         let chord = Chord::parse(keys)?;
+        focus_for_keys(&self.automation, parse_window_id(window_id)?, &element)?;
         let inputs = chord.to_inputs();
 
         // Press-and-release must arrive as one stream: splitting it lets another
@@ -1745,7 +1739,11 @@ fn describe_element(
 /// SetFocus did: if the foreground lock kept `handle` in the background, they
 /// would land in another application. So the window is brought forward, the
 /// element focused, and then both are checked before a single key is sent.
-fn focus_for_keys(handle: HWND, element: &IUIAutomationElement) -> Result<()> {
+fn focus_for_keys(
+    automation: &IUIAutomation,
+    handle: HWND,
+    element: &IUIAutomationElement,
+) -> Result<()> {
     bring_to_front(handle);
     unsafe { element.SetFocus() }.map_err(|error| {
         DriverError::new("DRIVER.ACTION_FAILED", format!("focus failed: {error}"))
@@ -1753,9 +1751,31 @@ fn focus_for_keys(handle: HWND, element: &IUIAutomationElement) -> Result<()> {
     let deadline = Instant::now() + Duration::from_millis(500);
     loop {
         let foreground = unsafe { GetAncestor(GetForegroundWindow(), GA_ROOT) };
-        let focused = unsafe { element.CurrentHasKeyboardFocus() }
-            .map(|focused| focused.as_bool())
-            .unwrap_or(true);
+        // Focus on the element or inside it (a container hands focus to a
+        // child); UIA that cannot say where focus is is not held against it.
+        let focused = match unsafe { automation.GetFocusedElement() } {
+            Ok(mut current) => {
+                let walker = unsafe { automation.RawViewWalker() }.ok();
+                let mut inside = false;
+                for _ in 0..CaptureLimits::MAX_DEPTH {
+                    if unsafe { automation.CompareElements(&current, element) }
+                        .is_ok_and(|same| same.as_bool())
+                    {
+                        inside = true;
+                        break;
+                    }
+                    match walker
+                        .as_ref()
+                        .and_then(|walker| unsafe { walker.GetParentElement(&current) }.ok())
+                    {
+                        Some(parent) => current = parent,
+                        None => break,
+                    }
+                }
+                inside
+            }
+            Err(_) => true,
+        };
         if foreground == handle && focused {
             return Ok(());
         }
@@ -2620,7 +2640,7 @@ impl WindowsUiaBackend {
             }
             "wm_paste"
         } else {
-            if let Err(error) = focus_for_keys(handle, &element) {
+            if let Err(error) = focus_for_keys(&self.automation, handle, &element) {
                 return Err(restore_on_failure(error));
             }
             if let Err(error) = deliver_atomically(&chord.to_inputs(), "the paste shortcut") {
