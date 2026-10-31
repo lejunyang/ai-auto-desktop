@@ -11,6 +11,7 @@ description = "Native Rust Linux AT-SPI provider for ai-auto-desktop"
 aad-core = { workspace = true }
 aad-plugin = { workspace = true }
 aad-runtime = { workspace = true }
+base64 = "0.22"
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 uuid = { workspace = true }
