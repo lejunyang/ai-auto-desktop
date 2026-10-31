@@ -430,6 +430,8 @@ pub struct Screen {
     at: Bounds,
     /// Why duplication is not in use, once.
     pub fallback: Option<String>,
+    /// Return the screen next time even if nothing changed.
+    refresh: bool,
 }
 
 impl Screen {
@@ -446,7 +448,13 @@ impl Screen {
             stale: Vec::new(),
             at: bounds(),
             fallback,
+            refresh: false,
         }
+    }
+
+    /// The next capture returns the screen even if nothing changed.
+    pub fn refresh(&mut self) {
+        self.refresh = true;
     }
 
     pub fn duplicating(&self) -> bool {
@@ -507,7 +515,16 @@ impl Screen {
                         damage: (!first).then_some(damage),
                     }));
                 }
-                Ok(None) => return Ok(None),
+                Ok(None) => {
+                    let again = std::mem::take(&mut self.refresh);
+                    return Ok(self.frame.clone().filter(|_| again).map(|pixels| Raw {
+                        pixels,
+                        width: at.2,
+                        height: at.3,
+                        format: PixelFormat::Bgra,
+                        damage: Some(Damage::default()),
+                    }));
+                }
                 Err(e) => {
                     self.fallback = Some(e);
                     self.duplication = None;

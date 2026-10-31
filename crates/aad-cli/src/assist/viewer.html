@@ -5,13 +5,14 @@
 :root{color-scheme:light dark;--bg:#f6f6f4;--fg:#1d1d1b;--muted:#6b6b66}
 @media (prefers-color-scheme:dark){:root{--bg:#161615;--fg:#ecece8;--muted:#9a9a93}}
 body{margin:0;background:var(--bg);color:var(--fg);font:14px system-ui,sans-serif;display:flex;flex-direction:column;height:100vh}
-header{padding:8px 16px;color:var(--muted)}
+header{padding:8px 16px;color:var(--muted);display:flex;gap:12px;align-items:center}
+#take{display:none;font:inherit;padding:2px 10px;border-radius:6px;border:1px solid var(--muted);background:transparent;color:var(--fg);cursor:pointer}
 main{flex:1;display:flex;align-items:center;justify-content:center;min-height:0;padding:0 16px 16px;position:relative}
 #pointer{position:fixed;pointer-events:none;display:none;image-rendering:auto}
 #keys{position:fixed;left:0;top:0;width:2px;height:1.2em;opacity:0;border:0;padding:0;margin:0;resize:none;overflow:hidden;font-size:16px}
 canvas{max-width:100%;max-height:100%;outline:none;cursor:crosshair;box-shadow:0 1px 6px rgba(0,0,0,.25)}
 </style></head><body>
-<header id="status">Connecting…</header>
+<header><span id="status">Connecting…</span><button id="take" type="button">Take control</button></header>
 <main><canvas id="screen" tabindex="0" aria-label="Shared screen" width="1" height="1"></canvas><img id="pointer" alt=""></main>
 <textarea id="keys" aria-label="Keyboard for the shared screen" autocomplete="off" autocapitalize="off" spellcheck="false"></textarea>
 <script>
@@ -124,12 +125,18 @@ async function picture(buffer){
   size(picture.width,picture.height);pen.drawImage(picture,0,0);picture.close();
 }
 let modeLabel='', videoLabel='', hint='';
+// Several people may watch; one at a time controls, and any can take over.
+const take=document.getElementById('take');
+take.addEventListener('click',()=>send({type:'take'}));
 function label(){mode=[source,modeLabel,videoLabel].filter(Boolean).join(' · ')+hint;show();}
 function control(m){
   if(m.type==='ready'){kind=m.view_only?'':m.source.kind;source=(m.view_only?'Viewing ':'Sharing ')+m.source.kind;hint=m.view_only?'':' — click the picture to control it';label();}
   if(m.type==='mode'){modeLabel=m.mode.codec+(m.mode.video?' + '+m.mode.video:'');if(!m.mode.video&&m.mode.codec!=='tiles') videoLabel='';label();}
   if(m.type==='stream') return stream(m);
   if(m.type==='cursor') return moved(m);
+  if(m.type==='control'&&kind){
+    hint=m.you?' — click the picture to control it':' — another viewer has control';
+    take.style.display=m.you?'none':'inline-block';label();}
   if(m.type==='clipboard') return copied(m);
   if(m.type==='error') status.textContent=m.message;
 }

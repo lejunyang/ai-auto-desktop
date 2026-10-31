@@ -3,7 +3,9 @@
 //! For the moments an agent needs a human: a login it cannot do, a captcha, a
 //! judgement call. The screen of one browser page (CDP screencast) or of the
 //! Windows desktop is streamed over a WebSocket on a loopback port, and the
-//! viewer's input comes back the same way. A random token in the URL is
+//! viewer's input comes back the same way. Several viewers may watch at once,
+//! each in the codec it chose; one of them at a time controls the screen
+//! (the first to come; any can take over). A random token in the URL is
 //! required for every connection; a host such as omem proxies it to its own
 //! page. This is a channel for people and works in screen positions, so it is
 //! not offered over MCP, where an agent must act on observed elements.
@@ -17,7 +19,9 @@
 //!   first frame of every video stream (a new stream starts with a keyframe);
 //!   `{"type":"cursor","x":0..1,"y":0..1,"visible":true,"shape":{"png":..,
 //!   "width":..,"height":..,"hotspot":[x,y],"screen":[w,h]}}` where the desktop's
-//!   pointer is (`shape` when it changed, in screen pixels); and
+//!   pointer is (`shape` when it changed, in screen pixels);
+//!   `{"type":"control","you":true,"holder":true,"viewers":2}` when who
+//!   controls changes (`you`: this viewer's input is passed on); and
 //!   `{"type":"error","message":..}`.
 //! - server binary: one frame per message, a big-endian header then the
 //!   payload: version u8 (1), codec u8 (1 = jpeg, 2 = webp, each a whole
@@ -42,7 +46,8 @@
 //!   `{"type":"key","action":"down|up","key":"/","code":"Slash"}` for keys that
 //!   type nothing and for shortcuts (see [`keys`]: `code` names the physical
 //!   key, so shortcuts work on any layout), `{"type":"text","text":"..."}` for
-//!   typed text, `{"type":"release"}` to let go of every key and button the
+//!   typed text, `{"type":"take"}` to take control from another viewer (what
+//!   that one held is let go), `{"type":"release"}` to let go of every key and button the
 //!   viewer holds (also done when it leaves), and `{"type":"clipboard"}`,
 //!   answered with `{"type":"clipboard","text":..,"characters":..,
 //!   "truncated":..}` (the desktop; not with --view-only or --no-clipboard).
@@ -155,6 +160,10 @@ pub struct AssistArgs {
     /// shortcut, unless --view-only).
     #[arg(long)]
     no_clipboard: bool,
+    /// Most viewers at once (1..32). The first to connect controls the
+    /// screen and the others watch; any of them can take control.
+    #[arg(long, default_value_t = 4)]
+    max_viewers: usize,
 }
 
 type Result<T> = std::result::Result<T, String>;
@@ -418,6 +427,7 @@ enum Want {
     Raw,
 }
 
+#[derive(Clone)]
 enum Picture {
     Encoded(Frame),
     Raw(Raw),
@@ -439,6 +449,9 @@ trait Source {
     /// Lets go of every key and button the viewer still holds: when it
     /// leaves or loses focus, nothing stays pressed on this side.
     fn release(&mut self) {}
+    /// The next capture returns the screen as it is even if nothing changed,
+    /// for a viewer that has no picture yet.
+    fn refresh(&mut self);
     /// The clipboard's text, for a viewer copying from this side.
     fn clipboard(&mut self) -> Result<Value> {
         Err("this source has no clipboard to read".into())
@@ -463,6 +476,7 @@ struct Config {
     video_rate: u32,
     hide_cursor: bool,
     no_clipboard: bool,
+    max_viewers: usize,
 }
 
 impl Config {
@@ -543,6 +557,7 @@ pub fn run(args: &AssistArgs) -> Result<Value> {
         video_rate: args.video_rate.max(1),
         hide_cursor: args.hide_cursor,
         no_clipboard: args.no_clipboard,
+        max_viewers: args.max_viewers.clamp(1, 32),
     };
     let first = config.first();
     let mut source: Box<dyn Source> = match (args.browser_port, args.desktop) {
@@ -576,22 +591,7 @@ pub fn run(args: &AssistArgs) -> Result<Value> {
         let stop = stop.clone();
         let _ = ctrlc::set_handler(move || stop.store(true, Ordering::SeqCst));
     }
-    listener.set_nonblocking(true).map_err(|e| e.to_string())?;
-    while !stop.load(Ordering::SeqCst) {
-        match listener.accept() {
-            Ok((stream, _)) => {
-                let _ = stream.set_nonblocking(false);
-                // One viewer at a time: a connection is served to its end.
-                if let Err(error) = serve(stream, &token, source.as_mut(), &config, &stop) {
-                    eprintln!("aad assist: {error}");
-                }
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            Err(e) => return Err(e.to_string()),
-        }
-    }
+    host(listener, &token, source.as_mut(), &config, &stop)?;
     Ok(json!({"status": "stopped"}))
 }
 
@@ -664,13 +664,16 @@ impl Outbox {
     }
 }
 
-fn serve(
-    mut stream: TcpStream,
-    token: &str,
-    source: &mut dyn Source,
-    config: &Config,
-    stop: &AtomicBool,
-) -> Result<()> {
+/// A viewer whose WebSocket handshake is done: its stream and the reader
+/// holding whatever it already sent.
+struct Connection {
+    stream: TcpStream,
+    reader: BufReader<TcpStream>,
+}
+
+/// Reads one HTTP request: the viewer page, a WebSocket upgrade, or a
+/// refusal. Runs on its own thread, so a slow client holds up no one.
+fn handshake(mut stream: TcpStream, token: &str) -> Result<Option<Connection>> {
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
         .map_err(|e| e.to_string())?;
@@ -699,14 +702,14 @@ fn serve(
     if !same(given.as_bytes(), token.as_bytes()) {
         let _ = stream
             .write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
-        return Ok(());
+        return Ok(None);
     }
     if path != "/ws" {
         let page = VIEWER.as_bytes();
         let head = format!("HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n", page.len());
         let _ = stream.write_all(head.as_bytes());
         let _ = stream.write_all(page);
-        return Ok(());
+        return Ok(None);
     }
     let key = headers
         .iter()
@@ -730,34 +733,120 @@ fn serve(
         .get_ref()
         .set_read_timeout(None)
         .map_err(|e| e.to_string())?;
-    let (outbox, writer) = Outbox::start(stream.try_clone().map_err(|e| e.to_string())?);
+    Ok(Some(Connection { stream, reader }))
+}
 
-    // The viewer's messages are read on their own thread; captures and input
-    // are handled here, so the source is only ever used from one thread.
-    let (sender, inbox) = mpsc::channel::<Value>();
-    let closed = Arc::new(AtomicBool::new(false));
-    {
-        let closed = closed.clone();
-        let outbox = outbox.clone();
-        let mut reader = reader;
-        std::thread::spawn(move || {
-            while let Ok(Some((opcode, payload))) = read_frame(&mut reader) {
-                match opcode {
-                    1 => {
-                        if let Ok(message) = serde_json::from_slice::<Value>(&payload) {
-                            if sender.send(message).is_err() {
-                                break;
-                            }
-                        }
-                    }
-                    8 => break,
-                    9 => outbox.control(10, payload),
-                    _ => {}
-                }
-            }
-            closed.store(true, Ordering::SeqCst);
-        });
+/// One connected viewer, with its own codec, mode and pipeline.
+struct Viewer<'a> {
+    id: u64,
+    stream: TcpStream,
+    outbox: Outbox,
+    writer: Option<std::thread::JoinHandle<()>>,
+    inbox: mpsc::Receiver<Value>,
+    closed: Arc<AtomicBool>,
+    pipeline: Pipeline<'a>,
+    started: Instant,
+    /// The latest picture it could not take yet, with every change since the
+    /// last one it took, so tiles miss nothing.
+    waiting: Option<Picture>,
+    /// Has not been sent the cursor's shape yet.
+    fresh: bool,
+}
+
+impl Viewer<'_> {
+    fn ready(&self) -> bool {
+        self.outbox.queued() <= 1 && !self.pipeline.busy()
     }
+
+    fn gone(&self) -> bool {
+        self.closed.load(Ordering::SeqCst) || self.outbox.failed()
+    }
+
+    /// Hands it a picture now, or keeps it until it can take one.
+    fn offer(&mut self, picture: Picture) -> Result<()> {
+        let picture = match self.waiting.take() {
+            Some(older) => later(older, picture),
+            None => picture,
+        };
+        if self.ready() {
+            self.pipeline.feed(picture)
+        } else {
+            self.waiting = Some(picture);
+            Ok(())
+        }
+    }
+
+    fn close(mut self) {
+        self.outbox.control(8, Vec::new());
+        drop(self.outbox);
+        if let Some(writer) = self.writer.take() {
+            let _ = writer.join();
+        }
+        let _ = self.stream.shutdown(std::net::Shutdown::Both);
+    }
+}
+
+/// The same picture, marked as no change: new to a viewer that has none,
+/// nothing to one that has.
+fn unchanged(picture: Picture) -> Picture {
+    match picture {
+        Picture::Raw(mut raw) => {
+            raw.damage = Some(damage::Damage::default());
+            Picture::Raw(raw)
+        }
+        encoded => encoded,
+    }
+}
+
+/// A picture that replaces one not yet sent: raw pixels carry every change
+/// since the older one's predecessor, or none known if either knew none.
+fn later(older: Picture, newer: Picture) -> Picture {
+    match (older, newer) {
+        (Picture::Raw(older), Picture::Raw(mut newer)) => {
+            newer.damage = match (older.damage, newer.damage.take()) {
+                (Some(mut before), Some(after)) => {
+                    before.merge(after);
+                    Some(before)
+                }
+                _ => None,
+            };
+            Picture::Raw(newer)
+        }
+        (_, newer) => newer,
+    }
+}
+
+/// Who may control the source, and what everyone is told about it.
+struct Control {
+    /// The viewer whose input is passed on.
+    holder: Option<u64>,
+}
+
+impl Control {
+    fn tell(&self, viewers: &[Viewer], view_only: bool) {
+        for viewer in viewers {
+            viewer.outbox.text(&json!({"type": "control",
+                "you": !view_only && self.holder == Some(viewer.id),
+                "holder": self.holder.is_some(), "viewers": viewers.len()}));
+        }
+    }
+}
+
+/// Serves every viewer from one source until stopped: one capture feeds all
+/// of them, each in its own mode, and one of them at a time controls it.
+fn host(
+    listener: TcpListener,
+    token: &str,
+    source: &mut dyn Source,
+    config: &Config,
+    stop: &AtomicBool,
+) -> Result<()> {
+    listener.set_nonblocking(true).map_err(|e| e.to_string())?;
+    let (arrived, arrivals) = mpsc::channel::<Connection>();
+    let mut viewers: Vec<Viewer> = Vec::new();
+    let mut control = Control { holder: None };
+    let mut next_id = 0u64;
+    let mut rate = 0;
     let codecs: Vec<&str> = config.offered.iter().map(|c| c.name()).collect();
     let video: serde_json::Map<String, Value> = config
         .probe
@@ -766,84 +855,233 @@ fn serve(
         .filter(|(codec, _)| config.offered.contains(codec))
         .map(|(codec, name)| (codec.name().to_string(), json!(name)))
         .collect();
-    let mut pipeline = Pipeline::new(config, config.first());
-    source.rate(config.fps(pipeline.mode));
-    outbox.text(
-        &json!({"type": "ready", "source": source.name(), "view_only": config.view_only,
-        "frames": {"header": "aad-frame/1", "codec": config.offered[0].name(), "codecs": codecs},
-        "mode": pipeline.mode.describe(), "video": video}),
-    );
-    let mut fresh = true;
-    let started = Instant::now();
-    let result = (|| -> Result<()> {
-        while !closed.load(Ordering::SeqCst) && !stop.load(Ordering::SeqCst) && !outbox.failed() {
-            while let Ok(event) = inbox.try_recv() {
+    while !stop.load(Ordering::SeqCst) {
+        // New connections are read on threads of their own.
+        loop {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    let _ = stream.set_nonblocking(false);
+                    let (arrived, token) = (arrived.clone(), token.to_string());
+                    std::thread::spawn(move || match handshake(stream, &token) {
+                        Ok(Some(connection)) => {
+                            let _ = arrived.send(connection);
+                        }
+                        Ok(None) => {}
+                        Err(error) => eprintln!("aad assist: {error}"),
+                    });
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(e) => return Err(e.to_string()),
+            }
+        }
+        let mut changed = false;
+        while let Ok(Connection { mut stream, reader }) = arrivals.try_recv() {
+            if viewers.len() >= config.max_viewers {
+                let refusal = json!({"type": "error", "message": format!("{} viewers are watching already (--max-viewers)", viewers.len())});
+                let _ = write_frame(&mut stream, 1, refusal.to_string().as_bytes());
+                let _ = write_frame(&mut stream, 8, &[]);
+                continue;
+            }
+            let (outbox, writer) = Outbox::start(stream.try_clone().map_err(|e| e.to_string())?);
+            let (sender, inbox) = mpsc::channel::<Value>();
+            let closed = Arc::new(AtomicBool::new(false));
+            {
+                let (closed, outbox, mut reader) = (closed.clone(), outbox.clone(), reader);
+                std::thread::spawn(move || {
+                    while let Ok(Some((opcode, payload))) = read_frame(&mut reader) {
+                        match opcode {
+                            1 => {
+                                if let Ok(message) = serde_json::from_slice::<Value>(&payload) {
+                                    if sender.send(message).is_err() {
+                                        break;
+                                    }
+                                }
+                            }
+                            8 => break,
+                            9 => outbox.control(10, payload),
+                            _ => {}
+                        }
+                    }
+                    closed.store(true, Ordering::SeqCst);
+                });
+            }
+            let pipeline = Pipeline::new(config, config.first());
+            outbox.text(&json!({"type": "ready", "source": source.name(), "view_only": config.view_only,
+                "frames": {"header": "aad-frame/1", "codec": config.offered[0].name(), "codecs": codecs},
+                "mode": pipeline.mode.describe(), "video": video}));
+            next_id += 1;
+            if control.holder.is_none() && !config.view_only {
+                control.holder = Some(next_id);
+            }
+            viewers.push(Viewer {
+                id: next_id,
+                stream,
+                outbox,
+                writer: Some(writer),
+                inbox,
+                closed,
+                pipeline,
+                started: Instant::now(),
+                waiting: None,
+                fresh: true,
+            });
+            changed = true;
+        }
+        for viewer in &mut viewers {
+            while let Ok(event) = viewer.inbox.try_recv() {
+                let controls = !config.view_only && control.holder == Some(viewer.id);
                 match event["type"].as_str() {
                     Some("hello") => match event["accept"].as_array().map(|a| (choose(a, &config.offered), a)) {
                         None => {}
                         Some((Some(chosen), accept)) => {
                             let mode = Mode::of(chosen, accept, &config.offered);
-                            pipeline.switch(mode);
-                            source.rate(config.fps(mode));
-                            outbox.text(&json!({"type": "mode", "mode": mode.describe()}));
+                            viewer.pipeline.switch(mode);
+                            viewer.outbox.text(&json!({"type": "mode", "mode": mode.describe()}));
                         }
-                        Some((None, _)) => outbox.text(&json!({"type": "error",
+                        Some((None, _)) => viewer.outbox.text(&json!({"type": "error",
                             "message": format!("no common codec; this server sends {}", codecs.join(", "))})),
                     },
-                    Some("keyframe") => pipeline.keyframe(),
+                    Some("keyframe") => viewer.pipeline.keyframe(),
                     _ if config.view_only => {}
+                    Some("take") => {
+                        if !controls {
+                            // Whatever the last controller held is let go first.
+                            source.release();
+                            control.holder = Some(viewer.id);
+                            changed = true;
+                        }
+                    }
+                    // Only the controlling viewer's input is passed on.
+                    _ if !controls => {}
                     Some("release") => source.release(),
-                    Some("clipboard") if config.no_clipboard => outbox.text(&json!({"type": "error",
+                    Some("clipboard") if config.no_clipboard => viewer.outbox.text(&json!({"type": "error",
                         "message": "this server does not share its clipboard (--no-clipboard)"})),
                     Some("clipboard") => match source.clipboard() {
-                        Ok(clipboard) => outbox.text(&clipboard),
-                        Err(error) => outbox.text(&json!({"type": "error", "message": error})),
+                        Ok(clipboard) => viewer.outbox.text(&clipboard),
+                        Err(error) => viewer.outbox.text(&json!({"type": "error", "message": error})),
                     },
                     _ => {
                         if let Err(error) = source.input(&event) {
-                            outbox.text(&json!({"type": "error", "message": error}));
+                            viewer.outbox.text(&json!({"type": "error", "message": error}));
                         }
                     }
                 }
             }
-            if !config.hide_cursor {
-                if let Some(cursor) = source.cursor(fresh) {
-                    outbox.text(&cursor);
-                }
-                fresh = false;
+        }
+        // Viewers that left; the controller's keys and buttons are let go.
+        let (gone, staying): (Vec<_>, Vec<_>) = viewers.into_iter().partition(Viewer::gone);
+        viewers = staying;
+        for viewer in gone {
+            if control.holder == Some(viewer.id) {
+                source.release();
+                control.holder = None;
             }
-            pipeline.tick();
-            if outbox.queued() <= 1 && !pipeline.busy() {
-                if let Some(picture) = source.capture(pipeline.want())? {
-                    if let Err(error) = pipeline.feed(picture) {
-                        pipeline.fail(&error, &outbox, source)?;
+            viewer.close();
+            changed = true;
+        }
+        if control.holder.is_none() && !config.view_only {
+            control.holder = viewers.first().map(|v| v.id);
+        }
+        if changed {
+            control.tell(&viewers, config.view_only);
+        }
+        if viewers.is_empty() {
+            std::thread::sleep(Duration::from_millis(20));
+            continue;
+        }
+        // Captures come as often as the most demanding viewer asks.
+        let fps = viewers
+            .iter()
+            .map(|v| config.fps(v.pipeline.mode))
+            .max()
+            .unwrap_or(5);
+        if fps != rate {
+            source.rate(fps);
+            rate = fps;
+        }
+        if !config.hide_cursor {
+            let fresh = viewers.iter().any(|v| v.fresh);
+            if let Some(cursor) = source.cursor(fresh) {
+                for viewer in &mut viewers {
+                    viewer.outbox.text(&cursor);
+                    viewer.fresh = false;
+                }
+            }
+        }
+        for viewer in &mut viewers {
+            viewer.pipeline.tick();
+            if viewer.ready() {
+                if let Some(picture) = viewer.waiting.take() {
+                    if let Err(error) = viewer.pipeline.feed(picture) {
+                        if viewer.pipeline.fail(&error, &viewer.outbox).is_err() {
+                            viewer.closed.store(true, Ordering::SeqCst);
+                        }
                     }
                 }
             }
+        }
+        // A viewer that just came, or switched mode, needs the screen even
+        // while it stays the same.
+        if viewers
+            .iter()
+            .any(|v| v.pipeline.empty() && v.waiting.is_none())
+        {
+            source.refresh();
+        }
+        if viewers.iter().any(Viewer::ready) {
+            // One kind of picture for everyone, or raw pixels when they differ.
+            let wants: Vec<Want> = viewers.iter().map(|v| v.pipeline.want()).collect();
+            let want = if wants.iter().all(|w| *w == wants[0]) {
+                wants[0]
+            } else {
+                Want::Raw
+            };
+            if let Some(picture) = source.capture(want)? {
+                let last = viewers.len() - 1;
+                let mut picture = Some(picture);
+                for (index, viewer) in viewers.iter_mut().enumerate() {
+                    let copy = if index == last {
+                        picture.take()
+                    } else {
+                        picture.clone()
+                    };
+                    if let Some(copy) = copy {
+                        if let Err(error) = viewer.offer(copy) {
+                            if viewer.pipeline.fail(&error, &viewer.outbox).is_err() {
+                                viewer.closed.store(true, Ordering::SeqCst);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        for viewer in &mut viewers {
             loop {
-                match pipeline.poll() {
-                    Ok(Some(Output::Text(message))) => outbox.text(&message),
+                match viewer.pipeline.poll() {
+                    Ok(Some(Output::Text(message))) => viewer.outbox.text(&message),
                     Ok(Some(Output::Frame(frame))) => {
-                        outbox.frame(encode(&frame, started.elapsed().as_millis() as u64));
+                        let at = viewer.started.elapsed().as_millis() as u64;
+                        viewer.outbox.frame(encode(&frame, at));
                     }
                     Ok(None) => break,
-                    Err(error) => pipeline.fail(&error, &outbox, source)?,
+                    Err(error) => {
+                        if viewer.pipeline.fail(&error, &viewer.outbox).is_err() {
+                            viewer.closed.store(true, Ordering::SeqCst);
+                            break;
+                        }
+                    }
                 }
             }
-            std::thread::sleep(Duration::from_millis(5));
         }
-        if outbox.failed() {
-            return Err("lost the viewer: a frame could not be sent".into());
-        }
-        Ok(())
-    })();
-    // Whatever the viewer still held down is let go, however it left.
-    source.release();
-    outbox.control(8, Vec::new());
-    drop(outbox);
-    let _ = writer.join();
-    let _ = stream.shutdown(std::net::Shutdown::Both);
-    result
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    if control.holder.is_some() {
+        source.release();
+    }
+    for viewer in viewers {
+        viewer.close();
+    }
+    Ok(())
 }
 
 enum Output {
@@ -954,6 +1192,11 @@ impl<'a> Pipeline<'a> {
             regions: VecDeque::new(),
             out: VecDeque::new(),
         }
+    }
+
+    /// Nothing to show yet: no picture has come since it started or switched.
+    fn empty(&self) -> bool {
+        self.last.is_none() && self.last_frame.is_none()
     }
 
     fn want(&self) -> Want {
@@ -1282,7 +1525,7 @@ impl<'a> Pipeline<'a> {
 
     /// A video encoder failed: say so, and go on without video if the viewer
     /// can.
-    fn fail(&mut self, error: &str, outbox: &Outbox, source: &mut dyn Source) -> Result<()> {
+    fn fail(&mut self, error: &str, outbox: &Outbox) -> Result<()> {
         let fallback = match self.mode {
             Mode::Adaptive(_) => Some(Mode::Tiles),
             Mode::Video(_) => self
@@ -1307,7 +1550,6 @@ impl<'a> Pipeline<'a> {
         };
         self.video = None;
         self.switch(mode);
-        source.rate(self.config.fps(mode));
         outbox.text(&json!({"type": "mode", "mode": mode.describe()}));
         Ok(())
     }
@@ -1548,6 +1790,10 @@ mod browser {
         pointer: (f64, f64),
         /// The key-up event for each key held down.
         held: Vec<Value>,
+        /// The last picture captured, for a viewer that arrives while the
+        /// page stays the same, and whether one is wanted.
+        last: Option<(Want, Picture)>,
+        refresh: bool,
     }
 
     fn cdp(e: aad_cdp::CdpError) -> String {
@@ -1591,6 +1837,8 @@ mod browser {
                 modifiers: 0,
                 pointer: (0.0, 0.0),
                 held: Vec::new(),
+                last: None,
+                refresh: false,
             })
         }
 
@@ -1694,27 +1942,9 @@ mod browser {
                 regions: None,
             }))
         }
-    }
 
-    /// The pixel size an encoded picture declares.
-    fn picture_size(data: &[u8]) -> Option<(u32, u32)> {
-        image::io::Reader::new(std::io::Cursor::new(data))
-            .with_guessed_format()
-            .ok()?
-            .into_dimensions()
-            .ok()
-    }
-
-    impl Source for Page {
-        fn name(&self) -> Value {
-            json!({"kind": "browser", "page_id": self.page})
-        }
-
-        fn rate(&mut self, fps: u32) {
-            self.pace.rate(fps);
-        }
-
-        fn capture(&mut self, want: Want) -> Result<Option<Picture>> {
+        /// A new picture of the page, if it painted since the last.
+        fn take(&mut self, want: Want) -> Result<Option<Picture>> {
             match want {
                 Want::Picture(Codec::Jpeg) => {
                     self.screencast(Some("jpeg"))?;
@@ -1754,6 +1984,48 @@ mod browser {
                         damage: None,
                     })))
                 }
+            }
+        }
+    }
+
+    /// The pixel size an encoded picture declares.
+    fn picture_size(data: &[u8]) -> Option<(u32, u32)> {
+        image::io::Reader::new(std::io::Cursor::new(data))
+            .with_guessed_format()
+            .ok()?
+            .into_dimensions()
+            .ok()
+    }
+
+    impl Source for Page {
+        fn name(&self) -> Value {
+            json!({"kind": "browser", "page_id": self.page})
+        }
+
+        fn rate(&mut self, fps: u32) {
+            self.pace.rate(fps);
+        }
+
+        fn refresh(&mut self) {
+            self.refresh = true;
+        }
+
+        fn capture(&mut self, want: Want) -> Result<Option<Picture>> {
+            match self.take(want)? {
+                Some(picture) => {
+                    self.last = Some((want, picture.clone()));
+                    self.refresh = false;
+                    Ok(Some(picture))
+                }
+                None if self.refresh => {
+                    self.refresh = false;
+                    Ok(self
+                        .last
+                        .as_ref()
+                        .filter(|(kind, _)| *kind == want)
+                        .map(|(_, picture)| super::unchanged(picture.clone())))
+                }
+                None => Ok(None),
             }
         }
 
@@ -2000,6 +2272,10 @@ mod desktop {
 
         fn cursor(&mut self, fresh: bool) -> Option<Value> {
             self.pointer.message(fresh)
+        }
+
+        fn refresh(&mut self) {
+            self.screen.refresh();
         }
 
         fn input(&mut self, event: &Value) -> Result<()> {
