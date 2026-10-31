@@ -17,6 +17,7 @@ With --desktop the Windows desktop is streamed as H.264 too: it decodes, and a
 click and typing land in an isolated probe window (this moves the real pointer,
 so run it on its own). AAD_TEST_CHROME overrides the Chrome executable.
 """
+import contextlib
 import json
 import os
 import shutil
@@ -237,11 +238,28 @@ def viewer_page_check(port, page_id, *extra):
         assist.wait()
 
 
-def browser_checks(codecs):
-    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), type("Site", (http.server.BaseHTTPRequestHandler,), {
-        "do_GET": lambda self: (self.send_response(200), self.send_header("Content-Type", "text/html"),
-                                self.end_headers(), self.wfile.write(RICH)),
-        "log_message": lambda self, *a: None}))
+class Site(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html")
+        self.end_headers()
+        self.wfile.write(RICH)
+
+    def log_message(self, *args):
+        pass
+
+    def handle(self):
+        # Chrome drops idle keep-alive connections; that is not a failure.
+        try:
+            super().handle()
+        except ConnectionError:
+            pass
+
+
+@contextlib.contextmanager
+def browser_page():
+    """A headless Chrome showing the rich fixture: (CDP port, page id)."""
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Site)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     profile = tempfile.mkdtemp(prefix="aad-assist-video-profile-")
     chrome = subprocess.Popen([CHROME, "--headless=new", "--remote-debugging-port=0", f"--user-data-dir={profile}",
@@ -256,15 +274,20 @@ def browser_checks(codecs):
         port = open(active).read().split()[0]
         time.sleep(1.0)
         targets = json.loads(urllib.request.urlopen(f"http://127.0.0.1:{port}/json/list").read())
-        page_id = next(t["id"] for t in targets if t["type"] == "page")
-        results = {codec: codec_check(port, codec, page_id) for codec in codecs}
-        results["viewer_page"] = viewer_page_check(port, page_id)
-        return results
+        yield port, next(t["id"] for t in targets if t["type"] == "page")
     finally:
         chrome.terminate()
         server.shutdown()
         time.sleep(1)
         shutil.rmtree(profile, ignore_errors=True)
+
+
+def browser_checks(codecs):
+    with browser_page() as (port, page_id):
+        results = {codec: codec_check(port, codec, page_id) for codec in codecs}
+        # Video only: the viewer would otherwise start on tiles.
+        results["viewer_page"] = viewer_page_check(port, page_id, "--codecs", "h264,vp9,av1,webp")
+        return results
 
 
 @reported
