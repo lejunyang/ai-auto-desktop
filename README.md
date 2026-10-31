@@ -391,7 +391,7 @@ Agent 遇到自己做不了的事（扫码之外的登录、验证码、需要�
 
 ```powershell
 aad assist --browser-port 9222            # 分享一个浏览器页面（CDP screencast）
-aad assist --desktop                      # 分享整个桌面（Windows；Linux 的 X11）
+aad assist --desktop                      # 分享整个桌面（Windows；Linux 的 X11；macOS 的主显示器）
 aad assist --desktop --view-only          # 只给看，不接收鼠标键盘
 aad assist --list-screens                 # 列出可分享的显示器和窗口
 aad assist --desktop --monitor 1          # 只分享第 1 块显示器
@@ -554,7 +554,20 @@ Shift 被松开、控制者离开后控制权交回、画面静止时后来者�
 `release` 松开按住的 Ctrl、查看端按着 Shift 和鼠标键断开后两者都被松开；在自带查看页里用输入法组出“中文”只送达一次、
 在画面里按下拖到画面外松开仍然送达；加 `--desktop` 时比对桌面剪贴板的回答和本机独立读到的内容（不改剪贴板），
 并在隔离的探针窗口里检查 Home、Shift+End、Delete、方向键的编辑效果、扫描码和扩展键标志，以及断开后 Shift 被松开。
-`tests/linux/verify_assist_desktop.py` 在自起的 Xvfb 里检查 Linux（CI 的 Linux 任务每次都跑）。macOS 的整桌面分享还没有做。
+`tests/linux/verify_assist_desktop.py` 在自起的 Xvfb 里检查 Linux（CI 的 Linux 任务每次都跑）。
+
+### macOS
+
+经 CoreGraphics：`CGDisplayCreateImage` 截整块显示器（物理像素），和上一张逐块比较，tiles 和视频照样只发变化的部分；
+`--desktop` 分享主显示器，`--monitor N` 分享其他显示器，`--list-screens` 列出显示器（单位是点）。输入作为 CGEvent 发出：
+鼠标事件带点击次数（macOS 靠它判断双击），按键用物理键对应的 Mac 虚拟键码并带上按住的修饰键标志，文字以 Unicode
+字符串输入，与键盘布局无关；快捷键按物理键原样转发，Windows 查看端的 Ctrl+C 在 Mac 上就是 Control+C，不会换成 Command。
+指针只报位置，形状用内置箭头（取系统光标图像需要 AppKit）；剪贴板取 `pbpaste` 的输出。截屏需要“屏幕录制”权限，
+输入需要“辅助功能”权限，`source.permissions` 报告两者；没有屏幕录制权限时会明确报错。`--window` 在 macOS 上不支持
+（`CGWindowListCreateImage` 在新系统上已废弃）。
+
+本机没有 Mac，macOS 只在 CI 上验证：编译、按键表单元测试，以及冒烟步骤（列出显示器、查看端拿到第一帧，或在 runner
+没有屏幕录制权限时拿到说明这一点的错误）。真实的点击、按键和画面效果 `[待验证: macOS 真机，授予屏幕录制与辅助功能权限]`。
 
 ### Linux（X11）
 
