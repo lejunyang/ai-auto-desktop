@@ -107,6 +107,67 @@ jobs:
           test -n "$AAD_TEST_CHROME"
           cargo test --locked -p aad-control --test browser_e2e -- --ignored
 
+      # aad assist on the macOS desktop: the displays are listed, and a
+      # viewer gets a first picture, or, where the runner grants no Screen
+      # Recording, the error that says so. Input needs Accessibility, which a
+      # runner may not grant either, so only what it reports is printed.
+      - name: Smoke assist on the macOS desktop
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --locked -p aad-cli
+          python3 - <<'PY'
+          import base64, json, os, socket, subprocess, sys, time
+          aad = "target/debug/aad"
+          screens = json.loads(subprocess.run([aad, "--compact", "assist", "--list-screens"], capture_output=True, text=True).stdout)
+          print("screens", screens)
+          assert screens["monitors"], "no display listed"
+          p = subprocess.Popen([aad, "--compact", "assist", "--desktop", "--view-only", "--codecs", "tiles"], stdout=subprocess.PIPE, text=True)
+          try:
+              announce = json.loads(p.stdout.readline())
+              print("source", announce["source"])
+              assert announce["source"]["capture"] == "coregraphics"
+              host, rest = announce["websocket"][len("ws://"):].split("/", 1)
+              address, port = host.split(":")
+              s = socket.create_connection((address, int(port)), timeout=20)
+              key = base64.b64encode(os.urandom(16)).decode()
+              s.sendall(f"GET /{rest} HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n".encode())
+              head = b""
+              while b"\r\n\r\n" not in head:
+                  head += s.recv(1)
+              payload = json.dumps({"type": "hello", "accept": ["tiles"]}).encode()
+              mask = os.urandom(4)
+              s.sendall(bytes([0x81, 0x80 | len(payload)]) + mask + bytes(b ^ mask[i % 4] for i, b in enumerate(payload)))
+              def exact(n):
+                  data = b""
+                  while len(data) < n:
+                      chunk = s.recv(n - len(data))
+                      assert chunk, "connection closed"
+                      data += chunk
+                  return data
+              deadline = time.time() + 30
+              outcome = None
+              while time.time() < deadline and outcome is None:
+                  first, second = exact(2)
+                  length = second & 0x7F
+                  if length == 126:
+                      length = int.from_bytes(exact(2), "big")
+                  elif length == 127:
+                      length = int.from_bytes(exact(8), "big")
+                  data = exact(length)
+                  if first & 0x0F == 2 and data[1] == 6:
+                      outcome = ("picture", int.from_bytes(data[4:8], "big"), int.from_bytes(data[8:12], "big"))
+                  elif first & 0x0F == 1:
+                      message = json.loads(data)
+                      if message.get("type") == "error":
+                          outcome = ("error", message["message"])
+              print("outcome", outcome)
+              assert outcome and (outcome[0] == "picture" or "Screen Recording" in outcome[1]), outcome
+          finally:
+              p.terminate()
+          PY
+
       # aad assist on an X11 desktop of its own (the script starts Xvfb):
       # what is streamed and what a viewer's input does, checked by effect.
       - name: Test assist on an X11 desktop
