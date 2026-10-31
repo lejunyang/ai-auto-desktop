@@ -36,6 +36,11 @@ image = { workspace = true }
 # Lossy WebP for assist pictures (libwebp, built from source).
 webp = { version = "0.3", default-features = false }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# The X11 desktop for assist, spoken to directly: damage tells what changed,
+# XTest injects input, XFixes gives the pointer, RandR the displays.
+x11rb = { version = "0.13", features = ["xtest", "damage", "xfixes", "randr"] }
+
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [
     "Win32_Foundation",

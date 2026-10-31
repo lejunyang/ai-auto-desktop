@@ -2,7 +2,8 @@
 //!
 //! For the moments an agent needs a human: a login it cannot do, a captcha, a
 //! judgement call. The screen of one browser page (CDP screencast) or of the
-//! Windows desktop is streamed over a WebSocket on a loopback port, and the
+//! desktop (Windows; Linux on X11, see [`x11`]) is streamed over a WebSocket
+//! on a loopback port, and the
 //! viewer's input comes back the same way. Several viewers may watch at once,
 //! each in the codec it chose; one of them at a time controls the screen
 //! (the first to come; any can take over). A random token in the URL is
@@ -67,7 +68,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 mod buffer;
 mod damage;
 mod keys;
@@ -76,6 +77,8 @@ mod scale;
 mod screen;
 mod tiles;
 mod video;
+#[cfg(target_os = "linux")]
+mod x11;
 
 #[derive(Args)]
 pub struct AssistArgs {
@@ -86,7 +89,7 @@ pub struct AssistArgs {
     /// first page when left out.
     #[arg(long, requires = "browser_port")]
     page: Option<String>,
-    /// Stream the whole desktop instead (Windows).
+    /// Stream the whole desktop instead (Windows, and Linux on X11).
     #[arg(long)]
     desktop: bool,
     /// Share one display, by its number from --list-screens.
@@ -476,7 +479,7 @@ trait Source {
 }
 
 /// Most clipboard text handed to a viewer at once.
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 const CLIPBOARD_CHARACTERS: usize = 100_000;
 
 /// Everything about the stream decided at startup.
@@ -2186,7 +2189,106 @@ fn unknown(event: &Value) -> String {
     format!("unknown key {named:?}")
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
+mod desktop {
+    pub use super::x11::Area;
+    use super::x11::X11;
+    use super::{
+        fraction, keys, unknown, Pace, Picture, Result, Source, Want, CLIPBOARD_CHARACTERS,
+    };
+    use serde_json::{json, Value};
+
+    pub fn screens() -> Result<Value> {
+        Ok(X11::open(&Area::All)?.screens())
+    }
+
+    pub fn open(fps: u32, area: &Area) -> Result<Box<dyn Source>> {
+        Ok(Box::new(Desktop {
+            pace: Pace::new(fps),
+            x11: X11::open(area)?,
+        }))
+    }
+
+    pub struct Desktop {
+        pace: Pace,
+        x11: X11,
+    }
+
+    impl Source for Desktop {
+        fn name(&self) -> Value {
+            let capture = if self.x11.damage_known() {
+                "x11-damage"
+            } else {
+                "x11"
+            };
+            json!({"kind": "desktop", "capture": capture})
+        }
+
+        fn rate(&mut self, fps: u32) {
+            self.pace.rate(fps);
+        }
+
+        fn refresh(&mut self) {
+            self.x11.refresh();
+        }
+
+        fn capture(&mut self, _want: Want) -> Result<Option<Picture>> {
+            if !self.pace.due() {
+                return Ok(None);
+            }
+            Ok(self.x11.capture()?.map(Picture::Raw))
+        }
+
+        fn cursor(&mut self, fresh: bool) -> Option<Value> {
+            self.x11.cursor(fresh)
+        }
+
+        fn input(&mut self, event: &Value) -> Result<()> {
+            match event["type"].as_str() {
+                Some("mouse") => {
+                    self.x11
+                        .point(fraction(event, "x")?, fraction(event, "y")?)?;
+                    let button = match event["button"].as_str() {
+                        Some("right") => 3,
+                        Some("middle") => 2,
+                        _ => 1,
+                    };
+                    match event["action"].as_str() {
+                        Some("down") => self.x11.button(button, true),
+                        Some("up") => self.x11.button(button, false),
+                        Some("wheel") => self.x11.wheel(
+                            event["dx"].as_f64().unwrap_or(0.0),
+                            event["dy"].as_f64().unwrap_or(0.0),
+                        ),
+                        _ => Ok(()),
+                    }
+                }
+                Some("key") => {
+                    let key = keys::of(event).ok_or_else(|| unknown(event))?;
+                    self.x11.key(key, event["action"] != "up")
+                }
+                Some("text") => {
+                    let text = event["text"].as_str().unwrap_or_default();
+                    if text.len() > 4096 {
+                        return Err("text is limited to 4096 bytes".into());
+                    }
+                    self.x11.text(text)
+                }
+                _ => Err("unknown event type".into()),
+            }
+        }
+
+        fn release(&mut self) {
+            self.x11.release();
+        }
+
+        fn clipboard(&mut self) -> Result<Value> {
+            self.x11.clipboard(CLIPBOARD_CHARACTERS)
+        }
+    }
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
 mod desktop {
     use super::{Result, Source};
     use serde_json::Value;
@@ -2197,7 +2299,7 @@ mod desktop {
     }
 
     pub fn screens() -> Result<Value> {
-        Err("listing screens is available on Windows so far".into())
+        Err("listing screens is available on Windows and Linux (X11) so far".into())
     }
 
     pub fn open(_fps: u32, area: &Area) -> Result<Box<dyn Source>> {
@@ -2207,7 +2309,7 @@ mod desktop {
             Area::Window(window) => format!("window {window}"),
         };
         Err(format!(
-            "sharing {what} is available on Windows so far; use --browser-port for a browser page"
+            "sharing {what} is available on Windows and Linux (X11) so far; use --browser-port for a browser page"
         ))
     }
 }

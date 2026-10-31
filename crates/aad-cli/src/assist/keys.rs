@@ -36,6 +36,74 @@ impl Key {
         }
     }
 
+    /// The X11 keysym of the key's unshifted meaning on a US layout.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub fn keysym(self) -> u32 {
+        let index = |list: &[&str]| list.iter().position(|c| *c == self.code).map(|i| i as u32);
+        if let Some(i) = index(&LETTERS) {
+            return 0x61 + i;
+        }
+        if let Some(i) = index(&DIGITS) {
+            return 0x30 + i;
+        }
+        if let Some(i) = index(&NUMPAD) {
+            return 0xFFB0 + i;
+        }
+        if let Some(i) = index(&FUNCTION) {
+            return 0xFFBE + i;
+        }
+        match self.code {
+            "Escape" => 0xFF1B,
+            "Backquote" => 0x60,
+            "Minus" => 0x2D,
+            "Equal" => 0x3D,
+            "Backspace" => 0xFF08,
+            "Tab" => 0xFF09,
+            "BracketLeft" => 0x5B,
+            "BracketRight" => 0x5D,
+            "Backslash" => 0x5C,
+            "CapsLock" => 0xFFE5,
+            "Semicolon" => 0x3B,
+            "Quote" => 0x27,
+            "Enter" => 0xFF0D,
+            "ShiftLeft" => 0xFFE1,
+            "ShiftRight" => 0xFFE2,
+            "IntlBackslash" => 0x3C,
+            "Comma" => 0x2C,
+            "Period" => 0x2E,
+            "Slash" => 0x2F,
+            "ControlLeft" => 0xFFE3,
+            "ControlRight" => 0xFFE4,
+            "MetaLeft" => 0xFFEB,
+            "MetaRight" => 0xFFEC,
+            "AltLeft" => 0xFFE9,
+            "AltRight" => 0xFFEA,
+            "Space" => 0x20,
+            "ContextMenu" => 0xFF67,
+            "PrintScreen" => 0xFF61,
+            "ScrollLock" => 0xFF14,
+            "Pause" => 0xFF13,
+            "Insert" => 0xFF63,
+            "Home" => 0xFF50,
+            "PageUp" => 0xFF55,
+            "Delete" => 0xFFFF,
+            "End" => 0xFF57,
+            "PageDown" => 0xFF56,
+            "ArrowUp" => 0xFF52,
+            "ArrowLeft" => 0xFF51,
+            "ArrowDown" => 0xFF54,
+            "ArrowRight" => 0xFF53,
+            "NumLock" => 0xFF7F,
+            "NumpadDivide" => 0xFFAF,
+            "NumpadMultiply" => 0xFFAA,
+            "NumpadSubtract" => 0xFFAD,
+            "NumpadAdd" => 0xFFAB,
+            "NumpadEnter" => 0xFF8D,
+            "NumpadDecimal" => 0xFFAE,
+            _ => 0,
+        }
+    }
+
     /// The modifier bit Chrome uses for this key, if it is one.
     pub fn modifier(self) -> u32 {
         match self.code {
@@ -211,6 +279,12 @@ mod tests {
         );
         assert_eq!(by_code("BracketLeft").unwrap().location(), 0);
         assert!(by_code("Hyper").is_none());
+        // Every key in the table has an X11 keysym.
+        for (code, _, _) in TABLE {
+            assert_ne!(by_code(code).unwrap().keysym(), 0, "{code}");
+        }
+        assert_eq!(by_code("KeyQ").unwrap().keysym(), 0x71);
+        assert_eq!(by_code("F12").unwrap().keysym(), 0xFFC9);
     }
 
     #[test]
