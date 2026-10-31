@@ -37,9 +37,15 @@
 //!   `{"type":"keyframe"}` asks for a frame decodable on its own, after a
 //!   decoding error. Then
 //!   `{"type":"mouse","action":"move|down|up|wheel","x":0..1,"y":0..1,
-//!   "button":"left|right|middle","dx":px,"dy":px}`,
-//!   `{"type":"key","action":"down|up","key":"Enter","code":"Enter"}` for keys
-//!   that are not text, and `{"type":"text","text":"..."}` for typed text.
+//!   "button":"left|right|middle","count":1..3,"dx":px,"dy":px}` (`count`
+//!   makes double and triple clicks on a page),
+//!   `{"type":"key","action":"down|up","key":"/","code":"Slash"}` for keys that
+//!   type nothing and for shortcuts (see [`keys`]: `code` names the physical
+//!   key, so shortcuts work on any layout), `{"type":"text","text":"..."}` for
+//!   typed text, `{"type":"release"}` to let go of every key and button the
+//!   viewer holds (also done when it leaves), and `{"type":"clipboard"}`,
+//!   answered with `{"type":"clipboard","text":..,"characters":..,
+//!   "truncated":..}` (the desktop; not with --view-only or --no-clipboard).
 //!
 //! Nothing is sent while the screen stays the same. Pictures are sent whole;
 //! tiles send only the 32-pixel tiles that changed, and moved regions as
@@ -57,6 +63,7 @@ use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 mod damage;
+mod keys;
 mod scale;
 #[cfg(windows)]
 mod screen;
@@ -144,6 +151,10 @@ pub struct AssistArgs {
     /// Do not send where the desktop's mouse pointer is and what it looks like.
     #[arg(long)]
     hide_cursor: bool,
+    /// Do not let the viewer read this side's clipboard (it may after a copy
+    /// shortcut, unless --view-only).
+    #[arg(long)]
+    no_clipboard: bool,
 }
 
 type Result<T> = std::result::Result<T, String>;
@@ -425,7 +436,17 @@ trait Source {
     fn cursor(&mut self, _fresh: bool) -> Option<Value> {
         None
     }
+    /// Lets go of every key and button the viewer still holds: when it
+    /// leaves or loses focus, nothing stays pressed on this side.
+    fn release(&mut self) {}
+    /// The clipboard's text, for a viewer copying from this side.
+    fn clipboard(&mut self) -> Result<Value> {
+        Err("this source has no clipboard to read".into())
+    }
 }
+
+/// Most clipboard text handed to a viewer at once.
+const CLIPBOARD_CHARACTERS: usize = 100_000;
 
 /// Everything about the stream decided at startup.
 struct Config {
@@ -440,6 +461,7 @@ struct Config {
     video_area: u32,
     video_rate: u32,
     hide_cursor: bool,
+    no_clipboard: bool,
 }
 
 impl Config {
@@ -519,6 +541,7 @@ pub fn run(args: &AssistArgs) -> Result<Value> {
         video_area: args.video_area.clamp(1, 100),
         video_rate: args.video_rate.max(1),
         hide_cursor: args.hide_cursor,
+        no_clipboard: args.no_clipboard,
     };
     let first = config.first();
     let mut source: Box<dyn Source> = match (args.browser_port, args.desktop) {
@@ -768,6 +791,13 @@ fn serve(
                     },
                     Some("keyframe") => pipeline.keyframe(),
                     _ if config.view_only => {}
+                    Some("release") => source.release(),
+                    Some("clipboard") if config.no_clipboard => outbox.text(&json!({"type": "error",
+                        "message": "this server does not share its clipboard (--no-clipboard)"})),
+                    Some("clipboard") => match source.clipboard() {
+                        Ok(clipboard) => outbox.text(&clipboard),
+                        Err(error) => outbox.text(&json!({"type": "error", "message": error})),
+                    },
                     _ => {
                         if let Err(error) = source.input(&event) {
                             outbox.text(&json!({"type": "error", "message": error}));
@@ -806,6 +836,8 @@ fn serve(
         }
         Ok(())
     })();
+    // Whatever the viewer still held down is let go, however it left.
+    source.release();
     outbox.control(8, Vec::new());
     drop(outbox);
     let _ = writer.join();
@@ -1483,51 +1515,10 @@ fn fraction(event: &Value, key: &str) -> Result<f64> {
         .ok_or_else(|| format!("{key} must be a fraction from 0 to 1"))
 }
 
-/// Windows virtual-key code and DOM code for keys that are not text.
-fn named_key(key: &str) -> Option<(u16, &'static str)> {
-    Some(match key {
-        "Enter" => (0x0d, "Enter"),
-        "Backspace" => (0x08, "Backspace"),
-        "Tab" => (0x09, "Tab"),
-        "Escape" => (0x1b, "Escape"),
-        "Delete" => (0x2e, "Delete"),
-        "Insert" => (0x2d, "Insert"),
-        "Home" => (0x24, "Home"),
-        "End" => (0x23, "End"),
-        "PageUp" => (0x21, "PageUp"),
-        "PageDown" => (0x22, "PageDown"),
-        "ArrowLeft" => (0x25, "ArrowLeft"),
-        "ArrowUp" => (0x26, "ArrowUp"),
-        "ArrowRight" => (0x27, "ArrowRight"),
-        "ArrowDown" => (0x28, "ArrowDown"),
-        "Shift" => (0x10, "ShiftLeft"),
-        "Control" => (0x11, "ControlLeft"),
-        "Alt" => (0x12, "AltLeft"),
-        "Meta" => (0x5b, "MetaLeft"),
-        "F1" => (0x70, "F1"),
-        "F2" => (0x71, "F2"),
-        "F3" => (0x72, "F3"),
-        "F4" => (0x73, "F4"),
-        "F5" => (0x74, "F5"),
-        "F6" => (0x75, "F6"),
-        "F7" => (0x76, "F7"),
-        "F8" => (0x77, "F8"),
-        "F9" => (0x78, "F9"),
-        "F10" => (0x79, "F10"),
-        "F11" => (0x7a, "F11"),
-        "F12" => (0x7b, "F12"),
-        // A letter or digit pressed with Ctrl or Alt, for shortcuts.
-        one if one.len() == 1 && one.as_bytes()[0].is_ascii_alphanumeric() => {
-            let upper = one.as_bytes()[0].to_ascii_uppercase();
-            (u16::from(upper), "")
-        }
-        _ => return None,
-    })
-}
-
 mod browser {
     use super::{
-        fraction, named_key, Codec, Frame, Pace, Picture, PixelFormat, Raw, Result, Source, Want,
+        fraction, keys, unknown, Codec, Frame, Pace, Picture, PixelFormat, Raw, Result, Source,
+        Want,
     };
     use aad_cdp::Client;
     use serde_json::{json, Value};
@@ -1552,6 +1543,10 @@ mod browser {
         size: (f64, f64),
         buttons: u32,
         modifiers: u32,
+        /// Where the pointer last was, in CSS pixels.
+        pointer: (f64, f64),
+        /// The key-up event for each key held down.
+        held: Vec<Value>,
     }
 
     fn cdp(e: aad_cdp::CdpError) -> String {
@@ -1593,6 +1588,8 @@ mod browser {
                 size: (0.0, 0.0),
                 buttons: 0,
                 modifiers: 0,
+                pointer: (0.0, 0.0),
+                held: Vec::new(),
             })
         }
 
@@ -1766,6 +1763,7 @@ mod browser {
                         fraction(event, "x")? * self.size.0,
                         fraction(event, "y")? * self.size.1,
                     );
+                    self.pointer = (x, y);
                     let (button, mask) = match event["button"].as_str() {
                         Some("right") => ("right", 2),
                         Some("middle") => ("middle", 4),
@@ -1796,37 +1794,40 @@ mod browser {
                     self.command("Input.dispatchMouseEvent", params)
                 }
                 Some("key") => {
-                    let key = event["key"].as_str().unwrap_or_default();
-                    let (code, dom) =
-                        named_key(key).ok_or_else(|| format!("unknown key {key:?}"))?;
-                    let bit = match key {
-                        "Alt" => 1,
-                        "Control" => 2,
-                        "Meta" => 4,
-                        "Shift" => 8,
-                        _ => 0,
-                    };
+                    let key = keys::of(event).ok_or_else(|| unknown(event))?;
                     let down = event["action"] != "up";
                     if down {
-                        self.modifiers |= bit;
+                        self.modifiers |= key.modifier();
                     } else {
-                        self.modifiers &= !bit;
+                        self.modifiers &= !key.modifier();
                     }
-                    let text = if key == "Enter" && down && self.modifiers == 0 {
-                        "\r"
+                    // The key as the viewer's layout names it, as Chrome reports it to the page.
+                    let name = event["key"]
+                        .as_str()
+                        .filter(|k| !k.is_empty())
+                        .unwrap_or(key.code)
+                        .to_string();
+                    let mut params = json!({"key": name, "code": key.code,
+                        "windowsVirtualKeyCode": key.chrome_vk(), "nativeVirtualKeyCode": key.chrome_vk(),
+                        "location": key.location(), "modifiers": self.modifiers});
+                    self.held.retain(|held| held["code"] != key.code);
+                    if down {
+                        let mut up = params.clone();
+                        up["type"] = json!("keyUp");
+                        self.held.push(up);
+                        // Enter types a line break unless Ctrl, Alt or Meta is held.
+                        let enter = matches!(key.code, "Enter" | "NumpadEnter");
+                        if enter && self.modifiers & 0b0111 == 0 {
+                            params["type"] = json!("keyDown");
+                            params["text"] = json!("\r");
+                            params["unmodifiedText"] = json!("\r");
+                        } else {
+                            params["type"] = json!("rawKeyDown");
+                        }
                     } else {
-                        ""
-                    };
-                    let dom = if dom.is_empty() {
-                        format!("Key{}", key.to_ascii_uppercase())
-                    } else {
-                        dom.to_string()
-                    };
-                    self.command(
-                        "Input.dispatchKeyEvent",
-                        json!({"type": if down {"keyDown"} else {"keyUp"}, "key": key, "code": dom,
-                               "windowsVirtualKeyCode": code, "modifiers": self.modifiers, "text": text}),
-                    )
+                        params["type"] = json!("keyUp");
+                    }
+                    self.command("Input.dispatchKeyEvent", params)
                 }
                 Some("text") => {
                     let text = event["text"].as_str().unwrap_or_default();
@@ -1838,7 +1839,37 @@ mod browser {
                 _ => Err("unknown event type".into()),
             }
         }
+
+        fn release(&mut self) {
+            for mut up in std::mem::take(&mut self.held).into_iter().rev() {
+                let key = up["code"].as_str().and_then(keys::by_code);
+                self.modifiers &= !key.map_or(0, keys::Key::modifier);
+                up["modifiers"] = json!(self.modifiers);
+                let _ = self.command("Input.dispatchKeyEvent", up);
+            }
+            self.modifiers = 0;
+            for (button, mask) in [("left", 1), ("right", 2), ("middle", 4)] {
+                if self.buttons & mask != 0 {
+                    self.buttons &= !mask;
+                    let (x, y) = self.pointer;
+                    let _ = self.command(
+                        "Input.dispatchMouseEvent",
+                        json!({"type": "mouseReleased", "x": x, "y": y, "button": button,
+                               "buttons": self.buttons, "clickCount": 1}),
+                    );
+                }
+            }
+        }
     }
+}
+
+/// The error for a key message no key matches.
+fn unknown(event: &Value) -> String {
+    let named = event["code"]
+        .as_str()
+        .or(event["key"].as_str())
+        .unwrap_or_default();
+    format!("unknown key {named:?}")
 }
 
 #[cfg(not(windows))]
@@ -1852,20 +1883,26 @@ mod desktop {
 #[cfg(windows)]
 mod desktop {
     use super::screen::{self, Pointer, Screen};
-    use super::{fraction, named_key, Pace, Picture, Result, Source, Want};
+    use super::{
+        fraction, keys, unknown, Pace, Picture, Result, Source, Want, CLIPBOARD_CHARACTERS,
+    };
     use serde_json::{json, Value};
     use windows::Win32::UI::Input::KeyboardAndMouse::{
-        SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYBD_EVENT_FLAGS,
-        KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL,
-        MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP,
-        MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK,
-        MOUSEEVENTF_WHEEL, MOUSEINPUT, MOUSE_EVENT_FLAGS, VIRTUAL_KEY,
+        MapVirtualKeyW, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT,
+        KEYBD_EVENT_FLAGS, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE,
+        MAPVK_VK_TO_VSC, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN,
+        MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE,
+        MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL,
+        MOUSEINPUT, MOUSE_EVENT_FLAGS, VIRTUAL_KEY,
     };
 
     pub struct Desktop {
         pace: Pace,
         screen: Screen,
         pointer: Pointer,
+        /// Keys and mouse buttons (1 left, 2 right, 4 middle) held down.
+        held: Vec<keys::Key>,
+        buttons: u8,
     }
 
     pub fn open(fps: u32) -> Result<Box<dyn Source>> {
@@ -1874,6 +1911,8 @@ mod desktop {
             pace: Pace::new(fps),
             screen: Screen::open(),
             pointer: Pointer::default(),
+            held: Vec::new(),
+            buttons: 0,
         }))
     }
 
@@ -1900,6 +1939,21 @@ mod desktop {
                 },
             },
         }
+    }
+
+    /// A physical key going down or up, with its scan code, which some
+    /// programs read instead of the virtual key.
+    fn press(key: keys::Key, up: bool) -> INPUT {
+        let scan = unsafe { MapVirtualKeyW(u32::from(key.vk), MAPVK_VK_TO_VSC) } as u16;
+        let mut flags = if up {
+            KEYEVENTF_KEYUP
+        } else {
+            KEYBD_EVENT_FLAGS(0)
+        };
+        if key.extended {
+            flags |= KEYEVENTF_EXTENDEDKEY;
+        }
+        self::key(key.vk, scan, flags)
     }
 
     fn key(vk: u16, scan: u16, flags: KEYBD_EVENT_FLAGS) -> INPUT {
@@ -1953,15 +2007,21 @@ mod desktop {
                     let x = (fraction(event, "x")? * 65535.0).round() as i32;
                     let y = (fraction(event, "y")? * 65535.0).round() as i32;
                     let at = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK;
-                    let (down, up) = match event["button"].as_str() {
-                        Some("right") => (MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP),
-                        Some("middle") => (MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP),
-                        _ => (MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP),
+                    let (down, up, mask) = match event["button"].as_str() {
+                        Some("right") => (MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, 2),
+                        Some("middle") => (MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, 4),
+                        _ => (MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, 1),
                     };
                     let mut inputs = vec![mouse(x, y, 0, at)];
                     match event["action"].as_str() {
-                        Some("down") => inputs.push(mouse(x, y, 0, at | down)),
-                        Some("up") => inputs.push(mouse(x, y, 0, at | up)),
+                        Some("down") => {
+                            self.buttons |= mask;
+                            inputs.push(mouse(x, y, 0, at | down));
+                        }
+                        Some("up") => {
+                            self.buttons &= !mask;
+                            inputs.push(mouse(x, y, 0, at | up));
+                        }
                         Some("wheel") => {
                             // Browsers report about 100 pixels per notch; Windows 120 units.
                             let notch = |pixels: f64| (-pixels / 100.0 * 120.0).round() as i32;
@@ -1979,14 +2039,13 @@ mod desktop {
                     send(&inputs)
                 }
                 Some("key") => {
-                    let name = event["key"].as_str().unwrap_or_default();
-                    let (vk, _) = named_key(name).ok_or_else(|| format!("unknown key {name:?}"))?;
-                    let flags = if event["action"] == "up" {
-                        KEYEVENTF_KEYUP
-                    } else {
-                        KEYBD_EVENT_FLAGS(0)
-                    };
-                    send(&[key(vk, 0, flags)])
+                    let key = keys::of(event).ok_or_else(|| unknown(event))?;
+                    let up = event["action"] == "up";
+                    self.held.retain(|held| held.code != key.code);
+                    if !up {
+                        self.held.push(key);
+                    }
+                    send(&[press(key, up)])
                 }
                 Some("text") => {
                     let text = event["text"].as_str().unwrap_or_default();
@@ -2006,6 +2065,36 @@ mod desktop {
                 }
                 _ => Err("unknown event type".into()),
             }
+        }
+
+        fn release(&mut self) {
+            let mut inputs: Vec<INPUT> = std::mem::take(&mut self.held)
+                .into_iter()
+                .rev()
+                .map(|key| press(key, true))
+                .collect();
+            for (mask, up) in [
+                (1, MOUSEEVENTF_LEFTUP),
+                (2, MOUSEEVENTF_RIGHTUP),
+                (4, MOUSEEVENTF_MIDDLEUP),
+            ] {
+                if self.buttons & mask != 0 {
+                    inputs.push(mouse(0, 0, 0, up));
+                }
+            }
+            self.buttons = 0;
+            if !inputs.is_empty() {
+                let _ = send(&inputs);
+            }
+        }
+
+        fn clipboard(&mut self) -> Result<Value> {
+            let (text, characters) = aad_uia::windows::clipboard_text(CLIPBOARD_CHARACTERS)
+                .map_err(|e| e.to_string())?;
+            Ok(
+                json!({"type": "clipboard", "text": text, "characters": characters,
+                      "truncated": characters > CLIPBOARD_CHARACTERS}),
+            )
         }
     }
 }

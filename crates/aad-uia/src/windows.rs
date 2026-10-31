@@ -2273,6 +2273,13 @@ fn utf16_text(bytes: &[u8]) -> String {
     String::from_utf16_lossy(&units)
 }
 
+/// The clipboard's text, at most `max_chars` of it, with its full length;
+/// refused when its source marked it as not for clipboard readers. For
+/// callers outside a driver session, such as `aad assist`.
+pub fn clipboard_text(max_chars: usize) -> Result<(Option<String>, usize)> {
+    read_clipboard_text(max_chars)
+}
+
 fn read_clipboard_text(max_chars: usize) -> Result<(Option<String>, usize)> {
     let _open = OpenedClipboard::open(None)?;
     // A password manager marks what it copies; that is not ours to read.
