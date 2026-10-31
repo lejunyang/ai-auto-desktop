@@ -206,19 +206,24 @@ jobs:
                           return True
                   return False
               def chord(code, key):
-                  viewer.send({"type": "key", "action": "down", "key": "Meta", "code": "MetaLeft"})
-                  viewer.send({"type": "key", "action": "down", "key": key, "code": code})
-                  viewer.send({"type": "key", "action": "up", "key": key, "code": code})
-                  viewer.send({"type": "key", "action": "up", "key": "Meta", "code": "MetaLeft"})
+                  # As a person presses them: a moment between the four events.
+                  for action, name, which in (("down", "Meta", "MetaLeft"), ("down", key, code),
+                                              ("up", key, code), ("up", "Meta", "MetaLeft")):
+                      viewer.send({"type": "key", "action": action, "key": name, "code": which})
+                      time.sleep(0.05)
                   time.sleep(0.5)
               def saved():
                   chord("KeyS", "s")
                   time.sleep(1)
                   return open("/tmp/assist-note.txt").read()
               def copied():
-                  chord("KeyA", "a")
-                  chord("KeyC", "c")
-                  return subprocess.run(["pbpaste"], capture_output=True, text=True, timeout=10).stdout
+                  for _ in range(3):
+                      chord("KeyA", "a")
+                      chord("KeyC", "c")
+                      text = subprocess.run(["pbpaste"], capture_output=True, text=True, timeout=10).stdout
+                      if text:
+                          return text
+                  return text
               viewer.send({"type": "mouse", "action": "move", "x": 0.25, "y": 0.75})
               pointer = cursor_near(0.25, 0.75)
               viewer.send({"type": "text", "text": "typed through assist"})
