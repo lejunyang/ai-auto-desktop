@@ -89,7 +89,9 @@ def viewers_check(port, page_id):
         c_frame = first_frame(c, 6)
         d = connect(announce, ["tiles"])
         e = connect(announce, ["tiles"])
-        refused = [m for m in messages(e, 2.0, "error") if "max-viewers" in m.get("message", "")]
+        # Whichever of the two came last is the one over the limit.
+        refused = [m for viewer in (d, e) for m in messages(viewer, 1.5, "error")
+                   if "max-viewers" in m.get("message", "")]
         for viewer in (a, c, d, e):
             viewer.close()
         # Everyone gone, then a new viewer: still a first picture.
@@ -106,7 +108,7 @@ def viewers_check(port, page_id):
             "new_controller_click_lands": len(taken_clicks) == 1,
             "control_handed_back_when_controller_leaves": any(m["you"] for m in handed_back),
             "late_viewer_gets_picture_of_still_page": bool(c_frame) and c_frame["keyframe"],
-            "viewer_over_limit_refused": bool(refused),
+            "viewer_over_limit_refused": len(refused) == 1,
             "reconnect_after_all_left_gets_picture": bool(f_frame) and f_frame["keyframe"],
         }
         result["passed"] = all(result.values())

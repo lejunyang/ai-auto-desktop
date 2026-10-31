@@ -88,6 +88,12 @@ class Viewer:
         return None
 
     def close(self):
+        # Shut down first: on Linux closing a socket another thread is reading
+        # does not end the connection, and the server would never see it go.
+        try:
+            self.sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
         self.sock.close()
 
     def send(self, message):
