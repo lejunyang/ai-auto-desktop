@@ -10,21 +10,30 @@
 //!
 //! Protocol. Control messages are JSON text frames; the screen is binary frames.
 //! - server text: `{"type":"ready","source":..,"frames":{"header":"aad-frame/1",
-//!   "codec":"webp","codecs":["webp","jpeg","h264",..]},"video":{"h264":"h264_nvenc",..}}`;
-//!   `{"type":"stream","codec":"h264","webcodecs":"avc1.42c01f","encoder":..,
-//!   "width":..,"height":..}` before the first frame of every video stream (a
-//!   new stream starts with a keyframe); and `{"type":"error","message":..}`.
-//! - server binary: one frame per message, a [`HEADER_LEN`]-byte big-endian
-//!   header then the payload: version u8 (1), codec u8 (1 = jpeg, 2 = webp,
-//!   each a whole picture; 3 = h264 as Annex B, 4 = vp9, 5 = av1 as OBUs,
-//!   each one video frame), flags u8 (bit 0: keyframe, decodable on its own),
-//!   reserved u8, width u32, height u32, header length u16 (24), reserved u16,
-//!   timestamp u64 (milliseconds since the stream started). A reader skips
-//!   `header length` bytes, so later versions can append fields; a codec it
-//!   does not know is skipped, not misdrawn.
-//! - viewer text: optionally first `{"type":"hello","accept":["h264","webp"]}`,
+//!   "codec":"webp","codecs":["webp","jpeg","tiles","h264",..]},"mode":{"codec":"webp"},
+//!   "video":{"h264":"h264_nvenc",..}}`; `{"type":"mode","mode":{"codec":"tiles",
+//!   "video":"h264"}}` after a hello; `{"type":"stream","codec":"h264",
+//!   "webcodecs":"avc1.42c01f","encoder":..,"width":..,"height":..}` before the
+//!   first frame of every video stream (a new stream starts with a keyframe);
+//!   `{"type":"cursor","x":0..1,"y":0..1,"visible":true,"shape":{"png":..,
+//!   "width":..,"height":..,"hotspot":[x,y],"screen":[w,h]}}` where the desktop's
+//!   pointer is (`shape` when it changed, in screen pixels); and
+//!   `{"type":"error","message":..}`.
+//! - server binary: one frame per message, a big-endian header then the
+//!   payload: version u8 (1), codec u8 (1 = jpeg, 2 = webp, each a whole
+//!   picture; 3 = h264 as Annex B, 4 = vp9, 5 = av1 as OBUs, each one video
+//!   frame; 6 = tiles, patches over the last frame, see [`tiles`]), flags u8
+//!   (bit 0: keyframe, decodable on its own; bit 1: regions follow), reserved
+//!   u8, width u32, height u32, header length u16, reserved u16, timestamp u64
+//!   (milliseconds since the stream started): [`HEADER_LEN`] bytes. With
+//!   regions, a u16 count and x, y, w, h u16 each follow: only there did the
+//!   picture change, and a video frame shown beside tiles is drawn only there.
+//!   A reader skips `header length` bytes, so later versions can append
+//!   fields; a codec it does not know is skipped, not misdrawn.
+//! - viewer text: optionally first `{"type":"hello","accept":["tiles","h264","webp"]}`,
 //!   naming the codecs it can draw in order of preference (the first offered
-//!   codec, WebP by default, when not said); a later hello switches codec.
+//!   codec, WebP by default, when not said); tiles first with a video codec
+//!   after them means both, adaptively. A later hello switches.
 //!   `{"type":"keyframe"}` asks for a frame decodable on its own, after a
 //!   decoding error. Then
 //!   `{"type":"mouse","action":"move|down|up|wheel","x":0..1,"y":0..1,
@@ -33,8 +42,10 @@
 //!   that are not text, and `{"type":"text","text":"..."}` for typed text.
 //!
 //! Nothing is sent while the screen stays the same. Pictures are sent whole;
-//! video (see [`video`]) codes what did not change as skipped blocks, so a
-//! small change costs a small frame.
+//! tiles send only the 32-pixel tiles that changed, and moved regions as
+//! copies; video (see [`video`]) codes what did not change as skipped blocks.
+//! Adaptively, small changes go as tiles and large or rapid ones as video,
+//! and once the screen settles what video drew is sent again as sharp tiles.
 use clap::Args;
 use serde_json::{json, Value};
 use std::collections::VecDeque;
@@ -45,6 +56,11 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
+mod damage;
+mod scale;
+#[cfg(windows)]
+mod screen;
+mod tiles;
 mod video;
 
 #[derive(Args)]
@@ -73,9 +89,9 @@ pub struct AssistArgs {
     /// Only show the screen; ignore the viewer's mouse and keyboard.
     #[arg(long)]
     view_only: bool,
-    /// Codecs to offer, comma separated, from webp, jpeg, h264, vp9 and av1.
-    /// A viewer that sends no hello gets the first. `auto` offers webp, jpeg
-    /// and every video codec ffmpeg can encode here.
+    /// Codecs to offer, comma separated, from webp, jpeg, tiles, h264, vp9
+    /// and av1. A viewer that sends no hello gets the first. `auto` offers
+    /// webp, jpeg, tiles and every video codec ffmpeg can encode here.
     #[arg(long, default_value = "auto", value_delimiter = ',')]
     codecs: Vec<String>,
     /// The ffmpeg that encodes video; else AAD_FFMPEG, else ffmpeg on PATH.
@@ -116,6 +132,18 @@ pub struct AssistArgs {
     /// Report which video codecs and encoders work here, then exit.
     #[arg(long)]
     probe_video: bool,
+    /// For a viewer taking tiles and video: send a change as video when it
+    /// covers at least this percentage of the screen.
+    #[arg(long, default_value_t = 30, value_name = "PERCENT")]
+    video_area: u32,
+    /// ... or when changes of at least 1% of the screen come this many times
+    /// a second (scrolling, playback). Once the screen settles, what video
+    /// drew is sent again as sharp tiles.
+    #[arg(long, default_value_t = 8, value_name = "PER_SECOND")]
+    video_rate: u32,
+    /// Do not send where the desktop's mouse pointer is and what it looks like.
+    #[arg(long)]
+    hide_cursor: bool,
 }
 
 type Result<T> = std::result::Result<T, String>;
@@ -138,12 +166,16 @@ enum Codec {
     Vp9 = 4,
     /// One AV1 temporal unit (low-overhead OBUs).
     Av1 = 5,
+    /// Only the regions that changed, drawn over the previous frame (see
+    /// [`tiles`]).
+    Tiles = 6,
 }
 
 impl Codec {
-    const ALL: [Codec; 5] = [
+    const ALL: [Codec; 6] = [
         Codec::Webp,
         Codec::Jpeg,
+        Codec::Tiles,
         Codec::H264,
         Codec::Vp9,
         Codec::Av1,
@@ -157,6 +189,7 @@ impl Codec {
             Codec::H264 => "h264",
             Codec::Vp9 => "vp9",
             Codec::Av1 => "av1",
+            Codec::Tiles => "tiles",
         }
     }
 
@@ -181,7 +214,7 @@ fn offered(asked: &[String], probe: &video::Probe) -> Result<Vec<Codec>> {
     let mut codecs = Vec::new();
     for name in asked.iter().map(|n| n.trim().to_ascii_lowercase()) {
         if name == "auto" {
-            codecs.extend([Codec::Webp, Codec::Jpeg]);
+            codecs.extend([Codec::Webp, Codec::Jpeg, Codec::Tiles]);
             codecs.extend(
                 Codec::VIDEO
                     .into_iter()
@@ -190,7 +223,9 @@ fn offered(asked: &[String], probe: &video::Probe) -> Result<Vec<Codec>> {
             continue;
         }
         let codec = Codec::named(&name).ok_or_else(|| {
-            format!("--codecs: unknown codec {name:?}; use webp, jpeg, h264, vp9, av1 or auto")
+            format!(
+                "--codecs: unknown codec {name:?}; use webp, jpeg, tiles, h264, vp9, av1 or auto"
+            )
         })?;
         if codec.is_video() && probe.encoder(codec).is_none() {
             return Err(match &probe.ffmpeg {
@@ -240,13 +275,9 @@ struct Raw {
     width: u32,
     height: u32,
     format: PixelFormat,
-}
-
-impl Raw {
-    fn same(&self, other: &Raw) -> bool {
-        (self.width, self.height, self.format) == (other.width, other.height, other.format)
-            && (Arc::ptr_eq(&self.pixels, &other.pixels) || self.pixels == other.pixels)
-    }
+    /// What changed since the source's previous picture, when the source
+    /// knows; the pictures are compared otherwise.
+    damage: Option<damage::Damage>,
 }
 
 /// When an unchanged picture is sent again anyway, so a late viewer sees it.
@@ -317,20 +348,52 @@ struct Frame {
     data: Vec<u8>,
     width: u32,
     height: u32,
+    /// Where the picture changed, in frame pixels: a video frame shown beside
+    /// tiles is drawn only there, so what tiles drew sharp elsewhere stays.
+    regions: Option<Vec<damage::Rect>>,
 }
 
-/// The binary message for one frame: header, then payload.
+/// Most regions sent with a frame; more are joined into one around them all.
+const MAX_REGIONS: usize = 256;
+
+/// The binary message for one frame: header, then payload. With regions,
+/// flag bit 1 is set and the header grows by a u16 count and x, y, w, h u16
+/// each.
 fn encode(frame: &Frame, at_ms: u64) -> Vec<u8> {
-    let mut message = Vec::with_capacity(HEADER_LEN + frame.data.len());
+    let regions: Option<Vec<damage::Rect>> = frame.regions.as_ref().map(|regions| {
+        if regions.len() <= MAX_REGIONS {
+            return regions.clone();
+        }
+        let left = regions.iter().map(|r| r.x).min().unwrap_or(0);
+        let top = regions.iter().map(|r| r.y).min().unwrap_or(0);
+        let right = regions.iter().map(|r| r.x + r.w).max().unwrap_or(0);
+        let bottom = regions.iter().map(|r| r.y + r.h).max().unwrap_or(0);
+        vec![damage::Rect {
+            x: left,
+            y: top,
+            w: right - left,
+            h: bottom - top,
+        }]
+    });
+    let header = HEADER_LEN + regions.as_ref().map_or(0, |r| 2 + 8 * r.len());
+    let mut message = Vec::with_capacity(header + frame.data.len());
     message.push(HEADER_VERSION);
     message.push(frame.codec as u8);
-    message.push(u8::from(frame.keyframe));
+    message.push(u8::from(frame.keyframe) | if regions.is_some() { 2 } else { 0 });
     message.push(0);
     message.extend_from_slice(&frame.width.to_be_bytes());
     message.extend_from_slice(&frame.height.to_be_bytes());
-    message.extend_from_slice(&(HEADER_LEN as u16).to_be_bytes());
+    message.extend_from_slice(&(header as u16).to_be_bytes());
     message.extend_from_slice(&0u16.to_be_bytes());
     message.extend_from_slice(&at_ms.to_be_bytes());
+    if let Some(regions) = &regions {
+        message.extend_from_slice(&(regions.len() as u16).to_be_bytes());
+        for r in regions {
+            for value in [r.x, r.y, r.w, r.h] {
+                message.extend_from_slice(&(value.min(u32::from(u16::MAX)) as u16).to_be_bytes());
+            }
+        }
+    }
     message.extend_from_slice(&frame.data);
     message
 }
@@ -358,6 +421,10 @@ trait Source {
     /// Most captures per second.
     fn rate(&mut self, fps: u32);
     fn input(&mut self, event: &Value) -> Result<()>;
+    /// A `cursor` message when the pointer changed; `fresh` for a new viewer.
+    fn cursor(&mut self, _fresh: bool) -> Option<Value> {
+        None
+    }
 }
 
 /// Everything about the stream decided at startup.
@@ -370,13 +437,27 @@ struct Config {
     max_height: u32,
     fps: Option<u32>,
     view_only: bool,
+    video_area: u32,
+    video_rate: u32,
+    hide_cursor: bool,
 }
 
 impl Config {
-    fn fps(&self, codec: Codec) -> u32 {
+    /// Whole pictures are costly, so they come 5 a second by default; the
+    /// other modes send only changes and default to 30.
+    fn fps(&self, mode: Mode) -> u32 {
         self.fps
-            .unwrap_or(if codec.is_video() { 30 } else { 5 })
+            .unwrap_or(if matches!(mode, Mode::Picture(_)) {
+                5
+            } else {
+                30
+            })
             .clamp(1, 60)
+    }
+
+    /// What a viewer that says nothing gets: the first codec offered.
+    fn first(&self) -> Mode {
+        Mode::of(self.offered[0], &[], &self.offered)
     }
 }
 
@@ -435,8 +516,11 @@ pub fn run(args: &AssistArgs) -> Result<Value> {
         max_height: args.max_height,
         fps: args.fps,
         view_only: args.view_only,
+        video_area: args.video_area.clamp(1, 100),
+        video_rate: args.video_rate.max(1),
+        hide_cursor: args.hide_cursor,
     };
-    let first = config.offered[0];
+    let first = config.first();
     let mut source: Box<dyn Source> = match (args.browser_port, args.desktop) {
         (Some(port), false) => Box::new(browser::Page::start(
             port,
@@ -658,25 +742,28 @@ fn serve(
         .filter(|(codec, _)| config.offered.contains(codec))
         .map(|(codec, name)| (codec.name().to_string(), json!(name)))
         .collect();
-    let mut pipeline = Pipeline::new(config, config.offered[0]);
-    source.rate(config.fps(pipeline.codec));
+    let mut pipeline = Pipeline::new(config, config.first());
+    source.rate(config.fps(pipeline.mode));
     outbox.text(
         &json!({"type": "ready", "source": source.name(), "view_only": config.view_only,
-        "frames": {"header": "aad-frame/1", "codec": pipeline.codec.name(), "codecs": codecs},
-        "video": video}),
+        "frames": {"header": "aad-frame/1", "codec": config.offered[0].name(), "codecs": codecs},
+        "mode": pipeline.mode.describe(), "video": video}),
     );
+    let mut fresh = true;
     let started = Instant::now();
     let result = (|| -> Result<()> {
         while !closed.load(Ordering::SeqCst) && !stop.load(Ordering::SeqCst) && !outbox.failed() {
             while let Ok(event) = inbox.try_recv() {
                 match event["type"].as_str() {
-                    Some("hello") => match event["accept"].as_array().map(|a| choose(a, &config.offered)) {
+                    Some("hello") => match event["accept"].as_array().map(|a| (choose(a, &config.offered), a)) {
                         None => {}
-                        Some(Some(chosen)) => {
-                            pipeline.switch(chosen);
-                            source.rate(config.fps(chosen));
+                        Some((Some(chosen), accept)) => {
+                            let mode = Mode::of(chosen, accept, &config.offered);
+                            pipeline.switch(mode);
+                            source.rate(config.fps(mode));
+                            outbox.text(&json!({"type": "mode", "mode": mode.describe()}));
                         }
-                        Some(None) => outbox.text(&json!({"type": "error",
+                        Some((None, _)) => outbox.text(&json!({"type": "error",
                             "message": format!("no common codec; this server sends {}", codecs.join(", "))})),
                     },
                     Some("keyframe") => pipeline.keyframe(),
@@ -688,6 +775,13 @@ fn serve(
                     }
                 }
             }
+            if !config.hide_cursor {
+                if let Some(cursor) = source.cursor(fresh) {
+                    outbox.text(&cursor);
+                }
+                fresh = false;
+            }
+            pipeline.tick();
             if outbox.queued() <= 1 && !pipeline.busy() {
                 if let Some(picture) = source.capture(pipeline.want())? {
                     if let Err(error) = pipeline.feed(picture) {
@@ -724,63 +818,138 @@ enum Output {
     Frame(Frame),
 }
 
-enum Stage {
-    None,
-    Pictures(Pictures),
-    Video(video::Encoder),
+/// How frames are made for one viewer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Mode {
+    /// Whole pictures in this codec.
+    Picture(Codec),
+    /// Every change as video.
+    Video(Codec),
+    /// Only the changed regions, as patches.
+    Tiles,
+    /// Patches for small changes, this video codec for large or rapid ones,
+    /// and patches again, sharp, for what video drew once the screen settles.
+    Adaptive(Codec),
 }
 
-/// Turns captures into frames in the codec the viewer chose, sending only
-/// what changed.
+impl Mode {
+    /// The mode for a codec the viewer chose: tiles become adaptive when the
+    /// viewer also takes a video codec this server offers.
+    fn of(chosen: Codec, accept: &[Value], offered: &[Codec]) -> Mode {
+        match chosen {
+            Codec::Tiles => accept
+                .iter()
+                .find_map(|wanted| {
+                    offered
+                        .iter()
+                        .copied()
+                        .find(|c| c.is_video() && wanted == c.name())
+                })
+                .map_or(Mode::Tiles, Mode::Adaptive),
+            c if c.is_video() => Mode::Video(c),
+            c => Mode::Picture(c),
+        }
+    }
+
+    fn describe(self) -> Value {
+        match self {
+            Mode::Picture(c) | Mode::Video(c) => json!({"codec": c.name()}),
+            Mode::Tiles => json!({"codec": "tiles"}),
+            Mode::Adaptive(c) => json!({"codec": "tiles", "video": c.name()}),
+        }
+    }
+}
+
+/// How long the screen must stay still before what video drew is sent
+/// again as patches.
+const SETTLE: Duration = Duration::from_millis(400);
+
+/// Which stage the next frame comes from, so frames leave in the order their
+/// pictures went in even when the two stages finish out of order.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Next {
+    Tiles,
+    Video,
+}
+
+/// Turns captures into frames for the viewer's mode, sending only what
+/// changed.
 struct Pipeline<'a> {
     config: &'a Config,
-    codec: Codec,
-    stage: Stage,
-    /// The last raw picture sent on, to compare the next with and to start a
-    /// new stream from.
+    mode: Mode,
+    pictures: Option<Pictures>,
+    tiles: Option<tiles::Tiles>,
+    video: Option<video::Encoder>,
+    /// The last raw picture sent on: what the next is compared with, and what
+    /// a new stream starts from.
     last: Option<Raw>,
     last_sent: Instant,
     /// The last picture that arrived encoded, to send again on request.
     last_frame: Option<Frame>,
     /// A new video stream has not been announced yet.
     announce: bool,
+    /// Adaptive: regions last drawn by video, to send again sharp.
+    blurred: Option<damage::Mask>,
+    /// Adaptive: when large changes happened in the last second.
+    changes: VecDeque<Instant>,
+    /// Adaptive: the stages frames are awaited from, oldest first.
+    order: VecDeque<Next>,
+    /// The screen at the size pictures and video are sent at, kept up to date
+    /// from each change.
+    scaled: scale::Downscale,
+    /// Adaptive: where each video frame in flight changed the screen.
+    regions: VecDeque<Vec<damage::Rect>>,
     out: VecDeque<Output>,
 }
 
 impl<'a> Pipeline<'a> {
-    fn new(config: &'a Config, codec: Codec) -> Self {
+    fn new(config: &'a Config, mode: Mode) -> Self {
         Self {
             config,
-            codec,
-            stage: Stage::None,
+            mode,
+            pictures: None,
+            tiles: None,
+            video: None,
             last: None,
             last_sent: Instant::now(),
             last_frame: None,
             announce: false,
+            blurred: None,
+            changes: VecDeque::new(),
+            order: VecDeque::new(),
+            scaled: scale::Downscale::default(),
+            regions: VecDeque::new(),
             out: VecDeque::new(),
         }
     }
 
     fn want(&self) -> Want {
-        if self.codec.is_video() {
-            Want::Raw
-        } else {
-            Want::Picture(self.codec)
+        match self.mode {
+            Mode::Picture(codec) => Want::Picture(codec),
+            _ => Want::Raw,
         }
     }
 
     fn busy(&self) -> bool {
-        match &self.stage {
-            Stage::None => false,
-            Stage::Pictures(pictures) => pictures.busy(),
-            Stage::Video(encoder) => encoder.busy(),
-        }
+        self.pictures.as_ref().is_some_and(Pictures::busy)
+            || self.tiles.as_ref().is_some_and(tiles::Tiles::busy)
+            || self.video.as_ref().is_some_and(video::Encoder::busy)
+            // Adaptive: one picture at a time, so patches never land under
+            // a video frame of an older screen.
+            || (matches!(self.mode, Mode::Adaptive(_))
+                && self.video.as_ref().is_some_and(video::Encoder::in_flight))
     }
 
-    fn switch(&mut self, codec: Codec) {
-        if codec != self.codec {
-            self.codec = codec;
-            self.stage = Stage::None;
+    fn switch(&mut self, mode: Mode) {
+        if mode != self.mode {
+            self.mode = mode;
+            self.pictures = None;
+            self.tiles = None;
+            self.video = None;
+            self.blurred = None;
+            self.order.clear();
+            self.regions.clear();
+            self.scaled = scale::Downscale::default();
             self.last_frame = None;
             self.restart();
         }
@@ -788,23 +957,22 @@ impl<'a> Pipeline<'a> {
 
     /// The current screen again, from a keyframe.
     fn keyframe(&mut self) {
-        if self.codec.is_video() {
-            self.stage = Stage::None;
-        }
+        self.video = None;
+        self.order.retain(|next| *next != Next::Video);
+        self.regions.clear();
         if let Some(frame) = self.last_frame.clone() {
             self.out.push_back(Output::Frame(frame));
         }
         self.restart();
     }
 
-    /// Sends the last raw picture into the current stage again.
+    /// Sends the last raw picture again, whole.
     fn restart(&mut self) {
-        if let Some(raw) = self.last.take() {
-            if let Err(error) = self.raw(raw.clone(), true) {
+        if let Some(raw) = self.last.clone() {
+            if let Err(error) = self.send(raw, None) {
                 self.out
                     .push_back(Output::Text(json!({"type": "error", "message": error})));
             }
-            self.last = Some(raw);
         }
     }
 
@@ -815,97 +983,299 @@ impl<'a> Pipeline<'a> {
                 self.out.push_back(Output::Frame(frame));
                 Ok(())
             }
-            Picture::Raw(raw) => self.raw(raw, false),
+            Picture::Raw(raw) => self.raw(raw),
         }
     }
 
-    fn raw(&mut self, raw: Raw, force: bool) -> Result<()> {
-        let unchanged = self.last.as_ref().is_some_and(|last| last.same(&raw));
-        if unchanged && !force && (self.codec.is_video() || self.last_sent.elapsed() < RESEND) {
+    fn raw(&mut self, raw: Raw) -> Result<()> {
+        let damage = match &self.last {
+            Some(last)
+                if (last.width, last.height, last.format)
+                    == (raw.width, raw.height, raw.format) =>
+            {
+                Some(match &raw.damage {
+                    Some(damage) => {
+                        damage::refine(&last.pixels, &raw.pixels, raw.width, raw.height, damage)
+                    }
+                    None => damage::Damage {
+                        moves: Vec::new(),
+                        dirty: damage::diff(&last.pixels, &raw.pixels, raw.width, raw.height)
+                            .rects(),
+                    },
+                })
+            }
+            _ => None,
+        };
+        if damage.as_ref().is_some_and(damage::Damage::is_empty) {
+            // Pictures are repeated now and then for a viewer that missed one.
+            if matches!(self.mode, Mode::Picture(_)) && self.last_sent.elapsed() >= RESEND {
+                return self.send(raw, None);
+            }
             return Ok(());
         }
+        self.send(raw, damage)
+    }
+
+    /// Sends a picture on; `damage` is what changed since the last one, or
+    /// `None` for a whole new picture.
+    fn send(&mut self, raw: Raw, damage: Option<damage::Damage>) -> Result<()> {
         self.last = Some(raw.clone());
         self.last_sent = Instant::now();
-        if self.codec.is_video() {
-            let shape = (raw.width, raw.height, raw.format);
-            if !matches!(&self.stage, Stage::Video(encoder) if encoder.input == shape) {
-                // A new size or a first picture: a new stream, from a keyframe.
-                self.stage = Stage::None;
-                let ffmpeg = self.config.probe.ffmpeg.as_ref().ok_or("no ffmpeg")?;
-                let name = self
-                    .config
-                    .probe
-                    .encoder(self.codec)
-                    .ok_or_else(|| format!("no {} encoder", self.codec.name()))?;
-                let encoder = video::Encoder::start(
-                    ffmpeg,
-                    name,
-                    &self.config.video,
-                    raw.width,
-                    raw.height,
-                    raw.format,
-                )?;
-                self.stage = Stage::Video(encoder);
-                self.announce = true;
+        let (max_width, max_height) = (self.config.max_width, self.config.max_height);
+        match self.mode {
+            Mode::Picture(codec) => {
+                let size = fit(raw.width, raw.height, max_width, max_height);
+                let raw = self.scaled(raw, damage.as_ref(), size);
+                if !self.pictures.as_ref().is_some_and(|p| p.codec == codec) {
+                    self.pictures = Some(Pictures::start(codec, self.config));
+                }
+                if let Some(pictures) = &self.pictures {
+                    pictures.push(raw);
+                }
             }
-            if let Stage::Video(encoder) = &self.stage {
-                encoder.push(raw.pixels);
+            Mode::Video(codec) => {
+                let size = video::output_size(raw.width, raw.height, max_width, max_height);
+                let raw = self.scaled(raw, damage.as_ref(), size);
+                self.video(codec, &raw)?;
             }
-        } else {
-            if !matches!(&self.stage, Stage::Pictures(p) if p.codec == self.codec) {
-                self.stage = Stage::Pictures(Pictures::start(self.codec, self.config));
-            }
-            if let Stage::Pictures(pictures) = &self.stage {
-                pictures.push(raw);
+            Mode::Tiles => self.tiles(raw, damage),
+            Mode::Adaptive(codec) => {
+                // Kept up to date through tiles too, for when video takes over.
+                let small = video::output_size(raw.width, raw.height, max_width, max_height);
+                let small = self.scaled(raw.clone(), damage.as_ref(), small);
+                let Some(damage) = damage else {
+                    self.blurred = None;
+                    self.tiles(raw, None);
+                    return Ok(());
+                };
+                let size = (raw.width, raw.height);
+                // Moves cost nothing as patches when the picture is not scaled.
+                let unscaled = video::output_size(
+                    size.0,
+                    size.1,
+                    self.config.max_width,
+                    self.config.max_height,
+                ) == size;
+                let counted = if unscaled {
+                    damage::Damage {
+                        moves: Vec::new(),
+                        dirty: damage.dirty.clone(),
+                    }
+                } else {
+                    damage.clone()
+                };
+                let share = damage::Mask::of(&counted, size.0, size.1).share();
+                let now = Instant::now();
+                if share >= 0.01 {
+                    self.changes.push_back(now);
+                }
+                while self
+                    .changes
+                    .front()
+                    .is_some_and(|at| now - *at > Duration::from_secs(1))
+                {
+                    self.changes.pop_front();
+                }
+                let motion = share * 100.0 >= f64::from(self.config.video_area)
+                    || (share >= 0.01 && self.changes.len() >= self.config.video_rate as usize);
+                if motion {
+                    // Only the changed part of the decoded frame is drawn.
+                    let scale = (
+                        f64::from(small.width) / f64::from(size.0),
+                        f64::from(small.height) / f64::from(size.1),
+                    );
+                    let regions = damage::Mask::of(&damage, size.0, size.1)
+                        .rects()
+                        .into_iter()
+                        .filter_map(|r| r.scale(scale).clip(small.width, small.height))
+                        .collect();
+                    self.video(codec, &small)?;
+                    self.regions.push_back(regions);
+                    let mask = damage::Mask::of(&damage, size.0, size.1);
+                    match &mut self.blurred {
+                        Some(blurred) => blurred.union(&mask),
+                        None => self.blurred = Some(mask),
+                    }
+                } else {
+                    let mut damage = damage;
+                    if let Some(blurred) = self.blurred.take() {
+                        damage.dirty.extend(blurred.rects());
+                    }
+                    self.tiles(raw, Some(damage));
+                }
             }
         }
         Ok(())
+    }
+
+    /// The picture at `size`, rescaling only what `damage` covers.
+    fn scaled(&mut self, raw: Raw, damage: Option<&damage::Damage>, size: (u32, u32)) -> Raw {
+        if size == (raw.width, raw.height) {
+            raw
+        } else {
+            self.scaled.apply(&raw, damage, size)
+        }
+    }
+
+    fn tiles(&mut self, raw: Raw, damage: Option<damage::Damage>) {
+        let config = self.config;
+        let adaptive = matches!(self.mode, Mode::Adaptive(_));
+        let tiles = self.tiles.get_or_insert_with(|| {
+            tiles::Tiles::start(
+                config.quality,
+                (config.max_width, config.max_height),
+                adaptive,
+            )
+        });
+        let full = damage.is_none();
+        tiles.push(raw, damage.unwrap_or_default(), full);
+        if matches!(self.mode, Mode::Adaptive(_)) {
+            self.order.push_back(Next::Tiles);
+        }
+    }
+
+    fn video(&mut self, codec: Codec, raw: &Raw) -> Result<()> {
+        let shape = (raw.width, raw.height, raw.format);
+        if !self
+            .video
+            .as_ref()
+            .is_some_and(|encoder| encoder.input == shape)
+        {
+            // A new size or a first picture: a new stream, from a keyframe.
+            self.video = None;
+            self.order.retain(|next| *next != Next::Video);
+            self.regions.clear();
+            let ffmpeg = self.config.probe.ffmpeg.as_ref().ok_or("no ffmpeg")?;
+            let name = self
+                .config
+                .probe
+                .encoder(codec)
+                .ok_or_else(|| format!("no {} encoder", codec.name()))?;
+            self.video = Some(video::Encoder::start(
+                ffmpeg,
+                name,
+                &self.config.video,
+                raw.width,
+                raw.height,
+                raw.format,
+            )?);
+            self.announce = true;
+        }
+        if let Some(encoder) = &mut self.video {
+            encoder.push(raw.pixels.clone());
+        }
+        if matches!(self.mode, Mode::Adaptive(_)) {
+            self.order.push_back(Next::Video);
+        }
+        Ok(())
+    }
+
+    /// Adaptive: once the screen settles, what video drew is sent again as
+    /// sharp patches.
+    fn tick(&mut self) {
+        if matches!(self.mode, Mode::Adaptive(_))
+            && self.blurred.is_some()
+            && self.last_sent.elapsed() >= SETTLE
+            && !self.busy()
+        {
+            if let (Some(raw), Some(blurred)) = (self.last.clone(), self.blurred.take()) {
+                let dirty = blurred.rects();
+                self.tiles(
+                    raw,
+                    Some(damage::Damage {
+                        moves: Vec::new(),
+                        dirty,
+                    }),
+                );
+            }
+        }
     }
 
     fn poll(&mut self) -> Result<Option<Output>> {
         if let Some(output) = self.out.pop_front() {
             return Ok(Some(output));
         }
-        match &mut self.stage {
-            Stage::None => Ok(None),
-            Stage::Pictures(pictures) => Ok(pictures.poll()?.map(Output::Frame)),
-            Stage::Video(encoder) => {
-                let Some(packet) = encoder.poll()? else {
-                    return Ok(None);
-                };
-                let frame = Frame {
-                    codec: encoder.codec,
-                    keyframe: packet.key,
-                    data: packet.data,
-                    width: encoder.width,
-                    height: encoder.height,
-                };
-                if self.announce {
-                    self.announce = false;
-                    self.out.push_back(Output::Frame(frame));
-                    return Ok(Some(Output::Text(json!({"type": "stream",
-                        "codec": encoder.codec.name(), "webcodecs": packet.webcodecs,
-                        "encoder": encoder.name, "width": encoder.width, "height": encoder.height}))));
-                }
-                Ok(Some(Output::Frame(frame)))
+        if let Some(pictures) = &self.pictures {
+            if let Some(frame) = pictures.poll()? {
+                return Ok(Some(Output::Frame(frame)));
             }
         }
+        let adaptive = matches!(self.mode, Mode::Adaptive(_));
+        let next = self.order.front().copied();
+        if !adaptive || next == Some(Next::Tiles) {
+            if let Some(tiles) = &self.tiles {
+                if let Some(frame) = tiles.poll()? {
+                    self.order.pop_front();
+                    return Ok(Some(Output::Frame(frame)));
+                }
+            }
+        }
+        if !adaptive || next == Some(Next::Video) {
+            if let Some(encoder) = &mut self.video {
+                if let Some(packet) = encoder.poll()? {
+                    self.order.pop_front();
+                    let frame = Frame {
+                        codec: encoder.codec,
+                        keyframe: packet.key,
+                        data: packet.data,
+                        width: encoder.width,
+                        height: encoder.height,
+                        regions: if adaptive {
+                            self.regions.pop_front()
+                        } else {
+                            None
+                        },
+                    };
+                    if self.announce {
+                        self.announce = false;
+                        self.out.push_back(Output::Frame(frame));
+                        return Ok(Some(Output::Text(json!({"type": "stream",
+                            "codec": encoder.codec.name(), "webcodecs": packet.webcodecs,
+                            "encoder": encoder.name, "width": encoder.width, "height": encoder.height}))));
+                    }
+                    return Ok(Some(Output::Frame(frame)));
+                }
+                // An encoder that dropped a picture is not waited for.
+                if adaptive && !encoder.in_flight() && !encoder.busy() {
+                    self.order.pop_front();
+                    self.regions.pop_front();
+                }
+            } else if adaptive {
+                self.order.pop_front();
+            }
+        }
+        Ok(None)
     }
 
-    /// A video encoder failed: say so, and go on with pictures if any are offered.
+    /// A video encoder failed: say so, and go on without video if the viewer
+    /// can.
     fn fail(&mut self, error: &str, outbox: &Outbox, source: &mut dyn Source) -> Result<()> {
-        let fallback = self.config.offered.iter().copied().find(|c| !c.is_video());
+        let fallback = match self.mode {
+            Mode::Adaptive(_) => Some(Mode::Tiles),
+            Mode::Video(_) => self
+                .config
+                .offered
+                .iter()
+                .copied()
+                .find(|c| !c.is_video())
+                .map(|c| Mode::of(c, &[], &self.config.offered)),
+            _ => None,
+        };
         let message = match fallback {
-            Some(codec) => format!("{error}; sending {} instead", codec.name()),
+            Some(mode) => format!(
+                "{error}; sending {} instead",
+                mode.describe()["codec"].as_str().unwrap_or("pictures")
+            ),
             None => error.to_string(),
         };
         outbox.text(&json!({"type": "error", "message": message}));
-        let Some(codec) = fallback.filter(|_| self.codec.is_video()) else {
+        let Some(mode) = fallback else {
             return Err(error.to_string());
         };
-        self.stage = Stage::None;
-        self.switch(codec);
-        source.rate(self.config.fps(codec));
+        self.video = None;
+        self.switch(mode);
+        source.rate(self.config.fps(mode));
+        outbox.text(&json!({"type": "mode", "mode": mode.describe()}));
         Ok(())
     }
 }
@@ -1045,6 +1415,7 @@ fn picture(
         data,
         width: image.width(),
         height: image.height(),
+        regions: None,
     })
 }
 
@@ -1322,6 +1693,7 @@ mod browser {
                 data,
                 width,
                 height,
+                regions: None,
             }))
         }
     }
@@ -1359,6 +1731,7 @@ mod browser {
                         data,
                         width,
                         height,
+                        regions: None,
                     })))
                 }
                 Want::Picture(_) => {
@@ -1379,6 +1752,8 @@ mod browser {
                         width,
                         height,
                         format: PixelFormat::Rgba,
+                        // A screencast frame says nothing of what changed.
+                        damage: None,
                     })))
                 }
             }
@@ -1476,15 +1851,9 @@ mod desktop {
 
 #[cfg(windows)]
 mod desktop {
-    use super::{fraction, named_key, Pace, Picture, PixelFormat, Raw, Result, Source, Want};
+    use super::screen::{self, Pointer, Screen};
+    use super::{fraction, named_key, Pace, Picture, Result, Source, Want};
     use serde_json::{json, Value};
-    use std::sync::Arc;
-    use windows::Win32::Foundation::HWND;
-    use windows::Win32::Graphics::Gdi::{
-        BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC,
-        GetDIBits, ReleaseDC, SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, CAPTUREBLT,
-        DIB_RGB_COLORS, SRCCOPY,
-    };
     use windows::Win32::UI::Input::KeyboardAndMouse::{
         SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYBD_EVENT_FLAGS,
         KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL,
@@ -1492,82 +1861,20 @@ mod desktop {
         MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK,
         MOUSEEVENTF_WHEEL, MOUSEINPUT, MOUSE_EVENT_FLAGS, VIRTUAL_KEY,
     };
-    use windows::Win32::UI::WindowsAndMessaging::{
-        GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
-        SM_YVIRTUALSCREEN,
-    };
 
     pub struct Desktop {
         pace: Pace,
+        screen: Screen,
+        pointer: Pointer,
     }
 
     pub fn open(fps: u32) -> Result<Box<dyn Source>> {
+        screen::dpi_aware();
         Ok(Box::new(Desktop {
             pace: Pace::new(fps),
+            screen: Screen::open(),
+            pointer: Pointer::default(),
         }))
-    }
-
-    /// The virtual screen as BGRA, with its size.
-    fn grab() -> Result<(Vec<u8>, u32, u32)> {
-        unsafe {
-            let (left, top) = (
-                GetSystemMetrics(SM_XVIRTUALSCREEN),
-                GetSystemMetrics(SM_YVIRTUALSCREEN),
-            );
-            let (width, height) = (
-                GetSystemMetrics(SM_CXVIRTUALSCREEN),
-                GetSystemMetrics(SM_CYVIRTUALSCREEN),
-            );
-            if width <= 0 || height <= 0 {
-                return Err("no screen to capture".into());
-            }
-            let screen = GetDC(HWND::default());
-            let memory = CreateCompatibleDC(screen);
-            let bitmap = CreateCompatibleBitmap(screen, width, height);
-            let old = SelectObject(memory, bitmap);
-            let copied = BitBlt(
-                memory,
-                0,
-                0,
-                width,
-                height,
-                screen,
-                left,
-                top,
-                SRCCOPY | CAPTUREBLT,
-            );
-            let mut info = BITMAPINFO {
-                bmiHeader: BITMAPINFOHEADER {
-                    biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-                    biWidth: width,
-                    biHeight: -height,
-                    biPlanes: 1,
-                    biBitCount: 32,
-                    biCompression: BI_RGB.0,
-                    ..Default::default()
-                },
-                ..Default::default()
-            };
-            let mut bgra = vec![0u8; width as usize * height as usize * 4];
-            let lines = GetDIBits(
-                memory,
-                bitmap,
-                0,
-                height as u32,
-                Some(bgra.as_mut_ptr().cast()),
-                &mut info,
-                DIB_RGB_COLORS,
-            );
-            SelectObject(memory, old);
-            let _ = DeleteObject(bitmap);
-            let _ = DeleteDC(memory);
-            ReleaseDC(HWND::default(), screen);
-            copied.map_err(|e| format!("could not copy the screen: {e}"))?;
-            if lines == 0 {
-                return Err("could not read the screen".into());
-            }
-            Ok((bgra, width as u32, height as u32))
-        }
     }
 
     fn send(inputs: &[INPUT]) -> Result<()> {
@@ -1612,7 +1919,16 @@ mod desktop {
 
     impl Source for Desktop {
         fn name(&self) -> Value {
-            json!({"kind": "desktop"})
+            let capture = if self.screen.duplicating() {
+                "dxgi"
+            } else {
+                "gdi"
+            };
+            let mut name = json!({"kind": "desktop", "capture": capture});
+            if let Some(reason) = &self.screen.fallback {
+                name["fallback"] = json!(reason);
+            }
+            name
         }
 
         fn rate(&mut self, fps: u32) {
@@ -1624,13 +1940,11 @@ mod desktop {
             if !self.pace.due() {
                 return Ok(None);
             }
-            let (bgra, width, height) = grab()?;
-            Ok(Some(Picture::Raw(Raw {
-                pixels: Arc::new(bgra),
-                width,
-                height,
-                format: PixelFormat::Bgra,
-            })))
+            Ok(self.screen.capture()?.map(Picture::Raw))
+        }
+
+        fn cursor(&mut self, fresh: bool) -> Option<Value> {
+            self.pointer.message(fresh)
         }
 
         fn input(&mut self, event: &Value) -> Result<()> {
@@ -1712,6 +2026,7 @@ mod tests {
             data: vec![0, 0, 0, 1, 0x67],
             width: 1536,
             height: 960,
+            regions: None,
         };
         let message = encode(&frame, 1234);
         assert_eq!(message.len(), HEADER_LEN + 5);
@@ -1727,6 +2042,46 @@ mod tests {
             1234
         );
         assert_eq!(&message[HEADER_LEN..], &[0, 0, 0, 1, 0x67]);
+    }
+
+    #[test]
+    fn regions_grow_the_header_and_old_readers_skip_them() {
+        let frame = Frame {
+            codec: Codec::H264,
+            keyframe: false,
+            data: vec![9, 9],
+            width: 100,
+            height: 50,
+            regions: Some(vec![damage::Rect {
+                x: 1,
+                y: 2,
+                w: 3,
+                h: 4,
+            }]),
+        };
+        let message = encode(&frame, 7);
+        assert_eq!(message[2], 2);
+        let skip = usize::from(u16::from_be_bytes(message[12..14].try_into().unwrap()));
+        assert_eq!(skip, HEADER_LEN + 2 + 8);
+        assert_eq!(&message[24..26], &[0, 1]);
+        assert_eq!(&message[26..34], &[0, 1, 0, 2, 0, 3, 0, 4]);
+        assert_eq!(&message[skip..], &[9, 9]);
+        let many = Frame {
+            regions: Some(
+                (0..MAX_REGIONS as u32 + 1)
+                    .map(|i| damage::Rect {
+                        x: i,
+                        y: i,
+                        w: 1,
+                        h: 1,
+                    })
+                    .collect(),
+            ),
+            ..frame
+        };
+        let message = encode(&many, 7);
+        // Too many are joined into one around them all.
+        assert_eq!(&message[24..34], &[0, 1, 0, 0, 0, 0, 1, 1, 1, 1]);
     }
 
     #[test]
@@ -1749,14 +2104,14 @@ mod tests {
     fn codecs_are_offered_only_when_they_can_be_sent() {
         let none = video::Probe::default();
         let auto = offered(&["auto".into()], &none).unwrap();
-        assert_eq!(auto, vec![Codec::Webp, Codec::Jpeg]);
+        assert_eq!(auto, vec![Codec::Webp, Codec::Jpeg, Codec::Tiles]);
         let found = video::Probe {
             chosen: vec![(Codec::Av1, "libsvtav1".into())],
             ..video::Probe::default()
         };
         assert_eq!(
             offered(&["auto".into()], &found).unwrap(),
-            vec![Codec::Webp, Codec::Jpeg, Codec::Av1]
+            vec![Codec::Webp, Codec::Jpeg, Codec::Tiles, Codec::Av1]
         );
         assert_eq!(
             offered(&["av1".into(), "webp".into(), "av1".into()], &found).unwrap(),
@@ -1778,6 +2133,7 @@ mod tests {
             width: 40,
             height: 20,
             format: PixelFormat::Rgba,
+            damage: None,
         };
         let frame = picture(&raw, Codec::Jpeg, 80, (20, 0)).unwrap();
         assert_eq!((frame.width, frame.height), (20, 10));
@@ -1791,28 +2147,24 @@ mod tests {
     }
 
     #[test]
-    fn identical_pictures_are_recognised() {
-        let pixels = Arc::new(vec![1u8; 16]);
-        let a = Raw {
-            pixels: pixels.clone(),
-            width: 2,
-            height: 2,
-            format: PixelFormat::Bgra,
-        };
-        let b = Raw {
-            pixels: Arc::new(vec![1u8; 16]),
-            ..a.clone()
-        };
-        let c = Raw {
-            pixels: Arc::new(vec![2u8; 16]),
-            ..a.clone()
-        };
-        assert!(a.same(&b));
-        assert!(!a.same(&c));
-        assert!(!a.same(&Raw {
-            width: 4,
-            height: 1,
-            ..a.clone()
-        }));
+    fn tiles_with_video_become_adaptive() {
+        let all = [Codec::Webp, Codec::Tiles, Codec::H264, Codec::Av1];
+        let accept = [json!("tiles"), json!("av1"), json!("h264"), json!("webp")];
+        assert_eq!(
+            Mode::of(Codec::Tiles, &accept, &all),
+            Mode::Adaptive(Codec::Av1)
+        );
+        assert_eq!(Mode::of(Codec::Tiles, &[json!("tiles")], &all), Mode::Tiles);
+        assert_eq!(
+            Mode::of(Codec::H264, &accept, &all),
+            Mode::Video(Codec::H264)
+        );
+        assert_eq!(
+            Mode::of(Codec::Webp, &accept, &all),
+            Mode::Picture(Codec::Webp)
+        );
+        // Video the server does not offer is not used.
+        let pictures = [Codec::Tiles, Codec::Webp];
+        assert_eq!(Mode::of(Codec::Tiles, &accept, &pictures), Mode::Tiles);
     }
 }

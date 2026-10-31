@@ -590,6 +590,10 @@ pub struct Encoder {
     pub width: u32,
     pub height: u32,
     pub input: (u32, u32, PixelFormat),
+    /// Pictures written or waiting whose frames have not come out yet, and
+    /// since when the oldest has been waiting.
+    pending: usize,
+    since: Option<Instant>,
 }
 
 impl Encoder {
@@ -704,15 +708,30 @@ impl Encoder {
             width: out_width,
             height: out_height,
             input: (width, height, format),
+            pending: 0,
+            since: None,
         })
     }
 
     /// Queues a picture, replacing one not yet taken: a slow encoder gets the
     /// newest screen rather than a backlog.
-    pub fn push(&self, pixels: Arc<Vec<u8>>) {
+    pub fn push(&mut self, pixels: Arc<Vec<u8>>) {
         let (lock, wake) = &*self.slot;
-        lock.lock().unwrap().next = Some(pixels);
+        let replaced = lock.lock().unwrap().next.replace(pixels).is_some();
         wake.notify_one();
+        if !replaced {
+            self.pending += 1;
+            self.since.get_or_insert_with(Instant::now);
+        }
+    }
+
+    /// Whether a picture went in whose frame has not come out. An encoder
+    /// that dropped one is not waited for longer than two seconds.
+    pub fn in_flight(&self) -> bool {
+        self.pending > 0
+            && self
+                .since
+                .is_some_and(|at| at.elapsed() < Duration::from_secs(2))
     }
 
     /// Whether a picture is still waiting or being written.
@@ -736,7 +755,11 @@ impl Encoder {
             self.packets.recv_timeout(wait)
         };
         match received {
-            Ok(Ok(packet)) => Ok(Some(packet)),
+            Ok(Ok(packet)) => {
+                self.pending = self.pending.saturating_sub(1);
+                self.since = (self.pending > 0).then(Instant::now);
+                Ok(Some(packet))
+            }
             Ok(Err(error)) => Err(self.failure(&error)),
             Err(RecvTimeoutError::Timeout) => Ok(None),
             Err(RecvTimeoutError::Disconnected) => Err(self.failure("ffmpeg stopped")),
