@@ -718,7 +718,22 @@ SceneError CheckTargetDescendants(
     if (!children.has_value()) {
         return SceneError::kX11;
     }
+    // XQueryTree lists children bottom to top. At a level that holds the
+    // window leading to the target (for example a window manager's frame,
+    // whose decoration and background windows sit under the client), only
+    // siblings stacked above it can cover the target; those below cannot.
+    // Below the target's own window every overlapping child still counts.
+    const bool chain_level =
+        std::any_of(children->begin(), children->end(), [&](Window child) {
+            return IsAncestorChainWindow(child, ancestor_chain);
+        });
+    bool above_chain = false;
     for (const Window child : children.value()) {
+        const bool in_chain = IsAncestorChainWindow(child, ancestor_chain);
+        if (chain_level && !above_chain && !in_chain) {
+            continue;
+        }
+        above_chain = above_chain || in_chain;
         WindowGeometry geometry;
         if (!GetRootRelativeGeometry(display, child, root, &geometry)) {
             return SceneError::kX11;
@@ -726,8 +741,7 @@ SceneError CheckTargetDescendants(
         if (geometry.map_state != IsViewable) {
             continue;
         }
-        if (geometry.window_class == InputOutput &&
-            !IsAncestorChainWindow(child, ancestor_chain) &&
+        if (geometry.window_class == InputOutput && !in_chain &&
             GeometryOverlapsRegion(geometry, arguments)) {
             return SceneError::kOccluded;
         }

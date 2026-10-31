@@ -200,6 +200,20 @@ pub fn spawn(path: &Path, args: &[String]) -> Result<u32> {
         const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
         command.creation_flags(CREATE_NEW_CONSOLE);
     }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // A session of its own: the program outlives this server and never
+        // receives the signals of the terminal or SSH session it runs under.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
     let mut child = command.spawn().map_err(|cause| {
         error(
             "CONTROL.LAUNCH_FAILED",
@@ -263,6 +277,45 @@ mod tests {
         let found = resolve("whoami").expect("whoami.exe is on PATH");
         assert!(found.is_absolute());
         assert!(resolve(r"sub\tool.exe").is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unix_programs_must_be_executable_files_and_start_in_their_own_session() {
+        use std::os::unix::fs::PermissionsExt;
+        let root =
+            std::env::temp_dir().join(format!("aad-launch-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&root).unwrap();
+        let plain = root.join("notes.txt");
+        std::fs::write(&plain, "text").unwrap();
+        std::fs::set_permissions(&plain, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(
+            resolve(plain.to_str().unwrap()).unwrap_err().code,
+            "POLICY.DENIED"
+        );
+        let found = resolve("true").expect("true is on PATH");
+        assert!(found.is_absolute());
+        // The child's session id is its own pid: it left this server's session.
+        let script = root.join("report-session");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nps -o sid= -p $$ | tr -d ' ' > {}/sid\necho $$ > {}/pid\n",
+                root.display(),
+                root.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        spawn(&script, &[]).unwrap();
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !root.join("pid").exists() && std::time::Instant::now() < until {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let read = |name: &str| std::fs::read_to_string(root.join(name)).unwrap_or_default();
+        assert_eq!(read("sid").trim(), read("pid").trim());
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

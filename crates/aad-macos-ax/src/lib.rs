@@ -33,6 +33,12 @@ const WRITE_ACTIONS: &[&str] = &[
     "key_chord",
     "set_value",
     "type_text",
+    "paste",
+    "minimize",
+    "maximize",
+    "restore",
+    "close_window",
+    "activate",
 ];
 /// Writes that send synthetic input and so are never offered on protected elements.
 const INPUT_ACTIONS: &[&str] = &[
@@ -42,7 +48,20 @@ const INPUT_ACTIONS: &[&str] = &[
     "key_chord",
     "set_value",
     "type_text",
+    "paste",
 ];
+/// Actions on an AXWindow node, carried out through its AX attributes and
+/// buttons and verified by reading the window back.
+pub const WINDOW_ACTIONS: &[&str] = &[
+    "minimize",
+    "maximize",
+    "restore",
+    "close_window",
+    "activate",
+];
+const MAX_PASTE_CHARS: usize = 4096;
+const DEFAULT_CLIPBOARD_CHARS: usize = 16_384;
+const MAX_CLIPBOARD_CHARS: usize = 65_536;
 const STATE_NAMES: &[&str] = &["enabled", "focused", "focusable", "editable", "protected"];
 const TYPE_TEXT_ROLES: &[&str] = &["AXTextField", "AXTextArea", "AXComboBox"];
 
@@ -186,6 +205,58 @@ pub trait AxBackend: Send + Sync {
             "this backend cannot record",
         ))
     }
+    /// One of [`WINDOW_ACTIONS`] on an AXWindow, answered once the window
+    /// reports the requested state.
+    fn window_action(
+        &self,
+        _token: &str,
+        _action: &str,
+        _deadline: Instant,
+    ) -> Result<Value, AutomationError> {
+        Err(driver_error(
+            "DRIVER.ACTION_UNSUPPORTED",
+            "this backend has no window actions",
+        ))
+    }
+    /// Paste `text` into the focused element through the general pasteboard,
+    /// putting the previous contents back afterwards.
+    fn paste(
+        &self,
+        _token: &str,
+        _text: &str,
+        _deadline: Instant,
+    ) -> Result<Value, AutomationError> {
+        Err(driver_error(
+            "DRIVER.ACTION_UNSUPPORTED",
+            "this backend cannot paste",
+        ))
+    }
+    /// A PNG of the element's window content at the element's bounds:
+    /// `{format, data, width, height, clipped}`.
+    fn capture_element(&self, _token: &str, _deadline: Instant) -> Result<Value, AutomationError> {
+        Err(driver_error(
+            "DRIVER.ACTION_UNSUPPORTED",
+            "this backend cannot capture",
+        ))
+    }
+    /// The general pasteboard's text: `{has_text, text, characters, truncated}`.
+    fn clipboard_text(
+        &self,
+        _max_characters: usize,
+        _deadline: Instant,
+    ) -> Result<Value, AutomationError> {
+        Err(driver_error(
+            "DRIVER.ACTION_UNSUPPORTED",
+            "this backend cannot read the pasteboard",
+        ))
+    }
+    /// A key chord posted to the session, anchored on no element.
+    fn global_key(&self, _keys: &[String], _deadline: Instant) -> Result<Value, AutomationError> {
+        Err(driver_error(
+            "DRIVER.ACTION_UNSUPPORTED",
+            "this backend has no global keys",
+        ))
+    }
     fn close(&self) {}
 }
 
@@ -249,6 +320,41 @@ impl MacOSAxProvider {
             "list_apps" => self.list_apps(args, deadline),
             "snapshot" => self.snapshot(args, deadline),
             "find" => self.find(args, deadline),
+            "capture" => self.capture_inline(args, deadline),
+            "clipboard_read" => {
+                only_keys(args, &["max_characters"])?;
+                let max = bounded_integer(
+                    args.get("max_characters"),
+                    DEFAULT_CLIPBOARD_CHARS as u64,
+                    1,
+                    MAX_CLIPBOARD_CHARS as u64,
+                    "max_characters",
+                )? as usize;
+                let read = self.backend.clipboard_text(max, deadline)?;
+                if !read["has_text"].is_boolean()
+                    || !read["characters"].is_u64()
+                    || !read["truncated"].is_boolean()
+                    || !(read["text"].is_string() || read["text"].is_null())
+                {
+                    return Err(driver_error(
+                        "DRIVER.ACTION_FAILED",
+                        "pasteboard read returned an invalid result",
+                    ));
+                }
+                let text = read["text"]
+                    .as_str()
+                    .map(|text| json!(text.chars().take(max).collect::<String>()))
+                    .unwrap_or(Value::Null);
+                Ok(
+                    json!({"has_text": read["has_text"], "text": text, "characters": read["characters"], "truncated": read["truncated"]}),
+                )
+            }
+            "global_key" => {
+                only_keys(args, &["keys"])?;
+                let keys = key_names(args.get("keys"))?;
+                refuse_reserved_chord(&keys)?;
+                self.backend.global_key(&keys, deadline)
+            }
             "watch" => {
                 only_keys(args, &["app"])?;
                 let app = app_selector(args.get("app"))?;
@@ -528,6 +634,79 @@ impl MacOSAxProvider {
         Ok((fresh, fresh_id, node, token))
     }
 
+    /// A PNG of one observed element, after the same revalidation as a write.
+    /// Refuses elements with protected content in their subtree. The caller's
+    /// observation stays current: a read does not spend it.
+    fn capture_inline(
+        &self,
+        args: &Map<String, Value>,
+        deadline: Instant,
+    ) -> Result<Value, AutomationError> {
+        only_keys(args, &["target", "locator"])?;
+        let observed = {
+            let target = args
+                .get("target")
+                .and_then(Value::as_object)
+                .ok_or_else(|| invalid("target must be an object"))?;
+            self.current(
+                target.get("snapshot_id").unwrap_or(&Value::Null),
+                target.get("revision").unwrap_or(&Value::Null),
+            )?
+        };
+        let checked = (|| {
+            let (fresh, fresh_id, node, token) = self.fresh_target(args, deadline)?;
+            let inside = descendants(&fresh, &fresh_id);
+            let protected =
+                fresh.public["nodes"]
+                    .as_array()
+                    .expect("nodes")
+                    .iter()
+                    .any(|candidate| {
+                        candidate["node_id"]
+                            .as_str()
+                            .is_some_and(|id| inside.contains(id))
+                            && (candidate["states"]["protected"] != false
+                                || candidate["provenance"]["value_redacted"] == true)
+                    });
+            if protected {
+                return Err(driver_error(
+                    "DRIVER.PROTECTED_ELEMENT",
+                    "capture target is not proven free of protected content",
+                ));
+            }
+            parse_bounds(node.get("bounds")).map_err(|_| {
+                driver_error(
+                    "DRIVER.ACTION_UNSUPPORTED",
+                    "capture requires positive-area bounds",
+                )
+            })?;
+            let shot = self.backend.capture_element(&token, deadline)?;
+            let valid = shot["format"] == "png"
+                && shot["data"].as_str().is_some_and(|data| !data.is_empty())
+                && shot["width"].as_u64().is_some_and(|w| w > 0)
+                && shot["height"].as_u64().is_some_and(|h| h > 0)
+                && shot["clipped"].is_boolean();
+            if !valid {
+                return Err(driver_error(
+                    "DRIVER.CAPTURE_FAILED",
+                    "macOS AX helper returned an invalid capture",
+                ));
+            }
+            Ok(json!({
+                "format": "png",
+                "data": shot["data"],
+                "width": shot["width"],
+                "height": shot["height"],
+                "clipped": shot["clipped"],
+                "node_id": fresh_id,
+            }))
+        })();
+        if let Ok(mut state) = self.state.lock() {
+            state.current = Some(observed);
+        }
+        checked
+    }
+
     fn write(
         &self,
         action: &str,
@@ -538,7 +717,7 @@ impl MacOSAxProvider {
         if action == "set_value" {
             allowed.push("value");
         }
-        if action == "type_text" {
+        if matches!(action, "type_text" | "paste") {
             allowed.push("text");
         }
         match action {
@@ -567,10 +746,10 @@ impl MacOSAxProvider {
         } else {
             None
         };
-        let text = if action == "type_text" {
-            Some(keyboard_text(args.get("text"))?)
-        } else {
-            None
+        let text = match action {
+            "type_text" => Some(keyboard_text(args.get("text"))?),
+            "paste" => Some(paste_text(args.get("text"))?),
+            _ => None,
         };
         let (button, position) = if action == "pointer_click" {
             (
@@ -594,6 +773,18 @@ impl MacOSAxProvider {
             return Err(driver_error(
                 "DRIVER.ACTION_UNSUPPORTED",
                 "type_text requires a proven non-protected text target",
+            ));
+        }
+        if action == "paste" && node["states"]["editable"] != true {
+            return Err(driver_error(
+                "DRIVER.ACTION_UNSUPPORTED",
+                "paste requires an editable, non-protected element",
+            ));
+        }
+        if WINDOW_ACTIONS.contains(&action) && node["role"] != "AXWindow" {
+            return Err(driver_error(
+                "DRIVER.ACTION_UNSUPPORTED",
+                format!("{action} is offered only on an AXWindow node"),
             ));
         }
         if matches!(action, "pointer_click" | "pointer_gesture" | "drag")
@@ -671,6 +862,12 @@ impl MacOSAxProvider {
                 self.backend
                     .key_chord(&token, keys.as_deref().expect("keys validated"), deadline)
             }
+            "paste" => self
+                .backend
+                .paste(&token, text.expect("text validated"), deadline),
+            window if WINDOW_ACTIONS.contains(&window) => {
+                self.backend.window_action(&token, window, deadline)
+            }
             _ => unreachable!(),
         };
         let backend_result = match result {
@@ -683,7 +880,12 @@ impl MacOSAxProvider {
             Err(error)
                 if matches!(
                     action,
-                    "type_text" | "pointer_click" | "pointer_gesture" | "drag" | "key_chord"
+                    "type_text"
+                        | "pointer_click"
+                        | "pointer_gesture"
+                        | "drag"
+                        | "key_chord"
+                        | "paste"
                 ) =>
             {
                 return Err(error)
@@ -934,6 +1136,55 @@ fn key_names(value: Option<&Value>) -> Result<Vec<String>, AutomationError> {
                 .ok_or_else(|| invalid("each key is a short alphanumeric name"))
         })
         .collect()
+}
+
+/// Text for `paste`: 1..4096 characters, no NUL.
+fn paste_text(value: Option<&Value>) -> Result<&str, AutomationError> {
+    let text = bounded_text(value, true)?;
+    if text.chars().count() > MAX_PASTE_CHARS {
+        return Err(invalid("paste text is 1..4096 characters"));
+    }
+    Ok(text)
+}
+
+/// Chords a global key never presses: the lock screen (Ctrl+Cmd+Q), log out
+/// (Shift+Cmd+Q, with or without Option) and Force Quit (Option+Cmd+Esc).
+fn refuse_reserved_chord(keys: &[String]) -> Result<(), AutomationError> {
+    let lower: Vec<String> = keys.iter().map(|key| key.to_ascii_lowercase()).collect();
+    let has = |names: &[&str]| lower.iter().any(|key| names.contains(&key.as_str()));
+    let main = lower.last().map(String::as_str).unwrap_or_default();
+    let cmd = has(&["cmd", "command", "meta", "super", "win"]);
+    let reserved = cmd
+        && ((main == "q" && (has(&["ctrl", "control"]) || has(&["shift"])))
+            || (matches!(main, "escape" | "esc") && has(&["alt", "option", "opt"])));
+    if reserved {
+        return Err(driver_error(
+            "DRIVER.KEY_RESERVED",
+            "Ctrl+Cmd+Q, Shift+Cmd+Q and Option+Cmd+Esc are never pressed",
+        ));
+    }
+    Ok(())
+}
+
+/// The node and everything under it in one snapshot.
+fn descendants(record: &Record, node_id: &str) -> BTreeSet<String> {
+    let nodes = record.public["nodes"].as_array().expect("nodes");
+    let mut result = BTreeSet::from([node_id.to_string()]);
+    let mut grew = true;
+    while grew {
+        grew = false;
+        for node in nodes {
+            if node["parent_id"]
+                .as_str()
+                .is_some_and(|parent| result.contains(parent))
+            {
+                if let Some(id) = node["node_id"].as_str() {
+                    grew |= result.insert(id.to_string());
+                }
+            }
+        }
+    }
+    result
 }
 
 fn bounded_string(value: Option<String>) -> Value {
@@ -1392,6 +1643,51 @@ fn manifest_document() -> Value {
     actions.insert("pointer_gesture".into(), contract("重新验证目标后，在元素 bounds 内的比例位置、经 AX 命中检查后向前台应用派发右键/中键/双击、滚轮或悬停。", "non_idempotent", "modify", "high", &["desktop.observe", "desktop.input"], point_input(json!({"button": button, "count": {"enum": [1, 2]}, "fraction": fraction, "scroll": {"type": "object", "required": ["direction"], "properties": {"direction": {"enum": ["up", "down", "left", "right"]}, "notches": {"type": "integer", "minimum": 1, "maximum": 30}}, "additionalProperties": false}, "hover_ms": {"type": "integer", "minimum": 1, "maximum": 5000}}), &[]), write_output(), true, true));
     actions.insert("drag".into(), contract("分别重新验证起点与终点并做 AX 命中检查后，在同一前台应用内按下、分步拖动并在终点释放。", "non_idempotent", "modify", "high", &["desktop.observe", "desktop.input"], point_input(json!({"to": target_schema(), "to_locator": locator_schema(), "button": button, "fraction": fraction, "to_fraction": fraction}), &["to", "to_locator"]), write_output(), true, true));
     actions.insert("key_chord".into(), contract("重新验证并聚焦非受保护目标后，按下修饰键（ctrl、shift、alt、cmd）加一个主键；名称按字面映射，不在平台间互换。", "non_idempotent", "input", "high", &["desktop.observe", "desktop.input"], point_input(json!({"keys": {"type": "array", "minItems": 1, "maxItems": 6, "items": {"type": "string", "minLength": 1, "maxLength": 32}}}), &["keys"]), write_output(), true, true));
+    for (name, description) in [
+        ("minimize", "重新验证 AXWindow 后设置 AXMinimized=true，等待（有上限）读回为 true。"),
+        ("maximize", "重新验证 AXWindow 后设置 AXFullScreen=true（macOS 没有与 Windows 相同的最大化），等待读回。"),
+        ("restore", "最小化时设 AXMinimized=false，全屏时设 AXFullScreen=false，等待读回。"),
+        ("close_window", "按下 AXWindow 的 AXCloseButton（AXPress），等待窗口从应用的 AXWindows 中消失；应用先询问时 effect unknown。"),
+        ("activate", "激活目标应用并对 AXWindow 执行 AXRaise，等待它成为前台应用的主窗口。"),
+    ] {
+        actions.insert(
+            name.into(),
+            contract(
+                description,
+                if name == "close_window" { "non_idempotent" } else { "idempotent" },
+                "modify",
+                "high",
+                &["desktop.observe", "desktop.input"],
+                write_input(),
+                write_output(),
+                true,
+                true,
+            ),
+        );
+    }
+    actions.insert("paste".into(), contract("重新验证并聚焦可编辑、非受保护元素后，经通用剪贴板（标记 Concealed/Transient）提供文字并向目标进程发送 Cmd+V，之后恢复原剪贴板内容。", "contextual", "input", "high", &["desktop.observe", "desktop.input"], json!({"type": "object", "required": ["target", "locator", "text"], "properties": {"target": target_schema(), "locator": locator_schema(), "text": {"type": "string", "minLength": 1, "maxLength": MAX_PASTE_CHARS}}, "additionalProperties": false}), write_output(), true, true));
+    let mut capture = contract("与写动作相同的重新验证后，只截取目标所在窗口自身的内容（CGWindowListCreateImage + 该窗口 ID，不含遮挡它的其他窗口），裁剪到元素 bounds；需要“屏幕录制”权限，未授予时拒绝。", "read_only", "observe", "medium", &["desktop.observe", "desktop.capture"], json!({"type": "object", "required": ["target", "locator"], "properties": {"target": target_schema(), "locator": locator_schema()}, "additionalProperties": false}), json!({"type": "object", "required": ["format", "data", "width", "height", "clipped", "node_id"], "properties": {"format": {"const": "png"}, "data": {"type": "string"}, "width": {"type": "integer", "minimum": 1}, "height": {"type": "integer", "minimum": 1}, "clipped": {"type": "boolean"}, "node_id": {"type": "string"}}, "additionalProperties": false}), true, true);
+    capture["errors"].as_array_mut().unwrap().extend([
+        json!({"code": "DRIVER.CAPTURE_FAILED", "description": "窗口截图失败。", "retryable": false, "effect": "not_applied", "data_schema": {"type": "object"}}),
+        json!({"code": "DRIVER.SCREEN_RECORDING_DENIED", "description": "MacOSAXHelper.app 没有屏幕录制权限。", "retryable": false, "effect": "not_applied", "data_schema": {"type": "object"}}),
+        json!({"code": "DRIVER.WINDOW_MINIMIZED", "description": "窗口已最小化，没有画面。", "retryable": false, "effect": "not_applied", "data_schema": {"type": "object"}}),
+    ]);
+    capture["sensitivity"] = json!({"input": "public", "output": "sensitive", "error": "public"});
+    actions.insert("capture".into(), capture);
+    let mut clipboard = contract(
+        "读取通用剪贴板的文字（只读、有上限）；带 org.nspasteboard.ConcealedType 的内容拒绝。",
+        "read_only",
+        "observe",
+        "high",
+        &["desktop.clipboard_read"],
+        json!({"type": "object", "properties": {"max_characters": {"type": "integer", "minimum": 1, "maximum": MAX_CLIPBOARD_CHARS}}, "additionalProperties": false}),
+        json!({"type": "object", "required": ["has_text", "text", "characters", "truncated"], "properties": {"has_text": {"type": "boolean"}, "text": {"type": ["string", "null"]}, "characters": {"type": "integer", "minimum": 0}, "truncated": {"type": "boolean"}}, "additionalProperties": false}),
+        false,
+        false,
+    );
+    clipboard["sensitivity"] = json!({"input": "public", "output": "sensitive", "error": "public"});
+    actions.insert("clipboard_read".into(), clipboard);
+    actions.insert("global_key".into(), contract("不锚定任何元素，以 CGEvent 向会话发送组合键；拒绝 Ctrl+Cmd+Q、Shift+Cmd+Q、Option+Cmd+Esc 与 Secure Event Input 期间的输入。", "non_idempotent", "input", "high", &["desktop.input"], json!({"type": "object", "required": ["keys"], "properties": {"keys": {"type": "array", "minItems": 1, "maxItems": 6, "items": {"type": "string", "minLength": 1, "maxLength": 32}}}, "additionalProperties": false}), json!({"type": "object"}), false, true));
     let capture_id = json!({"type": "object", "required": ["capture_id"], "properties": {"capture_id": {"type": "string", "minLength": 1, "maxLength": 64}}, "additionalProperties": false});
     actions.insert("watch".into(), contract("开始记录本人在一个应用里的点击、滚轮、组合键、文本修改和勾选（AXObserver + 只监听的事件 tap），不注入输入。", "idempotent", "observe", "medium", &["desktop.observe"], json!({"type": "object", "required": ["app"], "properties": {"app": app_schema()}, "additionalProperties": false}), json!({"type": "object"}), false, false));
     actions.insert(
@@ -1630,6 +1926,293 @@ mod tests {
         fn stop_recording(&self, _id: &str, _deadline: Instant) -> Result<(), AutomationError> {
             Ok(())
         }
+        fn window_action(
+            &self,
+            token: &str,
+            action: &str,
+            _deadline: Instant,
+        ) -> Result<Value, AutomationError> {
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            Ok(
+                json!({"native_operation": format!("AXWindow.{action}"), "accepted": true, "token": token}),
+            )
+        }
+        fn paste(
+            &self,
+            _token: &str,
+            text: &str,
+            _deadline: Instant,
+        ) -> Result<Value, AutomationError> {
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            Ok(
+                json!({"native_operation": "NSPasteboard+CGEventCmdV", "submitted": true, "pasted": text}),
+            )
+        }
+        fn capture_element(
+            &self,
+            token: &str,
+            _deadline: Instant,
+        ) -> Result<Value, AutomationError> {
+            Ok(
+                json!({"format": "png", "data": "iVBORw0KGgo=", "width": 240, "height": 60, "clipped": false, "token": token}),
+            )
+        }
+        fn clipboard_text(
+            &self,
+            max_characters: usize,
+            _deadline: Instant,
+        ) -> Result<Value, AutomationError> {
+            let text = "pasteboard text";
+            Ok(
+                json!({"has_text": true, "text": text.chars().take(max_characters).collect::<String>(), "characters": text.chars().count(), "truncated": text.chars().count() > max_characters}),
+            )
+        }
+        fn global_key(
+            &self,
+            keys: &[String],
+            _deadline: Instant,
+        ) -> Result<Value, AutomationError> {
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            Ok(
+                json!({"native_operation": "CGEventGlobalKeyChord", "submitted": true, "sent": keys}),
+            )
+        }
+    }
+
+    /// A one-window app: an AXWindow with an editable field and a secure field.
+    struct WindowBackend {
+        inner: FakeBackend,
+        secure: bool,
+    }
+    impl WindowBackend {
+        fn nodes(&self) -> Vec<BackendNode> {
+            let mut window = self.inner.node("window");
+            window.role = "AXWindow".into();
+            window.name = Some("Editor".into());
+            window.description = None;
+            window.actions = vec!["minimize".into(), "close_window".into()];
+            window.provenance.remove("identifier");
+            let mut field = self.inner.node("field");
+            field.parent_index = Some(0);
+            field.role = if self.secure {
+                "AXSecureTextField"
+            } else {
+                "AXTextField"
+            }
+            .into();
+            field.name = Some("Note".into());
+            field.description = None;
+            field.provenance.remove("identifier");
+            field.states.insert("editable".into(), Some(!self.secure));
+            field.states.insert("protected".into(), Some(self.secure));
+            field.actions = vec!["focus".into(), "set_value".into(), "paste".into()];
+            vec![window, field]
+        }
+    }
+    impl AxBackend for WindowBackend {
+        fn name(&self) -> &str {
+            "fake_macos_ax"
+        }
+        fn list_apps(
+            &self,
+            deadline: Instant,
+        ) -> Result<(bool, Vec<Map<String, Value>>), AutomationError> {
+            self.inner.list_apps(deadline)
+        }
+        fn capture(
+            &self,
+            _app: &Map<String, Value>,
+            _max_depth: u32,
+            _max_nodes: usize,
+            _deadline: Instant,
+        ) -> Result<BackendSnapshot, AutomationError> {
+            Ok(BackendSnapshot {
+                app: FakeBackend::app(),
+                nodes: self.nodes(),
+                truncated: false,
+            })
+        }
+        fn same_element(&self, a: &str, b: &str, _: Instant) -> Result<bool, AutomationError> {
+            Ok(a == b)
+        }
+        fn focus(&self, token: &str, deadline: Instant) -> Result<Value, AutomationError> {
+            self.inner.focus(token, deadline)
+        }
+        fn invoke(&self, token: &str, deadline: Instant) -> Result<Value, AutomationError> {
+            self.inner.invoke(token, deadline)
+        }
+        fn pointer_click(
+            &self,
+            token: &str,
+            button: &str,
+            position: &str,
+            deadline: Instant,
+        ) -> Result<Value, AutomationError> {
+            self.inner.pointer_click(token, button, position, deadline)
+        }
+        fn set_value(
+            &self,
+            token: &str,
+            value: &str,
+            deadline: Instant,
+        ) -> Result<Value, AutomationError> {
+            self.inner.set_value(token, value, deadline)
+        }
+        fn type_text(
+            &self,
+            token: &str,
+            text: &str,
+            deadline: Instant,
+        ) -> Result<Value, AutomationError> {
+            self.inner.type_text(token, text, deadline)
+        }
+        fn window_action(
+            &self,
+            token: &str,
+            action: &str,
+            deadline: Instant,
+        ) -> Result<Value, AutomationError> {
+            self.inner.window_action(token, action, deadline)
+        }
+        fn paste(
+            &self,
+            token: &str,
+            text: &str,
+            deadline: Instant,
+        ) -> Result<Value, AutomationError> {
+            self.inner.paste(token, text, deadline)
+        }
+        fn capture_element(
+            &self,
+            token: &str,
+            deadline: Instant,
+        ) -> Result<Value, AutomationError> {
+            self.inner.capture_element(token, deadline)
+        }
+    }
+
+    #[test]
+    fn window_actions_paste_and_capture_are_revalidated_and_routed() {
+        let backend = Arc::new(WindowBackend {
+            inner: FakeBackend::default(),
+            secure: false,
+        });
+        let provider = MacOSAxProvider::new(backend.clone()).unwrap();
+        let call = |action: &str, node: &str, locator: Value, extra: Value| {
+            let snapshot = take_snapshot(&provider);
+            let mut args = json!({"target": {"snapshot_id": snapshot["snapshot_id"], "revision": snapshot["revision"], "node_id": node}, "locator": locator});
+            args.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            provider.invoke(
+                &format!("desktop.macos_ax.{action}@1"),
+                args,
+                Some(Duration::from_secs(2)),
+            )
+        };
+        let window = json!({"role": "AXWindow", "name": "Editor"});
+        let field = json!({"role": "AXTextField", "name": "Note"});
+        let minimized = call("minimize", "n0", window.clone(), json!({})).unwrap();
+        assert_eq!(
+            minimized["backend_result"]["native_operation"],
+            "AXWindow.minimize"
+        );
+        assert_eq!(minimized["backend_result"]["token"], "window");
+        // Not offered on this window, so refused before anything is sent.
+        assert_eq!(
+            call("maximize", "n0", window.clone(), json!({}))
+                .unwrap_err()
+                .code,
+            "DRIVER.ACTION_UNSUPPORTED"
+        );
+        // Window actions only on the window; paste only on the field.
+        assert!(call("close_window", "n1", field.clone(), json!({})).is_err());
+        assert!(call("paste", "n0", window.clone(), json!({"text": "x"})).is_err());
+        let pasted = call("paste", "n1", field.clone(), json!({"text": "Grüße"})).unwrap();
+        assert_eq!(pasted["backend_result"]["pasted"], "Grüße");
+        assert!(call("paste", "n1", field.clone(), json!({"text": ""})).is_err());
+        assert_eq!(backend.inner.writes.load(Ordering::SeqCst), 2);
+
+        // Capture answers the PNG and leaves the observation usable.
+        let snapshot = take_snapshot(&provider);
+        let target = json!({"snapshot_id": snapshot["snapshot_id"], "revision": snapshot["revision"], "node_id": "n0"});
+        let shot = provider
+            .invoke(
+                "desktop.macos_ax.capture@1",
+                json!({"target": target, "locator": window}),
+                Some(Duration::from_secs(2)),
+            )
+            .unwrap();
+        assert_eq!(shot["width"], 240);
+        assert_eq!(shot["node_id"], "n0");
+        provider
+            .invoke(
+                "desktop.macos_ax.minimize@1",
+                json!({"target": target, "locator": window}),
+                Some(Duration::from_secs(2)),
+            )
+            .unwrap();
+
+        // A window holding a secure field is never captured.
+        let secure = MacOSAxProvider::new(Arc::new(WindowBackend {
+            inner: FakeBackend::default(),
+            secure: true,
+        }))
+        .unwrap();
+        let snapshot = take_snapshot(&secure);
+        let refused = secure
+            .invoke(
+                "desktop.macos_ax.capture@1",
+                json!({"target": {"snapshot_id": snapshot["snapshot_id"], "revision": snapshot["revision"], "node_id": "n0"}, "locator": {"role": "AXWindow", "name": "Editor"}}),
+                Some(Duration::from_secs(2)),
+            )
+            .unwrap_err();
+        assert_eq!(refused.code, "DRIVER.PROTECTED_ELEMENT");
+        // Nor pasted into.
+        let snapshot = take_snapshot(&secure);
+        assert!(secure
+            .invoke(
+                "desktop.macos_ax.paste@1",
+                json!({"target": {"snapshot_id": snapshot["snapshot_id"], "revision": snapshot["revision"], "node_id": "n1"}, "locator": {"role": "AXSecureTextField", "name": "Note"}, "text": "x"}),
+                Some(Duration::from_secs(2)),
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn pasteboard_reads_and_global_keys_are_bounded() {
+        let backend = Arc::new(FakeBackend::default());
+        let provider = MacOSAxProvider::new(backend.clone()).unwrap();
+        let call = |action: &str, args: Value| {
+            provider.invoke(
+                &format!("desktop.macos_ax.{action}@1"),
+                args,
+                Some(Duration::from_secs(2)),
+            )
+        };
+        let read = call("clipboard_read", json!({"max_characters": 10})).unwrap();
+        assert_eq!(read["text"], "pasteboard");
+        assert_eq!(read["characters"], 15);
+        assert_eq!(read["truncated"], true);
+        assert!(call("clipboard_read", json!({"max_characters": 0})).is_err());
+        assert!(call("clipboard_read", json!({"other": 1})).is_err());
+        assert_eq!(
+            call("global_key", json!({"keys": ["cmd", "tab"]})).unwrap()["sent"],
+            json!(["cmd", "tab"])
+        );
+        for reserved in [
+            json!(["ctrl", "cmd", "q"]),
+            json!(["shift", "cmd", "q"]),
+            json!(["alt", "cmd", "escape"]),
+        ] {
+            assert_eq!(
+                call("global_key", json!({"keys": reserved}))
+                    .unwrap_err()
+                    .code,
+                "DRIVER.KEY_RESERVED"
+            );
+        }
+        assert_eq!(backend.writes.load(Ordering::SeqCst), 1);
     }
 
     fn take_snapshot(provider: &MacOSAxProvider) -> Value {
@@ -1660,6 +2243,15 @@ mod tests {
             "key_chord",
             "set_value",
             "type_text",
+            "paste",
+            "capture",
+            "minimize",
+            "maximize",
+            "restore",
+            "close_window",
+            "activate",
+            "clipboard_read",
+            "global_key",
         ] {
             assert!(
                 parsed

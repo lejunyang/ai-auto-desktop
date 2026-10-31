@@ -188,15 +188,23 @@ impl LinuxBackend {
             Err(_) => (None, None, None, None),
         };
         remaining(deadline, false)?;
+        let process_id = self.process_id(&target.bus_name);
+        // The executable's file name, as desktop launch matches a new window
+        // of the same program when a launcher hands over to another process.
+        let process_name = process_id.and_then(|pid| {
+            std::fs::read_link(format!("/proc/{pid}/exe"))
+                .ok()
+                .and_then(|path| path.file_name()?.to_str().map(str::to_string))
+        });
         Ok(Map::from_iter([
             ("bus_name".into(), json!(target.bus_name)),
             ("object_path".into(), json!(target.object_path)),
             ("name".into(), optional_text(name)),
             (
                 "process_id".into(),
-                self.process_id(&target.bus_name)
-                    .map_or(Value::Null, |value| json!(value)),
+                process_id.map_or(Value::Null, |value| json!(value)),
             ),
+            ("process_name".into(), optional_text(process_name)),
             ("toolkit_name".into(), optional_text(toolkit_name)),
             ("toolkit_version".into(), optional_text(toolkit_version)),
             ("atspi_version".into(), optional_text(atspi_version)),
@@ -474,6 +482,7 @@ impl LinuxBackend {
             && !protected
         {
             actions.push("type_text".into());
+            actions.push("paste".into());
         }
         if fully_interactive
             && interfaces.contains(Interface::Component)
@@ -672,6 +681,12 @@ impl AtspiBackend for LinuxBackend {
                 Err(_) => truncated = true,
             }
         }
+        let process_id = info
+            .get("process_id")
+            .and_then(Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok())
+            .filter(|value| *value > 0);
+        self.add_window_actions(&mut nodes, process_id, deadline);
         Ok(BackendSnapshot {
             application: info,
             nodes,
@@ -1054,6 +1069,246 @@ impl AtspiBackend for LinuxBackend {
         ]);
         Ok((output.stdout, provenance))
     }
+
+    fn window_action(
+        &self,
+        _target: &NativeRef,
+        action: &str,
+        bounds: Bounds,
+        process_id: u32,
+        deadline: Instant,
+    ) -> Result<Value, AutomationError> {
+        let path = self.helper(HelperKind::Input)?;
+        let mut args = window_args("window-action", process_id, bounds);
+        args.extend([
+            "--action".into(),
+            if action == "close_window" {
+                "close"
+            } else {
+                action
+            }
+            .into(),
+            "--deadline-monotonic-ns".into(),
+            monotonic_deadline_ns(deadline)?.to_string(),
+        ]);
+        let output = run_helper(
+            &path,
+            &args,
+            None,
+            deadline,
+            XTEST_OUTPUT_LIMIT,
+            XTEST_OUTPUT_LIMIT,
+        )?;
+        let result = parse_input_helper(output, "window_dispatch", 1, process_id)?;
+        if result["reached"] != true {
+            return Err(driver_error(
+                "DRIVER.UNKNOWN_EFFECT",
+                "the window manager did not report the requested window state in time",
+            )
+            .with_effect("unknown")
+            .with_detail(
+                "observed_state",
+                json!({"exists": result["exists"], "minimized": result["minimized"], "maximized": result["maximized"], "active": result["active"]}),
+            ));
+        }
+        Ok(
+            json!({"native_interface": "EWMH", "action": action, "window": result["window"], "verified": true, "observed_state": {"exists": result["exists"], "minimized": result["minimized"], "maximized": result["maximized"], "active": result["active"]}}),
+        )
+    }
+
+    fn paste(
+        &self,
+        target: &NativeRef,
+        text: &str,
+        process_id: u32,
+        deadline: Instant,
+    ) -> Result<Value, AutomationError> {
+        let path = self.helper(HelperKind::Input)?;
+        let focus = self.focus(target, deadline)?;
+        std::thread::sleep(Duration::from_millis(50).min(remaining(deadline, true)?));
+        let args = [
+            "paste".to_string(),
+            "--expected-pid".into(),
+            process_id.to_string(),
+            "--deadline-monotonic-ns".into(),
+            monotonic_deadline_ns(deadline)?.to_string(),
+        ];
+        let output = run_helper(
+            &path,
+            &args,
+            Some(text.as_bytes()),
+            deadline,
+            XTEST_OUTPUT_LIMIT,
+            XTEST_OUTPUT_LIMIT,
+        )?;
+        let input = parse_input_helper(output, "keyboard_dispatch", 4, process_id)?;
+        if input["consumed"] != true {
+            return Err(driver_error(
+                "DRIVER.PASTE_NOT_CONSUMED",
+                "Ctrl+V reached the element but its process never asked for the text",
+            )
+            .with_effect("unknown")
+            .with_detail("clipboard_restored", input["restored"].clone()));
+        }
+        Ok(
+            json!({"native_interface": "Component.grab_focus -> X11 CLIPBOARD + XTEST Ctrl+V", "focus": focus, "input": input, "synthetic_input": true, "clipboard_restored": input["restored"]}),
+        )
+    }
+
+    fn clipboard_text(
+        &self,
+        max_bytes: usize,
+        deadline: Instant,
+    ) -> Result<Value, AutomationError> {
+        let path = self.helper(HelperKind::Input)?;
+        let args = [
+            "clipboard-read".to_string(),
+            "--max-bytes".into(),
+            max_bytes.clamp(1, 1 << 20).to_string(),
+            "--deadline-monotonic-ns".into(),
+            monotonic_deadline_ns(deadline)?.to_string(),
+        ];
+        let output = run_helper(
+            &path,
+            &args,
+            None,
+            deadline,
+            8 * 1024 * 1024,
+            XTEST_OUTPUT_LIMIT,
+        )?;
+        if let Some(code) = helper_error_code(&output.stdout) {
+            return Err(map_helper_code(&code).unwrap_or_else(|| {
+                driver_error("DRIVER.ACTION_FAILED", "the clipboard could not be read")
+                    .with_detail("helper_code", json!(code))
+            }));
+        }
+        let read = parse_one_json_object(&output.stdout, "clipboard helper result")
+            .map_err(|_| driver_error("DRIVER.ACTION_FAILED", "the clipboard could not be read"))?;
+        if !output.status.success() || read.get("ok") != Some(&Value::Bool(true)) {
+            return Err(driver_error(
+                "DRIVER.ACTION_FAILED",
+                "the clipboard could not be read",
+            ));
+        }
+        Ok(Value::Object(read))
+    }
+
+    fn global_key(&self, keys: &[String], deadline: Instant) -> Result<Value, AutomationError> {
+        let path = self.helper(HelperKind::Input)?;
+        let args = [
+            "global-key".to_string(),
+            "--keys".into(),
+            keys.join(","),
+            "--deadline-monotonic-ns".into(),
+            monotonic_deadline_ns(deadline)?.to_string(),
+        ];
+        let output = run_helper(
+            &path,
+            &args,
+            None,
+            deadline,
+            XTEST_OUTPUT_LIMIT,
+            XTEST_OUTPUT_LIMIT,
+        )?;
+        let input = parse_input_helper(output, "keyboard_dispatch", 2 * keys.len() as u64, 0)?;
+        Ok(json!({"native_interface": "XTEST", "keys": keys, "events": input["events"]}))
+    }
+}
+
+fn window_args(command: &str, process_id: u32, bounds: Bounds) -> Vec<String> {
+    vec![
+        command.to_string(),
+        "--expected-pid".into(),
+        process_id.to_string(),
+        "--x".into(),
+        bounds.x.to_string(),
+        "--y".into(),
+        bounds.y.to_string(),
+        "--width".into(),
+        bounds.width.to_string(),
+        "--height".into(),
+        bounds.height.to_string(),
+    ]
+}
+
+impl LinuxBackend {
+    /// The window manager's view of a top-level frame, when the X11 helper
+    /// and an EWMH window manager are there; `None` offers no window actions.
+    fn window_info(&self, process_id: u32, bounds: Bounds, deadline: Instant) -> Option<Value> {
+        let path = self.helper(HelperKind::Input).ok()?;
+        let mut args = window_args("window-info", process_id, bounds);
+        args.extend([
+            "--deadline-monotonic-ns".into(),
+            monotonic_deadline_ns(deadline).ok()?.to_string(),
+        ]);
+        let output = run_helper(
+            &path,
+            &args,
+            None,
+            deadline.min(Instant::now() + Duration::from_secs(2)),
+            XTEST_OUTPUT_LIMIT,
+            XTEST_OUTPUT_LIMIT,
+        )
+        .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let info = parse_one_json_object(&output.stdout, "window info").ok()?;
+        (info.get("ok") == Some(&Value::Bool(true)) && info.get("ewmh") == Some(&Value::Bool(true)))
+            .then_some(Value::Object(info))
+    }
+
+    /// Offer window actions on each top-level frame, by its current state.
+    fn add_window_actions(
+        &self,
+        nodes: &mut [BackendNode],
+        process_id: Option<u32>,
+        deadline: Instant,
+    ) {
+        let Some(process_id) = process_id else {
+            return;
+        };
+        for node in nodes.iter_mut() {
+            // A direct child of the application is a top-level window: GTK and
+            // Qt main windows say frame/dialog, a bare QWidget window filler.
+            // The helper still proves an X11 client window of this process
+            // has exactly these bounds before anything is offered.
+            let top_level = node.parent_index == Some(0);
+            let Some(bounds) = node.bounds.filter(|b| b.width > 0 && b.height > 0) else {
+                continue;
+            };
+            if !top_level || remaining(deadline, false).is_err() {
+                continue;
+            }
+            let Some(info) = self.window_info(process_id, bounds, deadline) else {
+                continue;
+            };
+            let supports = |name: &str| info["supports"][name] == true;
+            let minimized = info["minimized"] == true;
+            let maximized = info["maximized"] == true;
+            let mut offered = Vec::new();
+            if !minimized {
+                offered.push("minimize");
+            }
+            if supports("maximize") && !maximized && !minimized {
+                offered.push("maximize");
+            }
+            if (minimized && supports("activate")) || (maximized && supports("maximize")) {
+                offered.push("restore");
+            }
+            if supports("close") {
+                offered.push("close_window");
+            }
+            if supports("activate") && !minimized && info["active"] != true {
+                offered.push("activate");
+            }
+            node.actions.extend(offered.into_iter().map(String::from));
+            node.provenance.insert(
+                "window".into(),
+                json!({"x11_window": info["window"], "minimized": minimized, "maximized": maximized, "active": info["active"]}),
+            );
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1276,11 +1531,32 @@ fn parse_input_helper(
             )
             .with_effect("unknown"));
         }
-        return Ok(
-            json!({"native_interface": "XTEST", "synthetic_input": true, "submitted": true, "events": result["events"], "codepoints": result.get("codepoints").cloned().unwrap_or(Value::Null), "expected_process_id": process_id}),
-        );
+        let mut answer = json!({"native_interface": "XTEST", "synthetic_input": true, "submitted": true, "events": result["events"], "codepoints": result.get("codepoints").cloned().unwrap_or(Value::Null), "expected_process_id": process_id});
+        // Window and paste commands report what they observed afterwards.
+        for key in [
+            "consumed",
+            "restored",
+            "reached",
+            "window",
+            "action",
+            "exists",
+            "minimized",
+            "maximized",
+            "active",
+        ] {
+            if let Some(value) = result.get(key) {
+                answer[key] = value.clone();
+            }
+        }
+        return Ok(answer);
     }
     let code = output.status.code();
+    let helper_code = helper_error_code(&output.stdout);
+    if !dispatched {
+        if let Some(mapped) = helper_code.as_deref().and_then(map_helper_code) {
+            return Err(mapped.with_detail("helper_code", json!(helper_code)));
+        }
+    }
     if dispatched || code == Some(70) {
         return Err(driver_error(
             "DRIVER.UNKNOWN_EFFECT",
@@ -1310,6 +1586,46 @@ fn parse_input_helper(
     Err(driver_error(error_code, message)
         .with_retryable(retryable)
         .with_detail("helper_exit_code", json!(code)))
+}
+
+/// The `code` of the helper's failure record, if it printed one.
+fn helper_error_code(stdout: &[u8]) -> Option<String> {
+    stdout
+        .split(|byte| *byte == b'\n')
+        .filter_map(|line| serde_json::from_slice::<Value>(line).ok())
+        .find(|value| value["ok"] == false)
+        .and_then(|value| value["code"].as_str().map(str::to_string))
+}
+
+/// Helper refusals that have a precise driver meaning (all before dispatch).
+fn map_helper_code(code: &str) -> Option<AutomationError> {
+    Some(match code {
+        "window_manager_unsupported" => driver_error(
+            "DRIVER.ACTION_UNSUPPORTED",
+            "the window manager does not support this EWMH window request",
+        ),
+        "window_not_found" | "window_ambiguous" => driver_error(
+            "DRIVER.STALE_SNAPSHOT",
+            "no single top-level X11 window of the process matches the observed frame",
+        ),
+        "clipboard_protected" => driver_error(
+            "DRIVER.CLIPBOARD_PROTECTED",
+            "the clipboard holds content marked for password managers (x-kde-passwordManagerHint)",
+        ),
+        "clipboard_too_large" => driver_error(
+            "DRIVER.CLIPBOARD_TOO_LARGE",
+            "the clipboard holds more than can be kept, so nothing was pasted",
+        ),
+        "clipboard_busy" => driver_error(
+            "DRIVER.CLIPBOARD_BUSY",
+            "another client kept the clipboard; nothing was pasted",
+        ),
+        "focus_owner_mismatch" => driver_error(
+            "DRIVER.FOCUS_LOST",
+            "keyboard focus is not in the target's process; no key was sent",
+        ),
+        _ => return None,
+    })
 }
 
 fn after_focus(error: AutomationError) -> AutomationError {

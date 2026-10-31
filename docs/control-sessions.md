@@ -9,8 +9,8 @@
 | provider | 类型化动作 | 实际语义 / 限制 |
 | --- | --- | --- |
 | `desktop.windows_uia` | focus, invoke, click, fill, type_text, key, scroll, hover, drag, paste, minimize, maximize, restore, close_window, activate | UIA + 原生输入；click 带 button/count/fraction 时走原生手势；节点必须暴露对应能力。指针动作先对落点做 UIA 命中检查，键盘动作先证明窗口在前台、焦点在元素内（见下文）。另有只读的 capture / read_text，以及需单独授权的 launch、clipboard_read、global_key |
-| `desktop.linux_atspi` | focus, invoke, click, fill, type_text, key, scroll, hover, drag | AT-SPI；指针/键盘经 X11 XTest helper，只支持 KDE/X11 会话；派发前核对焦点、PID 与落点，drag 起止两点都核对 |
-| `desktop.macos_ax` | focus, invoke, click, fill, type_text, key, scroll, hover, drag | AX helper；需要同一登录用户的辅助功能权限；指针动作要求目标应用在前台并经 AX 命中检查，事件只投递给目标进程；key 名称按字面（`ctrl` 是 Control，`cmd` 是 Command） |
+| `desktop.linux_atspi` | focus, invoke, click, fill, type_text, key, scroll, hover, drag, paste, minimize, maximize, restore, close_window, activate | AT-SPI；指针/键盘经 X11 XTest helper，只支持 KDE/X11 会话；派发前核对焦点、PID 与落点，drag 起止两点都核对；窗口动作只在顶层窗口节点上、需要 EWMH 窗口管理器。另有只读 capture / read_text（Tesseract），以及需单独授权的 launch、clipboard_read、global_key（见下文“其他平台”） |
+| `desktop.macos_ax` | focus, invoke, click, fill, type_text, key, scroll, hover, drag, paste, minimize, maximize, restore, close_window, activate | AX helper；需要同一登录用户的辅助功能权限；指针动作要求目标应用在前台并经 AX 命中检查，事件只投递给目标进程；key 名称按字面（`ctrl` 是 Control，`cmd` 是 Command）；窗口动作只在 AXWindow 节点上，maximize 即全屏。另有 capture（需屏幕录制权限）、read_text、launch、clipboard_read、global_key。[待验证] 全部新增项需 macOS 真机 |
 | `browser.cdp` | focus, click, fill, type_text, key, scroll, hover, drag, select, check, navigate, back, forward, reload, open_tab, activate_page, close_page, accept, dismiss, upload, emulate, clear_site_data | 普通 click 为 `HTMLElement.click()` 的 DOM 激活；带 button/count/fraction 的 click、scroll、hover、drag 为可信 CDP Input（任何 frame，含跨进程 OOPIF），落点先在页面里命中检查；fill/select 为 DOM 值及 input/change 事件；check 已是目标状态时不点击；type_text/key 为发给焦点元素的可信 CDP 键盘输入；navigate/back/forward/reload、标签页动作 open_tab/activate_page/close_page 以及 emulate/clear_site_data 在 body 节点上，只限主 frame；accept/dismiss 只在 JavaScript 对话框节点上；upload 只在文件框上，路径受 `--allow-upload-dir` 限制 |
 
 以 `capabilities` 和观察节点的 `capabilities` 为准。可列出 provider 不表示当前 OS 已授予
@@ -159,7 +159,7 @@ system aware）只按逻辑尺寸渲染，截图会按物理窗口尺寸缩放�
 列出已装的。没有用 `aad-ocr`：它驱动 Tesseract，默认未安装，且在 Windows 上没有资源沙箱时拒绝运行。
 识别出的行是只读输出，不是 act 的目标：要对某个词操作，就对它所在的元素 `click` 并给出该词中心的
 `fraction`（fx + fw/2, fy + fh/2），这仍锚定在被观察、被重新校验的元素上；内容可能已移动时先重新读。
-OCR 会混淆 I 与 l 等字符。其他 provider 明确拒绝。
+OCR 会混淆 I 与 l 等字符。Linux 与 macOS 用 Tesseract，见下文“其他平台”。
 
 **粘贴。** 先复制剪贴板里所有内存型格式（GDI 句柄格式如位图、图元文件除外，位图仍以 CF_DIB 保存；超过 32 MiB
 时拒绝 `DRIVER.CLIPBOARD_TOO_LARGE`，不丢用户的内容），再以延迟渲染提供文字：只有目标进程来取时才给出，
@@ -184,9 +184,31 @@ Windows 上控制台程序得到自己的控制台。只接受 `.exe`（`.bat/.c
 的焦点上，没有锚定也无法验证，调用者必须重新观察，不能盲目重复。拒绝 Ctrl+Alt+Del（不能合成）与 Win+L（会锁住所有人），
 输入桌面不是用户桌面（UAC 提示、锁屏）时 `DRIVER.SECURE_DESKTOP`、什么也不发。
 
-**不支持。** UAC / 安全桌面自动化一律拒绝。窗口的 resize / move 需要坐标，不提供。Linux AT-SPI 与 macOS AX 不提供
-capture、read_text、窗口动作、paste、clipboard_read、global_key，明确返回 `CONTROL.ACTION_UNSUPPORTED`
-（AT-SPI 已有经宿主 artifact store 的 `capture_target`，尚未接入 `control_capture`）。
+**不支持。** UAC / 安全桌面自动化一律拒绝。窗口的 resize / move 需要坐标，不提供。
+
+## 其他平台：Linux（KDE/X11）与 macOS
+
+同一组会话操作、同样的授权参数与同样的回答形状（capture 的 `format`/`data`/`width`/`height`/`clipped` + `digest`，
+read_text 的 `text`/`lines`/`words` 与元素框内比例 `box`）。能力只在本机真正可用时出现在 `capabilities` 与节点的
+`capabilities` 中；做不到时以明确的错误码拒绝，不会假装成功。
+
+| 能力 | Linux `desktop.linux_atspi` | macOS `desktop.macos_ax` [待验证] |
+| --- | --- | --- |
+| 截图 | 重新校验后 X11 root XGetImage 按实时 bounds 裁剪；protected 子树、被遮挡、非 showing 拒绝 | 只截目标窗口自身内容（CGWindowListCreateImage + 窗口 ID）；需屏幕录制权限，否则 `DRIVER.SCREEN_RECORDING_DENIED` |
+| OCR | Tesseract（`aad-ocr`，`prlimit` 限制资源），装了才出现在 `reads`；否则 `DRIVER.OCR_UNAVAILABLE` | 同上，另需 `OCR_ALLOW_UNSANDBOXED_ENGINE=1`（macOS 上没有资源沙箱） |
+| 窗口动作 | 顶层窗口节点；EWMH 请求（iconify、`_NET_WM_STATE` 最大化、`_NET_ACTIVE_WINDOW`、`_NET_CLOSE_WINDOW`）后读回窗口管理器的状态；没有 EWMH 窗口管理器时不提供 | AXWindow 节点；`AXMinimized`、`AXFullScreen`（maximize = 全屏）、关闭按钮、激活 + `AXRaise`，读回状态 |
+| 粘贴 | X11 CLIPBOARD 由 helper 持有、只给目标进程的 X client，Ctrl+V，原内容交给一个脱离进程恢复 | 通用剪贴板延迟提供 + Concealed/Transient 标记，Cmd+V 只投给目标进程，之后恢复；无法限定来取的是谁 |
+| 读剪贴板 | `x-kde-passwordManagerHint` 拒绝 | `org.nspasteboard.ConcealedType` 拒绝 |
+| 全局快捷键 | XTest；拒绝 Ctrl+Alt+Backspace/Delete/L、Super+L | CGEvent；拒绝 Ctrl+Cmd+Q、Shift+Cmd+Q、Option+Cmd+Esc 与 Secure Event Input 期间 |
+| 启动程序 | argv 直接启动（`setsid`），按 AT-SPI 应用 PID 或可执行文件名等待 | 同上，`.app` 写成 `X.app/Contents/MacOS/X`；不支持按 bundle id 启动 |
+
+实测（WSL2 Ubuntu 22.04、Xvfb、openbox、Qt 5.15 fixture、tesseract 4.1，`tests/linux/run-linux-parity.sh`）：
+窗口截图尺寸等于其 bounds；Tesseract 读出状态标签 “Qt fixture status idle”；粘贴后字段值为所贴文字且 xclip
+读回原剪贴板；全局 Ctrl+A、Backspace 清空焦点字段；最大化后应用报告的宽度变大，最小化/还原经窗口管理器往返；
+启动白名单程序后其窗口作为 resource 返回、`/bin/sh` 被拒；close_window 后该进程退出。
+[待验证] KWin（真实 KDE Plasma X11）下的窗口动作与截图遮挡判断、Klipper 共存时的粘贴恢复、GTK 应用的粘贴；
+macOS 一列全部需要 macOS 真机（辅助功能 + 屏幕录制权限）验证。细节见
+[Linux 驱动](architecture/linux-kde-x11-driver.md) 与 [macOS 驱动](architecture/macos-ax-driver.md)。
 
 ## 观察视图与定位器
 
@@ -239,7 +261,7 @@ aad mcp --allow-input --allow-upload-dir D:\to-upload  # 浏览器 upload 只能
 `browser_record_*` 复用 `aad_cdp::recording` 写到存储目录的 `browser/<时间>-<id>/`。
 `Capture { target }` 是只读操作：浏览器把元素滚进视口后用 `Page.captureScreenshot` 按元素框裁剪
 （最大 4096×8192，超出时 `clipped: true`），会话加上 PNG 的 sha256 作为 `digest`。只支持主框架；
-Windows 桌面窗口见上文；其他 provider 返回 `CONTROL.ACTION_UNSUPPORTED`。
+桌面窗口见上文（Windows、Linux、macOS）；不提供截图的 provider 返回 `CONTROL.ACTION_UNSUPPORTED`。
 
 MCP 工具为 `control_capabilities`, `control_targets`, `control_observe`, `control_find`,
 `control_wait`, `control_act`, `control_capture`, `control_read_text`, `control_cancel`, `control_close`，

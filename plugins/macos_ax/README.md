@@ -53,6 +53,11 @@ marker；越过该边界后的 timeout、EOF 或协议失败归一为不可重�
 `DRIVER.UNKNOWN_EFFECT`。成功只表示事件已提交，调用方仍须以 fresh snapshot 验证业务
 后置条件。
 
+helper 协议 3 另有 `capture`（只截目标窗口，需“屏幕录制”权限，未授予时拒绝）、`window_action`
+（AXMinimized / AXFullScreen / 关闭按钮 / 激活并 AXRaise，读回状态）、`paste`（通用剪贴板延迟提供 + Cmd+V，
+之后恢复）、`clipboard_read` 与 `global_key`。这些都 [待验证]，见
+[`macos-ax-driver.md`](../../docs/architecture/macos-ax-driver.md)。
+
 CI 在 macOS runner 上构建并签名 helper，随后由 Rust adapter 完成握手与应用枚举 smoke。
 仓库还保留独立 Swift 真机套件 [`tests/macos`](../../tests/macos)，用于显式 TCC、AX 写动作
 与 CGEvent 回读验证。完整边界见

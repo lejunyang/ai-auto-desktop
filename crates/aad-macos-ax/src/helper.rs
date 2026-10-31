@@ -15,7 +15,8 @@ const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024 - 1;
 const HELPER_BUNDLE_ID: &str = "dev.ai-auto-desktop.macos-ax-helper";
 const HELPER_BUNDLE_NAME: &str = "MacOSAXHelper.app";
 const HELPER_EXECUTABLE_NAME: &str = "MacOSAXHelper";
-const HELPER_PROTOCOL_VERSION: u64 = 2;
+/// 3 added capture, window_action, paste, clipboard_read and global_key.
+const HELPER_PROTOCOL_VERSION: u64 = 3;
 
 struct HelperState {
     child: Child,
@@ -311,7 +312,13 @@ impl SwiftHelperBackend {
     ) -> Result<Value, AutomationError> {
         let track = matches!(
             operation,
-            "type_text" | "pointer_click" | "pointer_gesture" | "drag" | "key_chord"
+            "type_text"
+                | "pointer_click"
+                | "pointer_gesture"
+                | "drag"
+                | "key_chord"
+                | "paste"
+                | "global_key"
         );
         let result = self.rpc(operation, args, deadline, track)?;
         let expected = if track { "submitted" } else { "accepted" };
@@ -529,6 +536,61 @@ impl AxBackend for SwiftHelperBackend {
             json!({"native_token": token, "keys": keys}),
             deadline,
         )
+    }
+    fn window_action(
+        &self,
+        token: &str,
+        action: &str,
+        deadline: Instant,
+    ) -> Result<Value, AutomationError> {
+        let result = self.write(
+            "window_action",
+            json!({"native_token": token, "action": action}),
+            deadline,
+        )?;
+        if result["verified"] != true {
+            return Err(driver_error(
+                "DRIVER.UNKNOWN_EFFECT",
+                "the window did not report the requested state in time",
+            )
+            .with_effect("unknown")
+            .with_detail("observed_state", result["observed_state"].clone()));
+        }
+        Ok(result)
+    }
+    fn paste(&self, token: &str, text: &str, deadline: Instant) -> Result<Value, AutomationError> {
+        let result = self.write(
+            "paste",
+            json!({"native_token": token, "text": text}),
+            deadline,
+        )?;
+        if result["consumed"] != true {
+            return Err(driver_error(
+                "DRIVER.PASTE_NOT_CONSUMED",
+                "Cmd+V reached the element but nothing asked the pasteboard for the text",
+            )
+            .with_effect("unknown")
+            .with_detail("clipboard_restored", result["restored"].clone()));
+        }
+        Ok(result)
+    }
+    fn capture_element(&self, token: &str, deadline: Instant) -> Result<Value, AutomationError> {
+        self.rpc("capture", json!({"native_token": token}), deadline, false)
+    }
+    fn clipboard_text(
+        &self,
+        max_characters: usize,
+        deadline: Instant,
+    ) -> Result<Value, AutomationError> {
+        self.rpc(
+            "clipboard_read",
+            json!({"max_characters": max_characters}),
+            deadline,
+            false,
+        )
+    }
+    fn global_key(&self, keys: &[String], deadline: Instant) -> Result<Value, AutomationError> {
+        self.write("global_key", json!({"keys": keys}), deadline)
     }
     fn close(&self) {
         if let Ok(mut state) = self.state.lock() {
@@ -912,6 +974,124 @@ done
             .unwrap_err();
         assert_eq!(error.code, "DRIVER.PROTECTED_ELEMENT");
         assert_eq!(error.effect, "not_applied");
+    }
+
+    /// A helper that answers every request with `result`, after a keyboard
+    /// dispatch progress marker when `keyboard` is set.
+    fn answering(result: &str, keyboard: bool) -> Fixture {
+        let progress = if keyboard {
+            r#"  printf '{"id":"%s","progress":{"phase":"keyboard_dispatch","keyboard_dispatch_started":true,"focus_changed":true}}\n' "$id"
+"#
+        } else {
+            ""
+        };
+        Fixture::new(&format!(
+            "#!/bin/sh\nwhile IFS= read -r line; do\n  id=$(printf '%s' \"$line\" | sed -n 's/.*\"id\":\"\\([^\"]*\\)\".*/\\1/p')\n{progress}  printf '{{\"id\":\"%s\",\"result\":{result}}}\\n' \"$id\"\ndone\n"
+        ))
+    }
+
+    #[test]
+    fn paste_that_nothing_consumed_is_an_unknown_effect() {
+        let fixture = answering(
+            r#"{"native_operation":"NSPasteboard+CGEventCmdV","submitted":true,"keyboard_dispatch_started":true,"focus_changed":true,"phase":"submitted","consumed":false,"restored":"restored"}"#,
+            true,
+        );
+        let helper = backend(&fixture);
+        let error = helper
+            .paste("n", "text", Instant::now() + Duration::from_secs(2))
+            .unwrap_err();
+        assert_eq!(error.code, "DRIVER.PASTE_NOT_CONSUMED");
+        assert_eq!(error.effect, "unknown");
+        assert_eq!(error.details["clipboard_restored"], "restored");
+
+        let fixture = answering(
+            r#"{"native_operation":"NSPasteboard+CGEventCmdV","submitted":true,"keyboard_dispatch_started":true,"focus_changed":true,"phase":"submitted","consumed":true,"restored":"restored"}"#,
+            true,
+        );
+        let helper = backend(&fixture);
+        let pasted = helper
+            .paste("n", "text", Instant::now() + Duration::from_secs(2))
+            .unwrap();
+        assert_eq!(pasted["consumed"], true);
+    }
+
+    #[test]
+    fn unverified_window_state_is_an_unknown_effect() {
+        let fixture = answering(
+            r#"{"native_operation":"AXWindow.minimize","accepted":true,"verified":false,"observed_state":{"minimized":false}}"#,
+            false,
+        );
+        let helper = backend(&fixture);
+        let error = helper
+            .window_action("w", "minimize", Instant::now() + Duration::from_secs(2))
+            .unwrap_err();
+        assert_eq!(error.code, "DRIVER.UNKNOWN_EFFECT");
+        assert_eq!(error.effect, "unknown");
+        assert_eq!(error.details["observed_state"]["minimized"], false);
+
+        let fixture = answering(
+            r#"{"native_operation":"AXWindow.minimize","accepted":true,"verified":true,"observed_state":{"minimized":true}}"#,
+            false,
+        );
+        let helper = backend(&fixture);
+        assert_eq!(
+            helper
+                .window_action("w", "minimize", Instant::now() + Duration::from_secs(2))
+                .unwrap()["observed_state"]["minimized"],
+            true
+        );
+    }
+
+    #[test]
+    fn global_keys_must_declare_their_dispatch() {
+        // A helper that claims a submitted chord without the progress marker is inconsistent.
+        let fixture = answering(
+            r#"{"native_operation":"CGEventGlobalKeyChord","submitted":true,"keyboard_dispatch_started":true,"focus_changed":false,"phase":"submitted"}"#,
+            false,
+        );
+        let helper = backend(&fixture);
+        let error = helper
+            .global_key(
+                &["cmd".into(), "tab".into()],
+                Instant::now() + Duration::from_secs(2),
+            )
+            .unwrap_err();
+        assert_eq!(error.code, "DRIVER.UNKNOWN_EFFECT");
+
+        let fixture = answering(
+            r#"{"native_operation":"CGEventGlobalKeyChord","submitted":true,"keyboard_dispatch_started":true,"focus_changed":false,"phase":"submitted"}"#,
+            true,
+        );
+        let helper = backend(&fixture);
+        assert_eq!(
+            helper
+                .global_key(
+                    &["cmd".into(), "tab".into()],
+                    Instant::now() + Duration::from_secs(2)
+                )
+                .unwrap()["submitted"],
+            true
+        );
+    }
+
+    #[test]
+    fn capture_and_pasteboard_reads_pass_through_the_helper() {
+        let fixture = answering(
+            r#"{"format":"png","data":"iVBORw0KGgo=","width":2,"height":1,"clipped":false,"window_id":7}"#,
+            false,
+        );
+        let helper = backend(&fixture);
+        let shot = helper
+            .capture_element("n", Instant::now() + Duration::from_secs(2))
+            .unwrap();
+        assert_eq!(shot["window_id"], 7);
+        let read = helper
+            .clipboard_text(5, Instant::now() + Duration::from_secs(2))
+            .unwrap();
+        assert_eq!(
+            read["format"], "png",
+            "the fixture answers one shape to every request"
+        );
     }
 
     #[test]

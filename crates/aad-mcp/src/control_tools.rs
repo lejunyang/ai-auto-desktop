@@ -393,7 +393,7 @@ unknown-effect write automatically.",
         ),
         (
             "control_capture",
-            "Take a PNG screenshot of one observed element, e.g. a login QR code to show a person, the page body for the whole page, or a Windows window's root node for the whole window. Read-only. The answer carries the image and a `digest` of it: capture again later and compare digests to tell whether what is shown has changed (a QR code that refreshed) without looking at the image. Browser pages and Windows desktop windows (providers listing `capture` under `reads` in control_capabilities); password fields are refused, and a minimized window must be restored first.",
+            "Take a PNG screenshot of one observed element, e.g. a login QR code to show a person, the page body for the whole page, or a Windows window's root node for the whole window. Read-only. The answer carries the image and a `digest` of it: capture again later and compare digests to tell whether what is shown has changed (a QR code that refreshed) without looking at the image. Browser pages and desktop windows on Windows, Linux (KDE/X11) and macOS (providers listing `capture` under `reads` in control_capabilities; macOS needs Screen Recording permission); password fields are refused, and a minimized window must be restored first.",
             json!({"target": target_schema()}),
             vec!["target"],
             false,
@@ -407,8 +407,9 @@ with `words`, every one with a `box` of fx/fy/fw/fh: fractions of the element's 
 screen positions. The lines are not targets: to act on a word, click the element it was \
 read from with `fraction` at the word's centre (fx + fw/2, fy + fh/2), which is anchored \
 and revalidated on that element -- read again first if the content may have moved. \
-`digest` equals control_capture's for the same pixels. Windows desktop windows only \
-(providers listing `read_text` under `reads`); OCR can misread characters such as I and l.",
+`digest` equals control_capture's for the same pixels. Desktop providers listing \
+`read_text` under `reads`: Windows OCR on Windows, Tesseract elsewhere when it is installed; \
+OCR can misread characters such as I and l.",
             json!({
                 "target": target_schema(),
                 "language": {
@@ -651,13 +652,20 @@ not need the foreground (invoke, fill) still work; otherwise ask the person to c
 window once, then observe again."
         }
         "DRIVER.OCR_UNAVAILABLE" => {
-            "No Windows OCR language pack for that language is installed; \
-details.available_languages lists the ones that are. Pass one of those, or omit language. \
-Packs are added in Settings > Time & language by whoever administers the machine."
+            "No OCR for that language here: on Windows no OCR language pack is installed for \
+it, elsewhere Tesseract or its language data is missing (or, on macOS, not allowed to run \
+unsandboxed). details.available_languages lists what is installed when OCR exists at all; \
+pass one of those, or omit language. Language packs or Tesseract are installed by whoever \
+administers the machine."
         }
         "DRIVER.OCR_FAILED" => {
-            "Windows OCR could not read the image. Capture the element to see what it shows; \
+            "OCR could not read the image. Capture the element to see what it shows; \
 a very small or very large element reads poorly -- try its container or a smaller part."
+        }
+        "DRIVER.SCREEN_RECORDING_DENIED" => {
+            "macOS has not granted Screen Recording to MacOSAXHelper.app, so nothing was \
+captured. The person at the Mac grants it in System Settings > Privacy & Security > Screen \
+Recording; the helper never asks by itself."
         }
         "DRIVER.WINDOW_MINIMIZED" => {
             "The window is minimized, so it shows nothing. Restore it (the window node's \
