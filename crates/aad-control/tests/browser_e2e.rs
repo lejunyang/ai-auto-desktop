@@ -388,10 +388,14 @@ fn session_for(fixture: &Fixture) -> (Session, Arc<BrowserBackend>) {
 fn targets(session: &Session) -> Vec<Value> {
     let response = call(session, Operation::Targets {});
     assert!(response.error.is_none(), "{response:?}");
-    response.data.unwrap()["resources"]
-        .as_array()
-        .unwrap()
-        .clone()
+    let data = response.data.unwrap();
+    // A failed listing is not an empty one: it would make a closed tab
+    // look gone and drop every resource the test still uses.
+    assert!(
+        data["unavailable"].get(browser::PROVIDER).is_none(),
+        "the browser could not be listed: {data}"
+    );
+    data["resources"].as_array().unwrap().clone()
 }
 /// The main frame of the page with this id.
 fn main_of(session: &Session, page_id: &str) -> String {

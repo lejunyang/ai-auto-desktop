@@ -1517,6 +1517,15 @@ impl Backend for BrowserBackend {
                     });
                     continue;
                 }
+                // A tab being closed is still listed for a moment after its
+                // connection stops answering; it is gone, not a failure.
+                Err(_)
+                    if Client::list_targets_until(self.port()?, deadline)
+                        .is_ok_and(|now| now.iter().all(|t| t.id != target.id)) =>
+                {
+                    pages.remove(&target.id);
+                    continue;
+                }
                 Err(e) => return Err(e),
             };
             if let Some(dialog) = &page.dialog {
