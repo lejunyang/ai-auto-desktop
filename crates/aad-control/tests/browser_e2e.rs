@@ -736,7 +736,9 @@ fn frames_in_and_out_of_process_take_trusted_pointer_and_keyboard_input() {
         .unwrap()
         .contains(CROSS_SITE));
     let cross = cross["resource_id"].as_str().unwrap().to_string();
-    let local = frame_of(&session, |m| m["out_of_process"] == false);
+    let local = frame_of(&session, |m| {
+        m["url"].as_str().is_some_and(|u| u.ends_with("/frame"))
+    });
     let local = local["resource_id"].as_str().unwrap().to_string();
     let loaded = wait_until(&session, &cross, "CrossButton", WaitCondition::Appears);
     assert!(loaded.error.is_none(), "{loaded:?}");
@@ -1711,7 +1713,10 @@ fn browser_actions_are_observed_document_bound_and_have_real_page_effects() {
         let response = call(&session, Operation::Targets {});
         let data = response.data.unwrap();
         if data["resources"].as_array().unwrap().iter().any(|r| {
-            r["metadata"]["main_frame"] == false && r["metadata"]["out_of_process"] == false
+            r["metadata"]["main_frame"] == false
+                && r["metadata"]["url"]
+                    .as_str()
+                    .is_some_and(|u| u.ends_with("/frame"))
         }) {
             break data;
         }
@@ -1730,7 +1735,12 @@ fn browser_actions_are_observed_document_bound_and_have_real_page_effects() {
         .as_array()
         .unwrap()
         .iter()
-        .find(|r| r["metadata"]["main_frame"] == false && r["metadata"]["out_of_process"] == false)
+        .find(|r| {
+            r["metadata"]["main_frame"] == false
+                && r["metadata"]["url"]
+                    .as_str()
+                    .is_some_and(|u| u.ends_with("/frame"))
+        })
         .unwrap()["resource_id"]
         .as_str()
         .unwrap();
