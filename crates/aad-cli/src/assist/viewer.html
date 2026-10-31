@@ -1,0 +1,98 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Assist</title>
+<style>
+:root{color-scheme:light dark;--bg:#f6f6f4;--fg:#1d1d1b;--muted:#6b6b66}
+@media (prefers-color-scheme:dark){:root{--bg:#161615;--fg:#ecece8;--muted:#9a9a93}}
+body{margin:0;background:var(--bg);color:var(--fg);font:14px system-ui,sans-serif;display:flex;flex-direction:column;height:100vh}
+header{padding:8px 16px;color:var(--muted)}
+main{flex:1;display:flex;align-items:center;justify-content:center;min-height:0;padding:0 16px 16px}
+canvas{max-width:100%;max-height:100%;outline:none;cursor:crosshair;box-shadow:0 1px 6px rgba(0,0,0,.25)}
+</style></head><body>
+<header id="status">Connecting…</header>
+<main><canvas id="screen" tabindex="0" aria-label="Shared screen" width="1" height="1"></canvas></main>
+<script>
+const token=new URLSearchParams(location.search).get('token');
+const socket=new WebSocket(`ws://${location.host}/ws?token=${token}`);
+socket.binaryType='arraybuffer';
+const screen=document.getElementById('screen'), status=document.getElementById('status'), pen=screen.getContext('2d');
+const send=m=>socket.readyState===1&&socket.send(JSON.stringify(m));
+const MIME={1:'image/jpeg',2:'image/webp'};
+const VIDEO={3:'h264',4:'vp9',5:'av1'};
+// A representative stream of each codec; the exact one is checked again when it starts.
+const PROBE={h264:'avc1.42E01F',vp9:'vp09.00.41.08',av1:'av01.0.08M.08'};
+let decodable=[], refused=new Set(), video=null, source='', mode='';
+const show=()=>status.textContent=mode;
+const size=(w,h)=>{if(screen.width!==w||screen.height!==h){screen.width=w;screen.height=h;}};
+// WebCodecs exists only in secure contexts: localhost, or a host serving this over https.
+async function probe(){
+  if(!('VideoDecoder' in window)) return [];
+  const found=[];
+  for(const [name,codec] of Object.entries(PROBE)){
+    try{if((await VideoDecoder.isConfigSupported({codec})).supported) found.push(name);}catch{}
+  }
+  return found;
+}
+const hello=()=>send({type:'hello',accept:[...decodable.filter(c=>!refused.has(c)),'webp','jpeg']});
+socket.onopen=async()=>{decodable=await probe();hello();};
+function stop(){if(video&&video.decoder.state!=='closed') video.decoder.close();video=null;}
+async function stream(m){
+  stop();
+  const config={codec:m.webcodecs,optimizeForLatency:true};
+  let ok=false;
+  try{ok=(await VideoDecoder.isConfigSupported(config)).supported;}catch{}
+  if(!ok){refused.add(m.codec);hello();return;}
+  const decoder=new VideoDecoder({
+    output:f=>{size(f.displayWidth,f.displayHeight);pen.drawImage(f,0,0);f.close();},
+    error:e=>{status.textContent='Video decoding failed: '+e.message;stop();send({type:'keyframe'});}});
+  decoder.configure(config);
+  video={decoder,codec:m.codec,started:false};
+  mode=`${source} · ${m.codec} (${m.encoder}) ${m.width}×${m.height}`;show();
+}
+function chunk(buffer){
+  const head=new DataView(buffer), codec=VIDEO[head.getUint8(1)], key=(head.getUint8(2)&1)===1;
+  if(!video||video.codec!==codec||video.decoder.state!=='configured') return;
+  if(!video.started&&!key) return; // a decoder starts at a keyframe
+  video.started=true;
+  video.decoder.decode(new EncodedVideoChunk({type:key?'key':'delta',
+    timestamp:Number(head.getBigUint64(16))*1000,data:new Uint8Array(buffer,head.getUint16(12))}));
+}
+async function picture(buffer){
+  const head=new DataView(buffer);
+  if(video) stop();
+  const picture=await createImageBitmap(new Blob([new Uint8Array(buffer,head.getUint16(12))],{type:MIME[head.getUint8(1)]}));
+  size(picture.width,picture.height);pen.drawImage(picture,0,0);picture.close();
+}
+function control(m){
+  if(m.type==='ready'){source=(m.view_only?'Viewing ':'Sharing ')+m.source.kind;mode=source+(m.view_only?'':' — click the picture to control it');show();}
+  if(m.type==='stream') return stream(m);
+  if(m.type==='error') status.textContent=m.message;
+}
+// Messages are handled in order, so a stream's first frames wait for its decoder.
+// Pictures stand alone: one with a newer picture behind it is skipped.
+let chain=Promise.resolve(), waiting=0;
+const later=job=>{chain=chain.then(job).catch(e=>{status.textContent=String(e);});};
+socket.onmessage=e=>{
+  if(e.data instanceof ArrayBuffer){
+    const kind=new DataView(e.data).getUint8(1);
+    if(MIME[kind]){waiting++;later(()=>{waiting--;if(waiting===0) return picture(e.data);});}
+    else if(VIDEO[kind]) later(()=>chunk(e.data));
+    return; // an unknown codec is skipped, not misdrawn
+  }
+  const m=JSON.parse(e.data);later(()=>control(m));
+};
+socket.onclose=()=>{stop();status.textContent='Disconnected';};
+const at=e=>{const r=screen.getBoundingClientRect();return{x:Math.min(1,Math.max(0,(e.clientX-r.left)/r.width)),y:Math.min(1,Math.max(0,(e.clientY-r.top)/r.height))};};
+const button=e=>['left','middle','right'][e.button]||'left';
+let last=0;
+screen.addEventListener('mousemove',e=>{const now=Date.now();if(now-last<40)return;last=now;send({type:'mouse',action:'move',...at(e)});});
+screen.addEventListener('mousedown',e=>{e.preventDefault();screen.focus();send({type:'mouse',action:'down',button:button(e),...at(e)});});
+screen.addEventListener('mouseup',e=>send({type:'mouse',action:'up',button:button(e),...at(e)}));
+screen.addEventListener('contextmenu',e=>e.preventDefault());
+screen.addEventListener('wheel',e=>{e.preventDefault();send({type:'mouse',action:'wheel',dx:e.deltaX,dy:e.deltaY,...at(e)});},{passive:false});
+screen.addEventListener('keydown',e=>{e.preventDefault();
+  if(e.key.length===1&&!e.ctrlKey&&!e.metaKey&&!e.altKey) send({type:'text',text:e.key});
+  else send({type:'key',action:'down',key:e.key,code:e.code});});
+screen.addEventListener('keyup',e=>{e.preventDefault();if(!(e.key.length===1&&!e.ctrlKey&&!e.metaKey&&!e.altKey))send({type:'key',action:'up',key:e.key,code:e.code});});
+screen.addEventListener('paste',e=>send({type:'text',text:e.clipboardData.getData('text')}));
+</script></body></html>
