@@ -902,11 +902,39 @@ fn host(
             }
         }
         let mut changed = false;
-        while let Ok(Connection { mut stream, reader }) = arrivals.try_recv() {
+        // Viewers that left; the controller's keys and buttons are let go.
+        let (gone, staying): (Vec<_>, Vec<_>) = viewers.into_iter().partition(Viewer::gone);
+        viewers = staying;
+        for viewer in gone {
+            if control.holder == Some(viewer.id) {
+                source.release();
+                control.holder = None;
+            }
+            viewer.close();
+            changed = true;
+        }
+        if control.holder.is_none() && !config.view_only {
+            control.holder = viewers.first().map(|v| v.id);
+        }
+        while let Ok(Connection {
+            mut stream,
+            mut reader,
+        }) = arrivals.try_recv()
+        {
             if viewers.len() >= config.max_viewers {
                 let refusal = json!({"type": "error", "message": format!("{} viewers are watching already (--max-viewers)", viewers.len())});
-                let _ = write_frame(&mut stream, 1, refusal.to_string().as_bytes());
-                let _ = write_frame(&mut stream, 8, &[]);
+                std::thread::spawn(move || {
+                    let _ = write_frame(&mut stream, 1, refusal.to_string().as_bytes());
+                    let _ = write_frame(&mut stream, 8, &[]);
+                    // Closed with what the viewer sent still unread, the
+                    // connection would be reset and the refusal lost.
+                    let _ = stream.shutdown(std::net::Shutdown::Write);
+                    let _ = reader
+                        .get_ref()
+                        .set_read_timeout(Some(Duration::from_secs(2)));
+                    let mut sink = [0u8; 4096];
+                    while matches!(reader.read(&mut sink), Ok(n) if n > 0) {}
+                });
                 continue;
             }
             let (outbox, writer) = Outbox::start(stream.try_clone().map_err(|e| e.to_string())?);
@@ -994,20 +1022,6 @@ fn host(
                     }
                 }
             }
-        }
-        // Viewers that left; the controller's keys and buttons are let go.
-        let (gone, staying): (Vec<_>, Vec<_>) = viewers.into_iter().partition(Viewer::gone);
-        viewers = staying;
-        for viewer in gone {
-            if control.holder == Some(viewer.id) {
-                source.release();
-                control.holder = None;
-            }
-            viewer.close();
-            changed = true;
-        }
-        if control.holder.is_none() && !config.view_only {
-            control.holder = viewers.first().map(|v| v.id);
         }
         if changed {
             control.tell(&viewers, config.view_only);
