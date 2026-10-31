@@ -58,7 +58,7 @@ jobs:
         run: python -m compileall -q tests/windows
       - name: Install Linux native driver test dependencies
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends xvfb xauth dbus-x11 at-spi2-core g++ pkg-config qtbase5-dev libx11-dev libxtst-dev
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends xvfb xauth dbus-x11 at-spi2-core g++ pkg-config qtbase5-dev libx11-dev libxtst-dev openbox x11-utils xclip tesseract-ocr tesseract-ocr-eng
       - name: Build Linux native input and capture helpers
         if: runner.os == 'Linux'
         run: |
@@ -154,3 +154,10 @@ jobs:
       - name: Run Rust Linux AT-SPI fixture
         if: runner.os == 'Linux'
         run: tests/linux/run-rust-atspi-fixture.sh
+
+      # Capture, Tesseract OCR, paste, clipboard, global keys, EWMH window
+      # actions and launch, each checked by its effect, with openbox as the
+      # window manager in a private Xvfb session.
+      - name: Run Linux desktop parity fixture
+        if: runner.os == 'Linux'
+        run: tests/linux/run-linux-parity.sh
