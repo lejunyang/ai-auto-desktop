@@ -393,7 +393,15 @@ Agent 遇到自己做不了的事（扫码之外的登录、验证码、需要�
 aad assist --browser-port 9222            # 分享一个浏览器页面（CDP screencast）
 aad assist --desktop                      # 分享整个桌面（目前只有 Windows）
 aad assist --desktop --view-only          # 只给看，不接收鼠标键盘
+aad assist --list-screens                 # 列出可分享的显示器和窗口
+aad assist --desktop --monitor 1          # 只分享第 1 块显示器
+aad assist --desktop --window 0x3077a     # 只分享一个窗口（句柄，或标题的一部分）
 ```
+
+`--monitor` 和 `--window` 只分享桌面的一部分：截屏照常用 DXGI，再裁出这块区域（裁剪缓冲同样两份轮换，只补变化的区域），
+鼠标位置和光标都换算到这块区域里，区域外的光标不显示。窗口按 DWM 的可见边框跟随：移动后输入跟着走，大小改变后画面
+按新尺寸从关键帧重新开始，最小化时停在最后一帧，窗口关闭时报错。分享的是窗口在屏幕上占的那块区域，盖在它上面的
+东西也会被看到。
 
 可以同时有多个查看者（`--max-viewers`，默认 4）：各自选自己的编码，截一次屏供所有人用；暂时跟不上的查看者把漏掉的
 变化区域合并起来，等它能接收时一起补上，tiles 不会漏块。同一时刻只有一个查看者的鼠标键盘会被转发：最早连上的那个；
@@ -536,7 +544,10 @@ https 代理也可以；不支持某种编码时查看页会重新 hello 把它�
 所以不通过 MCP 提供给 Agent。
 `tests/windows/verify_assist.py` 用真实 Chrome（加 `--desktop` 再测 Windows 桌面）检查默认收到 WebP、
 声明只要 JPEG 时收到 JPEG、点击和输入生效、错误 token 被拒绝；`tests/windows/verify_assist_video.py`
-和 `verify_assist_tiles.py` 检查上面的视频与 tiles 行为；`tests/windows/verify_assist_viewers.py` 检查多个查看者：两人用不同编码同时看、只有控制者的点击生效、接管后上一位按着的
+和 `verify_assist_tiles.py` 检查上面的视频与 tiles 行为；`tests/windows/verify_assist_area.py` 检查 `--list-screens` 的显示器和窗口、`--monitor` 的画面就是该显示器、不存在的编号被拒绝；
+加 `--window` 时用隔离的探针窗口检查：首帧就是窗口大小、在画面里点哪里就落在窗口的哪里（窗口移动后也一样）、
+改变大小后按新尺寸重新开始、光标按窗口内的位置报告、补丁拼出的画面和此刻的关键帧逐块一致（最差的块平均差 2.5/255）；
+`tests/windows/verify_assist_viewers.py` 检查多个查看者：两人用不同编码同时看、只有控制者的点击生效、接管后上一位按着的
 Shift 被松开、控制者离开后控制权交回、画面静止时后来者和全部离开后重连的人都拿到首帧、超过 `--max-viewers` 的被拒绝；
 `tests/windows/verify_assist_input.py` 按页面上的
 实际效果检查远程操作：双击选中单词、Ctrl+A 后输入替换文字、Ctrl+/ 和 Ctrl+Space 以对应物理键到达页面、
