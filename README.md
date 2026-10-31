@@ -395,25 +395,74 @@ aad assist --desktop                      # 分享整个桌面（目前只有 Wi
 aad assist --desktop --view-only          # 只给看，不接收鼠标键盘
 ```
 
-启动后在 stdout 打印一行 JSON：`url`（自带的查看页，可选）、`websocket`、`token`。只监听本机回环地址，
-每个连接都要带 token。主要产物是 WebSocket 上的帧流，由 omem 这类宿主自己渲染：
+启动后在 stdout 打印一行 JSON：`url`（自带的查看页，可选）、`websocket`、`token`、`codecs`（提供的编码）
+和 `video`（找到的 ffmpeg 与每种视频编码选中的编码器）。只监听本机回环地址，每个连接都要带 token。
+主要产物是 WebSocket 上的帧流，由 omem 这类宿主自己渲染：
 
-- 画面是二进制消息，一帧一张图：24 字节大端头（版本、编码、标志位 bit0 = 关键帧、宽、高、头长度、
-  从开始算起的毫秒时间戳），之后是图片本身。读的一方按“头长度”跳过头，以后加字段不影响旧的读法；
-  不认识的编码跳过不画。
-- 编码默认 WebP（有损，`--quality` 默认 70），比同质量 JPEG 小得多；查看端可以先发
-  `{"type":"hello","accept":["webp","jpeg"]}` 按偏好选编码，只认 JPEG 的就只收 JPEG。
-  浏览器的 WebP 用 `Page.captureScreenshot` 按 `--fps` 取图（screencast 只给 JPEG），没变化不发；
-  桌面用 libwebp 编码。现在每帧都是完整的图（都是关键帧）；以后加 H.264 等视频编码只需新增一种编码值，
-  头里已有关键帧标志和时间戳。
-- 控制消息是 JSON 文本：服务端发 `ready`（含 `frames.codecs`）和 `error`，查看端发 `hello`、
-  `mouse`（move/down/up/wheel，位置是画面内 0..1 的比例）、`key`（Enter、方向键、F1–F12、修饰键等非文字按键）
-  和 `text`（输入的文字）。
+- 画面是二进制消息，一条一帧：24 字节大端头（版本、编码、标志位 bit0 = 关键帧、宽、高、头长度、
+  从开始算起的毫秒时间戳），之后是负载。读的一方按“头长度”跳过头，以后加字段不影响旧的读法；
+  不认识的编码跳过不画。编码值：1 = JPEG、2 = WebP（各是一整张图），3 = H.264（Annex B，
+  关键帧前带 SPS/PPS）、4 = VP9、5 = AV1（OBU），各是一帧视频。
+- 画面没变化就什么都不发。图片编码每次发整张图；视频编码里没变的块被编成跳过块，小改动只是很小的一帧。
+- 查看端可以先发 `{"type":"hello","accept":["h264","webp","jpeg"]}` 按自己的偏好选编码；不发 hello 的
+  查看端收到 `--codecs` 里的第一个（默认 WebP，旧宿主不受影响）。每段视频流开始前服务端发
+  `{"type":"stream","codec":"h264","webcodecs":"avc1.64001f","encoder":"h264_nvenc","width":..,"height":..}`，
+  紧接着是关键帧；`webcodecs` 可直接作 WebCodecs `VideoDecoder.configure` 的 `codec`。解码出错时查看端发
+  `{"type":"keyframe"}`，服务端重开编码器，从当前画面的关键帧重新开始。
+- 控制消息是 JSON 文本：服务端发 `ready`（含 `frames.codecs`、`video`）、`stream` 和 `error`，查看端发
+  `hello`、`keyframe`、`mouse`（move/down/up/wheel，位置是画面内 0..1 的比例）、`key`（Enter、方向键、
+  F1–F12、修饰键等非文字按键）和 `text`（输入的文字）。
+
+### 视频流（需要宿主自备 ffmpeg）
+
+本项目不带编码器。按 `--ffmpeg PATH` → 环境变量 `AAD_FFMPEG` → PATH 上的 `ffmpeg` 的顺序找；找到后启动时
+对每种视频编码依次试编码器（先硬件后软件），**每一帧都必须在下一帧送进去之前编出来**才算可用，所以列在
+`ffmpeg -encoders` 里却用不了的（没有 NVIDIA 卡的 NVENC、没有 AMD 卡的 AMF）以及会攒帧的（Media Foundation
+的 H.264 要等输入结束才吐帧）都不会被选中。没有 ffmpeg 时只提供 WebP/JPEG，行为和以前一样。
+
+```powershell
+aad assist --probe-video                                 # 只报告这台机器能用哪些视频编码器，然后退出
+aad assist --desktop --codecs h264,webp                  # 优先 H.264，不支持视频的查看端退回 WebP
+aad assist --desktop --encoder libx264 --preset veryfast --bitrate 4000
+aad assist --browser-port 9222 --codecs vp9 --chroma 444 # 4:4:4，彩色小字更清楚
+aad assist --desktop --codecs av1 --ffmpeg-arg=-svtav1-params --ffmpeg-arg=pred-struct=1:lp=4
+```
+
+| 参数 | 作用 |
+|---|---|
+| `--codecs` | 提供哪些编码及顺序：`webp,jpeg,h264,vp9,av1`；`auto`（默认）= WebP、JPEG 加上能用的视频编码 |
+| `--ffmpeg` | ffmpeg 路径（否则 `AAD_FFMPEG`，再否则 PATH） |
+| `--encoder` | 指定 ffmpeg 编码器，可重复：作后备，或每种编码各指定一个；不指定时先试硬件 |
+| `--fps` | 最高帧率 1..60；不填时图片 5、视频 30。只是上限，画面不变就不出帧 |
+| `--quality` | 1..100，图片的质量；视频不设 `--bitrate` 时换算成各编码器自己的恒定量化参数 |
+| `--bitrate` | 视频恒定码率（kbit/s） |
+| `--gop` | 关键帧间隔（帧数）；默认 0 = 只在开始或查看端要求时出关键帧 |
+| `--preset` | 编码器速度档（x264 `veryfast`、NVENC `p4`、SVT-AV1 `8`…）；默认各自最快的一档 |
+| `--chroma` | `420`（默认）或 `444`；不支持 4:4:4 的编码器会在试编时落选 |
+| `--ffmpeg-arg` | 原样追加一个 ffmpeg 输出参数，可重复（兜底，用于本项目没有包装的选项） |
+| `--max-width` / `--max-height` | 发出的画面最大宽高（默认 1600 宽、高不限），更大的屏幕按比例缩小；视频再取偶数 |
+
+内置的编码器参数都是低延迟配置：x264 `ultrafast` + `zerolatency`、NVENC `p1` + `ull` + `zerolatency`、
+QSV `async_depth 1`、libvpx `realtime`、SVT-AV1 低延迟预测结构、libaom `realtime`，都不带 B 帧。
+H.264 用 FLV、VP9/AV1 用 IVF 从 ffmpeg 取出（两者都在帧前写长度，一帧编完立刻转发，不用等下一帧开头）。
+抓屏和编码在各自线程上，网络慢时不再抓新画面（而不是在视频流中间丢帧），所以查看端拿到的总是最新画面。
+
+自带查看页用 WebCodecs 解码，WebCodecs 只在安全上下文里有：`localhost`/`127.0.0.1` 直接打开可以，宿主通过
+https 代理也可以；不支持某种编码时查看页会重新 hello 把它去掉，退回 WebP。
+
+本机实测（Windows 11，RTX 4080 Laptop + Intel 核显，ffmpeg 9.0.1 full build，Chrome headless=new，
+`tests/windows/verify_assist_video.py --desktop`）：自动选中 h264_nvenc / vp9_qsv / av1_nvenc，试编各约
+250 ms、vp9_qsv 约 1.5 s（并行进行）；768×496 的图文页面关键帧 72 KB（H.264）/ 104 KB（VP9）/ 86 KB（AV1），
+页面静止 6 秒发出 0 帧，点击和打字每帧最大 0.8–1.7 KB；收到的每一帧都能被独立的 ffmpeg 解码（帧数一致），
+经视频流的点击和输入真实生效；自带查看页在 Chrome 里用 WebCodecs 解出并画出画面（三种编码、软件编码器、
+4:4:4 都试过）；整桌面 1536×960 H.264 解码和输入生效。macOS 的 h264_videotoolbox、AMD 的 AMF 只按文档配置，
+`[待验证: 对应硬件]`；Linux 的 VAAPI 等需要上传滤镜的编码器没有内置配置，可用 `--encoder` 加 `--ffmpeg-arg` 自配。
 
 浏览器画面的输入用 CDP `Input.*` 发给页面，桌面用 `SendInput`。这是给人用的通道，按屏幕位置操作，
 所以不通过 MCP 提供给 Agent。
 `tests/windows/verify_assist.py` 用真实 Chrome（加 `--desktop` 再测 Windows 桌面）检查默认收到 WebP、
-声明只要 JPEG 时收到 JPEG、点击和输入生效、错误 token 被拒绝。Linux 和 macOS 的整桌面分享还没有做。
+声明只要 JPEG 时收到 JPEG、点击和输入生效、错误 token 被拒绝；`tests/windows/verify_assist_video.py`
+检查上面的视频行为。Linux 和 macOS 的整桌面分享还没有做。
 
 ## 桌面窗口（GUI）
 
