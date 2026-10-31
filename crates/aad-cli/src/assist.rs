@@ -295,7 +295,12 @@ fn serve(
     stream
         .write_all(format!("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n").as_bytes())
         .map_err(|e| e.to_string())?;
-    stream.set_read_timeout(None).map_err(|e| e.to_string())?;
+    // On the handle the reader holds: on Windows a cloned socket keeps its
+    // own timeout, and a viewer that only watches would be cut off after 5 s.
+    reader
+        .get_ref()
+        .set_read_timeout(None)
+        .map_err(|e| e.to_string())?;
 
     // The viewer's messages are read on their own thread; frames and input are
     // handled here, so the source is only ever used from one thread.
