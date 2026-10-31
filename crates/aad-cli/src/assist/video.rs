@@ -106,16 +106,19 @@ fn on_path() -> Option<PathBuf> {
         .find(|candidate| candidate.is_file())
 }
 
+#[cfg(windows)]
 fn command(path: &Path) -> Command {
+    use std::os::windows::process::CommandExt;
+    // No console window flashing up when aad itself runs without one.
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     let mut command = Command::new(path);
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        // No console window flashing up when aad itself runs without one.
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        command.creation_flags(CREATE_NO_WINDOW);
-    }
+    command.creation_flags(CREATE_NO_WINDOW);
     command
+}
+
+#[cfg(not(windows))]
+fn command(path: &Path) -> Command {
+    Command::new(path)
 }
 
 /// What this project knows about one ffmpeg encoder.

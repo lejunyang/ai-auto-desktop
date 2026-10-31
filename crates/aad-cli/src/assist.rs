@@ -446,6 +446,7 @@ trait Source {
 }
 
 /// Most clipboard text handed to a viewer at once.
+#[cfg(windows)]
 const CLIPBOARD_CHARACTERS: usize = 100_000;
 
 /// Everything about the stream decided at startup.
