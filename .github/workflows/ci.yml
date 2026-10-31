@@ -168,6 +168,64 @@ jobs:
               p.terminate()
           PY
 
+      # Where the runner grants Accessibility, input is checked by its
+      # effect: the pointer lands where the viewer points (read back from
+      # the system), and keys and text typed into TextEdit are its text.
+      - name: Check assist input on the macOS desktop
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          osascript -e 'tell application "TextEdit" to make new document' -e 'tell application "TextEdit" to activate'
+          sleep 2
+          PYTHONPATH=tests/windows python3 - <<'PY'
+          import json, queue, subprocess, sys, time
+          import verify_assist
+          verify_assist.AAD = "target/debug/aad"
+          from verify_assist import Viewer, start_assist
+          from verify_assist_video import listen
+          assist, announce = start_assist("--desktop", "--codecs", "tiles")
+          try:
+              if not announce["source"]["permissions"]["accessibility"]:
+                  print("no Accessibility on this runner; input not checked")
+                  sys.exit(0)
+              viewer = listen(Viewer(announce["websocket"]))
+              viewer.send({"type": "hello", "accept": ["tiles"]})
+              def cursor_near(x, y, seconds=5):
+                  end = time.time() + seconds
+                  while time.time() < end:
+                      try:
+                          m = viewer.inbox.get(timeout=0.2)
+                      except queue.Empty:
+                          continue
+                      if m and m.get("type") == "cursor" and abs(m["x"] - x) < 0.01 and abs(m["y"] - y) < 0.01:
+                          return True
+                  return False
+              viewer.send({"type": "mouse", "action": "move", "x": 0.25, "y": 0.75})
+              pointer = cursor_near(0.25, 0.75)
+              viewer.send({"type": "text", "text": "typed through assist"})
+              time.sleep(1)
+              def document():
+                  return subprocess.run(["osascript", "-e", 'tell application "TextEdit" to get text of document 1'],
+                                        capture_output=True, text=True).stdout.strip()
+              typed = document()
+              for action in ("down", "up"):
+                  if action == "down":
+                      viewer.send({"type": "key", "action": "down", "key": "Meta", "code": "MetaLeft"})
+                  viewer.send({"type": "key", "action": action, "key": "a", "code": "KeyA"})
+              viewer.send({"type": "key", "action": "up", "key": "Meta", "code": "MetaLeft"})
+              viewer.send({"type": "text", "text": "replaced"})
+              time.sleep(1)
+              replaced = document()
+              viewer.close()
+              result = {"pointer_lands": pointer, "typed": typed, "cmd_a_then_typing": replaced}
+              print(json.dumps(result))
+              assert pointer and typed == "typed through assist" and replaced == "replaced", result
+          finally:
+              assist.terminate()
+              subprocess.run(["osascript", "-e", 'tell application "TextEdit" to quit saving no'])
+          PY
+
       # aad assist on an X11 desktop of its own (the script starts Xvfb):
       # what is streamed and what a viewer's input does, checked by effect.
       - name: Test assist on an X11 desktop
