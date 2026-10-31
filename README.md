@@ -395,6 +395,12 @@ aad assist --desktop                      # 分享整个桌面（目前只有 Wi
 aad assist --desktop --view-only          # 只给看，不接收鼠标键盘
 ```
 
+可以同时有多个查看者（`--max-viewers`，默认 4）：各自选自己的编码，截一次屏供所有人用；暂时跟不上的查看者把漏掉的
+变化区域合并起来，等它能接收时一起补上，tiles 不会漏块。同一时刻只有一个查看者的鼠标键盘会被转发：最早连上的那个；
+其他人只看，查看页上有“Take control”按钮（发 `{"type":"take"}`）可以接管，接管时先把上一位还按着的键和鼠标键松开；
+控制者离开后交给下一位。谁在控制变化时每个查看者收到 `{"type":"control","you":..,"holder":..,"viewers":..}`。
+画面静止时新连上的查看者也会立刻收到当前画面。
+
 启动后在 stdout 打印一行 JSON：`url`（自带的查看页，可选）、`websocket`、`token`、`codecs`（提供的编码）
 和 `video`（找到的 ffmpeg 与每种视频编码选中的编码器）。只监听本机回环地址，每个连接都要带 token。
 主要产物是 WebSocket 上的帧流，由 omem 这类宿主自己渲染：
@@ -530,7 +536,9 @@ https 代理也可以；不支持某种编码时查看页会重新 hello 把它�
 所以不通过 MCP 提供给 Agent。
 `tests/windows/verify_assist.py` 用真实 Chrome（加 `--desktop` 再测 Windows 桌面）检查默认收到 WebP、
 声明只要 JPEG 时收到 JPEG、点击和输入生效、错误 token 被拒绝；`tests/windows/verify_assist_video.py`
-和 `verify_assist_tiles.py` 检查上面的视频与 tiles 行为；`tests/windows/verify_assist_input.py` 按页面上的
+和 `verify_assist_tiles.py` 检查上面的视频与 tiles 行为；`tests/windows/verify_assist_viewers.py` 检查多个查看者：两人用不同编码同时看、只有控制者的点击生效、接管后上一位按着的
+Shift 被松开、控制者离开后控制权交回、画面静止时后来者和全部离开后重连的人都拿到首帧、超过 `--max-viewers` 的被拒绝；
+`tests/windows/verify_assist_input.py` 按页面上的
 实际效果检查远程操作：双击选中单词、Ctrl+A 后输入替换文字、Ctrl+/ 和 Ctrl+Space 以对应物理键到达页面、
 `release` 松开按住的 Ctrl、查看端按着 Shift 和鼠标键断开后两者都被松开；在自带查看页里用输入法组出“中文”只送达一次、
 在画面里按下拖到画面外松开仍然送达；加 `--desktop` 时比对桌面剪贴板的回答和本机独立读到的内容（不改剪贴板），
