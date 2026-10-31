@@ -4,7 +4,8 @@ import Carbon.HIToolbox
 import Darwin
 import Foundation
 
-private let protocolVersion = 2
+/// 3 added capture, window_action, paste, clipboard_read and global_key.
+private let protocolVersion = 3
 private let maximumInputBytes = 1_048_576
 private let maximumOutputBytes = 8 * 1_024 * 1_024 - 1
 private let maximumFieldCharacters = 4_096
@@ -14,7 +15,51 @@ private let maximumUnicodeUnitsPerEvent = 20
 private let maximumDepth = 128
 private let maximumNodes = 5_000
 /// Operations whose failures report how far keyboard or pointer dispatch got.
-private let keyboardOperations: Set<String> = ["type_text", "key_chord"]
+private let keyboardOperations: Set<String> = ["type_text", "key_chord", "paste", "global_key"]
+private let maximumPasteCharacters = 4_096
+private let maximumClipboardCharacters = 65_536
+private let maximumSavedPasteboardBytes = 32 * 1_024 * 1_024
+private let maximumCapturePoints: CGFloat = 8_192
+private let concealedType = NSPasteboard.PasteboardType("org.nspasteboard.ConcealedType")
+private let transientType = NSPasteboard.PasteboardType("org.nspasteboard.TransientType")
+
+/// Offers the pasted text lazily, so the helper sees whether anything asked for it.
+private final class PasteProvider: NSObject, NSPasteboardItemDataProvider {
+    let text: String
+    private(set) var provided = false
+
+    init(text: String) {
+        self.text = text
+    }
+
+    func pasteboard(
+        _ pasteboard: NSPasteboard?, item: NSPasteboardItem,
+        provideDataForType type: NSPasteboard.PasteboardType
+    ) {
+        guard type == .string else { return }
+        item.setString(text, forType: .string)
+        provided = true
+    }
+
+    func pasteboardFinishedWithDataProvider(_ pasteboard: NSPasteboard) {}
+}
+
+/// CGWindowListCreateImage, looked up at run time: newer SDKs mark it
+/// obsolete for new deployment targets, but it remains the API that captures
+/// one window's own content without the windows covering it.
+private typealias WindowImageFunction = @convention(c) (
+    CGRect, UInt32, UInt32, UInt32
+) -> Unmanaged<CGImage>?
+
+private func createWindowImage(_ rect: CGRect, window: CGWindowID) -> CGImage? {
+    guard let symbol = dlsym(UnsafeMutableRawPointer(bitPattern: -2), "CGWindowListCreateImage") else {
+        return nil
+    }
+    let function = unsafeBitCast(symbol, to: WindowImageFunction.self)
+    let includingWindow: UInt32 = 1 << 3  // kCGWindowListOptionIncludingWindow
+    let options: UInt32 = (1 << 0) | (1 << 3)  // boundsIgnoreFraming | bestResolution
+    return function(rect, includingWindow, window, options)?.takeRetainedValue()
+}
 private let pointerOperations: Set<String> = ["pointer_click", "pointer_gesture", "drag"]
 
 private struct HelperFailure: Error {
@@ -470,6 +515,22 @@ private final class AXService {
             recorder.stop()
             recorders.removeValue(forKey: id)
             return ["stopped": true]
+        case "capture":
+            return try captureElement(args: Arguments(values: args), deadlineMS: deadlineMS)
+        case "window_action":
+            return try windowAction(args: Arguments(values: args), deadlineMS: deadlineMS)
+        case "paste":
+            return try paste(
+                args: Arguments(values: args), deadlineMS: deadlineMS,
+                requestID: requestID, progress: progress
+            )
+        case "clipboard_read":
+            return try clipboardRead(args: Arguments(values: args))
+        case "global_key":
+            return try globalKey(
+                args: Arguments(values: args), deadlineMS: deadlineMS,
+                requestID: requestID, progress: progress
+            )
         case "set_value":
             return try setValue(args: Arguments(values: args), deadlineMS: deadlineMS)
         case "type_text":
@@ -536,6 +597,10 @@ private final class AXService {
             ]
             if let bundleID = app.bundleIdentifier { result["bundle_id"] = bounded(bundleID) }
             if let name = app.localizedName { result["name"] = bounded(name) }
+            // The executable's file name, as desktop launch matches a program it started.
+            if let executable = app.executableURL?.lastPathComponent {
+                result["process_name"] = bounded(executable)
+            }
             return result
         }.sorted { left, right in
             (left["process_id"] as? Int ?? 0) < (right["process_id"] as? Int ?? 0)
@@ -681,12 +746,21 @@ private final class AXService {
         if isKeyboardTextTarget(role: role) && focusSettable && !protected && enabled != false {
             actions.append("type_text")
         }
+        if focusSettable && valueSettable && !protected && enabled != false {
+            actions.append("paste")
+        }
+        if role == "AXWindow" {
+            actions.append(contentsOf: windowActions(element))
+        }
         var provenance: [String: Any] = [
             "ax_role": role,
             "process_id": app["process_id"] ?? NSNull(),
             "coordinate_space": "screen_points",
             "value_redacted": protected,
         ]
+        if role == "AXWindow" {
+            provenance["window"] = windowState(element)
+        }
         if let identifier = stringAttribute(element, kAXIdentifierAttribute as CFString) {
             provenance["identifier"] = identifier
         }
@@ -1283,6 +1357,481 @@ private final class AXService {
             "keyboard_dispatch_started": progress.keyboardDispatchStarted,
             "focus_changed": progress.focusChanged,
             "phase": "submitted",
+        ]
+    }
+
+    // MARK: windows, capture, pasteboard and global keys
+
+    /// Poll (bounded by 3 seconds and the request deadline), letting the run
+    /// loop deliver pasteboard requests and window notifications meanwhile.
+    private func waitUntil(_ deadlineMS: Double?, _ condition: () -> Bool) -> Bool {
+        let limit = Date().addingTimeInterval(3)
+        while true {
+            if condition() { return true }
+            let now = Date()
+            if now >= limit { return false }
+            if let deadlineMS, now.timeIntervalSince1970 * 1_000 >= deadlineMS { return false }
+            RunLoop.current.run(until: now.addingTimeInterval(0.05))
+        }
+    }
+
+    private func elementAttribute(_ element: AXUIElement, _ name: CFString) -> AXUIElement? {
+        guard let raw = copyAttribute(element, name), CFGetTypeID(raw) == AXUIElementGetTypeID() else {
+            return nil
+        }
+        return unsafeBitCast(raw, to: AXUIElement.self)
+    }
+
+    private func elementList(_ element: AXUIElement, _ name: CFString) -> [AXUIElement] {
+        guard let raw = copyAttribute(element, name), CFGetTypeID(raw) == CFArrayGetTypeID() else {
+            return []
+        }
+        let values = unsafeBitCast(raw, to: CFArray.self)
+        var result: [AXUIElement] = []
+        for index in 0..<CFArrayGetCount(values) {
+            guard let pointer = CFArrayGetValueAtIndex(values, index) else { continue }
+            let value = Unmanaged<CFTypeRef>.fromOpaque(pointer).takeUnretainedValue()
+            if CFGetTypeID(value) == AXUIElementGetTypeID() {
+                result.append(unsafeBitCast(value, to: AXUIElement.self))
+            }
+        }
+        return result
+    }
+
+    private func closeButton(_ window: AXUIElement) -> AXUIElement? {
+        guard let button = elementAttribute(window, kAXCloseButtonAttribute as CFString),
+              copyActionNames(button).contains(kAXPressAction as String) else { return nil }
+        return button
+    }
+
+    private func isActiveWindow(_ window: AXUIElement) -> Bool {
+        var pid = pid_t(0)
+        guard AXUIElementGetPid(window, &pid) == .success,
+              NSWorkspace.shared.frontmostApplication?.processIdentifier == pid,
+              let main = elementAttribute(AXUIElementCreateApplication(pid), kAXMainWindowAttribute as CFString)
+        else { return false }
+        return CFEqual(main, window)
+    }
+
+    private func windowState(_ window: AXUIElement) -> [String: Any] {
+        [
+            "minimized": boolAttribute(window, kAXMinimizedAttribute as CFString) ?? false,
+            "full_screen": boolAttribute(window, "AXFullScreen" as CFString) ?? false,
+            "active": isActiveWindow(window),
+        ]
+    }
+
+    /// The window actions an AXWindow offers in its current state.
+    private func windowActions(_ window: AXUIElement) -> [String] {
+        let minimizedName = kAXMinimizedAttribute as CFString
+        let fullScreenName = "AXFullScreen" as CFString
+        let minimized = boolAttribute(window, minimizedName) == true
+        let fullScreen = boolAttribute(window, fullScreenName) == true
+        let canMinimize = isSettable(window, minimizedName)
+        let canFullScreen = isSettable(window, fullScreenName)
+        var actions: [String] = []
+        if canMinimize && !minimized { actions.append("minimize") }
+        if canFullScreen && !fullScreen && !minimized { actions.append("maximize") }
+        if (minimized && canMinimize) || (fullScreen && canFullScreen) { actions.append("restore") }
+        if closeButton(window) != nil { actions.append("close_window") }
+        if !minimized && !isActiveWindow(window) { actions.append("activate") }
+        return actions
+    }
+
+    private func setBool(_ element: AXUIElement, _ name: CFString, _ value: Bool) throws {
+        guard isSettable(element, name) else {
+            throw HelperFailure(
+                "DRIVER.ACTION_UNSUPPORTED", "window attribute is not settable",
+                data: ["attribute": name as String]
+            )
+        }
+        let error = AXUIElementSetAttributeValue(element, name, NSNumber(value: value))
+        try requireSuccess(error, operation: "AXUIElementSetAttributeValue(\(name as String))")
+    }
+
+    private func windowStillOpen(_ window: AXUIElement, pid: pid_t) -> Bool {
+        guard let app = NSRunningApplication(processIdentifier: pid), !app.isTerminated else {
+            return false
+        }
+        return elementList(AXUIElementCreateApplication(pid), kAXWindowsAttribute as CFString)
+            .contains { CFEqual($0, window) }
+    }
+
+    private func windowAction(args: Arguments, deadlineMS: Double?) throws -> [String: Any] {
+        try args.only(["native_token", "action"])
+        try requireTrusted()
+        let action = try args.string("action")!
+        let window = try tokens.resolve(try args.string("native_token")!)
+        try configureTimeout(window, deadlineMS: deadlineMS)
+        guard stringAttribute(window, kAXRoleAttribute as CFString) == "AXWindow" else {
+            throw HelperFailure("DRIVER.ACTION_UNSUPPORTED", "window actions need an AXWindow")
+        }
+        var pid = pid_t(0)
+        try requireSuccess(AXUIElementGetPid(window, &pid), operation: "AXUIElementGetPid")
+        let minimizedName = kAXMinimizedAttribute as CFString
+        let fullScreenName = "AXFullScreen" as CFString
+        try checkDeadline(deadlineMS)
+        let verified: Bool
+        switch action {
+        case "minimize":
+            try setBool(window, minimizedName, true)
+            verified = waitUntil(deadlineMS) { boolAttribute(window, minimizedName) == true }
+        case "maximize":
+            try setBool(window, fullScreenName, true)
+            verified = waitUntil(deadlineMS) { boolAttribute(window, fullScreenName) == true }
+        case "restore":
+            if boolAttribute(window, minimizedName) == true {
+                try setBool(window, minimizedName, false)
+                verified = waitUntil(deadlineMS) { boolAttribute(window, minimizedName) == false }
+            } else if boolAttribute(window, fullScreenName) == true {
+                try setBool(window, fullScreenName, false)
+                verified = waitUntil(deadlineMS) { boolAttribute(window, fullScreenName) == false }
+            } else {
+                throw HelperFailure(
+                    "DRIVER.ACTION_UNSUPPORTED", "the window is neither minimized nor full screen"
+                )
+            }
+        case "close_window":
+            guard let button = closeButton(window) else {
+                throw HelperFailure("DRIVER.ACTION_UNSUPPORTED", "the window has no close button")
+            }
+            let error = AXUIElementPerformAction(button, kAXPressAction as CFString)
+            try requireSuccess(error, operation: "AXUIElementPerformAction(AXCloseButton.AXPress)")
+            verified = waitUntil(deadlineMS) { !windowStillOpen(window, pid: pid) }
+            if verified {
+                return [
+                    "native_operation": "AXCloseButton.AXPress", "accepted": true,
+                    "verified": true, "observed_state": ["exists": false],
+                ]
+            }
+        case "activate":
+            guard let app = NSRunningApplication(processIdentifier: pid) else {
+                throw HelperFailure("DRIVER.STALE_SNAPSHOT", "the window's application is gone")
+            }
+            _ = app.activate(options: [])
+            _ = AXUIElementPerformAction(window, kAXRaiseAction as CFString)
+            verified = waitUntil(deadlineMS) { isActiveWindow(window) }
+        default:
+            throw HelperFailure("DRIVER.INVALID_REQUEST", "unknown window action", data: ["action": action])
+        }
+        return [
+            "native_operation": "AXWindow.\(action)", "accepted": true,
+            "verified": verified, "observed_state": windowState(window),
+        ]
+    }
+
+    /// The on-screen CGWindow of `pid` whose frame is the AX window's frame.
+    private func cgWindowID(pid: pid_t, frame: CGRect) -> CGWindowID? {
+        guard let raw = CGWindowListCopyWindowInfo(
+            [.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID
+        ) as? [[String: Any]] else { return nil }
+        let matches = raw.filter { info in
+            guard (info[kCGWindowOwnerPID as String] as? Int) == Int(pid),
+                  (info[kCGWindowLayer as String] as? Int) == 0,
+                  let bounds = info[kCGWindowBounds as String] as? NSDictionary,
+                  let rect = CGRect(dictionaryRepresentation: bounds as CFDictionary)
+            else { return false }
+            return abs(rect.minX - frame.minX) <= 1 && abs(rect.minY - frame.minY) <= 1
+                && abs(rect.width - frame.width) <= 1 && abs(rect.height - frame.height) <= 1
+        }
+        guard matches.count == 1, let number = matches[0][kCGWindowNumber as String] as? Int else {
+            return nil
+        }
+        return CGWindowID(number)
+    }
+
+    private func rect(_ bounds: [String: Int]) -> CGRect {
+        CGRect(
+            x: bounds["x", default: 0], y: bounds["y", default: 0],
+            width: bounds["width", default: 0], height: bounds["height", default: 0]
+        )
+    }
+
+    private func captureElement(args: Arguments, deadlineMS: Double?) throws -> [String: Any] {
+        try args.only(["native_token"])
+        try requireTrusted()
+        // Checked silently: the helper never raises the Screen Recording prompt.
+        guard CGPreflightScreenCaptureAccess() else {
+            throw HelperFailure(
+                "DRIVER.SCREEN_RECORDING_DENIED",
+                "Screen Recording permission has not been granted to MacOSAXHelper.app",
+                data: [
+                    "reason": "screen_recording_not_granted",
+                    "bundle_id": "dev.ai-auto-desktop.macos-ax-helper",
+                ]
+            )
+        }
+        let element = try tokens.resolve(try args.string("native_token")!)
+        try configureTimeout(element, deadlineMS: deadlineMS)
+        let role = stringAttribute(element, kAXRoleAttribute as CFString)
+        let subrole = stringAttribute(element, kAXSubroleAttribute as CFString)
+        guard role != "AXSecureTextField", subrole != "AXSecureTextField" else {
+            throw HelperFailure("DRIVER.PROTECTED_ELEMENT", "protected element is never captured")
+        }
+        guard let bounds = copyBounds(element), bounds["width", default: 0] > 0,
+              bounds["height", default: 0] > 0 else {
+            throw HelperFailure("DRIVER.ACTION_UNSUPPORTED", "capture requires positive-area bounds")
+        }
+        let owner: AXUIElement? = role == "AXWindow"
+            ? element : elementAttribute(element, kAXWindowAttribute as CFString)
+        guard let window = owner, let windowBounds = copyBounds(window) else {
+            throw HelperFailure("DRIVER.CAPTURE_FAILED", "the element's window could not be found")
+        }
+        if boolAttribute(window, kAXMinimizedAttribute as CFString) == true {
+            throw HelperFailure("DRIVER.WINDOW_MINIMIZED", "the window is minimized and shows nothing")
+        }
+        var pid = pid_t(0)
+        try requireSuccess(AXUIElementGetPid(element, &pid), operation: "AXUIElementGetPid")
+        let windowRect = rect(windowBounds)
+        guard let windowID = cgWindowID(pid: pid, frame: windowRect) else {
+            throw HelperFailure(
+                "DRIVER.CAPTURE_FAILED", "no single on-screen window of the application has this frame"
+            )
+        }
+        let wanted = rect(bounds)
+        var area = wanted.intersection(windowRect)
+        if area.width > maximumCapturePoints { area.size.width = maximumCapturePoints }
+        if area.height > maximumCapturePoints { area.size.height = maximumCapturePoints }
+        guard !area.isNull, area.width > 0, area.height > 0 else {
+            throw HelperFailure("DRIVER.ACTION_UNSUPPORTED", "the element lies outside its window")
+        }
+        try checkDeadline(deadlineMS)
+        guard let image = createWindowImage(area, window: windowID) else {
+            throw HelperFailure(
+                "DRIVER.CAPTURE_FAILED", "CGWindowListCreateImage returned no image",
+                data: ["window_id": Int(windowID)]
+            )
+        }
+        guard let png = NSBitmapImageRep(cgImage: image).representation(using: .png, properties: [:])
+        else {
+            throw HelperFailure("DRIVER.CAPTURE_FAILED", "the capture could not be encoded as PNG")
+        }
+        return [
+            "format": "png",
+            "data": png.base64EncodedString(),
+            "width": image.width,
+            "height": image.height,
+            "clipped": area != wanted,
+            "window_id": Int(windowID),
+        ]
+    }
+
+    private func savePasteboard(_ pasteboard: NSPasteboard) throws -> [[(NSPasteboard.PasteboardType, Data)]] {
+        var total = 0
+        var saved: [[(NSPasteboard.PasteboardType, Data)]] = []
+        for item in pasteboard.pasteboardItems ?? [] {
+            var entries: [(NSPasteboard.PasteboardType, Data)] = []
+            for type in item.types {
+                guard let data = item.data(forType: type) else { continue }
+                total += data.count
+                guard total <= maximumSavedPasteboardBytes else {
+                    throw HelperFailure(
+                        "DRIVER.CLIPBOARD_TOO_LARGE",
+                        "the pasteboard holds more than a paste can preserve; nothing was pasted"
+                    )
+                }
+                entries.append((type, data))
+            }
+            saved.append(entries)
+        }
+        return saved
+    }
+
+    /// Put the person's pasteboard back unless someone else wrote it since.
+    private func restorePasteboard(
+        _ pasteboard: NSPasteboard, _ saved: [[(NSPasteboard.PasteboardType, Data)]], offered: Int
+    ) -> String {
+        guard pasteboard.changeCount == offered else { return "kept_newer" }
+        pasteboard.clearContents()
+        if saved.isEmpty { return "cleared" }
+        let items = saved.map { entries -> NSPasteboardItem in
+            let item = NSPasteboardItem()
+            for (type, data) in entries { item.setData(data, forType: type) }
+            return item
+        }
+        return pasteboard.writeObjects(items) ? "restored" : "lost"
+    }
+
+    private func paste(
+        args: Arguments, deadlineMS: Double?, requestID: String,
+        progress: RequestProgress
+    ) throws -> [String: Any] {
+        try args.only(["native_token", "text"])
+        try requireTrusted()
+        let text = try args.string("text")!
+        guard !text.isEmpty, text.count <= maximumPasteCharacters else {
+            throw HelperFailure("DRIVER.INVALID_REQUEST", "helper args.text is 1..4096 characters")
+        }
+        let element = try tokens.resolve(try args.string("native_token")!)
+        try configureTimeout(element, deadlineMS: deadlineMS)
+        let role = stringAttribute(element, kAXRoleAttribute as CFString)
+        let subrole = stringAttribute(element, kAXSubroleAttribute as CFString)
+        if role == "AXSecureTextField" || subrole == "AXSecureTextField" {
+            throw HelperFailure("DRIVER.PROTECTED_ELEMENT", "paste target is protected")
+        }
+        guard boolAttribute(element, kAXEnabledAttribute as CFString) != false,
+              isSettable(element, kAXFocusedAttribute as CFString) else {
+            throw HelperFailure(
+                "DRIVER.ACTION_UNSUPPORTED", "paste target is disabled or cannot take focus",
+                data: progress.keyboardMetadata(phase: "target_preflight")
+            )
+        }
+        guard !secureEventInputIsEnabled(IsSecureEventInputEnabled()) else {
+            throw HelperFailure(
+                "DRIVER.PROTECTED_ELEMENT", "macOS Secure Event Input is enabled",
+                data: progress.keyboardMetadata(phase: "secure_event_input_preflight")
+            )
+        }
+        var targetPID = pid_t(0)
+        try requireSuccess(AXUIElementGetPid(element, &targetPID), operation: "AXUIElementGetPid")
+        try requireFrontmost(targetPID, operation: "paste")
+        try checkDeadline(deadlineMS)
+        let pasteboard = NSPasteboard.general
+        let saved = try savePasteboard(pasteboard)
+        let provider = PasteProvider(text: text)
+        let item = NSPasteboardItem()
+        // Clipboard managers that honour nspasteboard.org markers skip this text.
+        item.setData(Data(), forType: concealedType)
+        item.setData(Data(), forType: transientType)
+        guard item.setDataProvider(provider, forTypes: [.string]) else {
+            throw HelperFailure("DRIVER.ACTION_FAILED", "the pasteboard refused the text provider")
+        }
+        pasteboard.clearContents()
+        guard pasteboard.writeObjects([item]) else {
+            _ = restorePasteboard(pasteboard, saved, offered: pasteboard.changeCount)
+            throw HelperFailure("DRIVER.ACTION_FAILED", "the pasteboard refused the text")
+        }
+        let offered = pasteboard.changeCount
+        do {
+            progress.markFocusChanged()
+            emitKeyboardFocusProgress(id: requestID, focusChanged: true)
+            let focusError = AXUIElementSetAttributeValue(
+                element, kAXFocusedAttribute as CFString, kCFBooleanTrue
+            )
+            try requireSuccess(focusError, operation: "AXUIElementSetAttributeValue(AXFocused)")
+            guard boolAttribute(element, kAXFocusedAttribute as CFString) == true else {
+                throw HelperFailure(
+                    "DRIVER.ACTION_FAILED", "AX target did not become focused",
+                    data: progress.keyboardMetadata(phase: "focus_verification")
+                )
+            }
+            try requireFrontmost(targetPID, operation: "paste")
+            guard !secureEventInputIsEnabled(IsSecureEventInputEnabled()) else {
+                throw HelperFailure(
+                    "DRIVER.PROTECTED_ELEMENT",
+                    "macOS Secure Event Input became enabled before keyboard dispatch",
+                    data: progress.keyboardMetadata(phase: "secure_event_input_preflight")
+                )
+            }
+            try checkDeadline(deadlineMS)
+            let command = Self.modifierKeys["cmd"]!
+            let v = Self.keyCodes["v"]!
+            let events = try [
+                keyEvent(command.code, down: true, flags: command.flag),
+                keyEvent(v, down: true, flags: command.flag),
+                keyEvent(v, down: false, flags: command.flag),
+                keyEvent(command.code, down: false, flags: CGEventFlags()),
+            ]
+            progress.markKeyboardDispatchStarted()
+            emitKeyboardDispatchProgress(
+                id: requestID, keyboardDispatchStarted: true, focusChanged: progress.focusChanged
+            )
+            for event in events { event.postToPid(targetPID) }
+        } catch {
+            _ = restorePasteboard(pasteboard, saved, offered: offered)
+            throw error
+        }
+        let consumed = waitUntil(deadlineMS) { provider.provided }
+        // Let the target finish reading before the pasteboard changes again.
+        RunLoop.current.run(until: Date().addingTimeInterval(0.1))
+        let restored = restorePasteboard(pasteboard, saved, offered: offered)
+        return [
+            "native_operation": "NSPasteboard+CGEventCmdV",
+            "submitted": true,
+            "keyboard_dispatch_started": progress.keyboardDispatchStarted,
+            "focus_changed": progress.focusChanged,
+            "phase": "submitted",
+            "consumed": consumed,
+            "restored": restored,
+        ]
+    }
+
+    private func clipboardRead(args: Arguments) throws -> [String: Any] {
+        try args.only(["max_characters"])
+        let maximum = try args.integer("max_characters", minimum: 1, maximum: maximumClipboardCharacters)
+        let pasteboard = NSPasteboard.general
+        if (pasteboard.types ?? []).contains(concealedType) {
+            throw HelperFailure(
+                "DRIVER.CLIPBOARD_PROTECTED",
+                "the pasteboard holds content marked concealed (a password manager)"
+            )
+        }
+        guard let text = pasteboard.string(forType: .string) else {
+            return ["has_text": false, "text": NSNull(), "characters": 0, "truncated": false]
+        }
+        let count = text.count
+        return [
+            "has_text": true, "text": String(text.prefix(maximum)),
+            "characters": count, "truncated": count > maximum,
+        ]
+    }
+
+    private func globalKey(
+        args: Arguments, deadlineMS: Double?, requestID: String,
+        progress: RequestProgress
+    ) throws -> [String: Any] {
+        try args.only(["keys"])
+        try requireTrusted()
+        guard let raw = args.values["keys"] as? [String], (1...6).contains(raw.count) else {
+            throw HelperFailure("DRIVER.INVALID_REQUEST", "helper args.keys must hold 1..6 names")
+        }
+        let names = raw.map { $0.lowercased() }
+        var modifiers: [(code: CGKeyCode, flag: CGEventFlags)] = []
+        for name in names.dropLast() {
+            guard let modifier = Self.modifierKeys[name] else {
+                throw HelperFailure(
+                    "DRIVER.INVALID_REQUEST", "only modifiers may precede the main key",
+                    data: ["key": name]
+                )
+            }
+            modifiers.append(modifier)
+        }
+        guard let main = Self.keyCodes[names[names.count - 1]] else {
+            throw HelperFailure(
+                "DRIVER.ACTION_UNSUPPORTED", "the main key has no macOS key code here",
+                data: ["key": names[names.count - 1]]
+            )
+        }
+        guard !secureEventInputIsEnabled(IsSecureEventInputEnabled()) else {
+            throw HelperFailure(
+                "DRIVER.PROTECTED_ELEMENT", "macOS Secure Event Input is enabled",
+                data: progress.keyboardMetadata(phase: "secure_event_input_preflight")
+            )
+        }
+        var flags = CGEventFlags()
+        var events: [CGEvent] = []
+        for modifier in modifiers {
+            flags.insert(modifier.flag)
+            events.append(try keyEvent(modifier.code, down: true, flags: flags))
+        }
+        events.append(try keyEvent(main, down: true, flags: flags))
+        events.append(try keyEvent(main, down: false, flags: flags))
+        for modifier in modifiers.reversed() {
+            flags.remove(modifier.flag)
+            events.append(try keyEvent(modifier.code, down: false, flags: flags))
+        }
+        try checkDeadline(deadlineMS)
+        let frontmost = NSWorkspace.shared.frontmostApplication?.processIdentifier ?? 0
+        progress.markKeyboardDispatchStarted()
+        emitKeyboardDispatchProgress(id: requestID, keyboardDispatchStarted: true, focusChanged: false)
+        for event in events { event.post(tap: .cghidEventTap) }
+        return [
+            "native_operation": "CGEventGlobalKeyChord",
+            "submitted": true,
+            "keyboard_dispatch_started": progress.keyboardDispatchStarted,
+            "focus_changed": progress.focusChanged,
+            "phase": "submitted",
+            "frontmost_process_id": Int(frontmost),
         ]
     }
 
