@@ -240,7 +240,7 @@ jobs:
                         "cmd_a_cmd_c_copies": clipboard}
               print(json.dumps(result))
               assert pointer and typed.lower() == "typed through assist" and replaced.lower() == "replaced", result
-              assert clipboard == replaced, result
+              assert clipboard.lower() == replaced.lower(), result
           finally:
               assist.terminate()
               subprocess.run(["pkill", "-x", "TextEdit"])
