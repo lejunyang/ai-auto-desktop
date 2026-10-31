@@ -391,7 +391,7 @@ Agent 遇到自己做不了的事（扫码之外的登录、验证码、需要�
 
 ```powershell
 aad assist --browser-port 9222            # 分享一个浏览器页面（CDP screencast）
-aad assist --desktop                      # 分享整个桌面（目前只有 Windows）
+aad assist --desktop                      # 分享整个桌面（Windows；Linux 的 X11）
 aad assist --desktop --view-only          # 只给看，不接收鼠标键盘
 aad assist --list-screens                 # 列出可分享的显示器和窗口
 aad assist --desktop --monitor 1          # 只分享第 1 块显示器
@@ -554,7 +554,23 @@ Shift 被松开、控制者离开后控制权交回、画面静止时后来者�
 `release` 松开按住的 Ctrl、查看端按着 Shift 和鼠标键断开后两者都被松开；在自带查看页里用输入法组出“中文”只送达一次、
 在画面里按下拖到画面外松开仍然送达；加 `--desktop` 时比对桌面剪贴板的回答和本机独立读到的内容（不改剪贴板），
 并在隔离的探针窗口里检查 Home、Shift+End、Delete、方向键的编辑效果、扫描码和扩展键标志，以及断开后 Shift 被松开。
-Linux 和 macOS 的整桌面分享还没有做。
+`tests/linux/verify_assist_desktop.py` 在自起的 Xvfb 里检查 Linux（CI 的 Linux 任务每次都跑）。macOS 的整桌面分享还没有做。
+
+### Linux（X11）
+
+不经过 helper 进程，进程内直接说 X11 协议（x11rb，纯 Rust）：DAMAGE 扩展报出每次截屏以来重画的区域，只用 GetImage
+读回这些区域，写进和 Windows 一样两份轮换的缓冲区，画面不变时一次往返都不多；没有 DAMAGE 的 X server 退回整屏读取加
+逐块比较（`source.capture` 为 `x11` 而不是 `x11-damage`）。输入走 XTest：按键按物理键对应的 keysym 在服务器键盘映射里
+找键码，映射里没有的字符（如中文）临时映射到一个空闲键码再按，用完恢复，和 xdotool 的做法相同。XFixes 给出指针位置和
+图像（预乘 ARGB 转成 PNG），RandR 给出显示器，`_NET_CLIENT_LIST` 给出窗口，`--monitor`、`--window`、`--list-screens`
+和 Windows 一样可用；剪贴板向 CLIPBOARD 的所有者要 UTF8_STRING。只支持 24/32 位色深的屏幕；Wayland 会话里的
+原生窗口看不到（XWayland 的可以）。
+
+`tests/linux/verify_assist_desktop.py`（需要 Xvfb、openbox、xev、xdotool、xsetroot、xclip，自起一个 X server，
+不碰用户桌面）检查：画面像素就是 xsetroot 设置的颜色、画面静止 3 秒 0 帧、移动一个窗口只发出屏幕 22.8% 的补丁、
+补丁拼出的画面和关键帧逐块一致、指针精确落在查看端指的位置（xdotool 读回）、点击、Ctrl、滚轮和输入的“aZ;中”
+（“中”走临时键码）都作为 X 事件到达 xev 窗口、查看端按着 Shift 断开后 Shift 被松开、光标消息带可解码的形状、
+剪贴板取回 xclip 放进去的文字、`--list-screens` 列出显示器和窗口、`--window` 的画面正好是该窗口大小。
 
 ## 桌面窗口（GUI）
 
