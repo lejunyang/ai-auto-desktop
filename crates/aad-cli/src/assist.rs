@@ -2,7 +2,7 @@
 //!
 //! For the moments an agent needs a human: a login it cannot do, a captcha, a
 //! judgement call. The screen of one browser page (CDP screencast) or of the
-//! desktop (Windows; Linux on X11, see [`x11`]) is streamed over a WebSocket
+//! desktop (Windows; Linux on X11; macOS) is streamed over a WebSocket
 //! on a loopback port, and the
 //! viewer's input comes back the same way. Several viewers may watch at once,
 //! each in the codec it chose; one of them at a time controls the screen
@@ -72,6 +72,8 @@ use std::time::{Duration, Instant};
 mod buffer;
 mod damage;
 mod keys;
+#[cfg(target_os = "macos")]
+mod macos;
 mod scale;
 #[cfg(windows)]
 mod screen;
@@ -89,7 +91,8 @@ pub struct AssistArgs {
     /// first page when left out.
     #[arg(long, requires = "browser_port")]
     page: Option<String>,
-    /// Stream the whole desktop instead (Windows, and Linux on X11).
+    /// Stream the whole desktop instead (Windows, Linux on X11, and the main
+    /// display on macOS).
     #[arg(long)]
     desktop: bool,
     /// Share one display, by its number from --list-screens.
@@ -479,7 +482,7 @@ trait Source {
 }
 
 /// Most clipboard text handed to a viewer at once.
-#[cfg(any(windows, target_os = "linux"))]
+#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
 const CLIPBOARD_CHARACTERS: usize = 100_000;
 
 /// Everything about the stream decided at startup.
@@ -2288,7 +2291,105 @@ mod desktop {
     }
 }
 
-#[cfg(not(any(windows, target_os = "linux")))]
+#[cfg(target_os = "macos")]
+mod desktop {
+    pub use super::macos::Area;
+    use super::macos::Mac;
+    use super::{
+        fraction, keys, unknown, Pace, Picture, Result, Source, Want, CLIPBOARD_CHARACTERS,
+    };
+    use serde_json::{json, Value};
+
+    pub fn screens() -> Result<Value> {
+        Ok(super::macos::screens())
+    }
+
+    pub fn open(fps: u32, area: &Area) -> Result<Box<dyn Source>> {
+        Ok(Box::new(Desktop {
+            pace: Pace::new(fps),
+            mac: Mac::open(area)?,
+            refresh: false,
+        }))
+    }
+
+    pub struct Desktop {
+        pace: Pace,
+        mac: Mac,
+        refresh: bool,
+    }
+
+    impl Source for Desktop {
+        fn name(&self) -> Value {
+            json!({"kind": "desktop", "capture": "coregraphics", "permissions": self.mac.permissions()})
+        }
+
+        fn rate(&mut self, fps: u32) {
+            self.pace.rate(fps);
+        }
+
+        /// Every capture is whole and compared, so a repeat is just the next one.
+        fn refresh(&mut self) {
+            self.refresh = true;
+        }
+
+        fn capture(&mut self, _want: Want) -> Result<Option<Picture>> {
+            if !self.pace.due() && !std::mem::take(&mut self.refresh) {
+                return Ok(None);
+            }
+            Ok(Some(Picture::Raw(self.mac.capture()?)))
+        }
+
+        fn cursor(&mut self, fresh: bool) -> Option<Value> {
+            self.mac.cursor(fresh)
+        }
+
+        fn input(&mut self, event: &Value) -> Result<()> {
+            match event["type"].as_str() {
+                Some("mouse") => {
+                    let (x, y) = (fraction(event, "x")?, fraction(event, "y")?);
+                    let button = match event["button"].as_str() {
+                        Some("right") => 1,
+                        Some("middle") => 2,
+                        _ => 0,
+                    };
+                    match event["action"].as_str() {
+                        Some("wheel") => self.mac.wheel(
+                            event["dx"].as_f64().unwrap_or(0.0),
+                            event["dy"].as_f64().unwrap_or(0.0),
+                        ),
+                        Some(action) => {
+                            let count = event["count"].as_i64().unwrap_or(1);
+                            self.mac.mouse(action, button, x, y, count)
+                        }
+                        None => self.mac.mouse("move", button, x, y, 1),
+                    }
+                }
+                Some("key") => {
+                    let key = keys::of(event).ok_or_else(|| unknown(event))?;
+                    self.mac.key(key, event["action"] != "up")
+                }
+                Some("text") => {
+                    let text = event["text"].as_str().unwrap_or_default();
+                    if text.len() > 4096 {
+                        return Err("text is limited to 4096 bytes".into());
+                    }
+                    self.mac.text(text)
+                }
+                _ => Err("unknown event type".into()),
+            }
+        }
+
+        fn release(&mut self) {
+            self.mac.release();
+        }
+
+        fn clipboard(&mut self) -> Result<Value> {
+            self.mac.clipboard(CLIPBOARD_CHARACTERS)
+        }
+    }
+}
+
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
 mod desktop {
     use super::{Result, Source};
     use serde_json::Value;
