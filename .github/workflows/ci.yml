@@ -106,6 +106,19 @@ jobs:
           test -n "$AAD_TEST_CHROME"
           cargo test --locked -p aad-control --test browser_e2e -- --ignored
 
+      # aad assist on an X11 desktop of its own (the script starts Xvfb):
+      # what is streamed and what a viewer's input does, checked by effect.
+      - name: Test assist on an X11 desktop
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get install -y --no-install-recommends xdotool x11-xserver-utils
+          python3 -m venv /tmp/assist-venv
+          /tmp/assist-venv/bin/pip install --quiet pillow
+          cargo build --locked -p aad-cli
+          /tmp/assist-venv/bin/python tests/linux/verify_assist_desktop.py
+
       # The UIA research probes call Win32 APIs directly. They are excluded
       # from automatic example discovery on other hosts, but still need to be
       # compile-checked where those APIs exist.
