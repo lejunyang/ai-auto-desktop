@@ -1,31 +1,214 @@
 # 统一控制与远程会话
 
 `aad-control/1` 为 computer-use 与 browser-use 提供同一组操作：
-`capabilities → targets → observe → find → act`，另有 `cancel` 和 `close`。
+`capabilities → targets → observe → find → act`，另有 `wait`、`cancel` 和 `close`。
 它不依赖模型厂商的控制 API。平台适配器继续执行自己的实时元素校验；不支持的动作明确拒绝。
 
 ## 支持的动作与入口
 
 | provider | 类型化动作 | 实际语义 / 限制 |
 | --- | --- | --- |
-| `desktop.windows_uia` | focus, invoke, click, fill, type_text, key, scroll, hover, drag | UIA + 原生输入；click 带 button/count/fraction 时走原生手势；节点必须暴露对应能力 |
-| `desktop.linux_atspi` | focus, invoke, click, fill, type_text, key, scroll, hover, drag | AT-SPI；指针/键盘经 X11 XTest helper，只支持 KDE/X11 会话；派发前核对焦点、PID 与落点，drag 起止两点都核对 |
-| `desktop.macos_ax` | focus, invoke, click, fill, type_text, key, scroll, hover, drag | AX helper；需要同一登录用户的辅助功能权限；指针动作要求目标应用在前台并经 AX 命中检查，事件只投递给目标进程；key 名称按字面（`ctrl` 是 Control，`cmd` 是 Command） |
-| `browser.cdp` | focus, click, fill, key, scroll, hover, select, check, navigate, back, forward, reload | 普通 click 为 `HTMLElement.click()` 的 DOM 激活；带 button/count/fraction 的 click、scroll、hover 为主 frame 的可信 CDP Input，落点先在页面里命中检查；fill/select 为 DOM 值及 input/change 事件；check 已是目标状态时不点击；key 为主 frame 的 CDP Input；navigate/back/forward/reload 在 body 节点上，只限主 frame；没有 drag |
+| `desktop.windows_uia` | focus, invoke, click, fill, type_text, key, scroll, hover, drag, paste, minimize, maximize, restore, close_window, activate | UIA + 原生输入；click 带 button/count/fraction 时走原生手势；节点必须暴露对应能力。指针动作先对落点做 UIA 命中检查，键盘动作先证明窗口在前台、焦点在元素内（见下文）。另有只读的 capture / read_text，以及需单独授权的 launch、clipboard_read、global_key |
+| `desktop.linux_atspi` | focus, invoke, click, fill, type_text, key, scroll, hover, drag, paste, minimize, maximize, restore, close_window, activate | AT-SPI；指针/键盘经 X11 XTest helper，只支持 KDE/X11 会话；派发前核对焦点、PID 与落点，drag 起止两点都核对；窗口动作只在顶层窗口节点上、需要 EWMH 窗口管理器。另有只读 capture / read_text（Tesseract），以及需单独授权的 launch、clipboard_read、global_key（见下文“其他平台”） |
+| `desktop.macos_ax` | focus, invoke, click, fill, type_text, key, scroll, hover, drag, paste, minimize, maximize, restore, close_window, activate | AX helper；需要同一登录用户的辅助功能权限；指针动作要求目标应用在前台并经 AX 命中检查，事件只投递给目标进程；key 名称按字面（`ctrl` 是 Control，`cmd` 是 Command）；窗口动作只在 AXWindow 节点上，maximize 即全屏。另有 capture（需屏幕录制权限）、read_text、launch、clipboard_read、global_key。[待验证] 全部新增项需 macOS 真机 |
+| `browser.cdp` | focus, click, fill, type_text, key, scroll, hover, drag, select, check, navigate, back, forward, reload, open_tab, activate_page, close_page, accept, dismiss, upload, emulate, clear_site_data | 普通 click 为 `HTMLElement.click()` 的 DOM 激活；带 button/count/fraction 的 click、scroll、hover、drag 为可信 CDP Input（任何 frame，含跨进程 OOPIF），落点先在页面里命中检查；fill/select 为 DOM 值及 input/change 事件；check 已是目标状态时不点击；type_text/key 为发给焦点元素的可信 CDP 键盘输入；navigate/back/forward/reload、标签页动作 open_tab/activate_page/close_page 以及 emulate/clear_site_data 在 body 节点上，只限主 frame；accept/dismiss 只在 JavaScript 对话框节点上；upload 只在文件框上，路径受 `--allow-upload-dir` 限制 |
 
 以 `capabilities` 和观察节点的 `capabilities` 为准。可列出 provider 不表示当前 OS 已授予
-桌面权限。启动失败或不可用原因在 `unavailable` 中返回。浏览器 key 只支持列出的导航/编辑键
-和有限编辑组合，普通文本使用 fill。子 frame 不宣传 key、scroll、hover 和页面动作；OOPIF 等不支持路径明确报错。
+桌面权限。启动失败或不可用原因在 `unavailable` 中返回。
+
+浏览器键盘：先聚焦被观察元素并确认焦点（含开放 shadow root 内的深层焦点）和文档焦点都在它上面，再发键。
+`type_text` 只在可编辑节点上提供，逐字符发送，每个字符前重新确认焦点，焦点移走即以 `CONTROL.FOCUS_LOST`
+（`details.typed` 为已发字符数）停止：`mode: unicode`（默认）每字符一次 `Input.insertText`（有 input 事件，
+无按键事件）；`mode: keys` 发 keydown/keypress/keyup（带 key/code，`isTrusted=true`），只接受 US 布局可打出的字符，
+其他字符在发送前整体拒绝（`CONTROL.INVALID_REQUEST`，`details.character`）。`key` 接受针对焦点元素的编辑/导航键：
+Enter、Tab、Escape、方向键、Home/End、PageUp/PageDown、Backspace/Delete、单个字符、F2、ctrl+a/c/v/x/z/y/b/i、
+ctrl+shift+z、shift 或 ctrl+shift 加方向/Home/End；浏览器自己会处理的快捷键（ctrl+t/w/n/l/u、ctrl+tab、
+ctrl+PageUp/PageDown、其余 ctrl+shift 组合、所有 alt/meta 组合、F2 以外的功能键）以 `CONTROL.ACTION_UNSUPPORTED`
+拒绝——CDP 会把页面未消费的按键交回浏览器。
+
+浏览器 drag：只在可拖起的元素上提供（`draggable`、列表/网格项、grab/move 光标），终点可以是同一观察里的任何节点。
+两端都滚进视口后在当前位置各自命中检查（不再滚动），被遮挡或无法同时可见则 `CONTROL.OCCLUDED` 且什么都不按下；
+随后按下、12 步滑动、松开。HTML5 拖放经 `Input.setInterceptDrags` 截获，再用 `Input.dispatchDragEvent`
+（dragEnter/dragOver/drop，带拖拽数据）在终点完成。实测 headless Chrome 只用鼠标事件也能完成 HTML5 drop，
+但有界面的 Windows 浏览器会进入系统拖放循环，所以总是截获 `[待验证: 有界面 Chrome/Edge on Windows]`。
+
+Shadow DOM：观察深度优先进入每个开放 shadow root（先宿主的 shadow 树，再其 light 子节点——只有被 slot 的才会渲染），
+内部控件与普通节点一样有指纹、复核和动作；命中检查经 `shadowRoot.elementFromPoint` 穿过宿主，包含关系沿 host 向上。
+closed shadow root 无法从脚本进入，其内容不出现在观察里（限制）。`innerText` 不含 shadow 内文字，所以 text 视图也看不到它们。
+
+Frame：页面连接用 `Target.setAutoAttach`（flatten）跟随跨站 OOPIF，`control_targets` 把每个 frame 列成资源，
+metadata 带 `parent_frame_id`、`out_of_process`；跨站 iframe 一开始是进程内的 about:blank，换进程后资源 id 不变。
+每个 frame 在其自己的 CDP session 里建隔离 world 观察，DOM 动作就在那里执行。可信指针一律发到页面自己的
+session、用主 frame 坐标：先把各层 frame 宿主元素滚进视口，用其 content box 得出偏移，再在每一层用
+`DOM.getNodeForLocation`（文档坐标，需要加上该层滚动量）确认命中的是目标 frame 或下一层宿主，页面盖在 frame 上的元素
+因此以 `CONTROL.OCCLUDED` 拒绝；在 frame 内还会反复移动指针，直到 frame 自己报告目标 `:hover` 才按键。
+实测：OOPIF 刚滚进视口后立刻派发的输入落在主 frame 上，要等合成器跟上（约 300 ms），所以用 `:hover` 确认；
+直接发到 OOPIF 自己 session（frame 坐标）的鼠标事件也能送达，但绕过页面的命中检查，因此不用。键盘发到页面 session，
+由浏览器送到焦点 frame。截图 `control_capture` 仍只限主 frame。
 DOM click/fill 的事件 `isTrusted=false`，并不等价于原生指针或真实逐键输入；需要 `isTrusted=true` 的页面，
 给 click 一个 `fraction`（例如 0.5/0.5）走可信指针。可信指针先把元素滚进视口，再用 `elementFromPoint`
 确认落点命中该元素，盖着别的元素时返回 `CONTROL.OCCLUDED` 且不发送任何输入。`navigate` 只接受 http/https，
-不能打开 `file:`、`javascript:` 等地址；新开标签页尚未支持。
+不能打开 `file:`、`javascript:` 等地址。
+
+标签页与弹窗：`open_tab`（要 `url`，同样只接受 http/https）在浏览器里新开一个标签页，答复里带新页面的 `page_id`；
+`activate_page` 把被观察的页面切到前台，`close_page` 关闭它。三者都先在观察到的文档里确认 body 节点仍有效，
+再经浏览器级连接（`/json/version` 给出的 `/devtools/browser/<id>`，固定连 127.0.0.1）发送 `Target.createTarget`、
+`Target.activateTarget`、`Target.closeTarget`。页面自己打开的标签页或弹窗（`window.open`、`target=_blank`、
+OAuth 登录弹窗）在 `targets` 里与其他页面一样列出，`metadata.opener_page_id` 取自 `Target.getTargets` 的
+`openerId`，指向打开它的页面；不是被打开的页面该字段为 null。动作可能新开或关掉页面后要重新 `targets`。
+弹窗通常需要用户手势，DOM 激活（`isTrusted=false`）的 click 会被弹窗拦截，用带 `fraction` 的可信 click。
+实测（Windows，本机 Chrome headless，`browser_e2e` 的 `tabs_open_front_and_close_and_popups_name_their_opener`）：
+open_tab 后新页 `visibilityState` 为 visible、原页 hidden，activate_page 后原页回到 visible，close_page 后
+`targets` 不再列出该页，可信 click 触发的 `window.open` 弹窗带正确的 `opener_page_id`。
+
+JavaScript 对话框（alert/confirm/prompt/beforeunload）：会话连接每个页面时先开 `Page` 域，只缓冲
+`Page.javascriptDialogOpening/Closed` 两种事件。对话框打开后页面渲染进程被阻塞：`targets` 仍列出该页
+（`metadata.dialog` 给出类型与文字，能力只有 accept/dismiss），`observe` 只返回一个 `role: alertdialog` 的节点，
+`name` 是对话框文字，prompt 的 `value` 是默认答案，`dialog` 字段含 `type`/`message`/`default_prompt`/`url`；
+在它上面 `accept`（prompt 可带 `text`，其他类型带 `text` 返回 `CONTROL.INVALID_REQUEST`）或 `dismiss`，
+经 `Page.handleJavaScriptDialog` 处理；对话框已换成另一个或已关闭时返回 `CONTROL.STALE_TARGET`。
+同一页面上的其他 act 与 capture 立即返回 `CONTROL.DIALOG_OPEN`（`not_committed`，`details.dialog` 带类型与文字），
+不会等到超时。动作本身弹出对话框时（例如 click 的处理函数里调用 `prompt`），等待中的 CDP 命令被对话框事件
+中断，动作按已派发返回，`backend_result.dialog_opened: true`；可信指针的 mouseReleased、按键的 keyUp 在这种情况下不再发送。
+限制：会话连上页面之前就已打开的对话框无法经 CDP 处理——浏览器只允许看到它打开的那个连接应答，
+被阻塞的页面也不响应新连接的 `Page.enable`。这种页面 2 秒内判定为无响应，`targets` 里标 `metadata.responsive: false`、
+不提供能力，`observe` 返回 `BROWSER.PAGE_UNRESPONSIVE`，而不是让整个列表挂到超时；需要人手关闭对话框。
+会话在 `targets` 时连接全部页面，所以之后打开的对话框都能处理；一个新弹窗如果在下一次 `targets` 之前就弹出对话框，属于上述限制。
+实测（Windows，本机 Chrome headless，`dialogs_block_the_page_until_accepted_or_dismissed`）：prompt 带 text 接受后
+页面读到答案，confirm dismiss 得 false，计时器弹出的 alert 使 fill 在 3 秒内被拒且未写入，会话前已打开的 alert 被标为无响应。
+[待验证] Edge 与有界面（非 headless）浏览器的对话框行为；beforeunload 对话框只按同一事件路径处理，没有专门的 fixture。
+
+文件上传：`<input type=file>` 只提供 `upload`（要 `files`，1..32 个绝对路径），不提供 fill/click，不会弹出文件选择框；
+被页面用 `display:none` 藏在样式按钮后面的文件框也会出现在观察里（`states.hidden: true`），节点的 `files` 列出已选文件名。
+路径由会话在服务端授权下解析：服务启动时用 `--allow-upload-dir <DIR>`（可重复，`aad mcp` 与 `aad control serve` 都有，
+`--connect` 远程时只能在远端配置）给出允许的目录，没给时一律 `POLICY.DENIED`；每个文件必须存在且是普通文件，
+按解析后的真实路径（符号链接、`..` 都先展开）判断是否落在允许目录下，否则 `POLICY.DENIED`，相对路径 `CONTROL.INVALID_REQUEST`，
+不存在 `CONTROL.FILE_NOT_FOUND`；单选框给多个文件 `CONTROL.INVALID_REQUEST`。`capabilities` 的 `upload_dirs` 列出允许目录。
+浏览器侧先在隔离 world 里核对节点，再取该元素的对象引用调用 `DOM.setFileInputFiles`，页面收到 input/change 事件。
+实测（Windows，本机 Chrome headless，`uploads_reach_file_inputs_only_from_allowed_directories`）：允许目录内的文件上传后
+页面读到文件名和大小，隐藏的多选文件框收到两个文件；目录外、相对路径、不存在、单选多文件和未授权会话均被拒且页面无变化。
+
+下载：浏览器级连接建立时（第一次 `targets` 或标签页动作）用 `Browser.setDownloadBehavior`（`allow`，`eventsEnabled`）
+把下载放进本会话专用的临时目录 `aad-downloads-<uuid>`，并只缓冲 `Browser.downloadWillBegin/downloadProgress` 事件。
+MCP `browser_storage`（只读）列出某个页面或 frame 资源的 cookie（name、domain、path、expires、session、http_only、secure、same_site、size）和其 origin 的 localStorage 键及值长度；cookie 值只在服务端以 `--allow-cookie-values` 启动时给出（`control_capabilities` 的 `cookie_values`），storage 值从不给出。
+MCP `browser_network`（只读）列出页面自本会话连接以来最近的请求（每页最多 500 条，`dropped` 计遗忘数）：method、url（去掉凭据、fragment 和敏感查询值）、类型、状态（pending/finished/failed/redirected）、HTTP 状态、MIME、耗时与大小；`include_bodies` 时完成的文本响应带最多 4096 字符正文，JSON 敏感字段打码。只看页面 session 的 Network，OOPIF 内部发出的请求不在其中（限制）。
+
+MCP `browser_downloads`（只读，`--allow-input` 不需要）列出 `directory`、`tracking`（是否正在把下载放进该目录，否则原因在 `reason`）
+和每个下载的 `guid`、`url`、`suggested_filename`、`state`（in_progress/completed/canceled）、`received_bytes`、`total_bytes`、
+`path`（浏览器报告的 `filePath`，没有时取目录下的建议文件名）；最多记住最近 200 个。文件在会话结束后保留。
+只对本服务启动的浏览器（`browser_open`）这样做：经 `--browser-port` 等方式连上的用户自己的浏览器不调用
+`setDownloadBehavior`，下载设置保持原样，`browser_downloads` 回答 `tracking: false`、
+`reason: "attached browser: downloads are not redirected"`。`browser_close`、再次 `browser_open` 和会话关闭时，
+先尽力把启动的浏览器恢复为 `behavior: "default"`，之后 `tracking: false` 并说明已交还。
+实测 Chromium 在任何浏览器级 DevTools 客户端断开时都会清掉这个设置（连已断开的那个客户端从没设置过也一样），
+所以对启动的浏览器，会话在每次用浏览器级连接和每次 act 之前重新设置一次。
+实测（Windows，本机 Chrome headless，`downloads_land_in_the_session_directory_and_are_listed`）：点击带
+`Content-Disposition: attachment` 的链接后列表出现 completed 的 `report.txt`，路径在会话目录下，内容与服务端一致。
+[待验证] 有界面浏览器与 Edge 的下载行为；恢复为 default 后浏览器的实际下载位置未单独验证（测试只核对会话不再路由）。
 
 动作参数：`click` 可带 `button`（left/right/middle）、`count`（1/2）、`fraction`；`type_text` 可带
 `mode`（unicode/keys）；`scroll` 要 `direction`，可带 `notches`（1..30）、`fraction`；`hover` 可带
 `ms`（1..5000，默认 500）、`fraction`；`drag` 要 `to`（同一次观察里另一个节点的 target），可带
 `button`、`fraction`、`to_fraction`；`select` 要 `option`（选项文字或值，观察节点的 `options` 列出文字）；
-`check` 要 `checked`；`navigate` 要 `url`。`fraction` 是元素框内 0..1 的比例，不是屏幕坐标。
+`check` 要 `checked`；`navigate` 与 `open_tab` 要 `url`；`emulate` 要 `preset`（desktop/tablet/mobile/reset）或 `color_scheme`（light/dark/no_preference）或两者，只有预设名、没有尺寸或位置字段，效果持续到本会话与该页的连接断开；`clear_site_data` 用 `Storage.clearDataForOrigin` 清掉页面 origin 的 cookie、localStorage、IndexedDB、缓存与 service worker（不含 sessionStorage）；`accept` 可带 `text`（≤4096）；`paste` 要 `text`（1..4096）。`fraction` 是元素框内 0..1 的比例，不是屏幕坐标。
+`capabilities` 每个 provider 另列 `reads`（`capture`、`read_text`），并只在授权时列出 `launch`（允许启动的程序）、
+`clipboard_read: true`、`global_keys: true`。
+
+## 桌面截图、OCR、窗口、启动、剪贴板与全局快捷键（Windows）
+
+| 能力 | 入口 | 授权 | 语义 |
+| --- | --- | --- | --- |
+| 截图 | `capture` / MCP `control_capture` | 只读 | 观察过的节点重新校验后按实时边界裁剪；窗口自身的根节点截整个窗口（去掉不可见的缩放边框）。回答与浏览器相同：`format`/`data`/`width`/`height`/`clipped` + 会话加的 `digest` |
+| OCR | `read_text` / MCP `control_read_text` | 只读 | 对 capture 的同一批像素跑 Windows.Media.Ocr，回答 `text`、`lines`（含 `words`），位置是元素框内比例 `box: {fx, fy, fw, fh}`，并带同一 `digest`；可选 `language`（BCP-47） |
+| 窗口动作 | `act` 的 minimize / maximize / restore / close_window / activate | `--allow-input` | 只在窗口根节点上提供，按窗口当前状态与能力标注；先 UIA WindowPattern，没有时对锚定的 HWND 用 ShowWindow / WM_CLOSE；等待（有上限）状态真的达到，否则 effect unknown |
+| 粘贴 | `act` 的 `paste` | `--allow-input` | 可聚焦、可写、非密码元素；见下文 |
+| 启动程序 | `launch` / MCP `desktop_launch` | `--allow-input` + `--allow-launch <程序>`（可重复） | 只能启动白名单里逐字列出的程序，参数作为 argv 传入；等待（有上限）新窗口并作为 resource 返回 |
+| 读剪贴板 | `clipboard_read` / MCP `clipboard_read` | `--allow-clipboard-read`（与输入授权分开，默认关） | 只读文本，`max_characters` 1..65536（默认 16384），回报完整长度；来源标了 `ExcludeClipboardContentFromMonitorProcessing`（密码管理器）时拒绝 `DRIVER.CLIPBOARD_PROTECTED` |
+| 全局快捷键 | `global_key` / MCP `control_global_key` | `--allow-input` + `--allow-global-keys`（默认关） | 唯一不锚定元素的输入；见下文 |
+
+```powershell
+aad mcp --allow-input --allow-launch notepad.exe --allow-launch "C:\Tools\app.exe"
+aad mcp --allow-clipboard-read                 # 只读剪贴板，不授予输入
+aad mcp --allow-input --allow-global-keys      # 允许 Win+D、Alt+Tab 一类
+```
+
+未授权时本机 MCP 不在 `tools/list` 列出 `desktop_launch`、`clipboard_read`、`control_global_key`，
+调用仍会到达会话并以 `POLICY.DENIED` 拒绝；远程连接总列出它们，由远端服务的授权决定。
+
+**截图方法。** 用 `PrintWindow(PW_RENDERFULLCONTENT)` 让窗口自己渲染，而不是从屏幕 BitBlt：截图里永远不会
+出现盖在目标上的其他应用窗口（不泄露别的程序的内容），目标也不必在前台。代价：最小化窗口没有画面
+（拒绝 `DRIVER.WINDOW_MINIMIZED`，先 `restore`），不响应该请求的应用会渲染成黑色。密码元素拒绝
+`DRIVER.PROTECTED_ELEMENT`；被滚出视野（offscreen）的元素拒绝。单边最多 8192 像素（超出 `clipped: true`）。
+PNG 编码是确定的：同样的像素得到同样的 digest。
+
+**DPI 与多显示器。** Windows 后端在第一次 UIA 调用前把进程设为 Per-Monitor v2 DPI aware：UIA 边界、窗口矩形、
+SendInput 归一化用的虚拟屏幕范围和截图像素全部是物理像素。此前进程是 DPI unaware，缩放屏上落点被量化，
+混合 DPI 多显示器时副屏窗口的虚拟化矩形与虚拟屏幕对不上。DPI 虚拟化的窗口（unaware，或另一缩放比的
+system aware）只按逻辑尺寸渲染，截图会按物理窗口尺寸缩放，与 UIA 报告的物理边界对齐（清晰度与屏幕上一致）。
+所有指针手势共用一个归一化函数，单元测试覆盖了每个像素（含负原点的虚拟屏幕）往返一致；原先 `pointer_click`
+按整宽归一化，会落到左上一像素。
+
+**指针与键盘的落点证明。** 抬窗口到前台可能被前台锁拒绝，此前仍照样发送输入，点击会落到盖在那里的东西上
+（实测 fixture 的一次点击落到了 fixture 外面）。现在：指针手势发送前用 UIA `ElementFromPoint` 命中检查落点，
+必须是该元素、其内部或其容器（不是桌面、兄弟或别的窗口），否则 `DRIVER.OCCLUDED`、effect not_applied，
+且不说出遮挡者是谁（可能属于别的应用）；键盘（type_text、key、paste 的 Ctrl+V）发送前证明窗口在前台、
+焦点在元素内，否则 `DRIVER.FOCUS_LOST`，一个键也不发。前台切换失败时退而 `AttachThreadInput` 到前台线程，不合成任何输入。
+
+**OCR。** Windows 自带的 Windows.Media.Ocr：离线、无需安装引擎，每个已安装的 OCR 语言包一个识别器
+（本机：en-US、ja、zh-Hans-CN）。没有对应语言包时 `DRIVER.OCR_UNAVAILABLE` 并在 `details.available_languages`
+列出已装的。没有用 `aad-ocr`：它驱动 Tesseract，默认未安装，且在 Windows 上没有资源沙箱时拒绝运行。
+识别出的行是只读输出，不是 act 的目标：要对某个词操作，就对它所在的元素 `click` 并给出该词中心的
+`fraction`（fx + fw/2, fy + fh/2），这仍锚定在被观察、被重新校验的元素上；内容可能已移动时先重新读。
+OCR 会混淆 I 与 l 等字符。Linux 与 macOS 用 Tesseract，见下文“其他平台”。
+
+**粘贴。** 先复制剪贴板里所有内存型格式（GDI 句柄格式如位图、图元文件除外，位图仍以 CF_DIB 保存；超过 32 MiB
+时拒绝 `DRIVER.CLIPBOARD_TOO_LARGE`，不丢用户的内容），再以延迟渲染提供文字：只有目标进程来取时才给出，
+剪贴板历史、剪贴板管理器、同步工具来取一律拒绝，并带 `ExcludeClipboardContentFromMonitorProcessing`、
+`CanIncludeInClipboardHistory=0`、`CanUploadToCloudClipboard=0` 让守规矩的监视者（包括 Windows 剪贴板历史）不来取。
+经典 Win32 Edit/RichEdit 直接向该控件窗口发 `WM_PASTE`（消息，不受键盘钩子影响、不需前台）；其他控件在证明焦点后发
+Ctrl+V。目标真正来取时才算粘贴完成，之后恢复原剪贴板；1 秒内若有同步工具把提供时的标记重新发布回来，再恢复一次。
+目标始终没来取：`DRIVER.PASTE_NOT_CONSUMED`、effect unknown（快捷键已送到元素）。任何出口都会恢复剪贴板。
+注意：恢复是把原内容重新写入，会成为一次新的剪贴板变更（原主程序的延迟格式此时被渲染成数据）。
+实测（本机运行着 AutoHotkey、SnipDo、一个远程剪贴板同步和厂商 PC 管家）：Ctrl+V 只有约三分之一到达聚焦的 fixture Edit，
+`WM_PASTE` 每次都到；同步工具曾在恢复后把提供时的标记回写，现由回写检查修复。
+
+**启动程序。** 不经 shell、`start` 或文件/URL 关联：可执行文件以 argv 直接启动，标准流与服务（可能承载协议本身）分离，
+Windows 上控制台程序得到自己的控制台。只接受 `.exe`（`.bat/.cmd/.lnk` 等会经 cmd 或关联）；shell、脚本宿主和关联启动器
+（cmd、powershell、pwsh、explorer、rundll32、mshta、wscript、sh、bash、xdg-open、open……）即使在白名单里也拒绝，因为它们的参数
+会把这些都带回来。白名单项可以是绝对路径或 PATH 上的裸名；客户端必须逐字给出某一项。白名单里放解释器（python 等）
+等于授予任意代码执行，由操作者负责。等待新进程的窗口（或同一映像的新窗口——启动器把工作交给另一个进程时），
+返回的 resource 可直接 observe。
+
+**全局快捷键。** 唯一不锚定元素的输入，独立动作、独立授权、默认关闭。复用 `key` 的原子 SendInput 和修饰键泄漏清理，
+取输入租约，并使已有观察失效。成功时 effect 为 `dispatched`、commit_state `unknown`、`verified: false`：按键落在当时
+的焦点上，没有锚定也无法验证，调用者必须重新观察，不能盲目重复。拒绝 Ctrl+Alt+Del（不能合成）与 Win+L（会锁住所有人），
+输入桌面不是用户桌面（UAC 提示、锁屏）时 `DRIVER.SECURE_DESKTOP`、什么也不发。
+
+**不支持。** UAC / 安全桌面自动化一律拒绝。窗口的 resize / move 需要坐标，不提供。
+
+## 其他平台：Linux（KDE/X11）与 macOS
+
+同一组会话操作、同样的授权参数与同样的回答形状（capture 的 `format`/`data`/`width`/`height`/`clipped` + `digest`，
+read_text 的 `text`/`lines`/`words` 与元素框内比例 `box`）。能力只在本机真正可用时出现在 `capabilities` 与节点的
+`capabilities` 中；做不到时以明确的错误码拒绝，不会假装成功。
+
+| 能力 | Linux `desktop.linux_atspi` | macOS `desktop.macos_ax` [待验证] |
+| --- | --- | --- |
+| 截图 | 重新校验后 X11 root XGetImage 按实时 bounds 裁剪；protected 子树、被遮挡、非 showing 拒绝 | 只截目标窗口自身内容（CGWindowListCreateImage + 窗口 ID）；需屏幕录制权限，否则 `DRIVER.SCREEN_RECORDING_DENIED` |
+| OCR | Tesseract（`aad-ocr`，`prlimit` 限制资源），装了才出现在 `reads`；否则 `DRIVER.OCR_UNAVAILABLE` | 同上，另需 `OCR_ALLOW_UNSANDBOXED_ENGINE=1`（macOS 上没有资源沙箱） |
+| 窗口动作 | 顶层窗口节点；EWMH 请求（iconify、`_NET_WM_STATE` 最大化、`_NET_ACTIVE_WINDOW`、`_NET_CLOSE_WINDOW`）后读回窗口管理器的状态；没有 EWMH 窗口管理器时不提供 | AXWindow 节点；`AXMinimized`、`AXFullScreen`（maximize = 全屏）、关闭按钮、激活 + `AXRaise`，读回状态 |
+| 粘贴 | X11 CLIPBOARD 由 helper 持有、只给目标进程的 X client，Ctrl+V，原内容交给一个脱离进程恢复 | 通用剪贴板延迟提供 + Concealed/Transient 标记，Cmd+V 只投给目标进程，之后恢复；无法限定来取的是谁 |
+| 读剪贴板 | `x-kde-passwordManagerHint` 拒绝 | `org.nspasteboard.ConcealedType` 拒绝 |
+| 全局快捷键 | XTest；拒绝 Ctrl+Alt+Backspace/Delete/L、Super+L | CGEvent；拒绝 Ctrl+Cmd+Q、Shift+Cmd+Q、Option+Cmd+Esc 与 Secure Event Input 期间 |
+| 启动程序 | argv 直接启动（`setsid`），按 AT-SPI 应用 PID 或可执行文件名等待 | 同上，`.app` 写成 `X.app/Contents/MacOS/X`；不支持按 bundle id 启动 |
+
+实测（WSL2 Ubuntu 22.04、Xvfb、openbox、Qt 5.15 fixture、tesseract 4.1，`tests/linux/run-linux-parity.sh`）：
+窗口截图尺寸等于其 bounds；Tesseract 读出状态标签 “Qt fixture status idle”；粘贴后字段值为所贴文字且 xclip
+读回原剪贴板；全局 Ctrl+A、Backspace 清空焦点字段；最大化后应用报告的宽度变大，最小化/还原经窗口管理器往返；
+启动白名单程序后其窗口作为 resource 返回、`/bin/sh` 被拒；close_window 后该进程退出。
+[待验证] KWin（真实 KDE Plasma X11）下的窗口动作与截图遮挡判断、Klipper 共存时的粘贴恢复、GTK 应用的粘贴；
+macOS 一列全部需要 macOS 真机（辅助功能 + 屏幕录制权限）验证。细节见
+[Linux 驱动](architecture/linux-kde-x11-driver.md) 与 [macOS 驱动](architecture/macos-ax-driver.md)。
 
 ## 观察视图与定位器
 
@@ -35,16 +218,27 @@ DOM click/fill 的事件 `isTrusted=false`，并不等价于原生指针或真�
 | --- | --- | --- |
 | `nodes`（协议默认） | 全部节点 | 需要原始树的程序 |
 | `outline`（MCP 默认） | 可操作或有名字、不在屏幕外的节点，按 `limit`（默认 80，≤500）与 `max_characters`（默认 20000）截断；回报 `matched`、`shown`、`stopped_by` | AI 阅读 |
-| `overview` | 区域及其大小，不列内容 | 大窗口先看结构；只有 Windows 计算区域，其他平台返回 `CONTROL.VIEW_UNSUPPORTED` |
+| `overview` | 区域及其大小，不列内容 | 大窗口先看结构；Windows 窗口与浏览器页面计算区域，其他平台返回 `CONTROL.VIEW_UNSUPPORTED` |
+| `text` | 只读：页面或一个区域的可见文字（`innerText`，按 `max_characters` 截断并报 `characters`、`text_truncated`），表格按行/单元格列出 | 浏览器页面读正文；其他 provider 返回 `CONTROL.VIEW_UNSUPPORTED` |
 
-`view.region` 只用于 outline，取 overview 报出的区域名，与定位器 `within` 用的名字一致。
+`view.region` 用于 outline 和 text，取 overview 报出的区域名，与定位器 `within` 用的名字一致；名字不存在时返回 `CONTROL.NOT_FOUND` 并在 `details.regions` 列出现有区域。
+浏览器的区域是 landmark：header/nav/main/aside/footer/form/dialog、有名字的 section 和 ARIA landmark role，以可访问名命名，没有名字用 role，重名加序号；不在任何 landmark 里的节点归入 `(loose in the page)`。浏览器节点带 `parent` 与 `region`，landmark 节点的 `landmark` 就是区域名。
+
+浏览器的 role/name 取自浏览器的可访问性树（每个元素一次 `Accessibility.getPartialAXTree`，与 `DOM.describeNode` 一起流水线发送，只采用 backend id 对得上的节点）；被忽略、内部 role（StaticText、LabelText 等）或空名字时保留启发式结果，body 始终是 `document`。开销记在 `metadata.accessibility`：实测 67 个节点 8 ms，569 个节点约 60–80 ms（整次观察 130–150 ms；顺序请求时为 321 ms）；超过 2000 个节点保留启发式。
 Windows 的 outline 和 overview 直接复用本次观察的 driver 快照，不会另拍一张。
 
 `find` 的定位器：`role`、`name`、`node_id` 在所有 provider 上精确匹配；`value`、`automation_id`、
 `class_name`、`framework_id`、`states`、`match`（exact/contains）、`within`、`near`、`nth` 由 Windows
-driver 求值，其他 provider 返回 `CONTROL.LOCATOR_UNSUPPORTED`，不会悄悄忽略。匹配多个时返回
+driver 求值；浏览器页面求值 `value`、`states`、`match`（contains 不区分大小写）、`within`（另一个必须唯一的定位器，或 overview 的区域名作 `name`）和 `nth`（1 起，或 first/last，按屏幕从上到下、从左到右计数，在 `within` 内计数），对 `automation_id`、`class_name`、`framework_id`、`near` 返回 `CONTROL.LOCATOR_UNSUPPORTED` 并点名字段；其他 provider 对扩展字段一律返回 `CONTROL.LOCATOR_UNSUPPORTED`，不会悄悄忽略。匹配多个时返回
 `CONTROL.AMBIGUOUS`（Windows 为 `DRIVER.AMBIGUOUS_MATCH`）并在 `details.candidates` 列出候选；
 `expect: optional` 时找不到返回 `found: false` 而不是错误，多个匹配仍然报错。
+
+`wait` 由会话用 observe 与 find 反复实现，不依赖 provider，所以桌面与浏览器都有：给 `resource_id`、`locator` 和
+`condition`（`appears` 恰好一个匹配；`disappears` 没有匹配；`state` 恰好一个匹配且其 `states` 等于给出的
+`states` 对象），每隔 `interval_ms`（50..5000，默认 250）观察一次，直到满足或 `timeout_ms` 用完
+（`CONTROL.WAIT_TIMEOUT`，`details` 带 `polls` 与最后一次是否存在）。多个匹配永远不算找到：一直歧义到超时返回
+`CONTROL.AMBIGUOUS`。满足时返回最后一次的 `observation_id`，`appears`/`state` 还带该节点的 `target`，这次观察仍是当前观察，
+可以直接 act。等待期间占用会话串行锁（单请求上限 30 秒），`cancel` 可以中止，结果为 `not_committed`。
 
 给人用的 `aad apps/describe/overview/snapshot/find/do` 也走这个会话：每条命令一个进程、一个会话，
 `aad do` 在同一个进程里观察、定位、操作，接受与 `aad find` 相同的定位参数，不跨进程传引用。
@@ -59,6 +253,7 @@ aad mcp --allow-input                    # 本机 MCP，授予输入与工作流
 aad mcp --provider desktop.linux_atspi    # 限定 provider，不提供工作流工具
 aad mcp --browser-port 9222              # 显式连接本机已有的隔离 CDP 实例
 aad mcp --allow-input --allow-profile-copy  # browser_open 可以复制已有 profile 的登录
+aad mcp --allow-input --allow-upload-dir D:\to-upload  # 浏览器 upload 只能读这个目录下的文件
 ```
 
 会话总带一个浏览器 provider，没连接时没有页面；`Session::attach_browser(port)` 之后换成那个浏览器
@@ -66,10 +261,11 @@ aad mcp --allow-input --allow-profile-copy  # browser_open 可以复制已有 pr
 `browser_record_*` 复用 `aad_cdp::recording` 写到存储目录的 `browser/<时间>-<id>/`。
 `Capture { target }` 是只读操作：浏览器把元素滚进视口后用 `Page.captureScreenshot` 按元素框裁剪
 （最大 4096×8192，超出时 `clipped: true`），会话加上 PNG 的 sha256 作为 `digest`。只支持主框架；
-其他 provider 返回 `CONTROL.ACTION_UNSUPPORTED`。
+桌面窗口见上文（Windows、Linux、macOS）；不提供截图的 provider 返回 `CONTROL.ACTION_UNSUPPORTED`。
 
 MCP 工具为 `control_capabilities`, `control_targets`, `control_observe`, `control_find`,
-`control_act`, `control_cancel`, `control_close`，本机未限定授权时另有 `probe_environment` 与四个工作流工具。
+`control_wait`, `control_act`, `control_capture`, `control_read_text`, `control_cancel`, `control_close`，
+授权时另有 `desktop_launch`、`clipboard_read`、`control_global_key`；本机未限定授权时另有 `probe_environment`、四个工作流工具和浏览器工具（含只读的 `browser_downloads`、`browser_storage`、`browser_network`）。
 每次调用可带 `request_id` 与 `timeout_ms`。`control_cancel` 的被取消请求字段名为 `target_request_id`；
 MCP cancellation notification 也能取消仍在执行的统一操作。错误响应带 `hint`，说明可行的恢复方式。
 原先按动作拆开的 Windows MCP 工具（`list_apps`、`describe_window`、`find_element`、`invoke` 等）已移除，
@@ -150,7 +346,8 @@ CDP 仅接受 loopback 调试地址，显式 `--browser-port` 才启用；不会
 
 `aad_control::steps` 定义平台无关的步骤：`app`（provider、进程或应用名、标题片段、网址前缀，
 必须恰好匹配一个目标）、`locator`、`action`（不含会话引用；drag 的终点写在 `to`）或 `check`
-（`present` 与 `within_ms`），以及可选的 `input`（fill/type_text 的文字运行时传入，敏感值不落盘）。
+（`present` 与 `within_ms`），以及可选的 `input`（fill/type_text/paste 的文字运行时传入，敏感值不落盘）。
+窗口动作也可以保存为步骤（定位窗口根节点）。
 回放时列目标 → 选出唯一的应用 → observe → find → act，每次都重新定位。
 
 录制文档是 `kind: Recording`、`format: control-steps/1`；编译出的工作流只用
@@ -185,13 +382,27 @@ GUI 和 `aad record` 都用它。Windows driver 返回自己的录制步骤；AT
 
 `osdk run control-test` 跑纯逻辑、真实子进程 stdio、三平台原生适配 mock 和 MCP 回归。
 Linux CI 另外运行带沙箱的空白 Chromium fixture，检查 DOM/可信键盘、可信指针（右键、双击、悬停、滚轮、被遮挡时拒绝）、
-select/check、navigate/back/forward/reload 的实际结果及导航/frame/节点过期；同一个测试在 Windows 上用本机 Chrome 跑过
+select/check、navigate/back/forward/reload 的实际结果及导航/frame/节点过期；另有逐键输入与快捷键（记录 keydown/keypress 的 isTrusted）、指针排序与 HTML5 拖放、开放/closed shadow root 与 slot、进程内 frame 与经 `--host-resolver-rules` 映射的跨站 OOPIF（指针、键盘、输入、被页面元素遮挡时拒绝）、landmark 区域/text 视图/可访问名/扩展定位器、设备与配色模拟、cookie/localStorage 列表与清除、网络请求列表；这些在 Windows 11 本机 Chrome headless=new 上连续 5 次全部通过，Linux CI 尚未跑过新增用例 `[待验证: Linux CI 沙箱 Chromium]`；同一个测试在 Windows 上用本机 Chrome 跑过
 （`AAD_TEST_CHROME` 指向 chrome.exe，临时空白 profile；本机的 Edge 用同样参数启动后立即退出，原因未查）。
 隔离 Qt/AT-SPI fixture 通过真实 CLI 子进程（`aad control serve`，以及 `aad apps`、`aad do`、`aad find`）检查 fill/invoke 后的界面状态。
 Windows 上 `tests/windows/verify_*_effect.py` 用自建的隔离探针窗口，经 `aad do` 检查右键、中键、双击、两个方向的滚轮、悬停、拖拽、
 按键输入和保存的工作流，由 Raw Input 日志独立确认。所有 GUI fixture 串行执行。
 CI 和 release 工作流使用官方 one-sdk Action 最新正式版本，不依赖 pending one-sdk PR。
 
+Windows 真机（Windows 11、单显示器 3840×2400、250% 缩放）上，`cargo test -p aad-uia --test windows_native -- --ignored --test-threads=1`
+用测试自建、自毁的窗口检查可观察效果：纯色色块截出恰好 120×80 个已知颜色像素，根节点截图包含未缩放的色块，
+DPI unaware 窗口的色块截成其 300×200 物理边界；被置顶窗口盖住的元素点击被拒绝且遮挡窗口没有收到点击；
+GDI 画出的 "Invoice 4217"（UIA 只看到窗口文字）被 OCR 读成一行两个词且位置正确；maximize/restore/minimize/activate/close_window
+各自达到 IsZoomed/IsIconic/GetForegroundWindow/IsWindow 读回的状态；paste 后 Edit 的值由 ValuePattern 读回、剪贴板文字与之前一致；
+activate 后 Shift+F9 以 F9 加 Shift 到达 fixture 窗口，Shift 随后松开。
+`cargo test -p aad-control --test windows_control -- --ignored --test-threads=1` 让测试程序启动自身的一个副本：
+其窗口作为 resource 返回，经会话 observe、capture 后 close_window 关闭；cmd.exe、不在白名单、只读会话的启动都被拒绝。
+
+[待验证] 混合 DPI 的多显示器（以及虚拟屏幕负原点的真实副屏）：只有单显示器可测，归一化往返由单元测试覆盖。
+[待验证] paste 的 Ctrl+V 路径（非经典控件，如 WPF、Chromium、UWP 文本框）未在真实目标上验证；本机的键盘钩子工具使 Ctrl+V 不可靠。
+[待验证] `desktop_launch` 在 Linux/macOS：会话层代码可移植（`launch.rs` 已为 linux-gnu 与 apple-darwin 目标做类型检查），
+按 `metadata.process_id` 匹配新的 AT-SPI 应用 / AX 应用，但未在这两个平台运行；Windows 11 记事本这类把工作交给另一进程的启动器
+只按映像名匹配新窗口，未用真实应用验证。
 [待验证] 本云容器不能启动本机 Chromium 沙箱，浏览器实际效果由 GitHub Linux CI 验证。
 [待验证] Linux 上新的 CLI 段、双击和 Ctrl+A 只在 CI 的 Xvfb 环境里跑，本机只编译了 helper 并跑了单元测试；
 右键、滚轮、悬停、拖拽在 Linux 上还没有观察效果的 fixture。
@@ -201,5 +412,5 @@ CI 和 release 工作流使用官方 one-sdk Action 最新正式版本，不依�
 `aad do click <id> --role AXTextArea --button right` 弹出菜单；`aad do scroll <id> --role AXTextArea --direction down`
 在长文档里滚动；在“访达”列表里 `aad do drag` 把文件拖进文件夹。
 Windows/macOS 的新适配路由在 CI 以 mock 编译/测试；Windows 的输入桌面、macOS TCC 和跨机器 SSH
-未在真实设备验证。Wayland 原生输入、完整 OOPIF、浏览器拖拽与新标签页、结果缓存、
+未在真实设备验证。Wayland 原生输入、完整 OOPIF、浏览器拖拽、结果缓存、
 自动重放与统一 Android wire adapter 均不在本次范围。录制/回放及事件观察保持已有实现，不提升其可靠性声明。

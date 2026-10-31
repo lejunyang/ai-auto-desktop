@@ -1,7 +1,7 @@
 //! One continuous socket reader; command replies never compete with observers.
 use crate::{ws::WebSocket, CdpError};
 use serde_json::Value;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -15,9 +15,33 @@ struct Inbox {
     bytes: usize,
     dropped: u64,
     failure: Option<CdpError>,
+    /// Only these event methods are queued; `None` queues every event.
+    keep: Option<HashSet<String>>,
+    /// These events fail every command waiting for its reply.
+    interrupt: HashSet<String>,
 }
 
 impl Inbox {
+    fn filter(&mut self, keep: Option<&[&str]>, interrupt: &[&str]) {
+        self.keep = keep.map(|methods| methods.iter().map(|m| m.to_string()).collect());
+        self.interrupt = interrupt.iter().map(|m| m.to_string()).collect();
+        if let Some(keep) = &self.keep {
+            self.events
+                .retain(|(event, _)| event["method"].as_str().is_some_and(|m| keep.contains(m)));
+            self.bytes = self.events.iter().map(|(_, size)| size).sum();
+        }
+    }
+    fn arrived(&mut self, value: Value, bytes: usize) {
+        let method = value["method"].as_str().unwrap_or_default().to_string();
+        if self.interrupt.contains(&method) {
+            for (_, reply) in self.pending.drain() {
+                let _ = reply.send(Err(CdpError::Interrupted(method.clone())));
+            }
+        }
+        if self.keep.as_ref().is_none_or(|keep| keep.contains(&method)) {
+            self.event(value, bytes);
+        }
+    }
     fn event(&mut self, value: Value, bytes: usize) {
         if bytes > MAX_BYTES {
             self.dropped += 1;
@@ -80,7 +104,7 @@ impl Connection {
                     }
                     // A late reply to a timed-out command is not an event.
                 } else if value["method"].is_string() {
-                    state.event(value, text.len());
+                    state.arrived(value, text.len());
                 }
             };
             let mut state = shared.lock().unwrap();
@@ -118,6 +142,55 @@ impl Connection {
         })();
         self.inbox.lock().unwrap().pending.remove(&id);
         result
+    }
+
+    /// Send several commands before waiting for any reply, so a run of
+    /// independent calls costs one round trip instead of one each. Replies
+    /// come back in the order the commands were given.
+    pub fn pipeline(
+        &mut self,
+        messages: &[(u64, Value)],
+        deadline: Instant,
+    ) -> Vec<Result<Value, CdpError>> {
+        let mut waiting = Vec::with_capacity(messages.len());
+        {
+            let mut state = self.inbox.lock().unwrap();
+            if let Some(error) = &state.failure {
+                return messages.iter().map(|_| Err(error.clone())).collect();
+            }
+            for (id, _) in messages {
+                let (send, recv) = mpsc::sync_channel(1);
+                state.pending.insert(*id, send);
+                waiting.push(recv);
+            }
+        }
+        let sent = (|| {
+            self.socket.set_write_deadline(deadline)?;
+            for (_, message) in messages {
+                self.socket.send_text(&message.to_string())?;
+            }
+            Ok::<(), CdpError>(())
+        })();
+        let results = waiting
+            .into_iter()
+            .map(|recv| match &sent {
+                Err(error) => Err(error.clone()),
+                Ok(()) => recv
+                    .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                    .map_err(|_| CdpError::protocol("command deadline elapsed"))?,
+            })
+            .collect();
+        let mut state = self.inbox.lock().unwrap();
+        for (id, _) in messages {
+            state.pending.remove(id);
+        }
+        results
+    }
+
+    /// Queue only `keep` events (all when `None`), and abandon waiting
+    /// commands when an `interrupt` event arrives.
+    pub fn filter(&self, keep: Option<&[&str]>, interrupt: &[&str]) {
+        self.inbox.lock().unwrap().filter(keep, interrupt);
     }
 
     pub fn drain(&self) -> EventBatch {
@@ -183,6 +256,84 @@ mod tests {
         assert_eq!(events.len(), 2);
         assert_eq!(events[0]["method"], "Network.requestWillBeSent");
         assert_eq!(events[1]["method"], "Network.loadingFinished");
+    }
+
+    #[test]
+    fn an_interrupting_event_releases_a_waiting_command_and_filters_keep_the_queue_small() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let stream = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut peer, _) = listener.accept().unwrap();
+        let mut connection = Connection::new(WebSocket::from_stream(stream).unwrap()).unwrap();
+        connection.filter(
+            Some(&["Page.javascriptDialogOpening"]),
+            &["Page.javascriptDialogOpening"],
+        );
+        let worker = std::thread::spawn(move || {
+            let mut header = [0; 2];
+            peer.read_exact(&mut header).unwrap();
+            let mut payload = vec![0; (header[1] & 127) as usize + 4];
+            peer.read_exact(&mut payload).unwrap();
+            for text in [
+                r#"{"method":"Runtime.consoleAPICalled"}"#,
+                r#"{"method":"Page.javascriptDialogOpening","params":{"type":"alert"}}"#,
+            ] {
+                peer.write_all(&[0x81, text.len() as u8]).unwrap();
+                peer.write_all(text.as_bytes()).unwrap();
+            }
+            // The reply only comes once the dialog is gone; keep the socket open.
+            std::thread::sleep(Duration::from_millis(300));
+        });
+        let started = Instant::now();
+        let failure = connection
+            .command(
+                1,
+                &serde_json::json!({"id":1,"method":"Runtime.evaluate"}),
+                Instant::now() + Duration::from_secs(5),
+            )
+            .unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(
+            failure.interrupted_by(),
+            Some("Page.javascriptDialogOpening")
+        );
+        let events = connection.drain().events;
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events[0]["params"]["type"], "alert");
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn pipelined_commands_are_all_sent_before_replies_and_answered_in_order() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let stream = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut peer, _) = listener.accept().unwrap();
+        let mut connection = Connection::new(WebSocket::from_stream(stream).unwrap()).unwrap();
+        let worker = std::thread::spawn(move || {
+            // Read all three requests before answering any, in reverse order.
+            for _ in 0..3 {
+                let mut header = [0; 2];
+                peer.read_exact(&mut header).unwrap();
+                let mut payload = vec![0; (header[1] & 127) as usize + 4];
+                peer.read_exact(&mut payload).unwrap();
+            }
+            for text in [
+                r#"{"id":3,"result":{"n":3}}"#,
+                r#"{"id":1,"result":{"n":1}}"#,
+                r#"{"id":2,"error":{"message":"no"}}"#,
+            ] {
+                peer.write_all(&[0x81, text.len() as u8]).unwrap();
+                peer.write_all(text.as_bytes()).unwrap();
+            }
+        });
+        let messages: Vec<(u64, Value)> = (1..=3)
+            .map(|id| (id, serde_json::json!({"id": id, "method": "m"})))
+            .collect();
+        let results = connection.pipeline(&messages, Instant::now() + Duration::from_secs(2));
+        worker.join().unwrap();
+        assert_eq!(results[0].as_ref().unwrap()["n"], 1);
+        assert!(results[1].is_err());
+        assert_eq!(results[2].as_ref().unwrap()["n"], 3);
+        assert!(connection.inbox.lock().unwrap().pending.is_empty());
     }
 
     #[test]

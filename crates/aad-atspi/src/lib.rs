@@ -24,18 +24,36 @@ const MAX_DEPTH: u32 = 128;
 const MAX_NODES: usize = 5000;
 const MAX_CANDIDATE_SUMMARIES: usize = 10;
 const WRITE_ACTIONS: &[&str] = &[
+    "activate",
+    "close_window",
     "collapse",
     "drag",
     "expand",
     "focus",
     "invoke",
     "key_chord",
+    "maximize",
+    "minimize",
+    "paste",
     "pointer_click",
     "pointer_gesture",
+    "restore",
     "set_text",
     "toggle",
     "type_text",
 ];
+/// Actions on a top-level window's own frame node, carried out by the
+/// window manager (EWMH) and verified by reading the state back.
+pub const WINDOW_ACTIONS: &[&str] = &[
+    "minimize",
+    "maximize",
+    "restore",
+    "close_window",
+    "activate",
+];
+const MAX_PASTE_CHARS: usize = 4096;
+const DEFAULT_CLIPBOARD_CHARS: usize = 16_384;
+const MAX_CLIPBOARD_CHARS: usize = 65_536;
 const STATE_NAMES: &[&str] = &[
     "enabled",
     "visible",
@@ -251,6 +269,54 @@ pub trait AtspiBackend: Send + Sync {
             "native capture_target helper is unavailable",
         ))
     }
+    /// One of [`WINDOW_ACTIONS`] on the top-level window at `bounds` owned by
+    /// `process_id`; answers only once the window manager reports the state.
+    fn window_action(
+        &self,
+        _target: &NativeRef,
+        _action: &str,
+        _bounds: Bounds,
+        _process_id: u32,
+        _deadline: Instant,
+    ) -> Result<Value, AutomationError> {
+        Err(driver_error(
+            "DRIVER.ACTION_UNSUPPORTED",
+            "window actions need an EWMH window manager and the X11 helper",
+        ))
+    }
+    /// Focus the target and paste `text` into it through the clipboard,
+    /// putting the previous clipboard back afterwards.
+    fn paste(
+        &self,
+        _target: &NativeRef,
+        _text: &str,
+        _process_id: u32,
+        _deadline: Instant,
+    ) -> Result<Value, AutomationError> {
+        Err(driver_error(
+            "DRIVER.ACTION_UNSUPPORTED",
+            "paste needs the X11 helper",
+        ))
+    }
+    /// The CLIPBOARD selection's text, at most `max_bytes` of UTF-8:
+    /// `{"has_text", "text", "truncated"}`.
+    fn clipboard_text(
+        &self,
+        _max_bytes: usize,
+        _deadline: Instant,
+    ) -> Result<Value, AutomationError> {
+        Err(driver_error(
+            "DRIVER.ACTION_UNSUPPORTED",
+            "reading the clipboard needs the X11 helper",
+        ))
+    }
+    /// Press a chord wherever keyboard focus is, anchored on nothing.
+    fn global_key(&self, _keys: &[String], _deadline: Instant) -> Result<Value, AutomationError> {
+        Err(driver_error(
+            "DRIVER.ACTION_UNSUPPORTED",
+            "global keys need the X11 helper",
+        ))
+    }
 }
 
 #[derive(Clone)]
@@ -336,6 +402,35 @@ impl AtspiProvider {
             "snapshot" => self.snapshot(args, deadline),
             "find" => self.find(args, deadline),
             "capture_target" => self.capture_target(args, deadline, artifacts),
+            "capture" => self.capture_inline(args, deadline),
+            "clipboard_read" => {
+                only_keys(args, &["max_characters"])?;
+                let max = bounded_integer(
+                    args.get("max_characters"),
+                    DEFAULT_CLIPBOARD_CHARS as u64,
+                    1,
+                    MAX_CLIPBOARD_CHARS as u64,
+                    "max_characters",
+                )? as usize;
+                // Ask for enough UTF-8 to hold max characters plus one, so a
+                // longer clipboard is reported as truncated.
+                let read = self.backend.clipboard_text(4 * (max + 1), deadline)?;
+                let text = read["text"].as_str().unwrap_or_default();
+                let characters = text.chars().count();
+                let has_text = read["has_text"] == true;
+                Ok(json!({
+                    "has_text": has_text,
+                    "text": if has_text { json!(text.chars().take(max).collect::<String>()) } else { Value::Null },
+                    "characters": characters,
+                    "truncated": characters > max || read["truncated"] == true,
+                }))
+            }
+            "global_key" => {
+                only_keys(args, &["keys"])?;
+                let keys = parse_keys(args.get("keys"))?;
+                refuse_reserved_chord(&keys)?;
+                self.backend.global_key(&keys, deadline)
+            }
             "watch" => {
                 only_keys(args, &["application"])?;
                 let application = args
@@ -466,6 +561,7 @@ impl AtspiProvider {
                                 | "key_chord"
                                 | "set_text"
                                 | "type_text"
+                                | "paste"
                         )
                 })
                 .collect::<BTreeSet<_>>()
@@ -653,7 +749,7 @@ impl AtspiProvider {
         deadline: Instant,
     ) -> Result<Value, AutomationError> {
         let mut allowed = vec!["target", "locator"];
-        if matches!(action, "set_text" | "type_text") {
+        if matches!(action, "set_text" | "type_text" | "paste") {
             allowed.push("text");
         }
         match action {
@@ -836,6 +932,17 @@ impl AtspiProvider {
                         deadline,
                     )
                 }
+                "paste" => {
+                    let text = paste_text(args.get("text"))?;
+                    let process = process_id(&node, &fresh)?;
+                    self.backend.paste(&native, text, process, deadline)
+                }
+                window if WINDOW_ACTIONS.contains(&window) => {
+                    let process = process_id(&node, &fresh)?;
+                    let bounds = parse_bounds(node.get("bounds"))?;
+                    self.backend
+                        .window_action(&native, window, bounds, process, deadline)
+                }
                 "toggle" => self.backend.named_action(&native, "click", deadline),
                 "expand" | "collapse" => self.backend.named_action(&native, "activate", deadline),
                 _ => unreachable!(),
@@ -882,13 +989,65 @@ impl AtspiProvider {
         if args.get("format") != Some(&json!("png")) {
             return Err(invalid("capture_target.format must be png"));
         }
-        let (fresh, fresh_id, node, native) = self.fresh_target(args, deadline)?;
         let artifacts = artifacts.ok_or_else(|| {
             driver_error(
                 "DRIVER.ARTIFACT_IPC",
                 "capture_target requires a Host artifact store",
             )
         })?;
+        let mut target_args = args.clone();
+        target_args.remove("format");
+        let (png, provenance) = self.checked_capture(&target_args, deadline)?;
+        let reference = artifacts
+            .import_bytes(&png, Some("image/png"))
+            .map_err(|cause| {
+                driver_error("DRIVER.ARTIFACT_IPC", "Host artifact import failed").with_cause(cause)
+            })?;
+        Ok(json!({"frame": reference.to_value(), "provenance": provenance}))
+    }
+
+    /// The same checked capture answered inline, as the control session's
+    /// `capture` expects: `{format, data (base64 PNG), width, height, clipped}`.
+    fn capture_inline(
+        &self,
+        args: &Map<String, Value>,
+        deadline: Instant,
+    ) -> Result<Value, AutomationError> {
+        use base64::Engine as _;
+        only_keys(args, &["target", "locator"])?;
+        // A read must not spend the caller's observation: the fresh tree the
+        // check takes replaces the current snapshot, so put the observed one back.
+        let observed = self.observed_record(args)?;
+        let captured = self.checked_capture(args, deadline);
+        if let Ok(mut state) = self.state.lock() {
+            state.current = Some(observed);
+        }
+        let (png, provenance) = captured?;
+        let (width, height) = png_size(&png).ok_or_else(|| {
+            driver_error(
+                "DRIVER.CAPTURE_FAILED",
+                "X11 capture helper did not return a PNG",
+            )
+        })?;
+        Ok(json!({
+            "format": "png",
+            "data": base64::engine::general_purpose::STANDARD.encode(&png),
+            "width": width,
+            "height": height,
+            "clipped": false,
+            "node_id": provenance["node_id"],
+            "provenance": provenance,
+        }))
+    }
+
+    /// Revalidate the target against a fresh tree, refuse protected or
+    /// occluded content, and capture its live bounds through the X11 helper.
+    fn checked_capture(
+        &self,
+        args: &Map<String, Value>,
+        deadline: Instant,
+    ) -> Result<(Vec<u8>, Map<String, Value>), AutomationError> {
+        let (fresh, fresh_id, node, native) = self.fresh_target(args, deadline)?;
         let states = node["states"].as_object().expect("normalized states");
         if !["visible", "showing"]
             .iter()
@@ -955,16 +1114,11 @@ impl AtspiProvider {
         let (png, mut provenance) = self
             .backend
             .capture_target(&native, bounds, process, deadline)?;
-        let reference = artifacts
-            .import_bytes(&png, Some("image/png"))
-            .map_err(|cause| {
-                driver_error("DRIVER.ARTIFACT_IPC", "Host artifact import failed").with_cause(cause)
-            })?;
         provenance.insert("snapshot_id".into(), fresh.public["snapshot_id"].clone());
         provenance.insert("revision".into(), fresh.public["revision"].clone());
         provenance.insert("node_id".into(), json!(fresh_id));
         provenance.insert("application_process_id".into(), json!(process));
-        Ok(json!({"frame": reference.to_value(), "provenance": provenance}))
+        Ok((png, provenance))
     }
 
     fn validate_point(
@@ -1488,6 +1642,15 @@ fn fingerprint(node: &Value) -> String {
     format!("sha256:{:x}", Sha256::digest(encoded))
 }
 
+/// Width and height from a PNG's IHDR chunk.
+fn png_size(png: &[u8]) -> Option<(u32, u32)> {
+    if png.len() < 24 || &png[..8] != b"\x89PNG\r\n\x1a\n" || &png[12..16] != b"IHDR" {
+        return None;
+    }
+    let read = |at: usize| u32::from_be_bytes([png[at], png[at + 1], png[at + 2], png[at + 3]]);
+    Some((read(16), read(20)))
+}
+
 fn process_id(node: &Value, record: &Record) -> Result<u32, AutomationError> {
     let process = node["provenance"]["process_id"]
         .as_u64()
@@ -1620,6 +1783,32 @@ fn parse_keys(value: Option<&Value>) -> Result<Vec<String>, AutomationError> {
                 .ok_or_else(|| invalid("each key is a short alphanumeric name"))
         })
         .collect()
+}
+
+/// Chords a global key never presses: X's zap (Ctrl+Alt+Backspace), the
+/// session's logout/lock shortcuts (Ctrl+Alt+Delete, Ctrl+Alt+L, Super+L).
+fn refuse_reserved_chord(keys: &[String]) -> Result<(), AutomationError> {
+    let lower: Vec<String> = keys.iter().map(|key| key.to_ascii_lowercase()).collect();
+    let has = |names: &[&str]| lower.iter().any(|key| names.contains(&key.as_str()));
+    let main = lower.last().map(String::as_str).unwrap_or_default();
+    let ctrl_alt = has(&["ctrl", "control"]) && has(&["alt"]);
+    let super_key = has(&["win", "super", "meta"]);
+    if (ctrl_alt && matches!(main, "backspace" | "delete" | "l")) || (super_key && main == "l") {
+        return Err(driver_error(
+            "DRIVER.KEY_RESERVED",
+            "Ctrl+Alt+Backspace, Ctrl+Alt+Delete, Ctrl+Alt+L and Super+L are never pressed",
+        ));
+    }
+    Ok(())
+}
+
+/// Text for `paste`: 1..4096 characters, no NUL.
+fn paste_text(value: Option<&Value>) -> Result<&str, AutomationError> {
+    let text = bounded_text(value, true)?;
+    if text.chars().count() > MAX_PASTE_CHARS {
+        return Err(invalid("paste text is 1..4096 characters"));
+    }
+    Ok(text)
 }
 
 fn parse_bounds(value: Option<&Value>) -> Result<Bounds, AutomationError> {
@@ -1924,6 +2113,43 @@ fn manifest_document() -> Value {
     actions.insert("pointer_gesture".into(), contract("重新验证目标后，仅在明确的 KDE/X11 会话中，通过固定路径 XTest helper 在目标 bounds 内的比例位置执行右键/中键/双击、滚轮或悬停。", "non_idempotent", "modify", "high", &["desktop.observe", "desktop.input"], point_input(json!({"button": button, "count": {"enum": [1, 2]}, "fraction": fraction, "scroll": {"type": "object", "required": ["direction"], "properties": {"direction": {"enum": ["up", "down", "left", "right"]}, "notches": {"type": "integer", "minimum": 1, "maximum": 30}}, "additionalProperties": false}, "hover_ms": {"type": "integer", "minimum": 1, "maximum": 5000}}), &[]), write_output(), true, true));
     actions.insert("drag".into(), contract("分别重新验证起点与终点后，通过固定路径 XTest helper 按下、分步移动并在终点释放。", "non_idempotent", "modify", "high", &["desktop.observe", "desktop.input"], point_input(json!({"to": target_schema(), "to_locator": locator_schema(), "button": button, "fraction": fraction, "to_fraction": fraction}), &["to", "to_locator"]), write_output(), true, true));
     actions.insert("key_chord".into(), contract("重新验证并聚焦目标后，通过固定路径 XTest helper 按下修饰键加一个主键的组合。", "non_idempotent", "input", "high", &["desktop.observe", "desktop.input"], point_input(json!({"keys": {"type": "array", "minItems": 1, "maxItems": 6, "items": {"type": "string", "minLength": 1, "maxLength": 32}}}), &["keys"]), write_output(), true, true));
+    for (name, description) in [
+        ("minimize", "重新验证顶层窗口 frame 后，经 X11 helper 向窗口管理器发 ICCCM WM_CHANGE_STATE（XIconifyWindow），等待（有上限）_NET_WM_STATE_HIDDEN / IconicState 真的出现。"),
+        ("maximize", "重新验证顶层窗口 frame 后，经 EWMH _NET_WM_STATE 请求最大化，等待两个 MAXIMIZED 状态出现。"),
+        ("restore", "最小化时经 _NET_ACTIVE_WINDOW 还原、最大化时移除 MAXIMIZED 状态，等待状态真的改变。"),
+        ("close_window", "经 EWMH _NET_CLOSE_WINDOW 请求窗口管理器关闭窗口（应用可能先询问），等待窗口消失。"),
+        ("activate", "经 EWMH _NET_ACTIVE_WINDOW 请求激活窗口，等待 _NET_ACTIVE_WINDOW 指向它。"),
+    ] {
+        actions.insert(
+            name.into(),
+            contract(
+                description,
+                if name == "close_window" { "non_idempotent" } else { "idempotent" },
+                "modify",
+                "high",
+                &["desktop.observe", "desktop.input"],
+                common_write(),
+                write_output(),
+                true,
+                true,
+            ),
+        );
+    }
+    actions.insert("paste".into(), contract("重新验证并聚焦可编辑、非受保护目标后，由 X11 helper 持有 CLIPBOARD、只向目标进程提供文字并发送 Ctrl+V，之后尽力恢复原剪贴板。", "contextual", "input", "high", &["desktop.observe", "desktop.input"], json!({"type": "object", "required": ["target", "locator", "text"], "properties": {"target": target_schema(), "locator": locator_schema(), "text": {"type": "string", "minLength": 1, "maxLength": MAX_PASTE_CHARS}}, "additionalProperties": false}), write_output(), true, true));
+    let mut clipboard = contract(
+        "读取 X11 CLIPBOARD 选区的文字（只读、有上限）；带 x-kde-passwordManagerHint 的内容拒绝。",
+        "read_only",
+        "observe",
+        "high",
+        &["desktop.clipboard_read"],
+        json!({"type": "object", "properties": {"max_characters": {"type": "integer", "minimum": 1, "maximum": MAX_CLIPBOARD_CHARS}}, "additionalProperties": false}),
+        json!({"type": "object", "required": ["has_text", "text", "characters", "truncated"], "properties": {"has_text": {"type": "boolean"}, "text": {"type": ["string", "null"]}, "characters": {"type": "integer", "minimum": 0}, "truncated": {"type": "boolean"}}, "additionalProperties": false}),
+        false,
+        false,
+    );
+    clipboard["sensitivity"] = json!({"input": "public", "output": "sensitive", "error": "public"});
+    actions.insert("clipboard_read".into(), clipboard);
+    actions.insert("global_key".into(), contract("不锚定任何元素，经 X11 helper 在当前焦点处按下组合键；拒绝 Ctrl+Alt+Backspace/Delete/L 与 Super+L。", "non_idempotent", "input", "high", &["desktop.input"], json!({"type": "object", "required": ["keys"], "properties": {"keys": {"type": "array", "minItems": 1, "maxItems": 6, "items": {"type": "string", "minLength": 1, "maxLength": 32}}}, "additionalProperties": false}), json!({"type": "object"}), true, false));
     let capture_id = json!({"type": "object", "required": ["capture_id"], "properties": {"capture_id": {"type": "string", "minLength": 1, "maxLength": 64}}, "additionalProperties": false});
     actions.insert("watch".into(), contract("开始记录本人在一个应用里的点击、滚轮、组合键、文本修改和勾选（AT-SPI 事件 + XRecord），只读，不注入输入。", "idempotent", "observe", "medium", &["desktop.observe"], json!({"type": "object", "required": ["application"], "properties": {"application": {"type": "object"}}, "additionalProperties": false}), json!({"type": "object"}), false, false));
     actions.insert(
@@ -1966,6 +2192,10 @@ fn manifest_document() -> Value {
     capture["errors"] = json!(error_contracts(false, true, true));
     capture["sensitivity"] = json!({"input": "public", "output": "sensitive", "error": "public"});
     actions.insert("capture_target".into(), capture);
+    let mut inline = contract("与 capture_target 相同的重新验证、保护与遮挡检查后，按 fresh screen bounds 截图，直接返回 base64 PNG（供控制会话 capture）。", "read_only", "observe", "medium", &["desktop.observe", "desktop.capture"], json!({"type": "object", "required": ["target", "locator"], "properties": {"target": target_schema(), "locator": locator_schema()}, "additionalProperties": false}), json!({"type": "object", "required": ["format", "data", "width", "height", "clipped", "node_id", "provenance"], "properties": {"format": {"const": "png"}, "data": {"type": "string"}, "width": {"type": "integer", "minimum": 1}, "height": {"type": "integer", "minimum": 1}, "clipped": {"type": "boolean"}, "node_id": {"type": "string"}, "provenance": {"type": "object"}}, "additionalProperties": false}), false, true);
+    inline["errors"] = json!(error_contracts(false, true, true));
+    inline["sensitivity"] = json!({"input": "public", "output": "sensitive", "error": "public"});
+    actions.insert("capture".into(), inline);
     json!({"apiVersion": "ai-auto-desktop.dev/v1alpha1", "kind": "CapabilityManifest", "metadata": {"name": PROVIDER_NAME, "version": PROVIDER_VERSION, "description": "Linux 原生 AT-SPI 语义桌面驱动。"}, "actions": actions, "runtime": {"kind": "builtin", "protocol": "rust-provider-v1", "platforms": ["linux"]}})
 }
 
@@ -2031,6 +2261,8 @@ mod tests {
                     "pointer_click".into(),
                     "pointer_gesture".into(),
                     "key_chord".into(),
+                    "minimize".into(),
+                    "paste".into(),
                 ],
                 provenance: Map::from_iter([
                     ("bus_name".into(), json!(":1.42")),
@@ -2143,6 +2375,47 @@ mod tests {
             self.writes.fetch_add(1, Ordering::SeqCst);
             Ok(json!({"keys": keys}))
         }
+        fn window_action(
+            &self,
+            _target: &NativeRef,
+            action: &str,
+            bounds: Bounds,
+            process_id: u32,
+            _deadline: Instant,
+        ) -> Result<Value, AutomationError> {
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            Ok(json!({"action": action, "bounds": bounds.to_json(), "process_id": process_id}))
+        }
+        fn paste(
+            &self,
+            _target: &NativeRef,
+            text: &str,
+            _process_id: u32,
+            _deadline: Instant,
+        ) -> Result<Value, AutomationError> {
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            Ok(json!({"pasted": text}))
+        }
+        fn clipboard_text(
+            &self,
+            max_bytes: usize,
+            _deadline: Instant,
+        ) -> Result<Value, AutomationError> {
+            let text = "héllo world".repeat(4);
+            let cut = (0..=max_bytes.min(text.len()))
+                .rev()
+                .find(|at| text.is_char_boundary(*at))
+                .unwrap_or(0);
+            Ok(json!({"has_text": true, "text": &text[..cut], "truncated": text.len() > max_bytes}))
+        }
+        fn global_key(
+            &self,
+            keys: &[String],
+            _deadline: Instant,
+        ) -> Result<Value, AutomationError> {
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            Ok(json!({"keys": keys}))
+        }
         fn start_recording(
             &self,
             application: &Map<String, Value>,
@@ -2219,6 +2492,15 @@ mod tests {
             "snapshot",
             "find",
             "capture_target",
+            "capture",
+            "minimize",
+            "maximize",
+            "restore",
+            "close_window",
+            "activate",
+            "paste",
+            "clipboard_read",
+            "global_key",
             "focus",
             "invoke",
             "pointer_click",
@@ -2398,5 +2680,121 @@ mod tests {
         assert_eq!(result["frame"]["kind"], "ArtifactRef");
         assert!(result["frame"].get("path").is_none());
         assert!(!store.resolve(&result["frame"]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn window_actions_paste_clipboard_and_global_keys_are_validated_and_routed() {
+        let backend = Arc::new(FakeBackend::default());
+        let provider = AtspiProvider::new(backend.clone()).unwrap();
+        let call = |action: &str, extra: Value| {
+            let snapshot = take_snapshot(&provider);
+            let mut args = json!({"target": {"snapshot_id": snapshot["snapshot_id"], "revision": snapshot["revision"], "node_id": "n0"}, "locator": locator()});
+            args.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            provider.invoke(
+                &format!("desktop.linux_atspi.{action}@1"),
+                args,
+                Some(Duration::from_secs(2)),
+            )
+        };
+        let minimized = call("minimize", json!({})).unwrap();
+        assert_eq!(minimized["backend_result"]["action"], "minimize");
+        assert_eq!(minimized["backend_result"]["process_id"], 4242);
+        assert_eq!(
+            minimized["backend_result"]["bounds"],
+            json!({"x": 10, "y": 20, "width": 40, "height": 20})
+        );
+        // The node does not offer maximize, so it is refused before input.
+        assert_eq!(
+            call("maximize", json!({})).unwrap_err().code,
+            "DRIVER.ACTION_UNSUPPORTED"
+        );
+        let pasted = call("paste", json!({"text": "粘贴 text"})).unwrap();
+        assert_eq!(pasted["backend_result"]["pasted"], "粘贴 text");
+        for bad in [
+            json!({"text": ""}),
+            json!({"text": "x".repeat(4097)}),
+            json!({}),
+        ] {
+            assert!(call("paste", bad.clone()).is_err(), "{bad}");
+        }
+        assert_eq!(backend.writes.load(Ordering::SeqCst), 2);
+
+        let direct = |action: &str, args: Value| {
+            provider.invoke(
+                &format!("desktop.linux_atspi.{action}@1"),
+                args,
+                Some(Duration::from_secs(2)),
+            )
+        };
+        let read = direct("clipboard_read", json!({"max_characters": 5})).unwrap();
+        assert_eq!(read["text"], "héllo");
+        assert_eq!(read["truncated"], true);
+        let whole = direct("clipboard_read", json!({})).unwrap();
+        assert_eq!(whole["characters"], 44);
+        assert_eq!(whole["truncated"], false);
+        assert!(direct("clipboard_read", json!({"max_characters": 0})).is_err());
+        assert!(direct("clipboard_read", json!({"max_characters": 65_537})).is_err());
+
+        assert_eq!(
+            direct("global_key", json!({"keys": ["alt", "tab"]})).unwrap()["keys"],
+            json!(["alt", "tab"])
+        );
+        for reserved in [
+            json!(["ctrl", "alt", "backspace"]),
+            json!(["ctrl", "alt", "delete"]),
+            json!(["control", "alt", "l"]),
+            json!(["super", "l"]),
+            json!(["win", "L"]),
+        ] {
+            assert_eq!(
+                direct("global_key", json!({"keys": reserved}))
+                    .unwrap_err()
+                    .code,
+                "DRIVER.KEY_RESERVED"
+            );
+        }
+        assert!(direct("global_key", json!({"keys": ["ctrl", "a;b"]})).is_err());
+        assert_eq!(backend.writes.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn inline_capture_answers_a_png_and_keeps_the_observation_usable() {
+        let backend = Arc::new(FakeBackend::default());
+        let provider = AtspiProvider::new(backend.clone()).unwrap();
+        let snapshot = take_snapshot(&provider);
+        let target = json!({"snapshot_id": snapshot["snapshot_id"], "revision": snapshot["revision"], "node_id": "n0"});
+        let shot = provider
+            .invoke(
+                "desktop.linux_atspi.capture@1",
+                json!({"target": target, "locator": locator()}),
+                Some(Duration::from_secs(2)),
+            )
+            .unwrap();
+        assert_eq!(shot["format"], "png");
+        assert_eq!(
+            (shot["width"].clone(), shot["height"].clone()),
+            (json!(1), json!(1))
+        );
+        assert!(shot["data"]
+            .as_str()
+            .is_some_and(|data| data.starts_with("iVBOR")));
+        assert_eq!(shot["provenance"]["node_id"], "n0");
+        // The read did not replace the caller's snapshot.
+        provider
+            .invoke(
+                "desktop.linux_atspi.pointer_click@1",
+                json!({"target": target, "locator": locator()}),
+                Some(Duration::from_secs(2)),
+            )
+            .unwrap();
+        assert!(provider
+            .invoke(
+                "desktop.linux_atspi.capture@1",
+                json!({"target": target, "locator": locator(), "format": "png"}),
+                Some(Duration::from_secs(2)),
+            )
+            .is_err());
     }
 }

@@ -4,12 +4,13 @@ version = 3
 
 [[package]]
 name = "aad-atspi"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "aad-core",
  "aad-plugin",
  "aad-runtime",
  "atspi",
+ "base64 0.22.1",
  "libc",
  "serde_json",
  "sha2",
@@ -19,7 +20,7 @@ dependencies = [
 
 [[package]]
 name = "aad-cdp"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "base64 0.22.1",
  "clap",
@@ -34,7 +35,7 @@ dependencies = [
 
 [[package]]
 name = "aad-cli"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "aad-atspi",
  "aad-cdp",
@@ -63,26 +64,29 @@ dependencies = [
 
 [[package]]
 name = "aad-control"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "aad-atspi",
  "aad-cdp",
  "aad-core",
  "aad-macos-ax",
+ "aad-ocr",
  "aad-plugin",
  "aad-runtime",
  "aad-uia",
+ "base64 0.22.1",
  "fs2",
  "libc",
  "serde",
  "serde_json",
  "sha2",
  "uuid",
+ "windows 0.58.0",
 ]
 
 [[package]]
 name = "aad-core"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "indexmap 2.14.1",
  "serde",
@@ -93,7 +97,7 @@ dependencies = [
 
 [[package]]
 name = "aad-gui"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "aad-control",
  "aad-core",
@@ -107,7 +111,7 @@ dependencies = [
 
 [[package]]
 name = "aad-macos-ax"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "aad-core",
  "aad-plugin",
@@ -123,7 +127,7 @@ dependencies = [
 
 [[package]]
 name = "aad-mcp"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "aad-atspi",
  "aad-cdp",
@@ -141,7 +145,7 @@ dependencies = [
 
 [[package]]
 name = "aad-ocr"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "aad-core",
  "aad-plugin",
@@ -156,7 +160,7 @@ dependencies = [
 
 [[package]]
 name = "aad-plugin"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "aad-core",
  "serde",
@@ -168,7 +172,7 @@ dependencies = [
 
 [[package]]
 name = "aad-probe"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "aad-plugin",
  "libc",
@@ -180,7 +184,7 @@ dependencies = [
 
 [[package]]
 name = "aad-runtime"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "aad-core",
  "aad-plugin",
@@ -196,11 +200,13 @@ dependencies = [
 
 [[package]]
 name = "aad-uia"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "aad-core",
  "aad-plugin",
  "aad-runtime",
+ "base64 0.22.1",
+ "image",
  "serde",
  "serde_json",
  "sha2",

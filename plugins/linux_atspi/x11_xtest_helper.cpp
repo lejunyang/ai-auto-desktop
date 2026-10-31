@@ -20,7 +20,9 @@
 #include <poll.h>
 #include <string>
 #include <string_view>
+#include <fcntl.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 #include <vector>
 
@@ -836,6 +838,1206 @@ int RunRecordInput(int argc, char **argv) {
     return 0;
 }
 
+// ---------------------------------------------------------------------------
+// Windows, the clipboard and global keys.
+//
+// window-info / window-action find the one top-level client window of the
+// expected process whose root geometry is the observed AT-SPI frame, and use
+// EWMH/ICCCM requests to the window manager; an action waits (bounded) until
+// the window manager reports the state it asked for. clipboard-read reads the
+// CLIPBOARD selection's text. paste owns CLIPBOARD with the given text, serves
+// it only to the expected process after Ctrl+V, then hands the previous
+// contents to a short-lived restorer. global-key presses a chord on whatever
+// has focus, anchored on nothing.
+// ---------------------------------------------------------------------------
+
+constexpr int kExitTooLarge = 76;
+constexpr int kExitProtected = 77;
+constexpr std::size_t kMaxPasteBytes = 16 * 1024;
+constexpr std::size_t kMaxSavedClipboardBytes = 32 * 1024 * 1024;
+
+std::string JsonString(const std::string &raw) {
+    // Invalid UTF-8 becomes U+FFFD so the reader always gets valid JSON.
+    std::string out = "\"";
+    std::size_t index = 0;
+    while (index < raw.size()) {
+        const auto first = static_cast<unsigned char>(raw[index]);
+        std::size_t width = first < 0x80 ? 1
+                            : (first >= 0xc2 && first <= 0xdf) ? 2
+                            : (first >= 0xe0 && first <= 0xef) ? 3
+                            : (first >= 0xf0 && first <= 0xf4) ? 4
+                                                               : 0;
+        bool valid = width != 0 && index + width <= raw.size();
+        for (std::size_t offset = 1; valid && offset < width; ++offset) {
+            valid = (static_cast<unsigned char>(raw[index + offset]) & 0xc0) == 0x80;
+        }
+        if (!valid) {
+            out += "\\ufffd";
+            ++index;
+            continue;
+        }
+        if (width == 1) {
+            const char item = raw[index];
+            if (item == '"' || item == '\\') {
+                out += '\\';
+                out += item;
+            } else if (first < 0x20 || first == 0x7f) {
+                static const char *hex = "0123456789abcdef";
+                out += "\\u00";
+                out += hex[first >> 4];
+                out += hex[first & 0xf];
+            } else {
+                out += item;
+            }
+        } else {
+            out.append(raw, index, width);
+        }
+        index += width;
+    }
+    out += "\"";
+    return out;
+}
+
+std::optional<std::string> ReadStdin(std::size_t limit) {
+    std::string input;
+    char buffer[1024];
+    while (std::cin.good()) {
+        std::cin.read(buffer, sizeof(buffer));
+        const std::streamsize count = std::cin.gcount();
+        if (count > 0) {
+            input.append(buffer, static_cast<std::size_t>(count));
+            if (input.size() > limit) {
+                return std::nullopt;
+            }
+        }
+    }
+    return input;
+}
+
+std::vector<Atom> AtomList(Display *display, Window window, Atom property) {
+    std::vector<Atom> result;
+    Atom actual_type = None;
+    int actual_format = 0;
+    unsigned long count = 0;
+    unsigned long bytes_after = 0;
+    unsigned char *data = nullptr;
+    g_x_error = false;
+    const int status = XGetWindowProperty(display, window, property, 0, 4096, False, XA_ATOM,
+                                          &actual_type, &actual_format, &count, &bytes_after,
+                                          &data);
+    XSync(display, False);
+    if (!g_x_error && status == Success && actual_type == XA_ATOM && actual_format == 32 &&
+        data != nullptr) {
+        const auto *atoms = reinterpret_cast<Atom *>(data);
+        result.assign(atoms, atoms + count);
+    }
+    if (data != nullptr) {
+        XFree(data);
+    }
+    return result;
+}
+
+std::optional<Window> WindowProperty(Display *display, Window window, Atom property) {
+    Atom actual_type = None;
+    int actual_format = 0;
+    unsigned long count = 0;
+    unsigned long bytes_after = 0;
+    unsigned char *data = nullptr;
+    g_x_error = false;
+    const int status = XGetWindowProperty(display, window, property, 0, 1, False, XA_WINDOW,
+                                          &actual_type, &actual_format, &count, &bytes_after,
+                                          &data);
+    XSync(display, False);
+    std::optional<Window> result;
+    if (!g_x_error && status == Success && actual_type == XA_WINDOW && actual_format == 32 &&
+        count == 1 && data != nullptr) {
+        result = *reinterpret_cast<Window *>(data);
+    }
+    if (data != nullptr) {
+        XFree(data);
+    }
+    return result;
+}
+
+bool Contains(const std::vector<Atom> &atoms, Atom wanted) {
+    return wanted != None && std::find(atoms.begin(), atoms.end(), wanted) != atoms.end();
+}
+
+struct Ewmh {
+    Display *display = nullptr;
+    Window root = None;
+    bool present = false;
+    std::vector<Atom> supported;
+    Atom pid = None, wm_state = None, net_wm_state = None, hidden = None, max_vert = None,
+         max_horz = None, active = None, close = None, client_list = None, wm_change_state = None;
+};
+
+Ewmh LoadEwmh(Display *display) {
+    Ewmh ewmh;
+    ewmh.display = display;
+    ewmh.root = DefaultRootWindow(display);
+    auto atom = [&](const char *name) { return XInternAtom(display, name, False); };
+    ewmh.pid = atom("_NET_WM_PID");
+    ewmh.wm_state = atom("WM_STATE");
+    ewmh.net_wm_state = atom("_NET_WM_STATE");
+    ewmh.hidden = atom("_NET_WM_STATE_HIDDEN");
+    ewmh.max_vert = atom("_NET_WM_STATE_MAXIMIZED_VERT");
+    ewmh.max_horz = atom("_NET_WM_STATE_MAXIMIZED_HORZ");
+    ewmh.active = atom("_NET_ACTIVE_WINDOW");
+    ewmh.close = atom("_NET_CLOSE_WINDOW");
+    ewmh.client_list = atom("_NET_CLIENT_LIST");
+    ewmh.wm_change_state = atom("WM_CHANGE_STATE");
+    // A compliant window manager names a child window that repeats the property.
+    const Atom check = atom("_NET_SUPPORTING_WM_CHECK");
+    const auto wm = WindowProperty(display, ewmh.root, check);
+    if (wm.has_value()) {
+        const auto again = WindowProperty(display, wm.value(), check);
+        ewmh.present = again.has_value() && again.value() == wm.value();
+    }
+    if (ewmh.present) {
+        ewmh.supported = AtomList(display, ewmh.root, atom("_NET_SUPPORTED"));
+    }
+    return ewmh;
+}
+
+std::optional<unsigned long> OwnPid(Display *display, Window window, Atom pid_atom) {
+    Atom actual_type = None;
+    int actual_format = 0;
+    unsigned long count = 0;
+    unsigned long bytes_after = 0;
+    unsigned char *data = nullptr;
+    g_x_error = false;
+    const int status = XGetWindowProperty(display, window, pid_atom, 0, 1, False, XA_CARDINAL,
+                                          &actual_type, &actual_format, &count, &bytes_after,
+                                          &data);
+    XSync(display, False);
+    std::optional<unsigned long> result;
+    if (!g_x_error && status == Success && actual_type == XA_CARDINAL && actual_format == 32 &&
+        count == 1 && data != nullptr) {
+        result = *reinterpret_cast<unsigned long *>(data);
+    }
+    if (data != nullptr) {
+        XFree(data);
+    }
+    return result;
+}
+
+// ICCCM WM_STATE: 1 normal, 3 iconic; nullopt when the window is unmanaged.
+std::optional<long> IcccmState(const Ewmh &ewmh, Window window) {
+    Atom actual_type = None;
+    int actual_format = 0;
+    unsigned long count = 0;
+    unsigned long bytes_after = 0;
+    unsigned char *data = nullptr;
+    g_x_error = false;
+    const int status = XGetWindowProperty(ewmh.display, window, ewmh.wm_state, 0, 2, False,
+                                          ewmh.wm_state, &actual_type, &actual_format, &count,
+                                          &bytes_after, &data);
+    XSync(ewmh.display, False);
+    std::optional<long> result;
+    if (!g_x_error && status == Success && actual_format == 32 && count >= 1 && data != nullptr) {
+        result = *reinterpret_cast<long *>(data);
+    }
+    if (data != nullptr) {
+        XFree(data);
+    }
+    return result;
+}
+
+void CollectClients(Display *display, Window window, int depth, std::vector<Window> *out) {
+    Window root = None;
+    Window parent = None;
+    Window *children = nullptr;
+    unsigned int count = 0;
+    g_x_error = false;
+    const Status status = XQueryTree(display, window, &root, &parent, &children, &count);
+    XSync(display, False);
+    if (!status || g_x_error) {
+        return;
+    }
+    for (unsigned int index = 0; index < count && out->size() < 4096; ++index) {
+        out->push_back(children[index]);
+        if (depth < 3) {
+            CollectClients(display, children[index], depth + 1, out);
+        }
+    }
+    if (children != nullptr) {
+        XFree(children);
+    }
+}
+
+struct Geometry {
+    int x = 0, y = 0, width = 0, height = 0;
+};
+
+std::optional<Geometry> RootGeometry(Display *display, Window window) {
+    XWindowAttributes attributes{};
+    g_x_error = false;
+    if (!XGetWindowAttributes(display, window, &attributes) || g_x_error) {
+        return std::nullopt;
+    }
+    int x = 0;
+    int y = 0;
+    Window child = None;
+    if (!XTranslateCoordinates(display, window, DefaultRootWindow(display), 0, 0, &x, &y,
+                               &child)) {
+        return std::nullopt;
+    }
+    XSync(display, False);
+    if (g_x_error) {
+        return std::nullopt;
+    }
+    return Geometry{x, y, attributes.width, attributes.height};
+}
+
+bool Exists(Display *display, Window window) {
+    XWindowAttributes attributes{};
+    g_x_error = false;
+    const Status status = XGetWindowAttributes(display, window, &attributes);
+    XSync(display, False);
+    return status && !g_x_error;
+}
+
+// The one top-level client window of `pid` at `want` (the AT-SPI frame's
+// screen extents). With a single client window of that process its geometry
+// may be stale (e.g. while minimized), so it is accepted alone.
+std::optional<Window> FindClientWindow(const Ewmh &ewmh, unsigned long pid, const Geometry &want,
+                                       std::string *problem) {
+    std::vector<Window> all;
+    if (ewmh.present) {
+        Atom actual_type = None;
+        int actual_format = 0;
+        unsigned long count = 0;
+        unsigned long bytes_after = 0;
+        unsigned char *data = nullptr;
+        g_x_error = false;
+        if (XGetWindowProperty(ewmh.display, ewmh.root, ewmh.client_list, 0, 4096, False,
+                               XA_WINDOW, &actual_type, &actual_format, &count, &bytes_after,
+                               &data) == Success &&
+            actual_type == XA_WINDOW && actual_format == 32 && data != nullptr) {
+            const auto *windows = reinterpret_cast<Window *>(data);
+            all.assign(windows, windows + count);
+        }
+        if (data != nullptr) {
+            XFree(data);
+        }
+        XSync(ewmh.display, False);
+    }
+    if (all.empty()) {
+        CollectClients(ewmh.display, ewmh.root, 0, &all);
+    }
+    std::vector<Window> owned;
+    for (const Window window : all) {
+        if (OwnPid(ewmh.display, window, ewmh.pid) != pid) {
+            continue;
+        }
+        XWindowAttributes attributes{};
+        g_x_error = false;
+        if (!XGetWindowAttributes(ewmh.display, window, &attributes) || g_x_error ||
+            attributes.override_redirect || attributes.c_class != InputOutput) {
+            continue;
+        }
+        const bool managed = IcccmState(ewmh, window).has_value();
+        if (!managed && attributes.map_state != IsViewable) {
+            continue;
+        }
+        owned.push_back(window);
+    }
+    std::vector<Window> exact;
+    for (const Window window : owned) {
+        const auto geometry = RootGeometry(ewmh.display, window);
+        if (geometry.has_value() && std::abs(geometry->x - want.x) <= 2 &&
+            std::abs(geometry->y - want.y) <= 2 && geometry->width == want.width &&
+            geometry->height == want.height) {
+            exact.push_back(window);
+        }
+    }
+    if (exact.size() == 1) {
+        return exact[0];
+    }
+    if (exact.empty() && owned.size() == 1) {
+        return owned[0];
+    }
+    *problem = owned.empty() ? "window_not_found" : "window_ambiguous";
+    return std::nullopt;
+}
+
+struct WindowState {
+    bool exists = false, minimized = false, maximized = false, active = false;
+};
+
+WindowState ReadWindowState(const Ewmh &ewmh, Window window) {
+    WindowState state;
+    state.exists = Exists(ewmh.display, window);
+    if (!state.exists) {
+        return state;
+    }
+    const auto atoms = AtomList(ewmh.display, window, ewmh.net_wm_state);
+    const auto icccm = IcccmState(ewmh, window);
+    state.minimized = Contains(atoms, ewmh.hidden) || (icccm.has_value() && icccm.value() == 3);
+    state.maximized = Contains(atoms, ewmh.max_vert) && Contains(atoms, ewmh.max_horz);
+    const auto active = WindowProperty(ewmh.display, ewmh.root, ewmh.active);
+    state.active = active.has_value() && active.value() == window;
+    return state;
+}
+
+std::string StateJson(const WindowState &state) {
+    std::string out = "\"exists\":";
+    out += state.exists ? "true" : "false";
+    out += ",\"minimized\":";
+    out += state.minimized ? "true" : "false";
+    out += ",\"maximized\":";
+    out += state.maximized ? "true" : "false";
+    out += ",\"active\":";
+    out += state.active ? "true" : "false";
+    return out;
+}
+
+void SendRootMessage(const Ewmh &ewmh, Window window, Atom type, long l0, long l1, long l2) {
+    XEvent event{};
+    event.xclient.type = ClientMessage;
+    event.xclient.window = window;
+    event.xclient.message_type = type;
+    event.xclient.format = 32;
+    event.xclient.data.l[0] = l0;
+    event.xclient.data.l[1] = l1;
+    event.xclient.data.l[2] = l2;
+    event.xclient.data.l[3] = 1;  // source indication: a normal application
+    XSendEvent(ewmh.display, ewmh.root, False, SubstructureRedirectMask | SubstructureNotifyMask,
+               &event);
+}
+
+struct WindowArgs {
+    std::uint64_t pid = 0;
+    std::uint64_t deadline_ns = 0;
+    Geometry geometry;
+    std::string action;
+};
+
+std::optional<WindowArgs> ParseWindowArgs(int argc, char **argv, bool action) {
+    std::vector<std::string_view> allowed = {"expected-pid", "x", "y", "width", "height",
+                                             "deadline-monotonic-ns"};
+    if (action) {
+        allowed.push_back("action");
+    }
+    const auto pairs = ParsePairs(argc, argv, allowed);
+    if (!pairs.has_value() || pairs->size() != allowed.size()) {
+        return std::nullopt;
+    }
+    WindowArgs parsed;
+    const auto pid = ParseUnsigned(Pair(*pairs, "expected-pid").value_or(""));
+    const auto deadline = ParseUnsigned(Pair(*pairs, "deadline-monotonic-ns").value_or(""));
+    if (!pid.has_value() || pid.value() == 0 || pid.value() > static_cast<std::uint64_t>(INT_MAX) ||
+        !deadline.has_value() ||
+        !ParseInt(Pair(*pairs, "x").value_or(""), &parsed.geometry.x) ||
+        !ParseInt(Pair(*pairs, "y").value_or(""), &parsed.geometry.y) ||
+        !ParseInt(Pair(*pairs, "width").value_or(""), &parsed.geometry.width) ||
+        !ParseInt(Pair(*pairs, "height").value_or(""), &parsed.geometry.height) ||
+        parsed.geometry.width <= 0 || parsed.geometry.height <= 0) {
+        return std::nullopt;
+    }
+    parsed.pid = pid.value();
+    parsed.deadline_ns = deadline.value();
+    if (action) {
+        parsed.action = Pair(*pairs, "action").value_or("");
+        if (parsed.action != "minimize" && parsed.action != "maximize" &&
+            parsed.action != "restore" && parsed.action != "close" &&
+            parsed.action != "activate") {
+            return std::nullopt;
+        }
+    }
+    return parsed;
+}
+
+// Shared by every new command: the qualified session and an open display.
+Display *OpenQualifiedDisplay(std::optional<std::uint64_t> pid, int *exit_code) {
+    if (!SessionIsQualified()) {
+        EmitError("unsupported_session", "session_preflight", false);
+        *exit_code = kExitUnavailable;
+        return nullptr;
+    }
+    if (pid.has_value() && !PidBelongsToCurrentUser(static_cast<unsigned long>(pid.value()))) {
+        EmitError("untrusted_process", "target_preflight", false);
+        *exit_code = kExitTargetMismatch;
+        return nullptr;
+    }
+    XSetErrorHandler(HandleXError);
+    Display *display = XOpenDisplay(nullptr);
+    if (display == nullptr) {
+        EmitError("display_unavailable", "x11_preflight", false);
+        *exit_code = kExitUnavailable;
+    }
+    return display;
+}
+
+int RunWindow(std::string_view command, int argc, char **argv) {
+    const bool action = command == "window-action";
+    const auto args = ParseWindowArgs(argc, argv, action);
+    if (!args.has_value()) {
+        EmitError("invalid_arguments", "arguments", false);
+        return kExitInvalid;
+    }
+    int exit_code = 0;
+    Display *display = OpenQualifiedDisplay(args->pid, &exit_code);
+    if (display == nullptr) {
+        return exit_code;
+    }
+    const Ewmh ewmh = LoadEwmh(display);
+    std::string problem;
+    const auto window = FindClientWindow(ewmh, static_cast<unsigned long>(args->pid),
+                                         args->geometry, &problem);
+    if (!window.has_value()) {
+        XCloseDisplay(display);
+        EmitError(problem, "target_preflight", false);
+        return kExitTargetMismatch;
+    }
+    const WindowState before = ReadWindowState(ewmh, window.value());
+    const bool maximize = Contains(ewmh.supported, ewmh.net_wm_state) &&
+                          Contains(ewmh.supported, ewmh.max_vert) &&
+                          Contains(ewmh.supported, ewmh.max_horz);
+    const bool activate = Contains(ewmh.supported, ewmh.active);
+    const bool close = Contains(ewmh.supported, ewmh.close);
+    if (!action) {
+        std::cout << "{\"ok\":true,\"window\":" << window.value()
+                  << ",\"ewmh\":" << (ewmh.present ? "true" : "false")
+                  << ",\"supports\":{\"minimize\":" << (ewmh.present ? "true" : "false")
+                  << ",\"maximize\":" << (maximize ? "true" : "false")
+                  << ",\"activate\":" << (activate ? "true" : "false")
+                  << ",\"close\":" << (close ? "true" : "false") << "}," << StateJson(before)
+                  << "}" << std::endl;
+        XCloseDisplay(display);
+        return 0;
+    }
+    const std::string &name = args->action;
+    const bool supported = ewmh.present && (name == "minimize" || (name == "maximize" && maximize) ||
+                                            (name == "activate" && activate) ||
+                                            (name == "close" && close) ||
+                                            (name == "restore" && (activate || maximize)));
+    if (!supported) {
+        XCloseDisplay(display);
+        EmitError("window_manager_unsupported", "target_preflight", false);
+        return kExitUnavailable;
+    }
+    if (DeadlineExpired(args->deadline_ns)) {
+        XCloseDisplay(display);
+        EmitError("deadline_exceeded", "pre_dispatch", false);
+        return kExitTimeoutBeforeDispatch;
+    }
+    std::cout << "{\"event\":\"dispatch_started\"}" << std::endl;
+    g_x_error = false;
+    const Window target = window.value();
+    bool restoring_minimized = false;
+    if (name == "minimize") {
+        XIconifyWindow(display, target, DefaultScreen(display));
+    } else if (name == "maximize") {
+        SendRootMessage(ewmh, target, ewmh.net_wm_state, 1, static_cast<long>(ewmh.max_vert),
+                        static_cast<long>(ewmh.max_horz));
+    } else if (name == "restore") {
+        if (before.minimized) {
+            restoring_minimized = true;
+            if (activate) {
+                SendRootMessage(ewmh, target, ewmh.active, 1, CurrentTime, 0);
+            } else {
+                XMapRaised(display, target);
+            }
+        } else {
+            SendRootMessage(ewmh, target, ewmh.net_wm_state, 0, static_cast<long>(ewmh.max_vert),
+                            static_cast<long>(ewmh.max_horz));
+        }
+    } else if (name == "close") {
+        SendRootMessage(ewmh, target, ewmh.close, CurrentTime, 2, 0);
+    } else {
+        SendRootMessage(ewmh, target, ewmh.active, 1, CurrentTime, 0);
+    }
+    XSync(display, False);
+    const bool send_error = g_x_error;
+    // Wait (bounded) until the window manager reports the requested state.
+    const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    WindowState after = before;
+    bool reached = false;
+    while (!send_error) {
+        after = ReadWindowState(ewmh, target);
+        if (name == "minimize") {
+            reached = after.minimized;
+        } else if (name == "maximize") {
+            reached = after.maximized;
+        } else if (name == "restore") {
+            reached = after.exists &&
+                      (restoring_minimized ? !after.minimized : !after.maximized);
+        } else if (name == "close") {
+            XWindowAttributes attributes{};
+            g_x_error = false;
+            const bool alive = XGetWindowAttributes(display, target, &attributes) && !g_x_error;
+            reached = !alive || (attributes.map_state == IsUnmapped && !after.minimized);
+        } else {
+            reached = after.active;
+        }
+        if (reached || DeadlineExpired(args->deadline_ns) ||
+            std::chrono::steady_clock::now() >= until) {
+            break;
+        }
+        usleep(20'000);
+    }
+    XCloseDisplay(display);
+    if (send_error) {
+        EmitError("x11_error", "window_dispatch", true);
+        return kExitUnknownEffect;
+    }
+    std::cout << "{\"ok\":true,\"dispatch_started\":true,\"events\":1,\"window\":" << target
+              << ",\"action\":\"" << name << "\",\"reached\":" << (reached ? "true" : "false")
+              << "," << StateJson(after) << "}" << std::endl;
+    return 0;
+}
+
+// --- selections ------------------------------------------------------------
+
+struct Selection {
+    Display *display = nullptr;
+    Window window = None;
+    Atom clipboard = None, targets = None, utf8 = None, incr = None, property = None,
+         text = None, plain_utf8 = None, plain = None, multiple = None, timestamp = None,
+         password_hint = None;
+};
+
+Selection OpenSelection(Display *display) {
+    Selection selection;
+    selection.display = display;
+    selection.window =
+        XCreateSimpleWindow(display, DefaultRootWindow(display), -10, -10, 1, 1, 0, 0, 0);
+    XSelectInput(display, selection.window, PropertyChangeMask);
+    auto atom = [&](const char *name) { return XInternAtom(display, name, False); };
+    selection.clipboard = atom("CLIPBOARD");
+    selection.targets = atom("TARGETS");
+    selection.utf8 = atom("UTF8_STRING");
+    selection.incr = atom("INCR");
+    selection.property = atom("AAD_SELECTION");
+    selection.text = atom("TEXT");
+    selection.plain_utf8 = atom("text/plain;charset=utf-8");
+    selection.plain = atom("text/plain");
+    selection.multiple = atom("MULTIPLE");
+    selection.timestamp = atom("TIMESTAMP");
+    // KDE's (and KeePassXC's) marker for content a clipboard manager must not keep.
+    selection.password_hint = atom("x-kde-passwordManagerHint");
+    return selection;
+}
+
+// Wait for one event of `type` on our window, polling the connection.
+bool WaitEvent(Display *display, Window window, int type, XEvent *event,
+               std::uint64_t deadline_ns, int max_ms) {
+    const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(max_ms);
+    while (!DeadlineExpired(deadline_ns) && std::chrono::steady_clock::now() < until) {
+        if (XCheckTypedWindowEvent(display, window, type, event)) {
+            return true;
+        }
+        pollfd fds[1] = {{ConnectionNumber(display), POLLIN, 0}};
+        poll(fds, 1, 10);
+    }
+    return false;
+}
+
+struct Converted {
+    Atom type = None;
+    int format = 8;
+    std::string bytes;
+    bool truncated = false;
+    bool incremental = false;
+};
+
+std::optional<Converted> Convert(const Selection &selection, Atom target, std::size_t limit,
+                                 std::uint64_t deadline_ns) {
+    XDeleteProperty(selection.display, selection.window, selection.property);
+    XConvertSelection(selection.display, selection.clipboard, target, selection.property,
+                      selection.window, CurrentTime);
+    XFlush(selection.display);
+    XEvent event{};
+    if (!WaitEvent(selection.display, selection.window, SelectionNotify, &event, deadline_ns,
+                   2000) ||
+        event.xselection.property == None) {
+        return std::nullopt;
+    }
+    Converted converted;
+    Atom actual_type = None;
+    int actual_format = 0;
+    unsigned long count = 0;
+    unsigned long bytes_after = 0;
+    unsigned char *data = nullptr;
+    g_x_error = false;
+    const long longs = static_cast<long>(limit / 4 + 1);
+    const int status = XGetWindowProperty(selection.display, selection.window, selection.property,
+                                          0, longs, True, AnyPropertyType, &actual_type,
+                                          &actual_format, &count, &bytes_after, &data);
+    XSync(selection.display, False);
+    if (g_x_error || status != Success) {
+        if (data != nullptr) XFree(data);
+        return std::nullopt;
+    }
+    converted.type = actual_type;
+    converted.format = actual_format;
+    if (actual_type == selection.incr) {
+        converted.incremental = true;
+    } else if (data != nullptr) {
+        const std::size_t unit = actual_format == 32 ? sizeof(long)
+                                 : actual_format == 16 ? sizeof(short)
+                                                       : 1;
+        converted.bytes.assign(reinterpret_cast<char *>(data), count * unit);
+        converted.truncated = bytes_after > 0;
+    }
+    if (data != nullptr) {
+        XFree(data);
+    }
+    return converted;
+}
+
+std::vector<Atom> TargetsOf(const Selection &selection, std::uint64_t deadline_ns) {
+    std::vector<Atom> result;
+    const auto converted = Convert(selection, selection.targets, 64 * 1024, deadline_ns);
+    if (converted.has_value() && converted->format == 32 && !converted->incremental) {
+        const auto *atoms = reinterpret_cast<const Atom *>(converted->bytes.data());
+        result.assign(atoms, atoms + converted->bytes.size() / sizeof(Atom));
+    }
+    return result;
+}
+
+std::string Latin1ToUtf8(const std::string &latin1) {
+    std::string out;
+    for (const char item : latin1) {
+        const auto code = static_cast<unsigned char>(item);
+        if (code < 0x80) {
+            out += item;
+        } else {
+            out += static_cast<char>(0xc0 | (code >> 6));
+            out += static_cast<char>(0x80 | (code & 0x3f));
+        }
+    }
+    return out;
+}
+
+// `--<name> N --deadline-monotonic-ns D`, both required; N in 1..maximum.
+bool ParseLimitAndDeadline(int argc, char **argv, std::string_view name, std::uint64_t maximum,
+                           std::uint64_t *value, std::uint64_t *deadline) {
+    const auto pairs = ParsePairs(argc, argv, {name, "deadline-monotonic-ns"});
+    if (!pairs.has_value() || pairs->size() != 2) {
+        return false;
+    }
+    const auto parsed = ParseUnsigned(Pair(*pairs, name).value_or(""));
+    const auto until = ParseUnsigned(Pair(*pairs, "deadline-monotonic-ns").value_or(""));
+    if (!parsed.has_value() || !until.has_value() || parsed.value() < 1 ||
+        parsed.value() > maximum) {
+        return false;
+    }
+    *value = parsed.value();
+    *deadline = until.value();
+    return true;
+}
+
+int RunClipboardRead(int argc, char **argv) {
+    std::uint64_t limit_value = 0;
+    std::uint64_t deadline_value = 0;
+    if (!ParseLimitAndDeadline(argc, argv, "max-bytes", 1u << 20, &limit_value,
+                               &deadline_value)) {
+        EmitError("invalid_arguments", "arguments", false);
+        return kExitInvalid;
+    }
+    const std::optional<std::size_t> limit = static_cast<std::size_t>(limit_value);
+    const std::optional<std::uint64_t> deadline = deadline_value;
+    int exit_code = 0;
+    Display *display = OpenQualifiedDisplay(std::nullopt, &exit_code);
+    if (display == nullptr) {
+        return exit_code;
+    }
+    const Selection selection = OpenSelection(display);
+    auto finish = [&](const std::string &line, int code) {
+        XDestroyWindow(display, selection.window);
+        XCloseDisplay(display);
+        std::cout << line << std::endl;
+        return code;
+    };
+    if (XGetSelectionOwner(display, selection.clipboard) == None) {
+        return finish("{\"ok\":true,\"has_text\":false,\"text\":\"\",\"truncated\":false}", 0);
+    }
+    const auto targets = TargetsOf(selection, deadline.value());
+    if (Contains(targets, selection.password_hint)) {
+        return finish("{\"ok\":false,\"code\":\"clipboard_protected\",\"phase\":\"read\","
+                      "\"dispatch_started\":false}",
+                      kExitProtected);
+    }
+    const bool utf8 = targets.empty() || Contains(targets, selection.utf8);
+    const auto converted =
+        Convert(selection, utf8 ? selection.utf8 : XA_STRING, limit.value(), deadline.value());
+    if (!converted.has_value() || converted->format != 8) {
+        if (DeadlineExpired(deadline.value())) {
+            return finish("{\"ok\":false,\"code\":\"deadline_exceeded\",\"phase\":\"read\","
+                          "\"dispatch_started\":false}",
+                          kExitTimeoutBeforeDispatch);
+        }
+        return finish("{\"ok\":true,\"has_text\":false,\"text\":\"\",\"truncated\":false}", 0);
+    }
+    if (converted->incremental) {
+        return finish("{\"ok\":false,\"code\":\"clipboard_too_large\",\"phase\":\"read\","
+                      "\"dispatch_started\":false}",
+                      kExitTooLarge);
+    }
+    const std::string text = utf8 ? converted->bytes : Latin1ToUtf8(converted->bytes);
+    return finish(std::string("{\"ok\":true,\"has_text\":true,\"text\":") + JsonString(text) +
+                      ",\"truncated\":" + (converted->truncated ? "true" : "false") + "}",
+                  0);
+}
+
+// A server timestamp for selection ownership (ICCCM forbids CurrentTime).
+Time ServerTime(const Selection &selection) {
+    const Atom stamp = XInternAtom(selection.display, "AAD_TIMESTAMP", False);
+    unsigned char zero = 0;
+    XChangeProperty(selection.display, selection.window, stamp, XA_STRING, 8, PropModeAppend,
+                    &zero, 0);
+    XFlush(selection.display);
+    XEvent event{};
+    if (WaitEvent(selection.display, selection.window, PropertyNotify, &event,
+                  std::numeric_limits<std::uint64_t>::max(), 1000)) {
+        return event.xproperty.time;
+    }
+    return CurrentTime;
+}
+
+struct Item {
+    Atom target = None;
+    Atom type = None;
+    int format = 8;
+    std::string bytes;
+};
+
+void Reply(Display *display, const XSelectionRequestEvent &request, Atom property) {
+    XEvent reply{};
+    reply.xselection.type = SelectionNotify;
+    reply.xselection.display = display;
+    reply.xselection.requestor = request.requestor;
+    reply.xselection.selection = request.selection;
+    reply.xselection.target = request.target;
+    reply.xselection.property = property;
+    reply.xselection.time = request.time;
+    g_x_error = false;
+    XSendEvent(display, request.requestor, False, 0, &reply);
+    XSync(display, False);
+}
+
+// Answer one request from `items`; returns whether a non-TARGETS item was given.
+bool Serve(const Selection &selection, const XSelectionRequestEvent &request,
+           const std::vector<Item> &items) {
+    const Atom property = request.property == None ? request.target : request.property;
+    g_x_error = false;
+    if (request.target == selection.targets) {
+        std::vector<Atom> atoms = {selection.targets};
+        for (const auto &item : items) {
+            atoms.push_back(item.target);
+        }
+        XChangeProperty(selection.display, request.requestor, property, XA_ATOM, 32,
+                        PropModeReplace, reinterpret_cast<unsigned char *>(atoms.data()),
+                        static_cast<int>(atoms.size()));
+        Reply(selection.display, request, g_x_error ? None : property);
+        return false;
+    }
+    for (const auto &item : items) {
+        if (item.target != request.target) {
+            continue;
+        }
+        const std::size_t unit = item.format == 32 ? sizeof(long)
+                                 : item.format == 16 ? sizeof(short)
+                                                     : 1;
+        XChangeProperty(selection.display, request.requestor, property, item.type, item.format,
+                        PropModeReplace,
+                        reinterpret_cast<const unsigned char *>(item.bytes.data()),
+                        static_cast<int>(item.bytes.size() / unit));
+        XSync(selection.display, False);
+        const bool ok = !g_x_error;
+        Reply(selection.display, request, ok ? property : None);
+        return ok;
+    }
+    Reply(selection.display, request, None);
+    return false;
+}
+
+// The previous clipboard's contents, as many targets as fit in one request
+// each; nullopt (with *problem) when they cannot all be kept.
+std::optional<std::vector<Item>> SaveClipboard(const Selection &selection,
+                                               std::uint64_t deadline_ns, std::string *problem) {
+    std::vector<Item> saved;
+    const std::size_t max_request =
+        static_cast<std::size_t>(XExtendedMaxRequestSize(selection.display) != 0
+                                     ? XExtendedMaxRequestSize(selection.display)
+                                     : XMaxRequestSize(selection.display)) *
+            4 -
+        256;
+    std::size_t total = 0;
+    for (const Atom target : TargetsOf(selection, deadline_ns)) {
+        if (target == selection.targets || target == selection.multiple ||
+            target == selection.timestamp || target == None) {
+            continue;
+        }
+        char *raw = XGetAtomName(selection.display, target);
+        const std::string name = raw == nullptr ? "" : raw;
+        if (raw != nullptr) XFree(raw);
+        if (name == "SAVE_TARGETS" || name == "DELETE" || name.rfind("INSERT_", 0) == 0) {
+            continue;
+        }
+        const auto converted = Convert(selection, target, max_request, deadline_ns);
+        if (!converted.has_value()) {
+            continue;
+        }
+        if (converted->incremental || converted->truncated) {
+            *problem = "clipboard_too_large";
+            return std::nullopt;
+        }
+        total += converted->bytes.size();
+        if (total > kMaxSavedClipboardBytes) {
+            *problem = "clipboard_too_large";
+            return std::nullopt;
+        }
+        saved.push_back({target, converted->type, converted->format, converted->bytes});
+    }
+    return saved;
+}
+
+// Own CLIPBOARD with the saved contents from a detached process until another
+// client takes it (or an hour passes), so the person's clipboard survives.
+bool StartRestorer(const std::vector<Item> &saved, int inherited_display_fd) {
+    int ready[2];
+    if (pipe(ready) != 0) {
+        return false;
+    }
+    const pid_t child = fork();
+    if (child < 0) {
+        close(ready[0]);
+        close(ready[1]);
+        return false;
+    }
+    if (child == 0) {
+        close(ready[0]);
+        if (fork() != 0) {
+            _exit(0);  // the grandchild is reparented and never waited for
+        }
+        // Never touch the parent's X connection; just let go of its socket.
+        close(inherited_display_fd);
+        const int null = open("/dev/null", O_RDWR);
+        if (null >= 0) {
+            dup2(null, 0);
+            dup2(null, 1);
+            dup2(null, 2);
+        }
+        Display *display = XOpenDisplay(nullptr);
+        if (display == nullptr) {
+            _exit(1);
+        }
+        const Selection selection = OpenSelection(display);
+        XSelectInput(display, selection.window, PropertyChangeMask);
+        const Time time = ServerTime(selection);
+        XSetSelectionOwner(display, selection.clipboard, selection.window, time);
+        const bool owned = XGetSelectionOwner(display, selection.clipboard) == selection.window;
+        const char signal = owned ? '1' : '0';
+        if (write(ready[1], &signal, 1) < 0) {
+            _exit(1);
+        }
+        close(ready[1]);
+        const auto until = std::chrono::steady_clock::now() + std::chrono::hours(1);
+        while (owned && std::chrono::steady_clock::now() < until) {
+            XEvent event{};
+            while (XPending(display) > 0) {
+                XNextEvent(display, &event);
+                if (event.type == SelectionClear) {
+                    _exit(0);
+                }
+                if (event.type == SelectionRequest) {
+                    Serve(selection, event.xselectionrequest, saved);
+                }
+            }
+            pollfd fds[1] = {{ConnectionNumber(display), POLLIN, 0}};
+            poll(fds, 1, 500);
+        }
+        _exit(0);
+    }
+    close(ready[1]);
+    int status = 0;
+    waitpid(child, &status, 0);
+    char signal = '0';
+    pollfd fds[1] = {{ready[0], POLLIN, 0}};
+    const bool answered = poll(fds, 1, 2000) > 0 && read(ready[0], &signal, 1) == 1;
+    close(ready[0]);
+    return answered && signal == '1';
+}
+
+std::optional<std::vector<KeyCode>> ChordCodes(Display *display,
+                                               const std::vector<std::string> &keys) {
+    std::vector<KeyCode> chord;
+    bool seen_main = false;
+    for (std::size_t index = 0; index < keys.size(); ++index) {
+        const KeySym symbol = KeyNamed(keys[index]);
+        const KeyCode code = symbol == NoSymbol ? 0 : XKeysymToKeycode(display, symbol);
+        const bool last = index + 1 == keys.size();
+        if (code == 0 || IsModifier(symbol) == last || seen_main) {
+            return std::nullopt;
+        }
+        seen_main = last;
+        chord.push_back(code);
+    }
+    return chord;
+}
+
+bool PressChord(Display *display, const std::vector<KeyCode> &chord) {
+    bool submitted = true;
+    g_x_error = false;
+    for (const KeyCode code : chord) {
+        submitted = XTestFakeKeyEvent(display, code, True, 1) != 0 && submitted;
+    }
+    for (auto code = chord.rbegin(); code != chord.rend(); ++code) {
+        submitted = XTestFakeKeyEvent(display, *code, False, 1) != 0 && submitted;
+    }
+    XSync(display, False);
+    return submitted && !g_x_error;
+}
+
+// The resource-id mask the server gave this connection. Every client gets the
+// same mask, and all of one client's windows share the bits outside it, so a
+// requestor window (Qt and GTK use an unnamed helper window without
+// _NET_WM_PID) is tied to the client that owns a window with the expected pid.
+// Xlib keeps base and mask in the documented-private display fields; they are
+// only trusted when our own window id is consistent with them.
+std::optional<XID> ResourceMask(Display *display, Window own_window) {
+    const auto *raw = reinterpret_cast<_XPrivDisplay>(display);
+    const XID base = raw->private3;
+    const XID mask = raw->private4;
+    if (mask == 0 || (base & mask) != 0 || (own_window & ~mask) != base) {
+        return std::nullopt;
+    }
+    return mask;
+}
+
+// Whether `requestor` belongs to the X client that owns `pid_window`.
+bool SameClient(Display *display, Window requestor, Window pid_window,
+                std::optional<XID> mask, unsigned long pid, Atom pid_atom) {
+    const auto owner = WindowPid(display, requestor, pid_atom);
+    if (owner.has_value()) {
+        return owner.value() == pid;
+    }
+    return mask.has_value() && pid_window != None &&
+           (requestor & ~mask.value()) == (pid_window & ~mask.value());
+}
+
+// The focused window's ancestor that carries the expected pid.
+Window FocusedPidWindow(Display *display, unsigned long pid, Atom pid_atom) {
+    Window focus = None;
+    int revert_to = 0;
+    XGetInputFocus(display, &focus, &revert_to);
+    Window current = focus;
+    for (int depth = 0; depth < 64 && current != None && current != PointerRoot; ++depth) {
+        if (OwnPid(display, current, pid_atom) == pid) {
+            return current;
+        }
+        Window root = None;
+        Window parent = None;
+        Window *children = nullptr;
+        unsigned int count = 0;
+        g_x_error = false;
+        const Status status = XQueryTree(display, current, &root, &parent, &children, &count);
+        XSync(display, False);
+        if (children != nullptr) {
+            XFree(children);
+        }
+        if (!status || g_x_error || parent == None || current == root) {
+            break;
+        }
+        current = parent;
+    }
+    return None;
+}
+
+int RunPaste(int argc, char **argv) {
+    std::uint64_t pid_value = 0;
+    std::uint64_t deadline_value = 0;
+    if (!ParseLimitAndDeadline(argc, argv, "expected-pid", static_cast<std::uint64_t>(INT_MAX),
+                               &pid_value, &deadline_value)) {
+        EmitError("invalid_arguments", "arguments", false);
+        return kExitInvalid;
+    }
+    const std::optional<std::uint64_t> pid = pid_value;
+    const std::optional<std::uint64_t> deadline = deadline_value;
+    const auto text = ReadStdin(kMaxPasteBytes);
+    if (!text.has_value() || text->empty() || !DecodeUtf8(*text).has_value()) {
+        EmitError("unsupported_text", "text_preflight", false);
+        return kExitUnsupportedText;
+    }
+    int exit_code = 0;
+    Display *display = OpenQualifiedDisplay(pid, &exit_code);
+    if (display == nullptr) {
+        return exit_code;
+    }
+    int event_base = 0, error_base = 0, major = 0, minor = 0;
+    const Atom pid_atom = XInternAtom(display, "_NET_WM_PID", True);
+    if (!XTestQueryExtension(display, &event_base, &error_base, &major, &minor) ||
+        pid_atom == None) {
+        XCloseDisplay(display);
+        EmitError("xtest_unavailable", "x11_preflight", false);
+        return kExitUnavailable;
+    }
+    const KeyCode control = XKeysymToKeycode(display, XK_Control_L);
+    const KeyCode v = XKeysymToKeycode(display, XK_v);
+    if (control == 0 || v == 0) {
+        XCloseDisplay(display);
+        EmitError("unsupported_key", "key_preflight", false);
+        return kExitInvalid;
+    }
+    const Selection selection = OpenSelection(display);
+    auto fail = [&](std::string_view code, std::string_view phase, bool dispatched,
+                    int pre_dispatch_exit) {
+        XDestroyWindow(display, selection.window);
+        XCloseDisplay(display);
+        EmitError(code, phase, dispatched);
+        return dispatched ? kExitUnknownEffect : pre_dispatch_exit;
+    };
+    // Keep what the person had before anything changes.
+    const bool had_owner = XGetSelectionOwner(display, selection.clipboard) != None;
+    std::vector<Item> saved;
+    if (had_owner) {
+        std::string problem;
+        const auto kept = SaveClipboard(selection, deadline.value(), &problem);
+        if (!kept.has_value()) {
+            return fail(problem, "clipboard_preflight", false, kExitTooLarge);
+        }
+        saved = kept.value();
+    }
+    const std::vector<Item> offer = {
+        {selection.utf8, selection.utf8, 8, *text},
+        {selection.plain_utf8, selection.plain_utf8, 8, *text},
+        {selection.text, selection.utf8, 8, *text},
+    };
+    const Time time = ServerTime(selection);
+    XSetSelectionOwner(display, selection.clipboard, selection.window, time);
+    if (XGetSelectionOwner(display, selection.clipboard) != selection.window) {
+        return fail("clipboard_busy", "clipboard_preflight", false, kExitUnavailable);
+    }
+    auto restore = [&]() -> std::string {
+        if (!had_owner) {
+            XSetSelectionOwner(display, selection.clipboard, None, CurrentTime);
+            XSync(display, False);
+            return "cleared";
+        }
+        if (saved.empty()) {
+            return "none";
+        }
+        return StartRestorer(saved, ConnectionNumber(display)) ? "restored" : "lost";
+    };
+    // The caller has just focused the element; give the focus change a moment.
+    const auto focus_until = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    while (!FocusBelongsToPid(display, static_cast<unsigned long>(pid.value()), pid_atom) &&
+           !DeadlineExpired(deadline.value()) &&
+           std::chrono::steady_clock::now() < focus_until) {
+        usleep(5000);
+    }
+    if (DeadlineExpired(deadline.value()) ||
+        !FocusBelongsToPid(display, static_cast<unsigned long>(pid.value()), pid_atom)) {
+        restore();
+        return fail("focus_owner_mismatch", "target_preflight", false, kExitTargetMismatch);
+    }
+    const Window pid_window =
+        FocusedPidWindow(display, static_cast<unsigned long>(pid.value()), pid_atom);
+    const auto mask = ResourceMask(display, selection.window);
+    std::cout << "{\"event\":\"dispatch_started\"}" << std::endl;
+    if (!PressChord(display, {control, v})) {
+        restore();
+        return fail("x11_error", "keyboard_dispatch", true, kExitUnknownEffect);
+    }
+    // Serve the text only to the expected process; wait (bounded) for it.
+    bool consumed = false;
+    bool lost = false;
+    const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!consumed && !lost && !DeadlineExpired(deadline.value()) &&
+           std::chrono::steady_clock::now() < until) {
+        while (XPending(display) > 0 && !consumed) {
+            XEvent event{};
+            XNextEvent(display, &event);
+            if (event.type == SelectionClear) {
+                lost = true;
+            } else if (event.type == SelectionRequest) {
+                const auto &request = event.xselectionrequest;
+                if (SameClient(display, request.requestor, pid_window, mask,
+                               static_cast<unsigned long>(pid.value()), pid_atom)) {
+                    consumed = Serve(selection, request, offer);
+                } else {
+                    Reply(display, request, None);
+                }
+            }
+        }
+        pollfd fds[1] = {{ConnectionNumber(display), POLLIN, 0}};
+        poll(fds, 1, 10);
+    }
+    // Let the target finish reading before the selection changes hands.
+    usleep(50'000);
+    const std::string restored = restore();
+    XDestroyWindow(display, selection.window);
+    XCloseDisplay(display);
+    std::cout << "{\"ok\":true,\"dispatch_started\":true,\"events\":4,\"consumed\":"
+              << (consumed ? "true" : "false") << ",\"restored\":\"" << restored << "\"}"
+              << std::endl;
+    return 0;
+}
+
+int RunGlobalKey(int argc, char **argv) {
+    const auto pairs = ParsePairs(argc, argv, {"keys", "deadline-monotonic-ns"});
+    if (!pairs.has_value() || pairs->size() != 2) {
+        EmitError("invalid_arguments", "arguments", false);
+        return kExitInvalid;
+    }
+    const std::string raw_keys = Pair(*pairs, "keys").value_or("");
+    const auto parsed_deadline =
+        ParseUnsigned(Pair(*pairs, "deadline-monotonic-ns").value_or(""));
+    if (!parsed_deadline.has_value() || raw_keys.empty() || raw_keys.size() > 256) {
+        EmitError("invalid_arguments", "arguments", false);
+        return kExitInvalid;
+    }
+    const std::optional<std::uint64_t> deadline = parsed_deadline.value();
+    const std::string *raw = &raw_keys;
+    std::vector<std::string> keys;
+    std::size_t start = 0;
+    while (start <= raw->size()) {
+        const std::size_t end = std::min(raw->find(',', start), raw->size());
+        keys.push_back(raw->substr(start, end - start));
+        start = end + 1;
+    }
+    if (keys.empty() || keys.size() > 6) {
+        EmitError("invalid_arguments", "arguments", false);
+        return kExitInvalid;
+    }
+    int exit_code = 0;
+    Display *display = OpenQualifiedDisplay(std::nullopt, &exit_code);
+    if (display == nullptr) {
+        return exit_code;
+    }
+    int event_base = 0, error_base = 0, major = 0, minor = 0;
+    if (!XTestQueryExtension(display, &event_base, &error_base, &major, &minor)) {
+        XCloseDisplay(display);
+        EmitError("xtest_unavailable", "x11_preflight", false);
+        return kExitUnavailable;
+    }
+    const auto chord = ChordCodes(display, keys);
+    if (!chord.has_value()) {
+        XCloseDisplay(display);
+        EmitError("unsupported_key", "key_preflight", false);
+        return kExitInvalid;
+    }
+    if (DeadlineExpired(deadline.value())) {
+        XCloseDisplay(display);
+        EmitError("deadline_exceeded", "pre_dispatch", false);
+        return kExitTimeoutBeforeDispatch;
+    }
+    std::cout << "{\"event\":\"dispatch_started\"}" << std::endl;
+    const bool ok = PressChord(display, chord.value());
+    XCloseDisplay(display);
+    if (!ok) {
+        EmitError("x11_error", "keyboard_dispatch", true);
+        return kExitUnknownEffect;
+    }
+    std::cout << "{\"ok\":true,\"dispatch_started\":true,\"events\":" << 2 * chord->size() << "}"
+              << std::endl;
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char **argv) {
@@ -846,6 +2048,18 @@ int main(int argc, char **argv) {
     const std::string_view command(argv[1]);
     if (command == "record-input") {
         return RunRecordInput(argc, argv);
+    }
+    if (command == "window-info" || command == "window-action") {
+        return RunWindow(command, argc, argv);
+    }
+    if (command == "clipboard-read") {
+        return RunClipboardRead(argc, argv);
+    }
+    if (command == "paste") {
+        return RunPaste(argc, argv);
+    }
+    if (command == "global-key") {
+        return RunGlobalKey(argc, argv);
     }
     std::optional<std::uint64_t> expected_pid;
     std::optional<std::uint64_t> deadline_ns;

@@ -30,6 +30,23 @@ use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+/// The run store used when none is named.
+///
+/// One per user, beside the saved workflows in `~/.ai-auto-desktop`, so a run
+/// started by one front end -- `aad start`, or `run_workflow` over MCP -- is
+/// visible to `status`, `resume` and the rest from any other. `AAD_RUN_STORE`
+/// overrides it, which is also what keeps tests away from a real home.
+pub fn default_store_path() -> PathBuf {
+    if let Some(configured) = std::env::var_os("AAD_RUN_STORE") {
+        return PathBuf::from(configured);
+    }
+    let home = std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    home.join(".ai-auto-desktop").join("runs.sqlite3")
+}
+
 /// Bumped only with a migration; a newer file is refused rather than guessed at.
 pub const SCHEMA_VERSION: i64 = 1;
 
@@ -965,6 +982,37 @@ impl JournalStore {
         for row in rows {
             found.push(row?);
         }
+        Ok(found)
+    }
+
+    /// The most recent events, oldest first.
+    ///
+    /// For reporting where a run has got to without reading its whole history,
+    /// which for a long run can be far larger than the answer needs.
+    pub fn list_recent_events(&self, run_id: &str, limit: i64) -> Result<Vec<EventRecord>> {
+        if !(1..=10_000).contains(&limit) {
+            return Err(JournalError::invalid("limit must be between 1 and 10000"));
+        }
+        self.get_run(run_id)?;
+        let mut statement = self.connection.prepare(
+            "SELECT run_id, seq, event_type, payload_json, created_at
+             FROM events WHERE run_id = ?1
+             ORDER BY seq DESC LIMIT ?2",
+        )?;
+        let rows = statement.query_map(params![run_id, limit], |row| {
+            Ok(EventRecord {
+                run_id: row.get(0)?,
+                seq: row.get(1)?,
+                event_type: row.get(2)?,
+                payload: serde_json::from_str(&row.get::<_, String>(3)?).unwrap_or(Value::Null),
+                created_at: row.get(4)?,
+            })
+        })?;
+        let mut found = Vec::new();
+        for row in rows {
+            found.push(row?);
+        }
+        found.reverse();
         Ok(found)
     }
 

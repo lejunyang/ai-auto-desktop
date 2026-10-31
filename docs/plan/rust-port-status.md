@@ -228,8 +228,24 @@ socketpair 与 Windows 受保护 named pipe 尚未接入 Rust 进程插件宿主
 后者列可重新编辑的源——把二者混同会给调用方它跑不了的东西，或藏起它能跑的东西。
 新增 `workflow_path()` 复用同一套 `validate_name`，使「按名查找」与「按名保存」不可能漂移。
 
-仍缺：`run_workflow` 走内存 `aad_runtime::run`，未接 `DurableExecutor`——AI 跑长流程时
-进程中断即丢失，接上后才能用 `status` / `resume` 跟进。是否要做未定。
+~~仍缺：`run_workflow` 走内存 `aad_runtime::run`，未接 `DurableExecutor`。~~ 已补（`crates/aad-mcp/src/durable_tools.rs`）：
+
+- `run_workflow` 新增**显式** `durable: true`，经 `DurableExecutor` 写入每用户运行库
+  `durable::default_store_path()`（`AAD_RUN_STORE`，否则 `~/.ai-auto-desktop/runs.sqlite3`）；CLI 的
+  `--store` 同时改为可省略并默认同一路径，MCP 起的运行可直接 `aad status` / `aad resume`。
+- 持久模式的拒绝原样生效（script、写 action、敏感值；只读 action 需 `durable_actions: "read_only"`），
+  被拒返回 `DURABLE.*` + `run_created=false`；仅当调用方传 `fallback_in_memory: true` 才回退内存运行。
+- 新工具 `workflow_run_status` / `workflow_run_list` / `workflow_run_events`（分页）与写操作
+  `workflow_run_resume` / `workflow_run_pause` / `workflow_run_cancel`（需 `--allow-input`），参数越界即拒。
+- 执行器跑在服务器后台线程并持有 owner lease，调用最多等 `wait_ms`，超时返回 `running` + `run_id`。
+  客户端断开时请求 pause 并等约 2 秒；进程直接死掉则租约（60 秒）过期后由 resume 接管：边界处继续，
+  步骤中途落 `UNKNOWN_EFFECT` 且不重放。
+- 测试（假 session、无真机）：启动→状态→事件分页、拒绝与显式回退、长运行返回 running→断开后 paused→
+  另一个 `Runs` 实例 resume 完成、模拟崩溃后租约围栏与 `UNKNOWN_EFFECT` 零重放、cancel/pause 语义。
+  `[待验证]` 真实 MCP 客户端（如 Claude Desktop）在长运行与断开重连下的端到端表现，需 Windows 真机 + MCP 客户端。
+
+剩余限制：持久模式仍只覆盖 durable executor 本身支持的工作流（录制导出的写 action 工作流会被拒）；
+后台线程持有输入租约与串行锁期间（仅含 action 步骤时），需要同一把串行锁的调用可能等待。
 
 #### 2.6.1 已发现的缺陷：`run_workflow` 未注册桌面 provider（已修复并验证，提交 0920057）
 

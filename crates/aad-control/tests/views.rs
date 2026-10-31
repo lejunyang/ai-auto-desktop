@@ -135,6 +135,23 @@ fn views_without_provider_support_or_with_misplaced_options_are_refused() {
         },
     );
     assert_eq!(code(&overview), "CONTROL.VIEW_UNSUPPORTED");
+    let text = observe(
+        &session,
+        View {
+            mode: ViewMode::Text,
+            ..Default::default()
+        },
+    );
+    assert_eq!(code(&text), "CONTROL.VIEW_UNSUPPORTED");
+    let limited_text = observe(
+        &session,
+        View {
+            mode: ViewMode::Text,
+            limit: Some(5),
+            ..Default::default()
+        },
+    );
+    assert_eq!(code(&limited_text), "CONTROL.INVALID_REQUEST");
     let misplaced = observe(
         &session,
         View {
@@ -275,4 +292,97 @@ fn actions_round_trip_with_optional_fields_and_reject_unknown_ones() {
         json!({"type": "hover", "fraction": {"fx": 0.1, "fy": 0.2, "x": 1}})
     )
     .is_err());
+}
+
+/// A provider whose nodes name the region they sit in.
+struct Regional;
+impl Backend for Regional {
+    fn name(&self) -> &str {
+        "regional"
+    }
+    fn capabilities(&self) -> Vec<String> {
+        vec!["click".into()]
+    }
+    fn resources(&self, _: Duration) -> Result<Vec<BackendResource>> {
+        Ok(vec![BackendResource {
+            resource: Resource {
+                resource_id: "regional:page".into(),
+                provider: "regional".into(),
+                kind: "browser".into(),
+                name: "page".into(),
+                capabilities: self.capabilities(),
+                metadata: json!({}),
+            },
+            selector: json!({}),
+        }])
+    }
+    fn observe(&self, _: &Value, _: usize, _: Duration) -> Result<Value> {
+        Ok(json!({"truncated": false, "nodes": [
+            {"node_id": "n1", "role": "link", "name": "Home", "actions": ["click"], "region": "Primary"},
+            {"node_id": "n2", "role": "link", "name": "Docs", "actions": ["click"], "region": "Primary"},
+            {"node_id": "n3", "role": "button", "name": "Buy", "actions": ["click"], "region": "Results"},
+            {"node_id": "n4", "role": "cell", "name": "Tea", "actions": [], "region": "Results"},
+            {"node_id": "n5", "role": "button", "name": "Help", "actions": ["click"], "region": null},
+        ]}))
+    }
+    fn act(&self, _: &Value, _: &Value, _: &Action, _: &Context) -> Result<Value> {
+        Ok(json!({}))
+    }
+}
+
+#[test]
+fn nodes_that_name_their_region_get_an_overview_and_region_outlines() {
+    let session = Session::new(vec![Arc::new(Regional)], Policy::default());
+    assert!(call(&session, Operation::Targets {}).error.is_none());
+    let view = |view: View| {
+        call(
+            &session,
+            Operation::Observe {
+                resource_id: "regional:page".into(),
+                max_nodes: 100,
+                view,
+            },
+        )
+    };
+    let overview = view(View {
+        mode: ViewMode::Overview,
+        ..Default::default()
+    })
+    .data
+    .unwrap();
+    assert_eq!(overview["regions"][0]["region"], "Primary");
+    assert_eq!(overview["regions"][0]["elements"], 2);
+    assert_eq!(
+        overview["regions"][0]["holds"],
+        json!([{"role": "link", "count": 2}])
+    );
+    assert_eq!(overview["interactive"], 4);
+    assert!(overview["regions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|r| r["region"] == LOOSE_REGION));
+    let results = view(View {
+        mode: ViewMode::Outline,
+        region: Some("Results".into()),
+        ..Default::default()
+    })
+    .data
+    .unwrap();
+    let shown: Vec<_> = results["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| n["node_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(shown, ["n3", "n4"]);
+    assert_eq!(results["region"], "Results");
+    let missing = view(View {
+        mode: ViewMode::Outline,
+        region: Some("Nowhere".into()),
+        ..Default::default()
+    });
+    let failure = missing.error.unwrap();
+    assert_eq!(failure["code"], "CONTROL.NOT_FOUND");
+    assert_eq!(failure["details"]["regions"].as_array().unwrap().len(), 3);
 }

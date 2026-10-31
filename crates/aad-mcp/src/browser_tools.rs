@@ -22,6 +22,17 @@ pub const NAMES: &[&str] = &[
     "browser_close",
     "browser_record_start",
     "browser_record_stop",
+    "browser_downloads",
+    "browser_storage",
+    "browser_network",
+];
+
+/// Browser tools that only read.
+pub const READ_ONLY: &[&str] = &[
+    "browser_profiles",
+    "browser_downloads",
+    "browser_storage",
+    "browser_network",
 ];
 
 const BROWSERS: [&str; 3] = ["chrome", "edge", "brave"];
@@ -138,7 +149,71 @@ evidence/network-streams.jsonl (WebSocket and event-stream messages) and screens
             schema: json!({"type": "object", "properties": {}, "additionalProperties": false}),
             mutating: true,
         },
+        Tool {
+            name: "browser_downloads",
+            description: "List what the attached browser downloaded since this session \
+connected to it (control_targets connects): each download's guid, url, suggested \
+filename, state (in_progress, completed or canceled), bytes received and total, and the \
+path it was saved to. Only for a browser browser_open started: its downloads go to a \
+directory of this session's own, given as `directory`. A browser attached by port keeps \
+its own download setting, and the answer says tracking: false with the reason. \
+Read-only; read the files from `path`.",
+            schema: json!({"type": "object", "properties": {}, "additionalProperties": false}),
+            mutating: false,
+        },
+        Tool {
+            name: "browser_storage",
+            description: "List the cookies the browser holds for a page or frame from \
+control_targets (name, domain, path, expiry, session, http_only, secure, same_site, size) and \
+its origin's localStorage keys with their value lengths. Read-only. Cookie values are shown \
+only when the server was started with --allow-cookie-values; storage values never. To clear \
+them use control_act clear_site_data on the page's document node.",
+            schema: json!({
+                "type": "object",
+                "properties": {"resource_id": {"type": "string", "minLength": 1, "maxLength": 256}},
+                "required": ["resource_id"],
+                "additionalProperties": false
+            }),
+            mutating: false,
+        },
+        Tool {
+            name: "browser_network",
+            description: "List the recent requests of a browser page from control_targets, \
+newest last, since this session first attached to it: method, url (credentials and \
+sensitive query values redacted), resource type, state (pending, finished, failed, \
+redirected), status, MIME type, duration and size. Up to 500 are held per page; `dropped` \
+counts the ones forgotten. With include_bodies, finished text responses carry up to 4096 \
+characters of body with sensitive JSON fields redacted. Read-only.",
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "resource_id": {"type": "string", "minLength": 1, "maxLength": 256},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 500, "default": 50},
+                    "include_bodies": {"type": "boolean", "default": false}
+                },
+                "required": ["resource_id"],
+                "additionalProperties": false
+            }),
+            mutating: false,
+        },
     ]
+}
+
+fn session_error(e: aad_core::AutomationError) -> Value {
+    let mut payload = e.to_json();
+    let hint = match payload["code"].as_str() {
+        Some("BROWSER.NOT_CONNECTED") => {
+            Some("Start one with browser_open, or start the server with --browser-port.")
+        }
+        Some("CONTROL.TARGET_UNKNOWN") => {
+            Some("Call control_targets and pass a browser resource_id it returned.")
+        }
+        _ => None,
+    };
+    if let Some(hint) = hint {
+        payload["hint"] = json!(hint);
+    }
+    payload
 }
 
 struct Running {
@@ -225,6 +300,7 @@ impl Browsers {
             "browser_open" => self.open(session, arguments),
             "browser_close" => {
                 let recording = self.stop_recording().ok();
+                session.release_browser_downloads();
                 let closed = self.opened.lock().unwrap().take().is_some();
                 Ok(json!({"closed": closed, "recording": recording}))
             }
@@ -256,6 +332,40 @@ impl Browsers {
                 Ok(json!({"recording": true, "out": out}))
             }
             "browser_record_stop" => self.stop_recording(),
+            "browser_downloads" => session
+                .browser_downloads(std::time::Duration::from_secs(5))
+                .map_err(|e| {
+                    let mut payload = e.to_json();
+                    if payload["code"] == "BROWSER.NOT_CONNECTED" {
+                        payload["hint"] = json!(
+                            "Start one with browser_open, or start the server with --browser-port."
+                        );
+                    }
+                    payload
+                }),
+            "browser_storage" | "browser_network" => {
+                let resource = arguments["resource_id"].as_str().ok_or_else(|| {
+                    refused("MCP.INVALID_ARGUMENT", "resource_id is required", None)
+                })?;
+                let timeout = std::time::Duration::from_secs(10);
+                if name == "browser_storage" {
+                    session.browser_storage(resource, timeout)
+                } else {
+                    let limit = match &arguments["limit"] {
+                        Value::Null => 50,
+                        limit => limit.as_u64().ok_or_else(|| {
+                            refused("MCP.INVALID_ARGUMENT", "limit is a whole number", None)
+                        })? as usize,
+                    };
+                    session.browser_network(
+                        resource,
+                        limit,
+                        arguments["include_bodies"].as_bool().unwrap_or(false),
+                        timeout,
+                    )
+                }
+                .map_err(session_error)
+            }
             other => Err(refused(
                 "MCP.INVALID_ARGUMENT",
                 format!("unknown tool {other}"),
@@ -303,6 +413,7 @@ impl Browsers {
         };
         // One browser per server: the session works with one at a time.
         let _ = self.stop_recording();
+        session.release_browser_downloads();
         self.opened.lock().unwrap().take();
         let started = Browser::start(launch::Options {
             browser: browser.clone(),
@@ -321,7 +432,7 @@ impl Browsers {
             )
         })?;
         session
-            .attach_browser(started.port)
+            .attach_launched_browser(started.port)
             .map_err(|e| e.to_json())?;
         let mut answer = json!({
             "browser": browser,

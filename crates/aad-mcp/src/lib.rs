@@ -10,6 +10,7 @@
 
 pub mod browser_tools;
 pub mod control_tools;
+pub mod durable_tools;
 pub mod protocol;
 pub mod tools;
 
@@ -47,6 +48,8 @@ pub struct Server {
     active_control: Mutex<BTreeMap<String, String>>,
     /// The browser and recording started through the browser tools.
     browsers: browser_tools::Browsers,
+    /// Durable workflow runs this server started or resumed.
+    runs: durable_tools::Runs,
 }
 
 impl Server {
@@ -83,6 +86,7 @@ impl Server {
             unavailable,
             active_control: Mutex::new(BTreeMap::new()),
             browsers: browser_tools::Browsers::default(),
+            runs: durable_tools::Runs::default(),
         }
     }
 
@@ -114,6 +118,7 @@ impl Server {
             unavailable: None,
             active_control: Mutex::new(BTreeMap::new()),
             browsers: browser_tools::Browsers::default(),
+            runs: durable_tools::Runs::default(),
         }
     }
 
@@ -124,18 +129,39 @@ impl Server {
         self
     }
 
+    /// Keep durable runs in this store instead of the per-user default.
+    pub fn with_run_store(mut self, path: std::path::PathBuf) -> Self {
+        self.runs = std::mem::take(&mut self.runs).with_store(path);
+        self
+    }
+
+    /// Hold durable run leases this long between renewals.
+    pub fn with_run_lease_ttl_seconds(mut self, seconds: f64) -> Self {
+        self.runs = std::mem::take(&mut self.runs).with_lease_ttl_seconds(seconds);
+        self
+    }
+
     pub fn disconnect(&self) {
         self.control.disconnect();
+        // Durable runs ask to pause at their next step boundary; whatever is
+        // still inside a step when the process exits is left for resume.
+        self.runs.shutdown();
     }
 
     /// Local tools are offered only to an unrestricted local session: a
     /// provider or resource grant cannot be enforced on a workflow that finds
     /// its own windows by name.
     fn offers(&self, name: &str) -> bool {
-        if name.starts_with("control_") {
-            return true;
+        if control_tools::method(name).is_some() {
+            // A remote session holds its own grants and refuses on its side.
+            return self
+                .local
+                .as_ref()
+                .is_none_or(|session| control_tools::granted(name, session.policy()));
         }
-        (LOCAL_TOOLS.contains(&name) || browser_tools::NAMES.contains(&name))
+        (LOCAL_TOOLS.contains(&name)
+            || durable_tools::NAMES.contains(&name)
+            || browser_tools::NAMES.contains(&name))
             && self.local.as_ref().is_some_and(|session| {
                 let policy = session.policy();
                 policy.providers.is_empty() && policy.resources.is_none()
@@ -220,7 +246,16 @@ effect; never retry it automatically.",
                 "\n\nFor work that has been recorded before, prefer a saved workflow: \
 list_workflows shows what exists, describe_workflow reports the inputs it takes without \
 running it, and run_workflow runs it. That is more reliable than rebuilding the same \
-sequence of actions each time.",
+sequence of actions each time. A long workflow can run with durable: true, which \
+journals it so it survives this server exiting; follow it with workflow_run_status and \
+workflow_run_events, and stop or continue it with workflow_run_pause, \
+workflow_run_cancel and workflow_run_resume.",
+            );
+        }
+        if self.offers("desktop_launch") && self.local.is_some() {
+            instructions.push_str(
+                "\n\nThe operator allowlisted programs you may start with desktop_launch \
+(control_capabilities lists them under `launch`); it answers the new windows as resources.",
             );
         }
         if !self.allows_input() && self.local.is_some() {
@@ -259,7 +294,9 @@ notifications/cancelled to request cancellation of an in-flight JSON-RPC request
         if tools::find(name).is_none() {
             return Err((protocol::INVALID_PARAMS, format!("unknown tool {name:?}")));
         }
-        if !self.offers(name) {
+        // A session tool always reaches the session, listed or not: an
+        // ungranted one is refused there with POLICY.DENIED, not hidden here.
+        if control_tools::method(name).is_none() && !self.offers(name) {
             return Err((
                 protocol::INVALID_PARAMS,
                 "this connection exposes only its granted control session".into(),
@@ -267,7 +304,7 @@ notifications/cancelled to request cancellation of an in-flight JSON-RPC request
         }
 
         let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
-        if name.starts_with("control_") {
+        if control_tools::method(name).is_some() {
             let request = control_tools::prepare(name, &arguments, self.control.as_ref())
                 .map_err(|e| (protocol::INVALID_PARAMS, e))?;
             let key = rpc_id
@@ -299,7 +336,8 @@ notifications/cancelled to request cancellation of an in-flight JSON-RPC request
             .as_ref()
             .expect("local tools need a local session");
         let writes = matches!(name, "save_workflow" | "run_workflow")
-            || (browser_tools::NAMES.contains(&name) && name != "browser_profiles");
+            || durable_tools::MUTATING.contains(&name)
+            || (browser_tools::NAMES.contains(&name) && !browser_tools::READ_ONLY.contains(&name));
         if writes && !self.allows_input() {
             return Ok(content(
                 &json!({
@@ -317,6 +355,12 @@ notifications/cancelled to request cancellation of an in-flight JSON-RPC request
                 Err(payload) => content(&payload, true),
             });
         }
+        if durable_tools::NAMES.contains(&name) {
+            return Ok(match self.runs.call(session, name, &arguments) {
+                Ok(result) => content(&result, false),
+                Err(payload) => content(&parse_payload(&payload), true),
+            });
+        }
         if name != "run_workflow" {
             // These need no desktop: `probe_environment` exists to explain why
             // the desktop is unavailable, and the workflow tools read the store.
@@ -326,22 +370,52 @@ notifications/cancelled to request cancellation of an in-flight JSON-RPC request
             });
         }
 
-        // A workflow drives the desktop like control_act does: one gate, one
-        // input owner, the session's own provider instances.
-        let through_session = match tools::steps_through_session(&arguments) {
-            Ok(steps) => steps,
-            Err(payload) => return Ok(content(&parse_payload(&payload), true)),
-        };
-        let gate = session.gate();
-        let _serialized = (!through_session).then(|| gate.lock().unwrap());
-        let _lease = match session.input_lease("desktop-input") {
-            Ok(lease) => lease,
-            Err(error) => return Ok(content(&error.to_json(), true)),
-        };
-        Ok(match tools::run_workflow(session, &arguments) {
+        if !tools::wants_durable(&arguments) {
+            let (payload, is_error) = run_in_memory(session, &arguments);
+            return Ok(content(&payload, is_error));
+        }
+        Ok(match self.runs.start(session, &arguments) {
             Ok(result) => content(&result, false),
-            Err(payload) => content(&parse_payload(&payload), true),
+            Err(durable_tools::StartError::Failed(payload)) => {
+                content(&parse_payload(&payload), true)
+            }
+            Err(durable_tools::StartError::Refused(refusal)) => {
+                // Falling back is the caller's decision, never ours: an
+                // in-memory run cannot be followed up or resumed.
+                if arguments.get("fallback_in_memory").and_then(Value::as_bool) != Some(true) {
+                    return Ok(content(&refusal, true));
+                }
+                let memory = json!({
+                    "name": arguments.get("name").cloned().unwrap_or(Value::Null),
+                    "inputs": arguments.get("inputs").cloned().unwrap_or(Value::Null),
+                });
+                let (mut payload, is_error) = run_in_memory(session, &memory);
+                payload["durable"] = json!(false);
+                payload["durable_refusal"] = refusal;
+                content(&payload, is_error)
+            }
         })
+    }
+}
+
+/// Run a saved workflow in memory, as `run_workflow` without `durable` does.
+///
+/// A workflow drives the desktop like control_act does: one gate, one input
+/// owner, the session's own provider instances.
+fn run_in_memory(session: &Arc<aad_control::Session>, arguments: &Value) -> (Value, bool) {
+    let through_session = match tools::steps_through_session(arguments) {
+        Ok(steps) => steps,
+        Err(payload) => return (parse_payload(&payload), true),
+    };
+    let gate = session.gate();
+    let _serialized = (!through_session).then(|| gate.lock().unwrap());
+    let _lease = match session.input_lease("desktop-input") {
+        Ok(lease) => lease,
+        Err(error) => return (error.to_json(), true),
+    };
+    match tools::run_workflow(session, arguments) {
+        Ok(result) => (result, false),
+        Err(payload) => (parse_payload(&payload), true),
     }
 }
 
@@ -573,7 +647,9 @@ mod tests {
         let response = server().handle(&request("tools/list", json!({}))).unwrap();
         let tools = response["result"]["tools"].as_array().unwrap();
 
-        assert_eq!(tools.len(), tools::catalogue().len());
+        // Everything but the tools whose extra grant this server lacks.
+        let ungranted = ["desktop_launch", "clipboard_read", "control_global_key"];
+        assert_eq!(tools.len(), tools::catalogue().len() - ungranted.len());
         let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
         assert!(names.contains(&"control_observe"));
         assert!(names.contains(&"run_workflow"));
@@ -661,6 +737,30 @@ mod tests {
     }
 
     #[test]
+    fn listing_downloads_is_read_only_and_says_when_no_browser_is_attached() {
+        let server = Server::without_driver("no desktop");
+        let listed = server.handle(&request("tools/list", json!({}))).unwrap();
+        let tool = listed["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == "browser_downloads")
+            .cloned()
+            .expect("offered on a local session");
+        assert_eq!(tool["inputSchema"]["additionalProperties"], false);
+        let response = server
+            .handle(&request(
+                "tools/call",
+                json!({"name": "browser_downloads", "arguments": {}}),
+            ))
+            .unwrap();
+        let (is_error, payload) = tool_payload(&response);
+        assert!(is_error);
+        // Not refused as a write on this read-only server: there is just no browser.
+        assert_eq!(payload["code"], "BROWSER.NOT_CONNECTED", "{payload}");
+    }
+
+    #[test]
     fn restricted_grants_hide_the_local_workflow_tools() {
         // A workflow finds its own windows by name, so a provider or resource
         // grant could not be enforced on it.
@@ -669,7 +769,7 @@ mod tests {
             aad_control::Policy {
                 allow_input: true,
                 providers: ["desktop.linux_atspi".to_string()].into(),
-                resources: None,
+                ..Default::default()
             },
         ));
         let listed = restricted
@@ -692,6 +792,103 @@ mod tests {
             ))
             .unwrap();
         assert_eq!(refused["error"]["code"], protocol::INVALID_PARAMS);
+    }
+
+    fn listed(server: &Server) -> Vec<String> {
+        server.handle(&request("tools/list", json!({}))).unwrap()["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t["name"].as_str().map(str::to_string))
+            .collect()
+    }
+
+    #[test]
+    fn launching_is_listed_only_when_granted_and_refused_by_policy_otherwise() {
+        let plain = Server::without_driver("no desktop");
+        assert!(!listed(&plain).contains(&"desktop_launch".to_string()));
+        let response = plain
+            .handle(&request(
+                "tools/call",
+                json!({"name": "desktop_launch", "arguments": {"program": "notepad.exe"}}),
+            ))
+            .unwrap();
+        let (is_error, payload) = tool_payload(&response);
+        assert!(is_error);
+        assert_eq!(payload["error"]["code"], "POLICY.DENIED");
+        assert_eq!(payload["commit_state"], "not_committed");
+
+        let granted = Server::local(aad_control::Session::new(
+            Vec::new(),
+            aad_control::Policy {
+                allow_input: true,
+                launch: ["notepad.exe".to_string()].into(),
+                ..Default::default()
+            },
+        ));
+        assert!(listed(&granted).contains(&"desktop_launch".to_string()));
+        let instructions = granted.handle(&request("initialize", json!({}))).unwrap()["result"]
+            ["instructions"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(instructions.contains("desktop_launch"), "{instructions}");
+        // Asking for a program off the list is refused before anything starts.
+        let response = granted
+            .handle(&request(
+                "tools/call",
+                json!({"name": "desktop_launch", "arguments": {"program": "calc.exe"}}),
+            ))
+            .unwrap();
+        let (is_error, payload) = tool_payload(&response);
+        assert!(is_error);
+        assert_eq!(payload["error"]["code"], "POLICY.DENIED");
+        assert_eq!(
+            payload["error"]["details"]["allowlist"],
+            json!(["notepad.exe"])
+        );
+    }
+
+    #[test]
+    fn global_keys_and_the_clipboard_are_listed_only_with_their_own_grants() {
+        let input_only = Server::local(aad_control::Session::new(
+            Vec::new(),
+            aad_control::Policy {
+                allow_input: true,
+                ..Default::default()
+            },
+        ));
+        let names = listed(&input_only);
+        for hidden in ["control_global_key", "clipboard_read"] {
+            assert!(!names.contains(&hidden.to_string()), "{hidden}");
+        }
+        for (name, arguments) in [
+            ("control_global_key", json!({"keys": ["win", "d"]})),
+            ("clipboard_read", json!({})),
+        ] {
+            let response = input_only
+                .handle(&request(
+                    "tools/call",
+                    json!({"name": name, "arguments": arguments}),
+                ))
+                .unwrap();
+            let (is_error, payload) = tool_payload(&response);
+            assert!(is_error, "{name}");
+            assert_eq!(payload["error"]["code"], "POLICY.DENIED", "{name}");
+        }
+        let granted = Server::local(aad_control::Session::new(
+            Vec::new(),
+            aad_control::Policy {
+                allow_input: true,
+                allow_global_keys: true,
+                allow_clipboard_read: true,
+                ..Default::default()
+            },
+        ));
+        let names = listed(&granted);
+        for shown in ["control_global_key", "clipboard_read"] {
+            assert!(names.contains(&shown.to_string()), "{shown}");
+        }
     }
 
     #[test]

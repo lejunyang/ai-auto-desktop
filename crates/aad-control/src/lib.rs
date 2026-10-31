@@ -2,6 +2,7 @@
 //! No network listener: remote sessions inherit an authenticated SSH stdio pipe.
 
 pub mod browser;
+pub mod launch;
 pub mod lease;
 pub mod model;
 pub mod native;
@@ -50,11 +51,70 @@ pub trait Backend: Send + Sync {
     fn lease_key(&self, _snapshot: &Value) -> Option<String> {
         None
     }
+    /// Read-only operations beyond observe and find this provider offers,
+    /// such as `capture`; listed by `capabilities` so none is guessed at.
+    fn reads(&self) -> Vec<String> {
+        Vec::new()
+    }
     /// A PNG of an observed node: `{"format": "png", "data": base64, "width", "height"}`.
     fn capture(&self, _snapshot: &Value, _node: &Value, _timeout: Duration) -> Result<Value> {
         Err(error(
             "CONTROL.ACTION_UNSUPPORTED",
             "this provider cannot take screenshots",
+        ))
+    }
+    /// Cookies and storage keys of a resource, read-only; browsers only.
+    fn storage(&self, _selector: &Value, _timeout: Duration, _values: bool) -> Result<Value> {
+        Err(error(
+            "CONTROL.ACTION_UNSUPPORTED",
+            "this provider has no site storage",
+        ))
+    }
+    /// Recent network requests of a resource, read-only; browsers only.
+    fn network(
+        &self,
+        _selector: &Value,
+        _limit: usize,
+        _bodies: bool,
+        _timeout: Duration,
+    ) -> Result<Value> {
+        Err(error(
+            "CONTROL.ACTION_UNSUPPORTED",
+            "this provider records no network requests",
+        ))
+    }
+    /// OCR over the node's pixels: the PNG read (`format`, `data`, `width`,
+    /// `height`), the `engine` and `language`, and `lines` of `{text, bounds,
+    /// words}` with bounds in that image's pixels.
+    fn read_text(
+        &self,
+        _snapshot: &Value,
+        _node: &Value,
+        _language: Option<&str>,
+        _timeout: Duration,
+    ) -> Result<Value> {
+        Err(error(
+            "CONTROL.ACTION_UNSUPPORTED",
+            "this provider cannot read text from pixels",
+        ))
+    }
+    /// Whether this provider can press a key chord anchored on nothing.
+    fn offers_global_keys(&self) -> bool {
+        false
+    }
+    /// Press a key chord wherever keyboard focus is, anchored on nothing.
+    fn global_key(&self, _keys: &[String], _context: &Context) -> Result<Value> {
+        Err(error(
+            "CONTROL.ACTION_UNSUPPORTED",
+            "this provider cannot press global keys",
+        ))
+    }
+    /// The desktop clipboard's text: `{"has_text", "text", "characters",
+    /// "truncated"}`. Not anchored; the session checks its own grant first.
+    fn clipboard_read(&self, _max_characters: Option<usize>, _timeout: Duration) -> Result<Value> {
+        Err(error(
+            "CONTROL.ACTION_UNSUPPORTED",
+            "this provider cannot read the clipboard",
         ))
     }
     fn resources(&self, timeout: Duration) -> Result<Vec<BackendResource>>;
@@ -92,6 +152,21 @@ pub struct Policy {
     pub providers: BTreeSet<String>,
     /// Optional server-owned allowlist; a client cannot extend it.
     pub resources: Option<BTreeSet<String>>,
+    /// Programs `launch` may start, as the operator named them (an absolute
+    /// path or a bare name on PATH). Empty: launching is refused. Needs
+    /// `allow_input` as well.
+    pub launch: BTreeSet<String>,
+    /// Whether `clipboard_read` may return the clipboard's text. Separate from
+    /// input and off by default: the clipboard often holds secrets.
+    pub allow_clipboard_read: bool,
+    /// Whether global_key may press keys anchored on no element. Needs
+    /// llow_input as well; off by default.
+    pub allow_global_keys: bool,
+    /// Directories whose files an `upload` may hand to a page. Empty refuses
+    /// every upload; a client can neither extend nor see past them.
+    pub upload_roots: Vec<std::path::PathBuf>,
+    /// Whether browser_storage may show cookie values. Off: names and flags only.
+    pub allow_cookie_values: bool,
 }
 
 #[derive(Clone)]
@@ -259,6 +334,94 @@ impl Session {
         Ok(())
     }
 
+    /// Point the browser provider at a browser this server launched on `port`:
+    /// unlike [`Session::attach_browser`], its downloads are redirected to the
+    /// session's directory and tracked.
+    pub fn attach_launched_browser(&self, port: u16) -> Result<()> {
+        self.attach_browser(port)?;
+        if let Some(browser) = &self.browser {
+            browser.attach_launched(port);
+        }
+        Ok(())
+    }
+
+    /// Give a launched browser its own download setting back, e.g. before closing it.
+    pub fn release_browser_downloads(&self) {
+        if let Some(browser) = &self.browser {
+            browser.release_downloads();
+        }
+    }
+
+    /// What the attached browser downloaded into this session's directory. Read-only.
+    pub fn browser_downloads(&self, timeout: Duration) -> Result<Value> {
+        if self.closed.load(Ordering::SeqCst) {
+            return Err(error("CONTROL.SESSION_CLOSED", "session is closed"));
+        }
+        let browser = self.browser.as_ref().ok_or_else(|| {
+            error(
+                "BROWSER.NOT_CONNECTED",
+                "this session has no browser provider",
+            )
+        })?;
+        browser.downloads(timeout)
+    }
+
+    /// A listed resource's provider and selector, under this session's grants.
+    fn readable(&self, resource_id: &str) -> Result<(Arc<dyn Backend>, Value)> {
+        if self.closed.load(Ordering::SeqCst) || self.created.elapsed() >= self.lifetime {
+            return Err(error(
+                "CONTROL.SESSION_CLOSED",
+                "session is closed or expired",
+            ));
+        }
+        let item = self
+            .state
+            .lock()
+            .unwrap()
+            .resources
+            .get(resource_id)
+            .cloned()
+            .ok_or_else(|| {
+                error(
+                    "CONTROL.TARGET_UNKNOWN",
+                    "list targets before reading a resource",
+                )
+            })?;
+        if !self.allowed_provider(&item.resource.provider) || !self.allowed_resource(resource_id) {
+            return Err(error(
+                "POLICY.DENIED",
+                "the resource is outside this session's grant",
+            ));
+        }
+        Ok((
+            self.backends[&item.resource.provider].clone(),
+            item.selector,
+        ))
+    }
+
+    /// Cookies (values only under the operator's grant) and localStorage keys
+    /// of a listed browser page or frame. Read-only.
+    pub fn browser_storage(&self, resource_id: &str, timeout: Duration) -> Result<Value> {
+        let (backend, selector) = self.readable(resource_id)?;
+        let _gate = self.gate.lock().unwrap();
+        backend.storage(&selector, timeout, self.policy.allow_cookie_values)
+    }
+
+    /// The recent requests of a listed browser page. Read-only.
+    pub fn browser_network(
+        &self,
+        resource_id: &str,
+        limit: usize,
+        bodies: bool,
+        timeout: Duration,
+    ) -> Result<Value> {
+        if limit == 0 || limit > 500 {
+            return Err(error("CONTROL.INVALID_REQUEST", "limit must be in 1..500"));
+        }
+        let (backend, selector) = self.readable(resource_id)?;
+        let _gate = self.gate.lock().unwrap();
+        backend.network(&selector, limit, bodies, timeout)
+    }
     /// The CDP port the browser provider works with, if one is attached.
     pub fn browser_port(&self) -> Option<u16> {
         self.browser.as_ref().and_then(|b| b.attached_port())
@@ -380,7 +543,11 @@ impl Session {
             Ok(value) => (
                 Some(value),
                 None,
-                if request.mutating() {
+                if matches!(request.operation, Operation::GlobalKey { .. }) {
+                    // Delivered to whatever held focus: nothing anchors or
+                    // verifies it, so the commit state stays unknown.
+                    "dispatched".to_string()
+                } else if request.mutating() {
                     "applied".to_string()
                 } else {
                     "not_applied".to_string()
@@ -497,13 +664,13 @@ impl Session {
 
     fn dispatch(&self, operation: &Operation, context: &Context) -> Result<Value> {
         match operation {
-            Operation::Capabilities {} => Ok(
+            Operation::Capabilities {} => Ok(self.with_grants(
                 json!({"session_id": self.id, "protocol_version": PROTOCOL_VERSION,
                 "expires_in_ms": self.lifetime.saturating_sub(self.created.elapsed()).as_millis(),
-                "allow_input": self.policy.allow_input,"observation_retention":"until_next_observation_or_input_attempt","observation_ttl_ms":self.observation_ttl.as_millis(),"max_requests":self.max_requests,"input_lease":"exclusive_cooperating_session","input_lease_scope":"os_user","providers": self.backends.values().filter(|b| self.allowed_provider(b.name()))
-                    .map(|b| json!({"provider": b.name(), "actions": b.capabilities()})).collect::<Vec<_>>(),
+                "allow_input": self.policy.allow_input,"upload_dirs": self.policy.upload_roots,"cookie_values": self.policy.allow_cookie_values,"observation_retention":"until_next_observation_or_input_attempt","observation_ttl_ms":self.observation_ttl.as_millis(),"max_requests":self.max_requests,"input_lease":"exclusive_cooperating_session","input_lease_scope":"os_user","providers": self.backends.values().filter(|b| self.allowed_provider(b.name()))
+                    .map(|b| json!({"provider": b.name(), "actions": b.capabilities(), "reads": b.reads()})).collect::<Vec<_>>(),
                 "unavailable": self.failures}),
-            ),
+            )),
             Operation::Targets {} => {
                 let mut resources = BTreeMap::new();
                 let mut unavailable = self.failures.clone();
@@ -545,74 +712,14 @@ impl Session {
                     ));
                 }
                 validate_view(view)?;
-                let item = self
-                    .state
-                    .lock()
-                    .unwrap()
-                    .resources
-                    .get(resource_id)
-                    .cloned()
-                    .ok_or_else(|| {
-                        error(
-                            "CONTROL.TARGET_UNKNOWN",
-                            "list targets before observing a resource",
-                        )
-                    })?;
-                let backend = &self.backends[&item.resource.provider];
-                self.state
-                    .lock()
-                    .unwrap()
-                    .observations
-                    .retain(|_, old| old.provider != item.resource.provider);
-                let raw = backend.observe(&item.selector, *max_nodes, context.remaining()?)?;
-                context.remaining()?;
-                let observation_id = uuid::Uuid::new_v4().to_string();
-                let mut nodes = raw["nodes"].as_array().cloned().ok_or_else(|| {
-                    error("CONTROL.BAD_PROVIDER_OUTPUT", "snapshot omitted nodes")
-                })?;
-                if nodes.len() > *max_nodes {
-                    return Err(error(
-                        "CONTROL.BAD_PROVIDER_OUTPUT",
-                        "snapshot exceeded node budget",
-                    ));
-                }
-                for node in &mut nodes {
-                    node["capabilities"] = json!(backend.node_capabilities(node));
-                    let node_id = node["node_id"]
-                        .as_str()
-                        .ok_or_else(|| {
-                            error("CONTROL.BAD_PROVIDER_OUTPUT", "node omitted identity")
-                        })?
-                        .to_string();
-                    node["target"] = serde_json::to_value(Target {
-                        session_id: self.id.clone(),
-                        resource_id: resource_id.clone(),
-                        observation_id: observation_id.clone(),
-                        node_id,
-                    })
-                    .unwrap();
-                }
-                let mut state = self.state.lock().unwrap();
-                // Native providers have different snapshot retention rules. A new
-                // observation invalidates this provider's previous references.
-                state
-                    .observations
-                    .retain(|_, old| old.provider != item.resource.provider);
-                state.observations.insert(
-                    observation_id.clone(),
-                    Observation {
-                        provider: item.resource.provider,
-                        resource_id: resource_id.clone(),
-                        raw: raw.clone(),
-                        nodes: nodes.clone(),
-                        created: Instant::now(),
-                    },
-                );
-                drop(state);
+                let (observation_id, observation) =
+                    self.observe_resource(resource_id, *max_nodes, context)?;
+                let backend = &self.backends[&observation.provider];
+                let (raw, nodes) = (observation.raw, observation.nodes);
                 let mut answer = json!({"observation_id": observation_id, "resource_id": resource_id, "node_count": nodes.len(), "truncated": raw["truncated"] == true, "metadata": raw.get("metadata").cloned().unwrap_or(Value::Null)});
                 match view.mode {
                     ViewMode::Nodes => answer["nodes"] = json!(nodes),
-                    ViewMode::Outline | ViewMode::Overview => {
+                    ViewMode::Outline | ViewMode::Overview | ViewMode::Text => {
                         let shaped = match backend.view(&raw, view, context.remaining()?)? {
                             Some(shaped) => shaped,
                             None => portable_view(&nodes, view)?,
@@ -660,37 +767,24 @@ impl Session {
                     ));
                 }
                 let observation = self.observation(observation_id)?;
-                if observation.raw["truncated"] == true {
-                    return Err(error(
-                        "CONTROL.OBSERVATION_TRUNCATED",
-                        "truncated observation cannot prove uniqueness",
-                    ));
-                }
-                let backend = &self.backends[&observation.provider];
-                let resolved =
-                    match backend.find(&observation.raw, locator, *expect, context.remaining()?)? {
-                        Some(resolved) => resolved,
-                        None => portable_find(&observation.nodes, locator, *expect)?,
-                    };
-                context.remaining()?;
-                if resolved["found"] != true {
-                    return Ok(
-                        json!({"found": false, "match_count": 0, "observation_id": observation_id}),
-                    );
-                }
-                let node = resolved["node_id"]
-                    .as_str()
-                    .and_then(|id| observation.nodes.iter().find(|n| n["node_id"] == id))
-                    .ok_or_else(|| {
-                        error(
-                            "CONTROL.BAD_PROVIDER_OUTPUT",
-                            "find named a node outside the observation",
-                        )
-                    })?;
-                Ok(
-                    json!({"found": true, "match_count": resolved["match_count"].as_u64().unwrap_or(1), "node": node, "target": node["target"]}),
-                )
+                self.find_in(observation_id, &observation, locator, *expect, context)
             }
+            Operation::Wait {
+                resource_id,
+                locator,
+                condition,
+                states,
+                max_nodes,
+                interval_ms,
+            } => self.wait(
+                resource_id,
+                locator,
+                *condition,
+                states.as_ref(),
+                *max_nodes,
+                *interval_ms,
+                context,
+            ),
             Operation::Act { target, action } => {
                 if !self.policy.allow_input {
                     return Err(error(
@@ -720,6 +814,18 @@ impl Session {
                     ));
                 }
                 validate_action(action)?;
+                // Upload paths are resolved here, under the server's grant, so
+                // no provider ever sees a path outside it.
+                let resolved;
+                let action = match action {
+                    Action::Upload { files } => {
+                        resolved = Action::Upload {
+                            files: self.upload_files(files)?,
+                        };
+                        &resolved
+                    }
+                    other => other,
+                };
                 let observed = |id: &str| {
                     observation.raw["nodes"]
                         .as_array()
@@ -789,49 +895,564 @@ impl Session {
                 )
             }
             Operation::Capture { target } => {
-                if target.session_id != self.id {
-                    return Err(error(
-                        "CONTROL.SESSION_MISMATCH",
-                        "target belongs to another session",
-                    ));
-                }
-                let observation = self.observation(&target.observation_id)?;
-                if target.resource_id != observation.resource_id
-                    || !self.allowed_resource(&target.resource_id)
-                {
-                    return Err(error(
-                        "POLICY.DENIED",
-                        "target is outside the resource grant",
-                    ));
-                }
-                let node = observation.raw["nodes"]
-                    .as_array()
-                    .and_then(|nodes| {
-                        nodes
-                            .iter()
-                            .find(|n| n["node_id"] == target.node_id.as_str())
-                    })
-                    .ok_or_else(|| error("CONTROL.STALE_TARGET", "node was not observed"))?;
+                let (observation, node) = self.observed_node(target)?;
                 let backend = &self.backends[&observation.provider];
-                let mut shot = backend.capture(&observation.raw, node, context.remaining()?)?;
-                // Compared across captures to tell whether what is shown changed,
-                // e.g. a login code that refreshes, without reading the image.
-                let digest = shot["data"]
-                    .as_str()
-                    .map(|data| {
-                        use sha2::Digest;
-                        sha2::Sha256::digest(data.as_bytes())
-                            .iter()
-                            .map(|b| format!("{b:02x}"))
-                            .collect::<String>()
-                    })
-                    .unwrap_or_default();
-                shot["digest"] = json!(digest);
+                let mut shot = backend.capture(&observation.raw, &node, context.remaining()?)?;
+                shot["digest"] = json!(digest_of(&shot));
                 shot["provider"] = json!(observation.provider);
                 Ok(shot)
             }
+            Operation::ReadText { target, language } => {
+                if language.as_ref().is_some_and(|tag| {
+                    tag.is_empty()
+                        || tag.len() > 35
+                        || !tag.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+                }) {
+                    return Err(error(
+                        "CONTROL.INVALID_REQUEST",
+                        "language must be a BCP-47 tag such as en-US",
+                    ));
+                }
+                let (observation, node) = self.observed_node(target)?;
+                let backend = &self.backends[&observation.provider];
+                let read = backend.read_text(
+                    &observation.raw,
+                    &node,
+                    language.as_deref(),
+                    context.remaining()?,
+                )?;
+                context.remaining()?;
+                Ok(text_answer(&read, &observation.provider))
+            }
+            Operation::Launch {
+                program,
+                args,
+                wait_ms,
+            } => self.launch(program, args, *wait_ms, context),
+            Operation::GlobalKey { keys } => {
+                if !self.policy.allow_input || !self.policy.allow_global_keys {
+                    return Err(error(
+                        "POLICY.DENIED",
+                        "global keys were not granted by the server operator",
+                    ));
+                }
+                validate_action(&Action::Key { keys: keys.clone() })?;
+                let backend = self
+                    .backends
+                    .values()
+                    .find(|b| {
+                        b.name() != browser::PROVIDER
+                            && self.allowed_provider(b.name())
+                            && b.offers_global_keys()
+                    })
+                    .cloned()
+                    .ok_or_else(|| {
+                        error(
+                            "CONTROL.ACTION_UNSUPPORTED",
+                            "no provider in this session can press global keys",
+                        )
+                    })?;
+                let _lease = self.input_lease("desktop-input")?;
+                context.remaining()?;
+                let sent = backend.global_key(keys, context)?;
+                // Whatever was observed may have changed under the keys.
+                self.state.lock().unwrap().observations.clear();
+                Ok(json!({"submitted": true, "provider": backend.name(), "operation": "global_key", "backend_result": sent, "verified": false, "requires_fresh_observation": true}))
+            }
+            Operation::ClipboardRead { max_characters } => {
+                if !self.policy.allow_clipboard_read {
+                    return Err(error(
+                        "POLICY.DENIED",
+                        "reading the clipboard was not granted by the server operator",
+                    ));
+                }
+                if max_characters.is_some_and(|max| max == 0 || max > 65_536) {
+                    return Err(error(
+                        "CONTROL.INVALID_REQUEST",
+                        "max_characters must be in 1..65536",
+                    ));
+                }
+                let mut last = error(
+                    "CONTROL.ACTION_UNSUPPORTED",
+                    "no provider in this session can read the clipboard",
+                );
+                for backend in self
+                    .backends
+                    .values()
+                    .filter(|b| b.name() != browser::PROVIDER && self.allowed_provider(b.name()))
+                {
+                    match backend.clipboard_read(*max_characters, context.remaining()?) {
+                        Ok(mut read) => {
+                            read["provider"] = json!(backend.name());
+                            return Ok(read);
+                        }
+                        Err(e) if e.code == "CONTROL.ACTION_UNSUPPORTED" => last = e,
+                        Err(e) => return Err(e),
+                    }
+                }
+                Err(last)
+            }
             Operation::Cancel { .. } | Operation::Close {} => unreachable!(),
         }
+    }
+
+    /// Add the operator's extra grants to a capabilities answer. Each appears
+    /// only when granted, so a client never learns of a refused ability by
+    /// seeing it listed.
+    fn with_grants(&self, mut answer: Value) -> Value {
+        if self.policy.allow_input && !self.policy.launch.is_empty() {
+            answer["launch"] = json!(self.policy.launch);
+        }
+        if self.policy.allow_clipboard_read {
+            answer["clipboard_read"] = json!(true);
+        }
+        if self.policy.allow_input && self.policy.allow_global_keys {
+            answer["global_keys"] = json!(true);
+        }
+        answer
+    }
+
+    /// Start an allowlisted program and answer the windows it opens.
+    fn launch(
+        &self,
+        program: &str,
+        args: &[String],
+        wait_ms: Option<u64>,
+        context: &Context,
+    ) -> Result<Value> {
+        if !self.policy.allow_input || self.policy.launch.is_empty() {
+            return Err(error(
+                "POLICY.DENIED",
+                "launching programs was not granted by the server operator",
+            ));
+        }
+        launch::validate_args(program, args)?;
+        if !launch::allowed(&self.policy.launch, program) {
+            return Err(error(
+                "POLICY.DENIED",
+                "that program is not on the server's launch allowlist",
+            )
+            .with_detail("allowlist", json!(self.policy.launch)));
+        }
+        let path = launch::resolve(program)?;
+        let image = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let desktops: Vec<Arc<dyn Backend>> = self
+            .backends
+            .values()
+            .filter(|b| b.name() != browser::PROVIDER && self.allowed_provider(b.name()))
+            .cloned()
+            .collect();
+        let listed = |timeout: Duration| -> Vec<BackendResource> {
+            desktops
+                .iter()
+                .filter_map(|backend| backend.resources(timeout).ok())
+                .flatten()
+                .collect()
+        };
+        let before: BTreeSet<String> = listed(context.remaining()?)
+            .into_iter()
+            .map(|item| item.resource.resource_id)
+            .collect();
+        let _lease = self.input_lease("desktop-input")?;
+        let remaining = context.commit()?;
+        let process_id = launch::spawn(&path, args)?;
+        // Stop waiting early enough to answer inside the request's deadline:
+        // the process has started, so running out of time would turn a
+        // committed launch into an unknown one.
+        let wait = Duration::from_millis(wait_ms.unwrap_or(10_000).min(MAX_TIMEOUT_MS))
+            .min(remaining.saturating_sub(Duration::from_millis(500)));
+        let until = Instant::now() + wait;
+        let mut found: Vec<BackendResource>;
+        loop {
+            let now = listed(
+                until
+                    .saturating_duration_since(Instant::now())
+                    .max(Duration::from_millis(200)),
+            );
+            let by_process: Vec<BackendResource> = now
+                .iter()
+                .filter(|item| item.resource.metadata["process_id"] == json!(process_id))
+                .cloned()
+                .collect();
+            // A launcher stub may hand over to another process of the same
+            // program (and exit): new windows of that image count too.
+            found = if by_process.is_empty() {
+                now.into_iter()
+                    .filter(|item| {
+                        !before.contains(&item.resource.resource_id)
+                            && item.resource.metadata["process_name"]
+                                .as_str()
+                                .is_some_and(|name| name.eq_ignore_ascii_case(&image))
+                    })
+                    .collect()
+            } else {
+                by_process
+            };
+            if !found.is_empty() || Instant::now() >= until {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let mut state = self.state.lock().unwrap();
+        let resources: Vec<Resource> = found
+            .into_iter()
+            .filter(|item| self.allowed_resource(&item.resource.resource_id))
+            .map(|item| {
+                let public = item.resource.clone();
+                state.resources.insert(public.resource_id.clone(), item);
+                public
+            })
+            .collect();
+        drop(state);
+        Ok(json!({
+            "process_id": process_id,
+            "program": path.display().to_string(),
+            "window_appeared": !resources.is_empty(),
+            "resources": resources,
+        }))
+    }
+
+    /// The retained observation and raw node a read-only target names.
+    fn observed_node(&self, target: &Target) -> Result<(Observation, Value)> {
+        if target.session_id != self.id {
+            return Err(error(
+                "CONTROL.SESSION_MISMATCH",
+                "target belongs to another session",
+            ));
+        }
+        let observation = self.observation(&target.observation_id)?;
+        if target.resource_id != observation.resource_id
+            || !self.allowed_resource(&target.resource_id)
+        {
+            return Err(error(
+                "POLICY.DENIED",
+                "target is outside the resource grant",
+            ));
+        }
+        let node = observation.raw["nodes"]
+            .as_array()
+            .and_then(|nodes| {
+                nodes
+                    .iter()
+                    .find(|n| n["node_id"] == target.node_id.as_str())
+            })
+            .cloned()
+            .ok_or_else(|| error("CONTROL.STALE_TARGET", "node was not observed"))?;
+        Ok((observation, node))
+    }
+
+    /// Capture a listed resource and retain it as this provider's only
+    /// current observation, with session targets on every node.
+    fn observe_resource(
+        &self,
+        resource_id: &str,
+        max_nodes: usize,
+        context: &Context,
+    ) -> Result<(String, Observation)> {
+        if max_nodes == 0 || max_nodes > MAX_NODES {
+            return Err(error(
+                "CONTROL.INVALID_REQUEST",
+                "max_nodes must be in 1..2000",
+            ));
+        }
+        let item = self
+            .state
+            .lock()
+            .unwrap()
+            .resources
+            .get(resource_id)
+            .cloned()
+            .ok_or_else(|| {
+                error(
+                    "CONTROL.TARGET_UNKNOWN",
+                    "list targets before observing a resource",
+                )
+            })?;
+        let backend = &self.backends[&item.resource.provider];
+        self.state
+            .lock()
+            .unwrap()
+            .observations
+            .retain(|_, old| old.provider != item.resource.provider);
+        let raw = backend.observe(&item.selector, max_nodes, context.remaining()?)?;
+        context.remaining()?;
+        let observation_id = uuid::Uuid::new_v4().to_string();
+        let mut nodes = raw["nodes"]
+            .as_array()
+            .cloned()
+            .ok_or_else(|| error("CONTROL.BAD_PROVIDER_OUTPUT", "snapshot omitted nodes"))?;
+        if nodes.len() > max_nodes {
+            return Err(error(
+                "CONTROL.BAD_PROVIDER_OUTPUT",
+                "snapshot exceeded node budget",
+            ));
+        }
+        for node in &mut nodes {
+            node["capabilities"] = json!(backend.node_capabilities(node));
+            let node_id = node["node_id"]
+                .as_str()
+                .ok_or_else(|| error("CONTROL.BAD_PROVIDER_OUTPUT", "node omitted identity"))?
+                .to_string();
+            node["target"] = serde_json::to_value(Target {
+                session_id: self.id.clone(),
+                resource_id: resource_id.to_string(),
+                observation_id: observation_id.clone(),
+                node_id,
+            })
+            .unwrap();
+        }
+        let observation = Observation {
+            provider: item.resource.provider.clone(),
+            resource_id: resource_id.to_string(),
+            raw,
+            nodes,
+            created: Instant::now(),
+        };
+        let mut state = self.state.lock().unwrap();
+        // Native providers have different snapshot retention rules. A new
+        // observation invalidates this provider's previous references.
+        state
+            .observations
+            .retain(|_, old| old.provider != item.resource.provider);
+        state
+            .observations
+            .insert(observation_id.clone(), observation.clone());
+        Ok((observation_id, observation))
+    }
+
+    /// Resolve a locator inside one retained observation.
+    fn find_in(
+        &self,
+        observation_id: &str,
+        observation: &Observation,
+        locator: &Locator,
+        expect: Expect,
+        context: &Context,
+    ) -> Result<Value> {
+        if observation.raw["truncated"] == true {
+            return Err(error(
+                "CONTROL.OBSERVATION_TRUNCATED",
+                "truncated observation cannot prove uniqueness",
+            ));
+        }
+        let backend = &self.backends[&observation.provider];
+        let resolved =
+            match backend.find(&observation.raw, locator, expect, context.remaining()?)? {
+                Some(resolved) => resolved,
+                None => portable_find(&observation.nodes, locator, expect)?,
+            };
+        context.remaining()?;
+        if resolved["found"] != true {
+            return Ok(json!({"found": false, "match_count": 0, "observation_id": observation_id}));
+        }
+        let node = resolved["node_id"]
+            .as_str()
+            .and_then(|id| observation.nodes.iter().find(|n| n["node_id"] == id))
+            .ok_or_else(|| {
+                error(
+                    "CONTROL.BAD_PROVIDER_OUTPUT",
+                    "find named a node outside the observation",
+                )
+            })?;
+        Ok(
+            json!({"found": true, "match_count": resolved["match_count"].as_u64().unwrap_or(1), "node": node, "target": node["target"], "observation_id": observation_id}),
+        )
+    }
+
+    /// Observe and find again and again until the condition holds. Built only
+    /// from observe and find, so every provider gets it; an ambiguous match
+    /// never counts as found, and the last observation stays current so a
+    /// found node's target can be acted on directly.
+    #[allow(clippy::too_many_arguments)]
+    fn wait(
+        &self,
+        resource_id: &str,
+        locator: &Locator,
+        condition: WaitCondition,
+        states: Option<&Value>,
+        max_nodes: usize,
+        interval_ms: Option<u64>,
+        context: &Context,
+    ) -> Result<Value> {
+        let invalid = |message: &str| Err(error("CONTROL.INVALID_REQUEST", message.to_string()));
+        if locator.is_empty() {
+            return invalid("wait requires a locator with at least one condition");
+        }
+        let interval = interval_ms.unwrap_or(DEFAULT_WAIT_INTERVAL_MS);
+        if !(MIN_WAIT_INTERVAL_MS..=MAX_WAIT_INTERVAL_MS).contains(&interval) {
+            return invalid("interval_ms must be in 50..5000");
+        }
+        let wanted = match (condition, states) {
+            (WaitCondition::State, Some(Value::Object(map)))
+                if !map.is_empty()
+                    && map.len() <= 16
+                    && map
+                        .values()
+                        .all(|v| v.is_boolean() || v.is_string() || v.is_number()) =>
+            {
+                map.clone()
+            }
+            (WaitCondition::State, _) => {
+                return invalid(
+                    "a state wait needs `states`: 1..16 state names with boolean, string or number values",
+                )
+            }
+            (_, Some(_)) => return invalid("`states` applies to the state condition only"),
+            (_, None) => serde_json::Map::new(),
+        };
+        let interval = Duration::from_millis(interval);
+        let started = Instant::now();
+        let mut polls = 0u64;
+        loop {
+            polls += 1;
+            let (observation_id, observation) =
+                match self.observe_resource(resource_id, max_nodes, context) {
+                    Ok(observed) => observed,
+                    // The page was between documents: keep polling.
+                    Err(e) if e.code == "BROWSER.CONTEXT_LOST" => {
+                        let remaining = context.remaining()?;
+                        if remaining < interval + Duration::from_millis(200) {
+                            return Err(e.with_detail("polls", json!(polls)));
+                        }
+                        std::thread::sleep(interval.min(remaining));
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                };
+            let (outcome, ambiguous) = match self.find_in(
+                &observation_id,
+                &observation,
+                locator,
+                Expect::Optional,
+                context,
+            ) {
+                Ok(found) => (Some(found), None),
+                Err(e)
+                    if matches!(
+                        e.code.as_str(),
+                        "CONTROL.AMBIGUOUS" | "DRIVER.AMBIGUOUS_MATCH"
+                    ) =>
+                {
+                    (None, Some(e))
+                }
+                Err(e) => return Err(e),
+            };
+            let present = outcome.as_ref().is_some_and(|f| f["found"] == true);
+            let satisfied = match condition {
+                WaitCondition::Appears => present,
+                // Several matches are still something present.
+                WaitCondition::Disappears => outcome.is_some() && !present,
+                WaitCondition::State => {
+                    present
+                        && outcome.as_ref().is_some_and(|f| {
+                            wanted
+                                .iter()
+                                .all(|(name, value)| f["node"]["states"][name] == *value)
+                        })
+                }
+            };
+            if satisfied {
+                let mut answer = json!({
+                    "satisfied": true,
+                    "condition": condition,
+                    "resource_id": resource_id,
+                    "observation_id": observation_id,
+                    "polls": polls,
+                    "elapsed_ms": started.elapsed().as_millis() as u64,
+                });
+                if let Some(found) = outcome.filter(|_| present) {
+                    answer["node"] = found["node"].clone();
+                    answer["target"] = found["target"].clone();
+                }
+                return Ok(answer);
+            }
+            // Stop while there is still time to say why, rather than letting
+            // the next capture run into the request deadline.
+            let remaining = context.remaining()?;
+            if remaining < interval + Duration::from_millis(200) {
+                if let Some(ambiguous) = ambiguous {
+                    return Err(ambiguous.with_detail("polls", json!(polls)));
+                }
+                let mut failure = error(
+                    "CONTROL.WAIT_TIMEOUT",
+                    match condition {
+                        WaitCondition::Appears => "the element did not appear in time",
+                        WaitCondition::Disappears => "the element was still there",
+                        WaitCondition::State => "the element did not reach the states in time",
+                    },
+                )
+                .with_retryable(true);
+                failure.details.insert("polls".into(), json!(polls));
+                failure
+                    .details
+                    .insert("observation_id".into(), json!(observation_id));
+                failure.details.insert("present".into(), json!(present));
+                if let Some(found) = outcome.filter(|_| present) {
+                    failure
+                        .details
+                        .insert("states".into(), found["node"]["states"].clone());
+                }
+                return Err(failure);
+            }
+            let wake = Instant::now() + interval;
+            while Instant::now() < wake {
+                context.remaining()?;
+                std::thread::sleep(
+                    wake.saturating_duration_since(Instant::now())
+                        .min(Duration::from_millis(25)),
+                );
+            }
+        }
+    }
+
+    /// Each file as an existing regular file under an allowed directory, by
+    /// its resolved path, so a link cannot lead outside the grant.
+    fn upload_files(&self, files: &[String]) -> Result<Vec<String>> {
+        if self.policy.upload_roots.is_empty() {
+            return Err(error(
+                "POLICY.DENIED",
+                "file uploads were not allowed by whoever started this server",
+            ));
+        }
+        let roots: Vec<std::path::PathBuf> = self
+            .policy
+            .upload_roots
+            .iter()
+            .filter_map(|root| root.canonicalize().ok())
+            .collect();
+        files
+            .iter()
+            .map(|file| {
+                let path = std::path::Path::new(file);
+                if !path.is_absolute() {
+                    return Err(error(
+                        "CONTROL.INVALID_REQUEST",
+                        "upload takes absolute file paths",
+                    ));
+                }
+                let real = path
+                    .canonicalize()
+                    .ok()
+                    .filter(|real| real.is_file())
+                    .ok_or_else(|| {
+                        error(
+                            "CONTROL.FILE_NOT_FOUND",
+                            format!("no regular file at {file}"),
+                        )
+                    })?;
+                if !roots.iter().any(|root| real.starts_with(root)) {
+                    return Err(error(
+                        "POLICY.DENIED",
+                        format!("{file} is outside the directories allowed for uploads"),
+                    ));
+                }
+                Ok(plain_path(&real))
+            })
+            .collect()
     }
 
     fn observation(&self, id: &str) -> Result<Observation> {
@@ -851,14 +1472,84 @@ impl Session {
     }
 }
 
+/// The sha256 of a screenshot's base64 PNG. Compared across captures to tell
+/// whether what is shown changed, e.g. a login code that refreshes, without
+/// reading the image; a read_text of the same pixels carries the same digest.
+fn digest_of(shot: &Value) -> String {
+    use sha2::Digest;
+    shot["data"]
+        .as_str()
+        .map(|data| {
+            sha2::Sha256::digest(data.as_bytes())
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// A provider's OCR answer as callers see it: positions as fractions of the
+/// element's box (never screen or image coordinates), the image's digest
+/// instead of the image.
+fn text_answer(read: &Value, provider: &str) -> Value {
+    let width = read["width"].as_f64().filter(|w| *w > 0.0).unwrap_or(1.0);
+    let height = read["height"].as_f64().filter(|h| *h > 0.0).unwrap_or(1.0);
+    let round = |value: f64| (value.clamp(0.0, 1.0) * 10_000.0).round() / 10_000.0;
+    let shape = |span: &Value| {
+        let number = |key: &str| span["bounds"][key].as_f64().unwrap_or_default();
+        json!({
+            "text": span["text"],
+            "box": {
+                "fx": round(number("x") / width),
+                "fy": round(number("y") / height),
+                "fw": round(number("width") / width),
+                "fh": round(number("height") / height),
+            },
+        })
+    };
+    let lines: Vec<Value> = read["lines"]
+        .as_array()
+        .map(|lines| {
+            lines
+                .iter()
+                .map(|line| {
+                    let mut shaped = shape(line);
+                    shaped["words"] = json!(line["words"]
+                        .as_array()
+                        .map(|words| words.iter().map(shape).collect::<Vec<_>>())
+                        .unwrap_or_default());
+                    shaped
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let text = lines
+        .iter()
+        .filter_map(|line| line["text"].as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    json!({
+        "provider": provider,
+        "engine": read["engine"],
+        "language": read["language"],
+        "text": text,
+        "lines": lines,
+        "digest": digest_of(read),
+        "clipped": read["clipped"] == true,
+        "read_only": true,
+    })
+}
+
 fn validate_action(action: &Action) -> Result<()> {
     let text = match action {
         Action::Fill { value } => Some(value),
         Action::TypeText { text, .. } => Some(text),
+        Action::Paste { text } => Some(text),
         Action::Select { option } => Some(option),
+        Action::Accept { text } => text.as_ref(),
         _ => None,
     };
-    if let Action::Navigate { url } = action {
+    if let Action::Navigate { url } | Action::OpenTab { url } = action {
         let scheme = url
             .split_once("://")
             .map(|(scheme, _)| scheme.to_ascii_lowercase());
@@ -868,7 +1559,7 @@ fn validate_action(action: &Action) -> Result<()> {
         {
             return Err(error(
                 "CONTROL.INVALID_REQUEST",
-                "navigate takes an http or https address of at most 2048 characters",
+                "navigate and open_tab take an http or https address of at most 2048 characters",
             ));
         }
     }
@@ -876,6 +1567,32 @@ fn validate_action(action: &Action) -> Result<()> {
         return Err(error(
             "CONTROL.INVALID_REQUEST",
             "input text must be bounded and contain no NUL",
+        ));
+    }
+    if matches!(action, Action::Paste { text } if text.is_empty()) {
+        return Err(error("CONTROL.INVALID_REQUEST", "paste needs some text"));
+    }
+    if let Action::Upload { files } = action {
+        if files.is_empty()
+            || files.len() > MAX_UPLOAD_FILES
+            || files
+                .iter()
+                .any(|f| f.is_empty() || f.len() > 4096 || f.chars().any(char::is_control))
+        {
+            return Err(error(
+                "CONTROL.INVALID_REQUEST",
+                "upload takes 1..32 file paths of at most 4096 characters",
+            ));
+        }
+    }
+    if let Action::Emulate {
+        preset: None,
+        color_scheme: None,
+    } = action
+    {
+        return Err(error(
+            "CONTROL.INVALID_REQUEST",
+            "emulate needs a preset, a color_scheme or both",
         ));
     }
     if let Action::Key { keys } = action {
@@ -918,6 +1635,19 @@ fn validate_action(action: &Action) -> Result<()> {
     }
 }
 
+/// A resolved path as browsers accept it: without the Windows `\\?\` prefix.
+fn plain_path(path: &std::path::Path) -> String {
+    let text = path.display().to_string();
+    match text.strip_prefix(r"\\?\") {
+        Some(rest) if rest.as_bytes().get(1) == Some(&b':') => rest.to_string(),
+        Some(rest) => match rest.strip_prefix("UNC\\") {
+            Some(share) => format!(r"\\{share}"),
+            None => text,
+        },
+        None => text,
+    }
+}
+
 fn validate_view(view: &View) -> Result<()> {
     if view
         .limit
@@ -931,12 +1661,15 @@ fn validate_view(view: &View) -> Result<()> {
             "view limit must be in 1..500 and max_characters in 500..200000",
         ));
     }
-    if view.mode != ViewMode::Outline
-        && (view.region.is_some() || view.limit.is_some() || view.max_characters.is_some())
-    {
+    let shaped = match view.mode {
+        ViewMode::Outline => true,
+        ViewMode::Text => view.limit.is_none(),
+        _ => false,
+    };
+    if !shaped && (view.region.is_some() || view.limit.is_some() || view.max_characters.is_some()) {
         return Err(error(
             "CONTROL.INVALID_REQUEST",
-            "region, limit and max_characters shape an outline view only",
+            "region and max_characters shape an outline or text view; limit an outline only",
         ));
     }
     Ok(())
@@ -944,16 +1677,31 @@ fn validate_view(view: &View) -> Result<()> {
 
 /// Elements a caller can act on or read, in capture order, within both the
 /// element and character ceilings. Providers with richer structure override it.
+///
+/// A provider that reports a `region` on its nodes (the name of the landmark
+/// a node sits in, null outside any) also gets the overview and the outline
+/// of one region.
 fn portable_view(nodes: &[Value], view: &View) -> Result<Value> {
-    if view.mode == ViewMode::Overview || view.region.is_some() {
+    if view.mode == ViewMode::Text {
+        return Err(error(
+            "CONTROL.VIEW_UNSUPPORTED",
+            "this provider has no text view; observe with an outline view",
+        ));
+    }
+    let regional = nodes.iter().any(|n| n.get("region").is_some());
+    if !regional && (view.mode == ViewMode::Overview || view.region.is_some()) {
         return Err(error(
             "CONTROL.VIEW_UNSUPPORTED",
             "this provider has no region overview; observe with an outline view",
         ));
     }
+    let region_of = |n: &Value| n["region"].as_str().unwrap_or(LOOSE_REGION).to_string();
+    if view.mode == ViewMode::Overview {
+        return Ok(portable_overview(nodes, region_of));
+    }
     let limit = view.limit.unwrap_or(DEFAULT_OUTLINE_LIMIT);
     let budget = view.max_characters.unwrap_or(DEFAULT_OUTLINE_CHARACTERS);
-    let eligible: Vec<&Value> = nodes
+    let mut eligible: Vec<&Value> = nodes
         .iter()
         .filter(|n| {
             n["capabilities"].as_array().is_some_and(|c| !c.is_empty())
@@ -961,6 +1709,21 @@ fn portable_view(nodes: &[Value], view: &View) -> Result<Value> {
         })
         .filter(|n| n["states"]["offscreen"] != true)
         .collect();
+    if let Some(region) = &view.region {
+        eligible.retain(|n| region_of(n) == *region);
+        if eligible.is_empty() {
+            // Not an empty region: a misremembered name is a different fact.
+            return Err(error(
+                "CONTROL.NOT_FOUND",
+                format!("no region named {region:?} here"),
+            )
+            .with_retryable(true)
+            .with_detail(
+                "regions",
+                portable_overview(nodes, region_of)["regions"].clone(),
+            ));
+        }
+    }
     let mut shown = Vec::new();
     let mut characters = 0;
     let mut stopped_by = Value::Null;
@@ -977,13 +1740,61 @@ fn portable_view(nodes: &[Value], view: &View) -> Result<Value> {
         characters += size;
         shown.push((*node).clone());
     }
-    Ok(json!({
+    let mut answer = json!({
         "nodes": shown,
         "shown": shown.len(),
         "matched": eligible.len(),
         "outline_truncated": shown.len() < eligible.len(),
         "stopped_by": stopped_by,
-    }))
+    });
+    if let Some(region) = &view.region {
+        answer["region"] = json!(region);
+    }
+    Ok(answer)
+}
+
+/// The region of a node outside every landmark.
+pub const LOOSE_REGION: &str = "(loose in the page)";
+/// Regions an overview names; the rest are counted as folded.
+const OVERVIEW_REGIONS: usize = 12;
+
+/// Regions by how many actionable elements each holds, largest first, with
+/// what kind of thing is in them.
+fn portable_overview(nodes: &[Value], region_of: impl Fn(&Value) -> String) -> Value {
+    let mut regions: Vec<(String, Vec<&Value>)> = Vec::new();
+    for node in nodes.iter().filter(|n| {
+        n["capabilities"].as_array().is_some_and(|c| !c.is_empty())
+            && n["states"]["offscreen"] != true
+    }) {
+        let label = region_of(node);
+        match regions.iter_mut().find(|(known, _)| *known == label) {
+            Some((_, members)) => members.push(node),
+            None => regions.push((label, vec![node])),
+        }
+    }
+    regions.sort_by_key(|(_, members)| std::cmp::Reverse(members.len()));
+    let interactive: usize = regions.iter().map(|(_, m)| m.len()).sum();
+    let (named, folded) = regions.split_at(OVERVIEW_REGIONS.min(regions.len()));
+    let described: Vec<Value> = named
+        .iter()
+        .map(|(label, members)| {
+            let mut roles: BTreeMap<&str, usize> = BTreeMap::new();
+            for node in members {
+                *roles.entry(node["role"].as_str().unwrap_or("")).or_default() += 1;
+            }
+            json!({
+                "region": label,
+                "elements": members.len(),
+                "holds": roles.iter().map(|(role, count)| json!({"role": role, "count": count})).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    json!({
+        "regions": described,
+        "interactive": interactive,
+        "folded_regions": folded.len(),
+        "folded_elements": folded.iter().map(|(_, m)| m.len()).sum::<usize>(),
+    })
 }
 
 /// Exact `role` / `name` / `node_id` matching, the subset every provider shares.
@@ -1034,6 +1845,22 @@ fn portable_find(nodes: &[Value], locator: &Locator, expect: Expect) -> Result<V
 #[cfg(test)]
 mod admission_tests {
     use super::*;
+
+    #[test]
+    fn new_tabs_open_only_web_addresses() {
+        for url in ["http://127.0.0.1/", "https://example.com/a?b"] {
+            assert!(validate_action(&Action::OpenTab { url: url.into() }).is_ok());
+        }
+        for url in [
+            "javascript:alert(1)",
+            "file:///etc/passwd",
+            "chrome://settings",
+            "https://example.com/\n",
+        ] {
+            assert!(validate_action(&Action::OpenTab { url: url.into() }).is_err());
+        }
+        assert!(validate_action(&Action::ClosePage {}).is_ok());
+    }
 
     #[test]
     fn cancellation_cannot_fall_between_replay_guard_and_context_registration() {

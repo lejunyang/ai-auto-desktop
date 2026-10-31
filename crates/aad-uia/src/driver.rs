@@ -11,8 +11,8 @@
 //! occupies that position.
 
 use crate::backend::{
-    Backend, CaptureLimits, DriverError, PointerButton, PointerGesture, Result, ScrollDirection,
-    ScrollSpec, SnapshotStore,
+    Backend, CaptureLimits, DriverError, Pixels, PointerButton, PointerGesture, Result,
+    ScrollDirection, ScrollSpec, SnapshotStore,
 };
 use crate::capture::{self, CapturedEvent};
 use crate::model::{Locator, Node, Snapshot, Target, NODE_ACTIONS, OUTLINE_BUDGET};
@@ -20,6 +20,7 @@ use crate::observe_session::{ObserveManager, ObserveSource};
 use aad_plugin::{manifest, CapabilityManifest};
 use aad_runtime::journal::now_rfc3339;
 use aad_runtime::provider::Provider;
+use base64::Engine as _;
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -37,9 +38,21 @@ pub const WRITE_ACTIONS: &[&str] = &[
     "key_chord",
     "pointer_gesture",
     "drag",
+    "minimize",
+    "maximize",
+    "restore",
+    "close_window",
+    "activate",
+    "paste",
+    "global_key",
 ];
 
 const MAX_TYPE_TEXT_CHARS: usize = 1024;
+/// Clipboard text returned by default, and at most.
+const DEFAULT_CLIPBOARD_CHARS: usize = 16_384;
+const MAX_CLIPBOARD_CHARS: usize = 65_536;
+/// The most text one paste carries.
+const MAX_PASTE_CHARS: usize = 4_096;
 
 /// A chord is a handful of modifiers plus one key; anything longer is a caller
 /// error, not a combination any application listens for.
@@ -104,8 +117,32 @@ impl UiaDriver {
             "describe" => self.describe(&args),
             "overview" => self.overview(&args),
             "find" => self.find(&args),
+            "capture" => self.capture_element(&args),
+            "read_text" => self.read_text(&args),
+            "clipboard_read" => self.clipboard_read(&args),
+            "global_key" => {
+                let keys: Vec<String> = args
+                    .get("keys")
+                    .and_then(Value::as_array)
+                    .ok_or_else(|| DriverError::invalid("keys is required"))?
+                    .iter()
+                    .map(|key| {
+                        key.as_str()
+                            .map(str::to_string)
+                            .ok_or_else(|| DriverError::invalid("every key must be a string"))
+                    })
+                    .collect::<Result<_>>()?;
+                if keys.is_empty() || keys.len() > MAX_CHORD_KEYS {
+                    return Err(DriverError::invalid(format!(
+                        "a key combination holds 1..{MAX_CHORD_KEYS} keys"
+                    )));
+                }
+                let sent = self.backend.global_key(&keys)?;
+                Ok(json!({"applied": true, "action": "global_key", "keys": keys, "focus": sent}))
+            }
             "focus" | "invoke" | "set_value" | "type_text" | "pointer_click" | "key_chord"
-            | "pointer_gesture" | "drag" => self.act(action, &args),
+            | "pointer_gesture" | "drag" | "minimize" | "maximize" | "restore" | "close_window"
+            | "activate" | "paste" => self.act(action, &args),
             "watch" => self.watch(&args),
             "collect" => self.collect(&args),
             "release" => self.release(&args),
@@ -463,6 +500,108 @@ impl UiaDriver {
         Ok((snapshot.window.window_id.clone(), node))
     }
 
+    /// The live pixels of an observed, revalidated element.
+    ///
+    /// Read-only, but anchored like a write: the target must still match the
+    /// live UI, so a screenshot is always of the element the caller observed.
+    /// A password field is refused outright.
+    fn element_pixels(&self, args: &Value) -> Result<(Node, Pixels)> {
+        let target = args
+            .get("target")
+            .ok_or_else(|| DriverError::invalid("target is required"))
+            .and_then(|value| Target::from_value(value).map_err(DriverError::invalid))?;
+        let (window_id, node) = self.resolve(&target)?;
+        if node.states.protected == Some(true) {
+            return Err(DriverError::new(
+                "DRIVER.PROTECTED_ELEMENT",
+                "a password or otherwise protected element is never captured",
+            )
+            .with_detail("node_id", json!(node.node_id)));
+        }
+        // The window's own root node captures the whole window.
+        let whole_window = node.parent_id.is_none();
+        let pixels = self
+            .backend
+            .capture_pixels(&window_id, &node, whole_window)?;
+        Ok((node, pixels))
+    }
+
+    fn capture_element(&self, args: &Value) -> Result<Value> {
+        let (node, pixels) = self.element_pixels(args)?;
+        let png = encode_png(&pixels)?;
+        Ok(json!({
+            "format": "png",
+            "data": base64::engine::general_purpose::STANDARD.encode(png),
+            "width": pixels.width,
+            "height": pixels.height,
+            "clipped": pixels.clipped,
+            "node_id": node.node_id,
+        }))
+    }
+
+    /// OCR over the same pixels `capture` returns, with pixel boxes.
+    ///
+    /// The PNG travels with the answer so the session can digest exactly the
+    /// image that was read; the session drops it before answering a caller.
+    fn read_text(&self, args: &Value) -> Result<Value> {
+        let language = match args.get("language") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(tag))
+                if !tag.is_empty()
+                    && tag.len() <= 35
+                    && tag.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') =>
+            {
+                Some(tag.as_str())
+            }
+            Some(_) => return Err(DriverError::invalid("language must be a BCP-47 tag")),
+        };
+        let (node, pixels) = self.element_pixels(args)?;
+        let recognition = self.backend.recognize_text(&pixels, language)?;
+        let span = |span: &crate::backend::TextSpan| {
+            json!({"text": span.text, "bounds": {
+                "x": span.bounds.x, "y": span.bounds.y,
+                "width": span.bounds.width, "height": span.bounds.height,
+            }})
+        };
+        let png = encode_png(&pixels)?;
+        Ok(json!({
+            "engine": recognition.engine,
+            "language": recognition.language,
+            "lines": recognition.lines.iter().map(|(line, words)| {
+                let mut line = span(line);
+                line["words"] = json!(words.iter().map(span).collect::<Vec<_>>());
+                line
+            }).collect::<Vec<_>>(),
+            "format": "png",
+            "data": base64::engine::general_purpose::STANDARD.encode(png),
+            "width": pixels.width,
+            "height": pixels.height,
+            "clipped": pixels.clipped,
+            "node_id": node.node_id,
+        }))
+    }
+
+    /// The clipboard's text, bounded. Not anchored on any element: whether a
+    /// caller may read it at all is the host's policy, decided before this.
+    fn clipboard_read(&self, args: &Value) -> Result<Value> {
+        let max = match args.get("max_characters") {
+            None | Some(Value::Null) => DEFAULT_CLIPBOARD_CHARS,
+            Some(value) => value
+                .as_u64()
+                .filter(|max| (1..=MAX_CLIPBOARD_CHARS as u64).contains(max))
+                .ok_or_else(|| {
+                    DriverError::invalid(format!("max_characters must be 1..{MAX_CLIPBOARD_CHARS}"))
+                })? as usize,
+        };
+        let (text, total) = self.backend.clipboard_text(max)?;
+        Ok(json!({
+            "has_text": text.is_some(),
+            "text": text,
+            "characters": total,
+            "truncated": total > max,
+        }))
+    }
+
     fn act(&self, action: &str, args: &Value) -> Result<Value> {
         let target = args
             .get("target")
@@ -584,6 +723,48 @@ impl UiaDriver {
                 }
                 let gesture = parse_drag_gesture(args)?;
                 self.backend.drag(&window_id, &node, &to_node, &gesture)?
+            }
+            "paste" => {
+                let text = args
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| DriverError::invalid("text is required"))?;
+                if text.is_empty() || text.chars().count() > MAX_PASTE_CHARS {
+                    return Err(DriverError::invalid(format!(
+                        "paste takes 1..{MAX_PASTE_CHARS} characters"
+                    )));
+                }
+                if node.states.read_only == Some(true) || node.states.protected == Some(true) {
+                    return Err(DriverError::invalid(
+                        "the element is read-only or protected",
+                    ));
+                }
+                let pasted = self.backend.paste(&window_id, &node, text)?;
+                return Ok(json!({
+                    "applied": true,
+                    "action": action,
+                    "node_id": node.node_id,
+                    "window_id": window_id,
+                    "paste": pasted,
+                }));
+            }
+            "minimize" | "maximize" | "restore" | "close_window" | "activate" => {
+                // Only the window's own node stands for the window: a node
+                // inside it cannot be minimized or closed on its behalf.
+                if node.parent_id.is_some() {
+                    return Err(DriverError::new(
+                        "DRIVER.ACTION_UNSUPPORTED",
+                        "window actions apply to the observed window's own node",
+                    ));
+                }
+                let state = self.backend.window_action(&window_id, &node, action)?;
+                return Ok(json!({
+                    "applied": true,
+                    "action": action,
+                    "node_id": node.node_id,
+                    "window_id": window_id,
+                    "window": state,
+                }));
             }
             other => return Err(DriverError::invalid(format!("unknown action {other:?}"))),
         }
@@ -780,6 +961,35 @@ fn step_to_json(step: &capture::RecordedStep) -> Value {
     })
 }
 
+/// Encode captured pixels as an opaque PNG. Deterministic: the same pixels
+/// always give the same bytes, so a digest of the PNG tells change apart.
+pub fn encode_png(pixels: &Pixels) -> Result<Vec<u8>> {
+    let expected = pixels.width as usize * pixels.height as usize * 4;
+    if pixels.width == 0 || pixels.height == 0 || pixels.rgba.len() != expected {
+        return Err(DriverError::new(
+            "DRIVER.ACTION_FAILED",
+            "the captured image has no area or a malformed pixel buffer",
+        ));
+    }
+    let rgb: Vec<u8> = pixels
+        .rgba
+        .chunks_exact(4)
+        .flat_map(|p| [p[0], p[1], p[2]])
+        .collect();
+    let image = image::RgbImage::from_raw(pixels.width, pixels.height, rgb)
+        .ok_or_else(|| DriverError::new("DRIVER.ACTION_FAILED", "malformed pixel buffer"))?;
+    let mut png = Vec::new();
+    image
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .map_err(|error| {
+            DriverError::new(
+                "DRIVER.ACTION_FAILED",
+                format!("PNG encoding failed: {error}"),
+            )
+        })?;
+    Ok(png)
+}
+
 /// The action contracts this driver publishes in its manifest.
 /// The largest scroll a single request may ask for, in notches. Enough to page
 /// through a long list, bounded so one call cannot spin the wheel indefinitely.
@@ -965,6 +1175,24 @@ fn action_contracts() -> Map<String, Value> {
         "find".into(),
         read_only("Find the single element matching a locator."),
     );
+    actions.insert(
+        "capture".into(),
+        read_only("Take a PNG of one observed element, or of its whole window."),
+    );
+    // Changes nothing, but sensitive: hosts gate it behind its own grant.
+    actions.insert(
+        "clipboard_read".into(),
+        json!({
+            "contract_major": 1,
+            "summary": "Read the clipboard's text, bounded.",
+            "effect": {"default_class": "read_only"},
+            "risk": {"category": "observe", "level": "high"},
+        }),
+    );
+    actions.insert(
+        "read_text".into(),
+        read_only("Recognise the text one observed element shows, with Windows OCR."),
+    );
 
     // Watching changes nothing on the desktop, but it is not `read_only`
     // either: it installs hooks and holds a session open until released, which
@@ -1069,6 +1297,44 @@ fn action_contracts() -> Map<String, Value> {
             "Click the centre of an element.",
             "input",
             "medium",
+            "non_idempotent",
+        ),
+    );
+    for (name, summary) in [
+        ("minimize", "Minimize the observed window."),
+        ("maximize", "Maximize the observed window."),
+        (
+            "restore",
+            "Restore the observed window from minimized or maximized.",
+        ),
+        ("activate", "Bring the observed window to the foreground."),
+    ] {
+        actions.insert(name.into(), write(summary, "navigate", "low", "idempotent"));
+    }
+    actions.insert(
+        "global_key".into(),
+        write(
+            "Press a key combination wherever focus is, anchored on no element.",
+            "input",
+            "high",
+            "non_idempotent",
+        ),
+    );
+    actions.insert(
+        "paste".into(),
+        write(
+            "Paste text into an element through the clipboard, restoring the clipboard after.",
+            "input",
+            "medium",
+            "non_idempotent",
+        ),
+    );
+    actions.insert(
+        "close_window".into(),
+        write(
+            "Ask the observed window to close, as its close button would.",
+            "modify",
+            "high",
             "non_idempotent",
         ),
     );

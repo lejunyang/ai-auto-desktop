@@ -47,6 +47,12 @@ impl NativeBackend {
             "key" => "key_chord",
             "scroll" | "hover" => "pointer_gesture",
             "drag" => "drag",
+            "minimize" => "minimize",
+            "maximize" => "maximize",
+            "restore" => "restore",
+            "close_window" => "close_window",
+            "activate" => "activate",
+            "paste" => "paste",
             _ => "",
         }
     }
@@ -70,7 +76,231 @@ fn fraction(value: &Option<crate::Fraction>) -> Value {
     value.map_or(Value::Null, |f| json!({"fx": f.fx, "fy": f.fy}))
 }
 
+impl NativeBackend {
+    /// Whether the driver publishes this native operation.
+    fn offers(&self, native: &str) -> bool {
+        self.provider.manifest().actions.contains_key(native)
+    }
+    fn target_of(snapshot: &Value, node_id: &Value) -> Value {
+        json!({"snapshot_id": snapshot["snapshot_id"], "revision": snapshot["revision"], "node_id": node_id})
+    }
+    /// AT-SPI and AX re-resolve every target from a descriptive locator
+    /// before acting or capturing; UI Automation does not need one.
+    fn portable(&self) -> bool {
+        !matches!(self.flavor, Flavor::Windows)
+    }
+    fn locator_of(&self, node: &Value) -> Value {
+        let mut locator = Map::new();
+        locator.insert("role".into(), node["role"].clone());
+        for field in ["name", "description"] {
+            if node[field].as_str().is_some_and(|s| !s.is_empty()) {
+                locator.insert(field.into(), node[field].clone());
+            }
+        }
+        if matches!(self.flavor, Flavor::Linux) {
+            if node["attributes"]
+                .as_object()
+                .is_some_and(|v| !v.is_empty())
+            {
+                locator.insert("attributes".into(), node["attributes"].clone());
+            }
+        } else if !node["subrole"].is_null() {
+            locator.insert("subrole".into(), node["subrole"].clone());
+        }
+        Value::Object(locator)
+    }
+    /// The target (and, for AT-SPI/AX, locator) of a read on one node.
+    fn read_args(&self, snapshot: &Value, node: &Value) -> Value {
+        let mut args = json!({"target": Self::target_of(snapshot, &node["node_id"])});
+        if self.portable() {
+            args["locator"] = self.locator_of(node);
+        }
+        args
+    }
+    /// OCR off Windows: Tesseract over the capture's pixels, through the
+    /// resource-limited `aad-ocr` engine runner.
+    fn read_text_with_tesseract(
+        &self,
+        snapshot: &Value,
+        node: &Value,
+        language: Option<&str>,
+        timeout: Duration,
+    ) -> Result<Value> {
+        use base64::Engine as _;
+        let until = std::time::Instant::now() + timeout;
+        let left = || {
+            until
+                .checked_duration_since(std::time::Instant::now())
+                .filter(|left| !left.is_zero())
+                .ok_or_else(|| error("CONTROL.TIMEOUT", "request deadline elapsed"))
+        };
+        let engine = tesseract()?;
+        let languages = match language {
+            None => Vec::new(),
+            Some(tag) => {
+                let wanted = tesseract_language(tag);
+                let available = engine.languages(left()?).map_err(ocr_unavailable)?;
+                match wanted.filter(|code| available.iter().any(|have| have == code)) {
+                    Some(code) => vec![code.to_string()],
+                    None => {
+                        return Err(error(
+                            "DRIVER.OCR_UNAVAILABLE",
+                            format!("no installed Tesseract language data reads {tag}"),
+                        )
+                        .with_detail("available_languages", json!(available)))
+                    }
+                }
+            }
+        };
+        let shot = self.capture(snapshot, node, left()?)?;
+        let png = shot["data"]
+            .as_str()
+            .and_then(|data| base64::engine::general_purpose::STANDARD.decode(data).ok())
+            .ok_or_else(|| error("CONTROL.BAD_PROVIDER_OUTPUT", "capture returned no PNG"))?;
+        let mut read = engine
+            .recognize_png(&png, &languages, left()?)
+            .map_err(ocr_unavailable)?;
+        for key in ["format", "data", "width", "height", "clipped"] {
+            read[key] = shot[key].clone();
+        }
+        Ok(read)
+    }
+}
+
+fn tesseract() -> Result<aad_ocr::OcrProvider> {
+    let engine = aad_ocr::OcrProvider::new().map_err(ocr_unavailable)?;
+    engine.engine_ready().map_err(ocr_unavailable)?;
+    Ok(engine)
+}
+
+/// An engine that is missing or cannot be sandboxed is "no OCR here", the
+/// same answer Windows gives for a missing language pack.
+fn ocr_unavailable(cause: aad_core::AutomationError) -> aad_core::AutomationError {
+    match cause.code.as_str() {
+        "OCR.ENGINE_UNAVAILABLE" | "OCR.ENGINE_ISOLATION_UNAVAILABLE" => error(
+            "DRIVER.OCR_UNAVAILABLE",
+            "Tesseract OCR is not available on this host",
+        )
+        .with_detail("reason", json!(cause.message))
+        .with_detail("engine", json!("tesseract")),
+        "OCR.TIMEOUT" => error("CONTROL.TIMEOUT", cause.message.clone()).with_cause(cause),
+        _ => error("DRIVER.OCR_FAILED", "Tesseract could not read the image").with_cause(cause),
+    }
+}
+
+/// A BCP-47 tag to the Tesseract traineddata that reads it.
+pub fn tesseract_language(tag: &str) -> Option<&'static str> {
+    let lower = tag.to_ascii_lowercase();
+    let primary = lower.split('-').next().unwrap_or_default();
+    Some(match primary {
+        "en" => "eng",
+        "de" => "deu",
+        "fr" => "fra",
+        "es" => "spa",
+        "it" => "ita",
+        "pt" => "por",
+        "nl" => "nld",
+        "ru" => "rus",
+        "uk" => "ukr",
+        "pl" => "pol",
+        "tr" => "tur",
+        "ja" => "jpn",
+        "ko" => "kor",
+        "ar" => "ara",
+        "he" => "heb",
+        "hi" => "hin",
+        "zh" if lower.contains("hant") || lower.ends_with("-tw") || lower.ends_with("-hk") => {
+            "chi_tra"
+        }
+        "zh" => "chi_sim",
+        _ => return None,
+    })
+}
+
 impl Backend for NativeBackend {
+    fn reads(&self) -> Vec<String> {
+        let mut reads = Vec::new();
+        if self.offers("capture") {
+            reads.push("capture".to_string());
+        }
+        // Windows reads text in its own driver; elsewhere Tesseract reads the
+        // capture, so text is offered only where both exist on this host.
+        let read_text = match self.flavor {
+            Flavor::Windows => self.offers("read_text"),
+            _ => self.offers("capture") && tesseract().is_ok(),
+        };
+        if read_text {
+            reads.push("read_text".to_string());
+        }
+        reads
+    }
+    fn capture(&self, snapshot: &Value, node: &Value, timeout: Duration) -> Result<Value> {
+        if !self.offers("capture") {
+            return Err(error(
+                "CONTROL.ACTION_UNSUPPORTED",
+                "this provider cannot take screenshots",
+            ));
+        }
+        let shot = self.invoke("capture", self.read_args(snapshot, node), timeout)?;
+        let mut answer = Map::new();
+        for key in ["format", "data", "width", "height", "clipped"] {
+            answer.insert(key.into(), shot[key].clone());
+        }
+        Ok(Value::Object(answer))
+    }
+    fn offers_global_keys(&self) -> bool {
+        self.offers("global_key")
+    }
+    fn global_key(&self, keys: &[String], context: &crate::Context) -> Result<Value> {
+        if !self.offers_global_keys() {
+            return Err(error(
+                "CONTROL.ACTION_UNSUPPORTED",
+                "this provider cannot press global keys",
+            ));
+        }
+        self.invoke("global_key", json!({"keys": keys}), context.commit()?)
+    }
+    fn clipboard_read(&self, max_characters: Option<usize>, timeout: Duration) -> Result<Value> {
+        if !self.offers("clipboard_read") {
+            return Err(error(
+                "CONTROL.ACTION_UNSUPPORTED",
+                "this provider cannot read the clipboard",
+            ));
+        }
+        let mut args = json!({});
+        if let Some(max) = max_characters {
+            args["max_characters"] = json!(max);
+        }
+        self.invoke("clipboard_read", args, timeout)
+    }
+    fn read_text(
+        &self,
+        snapshot: &Value,
+        node: &Value,
+        language: Option<&str>,
+        timeout: Duration,
+    ) -> Result<Value> {
+        if !matches!(self.flavor, Flavor::Windows) {
+            if !self.offers("capture") {
+                return Err(error(
+                    "CONTROL.ACTION_UNSUPPORTED",
+                    "this provider cannot read text from pixels",
+                ));
+            }
+            return self.read_text_with_tesseract(snapshot, node, language, timeout);
+        }
+        if !self.offers("read_text") {
+            return Err(error(
+                "CONTROL.ACTION_UNSUPPORTED",
+                "this provider cannot read text from pixels",
+            ));
+        }
+        let mut args = json!({"target": Self::target_of(snapshot, &node["node_id"])});
+        if let Some(language) = language {
+            args["language"] = json!(language);
+        }
+        self.invoke("read_text", args, timeout)
+    }
     fn node_capabilities(&self, node: &Value) -> Vec<String> {
         ACTION_NAMES
             .iter()
@@ -153,7 +383,7 @@ impl Backend for NativeBackend {
         }
         let mut args = json!({"snapshot_id": snapshot["snapshot_id"]});
         match view.mode {
-            ViewMode::Nodes => Ok(None),
+            ViewMode::Nodes | ViewMode::Text => Ok(None),
             ViewMode::Overview => {
                 let overview = self.invoke("overview", args, timeout)?;
                 Ok(Some(json!({"regions": overview["regions"]})))
@@ -242,31 +472,12 @@ impl Backend for NativeBackend {
                 "observed node does not support this native operation",
             ));
         }
-        let target_of = |node_id: &Value| json!({"snapshot_id": snapshot["snapshot_id"], "revision": snapshot["revision"], "node_id": node_id});
+        let target_of = |node_id: &Value| Self::target_of(snapshot, node_id);
         let mut args = json!({"target": target_of(&node["node_id"])});
         // AT-SPI and AX re-resolve every target from a descriptive locator
         // before acting, so each end of an action carries one.
-        let portable = !matches!(self.flavor, Flavor::Windows);
-        let locator_of = |node: &Value| {
-            let mut locator = Map::new();
-            locator.insert("role".into(), node["role"].clone());
-            for field in ["name", "description"] {
-                if node[field].as_str().is_some_and(|s| !s.is_empty()) {
-                    locator.insert(field.into(), node[field].clone());
-                }
-            }
-            if matches!(self.flavor, Flavor::Linux) {
-                if node["attributes"]
-                    .as_object()
-                    .is_some_and(|v| !v.is_empty())
-                {
-                    locator.insert("attributes".into(), node["attributes"].clone());
-                }
-            } else if !node["subrole"].is_null() {
-                locator.insert("subrole".into(), node["subrole"].clone());
-            }
-            Value::Object(locator)
-        };
+        let portable = self.portable();
+        let locator_of = |node: &Value| self.locator_of(node);
         if portable {
             args["locator"] = locator_of(node);
         }
@@ -300,6 +511,7 @@ impl Backend for NativeBackend {
                 }
             }
             Action::Key { keys } => set("keys", json!(keys)),
+            Action::Paste { text } => set("text", json!(text)),
             Action::Click {
                 button,
                 count,

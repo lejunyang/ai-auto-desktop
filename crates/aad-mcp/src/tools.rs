@@ -268,7 +268,15 @@ run_workflow when it matters what gets touched.",
             name: "run_workflow",
             description: "Run a saved workflow and return its outputs. Every step is \
 recorded, so a failure reports which step failed and whether it had already taken \
-effect. Workflows containing script steps are refused.",
+effect. Workflows containing script steps are refused. With durable: true the run is \
+journalled to the per-user run store (the same one `aad status` / `aad resume` read) \
+so it survives this server exiting: the answer carries a run_id to follow with \
+workflow_run_status, workflow_run_events, workflow_run_pause, workflow_run_cancel and \
+workflow_run_resume, and a run that outlasts wait_ms is returned as running instead of \
+blocking. Durable execution is deliberately narrow: it refuses scripts, write actions \
+and sensitive inputs or outputs, and accepts top-level read-only actions only with \
+durable_actions: \"read_only\". A refused workflow is reported, not silently run in \
+memory, unless fallback_in_memory is true.",
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -281,6 +289,37 @@ effect. Workflows containing script steps are refused.",
                         "type": "object",
                         "description": "Values for the workflow's declared inputs, as \
             reported by describe_workflow."
+                    },
+                    "durable": {
+                        "type": "boolean",
+                        "description": "Journal the run so it can be followed and \
+            resumed after this server exits. Off by default."
+                    },
+                    "durable_actions": {
+                        "type": "string",
+                        "enum": ["deny", "read_only"],
+                        "description": "Durable only. deny (default) refuses every \
+            action step; read_only also accepts strictly validated top-level read-only \
+            actions. Write actions are always refused."
+                    },
+                    "fallback_in_memory": {
+                        "type": "boolean",
+                        "description": "Durable only. If durable execution refuses \
+            the workflow before anything ran, run it in memory instead (not resumable) \
+            and say why in durable_refusal."
+                    },
+                    "run_id": {
+                        "type": "string",
+                        "pattern": "^[A-Za-z0-9._-]{1,128}$",
+                        "description": "Durable only. Use this run id instead of a \
+            generated one; refused if it already exists."
+                    },
+                    "wait_ms": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 120000,
+                        "description": "Durable only. How long to wait for the run to \
+            finish before answering with status running. Defaults to 20000."
                     }
                 },
                 "required": ["name"],
@@ -289,6 +328,7 @@ effect. Workflows containing script steps are refused.",
             mutating: true,
         },
     ];
+    tools.extend(crate::durable_tools::catalogue());
     tools.extend(crate::control_tools::catalogue());
     tools.extend(crate::browser_tools::catalogue());
     tools
@@ -336,7 +376,7 @@ pub fn call_without_driver(name: &str, arguments: &Value) -> Result<Value, Strin
 
 /// Render a structured failure the same way driver errors are rendered, so an
 /// agent sees one error shape regardless of which layer refused.
-fn failure(code: &str, message: &str, hint: Option<&str>) -> String {
+pub(crate) fn failure(code: &str, message: &str, hint: Option<&str>) -> String {
     let mut payload = json!({
         "code": code,
         "message": message,
@@ -555,7 +595,9 @@ fn list_workflows() -> Result<Value, String> {
 /// Compiling is what makes the name trustworthy: an agent names a workflow, and
 /// the strict compiler decides whether it is runnable, so a malformed file is
 /// reported rather than half-executed.
-fn compiled_workflow(arguments: &Value) -> Result<(String, aad_core::WorkflowDescriptor), String> {
+pub(crate) fn compiled_workflow(
+    arguments: &Value,
+) -> Result<(String, aad_core::WorkflowDescriptor), String> {
     let name = arguments
         .get("name")
         .and_then(Value::as_str)
@@ -1052,15 +1094,73 @@ pub(crate) fn steps_through_session(arguments: &Value) -> Result<bool, String> {
     Ok(steps)
 }
 
-pub(crate) fn run_workflow(
-    session: &Arc<aad_control::Session>,
-    arguments: &Value,
-) -> Result<Value, String> {
-    let (name, descriptor) = compiled_workflow(arguments)?;
+/// The permissions a workflow run over MCP is granted. Only reached when
+/// whoever started the server granted input.
+pub(crate) const WORKFLOW_PERMISSIONS: [&str; 2] = ["desktop.input", "desktop.observe"];
 
-    // Refused by name before anything runs. A script step executes arbitrary
-    // code, and an agent choosing to run a workflow is not the same as a person
-    // deciding to trust that code.
+/// The `run_workflow` arguments that only mean something for a durable run.
+const DURABLE_ONLY: [&str; 4] = ["durable_actions", "fallback_in_memory", "run_id", "wait_ms"];
+
+/// Refuse arguments the schema does not declare.
+///
+/// The published schema says `additionalProperties: false`; enforcing it here
+/// means a misspelt `durable` is an error rather than a silently in-memory run.
+pub(crate) fn check_arguments(arguments: &Value, allowed: &[&str]) -> Result<(), String> {
+    let Some(fields) = arguments.as_object() else {
+        return Err(failure(
+            "MCP.INVALID_ARGUMENT",
+            "arguments must be an object",
+            None,
+        ));
+    };
+    if let Some(unknown) = fields.keys().find(|key| !allowed.contains(&key.as_str())) {
+        return Err(failure(
+            "MCP.INVALID_ARGUMENT",
+            &format!("unknown argument {unknown:?}"),
+            Some(&format!("Accepted arguments: {}.", allowed.join(", "))),
+        ));
+    }
+    Ok(())
+}
+
+/// Whether a `run_workflow` call asked for a durable run.
+pub(crate) fn wants_durable(arguments: &Value) -> bool {
+    arguments.get("durable").and_then(Value::as_bool) == Some(true)
+}
+
+/// Check `run_workflow` arguments for the mode they were sent in.
+pub(crate) fn check_run_arguments(arguments: &Value, durable: bool) -> Result<(), String> {
+    let mut allowed = vec!["name", "inputs", "durable"];
+    if durable {
+        allowed.extend(DURABLE_ONLY);
+    } else if let Some(stray) = DURABLE_ONLY
+        .iter()
+        .find(|field| arguments.get(**field).is_some())
+    {
+        return Err(failure(
+            "MCP.INVALID_ARGUMENT",
+            &format!("{stray} only applies to a durable run"),
+            Some("Pass durable: true as well, or leave it out."),
+        ));
+    }
+    check_arguments(arguments, &allowed)?;
+    match arguments.get("durable") {
+        None | Some(Value::Bool(_)) => Ok(()),
+        Some(_) => Err(failure(
+            "MCP.INVALID_ARGUMENT",
+            "durable must be a boolean",
+            None,
+        )),
+    }
+}
+
+/// Refused by name before anything runs. A script step executes arbitrary
+/// code, and an agent choosing to run a workflow is not the same as a person
+/// deciding to trust that code.
+pub(crate) fn refuse_scripts(
+    name: &str,
+    descriptor: &aad_core::WorkflowDescriptor,
+) -> Result<(), String> {
     if uses_scripts(&descriptor.raw) {
         return Err(failure(
             "MCP.SCRIPTS_REFUSED",
@@ -1071,21 +1171,27 @@ by a person: use `aad run <file> --allow-scripts`.",
             ),
         ));
     }
+    Ok(())
+}
 
-    let inputs = match arguments.get("inputs") {
-        None | Some(Value::Null) => serde_json::Map::new(),
-        Some(Value::Object(map)) => map.clone(),
-        Some(_) => {
-            return Err(failure(
-                "MCP.INVALID_ARGUMENT",
-                "inputs must be an object",
-                None,
-            ))
-        }
-    };
+/// The workflow inputs a call supplied.
+pub(crate) fn workflow_inputs(arguments: &Value) -> Result<serde_json::Map<String, Value>, String> {
+    match arguments.get("inputs") {
+        None | Some(Value::Null) => Ok(serde_json::Map::new()),
+        Some(Value::Object(map)) => Ok(map.clone()),
+        Some(_) => Err(failure(
+            "MCP.INVALID_ARGUMENT",
+            "inputs must be an object",
+            None,
+        )),
+    }
+}
 
-    // The same registry the CLI builds, so a workflow behaves identically
-    // whether a person ran it or an agent did.
+/// The same registry the CLI builds, so a workflow behaves identically
+/// whether a person ran it or an agent did.
+pub(crate) fn session_providers(
+    session: &Arc<aad_control::Session>,
+) -> Result<aad_runtime::ProviderRegistry, String> {
     let mut providers = aad_runtime::ProviderRegistry::new();
     // The session's own native instances, so a workflow shares the snapshot
     // store and input serialisation of the tools that observed the desktop.
@@ -1097,6 +1203,18 @@ by a person: use `aad run <file> --allow-scripts`.",
     )));
     aad_ocr::register(&mut providers)
         .map_err(|error| failure(&error.code, &error.message, None))?;
+    Ok(providers)
+}
+
+pub(crate) fn run_workflow(
+    session: &Arc<aad_control::Session>,
+    arguments: &Value,
+) -> Result<Value, String> {
+    check_run_arguments(arguments, false)?;
+    let (name, descriptor) = compiled_workflow(arguments)?;
+    refuse_scripts(&name, &descriptor)?;
+    let inputs = workflow_inputs(arguments)?;
+    let providers = session_providers(session)?;
     let artifacts = Arc::new(aad_runtime::ArtifactStore::default());
 
     let result = aad_runtime::run(
@@ -1105,8 +1223,7 @@ by a person: use `aad run <file> --allow-scripts`.",
             .with_inputs(inputs)
             .with_providers(providers)
             .with_artifacts(artifacts)
-            // Only reached when whoever started the server granted input.
-            .with_granted_permissions(["desktop.input", "desktop.observe"]),
+            .with_granted_permissions(WORKFLOW_PERMISSIONS),
     );
 
     let progress = walk_through(&result);
@@ -1161,7 +1278,7 @@ by a person: use `aad run <file> --allow-scripts`.",
 }
 
 /// The parts of a provider error a caller acts on.
-fn brief(error: &AutomationError) -> Value {
+pub(crate) fn brief(error: &AutomationError) -> Value {
     let mut payload = json!({
         "code": error.code,
         "message": error.message,
@@ -1175,7 +1292,7 @@ fn brief(error: &AutomationError) -> Value {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
 
     #[test]
     fn writing_to_a_file_is_not_offered_over_mcp() {
@@ -1587,15 +1704,15 @@ mod tests {
     ///
     /// The store is chosen by an environment variable, which is process-wide, so
     /// these tests hold a lock and run one at a time rather than fighting over it.
-    struct ScratchStore {
-        directory: std::path::PathBuf,
+    pub(crate) struct ScratchStore {
+        pub(crate) directory: std::path::PathBuf,
         _lock: std::sync::MutexGuard<'static, ()>,
     }
 
     static STORE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     impl ScratchStore {
-        fn new(label: &str) -> Self {
+        pub(crate) fn new(label: &str) -> Self {
             let lock = STORE_LOCK.lock().unwrap_or_else(|error| error.into_inner());
             let directory = std::env::temp_dir().join(format!(
                 "aad-mcp-{label}-{}-{:?}",
@@ -1612,7 +1729,7 @@ mod tests {
             }
         }
 
-        fn save(&self, name: &str, descriptor: Value) {
+        pub(crate) fn save(&self, name: &str, descriptor: Value) {
             aad_runtime::recordings::save_workflow(name, &descriptor).expect("save");
         }
     }
@@ -1625,7 +1742,7 @@ mod tests {
     }
 
     /// A workflow that needs no desktop, so a run can be asserted end to end.
-    fn pure_workflow() -> Value {
+    pub(crate) fn pure_workflow() -> Value {
         json!({
             "apiVersion": "ai-auto-desktop.dev/v1alpha1",
             "kind": "Workflow",
@@ -1746,14 +1863,14 @@ mod tests {
 
     /// A driver over the stub backend, with a private snapshot store.
     /// A session whose only native provider is the stub driver.
-    fn stub_session() -> Arc<aad_control::Session> {
+    pub(crate) fn stub_session() -> Arc<aad_control::Session> {
         Arc::new(
             aad_control::Session::new(Vec::new(), aad_control::Policy::default())
                 .with_providers(vec![stub_driver()]),
         )
     }
 
-    fn stub_driver() -> Arc<dyn Provider> {
+    pub(crate) fn stub_driver() -> Arc<dyn Provider> {
         Arc::new(aad_uia::UiaDriver::with_store(
             Arc::new(StubBackend),
             aad_uia::SnapshotStore::new(8, std::time::Duration::from_secs(60)),

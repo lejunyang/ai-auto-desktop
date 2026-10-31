@@ -27,8 +27,16 @@ plugins/linux_atspi/build_x11_capture_helper.sh
 
 Debian/Ubuntu 构建依赖为 `g++ pkg-config libx11-dev libxtst-dev`。CLI 默认从同目录的
 `.build/` 或发布包旁查找 helper，也可用 `AAD_LINUX_XTEST_HELPER`、
-`AAD_LINUX_CAPTURE_HELPER` 指定可信路径。helper 不调用 shell、`xdotool`、剪贴板或
-`uinput`。
+`AAD_LINUX_CAPTURE_HELPER` 指定可信路径。helper 不调用 shell、`xdotool` 或 `uinput`。
+
+XTest helper 另有 `window-info` / `window-action`（EWMH 窗口动作并读回状态）、`paste`（持有 CLIPBOARD、
+只给目标进程、Ctrl+V、交给脱离的 restorer 恢复原内容）、`clipboard-read` 与 `global-key`；控制会话的
+`capture` 复用截图 helper 并直接返回 PNG，`read_text` 对它运行 Tesseract。语义与限制见
+[`linux-kde-x11-driver.md`](../../docs/architecture/linux-kde-x11-driver.md)，效果验证：
+
+```sh
+tests/linux/run-linux-parity.sh   # 另需 openbox x11-utils xclip tesseract-ocr tesseract-ocr-eng
+```
 
 `type_text`、`pointer_click`、`pointer_gesture`、`drag`、`key_chord` 仅支持 KDE/X11 profile，
 并在派发前检查焦点、PID 与 AT-SPI element-at-point（`drag` 起点终点都查）；首个输入事件后的失败

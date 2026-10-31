@@ -90,6 +90,9 @@ pub enum ViewMode {
     Outline,
     /// Regions and their sizes without their contents.
     Overview,
+    /// The visible text of the page or of one region, with tables as rows.
+    /// Read-only; bounded by max_characters.
+    Text,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -97,7 +100,7 @@ pub enum ViewMode {
 pub struct View {
     #[serde(default)]
     pub mode: ViewMode,
-    /// Outline only: a region named by an overview.
+    /// Outline or text: a region named by an overview.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub region: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -207,9 +210,74 @@ pub enum Action {
     Back {},
     Forward {},
     Reload {},
+    /// Window actions, offered on an observed top-level window's own node.
+    Minimize {},
+    Maximize {},
+    /// Back to the normal size from minimized or maximized.
+    Restore {},
+    /// Ask the window to close, as its close button would; it may prompt.
+    CloseWindow {},
+    /// Bring the window to the foreground, restoring it if minimized.
+    Activate {},
+    /// Paste text through the clipboard into a focusable element, then put
+    /// the clipboard back as it was.
+    Paste {
+        text: String,
+    },
+    /// Open an http(s) address in a new tab of the observed page's browser.
+    OpenTab {
+        url: String,
+    },
+    /// Bring the observed page to the front.
+    ActivatePage {},
+    /// Close the observed page.
+    ClosePage {},
+    /// Accept the JavaScript dialog an observation shows; a prompt takes `text`.
+    Accept {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        text: Option<String>,
+    },
+    /// Dismiss (cancel) the JavaScript dialog an observation shows.
+    Dismiss {},
+    /// Put these local files into a file input. Absolute paths under a
+    /// directory the server operator allowed; nothing else is readable.
+    Upload {
+        files: Vec<String>,
+    },
+    /// Emulate a device class and/or colour scheme on the observed page, for
+    /// as long as this session's connection to it lasts.
+    Emulate {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        preset: Option<DevicePreset>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        color_scheme: Option<ColorScheme>,
+    },
+    /// Clear the observed page's site data: cookies and storage of its origin.
+    ClearSiteData {},
 }
 
-pub const ACTION_NAMES: [&str; 15] = [
+/// A device class to emulate: viewport, scale and touch come from the preset.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DevicePreset {
+    Desktop,
+    Tablet,
+    Mobile,
+    /// Back to the browser's own window.
+    Reset,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ColorScheme {
+    Light,
+    Dark,
+    NoPreference,
+}
+
+pub const MAX_UPLOAD_FILES: usize = 32;
+
+pub const ACTION_NAMES: [&str; 29] = [
     "focus",
     "invoke",
     "click",
@@ -225,10 +293,46 @@ pub const ACTION_NAMES: [&str; 15] = [
     "back",
     "forward",
     "reload",
+    "minimize",
+    "maximize",
+    "restore",
+    "close_window",
+    "activate",
+    "paste",
+    "open_tab",
+    "activate_page",
+    "close_page",
+    "accept",
+    "dismiss",
+    "upload",
+    "emulate",
+    "clear_site_data",
 ];
 
 /// Actions on the page as a whole, offered on its document node.
-pub const PAGE_ACTIONS: [&str; 4] = ["navigate", "back", "forward", "reload"];
+pub const PAGE_ACTIONS: [&str; 9] = [
+    "navigate",
+    "back",
+    "forward",
+    "reload",
+    "open_tab",
+    "activate_page",
+    "close_page",
+    "emulate",
+    "clear_site_data",
+];
+
+/// Page actions that address the browser's tabs rather than one document.
+pub const TAB_ACTIONS: [&str; 3] = ["open_tab", "activate_page", "close_page"];
+
+/// Actions on a desktop window as a whole, offered on its own node.
+pub const WINDOW_ACTIONS: [&str; 5] = [
+    "minimize",
+    "maximize",
+    "restore",
+    "close_window",
+    "activate",
+];
 
 impl Action {
     /// A plain left click.
@@ -256,6 +360,20 @@ impl Action {
             Self::Back {} => "back",
             Self::Forward {} => "forward",
             Self::Reload {} => "reload",
+            Self::Minimize {} => "minimize",
+            Self::Maximize {} => "maximize",
+            Self::Restore {} => "restore",
+            Self::CloseWindow {} => "close_window",
+            Self::Activate {} => "activate",
+            Self::Paste { .. } => "paste",
+            Self::OpenTab { .. } => "open_tab",
+            Self::ActivatePage {} => "activate_page",
+            Self::ClosePage {} => "close_page",
+            Self::Accept { .. } => "accept",
+            Self::Dismiss {} => "dismiss",
+            Self::Upload { .. } => "upload",
+            Self::Emulate { .. } => "emulate",
+            Self::ClearSiteData {} => "clear_site_data",
         }
     }
     /// A left single click at the centre needs nothing beyond a plain click.
@@ -297,11 +415,72 @@ pub enum Operation {
     Capture {
         target: Target,
     },
+    /// The text one observed element shows, read by OCR from its pixels.
+    /// Read-only; recognised lines are not targets.
+    ReadText {
+        target: Target,
+        /// A BCP-47 tag naming the OCR language; the user's languages otherwise.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        language: Option<String>,
+    },
+    /// Start a program the server operator allowlisted, then wait (bounded)
+    /// for its windows and answer them as targets. Never through a shell.
+    Launch {
+        program: String,
+        #[serde(default)]
+        args: Vec<String>,
+        /// How long to wait for a window, at most the request's timeout.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        wait_ms: Option<u64>,
+    },
+    /// Press a key combination wherever keyboard focus is -- Win+D, Alt+Tab --
+    /// anchored on no observed element. The one un-anchored input, refused
+    /// unless the operator granted it separately; its effect is never verified.
+    GlobalKey {
+        keys: Vec<String>,
+    },
+    /// The clipboard's text, bounded. Read-only, but refused unless the server
+    /// operator granted it separately: the clipboard often holds secrets.
+    ClipboardRead {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_characters: Option<usize>,
+    },
+    /// Observe a resource repeatedly until a locator's element appears,
+    /// disappears or reaches the given states, within the request deadline.
+    Wait {
+        resource_id: String,
+        locator: Box<Locator>,
+        condition: WaitCondition,
+        /// For `state`: every key must equal the found node's `states` value.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        states: Option<Value>,
+        #[serde(default = "default_nodes")]
+        max_nodes: usize,
+        /// Pause between observations; defaults to 250 ms.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        interval_ms: Option<u64>,
+    },
     Cancel {
         request_id: String,
     },
     Close {},
 }
+
+/// What `wait` waits for. An ambiguous match is never "found".
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WaitCondition {
+    /// Exactly one node matches.
+    Appears,
+    /// No node matches.
+    Disappears,
+    /// Exactly one node matches and its states equal the given ones.
+    State,
+}
+
+pub const DEFAULT_WAIT_INTERVAL_MS: u64 = 250;
+pub const MIN_WAIT_INTERVAL_MS: u64 = 50;
+pub const MAX_WAIT_INTERVAL_MS: u64 = 5_000;
 
 fn default_nodes() -> usize {
     1_000
@@ -332,7 +511,10 @@ impl Request {
         }
     }
     pub fn mutating(&self) -> bool {
-        matches!(self.operation, Operation::Act { .. })
+        matches!(
+            self.operation,
+            Operation::Act { .. } | Operation::Launch { .. } | Operation::GlobalKey { .. }
+        )
     }
 }
 

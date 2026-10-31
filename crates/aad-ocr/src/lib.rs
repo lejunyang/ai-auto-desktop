@@ -279,6 +279,118 @@ impl OcrProvider {
         )
     }
 
+    /// Whether this host can run the engine under its resource limits at all:
+    /// the executable is found and (on Linux) `prlimit` is present, or (elsewhere)
+    /// the operator explicitly allowed an unsandboxed engine. Starts nothing.
+    pub fn engine_ready(&self) -> Result<(), AutomationError> {
+        find_executable(&self.engine[0]).ok_or_else(|| {
+            ocr_error(
+                "OCR.ENGINE_UNAVAILABLE",
+                "Tesseract executable was not found",
+            )
+            .with_detail("executable", json!(self.engine[0]))
+        })?;
+        #[cfg(target_os = "linux")]
+        find_executable("prlimit").ok_or_else(|| {
+            ocr_error(
+                "OCR.ENGINE_ISOLATION_UNAVAILABLE",
+                "Linux OCR requires the prlimit command",
+            )
+        })?;
+        #[cfg(not(target_os = "linux"))]
+        if !self.allow_unsandboxed {
+            return Err(ocr_error(
+                "OCR.ENGINE_ISOLATION_UNAVAILABLE",
+                "this platform has no built-in OCR engine resource sandbox",
+            ));
+        }
+        Ok(())
+    }
+
+    /// The languages the installed engine can recognize (`tesseract --list-langs`).
+    pub fn languages(&self, timeout: Duration) -> Result<Vec<String>, AutomationError> {
+        let deadline = Instant::now() + timeout;
+        let mut command = self.engine.clone();
+        command.push("--list-langs".into());
+        let (stdout, stderr) = run_engine(&command, deadline, self.allow_unsandboxed)?;
+        let output = if stdout.is_empty() { &stderr } else { &stdout };
+        Ok(String::from_utf8_lossy(output)
+            .lines()
+            .map(str::trim)
+            .filter(|line| {
+                !line.is_empty()
+                    && line.len() <= 64
+                    && line.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            })
+            .map(str::to_string)
+            .take(256)
+            .collect())
+    }
+
+    /// OCR over an in-memory PNG the caller already holds (for example a
+    /// capture of an observed element). Answers `engine`, `version`,
+    /// `language` and `lines` of `{text, confidence, bounds, words}`, with
+    /// bounds in the image's pixels. An image without text has no lines.
+    pub fn recognize_png(
+        &self,
+        png: &[u8],
+        languages: &[String],
+        timeout: Duration,
+    ) -> Result<Value, AutomationError> {
+        if timeout <= RESPONSE_BUDGET {
+            return Err(ocr_error(
+                "OCR.TIMEOUT",
+                "host deadline elapsed before OCR could complete",
+            )
+            .with_retryable(true));
+        }
+        let deadline = Instant::now() + timeout - RESPONSE_BUDGET;
+        let languages = if languages.is_empty() {
+            Vec::new()
+        } else {
+            parse_languages(Some(&json!(languages)))?
+        };
+        if png.is_empty() || png.len() > MAX_IMAGE_BYTES {
+            return Err(ocr_error(
+                "OCR.IMAGE_UNAVAILABLE",
+                "image must be between 1 and 67108864 bytes",
+            ));
+        }
+        if detect_media_type(png) != Some("image/png") {
+            return Err(ocr_error("OCR.IMAGE_UNSUPPORTED", "image is not a PNG"));
+        }
+        let image = image::load_from_memory_with_format(png, ImageFormat::Png)
+            .map_err(|_| ocr_error("OCR.IMAGE_UNSUPPORTED", "image could not be decoded safely"))?;
+        check_dimensions(image.width(), image.height(), "decoder_header")?;
+        let temporary = TemporaryImage::new(png)?;
+        let version = self.engine_version(deadline)?;
+        let mut command = self.engine.clone();
+        command.extend([temporary.path().display().to_string(), "stdout".into()]);
+        if !languages.is_empty() {
+            command.extend(["-l".into(), languages.join("+")]);
+        }
+        command.push("tsv".into());
+        let (stdout, _) = run_engine(&command, deadline, self.allow_unsandboxed)?;
+        let lines = match parse_tsv(&stdout, (0, 0), deadline) {
+            Ok((_, _, lines)) => lines,
+            Err(error) if error.code == "OCR.NO_TEXT" => Vec::new(),
+            Err(error) => return Err(error),
+        };
+        let word = |word: &Word| json!({"text": word.text, "confidence": word.confidence, "bounds": word.bounds.to_json()});
+        Ok(json!({
+            "engine": "tesseract",
+            "version": version,
+            "language": if languages.is_empty() { Value::Null } else { json!(languages.join("+")) },
+            "width": image.width(),
+            "height": image.height(),
+            "lines": lines.iter().map(|line| {
+                let mut value = line_json(line);
+                value["words"] = json!(line.words.iter().map(word).collect::<Vec<_>>());
+                value
+            }).collect::<Vec<_>>(),
+        }))
+    }
+
     fn engine_version(&self, deadline: Instant) -> Result<String, AutomationError> {
         if let Ok(guard) = self.version.lock() {
             if let Some(version) = guard.clone() {
@@ -1751,6 +1863,37 @@ mod tests {
         assert_eq!(result["version"], "5.4.1");
         assert_eq!(result["text"], "Invoice A-42\nTotal $12.50");
         assert_eq!(result["matches"][0]["pattern_id"], "invoice_id");
+
+        // The same engine over a PNG held in memory, with words per line.
+        let mut png = Vec::new();
+        image::DynamicImage::new_rgb8(200, 80)
+            .write_to(&mut std::io::Cursor::new(&mut png), ImageFormat::Png)
+            .unwrap();
+        assert!(provider.engine_ready().is_ok());
+        let read = provider
+            .recognize_png(&png, &["eng".into()], Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(read["engine"], "tesseract");
+        assert_eq!(read["language"], "eng");
+        assert_eq!(read["width"], 200);
+        assert_eq!(read["lines"][0]["text"], "Invoice A-42");
+        assert_eq!(read["lines"][0]["words"][1]["text"], "A-42");
+        assert_eq!(
+            read["lines"][0]["words"][1]["bounds"],
+            json!({"x":55,"y":20,"width":50,"height":12})
+        );
+        assert_eq!(
+            provider
+                .recognize_png(b"not a png", &[], Duration::from_secs(5))
+                .unwrap_err()
+                .code,
+            "OCR.IMAGE_UNSUPPORTED"
+        );
+        let missing = OcrProvider::with_command(vec!["/nonexistent/tesseract".into()], true)
+            .unwrap()
+            .engine_ready()
+            .unwrap_err();
+        assert_eq!(missing.code, "OCR.ENGINE_UNAVAILABLE");
         let _ = std::fs::remove_dir_all(root);
     }
 }

@@ -62,7 +62,8 @@ pub fn redact(value: &mut Value) {
     }
 }
 
-fn redact_url(text: &str) -> String {
+/// The address with credentials, fragment and sensitive query values removed.
+pub fn redact_url(text: &str) -> String {
     let Ok(mut url) = url::Url::parse(text) else {
         return "[REDACTED URL]".into();
     };
@@ -171,6 +172,7 @@ pub fn fingerprint(record: &Value) -> String {
     format!("{:x}", Sha256::digest(semantic.to_string().as_bytes()))
 }
 
+#[derive(Default)]
 pub struct Groups {
     pub records: BTreeMap<String, Value>,
     last: BTreeMap<String, String>,
