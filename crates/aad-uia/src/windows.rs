@@ -13,8 +13,8 @@
 use std::sync::Arc;
 
 use crate::backend::{
-    Backend, CaptureLimits, CapturedTree, DriverError, PointerButton, PointerGesture, Result,
-    ScrollDirection, ScrollSpec,
+    Backend, CaptureLimits, CapturedTree, DriverError, ImageBox, Pixels, PointerButton,
+    PointerGesture, Recognition, Result, ScrollDirection, ScrollSpec, TextSpan,
 };
 use crate::capture::{CapturedEvent, EventBuffer, EventKind};
 use crate::model::{Bounds, Node, States, WindowInfo};
@@ -22,12 +22,40 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Sender};
 use std::time::{Duration, Instant};
 use windows::core::{implement, BSTR, PWSTR};
-use windows::Win32::Foundation::{CloseHandle, BOOL, HWND, LPARAM, MAX_PATH, RECT, TRUE};
+use windows::core::{HSTRING, PCWSTR};
+use windows::Globalization::Language;
+use windows::Graphics::Imaging::{BitmapPixelFormat, SoftwareBitmap};
+use windows::Media::Ocr::OcrEngine;
+use windows::Storage::Streams::DataWriter;
+use windows::Win32::Foundation::HGLOBAL;
+use windows::Win32::Foundation::{
+    CloseHandle, BOOL, HWND, LPARAM, MAX_PATH, POINT, RECT, TRUE, WPARAM,
+};
+use windows::Win32::Foundation::{GlobalFree, HANDLE};
+use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_EXTENDED_FRAME_BOUNDS};
+use windows::Win32::Graphics::Gdi::{
+    CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC, GetDIBits,
+    ReleaseDC, SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS,
+};
+use windows::Win32::Storage::Xps::{PrintWindow, PRINT_WINDOW_FLAGS};
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED,
 };
+use windows::Win32::System::DataExchange::{
+    CloseClipboard, EmptyClipboard, EnumClipboardFormats, GetClipboardData, GetClipboardOwner,
+    GetClipboardSequenceNumber, GetOpenClipboardWindow, IsClipboardFormatAvailable, OpenClipboard,
+    RegisterClipboardFormatW, SetClipboardData,
+};
+use windows::Win32::System::Memory::{
+    GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, GMEM_MOVEABLE,
+};
+use windows::Win32::System::StationsAndDesktops::{
+    CloseDesktop, GetUserObjectInformationW, OpenInputDesktop, DESKTOP_CONTROL_FLAGS,
+    DESKTOP_READOBJECTS, UOI_NAME,
+};
 use windows::Win32::System::Threading::{
-    OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_FORMAT, PROCESS_QUERY_LIMITED_INFORMATION,
+    AttachThreadInput, GetCurrentThreadId, OpenProcess, QueryFullProcessImageNameW,
+    PROCESS_NAME_FORMAT, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 use windows::Win32::UI::Accessibility::{
     CUIAutomation,
@@ -41,6 +69,7 @@ use windows::Win32::UI::Accessibility::{
     IUIAutomationPropertyChangedEventHandler_Impl,
     IUIAutomationTogglePattern,
     IUIAutomationValuePattern,
+    IUIAutomationWindowPattern,
     SetWinEventHook,
     TreeScope_Children,
     TreeScope_Subtree,
@@ -93,13 +122,24 @@ use windows::Win32::UI::Accessibility::{
     UIA_ValuePatternId,
     UIA_ValueValuePropertyId,
     UIA_WindowControlTypeId,
+    UIA_WindowPatternId,
     UnhookWinEvent,
+    WindowVisualState,
+    WindowVisualState_Maximized,
+    WindowVisualState_Minimized,
+    WindowVisualState_Normal,
     HWINEVENTHOOK,
     // Control type ids. A role comes from these rather than from the localized
     // display string, which changes with the system language.
     UIA_CONTROLTYPE_ID,
     UIA_EVENT_ID,
     UIA_PROPERTY_ID,
+};
+use windows::Win32::UI::HiDpi::{
+    GetAwarenessFromDpiAwarenessContext, GetThreadDpiAwarenessContext,
+    GetWindowDpiAwarenessContext, SetProcessDpiAwarenessContext, SetThreadDpiAwarenessContext,
+    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, DPI_AWARENESS_PER_MONITOR_AWARE,
+    DPI_AWARENESS_SYSTEM_AWARE, DPI_AWARENESS_UNAWARE,
 };
 use windows::Win32::UI::Input::Ime::ImmGetDefaultIMEWnd;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -114,12 +154,21 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     VK_SHIFT, VK_SPACE, VK_TAB, VK_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    DispatchMessageW, EnumWindows, GetAncestor, GetClassNameW, GetForegroundWindow,
-    GetGUIThreadInfo, GetSystemMetrics, GetWindowRect, GetWindowTextLengthW, GetWindowTextW,
-    GetWindowThreadProcessId, IsIconic, IsWindowVisible, PeekMessageW, SendMessageW,
-    SetForegroundWindow, GA_ROOT, GUITHREADINFO, MSG, PM_REMOVE, SM_CXVIRTUALSCREEN,
-    SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, WHEEL_DELTA, WINEVENT_OUTOFCONTEXT,
-    WINEVENT_SKIPOWNPROCESS,
+    BringWindowToTop, DispatchMessageW, EnumWindows, GetAncestor, GetClassNameW,
+    GetForegroundWindow, GetGUIThreadInfo, GetSystemMetrics, GetWindowRect, GetWindowTextLengthW,
+    GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindowVisible, PeekMessageW,
+    SendMessageW, SetForegroundWindow, GA_ROOT, GUITHREADINFO, MSG, PM_REMOVE,
+    PW_RENDERFULLCONTENT, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
+    SM_YVIRTUALSCREEN, WHEEL_DELTA, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS,
+};
+use windows::Win32::UI::WindowsAndMessaging::{
+    CreateWindowExW, DefWindowProcW, DestroyWindow, RegisterClassExW, SendMessageTimeoutW,
+    HWND_MESSAGE, SMTO_NORMAL, WINDOW_EX_STYLE, WINDOW_STYLE, WM_PASTE, WM_RENDERALLFORMATS,
+    WM_RENDERFORMAT, WNDCLASSEXW,
+};
+use windows::Win32::UI::WindowsAndMessaging::{
+    GetWindowLongW, IsWindow, IsZoomed, PostMessageW, ShowWindow, GWL_STYLE, SHOW_WINDOW_CMD,
+    SW_MAXIMIZE, SW_MINIMIZE, SW_RESTORE, WM_CLOSE, WS_MAXIMIZEBOX, WS_MINIMIZEBOX,
 };
 
 /// Initialise COM on the calling thread.
@@ -144,7 +193,40 @@ fn ensure_com() {
     });
 }
 
+/// Make this process per-monitor (v2) DPI aware, once.
+///
+/// Every coordinate this backend handles -- UIA bounding rectangles, window
+/// rectangles, the virtual-screen extent SendInput normalises against, and the
+/// pixels a capture reads -- must be in one space. A DPI-unaware process gets
+/// each of those virtualised to 96 DPI by a different rule: on a scaled display
+/// a point is quantised (one logical pixel covers several physical ones), and
+/// with monitors of different scales the virtualised rectangles of a window on
+/// a secondary monitor no longer line up with the virtualised screen. Physical
+/// pixels everywhere are the only space in which bounds, input and pixels agree.
+///
+/// The process-wide call fails harmlessly when awareness was already fixed (an
+/// application manifest, or a host that set it first); [`dpi_awareness`] reports
+/// what is actually in force.
+fn ensure_dpi_awareness() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| unsafe {
+        let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    });
+}
+
+/// The DPI awareness this thread runs under, by name.
+fn dpi_awareness() -> &'static str {
+    let awareness = unsafe { GetAwarenessFromDpiAwarenessContext(GetThreadDpiAwarenessContext()) };
+    match awareness {
+        DPI_AWARENESS_PER_MONITOR_AWARE => "per_monitor",
+        DPI_AWARENESS_SYSTEM_AWARE => "system",
+        DPI_AWARENESS_UNAWARE => "unaware",
+        _ => "unknown",
+    }
+}
+
 fn automation() -> Result<IUIAutomation> {
+    ensure_dpi_awareness();
     ensure_com();
     unsafe { CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER) }
         .map_err(|error| DriverError::unavailable(format!("UI Automation is unavailable: {error}")))
@@ -454,11 +536,10 @@ impl Backend for WindowsUiaBackend {
 
     fn type_text(&self, window_id: &str, node: &Node, text: &str) -> Result<()> {
         let element = self.require(window_id, node)?;
-        // Typing goes to whatever holds focus, so focus must be established
-        // first or the keystrokes land in the wrong place.
-        unsafe { element.SetFocus() }.map_err(|error| {
-            DriverError::new("DRIVER.ACTION_FAILED", format!("focus failed: {error}"))
-        })?;
+        // Typing goes to whatever holds focus, so focus must be established --
+        // and proven, window in front and element focused -- or the keystrokes
+        // land in another application.
+        focus_for_keys(&self.automation, parse_window_id(window_id)?, &element)?;
 
         let mut inputs: Vec<INPUT> = Vec::new();
         for unit in text.encode_utf16() {
@@ -506,9 +587,7 @@ impl Backend for WindowsUiaBackend {
         let layout = unsafe { GetKeyboardLayout(thread_id) };
         let caps_lock_on = unsafe { GetKeyState(VK_CAPITAL.0 as i32) } & 1 != 0;
         let sequence = KeyTextSequence::parse(text, layout, caps_lock_on)?;
-        unsafe { element.SetFocus() }.map_err(|error| {
-            DriverError::new("DRIVER.ACTION_FAILED", format!("focus failed: {error}"))
-        })?;
+        focus_for_keys(&self.automation, top_level, &element)?;
 
         // UIA elements in hosted controls often report the top-level HWND, not
         // the child that owns the caret. After SetFocus, GetGUIThreadInfo is the
@@ -556,11 +635,8 @@ impl Backend for WindowsUiaBackend {
         // element is focused first. Without this a shortcut meant for one field
         // would fire against wherever focus happened to be.
         let element = self.require(window_id, node)?;
-        unsafe { element.SetFocus() }.map_err(|error| {
-            DriverError::new("DRIVER.ACTION_FAILED", format!("focus failed: {error}"))
-        })?;
-
         let chord = Chord::parse(keys)?;
+        focus_for_keys(&self.automation, parse_window_id(window_id)?, &element)?;
         let inputs = chord.to_inputs();
 
         // Press-and-release must arrive as one stream: splitting it lets another
@@ -583,41 +659,16 @@ impl Backend for WindowsUiaBackend {
 
         // Clicking a background window would deliver the click to whatever is
         // actually in front, so raise the target first.
-        unsafe {
-            let _ = SetForegroundWindow(handle);
-        }
+        bring_to_front(handle);
+        self.ensure_hits(window_id, node, (x, y))?;
 
-        let (origin_x, origin_y, width, height) = unsafe {
-            (
-                GetSystemMetrics(SM_XVIRTUALSCREEN),
-                GetSystemMetrics(SM_YVIRTUALSCREEN),
-                GetSystemMetrics(SM_CXVIRTUALSCREEN),
-                GetSystemMetrics(SM_CYVIRTUALSCREEN),
-            )
-        };
-        if width <= 0 || height <= 0 {
-            return Err(DriverError::unavailable("the virtual screen has no extent"));
-        }
-        let absolute_x = ((x - origin_x) as f64 * 65_535.0 / width as f64).round() as i32;
-        let absolute_y = ((y - origin_y) as f64 * 65_535.0 / height as f64).round() as i32;
-
-        let mouse = |flags| INPUT {
-            r#type: INPUT_MOUSE,
-            Anonymous: windows::Win32::UI::Input::KeyboardAndMouse::INPUT_0 {
-                mi: MOUSEINPUT {
-                    dx: absolute_x,
-                    dy: absolute_y,
-                    mouseData: 0,
-                    dwFlags: flags,
-                    time: 0,
-                    dwExtraInfo: 0,
-                },
-            },
-        };
+        // The same normalisation every other gesture uses. This path used to
+        // scale by the full width, which lands one pixel up/left of the point.
+        let absolute = to_absolute((x, y))?;
         let inputs = [
-            mouse(MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK),
-            mouse(MOUSEEVENTF_LEFTDOWN | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK),
-            mouse(MOUSEEVENTF_LEFTUP | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK),
+            mouse_event(absolute, MOUSEEVENTF_MOVE),
+            mouse_event(absolute, MOUSEEVENTF_LEFTDOWN),
+            mouse_event(absolute, MOUSEEVENTF_LEFTUP),
         ];
         // A click is a move, a press and a release: only their order matters, so
         // if the atomic batch is refused, sending them individually is a
@@ -637,9 +688,8 @@ impl Backend for WindowsUiaBackend {
 
         // Same reasoning as pointer_click: a background window would misroute
         // the event, so raise the target first.
-        unsafe {
-            let _ = SetForegroundWindow(handle);
-        }
+        bring_to_front(handle);
+        self.ensure_hits(window_id, node, point)?;
         let absolute = to_absolute(point)?;
 
         if let Some(scroll) = gesture.scroll {
@@ -675,12 +725,14 @@ impl Backend for WindowsUiaBackend {
         gesture: &PointerGesture,
     ) -> Result<()> {
         let (handle, _) = self.element_for(window_id)?;
-        let start = to_absolute(element_point(from.bounds, gesture.fraction)?)?;
-        let end = to_absolute(element_point(to.bounds, gesture.to_fraction)?)?;
+        let start_point = element_point(from.bounds, gesture.fraction)?;
+        let end_point = element_point(to.bounds, gesture.to_fraction)?;
+        let start = to_absolute(start_point)?;
+        let end = to_absolute(end_point)?;
 
-        unsafe {
-            let _ = SetForegroundWindow(handle);
-        }
+        bring_to_front(handle);
+        self.ensure_hits(window_id, from, start_point)?;
+        self.ensure_hits(window_id, to, end_point)?;
         let (down, up) = button_events(gesture.button);
 
         // Press at the start, glide across in interpolated steps, release at the
@@ -707,8 +759,108 @@ impl Backend for WindowsUiaBackend {
         deliver_drag(&inputs, end, up)
     }
 
+    fn capture_pixels(&self, window_id: &str, node: &Node, whole_window: bool) -> Result<Pixels> {
+        let handle = parse_window_id(window_id)?;
+        if unsafe { IsIconic(handle) }.as_bool() {
+            return Err(DriverError::new(
+                "DRIVER.WINDOW_MINIMIZED",
+                "a minimized window has nothing on screen to capture; restore it first",
+            ));
+        }
+        let element = self.require(window_id, node)?;
+        if unsafe { element.CurrentIsPassword() }.is_ok_and(|value| value.as_bool()) {
+            return Err(DriverError::new(
+                "DRIVER.PROTECTED_ELEMENT",
+                "a password or otherwise protected element is never captured",
+            ));
+        }
+        if !whole_window
+            && unsafe { element.CurrentIsOffscreen() }.is_ok_and(|value| value.as_bool())
+        {
+            return Err(DriverError::new(
+                "DRIVER.ACTION_UNSUPPORTED",
+                "the element is scrolled or hidden out of view; bring it into view and observe again",
+            ));
+        }
+        let mut window = RECT::default();
+        unsafe { GetWindowRect(handle, &mut window) }.map_err(|error| {
+            DriverError::new(
+                "DRIVER.WINDOW_NOT_FOUND",
+                format!("the window rectangle could not be read: {error}"),
+            )
+        })?;
+        // Bounds are read live: the window may have moved since the snapshot.
+        let wanted = if whole_window {
+            extended_frame(handle).unwrap_or(window)
+        } else {
+            unsafe { element.CurrentBoundingRectangle() }.map_err(|error| {
+                DriverError::stale(format!("the element's bounds could not be read: {error}"))
+            })?
+        };
+        let region = intersect(wanted, window).ok_or_else(|| {
+            DriverError::new(
+                "DRIVER.ACTION_UNSUPPORTED",
+                "the element lies outside its window's area and shows nothing to capture",
+            )
+        })?;
+        let full = print_window(handle, &window)?;
+        Ok(crop(&full, &window, &region))
+    }
+
+    fn window_action(
+        &self,
+        window_id: &str,
+        node: &Node,
+        action: &str,
+    ) -> Result<serde_json::Value> {
+        self.act_on_window(window_id, node, action)
+    }
+
+    fn recognize_text(&self, pixels: &Pixels, language: Option<&str>) -> Result<Recognition> {
+        recognize(pixels, language)
+    }
+
+    fn clipboard_text(&self, max_chars: usize) -> Result<(Option<String>, usize)> {
+        read_clipboard_text(max_chars)
+    }
+
+    fn global_key(&self, keys: &[String]) -> Result<serde_json::Value> {
+        let chord = Chord::parse(keys)?;
+        refuse_reserved_chord(&chord)?;
+        // UAC prompts and the lock screen run on the secure desktop, which
+        // synthetic input cannot and must not reach.
+        if !on_default_desktop() {
+            return Err(DriverError::new(
+                "DRIVER.SECURE_DESKTOP",
+                "the input desktop is not the user's desktop (a UAC prompt or the lock screen); nothing was sent",
+            ));
+        }
+        let foreground = unsafe { GetForegroundWindow() };
+        let mut process = 0u32;
+        unsafe { GetWindowThreadProcessId(foreground, Some(&mut process)) };
+        // The same atomic chord path and modifier-leak cleanup as `key`.
+        deliver_atomically(&chord.to_inputs(), "the global key combination").map_err(
+            |mut error| {
+                let released = chord.release_modifiers();
+                error = error.with_detail("residual_state_cleared", serde_json::json!(released));
+                error
+            },
+        )?;
+        Ok(serde_json::json!({
+            "foreground_process_id": process,
+        }))
+    }
+
+    fn paste(&self, window_id: &str, node: &Node, text: &str) -> Result<serde_json::Value> {
+        self.paste_text(window_id, node, text)
+    }
+
     fn describe(&self) -> serde_json::Value {
-        serde_json::json!({"backend": "windows-uia", "platform": "windows"})
+        serde_json::json!({
+            "backend": "windows-uia",
+            "platform": "windows",
+            "dpi_awareness": dpi_awareness(),
+        })
     }
 }
 
@@ -1136,13 +1288,21 @@ fn to_absolute(point: (i32, i32)) -> Result<(i32, i32)> {
             "the virtual screen has no usable extent",
         ));
     }
-    let max_x = width - 1;
-    let max_y = height - 1;
-    let x = (point.0 - origin_x).clamp(0, max_x);
-    let y = (point.1 - origin_y).clamp(0, max_y);
-    let ax = (x as f64 * 65_535.0 / max_x as f64).round() as i32;
-    let ay = (y as f64 * 65_535.0 / max_y as f64).round() as i32;
-    Ok((ax, ay))
+    Ok((
+        normalise(point.0, origin_x, width),
+        normalise(point.1, origin_y, height),
+    ))
+}
+
+/// One axis of a virtual-screen pixel as a 0..=65535 absolute coordinate.
+///
+/// Windows maps an absolute coordinate back with `pixel = origin + dx * extent
+/// / 65536` (rounded down), so the coordinate chosen is the middle of the band
+/// that maps back onto the pixel: exact for every pixel, at any extent, and
+/// for an origin left of or above the primary monitor (negative offsets).
+fn normalise(pixel: i32, origin: i32, extent: i32) -> i32 {
+    let offset = i64::from((pixel - origin).clamp(0, extent - 1));
+    ((offset * 65_536 + 32_768) / i64::from(extent)).min(65_535) as i32
 }
 
 /// One mouse INPUT at an absolute point with the given flags.
@@ -1395,6 +1555,64 @@ impl WindowsUiaBackend {
         self.locate(window_id, node)?
             .ok_or_else(|| DriverError::stale("the element is no longer present in the window"))
     }
+
+    /// Refuse pointer input at `point` unless it would land on the element.
+    ///
+    /// Raising the window is best effort: Windows' foreground lock can refuse
+    /// it, and then another window -- or a dialog, menu or overlay of the same
+    /// application -- may cover the point. Sending the click anyway delivers
+    /// it to whatever is there, which may be another application entirely
+    /// (observed: a fixture click landed elsewhere after the foreground moved
+    /// on). So the point is hit-tested first: what UIA finds there must be the
+    /// element, something inside it, or a container of it (a label inside a
+    /// button is often not hit-testable itself), never something beside it.
+    fn ensure_hits(&self, window_id: &str, node: &Node, point: (i32, i32)) -> Result<()> {
+        let target = self.require(window_id, node)?;
+        let occluded = |what: &str| {
+            DriverError::new(
+                "DRIVER.OCCLUDED",
+                format!("pointer input would land on {what}, not on the observed element"),
+            )
+            .with_detail("node_id", serde_json::json!(node.node_id))
+        };
+        let Ok(hit) = (unsafe {
+            self.automation.ElementFromPoint(POINT {
+                x: point.0,
+                y: point.1,
+            })
+        }) else {
+            return Err(occluded("nothing UI Automation can identify"));
+        };
+        let walker = unsafe { self.automation.RawViewWalker() }
+            .map_err(|error| DriverError::unavailable(format!("no tree walker: {error}")))?;
+        let same = |a: &IUIAutomationElement, b: &IUIAutomationElement| {
+            unsafe { self.automation.CompareElements(a, b) }.is_ok_and(|same| same.as_bool())
+        };
+        // Is the hit the element or inside it?
+        let mut current = Some(hit.clone());
+        for _ in 0..CaptureLimits::MAX_DEPTH {
+            let Some(element) = current else { break };
+            if same(&element, &target) {
+                return Ok(());
+            }
+            current = unsafe { walker.GetParentElement(&element) }.ok();
+        }
+        // Is the hit a container of the element (but not the desktop itself)?
+        let desktop = unsafe { self.automation.GetRootElement() }.ok();
+        let mut current = unsafe { walker.GetParentElement(&target) }.ok();
+        for _ in 0..CaptureLimits::MAX_DEPTH {
+            let Some(element) = current else { break };
+            if desktop.as_ref().is_some_and(|root| same(&element, root)) {
+                break;
+            }
+            if same(&element, &hit) {
+                return Ok(());
+            }
+            current = unsafe { walker.GetParentElement(&element) }.ok();
+        }
+        // What covers it is not named: it may belong to another application.
+        Err(occluded("another element"))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1479,6 +1697,15 @@ fn describe_element(
     if has(UIA_ValuePatternId) && read_only != Some(true) {
         actions.push("set_value".to_string());
         actions.push("type_text".to_string());
+        // Pasting passes the text through the clipboard: never a password's.
+        if states.focusable == Some(true) && states.protected != Some(true) {
+            actions.push("paste".to_string());
+        }
+    }
+    // The captured window's own node stands for the window. Its actions follow
+    // what the window allows and the state it is in now.
+    if depth == 0 && parent_id.is_none() {
+        actions.extend(window_actions(element));
     }
     if bounds.is_some() && states.offscreen != Some(true) {
         actions.push("pointer_click".to_string());
@@ -1503,6 +1730,1166 @@ fn describe_element(
         depth,
         parent_id,
         children: Vec::new(),
+    }
+}
+
+/// Focus `element` for keystrokes and prove they would reach it.
+///
+/// SendInput keystrokes go to the foreground window's focus, whatever UIA's
+/// SetFocus did: if the foreground lock kept `handle` in the background, they
+/// would land in another application. So the window is brought forward, the
+/// element focused, and then both are checked before a single key is sent.
+fn focus_for_keys(
+    automation: &IUIAutomation,
+    handle: HWND,
+    element: &IUIAutomationElement,
+) -> Result<()> {
+    bring_to_front(handle);
+    unsafe { element.SetFocus() }.map_err(|error| {
+        DriverError::new("DRIVER.ACTION_FAILED", format!("focus failed: {error}"))
+    })?;
+    let deadline = Instant::now() + Duration::from_millis(500);
+    loop {
+        let foreground = unsafe { GetAncestor(GetForegroundWindow(), GA_ROOT) };
+        // Focus on the element or inside it (a container hands focus to a
+        // child); UIA that cannot say where focus is is not held against it.
+        let focused = match unsafe { automation.GetFocusedElement() } {
+            Ok(mut current) => {
+                let walker = unsafe { automation.RawViewWalker() }.ok();
+                let mut inside = false;
+                for _ in 0..CaptureLimits::MAX_DEPTH {
+                    if unsafe { automation.CompareElements(&current, element) }
+                        .is_ok_and(|same| same.as_bool())
+                    {
+                        inside = true;
+                        break;
+                    }
+                    match walker
+                        .as_ref()
+                        .and_then(|walker| unsafe { walker.GetParentElement(&current) }.ok())
+                    {
+                        Some(parent) => current = parent,
+                        None => break,
+                    }
+                }
+                inside
+            }
+            Err(_) => true,
+        };
+        if foreground == handle && focused {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(DriverError::new(
+                "DRIVER.FOCUS_LOST",
+                "the element's window could not take keyboard focus; no key was sent",
+            )
+            .with_detail("window_in_front", serde_json::json!(foreground == handle)));
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Chords a global key must never press: Ctrl+Alt+Del is the secure attention
+/// sequence (Windows ignores it from SendInput, so pressing it would only
+/// mislead), and Win+L locks the workstation, after which nothing -- not
+/// even the person -- can be driven until someone signs in again.
+fn refuse_reserved_chord(chord: &Chord) -> Result<()> {
+    let has = |vk: VIRTUAL_KEY| chord.modifiers.contains(&vk);
+    let reserved = (has(VK_CONTROL) && has(VK_MENU) && chord.key == VK_DELETE)
+        || (has(VK_LWIN) && chord.key == VIRTUAL_KEY(b'L' as u16));
+    if reserved {
+        return Err(DriverError::new(
+            "DRIVER.KEY_RESERVED",
+            "Ctrl+Alt+Del and Win+L are never pressed",
+        ));
+    }
+    Ok(())
+}
+
+/// Whether input currently goes to the interactive user's own desktop.
+fn on_default_desktop() -> bool {
+    let Ok(desktop) =
+        (unsafe { OpenInputDesktop(DESKTOP_CONTROL_FLAGS(0), false, DESKTOP_READOBJECTS) })
+    else {
+        // The secure desktop cannot be opened from a user process.
+        return false;
+    };
+    let mut name = [0u16; 64];
+    let mut needed = 0u32;
+    let read = unsafe {
+        GetUserObjectInformationW(
+            HANDLE(desktop.0),
+            UOI_NAME,
+            Some(name.as_mut_ptr().cast()),
+            (name.len() * 2) as u32,
+            Some(&mut needed),
+        )
+    };
+    let _ = unsafe { CloseDesktop(desktop) };
+    read.is_ok() && String::from_utf16_lossy(&name).trim_end_matches('\0') == "Default"
+}
+
+/// Make `handle` the foreground window, reporting whether it is.
+///
+/// `SetForegroundWindow` alone is refused by the foreground lock whenever this
+/// process did not receive the last input event -- for instance after another
+/// window closed and activation moved to some other application. Attaching to
+/// the foreground thread's input state for the duration of the call is the
+/// documented way a process that legitimately acts for the user hands focus
+/// over; it sends no input. It can still fail (another integrity level, a
+/// full-screen exclusive application), which the caller must handle.
+fn bring_to_front(handle: HWND) -> bool {
+    unsafe {
+        if GetForegroundWindow() == handle {
+            return true;
+        }
+        if SetForegroundWindow(handle).as_bool() && GetForegroundWindow() == handle {
+            return true;
+        }
+        let foreground = GetForegroundWindow();
+        let theirs = GetWindowThreadProcessId(foreground, None);
+        let ours = GetCurrentThreadId();
+        let attached =
+            theirs != 0 && theirs != ours && AttachThreadInput(ours, theirs, TRUE).as_bool();
+        let _ = BringWindowToTop(handle);
+        let _ = SetForegroundWindow(handle);
+        if attached {
+            let _ = AttachThreadInput(ours, theirs, BOOL(0));
+        }
+        GetForegroundWindow() == handle
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Screenshots
+// ---------------------------------------------------------------------------
+
+/// The largest capture returned on either side, in physical pixels.
+const MAX_CAPTURE_SIDE: i32 = 8_192;
+/// A window larger than this is refused rather than buffered whole.
+const MAX_WINDOW_PIXELS: i64 = 64 * 1024 * 1024;
+
+/// A window's visible frame, without the invisible resize border Windows 10+
+/// adds outside it (which `GetWindowRect` includes).
+fn extended_frame(handle: HWND) -> Option<RECT> {
+    let mut frame = RECT::default();
+    unsafe {
+        DwmGetWindowAttribute(
+            handle,
+            DWMWA_EXTENDED_FRAME_BOUNDS,
+            (&mut frame as *mut RECT).cast(),
+            std::mem::size_of::<RECT>() as u32,
+        )
+    }
+    .ok()?;
+    (frame.right > frame.left && frame.bottom > frame.top).then_some(frame)
+}
+
+fn intersect(a: RECT, b: RECT) -> Option<RECT> {
+    let rect = RECT {
+        left: a.left.max(b.left),
+        top: a.top.max(b.top),
+        right: a.right.min(b.right),
+        bottom: a.bottom.min(b.bottom),
+    };
+    (rect.right > rect.left && rect.bottom > rect.top).then_some(rect)
+}
+
+/// The whole window as top-down BGRA, rendered by the window itself.
+///
+/// `PrintWindow` with `PW_RENDERFULLCONTENT` asks the window (and DWM, for
+/// DirectComposition and GPU content) to render into our bitmap. Unlike a
+/// copy of the screen it never contains another window laid over the target,
+/// so a screenshot cannot leak what some other application shows, and it does
+/// not need the target in front. The price: a minimized window renders
+/// nothing (refused before this), and an application that ignores the request
+/// renders black.
+///
+/// A DPI-virtualised window (unaware, or system aware on a monitor of another
+/// scale) renders at its own logical size while Windows shows it stretched.
+/// Its rendering is scaled to the physical window size the same way, so the
+/// capture lines up with the physical bounds UIA reports. Such a capture is
+/// as soft as what is on screen, no sharper.
+fn print_window(handle: HWND, window: &RECT) -> Result<Vec<u8>> {
+    let width = window.right - window.left;
+    let height = window.bottom - window.top;
+    if width <= 0 || height <= 0 {
+        return Err(DriverError::new(
+            "DRIVER.ACTION_UNSUPPORTED",
+            "the window has no area to capture",
+        ));
+    }
+    if i64::from(width) * i64::from(height) > MAX_WINDOW_PIXELS {
+        return Err(DriverError::new(
+            "DRIVER.ACTION_UNSUPPORTED",
+            "the window is larger than a capture may buffer",
+        ));
+    }
+    let (own_width, own_height) = own_window_size(handle)
+        .filter(|&(w, h)| w > 0 && h > 0 && i64::from(w) * i64::from(h) <= MAX_WINDOW_PIXELS)
+        .unwrap_or((width, height));
+    let rendered = render_window(handle, own_width, own_height)?;
+    if (own_width, own_height) == (width, height) {
+        return Ok(rendered);
+    }
+    let image = image::RgbaImage::from_raw(own_width as u32, own_height as u32, rendered)
+        .ok_or_else(|| DriverError::new("DRIVER.ACTION_FAILED", "malformed window rendering"))?;
+    Ok(image::imageops::resize(
+        &image,
+        width as u32,
+        height as u32,
+        image::imageops::FilterType::Triangle,
+    )
+    .into_raw())
+}
+
+/// The window's size in its own DPI space: what `PrintWindow` renders.
+fn own_window_size(handle: HWND) -> Option<(i32, i32)> {
+    let mut rect = RECT::default();
+    unsafe {
+        let previous = SetThreadDpiAwarenessContext(GetWindowDpiAwarenessContext(handle));
+        let read = GetWindowRect(handle, &mut rect);
+        if !previous.0.is_null() {
+            SetThreadDpiAwarenessContext(previous);
+        }
+        read.ok()?;
+    }
+    Some((rect.right - rect.left, rect.bottom - rect.top))
+}
+
+/// `PrintWindow` into a bitmap of the given size, read back as BGRA.
+fn render_window(handle: HWND, width: i32, height: i32) -> Result<Vec<u8>> {
+    let mut bgra = vec![0u8; width as usize * height as usize * 4];
+    unsafe {
+        let screen = GetDC(HWND::default());
+        let memory = CreateCompatibleDC(screen);
+        let bitmap = CreateCompatibleBitmap(screen, width, height);
+        let old = SelectObject(memory, bitmap);
+        let printed = PrintWindow(handle, memory, PRINT_WINDOW_FLAGS(PW_RENDERFULLCONTENT));
+        // GetDIBits wants the bitmap out of any DC.
+        SelectObject(memory, old);
+        let mut info = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: width,
+                biHeight: -height,
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let lines = GetDIBits(
+            memory,
+            bitmap,
+            0,
+            height as u32,
+            Some(bgra.as_mut_ptr().cast()),
+            &mut info,
+            DIB_RGB_COLORS,
+        );
+        let _ = DeleteObject(bitmap);
+        let _ = DeleteDC(memory);
+        ReleaseDC(HWND::default(), screen);
+        if !printed.as_bool() {
+            return Err(DriverError::new(
+                "DRIVER.ACTION_FAILED",
+                "the window did not render itself for the screenshot",
+            ));
+        }
+        if lines != height {
+            return Err(DriverError::new(
+                "DRIVER.ACTION_FAILED",
+                "the rendered window could not be read back",
+            ));
+        }
+    }
+    Ok(bgra)
+}
+
+/// Cut `region` (screen pixels) out of a window-sized BGRA buffer as RGBA,
+/// keeping at most MAX_CAPTURE_SIDE on each side from the top-left.
+fn crop(bgra: &[u8], window: &RECT, region: &RECT) -> Pixels {
+    let stride = (window.right - window.left) as usize * 4;
+    let full_width = region.right - region.left;
+    let full_height = region.bottom - region.top;
+    let width = full_width.min(MAX_CAPTURE_SIDE);
+    let height = full_height.min(MAX_CAPTURE_SIDE);
+    let left = (region.left - window.left) as usize;
+    let top = (region.top - window.top) as usize;
+    let mut rgba = Vec::with_capacity(width as usize * height as usize * 4);
+    for row in 0..height as usize {
+        let start = (top + row) * stride + left * 4;
+        for pixel in bgra[start..start + width as usize * 4].chunks_exact(4) {
+            // PrintWindow leaves alpha undefined; the image is opaque.
+            rgba.extend_from_slice(&[pixel[2], pixel[1], pixel[0], 255]);
+        }
+    }
+    Pixels {
+        width: width as u32,
+        height: height as u32,
+        rgba,
+        clipped: width < full_width || height < full_height,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Text recognition
+// ---------------------------------------------------------------------------
+
+fn ocr_failed(what: &str, error: windows::core::Error) -> DriverError {
+    DriverError::new("DRIVER.OCR_FAILED", format!("{what}: {error}"))
+}
+
+/// The OCR languages installed on this machine, by tag.
+fn ocr_languages() -> Vec<String> {
+    OcrEngine::AvailableRecognizerLanguages()
+        .ok()
+        .map(|languages| {
+            languages
+                .into_iter()
+                .filter_map(|language| language.LanguageTag().ok())
+                .map(|tag| tag.to_string())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Windows' built-in OCR (Windows.Media.Ocr): offline, no extra engine to
+/// install, one recogniser per installed OCR language pack.
+fn recognize(pixels: &Pixels, language: Option<&str>) -> Result<Recognition> {
+    ensure_com();
+    let available = ocr_languages();
+    let unavailable = |message: &str| {
+        DriverError::new("DRIVER.OCR_UNAVAILABLE", message.to_string())
+            .with_detail("available_languages", serde_json::json!(available))
+    };
+    let engine = match language {
+        Some(tag) => {
+            let language = Language::CreateLanguage(&HSTRING::from(tag))
+                .map_err(|_| unavailable("the language tag is not one Windows knows"))?;
+            if !OcrEngine::IsLanguageSupported(&language).unwrap_or(false) {
+                return Err(unavailable(
+                    "no OCR language pack for that language is installed",
+                ));
+            }
+            OcrEngine::TryCreateFromLanguage(&language)
+                .map_err(|_| unavailable("the OCR engine for that language could not start"))?
+        }
+        // The user's profile languages first; an account whose languages have
+        // no OCR pack falls back to the first pack that is installed.
+        None => match OcrEngine::TryCreateFromUserProfileLanguages() {
+            Ok(engine) => engine,
+            Err(_) => {
+                let first = available
+                    .first()
+                    .ok_or_else(|| unavailable("no OCR language pack is installed"))?;
+                let language = Language::CreateLanguage(&HSTRING::from(first.as_str()))
+                    .map_err(|error| ocr_failed("OCR language", error))?;
+                OcrEngine::TryCreateFromLanguage(&language)
+                    .map_err(|_| unavailable("no OCR engine could start"))?
+            }
+        },
+    };
+    let limit = OcrEngine::MaxImageDimension().unwrap_or(10_000);
+    if pixels.width > limit || pixels.height > limit {
+        return Err(DriverError::new(
+            "DRIVER.ACTION_UNSUPPORTED",
+            format!("OCR reads images of at most {limit} pixels a side; read a smaller element"),
+        ));
+    }
+    let bgra: Vec<u8> = pixels
+        .rgba
+        .chunks_exact(4)
+        .flat_map(|p| [p[2], p[1], p[0], 255])
+        .collect();
+    let writer = DataWriter::new().map_err(|error| ocr_failed("image buffer", error))?;
+    writer
+        .WriteBytes(&bgra)
+        .map_err(|error| ocr_failed("image buffer", error))?;
+    let buffer = writer
+        .DetachBuffer()
+        .map_err(|error| ocr_failed("image buffer", error))?;
+    let bitmap = SoftwareBitmap::CreateCopyFromBuffer(
+        &buffer,
+        BitmapPixelFormat::Bgra8,
+        pixels.width as i32,
+        pixels.height as i32,
+    )
+    .map_err(|error| ocr_failed("bitmap", error))?;
+    let result = engine
+        .RecognizeAsync(&bitmap)
+        .and_then(|operation| operation.get())
+        .map_err(|error| ocr_failed("recognition", error))?;
+    let span = |text: HSTRING, rect: windows::Foundation::Rect| TextSpan {
+        text: text.to_string(),
+        bounds: ImageBox {
+            x: f64::from(rect.X),
+            y: f64::from(rect.Y),
+            width: f64::from(rect.Width),
+            height: f64::from(rect.Height),
+        },
+    };
+    let mut lines = Vec::new();
+    for line in result
+        .Lines()
+        .map_err(|error| ocr_failed("recognition", error))?
+    {
+        let words: Vec<TextSpan> = line
+            .Words()
+            .map(|words| {
+                words
+                    .into_iter()
+                    .filter_map(|word| Some(span(word.Text().ok()?, word.BoundingRect().ok()?)))
+                    .collect()
+            })
+            .unwrap_or_default();
+        // A line's box is the union of its words'.
+        let (mut left, mut top, mut right, mut bottom) = (f64::MAX, f64::MAX, 0.0f64, 0.0f64);
+        for word in &words {
+            left = left.min(word.bounds.x);
+            top = top.min(word.bounds.y);
+            right = right.max(word.bounds.x + word.bounds.width);
+            bottom = bottom.max(word.bounds.y + word.bounds.height);
+        }
+        if words.is_empty() {
+            continue;
+        }
+        let text = line.Text().map(|text| text.to_string()).unwrap_or_default();
+        lines.push((
+            TextSpan {
+                text,
+                bounds: ImageBox {
+                    x: left,
+                    y: top,
+                    width: right - left,
+                    height: bottom - top,
+                },
+            },
+            words,
+        ));
+    }
+    let language = engine
+        .RecognizerLanguage()
+        .and_then(|language| language.LanguageTag())
+        .map(|tag| tag.to_string())
+        .unwrap_or_default();
+    Ok(Recognition {
+        engine: "windows.media.ocr".into(),
+        language,
+        lines,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Clipboard
+// ---------------------------------------------------------------------------
+
+const CF_UNICODETEXT: u32 = 13;
+
+/// A registered clipboard format by name.
+fn clipboard_format(name: &str) -> u32 {
+    let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+    unsafe { RegisterClipboardFormatW(PCWSTR(wide.as_ptr())) }
+}
+/// The format with which a clipboard's source (a password manager) asks
+/// clipboard monitors to leave its content alone.
+const EXCLUDE_FROM_MONITORS: &str = "ExcludeClipboardContentFromMonitorProcessing";
+const CAN_INCLUDE_IN_HISTORY: &str = "CanIncludeInClipboardHistory";
+const CAN_UPLOAD_TO_CLOUD: &str = "CanUploadToCloudClipboard";
+
+/// The clipboard, opened and closed again on drop. Another process may hold
+/// it for a moment, so opening retries briefly before giving up.
+struct OpenedClipboard;
+
+impl OpenedClipboard {
+    fn open(owner: Option<HWND>) -> Result<Self> {
+        let deadline = Instant::now() + Duration::from_millis(1_000);
+        loop {
+            if unsafe { OpenClipboard(owner.unwrap_or_default()) }.is_ok() {
+                return Ok(Self);
+            }
+            if Instant::now() >= deadline {
+                return Err(DriverError::new(
+                    "DRIVER.CLIPBOARD_BUSY",
+                    "another application kept the clipboard open",
+                )
+                .retryable());
+            }
+            pump_for(Duration::from_millis(20));
+        }
+    }
+}
+
+impl Drop for OpenedClipboard {
+    fn drop(&mut self) {
+        let _ = unsafe { CloseClipboard() };
+    }
+}
+
+/// Dispatch this thread's messages for a while: a clipboard owner window
+/// must answer WM_RENDERFORMAT, which arrives as a sent message.
+fn pump_for(duration: Duration) {
+    let until = Instant::now() + duration;
+    let mut message = MSG::default();
+    loop {
+        while unsafe { PeekMessageW(&mut message, None, 0, 0, PM_REMOVE) }.as_bool() {
+            unsafe {
+                DispatchMessageW(&message);
+            }
+        }
+        if Instant::now() >= until {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// The bytes of one clipboard format, from an open clipboard.
+fn clipboard_bytes(format: u32) -> Option<Vec<u8>> {
+    let handle = unsafe { GetClipboardData(format) }.ok()?;
+    let global = HGLOBAL(handle.0);
+    let size = unsafe { GlobalSize(global) };
+    if size == 0 {
+        return None;
+    }
+    let data = unsafe { GlobalLock(global) } as *const u8;
+    if data.is_null() {
+        return None;
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(data, size) }.to_vec();
+    let _ = unsafe { GlobalUnlock(global) };
+    Some(bytes)
+}
+
+fn utf16_text(bytes: &[u8]) -> String {
+    let units: Vec<u16> = bytes
+        .chunks_exact(2)
+        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+        .take_while(|unit| *unit != 0)
+        .collect();
+    String::from_utf16_lossy(&units)
+}
+
+fn read_clipboard_text(max_chars: usize) -> Result<(Option<String>, usize)> {
+    let _open = OpenedClipboard::open(None)?;
+    // A password manager marks what it copies; that is not ours to read.
+    if unsafe { IsClipboardFormatAvailable(clipboard_format(EXCLUDE_FROM_MONITORS)) }.is_ok() {
+        return Err(DriverError::new(
+            "DRIVER.CLIPBOARD_PROTECTED",
+            "the clipboard's source marked its content as not for clipboard readers",
+        ));
+    }
+    if unsafe { IsClipboardFormatAvailable(CF_UNICODETEXT) }.is_err() {
+        return Ok((None, 0));
+    }
+    let Some(bytes) = clipboard_bytes(CF_UNICODETEXT) else {
+        return Ok((None, 0));
+    };
+    let text = utf16_text(&bytes);
+    let total = text.chars().count();
+    Ok((Some(text.chars().take(max_chars).collect()), total))
+}
+
+/// Formats whose clipboard handle is a GDI object, not memory: they cannot
+/// be copied byte-wise. Bitmaps survive anyway as CF_DIB/CF_DIBV5, which
+/// Windows synthesises from them.
+const GDI_FORMATS: [u32; 8] = [2, 3, 9, 14, 0x80, 0x82, 0x83, 0x8E];
+/// The most clipboard content a paste preserves; beyond it the paste is
+/// refused rather than lose what the user copied.
+const MAX_PRESERVED_BYTES: usize = 32 * 1024 * 1024;
+/// How long the target may take to ask for the pasted text.
+const PASTE_CONSUME_TIMEOUT: Duration = Duration::from_millis(2_000);
+
+thread_local! {
+    /// The text this thread's paste window offers, and how often it was asked for.
+    static PASTE_TEXT: std::cell::RefCell<Vec<u16>> = const { std::cell::RefCell::new(Vec::new()) };
+    static PASTE_RENDERS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    /// Requests for the text from anyone but the paste target, not answered.
+    static PASTE_REFUSED: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    /// The process the text is for, and whether Ctrl+V has been sent.
+    static PASTE_TARGET: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    static PASTE_KEYS_SENT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether the process now reading the clipboard is the one being pasted
+/// into. A request from anyone else -- clipboard managers, history, remote
+/// desktop clipboard sync -- gets no data and leaves the offer pending.
+fn requester_is_target() -> bool {
+    let requester = unsafe { GetOpenClipboardWindow() }.unwrap_or_default();
+    if requester.0.is_null() {
+        // Opened without a window: only plausible once the paste is under way.
+        return PASTE_KEYS_SENT.with(|sent| sent.get());
+    }
+    let mut process = 0u32;
+    unsafe { GetWindowThreadProcessId(requester, Some(&mut process)) };
+    process != 0 && process == PASTE_TARGET.with(|target| target.get())
+}
+
+/// Every format on the clipboard, copied, to put back afterwards.
+fn save_clipboard() -> Result<Vec<(u32, Vec<u8>)>> {
+    let _open = OpenedClipboard::open(None)?;
+    let mut saved = Vec::new();
+    let mut total = 0usize;
+    let mut format = 0u32;
+    loop {
+        format = unsafe { EnumClipboardFormats(format) };
+        if format == 0 {
+            break;
+        }
+        if GDI_FORMATS.contains(&format) {
+            continue;
+        }
+        if let Some(bytes) = clipboard_bytes(format) {
+            total += bytes.len();
+            if total > MAX_PRESERVED_BYTES {
+                return Err(DriverError::new(
+                    "DRIVER.CLIPBOARD_TOO_LARGE",
+                    "the clipboard holds more than a paste can preserve; nothing was pasted",
+                ));
+            }
+            saved.push((format, bytes));
+        }
+    }
+    Ok(saved)
+}
+
+fn global_copy(bytes: &[u8]) -> Option<HGLOBAL> {
+    unsafe {
+        let global = GlobalAlloc(GMEM_MOVEABLE, bytes.len().max(1)).ok()?;
+        let data = GlobalLock(global) as *mut u8;
+        if data.is_null() {
+            let _ = GlobalFree(global);
+            return None;
+        }
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), data, bytes.len());
+        let _ = GlobalUnlock(global);
+        Some(global)
+    }
+}
+
+unsafe extern "system" fn paste_window_proc(
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> windows::Win32::Foundation::LRESULT {
+    let render = || {
+        let text = PASTE_TEXT.with(|text| {
+            let text = text.borrow();
+            text.iter()
+                .chain(std::iter::once(&0u16))
+                .flat_map(|unit| unit.to_le_bytes())
+                .collect::<Vec<u8>>()
+        });
+        if let Some(global) = global_copy(&text) {
+            let _ = SetClipboardData(CF_UNICODETEXT, HANDLE(global.0));
+        }
+        PASTE_RENDERS.with(|renders| renders.set(renders.get() + 1));
+    };
+    match message {
+        // The target asked for the text: it is pasting now. Anyone else is
+        // refused, so the offer stays pending for the target.
+        WM_RENDERFORMAT if wparam.0 as u32 == CF_UNICODETEXT => {
+            if requester_is_target() {
+                render();
+            } else {
+                PASTE_REFUSED.with(|refused| refused.set(refused.get() + 1));
+            }
+            windows::Win32::Foundation::LRESULT(0)
+        }
+        // Never rendered for everyone: the clipboard is restored before the
+        // window goes, and an unrendered offer simply lapses.
+        WM_RENDERALLFORMATS => windows::Win32::Foundation::LRESULT(0),
+        _ => DefWindowProcW(hwnd, message, wparam, lparam),
+    }
+}
+
+/// A message-only window owning the clipboard for one paste.
+struct PasteWindow(HWND);
+
+impl PasteWindow {
+    fn create() -> Result<Self> {
+        static CLASS: std::sync::OnceLock<Vec<u16>> = std::sync::OnceLock::new();
+        let class_name = CLASS.get_or_init(|| {
+            let name: Vec<u16> = format!("AadPasteOwner_{}", std::process::id())
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect();
+            let class = WNDCLASSEXW {
+                cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+                lpfnWndProc: Some(paste_window_proc),
+                lpszClassName: PCWSTR(name.as_ptr()),
+                ..Default::default()
+            };
+            unsafe { RegisterClassExW(&class) };
+            name
+        });
+        let hwnd = unsafe {
+            CreateWindowExW(
+                WINDOW_EX_STYLE::default(),
+                PCWSTR(class_name.as_ptr()),
+                PCWSTR::null(),
+                WINDOW_STYLE::default(),
+                0,
+                0,
+                0,
+                0,
+                HWND_MESSAGE,
+                None,
+                None,
+                None,
+            )
+        }
+        .map_err(|error| DriverError::unavailable(format!("no clipboard owner window: {error}")))?;
+        Ok(Self(hwnd))
+    }
+}
+
+impl Drop for PasteWindow {
+    fn drop(&mut self) {
+        let _ = unsafe { DestroyWindow(self.0) };
+    }
+}
+
+/// Put a delayed-rendering text offer on the clipboard, owned by `owner`.
+fn offer_text(owner: HWND) -> Result<()> {
+    let _open = OpenedClipboard::open(Some(owner))?;
+    unsafe { EmptyClipboard() }.map_err(|error| {
+        DriverError::new("DRIVER.CLIPBOARD_BUSY", format!("clipboard: {error}"))
+    })?;
+    // SetClipboardData returns NULL for a delayed offer by design, so
+    // success is read back rather than taken from its result.
+    let _ = unsafe { SetClipboardData(CF_UNICODETEXT, HANDLE::default()) };
+    if unsafe { IsClipboardFormatAvailable(CF_UNICODETEXT) }.is_err() {
+        return Err(DriverError::new(
+            "DRIVER.CLIPBOARD_BUSY",
+            "the clipboard did not accept the text offer",
+        ));
+    }
+    // Ask well-behaved watchers -- Windows' clipboard history and cloud
+    // clipboard among them -- not to ask at all. (Measured: without this the
+    // history service's refused request left Edit controls unable to paste.)
+    for name in [
+        EXCLUDE_FROM_MONITORS,
+        CAN_INCLUDE_IN_HISTORY,
+        CAN_UPLOAD_TO_CLOUD,
+    ] {
+        if let Some(global) = global_copy(&0u32.to_le_bytes()) {
+            let _ = unsafe { SetClipboardData(clipboard_format(name), HANDLE(global.0)) };
+        }
+    }
+    Ok(())
+}
+
+/// Whether the clipboard now looks like a re-published copy of our offer:
+/// its markers without its text. Clipboard sync tools do this.
+fn echo_of_offer() -> bool {
+    let Ok(_open) = OpenedClipboard::open(None) else {
+        return false;
+    };
+    unsafe {
+        IsClipboardFormatAvailable(clipboard_format(EXCLUDE_FROM_MONITORS)).is_ok()
+            && IsClipboardFormatAvailable(CF_UNICODETEXT).is_err()
+    }
+}
+
+/// Wait (bounded) until nobody asks for the offer and nobody holds the
+/// clipboard open, so the target will be able to open it.
+fn settle_clipboard(owner: HWND) {
+    let until = Instant::now() + Duration::from_millis(600);
+    let mut quiet_since = Instant::now();
+    let mut refusals = PASTE_REFUSED.with(|refused| refused.get());
+    while Instant::now() < until {
+        pump_for(Duration::from_millis(15));
+        let now = PASTE_REFUSED.with(|refused| refused.get());
+        // Opening it is the only reliable test that nobody holds it: a
+        // reader that opened it without a window is invisible otherwise.
+        let held = match unsafe { OpenClipboard(owner) } {
+            Ok(()) => {
+                let _ = unsafe { CloseClipboard() };
+                false
+            }
+            Err(_) => true,
+        };
+        if now != refusals || held {
+            refusals = now;
+            quiet_since = Instant::now();
+        } else if quiet_since.elapsed() >= Duration::from_millis(150) {
+            return;
+        }
+    }
+}
+
+fn still_offered(owner: HWND) -> bool {
+    unsafe { GetClipboardOwner() }.is_ok_and(|current| current == owner)
+        && unsafe { IsClipboardFormatAvailable(CF_UNICODETEXT) }.is_ok()
+}
+
+/// Put the saved formats back.
+fn restore_clipboard(owner: HWND, saved: &[(u32, Vec<u8>)]) -> bool {
+    let Ok(_open) = OpenedClipboard::open(Some(owner)) else {
+        return false;
+    };
+    if unsafe { EmptyClipboard() }.is_err() {
+        return false;
+    }
+    let mut restored = true;
+    for (format, bytes) in saved {
+        restored &= global_copy(bytes)
+            .is_some_and(|global| unsafe { SetClipboardData(*format, HANDLE(global.0)) }.is_ok());
+    }
+    restored
+}
+
+impl WindowsUiaBackend {
+    /// Paste `text` into the element through the clipboard, then put the
+    /// clipboard back as it was.
+    ///
+    /// The text is offered by delayed rendering: our window owns the
+    /// clipboard and supplies the text only when someone asks for it. That
+    /// request is the target pasting, so restoring waits for it (and for the
+    /// target to close the clipboard) instead of guessing at a delay -- an
+    /// early restore would paste the user's old clipboard instead. Anyone but
+    /// the target process asking for the text -- clipboard history, managers,
+    /// sync tools -- is refused, so the text reaches only the target.
+    fn paste_text(&self, window_id: &str, node: &Node, text: &str) -> Result<serde_json::Value> {
+        let element = self.require(window_id, node)?;
+        if unsafe { element.CurrentIsPassword() }.is_ok_and(|value| value.as_bool()) {
+            return Err(DriverError::new(
+                "DRIVER.PROTECTED_ELEMENT",
+                "a password field is never pasted into: the text would pass through the clipboard",
+            ));
+        }
+        let chord = Chord::parse(&["ctrl".to_string(), "v".to_string()])?;
+        let saved = save_clipboard()?;
+        let owner = PasteWindow::create()?;
+        PASTE_TEXT.with(|slot| *slot.borrow_mut() = text.encode_utf16().collect());
+        PASTE_RENDERS.with(|renders| renders.set(0));
+        PASTE_REFUSED.with(|refused| refused.set(0));
+        PASTE_KEYS_SENT.with(|sent| sent.set(false));
+        let handle = parse_window_id(window_id)?;
+        let mut target_process = 0u32;
+        unsafe { GetWindowThreadProcessId(handle, Some(&mut target_process)) };
+        PASTE_TARGET.with(|target| target.set(target_process));
+        // From the moment the clipboard is emptied, every way out restores it.
+        let restore_on_failure = |error: DriverError| {
+            let restored = restore_clipboard(owner.0, &saved);
+            PASTE_TEXT.with(|slot| slot.borrow_mut().clear());
+            error.with_detail("clipboard_restored", serde_json::json!(restored))
+        };
+        // Offer the text, let clipboard watchers react (they are refused and
+        // let go), and offer again if one of them replaced the clipboard --
+        // clipboard sync tools re-publish what they saw. Only an offer that is
+        // still ours, on a clipboard nobody holds open, is pasted from.
+        let mut attempts = 0;
+        loop {
+            attempts += 1;
+            if let Err(error) = offer_text(owner.0) {
+                return Err(restore_on_failure(error));
+            }
+            settle_clipboard(owner.0);
+            if still_offered(owner.0) {
+                break;
+            }
+            if attempts == 3 {
+                return Err(restore_on_failure(DriverError::new(
+                    "DRIVER.CLIPBOARD_BUSY",
+                    "another application keeps replacing the clipboard; nothing was pasted",
+                )));
+            }
+        }
+        // A classic Win32 edit or rich edit is told to paste with WM_PASTE on
+        // its own window: a message to the anchored control, which keyboard
+        // hooks cannot swallow and which needs neither the foreground nor a
+        // modifier key. (Measured: on a machine running keyboard-hooking
+        // tools, Ctrl+V reached a focused fixture edit only one time in
+        // three; WM_PASTE every time.) Everything else gets Ctrl+V.
+        let native = unsafe { element.CurrentNativeWindowHandle() }.unwrap_or_default();
+        let classic = !native.0.is_null() && {
+            let class = class_name(native).to_ascii_lowercase();
+            class == "edit" || class.starts_with("richedit")
+        };
+        let via = if classic {
+            let _ = unsafe { element.SetFocus() };
+            PASTE_KEYS_SENT.with(|sent| sent.set(true));
+            let mut result = 0usize;
+            // While this waits, the edit's request for the text is answered:
+            // a thread blocked in SendMessage still handles sent messages.
+            let delivered = unsafe {
+                SendMessageTimeoutW(
+                    native,
+                    WM_PASTE,
+                    WPARAM(0),
+                    LPARAM(0),
+                    SMTO_NORMAL,
+                    PASTE_CONSUME_TIMEOUT.as_millis() as u32,
+                    Some(&mut result),
+                )
+            };
+            if delivered.0 == 0 {
+                return Err(restore_on_failure(
+                    DriverError::new(
+                        "DRIVER.ACTION_FAILED",
+                        "the edit did not answer the paste request in time",
+                    )
+                    .with_effect("unknown"),
+                ));
+            }
+            "wm_paste"
+        } else {
+            if let Err(error) = focus_for_keys(&self.automation, handle, &element) {
+                return Err(restore_on_failure(error));
+            }
+            if let Err(error) = deliver_atomically(&chord.to_inputs(), "the paste shortcut") {
+                let released = chord.release_modifiers();
+                return Err(restore_on_failure(error.with_detail(
+                    "residual_state_cleared",
+                    serde_json::json!(released),
+                )));
+            }
+            PASTE_KEYS_SENT.with(|sent| sent.set(true));
+            "ctrl_v"
+        };
+        let deadline = Instant::now() + PASTE_CONSUME_TIMEOUT;
+        while PASTE_RENDERS.with(|renders| renders.get()) == 0 && Instant::now() < deadline {
+            pump_for(Duration::from_millis(10));
+        }
+        let consumed = PASTE_RENDERS.with(|renders| renders.get()) > 0;
+        let refused = PASTE_REFUSED.with(|refused| refused.get());
+        // The target reads while it holds the clipboard open; opening it
+        // ourselves (inside restore) waits for it to finish.
+        let restored = restore_clipboard(owner.0, &saved);
+        PASTE_TEXT.with(|slot| slot.borrow_mut().clear());
+        // A clipboard sync tool may re-publish what it saw of the offer (its
+        // markers, never its text) after the restore. Watch for that briefly
+        // and restore once more; anything else replacing it is the user's.
+        let sequence = unsafe { GetClipboardSequenceNumber() };
+        let watch_until = Instant::now() + Duration::from_millis(1_000);
+        let mut restored = restored;
+        let mut restored_again = false;
+        while Instant::now() < watch_until {
+            pump_for(Duration::from_millis(50));
+            if unsafe { GetClipboardSequenceNumber() } != sequence {
+                if !restored_again && echo_of_offer() {
+                    restored = restore_clipboard(owner.0, &saved);
+                    restored_again = true;
+                } else {
+                    break;
+                }
+            }
+        }
+        if !consumed {
+            return Err(DriverError::new(
+                "DRIVER.PASTE_NOT_CONSUMED",
+                "Ctrl+V was sent but the element never asked for the clipboard's text",
+            )
+            // The shortcut landed on the element; what it did there is unknown.
+            .with_effect("unknown")
+            .with_detail("clipboard_restored", serde_json::json!(restored))
+            .with_detail("via", serde_json::json!(via))
+            .with_detail("other_readers_refused", serde_json::json!(refused)));
+        }
+        Ok(serde_json::json!({
+            "consumed": true,
+            "clipboard_restored": restored,
+            "clipboard_formats_restored": saved.len(),
+            "via": via,
+            "other_readers_refused": refused,
+        }))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Window actions
+// ---------------------------------------------------------------------------
+
+/// What a top-level window can do and where it stands, from UIA's
+/// WindowPattern where the window has one and its Win32 styles otherwise.
+struct WindowAbilities {
+    can_minimize: bool,
+    can_maximize: bool,
+    state: WindowVisualState,
+}
+
+fn window_abilities(element: &IUIAutomationElement, handle: HWND) -> WindowAbilities {
+    let pattern =
+        unsafe { element.GetCurrentPatternAs::<IUIAutomationWindowPattern>(UIA_WindowPatternId) }
+            .ok();
+    let style = unsafe { GetWindowLongW(handle, GWL_STYLE) } as u32;
+    let state = if unsafe { IsIconic(handle) }.as_bool() {
+        WindowVisualState_Minimized
+    } else if unsafe { IsZoomed(handle) }.as_bool() {
+        WindowVisualState_Maximized
+    } else {
+        WindowVisualState_Normal
+    };
+    let pattern_says = |read: &dyn Fn(&IUIAutomationWindowPattern) -> Option<bool>| {
+        pattern.as_ref().and_then(read)
+    };
+    WindowAbilities {
+        can_minimize: pattern_says(&|p| {
+            unsafe { p.CurrentCanMinimize() }.ok().map(|v| v.as_bool())
+        })
+        .unwrap_or(style & WS_MINIMIZEBOX.0 != 0),
+        can_maximize: pattern_says(&|p| {
+            unsafe { p.CurrentCanMaximize() }.ok().map(|v| v.as_bool())
+        })
+        .unwrap_or(style & WS_MAXIMIZEBOX.0 != 0),
+        state,
+    }
+}
+
+/// The window actions a captured window's root node offers.
+fn window_actions(element: &IUIAutomationElement) -> Vec<String> {
+    let Ok(handle) = (unsafe { element.CurrentNativeWindowHandle() }) else {
+        return Vec::new();
+    };
+    if handle.0.is_null() || unsafe { GetAncestor(handle, GA_ROOT) } != handle {
+        return Vec::new();
+    }
+    let abilities = window_abilities(element, handle);
+    let mut actions = vec!["activate".to_string(), "close_window".to_string()];
+    if abilities.can_minimize && abilities.state != WindowVisualState_Minimized {
+        actions.push("minimize".into());
+    }
+    if abilities.can_maximize && abilities.state != WindowVisualState_Maximized {
+        actions.push("maximize".into());
+    }
+    if abilities.state != WindowVisualState_Normal {
+        actions.push("restore".into());
+    }
+    actions
+}
+
+fn window_state_name(handle: HWND) -> &'static str {
+    unsafe {
+        if !IsWindow(handle).as_bool() {
+            "closed"
+        } else if IsIconic(handle).as_bool() {
+            "minimized"
+        } else if IsZoomed(handle).as_bool() {
+            "maximized"
+        } else {
+            "normal"
+        }
+    }
+}
+
+/// How long a window action may take to show in the window's state.
+const WINDOW_SETTLE: Duration = Duration::from_millis(1_500);
+
+impl WindowsUiaBackend {
+    fn act_on_window(
+        &self,
+        window_id: &str,
+        node: &Node,
+        action: &str,
+    ) -> Result<serde_json::Value> {
+        let handle = parse_window_id(window_id)?;
+        let element = self.require(window_id, node)?;
+        let live = unsafe { element.CurrentNativeWindowHandle() }.unwrap_or_default();
+        if live != handle {
+            return Err(DriverError::stale(
+                "the observed node no longer stands for its window",
+            ));
+        }
+        let pattern = unsafe {
+            element.GetCurrentPatternAs::<IUIAutomationWindowPattern>(UIA_WindowPatternId)
+        }
+        .ok();
+        let failed = |what: &str, error: windows::core::Error| {
+            DriverError::new("DRIVER.ACTION_FAILED", format!("{what} failed: {error}"))
+                .with_effect("unknown")
+        };
+        // UIA's WindowPattern first, as the window's own accessibility
+        // contract; Win32 on the anchored HWND for windows without one.
+        let visual = |state: WindowVisualState, command: SHOW_WINDOW_CMD| -> Result<()> {
+            match &pattern {
+                Some(pattern) => unsafe { pattern.SetWindowVisualState(state) }
+                    .map_err(|error| failed("changing the window state", error)),
+                None => {
+                    unsafe {
+                        let _ = ShowWindow(handle, command);
+                    }
+                    Ok(())
+                }
+            }
+        };
+        let reached: Box<dyn Fn() -> bool> = match action {
+            "minimize" => {
+                visual(WindowVisualState_Minimized, SW_MINIMIZE)?;
+                Box::new(|| unsafe { IsIconic(handle) }.as_bool())
+            }
+            "maximize" => {
+                visual(WindowVisualState_Maximized, SW_MAXIMIZE)?;
+                Box::new(|| unsafe { IsZoomed(handle) }.as_bool())
+            }
+            "restore" => {
+                visual(WindowVisualState_Normal, SW_RESTORE)?;
+                Box::new(|| unsafe { !IsIconic(handle).as_bool() && !IsZoomed(handle).as_bool() })
+            }
+            "close_window" => {
+                match &pattern {
+                    Some(pattern) => unsafe { pattern.Close() }
+                        .map_err(|error| failed("closing the window", error))?,
+                    None => unsafe { PostMessageW(handle, WM_CLOSE, WPARAM(0), LPARAM(0)) }
+                        .map_err(|error| failed("closing the window", error))?,
+                }
+                // A window may legitimately stay: "save changes?" is the
+                // application's answer, not a failure of the request.
+                let deadline = Instant::now() + WINDOW_SETTLE;
+                while unsafe { IsWindow(handle) }.as_bool() && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+                let closed = !unsafe { IsWindow(handle) }.as_bool();
+                return Ok(serde_json::json!({
+                    "state": window_state_name(handle),
+                    "closed": closed,
+                    "note": if closed { serde_json::Value::Null } else {
+                        serde_json::json!("the window is still open; it may be asking to save or confirm -- observe it")
+                    },
+                }));
+            }
+            "activate" => {
+                if unsafe { IsIconic(handle) }.as_bool() {
+                    visual(WindowVisualState_Normal, SW_RESTORE)?;
+                }
+                if !bring_to_front(handle) {
+                    return Err(DriverError::new(
+                        "DRIVER.ACTIVATION_REFUSED",
+                        "Windows did not let this process bring the window to the foreground",
+                    )
+                    // Restoring from minimized may have happened.
+                    .with_effect("unknown")
+                    .with_detail("state", serde_json::json!(window_state_name(handle))));
+                }
+                Box::new(|| unsafe { GetForegroundWindow() } == handle)
+            }
+            other => {
+                return Err(DriverError::invalid(format!(
+                    "unknown window action {other:?}"
+                )))
+            }
+        };
+        let deadline = Instant::now() + WINDOW_SETTLE;
+        while !reached() {
+            if Instant::now() >= deadline {
+                return Err(DriverError::new(
+                    "DRIVER.ACTION_FAILED",
+                    format!("the window did not reach the requested state after {action}"),
+                )
+                .with_effect("unknown")
+                .with_detail("state", serde_json::json!(window_state_name(handle))));
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        Ok(serde_json::json!({
+            "state": window_state_name(handle),
+            "foreground": unsafe { GetForegroundWindow() } == handle,
+        }))
     }
 }
 
@@ -2048,6 +3435,71 @@ mod tests {
             element_point(Some(bounds), Some((1.0, 1.0))).unwrap(),
             (109, 219)
         );
+    }
+
+    /// How Windows turns an absolute coordinate back into a virtual-screen pixel.
+    fn denormalise(absolute: i32, origin: i32, extent: i32) -> i32 {
+        origin + ((i64::from(absolute) * i64::from(extent)) >> 16) as i32
+    }
+
+    #[test]
+    fn every_pixel_round_trips_through_absolute_coordinates() {
+        // Primary-only, a secondary monitor left of the primary (negative
+        // origin), one above it, and an odd 3-monitor span.
+        for (origin, extent) in [
+            (0, 1536),
+            (0, 2560),
+            (-1920, 4480),
+            (-1200, 3360),
+            (0, 5761),
+        ] {
+            for pixel in origin..origin + extent {
+                let absolute = normalise(pixel, origin, extent);
+                assert!((0..=65_535).contains(&absolute));
+                assert_eq!(
+                    denormalise(absolute, origin, extent),
+                    pixel,
+                    "origin {origin} extent {extent}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_point_off_the_virtual_screen_is_clamped_to_its_edge() {
+        assert_eq!(
+            denormalise(normalise(-5000, -1920, 4480), -1920, 4480),
+            -1920
+        );
+        assert_eq!(denormalise(normalise(9000, -1920, 4480), -1920, 4480), 2559);
+    }
+
+    #[test]
+    fn the_secure_attention_sequence_and_locking_are_never_pressed() {
+        let chord = |keys: &[&str]| {
+            Chord::parse(&keys.iter().map(|k| k.to_string()).collect::<Vec<_>>()).unwrap()
+        };
+        for reserved in [&["ctrl", "alt", "delete"][..], &["win", "l"], &["Win", "L"]] {
+            assert_eq!(
+                refuse_reserved_chord(&chord(reserved)).unwrap_err().code,
+                "DRIVER.KEY_RESERVED"
+            );
+        }
+        for allowed in [
+            &["win", "d"][..],
+            &["alt", "tab"],
+            &["ctrl", "delete"],
+            &["l"],
+        ] {
+            assert!(refuse_reserved_chord(&chord(allowed)).is_ok());
+        }
+    }
+
+    #[test]
+    fn the_backend_runs_per_monitor_dpi_aware() {
+        // Bounds, input and captured pixels only agree in physical pixels.
+        let _backend = WindowsUiaBackend::new().expect("UIA is available");
+        assert_eq!(dpi_awareness(), "per_monitor");
     }
 
     #[test]

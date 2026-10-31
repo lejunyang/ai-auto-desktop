@@ -186,7 +186,7 @@ fn a_remote_connection_advertises_no_local_file_or_legacy_execution_tools() {
         .as_array()
         .unwrap()
         .iter()
-        .all(|tool| tool["name"].as_str().unwrap().starts_with("control_")));
+        .all(|tool| aad_mcp::control_tools::method(tool["name"].as_str().unwrap()).is_some()));
     assert_eq!(
         server.handle(&rpc(2, "save_workflow", json!({}))).unwrap()["error"]["code"],
         -32602

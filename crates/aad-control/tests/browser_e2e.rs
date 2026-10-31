@@ -65,6 +65,93 @@ customElements.define('x-closed',class extends HTMLElement{constructor(){super()
 /// A host name the fixture browser maps to loopback: a different site from 127.0.0.1.
 const CROSS_SITE: &str = "cross-site.test";
 
+/// Answer one fixture request, or nothing. Browsers open sockets before they
+/// have a request to send (preconnects). Answering such a socket with the
+/// default page before its request arrives makes the browser read that page as
+/// the reply to whatever it asks next -- a new tab at /second showing the
+/// fixture page -- so only a complete request line is ever answered.
+fn respond(mut stream: std::net::TcpStream, page: &str) {
+    // Accepted sockets may inherit the listener's non-blocking mode.
+    if stream.set_nonblocking(false).is_err() {
+        return;
+    }
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut bytes = Vec::new();
+    let mut chunk = [0u8; 8192];
+    while !bytes.windows(4).any(|w| w == b"\r\n\r\n") {
+        match stream.read(&mut chunk) {
+            Ok(0) => return,
+            Ok(count) => bytes.extend_from_slice(&chunk[..count]),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) && Instant::now() < deadline => {}
+            Err(_) => return,
+        }
+        if bytes.len() > 65536 {
+            return;
+        }
+    }
+    let request = String::from_utf8_lossy(&bytes);
+    let mut headers = "Content-Type: text/html; charset=utf-8";
+    let body = if request.starts_with("GET /download") {
+        headers = "Content-Type: application/octet-stream\r\nContent-Disposition: attachment; filename=\"report.txt\"";
+        "downloaded body"
+    } else if request.starts_with("GET /frame") {
+        "<!doctype html><input aria-label='FrameInput' onkeydown=\"document.getElementById('fs').value='key:'+event.key+':'+event.isTrusted\"><button aria-label='FrameButton' onmousedown=\"document.getElementById('fs').value='down:'+event.isTrusted\">Press</button><output id='fs' aria-label='FrameStatus'>ready</output><div style='height:900px'></div>"
+    } else if request.starts_with("GET /xframe") {
+        "<!doctype html><body style='margin:0'><input aria-label='CrossInput' onkeydown=\"document.getElementById('cs').value='key:'+event.key+':'+event.isTrusted\"><button aria-label='CrossButton' onmousedown=\"document.getElementById('cs').value='down:'+event.button+':'+event.isTrusted\">Press</button><output id='cs' aria-label='CrossStatus'>ready</output><div style='height:900px'></div></body>"
+    } else if request.starts_with("GET /api") {
+        headers = "Content-Type: application/json";
+        r#"{"ok":true,"password":"hunter2"}"#
+    } else if request.starts_with("GET /second") {
+        "<!doctype html><title>Second</title><body><p aria-label='Second marker'>second</p></body>"
+    } else {
+        page
+    };
+    let response = format!(
+        "HTTP/1.1 200 OK\r\n{headers}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let _ = stream.write_all(response.as_bytes());
+}
+
+#[test]
+fn the_fixture_server_answers_only_requests_it_has_read() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let accept = || loop {
+        match listener.accept() {
+            Ok((stream, _)) => return stream,
+            Err(_) => std::thread::sleep(Duration::from_millis(5)),
+        }
+    };
+    // A preconnected socket whose request comes late gets that request's page.
+    let mut client = std::net::TcpStream::connect(address).unwrap();
+    let server = accept();
+    let worker = std::thread::spawn(move || respond(server, PAGE));
+    std::thread::sleep(Duration::from_millis(1500));
+    client
+        .write_all(b"GET /second HTTP/1.1\r\nHost: x\r\n\r\n")
+        .unwrap();
+    let mut answer = String::new();
+    client.read_to_string(&mut answer).unwrap();
+    worker.join().unwrap();
+    assert!(answer.contains("Second marker"), "{answer}");
+    // One that never sends a request is closed without an answer.
+    let mut idle = std::net::TcpStream::connect(address).unwrap();
+    let server = accept();
+    let worker = std::thread::spawn(move || respond(server, PAGE));
+    idle.shutdown(std::net::Shutdown::Write).unwrap();
+    let mut answer = String::new();
+    idle.read_to_string(&mut answer).unwrap();
+    worker.join().unwrap();
+    assert_eq!(answer, "");
+}
+
 struct Fixture {
     child: Child,
     root: PathBuf,
@@ -96,31 +183,11 @@ impl Fixture {
         let server = std::thread::spawn(move || {
             while !stopped.load(Ordering::SeqCst) {
                 match listener.accept() {
-                    Ok((mut stream, _)) => {
-                        stream
-                            .set_read_timeout(Some(Duration::from_secs(1)))
-                            .unwrap();
-                        let mut bytes = [0u8; 8192];
-                        let count = stream.read(&mut bytes).unwrap_or(0);
-                        let request = String::from_utf8_lossy(&bytes[..count]);
-                        let mut headers = "Content-Type: text/html; charset=utf-8";
-                        let body = if request.starts_with("GET /download") {
-                            headers = "Content-Type: application/octet-stream\r\nContent-Disposition: attachment; filename=\"report.txt\"";
-                            "downloaded body"
-                        } else if request.starts_with("GET /frame") {
-                            "<!doctype html><input aria-label='FrameInput' onkeydown=\"document.getElementById('fs').value='key:'+event.key+':'+event.isTrusted\"><button aria-label='FrameButton' onmousedown=\"document.getElementById('fs').value='down:'+event.isTrusted\">Press</button><output id='fs' aria-label='FrameStatus'>ready</output><div style='height:900px'></div>"
-                        } else if request.starts_with("GET /xframe") {
-                            "<!doctype html><body style='margin:0'><input aria-label='CrossInput' onkeydown=\"document.getElementById('cs').value='key:'+event.key+':'+event.isTrusted\"><button aria-label='CrossButton' onmousedown=\"document.getElementById('cs').value='down:'+event.button+':'+event.isTrusted\">Press</button><output id='cs' aria-label='CrossStatus'>ready</output><div style='height:900px'></div></body>"
-                        } else if request.starts_with("GET /api") {
-                            headers = "Content-Type: application/json";
-                            r#"{"ok":true,"password":"hunter2"}"#
-                        } else if request.starts_with("GET /second") {
-                            "<!doctype html><title>Second</title><body><p aria-label='Second marker'>second</p></body>"
-                        } else {
-                            &page
-                        };
-                        let response=format!("HTTP/1.1 200 OK\r\n{headers}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len());
-                        let _ = stream.write_all(response.as_bytes());
+                    Ok((stream, _)) => {
+                        // One thread per connection: a socket the browser opens
+                        // ahead of time must not hold up the next request.
+                        let page = page.clone();
+                        std::thread::spawn(move || respond(stream, &page));
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                         std::thread::sleep(Duration::from_millis(5))

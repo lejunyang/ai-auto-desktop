@@ -628,7 +628,8 @@ a new run if the work still needs doing."
                     "workflow": run.workflow_name,
                     "status": run.status.as_str(),
                     "desired_state": run.desired_state.as_str(),
-                    "attached": self.is_attached(&run.run_id),
+                    // A finished run's runner may not have detached yet.
+                    "attached": !run.is_terminal() && self.is_attached(&run.run_id),
                     "created_at": run.created_at,
                     "updated_at": run.updated_at,
                     "finished_at": run.finished_at,
@@ -749,7 +750,9 @@ a new run if the work still needs doing."
                 })
             }
         };
-        let attached = self.is_attached(run_id);
+        // The runner records the terminal state just before it detaches, so a
+        // finished run is never reported as still attached.
+        let attached = !run.is_terminal() && self.is_attached(run_id);
         let recent = store
             .list_recent_events(run_id, RECENT_EVENTS)
             .unwrap_or_default();

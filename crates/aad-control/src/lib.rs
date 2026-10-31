@@ -2,6 +2,7 @@
 //! No network listener: remote sessions inherit an authenticated SSH stdio pipe.
 
 pub mod browser;
+pub mod launch;
 pub mod lease;
 pub mod model;
 pub mod native;
@@ -50,6 +51,11 @@ pub trait Backend: Send + Sync {
     fn lease_key(&self, _snapshot: &Value) -> Option<String> {
         None
     }
+    /// Read-only operations beyond observe and find this provider offers,
+    /// such as `capture`; listed by `capabilities` so none is guessed at.
+    fn reads(&self) -> Vec<String> {
+        Vec::new()
+    }
     /// A PNG of an observed node: `{"format": "png", "data": base64, "width", "height"}`.
     fn capture(&self, _snapshot: &Value, _node: &Value, _timeout: Duration) -> Result<Value> {
         Err(error(
@@ -75,6 +81,40 @@ pub trait Backend: Send + Sync {
         Err(error(
             "CONTROL.ACTION_UNSUPPORTED",
             "this provider records no network requests",
+        ))
+    }
+    /// OCR over the node's pixels: the PNG read (`format`, `data`, `width`,
+    /// `height`), the `engine` and `language`, and `lines` of `{text, bounds,
+    /// words}` with bounds in that image's pixels.
+    fn read_text(
+        &self,
+        _snapshot: &Value,
+        _node: &Value,
+        _language: Option<&str>,
+        _timeout: Duration,
+    ) -> Result<Value> {
+        Err(error(
+            "CONTROL.ACTION_UNSUPPORTED",
+            "this provider cannot read text from pixels",
+        ))
+    }
+    /// Whether this provider can press a key chord anchored on nothing.
+    fn offers_global_keys(&self) -> bool {
+        false
+    }
+    /// Press a key chord wherever keyboard focus is, anchored on nothing.
+    fn global_key(&self, _keys: &[String], _context: &Context) -> Result<Value> {
+        Err(error(
+            "CONTROL.ACTION_UNSUPPORTED",
+            "this provider cannot press global keys",
+        ))
+    }
+    /// The desktop clipboard's text: `{"has_text", "text", "characters",
+    /// "truncated"}`. Not anchored; the session checks its own grant first.
+    fn clipboard_read(&self, _max_characters: Option<usize>, _timeout: Duration) -> Result<Value> {
+        Err(error(
+            "CONTROL.ACTION_UNSUPPORTED",
+            "this provider cannot read the clipboard",
         ))
     }
     fn resources(&self, timeout: Duration) -> Result<Vec<BackendResource>>;
@@ -112,6 +152,16 @@ pub struct Policy {
     pub providers: BTreeSet<String>,
     /// Optional server-owned allowlist; a client cannot extend it.
     pub resources: Option<BTreeSet<String>>,
+    /// Programs `launch` may start, as the operator named them (an absolute
+    /// path or a bare name on PATH). Empty: launching is refused. Needs
+    /// `allow_input` as well.
+    pub launch: BTreeSet<String>,
+    /// Whether `clipboard_read` may return the clipboard's text. Separate from
+    /// input and off by default: the clipboard often holds secrets.
+    pub allow_clipboard_read: bool,
+    /// Whether global_key may press keys anchored on no element. Needs
+    /// llow_input as well; off by default.
+    pub allow_global_keys: bool,
     /// Directories whose files an `upload` may hand to a page. Empty refuses
     /// every upload; a client can neither extend nor see past them.
     pub upload_roots: Vec<std::path::PathBuf>,
@@ -493,7 +543,11 @@ impl Session {
             Ok(value) => (
                 Some(value),
                 None,
-                if request.mutating() {
+                if matches!(request.operation, Operation::GlobalKey { .. }) {
+                    // Delivered to whatever held focus: nothing anchors or
+                    // verifies it, so the commit state stays unknown.
+                    "dispatched".to_string()
+                } else if request.mutating() {
                     "applied".to_string()
                 } else {
                     "not_applied".to_string()
@@ -610,13 +664,13 @@ impl Session {
 
     fn dispatch(&self, operation: &Operation, context: &Context) -> Result<Value> {
         match operation {
-            Operation::Capabilities {} => Ok(
+            Operation::Capabilities {} => Ok(self.with_grants(
                 json!({"session_id": self.id, "protocol_version": PROTOCOL_VERSION,
                 "expires_in_ms": self.lifetime.saturating_sub(self.created.elapsed()).as_millis(),
                 "allow_input": self.policy.allow_input,"upload_dirs": self.policy.upload_roots,"cookie_values": self.policy.allow_cookie_values,"observation_retention":"until_next_observation_or_input_attempt","observation_ttl_ms":self.observation_ttl.as_millis(),"max_requests":self.max_requests,"input_lease":"exclusive_cooperating_session","input_lease_scope":"os_user","providers": self.backends.values().filter(|b| self.allowed_provider(b.name()))
-                    .map(|b| json!({"provider": b.name(), "actions": b.capabilities()})).collect::<Vec<_>>(),
+                    .map(|b| json!({"provider": b.name(), "actions": b.capabilities(), "reads": b.reads()})).collect::<Vec<_>>(),
                 "unavailable": self.failures}),
-            ),
+            )),
             Operation::Targets {} => {
                 let mut resources = BTreeMap::new();
                 let mut unavailable = self.failures.clone();
@@ -841,49 +895,254 @@ impl Session {
                 )
             }
             Operation::Capture { target } => {
-                if target.session_id != self.id {
-                    return Err(error(
-                        "CONTROL.SESSION_MISMATCH",
-                        "target belongs to another session",
-                    ));
-                }
-                let observation = self.observation(&target.observation_id)?;
-                if target.resource_id != observation.resource_id
-                    || !self.allowed_resource(&target.resource_id)
-                {
-                    return Err(error(
-                        "POLICY.DENIED",
-                        "target is outside the resource grant",
-                    ));
-                }
-                let node = observation.raw["nodes"]
-                    .as_array()
-                    .and_then(|nodes| {
-                        nodes
-                            .iter()
-                            .find(|n| n["node_id"] == target.node_id.as_str())
-                    })
-                    .ok_or_else(|| error("CONTROL.STALE_TARGET", "node was not observed"))?;
+                let (observation, node) = self.observed_node(target)?;
                 let backend = &self.backends[&observation.provider];
-                let mut shot = backend.capture(&observation.raw, node, context.remaining()?)?;
-                // Compared across captures to tell whether what is shown changed,
-                // e.g. a login code that refreshes, without reading the image.
-                let digest = shot["data"]
-                    .as_str()
-                    .map(|data| {
-                        use sha2::Digest;
-                        sha2::Sha256::digest(data.as_bytes())
-                            .iter()
-                            .map(|b| format!("{b:02x}"))
-                            .collect::<String>()
-                    })
-                    .unwrap_or_default();
-                shot["digest"] = json!(digest);
+                let mut shot = backend.capture(&observation.raw, &node, context.remaining()?)?;
+                shot["digest"] = json!(digest_of(&shot));
                 shot["provider"] = json!(observation.provider);
                 Ok(shot)
             }
+            Operation::ReadText { target, language } => {
+                if language.as_ref().is_some_and(|tag| {
+                    tag.is_empty()
+                        || tag.len() > 35
+                        || !tag.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+                }) {
+                    return Err(error(
+                        "CONTROL.INVALID_REQUEST",
+                        "language must be a BCP-47 tag such as en-US",
+                    ));
+                }
+                let (observation, node) = self.observed_node(target)?;
+                let backend = &self.backends[&observation.provider];
+                let read = backend.read_text(
+                    &observation.raw,
+                    &node,
+                    language.as_deref(),
+                    context.remaining()?,
+                )?;
+                context.remaining()?;
+                Ok(text_answer(&read, &observation.provider))
+            }
+            Operation::Launch {
+                program,
+                args,
+                wait_ms,
+            } => self.launch(program, args, *wait_ms, context),
+            Operation::GlobalKey { keys } => {
+                if !self.policy.allow_input || !self.policy.allow_global_keys {
+                    return Err(error(
+                        "POLICY.DENIED",
+                        "global keys were not granted by the server operator",
+                    ));
+                }
+                validate_action(&Action::Key { keys: keys.clone() })?;
+                let backend = self
+                    .backends
+                    .values()
+                    .find(|b| {
+                        b.name() != browser::PROVIDER
+                            && self.allowed_provider(b.name())
+                            && b.offers_global_keys()
+                    })
+                    .cloned()
+                    .ok_or_else(|| {
+                        error(
+                            "CONTROL.ACTION_UNSUPPORTED",
+                            "no provider in this session can press global keys",
+                        )
+                    })?;
+                let _lease = self.input_lease("desktop-input")?;
+                context.remaining()?;
+                let sent = backend.global_key(keys, context)?;
+                // Whatever was observed may have changed under the keys.
+                self.state.lock().unwrap().observations.clear();
+                Ok(json!({"submitted": true, "provider": backend.name(), "operation": "global_key", "backend_result": sent, "verified": false, "requires_fresh_observation": true}))
+            }
+            Operation::ClipboardRead { max_characters } => {
+                if !self.policy.allow_clipboard_read {
+                    return Err(error(
+                        "POLICY.DENIED",
+                        "reading the clipboard was not granted by the server operator",
+                    ));
+                }
+                if max_characters.is_some_and(|max| max == 0 || max > 65_536) {
+                    return Err(error(
+                        "CONTROL.INVALID_REQUEST",
+                        "max_characters must be in 1..65536",
+                    ));
+                }
+                let mut last = error(
+                    "CONTROL.ACTION_UNSUPPORTED",
+                    "no provider in this session can read the clipboard",
+                );
+                for backend in self
+                    .backends
+                    .values()
+                    .filter(|b| b.name() != browser::PROVIDER && self.allowed_provider(b.name()))
+                {
+                    match backend.clipboard_read(*max_characters, context.remaining()?) {
+                        Ok(mut read) => {
+                            read["provider"] = json!(backend.name());
+                            return Ok(read);
+                        }
+                        Err(e) if e.code == "CONTROL.ACTION_UNSUPPORTED" => last = e,
+                        Err(e) => return Err(e),
+                    }
+                }
+                Err(last)
+            }
             Operation::Cancel { .. } | Operation::Close {} => unreachable!(),
         }
+    }
+
+    /// Add the operator's extra grants to a capabilities answer. Each appears
+    /// only when granted, so a client never learns of a refused ability by
+    /// seeing it listed.
+    fn with_grants(&self, mut answer: Value) -> Value {
+        if self.policy.allow_input && !self.policy.launch.is_empty() {
+            answer["launch"] = json!(self.policy.launch);
+        }
+        if self.policy.allow_clipboard_read {
+            answer["clipboard_read"] = json!(true);
+        }
+        if self.policy.allow_input && self.policy.allow_global_keys {
+            answer["global_keys"] = json!(true);
+        }
+        answer
+    }
+
+    /// Start an allowlisted program and answer the windows it opens.
+    fn launch(
+        &self,
+        program: &str,
+        args: &[String],
+        wait_ms: Option<u64>,
+        context: &Context,
+    ) -> Result<Value> {
+        if !self.policy.allow_input || self.policy.launch.is_empty() {
+            return Err(error(
+                "POLICY.DENIED",
+                "launching programs was not granted by the server operator",
+            ));
+        }
+        launch::validate_args(program, args)?;
+        if !launch::allowed(&self.policy.launch, program) {
+            return Err(error(
+                "POLICY.DENIED",
+                "that program is not on the server's launch allowlist",
+            )
+            .with_detail("allowlist", json!(self.policy.launch)));
+        }
+        let path = launch::resolve(program)?;
+        let image = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let desktops: Vec<Arc<dyn Backend>> = self
+            .backends
+            .values()
+            .filter(|b| b.name() != browser::PROVIDER && self.allowed_provider(b.name()))
+            .cloned()
+            .collect();
+        let listed = |timeout: Duration| -> Vec<BackendResource> {
+            desktops
+                .iter()
+                .filter_map(|backend| backend.resources(timeout).ok())
+                .flatten()
+                .collect()
+        };
+        let before: BTreeSet<String> = listed(context.remaining()?)
+            .into_iter()
+            .map(|item| item.resource.resource_id)
+            .collect();
+        let _lease = self.input_lease("desktop-input")?;
+        let remaining = context.commit()?;
+        let process_id = launch::spawn(&path, args)?;
+        // Stop waiting early enough to answer inside the request's deadline:
+        // the process has started, so running out of time would turn a
+        // committed launch into an unknown one.
+        let wait = Duration::from_millis(wait_ms.unwrap_or(10_000).min(MAX_TIMEOUT_MS))
+            .min(remaining.saturating_sub(Duration::from_millis(500)));
+        let until = Instant::now() + wait;
+        let mut found: Vec<BackendResource>;
+        loop {
+            let now = listed(
+                until
+                    .saturating_duration_since(Instant::now())
+                    .max(Duration::from_millis(200)),
+            );
+            let by_process: Vec<BackendResource> = now
+                .iter()
+                .filter(|item| item.resource.metadata["process_id"] == json!(process_id))
+                .cloned()
+                .collect();
+            // A launcher stub may hand over to another process of the same
+            // program (and exit): new windows of that image count too.
+            found = if by_process.is_empty() {
+                now.into_iter()
+                    .filter(|item| {
+                        !before.contains(&item.resource.resource_id)
+                            && item.resource.metadata["process_name"]
+                                .as_str()
+                                .is_some_and(|name| name.eq_ignore_ascii_case(&image))
+                    })
+                    .collect()
+            } else {
+                by_process
+            };
+            if !found.is_empty() || Instant::now() >= until {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let mut state = self.state.lock().unwrap();
+        let resources: Vec<Resource> = found
+            .into_iter()
+            .filter(|item| self.allowed_resource(&item.resource.resource_id))
+            .map(|item| {
+                let public = item.resource.clone();
+                state.resources.insert(public.resource_id.clone(), item);
+                public
+            })
+            .collect();
+        drop(state);
+        Ok(json!({
+            "process_id": process_id,
+            "program": path.display().to_string(),
+            "window_appeared": !resources.is_empty(),
+            "resources": resources,
+        }))
+    }
+
+    /// The retained observation and raw node a read-only target names.
+    fn observed_node(&self, target: &Target) -> Result<(Observation, Value)> {
+        if target.session_id != self.id {
+            return Err(error(
+                "CONTROL.SESSION_MISMATCH",
+                "target belongs to another session",
+            ));
+        }
+        let observation = self.observation(&target.observation_id)?;
+        if target.resource_id != observation.resource_id
+            || !self.allowed_resource(&target.resource_id)
+        {
+            return Err(error(
+                "POLICY.DENIED",
+                "target is outside the resource grant",
+            ));
+        }
+        let node = observation.raw["nodes"]
+            .as_array()
+            .and_then(|nodes| {
+                nodes
+                    .iter()
+                    .find(|n| n["node_id"] == target.node_id.as_str())
+            })
+            .cloned()
+            .ok_or_else(|| error("CONTROL.STALE_TARGET", "node was not observed"))?;
+        Ok((observation, node))
     }
 
     /// Capture a listed resource and retain it as this provider's only
@@ -1213,10 +1472,79 @@ impl Session {
     }
 }
 
+/// The sha256 of a screenshot's base64 PNG. Compared across captures to tell
+/// whether what is shown changed, e.g. a login code that refreshes, without
+/// reading the image; a read_text of the same pixels carries the same digest.
+fn digest_of(shot: &Value) -> String {
+    use sha2::Digest;
+    shot["data"]
+        .as_str()
+        .map(|data| {
+            sha2::Sha256::digest(data.as_bytes())
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// A provider's OCR answer as callers see it: positions as fractions of the
+/// element's box (never screen or image coordinates), the image's digest
+/// instead of the image.
+fn text_answer(read: &Value, provider: &str) -> Value {
+    let width = read["width"].as_f64().filter(|w| *w > 0.0).unwrap_or(1.0);
+    let height = read["height"].as_f64().filter(|h| *h > 0.0).unwrap_or(1.0);
+    let round = |value: f64| (value.clamp(0.0, 1.0) * 10_000.0).round() / 10_000.0;
+    let shape = |span: &Value| {
+        let number = |key: &str| span["bounds"][key].as_f64().unwrap_or_default();
+        json!({
+            "text": span["text"],
+            "box": {
+                "fx": round(number("x") / width),
+                "fy": round(number("y") / height),
+                "fw": round(number("width") / width),
+                "fh": round(number("height") / height),
+            },
+        })
+    };
+    let lines: Vec<Value> = read["lines"]
+        .as_array()
+        .map(|lines| {
+            lines
+                .iter()
+                .map(|line| {
+                    let mut shaped = shape(line);
+                    shaped["words"] = json!(line["words"]
+                        .as_array()
+                        .map(|words| words.iter().map(shape).collect::<Vec<_>>())
+                        .unwrap_or_default());
+                    shaped
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let text = lines
+        .iter()
+        .filter_map(|line| line["text"].as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    json!({
+        "provider": provider,
+        "engine": read["engine"],
+        "language": read["language"],
+        "text": text,
+        "lines": lines,
+        "digest": digest_of(read),
+        "clipped": read["clipped"] == true,
+        "read_only": true,
+    })
+}
+
 fn validate_action(action: &Action) -> Result<()> {
     let text = match action {
         Action::Fill { value } => Some(value),
         Action::TypeText { text, .. } => Some(text),
+        Action::Paste { text } => Some(text),
         Action::Select { option } => Some(option),
         Action::Accept { text } => text.as_ref(),
         _ => None,
@@ -1240,6 +1568,9 @@ fn validate_action(action: &Action) -> Result<()> {
             "CONTROL.INVALID_REQUEST",
             "input text must be bounded and contain no NUL",
         ));
+    }
+    if matches!(action, Action::Paste { text } if text.is_empty()) {
+        return Err(error("CONTROL.INVALID_REQUEST", "paste needs some text"));
     }
     if let Action::Upload { files } = action {
         if files.is_empty()

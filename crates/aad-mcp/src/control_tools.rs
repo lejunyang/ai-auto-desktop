@@ -138,6 +138,27 @@ fn action_schema() -> Value {
         variant("back", "Go back one page in the observed browser page's history.", json!({}), &[]),
         variant("forward", "Go forward one page in the observed browser page's history.", json!({}), &[]),
         variant("reload", "Reload the observed browser page.", json!({}), &[]),
+        variant("paste", "Paste text into a focusable text element through the clipboard: \
+    the clipboard briefly offers the text -- to the target application only: clipboard \
+    history, managers and sync tools that ask are refused -- the element is focused and told \
+    to paste (a classic Win32 edit by WM_PASTE, anything else by Ctrl+V), and the clipboard is \
+    put back as it was. Use it where an application handles \
+    pasted text better than typed keys (rich editors, fields that filter keystrokes); prefer \
+    fill where offered. Never offered on password fields.", json!({
+            "text": {"type": "string", "minLength": 1, "maxLength": 4096}
+        }), &["text"]),
+        variant("minimize", "Minimize the observed desktop window. Offered on the \
+    window's own node (its root) when the window can be minimized and is not already.", json!({}), &[]),
+        variant("maximize", "Maximize the observed desktop window. Offered on its root \
+    node when the window can be maximized and is not already.", json!({}), &[]),
+        variant("restore", "Return the observed desktop window to its normal size from \
+    minimized or maximized. Offered on its root node when it is one of those.", json!({}), &[]),
+        variant("close_window", "Ask the observed desktop window to close, as its close \
+    button would. The application may refuse or ask to save first; the answer says whether \
+    the window closed. Offered on its root node.", json!({}), &[]),
+        variant("activate", "Bring the observed desktop window to the foreground, restoring \
+    it first if minimized. Refused with DRIVER.ACTIVATION_REFUSED when Windows will not let \
+    this process take the foreground. Offered on its root node.", json!({}), &[]),
         variant("open_tab", "Open an http or https address in a new tab of the observed \
     page's browser. Offered on the page's document node. The answer names the new page_id; \
     call control_targets to observe it.", json!({
@@ -189,7 +210,7 @@ pub(crate) fn saved_action_schema() -> Value {
         // The text may come from the step's `input` instead.
         if matches!(
             variant["properties"]["type"]["const"].as_str(),
-            Some("fill" | "type_text")
+            Some("fill" | "type_text" | "paste")
         ) {
             variant["required"] = json!(["type"]);
         }
@@ -372,9 +393,83 @@ unknown-effect write automatically.",
         ),
         (
             "control_capture",
-            "Take a PNG screenshot of one observed element, e.g. a login QR code to show a person, or the page body for the whole page. Read-only. The answer carries the image and a `digest` of it: capture again later and compare digests to tell whether what is shown has changed (a QR code that refreshed) without looking at the image. Browser pages only for now; password fields are refused.",
+            "Take a PNG screenshot of one observed element, e.g. a login QR code to show a person, the page body for the whole page, or a Windows window's root node for the whole window. Read-only. The answer carries the image and a `digest` of it: capture again later and compare digests to tell whether what is shown has changed (a QR code that refreshed) without looking at the image. Browser pages and Windows desktop windows (providers listing `capture` under `reads` in control_capabilities); password fields are refused, and a minimized window must be restored first.",
             json!({"target": target_schema()}),
             vec!["target"],
+            false,
+        ),
+        (
+            "control_read_text",
+            "Read the text an observed element shows by running OCR on its pixels -- for \
+canvases, custom-drawn controls and windows whose accessibility tree is empty or unnamed, \
+where control_observe finds nothing to read. Read-only. Answers `text`, and `lines` each \
+with `words`, every one with a `box` of fx/fy/fw/fh: fractions of the element's box, not \
+screen positions. The lines are not targets: to act on a word, click the element it was \
+read from with `fraction` at the word's centre (fx + fw/2, fy + fh/2), which is anchored \
+and revalidated on that element -- read again first if the content may have moved. \
+`digest` equals control_capture's for the same pixels. Windows desktop windows only \
+(providers listing `read_text` under `reads`); OCR can misread characters such as I and l.",
+            json!({
+                "target": target_schema(),
+                "language": {
+                    "type": "string", "minLength": 1, "maxLength": 35,
+                    "pattern": "^[A-Za-z0-9-]+$",
+                    "description": "BCP-47 tag of the OCR language, e.g. en-US or zh-Hans-CN. \
+Defaults to the user's languages; a language without an installed OCR pack is refused with \
+the installed ones listed."
+                }
+            }),
+            vec!["target"],
+            false,
+        ),
+        (
+            "desktop_launch",
+            "Start a program the server operator allowlisted (aad mcp --allow-input \
+--allow-launch PROGRAM), with arguments, then wait for its windows and answer them as \
+`resources`, ready for control_observe. `program` must name an allowlist entry exactly; \
+control_capabilities lists them under `launch` when granted. The program is started \
+directly -- never through a shell, `start`, or a file/URL association -- and shells or \
+script hosts are refused even if allowlisted. A program that hands over to another \
+process (a launcher stub) is matched by its image name among new windows.",
+            json!({
+                "program": {"type": "string", "minLength": 1, "maxLength": 260,
+                    "description": "An allowlisted program, exactly as listed."},
+                "args": {"type": "array", "maxItems": 32,
+                    "items": {"type": "string", "maxLength": 1024},
+                    "description": "Arguments passed as an argv, not interpreted by any shell."},
+                "wait_ms": {"type": "integer", "minimum": 0, "maximum": 30000, "default": 10000,
+                    "description": "How long to wait for a window; bounded by timeout_ms."}
+            }),
+            vec!["program"],
+            true,
+        ),
+        (
+            "control_global_key",
+            "Press a key combination wherever keyboard focus is -- system shortcuts such as \
+Win+D (show desktop) or Alt+Tab -- anchored on no observed element. Offered only when the \
+server operator granted it (aad mcp --allow-input --allow-global-keys). Prefer control_act's \
+`key` on an observed element: that one is anchored and focus is checked. This one is not: \
+the keys go to whatever holds focus, so the answer's commit_state is `unknown` even when \
+delivered; observe again to learn what happened and never repeat it blindly. Modifiers \
+(ctrl, shift, alt, win) then exactly one main key. Ctrl+Alt+Del and Win+L are refused, and \
+nothing is sent while a UAC prompt or the lock screen owns the input desktop.",
+            json!({
+                "keys": {"type": "array", "items": {"type": "string", "maxLength": 32}, "minItems": 1, "maxItems": 6}
+            }),
+            vec!["keys"],
+            true,
+        ),
+        (
+            "clipboard_read",
+            "Read the desktop clipboard's text. Read-only, but offered only when the server \
+operator granted it (aad mcp --allow-clipboard-read): the clipboard often holds passwords \
+and private text. Content that its source marked as not for clipboard readers (password \
+managers do) is refused. Text only; at most max_characters are returned, with the full \
+length in `characters`.",
+            json!({
+                "max_characters": {"type": "integer", "minimum": 1, "maximum": 65536, "default": 16384}
+            }),
+            vec![],
             false,
         ),
         (
@@ -416,6 +511,26 @@ cancellation of all in-flight work.",
         .collect()
 }
 
+/// The protocol method a session tool calls, or `None` for other tools.
+pub fn method(name: &str) -> Option<&str> {
+    match name {
+        "desktop_launch" => Some("launch"),
+        "clipboard_read" => Some("clipboard_read"),
+        other => other.strip_prefix("control_"),
+    }
+}
+
+/// Session tools that need a grant beyond input. A local server lists one
+/// only when its operator granted it; a remote session refuses on its side.
+pub fn granted(name: &str, policy: &aad_control::Policy) -> bool {
+    match name {
+        "desktop_launch" => policy.allow_input && !policy.launch.is_empty(),
+        "clipboard_read" => policy.allow_clipboard_read,
+        "control_global_key" => policy.allow_input && policy.allow_global_keys,
+        _ => true,
+    }
+}
+
 pub fn prepare(name: &str, arguments: &Value, endpoint: &dyn Endpoint) -> Result<Request, String> {
     let mut args = arguments
         .as_object()
@@ -434,9 +549,7 @@ pub fn prepare(name: &str, arguments: &Value, endpoint: &dyn Endpoint) -> Result
     if let Some(timeout) = args.remove("timeout_ms") {
         request.timeout_ms = timeout.as_u64().ok_or("timeout_ms must be an integer")?;
     }
-    let method = name
-        .strip_prefix("control_")
-        .ok_or("unknown control tool")?;
+    let method = method(name).ok_or("unknown control tool")?;
     if method == "cancel" {
         let id = args
             .remove("target_request_id")
@@ -495,8 +608,60 @@ it). Drop it, narrow with the fields it does take, or take the node_id from an o
             "Regions are computed for Windows windows and browser pages, and the text view for \
 browser pages. Observe with view mode outline."
         }
-        "CONTROL.OCCLUDED" => {
-            "Something is laid over the element, such as a dialog, a banner or a menu, so pointer input would land on that instead. Observe again and deal with what covers it, or use a plain click (DOM activation) if that is enough."
+        "CONTROL.OCCLUDED" | "DRIVER.OCCLUDED" => {
+            "Something is laid over the element, such as a dialog, a banner or a menu, so pointer input would land on that instead; nothing was sent. Observe again and deal with what covers it, or use invoke (desktop) or a plain click (browser DOM activation), which do not depend on what is on top."
+        }
+        "DRIVER.PROTECTED_ELEMENT" => {
+            "Password and other protected fields are never captured or read. Capture an \
+element around it, or ask the person you are helping."
+        }
+        "DRIVER.SECURE_DESKTOP" => {
+            "A UAC prompt or the lock screen owns input; automation never reaches it. Ask \
+the person you are helping to deal with it, then observe again."
+        }
+        "DRIVER.KEY_RESERVED" => {
+            "Ctrl+Alt+Del and Win+L are never pressed: the first cannot be synthesized and \
+the second would lock everyone out. Ask the person you are helping."
+        }
+        "DRIVER.CLIPBOARD_PROTECTED" => {
+            "What is on the clipboard was marked by its source (e.g. a password manager) as \
+not for clipboard readers. It is not read; ask the person you are helping if you need it."
+        }
+        "DRIVER.CLIPBOARD_BUSY" => {
+            "Another application held the clipboard open. Nothing was pasted or read; try \
+again shortly."
+        }
+        "DRIVER.CLIPBOARD_TOO_LARGE" => {
+            "The clipboard holds more than a paste can preserve, so nothing was pasted rather \
+than lose it. Use fill or type_text instead."
+        }
+        "DRIVER.PASTE_NOT_CONSUMED" => {
+            "Ctrl+V reached the element but it never asked for the text, so it does not \
+paste plain text (or used the shortcut for something else). Observe to see what happened, \
+then use fill or type_text. The clipboard was put back."
+        }
+        "DRIVER.FOCUS_LOST" => {
+            "The element's window could not be brought to the keyboard, so no key was sent \
+(it would have gone to another application). Use activate on the window's node, observe \
+again and retry, or prefer fill, which needs no focus."
+        }
+        "DRIVER.ACTIVATION_REFUSED" => {
+            "Windows' foreground lock kept this window from coming forward. Actions that do \
+not need the foreground (invoke, fill) still work; otherwise ask the person to click the \
+window once, then observe again."
+        }
+        "DRIVER.OCR_UNAVAILABLE" => {
+            "No Windows OCR language pack for that language is installed; \
+details.available_languages lists the ones that are. Pass one of those, or omit language. \
+Packs are added in Settings > Time & language by whoever administers the machine."
+        }
+        "DRIVER.OCR_FAILED" => {
+            "Windows OCR could not read the image. Capture the element to see what it shows; \
+a very small or very large element reads poorly -- try its container or a smaller part."
+        }
+        "DRIVER.WINDOW_MINIMIZED" => {
+            "The window is minimized, so it shows nothing. Restore it (the window node's \
+`restore` action, where offered), observe again and retry."
         }
         "BROWSER.CONTEXT_LOST" => {
             "The page was between documents (navigating or replacing a frame) while it was \
@@ -531,9 +696,13 @@ window shows now, or wait again with a longer timeout_ms (up to 30000)."
         }
         "POLICY.DENIED" => {
             "Whoever started this server did not grant this: input needs aad mcp \
---allow-input, a file upload needs the file under a directory given with --allow-upload-dir \
-(control_capabilities lists them as upload_dirs). Do not look for another way to act; ask \
-the person you are helping."
+--allow-input; desktop_launch also an --allow-launch entry for the program; a file upload \
+needs the file under a directory given with --allow-upload-dir (control_capabilities lists \
+them as upload_dirs). Do not look for another way to act; ask the person you are helping."
+        }
+        "CONTROL.LAUNCH_FAILED" => {
+            "The allowlisted program could not be found or started; details name it. Ask \
+the person running the server to check the --allow-launch entry."
         }
         "CONTROL.FILE_NOT_FOUND" => {
             "No regular file exists at that path. Upload takes absolute paths of existing \
@@ -717,6 +886,35 @@ mod tests {
             json!(["desktop", "tablet", "mobile", "reset"])
         );
         assert_eq!(variant("clear_site_data")["required"], json!(["type"]));
+    }
+
+    #[test]
+    fn reading_text_is_a_read_only_request_on_an_observed_target() {
+        let tool = tool("control_read_text");
+        assert!(!tool.mutating);
+        assert!(tool.description.contains("fraction"));
+        let session = aad_control::Session::new(Vec::new(), Default::default());
+        let target = json!({"session_id":"s","resource_id":"r","observation_id":"o","node_id":"n"});
+        let request = prepare(
+            "control_read_text",
+            &json!({"target": target, "language": "en-US"}),
+            &session,
+        )
+        .unwrap();
+        assert!(!request.mutating());
+        match request.operation {
+            Operation::ReadText { target, language } => {
+                assert_eq!(target.node_id, "n");
+                assert_eq!(language.as_deref(), Some("en-US"));
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(prepare(
+            "control_read_text",
+            &json!({"target": target, "region": "x"}),
+            &session
+        )
+        .is_err());
     }
 
     #[test]

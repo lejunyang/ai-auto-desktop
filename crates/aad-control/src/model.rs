@@ -210,6 +210,20 @@ pub enum Action {
     Back {},
     Forward {},
     Reload {},
+    /// Window actions, offered on an observed top-level window's own node.
+    Minimize {},
+    Maximize {},
+    /// Back to the normal size from minimized or maximized.
+    Restore {},
+    /// Ask the window to close, as its close button would; it may prompt.
+    CloseWindow {},
+    /// Bring the window to the foreground, restoring it if minimized.
+    Activate {},
+    /// Paste text through the clipboard into a focusable element, then put
+    /// the clipboard back as it was.
+    Paste {
+        text: String,
+    },
     /// Open an http(s) address in a new tab of the observed page's browser.
     OpenTab {
         url: String,
@@ -263,7 +277,7 @@ pub enum ColorScheme {
 
 pub const MAX_UPLOAD_FILES: usize = 32;
 
-pub const ACTION_NAMES: [&str; 23] = [
+pub const ACTION_NAMES: [&str; 29] = [
     "focus",
     "invoke",
     "click",
@@ -279,6 +293,12 @@ pub const ACTION_NAMES: [&str; 23] = [
     "back",
     "forward",
     "reload",
+    "minimize",
+    "maximize",
+    "restore",
+    "close_window",
+    "activate",
+    "paste",
     "open_tab",
     "activate_page",
     "close_page",
@@ -304,6 +324,15 @@ pub const PAGE_ACTIONS: [&str; 9] = [
 
 /// Page actions that address the browser's tabs rather than one document.
 pub const TAB_ACTIONS: [&str; 3] = ["open_tab", "activate_page", "close_page"];
+
+/// Actions on a desktop window as a whole, offered on its own node.
+pub const WINDOW_ACTIONS: [&str; 5] = [
+    "minimize",
+    "maximize",
+    "restore",
+    "close_window",
+    "activate",
+];
 
 impl Action {
     /// A plain left click.
@@ -331,6 +360,12 @@ impl Action {
             Self::Back {} => "back",
             Self::Forward {} => "forward",
             Self::Reload {} => "reload",
+            Self::Minimize {} => "minimize",
+            Self::Maximize {} => "maximize",
+            Self::Restore {} => "restore",
+            Self::CloseWindow {} => "close_window",
+            Self::Activate {} => "activate",
+            Self::Paste { .. } => "paste",
             Self::OpenTab { .. } => "open_tab",
             Self::ActivatePage {} => "activate_page",
             Self::ClosePage {} => "close_page",
@@ -379,6 +414,36 @@ pub enum Operation {
     /// A PNG of one observed element, read-only.
     Capture {
         target: Target,
+    },
+    /// The text one observed element shows, read by OCR from its pixels.
+    /// Read-only; recognised lines are not targets.
+    ReadText {
+        target: Target,
+        /// A BCP-47 tag naming the OCR language; the user's languages otherwise.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        language: Option<String>,
+    },
+    /// Start a program the server operator allowlisted, then wait (bounded)
+    /// for its windows and answer them as targets. Never through a shell.
+    Launch {
+        program: String,
+        #[serde(default)]
+        args: Vec<String>,
+        /// How long to wait for a window, at most the request's timeout.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        wait_ms: Option<u64>,
+    },
+    /// Press a key combination wherever keyboard focus is -- Win+D, Alt+Tab --
+    /// anchored on no observed element. The one un-anchored input, refused
+    /// unless the operator granted it separately; its effect is never verified.
+    GlobalKey {
+        keys: Vec<String>,
+    },
+    /// The clipboard's text, bounded. Read-only, but refused unless the server
+    /// operator granted it separately: the clipboard often holds secrets.
+    ClipboardRead {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_characters: Option<usize>,
     },
     /// Observe a resource repeatedly until a locator's element appears,
     /// disappears or reaches the given states, within the request deadline.
@@ -446,7 +511,10 @@ impl Request {
         }
     }
     pub fn mutating(&self) -> bool {
-        matches!(self.operation, Operation::Act { .. })
+        matches!(
+            self.operation,
+            Operation::Act { .. } | Operation::Launch { .. } | Operation::GlobalKey { .. }
+        )
     }
 }
 

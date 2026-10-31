@@ -170,6 +170,54 @@ pub struct PointerGesture {
     pub hover_ms: Option<u64>,
 }
 
+/// The pixels of one captured element, top-down RGBA rows.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Pixels {
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Vec<u8>,
+    /// The element was larger than the capture ceiling and was cut.
+    pub clipped: bool,
+}
+
+impl Pixels {
+    /// The colour at a pixel, for tests and checks.
+    pub fn at(&self, x: u32, y: u32) -> Option<[u8; 4]> {
+        if x >= self.width || y >= self.height {
+            return None;
+        }
+        let index = ((y * self.width + x) * 4) as usize;
+        self.rgba
+            .get(index..index + 4)
+            .map(|p| [p[0], p[1], p[2], p[3]])
+    }
+}
+
+/// A box inside a captured image, in its pixels.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ImageBox {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+}
+
+/// One recognised word or line.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TextSpan {
+    pub text: String,
+    pub bounds: ImageBox,
+}
+
+/// What OCR read from an image.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Recognition {
+    pub engine: String,
+    pub language: String,
+    /// Each line with its words.
+    pub lines: Vec<(TextSpan, Vec<TextSpan>)>,
+}
+
 /// The operations a platform backend must provide.
 pub trait Backend: Send + Sync {
     /// Enumerate top-level windows that a user could interact with.
@@ -254,6 +302,76 @@ pub trait Backend: Send + Sync {
         Err(DriverError::new(
             "DRIVER.ACTION_UNSUPPORTED",
             "drag is not implemented on this platform yet",
+        ))
+    }
+
+    /// The pixels the live element shows, cut to its bounds; the whole window
+    /// (without its invisible resize border) when `whole_window` is set.
+    ///
+    /// Read-only. The element must still match the snapshot; the backend reads
+    /// its bounds live rather than trusting the captured ones.
+    fn capture_pixels(
+        &self,
+        _window_id: &str,
+        _node: &Node,
+        _whole_window: bool,
+    ) -> Result<Pixels> {
+        Err(DriverError::new(
+            "DRIVER.ACTION_UNSUPPORTED",
+            "screenshots are not implemented on this platform yet",
+        ))
+    }
+
+    /// Minimize, maximize, restore, close or activate the observed window,
+    /// `node` being its own (root) node. Answers the window's state after.
+    fn window_action(
+        &self,
+        _window_id: &str,
+        _node: &Node,
+        _action: &str,
+    ) -> Result<serde_json::Value> {
+        Err(DriverError::new(
+            "DRIVER.ACTION_UNSUPPORTED",
+            "window actions are not implemented on this platform yet",
+        ))
+    }
+
+    /// The clipboard's text, at most `max_chars` characters of it, with the
+    /// full length. `None` when the clipboard holds no text. Content that its
+    /// source marked as excluded from clipboard monitors (password managers do)
+    /// is refused rather than read.
+    fn clipboard_text(&self, _max_chars: usize) -> Result<(Option<String>, usize)> {
+        Err(DriverError::new(
+            "DRIVER.ACTION_UNSUPPORTED",
+            "reading the clipboard is not implemented on this platform yet",
+        ))
+    }
+
+    /// Press a key chord wherever keyboard focus is, anchored on no element.
+    /// The one un-anchored input; hosts gate it behind a grant of its own.
+    /// Answers what little can be said: where focus was when it was sent.
+    fn global_key(&self, _keys: &[String]) -> Result<serde_json::Value> {
+        Err(DriverError::new(
+            "DRIVER.ACTION_UNSUPPORTED",
+            "global keys are not implemented on this platform yet",
+        ))
+    }
+
+    /// Paste `text` into the element through the clipboard (focus, Ctrl+V),
+    /// leaving the clipboard as it was. Answers whether the element took it.
+    fn paste(&self, _window_id: &str, _node: &Node, _text: &str) -> Result<serde_json::Value> {
+        Err(DriverError::new(
+            "DRIVER.ACTION_UNSUPPORTED",
+            "pasting is not implemented on this platform yet",
+        ))
+    }
+
+    /// Recognise the text an image shows, with the platform's own OCR.
+    /// `language` is a BCP-47 tag; `None` takes the user's languages.
+    fn recognize_text(&self, _pixels: &Pixels, _language: Option<&str>) -> Result<Recognition> {
+        Err(DriverError::new(
+            "DRIVER.ACTION_UNSUPPORTED",
+            "text recognition is not implemented on this platform yet",
         ))
     }
 

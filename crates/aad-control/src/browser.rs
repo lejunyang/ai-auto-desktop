@@ -1445,6 +1445,9 @@ impl Backend for BrowserBackend {
     ) -> Result<Value> {
         self.read_network(selector, limit, bodies, timeout)
     }
+    fn reads(&self) -> Vec<String> {
+        vec!["capture".into()]
+    }
     fn lease_key(&self, _snapshot: &Value) -> Option<String> {
         // UIA/AX/AT-SPI can also operate a browser. Share one cooperating
         // input owner rather than pretending these are disjoint devices.
@@ -2945,7 +2948,10 @@ mod tests {
         let lost = cdp_error(aad_cdp::CdpError::protocol(
             r#"{"code":-32000,"message":"Cannot find context with specified id"}"#,
         ));
-        assert_eq!((lost.code.as_str(), lost.retryable), ("BROWSER.CONTEXT_LOST", true));
+        assert_eq!(
+            (lost.code.as_str(), lost.retryable),
+            ("BROWSER.CONTEXT_LOST", true)
+        );
     }
     #[test]
     fn keys_are_allowlisted_without_arbitrary_cdp_parameters() {

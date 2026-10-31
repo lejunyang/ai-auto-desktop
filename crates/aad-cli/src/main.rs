@@ -54,7 +54,7 @@ enum Command {
     Snapshot(desk::ResourceArgs),
     /// Find the single element matching a locator.
     Find(desk::FindArgs),
-    /// Write a PNG screenshot of one element (browser pages).
+    /// Write a PNG screenshot of one element (browser pages and Windows windows).
     ///
     /// Compare `digest` between captures to tell whether what it shows changed.
     Capture(desk::CaptureArgs),

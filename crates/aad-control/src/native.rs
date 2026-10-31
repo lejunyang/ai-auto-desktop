@@ -47,6 +47,12 @@ impl NativeBackend {
             "key" => "key_chord",
             "scroll" | "hover" => "pointer_gesture",
             "drag" => "drag",
+            "minimize" => "minimize",
+            "maximize" => "maximize",
+            "restore" => "restore",
+            "close_window" => "close_window",
+            "activate" => "activate",
+            "paste" => "paste",
             _ => "",
         }
     }
@@ -70,7 +76,88 @@ fn fraction(value: &Option<crate::Fraction>) -> Value {
     value.map_or(Value::Null, |f| json!({"fx": f.fx, "fy": f.fy}))
 }
 
+impl NativeBackend {
+    /// Whether the driver publishes this native operation.
+    fn offers(&self, native: &str) -> bool {
+        self.provider.manifest().actions.contains_key(native)
+    }
+    fn target_of(snapshot: &Value, node_id: &Value) -> Value {
+        json!({"snapshot_id": snapshot["snapshot_id"], "revision": snapshot["revision"], "node_id": node_id})
+    }
+}
+
 impl Backend for NativeBackend {
+    fn reads(&self) -> Vec<String> {
+        // Only the Windows driver captures directly; AT-SPI's capture goes
+        // through the host artifact store and is not wired here yet.
+        ["capture", "read_text"]
+            .into_iter()
+            .filter(|read| matches!(self.flavor, Flavor::Windows) && self.offers(read))
+            .map(str::to_string)
+            .collect()
+    }
+    fn capture(&self, snapshot: &Value, node: &Value, timeout: Duration) -> Result<Value> {
+        if !self.reads().iter().any(|read| read == "capture") {
+            return Err(error(
+                "CONTROL.ACTION_UNSUPPORTED",
+                "this provider cannot take screenshots",
+            ));
+        }
+        let shot = self.invoke(
+            "capture",
+            json!({"target": Self::target_of(snapshot, &node["node_id"])}),
+            timeout,
+        )?;
+        let mut answer = Map::new();
+        for key in ["format", "data", "width", "height", "clipped"] {
+            answer.insert(key.into(), shot[key].clone());
+        }
+        Ok(Value::Object(answer))
+    }
+    fn offers_global_keys(&self) -> bool {
+        matches!(self.flavor, Flavor::Windows) && self.offers("global_key")
+    }
+    fn global_key(&self, keys: &[String], context: &crate::Context) -> Result<Value> {
+        if !self.offers_global_keys() {
+            return Err(error(
+                "CONTROL.ACTION_UNSUPPORTED",
+                "this provider cannot press global keys",
+            ));
+        }
+        self.invoke("global_key", json!({"keys": keys}), context.commit()?)
+    }
+    fn clipboard_read(&self, max_characters: Option<usize>, timeout: Duration) -> Result<Value> {
+        if !matches!(self.flavor, Flavor::Windows) || !self.offers("clipboard_read") {
+            return Err(error(
+                "CONTROL.ACTION_UNSUPPORTED",
+                "this provider cannot read the clipboard",
+            ));
+        }
+        let mut args = json!({});
+        if let Some(max) = max_characters {
+            args["max_characters"] = json!(max);
+        }
+        self.invoke("clipboard_read", args, timeout)
+    }
+    fn read_text(
+        &self,
+        snapshot: &Value,
+        node: &Value,
+        language: Option<&str>,
+        timeout: Duration,
+    ) -> Result<Value> {
+        if !self.reads().iter().any(|read| read == "read_text") {
+            return Err(error(
+                "CONTROL.ACTION_UNSUPPORTED",
+                "this provider cannot read text from pixels",
+            ));
+        }
+        let mut args = json!({"target": Self::target_of(snapshot, &node["node_id"])});
+        if let Some(language) = language {
+            args["language"] = json!(language);
+        }
+        self.invoke("read_text", args, timeout)
+    }
     fn node_capabilities(&self, node: &Value) -> Vec<String> {
         ACTION_NAMES
             .iter()
@@ -242,7 +329,7 @@ impl Backend for NativeBackend {
                 "observed node does not support this native operation",
             ));
         }
-        let target_of = |node_id: &Value| json!({"snapshot_id": snapshot["snapshot_id"], "revision": snapshot["revision"], "node_id": node_id});
+        let target_of = |node_id: &Value| Self::target_of(snapshot, node_id);
         let mut args = json!({"target": target_of(&node["node_id"])});
         // AT-SPI and AX re-resolve every target from a descriptive locator
         // before acting, so each end of an action carries one.
@@ -300,6 +387,7 @@ impl Backend for NativeBackend {
                 }
             }
             Action::Key { keys } => set("keys", json!(keys)),
+            Action::Paste { text } => set("text", json!(text)),
             Action::Click {
                 button,
                 count,
