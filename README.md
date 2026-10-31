@@ -414,10 +414,28 @@ aad assist --desktop --view-only          # 只给看，不接收鼠标键盘
 - 分享桌面时服务端另发 `{"type":"cursor","x":..,"y":..,"visible":true,"shape":{"png":"<base64>","width":..,
   "height":..,"hotspot":[x,y],"screen":[w,h]}}`：鼠标指针的位置（画面内比例）和样子（变了才带 `shape`，
   `screen` 是 `width`/`height` 所在的屏幕像素尺寸），指针不画进画面，由查看端叠加；`--hide-cursor` 关掉。
-- 控制消息是 JSON 文本：服务端发 `ready`（含 `frames.codecs`、`mode`、`video`）、`mode`、`stream`、`cursor`
-  和 `error`，查看端发
-  `hello`、`keyframe`、`mouse`（move/down/up/wheel，位置是画面内 0..1 的比例）、`key`（Enter、方向键、
-  F1–F12、修饰键等非文字按键）和 `text`（输入的文字）。
+- 控制消息是 JSON 文本：服务端发 `ready`（含 `frames.codecs`、`mode`、`video`）、`mode`、`stream`、`cursor`、
+  `clipboard` 和 `error`，查看端发
+  `hello`、`keyframe`、`mouse`（move/down/up/wheel，位置是画面内 0..1 的比例，`count` 是第几次连击）、
+  `key`（不出字的按键和快捷键，`code` 是物理键名，见下）、`text`（输入的文字）、`release` 和 `clipboard`。
+
+### 远程操作
+
+| 操作 | 浏览器页面（CDP `Input.*`） | Windows 桌面（`SendInput`） |
+|---|---|---|
+| 移动、按下、松开、拖拽，左/中/右键，横竖滚轮 | ✅ | ✅ |
+| 双击、三击 | ✅ 查看端发 `count`（`e.detail`） | ✅ 系统按间隔合成 |
+| 文字输入、粘贴（单次 ≤4096 字节） | ✅ `insertText` | ✅ Unicode 输入，和键盘布局无关 |
+| 中文等输入法 | ✅ 查看页里组字，只发组好的字 | ✅ 同左 |
+| 快捷键 | ✅ 按物理键（`code`）映射：字母、数字、标点（Ctrl+/、Ctrl+=、Ctrl+[）、Ctrl+Space、F1–F24、小键盘、CapsLock、PrintScreen、菜单键等 | ✅ 同左，带扫描码，方向键/Home/End/Insert/Delete/右侧修饰键带扩展键标志 |
+| 断开或查看页失去焦点时松开所有按住的键和鼠标键 | ✅ | ✅ |
+| 把远程剪贴板的文字带回查看端 | — | ✅ 查看端按 Ctrl+C/Ctrl+X 后自动取回（≤10 万字），密码管理器标记为不供读取的内容拒绝；`--no-clipboard` 关闭，`--view-only` 时不提供 |
+
+`key` 消息优先按 `code`（物理键）找键，没有 `code` 时按 `key` 的名字找；所以查看端是什么键盘布局，快捷键都落在
+同一个物理键上。出字的键不走 `key`：查看页把焦点放在点击处的一个隐藏输入框上，按键先经过本机输入法，组好的字和普通
+字符作为 `text` 发出（死键、输入法组字中的按键不发），Ctrl/Alt/Meta 组合和不出字的键作为 `key` 发出。按下鼠标后
+用指针捕获，拖到画面外再松开也会送达；查看页失去焦点或切到后台时发 `release`，对端把还按着的键和鼠标键全部松开，
+服务端在连接断开时也会这么做，不会留下按住的 Shift 或鼠标左键。
 
 ### 只传变化的部分（tiles）与自适应
 
@@ -512,7 +530,12 @@ https 代理也可以；不支持某种编码时查看页会重新 hello 把它�
 所以不通过 MCP 提供给 Agent。
 `tests/windows/verify_assist.py` 用真实 Chrome（加 `--desktop` 再测 Windows 桌面）检查默认收到 WebP、
 声明只要 JPEG 时收到 JPEG、点击和输入生效、错误 token 被拒绝；`tests/windows/verify_assist_video.py`
-和 `verify_assist_tiles.py` 检查上面的视频与 tiles 行为。Linux 和 macOS 的整桌面分享还没有做。
+和 `verify_assist_tiles.py` 检查上面的视频与 tiles 行为；`tests/windows/verify_assist_input.py` 按页面上的
+实际效果检查远程操作：双击选中单词、Ctrl+A 后输入替换文字、Ctrl+/ 和 Ctrl+Space 以对应物理键到达页面、
+`release` 松开按住的 Ctrl、查看端按着 Shift 和鼠标键断开后两者都被松开；在自带查看页里用输入法组出“中文”只送达一次、
+在画面里按下拖到画面外松开仍然送达；加 `--desktop` 时比对桌面剪贴板的回答和本机独立读到的内容（不改剪贴板），
+并在隔离的探针窗口里检查 Home、Shift+End、Delete、方向键的编辑效果、扫描码和扩展键标志，以及断开后 Shift 被松开。
+Linux 和 macOS 的整桌面分享还没有做。
 
 ## 桌面窗口（GUI）
 
