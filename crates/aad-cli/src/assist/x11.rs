@@ -720,13 +720,7 @@ impl X11 {
             let mut rgba = Vec::with_capacity(image.cursor_image.len() * 4);
             for argb in &image.cursor_image {
                 let a = (argb >> 24) & 0xFF;
-                let unmultiply = |c: u32| {
-                    if a == 0 {
-                        0
-                    } else {
-                        ((c * 255) / a).min(255) as u8
-                    }
-                };
+                let unmultiply = |c: u32| (c * 255).checked_div(a).map_or(0, |v| v.min(255) as u8);
                 rgba.extend_from_slice(&[
                     unmultiply((argb >> 16) & 0xFF),
                     unmultiply((argb >> 8) & 0xFF),
