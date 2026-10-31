@@ -17,7 +17,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.0.2"
+version = "0.0.3"
 edition = "2021"
 rust-version = "1.82"
 license = "Apache-2.0"
@@ -27,17 +27,17 @@ repository = "https://github.com/lejunyang/ai-auto-desktop"
 # `version` alongside `path`: inside the workspace the path wins, but
 # `cargo publish` rejects a path dependency that names no version, and the
 # published crate needs the registry version to resolve for downstream users.
-aad-core = { path = "crates/aad-core", version = "0.0.2" }
-aad-plugin = { path = "crates/aad-plugin", version = "0.0.2" }
-aad-runtime = { path = "crates/aad-runtime", version = "0.0.2" }
-aad-ocr = { path = "crates/aad-ocr", version = "0.0.2" }
-aad-atspi = { path = "crates/aad-atspi", version = "0.0.2" }
-aad-macos-ax = { path = "crates/aad-macos-ax", version = "0.0.2" }
-aad-cdp = { path = "crates/aad-cdp", version = "0.0.2" }
-aad-control = { path = "crates/aad-control", version = "0.0.2" }
-aad-probe = { path = "crates/aad-probe", version = "0.0.2" }
-aad-uia = { path = "crates/aad-uia", version = "0.0.2" }
-aad-mcp = { path = "crates/aad-mcp", version = "0.0.2" }
+aad-core = { path = "crates/aad-core", version = "0.0.3" }
+aad-plugin = { path = "crates/aad-plugin", version = "0.0.3" }
+aad-runtime = { path = "crates/aad-runtime", version = "0.0.3" }
+aad-ocr = { path = "crates/aad-ocr", version = "0.0.3" }
+aad-atspi = { path = "crates/aad-atspi", version = "0.0.3" }
+aad-macos-ax = { path = "crates/aad-macos-ax", version = "0.0.3" }
+aad-cdp = { path = "crates/aad-cdp", version = "0.0.3" }
+aad-control = { path = "crates/aad-control", version = "0.0.3" }
+aad-probe = { path = "crates/aad-probe", version = "0.0.3" }
+aad-uia = { path = "crates/aad-uia", version = "0.0.3" }
+aad-mcp = { path = "crates/aad-mcp", version = "0.0.3" }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
