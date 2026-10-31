@@ -399,19 +399,67 @@ aad assist --desktop --view-only          # 只给看，不接收鼠标键盘
 和 `video`（找到的 ffmpeg 与每种视频编码选中的编码器）。只监听本机回环地址，每个连接都要带 token。
 主要产物是 WebSocket 上的帧流，由 omem 这类宿主自己渲染：
 
-- 画面是二进制消息，一条一帧：24 字节大端头（版本、编码、标志位 bit0 = 关键帧、宽、高、头长度、
-  从开始算起的毫秒时间戳），之后是负载。读的一方按“头长度”跳过头，以后加字段不影响旧的读法；
+- 画面是二进制消息，一条一帧：24 字节大端头（版本、编码、标志位 bit0 = 关键帧 / bit1 = 后面带变化区域、
+  宽、高、头长度、从开始算起的毫秒时间戳），之后是负载。读的一方按“头长度”跳过头，以后加字段不影响旧的读法；
   不认识的编码跳过不画。编码值：1 = JPEG、2 = WebP（各是一整张图），3 = H.264（Annex B，
-  关键帧前带 SPS/PPS）、4 = VP9、5 = AV1（OBU），各是一帧视频。
-- 画面没变化就什么都不发。图片编码每次发整张图；视频编码里没变的块被编成跳过块，小改动只是很小的一帧。
-- 查看端可以先发 `{"type":"hello","accept":["h264","webp","jpeg"]}` 按自己的偏好选编码；不发 hello 的
-  查看端收到 `--codecs` 里的第一个（默认 WebP，旧宿主不受影响）。每段视频流开始前服务端发
+  关键帧前带 SPS/PPS）、4 = VP9、5 = AV1（OBU），各是一帧视频；6 = tiles（只有变化的部分，见下）。
+  bit1 置位时头后面跟着 u16 个数和若干 x、y、w、h（u16）：这一帧只有这些区域变了。
+- 画面没变化就什么都不发。图片编码每次发整张图；tiles 只发变了的 32 像素块；视频编码里没变的块被编成跳过块。
+- 查看端可以先发 `{"type":"hello","accept":["tiles","h264","webp","jpeg"]}` 按自己的偏好选编码；不发 hello 的
+  查看端收到 `--codecs` 里的第一个（默认 WebP，旧宿主不受影响）。hello 之后服务端发
+  `{"type":"mode","mode":{"codec":"tiles","video":"h264"}}` 说明实际模式。每段视频流开始前服务端发
   `{"type":"stream","codec":"h264","webcodecs":"avc1.64001f","encoder":"h264_nvenc","width":..,"height":..}`，
   紧接着是关键帧；`webcodecs` 可直接作 WebCodecs `VideoDecoder.configure` 的 `codec`。解码出错时查看端发
   `{"type":"keyframe"}`，服务端重开编码器，从当前画面的关键帧重新开始。
-- 控制消息是 JSON 文本：服务端发 `ready`（含 `frames.codecs`、`video`）、`stream` 和 `error`，查看端发
+- 分享桌面时服务端另发 `{"type":"cursor","x":..,"y":..,"visible":true,"shape":{"png":"<base64>","width":..,
+  "height":..,"hotspot":[x,y],"screen":[w,h]}}`：鼠标指针的位置（画面内比例）和样子（变了才带 `shape`，
+  `screen` 是 `width`/`height` 所在的屏幕像素尺寸），指针不画进画面，由查看端叠加；`--hide-cursor` 关掉。
+- 控制消息是 JSON 文本：服务端发 `ready`（含 `frames.codecs`、`mode`、`video`）、`mode`、`stream`、`cursor`
+  和 `error`，查看端发
   `hello`、`keyframe`、`mouse`（move/down/up/wheel，位置是画面内 0..1 的比例）、`key`（Enter、方向键、
   F1–F12、修饰键等非文字按键）和 `text`（输入的文字）。
+
+### 只传变化的部分（tiles）与自适应
+
+`tiles` 不依赖 ffmpeg：画面切成 32×32 的块，只把变了的块合并成矩形、各编成一张 WebP 补丁发出去，查看端在
+已有画面上原位画这些补丁；整块移动的区域（滚动）只发一条“从 (sx, sy) 复制过来”。一帧的负载是 u16 补丁数，
+每个补丁：类型 u8（1 = 图片，2 = 复制）、格式 u8（图片为 2 = WebP）、x、y、w、h（u16），复制再跟来源 x、y
+（u16），图片再跟 u32 长度和恰好 w×h 的图片。关键帧是一块盖满全画面的补丁；`--quality 100` 时补丁用无损 WebP。
+
+变化从哪里来：Windows 桌面用 DXGI 桌面复制（Desktop Duplication），系统直接给出每帧重绘和移动的区域，
+画面不变时根本没有新帧，只把变化的行从显存读回；再在这些区域里逐块比较，把“重画了但像素没变”的块去掉。
+DXGI 不可用（部分远程会话、旋转的显示器）或丢失（分辨率变化、安全桌面）时退回 GDI 整屏拷贝加逐块比较，
+一秒后再试 DXGI；`source.capture` 报告当前是 `dxgi` 还是 `gdi`。浏览器页面用 screencast 的 PNG 帧逐块比较。
+分享桌面的进程按每显示器 DPI 感知运行，拿到的是物理像素（以前在 250% 缩放下拿到的是系统缩小过的 1536×960
+模糊画面，现在是 3840×2400 再按 `--max-width` 缩小）。
+
+缩小也只做变化的部分：服务端保留一份缩小后的画面，每次只把变化区域从原图重新取平均；抓屏缓冲区两份轮换，
+新一帧只补上一帧变过的区域，不再整屏复制。
+
+查看端 hello 里 tiles 排在某种视频编码前面（自带查看页就是这样）时进入**自适应**：小改动发 tiles；
+变化面积超过 `--video-area`（默认屏幕的 30%）或每秒超过 `--video-rate` 次（默认 8 次，只算超过屏幕 1% 的变化，
+如滚动、播放）时发视频。视频帧在头里带变化区域，查看端照常解码每一帧，但**只把变化区域画到画布上**，别处保留
+tiles 画的清晰内容；画面静止 0.4 秒后，视频画过的区域再用 tiles 补发一遍清晰的。两路帧按送入顺序发出，
+不会出现旧画面盖住新补丁。
+
+本机实测（release 构建，3840×2400 桌面缩到 1600×1000，屏幕上有一处持续动画约 26 次/秒，10 秒平均，
+CPU 为 aad 加 ffmpeg 占单核的比例）：
+
+| 模式 | CPU | 带宽 |
+|---|---|---|
+| WebP 整图（5 帧/秒） | 50% | 约 540 KiB/s |
+| tiles | 8% | 约 14–34 KiB/s |
+| 自适应 tiles + h264 | 12% | 约 14–36 KiB/s |
+| h264（NVENC） | 23% | 约 4–10 KiB/s |
+| h264（x264） | 70% | 约 14–52 KiB/s |
+
+优化前同样场景下 NVENC 是 159%、x264 186%（每帧把 37 MB 的 4K 原图送进 ffmpeg 再由它缩小），tiles 26%（每帧整屏复制）。
+`tests/windows/verify_assist_tiles.py`（加 `--desktop` 再测桌面）检查：tiles 首帧是整画面、页面静止 6 秒 0 帧、
+点击只发按钮附近的补丁（1.8 KB，关键帧 35 KB）、按所有补丁拼出的画面和同一时刻的整张 WebP 只差 0.56/255、
+点击打字真实生效；自适应在大面积动画时切到视频、视频帧只报告动画区域、动画停止后该区域用 tiles 补发；
+自带查看页（另起一个 Chrome，避免被分享的页面变成后台标签而停止绘制）最终画面和页面一致；桌面报告 `dxgi`、
+补丁拼出的画面和服务端此刻的整帧逐块相比最差的块平均差 12/255（只有文字边缘的有损差异，没有错位或漏发的块）、
+打字只在编辑框附近产生约 1.2–6 KB、指针形状的 PNG 能解码且指针移到了点击处。
 
 ### 视频流（需要宿主自备 ffmpeg）
 
@@ -430,10 +478,10 @@ aad assist --desktop --codecs av1 --ffmpeg-arg=-svtav1-params --ffmpeg-arg=pred-
 
 | 参数 | 作用 |
 |---|---|
-| `--codecs` | 提供哪些编码及顺序：`webp,jpeg,h264,vp9,av1`；`auto`（默认）= WebP、JPEG 加上能用的视频编码 |
+| `--codecs` | 提供哪些编码及顺序：`webp,jpeg,tiles,h264,vp9,av1`；`auto`（默认）= WebP、JPEG、tiles 加上能用的视频编码 |
 | `--ffmpeg` | ffmpeg 路径（否则 `AAD_FFMPEG`，再否则 PATH） |
 | `--encoder` | 指定 ffmpeg 编码器，可重复：作后备，或每种编码各指定一个；不指定时先试硬件 |
-| `--fps` | 最高帧率 1..60；不填时图片 5、视频 30。只是上限，画面不变就不出帧 |
+| `--fps` | 最高帧率 1..60；不填时整图 5、tiles 和视频 30。只是上限，画面不变就不出帧 |
 | `--quality` | 1..100，图片的质量；视频不设 `--bitrate` 时换算成各编码器自己的恒定量化参数 |
 | `--bitrate` | 视频恒定码率（kbit/s） |
 | `--gop` | 关键帧间隔（帧数）；默认 0 = 只在开始或查看端要求时出关键帧 |
@@ -441,6 +489,8 @@ aad assist --desktop --codecs av1 --ffmpeg-arg=-svtav1-params --ffmpeg-arg=pred-
 | `--chroma` | `420`（默认）或 `444`；不支持 4:4:4 的编码器会在试编时落选 |
 | `--ffmpeg-arg` | 原样追加一个 ffmpeg 输出参数，可重复（兜底，用于本项目没有包装的选项） |
 | `--max-width` / `--max-height` | 发出的画面最大宽高（默认 1600 宽、高不限），更大的屏幕按比例缩小；视频再取偶数 |
+| `--video-area` / `--video-rate` | 自适应时改用视频的门槛：变化占屏幕的百分比（默认 30）/ 每秒次数（默认 8） |
+| `--hide-cursor` | 不发桌面鼠标指针的位置和样子 |
 
 内置的编码器参数都是低延迟配置：x264 `ultrafast` + `zerolatency`、NVENC `p1` + `ull` + `zerolatency`、
 QSV `async_depth 1`、libvpx `realtime`、SVT-AV1 低延迟预测结构、libaom `realtime`，都不带 B 帧。
@@ -462,7 +512,7 @@ https 代理也可以；不支持某种编码时查看页会重新 hello 把它�
 所以不通过 MCP 提供给 Agent。
 `tests/windows/verify_assist.py` 用真实 Chrome（加 `--desktop` 再测 Windows 桌面）检查默认收到 WebP、
 声明只要 JPEG 时收到 JPEG、点击和输入生效、错误 token 被拒绝；`tests/windows/verify_assist_video.py`
-检查上面的视频行为。Linux 和 macOS 的整桌面分享还没有做。
+和 `verify_assist_tiles.py` 检查上面的视频与 tiles 行为。Linux 和 macOS 的整桌面分享还没有做。
 
 ## 桌面窗口（GUI）
 
