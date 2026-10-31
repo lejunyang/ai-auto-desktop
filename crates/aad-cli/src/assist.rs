@@ -67,6 +67,8 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
+#[cfg(windows)]
+mod buffer;
 mod damage;
 mod keys;
 mod scale;
@@ -87,6 +89,21 @@ pub struct AssistArgs {
     /// Stream the whole desktop instead (Windows).
     #[arg(long)]
     desktop: bool,
+    /// Share one display, by its number from --list-screens.
+    #[arg(
+        long,
+        value_name = "N",
+        requires = "desktop",
+        conflicts_with = "window"
+    )]
+    monitor: Option<usize>,
+    /// Share one window: its handle from --list-screens, or part of its
+    /// title. It is followed as it moves; what lies over it shows too.
+    #[arg(long, value_name = "HANDLE_OR_TITLE", requires = "desktop")]
+    window: Option<String>,
+    /// List the displays and windows that can be shared, then exit.
+    #[arg(long)]
+    list_screens: bool,
     /// Loopback address to listen on.
     #[arg(long, default_value = "127.0.0.1:0")]
     listen: String,
@@ -536,6 +553,9 @@ fn probe(args: &AssistArgs, settings: &video::Settings) -> Result<video::Probe> 
 
 pub fn run(args: &AssistArgs) -> Result<Value> {
     let settings = video_settings(args);
+    if args.list_screens {
+        return desktop::screens();
+    }
     if args.probe_video {
         return Ok(probe(args, &settings)?.report());
     }
@@ -568,7 +588,14 @@ pub fn run(args: &AssistArgs) -> Result<Value> {
             config.quality,
             (config.max_width, config.max_height),
         )?),
-        (None, true) => desktop::open(config.fps(first))?,
+        (None, true) => {
+            let area = match (args.monitor, &args.window) {
+                (Some(index), _) => desktop::Area::Monitor(index),
+                (None, Some(window)) => desktop::Area::Window(window.clone()),
+                (None, None) => desktop::Area::All,
+            };
+            desktop::open(config.fps(first), &area)?
+        }
         _ => return Err("pass --browser-port PORT or --desktop".into()),
     };
     let token = uuid::Uuid::new_v4().simple().to_string();
@@ -2148,8 +2175,26 @@ fn unknown(event: &Value) -> String {
 #[cfg(not(windows))]
 mod desktop {
     use super::{Result, Source};
-    pub fn open(_fps: u32) -> Result<Box<dyn Source>> {
-        Err("desktop assistance is available on Windows so far; use --browser-port for a browser page".into())
+    use serde_json::Value;
+    pub enum Area {
+        All,
+        Monitor(usize),
+        Window(String),
+    }
+
+    pub fn screens() -> Result<Value> {
+        Err("listing screens is available on Windows so far".into())
+    }
+
+    pub fn open(_fps: u32, area: &Area) -> Result<Box<dyn Source>> {
+        let what = match area {
+            Area::All => "the desktop".to_string(),
+            Area::Monitor(index) => format!("display {index}"),
+            Area::Window(window) => format!("window {window}"),
+        };
+        Err(format!(
+            "sharing {what} is available on Windows so far; use --browser-port for a browser page"
+        ))
     }
 }
 
@@ -2178,11 +2223,17 @@ mod desktop {
         buttons: u8,
     }
 
-    pub fn open(fps: u32) -> Result<Box<dyn Source>> {
+    pub use super::screen::Area;
+
+    pub fn screens() -> Result<Value> {
+        Ok(screen::screens())
+    }
+
+    pub fn open(fps: u32, area: &Area) -> Result<Box<dyn Source>> {
         screen::dpi_aware();
         Ok(Box::new(Desktop {
             pace: Pace::new(fps),
-            screen: Screen::open(),
+            screen: Screen::open(area)?,
             pointer: Pointer::default(),
             held: Vec::new(),
             buttons: 0,
@@ -2271,7 +2322,7 @@ mod desktop {
         }
 
         fn cursor(&mut self, fresh: bool) -> Option<Value> {
-            self.pointer.message(fresh)
+            self.pointer.message(fresh, self.screen.shown.0)
         }
 
         fn refresh(&mut self) {
@@ -2281,8 +2332,14 @@ mod desktop {
         fn input(&mut self, event: &Value) -> Result<()> {
             match event["type"].as_str() {
                 Some("mouse") => {
-                    let x = (fraction(event, "x")? * 65535.0).round() as i32;
-                    let y = (fraction(event, "y")? * 65535.0).round() as i32;
+                    // From the shared part to the whole desktop's 0..65535.
+                    let (at, desktop) = self.screen.shown;
+                    let across = |f: f64, start: i32, size: u32, origin: i32, whole: u32| {
+                        let pixel = f64::from(start - origin) + f * f64::from(size.max(1) - 1);
+                        (pixel / f64::from(whole.max(2) - 1) * 65535.0).round() as i32
+                    };
+                    let x = across(fraction(event, "x")?, at.0, at.2, desktop.0, desktop.2);
+                    let y = across(fraction(event, "y")?, at.1, at.3, desktop.1, desktop.3);
                     let at = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK;
                     let (down, up, mask) = match event["button"].as_str() {
                         Some("right") => (MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, 2),

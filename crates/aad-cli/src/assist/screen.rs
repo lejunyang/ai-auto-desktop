@@ -16,12 +16,15 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use windows::core::Interface;
-use windows::Win32::Foundation::{HMODULE, HWND, POINT, RECT};
+use windows::Win32::Foundation::{BOOL, HMODULE, HWND, LPARAM, POINT, RECT};
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_UNKNOWN;
 use windows::Win32::Graphics::Direct3D11::{
     D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D, D3D11_CPU_ACCESS_READ,
     D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_READ, D3D11_SDK_VERSION,
     D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
+};
+use windows::Win32::Graphics::Dwm::{
+    DwmGetWindowAttribute, DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_MODE_ROTATION_IDENTITY, DXGI_MODE_ROTATION_UNSPECIFIED,
@@ -32,20 +35,21 @@ use windows::Win32::Graphics::Dxgi::{
 };
 use windows::Win32::Graphics::Gdi::{
     BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject,
-    GetDC, GetDIBits, GetObjectW, ReleaseDC, SelectObject, BITMAP, BITMAPINFO, BITMAPINFOHEADER,
-    BI_RGB, CAPTUREBLT, DIB_RGB_COLORS, HBITMAP, HGDIOBJ, SRCCOPY,
+    EnumDisplayMonitors, GetDC, GetDIBits, GetMonitorInfoW, GetObjectW, ReleaseDC, SelectObject,
+    BITMAP, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, CAPTUREBLT, DIB_RGB_COLORS, HBITMAP, HDC,
+    HGDIOBJ, HMONITOR, MONITORINFO, MONITORINFOEXW, SRCCOPY,
 };
 use windows::Win32::UI::HiDpi::{
     SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    DrawIconEx, GetCursorInfo, GetIconInfo, GetSystemMetrics, CURSORINFO, CURSOR_SHOWING,
+    DrawIconEx, EnumWindows, GetCursorInfo, GetIconInfo, GetSystemMetrics, GetWindowTextW,
+    GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible, CURSORINFO, CURSOR_SHOWING,
     DI_NORMAL, HCURSOR, HICON, ICONINFO, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
     SM_YVIRTUALSCREEN,
 };
 
-/// The virtual screen: left, top, width, height in physical pixels.
-type Bounds = (i32, i32, u32, u32);
+use super::buffer::{Bounds, Crop, Target};
 
 fn bounds() -> Bounds {
     unsafe {
@@ -55,6 +59,205 @@ fn bounds() -> Bounds {
             GetSystemMetrics(SM_CXVIRTUALSCREEN).max(0) as u32,
             GetSystemMetrics(SM_CYVIRTUALSCREEN).max(0) as u32,
         )
+    }
+}
+
+/// The displays, in the order --monitor numbers them, with whether each is
+/// the primary one.
+fn monitors() -> Vec<(Bounds, bool, String)> {
+    unsafe extern "system" fn each(monitor: HMONITOR, _: HDC, _: *mut RECT, found: LPARAM) -> BOOL {
+        let found = &mut *(found.0 as *mut Vec<(Bounds, bool, String)>);
+        let mut info = MONITORINFOEXW::default();
+        info.monitorInfo.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
+        if GetMonitorInfoW(
+            monitor,
+            &mut info as *mut MONITORINFOEXW as *mut MONITORINFO,
+        )
+        .as_bool()
+        {
+            let r = info.monitorInfo.rcMonitor;
+            let name = String::from_utf16_lossy(&info.szDevice);
+            found.push((
+                (
+                    r.left,
+                    r.top,
+                    (r.right - r.left).max(0) as u32,
+                    (r.bottom - r.top).max(0) as u32,
+                ),
+                info.monitorInfo.dwFlags & 1 != 0,
+                name.trim_end_matches('\0').to_string(),
+            ));
+        }
+        BOOL(1)
+    }
+    let mut found: Vec<(Bounds, bool, String)> = Vec::new();
+    unsafe {
+        let _ = EnumDisplayMonitors(
+            HDC::default(),
+            None,
+            Some(each),
+            LPARAM(&mut found as *mut _ as isize),
+        );
+    }
+    found
+}
+
+/// Where a window's frame is on the screen, without its invisible borders.
+fn window_bounds(window: HWND) -> Option<Bounds> {
+    let mut r = RECT::default();
+    unsafe {
+        DwmGetWindowAttribute(
+            window,
+            DWMWA_EXTENDED_FRAME_BOUNDS,
+            &mut r as *mut RECT as *mut _,
+            std::mem::size_of::<RECT>() as u32,
+        )
+        .ok()?;
+    }
+    Some((
+        r.left,
+        r.top,
+        (r.right - r.left).max(0) as u32,
+        (r.bottom - r.top).max(0) as u32,
+    ))
+}
+
+fn title(window: HWND) -> String {
+    let mut text = [0u16; 512];
+    let length = unsafe { GetWindowTextW(window, &mut text) };
+    String::from_utf16_lossy(&text[..length.max(0) as usize])
+}
+
+/// Visible top-level windows with a title, front to back.
+fn windows() -> Vec<HWND> {
+    unsafe extern "system" fn each(window: HWND, found: LPARAM) -> BOOL {
+        let found = &mut *(found.0 as *mut Vec<HWND>);
+        let mut cloaked = 0u32;
+        let _ = DwmGetWindowAttribute(
+            window,
+            DWMWA_CLOAKED,
+            &mut cloaked as *mut u32 as *mut _,
+            std::mem::size_of::<u32>() as u32,
+        );
+        if IsWindowVisible(window).as_bool() && cloaked == 0 && !title(window).is_empty() {
+            found.push(window);
+        }
+        BOOL(1)
+    }
+    let mut found: Vec<HWND> = Vec::new();
+    unsafe {
+        let _ = EnumWindows(Some(each), LPARAM(&mut found as *mut _ as isize));
+    }
+    found
+}
+
+/// What `--list-screens` prints: what can be shared.
+pub fn screens() -> Value {
+    dpi_aware();
+    let monitors: Vec<Value> = monitors()
+        .into_iter()
+        .enumerate()
+        .map(|(index, (b, primary, name))| {
+            json!({"monitor": index, "name": name, "primary": primary,
+                   "left": b.0, "top": b.1, "width": b.2, "height": b.3})
+        })
+        .collect();
+    let windows: Vec<Value> = windows()
+        .into_iter()
+        .filter_map(|window| {
+            let b = window_bounds(window)?;
+            let mut process = 0u32;
+            unsafe { GetWindowThreadProcessId(window, Some(&mut process)) };
+            Some(
+                json!({"window": format!("0x{:x}", window.0 as usize), "title": title(window),
+                        "process_id": process, "minimized": unsafe { IsIconic(window) }.as_bool(),
+                        "left": b.0, "top": b.1, "width": b.2, "height": b.3}),
+            )
+        })
+        .collect();
+    json!({"monitors": monitors, "windows": windows})
+}
+
+/// What part of the desktop is shared.
+pub enum Area {
+    All,
+    Monitor(usize),
+    Window(String),
+}
+
+/// The shared part, resolved.
+enum Part {
+    All,
+    Monitor(Bounds),
+    Window(HWND),
+}
+
+impl Part {
+    fn resolve(area: &Area) -> Result<Part> {
+        Ok(match area {
+            Area::All => Part::All,
+            Area::Monitor(index) => {
+                let all = monitors();
+                let (bounds, _, _) = all.get(*index).ok_or_else(|| {
+                    format!(
+                        "--monitor {index}: there are {} displays (see --list-screens)",
+                        all.len()
+                    )
+                })?;
+                Part::Monitor(*bounds)
+            }
+            Area::Window(wanted) => {
+                let handle = wanted
+                    .strip_prefix("0x")
+                    .map(|hex| usize::from_str_radix(hex, 16))
+                    .unwrap_or_else(|| wanted.parse::<usize>())
+                    .ok()
+                    .map(|h| HWND(h as *mut _))
+                    .filter(|h| unsafe { IsWindow(*h) }.as_bool());
+                match handle {
+                    Some(window) => Part::Window(window),
+                    None => {
+                        let lower = wanted.to_lowercase();
+                        let matching: Vec<HWND> = windows()
+                            .into_iter()
+                            .filter(|w| title(*w).to_lowercase().contains(&lower))
+                            .collect();
+                        match matching.as_slice() {
+                            [one] => Part::Window(*one),
+                            [] => return Err(format!("--window {wanted}: no window with that handle or title (see --list-screens)")),
+                            many => {
+                                let titles: Vec<String> = many.iter().take(5).map(|w| title(*w)).collect();
+                                return Err(format!("--window {wanted}: {} windows match: {}; give a handle from --list-screens", many.len(), titles.join(" | ")));
+                            }
+                        }
+                    }
+                }
+            }
+        })
+    }
+
+    /// Where it is now, inside the desktop; `None` while a window is
+    /// minimized.
+    fn bounds(&self, desktop: Bounds) -> Result<Option<Bounds>> {
+        let wanted = match self {
+            Part::All => return Ok(Some(desktop)),
+            Part::Monitor(bounds) => *bounds,
+            Part::Window(window) => {
+                if !unsafe { IsWindow(*window) }.as_bool() {
+                    return Err("the shared window was closed".into());
+                }
+                if unsafe { IsIconic(*window) }.as_bool() {
+                    return Ok(None);
+                }
+                window_bounds(*window).ok_or("the shared window has no bounds")?
+            }
+        };
+        let left = wanted.0.max(desktop.0);
+        let top = wanted.1.max(desktop.1);
+        let right = (wanted.0 + wanted.2 as i32).min(desktop.0 + desktop.2 as i32);
+        let bottom = (wanted.1 + wanted.3 as i32).min(desktop.1 + desktop.3 as i32);
+        Ok((right > left && bottom > top)
+            .then(|| (left, top, (right - left) as u32, (bottom - top) as u32)))
     }
 }
 
@@ -78,50 +281,6 @@ struct Output {
 
 struct Duplication {
     outputs: Vec<Output>,
-}
-
-/// Where a capture writes: the next picture, made on first use from the one
-/// before last when no one holds that any more. It then only needs the
-/// regions the last capture changed, not a copy of the whole screen.
-struct Target<'a> {
-    frame: &'a mut Option<Arc<Vec<u8>>>,
-    spare: &'a mut Option<Arc<Vec<u8>>>,
-    /// Where the spare differs from the frame.
-    stale: &'a mut Vec<Rect>,
-    width: usize,
-    height: usize,
-    ready: bool,
-}
-
-impl Target<'_> {
-    fn pixels(&mut self) -> &mut Vec<u8> {
-        if !self.ready {
-            self.ready = true;
-            let size = self.width * self.height * 4;
-            let next = match (self.spare.take(), self.frame.as_ref()) {
-                // No other holder (no weak references are ever made).
-                (Some(mut spare), Some(frame))
-                    if spare.len() == size && Arc::strong_count(&spare) == 1 =>
-                {
-                    let pixels = Arc::get_mut(&mut spare).unwrap_or_else(|| unreachable!());
-                    for rect in self.stale.iter() {
-                        for y in rect.y..rect.y + rect.h {
-                            let at = (y as usize * self.width + rect.x as usize) * 4;
-                            let span = at..at + rect.w as usize * 4;
-                            pixels[span.clone()].copy_from_slice(&frame[span]);
-                        }
-                    }
-                    spare
-                }
-                (_, Some(frame)) => Arc::new(frame.as_ref().clone()),
-                (_, None) => Arc::new(vec![0u8; size]),
-            };
-            self.stale.clear();
-            *self.spare = self.frame.replace(next);
-        }
-        let frame = self.frame.as_mut().unwrap_or_else(|| unreachable!());
-        Arc::get_mut(frame).unwrap_or_else(|| unreachable!())
-    }
 }
 
 impl Duplication {
@@ -432,10 +591,23 @@ pub struct Screen {
     pub fallback: Option<String>,
     /// Return the screen next time even if nothing changed.
     refresh: bool,
+    part: Part,
+    crop: Crop,
+    /// Where the shared part was at the last capture, and the whole desktop.
+    pub shown: (Bounds, Bounds),
 }
 
 impl Screen {
-    pub fn open() -> Self {
+    pub fn open(area: &Area) -> Result<Self> {
+        let part = Part::resolve(area)?;
+        let mut screen = Self::whole();
+        screen.part = part;
+        let desktop = bounds();
+        screen.shown = (screen.part.bounds(desktop)?.unwrap_or(desktop), desktop);
+        Ok(screen)
+    }
+
+    fn whole() -> Self {
         let (duplication, fallback) = match Duplication::open() {
             Ok(d) => (Some(d), None),
             Err(e) => (None, Some(e)),
@@ -449,7 +621,30 @@ impl Screen {
             at: bounds(),
             fallback,
             refresh: false,
+            part: Part::All,
+            crop: Crop::default(),
+            shown: (bounds(), bounds()),
         }
+    }
+
+    /// The shared part if it changed, with what changed when known.
+    pub fn capture(&mut self) -> Result<Option<Raw>> {
+        let desktop = bounds();
+        let Some(at) = self.part.bounds(desktop)? else {
+            // A minimized window: the viewer keeps its last picture.
+            return Ok(None);
+        };
+        self.shown = (at, desktop);
+        if at == desktop {
+            return self.capture_desktop();
+        }
+        // Moved or resized: the next capture must hold the whole part.
+        if self.crop.at != Some(at) {
+            self.refresh = true;
+        }
+        Ok(self
+            .capture_desktop()?
+            .map(|whole| self.crop.cut(&whole, desktop, at)))
     }
 
     /// The next capture returns the screen even if nothing changed.
@@ -461,8 +656,9 @@ impl Screen {
         self.duplication.is_some()
     }
 
-    /// The screen if it changed, with what changed when duplication knows.
-    pub fn capture(&mut self) -> Result<Option<Raw>> {
+    /// The whole desktop if it changed, with what changed when duplication
+    /// knows.
+    fn capture_desktop(&mut self) -> Result<Option<Raw>> {
         let at = bounds();
         if at != self.at {
             // Displays were added, removed or resized: start over.
@@ -554,7 +750,7 @@ pub struct Pointer {
 impl Pointer {
     /// A `cursor` message when the pointer moved, appeared, vanished or
     /// changed shape, at most 60 a second; `fresh` sends everything again.
-    pub fn message(&mut self, fresh: bool) -> Option<Value> {
+    pub fn message(&mut self, fresh: bool, at: Bounds) -> Option<Value> {
         if fresh {
             *self = Pointer::default();
         }
@@ -571,7 +767,9 @@ impl Pointer {
         unsafe { GetCursorInfo(&mut info) }.ok()?;
         let visible = info.flags.0 & CURSOR_SHOWING.0 != 0 && !info.hCursor.is_invalid();
         let POINT { x, y } = info.ptScreenPos;
-        let at = bounds();
+        // Outside the shared part it is not shown.
+        let visible =
+            visible && x >= at.0 && y >= at.1 && x < at.0 + at.2 as i32 && y < at.1 + at.3 as i32;
         let state = (x, y, visible);
         let handle = info.hCursor.0 as isize;
         let new_shape = visible && self.shape != Some(handle);
@@ -670,59 +868,5 @@ fn shape(cursor: HCURSOR) -> Option<(Vec<u8>, u32, u32, [u32; 2])> {
             .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
             .ok()?;
         Some((png, width as u32, height as u32, hotspot))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn the_spare_picture_is_caught_up_instead_of_copied() {
-        let (width, height) = (4usize, 2usize);
-        let mut frame = Some(Arc::new(vec![1u8; width * height * 4]));
-        // The picture before last: out of date in its second row.
-        let mut old = vec![1u8; width * height * 4];
-        old[width * 4..].fill(9);
-        let mut spare = Some(Arc::new(old));
-        let spare_at = Arc::as_ptr(spare.as_ref().unwrap());
-        let mut stale = vec![Rect {
-            x: 0,
-            y: 1,
-            w: 4,
-            h: 1,
-        }];
-        let mut target = Target {
-            frame: &mut frame,
-            spare: &mut spare,
-            stale: &mut stale,
-            width,
-            height,
-            ready: false,
-        };
-        let pixels = target.pixels();
-        assert!(pixels.iter().all(|p| *p == 1));
-        pixels[0] = 5;
-        // The spare's buffer became the new picture; the old picture is the spare.
-        assert_eq!(Arc::as_ptr(frame.as_ref().unwrap()), spare_at);
-        assert_eq!(frame.as_ref().unwrap()[0], 5);
-        assert_eq!(spare.as_ref().unwrap()[0], 1);
-        assert!(stale.is_empty());
-
-        // Someone still holds the spare: the picture is copied instead.
-        let held = spare.clone();
-        let mut target = Target {
-            frame: &mut frame,
-            spare: &mut spare,
-            stale: &mut stale,
-            width,
-            height,
-            ready: false,
-        };
-        assert_eq!(target.pixels()[0], 5);
-        assert_ne!(
-            Arc::as_ptr(frame.as_ref().unwrap()),
-            Arc::as_ptr(held.as_ref().unwrap())
-        );
     }
 }
