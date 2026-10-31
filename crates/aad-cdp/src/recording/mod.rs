@@ -1,5 +1,5 @@
 //! Task-scoped, passive browser recording. Network redaction is opt-in.
-mod network;
+pub mod network;
 mod storage;
 pub use storage::control;
 

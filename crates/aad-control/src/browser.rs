@@ -15,7 +15,7 @@ pub const PROVIDER: &str = "browser.cdp";
 
 /// CDP `Input` and page navigation address the page, not a frame, so they are
 /// offered only where the observed frame is the main one.
-const MAIN_FRAME_ONLY: [&str; 7] = PAGE_ACTIONS;
+const MAIN_FRAME_ONLY: [&str; 9] = PAGE_ACTIONS;
 
 /// How long a newly attached page may take to answer before it counts as blocked.
 const RESPONSIVE: Duration = Duration::from_secs(2);
@@ -160,6 +160,12 @@ impl Downloads {
 const DIALOG_CLOSED: &str = "Page.javascriptDialogClosed";
 const DRAG_INTERCEPTED: &str = "Input.dragIntercepted";
 const ATTACHED: &str = "Target.attachedToTarget";
+const REQUEST_SENT: &str = "Network.requestWillBeSent";
+const RESPONSE_RECEIVED: &str = "Network.responseReceived";
+const LOADING_FINISHED: &str = "Network.loadingFinished";
+const LOADING_FAILED: &str = "Network.loadingFailed";
+/// Requests remembered per page; the oldest are forgotten first.
+const MAX_REQUESTS: usize = 500;
 const DETACHED: &str = "Target.detachedFromTarget";
 /// Out-of-process frames followed per page.
 const MAX_CHILD_FRAMES: usize = 64;
@@ -177,6 +183,95 @@ struct Page {
     children: BTreeMap<String, String>,
     /// Children not yet asked to attach their own out-of-process frames.
     fresh: Vec<String>,
+    /// Recent requests of the page, for browser_network.
+    network: NetworkLog,
+}
+
+/// A page's recent requests as the Network domain reported them.
+#[derive(Default)]
+struct NetworkLog {
+    entries: std::collections::VecDeque<Value>,
+    /// Requests forgotten to the bound or lost before they were read.
+    dropped: u64,
+    seen: u64,
+}
+
+impl NetworkLog {
+    /// Fold one event in; false if it is not a network event.
+    fn apply(&mut self, event: &Value) -> bool {
+        let params = &event["params"];
+        let id = params["requestId"].as_str().unwrap_or_default();
+        fn find<'a>(
+            entries: &'a mut std::collections::VecDeque<Value>,
+            id: &str,
+        ) -> Option<&'a mut Value> {
+            entries
+                .iter_mut()
+                .rev()
+                .find(|entry| entry["request_id"] == id && entry["state"] == "pending")
+        }
+        match event["method"].as_str() {
+            Some(REQUEST_SENT) => {
+                if let Some(previous) = find(&mut self.entries, id) {
+                    // A redirect reuses the request id.
+                    previous["status"] = params["redirectResponse"]["status"].clone();
+                    previous["state"] = json!("redirected");
+                }
+                if self.entries.len() >= MAX_REQUESTS {
+                    self.entries.pop_front();
+                    self.dropped += 1;
+                }
+                self.seen += 1;
+                let url = params["request"]["url"].as_str().unwrap_or_default();
+                self.entries.push_back(json!({
+                    "request_id": id,
+                    "method": params["request"]["method"],
+                    "url": aad_cdp::recording::network::redact_url(url).chars().take(2048).collect::<String>(),
+                    "resource_type": params["type"],
+                    "state": "pending",
+                    "status": null,
+                    "mime_type": null,
+                    "wall_time": params["wallTime"],
+                    "started": params["timestamp"],
+                    "duration_ms": null,
+                    "encoded_bytes": null,
+                    "from_cache": false,
+                    "error": null,
+                }));
+            }
+            Some(RESPONSE_RECEIVED) => {
+                if let Some(entry) = find(&mut self.entries, id) {
+                    let response = &params["response"];
+                    entry["status"] = response["status"].clone();
+                    entry["mime_type"] = response["mimeType"].clone();
+                    entry["from_cache"] = json!(
+                        response["fromDiskCache"] == true
+                            || response["fromServiceWorker"] == true
+                            || response["fromPrefetchCache"] == true
+                    );
+                }
+            }
+            Some(LOADING_FINISHED) | Some(LOADING_FAILED) => {
+                if let Some(entry) = find(&mut self.entries, id) {
+                    let failed = event["method"] == LOADING_FAILED;
+                    entry["state"] = json!(if failed { "failed" } else { "finished" });
+                    if let (Some(end), Some(start)) =
+                        (params["timestamp"].as_f64(), entry["started"].as_f64())
+                    {
+                        entry["duration_ms"] = json!(((end - start) * 1000.0).round());
+                    }
+                    if failed {
+                        entry["error"] = params["errorText"].clone();
+                        entry["canceled"] = params["canceled"].clone();
+                    } else {
+                        entry["encoded_bytes"] = params["encodedDataLength"].clone();
+                    }
+                }
+            }
+            _ => return false,
+        }
+        true
+    }
 }
 
 static AUTO_ATTACH: std::sync::LazyLock<Value> = std::sync::LazyLock::new(
@@ -201,7 +296,13 @@ impl Page {
 
     /// Apply the dialog events received since the last look.
     fn sync_dialog(&mut self) {
-        for event in self.client.drain_events().events {
+        let batch = self.client.drain_events();
+        // Events lost to the connection's bounded queue are mostly requests.
+        self.network.dropped += batch.dropped;
+        for event in batch.events {
+            if event.get("sessionId").is_none() && self.network.apply(&event) {
+                continue;
+            }
             match event["method"].as_str() {
                 Some(DIALOG_OPENING) => {
                     let params = &event["params"];
@@ -401,6 +502,10 @@ impl BrowserBackend {
                     DRAG_INTERCEPTED,
                     ATTACHED,
                     DETACHED,
+                    REQUEST_SENT,
+                    RESPONSE_RECEIVED,
+                    LOADING_FINISHED,
+                    LOADING_FAILED,
                 ],
                 &[DIALOG_OPENING],
             );
@@ -428,6 +533,13 @@ impl BrowserBackend {
             // Cross-origin frames run in their own renderer: follow them as
             // flattened child sessions on this connection.
             command(&mut client, "Target.setAutoAttach", AUTO_ATTACH.clone())?;
+            // Requests from now on, for browser_network. Bodies stay in the
+            // browser's own bounded buffer until asked for.
+            command(
+                &mut client,
+                "Network.enable",
+                json!({"maxTotalBufferSize": 8_000_000, "maxResourceBufferSize": 1_000_000}),
+            )?;
             pages.insert(
                 target.id.clone(),
                 Page {
@@ -438,6 +550,7 @@ impl BrowserBackend {
                     drag: None,
                     children: BTreeMap::new(),
                     fresh: Vec::new(),
+                    network: NetworkLog::default(),
                 },
             );
         }
@@ -608,7 +721,21 @@ fn cdp_error(e: aad_cdp::CdpError) -> AutomationError {
             "a JavaScript dialog opened and blocks the page",
         );
     }
-    error("BROWSER.CDP_ERROR", e.to_string())
+    let message = e.to_string();
+    // The world or document went away under the command: navigation or
+    // context churn. A fresh observation recovers.
+    if [
+        "Cannot find context with specified id",
+        "Execution context was destroyed",
+        "Inspected target navigated or closed",
+        "Cannot find default execution context",
+    ]
+    .iter()
+    .any(|text| message.contains(text))
+    {
+        return error("BROWSER.CONTEXT_LOST", message).with_retryable(true);
+    }
+    error("BROWSER.CDP_ERROR", message)
 }
 fn command(client: &mut Client, method: &str, params: Value) -> Result<Value> {
     client.command(method, params).map_err(cdp_error)
@@ -764,7 +891,7 @@ fn locate(page: &mut Page, frame_id: &str) -> Result<FrameEntry> {
 /// browser's accessibility tree is asked once per node.
 const MAX_ACCESSIBLE_NODES: usize = 2_000;
 /// Accessibility queries sent before their replies are awaited.
-const AX_PIPELINE: usize = 200;
+const AX_PIPELINE: usize = 100;
 
 /// Roles and names as the browser's accessibility tree has them, for each
 /// observed element. An element the tree ignores, an internal role
@@ -810,18 +937,31 @@ fn accessibility(client: &mut Client, context: &Ctx, nodes: &mut [Value]) -> Res
         // One element per call, many calls in flight: the round trips, not
         // the browser's work, dominate a sequential pass.
         for chunk in elements.chunks(AX_PIPELINE) {
+            // Each element's backend id with its tree node: for an element the
+            // tree leaves out, the browser may answer with another node.
             let calls: Vec<(&str, Value)> = chunk
                 .iter()
-                .map(|(_, object)| {
-                    (
-                        "Accessibility.getPartialAXTree",
-                        json!({"objectId": object, "fetchRelatives": false}),
-                    )
+                .flat_map(|(_, object)| {
+                    [
+                        ("DOM.describeNode", json!({"objectId": object})),
+                        (
+                            "Accessibility.getPartialAXTree",
+                            json!({"objectId": object, "fetchRelatives": false}),
+                        ),
+                    ]
                 })
                 .collect();
-            for ((index, _), tree) in chunk.iter().zip(client.session_pipeline(session, &calls)) {
-                let tree = tree.map_err(cdp_error)?;
-                let Some(ax) = tree["nodes"].as_array().and_then(|n| n.first()) else {
+            let replies = client.session_pipeline(session, &calls);
+            for ((index, _), pair) in chunk.iter().zip(replies.chunks(2)) {
+                let (Ok(described), Ok(tree)) = (&pair[0], &pair[1]) else {
+                    continue;
+                };
+                let backend = &described["node"]["backendNodeId"];
+                let Some(ax) = tree["nodes"].as_array().and_then(|nodes| {
+                    nodes
+                        .iter()
+                        .find(|n| !backend.is_null() && n["backendDOMNodeId"] == *backend)
+                }) else {
                     continue;
                 };
                 if apply_accessibility(&mut nodes[*index], ax) {
@@ -1293,6 +1433,18 @@ impl Backend for BrowserBackend {
     ) -> Result<Option<Value>> {
         browser_find(snapshot, locator, expect).map(Some)
     }
+    fn storage(&self, selector: &Value, timeout: Duration, values: bool) -> Result<Value> {
+        self.read_storage(selector, timeout, values)
+    }
+    fn network(
+        &self,
+        selector: &Value,
+        limit: usize,
+        bodies: bool,
+        timeout: Duration,
+    ) -> Result<Value> {
+        self.read_network(selector, limit, bodies, timeout)
+    }
     fn lease_key(&self, _snapshot: &Value) -> Option<String> {
         // UIA/AX/AT-SPI can also operate a browser. Share one cooperating
         // input owner rather than pretending these are disjoint devices.
@@ -1323,6 +1475,8 @@ impl Backend for BrowserBackend {
             "accept",
             "dismiss",
             "upload",
+            "emulate",
+            "clear_site_data",
         ]
         .map(String::from)
         .to_vec()
@@ -1432,7 +1586,8 @@ impl Backend for BrowserBackend {
         );
         let page_id = selector["page_id"].as_str().unwrap();
         let frame_id = selector["frame_id"].as_str().unwrap();
-        self.with_page_state(page_id,deadline.saturating_duration_since(Instant::now()),|page|{
+        let attempt = || {
+            self.with_page_state(page_id,deadline.saturating_duration_since(Instant::now()),|page|{
             if let Some(dialog)=&page.dialog {
                 let main=page.main_frame.as_deref().is_none_or(|main|main==frame_id);
                 return Ok(dialog_snapshot(page_id,frame_id,main,dialog));
@@ -1461,6 +1616,13 @@ impl Backend for BrowserBackend {
             result["metadata"]=json!({"page_id":page_id,"frame_id":frame_id,"loader_id":frame["loaderId"],"context_id":context.id,"main_frame":main,"parent_frame_id":entry.parent,"out_of_process":session.is_some(),"accessibility":accessible});
             Ok(result)
         })
+        };
+        // An isolated world destroyed under the observation (navigation,
+        // context churn) is created again once, within the deadline.
+        match attempt() {
+            Err(e) if e.code == "BROWSER.CONTEXT_LOST" && Instant::now() < deadline => attempt(),
+            other => other,
+        }
     }
     fn act(
         &self,
@@ -1662,6 +1824,150 @@ impl BrowserBackend {
                 answer["region"] = json!(region);
             }
             Ok(answer)
+        })
+    }
+}
+
+/// Cookies and storage keys a storage answer lists at most.
+const MAX_COOKIES: usize = 500;
+const MAX_STORAGE_KEYS: usize = 1000;
+/// Response body characters a network answer carries per request.
+const MAX_BODY: usize = 4096;
+
+impl BrowserBackend {
+    /// The cookies the browser would send to a page or frame's address, and its
+    /// origin's localStorage keys. Read-only. Cookie values only when the
+    /// server operator allowed them; storage values never.
+    pub fn read_storage(&self, selector: &Value, timeout: Duration, values: bool) -> Result<Value> {
+        let page_id = selector["page_id"].as_str().unwrap_or_default();
+        let frame_id = selector["frame_id"].as_str().unwrap_or_default();
+        self.with_page_state(page_id, timeout, |page| {
+            if let Some(dialog) = &page.dialog {
+                return Err(dialog_open(dialog));
+            }
+            let entry = locate(page, frame_id)?;
+            let url = entry.frame["url"].as_str().unwrap_or_default().to_string();
+            let origin = entry.frame["securityOrigin"].as_str().unwrap_or_default().to_string();
+            let client = &mut page.client;
+            let session = entry.session.as_deref();
+            let found = run(client, session, "Network.getCookies", json!({"urls": [url]}))?;
+            let all = found["cookies"].as_array().cloned().unwrap_or_default();
+            let cookies: Vec<Value> = all
+                .iter()
+                .take(MAX_COOKIES)
+                .map(|cookie| {
+                    let mut listed = json!({
+                        "name": cookie["name"], "domain": cookie["domain"], "path": cookie["path"],
+                        "expires": if cookie["session"] == true { Value::Null } else { cookie["expires"].clone() },
+                        "session": cookie["session"], "http_only": cookie["httpOnly"],
+                        "secure": cookie["secure"], "same_site": cookie["sameSite"],
+                        "size": cookie["size"],
+                    });
+                    if values {
+                        listed["value"] = cookie["value"].clone();
+                    }
+                    listed
+                })
+                .collect();
+            // Storage of an opaque origin (about:blank, data:) is not readable.
+            let storage = if origin.starts_with("http://") || origin.starts_with("https://") {
+                let _ = run(client, session, "DOMStorage.enable", json!({}));
+                let items = run(
+                    client,
+                    session,
+                    "DOMStorage.getDOMStorageItems",
+                    json!({"storageId": {"securityOrigin": origin, "isLocalStorage": true}}),
+                );
+                let _ = run(client, session, "DOMStorage.disable", json!({}));
+                let items = items?;
+                let entries = items["entries"].as_array().cloned().unwrap_or_default();
+                json!({
+                    "keys": entries.iter().take(MAX_STORAGE_KEYS).map(|pair| json!({
+                        "key": pair[0], "value_length": pair[1].as_str().map(|v| v.chars().count()),
+                    })).collect::<Vec<_>>(),
+                    "count": entries.len(),
+                    "truncated": entries.len() > MAX_STORAGE_KEYS,
+                })
+            } else {
+                Value::Null
+            };
+            Ok(json!({
+                "url": aad_cdp::recording::network::redact_url(&url),
+                "origin": origin,
+                "cookies": cookies,
+                "cookie_count": all.len(),
+                "cookies_truncated": all.len() > MAX_COOKIES,
+                "cookie_values": if values { "shown" } else { "redacted: the server was not started with --allow-cookie-values" },
+                "local_storage": storage,
+            }))
+        })
+    }
+
+    /// The page's most recent requests since this session attached to it,
+    /// newest last. With `bodies`, finished text responses carry up to 4096
+    /// characters of their body, sensitive JSON fields redacted.
+    pub fn read_network(
+        &self,
+        selector: &Value,
+        limit: usize,
+        bodies: bool,
+        timeout: Duration,
+    ) -> Result<Value> {
+        let page_id = selector["page_id"].as_str().unwrap_or_default();
+        self.with_page_state(page_id, timeout, |page| {
+            page.sync_dialog();
+            let log = &page.network;
+            let skip = log.entries.len().saturating_sub(limit);
+            let mut requests: Vec<Value> = log.entries.iter().skip(skip).cloned().collect();
+            let (dropped, seen, held) = (log.dropped, log.seen, log.entries.len());
+            if bodies && page.dialog.is_none() {
+                for request in requests.iter_mut().filter(|r| {
+                    r["state"] == "finished"
+                        && r["mime_type"].as_str().is_some_and(|mime| {
+                            mime.starts_with("text/")
+                                || mime.contains("json")
+                                || mime.contains("xml")
+                                || mime.contains("javascript")
+                        })
+                }) {
+                    let body = command(
+                        &mut page.client,
+                        "Network.getResponseBody",
+                        json!({"requestId": request["request_id"]}),
+                    );
+                    request["body"] = match body {
+                        Ok(body) if body["base64Encoded"] != true => {
+                            let text = body["body"].as_str().unwrap_or_default();
+                            let mut shown = match serde_json::from_str::<Value>(text) {
+                                Ok(mut parsed) => {
+                                    aad_cdp::recording::network::redact(&mut parsed);
+                                    parsed.to_string()
+                                }
+                                Err(_) => text.to_string(),
+                            };
+                            let total = shown.chars().count();
+                            if total > MAX_BODY {
+                                shown = shown.chars().take(MAX_BODY).collect();
+                            }
+                            json!({"text": shown, "characters": total, "truncated": total > MAX_BODY})
+                        }
+                        // Evicted from the browser's buffer, or binary.
+                        _ => Value::Null,
+                    };
+                }
+            }
+            for request in &mut requests {
+                if let Some(object) = request.as_object_mut() {
+                    object.remove("started");
+                }
+            }
+            Ok(json!({
+                "requests": requests,
+                "held": held,
+                "seen": seen,
+                "dropped": dropped,
+                "since": "this session first attached to the page",
+            }))
         })
     }
 }
@@ -2058,6 +2364,23 @@ fn page(
         }
         None => None,
     };
+    // Site data belongs to the page's origin; an opaque one has none to clear.
+    let origin = match action {
+        Action::ClearSiteData {} => {
+            let tree = command(client, "Page.getFrameTree", json!({}))?;
+            let origin = tree["frameTree"]["frame"]["securityOrigin"]
+                .as_str()
+                .filter(|o| o.starts_with("http://") || o.starts_with("https://"))
+                .ok_or_else(|| {
+                    error(
+                        "CONTROL.ACTION_UNSUPPORTED",
+                        "only an http or https page has site data to clear",
+                    )
+                })?;
+            Some(origin.to_string())
+        }
+        _ => None,
+    };
     action_context.commit()?;
     let unknown = |e: AutomationError| e.with_effect("unknown");
     let operation = match action {
@@ -2082,9 +2405,93 @@ fn page(
             command(client, "Page.reload", json!({})).map_err(unknown)?;
             "Page.reload"
         }
+        Action::Emulate {
+            preset,
+            color_scheme,
+        } => {
+            emulate(client, *preset, *color_scheme).map_err(unknown)?;
+            return Ok(
+                json!({"submitted": true, "native_operation": "Emulation.setDeviceMetricsOverride",
+                    "preset": preset, "color_scheme": color_scheme,
+                    "lasts": "while this session's connection to the page lasts"}),
+            );
+        }
+        Action::ClearSiteData {} => {
+            let origin = origin.expect("looked up above");
+            run(
+                client,
+                None,
+                "Storage.clearDataForOrigin",
+                json!({"origin": origin, "storageTypes": SITE_DATA}),
+            )
+            .map_err(unknown)?;
+            return Ok(
+                json!({"submitted": true, "native_operation": "Storage.clearDataForOrigin",
+                    "origin": origin, "cleared": SITE_DATA}),
+            );
+        }
         _ => unreachable!("only page actions reach here"),
     };
     Ok(json!({"submitted": true, "native_operation": operation}))
+}
+
+/// What clear_site_data removes for the page's origin.
+const SITE_DATA: &str = "cookies,local_storage,indexeddb,cache_storage,service_workers,file_systems,websql,shared_storage,storage_buckets";
+
+/// Viewport, scale, mobile mode and touch for each device class: preset
+/// names only, so no caller supplies a size or position.
+fn emulate(
+    client: &mut Client,
+    preset: Option<crate::DevicePreset>,
+    color_scheme: Option<crate::ColorScheme>,
+) -> Result<()> {
+    use crate::DevicePreset::*;
+    let device = |width: u32, height: u32, scale: f64, mobile: bool| json!({"width": width, "height": height, "deviceScaleFactor": scale, "mobile": mobile});
+    match preset {
+        None => {}
+        Some(Reset) => {
+            command(client, "Emulation.clearDeviceMetricsOverride", json!({}))?;
+            command(
+                client,
+                "Emulation.setTouchEmulationEnabled",
+                json!({"enabled": false}),
+            )?;
+            if color_scheme.is_none() {
+                command(
+                    client,
+                    "Emulation.setEmulatedMedia",
+                    json!({"features": []}),
+                )?;
+            }
+        }
+        Some(preset) => {
+            let (metrics, touch) = match preset {
+                Desktop => (device(1366, 768, 1.0, false), false),
+                Tablet => (device(820, 1180, 2.0, true), true),
+                Mobile => (device(390, 844, 3.0, true), true),
+                Reset => unreachable!(),
+            };
+            command(client, "Emulation.setDeviceMetricsOverride", metrics)?;
+            let mut touch_params = json!({"enabled": touch});
+            if touch {
+                touch_params["maxTouchPoints"] = json!(5);
+            }
+            command(client, "Emulation.setTouchEmulationEnabled", touch_params)?;
+        }
+    }
+    if let Some(scheme) = color_scheme {
+        let value = match scheme {
+            crate::ColorScheme::Light => "light",
+            crate::ColorScheme::Dark => "dark",
+            crate::ColorScheme::NoPreference => "",
+        };
+        command(
+            client,
+            "Emulation.setEmulatedMedia",
+            json!({"features": [{"name": "prefers-color-scheme", "value": value}]}),
+        )?;
+    }
+    Ok(())
 }
 
 impl Drop for BrowserBackend {
@@ -2535,6 +2942,10 @@ mod tests {
             cdp_error(aad_cdp::CdpError::Interrupted(DIALOG_OPENING.into())).code,
             "CONTROL.DIALOG_OPEN"
         );
+        let lost = cdp_error(aad_cdp::CdpError::protocol(
+            r#"{"code":-32000,"message":"Cannot find context with specified id"}"#,
+        ));
+        assert_eq!((lost.code.as_str(), lost.retryable), ("BROWSER.CONTEXT_LOST", true));
     }
     #[test]
     fn keys_are_allowlisted_without_arbitrary_cdp_parameters() {
@@ -2749,6 +3160,51 @@ mod tests {
                 "CONTROL.LOCATOR_UNSUPPORTED"
             );
         }
+    }
+
+    #[test]
+    fn the_network_log_follows_requests_redirects_and_failures_within_its_bound() {
+        let mut log = NetworkLog::default();
+        let sent = |id: &str, url: &str, at: f64| {
+            json!({"method": REQUEST_SENT, "params": {"requestId": id, "type": "Fetch",
+                "timestamp": at, "wallTime": 1.0, "request": {"method": "GET", "url": url}}})
+        };
+        assert!(log.apply(&sent("1", "http://a.test/api?token=s3cret&page=2", 1.0)));
+        assert!(log.apply(
+            &json!({"method": RESPONSE_RECEIVED, "params": {"requestId": "1",
+            "response": {"status": 200, "mimeType": "application/json", "fromDiskCache": true}}})
+        ));
+        assert!(log.apply(
+            &json!({"method": LOADING_FINISHED, "params": {"requestId": "1",
+            "timestamp": 1.25, "encodedDataLength": 42}})
+        ));
+        let first = &log.entries[0];
+        assert_eq!(first["state"], "finished");
+        assert_eq!(first["status"], 200);
+        assert_eq!(first["duration_ms"], 250.0);
+        assert_eq!(first["from_cache"], true);
+        let url = first["url"].as_str().unwrap();
+        assert!(!url.contains("s3cret") && url.contains("page=2"), "{url}");
+        // A redirect reuses the id: the first hop is closed, a new entry opens.
+        log.apply(&sent("2", "http://a.test/old", 2.0));
+        let mut hop = sent("2", "http://a.test/new", 2.1);
+        hop["params"]["redirectResponse"] = json!({"status": 301});
+        log.apply(&hop);
+        log.apply(
+            &json!({"method": LOADING_FAILED, "params": {"requestId": "2",
+            "timestamp": 2.2, "errorText": "net::ERR_ABORTED", "canceled": true}}),
+        );
+        assert_eq!(log.entries[1]["state"], "redirected");
+        assert_eq!(log.entries[1]["status"], 301);
+        assert_eq!(log.entries[2]["state"], "failed");
+        assert_eq!(log.entries[2]["error"], "net::ERR_ABORTED");
+        assert!(!log.apply(&json!({"method": DIALOG_OPENING, "params": {}})));
+        for n in 0..MAX_REQUESTS {
+            log.apply(&sent(&format!("x{n}"), "http://a.test/", 3.0));
+        }
+        assert_eq!(log.entries.len(), MAX_REQUESTS);
+        assert_eq!(log.dropped, 3);
+        assert_eq!(log.seen, MAX_REQUESTS as u64 + 3);
     }
 
     #[test]

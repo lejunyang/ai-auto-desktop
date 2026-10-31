@@ -42,7 +42,7 @@
     if (checkable(el)) result.push('check');
     if (scrollable(el)) result.push('scroll');
     if (draggable(el)) result.push('drag');
-    if (el===document.body) result.push('navigate','back','forward','reload','open_tab','activate_page','close_page');
+    if (el===document.body) result.push('navigate','back','forward','reload','open_tab','activate_page','close_page','emulate','clear_site_data');
     return result;
   };
   const check = args => {

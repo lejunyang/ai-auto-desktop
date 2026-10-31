@@ -165,6 +165,19 @@ fn action_schema() -> Value {
                 "items": {"type": "string", "minLength": 1, "maxLength": 4096}
             }
         }), &["files"]),
+        variant("emulate", "Emulate a device class and/or colour scheme on the observed \
+    browser page, offered on its document node of the main frame. Lasts while this session's \
+    connection to the page does; reset returns to the browser's own window.", json!({
+            "preset": {"enum": ["desktop", "tablet", "mobile", "reset"], "description": "desktop \
+    1366x768; tablet 820x1180 at 2x with touch; mobile 390x844 at 3x with touch (a page \
+    without a viewport tag still lays out 980 CSS pixels wide, as on a phone); reset clears \
+    the emulation."},
+            "color_scheme": {"enum": ["light", "dark", "no_preference"], "description": "The \
+    prefers-color-scheme the page sees."}
+        }), &[]),
+        variant("clear_site_data", "Clear the observed browser page's site data -- cookies, \
+    localStorage, IndexedDB, cache storage, service workers -- for its origin. Offered on the \
+    page's document node of the main frame; a later reload starts signed out.", json!({}), &[]),
     ]})
 }
 
@@ -485,6 +498,10 @@ browser pages. Observe with view mode outline."
         "CONTROL.OCCLUDED" => {
             "Something is laid over the element, such as a dialog, a banner or a menu, so pointer input would land on that instead. Observe again and deal with what covers it, or use a plain click (DOM activation) if that is enough."
         }
+        "BROWSER.CONTEXT_LOST" => {
+            "The page was between documents (navigating or replacing a frame) while it was \
+being looked at. Observe again; control_wait keeps polling through this by itself."
+        }
         "CONTROL.FOCUS_LOST" | "CONTROL.FOCUS_FAILED" => {
             "Keyboard focus is not (or no longer) on the observed element, so further keys \
 would land elsewhere; details.typed says how many characters were sent. Observe again, \
@@ -687,6 +704,19 @@ mod tests {
             &session,
         )
         .is_err());
+    }
+
+    #[test]
+    fn emulation_takes_preset_names_never_sizes_or_positions() {
+        let emulate = variant("emulate");
+        let mut fields: Vec<&String> = emulate["properties"].as_object().unwrap().keys().collect();
+        fields.sort();
+        assert_eq!(fields, ["color_scheme", "preset", "type"]);
+        assert_eq!(
+            emulate["properties"]["preset"]["enum"],
+            json!(["desktop", "tablet", "mobile", "reset"])
+        );
+        assert_eq!(variant("clear_site_data")["required"], json!(["type"]));
     }
 
     #[test]

@@ -21,6 +21,9 @@ pub struct Grants {
     /// Without it every upload is refused.
     #[arg(long = "allow-upload-dir", value_name = "DIR")]
     upload_dirs: Vec<std::path::PathBuf>,
+    /// Let browser_storage show cookie values. Without it names and flags only.
+    #[arg(long)]
+    allow_cookie_values: bool,
 }
 impl Grants {
     fn policy(&self, allow_input: bool) -> Policy {
@@ -33,6 +36,7 @@ impl Grants {
                 Some(self.resources.iter().cloned().collect::<BTreeSet<_>>())
             },
             upload_roots: self.upload_dirs.clone(),
+            allow_cookie_values: self.allow_cookie_values,
         }
     }
 }
@@ -99,6 +103,7 @@ pub fn mcp(args: &McpArgs) -> std::io::Result<()> {
             || !args.grants.resources.is_empty()
             || args.grants.browser_port.is_some()
             || !args.grants.upload_dirs.is_empty()
+            || args.grants.allow_cookie_values
         {
             return Err(invalid("remote grants must be configured on the remote server; local flags cannot replace them"));
         }
@@ -158,6 +163,29 @@ mod tests {
                 std::path::PathBuf::from("C:/uploads"),
                 std::path::PathBuf::from("D:/more")
             ]
+        );
+    }
+    #[test]
+    fn cookie_values_stay_redacted_unless_the_operator_allows_them() {
+        #[derive(clap::Parser)]
+        struct Cli {
+            #[command(flatten)]
+            grants: Grants,
+        }
+        use clap::Parser;
+        assert!(
+            !Cli::try_parse_from(["aad"])
+                .unwrap()
+                .grants
+                .policy(false)
+                .allow_cookie_values
+        );
+        assert!(
+            Cli::try_parse_from(["aad", "--allow-cookie-values"])
+                .unwrap()
+                .grants
+                .policy(false)
+                .allow_cookie_values
         );
     }
     #[test]

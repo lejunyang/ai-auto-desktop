@@ -230,11 +230,40 @@ pub enum Action {
     Upload {
         files: Vec<String>,
     },
+    /// Emulate a device class and/or colour scheme on the observed page, for
+    /// as long as this session's connection to it lasts.
+    Emulate {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        preset: Option<DevicePreset>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        color_scheme: Option<ColorScheme>,
+    },
+    /// Clear the observed page's site data: cookies and storage of its origin.
+    ClearSiteData {},
+}
+
+/// A device class to emulate: viewport, scale and touch come from the preset.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DevicePreset {
+    Desktop,
+    Tablet,
+    Mobile,
+    /// Back to the browser's own window.
+    Reset,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ColorScheme {
+    Light,
+    Dark,
+    NoPreference,
 }
 
 pub const MAX_UPLOAD_FILES: usize = 32;
 
-pub const ACTION_NAMES: [&str; 21] = [
+pub const ACTION_NAMES: [&str; 23] = [
     "focus",
     "invoke",
     "click",
@@ -256,10 +285,12 @@ pub const ACTION_NAMES: [&str; 21] = [
     "accept",
     "dismiss",
     "upload",
+    "emulate",
+    "clear_site_data",
 ];
 
 /// Actions on the page as a whole, offered on its document node.
-pub const PAGE_ACTIONS: [&str; 7] = [
+pub const PAGE_ACTIONS: [&str; 9] = [
     "navigate",
     "back",
     "forward",
@@ -267,6 +298,8 @@ pub const PAGE_ACTIONS: [&str; 7] = [
     "open_tab",
     "activate_page",
     "close_page",
+    "emulate",
+    "clear_site_data",
 ];
 
 /// Page actions that address the browser's tabs rather than one document.
@@ -304,6 +337,8 @@ impl Action {
             Self::Accept { .. } => "accept",
             Self::Dismiss {} => "dismiss",
             Self::Upload { .. } => "upload",
+            Self::Emulate { .. } => "emulate",
+            Self::ClearSiteData {} => "clear_site_data",
         }
     }
     /// A left single click at the centre needs nothing beyond a plain click.

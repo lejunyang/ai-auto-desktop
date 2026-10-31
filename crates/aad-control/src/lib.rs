@@ -57,6 +57,26 @@ pub trait Backend: Send + Sync {
             "this provider cannot take screenshots",
         ))
     }
+    /// Cookies and storage keys of a resource, read-only; browsers only.
+    fn storage(&self, _selector: &Value, _timeout: Duration, _values: bool) -> Result<Value> {
+        Err(error(
+            "CONTROL.ACTION_UNSUPPORTED",
+            "this provider has no site storage",
+        ))
+    }
+    /// Recent network requests of a resource, read-only; browsers only.
+    fn network(
+        &self,
+        _selector: &Value,
+        _limit: usize,
+        _bodies: bool,
+        _timeout: Duration,
+    ) -> Result<Value> {
+        Err(error(
+            "CONTROL.ACTION_UNSUPPORTED",
+            "this provider records no network requests",
+        ))
+    }
     fn resources(&self, timeout: Duration) -> Result<Vec<BackendResource>>;
     fn observe(&self, selector: &Value, max_nodes: usize, timeout: Duration) -> Result<Value>;
     /// Shape a retained snapshot for the caller. `None` uses the portable
@@ -95,6 +115,8 @@ pub struct Policy {
     /// Directories whose files an `upload` may hand to a page. Empty refuses
     /// every upload; a client can neither extend nor see past them.
     pub upload_roots: Vec<std::path::PathBuf>,
+    /// Whether browser_storage may show cookie values. Off: names and flags only.
+    pub allow_cookie_values: bool,
 }
 
 #[derive(Clone)]
@@ -294,6 +316,62 @@ impl Session {
         browser.downloads(timeout)
     }
 
+    /// A listed resource's provider and selector, under this session's grants.
+    fn readable(&self, resource_id: &str) -> Result<(Arc<dyn Backend>, Value)> {
+        if self.closed.load(Ordering::SeqCst) || self.created.elapsed() >= self.lifetime {
+            return Err(error(
+                "CONTROL.SESSION_CLOSED",
+                "session is closed or expired",
+            ));
+        }
+        let item = self
+            .state
+            .lock()
+            .unwrap()
+            .resources
+            .get(resource_id)
+            .cloned()
+            .ok_or_else(|| {
+                error(
+                    "CONTROL.TARGET_UNKNOWN",
+                    "list targets before reading a resource",
+                )
+            })?;
+        if !self.allowed_provider(&item.resource.provider) || !self.allowed_resource(resource_id) {
+            return Err(error(
+                "POLICY.DENIED",
+                "the resource is outside this session's grant",
+            ));
+        }
+        Ok((
+            self.backends[&item.resource.provider].clone(),
+            item.selector,
+        ))
+    }
+
+    /// Cookies (values only under the operator's grant) and localStorage keys
+    /// of a listed browser page or frame. Read-only.
+    pub fn browser_storage(&self, resource_id: &str, timeout: Duration) -> Result<Value> {
+        let (backend, selector) = self.readable(resource_id)?;
+        let _gate = self.gate.lock().unwrap();
+        backend.storage(&selector, timeout, self.policy.allow_cookie_values)
+    }
+
+    /// The recent requests of a listed browser page. Read-only.
+    pub fn browser_network(
+        &self,
+        resource_id: &str,
+        limit: usize,
+        bodies: bool,
+        timeout: Duration,
+    ) -> Result<Value> {
+        if limit == 0 || limit > 500 {
+            return Err(error("CONTROL.INVALID_REQUEST", "limit must be in 1..500"));
+        }
+        let (backend, selector) = self.readable(resource_id)?;
+        let _gate = self.gate.lock().unwrap();
+        backend.network(&selector, limit, bodies, timeout)
+    }
     /// The CDP port the browser provider works with, if one is attached.
     pub fn browser_port(&self) -> Option<u16> {
         self.browser.as_ref().and_then(|b| b.attached_port())
@@ -535,7 +613,7 @@ impl Session {
             Operation::Capabilities {} => Ok(
                 json!({"session_id": self.id, "protocol_version": PROTOCOL_VERSION,
                 "expires_in_ms": self.lifetime.saturating_sub(self.created.elapsed()).as_millis(),
-                "allow_input": self.policy.allow_input,"upload_dirs": self.policy.upload_roots,"observation_retention":"until_next_observation_or_input_attempt","observation_ttl_ms":self.observation_ttl.as_millis(),"max_requests":self.max_requests,"input_lease":"exclusive_cooperating_session","input_lease_scope":"os_user","providers": self.backends.values().filter(|b| self.allowed_provider(b.name()))
+                "allow_input": self.policy.allow_input,"upload_dirs": self.policy.upload_roots,"cookie_values": self.policy.allow_cookie_values,"observation_retention":"until_next_observation_or_input_attempt","observation_ttl_ms":self.observation_ttl.as_millis(),"max_requests":self.max_requests,"input_lease":"exclusive_cooperating_session","input_lease_scope":"os_user","providers": self.backends.values().filter(|b| self.allowed_provider(b.name()))
                     .map(|b| json!({"provider": b.name(), "actions": b.capabilities()})).collect::<Vec<_>>(),
                 "unavailable": self.failures}),
             ),
@@ -973,7 +1051,19 @@ impl Session {
         loop {
             polls += 1;
             let (observation_id, observation) =
-                self.observe_resource(resource_id, max_nodes, context)?;
+                match self.observe_resource(resource_id, max_nodes, context) {
+                    Ok(observed) => observed,
+                    // The page was between documents: keep polling.
+                    Err(e) if e.code == "BROWSER.CONTEXT_LOST" => {
+                        let remaining = context.remaining()?;
+                        if remaining < interval + Duration::from_millis(200) {
+                            return Err(e.with_detail("polls", json!(polls)));
+                        }
+                        std::thread::sleep(interval.min(remaining));
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                };
             let (outcome, ambiguous) = match self.find_in(
                 &observation_id,
                 &observation,
@@ -1163,6 +1253,16 @@ fn validate_action(action: &Action) -> Result<()> {
                 "upload takes 1..32 file paths of at most 4096 characters",
             ));
         }
+    }
+    if let Action::Emulate {
+        preset: None,
+        color_scheme: None,
+    } = action
+    {
+        return Err(error(
+            "CONTROL.INVALID_REQUEST",
+            "emulate needs a preset, a color_scheme or both",
+        ));
     }
     if let Action::Key { keys } = action {
         if keys.is_empty() || keys.len() > 6 || keys.iter().any(|s| s.is_empty() || s.len() > 32) {

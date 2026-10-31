@@ -111,6 +111,9 @@ impl Fixture {
                             "<!doctype html><input aria-label='FrameInput' onkeydown=\"document.getElementById('fs').value='key:'+event.key+':'+event.isTrusted\"><button aria-label='FrameButton' onmousedown=\"document.getElementById('fs').value='down:'+event.isTrusted\">Press</button><output id='fs' aria-label='FrameStatus'>ready</output><div style='height:900px'></div>"
                         } else if request.starts_with("GET /xframe") {
                             "<!doctype html><body style='margin:0'><input aria-label='CrossInput' onkeydown=\"document.getElementById('cs').value='key:'+event.key+':'+event.isTrusted\"><button aria-label='CrossButton' onmousedown=\"document.getElementById('cs').value='down:'+event.button+':'+event.isTrusted\">Press</button><output id='cs' aria-label='CrossStatus'>ready</output><div style='height:900px'></div></body>"
+                        } else if request.starts_with("GET /api") {
+                            headers = "Content-Type: application/json";
+                            r#"{"ok":true,"password":"hunter2"}"#
                         } else if request.starts_with("GET /second") {
                             "<!doctype html><title>Second</title><body><p aria-label='Second marker'>second</p></body>"
                         } else {
@@ -958,6 +961,172 @@ fn pages_read_as_regions_text_and_accessible_names_and_locators_narrow() {
     );
 }
 
+fn page_value(fixture: &Fixture, expression: &str) -> Value {
+    fixture.client().eval(expression).unwrap()["result"]["value"].clone()
+}
+
+#[test]
+#[ignore = "requires isolated Chromium with its sandbox enabled; CI runs it explicitly"]
+fn pages_emulate_devices_list_storage_and_requests_and_clear_site_data() {
+    let _serial = serial();
+    let fixture = Fixture::new();
+    let (session, _) = session_for(&fixture);
+    let main = main_of(&session, &fixture.page_id);
+    let loaded = wait_until(&session, &main, "Name", WaitCondition::Appears);
+    assert!(loaded.error.is_none(), "{loaded:?}");
+    let observed = observe(&session, &main);
+    for action in ["emulate", "clear_site_data"] {
+        assert!(observed["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|n| n["role"] == "document"
+                && n["capabilities"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|a| a == action)));
+    }
+    // A phone in dark mode, then back.
+    let body = document(&session, &observed);
+    let refused = act(
+        &session,
+        body,
+        Action::Emulate {
+            preset: None,
+            color_scheme: None,
+        },
+    );
+    assert_eq!(refused.error.unwrap()["code"], "CONTROL.INVALID_REQUEST");
+    let body = document(&session, &observe(&session, &main));
+    let phone = act(
+        &session,
+        body,
+        Action::Emulate {
+            preset: Some(DevicePreset::Mobile),
+            color_scheme: Some(ColorScheme::Dark),
+        },
+    );
+    assert!(phone.error.is_none(), "{phone:?}");
+    // A page without a viewport tag lays out at 980 CSS pixels, as on a phone.
+    assert_eq!(page_value(&fixture, "screen.width"), 390);
+    assert_eq!(
+        page_value(
+            &fixture,
+            "matchMedia('(prefers-color-scheme: dark)').matches"
+        ),
+        true
+    );
+    assert_eq!(page_value(&fixture, "navigator.maxTouchPoints"), 5);
+    let body = document(&session, &observe(&session, &main));
+    let reset = act(
+        &session,
+        body,
+        Action::Emulate {
+            preset: Some(DevicePreset::Reset),
+            color_scheme: None,
+        },
+    );
+    assert!(reset.error.is_none(), "{reset:?}");
+    assert_ne!(page_value(&fixture, "screen.width"), 390);
+
+    // Storage: cookie names and flags, values only under the operator's grant.
+    page_value(
+        &fixture,
+        "document.cookie='theme=dark; path=/'; localStorage.setItem('cart','3 items'); true",
+    );
+    let stored = session
+        .browser_storage(&main, Duration::from_secs(5))
+        .unwrap();
+    let theme = stored["cookies"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == "theme")
+        .cloned()
+        .unwrap_or_else(|| panic!("{stored}"));
+    assert!(theme.get("value").is_none(), "{theme}");
+    assert_eq!(theme["path"], "/");
+    let cart = &stored["local_storage"]["keys"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|k| k["key"] == "cart")
+        .cloned()
+        .unwrap();
+    assert_eq!(cart["value_length"], 7);
+    assert!(cart.get("value").is_none());
+    let trusted = Session::new(
+        vec![Arc::new(BrowserBackend::new(fixture.port))],
+        Policy {
+            allow_cookie_values: true,
+            ..Default::default()
+        },
+    );
+    let trusted_main = main_of(&trusted, &fixture.page_id);
+    let shown = trusted
+        .browser_storage(&trusted_main, Duration::from_secs(5))
+        .unwrap();
+    assert!(shown["cookies"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|c| c["name"] == "theme" && c["value"] == "dark"));
+    drop(trusted);
+
+    // Requests the page made since this session attached, bodies on request.
+    page_value(
+        &fixture,
+        "fetch('/api?token=secret&page=2').then(r => r.text()).then(() => true)",
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let api = loop {
+        let listed = session
+            .browser_network(&main, 50, true, Duration::from_secs(5))
+            .unwrap();
+        if let Some(found) = listed["requests"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["url"].as_str().unwrap().contains("/api") && r["state"] == "finished")
+        {
+            break found.clone();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no finished api request: {listed}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert_eq!(api["method"], "GET");
+    assert_eq!(api["status"], 200);
+    assert_eq!(api["mime_type"], "application/json");
+    let url = api["url"].as_str().unwrap();
+    assert!(!url.contains("secret") && url.contains("page=2"), "{url}");
+    let body = api["body"]["text"].as_str().unwrap();
+    assert!(
+        body.contains("\"ok\":true") && !body.contains("hunter2"),
+        "{body}"
+    );
+    assert_eq!(
+        session
+            .browser_network(&main, 0, false, Duration::from_secs(5))
+            .unwrap_err()
+            .code,
+        "CONTROL.INVALID_REQUEST"
+    );
+
+    // Clearing site data takes the cookies and storage with it.
+    let body = document(&session, &observe(&session, &main));
+    let cleared = act(&session, body, Action::ClearSiteData {});
+    assert!(cleared.error.is_none(), "{cleared:?}");
+    let after = session
+        .browser_storage(&main, Duration::from_secs(5))
+        .unwrap();
+    assert_eq!(after["cookies"], json!([]), "{after}");
+    assert_eq!(after["local_storage"]["count"], 0, "{after}");
+}
+
 #[test]
 #[ignore = "requires isolated Chromium with its sandbox enabled; CI runs it explicitly"]
 fn wait_returns_an_element_that_appears_after_a_timer_ready_to_act_on() {
@@ -1474,12 +1643,9 @@ fn browser_actions_are_observed_document_bound_and_have_real_page_effects() {
     let resources = loop {
         let response = call(&session, Operation::Targets {});
         let data = response.data.unwrap();
-        if data["resources"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|r| r["metadata"]["main_frame"] == false)
-        {
+        if data["resources"].as_array().unwrap().iter().any(|r| {
+            r["metadata"]["main_frame"] == false && r["metadata"]["out_of_process"] == false
+        }) {
             break data;
         }
         assert!(Instant::now() < deadline, "iframe did not load: {data}");
@@ -1497,7 +1663,7 @@ fn browser_actions_are_observed_document_bound_and_have_real_page_effects() {
         .as_array()
         .unwrap()
         .iter()
-        .find(|r| r["metadata"]["main_frame"] == false)
+        .find(|r| r["metadata"]["main_frame"] == false && r["metadata"]["out_of_process"] == false)
         .unwrap()["resource_id"]
         .as_str()
         .unwrap();
