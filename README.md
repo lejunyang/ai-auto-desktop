@@ -324,6 +324,9 @@ aad mcp --allow-input    # 由启动它的人授予输入
 （默认保留原值，`redact_network` 才抹掉敏感字段）、WebSocket 消息和关键时刻的截图，停止时给出写入的目录和文件。
 `browser_open` 带 `record` 时在打开网址之前就开始记录。这些是过程数据，据此写技能、筛接口由 Agent 自己做。
 `browser_downloads`（只读）列出浏览器下载到本会话专用目录的文件：网址、建议文件名、状态、字节数和保存路径。
+`browser_storage`（只读）列出一个页面/frame 资源的 cookie 名称与属性及 localStorage 键（cookie 值需服务端 `--allow-cookie-values`）；
+`browser_network`（只读）列出页面最近的请求（状态、MIME、耗时，可选带打码后的正文）。控制动作另有 `emulate`（desktop/tablet/mobile/reset 与配色）和 `clear_site_data`，
+`control_observe` 的 `view.mode` 另有 `text`（页面或区域的可见文字与表格）。
 
 一个例子：打开浏览器到登录页 → `control_capture` 二维码发给人扫 → 隔几秒比对 digest，变了就重发 →
 登录后在页面上操作 → `browser_record_stop` → 读 `evidence/network.jsonl` 找到返回订单数据的接口。
