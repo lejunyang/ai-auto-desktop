@@ -170,9 +170,10 @@ jobs:
 
       # Where the runner grants Accessibility, input is checked by its
       # effect: the pointer lands where a viewer points (as the system
-      # reports it), and text typed into TextEdit, selected with Cmd+A and
-      # copied with Cmd+C through assist, is what pbpaste then reads. No
-      # AppleScript: a runner does not grant Automation of other apps.
+      # reports it); text typed into TextEdit and saved with Cmd+S through
+      # assist is the file's text, Cmd+A then typing replaces it, and Cmd+A
+      # Cmd+C puts it where pbpaste reads it. No AppleScript: a runner does
+      # not grant Automation of other apps.
       - name: Check assist input on the macOS desktop
         if: runner.os == 'macOS'
         shell: bash
@@ -210,6 +211,10 @@ jobs:
                   viewer.send({"type": "key", "action": "up", "key": key, "code": code})
                   viewer.send({"type": "key", "action": "up", "key": "Meta", "code": "MetaLeft"})
                   time.sleep(0.5)
+              def saved():
+                  chord("KeyS", "s")
+                  time.sleep(1)
+                  return open("/tmp/assist-note.txt").read()
               def copied():
                   chord("KeyA", "a")
                   chord("KeyC", "c")
@@ -218,14 +223,19 @@ jobs:
               pointer = cursor_near(0.25, 0.75)
               viewer.send({"type": "text", "text": "typed through assist"})
               time.sleep(1)
-              typed = copied()
+              typed = saved()
+              chord("KeyA", "a")
               viewer.send({"type": "text", "text": "replaced"})
               time.sleep(1)
-              replaced = copied()
+              replaced = saved()
+              clipboard = copied()
               viewer.close()
-              result = {"pointer_lands": pointer, "typed": typed, "cmd_a_then_typing": replaced}
+              # TextEdit capitalises the first letter of a sentence.
+              result = {"pointer_lands": pointer, "typed": typed, "cmd_a_then_typing": replaced,
+                        "cmd_a_cmd_c_copies": clipboard}
               print(json.dumps(result))
-              assert pointer and typed == "typed through assist" and replaced == "replaced", result
+              assert pointer and typed.lower() == "typed through assist" and replaced.lower() == "replaced", result
+              assert clipboard == replaced, result
           finally:
               assist.terminate()
               subprocess.run(["pkill", "-x", "TextEdit"])
