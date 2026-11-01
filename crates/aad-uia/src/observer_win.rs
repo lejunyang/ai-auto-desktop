@@ -545,3 +545,13 @@ fn observe_pump(
         let _ = unsafe { automation.RemovePropertyChangedEventHandler(root, &property_handler) };
     }
 }
+
+impl crate::observe_session::ObserveSource for ObserverSession {
+    fn drain(&self, max: usize) -> (Vec<crate::observe::ObservedEvent>, u64) {
+        self.drain(max)
+    }
+
+    fn sources(&self) -> Vec<String> {
+        self.sources.iter().map(|name| name.to_string()).collect()
+    }
+}

@@ -1,0 +1,200 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Assist</title>
+<style>
+:root{color-scheme:light dark;--bg:#f6f6f4;--fg:#1d1d1b;--muted:#6b6b66}
+@media (prefers-color-scheme:dark){:root{--bg:#161615;--fg:#ecece8;--muted:#9a9a93}}
+body{margin:0;background:var(--bg);color:var(--fg);font:14px system-ui,sans-serif;display:flex;flex-direction:column;height:100vh}
+header{padding:8px 16px;color:var(--muted);display:flex;gap:12px;align-items:center}
+#take{display:none;font:inherit;padding:2px 10px;border-radius:6px;border:1px solid var(--muted);background:transparent;color:var(--fg);cursor:pointer}
+main{flex:1;display:flex;align-items:center;justify-content:center;min-height:0;padding:0 16px 16px;position:relative}
+#pointer{position:fixed;pointer-events:none;display:none;image-rendering:auto}
+#keys{position:fixed;left:0;top:0;width:2px;height:1.2em;opacity:0;border:0;padding:0;margin:0;resize:none;overflow:hidden;font-size:16px}
+canvas{max-width:100%;max-height:100%;outline:none;cursor:crosshair;box-shadow:0 1px 6px rgba(0,0,0,.25)}
+</style></head><body>
+<header><span id="status">Connecting…</span><button id="take" type="button">Take control</button></header>
+<main><canvas id="screen" tabindex="0" aria-label="Shared screen" width="1" height="1"></canvas><img id="pointer" alt=""></main>
+<textarea id="keys" aria-label="Keyboard for the shared screen" autocomplete="off" autocapitalize="off" spellcheck="false"></textarea>
+<script>
+const token=new URLSearchParams(location.search).get('token');
+const socket=new WebSocket(`ws://${location.host}/ws?token=${token}`);
+socket.binaryType='arraybuffer';
+const screen=document.getElementById('screen'), status=document.getElementById('status'), pen=screen.getContext('2d');
+const send=m=>socket.readyState===1&&socket.send(JSON.stringify(m));
+const MIME={1:'image/jpeg',2:'image/webp'};
+const VIDEO={3:'h264',4:'vp9',5:'av1'}, TILES=6;
+// A representative stream of each codec; the exact one is checked again when it starts.
+const PROBE={h264:'avc1.42E01F',vp9:'vp09.00.41.08',av1:'av01.0.08M.08'};
+let decodable=[], refused=new Set(), video=null, source='', kind='', mode='';
+const show=()=>status.textContent=mode;
+const size=(w,h)=>{if(screen.width!==w||screen.height!==h){screen.width=w;screen.height=h;}};
+// WebCodecs exists only in secure contexts: localhost, or a host serving this over https.
+async function probe(){
+  if(!('VideoDecoder' in window)) return [];
+  const found=[];
+  for(const [name,codec] of Object.entries(PROBE)){
+    try{if((await VideoDecoder.isConfigSupported({codec})).supported) found.push(name);}catch{}
+  }
+  return found;
+}
+// Tiles first: with a video codec behind them the server sends small changes as
+// patches and large or rapid ones as video.
+const hello=()=>send({type:'hello',accept:['tiles',...decodable.filter(c=>!refused.has(c)),'webp','jpeg']});
+socket.onopen=async()=>{decodable=await probe();hello();};
+function stop(){if(video&&video.decoder.state!=='closed') video.decoder.close();video=null;}
+async function stream(m){
+  stop();
+  const config={codec:m.webcodecs,optimizeForLatency:true};
+  let ok=false;
+  try{ok=(await VideoDecoder.isConfigSupported(config)).supported;}catch{}
+  if(!ok){refused.add(m.codec);hello();return;}
+  // Frames come out in the order they went in, each with where it changed.
+  const regions=[];
+  const decoder=new VideoDecoder({
+    output:f=>{
+      const only=regions.shift();
+      size(f.displayWidth,f.displayHeight);
+      if(only) for(const r of only) pen.drawImage(f,r.x,r.y,r.w,r.h,r.x,r.y,r.w,r.h);
+      else pen.drawImage(f,0,0);
+      f.close();},
+    error:e=>{status.textContent='Video decoding failed: '+e.message;stop();send({type:'keyframe'});}});
+  decoder.configure(config);
+  video={decoder,codec:m.codec,started:false,regions};
+  videoLabel=`${m.codec} (${m.encoder})`;label();
+}
+// Patches over the picture already drawn: copies of pixels it has (a scroll)
+// and pictures of what changed, all decoded before any is drawn.
+async function tiles(buffer){
+  const head=new DataView(buffer), skip=head.getUint16(12), key=(head.getUint8(2)&1)===1;
+  const data=new DataView(buffer,skip), count=data.getUint16(0), patches=[];
+  let at=2;
+  for(let i=0;i<count;i++){
+    const kind=data.getUint8(at), p={kind,x:data.getUint16(at+2),y:data.getUint16(at+4),w:data.getUint16(at+6),h:data.getUint16(at+8)};
+    at+=10;
+    if(kind===2){p.sx=data.getUint16(at);p.sy=data.getUint16(at+2);at+=4;}
+    else{const len=data.getUint32(at);p.picture=createImageBitmap(new Blob([new Uint8Array(buffer,skip+at+4,len)],{type:'image/webp'}));at+=4+len;}
+    patches.push(p);
+  }
+  const pictures=await Promise.all(patches.map(p=>p.picture));
+  if(key) size(head.getUint32(4),head.getUint32(8));
+  patches.forEach((p,i)=>{
+    if(p.kind===2) pen.drawImage(screen,p.sx,p.sy,p.w,p.h,p.x,p.y,p.w,p.h);
+    else{pen.drawImage(pictures[i],p.x,p.y,p.w,p.h);pictures[i].close();}
+  });
+}
+// The remote pointer, drawn over the picture at its scale.
+const pointer=document.getElementById('pointer');
+let cursor=null;
+function place(){
+  if(!cursor||!cursor.visible||!cursor.shape){pointer.style.display='none';return;}
+  const r=screen.getBoundingClientRect(), k=r.width/cursor.shape.screen[0];
+  pointer.style.width=cursor.shape.width*k+'px';pointer.style.height=cursor.shape.height*k+'px';
+  pointer.style.left=r.left+cursor.x*r.width-cursor.shape.hotspot[0]*k+'px';
+  pointer.style.top=r.top+cursor.y*r.height-cursor.shape.hotspot[1]*k+'px';
+  pointer.style.display='block';
+}
+function moved(m){
+  if(m.shape){pointer.src='data:image/png;base64,'+m.shape.png;cursor={...m};}
+  else cursor=cursor?{...cursor,x:m.x,y:m.y,visible:m.visible}:null;
+  place();
+}
+addEventListener('resize',place);
+// Flag bit 1: a list of regions follows the fixed header; only those changed.
+function regionsOf(head){
+  if(!(head.getUint8(2)&2)) return null;
+  const list=[];
+  for(let i=0,n=head.getUint16(24);i<n;i++){
+    const at=26+8*i;
+    list.push({x:head.getUint16(at),y:head.getUint16(at+2),w:head.getUint16(at+4),h:head.getUint16(at+6)});
+  }
+  return list;
+}
+function chunk(buffer){
+  const head=new DataView(buffer), codec=VIDEO[head.getUint8(1)], key=(head.getUint8(2)&1)===1;
+  if(!video||video.codec!==codec||video.decoder.state!=='configured') return;
+  if(!video.started&&!key) return; // a decoder starts at a keyframe
+  video.started=true;
+  video.regions.push(regionsOf(head));
+  video.decoder.decode(new EncodedVideoChunk({type:key?'key':'delta',
+    timestamp:Number(head.getBigUint64(16))*1000,data:new Uint8Array(buffer,head.getUint16(12))}));
+}
+async function picture(buffer){
+  const head=new DataView(buffer);
+  if(video) stop();
+  const picture=await createImageBitmap(new Blob([new Uint8Array(buffer,head.getUint16(12))],{type:MIME[head.getUint8(1)]}));
+  size(picture.width,picture.height);pen.drawImage(picture,0,0);picture.close();
+}
+let modeLabel='', videoLabel='', hint='';
+// Several people may watch; one at a time controls, and any can take over.
+const take=document.getElementById('take');
+take.addEventListener('click',()=>send({type:'take'}));
+function label(){mode=[source,modeLabel,videoLabel].filter(Boolean).join(' · ')+hint;show();}
+function control(m){
+  if(m.type==='ready'){kind=m.view_only?'':m.source.kind;source=(m.view_only?'Viewing ':'Sharing ')+m.source.kind;hint=m.view_only?'':' — click the picture to control it';label();}
+  if(m.type==='mode'){modeLabel=m.mode.codec+(m.mode.video?' + '+m.mode.video:'');if(!m.mode.video&&m.mode.codec!=='tiles') videoLabel='';label();}
+  if(m.type==='stream') return stream(m);
+  if(m.type==='cursor') return moved(m);
+  if(m.type==='control'&&kind){
+    hint=m.you?' — click the picture to control it':' — another viewer has control';
+    take.style.display=m.you?'none':'inline-block';label();}
+  if(m.type==='clipboard') return copied(m);
+  if(m.type==='error') status.textContent=m.message;
+}
+// Messages are handled in order, so a stream's first frames wait for its decoder.
+// Pictures stand alone: one with a newer picture behind it is skipped.
+let chain=Promise.resolve(), waiting=0;
+const later=job=>{chain=chain.then(job).catch(e=>{status.textContent=String(e);});};
+socket.onmessage=e=>{
+  if(e.data instanceof ArrayBuffer){
+    const kind=new DataView(e.data).getUint8(1);
+    if(MIME[kind]){waiting++;later(()=>{waiting--;if(waiting===0) return picture(e.data);});}
+    else if(VIDEO[kind]) later(()=>chunk(e.data));
+    else if(kind===TILES) later(()=>tiles(e.data));
+    return; // an unknown codec is skipped, not misdrawn
+  }
+  const m=JSON.parse(e.data);later(()=>control(m));
+};
+socket.onclose=()=>{stop();status.textContent='Disconnected';};
+const at=e=>{const r=screen.getBoundingClientRect();return{x:Math.min(1,Math.max(0,(e.clientX-r.left)/r.width)),y:Math.min(1,Math.max(0,(e.clientY-r.top)/r.height))};};
+const button=e=>['left','middle','right'][e.button]||'left';
+// The pointer: captured on press, so a release outside the picture still
+// arrives; the click count makes double and triple clicks.
+const pressed=new Set();
+let last=0;
+screen.addEventListener('pointerdown',e=>{if(e.pointerType==='mouse') screen.setPointerCapture(e.pointerId);});
+screen.addEventListener('mousemove',e=>{const now=Date.now();if(now-last<(pressed.size?16:40))return;last=now;send({type:'mouse',action:'move',...at(e)});});
+screen.addEventListener('mousedown',e=>{e.preventDefault();typing(e);pressed.add(e.button);
+  send({type:'mouse',action:'down',button:button(e),count:e.detail||1,...at(e)});});
+screen.addEventListener('mouseup',e=>{if(!pressed.delete(e.button))return;
+  send({type:'mouse',action:'up',button:button(e),count:e.detail||1,...at(e)});});
+screen.addEventListener('contextmenu',e=>e.preventDefault());
+screen.addEventListener('wheel',e=>{e.preventDefault();send({type:'mouse',action:'wheel',dx:e.deltaX,dy:e.deltaY,...at(e)});},{passive:false});
+// The keyboard: a hidden text box near the last click holds the focus, so the
+// viewer's input method (Chinese, Japanese, accents) composes there and only
+// the finished text is sent. Keys that type nothing, and shortcuts, go as keys.
+const keys=document.getElementById('keys'), down=new Set();
+function typing(e){keys.style.left=e.clientX+'px';keys.style.top=e.clientY+'px';keys.focus({preventScroll:true});}
+const types=e=>e.key.length===1&&!e.ctrlKey&&!e.metaKey&&!e.altKey;
+keys.addEventListener('keydown',e=>{
+  if(e.isComposing||e.keyCode===229||e.key==='Dead'||types(e)) return;
+  e.preventDefault();down.add(e.code);
+  send({type:'key',action:'down',key:e.key,code:e.code});
+  // After a copy on the shared desktop, bring its clipboard here.
+  if(kind==='desktop'&&(e.ctrlKey||e.metaKey)&&(e.code==='KeyC'||e.code==='KeyX')) setTimeout(()=>send({type:'clipboard'}),300);
+});
+keys.addEventListener('keyup',e=>{if(!down.delete(e.code))return;e.preventDefault();send({type:'key',action:'up',key:e.key,code:e.code});});
+keys.addEventListener('input',e=>{if(e.isComposing)return;if(keys.value)send({type:'text',text:keys.value});keys.value='';});
+keys.addEventListener('compositionend',e=>{if(e.data)send({type:'text',text:e.data});keys.value='';});
+keys.addEventListener('paste',e=>{e.preventDefault();send({type:'text',text:e.clipboardData.getData('text')});});
+// Leaving the window lets go of everything held, here and on the other side.
+function release(){down.clear();pressed.clear();send({type:'release'});}
+addEventListener('blur',release);
+document.addEventListener('visibilitychange',()=>{if(document.hidden)release();});
+async function copied(m){
+  if(m.text==null){status.textContent='The shared clipboard holds no text';return;}
+  try{await navigator.clipboard.writeText(m.text);
+    status.textContent=`Copied ${m.characters} characters from the shared screen`+(m.truncated?' (cut short)':'');}
+  catch(e){status.textContent='Could not copy here: '+e.message;}
+  setTimeout(label,3000);
+}
+</script></body></html>

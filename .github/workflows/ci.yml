@@ -46,16 +46,17 @@ jobs:
         run: |
           set -euo pipefail
           test ! -f pyproject.toml
-          # Windows hardware probes are test harnesses, not a second shipped
-          # implementation. Keep them, while still rejecting Python elsewhere.
-          if git ls-files '*.py' '*.pyi' ':!:tests/windows/*.py' | grep -q .; then
+          # Windows hardware probes and the X11 assist check are test
+          # harnesses, not a second shipped implementation. Keep them, while
+          # still rejecting Python elsewhere.
+          if git ls-files '*.py' '*.pyi' ':!:tests/windows/*.py' ':!:tests/linux/*.py' | grep -q .; then
             echo "tracked Python implementation files remain" >&2
-            git ls-files '*.py' '*.pyi' ':!:tests/windows/*.py' >&2
+            git ls-files '*.py' '*.pyi' ':!:tests/windows/*.py' ':!:tests/linux/*.py' >&2
             exit 1
           fi
       - name: Check retained Windows hardware probes
         if: runner.os == 'Windows'
-        run: python -m compileall -q tests/windows
+        run: python -m compileall -q tests/windows tests/linux
       - name: Install Linux native driver test dependencies
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends xvfb xauth dbus-x11 at-spi2-core g++ pkg-config qtbase5-dev libx11-dev libxtst-dev openbox x11-utils xclip tesseract-ocr tesseract-ocr-eng
@@ -105,6 +106,268 @@ jobs:
           export AAD_TEST_CHROME="$(command -v google-chrome || command -v chromium)"
           test -n "$AAD_TEST_CHROME"
           cargo test --locked -p aad-control --test browser_e2e -- --ignored
+
+      # Each system builds only its own platform code: aad depends on this
+      # system's platform crate and accessibility backend, and on none of the
+      # other systems'.
+      - name: Check aad depends only on this system's platform crates
+        shell: bash
+        run: |
+          set -euo pipefail
+          crates=" $(cargo tree --locked -p aad-cli -e normal --prefix none | grep -oE '^aad-[a-z-]+' | sort -u | tr '\n' ' ')"
+          echo "aad depends on:$crates"
+          case "$RUNNER_OS" in
+            Windows) own="aad-windows aad-uia"; others="aad-linux aad-atspi aad-macos aad-macos-ax" ;;
+            Linux) own="aad-linux aad-atspi"; others="aad-windows aad-uia aad-macos aad-macos-ax" ;;
+            macOS) own="aad-macos aad-macos-ax"; others="aad-windows aad-uia aad-linux aad-atspi" ;;
+          esac
+          for crate in $own; do
+            [[ "$crates" == *" $crate "* ]] || { echo "aad lacks $crate" >&2; exit 1; }
+          done
+          for crate in $others; do
+            [[ "$crates" != *" $crate "* ]] || { echo "$crate is built here, where it does nothing" >&2; exit 1; }
+          done
+
+      # aad assist on the macOS desktop: the displays are listed, the display
+      # is read through ScreenCaptureKit, and a viewer gets a first picture,
+      # or, where the runner grants no Screen Recording, the error that says
+      # so. Input needs Accessibility, which a
+      # runner may not grant either, so only what it reports is printed.
+      - name: Smoke assist on the macOS desktop
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --locked -p aad-cli
+          python3 - <<'PY'
+          import base64, json, os, socket, subprocess, sys, time
+          aad = "target/debug/aad"
+          screens = json.loads(subprocess.run([aad, "--compact", "assist", "--list-screens"], capture_output=True, text=True).stdout)
+          print("screens", screens)
+          assert screens["monitors"], "no display listed"
+          p = subprocess.Popen([aad, "--compact", "assist", "--desktop", "--view-only", "--codecs", "tiles"], stdout=subprocess.PIPE, text=True)
+          try:
+              announce = json.loads(p.stdout.readline())
+              print("source", announce["source"])
+              assert announce["source"]["capture"] == "screencapturekit", announce["source"]
+              host, rest = announce["websocket"][len("ws://"):].split("/", 1)
+              address, port = host.split(":")
+              s = socket.create_connection((address, int(port)), timeout=20)
+              key = base64.b64encode(os.urandom(16)).decode()
+              s.sendall(f"GET /{rest} HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n".encode())
+              head = b""
+              while b"\r\n\r\n" not in head:
+                  head += s.recv(1)
+              payload = json.dumps({"type": "hello", "accept": ["tiles"]}).encode()
+              mask = os.urandom(4)
+              s.sendall(bytes([0x81, 0x80 | len(payload)]) + mask + bytes(b ^ mask[i % 4] for i, b in enumerate(payload)))
+              def exact(n):
+                  data = b""
+                  while len(data) < n:
+                      chunk = s.recv(n - len(data))
+                      assert chunk, "connection closed"
+                      data += chunk
+                  return data
+              deadline = time.time() + 30
+              outcome = None
+              while time.time() < deadline and outcome is None:
+                  first, second = exact(2)
+                  length = second & 0x7F
+                  if length == 126:
+                      length = int.from_bytes(exact(2), "big")
+                  elif length == 127:
+                      length = int.from_bytes(exact(8), "big")
+                  data = exact(length)
+                  if first & 0x0F == 2 and data[1] == 6:
+                      outcome = ("picture", int.from_bytes(data[4:8], "big"), int.from_bytes(data[8:12], "big"))
+                  elif first & 0x0F == 1:
+                      message = json.loads(data)
+                      if message.get("type") == "error":
+                          outcome = ("error", message["message"])
+              print("outcome", outcome)
+              assert outcome and (outcome[0] == "picture" or "Screen Recording" in outcome[1]), outcome
+          finally:
+              p.terminate()
+          PY
+
+      # Where the runner grants Accessibility, input is checked by its
+      # effect: the pointer lands where a viewer points (as the system
+      # reports it); text typed into TextEdit and saved with Cmd+S through
+      # assist is the file's text, Cmd+A then typing replaces it, and Cmd+A
+      # Cmd+C puts it where pbpaste reads it. No AppleScript: a runner does
+      # not grant Automation of other apps.
+      - name: Check assist input on the macOS desktop
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          : > /tmp/assist-note.txt
+          open -a TextEdit /tmp/assist-note.txt
+          sleep 3
+          PYTHONPATH=tests/windows python3 - <<'PY'
+          import json, queue, subprocess, sys, time
+          import verify_assist
+          verify_assist.AAD = "target/debug/aad"
+          from verify_assist import Viewer, start_assist
+          from verify_assist_video import listen
+          assist, announce = start_assist("--desktop", "--codecs", "tiles")
+          try:
+              if not announce["source"]["permissions"]["accessibility"]:
+                  print("no Accessibility on this runner; input not checked")
+                  sys.exit(0)
+              viewer = listen(Viewer(announce["websocket"]))
+              viewer.send({"type": "hello", "accept": ["tiles"]})
+              def cursor_near(x, y, seconds=5):
+                  end = time.time() + seconds
+                  while time.time() < end:
+                      try:
+                          m = viewer.inbox.get(timeout=0.2)
+                      except queue.Empty:
+                          continue
+                      if m and m.get("type") == "cursor" and abs(m["x"] - x) < 0.01 and abs(m["y"] - y) < 0.01:
+                          return True
+                  return False
+              def chord(code, key):
+                  # As a person presses them: a moment between the four events.
+                  for action, name, which in (("down", "Meta", "MetaLeft"), ("down", key, code),
+                                              ("up", key, code), ("up", "Meta", "MetaLeft")):
+                      viewer.send({"type": "key", "action": action, "key": name, "code": which})
+                      time.sleep(0.05)
+                  time.sleep(0.5)
+              def saved():
+                  chord("KeyS", "s")
+                  time.sleep(1)
+                  return open("/tmp/assist-note.txt").read()
+              def copied():
+                  for _ in range(3):
+                      chord("KeyA", "a")
+                      chord("KeyC", "c")
+                      text = subprocess.run(["pbpaste"], capture_output=True, text=True, timeout=10).stdout
+                      if text:
+                          return text
+                  return text
+              viewer.send({"type": "mouse", "action": "move", "x": 0.25, "y": 0.75})
+              pointer = cursor_near(0.25, 0.75)
+              viewer.send({"type": "text", "text": "typed through assist"})
+              time.sleep(1)
+              typed = saved()
+              chord("KeyA", "a")
+              viewer.send({"type": "text", "text": "replaced"})
+              time.sleep(1)
+              replaced = saved()
+              clipboard = copied()
+              viewer.close()
+              # TextEdit capitalises the first letter of a sentence.
+              result = {"pointer_lands": pointer, "typed": typed, "cmd_a_then_typing": replaced,
+                        "cmd_a_cmd_c_copies": clipboard}
+              print(json.dumps(result))
+              assert pointer and typed.lower() == "typed through assist" and replaced.lower() == "replaced", result
+              assert clipboard.lower() == replaced.lower(), result
+          finally:
+              assist.terminate()
+              subprocess.run(["pkill", "-x", "TextEdit"])
+          PY
+
+      # ScreenCaptureKit says what changed in each frame, and only that is
+      # read and sent. Checked by its effect: text typed into TextEdit through
+      # assist arrives as patches much smaller than the screen, and the
+      # picture patched together is the screen as `screencapture` takes it on
+      # its own, so no change went unreported (a picture checked against
+      # assist's own keyframe would miss that, being read the same way). The
+      # binary links ScreenCaptureKit weakly, to start on older macOS.
+      - name: Check assist sends only what changed on the macOS desktop
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          otool -l target/debug/aad | grep -A2 LC_LOAD_WEAK_DYLIB | grep ScreenCaptureKit
+          python3 -m venv /tmp/assist-venv
+          /tmp/assist-venv/bin/pip install --quiet pillow
+          : > /tmp/assist-changes.txt
+          open -a TextEdit /tmp/assist-changes.txt
+          sleep 3
+          AAD_ASSIST_TRACE=1 PYTHONPATH=tests/windows /tmp/assist-venv/bin/python - <<'PY'
+          import json, subprocess, sys, time
+          from PIL import Image, ImageChops, ImageStat
+          import verify_assist
+          verify_assist.AAD = "target/debug/aad"
+          from verify_assist import Viewer, start_assist
+          from verify_assist_tiles import apply, patches
+          from verify_assist_video import frames_until, listen
+          def tiles(viewer, seconds, stop=None):
+              _, frames = frames_until(viewer, seconds, stop)
+              return [f for f in frames if f["codec"] == 6]
+          def share(frames, size):
+              area = sum(p["rect"][2] * p["rect"][3] for f in frames for p in patches(f))
+              return round(area / (size[0] * size[1]), 4)
+          def wrong_tiles(a, b, tile=32, limit=24):
+              delta = ImageChops.difference(a, b).convert("L")
+              return [(x, y) for y in range(0, delta.height, tile) for x in range(0, delta.width, tile)
+                      if ImageStat.Stat(delta.crop((x, y, x + tile, y + tile))).mean[0] > limit]
+          assist, announce = start_assist("--desktop", "--codecs", "tiles")
+          try:
+              result = {"capture": announce["source"]["capture"]}
+              if not announce["source"]["permissions"]["accessibility"]:
+                  print("no Accessibility on this runner; nothing can be typed")
+                  sys.exit(0)
+              viewer = listen(Viewer(announce["websocket"]))
+              viewer.send({"type": "hello", "accept": ["tiles"]})
+              canvas = None
+              for frame in tiles(viewer, 10, lambda s, f: any(x["codec"] == 6 for x in f)):
+                  canvas = apply(canvas, frame)
+              result["size"] = list(canvas.size)
+              # The caret blinks and the clock ticks: a little is sent anyway.
+              settled = tiles(viewer, 3)
+              for frame in settled:
+                  canvas = apply(canvas, frame)
+              result["still_share"] = share(settled, canvas.size)
+              for line in range(6):
+                  viewer.send({"type": "text", "text": f"line {line}: the quick brown fox jumps over the lazy dog"})
+                  for action in ("down", "up"):
+                      viewer.send({"type": "key", "action": action, "key": "Enter", "code": "Enter"})
+                  time.sleep(0.2)
+              typed = tiles(viewer, 3)
+              for frame in typed:
+                  canvas = apply(canvas, frame)
+              result["typing_frames"] = len(typed)
+              result["typing_share"] = share(typed, canvas.size)
+              subprocess.run(["screencapture", "-x", "-m", "/tmp/assist-shot.png"], check=True)
+              for frame in tiles(viewer, 1):
+                  canvas = apply(canvas, frame)
+              shot = Image.open("/tmp/assist-shot.png").convert("RGB").resize(canvas.size)
+              wrong = wrong_tiles(canvas, shot)
+              result["tiles_unlike_screencapture"] = len(wrong)
+              result["where"] = wrong[:20]
+              viewer.close()
+              print(json.dumps(result))
+              canvas.save("/tmp/assist-canvas.png")
+              assert result["capture"] == "screencapturekit", result
+              assert typed and 0 < result["typing_share"] < 0.5, result
+              # A missed change shows as whole lines of text; the caret and
+              # the clock as a tile or two.
+              assert len(wrong) <= 4, result
+          finally:
+              assist.terminate()
+              # What ScreenCaptureKit handed over, frame by frame.
+              trace = assist.stderr.read().splitlines()
+              print(len(trace), "trace lines")
+              for line in trace[:15] + trace[-15:]:
+                  print(line)
+              subprocess.run(["pkill", "-x", "TextEdit"])
+          PY
+
+      # aad assist on an X11 desktop of its own (the script starts Xvfb):
+      # what is streamed and what a viewer's input does, checked by effect.
+      - name: Test assist on an X11 desktop
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get install -y --no-install-recommends xdotool x11-xserver-utils
+          python3 -m venv /tmp/assist-venv
+          /tmp/assist-venv/bin/pip install --quiet pillow
+          cargo build --locked -p aad-cli
+          /tmp/assist-venv/bin/python tests/linux/verify_assist_desktop.py
 
       # The UIA research probes call Win32 APIs directly. They are excluded
       # from automatic example discovery on other hosts, but still need to be

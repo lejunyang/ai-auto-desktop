@@ -2,6 +2,11 @@
 resolver = "2"
 members = [
     "crates/aad-core",
+    "crates/aad-platform",
+    "crates/aad-windows",
+    "crates/aad-linux",
+    "crates/aad-macos",
+    "crates/aad-desktop",
     "crates/aad-plugin",
     "crates/aad-runtime",
     "crates/aad-ocr",
@@ -17,7 +22,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.0.3"
+version = "0.0.4"
 edition = "2021"
 rust-version = "1.82"
 license = "Apache-2.0"
@@ -27,17 +32,22 @@ repository = "https://github.com/lejunyang/ai-auto-desktop"
 # `version` alongside `path`: inside the workspace the path wins, but
 # `cargo publish` rejects a path dependency that names no version, and the
 # published crate needs the registry version to resolve for downstream users.
-aad-core = { path = "crates/aad-core", version = "0.0.3" }
-aad-plugin = { path = "crates/aad-plugin", version = "0.0.3" }
-aad-runtime = { path = "crates/aad-runtime", version = "0.0.3" }
-aad-ocr = { path = "crates/aad-ocr", version = "0.0.3" }
-aad-atspi = { path = "crates/aad-atspi", version = "0.0.3" }
-aad-macos-ax = { path = "crates/aad-macos-ax", version = "0.0.3" }
-aad-cdp = { path = "crates/aad-cdp", version = "0.0.3" }
-aad-control = { path = "crates/aad-control", version = "0.0.3" }
-aad-probe = { path = "crates/aad-probe", version = "0.0.3" }
-aad-uia = { path = "crates/aad-uia", version = "0.0.3" }
-aad-mcp = { path = "crates/aad-mcp", version = "0.0.3" }
+aad-core = { path = "crates/aad-core", version = "0.0.4" }
+aad-platform = { path = "crates/aad-platform", version = "0.0.4" }
+aad-windows = { path = "crates/aad-windows", version = "0.0.4" }
+aad-linux = { path = "crates/aad-linux", version = "0.0.4" }
+aad-macos = { path = "crates/aad-macos", version = "0.0.4" }
+aad-desktop = { path = "crates/aad-desktop", version = "0.0.4" }
+aad-plugin = { path = "crates/aad-plugin", version = "0.0.4" }
+aad-runtime = { path = "crates/aad-runtime", version = "0.0.4" }
+aad-ocr = { path = "crates/aad-ocr", version = "0.0.4" }
+aad-atspi = { path = "crates/aad-atspi", version = "0.0.4" }
+aad-macos-ax = { path = "crates/aad-macos-ax", version = "0.0.4" }
+aad-cdp = { path = "crates/aad-cdp", version = "0.0.4" }
+aad-control = { path = "crates/aad-control", version = "0.0.4" }
+aad-probe = { path = "crates/aad-probe", version = "0.0.4" }
+aad-uia = { path = "crates/aad-uia", version = "0.0.4" }
+aad-mcp = { path = "crates/aad-mcp", version = "0.0.4" }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }

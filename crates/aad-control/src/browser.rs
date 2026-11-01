@@ -1519,10 +1519,7 @@ impl Backend for BrowserBackend {
                 }
                 // A tab being closed is still listed for a moment after its
                 // connection stops answering; it is gone, not a failure.
-                Err(_)
-                    if Client::list_targets_until(self.port()?, deadline)
-                        .is_ok_and(|now| now.iter().all(|t| t.id != target.id)) =>
-                {
+                Err(_) if self.closing(&target.id, deadline) => {
                     pages.remove(&target.id);
                     continue;
                 }
@@ -1548,7 +1545,14 @@ impl Backend for BrowserBackend {
                 });
                 continue;
             }
-            let map = frame_map(page)?;
+            let map = match frame_map(page) {
+                Ok(map) => map,
+                Err(_) if self.closing(&target.id, deadline) => {
+                    pages.remove(&target.id);
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
             let root = map
                 .iter()
                 .find(|(_, entry)| entry.main())
@@ -1729,6 +1733,28 @@ impl Backend for BrowserBackend {
 }
 
 impl BrowserBackend {
+    /// Whether a target that stopped answering is a tab being closed: it
+    /// leaves the browser's list within a moment. Looking only once is not
+    /// enough; the list can still name it right after its connection ended.
+    fn closing(&self, id: &str, deadline: Instant) -> bool {
+        let until = deadline.min(Instant::now() + Duration::from_millis(1500));
+        loop {
+            let listed = self
+                .port()
+                .ok()
+                .and_then(|port| Client::list_targets_until(port, until).ok());
+            match listed {
+                Some(now) if now.iter().all(|t| t.id != id) => return true,
+                None => return false,
+                Some(_) => {}
+            }
+            if Instant::now() >= until {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
     /// Accept or dismiss the dialog the observation showed, if it is still the one open.
     fn answer_dialog(
         &self,

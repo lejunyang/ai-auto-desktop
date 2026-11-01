@@ -1,0 +1,22 @@
+[package]
+name = "aad-linux"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "What Linux offers ai-auto-desktop: the X11 screen, input, clipboard; built on Linux only"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+aad-platform = { workspace = true }
+base64 = "0.22"
+image = { workspace = true }
+libc = { workspace = true }
+serde_json = { workspace = true }
+# The X11 desktop, spoken to directly: damage tells what changed, XTest
+# injects input, XFixes gives the pointer, RandR the displays.
+x11rb = { version = "0.13", features = ["xtest", "damage", "xfixes", "randr"] }
+
+# Inherit the workspace's deliberate lint allowances (see the root Cargo.toml).
+[lints]
+workspace = true

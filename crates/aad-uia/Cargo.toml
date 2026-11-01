@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Native Windows UI Automation driver: app discovery, UI description and automation"
+description = "Windows UI Automation backend for the ai-auto-desktop driver; built on Windows only"
 
 [features]
 # These executables are investigation tools that call Win32/UIA APIs directly.
@@ -14,18 +14,11 @@ description = "Native Windows UI Automation driver: app discovery, UI descriptio
 # the feature on in its Windows job so they are still compilation-checked.
 windows-native-examples = []
 
-[dependencies]
-aad-core = { workspace = true }
-aad-plugin = { workspace = true }
-aad-runtime = { workspace = true }
-base64 = "0.22"
-image = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
-sha2 = { workspace = true }
-uuid = { workspace = true }
-
 [target.'cfg(windows)'.dependencies]
+aad-desktop = { workspace = true }
+aad-platform = { workspace = true }
+aad-windows = { workspace = true }
+serde_json = { workspace = true }
 # The #[implement] macro expands to `windows_core::` paths and resolves them at
 # the crate root, so windows-core has to be a dependency in its own right --
 # a `use windows::core as windows_core` alias does not satisfy it.
@@ -44,19 +37,17 @@ windows = { version = "0.58", features = [
     "Win32_UI_Input_Ime",
     "Win32_Graphics_Gdi",
     "Win32_UI_HiDpi",
-    "Win32_Storage_Xps",
     "Win32_Graphics_Dwm",
-    "Win32_System_DataExchange",
-    "Win32_System_Memory",
     "Win32_System_StationsAndDesktops",
-    # Windows' built-in OCR for control_read_text.
-    "Foundation",
-    "Foundation_Collections",
-    "Globalization",
-    "Graphics_Imaging",
-    "Media_Ocr",
-    "Storage_Streams",
 ] }
+
+# The native tests and the investigation examples drive whole workflows.
+[target.'cfg(windows)'.dev-dependencies]
+aad-core = { workspace = true }
+aad-runtime = { workspace = true }
+base64 = "0.22"
+image = { workspace = true }
+uuid = { workspace = true }
 
 # Inherit the workspace's deliberate lint allowances (see the root Cargo.toml).
 [lints]
@@ -100,4 +91,124 @@ required-features = ["windows-native-examples"]
 
 [[example]]
 name = "spike_winevent"
+required-features = ["windows-native-examples"]
+
+[[example]]
+name = "probe_action_sets"
+required-features = ["windows-native-examples"]
+
+[[example]]
+name = "probe_bounds_disambiguation"
+required-features = ["windows-native-examples"]
+
+[[example]]
+name = "probe_budget"
+required-features = ["windows-native-examples"]
+
+[[example]]
+name = "probe_captured_bounds"
+required-features = ["windows-native-examples"]
+
+[[example]]
+name = "probe_chain"
+required-features = ["windows-native-examples"]
+
+[[example]]
+name = "probe_complex"
+required-features = ["windows-native-examples"]
+
+[[example]]
+name = "probe_compressed_tree"
+required-features = ["windows-native-examples"]
+
+[[example]]
+name = "probe_content_nodes"
+required-features = ["windows-native-examples"]
+
+[[example]]
+name = "probe_costs"
+required-features = ["windows-native-examples"]
+
+[[example]]
+name = "probe_drilldown"
+required-features = ["windows-native-examples"]
+
+[[example]]
+name = "probe_events"
+required-features = ["windows-native-examples"]
+
+[[example]]
+name = "probe_group_coverage"
+required-features = ["windows-native-examples"]
+
+[[example]]
+name = "probe_grouping"
+required-features = ["windows-native-examples"]
+
+[[example]]
+name = "probe_hotspot"
+required-features = ["windows-native-examples"]
+
+[[example]]
+name = "probe_id_families"
+required-features = ["windows-native-examples"]
+
+[[example]]
+name = "probe_layout_noise"
+required-features = ["windows-native-examples"]
+
+[[example]]
+name = "probe_legacy"
+required-features = ["windows-native-examples"]
+
+[[example]]
+name = "probe_loose"
+required-features = ["windows-native-examples"]
+
+[[example]]
+name = "probe_loose_groups"
+required-features = ["windows-native-examples"]
+
+[[example]]
+name = "probe_nameless"
+required-features = ["windows-native-examples"]
+
+[[example]]
+name = "probe_outline_shape"
+required-features = ["windows-native-examples"]
+
+[[example]]
+name = "probe_overview_live"
+required-features = ["windows-native-examples"]
+
+[[example]]
+name = "probe_positional"
+required-features = ["windows-native-examples"]
+
+[[example]]
+name = "probe_raw_events"
+required-features = ["windows-native-examples"]
+
+[[example]]
+name = "probe_region_criteria"
+required-features = ["windows-native-examples"]
+
+[[example]]
+name = "probe_regions"
+required-features = ["windows-native-examples"]
+
+[[example]]
+name = "probe_title_echo"
+required-features = ["windows-native-examples"]
+
+[[example]]
+name = "probe_titles"
+required-features = ["windows-native-examples"]
+
+[[example]]
+name = "probe_unresolved"
+required-features = ["windows-native-examples"]
+
+[[example]]
+name = "probe_within"
 required-features = ["windows-native-examples"]

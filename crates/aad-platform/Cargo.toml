@@ -1,0 +1,15 @@
+[package]
+name = "aad-platform"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "What every operating system offers ai-auto-desktop: shared screens, input, structured errors"
+
+[dependencies]
+serde_json = { workspace = true }
+
+# Inherit the workspace's deliberate lint allowances (see the root Cargo.toml).
+[lints]
+workspace = true

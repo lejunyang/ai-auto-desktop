@@ -391,29 +391,209 @@ Agent 遇到自己做不了的事（扫码之外的登录、验证码、需要�
 
 ```powershell
 aad assist --browser-port 9222            # 分享一个浏览器页面（CDP screencast）
-aad assist --desktop                      # 分享整个桌面（目前只有 Windows）
+aad assist --desktop                      # 分享整个桌面（Windows；Linux 的 X11；macOS 的主显示器）
 aad assist --desktop --view-only          # 只给看，不接收鼠标键盘
+aad assist --list-screens                 # 列出可分享的显示器和窗口
+aad assist --desktop --monitor 1          # 只分享第 1 块显示器
+aad assist --desktop --window 0x3077a     # 只分享一个窗口（句柄，或标题的一部分）
 ```
 
-启动后在 stdout 打印一行 JSON：`url`（自带的查看页，可选）、`websocket`、`token`。只监听本机回环地址，
-每个连接都要带 token。主要产物是 WebSocket 上的帧流，由 omem 这类宿主自己渲染：
+`--monitor` 和 `--window` 只分享桌面的一部分：截屏照常用 DXGI，再裁出这块区域（裁剪缓冲同样两份轮换，只补变化的区域），
+鼠标位置和光标都换算到这块区域里，区域外的光标不显示。窗口按 DWM 的可见边框跟随：移动后输入跟着走，大小改变后画面
+按新尺寸从关键帧重新开始，最小化时停在最后一帧，窗口关闭时报错。分享的是窗口在屏幕上占的那块区域，盖在它上面的
+东西也会被看到。
 
-- 画面是二进制消息，一帧一张图：24 字节大端头（版本、编码、标志位 bit0 = 关键帧、宽、高、头长度、
-  从开始算起的毫秒时间戳），之后是图片本身。读的一方按“头长度”跳过头，以后加字段不影响旧的读法；
-  不认识的编码跳过不画。
-- 编码默认 WebP（有损，`--quality` 默认 70），比同质量 JPEG 小得多；查看端可以先发
-  `{"type":"hello","accept":["webp","jpeg"]}` 按偏好选编码，只认 JPEG 的就只收 JPEG。
-  浏览器的 WebP 用 `Page.captureScreenshot` 按 `--fps` 取图（screencast 只给 JPEG），没变化不发；
-  桌面用 libwebp 编码。现在每帧都是完整的图（都是关键帧）；以后加 H.264 等视频编码只需新增一种编码值，
-  头里已有关键帧标志和时间戳。
-- 控制消息是 JSON 文本：服务端发 `ready`（含 `frames.codecs`）和 `error`，查看端发 `hello`、
-  `mouse`（move/down/up/wheel，位置是画面内 0..1 的比例）、`key`（Enter、方向键、F1–F12、修饰键等非文字按键）
-  和 `text`（输入的文字）。
+可以同时有多个查看者（`--max-viewers`，默认 4）：各自选自己的编码，截一次屏供所有人用；暂时跟不上的查看者把漏掉的
+变化区域合并起来，等它能接收时一起补上，tiles 不会漏块。同一时刻只有一个查看者的鼠标键盘会被转发：最早连上的那个；
+其他人只看，查看页上有“Take control”按钮（发 `{"type":"take"}`）可以接管，接管时先把上一位还按着的键和鼠标键松开；
+控制者离开后交给下一位。谁在控制变化时每个查看者收到 `{"type":"control","you":..,"holder":..,"viewers":..}`。
+画面静止时新连上的查看者也会立刻收到当前画面。
+
+启动后在 stdout 打印一行 JSON：`url`（自带的查看页，可选）、`websocket`、`token`、`codecs`（提供的编码）
+和 `video`（找到的 ffmpeg 与每种视频编码选中的编码器）。只监听本机回环地址，每个连接都要带 token。
+主要产物是 WebSocket 上的帧流，由 omem 这类宿主自己渲染：
+
+- 画面是二进制消息，一条一帧：24 字节大端头（版本、编码、标志位 bit0 = 关键帧 / bit1 = 后面带变化区域、
+  宽、高、头长度、从开始算起的毫秒时间戳），之后是负载。读的一方按“头长度”跳过头，以后加字段不影响旧的读法；
+  不认识的编码跳过不画。编码值：1 = JPEG、2 = WebP（各是一整张图），3 = H.264（Annex B，
+  关键帧前带 SPS/PPS）、4 = VP9、5 = AV1（OBU），各是一帧视频；6 = tiles（只有变化的部分，见下）。
+  bit1 置位时头后面跟着 u16 个数和若干 x、y、w、h（u16）：这一帧只有这些区域变了。
+- 画面没变化就什么都不发。图片编码每次发整张图；tiles 只发变了的 32 像素块；视频编码里没变的块被编成跳过块。
+- 查看端可以先发 `{"type":"hello","accept":["tiles","h264","webp","jpeg"]}` 按自己的偏好选编码；不发 hello 的
+  查看端收到 `--codecs` 里的第一个（默认 WebP，旧宿主不受影响）。hello 之后服务端发
+  `{"type":"mode","mode":{"codec":"tiles","video":"h264"}}` 说明实际模式。每段视频流开始前服务端发
+  `{"type":"stream","codec":"h264","webcodecs":"avc1.64001f","encoder":"h264_nvenc","width":..,"height":..}`，
+  紧接着是关键帧；`webcodecs` 可直接作 WebCodecs `VideoDecoder.configure` 的 `codec`。解码出错时查看端发
+  `{"type":"keyframe"}`，服务端重开编码器，从当前画面的关键帧重新开始。
+- 分享桌面时服务端另发 `{"type":"cursor","x":..,"y":..,"visible":true,"shape":{"png":"<base64>","width":..,
+  "height":..,"hotspot":[x,y],"screen":[w,h]}}`：鼠标指针的位置（画面内比例）和样子（变了才带 `shape`，
+  `screen` 是 `width`/`height` 所在的屏幕像素尺寸），指针不画进画面，由查看端叠加；`--hide-cursor` 关掉。
+- 控制消息是 JSON 文本：服务端发 `ready`（含 `frames.codecs`、`mode`、`video`）、`mode`、`stream`、`cursor`、
+  `clipboard` 和 `error`，查看端发
+  `hello`、`keyframe`、`mouse`（move/down/up/wheel，位置是画面内 0..1 的比例，`count` 是第几次连击）、
+  `key`（不出字的按键和快捷键，`code` 是物理键名，见下）、`text`（输入的文字）、`release` 和 `clipboard`。
+
+### 远程操作
+
+| 操作 | 浏览器页面（CDP `Input.*`） | Windows 桌面（`SendInput`） |
+|---|---|---|
+| 移动、按下、松开、拖拽，左/中/右键，横竖滚轮 | ✅ | ✅ |
+| 双击、三击 | ✅ 查看端发 `count`（`e.detail`） | ✅ 系统按间隔合成 |
+| 文字输入、粘贴（单次 ≤4096 字节） | ✅ `insertText` | ✅ Unicode 输入，和键盘布局无关 |
+| 中文等输入法 | ✅ 查看页里组字，只发组好的字 | ✅ 同左 |
+| 快捷键 | ✅ 按物理键（`code`）映射：字母、数字、标点（Ctrl+/、Ctrl+=、Ctrl+[）、Ctrl+Space、F1–F24、小键盘、CapsLock、PrintScreen、菜单键等 | ✅ 同左，带扫描码，方向键/Home/End/Insert/Delete/右侧修饰键带扩展键标志 |
+| 断开或查看页失去焦点时松开所有按住的键和鼠标键 | ✅ | ✅ |
+| 把远程剪贴板的文字带回查看端 | — | ✅ 查看端按 Ctrl+C/Ctrl+X 后自动取回（≤10 万字），密码管理器标记为不供读取的内容拒绝；`--no-clipboard` 关闭，`--view-only` 时不提供 |
+
+`key` 消息优先按 `code`（物理键）找键，没有 `code` 时按 `key` 的名字找；所以查看端是什么键盘布局，快捷键都落在
+同一个物理键上。出字的键不走 `key`：查看页把焦点放在点击处的一个隐藏输入框上，按键先经过本机输入法，组好的字和普通
+字符作为 `text` 发出（死键、输入法组字中的按键不发），Ctrl/Alt/Meta 组合和不出字的键作为 `key` 发出。按下鼠标后
+用指针捕获，拖到画面外再松开也会送达；查看页失去焦点或切到后台时发 `release`，对端把还按着的键和鼠标键全部松开，
+服务端在连接断开时也会这么做，不会留下按住的 Shift 或鼠标左键。
+
+### 只传变化的部分（tiles）与自适应
+
+`tiles` 不依赖 ffmpeg：画面切成 32×32 的块，只把变了的块合并成矩形、各编成一张 WebP 补丁发出去，查看端在
+已有画面上原位画这些补丁；整块移动的区域（滚动）只发一条“从 (sx, sy) 复制过来”。一帧的负载是 u16 补丁数，
+每个补丁：类型 u8（1 = 图片，2 = 复制）、格式 u8（图片为 2 = WebP）、x、y、w、h（u16），复制再跟来源 x、y
+（u16），图片再跟 u32 长度和恰好 w×h 的图片。关键帧是一块盖满全画面的补丁；`--quality 100` 时补丁用无损 WebP。
+
+变化从哪里来：Windows 桌面用 DXGI 桌面复制（Desktop Duplication），系统直接给出每帧重绘和移动的区域，
+画面不变时根本没有新帧，只把变化的行从显存读回；再在这些区域里逐块比较，把“重画了但像素没变”的块去掉。
+DXGI 不可用（部分远程会话、旋转的显示器）或丢失（分辨率变化、安全桌面）时退回 GDI 整屏拷贝加逐块比较，
+一秒后再试 DXGI；`source.capture` 报告当前是 `dxgi` 还是 `gdi`。浏览器页面用 screencast 的 PNG 帧逐块比较。
+分享桌面的进程按每显示器 DPI 感知运行，拿到的是物理像素（以前在 250% 缩放下拿到的是系统缩小过的 1536×960
+模糊画面，现在是 3840×2400 再按 `--max-width` 缩小）。
+
+缩小也只做变化的部分：服务端保留一份缩小后的画面，每次只把变化区域从原图重新取平均；抓屏缓冲区两份轮换，
+新一帧只补上一帧变过的区域，不再整屏复制。
+
+查看端 hello 里 tiles 排在某种视频编码前面（自带查看页就是这样）时进入**自适应**：小改动发 tiles；
+变化面积超过 `--video-area`（默认屏幕的 30%）或每秒超过 `--video-rate` 次（默认 8 次，只算超过屏幕 1% 的变化，
+如滚动、播放）时发视频。视频帧在头里带变化区域，查看端照常解码每一帧，但**只把变化区域画到画布上**，别处保留
+tiles 画的清晰内容；画面静止 0.4 秒后，视频画过的区域再用 tiles 补发一遍清晰的。两路帧按送入顺序发出，
+不会出现旧画面盖住新补丁。
+
+本机实测（release 构建，3840×2400 桌面缩到 1600×1000，屏幕上有一处持续动画约 26 次/秒，10 秒平均，
+CPU 为 aad 加 ffmpeg 占单核的比例）：
+
+| 模式 | CPU | 带宽 |
+|---|---|---|
+| WebP 整图（5 帧/秒） | 50% | 约 540 KiB/s |
+| tiles | 8% | 约 14–34 KiB/s |
+| 自适应 tiles + h264 | 12% | 约 14–36 KiB/s |
+| h264（NVENC） | 23% | 约 4–10 KiB/s |
+| h264（x264） | 70% | 约 14–52 KiB/s |
+
+优化前同样场景下 NVENC 是 159%、x264 186%（每帧把 37 MB 的 4K 原图送进 ffmpeg 再由它缩小），tiles 26%（每帧整屏复制）。
+`tests/windows/verify_assist_tiles.py`（加 `--desktop` 再测桌面）检查：tiles 首帧是整画面、页面静止 6 秒 0 帧、
+点击只发按钮附近的补丁（1.8 KB，关键帧 35 KB）、按所有补丁拼出的画面和同一时刻的整张 WebP 只差 0.56/255、
+点击打字真实生效；自适应在大面积动画时切到视频、视频帧只报告动画区域、动画停止后该区域用 tiles 补发；
+自带查看页（另起一个 Chrome，避免被分享的页面变成后台标签而停止绘制）最终画面和页面一致；桌面报告 `dxgi`、
+补丁拼出的画面和服务端此刻的整帧逐块相比最差的块平均差 12/255（只有文字边缘的有损差异，没有错位或漏发的块）、
+打字只在编辑框附近产生约 1.2–6 KB、指针形状的 PNG 能解码且指针移到了点击处。
+
+### 视频流（需要宿主自备 ffmpeg）
+
+本项目不带编码器。按 `--ffmpeg PATH` → 环境变量 `AAD_FFMPEG` → PATH 上的 `ffmpeg` 的顺序找；找到后启动时
+对每种视频编码依次试编码器（先硬件后软件），**每一帧都必须在下一帧送进去之前编出来**才算可用，所以列在
+`ffmpeg -encoders` 里却用不了的（没有 NVIDIA 卡的 NVENC、没有 AMD 卡的 AMF）以及会攒帧的（Media Foundation
+的 H.264 要等输入结束才吐帧）都不会被选中。没有 ffmpeg 时只提供 WebP/JPEG，行为和以前一样。
+
+```powershell
+aad assist --probe-video                                 # 只报告这台机器能用哪些视频编码器，然后退出
+aad assist --desktop --codecs h264,webp                  # 优先 H.264，不支持视频的查看端退回 WebP
+aad assist --desktop --encoder libx264 --preset veryfast --bitrate 4000
+aad assist --browser-port 9222 --codecs vp9 --chroma 444 # 4:4:4，彩色小字更清楚
+aad assist --desktop --codecs av1 --ffmpeg-arg=-svtav1-params --ffmpeg-arg=pred-struct=1:lp=4
+```
+
+| 参数 | 作用 |
+|---|---|
+| `--codecs` | 提供哪些编码及顺序：`webp,jpeg,tiles,h264,vp9,av1`；`auto`（默认）= WebP、JPEG、tiles 加上能用的视频编码 |
+| `--ffmpeg` | ffmpeg 路径（否则 `AAD_FFMPEG`，再否则 PATH） |
+| `--encoder` | 指定 ffmpeg 编码器，可重复：作后备，或每种编码各指定一个；不指定时先试硬件 |
+| `--fps` | 最高帧率 1..60；不填时整图 5、tiles 和视频 30。只是上限，画面不变就不出帧 |
+| `--quality` | 1..100，图片的质量；视频不设 `--bitrate` 时换算成各编码器自己的恒定量化参数 |
+| `--bitrate` | 视频恒定码率（kbit/s） |
+| `--gop` | 关键帧间隔（帧数）；默认 0 = 只在开始或查看端要求时出关键帧 |
+| `--preset` | 编码器速度档（x264 `veryfast`、NVENC `p4`、SVT-AV1 `8`…）；默认各自最快的一档 |
+| `--chroma` | `420`（默认）或 `444`；不支持 4:4:4 的编码器会在试编时落选 |
+| `--ffmpeg-arg` | 原样追加一个 ffmpeg 输出参数，可重复（兜底，用于本项目没有包装的选项） |
+| `--max-width` / `--max-height` | 发出的画面最大宽高（默认 1600 宽、高不限），更大的屏幕按比例缩小；视频再取偶数 |
+| `--video-area` / `--video-rate` | 自适应时改用视频的门槛：变化占屏幕的百分比（默认 30）/ 每秒次数（默认 8） |
+| `--hide-cursor` | 不发桌面鼠标指针的位置和样子 |
+
+内置的编码器参数都是低延迟配置：x264 `ultrafast` + `zerolatency`、NVENC `p1` + `ull` + `zerolatency`、
+QSV `async_depth 1`、libvpx `realtime`、SVT-AV1 低延迟预测结构、libaom `realtime`，都不带 B 帧。
+H.264 用 FLV、VP9/AV1 用 IVF 从 ffmpeg 取出（两者都在帧前写长度，一帧编完立刻转发，不用等下一帧开头）。
+抓屏和编码在各自线程上，网络慢时不再抓新画面（而不是在视频流中间丢帧），所以查看端拿到的总是最新画面。
+
+自带查看页用 WebCodecs 解码，WebCodecs 只在安全上下文里有：`localhost`/`127.0.0.1` 直接打开可以，宿主通过
+https 代理也可以；不支持某种编码时查看页会重新 hello 把它去掉，退回 WebP。
+
+本机实测（Windows 11，RTX 4080 Laptop + Intel 核显，ffmpeg 9.0.1 full build，Chrome headless=new，
+`tests/windows/verify_assist_video.py --desktop`）：自动选中 h264_nvenc / vp9_qsv / av1_nvenc，试编各约
+250 ms、vp9_qsv 约 1.5 s（并行进行）；768×496 的图文页面关键帧 72 KB（H.264）/ 104 KB（VP9）/ 86 KB（AV1），
+页面静止 6 秒发出 0 帧，点击和打字每帧最大 0.8–1.7 KB；收到的每一帧都能被独立的 ffmpeg 解码（帧数一致），
+经视频流的点击和输入真实生效；自带查看页在 Chrome 里用 WebCodecs 解出并画出画面（三种编码、软件编码器、
+4:4:4 都试过）；整桌面 1536×960 H.264 解码和输入生效。macOS 的 h264_videotoolbox、AMD 的 AMF 只按文档配置，
+`[待验证: 对应硬件]`；Linux 的 VAAPI 等需要上传滤镜的编码器没有内置配置，可用 `--encoder` 加 `--ffmpeg-arg` 自配。
 
 浏览器画面的输入用 CDP `Input.*` 发给页面，桌面用 `SendInput`。这是给人用的通道，按屏幕位置操作，
 所以不通过 MCP 提供给 Agent。
 `tests/windows/verify_assist.py` 用真实 Chrome（加 `--desktop` 再测 Windows 桌面）检查默认收到 WebP、
-声明只要 JPEG 时收到 JPEG、点击和输入生效、错误 token 被拒绝。Linux 和 macOS 的整桌面分享还没有做。
+声明只要 JPEG 时收到 JPEG、点击和输入生效、错误 token 被拒绝；`tests/windows/verify_assist_video.py`
+和 `verify_assist_tiles.py` 检查上面的视频与 tiles 行为；`tests/windows/verify_assist_area.py` 检查 `--list-screens` 的显示器和窗口、`--monitor` 的画面就是该显示器、不存在的编号被拒绝；
+加 `--window` 时用隔离的探针窗口检查：首帧就是窗口大小、在画面里点哪里就落在窗口的哪里（窗口移动后也一样）、
+改变大小后按新尺寸重新开始、光标按窗口内的位置报告、补丁拼出的画面和此刻的关键帧逐块一致（最差的块平均差 2.5/255）；
+`tests/windows/verify_assist_viewers.py` 检查多个查看者：两人用不同编码同时看、只有控制者的点击生效、接管后上一位按着的
+Shift 被松开、控制者离开后控制权交回、画面静止时后来者和全部离开后重连的人都拿到首帧、超过 `--max-viewers` 的被拒绝；
+`tests/windows/verify_assist_input.py` 按页面上的
+实际效果检查远程操作：双击选中单词、Ctrl+A 后输入替换文字、Ctrl+/ 和 Ctrl+Space 以对应物理键到达页面、
+`release` 松开按住的 Ctrl、查看端按着 Shift 和鼠标键断开后两者都被松开；在自带查看页里用输入法组出“中文”只送达一次、
+在画面里按下拖到画面外松开仍然送达；加 `--desktop` 时比对桌面剪贴板的回答和本机独立读到的内容（不改剪贴板），
+并在隔离的探针窗口里检查 Home、Shift+End、Delete、方向键的编辑效果、扫描码和扩展键标志，以及断开后 Shift 被松开。
+`tests/linux/verify_assist_desktop.py` 在自起的 Xvfb 里检查 Linux（CI 的 Linux 任务每次都跑）。
+
+### macOS
+
+截屏经 ScreenCaptureKit（macOS 12.3 起）：每一帧都带着自上一帧以来变化的区域（像素坐标），只把这些区域读进保留的画面，
+和 Windows 的 DXGI、X11 的 DAMAGE 一样，不再每帧整屏拷贝和比较；画面按显示器的像素尺寸取，不含指针（指针单独发送，
+由查看端画）。窗口移动在 macOS 上只作为变化区域报告，没有 Windows 那样的“移动”指令。没有 ScreenCaptureKit
+（更早的系统）、它启动失败或中途停止时，退回 `CGDisplayCreateImage` 截整屏再逐块比较；`source.capture` 报告用的是
+`screencapturekit` 还是 `coregraphics`，退回时 `source.screencapturekit` 写明原因。ScreenCaptureKit 是弱链接的，
+旧系统上照样能启动。设置环境变量 `AAD_ASSIST_TRACE` 时，每一帧带来的变化区域个数打印到 stderr。
+`--desktop` 分享主显示器，`--monitor N` 分享其他显示器，`--list-screens` 列出显示器（单位是点）。输入作为 CGEvent 发出：
+鼠标事件带点击次数（macOS 靠它判断双击），按键用物理键对应的 Mac 虚拟键码并带上按住的修饰键标志，文字以 Unicode
+字符串输入，与键盘布局无关；快捷键按物理键原样转发，Windows 查看端的 Ctrl+C 在 Mac 上就是 Control+C，不会换成 Command。
+指针只报位置，形状用内置箭头（取系统光标图像需要 AppKit）；剪贴板取 `pbpaste` 的输出。截屏需要“屏幕录制”权限，
+输入需要“辅助功能”权限，`source.permissions` 报告两者；没有屏幕录制权限时会明确报错。`--window` 在 macOS 上不支持
+（`CGWindowListCreateImage` 在新系统上已废弃）。
+
+本机没有 Mac，macOS 在 CI 的 macOS runner 上验证（runner 授予了屏幕录制和辅助功能权限）：列出显示器、截屏走的是
+ScreenCaptureKit、查看端拿到第一帧（1024×768）；在 TextEdit 里经 assist 打六行字，发出的补丁约占屏幕的五分之一，
+补丁拼出的画面和系统 `screencapture` 独立截的屏逐块比对没有一块不同（和 assist 自己的关键帧比对查不出漏报，
+因为关键帧也是同样读出来的），二进制里 ScreenCaptureKit 是弱链接；输入按效果检查——指针落在查看端指的位置（由系统读回）、在 TextEdit 里输入的文字经 Cmd+S 存进文件、
+Cmd+A 后输入替换掉全文、Cmd+A Cmd+C 后 `pbpaste` 读到同样的文字。观察到的一点：组合键的四个事件毫无间隔地连发时，
+Cmd+C 有时不生效，查看端按真人节奏（键间约 50 ms）发送时稳定生效。双击、滚轮、多显示器、Retina 屏，
+以及 ScreenCaptureKit 在 4K/Retina 上相对整屏比较省下多少 CPU，在 Mac 上还没有检查 `[待验证: macOS 真机]`。
+
+### Linux（X11）
+
+不经过 helper 进程，进程内直接说 X11 协议（x11rb，纯 Rust）：DAMAGE 扩展报出每次截屏以来重画的区域，只用 GetImage
+读回这些区域，写进和 Windows 一样两份轮换的缓冲区，画面不变时一次往返都不多；没有 DAMAGE 的 X server 退回整屏读取加
+逐块比较（`source.capture` 为 `x11` 而不是 `x11-damage`）。输入走 XTest：按键按物理键对应的 keysym 在服务器键盘映射里
+找键码，映射里没有的字符（如中文）临时映射到一个空闲键码再按，用完恢复，和 xdotool 的做法相同。XFixes 给出指针位置和
+图像（预乘 ARGB 转成 PNG），RandR 给出显示器，`_NET_CLIENT_LIST` 给出窗口，`--monitor`、`--window`、`--list-screens`
+和 Windows 一样可用；剪贴板向 CLIPBOARD 的所有者要 UTF8_STRING。只支持 24/32 位色深的屏幕；Wayland 会话里的
+原生窗口看不到（XWayland 的可以）。
+
+`tests/linux/verify_assist_desktop.py`（需要 Xvfb、openbox、xev、xdotool、xsetroot、xclip，自起一个 X server，
+不碰用户桌面）检查：画面像素就是 xsetroot 设置的颜色、画面静止 3 秒 0 帧、移动一个窗口只发出屏幕 22.8% 的补丁、
+补丁拼出的画面和关键帧逐块一致、指针精确落在查看端指的位置（xdotool 读回）、点击、Ctrl、滚轮和输入的“aZ;中”
+（“中”走临时键码）都作为 X 事件到达 xev 窗口、查看端按着 Shift 断开后 Shift 被松开、光标消息带可解码的形状、
+剪贴板取回 xclip 放进去的文字、`--list-screens` 列出显示器和窗口、`--window` 的画面正好是该窗口大小。
 
 ## 桌面窗口（GUI）
 
@@ -492,10 +672,15 @@ crates/
   aad-plugin    NDJSON over stdio 插件宿主、AADF 制品侧信道
   aad-runtime   工作流引擎、模板、journal、沙箱脚本
   aad-ocr       原生 Tesseract OCR 与图片输入校验
-  aad-atspi     Linux AT-SPI / X11 驱动
-  aad-macos-ax  macOS AX 的 Rust adapter 与 Swift helper 协议
-  aad-uia       原生 UI Automation：发现、描述、控制
-  aad-probe     只读能力探测
+  aad-platform  各系统共同的词汇：共享屏幕与输入（Desktop）、画面与变化区域、按键表、探测结果、结构化错误
+  aad-windows   Windows 的系统能力：DXGI/GDI 截屏、PrintWindow、SendInput、剪贴板、OCR、探测（只在 Windows 上编译）
+  aad-linux     Linux 的系统能力：X11 截屏（DAMAGE）、XTest 输入、剪贴板、探测（只在 Linux 上编译）
+  aad-macos     macOS 的系统能力：ScreenCaptureKit 截屏、CGEvent 输入、剪贴板、探测（只在 macOS 上编译）
+  aad-desktop   与系统无关的桌面驱动：UI 模型、Backend 边界、动作分发、录制与观察
+  aad-uia       Windows UI Automation 后端（只在 Windows 上编译）
+  aad-atspi     Linux AT-SPI / X11 驱动（只在 Linux 上依赖）
+  aad-macos-ax  macOS AX 的 Rust adapter 与 Swift helper 协议（只在 macOS 上依赖）
+  aad-probe     只读能力探测（汇总报告；各系统的检查在对应平台 crate 里）
   aad-mcp       stdio 上的 MCP server
   aad-cli       aad 可执行文件
 gui/            Tauri + Vue 桌面窗口

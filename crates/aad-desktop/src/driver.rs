@@ -16,7 +16,7 @@ use crate::backend::{
 };
 use crate::capture::{self, CapturedEvent};
 use crate::model::{Locator, Node, Snapshot, Target, NODE_ACTIONS, OUTLINE_BUDGET};
-use crate::observe_session::{ObserveManager, ObserveSource};
+use crate::observe_session::ObserveManager;
 use aad_plugin::{manifest, CapabilityManifest};
 use aad_runtime::journal::now_rfc3339;
 use aad_runtime::provider::Provider;
@@ -779,29 +779,14 @@ impl UiaDriver {
 }
 
 impl UiaDriver {
-    /// Install a capture session for a window.
-    ///
-    /// The one platform-dependent step. Where capture is not implemented this
-    /// says so rather than starting a session that would never produce a step:
-    /// a recorder that appears to work and records nothing is worse than one
-    /// that refuses.
-    #[cfg(windows)]
+    /// Install a capture session for a window, from the backend.
     fn open_capture(&self, window_id: &str, args: &Value) -> Result<Box<dyn CaptureSource>> {
         let limit = args
             .get("buffer")
             .and_then(Value::as_u64)
             .unwrap_or(512)
             .clamp(16, 4096) as usize;
-        let session = crate::windows::CaptureSession::start(window_id, limit)?;
-        Ok(Box::new(session))
-    }
-
-    #[cfg(not(windows))]
-    fn open_capture(&self, _window_id: &str, _args: &Value) -> Result<Box<dyn CaptureSource>> {
-        Err(DriverError::new(
-            "DRIVER.ACTION_UNSUPPORTED",
-            "recording interactions is only implemented on Windows so far",
-        ))
+        self.backend.open_capture(window_id, limit)
     }
 
     /// Start a desktop-wide observation session.
@@ -814,22 +799,8 @@ impl UiaDriver {
             .and_then(Value::as_u64)
             .unwrap_or(4_096)
             .clamp(64, 65_536) as usize;
-        let session = self.open_observation(limit)?;
+        let session = self.backend.open_observation(limit)?;
         Ok(self.observations.start(session))
-    }
-
-    #[cfg(windows)]
-    fn open_observation(&self, limit: usize) -> Result<Box<dyn ObserveSource>> {
-        let session = crate::observer_win::ObserverSession::start(limit)?;
-        Ok(Box::new(session))
-    }
-
-    #[cfg(not(windows))]
-    fn open_observation(&self, _limit: usize) -> Result<Box<dyn ObserveSource>> {
-        Err(DriverError::new(
-            "DRIVER.ACTION_UNSUPPORTED",
-            "ambient observation is only implemented on Windows so far",
-        ))
     }
 }
 

@@ -78,12 +78,22 @@ class Viewer:
         if opcode == 2:
             # aad-frame/1: version, codec, flags, reserved, width, height, header length, reserved, timestamp
             version, codec, flags, _, width, height, skip, _, at = struct.unpack(">BBBBIIHHQ", payload[:24])
+            regions = None
+            if flags & 2:
+                regions = [struct.unpack(">HHHH", payload[26 + 8 * i:34 + 8 * i])
+                           for i in range(struct.unpack(">H", payload[24:26])[0])]
             return {"type": "frame", "version": version, "codec": {1: "jpeg", 2: "webp"}.get(codec, codec),
                     "keyframe": bool(flags & 1), "width": width, "height": height, "at_ms": at,
-                    "data": payload[skip:]}
+                    "regions": regions, "data": payload[skip:]}
         return None
 
     def close(self):
+        # Shut down first: on Linux closing a socket another thread is reading
+        # does not end the connection, and the server would never see it go.
+        try:
+            self.sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
         self.sock.close()
 
     def send(self, message):

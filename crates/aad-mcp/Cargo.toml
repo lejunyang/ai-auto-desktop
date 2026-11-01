@@ -11,12 +11,10 @@ description = "Model Context Protocol server exposing desktop discovery and auto
 aad-core = { workspace = true }
 aad-control = { workspace = true }
 aad-cdp = { workspace = true }
-aad-atspi = { workspace = true }
-aad-macos-ax = { workspace = true }
 aad-ocr = { workspace = true }
 aad-probe = { workspace = true }
 aad-runtime = { workspace = true }
-aad-uia = { workspace = true }
+aad-desktop = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }

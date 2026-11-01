@@ -434,6 +434,19 @@ fn dispatch(command: &Command) -> (Value, u8) {
     }
 }
 
+/// The desktop driver on Windows UI Automation; elsewhere the error that
+/// says there is none (Linux and macOS have their own providers).
+fn native_driver() -> Result<aad_desktop::UiaDriver, aad_desktop::DriverError> {
+    #[cfg(windows)]
+    {
+        aad_uia::native_driver()
+    }
+    #[cfg(not(windows))]
+    {
+        Err(aad_desktop::unavailable())
+    }
+}
+
 /// Stream ambient observations as JSONL: one JSON object per line.
 ///
 /// The loop is "events wake, snapshots tell the truth": native events are
@@ -442,7 +455,7 @@ fn dispatch(command: &Command) -> (Value, u8) {
 /// snapshot. Only the incremental ChangeSet is emitted. A low-frequency poll
 /// covers applications whose events do not arrive.
 fn run_watch(args: &WatchArgs) -> (Value, u8) {
-    let driver = match aad_uia::native_driver() {
+    let driver = match native_driver() {
         Ok(driver) => driver,
         Err(error) => {
             return (
@@ -494,7 +507,7 @@ fn run_watch(args: &WatchArgs) -> (Value, u8) {
     // Per-window baseline snapshots, keyed by the backend's window id. A
     // window revisited after being closed is a new baseline either way, which
     // re-keying by the current window id naturally expresses.
-    let mut baselines: std::collections::HashMap<String, aad_uia::Snapshot> =
+    let mut baselines: std::collections::HashMap<String, aad_desktop::Snapshot> =
         std::collections::HashMap::new();
 
     let started_at = std::time::Instant::now();
@@ -564,7 +577,7 @@ fn run_watch(args: &WatchArgs) -> (Value, u8) {
     };
 
     let finish = |sink: &mut Box<dyn std::io::Write>,
-                  driver: &aad_uia::UiaDriver,
+                  driver: &aad_desktop::UiaDriver,
                   observe_id: &str,
                   total_dropped: u64,
                   stopped_early: bool| {
@@ -658,7 +671,7 @@ fn run_watch(args: &WatchArgs) -> (Value, u8) {
                 }
             }
         }
-        let mut events: Vec<aad_uia::ObservedEvent> = events_json
+        let mut events: Vec<aad_desktop::ObservedEvent> = events_json
             .iter()
             .filter_map(|value| serde_json::from_value(value.clone()).ok())
             .collect();
@@ -670,11 +683,11 @@ fn run_watch(args: &WatchArgs) -> (Value, u8) {
             fallback_interval.is_some_and(|interval| last_fallback.elapsed() >= interval);
         if fallback_due {
             last_fallback = std::time::Instant::now();
-            events.push(aad_uia::ObservedEvent {
+            events.push(aad_desktop::ObservedEvent {
                 sequence: u64::MAX,
-                kind: aad_uia::ObservationKind::Other,
+                kind: aad_desktop::ObservationKind::Other,
                 source: "poll_fallback".to_string(),
-                window: aad_uia::EventWindow::unknown(),
+                window: aad_desktop::EventWindow::unknown(),
                 element: None,
                 observed_at: std::time::Instant::now(),
             });
@@ -685,7 +698,7 @@ fn run_watch(args: &WatchArgs) -> (Value, u8) {
         }
 
         // Fold the raw burst into a few (window, kind) re-snapshot triggers.
-        let triggers = aad_uia::fold_triggers(&events, quiet);
+        let triggers = aad_desktop::fold_triggers(&events, quiet);
 
         // Resolve the current foreground window once for this batch. UIA
         // events only carry a pid, and a foreground switch that is still
@@ -701,12 +714,12 @@ fn run_watch(args: &WatchArgs) -> (Value, u8) {
             .and_then(|id| window_listing(&driver, id));
 
         let mut targets: Vec<Option<String>> = Vec::new();
-        let mut switches: Vec<&aad_uia::ObservedEvent> = Vec::new();
+        let mut switches: Vec<&aad_desktop::ObservedEvent> = Vec::new();
         for trigger in &triggers {
-            if trigger.kind == aad_uia::ObservationKind::ForegroundChanged {
+            if trigger.kind == aad_desktop::ObservationKind::ForegroundChanged {
                 if let Some(event) = events
                     .iter()
-                    .find(|event| event.kind == aad_uia::ObservationKind::ForegroundChanged)
+                    .find(|event| event.kind == aad_desktop::ObservationKind::ForegroundChanged)
                 {
                     switches.push(event);
                 }
@@ -781,17 +794,20 @@ fn run_watch(args: &WatchArgs) -> (Value, u8) {
 }
 
 /// Resolve one window id to its current listing, or None when it is gone.
-fn window_listing(driver: &aad_uia::UiaDriver, window_id: &str) -> Option<aad_uia::WindowInfo> {
+fn window_listing(
+    driver: &aad_desktop::UiaDriver,
+    window_id: &str,
+) -> Option<aad_desktop::WindowInfo> {
     let listing = driver.call("list_windows", &json!({})).ok()?;
     listing["windows"]
         .as_array()?
         .iter()
-        .filter_map(|value| serde_json::from_value::<aad_uia::WindowInfo>(value.clone()).ok())
+        .filter_map(|value| serde_json::from_value::<aad_desktop::WindowInfo>(value.clone()).ok())
         .find(|window| window.window_id == window_id)
 }
 
 /// The foreground window's id, or None when it cannot be determined.
-fn current_foreground_id(driver: &aad_uia::UiaDriver) -> Option<String> {
+fn current_foreground_id(driver: &aad_desktop::UiaDriver) -> Option<String> {
     let listing = driver.call("list_windows", &json!({})).ok()?;
     listing["windows"]
         .as_array()?
@@ -805,19 +821,21 @@ fn current_foreground_id(driver: &aad_uia::UiaDriver) -> Option<String> {
 /// and roll the baseline forward. The first capture of a window becomes a
 /// baseline (and, with --full, an emitted snapshot).
 fn resnapshot_and_diff(
-    driver: &aad_uia::UiaDriver,
+    driver: &aad_desktop::UiaDriver,
     sink: &mut Box<dyn std::io::Write>,
-    baselines: &mut std::collections::HashMap<String, aad_uia::Snapshot>,
+    baselines: &mut std::collections::HashMap<String, aad_desktop::Snapshot>,
     window_id: &str,
     args: &WatchArgs,
     emit: &impl Fn(&mut Box<dyn std::io::Write>, Value),
-) -> Result<(), aad_uia::DriverError> {
+) -> Result<(), aad_desktop::DriverError> {
     let captured = driver.call(
         "snapshot",
         &json!({"window_id": window_id, "max_nodes": args.max_nodes}),
     )?;
-    let snapshot: aad_uia::Snapshot = serde_json::from_value(captured.clone())
-        .map_err(|error| aad_uia::DriverError::invalid(format!("bad snapshot json: {error}")))?;
+    let snapshot: aad_desktop::Snapshot =
+        serde_json::from_value(captured.clone()).map_err(|error| {
+            aad_desktop::DriverError::invalid(format!("bad snapshot json: {error}"))
+        })?;
 
     match baselines.get(window_id) {
         None => {
@@ -836,7 +854,7 @@ fn resnapshot_and_diff(
             baselines.insert(window_id.to_string(), snapshot);
         }
         Some(previous) => {
-            let changes = aad_uia::diff_trees(previous, &snapshot);
+            let changes = aad_desktop::diff_trees(previous, &snapshot);
             if changes.is_empty() {
                 baselines.insert(window_id.to_string(), snapshot);
                 return Ok(());
@@ -860,9 +878,9 @@ fn resnapshot_and_diff(
                     }),
                 );
             } else {
-                let digest = aad_uia::digest(
+                let digest = aad_desktop::digest(
                     &changes,
-                    &aad_uia::DigestOptions {
+                    &aad_desktop::DigestOptions {
                         max_items: args.max_items,
                         include_states: true,
                     },
@@ -962,7 +980,7 @@ fn write_listing(
     (summary, EXIT_OK)
 }
 
-fn driver_failure(error: &aad_uia::DriverError) -> Value {
+fn driver_failure(error: &aad_desktop::DriverError) -> Value {
     let mut payload = json!({
         "status": "error",
         "error": {
@@ -1614,7 +1632,7 @@ fn durable_options(
             providers.insert(std::sync::Arc::new(provider));
         }
     }
-    if let Ok(driver) = aad_uia::native_driver() {
+    if let Ok(driver) = native_driver() {
         providers.insert(std::sync::Arc::new(driver));
     }
     let mode = match execution.durable_actions {
