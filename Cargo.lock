@@ -4,7 +4,7 @@ version = 3
 
 [[package]]
 name = "aad-atspi"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "aad-core",
  "aad-plugin",
@@ -20,7 +20,7 @@ dependencies = [
 
 [[package]]
 name = "aad-cdp"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "base64 0.22.1",
  "clap",
@@ -35,7 +35,7 @@ dependencies = [
 
 [[package]]
 name = "aad-cli"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "aad-atspi",
  "aad-cdp",
@@ -65,7 +65,7 @@ dependencies = [
 
 [[package]]
 name = "aad-control"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "aad-atspi",
  "aad-cdp",
@@ -87,7 +87,7 @@ dependencies = [
 
 [[package]]
 name = "aad-core"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "indexmap 2.14.1",
  "serde",
@@ -98,7 +98,7 @@ dependencies = [
 
 [[package]]
 name = "aad-gui"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "aad-control",
  "aad-core",
@@ -112,7 +112,7 @@ dependencies = [
 
 [[package]]
 name = "aad-macos-ax"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "aad-core",
  "aad-plugin",
@@ -128,7 +128,7 @@ dependencies = [
 
 [[package]]
 name = "aad-mcp"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "aad-atspi",
  "aad-cdp",
@@ -146,7 +146,7 @@ dependencies = [
 
 [[package]]
 name = "aad-ocr"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "aad-core",
  "aad-plugin",
@@ -161,7 +161,7 @@ dependencies = [
 
 [[package]]
 name = "aad-plugin"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "aad-core",
  "serde",
@@ -173,7 +173,7 @@ dependencies = [
 
 [[package]]
 name = "aad-probe"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "aad-plugin",
  "libc",
@@ -185,7 +185,7 @@ dependencies = [
 
 [[package]]
 name = "aad-runtime"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "aad-core",
  "aad-plugin",
@@ -201,7 +201,7 @@ dependencies = [
 
 [[package]]
 name = "aad-uia"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "aad-core",
  "aad-plugin",
