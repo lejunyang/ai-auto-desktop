@@ -18,7 +18,6 @@ windows-native-examples = []
 aad-desktop = { workspace = true }
 aad-platform = { workspace = true }
 aad-windows = { workspace = true }
-image = { workspace = true }
 serde_json = { workspace = true }
 # The #[implement] macro expands to `windows_core::` paths and resolves them at
 # the crate root, so windows-core has to be a dependency in its own right --
@@ -38,18 +37,8 @@ windows = { version = "0.58", features = [
     "Win32_UI_Input_Ime",
     "Win32_Graphics_Gdi",
     "Win32_UI_HiDpi",
-    "Win32_Storage_Xps",
     "Win32_Graphics_Dwm",
-    "Win32_System_DataExchange",
-    "Win32_System_Memory",
     "Win32_System_StationsAndDesktops",
-    # Windows' built-in OCR for control_read_text.
-    "Foundation",
-    "Foundation_Collections",
-    "Globalization",
-    "Graphics_Imaging",
-    "Media_Ocr",
-    "Storage_Streams",
 ] }
 
 # The native tests and the investigation examples drive whole workflows.
@@ -57,6 +46,7 @@ windows = { version = "0.58", features = [
 aad-core = { workspace = true }
 aad-runtime = { workspace = true }
 base64 = "0.22"
+image = { workspace = true }
 uuid = { workspace = true }
 
 # Inherit the workspace's deliberate lint allowances (see the root Cargo.toml).
