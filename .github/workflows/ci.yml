@@ -265,7 +265,7 @@ jobs:
           : > /tmp/assist-changes.txt
           open -a TextEdit /tmp/assist-changes.txt
           sleep 3
-          PYTHONPATH=tests/windows /tmp/assist-venv/bin/python - <<'PY'
+          AAD_ASSIST_TRACE=1 PYTHONPATH=tests/windows /tmp/assist-venv/bin/python - <<'PY'
           import json, subprocess, sys, time
           from PIL import Image, ImageChops, ImageStat
           import verify_assist
@@ -327,6 +327,11 @@ jobs:
               assert len(wrong) <= 4, result
           finally:
               assist.terminate()
+              # What ScreenCaptureKit handed over, frame by frame.
+              trace = assist.stderr.read().splitlines()
+              print(len(trace), "trace lines")
+              for line in trace[:15] + trace[-15:]:
+                  print(line)
               subprocess.run(["pkill", "-x", "TextEdit"])
           PY
 
