@@ -558,7 +558,12 @@ Shift 被松开、控制者离开后控制权交回、画面静止时后来者�
 
 ### macOS
 
-经 CoreGraphics：`CGDisplayCreateImage` 截整块显示器（物理像素），和上一张逐块比较，tiles 和视频照样只发变化的部分；
+截屏经 ScreenCaptureKit（macOS 12.3 起）：每一帧都带着自上一帧以来变化的区域（像素坐标），只把这些区域读进保留的画面，
+和 Windows 的 DXGI、X11 的 DAMAGE 一样，不再每帧整屏拷贝和比较；画面按显示器的像素尺寸取，不含指针（指针单独发送，
+由查看端画）。窗口移动在 macOS 上只作为变化区域报告，没有 Windows 那样的“移动”指令。没有 ScreenCaptureKit
+（更早的系统）、它启动失败或中途停止时，退回 `CGDisplayCreateImage` 截整屏再逐块比较；`source.capture` 报告用的是
+`screencapturekit` 还是 `coregraphics`，退回时 `source.screencapturekit` 写明原因。ScreenCaptureKit 是弱链接的，
+旧系统上照样能启动。设置环境变量 `AAD_ASSIST_TRACE` 时，每一帧带来的变化区域个数打印到 stderr。
 `--desktop` 分享主显示器，`--monitor N` 分享其他显示器，`--list-screens` 列出显示器（单位是点）。输入作为 CGEvent 发出：
 鼠标事件带点击次数（macOS 靠它判断双击），按键用物理键对应的 Mac 虚拟键码并带上按住的修饰键标志，文字以 Unicode
 字符串输入，与键盘布局无关；快捷键按物理键原样转发，Windows 查看端的 Ctrl+C 在 Mac 上就是 Control+C，不会换成 Command。
@@ -566,11 +571,13 @@ Shift 被松开、控制者离开后控制权交回、画面静止时后来者�
 输入需要“辅助功能”权限，`source.permissions` 报告两者；没有屏幕录制权限时会明确报错。`--window` 在 macOS 上不支持
 （`CGWindowListCreateImage` 在新系统上已废弃）。
 
-本机没有 Mac，macOS 在 CI 的 macOS runner 上验证（runner 授予了屏幕录制和辅助功能权限）：列出显示器、查看端拿到
-第一帧（1024×768）；输入按效果检查——指针落在查看端指的位置（由系统读回）、在 TextEdit 里输入的文字经 Cmd+S 存进文件、
+本机没有 Mac，macOS 在 CI 的 macOS runner 上验证（runner 授予了屏幕录制和辅助功能权限）：列出显示器、截屏走的是
+ScreenCaptureKit、查看端拿到第一帧（1024×768）；在 TextEdit 里经 assist 打六行字，发出的补丁约占屏幕的五分之一，
+补丁拼出的画面和系统 `screencapture` 独立截的屏逐块比对没有一块不同（和 assist 自己的关键帧比对查不出漏报，
+因为关键帧也是同样读出来的），二进制里 ScreenCaptureKit 是弱链接；输入按效果检查——指针落在查看端指的位置（由系统读回）、在 TextEdit 里输入的文字经 Cmd+S 存进文件、
 Cmd+A 后输入替换掉全文、Cmd+A Cmd+C 后 `pbpaste` 读到同样的文字。观察到的一点：组合键的四个事件毫无间隔地连发时，
-Cmd+C 有时不生效，查看端按真人节奏（键间约 50 ms）发送时稳定生效。双击、滚轮、多显示器和 Retina 屏上的效果在 Mac
-上还没有单独检查 `[待验证: macOS 真机]`。
+Cmd+C 有时不生效，查看端按真人节奏（键间约 50 ms）发送时稳定生效。双击、滚轮、多显示器、Retina 屏，
+以及 ScreenCaptureKit 在 4K/Retina 上相对整屏比较省下多少 CPU，在 Mac 上还没有检查 `[待验证: macOS 真机]`。
 
 ### Linux（X11）
 
