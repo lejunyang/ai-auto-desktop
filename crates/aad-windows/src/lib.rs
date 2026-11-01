@@ -6,6 +6,7 @@
 
 pub mod clipboard;
 mod desktop;
+pub mod probe;
 mod screen;
 
 pub use desktop::{open, screens};

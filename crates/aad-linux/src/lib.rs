@@ -5,6 +5,7 @@
 #![cfg(target_os = "linux")]
 
 mod desktop;
+pub mod probe;
 mod x11;
 
 pub use desktop::{open, screens};

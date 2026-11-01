@@ -6,6 +6,9 @@
 //! that run everywhere.
 
 use crate::model::{Bounds, Node, Snapshot, WindowInfo};
+pub use aad_platform::{
+    ImageBox, Pixels, PointerButton, Recognition, ScrollDirection, ScrollSpec, TextSpan,
+};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -78,14 +81,15 @@ impl std::fmt::Display for DriverError {
 
 impl std::error::Error for DriverError {}
 
-/// A platform crate's failure: nothing was done.
+/// A platform crate's failure, as the driver reports it.
 impl From<aad_platform::Error> for DriverError {
     fn from(error: aad_platform::Error) -> Self {
-        let made = Self::new(error.code, error.message);
-        if error.retryable {
-            made.retryable()
-        } else {
-            made
+        Self {
+            code: error.code.to_string(),
+            message: error.message,
+            retryable: error.retryable,
+            effect: error.effect.to_string(),
+            details: error.details,
         }
     }
 }
@@ -131,34 +135,6 @@ impl CaptureLimits {
     }
 }
 
-/// Which mouse button a pointer gesture uses.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub enum PointerButton {
-    #[default]
-    Left,
-    Right,
-    Middle,
-}
-
-/// A scroll direction. Named rather than a signed delta, so the caller states
-/// intent ("scroll down") and never a screen quantity that could stand in for a
-/// coordinate.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ScrollDirection {
-    Up,
-    Down,
-    Left,
-    Right,
-}
-
-/// A scroll request: which way, and how many notches (a notch is one wheel
-/// detent, WHEEL_DELTA).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ScrollSpec {
-    pub direction: ScrollDirection,
-    pub notches: u32,
-}
-
 /// Everything a pointer gesture beyond a plain left click needs.
 ///
 /// The point acted on is always derived inside the backend from the element's
@@ -180,54 +156,6 @@ pub struct PointerGesture {
     pub scroll: Option<ScrollSpec>,
     /// When set, the gesture hovers: move to the point and dwell this long.
     pub hover_ms: Option<u64>,
-}
-
-/// The pixels of one captured element, top-down RGBA rows.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Pixels {
-    pub width: u32,
-    pub height: u32,
-    pub rgba: Vec<u8>,
-    /// The element was larger than the capture ceiling and was cut.
-    pub clipped: bool,
-}
-
-impl Pixels {
-    /// The colour at a pixel, for tests and checks.
-    pub fn at(&self, x: u32, y: u32) -> Option<[u8; 4]> {
-        if x >= self.width || y >= self.height {
-            return None;
-        }
-        let index = ((y * self.width + x) * 4) as usize;
-        self.rgba
-            .get(index..index + 4)
-            .map(|p| [p[0], p[1], p[2], p[3]])
-    }
-}
-
-/// A box inside a captured image, in its pixels.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct ImageBox {
-    pub x: f64,
-    pub y: f64,
-    pub width: f64,
-    pub height: f64,
-}
-
-/// One recognised word or line.
-#[derive(Clone, Debug, PartialEq)]
-pub struct TextSpan {
-    pub text: String,
-    pub bounds: ImageBox,
-}
-
-/// What OCR read from an image.
-#[derive(Clone, Debug, PartialEq)]
-pub struct Recognition {
-    pub engine: String,
-    pub language: String,
-    /// Each line with its words.
-    pub lines: Vec<(TextSpan, Vec<TextSpan>)>,
 }
 
 /// The operations a platform backend must provide.

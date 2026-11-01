@@ -137,6 +137,7 @@ dependencies = [
  "aad-platform",
  "base64 0.22.1",
  "image",
+ "libc",
  "serde_json",
  "x11rb",
 ]
@@ -229,12 +230,13 @@ dependencies = [
 name = "aad-probe"
 version = "0.0.4"
 dependencies = [
+ "aad-linux",
+ "aad-macos",
+ "aad-platform",
  "aad-plugin",
- "libc",
+ "aad-windows",
  "serde",
  "serde_json",
- "windows 0.58.0",
- "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -279,6 +281,7 @@ dependencies = [
  "image",
  "serde_json",
  "windows 0.58.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

@@ -5,6 +5,7 @@
 
 mod desktop;
 mod macos;
+pub mod probe;
 mod sck;
 
 pub use desktop::{open, screens};
