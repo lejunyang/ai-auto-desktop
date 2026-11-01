@@ -107,6 +107,27 @@ jobs:
           test -n "$AAD_TEST_CHROME"
           cargo test --locked -p aad-control --test browser_e2e -- --ignored
 
+      # Each system builds only its own platform code: aad depends on this
+      # system's platform crate and accessibility backend, and on none of the
+      # other systems'.
+      - name: Check aad depends only on this system's platform crates
+        shell: bash
+        run: |
+          set -euo pipefail
+          crates=" $(cargo tree --locked -p aad-cli -e normal --prefix none | grep -oE '^aad-[a-z-]+' | sort -u | tr '\n' ' ')"
+          echo "aad depends on:$crates"
+          case "$RUNNER_OS" in
+            Windows) own="aad-windows aad-uia"; others="aad-linux aad-atspi aad-macos aad-macos-ax" ;;
+            Linux) own="aad-linux aad-atspi"; others="aad-windows aad-uia aad-macos aad-macos-ax" ;;
+            macOS) own="aad-macos aad-macos-ax"; others="aad-windows aad-uia aad-linux aad-atspi" ;;
+          esac
+          for crate in $own; do
+            [[ "$crates" == *" $crate "* ]] || { echo "aad lacks $crate" >&2; exit 1; }
+          done
+          for crate in $others; do
+            [[ "$crates" != *" $crate "* ]] || { echo "$crate is built here, where it does nothing" >&2; exit 1; }
+          done
+
       # aad assist on the macOS desktop: the displays are listed, the display
       # is read through ScreenCaptureKit, and a viewer gets a first picture,
       # or, where the runner grants no Screen Recording, the error that says
