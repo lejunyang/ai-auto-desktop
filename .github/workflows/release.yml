@@ -116,17 +116,18 @@ jobs:
         run: |
           set -euo pipefail
           test ! -f pyproject.toml
-          # Retain Windows hardware test harnesses; forbid a second shipped
-          # Python implementation everywhere else, as in the CI gate.
-          if git ls-files '*.py' '*.pyi' ':!:tests/windows/*.py' | grep -q .; then
+          # Retain the Windows hardware probes and the X11 assist check, which
+          # are test harnesses; forbid a second shipped Python implementation
+          # everywhere else, as in the CI gate.
+          if git ls-files '*.py' '*.pyi' ':!:tests/windows/*.py' ':!:tests/linux/*.py' | grep -q .; then
             echo "tracked Python implementation files remain" >&2
-            git ls-files '*.py' '*.pyi' ':!:tests/windows/*.py' >&2
+            git ls-files '*.py' '*.pyi' ':!:tests/windows/*.py' ':!:tests/linux/*.py' >&2
             exit 1
           fi
 
       - name: Check retained Windows hardware probes
         if: runner.os == 'Windows'
-        run: python -m compileall -q tests/windows
+        run: python -m compileall -q tests/windows tests/linux
 
       - name: Install Linux native driver test dependencies
         if: runner.os == 'Linux'
