@@ -21,12 +21,13 @@ use objc2_core_video::{
     CVPixelBufferGetWidth, CVPixelBufferLockBaseAddress, CVPixelBufferLockFlags,
     CVPixelBufferUnlockBaseAddress,
 };
-use objc2_foundation::{NSArray, NSDictionary, NSError, NSNumber, NSString, NSValue};
+use objc2_foundation::{NSArray, NSDictionary, NSError, NSNumber, NSRect, NSString, NSValue};
 use objc2_screen_capture_kit::{
     SCContentFilter, SCDisplay, SCFrameStatus, SCShareableContent, SCStream, SCStreamConfiguration,
     SCStreamDelegate, SCStreamFrameInfoDirtyRects, SCStreamFrameInfoStatus, SCStreamOutput,
     SCStreamOutputType,
 };
+use std::ffi::c_void;
 use std::sync::{mpsc, Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -110,11 +111,21 @@ impl Output {
             .and_then(|d| d.downcast::<NSArray>().ok());
         let mut latest = lock(self.ivars());
         latest.frame = Some(image);
+        let before = latest.changed.len();
         match dirty {
             Some(dirty) => {
                 for value in dirty.iter() {
-                    if let Ok(value) = value.downcast::<NSValue>() {
-                        latest.changed.extend(pixels(unsafe { value.rectValue() }));
+                    match rect_of(&value) {
+                        Some(rect) => latest.changed.extend(pixels(rect)),
+                        // Not a rect as documented: read the frame whole
+                        // rather than miss what changed.
+                        None => {
+                            trace(format_args!(
+                                "dirty rect of class {:?}",
+                                value.class().name()
+                            ));
+                            latest.whole = true;
+                        }
                     }
                 }
                 if latest.changed.len() > MOST_REGIONS {
@@ -124,6 +135,44 @@ impl Output {
             }
             None => latest.whole = true,
         }
+        trace(format_args!(
+            "frame: {} dirty rects, whole {}",
+            latest.changed.len().saturating_sub(before),
+            latest.whole
+        ));
+    }
+}
+
+/// A dirty rect: a CGRect in an NSValue, as documented, or a CGRect's
+/// dictionary form.
+fn rect_of(value: &AnyObject) -> Option<NSRect> {
+    if let Some(value) = value.downcast_ref::<NSValue>() {
+        // SAFETY: rectValue is asked only of a value holding a CGRect.
+        let kind = unsafe { std::ffi::CStr::from_ptr(value.objCType().as_ptr()) }.to_bytes();
+        let rect = kind.starts_with(b"{CGRect") || kind.starts_with(b"{_NSRect");
+        return rect.then(|| unsafe { value.rectValue() });
+    }
+    if value.downcast_ref::<NSDictionary>().is_some() {
+        let mut rect = NSRect::default();
+        let read = unsafe {
+            CGRectMakeWithDictionaryRepresentation((value as *const AnyObject).cast(), &mut rect)
+        };
+        return read.then_some(rect);
+    }
+    None
+}
+
+#[link(name = "CoreGraphics", kind = "framework")]
+extern "C" {
+    fn CGRectMakeWithDictionaryRepresentation(dict: *const c_void, rect: *mut NSRect) -> bool;
+}
+
+/// With AAD_ASSIST_TRACE set, what ScreenCaptureKit hands over goes to
+/// stderr, to tell a capture that misses changes from one that gets none.
+fn trace(what: std::fmt::Arguments<'_>) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *ON.get_or_init(|| std::env::var_os("AAD_ASSIST_TRACE").is_some()) {
+        eprintln!("assist: screencapturekit {what}");
     }
 }
 
@@ -138,7 +187,7 @@ fn frame_info(buffer: &CMSampleBuffer) -> Option<Retained<NSDictionary<NSString,
 }
 
 /// A rect in pixels, widened to whole pixels.
-fn pixels(rect: objc2_foundation::NSRect) -> Option<Rect> {
+fn pixels(rect: NSRect) -> Option<Rect> {
     let left = rect.origin.x.floor().max(0.0);
     let top = rect.origin.y.floor().max(0.0);
     let right = (rect.origin.x + rect.size.width).ceil();
