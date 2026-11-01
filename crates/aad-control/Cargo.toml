@@ -12,8 +12,6 @@ aad-core.workspace = true
 aad-runtime.workspace = true
 aad-plugin.workspace = true
 aad-uia.workspace = true
-aad-atspi.workspace = true
-aad-macos-ax.workspace = true
 aad-cdp.workspace = true
 aad-ocr.workspace = true
 base64 = "0.22"
@@ -23,6 +21,12 @@ uuid.workspace = true
 sha2.workspace = true
 fs2 = "0.4"
 libc.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+aad-atspi.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+aad-macos-ax.workspace = true
 
 [dev-dependencies]
 

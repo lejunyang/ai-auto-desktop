@@ -161,11 +161,9 @@ dependencies = [
 name = "aad-mcp"
 version = "0.0.4"
 dependencies = [
- "aad-atspi",
  "aad-cdp",
  "aad-control",
  "aad-core",
- "aad-macos-ax",
  "aad-ocr",
  "aad-probe",
  "aad-runtime",

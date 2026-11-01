@@ -16,8 +16,6 @@ aad-core = { workspace = true }
 aad-control = { workspace = true }
 aad-mcp = { workspace = true }
 aad-ocr = { workspace = true }
-aad-atspi = { workspace = true }
-aad-macos-ax = { workspace = true }
 aad-plugin = { workspace = true }
 aad-probe = { workspace = true }
 aad-runtime = { workspace = true }
@@ -41,10 +39,12 @@ webp = { version = "0.3", default-features = false }
 aad-windows = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
+aad-atspi = { workspace = true }
 aad-linux = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 aad-macos = { workspace = true }
+aad-macos-ax = { workspace = true }
 
 # Inherit the workspace's deliberate lint allowances (see the root Cargo.toml).
 [lints]
