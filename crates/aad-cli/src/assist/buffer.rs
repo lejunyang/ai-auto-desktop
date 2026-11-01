@@ -1,8 +1,8 @@
 //! Pictures kept between captures: the next one is made from the one before
 //! last, caught up on what changed since, instead of copied whole.
+use super::damage::Rect;
 #[cfg(any(windows, target_os = "linux"))]
 use super::damage::{Damage, Move};
-use super::damage::Rect;
 #[cfg(any(windows, target_os = "linux"))]
 use super::Raw;
 use std::sync::Arc;
