@@ -107,9 +107,10 @@ jobs:
           test -n "$AAD_TEST_CHROME"
           cargo test --locked -p aad-control --test browser_e2e -- --ignored
 
-      # aad assist on the macOS desktop: the displays are listed, and a
-      # viewer gets a first picture, or, where the runner grants no Screen
-      # Recording, the error that says so. Input needs Accessibility, which a
+      # aad assist on the macOS desktop: the displays are listed, the display
+      # is read through ScreenCaptureKit, and a viewer gets a first picture,
+      # or, where the runner grants no Screen Recording, the error that says
+      # so. Input needs Accessibility, which a
       # runner may not grant either, so only what it reports is printed.
       - name: Smoke assist on the macOS desktop
         if: runner.os == 'macOS'
@@ -127,7 +128,7 @@ jobs:
           try:
               announce = json.loads(p.stdout.readline())
               print("source", announce["source"])
-              assert announce["source"]["capture"] == "coregraphics"
+              assert announce["source"]["capture"] == "screencapturekit", announce["source"]
               host, rest = announce["websocket"][len("ws://"):].split("/", 1)
               address, port = host.split(":")
               s = socket.create_connection((address, int(port)), timeout=20)
@@ -241,6 +242,89 @@ jobs:
               print(json.dumps(result))
               assert pointer and typed.lower() == "typed through assist" and replaced.lower() == "replaced", result
               assert clipboard.lower() == replaced.lower(), result
+          finally:
+              assist.terminate()
+              subprocess.run(["pkill", "-x", "TextEdit"])
+          PY
+
+      # ScreenCaptureKit says what changed in each frame, and only that is
+      # read and sent. Checked by its effect: text typed into TextEdit through
+      # assist arrives as patches much smaller than the screen, and the
+      # picture patched together is the screen as `screencapture` takes it on
+      # its own, so no change went unreported (a picture checked against
+      # assist's own keyframe would miss that, being read the same way). The
+      # binary links ScreenCaptureKit weakly, to start on older macOS.
+      - name: Check assist sends only what changed on the macOS desktop
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          otool -l target/debug/aad | grep -A2 LC_LOAD_WEAK_DYLIB | grep ScreenCaptureKit
+          python3 -m venv /tmp/assist-venv
+          /tmp/assist-venv/bin/pip install --quiet pillow
+          : > /tmp/assist-changes.txt
+          open -a TextEdit /tmp/assist-changes.txt
+          sleep 3
+          PYTHONPATH=tests/windows /tmp/assist-venv/bin/python - <<'PY'
+          import json, subprocess, sys, time
+          from PIL import Image, ImageChops, ImageStat
+          import verify_assist
+          verify_assist.AAD = "target/debug/aad"
+          from verify_assist import Viewer, start_assist
+          from verify_assist_tiles import apply, patches
+          from verify_assist_video import frames_until, listen
+          def tiles(viewer, seconds, stop=None):
+              _, frames = frames_until(viewer, seconds, stop)
+              return [f for f in frames if f["codec"] == 6]
+          def share(frames, size):
+              area = sum(p["rect"][2] * p["rect"][3] for f in frames for p in patches(f))
+              return round(area / (size[0] * size[1]), 4)
+          def wrong_tiles(a, b, tile=32, limit=24):
+              delta = ImageChops.difference(a, b).convert("L")
+              return [(x, y) for y in range(0, delta.height, tile) for x in range(0, delta.width, tile)
+                      if ImageStat.Stat(delta.crop((x, y, x + tile, y + tile))).mean[0] > limit]
+          assist, announce = start_assist("--desktop", "--codecs", "tiles")
+          try:
+              result = {"capture": announce["source"]["capture"]}
+              if not announce["source"]["permissions"]["accessibility"]:
+                  print("no Accessibility on this runner; nothing can be typed")
+                  sys.exit(0)
+              viewer = listen(Viewer(announce["websocket"]))
+              viewer.send({"type": "hello", "accept": ["tiles"]})
+              canvas = None
+              for frame in tiles(viewer, 10, lambda s, f: any(x["codec"] == 6 for x in f)):
+                  canvas = apply(canvas, frame)
+              result["size"] = list(canvas.size)
+              # The caret blinks and the clock ticks: a little is sent anyway.
+              settled = tiles(viewer, 3)
+              for frame in settled:
+                  canvas = apply(canvas, frame)
+              result["still_share"] = share(settled, canvas.size)
+              for line in range(6):
+                  viewer.send({"type": "text", "text": f"line {line}: the quick brown fox jumps over the lazy dog"})
+                  for action in ("down", "up"):
+                      viewer.send({"type": "key", "action": action, "key": "Enter", "code": "Enter"})
+                  time.sleep(0.2)
+              typed = tiles(viewer, 3)
+              for frame in typed:
+                  canvas = apply(canvas, frame)
+              result["typing_frames"] = len(typed)
+              result["typing_share"] = share(typed, canvas.size)
+              subprocess.run(["screencapture", "-x", "-m", "/tmp/assist-shot.png"], check=True)
+              for frame in tiles(viewer, 1):
+                  canvas = apply(canvas, frame)
+              shot = Image.open("/tmp/assist-shot.png").convert("RGB").resize(canvas.size)
+              wrong = wrong_tiles(canvas, shot)
+              result["tiles_unlike_screencapture"] = len(wrong)
+              result["where"] = wrong[:20]
+              viewer.close()
+              print(json.dumps(result))
+              canvas.save("/tmp/assist-canvas.png")
+              assert result["capture"] == "screencapturekit", result
+              assert typed and 0 < result["typing_share"] < 0.5, result
+              # A missed change shows as whole lines of text; the caret and
+              # the clock as a tile or two.
+              assert len(wrong) <= 4, result
           finally:
               assist.terminate()
               subprocess.run(["pkill", "-x", "TextEdit"])
