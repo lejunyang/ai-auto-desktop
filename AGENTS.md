@@ -46,10 +46,12 @@ type(scope): 一句话说明做了什么
 
 ## 仓库结构速览
 
-- `crates/aad-uia`：核心 driver 与 Windows UIA 后端（唯一碰 COM 的地方）。
+- `crates/aad-desktop`：与系统无关的桌面驱动（UI 模型、`Backend` 边界、动作分发、录制与观察）。
+- `crates/aad-uia`：Windows UI Automation 后端（只在 Windows 上编译）。
+- `crates/aad-platform`：各系统共同的接口与类型；`crates/aad-windows` / `aad-linux` / `aad-macos`：各自系统的截屏、输入、剪贴板、OCR、探测等系统能力，**每个只在自己的系统上编译、只按目标平台被依赖**。新增调用系统 API 的代码放进对应平台 crate，而不是在其他 crate 里加 `cfg(target_os)` 分支（进程启动、脚本沙箱这类少量按系统区分的逻辑仍在各自 crate 中）；CI 会检查每个系统的 `aad` 只依赖本系统的平台 crate。
 - `crates/aad-mcp`：MCP 工具集（给 AI 调用的 schema 与分发）。
 - `crates/aad-cli`：`aad` 命令行入口。
 - `crates/aad-runtime`：工作流引擎与持久化执行。
-- `crates/aad-atspi` / `aad-macos-ax`：Linux / macOS 后端。
+- `crates/aad-atspi` / `aad-macos-ax`：Linux / macOS 无障碍后端（只在各自系统上被依赖）。
 - `docs/research`、`docs/plan`：调研结论与方案文档（含 `[待验证]` 标注约定：未真机验证的结论必须显式标注并注明所需环境）。
 - `tests/windows`：Windows 真机验证脚本（探针、端到端、效果验证）。

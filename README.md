@@ -672,10 +672,15 @@ crates/
   aad-plugin    NDJSON over stdio 插件宿主、AADF 制品侧信道
   aad-runtime   工作流引擎、模板、journal、沙箱脚本
   aad-ocr       原生 Tesseract OCR 与图片输入校验
-  aad-atspi     Linux AT-SPI / X11 驱动
-  aad-macos-ax  macOS AX 的 Rust adapter 与 Swift helper 协议
-  aad-uia       原生 UI Automation：发现、描述、控制
-  aad-probe     只读能力探测
+  aad-platform  各系统共同的词汇：共享屏幕与输入（Desktop）、画面与变化区域、按键表、探测结果、结构化错误
+  aad-windows   Windows 的系统能力：DXGI/GDI 截屏、PrintWindow、SendInput、剪贴板、OCR、探测（只在 Windows 上编译）
+  aad-linux     Linux 的系统能力：X11 截屏（DAMAGE）、XTest 输入、剪贴板、探测（只在 Linux 上编译）
+  aad-macos     macOS 的系统能力：ScreenCaptureKit 截屏、CGEvent 输入、剪贴板、探测（只在 macOS 上编译）
+  aad-desktop   与系统无关的桌面驱动：UI 模型、Backend 边界、动作分发、录制与观察
+  aad-uia       Windows UI Automation 后端（只在 Windows 上编译）
+  aad-atspi     Linux AT-SPI / X11 驱动（只在 Linux 上依赖）
+  aad-macos-ax  macOS AX 的 Rust adapter 与 Swift helper 协议（只在 macOS 上依赖）
+  aad-probe     只读能力探测（汇总报告；各系统的检查在对应平台 crate 里）
   aad-mcp       stdio 上的 MCP server
   aad-cli       aad 可执行文件
 gui/            Tauri + Vue 桌面窗口
