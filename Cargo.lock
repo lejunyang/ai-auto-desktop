@@ -41,6 +41,7 @@ dependencies = [
  "aad-cdp",
  "aad-control",
  "aad-core",
+ "aad-desktop",
  "aad-linux",
  "aad-macos",
  "aad-macos-ax",
@@ -72,6 +73,7 @@ dependencies = [
  "aad-atspi",
  "aad-cdp",
  "aad-core",
+ "aad-desktop",
  "aad-macos-ax",
  "aad-ocr",
  "aad-plugin",
@@ -96,6 +98,22 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "sha2",
+]
+
+[[package]]
+name = "aad-desktop"
+version = "0.0.4"
+dependencies = [
+ "aad-core",
+ "aad-platform",
+ "aad-plugin",
+ "aad-runtime",
+ "base64 0.22.1",
+ "image",
+ "serde",
+ "serde_json",
+ "sha2",
+ "uuid",
 ]
 
 [[package]]
@@ -164,10 +182,10 @@ dependencies = [
  "aad-cdp",
  "aad-control",
  "aad-core",
+ "aad-desktop",
  "aad-ocr",
  "aad-probe",
  "aad-runtime",
- "aad-uia",
  "serde",
  "serde_json",
  "uuid",
@@ -240,15 +258,13 @@ name = "aad-uia"
 version = "0.0.4"
 dependencies = [
  "aad-core",
+ "aad-desktop",
  "aad-platform",
- "aad-plugin",
  "aad-runtime",
  "aad-windows",
  "base64 0.22.1",
  "image",
- "serde",
  "serde_json",
- "sha2",
  "uuid",
  "windows 0.58.0",
  "windows-core 0.58.0",

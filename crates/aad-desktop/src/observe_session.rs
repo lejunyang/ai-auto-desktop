@@ -175,17 +175,6 @@ pub fn contracts(actions: &mut Map<String, Value>) {
     );
 }
 
-#[cfg(windows)]
-impl ObserveSource for crate::observer_win::ObserverSession {
-    fn drain(&self, max: usize) -> (Vec<ObservedEvent>, u64) {
-        self.drain(max)
-    }
-
-    fn sources(&self) -> Vec<String> {
-        self.sources.iter().map(|name| name.to_string()).collect()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

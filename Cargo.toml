@@ -6,6 +6,7 @@ members = [
     "crates/aad-windows",
     "crates/aad-linux",
     "crates/aad-macos",
+    "crates/aad-desktop",
     "crates/aad-plugin",
     "crates/aad-runtime",
     "crates/aad-ocr",
@@ -36,6 +37,7 @@ aad-platform = { path = "crates/aad-platform", version = "0.0.4" }
 aad-windows = { path = "crates/aad-windows", version = "0.0.4" }
 aad-linux = { path = "crates/aad-linux", version = "0.0.4" }
 aad-macos = { path = "crates/aad-macos", version = "0.0.4" }
+aad-desktop = { path = "crates/aad-desktop", version = "0.0.4" }
 aad-plugin = { path = "crates/aad-plugin", version = "0.0.4" }
 aad-runtime = { path = "crates/aad-runtime", version = "0.0.4" }
 aad-ocr = { path = "crates/aad-ocr", version = "0.0.4" }

@@ -11,7 +11,7 @@ description = "Session-scoped desktop and browser control with authenticated std
 aad-core.workspace = true
 aad-runtime.workspace = true
 aad-plugin.workspace = true
-aad-uia.workspace = true
+aad-desktop.workspace = true
 aad-cdp.workspace = true
 aad-ocr.workspace = true
 base64 = "0.22"
@@ -21,6 +21,9 @@ uuid.workspace = true
 sha2.workspace = true
 fs2 = "0.4"
 libc.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+aad-uia.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 aad-atspi.workspace = true

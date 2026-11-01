@@ -1,0 +1,24 @@
+[package]
+name = "aad-desktop"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The platform-independent desktop driver: UI model, backend boundary, action dispatch, recording and observation"
+
+[dependencies]
+aad-core = { workspace = true }
+aad-platform = { workspace = true }
+aad-plugin = { workspace = true }
+aad-runtime = { workspace = true }
+base64 = "0.22"
+image = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+uuid = { workspace = true }
+
+# Inherit the workspace's deliberate lint allowances (see the root Cargo.toml).
+[lints]
+workspace = true

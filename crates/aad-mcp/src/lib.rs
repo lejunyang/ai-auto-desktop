@@ -91,7 +91,7 @@ impl Server {
     }
 
     /// A local server with input granted over the given Windows driver.
-    pub fn with_driver(driver: aad_uia::UiaDriver) -> Self {
+    pub fn with_driver(driver: aad_desktop::UiaDriver) -> Self {
         let driver = Arc::new(driver);
         let backend = aad_control::native::NativeBackend::new(
             driver.clone(),

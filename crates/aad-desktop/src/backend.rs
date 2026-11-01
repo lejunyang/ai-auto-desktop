@@ -232,6 +232,33 @@ pub struct Recognition {
 
 /// The operations a platform backend must provide.
 pub trait Backend: Send + Sync {
+    /// Start recording a window's interactions. Where capture is not
+    /// implemented this says so rather than starting a session that would
+    /// never produce a step: a recorder that appears to work and records
+    /// nothing is worse than one that refuses.
+    fn open_capture(
+        &self,
+        _window_id: &str,
+        _limit: usize,
+    ) -> Result<Box<dyn crate::driver::CaptureSource>> {
+        Err(DriverError::new(
+            "DRIVER.ACTION_UNSUPPORTED",
+            "recording interactions is only implemented on Windows so far",
+        ))
+    }
+
+    /// Start a desktop-wide observation session, subscribed at the desktop
+    /// root, that reports foreground switches itself.
+    fn open_observation(
+        &self,
+        _limit: usize,
+    ) -> Result<Box<dyn crate::observe_session::ObserveSource>> {
+        Err(DriverError::new(
+            "DRIVER.ACTION_UNSUPPORTED",
+            "ambient observation is only implemented on Windows so far",
+        ))
+    }
+
     /// Enumerate top-level windows that a user could interact with.
     fn list_windows(&self) -> Result<Vec<WindowInfo>>;
 

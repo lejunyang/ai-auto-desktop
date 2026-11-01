@@ -322,6 +322,23 @@ fn rebuild_children(nodes: &mut [Node]) {
 }
 
 impl Backend for WindowsUiaBackend {
+    fn open_capture(
+        &self,
+        window_id: &str,
+        limit: usize,
+    ) -> Result<Box<dyn crate::driver::CaptureSource>> {
+        Ok(Box::new(CaptureSession::start(window_id, limit)?))
+    }
+
+    fn open_observation(
+        &self,
+        limit: usize,
+    ) -> Result<Box<dyn crate::observe_session::ObserveSource>> {
+        Ok(Box::new(crate::observer_win::ObserverSession::start(
+            limit,
+        )?))
+    }
+
     fn list_windows(&self) -> Result<Vec<WindowInfo>> {
         let mut handles: Vec<HWND> = Vec::new();
         unsafe {

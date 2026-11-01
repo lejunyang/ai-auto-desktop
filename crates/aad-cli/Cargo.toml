@@ -19,7 +19,7 @@ aad-ocr = { workspace = true }
 aad-plugin = { workspace = true }
 aad-probe = { workspace = true }
 aad-runtime = { workspace = true }
-aad-uia = { workspace = true }
+aad-desktop = { workspace = true }
 aad-cdp = { workspace = true }
 aad-platform = { workspace = true }
 clap = { workspace = true }
@@ -36,6 +36,7 @@ image = { workspace = true }
 webp = { version = "0.3", default-features = false }
 
 [target.'cfg(windows)'.dependencies]
+aad-uia = { workspace = true }
 aad-windows = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]

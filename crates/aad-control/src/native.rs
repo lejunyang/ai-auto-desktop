@@ -571,7 +571,7 @@ pub fn backends() -> (Vec<Arc<NativeBackend>>, BTreeMap<String, Value>) {
     let mut failures = BTreeMap::new();
     #[cfg(windows)]
     let native: Result<NativeBackend> = aad_uia::native_driver_with_store(
-        aad_uia::SnapshotStore::new(32, Duration::from_secs(300)),
+        aad_desktop::SnapshotStore::new(32, Duration::from_secs(300)),
     )
     .map(|driver| NativeBackend::new(Arc::new(driver), Flavor::Windows))
     .map_err(|e| e.into_automation_error());

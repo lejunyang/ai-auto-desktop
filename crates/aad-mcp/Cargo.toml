@@ -14,7 +14,7 @@ aad-cdp = { workspace = true }
 aad-ocr = { workspace = true }
 aad-probe = { workspace = true }
 aad-runtime = { workspace = true }
-aad-uia = { workspace = true }
+aad-desktop = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }

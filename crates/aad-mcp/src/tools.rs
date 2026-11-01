@@ -1764,14 +1764,14 @@ pub(crate) mod tests {
     /// somewhere real to land without touching the actual desktop.
     struct StubBackend;
 
-    fn stub_window() -> aad_uia::WindowInfo {
-        aad_uia::WindowInfo {
+    fn stub_window() -> aad_desktop::WindowInfo {
+        aad_desktop::WindowInfo {
             window_id: "w1".into(),
             title: "Fixture".into(),
             process_id: 7,
             process_name: Some("fixture.exe".into()),
             class_name: Some("FixtureClass".into()),
-            bounds: Some(aad_uia::Bounds {
+            bounds: Some(aad_desktop::Bounds {
                 x: 0,
                 y: 0,
                 width: 400,
@@ -1782,8 +1782,8 @@ pub(crate) mod tests {
         }
     }
 
-    fn stub_node() -> aad_uia::Node {
-        aad_uia::Node {
+    fn stub_node() -> aad_desktop::Node {
+        aad_desktop::Node {
             node_id: "n1".into(),
             role: "Button".into(),
             name: Some("Save".into()),
@@ -1791,13 +1791,13 @@ pub(crate) mod tests {
             automation_id: Some("saveButton".into()),
             class_name: None,
             framework_id: None,
-            bounds: Some(aad_uia::Bounds {
+            bounds: Some(aad_desktop::Bounds {
                 x: 10,
                 y: 10,
                 width: 60,
                 height: 20,
             }),
-            states: aad_uia::States {
+            states: aad_desktop::States {
                 enabled: Some(true),
                 ..Default::default()
             },
@@ -1808,17 +1808,17 @@ pub(crate) mod tests {
         }
     }
 
-    impl aad_uia::Backend for StubBackend {
-        fn list_windows(&self) -> Result<Vec<aad_uia::WindowInfo>, aad_uia::DriverError> {
+    impl aad_desktop::Backend for StubBackend {
+        fn list_windows(&self) -> Result<Vec<aad_desktop::WindowInfo>, aad_desktop::DriverError> {
             Ok(vec![stub_window()])
         }
 
         fn capture(
             &self,
             _window_id: &str,
-            _limits: aad_uia::CaptureLimits,
-        ) -> Result<aad_uia::CapturedTree, aad_uia::DriverError> {
-            Ok(aad_uia::CapturedTree {
+            _limits: aad_desktop::CaptureLimits,
+        ) -> Result<aad_desktop::CapturedTree, aad_desktop::DriverError> {
+            Ok(aad_desktop::CapturedTree {
                 window: stub_window(),
                 root_id: Some("n1".into()),
                 truncated: false,
@@ -1829,34 +1829,38 @@ pub(crate) mod tests {
         fn verify(
             &self,
             _window_id: &str,
-            _node: &aad_uia::Node,
-        ) -> Result<bool, aad_uia::DriverError> {
+            _node: &aad_desktop::Node,
+        ) -> Result<bool, aad_desktop::DriverError> {
             Ok(true)
         }
 
-        fn focus(&self, _w: &str, _n: &aad_uia::Node) -> Result<(), aad_uia::DriverError> {
+        fn focus(&self, _w: &str, _n: &aad_desktop::Node) -> Result<(), aad_desktop::DriverError> {
             Ok(())
         }
-        fn invoke(&self, _w: &str, _n: &aad_uia::Node) -> Result<(), aad_uia::DriverError> {
+        fn invoke(&self, _w: &str, _n: &aad_desktop::Node) -> Result<(), aad_desktop::DriverError> {
             Ok(())
         }
         fn set_value(
             &self,
             _w: &str,
-            _n: &aad_uia::Node,
+            _n: &aad_desktop::Node,
             _v: &str,
-        ) -> Result<(), aad_uia::DriverError> {
+        ) -> Result<(), aad_desktop::DriverError> {
             Ok(())
         }
         fn type_text(
             &self,
             _w: &str,
-            _n: &aad_uia::Node,
+            _n: &aad_desktop::Node,
             _t: &str,
-        ) -> Result<(), aad_uia::DriverError> {
+        ) -> Result<(), aad_desktop::DriverError> {
             Ok(())
         }
-        fn pointer_click(&self, _w: &str, _n: &aad_uia::Node) -> Result<(), aad_uia::DriverError> {
+        fn pointer_click(
+            &self,
+            _w: &str,
+            _n: &aad_desktop::Node,
+        ) -> Result<(), aad_desktop::DriverError> {
             Ok(())
         }
     }
@@ -1871,9 +1875,9 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn stub_driver() -> Arc<dyn Provider> {
-        Arc::new(aad_uia::UiaDriver::with_store(
+        Arc::new(aad_desktop::UiaDriver::with_store(
             Arc::new(StubBackend),
-            aad_uia::SnapshotStore::new(8, std::time::Duration::from_secs(60)),
+            aad_desktop::SnapshotStore::new(8, std::time::Duration::from_secs(60)),
         ))
     }
 
