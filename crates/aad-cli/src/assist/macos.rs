@@ -1,14 +1,19 @@
-//! The macOS desktop for `aad assist`, through CoreGraphics.
+//! The macOS desktop for `aad assist`, through CoreGraphics and
+//! ScreenCaptureKit.
 //!
-//! A display is captured whole with CGDisplayCreateImage, as pixels, and
-//! compared with the last picture tile by tile, so tiles and video still send
-//! only what changed. Input is posted as CGEvents: mouse events carry their
-//! click count (macOS makes double clicks from it), keys use the Mac virtual
-//! key of the physical key with the held modifiers as flags, and text is
-//! typed as Unicode strings, whatever the keyboard layout. The pointer's
-//! position comes from an empty event; its image is not available without
-//! AppKit, so a standard arrow is drawn. Capture needs the Screen Recording
-//! permission and input the Accessibility one; `source` reports both.
+//! A display is captured through ScreenCaptureKit where there is one (macOS
+//! 12.3 and later): it tells what changed in each frame, so only that is read
+//! (see `sck`). Elsewhere, or when it cannot start, the display is captured
+//! whole with CGDisplayCreateImage and compared with the last picture tile by
+//! tile; tiles and video send only what changed either way. Input is posted
+//! as CGEvents: mouse events carry their click count (macOS makes double
+//! clicks from it), keys use the Mac virtual key of the physical key with the
+//! held modifiers as flags, and text is typed as Unicode strings, whatever
+//! the keyboard layout. The pointer's position comes from an empty event; its
+//! image is not available without AppKit, so a standard arrow is drawn.
+//! Capture needs the Screen Recording permission and input the Accessibility
+//! one; `source` reports both.
+use super::sck::Stream;
 use super::{keys, PixelFormat, Raw, Result};
 use serde_json::{json, Value};
 use std::ffi::c_void;
@@ -44,6 +49,10 @@ extern "C" {
     fn CGMainDisplayID() -> u32;
     fn CGDisplayBounds(display: u32) -> CGRect;
     fn CGDisplayCreateImage(display: u32) -> CFTypeRef;
+    fn CGDisplayCopyDisplayMode(display: u32) -> CFTypeRef;
+    fn CGDisplayModeGetPixelWidth(mode: CFTypeRef) -> usize;
+    fn CGDisplayModeGetPixelHeight(mode: CFTypeRef) -> usize;
+    fn CGDisplayModeRelease(mode: CFTypeRef);
     fn CGImageGetWidth(image: CFTypeRef) -> usize;
     fn CGImageGetHeight(image: CFTypeRef) -> usize;
     fn CGImageGetBytesPerRow(image: CFTypeRef) -> usize;
@@ -270,6 +279,23 @@ fn displays() -> Vec<u32> {
     list[..count as usize].to_vec()
 }
 
+/// The display's size in pixels (twice its points on most Retina displays).
+fn pixel_size(display: u32) -> (u32, u32) {
+    unsafe {
+        let mode = CGDisplayCopyDisplayMode(display);
+        if mode.is_null() {
+            let b = CGDisplayBounds(display);
+            return (b.size.width as u32, b.size.height as u32);
+        }
+        let size = (
+            CGDisplayModeGetPixelWidth(mode) as u32,
+            CGDisplayModeGetPixelHeight(mode) as u32,
+        );
+        CGDisplayModeRelease(mode);
+        size
+    }
+}
+
 /// What part of the desktop is shared.
 pub enum Area {
     All,
@@ -297,6 +323,10 @@ pub struct Mac {
     display: u32,
     /// The display's place on the desktop, in points, where events go.
     bounds: CGRect,
+    /// Frames with what changed, where ScreenCaptureKit runs.
+    stream: Option<Stream>,
+    /// Why it does not, when it does not.
+    no_stream: Option<String>,
     flags: u64,
     held_keys: Vec<(u16, String)>,
     held_buttons: Vec<u32>,
@@ -323,9 +353,23 @@ impl Mac {
                 ))
             }
         };
+        let (stream, no_stream) = if !Stream::available() {
+            (
+                None,
+                Some("ScreenCaptureKit needs macOS 12.3 or later".into()),
+            )
+        } else {
+            let (width, height) = pixel_size(display);
+            match Stream::open(display, width, height) {
+                Ok(stream) => (Some(stream), None),
+                Err(why) => (None, Some(why)),
+            }
+        };
         Ok(Self {
             display,
             bounds: unsafe { CGDisplayBounds(display) },
+            stream,
+            no_stream,
             flags: 0,
             held_keys: Vec::new(),
             held_buttons: Vec::new(),
@@ -339,9 +383,47 @@ impl Mac {
                "accessibility": unsafe { AXIsProcessTrusted() }})
     }
 
-    /// The display as BGRA pixels.
-    pub fn capture(&mut self) -> Result<Raw> {
+    /// How the display is captured, for `source`.
+    pub fn capture_name(&self) -> serde_json::Map<String, Value> {
+        let mut name = serde_json::Map::new();
+        match &self.no_stream {
+            None => {
+                name.insert("capture".into(), json!("screencapturekit"));
+            }
+            Some(why) => {
+                name.insert("capture".into(), json!("coregraphics"));
+                name.insert("screencapturekit".into(), json!(why));
+            }
+        }
+        name
+    }
+
+    /// The next capture repeats the picture even when nothing changed.
+    pub fn refresh(&mut self) {
+        if let Some(stream) = &mut self.stream {
+            stream.refresh();
+        }
+    }
+
+    /// The display as BGRA pixels when it changed (or a repeat was asked
+    /// for). Should ScreenCaptureKit stop, the display is read whole from
+    /// then on.
+    pub fn capture(&mut self) -> Result<Option<Raw>> {
         self.bounds = unsafe { CGDisplayBounds(self.display) };
+        if let Some(stream) = &mut self.stream {
+            match stream.capture() {
+                Ok(raw) => return Ok(raw),
+                Err(why) => {
+                    self.stream = None;
+                    self.no_stream = Some(why);
+                }
+            }
+        }
+        self.capture_whole().map(Some)
+    }
+
+    /// The whole display as BGRA pixels, to be compared with the last.
+    fn capture_whole(&mut self) -> Result<Raw> {
         unsafe {
             let image = CGDisplayCreateImage(self.display);
             if image.is_null() {

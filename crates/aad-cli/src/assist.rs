@@ -68,13 +68,15 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-#[cfg(any(windows, target_os = "linux"))]
+#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
 mod buffer;
 mod damage;
 mod keys;
 #[cfg(target_os = "macos")]
 mod macos;
 mod scale;
+#[cfg(target_os = "macos")]
+mod sck;
 #[cfg(windows)]
 mod screen;
 mod tiles;
@@ -2308,35 +2310,35 @@ mod desktop {
         Ok(Box::new(Desktop {
             pace: Pace::new(fps),
             mac: Mac::open(area)?,
-            refresh: false,
         }))
     }
 
     pub struct Desktop {
         pace: Pace,
         mac: Mac,
-        refresh: bool,
     }
 
     impl Source for Desktop {
         fn name(&self) -> Value {
-            json!({"kind": "desktop", "capture": "coregraphics", "permissions": self.mac.permissions()})
+            let mut name = self.mac.capture_name();
+            name.insert("kind".into(), json!("desktop"));
+            name.insert("permissions".into(), self.mac.permissions());
+            Value::Object(name)
         }
 
         fn rate(&mut self, fps: u32) {
             self.pace.rate(fps);
         }
 
-        /// Every capture is whole and compared, so a repeat is just the next one.
         fn refresh(&mut self) {
-            self.refresh = true;
+            self.mac.refresh();
         }
 
         fn capture(&mut self, _want: Want) -> Result<Option<Picture>> {
-            if !self.pace.due() && !std::mem::take(&mut self.refresh) {
+            if !self.pace.due() {
                 return Ok(None);
             }
-            Ok(Some(Picture::Raw(self.mac.capture()?)))
+            Ok(self.mac.capture()?.map(Picture::Raw))
         }
 
         fn cursor(&mut self, fresh: bool) -> Option<Value> {
