@@ -10,8 +10,9 @@
 //!
 //! The process is made per-monitor DPI aware first, so both see physical
 //! pixels: unaware, Windows hands back a blurred, scaled-down screen.
-use super::damage::{Damage, Move, Rect};
-use super::{PixelFormat, Raw, Result};
+use crate::Result;
+use aad_platform::damage::{Damage, Move, Rect};
+use aad_platform::{Area, PixelFormat, Raw};
 use serde_json::{json, Value};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -49,7 +50,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SM_YVIRTUALSCREEN,
 };
 
-use super::buffer::{Bounds, Crop, Target};
+use aad_platform::buffer::{Bounds, Crop, Target};
 
 fn bounds() -> Bounds {
     unsafe {
@@ -176,13 +177,6 @@ pub fn screens() -> Value {
         })
         .collect();
     json!({"monitors": monitors, "windows": windows})
-}
-
-/// What part of the desktop is shared.
-pub enum Area {
-    All,
-    Monitor(usize),
-    Window(String),
 }
 
 /// The shared part, resolved.

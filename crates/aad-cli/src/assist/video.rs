@@ -637,7 +637,7 @@ impl Encoder {
         // Without these ffmpeg reads ahead to measure its input before it
         // encodes anything: below 5 fps nothing comes out for 20 frames.
         args.extend(words(&["-probesize", "32", "-fpsprobesize", "0"]));
-        args.extend(words(&["-f", "rawvideo", "-pix_fmt", format.ffmpeg()]));
+        args.extend(words(&["-f", "rawvideo", "-pix_fmt", format.name()]));
         args.extend(["-s".into(), format!("{width}x{height}")]);
         args.extend(["-framerate".into(), settings.fps.clamp(1, 60).to_string()]);
         args.extend(words(&["-i", "-", "-an"]));

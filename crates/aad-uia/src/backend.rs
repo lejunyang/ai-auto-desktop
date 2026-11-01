@@ -78,6 +78,18 @@ impl std::fmt::Display for DriverError {
 
 impl std::error::Error for DriverError {}
 
+/// A platform crate's failure: nothing was done.
+impl From<aad_platform::Error> for DriverError {
+    fn from(error: aad_platform::Error) -> Self {
+        let made = Self::new(error.code, error.message);
+        if error.retryable {
+            made.retryable()
+        } else {
+            made
+        }
+    }
+}
+
 pub type Result<T> = std::result::Result<T, DriverError>;
 
 /// A window plus the element tree captured from it.

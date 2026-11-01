@@ -16,6 +16,7 @@ windows-native-examples = []
 
 [dependencies]
 aad-core = { workspace = true }
+aad-platform = { workspace = true }
 aad-plugin = { workspace = true }
 aad-runtime = { workspace = true }
 base64 = "0.22"
@@ -26,6 +27,7 @@ sha2 = { workspace = true }
 uuid = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
+aad-windows = { workspace = true }
 # The #[implement] macro expands to `windows_core::` paths and resolves them at
 # the crate root, so windows-core has to be a dependency in its own right --
 # a `use windows::core as windows_core` alias does not satisfy it.

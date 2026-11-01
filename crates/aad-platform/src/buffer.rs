@@ -1,14 +1,10 @@
 //! Pictures kept between captures: the next one is made from the one before
 //! last, caught up on what changed since, instead of copied whole.
-use super::damage::Rect;
-#[cfg(any(windows, target_os = "linux"))]
-use super::damage::{Damage, Move};
-#[cfg(any(windows, target_os = "linux"))]
-use super::Raw;
+use crate::damage::{Damage, Move, Rect};
+use crate::Raw;
 use std::sync::Arc;
 
 /// A part of the screen: left, top, width, height in physical pixels.
-#[cfg(any(windows, target_os = "linux"))]
 pub type Bounds = (i32, i32, u32, u32);
 
 /// Where a capture writes: the next picture, made on first use from the one
@@ -57,7 +53,6 @@ impl Target<'_> {
 
 /// The shared part cut out of the whole desktop, double buffered like the
 /// desktop itself, so a change costs only its own rows.
-#[cfg(any(windows, target_os = "linux"))]
 #[derive(Default)]
 pub struct Crop {
     pub at: Option<Bounds>,
@@ -66,7 +61,6 @@ pub struct Crop {
     stale: Vec<Rect>,
 }
 
-#[cfg(any(windows, target_os = "linux"))]
 impl Crop {
     pub fn cut(&mut self, whole: &Raw, desktop: Bounds, at: Bounds) -> Raw {
         let offset = ((at.0 - desktop.0) as u32, (at.1 - desktop.1) as u32);

@@ -23,6 +23,7 @@ aad-probe = { workspace = true }
 aad-runtime = { workspace = true }
 aad-uia = { workspace = true }
 aad-cdp = { workspace = true }
+aad-platform = { workspace = true }
 clap = { workspace = true }
 shlex = { workspace = true }
 serde = { workspace = true }
@@ -36,36 +37,14 @@ image = { workspace = true }
 # Lossy WebP for assist pictures (libwebp, built from source).
 webp = { version = "0.3", default-features = false }
 
-[target.'cfg(target_os = "linux")'.dependencies]
-# The X11 desktop for assist, spoken to directly: damage tells what changed,
-# XTest injects input, XFixes gives the pointer, RandR the displays.
-x11rb = { version = "0.13", features = ["xtest", "damage", "xfixes", "randr"] }
-
-# The macOS desktop for assist through ScreenCaptureKit, which tells what
-# changed in each frame.
-[target.'cfg(target_os = "macos")'.dependencies]
-block2 = "0.6"
-dispatch2 = { version = "0.3", default-features = false, features = ["std", "objc2"] }
-objc2 = "0.6"
-objc2-core-foundation = { version = "0.3", default-features = false, features = ["std", "CFArray"] }
-objc2-core-media = { version = "0.3", default-features = false, features = ["std", "CMSampleBuffer", "CMTime", "objc2-core-video"] }
-objc2-core-video = { version = "0.3", default-features = false, features = ["std", "CVBase", "CVBuffer", "CVImageBuffer", "CVPixelBuffer", "CVReturn", "bitflags"] }
-objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSArray", "NSDictionary", "NSEnumerator", "NSError", "NSGeometry", "NSString", "NSValue", "objc2-core-foundation"] }
-objc2-screen-capture-kit = { version = "0.3", default-features = false, features = ["std", "SCShareableContent", "SCStream", "block2", "dispatch2", "objc2-core-foundation", "objc2-core-graphics", "objc2-core-media"] }
-
 [target.'cfg(windows)'.dependencies]
-windows = { version = "0.58", features = [
-    "Win32_Foundation",
-    "Win32_Graphics_Direct3D",
-    "Win32_Graphics_Direct3D11",
-    "Win32_Graphics_Dwm",
-    "Win32_Graphics_Dxgi",
-    "Win32_Graphics_Dxgi_Common",
-    "Win32_Graphics_Gdi",
-    "Win32_UI_HiDpi",
-    "Win32_UI_Input_KeyboardAndMouse",
-    "Win32_UI_WindowsAndMessaging",
-] }
+aad-windows = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+aad-linux = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+aad-macos = { workspace = true }
 
 # Inherit the workspace's deliberate lint allowances (see the root Cargo.toml).
 [lints]

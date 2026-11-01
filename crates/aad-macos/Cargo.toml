@@ -1,0 +1,29 @@
+[package]
+name = "aad-macos"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "What macOS offers ai-auto-desktop: the screen through ScreenCaptureKit, input, clipboard; built on macOS only"
+
+# ScreenCaptureKit tells what changed in each frame. A program using this
+# crate links it weakly (see aad-cli's build script) to start on macOS
+# before 12.3, where the screen is read through CoreGraphics instead.
+[target.'cfg(target_os = "macos")'.dependencies]
+aad-platform = { workspace = true }
+base64 = "0.22"
+image = { workspace = true }
+serde_json = { workspace = true }
+block2 = "0.6"
+dispatch2 = { version = "0.3", default-features = false, features = ["std", "objc2"] }
+objc2 = "0.6"
+objc2-core-foundation = { version = "0.3", default-features = false, features = ["std", "CFArray"] }
+objc2-core-media = { version = "0.3", default-features = false, features = ["std", "CMSampleBuffer", "CMTime", "objc2-core-video"] }
+objc2-core-video = { version = "0.3", default-features = false, features = ["std", "CVBase", "CVBuffer", "CVImageBuffer", "CVPixelBuffer", "CVReturn", "bitflags"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSArray", "NSDictionary", "NSEnumerator", "NSError", "NSGeometry", "NSString", "NSValue", "objc2-core-foundation"] }
+objc2-screen-capture-kit = { version = "0.3", default-features = false, features = ["std", "SCShareableContent", "SCStream", "block2", "dispatch2", "objc2-core-foundation", "objc2-core-graphics", "objc2-core-media"] }
+
+# Inherit the workspace's deliberate lint allowances (see the root Cargo.toml).
+[lints]
+workspace = true

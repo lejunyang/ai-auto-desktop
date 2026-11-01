@@ -68,21 +68,11 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
-mod buffer;
-mod damage;
-mod keys;
-#[cfg(target_os = "macos")]
-mod macos;
 mod scale;
-#[cfg(target_os = "macos")]
-mod sck;
-#[cfg(windows)]
-mod screen;
 mod tiles;
 mod video;
-#[cfg(target_os = "linux")]
-mod x11;
+
+use aad_platform::{damage, keys, PixelFormat, Raw};
 
 #[derive(Args)]
 pub struct AssistArgs {
@@ -297,34 +287,6 @@ fn offered(asked: &[String], probe: &video::Probe) -> Result<Vec<Codec>> {
     Ok(codecs)
 }
 
-/// How pixels are laid out in a [`Raw`] picture.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum PixelFormat {
-    Bgra,
-    Rgba,
-}
-
-impl PixelFormat {
-    fn ffmpeg(self) -> &'static str {
-        match self {
-            PixelFormat::Bgra => "bgra",
-            PixelFormat::Rgba => "rgba",
-        }
-    }
-}
-
-/// Uncompressed pixels, four bytes each, top row first.
-#[derive(Clone)]
-struct Raw {
-    pixels: Arc<Vec<u8>>,
-    width: u32,
-    height: u32,
-    format: PixelFormat,
-    /// What changed since the source's previous picture, when the source
-    /// knows; the pictures are compared otherwise.
-    damage: Option<damage::Damage>,
-}
-
 /// When an unchanged picture is sent again anyway, so a late viewer sees it.
 /// Video needs no repeat: a viewer starts on a keyframe of the current screen.
 const RESEND: Duration = Duration::from_secs(3);
@@ -484,7 +446,6 @@ trait Source {
 }
 
 /// Most clipboard text handed to a viewer at once.
-#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
 const CLIPBOARD_CHARACTERS: usize = 100_000;
 
 /// Everything about the stream decided at startup.
@@ -2194,338 +2155,102 @@ fn unknown(event: &Value) -> String {
     format!("unknown key {named:?}")
 }
 
-#[cfg(target_os = "linux")]
+/// The desktop of this system, from its platform crate.
 mod desktop {
-    pub use super::x11::Area;
-    use super::x11::X11;
     use super::{
         fraction, keys, unknown, Pace, Picture, Result, Source, Want, CLIPBOARD_CHARACTERS,
     };
+    pub use aad_platform::Area;
+    use aad_platform::{Button, Input, MouseAction};
     use serde_json::{json, Value};
 
+    #[cfg(target_os = "linux")]
+    use aad_linux as os;
+    #[cfg(target_os = "macos")]
+    use aad_macos as os;
+    #[cfg(windows)]
+    use aad_windows as os;
+
+    #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+    mod os {
+        use super::{Area, Result, Value};
+        const ONLY: &str = "available on Windows, Linux (X11) and macOS";
+
+        pub fn screens() -> Result<Value> {
+            Err(format!("listing screens is {ONLY}"))
+        }
+
+        pub fn open(area: &Area) -> Result<Box<dyn aad_platform::Desktop>> {
+            Err(format!(
+                "sharing {area} is {ONLY}; use --browser-port for a browser page"
+            ))
+        }
+    }
+
     pub fn screens() -> Result<Value> {
-        Ok(X11::open(&Area::All)?.screens())
+        os::screens()
     }
 
     pub fn open(fps: u32, area: &Area) -> Result<Box<dyn Source>> {
         Ok(Box::new(Desktop {
             pace: Pace::new(fps),
-            x11: X11::open(area)?,
+            desktop: os::open(area)?,
         }))
     }
 
-    pub struct Desktop {
+    struct Desktop {
         pace: Pace,
-        x11: X11,
+        desktop: Box<dyn aad_platform::Desktop>,
+    }
+
+    /// A viewer's input message, checked.
+    fn input(event: &Value) -> Result<Input> {
+        match event["type"].as_str() {
+            Some("mouse") => {
+                let (x, y) = (fraction(event, "x")?, fraction(event, "y")?);
+                let button = match event["button"].as_str() {
+                    Some("right") => Button::Right,
+                    Some("middle") => Button::Middle,
+                    _ => Button::Left,
+                };
+                let action = match event["action"].as_str() {
+                    Some("down") => MouseAction::Down,
+                    Some("up") => MouseAction::Up,
+                    Some("wheel") => MouseAction::Wheel {
+                        dx: event["dx"].as_f64().unwrap_or(0.0),
+                        dy: event["dy"].as_f64().unwrap_or(0.0),
+                    },
+                    _ => MouseAction::Move,
+                };
+                let count = event["count"].as_i64().unwrap_or(1);
+                Ok(Input::Mouse {
+                    action,
+                    button,
+                    x,
+                    y,
+                    count,
+                })
+            }
+            Some("key") => Ok(Input::Key {
+                key: keys::of(event).ok_or_else(|| unknown(event))?,
+                down: event["action"] != "up",
+            }),
+            Some("text") => {
+                let text = event["text"].as_str().unwrap_or_default();
+                if text.len() > 4096 {
+                    return Err("text is limited to 4096 bytes".into());
+                }
+                Ok(Input::Text(text.to_string()))
+            }
+            _ => Err("unknown event type".into()),
+        }
     }
 
     impl Source for Desktop {
         fn name(&self) -> Value {
-            let capture = if self.x11.damage_known() {
-                "x11-damage"
-            } else {
-                "x11"
-            };
-            json!({"kind": "desktop", "capture": capture})
-        }
-
-        fn rate(&mut self, fps: u32) {
-            self.pace.rate(fps);
-        }
-
-        fn refresh(&mut self) {
-            self.x11.refresh();
-        }
-
-        fn capture(&mut self, _want: Want) -> Result<Option<Picture>> {
-            if !self.pace.due() {
-                return Ok(None);
-            }
-            Ok(self.x11.capture()?.map(Picture::Raw))
-        }
-
-        fn cursor(&mut self, fresh: bool) -> Option<Value> {
-            self.x11.cursor(fresh)
-        }
-
-        fn input(&mut self, event: &Value) -> Result<()> {
-            match event["type"].as_str() {
-                Some("mouse") => {
-                    self.x11
-                        .point(fraction(event, "x")?, fraction(event, "y")?)?;
-                    let button = match event["button"].as_str() {
-                        Some("right") => 3,
-                        Some("middle") => 2,
-                        _ => 1,
-                    };
-                    match event["action"].as_str() {
-                        Some("down") => self.x11.button(button, true),
-                        Some("up") => self.x11.button(button, false),
-                        Some("wheel") => self.x11.wheel(
-                            event["dx"].as_f64().unwrap_or(0.0),
-                            event["dy"].as_f64().unwrap_or(0.0),
-                        ),
-                        _ => Ok(()),
-                    }
-                }
-                Some("key") => {
-                    let key = keys::of(event).ok_or_else(|| unknown(event))?;
-                    self.x11.key(key, event["action"] != "up")
-                }
-                Some("text") => {
-                    let text = event["text"].as_str().unwrap_or_default();
-                    if text.len() > 4096 {
-                        return Err("text is limited to 4096 bytes".into());
-                    }
-                    self.x11.text(text)
-                }
-                _ => Err("unknown event type".into()),
-            }
-        }
-
-        fn release(&mut self) {
-            self.x11.release();
-        }
-
-        fn clipboard(&mut self) -> Result<Value> {
-            self.x11.clipboard(CLIPBOARD_CHARACTERS)
-        }
-    }
-}
-
-#[cfg(target_os = "macos")]
-mod desktop {
-    pub use super::macos::Area;
-    use super::macos::Mac;
-    use super::{
-        fraction, keys, unknown, Pace, Picture, Result, Source, Want, CLIPBOARD_CHARACTERS,
-    };
-    use serde_json::{json, Value};
-
-    pub fn screens() -> Result<Value> {
-        Ok(super::macos::screens())
-    }
-
-    pub fn open(fps: u32, area: &Area) -> Result<Box<dyn Source>> {
-        Ok(Box::new(Desktop {
-            pace: Pace::new(fps),
-            mac: Mac::open(area)?,
-        }))
-    }
-
-    pub struct Desktop {
-        pace: Pace,
-        mac: Mac,
-    }
-
-    impl Source for Desktop {
-        fn name(&self) -> Value {
-            let mut name = self.mac.capture_name();
+            let mut name = self.desktop.name();
             name.insert("kind".into(), json!("desktop"));
-            name.insert("permissions".into(), self.mac.permissions());
             Value::Object(name)
-        }
-
-        fn rate(&mut self, fps: u32) {
-            self.pace.rate(fps);
-        }
-
-        fn refresh(&mut self) {
-            self.mac.refresh();
-        }
-
-        fn capture(&mut self, _want: Want) -> Result<Option<Picture>> {
-            if !self.pace.due() {
-                return Ok(None);
-            }
-            Ok(self.mac.capture()?.map(Picture::Raw))
-        }
-
-        fn cursor(&mut self, fresh: bool) -> Option<Value> {
-            self.mac.cursor(fresh)
-        }
-
-        fn input(&mut self, event: &Value) -> Result<()> {
-            match event["type"].as_str() {
-                Some("mouse") => {
-                    let (x, y) = (fraction(event, "x")?, fraction(event, "y")?);
-                    let button = match event["button"].as_str() {
-                        Some("right") => 1,
-                        Some("middle") => 2,
-                        _ => 0,
-                    };
-                    match event["action"].as_str() {
-                        Some("wheel") => self.mac.wheel(
-                            event["dx"].as_f64().unwrap_or(0.0),
-                            event["dy"].as_f64().unwrap_or(0.0),
-                        ),
-                        Some(action) => {
-                            let count = event["count"].as_i64().unwrap_or(1);
-                            self.mac.mouse(action, button, x, y, count)
-                        }
-                        None => self.mac.mouse("move", button, x, y, 1),
-                    }
-                }
-                Some("key") => {
-                    let key = keys::of(event).ok_or_else(|| unknown(event))?;
-                    self.mac.key(key, event["action"] != "up")
-                }
-                Some("text") => {
-                    let text = event["text"].as_str().unwrap_or_default();
-                    if text.len() > 4096 {
-                        return Err("text is limited to 4096 bytes".into());
-                    }
-                    self.mac.text(text)
-                }
-                _ => Err("unknown event type".into()),
-            }
-        }
-
-        fn release(&mut self) {
-            self.mac.release();
-        }
-
-        fn clipboard(&mut self) -> Result<Value> {
-            self.mac.clipboard(CLIPBOARD_CHARACTERS)
-        }
-    }
-}
-
-#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
-mod desktop {
-    use super::{Result, Source};
-    use serde_json::Value;
-    pub enum Area {
-        All,
-        Monitor(usize),
-        Window(String),
-    }
-
-    pub fn screens() -> Result<Value> {
-        Err("listing screens is available on Windows and Linux (X11) so far".into())
-    }
-
-    pub fn open(_fps: u32, area: &Area) -> Result<Box<dyn Source>> {
-        let what = match area {
-            Area::All => "the desktop".to_string(),
-            Area::Monitor(index) => format!("display {index}"),
-            Area::Window(window) => format!("window {window}"),
-        };
-        Err(format!(
-            "sharing {what} is available on Windows and Linux (X11) so far; use --browser-port for a browser page"
-        ))
-    }
-}
-
-#[cfg(windows)]
-mod desktop {
-    use super::screen::{self, Pointer, Screen};
-    use super::{
-        fraction, keys, unknown, Pace, Picture, Result, Source, Want, CLIPBOARD_CHARACTERS,
-    };
-    use serde_json::{json, Value};
-    use windows::Win32::UI::Input::KeyboardAndMouse::{
-        MapVirtualKeyW, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT,
-        KEYBD_EVENT_FLAGS, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE,
-        MAPVK_VK_TO_VSC, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN,
-        MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE,
-        MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL,
-        MOUSEINPUT, MOUSE_EVENT_FLAGS, VIRTUAL_KEY,
-    };
-
-    pub struct Desktop {
-        pace: Pace,
-        screen: Screen,
-        pointer: Pointer,
-        /// Keys and mouse buttons (1 left, 2 right, 4 middle) held down.
-        held: Vec<keys::Key>,
-        buttons: u8,
-    }
-
-    pub use super::screen::Area;
-
-    pub fn screens() -> Result<Value> {
-        Ok(screen::screens())
-    }
-
-    pub fn open(fps: u32, area: &Area) -> Result<Box<dyn Source>> {
-        screen::dpi_aware();
-        Ok(Box::new(Desktop {
-            pace: Pace::new(fps),
-            screen: Screen::open(area)?,
-            pointer: Pointer::default(),
-            held: Vec::new(),
-            buttons: 0,
-        }))
-    }
-
-    fn send(inputs: &[INPUT]) -> Result<()> {
-        let sent = unsafe { SendInput(inputs, std::mem::size_of::<INPUT>() as i32) };
-        if sent as usize == inputs.len() {
-            Ok(())
-        } else {
-            Err("Windows refused the input (a higher-privileged window may be in front)".into())
-        }
-    }
-
-    fn mouse(dx: i32, dy: i32, data: i32, flags: MOUSE_EVENT_FLAGS) -> INPUT {
-        INPUT {
-            r#type: INPUT_MOUSE,
-            Anonymous: INPUT_0 {
-                mi: MOUSEINPUT {
-                    dx,
-                    dy,
-                    mouseData: data as u32,
-                    dwFlags: flags,
-                    time: 0,
-                    dwExtraInfo: 0,
-                },
-            },
-        }
-    }
-
-    /// A physical key going down or up, with its scan code, which some
-    /// programs read instead of the virtual key.
-    fn press(key: keys::Key, up: bool) -> INPUT {
-        let scan = unsafe { MapVirtualKeyW(u32::from(key.vk), MAPVK_VK_TO_VSC) } as u16;
-        let mut flags = if up {
-            KEYEVENTF_KEYUP
-        } else {
-            KEYBD_EVENT_FLAGS(0)
-        };
-        if key.extended {
-            flags |= KEYEVENTF_EXTENDEDKEY;
-        }
-        self::key(key.vk, scan, flags)
-    }
-
-    fn key(vk: u16, scan: u16, flags: KEYBD_EVENT_FLAGS) -> INPUT {
-        INPUT {
-            r#type: INPUT_KEYBOARD,
-            Anonymous: INPUT_0 {
-                ki: KEYBDINPUT {
-                    wVk: VIRTUAL_KEY(vk),
-                    wScan: scan,
-                    dwFlags: flags,
-                    time: 0,
-                    dwExtraInfo: 0,
-                },
-            },
-        }
-    }
-
-    impl Source for Desktop {
-        fn name(&self) -> Value {
-            let capture = if self.screen.duplicating() {
-                "dxgi"
-            } else {
-                "gdi"
-            };
-            let mut name = json!({"kind": "desktop", "capture": capture});
-            if let Some(reason) = &self.screen.fallback {
-                name["fallback"] = json!(reason);
-            }
-            name
         }
 
         fn rate(&mut self, fps: u32) {
@@ -2537,117 +2262,27 @@ mod desktop {
             if !self.pace.due() {
                 return Ok(None);
             }
-            Ok(self.screen.capture()?.map(Picture::Raw))
+            Ok(self.desktop.capture()?.map(Picture::Raw))
         }
 
         fn cursor(&mut self, fresh: bool) -> Option<Value> {
-            self.pointer.message(fresh, self.screen.shown.0)
+            self.desktop.cursor(fresh)
         }
 
         fn refresh(&mut self) {
-            self.screen.refresh();
+            self.desktop.refresh();
         }
 
         fn input(&mut self, event: &Value) -> Result<()> {
-            match event["type"].as_str() {
-                Some("mouse") => {
-                    // From the shared part to the whole desktop's 0..65535.
-                    let (at, desktop) = self.screen.shown;
-                    let across = |f: f64, start: i32, size: u32, origin: i32, whole: u32| {
-                        let pixel = f64::from(start - origin) + f * f64::from(size.max(1) - 1);
-                        (pixel / f64::from(whole.max(2) - 1) * 65535.0).round() as i32
-                    };
-                    let x = across(fraction(event, "x")?, at.0, at.2, desktop.0, desktop.2);
-                    let y = across(fraction(event, "y")?, at.1, at.3, desktop.1, desktop.3);
-                    let at = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK;
-                    let (down, up, mask) = match event["button"].as_str() {
-                        Some("right") => (MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, 2),
-                        Some("middle") => (MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, 4),
-                        _ => (MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, 1),
-                    };
-                    let mut inputs = vec![mouse(x, y, 0, at)];
-                    match event["action"].as_str() {
-                        Some("down") => {
-                            self.buttons |= mask;
-                            inputs.push(mouse(x, y, 0, at | down));
-                        }
-                        Some("up") => {
-                            self.buttons &= !mask;
-                            inputs.push(mouse(x, y, 0, at | up));
-                        }
-                        Some("wheel") => {
-                            // Browsers report about 100 pixels per notch; Windows 120 units.
-                            let notch = |pixels: f64| (-pixels / 100.0 * 120.0).round() as i32;
-                            let dy = event["dy"].as_f64().unwrap_or(0.0);
-                            let dx = event["dx"].as_f64().unwrap_or(0.0);
-                            if dy != 0.0 {
-                                inputs.push(mouse(0, 0, notch(dy), MOUSEEVENTF_WHEEL));
-                            }
-                            if dx != 0.0 {
-                                inputs.push(mouse(0, 0, -notch(dx), MOUSEEVENTF_HWHEEL));
-                            }
-                        }
-                        _ => {}
-                    }
-                    send(&inputs)
-                }
-                Some("key") => {
-                    let key = keys::of(event).ok_or_else(|| unknown(event))?;
-                    let up = event["action"] == "up";
-                    self.held.retain(|held| held.code != key.code);
-                    if !up {
-                        self.held.push(key);
-                    }
-                    send(&[press(key, up)])
-                }
-                Some("text") => {
-                    let text = event["text"].as_str().unwrap_or_default();
-                    if text.len() > 4096 {
-                        return Err("text is limited to 4096 bytes".into());
-                    }
-                    let inputs: Vec<INPUT> = text
-                        .encode_utf16()
-                        .flat_map(|unit| {
-                            [
-                                key(0, unit, KEYEVENTF_UNICODE),
-                                key(0, unit, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP),
-                            ]
-                        })
-                        .collect();
-                    send(&inputs)
-                }
-                _ => Err("unknown event type".into()),
-            }
+            self.desktop.input(&input(event)?)
         }
 
         fn release(&mut self) {
-            let mut inputs: Vec<INPUT> = std::mem::take(&mut self.held)
-                .into_iter()
-                .rev()
-                .map(|key| press(key, true))
-                .collect();
-            for (mask, up) in [
-                (1, MOUSEEVENTF_LEFTUP),
-                (2, MOUSEEVENTF_RIGHTUP),
-                (4, MOUSEEVENTF_MIDDLEUP),
-            ] {
-                if self.buttons & mask != 0 {
-                    inputs.push(mouse(0, 0, 0, up));
-                }
-            }
-            self.buttons = 0;
-            if !inputs.is_empty() {
-                let _ = send(&inputs);
-            }
+            self.desktop.release();
         }
 
         fn clipboard(&mut self) -> Result<Value> {
-            let (text, characters) = aad_uia::windows::clipboard_text(CLIPBOARD_CHARACTERS)
-                .map_err(|e| e.to_string())?;
-            Ok(
-                json!({"type": "clipboard", "text": text, "characters": characters,
-                      "truncated": characters > CLIPBOARD_CHARACTERS}),
-            )
+            self.desktop.clipboard(CLIPBOARD_CHARACTERS)
         }
     }
 }

@@ -5,9 +5,10 @@
 //! gathered until the next capture, which reads only those regions out of it
 //! into the picture kept from before, like DAMAGE on X11. Moved regions come
 //! as changes: ScreenCaptureKit does not say where they came from.
-use super::buffer::Target;
-use super::damage::{Damage, Rect};
-use super::{PixelFormat, Raw, Result};
+use crate::Result;
+use aad_platform::buffer::Target;
+use aad_platform::damage::{Damage, Rect};
+use aad_platform::{PixelFormat, Raw};
 use block2::RcBlock;
 use dispatch2::{DispatchQueue, DispatchRetained};
 use objc2::rc::Retained;

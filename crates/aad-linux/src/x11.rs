@@ -1,4 +1,4 @@
-//! The X11 desktop (Linux) for `aad assist`, spoken to directly.
+//! The X11 desktop (Linux), spoken to directly.
 //!
 //! The DAMAGE extension names the regions redrawn since the last capture,
 //! and only those are read back with GetImage into a double-buffered
@@ -8,9 +8,10 @@
 //! xdotool does. XFixes gives the pointer's position and image, RandR the
 //! displays, `_NET_CLIENT_LIST` the windows. Without DAMAGE the whole screen
 //! is read and compared instead.
-use super::buffer::{Bounds, Crop, Target};
-use super::damage::{Damage, Rect};
-use super::{keys, PixelFormat, Raw, Result};
+use crate::Result;
+use aad_platform::buffer::{Bounds, Crop, Target};
+use aad_platform::damage::{Damage, Rect};
+use aad_platform::{keys, Area, PixelFormat, Raw};
 use serde_json::{json, Value};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -35,13 +36,6 @@ const KEY_RELEASE: u8 = 3;
 const BUTTON_PRESS: u8 = 4;
 const BUTTON_RELEASE: u8 = 5;
 const MOTION: u8 = 6;
-
-/// What part of the desktop is shared.
-pub enum Area {
-    All,
-    Monitor(usize),
-    Window(String),
-}
 
 /// The shared part, resolved.
 enum Part {

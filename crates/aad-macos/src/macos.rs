@@ -1,4 +1,4 @@
-//! The macOS desktop for `aad assist`, through CoreGraphics and
+//! The macOS desktop, through CoreGraphics and
 //! ScreenCaptureKit.
 //!
 //! A display is captured through ScreenCaptureKit where there is one (macOS
@@ -13,8 +13,9 @@
 //! image is not available without AppKit, so a standard arrow is drawn.
 //! Capture needs the Screen Recording permission and input the Accessibility
 //! one; `source` reports both.
-use super::sck::Stream;
-use super::{keys, PixelFormat, Raw, Result};
+use crate::sck::Stream;
+use crate::Result;
+use aad_platform::{keys, Area, PixelFormat, Raw};
 use serde_json::{json, Value};
 use std::ffi::c_void;
 use std::sync::Arc;
@@ -294,13 +295,6 @@ fn pixel_size(display: u32) -> (u32, u32) {
         CGDisplayModeRelease(mode);
         size
     }
-}
-
-/// What part of the desktop is shared.
-pub enum Area {
-    All,
-    Monitor(usize),
-    Window(String),
 }
 
 /// What `--list-screens` prints: the displays (windows are not shared here).
