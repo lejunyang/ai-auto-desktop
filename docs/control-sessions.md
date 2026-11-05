@@ -274,7 +274,7 @@ MCP 工具为 `control_capabilities`, `control_targets`, `control_observe`, `con
 `control_wait`, `control_act`, `control_capture`, `control_read_text`, `control_cancel`, `control_close`，
 授权时另有 `desktop_launch`、`clipboard_read`、`control_global_key`；本机未限定授权时另有 `probe_environment`、四个工作流工具和浏览器工具（含只读的 `browser_downloads`、`browser_storage`、`browser_network`）。
 每次调用可带 `request_id` 与 `timeout_ms`。`control_cancel` 的被取消请求字段名为 `target_request_id`；
-MCP cancellation notification 也能取消仍在执行的统一操作。错误响应带 `hint`，说明可行的恢复方式。
+MCP 服务一次只处理一个调用，后面的排队；MCP cancellation notification 能取消正在执行的统一操作，排队中的调用被取消后不再执行，直接返回 `CONTROL.CANCELLED`（`not_applied`）。错误响应带 `hint`，说明可行的恢复方式。
 原先按动作拆开的 Windows MCP 工具（`list_apps`、`describe_window`、`find_element`、`invoke` 等）已移除，
 能力并入上述工具；`run_workflow` 与 `control_act` 共用会话的 driver、串行锁和输入租约。
 远程 MCP 或指定 provider/resource 时只暴露统一工具，避免绕过授权。

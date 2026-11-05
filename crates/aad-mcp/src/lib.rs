@@ -43,9 +43,8 @@ pub struct Server {
     local: Option<Arc<aad_control::Session>>,
     /// Why no native desktop provider is available, if none is.
     unavailable: Option<String>,
-    /// The control call being answered, as (JSON-RPC id, control request id):
-    /// the one a `notifications/cancelled` can still reach.
-    current: Mutex<Option<(String, String)>>,
+    /// The calls a `notifications/cancelled` can still reach.
+    calls: Mutex<Calls>,
     /// The browser and recording started through the browser tools.
     browsers: browser_tools::Browsers,
     /// Durable workflow runs this server started or resumed.
@@ -84,7 +83,7 @@ impl Server {
             control: session.clone(),
             local: Some(session),
             unavailable,
-            current: Mutex::new(None),
+            calls: Mutex::default(),
             browsers: browser_tools::Browsers::default(),
             runs: durable_tools::Runs::default(),
         }
@@ -116,7 +115,7 @@ impl Server {
             control,
             local: None,
             unavailable: None,
-            current: Mutex::new(None),
+            calls: Mutex::default(),
             browsers: browser_tools::Browsers::default(),
             runs: durable_tools::Runs::default(),
         }
@@ -174,15 +173,61 @@ impl Server {
             .is_some_and(|session| session.policy().allow_input)
     }
 
+    /// Note a call read ahead of the one being answered, so a cancellation
+    /// that arrives while it waits is not lost.
+    fn queue(&self, id: &Value) {
+        let mut calls = self.calls.lock().unwrap();
+        calls.waiting.insert(id.to_string(), false);
+    }
+
+    /// Start answering a call, unless it was cancelled while it waited. A
+    /// control call becomes the current one, which a cancellation reaches
+    /// through the session.
+    fn start(&self, rpc_id: Option<&Value>, control_request: Option<&str>) -> bool {
+        let Some(id) = rpc_id else {
+            return true;
+        };
+        let key = id.to_string();
+        let mut calls = self.calls.lock().unwrap();
+        if calls.waiting.remove(&key) == Some(true) {
+            return false;
+        }
+        if let Some(request_id) = control_request {
+            calls.current = Some((key, request_id.to_string()));
+        }
+        true
+    }
+
     fn cancel_rpc(&self, id: &Value) {
         let key = id.to_string();
-        let current = self.current.lock().unwrap().clone();
-        if let Some((_, request_id)) = current.filter(|(at, _)| *at == key) {
-            let request = aad_control::Request::new(
-                Some(self.control.session_id().into()),
-                aad_control::Operation::Cancel { request_id },
-            );
-            self.control.request(&request);
+        let request_id = {
+            let mut calls = self.calls.lock().unwrap();
+            if let Some(cancelled) = calls.waiting.get_mut(&key) {
+                *cancelled = true;
+                return;
+            }
+            match &calls.current {
+                Some((at, request_id)) if *at == key => request_id.clone(),
+                _ => return,
+            }
+        };
+        let request = aad_control::Request::new(
+            Some(self.control.session_id().into()),
+            aad_control::Operation::Cancel { request_id },
+        );
+        self.control.request(&request);
+    }
+
+    /// The session's own answer to a control call cancelled before admission.
+    fn not_started(&self, request: &aad_control::Request) -> aad_control::Response {
+        aad_control::Response {
+            protocol_version: aad_control::PROTOCOL_VERSION.into(),
+            request_id: request.request_id.clone(),
+            session_id: self.control.session_id().into(),
+            effect: "not_applied".into(),
+            commit_state: aad_control::CommitState::NotCommitted,
+            data: None,
+            error: Some(cancelled_before_start()),
         }
     }
 
@@ -197,8 +242,19 @@ impl Server {
             return None;
         }
         let id = request.id.clone();
+        let outcome = self.answer(request);
+        if let Some(id) = &id {
+            // However the call ended, a later cancellation has nothing to reach.
+            self.calls.lock().unwrap().waiting.remove(&id.to_string());
+        }
+        Some(match outcome {
+            Ok(result) => protocol::result_response(id, result),
+            Err((code, message)) => protocol::error_response(id, code, &message),
+        })
+    }
 
-        let outcome = match request.method.as_str() {
+    fn answer(&self, request: &Request) -> Result<Value, (i64, String)> {
+        match request.method.as_str() {
             "initialize" => Ok(self.initialize()),
             "ping" => Ok(json!({})),
             "tools/list" => {
@@ -210,19 +266,11 @@ impl Server {
                 Ok(payload)
             }
             "tools/call" => self.call_tool(&request.params, request.id.as_ref()),
-            other => {
-                return Some(protocol::error_response(
-                    id,
-                    protocol::METHOD_NOT_FOUND,
-                    &format!("unknown method {other:?}"),
-                ))
-            }
-        };
-
-        Some(match outcome {
-            Ok(result) => protocol::result_response(id, result),
-            Err((code, message)) => protocol::error_response(id, code, &message),
-        })
+            other => Err((
+                protocol::METHOD_NOT_FOUND,
+                format!("unknown method {other:?}"),
+            )),
+        }
     }
 
     fn initialize(&self) -> Value {
@@ -303,11 +351,14 @@ notifications/cancelled to request cancellation of an in-flight JSON-RPC request
         if control_tools::method(name).is_some() {
             let request = control_tools::prepare(name, &arguments, self.control.as_ref())
                 .map_err(|e| (protocol::INVALID_PARAMS, e))?;
-            if let Some(id) = rpc_id {
-                *self.current.lock().unwrap() = Some((id.to_string(), request.request_id.clone()));
+            if !self.start(rpc_id, Some(&request.request_id)) {
+                return Ok(content(
+                    &control_tools::payload(self.not_started(&request)),
+                    true,
+                ));
             }
             let response = self.control.request(&request);
-            *self.current.lock().unwrap() = None;
+            self.calls.lock().unwrap().current = None;
             let is_error = response.error.is_some();
             let mut payload = control_tools::payload(response);
             if !is_error
@@ -324,6 +375,9 @@ notifications/cancelled to request cancellation of an in-flight JSON-RPC request
             .local
             .as_ref()
             .expect("local tools need a local session");
+        if !self.start(rpc_id, None) {
+            return Ok(content(&cancelled_before_start(), true));
+        }
         let writes = matches!(name, "save_workflow" | "run_workflow")
             || durable_tools::MUTATING.contains(&name)
             || (browser_tools::NAMES.contains(&name) && !browser_tools::READ_ONLY.contains(&name));
@@ -400,6 +454,20 @@ notifications/cancelled to request cancellation of an in-flight JSON-RPC request
             }
         })
     }
+}
+
+/// What a `notifications/cancelled` can reach.
+#[derive(Default)]
+struct Calls {
+    /// JSON-RPC ids read ahead and not started yet, with whether a
+    /// cancellation arrived while they waited.
+    waiting: std::collections::HashMap<String, bool>,
+    /// The control call being answered, as (JSON-RPC id, control request id).
+    current: Option<(String, String)>,
+}
+
+fn cancelled_before_start() -> Value {
+    aad_control::error("CONTROL.CANCELLED", "cancelled before it started").to_json()
 }
 
 /// Run a saved workflow in memory, as `run_workflow` without `durable` does.
@@ -500,10 +568,10 @@ pub fn serve_stdio_with(server: Server) -> std::io::Result<()> {
 /// Serve MCP over the given streams with this server until end of input.
 ///
 /// One call at a time: each request is answered before the next one starts,
-/// so no two calls run at once and replies come back in order. Only a
-/// `notifications/cancelled` is read ahead, by the reader thread, so it can
-/// reach the control call being answered; one for a call not started yet is
-/// dropped like any other notification.
+/// so no two calls run at once and replies come back in order. The reader
+/// thread reads ahead and handles `notifications/cancelled` itself: one for
+/// the control call being answered reaches the session, and a call cancelled
+/// while it waits is answered CONTROL.CANCELLED (not_applied) without running.
 pub fn serve_with(
     input: impl BufRead + Send + 'static,
     mut output: impl Write,
@@ -519,6 +587,9 @@ pub fn serve_with(
                     if request.method == "notifications/cancelled" && request.is_notification() {
                         reader.handle(&request);
                         continue;
+                    }
+                    if let Some(id) = &request.id {
+                        reader.queue(id);
                     }
                 }
             }

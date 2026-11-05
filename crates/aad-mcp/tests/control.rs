@@ -3,13 +3,15 @@ use aad_mcp::{Request as RpcRequest, Server};
 use serde_json::{json, Value};
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
-    Arc,
+    mpsc, Arc, Mutex,
 };
 use std::time::{Duration, Instant};
 
 struct Fake {
     name: &'static str,
     calls: AtomicUsize,
+    /// When set, each act waits for a release before it returns.
+    gate: Mutex<Option<mpsc::Receiver<()>>>,
 }
 impl Backend for Fake {
     fn name(&self) -> &str {
@@ -37,6 +39,9 @@ impl Backend for Fake {
     fn act(&self, _: &Value, _: &Value, _: &Action, context: &Context) -> Result<Value> {
         context.commit()?;
         self.calls.fetch_add(1, Ordering::SeqCst);
+        if let Some(gate) = self.gate.lock().unwrap().as_ref() {
+            let _ = gate.recv();
+        }
         std::thread::sleep(Duration::from_millis(80));
         Ok(json!({"submitted":true}))
     }
@@ -52,10 +57,11 @@ fn payload(reply: Value) -> Value {
     assert!(reply.get("error").is_none(), "{reply}");
     serde_json::from_str(reply["result"]["content"][0]["text"].as_str().unwrap()).unwrap()
 }
-fn server(name: &'static str, input: bool) -> (Arc<Server>, Arc<Fake>) {
+fn session(name: &'static str, input: bool) -> (Session, Arc<Fake>) {
     let fake = Arc::new(Fake {
         name,
         calls: AtomicUsize::new(0),
+        gate: Mutex::new(None),
     });
     let session = Session::new(
         vec![fake.clone()],
@@ -64,6 +70,10 @@ fn server(name: &'static str, input: bool) -> (Arc<Server>, Arc<Fake>) {
             ..Default::default()
         },
     );
+    (session, fake)
+}
+fn server(name: &'static str, input: bool) -> (Arc<Server>, Arc<Fake>) {
+    let (session, fake) = session(name, input);
     (Arc::new(Server::with_control(Arc::new(session))), fake)
 }
 fn target(server: &Server) -> Value {
@@ -171,6 +181,110 @@ fn cancellation_notification_reaches_an_in_flight_control_request() {
     assert_eq!(response["effect"], "unknown");
     assert_eq!(response["error"]["code"], "CONTROL.CANCELLED");
     assert_eq!(fake.calls.load(Ordering::SeqCst), 1);
+}
+/// Input handed over a chunk at a time. Each time the server asks for more,
+/// everything sent before has been read and handled.
+struct Feed {
+    chunks: mpsc::Receiver<String>,
+    asked: mpsc::Sender<()>,
+    pending: Vec<u8>,
+}
+impl std::io::Read for Feed {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.pending.is_empty() {
+            let _ = self.asked.send(());
+            match self.chunks.recv() {
+                Ok(chunk) => self.pending = chunk.into_bytes(),
+                Err(_) => return Ok(0),
+            }
+        }
+        let n = buf.len().min(self.pending.len());
+        buf[..n].copy_from_slice(&self.pending[..n]);
+        self.pending.drain(..n);
+        Ok(n)
+    }
+}
+/// The replies the server wrote, one JSON value per line.
+struct Replies(mpsc::Sender<Value>, Vec<u8>);
+impl std::io::Write for Replies {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.1.extend_from_slice(buf);
+        while let Some(end) = self.1.iter().position(|b| *b == b'\n') {
+            let line: Vec<u8> = self.1.drain(..=end).collect();
+            let _ = self.0.send(serde_json::from_slice(&line).unwrap());
+        }
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+fn line(id: u64, name: &str, args: Value) -> String {
+    let call = json!({"jsonrpc":"2.0","id":id,"method":"tools/call",
+        "params":{"name":name,"arguments":args}});
+    format!("{call}\n")
+}
+#[test]
+fn a_call_cancelled_while_it_waits_is_answered_without_running() {
+    let (session, fake) = session("browser.cdp", true);
+    let (release, held) = mpsc::channel();
+    *fake.gate.lock().unwrap() = Some(held);
+    let (send, chunks) = mpsc::channel::<String>();
+    let (asked_tx, asked) = mpsc::channel();
+    let (replies_tx, replies) = mpsc::channel();
+    let serving = std::thread::spawn(move || {
+        aad_mcp::serve_with(
+            std::io::BufReader::new(Feed {
+                chunks,
+                asked: asked_tx,
+                pending: Vec::new(),
+            }),
+            Replies(replies_tx, Vec::new()),
+            Server::with_control(Arc::new(session)),
+        )
+    });
+    // Send a chunk and wait until the server has read and handled all of it.
+    let feed = |chunk: String| {
+        send.send(chunk).unwrap();
+        asked.recv_timeout(Duration::from_secs(5)).unwrap();
+    };
+    let reply = || replies.recv_timeout(Duration::from_secs(5)).unwrap();
+    asked.recv_timeout(Duration::from_secs(5)).unwrap();
+
+    feed(line(1, "control_targets", json!({})));
+    reply();
+    feed(line(
+        2,
+        "control_observe",
+        json!({"resource_id":"fixture:one"}),
+    ));
+    let target = payload(reply())["data"]["nodes"][0]["target"].clone();
+    let click = json!({"target":target,"action":{"type":"click"}});
+
+    // The first click holds the line; the second waits behind it and is
+    // cancelled there.
+    feed(line(3, "control_act", click.clone()));
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while fake.calls.load(Ordering::SeqCst) == 0 {
+        assert!(Instant::now() < deadline);
+        std::thread::yield_now();
+    }
+    let cancel = json!({"jsonrpc":"2.0","method":"notifications/cancelled",
+        "params":{"requestId":4,"reason":"test"}});
+    feed(line(4, "control_act", click) + &format!("{cancel}\n"));
+    release.send(()).unwrap();
+
+    assert_eq!(payload(reply())["effect"], "applied");
+    let cancelled = reply();
+    assert_eq!(cancelled["id"], 4);
+    assert_eq!(cancelled["result"]["isError"], true);
+    let cancelled = payload(cancelled);
+    assert_eq!(cancelled["error"]["code"], "CONTROL.CANCELLED");
+    assert_eq!(cancelled["effect"], "not_applied");
+    assert_eq!(fake.calls.load(Ordering::SeqCst), 1);
+
+    drop(send);
+    serving.join().unwrap().unwrap();
 }
 #[test]
 fn a_remote_connection_advertises_no_local_file_or_legacy_execution_tools() {
