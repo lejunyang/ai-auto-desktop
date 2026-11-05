@@ -307,6 +307,9 @@ page/frame/loader/document、节点连接状态及语义指纹。导航、frame 
 关闭、EOF、断连和到期撤销观察与输入权限。重新连接创建全新会话，必须重新发现和观察；
 **不会恢复输入、自动重放或自动重试 unknown 动作**。
 
+MCP（`aad mcp`）一次只处理一个调用：回复上一个请求之后才开始下一个，回复按请求顺序返回。
+只有 `notifications/cancelled` 会提前读取，作用于正在处理的那个控制调用；还没开始的调用不能取消。
+
 ## 远程授权与隔离
 
 服务没有 TCP/HTTP 监听。认证由创建 stdio 的 OS/SSH 层完成；每个连接启动独立进程、独立会话，
@@ -334,10 +337,6 @@ aad control connect --command '["ssh","-T","-o","BatchMode=yes","-o","StrictHost
 CDP 仅接受 loopback 调试地址，显式 `--browser-port` 才启用；不会启动真实浏览器、复制登录态或创建凭证。
 浏览器调试端口本身有高权限，使用专用空白 profile 并保留 Chromium 沙箱。每个会话使用独立 isolated world，
 关闭时清理自己的 DOM 引用，不影响其他只读观察者。
-
-### 转发关闭拒绝
-
-可恢复的关闭拒绝排入响应队列后，转发端点会向上游权威端发起有界（1000 ms）的 capabilities 查询。字段 session_usable 综合关闭状态、生命周期和本次查询获准后的剩余请求配额。每次探测消耗一个请求 ID。权威信息缺失（包括旧版服务端）、探测失败或配额耗尽时，连接安全断开；本地套接字仍存活不足以授权继续服务。
 
 ## 与 Android 的互操作边界
 
