@@ -810,13 +810,18 @@ pub fn act(command: &DoCommand) -> (Value, u8) {
 pub struct RecordArgs {
     /// The window or application to watch, as for `aad describe`.
     resource: String,
-    /// How long to record for, in seconds (1..600).
+    /// How long to record for, in seconds (1..600; default 15).
     ///
-    /// Recording runs for a fixed time because a command-line session has no
-    /// way to be told "stop now": the process stays alive to hold the watch,
-    /// then reports.
-    #[arg(long, default_value_t = 15)]
-    seconds: u64,
+    /// A command-line session has no other way to be told "stop now": the
+    /// process stays alive to hold the watch, then reports. With
+    /// `--until-stdin-closes` this is only the longest it may run (up to 3600,
+    /// default 3600).
+    #[arg(long)]
+    seconds: Option<u64>,
+    /// Stop as soon as standard input closes, for a host that starts the
+    /// recording and ends it when the person says they are done.
+    #[arg(long)]
+    until_stdin_closes: bool,
     /// Save the steps as a named recording and workflow, ready for `aad run`.
     ///
     /// The steps name the application by process or title and each element by
@@ -835,6 +840,16 @@ fn automation(error: aad_core::AutomationError) -> (Value, u8) {
         error["hint"] = json!(hint);
     }
     (json!({"status": "error", "error": error}), EXIT_FAILED)
+}
+
+/// The longest a recording may run, in seconds.
+fn record_limit(seconds: Option<u64>, until_stdin_closes: bool) -> u64 {
+    match (seconds, until_stdin_closes) {
+        (Some(seconds), false) => seconds.clamp(1, 600),
+        (None, false) => 15,
+        (Some(seconds), true) => seconds.clamp(1, 3600),
+        (None, true) => 3600,
+    }
 }
 
 /// Watch a window for a while and report, or save, what was done in it.
@@ -860,17 +875,30 @@ pub fn record(args: &RecordArgs) -> (Value, u8) {
             .cloned()
             .ok_or_else(|| usage("the window closed"))?;
         let app = steps::describe(&resource, &all);
-        let seconds = args.seconds.clamp(1, 600);
+        let seconds = record_limit(args.seconds, args.until_stdin_closes);
+        let closed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut recording =
             Recording::start(&desk.session, &resource, app.clone(), 1).map_err(automation)?;
-        eprintln!(
-            "recording {} for {seconds}s…",
-            resource["name"].as_str().unwrap_or("the window")
-        );
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(seconds);
+        if args.until_stdin_closes {
+            let closed = closed.clone();
+            std::thread::spawn(move || {
+                let _ = std::io::copy(&mut std::io::stdin().lock(), &mut std::io::sink());
+                closed.store(true, std::sync::atomic::Ordering::SeqCst);
+            });
+        }
+        let name = resource["name"].as_str().unwrap_or("the window");
+        if args.until_stdin_closes {
+            eprintln!("recording {name} until standard input closes (at most {seconds}s)…");
+        } else {
+            eprintln!("recording {name} for {seconds}s…");
+        }
+        let started = std::time::Instant::now();
+        let deadline = started + std::time::Duration::from_secs(seconds);
         let (mut recorded, mut skipped, mut dropped) = (Vec::new(), Vec::new(), 0);
         // Collected as it goes: the providers buffer a bounded number of events.
-        while std::time::Instant::now() < deadline {
+        while std::time::Instant::now() < deadline
+            && !closed.load(std::sync::atomic::Ordering::SeqCst)
+        {
             std::thread::sleep(std::time::Duration::from_millis(300));
             let batch = recording.collect().map_err(automation)?;
             recorded.extend(batch.steps);
@@ -883,7 +911,12 @@ pub fn record(args: &RecordArgs) -> (Value, u8) {
         dropped += batch.dropped;
         let mut answer = json!({
             "app": app,
-            "seconds": seconds,
+            "seconds": started.elapsed().as_secs(),
+            "stopped_by": if closed.load(std::sync::atomic::Ordering::SeqCst) {
+                "stdin_closed"
+            } else {
+                "time"
+            },
             "count": recorded.len(),
             "steps": recorded,
             "skipped": skipped,
@@ -937,6 +970,15 @@ mod tests {
         let mut argv = vec!["do"];
         argv.extend_from_slice(args);
         Probe::try_parse_from(argv).map(|p| p.command)
+    }
+
+    #[test]
+    fn a_recording_a_host_stops_runs_until_then_within_an_hour() {
+        assert_eq!(record_limit(None, false), 15);
+        assert_eq!(record_limit(Some(9_000), false), 600);
+        assert_eq!(record_limit(None, true), 3_600);
+        assert_eq!(record_limit(Some(9_000), true), 3_600);
+        assert_eq!(record_limit(Some(120), true), 120);
     }
 
     #[test]

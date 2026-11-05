@@ -123,6 +123,7 @@ Linux（KDE/X11）上 key、scroll、hover、drag 和带选项的 click 经 XTes
 
 ```powershell
 aad record 99e160f2 --seconds 20 --save 报销填写   # 在这段时间里操作那个窗口
+aad record 99e160f2 --until-stdin-closes --save 报销填写   # 由宿主决定何时停：关掉标准输入就停（最长 1 小时）
 aad run <输出里的 workflow_path> --permission desktop.input --permission desktop.observe
 ```
 
