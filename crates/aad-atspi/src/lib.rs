@@ -1133,8 +1133,21 @@ impl AtspiProvider {
         deadline: Instant,
     ) -> Result<(), AutomationError> {
         let allowed = descendants(record, node_id);
+        // Start at the top-most ancestor that takes part in hit testing (has
+        // bounds, unlike the application object above the windows): a lookup
+        // from lower down cannot see what covers the target from outside it.
+        let positioned = record.public["nodes"]
+            .as_array()
+            .expect("normalized nodes")
+            .iter()
+            .filter(|node| node["bounds"].is_object())
+            .filter_map(|node| node["node_id"].as_str())
+            .collect::<BTreeSet<_>>();
         let mut hit = None;
-        for ancestor in ancestors(record, node_id).into_iter().rev() {
+        for ancestor in ancestor_chain(record, node_id).into_iter().rev() {
+            if !positioned.contains(ancestor.as_str()) {
+                continue;
+            }
             if let Some(native) = record.handles.get(&ancestor) {
                 match self.backend.accessible_at_point(native, point, deadline) {
                     Ok(Some(found)) => {
@@ -1630,6 +1643,11 @@ fn descendants(record: &Record, node_id: &str) -> BTreeSet<String> {
 }
 
 fn ancestors(record: &Record, node_id: &str) -> BTreeSet<String> {
+    ancestor_chain(record, node_id).into_iter().collect()
+}
+
+/// The node, its parent and so on up to the root, in that order.
+fn ancestor_chain(record: &Record, node_id: &str) -> Vec<String> {
     let nodes = record.public["nodes"].as_array().expect("normalized nodes");
     let parents = nodes
         .iter()
@@ -1640,11 +1658,11 @@ fn ancestors(record: &Record, node_id: &str) -> BTreeSet<String> {
             ))
         })
         .collect::<BTreeMap<_, _>>();
-    let mut result = BTreeSet::new();
+    let mut result = Vec::new();
     let mut current = Some(node_id.to_string());
     while let Some(id) = current {
         current = parents.get(&id).cloned().flatten();
-        result.insert(id);
+        result.push(id);
     }
     result
 }
@@ -2252,6 +2270,8 @@ mod tests {
         replaced: bool,
         truncated: bool,
         hit_chain: u8,
+        /// Containers above the target, which is then `n{depth}`.
+        depth: usize,
     }
 
     impl FakeBackend {
@@ -2348,7 +2368,26 @@ mod tests {
             } else {
                 "/org/a11y/save"
             };
-            let mut nodes = vec![self.node(path)];
+            let mut nodes = (0..self.depth)
+                .map(|level| {
+                    let mut node = self.node(&format!("/chain/{level}"));
+                    node.parent_index = level.checked_sub(1);
+                    if level == 0 {
+                        // Like the application object: no Component, no bounds.
+                        node.bounds = None;
+                    }
+                    node.role = "filler".into();
+                    node.name = None;
+                    node.description = None;
+                    node.attributes.clear();
+                    node.provenance
+                        .insert("accessible_id".into(), json!(format!("chain-{level}")));
+                    node
+                })
+                .collect::<Vec<_>>();
+            let mut target = self.node(path);
+            target.parent_index = self.depth.checked_sub(1);
+            nodes.push(target);
             if self.alias {
                 nodes.push(self.node(path));
             }
@@ -2488,6 +2527,27 @@ mod tests {
             _point: (i32, i32),
             _deadline: Instant,
         ) -> Result<Option<NativeRef>, AutomationError> {
+            if let Some(level) = root.object_path.strip_prefix("/chain/") {
+                // 5: a popup covers the window; 6: nothing does.
+                let level: usize = level.parse().unwrap();
+                if level == 0 {
+                    return Err(driver_error(
+                        "DRIVER.ACTION_FAILED",
+                        "the application object has no Component interface",
+                    ));
+                }
+                let object_path = if level == 1 && self.hit_chain == 5 {
+                    "/occluder".to_string()
+                } else if level + 1 == self.depth {
+                    "/org/a11y/save".to_string()
+                } else {
+                    format!("/chain/{}", level + 1)
+                };
+                return Ok(Some(NativeRef {
+                    bus_name: root.bus_name.clone(),
+                    object_path,
+                }));
+            }
             match (self.hit_chain, root.object_path.as_str()) {
                 (0, _) => Ok(Some(root.clone())),
                 (4, _) => Ok(None),
@@ -2710,6 +2770,33 @@ mod tests {
                 let error = result.unwrap_err();
                 assert_eq!(error.code, "DRIVER.POINT_NOT_PROVEN");
                 assert_eq!(error.effect, "not_applied");
+                assert_eq!(backend.writes.load(Ordering::SeqCst), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn pointer_hit_proof_starts_at_the_window_root() {
+        // With ten ancestors "n9" sorts after "n10": a start picked by id
+        // order would be the target's parent, below whatever covers it. The
+        // root has no bounds, like an application, and is not hit tested.
+        for (hit_chain, proven) in [(5, false), (6, true)] {
+            let backend = Arc::new(FakeBackend {
+                hit_chain,
+                depth: 10,
+                ..Default::default()
+            });
+            let provider = AtspiProvider::new(backend.clone()).unwrap();
+            let snapshot = take_snapshot(&provider);
+            let result = provider.invoke("desktop.linux_atspi.pointer_click@1", json!({
+                "target":{"snapshot_id":snapshot["snapshot_id"],"revision":snapshot["revision"],"node_id":"n10"},
+                "locator":locator()
+            }), Some(Duration::from_secs(2)));
+            if proven {
+                result.unwrap();
+                assert_eq!(backend.writes.load(Ordering::SeqCst), 1);
+            } else {
+                assert_eq!(result.unwrap_err().code, "DRIVER.POINT_NOT_PROVEN");
                 assert_eq!(backend.writes.load(Ordering::SeqCst), 0);
             }
         }
