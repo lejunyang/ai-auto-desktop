@@ -185,6 +185,27 @@ impl WebSocket {
         let _ = self.stream.shutdown(std::net::Shutdown::Both);
     }
 
+    /// Whether a frame (or the end of the stream) is there to read within
+    /// `wait`, without consuming anything: the reader polls with it between
+    /// frames, never inside one.
+    pub fn readable_within(&self, wait: std::time::Duration) -> Result<bool, CdpError> {
+        self.stream
+            .set_read_timeout(Some(wait))
+            .map_err(CdpError::io)?;
+        match self.stream.peek(&mut [0u8; 1]) {
+            Ok(_) => Ok(true),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                Ok(false)
+            }
+            Err(e) => Err(CdpError::io(e)),
+        }
+    }
+
     pub fn set_write_deadline(&self, deadline: Instant) -> Result<(), CdpError> {
         self.stream
             .set_write_timeout(Some(

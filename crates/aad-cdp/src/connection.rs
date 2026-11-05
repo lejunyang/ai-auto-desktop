@@ -70,18 +70,36 @@ pub(crate) struct Connection {
     socket: WebSocket,
     inbox: Arc<Mutex<Inbox>>,
     reader: Option<std::thread::JoinHandle<()>>,
+    /// Set when the connection is dropped, for a reader waiting between frames.
+    closing: Arc<std::sync::atomic::AtomicBool>,
     cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
+
+/// How often a reader with nothing to read checks whether it should stop.
+const READER_POLL: Duration = Duration::from_millis(200);
 
 impl Connection {
     pub fn new(socket: WebSocket) -> Result<Self, CdpError> {
         let mut read = socket.reader()?;
         let inbox = Arc::new(Mutex::new(Inbox::default()));
         let shared = inbox.clone();
+        let closing = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop = closing.clone();
         let reader = std::thread::spawn(move || {
             let failure = loop {
-                // No short idle timeout: abandoning a partially read frame
-                // corrupts the stream. Drop shuts the socket down to interrupt.
+                // Wait for a frame in short slices: shutting the socket down
+                // does not interrupt a blocking read on Windows, so Drop could
+                // otherwise wait until the operating system gives up on a silent
+                // peer. Once a frame has begun it is read whole, with no short
+                // timeout: abandoning a partially read frame corrupts the stream.
+                if stop.load(std::sync::atomic::Ordering::SeqCst) {
+                    break CdpError::protocol("connection closed");
+                }
+                match read.readable_within(READER_POLL) {
+                    Ok(true) => {}
+                    Ok(false) => continue,
+                    Err(error) => break error,
+                }
                 let frame = match read.recv_until(Instant::now() + Duration::from_secs(86400)) {
                     Ok(frame) => frame,
                     Err(error) => break error,
@@ -118,6 +136,7 @@ impl Connection {
             socket,
             inbox,
             reader: Some(reader),
+            closing,
             cancel: None,
         })
     }
@@ -234,6 +253,8 @@ impl Connection {
 
 impl Drop for Connection {
     fn drop(&mut self) {
+        self.closing
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         self.socket.shutdown();
         if let Some(reader) = self.reader.take() {
             let _ = reader.join();
