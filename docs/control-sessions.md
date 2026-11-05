@@ -241,7 +241,7 @@ driver 求值；浏览器页面求值 `value`、`states`、`match`（contains �
 `condition`（`appears` 恰好一个匹配；`disappears` 没有匹配；`state` 恰好一个匹配且其 `states` 等于给出的
 `states` 对象），每隔 `interval_ms`（50..5000，默认 250）观察一次，直到满足或 `timeout_ms` 用完
 （`CONTROL.WAIT_TIMEOUT`，`details` 带 `polls` 与最后一次是否存在）。多个匹配永远不算找到：一直歧义到超时返回
-最后一次的歧义码（浏览器和 macOS AX 为 `CONTROL.AMBIGUOUS`，Windows 为 `DRIVER.AMBIGUOUS_MATCH`，Linux AT-SPI 为 `DRIVER.AMBIGUOUS`）。满足时返回最后一次的 `observation_id`，`appears`/`state` 还带该节点的 `target`，这次观察仍是当前观察，
+最后一次的歧义码（浏览器和 macOS AX 为 `CONTROL.AMBIGUOUS`，Windows 为 `DRIVER.AMBIGUOUS_MATCH`，Linux AT-SPI 为 `DRIVER.AMBIGUOUS`），`details` 带那次观察的 `observation_id`，可以在其中用候选的 `node_id` 定位。录制工作流里的 check 步骤也这样等：多个匹配既不算出现也不算消失，一直如此到期限时报歧义码。满足时返回最后一次的 `observation_id`，`appears`/`state` 还带该节点的 `target`，这次观察仍是当前观察，
 可以直接 act。等待期间占用会话串行锁（单请求上限 30 秒），`cancel` 可以中止，结果为 `not_committed`。
 
 给人用的 `aad apps/describe/overview/snapshot/find/do` 也走这个会话：每条命令一个进程、一个会话，

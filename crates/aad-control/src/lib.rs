@@ -1726,7 +1726,11 @@ impl Session {
             let remaining = context.remaining()?;
             if remaining < interval + Duration::from_millis(200) {
                 if let Some(ambiguous) = ambiguous {
-                    return Err(ambiguous.with_detail("polls", json!(polls)));
+                    // The candidates are node ids of this observation: name
+                    // it, so they can be narrowed with find there.
+                    return Err(ambiguous
+                        .with_detail("polls", json!(polls))
+                        .with_detail("observation_id", json!(observation_id)));
                 }
                 let mut failure = error(
                     "CONTROL.WAIT_TIMEOUT",
