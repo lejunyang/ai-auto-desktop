@@ -33,12 +33,18 @@
   // What a person could pick up: HTML5 draggables, items of lists and grids,
   // and whatever shows a grab cursor.
   const draggable = el => el!==document.body && (el.draggable || ['listitem','option','row','treeitem'].includes(roleOf(el)) || /^(grab|grabbing|move)$/.test(getComputedStyle(el).cursor));
+  // focus() exists on all HTMLElements, including divs that cannot take focus.
+  // Explicit negative tabindex still permits programmatic focus.
+  const focusable = el => typeof el.focus==='function' && (el.tabIndex>=0 || el.hasAttribute('tabindex') || el.isContentEditable || activeElement()===el);
   const actions = el => {
     if (!enabled(el) || protectedNode(el)) return [];
     if (fileInput(el)) return ['upload'];
     const result=[];
-    if (typeof el.focus==='function') result.push('focus','key');
-    if ((['BUTTON','A','INPUT','SELECT'].includes(el.tagName) || el.onclick || roleOf(el)==='button' || checkable(el)) && typeof el.click==='function') result.push('click','hover');
+    if (focusable(el)) result.push('focus','key');
+    // Delegated listeners (including React) are invisible in our isolated world.
+    // The rendered pointer affordance also identifies their clickable elements;
+    // check() rechecks this capability and the observed identity before input.
+    if ((['BUTTON','A','INPUT','SELECT'].includes(el.tagName) || el.onclick || roleOf(el)==='button' || checkable(el) || getComputedStyle(el).cursor==='pointer') && typeof el.click==='function') result.push('click','hover');
     if (editable(el)) result.push('fill','type_text');
     if (el.tagName==='SELECT' && !el.multiple) result.push('select');
     if (checkable(el)) result.push('check');
