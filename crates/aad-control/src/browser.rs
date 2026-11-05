@@ -1748,7 +1748,7 @@ impl Backend for BrowserBackend {
                 .ok_or_else(||error("BROWSER.BAD_RESULT","frame did not provide an isolated context"))?;
             let context=Ctx{session:session.clone(),id:context};
             let nonce=serde_json::to_string(&uuid::Uuid::new_v4().to_string()).unwrap();
-            eval(client,&context,include_str!("browser.js").replace("NONCE",&nonce))?;
+            eval(client,&context,include_str!("browser.js").replace("/*AAD_NAMING*/",aad_cdp::NAMING).replace("NONCE",&nonce))?;
             let observation=uuid::Uuid::new_v4().to_string();
             *self.last_context.lock().unwrap()=Some((page_id.into(),context.clone()));
             let mut result=eval(client,&context,format!("globalThis.__aadControlV1.observe({}, {}, {})",serde_json::to_string(&observation).unwrap(),max_nodes,selector["scope_id"]))?;
