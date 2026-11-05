@@ -896,7 +896,11 @@ fn walk_through(result: &aad_runtime::RunResult) -> Vec<Value> {
                 }
             }
             None => {
-                let expected = if parts.iter().any(|(id, _, _)| id.ends_with("_destination")) {
+                // A saved control step (control-steps/1) runs as one step of its
+                // own; an expanded action needs its helper steps and the action.
+                let expected = if parts.iter().all(|(id, _, _)| id == &logical) {
+                    1
+                } else if parts.iter().any(|(id, _, _)| id.ends_with("_destination")) {
                     4
                 } else {
                     3
@@ -1416,6 +1420,17 @@ pub(crate) mod tests {
         ]));
         assert_eq!(failed.len(), 1);
         assert_eq!(failed[0]["phase"], "finding the drag destination");
+    }
+
+    #[test]
+    fn a_control_step_that_ran_is_done() {
+        // `aad record` and browser recordings save one control step per action,
+        // with nothing expanded around it.
+        let steps = walk_through(&run_with(&[("rec1", "succeeded"), ("rec2", "succeeded")]));
+        assert_eq!(steps[0]["status"], "succeeded");
+        assert_eq!(steps[1]["status"], "succeeded");
+        let failed = walk_through(&run_with(&[("rec1", "failed")]));
+        assert_eq!(failed[0]["status"], "failed");
     }
 
     #[test]
