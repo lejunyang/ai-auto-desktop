@@ -6,13 +6,36 @@ param(
         'x86_64-apple-darwin', 'aarch64-apple-darwin')]
     [string]$Target,
     [Parameter(Mandatory = $true)][string]$Version,
-    [string]$OutputDirectory = 'dist'
+    [string]$OutputDirectory = 'dist',
+    [string]$TargetDirectory
 )
 
 # Package the actual target build, preserving helper bundles and executable
 # modes. The target runner executes the extracted CLI too. PS 5.1 syntax.
 $ErrorActionPreference = 'Stop'
 $repository = (Resolve-Path (Join-Path $PSScriptRoot '../..')).Path
+if (-not $TargetDirectory -and $env:CARGO_TARGET_DIR) {
+    # Cargo resolves this environment override relative to the calling process.
+    # Resolve it before changing directory to discover repository configuration.
+    $TargetDirectory = $env:CARGO_TARGET_DIR
+    if (-not [IO.Path]::IsPathRooted($TargetDirectory)) {
+        $TargetDirectory = Join-Path (Get-Location).Path $TargetDirectory
+    }
+}
+if (-not $TargetDirectory) {
+    Push-Location $repository
+    try {
+        $metadata = & cargo metadata --no-deps --format-version 1 --manifest-path (Join-Path $repository 'Cargo.toml')
+        if ($LASTEXITCODE) { throw 'Cannot resolve Cargo target directory' }
+        $TargetDirectory = ($metadata | ConvertFrom-Json).target_directory
+    } finally {
+        Pop-Location
+    }
+}
+if (-not $TargetDirectory -or -not (Test-Path -LiteralPath $TargetDirectory -PathType Container)) {
+    throw 'Cargo target directory does not exist'
+}
+$TargetDirectory = (Resolve-Path -LiteralPath $TargetDirectory).Path
 New-Item -ItemType Directory -Force $OutputDirectory | Out-Null
 $output = (Resolve-Path $OutputDirectory).Path
 $name = "aad-$Version-$Target"
@@ -26,8 +49,8 @@ if ($windowsTarget) { $executable = 'aad.exe' }
 $browserHelper = 'aad-browser'
 if ($windowsTarget) { $browserHelper = 'aad-browser.exe' }
 try {
-    Copy-Item (Join-Path $repository "target/$Target/release/$executable") $staging
-    Copy-Item (Join-Path $repository "target/$Target/release/$browserHelper") $staging
+    Copy-Item (Join-Path $TargetDirectory "$Target/release/$executable") $staging
+    Copy-Item (Join-Path $TargetDirectory "$Target/release/$browserHelper") $staging
     if ($Target.Contains('-linux-')) {
         $helpers = Join-Path $repository "plugins/linux_atspi/.build-$Target"
         Copy-Item (Join-Path $helpers 'x11_xtest_helper') (Join-Path $staging 'aad-linux-xtest-helper')
@@ -69,6 +92,11 @@ try {
         if ($LASTEXITCODE) { throw 'Cannot package CLI archive' }
         & tar -xzf $archive -C $unpacked
         if ($LASTEXITCODE) { throw 'Cannot read back CLI archive' }
+    }
+    foreach ($binary in @($executable, $browserHelper)) {
+        $sourceHash = (Get-FileHash (Join-Path $TargetDirectory "$Target/release/$binary") -Algorithm SHA256).Hash
+        $packedHash = (Get-FileHash (Join-Path $unpacked "$name/$binary") -Algorithm SHA256).Hash
+        if ($sourceHash -ne $packedHash) { throw "Packaged $binary differs from build output" }
     }
     $cli = Join-Path $unpacked "$name/$executable"
     $actual = & $cli --version
