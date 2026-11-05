@@ -339,6 +339,17 @@ struct RunArgs {
 }
 
 fn main() -> ExitCode {
+    if std::env::args_os().len() == 2
+        && std::env::args_os()
+            .nth(1)
+            .is_some_and(|a| a == "--aad-qr-decode")
+    {
+        return if aad_control::qr::worker().is_ok() {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::FAILURE
+        };
+    }
     let cli = Cli::parse();
 
     // The MCP server owns stdout for the whole session: it is a protocol

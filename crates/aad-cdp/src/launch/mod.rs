@@ -17,6 +17,25 @@ use std::time::{Duration, Instant};
 
 type Result<T> = crate::recording::Result<T>;
 
+pub trait Authority {
+    fn cancellation(&self) -> Option<std::sync::Arc<std::sync::atomic::AtomicBool>> {
+        None
+    }
+    fn check(&self) -> Result<()> {
+        Ok(())
+    }
+    fn navigation(&self) -> Result<()> {
+        self.check()
+    }
+    fn effect(&self, action: &mut dyn FnMut() -> Result<()>) -> Result<()>;
+}
+struct Unrestricted;
+impl Authority for Unrestricted {
+    fn effect(&self, action: &mut dyn FnMut() -> Result<()>) -> Result<()> {
+        action()
+    }
+}
+
 pub struct Options {
     pub browser: String,
     pub executable: Option<PathBuf>,
@@ -36,14 +55,19 @@ struct Profile {
 }
 
 impl Profile {
-    fn prepare(options: &Options) -> Result<Self> {
+    fn prepare(options: &Options, authority: &dyn Authority) -> Result<Self> {
         let path = options.profile_dir.clone().unwrap_or_else(|| {
             std::env::temp_dir().join(format!("aad-record-profile-{}", uuid::Uuid::new_v4()))
         });
         if let Some(source) = &options.copy_from {
             selected_profile(source, &options.profile_id)?;
             profile::validate_copy_destination(source, &path)?;
-            ensure_available(source, &options.browser, options.kill_browser)?;
+            occupancy::ensure_available_guarded(
+                source,
+                &options.browser,
+                options.kill_browser,
+                authority,
+            )?;
             copy_selected_profile(source, &path, &options.profile_id)?;
         } else {
             fs::create_dir_all(&path)?;
@@ -54,7 +78,12 @@ impl Profile {
             temporary: options.profile_dir.is_none(),
             lock: None,
         };
-        ensure_available(&profile.path, &options.browser, options.kill_browser)?;
+        occupancy::ensure_available_guarded(
+            &profile.path,
+            &options.browser,
+            options.kill_browser,
+            authority,
+        )?;
         profile.lock = Some(
             OpenOptions::new()
                 .write(true)
@@ -106,7 +135,14 @@ pub struct Browser {
 }
 
 impl Browser {
+    pub fn process_id(&self) -> u32 {
+        self.child.id()
+    }
+
     pub fn start(options: Options) -> Result<Self> {
+        Self::start_guarded(options, &Unrestricted)
+    }
+    pub fn start_guarded(options: Options, authority: &dyn Authority) -> Result<Self> {
         let exe = options
             .executable
             .clone()
@@ -117,7 +153,7 @@ impl Browser {
                     options.browser
                 )
             })?;
-        let profile = Profile::prepare(&options)?;
+        let profile = Profile::prepare(&options, authority)?;
         let mut command = Command::new(exe);
         command
             .args([
@@ -140,7 +176,12 @@ impl Browser {
             use std::os::unix::process::CommandExt;
             command.process_group(0);
         }
-        let child = command.spawn()?;
+        let mut child = None;
+        authority.effect(&mut || {
+            child = Some(command.spawn()?);
+            Ok(())
+        })?;
+        let child = child.unwrap();
         let mut browser = Self {
             client: None,
             child,
@@ -148,7 +189,11 @@ impl Browser {
             port: 0,
             page: String::new(),
         };
-        browser.wait_ready()?;
+        browser.wait_ready(authority)?;
+        authority.check()?;
+        if let Some(cancel) = authority.cancellation() {
+            browser.client.as_mut().unwrap().set_cancellation(cancel);
+        }
         let result = browser.client.as_mut().unwrap().command(
             "Target.createTarget",
             json!({"url":"about:blank", "newWindow":true}),
@@ -157,12 +202,14 @@ impl Browser {
             .as_str()
             .ok_or("missing newly created page ID")?
             .into();
+        authority.check()?;
         Ok(browser)
     }
 
-    fn wait_ready(&mut self) -> Result<()> {
+    fn wait_ready(&mut self, authority: &dyn Authority) -> Result<()> {
         let deadline = Instant::now() + Duration::from_secs(20);
         while Instant::now() < deadline {
+            authority.check()?;
             if let Some(status) = self.child.try_wait()? {
                 return Err(format!("browser exited before CDP startup ({status}); close any browser using this profile, or choose a new --profile-dir").into());
             }
@@ -174,7 +221,11 @@ impl Browser {
                 ) {
                     if path.starts_with("/devtools/browser/") {
                         let endpoint = format!("ws://127.0.0.1:{port}{path}");
-                        if let Ok(ws) = WebSocket::connect_until(&endpoint, deadline) {
+                        if let Ok(ws) = WebSocket::connect_cancellable(
+                            &endpoint,
+                            deadline,
+                            authority.cancellation().as_deref(),
+                        ) {
                             self.client = Some(Client {
                                 connection: Connection::new(ws)?,
                                 next_id: 0,
@@ -198,14 +249,24 @@ impl Browser {
     /// Startup navigation, only for the blank page created by this launch.
     /// Call after installing the recorder so the initial requests are observed.
     pub fn open_url(&self, url: &str) -> Result<()> {
-        let target = Client::list_targets(self.port)?
+        self.open_url_guarded(url, &Unrestricted)
+    }
+    pub fn open_url_guarded(&self, url: &str, authority: &dyn Authority) -> Result<()> {
+        authority.check()?;
+        let cancel = authority.cancellation();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let target = Client::list_targets_cancellable(self.port, deadline, cancel.as_deref())?
             .into_iter()
             .find(|t| t.id == self.page)
             .ok_or("created page was closed")?;
         if target.url != "about:blank" {
             return Err("created page has already navigated; refusing to replace it".into());
         }
-        let mut client = Client::attach(&target)?;
+        let mut client = Client::attach_cancellable(&target, deadline, cancel)?;
+        if let Some(cancel) = authority.cancellation() {
+            client.set_cancellation(cancel);
+        }
+        authority.navigation()?;
         let result = client.command("Page.navigate", json!({"url":url}))?;
         if let Some(error) = result["errorText"].as_str() {
             return Err(format!("could not open URL: {error}").into());

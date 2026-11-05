@@ -3,6 +3,8 @@
   const documentToken = NONCE;
   let observation = null;
   let nodes = new Map();
+  let scopeRoot = null, scopeInvalid = false;
+  const scopeObserver = new MutationObserver(() => { scopeInvalid = true; });
   const inputRole = el => ({checkbox:'checkbox',radio:'radio',button:'button',submit:'button',reset:'button',range:'slider',file:'button'}[(el.type||'').toLowerCase()] || 'textbox');
   const roleOf = el => el.getAttribute('role') || (el.tagName==='INPUT' ? inputRole(el) : ({TEXTAREA:'textbox',BUTTON:'button',A:'link',SELECT:'combobox',BODY:'document',IMG:'img',CANVAS:'canvas',SVG:'img',LI:'listitem',UL:'list',OL:'list',TABLE:'table',TR:'row',TD:'cell',TH:'columnheader',H1:'heading',H2:'heading',H3:'heading',H4:'heading',H5:'heading',H6:'heading',DIALOG:'dialog',FORM:'form',HEADER:'banner',NAV:'navigation',MAIN:'main',ASIDE:'complementary',FOOTER:'contentinfo',SECTION:'region',OUTPUT:'status'}[el.tagName.toUpperCase()] || 'generic'));
   const textOf = el => {let text='',i=0;const walker=document.createTreeWalker(el,NodeFilter.SHOW_TEXT);let node;while(text.length<256 && i++<32 && (node=walker.nextNode()))text+=(node.nodeValue||'').slice(0,256-text.length);return text;};
@@ -31,12 +33,18 @@
   // What a person could pick up: HTML5 draggables, items of lists and grids,
   // and whatever shows a grab cursor.
   const draggable = el => el!==document.body && (el.draggable || ['listitem','option','row','treeitem'].includes(roleOf(el)) || /^(grab|grabbing|move)$/.test(getComputedStyle(el).cursor));
+  // focus() exists on all HTMLElements, including divs that cannot take focus.
+  // Explicit negative tabindex still permits programmatic focus.
+  const focusable = el => typeof el.focus==='function' && (el.tabIndex>=0 || el.hasAttribute('tabindex') || el.isContentEditable || activeElement()===el);
   const actions = el => {
     if (!enabled(el) || protectedNode(el)) return [];
     if (fileInput(el)) return ['upload'];
     const result=[];
-    if (typeof el.focus==='function') result.push('focus','key');
-    if ((['BUTTON','A','INPUT','SELECT'].includes(el.tagName) || el.onclick || roleOf(el)==='button' || checkable(el)) && typeof el.click==='function') result.push('click','hover');
+    if (focusable(el)) result.push('focus','key');
+    // Delegated listeners (including React) are invisible in our isolated world.
+    // The rendered pointer affordance also identifies their clickable elements;
+    // check() rechecks this capability and the observed identity before input.
+    if ((['BUTTON','A','INPUT','SELECT'].includes(el.tagName) || el.onclick || roleOf(el)==='button' || checkable(el) || getComputedStyle(el).cursor==='pointer') && typeof el.click==='function') result.push('click','hover');
     if (editable(el)) result.push('fill','type_text');
     if (el.tagName==='SELECT' && !el.multiple) result.push('select');
     if (checkable(el)) result.push('check');
@@ -46,6 +54,7 @@
     return result;
   };
   const check = args => {
+    if (scopeRoot && (scopeInvalid || scopeObserver.takeRecords().length || !scopeRoot.isConnected)) return {error:'CONTROL.STALE_TARGET'};
     if (args.document_token!==documentToken || args.observation!==observation) return {error:'CONTROL.STALE_TARGET'};
     const found=nodes.get(args.node_id);
     if (!found || !present(found.el) || fingerprint(found.el)!==found.fingerprint) return {error:'CONTROL.STALE_TARGET'};
@@ -55,16 +64,31 @@
     return found;
   };
   globalThis.__aadControlV1 = {
-    observe: (id,limit) => {
+    validate_scope: args => {
+      if(args.document_token!==documentToken || args.observation!==observation ||
+         !scopeRoot || !scopeRoot.isConnected || scopeInvalid || scopeObserver.takeRecords().length)
+        return {error:'CONTROL.STALE_TARGET'};
+      return {valid:true};
+    },
+    observe: (id,limit,scopeId=null) => {
       observation=id; nodes=new Map();
+      scopeObserver.disconnect(); scopeRoot=null; scopeInvalid=false;
+      if (scopeId !== null) {
+        const matches=document.querySelectorAll('[id="'+CSS.escape(scopeId)+'"]');
+        if(matches.length!==1)return {error:matches.length?'CONTROL.AMBIGUOUS':'CONTROL.SCOPE_NOT_FOUND'};
+        scopeRoot=matches[0];
+        scopeObserver.observe(document,{subtree:true,childList:true,attributes:true,characterData:true});
+      }
       const items=[];
       // Depth first through the page and every open shadow root: a host's
       // shadow tree first, then its light children, which show only where
       // slotted. Closed shadow roots cannot be entered from script.
-      const stack=document.body?[document.body]:[];
+      const root=scopeRoot||document.body;
+      const stack=root?[root]:[];
       let scanned=0;
       while(stack.length && items.length<=limit && scanned++<20000) {
         const el=stack.pop();
+        if(scopeRoot && el.shadowRoot)scopeObserver.observe(el.shadowRoot,{subtree:true,childList:true,attributes:true,characterData:true});
         if(present(el))items.push(el);
         const children=el.shadowRoot?[...el.shadowRoot.children,...el.children]:el.children;
         for(let i=children.length-1;i>=0;i--)stack.push(children[i]);
@@ -89,7 +113,7 @@
       // Top to bottom, then left to right: the order "the third button" means.
       const order=kept.map((el,index)=>{const box=el.getBoundingClientRect();return [Math.round(box.top+scrollY),Math.round(box.left+scrollX),index];})
         .sort((a,b)=>a[0]-b[0]||a[1]-b[1]||a[2]-b[2]).map(entry=>'n'+entry[2]);
-      return {document_token:documentToken,nodes:result,order,truncated:items.length>limit||stack.length>0};
+      return {document_token:documentToken,scope_id:scopeId,scope_revision:scopeId===null?null:id,nodes:result,order,truncated:items.length>limit||stack.length>0};
     },
     // The observed elements in node order, for the browser's accessibility tree.
     elements: () => Array.from(nodes.values()).map(found=>found.el),
@@ -97,10 +121,12 @@
     // as rows of cells. Each part stops at max_characters.
     text: args => {
       if (args.document_token!==documentToken || args.observation!==observation) return {error:'CONTROL.STALE_TARGET'};
-      let root=document.body;
+      if (scopeRoot && (scopeInvalid || scopeObserver.takeRecords().length || !scopeRoot.isConnected)) return {error:'CONTROL.STALE_TARGET'};
+      let root=scopeRoot||document.body;
       if (args.node_id) {
         const found=nodes.get(args.node_id);
         if (!found || !found.el.isConnected || fingerprint(found.el)!==found.fingerprint) return {error:'CONTROL.STALE_TARGET'};
+        if (scopeRoot && !inside(scopeRoot,found.el)) return {error:'CONTROL.STALE_TARGET'};
         root=found.el;
       }
       const max=args.max_characters;

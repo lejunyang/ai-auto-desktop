@@ -4,6 +4,14 @@ use std::collections::BTreeMap;
 
 pub fn sensitive(key: &str) -> bool {
     let key = key.to_ascii_lowercase().replace(['-', '_'], "");
+    // Redirect destinations can nest encoded authorization challenges. Omit
+    // the whole value rather than relying on a finite URL decoding depth.
+    if matches!(
+        key.as_str(),
+        "code" | "returnto" | "returnurl" | "redirecturi" | "redirecturl" | "callback"
+    ) {
+        return true;
+    }
     [
         "authorization",
         "cookie",
@@ -27,7 +35,14 @@ pub fn redact(value: &mut Value) {
     match value {
         Value::Object(map) => {
             for (key, value) in map {
-                if sensitive(key) || key == "postDataEntries" || key == "urlFragment" {
+                // URL-bearing headers may contain relative destinations and
+                // arbitrarily nested login challenges. Omit the entire value.
+                if sensitive(key)
+                    || key.eq_ignore_ascii_case("location")
+                    || key.eq_ignore_ascii_case("referer")
+                    || key == "postDataEntries"
+                    || key == "urlFragment"
+                {
                     *value = json!("[REDACTED]");
                 } else if key == "url" || key == "documentURL" || key == "href" {
                     if let Some(text) = value.as_str() {
@@ -231,6 +246,37 @@ impl Groups {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn url_headers_are_redacted_case_insensitively_and_idempotently() {
+        for header in ["Location", "LOCATION", "location", "Referer", "rEfErEr"] {
+            for destination in [
+                "/login?code=SYNTH_CODE&returnTo=%2Fcb%3Fticket%3DSYNTH_TICKET",
+                "https://example.test/cb?ticket=SYNTH_TICKET#SYNTH_FRAGMENT",
+            ] {
+                let mut record = json!({"headers": {header: destination}});
+                redact(&mut record);
+                assert_eq!(record["headers"][header], "[REDACTED]");
+                let once = record.clone();
+                redact(&mut record);
+                assert_eq!(record, once);
+            }
+        }
+    }
+    #[test]
+    fn nested_redirect_challenges_and_authorization_codes_are_redacted() {
+        let mut record = json!({
+            "url": "https://example.test/login?code=secret-code&returnTo=%2Flogin%3Fticket%3Dsecret-ticket&order=123",
+            "headers": {"Cookie": "secret-cookie", "Authorization": "secret-auth"},
+            "body": "{\"returnTo\":\"/login?code=secret-nested\",\"token\":\"secret-token\"}"
+        });
+        redact(&mut record);
+        assert!(!record.to_string().contains("secret-"));
+        assert!(record["url"].as_str().unwrap().contains("order=123"));
+        // Idempotence matters when a recorder and a presentation layer both redact.
+        let once = record.clone();
+        redact(&mut record);
+        assert_eq!(record, once);
+    }
     #[test]
     fn optional_redaction_removes_secrets_without_losing_business_fields() {
         let original = json!({"request":{"url":"https://example.com/?token=raw-token&order=123","headers":{"Cookie":"sid=raw-cookie","Authorization":"raw-auth"},"postData":"{\"password\":\"raw-password\",\"name\":\"alice\"}"},"body":"{\"token\":\"raw-body\",\"status\":\"confirmed\"}"});

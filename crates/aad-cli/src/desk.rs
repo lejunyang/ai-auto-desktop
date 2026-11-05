@@ -27,6 +27,9 @@ pub struct AppsArgs {
 
 #[derive(Args)]
 pub struct ResourceArgs {
+    /// Observe only this unique HTML container id in the selected browser frame.
+    #[arg(long)]
+    scope_id: Option<String>,
     /// The window or application, from `aad apps`: its resource id, a unique
     /// prefix of the id's hash, or the window id printed beside it.
     resource: String,
@@ -124,6 +127,9 @@ pub struct FindArgs {
 
 #[derive(Args)]
 pub struct Pick {
+    /// After dispatch, wait for this JSON locator to appear. Never replay input.
+    #[arg(long, value_name = "JSON")]
+    verify: Option<String>,
     #[command(flatten)]
     at: ResourceArgs,
     #[command(flatten)]
@@ -363,7 +369,8 @@ impl Desk {
         }
     }
 
-    fn observe(&self, at: &ResourceArgs, view: View) -> Outcome {
+    fn observe(&self, at: &ResourceArgs, mut view: View) -> Outcome {
+        view.scope_id = at.scope_id.clone();
         let resource_id = self.resolve(&at.resource)?;
         self.call(Operation::Observe {
             resource_id,
@@ -390,14 +397,29 @@ fn hint(code: &str) -> Option<&'static str> {
         "CONTROL.STALE_TARGET" | "DRIVER.STALE_HANDLE" => {
             "The interface changed while the command ran. Run it again."
         }
-        "CONTROL.AMBIGUOUS" | "DRIVER.AMBIGUOUS_MATCH" => {
+        "DRIVER.AMBIGUOUS_MATCH" => {
             "Several elements matched; details.candidates lists them. Narrow it with --in \
 (the container) or --near (a neighbouring label), and --nth only when position is all \
 that tells them apart."
         }
+        // CONTROL.AMBIGUOUS is shared by browser and portable native find
+        // (including AX). Each CLI command observes anew, so a node_id from
+        // this command cannot safely select a candidate in the next command.
+        code if aad_control::is_ambiguous(code) => {
+            "Several elements matched; details.candidates lists them. Use --role and --name \
+for an exact match. If those fields cannot distinguish the candidates, use a persistent \
+`aad control serve` or MCP session: observe there, then select a candidate using node_id \
+and observation_id from that same observation. Do not reuse node_id across CLI commands; \
+each command takes a new observation."
+        }
         "CONTROL.NOT_FOUND" | "DRIVER.NOT_FOUND" => {
             "Nothing matched. `aad describe` shows what is there; `aad find --optional` asks \
 whether something is gone."
+        }
+        "DRIVER.POINT_NOT_PROVEN" => {
+            "The center-point hit could not be confirmed inside the target; no input was sent. \
+Run `aad describe` again and narrow the locator to a specific leaf, or scroll and retry. \
+Use a keyboard action only if the target offers it."
         }
         "CONTROL.ACTION_UNSUPPORTED" | "DRIVER.ACTION_UNSUPPORTED" => {
             "The element does not offer that action; `aad find` lists its capabilities."
@@ -535,6 +557,7 @@ pub fn describe(args: &OutlineArgs) -> (Value, u8) {
     let desk = Desk::open(false);
     let to_file = args.out.is_some();
     let view = View {
+        scope_id: args.at.scope_id.clone(),
         mode: ViewMode::Outline,
         region: args.region.clone(),
         limit: Some(if to_file {
@@ -768,6 +791,12 @@ pub fn act(command: &DoCommand) -> (Value, u8) {
         let action: Action =
             serde_json::from_value(action).map_err(|error| usage(error.to_string()))?;
         let result = desk.call(Operation::Act {
+            verify: pick
+                .verify
+                .as_ref()
+                .map(|value| serde_json::from_str(value))
+                .transpose()
+                .map_err(|error| usage(format!("invalid verification locator: {error}")))?,
             target: serde_json::from_value(found["target"].clone())
                 .map_err(|error| usage(error.to_string()))?,
             action,
@@ -1048,8 +1077,44 @@ mod tests {
 
     #[test]
     fn hints_speak_in_command_line_terms() {
-        assert!(hint("CONTROL.AMBIGUOUS").unwrap().contains("--in"));
+        for code in [
+            "CONTROL.AMBIGUOUS",
+            "DRIVER.AMBIGUOUS_MATCH",
+            "DRIVER.AMBIGUOUS",
+        ] {
+            let recovery = hint(code).unwrap();
+            if code == "DRIVER.AMBIGUOUS_MATCH" {
+                for flag in ["--in", "--near", "--nth"] {
+                    assert!(recovery.contains(flag), "{code}: {flag}");
+                }
+            } else {
+                for field in [
+                    "--role",
+                    "--name",
+                    "candidates",
+                    "aad control serve",
+                    "MCP",
+                    "observation_id from that same observation",
+                    "Do not reuse node_id across CLI commands",
+                ] {
+                    assert!(recovery.contains(field), "{code}: {field}");
+                }
+                for unsupported in ["--in", "--near", "--nth", "--locator"] {
+                    assert!(!recovery.contains(unsupported), "{code}: {unsupported}");
+                }
+            }
+        }
         assert!(hint("CONTROL.TARGET_UNKNOWN").unwrap().contains("aad apps"));
+        let point = hint("DRIVER.POINT_NOT_PROVEN").unwrap();
+        for way in [
+            "no input was sent",
+            "aad describe",
+            "leaf",
+            "scroll",
+            "keyboard",
+        ] {
+            assert!(point.contains(way), "{way}");
+        }
         assert!(hint("CONTROL.SOMETHING_ELSE").is_none());
     }
 }

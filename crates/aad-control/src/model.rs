@@ -98,6 +98,9 @@ pub enum ViewMode {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct View {
+    /// Observe only the container with this unique HTML id, in the selected frame.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope_id: Option<String>,
     #[serde(default)]
     pub mode: ViewMode,
     /// Outline or text: a region named by an overview.
@@ -392,6 +395,21 @@ impl Action {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "method", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Operation {
+    /// Bounded, redacted browser diagnostics from this persistent session.
+    BrowserNetwork {
+        resource_id: String,
+        limit: usize,
+    },
+    WatchQr {
+        resource_id: String,
+        locator: Box<Locator>,
+        #[serde(default)]
+        expired: Option<Box<Locator>>,
+        #[serde(default)]
+        confirmed: Option<Box<Locator>>,
+        #[serde(default)]
+        previous: Option<String>,
+    },
     Capabilities {},
     Targets {},
     Observe {
@@ -410,6 +428,9 @@ pub enum Operation {
     Act {
         target: Target,
         action: Action,
+        /// Wait for this locator to appear after dispatch, within the request deadline.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        verify: Option<Box<Locator>>,
     },
     /// A PNG of one observed element, read-only.
     Capture {

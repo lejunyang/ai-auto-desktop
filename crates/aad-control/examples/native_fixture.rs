@@ -92,6 +92,7 @@ fn main() {
     request(
         endpoint.as_ref(),
         Operation::Act {
+            verify: None,
             target: serde_json::from_value(reset["target"].clone()).unwrap(),
             action: Action::Invoke {},
         },
@@ -118,6 +119,7 @@ fn main() {
     request(
         endpoint.as_ref(),
         Operation::Act {
+            verify: None,
             target: serde_json::from_value(found["target"].clone()).unwrap(),
             action: Action::Fill {
                 value: "Unified native control".into(),
@@ -145,6 +147,7 @@ fn main() {
     request(
         endpoint.as_ref(),
         Operation::Act {
+            verify: None,
             target: serde_json::from_value(found["target"].clone()).unwrap(),
             action: Action::Invoke {},
         },

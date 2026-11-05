@@ -216,6 +216,7 @@ fn a_launched_program_answers_its_window_which_can_be_observed_captured_and_clos
     let closed = data(run(
         &session,
         Operation::Act {
+            verify: None,
             target,
             action: Action::CloseWindow {},
         },

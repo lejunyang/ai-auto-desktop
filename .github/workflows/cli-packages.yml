@@ -90,7 +90,7 @@ jobs:
             # linker: musl-gcc itself mislinks static PIE on some GNU hosts.
             [Environment]::SetEnvironmentVariable(('CC_' + $target.Replace('-', '_')), 'musl-gcc')
           }
-          cargo build --release --locked -p aad-cli -p aad-cdp --bins --target $target
+          cargo build --release --locked -p aad-cli -p aad-cdp --bins --target $target --target-dir (Join-Path $pwd target)
           if ($LASTEXITCODE) { throw 'CLI build failed' }
 
       - name: Build GNU Linux helpers
@@ -119,7 +119,7 @@ jobs:
         run: |
           $version = '${{ steps.version.outputs.version }}'
           $target = '${{ matrix.target }}'
-          $archive = ./scripts/release/package-cli.ps1 -Target $target -Version $version
+          $archive = ./scripts/release/package-cli.ps1 -Target $target -Version $version -TargetDirectory (Join-Path $pwd target)
           if ($IsLinux) {
             ./tests/linux/verify-release.ps1 -Archive $archive -Version $version -Target $target
           }

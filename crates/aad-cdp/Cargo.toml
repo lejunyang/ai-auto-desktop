@@ -7,7 +7,11 @@ license.workspace = true
 repository.workspace = true
 description = "Read-only Chrome DevTools Protocol client for observing Chromium page text and activity"
 
+[features]
+lifecycle-test-hooks = []
+
 [dependencies]
+socket2 = "0.6"
 serde = { workspace = true }
 serde_json = { workspace = true }
 clap = { workspace = true }

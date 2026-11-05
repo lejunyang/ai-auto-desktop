@@ -93,7 +93,7 @@ fn platform_specific_selectors_actions_and_capabilities_are_not_conflated() {
             .observe(&resources[0].selector, 32, Duration::from_secs(1))
             .unwrap();
         let snapshot = json!({"snapshot_id":"provider-generation:7","revision":7});
-        let node = json!({"node_id":"n","role":"text","name":"Entry","actions":[write],"attributes":{"id":"entry"}});
+        let node = json!({"node_id":"n","role":"text","name":"Entry","actions":[write],"attributes":{"id":"entry"},"provenance":{"bus_name":":1.2","object_path":"/org/a11y/button"}});
         assert_eq!(backend.node_capabilities(&node), vec!["fill"]);
         backend
             .act(
@@ -110,6 +110,13 @@ fn platform_specific_selectors_actions_and_capabilities_are_not_conflated() {
         assert_eq!(called, &format!("{name}.{write}@1"));
         assert_eq!(args[argument], "text");
         assert_eq!(args["target"]["snapshot_id"], "provider-generation:7");
+        if matches!(flavor, Flavor::Linux) {
+            assert_eq!(args["locator"]["bus_name"], ":1.2");
+            assert_eq!(args["locator"]["object_path"], "/org/a11y/button");
+        } else {
+            assert!(args["locator"].get("bus_name").is_none());
+            assert!(args["locator"].get("object_path").is_none());
+        }
         assert_eq!(
             args.get("locator").is_some(),
             !matches!(flavor, Flavor::Windows)

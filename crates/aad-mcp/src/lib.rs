@@ -18,9 +18,7 @@ pub use protocol::Request;
 
 use aad_control::transport::Endpoint;
 use serde_json::{json, Value};
-use std::collections::BTreeMap;
 use std::io::{BufRead, Write};
-use std::io::{BufReader, Read};
 use std::sync::{Arc, Mutex};
 
 pub const SERVER_NAME: &str = "ai-auto-desktop";
@@ -45,7 +43,9 @@ pub struct Server {
     local: Option<Arc<aad_control::Session>>,
     /// Why no native desktop provider is available, if none is.
     unavailable: Option<String>,
-    active_control: Mutex<BTreeMap<String, String>>,
+    /// The control call being answered, as (JSON-RPC id, control request id):
+    /// the one a `notifications/cancelled` can still reach.
+    current: Mutex<Option<(String, String)>>,
     /// The browser and recording started through the browser tools.
     browsers: browser_tools::Browsers,
     /// Durable workflow runs this server started or resumed.
@@ -84,7 +84,7 @@ impl Server {
             control: session.clone(),
             local: Some(session),
             unavailable,
-            active_control: Mutex::new(BTreeMap::new()),
+            current: Mutex::new(None),
             browsers: browser_tools::Browsers::default(),
             runs: durable_tools::Runs::default(),
         }
@@ -116,7 +116,7 @@ impl Server {
             control,
             local: None,
             unavailable: None,
-            active_control: Mutex::new(BTreeMap::new()),
+            current: Mutex::new(None),
             browsers: browser_tools::Browsers::default(),
             runs: durable_tools::Runs::default(),
         }
@@ -175,13 +175,9 @@ impl Server {
     }
 
     fn cancel_rpc(&self, id: &Value) {
-        if let Some(request_id) = self
-            .active_control
-            .lock()
-            .unwrap()
-            .get(&id.to_string())
-            .cloned()
-        {
+        let key = id.to_string();
+        let current = self.current.lock().unwrap().clone();
+        if let Some((_, request_id)) = current.filter(|(at, _)| *at == key) {
             let request = aad_control::Request::new(
                 Some(self.control.session_id().into()),
                 aad_control::Operation::Cancel { request_id },
@@ -307,24 +303,17 @@ notifications/cancelled to request cancellation of an in-flight JSON-RPC request
         if control_tools::method(name).is_some() {
             let request = control_tools::prepare(name, &arguments, self.control.as_ref())
                 .map_err(|e| (protocol::INVALID_PARAMS, e))?;
-            let key = rpc_id
-                .map(Value::to_string)
-                .unwrap_or_else(|| request.request_id.clone());
-            {
-                let mut active = self.active_control.lock().unwrap();
-                if active.contains_key(&key) {
-                    return Err((
-                        protocol::INVALID_REQUEST,
-                        "duplicate in-flight JSON-RPC id".into(),
-                    ));
-                }
-                active.insert(key.clone(), request.request_id.clone());
+            if let Some(id) = rpc_id {
+                *self.current.lock().unwrap() = Some((id.to_string(), request.request_id.clone()));
             }
             let response = self.control.request(&request);
-            self.active_control.lock().unwrap().remove(&key);
+            *self.current.lock().unwrap() = None;
             let is_error = response.error.is_some();
             let mut payload = control_tools::payload(response);
-            if name == "control_capture" && !is_error {
+            if !is_error
+                && (name == "control_capture"
+                    || (name == "control_watch_qr" && payload["data"]["data"].is_string()))
+            {
                 return Ok(image_content(&mut payload));
             }
             return Ok(content(&payload, is_error));
@@ -350,9 +339,24 @@ notifications/cancelled to request cancellation of an in-flight JSON-RPC request
             ));
         }
         if browser_tools::NAMES.contains(&name) {
-            return Ok(match self.browsers.call(session, name, &arguments) {
-                Ok(result) => content(&result, false),
-                Err(payload) => content(&payload, true),
+            let id =
+                aad_control::Request::new(None, aad_control::Operation::Capabilities {}).request_id;
+            let result = if matches!(name, "browser_open" | "browser_record_stop") {
+                session.browser_request(&id, |context| {
+                    self.browsers.call(session, context, name, &arguments)
+                })
+            } else {
+                Ok(self.browsers.call(
+                    session,
+                    &aad_control::Context::new(std::time::Duration::from_secs(60), false),
+                    name,
+                    &arguments,
+                ))
+            };
+            return Ok(match result {
+                Ok(Ok(result)) => content(&result, false),
+                Ok(Err(payload)) => content(&payload, true),
+                Err(error) => content(&error.to_json(), true),
             });
         }
         if durable_tools::NAMES.contains(&name) {
@@ -428,7 +432,7 @@ fn parse_payload(payload: &str) -> Value {
 impl Server {
     /// A server with no native provider, as on a machine where automation cannot run.
     fn without_driver(reason: &str) -> Self {
-        let mut failures = BTreeMap::new();
+        let mut failures = std::collections::BTreeMap::new();
         failures.insert(
             "desktop".to_string(),
             json!({"code": "CONTROL.UNAVAILABLE", "message": reason}),
@@ -476,9 +480,66 @@ fn content(value: &Value, is_error: bool) -> Value {
 }
 
 /// Serve MCP over the given streams until end of input.
-pub fn serve(input: impl BufRead, mut output: impl Write) -> std::io::Result<()> {
-    let server = Server::new();
-    for line in input.lines() {
+pub fn serve(input: impl BufRead + Send + 'static, output: impl Write) -> std::io::Result<()> {
+    serve_with(input, output, Server::new())
+}
+
+/// Serve MCP over this process's stdio.
+pub fn serve_stdio() -> std::io::Result<()> {
+    serve_stdio_with(Server::new())
+}
+
+pub fn serve_stdio_with(server: Server) -> std::io::Result<()> {
+    serve_with(
+        std::io::BufReader::new(std::io::stdin()),
+        std::io::stdout(),
+        server,
+    )
+}
+
+/// Serve MCP over the given streams with this server until end of input.
+///
+/// One call at a time: each request is answered before the next one starts,
+/// so no two calls run at once and replies come back in order. Only a
+/// `notifications/cancelled` is read ahead, by the reader thread, so it can
+/// reach the control call being answered; one for a call not started yet is
+/// dropped like any other notification.
+pub fn serve_with(
+    input: impl BufRead + Send + 'static,
+    mut output: impl Write,
+    server: Server,
+) -> std::io::Result<()> {
+    let server = Arc::new(server);
+    let (lines, queue) = std::sync::mpsc::channel::<std::io::Result<String>>();
+    let reader = server.clone();
+    std::thread::spawn(move || {
+        for line in input.lines() {
+            if let Ok(text) = &line {
+                if let Ok(request) = protocol::parse(text) {
+                    if request.method == "notifications/cancelled" && request.is_notification() {
+                        reader.handle(&request);
+                        continue;
+                    }
+                }
+            }
+            let failed = line.is_err();
+            if lines.send(line).is_err() || failed {
+                break;
+            }
+        }
+    });
+    let served = serve_lines(queue, &mut output, &server);
+    // End of input (or a broken pipe) ends whatever the session still holds.
+    server.disconnect();
+    served
+}
+
+fn serve_lines(
+    queue: std::sync::mpsc::Receiver<std::io::Result<String>>,
+    output: &mut impl Write,
+    server: &Server,
+) -> std::io::Result<()> {
+    for line in queue {
         let line = line?;
         if line.trim().is_empty() {
             continue;
@@ -492,94 +553,6 @@ pub fn serve(input: impl BufRead, mut output: impl Write) -> std::io::Result<()>
             // Flush per message: an MCP client blocks waiting for the reply.
             output.flush()?;
         }
-    }
-    Ok(())
-}
-
-/// Serve MCP over this process's stdio.
-pub fn serve_stdio() -> std::io::Result<()> {
-    serve_stdio_with(Server::new())
-}
-
-pub fn serve_stdio_with(server: Server) -> std::io::Result<()> {
-    serve_concurrent(std::io::stdin(), std::io::stdout(), server)
-}
-
-/// Production stdio loop: a cancellation notification can be read while a
-/// control action is in flight. Legacy operations share the native action gate.
-pub fn serve_concurrent(
-    input: impl Read,
-    output: impl Write + Send + 'static,
-    server: Server,
-) -> std::io::Result<()> {
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::time::{Duration, Instant};
-    let server = Arc::new(server);
-    let output = Arc::new(Mutex::new(output));
-    let active = Arc::new(AtomicUsize::new(0));
-    let failed = Arc::new(AtomicBool::new(false));
-    let mut input = BufReader::new(input);
-    loop {
-        if failed.load(Ordering::SeqCst) {
-            break;
-        }
-        let frame = match aad_control::transport::read_frame(&mut input, 8 * 1024 * 1024) {
-            Ok(Some(frame)) => frame,
-            Ok(None) => break,
-            Err(e) => {
-                server.disconnect();
-                return Err(e);
-            }
-        };
-        let request = match protocol::parse(std::str::from_utf8(&frame).unwrap_or("")) {
-            Ok(request) => request,
-            Err(response) => {
-                writeln!(&mut *output.lock().unwrap(), "{response}")?;
-                output.lock().unwrap().flush()?;
-                continue;
-            }
-        };
-        if request.is_notification() {
-            server.handle(&request);
-            continue;
-        }
-        if active.load(Ordering::SeqCst) >= 8 {
-            let response = protocol::error_response(
-                request.id,
-                protocol::INTERNAL_ERROR,
-                "too many in-flight MCP requests",
-            );
-            writeln!(&mut *output.lock().unwrap(), "{response}")?;
-            output.lock().unwrap().flush()?;
-            continue;
-        }
-        active.fetch_add(1, Ordering::SeqCst);
-        let (server, output, active, failed) = (
-            server.clone(),
-            output.clone(),
-            active.clone(),
-            failed.clone(),
-        );
-        std::thread::spawn(move || {
-            if let Some(response) = server.handle(&request) {
-                let mut output = output.lock().unwrap();
-                if writeln!(&mut *output, "{response}")
-                    .and_then(|()| output.flush())
-                    .is_err()
-                {
-                    failed.store(true, Ordering::SeqCst);
-                    server.disconnect();
-                }
-            }
-            active.fetch_sub(1, Ordering::SeqCst);
-        });
-    }
-    server.disconnect();
-    // EOF ends authority to dispatch input. Allow bounded time to flush already
-    // completed read-only replies, then let the CLI reclaim its private workers.
-    let deadline = Instant::now() + Duration::from_secs(1);
-    while active.load(Ordering::SeqCst) > 0 && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(5));
     }
     Ok(())
 }

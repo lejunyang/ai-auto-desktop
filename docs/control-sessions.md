@@ -16,6 +16,10 @@
 以 `capabilities` 和观察节点的 `capabilities` 为准。可列出 provider 不表示当前 OS 已授予
 桌面权限。启动失败或不可用原因在 `unavailable` 中返回。
 
+AT-SPI 中心点命中校验无法确认落在新鲜目标子树时返回 `DRIVER.POINT_NOT_PROVEN`，
+`effect: not_applied`，不发送输入。重新观察并定位具体叶子节点，或滚动后重试；目标支持键盘动作时也可使用键盘。
+该错误表示命中证明失败；元素缺少动作能力仍返回 `DRIVER.ACTION_UNSUPPORTED`。
+
 浏览器键盘：先聚焦被观察元素并确认焦点（含开放 shadow root 内的深层焦点）和文档焦点都在它上面，再发键。
 `type_text` 只在可编辑节点上提供，逐字符发送，每个字符前重新确认焦点，焦点移走即以 `CONTROL.FOCUS_LOST`
 （`details.typed` 为已发字符数）停止：`mode: unicode`（默认）每字符一次 `Input.insertText`（有 input 事件，
@@ -230,18 +234,21 @@ Windows 的 outline 和 overview 直接复用本次观察的 driver 快照，不
 `find` 的定位器：`role`、`name`、`node_id` 在所有 provider 上精确匹配；`value`、`automation_id`、
 `class_name`、`framework_id`、`states`、`match`（exact/contains）、`within`、`near`、`nth` 由 Windows
 driver 求值；浏览器页面求值 `value`、`states`、`match`（contains 不区分大小写）、`within`（另一个必须唯一的定位器，或 overview 的区域名作 `name`）和 `nth`（1 起，或 first/last，按屏幕从上到下、从左到右计数，在 `within` 内计数），对 `automation_id`、`class_name`、`framework_id`、`near` 返回 `CONTROL.LOCATOR_UNSUPPORTED` 并点名字段；其他 provider 对扩展字段一律返回 `CONTROL.LOCATOR_UNSUPPORTED`，不会悄悄忽略。匹配多个时返回
-`CONTROL.AMBIGUOUS`（Windows 为 `DRIVER.AMBIGUOUS_MATCH`）并在 `details.candidates` 列出候选；
+`CONTROL.AMBIGUOUS`（浏览器和 macOS AX；Windows 为 `DRIVER.AMBIGUOUS_MATCH`，Linux AT-SPI 为 `DRIVER.AMBIGUOUS`）并在 `details.candidates` 列出候选；
 `expect: optional` 时找不到返回 `found: false` 而不是错误，多个匹配仍然报错。
 
 `wait` 由会话用 observe 与 find 反复实现，不依赖 provider，所以桌面与浏览器都有：给 `resource_id`、`locator` 和
 `condition`（`appears` 恰好一个匹配；`disappears` 没有匹配；`state` 恰好一个匹配且其 `states` 等于给出的
 `states` 对象），每隔 `interval_ms`（50..5000，默认 250）观察一次，直到满足或 `timeout_ms` 用完
 （`CONTROL.WAIT_TIMEOUT`，`details` 带 `polls` 与最后一次是否存在）。多个匹配永远不算找到：一直歧义到超时返回
-`CONTROL.AMBIGUOUS`。满足时返回最后一次的 `observation_id`，`appears`/`state` 还带该节点的 `target`，这次观察仍是当前观察，
+最后一次的歧义码（浏览器和 macOS AX 为 `CONTROL.AMBIGUOUS`，Windows 为 `DRIVER.AMBIGUOUS_MATCH`，Linux AT-SPI 为 `DRIVER.AMBIGUOUS`）。满足时返回最后一次的 `observation_id`，`appears`/`state` 还带该节点的 `target`，这次观察仍是当前观察，
 可以直接 act。等待期间占用会话串行锁（单请求上限 30 秒），`cancel` 可以中止，结果为 `not_committed`。
 
 给人用的 `aad apps/describe/overview/snapshot/find/do` 也走这个会话：每条命令一个进程、一个会话，
 `aad do` 在同一个进程里观察、定位、操作，接受与 `aad find` 相同的定位参数，不跨进程传引用。
+歧义候选优先用精确的 role/name 区分。字段完全相同时，使用下方持久协议入口，在该会话内重新观察，
+再用同一次观察的 `observation_id` 和候选 `node_id` 定位。不要把上一条 CLI 命令的 `node_id`
+传给下一条命令：重新观察后的编号可能指向另一个元素。
 
 CLI 的持久协议入口在三平台均可用：
 
@@ -306,6 +313,9 @@ page/frame/loader/document、节点连接状态及语义指纹。导航、frame 
 最多 8 个请求在途，请求 64 KiB、响应 8 MiB；空闲连接 60 秒关闭，客户端每 20 秒只读保活。
 关闭、EOF、断连和到期撤销观察与输入权限。重新连接创建全新会话，必须重新发现和观察；
 **不会恢复输入、自动重放或自动重试 unknown 动作**。
+
+MCP（`aad mcp`）一次只处理一个调用：回复上一个请求之后才开始下一个，回复按请求顺序返回。
+只有 `notifications/cancelled` 会提前读取，作用于正在处理的那个控制调用；还没开始的调用不能取消。
 
 ## 远程授权与隔离
 
@@ -414,3 +424,18 @@ activate 后 Shift+F9 以 F9 加 Shift 到达 fixture 窗口，Shift 随后松�
 Windows/macOS 的新适配路由在 CI 以 mock 编译/测试；Windows 的输入桌面、macOS TCC 和跨机器 SSH
 未在真实设备验证。Wayland 原生输入、完整 OOPIF、浏览器拖拽、结果缓存、
 自动重放与统一 Android wire adapter 均不在本次范围。录制/回放及事件观察保持已有实现，不提升其可靠性声明。
+
+### CLI 浏览器诊断
+
+运行 `aad control diagnostics --browser-port PORT` 启动只读持久 NDJSON 会话。
+在同一进程依次发送 `capabilities`、`targets`，取得响应的 session_id 和浏览器 resource_id，
+随后发送（每条 JSON 独占一行）：
+
+```json
+{"request_id":"network-1","session_id":"响应中的会话ID","timeout_ms":3000,"operation":{"method":"browser_network","resource_id":"targets返回的资源ID","limit":50}}
+```
+
+`browser_network` 也可通过既有 `control serve/connect` 读取。limit 必须在 1–500，
+返回脱敏请求、摘要、覆盖区间与分层丢失计数；此协议入口不读取响应正文。
+采集从该会话附加页面开始，无法追回启动 CLI 之前的事件。保持进程运行并重复读取以延续采集。
+结束时发送 `close`；附加的用户浏览器不会被关闭。

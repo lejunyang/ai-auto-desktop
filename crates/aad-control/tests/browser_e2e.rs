@@ -21,6 +21,9 @@ const PAGE: &str = r#"<!doctype html><html><body>
 <form onsubmit="event.preventDefault()"><input id="name" aria-label="Name" oninput="document.getElementById('status').value='fill:'+this.value" onkeydown="if(event.key==='Enter')document.getElementById('status').value='key:'+event.isTrusted">
 <button id="save" aria-label="Save" type="button" onclick="document.getElementById('status').value='clicked:'+event.isTrusted">Save</button></form>
 <output id="status" aria-label="Status">ready</output>
+<div id="delegated" aria-label="Delegated login" style="cursor:pointer"><img alt="Login icon" src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='20' height='20'%3E%3C/svg%3E"></div>
+<div aria-label="Plain container">Plain</div><div tabindex="-1" aria-label="Focusable container">Focusable</div>
+<script>document.addEventListener('click',event=>{if(event.target.closest('#delegated'))document.getElementById('status').value='delegated:'+event.isTrusted;});</script>
 <input id="protected" aria-label="Protected" type="password" value="redacted-fixture">
 <button aria-label="Duplicate">a</button><button aria-label="Duplicate">b</button>
 <select aria-label="Size" onchange="document.getElementById('status').value='size:'+this.value"><option value="s">Small</option><option value="l">Large</option></select>
@@ -343,7 +346,14 @@ fn document(session: &Session, observation: &Value) -> Target {
     serde_json::from_value(response.data.unwrap()["target"].clone()).unwrap()
 }
 fn act(session: &Session, target: Target, action: Action) -> Response {
-    call(session, Operation::Act { target, action })
+    call(
+        session,
+        Operation::Act {
+            target,
+            action,
+            verify: None,
+        },
+    )
 }
 fn node<'a>(observation: &'a Value, name: &str) -> &'a Value {
     observation["nodes"]
@@ -455,6 +465,63 @@ fn type_text(text: &str, mode: Option<TypeMode>) -> Action {
         text: text.into(),
         mode,
     }
+}
+
+#[test]
+#[ignore = "requires isolated Chromium with its sandbox enabled; CI runs it explicitly"]
+fn delegated_icons_click_without_advertising_unusable_keyboard_input() {
+    let _serial = serial();
+    let fixture = Fixture::new();
+    let (session, _) = session_for(&fixture);
+    let main = main_of(&session, &fixture.page_id);
+    assert!(
+        wait_until(&session, &main, "Delegated login", WaitCondition::Appears)
+            .error
+            .is_none()
+    );
+    let observed = observe(&session, &main);
+    for name in ["Plain container", "Delegated login"] {
+        assert!(!actions(&observed, name).contains(&"focus".to_string()));
+        assert!(!actions(&observed, name).contains(&"key".to_string()));
+    }
+    assert!(actions(&observed, "Delegated login").contains(&"click".to_string()));
+    for name in ["Plain container", "Delegated login"] {
+        let refused = act_on(&session, &main, "generic", name, keys(&["Enter"]));
+        assert_eq!(refused.commit_state, CommitState::NotCommitted);
+        assert_eq!(refused.error.unwrap()["code"], "CONTROL.ACTION_UNSUPPORTED");
+        let refused = act_on(&session, &main, "generic", name, Action::Focus {});
+        assert_eq!(refused.commit_state, CommitState::NotCommitted);
+        assert_eq!(refused.error.unwrap()["code"], "CONTROL.ACTION_UNSUPPORTED");
+    }
+    let focused = act_on(
+        &session,
+        &main,
+        "generic",
+        "Focusable container",
+        Action::Focus {},
+    );
+    assert!(focused.error.is_none(), "{focused:?}");
+    let clicked = act_on(
+        &session,
+        &main,
+        "generic",
+        "Delegated login",
+        Action::click(),
+    );
+    assert!(clicked.error.is_none(), "{clicked:?}");
+    assert_eq!(
+        value(&observe(&session, &main), "Status"),
+        "delegated:false"
+    );
+    let clicked = act_on(
+        &session,
+        &main,
+        "generic",
+        "Delegated login",
+        trusted_click(),
+    );
+    assert!(clicked.error.is_none(), "{clicked:?}");
+    assert_eq!(value(&observe(&session, &main), "Status"), "delegated:true");
 }
 
 #[test]

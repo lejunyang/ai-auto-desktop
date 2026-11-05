@@ -143,6 +143,14 @@ fn matches(process: &Process, id: &Identity) -> bool {
 /// Detect and optionally terminate only processes proven to own this data root.
 /// Chromium's process lock spans all named profiles in the root, not just one.
 pub fn ensure_available(path: &Path, browser: &str, kill: bool) -> Result<()> {
+    ensure_available_guarded(path, browser, kill, &super::Unrestricted)
+}
+pub(super) fn ensure_available_guarded(
+    path: &Path,
+    browser: &str,
+    kill: bool,
+    authority: &dyn super::Authority,
+) -> Result<()> {
     if !path.exists() {
         return Ok(());
     }
@@ -189,7 +197,10 @@ pub fn ensure_available(path: &Path, browser: &str, kill: bool) -> Result<()> {
                 if !confirmed.contains(pid) {
                     return Err("browser ownership changed before termination; retry".into());
                 }
-                let _ = process.kill_with(Signal::Term);
+                authority.effect(&mut || {
+                    let _ = process.kill_with(Signal::Term);
+                    Ok(())
+                })?;
             }
         }
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -209,7 +220,10 @@ pub fn ensure_available(path: &Path, browser: &str, kill: bool) -> Result<()> {
             }
             if deadline.saturating_duration_since(Instant::now()) < Duration::from_secs(2) {
                 for process in live {
-                    let _ = process.kill();
+                    authority.effect(&mut || {
+                        let _ = process.kill();
+                        Ok(())
+                    })?;
                 }
             }
             std::thread::sleep(Duration::from_millis(100));

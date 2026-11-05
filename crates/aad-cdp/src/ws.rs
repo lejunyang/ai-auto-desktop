@@ -89,14 +89,16 @@ impl WebSocket {
     }
 
     pub fn connect_until(url: &str, deadline: Instant) -> Result<Self, CdpError> {
+        Self::connect_cancellable(url, deadline, None)
+    }
+    pub fn connect_cancellable(
+        url: &str,
+        deadline: Instant,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
+    ) -> Result<Self, CdpError> {
         let (address, path) = local_endpoint(url)?;
         let host_port = address.to_string();
-        let timeout = deadline
-            .checked_duration_since(Instant::now())
-            .ok_or_else(|| CdpError::connect("deadline elapsed"))?;
-        let mut stream = TcpStream::connect_timeout(&address, timeout)
-            .map_err(|error| CdpError::connect(format!("{host_port}: {error}")))?;
-        stream.set_nonblocking(false).map_err(CdpError::io)?;
+        let mut stream = crate::tcp::connect(address, deadline, cancel, "ws")?;
         stream
             .set_read_timeout(Some(std::time::Duration::from_secs(10)))
             .map_err(CdpError::io)?;
@@ -120,14 +122,28 @@ impl WebSocket {
         let mut response = Vec::new();
         let mut byte = [0u8; 1];
         loop {
+            if cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::SeqCst)) {
+                return Err(CdpError::connect("cancelled"));
+            }
             stream
                 .set_read_timeout(Some(
                     deadline
                         .checked_duration_since(Instant::now())
-                        .ok_or_else(|| CdpError::connect("handshake timed out"))?,
+                        .ok_or_else(|| CdpError::connect("handshake timed out"))?
+                        .min(std::time::Duration::from_millis(50)),
                 ))
                 .map_err(CdpError::io)?;
-            stream.read_exact(&mut byte).map_err(CdpError::io)?;
+            match stream.read_exact(&mut byte) {
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    continue
+                }
+                result => result.map_err(CdpError::io)?,
+            }
             response.push(byte[0]);
             if response.ends_with(b"\r\n\r\n") {
                 break;
@@ -355,6 +371,94 @@ fn websocket_accept(key: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runtime_enable_is_cancellable_before_attach_returns() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = cancel.clone();
+        let (release, held) = std::sync::mpsc::channel();
+        let peer = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut byte = [0];
+            while !request.ends_with(b"\r\n\r\n") {
+                stream.read_exact(&mut byte).unwrap();
+                request.push(byte[0]);
+            }
+            let request = String::from_utf8(request).unwrap();
+            let key = request
+                .lines()
+                .find_map(|l| l.strip_prefix("Sec-WebSocket-Key: "))
+                .unwrap();
+            write!(stream, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {}\r\n\r\n", websocket_accept(key)).unwrap();
+            let mut command = [0; 1024];
+            assert!(stream.read(&mut command).unwrap() > 0);
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            held.recv().unwrap();
+        });
+        let target: crate::Target = serde_json::from_value(serde_json::json!({
+            "id":"test", "type":"page", "title":"", "url":"about:blank",
+            "webSocketDebuggerUrl":format!("ws://{address}/test")
+        }))
+        .unwrap();
+        let start = Instant::now();
+        assert!(crate::Client::attach_cancellable(
+            &target,
+            start + std::time::Duration::from_secs(10),
+            Some(cancel)
+        )
+        .is_err());
+        assert!(start.elapsed() < std::time::Duration::from_secs(1));
+        release.send(()).unwrap();
+        peer.join().unwrap();
+    }
+
+    #[test]
+    fn slow_handshake_survives_polling_and_can_be_cancelled() {
+        for cancelled in [false, true] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let flag = cancel.clone();
+            let peer = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = Vec::new();
+                let mut byte = [0];
+                while !request.ends_with(b"\r\n\r\n") {
+                    stream.read_exact(&mut byte).unwrap();
+                    request.push(byte[0]);
+                }
+                let request = String::from_utf8(request).unwrap();
+                let key = request
+                    .lines()
+                    .find_map(|l| l.strip_prefix("Sec-WebSocket-Key: "))
+                    .unwrap();
+                let response = format!("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {}\r\n\r\n", websocket_accept(key));
+                stream.write_all(&response.as_bytes()[..10]).unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                if cancelled {
+                    flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                let _ = stream.write_all(&response.as_bytes()[10..]);
+            });
+            let start = Instant::now();
+            let result = WebSocket::connect_cancellable(
+                &format!("ws://{address}/test"),
+                start + std::time::Duration::from_secs(2),
+                Some(&cancel),
+            );
+            if cancelled {
+                assert!(result.is_err());
+                assert!(start.elapsed() < std::time::Duration::from_millis(350));
+            } else {
+                assert!(result.is_ok());
+            }
+            peer.join().unwrap();
+        }
+    }
 
     fn receive(bytes: &[u8]) -> Result<Frame, CdpError> {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();

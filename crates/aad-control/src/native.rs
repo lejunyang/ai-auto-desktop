@@ -98,6 +98,11 @@ impl NativeBackend {
             }
         }
         if matches!(self.flavor, Flavor::Linux) {
+            for field in ["bus_name", "object_path"] {
+                if let Some(value) = node["provenance"][field].as_str() {
+                    locator.insert(field.into(), json!(value));
+                }
+            }
             if node["attributes"]
                 .as_object()
                 .is_some_and(|v| !v.is_empty())
@@ -435,7 +440,30 @@ impl Backend for NativeBackend {
         timeout: Duration,
     ) -> Result<Option<Value>> {
         // node_id is a session-level field; the driver locator does not know it.
-        if !matches!(self.flavor, Flavor::Windows) || locator.node_id.is_some() {
+        if locator.node_id.is_some() {
+            return Ok(None);
+        }
+        if matches!(self.flavor, Flavor::Linux) && !locator.extended() {
+            let found = self.invoke(
+                "find",
+                json!({
+                    "snapshot_id": snapshot["snapshot_id"],
+                    "revision": snapshot["revision"],
+                    "locator": serde_json::to_value(locator).unwrap(),
+                }),
+                timeout,
+            );
+            return match found {
+                Ok(found) => Ok(Some(
+                    json!({"found": true, "node_id": found["target"]["node_id"], "match_count": 1}),
+                )),
+                Err(err) if expect == Expect::Optional && err.code == "DRIVER.NOT_FOUND" => {
+                    Ok(Some(json!({"found": false})))
+                }
+                Err(err) => Err(err),
+            };
+        }
+        if !matches!(self.flavor, Flavor::Windows) {
             return Ok(None);
         }
         let mut args = json!({
