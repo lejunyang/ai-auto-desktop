@@ -257,6 +257,17 @@ pub trait AtspiBackend: Send + Sync {
             "AT-SPI point lookup is unavailable",
         ))
     }
+    /// The element's parent, or `None` above the application.
+    fn parent(
+        &self,
+        _node: &NativeRef,
+        _deadline: Instant,
+    ) -> Result<Option<NativeRef>, AutomationError> {
+        Err(driver_error(
+            "DRIVER.ACTION_UNSUPPORTED",
+            "AT-SPI parent lookup is unavailable",
+        ))
+    }
     fn capture_target(
         &self,
         _target: &NativeRef,
@@ -1189,10 +1200,47 @@ impl AtspiProvider {
                 Err(error) => return Err(error),
             }
         }
+        if self.inside(record, &allowed, &hit, deadline)? {
+            return Ok(());
+        }
         Err(driver_error(
             "DRIVER.POINT_NOT_PROVEN",
             "center point did not hit the fresh target subtree",
         ))
+    }
+
+    /// Whether `hit` lies inside the allowed subtree, by walking up from it
+    /// to the first element the snapshot lists. Toolkits such as Chromium
+    /// answer a hit test with the deepest element at the point, which is
+    /// often one the snapshot does not list: below its depth, or text and
+    /// images it does not expose as nodes.
+    fn inside(
+        &self,
+        record: &Record,
+        allowed: &BTreeSet<String>,
+        hit: &NativeRef,
+        deadline: Instant,
+    ) -> Result<bool, AutomationError> {
+        let mut node = hit.clone();
+        for _ in 0..64 {
+            remaining(deadline, false)?;
+            let mut listed = record
+                .handles
+                .iter()
+                .filter(|(_, native)| **native == node)
+                .map(|(id, _)| id)
+                .peekable();
+            if listed.peek().is_some() {
+                return Ok(listed.any(|id| allowed.contains(id)));
+            }
+            match self.backend.parent(&node, deadline) {
+                Ok(Some(parent)) => node = parent,
+                Ok(None) => return Ok(false),
+                Err(error) if error.code == "DRIVER.ACTION_UNSUPPORTED" => return Ok(false),
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(false)
     }
 }
 
@@ -2538,6 +2586,9 @@ mod tests {
                 }
                 let object_path = if level == 1 && self.hit_chain == 5 {
                     "/occluder".to_string()
+                } else if level == 1 && matches!(self.hit_chain, 7 | 8) {
+                    // Like Chromium: the deepest element, which is not listed.
+                    "/leaf".to_string()
                 } else if level + 1 == self.depth {
                     "/org/a11y/save".to_string()
                 } else {
@@ -2562,6 +2613,27 @@ mod tests {
                 (2, _) => Ok(Some(root.clone())),
                 _ => Ok(None),
             }
+        }
+        fn parent(
+            &self,
+            node: &NativeRef,
+            _deadline: Instant,
+        ) -> Result<Option<NativeRef>, AutomationError> {
+            // 7: the leaf is inside the target; 8: inside one of its ancestors.
+            let path = match (self.hit_chain, node.object_path.as_str()) {
+                (7, "/leaf") => "/org/a11y/save",
+                (8, "/leaf") => "/chain/3",
+                _ => {
+                    return Err(driver_error(
+                        "DRIVER.ACTION_UNSUPPORTED",
+                        "this fixture has no parent here",
+                    ))
+                }
+            };
+            Ok(Some(NativeRef {
+                bus_name: node.bus_name.clone(),
+                object_path: path.into(),
+            }))
         }
         fn capture_target(
             &self,
@@ -2781,23 +2853,44 @@ mod tests {
         // order would be the target's parent, below whatever covers it. The
         // root has no bounds, like an application, and is not hit tested.
         for (hit_chain, proven) in [(5, false), (6, true)] {
-            let backend = Arc::new(FakeBackend {
-                hit_chain,
-                depth: 10,
-                ..Default::default()
-            });
-            let provider = AtspiProvider::new(backend.clone()).unwrap();
-            let snapshot = take_snapshot(&provider);
-            let result = provider.invoke("desktop.linux_atspi.pointer_click@1", json!({
-                "target":{"snapshot_id":snapshot["snapshot_id"],"revision":snapshot["revision"],"node_id":"n10"},
-                "locator":locator()
-            }), Some(Duration::from_secs(2)));
-            if proven {
-                result.unwrap();
+            assert_eq!(
+                click_through_chain(hit_chain),
+                proven,
+                "hit chain {hit_chain}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_deepest_hit_the_snapshot_does_not_list_counts_inside_its_listed_parent() {
+        // The hit is a leaf below what the snapshot lists. It proves the
+        // target only when walking up from it reaches the target first.
+        assert!(click_through_chain(7));
+        assert!(!click_through_chain(8));
+    }
+
+    /// Click `n10` under ten containers; whether the hit proof let it through.
+    fn click_through_chain(hit_chain: u8) -> bool {
+        let backend = Arc::new(FakeBackend {
+            hit_chain,
+            depth: 10,
+            ..Default::default()
+        });
+        let provider = AtspiProvider::new(backend.clone()).unwrap();
+        let snapshot = take_snapshot(&provider);
+        let result = provider.invoke("desktop.linux_atspi.pointer_click@1", json!({
+            "target":{"snapshot_id":snapshot["snapshot_id"],"revision":snapshot["revision"],"node_id":"n10"},
+            "locator":locator()
+        }), Some(Duration::from_secs(2)));
+        match result {
+            Ok(_) => {
                 assert_eq!(backend.writes.load(Ordering::SeqCst), 1);
-            } else {
-                assert_eq!(result.unwrap_err().code, "DRIVER.POINT_NOT_PROVEN");
+                true
+            }
+            Err(error) => {
+                assert_eq!(error.code, "DRIVER.POINT_NOT_PROVEN");
                 assert_eq!(backend.writes.load(Ordering::SeqCst), 0);
+                false
             }
         }
     }
