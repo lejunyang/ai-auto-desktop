@@ -15,12 +15,14 @@ aad-desktop.workspace = true
 aad-cdp.workspace = true
 aad-ocr.workspace = true
 base64 = "0.22"
+image.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 uuid.workspace = true
 sha2.workspace = true
 fs2 = "0.4"
 libc.workspace = true
+rqrr = { version = "0.10.1", default-features = false }
 
 [target.'cfg(windows)'.dependencies]
 aad-uia.workspace = true
@@ -32,6 +34,7 @@ aad-atspi.workspace = true
 aad-macos-ax.workspace = true
 
 [dev-dependencies]
+qrcode = { version = "0.14.1", default-features = false }
 
 # Real-desktop fixtures for the ignored Windows session tests.
 [target.'cfg(windows)'.dev-dependencies]
@@ -44,3 +47,6 @@ windows = { version = "0.58", features = [
 
 [lints]
 workspace = true
+
+[features]
+qr-test-hooks = []

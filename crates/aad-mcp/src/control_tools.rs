@@ -238,6 +238,7 @@ fn view_schema() -> Value {
         "description": "How much of the observation to return. The whole capture is kept \
     either way, so any node of it can be found or acted on.",
         "properties": {
+            "scope_id": {"type":"string", "minLength":1, "maxLength":256, "description":"Complete capture rooted at one unique HTML id in the selected frame. Native providers refuse this option. Distinct from region view filtering."},
             "mode": {
                 "enum": ["outline", "overview", "text", "nodes"],
                 "default": "outline",
@@ -387,7 +388,7 @@ narrow the locator. control_cancel stops a wait.",
 attempt consumes that provider's observation, so observe again before the next one. \
 Submission is not proof the task succeeded: observe again and check. Never retry an \
 unknown-effect write automatically.",
-            json!({"target": target_schema(), "action": action_schema()}),
+            json!({"target": target_schema(), "action": action_schema(), "verify": locator_schema()}),
             vec!["target", "action"],
             true,
         ),
@@ -396,6 +397,13 @@ unknown-effect write automatically.",
             "Take a PNG screenshot of one observed element, e.g. a login QR code to show a person, the page body for the whole page, or a Windows window's root node for the whole window. Read-only. The answer carries the image and a `digest` of it: capture again later and compare digests to tell whether what is shown has changed (a QR code that refreshed) without looking at the image. Browser pages and desktop windows on Windows, Linux (KDE/X11) and macOS (providers listing `capture` under `reads` in control_capabilities; macOS needs Screen Recording permission); password fields are refused, and a minimized window must be restored first.",
             json!({"target": target_schema()}),
             vec!["target"],
+            false,
+        ),
+        (
+            "control_watch_qr",
+            "Read-only QR polling for at most five seconds. Supply the prior version to deduplicate. Only explicit expired/confirmed locators establish those states; confirmed stops monitoring. Send returned PNG only to the owner, without logging it or decoded challenge data. No automatic refresh or input.",
+            json!({"resource_id":{"type":"string"}, "locator":locator_schema(), "expired":locator_schema(), "confirmed":locator_schema(), "previous":{"type":"string"}}),
+            vec!["resource_id", "locator"],
             false,
         ),
         (
@@ -567,6 +575,13 @@ pub fn prepare(name: &str, arguments: &Value, endpoint: &dyn Endpoint) -> Result
     }
     args.insert("method".into(), json!(method));
     request.operation = serde_json::from_value(Value::Object(args)).map_err(|e| e.to_string())?;
+    if request.request_id.is_empty()
+        || request.request_id.len() > 128
+        || request.timeout_ms == 0
+        || request.timeout_ms > aad_control::MAX_TIMEOUT_MS
+    {
+        return Err("bounded request id and timeout_ms (1..30000) required".into());
+    }
     Ok(request)
 }
 

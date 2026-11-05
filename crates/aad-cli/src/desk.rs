@@ -27,6 +27,9 @@ pub struct AppsArgs {
 
 #[derive(Args)]
 pub struct ResourceArgs {
+    /// Observe only this unique HTML container id in the selected browser frame.
+    #[arg(long)]
+    scope_id: Option<String>,
     /// The window or application, from `aad apps`: its resource id, a unique
     /// prefix of the id's hash, or the window id printed beside it.
     resource: String,
@@ -124,6 +127,9 @@ pub struct FindArgs {
 
 #[derive(Args)]
 pub struct Pick {
+    /// After dispatch, wait for this JSON locator to appear. Never replay input.
+    #[arg(long, value_name = "JSON")]
+    verify: Option<String>,
     #[command(flatten)]
     at: ResourceArgs,
     #[command(flatten)]
@@ -363,7 +369,8 @@ impl Desk {
         }
     }
 
-    fn observe(&self, at: &ResourceArgs, view: View) -> Outcome {
+    fn observe(&self, at: &ResourceArgs, mut view: View) -> Outcome {
+        view.scope_id = at.scope_id.clone();
         let resource_id = self.resolve(&at.resource)?;
         self.call(Operation::Observe {
             resource_id,
@@ -535,6 +542,7 @@ pub fn describe(args: &OutlineArgs) -> (Value, u8) {
     let desk = Desk::open(false);
     let to_file = args.out.is_some();
     let view = View {
+        scope_id: args.at.scope_id.clone(),
         mode: ViewMode::Outline,
         region: args.region.clone(),
         limit: Some(if to_file {
@@ -768,6 +776,12 @@ pub fn act(command: &DoCommand) -> (Value, u8) {
         let action: Action =
             serde_json::from_value(action).map_err(|error| usage(error.to_string()))?;
         let result = desk.call(Operation::Act {
+            verify: pick
+                .verify
+                .as_ref()
+                .map(|value| serde_json::from_str(value))
+                .transpose()
+                .map_err(|error| usage(format!("invalid verification locator: {error}")))?,
             target: serde_json::from_value(found["target"].clone())
                 .map_err(|error| usage(error.to_string()))?,
             action,

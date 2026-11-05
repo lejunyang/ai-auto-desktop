@@ -36,6 +36,37 @@ fn session(proxy: bool) {
     assert_eq!(hello.protocol_version, PROTOCOL_VERSION);
     assert_eq!(hello.data.unwrap()["allow_input"], false);
     let id = hello.session_id;
+    for cancelled in [false, true] {
+        let mut seed = Request::new(Some(id.clone()), Operation::Capabilities {});
+        let close_id = if cancelled {
+            "cancelled-close"
+        } else {
+            "duplicate-close"
+        };
+        seed.request_id = close_id.into();
+        if cancelled {
+            seed.request_id = "cancel-seed".into();
+            seed.operation = Operation::Cancel {
+                request_id: close_id.into(),
+            };
+        }
+        assert!(call(seed).error.is_none());
+        let mut close = Request::new(Some(id.clone()), Operation::Close {});
+        close.request_id = close_id.into();
+        let rejected = call(close);
+        assert_eq!(rejected.effect, "not_applied");
+        assert_eq!(
+            rejected.error.unwrap()["code"],
+            if cancelled {
+                "CONTROL.CANCELLED"
+            } else {
+                "CONTROL.DUPLICATE_REQUEST"
+            }
+        );
+        let query = call(Request::new(Some(id.clone()), Operation::Capabilities {}));
+        assert!(query.error.is_none(), "{query:?}");
+        assert_eq!(query.session_id, id);
+    }
     let targets = call(Request::new(Some(id.clone()), Operation::Targets {}));
     assert!(targets.error.is_none(), "{targets:?}");
     assert!(targets.data.unwrap()["resources"].is_array());

@@ -343,7 +343,14 @@ fn document(session: &Session, observation: &Value) -> Target {
     serde_json::from_value(response.data.unwrap()["target"].clone()).unwrap()
 }
 fn act(session: &Session, target: Target, action: Action) -> Response {
-    call(session, Operation::Act { target, action })
+    call(
+        session,
+        Operation::Act {
+            target,
+            action,
+            verify: None,
+        },
+    )
 }
 fn node<'a>(observation: &'a Value, name: &str) -> &'a Value {
     observation["nodes"]

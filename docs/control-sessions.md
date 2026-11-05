@@ -335,6 +335,10 @@ CDP 仅接受 loopback 调试地址，显式 `--browser-port` 才启用；不会
 浏览器调试端口本身有高权限，使用专用空白 profile 并保留 Chromium 沙箱。每个会话使用独立 isolated world，
 关闭时清理自己的 DOM 引用，不影响其他只读观察者。
 
+### 转发关闭拒绝
+
+可恢复的关闭拒绝排入响应队列后，转发端点会向上游权威端发起有界（1000 ms）的 capabilities 查询。字段 session_usable 综合关闭状态、生命周期和本次查询获准后的剩余请求配额。每次探测消耗一个请求 ID。权威信息缺失（包括旧版服务端）、探测失败或配额耗尽时，连接安全断开；本地套接字仍存活不足以授权继续服务。
+
 ## 与 Android 的互操作边界
 
 两个项目对齐 session/resource/observation/target、类型化能力和 `not_committed|committed|unknown`。
@@ -414,3 +418,18 @@ activate 后 Shift+F9 以 F9 加 Shift 到达 fixture 窗口，Shift 随后松�
 Windows/macOS 的新适配路由在 CI 以 mock 编译/测试；Windows 的输入桌面、macOS TCC 和跨机器 SSH
 未在真实设备验证。Wayland 原生输入、完整 OOPIF、浏览器拖拽、结果缓存、
 自动重放与统一 Android wire adapter 均不在本次范围。录制/回放及事件观察保持已有实现，不提升其可靠性声明。
+
+### CLI 浏览器诊断
+
+运行 `aad control diagnostics --browser-port PORT` 启动只读持久 NDJSON 会话。
+在同一进程依次发送 `capabilities`、`targets`，取得响应的 session_id 和浏览器 resource_id，
+随后发送（每条 JSON 独占一行）：
+
+```json
+{"request_id":"network-1","session_id":"响应中的会话ID","timeout_ms":3000,"operation":{"method":"browser_network","resource_id":"targets返回的资源ID","limit":50}}
+```
+
+`browser_network` 也可通过既有 `control serve/connect` 读取。limit 必须在 1–500，
+返回脱敏请求、摘要、覆盖区间与分层丢失计数；此协议入口不读取响应正文。
+采集从该会话附加页面开始，无法追回启动 CLI 之前的事件。保持进程运行并重复读取以延续采集。
+结束时发送 `close`；附加的用户浏览器不会被关闭。

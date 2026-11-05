@@ -243,7 +243,16 @@ fn drag_ends_share_one_observation_and_gestures_follow_node_capabilities() {
         fraction: None,
         to_fraction: None,
     };
-    let act = |target: Target, action: Action| call(&session, Operation::Act { target, action });
+    let act = |target: Target, action: Action| {
+        call(
+            &session,
+            Operation::Act {
+                target,
+                action,
+                verify: None,
+            },
+        )
+    };
 
     assert_eq!(
         code(&act(from.clone(), drag(from.clone()))),

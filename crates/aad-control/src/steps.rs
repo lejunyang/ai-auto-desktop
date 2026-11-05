@@ -391,7 +391,15 @@ pub fn perform(
     let action = step.typed(value.as_deref(), to.as_ref())?;
     let target = serde_json::from_value(found["target"].clone())
         .map_err(|e| error("STEP.BAD_TARGET", e.to_string()))?;
-    let result = request(session, Operation::Act { target, action }, deadline)?;
+    let result = request(
+        session,
+        Operation::Act {
+            target,
+            action,
+            verify: None,
+        },
+        deadline,
+    )?;
     Ok(json!({"step": step.id, "element": public(&found["node"]), "result": result}))
 }
 

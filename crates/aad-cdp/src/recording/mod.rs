@@ -42,6 +42,7 @@ struct Step {
 }
 
 struct Context {
+    identity: String,
     frame: String,
     previous: Option<Value>,
 }
@@ -60,12 +61,20 @@ struct Pending {
 }
 
 pub struct Recorder {
+    #[cfg(test)]
+    snapshot_changes: Vec<Value>,
+    stop_reason: Option<std::sync::Arc<std::sync::Mutex<Option<String>>>>,
+    cancellation: Option<std::sync::Arc<AtomicBool>>,
     options: Options,
     storage: storage::Storage,
     session_id: String,
     world: String,
     binding: String,
     pages: Vec<Page>,
+    sample_pages: std::collections::VecDeque<String>,
+    sample_frames: HashMap<String, std::collections::VecDeque<(String, i64)>>,
+    ui_gaps: std::collections::HashSet<String>,
+    ui_gap_overflow: bool,
     steps: Vec<Step>,
     pending: HashMap<String, Pending>,
     groups: network::Groups,
@@ -75,6 +84,26 @@ pub struct Recorder {
     commands_read: usize,
     started_ms: u64,
     stopped: bool,
+    interruption: Option<String>,
+}
+
+fn register_ui_gap(
+    keys: &mut HashSet<String>,
+    overflow: &mut bool,
+    key: String,
+) -> Option<&'static str> {
+    if keys.contains(&key) {
+        return None;
+    }
+    if keys.len() < 256 {
+        keys.insert(key);
+        Some("ui_snapshot_unavailable")
+    } else if !*overflow {
+        *overflow = true;
+        Some("ui_snapshot_gap_overflow")
+    } else {
+        None
+    }
 }
 
 fn now() -> u64 {
@@ -102,24 +131,48 @@ fn eval(client: &mut Client, session: &str, context: i64, expression: &str) -> R
 }
 
 impl Recorder {
+    pub fn set_stop_reason(&mut self, reason: std::sync::Arc<std::sync::Mutex<Option<String>>>) {
+        self.stop_reason = Some(reason);
+    }
     pub fn start(options: Options) -> Result<Self> {
+        Self::start_cancellable(options, None)
+    }
+    pub fn start_cancellable(
+        options: Options,
+        cancellation: Option<std::sync::Arc<AtomicBool>>,
+    ) -> Result<Self> {
         if options.body_limit > 1024 * 1024 || options.max_bytes < 1024 * 1024 {
             return Err("body limit must be <= 1 MiB; session budget must be >= 1 MiB".into());
         }
-        let target = Client::list_targets(options.port)?
-            .into_iter()
-            .find(|t| t.id == options.page)
-            .ok_or("explicit page target not found")?;
-        let client = Client::attach(&target)?;
+        #[cfg(feature = "lifecycle-test-hooks")]
+        let _test_scope = crate::tcp::RecorderStart::enter();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let target =
+            Client::list_targets_cancellable(options.port, deadline, cancellation.as_deref())?
+                .into_iter()
+                .find(|t| t.id == options.page)
+                .ok_or("explicit page target not found")?;
+        let mut client = Client::attach_cancellable(&target, deadline, cancellation.clone())?;
+        if let Some(cancel) = &cancellation {
+            client.set_cancellation(cancel.clone());
+        }
         let storage = storage::Storage::new(&options)?;
         let session_id = uuid::Uuid::new_v4().simple().to_string();
         let mut recorder = Self {
+            #[cfg(test)]
+            snapshot_changes: Vec::new(),
+            stop_reason: None,
+            cancellation,
             options,
             storage,
             world: format!("aad-record-{session_id}"),
             binding: format!("__aadRecord_{session_id}"),
             session_id,
             pages: Vec::new(),
+            sample_pages: Default::default(),
+            sample_frames: Default::default(),
+            ui_gaps: Default::default(),
+            ui_gap_overflow: false,
             steps: Vec::new(),
             pending: HashMap::new(),
             groups: network::Groups::new(),
@@ -129,6 +182,7 @@ impl Recorder {
             commands_read: 0,
             started_ms: now(),
             stopped: false,
+            interruption: None,
         };
         recorder.pages.push(Page {
             id: target.id.clone(),
@@ -208,6 +262,7 @@ impl Recorder {
                         page.contexts.insert(
                             (session.into(), context),
                             Context {
+                                identity: uuid::Uuid::new_v4().to_string(),
                                 frame,
                                 previous: None,
                             },
@@ -229,6 +284,10 @@ impl Recorder {
         let result = (|| -> Result<()> {
             loop {
                 if cancel.load(Ordering::SeqCst)
+                    || self
+                        .cancellation
+                        .as_ref()
+                        .is_some_and(|c| c.load(Ordering::SeqCst))
                     || self.options.seconds > 0
                         && started.elapsed() >= Duration::from_secs(self.options.seconds)
                 {
@@ -256,6 +315,19 @@ impl Recorder {
         })();
         let error = result.as_ref().err().map(ToString::to_string);
         self.finish(error)?;
+        // Preserve failure propagation for CLI callers; a structured stop
+        // summary is reserved for an explicitly requested termination.
+        if self.stop_reason.is_none() {
+            result.as_ref().map_err(|error| error.to_string())?;
+            if let Some(error) = &self.interruption {
+                return Err(error.clone().into());
+            }
+        }
+        if let Some(error) = &self.interruption {
+            return Ok(
+                json!({"recorded":false,"status":"incomplete","error":error,"out":self.options.out}),
+            );
+        }
         result?;
         Ok(
             json!({"recorded":true,"out":self.options.out,"steps":self.steps.len(),"gaps":self.gaps,"network_redaction":self.options.redact_network}),
@@ -351,6 +423,7 @@ impl Recorder {
                             .contexts
                             .entry((session.into(), id))
                             .or_insert(Context {
+                                identity: uuid::Uuid::new_v4().to_string(),
                                 frame: context["auxData"]["frameId"].as_str().unwrap_or("").into(),
                                 previous: None,
                             });
@@ -358,13 +431,46 @@ impl Recorder {
                 }
             }
             "Runtime.executionContextDestroyed" => {
+                if let Some(queue) = self.sample_frames.get_mut(&page_id) {
+                    queue.retain(|(s, id)| {
+                        s != session || Some(*id) != p["executionContextId"].as_i64()
+                    });
+                }
                 self.pages[index].contexts.remove(&(
                     session.into(),
                     p["executionContextId"].as_i64().unwrap_or(-1),
                 ));
             }
             "Runtime.executionContextsCleared" => {
+                if let Some(queue) = self.sample_frames.get_mut(&page_id) {
+                    queue.retain(|(s, _)| s != session);
+                }
                 self.pages[index].contexts.retain(|(s, _), _| s != session);
+                #[cfg(feature = "lifecycle-test-hooks")]
+                if let Some(path) = std::env::var_os("AAD_TEST_CONTEXTS_CLEARED") {
+                    std::fs::write(
+                        path,
+                        serde_json::to_vec(
+                            &json!({"page":page_id,"contexts":self.pages[index].contexts.len()}),
+                        )?,
+                    )?;
+                    if let Some(release) = std::env::var_os("AAD_TEST_CONTEXTS_RELEASE") {
+                        let deadline = Instant::now() + Duration::from_secs(5);
+                        while !std::path::Path::new(&release).exists() {
+                            if Instant::now() >= deadline
+                                || self
+                                    .cancellation
+                                    .as_ref()
+                                    .is_some_and(|c| c.load(Ordering::SeqCst))
+                            {
+                                return Err(
+                                    "context clear test barrier cancelled or timed out".into()
+                                );
+                            }
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                    }
+                }
             }
             "Target.attachedToTarget" => {
                 if p["targetInfo"]["type"] == "iframe" {
@@ -380,6 +486,9 @@ impl Recorder {
             }
             "Target.detachedFromTarget" => {
                 let detached = p["sessionId"].as_str().unwrap_or("");
+                if let Some(queue) = self.sample_frames.get_mut(&page_id) {
+                    queue.retain(|(s, _)| s != detached);
+                }
                 self.pages[index].contexts.retain(|(s, _), _| s != detached);
                 self.pages[index].sessions.remove(detached);
             }
@@ -447,10 +556,52 @@ impl Recorder {
     }
 
     fn capture(&mut self) -> Result<()> {
-        for index in 0..self.pages.len() {
-            let contexts: Vec<_> = self.pages[index].contexts.keys().cloned().collect();
-            let page_id = self.pages[index].id.clone();
+        // Optional UI evidence must not monopolize the recorder while network
+        // completion events wait in the queue (e.g. a stalled screenshot).
+        let deadline = Instant::now() + Duration::from_millis(500);
+        for page in &mut self.pages {
+            page.client.set_deadline(deadline);
+        }
+        let result = self.capture_bounded(deadline);
+        for page in &mut self.pages {
+            page.client.clear_deadline();
+        }
+        result
+    }
+
+    fn capture_bounded(&mut self, deadline: Instant) -> Result<()> {
+        self.sample_pages
+            .retain(|id| self.pages.iter().any(|p| &p.id == id));
+        self.sample_frames
+            .retain(|id, _| self.pages.iter().any(|p| &p.id == id));
+        for page in &self.pages {
+            if !self.sample_pages.contains(&page.id) {
+                self.sample_pages.push_back(page.id.clone());
+            }
+        }
+        let order: Vec<_> = self.sample_pages.iter().cloned().collect();
+        if let Some(first) = self.sample_pages.pop_front() {
+            self.sample_pages.push_back(first);
+        }
+        for page_id in order {
+            let index = self.pages.iter().position(|p| p.id == page_id).unwrap();
+            let queue = self.sample_frames.entry(page_id.clone()).or_default();
+            queue.retain(|key| self.pages[index].contexts.contains_key(key));
+            let mut keys: Vec<_> = self.pages[index].contexts.keys().cloned().collect();
+            keys.sort();
+            for key in keys {
+                if !queue.contains(&key) {
+                    queue.push_back(key);
+                }
+            }
+            let contexts: Vec<_> = queue.iter().cloned().collect();
             for (session, context) in contexts {
+                if Instant::now() < deadline {
+                    let queue = self.sample_frames.get_mut(&page_id).unwrap();
+                    if let Some(first) = queue.pop_front() {
+                        queue.push_back(first);
+                    }
+                }
                 let value = match eval(
                     &mut self.pages[index].client,
                     &session,
@@ -458,13 +609,27 @@ impl Recorder {
                     "globalThis.__aadCdp ? globalThis.__aadCdp.snapshot() : null",
                 ) {
                     Ok(value) if value.is_object() => value,
-                    _ => continue,
+                    _ => {
+                        let key = self.pages[index].contexts[&(session.clone(), context)]
+                            .identity
+                            .clone();
+                        if let Some(kind) = register_ui_gap(
+                            &mut self.ui_gaps,
+                            &mut self.ui_gap_overflow,
+                            key.clone(),
+                        ) {
+                            self.gap(kind, json!({"page":page_id,"session":session,"context":context,"identity":key,"limit":256}))?;
+                        }
+                        continue;
+                    }
                 };
                 let state = self.pages[index]
                     .contexts
                     .get_mut(&(session.clone(), context))
                     .unwrap();
                 let frame = state.frame.clone();
+                #[cfg(test)]
+                let identity = state.identity.clone();
                 let old = state.previous.replace(value.clone());
                 if old.as_ref() == Some(&value) {
                     continue;
@@ -496,6 +661,8 @@ impl Recorder {
                     } else {
                         None
                     };
+                    #[cfg(test)]
+                    self.snapshot_changes.push(json!({"page":page_id,"frame":frame,"session":session,"context":context,"identity":identity,"step":edited.unwrap_or(step),"change":change}));
                     self.change(edited.unwrap_or(step), change)?;
                 }
                 if value["truncated"] == true {
@@ -639,6 +806,22 @@ impl Recorder {
                                 || mime.starts_with("text/")
                                 || mime.contains("javascript"))
                         {
+                            #[cfg(feature = "lifecycle-test-hooks")]
+                            if url.contains("/api/orders") {
+                                if let Ok(path) = std::env::var("AAD_TEST_BODY_GATE") {
+                                    std::fs::write(&path, b"body-request-ready")?;
+                                    let deadline = Instant::now() + Duration::from_secs(10);
+                                    while !Path::new(&format!("{path}.release")).exists()
+                                        && Instant::now() < deadline
+                                        && !self
+                                            .cancellation
+                                            .as_ref()
+                                            .is_some_and(|c| c.load(Ordering::SeqCst))
+                                    {
+                                        std::thread::sleep(Duration::from_millis(5));
+                                    }
+                                }
+                            }
                             match self.pages[index].client.session_command(
                                 session_arg(session),
                                 "Network.getResponseBody",
@@ -652,7 +835,19 @@ impl Recorder {
                                     pending.record["body_truncated"] = json!(truncated);
                                     pending.record["body_base64"] = body["base64Encoded"].clone();
                                 }
-                                Err(_) => pending.record["body_status"] = json!("unavailable"),
+                                Err(error) => {
+                                    pending.record["body_status"] = json!("unavailable");
+                                    pending.record["body_error"] = json!(error.to_string());
+                                    let message = error.to_string();
+                                    if message.contains("command cancelled")
+                                        || message.contains("command deadline elapsed")
+                                        || message.contains("command disconnected")
+                                    {
+                                        self.interruption = Some(format!(
+                                            "response body capture interrupted: {error}"
+                                        ));
+                                    }
+                                }
                             }
                         } else {
                             pending.record["body_status"] = json!("not_captured_by_type_or_limit");
@@ -768,9 +963,13 @@ impl Recorder {
         if related.is_empty() {
             return Ok(());
         }
-        for target in Client::list_targets(self.options.port)?
-            .into_iter()
-            .filter(|t| related.contains(&t.id))
+        for target in Client::list_targets_cancellable(
+            self.options.port,
+            Instant::now() + Duration::from_secs(3),
+            self.cancellation.as_deref(),
+        )?
+        .into_iter()
+        .filter(|t| related.contains(&t.id))
         {
             if self.pages.len() >= 16 {
                 return Err("recording page limit reached (16)".into());
@@ -780,7 +979,25 @@ impl Recorder {
         Ok(())
     }
     fn attach_popup(&mut self, target: Target) -> Result<()> {
-        let client = Client::attach(&target)?;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        #[cfg(feature = "lifecycle-test-hooks")]
+        if let Ok(path) = std::env::var("AAD_TEST_POPUP_ATTACH_GATE") {
+            std::fs::write(&path, b"attaching")?;
+            while !Path::new(&format!("{path}.release")).exists() && Instant::now() < deadline {
+                if self
+                    .cancellation
+                    .as_ref()
+                    .is_some_and(|c| c.load(Ordering::SeqCst))
+                {
+                    return Err("popup attachment cancelled".into());
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        let mut client = Client::attach_cancellable(&target, deadline, self.cancellation.clone())?;
+        if let Some(cancel) = &self.cancellation {
+            client.set_cancellation(cancel.clone());
+        }
         let id = target.id.clone();
         self.pages.push(Page {
             id: id.clone(),
@@ -798,6 +1015,10 @@ impl Recorder {
             json!({"url":target.url,"title":target.title}),
         )?;
         self.install(self.pages.len() - 1, "")?;
+        #[cfg(feature = "lifecycle-test-hooks")]
+        if let Ok(path) = std::env::var("AAD_TEST_POPUP_ATTACH_GATE") {
+            std::fs::write(format!("{path}.attached"), b"attached")?;
+        }
         self.gap(
             "popup_attach_window",
             json!({"page":id,"initial_traffic_may_be_missing":true}),
@@ -873,6 +1094,50 @@ impl Recorder {
         }
     }
     fn finish(&mut self, error: Option<String>) -> Result<()> {
+        // Preserve network evidence already received before stopping. Do not
+        // resume UI capture or install scripts while cancellation is set.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let mut received = false;
+            for index in 0..self.pages.len() {
+                self.pages[index].client.set_deadline(deadline);
+                let batch = self.pages[index].client.drain_events();
+                if let Some(error) = batch.failure {
+                    self.interruption
+                        .get_or_insert_with(|| format!("CDP disconnected: {error}"));
+                }
+                if batch.dropped > 0 {
+                    self.gap("event_overflow", json!({"dropped":batch.dropped}))?;
+                    self.interruption
+                        .get_or_insert("network events dropped during stop".into());
+                }
+                received |= !batch.events.is_empty();
+                for event in batch.events {
+                    if event["method"]
+                        .as_str()
+                        .is_some_and(|m| m.starts_with("Network."))
+                    {
+                        self.event(index, event)?;
+                    }
+                }
+            }
+            if !received {
+                break;
+            }
+            if Instant::now() >= deadline
+                || self
+                    .cancellation
+                    .as_ref()
+                    .is_some_and(|c| c.load(Ordering::SeqCst))
+            {
+                self.interruption
+                    .get_or_insert("recording drain interrupted".into());
+                break;
+            }
+        }
+        for page in &mut self.pages {
+            page.client.clear_deadline();
+        }
         self.cleanup();
         self.stopped = true;
         let pending = std::mem::take(&mut self.pending);
@@ -892,7 +1157,21 @@ impl Recorder {
             export(&self.options.out)?;
             Ok(())
         })();
-        let failure = error.or_else(|| result.as_ref().err().map(ToString::to_string));
+        let stop_reason = self.stop_reason.clone();
+        let mut finalization = stop_reason.as_ref().map(|r| r.lock().unwrap());
+        let failure = finalization
+            .as_ref()
+            .and_then(|r| (**r).clone())
+            .or(error)
+            .or_else(|| self.interruption.clone())
+            .or_else(|| {
+                self.cancellation
+                    .as_ref()
+                    .filter(|c| c.load(Ordering::SeqCst))
+                    .map(|_| "recording cancelled or graceful stop deadline exceeded".to_string())
+            })
+            .or_else(|| result.as_ref().err().map(ToString::to_string));
+        self.interruption = failure.clone();
         self.storage.manifest(&self.manifest(
             if failure.is_some() {
                 "incomplete"
@@ -901,6 +1180,11 @@ impl Recorder {
             },
             failure,
         ))?;
+        // Empty reason acknowledges committed final state. The stop caller
+        // holds the same lock before deciding whether to force cancellation.
+        if let Some(state) = finalization.as_mut() {
+            **state = Some(String::new());
+        }
         result
     }
 }
@@ -1122,4 +1406,224 @@ fn markdown(text: &str) -> String {
         .replace(['\n', '\r'], " ")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
+}
+#[cfg(test)]
+mod gap_tests {
+    use super::*;
+    #[test]
+    #[ignore = "requires an isolated Chromium fixture via AAD_SAMPLING_PORT/PAGE/POPUP"]
+    fn real_context_recreation_preserves_waiting_frame_order() {
+        let out = std::env::temp_dir().join(format!("aad-frame-order-{}", uuid::Uuid::new_v4()));
+        let options = Options {
+            port: std::env::var("AAD_SAMPLING_PORT").unwrap().parse().unwrap(),
+            page: std::env::var("AAD_SAMPLING_PAGE").unwrap(),
+            out: out.clone(),
+            seconds: 0,
+            redact_network: true,
+            screenshots: false,
+            body_limit: 0,
+            max_bytes: 1048576,
+            follow_popups: true,
+        };
+        let mut r = Recorder::start(options).unwrap();
+        r.discover().unwrap();
+        r.poll().unwrap();
+        let popup = std::env::var("AAD_SAMPLING_POPUP").unwrap();
+        let index = r.pages.iter().position(|p| p.id == popup).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let keys = loop {
+            r.poll().unwrap();
+            let candidates: Vec<_> = r.pages[index].contexts.keys().cloned().collect();
+            let mut children = Vec::new();
+            for key in candidates {
+                if let Ok(value) = eval(
+                    &mut r.pages[index].client,
+                    &key.0,
+                    key.1,
+                    "document.body && document.body.innerText",
+                ) {
+                    if value
+                        .as_str()
+                        .is_some_and(|text| text == "FRAME_0" || text == "FRAME_1")
+                    {
+                        children.push(key);
+                    }
+                }
+            }
+            children.sort();
+            if children.len() == 2 {
+                break children;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "two live child frame contexts missing"
+            );
+        };
+        let a = keys[0].clone();
+        let b = keys[1].clone();
+        let frame_a = r.pages[index].contexts[&a].frame.clone();
+        let frame_b = r.pages[index].contexts[&b].frame.clone();
+        let identity_a = r.pages[index].contexts[&a].identity.clone();
+        let identity_b = r.pages[index].contexts[&b].identity.clone();
+        assert_ne!(frame_a, frame_b);
+        let label_a = eval(
+            &mut r.pages[index].client,
+            &a.0,
+            a.1,
+            "document.body.innerText",
+        )
+        .unwrap();
+        let label_b = eval(
+            &mut r.pages[index].client,
+            &b.0,
+            b.1,
+            "document.body.innerText",
+        )
+        .unwrap();
+        r.pages[index]
+            .contexts
+            .retain(|key, _| key == &a || key == &b);
+        let began = Instant::now();
+        r.capture().unwrap();
+        assert!(began.elapsed() >= Duration::from_millis(450));
+        let gaps = std::fs::read_to_string(out.join("evidence/health.jsonl"));
+        let gaps = gaps
+            .or_else(|_| std::fs::read_to_string(out.join("health.jsonl")))
+            .unwrap();
+        for (key, identity) in [(&a, &identity_a), (&b, &identity_b)] {
+            assert!(gaps
+                .lines()
+                .map(|line| serde_json::from_str::<Value>(line).unwrap())
+                .any(|row| {
+                    let d = &row["detail"];
+                    row["kind"] == "ui_snapshot_unavailable"
+                        && d["page"] == popup
+                        && d["session"] == key.0
+                        && d["context"] == key.1
+                        && d["identity"] == *identity
+                }));
+        }
+        assert_eq!(
+            r.sample_frames[&popup].iter().cloned().collect::<Vec<_>>(),
+            vec![a.clone(), b.clone()]
+        );
+        let baseline = std::fs::read_to_string(out.join("evidence/ui.jsonl"))
+            .unwrap_or_default()
+            .lines()
+            .count();
+        let frame = r.pages[index].contexts[&a].frame.clone();
+        r.event(index, json!({"method":"Runtime.executionContextDestroyed","sessionId":a.0,"params":{"executionContextId":a.1}})).unwrap();
+        r.event(index, json!({"method":"Runtime.executionContextCreated","sessionId":a.0,"params":{"context":{"id":a.1,"name":r.world,"auxData":{"frameId":frame}}}})).unwrap();
+        let recreated = r.pages[index].contexts[&a].identity.clone();
+        assert_ne!(recreated, identity_a);
+        assert_eq!(r.pages[index].contexts[&b].identity, identity_b);
+        let trace_baseline = r.snapshot_changes.len();
+        r.capture().unwrap();
+        let evidence = std::fs::read_to_string(out.join("evidence/ui.jsonl")).unwrap();
+        let frames: Vec<_> = evidence
+            .lines()
+            .skip(baseline)
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .filter_map(|row| {
+                let step = &r.steps[row["step_id"].as_u64().unwrap() as usize];
+                let trace = r.snapshot_changes[trace_baseline..].iter().find(|trace| {
+                    trace["step"] == row["step_id"] && trace["change"] == row["change"]
+                })?;
+                let exact_a = trace["frame"] == frame_a
+                    && trace["session"] == a.0
+                    && trace["context"] == a.1
+                    && trace["identity"] == recreated;
+                let exact_b = trace["frame"] == frame_b
+                    && trace["session"] == b.0
+                    && trace["context"] == b.1
+                    && trace["identity"] == identity_b;
+                (step.page_id == popup
+                    && trace["page"] == popup
+                    && (exact_a || exact_b)
+                    && row["change"]["kind"] == "appeared")
+                    .then(|| row["change"]["element"]["name"].clone())
+            })
+            .collect();
+        assert!(r.pages[index].contexts[&a].previous.is_some());
+        assert!(r.pages[index].contexts[&b].previous.is_some());
+        assert!(
+            frames.iter().position(|f| f == &label_b).unwrap()
+                < frames.iter().position(|f| f == &label_a).unwrap(),
+            "{frames:?}"
+        );
+        // The third normal round starts with the slow main page again.
+        // A's new generation gets its own gap; B's old generation deduplicates.
+        r.capture().unwrap();
+        let gaps = std::fs::read_to_string(out.join("evidence/health.jsonl")).unwrap();
+        for (key, identity) in [(&a, &recreated), (&b, &identity_b)] {
+            let count = gaps
+                .lines()
+                .map(|line| serde_json::from_str::<Value>(line).unwrap())
+                .filter(|row| {
+                    let d = &row["detail"];
+                    row["kind"] == "ui_snapshot_unavailable"
+                        && d["page"] == popup
+                        && d["session"] == key.0
+                        && d["context"] == key.1
+                        && d["identity"] == *identity
+                })
+                .count();
+            assert_eq!(count, 1, "one gap per exact context generation");
+        }
+        r.finish(None).unwrap();
+        std::fs::remove_dir_all(out).unwrap();
+    }
+
+    #[test]
+    fn persisted_gap_capacity_deduplicates_before_overflow() {
+        let out = std::env::temp_dir().join(format!("aad-gap-{}", uuid::Uuid::new_v4()));
+        let options = Options {
+            port: 0,
+            page: String::new(),
+            out: out.clone(),
+            seconds: 0,
+            redact_network: true,
+            screenshots: false,
+            body_limit: 0,
+            max_bytes: 1048576,
+            follow_popups: false,
+        };
+        let mut storage = storage::Storage::new(&options).unwrap();
+        let mut keys = HashSet::new();
+        let mut overflow = false;
+        for (index, key) in (0..256).chain([0, 256, 0, 256, 257]).enumerate() {
+            if let Some(kind) = register_ui_gap(&mut keys, &mut overflow, key.to_string()) {
+                storage
+                    .append("evidence/health.jsonl", &json!({"at_ms":index,"kind":kind}))
+                    .unwrap();
+            }
+            let records: Vec<Value> = std::fs::read_to_string(out.join("evidence/health.jsonl"))
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            assert_eq!(
+                records.len(),
+                if index < 256 {
+                    index + 1
+                } else if index == 256 {
+                    256
+                } else {
+                    257
+                }
+            );
+            assert_eq!(
+                records
+                    .iter()
+                    .filter(|r| r["kind"] == "ui_snapshot_gap_overflow")
+                    .count(),
+                usize::from(index >= 257)
+            );
+            if index >= 257 {
+                assert_eq!(records[256]["at_ms"], 257);
+            }
+            assert!(keys.len() <= 256);
+        }
+        std::fs::remove_dir_all(out).unwrap();
+    }
 }

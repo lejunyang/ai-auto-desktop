@@ -70,6 +70,7 @@ pub(crate) struct Connection {
     socket: WebSocket,
     inbox: Arc<Mutex<Inbox>>,
     reader: Option<std::thread::JoinHandle<()>>,
+    cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl Connection {
@@ -117,7 +118,36 @@ impl Connection {
             socket,
             inbox,
             reader: Some(reader),
+            cancel: None,
         })
+    }
+
+    pub fn set_cancellation(&mut self, cancel: Arc<std::sync::atomic::AtomicBool>) {
+        self.cancel = Some(cancel);
+    }
+    fn receive(
+        &self,
+        recv: &mpsc::Receiver<Result<Value, CdpError>>,
+        deadline: Instant,
+    ) -> Result<Value, CdpError> {
+        loop {
+            if self
+                .cancel
+                .as_ref()
+                .is_some_and(|c| c.load(std::sync::atomic::Ordering::SeqCst))
+            {
+                return Err(CdpError::protocol("command cancelled"));
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(CdpError::protocol("command deadline elapsed"));
+            }
+            match recv.recv_timeout(remaining.min(Duration::from_millis(10))) {
+                Ok(value) => return value,
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(_) => return Err(CdpError::protocol("command disconnected")),
+            }
+        }
     }
 
     pub fn command(
@@ -137,8 +167,7 @@ impl Connection {
         let result = (|| {
             self.socket.set_write_deadline(deadline)?;
             self.socket.send_text(&message.to_string())?;
-            recv.recv_timeout(deadline.saturating_duration_since(Instant::now()))
-                .map_err(|_| CdpError::protocol("command deadline elapsed"))?
+            self.receive(&recv, deadline)
         })();
         self.inbox.lock().unwrap().pending.remove(&id);
         result
@@ -175,9 +204,7 @@ impl Connection {
             .into_iter()
             .map(|recv| match &sent {
                 Err(error) => Err(error.clone()),
-                Ok(()) => recv
-                    .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-                    .map_err(|_| CdpError::protocol("command deadline elapsed"))?,
+                Ok(()) => self.receive(&recv, deadline),
             })
             .collect();
         let mut state = self.inbox.lock().unwrap();
@@ -218,6 +245,33 @@ impl Drop for Connection {
 mod tests {
     use super::*;
     use std::io::{Read, Write};
+    #[test]
+    fn cancellation_interrupts_a_command_without_a_reply() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let stream = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut peer, _) = listener.accept().unwrap();
+        let mut connection = Connection::new(WebSocket::from_stream(stream).unwrap()).unwrap();
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        connection.set_cancellation(cancel.clone());
+        let (release_tx, release_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            peer.read_exact(&mut [0; 1]).unwrap();
+            cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+            release_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        });
+        let start = Instant::now();
+        let result = connection.command(
+            1,
+            &serde_json::json!({"id":1,"method":"Page.captureScreenshot"}),
+            start + Duration::from_secs(10),
+        );
+        assert!(result.unwrap_err().to_string().contains("cancelled"));
+        assert!(start.elapsed() < Duration::from_millis(250));
+        release_tx.send(()).unwrap();
+        worker.join().unwrap();
+    }
+
     #[test]
     fn events_survive_before_responses_and_while_no_command_is_running() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -340,7 +394,13 @@ mod tests {
     fn overflow_is_bounded_and_accounted_for() {
         let mut state = Inbox::default();
         for _ in 0..MAX_EVENTS + 3 {
-            state.event(Value::Null, 1);
+            // Same request, many response events: event loss must never be
+            // interpreted as a count of distinct requests.
+            state.event(
+                serde_json::json!({"method":"Network.responseReceived",
+                "params":{"requestId":"one-request"}}),
+                1,
+            );
         }
         assert_eq!(state.events.len(), MAX_EVENTS);
         assert_eq!(state.dropped, 3);

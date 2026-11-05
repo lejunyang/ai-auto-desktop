@@ -35,7 +35,13 @@ async function runCase(redacted) {
   let polls=0;const serverRequests=[];
   const f=await fixture((req,res)=>{
     serverRequests.push({url:req.url,authorization:req.headers.authorization,cookie:req.headers.cookie});
-    if(req.url.startsWith('/auth/')){
+    if(req.url==='/header-redirect'){
+      res.writeHead(302,{'lOcAtIoN':'/header-final?code=SYNTH_CODE&returnTo=%2Fcb%3Fticket%3DSYNTH_TICKET'});
+      res.end();
+    }else if(req.url.startsWith('/header-final')){
+      res.writeHead(200,{'Content-Type':'text/plain','Location':'/cb?ticket=SYNTH_RESPONSE','Referer':'/cb?code=SYNTH_REFERER'});
+      res.end('header fixture');
+    }else if(req.url.startsWith('/auth/')){
       res.setHeader('Content-Type','application/json');
       res.end(JSON.stringify({status:req.url.includes('/status')?(++polls>=4?'confirmed':'waiting'):'created',token:'response-secret',qr_id:'fixture-qr'}));
     }else if(req.url==='/frame'){
@@ -59,6 +65,8 @@ async function runCase(redacted) {
     await f.cdp.eval(`(()=>{for(const [id,value] of [['account','alice'],['other','second']]){const el=document.getElementById(id);if(!el||el.tagName!=='INPUT')throw Error('stale fixture');el.value=value;el.dispatchEvent(new Event('input',{bubbles:true}));}const button=document.getElementById('login');if(button.textContent!=='扫码登录')throw Error('stale fixture');button.click();})()`);
     await until(()=>f.cdp.eval(`!document.getElementById('qr').hidden`),'QR dialog visible');
     await delay(1000);
+    await f.cdp.eval("fetch('/header-redirect').then(r=>r.text())");
+    await delay(500);
     for(let i=0;i<4;i++){await f.cdp.eval('pollStatus()');await delay(100);}
     assert.equal(await f.cdp.eval(`!document.getElementById('profile').hidden`),true);
     await delay(1000);
@@ -72,6 +80,12 @@ async function runCase(redacted) {
     const stop=await command(['browser-record','stop','--out',out]).done;assert.equal(stop.code,0,stop.stderr);
     const result=await recorder.done;assert.equal(result.code,0,`${result.stdout}\n${result.stderr}`);
     const manifest=await json(join(out,'manifest.json'));assert.equal(manifest.status,'complete');assert.equal(manifest.network_redaction,redacted?'enabled':'disabled');
+    for(const file of ['network.jsonl','network-extra.jsonl']){
+      const text=await readFile(join(out,'evidence',file),'utf8');
+      for(const secret of ['SYNTH_CODE','SYNTH_TICKET','SYNTH_RESPONSE','SYNTH_REFERER']){
+        assert.equal(text.includes(secret),!redacted, file+' '+secret);
+      }
+    }
     const steps=await jsonl(join(out,'steps.jsonl'));
     const actions=steps.filter(s=>s.kind==='action');
     assert.deepEqual(actions.slice(0,3).map(s=>s.action.kind),['input','input','click']);

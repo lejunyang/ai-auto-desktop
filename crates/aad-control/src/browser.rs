@@ -171,6 +171,7 @@ const DETACHED: &str = "Target.detachedFromTarget";
 const MAX_CHILD_FRAMES: usize = 64;
 
 struct Page {
+    connection_failed: bool,
     client: Client,
     websocket: String,
     /// The JavaScript dialog blocking this page, as the browser announced it.
@@ -185,14 +186,64 @@ struct Page {
     fresh: Vec<String>,
     /// Recent requests of the page, for browser_network.
     network: NetworkLog,
+    history: std::sync::Arc<Mutex<DiagnosticHistory>>,
 }
 
+/// Bounded history survives page connection replacement within this backend.
+#[derive(Default)]
+struct DiagnosticHistory {
+    events: std::collections::VecDeque<(Instant, Value)>,
+    generation: u64,
+    discarded: u64,
+    started: Option<u128>,
+}
+impl DiagnosticHistory {
+    fn record(&mut self, kind: &str, details: Value) {
+        let now = Instant::now();
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        self.started.get_or_insert(timestamp);
+        self.prune();
+        while self.events.len() >= 128 {
+            self.events.pop_front();
+            self.discarded += 1;
+        }
+        self.events.push_back((
+            now,
+            json!({"kind":kind,"at_unix_ms":timestamp,
+            "generation":self.generation,"details":details}),
+        ));
+    }
+    fn prune(&mut self) {
+        while self
+            .events
+            .front()
+            .is_some_and(|(at, _)| at.elapsed() > Duration::from_secs(300))
+        {
+            self.events.pop_front();
+            self.discarded += 1;
+        }
+    }
+    fn snapshot(&mut self, page: &str) -> Value {
+        self.prune();
+        json!({"page_id":page,"generation":self.generation,
+            "collection_started_unix_ms":self.started,
+            "retained_from_unix_ms":self.events.front().map(|(_,v)|v["at_unix_ms"].clone()),
+            "sampled_at_unix_ms":std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis(),
+            "discarded_timeline_events":self.discarded,"max_age_ms":300000,"capacity":128,
+            "events":self.events.iter().map(|(_,v)|v.clone()).collect::<Vec<_>>()})
+    }
+}
 /// A page's recent requests as the Network domain reported them.
 #[derive(Default)]
 struct NetworkLog {
     entries: std::collections::VecDeque<Value>,
-    /// Requests forgotten to the bound or lost before they were read.
+    /// Requests evicted from the bounded request cache.
     dropped: u64,
+    /// Raw CDP events lost before consumption; not a request count.
+    dropped_events: u64,
     seen: u64,
 }
 
@@ -297,9 +348,36 @@ impl Page {
     /// Apply the dialog events received since the last look.
     fn sync_dialog(&mut self) {
         let batch = self.client.drain_events();
-        // Events lost to the connection's bounded queue are mostly requests.
-        self.network.dropped += batch.dropped;
+        // One request can produce multiple events; keep the units separate.
+        self.network.dropped_events += batch.dropped;
+        if batch.dropped > 0 {
+            self.history
+                .lock()
+                .unwrap()
+                .record("event_gap", json!({"dropped_events":batch.dropped}));
+        }
+        if batch.failure.is_some() && !self.connection_failed {
+            self.connection_failed = true;
+            self.history.lock().unwrap().record(
+                "connection_failure",
+                json!({"reason":"CDP connection failed"}),
+            );
+        }
         for event in batch.events {
+            if matches!(
+                event["method"].as_str(),
+                Some("Page.frameNavigated" | "Page.navigatedWithinDocument")
+            ) {
+                let params = &event["params"];
+                let url = params["url"]
+                    .as_str()
+                    .or_else(|| params["frame"]["url"].as_str())
+                    .unwrap_or_default();
+                let mut details = json!({"url":url,"frame_id":params["frameId"].as_str().or_else(||params["frame"]["id"].as_str()),
+                    "method":event["method"]});
+                aad_cdp::recording::network::redact(&mut details);
+                self.history.lock().unwrap().record("navigation", details);
+            }
             if event.get("sessionId").is_none() && self.network.apply(&event) {
                 continue;
             }
@@ -393,6 +471,7 @@ pub struct BrowserBackend {
     /// The loopback CDP port; 0 until a browser is attached.
     port: AtomicU16,
     pages: Mutex<BTreeMap<String, Page>>,
+    histories: Mutex<BTreeMap<String, std::sync::Arc<Mutex<DiagnosticHistory>>>>,
     /// The browser-level connection, for tabs and downloads; opened when first needed.
     browser: Mutex<Option<Client>>,
     downloads: Mutex<Downloads>,
@@ -406,6 +485,7 @@ impl BrowserBackend {
         Self {
             port: AtomicU16::new(port),
             pages: Mutex::new(BTreeMap::new()),
+            histories: Mutex::new(BTreeMap::new()),
             browser: Mutex::new(None),
             downloads: Mutex::new(Downloads::default()),
             world: format!("aad-control-{}", uuid::Uuid::new_v4()),
@@ -450,6 +530,7 @@ impl BrowserBackend {
             downloads.released = false;
         }
         self.pages.lock().unwrap().clear();
+        self.histories.lock().unwrap().clear();
         *self.browser.lock().unwrap() = None;
         *self.last_context.lock().unwrap() = None;
         self.port.store(port, Ordering::SeqCst);
@@ -497,6 +578,8 @@ impl BrowserBackend {
             let mut client = Client::attach_bare_until(target, deadline).map_err(cdp_error)?;
             client.filter_events(
                 &[
+                    "Page.frameNavigated",
+                    "Page.navigatedWithinDocument",
                     DIALOG_OPENING,
                     DIALOG_CLOSED,
                     DRAG_INTERCEPTED,
@@ -540,9 +623,32 @@ impl BrowserBackend {
                 "Network.enable",
                 json!({"maxTotalBufferSize": 8_000_000, "maxResourceBufferSize": 1_000_000}),
             )?;
+            let history = {
+                let mut histories = self.histories.lock().unwrap();
+                if histories.len() >= 64 && !histories.contains_key(&target.id) {
+                    if let Some(key) = histories.keys().next().cloned() {
+                        histories.remove(&key);
+                    }
+                }
+                histories.entry(target.id.clone()).or_default().clone()
+            };
+            {
+                let mut h = history.lock().unwrap();
+                h.generation += 1;
+                let reconnect = h.generation > 1;
+                h.record(
+                    if reconnect {
+                        "reconnect_gap"
+                    } else {
+                        "attached"
+                    },
+                    json!({"unobserved_events":"unknown","pre_attach_history_available":false}),
+                );
+            }
             pages.insert(
                 target.id.clone(),
                 Page {
+                    connection_failed: false,
                     client,
                     websocket: target.webSocketDebuggerUrl.clone(),
                     dialog: None,
@@ -551,6 +657,7 @@ impl BrowserBackend {
                     children: BTreeMap::new(),
                     fresh: Vec::new(),
                     network: NetworkLog::default(),
+                    history,
                 },
             );
         }
@@ -591,7 +698,11 @@ impl BrowserBackend {
             page.sync_dialog();
             // A fresh connection on the next call recovers from a broken one,
             // but not while a dialog blocks the page: attaching would hang.
-            if result.is_err() && page.dialog.is_none() {
+            if page.connection_failed || (result.is_err() && page.dialog.is_none()) {
+                page.history.lock().unwrap().record("connection_discarded", json!({
+                    "cached_requests_lost":page.network.entries.len(),
+                    "evicted_requests":page.network.dropped,"dropped_events":page.network.dropped_events
+                }));
                 pages.remove(page_id);
             }
         }
@@ -1397,8 +1508,9 @@ impl Route {
 
 impl Backend for BrowserBackend {
     fn close(&self) {
-        self.release_downloads();
         self.closed.store(true, Ordering::SeqCst);
+        self.port.store(0, Ordering::SeqCst);
+        self.release_downloads();
         if let Ok(mut pages) = self.pages.try_lock() {
             self.clear_context(&mut pages, Instant::now() + Duration::from_millis(100));
         }
@@ -1429,8 +1541,17 @@ impl Backend for BrowserBackend {
         snapshot: &Value,
         locator: &crate::Locator,
         expect: crate::Expect,
-        _timeout: Duration,
+        timeout: Duration,
     ) -> Result<Option<Value>> {
+        if snapshot["scope_id"].is_string() {
+            let meta = &snapshot["metadata"];
+            self.with_page_state(meta["page_id"].as_str().unwrap_or_default(), timeout, |page| {
+                let entry = locate(page, meta["frame_id"].as_str().unwrap_or_default())?;
+                let context = Ctx { session: entry.session.clone(), id: meta["context_id"].as_i64().unwrap_or_default() };
+                let args = json!({"document_token":snapshot["document_token"], "observation":snapshot["snapshot_id"]});
+                checked(eval(&mut page.client, &context, format!("globalThis.__aadControlV1.validate_scope({args})"))?)
+            })?;
+        }
         browser_find(snapshot, locator, expect).map(Some)
     }
     fn storage(&self, selector: &Value, timeout: Duration, values: bool) -> Result<Value> {
@@ -1594,6 +1715,17 @@ impl Backend for BrowserBackend {
         }
         Ok(resources)
     }
+    fn observe_scope(
+        &self,
+        selector: &Value,
+        scope: &str,
+        max_nodes: usize,
+        timeout: Duration,
+    ) -> Result<Value> {
+        let mut selector = selector.clone();
+        selector["scope_id"] = json!(scope);
+        self.observe(&selector, max_nodes, timeout)
+    }
     fn observe(&self, selector: &Value, max_nodes: usize, timeout: Duration) -> Result<Value> {
         let deadline = Instant::now() + timeout;
         self.clear_context(
@@ -1619,7 +1751,8 @@ impl Backend for BrowserBackend {
             eval(client,&context,include_str!("browser.js").replace("NONCE",&nonce))?;
             let observation=uuid::Uuid::new_v4().to_string();
             *self.last_context.lock().unwrap()=Some((page_id.into(),context.clone()));
-            let mut result=eval(client,&context,format!("globalThis.__aadControlV1.observe({}, {})",serde_json::to_string(&observation).unwrap(),max_nodes))?;
+            let mut result=eval(client,&context,format!("globalThis.__aadControlV1.observe({}, {}, {})",serde_json::to_string(&observation).unwrap(),max_nodes,selector["scope_id"]))?;
+            if let Some(code) = result["error"].as_str() { return Err(error(code, "scope must identify one complete container in this frame")); }
             let main=entry.main();
             if !main {if let Some(nodes)=result["nodes"].as_array_mut(){for node in nodes {if let Some(actions)=node["actions"].as_array_mut(){actions.retain(|v|!MAIN_FRAME_ONLY.iter().any(|name|v==name));}}}}
             result["snapshot_id"]=json!(observation);
@@ -1999,14 +2132,74 @@ impl BrowserBackend {
                     object.remove("started");
                 }
             }
+            // Summarize only the returned window; never infer authentication
+            // failure from a URL containing "login" or from a redirect alone.
+            let summary = network_summary(&requests);
             Ok(json!({
                 "requests": requests,
+                "summary": summary,
+                "page_id": page_id,
+                "omitted_by_limit": skip,
                 "held": held,
                 "seen": seen,
                 "dropped": dropped,
-                "since": "this session first attached to the page",
+                "dropped_unit": "evicted_requests",
+                "evicted_requests": dropped,
+                "dropped_events": page.network.dropped_events,
+                "event_collection_gap": page.network.dropped_events > 0,
+                "since": "current connection generation; earlier connection gaps are in timeline",
+                "timeline":page.history.lock().unwrap().snapshot(page_id),
             }))
         })
+    }
+}
+
+fn network_summary(requests: &[Value]) -> Value {
+    json!({
+        "scope": "returned requests only",
+        "document_requests": requests.iter().filter(|r| r["resource_type"] == "Document").count(),
+        "redirects": requests.iter().filter(|r| r["state"] == "redirected").count(),
+        "http_401": requests.iter().filter(|r| r["status"].as_f64() == Some(401.0)).count(),
+        "http_403": requests.iter().filter(|r| r["status"].as_f64() == Some(403.0)).count(),
+        "request_failures": requests.iter().filter(|r| r["state"] == "failed").count(),
+        "missing_evidence": ["requests before attachment", "authentication outcome"],
+    })
+}
+
+#[cfg(test)]
+mod diagnostic_summary_tests {
+    use super::*;
+
+    #[test]
+    fn status_counts_accept_integer_and_float_representations() {
+        let result = network_summary(&[
+            json!({"status": 401}),
+            json!({"status": 401.0}),
+            json!({"status": 403}),
+            json!({"status": 403.0}),
+            json!({"status": null}),
+            json!({}),
+            json!({"status": 401.5}),
+            json!({"status": "403"}),
+        ]);
+        assert_eq!(result["http_401"], 2);
+        assert_eq!(result["http_403"], 2);
+    }
+
+    #[test]
+    fn ordinary_login_navigation_is_not_an_authentication_failure() {
+        let result = network_summary(&[
+            json!({"url": "https://example.test/login", "resource_type": "Document", "state": "redirected", "status": 302}),
+            json!({"status": 401}),
+            json!({"status": 403}),
+            json!({"state": "failed"}),
+        ]);
+        assert_eq!(result["redirects"], 1);
+        assert_eq!(result["document_requests"], 1);
+        assert_eq!(result["http_401"], 1);
+        assert_eq!(result["http_403"], 1);
+        assert_eq!(result["request_failures"], 1);
+        assert_eq!(network_summary(&[])["http_401"], 0);
     }
 }
 
@@ -2908,6 +3101,24 @@ fn keyboard(
 mod tests {
     use super::*;
     #[test]
+    fn close_revokes_port_while_page_connection_is_busy() {
+        let backend = std::sync::Arc::new(BrowserBackend::new(9222));
+        let pages = backend.pages.lock().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let closing = backend.clone();
+        let worker = std::thread::spawn(move || {
+            closing.close();
+            tx.send(()).unwrap();
+        });
+        let completed = rx.recv_timeout(Duration::from_secs(1));
+        drop(pages);
+        worker.join().unwrap();
+        completed.expect("close must not wait for a stalled page command");
+        assert_eq!(backend.attached_port(), None);
+        assert!(backend.closed.load(Ordering::SeqCst));
+    }
+
+    #[test]
     fn downloads_follow_the_browser_events_and_stay_bounded() {
         let directory = std::env::temp_dir().join(format!("aad-dl-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&directory).unwrap();
@@ -3204,6 +3415,31 @@ mod tests {
     }
 
     #[test]
+    fn diagnostic_timeline_bounds_age_capacity_and_connection_generations() {
+        let mut history = DiagnosticHistory {
+            generation: 1,
+            ..Default::default()
+        };
+        history.record("attached", json!({}));
+        history.events.front_mut().unwrap().0 = Instant::now() - Duration::from_secs(301);
+        history.prune();
+        assert_eq!(history.discarded, 1);
+        assert!(history.events.is_empty());
+        for _ in 0..130 {
+            history.record("navigation", json!({"url":"/login"}));
+        }
+        assert_eq!(history.events.len(), 128);
+        assert_eq!(history.discarded, 3);
+        history.record("connection_failure", json!({}));
+        history.generation += 1;
+        history.record("reconnect_gap", json!({"unobserved_events":"unknown"}));
+        let snapshot = history.snapshot("page");
+        assert_eq!(snapshot["generation"], 2);
+        assert_eq!(snapshot["events"][127]["kind"], "reconnect_gap");
+        assert!(snapshot["collection_started_unix_ms"].is_number());
+    }
+
+    #[test]
     fn the_network_log_follows_requests_redirects_and_failures_within_its_bound() {
         let mut log = NetworkLog::default();
         let sent = |id: &str, url: &str, at: f64| {
@@ -3244,6 +3480,13 @@ mod tests {
             log.apply(&sent(&format!("x{n}"), "http://a.test/", 3.0));
         }
         assert_eq!(log.entries.len(), MAX_REQUESTS);
+        assert_eq!(log.dropped, 3);
+        // Event loss is measured independently of request eviction and the
+        // caller's display limit; multiple events can describe one request.
+        log.dropped_events += 7;
+        let omitted_by_limit = log.entries.len().saturating_sub(2);
+        assert_eq!(omitted_by_limit, MAX_REQUESTS - 2);
+        assert_eq!(log.dropped_events, 7);
         assert_eq!(log.dropped, 3);
         assert_eq!(log.seen, MAX_REQUESTS as u64 + 3);
     }

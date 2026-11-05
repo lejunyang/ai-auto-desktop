@@ -17,12 +17,12 @@
 
 use serde::Serialize;
 use std::io::{Read, Write};
-use std::net::TcpStream;
 use std::time::Duration;
 
 mod connection;
 pub mod launch;
 pub mod recording;
+mod tcp;
 mod ws;
 
 pub use connection::EventBatch;
@@ -98,6 +98,10 @@ pub struct Client {
 }
 
 impl Client {
+    pub fn set_cancellation(&mut self, cancel: std::sync::Arc<std::sync::atomic::AtomicBool>) {
+        self.connection.set_cancellation(cancel);
+    }
+
     /// List debuggable targets over HTTP. Returns an error when no browser is
     /// listening on `port`, so callers can fall back to UIA.
     pub fn list_targets(port: u16) -> Result<Vec<Target>, CdpError> {
@@ -107,7 +111,14 @@ impl Client {
         port: u16,
         deadline: std::time::Instant,
     ) -> Result<Vec<Target>, CdpError> {
-        let body = http_get_until(port, "/json/list", deadline)?;
+        Self::list_targets_cancellable(port, deadline, None)
+    }
+    pub fn list_targets_cancellable(
+        port: u16,
+        deadline: std::time::Instant,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
+    ) -> Result<Vec<Target>, CdpError> {
+        let body = http_get_cancellable(port, "/json/list", deadline, cancel)?;
         let targets: Vec<Target> = serde_json::from_str(&body)
             .map_err(|error| CdpError::protocol(format!("could not parse /json/list: {error}")))?;
         Ok(targets
@@ -139,12 +150,26 @@ impl Client {
     }
 
     pub fn attach_until(target: &Target, deadline: std::time::Instant) -> Result<Self, CdpError> {
-        let ws = ws::WebSocket::connect_until(&target.webSocketDebuggerUrl, deadline)?;
+        Self::attach_cancellable(target, deadline, None)
+    }
+    pub fn attach_cancellable(
+        target: &Target,
+        deadline: std::time::Instant,
+        cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    ) -> Result<Self, CdpError> {
+        let ws = ws::WebSocket::connect_cancellable(
+            &target.webSocketDebuggerUrl,
+            deadline,
+            cancel.as_deref(),
+        )?;
         let mut client = Client {
             connection: connection::Connection::new(ws)?,
             next_id: 0,
             deadline: Some(deadline),
         };
+        if let Some(cancel) = cancel {
+            client.set_cancellation(cancel);
+        }
         client.enable_runtime()?;
         client.deadline = None;
         Ok(client)
@@ -184,6 +209,10 @@ impl Client {
     /// library primitive, never a pass-through method exposed to AI clients.
     pub fn set_deadline(&mut self, deadline: std::time::Instant) {
         self.deadline = Some(deadline);
+    }
+
+    pub fn clear_deadline(&mut self) {
+        self.deadline = None;
     }
 
     pub fn command(
@@ -350,16 +379,24 @@ fn http_get(port: u16, path: &str) -> Result<String, CdpError> {
     )
 }
 fn http_get_until(port: u16, path: &str, deadline: std::time::Instant) -> Result<String, CdpError> {
+    http_get_cancellable(port, path, deadline, None)
+}
+fn http_get_cancellable(
+    port: u16,
+    path: &str,
+    deadline: std::time::Instant,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<String, CdpError> {
     let remaining = || {
+        if cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::SeqCst)) {
+            return Err(CdpError::connect("cancelled"));
+        }
         deadline
             .checked_duration_since(std::time::Instant::now())
             .ok_or_else(|| CdpError::connect("HTTP deadline elapsed"))
     };
     let address = std::net::SocketAddr::from(([127, 0, 0, 1], port));
-    let mut stream = TcpStream::connect_timeout(&address, remaining()?)
-        .map_err(|error| CdpError::connect(format!("port {port}: {error}")))?;
-    // Explicitly restore blocking mode after connect_timeout, including Windows.
-    stream.set_nonblocking(false).map_err(CdpError::io)?;
+    let mut stream = tcp::connect(address, deadline, cancel, "http")?;
     stream
         .set_write_timeout(Some(remaining()?))
         .map_err(CdpError::io)?;
@@ -376,9 +413,19 @@ fn http_get_until(port: u16, path: &str, deadline: std::time::Instant) -> Result
     let mut header_end = None;
     loop {
         stream
-            .set_read_timeout(Some(remaining()?))
+            .set_read_timeout(Some(remaining()?.min(Duration::from_millis(50))))
             .map_err(CdpError::io)?;
-        let read = stream.read(&mut chunk).map_err(CdpError::io)?;
+        let read = match stream.read(&mut chunk) {
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                continue
+            }
+            result => result.map_err(CdpError::io)?,
+        };
         if read == 0 {
             break;
         }
@@ -447,6 +494,32 @@ const STATE_JS: &str = r#"
 #[cfg(test)]
 mod http_tests {
     use super::*;
+    #[test]
+    fn discovery_cancel_does_not_wait_for_server_response() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = cancel.clone();
+        let (release, held) = std::sync::mpsc::channel();
+        let peer = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0; 1024];
+            assert!(stream.read(&mut request).unwrap() > 0);
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            held.recv().unwrap();
+        });
+        let start = std::time::Instant::now();
+        assert!(Client::list_targets_cancellable(
+            port,
+            start + Duration::from_secs(3),
+            Some(&cancel)
+        )
+        .is_err());
+        assert!(start.elapsed() < Duration::from_secs(1));
+        release.send(()).unwrap();
+        peer.join().unwrap();
+    }
+
     use std::net::TcpListener;
     use std::time::Instant;
     fn server(response: Vec<u8>, trickle: bool) -> (u16, std::thread::JoinHandle<()>) {

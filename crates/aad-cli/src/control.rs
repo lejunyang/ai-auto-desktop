@@ -97,6 +97,12 @@ pub struct McpArgs {
 
 #[derive(Subcommand)]
 pub enum ControlCommand {
+    /// Read-only persistent browser diagnostics over NDJSON.
+    /// Send targets, then browser_network with resource_id and limit (1..500).
+    Diagnostics {
+        #[arg(long)]
+        browser_port: u16,
+    },
     /// Serve one private NDJSON session on inherited authenticated stdin/stdout.
     /// Use SSH for a remote machine; this command has no network listener.
     Serve(ServeArgs),
@@ -157,6 +163,10 @@ pub fn mcp(args: &McpArgs) -> std::io::Result<()> {
 
 pub fn run(command_args: &ControlCommand) -> std::io::Result<()> {
     let endpoint: Arc<dyn Endpoint> = match command_args {
+        ControlCommand::Diagnostics { browser_port } => Arc::new(Session::native_with_browser(
+            Default::default(),
+            Some(*browser_port),
+        )),
         ControlCommand::Serve(args) => {
             args.grants.check(args.allow_input)?;
             Arc::new(Session::native_with_browser(

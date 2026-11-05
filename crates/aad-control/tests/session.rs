@@ -47,6 +47,27 @@ impl Backend for Fake {
 fn call(session: &Session, op: Operation) -> Response {
     session.execute(&Request::new(Some(session.id().into()), op))
 }
+
+#[test]
+fn single_step_verification_never_replays_input() {
+    for (name, verified) in [("Save", true), ("Never appears", false)] {
+        let (session, backend) = fixture(true, Duration::ZERO);
+        let target = observed(&session);
+        let operation = serde_json::from_value(json!({
+            "method": "act", "target": target,
+            "action": {"type": "click"}, "verify": {"name": name}
+        }))
+        .unwrap();
+        let mut request = Request::new(Some(session.id().into()), operation);
+        request.timeout_ms = 600;
+        let response = session.execute(&request);
+        assert!(response.error.is_none(), "{:?}", response.error);
+        let data = response.data.unwrap();
+        assert_eq!(data["submitted"], true);
+        assert_eq!(data["verified"], verified);
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
+    }
+}
 fn observed(session: &Session) -> Target {
     assert!(call(session, Operation::Targets {}).error.is_none());
     let observed = call(
@@ -88,6 +109,7 @@ fn targets_are_session_bound_consumed_and_not_replayable() {
         call(
             &b,
             Operation::Act {
+                verify: None,
                 target: target.clone(),
                 action: Action::click()
             }
@@ -99,6 +121,7 @@ fn targets_are_session_bound_consumed_and_not_replayable() {
     let request = Request::new(
         Some(a.id().into()),
         Operation::Act {
+            verify: None,
             target: target.clone(),
             action: Action::click(),
         },
@@ -112,6 +135,7 @@ fn targets_are_session_bound_consumed_and_not_replayable() {
         call(
             &a,
             Operation::Act {
+                verify: None,
                 target,
                 action: Action::click()
             }
@@ -130,6 +154,7 @@ fn policy_and_unsupported_actions_do_not_dispatch() {
         call(
             &session,
             Operation::Act {
+                verify: None,
                 target,
                 action: Action::click()
             }
@@ -144,6 +169,7 @@ fn policy_and_unsupported_actions_do_not_dispatch() {
         call(
             &session,
             Operation::Act {
+                verify: None,
                 target,
                 action: Action::Key {
                     keys: vec!["Enter".into()]
@@ -163,6 +189,7 @@ fn cancellation_after_dispatch_reports_unknown_and_does_not_retry() {
     let request = Request::new(
         Some(session.id().into()),
         Operation::Act {
+            verify: None,
             target,
             action: Action::click(),
         },
@@ -192,6 +219,7 @@ fn cancellation_before_worker_admission_prevents_dispatch() {
     let request = Request::new(
         Some(session.id().into()),
         Operation::Act {
+            verify: None,
             target,
             action: Action::click(),
         },
@@ -222,6 +250,7 @@ fn cancellation_during_preflight_wins_before_the_atomic_commit_boundary() {
     let request = Request::new(
         Some(session.id().into()),
         Operation::Act {
+            verify: None,
             target,
             action: Action::click(),
         },
@@ -268,6 +297,7 @@ fn deadline_before_and_after_commit_has_distinct_effects() {
         let mut request = Request::new(
             Some(session.id().into()),
             Operation::Act {
+                verify: None,
                 target,
                 action: Action::click(),
             },
@@ -380,6 +410,7 @@ fn wait_returns_an_actionable_target_once_the_element_appears() {
     let acted = call(
         &session,
         Operation::Act {
+            verify: None,
             target,
             action: Action::click(),
         },
@@ -556,6 +587,7 @@ fn uploads_name_only_existing_files_under_the_server_grant() {
         call(
             session,
             Operation::Act {
+                verify: None,
                 target,
                 action: Action::Upload { files },
             },
@@ -619,6 +651,7 @@ fn close_expiry_and_bounded_replay_guard_revoke_observations() {
     let response = call(
         &session,
         Operation::Act {
+            verify: None,
             target,
             action: Action::click(),
         },
@@ -927,4 +960,37 @@ fn global_keys_need_both_grants_and_never_claim_a_verified_effect() {
         },
     );
     assert_eq!(malformed.error.unwrap()["code"], "CONTROL.INVALID_REQUEST");
+}
+
+#[test]
+fn eight_active_waits_are_cancelled_without_replay() {
+    let (session, backend) = changing();
+    let mut workers = Vec::new();
+    let mut ids = Vec::new();
+    for _ in 0..8 {
+        let mut request = Request::new(
+            Some(session.id().into()),
+            wait_for("Never", WaitCondition::Appears, None),
+        );
+        request.timeout_ms = 20_000;
+        ids.push(request.request_id.clone());
+        let running = session.clone();
+        let observed = backend.observed.load(Ordering::SeqCst);
+        workers.push(std::thread::spawn(move || running.execute(&request)));
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while backend.observed.load(Ordering::SeqCst) == observed {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+    }
+    for id in ids {
+        let result = call(&session, Operation::Cancel { request_id: id });
+        assert!(result.error.is_none(), "{result:?}");
+    }
+    for worker in workers {
+        let response = worker.join().unwrap();
+        assert_eq!(response.error.unwrap()["code"], "CONTROL.CANCELLED");
+        assert_eq!(response.commit_state, CommitState::NotCommitted);
+    }
+    assert_eq!(backend.acted.load(Ordering::SeqCst), 0);
 }

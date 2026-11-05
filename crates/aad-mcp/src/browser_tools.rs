@@ -17,6 +17,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::thread::JoinHandle;
 
 pub const NAMES: &[&str] = &[
+    "browser_status",
     "browser_profiles",
     "browser_open",
     "browser_close",
@@ -29,6 +30,7 @@ pub const NAMES: &[&str] = &[
 
 /// Browser tools that only read.
 pub const READ_ONLY: &[&str] = &[
+    "browser_status",
     "browser_profiles",
     "browser_downloads",
     "browser_storage",
@@ -77,13 +79,19 @@ by id and display name, for browser_open's copy_profile. Read-only.",
             mutating: false,
         },
         Tool {
+            name: "browser_status",
+            description: "Read configured browser ownership, process and profile mode. Does not probe endpoint liveness or read credentials.",
+            schema: json!({"type":"object", "properties":{}, "additionalProperties":false}),
+            mutating: false,
+        },
+        Tool {
             name: "browser_open",
             description: "Start a browser for this session and attach the control tools \
 to it: control_targets then lists its pages. Without a profile it starts empty and \
 forgets everything when closed. profile_dir keeps a working profile between runs, so a \
 login done once stays. copy_profile starts from a copy of an existing profile's logins \
-(see browser_profiles); the server must allow it. Opening a new browser closes the one \
-opened before. With `record`, recording starts before the URL loads, so the first \
+(see browser_profiles); the server must allow it. An already opened browser is preserved \
+and replacement is refused until browser_close. Copying does not guarantee login migration. With `record`, recording starts before the URL loads, so the first \
 requests are kept.",
             schema: json!({
                 "type": "object",
@@ -182,7 +190,7 @@ them use control_act clear_site_data on the page's document node.",
 newest last, since this session first attached to it: method, url (credentials and \
 sensitive query values redacted), resource type, state (pending, finished, failed, \
 redirected), status, MIME type, duration and size. Up to 500 are held per page; `dropped` \
-counts the ones forgotten. With include_bodies, finished text responses carry up to 4096 \
+is an alias of evicted_requests (request cache evictions); dropped_events counts lost CDP events, not requests. omitted_by_limit counts retained requests excluded from this result. With include_bodies, finished text responses carry up to 4096 \
 characters of body with sensitive JSON fields redacted. Read-only.",
             schema: json!({
                 "type": "object",
@@ -217,16 +225,149 @@ fn session_error(e: aad_core::AutomationError) -> Value {
 }
 
 struct Running {
+    reason: Arc<Mutex<Option<String>>>,
     cancel: Arc<AtomicBool>,
-    thread: JoinHandle<Result<Value, String>>,
+    stop: Arc<AtomicBool>,
+    thread: Mutex<Option<JoinHandle<Result<Value, String>>>>,
+    result: Mutex<Option<Result<Value, String>>>,
+    completed: std::sync::Condvar,
     out: PathBuf,
+}
+
+impl Running {
+    fn is_finished(&self) -> bool {
+        self.result.lock().unwrap().is_some()
+            || self
+                .thread
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|t| t.is_finished())
+    }
+    fn abort(&self, message: &str) {
+        let mut reason = self.reason.lock().unwrap();
+        if reason.is_none() {
+            *reason = Some(message.to_string());
+            self.cancel.store(true, Ordering::SeqCst);
+        }
+    }
+    fn join(&self) -> Result<Value, String> {
+        let thread = self.thread.lock().unwrap().take();
+        if let Some(thread) = thread {
+            let result = thread
+                .join()
+                .unwrap_or_else(|_| Err("the recorder panicked".into()));
+            *self.result.lock().unwrap() = Some(result.clone());
+            self.completed.notify_all();
+            result
+        } else {
+            let mut result = self.result.lock().unwrap();
+            while result.is_none() {
+                result = self.completed.wait(result).unwrap();
+            }
+            result.clone().unwrap()
+        }
+    }
+}
+
+fn abort_recording(recording: &Mutex<Option<Arc<Running>>>) {
+    let running = recording.lock().unwrap().clone();
+    if let Some(running) = running {
+        running.abort("recording cancelled by session shutdown");
+        let _ = running.join();
+        let mut slot = recording.lock().unwrap();
+        if slot
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, &running))
+        {
+            slot.take();
+        }
+    }
+}
+
+#[cfg(test)]
+mod recording_stop_tests {
+    use super::*;
+
+    fn recorder(graceful: bool) {
+        let browsers = Browsers::default();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_cancel = cancel.clone();
+        let worker_stop = stop.clone();
+        let thread = std::thread::spawn(move || {
+            while !worker_stop.load(Ordering::SeqCst) {
+                std::thread::yield_now();
+            }
+            if graceful {
+                // Represents the final response-body request after stop.
+                assert!(!worker_cancel.load(Ordering::SeqCst));
+            } else {
+                while !worker_cancel.load(Ordering::SeqCst) {
+                    std::thread::yield_now();
+                }
+            }
+            Ok(json!({"body_kept": graceful}))
+        });
+        *browsers.recording.lock().unwrap() = Some(Arc::new(Running {
+            reason: Arc::default(),
+            cancel,
+            stop,
+            thread: Mutex::new(Some(thread)),
+            result: Mutex::new(None),
+            completed: std::sync::Condvar::new(),
+            out: PathBuf::new(),
+        }));
+        let result = browsers.end_recording(graceful).unwrap();
+        assert_eq!(result["summary"]["body_kept"], graceful);
+    }
+
+    #[test]
+    fn explicit_stop_preserves_final_command() {
+        recorder(true);
+    }
+
+    #[test]
+    fn abort_interrupts_final_command() {
+        recorder(false);
+    }
+
+    #[test]
+    fn stalled_graceful_finish_is_cancelled() {
+        let browsers = Browsers::default();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = cancel.clone();
+        let thread = std::thread::spawn(move || {
+            while !worker_cancel.load(Ordering::SeqCst) {
+                std::thread::yield_now();
+            }
+            Ok(json!({"interrupted": true}))
+        });
+        *browsers.recording.lock().unwrap() = Some(Arc::new(Running {
+            reason: Arc::default(),
+            cancel,
+            stop: Arc::new(AtomicBool::new(false)),
+            thread: Mutex::new(Some(thread)),
+            result: Mutex::new(None),
+            completed: std::sync::Condvar::new(),
+            out: PathBuf::new(),
+        }));
+        let started = std::time::Instant::now();
+        let result = browsers.finish_recording().unwrap();
+        assert_eq!(result["summary"]["interrupted"], true);
+        assert!(started.elapsed() < std::time::Duration::from_secs(3));
+    }
 }
 
 /// The browser and recording this server started.
 #[derive(Default)]
 pub struct Browsers {
-    opened: Mutex<Option<Browser>>,
-    recording: Mutex<Option<Running>>,
+    // Held across preparation and publication, and before every field/session
+    // lock. Internal helpers never reacquire it.
+    lifecycle: Mutex<()>,
+    opened: Arc<Mutex<Option<Browser>>>,
+    profile_mode: Arc<Mutex<Option<String>>>,
+    recording: Arc<Mutex<Option<Arc<Running>>>>,
     /// Whether copy_profile may copy an existing profile's logins.
     pub allow_profile_copy: bool,
 }
@@ -258,6 +399,14 @@ fn browser_of(arguments: &Value) -> Result<String, Value> {
 }
 
 fn options(record: &Value, port: u16, page: String) -> Result<Options, Value> {
+    if record
+        .get("body_limit")
+        .is_some_and(|v| v.as_u64().is_none_or(|n| n > 1024 * 1024))
+    {
+        return Err(failed(
+            "body_limit must be an integer no greater than 1 MiB",
+        ));
+    }
     let directory = aad_runtime::recordings::recordings_dir().join("browser");
     std::fs::create_dir_all(&directory).map_err(failed)?;
     let stamp = std::time::SystemTime::now()
@@ -281,10 +430,75 @@ impl Browsers {
     pub fn call(
         &self,
         session: &aad_control::Session,
+        context: &aad_control::Context,
         name: &str,
         arguments: &Value,
     ) -> Result<Value, Value> {
+        #[cfg(feature = "lifecycle-test-hooks")]
+        if name == "browser_open" {
+            if let Ok(path) = std::env::var("AAD_TEST_LIFECYCLE") {
+                use std::io::Write;
+                let contended = self.lifecycle.try_lock().is_err();
+                writeln!(
+                    std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(path)
+                        .unwrap(),
+                    "{contended}"
+                )
+                .unwrap();
+            }
+        }
+        let _lifecycle = if name == "browser_status" {
+            self.lifecycle.try_lock().map_err(|_| json!({"code":"BROWSER.BUSY","message":"browser lifecycle transition in progress; retry later"}))?
+        } else {
+            loop {
+                context.remaining().map_err(|e| e.to_json())?;
+                match self.lifecycle.try_lock() {
+                    Ok(lock) => break lock,
+                    Err(std::sync::TryLockError::WouldBlock) => {
+                        std::thread::sleep(std::time::Duration::from_millis(10))
+                    }
+                    Err(std::sync::TryLockError::Poisoned(_)) => {
+                        panic!("browser lifecycle poisoned")
+                    }
+                }
+            }
+        };
+        #[cfg(feature = "lifecycle-test-hooks")]
+        if name == "browser_open" {
+            if let Ok(path) = std::env::var("AAD_TEST_EFFECT_GATE") {
+                session
+                    .browser_effect(context, || {
+                        std::fs::write(&path, "entered").unwrap();
+                        while !std::path::Path::new(&format!("{path}.release")).exists() {
+                            std::thread::sleep(std::time::Duration::from_millis(10));
+                        }
+                    })
+                    .map_err(|e| e.to_json())?;
+            }
+        }
+        if name == "browser_open" || name == "browser_record_start" {
+            session
+                .browser_effect(context, || ())
+                .map_err(|e| e.to_json())?;
+        }
         match name {
+            "browser_status" => {
+                let opened = self.opened.lock().unwrap();
+                let port = session.browser_port();
+                Ok(json!({
+                    "connection": if port.is_some() { "configured" } else { "not_configured" },
+                    "liveness": "not_probed",
+                    "port": port,
+                    "ownership": if opened.is_some() { "tool" } else if port.is_some() { "external" } else { "none" },
+                    "process_id": opened.as_ref().map(Browser::process_id),
+                    "profile_mode": if opened.is_some() { self.profile_mode.lock().unwrap().clone() } else { port.map(|_| "attached_unknown".to_string()) },
+                    "close_impact": if opened.is_some() { "closes tool browser; deletes temporary profile only" } else { "does not close external browser" },
+                    "copy_limitation": "copied profile does not guarantee login migration",
+                }))
+            }
             "browser_profiles" => {
                 let browser = browser_of(arguments)?;
                 let root = launch::real_user_data(&browser).ok_or_else(|| {
@@ -297,10 +511,11 @@ impl Browsers {
                 let profiles = launch::list_profiles(&root).map_err(failed)?;
                 Ok(json!({"browser": browser, "profiles": profiles}))
             }
-            "browser_open" => self.open(session, arguments),
+            "browser_open" => self.open(session, context, arguments),
             "browser_close" => {
                 let recording = self.stop_recording().ok();
-                session.release_browser_downloads();
+                session.detach_browser();
+                *self.profile_mode.lock().unwrap() = None;
                 let closed = self.opened.lock().unwrap().take().is_some();
                 Ok(json!({"closed": closed, "recording": recording}))
             }
@@ -328,10 +543,16 @@ impl Browsers {
                             )
                         })?,
                 };
-                let out = self.start_recording(options(&arguments["record"], port, page)?)?;
+                let out = self.start_recording(
+                    session,
+                    context,
+                    options(&arguments["record"], port, page)?,
+                )?;
                 Ok(json!({"recording": true, "out": out}))
             }
-            "browser_record_stop" => self.stop_recording(),
+            "browser_record_stop" => {
+                self.end_recording_with_context(true, Some((context, session)))
+            }
             "browser_downloads" => session
                 .browser_downloads(std::time::Duration::from_secs(5))
                 .map_err(|e| {
@@ -374,12 +595,19 @@ impl Browsers {
         }
     }
 
-    fn open(&self, session: &aad_control::Session, arguments: &Value) -> Result<Value, Value> {
+    fn open(
+        &self,
+        session: &aad_control::Session,
+        context: &aad_control::Context,
+        arguments: &Value,
+    ) -> Result<Value, Value> {
         let browser = browser_of(arguments)?;
         let url = arguments["url"].as_str();
         if let Some(url) = url {
-            let scheme = url.split_once("://").map(|(s, _)| s.to_ascii_lowercase());
-            if !matches!(scheme.as_deref(), Some("http" | "https"))
+            let parsed = url::Url::parse(url);
+            if !parsed
+                .as_ref()
+                .is_ok_and(|u| matches!(u.scheme(), "http" | "https") && u.host_str().is_some())
                 || url.chars().any(char::is_control)
             {
                 return Err(refused(
@@ -411,11 +639,56 @@ impl Browsers {
             }
             None => None,
         };
-        // One browser per server: the session works with one at a time.
-        let _ = self.stop_recording();
-        session.release_browser_downloads();
-        self.opened.lock().unwrap().take();
-        let started = Browser::start(launch::Options {
+        // Replacing a live owned browser cannot be made lossless when profiles
+        // or close_running overlap. Require an explicit close before switching.
+        if self.opened.lock().unwrap().is_some() {
+            return Err(refused(
+                "BROWSER.ALREADY_OPEN",
+                "a tool-owned browser is already open; it has been preserved",
+                Some("Use the current session, or explicitly call browser_close before opening another browser; closing loses its temporary profile."),
+            ));
+        }
+        if self.recording.lock().unwrap().is_some() {
+            return Err(refused(
+                "BROWSER.RECORDING",
+                "opening another browser would interrupt the current recording; the session has been preserved",
+                Some("Stop the recording explicitly before opening another browser."),
+            ));
+        }
+        // Validate recording arguments and its destination before starting a
+        // candidate process. Port and page are filled after launch.
+        let record_options = arguments
+            .get("record")
+            .map(|record| options(record, 0, String::new()))
+            .transpose()?;
+        if session.browser_port().is_some() && arguments["close_running"] == true {
+            return Err(refused("BROWSER.UNSAFE_REPLACEMENT",
+                "close_running could terminate the attached external browser; the existing session has been preserved",
+                Some("Use an independent profile without close_running.")));
+        }
+        struct Guard<'a>(&'a aad_control::Session, &'a aad_control::Context);
+        impl launch::Authority for Guard<'_> {
+            fn cancellation(&self) -> Option<Arc<AtomicBool>> {
+                Some(self.1.browser_cancellation())
+            }
+            fn check(&self) -> aad_cdp::recording::Result<()> {
+                self.1.remaining().map(|_| ()).map_err(|e| e.message.into())
+            }
+            fn navigation(&self) -> aad_cdp::recording::Result<()> {
+                self.0
+                    .browser_navigation(self.1)
+                    .map_err(|e| e.message.into())
+            }
+            fn effect(
+                &self,
+                action: &mut dyn FnMut() -> aad_cdp::recording::Result<()>,
+            ) -> aad_cdp::recording::Result<()> {
+                self.0
+                    .browser_effect(self.1, action)
+                    .map_err(|e| e.message)?
+            }
+        }
+        let started = Browser::start_guarded(launch::Options {
             browser: browser.clone(),
             executable: None,
             profile_dir: arguments["profile_dir"].as_str().map(PathBuf::from),
@@ -423,17 +696,15 @@ impl Browsers {
             profile_id: copy.unwrap_or("Default").to_string(),
             kill_browser: arguments["close_running"].as_bool().unwrap_or(false),
             headless: arguments["headless"].as_bool().unwrap_or(false),
-        })
+        }, &Guard(session, context))
         .map_err(|e| {
+            if let Err(cancelled) = context.remaining() { return cancelled.to_json(); }
             refused(
                 "BROWSER.START_FAILED",
                 e.to_string(),
                 Some("If the profile is in use, close that browser or pass close_running with the person's agreement."),
             )
         })?;
-        session
-            .attach_launched_browser(started.port)
-            .map_err(|e| e.to_json())?;
         let mut answer = json!({
             "browser": browser,
             "port": started.port,
@@ -441,72 +712,270 @@ impl Browsers {
             "profile_dir": started.profile_dir().display().to_string(),
             "temporary_profile": arguments["profile_dir"].is_null(),
         });
-        if arguments.get("record").is_some() {
-            let options = options(&arguments["record"], started.port, started.page.clone())?;
-            answer["recording"] = json!({"out": self.start_recording(options)?});
+        #[cfg(feature = "lifecycle-test-hooks")]
+        if let Ok(path) = std::env::var("AAD_TEST_CANDIDATE") {
+            std::fs::write(path, format!("{} {}", started.process_id(), started.port)).unwrap();
+        }
+        #[cfg(feature = "lifecycle-test-hooks")]
+        if let Ok(path) = std::env::var("AAD_TEST_CANDIDATE_LOG") {
+            use std::io::Write;
+            writeln!(
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)
+                    .unwrap(),
+                "{}",
+                started.process_id()
+            )
+            .unwrap();
+        }
+        if let Some(mut options) = record_options {
+            options.port = started.port;
+            options.page = started.page.clone();
+            answer["recording"] = json!({"out": self.start_recording(session, context, options)?});
+        }
+        #[cfg(feature = "lifecycle-test-hooks")]
+        if let Ok(path) = std::env::var("AAD_TEST_BEFORE_NAVIGATION") {
+            std::fs::write(&path, "entered").unwrap();
+            while !std::path::Path::new(&format!("{path}.release")).exists() {
+                if context.remaining().is_err() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
         }
         if let Some(url) = url {
-            started.open_url(url).map_err(failed)?;
+            if let Err(error) = started.open_url_guarded(url, &Guard(session, context)) {
+                let _ = self.stop_recording();
+                if let Err(cancelled) = context.remaining() {
+                    return Err(cancelled.to_json());
+                }
+                return Err(failed(error));
+            }
             answer["url"] = json!(url);
         }
-        *self.opened.lock().unwrap() = Some(started);
+        // Publish only after all fallible preparation has succeeded. A failed
+        // candidate is dropped without invalidating the old session's handles.
+        #[cfg(feature = "lifecycle-test-hooks")]
+        let inject_attach_failure = std::env::var_os("AAD_TEST_ATTACH_FAILURE").is_some();
+        #[cfg(not(feature = "lifecycle-test-hooks"))]
+        let inject_attach_failure = false;
+        let attachment = if inject_attach_failure {
+            Err(failed("injected attachment failure"))
+        } else {
+            session
+                .publish_browser_with_context(started.port, Some(context), || {
+                    *self.profile_mode.lock().unwrap() = Some(
+                        if copy.is_some() {
+                            "copy"
+                        } else if arguments["profile_dir"].is_string() {
+                            "persistent"
+                        } else {
+                            "temporary"
+                        }
+                        .into(),
+                    );
+                    *self.opened.lock().unwrap() = Some(started);
+                    let opened = self.opened.clone();
+                    let recording = self.recording.clone();
+                    let profile = self.profile_mode.clone();
+                    Box::new(move || {
+                        abort_recording(&recording);
+                        opened.lock().unwrap().take();
+                        profile.lock().unwrap().take();
+                    })
+                })
+                .map_err(|e| e.to_json())
+        };
+        if let Err(error) = attachment {
+            let _ = self.stop_recording();
+            return Err(error);
+        }
         Ok(answer)
     }
 
-    fn start_recording(&self, options: Options) -> Result<String, Value> {
-        let mut slot = self.recording.lock().unwrap();
-        if slot.is_some() {
-            return Err(refused(
-                "BROWSER.RECORDING",
-                "a recording is already running",
-                Some("Stop it with browser_record_stop first."),
-            ));
-        }
+    fn start_recording(
+        &self,
+        session: &aad_control::Session,
+        context: &aad_control::Context,
+        options: Options,
+    ) -> Result<String, Value> {
+        #[cfg(feature = "lifecycle-test-hooks")]
+        let options = {
+            let mut options = options;
+            if std::env::var_os("AAD_TEST_RECORDER_FAILURE").is_some() {
+                options.max_bytes = 0;
+            }
+            options
+        };
         let out = options.out.clone();
-        let cancel = Arc::new(AtomicBool::new(false));
-        let (ready, started) = mpsc::channel();
-        let stop = cancel.clone();
-        let thread = std::thread::spawn(move || {
-            let recorder = match Recorder::start(options) {
-                Ok(recorder) => {
-                    let _ = ready.send(Ok(()));
-                    recorder
+        let started = session
+            .register_browser_resource(context, || {
+                let mut slot = self.recording.lock().unwrap();
+                if slot.is_some() {
+                    return Err(aad_control::error(
+                        "BROWSER.RECORDING",
+                        "a recording is already running",
+                    ));
                 }
-                Err(e) => {
-                    let _ = ready.send(Err(e.to_string()));
-                    return Err("did not start".to_string());
-                }
-            };
-            recorder.run(&stop).map_err(|e| e.to_string())
-        });
-        match started.recv() {
+                let cancel = Arc::new(AtomicBool::new(false));
+                let graceful = Arc::new(AtomicBool::new(false));
+                let graceful_thread = graceful.clone();
+                let reason = Arc::new(Mutex::new(None));
+                let worker_reason = reason.clone();
+                let (ready, started) = mpsc::channel();
+                let stop = cancel.clone();
+                let thread = std::thread::spawn(move || {
+                    #[cfg(feature = "lifecycle-test-hooks")]
+                    if let Ok(path) = std::env::var("AAD_TEST_RECORDER_START_BARRIER") {
+                        let _ = std::fs::write(&path, b"entered");
+                        while !stop.load(Ordering::SeqCst)
+                            && !std::path::Path::new(&format!("{path}.release")).exists()
+                        {
+                            std::thread::sleep(std::time::Duration::from_millis(10));
+                        }
+                        if stop.load(Ordering::SeqCst) {
+                            let _ = ready.send(Err("recording startup cancelled".to_string()));
+                            return Err("recording startup cancelled".to_string());
+                        }
+                    }
+                    let mut recorder =
+                        match Recorder::start_cancellable(options, Some(stop.clone())) {
+                            Ok(recorder) => {
+                                let _ = ready.send(Ok(()));
+                                recorder
+                            }
+                            Err(e) => {
+                                let _ = ready.send(Err(e.to_string()));
+                                return Err("did not start".to_string());
+                            }
+                        };
+                    recorder.set_stop_reason(worker_reason);
+                    recorder.run(&graceful_thread).map_err(|e| e.to_string())
+                });
+                *slot = Some(Arc::new(Running {
+                    reason,
+                    cancel,
+                    stop: graceful,
+                    thread: Mutex::new(Some(thread)),
+                    result: Mutex::new(None),
+                    completed: std::sync::Condvar::new(),
+                    out: out.clone(),
+                }));
+                let recording = self.recording.clone();
+                Ok((
+                    started,
+                    Box::new(move || {
+                        abort_recording(&recording);
+                    }) as Box<dyn FnOnce() + Send>,
+                ))
+            })
+            .map_err(|e| e.to_json())?;
+        // Do not hold the slot/publication lock while startup is in flight:
+        // close already owns a cancellation handle and can reap the recorder.
+        let startup = loop {
+            if let Err(error) = context.remaining() {
+                let _ = self.stop_recording();
+                return Err(error.to_json());
+            }
+            match started.recv_timeout(std::time::Duration::from_millis(10)) {
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                result => break result,
+            }
+        };
+        match startup {
             Ok(Ok(())) => {}
             Ok(Err(message)) => {
-                let _ = thread.join();
+                let _ = self.stop_recording();
                 return Err(failed(message));
             }
-            Err(_) => return Err(failed("the recorder stopped before starting")),
+            Err(_) => {
+                let _ = self.stop_recording();
+                return Err(failed("the recorder stopped before starting"));
+            }
         }
-        *slot = Some(Running {
-            cancel,
-            thread,
-            out: out.clone(),
-        });
+        if let Err(error) = session.browser_effect(context, || ()) {
+            let _ = self.stop_recording();
+            return Err(error.to_json());
+        }
         Ok(out.display().to_string())
     }
 
     fn stop_recording(&self) -> Result<Value, Value> {
+        self.end_recording(false)
+    }
+
+    #[cfg(test)]
+    fn finish_recording(&self) -> Result<Value, Value> {
+        self.end_recording(true)
+    }
+
+    fn end_recording(&self, graceful: bool) -> Result<Value, Value> {
+        self.end_recording_with_context(graceful, None)
+    }
+
+    fn end_recording_with_context(
+        &self,
+        graceful: bool,
+        context: Option<(&aad_control::Context, &aad_control::Session)>,
+    ) -> Result<Value, Value> {
         let running = self
             .recording
             .lock()
             .unwrap()
-            .take()
+            .clone()
             .ok_or_else(|| refused("BROWSER.NOT_RECORDING", "no recording is running", None))?;
-        running.cancel.store(true, Ordering::SeqCst);
-        let summary = running
-            .thread
-            .join()
-            .map_err(|_| failed("the recorder panicked"))?;
+        running.stop.store(true, Ordering::SeqCst);
+        #[cfg(feature = "lifecycle-test-hooks")]
+        if let Ok(path) = std::env::var("AAD_TEST_BODY_GATE") {
+            let _ = std::fs::write(format!("{path}.stop"), b"stopping");
+        }
+        if graceful {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while !running.is_finished() && std::time::Instant::now() < deadline {
+                #[cfg(feature = "lifecycle-test-hooks")]
+                if let Ok(path) = std::env::var("AAD_TEST_STOP_WAITING") {
+                    let _ = std::fs::write(path, b"waiting");
+                }
+                if context.is_some_and(|(c, _)| c.remaining().is_err()) {
+                    running.abort(if context.is_some_and(|(_, s)| s.is_closed()) {
+                        "recording cancelled by session shutdown"
+                    } else {
+                        "recording cancelled by stop request"
+                    });
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+        if !running.is_finished() {
+            let mut reason = running.reason.lock().unwrap();
+            if reason.is_none() {
+                *reason = Some(
+                    if context.is_some_and(|(_, s)| s.is_closed()) {
+                        "recording cancelled by session shutdown"
+                    } else if context.is_some_and(|(c, _)| c.remaining().is_err()) {
+                        "recording cancelled by stop request"
+                    } else if graceful {
+                        "recording graceful stop deadline exceeded (2000 ms)"
+                    } else {
+                        "recording cancelled by session shutdown"
+                    }
+                    .to_string(),
+                );
+                running.cancel.store(true, Ordering::SeqCst);
+            }
+        }
+        let summary = running.join();
+        let mut slot = self.recording.lock().unwrap();
+        if slot
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, &running))
+        {
+            slot.take();
+        }
+        drop(slot);
         let files = [
             "steps.jsonl",
             "evidence/network.jsonl",

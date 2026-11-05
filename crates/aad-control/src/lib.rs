@@ -6,6 +6,7 @@ pub mod launch;
 pub mod lease;
 pub mod model;
 pub mod native;
+pub mod qr;
 pub mod recording;
 pub mod steps;
 pub mod transport;
@@ -119,6 +120,18 @@ pub trait Backend: Send + Sync {
     }
     fn resources(&self, timeout: Duration) -> Result<Vec<BackendResource>>;
     fn observe(&self, selector: &Value, max_nodes: usize, timeout: Duration) -> Result<Value>;
+    fn observe_scope(
+        &self,
+        _selector: &Value,
+        _scope: &str,
+        _max_nodes: usize,
+        _timeout: Duration,
+    ) -> Result<Value> {
+        Err(error(
+            "CONTROL.SCOPE_UNSUPPORTED",
+            "provider does not support complete scoped observation",
+        ))
+    }
     /// Shape a retained snapshot for the caller. `None` uses the portable
     /// outline; a provider answers with `nodes` keyed by `node_id`, or `regions`.
     fn view(&self, _snapshot: &Value, _view: &View, _timeout: Duration) -> Result<Option<Value>> {
@@ -171,6 +184,8 @@ pub struct Policy {
 
 #[derive(Clone)]
 struct Observation {
+    scope: Option<String>,
+    max_nodes: usize,
     provider: String,
     resource_id: String,
     raw: Value,
@@ -188,21 +203,98 @@ struct State {
 }
 
 pub struct Context {
+    effect_gate: Mutex<()>,
     // 0=pending, 1=may have committed, 2=cancelled before, 3=cancelled after.
     phase: AtomicU8,
+    browser_publication: AtomicU8,
+    browser_cancelled: Arc<AtomicBool>,
     deadline: Instant,
     mutating: bool,
+}
+
+// Backend screenshot APIs may only accept a duration. Bound their worker
+// count while allowing the caller to stop waiting immediately on cancellation.
+// The backend retains its original finite deadline and its output is discarded
+// if the caller has already terminated.
+fn capture_cancellable(
+    context: &Context,
+    capture: impl FnOnce() -> Result<Value> + Send + 'static,
+) -> Result<Value> {
+    static ACTIVE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    if ACTIVE
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+            (n < 8).then_some(n + 1)
+        })
+        .is_err()
+    {
+        return Err(error("CONTROL.BUSY", "screenshot workers are occupied"));
+    }
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        struct Permit;
+        impl Drop for Permit {
+            fn drop(&mut self) {
+                ACTIVE.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+        let _permit = Permit;
+        let _ = tx.send(capture());
+    });
+    loop {
+        let remaining = context.remaining()?;
+        match rx.recv_timeout(remaining.min(Duration::from_millis(10))) {
+            Ok(result) => {
+                context.remaining()?;
+                return result;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(_) => {
+                context.remaining()?;
+                return Err(error("CONTROL.CAPTURE_FAILED", "screenshot worker stopped"));
+            }
+        }
+    }
 }
 
 impl Context {
     pub fn new(timeout: Duration, mutating: bool) -> Self {
         Self {
+            effect_gate: Mutex::new(()),
+            browser_publication: AtomicU8::new(0),
+            browser_cancelled: Arc::new(AtomicBool::new(false)),
             phase: AtomicU8::new(0),
             deadline: Instant::now() + timeout,
             mutating,
         }
     }
+    /// Nonblocking browser-open cancellation. Publication and cancellation
+    /// compete for this single terminal transition, independently of slow effects.
+    pub fn browser_cancellation(&self) -> Arc<AtomicBool> {
+        self.browser_cancelled.clone()
+    }
+    pub fn cancel_browser(&self) {
+        if self
+            .browser_publication
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |state| match state {
+                0 => Some(1),
+                3 => Some(4),
+                _ => None,
+            })
+            .is_ok()
+        {
+            self.browser_cancelled.store(true, Ordering::SeqCst);
+        }
+    }
+    pub fn begin_browser_navigation(&self) -> Result<()> {
+        self.remaining()?;
+        self.browser_publication
+            .compare_exchange(0, 3, Ordering::SeqCst, Ordering::SeqCst)
+            .map_err(|_| error("CONTROL.CANCELLED", "browser navigation cancelled"))?;
+        Ok(())
+    }
+
     pub fn cancel(&self) {
+        let _effect = self.effect_gate.lock().unwrap();
         let mut phase = self.phase.load(Ordering::SeqCst);
         loop {
             let next = match phase {
@@ -229,6 +321,18 @@ impl Context {
         self.remaining()
     }
     pub fn remaining(&self) -> Result<Duration> {
+        let browser_phase = self.browser_publication.load(Ordering::SeqCst);
+        if matches!(browser_phase, 1 | 4) {
+            return Err(
+                error("CONTROL.CANCELLED", "browser request cancelled").with_effect(
+                    if browser_phase == 4 {
+                        "unknown"
+                    } else {
+                        "not_applied"
+                    },
+                ),
+            );
+        }
         let phase = self.phase.load(Ordering::SeqCst);
         let code = if matches!(phase, 2 | 3) {
             Some("CONTROL.CANCELLED")
@@ -238,11 +342,12 @@ impl Context {
             None
         };
         if let Some(code) = code {
-            let effect = if self.mutating && matches!(phase, 1 | 3) {
-                "unknown"
-            } else {
-                "not_applied"
-            };
+            let effect =
+                if matches!(browser_phase, 3 | 4) || self.mutating && matches!(phase, 1 | 3) {
+                    "unknown"
+                } else {
+                    "not_applied"
+                };
             return Err(error(code, "request cancelled or deadline elapsed").with_effect(effect));
         }
         Ok(self.deadline.saturating_duration_since(Instant::now()))
@@ -257,8 +362,10 @@ pub struct Session {
     state: Mutex<State>,
     /// Native focus/input is serialized, even when cancellation is concurrent.
     gate: Arc<Mutex<()>>,
+    browser_contexts: Mutex<Vec<std::sync::Weak<Context>>>,
     active: Mutex<BTreeMap<String, Arc<Context>>>,
     closed: AtomicBool,
+    browser_publication: Mutex<Vec<Box<dyn FnOnce() + Send>>>,
     created: Instant,
     lifetime: Duration,
     observation_ttl: Duration,
@@ -282,8 +389,10 @@ impl Session {
             failures: BTreeMap::new(),
             state: Mutex::new(State::default()),
             gate: Arc::new(Mutex::new(())),
+            browser_contexts: Mutex::new(Vec::new()),
             active: Mutex::new(BTreeMap::new()),
             closed: AtomicBool::new(false),
+            browser_publication: Mutex::new(Vec::new()),
             created: Instant::now(),
             lifetime: Duration::from_secs(3600),
             observation_ttl: Duration::from_secs(300),
@@ -292,6 +401,66 @@ impl Session {
             providers: Vec::new(),
             browser: None,
         }
+    }
+
+    pub fn register_browser_context(&self, context: &Arc<Context>) {
+        let mut contexts = self.browser_contexts.lock().unwrap();
+        contexts.retain(|c| c.strong_count() > 0);
+        if self.closed.load(Ordering::SeqCst) {
+            context.cancel_browser();
+        }
+        contexts.push(Arc::downgrade(context));
+    }
+    pub fn browser_navigation(&self, context: &Context) -> Result<()> {
+        let _contexts = self.browser_contexts.lock().unwrap();
+        if self.closed.load(Ordering::SeqCst) {
+            context.cancel_browser();
+        }
+        context.begin_browser_navigation()
+    }
+
+    pub fn browser_request<T>(&self, id: &str, run: impl FnOnce(&Context) -> T) -> Result<T> {
+        let context = Arc::new(Context::new(Duration::from_secs(60), false));
+        self.register_browser_context(&context);
+        {
+            let _publication = self.browser_publication.lock().unwrap();
+            if self.closed.load(Ordering::SeqCst) {
+                return Err(error("CONTROL.SESSION_CLOSED", "session closed"));
+            }
+            let mut active = self.active.lock().unwrap();
+            if self.state.lock().unwrap().cancelled_requests.remove(id) {
+                context.cancel();
+            }
+            active.insert(id.into(), context.clone());
+        }
+        let result = run(&context);
+        self.active.lock().unwrap().remove(id);
+        Ok(result)
+    }
+    pub fn browser_effect<T>(&self, context: &Context, effect: impl FnOnce() -> T) -> Result<T> {
+        let _publication = self.browser_publication.lock().unwrap();
+        let _effect = context.effect_gate.lock().unwrap();
+        if self.closed.load(Ordering::SeqCst) {
+            return Err(error("CONTROL.SESSION_CLOSED", "session closed"));
+        }
+        context.remaining()?;
+        Ok(effect())
+    }
+
+    pub fn register_browser_resource<T>(
+        &self,
+        context: &Context,
+        create: impl FnOnce() -> Result<(T, Box<dyn FnOnce() + Send>)>,
+    ) -> Result<T> {
+        let mut resources = self.browser_publication.lock().unwrap();
+        let _effect = context.effect_gate.lock().unwrap();
+        if self.closed.load(Ordering::SeqCst) {
+            return Err(error("CONTROL.SESSION_CLOSED", "session closed"));
+        }
+        context.remaining()?;
+        let (value, cleanup) = create()?;
+        resources.push(cleanup);
+        Ok(value)
     }
 
     pub fn native(policy: Policy) -> Self {
@@ -319,34 +488,107 @@ impl Session {
     /// Point the browser provider at the CDP endpoint on this loopback port.
     /// Earlier browser observations stop resolving.
     pub fn attach_browser(&self, port: u16) -> Result<()> {
+        let _gate = self.gate.lock().unwrap();
+        let _publication = self.browser_publication.lock().unwrap();
+        self.attach_browser_locked(port, false)
+    }
+
+    fn attach_browser_locked(&self, port: u16, launched: bool) -> Result<()> {
+        if self.closed.load(Ordering::SeqCst) {
+            return Err(error(
+                "CONTROL.SESSION_CLOSED",
+                "cannot attach a browser to a closed session",
+            ));
+        }
         let browser = self.browser.as_ref().ok_or_else(|| {
             error(
                 "BROWSER.NOT_CONNECTED",
                 "this session has no browser provider",
             )
         })?;
-        browser.attach(port);
-        self.state
-            .lock()
-            .unwrap()
+        if launched {
+            browser.attach_launched(port);
+        } else {
+            browser.attach(port);
+        }
+        if self.closed.load(Ordering::SeqCst) {
+            browser.attach(0);
+            return Err(error(
+                "CONTROL.SESSION_CLOSED",
+                "session closed during attachment",
+            ));
+        }
+        let mut state = self.state.lock().unwrap();
+        state
             .observations
             .retain(|_, old| old.provider != browser::PROVIDER);
+        state
+            .resources
+            .retain(|_, old| old.resource.provider != browser::PROVIDER);
         Ok(())
+    }
+
+    /// Forget the browser connection and every resource and observation it owned.
+    /// This does not close an externally owned browser process.
+    pub fn detach_browser(&self) {
+        let _gate = self.gate.lock().unwrap();
+        if let Some(browser) = &self.browser {
+            browser.attach(0);
+        }
+        let mut state = self.state.lock().unwrap();
+        state
+            .observations
+            .retain(|_, old| old.provider != browser::PROVIDER);
+        state
+            .resources
+            .retain(|_, old| old.resource.provider != browser::PROVIDER);
     }
 
     /// Point the browser provider at a browser this server launched on `port`:
     /// unlike [`Session::attach_browser`], its downloads are redirected to the
     /// session's directory and tracked.
     pub fn attach_launched_browser(&self, port: u16) -> Result<()> {
-        self.attach_browser(port)?;
-        if let Some(browser) = &self.browser {
-            browser.attach_launched(port);
+        let _gate = self.gate.lock().unwrap();
+        let _publication = self.browser_publication.lock().unwrap();
+        self.attach_browser_locked(port, true)
+    }
+
+    /// Publish endpoint and ownership together with their close cleanup.
+    /// Preparation must finish before this short critical section.
+    pub fn publish_launched_browser(
+        &self,
+        port: u16,
+        publish: impl FnOnce() -> Box<dyn FnOnce() + Send>,
+    ) -> Result<()> {
+        self.publish_browser_with_context(port, None, publish)
+    }
+
+    pub fn publish_browser_with_context(
+        &self,
+        port: u16,
+        context: Option<&Context>,
+        publish: impl FnOnce() -> Box<dyn FnOnce() + Send>,
+    ) -> Result<()> {
+        let _gate = self.gate.lock().unwrap();
+        let mut publication = self.browser_publication.lock().unwrap();
+        let _effect = context.map(|c| c.effect_gate.lock().unwrap());
+        if let Some(context) = context {
+            context.remaining()?;
+            context
+                .browser_publication
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |state| {
+                    matches!(state, 0 | 3).then_some(2)
+                })
+                .map_err(|_| error("CONTROL.CANCELLED", "browser publication cancelled"))?;
         }
+        self.attach_browser_locked(port, true)?;
+        publication.push(publish());
         Ok(())
     }
 
     /// Give a launched browser its own download setting back, e.g. before closing it.
     pub fn release_browser_downloads(&self) {
+        let _gate = self.gate.lock().unwrap();
         if let Some(browser) = &self.browser {
             browser.release_downloads();
         }
@@ -354,6 +596,7 @@ impl Session {
 
     /// What the attached browser downloaded into this session's directory. Read-only.
     pub fn browser_downloads(&self, timeout: Duration) -> Result<Value> {
+        let _gate = self.gate.lock().unwrap();
         if self.closed.load(Ordering::SeqCst) {
             return Err(error("CONTROL.SESSION_CLOSED", "session is closed"));
         }
@@ -455,6 +698,10 @@ impl Session {
         &self.id
     }
 
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::SeqCst)
+    }
+
     /// Share serialization with a compatibility facade over the same desktop.
     pub fn with_gate(mut self, gate: Arc<Mutex<()>>) -> Self {
         self.gate = gate;
@@ -506,9 +753,22 @@ impl Session {
     }
 
     pub fn close(&self) {
-        self.closed.store(true, Ordering::SeqCst);
+        {
+            let contexts = self.browser_contexts.lock().unwrap();
+            self.closed.store(true, Ordering::SeqCst);
+            for context in contexts.iter().filter_map(std::sync::Weak::upgrade) {
+                context.cancel_browser();
+            }
+        }
         for context in self.active.lock().unwrap().values() {
             context.cancel();
+        }
+        let mut publication = self.browser_publication.lock().unwrap();
+        for cleanup in publication.drain(..) {
+            cleanup();
+        }
+        if let Some(browser) = &self.browser {
+            browser.close();
         }
         // Do not wait on the backend gate: a close must cancel an in-flight request.
         self.state.lock().unwrap().observations.clear();
@@ -620,6 +880,18 @@ impl Session {
                 return Ok(json!({"cancellation_requested": self.cancel(request_id)}));
             }
             Operation::Close {} => {
+                if self
+                    .state
+                    .lock()
+                    .unwrap()
+                    .cancelled_requests
+                    .remove(&request.request_id)
+                {
+                    return Err(error(
+                        "CONTROL.CANCELLED",
+                        "close cancelled before admission",
+                    ));
+                }
                 drop(active);
                 self.close();
                 return Ok(json!({"closed": true}));
@@ -633,6 +905,9 @@ impl Session {
             .cancelled_requests
             .remove(&request.request_id);
         let context = Arc::new(Context {
+            effect_gate: Mutex::new(()),
+            browser_publication: AtomicU8::new(0),
+            browser_cancelled: Arc::new(AtomicBool::new(false)),
             phase: AtomicU8::new(if cancelled { 2 } else { 0 }),
             deadline: Instant::now() + Duration::from_millis(request.timeout_ms),
             mutating: request.mutating(),
@@ -664,9 +939,20 @@ impl Session {
 
     fn dispatch(&self, operation: &Operation, context: &Context) -> Result<Value> {
         match operation {
+            Operation::BrowserNetwork { resource_id, limit } => {
+                if *limit == 0 || *limit > 500 {
+                    return Err(error("CONTROL.INVALID_REQUEST", "limit must be in 1..500"));
+                }
+                let (backend, selector) = self.readable(resource_id)?;
+                backend.network(&selector, *limit, false, context.remaining()?)
+            }
+            Operation::WatchQr { resource_id, locator, expired, confirmed, previous } =>
+                self.watch_qr(resource_id, locator, expired.as_deref(), confirmed.as_deref(), previous.as_deref(), context),
             Operation::Capabilities {} => Ok(self.with_grants(
                 json!({"session_id": self.id, "protocol_version": PROTOCOL_VERSION,
                 "expires_in_ms": self.lifetime.saturating_sub(self.created.elapsed()).as_millis(),
+                "session_usable": !self.is_closed() && self.created.elapsed() < self.lifetime
+                    && self.state.lock().unwrap().requests.len() < self.max_requests,
                 "allow_input": self.policy.allow_input,"upload_dirs": self.policy.upload_roots,"cookie_values": self.policy.allow_cookie_values,"observation_retention":"until_next_observation_or_input_attempt","observation_ttl_ms":self.observation_ttl.as_millis(),"max_requests":self.max_requests,"input_lease":"exclusive_cooperating_session","input_lease_scope":"os_user","providers": self.backends.values().filter(|b| self.allowed_provider(b.name()))
                     .map(|b| json!({"provider": b.name(), "actions": b.capabilities(), "reads": b.reads()})).collect::<Vec<_>>(),
                 "unavailable": self.failures}),
@@ -713,10 +999,13 @@ impl Session {
                 }
                 validate_view(view)?;
                 let (observation_id, observation) =
-                    self.observe_resource(resource_id, *max_nodes, context)?;
+                    self.observe_resource_scoped(resource_id, *max_nodes, view.scope_id.as_deref(), context)?;
                 let backend = &self.backends[&observation.provider];
                 let (raw, nodes) = (observation.raw, observation.nodes);
                 let mut answer = json!({"observation_id": observation_id, "resource_id": resource_id, "node_count": nodes.len(), "truncated": raw["truncated"] == true, "metadata": raw.get("metadata").cloned().unwrap_or(Value::Null)});
+                if raw["scope_id"].is_string() {
+                    answer["scope"] = json!({"id":raw["scope_id"], "revision":raw["scope_revision"], "complete":raw["truncated"] != true});
+                }
                 match view.mode {
                     ViewMode::Nodes => answer["nodes"] = json!(nodes),
                     ViewMode::Outline | ViewMode::Overview | ViewMode::Text => {
@@ -783,9 +1072,13 @@ impl Session {
                 states.as_ref(),
                 *max_nodes,
                 *interval_ms,
+                None,
                 context,
             ),
-            Operation::Act { target, action } => {
+            Operation::Act { target, action, verify } => {
+                if verify.as_ref().is_some_and(|locator| locator.is_empty()) {
+                    return Err(error("CONTROL.INVALID_REQUEST", "verification requires a nonempty locator"));
+                }
                 if !self.policy.allow_input {
                     return Err(error(
                         "POLICY.DENIED",
@@ -889,6 +1182,14 @@ impl Session {
                     .observations
                     .retain(|_, old| old.provider != observation.provider);
                 let value = result?;
+                drop(_lease);
+                if let Some(locator) = verify {
+                    let verification = self.wait(&target.resource_id, locator, WaitCondition::Appears, None, observation.max_nodes, None, observation.scope.as_deref(), context);
+                    return Ok(match verification {
+                        Ok(evidence) => json!({"submitted": true, "verified": true, "verification": "verified", "evidence": evidence, "backend_result": value}),
+                        Err(failure) => json!({"submitted": true, "verified": false, "verification": if matches!(failure.code.as_str(), "CONTROL.WAIT_TIMEOUT" | "CONTROL.TIMEOUT") { "timeout_unconfirmed" } else { "unconfirmed" }, "diagnostics": self.verification_diagnostics(&target.resource_id), "verification_error": {"code": failure.code, "message": failure.message, "details": failure.details}, "backend_result": value}),
+                    });
+                }
                 context.remaining()?;
                 Ok(
                     json!({"submitted": true, "provider": observation.provider, "operation": action.name(), "backend_result": value, "requires_fresh_observation": true}),
@@ -896,8 +1197,10 @@ impl Session {
             }
             Operation::Capture { target } => {
                 let (observation, node) = self.observed_node(target)?;
-                let backend = &self.backends[&observation.provider];
-                let mut shot = backend.capture(&observation.raw, &node, context.remaining()?)?;
+                let backend = self.backends[&observation.provider].clone();
+                let timeout = context.remaining()?;
+                let raw = observation.raw.clone();
+                let mut shot = capture_cancellable(context, move || backend.capture(&raw, &node, timeout))?;
                 shot["digest"] = json!(digest_of(&shot));
                 shot["provider"] = json!(observation.provider);
                 Ok(shot)
@@ -1145,6 +1448,29 @@ impl Session {
         Ok((observation, node))
     }
 
+    fn verification_diagnostics(&self, resource: &str) -> Value {
+        let page = {
+            let state = self.state.lock().unwrap();
+            state.observations.values().find(|o| o.resource_id == resource).map(|o| {
+                let nodes: Vec<_> = o.nodes.iter().take(20).map(|n| json!({
+                    "role": n["role"].as_str().unwrap_or_default().chars().take(64).collect::<String>(),
+                    "name": n["name"].as_str().unwrap_or_default().chars().take(128).collect::<String>()
+                })).collect();
+                json!({"scope_id":o.scope,"nodes":nodes,"omitted":o.nodes.len().saturating_sub(20),"truncated":o.raw["truncated"]})
+            })
+        };
+        let network = self.readable(resource).and_then(|(backend, selector)| {
+            backend.network(&selector, 20, false, Duration::from_millis(200))
+        });
+        let network = match network {
+            Ok(log) => {
+                json!({"summary":log["summary"],"since":log["since"],"dropped":log["dropped"],"omitted_by_limit":log["omitted_by_limit"]})
+            }
+            Err(e) => json!({"unavailable":e.code}),
+        };
+        json!({"page":page,"network":network})
+    }
+
     /// Capture a listed resource and retain it as this provider's only
     /// current observation, with session targets on every node.
     fn observe_resource(
@@ -1153,6 +1479,22 @@ impl Session {
         max_nodes: usize,
         context: &Context,
     ) -> Result<(String, Observation)> {
+        self.observe_resource_scoped(resource_id, max_nodes, None, context)
+    }
+
+    fn observe_resource_scoped(
+        &self,
+        resource_id: &str,
+        max_nodes: usize,
+        scope: Option<&str>,
+        context: &Context,
+    ) -> Result<(String, Observation)> {
+        if scope.is_some_and(|id| id.is_empty() || id.len() > 256) {
+            return Err(error(
+                "CONTROL.INVALID_REQUEST",
+                "scope_id must contain 1..256 bytes",
+            ));
+        }
         if max_nodes == 0 || max_nodes > MAX_NODES {
             return Err(error(
                 "CONTROL.INVALID_REQUEST",
@@ -1178,7 +1520,12 @@ impl Session {
             .unwrap()
             .observations
             .retain(|_, old| old.provider != item.resource.provider);
-        let raw = backend.observe(&item.selector, max_nodes, context.remaining()?)?;
+        let raw = match scope {
+            Some(scope) => {
+                backend.observe_scope(&item.selector, scope, max_nodes, context.remaining()?)?
+            }
+            None => backend.observe(&item.selector, max_nodes, context.remaining()?)?,
+        };
         context.remaining()?;
         let observation_id = uuid::Uuid::new_v4().to_string();
         let mut nodes = raw["nodes"]
@@ -1206,6 +1553,8 @@ impl Session {
             .unwrap();
         }
         let observation = Observation {
+            scope: scope.map(str::to_owned),
+            max_nodes,
             provider: item.resource.provider.clone(),
             resource_id: resource_id.to_string(),
             raw,
@@ -1276,6 +1625,7 @@ impl Session {
         states: Option<&Value>,
         max_nodes: usize,
         interval_ms: Option<u64>,
+        scope: Option<&str>,
         context: &Context,
     ) -> Result<Value> {
         let invalid = |message: &str| Err(error("CONTROL.INVALID_REQUEST", message.to_string()));
@@ -1310,7 +1660,7 @@ impl Session {
         loop {
             polls += 1;
             let (observation_id, observation) =
-                match self.observe_resource(resource_id, max_nodes, context) {
+                match self.observe_resource_scoped(resource_id, max_nodes, scope, context) {
                     Ok(observed) => observed,
                     // The page was between documents: keep polling.
                     Err(e) if e.code == "BROWSER.CONTEXT_LOST" => {
@@ -1847,6 +2197,117 @@ mod admission_tests {
     use super::*;
 
     #[test]
+    fn close_waits_for_attachment_final_state_update() {
+        let mut session = Session::new(Vec::new(), Policy::default());
+        session.browser = Some(Arc::new(browser::BrowserBackend::new(0)));
+        let session = Arc::new(session);
+        let state = session.state.lock().unwrap();
+        let attaching = session.clone();
+        let worker = std::thread::spawn(move || attaching.attach_launched_browser(32123));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while session.browser_port() != Some(32123) {
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        let closing = session.clone();
+        let closer = std::thread::spawn(move || closing.close());
+        while !session.closed.load(Ordering::SeqCst) {
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        drop(state);
+        let _ = worker.join().unwrap();
+        closer.join().unwrap();
+        assert_eq!(session.browser_port(), None);
+        assert!(session.attach_launched_browser(32124).is_err());
+    }
+
+    #[test]
+    fn close_serializes_with_endpoint_and_owner_publication() {
+        let mut session = Session::new(Vec::new(), Policy::default());
+        session.browser = Some(Arc::new(browser::BrowserBackend::new(0)));
+        let session = Arc::new(session);
+        let owned = Arc::new(AtomicBool::new(false));
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let worker_session = session.clone();
+        let worker_owned = owned.clone();
+        let worker = std::thread::spawn(move || {
+            worker_session.publish_launched_browser(32123, || {
+                entered_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+                worker_owned.store(true, Ordering::SeqCst);
+                Box::new(move || {
+                    worker_owned.store(false, Ordering::SeqCst);
+                })
+            })
+        });
+        entered_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        let closing = session.clone();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let closer = std::thread::spawn(move || {
+            closing.close();
+            done_tx.send(()).unwrap();
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !session.closed.load(Ordering::SeqCst) {
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        assert!(
+            done_rx.try_recv().is_err(),
+            "close returned before candidate publication cleanup"
+        );
+        release_tx.send(()).unwrap();
+        worker.join().unwrap().unwrap();
+        done_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        closer.join().unwrap();
+        assert!(!owned.load(Ordering::SeqCst));
+        assert_eq!(session.browser_port(), None);
+        assert!(session
+            .publish_launched_browser(32124, || panic!("published after close"))
+            .is_err());
+    }
+
+    #[test]
+    fn browser_lifecycle_and_downloads_wait_for_inflight_dispatch() {
+        for operation in ["attach", "launch", "detach", "downloads"] {
+            let mut session = Session::new(Vec::new(), Policy::default());
+            session.browser = Some(Arc::new(browser::BrowserBackend::new(0)));
+            let session = Arc::new(session);
+            // Model an admitted enumeration paused before writing its results.
+            let gate = session.gate.lock().unwrap();
+            let (started_tx, started_rx) = std::sync::mpsc::channel();
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let running = session.clone();
+            let worker = std::thread::spawn(move || {
+                started_tx.send(()).unwrap();
+                match operation {
+                    "attach" => running.attach_browser(0).unwrap(),
+                    "launch" => running.attach_launched_browser(0).unwrap(),
+                    "detach" => running.detach_browser(),
+                    _ => {
+                        assert!(running
+                            .browser_downloads(Duration::from_millis(50))
+                            .is_err());
+                    }
+                }
+                done_tx.send(()).unwrap();
+            });
+            started_rx.recv().unwrap();
+            assert!(
+                done_rx.recv_timeout(Duration::from_millis(100)).is_err(),
+                "{operation} bypassed the in-flight query gate"
+            );
+            drop(gate);
+            done_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            worker.join().unwrap();
+            assert_eq!(session.browser_port(), None);
+            assert!(session.state.lock().unwrap().resources.is_empty());
+        }
+    }
+
+    #[test]
     fn new_tabs_open_only_web_addresses() {
         for url in ["http://127.0.0.1/", "https://example.com/a?b"] {
             assert!(validate_action(&Action::OpenTab { url: url.into() }).is_ok());
@@ -1885,5 +2346,118 @@ mod admission_tests {
         let response = worker.join().unwrap();
         assert_eq!(response.commit_state, CommitState::NotCommitted);
         assert_eq!(response.error.unwrap()["code"], "CONTROL.CANCELLED");
+    }
+}
+
+#[cfg(test)]
+mod capture_cancellation_tests {
+    use super::*;
+    #[test]
+    fn capture_barrier_cancellation_wins_before_backend_error() {
+        let context = Arc::new(Context::new(Duration::from_secs(2), false));
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let running = context.clone();
+        let worker = std::thread::spawn(move || {
+            capture_cancellable(&running, move || {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                Err(error("BROWSER.CDP_ERROR", "late capture error"))
+            })
+        });
+        entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let start = Instant::now();
+        context.cancel();
+        let result = worker.join().unwrap().unwrap_err();
+        assert_eq!(result.code, "CONTROL.CANCELLED");
+        assert!(start.elapsed() < Duration::from_millis(250));
+        release_tx.send(()).unwrap();
+    }
+    #[test]
+    fn capture_barrier_timeout_discards_late_image() {
+        let context = Context::new(Duration::from_millis(50), false);
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let start = Instant::now();
+        let result = capture_cancellable(&context, move || {
+            release_rx.recv().unwrap();
+            Ok(json!({"data":"late-image"}))
+        })
+        .unwrap_err();
+        assert_eq!(result.code, "CONTROL.TIMEOUT");
+        assert!(start.elapsed() < Duration::from_millis(250));
+        release_tx.send(()).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod browser_request_tests {
+    use super::*;
+    #[test]
+    fn queued_browser_request_cannot_commit_after_cancel_or_close() {
+        for close in [false, true] {
+            let session = Arc::new(Session::new(Vec::new(), Policy::default()));
+            let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let running = session.clone();
+            let worker = std::thread::spawn(move || {
+                running.browser_request("queued", |context| {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    running.browser_effect(context, || panic!("side effect after revocation"))
+                })
+            });
+            entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            if close {
+                session.close();
+            } else {
+                assert!(session.cancel("queued"));
+            }
+            release_tx.send(()).unwrap();
+            let failure = worker.join().unwrap().unwrap().unwrap_err();
+            assert_eq!(
+                failure.code,
+                if close {
+                    "CONTROL.SESSION_CLOSED"
+                } else {
+                    "CONTROL.CANCELLED"
+                }
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod browser_cancel_boundary_tests {
+    use super::*;
+    #[test]
+    fn cancellation_does_not_wait_for_effect_and_prevents_publication() {
+        let context = Arc::new(Context::new(Duration::from_secs(10), false));
+        let effect = context.effect_gate.lock().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let cancelling = context.clone();
+        let worker = std::thread::spawn(move || {
+            cancelling.cancel_browser();
+            tx.send(()).unwrap();
+        });
+        let result = rx.recv_timeout(Duration::from_secs(1));
+        drop(effect);
+        worker.join().unwrap();
+        result.expect("cancel must not wait for lifecycle effects");
+        assert!(context.remaining().is_err());
+        assert!(context
+            .browser_publication
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |state| matches!(
+                state,
+                0 | 3
+            )
+            .then_some(2))
+            .is_err());
+    }
+    #[test]
+    fn cancellation_after_publication_does_not_claim_to_undo_it() {
+        let context = Context::new(Duration::from_secs(10), false);
+        context.browser_publication.store(2, Ordering::SeqCst);
+        context.cancel_browser();
+        assert!(context.remaining().is_ok());
     }
 }

@@ -182,6 +182,7 @@ fn persistent_session_negotiates_targets_observes_finds_and_acts() {
     );
     assert!(h
         .call(Operation::Act {
+            verify: None,
             target,
             action: Action::click()
         })
@@ -199,6 +200,7 @@ fn client_cannot_elevate_server_grants_or_cross_session_targets() {
     assert_eq!(
         read_only
             .call(Operation::Act {
+                verify: None,
                 target: target.clone(),
                 action: Action::click()
             })
@@ -211,6 +213,7 @@ fn client_cannot_elevate_server_grants_or_cross_session_targets() {
     assert_eq!(
         other
             .call(Operation::Act {
+                verify: None,
                 target,
                 action: Action::click()
             })
@@ -226,6 +229,7 @@ fn cancellation_is_processed_during_an_in_flight_write() {
     let request = Request::new(
         None,
         Operation::Act {
+            verify: None,
             target,
             action: Action::click(),
         },
@@ -256,6 +260,7 @@ fn disconnect_during_input_is_unknown_and_never_retried() {
         client.request(&Request::new(
             None,
             Operation::Act {
+                verify: None,
                 target,
                 action: Action::click(),
             },
@@ -305,6 +310,7 @@ fn reconnect_never_replays_pending_input_or_accepts_old_targets() {
         client.request(&Request::new(
             None,
             Operation::Act {
+                verify: None,
                 target,
                 action: Action::click(),
             },
@@ -321,6 +327,7 @@ fn reconnect_never_replays_pending_input_or_accepts_old_targets() {
     let new = Harness::new(true, Duration::ZERO, false);
     assert_eq!(new.backend.writes.load(Ordering::SeqCst), 0);
     let rejected = new.call(Operation::Act {
+        verify: None,
         target: old_target,
         action: Action::click(),
     });
