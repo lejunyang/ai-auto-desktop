@@ -23,6 +23,14 @@ use std::time::{Duration, Instant};
 
 pub type Result<T> = std::result::Result<T, AutomationError>;
 
+/// Ambiguous matches across browser and native desktop providers.
+pub fn is_ambiguous(code: &str) -> bool {
+    matches!(
+        code,
+        "CONTROL.AMBIGUOUS" | "DRIVER.AMBIGUOUS_MATCH" | "DRIVER.AMBIGUOUS"
+    )
+}
+
 pub fn error(code: &str, message: impl Into<String>) -> AutomationError {
     AutomationError::new(code, message).with_effect("not_applied")
 }
@@ -1681,14 +1689,7 @@ impl Session {
                 context,
             ) {
                 Ok(found) => (Some(found), None),
-                Err(e)
-                    if matches!(
-                        e.code.as_str(),
-                        "CONTROL.AMBIGUOUS" | "DRIVER.AMBIGUOUS_MATCH"
-                    ) =>
-                {
-                    (None, Some(e))
-                }
+                Err(e) if is_ambiguous(&e.code) => (None, Some(e)),
                 Err(e) => return Err(e),
             };
             let present = outcome.as_ref().is_some_and(|f| f["found"] == true);

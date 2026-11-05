@@ -690,7 +690,11 @@ impl AtspiProvider {
         .to_string();
         let locator = parse_locator(args.get("locator"))?;
         let expected = resolve(record, &locator, deadline)?;
-        if expected["node_id"] != node_id || !record.handles.contains_key(&node_id) {
+        let expected_id = expected["node_id"].as_str().expect("normalized node id");
+        if !record.handles.contains_key(&node_id)
+            || record.handles.get(expected_id) != record.handles.get(&node_id)
+            || record.fingerprints.get(expected_id) != record.fingerprints.get(&node_id)
+        {
             return Err(stale("target does not match the snapshot locator result"));
         }
         let expected_fingerprint = record.fingerprints[&node_id].clone();
@@ -1143,24 +1147,39 @@ impl AtspiProvider {
                 }
             }
         }
-        let hit = hit.ok_or_else(|| {
+        let mut hit = hit.ok_or_else(|| {
             driver_error(
-                "DRIVER.ACTION_UNSUPPORTED",
+                "DRIVER.POINT_NOT_PROVEN",
                 "AT-SPI could not prove the target at its center point",
             )
         })?;
-        if allowed
-            .iter()
-            .filter_map(|id| record.handles.get(id))
-            .any(|native| native == &hit)
-        {
-            Ok(())
-        } else {
-            Err(driver_error(
-                "DRIVER.ACTION_UNSUPPORTED",
-                "center point did not hit the fresh target subtree",
-            ))
+        // AT-SPI may return an immediate child container rather than the
+        // deepest accessible. Follow the actual hit chain, never search other
+        // branches after an occluding node or an unsupported hit test.
+        let mut visited = BTreeSet::new();
+        for _ in 0..32 {
+            remaining(deadline, false)?;
+            if allowed
+                .iter()
+                .filter_map(|id| record.handles.get(id))
+                .any(|native| native == &hit)
+            {
+                return Ok(());
+            }
+            if !visited.insert((hit.bus_name.clone(), hit.object_path.clone())) {
+                break;
+            }
+            match self.backend.accessible_at_point(&hit, point, deadline) {
+                Ok(Some(next)) => hit = next,
+                Ok(None) => break,
+                Err(error) if error.code == "DRIVER.ACTION_UNSUPPORTED" => break,
+                Err(error) => return Err(error),
+            }
         }
+        Err(driver_error(
+            "DRIVER.POINT_NOT_PROVEN",
+            "center point did not hit the fresh target subtree",
+        ))
     }
 }
 
@@ -1558,6 +1577,16 @@ fn resolve(
     for node in record.public["nodes"].as_array().expect("normalized nodes") {
         remaining(deadline, false)?;
         if node_matches(node, locator) {
+            // Multiple tree paths can expose the same accessible. Collapse only
+            // identical native identities with identical identity fingerprints.
+            let id = node["node_id"].as_str().expect("normalized node id");
+            if candidates.iter().any(|candidate: &Value| {
+                let other = candidate["node_id"].as_str().expect("normalized node id");
+                record.handles.get(id) == record.handles.get(other)
+                    && record.fingerprints.get(id) == record.fingerprints.get(other)
+            }) {
+                continue;
+            }
             candidates.push(node.clone());
         }
     }
@@ -1950,6 +1979,12 @@ fn error_contracts(write: bool, locator: bool, capture: bool) -> Vec<Value> {
     if write || capture {
         values.extend([
             (
+                "DRIVER.POINT_NOT_PROVEN",
+                "中心点命中无法确认属于目标子树，未发送输入。",
+                false,
+                "not_applied",
+            ),
+            (
                 "DRIVER.ACTION_UNSUPPORTED",
                 "目标缺少所需 AT-SPI 接口。",
                 false,
@@ -2213,7 +2248,10 @@ mod tests {
         writes: AtomicUsize,
         changed: bool,
         duplicate: bool,
+        alias: bool,
+        replaced: bool,
         truncated: bool,
+        hit_chain: u8,
     }
 
     impl FakeBackend {
@@ -2237,7 +2275,7 @@ mod tests {
                 },
                 parent_index: None,
                 role: "push button".into(),
-                name: Some(if changed { "Changed" } else { "Save" }.into()),
+                name: Some("Save".into()),
                 description: Some("Save the document".into()),
                 value: None,
                 attributes: BTreeMap::from_iter([("automation-id".into(), "save".into())]),
@@ -2267,7 +2305,10 @@ mod tests {
                 provenance: Map::from_iter([
                     ("bus_name".into(), json!(":1.42")),
                     ("object_path".into(), json!(object_path)),
-                    ("accessible_id".into(), json!("save")),
+                    (
+                        "accessible_id".into(),
+                        json!(if changed { "replacement" } else { "save" }),
+                    ),
                     ("application_name".into(), json!("Fixture")),
                     ("toolkit_name".into(), json!("gtk")),
                     ("process_id".into(), json!(4242)),
@@ -2302,7 +2343,15 @@ mod tests {
             _deadline: Instant,
         ) -> Result<BackendSnapshot, AutomationError> {
             self.captures.fetch_add(1, Ordering::SeqCst);
-            let mut nodes = vec![self.node("/org/a11y/save")];
+            let path = if self.replaced && self.captures.load(Ordering::SeqCst) > 1 {
+                "/org/a11y/replacement"
+            } else {
+                "/org/a11y/save"
+            };
+            let mut nodes = vec![self.node(path)];
+            if self.alias {
+                nodes.push(self.node(path));
+            }
             if self.duplicate {
                 nodes.push(self.node("/org/a11y/save-2"));
             }
@@ -2439,7 +2488,20 @@ mod tests {
             _point: (i32, i32),
             _deadline: Instant,
         ) -> Result<Option<NativeRef>, AutomationError> {
-            Ok(Some(root.clone()))
+            match (self.hit_chain, root.object_path.as_str()) {
+                (0, _) => Ok(Some(root.clone())),
+                (4, _) => Ok(None),
+                (_, "/org/a11y/save") => Ok(Some(NativeRef {
+                    bus_name: root.bus_name.clone(),
+                    object_path: "/container".into(),
+                })),
+                (1, "/container") => Ok(Some(NativeRef {
+                    bus_name: root.bus_name.clone(),
+                    object_path: "/org/a11y/save".into(),
+                })),
+                (2, _) => Ok(Some(root.clone())),
+                _ => Ok(None),
+            }
         }
         fn capture_target(
             &self,
@@ -2535,6 +2597,56 @@ mod tests {
     }
 
     #[test]
+    fn native_aliases_and_identity_locators_preserve_action_guards() {
+        for (alias, duplicate, replaced, changed, node, expected_error) in [
+            (true, false, false, false, "n1", None),
+            (false, true, false, false, "n0", None),
+            (
+                true,
+                false,
+                true,
+                false,
+                "n1",
+                Some("DRIVER.STALE_SNAPSHOT"),
+            ),
+            (
+                true,
+                false,
+                false,
+                true,
+                "n1",
+                Some("DRIVER.STALE_SNAPSHOT"),
+            ),
+        ] {
+            let backend = Arc::new(FakeBackend {
+                alias,
+                duplicate,
+                replaced,
+                changed,
+                ..Default::default()
+            });
+            let provider = AtspiProvider::new(backend.clone()).unwrap();
+            let snapshot = take_snapshot(&provider);
+            let mut selection = locator();
+            if duplicate {
+                selection["bus_name"] = json!(":1.42");
+                selection["object_path"] = json!("/org/a11y/save");
+            }
+            let result = provider.invoke("desktop.linux_atspi.invoke@1", json!({
+                "target": {"snapshot_id": snapshot["snapshot_id"], "revision": snapshot["revision"], "node_id": node},
+                "locator": selection
+            }), Some(Duration::from_secs(2)));
+            if let Some(code) = expected_error {
+                assert_eq!(result.unwrap_err().code, code);
+                assert_eq!(backend.writes.load(Ordering::SeqCst), 0);
+            } else {
+                result.unwrap();
+                assert_eq!(backend.writes.load(Ordering::SeqCst), 1);
+            }
+        }
+    }
+
+    #[test]
     fn ambiguous_and_truncated_snapshots_fail_closed() {
         let provider = AtspiProvider::new(Arc::new(FakeBackend {
             duplicate: true,
@@ -2576,6 +2688,31 @@ mod tests {
         let error = provider.invoke("desktop.linux_atspi.invoke@1", json!({"target": {"snapshot_id": snapshot["snapshot_id"], "revision": snapshot["revision"], "node_id": "n0"}, "locator": locator()}), Some(Duration::from_secs(2))).unwrap_err();
         assert_eq!(error.code, "DRIVER.STALE_SNAPSHOT");
         assert_eq!(backend.writes.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn pointer_hit_descends_containers_but_rejects_stuck_or_missing_hits() {
+        for hit_chain in [1, 2, 3, 4] {
+            let backend = Arc::new(FakeBackend {
+                hit_chain,
+                ..Default::default()
+            });
+            let provider = AtspiProvider::new(backend.clone()).unwrap();
+            let snapshot = take_snapshot(&provider);
+            let result = provider.invoke("desktop.linux_atspi.pointer_click@1", json!({
+                "target":{"snapshot_id":snapshot["snapshot_id"],"revision":snapshot["revision"],"node_id":"n0"},
+                "locator":locator()
+            }), Some(Duration::from_secs(2)));
+            if hit_chain == 1 {
+                result.unwrap();
+                assert_eq!(backend.writes.load(Ordering::SeqCst), 1);
+            } else {
+                let error = result.unwrap_err();
+                assert_eq!(error.code, "DRIVER.POINT_NOT_PROVEN");
+                assert_eq!(error.effect, "not_applied");
+                assert_eq!(backend.writes.load(Ordering::SeqCst), 0);
+            }
+        }
     }
 
     #[test]
