@@ -855,16 +855,10 @@ fn record_limit(seconds: Option<u64>, until_stdin_closes: bool) -> u64 {
 /// Watch a window for a while and report, or save, what was done in it.
 pub fn record(args: &RecordArgs) -> (Value, u8) {
     use aad_control::{recording::Recording, steps};
-    use aad_runtime::recordings;
     let desk = Desk::open(false);
     let outcome = (|| {
         if let Some(name) = &args.save {
-            let existing = recordings::workflow_path(name).map_err(|e| usage(e.message))?;
-            if existing.exists() && !args.overwrite {
-                return Err(usage(format!(
-                    "a recording called {name:?} exists; pass --overwrite to replace it"
-                )));
-            }
+            may_save(name, args.overwrite).map_err(usage)?;
         }
         let resource_id = desk.resolve(&args.resource)?;
         let listed = desk.targets()?;
@@ -923,36 +917,49 @@ pub fn record(args: &RecordArgs) -> (Value, u8) {
             "dropped": dropped,
         });
         if let Some(name) = &args.save {
-            answer["saved"] = if recorded.is_empty() {
-                json!({"failed": "nothing replayable was recorded"})
-            } else {
-                match steps::workflow(name, &recorded) {
-                    Err(error) => json!({"failed": error.message}),
-                    Ok(workflow) => {
-                        let written =
-                            recordings::save_recording(name, &steps::recording(name, &recorded))
-                                .and_then(|recording| {
-                                    recordings::save_workflow(name, &workflow)
-                                        .map(|w| (recording, w))
-                                });
-                        match written {
-                            Ok((recording, workflow)) => json!({
-                                "recording_path": recording.display().to_string(),
-                                "workflow_path": workflow.display().to_string(),
-                                "run": format!(
-                                    "aad run {} --permission desktop.input --permission desktop.observe",
-                                    workflow.display()
-                                ),
-                            }),
-                            Err(error) => json!({"failed": error.message}),
-                        }
-                    }
-                }
-            };
+            answer["saved"] = save_steps(name, &recorded);
         }
         Ok(answer)
     })();
     finish(outcome)
+}
+
+/// Refuse to replace a saved recording unless asked to.
+pub fn may_save(name: &str, overwrite: bool) -> Result<(), String> {
+    let existing = aad_runtime::recordings::workflow_path(name).map_err(|e| e.message)?;
+    if existing.exists() && !overwrite {
+        return Err(format!(
+            "a recording called {name:?} exists; pass --overwrite to replace it"
+        ));
+    }
+    Ok(())
+}
+
+/// Save recorded steps as a named recording and the workflow that replays
+/// them, answering where they went or why they were not saved.
+pub fn save_steps(name: &str, recorded: &[aad_control::steps::Step]) -> Value {
+    use aad_control::steps;
+    use aad_runtime::recordings;
+    if recorded.is_empty() {
+        return json!({"failed": "nothing replayable was recorded"});
+    }
+    let workflow = match steps::workflow(name, recorded) {
+        Ok(workflow) => workflow,
+        Err(error) => return json!({"failed": error.message}),
+    };
+    let written = recordings::save_recording(name, &steps::recording(name, recorded))
+        .and_then(|recording| recordings::save_workflow(name, &workflow).map(|w| (recording, w)));
+    match written {
+        Ok((recording, workflow)) => json!({
+            "recording_path": recording.display().to_string(),
+            "workflow_path": workflow.display().to_string(),
+            "run": format!(
+                "aad run {} --permission desktop.input --permission desktop.observe",
+                workflow.display()
+            ),
+        }),
+        Err(error) => json!({"failed": error.message}),
+    }
 }
 
 #[cfg(test)]

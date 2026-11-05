@@ -22,7 +22,7 @@ GUI 也走同一个会话，三个平台都能查看界面、搭建、录制和�
 产出同一种平台无关的步骤；`aad watch` 仍只在 Windows 上。
 录制、回放和事件观察的限制见[控制能力审视](docs/research/control-audit-2026-10-17.md)。
 
-浏览器任务观测使用 `aad browser-record`：记录操作、关键元素变化、网络请求和截图，生成给 AI 编写 skill 的步骤说明。`aad browser-record start --browser edge --url 'https://example.com' --out ./recording` 自动启动并录制，可用 `--profile-dir` 复用工作 profile，或用 `--existing-profile [ID]` 选择日常已有 profile（只有一个时无需填 ID）。占用时默认提示，显式 `--kill-browser` 才结束占用浏览器并启动。**网络默认保留原值，`--redact-network` 才开启脱敏**。详见[浏览器任务录制](docs/browser-recording.md)。
+浏览器任务观测使用 `aad browser-record`：记录操作、关键元素变化、网络请求和截图，生成给 AI 编写 skill 的步骤说明。`aad browser-record start --browser edge --url 'https://example.com' --out ./recording` 自动启动并录制，可用 `--profile-dir` 复用工作 profile，或用 `--existing-profile [ID]` 选择日常已有 profile（只有一个时无需填 ID）。占用时默认提示，显式 `--kill-browser` 才结束占用浏览器并启动。**网络默认保留原值，`--redact-network` 才开启脱敏**。录完可以用 `aad browser-record steps --out ./recording --save 名字` 转成可回放的步骤，再 `aad run 名字`。详见[浏览器任务录制](docs/browser-recording.md)。
 
 ## 安全模型：先观察，才能操作
 
