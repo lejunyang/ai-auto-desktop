@@ -596,17 +596,29 @@ input attempt replaced this one. Call control_observe again and use a target fro
         // usually already share both -- five Edit buttons in a table have the
         // same role and no automation_id. Ordered by how well each survives the
         // interface changing.
-        "CONTROL.AMBIGUOUS" | "DRIVER.AMBIGUOUS_MATCH" => {
+        "DRIVER.AMBIGUOUS_MATCH" => {
             "The locator matched several elements, listed in details.candidates. Narrow \
 it with `within` to name the container the wanted one sits in -- a row labelled with its \
 own text stays correct after the list reorders -- or with `near` to place it against a \
 neighbouring label. Use `nth` only when nothing distinguishes them but position, or pick \
 the node_id of the right candidate."
         }
+        // Browser and AX share CONTROL.AMBIGUOUS. With no provider context,
+        // the portable locator fields are the recovery that works for both.
+        code if aad_control::is_ambiguous(code) => {
+            "The locator matched several elements, listed in details.candidates. Use exact \
+role/name fields to distinguish them, or pass the wanted candidate's node_id in the locator. \
+Use node_id only with the observation that supplied the candidates."
+        }
         "CONTROL.NOT_FOUND" | "DRIVER.NOT_FOUND" => {
             "No element matched. Read an outline with control_observe to see what is \
 present, or observe again if it may still be appearing. To ask whether something is \
 gone, pass expect: optional."
+        }
+        "DRIVER.POINT_NOT_PROVEN" => {
+            "The center-point hit could not be confirmed inside the target; no input was sent. \
+Call control_observe again and select a specific leaf node, or scroll and retry. \
+Use a keyboard action only if the target's capabilities offer it."
         }
         "CONTROL.ACTION_UNSUPPORTED" | "DRIVER.ACTION_UNSUPPORTED" => {
             "This node does not offer that action; its `capabilities` in the observation \
@@ -1009,11 +1021,40 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("control_observe"));
-        let ambiguous = payload(response("DRIVER.AMBIGUOUS_MATCH"));
-        let hint = ambiguous["error"]["hint"].as_str().unwrap();
-        for way in ["within", "near", "nth", "candidates"] {
+        for code in [
+            "CONTROL.AMBIGUOUS",
+            "DRIVER.AMBIGUOUS_MATCH",
+            "DRIVER.AMBIGUOUS",
+        ] {
+            let ambiguous = payload(response(code));
+            let hint = ambiguous["error"]["hint"].as_str().unwrap();
+            for way in ["node_id", "candidates"] {
+                assert!(hint.contains(way), "{code}: {way}");
+            }
+            if code == "DRIVER.AMBIGUOUS_MATCH" {
+                for way in ["within", "near", "nth"] {
+                    assert!(hint.contains(way), "{code}: {way}");
+                }
+            } else {
+                assert!(hint.contains("role/name"), "{code}");
+                for unsupported in ["within", "near", "nth"] {
+                    assert!(!hint.contains(unsupported), "{code}: {unsupported}");
+                }
+            }
+        }
+        let point = payload(response("DRIVER.POINT_NOT_PROVEN"));
+        let hint = point["error"]["hint"].as_str().unwrap();
+        for way in [
+            "no input was sent",
+            "control_observe",
+            "leaf",
+            "scroll",
+            "keyboard",
+        ] {
             assert!(hint.contains(way), "{way}");
         }
+        assert_eq!(point["effect"], "not_applied");
+        assert_eq!(point["commit_state"], "not_committed");
         assert!(payload(response("CONTROL.SOMETHING_ELSE"))["error"]
             .get("hint")
             .is_none());
