@@ -30,9 +30,17 @@
   // Containment across shadow boundaries.
   const inside = (el,hit) => {for(let n=hit;n;n=n.parentNode||n.host){if(n===el)return true;}return false;};
   const scrollable = el => el===document.body || ((el.scrollHeight>el.clientHeight+1 || el.scrollWidth>el.clientWidth+1) && /(auto|scroll|overlay)/.test(getComputedStyle(el).overflow+getComputedStyle(el).overflowY+getComputedStyle(el).overflowX));
+  // The cursor is inherited, so it marks the element where it starts and the
+  // items someone picks inside it, not every icon and label within them.
+  const PICKED_ROLES = ['listitem','option','menuitem','menuitemcheckbox','menuitemradio','treeitem','row','gridcell','tab'];
+  const cursorMarks = (el, cursors) => {
+    if (!cursors.test(getComputedStyle(el).cursor)) return false;
+    const parent = el.parentElement || (el.parentNode && el.parentNode.host);
+    return !parent || !cursors.test(getComputedStyle(parent).cursor) || PICKED_ROLES.includes(roleOf(el));
+  };
   // What a person could pick up: HTML5 draggables, items of lists and grids,
   // and whatever shows a grab cursor.
-  const draggable = el => el!==document.body && (el.draggable || ['listitem','option','row','treeitem'].includes(roleOf(el)) || /^(grab|grabbing|move)$/.test(getComputedStyle(el).cursor));
+  const draggable = el => el!==document.body && (el.draggable || ['listitem','option','row','treeitem'].includes(roleOf(el)) || cursorMarks(el, /^(grab|grabbing|move)$/));
   // focus() exists on all HTMLElements, including divs that cannot take focus.
   // Explicit negative tabindex still permits programmatic focus.
   const focusable = el => typeof el.focus==='function' && (el.tabIndex>=0 || el.hasAttribute('tabindex') || el.isContentEditable || activeElement()===el);
@@ -44,7 +52,7 @@
     // Delegated listeners (including React) are invisible in our isolated world.
     // The rendered pointer affordance also identifies their clickable elements;
     // check() rechecks this capability and the observed identity before input.
-    if ((['BUTTON','A','INPUT','SELECT'].includes(el.tagName) || el.onclick || roleOf(el)==='button' || checkable(el) || getComputedStyle(el).cursor==='pointer') && typeof el.click==='function') result.push('click','hover');
+    if ((['BUTTON','A','INPUT','SELECT'].includes(el.tagName) || el.onclick || roleOf(el)==='button' || checkable(el) || cursorMarks(el, /^pointer$/)) && typeof el.click==='function') result.push('click','hover');
     if (editable(el)) result.push('fill','type_text');
     if (el.tagName==='SELECT' && !el.multiple) result.push('select');
     if (checkable(el)) result.push('check');

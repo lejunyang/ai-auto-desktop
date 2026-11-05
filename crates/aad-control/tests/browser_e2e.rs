@@ -23,6 +23,7 @@ const PAGE: &str = r#"<!doctype html><html><body>
 <output id="status" aria-label="Status">ready</output>
 <div id="delegated" aria-label="Delegated login" style="cursor:pointer"><img alt="Login icon" src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='20' height='20'%3E%3C/svg%3E"></div>
 <div aria-label="Plain container">Plain</div><div tabindex="-1" aria-label="Focusable container">Focusable</div>
+<ul aria-label="Pointer menu" style="cursor:pointer"><li aria-label="Menu item">Item</li></ul>
 <script>document.addEventListener('click',event=>{if(event.target.closest('#delegated'))document.getElementById('status').value='delegated:'+event.isTrusted;});</script>
 <input id="protected" aria-label="Protected" type="password" value="redacted-fixture">
 <button aria-label="Duplicate">a</button><button aria-label="Duplicate">b</button>
@@ -485,6 +486,10 @@ fn delegated_icons_click_without_advertising_unusable_keyboard_input() {
         assert!(!actions(&observed, name).contains(&"key".to_string()));
     }
     assert!(actions(&observed, "Delegated login").contains(&"click".to_string()));
+    // The cursor is inherited: the icon inside shows it too, but the click
+    // belongs to its container. Items picked from a pointer list keep it.
+    assert!(!actions(&observed, "Login icon").contains(&"click".to_string()));
+    assert!(actions(&observed, "Menu item").contains(&"click".to_string()));
     for name in ["Plain container", "Delegated login"] {
         let refused = act_on(&session, &main, "generic", name, keys(&["Enter"]));
         assert_eq!(refused.commit_state, CommitState::NotCommitted);
