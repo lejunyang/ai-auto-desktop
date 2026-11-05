@@ -411,7 +411,8 @@ aad assist --desktop --window 0x3077a     # 只分享一个窗口（句柄，或
 
 启动后在 stdout 打印一行 JSON：`url`（自带的查看页，可选）、`websocket`、`token`、`codecs`（提供的编码）
 和 `video`（找到的 ffmpeg 与每种视频编码选中的编码器）。只监听本机回环地址，每个连接都要带 token。
-主要产物是 WebSocket 上的帧流，由 omem 这类宿主自己渲染：
+自带的查看页在自己所在的路径下连 `ws`（https 下用 wss），宿主可以把页面和 WebSocket 一起放在自己的路径前缀下转发
+（例如 `/remote/<会话>/?token=…` 与 `/remote/<会话>/ws?token=…`）。主要产物是 WebSocket 上的帧流，由 omem 这类宿主自己渲染：
 
 - 画面是二进制消息，一条一帧：24 字节大端头（版本、编码、标志位 bit0 = 关键帧 / bit1 = 后面带变化区域、
   宽、高、头长度、从开始算起的毫秒时间戳），之后是负载。读的一方按“头长度”跳过头，以后加字段不影响旧的读法；
