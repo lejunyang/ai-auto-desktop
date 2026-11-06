@@ -3,11 +3,12 @@
 更新：2026-11-07。用户当前只提供 Linux/KDE/X11 真机；其他平台必须保留 **[待真机验收]**。
 实现存在、目标 cfg 编译通过、隔离 fixture 通过、真实应用流程通过是不同证据，不互相替代。
 完整变更及未完成工作见 [能力补齐计划](../plan/capability-completion-2026-11-07.md)。
+Electron 的两条恢复路径见 [规范动作与窗口 surface 验证](../research/electron-atspi-canonical-actions-2026-11-07.md)；截图的 scope 边界见 [完整窗口保护说明](../research/scoped-capture-window-protection.md)。
 
 | 目标环境 | 当前证据 | 仍需验收 |
 | --- | --- | --- |
 | 本机 KDE/X11、Qt Widgets/QML | KWrite 中文编辑保存并磁盘回读；系统设置搜索及分类导航；Dolphin 多选/框选、恢复 F2 编辑框并中文重命名后磁盘回读；Qt 密码替换/清空、键鼠长按与拖拽起点停留的独立事件计时；Fcitx5 微软双拼显式物理键组合、候选截图、空格选词与 Qt/AT-SPI 提交回读；同 PID 双窗口拒绝错误焦点；同 surface 路径逐点实际轨迹、窄 scope 外 sibling overlay 和取消后的释放；双独立 Qt 进程跨资源实际 MIME 数据传递、目标可见结果及取消/移动/悬停遮挡拒绝；原生 `control_cancel` 后键鼠实际释放及下一次调用恢复；截图与窗口动作 | 其他 IME、翻页和复杂组合；混合 DPI 多屏；跨应用完整任务；更多第三方应用多窗口验收；一般同步 D-Bus 调用只能在调用前后响应取消，路径专用只读 worker 与 helper 释放独立 |
-| 本机 Electron | Code/Codex 可恢复局部完整观察、find、scope token 刷新；独立 VS Code profile 经原生 focus/Ctrl+A/中文 paste/Ctrl+S 后，DOM、磁盘与截图回读通过 | 原生指针命中仍有拒绝；其他 Electron 应用、任意延迟剪贴板客户端及复杂 IME 不能从这一编辑流程外推 |
+| 本机 Electron | Code/Codex 可恢复局部完整观察、find、scope token 刷新；独立 VS Code profile 经原生 focus/Ctrl+A/中文 paste/Ctrl+S 后，DOM、磁盘与截图回读通过；`039352f` 规范 press 实际关闭 Code Welcome；显式完整窗口 scope 的公开截图→目视→fresh frame 比例点击也实际关闭 Welcome，独立 CDP 与 PNG 回读一致 | 精确 Close 指针目标仍可能返回 POINT_NOT_PROVEN，不能把语义 invoke 或窗口 surface 成功称为该命中修复，也不能自动扩大 scope；其他 Electron 应用、任意延迟剪贴板客户端及复杂 IME 需独立验收 |
 | Chromium | 真实独立浏览器回归 34/34，覆盖 DOM、frames、scope、Canvas/closed-shadow 折线路径及内部字段保护、修饰键、敏感输入与按实例输入租约；有界面页面快捷键隔离；有界按住及异常释放；本地文件/Settings 授权与执行中祖先 URL 复核 | HTML5 自定义路径和跨资源拖拽未支持；closed shadow 内部语义节点未公开；其他内部页面逐项验收；非 Chromium 不能套用这些结论 |
 | 本机 Firefox 159.0.1 headless / BiDi | 公开 CLI 25 组检查：DOM 中文 fill、真实全选/按键/点击/滚轮、scope、PNG 截图、过期/遮挡拒绝、light/closed 密码 reveal 后持续保护、移除后截图恢复；key/click 长按实际时长、失焦/遮挡/取消释放及下一次输入；导航/刷新/标签页独立 token/visibility 与部分效果拒绝；连续同源历史与长 URL、跨域历史拒绝；独立协议/session 生命周期检查 | 子 frame 只读；双击、指针修饰键、跨域/不透明历史、drag、secret/upload/dialog 等 **[待实现]**。有界面及 Windows/macOS Firefox、复杂 IME **[待真机验收]**；当前全部输入占桌面租约，不能当作 Chromium 等价覆盖 |
 | Windows | UIA、SendInput、修饰键与专用保密输入有实现；目标 Windows cfg check/clippy 通过 | **[待真机验收]** Windows 交互桌面，Win32/WPF/Chromium，各种 DPI 与多屏，中文 IME，取消或超时后的键鼠释放，密码字段实际替换/清空 |
@@ -85,6 +86,11 @@ pwsh -File tests/linux/verify-dolphin-rename.ps1 `
 # 真实 Code 使用新 profile 和临时文件；Node 的 CDP 连接只作独立回读。
 pwsh -File tests/linux/verify-x11-paste-sequence.ps1
 pwsh -File tests/linux/verify-code-paste.ps1 `
+  -Aad target/debug/aad `
+  -InputHelper /absolute/path/to/x11_xtest_helper
+
+# Code 的空本地化标签不阻止规范 press；Qt Press 同时做回归。
+pwsh -File tests/linux/verify-canonical-invoke.ps1 `
   -Aad target/debug/aad `
   -InputHelper /absolute/path/to/x11_xtest_helper
 
