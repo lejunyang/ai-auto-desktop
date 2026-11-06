@@ -395,13 +395,13 @@ macOS 一列全部需要 macOS 真机（辅助功能 + 屏幕录制权限）验�
 | --- | --- | --- |
 | `nodes`（协议默认） | 全部节点 | 需要原始树的程序 |
 | `outline`（MCP 默认） | 可操作或有名字、不在屏幕外的节点，按 `limit`（默认 80，≤500）与 `max_characters`（默认 20000）截断；回报 `matched`、`shown`、`stopped_by` | AI 阅读 |
-| `overview` | 区域及其大小，不列内容 | 大窗口先看结构；Windows 窗口与浏览器页面计算区域，其他平台返回 `CONTROL.VIEW_UNSUPPORTED` |
-| `text` | 只读：页面或一个区域的可见文字（`innerText`，按 `max_characters` 截断并报 `characters`、`text_truncated`），表格按行/单元格列出 | 浏览器页面读正文；其他 provider 返回 `CONTROL.VIEW_UNSUPPORTED` |
+| `overview` | 区域及其大小，不列内容 | 大窗口先看结构；Windows 窗口与 Chromium/CDP 页面计算区域，其他 provider 返回 `CONTROL.VIEW_UNSUPPORTED` |
+| `text` | 只读：页面或一个区域的可见文字（`innerText`，按 `max_characters` 截断并报 `characters`、`text_truncated`），表格按行/单元格列出 | Chromium/CDP 页面读正文；其他 provider 返回 `CONTROL.VIEW_UNSUPPORTED` |
 
 `view.region` 用于 outline 和 text，取 overview 报出的区域名，与定位器 `within` 用的名字一致；名字不存在时返回 `CONTROL.NOT_FOUND` 并在 `details.regions` 列出现有区域。
-浏览器的区域是 landmark：header/nav/main/aside/footer/form/dialog、有名字的 section 和 ARIA landmark role，以可访问名命名，没有名字用 role，重名加序号；不在任何 landmark 里的节点归入 `(loose in the page)`。浏览器节点带 `parent` 与 `region`，landmark 节点的 `landmark` 就是区域名。
+Chromium/CDP 的区域是 landmark：header/nav/main/aside/footer/form/dialog、有名字的 section 和 ARIA landmark role，以可访问名命名，没有名字用 role，重名加序号；不在任何 landmark 里的节点归入 `(loose in the page)`。节点带 `parent` 与 `region`，landmark 节点的 `landmark` 就是区域名。
 
-浏览器的 role/name 取自浏览器的可访问性树（每个元素一次 `Accessibility.getPartialAXTree`，与 `DOM.describeNode` 一起流水线发送，只采用 backend id 对得上的节点）；被忽略、内部 role（StaticText、LabelText 等）或空名字时保留启发式结果，body 始终是 `document`。开销记在 `metadata.accessibility`：实测 67 个节点 8 ms，569 个节点约 60–80 ms（整次观察 130–150 ms；顺序请求时为 321 ms）；超过 2000 个节点保留启发式。
+Chromium/CDP 的 role/name 取自浏览器的可访问性树（每个元素一次 `Accessibility.getPartialAXTree`，与 `DOM.describeNode` 一起流水线发送，只采用 backend id 对得上的节点）；被忽略、内部 role（StaticText、LabelText 等）或空名字时保留启发式结果，body 始终是 `document`。开销记在 `metadata.accessibility`：实测 67 个节点 8 ms，569 个节点约 60–80 ms（整次观察 130–150 ms；顺序请求时为 321 ms）；超过 2000 个节点保留启发式。Firefox BiDi 当前使用 DOM 语义，不请求 Chromium AX 树。
 Windows 的 outline 和 overview 直接复用本次观察的 driver 快照，不会另拍一张。
 
 `find` 的定位器：`role`、`name`、`node_id` 在所有 provider 上精确匹配；`value`、`automation_id`、
@@ -439,7 +439,7 @@ aad mcp --allow-input --allow-upload-dir D:\to-upload  # 浏览器 upload 只能
 会话总带一个浏览器 provider，没连接时没有页面；`Session::attach_browser(port)` 之后换成那个浏览器
 （旧的浏览器观察作废）。MCP 的 `browser_open` 用 `aad_cdp::launch` 启动浏览器后就这样接上，
 `browser_record_*` 复用 `aad_cdp::recording` 写到存储目录的 `browser/<时间>-<id>/`。
-`Capture { target }` 是只读操作：浏览器把元素滚进视口后用 `Page.captureScreenshot` 按元素框裁剪
+`Capture { target }` 是只读操作：Chromium/CDP 把元素滚进视口后用 `Page.captureScreenshot` 按元素框裁剪
 （最大 4096×8192，超出时 `clipped: true`），会话加上 PNG 的 sha256 作为 `digest`。只支持主框架；
 桌面窗口见上文（Windows、Linux、macOS）；不提供截图的 provider 返回 `CONTROL.ACTION_UNSUPPORTED`。
 
@@ -586,17 +586,20 @@ activate 后 Shift+F9 以 F9 加 Shift 到达 fixture 窗口，Shift 随后松�
 [待验证] `desktop_launch` 在 Linux/macOS：会话层代码可移植（`launch.rs` 已为 linux-gnu 与 apple-darwin 目标做类型检查），
 按 `metadata.process_id` 匹配新的 AT-SPI 应用 / AX 应用，但未在这两个平台运行；Windows 11 记事本这类把工作交给另一进程的启动器
 只按映像名匹配新窗口，未用真实应用验证。
-[待验证] 本云容器不能启动本机 Chromium 沙箱，浏览器实际效果由 GitHub Linux CI 验证。
-[待验证] Linux 上新的 CLI 段、双击和 Ctrl+A 只在 CI 的 Xvfb 环境里跑，本机只编译了 helper 并跑了单元测试；
-右键、滚轮、悬停、拖拽在 Linux 上还没有观察效果的 fixture。
+2026-11-07 本机独立 Chromium fixture 已通过 34 项真实回归，含 OOPIF 与浏览器拖拽；有界面页面快捷键另有 18 组验收。
+Firefox BiDi 的公开 CLI 已通过 25 组检查，支持范围见上文，不能当作 Chromium 等价覆盖。
+本机 KDE/X11 已验证 Qt 的手势、取消释放、跨进程数据拖放，以及 Dolphin 中文重命名、KWrite 和 VS Code 中文编辑保存的独立回读。
+Qt fixture 不代表任意应用或文件管理器拖文件已通过；其他桌面、混合 DPI 多屏及复杂 IME 仍需逐项验证。
+当前证据与剩余范围见[平台能力矩阵](testing/platform-capability-matrix.md)，不将本机运行替代 CI 沙箱环境验收。
 [待验证] macOS 的 pointer_gesture、drag、key_chord：Swift 代码没有在本机编译过，Rust 侧只跑了单元测试。
 在 Mac 上依次验证：`plugins/macos_ax/build.sh` 能编译签名；打开“文本编辑”，`aad apps` 取得它的 resource id 后，
 `aad do key <id> --role AXTextArea --keys cmd,a`、`aad do type-text ... --text x` 替换全文；
 `aad do click <id> --role AXTextArea --button right` 弹出菜单；`aad do scroll <id> --role AXTextArea --direction down`
 在长文档里滚动；在“访达”列表里 `aad do drag` 把文件拖进文件夹。
-Windows/macOS 的新适配路由在 CI 以 mock 编译/测试；Windows 的输入桌面、macOS TCC 和跨机器 SSH
-未在真实设备验证。Wayland 原生输入、完整 OOPIF、浏览器拖拽、结果缓存、
-自动重放与统一 Android wire adapter 均不在本次范围。录制/回放及事件观察保持已有实现，不提升其可靠性声明。
+本轮新增 Windows/macOS 手势、保密输入与取消释放通过目标 cfg 或宿主逻辑检查，仍需相应交互桌面与 macOS TCC 真机验收；
+上面的既有 Windows 验收不能替代本轮新增行为的效果检查。Wayland 目前只有库层 portal 授权及会话绑定，尚无 CLI/MCP 输入入口，
+PipeWire/libei 消费、窗口身份与命中证明仍待实现。结果缓存、自动重放与统一 Android wire adapter 不在本轮交付范围。
+录制/回放及事件观察保持已有实现，不提升其可靠性声明。
 
 ### CLI 浏览器诊断
 
