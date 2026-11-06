@@ -29,6 +29,7 @@
 | 输入租约 | 保留共享前台互斥，独立 headless 不受无关桌面会话阻断；占用可诊断、可正常释放 | `2fe2395`、`562dcf5`、`6966e4c` 已提交。Chromium 可信 headless 按 browser UUID 隔离，同实例仍互斥，未知/有界面实例仍占桌面；Chromium 19 项及保存工作流在桌面租约被占用时的实际执行通过。Firefox 首版输入保守占桌面，独立 headless 租约待实现 |
 | macOS 拖拽 | 两端使用同一 fresh snapshot 复核；跨元素实际拖动验证 | 修复已提交 `8f92886`，25 项宿主逻辑测试及 clippy 通过；**[待验证]** macOS 真机 AX/TCC 与实际拖拽效果 |
 | 跨资源拖拽准入 | 保留两个资源的有效观察，分别检查授权、范围与能力，获取两端输入租约；后端逐端 fresh 后执行 | `c343f69` 提供内部 opt-in/hook，保留每资源最新一份、每 provider 最多 16 份且受原 TTL 限制，输入尝试后整组失效。新增 9 项 fake 测试及 Session/views/native adapters 共 45/45 通过。`0b2ea22` 补充显式声明 `drag_between` 的原生 provider 接线，两端 snapshot/revision/locator 分别传递，9 项 adapter 测试及 clippy 通过。Linux 后端 `5dde3ad` 已启用，保留每已解析应用最新观察（16 份/300 秒），每阶段双端 fresh、串行调用门禁与整组失效。双进程 Qt 精确 MIME 传递、可见结果及取消/移动/悬停覆盖 4/4；私有 Xvfb 15/15（分发测试 `c4af0d4`）。仅内部直线，最大轴距离 4096 像素，外部窗口/未知装饰保守拒绝；Windows/macOS/browser 未启用 |
+| Qt/X11 坐标校准 | 每窗口逻辑/物理坐标绑定，准确身份与全应用唯一性，不靠全局缩放或标题模糊匹配；真实应用回归 | `597656c`、测试 `4c3e955` 已提交。Qt 1/1.5/2 倍应用缩放下真实点击、F2 和 PNG；歧义及窄 scope 拒绝、非 X11 拒绝，共 5 组通过。规范标题转换 8 项通过；Dolphin 中文目录重命名、KWrite 中文文件全选/粘贴/保存，经磁盘回读一致。混合 DPI 多显示器、旋转、热插拔及非 Qt 缩放仍待验证 |
 | 系统覆盖 | GNOME X11 / Wayland 路线、Windows/macOS、DPI/IME/权限弹窗的实现与实际验收矩阵；不将 KDE 成功外推 | 用户确认仅有本机 Linux/KDE。`bea9187` 移除 X11 的 KDE 品牌限制，Xvfb 正反例及 KDE 新产物点击/截图通过；GNOME/XFCE 真机 **[待验收]**。Windows/macOS 实际效果 **[待真机验收]**。Wayland 输入后端 **[待实现、待真机验收]**，路线及证据见平台矩阵 |
 | 配套产物一致性 | 发布/启动检测 helper 协议与能力，避免新 CLI 静默搭配旧 helper；构建和真实入口验证 | XTest 握手 `4d20ad6` 已提交；新 helper 正常提供动作，旧 helper 返回 `DRIVER.HELPER_INCOMPATIBLE` 并移除合成输入能力，语义 invoke 仍通过真实标签变化验证 |
 
@@ -75,6 +76,7 @@
 - `paste-sequence-fixed/validation.json`、`code-paste-distributed/summary.json`：首次文字后继续有界服务请求，私有 Xvfb 三格式延迟、后续复制保留、持续请求期限及取消回归通过。分发脚本通过原生入口完成 VS Code Ctrl+A→中文 paste→Ctrl+S，DOM、磁盘及 `independent-editor.png` 一致。真实 Code 是 1 次文字与 18 次元数据请求，不等于私有三格式测试；250 ms 静默/总 2 秒是策略上限，不承诺任意延迟客户端。原生指针命中问题仍独立保留。
 - `physical-keys/qt-shuangpin/summary.json`、`candidate.png`：本机当前输入法列表为微软双拼/美式键盘，测试没有修改列表。默认 Unicode 输入拒绝后，显式 keys 产生真实 preedit 和“你好”候选，space 后应用独立回报一次 commit，fresh AT-SPI 一致；原方法恢复，自有窗口退出。私有 Xvfb 10 组验证当前键位与 Caps、无映射字符不部分派发、缺窗口锚点及同 PID 错窗口拒绝、外部持键不抢占，以及取消/焦点/锁定状态/键位变化后的停止和释放。
 - `linux-cross-drag/verification.json`、`qt-v3/summary.json`、`qt-v3/native-cross.ndjson`：60 项 AT-SPI 宿主测试与 clippy 通过，私有 Xvfb 15 项含真实双 PID 轨迹、可信/伪造 WM frame、单像素外部窗口及校验等待时新外部持键。公开 CLI 两独立 Qt 进程的精确 MIME 数据与可见接收结果、取消、窗口移动、悬停覆盖四项通过；成功约 4840 ms，取消/移动分别 45/77 ms 内返回并已释放，悬停覆盖零 down。真实 fixture 无窗口装饰，Xvfb 模拟可信 WM 不代表任意 WM 或文件管理器拖文件任务已验收。
+- `qt-scale-final/summary.json` 与 3 张 PNG：同一源码 CLI/helper 的公开入口 5/5，实际标签/F2 文本和像素尺寸回读；1.5/2 倍截图已目视核对。`dpi-title-tests` 的私有 Xvfb 8/8 拒绝/解码检查，`dpi-dolphin-chinese-title/summary.json` 与 `dpi-kwrite-regression/summary.json` 分别确认中文窗口身份下的重命名与编辑保存。`aad-linux` 标题单测、AT-SPI 60/60（含同期跨资源测试）及两 crate all-targets clippy 通过。仅改自建 Qt 进程的 QT_SCALE_FACTOR，没有修改系统显示设置；混合 DPI 多屏待真机。
 - Windows 修饰键代码已用 pin 工具链实际 `x86_64-pc-windows-gnu` cfg 做 check/clippy；这只证明编译，不能当成 Windows SendInput 效果验收。**[待验证]** Windows 交互桌面、相应权限与 DPI/IME 测试环境。
 
 各功能的测试数字对应其提交时点；后续共享模型变化后仍需相应回归。未验证的平台与场景保持待办，不从 KDE/Chromium 的成功外推。
