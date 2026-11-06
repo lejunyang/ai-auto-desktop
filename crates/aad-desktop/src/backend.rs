@@ -10,8 +10,8 @@ pub use aad_platform::{
     ImageBox, Pixels, PointerButton, Recognition, ScrollDirection, ScrollSpec, TextSpan,
 };
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// A structured driver failure.
@@ -95,6 +95,44 @@ impl From<aad_platform::Error> for DriverError {
 }
 
 pub type Result<T> = std::result::Result<T, DriverError>;
+
+pub fn ensure_input_active(deadline: Instant, cancellation: Option<&AtomicBool>) -> Result<()> {
+    if cancellation.is_some_and(|flag| flag.load(Ordering::SeqCst)) {
+        return Err(DriverError::new("DRIVER.CANCELLED", "input was cancelled"));
+    }
+    ensure_input_deadline(deadline)
+}
+
+/// Internal execution control; never accepted from serialized action arguments.
+pub struct InputControl {
+    pub deadline: Instant,
+    pub cancellation: Option<Arc<AtomicBool>>,
+}
+impl InputControl {
+    pub fn check(&self) -> Result<()> {
+        ensure_input_active(self.deadline, self.cancellation.as_deref())
+    }
+}
+impl Default for InputControl {
+    fn default() -> Self {
+        Self {
+            deadline: Instant::now() + Duration::from_secs(30),
+            cancellation: None,
+        }
+    }
+}
+
+/// Already validated element operations, with borrowed text kept out of Debug.
+pub enum ElementInput<'a> {
+    Focus,
+    Invoke,
+    PointerClick,
+    SetValue(&'a str),
+    SecretInput(&'a str),
+    TypeText { text: &'a str, keys: bool },
+    Paste(&'a str),
+    WindowAction(&'a str),
+}
 
 pub fn ensure_input_deadline(deadline: Instant) -> Result<()> {
     if Instant::now() >= deadline {
@@ -191,6 +229,8 @@ impl CaptureLimits {
 /// what keeps the "observe first" rule intact for pointer actions too.
 #[derive(Clone, Debug, Default)]
 pub struct PointerGesture {
+    /// Internal cooperative cancellation. Never deserialized from action arguments.
+    pub cancellation: Option<Arc<AtomicBool>>,
     /// Internal execution deadline, derived by the provider from its timeout.
     /// This is never accepted as a caller-supplied pointer field.
     pub deadline: Option<Instant>,
@@ -219,6 +259,60 @@ pub struct PointerGesture {
 
 /// The operations a platform backend must provide.
 pub trait Backend: Send + Sync {
+    /// Defaults only bracket synchronous operations. Native implementations
+    /// also check immediately before OS dispatch and inside bounded waits.
+    fn element_input_controlled(
+        &self,
+        window_id: &str,
+        node: &Node,
+        input: ElementInput<'_>,
+        control: &InputControl,
+    ) -> Result<serde_json::Value> {
+        control.check()?;
+        let result = match input {
+            ElementInput::Focus => self
+                .focus(window_id, node)
+                .map(|()| serde_json::Value::Null),
+            ElementInput::Invoke => self
+                .invoke(window_id, node)
+                .map(|()| serde_json::Value::Null),
+            ElementInput::PointerClick => self
+                .pointer_click(window_id, node)
+                .map(|()| serde_json::Value::Null),
+            ElementInput::SetValue(text) => self
+                .set_value(window_id, node, text)
+                .map(|()| serde_json::Value::Null),
+            ElementInput::SecretInput(text) => self
+                .secret_input(window_id, node, text)
+                .map(|()| serde_json::Value::Null),
+            ElementInput::TypeText { text, keys: true } => self
+                .type_text_keys(window_id, node, text)
+                .map(|()| serde_json::Value::Null),
+            ElementInput::TypeText { text, keys: false } => self
+                .type_text(window_id, node, text)
+                .map(|()| serde_json::Value::Null),
+            ElementInput::Paste(text) => self.paste(window_id, node, text),
+            ElementInput::WindowAction(action) => self.window_action(window_id, node, action),
+        };
+        let result = result?;
+        control
+            .check()
+            .map_err(|error| error.with_effect("unknown"))?;
+        Ok(result)
+    }
+    fn global_key_controlled(
+        &self,
+        keys: &[String],
+        control: &InputControl,
+    ) -> Result<serde_json::Value> {
+        control.check()?;
+        let result = self.global_key(keys);
+        let result = result?;
+        control
+            .check()
+            .map_err(|error| error.with_effect("unknown"))?;
+        Ok(result)
+    }
     /// Replace an observed protected field without reading it or using the clipboard.
     fn secret_input(&self, _window_id: &str, _node: &Node, _text: &str) -> Result<()> {
         Err(DriverError::new(
@@ -330,6 +424,19 @@ pub trait Backend: Send + Sync {
             ));
         }
         self.key_chord_with_deadline(window_id, node, keys, deadline)
+    }
+
+    fn key_chord_controlled(
+        &self,
+        window_id: &str,
+        node: &Node,
+        keys: &[String],
+        hold_ms: Option<u64>,
+        deadline: Instant,
+        cancellation: Option<Arc<AtomicBool>>,
+    ) -> Result<()> {
+        ensure_input_active(deadline, cancellation.as_deref())?;
+        self.key_chord_held(window_id, node, keys, hold_ms, deadline)
     }
 
     /// Perform a pointer gesture on a single element: a right or middle click, a

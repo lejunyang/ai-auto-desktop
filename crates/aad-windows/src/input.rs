@@ -3,8 +3,9 @@
 //! desktop, delivered through SendInput atomically where that matters and
 //! with a careful account of what landed when it is refused.
 use aad_platform::{Error, PointerButton, ScrollDirection, ScrollSpec};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, MapVirtualKeyW, SendInput, VkKeyScanExW, HKL, INPUT, INPUT_KEYBOARD,
     INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, MAPVK_VK_TO_VSC,
@@ -607,6 +608,7 @@ pub struct HeldInput {
     state: Arc<(Mutex<HeldState>, Condvar)>,
     worker: Option<std::thread::JoinHandle<()>>,
     deadline: Instant,
+    cancellation: Option<Arc<AtomicBool>>,
 }
 
 #[derive(Default)]
@@ -614,13 +616,22 @@ struct HeldState {
     accepted: Vec<INPUT>,
     stopped: bool,
     expired: bool,
+    cancelled: bool,
     submitted: bool,
 }
 
 impl HeldInput {
     pub fn new(deadline: Instant) -> Result<Self> {
+        Self::new_cancellable(deadline, None)
+    }
+
+    pub fn new_cancellable(
+        deadline: Instant,
+        cancellation: Option<Arc<AtomicBool>>,
+    ) -> Result<Self> {
         let state = Arc::new((Mutex::new(HeldState::default()), Condvar::new()));
         let worker_state = state.clone();
+        let worker_cancellation = cancellation.clone();
         let worker = std::thread::Builder::new()
             .name("aad-input-release".into())
             .spawn(move || {
@@ -628,14 +639,18 @@ impl HeldInput {
                 let mut state = lock.lock().unwrap_or_else(|poison| poison.into_inner());
                 while !state.stopped {
                     let now = Instant::now();
-                    if now >= deadline {
+                    let cancelled = worker_cancellation
+                        .as_ref()
+                        .is_some_and(|flag| flag.load(Ordering::SeqCst));
+                    if cancelled || now >= deadline {
                         state.stopped = true;
-                        state.expired = true;
+                        state.expired = now >= deadline;
+                        state.cancelled = cancelled;
                         release_held(&mut state);
                         break;
                     }
                     state = wake
-                        .wait_timeout(state, deadline - now)
+                        .wait_timeout(state, (deadline - now).min(Duration::from_millis(10)))
                         .unwrap_or_else(|poison| poison.into_inner())
                         .0;
                 }
@@ -650,6 +665,7 @@ impl HeldInput {
             state,
             worker: Some(worker),
             deadline,
+            cancellation,
         })
     }
 
@@ -659,10 +675,21 @@ impl HeldInput {
             .0
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        if state.stopped || Instant::now() >= self.deadline {
+        let cancelled = self
+            .cancellation
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::SeqCst));
+        if cancelled || state.stopped || Instant::now() >= self.deadline {
+            state.cancelled |= cancelled;
+            state.stopped = true;
+            release_held(&mut state);
             return Err(Error::new(
-                "DRIVER.TIMEOUT",
-                "input hold expired before the next dispatch",
+                if state.cancelled {
+                    "DRIVER.CANCELLED"
+                } else {
+                    "DRIVER.TIMEOUT"
+                },
+                "input stopped before the next dispatch",
             )
             .with_effect(if state.submitted {
                 "unknown"
@@ -676,7 +703,12 @@ impl HeldInput {
         let mut sent = unsafe { SendInput(inputs, std::mem::size_of::<INPUT>() as i32) } as usize;
         if sent == 0 && fallback {
             for input in inputs {
-                if Instant::now() >= self.deadline {
+                if Instant::now() >= self.deadline
+                    || self
+                        .cancellation
+                        .as_ref()
+                        .is_some_and(|flag| flag.load(Ordering::SeqCst))
+                {
                     break;
                 }
                 if unsafe { SendInput(&[*input], std::mem::size_of::<INPUT>() as i32) } != 1 {
@@ -710,6 +742,18 @@ impl HeldInput {
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
             .expired
+    }
+
+    pub fn cancelled(&self) -> bool {
+        self.cancellation
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::SeqCst))
+            || self
+                .state
+                .0
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .cancelled
     }
 
     /// Cleanup does not consult the expired request deadline or changed focus.

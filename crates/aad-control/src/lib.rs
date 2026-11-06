@@ -256,6 +256,7 @@ struct State {
 
 pub struct Context {
     effect_gate: Mutex<()>,
+    cancellation: aad_runtime::CancellationToken,
     // 0=pending, 1=may have committed, 2=cancelled before, 3=cancelled after.
     phase: AtomicU8,
     browser_publication: AtomicU8,
@@ -312,6 +313,7 @@ impl Context {
     pub fn new(timeout: Duration, mutating: bool) -> Self {
         Self {
             effect_gate: Mutex::new(()),
+            cancellation: aad_runtime::CancellationToken::new(),
             browser_publication: AtomicU8::new(0),
             browser_cancelled: Arc::new(AtomicBool::new(false)),
             phase: AtomicU8::new(0),
@@ -346,6 +348,9 @@ impl Context {
     }
 
     pub fn cancel(&self) {
+        // Native release watchdogs must see cancellation even if a slow effect
+        // still owns the publication gate. The token never grants dispatch.
+        self.cancellation.cancel();
         let _effect = self.effect_gate.lock().unwrap();
         let mut phase = self.phase.load(Ordering::SeqCst);
         loop {
@@ -362,6 +367,9 @@ impl Context {
                 Err(actual) => phase = actual,
             }
         }
+    }
+    pub fn cancellation(&self) -> &aad_runtime::CancellationToken {
+        &self.cancellation
     }
     /// Atomically cross the may-commit boundary immediately before input. A
     /// cancellation that wins first prevents dispatch; later interruption is unknown.
@@ -386,7 +394,7 @@ impl Context {
             );
         }
         let phase = self.phase.load(Ordering::SeqCst);
-        let code = if matches!(phase, 2 | 3) {
+        let code = if self.cancellation.is_cancelled() || matches!(phase, 2 | 3) {
             Some("CONTROL.CANCELLED")
         } else if Instant::now() >= self.deadline {
             Some("CONTROL.TIMEOUT")
@@ -981,6 +989,7 @@ impl Session {
             .remove(&request.request_id);
         let context = Arc::new(Context {
             effect_gate: Mutex::new(()),
+            cancellation: aad_runtime::CancellationToken::new(),
             browser_publication: AtomicU8::new(0),
             browser_cancelled: Arc::new(AtomicBool::new(false)),
             phase: AtomicU8::new(if cancelled { 2 } else { 0 }),
@@ -2731,5 +2740,34 @@ mod browser_cancel_boundary_tests {
         context.browser_publication.store(2, Ordering::SeqCst);
         context.cancel_browser();
         assert!(context.remaining().is_ok());
+    }
+}
+
+#[cfg(test)]
+mod native_cancel_boundary_tests {
+    use super::*;
+
+    #[test]
+    fn native_release_token_is_published_before_waiting_for_effect_gate() {
+        let context = Arc::new(Context::new(Duration::from_secs(5), true));
+        context.commit().unwrap();
+        let effect = context.effect_gate.lock().unwrap();
+        let cancelling = context.clone();
+        let worker = std::thread::spawn(move || cancelling.cancel());
+        let limit = Instant::now() + Duration::from_secs(1);
+        while !context.cancellation().is_cancelled() && Instant::now() < limit {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let published = context.cancellation().is_cancelled();
+        let remaining = context.remaining();
+        drop(effect);
+        worker.join().unwrap();
+        assert!(
+            published,
+            "native watchdog must see cancellation while effect is blocked"
+        );
+        let error = remaining.unwrap_err();
+        assert_eq!(error.code, "CONTROL.CANCELLED");
+        assert_eq!(error.effect, "unknown");
     }
 }

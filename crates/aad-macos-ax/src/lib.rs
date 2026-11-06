@@ -102,7 +102,59 @@ impl Bounds {
     }
 }
 
+/// Validated native writes. Text is deliberately not Debug/Serialize.
+pub enum AxInput<'a> {
+    Focus,
+    Invoke,
+    PointerClick { button: &'a str, position: &'a str },
+    SetValue(&'a str),
+    TypeText(&'a str),
+    SecretInput(&'a str),
+    Paste(&'a str),
+    WindowAction(&'a str),
+}
+
 pub trait AxBackend: Send + Sync {
+    fn input_controlled(
+        &self,
+        token: &str,
+        input: AxInput<'_>,
+        deadline: Instant,
+        cancellation: &aad_runtime::CancellationToken,
+    ) -> Result<Value, AutomationError> {
+        cancellation.check()?;
+        let result = match input {
+            AxInput::Focus => self.focus(token, deadline),
+            AxInput::Invoke => self.invoke(token, deadline),
+            AxInput::PointerClick { button, position } => {
+                self.pointer_click(token, button, position, deadline)
+            }
+            AxInput::SetValue(text) => self.set_value(token, text, deadline),
+            AxInput::TypeText(text) => self.type_text(token, text, deadline),
+            AxInput::SecretInput(text) => self.secret_input(token, text, deadline),
+            AxInput::Paste(text) => self.paste(token, text, deadline),
+            AxInput::WindowAction(action) => self.window_action(token, action, deadline),
+        };
+        let result = result?;
+        cancellation
+            .check()
+            .map_err(|error| error.with_effect("unknown"))?;
+        Ok(result)
+    }
+    fn global_key_controlled(
+        &self,
+        keys: &[String],
+        deadline: Instant,
+        cancellation: &aad_runtime::CancellationToken,
+    ) -> Result<Value, AutomationError> {
+        cancellation.check()?;
+        let result = self.global_key(keys, deadline);
+        let result = result?;
+        cancellation
+            .check()
+            .map_err(|error| error.with_effect("unknown"))?;
+        Ok(result)
+    }
     fn name(&self) -> &str;
     fn security_info(&self) -> Option<Map<String, Value>> {
         None
@@ -208,6 +260,41 @@ pub trait AxBackend: Send + Sync {
             ));
         }
         self.key_chord(token, keys, deadline)
+    }
+
+    /// Cooperative hooks default to a preflight check for third-party backends.
+    /// The native helper overrides these to interrupt and release held input.
+    fn key_chord_controlled(
+        &self,
+        token: &str,
+        keys: &[String],
+        hold_ms: Option<u64>,
+        deadline: Instant,
+        cancellation: &aad_runtime::CancellationToken,
+    ) -> Result<Value, AutomationError> {
+        cancellation.check()?;
+        self.key_chord_held(token, keys, hold_ms, deadline)
+    }
+    fn pointer_gesture_controlled(
+        &self,
+        token: &str,
+        gesture: &Value,
+        deadline: Instant,
+        cancellation: &aad_runtime::CancellationToken,
+    ) -> Result<Value, AutomationError> {
+        cancellation.check()?;
+        self.pointer_gesture(token, gesture, deadline)
+    }
+    fn drag_controlled(
+        &self,
+        token: &str,
+        to_token: &str,
+        request: &Value,
+        deadline: Instant,
+        cancellation: &aad_runtime::CancellationToken,
+    ) -> Result<Value, AutomationError> {
+        cancellation.check()?;
+        self.drag(token, to_token, request, deadline)
     }
     /// Start watching what a person does in the application with this process id.
     fn start_recording(
@@ -335,6 +422,22 @@ impl MacOSAxProvider {
     }
 
     fn call(&self, action: &str, args: Value, deadline: Instant) -> Result<Value, AutomationError> {
+        self.call_controlled(
+            action,
+            args,
+            deadline,
+            &aad_runtime::CancellationToken::new(),
+        )
+    }
+
+    fn call_controlled(
+        &self,
+        action: &str,
+        args: Value,
+        deadline: Instant,
+        cancellation: &aad_runtime::CancellationToken,
+    ) -> Result<Value, AutomationError> {
+        cancellation.check()?;
         remaining(deadline, false)?;
         let short = action
             .strip_prefix(PROVIDER_NAME)
@@ -381,7 +484,8 @@ impl MacOSAxProvider {
                 only_keys(args, &["keys"])?;
                 let keys = key_names(args.get("keys"))?;
                 refuse_reserved_chord(&keys)?;
-                self.backend.global_key(&keys, deadline)
+                self.backend
+                    .global_key_controlled(&keys, deadline, cancellation)
             }
             "watch" => {
                 only_keys(args, &["app"])?;
@@ -409,7 +513,9 @@ impl MacOSAxProvider {
                     Ok(json!({"released": true}))
                 }
             }
-            action if WRITE_ACTIONS.contains(&action) => self.write(action, args, deadline),
+            action if WRITE_ACTIONS.contains(&action) => {
+                self.write(action, args, deadline, cancellation)
+            }
             _ => Err(invalid("unknown macOS AX action")),
         }
     }
@@ -766,6 +872,7 @@ impl MacOSAxProvider {
         action: &str,
         args: &Map<String, Value>,
         deadline: Instant,
+        cancellation: &aad_runtime::CancellationToken,
     ) -> Result<Value, AutomationError> {
         let mut allowed = vec!["target", "locator"];
         if action == "set_value" {
@@ -943,6 +1050,7 @@ impl MacOSAxProvider {
                 format!("target does not support native {action}"),
             ));
         }
+        cancellation.check()?;
         let available = remaining(deadline, false)?;
         if hold_ms.is_some_and(|ms| available <= Duration::from_millis(ms)) {
             return Err(driver_error(
@@ -951,49 +1059,47 @@ impl MacOSAxProvider {
             ));
         }
         let result = match action {
-            "focus" => self.backend.focus(&token, deadline),
-            "invoke" => self.backend.invoke(&token, deadline),
-            "pointer_click" => self
-                .backend
-                .pointer_click(&token, button, position, deadline),
-            "set_value" => {
-                self.backend
-                    .set_value(&token, value.expect("value validated"), deadline)
-            }
-            "type_text" => self
-                .backend
-                .type_text(&token, text.expect("text validated"), deadline),
-            "secret_input" => {
-                self.backend
-                    .secret_input(&token, text.expect("text validated"), deadline)
-            }
-            "pointer_gesture" => self.backend.pointer_gesture(
+            "pointer_gesture" => self.backend.pointer_gesture_controlled(
                 &token,
                 gesture.as_ref().expect("gesture validated"),
                 deadline,
+                cancellation,
             ),
-            "drag" => self.backend.drag(
+            "drag" => self.backend.drag_controlled(
                 &token,
                 destination.as_deref().expect("destination verified"),
                 gesture.as_ref().expect("drag validated"),
                 deadline,
+                cancellation,
             ),
-            "key_chord" => self.backend.key_chord_held(
+            "key_chord" => self.backend.key_chord_controlled(
                 &token,
                 keys.as_deref().expect("keys validated"),
                 hold_ms,
                 deadline,
+                cancellation,
             ),
-            "paste" => self
-                .backend
-                .paste(&token, text.expect("text validated"), deadline),
-            window if WINDOW_ACTIONS.contains(&window) => {
-                self.backend.window_action(&token, window, deadline)
+            other => {
+                let input = match other {
+                    "focus" => AxInput::Focus,
+                    "invoke" => AxInput::Invoke,
+                    "pointer_click" => AxInput::PointerClick { button, position },
+                    "set_value" => AxInput::SetValue(value.expect("value validated")),
+                    "type_text" => AxInput::TypeText(text.expect("text validated")),
+                    "secret_input" => AxInput::SecretInput(text.expect("text validated")),
+                    "paste" => AxInput::Paste(text.expect("text validated")),
+                    window if WINDOW_ACTIONS.contains(&window) => AxInput::WindowAction(window),
+                    _ => unreachable!(),
+                };
+                self.backend
+                    .input_controlled(&token, input, deadline, cancellation)
             }
-            _ => unreachable!(),
         };
         let backend_result = match result {
             Ok(_) if action == "secret_input" => {
+                cancellation
+                    .check()
+                    .map_err(|error| error.with_effect("unknown"))?;
                 remaining(deadline, true)?;
                 json!({"submitted": true, "redacted": true})
             }
@@ -1006,6 +1112,9 @@ impl MacOSAxProvider {
                 .with_retryable(error.retryable));
             }
             Ok(value) => {
+                cancellation
+                    .check()
+                    .map_err(|error| error.with_effect("unknown"))?;
                 remaining(deadline, true)?;
                 value
             }
@@ -1059,6 +1168,15 @@ impl Provider for MacOSAxProvider {
         timeout: Option<Duration>,
     ) -> Result<Value, AutomationError> {
         self.call(action, args, Self::deadline(timeout)?)
+    }
+    fn invoke_cancellable(
+        &self,
+        action: &str,
+        args: Value,
+        timeout: Option<Duration>,
+        cancellation: &aad_runtime::CancellationToken,
+    ) -> Result<Value, AutomationError> {
+        self.call_controlled(action, args, Self::deadline(timeout)?, cancellation)
     }
     fn close(&self) {
         self.backend.close();

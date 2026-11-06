@@ -441,8 +441,19 @@ impl Paste {
 
     /// Waits up to `timeout` for the target to ask for the text.
     pub fn consumed(&self, timeout: Duration) -> bool {
+        self.consumed_cancellable(timeout, None)
+    }
+
+    pub fn consumed_cancellable(
+        &self,
+        timeout: Duration,
+        cancellation: Option<&std::sync::atomic::AtomicBool>,
+    ) -> bool {
         let deadline = Instant::now() + timeout;
         while PASTE_RENDERS.with(|renders| renders.get()) == 0 && Instant::now() < deadline {
+            if cancellation.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::SeqCst)) {
+                break;
+            }
             pump_for(Duration::from_millis(10));
         }
         PASTE_RENDERS.with(|renders| renders.get()) > 0

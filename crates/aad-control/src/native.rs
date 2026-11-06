@@ -70,6 +70,17 @@ impl Provider for WorkflowProvider {
         Self::refuse_secret(action)?;
         self.inner.invoke(action, args, timeout)
     }
+    fn invoke_cancellable(
+        &self,
+        action: &str,
+        args: Value,
+        timeout: Option<Duration>,
+        cancellation: &aad_runtime::CancellationToken,
+    ) -> Result<Value> {
+        Self::refuse_secret(action)?;
+        self.inner
+            .invoke_cancellable(action, args, timeout, cancellation)
+    }
     fn invoke_with_artifacts(
         &self,
         action: &str,
@@ -98,6 +109,19 @@ impl NativeBackend {
     fn invoke(&self, action: &str, args: Value, timeout: Duration) -> Result<Value> {
         self.provider
             .invoke(&format!("{}.{action}@1", self.name()), args, Some(timeout))
+    }
+    fn invoke_controlled(
+        &self,
+        action: &str,
+        args: Value,
+        context: &crate::Context,
+    ) -> Result<Value> {
+        self.provider.invoke_cancellable(
+            &format!("{}.{action}@1", self.name()),
+            args,
+            Some(context.commit()?),
+            context.cancellation(),
+        )
     }
     /// The native operation behind a typed capability name.
     fn native_name(&self, capability: &str) -> &'static str {
@@ -328,7 +352,7 @@ impl Backend for NativeBackend {
                 "this provider cannot press global keys",
             ));
         }
-        self.invoke("global_key", json!({"keys": keys}), context.commit()?)
+        self.invoke_controlled("global_key", json!({"keys": keys}), context)
     }
     fn clipboard_read(&self, max_characters: Option<usize>, timeout: Duration) -> Result<Value> {
         if !self.offers("clipboard_read") {
@@ -730,7 +754,7 @@ impl Backend for NativeBackend {
             }
             _ => {}
         }
-        self.invoke(native, args, context.commit()?)
+        self.invoke_controlled(native, args, context)
     }
 
     fn secret_input(
@@ -752,7 +776,7 @@ impl Backend for NativeBackend {
         }
         let mut args = self.read_args(snapshot, node);
         args["text"] = json!(text);
-        self.invoke("secret_input", args, context.commit()?)
+        self.invoke_controlled("secret_input", args, context)
     }
 }
 

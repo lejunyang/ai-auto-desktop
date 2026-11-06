@@ -18,14 +18,16 @@ private let inputCancellation = InputCancellation()
 private final class InputReleaseGuard {
     private let lock = NSLock()
     private let pid: pid_t
+    private let global: Bool
     private let deadline: UInt64
     private var releases: [CGEvent] = []
     private var stopped = false
     private(set) var expired = false
     private let timer: DispatchSourceTimer
 
-    init(pid: pid_t, deadlineMS: Double?, holdMS: Int, routeMS: Int = 0) {
+    init(pid: pid_t, deadlineMS: Double?, holdMS: Int, routeMS: Int = 0, global: Bool = false) {
         self.pid = pid
+        self.global = global
         let boundMS = Double(holdMS + routeMS + 750)
         let remainingMS = deadlineMS.map { max(0, $0 - Date().timeIntervalSince1970 * 1000) } ?? boundMS
         self.deadline = DispatchTime.now().uptimeNanoseconds + UInt64(min(boundMS, remainingMS) * 1_000_000)
@@ -36,8 +38,12 @@ private final class InputReleaseGuard {
     }
 
     private func releaseLocked() {
-        for event in releases.reversed() { event.flags = []; event.postToPid(pid) }
+        for event in releases.reversed() { event.flags = []; postNative(event) }
         releases.removeAll()
+    }
+
+    private func postNative(_ event: CGEvent) {
+        if global { event.post(tap: .cghidEventTap) } else { event.postToPid(pid) }
     }
 
     private func expireIfNeeded() {
@@ -53,13 +59,26 @@ private final class InputReleaseGuard {
         lock.lock(); defer { lock.unlock() }
         guard !stopped, DispatchTime.now().uptimeNanoseconds < deadline, !inputCancellation.cancelled else {
             stopped = true; expired = true; releaseLocked()
-            throw HelperFailure("DRIVER.TIMEOUT", "held input was cancelled or expired")
+            throw HelperFailure(inputCancellation.cancelled ? "DRIVER.CANCELLED" : "DRIVER.TIMEOUT", "input was cancelled or expired")
+        }
+        if release != nil && event.type == .keyDown {
+            let code = CGKeyCode(event.getIntegerValueField(.keyboardEventKeycode))
+            let aliases: [CGKeyCode: [CGKeyCode]] = [59: [59, 62], 56: [56, 60], 58: [58, 61], 55: [55, 54]]
+            guard !(aliases[code] ?? [code]).contains(where: { CGEventSource.keyState(.combinedSessionState, key: $0) }) else {
+                throw HelperFailure("DRIVER.INPUT_BLOCKED", "a requested key is already held")
+            }
+        }
+        if release != nil && [.leftMouseDown, .rightMouseDown, .otherMouseDown].contains(event.type) {
+            let button: CGMouseButton = event.type == .leftMouseDown ? .left : (event.type == .rightMouseDown ? .right : .center)
+            guard !CGEventSource.buttonState(.combinedSessionState, button: button) else {
+                throw HelperFailure("DRIVER.INPUT_BLOCKED", "a requested pointer button is already held")
+            }
         }
         if let release { releases.append(release) }
         if event.type != .keyDown && event.type != .keyUp {
             for pending in releases { pending.location = event.location }
         }
-        event.postToPid(pid)
+        postNative(event)
         switch event.type {
         case .keyUp:
             let code = event.getIntegerValueField(.keyboardEventKeycode)
@@ -1209,22 +1228,15 @@ private final class AXService {
         holdMS: Int? = nil, verifyHold: () throws -> Void = {}
     ) throws {
         if let holdMS { try requireHoldBudget(holdMS, deadlineMS: deadlineMS) }
-        let holdGuard = holdMS.map { InputReleaseGuard(pid: pid, deadlineMS: deadlineMS, holdMS: $0) }
+        let holdGuard = InputReleaseGuard(pid: pid, deadlineMS: deadlineMS, holdMS: holdMS ?? 0, routeMS: paceDrag ? events.count * 15 : 0)
         var held = false
         defer {
-            if let holdGuard {
-                _ = holdGuard.finish()
-                if held { progress.markPointerReleaseSubmitted() }
-            } else if held, let release {
-                release.flags = []
-                release.postToPid(pid)
-                progress.markPointerReleaseSubmitted()
-            }
+            _ = holdGuard.finish()
+            if held { progress.markPointerReleaseSubmitted() }
         }
         for (index, event) in events.enumerated() {
             try requireFrontmost(pid, operation: operation)
             try checkDeadline(deadlineMS)
-            if holdGuard == nil { release?.location = event.location }
             switch event.type {
             case .leftMouseDown, .rightMouseDown, .otherMouseDown:
                 if let holdMS { try verifyHold(); try requireHoldBudget(holdMS, deadlineMS: deadlineMS) }
@@ -1233,10 +1245,8 @@ private final class AXService {
             }
             event.flags = flags
             startPointerDispatch(requestID: requestID, progress: progress)
-            if let holdGuard {
-                let down = [.leftMouseDown, .rightMouseDown, .otherMouseDown].contains(event.type)
-                try holdGuard.post(event, release: down ? release : nil)
-            } else { event.postToPid(pid) }
+            let down = [.leftMouseDown, .rightMouseDown, .otherMouseDown].contains(event.type)
+            try holdGuard.post(event, release: down ? release : nil)
             if let holdMS, [.leftMouseDown, .rightMouseDown, .otherMouseDown].contains(event.type) {
                 try boundedDwell(milliseconds: holdMS, deadlineMS: deadlineMS, verify: verifyHold)
             }
@@ -1277,7 +1287,7 @@ private final class AXService {
         if let deadlineMS {
             until = min(until, Date(timeIntervalSince1970: deadlineMS / 1000))
         }
-        while Date() < until { usleep(10_000) }
+        while Date() < until && !inputCancellation.cancelled { usleep(10_000) }
     }
 
     private func pointerGesture(
@@ -1692,7 +1702,9 @@ private final class AXService {
                 }
             }
             for event in events.dropFirst(pressCount) { try guardInput.post(event) }
-        } else { for event in events { event.postToPid(targetPID) } }
+        } else {
+            try postKeySequence(events, targetPID: targetPID, deadlineMS: deadlineMS)
+        }
         return [
             "native_operation": "CGEventKeyChord",
             "submitted": true,
@@ -1709,6 +1721,7 @@ private final class AXService {
     private func waitUntil(_ deadlineMS: Double?, _ condition: () -> Bool) -> Bool {
         let limit = Date().addingTimeInterval(3)
         while true {
+            if inputCancellation.cancelled { return false }
             if condition() { return true }
             let now = Date()
             if now >= limit { return false }
@@ -2045,11 +2058,13 @@ private final class AXService {
         }
         let offered = pasteboard.changeCount
         do {
+            try checkDeadline(deadlineMS)
             progress.markFocusChanged()
             emitKeyboardFocusProgress(id: requestID, focusChanged: true)
             let focusError = AXUIElementSetAttributeValue(
                 element, kAXFocusedAttribute as CFString, kCFBooleanTrue
             )
+            try checkDeadline(deadlineMS)
             try requireSuccess(focusError, operation: "AXUIElementSetAttributeValue(AXFocused)")
             guard boolAttribute(element, kAXFocusedAttribute as CFString) == true else {
                 throw HelperFailure(
@@ -2078,7 +2093,7 @@ private final class AXService {
             emitKeyboardDispatchProgress(
                 id: requestID, keyboardDispatchStarted: true, focusChanged: progress.focusChanged
             )
-            for event in events { event.postToPid(targetPID) }
+            try postKeySequence(events, targetPID: targetPID, deadlineMS: deadlineMS)
         } catch {
             _ = restorePasteboard(pasteboard, saved, offered: offered)
             throw error
@@ -2166,7 +2181,7 @@ private final class AXService {
         let frontmost = NSWorkspace.shared.frontmostApplication?.processIdentifier ?? 0
         progress.markKeyboardDispatchStarted()
         emitKeyboardDispatchProgress(id: requestID, keyboardDispatchStarted: true, focusChanged: false)
-        for event in events { event.post(tap: .cghidEventTap) }
+        try postKeySequence(events, targetPID: frontmost, deadlineMS: deadlineMS, global: true)
         return [
             "native_operation": "CGEventGlobalKeyChord",
             "submitted": true,
@@ -2353,7 +2368,7 @@ private final class AXService {
             }
             let chunk = Array(utf16[offset..<end])
             try postUnicodeKeyboardChunk(
-                chunk, targetPID: targetPID, requestID: requestID, progress: progress
+                chunk, targetPID: targetPID, requestID: requestID, progress: progress, deadlineMS: deadlineMS
             )
             offset = end
         }
@@ -2387,7 +2402,7 @@ private final class AXService {
 
     private func postUnicodeKeyboardChunk(
         _ utf16: [UInt16], targetPID: pid_t, requestID: String,
-        progress: RequestProgress
+        progress: RequestProgress, deadlineMS: Double?
     ) throws {
         guard !utf16.isEmpty, utf16.count <= maximumUnicodeUnitsPerEvent else {
             throw HelperFailure("DRIVER.INVALID_REQUEST", "Unicode keyboard chunk is outside its bound")
@@ -2422,8 +2437,23 @@ private final class AXService {
                 focusChanged: progress.focusChanged
             )
         }
-        keyDown.postToPid(targetPID)
-        keyUp.postToPid(targetPID)
+        let guardInput = InputReleaseGuard(pid: targetPID, deadlineMS: deadlineMS, holdMS: 0)
+        defer { _ = guardInput.finish() }
+        try guardInput.post(keyDown, release: keyUp)
+        try guardInput.post(keyUp)
+    }
+
+    private func postKeySequence(_ events: [CGEvent], targetPID: pid_t, deadlineMS: Double?, global: Bool = false) throws {
+        let guardInput = InputReleaseGuard(pid: targetPID, deadlineMS: deadlineMS, holdMS: 0, global: global)
+        defer { _ = guardInput.finish() }
+        for event in events {
+            try checkDeadline(deadlineMS)
+            let release: CGEvent?
+            if event.type == .keyDown {
+                release = try keyEvent(CGKeyCode(event.getIntegerValueField(.keyboardEventKeycode)), down: false, flags: [])
+            } else { release = nil }
+            try guardInput.post(event, release: release)
+        }
     }
 
     private func configureTimeout(_ element: AXUIElement, deadlineMS: Double?) throws {
