@@ -21,7 +21,7 @@
 | 原生粘贴与 IME | KDE 原生 paste 实际输入成功并恢复原剪贴板；明确输入法条件，补充可工作的中文输入路径与诊断 | 已提交 `8421506`、`51a72ca`；隔离 X11 协议回归、KDE Qt/KWrite/QML 中文粘贴成功且恢复剪贴板。helper 无内容诊断与派发前错误已正确传递；复杂 IME 覆盖待补齐 |
 | 浏览器局部观察 | 范围外无关 DOM 更新不误判 stale；范围内改动、身份替换、相关布局变化仍拒绝；大型页面可局部操作 | 已提交 `e8b8959`、`368177c`；Chromium 实测外部 ticker、相关 stale 拒绝、无 HTML id 的 scope_target、shadow root、scope token 刷新及 act.verify |
 | 手势表达 | 同元素不同位置拖动、修饰键点击/拖动、有界按住和路径、跨资源拖拽具有完整端点复核与释放保证；真实效果验收 | 浏览器同 surface drag `d350c7b`、原生同元素 `9274fee`、三端与浏览器修饰键 `e46829b`、有界按住 `d314931` 已提交；Qt/Chromium 与 Dolphin 选择手势实测通过。路径接口及 Windows/macOS 实现 `4b10562` 已提交，目标 cfg 检查通过，真机效果待验；Linux/browser 路径、跨资源与原生会话即时取消待完成 |
-| 视觉与自绘恢复 | Canvas/自绘/closed shadow 等缺乏语义控件时，通过可校验 surface 完成视觉操作；保留保护区域与命中限制 | Canvas trusted click/hover/scroll/drag 已提交 `d350c7b`，像素与可信事件回读通过；原生非 Focusable 指针 `31cf35a` 已在 Dolphin 验证，显式激活 `76cd6e1` 通过。closed shadow 等待完成 |
+| 视觉与自绘恢复 | Canvas/自绘/closed shadow 等缺乏语义控件时，通过可校验 surface 完成视觉操作；保留保护区域与命中限制 | Canvas trusted click/hover/scroll/drag 已提交 `d350c7b`，像素与可信事件回读通过；原生非 Focusable 指针 `31cf35a` 已在 Dolphin 验证，显式激活 `76cd6e1` 通过。closed shadow host 的视觉动作与保护 `3c7c2fc` 已通过 Chromium 27/27；内部语义节点仍不公开，其他原生自绘应用需逐项验收 |
 | 保密输入 | 显式授权的 protected 输入与保密读取分离；三端/browser 策略一致，日志与录制不泄漏值，合成密码框验收 | `008974d` 已提交即时 secret_ref 授权路径；Qt 密码数字角色、替换/清空与独立状态回读通过，Chromium 21 项含敏感 DOM 身份恢复通过。普通输入不能绕过，持久化入口拒绝专用动作，子进程不继承绑定环境变量。Windows/macOS 实际效果 **[待真机验收]**；系统凭据库与保密工作流未实现 |
 | 浏览器键盘与浏览器自身界面 | 页面编辑器快捷键与浏览器级动作分开；补明确授权的浏览器内部/本地页面操作路径，并明确非 Chromium 覆盖 | 页面快捷键隔离 `1a3bb77` 已提交；有界面 Chromium 18 组 Ctrl 组合只送页面、不误触浏览器 UI 的验收及异常 keyUp 通过，完整回归 23/23。内部/本地页面授权与非 Chromium 后端待完成 |
 | 输入租约 | 保留共享前台互斥，独立 headless 不受无关桌面会话阻断；占用可诊断、可正常释放 | `2fe2395`、`562dcf5`、`6966e4c` 已提交。可信 headless 按 browser UUID 隔离，同实例仍互斥，未知/有界面实例仍占桌面；Chromium 19 项及保存工作流在桌面租约被占用时的实际执行通过 |
@@ -57,6 +57,7 @@
 - `hold-kde/summary.json`：`verify-bounded-hold.ps1` 请求 200 ms，Qt 应用独立记录 F2 按下至释放 205 ms、按钮 201 ms、拖拽第一次移动 205 ms/释放 405 ms。此前可打印字母用例未收到计时状态，不能据此宣称 IME 长按已通过；改用 F2 隔离输入法影响。
 - `hold-helpers/validation.json`：私有 Xvfb 独立回读键鼠状态与时序；长按、截止时间、helper 终止、焦点/遮挡变化后的释放，以及不接管外部已按住的键鼠通过。helper 终止不等于 `control_cancel`，原生 provider 的即时取消传播仍待实现。
 - `browser-hold-targeted.log`、`browser-hold-full.log`：真实 Chromium 长按、拖拽起点停留、预算不足、焦点变化、遮挡和会话取消后的释放通过，功能提交前完整回归 24/24；日志同样位于 `artifacts/capability-audit-2026-11-07/`。
+- `browser-closed-shadow-targeted.log`、`browser-closed-shadow-full.log`：closed host 默认 trusted click 后独立 PNG 像素回读、局部 drag/wheel、遮挡和 stale 拒绝通过；双密码字段 reveal 后移到 light DOM 仍脱敏并拒绝截图，移除后恢复。专项 2/2，完整 27/27，日志位于 `artifacts/capability-audit-2026-11-07/`。
 - `electron-native/summary.json`：独立 profile 的 VS Code，414 节点截断观察缩小到 31 节点完整编辑框；点击被 `DRIVER.POINT_NOT_PROVEN` 拒绝，focus/key/paste 返回已派发但实际文本不符，未继续保存，不算编辑成功。初始树含 Welcome 模态界面，随后 X11 检查发现同 PID 另一活动原生对话框；需要先处理启动界面，并用同进程双窗口 fixture 独立验证键盘焦点边界。仅凭动作之后的活动窗口不能断定此前每次输入落点。
 - Windows 修饰键代码已用 pin 工具链实际 `x86_64-pc-windows-gnu` cfg 做 check/clippy；这只证明编译，不能当成 Windows SendInput 效果验收。**[待验证]** Windows 交互桌面、相应权限与 DPI/IME 测试环境。
 

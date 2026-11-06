@@ -53,7 +53,15 @@ Alt/Meta 及 F2 以外的功能键仍以 `CONTROL.ACTION_UNSUPPORTED` 拒绝。
 
 Shadow DOM：观察深度优先进入每个开放 shadow root（先宿主的 shadow 树，再其 light 子节点——只有被 slot 的才会渲染），
 内部控件与普通节点一样有指纹、复核和动作；命中检查经 `shadowRoot.elementFromPoint` 穿过宿主，包含关系沿 host 向上。
-closed shadow root 无法从脚本进入，其内容不出现在观察里（限制）。`innerText` 不含 shadow 内文字，所以 text 视图也看不到它们。
+closed shadow 的内部节点仍不出现在公共观察里，但后端通过 CDP 私下确认 root 后，可将已观察的 host 标为
+`surface: closed_shadow`，提供可信点击、hover、scroll 与拖拽；使用 host 内的比例位置并重新核对命中。
+默认 click 也走 CDP 指针事件，使内部控件收到真实点击。截图可以提供其视觉内容，text 视图不展开内部文字。
+每次观察、动作和截图会检查内部受保护字段；密码/hidden 字段只记录身份，不导出其值。
+已记录的字段即使改为普通文本并移出 shadow，仍保持保护；相关受保护内容可见时拒绝截图。
+私有 CDP DOM 响应可能含 HTML 属性，但不会导出给调用者，也不用于读取字段值。
+检查超过预算或不能证明子 frame 安全时，拒绝相应能力/截图；整页预算不足不影响可完整检查的普通局部观察。
+本机 Chromium 已验收点击后的像素变化、trusted 事件、局部拖拽/滚动、遮挡与过期目标拒绝，以及两个密码字段
+同时 reveal/移到 light DOM 后的持续保护。未知 closed shadow 不会自动获得 surface 权限。
 
 Frame：页面连接用 `Target.setAutoAttach`（flatten）跟随跨站 OOPIF，`control_targets` 把每个 frame 列成资源，
 metadata 带 `parent_frame_id`、`out_of_process`；跨站 iframe 一开始是进程内的 about:blank，换进程后资源 id 不变。
