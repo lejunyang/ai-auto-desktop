@@ -3311,9 +3311,9 @@ fn typed_key(character: char) -> Option<KeyPress> {
     })
 }
 
-/// A chord for the focused element. Shortcuts the browser itself acts on --
-/// new or closed tabs and windows, history, devtools, find, reload, zoom --
-/// are refused: CDP hands keys the page does not consume back to the browser.
+/// A chord for the focused element. These are renderer events: page editors
+/// may use Ctrl+K/S and other letters without invoking browser accelerators.
+/// OS modifiers and function keys still use the bounded set supported here.
 fn key_chord(keys: &[String]) -> Result<KeyPress> {
     let mut modifiers: u32 = 0;
     let mut primary = None;
@@ -3363,8 +3363,8 @@ fn key_chord(keys: &[String]) -> Result<KeyPress> {
         Err(error(
             "CONTROL.ACTION_UNSUPPORTED",
             format!(
-                "{} is a browser-global shortcut or not an element-scoped key; only editing \
-                 and navigation keys for the focused element are sent",
+                "{} is not a supported element-scoped key; only supported editing, \
+                 page shortcuts and navigation keys are sent",
                 keys.join("+")
             ),
         ))
@@ -3378,20 +3378,17 @@ fn key_chord(keys: &[String]) -> Result<KeyPress> {
     );
     let allowed = match (modifiers & CTRL != 0, modifiers & SHIFT != 0) {
         (false, _) => named.is_some() || character.is_some(),
-        // Ctrl+Tab and Ctrl+PageUp/PageDown switch tabs.
+        // Tab switching has explicit page actions. Letter shortcuts also
+        // belong to page editors and are delivered without browser fallback.
         (true, false) => {
             navigation
                 || matches!(
                     named.map(|(k, _)| k),
                     Some("Enter" | "Backspace" | "Delete" | " ")
                 )
-                || matches!(
-                    lower.as_str(),
-                    "a" | "c" | "v" | "x" | "z" | "y" | "b" | "i"
-                )
+                || character.is_some_and(|c| c.is_ascii_alphabetic())
         }
-        // Ctrl+Shift opens windows, devtools and history; selection and redo stay.
-        (true, true) => navigation || lower == "z",
+        (true, true) => navigation || character.is_some_and(|c| c.is_ascii_alphabetic()),
     };
     if !allowed {
         return refuse();
@@ -3442,25 +3439,45 @@ fn key_chord(keys: &[String]) -> Result<KeyPress> {
     })
 }
 
-/// Press and release one key. The document must still be the observed one
-/// between the two halves.
-fn press(client: &mut Client, press: &KeyPress) -> Result<()> {
-    let mut down = json!({"type": if press.text.is_some() {"keyDown"} else {"rawKeyDown"},
+/// Native virtual key 0 makes Chromium set skip_if_unhandled. This bypasses
+/// browser accelerators both before renderer dispatch and after an unhandled
+/// renderer event, while preserving trusted DOM key/code/modifier fields.
+fn key_event(press: &KeyPress, release: bool) -> Value {
+    let mut event = json!({"type": if release {"keyUp"} else if press.text.is_some() {"keyDown"} else {"rawKeyDown"},
         "key": press.key, "code": press.code, "windowsVirtualKeyCode": press.virtual_key,
-        "nativeVirtualKeyCode": press.virtual_key, "modifiers": press.modifiers});
-    if let Some(text) = &press.text {
-        down["text"] = json!(text);
-        down["unmodifiedText"] = json!(text);
+        "nativeVirtualKeyCode": 0, "modifiers": press.modifiers});
+    if !release {
+        if let Some(text) = &press.text {
+            event["text"] = json!(text);
+            event["unmodifiedText"] = json!(text);
+        }
     }
-    command(client, "Input.dispatchKeyEvent", down).map_err(|e| e.with_effect("unknown"))?;
-    command(
-        client,
-        "Input.dispatchKeyEvent",
-        json!({"type": "keyUp", "key": press.key, "code": press.code,
-            "windowsVirtualKeyCode": press.virtual_key, "nativeVirtualKeyCode": press.virtual_key,
-            "modifiers": press.modifiers}),
-    )
-    .map_err(|e| e.with_effect("unknown"))?;
+    event
+}
+
+/// Even a timed-out dispatch may already have pressed a key. A short cleanup
+/// budget permits release after the request deadline; it never permits more
+/// typing, and the original deadline is restored afterwards.
+fn press(client: &mut Client, press: &KeyPress, deadline: Instant) -> Result<()> {
+    let pressed = command(client, "Input.dispatchKeyEvent", key_event(press, false))
+        .map_err(|e| e.with_effect("unknown"));
+    if pressed.is_err() {
+        client.set_deadline(Instant::now() + Duration::from_millis(200));
+    }
+    let released = command(client, "Input.dispatchKeyEvent", key_event(press, true))
+        .map_err(|e| e.with_effect("unknown"));
+    let cleared = if released.is_ok() {
+        true
+    } else if pressed.is_ok() {
+        client.set_deadline(Instant::now() + Duration::from_millis(200));
+        command(client, "Input.dispatchKeyEvent", key_event(press, true)).is_ok()
+    } else {
+        false
+    };
+    client.set_deadline(deadline);
+    pressed
+        .and(released)
+        .map_err(|e| e.with_detail("key_released", json!(cleared)))?;
     Ok(())
 }
 
@@ -3552,7 +3569,11 @@ fn keyboard(
         }
         action_context.commit()?;
         match &strokes {
-            Keystrokes::Presses(presses) => press(client, &presses[index])?,
+            Keystrokes::Presses(presses) => press(
+                client,
+                &presses[index],
+                Instant::now() + action_context.remaining()?,
+            )?,
             Keystrokes::Text(chunks) => {
                 command(client, "Input.insertText", json!({"text": chunks[index]}))
                     .map_err(|e| e.with_effect("unknown"))?;
@@ -3779,6 +3800,12 @@ mod tests {
             &["ctrl", "x"],
             &["ctrl", "z"],
             &["ctrl", "shift", "z"],
+            &["ctrl", "k"],
+            &["ctrl", "s"],
+            &["ctrl", "t"],
+            &["ctrl", "w"],
+            &["ctrl", "shift", "n"],
+            &["ctrl", "shift", "i"],
             &["shift", "ArrowLeft"],
             &["ctrl", "shift", "End"],
             &["shift", "Tab"],
@@ -3792,17 +3819,10 @@ mod tests {
         assert_eq!((bang.key.as_str(), bang.text.as_deref()), ("!", Some("!")));
         let shifted = chord(&["shift", "a"]).unwrap();
         assert_eq!((shifted.key.as_str(), shifted.modifiers), ("A", SHIFT));
-        // Shortcuts the browser itself acts on are refused.
+        // OS modifiers and unsupported function keys are still refused.
         for keys in [
-            &["ctrl", "t"][..],
-            &["ctrl", "w"],
-            &["ctrl", "n"],
-            &["ctrl", "l"],
-            &["ctrl", "u"],
-            &["ctrl", "Tab"],
+            &["ctrl", "Tab"][..],
             &["ctrl", "PageDown"],
-            &["ctrl", "shift", "t"],
-            &["ctrl", "shift", "i"],
             &["F12"],
             &["F5"],
             &["alt", "F4"],
@@ -3811,10 +3831,24 @@ mod tests {
         ] {
             let refused = chord(keys).unwrap_err();
             assert_eq!(refused.code, "CONTROL.ACTION_UNSUPPORTED", "{keys:?}");
-            assert!(refused.message.contains("browser-global"), "{keys:?}");
+            assert!(refused.message.contains("element-scoped"), "{keys:?}");
         }
         assert!(chord(&["Enter", "Tab"]).is_err());
         assert!(chord(&["ctrl"]).is_err());
+    }
+
+    #[test]
+    fn page_keys_never_create_native_browser_accelerators() {
+        for keys in [["ctrl", "s"], ["ctrl", "k"], ["ctrl", "w"]] {
+            let press = key_chord(&keys.map(str::to_string)).unwrap();
+            for release in [false, true] {
+                let event = key_event(&press, release);
+                assert_eq!(event["nativeVirtualKeyCode"], 0);
+                assert_eq!(event["windowsVirtualKeyCode"], press.virtual_key);
+                assert_eq!(event["modifiers"], CTRL);
+                assert!(event.get("text").is_none());
+            }
+        }
     }
 
     #[test]

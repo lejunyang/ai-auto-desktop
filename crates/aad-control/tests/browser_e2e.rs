@@ -170,6 +170,9 @@ impl Fixture {
         Self::with_automation(false)
     }
     fn with_automation(automation: bool) -> Self {
+        Self::with_mode(automation, false)
+    }
+    fn with_mode(automation: bool, headed: bool) -> Self {
         let binary = std::env::var_os("AAD_TEST_CHROME")
             .expect("set AAD_TEST_CHROME to a sandbox-capable Chromium binary");
         let root = std::env::temp_dir().join(format!("aad-browser-e2e-{}", uuid::Uuid::new_v4()));
@@ -206,7 +209,6 @@ impl Fixture {
         let mut command = Command::new(binary);
         command
             .args([
-                "--headless=new",
                 "--remote-debugging-address=127.0.0.1",
                 "--remote-debugging-port=0",
                 "--no-first-run",
@@ -221,6 +223,11 @@ impl Fixture {
             .stderr(Stdio::inherit());
         if automation {
             command.arg("--enable-automation");
+        }
+        if headed {
+            command.args(["--force-renderer-accessibility", "--window-size=1000,700"]);
+        } else {
+            command.arg("--headless=new");
         }
         // Reclaim only this fixture's own process group, never all Chrome processes.
         #[cfg(unix)]
@@ -691,14 +698,8 @@ fn typing_sends_trusted_keystrokes_and_shortcuts_stay_on_the_focused_field() {
     let undone = act_on(&session, &main, "textbox", "Typed", keys(&["ctrl", "z"]));
     assert!(undone.error.is_none(), "{undone:?}");
     assert_eq!(value(&observe(&session, &main), "Typed"), "Zé日");
-    // Shortcuts the browser itself would act on never reach the page.
-    for chord in [
-        &["ctrl", "t"][..],
-        &["ctrl", "w"],
-        &["F12"],
-        &["alt", "F4"],
-        &["ctrl", "shift", "n"],
-    ] {
+    // OS modifiers and function keys outside the supported set remain refused.
+    for chord in [&["F12"][..], &["alt", "F4"], &["ctrl", "Tab"]] {
         let refused = act_on(&session, &main, "textbox", "Typed", keys(chord));
         assert_eq!(refused.commit_state, CommitState::NotCommitted, "{chord:?}");
         assert_eq!(
@@ -714,6 +715,235 @@ fn typing_sends_trusted_keystrokes_and_shortcuts_stay_on_the_focused_field() {
             .count(),
         1,
         "no tab was opened"
+    );
+}
+
+#[test]
+#[ignore = "requires isolated Chromium; set AAD_TEST_HEADED=1 to also verify native browser UI"]
+fn page_shortcuts_reach_editors_without_falling_back_to_browser_ui() {
+    let _serial = serial();
+    let headed = std::env::var("AAD_TEST_HEADED").as_deref() == Ok("1");
+    let fixture = Fixture::with_mode(false, headed);
+    let (session, _) = session_for(&fixture);
+    let main = main_of(&session, &fixture.page_id);
+    assert!(wait_until(&session, &main, "Typed", WaitCondition::Appears)
+        .error
+        .is_none());
+    assert_eq!(
+        page_value(
+            &fixture,
+            r#"document.title='AAD page shortcut fixture';
+        document.body.innerHTML='<textarea aria-label="Shortcut editor"></textarea><output aria-label="Shortcut effect">ready</output>';
+        window.keyEffects=[];window.editorHandlesKeys=false;
+        document.querySelector('textarea').addEventListener('keydown',e=>{
+            window.keyEffects.push(['down',e.key,e.ctrlKey,e.shiftKey,e.isTrusted]);
+            if(window.editorHandlesKeys){e.preventDefault();document.querySelector('output').value='handled:'+e.key;}
+        });
+        document.querySelector('textarea').addEventListener('keyup',e=>window.keyEffects.push(['up',e.key,e.ctrlKey,e.shiftKey,e.isTrusted]));true"#
+        ),
+        true
+    );
+    assert!(act_on(
+        &session,
+        &main,
+        "textbox",
+        "Shortcut editor",
+        Action::Focus {}
+    )
+    .error
+    .is_none());
+
+    // In headed validation a separate, read-only native provider checks the
+    // real Chrome application, including its toolbar and native dialogs.
+    let native = if headed {
+        let (backends, failures) = native::backends();
+        assert!(
+            failures.is_empty(),
+            "native UI verification unavailable: {failures:?}"
+        );
+        let backend = backends.into_iter().next().expect("native UI verifier");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let resource = loop {
+            let resources = backend.resources(Duration::from_secs(3)).unwrap();
+            if let Some(resource) = resources
+                .into_iter()
+                .find(|resource| resource.resource.metadata["process_id"] == fixture.child.id())
+            {
+                break resource;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "fixture browser never appeared in native accessibility"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        };
+        Some((backend, resource.selector))
+    } else {
+        None
+    };
+    let native_state = || -> Value {
+        let Some((backend, selector)) = &native else {
+            return Value::Null;
+        };
+        let observed = backend
+            .observe(selector, 2000, Duration::from_secs(5))
+            .unwrap();
+        assert_ne!(
+            observed["truncated"], true,
+            "native browser capture must be complete"
+        );
+        let nodes = observed["nodes"].as_array().unwrap();
+        assert!(
+            nodes
+                .iter()
+                .any(|node| node["name"] == "Shortcut editor" && node["states"]["focused"] == true),
+            "native focus left the fixture editor: {observed}"
+        );
+        json!(nodes
+            .iter()
+            .filter(|node| matches!(
+                node["role"].as_str(),
+                Some("window" | "frame" | "dialog" | "alert" | "alertdialog")
+            ))
+            .map(|node| json!([node["role"], node["name"]]))
+            .collect::<Vec<_>>())
+    };
+    let initial_native = native_state();
+    let initial_pages = targets(&session)
+        .iter()
+        .filter(|resource| resource["metadata"]["main_frame"] == true)
+        .count();
+    for handled in [true, false] {
+        assert_eq!(
+            page_value(
+                &fixture,
+                &format!("window.editorHandlesKeys={handled};true")
+            ),
+            true
+        );
+        for chord in [
+            &["ctrl", "k"][..],
+            &["ctrl", "s"],
+            &["ctrl", "f"],
+            &["ctrl", "p"],
+            &["ctrl", "l"],
+            &["ctrl", "t"],
+            &["ctrl", "w"],
+            &["ctrl", "shift", "n"],
+            &["ctrl", "shift", "i"],
+        ] {
+            assert_eq!(
+                page_value(
+                    &fixture,
+                    "window.keyEffects=[];document.querySelector('output').value='ready';true"
+                ),
+                true
+            );
+            let result = act_on(&session, &main, "textbox", "Shortcut editor", keys(chord));
+            assert!(
+                result.error.is_none(),
+                "{chord:?}, handler={handled}: {result:?}"
+            );
+            let shift = chord.contains(&"shift");
+            let letter = chord.last().unwrap();
+            let key = if shift {
+                letter.to_ascii_uppercase()
+            } else {
+                letter.to_string()
+            };
+            assert_eq!(
+                page_value(&fixture, "window.keyEffects"),
+                json!([
+                    ["down", key, true, shift, true],
+                    ["up", key, true, shift, true]
+                ])
+            );
+            assert_eq!(
+                page_value(&fixture, "document.querySelector('output').value"),
+                if handled {
+                    json!(format!("handled:{key}"))
+                } else {
+                    json!("ready")
+                }
+            );
+            assert_eq!(page_value(&fixture,"document.hasFocus() && document.activeElement===document.querySelector('textarea')"),true);
+            assert_eq!(page_value(&fixture, "location.href"), fixture.url);
+            assert_eq!(
+                targets(&session)
+                    .iter()
+                    .filter(|resource| resource["metadata"]["main_frame"] == true)
+                    .count(),
+                initial_pages
+            );
+            assert_eq!(
+                native_state(),
+                initial_native,
+                "browser window/dialog changed after {chord:?}"
+            );
+        }
+    }
+    eprintln!(
+        "page shortcut validation: headed={headed}, native_ui_checked={}",
+        native.is_some()
+    );
+}
+
+#[test]
+#[ignore = "requires isolated Chromium with its sandbox enabled; CI runs it explicitly"]
+fn a_timed_out_page_key_still_releases_before_any_more_typing() {
+    let _serial = serial();
+    let fixture = Fixture::new();
+    let (session, _) = session_for(&fixture);
+    let main = main_of(&session, &fixture.page_id);
+    assert!(wait_until(&session, &main, "Typed", WaitCondition::Appears)
+        .error
+        .is_none());
+    assert_eq!(
+        page_value(
+            &fixture,
+            r#"window.releaseProof=[];
+        const field=document.getElementById('typed');
+        field.addEventListener('keydown',e=>{window.releaseProof.push('down:'+e.key);if(e.ctrlKey&&e.key==='k'){const until=performance.now()+220;while(performance.now()<until){}}});
+        field.addEventListener('keyup',e=>window.releaseProof.push('up:'+e.key));true"#
+        ),
+        true
+    );
+    let observed = observe(&session, &main);
+    let target = find(&session, &observed, "textbox", "Typed");
+    let response = call_within(
+        &session,
+        Operation::Act {
+            target,
+            action: keys(&["ctrl", "k"]),
+            verify: None,
+        },
+        150,
+    );
+    assert!(
+        response.error.is_some(),
+        "busy renderer must exceed the request deadline"
+    );
+    assert_eq!(
+        response.error.as_ref().unwrap()["details"]["key_released"],
+        true,
+        "{response:?}"
+    );
+    assert_eq!(
+        page_value(&fixture, "window.releaseProof"),
+        json!(["down:k", "up:k"])
+    );
+    let typed = act_on(
+        &session,
+        &main,
+        "textbox",
+        "Typed",
+        type_text("z", Some(TypeMode::Keys)),
+    );
+    assert!(typed.error.is_none(), "{typed:?}");
+    assert_eq!(value(&observe(&session, &main), "Typed"), "z");
+    assert_eq!(
+        page_value(&fixture, "window.releaseProof"),
+        json!(["down:k", "up:k", "down:z", "up:z"])
     );
 }
 
