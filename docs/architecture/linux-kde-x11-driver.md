@@ -56,6 +56,18 @@ selection 协议访问（见下文）。观察前通过无输入的 `describe` �
 这项证明不使用“该进程只有一个窗口”的几何降级；持键过程中继续复核并释放自己按下的键。
 旧 helper 不提供相应键盘动作，普通 AT-SPI 语义调用及其已声明的纯指针功能仍可用。
 
+非空 `drag.path` 还要求 `anchored-drag-path`，最多 32 个同一观察、同一元素内的归一化中间锚点；
+起点和终点比例必须显式给出。按下前逐点检查，每段前完整 fresh AT-SPI 复核原生身份、
+fingerprint、状态、原始 bounds 及前后点，释放前再查终点。窄 scope 另以最多 5000 节点、
+128 层读取所属完整窗口，只用于遮挡校验，截断则拒绝；该私有读取不扩大授权成员或发布为
+当前观察。其他可见分支覆盖锚点时保守拒绝，包括 disabled 覆盖层，因为 Qt 在鼠标抓取期间
+可能继续把命中结果报告给原控件。未被 toolkit 暴露的非原生覆盖层仍不能保证被识别。
+
+helper 每段先发带请求唯一 nonce 和顺序号的验证请求，收到对应 ACK 后才移动，并独立复核
+X11 窗口/PID/几何/命中。Rust 只读 worker 不占主循环；AX 调用阻塞时取消和截止时间仍可
+触发 helper 释放，迟到结果不再 ACK。每个 backend 同时只保留一个此类 worker，尚未退出的
+只读请求会阻止新路径。空路径行为不变，跨资源拖拽尚未由 Linux provider 启用。
+
 ## 截图、OCR、窗口、粘贴、剪贴板与全局快捷键
 
 与 Windows 同一组会话操作与授权（`--allow-input`、`--allow-clipboard-read`、
@@ -105,6 +117,12 @@ PID-only 判定的缺口，并验证新窗口绑定、子窗口焦点、长按�
 `verify-x11-paste-sequence.ps1` 另验证延迟三种文字格式、明确拒绝不支持格式、后续 owner
 不被覆盖，以及连续请求仍在交付上限内结束。真实 Code 此次取数为 1 次文字和 18 次元数据，
 不能把私有三格式案例当成 Code 的实际请求序列。Code 原生指针命中仍需单独解决。
+
+`verify-x11-drag-path.ps1` 的私有 Xvfb 十项检查回读真实轨迹与键鼠释放；
+`verify-native-drag-path.ps1` 的本机 Qt 七项检查包含窄 surface scope 外的 sibling overlay，
+实际事件确认正向路径三次移动、坏锚点零 down、几何变化/遮挡/取消后 up。
+小 fixture 的两中间点整窗口路径约 734 ms，窄 scope 加窗口复核约 1114 ms；取消后的 up
+约 3 ms，窄 scope 遮挡后的 up 约 189 ms。这些是本次测试耗时，不能外推复杂应用或 32 点性能。
 
 取消由每次调用显式传入的 `CancellationToken` 贯穿到 Linux backend。调用副本共享当前观察、
 焦点订阅与录制状态，取消 token 不写回共享 backend；下一次调用不会继承取消状态。
