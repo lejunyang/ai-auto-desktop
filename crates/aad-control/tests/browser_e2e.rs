@@ -167,6 +167,9 @@ struct Fixture {
 }
 impl Fixture {
     fn new() -> Self {
+        Self::with_automation(false)
+    }
+    fn with_automation(automation: bool) -> Self {
         let binary = std::env::var_os("AAD_TEST_CHROME")
             .expect("set AAD_TEST_CHROME to a sandbox-capable Chromium binary");
         let root = std::env::temp_dir().join(format!("aad-browser-e2e-{}", uuid::Uuid::new_v4()));
@@ -216,6 +219,9 @@ impl Fixture {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::inherit());
+        if automation {
+            command.arg("--enable-automation");
+        }
         // Reclaim only this fixture's own process group, never all Chrome processes.
         #[cfg(unix)]
         unsafe {
@@ -838,6 +844,133 @@ fn canvas_surfaces_take_trusted_clicks_wheels_and_drags_inside_the_same_element(
     let covered = act(&session, canvas, Action::click());
     assert_eq!(covered.error.unwrap()["code"], "CONTROL.OCCLUDED");
     assert_eq!(page_value(&fixture, "window.surfaceEvents"), json!([]));
+}
+
+#[test]
+#[ignore = "requires isolated Chromium with its sandbox enabled; CI runs it explicitly"]
+fn verified_headless_instances_are_isolated_but_all_attachments_share_ownership() {
+    let _serial = serial();
+    let desktop = Session::new(Vec::new(), Policy::default());
+    desktop.input_lease("desktop-input").unwrap();
+    let first = Fixture::with_automation(true);
+    let backend = Arc::new(BrowserBackend::launched(first.port));
+    let owned = Session::new(
+        vec![backend],
+        Policy {
+            allow_input: true,
+            ..Default::default()
+        },
+    );
+    let owned_main = main_of(&owned, &first.page_id);
+    let loaded = wait_until(&owned, &owned_main, "Name", WaitCondition::Appears);
+    assert!(loaded.error.is_none(), "{loaded:?}");
+    page_value(
+        &first,
+        "window.saveCount=0;document.getElementById('save').onclick=()=>window.saveCount++;true",
+    );
+    let observed = observe(&owned, &owned_main);
+    assert_eq!(observed["metadata"]["headless_input"], true);
+    let instance = observed["metadata"]["browser_instance_id"].clone();
+    assert!(instance.as_str().is_some_and(|id| !id.is_empty()));
+    let clicked = act(
+        &owned,
+        find(&owned, &observed, "button", "Save"),
+        Action::click(),
+    );
+    assert!(clicked.error.is_none(), "{clicked:?}");
+    assert_eq!(page_value(&first, "window.saveCount"), 1);
+
+    let (attached, _) = session_for(&first);
+    let attached_main = main_of(&attached, &first.page_id);
+    let observed = observe(&attached, &attached_main);
+    assert_eq!(observed["metadata"]["browser_instance_id"], instance);
+    assert_eq!(observed["metadata"]["headless_input"], true);
+    let refused = act(
+        &attached,
+        find(&attached, &observed, "button", "Save"),
+        Action::click(),
+    );
+    assert_eq!(refused.error.unwrap()["code"], "CONTROL.RESOURCE_BUSY");
+    assert_eq!(page_value(&first, "window.saveCount"), 1);
+
+    // Exercise the actual shared launcher, including its automation switch,
+    // as well as an independently started browser attached only by port.
+    let second = aad_cdp::launch::Browser::start(aad_cdp::launch::Options {
+        browser: "chrome".into(),
+        executable: Some(std::env::var_os("AAD_TEST_CHROME").unwrap().into()),
+        profile_dir: None,
+        copy_from: None,
+        profile_id: "Default".into(),
+        kill_browser: false,
+        headless: true,
+    })
+    .unwrap();
+    let independent = Session::new(
+        vec![Arc::new(BrowserBackend::new(second.port))],
+        Policy {
+            allow_input: true,
+            ..Default::default()
+        },
+    );
+    let independent_main = main_of(&independent, &second.page);
+    let observed = observe(&independent, &independent_main);
+    let navigated = act(
+        &independent,
+        document(&independent, &observed),
+        Action::Navigate {
+            url: first.url.clone(),
+        },
+    );
+    assert!(navigated.error.is_none(), "{navigated:?}");
+    let loaded = wait_until(
+        &independent,
+        &independent_main,
+        "Name",
+        WaitCondition::Appears,
+    );
+    assert!(loaded.error.is_none(), "{loaded:?}");
+    assert_ne!(
+        observe(&independent, &independent_main)["metadata"]["browser_instance_id"],
+        instance
+    );
+    let clicked = act_on(
+        &independent,
+        &independent_main,
+        "button",
+        "Save",
+        Action::click(),
+    );
+    assert!(clicked.error.is_none(), "{clicked:?}");
+    assert_eq!(
+        status(&observe(&independent, &independent_main)),
+        "clicked:false"
+    );
+
+    // Without command-line verification, even an actually headless browser
+    // conservatively needs the physical desktop in addition to its instance.
+    let unknown = Fixture::new();
+    let (fallback, _) = session_for(&unknown);
+    let fallback_main = main_of(&fallback, &unknown.page_id);
+    assert!(
+        wait_until(&fallback, &fallback_main, "Name", WaitCondition::Appears)
+            .error
+            .is_none()
+    );
+    assert_eq!(
+        observe(&fallback, &fallback_main)["metadata"]["headless_input"],
+        false
+    );
+    let refused = act_on(&fallback, &fallback_main, "button", "Save", Action::click());
+    assert_eq!(refused.error.unwrap()["code"], "CONTROL.RESOURCE_BUSY");
+    assert_eq!(status(&observe(&fallback, &fallback_main)), "ready");
+    desktop.close();
+    let clicked = act_on(&fallback, &fallback_main, "button", "Save", Action::click());
+    assert!(clicked.error.is_none(), "{clicked:?}");
+    assert_eq!(status(&observe(&fallback, &fallback_main)), "clicked:false");
+    owned.close();
+    let clicked = act_on(&attached, &attached_main, "button", "Save", Action::click());
+    assert!(clicked.error.is_none(), "{clicked:?}");
+    assert_eq!(page_value(&first, "window.saveCount"), 2);
 }
 
 #[test]

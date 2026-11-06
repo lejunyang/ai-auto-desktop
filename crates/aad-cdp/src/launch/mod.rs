@@ -169,7 +169,10 @@ impl Browser {
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         if options.headless {
-            command.arg("--headless=new");
+            // Allows trusted Browser.getBrowserCommandLine verification, so
+            // attached control sessions can share this instance's input lease
+            // without unnecessarily owning the physical desktop.
+            command.args(["--headless=new", "--enable-automation"]);
         }
         #[cfg(unix)]
         {

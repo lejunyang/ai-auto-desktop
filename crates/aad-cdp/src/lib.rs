@@ -199,16 +199,29 @@ impl Client {
     /// and `Browser` domains. The endpoint comes from `/json/version` and is
     /// always reached on loopback at `port`, whatever host the browser names.
     pub fn browser_until(port: u16, deadline: std::time::Instant) -> Result<Self, CdpError> {
+        Self::browser_with_identity_until(port, deadline).map(|(client, _)| client)
+    }
+
+    /// The connection and the browser instance id from its validated endpoint.
+    /// All attached sessions use this same identity for cooperating input locks.
+    pub fn browser_with_identity_until(
+        port: u16,
+        deadline: std::time::Instant,
+    ) -> Result<(Self, String), CdpError> {
         let body = http_get_until(port, "/json/version", deadline)?;
         let value: serde_json::Value =
             serde_json::from_str(&body).map_err(|error| CdpError::protocol(error.to_string()))?;
         let endpoint = browser_endpoint(port, value["webSocketDebuggerUrl"].as_str())?;
+        let identity = endpoint.rsplit('/').next().unwrap().to_string();
         let ws = ws::WebSocket::connect_until(&endpoint, deadline)?;
-        Ok(Client {
-            connection: connection::Connection::new(ws)?,
-            next_id: 0,
-            deadline: None,
-        })
+        Ok((
+            Client {
+                connection: connection::Connection::new(ws)?,
+                next_id: 0,
+                deadline: None,
+            },
+            identity,
+        ))
     }
 
     /// Deadline for a trusted application's sequence of CDP calls. This is a

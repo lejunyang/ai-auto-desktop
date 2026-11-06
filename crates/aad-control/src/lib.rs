@@ -60,6 +60,11 @@ pub trait Backend: Send + Sync {
     fn lease_key(&self, _snapshot: &Value) -> Option<String> {
         None
     }
+    /// All cooperating input resources needed by this operation. A browser
+    /// always owns its instance, and may also need the physical desktop.
+    fn lease_keys(&self, snapshot: &Value) -> Result<Vec<String>> {
+        Ok(self.lease_key(snapshot).into_iter().collect())
+    }
     /// Read-only operations beyond observe and find this provider offers,
     /// such as `capture`; listed by `capabilities` so none is guessed at.
     fn reads(&self) -> Vec<String> {
@@ -802,6 +807,12 @@ impl Session {
     }
 
     pub fn input_lease(&self, key: &str) -> Result<Arc<lease::InputLease>> {
+        Ok(self.input_leases(&[key.to_string()])?.pop().unwrap())
+    }
+
+    /// Acquire a sorted set atomically with respect to this session. Failed
+    /// acquisition drops only this call's new leases; existing ones survive.
+    pub fn input_leases(&self, keys: &[String]) -> Result<Vec<Arc<lease::InputLease>>> {
         if self.closed.load(Ordering::SeqCst) || self.created.elapsed() >= self.lifetime {
             return Err(error(
                 "CONTROL.SESSION_CLOSED",
@@ -812,12 +823,23 @@ impl Session {
         if self.closed.load(Ordering::SeqCst) {
             return Err(error("CONTROL.SESSION_CLOSED", "session is closed"));
         }
-        if let Some(lease) = leases.get(key) {
-            return Ok(lease.clone());
+        let ordered: BTreeSet<&str> = keys.iter().map(String::as_str).collect();
+        let mut acquired = Vec::new();
+        let mut result = Vec::new();
+        for key in ordered {
+            if let Some(lease) = leases.get(key) {
+                result.push(lease.clone());
+            } else {
+                let lease = Arc::new(lease::InputLease::acquire_for(key, &self.id)?);
+                acquired.push((key.to_string(), lease.clone()));
+                result.push(lease);
+            }
         }
-        let lease = Arc::new(lease::InputLease::acquire_for(key, &self.id)?);
-        leases.insert(key.into(), lease.clone());
-        Ok(lease)
+        if self.closed.load(Ordering::SeqCst) {
+            return Err(error("CONTROL.SESSION_CLOSED", "session is closed"));
+        }
+        leases.extend(acquired);
+        Ok(result)
     }
 
     pub fn execute(&self, request: &Request) -> Response {
@@ -1193,12 +1215,21 @@ impl Session {
                     ));
                 }
                 context.remaining()?;
-                let _lease = backend
-                    .lease_key(&observation.raw)
-                    .map(|key| self.input_lease(&key))
-                    .transpose()?;
+                let _lease = self.input_leases(&backend.lease_keys(&observation.raw)?)?;
                 context.remaining()?;
-                let result = backend.act(&observation.raw, node, action, context);
+                let result = match secret {
+                    Some(text) => backend
+                        .secret_input(&observation.raw, node, text, context)
+                        .map(|_| json!({"submitted": true, "redacted": true}))
+                        .map_err(|failure| {
+                            // Platform APIs may echo arguments even in errors.
+                            // No free-form backend value leaves this boundary.
+                            error("CONTROL.SECRET_INPUT_FAILED", "secret input failed; no secret values are included in this response")
+                                .with_effect(if failure.effect == "not_applied" { "not_applied" } else { "unknown" })
+                                .with_retryable(failure.retryable)
+                        }),
+                    None => backend.act(&observation.raw, node, action, context),
+                };
                 self.state
                     .lock()
                     .unwrap()
@@ -2500,6 +2531,44 @@ mod browser_request_tests {
                 }
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod input_lease_set_tests {
+    use super::*;
+
+    #[test]
+    fn a_failed_lease_set_releases_only_new_locks() {
+        let id = uuid::Uuid::new_v4();
+        let fresh = format!("lease-test-{id}-a");
+        let retained = format!("lease-test-{id}-m");
+        let blocked = format!("lease-test-{id}-z");
+        let owner = Session::new(Vec::new(), Policy::default());
+        let contender = Session::new(Vec::new(), Policy::default());
+        let verifier = Session::new(Vec::new(), Policy::default());
+        owner.input_lease(&blocked).unwrap();
+        contender.input_lease(&retained).unwrap();
+        // Input order is intentionally reversed: sorted acquisition takes the
+        // new lock first, then the pre-existing one, then encounters conflict.
+        let failed = contender.input_leases(&[blocked.clone(), retained.clone(), fresh.clone()]);
+        assert_eq!(failed.err().unwrap().code, "CONTROL.RESOURCE_BUSY");
+        verifier
+            .input_lease(&fresh)
+            .expect("new lock was rolled back");
+        assert_eq!(
+            verifier.input_lease(&retained).err().unwrap().code,
+            "CONTROL.RESOURCE_BUSY"
+        );
+        owner.close();
+        contender
+            .input_leases(&[blocked.clone(), blocked, retained])
+            .unwrap();
+        assert_eq!(
+            contender.leases.lock().unwrap().len(),
+            2,
+            "duplicates are acquired once"
+        );
     }
 }
 

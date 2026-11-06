@@ -479,6 +479,57 @@ struct ElementScope {
     backend_node_id: i64,
 }
 
+#[derive(Clone)]
+struct BrowserInput {
+    instance: String,
+    headless: bool,
+}
+
+/// Only the browser process's own command line establishes isolation; a
+/// page's user agent, launch request, or caller-supplied flag cannot do so.
+fn verified_headless(command_line: &Value) -> bool {
+    let Some(arguments) = command_line["arguments"].as_array() else {
+        return false;
+    };
+    let switches: Vec<&str> = arguments
+        .iter()
+        .skip(1)
+        .filter_map(Value::as_str)
+        .take_while(|argument| *argument != "--")
+        .filter(|argument| argument.starts_with("--headless"))
+        .collect();
+    !switches.is_empty()
+        && switches.iter().all(|argument| {
+            matches!(
+                *argument,
+                "--headless" | "--headless=new" | "--headless=old"
+            )
+        })
+}
+
+fn browser_input_keys(snapshot: &Value) -> Result<Vec<String>> {
+    let instance = snapshot["metadata"]["browser_instance_id"]
+        .as_str()
+        .filter(|id| {
+            !id.is_empty()
+                && id.len() <= 128
+                && id.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-')
+        })
+        .ok_or_else(|| {
+            error(
+                "CONTROL.STALE_TARGET",
+                "browser input identity is missing; observe again",
+            )
+        })?;
+    // Every attachment contends on the instance even when headless status is
+    // unknown. Otherwise a failed command-line query could select another lock.
+    let mut keys = vec![format!("browser-input:{instance}")];
+    if snapshot["metadata"]["headless_input"] != true {
+        keys.push("desktop-input".into());
+    }
+    Ok(keys)
+}
+
 pub struct BrowserBackend {
     /// The loopback CDP port; 0 until a browser is attached.
     port: AtomicU16,
@@ -486,6 +537,7 @@ pub struct BrowserBackend {
     histories: Mutex<BTreeMap<String, std::sync::Arc<Mutex<DiagnosticHistory>>>>,
     /// The browser-level connection, for tabs and downloads; opened when first needed.
     browser: Mutex<Option<Client>>,
+    input_identity: Mutex<Option<BrowserInput>>,
     downloads: Mutex<Downloads>,
     world: String,
     last_context: Mutex<Option<(String, Ctx)>>,
@@ -500,6 +552,7 @@ impl BrowserBackend {
             pages: Mutex::new(BTreeMap::new()),
             histories: Mutex::new(BTreeMap::new()),
             browser: Mutex::new(None),
+            input_identity: Mutex::new(None),
             downloads: Mutex::new(Downloads::default()),
             world: format!("aad-control-{}", uuid::Uuid::new_v4()),
             last_context: Mutex::new(None),
@@ -546,6 +599,7 @@ impl BrowserBackend {
         self.pages.lock().unwrap().clear();
         self.histories.lock().unwrap().clear();
         *self.browser.lock().unwrap() = None;
+        *self.input_identity.lock().unwrap() = None;
         *self.last_context.lock().unwrap() = None;
         self.element_scopes.lock().unwrap().clear();
         self.port.store(port, Ordering::SeqCst);
@@ -747,7 +801,21 @@ impl BrowserBackend {
         let port = self.port()?;
         let mut slot = self.browser.lock().unwrap();
         if slot.is_none() {
-            let client = Client::browser_until(port, deadline).map_err(cdp_error)?;
+            let (mut client, instance) =
+                Client::browser_with_identity_until(port, deadline).map_err(cdp_error)?;
+            client.set_deadline(deadline);
+            let headless = client
+                .command("Browser.getBrowserCommandLine", json!({}))
+                .ok()
+                .is_some_and(|command_line| verified_headless(&command_line));
+            let mut known = self.input_identity.lock().unwrap();
+            // Process arguments are immutable. A transient query failure on
+            // reconnect cannot revoke already established isolation.
+            let headless = headless
+                || known
+                    .as_ref()
+                    .is_some_and(|old| old.instance == instance && old.headless);
+            *known = Some(BrowserInput { instance, headless });
             client.filter_events(&[DOWNLOAD_BEGIN, DOWNLOAD_PROGRESS], &[]);
             *slot = Some(client);
         }
@@ -763,6 +831,20 @@ impl BrowserBackend {
             *slot = None;
         }
         result
+    }
+
+    fn browser_input(&self, deadline: Instant) -> Result<BrowserInput> {
+        // Confirm that the browser connection is alive before binding a new
+        // observation to its identity (a debug port may have been reused).
+        self.with_browser(deadline, |client| {
+            command(client, "Browser.getVersion", json!({}))
+        })?;
+        self.input_identity.lock().unwrap().clone().ok_or_else(|| {
+            error(
+                "BROWSER.BAD_RESULT",
+                "browser input identity is unavailable",
+            )
+        })
     }
 
     /// What the browser downloaded since this session first connected to it:
@@ -1589,10 +1671,8 @@ impl Backend for BrowserBackend {
     fn reads(&self) -> Vec<String> {
         vec!["capture".into()]
     }
-    fn lease_key(&self, _snapshot: &Value) -> Option<String> {
-        // UIA/AX/AT-SPI can also operate a browser. Share one cooperating
-        // input owner rather than pretending these are disjoint devices.
-        Some("desktop-input".into())
+    fn lease_keys(&self, snapshot: &Value) -> Result<Vec<String>> {
+        browser_input_keys(snapshot)
     }
     fn name(&self) -> &str {
         PROVIDER
@@ -1846,6 +1926,7 @@ impl Backend for BrowserBackend {
     }
     fn observe(&self, selector: &Value, max_nodes: usize, timeout: Duration) -> Result<Value> {
         let deadline = Instant::now() + timeout;
+        let input = self.browser_input(deadline)?;
         self.clear_context(
             &mut self.pages.lock().unwrap(),
             deadline.min(Instant::now() + Duration::from_millis(100)),
@@ -1901,10 +1982,13 @@ impl Backend for BrowserBackend {
         };
         // An isolated world destroyed under the observation (navigation,
         // context churn) is created again once, within the deadline.
-        match attempt() {
+        let mut result = match attempt() {
             Err(e) if e.code == "BROWSER.CONTEXT_LOST" && Instant::now() < deadline => attempt(),
             other => other,
-        }
+        }?;
+        result["metadata"]["browser_instance_id"] = json!(input.instance);
+        result["metadata"]["headless_input"] = json!(input.headless);
+        Ok(result)
     }
     fn act(
         &self,
@@ -1914,6 +1998,13 @@ impl Backend for BrowserBackend {
         action_context: &crate::Context,
     ) -> Result<Value> {
         let meta = &snapshot["metadata"];
+        let input = self.browser_input(Instant::now() + action_context.remaining()?)?;
+        if meta["browser_instance_id"] != input.instance {
+            return Err(error(
+                "CONTROL.STALE_TARGET",
+                "browser input instance changed; observe again",
+            ));
+        }
         if !node["actions"]
             .as_array()
             .is_some_and(|a| a.iter().any(|v| v == action.name()))
@@ -3305,6 +3396,81 @@ fn keyboard(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn isolation_requires_the_browser_command_line_not_a_page_claim() {
+        for switch in ["--headless", "--headless=new", "--headless=old"] {
+            assert!(verified_headless(
+                &json!({"arguments":["chromium",switch,"--enable-automation"]})
+            ));
+        }
+        for untrusted in [
+            json!({"userAgent":"HeadlessChrome", "headless":true}),
+            json!({"arguments":["--headless=new"]}),
+            json!({"arguments":["chromium","--","--headless=new"]}),
+            json!({"arguments":["chromium","--headless=false"]}),
+            json!({"arguments":["chromium","--headless=new","--headless=unknown"]}),
+            json!({"arguments":["chromium","--enable-automation"]}),
+        ] {
+            assert!(!verified_headless(&untrusted), "{untrusted}");
+        }
+        assert!(browser_input_keys(&json!({})).is_err());
+    }
+
+    #[test]
+    fn headless_and_unknown_attachments_share_an_instance_lock_and_fallback_owns_desktop() {
+        let id = uuid::Uuid::new_v4().to_string();
+        let another = uuid::Uuid::new_v4().to_string();
+        let desktop = format!("test-desktop-{id}");
+        let keys = |instance: &str, headless: bool| {
+            let mut keys = browser_input_keys(
+                &json!({"metadata":{"browser_instance_id":instance,"headless_input":headless}}),
+            )
+            .unwrap();
+            assert_eq!(keys.contains(&"desktop-input".to_string()), !headless);
+            // Real filesystem locks, in a unique desktop namespace so this
+            // non-GUI unit test cannot block someone else's foreground work.
+            for key in &mut keys {
+                if key == "desktop-input" {
+                    *key = desktop.clone();
+                }
+            }
+            keys
+        };
+        let session = || crate::Session::new(Vec::new(), crate::Policy::default());
+        let unknown = session();
+        let confirmed = session();
+        let independent = session();
+        unknown.input_leases(&keys(&id, false)).unwrap();
+        assert_eq!(
+            confirmed.input_leases(&keys(&id, true)).err().unwrap().code,
+            "CONTROL.RESOURCE_BUSY"
+        );
+        independent.input_leases(&keys(&another, true)).unwrap();
+        unknown.close();
+        confirmed.input_leases(&keys(&id, true)).unwrap();
+        let retried = session();
+        assert_eq!(
+            retried.input_leases(&keys(&id, false)).err().unwrap().code,
+            "CONTROL.RESOURCE_BUSY"
+        );
+
+        let native = session();
+        native.input_lease(&desktop).unwrap();
+        let fresh = uuid::Uuid::new_v4().to_string();
+        let fallback = session();
+        assert_eq!(
+            fallback
+                .input_leases(&keys(&fresh, false))
+                .err()
+                .unwrap()
+                .code,
+            "CONTROL.RESOURCE_BUSY"
+        );
+        // Losing desktop acquisition releases the newly taken instance lock.
+        let isolated = session();
+        isolated.input_leases(&keys(&fresh, true)).unwrap();
+    }
     #[test]
     fn unknown_element_scope_tokens_never_fall_back_to_html_ids() {
         let backend = BrowserBackend::new(0);
