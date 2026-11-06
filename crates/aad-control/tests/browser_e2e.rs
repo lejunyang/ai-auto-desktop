@@ -237,7 +237,9 @@ impl Fixture {
             url,
             page_id: String::new(),
         };
-        let deadline = Instant::now() + Duration::from_secs(20);
+        // The tests start their Chromiums at once, which on a small CI runner
+        // can take well over 20 seconds.
+        let deadline = Instant::now() + Duration::from_secs(60);
         loop {
             if let Ok(text) = std::fs::read_to_string(fixture.root.join("DevToolsActivePort")) {
                 if let Some(port) = text.lines().next().and_then(|s| s.parse().ok()) {
