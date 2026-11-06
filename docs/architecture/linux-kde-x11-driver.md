@@ -96,6 +96,19 @@ plugins/linux_atspi/build_x11_capture_helper.sh
 PID-only 判定的缺口，并验证新窗口绑定、子窗口焦点、长按途中同 PID 焦点切换和窗口移动后的释放。
 这些测试不证明此前 VS Code 实验每一次输入的实际落点；Electron 编辑保存仍需独立验收。
 
+取消由每次调用显式传入的 `CancellationToken` 贯穿到 Linux backend。调用副本共享当前观察、
+焦点订阅与录制状态，取消 token 不写回共享 backend；下一次调用不会继承取消状态。
+helper 必须声明 `cooperative-cancel`。Rust 同时轮询子进程、token、截止时间与非阻塞 stdin，
+即使 helper 不读取大输入也能取消。取消先发送 SIGTERM，再关闭未完成的输入管道；helper
+停止后续字符/按键，释放自己按下的键鼠并恢复剪贴板，最多给清理 3 秒再强制结束。
+已派发或被强制结束而缺少完整证据时返回 `unknown`，原观察失效。同步 AT-SPI D-Bus 请求
+只在派发前后检查 token，不能承诺中断正在等待的 D-Bus 调用。
+
+`verify-native-cancel.ps1` 在 Qt 应用独立报告实际 down 后通过正式控制入口取消 5 秒长按，
+分别确认键、按钮、拖拽提前释放及下一次操作成功。`verify-x11-cancel.ps1` 在私有 Xvfb
+确认长文本停止后续字符、全局测试组合键释放、粘贴预读取消不更换原 owner，以及粘贴派发后
+取消仍能独立读回原剪贴板。没有用真实全局快捷键操作用户桌面。
+
 CI 在私有 Xvfb、session bus 和 AT-SPI bus 中编译 Qt5 C++ fixture，并使用正式 Rust provider
 验证应用枚举、snapshot/find、set_text、XTest Unicode 输入、中心点点击和目标截图：
 
