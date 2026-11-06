@@ -150,6 +150,18 @@ login-recording/
 aad browser-record export --out ./login-recording
 ```
 
+## 回放
+
+录到的操作可以转成和 `aad record` 一样的平台无关步骤（`control-steps/1`），用 `aad run` 重放：
+
+```powershell
+aad browser-record steps --out ./login-recording                    # 只看转出的步骤和跳过的操作
+aad browser-record steps --out ./login-recording --save 后台开权限  # 另存为录制和工作流
+aad run 后台开权限 --permission desktop.input --permission desktop.observe
+```
+
+每一步按页面地址（到路径为止，去掉查询和锚点）找页面，按控制会话自己的角色和名字找元素：录制脚本和控制会话用同一份命名规则（`aad-cdp/src/naming.js`），所以录下的名字回放时能找到同一个元素。页面和它里面的同站 iframe 地址前缀相同时，选地址完全一致的那个。连续输入合并成一次填写，点进输入框或勾选框的那一下并入它引起的修改，勾选框和单选框记成勾选，Enter 记成按键，表单提交不单独成步（引起它的点击或 Enter 已经是一步）；密码框的内容不保存，改成运行时输入。回放前浏览器要已经打开那个页面（例如 MCP 的 `browser_open`）。这个版本以前的录制没有控制会话的定位，转换时列在 `skipped` 里。
+
 ## 完整性与当前边界
 
 - CDP 断连、写入失败、超预算会失败退出并尽力写入 `incomplete`，不要把缺失当作用户没有操作。网络和步骤分组在正常停止时最终落盘；崩溃时可读动作/UI 检查点，但不能保证所有内存中的请求分组已保存。当前不自动重连恢复录制。

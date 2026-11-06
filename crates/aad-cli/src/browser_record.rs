@@ -41,6 +41,21 @@ pub enum Command {
         #[arg(long)]
         out: PathBuf,
     },
+    /// Turn a completed recording into steps that replay with `aad run`.
+    ///
+    /// Each step names its page by address and its element by the role and
+    /// name the control session finds it by. Typed passwords become inputs
+    /// asked for at run time.
+    Steps {
+        #[arg(long)]
+        out: PathBuf,
+        /// Save them as a named recording and workflow, as `aad record --save`.
+        #[arg(long, value_name = "NAME")]
+        save: Option<String>,
+        /// Replace an existing recording of that name.
+        #[arg(long, requires = "save")]
+        overwrite: bool,
+    },
 }
 
 #[derive(Args)]
@@ -189,6 +204,26 @@ pub fn run(command: &Command) -> recording::Result<Value> {
         Command::Export { out } => {
             recording::export(out)?;
             Ok(json!({"exported":true,"out":out.join("walkthrough.md")}))
+        }
+        Command::Steps {
+            out,
+            save,
+            overwrite,
+        } => {
+            if let Some(name) = save {
+                crate::desk::may_save(name, *overwrite)?;
+            }
+            let recorded = std::fs::read_to_string(out.join("steps.jsonl"))?;
+            let batch = aad_control::recording::from_browser_steps(&recorded, &mut 1);
+            let mut answer = json!({
+                "count": batch.steps.len(),
+                "steps": batch.steps,
+                "skipped": batch.skipped,
+            });
+            if let Some(name) = save {
+                answer["saved"] = crate::desk::save_steps(name, &batch.steps);
+            }
+            Ok(answer)
         }
     }
 }

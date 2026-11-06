@@ -303,7 +303,7 @@ fn resource(session: &Session, app: &App, deadline: Instant) -> Result<Option<St
         .as_array()
         .map(|all| all.iter().filter(|r| matches(app, r)).collect())
         .unwrap_or_default();
-    match found.as_slice() {
+    match closest(app, found).as_slice() {
         [] => Ok(None),
         [one] => Ok(one["resource_id"].as_str().map(str::to_string)),
         several => Err(error(
@@ -318,6 +318,27 @@ fn resource(session: &Session, app: &App, deadline: Instant) -> Result<Option<St
                 .map(|r| json!({"name": r["name"], "provider": r["provider"]}))
                 .collect::<Vec<_>>()),
         )),
+    }
+}
+
+/// A page and the frames inside it can all start with a step's address: the
+/// step means the one whose address is exactly that (query and fragment
+/// aside), when only one is.
+fn closest<'a>(app: &App, found: Vec<&'a Value>) -> Vec<&'a Value> {
+    let Some(url) = app.url.as_deref().filter(|_| found.len() > 1) else {
+        return found;
+    };
+    let page =
+        |address: &str| address[..address.find(['?', '#']).unwrap_or(address.len())].to_string();
+    let exact: Vec<&Value> = found
+        .iter()
+        .copied()
+        .filter(|r| r["metadata"]["url"].as_str().map(page).as_deref() == Some(url))
+        .collect();
+    if exact.len() == 1 {
+        exact
+    } else {
+        found
     }
 }
 

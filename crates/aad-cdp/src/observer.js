@@ -7,6 +7,7 @@
   let nextId = 0, sequence = 0, dropped = 0, dirty = true;
   const queue = [], listeners = [];
   const id = el => { if (!ids.has(el)) ids.set(el, ++nextId); return String(ids.get(el)); };
+  /*AAD_NAMING*/
   const label = el => (el.getAttribute?.('aria-label') ||
     Array.from(el.labels || []).map(l => l.innerText || l.textContent || '').join(' ') ||
     el.getAttribute?.('title') || el.getAttribute?.('placeholder') ||
@@ -16,6 +17,8 @@
   const element = el => ({
     node_id: id(el), role: role(el), name: label(el), tag: el.tagName?.toLowerCase(),
     locator: {role:role(el),name:label(el),id:el.id || null,test_id:el.getAttribute?.('data-testid') || null},
+    // The role and name the control session finds it by, for replaying the step.
+    control: {role:roleOf(el),name:labelOf(el)},
     enabled: !el.disabled && el.getAttribute?.('aria-disabled') !== 'true',
     selected: el.getAttribute?.('aria-selected'), expanded: el.getAttribute?.('aria-expanded'),
     checked: typeof el.checked === 'boolean' ? el.checked : el.getAttribute?.('aria-checked'),

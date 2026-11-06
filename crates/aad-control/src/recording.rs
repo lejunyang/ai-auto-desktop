@@ -190,6 +190,91 @@ pub fn from_events(app: &App, events: &[Value], next: &mut usize) -> Batch {
     batch
 }
 
+const BROWSER: &str = "browser.cdp";
+
+/// The page a recorded browser action happened on, as a step names it: the
+/// address up to its path, so a query or fragment that changes per visit
+/// does not keep the step from finding its page.
+fn page_of(url: &str) -> Option<String> {
+    let cut = url.find(['?', '#']).unwrap_or(url.len());
+    let page = &url[..cut];
+    (page.starts_with("http://") || page.starts_with("https://")).then(|| page.to_string())
+}
+
+/// Steps for a browser recording's `steps.jsonl` (aad-cdp's recorder), oldest
+/// first. Each action names its element by `control`, the role and name the
+/// control session finds it by; actions recorded without one (older
+/// recordings) are skipped. A form submission is skipped as well: the click
+/// or Enter that caused it is already a step.
+pub fn from_browser_steps(steps_jsonl: &str, next: &mut usize) -> Batch {
+    let mut batch = Batch::default();
+    // Consecutive actions on one page replay against that page.
+    let mut runs: Vec<(App, Vec<Value>)> = Vec::new();
+    for line in steps_jsonl.lines().filter(|l| !l.trim().is_empty()) {
+        let Ok(step) = serde_json::from_str::<Value>(line) else {
+            batch.skipped.push(json!({"reason": "无法读取的记录行"}));
+            continue;
+        };
+        if step["kind"] != "action" {
+            continue;
+        }
+        let action = &step["action"];
+        let kind = action["kind"].as_str().unwrap_or_default();
+        if kind == "submit" {
+            continue;
+        }
+        let control = &action["control"];
+        if control["role"].as_str().is_none_or(str::is_empty) {
+            batch.skipped.push(json!({
+                "reason": "记录里没有控制会话的定位（旧版录制）",
+                "summary": format!("{kind} {}", action["label"].as_str().unwrap_or_default()),
+            }));
+            continue;
+        }
+        let Some(page) = action["url"].as_str().and_then(page_of) else {
+            batch
+                .skipped
+                .push(json!({"reason": "不在网页上的操作", "summary": kind}));
+            continue;
+        };
+        let mut node = json!({"role": control["role"], "name": control["name"]});
+        let at_ms = action["at_ms"].clone();
+        let event = match kind {
+            "click" => json!({"kind": "click", "button": "left", "node": node, "at_ms": at_ms}),
+            "enter" => json!({"kind": "key", "keys": ["enter"], "node": node, "at_ms": at_ms}),
+            "input" if matches!(action["type"].as_str(), Some("checkbox" | "radio")) => json!({
+                "kind": "toggle", "checked": action["checked"] == true, "node": node, "at_ms": at_ms,
+            }),
+            "input" => {
+                node["value"] = action["value"].clone();
+                node["protected"] = json!(action["protected"] == true);
+                json!({"kind": "text", "node": node, "at_ms": at_ms})
+            }
+            other => {
+                batch
+                    .skipped
+                    .push(json!({"reason": format!("不认识的浏览器操作 {other:?}")}));
+                continue;
+            }
+        };
+        let app = App {
+            provider: Some(BROWSER.into()),
+            url: Some(page),
+            ..Default::default()
+        };
+        match runs.last_mut() {
+            Some((last, events)) if *last == app => events.push(event),
+            _ => runs.push((app, vec![event])),
+        }
+    }
+    for (app, events) in runs {
+        let part = from_events(&app, &events, next);
+        batch.steps.extend(part.steps);
+        batch.skipped.extend(part.skipped);
+    }
+    batch
+}
+
 /// A recording in progress on one window or application.
 pub struct Recording {
     provider: Arc<dyn Provider>,

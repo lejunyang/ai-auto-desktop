@@ -810,13 +810,18 @@ pub fn act(command: &DoCommand) -> (Value, u8) {
 pub struct RecordArgs {
     /// The window or application to watch, as for `aad describe`.
     resource: String,
-    /// How long to record for, in seconds (1..600).
+    /// How long to record for, in seconds (1..600; default 15).
     ///
-    /// Recording runs for a fixed time because a command-line session has no
-    /// way to be told "stop now": the process stays alive to hold the watch,
-    /// then reports.
-    #[arg(long, default_value_t = 15)]
-    seconds: u64,
+    /// A command-line session has no other way to be told "stop now": the
+    /// process stays alive to hold the watch, then reports. With
+    /// `--until-stdin-closes` this is only the longest it may run (up to 3600,
+    /// default 3600).
+    #[arg(long)]
+    seconds: Option<u64>,
+    /// Stop as soon as standard input closes, for a host that starts the
+    /// recording and ends it when the person says they are done.
+    #[arg(long)]
+    until_stdin_closes: bool,
     /// Save the steps as a named recording and workflow, ready for `aad run`.
     ///
     /// The steps name the application by process or title and each element by
@@ -837,19 +842,23 @@ fn automation(error: aad_core::AutomationError) -> (Value, u8) {
     (json!({"status": "error", "error": error}), EXIT_FAILED)
 }
 
+/// The longest a recording may run, in seconds.
+fn record_limit(seconds: Option<u64>, until_stdin_closes: bool) -> u64 {
+    match (seconds, until_stdin_closes) {
+        (Some(seconds), false) => seconds.clamp(1, 600),
+        (None, false) => 15,
+        (Some(seconds), true) => seconds.clamp(1, 3600),
+        (None, true) => 3600,
+    }
+}
+
 /// Watch a window for a while and report, or save, what was done in it.
 pub fn record(args: &RecordArgs) -> (Value, u8) {
     use aad_control::{recording::Recording, steps};
-    use aad_runtime::recordings;
     let desk = Desk::open(false);
     let outcome = (|| {
         if let Some(name) = &args.save {
-            let existing = recordings::workflow_path(name).map_err(|e| usage(e.message))?;
-            if existing.exists() && !args.overwrite {
-                return Err(usage(format!(
-                    "a recording called {name:?} exists; pass --overwrite to replace it"
-                )));
-            }
+            may_save(name, args.overwrite).map_err(usage)?;
         }
         let resource_id = desk.resolve(&args.resource)?;
         let listed = desk.targets()?;
@@ -860,17 +869,30 @@ pub fn record(args: &RecordArgs) -> (Value, u8) {
             .cloned()
             .ok_or_else(|| usage("the window closed"))?;
         let app = steps::describe(&resource, &all);
-        let seconds = args.seconds.clamp(1, 600);
+        let seconds = record_limit(args.seconds, args.until_stdin_closes);
+        let closed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut recording =
             Recording::start(&desk.session, &resource, app.clone(), 1).map_err(automation)?;
-        eprintln!(
-            "recording {} for {seconds}s…",
-            resource["name"].as_str().unwrap_or("the window")
-        );
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(seconds);
+        if args.until_stdin_closes {
+            let closed = closed.clone();
+            std::thread::spawn(move || {
+                let _ = std::io::copy(&mut std::io::stdin().lock(), &mut std::io::sink());
+                closed.store(true, std::sync::atomic::Ordering::SeqCst);
+            });
+        }
+        let name = resource["name"].as_str().unwrap_or("the window");
+        if args.until_stdin_closes {
+            eprintln!("recording {name} until standard input closes (at most {seconds}s)…");
+        } else {
+            eprintln!("recording {name} for {seconds}s…");
+        }
+        let started = std::time::Instant::now();
+        let deadline = started + std::time::Duration::from_secs(seconds);
         let (mut recorded, mut skipped, mut dropped) = (Vec::new(), Vec::new(), 0);
         // Collected as it goes: the providers buffer a bounded number of events.
-        while std::time::Instant::now() < deadline {
+        while std::time::Instant::now() < deadline
+            && !closed.load(std::sync::atomic::Ordering::SeqCst)
+        {
             std::thread::sleep(std::time::Duration::from_millis(300));
             let batch = recording.collect().map_err(automation)?;
             recorded.extend(batch.steps);
@@ -883,43 +905,61 @@ pub fn record(args: &RecordArgs) -> (Value, u8) {
         dropped += batch.dropped;
         let mut answer = json!({
             "app": app,
-            "seconds": seconds,
+            "seconds": started.elapsed().as_secs(),
+            "stopped_by": if closed.load(std::sync::atomic::Ordering::SeqCst) {
+                "stdin_closed"
+            } else {
+                "time"
+            },
             "count": recorded.len(),
             "steps": recorded,
             "skipped": skipped,
             "dropped": dropped,
         });
         if let Some(name) = &args.save {
-            answer["saved"] = if recorded.is_empty() {
-                json!({"failed": "nothing replayable was recorded"})
-            } else {
-                match steps::workflow(name, &recorded) {
-                    Err(error) => json!({"failed": error.message}),
-                    Ok(workflow) => {
-                        let written =
-                            recordings::save_recording(name, &steps::recording(name, &recorded))
-                                .and_then(|recording| {
-                                    recordings::save_workflow(name, &workflow)
-                                        .map(|w| (recording, w))
-                                });
-                        match written {
-                            Ok((recording, workflow)) => json!({
-                                "recording_path": recording.display().to_string(),
-                                "workflow_path": workflow.display().to_string(),
-                                "run": format!(
-                                    "aad run {} --permission desktop.input --permission desktop.observe",
-                                    workflow.display()
-                                ),
-                            }),
-                            Err(error) => json!({"failed": error.message}),
-                        }
-                    }
-                }
-            };
+            answer["saved"] = save_steps(name, &recorded);
         }
         Ok(answer)
     })();
     finish(outcome)
+}
+
+/// Refuse to replace a saved recording unless asked to.
+pub fn may_save(name: &str, overwrite: bool) -> Result<(), String> {
+    let existing = aad_runtime::recordings::workflow_path(name).map_err(|e| e.message)?;
+    if existing.exists() && !overwrite {
+        return Err(format!(
+            "a recording called {name:?} exists; pass --overwrite to replace it"
+        ));
+    }
+    Ok(())
+}
+
+/// Save recorded steps as a named recording and the workflow that replays
+/// them, answering where they went or why they were not saved.
+pub fn save_steps(name: &str, recorded: &[aad_control::steps::Step]) -> Value {
+    use aad_control::steps;
+    use aad_runtime::recordings;
+    if recorded.is_empty() {
+        return json!({"failed": "nothing replayable was recorded"});
+    }
+    let workflow = match steps::workflow(name, recorded) {
+        Ok(workflow) => workflow,
+        Err(error) => return json!({"failed": error.message}),
+    };
+    let written = recordings::save_recording(name, &steps::recording(name, recorded))
+        .and_then(|recording| recordings::save_workflow(name, &workflow).map(|w| (recording, w)));
+    match written {
+        Ok((recording, workflow)) => json!({
+            "recording_path": recording.display().to_string(),
+            "workflow_path": workflow.display().to_string(),
+            "run": format!(
+                "aad run {} --permission desktop.input --permission desktop.observe",
+                workflow.display()
+            ),
+        }),
+        Err(error) => json!({"failed": error.message}),
+    }
 }
 
 #[cfg(test)]
@@ -937,6 +977,15 @@ mod tests {
         let mut argv = vec!["do"];
         argv.extend_from_slice(args);
         Probe::try_parse_from(argv).map(|p| p.command)
+    }
+
+    #[test]
+    fn a_recording_a_host_stops_runs_until_then_within_an_hour() {
+        assert_eq!(record_limit(None, false), 15);
+        assert_eq!(record_limit(Some(9_000), false), 600);
+        assert_eq!(record_limit(None, true), 3_600);
+        assert_eq!(record_limit(Some(9_000), true), 3_600);
+        assert_eq!(record_limit(Some(120), true), 120);
     }
 
     #[test]
