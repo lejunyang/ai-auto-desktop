@@ -38,8 +38,10 @@ XTest helper 另有 `window-info` / `window-action`（EWMH 窗口动作并读回
 tests/linux/run-linux-parity.sh   # 另需 openbox x11-utils xclip tesseract-ocr tesseract-ocr-eng
 ```
 
-`type_text`、`pointer_click`、`pointer_gesture`、`drag`、`key_chord` 仅支持 KDE/X11 profile，
-并在派发前检查焦点、PID 与 AT-SPI element-at-point（`drag` 起点终点都查）；首个输入事件后的失败
+XTest 输入和目标截图要求明确的 `XDG_SESSION_TYPE=x11` 与可连接的 `DISPLAY`，不以 KDE、GNOME、
+XFCE 等桌面名称决定是否可用。Wayland 会话仍拒绝，即使存在 XWayland 的 `DISPLAY`。
+输入仍在派发前检查目标 PID、同用户身份以及对应的焦点或 AT-SPI element-at-point
+（`drag` 起点终点都查）；窗口管理动作另需窗口管理器提供相应 EWMH 能力。首个输入事件后的失败
 一律报告 `DRIVER.UNKNOWN_EFFECT`，helper 失败时会先松开已按下的键和按钮。`key_chord` 只接受
 修饰键（ctrl、shift、alt、super）加一个主键（字母数字、F1–F24、方向、Enter、Tab、Esc 等命名键）。
 `capture_target` 只截取 fresh 语义 target 的可见区域，经 Host 的 run-scoped
@@ -57,3 +59,8 @@ tests/linux/run-rust-atspi-fixture.sh
 
 该 fixture 证明受控 Qt5/X11 路径，不把结果外推到任意桌面、Wayland、锁屏或提权界面。
 完整边界见 [`linux-kde-x11-driver.md`](../../docs/architecture/linux-kde-x11-driver.md)。
+
+`pwsh -File tests/linux/verify-x11-session.ps1` 在私有 Xvfb 中切换桌面名称，回读实际点击事件和目标
+PNG，并确认 PID、键盘焦点、Wayland 会话拒绝条件仍生效。它验证协议条件，不代表真实桌面管理器
+的完整验收。**[待验证] GNOME X11 / XFCE 真机**还需分别检查应用文本输入、焦点切换、遮挡截图、
+窗口激活和剪贴板恢复；当前真实桌面效果证据来自 KDE Plasma/X11。
