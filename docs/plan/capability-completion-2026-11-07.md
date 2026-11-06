@@ -27,7 +27,7 @@
 | 浏览器键盘与浏览器自身界面 | 页面编辑器快捷键与浏览器级动作分开；补明确授权的浏览器内部/本地页面操作路径，并明确非 Chromium 覆盖 | 页面快捷键隔离 `1a3bb77` 已提交；有界面 Chromium 18 组 Ctrl 组合只送页面、不误触浏览器 UI 的验收及异常 keyUp 通过。内部/本地页面授权 `527f5e4`、`ac4963b` 已提交，本地 HTML 点击、越界拒绝及 Chromium Settings 搜索输入回读通过。执行中祖先 URL/loader 复核与 history 授权 `d3f72eb` 已提交，3 项专项、完整 Chromium 34/34 和浏览器单测 21/21；非 Chromium 后端待实现 |
 | 输入租约 | 保留共享前台互斥，独立 headless 不受无关桌面会话阻断；占用可诊断、可正常释放 | `2fe2395`、`562dcf5`、`6966e4c` 已提交。可信 headless 按 browser UUID 隔离，同实例仍互斥，未知/有界面实例仍占桌面；Chromium 19 项及保存工作流在桌面租约被占用时的实际执行通过 |
 | macOS 拖拽 | 两端使用同一 fresh snapshot 复核；跨元素实际拖动验证 | 修复已提交 `8f92886`，25 项宿主逻辑测试及 clippy 通过；**[待验证]** macOS 真机 AX/TCC 与实际拖拽效果 |
-| 跨资源拖拽准入 | 保留两个资源的有效观察，分别检查授权、范围与能力，获取两端输入租约；后端逐端 fresh 后执行 | `c343f69` 提供内部 opt-in/hook，保留每资源最新一份、每 provider 最多 16 份且受原 TTL 限制，输入尝试后整组失效。新增 9 项 fake 测试及 Session/views/native adapters 共 45/45 通过。当前生产后端均未启用，不等于已有跨应用拖拽；Linux 后端实现与真实效果仍待完成 |
+| 跨资源拖拽准入 | 保留两个资源的有效观察，分别检查授权、范围与能力，获取两端输入租约；后端逐端 fresh 后执行 | `c343f69` 提供内部 opt-in/hook，保留每资源最新一份、每 provider 最多 16 份且受原 TTL 限制，输入尝试后整组失效。新增 9 项 fake 测试及 Session/views/native adapters 共 45/45 通过。`0b2ea22` 补充显式声明 `drag_between` 的原生 provider 接线，两端 snapshot/revision/locator 分别传递，9 项 adapter 测试及 clippy 通过。当前生产后端均未启用，不等于已有跨应用拖拽；Linux 后端实现与真实效果仍待完成 |
 | 系统覆盖 | GNOME X11 / Wayland 路线、Windows/macOS、DPI/IME/权限弹窗的实现与实际验收矩阵；不将 KDE 成功外推 | 用户确认仅有本机 Linux/KDE。`bea9187` 移除 X11 的 KDE 品牌限制，Xvfb 正反例及 KDE 新产物点击/截图通过；GNOME/XFCE 真机 **[待验收]**。Windows/macOS 实际效果 **[待真机验收]**。Wayland 输入后端 **[待实现、待真机验收]**，路线及证据见平台矩阵 |
 | 配套产物一致性 | 发布/启动检测 helper 协议与能力，避免新 CLI 静默搭配旧 helper；构建和真实入口验证 | XTest 握手 `4d20ad6` 已提交；新 helper 正常提供动作，旧 helper 返回 `DRIVER.HELPER_INCOMPATIBLE` 并移除合成输入能力，语义 invoke 仍通过真实标签变化验证 |
 
