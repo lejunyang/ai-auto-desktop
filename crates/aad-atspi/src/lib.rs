@@ -1163,6 +1163,7 @@ impl AtspiProvider {
             }
             Err(error)
                 if dispatched
+                    && error.details.get("dispatch_started") != Some(&Value::Bool(false))
                     && matches!(
                         error.code.as_str(),
                         "DRIVER.ACTION_FAILED" | "DRIVER.TIMEOUT"
@@ -2562,6 +2563,7 @@ mod tests {
         scoped_truncated: bool,
         scope_context: bool,
         visibility_recovery: bool,
+        refused_input: bool,
         hit_chain: u8,
         /// Containers above the target, which is then `n{depth}`.
         depth: usize,
@@ -2787,6 +2789,12 @@ mod tests {
             _process_id: u32,
             _deadline: Instant,
         ) -> Result<Value, AutomationError> {
+            if self.refused_input {
+                return Err(
+                    driver_error("DRIVER.ACTION_FAILED", "helper refused before input")
+                        .with_detail("dispatch_started", json!(false)),
+                );
+            }
             self.writes.fetch_add(1, Ordering::SeqCst);
             Ok(json!({"point": {"x": point.0, "y": point.1}, "gesture": format!("{gesture:?}")}))
         }
@@ -3160,6 +3168,21 @@ mod tests {
             result.unwrap();
             assert_eq!(backend.writes.load(Ordering::SeqCst), 1);
         }
+    }
+
+    #[test]
+    fn proven_input_refusal_does_not_become_unknown_effect() {
+        let backend = Arc::new(FakeBackend {
+            hit_chain: 1,
+            refused_input: true,
+            ..Default::default()
+        });
+        let provider = AtspiProvider::new(backend.clone()).unwrap();
+        let observed = take_snapshot(&provider);
+        let error = provider.invoke("desktop.linux_atspi.pointer_gesture@1", json!({"target": {"snapshot_id": observed["snapshot_id"], "revision": observed["revision"], "node_id": "n0"}, "locator": locator()}), Some(Duration::from_secs(2))).unwrap_err();
+        assert_eq!(error.code, "DRIVER.ACTION_FAILED");
+        assert_eq!(error.effect, "not_applied");
+        assert_eq!(backend.writes.load(Ordering::SeqCst), 0);
     }
 
     #[test]

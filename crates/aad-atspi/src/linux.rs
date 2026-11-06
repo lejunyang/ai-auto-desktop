@@ -1315,10 +1315,11 @@ impl AtspiBackend for LinuxBackend {
         if input["consumed"] != true {
             return Err(driver_error(
                 "DRIVER.PASTE_NOT_CONSUMED",
-                "Ctrl+V reached the element but its process never asked for the text",
+                "paste text was not served to the target; inspect paste diagnostics",
             )
             .with_effect("unknown")
-            .with_detail("clipboard_restored", input["restored"].clone()));
+            .with_detail("clipboard_restored", input["restored"].clone())
+            .with_detail("paste_diagnostics", input["paste_diagnostics"].clone()));
         }
         Ok(
             json!({"native_interface": "Component.grab_focus -> X11 CLIPBOARD + XTEST Ctrl+V", "focus": focus, "input": input, "synthetic_input": true, "clipboard_restored": input["restored"]}),
@@ -1822,13 +1823,41 @@ fn parse_input_helper(
                 answer[key] = value.clone();
             }
         }
+        if let Some(diagnostics) = result.get("paste_diagnostics").and_then(Value::as_object) {
+            let mut safe = Map::new();
+            for key in [
+                "selection_requests",
+                "accepted_requests",
+                "rejected_requests",
+                "targets_requests",
+                "metadata_requests",
+                "text_requests",
+                "unsupported_requests",
+                "failed_writes",
+                "selection_lost",
+                "deadline_exceeded",
+                "target_window_found",
+                "resource_mask_available",
+            ] {
+                if let Some(value) = diagnostics
+                    .get(key)
+                    .filter(|value| value.is_u64() || value.is_boolean())
+                {
+                    safe.insert(key.into(), value.clone());
+                }
+            }
+            answer["paste_diagnostics"] = Value::Object(safe);
+        }
         return Ok(answer);
     }
     let code = output.status.code();
     let helper_code = helper_error_code(&output.stdout);
     if !dispatched {
         if let Some(mapped) = helper_code.as_deref().and_then(map_helper_code) {
-            return Err(mapped.with_detail("helper_code", json!(helper_code)));
+            return Err(mapped
+                .with_detail("helper_code", json!(helper_code))
+                .with_detail("helper_exit_code", json!(code))
+                .with_detail("dispatch_started", json!(false)));
         }
     }
     if dispatched || code == Some(70) {
@@ -1837,7 +1866,9 @@ fn parse_input_helper(
             "XTest helper failed after dispatch",
         )
         .with_effect("unknown")
-        .with_detail("phase", json!(phase)));
+        .with_detail("phase", json!(phase))
+        .with_detail("helper_code", json!(helper_code))
+        .with_detail("dispatch_started", json!(dispatched)));
     }
     let (error_code, message, retryable) = match code {
         Some(69) => ("DRIVER.UNAVAILABLE", "X11/XTest is unavailable", false),
@@ -1859,7 +1890,9 @@ fn parse_input_helper(
     };
     Err(driver_error(error_code, message)
         .with_retryable(retryable)
-        .with_detail("helper_exit_code", json!(code)))
+        .with_detail("helper_exit_code", json!(code))
+        .with_detail("helper_code", json!(helper_code))
+        .with_detail("dispatch_started", json!(false)))
 }
 
 /// The `code` of the helper's failure record, if it printed one.
@@ -1894,9 +1927,17 @@ fn map_helper_code(code: &str) -> Option<AutomationError> {
             "DRIVER.CLIPBOARD_BUSY",
             "another client kept the clipboard; nothing was pasted",
         ),
-        "focus_owner_mismatch" => driver_error(
+        "focus_owner_mismatch" | "focus_owner_changed" => driver_error(
             "DRIVER.FOCUS_LOST",
             "keyboard focus is not in the target's process; no key was sent",
+        ),
+        "target_point_mismatch" => driver_error(
+            "DRIVER.POINT_NOT_PROVEN",
+            "the pointer location is not on a target-process window; no input was sent",
+        ),
+        "modifier_unavailable_or_held" => driver_error(
+            "DRIVER.ACTION_UNSUPPORTED",
+            "a pointer modifier is unavailable or already held; no input was sent",
         ),
         _ => return None,
     })
@@ -2470,6 +2511,33 @@ impl LinuxBackend {
 #[cfg(test)]
 mod capture_tests {
     use super::*;
+    use std::os::unix::process::ExitStatusExt;
+
+    #[test]
+    fn helper_refusals_preserve_proven_non_dispatch_and_specific_cause() {
+        let error = parse_input_helper(HelperOutput {
+            status: ExitStatus::from_raw(73 << 8),
+            stdout: b"{\"ok\":false,\"code\":\"target_point_mismatch\",\"dispatch_started\":false}\n".to_vec(),
+            stderr: vec![],
+        }, "pointer_dispatch", 1, 42).unwrap_err();
+        assert_eq!(error.code, "DRIVER.POINT_NOT_PROVEN");
+        assert_eq!(error.effect, "not_applied");
+        assert_eq!(error.details["helper_code"], "target_point_mismatch");
+        assert_eq!(error.details["dispatch_started"], false);
+    }
+
+    #[test]
+    fn paste_diagnostics_keep_counts_and_flags_without_payloads() {
+        let result = parse_input_helper(HelperOutput {
+            status: ExitStatus::from_raw(0),
+            stdout: b"{\"ok\":true,\"dispatch_started\":true,\"events\":4,\"consumed\":false,\"paste_diagnostics\":{\"selection_requests\":3,\"target_window_found\":true,\"text_requests\":\"secret\",\"clipboard_text\":\"secret\"}}\n".to_vec(),
+            stderr: vec![],
+        }, "keyboard_dispatch", 4, 42).unwrap();
+        assert_eq!(
+            result["paste_diagnostics"],
+            json!({"selection_requests": 3, "target_window_found": true})
+        );
+    }
 
     #[test]
     fn pointer_state_requires_visibility_but_not_keyboard_focusability() {
