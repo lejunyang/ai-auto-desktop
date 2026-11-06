@@ -2215,6 +2215,16 @@ int main(int argc, char **argv) {
         return kExitInvalid;
     }
     const std::string_view command(argv[1]);
+    if (command == "describe") {
+        if (argc != 2) {
+            EmitError("invalid_arguments", "arguments", false);
+            return kExitInvalid;
+        }
+        // This protocol handshake does not open a display or touch input state.
+        std::cout << R"({"helper":"aad-linux-xtest","protocol":1,"features":["focus-info","type-text","pointer-click","pointer-gesture","drag","key-chord","window-info","window-action","paste","clipboard-read","global-key","record-input","pointer-modifiers"]})"
+                  << std::endl;
+        return 0;
+    }
     if (command == "record-input") {
         return RunRecordInput(argc, argv);
     }

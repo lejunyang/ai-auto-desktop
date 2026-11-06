@@ -135,6 +135,17 @@ impl Bounds {
 pub trait AtspiBackend: Send + Sync {
     fn name(&self) -> &str;
     fn session_info(&self) -> Map<String, Value>;
+    fn inspect_session(&self, _deadline: Instant) -> Map<String, Value> {
+        self.session_info()
+    }
+    /// Explain a missing synthetic action without blocking semantic AT-SPI actions.
+    fn check_action_support(
+        &self,
+        _action: &str,
+        _deadline: Instant,
+    ) -> Result<(), AutomationError> {
+        Ok(())
+    }
     fn list_applications(
         &self,
         deadline: Instant,
@@ -459,11 +470,12 @@ impl AtspiProvider {
         match short {
             "inspect_session" => {
                 only_keys(args, &[])?;
-                let session = self.backend.session_info();
+                let session = self.backend.inspect_session(deadline);
                 Ok(json!({
                     "backend": self.backend.name(),
                     "session_type": bounded_optional_string(session.get("session_type")),
                     "desktop": bounded_optional_string(session.get("desktop")),
+                    "input_helper": session.get("input_helper").cloned().unwrap_or(Value::Null),
                 }))
             }
             "list_applications" => {
@@ -798,6 +810,7 @@ impl AtspiProvider {
             "truncated": raw.truncated,
             "truncation_reasons": raw.truncation_reasons,
         });
+        public["metadata"] = json!({"input_helper": public["session"]["input_helper"]});
         if let Some(scope) = &scope {
             if ["bus_name", "object_path", "process_id"]
                 .iter()
@@ -1040,6 +1053,7 @@ impl AtspiProvider {
         let (fresh, fresh_id, node, native) = self.fresh_target(args, deadline)?;
         let available = node["actions"].as_array().expect("normalized action array");
         if !available.iter().any(|value| value == action) {
+            self.backend.check_action_support(action, deadline)?;
             return Err(driver_error(
                 "DRIVER.ACTION_UNSUPPORTED",
                 format!("target does not support native {action}"),
@@ -2337,6 +2351,14 @@ fn error_contracts(write: bool, locator: bool, capture: bool) -> Vec<Value> {
     }
     if write {
         values.push((
+            "DRIVER.HELPER_INCOMPATIBLE",
+            "Linux XTest helper 协议或所需能力不兼容；请从同一源码重新构建安装 helper。",
+            false,
+            "not_applied",
+        ));
+    }
+    if write {
+        values.push((
             "DRIVER.UNKNOWN_EFFECT",
             "原生动作可能已生效。",
             false,
@@ -2382,6 +2404,8 @@ fn manifest_document() -> Value {
     let write_output = || json!({"type": "object", "required": ["ok", "action", "resolved"], "properties": {"ok": {"const": true}, "action": {"enum": WRITE_ACTIONS}, "resolved": target_schema(), "backend_result": {}}, "additionalProperties": false});
     let mut actions = Map::new();
     actions.insert("inspect_session".into(), contract("返回不含应用内容的当前 AT-SPI backend 与桌面会话类型。", "read_only", "observe", "low", &["desktop.observe"], json!({"type": "object", "additionalProperties": false}), json!({"type": "object", "required": ["backend", "session_type", "desktop"], "properties": {"backend": {"type": "string", "maxLength": 128}, "session_type": {"type": ["string", "null"], "maxLength": 128}, "desktop": {"type": ["string", "null"], "maxLength": 256}}, "additionalProperties": false}), false, false));
+    actions["inspect_session"]["output_schema"]["properties"]["input_helper"] =
+        json!({"type": ["object", "null"]});
     actions["inspect_session"]["sensitivity"] =
         json!({"input": "public", "output": "public", "error": "public"});
     actions["inspect_session"]["durability"] = json!({"checkpoint_fields": {
@@ -2390,7 +2414,8 @@ fn manifest_document() -> Value {
         "desktop": {"pointer": "/desktop", "schema": {"type": ["string", "null"], "maxLength": 256}}
     }});
     actions.insert("list_applications".into(), contract("通过 AT-SPI desktop 根节点枚举当前会话的桌面应用。", "read_only", "observe", "low", &["desktop.observe"], json!({"type": "object", "additionalProperties": false}), json!({"type": "object", "required": ["session", "backend", "applications"], "properties": {"session": {"type": "object"}, "backend": {"type": "string"}, "applications": {"type": "array", "items": {"type": "object"}}}, "additionalProperties": false}), false, false));
-    let snapshot_output = json!({"type": "object", "required": ["snapshot_id", "revision", "session", "backend", "application", "nodes", "truncated", "truncation_reasons"], "properties": {"snapshot_id": {"type": "string"}, "revision": {"type": "integer", "minimum": 1}, "session": {"type": "object"}, "backend": {"type": "string"}, "application": {"type": "object"}, "nodes": {"type": "array", "items": {"type": "object"}}, "truncated": {"type": "boolean"}, "truncation_reasons": {"type": "array", "items": {"type": "object"}, "maxItems": 32}}, "additionalProperties": false});
+    let mut snapshot_output = json!({"type": "object", "required": ["snapshot_id", "revision", "session", "backend", "application", "nodes", "truncated", "truncation_reasons"], "properties": {"snapshot_id": {"type": "string"}, "revision": {"type": "integer", "minimum": 1}, "session": {"type": "object"}, "backend": {"type": "string"}, "application": {"type": "object"}, "nodes": {"type": "array", "items": {"type": "object"}}, "truncated": {"type": "boolean"}, "truncation_reasons": {"type": "array", "items": {"type": "object"}, "maxItems": 32}}, "additionalProperties": false});
+    snapshot_output["properties"]["metadata"] = json!({"type": "object", "properties": {"input_helper": {"type": ["object", "null"]}}, "additionalProperties": false});
     actions.insert("snapshot".into(), contract("抓取一个精确应用选择器对应的有界 AT-SPI 可访问性树。", "read_only", "observe", "low", &["desktop.observe"], json!({"type": "object", "required": ["application"], "properties": {"application": application_schema(), "max_depth": {"type": "integer", "minimum": 0, "maximum": MAX_DEPTH}, "max_nodes": {"type": "integer", "minimum": 1, "maximum": MAX_NODES}}, "additionalProperties": false}), snapshot_output.clone(), false, false));
     let mut scoped_output = snapshot_output;
     scoped_output["properties"]["scope_id"] = json!({"type": "string", "minLength": 1});
@@ -2730,6 +2755,10 @@ mod tests {
             Map::from_iter([
                 ("session_type".into(), json!("x11")),
                 ("desktop".into(), json!("KDE")),
+                (
+                    "input_helper".into(),
+                    json!({"ready": false, "code": "DRIVER.HELPER_INCOMPATIBLE"}),
+                ),
             ])
         }
         fn list_applications(
@@ -3395,6 +3424,14 @@ mod tests {
         assert_eq!(snapshot["backend"], "fake_atspi");
         assert_eq!(snapshot["nodes"][0]["role"], "push_button");
         assert_eq!(snapshot["truncation_reasons"], json!([]));
+        assert_eq!(
+            snapshot["metadata"]["input_helper"],
+            snapshot["session"]["input_helper"]
+        );
+        assert_eq!(
+            snapshot["metadata"]["input_helper"]["code"],
+            "DRIVER.HELPER_INCOMPATIBLE"
+        );
         let found = provider.invoke("desktop.linux_atspi.find@1", json!({"snapshot_id": snapshot["snapshot_id"], "revision": snapshot["revision"], "locator": locator()}), Some(Duration::from_secs(2))).unwrap();
         assert_eq!(found["target"]["node_id"], "n0");
         assert_eq!(found["node"]["name"], "Save");

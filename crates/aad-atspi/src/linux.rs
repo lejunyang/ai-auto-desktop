@@ -10,7 +10,7 @@ use atspi::proxy::editable_text::EditableTextProxy;
 use atspi::proxy::text::TextProxy;
 use atspi::{CoordType, Interface, ObjectRef, State};
 use serde_json::json;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -118,6 +118,7 @@ pub struct LinuxBackend {
     session_bus: Connection,
     connection: Connection,
     recordings: Mutex<BTreeMap<String, LinuxRecorder>>,
+    input_helper_status: Mutex<Value>,
 }
 
 impl LinuxBackend {
@@ -143,6 +144,7 @@ impl LinuxBackend {
             session_bus,
             connection,
             recordings: Mutex::new(BTreeMap::new()),
+            input_helper_status: Mutex::new(json!({"ready": false, "code": "not_probed"})),
         };
         backend.children(&Self::root_ref(), Instant::now() + Duration::from_secs(3))?;
         Ok(backend)
@@ -227,6 +229,17 @@ impl LinuxBackend {
         process_id: u32,
         deadline: Instant,
     ) -> Result<(), AutomationError> {
+        let path = self.input_helper("focus-info", deadline)?;
+        self.verify_focused_with_helper(target, process_id, deadline, &path)
+    }
+
+    fn verify_focused_with_helper(
+        &self,
+        target: &NativeRef,
+        process_id: u32,
+        deadline: Instant,
+        path: &Path,
+    ) -> Result<(), AutomationError> {
         let focused = || -> Result<bool, AutomationError> {
             remaining(deadline, false)?;
             let states = zbus::block_on(self.accessible(target)?.get_state())
@@ -247,7 +260,7 @@ impl LinuxBackend {
             ));
         }
         let output = run_helper(
-            &self.helper(HelperKind::Input)?,
+            path,
             &[
                 "focus-info".into(),
                 "--expected-pid".into(),
@@ -417,7 +430,15 @@ impl LinuxBackend {
         process_id: u32,
         deadline: Instant,
     ) -> Result<Value, AutomationError> {
-        let path = self.helper(HelperKind::Input)?;
+        let support = self.probe_input(deadline)?;
+        support.require(args.first().map(String::as_str).unwrap_or(""))?;
+        if args.iter().any(|arg| arg == "--modifiers") {
+            support.require("pointer-modifiers")?;
+        }
+        if args.first().is_some_and(|command| command == "key-chord") {
+            support.require("focus-info")?;
+        }
+        let path = support.path;
         let focus = if args.first().is_some_and(|command| command == "key-chord") {
             let proof = self.focus(target, deadline)?;
             std::thread::sleep(Duration::from_millis(50).min(remaining(deadline, true)?));
@@ -497,11 +518,31 @@ impl LinuxBackend {
         Ok(path)
     }
 
+    fn probe_input(&self, deadline: Instant) -> Result<InputSupport, AutomationError> {
+        let result = self.helper(HelperKind::Input).and_then(|path| {
+            probe_input_helper(&path, deadline).map(|features| InputSupport { path, features })
+        });
+        *self.input_helper_status.lock().unwrap() = match &result {
+            Ok(support) => {
+                json!({"ready": true, "protocol": INPUT_HELPER_PROTOCOL, "features": support.features})
+            }
+            Err(error) => json!({"ready": false, "code": error.code, "message": error.message}),
+        };
+        result
+    }
+
+    fn input_helper(&self, feature: &str, deadline: Instant) -> Result<PathBuf, AutomationError> {
+        let support = self.probe_input(deadline)?;
+        support.require(feature)?;
+        Ok(support.path)
+    }
+
     fn read_node(
         &self,
         target: NativeRef,
         parent_index: Option<usize>,
         application: &Map<String, Value>,
+        input: Option<&InputSupport>,
         deadline: Instant,
     ) -> Result<(BackendNode, usize), AutomationError> {
         remaining(deadline, false)?;
@@ -597,7 +638,8 @@ impl LinuxBackend {
         // Qt Quick can report hidden states for its actual focused text input.
         // Recover only keyboard actions, with independent live focus ownership;
         // input paths repeat the focus check after GrabFocus before dispatch.
-        let visibility_recovery = !fully_interactive
+        let visibility_recovery = input.is_some_and(|support| support.has("focus-info"))
+            && !fully_interactive
             && toolkit == Some("Qt")
             && states.is_some_and(|states| {
                 [
@@ -614,8 +656,15 @@ impl LinuxBackend {
             && interfaces.contains(Interface::Component)
             && bounds.is_some_and(|bounds| bounds.width > 0 && bounds.height > 0)
             && !protected
-            && process_id
-                .is_some_and(|pid| self.verify_focused(&target, pid as u32, deadline).is_ok());
+            && process_id.is_some_and(|pid| {
+                self.verify_focused_with_helper(
+                    &target,
+                    pid as u32,
+                    deadline,
+                    &input.expect("feature checked").path,
+                )
+                .is_ok()
+            });
         if (fully_interactive || visibility_recovery)
             && states.is_some_and(|states| states.contains(State::Editable))
             && matches!(role.as_str(), "entry" | "text")
@@ -623,10 +672,13 @@ impl LinuxBackend {
             && process_id.is_some()
             && !protected
         {
-            actions.push("type_text".into());
-            actions.push("paste".into());
+            for (action, feature) in [("type_text", "type-text"), ("paste", "paste")] {
+                if input.is_some_and(|support| support.has(feature) && support.has("focus-info")) {
+                    actions.push(action.into());
+                }
+            }
         }
-        if visibility_recovery {
+        if visibility_recovery && input.is_some_and(|support| support.has("key-chord")) {
             actions.push("key_chord".into());
         }
         if pointer_interactive
@@ -635,8 +687,19 @@ impl LinuxBackend {
             && bounds.is_some_and(|bounds| bounds.width > 0 && bounds.height > 0)
             && !protected
         {
-            actions.extend(["pointer_click", "pointer_gesture", "drag"].map(String::from));
-            if fully_interactive {
+            for (action, feature) in [
+                ("pointer_click", "pointer-click"),
+                ("pointer_gesture", "pointer-gesture"),
+                ("drag", "drag"),
+            ] {
+                if input.is_some_and(|support| support.has(feature)) {
+                    actions.push(action.into());
+                }
+            }
+            if fully_interactive
+                && input
+                    .is_some_and(|support| support.has("key-chord") && support.has("focus-info"))
+            {
                 actions.push("key_chord".into());
             }
         }
@@ -777,7 +840,35 @@ impl AtspiBackend for LinuxBackend {
     }
 
     fn session_info(&self) -> Map<String, Value> {
-        session_info()
+        let mut session = session_info();
+        session.insert(
+            "input_helper".into(),
+            self.input_helper_status.lock().unwrap().clone(),
+        );
+        session
+    }
+
+    fn inspect_session(&self, deadline: Instant) -> Map<String, Value> {
+        let _ = self.probe_input(deadline);
+        self.session_info()
+    }
+
+    fn check_action_support(&self, action: &str, deadline: Instant) -> Result<(), AutomationError> {
+        let feature = match action {
+            "type_text" => "type-text",
+            "pointer_click" => "pointer-click",
+            "pointer_gesture" => "pointer-gesture",
+            "key_chord" => "key-chord",
+            "drag" | "paste" => action,
+            "activate" | "minimize" | "maximize" | "restore" | "close_window" => "window-action",
+            _ => return Ok(()),
+        };
+        let support = self.probe_input(deadline)?;
+        support.require(feature)?;
+        if matches!(action, "type_text" | "key_chord" | "paste") {
+            support.require("focus-info")?;
+        }
+        Ok(())
     }
 
     fn list_applications(
@@ -993,7 +1084,8 @@ impl AtspiBackend for LinuxBackend {
         process_id: u32,
         deadline: Instant,
     ) -> Result<Value, AutomationError> {
-        let path = self.helper(HelperKind::Input)?;
+        let path = self.input_helper("type-text", deadline)?;
+        self.input_helper("focus-info", deadline)?;
         let focus = self.focus(target, deadline)?;
         std::thread::sleep(Duration::from_millis(50).min(remaining(deadline, true)?));
         self.verify_focused(target, process_id, deadline)
@@ -1033,7 +1125,7 @@ impl AtspiBackend for LinuxBackend {
         process_id: u32,
         deadline: Instant,
     ) -> Result<Value, AutomationError> {
-        let path = self.helper(HelperKind::Input)?;
+        let path = self.input_helper("pointer-click", deadline)?;
         let args = [
             "pointer-click".to_string(),
             "--expected-pid".into(),
@@ -1289,7 +1381,7 @@ impl AtspiBackend for LinuxBackend {
         process_id: u32,
         deadline: Instant,
     ) -> Result<Value, AutomationError> {
-        let path = self.helper(HelperKind::Input)?;
+        let path = self.input_helper("window-action", deadline)?;
         let mut args = window_args("window-action", process_id, bounds);
         args.extend([
             "--action".into(),
@@ -1334,7 +1426,8 @@ impl AtspiBackend for LinuxBackend {
         process_id: u32,
         deadline: Instant,
     ) -> Result<Value, AutomationError> {
-        let path = self.helper(HelperKind::Input)?;
+        let path = self.input_helper("paste", deadline)?;
+        self.input_helper("focus-info", deadline)?;
         let focus = self.focus(target, deadline)?;
         std::thread::sleep(Duration::from_millis(50).min(remaining(deadline, true)?));
         self.verify_focused(target, process_id, deadline)
@@ -1374,7 +1467,7 @@ impl AtspiBackend for LinuxBackend {
         max_bytes: usize,
         deadline: Instant,
     ) -> Result<Value, AutomationError> {
-        let path = self.helper(HelperKind::Input)?;
+        let path = self.input_helper("clipboard-read", deadline)?;
         let args = [
             "clipboard-read".to_string(),
             "--max-bytes".into(),
@@ -1408,7 +1501,7 @@ impl AtspiBackend for LinuxBackend {
     }
 
     fn global_key(&self, keys: &[String], deadline: Instant) -> Result<Value, AutomationError> {
-        let path = self.helper(HelperKind::Input)?;
+        let path = self.input_helper("global-key", deadline)?;
         let args = [
             "global-key".to_string(),
             "--keys".into(),
@@ -1455,6 +1548,7 @@ impl LinuxBackend {
         max_nodes: usize,
         deadline: Instant,
     ) -> Result<BackendSnapshot, AutomationError> {
+        let input = self.probe_input(deadline).ok();
         let mut nodes = Vec::new();
         if ancestors.len() >= max_nodes {
             return Err(driver_error(
@@ -1464,7 +1558,10 @@ impl LinuxBackend {
         }
         for ancestor in ancestors {
             let parent = nodes.len().checked_sub(1);
-            nodes.push(self.read_node(ancestor, parent, &info, deadline)?.0);
+            nodes.push(
+                self.read_node(ancestor, parent, &info, input.as_ref(), deadline)?
+                    .0,
+            );
         }
         let parent = nodes.len().checked_sub(1);
         let mut queue = VecDeque::from([(root, parent, 0u32)]);
@@ -1480,7 +1577,8 @@ impl LinuxBackend {
                 );
                 break;
             }
-            let (node, child_count) = self.read_node(target.clone(), parent, &info, deadline)?;
+            let (node, child_count) =
+                self.read_node(target.clone(), parent, &info, input.as_ref(), deadline)?;
             let current = nodes.len();
             nodes.push(node);
             match self.child_references(&target, deadline) {
@@ -1534,7 +1632,7 @@ impl LinuxBackend {
             .and_then(Value::as_u64)
             .and_then(|value| u32::try_from(value).ok())
             .filter(|value| *value > 0);
-        self.add_window_actions(&mut nodes, process_id, deadline);
+        self.add_window_actions(&mut nodes, process_id, input.as_ref(), deadline);
         Ok(BackendSnapshot {
             application: info,
             nodes,
@@ -1545,15 +1643,20 @@ impl LinuxBackend {
 
     /// The window manager's view of a top-level frame, when the X11 helper
     /// and an EWMH window manager are there; `None` offers no window actions.
-    fn window_info(&self, process_id: u32, bounds: Bounds, deadline: Instant) -> Option<Value> {
-        let path = self.helper(HelperKind::Input).ok()?;
+    fn window_info(
+        &self,
+        process_id: u32,
+        bounds: Bounds,
+        path: &Path,
+        deadline: Instant,
+    ) -> Option<Value> {
         let mut args = window_args("window-info", process_id, bounds);
         args.extend([
             "--deadline-monotonic-ns".into(),
             monotonic_deadline_ns(deadline).ok()?.to_string(),
         ]);
         let output = run_helper(
-            &path,
+            path,
             &args,
             None,
             deadline.min(Instant::now() + Duration::from_secs(2)),
@@ -1574,8 +1677,14 @@ impl LinuxBackend {
         &self,
         nodes: &mut [BackendNode],
         process_id: Option<u32>,
+        input: Option<&InputSupport>,
         deadline: Instant,
     ) {
+        let Some(input) =
+            input.filter(|input| input.has("window-info") && input.has("window-action"))
+        else {
+            return;
+        };
         let Some(process_id) = process_id else {
             return;
         };
@@ -1591,7 +1700,7 @@ impl LinuxBackend {
             if !top_level || remaining(deadline, false).is_err() {
                 continue;
             }
-            let Some(info) = self.window_info(process_id, bounds, deadline) else {
+            let Some(info) = self.window_info(process_id, bounds, &input.path, deadline) else {
                 continue;
             };
             let supports = |name: &str| info["supports"][name] == true;
@@ -1620,6 +1729,100 @@ impl LinuxBackend {
             );
         }
     }
+}
+
+const INPUT_HELPER_PROTOCOL: u64 = 1;
+
+/// Capabilities describe the binary, not the user's display. Live display,
+/// focus, UID and hit checks still run for every actual operation.
+struct InputSupport {
+    path: PathBuf,
+    features: BTreeSet<String>,
+}
+
+impl InputSupport {
+    fn has(&self, feature: &str) -> bool {
+        self.features.contains(feature)
+    }
+
+    fn require(&self, feature: &str) -> Result<(), AutomationError> {
+        if self.has(feature) {
+            Ok(())
+        } else {
+            Err(
+                incompatible_helper("required helper feature is unavailable")
+                    .with_detail("required_feature", json!(feature)),
+            )
+        }
+    }
+}
+
+fn incompatible_helper(reason: &str) -> AutomationError {
+    driver_error(
+        "DRIVER.HELPER_INCOMPATIBLE",
+        format!("{reason}; rebuild and install the Linux XTest helper from the same source as aad"),
+    )
+    .with_detail("expected_protocol", json!(INPUT_HELPER_PROTOCOL))
+    .with_detail("dispatch_started", json!(false))
+}
+
+fn parse_helper_description(output: HelperOutput) -> Result<BTreeSet<String>, AutomationError> {
+    if !output.status.success() {
+        return Err(incompatible_helper(
+            "Linux XTest helper does not support the capability handshake",
+        ));
+    }
+    let description =
+        parse_one_json_object(&output.stdout, "input helper capabilities").map_err(|_| {
+            incompatible_helper("Linux XTest helper returned an invalid capability handshake")
+        })?;
+    if description.get("helper").and_then(Value::as_str) != Some("aad-linux-xtest")
+        || description.get("protocol").and_then(Value::as_u64) != Some(INPUT_HELPER_PROTOCOL)
+    {
+        return Err(incompatible_helper(
+            "Linux XTest helper protocol does not match this adapter",
+        ));
+    }
+    let features = description
+        .get("features")
+        .and_then(Value::as_array)
+        .filter(|items| items.len() <= 64)
+        .ok_or_else(|| incompatible_helper("Linux XTest helper feature list is invalid"))?;
+    let mut result = BTreeSet::new();
+    for feature in features {
+        let feature = feature
+            .as_str()
+            .filter(|feature| {
+                !feature.is_empty()
+                    && feature.len() <= 64
+                    && feature
+                        .bytes()
+                        .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == b'-')
+            })
+            .ok_or_else(|| incompatible_helper("Linux XTest helper feature name is invalid"))?;
+        if !result.insert(feature.to_string()) {
+            return Err(incompatible_helper(
+                "Linux XTest helper features contain duplicates",
+            ));
+        }
+    }
+    Ok(result)
+}
+
+fn probe_input_helper(path: &Path, deadline: Instant) -> Result<BTreeSet<String>, AutomationError> {
+    let output = run_helper(
+        path,
+        &["describe".into()],
+        None,
+        deadline.min(Instant::now() + Duration::from_millis(500)),
+        XTEST_OUTPUT_LIMIT,
+        XTEST_OUTPUT_LIMIT,
+    )
+    .map_err(|error| {
+        incompatible_helper("Linux XTest helper capability handshake failed")
+            .with_detail("cause_code", json!(error.code))
+    })?;
+    parse_helper_description(output)
 }
 
 #[derive(Clone, Copy)]
@@ -2266,7 +2469,9 @@ impl LinuxBackend {
     /// An element as the watched events carry it.
     fn describe(&self, target: &NativeRef, info: &Map<String, Value>) -> Option<Value> {
         let deadline = Instant::now() + Duration::from_secs(2);
-        let (node, _) = self.read_node(target.clone(), None, info, deadline).ok()?;
+        let (node, _) = self
+            .read_node(target.clone(), None, info, None, deadline)
+            .ok()?;
         let protected = node.states.get("protected").copied().flatten() == Some(true);
         Some(json!({
             "role": node.role,
@@ -2471,7 +2676,7 @@ impl LinuxBackend {
                     "the application has no process id",
                 )
             })?;
-        let helper = self.helper(HelperKind::Input)?;
+        let helper = self.input_helper("record-input", deadline)?;
         let mut command = Command::new(&helper);
         helper_environment(&mut command);
         command
@@ -2555,6 +2760,80 @@ impl LinuxBackend {
 mod capture_tests {
     use super::*;
     use std::os::unix::process::ExitStatusExt;
+
+    #[test]
+    fn helper_handshake_rejects_legacy_malformed_and_wrong_protocol_without_input() {
+        for (status, body) in [
+            (64, r#"{"ok":false,"code":"invalid_arguments"}"#),
+            (
+                0,
+                r#"{"helper":"aad-linux-xtest","protocol":0,"features":[]}"#,
+            ),
+            (
+                0,
+                r#"{"helper":"another-helper","protocol":1,"features":[]}"#,
+            ),
+            (
+                0,
+                r#"{"helper":"aad-linux-xtest","protocol":1,"features":["drag","drag"]}"#,
+            ),
+            (
+                0,
+                r#"{"helper":"aad-linux-xtest","protocol":1,"features":["arbitrary text"]}"#,
+            ),
+            (0, "not json"),
+        ] {
+            let error = parse_helper_description(HelperOutput {
+                status: ExitStatus::from_raw(status << 8),
+                stdout: body.as_bytes().to_vec(),
+                stderr: vec![],
+            })
+            .unwrap_err();
+            assert_eq!(error.code, "DRIVER.HELPER_INCOMPATIBLE");
+            assert_eq!(error.effect, "not_applied");
+            assert_eq!(error.details["dispatch_started"], false);
+        }
+    }
+
+    #[test]
+    fn capability_probe_executes_only_describe_and_never_requires_a_display() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("aad-helper-probe-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let helper = dir.join("helper");
+        // The fake helper rejects any command other than describe. This exercises
+        // the real subprocess boundary without touching an X server or user input.
+        std::fs::write(&helper, concat!(
+            "#!/bin/sh\n",
+            "test \"$#\" = 1 && test \"$1\" = describe || exit 91\n",
+            "printf '%s\\n' '{\"helper\":\"aad-linux-xtest\",\"protocol\":1,\"features\":[\"pointer-gesture\"]}'\n",
+        )).unwrap();
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let result = probe_input_helper(&helper, Instant::now() + Duration::from_secs(2));
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(
+            result.unwrap(),
+            BTreeSet::from(["pointer-gesture".to_string()])
+        );
+    }
+
+    #[test]
+    fn helper_features_are_individually_required_and_unknown_future_features_are_safe() {
+        let features = parse_helper_description(HelperOutput {
+            status: ExitStatus::from_raw(0),
+            stdout: br#"{"helper":"aad-linux-xtest","protocol":1,"features":["pointer-gesture","future-read-only"]}"#.to_vec(),
+            stderr: vec![],
+        }).unwrap();
+        let support = InputSupport {
+            path: "/unused".into(),
+            features,
+        };
+        assert!(support.require("pointer-gesture").is_ok());
+        let error = support.require("pointer-modifiers").unwrap_err();
+        assert_eq!(error.code, "DRIVER.HELPER_INCOMPATIBLE");
+        assert_eq!(error.details["required_feature"], "pointer-modifiers");
+        assert!(!support.has("focus-info"));
+    }
 
     #[test]
     fn helper_refusals_preserve_proven_non_dispatch_and_specific_cause() {
