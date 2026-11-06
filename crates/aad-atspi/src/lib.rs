@@ -223,6 +223,15 @@ pub trait AtspiBackend: Send + Sync {
         deadline: Instant,
     ) -> Result<Value, AutomationError>;
     fn invoke(&self, target: &NativeRef, deadline: Instant) -> Result<Value, AutomationError>;
+    /// Invoke the exact canonical activation selected by the fresh observation.
+    fn invoke_named(
+        &self,
+        target: &NativeRef,
+        name: &str,
+        deadline: Instant,
+    ) -> Result<Value, AutomationError> {
+        self.named_action(target, name, deadline)
+    }
     fn set_text(
         &self,
         target: &NativeRef,
@@ -1448,7 +1457,10 @@ impl AtspiProvider {
             dispatched = true;
             match action {
                 "focus" => self.backend.focus(&native, window.as_ref(), deadline),
-                "invoke" => self.backend.invoke(&native, deadline),
+                "invoke" => match node["provenance"]["native_invoke_name"].as_str() {
+                    Some(name) => self.backend.invoke_named(&native, name, deadline),
+                    None => self.backend.invoke(&native, deadline),
+                },
                 "set_text" => {
                     let text = bounded_text(args.get("text"), false)?;
                     self.backend.set_text(&native, text, deadline)

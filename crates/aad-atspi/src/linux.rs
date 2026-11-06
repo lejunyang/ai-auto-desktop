@@ -20,6 +20,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use zbus::blocking::{connection, Connection, Proxy};
 
+mod actions;
 mod coordinates;
 mod drag_between;
 mod drag_path;
@@ -478,15 +479,6 @@ impl LinuxBackend {
         .map_err(|error| native_failure("Component proxy", target, error))
     }
 
-    fn actions(&self, target: &NativeRef) -> Vec<atspi::Action> {
-        self.action_proxy(target)
-            .and_then(|proxy| {
-                zbus::block_on(proxy.get_actions())
-                    .map_err(|error| native_failure("Action.GetActions", target, error))
-            })
-            .unwrap_or_default()
-    }
-
     /// Keyboard input needs focus; pointer input is proven by live hit tests.
     fn run_input(
         &self,
@@ -699,7 +691,7 @@ impl LinuxBackend {
                     zbus::block_on(proxy.get_text(0, count.clamp(0, MAX_FIELD_CHARS as i32))).ok()
                 })
         };
-        let action_metadata = self.actions(&target);
+        let action_metadata = self.canonical_actions(&target, deadline).unwrap_or_default();
         let toolkit = application.get("toolkit_name").and_then(Value::as_str);
         let toolkit_version = application
             .get("toolkit_version")
@@ -715,15 +707,8 @@ impl LinuxBackend {
         {
             actions.push("focus".into());
         }
-        let qt_invoke = toolkit == Some("Qt")
-            && toolkit_version.starts_with("5.")
-            && role == "push_button"
-            && action_metadata
-                .iter()
-                .filter(|action| action.name == "Press")
-                .count()
-                == 1;
-        if qt_invoke || (actionable && toolkit != Some("Qt") && action_metadata.len() == 1) {
+        let invoke_action = actions::unique_activation(&action_metadata);
+        if actionable && invoke_action.is_some() {
             actions.push("invoke".into());
         }
         if actionable && interfaces.contains(Interface::EditableText) && !protected {
@@ -862,7 +847,7 @@ impl LinuxBackend {
         let native_actions = action_metadata
             .iter()
             .enumerate()
-            .map(|(index, action)| json!({"index": index, "name": action.name, "description": action.description, "key_binding": action.keybinding}))
+            .map(|(index, action)| json!({"index": index, "name": action.name, "localized_name": action.localized_name, "description": action.description, "key_binding": action.keybinding}))
             .collect::<Vec<_>>();
         let native_action_name = if actions.contains(&"toggle".to_string()) {
             Some("click")
@@ -870,10 +855,8 @@ impl LinuxBackend {
             || actions.contains(&"collapse".to_string())
         {
             Some("activate")
-        } else if qt_invoke {
-            Some("Press")
         } else {
-            None
+            invoke_action.map(|action| action.name.as_str())
         };
         remaining(deadline, false)?;
         Ok((
@@ -932,6 +915,10 @@ impl LinuxBackend {
                     (
                         "native_action_name".into(),
                         native_action_name.map_or(Value::Null, |value| json!(value)),
+                    ),
+                    (
+                        "native_invoke_name".into(),
+                        invoke_action.map_or(Value::Null, |action| json!(action.name)),
                     ),
                 ]),
             },
@@ -1109,34 +1096,20 @@ impl AtspiBackend for LinuxBackend {
 
     fn invoke(&self, target: &NativeRef, deadline: Instant) -> Result<Value, AutomationError> {
         self.check_cancelled(false)?;
-        let actions = self.actions(target);
-        let index = if actions.len() == 1 {
-            0
-        } else {
-            actions
-                .iter()
-                .position(|action| action.name == "Press")
-                .ok_or_else(|| {
-                    driver_error(
-                        "DRIVER.ACTION_UNSUPPORTED",
-                        "invoke has no unique qualified native action",
-                    )
-                })?
-        };
-        remaining(deadline, false)?;
-        self.check_cancelled(false)?;
-        let accepted = zbus::block_on(self.action_proxy(target)?.do_action(index as i32))
-            .map_err(|error| native_failure("Action.DoAction", target, error))?;
-        self.check_cancelled(true)?;
-        if !accepted {
-            return Err(driver_error(
-                "DRIVER.ACTION_FAILED",
-                "Action.DoAction did not accept the request",
-            ));
-        }
-        Ok(
-            json!({"native_interface": "Action.do_action", "accepted": true, "native_action_name": actions[index].name}),
-        )
+        let actions = self.canonical_actions(target, deadline)?;
+        let selected = actions::unique_activation(&actions).ok_or_else(|| {
+            driver_error("DRIVER.ACTION_UNSUPPORTED", "invoke has no unique qualified native action")
+        })?;
+        self.invoke_canonical(target, &selected.name, deadline)
+    }
+
+    fn invoke_named(
+        &self,
+        target: &NativeRef,
+        name: &str,
+        deadline: Instant,
+    ) -> Result<Value, AutomationError> {
+        self.invoke_canonical(target, name, deadline)
     }
 
     fn set_text(
@@ -1231,33 +1204,7 @@ impl AtspiBackend for LinuxBackend {
         name: &str,
         deadline: Instant,
     ) -> Result<Value, AutomationError> {
-        self.check_cancelled(false)?;
-        let actions = self.actions(target);
-        let matches = actions
-            .iter()
-            .enumerate()
-            .filter(|(_, action)| action.name.eq_ignore_ascii_case(name))
-            .collect::<Vec<_>>();
-        let [(index, action)] = matches.as_slice() else {
-            return Err(driver_error(
-                "DRIVER.ACTION_UNSUPPORTED",
-                format!("target has no unique native {name} action"),
-            ));
-        };
-        remaining(deadline, false)?;
-        self.check_cancelled(false)?;
-        let accepted = zbus::block_on(self.action_proxy(target)?.do_action(*index as i32))
-            .map_err(|error| native_failure("Action.DoAction", target, error))?;
-        self.check_cancelled(true)?;
-        if !accepted {
-            return Err(driver_error(
-                "DRIVER.ACTION_FAILED",
-                "Action.DoAction did not accept the request",
-            ));
-        }
-        Ok(
-            json!({"native_interface": "Action.do_action", "native_action_name": name, "native_action": {"index": index, "name": action.name, "description": action.description, "key_binding": action.keybinding}, "accepted": true, "dispatched": true, "no_op": false}),
-        )
+        self.dispatch_canonical_verb(target, name, deadline)
     }
 
     fn accessible_at_point(
