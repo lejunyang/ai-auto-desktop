@@ -234,6 +234,31 @@ fn an_input_supplies_text_that_is_never_stored() {
 }
 
 #[test]
+fn a_saved_step_rejects_session_bound_path_anchors_before_replay() {
+    let (session, backend) = session();
+    let mut step = act(
+        "path",
+        Some("todo"),
+        named("button", "Save"),
+        json!({"type":"drag", "path":[{
+            "target":{"session_id":"old","resource_id":"old","observation_id":"old","node_id":"n1"},
+            "fraction":{"fx":0.5,"fy":0.5}
+        }]}),
+    );
+    step.to = Some(named("list", "Bin"));
+    assert_eq!(step.validate().unwrap_err().code, "STEP.INVALID");
+    assert_eq!(
+        steps::perform(&session, &step, &Map::new(), Duration::from_secs(5))
+            .unwrap_err()
+            .code,
+        "STEP.INVALID"
+    );
+    assert!(backend.acted.lock().unwrap().is_empty());
+    step.action = Some(json!({"type":"drag", "path":[]}));
+    step.validate().unwrap();
+}
+
+#[test]
 fn a_check_waits_for_an_element_to_appear() {
     let (session, _) = session();
     let check = Step {

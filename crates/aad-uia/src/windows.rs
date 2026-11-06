@@ -846,6 +846,9 @@ impl Backend for WindowsUiaBackend {
             .deadline
             .unwrap_or_else(|| Instant::now() + Duration::from_secs(30));
         ensure_input_deadline(deadline)?;
+        if !gesture.path.is_empty() {
+            return self.path_drag(window_id, from, to, gesture, deadline);
+        }
         let (handle, _) = self.element_for(window_id)?;
         let start_point = element_point(from.bounds, gesture.fraction)?;
         let end_point = element_point(to.bounds, gesture.to_fraction)?;
@@ -1095,6 +1098,100 @@ fn element_point(
 }
 
 impl WindowsUiaBackend {
+    fn path_drag(
+        &self,
+        window_id: &str,
+        from: &Node,
+        to: &Node,
+        gesture: &PointerGesture,
+        deadline: Instant,
+    ) -> Result<()> {
+        if gesture.path.len() > 32
+            || from.node_id != to.node_id
+            || gesture.fraction.is_none()
+            || gesture.to_fraction.is_none()
+        {
+            return Err(DriverError::invalid(
+                "drag path requires one surface and explicit endpoint fractions",
+            ));
+        }
+        let mut fractions = vec![gesture.fraction.expect("explicit source")];
+        fractions.extend_from_slice(&gesture.path);
+        fractions.push(gesture.to_fraction.expect("explicit destination"));
+        let handle = parse_window_id(window_id)?;
+        bring_to_front(handle);
+        let original = self.require_hold_target(window_id, from)?;
+        let mut route = Vec::new();
+        for fraction in fractions {
+            let point = element_point(from.bounds, Some(fraction))?;
+            self.ensure_hits(window_id, from, point)?;
+            route.push((point, to_absolute(point)?));
+        }
+        let verify = |point| -> Result<()> {
+            ensure_input_deadline(deadline)?;
+            ensure_hold_focus(handle, None)?;
+            ensure_pointer_modifier_focus(handle, &gesture.modifiers)?;
+            let live = self.require_hold_target(window_id, from)?;
+            if !unsafe { self.automation.CompareElements(&original, &live) }
+                .is_ok_and(|same| same.as_bool())
+            {
+                return Err(DriverError::stale("drag path surface identity changed"));
+            }
+            self.ensure_hits(window_id, from, point)?;
+            ensure_input_deadline(deadline)
+        };
+        verify(route[0].0)?;
+        let dwell = gesture.hold_ms.unwrap_or(0);
+        if dwell > 0 {
+            ensure_hold_budget(dwell, deadline)?;
+        }
+        let budget = Duration::from_millis(dwell + (route.len() as u64) * 16 + 1000);
+        let mut held = HeldInput::new(deadline.min(Instant::now() + budget))?;
+        let (down, up) = button_events(gesture.button);
+        let start = route[0].1;
+        let prefix = modified_pointer_inputs(
+            &[
+                mouse_event(start, MOUSEEVENTF_MOVE),
+                mouse_event(start, down),
+            ],
+            &gesture.modifiers,
+        )?;
+        // Refuse externally held input before entering the path; send checks
+        // again under the watchdog lock immediately before each new down.
+        ensure_inputs_released(&prefix[..gesture.modifiers.len() + 2])?;
+        let result = (|| {
+            held.send(
+                &prefix[..gesture.modifiers.len() + 2],
+                true,
+                "drag path down",
+            )?;
+            if dwell > 0 {
+                wait_input_hold(dwell, deadline, || verify(route[0].0))?;
+            }
+            for (point, absolute) in route.iter().skip(1) {
+                verify(*point)?;
+                held.send(
+                    &[mouse_event(*absolute, MOUSEEVENTF_MOVE)],
+                    false,
+                    "drag path move",
+                )?;
+                wait_input_hold(16, deadline, || ensure_hold_focus(handle, None))?;
+            }
+            verify(route.last().expect("path endpoint").0)?;
+            let suffix = modified_pointer_inputs(
+                &[mouse_event(route.last().expect("path endpoint").1, up)],
+                &gesture.modifiers,
+            )?;
+            held.send(
+                &suffix[gesture.modifiers.len()..],
+                true,
+                "drag path release",
+            )?;
+            Ok(())
+        })();
+        finish_held_input(&mut held, result)
+    }
+
     fn ensure_held_key_target(&self, element: &IUIAutomationElement) -> Result<()> {
         let focused = unsafe { self.automation.GetFocusedElement() }.map_err(|_| {
             DriverError::new("DRIVER.FOCUS_LOST", "could not verify the held key element")

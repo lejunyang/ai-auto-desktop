@@ -687,6 +687,7 @@ impl Backend for NativeBackend {
                 to_fraction,
                 modifiers,
                 hold_ms,
+                path,
             } => {
                 set("to", target_of(&json!(to.node_id)));
                 if portable {
@@ -705,6 +706,24 @@ impl Backend for NativeBackend {
                 set("fraction", fraction(from_at));
                 set("to_fraction", fraction(to_fraction));
                 set("hold_ms", json!(hold_ms));
+                if !path.is_empty() {
+                    let anchors = path
+                        .iter()
+                        .map(|anchor| {
+                            let mut value = json!({
+                                "target": target_of(&json!(anchor.target.node_id)),
+                                "fraction": anchor.fraction,
+                            });
+                            if portable {
+                                // Control validation requires the same observed
+                                // surface for every intermediate anchor.
+                                value["locator"] = locator_of(node);
+                            }
+                            value
+                        })
+                        .collect::<Vec<_>>();
+                    set("path", json!(anchors));
+                }
                 if !modifiers.is_empty() {
                     set("modifiers", json!(modifiers));
                 }

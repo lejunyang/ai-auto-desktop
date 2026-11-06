@@ -24,10 +24,11 @@ private final class InputReleaseGuard {
     private(set) var expired = false
     private let timer: DispatchSourceTimer
 
-    init(pid: pid_t, deadlineMS: Double?, holdMS: Int) {
+    init(pid: pid_t, deadlineMS: Double?, holdMS: Int, routeMS: Int = 0) {
         self.pid = pid
-        let remainingMS = deadlineMS.map { max(0, $0 - Date().timeIntervalSince1970 * 1000) } ?? Double(holdMS + 750)
-        self.deadline = DispatchTime.now().uptimeNanoseconds + UInt64(min(Double(holdMS + 750), remainingMS) * 1_000_000)
+        let boundMS = Double(holdMS + routeMS + 750)
+        let remainingMS = deadlineMS.map { max(0, $0 - Date().timeIntervalSince1970 * 1000) } ?? boundMS
+        self.deadline = DispatchTime.now().uptimeNanoseconds + UInt64(min(boundMS, remainingMS) * 1_000_000)
         timer = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .userInitiated))
         timer.schedule(deadline: .now(), repeating: .milliseconds(10))
         timer.setEventHandler { [weak self] in self?.expireIfNeeded() }
@@ -1374,7 +1375,13 @@ private final class AXService {
         args: Arguments, deadlineMS: Double?, requestID: String,
         progress: RequestProgress
     ) throws -> [String: Any] {
-        try args.only(["native_token", "to_token", "button", "fx", "fy", "to_fx", "to_fy", "modifiers", "hold_ms"])
+        try args.only(["native_token", "to_token", "button", "fx", "fy", "to_fx", "to_fy", "modifiers", "hold_ms", "path"])
+        if let raw = args.values["path"] {
+            guard let path = raw as? [[String: Any]], path.count <= 32 else {
+                throw HelperFailure("DRIVER.INVALID_REQUEST", "drag path takes at most 32 element fractions")
+            }
+            if !path.isEmpty { return try pathDrag(args: args, path: path, deadlineMS: deadlineMS, requestID: requestID, progress: progress) }
+        }
         try requireTrusted()
         let flags = try pointerModifiers(args)
         let types = try mouseTypes(try args.string("button")!)
@@ -1437,6 +1444,95 @@ private final class AXService {
             "pointer_dispatch_started": progress.pointerDispatchStarted,
             "phase": "submitted",
         ]
+    }
+
+    /// Fractions arrive only after the provider has checked every observed
+    /// anchor. Recheck native identity, bounds and hit ownership for each move.
+    private func pathDrag(
+        args: Arguments, path: [[String: Any]], deadlineMS: Double?, requestID: String,
+        progress: RequestProgress
+    ) throws -> [String: Any] {
+        try requireTrusted()
+        let sourceToken = try args.string("native_token")!
+        let source = try tokens.resolve(sourceToken)
+        let destination = try tokens.resolve(try args.string("to_token")!)
+        try configureTimeout(source, deadlineMS: deadlineMS)
+        let sourceRole = stringAttribute(source, kAXRoleAttribute as CFString)
+        let sourceSubrole = stringAttribute(source, kAXSubroleAttribute as CFString)
+        let sourceTitle = stringAttribute(source, kAXTitleAttribute as CFString)
+        guard CFEqual(source, destination) else {
+            throw HelperFailure("DRIVER.INVALID_REQUEST", "drag path endpoints must share one native surface")
+        }
+        let flags = try pointerModifiers(args)
+        let types = try mouseTypes(try args.string("button")!)
+        let holdMS = try holdDuration(args) ?? 0
+        if CGEventSource.buttonState(.combinedSessionState, button: types.button) {
+            throw HelperFailure("DRIVER.INPUT_BLOCKED", "requested pointer button is already held")
+        }
+        var fractions: [(Double, Double)] = [(try args.fraction("fx"), try args.fraction("fy"))]
+        for raw in path {
+            let anchor = Arguments(values: raw)
+            try anchor.only(["fx", "fy"])
+            fractions.append((try anchor.fraction("fx"), try anchor.fraction("fy")))
+        }
+        fractions.append((try args.fraction("to_fx"), try args.fraction("to_fy")))
+        var route: [PointerTarget] = []
+        for (fx, fy) in fractions {
+            let target = try pointerTarget(token: sourceToken, fx: fx, fy: fy, operation: "drag", deadlineMS: deadlineMS, progress: progress)
+            if let original = route.first, target.pid != original.pid || target.bounds != original.bounds {
+                throw HelperFailure("DRIVER.STALE_HANDLE", "drag path surface moved during preflight")
+            }
+            route.append(target)
+        }
+        let first = route[0]
+        func verify(_ index: Int) throws {
+            try checkDeadline(deadlineMS)
+            let native = try tokens.resolve(sourceToken)
+            guard CFEqual(source, native) else { throw HelperFailure("DRIVER.STALE_HANDLE", "drag path native identity changed") }
+            try configureTimeout(native, deadlineMS: deadlineMS)
+            guard stringAttribute(native, kAXRoleAttribute as CFString) == sourceRole,
+                  stringAttribute(native, kAXSubroleAttribute as CFString) == sourceSubrole,
+                  stringAttribute(native, kAXTitleAttribute as CFString) == sourceTitle else {
+                throw HelperFailure("DRIVER.STALE_HANDLE", "drag path surface semantics changed")
+            }
+            let expected = route[index]
+            let fresh = try pointerTarget(token: sourceToken, fx: fractions[index].0, fy: fractions[index].1,
+                operation: "drag", deadlineMS: deadlineMS, progress: progress)
+            guard fresh.pid == first.pid, fresh.bounds == first.bounds, fresh.point == expected.point else {
+                throw HelperFailure("DRIVER.STALE_HANDLE", "drag path surface geometry changed")
+            }
+            try checkDeadline(deadlineMS)
+        }
+        try verify(0)
+        if holdMS > 0 { try requireHoldBudget(holdMS, deadlineMS: deadlineMS) }
+        let guardInput = InputReleaseGuard(pid: first.pid, deadlineMS: deadlineMS, holdMS: holdMS, routeMS: route.count * 16 + 250)
+        defer { _ = guardInput.finish(); progress.markPointerReleaseSubmitted() }
+        let down = try mouseEvent(types.down, at: first.point, button: types.button)
+        let release = try mouseEvent(types.up, at: first.point, button: types.button)
+        let move = try mouseEvent(.mouseMoved, at: first.point, button: types.button)
+        move.flags = flags; down.flags = flags
+        startPointerDispatch(requestID: requestID, progress: progress)
+        try guardInput.post(move)
+        // Preflight may involve slow AX calls. Recheck ownership immediately
+        // before the down so cleanup cannot release an already-held button.
+        if CGEventSource.buttonState(.combinedSessionState, button: types.button) {
+            throw HelperFailure("DRIVER.INPUT_BLOCKED", "requested pointer button became held")
+        }
+        try guardInput.post(down, release: release)
+        if holdMS > 0 { try boundedDwell(milliseconds: holdMS, deadlineMS: deadlineMS) { try verify(0) } }
+        for index in 1..<route.count {
+            try verify(index)
+            let move = try mouseEvent(types.dragged, at: route[index].point, button: types.button)
+            move.flags = flags
+            try guardInput.post(move)
+            try boundedDwell(milliseconds: 16, deadlineMS: deadlineMS) { try self.requireFrontmost(first.pid, operation: "drag") }
+        }
+        try verify(route.count - 1)
+        let up = try mouseEvent(types.up, at: route.last!.point, button: types.button)
+        up.flags = flags
+        try guardInput.post(up)
+        return ["native_operation":"CGEventPathDrag", "submitted":true,
+            "pointer_dispatch_started":progress.pointerDispatchStarted, "phase":"submitted"]
     }
 
     /// US ANSI virtual key codes for the key names the control protocol uses.

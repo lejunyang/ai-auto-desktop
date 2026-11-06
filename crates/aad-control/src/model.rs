@@ -166,6 +166,16 @@ pub struct Fraction {
     pub fy: f64,
 }
 
+/// An intermediate drag location, anchored to an observed surface.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct DragAnchor {
+    pub target: Target,
+    pub fraction: Fraction,
+}
+
+pub const MAX_DRAG_ANCHORS: usize = 32;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Action {
@@ -230,6 +240,10 @@ pub enum Action {
         /// Wait at the source after button down and before the first move.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         hold_ms: Option<u64>,
+        /// Intermediate anchors on the same observed surface, in visit order.
+        /// Explicit source and destination fractions are required when nonempty.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        path: Vec<DragAnchor>,
     },
     /// Choose one option of a list box by its label or value.
     Select {

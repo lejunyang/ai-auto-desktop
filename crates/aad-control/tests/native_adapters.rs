@@ -289,6 +289,58 @@ impl Provider for Fixture {
         Ok(json!({"ok":true}))
     }
 }
+
+#[test]
+fn drag_path_adapters_preserve_each_observed_anchor() {
+    for (name, flavor) in [
+        ("desktop.windows_uia", Flavor::Windows),
+        ("desktop.linux_atspi", Flavor::Linux),
+        ("desktop.macos_ax", Flavor::MacOS),
+    ] {
+        let provider = Fixture::new(name, flavor);
+        let backend = NativeBackend::new(provider.clone(), flavor);
+        let node = json!({"node_id":"n","role":"pane","name":"surface","actions":["drag"],
+            "provenance":{"bus_name":":1.2","object_path":"/surface"}});
+        let snapshot = json!({"snapshot_id":"s","revision":1,"nodes":[node]});
+        let target = json!({"session_id":"s","resource_id":"r","observation_id":"o","node_id":"n"});
+        let action = serde_json::from_value(json!({"type":"drag","to":target,
+            "fraction":{"fx":0.1,"fy":0.2},"to_fraction":{"fx":0.9,"fy":0.8},
+            "path":[{"target":target,"fraction":{"fx":0.3,"fy":0.7}},
+                    {"target":target,"fraction":{"fx":0.6,"fy":0.1}}]}))
+        .unwrap();
+        backend
+            .act(
+                &snapshot,
+                &node,
+                &action,
+                &Context::new(Duration::from_secs(1), true),
+            )
+            .unwrap();
+        let calls = provider.calls.lock().unwrap();
+        let (called, args) = calls.last().unwrap();
+        assert_eq!(called, &format!("{name}.drag@1"));
+        assert_eq!(args["path"].as_array().unwrap().len(), 2);
+        for (anchor, fraction) in args["path"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .zip([json!({"fx":0.3,"fy":0.7}), json!({"fx":0.6,"fy":0.1})])
+        {
+            assert_eq!(
+                anchor["target"],
+                json!({"snapshot_id":"s","revision":1,"node_id":"n"})
+            );
+            assert_eq!(anchor["fraction"], fraction);
+            assert_eq!(
+                anchor.get("locator").is_some(),
+                !matches!(flavor, Flavor::Windows)
+            );
+            if matches!(flavor, Flavor::Linux) {
+                assert_eq!(anchor["locator"]["object_path"], "/surface");
+            }
+        }
+    }
+}
 #[test]
 fn platform_specific_selectors_actions_and_capabilities_are_not_conflated() {
     for (name, flavor, selector_field, write, argument) in [
@@ -436,6 +488,7 @@ fn windows_gestures_views_and_rich_locators_route_to_the_driver() {
     backend.act(&snapshot, &node, &scroll, &context()).unwrap();
     assert_eq!(last().1["scroll"], json!({"direction":"down","notches":5}));
     let drag = Action::Drag {
+        path: Vec::new(),
         to: Target {
             session_id: "x".into(),
             resource_id: "r".into(),

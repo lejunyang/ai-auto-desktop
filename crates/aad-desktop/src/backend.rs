@@ -208,6 +208,9 @@ pub struct PointerGesture {
     /// Where inside the destination element to release a drag. `None` means its
     /// centre. Ignored by single-element gestures.
     pub to_fraction: Option<(f64, f64)>,
+    /// Intermediate fractions of the same observed surface. The provider has
+    /// checked every caller-supplied anchor against the source snapshot/node.
+    pub path: Vec<(f64, f64)>,
     /// When set, the gesture is a scroll rather than a click.
     pub scroll: Option<ScrollSpec>,
     /// When set, the gesture hovers: move to the point and dwell this long.

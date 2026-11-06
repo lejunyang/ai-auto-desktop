@@ -1226,7 +1226,7 @@ impl Session {
                     }
                     None
                 };
-                if let Action::Drag { to, .. } = action {
+                if let Action::Drag { to, path, .. } = action {
                     // Both ends must come from the same view of the same resource,
                     // so one live revalidation covers the whole gesture.
                     if to.session_id != target.session_id
@@ -1242,6 +1242,17 @@ impl Session {
                     // selection). Its fractions still undergo validation and
                     // the provider revalidates the observed native element.
                     observed(&to.node_id)?;
+                    if !path.is_empty() {
+                        if to != target || path.iter().any(|anchor| &anchor.target != target) {
+                            return Err(error(
+                                "CONTROL.INVALID_REQUEST",
+                                "a drag path must stay on the same observed surface as both endpoints",
+                            ));
+                        }
+                        for anchor in path {
+                            observed(&anchor.target.node_id)?;
+                        }
+                    }
                 }
                 let backend = &self.backends[&observation.provider];
                 if !backend
@@ -2140,6 +2151,20 @@ fn validate_action(action: &Action) -> Result<()> {
             return invalid("pointer modifiers must be unique: ctrl, shift, alt or meta");
         }
     }
+    if let Action::Drag {
+        path,
+        fraction,
+        to_fraction,
+        ..
+    } = action
+    {
+        if path.len() > MAX_DRAG_ANCHORS {
+            return invalid("a drag path contains at most 32 intermediate anchors");
+        }
+        if !path.is_empty() && (fraction.is_none() || to_fraction.is_none()) {
+            return invalid("a drag path requires explicit source and destination fractions");
+        }
+    }
     let fractions: Vec<&Fraction> = match action {
         Action::Click { fraction, .. }
         | Action::Scroll { fraction, .. }
@@ -2147,8 +2172,13 @@ fn validate_action(action: &Action) -> Result<()> {
         Action::Drag {
             fraction,
             to_fraction,
+            path,
             ..
-        } => fraction.iter().chain(to_fraction.iter()).collect(),
+        } => fraction
+            .iter()
+            .chain(to_fraction.iter())
+            .chain(path.iter().map(|anchor| &anchor.fraction))
+            .collect(),
         _ => Vec::new(),
     };
     if fractions

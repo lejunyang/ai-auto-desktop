@@ -137,6 +137,13 @@ impl Step {
             if name == "secret_input" {
                 return Err(invalid("secret input is available only as an immediate action, not in saved steps or workflows"));
             }
+            if name == "drag"
+                && action
+                    .get("path")
+                    .is_some_and(|path| !path.as_array().is_some_and(Vec::is_empty))
+            {
+                return Err(invalid("drag paths contain session-bound anchors and are available only as immediate actions"));
+            }
             if !ACTION_NAMES.contains(&name) {
                 return Err(invalid(format!(
                     "step {} has no known action type",

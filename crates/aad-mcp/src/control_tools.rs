@@ -144,7 +144,15 @@ fn action_schema() -> Value {
             "fraction": fraction_schema("Where inside the source element to grab"),
             "to_fraction": fraction_schema("Where inside the destination element to release"),
             "modifiers": pointer_modifiers_schema(),
-            "hold_ms": hold_schema("Wait at the source with the button held, before the first drag movement, in milliseconds.")
+            "hold_ms": hold_schema("Wait at the source with the button held, before the first drag movement, in milliseconds."),
+            "path": {
+                "type":"array", "maxItems":32,
+                "description":"Intermediate anchors to visit in order while holding the button. Every anchor and both endpoints must be the same observed surface, with explicit source and destination fractions. Only immediate actions; saved workflows do not accept these session-bound anchors. Unsupported providers refuse before input.",
+                "items": {"type":"object", "properties":{
+                    "target": target_schema(),
+                    "fraction": fraction_schema("Intermediate location inside the observed surface")
+                }, "required":["target","fraction"], "additionalProperties":false}
+            }
         }), &["to"]),
         variant("select", "Choose one option of a list box (a browser <select>), by its \
     label as the observation lists it in `options`, or by its value.", json!({
@@ -244,6 +252,7 @@ pub(crate) fn saved_action_schema() -> Value {
         if variant["properties"]["type"]["const"] == "drag" {
             if let Some(properties) = variant["properties"].as_object_mut() {
                 properties.remove("to");
+                properties.remove("path");
             }
             variant["required"] = json!(["type"]);
             variant["description"] = json!(
@@ -887,6 +896,23 @@ mod tests {
         for kind in ["scroll", "hover"] {
             assert!(variant(kind)["properties"].get("modifiers").is_none());
         }
+    }
+
+    #[test]
+    fn drag_paths_require_observed_targets_and_are_not_saved() {
+        let schema = variant("drag");
+        let path = &schema["properties"]["path"];
+        assert_eq!(path["maxItems"], 32);
+        assert_eq!(path["items"]["required"], json!(["target", "fraction"]));
+        assert_eq!(path["items"]["additionalProperties"], false);
+        let saved = saved_action_schema();
+        let drag = saved["oneOf"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|variant| variant["properties"]["type"]["const"] == "drag")
+            .unwrap();
+        assert!(drag["properties"].get("path").is_none());
     }
 
     #[test]

@@ -1005,6 +1005,7 @@ fn fractions_stay_relative_to_the_full_element_when_the_viewport_clips_it() {
         &session,
         surface.clone(),
         Action::Drag {
+            path: Vec::new(),
             to: surface,
             button: None,
             fraction: Some(Fraction { fx: 0.3, fy: 0.5 }),
@@ -1099,6 +1100,7 @@ fn bounded_holds_have_real_durations_and_release_on_focus_occlusion_and_cancel()
         &session,
         surface.clone(),
         Action::Drag {
+            path: Vec::new(),
             to: surface,
             button: None,
             fraction: Some(Fraction { fx: 0.2, fy: 0.5 }),
@@ -1210,6 +1212,7 @@ fn drag_to(session: &Session, main: &str, from: &str, (role, to): (&str, &str)) 
         session,
         source,
         Action::Drag {
+            path: Vec::new(),
             hold_ms: None,
             modifiers: Vec::new(),
             to,
@@ -1277,6 +1280,7 @@ fn canvas_surfaces_take_trusted_clicks_wheels_and_drags_inside_the_same_element(
         &session,
         canvas.clone(),
         Action::Drag {
+            path: Vec::new(),
             hold_ms: None,
             modifiers: Vec::new(),
             to: canvas,
@@ -1526,6 +1530,7 @@ fn pointer_modifiers_reach_click_drag_and_drop_without_keyboard_state() {
         &session,
         surface.clone(),
         Action::Drag {
+            path: Vec::new(),
             hold_ms: None,
             to: surface,
             button: None,
@@ -1554,6 +1559,7 @@ fn pointer_modifiers_reach_click_drag_and_drop_without_keyboard_state() {
         &session,
         card,
         Action::Drag {
+            path: Vec::new(),
             hold_ms: None,
             to: bin,
             button: None,
@@ -1621,6 +1627,7 @@ fn drags_move_pointer_sortables_and_html5_draggables() {
         &session,
         card,
         Action::Drag {
+            path: Vec::new(),
             hold_ms: None,
             modifiers: Vec::new(),
             to: bin,

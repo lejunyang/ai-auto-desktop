@@ -238,6 +238,7 @@ fn drag_ends_share_one_observation_and_gestures_follow_node_capabilities() {
     let from = target(&observation, "n1");
     let to = target(&observation, "n4");
     let drag = |to: Target| Action::Drag {
+        path: Vec::new(),
         to,
         button: None,
         fraction: None,
@@ -295,6 +296,7 @@ fn drag_moves_between_fractions_of_one_observed_surface() {
     let observation = observe(&session, View::default()).data.unwrap();
     let surface = target(&observation, "n1");
     let drag = |to: Target, destination: Fraction| Action::Drag {
+        path: Vec::new(),
         to,
         button: None,
         fraction: Some(Fraction { fx: 0.2, fy: 0.3 }),
@@ -349,6 +351,52 @@ fn drag_moves_between_fractions_of_one_observed_surface() {
     assert_eq!(
         code(&act(drag(surface.clone(), end))),
         "CONTROL.STALE_TARGET"
+    );
+}
+
+#[test]
+fn drag_paths_reject_unobserved_or_foreign_anchors_before_dispatch() {
+    let (session, backend) = session();
+    let observation = observe(&session, View::default()).data.unwrap();
+    let surface = target(&observation, "n1");
+    let action = json!({"type":"drag", "to":surface,
+        "fraction":{"fx":0.1,"fy":0.2}, "to_fraction":{"fx":0.9,"fy":0.8},
+        "path":[{"target":surface,"fraction":{"fx":0.5,"fy":0.1}}]});
+    let act = |value: Value| {
+        call(
+            &session,
+            Operation::Act {
+                target: surface.clone(),
+                action: serde_json::from_value(value).unwrap(),
+                verify: None,
+            },
+        )
+    };
+    for field in ["session_id", "resource_id", "observation_id", "node_id"] {
+        let mut bad = action.clone();
+        bad["path"][0]["target"][field] = json!("unobserved");
+        assert_eq!(code(&act(bad)), "CONTROL.INVALID_REQUEST", "{field}");
+    }
+    let mut foreign = action.clone();
+    foreign["to"] = json!(target(&observation, "n4"));
+    assert_eq!(code(&act(foreign)), "CONTROL.INVALID_REQUEST");
+    for field in ["fraction", "to_fraction"] {
+        let mut bad = action.clone();
+        bad.as_object_mut().unwrap().remove(field);
+        assert_eq!(code(&act(bad)), "CONTROL.INVALID_REQUEST");
+    }
+    let mut outside = action.clone();
+    outside["path"][0]["fraction"]["fx"] = json!(1.01);
+    assert_eq!(code(&act(outside)), "CONTROL.INVALID_REQUEST");
+    let mut too_long = action.clone();
+    too_long["path"] = json!(vec![action["path"][0].clone(); 33]);
+    assert_eq!(code(&act(too_long)), "CONTROL.INVALID_REQUEST");
+    assert!(backend.acted.lock().unwrap().is_empty());
+    let result = act(action.clone());
+    assert!(result.error.is_none(), "{result:?}");
+    assert_eq!(
+        serde_json::to_value(&*backend.acted.lock().unwrap()).unwrap(),
+        json!([action])
     );
 }
 

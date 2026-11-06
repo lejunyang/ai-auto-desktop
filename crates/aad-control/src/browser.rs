@@ -2174,7 +2174,8 @@ impl Backend for BrowserBackend {
             // Trusted pointer input is addressed to the page; the owner
             // elements of enclosing frames are brought into view first.
             let route=if trusted {Route::to(state,frame_id)?} else {Route::default()};
-            if let Action::Drag {to,fraction,to_fraction,button,modifiers,hold_ms}=action {
+            if let Action::Drag {to,fraction,to_fraction,button,modifiers,hold_ms,path}=action {
+                if !path.is_empty() {return Err(error("CONTROL.ACTION_UNSUPPORTED","browser drag paths are not implemented"));}
                 let observed=|node_id:&str,fraction:&Option<crate::Fraction>,action:Value|{let mut args=json!({"document_token":snapshot["document_token"],"observation":snapshot["snapshot_id"],"node_id":node_id,"action":action,"frame_id":frame_id,"loader_id":meta["loader_id"]});if let Some(f)=fraction{args["fraction"]=json!({"fx":f.fx,"fy":f.fy});}args};
                 let from=observed(node["node_id"].as_str().unwrap_or_default(),fraction,json!("drag"));
                 let onto=observed(&to.node_id,to_fraction,Value::Null);

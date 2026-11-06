@@ -771,6 +771,7 @@ impl UiaDriver {
                     .with_detail("supported", json!(to_node.actions)));
                 }
                 let mut gesture = parse_drag_gesture(args)?;
+                gesture.path = parse_drag_path(args, &target, &to_target)?;
                 ensure_input_deadline(deadline)?;
                 gesture.deadline = Some(deadline);
                 self.backend.drag(&window_id, &node, &to_node, &gesture)?
@@ -1079,6 +1080,9 @@ fn parse_pointer_modifiers(args: &Value) -> Result<Vec<String>> {
 }
 
 fn parse_pointer_gesture(args: &Value) -> Result<PointerGesture> {
+    if args.get("path").is_some() {
+        return Err(DriverError::invalid("path is supported for drag only"));
+    }
     let button = parse_button(args)?;
     let modifiers = parse_pointer_modifiers(args)?;
     let count = match args.get("count") {
@@ -1180,6 +1184,7 @@ fn parse_pointer_gesture(args: &Value) -> Result<PointerGesture> {
         modifiers,
         fraction: parse_fraction(args, "fraction")?,
         to_fraction: None,
+        path: Vec::new(),
         scroll,
         hover_ms,
     })
@@ -1214,9 +1219,57 @@ fn parse_drag_gesture(args: &Value) -> Result<PointerGesture> {
         modifiers: parse_pointer_modifiers(args)?,
         fraction: parse_fraction(args, "fraction")?,
         to_fraction: parse_fraction(args, "to_fraction")?,
+        path: Vec::new(),
         scroll: None,
         hover_ms: None,
     })
+}
+
+fn parse_drag_path(args: &Value, source: &Target, destination: &Target) -> Result<Vec<(f64, f64)>> {
+    let Some(path) = args.get("path") else {
+        return Ok(Vec::new());
+    };
+    let path = path
+        .as_array()
+        .ok_or_else(|| DriverError::invalid("drag path must be an array"))?;
+    if path.len() > 32 {
+        return Err(DriverError::invalid("drag path accepts at most 32 anchors"));
+    }
+    if path.is_empty() {
+        return Ok(Vec::new());
+    }
+    if source != destination
+        || parse_fraction(args, "fraction")?.is_none()
+        || parse_fraction(args, "to_fraction")?.is_none()
+    {
+        return Err(DriverError::invalid(
+            "drag path requires explicit endpoint fractions on the same observed surface",
+        ));
+    }
+    path.iter()
+        .map(|anchor| {
+            let object = anchor
+                .as_object()
+                .ok_or_else(|| DriverError::invalid("drag path anchor must be an object"))?;
+            if object
+                .keys()
+                .any(|name| !matches!(name.as_str(), "target" | "fraction"))
+            {
+                return Err(DriverError::invalid(
+                    "drag path anchor accepts target and fraction only",
+                ));
+            }
+            let target = Target::from_value(object.get("target").unwrap_or(&Value::Null))
+                .map_err(DriverError::invalid)?;
+            if target != *source {
+                return Err(DriverError::invalid(
+                    "drag path anchor must identify the source observation and surface",
+                ));
+            }
+            parse_fraction(anchor, "fraction")?
+                .ok_or_else(|| DriverError::invalid("drag path anchor requires a fraction"))
+        })
+        .collect()
 }
 
 fn action_contracts() -> Map<String, Value> {
@@ -1486,6 +1539,7 @@ mod tests {
         verify_result: Mutex<bool>,
         verify_delay: Mutex<Duration>,
         received_deadlines: Mutex<Vec<Instant>>,
+        received_paths: Mutex<Vec<Vec<(f64, f64)>>>,
     }
 
     impl FakeBackend {
@@ -1496,6 +1550,7 @@ mod tests {
                 verify_result: Mutex::new(true),
                 verify_delay: Mutex::new(Duration::ZERO),
                 received_deadlines: Mutex::new(Vec::new()),
+                received_paths: Mutex::new(Vec::new()),
             })
         }
 
@@ -1619,8 +1674,12 @@ mod tests {
             _window_id: &str,
             from: &Node,
             to: &Node,
-            _gesture: &PointerGesture,
+            gesture: &PointerGesture,
         ) -> Result<()> {
+            self.received_paths
+                .lock()
+                .unwrap()
+                .push(gesture.path.clone());
             self.record(&format!("drag:{}->{}", from.node_id, to.node_id));
             Ok(())
         }
@@ -1750,6 +1809,68 @@ mod tests {
             let error = parse_pointer_gesture(&arguments).unwrap_err();
             assert_eq!(error.code, "DRIVER.INVALID_REQUEST");
         }
+    }
+
+    #[test]
+    fn drag_path_reaches_backend_only_after_anchor_validation() {
+        let (driver, backend) = driver(vec![node("n1", "Pane", "Surface", &["drag"])]);
+        let source = driver
+            .call(
+                "find",
+                &json!({"window_id":"w1","locator":{"name":"Surface"}}),
+            )
+            .unwrap();
+        let target = target_of(&source);
+        let args = json!({"target":target,"to":target,"fraction":{"fx":0.1,"fy":0.2},
+            "to_fraction":{"fx":0.8,"fy":0.9},"path":[{"target":target,"fraction":{"fx":0.3,"fy":0.6}}]});
+        driver.call("drag", &args).unwrap();
+        assert_eq!(
+            *backend.received_paths.lock().unwrap(),
+            vec![vec![(0.3, 0.6)]]
+        );
+        let mut bad = args.clone();
+        bad["path"][0]["target"]["snapshot_id"] = json!("other");
+        assert!(driver.call("drag", &bad).is_err());
+        assert_eq!(backend.performed().len(), 1);
+    }
+
+    #[test]
+    fn drag_path_preserves_every_anchor_and_refuses_cross_surface_or_implicit_endpoints() {
+        let target = Target {
+            snapshot_id: "s1".into(),
+            revision: 1,
+            node_id: "n1".into(),
+        };
+        let args = json!({"fraction":{"fx":0.1,"fy":0.2},"to_fraction":{"fx":0.9,"fy":0.8},
+            "path":[{"target":target,"fraction":{"fx":0.3,"fy":0.7}},
+                    {"target":target,"fraction":{"fx":0.6,"fy":0.4}}]});
+        assert_eq!(
+            parse_drag_path(&args, &target, &target).unwrap(),
+            vec![(0.3, 0.7), (0.6, 0.4)]
+        );
+        let mut bad = args.clone();
+        bad["path"][0]["target"]["revision"] = json!(2);
+        assert!(parse_drag_path(&bad, &target, &target).is_err());
+        let mut bad = args.clone();
+        bad["path"][0]["target"]["node_id"] = json!("n2");
+        assert!(parse_drag_path(&bad, &target, &target).is_err());
+        let mut bad = args.clone();
+        bad.as_object_mut().unwrap().remove("fraction");
+        assert!(parse_drag_path(&bad, &target, &target).is_err());
+        let mut bad = args.clone();
+        bad["path"][0]["fraction"]["fx"] = json!(1.1);
+        assert!(parse_drag_path(&bad, &target, &target).is_err());
+        let mut bad = args.clone();
+        bad["path"] = json!(vec![args["path"][0].clone(); 33]);
+        assert!(parse_drag_path(&bad, &target, &target).is_err());
+        let other = Target {
+            node_id: "n2".into(),
+            ..target.clone()
+        };
+        assert!(parse_drag_path(&args, &target, &other).is_err());
+        assert!(parse_drag_path(&json!({"path":[]}), &target, &other)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

@@ -793,6 +793,7 @@ impl MacOSAxProvider {
                 "to_fraction",
                 "modifiers",
                 "hold_ms",
+                "path",
             ]),
             "key_chord" => allowed.extend(["keys", "hold_ms"]),
             _ => {}
@@ -804,6 +805,11 @@ impl MacOSAxProvider {
             "pointer_gesture" => Some(gesture_request(args)?),
             "drag" => Some(drag_request(args)?),
             _ => None,
+        };
+        let path = if action == "drag" {
+            drag_path_anchors(args)?
+        } else {
+            Vec::new()
         };
         let keys = if action == "key_chord" {
             Some(key_names(args.get("keys"))?)
@@ -913,6 +919,19 @@ impl MacOSAxProvider {
         } else {
             None
         };
+        for anchor in &path {
+            let (_, _, intermediate) = self.revalidate_target(
+                anchor,
+                drag_observation.as_ref().expect("drag observation saved"),
+                &fresh,
+                deadline,
+            )?;
+            if !self.backend.same_element(&token, &intermediate, deadline)? {
+                return Err(stale(
+                    "drag path must remain on the observed source surface",
+                ));
+            }
+        }
         if !node["actions"]
             .as_array()
             .expect("actions")
@@ -1281,7 +1300,64 @@ fn drag_request(args: &Map<String, Value>) -> Result<Value, AutomationError> {
     if !modifiers.is_empty() {
         request["modifiers"] = json!(modifiers);
     }
+    let path = drag_path_anchors(args)?;
+    if !path.is_empty() {
+        request["path"] = Value::Array(
+            path.iter()
+                .map(|anchor| {
+                    let (fx, fy) =
+                        fraction_pair(anchor.get("fraction")).expect("validated path fraction");
+                    json!({"fx":fx,"fy":fy})
+                })
+                .collect(),
+        );
+    }
     Ok(request)
+}
+
+fn drag_path_anchors(
+    args: &Map<String, Value>,
+) -> Result<Vec<Map<String, Value>>, AutomationError> {
+    let Some(path) = args.get("path") else {
+        return Ok(Vec::new());
+    };
+    let path = path
+        .as_array()
+        .ok_or_else(|| invalid("path must be an array"))?;
+    if path.len() > 32 {
+        return Err(invalid("path accepts at most 32 anchors"));
+    }
+    if path.is_empty() {
+        return Ok(Vec::new());
+    }
+    if args.get("target") != args.get("to")
+        || args.get("fraction").is_none_or(Value::is_null)
+        || args.get("to_fraction").is_none_or(Value::is_null)
+    {
+        return Err(invalid(
+            "path requires explicit endpoint fractions of the same observed surface",
+        ));
+    }
+    fraction_pair(args.get("fraction"))?;
+    fraction_pair(args.get("to_fraction"))?;
+    path.iter()
+        .map(|anchor| {
+            let anchor = anchor
+                .as_object()
+                .ok_or_else(|| invalid("path anchor must be an object"))?;
+            only_keys(anchor, &["target", "locator", "fraction"])?;
+            if anchor.get("target") != args.get("target")
+                || anchor.get("fraction").is_none_or(Value::is_null)
+            {
+                return Err(invalid(
+                    "each path anchor requires the source target and an explicit fraction",
+                ));
+            }
+            parse_locator(anchor.get("locator"))?;
+            fraction_pair(anchor.get("fraction"))?;
+            Ok(anchor.clone())
+        })
+        .collect()
 }
 
 fn key_names(value: Option<&Value>) -> Result<Vec<String>, AutomationError> {
@@ -1923,6 +1999,10 @@ fn manifest_document() -> Value {
         actions.get_mut(action).expect("gesture contract")["input_schema"]["properties"]
             ["hold_ms"] = hold.clone();
     }
+    actions.get_mut("drag").expect("drag contract")["input_schema"]["properties"]["path"] = json!({
+        "type":"array", "maxItems":32, "items":{"type":"object", "required":["target","locator","fraction"],
+        "properties":{"target":target_schema(),"locator":locator_schema(),"fraction":fraction},"additionalProperties":false}
+    });
     json!({"apiVersion": "ai-auto-desktop.dev/v1alpha1", "kind": "CapabilityManifest", "metadata": {"name": PROVIDER_NAME, "version": PROVIDER_VERSION, "description": "macOS 原生 Accessibility API 进程驱动（完整性校验的 Swift helper）。"}, "actions": actions, "runtime": {"kind": "builtin", "protocol": "rust-provider-v1", "platforms": ["macos"]}})
 }
 
@@ -2712,6 +2792,58 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.code, "DRIVER.STALE_SNAPSHOT");
         assert_eq!(backend.writes.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn drag_path_validates_all_anchors_against_one_fresh_surface() {
+        let backend = Arc::new(FakeBackend::default());
+        let provider = MacOSAxProvider::new(backend.clone()).unwrap();
+        let snapshot = take_snapshot(&provider);
+        let mut args = drag_args(&snapshot, true);
+        args["fraction"] = json!({"fx":0.1,"fy":0.2});
+        args["to_fraction"] = json!({"fx":0.9,"fy":0.8});
+        args["path"] = json!([
+            {"target":args["target"],"locator":args["locator"],"fraction":{"fx":0.3,"fy":0.7}},
+            {"target":args["target"],"locator":args["locator"],"fraction":{"fx":0.6,"fy":0.4}}]);
+        let result = provider
+            .invoke(
+                "desktop.macos_ax.drag@1",
+                args.clone(),
+                Some(Duration::from_secs(2)),
+            )
+            .unwrap();
+        assert_eq!(
+            result["backend_result"]["sent"]["path"],
+            json!([{"fx":0.3,"fy":0.7},{"fx":0.6,"fy":0.4}])
+        );
+        let mut bad = args.clone();
+        bad["path"][1]["target"]["revision"] = json!(999);
+        assert!(drag_path_anchors(bad.as_object().unwrap()).is_err());
+        let mut bad = args.clone();
+        bad["path"][1]["target"]["node_id"] = json!("n1");
+        assert!(drag_path_anchors(bad.as_object().unwrap()).is_err());
+        let mut bad = args.clone();
+        bad["path"][0]["fraction"] = Value::Null;
+        assert!(drag_path_anchors(bad.as_object().unwrap()).is_err());
+        let mut bad = args.clone();
+        bad.as_object_mut().unwrap().remove("fraction");
+        assert!(drag_path_anchors(bad.as_object().unwrap()).is_err());
+        let mut bad = args.clone();
+        bad["path"] = json!(vec![args["path"][0].clone(); 33]);
+        assert!(drag_path_anchors(bad.as_object().unwrap()).is_err());
+        assert_eq!(backend.writes.load(Ordering::SeqCst), 1);
+
+        // An anchor with the source handle but another locator must not get
+        // authority from its fraction alone, even on a valid original snapshot.
+        let snapshot = take_snapshot(&provider);
+        let mut bad = drag_args(&snapshot, true);
+        bad["fraction"] = json!({"fx":0.1,"fy":0.2});
+        bad["to_fraction"] = json!({"fx":0.9,"fy":0.8});
+        bad["path"] = json!([{"target":bad["target"],"locator":{"role":"AXButton","name":"Missing"},"fraction":{"fx":0.4,"fy":0.6}}]);
+        assert!(provider
+            .invoke("desktop.macos_ax.drag@1", bad, Some(Duration::from_secs(2)))
+            .is_err());
+        assert_eq!(backend.writes.load(Ordering::SeqCst), 1);
     }
 
     #[test]
