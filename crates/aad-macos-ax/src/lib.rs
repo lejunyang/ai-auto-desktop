@@ -566,20 +566,35 @@ impl MacOSAxProvider {
         Ok(json!({"target": target(&record, id), "node": node}))
     }
 
-    fn fresh_target(
+    fn observed_record(&self, args: &Map<String, Value>) -> Result<Record, AutomationError> {
+        let target = args
+            .get("target")
+            .and_then(Value::as_object)
+            .ok_or_else(|| invalid("target must be an object"))?;
+        only_keys(target, &["snapshot_id", "revision", "node_id"])?;
+        self.current(
+            target.get("snapshot_id").unwrap_or(&Value::Null),
+            target.get("revision").unwrap_or(&Value::Null),
+        )
+    }
+
+    fn revalidate_target(
         &self,
         args: &Map<String, Value>,
+        record: &Record,
+        fresh: &Record,
         deadline: Instant,
-    ) -> Result<(Record, String, Value, String), AutomationError> {
+    ) -> Result<(String, Value, String), AutomationError> {
         let target_value = args
             .get("target")
             .and_then(Value::as_object)
             .ok_or_else(|| invalid("target must be an object"))?;
         only_keys(target_value, &["snapshot_id", "revision", "node_id"])?;
-        let record = self.current(
-            target_value.get("snapshot_id").unwrap_or(&Value::Null),
-            target_value.get("revision").unwrap_or(&Value::Null),
-        )?;
+        if target_value.get("snapshot_id") != record.public.get("snapshot_id")
+            || target_value.get("revision") != record.public.get("revision")
+        {
+            return Err(stale("target does not belong to the observed snapshot"));
+        }
         if record.public["truncated"] == true {
             return Err(driver_error(
                 "DRIVER.SNAPSHOT_TRUNCATED",
@@ -592,25 +607,19 @@ impl MacOSAxProvider {
         )?
         .to_string();
         let locator = parse_locator(args.get("locator"))?;
-        let expected = resolve(&record, &locator, deadline)?;
+        let expected = resolve(record, &locator, deadline)?;
         if expected["node_id"] != id || !record.handles.contains_key(&id) {
             return Err(stale("target does not match the snapshot locator result"));
         }
         let fingerprint = record.fingerprints[&id].clone();
         let old_token = record.handles[&id].clone();
-        let fresh = self.capture(
-            &record.app_selector,
-            record.max_depth,
-            record.max_nodes,
-            deadline,
-        )?;
         if fresh.public["truncated"] == true {
             return Err(driver_error(
                 "DRIVER.SNAPSHOT_TRUNCATED",
                 "fresh action snapshot is truncated",
             ));
         }
-        let node = resolve(&fresh, &locator, deadline).map_err(|error| {
+        let node = resolve(fresh, &locator, deadline).map_err(|error| {
             if matches!(error.code.as_str(), "DRIVER.NOT_FOUND" | "DRIVER.AMBIGUOUS") {
                 stale("locator no longer resolves to its original target").with_cause(error)
             } else {
@@ -631,6 +640,23 @@ impl MacOSAxProvider {
                 "locator resolved to a different native or semantic target",
             ));
         }
+        Ok((fresh_id, node, token))
+    }
+
+    fn fresh_target(
+        &self,
+        args: &Map<String, Value>,
+        deadline: Instant,
+    ) -> Result<(Record, String, Value, String), AutomationError> {
+        let record = self.observed_record(args)?;
+        self.revalidate_target(args, &record, &record, deadline)?;
+        let fresh = self.capture(
+            &record.app_selector,
+            record.max_depth,
+            record.max_nodes,
+            deadline,
+        )?;
+        let (fresh_id, node, token) = self.revalidate_target(args, &record, &fresh, deadline)?;
         Ok((fresh, fresh_id, node, token))
     }
 
@@ -759,6 +785,14 @@ impl MacOSAxProvider {
         } else {
             ("left", "center")
         };
+        // A drag's endpoints must both be checked against one fresh tree. A
+        // second capture would spend the source observation and make the
+        // destination's original reference stale before it can be validated.
+        let drag_observation = if action == "drag" {
+            Some(self.observed_record(args)?)
+        } else {
+            None
+        };
         let (fresh, fresh_id, node, token) = self.fresh_target(args, deadline)?;
         if INPUT_ACTIONS.contains(&action) && node["states"]["protected"] == true {
             return Err(driver_error(
@@ -795,7 +829,8 @@ impl MacOSAxProvider {
                 format!("{action} requires positive-area bounds"),
             ));
         }
-        // The destination of a drag is re-verified exactly like the source.
+        // The destination uses the source's original and fresh observations,
+        // including both native identity and semantic fingerprint checks.
         let destination = if action == "drag" {
             let mut to_args = Map::new();
             to_args.insert(
@@ -806,10 +841,12 @@ impl MacOSAxProvider {
                 "locator".into(),
                 args.get("to_locator").cloned().unwrap_or(Value::Null),
             );
-            let (_, to_id, to_node, to_token) = self.fresh_target(&to_args, deadline)?;
-            if to_id == fresh_id {
-                return Err(invalid("drag needs a destination other than its source"));
-            }
+            let (_, to_node, to_token) = self.revalidate_target(
+                &to_args,
+                drag_observation.as_ref().expect("drag observation saved"),
+                &fresh,
+                deadline,
+            )?;
             if to_node["states"]["protected"] == true
                 || parse_bounds(to_node.get("bounds")).is_err()
             {
@@ -1758,6 +1795,8 @@ mod tests {
         changed: bool,
         duplicate: bool,
         truncated: bool,
+        drag_destination: bool,
+        drag_change: Option<&'static str>,
     }
 
     impl FakeBackend {
@@ -1797,6 +1836,7 @@ mod tests {
                     "invoke".into(),
                     "pointer_click".into(),
                     "pointer_gesture".into(),
+                    "drag".into(),
                     "key_chord".into(),
                 ],
                 provenance: Map::from_iter([
@@ -1835,10 +1875,32 @@ mod tests {
             if self.duplicate {
                 nodes.push(self.node("save2"));
             }
+            let fresh = self.captures.load(Ordering::SeqCst) > 1;
+            if self.drag_destination {
+                let mut destination = self.node("drop");
+                destination.name = Some("Drop".into());
+                destination
+                    .provenance
+                    .insert("identifier".into(), json!("drop"));
+                if fresh {
+                    match self.drag_change {
+                        Some("native") => destination.native_token = "replacement".into(),
+                        Some("semantic") => destination.name = Some("Changed".into()),
+                        Some("protected") => {
+                            destination.states.insert("protected".into(), Some(true));
+                        }
+                        _ => {}
+                    }
+                }
+                nodes.push(destination);
+            }
+            if fresh && self.drag_change == Some("reordered") {
+                nodes.reverse();
+            }
             Ok(BackendSnapshot {
                 app: Self::app(),
                 nodes,
-                truncated: self.truncated,
+                truncated: self.truncated || (fresh && self.drag_change == Some("truncated")),
             })
         }
         fn same_element(
@@ -1904,6 +1966,16 @@ mod tests {
         ) -> Result<Value, AutomationError> {
             self.writes.fetch_add(1, Ordering::SeqCst);
             Ok(json!({"native_operation": "CGEventKeyChord", "submitted": true, "sent": keys}))
+        }
+        fn drag(
+            &self,
+            token: &str,
+            to_token: &str,
+            request: &Value,
+            _deadline: Instant,
+        ) -> Result<Value, AutomationError> {
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            Ok(json!({"submitted": true, "from": token, "to": to_token, "sent": request}))
         }
         fn start_recording(
             &self,
@@ -2296,6 +2368,114 @@ mod tests {
         let provider = MacOSAxProvider::new(backend.clone()).unwrap();
         let snapshot = take_snapshot(&provider);
         let error = provider.invoke("desktop.macos_ax.invoke@1", json!({"target": {"snapshot_id": snapshot["snapshot_id"], "revision": snapshot["revision"], "node_id": "n0"}, "locator": locator()}), Some(Duration::from_secs(2))).unwrap_err();
+        assert_eq!(error.code, "DRIVER.STALE_SNAPSHOT");
+        assert_eq!(backend.writes.load(Ordering::SeqCst), 0);
+    }
+
+    fn drag_args(snapshot: &Value, same_node: bool) -> Value {
+        json!({
+            "target": {"snapshot_id": snapshot["snapshot_id"], "revision": snapshot["revision"], "node_id": "n0"},
+            "locator": locator(),
+            "to": {"snapshot_id": snapshot["snapshot_id"], "revision": snapshot["revision"], "node_id": if same_node { "n0" } else { "n1" }},
+            "to_locator": if same_node { locator() } else { json!({"role": "AXButton", "name": "Drop", "identifier": "drop"}) },
+            "fraction": {"fx": 0.2, "fy": 0.3},
+            "to_fraction": {"fx": 0.8, "fy": 0.7},
+        })
+    }
+
+    #[test]
+    fn drag_revalidates_both_endpoints_in_one_fresh_snapshot() {
+        for change in [None, Some("reordered")] {
+            let backend = Arc::new(FakeBackend {
+                drag_destination: true,
+                drag_change: change,
+                ..Default::default()
+            });
+            let provider = MacOSAxProvider::new(backend.clone()).unwrap();
+            let snapshot = take_snapshot(&provider);
+            let result = provider
+                .invoke(
+                    "desktop.macos_ax.drag@1",
+                    drag_args(&snapshot, false),
+                    Some(Duration::from_secs(2)),
+                )
+                .unwrap();
+            assert_eq!(result["backend_result"]["from"], "save");
+            assert_eq!(result["backend_result"]["to"], "drop");
+            assert_eq!(backend.captures.load(Ordering::SeqCst), 2);
+            assert_eq!(backend.writes.load(Ordering::SeqCst), 1);
+            assert_eq!(result["resolved"]["revision"], 2);
+        }
+    }
+
+    #[test]
+    fn drag_can_move_between_fractions_of_one_observed_element() {
+        let backend = Arc::new(FakeBackend::default());
+        let provider = MacOSAxProvider::new(backend.clone()).unwrap();
+        let snapshot = take_snapshot(&provider);
+        let result = provider
+            .invoke(
+                "desktop.macos_ax.drag@1",
+                drag_args(&snapshot, true),
+                Some(Duration::from_secs(2)),
+            )
+            .unwrap();
+        assert_eq!(result["backend_result"]["from"], "save");
+        assert_eq!(result["backend_result"]["to"], "save");
+        assert_eq!(
+            result["backend_result"]["sent"],
+            json!({
+                "button": "left", "fx": 0.2, "fy": 0.3, "to_fx": 0.8, "to_fy": 0.7,
+            })
+        );
+        assert_eq!(backend.captures.load(Ordering::SeqCst), 2);
+        assert_eq!(backend.writes.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn drag_rejects_changed_or_protected_destination_before_dispatch() {
+        for (change, code) in [
+            ("native", "DRIVER.STALE_SNAPSHOT"),
+            ("semantic", "DRIVER.STALE_SNAPSHOT"),
+            ("protected", "DRIVER.ACTION_UNSUPPORTED"),
+            ("truncated", "DRIVER.SNAPSHOT_TRUNCATED"),
+        ] {
+            let backend = Arc::new(FakeBackend {
+                drag_destination: true,
+                drag_change: Some(change),
+                ..Default::default()
+            });
+            let provider = MacOSAxProvider::new(backend.clone()).unwrap();
+            let snapshot = take_snapshot(&provider);
+            let error = provider
+                .invoke(
+                    "desktop.macos_ax.drag@1",
+                    drag_args(&snapshot, false),
+                    Some(Duration::from_secs(2)),
+                )
+                .unwrap_err();
+            assert_eq!(error.code, code, "{change}");
+            assert_eq!(backend.writes.load(Ordering::SeqCst), 0, "{change}");
+        }
+    }
+
+    #[test]
+    fn drag_rejects_destination_from_another_observation() {
+        let backend = Arc::new(FakeBackend {
+            drag_destination: true,
+            ..Default::default()
+        });
+        let provider = MacOSAxProvider::new(backend.clone()).unwrap();
+        let snapshot = take_snapshot(&provider);
+        let mut args = drag_args(&snapshot, false);
+        args["to"]["snapshot_id"] = json!("different-observation");
+        let error = provider
+            .invoke(
+                "desktop.macos_ax.drag@1",
+                args,
+                Some(Duration::from_secs(2)),
+            )
+            .unwrap_err();
         assert_eq!(error.code, "DRIVER.STALE_SNAPSHOT");
         assert_eq!(backend.writes.load(Ordering::SeqCst), 0);
     }
