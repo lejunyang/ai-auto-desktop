@@ -4,11 +4,11 @@ use aad_control::{
     native::{Flavor, NativeBackend},
     *,
 };
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use std::{
     sync::{
-        atomic::{AtomicUsize, Ordering},
         Arc,
+        atomic::{AtomicUsize, Ordering},
     },
     time::Instant,
 };
@@ -82,6 +82,7 @@ impl AtspiBackend for Tree {
             application: Self::app(),
             nodes,
             truncated: false,
+            truncation_reasons: vec![],
         })
     }
     fn focus(&self, _: &NativeRef, _: Instant) -> Result<Value> {

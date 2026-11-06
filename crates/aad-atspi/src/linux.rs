@@ -1,6 +1,6 @@
 use super::{
-    driver_error, remaining, AtspiBackend, AutomationError, BackendNode, BackendSnapshot, Bounds,
-    Gesture, Map, NativeRef, Value, MAX_FIELD_CHARS, MAX_NODES,
+    AtspiBackend, AutomationError, BackendNode, BackendSnapshot, Bounds, Gesture, MAX_FIELD_CHARS,
+    MAX_NODES, Map, NativeRef, Value, driver_error, remaining,
 };
 use atspi::proxy::accessible::AccessibleProxy;
 use atspi::proxy::action::ActionProxy;
@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use zbus::blocking::{connection, Connection, Proxy};
+use zbus::blocking::{Connection, Proxy, connection};
 
 const REGISTRY_NAME: &str = "org.a11y.atspi.Registry";
 const REGISTRY_PATH: &str = "/org/a11y/atspi/accessible/root";
@@ -29,6 +29,40 @@ const XTEST_OUTPUT_LIMIT: usize = 64 * 1024;
 const CAPTURE_OUTPUT_LIMIT: usize = 64 * 1024 * 1024;
 const CAPTURE_METADATA_LIMIT: usize = 64 * 1024;
 type ApplicationEntry = (NativeRef, Map<String, Value>);
+
+/// AT-SPI toolkits may include a null object in GetChildren (for example a
+/// separator in a Qt menu). It is an absent child, not an inaccessible subtree.
+/// Keep the wire count for comparison with ChildCount before removing nulls.
+struct ChildReferences {
+    items: Vec<NativeRef>,
+    returned_count: usize,
+}
+
+impl ChildReferences {
+    fn new(references: Vec<NativeRef>) -> Self {
+        let returned_count = references.len();
+        let items = references
+            .into_iter()
+            .filter(|reference| {
+                !matches!(
+                    reference.object_path.as_str(),
+                    "/org/a11y/atspi/null" | "/org/a11y/atspi/accessible/null"
+                )
+            })
+            .collect();
+        Self {
+            items,
+            returned_count,
+        }
+    }
+}
+
+fn capture_issue(reasons: &mut Vec<Value>, issue: Value) {
+    // A broken application must not turn diagnostics into an unbounded output.
+    if reasons.len() < 32 {
+        reasons.push(issue);
+    }
+}
 
 fn check_fcitx_text_input(session: &Connection) -> Result<(), AutomationError> {
     let query_error = |error: zbus::Error| {
@@ -143,6 +177,14 @@ impl LinuxBackend {
         target: &NativeRef,
         deadline: Instant,
     ) -> Result<Vec<NativeRef>, AutomationError> {
+        Ok(self.child_references(target, deadline)?.items)
+    }
+
+    fn child_references(
+        &self,
+        target: &NativeRef,
+        deadline: Instant,
+    ) -> Result<ChildReferences, AutomationError> {
         remaining(deadline, false)?;
         let children = zbus::block_on(self.accessible(target)?.get_children())
             .map_err(|error| native_failure("Accessible.GetChildren", target, error))?;
@@ -153,7 +195,9 @@ impl LinuxBackend {
                 "Accessible.GetChildren exceeded the hard fan-out limit",
             ));
         }
-        Ok(children.into_iter().map(Self::native).collect())
+        Ok(ChildReferences::new(
+            children.into_iter().map(Self::native).collect(),
+        ))
     }
 
     fn process_id(&self, bus_name: &str) -> Option<u32> {
@@ -648,25 +692,46 @@ impl AtspiBackend for LinuxBackend {
         let mut queue = VecDeque::from([(root, None, 0u32)]);
         let mut nodes = Vec::new();
         let mut truncated = false;
+        let mut truncation_reasons = Vec::new();
         while let Some((target, parent, depth)) = queue.pop_front() {
             remaining(deadline, false)?;
             if nodes.len() >= max_nodes {
                 truncated = true;
+                capture_issue(
+                    &mut truncation_reasons,
+                    json!({"code": "max_nodes", "limit": max_nodes}),
+                );
                 break;
             }
             let (node, child_count) = self.read_node(target.clone(), parent, &info, deadline)?;
             let current = nodes.len();
             nodes.push(node);
-            if depth >= max_depth {
-                truncated |= child_count > 0;
-                continue;
-            }
-            match self.children(&target, deadline) {
+            match self.child_references(&target, deadline) {
                 Ok(children) => {
-                    truncated |= children.len() != child_count;
-                    for child in children {
+                    if children.returned_count != child_count {
+                        truncated = true;
+                        capture_issue(
+                            &mut truncation_reasons,
+                            json!({"code": "child_count_changed", "node_id": format!("n{current}"), "reported_children": child_count, "returned_children": children.returned_count}),
+                        );
+                    }
+                    if depth >= max_depth {
+                        if !children.items.is_empty() {
+                            truncated = true;
+                            capture_issue(
+                                &mut truncation_reasons,
+                                json!({"code": "max_depth", "node_id": format!("n{current}"), "limit": max_depth}),
+                            );
+                        }
+                        continue;
+                    }
+                    for child in children.items {
                         if nodes.len() + queue.len() >= max_nodes {
                             truncated = true;
+                            capture_issue(
+                                &mut truncation_reasons,
+                                json!({"code": "max_nodes", "node_id": format!("n{current}"), "limit": max_nodes}),
+                            );
                             break;
                         }
                         queue.push_back((child, Some(current), depth + 1));
@@ -676,9 +741,15 @@ impl AtspiBackend for LinuxBackend {
                     if error.code == "DRIVER.TIMEOUT"
                         || error.code == "DRIVER.OUTPUT_TOO_LARGE" =>
                 {
-                    return Err(error)
+                    return Err(error);
                 }
-                Err(_) => truncated = true,
+                Err(error) => {
+                    truncated = true;
+                    capture_issue(
+                        &mut truncation_reasons,
+                        json!({"code": "children_unavailable", "node_id": format!("n{current}"), "error_code": error.code}),
+                    );
+                }
             }
         }
         let process_id = info
@@ -691,6 +762,7 @@ impl AtspiBackend for LinuxBackend {
             application: info,
             nodes,
             truncated,
+            truncation_reasons,
         })
     }
 
@@ -2201,6 +2273,49 @@ impl LinuxBackend {
         let _ = recorder.input.kill();
         let _ = recorder.input.wait();
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod capture_tests {
+    use super::*;
+
+    #[test]
+    fn null_children_do_not_become_unavailable_nodes_or_count_mismatches() {
+        let native = |path: &str| NativeRef {
+            bus_name: ":1.42".into(),
+            object_path: path.into(),
+        };
+        let children = ChildReferences::new(vec![
+            native("/org/a11y/atspi/null"),
+            native("/org/a11y/atspi/accessible/null"),
+            native("/org/a11y/atspi/accessible/42"),
+            native("/org/a11y/atspi/accessible/nullish"),
+        ]);
+        assert_eq!(children.returned_count, 4);
+        assert_eq!(children.items.len(), 2);
+        assert_eq!(
+            children.items[0].object_path,
+            "/org/a11y/atspi/accessible/42"
+        );
+        assert_eq!(
+            children.items[1].object_path,
+            "/org/a11y/atspi/accessible/nullish"
+        );
+    }
+
+    #[test]
+    fn truncation_diagnostics_are_bounded() {
+        let mut reasons = Vec::new();
+        for i in 0..40 {
+            capture_issue(
+                &mut reasons,
+                json!({"code": "children_unavailable", "node_id": format!("n{i}"), "error_code": "DRIVER.UNAVAILABLE"}),
+            );
+        }
+        assert_eq!(reasons.len(), 32);
+        assert_eq!(reasons[0]["node_id"], "n0");
+        assert_eq!(reasons[31]["node_id"], "n31");
     }
 }
 

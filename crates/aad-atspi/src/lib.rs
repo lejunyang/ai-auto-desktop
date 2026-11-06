@@ -5,9 +5,9 @@
 //! accessibility D-Bus with pure-Rust `zbus`; no Python worker is involved.
 
 use aad_core::AutomationError;
-use aad_plugin::{manifest, CapabilityManifest};
+use aad_plugin::{CapabilityManifest, manifest};
 use aad_runtime::{ArtifactStore, Provider};
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -96,6 +96,8 @@ pub struct BackendSnapshot {
     pub application: Map<String, Value>,
     pub nodes: Vec<BackendNode>,
     pub truncated: bool,
+    /// Bounded, content-free explanations for an incomplete capture.
+    pub truncation_reasons: Vec<Value>,
 }
 
 /// A pointer gesture, already validated, in X11's own button numbering.
@@ -603,6 +605,7 @@ impl AtspiProvider {
             "application": raw.application,
             "nodes": nodes,
             "truncated": raw.truncated,
+            "truncation_reasons": raw.truncation_reasons,
         });
         let record = Record {
             public,
@@ -926,7 +929,7 @@ impl AtspiProvider {
                         Some("middle") => 2,
                         Some("right") => 3,
                         Some(_) => {
-                            return Err(invalid("drag.button must be left, middle or right"))
+                            return Err(invalid("drag.button must be left, middle or right"));
                         }
                     };
                     self.backend.drag(
@@ -1659,10 +1662,11 @@ fn resolve(
                 .with_detail("candidate_count", json!(many.len()))
                 .with_detail(
                     "candidates",
-                    json!(many
-                        .iter()
-                        .take(MAX_CANDIDATE_SUMMARIES)
-                        .collect::<Vec<_>>()),
+                    json!(
+                        many.iter()
+                            .take(MAX_CANDIDATE_SUMMARIES)
+                            .collect::<Vec<_>>()
+                    ),
                 ),
         ),
     }
@@ -2119,7 +2123,7 @@ fn manifest_document() -> Value {
         "desktop": {"pointer": "/desktop", "schema": {"type": ["string", "null"], "maxLength": 256}}
     }});
     actions.insert("list_applications".into(), contract("通过 AT-SPI desktop 根节点枚举当前会话的桌面应用。", "read_only", "observe", "low", &["desktop.observe"], json!({"type": "object", "additionalProperties": false}), json!({"type": "object", "required": ["session", "backend", "applications"], "properties": {"session": {"type": "object"}, "backend": {"type": "string"}, "applications": {"type": "array", "items": {"type": "object"}}}, "additionalProperties": false}), false, false));
-    let snapshot_output = json!({"type": "object", "required": ["snapshot_id", "revision", "session", "backend", "application", "nodes", "truncated"], "properties": {"snapshot_id": {"type": "string"}, "revision": {"type": "integer", "minimum": 1}, "session": {"type": "object"}, "backend": {"type": "string"}, "application": {"type": "object"}, "nodes": {"type": "array", "items": {"type": "object"}}, "truncated": {"type": "boolean"}}, "additionalProperties": false});
+    let snapshot_output = json!({"type": "object", "required": ["snapshot_id", "revision", "session", "backend", "application", "nodes", "truncated", "truncation_reasons"], "properties": {"snapshot_id": {"type": "string"}, "revision": {"type": "integer", "minimum": 1}, "session": {"type": "object"}, "backend": {"type": "string"}, "application": {"type": "object"}, "nodes": {"type": "array", "items": {"type": "object"}}, "truncated": {"type": "boolean"}, "truncation_reasons": {"type": "array", "items": {"type": "object"}, "maxItems": 32}}, "additionalProperties": false});
     actions.insert("snapshot".into(), contract("抓取一个精确应用选择器对应的有界 AT-SPI 可访问性树。", "read_only", "observe", "low", &["desktop.observe"], json!({"type": "object", "required": ["application"], "properties": {"application": application_schema(), "max_depth": {"type": "integer", "minimum": 0, "maximum": MAX_DEPTH}, "max_nodes": {"type": "integer", "minimum": 1, "maximum": MAX_NODES}}, "additionalProperties": false}), snapshot_output, false, false));
     actions["snapshot"]["errors"].as_array_mut().unwrap().extend([
         json!({"code": "DRIVER.NOT_FOUND", "description": "定位器没有匹配节点。", "retryable": false, "effect": "not_applied", "data_schema": {"type": "object"}}),
@@ -2215,17 +2219,36 @@ fn manifest_document() -> Value {
     actions.insert("drag".into(), contract("分别重新验证起点与终点后，通过固定路径 XTest helper 按下、分步移动并在终点释放。", "non_idempotent", "modify", "high", &["desktop.observe", "desktop.input"], point_input(json!({"to": target_schema(), "to_locator": locator_schema(), "button": button, "fraction": fraction, "to_fraction": fraction}), &["to", "to_locator"]), write_output(), true, true));
     actions.insert("key_chord".into(), contract("重新验证并聚焦目标后，通过固定路径 XTest helper 按下修饰键加一个主键的组合。", "non_idempotent", "input", "high", &["desktop.observe", "desktop.input"], point_input(json!({"keys": {"type": "array", "minItems": 1, "maxItems": 6, "items": {"type": "string", "minLength": 1, "maxLength": 32}}}), &["keys"]), write_output(), true, true));
     for (name, description) in [
-        ("minimize", "重新验证顶层窗口 frame 后，经 X11 helper 向窗口管理器发 ICCCM WM_CHANGE_STATE（XIconifyWindow），等待（有上限）_NET_WM_STATE_HIDDEN / IconicState 真的出现。"),
-        ("maximize", "重新验证顶层窗口 frame 后，经 EWMH _NET_WM_STATE 请求最大化，等待两个 MAXIMIZED 状态出现。"),
-        ("restore", "最小化时经 _NET_ACTIVE_WINDOW 还原、最大化时移除 MAXIMIZED 状态，等待状态真的改变。"),
-        ("close_window", "经 EWMH _NET_CLOSE_WINDOW 请求窗口管理器关闭窗口（应用可能先询问），等待窗口消失。"),
-        ("activate", "经 EWMH _NET_ACTIVE_WINDOW 请求激活窗口，等待 _NET_ACTIVE_WINDOW 指向它。"),
+        (
+            "minimize",
+            "重新验证顶层窗口 frame 后，经 X11 helper 向窗口管理器发 ICCCM WM_CHANGE_STATE（XIconifyWindow），等待（有上限）_NET_WM_STATE_HIDDEN / IconicState 真的出现。",
+        ),
+        (
+            "maximize",
+            "重新验证顶层窗口 frame 后，经 EWMH _NET_WM_STATE 请求最大化，等待两个 MAXIMIZED 状态出现。",
+        ),
+        (
+            "restore",
+            "最小化时经 _NET_ACTIVE_WINDOW 还原、最大化时移除 MAXIMIZED 状态，等待状态真的改变。",
+        ),
+        (
+            "close_window",
+            "经 EWMH _NET_CLOSE_WINDOW 请求窗口管理器关闭窗口（应用可能先询问），等待窗口消失。",
+        ),
+        (
+            "activate",
+            "经 EWMH _NET_ACTIVE_WINDOW 请求激活窗口，等待 _NET_ACTIVE_WINDOW 指向它。",
+        ),
     ] {
         actions.insert(
             name.into(),
             contract(
                 description,
-                if name == "close_window" { "non_idempotent" } else { "idempotent" },
+                if name == "close_window" {
+                    "non_idempotent"
+                } else {
+                    "idempotent"
+                },
                 "modify",
                 "high",
                 &["desktop.observe", "desktop.input"],
@@ -2288,12 +2311,32 @@ fn manifest_document() -> Value {
         "root_size": {"type": "object", "required": ["width", "height"], "properties": {"width": {"type": "integer", "minimum": 1}, "height": {"type": "integer", "minimum": 1}}, "additionalProperties": false},
         "cursor_included": {"const": false}, "occlusion_checked": {"const": true}, "same_euid_verified": {"const": true}, "scene_stable": {"const": true}
     }, "additionalProperties": false});
-    let mut capture = contract("重新验证精确 AT-SPI 目标后，经固定 X11 helper 截取其 fresh screen bounds；仅输出 host 托管 PNG artifact 与可审计 provenance。", "read_only", "observe", "medium", &["desktop.observe", "desktop.capture"], json!({"type": "object", "required": ["target", "locator", "format"], "properties": {"target": target_schema(), "locator": locator_schema(), "format": {"const": "png"}}, "additionalProperties": false}), json!({"type": "object", "required": ["frame", "provenance"], "properties": {"frame": {"type": "object"}, "provenance": capture_provenance}, "additionalProperties": false}), false, true);
+    let mut capture = contract(
+        "重新验证精确 AT-SPI 目标后，经固定 X11 helper 截取其 fresh screen bounds；仅输出 host 托管 PNG artifact 与可审计 provenance。",
+        "read_only",
+        "observe",
+        "medium",
+        &["desktop.observe", "desktop.capture"],
+        json!({"type": "object", "required": ["target", "locator", "format"], "properties": {"target": target_schema(), "locator": locator_schema(), "format": {"const": "png"}}, "additionalProperties": false}),
+        json!({"type": "object", "required": ["frame", "provenance"], "properties": {"frame": {"type": "object"}, "provenance": capture_provenance}, "additionalProperties": false}),
+        false,
+        true,
+    );
     capture["artifacts"] = json!({"outputs": {"frame": {"pointer": "/frame", "media_types": ["image/png"], "max_size_bytes": 64 * 1024 * 1024}}});
     capture["errors"] = json!(error_contracts(false, true, true));
     capture["sensitivity"] = json!({"input": "public", "output": "sensitive", "error": "public"});
     actions.insert("capture_target".into(), capture);
-    let mut inline = contract("与 capture_target 相同的重新验证、保护与遮挡检查后，按 fresh screen bounds 截图，直接返回 base64 PNG（供控制会话 capture）。", "read_only", "observe", "medium", &["desktop.observe", "desktop.capture"], json!({"type": "object", "required": ["target", "locator"], "properties": {"target": target_schema(), "locator": locator_schema()}, "additionalProperties": false}), json!({"type": "object", "required": ["format", "data", "width", "height", "clipped", "node_id", "provenance"], "properties": {"format": {"const": "png"}, "data": {"type": "string"}, "width": {"type": "integer", "minimum": 1}, "height": {"type": "integer", "minimum": 1}, "clipped": {"type": "boolean"}, "node_id": {"type": "string"}, "provenance": {"type": "object"}}, "additionalProperties": false}), false, true);
+    let mut inline = contract(
+        "与 capture_target 相同的重新验证、保护与遮挡检查后，按 fresh screen bounds 截图，直接返回 base64 PNG（供控制会话 capture）。",
+        "read_only",
+        "observe",
+        "medium",
+        &["desktop.observe", "desktop.capture"],
+        json!({"type": "object", "required": ["target", "locator"], "properties": {"target": target_schema(), "locator": locator_schema()}, "additionalProperties": false}),
+        json!({"type": "object", "required": ["format", "data", "width", "height", "clipped", "node_id", "provenance"], "properties": {"format": {"const": "png"}, "data": {"type": "string"}, "width": {"type": "integer", "minimum": 1}, "height": {"type": "integer", "minimum": 1}, "clipped": {"type": "boolean"}, "node_id": {"type": "string"}, "provenance": {"type": "object"}}, "additionalProperties": false}),
+        false,
+        true,
+    );
     inline["errors"] = json!(error_contracts(false, true, true));
     inline["sensitivity"] = json!({"input": "public", "output": "sensitive", "error": "public"});
     actions.insert("capture".into(), inline);
@@ -2446,6 +2489,11 @@ mod tests {
                 application: Self::application(),
                 nodes,
                 truncated: self.truncated,
+                truncation_reasons: if self.truncated {
+                    vec![json!({"code": "max_nodes", "limit": 1000})]
+                } else {
+                    vec![]
+                },
             })
         }
         fn focus(&self, _target: &NativeRef, _deadline: Instant) -> Result<Value, AutomationError> {
@@ -2627,7 +2675,7 @@ mod tests {
                     return Err(driver_error(
                         "DRIVER.ACTION_UNSUPPORTED",
                         "this fixture has no parent here",
-                    ))
+                    ));
                 }
             };
             Ok(Some(NativeRef {
@@ -2723,6 +2771,7 @@ mod tests {
         let snapshot = take_snapshot(&provider);
         assert_eq!(snapshot["backend"], "fake_atspi");
         assert_eq!(snapshot["nodes"][0]["role"], "push_button");
+        assert_eq!(snapshot["truncation_reasons"], json!([]));
         let found = provider.invoke("desktop.linux_atspi.find@1", json!({"snapshot_id": snapshot["snapshot_id"], "revision": snapshot["revision"], "locator": locator()}), Some(Duration::from_secs(2))).unwrap();
         assert_eq!(found["target"]["node_id"], "n0");
         assert_eq!(found["node"]["name"], "Save");
@@ -2795,6 +2844,10 @@ mod tests {
         }))
         .unwrap();
         let snapshot = take_snapshot(&provider);
+        assert_eq!(
+            snapshot["truncation_reasons"],
+            json!([{"code": "max_nodes", "limit": 1000}])
+        );
         let error = provider.invoke("desktop.linux_atspi.find@1", json!({"snapshot_id": snapshot["snapshot_id"], "revision": snapshot["revision"], "locator": locator()}), Some(Duration::from_secs(2))).unwrap_err();
         assert_eq!(error.code, "DRIVER.SNAPSHOT_TRUNCATED");
     }
@@ -3094,9 +3147,11 @@ mod tests {
             (shot["width"].clone(), shot["height"].clone()),
             (json!(1), json!(1))
         );
-        assert!(shot["data"]
-            .as_str()
-            .is_some_and(|data| data.starts_with("iVBOR")));
+        assert!(
+            shot["data"]
+                .as_str()
+                .is_some_and(|data| data.starts_with("iVBOR"))
+        );
         assert_eq!(shot["provenance"]["node_id"], "n0");
         // The read did not replace the caller's snapshot.
         provider
@@ -3106,12 +3161,14 @@ mod tests {
                 Some(Duration::from_secs(2)),
             )
             .unwrap();
-        assert!(provider
-            .invoke(
-                "desktop.linux_atspi.capture@1",
-                json!({"target": target, "locator": locator(), "format": "png"}),
-                Some(Duration::from_secs(2)),
-            )
-            .is_err());
+        assert!(
+            provider
+                .invoke(
+                    "desktop.linux_atspi.capture@1",
+                    json!({"target": target, "locator": locator(), "format": "png"}),
+                    Some(Duration::from_secs(2)),
+                )
+                .is_err()
+        );
     }
 }
