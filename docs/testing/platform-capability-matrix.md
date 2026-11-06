@@ -14,7 +14,7 @@
 | macOS | AX 与 Swift helper 有实现；同一 fresh snapshot 复核拖拽两端；Rust macOS cfg check 及宿主逻辑测试通过 | **[待真机验收]** macOS SDK/Swift helper 构建、辅助功能与屏幕录制权限、原生/Chromium 应用、拖拽和输入效果、Secure Input 条件；Rust cfg 检查不代表 Swift 已编译 |
 | GNOME/X11、XFCE/X11 | `bea9187` 已移除桌面品牌限制，保留真实会话和窗口身份检查；私有 Xvfb 四种标签真实点击/截图与拒绝路径、本机 KDE 新 helper 验收通过 | **[待真机验收]** GNOME/XFCE 窗口管理器、GTK 控件、剪贴板管理器、焦点与窗口动作；Xvfb 下更换环境标签只验证门禁和协议兼容性 |
 | 本机 Qt/X11 应用缩放 | `597656c` 按准确窗口身份校准逻辑/物理坐标；单显示器 Qt 1/1.5/2 倍应用缩放下的实际点击、F2 与局部 PNG；歧义和 scope 拒绝；8 项标题编码检查；Dolphin 中文目录重命名与 KWrite 中文文件保存经磁盘回读通过 | **[待真机验收]** 混合 DPI 多屏、旋转与热插拔；非 Qt 缩放不在此次校准范围；不证明 Wayland 支持 |
-| KDE/GNOME Wayland | 仅环境探测与 AT-SPI 语义层；XTest/根窗口截图没有 Wayland 实现 | **[待实现、待真机验收]** 获授权的 portal 输入/屏幕流、流坐标与观察元素映射、焦点和命中证明；不能把 XWayland 的 DISPLAY 当作完整 Wayland 支持 |
+| KDE/GNOME Wayland | `e1e2d47` 的库层 portal 授权/撤销/取消/FD 生命周期，`117c599` 的独立会话及当前 EI region 绑定，均通过私有真实 D-Bus 协议测试；无 CLI/MCP 或输入入口 | **[待实现、待真机验收]** PipeWire/libei 消费与输入、compositor 窗口身份/焦点/命中证明、真实授权 UI。不能把 XWayland 的 DISPLAY 当作完整 Wayland 支持；详见 [授权输入路线](../plan/wayland-authorized-input.md) |
 
 ## 可以复现的本机检查
 
