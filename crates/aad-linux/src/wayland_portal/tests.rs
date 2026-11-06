@@ -399,6 +399,49 @@ fn private_portal_transport() {
         .unwrap()
         .unwrap();
 
+    // Two real authorizations with identical stream metadata remain distinct.
+    let (service, _) = server(Scenario::Happy);
+    let cancel = AtomicBool::new(false);
+    let mut first = authorize(
+        PortalClient::connect(deadline(), &cancel).unwrap(),
+        deadline(),
+        &cancel,
+    )
+    .unwrap();
+    let generation = first.generation().unwrap();
+    let stream = first.streams().unwrap()[0].clone();
+    let region = EiRegion {
+        mapping_id: "monitor".into(),
+        logical_origin: (-100, 0),
+        logical_size: (100, 200),
+    };
+    let frame = FrameGeometry {
+        pixel_size: (200, 400),
+        pipewire_serial: 123,
+        untransformed: true,
+    };
+    let mapping =
+        StreamMapping::bind(generation, &stream, std::slice::from_ref(&region), frame).unwrap();
+    let mut second = authorize(
+        PortalClient::connect(deadline(), &cancel).unwrap(),
+        deadline(),
+        &cancel,
+    )
+    .unwrap();
+    assert_eq!(second.streams().unwrap()[0], stream);
+    assert!(mapping
+        .map_fraction(
+            second.generation().unwrap(),
+            &stream,
+            &region,
+            frame,
+            (0.5, 0.5)
+        )
+        .is_err());
+    first.close();
+    second.close();
+    wait(service.close(), deadline(), &cancel).unwrap().unwrap();
+
     // A compositor/portal restart invalidates the grant even without Closed.
     let (service, state) = server(Scenario::Happy);
     let cancel = AtomicBool::new(false);
@@ -439,19 +482,51 @@ fn mapping_rejects_stale_ambiguous_and_transformed_frames() {
         pipewire_serial: 123,
         untransformed: true,
     };
-    let mapping = StreamMapping::bind(1, &stream, std::slice::from_ref(&region), frame).unwrap();
+    let generation = SessionGeneration::new();
+    let mapping =
+        StreamMapping::bind(generation, &stream, std::slice::from_ref(&region), frame).unwrap();
     assert_eq!(
-        mapping.map_fraction(1, &stream, frame, (0.5, 0.5)).unwrap(),
+        mapping
+            .map_fraction(generation, &stream, &region, frame, (0.5, 0.5))
+            .unwrap(),
         (-50.0, 100.0)
     );
-    assert!(mapping.map_fraction(2, &stream, frame, (0.5, 0.5)).is_err());
+    let mut next_revision = generation;
+    next_revision.invalidate();
     assert!(mapping
-        .map_fraction(1, &stream, frame, (f64::NAN, 0.5))
+        .map_fraction(next_revision, &stream, &region, frame, (0.5, 0.5))
         .is_err());
-    assert!(mapping.map_fraction(1, &stream, frame, (1.0, 0.5)).is_err());
-    assert!(StreamMapping::bind(1, &stream, &[region.clone(), region.clone()], frame).is_err());
+    let moved_region = EiRegion {
+        logical_origin: (0, 0),
+        ..region.clone()
+    };
+    assert!(mapping
+        .map_fraction(generation, &stream, &moved_region, frame, (0.5, 0.5))
+        .is_err());
+    assert!(mapping
+        .map_fraction(
+            SessionGeneration::new(),
+            &stream,
+            &region,
+            frame,
+            (0.5, 0.5)
+        )
+        .is_err());
+    assert!(mapping
+        .map_fraction(generation, &stream, &region, frame, (f64::NAN, 0.5))
+        .is_err());
+    assert!(mapping
+        .map_fraction(generation, &stream, &region, frame, (1.0, 0.5))
+        .is_err());
     assert!(StreamMapping::bind(
-        1,
+        generation,
+        &stream,
+        &[region.clone(), region.clone()],
+        frame
+    )
+    .is_err());
+    assert!(StreamMapping::bind(
+        generation,
         &stream,
         std::slice::from_ref(&region),
         FrameGeometry {
@@ -461,7 +536,7 @@ fn mapping_rejects_stale_ambiguous_and_transformed_frames() {
     )
     .is_err());
     assert!(StreamMapping::bind(
-        1,
+        generation,
         &stream,
         &[region],
         FrameGeometry {

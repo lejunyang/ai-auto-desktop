@@ -17,14 +17,14 @@ pub struct FrameGeometry {
 /// Stream-to-region calibration only. It proves neither target-window identity
 /// nor focus and cannot authorize an input operation on its own.
 pub struct StreamMapping {
-    generation: u64,
+    generation: SessionGeneration,
     stream: AuthorizedStream,
     region: EiRegion,
     frame: FrameGeometry,
 }
 impl StreamMapping {
     pub fn bind(
-        generation: u64,
+        generation: SessionGeneration,
         stream: &AuthorizedStream,
         regions: &[EiRegion],
         frame: FrameGeometry,
@@ -40,7 +40,7 @@ impl StreamMapping {
         let [region] = matches.as_slice() else {
             return Err(PortalError::MappingUnproven);
         };
-        if generation == 0
+        if generation.revision == 0
             || stream.source_type != 1
             || !frame.untransformed
             || frame.pixel_size.0 == 0
@@ -63,13 +63,15 @@ impl StreamMapping {
     }
     pub fn map_fraction(
         &self,
-        generation: u64,
+        generation: SessionGeneration,
         stream: &AuthorizedStream,
+        region: &EiRegion,
         frame: FrameGeometry,
         fraction: (f64, f64),
     ) -> Result<(f64, f64)> {
         if generation != self.generation
             || stream != &self.stream
+            || region != &self.region
             || frame != self.frame
             || !fraction.0.is_finite()
             || !fraction.1.is_finite()

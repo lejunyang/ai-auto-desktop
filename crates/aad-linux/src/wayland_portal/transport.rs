@@ -377,7 +377,7 @@ impl PortalClient {
                     closed_events,
                     devices,
                     streams,
-                    generation: 1,
+                    generation: SessionGeneration::new(),
                     active: true,
                     eis: None,
                     pipewire: None,
@@ -412,7 +412,7 @@ pub struct AuthorizedSession {
     closed_events: MessageStream,
     devices: u32,
     streams: Vec<AuthorizedStream>,
-    generation: u64,
+    generation: SessionGeneration,
     active: bool,
     eis: Option<OwnedFd>,
     pipewire: Option<OwnedFd>,
@@ -433,7 +433,7 @@ impl AuthorizedSession {
     }
     fn invalidate(&mut self) {
         self.active = false;
-        self.generation = self.generation.saturating_add(1);
+        self.generation.invalidate();
         self.eis.take();
         self.pipewire.take();
     }
@@ -445,7 +445,7 @@ impl AuthorizedSession {
         self.refresh()?;
         Ok(self.devices)
     }
-    pub fn generation(&mut self) -> Result<u64> {
+    pub fn generation(&mut self) -> Result<SessionGeneration> {
         self.refresh()?;
         Ok(self.generation)
     }

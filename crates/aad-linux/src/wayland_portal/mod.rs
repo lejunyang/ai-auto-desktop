@@ -50,6 +50,25 @@ impl AuthorizationOptions {
     }
 }
 
+/// Opaque identity and revision of one authorization. Obtain it from the live
+/// session; matching stream metadata cannot transfer a mapping to another grant.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct SessionGeneration {
+    session_id: uuid::Uuid,
+    revision: u64,
+}
+impl SessionGeneration {
+    fn new() -> Self {
+        Self {
+            session_id: uuid::Uuid::new_v4(),
+            revision: 1,
+        }
+    }
+    fn invalidate(&mut self) {
+        self.revision = self.revision.saturating_add(1);
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AuthorizedStream {
     pub node_id: u32,
