@@ -62,6 +62,7 @@
 - `browser-closed-shadow-targeted.log`、`browser-closed-shadow-full.log`：closed host 默认 trusted click 后独立 PNG 像素回读、局部 drag/wheel、遮挡和 stale 拒绝通过；双密码字段 reveal 后移到 light DOM 仍脱敏并拒绝截图，移除后恢复。专项 2/2，完整 27/27，日志位于 `artifacts/capability-audit-2026-11-07/`。
 - `browser-access-targeted.log`：服务器授权目录内本地 HTML 实际点击、未授权文件与内部来源拒绝、外部导航后重新检查通过；授权 `chrome://version` 可观察，`chrome://settings` 展开真实搜索 UI 后输入并独立遍历 DOM 回读通过。专项 2/2；祖先 frame 门禁单测、会话 19/19、CLI 6/6 及 control/CLI/MCP all-targets clippy 通过。`browser-access-capture.log` 与 `chromium-settings-search.png` 补验公开截图内存在输入值；截图仍在加载，未宣称搜索结果完成。上述文件位于 `artifacts/capability-completion/`。
 - `electron-native/summary.json`：独立 profile 的 VS Code，414 节点截断观察缩小到 31 节点完整编辑框；点击被 `DRIVER.POINT_NOT_PROVEN` 拒绝，focus/key/paste 返回已派发但实际文本不符，未继续保存，不算编辑成功。初始树含 Welcome 模态界面，随后 X11 检查发现同 PID 另一活动原生对话框；需要先处理启动界面，并用同进程双窗口 fixture 独立验证键盘焦点边界。仅凭动作之后的活动窗口不能断定此前每次输入落点。
+- `electron-native-v2/summary.json`：严格窗口绑定后的复测，通过 Welcome 内已观察 Close 按钮的 focus→Enter 关闭活动窗口启动界面，再将编辑框缩小到 31 节点。Ctrl+A 与 paste 返回派发、剪贴板消费和恢复成功，但 AT-SPI 文本回读仍为原文加换行，未保存，仍不算编辑闭环通过。Welcome 的指针点击也仍被命中检查拒绝；需要独立核对 Electron 文本模型、焦点和选区。测试自有 profile 进程已关闭。
 - Windows 修饰键代码已用 pin 工具链实际 `x86_64-pc-windows-gnu` cfg 做 check/clippy；这只证明编译，不能当成 Windows SendInput 效果验收。**[待验证]** Windows 交互桌面、相应权限与 DPI/IME 测试环境。
 
 各功能的测试数字对应其提交时点；后续共享模型变化后仍需相应回归。未验证的平台与场景保持待办，不从 KDE/Chromium 的成功外推。
