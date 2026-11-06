@@ -1317,17 +1317,17 @@ impl AtspiProvider {
         })();
         match result {
             Ok(backend_result) => {
-                remaining(deadline, true)?;
                 if let Ok(mut state) = self.state.lock() {
                     if let Some(record) = state.current.as_mut() {
                         record.valid = false;
                     }
                 }
+                remaining(deadline, true)?;
                 Ok(
                     json!({"ok": true, "action": action, "resolved": target(&fresh, &fresh_id), "backend_result": backend_result}),
                 )
             }
-            Err(error) if error.code == "DRIVER.CANCELLED" && error.effect == "unknown" => {
+            Err(error) if error.effect == "unknown" => {
                 if let Ok(mut state) = self.state.lock() {
                     if let Some(record) = state.current.as_mut() {
                         record.valid = false;
@@ -2923,6 +2923,8 @@ mod tests {
         cancellation: Option<CancellationToken>,
         cancel_in_capture: bool,
         cancel_in_write: bool,
+        late_write_success: bool,
+        uncertain_write_failure: bool,
         subscription_lifetime: Arc<()>,
         changed: bool,
         duplicate: bool,
@@ -3152,12 +3154,21 @@ mod tests {
             self.writes.fetch_add(1, Ordering::SeqCst);
             Ok(json!({"accepted": true}))
         }
-        fn invoke(
-            &self,
-            _target: &NativeRef,
-            _deadline: Instant,
-        ) -> Result<Value, AutomationError> {
+        fn invoke(&self, _target: &NativeRef, deadline: Instant) -> Result<Value, AutomationError> {
             self.writes.fetch_add(1, Ordering::SeqCst);
+            if self.late_write_success {
+                std::thread::sleep(
+                    deadline.saturating_duration_since(Instant::now()) + Duration::from_millis(1),
+                );
+            }
+            if self.uncertain_write_failure {
+                return Err(driver_error(
+                    "DRIVER.INPUT_FAILED",
+                    "helper stopped with uncertain input state",
+                )
+                .with_effect("unknown")
+                .with_detail("dispatch_started", json!(false)));
+            }
             if self.cancel_in_write {
                 if let Some(token) = &self.cancellation {
                     token.cancel();
@@ -4048,6 +4059,53 @@ mod tests {
             .unwrap_err();
         assert_eq!(stale.code, "DRIVER.STALE_SNAPSHOT");
         assert_eq!(backend.writes.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn late_success_and_unknown_failure_invalidate_even_the_fresh_record() {
+        for late in [true, false] {
+            let backend = Arc::new(FakeBackend {
+                late_write_success: late,
+                uncertain_write_failure: !late,
+                ..Default::default()
+            });
+            let provider = AtspiProvider::new(backend.clone()).unwrap();
+            let initial = take_snapshot(&provider);
+            let args = json!({"target": {"snapshot_id": initial["snapshot_id"], "revision": initial["revision"], "node_id": "n0"}, "locator": locator()});
+            let error = provider
+                .invoke(
+                    "desktop.linux_atspi.invoke@1",
+                    args,
+                    Some(Duration::from_millis(50)),
+                )
+                .unwrap_err();
+            assert_eq!(
+                error.code,
+                if late {
+                    "DRIVER.TIMEOUT"
+                } else {
+                    "DRIVER.INPUT_FAILED"
+                }
+            );
+            assert_eq!(error.effect, "unknown");
+            if !late {
+                assert_eq!(error.details["dispatch_started"], false);
+            }
+            let fresh = provider.state.lock().unwrap().current.clone().unwrap();
+            assert!(!fresh.valid);
+            assert_ne!(fresh.public["revision"], initial["revision"]);
+            // Guessing the internally refreshed revision must not recover authority.
+            let guessed = json!({"target": {"snapshot_id": fresh.public["snapshot_id"], "revision": fresh.public["revision"], "node_id": "n0"}, "locator": locator()});
+            let stale = provider
+                .invoke(
+                    "desktop.linux_atspi.invoke@1",
+                    guessed,
+                    Some(Duration::from_secs(1)),
+                )
+                .unwrap_err();
+            assert_eq!(stale.code, "DRIVER.STALE_SNAPSHOT");
+            assert_eq!(backend.writes.load(Ordering::SeqCst), 1);
+        }
     }
 
     #[test]
