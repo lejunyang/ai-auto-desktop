@@ -218,6 +218,10 @@ impl SwiftHelperBackend {
                     || progress
                         .get("pointer_dispatch_started")
                         .and_then(Value::as_bool)
+                        == Some(true)
+                    || progress
+                        .get("native_dispatch_started")
+                        .and_then(Value::as_bool)
                         == Some(true);
                 focus_changed |=
                     progress.get("focus_changed").and_then(Value::as_bool) == Some(true);
@@ -248,6 +252,10 @@ impl SwiftHelperBackend {
                     == Some(true)
                     || details
                         .get("pointer_dispatch_started")
+                        .and_then(Value::as_bool)
+                        == Some(true)
+                    || details
+                        .get("native_dispatch_started")
                         .and_then(Value::as_bool)
                         == Some(true);
                 focus_changed |=
@@ -288,6 +296,11 @@ impl SwiftHelperBackend {
                         result
                             .get("pointer_dispatch_started")
                             .and_then(Value::as_bool)
+                    })
+                    .or_else(|| {
+                        result
+                            .get("native_dispatch_started")
+                            .and_then(Value::as_bool)
                     });
                 if declared != Some(dispatch_started) {
                     terminate_state(state, true);
@@ -313,6 +326,7 @@ impl SwiftHelperBackend {
         let track = matches!(
             operation,
             "type_text"
+                | "secret_input"
                 | "pointer_click"
                 | "pointer_gesture"
                 | "drag"
@@ -467,6 +481,18 @@ impl AxBackend for SwiftHelperBackend {
     ) -> Result<Value, AutomationError> {
         self.write(
             "type_text",
+            json!({"native_token": token, "text": text}),
+            deadline,
+        )
+    }
+    fn secret_input(
+        &self,
+        token: &str,
+        text: &str,
+        deadline: Instant,
+    ) -> Result<Value, AutomationError> {
+        self.write(
+            "secret_input",
             json!({"native_token": token, "text": text}),
             deadline,
         )
@@ -974,6 +1000,26 @@ done
             .unwrap_err();
         assert_eq!(error.code, "DRIVER.PROTECTED_ELEMENT");
         assert_eq!(error.effect, "not_applied");
+    }
+
+    #[test]
+    fn secret_native_write_progress_preserves_unknown_effect_on_channel_loss() {
+        let script = r#"#!/bin/sh
+IFS= read -r line
+id=$(printf '%s' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+printf '{"id":"%s","progress":{"native_dispatch_started":true}}\n' "$id"
+exit 0
+"#;
+        let fixture = Fixture::new(script);
+        let error = backend(&fixture)
+            .secret_input(
+                "n",
+                "synthetic-fixture",
+                Instant::now() + Duration::from_secs(2),
+            )
+            .unwrap_err();
+        assert_eq!(error.effect, "unknown");
+        assert!(!format!("{error:?}").contains("synthetic-fixture"));
     }
 
     /// A helper that answers every request with `result`, after a keyboard

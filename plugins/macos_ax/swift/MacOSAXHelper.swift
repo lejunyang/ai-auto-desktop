@@ -539,6 +539,8 @@ private final class AXService {
             )
         case "set_value":
             return try setValue(args: Arguments(values: args), deadlineMS: deadlineMS)
+        case "secret_input":
+            return try secretInput(args: Arguments(values: args), deadlineMS: deadlineMS, requestID: requestID)
         case "type_text":
             return try typeText(
                 args: Arguments(values: args), deadlineMS: deadlineMS,
@@ -749,6 +751,7 @@ private final class AXService {
         if focusSettable && enabled != false && !protected { actions.append("key_chord") }
         if actionNames.contains(kAXPressAction as String) && enabled != false { actions.append("invoke") }
         if valueSettable && !protected && enabled != false { actions.append("set_value") }
+        if valueSettable && protected && enabled != false { actions.append("secret_input") }
         if isKeyboardTextTarget(role: role) && focusSettable && !protected && enabled != false {
             actions.append("type_text")
         }
@@ -787,7 +790,7 @@ private final class AXService {
                 "enabled": enabled.map { $0 as Any } ?? NSNull(),
                 "focused": boolAttribute(element, kAXFocusedAttribute as CFString).map { $0 as Any } ?? NSNull(),
                 "focusable": focusSettable,
-                "editable": valueSettable && !protected,
+                "editable": valueSettable,
                 "protected": protected,
             ],
             bounds: normalizedBounds,
@@ -1926,6 +1929,39 @@ private final class AXService {
         )
         try requireSuccess(error, operation: "AXUIElementSetAttributeValue(AXValue)")
         return ["native_operation": "AXValue", "accepted": true]
+    }
+
+    private func secretInput(args: Arguments, deadlineMS: Double?, requestID: String) throws -> [String: Any] {
+        try args.only(["native_token", "text"])
+        try requireTrusted()
+        let text = try args.string("text")!
+        guard text.unicodeScalars.count <= maximumTypeTextScalars,
+              !text.unicodeScalars.contains(where: { $0.value == 0 || $0.value == 10 || $0.value == 13 }) else {
+            throw HelperFailure("DRIVER.INVALID_REQUEST", "protected input is outside the supported bounds")
+        }
+        let element = try tokens.resolve(try args.string("native_token")!)
+        try configureTimeout(element, deadlineMS: deadlineMS)
+        let role = stringAttribute(element, kAXRoleAttribute as CFString)
+        let subrole = stringAttribute(element, kAXSubroleAttribute as CFString)
+        guard role == "AXSecureTextField" || subrole == "AXSecureTextField",
+              boolAttribute(element, kAXEnabledAttribute as CFString) != false,
+              isSettable(element, kAXValueAttribute as CFString) else {
+            throw HelperFailure("DRIVER.ACTION_UNSUPPORTED", "target is not a writable protected AX field")
+        }
+        try checkDeadline(deadlineMS)
+        // AXValue replacement addresses the validated element directly. Never
+        // read AXValue or fall back to the clipboard or secure-event injection.
+        emit(["id": requestID, "progress": ["native_dispatch_started": true]])
+        let error = AXUIElementSetAttributeValue(
+            element, kAXValueAttribute as CFString, text as CFString
+        )
+        guard error == .success else {
+            throw HelperFailure(
+                "DRIVER.SECRET_INPUT_FAILED", "protected input replacement failed",
+                data: ["native_dispatch_started": true]
+            )
+        }
+        return ["native_operation": "AXValue", "submitted": true, "native_dispatch_started": true, "redacted": true]
     }
 
     private func typeText(

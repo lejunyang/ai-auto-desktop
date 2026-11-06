@@ -143,12 +143,43 @@ pub fn pressed_keys_after_prefix(inputs: &[INPUT], sent: usize) -> Vec<VIRTUAL_K
 
 pub fn release_pressed_prefix(inputs: &[INPUT], sent: usize) -> Vec<u16> {
     let mut released = Vec::new();
-    for key in pressed_keys_after_prefix(inputs, sent).into_iter().rev() {
-        let event = [virtual_key_event(key, true)];
+    for release in keyboard_recovery(inputs, sent) {
+        let key = unsafe { release.Anonymous.ki }.wVk;
+        let event = [release];
         let _ = unsafe { SendInput(&event, std::mem::size_of::<INPUT>() as i32) };
         released.push(key.0);
     }
     released
+}
+
+/// Preserve Unicode/scan-code identity and flags when releasing an interrupted
+/// keyboard batch. A Unicode key-up cannot be replaced by virtual key zero.
+fn keyboard_recovery(inputs: &[INPUT], sent: usize) -> Vec<INPUT> {
+    let mut held: Vec<INPUT> = Vec::new();
+    for input in inputs
+        .iter()
+        .take(sent)
+        .filter(|input| input.r#type == INPUT_KEYBOARD)
+    {
+        let key = unsafe { input.Anonymous.ki };
+        if let Some(index) = held.iter().position(|previous| {
+            let previous = unsafe { previous.Anonymous.ki };
+            previous.wVk == key.wVk
+                && previous.wScan == key.wScan
+                && (previous.dwFlags & !KEYEVENTF_KEYUP) == (key.dwFlags & !KEYEVENTF_KEYUP)
+        }) {
+            held.remove(index);
+        }
+        if !key.dwFlags.contains(KEYEVENTF_KEYUP) {
+            let mut release = *input;
+            unsafe {
+                release.Anonymous.ki.dwFlags |= KEYEVENTF_KEYUP;
+            }
+            held.push(release);
+        }
+    }
+    held.reverse();
+    held
 }
 
 /// A parsed key combination: the modifiers to hold and the main key to press.
@@ -557,11 +588,16 @@ fn deliver_pointer_using(
 /// up a partial batch without replaying any click or drag movement.
 pub fn deliver_pointer(inputs: &[INPUT], modifiers: &[String], what: &str) -> Result<()> {
     let combined = modified_pointer_inputs(inputs, modifiers)?;
-    ensure_pointer_modifiers_up(modifiers, |key| unsafe {
-        GetAsyncKeyState(i32::from(key.0)) as u16 & 0x8000 != 0
-    })?;
+    ensure_modifiers_released(modifiers)?;
     deliver_pointer_using(&combined, what, |events| unsafe {
         SendInput(events, std::mem::size_of::<INPUT>() as i32) as usize
+    })
+}
+
+/// Refuse to take ownership of a modifier that is already held.
+pub fn ensure_modifiers_released(modifiers: &[String]) -> Result<()> {
+    ensure_pointer_modifiers_up(modifiers, |key| unsafe {
+        GetAsyncKeyState(i32::from(key.0)) as u16 & 0x8000 != 0
     })
 }
 
@@ -983,6 +1019,28 @@ mod tests {
             vec![VK_SHIFT, VIRTUAL_KEY(b'A' as u16)]
         );
         assert!(pressed_keys_after_prefix(&inputs, 4).is_empty());
+    }
+
+    #[test]
+    fn partial_unicode_prefix_retains_the_original_key_up_identity() {
+        use windows::Win32::UI::Input::KeyboardAndMouse::KEYEVENTF_UNICODE;
+        let mut unicode = virtual_key_event(VIRTUAL_KEY(0), false);
+        unicode.Anonymous.ki = KEYBDINPUT {
+            wVk: VIRTUAL_KEY(0),
+            wScan: 0xd83d,
+            dwFlags: KEYEVENTF_UNICODE,
+            time: 0,
+            dwExtraInfo: 0,
+        };
+        let inputs = [virtual_key_event(VK_CONTROL, false), unicode];
+        let release = keyboard_recovery(&inputs, 2);
+        assert_eq!(release.len(), 2);
+        let key = unsafe { release[0].Anonymous.ki };
+        assert_eq!(key.wScan, 0xd83d);
+        assert_eq!(key.dwFlags, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP);
+        assert_eq!(unsafe { release[1].Anonymous.ki }.wVk, VK_CONTROL);
+        let complete = [unicode, release[0]];
+        assert!(keyboard_recovery(&complete, 2).is_empty());
     }
 
     #[test]

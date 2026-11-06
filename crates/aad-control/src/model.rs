@@ -185,6 +185,10 @@ pub enum Action {
     Fill {
         value: String,
     },
+    /// Replace a protected field using a server-owned secret binding.
+    SecretInput {
+        secret_ref: String,
+    },
     TypeText {
         text: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -300,11 +304,12 @@ pub enum ColorScheme {
 
 pub const MAX_UPLOAD_FILES: usize = 32;
 
-pub const ACTION_NAMES: [&str; 29] = [
+pub const ACTION_NAMES: [&str; 30] = [
     "focus",
     "invoke",
     "click",
     "fill",
+    "secret_input",
     "type_text",
     "key",
     "scroll",
@@ -373,6 +378,7 @@ impl Action {
             Self::Invoke {} => "invoke",
             Self::Click { .. } => "click",
             Self::Fill { .. } => "fill",
+            Self::SecretInput { .. } => "secret_input",
             Self::TypeText { .. } => "type_text",
             Self::Key { .. } => "key",
             Self::Scroll { .. } => "scroll",

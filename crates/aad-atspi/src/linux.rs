@@ -77,6 +77,25 @@ fn pointer_state_allows_input(states: Option<atspi::StateSet>) -> bool {
     })
 }
 
+fn canonical_role(native_role: atspi::Role, role_name: &str) -> String {
+    // Qt 5 GetRoleName reports the base EditableText role ("text") even when
+    // GetRole correctly returns PasswordText. The numeric protocol role is
+    // authoritative for protection; never infer it from labels or text values.
+    if native_role == atspi::Role::PasswordText {
+        "password_text".into()
+    } else {
+        super::normalize_role(role_name)
+    }
+}
+
+fn secret_editable(role: &str, editable_interface: bool, states: atspi::StateSet) -> bool {
+    matches!(role, "password_text" | "password")
+        && editable_interface
+        && [State::Editable, State::Enabled, State::Sensitive]
+            .into_iter()
+            .all(|state| states.contains(state))
+}
+
 fn check_fcitx_text_input(session: &Connection) -> Result<(), AutomationError> {
     let query_error = |error: zbus::Error| {
         driver_error(
@@ -547,9 +566,10 @@ impl LinuxBackend {
     ) -> Result<(BackendNode, usize), AutomationError> {
         remaining(deadline, false)?;
         let accessible = self.accessible(&target)?;
-        let role = zbus::block_on(accessible.get_role_name())
-            .map(|role| super::normalize_role(&role))
-            .unwrap_or_else(|_| "unknown".into());
+        let native_role = zbus::block_on(accessible.get_role())
+            .map_err(|error| native_failure("Accessible.GetRole", &target, error))?;
+        let role_name = zbus::block_on(accessible.get_role_name()).unwrap_or_default();
+        let role = canonical_role(native_role, &role_name);
         let interfaces = zbus::block_on(accessible.get_interfaces()).unwrap_or_default();
         let states = zbus::block_on(accessible.get_state()).ok();
         let protected = matches!(role.as_str(), "password_text" | "password");
@@ -627,6 +647,16 @@ impl LinuxBackend {
         }
         if actionable && interfaces.contains(Interface::EditableText) && !protected {
             actions.push("set_text".into());
+        }
+        if protected
+            && interfaces.contains(Interface::EditableText)
+            && states.is_some_and(|states| {
+                [State::Editable, State::Enabled, State::Sensitive]
+                    .into_iter()
+                    .all(|state| states.contains(state))
+            })
+        {
+            actions.push("secret_input".into());
         }
         let process_id = application
             .get("process_id")
@@ -807,6 +837,7 @@ impl LinuxBackend {
                             .cloned()
                             .unwrap_or(Value::Null),
                     ),
+                    ("atspi_role".into(), json!(native_role as u32)),
                     ("value_redacted".into(), json!(protected)),
                     ("coordinate_space".into(), json!("screen")),
                     ("atspi_actions".into(), json!(native_actions)),
@@ -1012,6 +1043,58 @@ impl AtspiBackend for LinuxBackend {
             ));
         }
         Ok(json!({"native_interface": "EditableText.set_text_contents", "accepted": true}))
+    }
+
+    fn secret_input(
+        &self,
+        target: &NativeRef,
+        text: &str,
+        deadline: Instant,
+    ) -> Result<Value, AutomationError> {
+        // Recheck the exact accessible immediately before the native setter.
+        // Never include D-Bus error text: an application could echo the secret.
+        let unavailable = || {
+            driver_error(
+                "DRIVER.ACTION_UNSUPPORTED",
+                "protected replacement could not be verified",
+            )
+        };
+        remaining(deadline, false)?;
+        let accessible = self.accessible(target).map_err(|_| unavailable())?;
+        let native_role = zbus::block_on(accessible.get_role()).map_err(|_| unavailable())?;
+        let role_name = zbus::block_on(accessible.get_role_name()).map_err(|_| unavailable())?;
+        let role = canonical_role(native_role, &role_name);
+        let interfaces = zbus::block_on(accessible.get_interfaces()).map_err(|_| unavailable())?;
+        let states = zbus::block_on(accessible.get_state()).map_err(|_| unavailable())?;
+        if !secret_editable(&role, interfaces.contains(Interface::EditableText), states) {
+            return Err(unavailable());
+        }
+        let builder = EditableTextProxy::builder(self.connection.inner())
+            .destination(target.bus_name.as_str())
+            .and_then(|builder| builder.path(target.object_path.as_str()))
+            .map_err(|_| unavailable())?;
+        let proxy = zbus::block_on(
+            builder
+                .cache_properties(zbus::proxy::CacheProperties::No)
+                .build(),
+        )
+        .map_err(|_| unavailable())?;
+        remaining(deadline, false)?;
+        let accepted = zbus::block_on(proxy.set_text_contents(text)).map_err(|_| {
+            driver_error(
+                "DRIVER.UNKNOWN_EFFECT",
+                "protected replacement was not confirmed",
+            )
+            .with_effect("unknown")
+        })?;
+        if !accepted {
+            return Err(driver_error(
+                "DRIVER.UNKNOWN_EFFECT",
+                "protected replacement was not confirmed",
+            )
+            .with_effect("unknown"));
+        }
+        Ok(json!({"submitted": true, "redacted": true}))
     }
 
     fn named_action(
@@ -2760,6 +2843,56 @@ impl LinuxBackend {
 mod capture_tests {
     use super::*;
     use std::os::unix::process::ExitStatusExt;
+
+    #[test]
+    fn numeric_password_role_overrides_qt_generic_text_role_name() {
+        assert_eq!(
+            canonical_role(atspi::Role::PasswordText, "text"),
+            "password_text"
+        );
+        assert_eq!(
+            canonical_role(atspi::Role::PasswordText, ""),
+            "password_text"
+        );
+        assert_eq!(canonical_role(atspi::Role::Text, "text"), "text");
+        assert_eq!(
+            canonical_role(atspi::Role::Text, "password text"),
+            "password_text"
+        );
+        let states = [State::Editable, State::Enabled, State::Sensitive]
+            .into_iter()
+            .collect();
+        assert!(secret_editable(
+            &canonical_role(atspi::Role::PasswordText, "text"),
+            true,
+            states
+        ));
+        assert!(!secret_editable(
+            &canonical_role(atspi::Role::Text, "text"),
+            true,
+            states
+        ));
+    }
+
+    #[test]
+    fn secret_native_guard_requires_password_editability_and_enabled_state() {
+        let states = [State::Editable, State::Enabled, State::Sensitive]
+            .into_iter()
+            .collect();
+        assert!(secret_editable("password_text", true, states));
+        assert!(!secret_editable("text", true, states));
+        assert!(!secret_editable("password_text", false, states));
+        assert!(!secret_editable(
+            "password_text",
+            true,
+            [State::Enabled, State::Sensitive].into_iter().collect()
+        ));
+        assert!(!secret_editable(
+            "password_text",
+            true,
+            [State::Editable, State::Sensitive].into_iter().collect()
+        ));
+    }
 
     #[test]
     fn helper_handshake_rejects_legacy_malformed_and_wrong_protocol_without_input() {

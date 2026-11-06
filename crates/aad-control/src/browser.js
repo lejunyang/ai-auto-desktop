@@ -27,7 +27,11 @@
   // Landmarks a page is divided into, as an overview names its regions.
   const LANDMARK_ROLES = ['banner','navigation','main','complementary','contentinfo','form','search','dialog','alertdialog','region'];
   const landmark = el => el!==document.body && (el.getAttribute('role') ? LANDMARK_ROLES.includes(el.getAttribute('role')) : (['HEADER','NAV','MAIN','ASIDE','FOOTER','FORM','DIALOG'].includes(el.tagName) || (el.tagName==='SECTION' && !!(el.getAttribute('aria-label')||el.getAttribute('aria-labelledby')))));
-  const protectedNode = el => el.tagName === 'INPUT' && ['password','hidden'].includes((el.type||'').toLowerCase());
+  // Retain protection for these elements even if the application reveals a
+  // password by changing its input type. No secret values are stored here.
+  const secretElements = new Set();
+  const password = el => el.tagName==='INPUT' && (el.type||'').toLowerCase()==='password';
+  const protectedNode = el => secretElements.has(el) || (el.tagName === 'INPUT' && ['password','hidden'].includes((el.type||'').toLowerCase()));
   // A file input only ever takes files, through upload; often it is hidden behind a styled button.
   const fileInput = el => el.tagName === 'INPUT' && (el.type||'').toLowerCase() === 'file';
   // Canvas exposes pixels rather than child controls. Its observed element
@@ -86,7 +90,8 @@
   // Explicit negative tabindex still permits programmatic focus.
   const focusable = el => typeof el.focus==='function' && (el.tabIndex>=0 || el.hasAttribute('tabindex') || el.isContentEditable || activeElement()===el);
   const actions = el => {
-    if (!enabled(el) || protectedNode(el)) return [];
+    if (!enabled(el)) return [];
+    if (protectedNode(el)) return password(el) && !el.readOnly ? ['secret_input'] : [];
     if (fileInput(el)) return ['upload'];
     const result=[];
     if (focusable(el)) result.push('focus','key');
@@ -107,7 +112,7 @@
     if (args.document_token!==documentToken || args.observation!==observation) return {error:'CONTROL.STALE_TARGET'};
     const found=nodes.get(args.node_id);
     if (!found || !present(found.el) || fingerprint(found.el)!==found.fingerprint) return {error:'CONTROL.STALE_TARGET'};
-    if (!enabled(found.el) || protectedNode(found.el)) return {error:'CONTROL.ACTION_UNSUPPORTED'};
+    if (!enabled(found.el) || (protectedNode(found.el) && args.action!=='secret_input')) return {error:'CONTROL.ACTION_UNSUPPORTED'};
     // A drag's destination is any observed element; everything else needs its action.
     if (args.action!==null && !actions(found.el).includes(args.action)) return {error:'CONTROL.ACTION_UNSUPPORTED'};
     return found;
@@ -178,6 +183,23 @@
     },
     // The observed elements in node order, for the browser's accessibility tree.
     elements: () => Array.from(nodes.values()).map(found=>found.el),
+    // Rehydrate identities retained by the backend across observation resets
+    // and CDP reconnects. Neither identifiers nor this set contain values.
+    mark_secret: el => { if(el.ownerDocument===document)secretElements.add(el); return true; },
+    secrets_visible: () => Array.from(secretElements).some(visible),
+    // Only the dedicated server-owned binding path calls this method. Check
+    // identity and replace in one JS turn; no clipboard or keyboard is used.
+    secret_input: (args,value) => {
+      const found=check(args); if(found.error) return found;
+      const el=found.el;
+      if(!password(el) || el.readOnly || typeof value!=='string' ||
+         Array.from(value).length>1024 || /[\0\r\n]/.test(value)) return {error:'CONTROL.ACTION_UNSUPPORTED'};
+      secretElements.add(el);
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set.call(el,value);
+      el.dispatchEvent(new Event('input',{bubbles:true,composed:true}));
+      el.dispatchEvent(new Event('change',{bubbles:true,composed:true}));
+      return {submitted:true,redacted:true};
+    },
     // What the page, or one observed region of it, shows as text, with tables
     // as rows of cells. Each part stops at max_characters.
     text: args => {
@@ -273,6 +295,16 @@
       found.el.scrollIntoView({block:'nearest',inline:'nearest'});
       const box=found.el.getBoundingClientRect();
       if (box.width<1 || box.height<1) return {error:'CONTROL.OCCLUDED'};
+      // A parent or overlapping element's screenshot could reveal a field
+      // whose type the page changed to text. Refuse the entire capture rather
+      // than racing a pixel mask against a later layout change.
+      for(const secret of secretElements) {
+        if(!visible(secret))continue;
+        const privateBox=secret.getBoundingClientRect();
+        if(privateBox.left<box.right && privateBox.right>box.left &&
+           privateBox.top<box.bottom && privateBox.bottom>box.top)
+          return {error:'CONTROL.ACTION_UNSUPPORTED'};
+      }
       return {x:box.left+scrollX,y:box.top+scrollY,width:box.width,height:box.height};
     },
     // Where trusted pointer input should land, in this frame's CSS pixels. The

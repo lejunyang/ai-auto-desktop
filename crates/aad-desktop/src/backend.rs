@@ -162,6 +162,13 @@ pub struct PointerGesture {
 
 /// The operations a platform backend must provide.
 pub trait Backend: Send + Sync {
+    /// Replace an observed protected field without reading it or using the clipboard.
+    fn secret_input(&self, _window_id: &str, _node: &Node, _text: &str) -> Result<()> {
+        Err(DriverError::new(
+            "DRIVER.ACTION_UNSUPPORTED",
+            "secret input is not implemented on this platform",
+        ))
+    }
     /// Start recording a window's interactions. Where capture is not
     /// implemented this says so rather than starting a session that would
     /// never produce a step: a recorder that appears to work and records

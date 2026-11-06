@@ -134,6 +134,9 @@ impl Step {
         }
         if let Some(action) = &self.action {
             let name = action["type"].as_str().unwrap_or_default();
+            if name == "secret_input" {
+                return Err(invalid("secret input is available only as an immediate action, not in saved steps or workflows"));
+            }
             if !ACTION_NAMES.contains(&name) {
                 return Err(invalid(format!(
                     "step {} has no known action type",

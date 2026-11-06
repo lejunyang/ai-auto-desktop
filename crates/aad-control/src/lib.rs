@@ -8,9 +8,11 @@ pub mod model;
 pub mod native;
 pub mod qr;
 pub mod recording;
+pub mod secrets;
 pub mod steps;
 pub mod transport;
 pub use model::*;
+pub use secrets::{valid_secret_ref, SecretBindings};
 
 use aad_core::AutomationError;
 use serde_json::{json, Value};
@@ -46,6 +48,21 @@ pub struct BackendResource {
 pub trait Backend: Send + Sync {
     fn close(&self) {}
     fn name(&self) -> &str;
+    /// Replace an observed protected field from a server-owned binding. A
+    /// backend must revalidate protection, editability and target identity.
+    /// This is separate from ordinary text input and never uses the clipboard.
+    fn secret_input(
+        &self,
+        _snapshot: &Value,
+        _node: &Value,
+        _text: &str,
+        _context: &Context,
+    ) -> Result<Value> {
+        Err(error(
+            "CONTROL.ACTION_UNSUPPORTED",
+            "secret input is unavailable",
+        ))
+    }
     fn capabilities(&self) -> Vec<String>;
     fn node_capabilities(&self, node: &Value) -> Vec<String> {
         let supported = self.capabilities();
@@ -189,6 +206,10 @@ pub trait Backend: Send + Sync {
 pub struct Policy {
     /// Input is denied unless the trusted server operator explicitly grants it.
     pub allow_input: bool,
+    /// A separate server grant for writing protected fields using bindings.
+    pub allow_secret_input: bool,
+    /// Values stay server-side; protocol clients can only name a binding.
+    pub secret_bindings: SecretBindings,
     /// Empty means all installed providers in this OS account, never arbitrary plugins.
     pub providers: BTreeSet<String>,
     /// Optional server-owned allowlist; a client cannot extend it.
@@ -699,7 +720,10 @@ impl Session {
     }
 
     pub fn with_providers(mut self, providers: Vec<Arc<dyn aad_runtime::Provider>>) -> Self {
-        self.providers = providers;
+        self.providers = providers
+            .into_iter()
+            .map(native::workflow_provider)
+            .collect();
         self
     }
     pub fn providers(&self) -> &[Arc<dyn aad_runtime::Provider>] {
@@ -998,7 +1022,7 @@ impl Session {
                 "expires_in_ms": self.lifetime.saturating_sub(self.created.elapsed()).as_millis(),
                 "session_usable": !self.is_closed() && self.created.elapsed() < self.lifetime
                     && self.state.lock().unwrap().requests.len() < self.max_requests,
-                "allow_input": self.policy.allow_input,"upload_dirs": self.policy.upload_roots,"cookie_values": self.policy.allow_cookie_values,"observation_retention":"until_next_observation_or_input_attempt","observation_ttl_ms":self.observation_ttl.as_millis(),"max_requests":self.max_requests,"input_lease":"exclusive_cooperating_session","input_lease_scope":"os_user","providers": self.backends.values().filter(|b| self.allowed_provider(b.name()))
+                "allow_input": self.policy.allow_input,"allow_secret_input":self.policy.allow_secret_input,"secret_bindings":if self.policy.allow_secret_input { self.policy.secret_bindings.names() } else { Vec::new() },"upload_dirs": self.policy.upload_roots,"cookie_values": self.policy.allow_cookie_values,"observation_retention":"until_next_observation_or_input_attempt","observation_ttl_ms":self.observation_ttl.as_millis(),"max_requests":self.max_requests,"input_lease":"exclusive_cooperating_session","input_lease_scope":"os_user","providers": self.backends.values().filter(|b| self.allowed_provider(b.name()))
                     .map(|b| json!({"provider": b.name(), "actions": b.capabilities(), "reads": b.reads()})).collect::<Vec<_>>(),
                 "unavailable": self.failures}),
             )),
@@ -1176,6 +1200,24 @@ impl Session {
                         .ok_or_else(|| error("CONTROL.STALE_TARGET", "node was not observed"))
                 };
                 let node = observed(&target.node_id)?;
+                let secret = if let Action::SecretInput { secret_ref } = action {
+                    if !self.policy.allow_secret_input {
+                        return Err(error("POLICY.DENIED", "secret input permission was not granted by the server operator"));
+                    }
+                    if node["states"]["protected"] != true {
+                        return Err(error("CONTROL.ACTION_UNSUPPORTED", "secret input requires an observed protected field"));
+                    }
+                    Some(self.policy.secret_bindings.resolve(secret_ref).ok_or_else(|| {
+                        error("CONTROL.SECRET_BINDING_MISSING", "the server has no such secret binding")
+                    })?)
+                } else {
+                    if node["states"]["protected"] == true
+                        && matches!(action, Action::Fill { .. } | Action::TypeText { .. } | Action::Paste { .. } | Action::Key { .. })
+                    {
+                        return Err(error("POLICY.DENIED", "protected fields require the dedicated secret input action"));
+                    }
+                    None
+                };
                 if let Action::Drag { to, .. } = action {
                     // Both ends must come from the same view of the same resource,
                     // so one live revalidation covers the whole gesture.
@@ -1633,7 +1675,17 @@ impl Session {
             ));
         }
         for node in &mut nodes {
-            node["capabilities"] = json!(backend.node_capabilities(node));
+            let mut capabilities = backend.node_capabilities(node);
+            if !self.policy.allow_secret_input {
+                capabilities.retain(|name| name != "secret_input");
+            }
+            if node["states"]["protected"] == true {
+                node["value"] = Value::Null;
+                capabilities.retain(|name| {
+                    !matches!(name.as_str(), "fill" | "type_text" | "paste" | "key")
+                });
+            }
+            node["capabilities"] = json!(capabilities);
             let node_id = node["node_id"]
                 .as_str()
                 .ok_or_else(|| error("CONTROL.BAD_PROVIDER_OUTPUT", "node omitted identity"))?
@@ -1982,6 +2034,14 @@ fn text_answer(read: &Value, provider: &str) -> Value {
 }
 
 fn validate_action(action: &Action) -> Result<()> {
+    if let Action::SecretInput { secret_ref } = action {
+        if !valid_secret_ref(secret_ref) {
+            return Err(error(
+                "CONTROL.INVALID_REQUEST",
+                "invalid secret binding reference",
+            ));
+        }
+    }
     let text = match action {
         Action::Fill { value } => Some(value),
         Action::TypeText { text, .. } => Some(text),

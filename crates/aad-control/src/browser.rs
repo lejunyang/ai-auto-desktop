@@ -6,7 +6,7 @@ use crate::{
 use aad_cdp::{Client, Target};
 use aad_core::AutomationError;
 use serde_json::{json, Value};
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -485,6 +485,12 @@ struct BrowserInput {
     headless: bool,
 }
 
+#[derive(Clone)]
+struct SecretFrame {
+    loader: Value,
+    nodes: BTreeSet<i64>,
+}
+
 /// Only the browser process's own command line establishes isolation; a
 /// page's user agent, launch request, or caller-supplied flag cannot do so.
 fn verified_headless(command_line: &Value) -> bool {
@@ -538,6 +544,7 @@ pub struct BrowserBackend {
     /// The browser-level connection, for tabs and downloads; opened when first needed.
     browser: Mutex<Option<Client>>,
     input_identity: Mutex<Option<BrowserInput>>,
+    secret_frames: Mutex<BTreeMap<(String, String), SecretFrame>>,
     downloads: Mutex<Downloads>,
     world: String,
     last_context: Mutex<Option<(String, Ctx)>>,
@@ -553,6 +560,7 @@ impl BrowserBackend {
             histories: Mutex::new(BTreeMap::new()),
             browser: Mutex::new(None),
             input_identity: Mutex::new(None),
+            secret_frames: Mutex::new(BTreeMap::new()),
             downloads: Mutex::new(Downloads::default()),
             world: format!("aad-control-{}", uuid::Uuid::new_v4()),
             last_context: Mutex::new(None),
@@ -600,6 +608,7 @@ impl BrowserBackend {
         self.histories.lock().unwrap().clear();
         *self.browser.lock().unwrap() = None;
         *self.input_identity.lock().unwrap() = None;
+        self.secret_frames.lock().unwrap().clear();
         *self.last_context.lock().unwrap() = None;
         self.element_scopes.lock().unwrap().clear();
         self.port.store(port, Ordering::SeqCst);
@@ -778,19 +787,6 @@ impl BrowserBackend {
         result
     }
 
-    /// Work on a page that must not be blocked by a JavaScript dialog.
-    fn with_page<T>(
-        &self,
-        page_id: &str,
-        timeout: Duration,
-        f: impl FnOnce(&mut Client) -> Result<T>,
-    ) -> Result<T> {
-        self.with_page_state(page_id, timeout, |page| match &page.dialog {
-            Some(dialog) => Err(dialog_open(dialog)),
-            None => f(&mut page.client),
-        })
-    }
-
     /// Run commands on the browser-level connection, opening it when needed.
     /// A failure drops it, so the next call reconnects to the current browser.
     fn with_browser<T>(
@@ -919,6 +915,72 @@ impl BrowserBackend {
                 );
             }
         }
+    }
+
+    /// Observation resets discard the JS node map. Keep only DOM identities
+    /// in Rust so a revealed field remains protected in the next observation,
+    /// including after a CDP connection is replaced.
+    fn restore_secrets(
+        &self,
+        client: &mut Client,
+        context: &Ctx,
+        page_id: &str,
+        frame_id: &str,
+        loader: &Value,
+    ) -> Result<()> {
+        let key = (page_id.into(), frame_id.into());
+        let marked = self.secret_frames.lock().unwrap().get(&key).cloned();
+        let Some(marked) = marked else {
+            return Ok(());
+        };
+        if marked.loader != *loader {
+            self.secret_frames.lock().unwrap().remove(&key);
+            return Ok(());
+        }
+        for backend_node in marked.nodes {
+            let resolved = match run(
+                client,
+                context.session.as_deref(),
+                "DOM.resolveNode",
+                json!({"backendNodeId":backend_node,"executionContextId":context.id}),
+            ) {
+                Ok(resolved) => resolved,
+                // The renderer no longer owns this DOM identity. A different
+                // element can never inherit the same backend node identity.
+                Err(e) if e.message.contains("No node with given id found") => continue,
+                Err(_) => {
+                    return Err(error(
+                        "CONTROL.ACTION_UNSUPPORTED",
+                        "cannot confirm protected element identity",
+                    ))
+                }
+            };
+            let object = resolved["object"]["objectId"].as_str().ok_or_else(|| {
+                error(
+                    "CONTROL.ACTION_UNSUPPORTED",
+                    "cannot confirm protected element identity",
+                )
+            })?;
+            let marked = run(
+                client,
+                context.session.as_deref(),
+                "Runtime.callFunctionOn",
+                json!({"objectId":object,"functionDeclaration":"function(){return globalThis.__aadControlV1.mark_secret(this);}","returnByValue":true}),
+            );
+            let _ = run(
+                client,
+                context.session.as_deref(),
+                "Runtime.releaseObject",
+                json!({"objectId":object}),
+            );
+            if evaluated(marked?)? != true {
+                return Err(error(
+                    "CONTROL.ACTION_UNSUPPORTED",
+                    "cannot confirm protected element identity",
+                ));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1210,7 +1272,9 @@ fn apply_accessibility(node: &mut Value, ax: &Value) -> bool {
     if let Some(name) = ax["name"]["value"]
         .as_str()
         .map(str::trim)
-        .filter(|name| !name.is_empty())
+        // A revealed password changed to a submit/button input can acquire an
+        // AX name derived from its value. Keep its explicit DOM label instead.
+        .filter(|name| !name.is_empty() && node["states"]["protected"] != true)
     {
         let name: String = name.chars().take(256).collect();
         changed |= node["name"] != name.as_str();
@@ -1683,6 +1747,7 @@ impl Backend for BrowserBackend {
             "click",
             "fill",
             "type_text",
+            "secret_input",
             "key",
             "scroll",
             "hover",
@@ -1951,6 +2016,7 @@ impl Backend for BrowserBackend {
             let context=Ctx{session:session.clone(),id:context};
             let nonce=serde_json::to_string(&uuid::Uuid::new_v4().to_string()).unwrap();
             eval(client,&context,include_str!("browser.js").replace("/*AAD_NAMING*/",aad_cdp::NAMING).replace("NONCE",&nonce))?;
+            self.restore_secrets(client,&context,page_id,frame_id,&frame["loaderId"])?;
             let observation=uuid::Uuid::new_v4().to_string();
             *self.last_context.lock().unwrap()=Some((page_id.into(),context.clone()));
             let mut result=if let Some(backend_node_id)=selector["scope_backend_node_id"].as_i64() {
@@ -1989,6 +2055,76 @@ impl Backend for BrowserBackend {
         result["metadata"]["browser_instance_id"] = json!(input.instance);
         result["metadata"]["headless_input"] = json!(input.headless);
         Ok(result)
+    }
+    fn secret_input(
+        &self,
+        snapshot: &Value,
+        node: &Value,
+        text: &str,
+        action_context: &crate::Context,
+    ) -> Result<Value> {
+        let perform = || -> Result<Value> {
+            if text.chars().count() > 1024
+                || text.chars().any(|ch| matches!(ch, '\0' | '\r' | '\n'))
+                || node["states"]["protected"] != true
+                || !node["actions"]
+                    .as_array()
+                    .is_some_and(|actions| actions.iter().any(|action| action == "secret_input"))
+            {
+                return Err(error(
+                    "CONTROL.ACTION_UNSUPPORTED",
+                    "secret input requires an editable password field and bounded single-line text",
+                ));
+            }
+            let meta = &snapshot["metadata"];
+            let input = self.browser_input(Instant::now() + action_context.remaining()?)?;
+            if meta["browser_instance_id"] != input.instance {
+                return Err(error(
+                    "CONTROL.STALE_TARGET",
+                    "browser input instance changed",
+                ));
+            }
+            let page_id = meta["page_id"].as_str().unwrap_or_default();
+            let frame_id = meta["frame_id"].as_str().unwrap_or_default();
+            self.with_page_state(page_id,action_context.remaining()?,|page|{
+                if let Some(dialog)=&page.dialog{return Err(dialog_open(dialog));}
+                let entry=locate(page,frame_id)?;
+                if entry.frame["loaderId"]!=meta["loader_id"] {return Err(error("CONTROL.STALE_TARGET","browser document navigated"));}
+                let context=Ctx{session:entry.session,id:meta["context_id"].as_i64().unwrap_or_default()};
+                let args=json!({"document_token":snapshot["document_token"],"observation":snapshot["snapshot_id"],"node_id":node["node_id"],"action":"secret_input"});
+                let value=serde_json::to_string(text).map_err(|_|error("CONTROL.INVALID_REQUEST","invalid secret binding"))?;
+                let element=run(&mut page.client,context.session.as_deref(),"Runtime.evaluate",json!({"expression":format!("globalThis.__aadControlV1.element({args})"),"contextId":context.id,"returnByValue":false}))?;
+                let object=element["result"]["objectId"].as_str().filter(|_|element["result"]["subtype"]=="node")
+                    .ok_or_else(||error("CONTROL.STALE_TARGET","password field no longer available"))?;
+                let described=run(&mut page.client,context.session.as_deref(),"DOM.describeNode",json!({"objectId":object}));
+                let _=run(&mut page.client,context.session.as_deref(),"Runtime.releaseObject",json!({"objectId":object}));
+                let backend_node=described?["node"]["backendNodeId"].as_i64()
+                    .ok_or_else(||error("BROWSER.BAD_RESULT","no password field identity"))?;
+                {
+                    let mut secrets=self.secret_frames.lock().unwrap();
+                    let marked=secrets.entry((page_id.into(),frame_id.into())).or_insert_with(||SecretFrame{loader:entry.frame["loaderId"].clone(),nodes:BTreeSet::new()});
+                    if marked.loader!=entry.frame["loaderId"] {
+                        marked.loader=entry.frame["loaderId"].clone();
+                        marked.nodes.clear();
+                    }
+                    marked.nodes.insert(backend_node);
+                }
+                action_context.commit()?;
+                checked(eval(&mut page.client,&context,format!("globalThis.__aadControlV1.secret_input({args},{value})")).map_err(|e|e.with_effect("unknown"))?)?;
+                Ok(json!({"submitted":true,"redacted":true}))
+            })
+        };
+        // CDP and page exceptions can carry arbitrary text. The dedicated
+        // boundary never returns them, even to callers using Backend directly.
+        perform().map_err(|failure| {
+            error("CONTROL.SECRET_INPUT_FAILED", "secret input failed").with_effect(
+                if failure.effect == "not_applied" {
+                    "not_applied"
+                } else {
+                    "unknown"
+                },
+            )
+        })
     }
     fn act(
         &self,
@@ -2447,10 +2583,46 @@ impl BrowserBackend {
         }
         let page_id = meta["page_id"].as_str().unwrap_or_default();
         let frame_id = meta["frame_id"].as_str().unwrap_or_default();
-        self.with_page(page_id, timeout, |client| {
-            if current_frame(client, None, frame_id)?["loaderId"] != meta["loader_id"] {
+        self.with_page_state(page_id, timeout, |page| {
+            if let Some(dialog) = &page.dialog {
+                return Err(dialog_open(dialog));
+            }
+            if current_frame(&mut page.client, None, frame_id)?["loaderId"] != meta["loader_id"] {
                 return Err(error("CONTROL.STALE_TARGET", "browser document navigated"));
             }
+            let marked:Vec<_>=self.secret_frames.lock().unwrap().iter()
+                .filter(|((known_page,known_frame),_)|known_page==page_id && known_frame!=frame_id)
+                .map(|(key,frame)|(key.clone(),frame.clone())).collect();
+            for (key,secret) in marked {
+                let current=match locate(page,&key.1) {
+                    Ok(entry)=>entry,
+                    Err(e) if e.code=="CONTROL.STALE_TARGET"=>{
+                        self.secret_frames.lock().unwrap().remove(&key);
+                        continue;
+                    }
+                    Err(_)=>return Err(error("CONTROL.ACTION_UNSUPPORTED","capture cannot confirm protected child-frame visibility")),
+                };
+                if current.frame["loaderId"]!=secret.loader {
+                    self.secret_frames.lock().unwrap().remove(&key);
+                    continue;
+                }
+                // Child sessions belong to a connection, so recover this
+                // backend's named world after reconnecting, too. An absent
+                // marker in an unchanged document is unknown, never safe.
+                let visible=(|| -> Result<Value> {
+                    let created=run(&mut page.client,current.session.as_deref(),"Page.createIsolatedWorld",json!({"frameId":key.1,"worldName":self.world,"grantUniveralAccess":false}))?;
+                    let id=created["executionContextId"].as_i64().ok_or_else(||error("BROWSER.BAD_RESULT","no protected frame context"))?;
+                    let context=Ctx{session:current.session,id};
+                    let nonce=serde_json::to_string(&uuid::Uuid::new_v4().to_string()).unwrap();
+                    eval(&mut page.client,&context,include_str!("browser.js").replace("/*AAD_NAMING*/",aad_cdp::NAMING).replace("NONCE",&nonce))?;
+                    self.restore_secrets(&mut page.client,&context,page_id,&key.1,&current.frame["loaderId"])?;
+                    eval(&mut page.client,&context,"globalThis.__aadControlV1.secrets_visible()".into())
+                })().map_err(|_|error("CONTROL.ACTION_UNSUPPORTED","capture cannot confirm protected child-frame visibility"))?;
+                if visible!=false {
+                    return Err(error("CONTROL.ACTION_UNSUPPORTED","capture may include a protected child-frame element"));
+                }
+            }
+            let client=&mut page.client;
             let context = Ctx {
                 session: None,
                 id: meta["context_id"].as_i64().unwrap_or_default(),
@@ -3699,6 +3871,23 @@ mod tests {
         let mut body = json!({"role": "document", "name": ""});
         apply_accessibility(&mut body, &json!({"role": {"value": "generic"}}));
         assert_eq!(body["role"], "document");
+    }
+
+    #[test]
+    fn protected_nodes_never_import_a_value_derived_accessible_name() {
+        let mut node = json!({"role":"textbox","name":"login","value":null,
+            "states":{"protected":true}});
+        assert!(apply_accessibility(
+            &mut node,
+            &json!({
+                "role":{"value":"button"},"name":{"value":"synthetic-private-value"},
+                "value":{"value":"synthetic-private-value"}
+            })
+        ));
+        assert_eq!(node["role"], "button");
+        assert_eq!(node["name"], "login");
+        assert!(node["value"].is_null());
+        assert!(!node.to_string().contains("synthetic-private-value"));
     }
 
     fn capture() -> Value {

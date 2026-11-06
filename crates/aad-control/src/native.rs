@@ -3,6 +3,7 @@ use crate::{
     error, Action, Backend, BackendResource, Expect, Locator, Resource, Result, View, ViewMode,
     ACTION_NAMES,
 };
+use aad_plugin::CapabilityManifest;
 use aad_runtime::Provider;
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
@@ -22,14 +23,77 @@ pub struct NativeBackend {
     flavor: Flavor,
 }
 
+/// Workflows share the provider's snapshot store, but cannot bypass the
+/// session's server-owned secret bindings with an arbitrary `with.text`.
+struct WorkflowProvider {
+    inner: Arc<dyn Provider>,
+    manifest: CapabilityManifest,
+}
+
+/// Keep private, server-resolved secret input out of arbitrary workflow calls.
+pub fn workflow_provider(inner: Arc<dyn Provider>) -> Arc<dyn Provider> {
+    Arc::new(WorkflowProvider::new(inner))
+}
+
+impl WorkflowProvider {
+    fn new(inner: Arc<dyn Provider>) -> Self {
+        let mut manifest = inner.manifest().clone();
+        manifest.actions.remove("secret_input");
+        if let Some(actions) = manifest.raw["actions"].as_object_mut() {
+            actions.remove("secret_input");
+        }
+        Self { inner, manifest }
+    }
+
+    fn refuse_secret(action: &str) -> Result<()> {
+        let name = action
+            .split('@')
+            .next()
+            .unwrap_or(action)
+            .rsplit('.')
+            .next();
+        if name == Some("secret_input") {
+            return Err(error(
+                "CONTROL.SECRET_WORKFLOW_DENIED",
+                "secret input cannot run through a workflow",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl Provider for WorkflowProvider {
+    fn manifest(&self) -> &CapabilityManifest {
+        &self.manifest
+    }
+    fn invoke(&self, action: &str, args: Value, timeout: Option<Duration>) -> Result<Value> {
+        Self::refuse_secret(action)?;
+        self.inner.invoke(action, args, timeout)
+    }
+    fn invoke_with_artifacts(
+        &self,
+        action: &str,
+        args: Value,
+        timeout: Option<Duration>,
+        artifacts: &aad_runtime::ArtifactStore,
+    ) -> Result<Value> {
+        Self::refuse_secret(action)?;
+        self.inner
+            .invoke_with_artifacts(action, args, timeout, artifacts)
+    }
+    fn close(&self) {
+        self.inner.close();
+    }
+}
+
 impl NativeBackend {
     pub fn new(provider: Arc<dyn Provider>, flavor: Flavor) -> Self {
         Self { provider, flavor }
     }
-    /// The provider itself, for saved workflows that must drive the same
-    /// native instance and snapshot store as this session.
+    /// A workflow view sharing the native instance and snapshot store, with
+    /// ephemeral secret input removed from discovery and dispatch.
     pub fn provider(&self) -> Arc<dyn Provider> {
-        self.provider.clone()
+        workflow_provider(self.provider.clone())
     }
     fn invoke(&self, action: &str, args: Value, timeout: Duration) -> Result<Value> {
         self.provider
@@ -44,6 +108,7 @@ impl NativeBackend {
             "fill" if matches!(self.flavor, Flavor::Linux) => "set_text",
             "fill" => "set_value",
             "type_text" => "type_text",
+            "secret_input" => "secret_input",
             "key" => "key_chord",
             "scroll" | "hover" => "pointer_gesture",
             "drag" => "drag",
@@ -525,6 +590,12 @@ impl Backend for NativeBackend {
         action: &Action,
         context: &crate::Context,
     ) -> Result<Value> {
+        if matches!(action, Action::SecretInput { .. }) {
+            return Err(error(
+                "POLICY.DENIED",
+                "secret input requires a server-resolved binding",
+            ));
+        }
         let native = self.native_action(action);
         if !node["actions"]
             .as_array()
@@ -634,6 +705,28 @@ impl Backend for NativeBackend {
             _ => {}
         }
         self.invoke(native, args, context.commit()?)
+    }
+
+    fn secret_input(
+        &self,
+        snapshot: &Value,
+        node: &Value,
+        text: &str,
+        context: &crate::Context,
+    ) -> Result<Value> {
+        if node["states"]["protected"] != true
+            || !node["actions"]
+                .as_array()
+                .is_some_and(|actions| actions.iter().any(|action| action == "secret_input"))
+        {
+            return Err(error(
+                "CONTROL.ACTION_UNSUPPORTED",
+                "the observed element does not support secret input",
+            ));
+        }
+        let mut args = self.read_args(snapshot, node);
+        args["text"] = json!(text);
+        self.invoke("secret_input", args, context.commit()?)
     }
 }
 

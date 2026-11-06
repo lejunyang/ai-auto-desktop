@@ -137,6 +137,40 @@ pub fn save_workflow(name: &str, descriptor: &Value) -> Result<PathBuf> {
     write_document(name, WORKFLOW_SUFFIX, descriptor)
 }
 
+/// Protected input is ephemeral until a dedicated sensitive replay broker exists.
+/// Inspect nested steps too, before serializing or reporting malformed fields.
+pub fn ensure_no_secret_input(document: &Value) -> Result<()> {
+    match document {
+        Value::Object(fields) => {
+            let secret_action = fields.get("type").and_then(Value::as_str) == Some("secret_input")
+                || fields.get("action").and_then(Value::as_str) == Some("secret_input")
+                || fields
+                    .get("uses")
+                    .and_then(Value::as_str)
+                    .is_some_and(|uses| {
+                        uses.split('@').next().unwrap_or(uses).rsplit('.').next()
+                            == Some("secret_input")
+                    });
+            if secret_action {
+                return Err(StoreError::new(
+                    "STORE.SECRET_INPUT_UNSUPPORTED",
+                    "secret input is only supported as an immediate authorized action",
+                ));
+            }
+            for value in fields.values() {
+                ensure_no_secret_input(value)?;
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                ensure_no_secret_input(value)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 /// Where the runnable workflow called `name` lives.
 ///
 /// Goes through the same validation as saving, so a name that could escape the
@@ -165,6 +199,7 @@ pub fn remove_workflow(name: &str) -> Result<bool> {
 }
 
 fn write_document(name: &str, suffix: &str, document: &Value) -> Result<PathBuf> {
+    ensure_no_secret_input(document)?;
     let name = validate_name(name)?;
     let directory = recordings_dir();
     fs::create_dir_all(&directory).map_err(|error| {
@@ -394,6 +429,28 @@ mod tests {
             reloaded, original,
             "a round trip must not alter the recording"
         );
+    }
+
+    #[test]
+    fn secret_actions_never_reach_recording_or_workflow_files() {
+        let sandbox = Sandbox::new("secret-refusal");
+        for step in [
+            json!({"action":{"type":"secret_input","secret_ref":"password"}}),
+            json!({"action":"secret_input","text":"synthetic-fixture"}),
+            json!({"uses":"desktop.windows_uia.secret_input@1","with":{"text":"synthetic-fixture"}}),
+            json!({"steps":[{"uses":"desktop.linux_atspi.secret_input@1","with":{"text":"synthetic-fixture"}}]}),
+        ] {
+            let document = json!({"steps":[step]});
+            for result in [
+                save_recording("blocked", &document),
+                save_workflow("blocked", &document),
+            ] {
+                let error = result.unwrap_err();
+                assert_eq!(error.code, "STORE.SECRET_INPUT_UNSUPPORTED");
+                assert!(!error.message.contains("synthetic-fixture"));
+            }
+        }
+        assert_eq!(fs::read_dir(&sandbox.directory).unwrap().count(), 0);
     }
 
     #[test]

@@ -1,6 +1,6 @@
 use aad_control::{
     transport::{self, Endpoint, RemoteClient},
-    Policy, Session,
+    Policy, SecretBindings, Session,
 };
 use clap::{Args, Subcommand};
 use std::collections::BTreeSet;
@@ -37,11 +37,31 @@ pub struct Grants {
     /// Let browser_storage show cookie values. Without it names and flags only.
     #[arg(long)]
     allow_cookie_values: bool,
+    /// Permit replacing protected fields with server-owned secret bindings.
+    /// Also requires --allow-input. Ordinary fill/type/paste stay prohibited.
+    #[arg(long)]
+    allow_secret_input: bool,
+    /// Bind a public name to a server environment variable. Only the name is
+    /// exposed to control clients; never put the secret value on the command line.
+    #[arg(long = "secret-env", value_name = "NAME=ENV")]
+    secret_env: Vec<String>,
+    /// Populated once by the synchronous startup path, before any child/thread.
+    #[arg(skip)]
+    prepared_bindings: Option<SecretBindings>,
 }
 impl Grants {
-    fn policy(&self, allow_input: bool) -> Policy {
-        Policy {
+    fn policy(&self, allow_input: bool) -> std::io::Result<Policy> {
+        self.check(allow_input)?;
+        Ok(Policy {
             allow_input,
+            allow_secret_input: self.allow_secret_input,
+            secret_bindings: if self.secret_env.is_empty() {
+                SecretBindings::default()
+            } else {
+                self.prepared_bindings
+                    .clone()
+                    .ok_or_else(|| invalid("secret bindings must be prepared during startup"))?
+            },
             providers: self.providers.iter().cloned().collect(),
             resources: if self.resources.is_empty() {
                 None
@@ -53,15 +73,42 @@ impl Grants {
             allow_global_keys: self.allow_global_keys,
             upload_roots: self.upload_dirs.clone(),
             allow_cookie_values: self.allow_cookie_values,
-        }
+        })
+    }
+    fn prepare_secrets(&mut self, allow_input: bool) -> std::io::Result<Vec<String>> {
+        self.check(allow_input)?;
+        // Read every binding before the caller removes any environment key:
+        // several public names may intentionally use the same source variable.
+        let bindings =
+            bindings_from_environment(&self.secret_env, |name| std::env::var(name).ok())?;
+        let variables = self
+            .secret_env
+            .iter()
+            .map(|binding| {
+                binding
+                    .split_once('=')
+                    .expect("bindings validated")
+                    .1
+                    .to_string()
+            })
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        self.prepared_bindings = Some(bindings);
+        Ok(variables)
     }
     /// Launching and global keys are input: refuse them without the input grant
     /// rather than start a server that would refuse every such request.
     fn check(&self, allow_input: bool) -> std::io::Result<()> {
-        if !allow_input && (!self.allow_launch.is_empty() || self.allow_global_keys) {
+        if !allow_input
+            && (!self.allow_launch.is_empty() || self.allow_global_keys || self.allow_secret_input)
+        {
             return Err(invalid(
-                "--allow-launch and --allow-global-keys need --allow-input",
+                "--allow-launch, --allow-global-keys and --allow-secret-input need --allow-input",
             ));
+        }
+        if !self.allow_secret_input && !self.secret_env.is_empty() {
+            return Err(invalid("--secret-env needs --allow-secret-input"));
         }
         Ok(())
     }
@@ -75,7 +122,46 @@ impl Grants {
             || self.allow_global_keys
             || !self.upload_dirs.is_empty()
             || self.allow_cookie_values
+            || self.allow_secret_input
+            || !self.secret_env.is_empty()
     }
+}
+
+fn bindings_from_environment(
+    bindings: &[String],
+    mut read: impl FnMut(&str) -> Option<String>,
+) -> std::io::Result<SecretBindings> {
+    let mut specifications = Vec::new();
+    let mut names = BTreeSet::new();
+    for binding in bindings {
+        let (name, variable) = binding
+            .split_once('=')
+            .ok_or_else(|| invalid("secret binding must be NAME=ENV"))?;
+        if !aad_control::valid_secret_ref(name)
+            || variable.is_empty()
+            || variable.len() > 128
+            || !variable
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+            || variable.as_bytes()[0].is_ascii_digit()
+        {
+            return Err(invalid(
+                "invalid secret binding name or environment variable",
+            ));
+        }
+        if !names.insert(name) {
+            return Err(invalid("invalid or duplicate secret binding"));
+        }
+        specifications.push((name, variable));
+    }
+    let mut pairs = Vec::new();
+    for (name, variable) in specifications {
+        let value = read(variable).ok_or_else(|| {
+            invalid("secret binding environment variable is absent or not Unicode")
+        })?;
+        pairs.push((name.to_string(), value));
+    }
+    SecretBindings::new(pairs).map_err(|_| invalid("invalid or duplicate secret binding"))
 }
 
 #[derive(Args, Default)]
@@ -95,6 +181,19 @@ pub struct McpArgs {
     connect: Option<String>,
 }
 
+impl McpArgs {
+    pub fn prepare_secrets(&mut self) -> std::io::Result<Vec<String>> {
+        if self.connect.is_some() {
+            if self.allow_input || self.grants.any() {
+                return Err(invalid("remote grants must be configured on the remote server; local flags cannot replace them"));
+            }
+            Ok(Vec::new())
+        } else {
+            self.grants.prepare_secrets(self.allow_input)
+        }
+    }
+}
+
 #[derive(Subcommand)]
 pub enum ControlCommand {
     /// Read-only persistent browser diagnostics over NDJSON.
@@ -109,6 +208,15 @@ pub enum ControlCommand {
     /// Proxy a persistent session through trusted operator-supplied argv.
     /// Missing request session IDs are bound to this connection by the client.
     Connect(ConnectArgs),
+}
+
+impl ControlCommand {
+    pub fn prepare_secrets(&mut self) -> std::io::Result<Vec<String>> {
+        match self {
+            Self::Serve(args) => args.grants.prepare_secrets(args.allow_input),
+            _ => Ok(Vec::new()),
+        }
+    }
 }
 
 #[derive(Args)]
@@ -149,7 +257,7 @@ pub fn mcp(args: &McpArgs) -> std::io::Result<()> {
     } else {
         args.grants.check(args.allow_input)?;
         let server = aad_mcp::Server::with_options(
-            args.grants.policy(args.allow_input),
+            args.grants.policy(args.allow_input)?,
             args.grants.browser_port,
         );
         if args.allow_profile_copy {
@@ -170,7 +278,7 @@ pub fn run(command_args: &ControlCommand) -> std::io::Result<()> {
         ControlCommand::Serve(args) => {
             args.grants.check(args.allow_input)?;
             Arc::new(Session::native_with_browser(
-                args.grants.policy(args.allow_input),
+                args.grants.policy(args.allow_input)?,
                 args.grants.browser_port,
             ))
         }
@@ -195,12 +303,12 @@ mod tests {
         let launch = Cli::try_parse_from(["aad", "--allow-launch", "notepad.exe"]).unwrap();
         assert!(launch.grants.check(false).is_err());
         assert!(launch.grants.check(true).is_ok());
-        assert_eq!(launch.grants.policy(true).launch.len(), 1);
+        assert_eq!(launch.grants.policy(true).unwrap().launch.len(), 1);
         let keys = Cli::try_parse_from(["aad", "--allow-global-keys"]).unwrap();
         assert!(keys.grants.check(false).is_err());
         let clipboard = Cli::try_parse_from(["aad", "--allow-clipboard-read"]).unwrap();
         assert!(clipboard.grants.check(false).is_ok());
-        assert!(clipboard.grants.policy(false).allow_clipboard_read);
+        assert!(clipboard.grants.policy(false).unwrap().allow_clipboard_read);
     }
     #[test]
     fn uploads_are_refused_unless_the_operator_names_directories() {
@@ -211,7 +319,7 @@ mod tests {
         }
         use clap::Parser;
         let none = Cli::try_parse_from(["aad"]).unwrap();
-        assert!(none.grants.policy(true).upload_roots.is_empty());
+        assert!(none.grants.policy(true).unwrap().upload_roots.is_empty());
         let two = Cli::try_parse_from([
             "aad",
             "--allow-upload-dir",
@@ -221,7 +329,7 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(
-            two.grants.policy(true).upload_roots,
+            two.grants.policy(true).unwrap().upload_roots,
             vec![
                 std::path::PathBuf::from("C:/uploads"),
                 std::path::PathBuf::from("D:/more")
@@ -241,6 +349,7 @@ mod tests {
                 .unwrap()
                 .grants
                 .policy(false)
+                .unwrap()
                 .allow_cookie_values
         );
         assert!(
@@ -248,6 +357,7 @@ mod tests {
                 .unwrap()
                 .grants
                 .policy(false)
+                .unwrap()
                 .allow_cookie_values
         );
     }
@@ -260,5 +370,46 @@ mod tests {
             vec!["ssh", "-T", "example", "aad control serve"]
         );
         assert!(command(r#"["bad\u0000program"]"#).is_err());
+    }
+
+    #[test]
+    fn secret_bindings_require_both_grants_and_never_put_values_in_debug_or_errors() {
+        let mut grants = Grants {
+            secret_env: vec!["login=AAD_TEST_SECRET".into()],
+            ..Default::default()
+        };
+        assert!(grants.check(true).is_err());
+        grants.allow_secret_input = true;
+        assert!(grants.check(false).is_err());
+        assert!(grants.check(true).is_ok());
+        assert!(grants.any());
+        let bindings = bindings_from_environment(&grants.secret_env, |variable| {
+            assert_eq!(variable, "AAD_TEST_SECRET");
+            Some("test-only-password".into())
+        })
+        .unwrap();
+        assert_eq!(bindings.names(), ["login"]);
+        assert!(!format!("{bindings:?}").contains("test-only-password"));
+        assert!(
+            grants.policy(true).is_err(),
+            "policy must not read environment lazily"
+        );
+        grants.prepared_bindings = Some(bindings);
+        assert_eq!(
+            grants.policy(true).unwrap().secret_bindings.names(),
+            ["login"]
+        );
+        for names in [vec!["login=$(echo bad)".into()], vec!["login".into()]] {
+            assert!(
+                bindings_from_environment(&names, |_| panic!("must validate before reading"))
+                    .is_err()
+            );
+        }
+        assert!(bindings_from_environment(
+            &["first=AAD_TEST_SECRET".into(), "malformed".into()],
+            |_| panic!("validate every specification before reading any value")
+        )
+        .is_err());
+        assert!(bindings_from_environment(&grants.secret_env, |_| None).is_err());
     }
 }

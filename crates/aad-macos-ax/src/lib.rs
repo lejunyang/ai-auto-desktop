@@ -32,6 +32,7 @@ const WRITE_ACTIONS: &[&str] = &[
     "drag",
     "key_chord",
     "set_value",
+    "secret_input",
     "type_text",
     "paste",
     "minimize",
@@ -144,6 +145,18 @@ pub trait AxBackend: Send + Sync {
         text: &str,
         deadline: Instant,
     ) -> Result<Value, AutomationError>;
+    /// Replace a freshly verified secure editable field without reading its value.
+    fn secret_input(
+        &self,
+        _token: &str,
+        _text: &str,
+        _deadline: Instant,
+    ) -> Result<Value, AutomationError> {
+        Err(driver_error(
+            "DRIVER.ACTION_UNSUPPORTED",
+            "this backend has no protected input replacement",
+        ))
+    }
     /// `gesture` is already validated: `mode` click, wheel or hover with its
     /// fields, plus `fx`/`fy` inside the element.
     fn pointer_gesture(
@@ -743,7 +756,7 @@ impl MacOSAxProvider {
         if action == "set_value" {
             allowed.push("value");
         }
-        if matches!(action, "type_text" | "paste") {
+        if matches!(action, "type_text" | "paste" | "secret_input") {
             allowed.push("text");
         }
         match action {
@@ -787,6 +800,7 @@ impl MacOSAxProvider {
         let text = match action {
             "type_text" => Some(keyboard_text(args.get("text"))?),
             "paste" => Some(paste_text(args.get("text"))?),
+            "secret_input" => Some(secret_text(args.get("text"))?),
             _ => None,
         };
         let (button, position) = if action == "pointer_click" {
@@ -806,6 +820,16 @@ impl MacOSAxProvider {
             None
         };
         let (fresh, fresh_id, node, token) = self.fresh_target(args, deadline)?;
+        if action == "secret_input"
+            && (node["states"]["protected"] != true
+                || node["states"]["editable"] != true
+                || node["states"]["enabled"] == false)
+        {
+            return Err(driver_error(
+                "DRIVER.ACTION_UNSUPPORTED",
+                "secret input requires an enabled protected editable element",
+            ));
+        }
         if INPUT_ACTIONS.contains(&action) && node["states"]["protected"] == true {
             return Err(driver_error(
                 "DRIVER.PROTECTED_ELEMENT",
@@ -896,6 +920,10 @@ impl MacOSAxProvider {
             "type_text" => self
                 .backend
                 .type_text(&token, text.expect("text validated"), deadline),
+            "secret_input" => {
+                self.backend
+                    .secret_input(&token, text.expect("text validated"), deadline)
+            }
             "pointer_gesture" => self.backend.pointer_gesture(
                 &token,
                 gesture.as_ref().expect("gesture validated"),
@@ -920,6 +948,18 @@ impl MacOSAxProvider {
             _ => unreachable!(),
         };
         let backend_result = match result {
+            Ok(_) if action == "secret_input" => {
+                remaining(deadline, true)?;
+                json!({"submitted": true, "redacted": true})
+            }
+            Err(error) if action == "secret_input" => {
+                return Err(driver_error(
+                    "DRIVER.SECRET_INPUT_FAILED",
+                    "protected input replacement failed",
+                )
+                .with_effect(&error.effect)
+                .with_retryable(error.retryable));
+            }
             Ok(value) => {
                 remaining(deadline, true)?;
                 value
@@ -1226,6 +1266,15 @@ fn paste_text(value: Option<&Value>) -> Result<&str, AutomationError> {
         return Err(invalid("paste text is 1..4096 characters"));
     }
     Ok(text)
+}
+
+fn secret_text(value: Option<&Value>) -> Result<&str, AutomationError> {
+    value
+        .and_then(Value::as_str)
+        .filter(|text| {
+            text.chars().count() <= MAX_TYPE_TEXT_CHARS && !text.contains(['\0', '\r', '\n'])
+        })
+        .ok_or_else(|| invalid("protected input is outside the supported bounds"))
 }
 
 /// Chords a global key never presses: the lock screen (Ctrl+Cmd+Q), log out
@@ -1811,8 +1860,13 @@ fn manifest_document() -> Value {
             "text",
             "重新验证并聚焦非受保护文本目标后，显式发送有界 Unicode 键盘输入。",
         ),
+        (
+            "secret_input",
+            "text",
+            "仅供受授权的瞬时输入通道替换受保护 AXValue；不读回或使用剪贴板。",
+        ),
     ] {
-        let mut property = json!({"type": "string", "maxLength": if name == "type_text" { MAX_TYPE_TEXT_CHARS } else { MAX_FIELD_CHARS }});
+        let mut property = json!({"type": "string", "maxLength": if matches!(name, "type_text" | "secret_input") { MAX_TYPE_TEXT_CHARS } else { MAX_FIELD_CHARS }});
         if name == "type_text" {
             property["minLength"] = json!(1);
         }
@@ -2120,13 +2174,33 @@ mod tests {
             field.name = Some("Note".into());
             field.description = None;
             field.provenance.remove("identifier");
-            field.states.insert("editable".into(), Some(!self.secure));
+            field.states.insert("editable".into(), Some(true));
             field.states.insert("protected".into(), Some(self.secure));
-            field.actions = vec!["focus".into(), "set_value".into(), "paste".into()];
+            field.actions = vec![
+                "focus".into(),
+                "set_value".into(),
+                "paste".into(),
+                "secret_input".into(),
+            ];
             vec![window, field]
         }
     }
     impl AxBackend for WindowBackend {
+        fn secret_input(
+            &self,
+            _token: &str,
+            text: &str,
+            _deadline: Instant,
+        ) -> Result<Value, AutomationError> {
+            self.inner.writes.fetch_add(1, Ordering::SeqCst);
+            if text == "fixture-error" {
+                Err(driver_error("DRIVER.ACTION_FAILED", text)
+                    .with_effect("unknown")
+                    .with_detail("echo", json!(text)))
+            } else {
+                Ok(json!({"echo":text}))
+            }
+        }
         fn name(&self) -> &str {
             "fake_macos_ax"
         }
@@ -2206,6 +2280,57 @@ mod tests {
         ) -> Result<Value, AutomationError> {
             self.inner.capture_element(token, deadline)
         }
+    }
+
+    #[test]
+    fn protected_replacement_is_dedicated_and_never_returns_backend_text() {
+        let backend = Arc::new(WindowBackend {
+            inner: FakeBackend::default(),
+            secure: true,
+        });
+        let provider = MacOSAxProvider::new(backend.clone()).unwrap();
+        let args = |text: &str| {
+            let snapshot = take_snapshot(&provider);
+            assert_eq!(snapshot["nodes"][1]["value"], Value::Null);
+            assert!(snapshot["nodes"][1]["actions"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("secret_input")));
+            json!({"target":{"snapshot_id":snapshot["snapshot_id"],"revision":snapshot["revision"],"node_id":"n1"},"locator":{"role":"AXSecureTextField","name":"Note"},"text":text})
+        };
+        for text in ["synthetic-fixture", ""] {
+            let result = provider
+                .invoke("desktop.macos_ax.secret_input@1", args(text), None)
+                .unwrap();
+            assert_eq!(
+                result["backend_result"],
+                json!({"submitted":true,"redacted":true})
+            );
+        }
+        let error = provider
+            .invoke(
+                "desktop.macos_ax.secret_input@1",
+                args("fixture-error"),
+                None,
+            )
+            .unwrap_err();
+        assert_eq!(error.code, "DRIVER.SECRET_INPUT_FAILED");
+        assert_eq!(error.effect, "unknown");
+        assert!(!format!("{error:?}").contains("fixture-error"));
+        for text in ["bad\n", "bad\0", "bad\r", &"a".repeat(1025)] {
+            assert!(provider
+                .invoke("desktop.macos_ax.secret_input@1", args(text), None)
+                .is_err());
+        }
+        let mut stale = args("synthetic-fixture");
+        stale["target"]["revision"] = json!(0);
+        assert!(provider
+            .invoke("desktop.macos_ax.secret_input@1", stale, None)
+            .is_err());
+        assert!(provider
+            .invoke("desktop.macos_ax.paste@1", args("fixture"), None)
+            .is_err());
+        assert_eq!(backend.inner.writes.load(Ordering::SeqCst), 3);
     }
 
     #[test]

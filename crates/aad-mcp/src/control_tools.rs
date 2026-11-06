@@ -87,6 +87,9 @@ fn action_schema() -> Value {
     type_text for text fields: it is atomic and does not depend on focus.", json!({
             "value": {"type": "string", "maxLength": 4096}
         }), &["value"]),
+        variant("secret_input", "Replace an observed protected, editable field from a server-owned secret binding. Requires the operator's separate secret-input grant. The text never passes through the clipboard or the public action; reads and captures remain protected. Not available in saved steps or workflows.", json!({
+            "secret_ref": {"type":"string", "minLength":1, "maxLength":64, "pattern":"^[A-Za-z][A-Za-z0-9_-]*$", "description":"An exact binding name listed by control_capabilities; never a secret value or an environment-variable expression."}
+        }), &["secret_ref"]),
         variant("type_text", "Type text as keystrokes after focusing the element. Use \
     only when fill is unsupported, since keystrokes go wherever focus lands.", json!({
             "text": {"type": "string", "maxLength": 1024},
@@ -218,6 +221,9 @@ fn action_schema() -> Value {
 /// in the step's `to` locator instead of a session-bound target.
 pub(crate) fn saved_action_schema() -> Value {
     let mut schema = action_schema();
+    if let Some(variants) = schema["oneOf"].as_array_mut() {
+        variants.retain(|variant| variant["properties"]["type"]["const"] != "secret_input");
+    }
     for variant in schema["oneOf"].as_array_mut().into_iter().flatten() {
         // The text may come from the step's `input` instead.
         if matches!(
@@ -816,7 +822,7 @@ mod tests {
                 let field = field.as_str().unwrap();
                 sample[field] = match field {
                     "type" => json!(name),
-                    "value" | "text" => json!("x"),
+                    "value" | "text" | "secret_ref" => json!("x"),
                     "keys" => json!(["enter"]),
                     "direction" => json!("down"),
                     "option" => json!("x"),
@@ -832,6 +838,23 @@ mod tests {
             serde_json::from_value::<aad_control::Action>(sample)
                 .unwrap_or_else(|e| panic!("{name}: {e}"));
         }
+    }
+
+    #[test]
+    fn secrets_expose_only_a_binding_name_and_cannot_be_saved() {
+        let schema = variant("secret_input");
+        assert_eq!(schema["required"], json!(["type", "secret_ref"]));
+        assert_eq!(schema["properties"].as_object().unwrap().len(), 2);
+        assert_eq!(schema["properties"]["secret_ref"]["maxLength"], 64);
+        assert!(!saved_action_schema()["oneOf"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["properties"]["type"]["const"] == "secret_input"));
+        assert!(serde_json::from_value::<aad_control::Action>(
+            json!({"type":"secret_input","secret_ref":"password","text":"synthetic-fixture"})
+        )
+        .is_err());
     }
 
     #[test]

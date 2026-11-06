@@ -1781,6 +1781,260 @@ fn page_value(fixture: &Fixture, expression: &str) -> Value {
     fixture.client().eval(expression).unwrap()["result"]["value"].clone()
 }
 
+fn secret_session(fixture: &Fixture) -> Session {
+    Session::new(
+        vec![Arc::new(BrowserBackend::new(fixture.port))],
+        Policy {
+            allow_input: true,
+            allow_secret_input: true,
+            secret_bindings: SecretBindings::new([(
+                "login".into(),
+                "browser-synthetic-private-输入".into(),
+            )])
+            .unwrap(),
+            ..Default::default()
+        },
+    )
+}
+
+fn input_secret(session: &Session, resource: &str, name: &str) -> Response {
+    let observed = observe(session, resource);
+    act(
+        session,
+        find(session, &observed, "textbox", name),
+        Action::SecretInput {
+            secret_ref: "login".into(),
+        },
+    )
+}
+
+fn capture_document(session: &Session, resource: &str) -> Response {
+    let observed = observe(session, resource);
+    call(
+        session,
+        Operation::Capture {
+            target: document(session, &observed),
+        },
+    )
+}
+
+#[test]
+#[ignore = "requires isolated Chromium with its sandbox enabled; CI runs it explicitly"]
+fn secret_input_revalidates_passwords_and_keeps_revealed_fields_redacted() {
+    let _serial = serial();
+    let fixture = Fixture::new();
+    let (denied, _) = session_for(&fixture);
+    let main = main_of(&denied, &fixture.page_id);
+    assert!(
+        wait_until(&denied, &main, "Protected", WaitCondition::Appears)
+            .error
+            .is_none()
+    );
+    let observed = observe(&denied, &main);
+    assert_eq!(node(&observed, "Protected")["capabilities"], json!([]));
+    assert_eq!(
+        input_secret(&denied, &main, "Protected").error.unwrap()["code"],
+        "POLICY.DENIED"
+    );
+    drop(denied);
+
+    let session = secret_session(&fixture);
+    let main = main_of(&session, &fixture.page_id);
+    assert_eq!(
+        page_value(
+            &fixture,
+            r#"(() => {
+        const field=document.getElementById('protected');
+        window.secretEffect={input:false,change:false};
+        for(const event of ['input','change']) field.addEventListener(event,()=>{
+            window.secretEffect[event]=field.value==='browser-synthetic-private-输入';
+        });
+        return field.value!=='browser-synthetic-private-输入';
+    })()"#
+        ),
+        true
+    );
+    let observed = observe(&session, &main);
+    let protected = node(&observed, "Protected");
+    assert_eq!(protected["capabilities"], json!(["secret_input"]));
+    assert!(protected["value"].is_null());
+    for action in [
+        Action::Fill {
+            value: "ordinary".into(),
+        },
+        Action::TypeText {
+            text: "ordinary".into(),
+            mode: None,
+        },
+        Action::Paste {
+            text: "ordinary".into(),
+        },
+        Action::Key {
+            keys: vec!["A".into()],
+        },
+    ] {
+        let observed = observe(&session, &main);
+        let result = act(
+            &session,
+            find(&session, &observed, "textbox", "Protected"),
+            action,
+        );
+        assert!(
+            result.error.is_some(),
+            "ordinary input must refuse a protected field"
+        );
+    }
+    let result = input_secret(&session, &main, "Protected");
+    assert!(result.error.is_none(), "{result:?}");
+    assert_eq!(
+        result.data.as_ref().unwrap()["backend_result"],
+        json!({"submitted":true,"redacted":true})
+    );
+    assert!(!serde_json::to_string(&result)
+        .unwrap()
+        .contains("browser-synthetic-private"));
+    assert_eq!(
+        page_value(
+            &fixture,
+            "window.secretEffect.input && window.secretEffect.change"
+        ),
+        true
+    );
+    assert_eq!(
+        capture_document(&session, &main).error.unwrap()["code"],
+        "CONTROL.ACTION_UNSUPPORTED"
+    );
+
+    // Showing a previously written field cannot turn it into a public value,
+    // an ordinary text-input target, or pixels in its parent's screenshot.
+    assert_eq!(
+        page_value(
+            &fixture,
+            "document.getElementById('protected').type='text'; true"
+        ),
+        true
+    );
+    let observed = observe(&session, &main);
+    let protected = node(&observed, "Protected");
+    assert_eq!(protected["states"]["protected"], true);
+    assert!(protected["value"].is_null());
+    assert_eq!(protected["capabilities"], json!([]));
+    assert!(!observed.to_string().contains("browser-synthetic-private"));
+    assert_eq!(
+        call(
+            &session,
+            Operation::Capture {
+                target: find(&session, &observed, "textbox", "Protected")
+            }
+        )
+        .error
+        .unwrap()["code"],
+        "CONTROL.ACTION_UNSUPPORTED"
+    );
+    assert_eq!(
+        capture_document(&session, &main).error.unwrap()["code"],
+        "CONTROL.ACTION_UNSUPPORTED"
+    );
+    assert!(input_secret(&session, &main, "Name").error.is_some());
+
+    // Each stale or no-longer-editable target must fail before changing it.
+    for mutation in [
+        "field.type='text'",
+        "field.readOnly=true",
+        "field.disabled=true",
+        "field.replaceWith(field.cloneNode(true))",
+    ] {
+        assert_eq!(page_value(&fixture, "{const field=document.getElementById('protected');field.type='password';field.readOnly=false;field.disabled=false;field.value='unchanged';} true"), true);
+        let observed = observe(&session, &main);
+        let target = find(&session, &observed, "textbox", "Protected");
+        assert_eq!(
+            page_value(
+                &fixture,
+                &format!("{{const field=document.getElementById('protected');{mutation};}} true")
+            ),
+            true
+        );
+        let result = act(
+            &session,
+            target,
+            Action::SecretInput {
+                secret_ref: "login".into(),
+            },
+        );
+        assert_eq!(
+            result.error.as_ref().unwrap()["code"],
+            "CONTROL.SECRET_INPUT_FAILED"
+        );
+        assert!(!serde_json::to_string(&result)
+            .unwrap()
+            .contains("browser-synthetic-private"));
+        assert_eq!(
+            page_value(
+                &fixture,
+                "document.getElementById('protected').value==='unchanged'"
+            ),
+            true
+        );
+    }
+    assert_eq!(
+        page_value(
+            &fixture,
+            "document.getElementById('protected').remove(); true"
+        ),
+        true
+    );
+    let captured = capture_document(&session, &main);
+    assert!(captured.error.is_none(), "{captured:?}");
+}
+
+#[test]
+#[ignore = "requires isolated Chromium with its sandbox enabled; CI runs it explicitly"]
+fn secret_child_fields_block_capture_only_while_they_remain_visible() {
+    let _serial = serial();
+    let fixture = Fixture::new();
+    let session = secret_session(&fixture);
+    let main = main_of(&session, &fixture.page_id);
+    let frame = frame_of(&session, |meta| {
+        meta["url"]
+            .as_str()
+            .is_some_and(|url| url.ends_with("/frame"))
+    });
+    let resource = frame["resource_id"].as_str().unwrap();
+    assert!(
+        wait_until(&session, resource, "FrameInput", WaitCondition::Appears)
+            .error
+            .is_none()
+    );
+    assert_eq!(page_value(&fixture, "document.querySelector('iframe').contentDocument.querySelector('input').type='password'; true"), true);
+    let result = input_secret(&session, resource, "FrameInput");
+    assert!(result.error.is_none(), "{result:?}");
+    assert_eq!(page_value(&fixture, "document.querySelector('iframe').contentDocument.querySelector('input').value==='browser-synthetic-private-输入'"), true);
+    assert_eq!(
+        capture_document(&session, &main).error.unwrap()["code"],
+        "CONTROL.ACTION_UNSUPPORTED"
+    );
+    assert_eq!(page_value(&fixture, "window.detachedSecret=document.querySelector('iframe').contentDocument.querySelector('input'); window.detachedSecret.type='text'; window.detachedSecret.remove(); true"), true);
+    let recovered = capture_document(&session, &main);
+    assert!(recovered.error.is_none(), "{recovered:?}");
+
+    // A temporary removal must not erase protection when the same field is
+    // reinserted, even after capture discarded and reattached its CDP client.
+    assert_eq!(page_value(&fixture, "document.querySelector('iframe').contentDocument.body.prepend(window.detachedSecret); true"), true);
+    let observed = observe(&session, resource);
+    assert!(node(&observed, "FrameInput")["value"].is_null());
+    assert_eq!(node(&observed, "FrameInput")["states"]["protected"], true);
+    assert_eq!(
+        capture_document(&session, &main).error.unwrap()["code"],
+        "CONTROL.ACTION_UNSUPPORTED"
+    );
+    assert_eq!(
+        page_value(&fixture, "document.querySelector('iframe').remove(); true"),
+        true
+    );
+    let recovered = capture_document(&session, &main);
+    assert!(recovered.error.is_none(), "{recovered:?}");
+}
+
 #[test]
 #[ignore = "requires isolated Chromium with its sandbox enabled; CI runs it explicitly"]
 fn pages_emulate_devices_list_storage_and_requests_and_clear_site_data() {
@@ -2509,7 +2763,7 @@ fn browser_actions_are_observed_document_bound_and_have_real_page_effects() {
         .find(|n| n["name"] == "Protected")
         .unwrap();
     assert!(protected["value"].is_null());
-    assert_eq!(protected["actions"], json!([]));
+    assert_eq!(protected["capabilities"], json!([]));
     assert_eq!(
         call(
             &session,

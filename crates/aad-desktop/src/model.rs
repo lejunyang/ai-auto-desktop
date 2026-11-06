@@ -76,7 +76,14 @@ impl States {
 }
 
 /// The actions that operate on a single element.
-pub const NODE_ACTIONS: &[&str] = &["focus", "invoke", "set_value", "type_text", "pointer_click"];
+pub const NODE_ACTIONS: &[&str] = &[
+    "focus",
+    "invoke",
+    "set_value",
+    "type_text",
+    "pointer_click",
+    "secret_input",
+];
 
 /// One element in a UI snapshot.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

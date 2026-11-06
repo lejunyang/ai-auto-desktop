@@ -29,6 +29,7 @@ impl Fixture {
             "set_value",
             "set_text",
             "type_text",
+            "secret_input",
         ] {
             actions.insert(action.into(), json!({"contract_major":1}));
         }
@@ -43,6 +44,95 @@ impl Fixture {
             calls: Mutex::new(Vec::new()),
             flavor,
         })
+    }
+}
+
+#[test]
+fn secret_input_uses_only_the_dedicated_hook_and_cannot_enter_workflows() {
+    for (name, flavor) in [
+        ("desktop.windows_uia", Flavor::Windows),
+        ("desktop.linux_atspi", Flavor::Linux),
+        ("desktop.macos_ax", Flavor::MacOS),
+    ] {
+        let provider = Fixture::new(name, flavor);
+        let backend = NativeBackend::new(provider.clone(), flavor);
+        let node = json!({"node_id":"n", "role":"edit", "states":{"protected":true}, "actions":["secret_input"]});
+        let snapshot = json!({"snapshot_id":"s", "revision":1, "nodes":[node]});
+        backend
+            .secret_input(
+                &snapshot,
+                &node,
+                "synthetic-fixture",
+                &Context::new(Duration::from_secs(1), true),
+            )
+            .unwrap();
+        {
+            let calls = provider.calls.lock().unwrap();
+            assert_eq!(calls[0].0, format!("{name}.secret_input@1"));
+            assert_eq!(
+                calls[0].1["target"],
+                json!({"snapshot_id":"s","revision":1,"node_id":"n"})
+            );
+            assert_eq!(calls[0].1["text"], "synthetic-fixture");
+        }
+        assert!(backend
+            .act(
+                &snapshot,
+                &node,
+                &Action::SecretInput {
+                    secret_ref: "password".into()
+                },
+                &Context::new(Duration::from_secs(1), true)
+            )
+            .is_err());
+        let workflow_provider = backend.provider();
+        assert!(!workflow_provider
+            .manifest()
+            .actions
+            .contains_key("secret_input"));
+        assert!(workflow_provider.manifest().raw["actions"]
+            .get("secret_input")
+            .is_none());
+        let uses = format!("{name}.secret_input@1");
+        assert_eq!(
+            workflow_provider
+                .invoke(&uses, json!({"text":"synthetic-fixture"}), None)
+                .unwrap_err()
+                .code,
+            "CONTROL.SECRET_WORKFLOW_DENIED"
+        );
+        assert_eq!(
+            workflow_provider
+                .invoke_with_artifacts(
+                    &uses,
+                    json!({"text":"synthetic-fixture"}),
+                    None,
+                    &aad_runtime::ArtifactStore::default()
+                )
+                .unwrap_err()
+                .code,
+            "CONTROL.SECRET_WORKFLOW_DENIED"
+        );
+        let mut registry = aad_runtime::ProviderRegistry::new();
+        registry.insert(workflow_provider.clone());
+        assert!(
+            registry.resolve(&uses).is_none(),
+            "handwritten workflow action must not resolve"
+        );
+        // Hosts may register raw providers explicitly; the Session boundary
+        // must apply the same filter as NativeBackend::provider().
+        let session =
+            Session::new(Vec::new(), Policy::default()).with_providers(vec![provider.clone()]);
+        let registered = &session.providers()[0];
+        assert!(!registered.manifest().actions.contains_key("secret_input"));
+        assert_eq!(
+            registered
+                .invoke(&uses, json!({"text":"synthetic-fixture"}), None)
+                .unwrap_err()
+                .code,
+            "CONTROL.SECRET_WORKFLOW_DENIED"
+        );
+        assert_eq!(provider.calls.lock().unwrap().len(), 1);
     }
 }
 

@@ -121,6 +121,21 @@ fn act(id: &str, title: Option<&str>, locator: Locator, action: Value) -> Step {
     }
 }
 
+#[test]
+fn saved_steps_and_compiled_workflows_refuse_secret_input() {
+    let step = act(
+        "password",
+        None,
+        Locator::default(),
+        json!({"type":"secret_input","secret_ref":"password"}),
+    );
+    assert_eq!(step.validate().unwrap_err().code, "STEP.INVALID");
+    assert_eq!(
+        steps::workflow("login", &[step]).unwrap_err().code,
+        "STEP.INVALID"
+    );
+}
+
 fn targets(session: &Session) -> Vec<Value> {
     let response = session.execute(&Request::new(
         Some(session.id().into()),

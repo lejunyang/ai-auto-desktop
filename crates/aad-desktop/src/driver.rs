@@ -34,6 +34,7 @@ pub const WRITE_ACTIONS: &[&str] = &[
     "invoke",
     "set_value",
     "type_text",
+    "secret_input",
     "pointer_click",
     "key_chord",
     "pointer_gesture",
@@ -142,7 +143,7 @@ impl UiaDriver {
             }
             "focus" | "invoke" | "set_value" | "type_text" | "pointer_click" | "key_chord"
             | "pointer_gesture" | "drag" | "minimize" | "maximize" | "restore" | "close_window"
-            | "activate" | "paste" => self.act(action, &args),
+            | "activate" | "paste" | "secret_input" => self.act(action, &args),
             "watch" => self.watch(&args),
             "collect" => self.collect(&args),
             "release" => self.release(&args),
@@ -511,6 +512,7 @@ impl UiaDriver {
             .ok_or_else(|| DriverError::invalid("target is required"))
             .and_then(|value| Target::from_value(value).map_err(DriverError::invalid))?;
         let (window_id, node) = self.resolve(&target)?;
+
         if node.states.protected == Some(true) {
             return Err(DriverError::new(
                 "DRIVER.PROTECTED_ELEMENT",
@@ -609,6 +611,15 @@ impl UiaDriver {
             .and_then(|value| Target::from_value(value).map_err(DriverError::invalid))?;
         let (window_id, node) = self.resolve(&target)?;
 
+        if node.states.protected == Some(true)
+            && matches!(action, "set_value" | "type_text" | "key_chord" | "paste")
+        {
+            return Err(DriverError::new(
+                "DRIVER.PROTECTED_ELEMENT",
+                "protected input requires the dedicated secret action",
+            ));
+        }
+
         // Refuse an action the element does not actually support, rather than
         // letting the backend fail in a less legible way.
         if !node.actions.iter().any(|name| name == action) {
@@ -621,6 +632,31 @@ impl UiaDriver {
         }
 
         match action {
+            "secret_input" => {
+                let text = args
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| DriverError::invalid("secret input requires text"))?;
+                if text.chars().count() > MAX_TYPE_TEXT_CHARS || text.contains(['\0', '\r', '\n']) {
+                    return Err(DriverError::invalid("invalid secret input"));
+                }
+                if node.states.protected != Some(true)
+                    || node.states.read_only == Some(true)
+                    || node.states.enabled == Some(false)
+                {
+                    return Err(DriverError::new(
+                        "DRIVER.PROTECTED_ELEMENT",
+                        "secret input requires an editable protected field",
+                    ));
+                }
+                self.backend
+                    .secret_input(&window_id, &node, text)
+                    .map_err(|error| {
+                        DriverError::new("DRIVER.SECRET_INPUT_FAILED", "secret input failed")
+                            .with_effect(&error.effect)
+                    })?;
+                return Ok(json!({"submitted":true,"redacted":true}));
+            }
             "focus" => self.backend.focus(&window_id, &node)?,
             "invoke" => self.backend.invoke(&window_id, &node)?,
             "pointer_click" => {
@@ -1267,6 +1303,15 @@ fn action_contracts() -> Map<String, Value> {
         ),
     );
     actions.insert(
+        "secret_input".into(),
+        write(
+            "Replace a protected field without clipboard or value read-back.",
+            "input",
+            "high",
+            "non_idempotent",
+        ),
+    );
+    actions.insert(
         "key_chord".into(),
         write(
             "Press a key combination on the focused element, e.g. Ctrl+C or F5.",
@@ -1463,6 +1508,17 @@ mod tests {
         fn set_value(&self, _window_id: &str, node: &Node, value: &str) -> Result<()> {
             self.record(&format!("set_value:{}:{value}", node.node_id));
             Ok(())
+        }
+
+        fn secret_input(&self, _window_id: &str, _node: &Node, text: &str) -> Result<()> {
+            self.record("secret_input");
+            if text == "fixture-error" {
+                Err(DriverError::new("DRIVER.ACTION_FAILED", text)
+                    .with_detail("echo", json!(text))
+                    .with_effect("unknown"))
+            } else {
+                Ok(())
+            }
         }
 
         fn type_text(&self, _window_id: &str, node: &Node, text: &str) -> Result<()> {
@@ -1913,6 +1969,70 @@ mod tests {
             .unwrap();
 
         assert_eq!(backend.performed(), vec!["set_value:n1:Ada".to_string()]);
+    }
+
+    #[test]
+    fn secret_replacement_revalidates_and_redacts_without_opening_ordinary_input() {
+        let mut field = node(
+            "n1",
+            "Edit",
+            "Password",
+            &[
+                "secret_input",
+                "set_value",
+                "type_text",
+                "paste",
+                "key_chord",
+            ],
+        );
+        field.states.protected = Some(true);
+        let (driver, backend) = driver(vec![field]);
+        let found = driver
+            .call(
+                "find",
+                &json!({"window_id":"w1","locator":{"name":"Password"}}),
+            )
+            .unwrap();
+        let target = target_of(&found);
+        for text in ["synthetic-fixture", ""] {
+            assert_eq!(
+                driver
+                    .call("secret_input", &json!({"target":target,"text":text}))
+                    .unwrap(),
+                json!({"submitted":true,"redacted":true})
+            );
+        }
+        let error = driver
+            .call(
+                "secret_input",
+                &json!({"target":target,"text":"fixture-error"}),
+            )
+            .unwrap_err();
+        assert_eq!(error.code, "DRIVER.SECRET_INPUT_FAILED");
+        assert_eq!(error.effect, "unknown");
+        assert!(!format!("{error:?}").contains("fixture-error"));
+        for action in ["set_value", "type_text", "paste", "key_chord"] {
+            assert_eq!(
+                driver
+                    .call(
+                        action,
+                        &json!({"target":target,"value":"fixture","text":"fixture","keys":["A"]})
+                    )
+                    .unwrap_err()
+                    .code,
+                "DRIVER.PROTECTED_ELEMENT"
+            );
+        }
+        for text in ["bad\n", "bad\0", "bad\r", &"a".repeat(1025)] {
+            assert!(driver
+                .call("secret_input", &json!({"target":target,"text":text}))
+                .is_err());
+        }
+        backend.set_verify(false);
+        assert!(driver
+            .call("secret_input", &json!({"target":target,"text":"fixture"}))
+            .is_err());
+        assert_eq!(backend.performed(), vec!["secret_input"; 3]);
     }
 
     #[test]

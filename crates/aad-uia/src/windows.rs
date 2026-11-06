@@ -21,8 +21,8 @@ use aad_windows::capture::{crop, extended_frame, intersect, print_window};
 use aad_windows::clipboard::Paste;
 use aad_windows::com::ensure as ensure_com;
 use aad_windows::input::{
-    button_events, deliver_atomically, deliver_pointer, deliver_scroll, mouse_event,
-    release_pressed_prefix, to_absolute, Chord, KeyTextSequence,
+    button_events, deliver_atomically, deliver_pointer, deliver_scroll, ensure_modifiers_released,
+    mouse_event, release_pressed_prefix, to_absolute, virtual_key_event, Chord, KeyTextSequence,
 };
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Sender};
@@ -128,7 +128,7 @@ use windows::Win32::UI::Input::Ime::ImmGetDefaultIMEWnd;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, GetKeyboardLayout, INPUT, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP,
     KEYEVENTF_UNICODE, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MOVE, VIRTUAL_KEY,
-    VK_CAPITAL, VK_CONTROL, VK_DELETE, VK_LWIN, VK_MENU,
+    VK_BACK, VK_CAPITAL, VK_CONTROL, VK_DELETE, VK_LWIN, VK_MENU,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     BringWindowToTop, DispatchMessageW, EnumWindows, GetAncestor, GetClassNameW,
@@ -499,6 +499,74 @@ impl Backend for WindowsUiaBackend {
             ));
         }
         Ok(())
+    }
+
+    fn secret_input(&self, window_id: &str, node: &Node, text: &str) -> Result<()> {
+        let element = self.require(window_id, node)?;
+        if !unsafe { element.CurrentIsPassword() }.is_ok_and(|value| value.as_bool())
+            || !unsafe { element.CurrentIsEnabled() }.is_ok_and(|value| value.as_bool())
+        {
+            return Err(DriverError::new(
+                "DRIVER.PROTECTED_ELEMENT",
+                "secret input requires an enabled protected field",
+            ));
+        }
+        if let Ok(pattern) =
+            unsafe { element.GetCurrentPatternAs::<IUIAutomationValuePattern>(UIA_ValuePatternId) }
+        {
+            if !unsafe { pattern.CurrentIsReadOnly() }.is_ok_and(|value| !value.as_bool()) {
+                return Err(DriverError::new(
+                    "DRIVER.PROTECTED_ELEMENT",
+                    "secret field is not editable",
+                ));
+            }
+            // Never read CurrentValue or attach the requested value to errors.
+            unsafe { pattern.SetValue(&BSTR::from(text)) }.map_err(|_| {
+                DriverError::new("DRIVER.SECRET_INPUT_FAILED", "secret input failed")
+                    .with_effect("unknown")
+            })?;
+            return Ok(());
+        }
+        if unsafe { element.CurrentControlType() }.ok() != Some(UIA_EditControlTypeId)
+            || !unsafe { element.CurrentIsKeyboardFocusable() }.is_ok_and(|value| value.as_bool())
+        {
+            return Err(DriverError::new(
+                "DRIVER.ACTION_UNSUPPORTED",
+                "protected field has no replacement input path",
+            ));
+        }
+        focus_for_keys(&self.automation, parse_window_id(window_id)?, &element)?;
+        ensure_modifiers_released(&["ctrl".into(), "shift".into(), "alt".into(), "meta".into()])?;
+        let mut inputs = Chord::parse(&["ctrl".into(), "a".into()])?.to_inputs();
+        // Deleting the selection also gives empty secret text replace semantics.
+        inputs.push(virtual_key_event(VK_BACK, false));
+        inputs.push(virtual_key_event(VK_BACK, true));
+        for unit in text.encode_utf16() {
+            for flags in [KEYEVENTF_UNICODE, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP] {
+                inputs.push(INPUT {
+                    r#type: INPUT_KEYBOARD,
+                    Anonymous: windows::Win32::UI::Input::KeyboardAndMouse::INPUT_0 {
+                        ki: KEYBDINPUT {
+                            wVk: VIRTUAL_KEY(0),
+                            wScan: unit,
+                            dwFlags: flags,
+                            time: 0,
+                            dwExtraInfo: 0,
+                        },
+                    },
+                });
+            }
+        }
+        deliver_atomically(&inputs, "secret input").map_err(|error| {
+            let sent = error
+                .details
+                .get("events_sent")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0) as usize;
+            release_pressed_prefix(&inputs, sent);
+            DriverError::new("DRIVER.SECRET_INPUT_FAILED", "secret input failed")
+                .with_effect(error.effect)
+        })
     }
 
     fn type_text(&self, window_id: &str, node: &Node, text: &str) -> Result<()> {
@@ -1065,12 +1133,16 @@ fn describe_element(
     // for a reason nobody would think to look for.
     let role = control_type_name(unsafe { element.CurrentControlType() }.unwrap_or_default());
 
-    let value =
+    let protected = flag(unsafe { element.CurrentIsPassword() });
+    let value = if protected == Some(true) {
+        None
+    } else {
         unsafe { element.GetCurrentPatternAs::<IUIAutomationValuePattern>(UIA_ValuePatternId) }
             .ok()
             .and_then(|pattern| unsafe { pattern.CurrentValue() }.ok())
             .map(|value| value.to_string())
-            .filter(|value| !value.is_empty());
+            .filter(|value| !value.is_empty())
+    };
 
     let read_only =
         unsafe { element.GetCurrentPatternAs::<IUIAutomationValuePattern>(UIA_ValuePatternId) }
@@ -1099,7 +1171,7 @@ fn describe_element(
         // Recorded so the absent value above is explained rather than looking
         // like a capture failure. UIA withholds a password field's text on its
         // own; this only reports that it did.
-        protected: flag(unsafe { element.CurrentIsPassword() }),
+        protected,
     };
 
     let mut actions = Vec::new();
@@ -1107,13 +1179,21 @@ fn describe_element(
         actions.push("focus".to_string());
         // A key combination goes to whatever holds focus, so anything focusable
         // can receive one -- the same gate as ocus itself.
-        actions.push("key_chord".to_string());
+        if states.protected != Some(true) {
+            actions.push("key_chord".to_string());
+        }
     }
     let has = |id| unsafe { element.GetCurrentPattern(id) }.is_ok();
     if has(UIA_InvokePatternId) || has(UIA_TogglePatternId) || has(UIA_LegacyIAccessiblePatternId) {
         actions.push("invoke".to_string());
     }
-    if has(UIA_ValuePatternId) && read_only != Some(true) {
+    if states.protected == Some(true)
+        && read_only != Some(true)
+        && (has(UIA_ValuePatternId) || (role == "edit" && states.focusable == Some(true)))
+    {
+        actions.push("secret_input".to_string());
+    }
+    if has(UIA_ValuePatternId) && read_only != Some(true) && states.protected != Some(true) {
         actions.push("set_value".to_string());
         actions.push("type_text".to_string());
         // Pasting passes the text through the clipboard: never a password's.

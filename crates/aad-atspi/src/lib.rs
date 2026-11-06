@@ -39,6 +39,7 @@ const WRITE_ACTIONS: &[&str] = &[
     "pointer_gesture",
     "restore",
     "set_text",
+    "secret_input",
     "toggle",
     "type_text",
 ];
@@ -179,6 +180,19 @@ pub trait AtspiBackend: Send + Sync {
         text: &str,
         deadline: Instant,
     ) -> Result<Value, AutomationError>;
+    /// Trusted server-bound replacement for a fresh protected editable element.
+    /// Implementations must neither use the clipboard nor expose text or its length.
+    fn secret_input(
+        &self,
+        _target: &NativeRef,
+        _text: &str,
+        _deadline: Instant,
+    ) -> Result<Value, AutomationError> {
+        Err(driver_error(
+            "DRIVER.ACTION_UNSUPPORTED",
+            "secret replacement is unavailable",
+        ))
+    }
     fn named_action(
         &self,
         target: &NativeRef,
@@ -541,6 +555,9 @@ impl AtspiProvider {
                     Ok(json!({"released": true}))
                 }
             }
+            "secret_input" => self
+                .secret_input(args, deadline)
+                .map_err(redact_secret_error),
             action if WRITE_ACTIONS.contains(&action) => self.write(action, args, deadline),
             _ => Err(invalid("unknown AT-SPI action")),
         }
@@ -991,6 +1008,35 @@ impl AtspiProvider {
         let (fresh_id, resolved, native) =
             Self::revalidate_target(args, &record, &fresh, deadline)?;
         Ok((fresh, fresh_id, resolved, native))
+    }
+
+    fn secret_input(
+        &self,
+        args: &Map<String, Value>,
+        deadline: Instant,
+    ) -> Result<Value, AutomationError> {
+        only_keys(args, &["target", "locator", "text"])?;
+        let text = secret_text(args.get("text"))?;
+        let observed = self.observed_record(args)?;
+        let (_, observed_node, _) = Self::revalidate_target(args, &observed, &observed, deadline)?;
+        check_secret_target(&observed_node)?;
+        let (fresh, fresh_id, node, native) = self.fresh_target(args, deadline)?;
+        check_secret_target(&node)?;
+        remaining(deadline, false)?;
+        let result = self.backend.secret_input(&native, text, deadline);
+        // The secret endpoint never exposes arbitrary native output, including
+        // errors, values, lengths or an echoed request from a broken toolkit.
+        if let Ok(mut state) = self.state.lock() {
+            if let Some(record) = state.current.as_mut() {
+                record.valid = false;
+            }
+        }
+        result?;
+        remaining(deadline, true)?;
+        Ok(json!({
+            "ok": true, "action": "secret_input", "resolved": target(&fresh, &fresh_id),
+            "backend_result": {"submitted": true, "redacted": true},
+        }))
     }
 
     fn write(
@@ -1668,6 +1714,55 @@ fn bounded_text(value: Option<&Value>, non_empty: bool) -> Result<&str, Automati
         return Err(invalid("text is outside the allowed range"));
     }
     Ok(value)
+}
+
+fn check_secret_target(node: &Value) -> Result<(), AutomationError> {
+    if node["states"]["protected"] != true
+        || node["states"]["editable"] != true
+        || node["states"]["enabled"] != true
+        || node["states"]["sensitive"] != true
+        || !node["actions"]
+            .as_array()
+            .is_some_and(|actions| actions.iter().any(|action| action == "secret_input"))
+    {
+        return Err(driver_error(
+            "DRIVER.ACTION_UNSUPPORTED",
+            "secret replacement requires an observed and fresh protected editable target",
+        ));
+    }
+    Ok(())
+}
+
+fn secret_text(value: Option<&Value>) -> Result<&str, AutomationError> {
+    value
+        .and_then(Value::as_str)
+        .filter(|text| text.chars().count() <= 1024 && !text.contains(['\0', '\r', '\n']))
+        .ok_or_else(|| invalid("secret replacement is outside the allowed range"))
+}
+
+fn redact_secret_error(error: AutomationError) -> AutomationError {
+    let code = match error.code.as_str() {
+        "DRIVER.INVALID_REQUEST"
+        | "DRIVER.STALE_SNAPSHOT"
+        | "DRIVER.SNAPSHOT_TRUNCATED"
+        | "DRIVER.NOT_FOUND"
+        | "DRIVER.AMBIGUOUS"
+        | "DRIVER.ACTION_UNSUPPORTED"
+        | "DRIVER.PROTECTED_ELEMENT"
+        | "DRIVER.TIMEOUT"
+        | "DRIVER.OUTPUT_TOO_LARGE"
+        | "DRIVER.UNKNOWN_EFFECT" => error.code.as_str(),
+        _ => "DRIVER.UNKNOWN_EFFECT",
+    };
+    driver_error(code, "secret replacement was not confirmed")
+        .with_effect(
+            if error.effect == "unknown" || code == "DRIVER.UNKNOWN_EFFECT" {
+                "unknown"
+            } else {
+                "not_applied"
+            },
+        )
+        .with_detail("redacted", json!(true))
 }
 
 fn ordinary_text(value: Option<&Value>) -> Result<&str, AutomationError> {
@@ -2502,6 +2597,14 @@ fn manifest_document() -> Value {
                 .remove("minLength");
         }
     }
+    actions.insert("secret_input".into(), contract(
+        "仅供服务器绑定 secret 的专用入口；重新验证 protected editable 后替换，不使用剪贴板，不返回值或长度。",
+        "contextual", "input", "high", &["desktop.observe", "desktop.input"],
+        json!({"type": "object", "required": ["target", "locator", "text"], "properties": {"target": target_schema(), "locator": locator_schema(), "text": {"type": "string", "maxLength": 1024}}, "additionalProperties": false}),
+        write_output(), true, true,
+    ));
+    actions["secret_input"]["sensitivity"] =
+        json!({"input": "sensitive", "output": "public", "error": "public"});
     actions.insert("pointer_click".into(), contract("重新验证目标后，仅在明确的 KDE/X11 会话中，通过固定路径 XTest helper 按目标 bounds 中心点显式执行左键单击。", "non_idempotent", "modify", "high", &["desktop.observe", "desktop.input"], json!({"type": "object", "required": ["target", "locator"], "properties": {"target": target_schema(), "locator": locator_schema(), "button": {"enum": ["left"]}, "position": {"enum": ["center"]}}, "additionalProperties": false}), write_output(), true, true));
     let point_input = |extra: Value, required: &[&str]| {
         let mut properties = json!({"target": target_schema(), "locator": locator_schema()});
@@ -2668,6 +2771,10 @@ mod tests {
         scope_context: bool,
         visibility_recovery: bool,
         refused_input: bool,
+        secret_protected: bool,
+        secret_editable: bool,
+        secret_loses_protection: bool,
+        secret_failure: bool,
         hit_chain: u8,
         /// Containers above the target, which is then `n{depth}`.
         depth: usize,
@@ -2704,7 +2811,15 @@ mod tests {
                     ("showing".into(), Some(true)),
                     ("focusable".into(), Some(true)),
                     ("sensitive".into(), Some(true)),
-                    ("protected".into(), Some(false)),
+                    (
+                        "protected".into(),
+                        Some(
+                            self.secret_protected
+                                && !(self.secret_loses_protection
+                                    && self.captures.load(Ordering::SeqCst) > 1),
+                        ),
+                    ),
+                    ("editable".into(), Some(self.secret_editable)),
                 ]),
                 bounds: Some(Bounds {
                     x: 10,
@@ -2721,6 +2836,9 @@ mod tests {
                     "key_chord".into(),
                     "minimize".into(),
                     "paste".into(),
+                    "secret_input".into(),
+                    "set_text".into(),
+                    "type_text".into(),
                 ],
                 provenance: Map::from_iter([
                     (
@@ -2859,6 +2977,23 @@ mod tests {
         ) -> Result<Value, AutomationError> {
             self.writes.fetch_add(1, Ordering::SeqCst);
             Ok(json!({"accepted": true}))
+        }
+        fn secret_input(
+            &self,
+            _target: &NativeRef,
+            text: &str,
+            _deadline: Instant,
+        ) -> Result<Value, AutomationError> {
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            if self.secret_failure {
+                return Err(
+                    driver_error("DRIVER.ACTION_FAILED", format!("toolkit echoed {text}"))
+                        .with_detail("value", json!(text))
+                        .with_detail("length", json!(text.len())),
+                );
+            }
+            // Deliberately hostile metadata verifies the provider never forwards it.
+            Ok(json!({"submitted": true, "value": text, "length": text.len()}))
         }
         fn set_text(
             &self,
@@ -3119,6 +3254,118 @@ mod tests {
 
     fn locator() -> Value {
         json!({"role": "push_button", "name": "Save", "attributes": {"automation-id": "save"}})
+    }
+
+    #[test]
+    fn secret_replacement_and_clear_redact_backend_output_and_reject_ordinary_input() {
+        let backend = Arc::new(FakeBackend {
+            secret_protected: true,
+            secret_editable: true,
+            ..Default::default()
+        });
+        let provider = AtspiProvider::new(backend.clone()).unwrap();
+        for text in ["test-secret-私密", ""] {
+            let observed = take_snapshot(&provider);
+            assert!(observed["nodes"][0]["value"].is_null());
+            for forbidden in ["set_text", "type_text", "paste", "key_chord"] {
+                assert!(!observed["nodes"][0]["actions"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|action| action == forbidden));
+            }
+            let args = json!({"target": {"snapshot_id": observed["snapshot_id"], "revision": observed["revision"], "node_id": "n0"}, "locator": locator(), "text": text});
+            let result = provider
+                .invoke(
+                    "desktop.linux_atspi.secret_input@1",
+                    args,
+                    Some(Duration::from_secs(2)),
+                )
+                .unwrap();
+            assert_eq!(
+                result["backend_result"],
+                json!({"submitted": true, "redacted": true})
+            );
+            assert!(!result.to_string().contains("test-secret"));
+            assert!(!result.to_string().contains("length"));
+        }
+        assert_eq!(backend.writes.load(Ordering::SeqCst), 2);
+        let observed = take_snapshot(&provider);
+        let args = json!({"target": {"snapshot_id": observed["snapshot_id"], "revision": observed["revision"], "node_id": "n0"}, "locator": locator(), "text": "ordinary"});
+        assert!(provider
+            .invoke(
+                "desktop.linux_atspi.set_text@1",
+                args,
+                Some(Duration::from_secs(2))
+            )
+            .is_err());
+        assert_eq!(backend.writes.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn secret_replacement_rechecks_protection_and_editability_and_sanitizes_errors() {
+        for (protected, editable, lost) in [
+            (false, true, false),
+            (true, false, false),
+            (true, true, true),
+        ] {
+            let backend = Arc::new(FakeBackend {
+                secret_protected: protected,
+                secret_editable: editable,
+                secret_loses_protection: lost,
+                ..Default::default()
+            });
+            let provider = AtspiProvider::new(backend.clone()).unwrap();
+            let observed = take_snapshot(&provider);
+            let args = json!({"target": {"snapshot_id": observed["snapshot_id"], "revision": observed["revision"], "node_id": "n0"}, "locator": locator(), "text": "never-dispatched"});
+            assert!(provider
+                .invoke(
+                    "desktop.linux_atspi.secret_input@1",
+                    args,
+                    Some(Duration::from_secs(2))
+                )
+                .is_err());
+            assert_eq!(backend.writes.load(Ordering::SeqCst), 0);
+            if !protected || !editable {
+                assert_eq!(
+                    backend.captures.load(Ordering::SeqCst),
+                    1,
+                    "unobserved protected/editable status must be refused before refresh"
+                );
+            }
+        }
+        let backend = Arc::new(FakeBackend {
+            secret_protected: true,
+            secret_editable: true,
+            secret_failure: true,
+            ..Default::default()
+        });
+        let provider = AtspiProvider::new(backend).unwrap();
+        let observed = take_snapshot(&provider);
+        let args = json!({"target": {"snapshot_id": observed["snapshot_id"], "revision": observed["revision"], "node_id": "n0"}, "locator": locator(), "text": "dont-echo-me"});
+        let error = provider
+            .invoke(
+                "desktop.linux_atspi.secret_input@1",
+                args,
+                Some(Duration::from_secs(2)),
+            )
+            .unwrap_err();
+        assert_eq!(error.code, "DRIVER.UNKNOWN_EFFECT");
+        assert_eq!(
+            error.details,
+            json!({"redacted": true}).as_object().unwrap().clone()
+        );
+        assert!(!format!("{error:?}").contains("dont-echo-me"));
+        assert!(!format!("{error:?}").contains("length"));
+        for text in [
+            "bad\nvalue".to_string(),
+            "bad\rvalue".into(),
+            "bad\0value".into(),
+            "a".repeat(1025),
+        ] {
+            assert!(secret_text(Some(&json!(text))).is_err());
+        }
+        assert_eq!(secret_text(Some(&json!(""))).unwrap(), "");
     }
 
     #[test]
