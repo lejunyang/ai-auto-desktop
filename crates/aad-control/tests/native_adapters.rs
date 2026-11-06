@@ -14,6 +14,15 @@ struct Fixture {
     flavor: Flavor,
 }
 impl Fixture {
+    fn with_cross_resource_drag(name: &str, flavor: Flavor) -> Arc<Self> {
+        let mut fixture = Self::new(name, flavor);
+        let fixture_mut = Arc::get_mut(&mut fixture).unwrap();
+        let mut raw = fixture_mut.manifest.raw.clone();
+        raw["actions"]["drag_between"] = json!({"contract_major":1});
+        fixture_mut.manifest = manifest::parse(&raw).unwrap();
+        fixture
+    }
+
     fn new(name: &str, flavor: Flavor) -> Arc<Self> {
         let mut actions = Map::new();
         for action in [
@@ -45,6 +54,142 @@ impl Fixture {
             flavor,
         })
     }
+}
+
+#[test]
+fn cross_resource_native_drag_keeps_each_snapshot_and_locator_independent() {
+    for (name, flavor) in [
+        ("desktop.windows_uia", Flavor::Windows),
+        ("desktop.linux_atspi", Flavor::Linux),
+        ("desktop.macos_ax", Flavor::MacOS),
+    ] {
+        let provider = Fixture::with_cross_resource_drag(name, flavor);
+        let backend = NativeBackend::new(provider.clone(), flavor);
+        assert!(backend.supports_cross_resource_drag());
+        // Node ids are only unique within a snapshot. Both applications may
+        // legitimately call their surface n1; neither end may borrow the
+        // other's revision, native identity or descriptive locator.
+        let source = json!({"node_id":"n1","role":"canvas","name":"Source","actions":["drag"],
+            "provenance":{"bus_name":":1.10","object_path":"/a/source"}});
+        let destination = json!({"node_id":"n1","role":"canvas","name":"Destination","actions":["drag"],
+            "provenance":{"bus_name":":1.20","object_path":"/a/destination"}});
+        let source_snapshot = json!({"snapshot_id":"source:9","revision":9,"nodes":[source]});
+        let destination_snapshot =
+            json!({"snapshot_id":"destination:17","revision":17,"nodes":[destination]});
+        let action = serde_json::from_value(json!({"type":"drag",
+            "to":{"session_id":"session","resource_id":"destination","observation_id":"o17","node_id":"n1"},
+            "fraction":{"fx":0.2,"fy":0.3},"to_fraction":{"fx":0.7,"fy":0.8},
+            "button":"right","modifiers":["ctrl"],"hold_ms":150})).unwrap();
+        backend
+            .drag_between(
+                DragEndpoint {
+                    snapshot: &source_snapshot,
+                    node: &source,
+                },
+                DragEndpoint {
+                    snapshot: &destination_snapshot,
+                    node: &destination,
+                },
+                &action,
+                &Context::new(Duration::from_secs(1), true),
+            )
+            .unwrap();
+        let calls = provider.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, format!("{name}.drag_between@1"));
+        let args = &calls[0].1;
+        assert_eq!(
+            args["target"],
+            json!({"snapshot_id":"source:9","revision":9,"node_id":"n1"})
+        );
+        assert_eq!(
+            args["to"],
+            json!({"snapshot_id":"destination:17","revision":17,"node_id":"n1"})
+        );
+        assert_eq!(args["fraction"], json!({"fx":0.2,"fy":0.3}));
+        assert_eq!(args["to_fraction"], json!({"fx":0.7,"fy":0.8}));
+        assert_eq!(args["button"], "right");
+        assert_eq!(args["modifiers"], json!(["ctrl"]));
+        assert_eq!(args["hold_ms"], 150);
+        if matches!(flavor, Flavor::Windows) {
+            assert!(args.get("locator").is_none());
+            assert!(args.get("to_locator").is_none());
+        } else {
+            assert_eq!(args["locator"]["name"], "Source");
+            assert_eq!(args["to_locator"]["name"], "Destination");
+            if matches!(flavor, Flavor::Linux) {
+                assert_eq!(args["locator"]["bus_name"], ":1.10");
+                assert_eq!(args["to_locator"]["bus_name"], ":1.20");
+                assert_eq!(args["locator"]["object_path"], "/a/source");
+                assert_eq!(args["to_locator"]["object_path"], "/a/destination");
+            }
+        }
+    }
+}
+
+#[test]
+fn native_cross_resource_drag_refuses_unsupported_invalid_or_cancelled_calls() {
+    let plain = Fixture::new("desktop.linux_atspi", Flavor::Linux);
+    let unsupported = NativeBackend::new(plain.clone(), Flavor::Linux);
+    assert!(!unsupported.supports_cross_resource_drag());
+    let provider = Fixture::with_cross_resource_drag("desktop.linux_atspi", Flavor::Linux);
+    let backend = NativeBackend::new(provider.clone(), Flavor::Linux);
+    let source = json!({"node_id":"n1","actions":["drag"]});
+    let destination = json!({"node_id":"n2","actions":["drag"]});
+    let source_snapshot = json!({"snapshot_id":"s","revision":1});
+    let destination_snapshot = json!({"snapshot_id":"d","revision":2});
+    let original = json!({"type":"drag","to":{"session_id":"s","resource_id":"d","observation_id":"o2","node_id":"n2"}});
+    let call = |backend: &NativeBackend, value: Value, destination: &Value, context: &Context| {
+        backend
+            .drag_between(
+                DragEndpoint {
+                    snapshot: &source_snapshot,
+                    node: &source,
+                },
+                DragEndpoint {
+                    snapshot: &destination_snapshot,
+                    node: destination,
+                },
+                &serde_json::from_value(value).unwrap(),
+                context,
+            )
+            .unwrap_err()
+            .code
+    };
+    let context = Context::new(Duration::from_secs(1), true);
+    assert_eq!(
+        call(&unsupported, original.clone(), &destination, &context),
+        "CONTROL.ACTION_UNSUPPORTED"
+    );
+    assert_eq!(
+        call(&backend, json!({"type":"focus"}), &destination, &context),
+        "CONTROL.INVALID_REQUEST"
+    );
+    let mut changed = original.clone();
+    changed["to"]["node_id"] = json!("other");
+    assert_eq!(
+        call(&backend, changed, &destination, &context),
+        "CONTROL.STALE_TARGET"
+    );
+    let mut changed = original.clone();
+    changed["path"] = json!([{"target":original["to"],"fraction":{"fx":0.5,"fy":0.5}}]);
+    assert_eq!(
+        call(&backend, changed, &destination, &context),
+        "CONTROL.INVALID_REQUEST"
+    );
+    let mut read_only = destination.clone();
+    read_only["actions"] = json!([]);
+    assert_eq!(
+        call(&backend, original.clone(), &read_only, &context),
+        "CONTROL.ACTION_UNSUPPORTED"
+    );
+    context.cancel();
+    assert_eq!(
+        call(&backend, original, &destination, &context),
+        "CONTROL.CANCELLED"
+    );
+    assert!(provider.calls.lock().unwrap().is_empty());
+    assert!(plain.calls.lock().unwrap().is_empty());
 }
 
 #[test]

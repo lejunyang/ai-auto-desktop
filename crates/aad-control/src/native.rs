@@ -424,6 +424,81 @@ impl Backend for NativeBackend {
             .map(|name| name.to_string())
             .collect()
     }
+    fn supports_cross_resource_drag(&self) -> bool {
+        // Advertising this private operation promises independent snapshot
+        // retention and fresh validation of both native endpoints. Ordinary
+        // single-snapshot `drag` does not make that promise.
+        self.offers("drag_between")
+    }
+    fn drag_between(
+        &self,
+        source: crate::DragEndpoint<'_>,
+        destination: crate::DragEndpoint<'_>,
+        action: &Action,
+        context: &crate::Context,
+    ) -> Result<Value> {
+        if !self.supports_cross_resource_drag() {
+            return Err(error(
+                "CONTROL.ACTION_UNSUPPORTED",
+                "this native provider cannot drag between resources",
+            ));
+        }
+        let Action::Drag {
+            to,
+            button,
+            fraction: from_at,
+            to_fraction,
+            modifiers,
+            hold_ms,
+            path,
+        } = action
+        else {
+            return Err(error("CONTROL.INVALID_REQUEST", "expected a drag action"));
+        };
+        if !path.is_empty() {
+            return Err(error(
+                "CONTROL.INVALID_REQUEST",
+                "a drag path must stay on one observed surface",
+            ));
+        }
+        if destination.node["node_id"] != to.node_id {
+            return Err(error(
+                "CONTROL.STALE_TARGET",
+                "drag destination does not match the observed endpoint",
+            ));
+        }
+        for endpoint in [&source, &destination] {
+            if !self
+                .node_capabilities(endpoint.node)
+                .iter()
+                .any(|name| name == "drag")
+            {
+                return Err(error(
+                    "CONTROL.ACTION_UNSUPPORTED",
+                    "both observed endpoints must support native drag",
+                ));
+            }
+        }
+        let mut args = self.read_args(source.snapshot, source.node);
+        args["to"] = Self::target_of(destination.snapshot, &destination.node["node_id"]);
+        if self.portable() {
+            args["to_locator"] = self.locator_of(destination.node);
+        }
+        for (key, value) in [
+            ("button", json!(button)),
+            ("fraction", fraction(from_at)),
+            ("to_fraction", fraction(to_fraction)),
+            ("hold_ms", json!(hold_ms)),
+        ] {
+            if !value.is_null() {
+                args[key] = value;
+            }
+        }
+        if !modifiers.is_empty() {
+            args["modifiers"] = json!(modifiers);
+        }
+        self.invoke_controlled("drag_between", args, context)
+    }
     fn resources(&self, timeout: Duration) -> Result<Vec<BackendResource>> {
         let (action, collection) = match self.flavor {
             Flavor::Windows => ("list_windows", "windows"),
