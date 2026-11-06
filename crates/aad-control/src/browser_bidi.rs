@@ -22,6 +22,11 @@ const ACTIONS: &[&str] = &[
     "type_text",
     "select",
     "check",
+    "navigate",
+    "reload",
+    "open_tab",
+    "activate_page",
+    "close_page",
 ];
 const MAX_FRAMES: usize = 256;
 
@@ -417,6 +422,79 @@ impl FirefoxBackend {
             )
             .is_ok()
     }
+    fn navigate(
+        &self,
+        client: &mut Client,
+        id: &str,
+        url: &str,
+        request: &Request<'_>,
+    ) -> Result<Value> {
+        let url = self.access.navigation_url(url)?;
+        request.commit()?;
+        request.command(
+            client,
+            "browsingContext.navigate",
+            json!({"context":id,"url":url,"wait":"interactive"}),
+        )?;
+        // A redirect can leave the requested grant. Do not read the destination
+        // DOM or claim success under the source URL's authorization.
+        let current = self.authorized(&frames(client, request)?, id)?;
+        Ok(
+            json!({"submitted":true,"native_operation":"WebDriver BiDi browsingContext.navigate","page_id":id,"url":current.url}),
+        )
+    }
+    fn open_tab(
+        &self,
+        client: &mut Client,
+        snapshot: &Value,
+        args: &Value,
+        url: &str,
+        request: &Request<'_>,
+    ) -> Result<Value> {
+        let url = self.access.navigation_url(url)?;
+        let (source, _) = self.input_check(client, snapshot, args, request)?;
+        request.commit()?;
+        let created = request.command(
+            client,
+            "browsingContext.create",
+            json!({"type":"tab","referenceContext":source,"background":false}),
+        )?;
+        let id = created["context"].as_str().ok_or_else(unsupported)?;
+        let result = (|| {
+            // Creating a tab and navigating it are separate BiDi commands.
+            // Recheck the observed source and observe/fresh-check the new blank
+            // document before the second write, rather than trusting its ID.
+            self.input_check(client, snapshot, args, request)?;
+            let frame = self.authorized(&frames(client, request)?, id)?;
+            if frame.parent.is_some() || frame.url != "about:blank" {
+                return Err(error(
+                    "CONTROL.STALE_TARGET",
+                    "Firefox new tab changed before navigation",
+                ));
+            }
+            let realm = self.realm(client, &frame, request)?;
+            let observation = uuid::Uuid::new_v4().to_string();
+            let mut blank = request.value(
+                client,
+                &realm,
+                &format!(
+                    "globalThis.__aadControlV1.observe({}, 1)",
+                    json!(observation)
+                ),
+            )?;
+            let body = blank["nodes"]
+                .as_array()
+                .and_then(|nodes| nodes.iter().find(|node| node["tag"] == "body"))
+                .ok_or_else(unsupported)?;
+            let blank_args = json!({"document_token":blank["document_token"],"observation":observation,"node_id":body["node_id"],"action":"navigate"});
+            blank["metadata"] = json!({"context":id,"realm":realm,"parent":null,"main_frame":true});
+            self.input_check(client, &blank, &blank_args, request)?;
+            self.navigate(client, id, &url, request)
+        })();
+        // Never close a tab whose document may have changed while handling an
+        // error. Expose the created identity so the caller can observe/close it.
+        result.map_err(|e| e.with_detail("created_page_id", json!(id)))
+    }
 }
 
 impl Backend for FirefoxBackend {
@@ -560,6 +638,9 @@ impl Backend for FirefoxBackend {
         context: &Context,
     ) -> Result<Value> {
         validate_action(action)?;
+        if let Action::Navigate { url } | Action::OpenTab { url } = action {
+            self.access.navigation_url(url)?;
+        }
         let request = Request {
             deadline: Instant::now() + context.remaining()?,
             action: Some(context),
@@ -574,6 +655,39 @@ impl Backend for FirefoxBackend {
         let mut args = json!({"document_token":snapshot["document_token"],"observation":snapshot["snapshot_id"],"node_id":node["node_id"],"action":action_name});
         let (id, realm) = self.input_check(client, snapshot, &args, &request)?;
         match action {
+            Action::Navigate { url } => self.navigate(client, &id, url, &request),
+            Action::OpenTab { url } => self.open_tab(client, snapshot, &args, url, &request),
+            Action::Reload {} => {
+                request.commit()?;
+                request.command(
+                    client,
+                    "browsingContext.reload",
+                    json!({"context":id,"wait":"interactive"}),
+                )?;
+                let current = self.authorized(&frames(client, &request)?, &id)?;
+                Ok(
+                    json!({"submitted":true,"native_operation":"WebDriver BiDi browsingContext.reload","page_id":id,"url":current.url}),
+                )
+            }
+            Action::ActivatePage {} | Action::ClosePage {} => {
+                let method = if matches!(action, Action::ActivatePage {}) {
+                    "browsingContext.activate"
+                } else {
+                    "browsingContext.close"
+                };
+                request.commit()?;
+                // Do not set promptUnload=false to bypass a page's beforeunload
+                // protection; unsupported prompts remain explicit failures.
+                let params = if matches!(action, Action::ClosePage {}) {
+                    json!({"context":id,"promptUnload":true})
+                } else {
+                    json!({"context":id})
+                };
+                request.command(client, method, params)?;
+                Ok(
+                    json!({"submitted":true,"native_operation":format!("WebDriver BiDi {method}"),"page_id":id}),
+                )
+            }
             Action::Focus {}
             | Action::Fill { .. }
             | Action::Invoke {}
@@ -820,7 +934,12 @@ fn validate_action(action: &Action) -> Result<()> {
         | Action::Invoke {}
         | Action::Select { .. }
         | Action::Check { .. }
-        | Action::Scroll { .. } => Ok(()),
+        | Action::Scroll { .. }
+        | Action::Navigate { .. }
+        | Action::Reload {}
+        | Action::OpenTab { .. }
+        | Action::ActivatePage {}
+        | Action::ClosePage {} => Ok(()),
         Action::Click {
             modifiers,
             hold_ms,
