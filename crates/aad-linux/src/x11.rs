@@ -20,7 +20,7 @@ use x11rb::protocol::damage::{ConnectionExt as _, ReportLevel};
 use x11rb::protocol::randr::ConnectionExt as _;
 use x11rb::protocol::xfixes::ConnectionExt as _;
 use x11rb::protocol::xproto::{
-    Atom, AtomEnum, ConnectionExt as _, CreateWindowAux, ImageFormat, Window, WindowClass,
+    Atom, AtomEnum, ConnectionExt as _, CreateWindowAux, ImageFormat, Mapping, Window, WindowClass,
 };
 use x11rb::protocol::xtest::ConnectionExt as _;
 use x11rb::protocol::Event;
@@ -633,9 +633,34 @@ impl X11 {
             .map_err(|e| failed("keyboard")(&e))?;
         self.flush()?;
         self.spare_keys[index].keysym = keysym;
-        // Clients read the new map when they see the mapping change.
-        std::thread::sleep(Duration::from_millis(20));
+        self.await_mapping_notify(code);
         Ok(code)
+    }
+
+    /// Wait until the server has announced a changed key. On a busy server
+    /// the announcement can reach clients after a key event sent 20 ms after
+    /// the change, and a client then reads that press with the old, empty
+    /// map. It goes to every client at once, so ours arriving means theirs
+    /// is on its way ahead of the press; then a moment for them to read it.
+    fn await_mapping_notify(&mut self, code: u8) {
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while Instant::now() < deadline {
+            match self.conn.poll_for_event() {
+                Ok(Some(Event::MappingNotify(notify)))
+                    if notify.request == Mapping::KEYBOARD
+                        && (u16::from(notify.first_keycode)
+                            ..u16::from(notify.first_keycode) + u16::from(notify.count))
+                            .contains(&u16::from(code)) =>
+                {
+                    break
+                }
+                // Nothing else here needs events (capture fetches damage).
+                Ok(Some(_)) => {}
+                Ok(None) => std::thread::sleep(Duration::from_millis(2)),
+                Err(_) => break,
+            }
+        }
+        std::thread::sleep(Duration::from_millis(20));
     }
 
     pub fn key(&mut self, key: keys::Key, down: bool) -> Result<()> {
