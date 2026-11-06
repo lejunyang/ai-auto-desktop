@@ -49,6 +49,13 @@ selection 协议访问（见下文）。观察前通过无输入的 `describe` �
 明确发生在派发前的拒绝保留 `not_applied`；首次输入/指针事件后的不确定失败按 `DRIVER.UNKNOWN_EFFECT` 处理；
 成功仍须 fresh snapshot 验证。截图不会自动触发 OCR。
 
+键盘输入额外要求 helper 声明 `window-focus`。后端从同一 fresh snapshot 的结构父链取得顶层
+窗口，在派发前复核 AT-SPI bounds，并由 helper 找到同 PID、几何匹配的唯一 X11 client。
+`type_text`、`key_chord`、`paste` 和带修饰键的指针动作向 helper 传入内部窗口绑定；实际焦点
+必须属于该 client 或其子窗口。另一个同 PID 窗口、窗口移动或失焦都不能沿用原证明。
+这项证明不使用“该进程只有一个窗口”的几何降级；持键过程中继续复核并释放自己按下的键。
+旧 helper 不提供相应键盘动作，普通 AT-SPI 语义调用及其已声明的纯指针功能仍可用。
+
 ## 截图、OCR、窗口、粘贴、剪贴板与全局快捷键
 
 与 Windows 同一组会话操作与授权（`--allow-input`、`--allow-clipboard-read`、
@@ -82,6 +89,12 @@ plugins/linux_atspi/build_x11_capture_helper.sh
 不能用于操作、find、截图或扩大 scope。切换应用和关闭后端时退出监听。
 尚未开始观察前就已打开、且之后没有发焦点事件的编辑框不保证发现。
 本机 Dolphin 已完成 F2→发现编辑框→中文重命名→磁盘回读；虚拟 table 的不完整父链仍拒绝 scope。
+
+`tests/linux/verify-window-focus.ps1` 在本机运行两个同 PID Qt 窗口，刻意模拟过期的 AX Focused
+位与无效果的 focus 动作；错误窗口的操作被拒绝，两个实际事件计数均为零。正确聚焦或激活后，
+对应窗口独立回报一次按下、一次释放。`verify-x11-window-focus.ps1` 在私有 Xvfb 复现旧
+PID-only 判定的缺口，并验证新窗口绑定、子窗口焦点、长按途中同 PID 焦点切换和窗口移动后的释放。
+这些测试不证明此前 VS Code 实验每一次输入的实际落点；Electron 编辑保存仍需独立验收。
 
 CI 在私有 Xvfb、session bus 和 AT-SPI bus 中编译 Qt5 C++ fixture，并使用正式 Rust provider
 验证应用枚举、snapshot/find、set_text、XTest Unicode 输入、中心点点击和目标截图：
