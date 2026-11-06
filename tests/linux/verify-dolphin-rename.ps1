@@ -2,7 +2,8 @@ param(
     [Parameter(Mandatory = $true)][string]$Aad,
     [Parameter(Mandatory = $true)][string]$InputHelper,
     [string]$Dolphin = '/usr/bin/dolphin',
-    [string]$OutputDirectory = ''
+    [string]$OutputDirectory = '',
+    [switch]$UnicodeWindowTitle
 )
 
 # Run alone on an authorized interactive X11 desktop. All mutations are confined
@@ -13,7 +14,8 @@ if (-not $OutputDirectory) {
 }
 New-Item -ItemType Directory -Path $OutputDirectory -Force | Out-Null
 $OutputDirectory = (Resolve-Path $OutputDirectory).Path
-$folder = Join-Path $OutputDirectory ('rename-fixture-' + [guid]::NewGuid().ToString('N'))
+$prefix = if ($UnicodeWindowTitle) { 'rename-' + [char]0x4e2d + [char]0x6587 } else { 'rename-fixture' }
+$folder = Join-Path $OutputDirectory ($prefix + '-' + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $folder | Out-Null
 $contents = "Synthetic AAD focus recovery fixture`n"
 [IO.File]::WriteAllText((Join-Path $folder 'first.txt'), $contents)
