@@ -5,7 +5,35 @@
   const visible=el=>el.isConnected && el.ownerDocument===document &&
     el.getClientRects().length>0 && getComputedStyle(el).visibility!=='hidden';
   const overlaps=(a,b)=>a.left<b.right&&a.right>b.left&&a.top<b.bottom&&a.bottom>b.top;
+  // Navigation.entries is the contiguous, same-origin segment around the
+  // current entry, not a filtered list that skips intervening foreign origins.
+  // Read only browser-owned identity/URLs; never import application state.
+  const historyTarget=delta=>{
+    const nav=globalThis.navigation,current=nav?.currentEntry;
+    if(!current || !Number.isInteger(current.index) || current.index<0)return null;
+    const entries=nav.entries();if(entries.length>4096)return null;
+    const target=entries[current.index+delta];
+    if(!target?.url || !current.url || !/^https?:$/.test(location.protocol))return null;
+    if(new URL(target.url).origin!==location.origin)return null;
+    const identity=entry=>({id:entry.id,key:entry.key,url:entry.url});
+    return {source:identity(current),destination:identity(target)};
+  };
   globalThis.__aadBidiV1={
+    history_targets: ()=>({back:historyTarget(-1),forward:historyTarget(1)}),
+    history: (args,expected)=>{
+      const confirmed=globalThis.__aadControlV1.confirm(args);if(confirmed.error)return confirmed;
+      const current=historyTarget(args.action==='back'?-1:1);
+      if(!current)return {error:'CONTROL.ACTION_UNSUPPORTED'};
+      if(['source','destination'].some(which=>['id','key','url'].some(field=>current[which][field]!==expected?.[which]?.[field])))
+        return {error:'CONTROL.STALE_TARGET'};
+      // The key is pinned after URL authorization, and its id/URL is compared
+      // in the same JS turn as traversal. Do not issue an unchecked delta.
+      globalThis.__aadBidiHistoryFailed=false;
+      const result=navigation.traverseTo(current.destination.key);
+      result.committed.catch(()=>{globalThis.__aadBidiHistoryFailed=true});
+      result.finished.catch(()=>{});
+      return {submitted:true};
+    },
     point: args=>{
       const point=globalThis.__aadControlV1.point(args);if(point.error)return point;
       const el=globalThis.__aadControlV1.scope_element(args);if(!el)return {error:'CONTROL.STALE_TARGET'};

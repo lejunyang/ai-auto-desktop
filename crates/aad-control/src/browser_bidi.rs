@@ -23,6 +23,8 @@ const ACTIONS: &[&str] = &[
     "select",
     "check",
     "navigate",
+    "back",
+    "forward",
     "reload",
     "open_tab",
     "activate_page",
@@ -365,6 +367,7 @@ impl FirefoxBackend {
             )
         };
         let mut result = request.value(client, &realm, &expression)?;
+        let history = request.value(client, &realm, "globalThis.__aadBidiV1.history_targets()")?;
         for node in result["nodes"].as_array_mut().into_iter().flatten() {
             let protected = node["states"]["protected"] == true;
             if protected {
@@ -372,7 +375,14 @@ impl FirefoxBackend {
                 node["value"] = Value::Null;
             }
             if let Some(actions) = node["actions"].as_array_mut() {
-                actions.retain(|a| frame.parent.is_none() && ACTIONS.iter().any(|name| a == name));
+                actions.retain(|a| {
+                    frame.parent.is_none()
+                        && ACTIONS.iter().any(|name| a == name)
+                        && (!matches!(a.as_str(), Some("back" | "forward"))
+                            || history[a.as_str().unwrap()]["destination"]["url"]
+                                .as_str()
+                                .is_some_and(|url| self.access.check_document(url).is_ok()))
+                });
                 if actions.iter().any(|a| a == "click") {
                     actions.push(json!("invoke"));
                 }
@@ -442,6 +452,55 @@ impl FirefoxBackend {
         Ok(
             json!({"submitted":true,"native_operation":"WebDriver BiDi browsingContext.navigate","page_id":id,"url":current.url}),
         )
+    }
+    fn history(
+        &self,
+        client: &mut Client,
+        snapshot: &Value,
+        args: &Value,
+        request: &Request<'_>,
+    ) -> Result<Value> {
+        let (id, realm) = self.input_check(client, snapshot, args, request)?;
+        let targets = request.value(client, &realm, "globalThis.__aadBidiV1.history_targets()")?;
+        let target = &targets[args["action"].as_str().ok_or_else(unsupported)?];
+        let url = target["destination"]["url"]
+            .as_str()
+            .ok_or_else(unsupported)?;
+        let entry = target["destination"]["id"]
+            .as_str()
+            .ok_or_else(unsupported)?;
+        self.access.check_document(url)?;
+        self.input_check(client, snapshot, args, request)?;
+        request.commit()?;
+        request.value(
+            client,
+            &realm,
+            &format!("globalThis.__aadBidiV1.history({args},{target})"),
+        )?;
+        loop {
+            self.authorized(&frames(client, request)?, &id)?;
+            // Traversal can replace the realm. Read only browser-owned history
+            // identity from the current context until the authorized key lands.
+            let current=request.script(client,json!({"context":id,"sandbox":self.world}),
+                "JSON.stringify({id:globalThis.navigation?.currentEntry?.id,failed:globalThis.__aadBidiHistoryFailed===true})")?;
+            let current: Value =
+                serde_json::from_str(current["result"]["value"].as_str().unwrap_or("null"))
+                    .map_err(|_| unsupported())?;
+            if current["failed"] == true {
+                return Err(error(
+                    "BROWSER.NAVIGATION_FAILED",
+                    "Firefox history traversal did not commit",
+                ));
+            }
+            if current["id"] == entry {
+                let current = self.authorized(&frames(client, request)?, &id)?;
+                return Ok(
+                    json!({"submitted":true,"native_operation":"DOM Navigation.traverseTo","page_id":id,"url":current.url}),
+                );
+            }
+            request.remaining()?;
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
     fn open_tab(
         &self,
@@ -655,6 +714,7 @@ impl Backend for FirefoxBackend {
         let mut args = json!({"document_token":snapshot["document_token"],"observation":snapshot["snapshot_id"],"node_id":node["node_id"],"action":action_name});
         let (id, realm) = self.input_check(client, snapshot, &args, &request)?;
         match action {
+            Action::Back {} | Action::Forward {} => self.history(client, snapshot, &args, &request),
             Action::Navigate { url } => self.navigate(client, &id, url, &request),
             Action::OpenTab { url } => self.open_tab(client, snapshot, &args, url, &request),
             Action::Reload {} => {
@@ -936,6 +996,8 @@ fn validate_action(action: &Action) -> Result<()> {
         | Action::Check { .. }
         | Action::Scroll { .. }
         | Action::Navigate { .. }
+        | Action::Back {}
+        | Action::Forward {}
         | Action::Reload {}
         | Action::OpenTab { .. }
         | Action::ActivatePage {}
