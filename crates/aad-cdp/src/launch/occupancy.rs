@@ -244,18 +244,16 @@ pub(super) fn ensure_available_guarded(
                 std::fs::remove_file(path.join("SingletonLock"))?;
             }
         }
-        // An existing AAD recorder will observe the browser exit and release
-        // its lease. Never delete someone else's live recorder lock ourselves.
+        // Give the owning recorder time to finish. The OS releases its guard
+        // even after a crash; file existence alone does not establish ownership.
         for _ in 0..50 {
-            if !path.join(".aad-recording.lock").exists() {
+            if super::lease::check(&path).is_ok() {
                 break;
             }
             std::thread::sleep(Duration::from_millis(100));
         }
     }
-    if path.join(".aad-recording.lock").exists() {
-        return Err("profile has an AAD recording lease; stop its recorder first, or use --kill-browser while its browser is running. A stale lease requires manual cleanup after checking the process".into());
-    }
+    super::lease::check(&path)?;
     #[cfg(unix)]
     if std::fs::symlink_metadata(path.join("SingletonLock")).is_ok() {
         return Err("profile has a browser lock but its owner cannot be verified; close it manually. --kill-browser never kills an unverified process".into());
