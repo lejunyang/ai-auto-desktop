@@ -12,7 +12,7 @@
 | `desktop.linux_atspi` | focus, invoke, click, fill, type_text, key, scroll, hover, drag, paste, minimize, maximize, restore, close_window, activate | AT-SPI；指针/键盘经 X11 XTest helper，本机 KDE/X11 已验收，GNOME/XFCE X11 待真机验收，Wayland 输入尚未实现；派发前核对焦点、PID 与落点，drag 起止两点都核对；窗口动作只在顶层窗口节点上、需要 EWMH 窗口管理器。另有只读 capture / read_text（Tesseract），以及需单独授权的 launch、clipboard_read、global_key（见下文“其他平台”） |
 | `desktop.macos_ax` | focus, invoke, click, fill, type_text, key, scroll, hover, drag, paste, minimize, maximize, restore, close_window, activate | AX helper；需要同一登录用户的辅助功能权限；指针动作要求目标应用在前台并经 AX 命中检查，事件只投递给目标进程；key 名称按字面（`ctrl` 是 Control，`cmd` 是 Command）；窗口动作只在 AXWindow 节点上，maximize 即全屏。另有 capture（需屏幕录制权限）、read_text、launch、clipboard_read、global_key。[待验证] 全部新增项需 macOS 真机 |
 | `browser.cdp` | focus, click, fill, type_text, key, scroll, hover, drag, select, check, navigate, back, forward, reload, open_tab, activate_page, close_page, accept, dismiss, upload, emulate, clear_site_data | 普通 click 为 `HTMLElement.click()` 的 DOM 激活；带 button/count/fraction 的 click、scroll、hover、drag 为可信 CDP Input（任何 frame，含跨进程 OOPIF），落点先在页面里命中检查；fill/select 为 DOM 值及 input/change 事件；check 已是目标状态时不点击；type_text/key 为发给焦点元素的可信 CDP 键盘输入；navigate/back/forward/reload、标签页动作 open_tab/activate_page/close_page 以及 emulate/clear_site_data 在 body 节点上，只限主 frame；accept/dismiss 只在 JavaScript 对话框节点上；upload 只在文件框上，路径受 `--allow-upload-dir` 限制 |
-| `browser.firefox_bidi` | focus, invoke, fill, click, hover, scroll, key, type_text, select, check, navigate, reload, open_tab, activate_page, close_page | Firefox WebDriver BiDi；主文档写操作，子 frame 只读；click/hover/scroll/key/keys 文本使用可信输入，invoke/fill/check/select 使用 DOM 语义。支持安全局部 capture 和锚定 body 的导航/标签页操作；双击、长按、指针修饰键、历史等尚未实现，参数范围见下文 Firefox 专节 |
+| `browser.firefox_bidi` | focus, invoke, fill, click, hover, scroll, key, type_text, select, check, navigate, back, forward, reload, open_tab, activate_page, close_page | Firefox WebDriver BiDi；主文档写操作，子 frame 只读；click/hover/scroll/key/keys 文本使用可信输入，invoke/fill/check/select 使用 DOM 语义。支持安全局部 capture 和锚定 body 的导航/标签页操作；历史只支持可证明目标的连续同源 HTTP(S) 片段。双击、长按、指针修饰键尚未实现，参数范围见下文 Firefox 专节 |
 
 以 `capabilities` 和观察节点的 `capabilities` 为准。可列出 provider 不表示当前 OS 已授予
 桌面权限。启动失败或不可用原因在 `unavailable` 中返回。
@@ -229,18 +229,26 @@ BiDi 新建标签页与导航是两条命令：创建后再次校验源文档，
 后端不会在错误处理时盲目关闭可能已变化的页面。close_page 请求 `promptUnload: true`；
 实际 beforeunload 提示交互 **[待验收]**，当前尚未提供 Firefox 对话框应答动作。
 
+`back`/`forward` 只接受浏览器 Navigation API 能公开证明的相邻 HTTP(S) 历史条目。
+该 API 的 entries 是当前条目周围的[连续同源片段](https://html.spec.whatwg.org/multipage/nav-history-apis.html#the-history-entry-list)，
+不会把中间的跨域条目过滤后拼接。后端检查目的 URL 授权，并在隔离 realm 同一 JS turn 中
+复核源和目的条目的 id/key/URL，再按确定的 key 调用 traverseTo；不按未经验证的偏移量跳转。
+没有可证明的相邻条目时，节点不提供对应动作。跨域、不透明 URL、file 历史以及 API 隐去 URL 的条目
+目前明确拒绝。既有长 HTTP URL 走文档授权，不受显式 navigate 的 2048 字节输入限制；不读取应用 history state。
+
 双击仍明确拒绝：Firefox 会在每条输入命令重置点击计数，而同批两次点击不能在第一次页面处理器之后
 执行本项目的 fresh 复核。该行为由本机 Firefox 159.0.1 随附 Actions.sys.mjs 和
 [Mozilla Bug 1864614](https://bugzilla.mozilla.org/show_bug.cgi?id=1864614) 的协议设计记录相互印证。
 
 尚未实现指针修饰键、长按、hover 停留、drag/path、secret_input、上传、对话框、
-back/forward 历史遍历、模拟环境与存储控制。它们不出现在相应节点能力中，未支持参数返回
+跨域/不透明历史遍历、模拟环境与存储控制。它们不出现在相应节点能力中，未支持参数返回
 `CONTROL.ACTION_UNSUPPORTED`。Firefox 内部特权页面也未验收，Chromium 的内部来源授权不能直接外推。
 
-本机 Linux Firefox 159.0.1 headless 已通过公开 CLI 的 18 组检查：中文 DOM 编辑与独立值回读、
+本机 Linux Firefox 159.0.1 headless 已通过公开 CLI 的 21 组检查：中文 DOM 编辑与独立值回读、
 真实全选/逐键输入、按钮/滚轮事件、局部截图、无 id scope、过期/遮挡拒绝、受保护字段 reveal 后的持续保护、
 移除后截图恢复，以及取消后的释放和后续点击。新增导航/刷新用独立文档 token 确认，标签页切换用
 页面 visibility 回读；授权拒绝、关闭后资源消失和创建过程中源 body 被替换后的停止也通过。
+历史另验收同源前进/后退、页面建立的长 URL 条目，以及跨域边界拒绝且不跳过条目。
 测试见 `tests/browser/firefox_bidi_e2e.mjs`。
 有界面 Firefox、Windows/macOS Firefox 与复杂 IME **[待真机验收]**；这些证据不等同于 Chromium 34 项回归。
 
