@@ -734,6 +734,7 @@ impl AtspiProvider {
         let mut handles = BTreeMap::new();
         let mut fingerprints = BTreeMap::new();
         let mut members = BTreeSet::new();
+        let mut structural_members = BTreeSet::new();
         for (index, item) in raw.nodes.into_iter().enumerate() {
             remaining(deadline, false)?;
             let parent_id = item
@@ -750,10 +751,16 @@ impl AtspiProvider {
                 })
                 .transpose()?;
             let node_id = format!("n{index}");
-            let member = scope.as_ref().is_none_or(|scope| item.native == scope.root)
+            let in_scope = scope.as_ref().is_none_or(|scope| item.native == scope.root)
                 || parent_id
                     .as_ref()
-                    .is_some_and(|parent| members.contains(parent));
+                    .is_some_and(|parent| structural_members.contains(parent));
+            if in_scope {
+                structural_members.insert(node_id.clone());
+            }
+            // A recovered focus parent is context: its unenumerated siblings
+            // were not captured. Its verified editor child may still be used.
+            let member = in_scope && item.provenance.get("focus_context") != Some(&json!(true));
             if member {
                 members.insert(node_id.clone());
             }
@@ -2801,6 +2808,7 @@ mod tests {
         truncated: bool,
         scoped_truncated: bool,
         scope_context: bool,
+        focus_context: bool,
         visibility_recovery: bool,
         refused_input: bool,
         secret_protected: bool,
@@ -2942,6 +2950,9 @@ mod tests {
                     node.name = None;
                     node.description = None;
                     node.attributes.clear();
+                    if self.focus_context && level + 1 == self.depth {
+                        node.provenance.insert("focus_context".into(), json!(true));
+                    }
                     node.provenance
                         .insert("accessible_id".into(), json!(format!("chain-{level}")));
                     node
@@ -3758,6 +3769,51 @@ mod tests {
             );
             assert_eq!(backend.writes.load(Ordering::SeqCst), 1);
         }
+    }
+
+    #[test]
+    fn recovered_focus_context_is_read_only_but_keeps_its_observed_child_usable() {
+        let backend = Arc::new(FakeBackend {
+            depth: 2,
+            focus_context: true,
+            ..Default::default()
+        });
+        let provider = AtspiProvider::new(backend.clone()).unwrap();
+        let observed = take_snapshot(&provider);
+        assert_eq!(observed["nodes"][1]["provenance"]["scope_context"], true);
+        assert_eq!(observed["nodes"][1]["actions"], json!([]));
+        assert!(!observed["nodes"][2]["actions"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        let context_target = json!({"snapshot_id": observed["snapshot_id"], "revision": observed["revision"], "node_id": "n1"});
+        let context_locator = json!({"bus_name": ":1.42", "object_path": "/chain/1"});
+        assert!(provider
+            .invoke(
+                "desktop.linux_atspi.snapshot_scope@1",
+                json!({"target": context_target, "locator": context_locator}),
+                Some(Duration::from_secs(2))
+            )
+            .is_err());
+        assert!(provider.invoke("desktop.linux_atspi.find@1", json!({"snapshot_id": observed["snapshot_id"], "revision": observed["revision"], "locator": context_locator}), Some(Duration::from_secs(2))).is_err());
+        assert!(provider
+            .invoke(
+                "desktop.linux_atspi.capture@1",
+                json!({"target": context_target, "locator": context_locator}),
+                Some(Duration::from_secs(2))
+            )
+            .is_err());
+        assert_eq!(backend.writes.load(Ordering::SeqCst), 0);
+        let observed = take_snapshot(&provider);
+        let target = json!({"snapshot_id": observed["snapshot_id"], "revision": observed["revision"], "node_id": "n2"});
+        provider
+            .invoke(
+                "desktop.linux_atspi.invoke@1",
+                json!({"target": target, "locator": locator()}),
+                Some(Duration::from_secs(2)),
+            )
+            .unwrap();
+        assert_eq!(backend.writes.load(Ordering::SeqCst), 1);
     }
 
     #[test]

@@ -20,6 +20,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use zbus::blocking::{connection, Connection, Proxy};
 
+mod focus_discovery;
+use focus_discovery::FocusDiscovery;
+
 const REGISTRY_NAME: &str = "org.a11y.atspi.Registry";
 const REGISTRY_PATH: &str = "/org/a11y/atspi/accessible/root";
 const DBUS_NAME: &str = "org.freedesktop.DBus";
@@ -138,6 +141,8 @@ pub struct LinuxBackend {
     connection: Connection,
     recordings: Mutex<BTreeMap<String, LinuxRecorder>>,
     input_helper_status: Mutex<Value>,
+    accessibility_address: String,
+    focus_discovery: Mutex<Option<FocusDiscovery>>,
 }
 
 impl LinuxBackend {
@@ -164,6 +169,8 @@ impl LinuxBackend {
             connection,
             recordings: Mutex::new(BTreeMap::new()),
             input_helper_status: Mutex::new(json!({"ready": false, "code": "not_probed"})),
+            accessibility_address: bus,
+            focus_discovery: Mutex::new(None),
         };
         backend.children(&Self::root_ref(), Instant::now() + Duration::from_secs(3))?;
         Ok(backend)
@@ -1646,7 +1653,46 @@ impl LinuxBackend {
         max_nodes: usize,
         deadline: Instant,
     ) -> Result<BackendSnapshot, AutomationError> {
+        self.ensure_focus_discovery(&info, deadline);
         let input = self.probe_input(deadline).ok();
+        let mut snapshot = self.capture_tree_nodes(
+            root.clone(),
+            info,
+            ancestors,
+            max_depth,
+            max_nodes,
+            input.as_ref(),
+            deadline,
+        )?;
+        self.append_focused_branch(
+            &root,
+            &mut snapshot,
+            max_depth,
+            max_nodes,
+            input.as_ref(),
+            deadline,
+        )?;
+        let process_id = snapshot
+            .application
+            .get("process_id")
+            .and_then(Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok())
+            .filter(|value| *value > 0);
+        self.add_window_actions(&mut snapshot.nodes, process_id, input.as_ref(), deadline);
+        Ok(snapshot)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn capture_tree_nodes(
+        &self,
+        root: NativeRef,
+        info: Map<String, Value>,
+        ancestors: Vec<NativeRef>,
+        max_depth: u32,
+        max_nodes: usize,
+        input: Option<&InputSupport>,
+        deadline: Instant,
+    ) -> Result<BackendSnapshot, AutomationError> {
         let mut nodes = Vec::new();
         if ancestors.len() >= max_nodes {
             return Err(driver_error(
@@ -1656,10 +1702,7 @@ impl LinuxBackend {
         }
         for ancestor in ancestors {
             let parent = nodes.len().checked_sub(1);
-            nodes.push(
-                self.read_node(ancestor, parent, &info, input.as_ref(), deadline)?
-                    .0,
-            );
+            nodes.push(self.read_node(ancestor, parent, &info, input, deadline)?.0);
         }
         let parent = nodes.len().checked_sub(1);
         let mut queue = VecDeque::from([(root, parent, 0u32)]);
@@ -1676,7 +1719,7 @@ impl LinuxBackend {
                 break;
             }
             let (node, child_count) =
-                self.read_node(target.clone(), parent, &info, input.as_ref(), deadline)?;
+                self.read_node(target.clone(), parent, &info, input, deadline)?;
             let current = nodes.len();
             nodes.push(node);
             match self.child_references(&target, deadline) {
@@ -1725,12 +1768,6 @@ impl LinuxBackend {
                 }
             }
         }
-        let process_id = info
-            .get("process_id")
-            .and_then(Value::as_u64)
-            .and_then(|value| u32::try_from(value).ok())
-            .filter(|value| *value > 0);
-        self.add_window_actions(&mut nodes, process_id, input.as_ref(), deadline);
         Ok(BackendSnapshot {
             application: info,
             nodes,
