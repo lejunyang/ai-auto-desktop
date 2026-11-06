@@ -3,8 +3,26 @@
   const documentToken = NONCE;
   let observation = null;
   let nodes = new Map();
-  let scopeRoot = null, scopeInvalid = false;
-  const scopeObserver = new MutationObserver(() => { scopeInvalid = true; });
+  let scopeRoot = null, scopeInvalid = false, scopeNeedsValidation = false;
+  let scopeParents = [], scopeElements = [], scopeIdentity = null;
+  const scopeChanges = records => {
+    if (!scopeRoot) return;
+    for (const record of records) {
+      // Changes inside the captured region, to its ancestors' attributes,
+      // or moving the region itself invalidate its complete observation.
+      if (inside(scopeRoot,record.target) ||
+          (record.type==='attributes' && inside(record.target,scopeRoot)) ||
+          (record.type==='childList' && [...record.addedNodes,...record.removedNodes].some(n=>inside(n,scopeRoot)))) {
+        scopeInvalid=true;
+      } else {
+        // A sibling timer is not a change to this region. It may still move
+        // it, reveal a previously hidden child through CSS, or rename it via
+        // an external label: check the captured region before accepting it.
+        scopeNeedsValidation=true;
+      }
+    }
+  };
+  const scopeObserver = new MutationObserver(scopeChanges);
   /*AAD_NAMING*/
   // Landmarks a page is divided into, as an overview names its regions.
   const LANDMARK_ROLES = ['banner','navigation','main','complementary','contentinfo','form','search','dialog','alertdialog','region'];
@@ -26,6 +44,29 @@
   const deepHit = (x,y) => {let hit=document.elementFromPoint(x,y);while(hit && hit.shadowRoot){const inner=hit.shadowRoot.elementFromPoint(x,y);if(!inner||inner===hit)break;hit=inner;}return hit;};
   // Containment across shadow boundaries.
   const inside = (el,hit) => {for(let n=hit;n;n=n.parentNode||n.host){if(n===el)return true;}return false;};
+  const parentsOf = el => {const parents=[];for(let n=el.parentNode||el.host;n;n=n.parentNode||n.host)parents.push(n);return parents;};
+  const scopeState = el => {
+    const shown=present(el), box=el.getBoundingClientRect();
+    const labels=(el.getAttribute('aria-labelledby')||'').split(/\s+/).filter(Boolean).slice(0,8)
+      .map(id=>(document.getElementById(id)?.textContent||'').slice(0,256));
+    return JSON.stringify([shown,fingerprint(el),labels,box.left+scrollX,box.top+scrollY,box.width,box.height]);
+  };
+  const scopeCurrent = () => {
+    scopeChanges(scopeObserver.takeRecords());
+    if (scopeInvalid || !scopeRoot.isConnected) return false;
+    const parents=parentsOf(scopeRoot);
+    if (parents.length!==scopeParents.length || parents.some((parent,i)=>parent!==scopeParents[i])) return false;
+    if (scopeNeedsValidation) {
+      const matches=document.querySelectorAll('[id="'+CSS.escape(scopeIdentity)+'"]');
+      if (matches.length!==1 || matches[0]!==scopeRoot ||
+          scopeElements.some(({el,state})=>scopeState(el)!==state)) {
+        scopeInvalid=true;
+        return false;
+      }
+      scopeNeedsValidation=false;
+    }
+    return true;
+  };
   const scrollable = el => el===document.body || ((el.scrollHeight>el.clientHeight+1 || el.scrollWidth>el.clientWidth+1) && /(auto|scroll|overlay)/.test(getComputedStyle(el).overflow+getComputedStyle(el).overflowY+getComputedStyle(el).overflowX));
   // The cursor is inherited, so it marks the element where it starts and the
   // items someone picks inside it, not every icon and label within them.
@@ -59,7 +100,7 @@
     return result;
   };
   const check = args => {
-    if (scopeRoot && (scopeInvalid || scopeObserver.takeRecords().length || !scopeRoot.isConnected)) return {error:'CONTROL.STALE_TARGET'};
+    if (scopeRoot && !scopeCurrent()) return {error:'CONTROL.STALE_TARGET'};
     if (args.document_token!==documentToken || args.observation!==observation) return {error:'CONTROL.STALE_TARGET'};
     const found=nodes.get(args.node_id);
     if (!found || !present(found.el) || fingerprint(found.el)!==found.fingerprint) return {error:'CONTROL.STALE_TARGET'};
@@ -71,17 +112,19 @@
   globalThis.__aadControlV1 = {
     validate_scope: args => {
       if(args.document_token!==documentToken || args.observation!==observation ||
-         !scopeRoot || !scopeRoot.isConnected || scopeInvalid || scopeObserver.takeRecords().length)
+         !scopeRoot || !scopeCurrent())
         return {error:'CONTROL.STALE_TARGET'};
       return {valid:true};
     },
     observe: (id,limit,scopeId=null) => {
       observation=id; nodes=new Map();
-      scopeObserver.disconnect(); scopeRoot=null; scopeInvalid=false;
+      scopeObserver.disconnect(); scopeRoot=null; scopeInvalid=false; scopeNeedsValidation=false;
+      scopeParents=[]; scopeElements=[]; scopeIdentity=scopeId;
       if (scopeId !== null) {
         const matches=document.querySelectorAll('[id="'+CSS.escape(scopeId)+'"]');
         if(matches.length!==1)return {error:matches.length?'CONTROL.AMBIGUOUS':'CONTROL.SCOPE_NOT_FOUND'};
         scopeRoot=matches[0];
+        scopeParents=parentsOf(scopeRoot);
         scopeObserver.observe(document,{subtree:true,childList:true,attributes:true,characterData:true});
       }
       const items=[];
@@ -93,6 +136,7 @@
       let scanned=0;
       while(stack.length && items.length<=limit && scanned++<20000) {
         const el=stack.pop();
+        if(scopeRoot)scopeElements.push({el,state:scopeState(el)});
         if(scopeRoot && el.shadowRoot)scopeObserver.observe(el.shadowRoot,{subtree:true,childList:true,attributes:true,characterData:true});
         if(present(el))items.push(el);
         const children=el.shadowRoot?[...el.shadowRoot.children,...el.children]:el.children;
@@ -126,7 +170,7 @@
     // as rows of cells. Each part stops at max_characters.
     text: args => {
       if (args.document_token!==documentToken || args.observation!==observation) return {error:'CONTROL.STALE_TARGET'};
-      if (scopeRoot && (scopeInvalid || scopeObserver.takeRecords().length || !scopeRoot.isConnected)) return {error:'CONTROL.STALE_TARGET'};
+      if (scopeRoot && !scopeCurrent()) return {error:'CONTROL.STALE_TARGET'};
       let root=scopeRoot||document.body;
       if (args.node_id) {
         const found=nodes.get(args.node_id);

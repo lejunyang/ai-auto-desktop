@@ -1020,6 +1020,89 @@ fn locate(session: &Session, observation: &Value, locator: Value) -> Response {
 
 #[test]
 #[ignore = "requires isolated Chromium with its sandbox enabled; CI runs it explicitly"]
+fn scoped_observations_ignore_unrelated_updates_but_reject_related_changes() {
+    let _serial = serial();
+    let fixture = Fixture::new();
+    let (session, _) = session_for(&fixture);
+    let main = main_of(&session, &fixture.page_id);
+    let loaded = wait_until(&session, &main, "Name", WaitCondition::Appears);
+    assert!(loaded.error.is_none(), "{loaded:?}");
+    let reset = || {
+        page_value(
+            &fixture,
+            r#"clearInterval(window.scopeTicker);
+            document.head.innerHTML='<style id="scope-style">.scope-hidden { display:none }</style>';
+            document.body.innerHTML='<div id="scope-parent"><section id="scope"><button aria-label="Scoped save" onclick="document.getElementById(\'scope-result\').textContent=\'saved\'">Save</button><button class="scope-hidden">Hidden</button></section></div><output id="scope-result"></output><span id="scope-ticker" style="position:fixed;right:0;bottom:0">0</span>';
+            true"#,
+        );
+    };
+    let scoped = || {
+        let result = observe_view(
+            &session,
+            &main,
+            View {
+                scope_id: Some("scope".into()),
+                ..Default::default()
+            },
+        );
+        assert!(result.error.is_none(), "{result:?}");
+        result.data.unwrap()
+    };
+
+    reset();
+    let observed = scoped();
+    page_value(
+        &fixture,
+        r#"window.scopeTicks=0; window.scopeTicker=setInterval(()=>{
+            const ticker=document.getElementById('scope-ticker');
+            ticker.textContent=String(++window.scopeTicks);
+            ticker.dataset.tick=String(window.scopeTicks);
+        },10); true"#,
+    );
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(page_value(&fixture, "window.scopeTicks").as_u64().unwrap() > 0);
+    // Both locator resolution and the write must survive unrelated DOM churn.
+    let target = find(&session, &observed, "button", "Scoped save");
+    let clicked = act(&session, target, trusted_click());
+    assert!(clicked.error.is_none(), "{clicked:?}");
+    assert_eq!(
+        page_value(
+            &fixture,
+            "document.getElementById('scope-result').textContent"
+        ),
+        "saved"
+    );
+
+    for mutation in [
+        "document.querySelector('#scope button').textContent='Changed'",
+        "document.getElementById('scope-parent').className='changed'",
+        "document.getElementById('scope').replaceWith(document.getElementById('scope').cloneNode(true))",
+        "document.body.append(document.getElementById('scope'))",
+        // These mutations are outside the subtree but change its layout or
+        // membership: they cannot be treated like the unrelated timer above.
+        "document.getElementById('scope-style').textContent='.scope-hidden { display:block }'",
+        "const banner=document.createElement('div');banner.style.height='100px';document.body.prepend(banner)",
+        // The scope selector must still denote exactly the original region.
+        "const duplicate=document.createElement('section');duplicate.id='scope';document.body.append(duplicate)",
+    ] {
+        reset();
+        let observed = scoped();
+        let target = find(&session, &observed, "button", "Scoped save");
+        page_value(&fixture, &format!("{mutation}; true"));
+        let found = locate(&session, &observed, json!({"name":"Scoped save"}));
+        assert_eq!(found.error.unwrap()["code"], "CONTROL.STALE_TARGET", "{mutation}");
+        let clicked = act(&session, target, trusted_click());
+        assert_eq!(clicked.error.unwrap()["code"], "CONTROL.STALE_TARGET", "{mutation}");
+        assert_eq!(
+            page_value(&fixture, "document.getElementById('scope-result').textContent"),
+            "",
+            "{mutation}"
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires isolated Chromium with its sandbox enabled; CI runs it explicitly"]
 fn pages_read_as_regions_text_and_accessible_names_and_locators_narrow() {
     let _serial = serial();
     let fixture = Fixture::new();
