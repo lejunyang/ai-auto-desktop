@@ -187,7 +187,7 @@ fn protocol(message: &str) -> AutomationError {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn run(
+pub(super) fn run(
     path: &Path,
     args: &[String],
     nonce: &str,

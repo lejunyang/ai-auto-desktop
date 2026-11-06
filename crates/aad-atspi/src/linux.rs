@@ -20,6 +20,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use zbus::blocking::{connection, Connection, Proxy};
 
+mod drag_between;
 mod drag_path;
 mod focus_discovery;
 use focus_discovery::FocusDiscovery;
@@ -933,6 +934,19 @@ impl LinuxBackend {
 }
 
 impl AtspiBackend for LinuxBackend {
+    fn supports_cross_resource_drag(&self) -> bool {
+        self.probe_input(Instant::now() + Duration::from_secs(1))
+            .is_ok_and(|support| support.require("anchored-drag-between").is_ok())
+    }
+
+    fn drag_between(
+        &self,
+        request: super::DragBetweenRequest<'_>,
+        validate: super::DragPathValidation,
+    ) -> Result<Value, AutomationError> {
+        self.run_drag_between(request, validate)
+    }
+
     fn cancellation_scope(
         &self,
         token: &super::CancellationToken,

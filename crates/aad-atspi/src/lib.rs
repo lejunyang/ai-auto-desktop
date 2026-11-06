@@ -10,8 +10,11 @@ use aad_runtime::{ArtifactStore, CancellationToken, Provider};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, TryLockError};
 use std::time::{Duration, Instant};
+
+mod cross_resource;
+pub use cross_resource::{DragBetweenEndpoint, DragBetweenRequest};
 
 pub const PROVIDER_NAME: &str = "desktop.linux_atspi";
 pub const PROVIDER_VERSION: &str = "0.1.0";
@@ -157,6 +160,19 @@ impl Bounds {
 }
 
 pub trait AtspiBackend: Send + Sync {
+    fn supports_cross_resource_drag(&self) -> bool {
+        false
+    }
+    fn drag_between(
+        &self,
+        _request: DragBetweenRequest<'_>,
+        _validate: DragPathValidation,
+    ) -> Result<Value, AutomationError> {
+        Err(driver_error(
+            "DRIVER.ACTION_UNSUPPORTED",
+            "cross-resource drag is unavailable",
+        ))
+    }
     /// Return an invocation-local view sharing persistent observation state.
     /// The token must never replace a session policy or persist into later calls.
     fn cancellation_scope(&self, _token: &CancellationToken) -> Option<Arc<dyn AtspiBackend>> {
@@ -493,12 +509,14 @@ struct Record {
     max_nodes: usize,
     scope: Option<Scope>,
     valid: bool,
+    created: Instant,
 }
 
 #[derive(Default)]
 struct DriverState {
     revision: u64,
     current: Option<Record>,
+    retained: VecDeque<Record>,
 }
 
 pub struct AtspiProvider {
@@ -506,13 +524,22 @@ pub struct AtspiProvider {
     manifest: CapabilityManifest,
     generation: String,
     state: Arc<Mutex<DriverState>>,
+    retain_resources: bool,
+    invocation_gate: Arc<Mutex<()>>,
+    cancellation: Option<CancellationToken>,
 }
 
 impl AtspiProvider {
     pub fn new(backend: Arc<dyn AtspiBackend>) -> Result<Self, AutomationError> {
+        let retain_resources = backend.supports_cross_resource_drag();
+        let document = if retain_resources {
+            cross_resource::enabled_manifest()
+        } else {
+            manifest_document()
+        };
         Ok(Self {
             backend,
-            manifest: manifest::parse(&manifest_document()).map_err(|reason| {
+            manifest: manifest::parse(&document).map_err(|reason| {
                 driver_error(
                     "DRIVER.INTERNAL",
                     format!("built-in AT-SPI manifest is invalid: {reason}"),
@@ -520,6 +547,9 @@ impl AtspiProvider {
             })?,
             generation: uuid::Uuid::new_v4().simple().to_string(),
             state: Arc::new(Mutex::new(DriverState::default())),
+            retain_resources,
+            invocation_gate: Arc::new(Mutex::new(())),
+            cancellation: None,
         })
     }
 
@@ -532,6 +562,67 @@ impl AtspiProvider {
     }
 
     fn call(
+        &self,
+        action: &str,
+        args: Value,
+        deadline: Instant,
+        artifacts: Option<&ArtifactStore>,
+    ) -> Result<Value, AutomationError> {
+        let _guard = loop {
+            remaining(deadline, false)?;
+            if let Some(token) = &self.cancellation {
+                token.check()?;
+            }
+            match self.invocation_gate.try_lock() {
+                Ok(guard) => break guard,
+                Err(TryLockError::WouldBlock) => std::thread::sleep(Duration::from_millis(5)),
+                Err(TryLockError::Poisoned(_)) => {
+                    return Err(driver_error(
+                        "DRIVER.ACTION_FAILED",
+                        "provider invocation state is unavailable",
+                    ));
+                }
+            }
+        };
+        let short = action
+            .strip_prefix(PROVIDER_NAME)
+            .and_then(|a| a.strip_prefix('.'))
+            .and_then(|a| a.strip_suffix("@1"));
+        let written = short.is_some_and(|a| {
+            WRITE_ACTIONS.contains(&a) || matches!(a, "drag_between" | "global_key")
+        });
+        let result = self.call_unguarded(action, args, deadline, artifacts);
+        // Serializing publication with input prevents an overlapping read from
+        // silently re-authorizing records while another call owns native input.
+        if written && self.retain_resources {
+            if let Ok(mut state) = self.state.lock() {
+                state.invalidate_all();
+            }
+        }
+        if !result
+            .as_ref()
+            .err()
+            .is_some_and(|e| e.code == "DRIVER.CANCELLED")
+        {
+            if let Some(token) = &self.cancellation {
+                if token.is_cancelled() {
+                    if written {
+                        if let Ok(mut state) = self.state.lock() {
+                            state.invalidate_all();
+                        }
+                    }
+                    return Err(token.check().unwrap_err().with_effect(if written {
+                        "unknown"
+                    } else {
+                        "not_applied"
+                    }));
+                }
+            }
+        }
+        result
+    }
+
+    fn call_unguarded(
         &self,
         action: &str,
         args: Value,
@@ -568,6 +659,7 @@ impl AtspiProvider {
             }
             "snapshot" => self.snapshot(args, deadline),
             "snapshot_scope" => self.snapshot_scope(args, deadline),
+            "drag_between" => self.drag_between(args, deadline),
             "find" => self.find(args, deadline),
             "capture_target" => self.capture_target(args, deadline, artifacts),
             "capture" => self.capture_inline(args, deadline),
@@ -707,8 +799,7 @@ impl AtspiProvider {
                 .lock()
                 .map_err(|_| driver_error("DRIVER.ACTION_FAILED", "driver state is unavailable"))?;
             let record = state
-                .current
-                .as_ref()
+                .scope_record(scope_id, self.retain_resources)
                 .ok_or_else(|| stale("scope is no longer current"))?
                 .clone();
             let scope = record
@@ -932,8 +1023,9 @@ impl AtspiProvider {
             max_nodes,
             scope,
             valid: true,
+            created: Instant::now(),
         };
-        state.current = Some(record.clone());
+        state.publish(record.clone(), self.retain_resources);
         Ok(record)
     }
 
@@ -951,10 +1043,12 @@ impl AtspiProvider {
             .state
             .lock()
             .map_err(|_| driver_error("DRIVER.ACTION_FAILED", "driver state is unavailable"))?;
-        let record = state
-            .current
-            .as_ref()
-            .ok_or_else(|| stale("snapshot is not the current driver version"))?;
+        let record = if self.retain_resources {
+            state.retained_record(snapshot_id, revision)
+        } else {
+            state.current.as_ref()
+        }
+        .ok_or_else(|| stale("snapshot is not the current driver version"))?;
         if !record.valid
             || record.public["snapshot_id"] != snapshot_id
             || record.public["revision"] != revision
@@ -1295,12 +1389,7 @@ impl AtspiProvider {
             let expected_window = window.clone();
             // A late, read-only capture must not publish a new current snapshot
             // after the action returned or another observation was admitted.
-            let validator = Self {
-                backend: self.backend.clone(),
-                manifest: self.manifest.clone(),
-                generation: self.generation.clone(),
-                state: Arc::new(Mutex::new(DriverState::default())),
-            };
+            let validator = self.private_validator();
             let validation_points = points.clone();
             let validate: DragPathValidation = Arc::new(move |index| {
                 remaining(deadline, false)?;
@@ -1557,7 +1646,7 @@ impl AtspiProvider {
         let observed = self.observed_record(args)?;
         let captured = self.checked_capture(args, deadline);
         if let Ok(mut state) = self.state.lock() {
-            state.current = Some(observed);
+            state.publish(observed, self.retain_resources);
         }
         let (png, provenance) = captured?;
         let (width, height) = png_size(&png).ok_or_else(|| {
@@ -1914,36 +2003,11 @@ impl Provider for AtspiProvider {
             manifest: self.manifest.clone(),
             generation: self.generation.clone(),
             state: self.state.clone(),
+            retain_resources: self.retain_resources,
+            invocation_gate: self.invocation_gate.clone(),
+            cancellation: Some(token.clone()),
         };
-        let result = scoped.call(action, args, Self::deadline(timeout)?, None);
-        if result
-            .as_ref()
-            .err()
-            .is_some_and(|error| error.code == "DRIVER.CANCELLED")
-        {
-            return result;
-        }
-        if token.is_cancelled() {
-            let short = action
-                .strip_prefix(PROVIDER_NAME)
-                .and_then(|value| value.strip_prefix('.'))
-                .and_then(|value| value.strip_suffix("@1"));
-            let written = short
-                .is_some_and(|action| WRITE_ACTIONS.contains(&action) || action == "global_key");
-            if written {
-                if let Ok(mut state) = self.state.lock() {
-                    if let Some(record) = state.current.as_mut() {
-                        record.valid = false;
-                    }
-                }
-            }
-            return Err(token.check().unwrap_err().with_effect(if written {
-                "unknown"
-            } else {
-                "not_applied"
-            }));
-        }
-        result
+        scoped.call(action, args, Self::deadline(timeout)?, None)
     }
 
     fn invoke_with_artifacts(
@@ -3272,6 +3336,7 @@ mod tests {
         path_supported: bool,
         path_changed_after: usize,
         path_window_visibility: u8,
+        cross_supported: bool,
         /// Containers above the target, which is then `n{depth}`.
         depth: usize,
     }
@@ -3368,6 +3433,23 @@ mod tests {
     }
 
     impl AtspiBackend for FakeBackend {
+        fn supports_cross_resource_drag(&self) -> bool {
+            self.cross_supported
+        }
+        fn drag_between(
+            &self,
+            request: DragBetweenRequest<'_>,
+            validate: DragPathValidation,
+        ) -> Result<Value, AutomationError> {
+            validate(0)?;
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            for index in 1..=cross_resource::CROSS_DRAG_SEGMENTS + 3 {
+                validate(index).map_err(|e| e.with_effect("unknown"))?;
+            }
+            Ok(
+                json!({"source_pid":request.source.process_id,"destination_pid":request.destination.process_id,"source_bus":request.source.target.bus_name,"destination_bus":request.destination.target.bus_name}),
+            )
+        }
         fn cancellation_scope(&self, token: &CancellationToken) -> Option<Arc<dyn AtspiBackend>> {
             let mut scoped = self.clone();
             scoped.cancellation = Some(token.clone());
@@ -3420,7 +3502,7 @@ mod tests {
                         node.bounds = None;
                     }
                     node.role = "filler".into();
-                    if self.path_window_visibility != 0 {
+                    if self.path_window_visibility != 0 || self.cross_supported {
                         node.role = if level == 0 { "application" } else { "frame" }.into();
                     }
                     node.name = None;
@@ -3443,8 +3525,23 @@ mod tests {
             if self.duplicate {
                 nodes.push(self.node("/org/a11y/save-2"));
             }
+            let mut application = Self::application();
+            if self.cross_supported {
+                let pid = _application
+                    .get("process_id")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(4242);
+                let bus = format!(":1.{pid}");
+                application.insert("process_id".into(), json!(pid));
+                application.insert("bus_name".into(), json!(bus));
+                for node in &mut nodes {
+                    node.native.bus_name = bus.clone();
+                    node.provenance.insert("bus_name".into(), json!(bus));
+                    node.provenance.insert("process_id".into(), json!(pid));
+                }
+            }
             Ok(BackendSnapshot {
-                application: Self::application(),
+                application,
                 nodes,
                 truncated: self.truncated,
                 truncation_reasons: if self.truncated {
@@ -3463,7 +3560,7 @@ mod tests {
             _deadline: Instant,
         ) -> Result<BackendSnapshot, AutomationError> {
             self.scoped_captures.fetch_add(1, Ordering::SeqCst);
-            if self.path_window_visibility != 0 {
+            if self.path_window_visibility != 0 || self.cross_supported {
                 let mut snapshot = self.capture(_application, _max_depth, _max_nodes, _deadline)?;
                 if root.object_path == "/chain/1" {
                     if self.path_window_visibility == 2 {
@@ -4389,6 +4486,195 @@ mod tests {
             assert_eq!(current.members, BTreeSet::from(["n2".to_string()]));
             assert!(backend.scoped_captures.load(Ordering::SeqCst) >= 4);
         }
+    }
+
+    fn cross_snapshot(provider: &AtspiProvider, pid: u32) -> Value {
+        provider
+            .invoke(
+                "desktop.linux_atspi.snapshot@1",
+                json!({"application":{"process_id":pid}}),
+                Some(Duration::from_secs(2)),
+            )
+            .unwrap()
+    }
+
+    fn cross_args(source: &Value, destination: &Value) -> Value {
+        json!({"target":{"snapshot_id":source["snapshot_id"],"revision":source["revision"],"node_id":"n2"},
+            "locator":locator(), "to":{"snapshot_id":destination["snapshot_id"],"revision":destination["revision"],"node_id":"n2"},
+            "to_locator":locator(),"fraction":{"fx":0.1,"fy":0.2},"to_fraction":{"fx":0.9,"fy":0.8}})
+    }
+
+    #[test]
+    fn cross_drag_keeps_both_original_resources_and_invalidates_every_retained_record() {
+        let backend = Arc::new(FakeBackend {
+            cross_supported: true,
+            depth: 2,
+            ..Default::default()
+        });
+        let provider = AtspiProvider::new(backend.clone()).unwrap();
+        let source = cross_snapshot(&provider, 4242);
+        let destination = cross_snapshot(&provider, 4243);
+        let untouched = cross_snapshot(&provider, 4244);
+        let result = provider
+            .invoke(
+                "desktop.linux_atspi.drag_between@1",
+                cross_args(&source, &destination),
+                Some(Duration::from_secs(5)),
+            )
+            .unwrap();
+        assert_eq!(result["backend_result"]["source_pid"], 4242);
+        assert_eq!(result["backend_result"]["destination_pid"], 4243);
+        assert_eq!(result["backend_result"]["source_bus"], ":1.4242");
+        assert_eq!(result["backend_result"]["destination_bus"], ":1.4243");
+        assert_eq!(backend.writes.load(Ordering::SeqCst), 1);
+        let state = provider.state.lock().unwrap();
+        assert_eq!(
+            state.revision, 3,
+            "private endpoint refreshes cannot publish observations"
+        );
+        assert_eq!(state.retained.len(), 3);
+        assert!(state.retained.iter().all(|r| !r.valid));
+        drop(state);
+        for observed in [&source, &destination, &untouched] {
+            assert_eq!(
+                provider
+                    .current_record(&observed["snapshot_id"], &observed["revision"])
+                    .err()
+                    .unwrap()
+                    .code,
+                "DRIVER.STALE_SNAPSHOT"
+            );
+        }
+    }
+
+    #[test]
+    fn retained_resources_are_latest_per_identity_bounded_and_expiring() {
+        let provider = AtspiProvider::new(Arc::new(FakeBackend {
+            cross_supported: true,
+            depth: 2,
+            ..Default::default()
+        }))
+        .unwrap();
+        let first = cross_snapshot(&provider, 4242);
+        let replaced = cross_snapshot(&provider, 4242);
+        assert!(
+            provider
+                .current_record(&first["snapshot_id"], &first["revision"])
+                .is_err()
+        );
+        assert!(
+            provider
+                .current_record(&replaced["snapshot_id"], &replaced["revision"])
+                .is_ok()
+        );
+        for pid in 4243..4259 {
+            cross_snapshot(&provider, pid);
+        }
+        assert_eq!(provider.state.lock().unwrap().retained.len(), 16);
+        assert!(
+            provider
+                .current_record(&replaced["snapshot_id"], &replaced["revision"])
+                .is_err()
+        );
+        let latest = cross_snapshot(&provider, 4260);
+        {
+            let mut state = provider.state.lock().unwrap();
+            for r in &mut state.retained {
+                r.created -= Duration::from_secs(301);
+            }
+        }
+        assert!(
+            provider
+                .current_record(&latest["snapshot_id"], &latest["revision"])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn cross_drag_refuses_missing_stale_scope_path_and_unsupported_without_input() {
+        for variant in ["stale", "path", "scope", "unsupported"] {
+            let backend = Arc::new(FakeBackend {
+                cross_supported: variant != "unsupported",
+                depth: 2,
+                ..Default::default()
+            });
+            let provider = AtspiProvider::new(backend.clone()).unwrap();
+            let source = cross_snapshot(&provider, 4242);
+            let destination = cross_snapshot(&provider, 4243);
+            let mut args = cross_args(&source, &destination);
+            match variant {
+                "stale" => args["to"]["revision"] = json!(0),
+                "path" => args["path"] = json!([]),
+                "scope" => {
+                    let mut state = provider.state.lock().unwrap();
+                    state.retained.front_mut().unwrap().members.remove("n2");
+                }
+                _ => {}
+            }
+            assert!(
+                provider
+                    .invoke(
+                        "desktop.linux_atspi.drag_between@1",
+                        args,
+                        Some(Duration::from_secs(2))
+                    )
+                    .is_err()
+            );
+            assert_eq!(backend.writes.load(Ordering::SeqCst), 0);
+            if variant != "unsupported" {
+                assert!(
+                    provider
+                        .state
+                        .lock()
+                        .unwrap()
+                        .retained
+                        .iter()
+                        .all(|r| !r.valid)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn provider_invocation_gate_obeys_deadline_and_cancellation_without_publication() {
+        let backend = Arc::new(FakeBackend {
+            cross_supported: true,
+            depth: 2,
+            ..Default::default()
+        });
+        let provider = Arc::new(AtspiProvider::new(backend.clone()).unwrap());
+        cross_snapshot(&provider, 4242);
+        let guard = provider.invocation_gate.lock().unwrap();
+        let error = provider
+            .invoke(
+                "desktop.linux_atspi.snapshot@1",
+                json!({"application":{"process_id":4243}}),
+                Some(Duration::from_millis(20)),
+            )
+            .unwrap_err();
+        assert_eq!(error.code, "DRIVER.TIMEOUT");
+        let token = CancellationToken::new();
+        let sent = token.clone();
+        let p = provider.clone();
+        let pending = std::thread::spawn(move || {
+            p.invoke_cancellable(
+                "desktop.linux_atspi.snapshot@1",
+                json!({"application":{"process_id":4243}}),
+                Some(Duration::from_secs(2)),
+                &sent,
+            )
+        });
+        std::thread::sleep(Duration::from_millis(20));
+        token.cancel();
+        assert_eq!(
+            pending.join().unwrap().unwrap_err().code,
+            "DRIVER.CANCELLED"
+        );
+        assert_eq!(backend.captures.load(Ordering::SeqCst), 1);
+        assert_eq!(provider.state.lock().unwrap().retained.len(), 1);
+        drop(guard);
+        cross_snapshot(&provider, 4243);
+        assert_eq!(provider.state.lock().unwrap().retained.len(), 2);
     }
 
     #[test]

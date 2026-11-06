@@ -2697,6 +2697,8 @@ int RunGlobalKey(int argc, char **argv) {
     return 0;
 }
 
+#include "x11_drag_between.hpp"
+
 }  // namespace
 
 int main(int argc, char **argv) {
@@ -2705,13 +2707,14 @@ int main(int argc, char **argv) {
         return kExitInvalid;
     }
     const std::string_view command(argv[1]);
+    if (command == "drag-between") return RunDragBetween(argc, argv);
     if (command == "describe") {
         if (argc != 2) {
             EmitError("invalid_arguments", "arguments", false);
             return kExitInvalid;
         }
         // This protocol handshake does not open a display or touch input state.
-        std::cout << R"({"helper":"aad-linux-xtest","protocol":1,"features":["focus-info","type-text","pointer-click","pointer-gesture","drag","key-chord","window-info","window-action","paste","clipboard-read","global-key","record-input","pointer-modifiers","x11-desktop-independent","bounded-hold","window-focus","cooperative-cancel","anchored-drag-path","type-text-keys"]})"
+        std::cout << R"({"helper":"aad-linux-xtest","protocol":1,"features":["focus-info","type-text","pointer-click","pointer-gesture","drag","key-chord","window-info","window-action","paste","clipboard-read","global-key","record-input","pointer-modifiers","x11-desktop-independent","bounded-hold","window-focus","cooperative-cancel","anchored-drag-path","type-text-keys","anchored-drag-between"]})"
                   << std::endl;
         return 0;
     }
