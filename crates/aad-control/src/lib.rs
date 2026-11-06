@@ -815,7 +815,7 @@ impl Session {
         if let Some(lease) = leases.get(key) {
             return Ok(lease.clone());
         }
-        let lease = Arc::new(lease::InputLease::acquire(key)?);
+        let lease = Arc::new(lease::InputLease::acquire_for(key, &self.id)?);
         leases.insert(key.into(), lease.clone());
         Ok(lease)
     }
