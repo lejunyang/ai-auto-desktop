@@ -9,6 +9,7 @@
 | 本机 KDE/X11、Qt Widgets/QML | KWrite 中文编辑保存并磁盘回读；系统设置搜索及分类导航；Dolphin 多选/框选、恢复 F2 编辑框并中文重命名后磁盘回读；Qt 密码替换/清空、键鼠长按与拖拽起点停留的独立事件计时；Fcitx5 微软双拼显式物理键组合、候选截图、空格选词与 Qt/AT-SPI 提交回读；同 PID 双窗口拒绝错误焦点；同 surface 路径逐点实际轨迹、窄 scope 外 sibling overlay 和取消后的释放；原生 `control_cancel` 后键鼠实际释放及下一次调用恢复；截图与窗口动作 | 其他 IME、翻页和复杂组合；多屏和缩放；跨应用完整任务；更多第三方应用多窗口验收；一般同步 D-Bus 调用只能在调用前后响应取消，路径专用只读 worker 与 helper 释放独立 |
 | 本机 Electron | Code/Codex 可恢复局部完整观察、find、scope token 刷新；独立 VS Code profile 经原生 focus/Ctrl+A/中文 paste/Ctrl+S 后，DOM、磁盘与截图回读通过 | 原生指针命中仍有拒绝；其他 Electron 应用、任意延迟剪贴板客户端及复杂 IME 不能从这一编辑流程外推 |
 | Chromium | 真实独立浏览器回归 34/34，覆盖 DOM、frames、scope、Canvas/closed-shadow 折线路径及内部字段保护、修饰键、敏感输入与按实例输入租约；有界面页面快捷键隔离；有界按住及异常释放；本地文件/Settings 授权与执行中祖先 URL 复核 | HTML5 自定义路径和跨资源拖拽未支持；closed shadow 内部语义节点未公开；其他内部页面逐项验收；非 Chromium 不能套用这些结论 |
+| 本机 Firefox 159.0.1 headless / BiDi | 公开 CLI 13 组检查：DOM 中文 fill、真实全选/按键/点击/滚轮、scope、PNG 截图、过期/遮挡拒绝、light/closed 密码 reveal 后持续保护、移除后截图恢复、取消释放及下一次输入；独立协议/session 生命周期检查 | 子 frame 只读；双击、指针修饰键/长按、导航/标签页、drag、secret/upload/dialog 等 **[待实现]**。有界面及 Windows/macOS Firefox、复杂 IME **[待真机验收]**；当前全部输入占桌面租约，不能当作 Chromium 等价覆盖 |
 | Windows | UIA、SendInput、修饰键与专用保密输入有实现；目标 Windows cfg check/clippy 通过 | **[待真机验收]** Windows 交互桌面，Win32/WPF/Chromium，各种 DPI 与多屏，中文 IME，取消或超时后的键鼠释放，密码字段实际替换/清空 |
 | macOS | AX 与 Swift helper 有实现；同一 fresh snapshot 复核拖拽两端；Rust macOS cfg check 及宿主逻辑测试通过 | **[待真机验收]** macOS SDK/Swift helper 构建、辅助功能与屏幕录制权限、原生/Chromium 应用、拖拽和输入效果、Secure Input 条件；Rust cfg 检查不代表 Swift 已编译 |
 | GNOME/X11、XFCE/X11 | `bea9187` 已移除桌面品牌限制，保留真实会话和窗口身份检查；私有 Xvfb 四种标签真实点击/截图与拒绝路径、本机 KDE 新 helper 验收通过 | **[待真机验收]** GNOME/XFCE 窗口管理器、GTK 控件、剪贴板管理器、焦点与窗口动作；Xvfb 下更换环境标签只验证门禁和协议兼容性 |
@@ -75,6 +76,12 @@ pwsh -File tests/linux/verify-fcitx-physical-keys.ps1 `
 
 # AAD_TEST_CHROME 指向本机测试 Chromium；独立 profile。
 osdk exec -- cargo test --locked -p aad-control --test browser_e2e -- --ignored --test-threads=1
+
+# Linux + Node >=22；脚本启动独立 Firefox headless profile，所有写操作经公开 CLI。
+# BiDi 当前保守占用 desktop-input，仍须与其他输入测试串行。
+$env:AAD_TEST_FIREFOX = '/absolute/path/to/firefox'
+$env:AAD_TEST_AAD = (Resolve-Path target/debug/aad).Path
+node tests/browser/firefox_bidi_e2e.mjs
 ```
 
 密码测试由被测应用独立比较实际值，只回报相等/已清空状态；客户端同时检查输出无测试值。

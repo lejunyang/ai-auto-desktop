@@ -12,11 +12,12 @@
 | `desktop.linux_atspi` | focus, invoke, click, fill, type_text, key, scroll, hover, drag, paste, minimize, maximize, restore, close_window, activate | AT-SPI；指针/键盘经 X11 XTest helper，本机 KDE/X11 已验收，GNOME/XFCE X11 待真机验收，Wayland 输入尚未实现；派发前核对焦点、PID 与落点，drag 起止两点都核对；窗口动作只在顶层窗口节点上、需要 EWMH 窗口管理器。另有只读 capture / read_text（Tesseract），以及需单独授权的 launch、clipboard_read、global_key（见下文“其他平台”） |
 | `desktop.macos_ax` | focus, invoke, click, fill, type_text, key, scroll, hover, drag, paste, minimize, maximize, restore, close_window, activate | AX helper；需要同一登录用户的辅助功能权限；指针动作要求目标应用在前台并经 AX 命中检查，事件只投递给目标进程；key 名称按字面（`ctrl` 是 Control，`cmd` 是 Command）；窗口动作只在 AXWindow 节点上，maximize 即全屏。另有 capture（需屏幕录制权限）、read_text、launch、clipboard_read、global_key。[待验证] 全部新增项需 macOS 真机 |
 | `browser.cdp` | focus, click, fill, type_text, key, scroll, hover, drag, select, check, navigate, back, forward, reload, open_tab, activate_page, close_page, accept, dismiss, upload, emulate, clear_site_data | 普通 click 为 `HTMLElement.click()` 的 DOM 激活；带 button/count/fraction 的 click、scroll、hover、drag 为可信 CDP Input（任何 frame，含跨进程 OOPIF），落点先在页面里命中检查；fill/select 为 DOM 值及 input/change 事件；check 已是目标状态时不点击；type_text/key 为发给焦点元素的可信 CDP 键盘输入；navigate/back/forward/reload、标签页动作 open_tab/activate_page/close_page 以及 emulate/clear_site_data 在 body 节点上，只限主 frame；accept/dismiss 只在 JavaScript 对话框节点上；upload 只在文件框上，路径受 `--allow-upload-dir` 限制 |
+| `browser.firefox_bidi` | focus, invoke, fill, click, hover, scroll, key, type_text, select, check | Firefox WebDriver BiDi；主文档写操作，子 frame 只读；click/hover/scroll/key/keys 文本使用可信输入，invoke/fill/check/select 使用 DOM 语义。支持安全局部 capture；双击、长按、指针修饰键、导航/标签页等首版未实现，参数范围见下文 Firefox 专节 |
 
 以 `capabilities` 和观察节点的 `capabilities` 为准。可列出 provider 不表示当前 OS 已授予
 桌面权限。启动失败或不可用原因在 `unavailable` 中返回。
 
-`key`、单次 `click` 和 `drag` 接受可选 `hold_ms`，范围 1–5000 毫秒。
+原生 provider 与 `browser.cdp` 的 `key`、单次 `click` 和 `drag` 接受可选 `hold_ms`，范围 1–5000 毫秒。
 按键在按下组合键后等待，点击在按下按钮后等待，拖拽在起点按下后等待再移动；
 每次调用均负责释放自己按下的键和按钮，不允许跨调用遗留按下状态。
 `click` 带 `hold_ms` 时使用真实指针路径，不能同时指定双击；全局快捷键不支持长按。
@@ -38,7 +39,7 @@ AT-SPI 中心点命中校验无法确认落在新鲜目标子树时返回 `DRIVE
 `effect: not_applied`，不发送输入。重新观察并定位具体叶子节点，或滚动后重试；目标支持键盘动作时也可使用键盘。
 该错误表示命中证明失败；元素缺少动作能力仍返回 `DRIVER.ACTION_UNSUPPORTED`。
 
-浏览器键盘：先聚焦被观察元素并确认焦点（含开放 shadow root 内的深层焦点）和文档焦点都在它上面，再发键。
+Chromium/CDP 键盘：先聚焦被观察元素并确认焦点（含开放 shadow root 内的深层焦点）和文档焦点都在它上面，再发键。
 `type_text` 只在可编辑节点上提供，逐字符发送，每个字符前重新确认焦点，焦点移走即以 `CONTROL.FOCUS_LOST`
 （`details.typed` 为已发字符数）停止：`mode: unicode`（默认）每字符一次 `Input.insertText`（有 input 事件，
 无按键事件）；`mode: keys` 发 keydown/keypress/keyup（带 key/code，`isTrusted=true`），只接受 US 布局可打出的字符，
@@ -52,7 +53,7 @@ Alt/Meta 及 F2 以外的功能键仍以 `CONTROL.ACTION_UNSUPPORTED` 拒绝。
 2026-11-07 本机有界面 Chromium 对有/无页面处理器共 18 组 Ctrl 组合完成真实检查：
 页面收到可信事件，原生编辑器焦点、窗口/对话框集合、网址和标签页不变；另有超时后释放验收。
 
-浏览器 drag：在可拖起的元素（`draggable`、列表/网格项、grab/move 光标）及已确认的 Canvas/closed-shadow surface 上提供，终点可以是同一观察里的任何节点。
+Chromium/CDP drag：在可拖起的元素（`draggable`、列表/网格项、grab/move 光标）及已确认的 Canvas/closed-shadow surface 上提供，终点可以是同一观察里的任何节点。
 两端都滚进视口后在当前位置各自命中检查（不再滚动），被遮挡或无法同时可见则 `CONTROL.OCCLUDED` 且什么都不按下；
 随后按下、12 步滑动、松开。HTML5 拖放经 `Input.setInterceptDrags` 截获，再用 `Input.dispatchDragEvent`
 （dragEnter/dragOver/drop，带拖拽数据）在终点完成。实测 headless Chrome 只用鼠标事件也能完成 HTML5 drop，
@@ -177,6 +178,51 @@ MCP `browser_downloads`（只读，`--allow-input` 不需要）列出 `directory
 `check` 要 `checked`；`navigate` 与 `open_tab` 要 `url`；`emulate` 要 `preset`（desktop/tablet/mobile/reset）或 `color_scheme`（light/dark/no_preference）或两者，只有预设名、没有尺寸或位置字段，效果持续到本会话与该页的连接断开；`clear_site_data` 用 `Storage.clearDataForOrigin` 清掉页面 origin 的 cookie、localStorage、IndexedDB、缓存与 service worker（不含 sessionStorage）；`accept` 可带 `text`（≤4096）；`paste` 要 `text`（1..4096）。`fraction` 是元素框内 0..1 的比例，不是屏幕坐标。
 `capabilities` 每个 provider 另列 `reads`（`capture`、`read_text`），并只在授权时列出 `launch`（允许启动的程序）、
 `clipboard_read: true`、`global_keys: true`。
+
+## Firefox WebDriver BiDi（首版）
+
+Firefox 使用独立的 `browser.firefox_bidi` provider。连接操作者已启动的本机 BiDi 端口，
+不复用 Chromium/CDP 命令，也不在失败时切换协议。CLI 和 MCP 入口分别为：
+
+```powershell
+aad control serve --allow-input --provider browser.firefox_bidi --browser-bidi-port 9223
+aad mcp --allow-input --provider browser.firefox_bidi --browser-bidi-port 9223
+```
+
+`--browser-bidi-port` 与 `--browser-port` 互斥，只连接 loopback `/session`。
+一个 provider 持有一条连接和一个 Firefox 自动化 session；已有自动化 session 占用时明确失败。
+关闭控制会话会结束自己的 BiDi session，不关闭浏览器。当前包括 headless 在内的输入均保守占用
+`desktop-input`，不会仅凭网页或 user agent 声称 headless 就免除桌面互斥。
+
+观察、find、wait、HTML id scope 和从已观察元素派生的 `scope_target` 可用。
+观察基于有界 DOM 语义与独立 sandbox realm，不能视为 Firefox 原生无障碍树；
+身份 token、节点指纹、当前 realm、文档及祖先 URL 授权在操作前重新检查。
+子 frame 可单独观察，但动作能力为空，首版不向子 frame 写入。
+
+主文档支持 DOM `focus`、`fill`、`invoke`、`check`、`select`。fill 是替换值并派发 input/change，
+invoke 是 DOM 激活；这些不承诺可信用户事件。`click` 始终使用可信指针，支持左/中/右键及元素内比例，
+只接受单击；`hover`、`scroll` 使用可信指针/滚轮。派发前检查新鲜身份、整数落点及遮挡，
+准备阶段的滚动和聚焦同样受取消与截止时间约束。
+
+`key` 首版接受单个可打印字符、Enter/Tab/Escape、Backspace/Delete、Home/End、方向键、Space，
+以及 Ctrl+A。其他组合、功能键及 `hold_ms` 明确拒绝。`type_text` 必须显式给 `mode: keys`；
+默认/显式 Unicode 模式暂未实现，不能默默改为按键输入。每个字符/按键前复核焦点、身份及授权，
+异常后以独立短预算调用 releaseActions，错误详情报告释放结果；正在阻塞的协议调用仍受其截止时间约束。
+
+`capture` 只截取主文档中已观察、完全在视口内的节点，不自动滚动。
+后端私下遍历 light/open/closed shadow 中的保护字段，持续记住其身份；即使 password 改成 text
+或移出 closed root，仍不导出值，且拒绝覆盖它的截图。私有协议响应可能含 HTML 属性，
+不会将其原样导出给调用者。截图范围与任何 frame 相交也暂时拒绝；相关元素移除后可以重新观察并恢复截图。
+扫描不完整则拒绝，不以未知状态放行；这不防止页面自己将秘密复制到其他普通内容区域。
+
+首版尚未实现双击、指针修饰键、长按、hover 停留、drag/path、secret_input、上传、对话框、
+导航/历史/标签页生命周期、模拟环境与存储控制。它们不出现在相应节点能力中，未支持参数返回
+`CONTROL.ACTION_UNSUPPORTED`。Firefox 内部特权页面也未验收，Chromium 的内部来源授权不能直接外推。
+
+本机 Linux Firefox 159.0.1 headless 已通过公开 CLI 的 13 组检查：中文 DOM 编辑与独立值回读、
+真实全选/逐键输入、按钮/滚轮事件、局部截图、无 id scope、过期/遮挡拒绝、受保护字段 reveal 后的持续保护、
+移除后截图恢复，以及取消后的释放和后续点击。测试见 `tests/browser/firefox_bidi_e2e.mjs`。
+有界面 Firefox、Windows/macOS Firefox 与复杂 IME **[待真机验收]**；这些证据不等同于 Chromium 34 项回归。
 
 ## 桌面截图、OCR、窗口、启动、剪贴板与全局快捷键（Windows）
 
