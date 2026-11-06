@@ -10,10 +10,10 @@ use std::sync::{
     Arc, Mutex,
 };
 use std::time::Duration;
-use sysinfo::{Pid, ProcessRefreshKind, ProcessStatus, ProcessesToUpdate, System, UpdateKind};
 
 const MARKER: &str = "aad-profile-lease-v1\n";
 const SENTINEL: &str = ".aad-recording.lock";
+const GUARD: &str = ".aad-recording.guard";
 
 pub(super) struct Lease {
     path: PathBuf,
@@ -36,7 +36,7 @@ fn guard(path: &Path) -> super::Result<Guard> {
         .write(true)
         .create(true)
         .truncate(false)
-        .open(path.join(".aad-recording.guard"))?;
+        .open(path.join(GUARD))?;
     file.try_lock_exclusive().map_err(|e| {
         if e.kind() == ErrorKind::WouldBlock {
             "profile is owned by an active AAD browser session; close that session first"
@@ -48,9 +48,28 @@ fn guard(path: &Path) -> super::Result<Guard> {
     Ok(Guard(file))
 }
 
-// Older versions used an empty sentinel and did not hold an OS lock. Reclaim
-// those only when no other possible legacy owner remains; never guess a PID.
+// Older versions used an empty sentinel and did not hold an OS lock, but kept
+// the sentinel open for the whole session. On Windows an exclusive open proves
+// whether any handle (and so any owner) remains. Elsewhere reclaim it only when
+// no other possible legacy owner remains; never guess a PID.
+#[cfg(windows)]
+fn legacy_owner_alive(sentinel: &Path) -> bool {
+    use std::os::windows::fs::OpenOptionsExt;
+    match OpenOptions::new().read(true).share_mode(0).open(sentinel) {
+        Ok(_) => false,
+        // A sharing violation means a handle is open; anything else is unknown.
+        Err(e) => e.kind() != ErrorKind::NotFound,
+    }
+}
+
+#[cfg(not(windows))]
+fn legacy_owner_alive(_sentinel: &Path) -> bool {
+    legacy_owner_running()
+}
+
+#[cfg(not(windows))]
 fn legacy_owner_running() -> bool {
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessStatus, ProcessesToUpdate, System, UpdateKind};
     let mut system = System::new();
     system.refresh_processes_specifics(
         ProcessesToUpdate::All,
@@ -79,20 +98,31 @@ fn legacy_owner_running() -> bool {
 /// Called only while holding the guard. New sentinels without that guard are
 /// abandoned. Unknown legacy sentinels are preserved while an old owner may live.
 fn reclaim(path: &Path) -> super::Result<()> {
+    reclaim_with(path, legacy_owner_alive)
+}
+
+fn reclaim_with(path: &Path, owner_alive: impl FnOnce(&Path) -> bool) -> super::Result<()> {
     let sentinel = path.join(SENTINEL);
     let bytes = match fs::read(&sentinel) {
         Ok(bytes) => bytes,
         Err(e) if e.kind() == ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(e.into()),
     };
-    if bytes != MARKER.as_bytes() && legacy_owner_running() {
+    if bytes != MARKER.as_bytes() && owner_alive(&sentinel) {
         return Err("profile has a legacy AAD lease with a possible live owner; close other AAD browser sessions and retry so it can be recovered automatically".into());
     }
-    fs::remove_file(sentinel)?;
-    Ok(())
+    match fs::remove_file(sentinel) {
+        Err(e) if e.kind() != ErrorKind::NotFound => Err(e.into()),
+        _ => Ok(()),
+    }
 }
 
 pub(super) fn check(path: &Path) -> super::Result<()> {
+    // Nothing has ever leased this directory (for example a real browser
+    // profile that is only read): do not leave a guard file behind in it.
+    if !path.join(GUARD).exists() && !path.join(SENTINEL).exists() {
+        return Ok(());
+    }
     let _guard = guard(path)?;
     reclaim(path)
 }
@@ -216,7 +246,15 @@ mod tests {
         child.wait().unwrap();
         assert!(ready && blocked);
         assert!(path.join(SENTINEL).exists());
-        let recovered = Lease::acquire(&path).unwrap();
+        // Windows releases a terminated process's locks asynchronously.
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let recovered = loop {
+            match Lease::acquire(&path) {
+                Ok(lease) => break lease,
+                Err(e) if Instant::now() >= deadline => panic!("lease not recovered: {e}"),
+                Err(_) => std::thread::sleep(Duration::from_millis(50)),
+            }
+        };
         drop(recovered);
         assert!(!path.join(SENTINEL).exists());
         fs::remove_dir_all(path).unwrap();
@@ -252,19 +290,56 @@ mod tests {
         fs::remove_dir_all(path).unwrap();
     }
 
+    // Inject the owner probe: sibling tests spawn copies of this test binary,
+    // so the real process scan is not stable while the suite runs.
     #[test]
-    fn an_unowned_legacy_sentinel_is_recovered() {
+    fn a_legacy_sentinel_is_kept_while_its_owner_may_live_and_recovered_after() {
         let path = profile();
         fs::write(path.join(SENTINEL), b"").unwrap();
-        // Other AAD processes on a developer's machine are real possible owners.
-        if legacy_owner_running() {
-            assert!(Lease::acquire(&path).is_err());
-            assert!(path.join(SENTINEL).exists());
-        } else {
-            let lease = Lease::acquire(&path).unwrap();
-            drop(lease);
-            assert!(!path.join(SENTINEL).exists());
-        }
+        let guard = guard(&path).unwrap();
+        assert!(reclaim_with(&path, |_| true).is_err());
+        assert!(path.join(SENTINEL).exists());
+        reclaim_with(&path, |_| false).unwrap();
+        assert!(!path.join(SENTINEL).exists());
+        drop(guard);
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn a_current_sentinel_without_its_guard_is_abandoned_whatever_runs() {
+        let path = profile();
+        fs::write(path.join(SENTINEL), MARKER).unwrap();
+        let guard = guard(&path).unwrap();
+        reclaim_with(&path, |_| true).unwrap();
+        assert!(!path.join(SENTINEL).exists());
+        drop(guard);
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn checking_an_unleased_directory_leaves_no_files() {
+        let path = profile();
+        check(&path).unwrap();
+        assert!(fs::read_dir(&path).unwrap().next().is_none());
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    // Old versions kept the empty sentinel open until their session ended.
+    #[cfg(windows)]
+    #[test]
+    fn a_legacy_sentinel_is_recovered_once_its_old_owner_closes_it() {
+        let path = profile();
+        let old_owner = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path.join(SENTINEL))
+            .unwrap();
+        assert!(Lease::acquire(&path).is_err());
+        assert!(path.join(SENTINEL).exists());
+        drop(old_owner);
+        let lease = Lease::acquire(&path).unwrap();
+        drop(lease);
+        assert!(!path.join(SENTINEL).exists());
         fs::remove_dir_all(path).unwrap();
     }
 }
