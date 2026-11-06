@@ -381,6 +381,41 @@ impl Backend for NativeBackend {
         args["max_nodes"] = json!(max_nodes);
         self.invoke("snapshot", args, timeout)
     }
+    fn observe_scope(
+        &self,
+        selector: &Value,
+        scope: &str,
+        max_nodes: usize,
+        timeout: Duration,
+    ) -> Result<Value> {
+        if !self.offers("snapshot_scope") {
+            return Err(error(
+                "CONTROL.SCOPE_UNSUPPORTED",
+                "native provider has no scoped capture",
+            ));
+        }
+        let mut args = selector.clone();
+        args["scope_id"] = json!(scope);
+        args["max_nodes"] = json!(max_nodes);
+        self.invoke("snapshot_scope", args, timeout)
+    }
+    fn observe_target_scope(
+        &self,
+        snapshot: &Value,
+        node: &Value,
+        max_nodes: usize,
+        timeout: Duration,
+    ) -> Result<Value> {
+        if !self.offers("snapshot_scope") {
+            return Err(error(
+                "CONTROL.SCOPE_UNSUPPORTED",
+                "native provider has no scoped capture",
+            ));
+        }
+        let mut args = self.read_args(snapshot, node);
+        args["max_nodes"] = json!(max_nodes);
+        self.invoke("snapshot_scope", args, timeout)
+    }
     fn view(&self, snapshot: &Value, view: &View, timeout: Duration) -> Result<Option<Value>> {
         // Only the Windows driver computes regions; the others use the portable outline.
         if !matches!(self.flavor, Flavor::Windows) {

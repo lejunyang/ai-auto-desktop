@@ -5,9 +5,9 @@
 //! accessibility D-Bus with pure-Rust `zbus`; no Python worker is involved.
 
 use aad_core::AutomationError;
-use aad_plugin::{CapabilityManifest, manifest};
+use aad_plugin::{manifest, CapabilityManifest};
 use aad_runtime::{ArtifactStore, Provider};
-use serde_json::{Map, Value, json};
+use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -146,6 +146,20 @@ pub trait AtspiBackend: Send + Sync {
         max_nodes: usize,
         deadline: Instant,
     ) -> Result<BackendSnapshot, AutomationError>;
+    /// Capture a previously observed root, retaining ancestors needed for hit testing.
+    fn capture_scope(
+        &self,
+        _application: &Map<String, Value>,
+        _root: &NativeRef,
+        _max_depth: u32,
+        _max_nodes: usize,
+        _deadline: Instant,
+    ) -> Result<BackendSnapshot, AutomationError> {
+        Err(driver_error(
+            "DRIVER.ACTION_UNSUPPORTED",
+            "scoped capture is unavailable",
+        ))
+    }
     fn focus(&self, target: &NativeRef, deadline: Instant) -> Result<Value, AutomationError>;
     fn invoke(&self, target: &NativeRef, deadline: Instant) -> Result<Value, AutomationError>;
     fn set_text(
@@ -333,13 +347,24 @@ pub trait AtspiBackend: Send + Sync {
 }
 
 #[derive(Clone)]
+struct Scope {
+    id: String,
+    root: NativeRef,
+    fingerprint: String,
+    application: Value,
+}
+
+#[derive(Clone)]
 struct Record {
     public: Value,
     handles: BTreeMap<String, NativeRef>,
     fingerprints: BTreeMap<String, String>,
+    members: BTreeSet<String>,
     application_selector: Map<String, Value>,
     max_depth: u32,
     max_nodes: usize,
+    scope: Option<Scope>,
+    valid: bool,
 }
 
 #[derive(Default)]
@@ -413,6 +438,7 @@ impl AtspiProvider {
                 }))
             }
             "snapshot" => self.snapshot(args, deadline),
+            "snapshot_scope" => self.snapshot_scope(args, deadline),
             "find" => self.find(args, deadline),
             "capture_target" => self.capture_target(args, deadline, artifacts),
             "capture" => self.capture_inline(args, deadline),
@@ -503,9 +529,125 @@ impl AtspiProvider {
         max_nodes: usize,
         deadline: Instant,
     ) -> Result<Record, AutomationError> {
-        let raw = self
-            .backend
-            .capture(selector, max_depth, max_nodes, deadline)?;
+        self.capture_scoped(selector, max_depth, max_nodes, None, deadline)
+    }
+
+    fn snapshot_scope(
+        &self,
+        args: &Map<String, Value>,
+        deadline: Instant,
+    ) -> Result<Value, AutomationError> {
+        only_keys(
+            args,
+            &[
+                "target",
+                "locator",
+                "scope_id",
+                "application",
+                "max_depth",
+                "max_nodes",
+            ],
+        )?;
+        let max_depth = bounded_integer(
+            args.get("max_depth"),
+            DEFAULT_MAX_DEPTH as u64,
+            0,
+            MAX_DEPTH as u64,
+            "max_depth",
+        )? as u32;
+        let max_nodes = bounded_integer(
+            args.get("max_nodes"),
+            DEFAULT_MAX_NODES as u64,
+            1,
+            MAX_NODES as u64,
+            "max_nodes",
+        )? as usize;
+        let (record, scope) = if let Some(scope_id) = args.get("scope_id") {
+            if args.contains_key("target") || args.contains_key("locator") {
+                return Err(invalid(
+                    "scope_id and target/locator are mutually exclusive",
+                ));
+            }
+            let scope_id = required_string(scope_id, "scope_id")?;
+            let selector = application_selector(args.get("application"))?;
+            let state = self
+                .state
+                .lock()
+                .map_err(|_| driver_error("DRIVER.ACTION_FAILED", "driver state is unavailable"))?;
+            let record = state
+                .current
+                .as_ref()
+                .ok_or_else(|| stale("scope is no longer current"))?
+                .clone();
+            let scope = record
+                .scope
+                .as_ref()
+                .filter(|scope| scope.id == scope_id)
+                .ok_or_else(|| stale("scope is no longer current"))?
+                .clone();
+            if selector != record.application_selector {
+                return Err(stale("scope belongs to a different application selector"));
+            }
+            (record, scope)
+        } else {
+            if args.contains_key("application") {
+                return Err(invalid("target-based scope uses its observed application"));
+            }
+            let record = self.observed_record(args)?;
+            let node_id = required_string(&args["target"]["node_id"], "target.node_id")?;
+            let locator = parse_locator(args.get("locator"))?;
+            // This read-only narrowing operation may start from an incomplete
+            // tree, but can only select a native identity actually observed.
+            let resolved = resolve(&record, &locator, deadline)?;
+            let resolved_id = resolved["node_id"].as_str().expect("normalized node id");
+            let root = record
+                .handles
+                .get(node_id)
+                .ok_or_else(|| stale("scope root was not observed"))?;
+            if !record.members.contains(node_id) {
+                return Err(stale("context ancestors cannot expand the observed scope"));
+            }
+            if record.handles.get(resolved_id) != Some(root)
+                || record.fingerprints.get(resolved_id) != record.fingerprints.get(node_id)
+            {
+                return Err(stale("scope target does not match its observed locator"));
+            }
+            let scope = Scope {
+                id: uuid::Uuid::new_v4().simple().to_string(),
+                root: root.clone(),
+                fingerprint: record.fingerprints[node_id].clone(),
+                application: record.public["application"].clone(),
+            };
+            (record, scope)
+        };
+        Ok(self
+            .capture_scoped(
+                &record.application_selector,
+                max_depth,
+                max_nodes,
+                Some(scope),
+                deadline,
+            )?
+            .public)
+    }
+
+    fn capture_scoped(
+        &self,
+        selector: &Map<String, Value>,
+        max_depth: u32,
+        max_nodes: usize,
+        scope: Option<Scope>,
+        deadline: Instant,
+    ) -> Result<Record, AutomationError> {
+        let raw = match scope.as_ref() {
+            Some(scope) => {
+                self.backend
+                    .capture_scope(selector, &scope.root, max_depth, max_nodes, deadline)?
+            }
+            None => self
+                .backend
+                .capture(selector, max_depth, max_nodes, deadline)?,
+        };
         if raw.nodes.len() > max_nodes {
             return Err(driver_error(
                 "DRIVER.ACTION_FAILED",
@@ -522,6 +664,7 @@ impl AtspiProvider {
         let mut nodes = Vec::with_capacity(raw.nodes.len());
         let mut handles = BTreeMap::new();
         let mut fingerprints = BTreeMap::new();
+        let mut members = BTreeSet::new();
         for (index, item) in raw.nodes.into_iter().enumerate() {
             remaining(deadline, false)?;
             let parent_id = item
@@ -538,6 +681,13 @@ impl AtspiProvider {
                 })
                 .transpose()?;
             let node_id = format!("n{index}");
+            let member = scope.as_ref().is_none_or(|scope| item.native == scope.root)
+                || parent_id
+                    .as_ref()
+                    .is_some_and(|parent| members.contains(parent));
+            if member {
+                members.insert(node_id.clone());
+            }
             let role = normalize_role(&item.role);
             let mut states = Map::new();
             for name in STATE_NAMES {
@@ -553,6 +703,9 @@ impl AtspiProvider {
             }
             let mut provenance = item.provenance;
             provenance.insert("backend".into(), json!(self.backend.name()));
+            if !member {
+                provenance.insert("scope_context".into(), json!(true));
+            }
             let protected = states.get("protected") == Some(&Value::Bool(true))
                 || provenance.get("value_redacted") == Some(&Value::Bool(true))
                 || matches!(role.as_str(), "password_text" | "password");
@@ -563,6 +716,7 @@ impl AtspiProvider {
             let actions = item
                 .actions
                 .into_iter()
+                .filter(|_| member)
                 .filter(|action| WRITE_ACTIONS.contains(&action.as_str()))
                 .filter(|action| {
                     !protected
@@ -597,7 +751,7 @@ impl AtspiProvider {
             fingerprints.insert(node_id, fingerprint(&node));
             nodes.push(node);
         }
-        let public = json!({
+        let mut public = json!({
             "snapshot_id": snapshot_id,
             "revision": revision,
             "session": self.backend.session_info(),
@@ -607,13 +761,37 @@ impl AtspiProvider {
             "truncated": raw.truncated,
             "truncation_reasons": raw.truncation_reasons,
         });
+        if let Some(scope) = &scope {
+            if ["bus_name", "object_path", "process_id"]
+                .iter()
+                .any(|key| public["application"][key] != scope.application[key])
+            {
+                return Err(stale("scoped application identity changed"));
+            }
+            let roots = handles
+                .iter()
+                .filter(|(_, native)| *native == &scope.root)
+                .collect::<Vec<_>>();
+            if roots.is_empty()
+                || roots
+                    .iter()
+                    .any(|(id, _)| fingerprints.get(*id) != Some(&scope.fingerprint))
+            {
+                return Err(stale("scope root is absent or its identity changed"));
+            }
+            public["scope_id"] = json!(scope.id);
+            public["scope_revision"] = json!(revision);
+        }
         let record = Record {
             public,
             handles,
             fingerprints,
+            members,
             application_selector: selector.clone(),
             max_depth,
             max_nodes,
+            scope,
+            valid: true,
         };
         state.current = Some(record.clone());
         Ok(record)
@@ -637,7 +815,10 @@ impl AtspiProvider {
             .current
             .as_ref()
             .ok_or_else(|| stale("snapshot is not the current driver version"))?;
-        if record.public["snapshot_id"] != snapshot_id || record.public["revision"] != revision {
+        if !record.valid
+            || record.public["snapshot_id"] != snapshot_id
+            || record.public["revision"] != revision
+        {
             return Err(stale("snapshot is not the current driver version"));
         }
         Ok(record.clone())
@@ -705,7 +886,8 @@ impl AtspiProvider {
         let locator = parse_locator(args.get("locator"))?;
         let expected = resolve(record, &locator, deadline)?;
         let expected_id = expected["node_id"].as_str().expect("normalized node id");
-        if !record.handles.contains_key(&node_id)
+        if !record.members.contains(&node_id)
+            || !record.handles.contains_key(&node_id)
             || record.handles.get(expected_id) != record.handles.get(&node_id)
             || record.fingerprints.get(expected_id) != record.fingerprints.get(&node_id)
         {
@@ -749,10 +931,11 @@ impl AtspiProvider {
         // Reject invalid observed references before asking the backend for a
         // fresh tree. Both checks use the same identity/fingerprint rules.
         Self::revalidate_target(args, &record, &record, deadline)?;
-        let fresh = self.capture(
+        let fresh = self.capture_scoped(
             &record.application_selector,
             record.max_depth,
             record.max_nodes,
+            record.scope.clone(),
             deadline,
         )?;
         let (fresh_id, resolved, native) =
@@ -970,7 +1153,9 @@ impl AtspiProvider {
             Ok(backend_result) => {
                 remaining(deadline, true)?;
                 if let Ok(mut state) = self.state.lock() {
-                    state.current = None;
+                    if let Some(record) = state.current.as_mut() {
+                        record.valid = false;
+                    }
                 }
                 Ok(
                     json!({"ok": true, "action": action, "resolved": target(&fresh, &fresh_id), "backend_result": backend_result}),
@@ -984,7 +1169,9 @@ impl AtspiProvider {
                     ) =>
             {
                 if let Ok(mut state) = self.state.lock() {
-                    state.current = None;
+                    if let Some(record) = state.current.as_mut() {
+                        record.valid = false;
+                    }
                 }
                 Err(driver_error(
                     "DRIVER.UNKNOWN_EFFECT",
@@ -1640,7 +1827,11 @@ fn resolve(
     let mut candidates = Vec::new();
     for node in record.public["nodes"].as_array().expect("normalized nodes") {
         remaining(deadline, false)?;
-        if node_matches(node, locator) {
+        if record
+            .members
+            .contains(node["node_id"].as_str().expect("normalized node id"))
+            && node_matches(node, locator)
+        {
             // Multiple tree paths can expose the same accessible. Collapse only
             // identical native identities with identical identity fingerprints.
             let id = node["node_id"].as_str().expect("normalized node id");
@@ -1662,11 +1853,10 @@ fn resolve(
                 .with_detail("candidate_count", json!(many.len()))
                 .with_detail(
                     "candidates",
-                    json!(
-                        many.iter()
-                            .take(MAX_CANDIDATE_SUMMARIES)
-                            .collect::<Vec<_>>()
-                    ),
+                    json!(many
+                        .iter()
+                        .take(MAX_CANDIDATE_SUMMARIES)
+                        .collect::<Vec<_>>()),
                 ),
         ),
     }
@@ -2124,7 +2314,15 @@ fn manifest_document() -> Value {
     }});
     actions.insert("list_applications".into(), contract("通过 AT-SPI desktop 根节点枚举当前会话的桌面应用。", "read_only", "observe", "low", &["desktop.observe"], json!({"type": "object", "additionalProperties": false}), json!({"type": "object", "required": ["session", "backend", "applications"], "properties": {"session": {"type": "object"}, "backend": {"type": "string"}, "applications": {"type": "array", "items": {"type": "object"}}}, "additionalProperties": false}), false, false));
     let snapshot_output = json!({"type": "object", "required": ["snapshot_id", "revision", "session", "backend", "application", "nodes", "truncated", "truncation_reasons"], "properties": {"snapshot_id": {"type": "string"}, "revision": {"type": "integer", "minimum": 1}, "session": {"type": "object"}, "backend": {"type": "string"}, "application": {"type": "object"}, "nodes": {"type": "array", "items": {"type": "object"}}, "truncated": {"type": "boolean"}, "truncation_reasons": {"type": "array", "items": {"type": "object"}, "maxItems": 32}}, "additionalProperties": false});
-    actions.insert("snapshot".into(), contract("抓取一个精确应用选择器对应的有界 AT-SPI 可访问性树。", "read_only", "observe", "low", &["desktop.observe"], json!({"type": "object", "required": ["application"], "properties": {"application": application_schema(), "max_depth": {"type": "integer", "minimum": 0, "maximum": MAX_DEPTH}, "max_nodes": {"type": "integer", "minimum": 1, "maximum": MAX_NODES}}, "additionalProperties": false}), snapshot_output, false, false));
+    actions.insert("snapshot".into(), contract("抓取一个精确应用选择器对应的有界 AT-SPI 可访问性树。", "read_only", "observe", "low", &["desktop.observe"], json!({"type": "object", "required": ["application"], "properties": {"application": application_schema(), "max_depth": {"type": "integer", "minimum": 0, "maximum": MAX_DEPTH}, "max_nodes": {"type": "integer", "minimum": 1, "maximum": MAX_NODES}}, "additionalProperties": false}), snapshot_output.clone(), false, false));
+    let mut scoped_output = snapshot_output;
+    scoped_output["properties"]["scope_id"] = json!({"type": "string", "minLength": 1});
+    scoped_output["properties"]["scope_revision"] = json!({"type": "integer", "minimum": 1});
+    scoped_output["required"]
+        .as_array_mut()
+        .unwrap()
+        .extend([json!("scope_id"), json!("scope_revision")]);
+    actions.insert("snapshot_scope".into(), contract("重新验证已观察目标并抓取其有界子树及命中校验所需祖先；可用当前 scope_id 刷新同一范围。", "read_only", "observe", "low", &["desktop.observe"], json!({"type": "object", "properties": {"target": target_schema(), "locator": locator_schema(), "scope_id": {"type": "string", "minLength": 1}, "application": application_schema(), "max_depth": {"type": "integer", "minimum": 0, "maximum": MAX_DEPTH}, "max_nodes": {"type": "integer", "minimum": 1, "maximum": MAX_NODES}}, "oneOf": [{"required": ["target", "locator"], "not": {"anyOf": [{"required": ["scope_id"]}, {"required": ["application"]}]}}, {"required": ["scope_id", "application"], "not": {"anyOf": [{"required": ["target"]}, {"required": ["locator"]}]}}], "additionalProperties": false}), scoped_output, false, true));
     actions["snapshot"]["errors"].as_array_mut().unwrap().extend([
         json!({"code": "DRIVER.NOT_FOUND", "description": "定位器没有匹配节点。", "retryable": false, "effect": "not_applied", "data_schema": {"type": "object"}}),
         json!({"code": "DRIVER.AMBIGUOUS", "description": "定位器匹配多个节点。", "retryable": false, "effect": "not_applied", "data_schema": {"type": "object"}}),
@@ -2354,12 +2552,15 @@ mod tests {
     #[derive(Default)]
     struct FakeBackend {
         captures: AtomicUsize,
+        scoped_captures: AtomicUsize,
         writes: AtomicUsize,
         changed: bool,
         duplicate: bool,
         alias: bool,
         replaced: bool,
         truncated: bool,
+        scoped_truncated: bool,
+        scope_context: bool,
         hit_chain: u8,
         /// Containers above the target, which is then `n{depth}`.
         depth: usize,
@@ -2494,6 +2695,37 @@ mod tests {
                 } else {
                     vec![]
                 },
+            })
+        }
+        fn capture_scope(
+            &self,
+            _application: &Map<String, Value>,
+            root: &NativeRef,
+            _max_depth: u32,
+            _max_nodes: usize,
+            _deadline: Instant,
+        ) -> Result<BackendSnapshot, AutomationError> {
+            self.scoped_captures.fetch_add(1, Ordering::SeqCst);
+            let mut node = self.node(&root.object_path);
+            if self.changed {
+                node.name = Some("Changed".into());
+            }
+            if self.replaced {
+                node.native.object_path = "/replacement".into();
+            }
+            let mut nodes = Vec::new();
+            if self.scope_context {
+                let mut context = self.node("/context");
+                context.name = Some("Context".into());
+                nodes.push(context);
+                node.parent_index = Some(0);
+            }
+            nodes.push(node);
+            Ok(BackendSnapshot {
+                application: Self::application(),
+                nodes,
+                truncated: self.scoped_truncated,
+                truncation_reasons: vec![],
             })
         }
         fn focus(&self, _target: &NativeRef, _deadline: Instant) -> Result<Value, AutomationError> {
@@ -2732,6 +2964,7 @@ mod tests {
             "inspect_session",
             "list_applications",
             "snapshot",
+            "snapshot_scope",
             "find",
             "capture_target",
             "capture",
@@ -2763,6 +2996,145 @@ mod tests {
             );
         }
         assert!(parsed.actions["capture_target"].has_artifacts());
+    }
+
+    #[test]
+    fn scoped_reads_recover_truncated_observations_and_keep_writes_scoped() {
+        let backend = Arc::new(FakeBackend {
+            truncated: true,
+            ..Default::default()
+        });
+        let provider = AtspiProvider::new(backend.clone()).unwrap();
+        let observed = take_snapshot(&provider);
+        let scoped = provider.invoke("desktop.linux_atspi.snapshot_scope@1", json!({"target": {"snapshot_id": observed["snapshot_id"], "revision": observed["revision"], "node_id": "n0"}, "locator": locator(), "max_nodes": 20}), Some(Duration::from_secs(2))).unwrap();
+        assert_eq!(scoped["truncated"], false);
+        assert_eq!(scoped["scope_revision"], scoped["revision"]);
+        let write_args = json!({"target": {"snapshot_id": scoped["snapshot_id"], "revision": scoped["revision"], "node_id": "n0"}, "locator": locator()});
+        provider
+            .invoke(
+                "desktop.linux_atspi.focus@1",
+                write_args.clone(),
+                Some(Duration::from_secs(2)),
+            )
+            .unwrap();
+        assert_eq!(
+            backend.captures.load(Ordering::SeqCst),
+            1,
+            "write refresh must not fall back to the full application"
+        );
+        assert_eq!(backend.scoped_captures.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            provider
+                .invoke(
+                    "desktop.linux_atspi.focus@1",
+                    write_args,
+                    Some(Duration::from_secs(2))
+                )
+                .unwrap_err()
+                .code,
+            "DRIVER.STALE_SNAPSHOT"
+        );
+        let refreshed = provider.invoke("desktop.linux_atspi.snapshot_scope@1", json!({"scope_id": scoped["scope_id"], "application": {"name": "Fixture"}, "max_nodes": 20}), Some(Duration::from_secs(2))).unwrap();
+        assert_eq!(refreshed["scope_id"], scoped["scope_id"]);
+        assert!(refreshed["revision"].as_u64() > scoped["revision"].as_u64());
+    }
+
+    #[test]
+    fn scoped_reads_reject_forged_mismatched_and_expired_roots() {
+        for (changed, replaced, node_id, name) in [
+            (false, false, "missing", "Save"),
+            (false, false, "n0", "Wrong"),
+            (true, false, "n0", "Save"),
+            (false, true, "n0", "Save"),
+        ] {
+            let backend = Arc::new(FakeBackend {
+                truncated: true,
+                changed,
+                replaced,
+                ..Default::default()
+            });
+            let provider = AtspiProvider::new(backend).unwrap();
+            let observed = take_snapshot(&provider);
+            assert!(provider.invoke("desktop.linux_atspi.snapshot_scope@1", json!({"target": {"snapshot_id": observed["snapshot_id"], "revision": observed["revision"], "node_id": node_id}, "locator": {"name": name}}), Some(Duration::from_secs(2))).is_err());
+        }
+        let provider = AtspiProvider::new(Arc::new(FakeBackend::default())).unwrap();
+        let observed = take_snapshot(&provider);
+        let scoped = provider.invoke("desktop.linux_atspi.snapshot_scope@1", json!({"target": {"snapshot_id": observed["snapshot_id"], "revision": observed["revision"], "node_id": "n0"}, "locator": locator()}), Some(Duration::from_secs(2))).unwrap();
+        let refresh = |id: Value, app: &str| json!({"scope_id": id, "application": {"name": app}});
+        for args in [
+            refresh(json!("invented"), "Fixture"),
+            refresh(scoped["scope_id"].clone(), "Other"),
+        ] {
+            assert_eq!(
+                provider
+                    .invoke(
+                        "desktop.linux_atspi.snapshot_scope@1",
+                        args,
+                        Some(Duration::from_secs(2))
+                    )
+                    .unwrap_err()
+                    .code,
+                "DRIVER.STALE_SNAPSHOT"
+            );
+        }
+        take_snapshot(&provider);
+        assert_eq!(
+            provider
+                .invoke(
+                    "desktop.linux_atspi.snapshot_scope@1",
+                    refresh(scoped["scope_id"].clone(), "Fixture"),
+                    Some(Duration::from_secs(2))
+                )
+                .unwrap_err()
+                .code,
+            "DRIVER.STALE_SNAPSHOT"
+        );
+    }
+
+    #[test]
+    fn truncated_scopes_still_cannot_authorize_writes() {
+        let backend = Arc::new(FakeBackend {
+            truncated: true,
+            scoped_truncated: true,
+            ..Default::default()
+        });
+        let provider = AtspiProvider::new(backend.clone()).unwrap();
+        let observed = take_snapshot(&provider);
+        let scoped = provider.invoke("desktop.linux_atspi.snapshot_scope@1", json!({"target": {"snapshot_id": observed["snapshot_id"], "revision": observed["revision"], "node_id": "n0"}, "locator": locator()}), Some(Duration::from_secs(2))).unwrap();
+        let result = provider.invoke("desktop.linux_atspi.focus@1", json!({"target": {"snapshot_id": scoped["snapshot_id"], "revision": scoped["revision"], "node_id": "n0"}, "locator": locator()}), Some(Duration::from_secs(2))).unwrap_err();
+        assert_eq!(result.code, "DRIVER.SNAPSHOT_TRUNCATED");
+        assert_eq!(backend.writes.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn scope_ancestors_are_context_and_cannot_authorize_broader_actions_or_captures() {
+        let backend = Arc::new(FakeBackend {
+            scope_context: true,
+            ..Default::default()
+        });
+        let provider = AtspiProvider::new(backend.clone()).unwrap();
+        let observed = take_snapshot(&provider);
+        let scoped = provider.invoke("desktop.linux_atspi.snapshot_scope@1", json!({"target": {"snapshot_id": observed["snapshot_id"], "revision": observed["revision"], "node_id": "n0"}, "locator": locator()}), Some(Duration::from_secs(2))).unwrap();
+        assert_eq!(scoped["nodes"][0]["provenance"]["scope_context"], true);
+        assert_eq!(scoped["nodes"][0]["actions"], json!([]));
+        assert_eq!(scoped["nodes"][1]["parent_id"], "n0");
+        let found = provider.invoke("desktop.linux_atspi.find@1", json!({"snapshot_id": scoped["snapshot_id"], "revision": scoped["revision"], "locator": {"role": "push_button"}}), Some(Duration::from_secs(2))).unwrap();
+        assert_eq!(
+            found["target"]["node_id"], "n1",
+            "context nodes must not make scoped locators ambiguous"
+        );
+        for action in ["focus", "capture", "snapshot_scope"] {
+            let args = json!({"target": {"snapshot_id": scoped["snapshot_id"], "revision": scoped["revision"], "node_id": "n0"}, "locator": {"name": "Context"}});
+            assert!(provider
+                .invoke(
+                    &format!("desktop.linux_atspi.{action}@1"),
+                    args,
+                    Some(Duration::from_secs(2))
+                )
+                .is_err());
+        }
+        assert_eq!(backend.writes.load(Ordering::SeqCst), 0);
+        assert_eq!(backend.scoped_captures.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -3147,11 +3519,9 @@ mod tests {
             (shot["width"].clone(), shot["height"].clone()),
             (json!(1), json!(1))
         );
-        assert!(
-            shot["data"]
-                .as_str()
-                .is_some_and(|data| data.starts_with("iVBOR"))
-        );
+        assert!(shot["data"]
+            .as_str()
+            .is_some_and(|data| data.starts_with("iVBOR")));
         assert_eq!(shot["provenance"]["node_id"], "n0");
         // The read did not replace the caller's snapshot.
         provider
@@ -3161,14 +3531,12 @@ mod tests {
                 Some(Duration::from_secs(2)),
             )
             .unwrap();
-        assert!(
-            provider
-                .invoke(
-                    "desktop.linux_atspi.capture@1",
-                    json!({"target": target, "locator": locator(), "format": "png"}),
-                    Some(Duration::from_secs(2)),
-                )
-                .is_err()
-        );
+        assert!(provider
+            .invoke(
+                "desktop.linux_atspi.capture@1",
+                json!({"target": target, "locator": locator(), "format": "png"}),
+                Some(Duration::from_secs(2)),
+            )
+            .is_err());
     }
 }

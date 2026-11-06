@@ -238,7 +238,8 @@ fn view_schema() -> Value {
         "description": "How much of the observation to return. The whole capture is kept \
     either way, so any node of it can be found or acted on.",
         "properties": {
-            "scope_id": {"type":"string", "minLength":1, "maxLength":256, "description":"Complete capture rooted at one unique HTML id in the selected frame. Native providers refuse this option. Distinct from region view filtering."},
+            "scope_id": {"type":"string", "minLength":1, "maxLength":256, "description":"Browser: unique HTML id in the selected frame. Native: opaque id returned by an earlier scoped observation of this resource. Re-captures a complete subtree, not region view filtering. Cannot be combined with scope_target."},
+            "scope_target": target_schema(),
             "mode": {
                 "enum": ["outline", "overview", "text", "nodes"],
                 "default": "outline",

@@ -558,6 +558,7 @@ pub fn describe(args: &OutlineArgs) -> (Value, u8) {
     let to_file = args.out.is_some();
     let view = View {
         scope_id: args.at.scope_id.clone(),
+        scope_target: None,
         mode: ViewMode::Outline,
         region: args.region.clone(),
         limit: Some(if to_file {

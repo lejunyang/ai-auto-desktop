@@ -33,12 +33,56 @@ impl Fixture {
         if matches!(flavor, Flavor::Windows) {
             actions.insert("key_chord".into(), json!({"contract_major":1}));
         }
+        if matches!(flavor, Flavor::Linux) {
+            actions.insert("snapshot_scope".into(), json!({"contract_major":1}));
+        }
         Arc::new(Self {
             manifest: manifest::parse(&manifest::document(name, actions)).unwrap(),
             calls: Mutex::new(Vec::new()),
             flavor,
         })
     }
+}
+
+#[test]
+fn native_scope_keeps_the_observed_identity_and_resource_selector() {
+    let provider = Fixture::new("desktop.linux_atspi", Flavor::Linux);
+    let backend = NativeBackend::new(provider.clone(), Flavor::Linux);
+    let snapshot = json!({"snapshot_id":"generation:1","revision":1,"truncated":true});
+    let node = json!({"node_id":"n20","role":"pane","name":"Editor",
+        "provenance":{"bus_name":":1.2","object_path":"/org/a11y/editor"}});
+    backend
+        .observe_target_scope(&snapshot, &node, 300, Duration::from_secs(1))
+        .unwrap();
+    backend
+        .observe_scope(
+            &json!({"application":{"bus_name":":1.2"}}),
+            "opaque-scope",
+            300,
+            Duration::from_secs(1),
+        )
+        .unwrap();
+    let calls = provider.calls.lock().unwrap();
+    assert_eq!(calls[0].0, "desktop.linux_atspi.snapshot_scope@1");
+    assert_eq!(
+        calls[0].1["target"],
+        json!({"snapshot_id":"generation:1","revision":1,"node_id":"n20"})
+    );
+    assert_eq!(calls[0].1["locator"]["object_path"], "/org/a11y/editor");
+    assert_eq!(calls[0].1["max_nodes"], 300);
+    assert_eq!(calls[1].1["scope_id"], "opaque-scope");
+    assert_eq!(calls[1].1["application"], json!({"bus_name":":1.2"}));
+    let unsupported = NativeBackend::new(
+        Fixture::new("desktop.macos_ax", Flavor::MacOS),
+        Flavor::MacOS,
+    );
+    assert_eq!(
+        unsupported
+            .observe_target_scope(&snapshot, &node, 300, Duration::from_secs(1))
+            .unwrap_err()
+            .code,
+        "CONTROL.SCOPE_UNSUPPORTED"
+    );
 }
 impl Provider for Fixture {
     fn manifest(&self) -> &CapabilityManifest {

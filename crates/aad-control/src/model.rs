@@ -98,9 +98,15 @@ pub enum ViewMode {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct View {
-    /// Observe only the container with this unique HTML id, in the selected frame.
+    /// Browser: a unique HTML id. Native: an opaque scope id returned by an
+    /// earlier scoped observation of this resource.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scope_id: Option<String>,
+    /// Capture a complete subtree rooted at an already observed element.
+    /// Its source observation may be truncated: this is a read, not input.
+    /// Mutually exclusive with scope_id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope_target: Option<Target>,
     #[serde(default)]
     pub mode: ViewMode,
     /// Outline or text: a region named by an overview.

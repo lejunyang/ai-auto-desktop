@@ -1,6 +1,6 @@
 use super::{
-    AtspiBackend, AutomationError, BackendNode, BackendSnapshot, Bounds, Gesture, MAX_FIELD_CHARS,
-    MAX_NODES, Map, NativeRef, Value, driver_error, remaining,
+    driver_error, remaining, AtspiBackend, AutomationError, BackendNode, BackendSnapshot, Bounds,
+    Gesture, Map, NativeRef, Value, MAX_FIELD_CHARS, MAX_NODES,
 };
 use atspi::proxy::accessible::AccessibleProxy;
 use atspi::proxy::action::ActionProxy;
@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use zbus::blocking::{Connection, Proxy, connection};
+use zbus::blocking::{connection, Connection, Proxy};
 
 const REGISTRY_NAME: &str = "org.a11y.atspi.Registry";
 const REGISTRY_PATH: &str = "/org/a11y/atspi/accessible/root";
@@ -689,81 +689,45 @@ impl AtspiBackend for LinuxBackend {
         deadline: Instant,
     ) -> Result<BackendSnapshot, AutomationError> {
         let (root, info) = self.resolve_application(application, deadline)?;
-        let mut queue = VecDeque::from([(root, None, 0u32)]);
-        let mut nodes = Vec::new();
-        let mut truncated = false;
-        let mut truncation_reasons = Vec::new();
-        while let Some((target, parent, depth)) = queue.pop_front() {
+        self.capture_tree(root, info, Vec::new(), max_depth, max_nodes, deadline)
+    }
+
+    fn capture_scope(
+        &self,
+        application: &Map<String, Value>,
+        root: &NativeRef,
+        max_depth: u32,
+        max_nodes: usize,
+        deadline: Instant,
+    ) -> Result<BackendSnapshot, AutomationError> {
+        let (app, info) = self.resolve_application(application, deadline)?;
+        let mut current = root.clone();
+        let mut ancestors = Vec::new();
+        let mut visited = std::collections::BTreeSet::new();
+        while current != app {
             remaining(deadline, false)?;
-            if nodes.len() >= max_nodes {
-                truncated = true;
-                capture_issue(
-                    &mut truncation_reasons,
-                    json!({"code": "max_nodes", "limit": max_nodes}),
-                );
-                break;
+            if current.bus_name != app.bus_name
+                || !visited.insert(current.object_path.clone())
+                || ancestors.len() >= super::MAX_DEPTH as usize
+            {
+                return Err(super::stale(
+                    "scope root is not proven to belong to its observed application",
+                ));
             }
-            let (node, child_count) = self.read_node(target.clone(), parent, &info, deadline)?;
-            let current = nodes.len();
-            nodes.push(node);
-            match self.child_references(&target, deadline) {
-                Ok(children) => {
-                    if children.returned_count != child_count {
-                        truncated = true;
-                        capture_issue(
-                            &mut truncation_reasons,
-                            json!({"code": "child_count_changed", "node_id": format!("n{current}"), "reported_children": child_count, "returned_children": children.returned_count}),
-                        );
-                    }
-                    if depth >= max_depth {
-                        if !children.items.is_empty() {
-                            truncated = true;
-                            capture_issue(
-                                &mut truncation_reasons,
-                                json!({"code": "max_depth", "node_id": format!("n{current}"), "limit": max_depth}),
-                            );
-                        }
-                        continue;
-                    }
-                    for child in children.items {
-                        if nodes.len() + queue.len() >= max_nodes {
-                            truncated = true;
-                            capture_issue(
-                                &mut truncation_reasons,
-                                json!({"code": "max_nodes", "node_id": format!("n{current}"), "limit": max_nodes}),
-                            );
-                            break;
-                        }
-                        queue.push_back((child, Some(current), depth + 1));
-                    }
-                }
-                Err(error)
-                    if error.code == "DRIVER.TIMEOUT"
-                        || error.code == "DRIVER.OUTPUT_TOO_LARGE" =>
-                {
-                    return Err(error);
-                }
-                Err(error) => {
-                    truncated = true;
-                    capture_issue(
-                        &mut truncation_reasons,
-                        json!({"code": "children_unavailable", "node_id": format!("n{current}"), "error_code": error.code}),
-                    );
-                }
-            }
+            current = self.parent(&current, deadline)?.ok_or_else(|| {
+                super::stale("scope root is detached from its observed application")
+            })?;
+            ancestors.push(current.clone());
         }
-        let process_id = info
-            .get("process_id")
-            .and_then(Value::as_u64)
-            .and_then(|value| u32::try_from(value).ok())
-            .filter(|value| *value > 0);
-        self.add_window_actions(&mut nodes, process_id, deadline);
-        Ok(BackendSnapshot {
-            application: info,
-            nodes,
-            truncated,
-            truncation_reasons,
-        })
+        ancestors.reverse();
+        self.capture_tree(
+            root.clone(),
+            info,
+            ancestors,
+            max_depth,
+            max_nodes,
+            deadline,
+        )
     }
 
     fn focus(&self, target: &NativeRef, deadline: Instant) -> Result<Value, AutomationError> {
@@ -1315,6 +1279,103 @@ fn window_args(command: &str, process_id: u32, bounds: Bounds) -> Vec<String> {
 }
 
 impl LinuxBackend {
+    fn capture_tree(
+        &self,
+        root: NativeRef,
+        info: Map<String, Value>,
+        ancestors: Vec<NativeRef>,
+        max_depth: u32,
+        max_nodes: usize,
+        deadline: Instant,
+    ) -> Result<BackendSnapshot, AutomationError> {
+        let mut nodes = Vec::new();
+        if ancestors.len() >= max_nodes {
+            return Err(driver_error(
+                "DRIVER.OUTPUT_TOO_LARGE",
+                "scope ancestors exceed the node budget",
+            ));
+        }
+        for ancestor in ancestors {
+            let parent = nodes.len().checked_sub(1);
+            nodes.push(self.read_node(ancestor, parent, &info, deadline)?.0);
+        }
+        let parent = nodes.len().checked_sub(1);
+        let mut queue = VecDeque::from([(root, parent, 0u32)]);
+        let mut truncated = false;
+        let mut truncation_reasons = Vec::new();
+        while let Some((target, parent, depth)) = queue.pop_front() {
+            remaining(deadline, false)?;
+            if nodes.len() >= max_nodes {
+                truncated = true;
+                capture_issue(
+                    &mut truncation_reasons,
+                    json!({"code": "max_nodes", "limit": max_nodes}),
+                );
+                break;
+            }
+            let (node, child_count) = self.read_node(target.clone(), parent, &info, deadline)?;
+            let current = nodes.len();
+            nodes.push(node);
+            match self.child_references(&target, deadline) {
+                Ok(children) => {
+                    if children.returned_count != child_count {
+                        truncated = true;
+                        capture_issue(
+                            &mut truncation_reasons,
+                            json!({"code": "child_count_changed", "node_id": format!("n{current}"), "reported_children": child_count, "returned_children": children.returned_count}),
+                        );
+                    }
+                    if depth >= max_depth {
+                        if !children.items.is_empty() {
+                            truncated = true;
+                            capture_issue(
+                                &mut truncation_reasons,
+                                json!({"code": "max_depth", "node_id": format!("n{current}"), "limit": max_depth}),
+                            );
+                        }
+                        continue;
+                    }
+                    for child in children.items {
+                        if nodes.len() + queue.len() >= max_nodes {
+                            truncated = true;
+                            capture_issue(
+                                &mut truncation_reasons,
+                                json!({"code": "max_nodes", "node_id": format!("n{current}"), "limit": max_nodes}),
+                            );
+                            break;
+                        }
+                        queue.push_back((child, Some(current), depth + 1));
+                    }
+                }
+                Err(error)
+                    if error.code == "DRIVER.TIMEOUT"
+                        || error.code == "DRIVER.OUTPUT_TOO_LARGE" =>
+                {
+                    return Err(error);
+                }
+                Err(error) => {
+                    truncated = true;
+                    capture_issue(
+                        &mut truncation_reasons,
+                        json!({"code": "children_unavailable", "node_id": format!("n{current}"), "error_code": error.code}),
+                    );
+                }
+            }
+        }
+        let process_id = info
+            .get("process_id")
+            .and_then(Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok())
+            .filter(|value| *value > 0);
+        self.add_window_actions(&mut nodes, process_id, deadline);
+        Ok(BackendSnapshot {
+            application: info,
+            nodes,
+            truncated,
+            truncation_reasons,
+        })
+    }
+
     /// The window manager's view of a top-level frame, when the X11 helper
     /// and an EWMH window manager are there; `None` offers no window actions.
     fn window_info(&self, process_id: u32, bounds: Bounds, deadline: Instant) -> Option<Value> {

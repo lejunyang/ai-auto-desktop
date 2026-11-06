@@ -140,6 +140,21 @@ pub trait Backend: Send + Sync {
             "provider does not support complete scoped observation",
         ))
     }
+    /// Recapture the subtree of an observed node. Implementations must verify
+    /// the root's native identity and retain that boundary for later input
+    /// revalidation; filtering an incomplete capture is not sufficient.
+    fn observe_target_scope(
+        &self,
+        _snapshot: &Value,
+        _node: &Value,
+        _max_nodes: usize,
+        _timeout: Duration,
+    ) -> Result<Value> {
+        Err(error(
+            "CONTROL.SCOPE_UNSUPPORTED",
+            "provider does not support observation rooted at an observed node",
+        ))
+    }
     /// Shape a retained snapshot for the caller. `None` uses the portable
     /// outline; a provider answers with `nodes` keyed by `node_id`, or `regions`.
     fn view(&self, _snapshot: &Value, _view: &View, _timeout: Duration) -> Result<Option<Value>> {
@@ -1007,10 +1022,13 @@ impl Session {
                 }
                 validate_view(view)?;
                 let (observation_id, observation) =
-                    self.observe_resource_scoped(resource_id, *max_nodes, view.scope_id.as_deref(), context)?;
+                    self.observe_resource_scoped(resource_id, *max_nodes, view.scope_id.as_deref(), view.scope_target.as_ref(), context)?;
                 let backend = &self.backends[&observation.provider];
                 let (raw, nodes) = (observation.raw, observation.nodes);
                 let mut answer = json!({"observation_id": observation_id, "resource_id": resource_id, "node_count": nodes.len(), "truncated": raw["truncated"] == true, "metadata": raw.get("metadata").cloned().unwrap_or(Value::Null)});
+                if let Some(reasons) = raw.get("truncation_reasons") {
+                    answer["truncation_reasons"] = reasons.clone();
+                }
                 if raw["scope_id"].is_string() {
                     answer["scope"] = json!({"id":raw["scope_id"], "revision":raw["scope_revision"], "complete":raw["truncated"] != true});
                 }
@@ -1487,7 +1505,7 @@ impl Session {
         max_nodes: usize,
         context: &Context,
     ) -> Result<(String, Observation)> {
-        self.observe_resource_scoped(resource_id, max_nodes, None, context)
+        self.observe_resource_scoped(resource_id, max_nodes, None, None, context)
     }
 
     fn observe_resource_scoped(
@@ -1495,6 +1513,7 @@ impl Session {
         resource_id: &str,
         max_nodes: usize,
         scope: Option<&str>,
+        scope_target: Option<&Target>,
         context: &Context,
     ) -> Result<(String, Observation)> {
         if scope.is_some_and(|id| id.is_empty() || id.len() > 256) {
@@ -1523,16 +1542,55 @@ impl Session {
                 )
             })?;
         let backend = &self.backends[&item.resource.provider];
+        // Read the anchor before expiring this provider's old observations.
+        // A truncated capture cannot authorize input, but an actually observed
+        // node can anchor a fresh, complete subtree capture.
+        let anchored = scope_target
+            .map(|target| {
+                if target.session_id != self.id {
+                    return Err(error(
+                        "CONTROL.SESSION_MISMATCH",
+                        "scope target belongs to another session",
+                    ));
+                }
+                let observed = self.observation(&target.observation_id)?;
+                if target.resource_id != resource_id
+                    || observed.resource_id != resource_id
+                    || observed.provider != item.resource.provider
+                    || !self.allowed_resource(resource_id)
+                {
+                    return Err(error(
+                        "POLICY.DENIED",
+                        "scope target is outside the resource grant",
+                    ));
+                }
+                let node = observed.raw["nodes"]
+                    .as_array()
+                    .and_then(|nodes| nodes.iter().find(|node| node["node_id"] == target.node_id))
+                    .cloned()
+                    .ok_or_else(|| error("CONTROL.STALE_TARGET", "scope node was not observed"))?;
+                if node["provenance"]["scope_context"] == true {
+                    return Err(error(
+                        "CONTROL.STALE_TARGET",
+                        "ancestor context is outside the observed scope",
+                    ));
+                }
+                Ok((observed.raw, node))
+            })
+            .transpose()?;
         self.state
             .lock()
             .unwrap()
             .observations
             .retain(|_, old| old.provider != item.resource.provider);
-        let raw = match scope {
-            Some(scope) => {
+        let raw = match (scope, anchored) {
+            (_, Some((snapshot, node))) => {
+                backend.observe_target_scope(&snapshot, &node, max_nodes, context.remaining()?)?
+            }
+            (Some(scope), None) => {
                 backend.observe_scope(&item.selector, scope, max_nodes, context.remaining()?)?
             }
-            None => backend.observe(&item.selector, max_nodes, context.remaining()?)?,
+            (None, None) => backend.observe(&item.selector, max_nodes, context.remaining()?)?,
         };
         context.remaining()?;
         let observation_id = uuid::Uuid::new_v4().to_string();
@@ -1561,7 +1619,7 @@ impl Session {
             .unwrap();
         }
         let observation = Observation {
-            scope: scope.map(str::to_owned),
+            scope: raw["scope_id"].as_str().or(scope).map(str::to_owned),
             max_nodes,
             provider: item.resource.provider.clone(),
             resource_id: resource_id.to_string(),
@@ -1668,7 +1726,7 @@ impl Session {
         loop {
             polls += 1;
             let (observation_id, observation) =
-                match self.observe_resource_scoped(resource_id, max_nodes, scope, context) {
+                match self.observe_resource_scoped(resource_id, max_nodes, scope, None, context) {
                     Ok(observed) => observed,
                     // The page was between documents: keep polling.
                     Err(e) if e.code == "BROWSER.CONTEXT_LOST" => {
@@ -2004,6 +2062,12 @@ fn plain_path(path: &std::path::Path) -> String {
 }
 
 fn validate_view(view: &View) -> Result<()> {
+    if view.scope_id.is_some() && view.scope_target.is_some() {
+        return Err(error(
+            "CONTROL.INVALID_REQUEST",
+            "scope_id and scope_target are mutually exclusive",
+        ));
+    }
     if view
         .limit
         .is_some_and(|limit| limit == 0 || limit > MAX_OUTLINE_LIMIT)
@@ -2162,6 +2226,7 @@ fn portable_find(nodes: &[Value], locator: &Locator, expect: Expect) -> Result<V
     }
     let matching: Vec<_> = nodes
         .iter()
+        .filter(|node| node["provenance"]["scope_context"] != true)
         .filter(|n| {
             locator.name.as_ref().is_none_or(|v| n["name"] == *v)
                 && locator.role.as_ref().is_none_or(|v| n["role"] == *v)
