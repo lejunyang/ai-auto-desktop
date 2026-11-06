@@ -89,6 +89,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "url",
  "uuid",
  "windows 0.58.0",
 ]

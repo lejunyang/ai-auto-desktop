@@ -2,6 +2,7 @@
 //! No network listener: remote sessions inherit an authenticated SSH stdio pipe.
 
 pub mod browser;
+pub mod browser_access;
 pub mod launch;
 pub mod lease;
 pub mod model;
