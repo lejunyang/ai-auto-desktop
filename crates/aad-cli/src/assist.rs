@@ -51,7 +51,13 @@
 //!   that one held is let go), `{"type":"release"}` to let go of every key and button the
 //!   viewer holds (also done when it leaves), and `{"type":"clipboard"}`,
 //!   answered with `{"type":"clipboard","text":..,"characters":..,
-//!   "truncated":..}` (the desktop; not with --view-only or --no-clipboard).
+//!   "truncated":..}` (the desktop's clipboard, a page's selected text; not
+//!   with --view-only or --no-clipboard). Key, mouse and text events may carry
+//!   `"modifiers":["Control","Shift"]`, the modifiers the viewer holds: any
+//!   not pressed here yet are pressed first, any let go are released. A
+//!   browser page also takes `{"type":"viewport","width":..,"height":..}`, in
+//!   CSS pixels, and is laid out at that size. `ready` names the `os` of this
+//!   side, so a Mac viewer knows whether its Command key is Control here.
 //!
 //! Nothing is sent while the screen stays the same. Pictures are sent whole;
 //! tiles send only the 32-pixel tiles that changed, and moved regions as
@@ -818,6 +824,63 @@ struct Control {
     holder: Option<u64>,
 }
 
+/// The modifier keys, by the bit [`keys::Key::modifier`] gives them, the
+/// name a viewer reports them by and the key pressed for them here.
+const MODIFIERS: [(u32, &str, &str); 4] = [
+    (1, "Alt", "AltLeft"),
+    (2, "Control", "ControlLeft"),
+    (4, "Meta", "MetaLeft"),
+    (8, "Shift", "ShiftLeft"),
+];
+
+/// The modifiers pressed on this side for the controlling viewer.
+///
+/// A key, mouse or text event may say which modifiers the viewer holds at that
+/// moment (`"modifiers":["Control"]`); those not yet pressed here are pressed
+/// first and those no longer held are let go. A shortcut then arrives as meant
+/// even when the viewer never sent the modifier's own key: the window got the
+/// focus with Ctrl already down, or a tool sent only the combined key.
+#[derive(Default)]
+struct Held(u32);
+
+impl Held {
+    fn apply(&mut self, source: &mut dyn Source, event: &Value) -> Result<()> {
+        // The modifier an event is itself the key of is pressed or let go by that event.
+        let own = if event["type"] == "key" {
+            keys::of(event).map_or(0, keys::Key::modifier)
+        } else {
+            0
+        };
+        if let Some(list) = event["modifiers"].as_array() {
+            let wanted = list
+                .iter()
+                .filter_map(Value::as_str)
+                .filter_map(|name| MODIFIERS.iter().find(|(_, n, _)| *n == name))
+                .fold(0, |bits, (bit, _, _)| bits | bit);
+            for (bit, name, code) in MODIFIERS {
+                let on = wanted & bit != 0;
+                if bit & own != 0 || on == (self.0 & bit != 0) {
+                    continue;
+                }
+                source.input(
+                    &json!({"type": "key", "action": if on { "down" } else { "up" },
+                    "key": name, "code": code}),
+                )?;
+                self.0 ^= bit;
+            }
+        }
+        source.input(event)?;
+        if own != 0 {
+            if event["action"] == "up" {
+                self.0 &= !own;
+            } else {
+                self.0 |= own;
+            }
+        }
+        Ok(())
+    }
+}
+
 impl Control {
     fn tell(&self, viewers: &[Viewer], view_only: bool) {
         for viewer in viewers {
@@ -841,6 +904,7 @@ fn host(
     let (arrived, arrivals) = mpsc::channel::<Connection>();
     let mut viewers: Vec<Viewer> = Vec::new();
     let mut control = Control { holder: None };
+    let mut held = Held::default();
     let mut next_id = 0u64;
     let mut rate = 0;
     let codecs: Vec<&str> = config.offered.iter().map(|c| c.name()).collect();
@@ -877,6 +941,7 @@ fn host(
         for viewer in gone {
             if control.holder == Some(viewer.id) {
                 source.release();
+                held = Held::default();
                 control.holder = None;
             }
             viewer.close();
@@ -930,7 +995,7 @@ fn host(
                 });
             }
             let pipeline = Pipeline::new(config, config.first());
-            outbox.text(&json!({"type": "ready", "source": source.name(), "view_only": config.view_only,
+            outbox.text(&json!({"type": "ready", "source": source.name(), "os": std::env::consts::OS, "view_only": config.view_only,
                 "frames": {"header": "aad-frame/1", "codec": config.offered[0].name(), "codecs": codecs},
                 "mode": pipeline.mode.describe(), "video": video}));
             next_id += 1;
@@ -971,13 +1036,17 @@ fn host(
                         if !controls {
                             // Whatever the last controller held is let go first.
                             source.release();
+                            held = Held::default();
                             control.holder = Some(viewer.id);
                             changed = true;
                         }
                     }
                     // Only the controlling viewer's input is passed on.
                     _ if !controls => {}
-                    Some("release") => source.release(),
+                    Some("release") => {
+                        source.release();
+                        held = Held::default();
+                    }
                     Some("clipboard") if config.no_clipboard => viewer.outbox.text(&json!({"type": "error",
                         "message": "this server does not share its clipboard (--no-clipboard)"})),
                     Some("clipboard") => match source.clipboard() {
@@ -985,7 +1054,7 @@ fn host(
                         Err(error) => viewer.outbox.text(&json!({"type": "error", "message": error})),
                     },
                     _ => {
-                        if let Err(error) = source.input(&event) {
+                        if let Err(error) = held.apply(source, &event) {
                             viewer.outbox.text(&json!({"type": "error", "message": error}));
                         }
                     }
@@ -2007,6 +2076,10 @@ mod browser {
             .ok()
     }
 
+    /// The selected text of the focused field or of the page, through
+    /// same-origin frames.
+    const SELECTION: &str = "(() => { let d = document, a = d.activeElement;         try { while (a && a.contentDocument) { d = a.contentDocument; a = d.activeElement; } } catch {}         if (a && /^(INPUT|TEXTAREA)$/.test(a.tagName) && typeof a.selectionStart === 'number')         return a.value.slice(a.selectionStart, a.selectionEnd);         return String(d.getSelection() || ''); })()";
+
     impl Source for Page {
         fn name(&self) -> Value {
             json!({"kind": "browser", "page_id": self.page})
@@ -2119,8 +2192,40 @@ mod browser {
                     }
                     self.command("Input.insertText", json!({"text": text}))
                 }
+                // The page laid out at the size the viewer has room for, so it
+                // fills the viewer instead of being scaled into it.
+                Some("viewport") => {
+                    let side = |name: &str, low: u64, high: u64| {
+                        event[name].as_u64().map(|v| v.clamp(low, high))
+                    };
+                    match (side("width", 320, 3840), side("height", 240, 2160)) {
+                        (Some(width), Some(height)) => self.command(
+                            "Emulation.setDeviceMetricsOverride",
+                            json!({"width": width, "height": height, "deviceScaleFactor": 1, "mobile": false}),
+                        ),
+                        _ => Err("a viewport needs a width and a height".into()),
+                    }
+                }
                 _ => Err("unknown event type".into()),
             }
+        }
+
+        /// What is selected in the page. A copy there goes to the clipboard of
+        /// this machine (or of no one, headless), so a viewer copying from the
+        /// page is given the text the copy took.
+        fn clipboard(&mut self) -> Result<Value> {
+            let answer = self.call(
+                "Runtime.evaluate",
+                json!({"expression": SELECTION, "returnByValue": true}),
+            )?;
+            let text = answer["result"]["value"].as_str().filter(|t| !t.is_empty());
+            let characters = text.map_or(0, |t| t.chars().count());
+            let text: Option<String> =
+                text.map(|t| t.chars().take(super::CLIPBOARD_CHARACTERS).collect());
+            Ok(
+                json!({"type": "clipboard", "text": text, "characters": characters,
+                "truncated": characters > super::CLIPBOARD_CHARACTERS}),
+            )
         }
 
         fn release(&mut self) {
@@ -2294,6 +2399,79 @@ const VIEWER: &str = include_str!("assist/viewer.html");
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A source that only keeps the input it was given.
+    #[derive(Default)]
+    struct Keys(Vec<String>);
+
+    impl Source for Keys {
+        fn name(&self) -> Value {
+            json!({"kind": "test"})
+        }
+        fn capture(&mut self, _want: Want) -> Result<Option<Picture>> {
+            Ok(None)
+        }
+        fn rate(&mut self, _fps: u32) {}
+        fn input(&mut self, event: &Value) -> Result<()> {
+            self.0.push(match event["type"].as_str() {
+                Some("key") => format!(
+                    "{} {}",
+                    event["action"].as_str().unwrap(),
+                    event["code"].as_str().unwrap()
+                ),
+                other => other.unwrap_or_default().to_string(),
+            });
+            Ok(())
+        }
+        fn refresh(&mut self) {}
+    }
+
+    #[test]
+    fn a_shortcut_arrives_whole_when_its_modifier_press_did_not() {
+        let (mut source, mut held) = (Keys::default(), Held::default());
+        // Only the combined key, as when the page got the focus with Ctrl already down.
+        let key = |action: &str, mods: Value| json!({"type": "key", "action": action, "key": "a", "code": "KeyA", "modifiers": mods});
+        held.apply(&mut source, &key("down", json!(["Control"])))
+            .unwrap();
+        held.apply(&mut source, &key("up", json!(["Control"])))
+            .unwrap();
+        // Text goes with nothing held: Control is let go before it is typed.
+        held.apply(
+            &mut source,
+            &json!({"type": "text", "text": "x", "modifiers": []}),
+        )
+        .unwrap();
+        assert_eq!(
+            source.0,
+            [
+                "down ControlLeft",
+                "down KeyA",
+                "up KeyA",
+                "up ControlLeft",
+                "text"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_modifier_the_viewer_pressed_itself_is_not_pressed_twice() {
+        let (mut source, mut held) = (Keys::default(), Held::default());
+        let shift = |action: &str, mods: Value| json!({"type": "key", "action": action, "key": "Shift", "code": "ShiftLeft", "modifiers": mods});
+        held.apply(&mut source, &shift("down", json!(["Shift"])))
+            .unwrap();
+        held.apply(&mut source, &json!({"type": "key", "action": "down", "key": "ArrowLeft", "code": "ArrowLeft", "modifiers": ["Shift"]})).unwrap();
+        held.apply(&mut source, &shift("up", json!([]))).unwrap();
+        // Events without the field (older viewers) change nothing.
+        held.apply(
+            &mut source,
+            &json!({"type": "mouse", "action": "move", "x": 0.5, "y": 0.5}),
+        )
+        .unwrap();
+        assert_eq!(
+            source.0,
+            ["down ShiftLeft", "down ArrowLeft", "up ShiftLeft", "mouse"]
+        );
+    }
 
     #[test]
     fn a_frame_header_carries_what_a_decoder_needs() {

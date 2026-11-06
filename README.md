@@ -433,7 +433,13 @@ aad assist --desktop --window 0x3077a     # 只分享一个窗口（句柄，或
 - 控制消息是 JSON 文本：服务端发 `ready`（含 `frames.codecs`、`mode`、`video`）、`mode`、`stream`、`cursor`、
   `clipboard` 和 `error`，查看端发
   `hello`、`keyframe`、`mouse`（move/down/up/wheel，位置是画面内 0..1 的比例，`count` 是第几次连击）、
-  `key`（不出字的按键和快捷键，`code` 是物理键名，见下）、`text`（输入的文字）、`release` 和 `clipboard`。
+  `key`（不出字的按键和快捷键，`code` 是物理键名，见下）、`text`（输入的文字）、`release` 和 `clipboard`；
+  分享浏览器页面时还有 `viewport`（`{"type":"viewport","width":..,"height":..}`，CSS 像素，页面按这个大小排版，
+  不是缩放进查看端）。`ready` 里的 `os` 是分享端的系统（`windows` / `linux` / `macos`）。
+- `key`、`mouse`、`text` 可以带 `"modifiers":["Control","Shift"]`：查看端此刻按着的修饰键。分享端还没按下的先补按、
+  已经松开的先松开，再处理这条消息；所以修饰键自己的按下没送到时（按住 Ctrl 再把焦点切进查看页、工具只发一个带
+  Ctrl 的 A 键），快捷键照样成立。自带的查看页发 `text` 时带 `"modifiers":[]`，按着 Ctrl 粘贴出的是字而不是快捷键。
+  不带这个字段的消息照旧处理。
 
 ### 远程操作
 
@@ -445,11 +451,15 @@ aad assist --desktop --window 0x3077a     # 只分享一个窗口（句柄，或
 | 中文等输入法 | ✅ 查看页里组字，只发组好的字 | ✅ 同左 |
 | 快捷键 | ✅ 按物理键（`code`）映射：字母、数字、标点（Ctrl+/、Ctrl+=、Ctrl+[）、Ctrl+Space、F1–F24、小键盘、CapsLock、PrintScreen、菜单键等 | ✅ 同左，带扫描码，方向键/Home/End/Insert/Delete/右侧修饰键带扩展键标志 |
 | 断开或查看页失去焦点时松开所有按住的键和鼠标键 | ✅ | ✅ |
-| 把远程剪贴板的文字带回查看端 | — | ✅ 查看端按 Ctrl+C/Ctrl+X 后自动取回（≤10 万字），密码管理器标记为不供读取的内容拒绝；`--no-clipboard` 关闭，`--view-only` 时不提供 |
+| 把复制的文字带回查看端 | ✅ 查看端按 Ctrl+C/Ctrl+X 后取回页面选中的文字（输入框里的选区或页面选区，同源 iframe 里也算） | ✅ 查看端按 Ctrl+C/Ctrl+X 后自动取回（≤10 万字），密码管理器标记为不供读取的内容拒绝；`--no-clipboard` 关闭，`--view-only` 时不提供 |
+| 粘贴查看端的剪贴板 | ✅ 查看页让 Ctrl+V 走本机的粘贴，把文字作为 `text` 发出 | ✅ 同左 |
+| 页面按查看端的大小排版 | ✅ `viewport` → `Emulation.setDeviceMetricsOverride`（控制者的查看页打开和改变大小时发） | — |
 
 `key` 消息优先按 `code`（物理键）找键，没有 `code` 时按 `key` 的名字找；所以查看端是什么键盘布局，快捷键都落在
 同一个物理键上。出字的键不走 `key`：查看页把焦点放在点击处的一个隐藏输入框上，按键先经过本机输入法，组好的字和普通
-字符作为 `text` 发出（死键、输入法组字中的按键不发），Ctrl/Alt/Meta 组合和不出字的键作为 `key` 发出。按下鼠标后
+字符作为 `text` 发出（死键、输入法组字中的按键不发），Ctrl/Alt/Meta 组合和不出字的键作为 `key` 发出。在 Mac 上看
+不是 macOS 的分享端时，⌘ 当 Ctrl 发出，⌘C、⌘V、⌘A 和那边的 Ctrl 组合一样用。查看页里右键不弹本机浏览器的菜单。
+查看页的文字按 `?lang=zh|en` 或浏览器语言显示中文或英文。按下鼠标后
 用指针捕获，拖到画面外再松开也会送达；查看页失去焦点或切到后台时发 `release`，对端把还按着的键和鼠标键全部松开，
 服务端在连接断开时也会这么做，不会留下按住的 Shift 或鼠标左键。
 
