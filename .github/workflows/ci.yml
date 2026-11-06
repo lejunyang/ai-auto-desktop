@@ -203,7 +203,15 @@ jobs:
           set -euo pipefail
           : > /tmp/assist-note.txt
           open -a TextEdit /tmp/assist-note.txt
-          sleep 3
+          # Start once TextEdit is in front: a slow runner can take longer
+          # than a fixed wait to open it, and the keys would go elsewhere.
+          for _ in $(seq 30); do
+            if lsappinfo info -only name "$(lsappinfo front)" | grep -q TextEdit; then break; fi
+            sleep 1
+            open -a TextEdit /tmp/assist-note.txt
+          done
+          lsappinfo info -only name "$(lsappinfo front)" || true
+          sleep 2
           PYTHONPATH=tests/windows python3 - <<'PY'
           import json, queue, subprocess, sys, time
           import verify_assist
