@@ -1167,6 +1167,111 @@ const MAX_ACCESSIBLE_NODES: usize = 2_000;
 /// Accessibility queries sent before their replies are awaited.
 const AX_PIPELINE: usize = 100;
 
+/// Discover private shadow root identities without exporting their descendants
+/// or inspecting value attributes. Inspection is bounded and fails closed.
+fn closed_root_ids(tree: &Value) -> Result<Vec<i64>> {
+    let mut roots = Vec::new();
+    let mut stack = vec![tree];
+    let mut scanned = 0;
+    while let Some(node) = stack.pop() {
+        scanned += 1;
+        if scanned > 20_000 {
+            return Err(error(
+                "CONTROL.ACTION_UNSUPPORTED",
+                "cannot confirm protected closed-shadow content within the inspection budget",
+            ));
+        }
+        if node["shadowRootType"] == "closed" {
+            roots.push(node["backendNodeId"].as_i64().ok_or_else(|| {
+                error("BROWSER.BAD_RESULT", "closed shadow root has no identity")
+            })?);
+        }
+        for field in ["children", "shadowRoots"] {
+            if let Some(children) = node[field].as_array() {
+                stack.extend(children);
+            }
+        }
+    }
+    Ok(roots)
+}
+
+fn refresh_closed_roots(
+    client: &mut Client,
+    context: &Ctx,
+    observed: Option<&Value>,
+    reset: bool,
+) -> Result<()> {
+    let session = context.session.as_deref();
+    const GROUP: &str = "aad-control-private-shadow-roots";
+    if reset {
+        eval(
+            client,
+            context,
+            "globalThis.__aadControlV1.reset_closed_roots()".into(),
+        )?;
+    }
+    let result = (|| -> Result<()> {
+        let expression = observed
+            .map(|args| format!("globalThis.__aadControlV1.scope_element({args})"))
+            .unwrap_or_else(|| "document.documentElement".into());
+        let body = run(
+            client,
+            session,
+            "Runtime.evaluate",
+            json!({"expression":expression,"contextId":context.id,"objectGroup":GROUP}),
+        )?;
+        let object = body["result"]["objectId"].as_str().ok_or_else(|| {
+            if observed.is_some() {
+                error("CONTROL.STALE_TARGET", "observed element no longer exists")
+            } else {
+                error("BROWSER.BAD_RESULT", "frame has no document root")
+            }
+        })?;
+        let described = run(
+            client,
+            session,
+            "DOM.describeNode",
+            json!({"objectId":object,"depth":-1,"pierce":true}),
+        )?;
+        for id in closed_root_ids(&described["node"])? {
+            let root = run(
+                client,
+                session,
+                "DOM.resolveNode",
+                json!({"backendNodeId":id,"executionContextId":context.id,"objectGroup":GROUP}),
+            )?;
+            let object = root["object"]["objectId"]
+                .as_str()
+                .ok_or_else(|| error("BROWSER.BAD_RESULT", "closed shadow root disappeared"))?;
+            let registered = run(
+                client,
+                session,
+                "Runtime.callFunctionOn",
+                json!({"objectId":object,"functionDeclaration":"function(){return globalThis.__aadControlV1.mark_closed_root(this);}","returnByValue":true}),
+            )?;
+            if evaluated(registered)? != true {
+                return Err(error(
+                    "CONTROL.ACTION_UNSUPPORTED",
+                    "cannot confirm protected closed-shadow content",
+                ));
+            }
+        }
+        eval(
+            client,
+            context,
+            "globalThis.__aadControlV1.record_closed_protection()".into(),
+        )?;
+        Ok(())
+    })();
+    let _ = run(
+        client,
+        session,
+        "Runtime.releaseObjectGroup",
+        json!({"objectGroup":GROUP}),
+    );
+    result
+}
+
 /// Roles and names as the browser's accessibility tree has them, for each
 /// observed element. An element the tree ignores, an internal role
 /// (`StaticText`, `LabelText`, ...) or an empty name keeps the heuristic
@@ -2033,6 +2138,20 @@ impl Backend for BrowserBackend {
                 eval(client,&context,format!("globalThis.__aadControlV1.observe({}, {}, {})",serde_json::to_string(&observation).unwrap(),max_nodes,selector["scope_id"]))?
             };
             if let Some(code) = result["error"].as_str() { return Err(error(code, "scope must identify one complete container in this frame")); }
+            let scope_inspect=selector["scope_id"].is_string().then(||json!({"document_token":result["document_token"],"observation":observation,"node_id":result["nodes"][0]["node_id"]}));
+            let shadow=match refresh_closed_roots(client,&context,scope_inspect.as_ref(),true) {
+                Ok(())=>json!({"complete":true}),
+                Err(e) if e.code=="CONTROL.ACTION_UNSUPPORTED"=>json!({"complete":false,"reason":e.message}),
+                Err(e)=>return Err(e),
+            };
+            let surfaces=eval(client,&context,"globalThis.__aadControlV1.surface_state()".into())?;
+            for (node,surface) in result["nodes"].as_array_mut().into_iter().flatten().zip(surfaces.as_array().into_iter().flatten()) {
+                if node["node_id"]!=surface["node_id"] {return Err(error("BROWSER.BAD_RESULT","private inspection lost the observed node identity"));}
+                node["actions"]=surface["actions"].clone();
+                node["states"]["protected"]=surface["protected"].clone();
+                if surface["protected"]==true {node["value"]=Value::Null;}
+                if !surface["surface"].is_null() {node["surface"]=surface["surface"].clone();}
+            }
             let main=entry.main();
             if !main {if let Some(nodes)=result["nodes"].as_array_mut(){for node in nodes {if let Some(actions)=node["actions"].as_array_mut(){actions.retain(|v|!MAIN_FRAME_ONLY.iter().any(|name|v==name));}}}}
             result["snapshot_id"]=json!(observation);
@@ -2042,7 +2161,7 @@ impl Backend for BrowserBackend {
             let accessible=accessibility(client,&context,&mut nodes).unwrap_or_else(|e|json!({"applied":false,"reason":e.message}));
             regions(&mut nodes);
             result["nodes"]=json!(nodes);
-            result["metadata"]=json!({"page_id":page_id,"frame_id":frame_id,"loader_id":frame["loaderId"],"context_id":context.id,"main_frame":main,"parent_frame_id":entry.parent,"out_of_process":session.is_some(),"accessibility":accessible});
+            result["metadata"]=json!({"page_id":page_id,"frame_id":frame_id,"loader_id":frame["loaderId"],"context_id":context.id,"main_frame":main,"parent_frame_id":entry.parent,"out_of_process":session.is_some(),"accessibility":accessible,"closed_shadow_inspection":shadow});
             Ok(result)
         })
         };
@@ -2153,7 +2272,11 @@ impl Backend for BrowserBackend {
         // A plain DOM click works in any frame. Canvas handlers usually need
         // pointer down/up; those and explicit gestures use trusted input.
         let trusted = match action {
-            Action::Click { .. } => node["tag"] == "canvas" || !action.plain_click(),
+            Action::Click { .. } => {
+                node["tag"] == "canvas"
+                    || node["surface"] == "closed_shadow"
+                    || !action.plain_click()
+            }
             Action::Scroll { .. } | Action::Hover { .. } | Action::Drag { .. } => true,
             _ => false,
         };
@@ -2171,6 +2294,14 @@ impl Backend for BrowserBackend {
             let entry=locate(state,frame_id)?;
             if entry.frame["loaderId"]!=meta["loader_id"] {return Err(error("CONTROL.STALE_TARGET","browser document navigated"));}
             let context=Ctx{session:entry.session.clone(),id:meta["context_id"].as_i64().unwrap_or_default()};
+            let mut inspect=json!({"document_token":snapshot["document_token"],"observation":snapshot["snapshot_id"],"node_id":node["node_id"]});
+            refresh_closed_roots(&mut state.client,&context,Some(&inspect),true)?;
+            if let Action::Drag{to,..}=action {
+                if to.node_id!=node["node_id"] {
+                    inspect["node_id"]=json!(to.node_id);
+                    refresh_closed_roots(&mut state.client,&context,Some(&inspect),false)?;
+                }
+            }
             // Trusted pointer input is addressed to the page; the owner
             // elements of enclosing frames are brought into view first.
             let route=if trusted {Route::to(state,frame_id)?} else {Route::default()};
@@ -2623,11 +2754,28 @@ impl BrowserBackend {
                     return Err(error("CONTROL.ACTION_UNSUPPORTED","capture may include a protected child-frame element"));
                 }
             }
+            // A main-frame capture can include any child frame, even when its
+            // DOM was never in the caller's observation. Inspect protection in
+            // each frame's own isolated world; unknown visibility fails closed.
+            for (child_id,entry) in frame_map(page)? {
+                if child_id==frame_id {continue;}
+                let safe=(||->Result<bool> {
+                    let created=run(&mut page.client,entry.session.as_deref(),"Page.createIsolatedWorld",json!({"frameId":child_id,"worldName":self.world,"grantUniveralAccess":false}))?;
+                    let id=created["executionContextId"].as_i64().ok_or_else(||error("BROWSER.BAD_RESULT","no child context"))?;
+                    let context=Ctx{session:entry.session,id};
+                    let nonce=serde_json::to_string(&uuid::Uuid::new_v4().to_string()).unwrap();
+                    eval(&mut page.client,&context,include_str!("browser.js").replace("/*AAD_NAMING*/",aad_cdp::NAMING).replace("NONCE",&nonce))?;
+                    refresh_closed_roots(&mut page.client,&context,None,true)?;
+                    Ok(eval(&mut page.client,&context,"globalThis.__aadControlV1.closed_protected_visible()".into())?==false)
+                })().unwrap_or(false);
+                if !safe {return Err(error("CONTROL.ACTION_UNSUPPORTED","capture may include protected closed-shadow content in a child frame"));}
+            }
             let client=&mut page.client;
             let context = Ctx {
                 session: None,
                 id: meta["context_id"].as_i64().unwrap_or_default(),
             };
+            refresh_closed_roots(client,&context,None,true)?;
             let args = json!({"document_token": snapshot["document_token"], "observation": snapshot["snapshot_id"], "node_id": node["node_id"]});
             let rect = checked(eval(
                 client,
@@ -3706,6 +3854,24 @@ fn keyboard(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn private_shadow_discovery_follows_nested_roots_and_fails_closed_at_its_bound() {
+        let tree = json!({"children":[{"shadowRoots":[
+            {"shadowRootType":"closed","backendNodeId":7,"children":[
+                {"shadowRoots":[{"shadowRootType":"closed","backendNodeId":9}]}
+            ]},
+            {"shadowRootType":"open","backendNodeId":11}
+        ]}],"contentDocument":{"shadowRoots":[{"shadowRootType":"closed","backendNodeId":13}]}});
+        assert_eq!(closed_root_ids(&tree).unwrap(), vec![7, 9]);
+        assert!(closed_root_ids(&json!({"shadowRootType":"closed"})).is_err());
+        assert_eq!(
+            closed_root_ids(&json!({"children":vec![json!({});20_000]}))
+                .unwrap_err()
+                .code,
+            "CONTROL.ACTION_UNSUPPORTED"
+        );
+    }
 
     #[test]
     fn isolation_requires_the_browser_command_line_not_a_page_claim() {

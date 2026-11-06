@@ -950,6 +950,364 @@ fn a_timed_out_page_key_still_releases_before_any_more_typing() {
 
 #[test]
 #[ignore = "requires isolated Chromium with its sandbox enabled; CI runs it explicitly"]
+fn closed_shadow_hosts_are_observed_visual_surfaces_with_trusted_pointer_input() {
+    use base64::Engine;
+    let _serial = serial();
+    let fixture = Fixture::new();
+    let (session, _) = session_for(&fixture);
+    let main = main_of(&session, &fixture.page_id);
+    assert!(wait_until(&session, &main, "Typed", WaitCondition::Appears)
+        .error
+        .is_none());
+    assert_eq!(
+        page_value(
+            &fixture,
+            r#"document.body.innerHTML='<x-private aria-label="Private panel" style="display:block;width:300px;height:120px"></x-private><x-plain aria-label="Plain custom element" style="display:block;width:300px;height:30px"></x-plain>';
+        window.privateEvents=[];
+        const host=document.querySelector('x-private'),root=host.attachShadow({mode:'closed'});
+        root.innerHTML='<canvas aria-label="Internal drawing" width="300" height="120" style="display:block"></canvas>';
+        const canvas=root.querySelector('canvas'),ctx=canvas.getContext('2d');
+        window.privateCanvas=canvas;
+        canvas.addEventListener('mousedown',e=>{window.privateEvents.push(['down',e.isTrusted]);ctx.fillStyle='red';ctx.fillRect(0,0,300,120);});
+        canvas.addEventListener('mousemove',e=>{if(e.buttons===1){ctx.fillStyle='blue';ctx.fillRect(e.offsetX-4,e.offsetY-4,8,8);}});
+        canvas.addEventListener('mouseup',e=>window.privateEvents.push(['up',e.isTrusted]));
+        canvas.addEventListener('wheel',e=>{e.preventDefault();window.privateEvents.push(['wheel',e.deltaY,e.isTrusted]);},{passive:false});
+        host.shadowRoot===null"#
+        ),
+        true
+    );
+    let observed = observe(&session, &main);
+    assert!(!observed["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|n| n["name"] == "Internal drawing"));
+    assert_eq!(node(&observed, "Private panel")["surface"], "closed_shadow");
+    let capabilities = &node(&observed, "Private panel")["capabilities"];
+    for name in ["click", "hover", "scroll", "drag"] {
+        assert!(
+            capabilities.as_array().unwrap().contains(&json!(name)),
+            "{capabilities}"
+        );
+    }
+    assert!(!capabilities.as_array().unwrap().contains(&json!("fill")));
+    assert!(!capabilities
+        .as_array()
+        .unwrap()
+        .contains(&json!("type_text")));
+    assert!(actions(&observed, "Plain custom element").is_empty());
+    let target =
+        serde_json::from_value(node(&observed, "Private panel")["target"].clone()).unwrap();
+    let clicked = act(&session, target, Action::click());
+    assert!(clicked.error.is_none(), "{clicked:?}");
+    assert_eq!(
+        page_value(&fixture, "window.privateEvents"),
+        json!([["down", true], ["up", true]])
+    );
+
+    // Decode the public screenshot independently of DOM and event assertions.
+    let observed = observe(&session, &main);
+    let target =
+        serde_json::from_value(node(&observed, "Private panel")["target"].clone()).unwrap();
+    let captured = call(&session, Operation::Capture { target });
+    assert!(captured.error.is_none(), "{captured:?}");
+    let captured = captured.data.unwrap();
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(captured["data"].as_str().unwrap())
+        .unwrap();
+    let image = image::load_from_memory(&bytes).unwrap().into_rgb8();
+    assert_eq!(image.dimensions(), (300, 120));
+    assert_eq!(image.get_pixel(150, 60).0, [255, 0, 0]);
+
+    // Drilling into the observed host preserves its capability and anchor.
+    let observed = observe(&session, &main);
+    let target =
+        serde_json::from_value(node(&observed, "Private panel")["target"].clone()).unwrap();
+    let scoped = observe_view(
+        &session,
+        &main,
+        View {
+            scope_target: Some(target),
+            ..Default::default()
+        },
+    );
+    assert!(scoped.error.is_none(), "{scoped:?}");
+    let scoped = scoped.data.unwrap();
+    assert_eq!(scoped["nodes"].as_array().unwrap().len(), 1);
+    let target: Target =
+        serde_json::from_value(node(&scoped, "Private panel")["target"].clone()).unwrap();
+    let dragged = act(
+        &session,
+        target.clone(),
+        Action::Drag {
+            path: Vec::new(),
+            to: target,
+            button: None,
+            fraction: Some(Fraction { fx: 0.2, fy: 0.5 }),
+            to_fraction: Some(Fraction { fx: 0.8, fy: 0.5 }),
+            modifiers: Vec::new(),
+            hold_ms: None,
+        },
+    );
+    assert!(dragged.error.is_none(), "{dragged:?}");
+    assert_eq!(
+        page_value(
+            &fixture,
+            "Array.from(window.privateCanvas.getContext('2d').getImageData(150,60,1,1).data)"
+        ),
+        json!([0, 0, 255, 255])
+    );
+    assert_eq!(page_value(&fixture, "window.privateEvents=[];true"), true);
+    let observed = observe(&session, &main);
+    let target =
+        serde_json::from_value(node(&observed, "Private panel")["target"].clone()).unwrap();
+    let scrolled = act(
+        &session,
+        target,
+        Action::Scroll {
+            direction: Direction::Down,
+            notches: Some(1),
+            fraction: None,
+        },
+    );
+    assert!(scrolled.error.is_none(), "{scrolled:?}");
+    let until = Instant::now() + Duration::from_secs(2);
+    loop {
+        let events = page_value(&fixture, "window.privateEvents");
+        if events == json!([["wheel", 100, true]]) {
+            break;
+        }
+        assert!(Instant::now() < until, "{events}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    let observed = observe(&session, &main);
+    let target =
+        serde_json::from_value(node(&observed, "Private panel")["target"].clone()).unwrap();
+    assert_eq!(page_value(&fixture,"window.privateEvents=[];const cover=document.createElement('div');cover.id='cover';cover.style='position:fixed;inset:0;background:white;z-index:999';document.body.append(cover);true"),true);
+    assert_eq!(
+        act(&session, target, Action::click()).error.unwrap()["code"],
+        "CONTROL.OCCLUDED"
+    );
+    assert_eq!(page_value(&fixture, "window.privateEvents"), json!([]));
+    assert_eq!(
+        page_value(&fixture, "document.getElementById('cover').remove();true"),
+        true
+    );
+
+    // The marker belongs to this element identity, never its tag or name.
+    let observed = observe(&session, &main);
+    let target =
+        serde_json::from_value(node(&observed, "Private panel")["target"].clone()).unwrap();
+    assert_eq!(page_value(&fixture,"const old=document.querySelector('x-private');old.replaceWith(old.cloneNode(false));true"),true);
+    assert_eq!(
+        act(&session, target, Action::click()).error.unwrap()["code"],
+        "CONTROL.STALE_TARGET"
+    );
+    let replaced = observe(&session, &main);
+    assert!(node(&replaced, "Private panel")["surface"].is_null());
+    assert!(actions(&replaced, "Private panel").is_empty());
+    // Truncated observations must still identify hosts in their retained nodes.
+    assert_eq!(page_value(&fixture,"document.querySelector('x-private').attachShadow({mode:'closed'}).innerHTML='<button>Inside</button>';for(let i=0;i<2100;i++){const p=document.createElement('p');p.textContent='row';document.body.append(p);}true"),true);
+    let large = call(
+        &session,
+        Operation::Observe {
+            resource_id: main.clone(),
+            max_nodes: 2000,
+            view: Default::default(),
+        },
+    );
+    assert!(large.error.is_none(), "{large:?}");
+    let large = large.data.unwrap();
+    assert_eq!(large["nodes"].as_array().unwrap().len(), 2000);
+    assert_eq!(large["truncated"], true);
+    assert_eq!(node(&large, "Private panel")["surface"], "closed_shadow");
+    assert_eq!(page_value(&fixture,"for(let i=0;i<10000;i++){const p=document.createElement('p');p.textContent='row';document.body.append(p);}true"),true);
+    let large = observe(&session, &main);
+    assert_eq!(
+        large["metadata"]["closed_shadow_inspection"]["complete"],
+        false
+    );
+    let host = serde_json::from_value(node(&large, "Private panel")["target"].clone()).unwrap();
+    let scoped = observe_view(
+        &session,
+        &main,
+        View {
+            scope_target: Some(host),
+            ..Default::default()
+        },
+    );
+    assert!(scoped.error.is_none(), "{scoped:?}");
+    let scoped = scoped.data.unwrap();
+    assert_eq!(
+        scoped["metadata"]["closed_shadow_inspection"]["complete"],
+        true
+    );
+    assert_eq!(node(&scoped, "Private panel")["surface"], "closed_shadow");
+}
+
+#[test]
+#[ignore = "requires isolated Chromium with its sandbox enabled; CI runs it explicitly"]
+fn closed_shadow_passwords_block_surface_input_and_covering_captures() {
+    let _serial = serial();
+    let fixture = Fixture::new();
+    let (session, _) = session_for(&fixture);
+    let main = main_of(&session, &fixture.page_id);
+    assert!(wait_until(&session, &main, "Typed", WaitCondition::Appears)
+        .error
+        .is_none());
+    assert_eq!(
+        page_value(
+            &fixture,
+            r#"document.body.innerHTML='<div aria-label="Private login" tabindex="0" style="display:block;width:300px;height:120px"></div>';
+        window.privateHost=document.querySelector('div');window.privateRoot=privateHost.attachShadow({mode:'closed'});
+        privateRoot.innerHTML='<button>Login</button>';window.privateClicks=0;privateHost.addEventListener('click',()=>window.privateClicks++);true"#
+        ),
+        true
+    );
+    let target = |observed: &Value| {
+        serde_json::from_value::<Target>(node(observed, "Private login")["target"].clone()).unwrap()
+    };
+    let observed = observe(&session, &main);
+    let before = target(&observed);
+    assert_eq!(
+        page_value(
+            &fixture,
+            r#"window.privatePassword=document.createElement('input');privatePassword.type='password';privatePassword.value='closed-synthetic-private';privateRoot.append(privatePassword);true"#
+        ),
+        true
+    );
+    assert_eq!(
+        act(&session, before, Action::click()).error.unwrap()["code"],
+        "CONTROL.ACTION_UNSUPPORTED"
+    );
+    assert_eq!(page_value(&fixture, "window.privateClicks"), 0);
+    let observed = observe(&session, &main);
+    assert_eq!(
+        node(&observed, "Private login")["states"]["protected"],
+        true
+    );
+    assert_eq!(node(&observed, "Private login")["capabilities"], json!([]));
+    assert!(!observed.to_string().contains("closed-synthetic-private"));
+    assert_eq!(
+        act(&session, target(&observed), keys(&["a"]))
+            .error
+            .unwrap()["code"],
+        "POLICY.DENIED"
+    );
+    assert_eq!(
+        call(
+            &session,
+            Operation::Capture {
+                target: target(&observed)
+            }
+        )
+        .error
+        .unwrap()["code"],
+        "CONTROL.ACTION_UNSUPPORTED"
+    );
+    assert_eq!(
+        capture_document(&session, &main).error.unwrap()["code"],
+        "CONTROL.ACTION_UNSUPPORTED"
+    );
+
+    // A reveal toggle and a fresh observation must not erase known protection.
+    assert_eq!(
+        page_value(&fixture, "privatePassword.type='text';true"),
+        true
+    );
+    let revealed = observe(&session, &main);
+    assert_eq!(
+        node(&revealed, "Private login")["states"]["protected"],
+        true
+    );
+    assert_eq!(
+        capture_document(&session, &main).error.unwrap()["code"],
+        "CONTROL.ACTION_UNSUPPORTED"
+    );
+    // Moving the revealed field outside the host retains its identity too.
+    assert_eq!(page_value(&fixture,"privatePassword.setAttribute('aria-label','Moved private field');document.body.append(privatePassword);true"),true);
+    let moved = observe(&session, &main);
+    assert_eq!(node(&moved, "Moved private field")["value"], Value::Null);
+    assert_eq!(
+        capture_document(&session, &main).error.unwrap()["code"],
+        "CONTROL.ACTION_UNSUPPORTED"
+    );
+    assert_eq!(page_value(&fixture, "privatePassword.remove();true"), true);
+    assert!(capture_document(&session, &main).error.is_none());
+
+    // Every private field must be remembered, not just the first match.
+    assert_eq!(page_value(&fixture,"window.privatePair=['Private one','Private two'].map(name=>{const input=document.createElement('input');input.type='password';input.value='pair-private';input.setAttribute('aria-label',name);privateRoot.append(input);return input;});true"),true);
+    observe(&session, &main);
+    assert_eq!(
+        page_value(
+            &fixture,
+            "for(const input of privatePair){input.type='text';document.body.append(input);}true"
+        ),
+        true
+    );
+    let moved = observe(&session, &main);
+    for name in ["Private one", "Private two"] {
+        assert_eq!(node(&moved, name)["value"], Value::Null, "{name}");
+        assert_eq!(node(&moved, name)["states"]["protected"], true, "{name}");
+    }
+    assert!(!moved.to_string().contains("pair-private"));
+    assert_eq!(
+        capture_document(&session, &main).error.unwrap()["code"],
+        "CONTROL.ACTION_UNSUPPORTED"
+    );
+    assert_eq!(
+        page_value(
+            &fixture,
+            "for(const input of privatePair)input.remove();true"
+        ),
+        true
+    );
+    assert!(capture_document(&session, &main).error.is_none());
+
+    // A newly attached nested closed root is inspected before the next write.
+    let observed = observe(&session, &main);
+    let before = target(&observed);
+    assert_eq!(page_value(&fixture,"const nested=document.createElement('div');privateRoot.append(nested);nested.attachShadow({mode:'closed'}).innerHTML='<input type=password>';true"),true);
+    assert_eq!(
+        act(&session, before, Action::click()).error.unwrap()["code"],
+        "CONTROL.ACTION_UNSUPPORTED"
+    );
+    assert_eq!(
+        capture_document(&session, &main).error.unwrap()["code"],
+        "CONTROL.ACTION_UNSUPPORTED"
+    );
+    assert_eq!(
+        page_value(&fixture, "privateRoot.replaceChildren();true"),
+        true
+    );
+    assert!(capture_document(&session, &main).error.is_none());
+
+    // An unobserved child frame may still appear in a main-frame screenshot.
+    assert_eq!(page_value(&fixture,"window.privateFrame=document.createElement('iframe');privateFrame.src='/frame';document.body.append(privateFrame);true"),true);
+    let until = Instant::now() + Duration::from_secs(3);
+    loop {
+        if page_value(
+            &fixture,
+            "!!privateFrame.contentDocument.querySelector('input')",
+        ) == true
+        {
+            break;
+        }
+        assert!(Instant::now() < until, "child fixture did not load");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(page_value(&fixture,"const inner=privateFrame.contentDocument.createElement('div');inner.style='width:120px;height:40px';privateFrame.contentDocument.body.append(inner);inner.attachShadow({mode:'closed'}).innerHTML='<input type=password>';true"),true);
+    assert_eq!(
+        capture_document(&session, &main).error.unwrap()["code"],
+        "CONTROL.ACTION_UNSUPPORTED"
+    );
+    assert_eq!(page_value(&fixture, "privateFrame.remove();true"), true);
+    assert!(capture_document(&session, &main).error.is_none());
+}
+
+#[test]
+#[ignore = "requires isolated Chromium with its sandbox enabled; CI runs it explicitly"]
 fn fractions_stay_relative_to_the_full_element_when_the_viewport_clips_it() {
     let _serial = serial();
     let fixture = Fixture::new();

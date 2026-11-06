@@ -30,13 +30,38 @@
   // Retain protection for these elements even if the application reveals a
   // password by changing its input type. No secret values are stored here.
   const secretElements = new Set();
+  // This private identity set survives observation resets in this named
+  // isolated world. Detached fields no longer block screenshots.
+  const closedSecrets = globalThis.__aadClosedProtectedV1 || (globalThis.__aadClosedProtectedV1=new Set());
   const password = el => el.tagName==='INPUT' && (el.type||'').toLowerCase()==='password';
-  const protectedNode = el => secretElements.has(el) || (el.tagName === 'INPUT' && ['password','hidden'].includes((el.type||'').toLowerCase()));
+  const fieldProtected = el => secretElements.has(el) || closedSecrets.has(el) || (el.tagName === 'INPUT' && ['password','hidden'].includes((el.type||'').toLowerCase()));
+  const protectedNode = el => fieldProtected(el) || (closedRoots.has(el) && closedProtected(el));
   // A file input only ever takes files, through upload; often it is hidden behind a styled button.
   const fileInput = el => el.tagName === 'INPUT' && (el.type||'').toLowerCase() === 'file';
   // Canvas exposes pixels rather than child controls. Its observed element
   // remains the anchor; pointer input still rechecks identity and hit testing.
   const canvas = el => el.tagName === 'CANVAS';
+  // Normal DOM traversal cannot enter a closed shadow root. CDP supplies a
+  // private root reference; only its observed host becomes a visual surface.
+  const closedRoots = new Map();
+  const surface = el => canvas(el) || closedRoots.has(el);
+  // Inspect protection flags, not field values, and recheck them synchronously
+  // with every action and screenshot request.
+  const closedProtected = host => {
+    const root=closedRoots.get(host);
+    if(!root || root.host!==host)return true;
+    const stack=[...root.children];
+    let scanned=0, protectedFound=false;
+    while(stack.length) {
+      if(++scanned>20000)return true;
+      const el=stack.pop();
+      if(fieldProtected(el)){closedSecrets.add(el);protectedFound=true;}
+      const inner=closedRoots.get(el)||el.shadowRoot;
+      if(inner)stack.push(...inner.children);
+      stack.push(...el.children);
+    }
+    return protectedFound;
+  };
   const present = el => visible(el) || (fileInput(el) && el.isConnected && el.ownerDocument === document);
   const visible = el => el.isConnected && el.ownerDocument === document && el.getClientRects().length > 0 && getComputedStyle(el).visibility !== 'hidden';
   const enabled = el => !el.disabled && !el.closest('[inert]') && el.getAttribute('aria-disabled') !== 'true';
@@ -85,7 +110,7 @@
   };
   // What a person could pick up: HTML5 draggables, items of lists and grids,
   // and whatever shows a grab cursor.
-  const draggable = el => el!==document.body && (canvas(el) || el.draggable || ['listitem','option','row','treeitem'].includes(roleOf(el)) || cursorMarks(el, /^(grab|grabbing|move)$/));
+  const draggable = el => el!==document.body && (surface(el) || el.draggable || ['listitem','option','row','treeitem'].includes(roleOf(el)) || cursorMarks(el, /^(grab|grabbing|move)$/));
   // focus() exists on all HTMLElements, including divs that cannot take focus.
   // Explicit negative tabindex still permits programmatic focus.
   const focusable = el => typeof el.focus==='function' && (el.tabIndex>=0 || el.hasAttribute('tabindex') || el.isContentEditable || activeElement()===el);
@@ -98,11 +123,11 @@
     // Delegated listeners (including React) are invisible in our isolated world.
     // The rendered pointer affordance also identifies their clickable elements;
     // check() rechecks this capability and the observed identity before input.
-    if ((canvas(el) || ['BUTTON','A','INPUT','SELECT'].includes(el.tagName) || el.onclick || roleOf(el)==='button' || checkable(el) || cursorMarks(el, /^pointer$/)) && typeof el.click==='function') result.push('click','hover');
+    if ((surface(el) || ['BUTTON','A','INPUT','SELECT'].includes(el.tagName) || el.onclick || roleOf(el)==='button' || checkable(el) || cursorMarks(el, /^pointer$/)) && typeof el.click==='function') result.push('click','hover');
     if (editable(el)) result.push('fill','type_text');
     if (el.tagName==='SELECT' && !el.multiple) result.push('select');
     if (checkable(el)) result.push('check');
-    if (canvas(el) || scrollable(el)) result.push('scroll');
+    if (surface(el) || scrollable(el)) result.push('scroll');
     if (draggable(el)) result.push('drag');
     if (el===document.body) result.push('navigate','back','forward','reload','open_tab','activate_page','close_page','emulate','clear_site_data');
     return result;
@@ -171,6 +196,7 @@
           value:protectedNode(el)?null:(('value' in el)?String(el.value).slice(0,4096):null),
           states:{enabled:enabled(el),protected:protectedNode(el),read_only:!!el.readOnly,focused:activeElement()===el},actions:actions(el),parent:parentOf(el)};
         if (landmark(el)) node.landmark=true;
+        if (closedRoots.has(el)) node.surface='closed_shadow';
         if (checkable(el)) node.states.checked=checkedOf(el);
         if (fileInput(el)) { node.states.hidden=!visible(el); node.files=Array.from(el.files||[]).slice(0,32).map(f=>f.name.slice(0,256)); node.multiple=!!el.multiple; }
         if (el.tagName==='SELECT') node.options=Array.from(el.options).slice(0,100).map(o=>o.label.trim().slice(0,256));
@@ -183,6 +209,11 @@
     },
     // The observed elements in node order, for the browser's accessibility tree.
     elements: () => Array.from(nodes.values()).map(found=>found.el),
+    reset_closed_roots: () => { closedRoots.clear(); return true; },
+    mark_closed_root: root => { if(!root || !root.host || root.host.ownerDocument!==document)return false; closedRoots.set(root.host,root); return true; },
+    record_closed_protection: () => { for(const host of closedRoots.keys())closedProtected(host); return true; },
+    closed_protected_visible: () => Array.from(closedSecrets).some(visible) || Array.from(closedRoots.keys()).some(host=>visible(host)&&closedProtected(host)),
+    surface_state: () => Array.from(nodes,([node_id,{el}])=>({node_id,surface:closedRoots.has(el)?'closed_shadow':null,protected:protectedNode(el),actions:actions(el)})),
     // Rehydrate identities retained by the backend across observation resets
     // and CDP reconnects. Neither identifiers nor this set contain values.
     mark_secret: el => { if(el.ownerDocument===document)secretElements.add(el); return true; },
@@ -298,9 +329,16 @@
       // A parent or overlapping element's screenshot could reveal a field
       // whose type the page changed to text. Refuse the entire capture rather
       // than racing a pixel mask against a later layout change.
-      for(const secret of secretElements) {
+      for(const secret of [...secretElements,...closedSecrets]) {
         if(!visible(secret))continue;
         const privateBox=secret.getBoundingClientRect();
+        if(privateBox.left<box.right && privateBox.right>box.left &&
+           privateBox.top<box.bottom && privateBox.bottom>box.top)
+          return {error:'CONTROL.ACTION_UNSUPPORTED'};
+      }
+      for(const host of closedRoots.keys()) {
+        if(!visible(host) || !closedProtected(host))continue;
+        const privateBox=host.getBoundingClientRect();
         if(privateBox.left<box.right && privateBox.right>box.left &&
            privateBox.top<box.bottom && privateBox.bottom>box.top)
           return {error:'CONTROL.ACTION_UNSUPPORTED'};
@@ -332,6 +370,18 @@
         x=at(left,width,0.5); y=at(top,height,0.5);
       }
       if(!inside(el,deepHit(x,y))) return {error:'CONTROL.OCCLUDED'};
+      for(const secret of [...secretElements,...closedSecrets]) {
+        if(!visible(secret))continue;
+        const privateBox=secret.getBoundingClientRect();
+        if(x>=privateBox.left && x<privateBox.right && y>=privateBox.top && y<privateBox.bottom)
+          return {error:'CONTROL.ACTION_UNSUPPORTED'};
+      }
+      for(const host of closedRoots.keys()) {
+        if(!visible(host) || !closedProtected(host))continue;
+        const privateBox=host.getBoundingClientRect();
+        if(x>=privateBox.left && x<privateBox.right && y>=privateBox.top && y<privateBox.bottom)
+          return {error:'CONTROL.ACTION_UNSUPPORTED'};
+      }
       return {x,y};
     }
   };
