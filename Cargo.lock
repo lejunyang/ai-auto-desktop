@@ -150,10 +150,13 @@ version = "0.0.6"
 dependencies = [
  "aad-platform",
  "base64 0.22.1",
+ "futures-core",
  "image",
  "libc",
  "serde_json",
+ "uuid",
  "x11rb",
+ "zbus",
 ]
 
 [[package]]

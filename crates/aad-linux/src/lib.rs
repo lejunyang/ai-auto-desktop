@@ -6,6 +6,7 @@
 
 mod desktop;
 pub mod probe;
+pub mod wayland_portal;
 mod x11;
 
 pub use desktop::{open, screens};
