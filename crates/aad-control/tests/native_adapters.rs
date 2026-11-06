@@ -228,6 +228,51 @@ fn native_scope_keeps_the_observed_identity_and_resource_selector() {
         "CONTROL.SCOPE_UNSUPPORTED"
     );
 }
+
+#[test]
+fn held_input_preserves_duration_and_uses_physical_native_operations() {
+    for (name, flavor) in [
+        ("desktop.windows_uia", Flavor::Windows),
+        ("desktop.linux_atspi", Flavor::Linux),
+        ("desktop.macos_ax", Flavor::MacOS),
+    ] {
+        let provider = Fixture::new(name, flavor);
+        let backend = NativeBackend::new(provider.clone(), flavor);
+        let node = json!({"node_id":"n", "actions":["pointer_click","pointer_gesture","drag","key_chord"],
+            "provenance":{"bus_name":":1.2","object_path":"/org/a11y/surface"}});
+        let snapshot = json!({"snapshot_id":"s", "revision":1, "nodes":[node]});
+        for (kind, native) in [
+            ("click", "pointer_gesture"),
+            ("drag", "drag"),
+            ("key", "key_chord"),
+        ] {
+            let mut value = json!({"type":kind,"hold_ms":250});
+            if kind == "drag" {
+                value["to"] =
+                    json!({"session_id":"s","resource_id":"r","observation_id":"o","node_id":"n"});
+            } else if kind == "key" {
+                value["keys"] = json!(["a"]);
+            }
+            let action: Action = serde_json::from_value(value).unwrap();
+            backend
+                .act(
+                    &snapshot,
+                    &node,
+                    &action,
+                    &Context::new(Duration::from_secs(1), true),
+                )
+                .unwrap();
+            let calls = provider.calls.lock().unwrap();
+            let (called, args) = calls.last().unwrap();
+            assert_eq!(called, &format!("{name}.{native}@1"));
+            assert_eq!(args["hold_ms"], 250);
+            assert_eq!(
+                args["target"],
+                json!({"snapshot_id":"s","revision":1,"node_id":"n"})
+            );
+        }
+    }
+}
 impl Provider for Fixture {
     fn manifest(&self) -> &CapabilityManifest {
         &self.manifest
@@ -374,6 +419,7 @@ fn windows_gestures_views_and_rich_locators_route_to_the_driver() {
         count: None,
         fraction: Some(Fraction { fx: 0.25, fy: 0.5 }),
         modifiers: vec![PointerModifier::Ctrl, PointerModifier::Shift],
+        hold_ms: None,
     };
     backend.act(&snapshot, &node, &right, &context()).unwrap();
     let (called, args) = last();
@@ -400,6 +446,7 @@ fn windows_gestures_views_and_rich_locators_route_to_the_driver() {
         fraction: None,
         to_fraction: None,
         modifiers: vec![PointerModifier::Alt],
+        hold_ms: None,
     };
     backend.act(&snapshot, &node, &drag, &context()).unwrap();
     let (called, args) = last();

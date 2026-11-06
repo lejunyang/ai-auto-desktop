@@ -172,6 +172,7 @@ fn policy_and_unsupported_actions_do_not_dispatch() {
                 verify: None,
                 target,
                 action: Action::Key {
+                    hold_ms: None,
                     keys: vec!["Enter".into()]
                 }
             }

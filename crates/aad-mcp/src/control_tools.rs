@@ -53,6 +53,11 @@ fn pointer_modifiers_schema() -> Value {
     })
 }
 
+fn hold_schema(description: &str) -> Value {
+    json!({"type":"integer", "minimum":1, "maximum":5000,
+        "description":format!("{description} Within this request only; input is released on completion or failure. Providers refuse unsupported holds or insufficient deadlines.")})
+}
+
 fn action_schema() -> Value {
     let variant = |name: &str, description: &str, properties: Value, required: &[&str]| {
         let mut all = Map::from_iter([("type".to_string(), json!({"const": name}))]);
@@ -81,7 +86,8 @@ fn action_schema() -> Value {
             "button": button_schema(),
             "count": {"type": "integer", "enum": [1, 2], "description": "1 for a single click, 2 for a double click."},
             "fraction": fraction_schema("Where inside the element to click"),
-            "modifiers": pointer_modifiers_schema()
+            "modifiers": pointer_modifiers_schema(),
+            "hold_ms": hold_schema("Keep the button down before release, in milliseconds. Only a single click (count 1) can be held.")
         }), &[]),
         variant("fill", "Replace the element's value directly. Prefer this over \
     type_text for text fields: it is atomic and does not depend on focus.", json!({
@@ -108,10 +114,12 @@ fn action_schema() -> Value {
     shortcuts and keys no text can express, such as Ctrl+Z, F5, Tab or Escape. Modifiers \
     (ctrl, shift, alt, win) followed by exactly one main key. Browsers accept editing and \
     navigation keys for the focused element -- Enter, Tab, Escape, arrows, Home/End, \
-    Backspace, a single character, ctrl+a/c/v/x/z/y, ctrl+shift+z, shift or ctrl+shift with \
-    arrows -- and refuse browser-global shortcuts (ctrl+t/w/n/l, ctrl+tab, other \
-    ctrl+shift chords, alt chords, function keys but F2).", json!({
-            "keys": {"type": "array", "items": {"type": "string", "maxLength": 32}, "minItems": 1, "maxItems": 6}
+    Backspace, a single character, Ctrl or Ctrl+Shift with letters, shift or ctrl+shift with \
+    arrows. These are page renderer events and do not activate browser accelerators. \
+    Ctrl+Tab/PageUp/PageDown, Alt/Meta and function keys except F2 remain unsupported; use \
+    explicit page actions for browser tabs.", json!({
+            "keys": {"type": "array", "items": {"type": "string", "maxLength": 32}, "minItems": 1, "maxItems": 6},
+            "hold_ms": hold_schema("Keep the key combination down before release, in milliseconds.")
         }), &["keys"]),
         variant("scroll", "Scroll the wheel over the element. In a browser, offered on the \
     page body and on scrollable containers, in any frame.", json!({
@@ -135,7 +143,8 @@ fn action_schema() -> Value {
             "button": button_schema(),
             "fraction": fraction_schema("Where inside the source element to grab"),
             "to_fraction": fraction_schema("Where inside the destination element to release"),
-            "modifiers": pointer_modifiers_schema()
+            "modifiers": pointer_modifiers_schema(),
+            "hold_ms": hold_schema("Wait at the source with the button held, before the first drag movement, in milliseconds.")
         }), &["to"]),
         variant("select", "Choose one option of a list box (a browser <select>), by its \
     label as the observation lists it in `options`, or by its value.", json!({

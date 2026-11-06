@@ -2174,14 +2174,14 @@ impl Backend for BrowserBackend {
             // Trusted pointer input is addressed to the page; the owner
             // elements of enclosing frames are brought into view first.
             let route=if trusted {Route::to(state,frame_id)?} else {Route::default()};
-            if let Action::Drag {to,fraction,to_fraction,button,modifiers}=action {
-                let observed=|node_id:&str,fraction:&Option<crate::Fraction>,action:Value|{let mut args=json!({"document_token":snapshot["document_token"],"observation":snapshot["snapshot_id"],"node_id":node_id,"action":action});if let Some(f)=fraction{args["fraction"]=json!({"fx":f.fx,"fy":f.fy});}args};
+            if let Action::Drag {to,fraction,to_fraction,button,modifiers,hold_ms}=action {
+                let observed=|node_id:&str,fraction:&Option<crate::Fraction>,action:Value|{let mut args=json!({"document_token":snapshot["document_token"],"observation":snapshot["snapshot_id"],"node_id":node_id,"action":action,"frame_id":frame_id,"loader_id":meta["loader_id"]});if let Some(f)=fraction{args["fraction"]=json!({"fx":f.fx,"fy":f.fy});}args};
                 let from=observed(node["node_id"].as_str().unwrap_or_default(),fraction,json!("drag"));
                 let onto=observed(&to.node_id,to_fraction,Value::Null);
-                return drag(state,&context,&route,&from,&onto,*button,pointer_modifiers(modifiers),action_context);
+                return drag(state,&context,&route,&from,&onto,*button,pointer_modifiers(modifiers),*hold_ms,action_context);
             }
             let client=&mut state.client;
-            let mut args=json!({"document_token":snapshot["document_token"],"observation":snapshot["snapshot_id"],"node_id":node["node_id"],"action":action.name()});
+            let mut args=json!({"document_token":snapshot["document_token"],"observation":snapshot["snapshot_id"],"node_id":node["node_id"],"action":action.name(),"frame_id":frame_id,"loader_id":meta["loader_id"]});
             match action {
                 Action::Fill {value}=>args["value"]=json!(value),
                 Action::Select {option}=>args["option"]=json!(option),
@@ -2662,6 +2662,76 @@ fn mouse(client: &mut Client, params: Value) -> Result<Value> {
     command(client, "Input.dispatchMouseEvent", params).map_err(|e| e.with_effect("unknown"))
 }
 
+const INPUT_CLEANUP: Duration = Duration::from_millis(200);
+
+fn hold_preflight(context: &crate::Context, hold_ms: Option<u64>) -> Result<()> {
+    if let Some(ms) = hold_ms {
+        if !(1..=5000).contains(&ms) {
+            return Err(error(
+                "CONTROL.INVALID_REQUEST",
+                "hold_ms must be in 1..5000",
+            ));
+        }
+        if context.remaining()? < Duration::from_millis(ms) + INPUT_CLEANUP {
+            return Err(error(
+                "CONTROL.TIMEOUT",
+                "request deadline does not cover the hold and input release",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn wait_hold(
+    client: &mut Client,
+    hold_ms: Option<u64>,
+    context: &crate::Context,
+    verify: impl Fn(&mut Client) -> Result<()>,
+) -> Result<()> {
+    let Some(ms) = hold_ms else {
+        return Ok(());
+    };
+    let until = Instant::now() + Duration::from_millis(ms);
+    loop {
+        context.remaining()?;
+        verify(client).map_err(|e| e.with_effect("unknown"))?;
+        let remaining = until.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(());
+        }
+        std::thread::sleep(remaining.min(Duration::from_millis(25)));
+    }
+}
+
+fn held_pointer(
+    client: &mut Client,
+    context: &Ctx,
+    route: &Route,
+    args: &Value,
+    expected: (f64, f64),
+) -> Result<()> {
+    if current_frame(
+        client,
+        context.session.as_deref(),
+        args["frame_id"].as_str().unwrap_or_default(),
+    )?["loaderId"]
+        != args["loader_id"]
+    {
+        return Err(error(
+            "CONTROL.STALE_TARGET",
+            "held pointer document changed",
+        ));
+    }
+    let mut still = args.clone();
+    still["noscroll"] = json!(true);
+    let local = landing(client, context, &still)?;
+    let actual = route.page_point(client, local)?;
+    if (actual.0 - expected.0).abs() > 0.5 || (actual.1 - expected.1).abs() > 0.5 {
+        return Err(error("CONTROL.STALE_TARGET", "held pointer target moved"));
+    }
+    Ok(())
+}
+
 /// CDP carries modifier state on each pointer event, so a gesture does not
 /// send keys to a different focused element or leave modifier keys pressed.
 fn pointer_modifiers(modifiers: &[PointerModifier]) -> u32 {
@@ -2684,6 +2754,9 @@ fn pointer(
     action: &Action,
     action_context: &crate::Context,
 ) -> Result<Value> {
+    if let Action::Click { hold_ms, .. } = action {
+        hold_preflight(action_context, *hold_ms)?;
+    }
     let point = landing(client, context, args)?;
     let (x, y) = route.page_point(client, point)?;
     let modifiers = match action {
@@ -2701,26 +2774,40 @@ fn pointer(
         action_context,
     )?;
     match action {
-        Action::Click { button, count, .. } => {
+        Action::Click {
+            button,
+            count,
+            hold_ms,
+            ..
+        } => {
+            hold_preflight(action_context, *hold_ms)?;
             let (name, mask) = match button {
                 None | Some(Button::Left) => ("left", 1),
                 Some(Button::Right) => ("right", 2),
                 Some(Button::Middle) => ("middle", 4),
             };
             for click in 1..=count.unwrap_or(1) {
+                let deadline = Instant::now() + action_context.remaining()?;
                 let pressed = mouse(
                     client,
                     json!({"type": "mousePressed", "x": x, "y": y, "button": name, "buttons": mask, "clickCount": click, "modifiers": modifiers}),
-                );
+                ).and_then(|_|wait_hold(client,*hold_ms,action_context,|client|held_pointer(client,context,route,args,(x,y))));
                 // Even an errored dispatch may already have pressed the button.
+                if pressed.is_err() {
+                    client.set_deadline(Instant::now() + INPUT_CLEANUP);
+                }
                 let released = mouse(
                     client,
                     json!({"type": "mouseReleased", "x": x, "y": y, "button": name, "buttons": 0, "clickCount": click, "modifiers": modifiers}),
                 );
-                let cleared = released.is_ok() || mouse(
-                        client,
-                        json!({"type": "mouseReleased", "x": x, "y": y, "button": name, "buttons": 0, "modifiers": 0}),
-                    ).is_ok();
+                let cleared = released.is_ok()
+                    || if pressed.is_ok() {
+                        client.set_deadline(Instant::now() + INPUT_CLEANUP);
+                        mouse(client,json!({"type":"mouseReleased","x":x,"y":y,"button":name,"buttons":0,"modifiers":0})).is_ok()
+                    } else {
+                        false
+                    };
+                client.set_deadline(deadline);
                 pressed
                     .and(released)
                     .map_err(|e| e.with_detail("pointer_button_released", json!(cleared)))?;
@@ -2838,8 +2925,11 @@ fn drag(
     onto: &Value,
     button: Option<Button>,
     modifiers: u32,
+    hold_ms: Option<u64>,
     action_context: &crate::Context,
 ) -> Result<Value> {
+    hold_preflight(action_context, hold_ms)?;
+    let deadline = Instant::now() + action_context.remaining()?;
     let client = &mut page.client;
     landing(client, context, from)?;
     landing(client, context, onto)?;
@@ -2892,11 +2982,16 @@ fn drag(
             modifiers,
             action_context,
         )?;
+        hold_preflight(action_context, hold_ms)?;
         held = true;
         mouse(
             &mut page.client,
             json!({"type": "mousePressed", "x": start.0, "y": start.1, "button": name, "buttons": mask, "clickCount": 1, "modifiers": modifiers}),
         )?;
+        wait_hold(&mut page.client, hold_ms, action_context, |client| {
+            held_pointer(client, context, route, from, start)?;
+            held_pointer(client, context, route, onto, end)
+        })?;
         let mut intercepted = None;
         for step in 1..=DRAG_STEPS {
             let f = f64::from(step) / f64::from(DRAG_STEPS);
@@ -2947,6 +3042,9 @@ fn drag(
                 "html5_drag": intercepted.is_some(), "steps": DRAG_STEPS}),
         )
     })();
+    if result.is_err() {
+        page.client.set_deadline(Instant::now() + INPUT_CLEANUP);
+    }
     let cleared = if held {
         // Cleanup is best effort; preserve the original error and its unknown
         // effect if the renderer or the connection can no longer answer.
@@ -2963,6 +3061,7 @@ fn drag(
         json!({"enabled": false}),
     );
     let interception_cleared = disabled.is_ok();
+    page.client.set_deadline(deadline);
     result
         .and_then(|value| {
             disabled
@@ -3458,18 +3557,27 @@ fn key_event(press: &KeyPress, release: bool) -> Value {
 /// Even a timed-out dispatch may already have pressed a key. A short cleanup
 /// budget permits release after the request deadline; it never permits more
 /// typing, and the original deadline is restored afterwards.
-fn press(client: &mut Client, press: &KeyPress, deadline: Instant) -> Result<()> {
+fn press(
+    client: &mut Client,
+    press: &KeyPress,
+    deadline: Instant,
+    hold_ms: Option<u64>,
+    context: &crate::Context,
+    verify: impl Fn(&mut Client) -> Result<()>,
+) -> Result<()> {
+    hold_preflight(context, hold_ms)?;
     let pressed = command(client, "Input.dispatchKeyEvent", key_event(press, false))
-        .map_err(|e| e.with_effect("unknown"));
+        .map_err(|e| e.with_effect("unknown"))
+        .and_then(|_| wait_hold(client, hold_ms, context, verify));
     if pressed.is_err() {
-        client.set_deadline(Instant::now() + Duration::from_millis(200));
+        client.set_deadline(Instant::now() + INPUT_CLEANUP);
     }
     let released = command(client, "Input.dispatchKeyEvent", key_event(press, true))
         .map_err(|e| e.with_effect("unknown"));
     let cleared = if released.is_ok() {
         true
     } else if pressed.is_ok() {
-        client.set_deadline(Instant::now() + Duration::from_millis(200));
+        client.set_deadline(Instant::now() + INPUT_CLEANUP);
         command(client, "Input.dispatchKeyEvent", key_event(press, true)).is_ok()
     } else {
         false
@@ -3523,8 +3631,13 @@ fn keyboard(
     action: &Action,
     action_context: &crate::Context,
 ) -> Result<Value> {
+    let hold_ms = match action {
+        Action::Key { hold_ms, .. } => *hold_ms,
+        _ => None,
+    };
+    hold_preflight(action_context, hold_ms)?;
     let strokes = match action {
-        Action::Key { keys } => Keystrokes::Presses(vec![key_chord(keys)?]),
+        Action::Key { keys, .. } => Keystrokes::Presses(vec![key_chord(keys)?]),
         Action::TypeText { text, mode } => keystrokes(text, *mode)?,
         _ => unreachable!("only keyboard actions reach here"),
     };
@@ -3573,6 +3686,9 @@ fn keyboard(
                 client,
                 &presses[index],
                 Instant::now() + action_context.remaining()?,
+                hold_ms,
+                action_context,
+                |client| focused(client, "unknown"),
             )?,
             Keystrokes::Text(chunks) => {
                 command(client, "Input.insertText", json!({"text": chunks[index]}))

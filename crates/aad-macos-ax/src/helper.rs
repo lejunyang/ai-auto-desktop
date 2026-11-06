@@ -169,10 +169,10 @@ impl SwiftHelperBackend {
         let mut focus_changed = false;
         loop {
             let line = read_line(state, deadline).map_err(|error| {
-                let effect = dispatch_started || focus_changed;
-                if effect {
-                    terminate_state(state, true);
-                }
+                // SIGTERM gives the helper's independent release guard a
+                // bounded cleanup window. SIGKILL would bypass owned key-up.
+                // Even without progress, an in-flight request must be stopped.
+                terminate_state(state);
                 channel_error(
                     &error.code,
                     &error.message,
@@ -182,7 +182,7 @@ impl SwiftHelperBackend {
                 )
             })?;
             let response: Value = serde_json::from_slice(&line).map_err(|_| {
-                terminate_state(state, true);
+                terminate_state(state);
                 channel_error(
                     "DRIVER.ACTION_FAILED",
                     "macOS AX helper returned invalid JSON",
@@ -201,7 +201,7 @@ impl SwiftHelperBackend {
                 )
             })?;
             if object.get("id") != Some(&json!(id)) {
-                terminate_state(state, true);
+                terminate_state(state);
                 return Err(channel_error(
                     "DRIVER.ACTION_FAILED",
                     "macOS AX helper response id mismatch",
@@ -261,7 +261,7 @@ impl SwiftHelperBackend {
                 focus_changed |=
                     details.get("focus_changed").and_then(Value::as_bool) == Some(true);
                 if track_dispatch && dispatch_started {
-                    terminate_state(state, true);
+                    terminate_state(state);
                     return Err(driver_error(
                         "DRIVER.UNKNOWN_EFFECT",
                         "macOS input result is unknown after native dispatch",
@@ -303,7 +303,7 @@ impl SwiftHelperBackend {
                             .and_then(Value::as_bool)
                     });
                 if declared != Some(dispatch_started) {
-                    terminate_state(state, true);
+                    terminate_state(state);
                     return Err(channel_error(
                         "DRIVER.UNKNOWN_EFFECT",
                         "macOS AX helper dispatch state is inconsistent",
@@ -355,7 +355,7 @@ impl Drop for SwiftHelperBackend {
     fn drop(&mut self) {
         if let Ok(mut state) = self.state.lock() {
             if let Some(state) = state.as_mut() {
-                terminate_state(state, false);
+                terminate_state(state);
             }
             *state = None;
         }
@@ -563,6 +563,19 @@ impl AxBackend for SwiftHelperBackend {
             deadline,
         )
     }
+    fn key_chord_held(
+        &self,
+        token: &str,
+        keys: &[String],
+        hold_ms: Option<u64>,
+        deadline: Instant,
+    ) -> Result<Value, AutomationError> {
+        let mut args = json!({"native_token": token, "keys": keys});
+        if let Some(ms) = hold_ms {
+            args["hold_ms"] = json!(ms);
+        }
+        self.write("key_chord", args, deadline)
+    }
     fn window_action(
         &self,
         token: &str,
@@ -621,7 +634,7 @@ impl AxBackend for SwiftHelperBackend {
     fn close(&self) {
         if let Ok(mut state) = self.state.lock() {
             if let Some(state) = state.as_mut() {
-                terminate_state(state, false);
+                terminate_state(state);
             }
             *state = None;
         }
@@ -752,12 +765,13 @@ fn read_line(state: &mut HelperState, deadline: Instant) -> Result<Vec<u8>, Auto
     }
 }
 
-fn terminate_state(state: &mut HelperState, force: bool) {
-    let signal = if force { libc::SIGKILL } else { libc::SIGTERM };
+fn terminate_state(state: &mut HelperState) {
+    // All shutdown paths first allow a held-input watchdog to release. The
+    // cleanup budget is independent of the expired request's timeout.
     unsafe {
-        libc::kill(-(state.child.id() as i32), signal);
+        libc::kill(-(state.child.id() as i32), libc::SIGTERM);
     }
-    let grace = Instant::now() + Duration::from_millis(200);
+    let grace = Instant::now() + Duration::from_millis(500);
     while Instant::now() < grace {
         if state.child.try_wait().ok().flatten().is_some() {
             return;
@@ -938,12 +952,21 @@ mod tests {
     }
 
     fn backend(fixture: &Fixture) -> SwiftHelperBackend {
-        let mut child = Command::new("sh")
+        use std::os::unix::process::CommandExt;
+        let mut command = Command::new("sh");
+        command
             .arg(&fixture.executable)
             .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .spawn()
-            .unwrap();
+            .stdout(Stdio::piped());
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = command.spawn().unwrap();
         let stdin = child.stdin.take().unwrap();
         let stdout = child.stdout.take().unwrap();
         SwiftHelperBackend {
@@ -956,6 +979,43 @@ mod tests {
             })),
             helper_source: "fixture".into(),
         }
+    }
+
+    #[test]
+    fn expired_input_request_gets_cleanup_grace_before_process_exit() {
+        let fixture = Fixture::new(
+            r#"#!/bin/sh
+trap 'printf released > "$0.release"; exit 0' TERM
+IFS= read -r line
+id=$(printf '%s' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+printf '{"id":"%s","progress":{"keyboard_dispatch_started":true}}\n' "$id"
+while :; do sleep 0.01; done
+"#,
+        );
+        let backend = backend(&fixture);
+        let started = Instant::now();
+        let error = backend
+            .key_chord_held(
+                "fixture",
+                &["a".into()],
+                Some(20),
+                started + Duration::from_millis(100),
+            )
+            .unwrap_err();
+        assert_eq!(error.effect, "unknown");
+        assert!(started.elapsed() < Duration::from_secs(2));
+        let marker = PathBuf::from(format!("{}.release", fixture.executable.display()));
+        assert_eq!(std::fs::read_to_string(marker).unwrap(), "released");
+        assert!(backend
+            .state
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .child
+            .try_wait()
+            .unwrap()
+            .is_some());
     }
 
     #[test]

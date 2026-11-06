@@ -2,7 +2,81 @@ import AppKit
 import ApplicationServices
 import Carbon.HIToolbox
 import Darwin
+import Dispatch
 import Foundation
+
+/// Signal handling runs on Dispatch, outside an async signal handler. A blocked
+/// AX request cannot prevent the independent input-release timer from firing.
+private final class InputCancellation {
+    private let lock = NSLock()
+    private var requested = false
+    var cancelled: Bool { lock.lock(); defer { lock.unlock() }; return requested }
+    func cancel() { lock.lock(); requested = true; lock.unlock() }
+}
+private let inputCancellation = InputCancellation()
+
+private final class InputReleaseGuard {
+    private let lock = NSLock()
+    private let pid: pid_t
+    private let deadline: UInt64
+    private var releases: [CGEvent] = []
+    private var stopped = false
+    private(set) var expired = false
+    private let timer: DispatchSourceTimer
+
+    init(pid: pid_t, deadlineMS: Double?, holdMS: Int) {
+        self.pid = pid
+        let remainingMS = deadlineMS.map { max(0, $0 - Date().timeIntervalSince1970 * 1000) } ?? Double(holdMS + 750)
+        self.deadline = DispatchTime.now().uptimeNanoseconds + UInt64(min(Double(holdMS + 750), remainingMS) * 1_000_000)
+        timer = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .userInitiated))
+        timer.schedule(deadline: .now(), repeating: .milliseconds(10))
+        timer.setEventHandler { [weak self] in self?.expireIfNeeded() }
+        timer.resume()
+    }
+
+    private func releaseLocked() {
+        for event in releases.reversed() { event.flags = []; event.postToPid(pid) }
+        releases.removeAll()
+    }
+
+    private func expireIfNeeded() {
+        lock.lock(); defer { lock.unlock() }
+        if !stopped && (DispatchTime.now().uptimeNanoseconds >= deadline || inputCancellation.cancelled) {
+            stopped = true
+            expired = true
+            releaseLocked()
+        }
+    }
+
+    func post(_ event: CGEvent, release: CGEvent? = nil) throws {
+        lock.lock(); defer { lock.unlock() }
+        guard !stopped, DispatchTime.now().uptimeNanoseconds < deadline, !inputCancellation.cancelled else {
+            stopped = true; expired = true; releaseLocked()
+            throw HelperFailure("DRIVER.TIMEOUT", "held input was cancelled or expired")
+        }
+        if let release { releases.append(release) }
+        if event.type != .keyDown && event.type != .keyUp {
+            for pending in releases { pending.location = event.location }
+        }
+        event.postToPid(pid)
+        switch event.type {
+        case .keyUp:
+            let code = event.getIntegerValueField(.keyboardEventKeycode)
+            releases.removeAll { $0.type == .keyUp && $0.getIntegerValueField(.keyboardEventKeycode) == code }
+        case .leftMouseUp, .rightMouseUp, .otherMouseUp:
+            releases.removeAll { $0.type == event.type }
+        default: break
+        }
+    }
+
+    /// Always returns after owned releases are submitted, even past the deadline.
+    func finish() -> Bool {
+        lock.lock(); stopped = true; releaseLocked(); let timedOut = expired; lock.unlock()
+        timer.cancel()
+        return timedOut
+    }
+    deinit { _ = finish() }
+}
 
 /// 3 added capture, window_action, paste, clipboard_read and global_key.
 private let protocolVersion = 3
@@ -556,6 +630,7 @@ private final class AXService {
     }
 
     private func checkDeadline(_ deadlineMS: Double?) throws {
+        if inputCancellation.cancelled { throw HelperFailure("DRIVER.TIMEOUT", "AX helper input was cancelled") }
         guard let deadlineMS else { return }
         guard deadlineMS.isFinite else {
             throw HelperFailure("DRIVER.INVALID_REQUEST", "deadline_ms must be finite")
@@ -985,6 +1060,7 @@ private final class AXService {
     private struct PointerTarget {
         let pid: pid_t
         let point: CGPoint
+        let bounds: [String: Int]
     }
 
     /// A point inside an enabled, unprotected element of the frontmost
@@ -1050,7 +1126,7 @@ private final class AXService {
                 data: progress.pointerMetadata(phase: "hit_test_verification")
             )
         }
-        return PointerTarget(pid: targetPID, point: point)
+        return PointerTarget(pid: targetPID, point: point, bounds: bounds)
     }
 
     private func isSelfOrDescendant(_ candidate: AXUIElement, of ancestor: AXUIElement) -> Bool {
@@ -1128,11 +1204,17 @@ private final class AXService {
     private func postPointerEvents(
         _ events: [CGEvent], pid: pid_t, flags: CGEventFlags,
         release: CGEvent?, operation: String, deadlineMS: Double?,
-        requestID: String, progress: RequestProgress, paceDrag: Bool = false
+        requestID: String, progress: RequestProgress, paceDrag: Bool = false,
+        holdMS: Int? = nil, verifyHold: () throws -> Void = {}
     ) throws {
+        if let holdMS { try requireHoldBudget(holdMS, deadlineMS: deadlineMS) }
+        let holdGuard = holdMS.map { InputReleaseGuard(pid: pid, deadlineMS: deadlineMS, holdMS: $0) }
         var held = false
         defer {
-            if held, let release {
+            if let holdGuard {
+                _ = holdGuard.finish()
+                if held { progress.markPointerReleaseSubmitted() }
+            } else if held, let release {
                 release.flags = []
                 release.postToPid(pid)
                 progress.markPointerReleaseSubmitted()
@@ -1141,20 +1223,51 @@ private final class AXService {
         for (index, event) in events.enumerated() {
             try requireFrontmost(pid, operation: operation)
             try checkDeadline(deadlineMS)
-            release?.location = event.location
+            if holdGuard == nil { release?.location = event.location }
             switch event.type {
-            case .leftMouseDown, .rightMouseDown, .otherMouseDown: held = true
+            case .leftMouseDown, .rightMouseDown, .otherMouseDown:
+                if let holdMS { try verifyHold(); try requireHoldBudget(holdMS, deadlineMS: deadlineMS) }
+                held = true
             default: break
             }
             event.flags = flags
             startPointerDispatch(requestID: requestID, progress: progress)
-            event.postToPid(pid)
+            if let holdGuard {
+                let down = [.leftMouseDown, .rightMouseDown, .otherMouseDown].contains(event.type)
+                try holdGuard.post(event, release: down ? release : nil)
+            } else { event.postToPid(pid) }
+            if let holdMS, [.leftMouseDown, .rightMouseDown, .otherMouseDown].contains(event.type) {
+                try boundedDwell(milliseconds: holdMS, deadlineMS: deadlineMS, verify: verifyHold)
+            }
             switch event.type {
             case .leftMouseUp, .rightMouseUp, .otherMouseUp: held = false
             default: break
             }
             if paceDrag && index >= 1 { usleep(15_000) }
         }
+    }
+
+    private func holdDuration(_ args: Arguments) throws -> Int? {
+        if args.values["hold_ms"] == nil { return nil }
+        return try args.integer("hold_ms", minimum: 1, maximum: 5_000)
+    }
+
+    private func requireHoldBudget(_ milliseconds: Int, deadlineMS: Double?) throws {
+        try checkDeadline(deadlineMS)
+        guard let deadlineMS, deadlineMS - Date().timeIntervalSince1970 * 1000 > Double(milliseconds) else {
+            throw HelperFailure("DRIVER.TIMEOUT", "hold exceeds the remaining input deadline")
+        }
+    }
+
+    private func boundedDwell(milliseconds: Int, deadlineMS: Double?, verify: () throws -> Void) throws {
+        let end = DispatchTime.now().uptimeNanoseconds + UInt64(milliseconds) * 1_000_000
+        repeat {
+            try checkDeadline(deadlineMS)
+            try verify()
+            try checkDeadline(deadlineMS)
+            if DispatchTime.now().uptimeNanoseconds >= end { return }
+            usleep(10_000)
+        } while true
     }
 
     /// Rest for a while, but never past the request's deadline.
@@ -1171,10 +1284,11 @@ private final class AXService {
         progress: RequestProgress
     ) throws -> [String: Any] {
         try args.only([
-            "native_token", "mode", "button", "count", "direction", "notches", "hover_ms", "fx", "fy", "modifiers",
+            "native_token", "mode", "button", "count", "direction", "notches", "hover_ms", "fx", "fy", "modifiers", "hold_ms",
         ])
         try requireTrusted()
         let mode = try args.string("mode")!
+        let holdMS = try holdDuration(args)
         let flags = try pointerModifiers(args)
         let target = try pointerTarget(
             token: try args.string("native_token")!,
@@ -1186,10 +1300,14 @@ private final class AXService {
         var release: CGEvent?
         switch mode {
         case "click":
-            try args.only(["native_token", "mode", "button", "count", "fx", "fy", "modifiers"])
+            try args.only(["native_token", "mode", "button", "count", "fx", "fy", "modifiers", "hold_ms"])
             let types = try mouseTypes(try args.string("button")!)
             release = try mouseEvent(types.up, at: target.point, button: types.button)
             let count = try args.integer("count", minimum: 1, maximum: 2)
+            if holdMS != nil && count != 1 { throw HelperFailure("DRIVER.INVALID_REQUEST", "hold_ms requires a single click") }
+            if holdMS != nil && CGEventSource.buttonState(.combinedSessionState, button: types.button) {
+                throw HelperFailure("DRIVER.INPUT_BLOCKED", "requested pointer button is already held")
+            }
             for click in 1...count {
                 events.append(try mouseEvent(
                     types.down, at: target.point, button: types.button, clicks: Int64(click)
@@ -1233,7 +1351,15 @@ private final class AXService {
         try postPointerEvents(
             events, pid: target.pid, flags: flags, release: release,
             operation: "pointer_gesture", deadlineMS: deadlineMS,
-            requestID: requestID, progress: progress
+            requestID: requestID, progress: progress, holdMS: holdMS,
+            verifyHold: {
+                let fresh = try self.pointerTarget(
+                    token: try args.string("native_token")!, fx: try args.fraction("fx"), fy: try args.fraction("fy"),
+                    operation: "pointer_gesture", deadlineMS: deadlineMS, progress: progress)
+                guard fresh.pid == target.pid, fresh.bounds == target.bounds, fresh.point == target.point else {
+                    throw HelperFailure("DRIVER.STALE_HANDLE", "held pointer target geometry changed")
+                }
+            }
         )
         if dwellMS > 0 { dwell(milliseconds: dwellMS, deadlineMS: deadlineMS) }
         return [
@@ -1248,10 +1374,14 @@ private final class AXService {
         args: Arguments, deadlineMS: Double?, requestID: String,
         progress: RequestProgress
     ) throws -> [String: Any] {
-        try args.only(["native_token", "to_token", "button", "fx", "fy", "to_fx", "to_fy", "modifiers"])
+        try args.only(["native_token", "to_token", "button", "fx", "fy", "to_fx", "to_fy", "modifiers", "hold_ms"])
         try requireTrusted()
         let flags = try pointerModifiers(args)
         let types = try mouseTypes(try args.string("button")!)
+        let holdMS = try holdDuration(args)
+        if holdMS != nil && CGEventSource.buttonState(.combinedSessionState, button: types.button) {
+            throw HelperFailure("DRIVER.INPUT_BLOCKED", "requested pointer button is already held")
+        }
         let from = try pointerTarget(
             token: try args.string("native_token")!,
             fx: try args.fraction("fx"), fy: try args.fraction("fy"),
@@ -1287,7 +1417,19 @@ private final class AXService {
         try postPointerEvents(
             events, pid: from.pid, flags: flags, release: release,
             operation: "drag", deadlineMS: deadlineMS,
-            requestID: requestID, progress: progress, paceDrag: true
+            requestID: requestID, progress: progress, paceDrag: true, holdMS: holdMS,
+            verifyHold: {
+                for (token, fx, fy, expected) in [
+                    ("native_token", "fx", "fy", from), ("to_token", "to_fx", "to_fy", to)
+                ] {
+                    let fresh = try self.pointerTarget(
+                        token: try args.string(token)!, fx: try args.fraction(fx), fy: try args.fraction(fy),
+                        operation: "drag", deadlineMS: deadlineMS, progress: progress)
+                    guard fresh.pid == expected.pid, fresh.bounds == expected.bounds, fresh.point == expected.point else {
+                        throw HelperFailure("DRIVER.STALE_HANDLE", "held drag endpoint geometry changed")
+                    }
+                }
+            }
         )
         return [
             "native_operation": "CGEventDrag",
@@ -1333,8 +1475,9 @@ private final class AXService {
         args: Arguments, deadlineMS: Double?, requestID: String,
         progress: RequestProgress
     ) throws -> [String: Any] {
-        try args.only(["native_token", "keys"])
+        try args.only(["native_token", "keys", "hold_ms"])
         try requireTrusted()
+        let holdMS = try holdDuration(args)
         guard let raw = args.values["keys"] as? [String], (1...6).contains(raw.count) else {
             throw HelperFailure("DRIVER.INVALID_REQUEST", "helper args.keys must hold 1..6 names")
         }
@@ -1420,11 +1563,40 @@ private final class AXService {
             )
         }
         try checkDeadline(deadlineMS)
+        if let holdMS {
+            try requireHoldBudget(holdMS, deadlineMS: deadlineMS)
+            let requested = modifiers.map { $0.code } + [main]
+            let aliases: [CGKeyCode: [CGKeyCode]] = [59: [59, 62], 56: [56, 60], 58: [58, 61], 55: [55, 54]]
+            if requested.flatMap({ aliases[$0] ?? [$0] }).contains(where: {
+                CGEventSource.keyState(.combinedSessionState, key: $0)
+            }) {
+                throw HelperFailure("DRIVER.INPUT_BLOCKED", "a requested key is already held")
+            }
+        }
         progress.markKeyboardDispatchStarted()
         emitKeyboardDispatchProgress(
             id: requestID, keyboardDispatchStarted: true, focusChanged: progress.focusChanged
         )
-        for event in events { event.postToPid(targetPID) }
+        if let holdMS {
+            let guardInput = InputReleaseGuard(pid: targetPID, deadlineMS: deadlineMS, holdMS: holdMS)
+            defer { _ = guardInput.finish() }
+            let pressCount = modifiers.count + 1
+            for event in events.prefix(pressCount) {
+                let code = CGKeyCode(event.getIntegerValueField(.keyboardEventKeycode))
+                let release = try keyEvent(code, down: false, flags: [])
+                try guardInput.post(event, release: release)
+            }
+            try boundedDwell(milliseconds: holdMS, deadlineMS: deadlineMS) {
+                try self.requireFrontmost(targetPID, operation: "key_chord")
+                try self.configureTimeout(element, deadlineMS: deadlineMS)
+                guard self.boolAttribute(element, kAXFocusedAttribute as CFString) == true,
+                      self.boolAttribute(element, kAXEnabledAttribute as CFString) != false,
+                      !self.secureEventInputIsEnabled(IsSecureEventInputEnabled()) else {
+                    throw HelperFailure("DRIVER.FOCUS_LOST", "held key target lost focus or became protected")
+                }
+            }
+            for event in events.dropFirst(pressCount) { try guardInput.post(event) }
+        } else { for event in events { event.postToPid(targetPID) } }
         return [
             "native_operation": "CGEventKeyChord",
             "submitted": true,
@@ -2348,7 +2520,7 @@ private func serve(_ service: AXService) {
     let input = FileHandle.standardInput
     var buffer = Data()
     var discardingOversizedFrame = false
-    while true {
+    while !inputCancellation.cancelled {
         // A pipe request is usually much smaller than 64 KiB and the client
         // keeps stdin open for the next RPC. readData(ofLength:) may wait to
         // fill that length, deadlocking both sides until the RPC deadline.
@@ -2471,4 +2643,10 @@ private func handleFrame(_ data: Data, service: AXService) {
     }
 }
 
+signal(SIGPIPE, SIG_IGN)
+signal(SIGTERM, SIG_IGN)
+let terminationSource = DispatchSource.makeSignalSource(signal: SIGTERM, queue: DispatchQueue.global(qos: .userInitiated))
+terminationSource.setEventHandler { inputCancellation.cancel() }
+terminationSource.resume()
 serve(AXService())
+terminationSource.cancel()

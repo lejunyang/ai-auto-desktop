@@ -735,8 +735,13 @@ impl UiaDriver {
                         "a key combination may hold at most {MAX_CHORD_KEYS} keys"
                     )));
                 }
-                self.backend
-                    .key_chord_with_deadline(&window_id, &node, &keys, deadline)?
+                self.backend.key_chord_held(
+                    &window_id,
+                    &node,
+                    &keys,
+                    parse_hold_ms(args)?,
+                    deadline,
+                )?
             }
             "pointer_gesture" => {
                 let mut gesture = parse_pointer_gesture(args)?;
@@ -1163,8 +1168,13 @@ fn parse_pointer_gesture(args: &Value) -> Result<PointerGesture> {
         ));
     }
 
+    let hold_ms = parse_hold_ms(args)?;
+    if hold_ms.is_some() && (scroll.is_some() || hover_ms.is_some() || count != 1) {
+        return Err(DriverError::invalid("hold_ms requires a single click"));
+    }
     Ok(PointerGesture {
         deadline: None,
+        hold_ms,
         button,
         count,
         modifiers,
@@ -1173,6 +1183,19 @@ fn parse_pointer_gesture(args: &Value) -> Result<PointerGesture> {
         scroll,
         hover_ms,
     })
+}
+
+fn parse_hold_ms(args: &Value) -> Result<Option<u64>> {
+    args.get("hold_ms")
+        .map(|value| {
+            value
+                .as_u64()
+                .filter(|value| (1..=5_000).contains(value))
+                .ok_or_else(|| {
+                    DriverError::invalid("hold_ms must be an integer between 1 and 5000")
+                })
+        })
+        .transpose()
 }
 
 fn parse_drag_gesture(args: &Value) -> Result<PointerGesture> {
@@ -1185,6 +1208,7 @@ fn parse_drag_gesture(args: &Value) -> Result<PointerGesture> {
     }
     Ok(PointerGesture {
         deadline: None,
+        hold_ms: parse_hold_ms(args)?,
         button: parse_button(args)?,
         count: 1,
         modifiers: parse_pointer_modifiers(args)?,
@@ -1725,6 +1749,33 @@ mod tests {
         ] {
             let error = parse_pointer_gesture(&arguments).unwrap_err();
             assert_eq!(error.code, "DRIVER.INVALID_REQUEST");
+        }
+    }
+
+    #[test]
+    fn bounded_hold_parser_is_explicit_and_does_not_accept_scroll_or_double_click() {
+        assert_eq!(
+            parse_pointer_gesture(&json!({"hold_ms": 123}))
+                .unwrap()
+                .hold_ms,
+            Some(123)
+        );
+        assert_eq!(
+            parse_drag_gesture(&json!({"hold_ms": 5000}))
+                .unwrap()
+                .hold_ms,
+            Some(5000)
+        );
+        for args in [
+            json!({"hold_ms":0}),
+            json!({"hold_ms":5001}),
+            json!({"hold_ms":null}),
+            json!({"hold_ms":1.5}),
+            json!({"hold_ms":10,"count":2}),
+            json!({"hold_ms":10,"hover_ms":50}),
+            json!({"hold_ms":10,"scroll":{"direction":"down"}}),
+        ] {
+            assert!(parse_pointer_gesture(&args).is_err(), "{args}");
         }
     }
 

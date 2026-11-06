@@ -454,6 +454,9 @@ impl LinuxBackend {
         if args.iter().any(|arg| arg == "--modifiers") {
             support.require("pointer-modifiers")?;
         }
+        if args.iter().any(|arg| arg == "--hold-ms") {
+            support.require("bounded-hold")?;
+        }
         if args.first().is_some_and(|command| command == "key-chord") {
             support.require("focus-info")?;
         }
@@ -1245,7 +1248,7 @@ impl AtspiBackend for LinuxBackend {
         process_id: u32,
         deadline: Instant,
     ) -> Result<Value, AutomationError> {
-        self.pointer_gesture_modified(target, point, gesture, &[], process_id, deadline)
+        self.pointer_gesture_modified(target, point, gesture, &[], None, process_id, deadline)
     }
 
     fn pointer_gesture_modified(
@@ -1254,6 +1257,7 @@ impl AtspiBackend for LinuxBackend {
         point: (i32, i32),
         gesture: Gesture,
         modifiers: &[String],
+        hold_ms: Option<u16>,
         process_id: u32,
         deadline: Instant,
     ) -> Result<Value, AutomationError> {
@@ -1302,6 +1306,9 @@ impl AtspiBackend for LinuxBackend {
         if !modifiers.is_empty() {
             args.extend(["--modifiers".into(), modifiers.join(",")]);
         }
+        if let Some(ms) = hold_ms {
+            args.extend(["--hold-ms".into(), ms.to_string()]);
+        }
         let input = self.run_input(
             target,
             args,
@@ -1323,7 +1330,7 @@ impl AtspiBackend for LinuxBackend {
         process_id: u32,
         deadline: Instant,
     ) -> Result<Value, AutomationError> {
-        self.drag_modified(target, from, to, button, &[], process_id, deadline)
+        self.drag_modified(target, from, to, button, &[], None, process_id, deadline)
     }
 
     fn drag_modified(
@@ -1333,6 +1340,7 @@ impl AtspiBackend for LinuxBackend {
         to: (i32, i32),
         button: u8,
         modifiers: &[String],
+        hold_ms: Option<u16>,
         process_id: u32,
         deadline: Instant,
     ) -> Result<Value, AutomationError> {
@@ -1354,6 +1362,9 @@ impl AtspiBackend for LinuxBackend {
         if !modifiers.is_empty() {
             args.extend(["--modifiers".into(), modifiers.join(",")]);
         }
+        if let Some(ms) = hold_ms {
+            args.extend(["--hold-ms".into(), ms.to_string()]);
+        }
         let input = self.run_input(
             target,
             args,
@@ -1370,16 +1381,20 @@ impl AtspiBackend for LinuxBackend {
         &self,
         target: &NativeRef,
         keys: &[String],
+        hold_ms: Option<u16>,
         process_id: u32,
         deadline: Instant,
     ) -> Result<Value, AutomationError> {
-        let args = vec![
+        let mut args = vec![
             "key-chord".to_string(),
             "--expected-pid".into(),
             process_id.to_string(),
             "--keys".into(),
             keys.join(","),
         ];
+        if let Some(ms) = hold_ms {
+            args.extend(["--hold-ms".into(), ms.to_string()]);
+        }
         let minimum = 2 * keys.len() as u64;
         let input = self.run_input(target, args, minimum, process_id, deadline)?;
         Ok(
@@ -2268,6 +2283,10 @@ fn map_helper_code(code: &str) -> Option<AutomationError> {
             "DRIVER.ACTION_UNSUPPORTED",
             "a pointer modifier is unavailable or already held; no input was sent",
         ),
+        "input_already_held" => driver_error(
+            "DRIVER.ACTION_UNSUPPORTED",
+            "external input is already held; no input was sent or released",
+        ),
         _ => return None,
     })
 }
@@ -2965,6 +2984,9 @@ mod capture_tests {
         let error = support.require("pointer-modifiers").unwrap_err();
         assert_eq!(error.code, "DRIVER.HELPER_INCOMPATIBLE");
         assert_eq!(error.details["required_feature"], "pointer-modifiers");
+        let error = support.require("bounded-hold").unwrap_err();
+        assert_eq!(error.code, "DRIVER.HELPER_INCOMPATIBLE");
+        assert_eq!(error.details["required_feature"], "bounded-hold");
         assert!(!support.has("focus-info"));
     }
 

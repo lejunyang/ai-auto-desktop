@@ -393,6 +393,7 @@ struct GestureRequest {
     unsigned count = 1;
     unsigned notches = 3;
     unsigned hover_ms = 500;
+    unsigned hold_ms = 0;
     std::vector<std::string> keys;
     std::vector<std::string> modifiers;
 };
@@ -494,6 +495,8 @@ int RunGesture(Display *display, std::string_view command, const GestureRequest 
     std::vector<KeyCode> chord;
     std::vector<KeyCode> modifiers;
     std::vector<KeyCode> pressed_modifiers;
+    std::vector<KeyCode> pressed_chord;
+    bool button_pressed = false;
     char held_keys[32]{};
     XQueryKeymap(display, held_keys);
     for (const auto &name : request.modifiers) {
@@ -513,10 +516,16 @@ int RunGesture(Display *display, std::string_view command, const GestureRequest 
             const KeySym symbol = KeyNamed(request.keys[index]);
             const KeyCode code = symbol == NoSymbol ? 0 : XKeysymToKeycode(display, symbol);
             const bool last = index + 1 == request.keys.size();
-            if (code == 0 || IsModifier(symbol) == last || seen_main) {
+            if (code == 0 || IsModifier(symbol) == last || seen_main ||
+                std::find(chord.begin(), chord.end(), code) != chord.end()) {
                 XCloseDisplay(display);
                 EmitError("unsupported_key", "key_preflight", false);
                 return kExitInvalid;
+            }
+            if ((held_keys[code / 8] & (1 << (code % 8))) != 0) {
+                XCloseDisplay(display);
+                EmitError("input_already_held", "key_preflight", false);
+                return kExitTargetMismatch;
             }
             seen_main = last;
             chord.push_back(code);
@@ -535,14 +544,29 @@ int RunGesture(Display *display, std::string_view command, const GestureRequest 
             }
         }
     }
+    if (request.hold_ms != 0) {
+        Window root = None, child = None;
+        int rx = 0, ry = 0, wx = 0, wy = 0;
+        unsigned mask = 0;
+        const bool pointer_known = XQueryPointer(display, DefaultRootWindow(display), &root,
+                                                 &child, &rx, &ry, &wx, &wy, &mask) != 0;
+        const bool key_held = std::any_of(std::begin(held_keys), std::end(held_keys),
+                                          [](char keys) { return keys != 0; });
+        if (!pointer_known || key_held ||
+            (mask & (Button1Mask | Button2Mask | Button3Mask | Button4Mask | Button5Mask)) != 0) {
+            XCloseDisplay(display);
+            EmitError("input_already_held", "input_preflight", false);
+            return kExitTargetMismatch;
+        }
+    }
     bool dispatch_started = false;
     auto finish_failure = [&](std::string_view code, std::string_view phase, int pre_dispatch_exit) {
         // Never leave a button or a modifier held down.
         if (dispatch_started) {
-            if (command == "drag") {
+            if (button_pressed) {
                 XTestFakeButtonEvent(display, request.button, False, 1);
             }
-            for (auto code_it = chord.rbegin(); code_it != chord.rend(); ++code_it) {
+            for (auto code_it = pressed_chord.rbegin(); code_it != pressed_chord.rend(); ++code_it) {
                 XTestFakeKeyEvent(display, *code_it, False, 1);
             }
             for (auto code_it = pressed_modifiers.rbegin(); code_it != pressed_modifiers.rend(); ++code_it) {
@@ -575,23 +599,67 @@ int RunGesture(Display *display, std::string_view command, const GestureRequest 
         submitted = ok && submitted;
         ++event_count;
     };
+    // A hold is one bounded transaction. Recheck live ownership while down;
+    // cleanup releases only inputs this transaction pressed, even after loss.
+    auto hold_problem = [&]() -> std::string_view {
+        if (DeadlineExpired(deadline_ns)) return "deadline_exceeded";
+        if (!submitted || g_x_error) return "x11_error";
+        if (!PidBelongsToCurrentUser(static_cast<unsigned long>(expected_pid))) return "untrusted_process";
+        if ((command == "key-chord" || !modifiers.empty()) &&
+            !FocusBelongsToPid(display, expected_pid, pid_atom)) return "focus_owner_changed";
+        if (command != "key-chord") {
+            Window root = None, child = None;
+            int rx = 0, ry = 0, wx = 0, wy = 0;
+            unsigned mask = 0;
+            if (!XQueryPointer(display, DefaultRootWindow(display), &root, &child, &rx, &ry,
+                               &wx, &wy, &mask) || rx != request.x || ry != request.y) {
+                return "pointer_position_changed";
+            }
+            if (!WindowAtPointBelongsToPid(display, request.x, request.y, expected_pid, pid_atom) ||
+                (command == "drag" && !WindowAtPointBelongsToPid(display, request.to_x,
+                    request.to_y, expected_pid, pid_atom))) return "target_point_mismatch";
+        }
+        if (!submitted || g_x_error) return "x11_error";
+        return {};
+    };
+    auto hold = [&]() -> std::string_view {
+        if (request.hold_ms == 0) return {};
+        XSync(display, False);
+        const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(request.hold_ms);
+        for (;;) {
+            const auto problem = hold_problem();
+            if (!problem.empty()) return problem;
+            if (std::chrono::steady_clock::now() >= until) return {};
+            usleep(5000);
+        }
+    };
     for (const auto code : modifiers) {
         pressed_modifiers.push_back(code);
         submit(XTestFakeKeyEvent(display, code, True, 1) != 0);
     }
     if (command == "key-chord") {
         for (const KeyCode code : chord) {
+            pressed_chord.push_back(code);
             submit(XTestFakeKeyEvent(display, code, True, 1) != 0);
+        }
+        if (const auto problem = hold(); !problem.empty()) {
+            return finish_failure(problem, "input_hold", kExitUnknownEffect);
         }
         for (auto code_it = chord.rbegin(); code_it != chord.rend(); ++code_it) {
             submit(XTestFakeKeyEvent(display, *code_it, False, 1) != 0);
         }
+        XSync(display, False);
+        if (submitted && !g_x_error) pressed_chord.clear();
     } else {
         submit(XTestFakeMotionEvent(display, -1, request.x, request.y, 1) != 0);
         if (command == "drag") {
             XSync(display, False);
+            button_pressed = true;
             submit(XTestFakeButtonEvent(display, request.button, True, 1) != 0);
             XSync(display, False);
+            if (const auto problem = hold(); !problem.empty()) {
+                return finish_failure(problem, "input_hold", kExitUnknownEffect);
+            }
             // Glide in steps: many toolkits only start a drag after the
             // pointer has moved a few pixels with the button held.
             constexpr int kSteps = 12;
@@ -601,15 +669,29 @@ int RunGesture(Display *display, std::string_view command, const GestureRequest 
                 }
                 const int x = request.x + (request.to_x - request.x) * step / kSteps;
                 const int y = request.y + (request.to_y - request.y) * step / kSteps;
+                if (request.hold_ms != 0 &&
+                    (!PidBelongsToCurrentUser(static_cast<unsigned long>(expected_pid)) ||
+                     (!modifiers.empty() && !FocusBelongsToPid(display, expected_pid, pid_atom)) ||
+                     !WindowAtPointBelongsToPid(display, x, y, expected_pid, pid_atom))) {
+                    return finish_failure("target_changed", "input_dispatch", kExitUnknownEffect);
+                }
                 submit(XTestFakeMotionEvent(display, -1, x, y, 1) != 0);
                 XSync(display, False);
                 SleepUntilOrDeadline(15, deadline_ns);
             }
             submit(XTestFakeButtonEvent(display, request.button, False, 1) != 0);
+            XSync(display, False);
+            if (submitted && !g_x_error) button_pressed = false;
         } else if (request.mode == "click") {
             for (unsigned click = 0; click < request.count; ++click) {
+                button_pressed = true;
                 submit(XTestFakeButtonEvent(display, request.button, True, 1) != 0);
+                if (const auto problem = hold(); !problem.empty()) {
+                    return finish_failure(problem, "input_hold", kExitUnknownEffect);
+                }
                 submit(XTestFakeButtonEvent(display, request.button, False, 1) != 0);
+                XSync(display, False);
+                if (submitted && !g_x_error) button_pressed = false;
             }
         } else if (request.mode == "wheel") {
             for (unsigned notch = 0; notch < request.notches; ++notch) {
@@ -625,6 +707,7 @@ int RunGesture(Display *display, std::string_view command, const GestureRequest 
         submit(XTestFakeKeyEvent(display, *code_it, False, 1) != 0);
     }
     XSync(display, False);
+    if (submitted && !g_x_error) pressed_modifiers.clear();
     if (DeadlineExpired(deadline_ns)) {
         return finish_failure("deadline_exceeded", "input_dispatch", kExitUnknownEffect);
     }
@@ -641,7 +724,7 @@ int RunGesture(Display *display, std::string_view command, const GestureRequest 
 std::optional<GestureRequest> ParseGesture(std::string_view command, int argc, char **argv,
                                            std::optional<std::uint64_t> *expected_pid,
                                            std::optional<std::uint64_t> *deadline_ns) {
-    std::vector<std::string_view> allowed = {"expected-pid", "deadline-monotonic-ns"};
+    std::vector<std::string_view> allowed = {"expected-pid", "deadline-monotonic-ns", "hold-ms"};
     if (command == "pointer-gesture") {
         allowed.insert(allowed.end(), {"mode", "x", "y", "button", "count", "notches", "hover-ms"});
         allowed.push_back("modifiers");
@@ -663,6 +746,11 @@ std::optional<GestureRequest> ParseGesture(std::string_view command, int argc, c
     *expected_pid = ParseUnsigned(*pid);
     *deadline_ns = ParseUnsigned(*deadline);
     GestureRequest request;
+    if (const auto hold = Pair(*pairs, "hold-ms")) {
+        const auto parsed = BoundedUnsigned(hold, 1, 5000);
+        if (!parsed.has_value()) return std::nullopt;
+        request.hold_ms = parsed.value();
+    }
     if (const auto modifiers = Pair(*pairs, "modifiers")) {
         if (modifiers->empty() || modifiers->size() > 32) return std::nullopt;
         std::size_t start = 0;
@@ -717,6 +805,7 @@ std::optional<GestureRequest> ParseGesture(std::string_view command, int argc, c
     }
     request.mode = *mode;
     if (request.mode != "click" && !request.modifiers.empty()) return std::nullopt;
+    if (request.mode != "click" && request.hold_ms != 0) return std::nullopt;
     if (request.mode == "click") {
         const auto parsed = BoundedUnsigned(button, 1, 3);
         const auto count = BoundedUnsigned(Pair(*pairs, "count"), 1, 2);
@@ -726,6 +815,7 @@ std::optional<GestureRequest> ParseGesture(std::string_view command, int argc, c
         }
         request.button = parsed.value();
         request.count = count.value();
+        if (request.hold_ms != 0 && request.count != 1) return std::nullopt;
     } else if (request.mode == "wheel") {
         // X11 reports the wheel as buttons 4 (up) to 7 (right).
         const auto parsed = BoundedUnsigned(button, 4, 7);
@@ -2194,7 +2284,7 @@ int main(int argc, char **argv) {
             return kExitInvalid;
         }
         // This protocol handshake does not open a display or touch input state.
-        std::cout << R"({"helper":"aad-linux-xtest","protocol":1,"features":["focus-info","type-text","pointer-click","pointer-gesture","drag","key-chord","window-info","window-action","paste","clipboard-read","global-key","record-input","pointer-modifiers","x11-desktop-independent"]})"
+        std::cout << R"({"helper":"aad-linux-xtest","protocol":1,"features":["focus-info","type-text","pointer-click","pointer-gesture","drag","key-chord","window-info","window-action","paste","clipboard-read","global-key","record-input","pointer-modifiers","x11-desktop-independent","bounded-hold"]})"
                   << std::endl;
         return 0;
     }

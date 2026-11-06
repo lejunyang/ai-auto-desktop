@@ -3,6 +3,8 @@
 //! desktop, delivered through SendInput atomically where that matters and
 //! with a careful account of what landed when it is refused.
 use aad_platform::{Error, PointerButton, ScrollDirection, ScrollSpec};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::Instant;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, MapVirtualKeyW, SendInput, VkKeyScanExW, HKL, INPUT, INPUT_KEYBOARD,
     INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, MAPVK_VK_TO_VSC,
@@ -10,9 +12,10 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN,
     MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL, MOUSEINPUT, MOUSE_EVENT_FLAGS,
     VIRTUAL_KEY, VK_BACK, VK_CONTROL, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_F1, VK_F10, VK_F11,
-    VK_F12, VK_F2, VK_F3, VK_F4, VK_F5, VK_F6, VK_F7, VK_F8, VK_F9, VK_HOME, VK_INSERT,
-    VK_LCONTROL, VK_LEFT, VK_LMENU, VK_LSHIFT, VK_LWIN, VK_MENU, VK_NEXT, VK_PRIOR, VK_RCONTROL,
-    VK_RETURN, VK_RIGHT, VK_RMENU, VK_RSHIFT, VK_RWIN, VK_SHIFT, VK_SPACE, VK_TAB, VK_UP,
+    VK_F12, VK_F2, VK_F3, VK_F4, VK_F5, VK_F6, VK_F7, VK_F8, VK_F9, VK_HOME, VK_INSERT, VK_LBUTTON,
+    VK_LCONTROL, VK_LEFT, VK_LMENU, VK_LSHIFT, VK_LWIN, VK_MBUTTON, VK_MENU, VK_NEXT, VK_PRIOR,
+    VK_RBUTTON, VK_RCONTROL, VK_RETURN, VK_RIGHT, VK_RMENU, VK_RSHIFT, VK_RWIN, VK_SHIFT, VK_SPACE,
+    VK_TAB, VK_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
@@ -490,7 +493,7 @@ pub fn deliver_with_safe_fallback(inputs: &[INPUT], what: &str) -> Result<()> {
 
 /// Wrap a click or drag in modifier presses and reverse-order releases.
 /// These are logical keys, so Ctrl/Alt/Shift/Meta keep their meaning across layouts.
-fn modified_pointer_inputs(inputs: &[INPUT], modifiers: &[String]) -> Result<Vec<INPUT>> {
+pub fn modified_pointer_inputs(inputs: &[INPUT], modifiers: &[String]) -> Result<Vec<INPUT>> {
     let mut keys = Vec::new();
     for name in modifiers {
         let key = match name.as_str() {
@@ -524,7 +527,11 @@ fn pointer_recovery(inputs: &[INPUT], sent: usize) -> Vec<INPUT> {
                 held.remove(index);
             }
             if !key.dwFlags.contains(KEYEVENTF_KEYUP) {
-                held.push((id.0, id.1, virtual_key_event(key.wVk, true)));
+                let mut release = *input;
+                unsafe {
+                    release.Anonymous.ki.dwFlags |= KEYEVENTF_KEYUP;
+                }
+                held.push((id.0, id.1, release));
             }
         } else if input.r#type == INPUT_MOUSE {
             let mouse = unsafe { input.Anonymous.mi };
@@ -592,6 +599,198 @@ pub fn deliver_pointer(inputs: &[INPUT], modifiers: &[String], what: &str) -> Re
     deliver_pointer_using(&combined, what, |events| unsafe {
         SendInput(events, std::mem::size_of::<INPUT>() as i32) as usize
     })
+}
+
+/// A synchronous multi-stage gesture owns only its accepted key/button downs.
+/// Drop releases these even when a focus check, deadline or dispatch fails.
+pub struct HeldInput {
+    state: Arc<(Mutex<HeldState>, Condvar)>,
+    worker: Option<std::thread::JoinHandle<()>>,
+    deadline: Instant,
+}
+
+#[derive(Default)]
+struct HeldState {
+    accepted: Vec<INPUT>,
+    stopped: bool,
+    expired: bool,
+    submitted: bool,
+}
+
+impl HeldInput {
+    pub fn new(deadline: Instant) -> Result<Self> {
+        let state = Arc::new((Mutex::new(HeldState::default()), Condvar::new()));
+        let worker_state = state.clone();
+        let worker = std::thread::Builder::new()
+            .name("aad-input-release".into())
+            .spawn(move || {
+                let (lock, wake) = &*worker_state;
+                let mut state = lock.lock().unwrap_or_else(|poison| poison.into_inner());
+                while !state.stopped {
+                    let now = Instant::now();
+                    if now >= deadline {
+                        state.stopped = true;
+                        state.expired = true;
+                        release_held(&mut state);
+                        break;
+                    }
+                    state = wake
+                        .wait_timeout(state, deadline - now)
+                        .unwrap_or_else(|poison| poison.into_inner())
+                        .0;
+                }
+            })
+            .map_err(|_| {
+                Error::new(
+                    "DRIVER.UNAVAILABLE",
+                    "could not start the input release watchdog",
+                )
+            })?;
+        Ok(Self {
+            state,
+            worker: Some(worker),
+            deadline,
+        })
+    }
+
+    pub fn send(&mut self, inputs: &[INPUT], fallback: bool, what: &str) -> Result<()> {
+        let mut state = self
+            .state
+            .0
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if state.stopped || Instant::now() >= self.deadline {
+            return Err(Error::new(
+                "DRIVER.TIMEOUT",
+                "input hold expired before the next dispatch",
+            )
+            .with_effect(if state.submitted {
+                "unknown"
+            } else {
+                "not_applied"
+            }));
+        }
+        // Focus/AX preflight may have taken time since the first held-state
+        // check. Check each new down again immediately before taking ownership.
+        ensure_inputs_released(inputs)?;
+        let mut sent = unsafe { SendInput(inputs, std::mem::size_of::<INPUT>() as i32) } as usize;
+        if sent == 0 && fallback {
+            for input in inputs {
+                if Instant::now() >= self.deadline {
+                    break;
+                }
+                if unsafe { SendInput(&[*input], std::mem::size_of::<INPUT>() as i32) } != 1 {
+                    break;
+                }
+                sent += 1;
+            }
+        }
+        state
+            .accepted
+            .extend_from_slice(&inputs[..sent.min(inputs.len())]);
+        state.submitted |= sent > 0;
+        if sent == inputs.len() {
+            Ok(())
+        } else {
+            Err(input_rejected(sent, inputs.len(), what))
+        }
+    }
+
+    pub fn submitted(&self) -> bool {
+        self.state
+            .0
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .submitted
+    }
+
+    pub fn expired(&self) -> bool {
+        self.state
+            .0
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .expired
+    }
+
+    /// Cleanup does not consult the expired request deadline or changed focus.
+    /// Retry a refused release once; report failure rather than claiming success.
+    pub fn release(&mut self) -> bool {
+        let mut state = self
+            .state
+            .0
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        state.stopped = true;
+        let released = release_held(&mut state);
+        self.state.1.notify_all();
+        released
+    }
+}
+
+fn release_held(state: &mut HeldState) -> bool {
+    let mut released = true;
+    for event in pointer_recovery(&state.accepted, state.accepted.len()) {
+        let events = [event];
+        let size = std::mem::size_of::<INPUT>() as i32;
+        if unsafe { SendInput(&events, size) } != 1 && unsafe { SendInput(&events, size) } != 1 {
+            released = false;
+        }
+    }
+    if released {
+        state.accepted.clear();
+    }
+    released
+}
+
+impl Drop for HeldInput {
+    fn drop(&mut self) {
+        self.release();
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+/// A bounded gesture must never release keys or buttons held before its call.
+pub fn ensure_inputs_released(inputs: &[INPUT]) -> Result<()> {
+    for input in inputs {
+        let mut keys = Vec::new();
+        if input.r#type == INPUT_KEYBOARD {
+            let key = unsafe { input.Anonymous.ki };
+            if key.dwFlags.contains(KEYEVENTF_KEYUP) {
+                continue;
+            }
+            keys.extend(match key.wVk {
+                VK_CONTROL => vec![VK_CONTROL, VK_LCONTROL, VK_RCONTROL],
+                VK_SHIFT => vec![VK_SHIFT, VK_LSHIFT, VK_RSHIFT],
+                VK_MENU => vec![VK_MENU, VK_LMENU, VK_RMENU],
+                VK_LWIN | VK_RWIN => vec![VK_LWIN, VK_RWIN],
+                other => vec![other],
+            });
+        } else if input.r#type == INPUT_MOUSE {
+            let flags = unsafe { input.Anonymous.mi }.dwFlags;
+            for (flag, key) in [
+                (MOUSEEVENTF_LEFTDOWN, VK_LBUTTON),
+                (MOUSEEVENTF_RIGHTDOWN, VK_RBUTTON),
+                (MOUSEEVENTF_MIDDLEDOWN, VK_MBUTTON),
+            ] {
+                if flags.contains(flag) {
+                    keys.push(key);
+                }
+            }
+        }
+        if keys
+            .iter()
+            .any(|key| unsafe { GetAsyncKeyState(i32::from(key.0)) } as u16 & 0x8000 != 0)
+        {
+            return Err(Error::new(
+                "DRIVER.INPUT_BLOCKED",
+                "a requested key or button is already held",
+            )
+            .with_effect("not_applied"));
+        }
+    }
+    Ok(())
 }
 
 /// Refuse to take ownership of a modifier that is already held.
@@ -736,6 +935,20 @@ mod tests {
                 "move".into()
             }
         }
+    }
+
+    #[test]
+    fn watchdog_expiry_prevents_late_dispatch_and_drop_joins_it() {
+        let mut held =
+            HeldInput::new(Instant::now() + std::time::Duration::from_millis(10)).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(held.expired());
+        // Empty events are deliberate: this test never injects desktop input.
+        let error = held.send(&[], false, "late movement").unwrap_err();
+        assert_eq!(error.code, "DRIVER.TIMEOUT");
+        assert_eq!(error.effect, "not_applied");
+        assert!(held.release());
+        drop(held);
     }
 
     #[test]

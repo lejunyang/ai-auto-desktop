@@ -175,6 +175,7 @@ fn ordinary_text_and_key_actions_cannot_bypass_the_secret_grant() {
             text: "public".into(),
         },
         Action::Key {
+            hold_ms: None,
             keys: vec!["ctrl".into(), "v".into()],
         },
     ] {

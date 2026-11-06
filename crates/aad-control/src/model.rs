@@ -181,6 +181,9 @@ pub enum Action {
         fraction: Option<Fraction>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         modifiers: Vec<PointerModifier>,
+        /// Keep the button down for this bounded duration before releasing.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        hold_ms: Option<u64>,
     },
     Fill {
         value: String,
@@ -196,6 +199,9 @@ pub enum Action {
     },
     Key {
         keys: Vec<String>,
+        /// Keep the chord down within this single request, then release it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        hold_ms: Option<u64>,
     },
     Scroll {
         direction: Direction,
@@ -221,6 +227,9 @@ pub enum Action {
         to_fraction: Option<Fraction>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         modifiers: Vec<PointerModifier>,
+        /// Wait at the source after button down and before the first move.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        hold_ms: Option<u64>,
     },
     /// Choose one option of a list box by its label or value.
     Select {
@@ -363,6 +372,16 @@ pub const WINDOW_ACTIONS: [&str; 5] = [
 ];
 
 impl Action {
+    /// A hold is contained in one action; no key/button state escapes it.
+    pub fn hold_ms(&self) -> Option<u64> {
+        match self {
+            Self::Key { hold_ms, .. }
+            | Self::Click { hold_ms, .. }
+            | Self::Drag { hold_ms, .. } => *hold_ms,
+            _ => None,
+        }
+    }
+
     /// A plain left click.
     pub fn click() -> Self {
         Self::Click {
@@ -370,6 +389,7 @@ impl Action {
             count: None,
             fraction: None,
             modifiers: Vec::new(),
+            hold_ms: None,
         }
     }
     pub fn name(&self) -> &'static str {
@@ -415,6 +435,7 @@ impl Action {
                 count: None | Some(1),
                 fraction: None,
                 modifiers,
+                hold_ms: None,
             } if modifiers.is_empty()
         )
     }

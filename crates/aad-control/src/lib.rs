@@ -1179,6 +1179,14 @@ impl Session {
                     ));
                 }
                 validate_action(action)?;
+                if let Some(ms) = action.hold_ms() {
+                    if Duration::from_millis(ms) >= context.remaining()? {
+                        return Err(error(
+                            "CONTROL.TIMEOUT",
+                            "the requested hold exceeds the remaining action deadline",
+                        ));
+                    }
+                }
                 // Upload paths are resolved here, under the server's grant, so
                 // no provider ever sees a path outside it.
                 let resolved;
@@ -1335,7 +1343,7 @@ impl Session {
                         "global keys were not granted by the server operator",
                     ));
                 }
-                validate_action(&Action::Key { keys: keys.clone() })?;
+                validate_action(&Action::Key { keys: keys.clone(), hold_ms: None })?;
                 let backend = self
                     .backends
                     .values()
@@ -2096,7 +2104,7 @@ fn validate_action(action: &Action) -> Result<()> {
             "emulate needs a preset, a color_scheme or both",
         ));
     }
-    if let Action::Key { keys } = action {
+    if let Action::Key { keys, .. } = action {
         if keys.is_empty() || keys.len() > 6 || keys.iter().any(|s| s.is_empty() || s.len() > 32) {
             return Err(error(
                 "CONTROL.INVALID_REQUEST",
@@ -2105,6 +2113,23 @@ fn validate_action(action: &Action) -> Result<()> {
         }
     }
     let invalid = |message: &str| Err(error("CONTROL.INVALID_REQUEST", message.to_string()));
+    if let Action::Key {
+        hold_ms: Some(ms), ..
+    }
+    | Action::Click {
+        hold_ms: Some(ms), ..
+    }
+    | Action::Drag {
+        hold_ms: Some(ms), ..
+    } = action
+    {
+        if !(1..=5000).contains(ms) {
+            return invalid("hold_ms must be in 1..5000");
+        }
+        if matches!(action, Action::Click { count: Some(2), .. }) {
+            return invalid("a held click must have count 1");
+        }
+    }
     if let Action::Click { modifiers, .. } | Action::Drag { modifiers, .. } = action {
         if modifiers.len() > 4
             || modifiers

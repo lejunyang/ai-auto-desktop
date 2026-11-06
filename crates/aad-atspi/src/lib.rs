@@ -243,13 +243,14 @@ pub trait AtspiBackend: Send + Sync {
         point: (i32, i32),
         gesture: Gesture,
         modifiers: &[String],
+        hold_ms: Option<u16>,
         process_id: u32,
         deadline: Instant,
     ) -> Result<Value, AutomationError> {
-        if !modifiers.is_empty() {
+        if !modifiers.is_empty() || hold_ms.is_some() {
             return Err(driver_error(
                 "DRIVER.ACTION_UNSUPPORTED",
-                "pointer modifiers are unavailable",
+                "pointer modifiers or bounded hold are unavailable",
             ));
         }
         self.pointer_gesture(target, point, gesture, process_id, deadline)
@@ -277,13 +278,14 @@ pub trait AtspiBackend: Send + Sync {
         to: (i32, i32),
         button: u8,
         modifiers: &[String],
+        hold_ms: Option<u16>,
         process_id: u32,
         deadline: Instant,
     ) -> Result<Value, AutomationError> {
-        if !modifiers.is_empty() {
+        if !modifiers.is_empty() || hold_ms.is_some() {
             return Err(driver_error(
                 "DRIVER.ACTION_UNSUPPORTED",
-                "drag modifiers are unavailable",
+                "drag modifiers or bounded hold are unavailable",
             ));
         }
         self.drag(target, from, to, button, process_id, deadline)
@@ -292,6 +294,7 @@ pub trait AtspiBackend: Send + Sync {
         &self,
         _target: &NativeRef,
         _keys: &[String],
+        _hold_ms: Option<u16>,
         _process_id: u32,
         _deadline: Instant,
     ) -> Result<Value, AutomationError> {
@@ -1058,6 +1061,7 @@ impl AtspiProvider {
                 "scroll",
                 "hover_ms",
                 "modifiers",
+                "hold_ms",
             ]),
             "drag" => allowed.extend([
                 "to",
@@ -1066,8 +1070,9 @@ impl AtspiProvider {
                 "fraction",
                 "to_fraction",
                 "modifiers",
+                "hold_ms",
             ]),
-            "key_chord" => allowed.push("keys"),
+            "key_chord" => allowed.extend(["keys", "hold_ms"]),
             _ => {}
         }
         only_keys(args, &allowed)?;
@@ -1077,6 +1082,14 @@ impl AtspiProvider {
             None
         };
         let modifiers = parse_modifiers(args.get("modifiers"))?;
+        let hold_ms = parse_hold_ms(args.get("hold_ms"))?;
+        if hold_ms.is_some()
+            && gesture.is_some_and(|gesture| !matches!(gesture, Gesture::Click { count: 1, .. }))
+        {
+            return Err(invalid(
+                "hold_ms supports a single click, key chord or drag",
+            ));
+        }
         if !modifiers.is_empty()
             && matches!(gesture, Some(Gesture::Wheel { .. } | Gesture::Hover { .. }))
         {
@@ -1214,6 +1227,7 @@ impl AtspiProvider {
                         pointer.expect("computed above"),
                         gesture.expect("parsed above"),
                         &modifiers,
+                        hold_ms,
                         process,
                         deadline,
                     )
@@ -1234,6 +1248,7 @@ impl AtspiProvider {
                         destination.expect("computed above"),
                         button,
                         &modifiers,
+                        hold_ms,
                         process,
                         deadline,
                     )
@@ -1243,6 +1258,7 @@ impl AtspiProvider {
                     self.backend.key_chord(
                         &native,
                         keys.as_deref().expect("parsed above"),
+                        hold_ms,
                         process,
                         deadline,
                     )
@@ -2172,6 +2188,18 @@ fn parse_gesture(args: &Map<String, Value>) -> Result<Gesture, AutomationError> 
     Ok(Gesture::Click { button, count })
 }
 
+fn parse_hold_ms(value: Option<&Value>) -> Result<Option<u16>, AutomationError> {
+    value
+        .map(|value| {
+            value
+                .as_u64()
+                .filter(|value| (1..=5000).contains(value))
+                .map(|value| value as u16)
+                .ok_or_else(|| invalid("hold_ms must be an integer from 1 to 5000"))
+        })
+        .transpose()
+}
+
 fn parse_modifiers(value: Option<&Value>) -> Result<Vec<String>, AutomationError> {
     let Some(value) = value else {
         return Ok(Vec::new());
@@ -2624,6 +2652,10 @@ fn manifest_document() -> Value {
     for name in ["pointer_gesture", "drag"] {
         actions[name]["input_schema"]["properties"]["modifiers"] = json!({"type": "array", "maxItems": 4, "uniqueItems": true, "items": {"enum": ["ctrl", "shift", "alt", "meta"]}});
     }
+    for name in ["pointer_gesture", "drag", "key_chord"] {
+        actions[name]["input_schema"]["properties"]["hold_ms"] =
+            json!({"type": "integer", "minimum": 1, "maximum": 5000});
+    }
     for (name, description) in [
         (
             "minimize",
@@ -3046,11 +3078,12 @@ mod tests {
             &self,
             _target: &NativeRef,
             keys: &[String],
+            hold_ms: Option<u16>,
             _process_id: u32,
             _deadline: Instant,
         ) -> Result<Value, AutomationError> {
             self.writes.fetch_add(1, Ordering::SeqCst);
-            Ok(json!({"keys": keys}))
+            Ok(json!({"keys": keys, "hold_ms": hold_ms}))
         }
         fn window_action(
             &self,
@@ -3099,11 +3132,13 @@ mod tests {
             point: (i32, i32),
             gesture: Gesture,
             modifiers: &[String],
+            hold_ms: Option<u16>,
             process_id: u32,
             deadline: Instant,
         ) -> Result<Value, AutomationError> {
             let mut result = self.pointer_gesture(target, point, gesture, process_id, deadline)?;
             result["modifiers"] = json!(modifiers);
+            result["hold_ms"] = json!(hold_ms);
             Ok(result)
         }
         fn drag_modified(
@@ -3113,11 +3148,13 @@ mod tests {
             to: (i32, i32),
             button: u8,
             modifiers: &[String],
+            hold_ms: Option<u16>,
             process_id: u32,
             deadline: Instant,
         ) -> Result<Value, AutomationError> {
             let mut result = self.drag(target, from, to, button, process_id, deadline)?;
             result["modifiers"] = json!(modifiers);
+            result["hold_ms"] = json!(hold_ms);
             Ok(result)
         }
         fn drag(
@@ -3644,6 +3681,80 @@ mod tests {
             assert_eq!(
                 result["backend_result"]["modifiers"],
                 json!(["ctrl", "shift"])
+            );
+            assert_eq!(backend.writes.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[test]
+    fn bounded_holds_validate_before_refresh_and_retain_observed_targets() {
+        for extra in [
+            json!({"hold_ms": 0}),
+            json!({"hold_ms": 5001}),
+            json!({"hold_ms": -1}),
+            json!({"hold_ms": 1.5}),
+            json!({"hold_ms": "100"}),
+            json!({"hold_ms": null}),
+            json!({"hold_ms": 100, "count": 2}),
+            json!({"hold_ms": 100, "hover_ms": 100}),
+            json!({"hold_ms": 100, "scroll": {"direction": "down"}}),
+        ] {
+            let backend = Arc::new(FakeBackend::default());
+            let provider = AtspiProvider::new(backend.clone()).unwrap();
+            let observed = take_snapshot(&provider);
+            let mut args = json!({"target": {"snapshot_id": observed["snapshot_id"], "revision": observed["revision"], "node_id": "n0"}, "locator": locator()});
+            args.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            assert_eq!(
+                provider
+                    .invoke(
+                        "desktop.linux_atspi.pointer_gesture@1",
+                        args,
+                        Some(Duration::from_secs(2))
+                    )
+                    .unwrap_err()
+                    .code,
+                "DRIVER.INVALID_REQUEST"
+            );
+            assert_eq!(backend.captures.load(Ordering::SeqCst), 1);
+            assert_eq!(backend.writes.load(Ordering::SeqCst), 0);
+        }
+        for action in ["pointer_gesture", "drag", "key_chord"] {
+            let backend = Arc::new(FakeBackend {
+                hit_chain: 1,
+                ..Default::default()
+            });
+            let provider = AtspiProvider::new(backend.clone()).unwrap();
+            let observed = take_snapshot(&provider);
+            let target = json!({"snapshot_id": observed["snapshot_id"], "revision": observed["revision"], "node_id": "n0"});
+            let mut args = json!({"target": target, "locator": locator(), "hold_ms": 250});
+            if action == "drag" {
+                args["to"] = target;
+                args["to_locator"] = locator();
+            } else if action == "key_chord" {
+                args["keys"] = json!(["ctrl", "a"]);
+            }
+            let result = provider
+                .invoke(
+                    &format!("desktop.linux_atspi.{action}@1"),
+                    args.clone(),
+                    Some(Duration::from_secs(2)),
+                )
+                .unwrap();
+            assert_eq!(result["backend_result"]["hold_ms"], 250);
+            assert_eq!(backend.captures.load(Ordering::SeqCst), 2);
+            assert_eq!(backend.writes.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                provider
+                    .invoke(
+                        &format!("desktop.linux_atspi.{action}@1"),
+                        args,
+                        Some(Duration::from_secs(2))
+                    )
+                    .unwrap_err()
+                    .code,
+                "DRIVER.STALE_SNAPSHOT"
             );
             assert_eq!(backend.writes.load(Ordering::SeqCst), 1);
         }

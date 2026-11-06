@@ -194,6 +194,21 @@ pub trait AxBackend: Send + Sync {
             "this backend has no key chords",
         ))
     }
+    fn key_chord_held(
+        &self,
+        token: &str,
+        keys: &[String],
+        hold_ms: Option<u64>,
+        deadline: Instant,
+    ) -> Result<Value, AutomationError> {
+        if hold_ms.is_some() {
+            return Err(driver_error(
+                "DRIVER.ACTION_UNSUPPORTED",
+                "this backend has no bounded key holds",
+            ));
+        }
+        self.key_chord(token, keys, deadline)
+    }
     /// Start watching what a person does in the application with this process id.
     fn start_recording(
         &self,
@@ -768,6 +783,7 @@ impl MacOSAxProvider {
                 "scroll",
                 "hover_ms",
                 "modifiers",
+                "hold_ms",
             ]),
             "drag" => allowed.extend([
                 "to",
@@ -776,11 +792,13 @@ impl MacOSAxProvider {
                 "fraction",
                 "to_fraction",
                 "modifiers",
+                "hold_ms",
             ]),
-            "key_chord" => allowed.push("keys"),
+            "key_chord" => allowed.extend(["keys", "hold_ms"]),
             _ => {}
         }
         only_keys(args, &allowed)?;
+        let hold_ms = hold_duration(args.get("hold_ms"))?;
         // Validated before anything is captured, so a malformed request costs nothing.
         let gesture = match action {
             "pointer_gesture" => Some(gesture_request(args)?),
@@ -906,7 +924,13 @@ impl MacOSAxProvider {
                 format!("target does not support native {action}"),
             ));
         }
-        remaining(deadline, false)?;
+        let available = remaining(deadline, false)?;
+        if hold_ms.is_some_and(|ms| available <= Duration::from_millis(ms)) {
+            return Err(driver_error(
+                "DRIVER.TIMEOUT",
+                "hold exceeds the remaining input deadline",
+            ));
+        }
         let result = match action {
             "focus" => self.backend.focus(&token, deadline),
             "invoke" => self.backend.invoke(&token, deadline),
@@ -935,10 +959,12 @@ impl MacOSAxProvider {
                 gesture.as_ref().expect("drag validated"),
                 deadline,
             ),
-            "key_chord" => {
-                self.backend
-                    .key_chord(&token, keys.as_deref().expect("keys validated"), deadline)
-            }
+            "key_chord" => self.backend.key_chord_held(
+                &token,
+                keys.as_deref().expect("keys validated"),
+                hold_ms,
+                deadline,
+            ),
             "paste" => self
                 .backend
                 .paste(&token, text.expect("text validated"), deadline),
@@ -1172,6 +1198,17 @@ fn pointer_modifiers(value: Option<&Value>) -> Result<Vec<&str>, AutomationError
 }
 
 /// The Windows driver's request shape, normalised for the Swift helper.
+fn hold_duration(value: Option<&Value>) -> Result<Option<u64>, AutomationError> {
+    value
+        .map(|value| {
+            value
+                .as_u64()
+                .filter(|ms| (1..=5000).contains(ms))
+                .ok_or_else(|| invalid("hold_ms must be an integer between 1 and 5000"))
+        })
+        .transpose()
+}
+
 fn gesture_request(args: &Map<String, Value>) -> Result<Value, AutomationError> {
     let given = |name: &str| args.get(name).is_some_and(|value| !value.is_null());
     let modifiers = pointer_modifiers(args.get("modifiers"))?;
@@ -1221,6 +1258,12 @@ fn gesture_request(args: &Map<String, Value>) -> Result<Value, AutomationError> 
     };
     request["fx"] = json!(fx);
     request["fy"] = json!(fy);
+    if let Some(ms) = hold_duration(args.get("hold_ms"))? {
+        if request["mode"] != "click" || request["count"] != 1 {
+            return Err(invalid("hold_ms requires a single click"));
+        }
+        request["hold_ms"] = json!(ms);
+    }
     if !modifiers.is_empty() {
         request["modifiers"] = json!(modifiers);
     }
@@ -1231,6 +1274,9 @@ fn drag_request(args: &Map<String, Value>) -> Result<Value, AutomationError> {
     let (fx, fy) = fraction_pair(args.get("fraction"))?;
     let (to_fx, to_fy) = fraction_pair(args.get("to_fraction"))?;
     let mut request = json!({"button": button_name(args.get("button"))?, "fx": fx, "fy": fy, "to_fx": to_fx, "to_fy": to_fy});
+    if let Some(ms) = hold_duration(args.get("hold_ms"))? {
+        request["hold_ms"] = json!(ms);
+    }
     let modifiers = pointer_modifiers(args.get("modifiers"))?;
     if !modifiers.is_empty() {
         request["modifiers"] = json!(modifiers);
@@ -1771,6 +1817,7 @@ fn manifest_document() -> Value {
     let fraction = json!({"type": "object", "required": ["fx", "fy"], "properties": {"fx": {"type": "number", "minimum": 0, "maximum": 1}, "fy": {"type": "number", "minimum": 0, "maximum": 1}}, "additionalProperties": false});
     let button = json!({"enum": ["left", "middle", "right"]});
     let modifiers = json!({"type":"array", "maxItems":4, "uniqueItems":true, "items":{"enum":["ctrl", "shift", "alt", "meta"]}});
+    let hold = json!({"type":"integer", "minimum":1, "maximum":5000});
     actions.insert("pointer_gesture".into(), contract("重新验证目标后，在元素 bounds 内的比例位置、经 AX 命中检查后向前台应用派发右键/中键/双击、滚轮或悬停；click 可带 modifiers。", "non_idempotent", "modify", "high", &["desktop.observe", "desktop.input"], point_input(json!({"button": button, "count": {"enum": [1, 2]}, "fraction": fraction, "modifiers": modifiers, "scroll": {"type": "object", "required": ["direction"], "properties": {"direction": {"enum": ["up", "down", "left", "right"]}, "notches": {"type": "integer", "minimum": 1, "maximum": 30}}, "additionalProperties": false}, "hover_ms": {"type": "integer", "minimum": 1, "maximum": 5000}}), &[]), write_output(), true, true));
     actions.insert("drag".into(), contract("分别重新验证起点与终点并做 AX 命中检查后，在同一前台应用内按下、分步拖动并在终点释放，可带 modifiers。", "non_idempotent", "modify", "high", &["desktop.observe", "desktop.input"], point_input(json!({"to": target_schema(), "to_locator": locator_schema(), "button": button, "fraction": fraction, "to_fraction": fraction, "modifiers": modifiers}), &["to", "to_locator"]), write_output(), true, true));
     actions.insert("key_chord".into(), contract("重新验证并聚焦非受保护目标后，按下修饰键（ctrl、shift、alt、cmd）加一个主键；名称按字面映射，不在平台间互换。", "non_idempotent", "input", "high", &["desktop.observe", "desktop.input"], point_input(json!({"keys": {"type": "array", "minItems": 1, "maxItems": 6, "items": {"type": "string", "minLength": 1, "maxLength": 32}}}), &["keys"]), write_output(), true, true));
@@ -1871,6 +1918,10 @@ fn manifest_document() -> Value {
             property["minLength"] = json!(1);
         }
         actions.insert(name.into(), contract(description, "contextual", "input", "high", &["desktop.observe", "desktop.input"], json!({"type": "object", "required": ["target", "locator", field], "properties": {"target": target_schema(), "locator": locator_schema(), field: property}, "additionalProperties": false}), write_output(), true, true));
+    }
+    for action in ["pointer_gesture", "drag", "key_chord"] {
+        actions.get_mut(action).expect("gesture contract")["input_schema"]["properties"]
+            ["hold_ms"] = hold.clone();
     }
     json!({"apiVersion": "ai-auto-desktop.dev/v1alpha1", "kind": "CapabilityManifest", "metadata": {"name": PROVIDER_NAME, "version": PROVIDER_VERSION, "description": "macOS 原生 Accessibility API 进程驱动（完整性校验的 Swift helper）。"}, "actions": actions, "runtime": {"kind": "builtin", "protocol": "rust-provider-v1", "platforms": ["macos"]}})
 }
@@ -2065,6 +2116,19 @@ mod tests {
         ) -> Result<Value, AutomationError> {
             self.writes.fetch_add(1, Ordering::SeqCst);
             Ok(json!({"native_operation": "CGEventKeyChord", "submitted": true, "sent": keys}))
+        }
+        fn key_chord_held(
+            &self,
+            token: &str,
+            keys: &[String],
+            hold_ms: Option<u64>,
+            deadline: Instant,
+        ) -> Result<Value, AutomationError> {
+            let mut result = self.key_chord(token, keys, deadline)?;
+            if let Some(ms) = hold_ms {
+                result["hold_ms"] = json!(ms);
+            }
+            Ok(result)
         }
         fn drag(
             &self,
@@ -2648,6 +2712,57 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.code, "DRIVER.STALE_SNAPSHOT");
         assert_eq!(backend.writes.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn bounded_holds_are_normalised_and_refused_before_dispatch_when_invalid() {
+        let backend = Arc::new(FakeBackend::default());
+        let provider = MacOSAxProvider::new(backend.clone()).unwrap();
+        let snapshot = take_snapshot(&provider);
+        let mut args = drag_args(&snapshot, true);
+        args["hold_ms"] = json!(23);
+        let result = provider
+            .invoke(
+                "desktop.macos_ax.drag@1",
+                args,
+                Some(Duration::from_secs(2)),
+            )
+            .unwrap();
+        assert_eq!(result["backend_result"]["sent"]["hold_ms"], 23);
+        let invoke = |extra: Value, timeout: Duration| {
+            let snapshot = take_snapshot(&provider);
+            let mut args = json!({"target": {"snapshot_id": snapshot["snapshot_id"], "revision": snapshot["revision"], "node_id": "n0"}, "locator": locator(), "keys":["a"]});
+            args.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            provider.invoke("desktop.macos_ax.key_chord@1", args, Some(timeout))
+        };
+        assert_eq!(
+            invoke(json!({"hold_ms":40}), Duration::from_secs(2)).unwrap()["backend_result"]
+                ["hold_ms"],
+            40
+        );
+        for bad in [json!(0), json!(5001), json!(null), json!(1.5)] {
+            assert!(invoke(json!({"hold_ms":bad}), Duration::from_secs(2)).is_err());
+        }
+        assert_eq!(
+            invoke(json!({"hold_ms":500}), Duration::from_millis(50))
+                .unwrap_err()
+                .code,
+            "DRIVER.TIMEOUT"
+        );
+        assert_eq!(backend.writes.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            gesture_request(json!({"hold_ms":50}).as_object().unwrap()).unwrap()["hold_ms"],
+            50
+        );
+        for invalid in [
+            json!({"hold_ms":10,"count":2}),
+            json!({"hold_ms":10,"hover_ms":10}),
+            json!({"hold_ms":10,"scroll":{"direction":"down"}}),
+        ] {
+            assert!(gesture_request(invalid.as_object().unwrap()).is_err());
+        }
     }
 
     #[test]

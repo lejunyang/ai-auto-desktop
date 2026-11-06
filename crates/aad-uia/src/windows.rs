@@ -13,8 +13,8 @@
 use std::sync::Arc;
 
 use crate::backend::{
-    ensure_input_deadline, Backend, CaptureLimits, CapturedTree, DriverError, Pixels,
-    PointerGesture, Recognition, Result,
+    ensure_hold_budget, ensure_input_deadline, wait_input_hold, Backend, CaptureLimits,
+    CapturedTree, DriverError, Pixels, PointerGesture, Recognition, Result,
 };
 use crate::capture::{CapturedEvent, EventBuffer, EventKind};
 use crate::model::{Bounds, Node, States, WindowInfo};
@@ -22,8 +22,9 @@ use aad_windows::capture::{crop, extended_frame, intersect, print_window};
 use aad_windows::clipboard::Paste;
 use aad_windows::com::ensure as ensure_com;
 use aad_windows::input::{
-    button_events, deliver_atomically, deliver_pointer, deliver_scroll, ensure_modifiers_released,
-    mouse_event, release_pressed_prefix, to_absolute, virtual_key_event, Chord, KeyTextSequence,
+    button_events, deliver_atomically, deliver_pointer, deliver_scroll, ensure_inputs_released,
+    ensure_modifiers_released, modified_pointer_inputs, mouse_event, release_pressed_prefix,
+    to_absolute, virtual_key_event, Chord, HeldInput, KeyTextSequence,
 };
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Sender};
@@ -705,6 +706,47 @@ impl Backend for WindowsUiaBackend {
         })
     }
 
+    fn key_chord_held(
+        &self,
+        window_id: &str,
+        node: &Node,
+        keys: &[String],
+        hold_ms: Option<u64>,
+        deadline: Instant,
+    ) -> Result<()> {
+        let Some(hold_ms) = hold_ms else {
+            return self.key_chord_with_deadline(window_id, node, keys, deadline);
+        };
+        ensure_hold_budget(hold_ms, deadline)?;
+        let element = self.require_hold_target(window_id, node)?;
+        let handle = parse_window_id(window_id)?;
+        let chord = Chord::parse(keys)?;
+        let inputs = chord.to_inputs();
+        ensure_inputs_released(&inputs)?;
+        focus_for_keys(&self.automation, handle, &element)?;
+        self.require_hold_target(window_id, node)?;
+        self.ensure_held_key_target(&element)?;
+        let focus = input_focus_handle(handle)?;
+        ensure_hold_budget(hold_ms, deadline)?;
+        let mut held =
+            HeldInput::new(deadline.min(Instant::now() + Duration::from_millis(hold_ms + 250)))?;
+        let result = (|| {
+            held.send(&inputs[..chord.modifiers.len() + 1], false, "held key down")?;
+            wait_input_hold(hold_ms, deadline, || {
+                ensure_hold_focus(handle, Some(focus))?;
+                self.ensure_held_key_target(&element)
+            })?;
+            ensure_hold_focus(handle, Some(focus))?;
+            held.send(
+                &inputs[chord.modifiers.len() + 1..],
+                false,
+                "held key release",
+            )?;
+            Ok(())
+        })();
+        finish_held_input(&mut held, result)
+    }
+
     fn pointer_click(&self, window_id: &str, node: &Node) -> Result<()> {
         let (handle, _) = self.element_for(window_id)?;
         let (x, y) = crate::backend::click_point(node.bounds)?;
@@ -780,6 +822,12 @@ impl Backend for WindowsUiaBackend {
         // as with pointer_click.
         ensure_pointer_modifier_focus(handle, &gesture.modifiers)?;
         ensure_input_deadline(deadline)?;
+        if let Some(hold_ms) = gesture.hold_ms {
+            if clicks != 1 {
+                return Err(DriverError::invalid("hold_ms requires a single click"));
+            }
+            return self.held_pointer(window_id, node, None, gesture, &inputs, hold_ms, deadline);
+        }
         Ok(deliver_pointer(
             &inputs,
             &gesture.modifiers,
@@ -832,6 +880,17 @@ impl Backend for WindowsUiaBackend {
         // best-effort button release and remains effect=unknown.
         ensure_pointer_modifier_focus(handle, &gesture.modifiers)?;
         ensure_input_deadline(deadline)?;
+        if let Some(hold_ms) = gesture.hold_ms {
+            return self.held_pointer(
+                window_id,
+                from,
+                Some(to),
+                gesture,
+                &inputs,
+                hold_ms,
+                deadline,
+            );
+        }
         Ok(deliver_pointer(&inputs, &gesture.modifiers, "the drag")?)
     }
 
@@ -1036,6 +1095,118 @@ fn element_point(
 }
 
 impl WindowsUiaBackend {
+    fn ensure_held_key_target(&self, element: &IUIAutomationElement) -> Result<()> {
+        let focused = unsafe { self.automation.GetFocusedElement() }.map_err(|_| {
+            DriverError::new("DRIVER.FOCUS_LOST", "could not verify the held key element")
+        })?;
+        if !unsafe { self.automation.CompareElements(element, &focused) }
+            .is_ok_and(|same| same.as_bool())
+            || !unsafe { element.CurrentIsEnabled() }.is_ok_and(|enabled| enabled.as_bool())
+            || !unsafe { element.CurrentIsPassword() }.is_ok_and(|protected| !protected.as_bool())
+        {
+            return Err(DriverError::new(
+                "DRIVER.FOCUS_LOST",
+                "held key element lost focus or changed state",
+            ));
+        }
+        Ok(())
+    }
+
+    fn require_hold_target(&self, window_id: &str, node: &Node) -> Result<IUIAutomationElement> {
+        let element = self.require(window_id, node)?;
+        let current = describe_element(&element, &node.node_id, node.depth, node.parent_id.clone());
+        if current.role != node.role
+            || current.name != node.name
+            || current.automation_id != node.automation_id
+            || current.class_name != node.class_name
+            || current.bounds != node.bounds
+            || current.states.enabled == Some(false)
+            || current.states.protected == Some(true)
+        {
+            return Err(DriverError::stale(
+                "held input target changed identity, geometry or state",
+            ));
+        }
+        Ok(element)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn held_pointer(
+        &self,
+        window_id: &str,
+        from: &Node,
+        to: Option<&Node>,
+        gesture: &PointerGesture,
+        inputs: &[windows::Win32::UI::Input::KeyboardAndMouse::INPUT],
+        hold_ms: u64,
+        deadline: Instant,
+    ) -> Result<()> {
+        ensure_hold_budget(hold_ms, deadline)?;
+        let handle = parse_window_id(window_id)?;
+        let source = self.require_hold_target(window_id, from)?;
+        let destination = to
+            .map(|node| self.require_hold_target(window_id, node))
+            .transpose()?;
+        let start = element_point(from.bounds, gesture.fraction)?;
+        self.ensure_hits(window_id, from, start)?;
+        let focus = if gesture.modifiers.is_empty() {
+            None
+        } else {
+            Some(input_focus_handle(handle)?)
+        };
+        let mut rect = RECT::default();
+        unsafe { GetWindowRect(handle, &mut rect) }
+            .map_err(|_| DriverError::stale("held input window disappeared"))?;
+        let combined = modified_pointer_inputs(inputs, &gesture.modifiers)?;
+        ensure_inputs_released(&combined)?;
+        ensure_hold_budget(hold_ms, deadline)?;
+        // A stalled COM revalidation cannot prolong owned input indefinitely.
+        // No later movement/down can pass the same lock after watchdog release.
+        let mut held =
+            HeldInput::new(deadline.min(Instant::now() + Duration::from_millis(hold_ms + 250)))?;
+        let split = gesture.modifiers.len() + 2;
+        let result = (|| {
+            held.send(&combined[..split], true, "held pointer down")?;
+            wait_input_hold(hold_ms, deadline, || {
+                ensure_hold_focus(handle, focus)?;
+                let mut current = RECT::default();
+                unsafe { GetWindowRect(handle, &mut current) }
+                    .map_err(|_| DriverError::stale("held input window disappeared"))?;
+                if current != rect {
+                    return Err(DriverError::stale("held input window geometry changed"));
+                }
+                Ok(())
+            })?;
+            let current = self.require_hold_target(window_id, from)?;
+            if !unsafe { self.automation.CompareElements(&source, &current) }
+                .is_ok_and(|same| same.as_bool())
+            {
+                return Err(DriverError::stale("held pointer source identity changed"));
+            }
+            self.ensure_hits(window_id, from, start)?;
+            if let (Some(node), Some(original)) = (to, destination.as_ref()) {
+                let current = self.require_hold_target(window_id, node)?;
+                if !unsafe { self.automation.CompareElements(original, &current) }
+                    .is_ok_and(|same| same.as_bool())
+                {
+                    return Err(DriverError::stale(
+                        "held pointer destination identity changed",
+                    ));
+                }
+                self.ensure_hits(
+                    window_id,
+                    node,
+                    element_point(node.bounds, gesture.to_fraction)?,
+                )?;
+            }
+            ensure_hold_focus(handle, focus)?;
+            ensure_input_deadline(deadline)?;
+            held.send(&combined[split..], true, "held pointer completion")?;
+            Ok(())
+        })();
+        finish_held_input(&mut held, result)
+    }
+
     /// Find the live element corresponding to a captured node.
     fn locate(&self, window_id: &str, node: &Node) -> Result<Option<IUIAutomationElement>> {
         let (_, root) = self.element_for(window_id)?;
@@ -1297,6 +1468,62 @@ fn ensure_pointer_modifier_focus(handle: HWND, modifiers: &[String]) -> Result<(
 /// SetFocus did: if the foreground lock kept `handle` in the background, they
 /// would land in another application. So the window is brought forward, the
 /// element focused, and then both are checked before a single key is sent.
+fn input_focus_handle(handle: HWND) -> Result<HWND> {
+    let mut info = GUITHREADINFO {
+        cbSize: std::mem::size_of::<GUITHREADINFO>() as u32,
+        ..Default::default()
+    };
+    let thread = unsafe { GetWindowThreadProcessId(handle, None) };
+    unsafe { GetGUIThreadInfo(thread, &mut info) }
+        .map_err(|_| DriverError::new("DRIVER.FOCUS_LOST", "could not verify held input focus"))?;
+    if info.hwndFocus.is_invalid() {
+        return Err(DriverError::new(
+            "DRIVER.FOCUS_LOST",
+            "held input target has no native focus",
+        ));
+    }
+    Ok(info.hwndFocus)
+}
+
+fn ensure_hold_focus(handle: HWND, focus: Option<HWND>) -> Result<()> {
+    if unsafe { GetAncestor(GetForegroundWindow(), GA_ROOT) } != handle
+        || focus.is_some_and(|expected| input_focus_handle(handle).ok() != Some(expected))
+    {
+        return Err(DriverError::new(
+            "DRIVER.FOCUS_LOST",
+            "held input target lost foreground or keyboard focus",
+        ));
+    }
+    Ok(())
+}
+
+fn finish_held_input(held: &mut HeldInput, result: Result<()>) -> Result<()> {
+    let submitted = held.submitted();
+    let expired = held.expired();
+    let released = held.release();
+    let result = result.and_then(|()| {
+        if expired {
+            Err(DriverError::new(
+                "DRIVER.TIMEOUT",
+                "input watchdog released an expired hold",
+            ))
+        } else if !released {
+            Err(DriverError::new(
+                "DRIVER.ACTION_FAILED",
+                "held input release was refused",
+            ))
+        } else {
+            Ok(())
+        }
+    });
+    result.map_err(|error| {
+        error
+            .with_effect(if submitted { "unknown" } else { "not_applied" })
+            .with_detail("residual_state_cleared", serde_json::json!(released))
+            .with_detail("hold_watchdog_expired", serde_json::json!(expired))
+    })
+}
+
 fn focus_for_keys(
     automation: &IUIAutomation,
     handle: HWND,

@@ -473,6 +473,7 @@ fn act_on(session: &Session, main: &str, role: &str, name: &str, action: Action)
 }
 fn keys(keys: &[&str]) -> Action {
     Action::Key {
+        hold_ms: None,
         keys: keys.iter().map(|k| k.to_string()).collect(),
     }
 }
@@ -947,6 +948,183 @@ fn a_timed_out_page_key_still_releases_before_any_more_typing() {
     );
 }
 
+#[test]
+#[ignore = "requires isolated Chromium with its sandbox enabled; CI runs it explicitly"]
+fn bounded_holds_have_real_durations_and_release_on_focus_occlusion_and_cancel() {
+    let _serial = serial();
+    let fixture = Fixture::new();
+    let (session, _) = session_for(&fixture);
+    let session = Arc::new(session);
+    let main = main_of(&session, &fixture.page_id);
+    assert!(wait_until(&session, &main, "Typed", WaitCondition::Appears)
+        .error
+        .is_none());
+    assert_eq!(
+        page_value(
+            &fixture,
+            r#"document.body.innerHTML='<input aria-label="Hold editor"><input aria-label="Other"><canvas aria-label="Hold surface" width="300" height="100" style="display:block"></canvas>';
+        window.holdEvents=[];window.changeDuringHold='';
+        document.addEventListener('keydown',e=>{
+            window.holdEvents.push(['keyDown',performance.now(),e.isTrusted,e.repeat]);
+            if(window.changeDuringHold==='focus')setTimeout(()=>document.querySelectorAll('input')[1].focus(),50);
+        },true);
+        document.addEventListener('keyup',e=>window.holdEvents.push(['keyUp',performance.now(),e.isTrusted,e.repeat]),true);
+        document.addEventListener('mousedown',e=>{
+            window.holdEvents.push(['mouseDown',performance.now(),e.isTrusted,e.buttons]);
+            if(window.changeDuringHold==='overlay')setTimeout(()=>{
+                const cover=document.createElement('div');cover.id='cover';cover.style='position:fixed;inset:0;background:white;z-index:9999';document.body.appendChild(cover);
+            },50);
+        },true);
+        document.addEventListener('mousemove',e=>{if(e.buttons)window.holdEvents.push(['mouseMove',performance.now(),e.isTrusted,e.buttons]);},true);
+        document.addEventListener('mouseup',e=>window.holdEvents.push(['mouseUp',performance.now(),e.isTrusted,e.buttons]),true);true"#
+        ),
+        true
+    );
+    let held_key = || Action::Key {
+        keys: vec!["ctrl".into(), "k".into()],
+        hold_ms: Some(180),
+    };
+    let held_click = || Action::Click {
+        button: None,
+        count: None,
+        fraction: None,
+        modifiers: Vec::new(),
+        hold_ms: Some(180),
+    };
+    for (role, name, action, down, up) in [
+        ("textbox", "Hold editor", held_key(), "keyDown", "keyUp"),
+        (
+            "canvas",
+            "Hold surface",
+            held_click(),
+            "mouseDown",
+            "mouseUp",
+        ),
+    ] {
+        assert_eq!(page_value(&fixture, "window.holdEvents=[];true"), true);
+        let result = act_on(&session, &main, role, name, action);
+        assert!(result.error.is_none(), "{result:?}");
+        let proof = page_value(&fixture, "window.holdEvents");
+        let events = proof.as_array().unwrap();
+        assert_eq!(events.len(), 2, "{proof}");
+        assert_eq!(events[0][0], down);
+        assert_eq!(events[1][0], up);
+        assert!(
+            events[1][1].as_f64().unwrap() - events[0][1].as_f64().unwrap() >= 170.0,
+            "{proof}"
+        );
+        assert!(events.iter().all(|event| event[2] == true));
+    }
+    assert_eq!(page_value(&fixture, "window.holdEvents=[];true"), true);
+    let observed = observe(&session, &main);
+    let surface = find(&session, &observed, "canvas", "Hold surface");
+    let result = act(
+        &session,
+        surface.clone(),
+        Action::Drag {
+            to: surface,
+            button: None,
+            fraction: Some(Fraction { fx: 0.2, fy: 0.5 }),
+            to_fraction: Some(Fraction { fx: 0.8, fy: 0.5 }),
+            modifiers: Vec::new(),
+            hold_ms: Some(180),
+        },
+    );
+    assert!(result.error.is_none(), "{result:?}");
+    let proof = page_value(&fixture, "window.holdEvents");
+    let events = proof.as_array().unwrap();
+    assert_eq!(events[0][0], "mouseDown");
+    assert_eq!(events[1][0], "mouseMove");
+    assert!(
+        events[1][1].as_f64().unwrap() - events[0][1].as_f64().unwrap() >= 170.0,
+        "{proof}"
+    );
+    assert_eq!(events.last().unwrap()[0], "mouseUp");
+    assert_eq!(events.last().unwrap()[3], 0);
+
+    // The deadline includes room for release; refuse before any input.
+    assert_eq!(page_value(&fixture, "window.holdEvents=[];true"), true);
+    let observed = observe(&session, &main);
+    let response = call_within(
+        &session,
+        Operation::Act {
+            target: find(&session, &observed, "textbox", "Hold editor"),
+            action: held_key(),
+            verify: None,
+        },
+        250,
+    );
+    assert_eq!(response.error.unwrap()["code"], "CONTROL.TIMEOUT");
+    assert_eq!(page_value(&fixture, "window.holdEvents"), json!([]));
+
+    assert_eq!(
+        page_value(
+            &fixture,
+            "window.changeDuringHold='focus';window.holdEvents=[];true"
+        ),
+        true
+    );
+    let result = act_on(&session, &main, "textbox", "Hold editor", held_key());
+    assert_eq!(result.error.as_ref().unwrap()["code"], "CONTROL.FOCUS_LOST");
+    assert_eq!(result.error.unwrap()["details"]["key_released"], true);
+    assert_eq!(
+        page_value(&fixture, "window.holdEvents.map(e=>e[0])"),
+        json!(["keyDown", "keyUp"])
+    );
+
+    assert_eq!(
+        page_value(
+            &fixture,
+            "window.changeDuringHold='overlay';window.holdEvents=[];true"
+        ),
+        true
+    );
+    let result = act_on(&session, &main, "canvas", "Hold surface", held_click());
+    assert_eq!(result.error.as_ref().unwrap()["code"], "CONTROL.OCCLUDED");
+    assert_eq!(
+        result.error.unwrap()["details"]["pointer_button_released"],
+        true
+    );
+    assert_eq!(
+        page_value(&fixture, "window.holdEvents.map(e=>e[0])"),
+        json!(["mouseDown", "mouseUp"])
+    );
+    assert_eq!(page_value(&fixture,"document.getElementById('cover').remove();window.changeDuringHold='';window.holdEvents=[];true"),true);
+
+    // Cancelling during a hold must still produce the matching release.
+    let observed = observe(&session, &main);
+    let request = Request::new(
+        Some(session.id().into()),
+        Operation::Act {
+            target: find(&session, &observed, "textbox", "Hold editor"),
+            action: Action::Key {
+                keys: vec!["ctrl".into(), "k".into()],
+                hold_ms: Some(1500),
+            },
+            verify: None,
+        },
+    );
+    let request_id = request.request_id.clone();
+    let worker_session = session.clone();
+    let worker = std::thread::spawn(move || worker_session.execute(&request));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while page_value(&fixture, "window.holdEvents.length>0") != true {
+        assert!(Instant::now() < deadline, "held key was never pressed");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(session.cancel(&request_id));
+    let response = worker.join().unwrap();
+    assert_eq!(
+        response.error.as_ref().unwrap()["code"],
+        "CONTROL.CANCELLED"
+    );
+    assert_eq!(response.error.unwrap()["details"]["key_released"], true);
+    assert_eq!(
+        page_value(&fixture, "window.holdEvents.map(e=>e[0])"),
+        json!(["keyDown", "keyUp"])
+    );
+}
+
 fn drag_to(session: &Session, main: &str, from: &str, (role, to): (&str, &str)) -> Response {
     let observed = observe(session, main);
     let source = find(session, &observed, "listitem", from);
@@ -955,6 +1133,7 @@ fn drag_to(session: &Session, main: &str, from: &str, (role, to): (&str, &str)) 
         session,
         source,
         Action::Drag {
+            hold_ms: None,
             modifiers: Vec::new(),
             to,
             button: None,
@@ -1021,6 +1200,7 @@ fn canvas_surfaces_take_trusted_clicks_wheels_and_drags_inside_the_same_element(
         &session,
         canvas.clone(),
         Action::Drag {
+            hold_ms: None,
             modifiers: Vec::new(),
             to: canvas,
             button: None,
@@ -1241,6 +1421,7 @@ fn pointer_modifiers_reach_click_drag_and_drop_without_keyboard_state() {
             "canvas",
             "Modified surface",
             Action::Click {
+                hold_ms: None,
                 button: None,
                 count: None,
                 fraction: None,
@@ -1268,6 +1449,7 @@ fn pointer_modifiers_reach_click_drag_and_drop_without_keyboard_state() {
         &session,
         surface.clone(),
         Action::Drag {
+            hold_ms: None,
             to: surface,
             button: None,
             fraction: Some(Fraction { fx: 0.2, fy: 0.5 }),
@@ -1295,6 +1477,7 @@ fn pointer_modifiers_reach_click_drag_and_drop_without_keyboard_state() {
         &session,
         card,
         Action::Drag {
+            hold_ms: None,
             to: bin,
             button: None,
             fraction: None,
@@ -1361,6 +1544,7 @@ fn drags_move_pointer_sortables_and_html5_draggables() {
         &session,
         card,
         Action::Drag {
+            hold_ms: None,
             modifiers: Vec::new(),
             to: bin,
             button: None,
@@ -1445,6 +1629,7 @@ fn controls_inside_open_shadow_roots_are_observed_and_operated() {
         "button",
         "Go",
         Action::Click {
+            hold_ms: None,
             modifiers: Vec::new(),
             button: None,
             count: None,
@@ -1485,6 +1670,7 @@ fn frame_of(session: &Session, wanted: impl Fn(&Value) -> bool) -> Value {
 }
 fn trusted_click() -> Action {
     Action::Click {
+        hold_ms: None,
         modifiers: Vec::new(),
         button: None,
         count: None,
@@ -1532,6 +1718,7 @@ fn frames_in_and_out_of_process_take_trusted_pointer_and_keyboard_input() {
         "button",
         "CrossButton",
         Action::Click {
+            hold_ms: None,
             modifiers: Vec::new(),
             button: Some(Button::Right),
             count: None,
@@ -2100,6 +2287,7 @@ fn secret_input_revalidates_passwords_and_keeps_revealed_fields_redacted() {
             text: "ordinary".into(),
         },
         Action::Key {
+            hold_ms: None,
             keys: vec!["A".into()],
         },
     ] {
@@ -2581,6 +2769,7 @@ fn tabs_open_front_and_close_and_popups_name_their_opener() {
         &session,
         popup,
         Action::Click {
+            hold_ms: None,
             modifiers: Vec::new(),
             button: None,
             count: None,
@@ -3026,6 +3215,7 @@ fn browser_actions_are_observed_document_bound_and_have_real_page_effects() {
         &session,
         target,
         Action::Key {
+            hold_ms: None,
             keys: vec!["Enter".into()],
         },
     );
@@ -3089,6 +3279,7 @@ fn browser_actions_are_observed_document_bound_and_have_real_page_effects() {
         &session,
         target,
         Action::Click {
+            hold_ms: None,
             modifiers: Vec::new(),
             button: Some(Button::Right),
             count: None,
@@ -3103,6 +3294,7 @@ fn browser_actions_are_observed_document_bound_and_have_real_page_effects() {
         &session,
         target,
         Action::Click {
+            hold_ms: None,
             modifiers: Vec::new(),
             button: None,
             count: Some(2),
@@ -3175,6 +3367,7 @@ fn browser_actions_are_observed_document_bound_and_have_real_page_effects() {
         &session,
         target,
         Action::Click {
+            hold_ms: None,
             modifiers: Vec::new(),
             button: None,
             count: None,

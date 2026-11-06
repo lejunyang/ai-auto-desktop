@@ -107,6 +107,44 @@ pub fn ensure_input_deadline(deadline: Instant) -> Result<()> {
     }
 }
 
+/// Validate the bounded dwell before any key or button goes down.
+pub fn ensure_hold_budget(hold_ms: u64, deadline: Instant) -> Result<()> {
+    if !(1..=5_000).contains(&hold_ms) {
+        return Err(DriverError::invalid("hold_ms must be between 1 and 5000"));
+    }
+    if deadline.saturating_duration_since(Instant::now()) <= Duration::from_millis(hold_ms) {
+        return Err(DriverError::new(
+            "DRIVER.TIMEOUT",
+            "hold exceeds the remaining input deadline",
+        ));
+    }
+    Ok(())
+}
+
+/// Synchronous dwell: callers retain their release guard until this returns.
+/// Verification never refocuses or activates a changed target.
+pub fn wait_input_hold(
+    hold_ms: u64,
+    deadline: Instant,
+    mut verify: impl FnMut() -> Result<()>,
+) -> Result<()> {
+    let end = Instant::now() + Duration::from_millis(hold_ms);
+    loop {
+        ensure_input_deadline(deadline)?;
+        verify()?;
+        ensure_input_deadline(deadline)?;
+        let now = Instant::now();
+        if now >= end {
+            return Ok(());
+        }
+        std::thread::sleep(
+            (end - now)
+                .min(deadline - now)
+                .min(Duration::from_millis(20)),
+        );
+    }
+}
+
 /// A window plus the element tree captured from it.
 #[derive(Clone, Debug)]
 pub struct CapturedTree {
@@ -156,6 +194,8 @@ pub struct PointerGesture {
     /// Internal execution deadline, derived by the provider from its timeout.
     /// This is never accepted as a caller-supplied pointer field.
     pub deadline: Option<Instant>,
+    /// Dwell after button down, before release or the first drag movement.
+    pub hold_ms: Option<u64>,
     /// Which button. Defaults to the left button.
     pub button: PointerButton,
     /// 1 for a single click, 2 for a double click.
@@ -270,6 +310,23 @@ pub trait Backend: Send + Sync {
     ) -> Result<()> {
         ensure_input_deadline(deadline)?;
         self.key_chord(window_id, node, keys)
+    }
+
+    fn key_chord_held(
+        &self,
+        window_id: &str,
+        node: &Node,
+        keys: &[String],
+        hold_ms: Option<u64>,
+        deadline: Instant,
+    ) -> Result<()> {
+        if hold_ms.is_some() {
+            return Err(DriverError::new(
+                "DRIVER.ACTION_UNSUPPORTED",
+                "bounded key holds are not implemented on this platform",
+            ));
+        }
+        self.key_chord_with_deadline(window_id, node, keys, deadline)
     }
 
     /// Perform a pointer gesture on a single element: a right or middle click, a
@@ -748,6 +805,26 @@ mod tests {
         .clamp();
         assert_eq!(raised.max_depth, 1);
         assert_eq!(raised.max_nodes, 1);
+    }
+
+    #[test]
+    fn bounded_hold_refuses_insufficient_budget_and_stops_on_changed_target() {
+        assert!(ensure_hold_budget(0, Instant::now() + Duration::from_secs(1)).is_err());
+        assert!(ensure_hold_budget(5001, Instant::now() + Duration::from_secs(10)).is_err());
+        assert!(ensure_hold_budget(200, Instant::now() + Duration::from_millis(20)).is_err());
+        let started = Instant::now();
+        let mut checked = 0;
+        let error = wait_input_hold(500, started + Duration::from_secs(1), || {
+            checked += 1;
+            Err(DriverError::stale("target changed"))
+        })
+        .unwrap_err();
+        assert_eq!(checked, 1);
+        assert_eq!(error.code, "DRIVER.STALE_HANDLE");
+        assert!(started.elapsed() < Duration::from_millis(400));
+        let error = wait_input_hold(100, Instant::now() + Duration::from_millis(10), || Ok(()))
+            .unwrap_err();
+        assert_eq!(error.code, "DRIVER.TIMEOUT");
     }
 
     #[test]

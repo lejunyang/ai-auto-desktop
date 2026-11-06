@@ -243,6 +243,7 @@ fn drag_ends_share_one_observation_and_gestures_follow_node_capabilities() {
         fraction: None,
         to_fraction: None,
         modifiers: Vec::new(),
+        hold_ms: None,
     };
     let act = |target: Target, action: Action| {
         call(
@@ -266,6 +267,7 @@ fn drag_ends_share_one_observation_and_gestures_follow_node_capabilities() {
         count: None,
         fraction: Some(Fraction { fx: 1.5, fy: 0.5 }),
         modifiers: Vec::new(),
+        hold_ms: None,
     };
     assert_eq!(code(&act(from.clone(), outside)), "CONTROL.INVALID_REQUEST");
     let scroll = Action::Scroll {
@@ -298,6 +300,7 @@ fn drag_moves_between_fractions_of_one_observed_surface() {
         fraction: Some(Fraction { fx: 0.2, fy: 0.3 }),
         to_fraction: Some(destination),
         modifiers: Vec::new(),
+        hold_ms: None,
     };
     let act = |action| {
         call(
@@ -347,6 +350,58 @@ fn drag_moves_between_fractions_of_one_observed_surface() {
         code(&act(drag(surface.clone(), end))),
         "CONTROL.STALE_TARGET"
     );
+}
+
+#[test]
+fn holds_are_bounded_single_clicks_and_cannot_outlive_the_request_budget() {
+    let (session, backend) = session();
+    let observation = observe(&session, View::default()).data.unwrap();
+    let surface = target(&observation, "n1");
+    for action in [
+        json!({"type":"click", "hold_ms":0}),
+        json!({"type":"click", "hold_ms":5001}),
+        json!({"type":"click", "hold_ms":10, "count":2}),
+        json!({"type":"drag", "to":surface, "hold_ms":5001}),
+        json!({"type":"key", "keys":["a"], "hold_ms":0}),
+    ] {
+        let response = call(
+            &session,
+            Operation::Act {
+                target: surface.clone(),
+                action: serde_json::from_value(action).unwrap(),
+                verify: None,
+            },
+        );
+        assert_eq!(code(&response), "CONTROL.INVALID_REQUEST");
+    }
+    let held: Action = serde_json::from_value(json!({"type":"click", "hold_ms":500})).unwrap();
+    assert!(
+        !held.plain_click(),
+        "a hold must not use semantic activation"
+    );
+    let mut request = Request::new(
+        Some(session.id().into()),
+        Operation::Act {
+            target: surface.clone(),
+            action: held,
+            verify: None,
+        },
+    );
+    request.timeout_ms = 100;
+    assert_eq!(code(&session.execute(&request)), "CONTROL.TIMEOUT");
+    assert!(backend.acted.lock().unwrap().is_empty());
+    let held: Action =
+        serde_json::from_value(json!({"type":"drag", "to":surface, "hold_ms":10})).unwrap();
+    let response = call(
+        &session,
+        Operation::Act {
+            target: surface,
+            action: held,
+            verify: None,
+        },
+    );
+    assert!(response.error.is_none(), "{:?}", response.error);
+    assert_eq!(backend.acted.lock().unwrap()[0].hold_ms(), Some(10));
 }
 
 #[test]

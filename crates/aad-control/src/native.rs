@@ -644,17 +644,22 @@ impl Backend for NativeBackend {
                     _ => {}
                 }
             }
-            Action::Key { keys } => set("keys", json!(keys)),
+            Action::Key { keys, hold_ms } => {
+                set("keys", json!(keys));
+                set("hold_ms", json!(hold_ms));
+            }
             Action::Paste { text } => set("text", json!(text)),
             Action::Click {
                 button,
                 count,
                 fraction: at,
                 modifiers,
+                hold_ms,
             } if native == "pointer_gesture" => {
                 set("button", serde_json::to_value(button).unwrap());
                 set("count", serde_json::to_value(count).unwrap());
                 set("fraction", fraction(at));
+                set("hold_ms", json!(hold_ms));
                 if !modifiers.is_empty() {
                     set("modifiers", json!(modifiers));
                 }
@@ -681,6 +686,7 @@ impl Backend for NativeBackend {
                 fraction: from_at,
                 to_fraction,
                 modifiers,
+                hold_ms,
             } => {
                 set("to", target_of(&json!(to.node_id)));
                 if portable {
@@ -698,6 +704,7 @@ impl Backend for NativeBackend {
                 set("button", serde_json::to_value(button).unwrap());
                 set("fraction", fraction(from_at));
                 set("to_fraction", fraction(to_fraction));
+                set("hold_ms", json!(hold_ms));
                 if !modifiers.is_empty() {
                     set("modifiers", json!(modifiers));
                 }
