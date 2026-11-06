@@ -6,16 +6,35 @@
 @media (prefers-color-scheme:dark){:root{--bg:#161615;--fg:#ecece8;--muted:#9a9a93}}
 body{margin:0;background:var(--bg);color:var(--fg);font:14px system-ui,sans-serif;display:flex;flex-direction:column;height:100vh}
 header{padding:8px 16px;color:var(--muted);display:flex;gap:12px;align-items:center}
-#take{display:none;font:inherit;padding:2px 10px;border-radius:6px;border:1px solid var(--muted);background:transparent;color:var(--fg);cursor:pointer}
+#take{display:none;white-space:nowrap;font:inherit;padding:2px 10px;border-radius:6px;border:1px solid var(--muted);background:transparent;color:var(--fg);cursor:pointer}
 main{flex:1;display:flex;align-items:center;justify-content:center;min-height:0;padding:0 16px 16px;position:relative}
 #pointer{position:fixed;pointer-events:none;display:none;image-rendering:auto}
-#keys{position:fixed;left:0;top:0;width:2px;height:1.2em;opacity:0;border:0;padding:0;margin:0;resize:none;overflow:hidden;font-size:16px}
+#keys{position:fixed;left:0;top:0;width:2px;height:1.2em;opacity:0;border:0;padding:0;margin:0;resize:none;overflow:hidden;font-size:16px;pointer-events:none}
 canvas{max-width:100%;max-height:100%;outline:none;cursor:crosshair;box-shadow:0 1px 6px rgba(0,0,0,.25)}
 </style></head><body>
-<header><span id="status">Connecting…</span><button id="take" type="button">Take control</button></header>
-<main><canvas id="screen" tabindex="0" aria-label="Shared screen" width="1" height="1"></canvas><img id="pointer" alt=""></main>
-<textarea id="keys" aria-label="Keyboard for the shared screen" autocomplete="off" autocapitalize="off" spellcheck="false"></textarea>
+<header><span id="status"></span><button id="take" type="button"></button></header>
+<main><canvas id="screen" tabindex="0" width="1" height="1"></canvas><img id="pointer" alt=""></main>
+<textarea id="keys" autocomplete="off" autocapitalize="off" spellcheck="false"></textarea>
 <script>
+// The viewer's language: ?lang=zh or en, else the browser's.
+const TEXT={
+  en:{connecting:'Connecting…',take:'Take control',screen:'Shared screen',keys:'Keyboard for the shared screen',
+    viewing:k=>`Viewing ${k}`,sharing:k=>`Sharing ${k}`,browser:'browser',desktop:'desktop',
+    click:' — click the picture to control it',other:' — another viewer has control',
+    decoding:'Video decoding failed: ',disconnected:'Disconnected',empty:'The shared clipboard holds no text',
+    copied:(n,cut)=>`Copied ${n} characters from the shared screen`+(cut?' (cut short)':''),notCopied:'Could not copy here: '},
+  zh:{connecting:'正在连接…',take:'接过控制',screen:'远程画面',keys:'远程画面的键盘',
+    viewing:k=>`正在观看${k}`,sharing:k=>`正在共享${k}`,browser:'浏览器',desktop:'桌面',
+    click:' · 点画面即可操作',other:' · 别人在操作',
+    decoding:'视频解码失败：',disconnected:'已断开',empty:'远程剪贴板里没有文字',
+    copied:(n,cut)=>`已从远程复制 ${n} 个字`+(cut?'（截断了）':''),notCopied:'没能复制到这边：'}};
+const lang=new URLSearchParams(location.search).get('lang')||navigator.language||'en';
+const t=TEXT[lang.toLowerCase().startsWith('zh')?'zh':'en'];
+document.documentElement.lang=t===TEXT.zh?'zh':'en';
+document.getElementById('status').textContent=t.connecting;
+document.getElementById('take').textContent=t.take;
+document.getElementById('screen').setAttribute('aria-label',t.screen);
+document.getElementById('keys').setAttribute('aria-label',t.keys);
 const token=new URLSearchParams(location.search).get('token');
 // Next to this page, whatever path and scheme it was served under: a host can
 // proxy the viewer below a prefix and over https (wss).
@@ -27,7 +46,7 @@ const MIME={1:'image/jpeg',2:'image/webp'};
 const VIDEO={3:'h264',4:'vp9',5:'av1'}, TILES=6;
 // A representative stream of each codec; the exact one is checked again when it starts.
 const PROBE={h264:'avc1.42E01F',vp9:'vp09.00.41.08',av1:'av01.0.08M.08'};
-let decodable=[], refused=new Set(), video=null, source='', kind='', mode='';
+let decodable=[], refused=new Set(), video=null, source='', kind='', mode='', os='';
 const show=()=>status.textContent=mode;
 const size=(w,h)=>{if(screen.width!==w||screen.height!==h){screen.width=w;screen.height=h;}};
 // WebCodecs exists only in secure contexts: localhost, or a host serving this over https.
@@ -59,7 +78,7 @@ async function stream(m){
       if(only) for(const r of only) pen.drawImage(f,r.x,r.y,r.w,r.h,r.x,r.y,r.w,r.h);
       else pen.drawImage(f,0,0);
       f.close();},
-    error:e=>{status.textContent='Video decoding failed: '+e.message;stop();send({type:'keyframe'});}});
+    error:e=>{status.textContent=t.decoding+e.message;stop();send({type:'keyframe'});}});
   decoder.configure(config);
   video={decoder,codec:m.codec,started:false,regions};
   videoLabel=`${m.codec} (${m.encoder})`;label();
@@ -132,12 +151,12 @@ const take=document.getElementById('take');
 take.addEventListener('click',()=>send({type:'take'}));
 function label(){mode=[source,modeLabel,videoLabel].filter(Boolean).join(' · ')+hint;show();}
 function control(m){
-  if(m.type==='ready'){kind=m.view_only?'':m.source.kind;source=(m.view_only?'Viewing ':'Sharing ')+m.source.kind;hint=m.view_only?'':' — click the picture to control it';label();}
+  if(m.type==='ready'){kind=m.view_only?'':m.source.kind;os=m.os||'';source=t[m.view_only?'viewing':'sharing'](t[m.source.kind]||m.source.kind);hint=m.view_only?'':t.click;label();fit();}
   if(m.type==='mode'){modeLabel=m.mode.codec+(m.mode.video?' + '+m.mode.video:'');if(!m.mode.video&&m.mode.codec!=='tiles') videoLabel='';label();}
   if(m.type==='stream') return stream(m);
   if(m.type==='cursor') return moved(m);
   if(m.type==='control'&&kind){
-    hint=m.you?' — click the picture to control it':' — another viewer has control';
+    hint=m.you?t.click:t.other;if(m.you){fitted='';fit();}
     take.style.display=m.you?'none':'inline-block';label();}
   if(m.type==='clipboard') return copied(m);
   if(m.type==='error') status.textContent=m.message;
@@ -156,9 +175,16 @@ socket.onmessage=e=>{
   }
   const m=JSON.parse(e.data);later(()=>control(m));
 };
-socket.onclose=()=>{stop();status.textContent='Disconnected';};
+socket.onclose=()=>{stop();status.textContent=t.disconnected;};
 const at=e=>{const r=screen.getBoundingClientRect();return{x:Math.min(1,Math.max(0,(e.clientX-r.left)/r.width)),y:Math.min(1,Math.max(0,(e.clientY-r.top)/r.height))};};
 const button=e=>['left','middle','right'][e.button]||'left';
+// On a Mac, Command does there what Control does elsewhere: on a shared
+// Windows or Linux screen it is sent as Control, so Cmd+C copies.
+const mac=/Mac|iPhone|iPad/.test(navigator.platform), swap=()=>mac&&os!=='macos';
+// The modifiers held with each event, so a shortcut arrives whole even when the
+// modifier's own key press never reached this page.
+const held=e=>{const m=[];if(e.altKey)m.push('Alt');if(e.ctrlKey||(e.metaKey&&swap()))m.push('Control');
+  if(e.metaKey&&!swap())m.push('Meta');if(e.shiftKey)m.push('Shift');return m;};
 // The pointer: captured on press, so a release outside the picture still
 // arrives; the click count makes double and triple clicks.
 const pressed=new Set();
@@ -166,37 +192,56 @@ let last=0;
 screen.addEventListener('pointerdown',e=>{if(e.pointerType==='mouse') screen.setPointerCapture(e.pointerId);});
 screen.addEventListener('mousemove',e=>{const now=Date.now();if(now-last<(pressed.size?16:40))return;last=now;send({type:'mouse',action:'move',...at(e)});});
 screen.addEventListener('mousedown',e=>{e.preventDefault();typing(e);pressed.add(e.button);
-  send({type:'mouse',action:'down',button:button(e),count:e.detail||1,...at(e)});});
+  send({type:'mouse',action:'down',button:button(e),count:e.detail||1,modifiers:held(e),...at(e)});});
 screen.addEventListener('mouseup',e=>{if(!pressed.delete(e.button))return;
-  send({type:'mouse',action:'up',button:button(e),count:e.detail||1,...at(e)});});
-screen.addEventListener('contextmenu',e=>e.preventDefault());
-screen.addEventListener('wheel',e=>{e.preventDefault();send({type:'mouse',action:'wheel',dx:e.deltaX,dy:e.deltaY,...at(e)});},{passive:false});
+  send({type:'mouse',action:'up',button:button(e),count:e.detail||1,modifiers:held(e),...at(e)});});
+// The right button is for the shared screen: this browser's own menu stays shut.
+document.addEventListener('contextmenu',e=>e.preventDefault());
+screen.addEventListener('wheel',e=>{e.preventDefault();send({type:'mouse',action:'wheel',dx:e.deltaX,dy:e.deltaY,modifiers:held(e),...at(e)});},{passive:false});
 // The keyboard: a hidden text box near the last click holds the focus, so the
 // viewer's input method (Chinese, Japanese, accents) composes there and only
 // the finished text is sent. Keys that type nothing, and shortcuts, go as keys.
 const keys=document.getElementById('keys'), down=new Set();
 function typing(e){keys.style.left=e.clientX+'px';keys.style.top=e.clientY+'px';keys.focus({preventScroll:true});}
 const types=e=>e.key.length===1&&!e.ctrlKey&&!e.metaKey&&!e.altKey;
+const shortcut=e=>(e.ctrlKey||e.metaKey)&&!e.altKey;
+// Command itself goes as Control where it is swapped.
+const named=e=>e.key==='Meta'&&swap()?{key:'Control',code:e.code==='MetaRight'?'ControlRight':'ControlLeft'}:{key:e.key,code:e.code};
 keys.addEventListener('keydown',e=>{
   if(e.isComposing||e.keyCode===229||e.key==='Dead'||types(e)) return;
+  // Paste pastes this side's clipboard: the paste event below sends its text.
+  if(shortcut(e)&&!e.shiftKey&&e.code==='KeyV') return;
   e.preventDefault();down.add(e.code);
-  send({type:'key',action:'down',key:e.key,code:e.code});
-  // After a copy on the shared desktop, bring its clipboard here.
-  if(kind==='desktop'&&(e.ctrlKey||e.metaKey)&&(e.code==='KeyC'||e.code==='KeyX')) setTimeout(()=>send({type:'clipboard'}),300);
+  send({type:'key',action:'down',...named(e),modifiers:held(e)});
+  // After a copy on the shared screen, bring what it copied here.
+  if(kind&&shortcut(e)&&(e.code==='KeyC'||e.code==='KeyX')) setTimeout(()=>send({type:'clipboard'}),300);
 });
-keys.addEventListener('keyup',e=>{if(!down.delete(e.code))return;e.preventDefault();send({type:'key',action:'up',key:e.key,code:e.code});});
-keys.addEventListener('input',e=>{if(e.isComposing)return;if(keys.value)send({type:'text',text:keys.value});keys.value='';});
-keys.addEventListener('compositionend',e=>{if(e.data)send({type:'text',text:e.data});keys.value='';});
-keys.addEventListener('paste',e=>{e.preventDefault();send({type:'text',text:e.clipboardData.getData('text')});});
+keys.addEventListener('keyup',e=>{if(!down.delete(e.code))return;e.preventDefault();send({type:'key',action:'up',...named(e),modifiers:held(e)});});
+// Text goes with no modifier held, so a paste with Ctrl down types, not shortcuts.
+keys.addEventListener('input',e=>{if(e.isComposing)return;if(keys.value)send({type:'text',text:keys.value,modifiers:[]});keys.value='';});
+keys.addEventListener('compositionend',e=>{if(e.data)send({type:'text',text:e.data,modifiers:[]});keys.value='';});
+keys.addEventListener('paste',e=>{e.preventDefault();const text=e.clipboardData.getData('text');if(text)send({type:'text',text,modifiers:[]});});
+// A shared page is laid out at the room this viewer has for it, not scaled into it.
+const area=document.querySelector('main');
+let fitted='', fitting=0;
+function fit(){
+  if(kind!=='browser') return;
+  const r=area.getBoundingClientRect(), s=getComputedStyle(area);
+  const w=Math.floor(r.width-parseFloat(s.paddingLeft)-parseFloat(s.paddingRight));
+  const h=Math.floor(r.height-parseFloat(s.paddingTop)-parseFloat(s.paddingBottom));
+  if(w<1||h<1||`${w}x${h}`===fitted) return;
+  fitted=`${w}x${h}`;send({type:'viewport',width:w,height:h});
+}
+addEventListener('resize',()=>{clearTimeout(fitting);fitting=setTimeout(fit,250);});
 // Leaving the window lets go of everything held, here and on the other side.
 function release(){down.clear();pressed.clear();send({type:'release'});}
 addEventListener('blur',release);
 document.addEventListener('visibilitychange',()=>{if(document.hidden)release();});
 async function copied(m){
-  if(m.text==null){status.textContent='The shared clipboard holds no text';return;}
+  if(m.text==null){status.textContent=t.empty;setTimeout(label,3000);return;}
   try{await navigator.clipboard.writeText(m.text);
-    status.textContent=`Copied ${m.characters} characters from the shared screen`+(m.truncated?' (cut short)':'');}
-  catch(e){status.textContent='Could not copy here: '+e.message;}
+    status.textContent=t.copied(m.characters,m.truncated);}
+  catch(e){status.textContent=t.notCopied+e.message;}
   setTimeout(label,3000);
 }
 </script></body></html>
