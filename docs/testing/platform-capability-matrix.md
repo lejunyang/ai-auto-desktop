@@ -8,7 +8,7 @@
 | --- | --- | --- |
 | 本机 KDE/X11、Qt Widgets/QML | KWrite 中文编辑保存并磁盘回读；系统设置搜索及分类导航；Dolphin 多选/框选、恢复 F2 编辑框并中文重命名后磁盘回读；Qt 密码替换/清空、键鼠长按与拖拽起点停留的独立事件计时；同 PID 双窗口拒绝错误焦点；原生 `control_cancel` 后键鼠实际释放及下一次调用恢复；截图与窗口动作 | 复杂 IME；多屏和缩放；跨应用完整任务；更多第三方应用多窗口验收；同步 D-Bus 调用只能在调用前后响应取消 |
 | 本机 Electron | Code/Codex 可恢复局部完整观察、find、scope token 刷新 | 真实点击、编辑保存和剪贴板闭环；不能把发现节点当作输入验收 |
-| Chromium | 真实独立浏览器回归覆盖 DOM、frames、scope、Canvas、closed shadow host 视觉动作及内部字段保护、修饰键、敏感输入与按实例输入租约；有界面页面快捷键隔离；有界按住及焦点变化/遮挡/取消后的释放 | 路径、浏览器内部/本地页面授权；closed shadow 内部语义节点未公开；非 Chromium 不能套用这些结论 |
+| Chromium | 真实独立浏览器回归 34/34，覆盖 DOM、frames、scope、Canvas/closed-shadow 折线路径及内部字段保护、修饰键、敏感输入与按实例输入租约；有界面页面快捷键隔离；有界按住及异常释放；本地文件/Settings 授权与执行中祖先 URL 复核 | HTML5 自定义路径和跨资源拖拽未支持；closed shadow 内部语义节点未公开；其他内部页面逐项验收；非 Chromium 不能套用这些结论 |
 | Windows | UIA、SendInput、修饰键与专用保密输入有实现；目标 Windows cfg check/clippy 通过 | **[待真机验收]** Windows 交互桌面，Win32/WPF/Chromium，各种 DPI 与多屏，中文 IME，取消或超时后的键鼠释放，密码字段实际替换/清空 |
 | macOS | AX 与 Swift helper 有实现；同一 fresh snapshot 复核拖拽两端；Rust macOS cfg check 及宿主逻辑测试通过 | **[待真机验收]** macOS SDK/Swift helper 构建、辅助功能与屏幕录制权限、原生/Chromium 应用、拖拽和输入效果、Secure Input 条件；Rust cfg 检查不代表 Swift 已编译 |
 | GNOME/X11、XFCE/X11 | `bea9187` 已移除桌面品牌限制，保留真实会话和窗口身份检查；私有 Xvfb 四种标签真实点击/截图与拒绝路径、本机 KDE 新 helper 验收通过 | **[待真机验收]** GNOME/XFCE 窗口管理器、GTK 控件、剪贴板管理器、焦点与窗口动作；Xvfb 下更换环境标签只验证门禁和协议兼容性 |

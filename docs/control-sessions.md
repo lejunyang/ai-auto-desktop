@@ -52,11 +52,19 @@ Alt/Meta 及 F2 以外的功能键仍以 `CONTROL.ACTION_UNSUPPORTED` 拒绝。
 2026-11-07 本机有界面 Chromium 对有/无页面处理器共 18 组 Ctrl 组合完成真实检查：
 页面收到可信事件，原生编辑器焦点、窗口/对话框集合、网址和标签页不变；另有超时后释放验收。
 
-浏览器 drag：只在可拖起的元素上提供（`draggable`、列表/网格项、grab/move 光标），终点可以是同一观察里的任何节点。
+浏览器 drag：在可拖起的元素（`draggable`、列表/网格项、grab/move 光标）及已确认的 Canvas/closed-shadow surface 上提供，终点可以是同一观察里的任何节点。
 两端都滚进视口后在当前位置各自命中检查（不再滚动），被遮挡或无法同时可见则 `CONTROL.OCCLUDED` 且什么都不按下；
 随后按下、12 步滑动、松开。HTML5 拖放经 `Input.setInterceptDrags` 截获，再用 `Input.dispatchDragEvent`
 （dragEnter/dragOver/drop，带拖拽数据）在终点完成。实测 headless Chrome 只用鼠标事件也能完成 HTML5 drop，
 但有界面的 Windows 浏览器会进入系统拖放循环，所以总是截获 `[待验证: 有界面 Chrome/Edge on Windows]`。
+
+`drag.path` 可指定最多 32 个中间锚点，每项为 `target` 与元素内的 `fraction`；起终点也必须显式给出比例，
+所有锚点必须引用同一观察中的同一 surface。浏览器仅支持 Canvas 与已确认的 closed-shadow host，
+按起点、中间点、终点依次派发可信鼠标事件，每段至少 16 ms；`hold_ms` 仍是起点按下后的停留时间。
+按下前复核全部锚点，段间继续检查身份、布局和命中；预算不足、遮挡或变化时拒绝或停止并释放。
+自定义路径不支持 HTML5 draggable；异常时释放鼠标、取消拖放并关闭截获，清理结果在错误详情中报告。
+省略 path 保持原来的两端拖动。Chromium 已用公开截图 PNG 独立核对 Canvas/closed-shadow 内的折线，
+并回读可信事件顺序及超时、取消、遮挡和几何变化后的释放；不代表跨页面或跨资源拖拽已支持。
 
 Shadow DOM：观察深度优先进入每个开放 shadow root（先宿主的 shadow 树，再其 light 子节点——只有被 slot 的才会渲染），
 内部控件与普通节点一样有指纹、复核和动作；命中检查经 `shadowRoot.elementFromPoint` 穿过宿主，包含关系沿 host 向上。
@@ -96,8 +104,14 @@ aad mcp --browser-port 9222 --allow-input `
 `javascript:`、`data:`、`blob:` 不能作为 navigate/open_tab 目标。当前已存在的普通 data 文档仍可观察。
 未授权页面在 targets 中保留诊断、动作能力为空；观察/操作前复核当前文档及其祖先 frame 的授权，
 截图还检查可能包含的子 frame。授权不保证浏览器允许该特权页面使用 CDP 隔离 world，后端拒绝时不会改走任意脚本。
+长按、连续输入、拖拽各段与 HTML5 drop 前也会重新检查当前文档和祖先的 URL、loader 与嵌入关系，
+文件授权按当时 canonical 文件复核；失效后不再派发后续输入，只尝试释放自有键鼠和取消拖放。
+取消和截止时间在 fresh 查询前后检查，准备阶段的滚动/聚焦也受同一边界约束；正在等待的 CDP 命令仍受其截止时间约束。
+`back`/`forward` 在导航前检查历史目标的文档授权，保留已有空白页、data 文档和长 http(s) URL 的历史访问。
 这是本项目的文档访问门禁，不是浏览器文件系统或网络沙箱：页面脚本、资源加载仍遵循浏览器自身权限。
 本机已验收本地 HTML 的实际点击与越界拒绝、`chrome://version` 观察，以及 `chrome://settings` 打开搜索框并输入后回读。
+本机 Chromium 自身拒绝 file 页跨文件路径的 `pushState`；fragment 更新正常。另以授权文件消失且 DOM/loader 不变的方式，
+实测 8 条输入链及 srcdoc 祖先授权失效后的停止/释放，不把它描述成已复现跨路径 pushState 绕过。
 
 标签页与弹窗：`open_tab`（要 `url`，使用与 navigate 相同的服务器授权）在浏览器里新开一个标签页，答复里带新页面的 `page_id`；
 `activate_page` 把被观察的页面切到前台，`close_page` 关闭它。三者都先在观察到的文档里确认 body 节点仍有效，
