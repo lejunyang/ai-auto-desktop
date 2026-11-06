@@ -35,7 +35,8 @@ null 子引用会被过滤，深度、节点预算和真实读取失败仍产生
 
 AT-SPI 语义调用在 Rust 进程内完成。显式键鼠输入与截图使用固定路径的最小 C++ helper：
 
-- `type_text`：聚焦并验证 PID 后，以 XTEST 提交有界 UTF-8 文本；
+- `type_text`：聚焦并验证窗口后，以 XTEST 提交有界 UTF-8 文本；缺省 `unicode` 模式拒绝
+  Fcitx5 组合输入。显式 `mode: "keys"` 则通过当前输入法发送已有布局按键；
 - `pointer_click`：由 fresh bounds 计算中心点，经 AT-SPI subtree hit-test 与 X11 PID/focus
   复核后提交左键；
 - `capture_target`：只截取 fresh 语义 target 的可见矩形，拒绝全屏、任意坐标、protected
@@ -55,6 +56,19 @@ selection 协议访问（见下文）。观察前通过无输入的 `describe` �
 必须属于该 client 或其子窗口。另一个同 PID 窗口、窗口移动或失焦都不能沿用原证明。
 这项证明不使用“该进程只有一个窗口”的几何降级；持键过程中继续复核并释放自己按下的键。
 旧 helper 不提供相应键盘动作，普通 AT-SPI 语义调用及其已声明的纯指针功能仍可用。
+
+显式 keys 模式额外要求 `type-text-keys`，只从当前 XKB group 和锁定状态中寻找现有键位与
+Shift 组合，不创建 Unicode 映射、不使用剪贴板、不切换输入法；无法表示的字符在整个字符串
+派发前拒绝。每笔按键复核窗口、PID、键位和状态，拒绝抢占外部持键，取消或变化时仅释放自己
+按下的键。这个模式提交按键，最终文字由输入法决定；调用者可在 fresh 观察后发送锚定的
+space/enter 选择候选，不能把 `submitted` 当成候选已确认。
+
+本机 `verify-fcitx-physical-keys.ps1` 在新 Qt 窗口里使用已配置的微软双拼：`nihk` 产生可见
+“你好”候选，space 后 Qt 的 `QInputMethodEvent` commit、字段值与 fresh AT-SPI 一致，
+同时验证默认 Unicode 模式拒绝组合。截图只裁剪自己的前台测试窗口。测试显式选择并恢复
+原方法，生产路径不会切换输入法；本机全拼虽已安装但未加入当前列表，未修改列表冒充覆盖。
+私有 Xvfb 另验证已有键位、Caps、缺字拒绝、错误窗口、外部持键、取消与焦点/状态/键位变化。
+其他方案、候选翻页和复杂组合 **[待真机验收]**。
 
 非空 `drag.path` 还要求 `anchored-drag-path`，最多 32 个同一观察、同一元素内的归一化中间锚点；
 起点和终点比例必须显式给出。按下前逐点检查，每段前完整 fresh AT-SPI 复核原生身份、

@@ -6,7 +6,7 @@
 
 | 目标环境 | 当前证据 | 仍需验收 |
 | --- | --- | --- |
-| 本机 KDE/X11、Qt Widgets/QML | KWrite 中文编辑保存并磁盘回读；系统设置搜索及分类导航；Dolphin 多选/框选、恢复 F2 编辑框并中文重命名后磁盘回读；Qt 密码替换/清空、键鼠长按与拖拽起点停留的独立事件计时；同 PID 双窗口拒绝错误焦点；同 surface 路径逐点实际轨迹、窄 scope 外 sibling overlay 和取消后的释放；原生 `control_cancel` 后键鼠实际释放及下一次调用恢复；截图与窗口动作 | 复杂 IME；多屏和缩放；跨应用完整任务；更多第三方应用多窗口验收；一般同步 D-Bus 调用只能在调用前后响应取消，路径专用只读 worker 与 helper 释放独立 |
+| 本机 KDE/X11、Qt Widgets/QML | KWrite 中文编辑保存并磁盘回读；系统设置搜索及分类导航；Dolphin 多选/框选、恢复 F2 编辑框并中文重命名后磁盘回读；Qt 密码替换/清空、键鼠长按与拖拽起点停留的独立事件计时；Fcitx5 微软双拼显式物理键组合、候选截图、空格选词与 Qt/AT-SPI 提交回读；同 PID 双窗口拒绝错误焦点；同 surface 路径逐点实际轨迹、窄 scope 外 sibling overlay 和取消后的释放；原生 `control_cancel` 后键鼠实际释放及下一次调用恢复；截图与窗口动作 | 其他 IME、翻页和复杂组合；多屏和缩放；跨应用完整任务；更多第三方应用多窗口验收；一般同步 D-Bus 调用只能在调用前后响应取消，路径专用只读 worker 与 helper 释放独立 |
 | 本机 Electron | Code/Codex 可恢复局部完整观察、find、scope token 刷新；独立 VS Code profile 经原生 focus/Ctrl+A/中文 paste/Ctrl+S 后，DOM、磁盘与截图回读通过 | 原生指针命中仍有拒绝；其他 Electron 应用、任意延迟剪贴板客户端及复杂 IME 不能从这一编辑流程外推 |
 | Chromium | 真实独立浏览器回归 34/34，覆盖 DOM、frames、scope、Canvas/closed-shadow 折线路径及内部字段保护、修饰键、敏感输入与按实例输入租约；有界面页面快捷键隔离；有界按住及异常释放；本地文件/Settings 授权与执行中祖先 URL 复核 | HTML5 自定义路径和跨资源拖拽未支持；closed shadow 内部语义节点未公开；其他内部页面逐项验收；非 Chromium 不能套用这些结论 |
 | Windows | UIA、SendInput、修饰键与专用保密输入有实现；目标 Windows cfg check/clippy 通过 | **[待真机验收]** Windows 交互桌面，Win32/WPF/Chromium，各种 DPI 与多屏，中文 IME，取消或超时后的键鼠释放，密码字段实际替换/清空 |
@@ -64,6 +64,14 @@ pwsh -File tests/linux/verify-x11-paste-sequence.ps1
 pwsh -File tests/linux/verify-code-paste.ps1 `
   -Aad target/debug/aad `
   -InputHelper /absolute/path/to/x11_xtest_helper
+
+# 显式 keys 模式只使用现有 XKB 键位，helper 声明 type-text-keys。
+# 此例对应本机已配置的 Fcitx5 微软双拼；测试不改输入法列表，并恢复原方法。
+pwsh -File tests/linux/verify-x11-physical-keys.ps1
+pwsh -File tests/linux/verify-fcitx-physical-keys.ps1 `
+  -Aad target/debug/aad `
+  -InputHelper /absolute/path/to/x11_xtest_helper `
+  -ComposingMethod shuangpin -Keystrokes nihk -ExpectedText '你好'
 
 # AAD_TEST_CHROME 指向本机测试 Chromium；独立 profile。
 osdk exec -- cargo test --locked -p aad-control --test browser_e2e -- --ignored --test-threads=1
