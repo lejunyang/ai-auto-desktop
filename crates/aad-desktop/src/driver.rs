@@ -11,8 +11,8 @@
 //! occupies that position.
 
 use crate::backend::{
-    Backend, CaptureLimits, DriverError, Pixels, PointerButton, PointerGesture, Result,
-    ScrollDirection, ScrollSpec, SnapshotStore,
+    ensure_input_deadline, Backend, CaptureLimits, DriverError, Pixels, PointerButton,
+    PointerGesture, Result, ScrollDirection, ScrollSpec, SnapshotStore,
 };
 use crate::capture::{self, CapturedEvent};
 use crate::model::{Locator, Node, Snapshot, Target, NODE_ACTIONS, OUTLINE_BUDGET};
@@ -24,7 +24,7 @@ use base64::Engine as _;
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub const PROVIDER_NAME: &str = "desktop.windows_uia";
 
@@ -108,6 +108,11 @@ impl UiaDriver {
 
     /// Dispatch one action by its short name.
     pub fn call(&self, action: &str, args: &Value) -> Result<Value> {
+        self.call_with_deadline(action, args, Instant::now() + Duration::from_secs(30))
+    }
+
+    fn call_with_deadline(&self, action: &str, args: &Value, deadline: Instant) -> Result<Value> {
+        ensure_input_deadline(deadline)?;
         let args = match args {
             Value::Null => Value::Object(Map::new()),
             other => other.clone(),
@@ -143,7 +148,7 @@ impl UiaDriver {
             }
             "focus" | "invoke" | "set_value" | "type_text" | "pointer_click" | "key_chord"
             | "pointer_gesture" | "drag" | "minimize" | "maximize" | "restore" | "close_window"
-            | "activate" | "paste" | "secret_input" => self.act(action, &args),
+            | "activate" | "paste" | "secret_input" => self.act(action, &args, deadline),
             "watch" => self.watch(&args),
             "collect" => self.collect(&args),
             "release" => self.release(&args),
@@ -604,12 +609,13 @@ impl UiaDriver {
         }))
     }
 
-    fn act(&self, action: &str, args: &Value) -> Result<Value> {
+    fn act(&self, action: &str, args: &Value, deadline: Instant) -> Result<Value> {
         let target = args
             .get("target")
             .ok_or_else(|| DriverError::invalid("target is required"))
             .and_then(|value| Target::from_value(value).map_err(DriverError::invalid))?;
         let (window_id, node) = self.resolve(&target)?;
+        ensure_input_deadline(deadline)?;
 
         if node.states.protected == Some(true)
             && matches!(action, "set_value" | "type_text" | "key_chord" | "paste")
@@ -729,10 +735,12 @@ impl UiaDriver {
                         "a key combination may hold at most {MAX_CHORD_KEYS} keys"
                     )));
                 }
-                self.backend.key_chord(&window_id, &node, &keys)?
+                self.backend
+                    .key_chord_with_deadline(&window_id, &node, &keys, deadline)?
             }
             "pointer_gesture" => {
-                let gesture = parse_pointer_gesture(args)?;
+                let mut gesture = parse_pointer_gesture(args)?;
+                gesture.deadline = Some(deadline);
                 self.backend.pointer_gesture(&window_id, &node, &gesture)?
             }
             "drag" => {
@@ -757,7 +765,9 @@ impl UiaDriver {
                     .with_detail("node_id", json!(to_node.node_id))
                     .with_detail("supported", json!(to_node.actions)));
                 }
-                let gesture = parse_drag_gesture(args)?;
+                let mut gesture = parse_drag_gesture(args)?;
+                ensure_input_deadline(deadline)?;
+                gesture.deadline = Some(deadline);
                 self.backend.drag(&window_id, &node, &to_node, &gesture)?
             }
             "paste" => {
@@ -1154,6 +1164,7 @@ fn parse_pointer_gesture(args: &Value) -> Result<PointerGesture> {
     }
 
     Ok(PointerGesture {
+        deadline: None,
         button,
         count,
         modifiers,
@@ -1173,6 +1184,7 @@ fn parse_drag_gesture(args: &Value) -> Result<PointerGesture> {
         }
     }
     Ok(PointerGesture {
+        deadline: None,
         button: parse_button(args)?,
         count: 1,
         modifiers: parse_pointer_modifiers(args)?,
@@ -1398,7 +1410,7 @@ impl Provider for UiaDriver {
         &self,
         action: &str,
         args: Value,
-        _timeout: Option<Duration>,
+        timeout: Option<Duration>,
     ) -> std::result::Result<Value, aad_core::AutomationError> {
         // Accept the fully qualified id as well as the bare action name.
         let short = action
@@ -1406,7 +1418,12 @@ impl Provider for UiaDriver {
             .unwrap_or(action);
         let short = short.split_once('@').map(|(head, _)| head).unwrap_or(short);
 
-        self.call(short, &args)
+        let deadline = Instant::now()
+            .checked_add(timeout.unwrap_or(Duration::from_secs(30)))
+            .ok_or_else(|| {
+                DriverError::invalid("input timeout is too large").into_automation_error()
+            })?;
+        self.call_with_deadline(short, &args, deadline)
             .map_err(DriverError::into_automation_error)
     }
 }
@@ -1443,6 +1460,8 @@ mod tests {
         nodes: Mutex<Vec<Node>>,
         performed: Mutex<Vec<String>>,
         verify_result: Mutex<bool>,
+        verify_delay: Mutex<Duration>,
+        received_deadlines: Mutex<Vec<Instant>>,
     }
 
     impl FakeBackend {
@@ -1451,6 +1470,8 @@ mod tests {
                 nodes: Mutex::new(nodes),
                 performed: Mutex::new(Vec::new()),
                 verify_result: Mutex::new(true),
+                verify_delay: Mutex::new(Duration::ZERO),
+                received_deadlines: Mutex::new(Vec::new()),
             })
         }
 
@@ -1492,6 +1513,7 @@ mod tests {
         }
 
         fn verify(&self, _window_id: &str, _node: &Node) -> Result<bool> {
+            std::thread::sleep(*self.verify_delay.lock().unwrap());
             Ok(*self.verify_result.lock().unwrap())
         }
 
@@ -1541,12 +1563,26 @@ mod tests {
             Ok(())
         }
 
+        fn key_chord_with_deadline(
+            &self,
+            window_id: &str,
+            node: &Node,
+            keys: &[String],
+            deadline: Instant,
+        ) -> Result<()> {
+            self.received_deadlines.lock().unwrap().push(deadline);
+            self.key_chord(window_id, node, keys)
+        }
+
         fn pointer_gesture(
             &self,
             _window_id: &str,
             node: &Node,
             gesture: &PointerGesture,
         ) -> Result<()> {
+            if let Some(deadline) = gesture.deadline {
+                self.received_deadlines.lock().unwrap().push(deadline);
+            }
             self.record(&format!(
                 "pointer_gesture:{}:{:?}x{}",
                 node.node_id, gesture.button, gesture.count
@@ -1620,6 +1656,46 @@ mod tests {
 
     fn target_of(found: &Value) -> Value {
         found["target"].clone()
+    }
+
+    #[test]
+    fn provider_deadlines_reach_gestures_and_expiry_during_revalidation_refuses_input() {
+        let (driver, backend) = driver(vec![node(
+            "n1",
+            "Edit",
+            "Field",
+            &["key_chord", "pointer_gesture"],
+        )]);
+        let found = driver
+            .call(
+                "find",
+                &json!({"window_id":"w1","locator":{"name":"Field"}}),
+            )
+            .unwrap();
+        let args = json!({"target":target_of(&found),"keys":["a"]});
+        let before = Instant::now();
+        driver
+            .invoke("key_chord", args.clone(), Some(Duration::from_millis(250)))
+            .unwrap();
+        driver
+            .invoke(
+                "pointer_gesture",
+                args.clone(),
+                Some(Duration::from_millis(250)),
+            )
+            .unwrap();
+        let deadlines = backend.received_deadlines.lock().unwrap();
+        assert_eq!(deadlines.len(), 2);
+        assert!(deadlines.iter().all(|deadline| *deadline >= before
+            && *deadline <= Instant::now() + Duration::from_millis(250)));
+        drop(deadlines);
+        *backend.verify_delay.lock().unwrap() = Duration::from_millis(20);
+        let failure = driver
+            .invoke("key_chord", args, Some(Duration::from_millis(5)))
+            .unwrap_err();
+        assert_eq!(failure.code, "DRIVER.TIMEOUT");
+        assert_eq!(failure.effect, "not_applied");
+        assert_eq!(backend.performed().len(), 2);
     }
 
     #[test]

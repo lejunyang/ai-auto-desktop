@@ -13,7 +13,8 @@
 use std::sync::Arc;
 
 use crate::backend::{
-    Backend, CaptureLimits, CapturedTree, DriverError, Pixels, PointerGesture, Recognition, Result,
+    ensure_input_deadline, Backend, CaptureLimits, CapturedTree, DriverError, Pixels,
+    PointerGesture, Recognition, Result,
 };
 use crate::capture::{CapturedEvent, EventBuffer, EventKind};
 use crate::model::{Bounds, Node, States, WindowInfo};
@@ -666,6 +667,21 @@ impl Backend for WindowsUiaBackend {
     }
 
     fn key_chord(&self, window_id: &str, node: &Node, keys: &[String]) -> Result<()> {
+        self.key_chord_with_deadline(
+            window_id,
+            node,
+            keys,
+            Instant::now() + Duration::from_secs(30),
+        )
+    }
+
+    fn key_chord_with_deadline(
+        &self,
+        window_id: &str,
+        node: &Node,
+        keys: &[String],
+        deadline: Instant,
+    ) -> Result<()> {
         // A chord lands on whatever holds focus, exactly like typing, so the
         // element is focused first. Without this a shortcut meant for one field
         // would fire against wherever focus happened to be.
@@ -673,6 +689,7 @@ impl Backend for WindowsUiaBackend {
         let chord = Chord::parse(keys)?;
         focus_for_keys(&self.automation, parse_window_id(window_id)?, &element)?;
         let inputs = chord.to_inputs();
+        ensure_input_deadline(deadline)?;
 
         // Press-and-release must arrive as one stream: splitting it lets another
         // source slip between a modifier going down and the key it modifies. And
@@ -718,6 +735,10 @@ impl Backend for WindowsUiaBackend {
         node: &Node,
         gesture: &PointerGesture,
     ) -> Result<()> {
+        let deadline = gesture
+            .deadline
+            .unwrap_or_else(|| Instant::now() + Duration::from_secs(30));
+        ensure_input_deadline(deadline)?;
         let (handle, _) = self.element_for(window_id)?;
         let point = element_point(node.bounds, gesture.fraction)?;
 
@@ -726,16 +747,24 @@ impl Backend for WindowsUiaBackend {
         bring_to_front(handle);
         self.ensure_hits(window_id, node, point)?;
         let absolute = to_absolute(point)?;
+        ensure_input_deadline(deadline)?;
 
         if let Some(scroll) = gesture.scroll {
             return Ok(deliver_scroll(absolute, scroll)?);
         }
         if let Some(dwell_ms) = gesture.hover_ms {
+            let dwell = Duration::from_millis(dwell_ms.min(MAX_HOVER_MS));
+            if deadline.saturating_duration_since(Instant::now()) < dwell {
+                return Err(DriverError::new(
+                    "DRIVER.TIMEOUT",
+                    "hover exceeds the remaining input deadline",
+                ));
+            }
             // Hover is a move and a wait: the point must be reached, then held
             // long enough for a tooltip or hover menu to appear.
             let move_to = [mouse_event(absolute, MOUSEEVENTF_MOVE)];
             deliver_atomically(&move_to, "the hover move")?;
-            std::thread::sleep(Duration::from_millis(dwell_ms.min(MAX_HOVER_MS)));
+            std::thread::sleep(dwell);
             return Ok(());
         }
 
@@ -750,6 +779,7 @@ impl Backend for WindowsUiaBackend {
         // batch is refused, sending the events in order is a faithful fallback,
         // as with pointer_click.
         ensure_pointer_modifier_focus(handle, &gesture.modifiers)?;
+        ensure_input_deadline(deadline)?;
         Ok(deliver_pointer(
             &inputs,
             &gesture.modifiers,
@@ -764,6 +794,10 @@ impl Backend for WindowsUiaBackend {
         to: &Node,
         gesture: &PointerGesture,
     ) -> Result<()> {
+        let deadline = gesture
+            .deadline
+            .unwrap_or_else(|| Instant::now() + Duration::from_secs(30));
+        ensure_input_deadline(deadline)?;
         let (handle, _) = self.element_for(window_id)?;
         let start_point = element_point(from.bounds, gesture.fraction)?;
         let end_point = element_point(to.bounds, gesture.to_fraction)?;
@@ -797,6 +831,7 @@ impl Backend for WindowsUiaBackend {
         // degrade to ordered single events. Any partial failure triggers a
         // best-effort button release and remains effect=unknown.
         ensure_pointer_modifier_focus(handle, &gesture.modifiers)?;
+        ensure_input_deadline(deadline)?;
         Ok(deliver_pointer(&inputs, &gesture.modifiers, "the drag")?)
     }
 

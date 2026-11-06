@@ -96,6 +96,17 @@ impl From<aad_platform::Error> for DriverError {
 
 pub type Result<T> = std::result::Result<T, DriverError>;
 
+pub fn ensure_input_deadline(deadline: Instant) -> Result<()> {
+    if Instant::now() >= deadline {
+        Err(DriverError::new(
+            "DRIVER.TIMEOUT",
+            "input deadline expired before dispatch",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 /// A window plus the element tree captured from it.
 #[derive(Clone, Debug)]
 pub struct CapturedTree {
@@ -142,6 +153,9 @@ impl CaptureLimits {
 /// what keeps the "observe first" rule intact for pointer actions too.
 #[derive(Clone, Debug, Default)]
 pub struct PointerGesture {
+    /// Internal execution deadline, derived by the provider from its timeout.
+    /// This is never accepted as a caller-supplied pointer field.
+    pub deadline: Option<Instant>,
     /// Which button. Defaults to the left button.
     pub button: PointerButton,
     /// 1 for a single click, 2 for a double click.
@@ -243,6 +257,19 @@ pub trait Backend: Send + Sync {
             "DRIVER.ACTION_UNSUPPORTED",
             "sending key combinations is not implemented on this platform yet",
         ))
+    }
+
+    /// Timed dispatch hook. Backends with multi-step input must keep checking
+    /// this deadline and release their own input before returning on failure.
+    fn key_chord_with_deadline(
+        &self,
+        window_id: &str,
+        node: &Node,
+        keys: &[String],
+        deadline: Instant,
+    ) -> Result<()> {
+        ensure_input_deadline(deadline)?;
+        self.key_chord(window_id, node, keys)
     }
 
     /// Perform a pointer gesture on a single element: a right or middle click, a
