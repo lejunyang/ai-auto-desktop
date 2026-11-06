@@ -75,6 +75,14 @@ plugins/linux_atspi/build_x11_capture_helper.sh
 
 ## 验证
 
+对于 Dolphin 这类遗漏内联编辑框的无障碍树，后端在观察前只订阅当前应用唯一 D-Bus sender
+的 focused 事件，不退为全桌面订阅。事件只提供对象引用；随后仍须核对连接 PID、GetApplication、
+完整父链、真实 Text/Entry/PasswordText 角色、EditableText 接口、当前焦点及几何包含关系，
+才能把编辑框补入观察。PasswordText 不读取 value；缺失的中间父节点仅作只读 context，
+不能用于操作、find、截图或扩大 scope。切换应用和关闭后端时退出监听。
+尚未开始观察前就已打开、且之后没有发焦点事件的编辑框不保证发现。
+本机 Dolphin 已完成 F2→发现编辑框→中文重命名→磁盘回读；虚拟 table 的不完整父链仍拒绝 scope。
+
 CI 在私有 Xvfb、session bus 和 AT-SPI bus 中编译 Qt5 C++ fixture，并使用正式 Rust provider
 验证应用枚举、snapshot/find、set_text、XTest Unicode 输入、中心点点击和目标截图：
 

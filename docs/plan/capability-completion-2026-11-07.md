@@ -16,11 +16,11 @@
 
 | 项目 | 完成条件 | 状态与证据 |
 | --- | --- | --- |
-| 原生观察恢复 | 过滤规范 AT-SPI null 引用；输出具体截断原因；从已观察窗口/容器抓完整子树，动作复核也限定同一 scope；Dolphin/Electron 实测恢复合法操作 | null/截断诊断、局部观察已提交；Dolphin 整树完整，Code/Codex 局部定位及刷新通过；Qt scoped click 状态回读通过。Dolphin 激活、指针、选择已通过；其 F2 内联编辑框仍未被 AX 暴露，Electron 指针待继续验收 |
+| 原生观察恢复 | 过滤规范 AT-SPI null 引用；输出具体截断原因；从已观察窗口/容器抓完整子树，动作复核也限定同一 scope；Dolphin/Electron 实测恢复合法操作 | null/截断诊断、局部观察已提交；Code/Codex 局部定位及刷新、Qt scoped click 通过。`e5f4f38` 以本应用焦点事件补充真实编辑框，Dolphin F2→中文重命名→磁盘回读通过；虚拟 table 父链不完整的 scope 仍拒绝。Electron 编辑/保存闭环待完成 |
 | 焦点与 QML 可见性 | KWrite 已聚焦而 GrabFocus=false 时仍可安全验证并输入；设置搜索框在可见性元数据不一致时有受控输入路径；编辑保存与设置搜索实际回读 | 已提交 `f2282a5`；KWrite 中文编辑保存后磁盘回读一致，设置搜索“快捷键”截图与值回读一致，并打开匹配页面 |
 | 原生粘贴与 IME | KDE 原生 paste 实际输入成功并恢复原剪贴板；明确输入法条件，补充可工作的中文输入路径与诊断 | 已提交 `8421506`、`51a72ca`；隔离 X11 协议回归、KDE Qt/KWrite/QML 中文粘贴成功且恢复剪贴板。helper 无内容诊断与派发前错误已正确传递；复杂 IME 覆盖待补齐 |
 | 浏览器局部观察 | 范围外无关 DOM 更新不误判 stale；范围内改动、身份替换、相关布局变化仍拒绝；大型页面可局部操作 | 已提交 `e8b8959`、`368177c`；Chromium 实测外部 ticker、相关 stale 拒绝、无 HTML id 的 scope_target、shadow root、scope token 刷新及 act.verify |
-| 手势表达 | 同元素不同位置拖动、修饰键点击/拖动、有界按住和路径、跨资源拖拽具有完整端点复核与释放保证；真实效果验收 | 浏览器同 surface drag `d350c7b`、原生同元素 `9274fee`、三端与浏览器修饰键 `e46829b` 已提交；Chromium 可信事件与像素、Dolphin Ctrl 多选和框选通过，随后普通点击恢复单选。有界按住已接入，Qt 独立计时及 Chromium 实测通过；Windows/macOS 待真机验收。路径、跨资源与原生会话即时取消待完成 |
+| 手势表达 | 同元素不同位置拖动、修饰键点击/拖动、有界按住和路径、跨资源拖拽具有完整端点复核与释放保证；真实效果验收 | 浏览器同 surface drag `d350c7b`、原生同元素 `9274fee`、三端与浏览器修饰键 `e46829b`、有界按住 `d314931` 已提交；Qt/Chromium 与 Dolphin 选择手势实测通过。路径接口及 Windows/macOS 实现 `4b10562` 已提交，目标 cfg 检查通过，真机效果待验；Linux/browser 路径、跨资源与原生会话即时取消待完成 |
 | 视觉与自绘恢复 | Canvas/自绘/closed shadow 等缺乏语义控件时，通过可校验 surface 完成视觉操作；保留保护区域与命中限制 | Canvas trusted click/hover/scroll/drag 已提交 `d350c7b`，像素与可信事件回读通过；原生非 Focusable 指针 `31cf35a` 已在 Dolphin 验证，显式激活 `76cd6e1` 通过。closed shadow 等待完成 |
 | 保密输入 | 显式授权的 protected 输入与保密读取分离；三端/browser 策略一致，日志与录制不泄漏值，合成密码框验收 | `008974d` 已提交即时 secret_ref 授权路径；Qt 密码数字角色、替换/清空与独立状态回读通过，Chromium 21 项含敏感 DOM 身份恢复通过。普通输入不能绕过，持久化入口拒绝专用动作，子进程不继承绑定环境变量。Windows/macOS 实际效果 **[待真机验收]**；系统凭据库与保密工作流未实现 |
 | 浏览器键盘与浏览器自身界面 | 页面编辑器快捷键与浏览器级动作分开；补明确授权的浏览器内部/本地页面操作路径，并明确非 Chromium 覆盖 | 页面快捷键隔离 `1a3bb77` 已提交；有界面 Chromium 18 组 Ctrl 组合只送页面、不误触浏览器 UI 的验收及异常 keyUp 通过，完整回归 23/23。内部/本地页面授权与非 Chromium 后端待完成 |
@@ -53,6 +53,7 @@
 - 浏览器原始日志位于 `artifacts/capability-audit-2026-11-07/`；页面键另有 `browser-page-keys-headed.log`、`browser-page-key-timeout.log`、`browser-page-keys-full.log`。有界面用例用 AT-SPI 独立回读焦点和窗口集合，不只验证 DOM 事件。
 - `dolphin/rename-component-probe.json`：重命名状态对已观察 cell 及其祖先，在文件图标/文字区域做只读 GetAccessibleAtPoint；仅返回现有 table 或 AT-SPI null，没有恢复出编辑控件，重命名仍未完成。
 - `dolphin-focused-event/focused-event-summary.json`：仅订阅本次启动 Dolphin 的焦点事件，取得整树遗漏的真实 text/EditableText 控件；独立核对 PID、GetApplication、父链及尺寸通过。此时仅证明恢复路线，尚未算作重命名成功。
+- `dolphin-focus-recovery/summary.json`：恢复实现后的正式 CLI 实测发现 focused/editable Text，补入的一个父链 context 保持只读；fill 中文文件名再 Enter，磁盘新名存在、旧名消失且内容一致。另一个 table scope 因虚拟父链断开安全拒绝，不能称所有 Dolphin scope 都可用。
 - `hold-kde/summary.json`：`verify-bounded-hold.ps1` 请求 200 ms，Qt 应用独立记录 F2 按下至释放 205 ms、按钮 201 ms、拖拽第一次移动 205 ms/释放 405 ms。此前可打印字母用例未收到计时状态，不能据此宣称 IME 长按已通过；改用 F2 隔离输入法影响。
 - `hold-helpers/validation.json`：私有 Xvfb 独立回读键鼠状态与时序；长按、截止时间、helper 终止、焦点/遮挡变化后的释放，以及不接管外部已按住的键鼠通过。helper 终止不等于 `control_cancel`，原生 provider 的即时取消传播仍待实现。
 - `browser-hold-targeted.log`、`browser-hold-full.log`：真实 Chromium 长按、拖拽起点停留、预算不足、焦点变化、遮挡和会话取消后的释放通过，功能提交前完整回归 24/24；日志同样位于 `artifacts/capability-audit-2026-11-07/`。
