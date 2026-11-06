@@ -74,10 +74,25 @@ session、用主 frame 坐标：先把各层 frame 宿主元素滚进视口，�
 由浏览器送到焦点 frame。截图 `control_capture` 仍只限主 frame。
 DOM click/fill 的事件 `isTrusted=false`，并不等价于原生指针或真实逐键输入；需要 `isTrusted=true` 的页面，
 给 click 一个 `fraction`（例如 0.5/0.5）走可信指针。可信指针先把元素滚进视口，再用 `elementFromPoint`
-确认落点命中该元素，盖着别的元素时返回 `CONTROL.OCCLUDED` 且不发送任何输入。`navigate` 只接受 http/https，
-不能打开 `file:`、`javascript:` 等地址。
+确认落点命中该元素，盖着别的元素时返回 `CONTROL.OCCLUDED` 且不发送任何输入。
+`navigate` 默认只接受 http/https；操作者可在服务器启动时显式授予本地文件目录或浏览器内部来源：
 
-标签页与弹窗：`open_tab`（要 `url`，同样只接受 http/https）在浏览器里新开一个标签页，答复里带新页面的 `page_id`；
+```powershell
+aad mcp --browser-port 9222 --allow-input `
+  --allow-browser-file-dir /absolute/path/to/test-pages `
+  --allow-browser-internal-origin chrome://settings
+```
+
+两个授权参数均可重复。目录必须已存在；只接受其内可访问的普通文件，按 canonical 路径检查，
+拒绝目录索引、远程 file 主机和越界符号链接。内部来源必须是明确的 `chrome://host`、`edge://host`
+或 `chrome-extension://id`，不支持通配符；来源内路径、查询和 fragment 可以变化。
+`javascript:`、`data:`、`blob:` 不能作为 navigate/open_tab 目标。当前已存在的普通 data 文档仍可观察。
+未授权页面在 targets 中保留诊断、动作能力为空；观察/操作前复核当前文档及其祖先 frame 的授权，
+截图还检查可能包含的子 frame。授权不保证浏览器允许该特权页面使用 CDP 隔离 world，后端拒绝时不会改走任意脚本。
+这是本项目的文档访问门禁，不是浏览器文件系统或网络沙箱：页面脚本、资源加载仍遵循浏览器自身权限。
+本机已验收本地 HTML 的实际点击与越界拒绝、`chrome://version` 观察，以及 `chrome://settings` 打开搜索框并输入后回读。
+
+标签页与弹窗：`open_tab`（要 `url`，使用与 navigate 相同的服务器授权）在浏览器里新开一个标签页，答复里带新页面的 `page_id`；
 `activate_page` 把被观察的页面切到前台，`close_page` 关闭它。三者都先在观察到的文档里确认 body 节点仍有效，
 再经浏览器级连接（`/json/version` 给出的 `/devtools/browser/<id>`，固定连 127.0.0.1）发送 `Target.createTarget`、
 `Target.activateTarget`、`Target.closeTarget`。页面自己打开的标签页或弹窗（`window.open`、`target=_blank`、
