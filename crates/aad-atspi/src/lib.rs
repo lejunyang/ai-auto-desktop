@@ -1674,6 +1674,17 @@ impl AtspiProvider {
         deadline: Instant,
     ) -> Result<(Vec<u8>, Map<String, Value>), AutomationError> {
         let (fresh, fresh_id, node, native) = self.fresh_target(args, deadline)?;
+        let expanded = self.private_window_record(&fresh, &fresh_id, "capture", deadline)?;
+        let (visibility, visibility_id) = expanded
+            .as_ref()
+            .map(|(record, id)| (record, id.as_str()))
+            .unwrap_or((&fresh, fresh_id.as_str()));
+        let node = visibility.public["nodes"]
+            .as_array()
+            .expect("normalized nodes")
+            .iter()
+            .find(|node| node["node_id"] == visibility_id)
+            .unwrap_or(&node);
         let states = node["states"].as_object().expect("normalized states");
         if !["visible", "showing"]
             .iter()
@@ -1684,28 +1695,6 @@ impl AtspiProvider {
                 "capture_target requires a visible, showing target",
             ));
         }
-        let descendants = descendants(&fresh, &fresh_id);
-        let unsafe_node = fresh.public["nodes"]
-            .as_array()
-            .expect("normalized nodes")
-            .iter()
-            .find(|candidate| {
-                candidate["node_id"]
-                    .as_str()
-                    .is_some_and(|id| descendants.contains(id))
-                    && (candidate["provenance"]["value_redacted"] != false
-                        || candidate["states"]["protected"] != false
-                        || matches!(
-                            candidate["role"].as_str(),
-                            Some("password_text" | "password")
-                        ))
-            });
-        if unsafe_node.is_some() {
-            return Err(driver_error(
-                "DRIVER.PROTECTED_ELEMENT",
-                "capture target is not proven free of protected content",
-            ));
-        }
         let bounds = parse_bounds(node.get("bounds"))?;
         if bounds.width <= 0 || bounds.height <= 0 {
             return Err(driver_error(
@@ -1713,15 +1702,54 @@ impl AtspiProvider {
                 "capture target has no positive-area bounds",
             ));
         }
+        let descendants = descendants(visibility, visibility_id);
+        let unsafe_node = visibility.public["nodes"]
+            .as_array()
+            .expect("normalized nodes")
+            .iter()
+            .find(|candidate| {
+                let protected = candidate["provenance"]["value_redacted"] != false
+                    || candidate["states"]["protected"] != false
+                    || matches!(
+                        candidate["role"].as_str(),
+                        Some("password_text" | "password")
+                    );
+                let within = candidate["node_id"]
+                    .as_str()
+                    .is_some_and(|id| descendants.contains(id));
+                // A protected sibling may be painted into the target rectangle.
+                // Qt can misreport visible/showing, so those flags cannot clear
+                // protection. Missing geometry cannot prove it lies outside.
+                protected
+                    && (within
+                        || parse_bounds(candidate.get("bounds"))
+                            .map(|candidate_bounds| {
+                                candidate_bounds.width <= 0
+                                    || candidate_bounds.height <= 0
+                                    || overlaps(bounds, candidate_bounds)
+                            })
+                            .unwrap_or(true))
+            });
+        if unsafe_node.is_some() {
+            return Err(driver_error(
+                "DRIVER.PROTECTED_ELEMENT",
+                "capture rectangle is not proven free of protected content in its window",
+            )
+            .with_detail("check", json!("capture_window_protection")));
+        }
         self.validate_point(
-            &fresh,
-            &fresh_id,
+            visibility,
+            visibility_id,
             (bounds.x + bounds.width / 2, bounds.y + bounds.height / 2),
             deadline,
         )?;
-        for candidate in fresh.public["nodes"].as_array().expect("normalized nodes") {
+        let ancestors = ancestors(visibility, visibility_id);
+        for candidate in visibility.public["nodes"]
+            .as_array()
+            .expect("normalized nodes")
+        {
             let id = candidate["node_id"].as_str().unwrap_or_default();
-            if descendants.contains(id) || ancestors(&fresh, &fresh_id).contains(id) {
+            if descendants.contains(id) || ancestors.contains(id) {
                 continue;
             }
             if let Ok(candidate_bounds) = parse_bounds(candidate.get("bounds")) {
@@ -1732,11 +1760,15 @@ impl AtspiProvider {
                         "DRIVER.ACTION_UNSUPPORTED",
                         "capture target overlaps a visible node outside its subtree",
                     )
-                    .with_detail("overlapping_node_id", json!(id)));
+                    .with_detail("check", json!("capture_window_occlusion")));
                 }
             }
         }
-        let process = process_id(&node, &fresh)?;
+        let process = process_id(node, &fresh)?;
+        remaining(deadline, false)?;
+        if let Some(token) = &self.cancellation {
+            token.check()?;
+        }
         let (png, mut provenance) = self
             .backend
             .capture_target(&native, bounds, process, deadline)?;
@@ -1744,6 +1776,7 @@ impl AtspiProvider {
         provenance.insert("revision".into(), fresh.public["revision"].clone());
         provenance.insert("node_id".into(), json!(fresh_id));
         provenance.insert("application_process_id".into(), json!(process));
+        provenance.insert("private_window_checked".into(), json!(expanded.is_some()));
         Ok((png, provenance))
     }
 
@@ -1753,11 +1786,50 @@ impl AtspiProvider {
         node_id: &str,
         deadline: Instant,
     ) -> Result<Option<(Record, String)>, AutomationError> {
+        let expanded = self.private_window_record(record, node_id, "drag", deadline)?;
+        if let Some((visibility, id)) = &expanded {
+            let node = visibility.public["nodes"]
+                .as_array()
+                .expect("normalized nodes")
+                .iter()
+                .find(|node| node["node_id"] == *id)
+                .expect("normalized handle");
+            if node["states"]["protected"] == true
+                || node["states"]["enabled"] == false
+                || node["states"]["sensitive"] == false
+                || !node["actions"]
+                    .as_array()
+                    .is_some_and(|actions| actions.iter().any(|a| a == "drag"))
+            {
+                return Err(stale(
+                    "drag surface input state changed during window capture",
+                ));
+            }
+        }
+        Ok(expanded)
+    }
+
+    /// Read the complete containing window without publishing nodes or granting
+    /// membership outside the observed scope. This only establishes visibility.
+    fn private_window_record(
+        &self,
+        record: &Record,
+        node_id: &str,
+        purpose: &str,
+        deadline: Instant,
+    ) -> Result<Option<(Record, String)>, AutomationError> {
+        remaining(deadline, false)?;
+        if let Some(token) = &self.cancellation {
+            token.check()?;
+        }
         let Some(scope) = &record.scope else {
             return Ok(None);
         };
-        let window = input_window(record, node_id)
-            .ok_or_else(|| stale("scoped drag has no observed containing window"))?;
+        let window = input_window(record, node_id).ok_or_else(|| {
+            stale(format!(
+                "scoped {purpose} has no observed containing window"
+            ))
+        })?;
         if scope.root == window.native {
             return Ok(None);
         }
@@ -1765,8 +1837,8 @@ impl AtspiProvider {
             .handles
             .iter()
             .find_map(|(id, native)| (native == &window.native).then_some(id))
-            .ok_or_else(|| stale("drag window was not observed"))?;
-        let visibility = self.capture_scoped(
+            .ok_or_else(|| stale(format!("{purpose} window was not observed")))?;
+        let visibility = self.private_validator().capture_scoped(
             &record.application_selector,
             MAX_DEPTH,
             MAX_NODES,
@@ -1778,11 +1850,14 @@ impl AtspiProvider {
             }),
             deadline,
         )?;
+        if let Some(token) = &self.cancellation {
+            token.check()?;
+        }
         if visibility.public["truncated"] == true {
             return Err(driver_error(
                 "DRIVER.SNAPSHOT_TRUNCATED",
-                "drag occlusion window capture is incomplete",
-            ));
+                format!("{purpose} requires a complete containing-window observation for protection and occlusion checks"),
+            ).with_detail("check", json!("containing_window_completeness")));
         }
         let matching = visibility
             .handles
@@ -1790,7 +1865,9 @@ impl AtspiProvider {
             .filter_map(|(id, native)| (native == &record.handles[node_id]).then_some(id.clone()))
             .collect::<Vec<_>>();
         let [id] = matching.as_slice() else {
-            return Err(stale("drag surface identity changed during window capture"));
+            return Err(stale(format!(
+                "{purpose} target identity changed during window capture"
+            )));
         };
         let node = visibility.public["nodes"]
             .as_array()
@@ -1807,18 +1884,12 @@ impl AtspiProvider {
         let observed_window = input_window(&visibility, id);
         if visibility.fingerprints[id] != record.fingerprints[node_id]
             || parse_bounds(node.get("bounds"))? != parse_bounds(original_node.get("bounds"))?
-            || node["states"]["protected"] == true
-            || node["states"]["enabled"] == false
-            || node["states"]["sensitive"] == false
-            || !node["actions"]
-                .as_array()
-                .is_some_and(|actions| actions.iter().any(|a| a == "drag"))
             || observed_window.as_ref().map(|w| (&w.native, w.bounds))
                 != Some((&window.native, window.bounds))
         {
-            return Err(stale(
-                "drag surface or window changed during occlusion capture",
-            ));
+            return Err(stale(format!(
+                "{purpose} target or window changed during occlusion capture"
+            )));
         }
         Ok(Some((visibility, id.clone())))
     }
@@ -3311,6 +3382,7 @@ mod tests {
     struct FakeBackend {
         captures: Arc<AtomicUsize>,
         scoped_captures: Arc<AtomicUsize>,
+        pixel_captures: Arc<AtomicUsize>,
         writes: Arc<AtomicUsize>,
         cancellation: Option<CancellationToken>,
         cancel_in_capture: bool,
@@ -3336,6 +3408,8 @@ mod tests {
         path_supported: bool,
         path_changed_after: usize,
         path_window_visibility: u8,
+        capture_only_target: bool,
+        cancel_in_window_capture: bool,
         cross_supported: bool,
         /// Containers above the target, which is then `n{depth}`.
         depth: usize,
@@ -3517,6 +3591,9 @@ mod tests {
                 })
                 .collect::<Vec<_>>();
             let mut target = self.node(path);
+            if self.capture_only_target {
+                target.actions.clear();
+            }
             target.parent_index = self.depth.checked_sub(1);
             nodes.push(target);
             if self.alias {
@@ -3563,12 +3640,35 @@ mod tests {
             if self.path_window_visibility != 0 || self.cross_supported {
                 let mut snapshot = self.capture(_application, _max_depth, _max_nodes, _deadline)?;
                 if root.object_path == "/chain/1" {
-                    if self.path_window_visibility == 2 {
+                    if self.cancel_in_window_capture {
+                        if let Some(token) = &self.cancellation {
+                            token.cancel();
+                            token.check()?;
+                        }
+                    }
+                    if matches!(self.path_window_visibility, 2 | 4 | 5 | 6) {
                         let mut overlay = self.node("/window/overlay");
                         overlay.name = Some("Disabled covering sibling".into());
                         overlay.parent_index = Some(1);
                         overlay.states.insert("enabled".into(), Some(false));
+                        if self.path_window_visibility >= 4 {
+                            overlay.role = "password text".into();
+                            overlay.states.insert("protected".into(), Some(true));
+                            // Qt can expose a visible QML control with false
+                            // visible/showing flags: they cannot unprotect it.
+                            overlay.states.insert("visible".into(), Some(false));
+                            overlay.states.insert("showing".into(), Some(false));
+                        }
+                        if self.path_window_visibility == 5 {
+                            overlay.bounds = None;
+                        }
+                        if self.path_window_visibility == 6 {
+                            overlay.bounds.as_mut().unwrap().x += 100;
+                        }
                         snapshot.nodes.push(overlay);
+                    }
+                    if self.path_window_visibility == 7 {
+                        snapshot.nodes[2].bounds.as_mut().unwrap().x += 1;
                     }
                     snapshot.truncated = self.path_window_visibility == 3;
                 }
@@ -3921,6 +4021,7 @@ mod tests {
             process_id: u32,
             _deadline: Instant,
         ) -> Result<(Vec<u8>, Map<String, Value>), AutomationError> {
+            self.pixel_captures.fetch_add(1, Ordering::SeqCst);
             const PNG: &[u8] = &[
                 137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0,
                 1, 8, 4, 0, 0, 0, 181, 28, 12, 2, 0, 0, 0, 11, 73, 68, 65, 84, 120, 218, 99, 100,
@@ -5302,6 +5403,112 @@ mod tests {
         assert_eq!(result["frame"]["kind"], "ArtifactRef");
         assert!(result["frame"].get("path").is_none());
         assert!(!store.resolve(&result["frame"]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn scoped_capture_checks_private_window_before_reading_pixels() {
+        for mode in 1..=7 {
+            let backend = Arc::new(FakeBackend {
+                depth: 2,
+                path_window_visibility: mode,
+                capture_only_target: true,
+                ..Default::default()
+            });
+            let provider = AtspiProvider::new(backend.clone()).unwrap();
+            let initial = take_snapshot(&provider);
+            let scoped = provider.invoke("desktop.linux_atspi.snapshot_scope@1", json!({
+                "target":{"snapshot_id":initial["snapshot_id"],"revision":initial["revision"],"node_id":"n2"},
+                "locator":locator()
+            }), Some(Duration::from_secs(2))).unwrap();
+            let args = json!({"target":{"snapshot_id":scoped["snapshot_id"],"revision":scoped["revision"],"node_id":"n2"},"locator":locator()});
+            let result = provider.invoke(
+                "desktop.linux_atspi.capture@1",
+                args,
+                Some(Duration::from_secs(2)),
+            );
+            if matches!(mode, 1 | 6) {
+                result.unwrap();
+                assert_eq!(backend.pixel_captures.load(Ordering::SeqCst), 1);
+            } else {
+                let error = result.unwrap_err();
+                assert_eq!(
+                    error.code,
+                    match mode {
+                        2 => "DRIVER.ACTION_UNSUPPORTED",
+                        3 => "DRIVER.SNAPSHOT_TRUNCATED",
+                        4 | 5 => "DRIVER.PROTECTED_ELEMENT",
+                        _ => "DRIVER.STALE_SNAPSHOT",
+                    }
+                );
+                assert_eq!(
+                    backend.pixel_captures.load(Ordering::SeqCst),
+                    0,
+                    "mode {mode}: unsafe pixels must never reach the backend"
+                );
+            }
+            let state = provider.state.lock().unwrap();
+            assert_eq!(
+                state.revision, 3,
+                "private window observation must not publish"
+            );
+            let current = state.current.as_ref().unwrap();
+            assert_eq!(current.public["snapshot_id"], scoped["snapshot_id"]);
+            assert_eq!(current.members, BTreeSet::from(["n2".to_string()]));
+            assert_eq!(
+                current.scope.as_ref().unwrap().root.object_path,
+                "/org/a11y/save"
+            );
+        }
+    }
+
+    #[test]
+    fn scoped_capture_cancellation_is_private_and_does_not_poison_the_next_call() {
+        let backend = Arc::new(FakeBackend {
+            depth: 2,
+            path_window_visibility: 1,
+            cancel_in_window_capture: true,
+            ..Default::default()
+        });
+        let lifetime = Arc::strong_count(&backend.subscription_lifetime);
+        let provider = AtspiProvider::new(backend.clone()).unwrap();
+        let initial = take_snapshot(&provider);
+        let scoped = provider.invoke("desktop.linux_atspi.snapshot_scope@1", json!({
+            "target":{"snapshot_id":initial["snapshot_id"],"revision":initial["revision"],"node_id":"n2"},
+            "locator":locator()
+        }), Some(Duration::from_secs(2))).unwrap();
+        let args = json!({"target":{"snapshot_id":scoped["snapshot_id"],"revision":scoped["revision"],"node_id":"n2"},"locator":locator()});
+        let token = CancellationToken::new();
+        let result = provider
+            .invoke_cancellable(
+                "desktop.linux_atspi.capture@1",
+                args.clone(),
+                Some(Duration::from_secs(2)),
+                &token,
+            )
+            .unwrap_err();
+        assert_eq!(result.code, "DRIVER.CANCELLED");
+        assert_eq!(backend.pixel_captures.load(Ordering::SeqCst), 0);
+        assert!(backend.cancellation.is_none());
+        assert_eq!(Arc::strong_count(&backend.subscription_lifetime), lifetime);
+        provider
+            .invoke(
+                "desktop.linux_atspi.capture@1",
+                args,
+                Some(Duration::from_secs(2)),
+            )
+            .unwrap();
+        assert_eq!(backend.pixel_captures.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            provider
+                .state
+                .lock()
+                .unwrap()
+                .current
+                .as_ref()
+                .unwrap()
+                .public["snapshot_id"],
+            scoped["snapshot_id"]
+        );
     }
 
     #[test]
