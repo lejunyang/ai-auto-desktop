@@ -67,6 +67,19 @@ struct Request<'a> {
     action: Option<&'a Context>,
 }
 impl Request<'_> {
+    fn hold_budget(&self, hold_ms: Option<u64>) -> Result<()> {
+        self.remaining()?;
+        if hold_ms.is_some_and(|ms| {
+            self.deadline.saturating_duration_since(Instant::now())
+                < Duration::from_millis(ms.saturating_add(50))
+        }) {
+            return Err(error(
+                "CONTROL.TIMEOUT",
+                "Firefox hold exceeds the remaining request budget",
+            ));
+        }
+        Ok(())
+    }
     fn remaining(&self) -> Result<()> {
         if let Some(context) = self.action {
             context.remaining()?;
@@ -431,6 +444,53 @@ impl FirefoxBackend {
                 None,
             )
             .is_ok()
+    }
+    fn hold(
+        &self,
+        client: &mut Client,
+        snapshot: &Value,
+        args: &Value,
+        point: Option<(i64, i64)>,
+        request: &Request<'_>,
+        hold_ms: Option<u64>,
+    ) -> Result<()> {
+        let Some(ms) = hold_ms else {
+            return Ok(());
+        };
+        let until = Instant::now() + Duration::from_millis(ms);
+        loop {
+            let (_, realm) = self.input_check(client, snapshot, args, request)?;
+            if let Some((x, y)) = point {
+                let current = request.value(
+                    client,
+                    &realm,
+                    &format!("globalThis.__aadBidiV1.point({args})"),
+                )?;
+                if current["x"] != x || current["y"] != y {
+                    return Err(error(
+                        "CONTROL.STALE_TARGET",
+                        "Firefox held pointer anchor moved",
+                    ));
+                }
+            } else if request.value(
+                client,
+                &realm,
+                &format!("globalThis.__aadControlV1.verify({args})"),
+            )?["ok"]
+                != true
+            {
+                return Err(error(
+                    "CONTROL.FOCUS_FAILED",
+                    "Firefox focus left the held key anchor",
+                ));
+            }
+            request.remaining()?;
+            let left = until.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Ok(());
+            }
+            std::thread::sleep(left.min(Duration::from_millis(10)));
+        }
     }
     fn navigate(
         &self,
@@ -819,7 +879,10 @@ impl Backend for FirefoxBackend {
                                 &id,
                                 json!({"type":"pointerMove","x":x,"y":y,"origin":"viewport","duration":0}),
                             )?;
-                            if let Action::Click { button, .. } = action {
+                            if let Action::Click {
+                                button, hold_ms, ..
+                            } = action
+                            {
                                 self.input_check(client, snapshot, &args, &request)?;
                                 let current = request.value(
                                     client,
@@ -838,11 +901,20 @@ impl Backend for FirefoxBackend {
                                     Button::Middle => 1,
                                     Button::Right => 2,
                                 };
+                                request.hold_budget(*hold_ms)?;
                                 pointer(
                                     client,
                                     &request,
                                     &id,
                                     json!({"type":"pointerDown","button":button}),
+                                )?;
+                                self.hold(
+                                    client,
+                                    snapshot,
+                                    &args,
+                                    Some((x, y)),
+                                    &request,
+                                    *hold_ms,
                                 )?;
                                 self.input_check(client, snapshot, &args, &request)?;
                                 request.commit()?;
@@ -870,6 +942,10 @@ impl Backend for FirefoxBackend {
                 }
             }
             Action::Key { .. } | Action::TypeText { .. } => {
+                let hold_ms = match action {
+                    Action::Key { hold_ms, .. } => *hold_ms,
+                    _ => None,
+                };
                 let chords = match action {
                     Action::Key { keys, .. } => vec![key_values(keys)?],
                     Action::TypeText { text, .. } => {
@@ -885,6 +961,7 @@ impl Backend for FirefoxBackend {
                 )?;
                 let result = (|| {
                     for chord in chords {
+                        request.hold_budget(hold_ms)?;
                         self.input_check(client, snapshot, &args, &request)?;
                         if request.value(
                             client,
@@ -912,9 +989,11 @@ impl Backend for FirefoxBackend {
                                     "Firefox focus left the observed element",
                                 ));
                             }
+                            request.hold_budget(hold_ms)?;
                             request.commit()?;
                             keyboard(client, &request, &id, "keyDown", key)?;
                         }
+                        self.hold(client, snapshot, &args, None, &request, hold_ms)?;
                         for key in chord.iter().rev() {
                             self.input_check(client, snapshot, &args, &request)?;
                             request.commit()?;
@@ -1007,9 +1086,16 @@ fn validate_action(action: &Action) -> Result<()> {
             hold_ms,
             count,
             ..
-        } if modifiers.is_empty() && hold_ms.is_none() && count.unwrap_or(1) == 1 => Ok(()),
+        } if modifiers.is_empty()
+            && hold_ms.is_none_or(|ms| (1..=5000).contains(&ms))
+            && count.unwrap_or(1) == 1 =>
+        {
+            Ok(())
+        }
         Action::Hover { ms, .. } if ms.is_none() => Ok(()),
-        Action::Key { keys, hold_ms } if hold_ms.is_none() => key_values(keys).map(|_| ()),
+        Action::Key { keys, hold_ms } if hold_ms.is_none_or(|ms| (1..=5000).contains(&ms)) => {
+            key_values(keys).map(|_| ())
+        }
         Action::TypeText { text, mode }
             if *mode == Some(TypeMode::Keys)
                 && text
@@ -1036,7 +1122,7 @@ mod tests {
         .is_err());
         assert!(validate_action(&Action::Key {
             keys: vec!["a".into()],
-            hold_ms: Some(1)
+            hold_ms: Some(5001)
         })
         .is_err());
         assert!(validate_action(&Action::TypeText {
