@@ -1820,6 +1820,39 @@ bool SameClient(Display *display, Window requestor, Window pid_window,
            (requestor & ~mask.value()) == (pid_window & ~mask.value());
 }
 
+enum class PasteReply { Metadata, Text, Rejected, Unsupported, WriteFailed };
+
+PasteReply ServePaste(const Selection &selection, const XSelectionRequestEvent &request,
+                     const std::vector<Item> &offer, Window pid_window,
+                     std::optional<XID> mask, unsigned long pid, Atom pid_atom) {
+    const bool target_client = SameClient(selection.display, request.requestor, pid_window,
+                                          mask, pid, pid_atom);
+    // Klipper's "prevent empty clipboard" restores its previous item when a
+    // denied TARGETS conversion looks empty, taking ownership before the target
+    // can paste. Give other clients a nonempty, content-free offer: only the KDE
+    // private-content marker. Text and its format list remain target-only.
+    // The marker also keeps supporting clipboard managers from storing the text.
+    const std::vector<Item> metadata = {
+        {selection.password_hint, selection.password_hint, 8, "secret"},
+    };
+    if (request.target == selection.targets || request.target == selection.password_hint) {
+        Serve(selection, request, target_client ? offer : metadata);
+        return PasteReply::Metadata;
+    }
+    if (!target_client) {
+        Reply(selection.display, request, None);
+        return PasteReply::Rejected;
+    }
+    const bool supported = std::any_of(
+        offer.begin(), offer.end(),
+        [&](const Item &item) { return item.target == request.target; });
+    const bool served = Serve(selection, request, offer);
+    if (!supported) {
+        return PasteReply::Unsupported;
+    }
+    return served ? PasteReply::Text : PasteReply::WriteFailed;
+}
+
 // The focused window's ancestor that carries the expected pid.
 Window FocusedPidWindow(Display *display, unsigned long pid, Atom pid_atom) {
     Window focus = None;
@@ -1906,6 +1939,7 @@ int RunPaste(int argc, char **argv) {
         {selection.utf8, selection.utf8, 8, *text},
         {selection.plain_utf8, selection.plain_utf8, 8, *text},
         {selection.text, selection.utf8, 8, *text},
+        {selection.password_hint, selection.password_hint, 8, "secret"},
     };
     const Time time = ServerTime(selection);
     XSetSelectionOwner(display, selection.clipboard, selection.window, time);
@@ -1946,6 +1980,14 @@ int RunPaste(int argc, char **argv) {
     // Serve the text only to the expected process; wait (bounded) for it.
     bool consumed = false;
     bool lost = false;
+    unsigned int selection_requests = 0;
+    unsigned int accepted_requests = 0;
+    unsigned int rejected_requests = 0;
+    unsigned int targets_requests = 0;
+    unsigned int metadata_requests = 0;
+    unsigned int text_requests = 0;
+    unsigned int unsupported_requests = 0;
+    unsigned int failed_writes = 0;
     const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(2);
     while (!consumed && !lost && !DeadlineExpired(deadline.value()) &&
            std::chrono::steady_clock::now() < until) {
@@ -1956,12 +1998,18 @@ int RunPaste(int argc, char **argv) {
                 lost = true;
             } else if (event.type == SelectionRequest) {
                 const auto &request = event.xselectionrequest;
-                if (SameClient(display, request.requestor, pid_window, mask,
-                               static_cast<unsigned long>(pid.value()), pid_atom)) {
-                    consumed = Serve(selection, request, offer);
-                } else {
-                    Reply(display, request, None);
-                }
+                ++selection_requests;
+                const PasteReply reply = ServePaste(
+                    selection, request, offer, pid_window, mask,
+                    static_cast<unsigned long>(pid.value()), pid_atom);
+                consumed = reply == PasteReply::Text;
+                rejected_requests += reply == PasteReply::Rejected;
+                accepted_requests += reply != PasteReply::Rejected;
+                targets_requests += request.target == selection.targets;
+                metadata_requests += reply == PasteReply::Metadata;
+                text_requests += consumed || reply == PasteReply::WriteFailed;
+                unsupported_requests += reply == PasteReply::Unsupported;
+                failed_writes += reply == PasteReply::WriteFailed;
             }
         }
         pollfd fds[1] = {{ConnectionNumber(display), POLLIN, 0}};
@@ -1973,7 +2021,20 @@ int RunPaste(int argc, char **argv) {
     XDestroyWindow(display, selection.window);
     XCloseDisplay(display);
     std::cout << "{\"ok\":true,\"dispatch_started\":true,\"events\":4,\"consumed\":"
-              << (consumed ? "true" : "false") << ",\"restored\":\"" << restored << "\"}"
+              << (consumed ? "true" : "false") << ",\"restored\":\"" << restored
+              << "\",\"paste_diagnostics\":{\"selection_requests\":" << selection_requests
+              << ",\"accepted_requests\":" << accepted_requests
+              << ",\"rejected_requests\":" << rejected_requests
+              << ",\"targets_requests\":" << targets_requests
+              << ",\"metadata_requests\":" << metadata_requests
+              << ",\"text_requests\":" << text_requests
+              << ",\"unsupported_requests\":" << unsupported_requests
+              << ",\"failed_writes\":" << failed_writes
+              << ",\"selection_lost\":" << (lost ? "true" : "false")
+              << ",\"deadline_exceeded\":" << (DeadlineExpired(deadline.value()) ? "true" : "false")
+              << ",\"target_window_found\":" << (pid_window != None ? "true" : "false")
+              << ",\"resource_mask_available\":" << (mask.has_value() ? "true" : "false")
+              << "}}"
               << std::endl;
     return 0;
 }
