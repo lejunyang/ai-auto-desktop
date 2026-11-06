@@ -2362,6 +2362,15 @@ mod tests {
     }
 
     #[test]
+    fn the_viewer_connects_next_to_wherever_it_was_served() {
+        // A host proxies the page below its own prefix, often over https: an
+        // address built from location.host alone would leave both behind.
+        assert!(!VIEWER.contains("location.host"));
+        assert!(VIEWER.contains("new URL(`ws?token="));
+        assert!(VIEWER.contains("location.href.replace(/^http/,'ws')"));
+    }
+
+    #[test]
     fn the_viewer_picks_among_the_offered_codecs() {
         let pictures = [Codec::Webp, Codec::Jpeg];
         assert_eq!(choose(&[json!("jpeg")], &pictures), Some(Codec::Jpeg));

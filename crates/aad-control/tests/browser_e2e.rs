@@ -531,6 +531,100 @@ fn delegated_icons_click_without_advertising_unusable_keyboard_input() {
 
 #[test]
 #[ignore = "requires isolated Chromium with its sandbox enabled; CI runs it explicitly"]
+fn a_recorded_browser_task_replays_as_saved_steps() {
+    use aad_cdp::recording::{Options, Recorder};
+    let _serial = serial();
+    let fixture = Fixture::new();
+    let (session, _) = session_for(&fixture);
+    let main = main_of(&session, &fixture.page_id);
+    assert!(
+        wait_until(&session, &main, "Status", WaitCondition::Appears)
+            .error
+            .is_none()
+    );
+    let out = fixture.root.join("recording");
+    let recorder = Recorder::start(Options {
+        port: fixture.port,
+        page: fixture.page_id.clone(),
+        out: out.clone(),
+        seconds: 0,
+        redact_network: true,
+        screenshots: false,
+        body_limit: 0,
+        max_bytes: 1 << 20,
+        follow_popups: false,
+    })
+    .unwrap();
+    let finish = Arc::new(AtomicBool::new(false));
+    let finished = finish.clone();
+    let recording = std::thread::spawn(move || recorder.run(&finished).map_err(|e| e.to_string()));
+    // What a person does: types a name, then saves.
+    let typed = act_on(&session, &main, "textbox", "Name", type_text("Ada", None));
+    assert!(typed.error.is_none(), "{typed:?}");
+    let saved = act_on(&session, &main, "button", "Save", trusted_click());
+    assert!(saved.error.is_none(), "{saved:?}");
+    std::thread::sleep(Duration::from_millis(800));
+    finish.store(true, Ordering::SeqCst);
+    recording.join().unwrap().unwrap();
+
+    let recorded = std::fs::read_to_string(out.join("steps.jsonl")).unwrap();
+    let batch = recording::from_browser_steps(&recorded, &mut 1);
+    let summary: Vec<(String, Value)> = batch
+        .steps
+        .iter()
+        .map(|s| {
+            (
+                s.locator.name.clone().unwrap_or_default(),
+                s.action.as_ref().unwrap()["type"].clone(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        summary,
+        vec![
+            ("Name".into(), json!("fill")),
+            ("Save".into(), json!("click"))
+        ],
+        "skipped: {:?}",
+        batch.skipped
+    );
+    assert_eq!(batch.steps[0].action.as_ref().unwrap()["value"], "Ada");
+    assert_eq!(
+        batch.steps[0].app.url.as_deref(),
+        Some(fixture.url.as_str())
+    );
+
+    // The same page afresh: the replay finds both elements again by role and
+    // name, among the page and its same-site frame, and has the same effect.
+    let body = document(&session, &observe(&session, &main));
+    assert!(act(&session, body, Action::Reload {}).error.is_none());
+    let main = main_of(&session, &fixture.page_id);
+    assert!(
+        wait_until(&session, &main, "Status", WaitCondition::Appears)
+            .error
+            .is_none()
+    );
+    assert_eq!(value(&observe(&session, &main), "Name"), "");
+    for step in &batch.steps {
+        steps::perform(
+            &session,
+            step,
+            &serde_json::Map::new(),
+            Duration::from_secs(10),
+        )
+        .unwrap_or_else(|e| panic!("step {}: {e:?}", step.id));
+    }
+    let observed = observe(&session, &main);
+    assert_eq!(value(&observed, "Name"), "Ada");
+    assert!(
+        status(&observed).starts_with("clicked:"),
+        "{}",
+        status(&observed)
+    );
+}
+
+#[test]
+#[ignore = "requires isolated Chromium with its sandbox enabled; CI runs it explicitly"]
 fn typing_sends_trusted_keystrokes_and_shortcuts_stay_on_the_focused_field() {
     let _serial = serial();
     let fixture = Fixture::new();

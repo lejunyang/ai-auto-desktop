@@ -22,7 +22,7 @@ GUI 也走同一个会话，三个平台都能查看界面、搭建、录制和�
 产出同一种平台无关的步骤；`aad watch` 仍只在 Windows 上。
 录制、回放和事件观察的限制见[控制能力审视](docs/research/control-audit-2026-10-17.md)。
 
-浏览器任务观测使用 `aad browser-record`：记录操作、关键元素变化、网络请求和截图，生成给 AI 编写 skill 的步骤说明。`aad browser-record start --browser edge --url 'https://example.com' --out ./recording` 自动启动并录制，可用 `--profile-dir` 复用工作 profile，或用 `--existing-profile [ID]` 选择日常已有 profile（只有一个时无需填 ID）。占用时默认提示，显式 `--kill-browser` 才结束占用浏览器并启动。**网络默认保留原值，`--redact-network` 才开启脱敏**。详见[浏览器任务录制](docs/browser-recording.md)。
+浏览器任务观测使用 `aad browser-record`：记录操作、关键元素变化、网络请求和截图，生成给 AI 编写 skill 的步骤说明。`aad browser-record start --browser edge --url 'https://example.com' --out ./recording` 自动启动并录制，可用 `--profile-dir` 复用工作 profile，或用 `--existing-profile [ID]` 选择日常已有 profile（只有一个时无需填 ID）。占用时默认提示，显式 `--kill-browser` 才结束占用浏览器并启动。**网络默认保留原值，`--redact-network` 才开启脱敏**。录完可以用 `aad browser-record steps --out ./recording --save 名字` 转成可回放的步骤，再 `aad run 名字`。详见[浏览器任务录制](docs/browser-recording.md)。
 
 ## 安全模型：先观察，才能操作
 
@@ -123,6 +123,7 @@ Linux（KDE/X11）上 key、scroll、hover、drag 和带选项的 click 经 XTes
 
 ```powershell
 aad record 99e160f2 --seconds 20 --save 报销填写   # 在这段时间里操作那个窗口
+aad record 99e160f2 --until-stdin-closes --save 报销填写   # 由宿主决定何时停：关掉标准输入就停（最长 1 小时）
 aad run <输出里的 workflow_path> --permission desktop.input --permission desktop.observe
 ```
 
@@ -411,7 +412,8 @@ aad assist --desktop --window 0x3077a     # 只分享一个窗口（句柄，或
 
 启动后在 stdout 打印一行 JSON：`url`（自带的查看页，可选）、`websocket`、`token`、`codecs`（提供的编码）
 和 `video`（找到的 ffmpeg 与每种视频编码选中的编码器）。只监听本机回环地址，每个连接都要带 token。
-主要产物是 WebSocket 上的帧流，由 omem 这类宿主自己渲染：
+自带的查看页在自己所在的路径下连 `ws`（https 下用 wss），宿主可以把页面和 WebSocket 一起放在自己的路径前缀下转发
+（例如 `/remote/<会话>/?token=…` 与 `/remote/<会话>/ws?token=…`）。主要产物是 WebSocket 上的帧流，由 omem 这类宿主自己渲染：
 
 - 画面是二进制消息，一条一帧：24 字节大端头（版本、编码、标志位 bit0 = 关键帧 / bit1 = 后面带变化区域、
   宽、高、头长度、从开始算起的毫秒时间戳），之后是负载。读的一方按“头长度”跳过头，以后加字段不影响旧的读法；

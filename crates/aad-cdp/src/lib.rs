@@ -82,12 +82,18 @@ pub struct ActivityReport {
     pub dropped: u64,
 }
 
+/// How the browser names elements (role and accessible name), shared by the
+/// control session and the recorder so recorded steps replay.
+pub const NAMING: &str = include_str!("naming.js");
+
 /// Shared passive observer. A nonempty binding streams actions to the host.
 pub fn observer_script(binding: &str) -> String {
-    include_str!("observer.js").replace(
-        "'__AAD_BINDING__'",
-        &serde_json::to_string(binding).unwrap(),
-    )
+    include_str!("observer.js")
+        .replace("/*AAD_NAMING*/", NAMING)
+        .replace(
+            "'__AAD_BINDING__'",
+            &serde_json::to_string(binding).unwrap(),
+        )
 }
 
 /// A connected CDP page session.
