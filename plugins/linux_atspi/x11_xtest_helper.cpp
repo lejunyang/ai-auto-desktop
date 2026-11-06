@@ -2246,6 +2246,11 @@ int RunPaste(int argc, char **argv, const std::optional<WindowBinding> &binding)
         return fail("clipboard_busy", "clipboard_preflight", false, kExitUnavailable);
     }
     auto restore = [&]() -> std::string {
+        // A new owner may represent a later user copy. Restore only while this
+        // transaction still owns the temporary selection.
+        if (XGetSelectionOwner(display, selection.clipboard) != selection.window) {
+            return "ownership_changed";
+        }
         if (!had_owner) {
             XSetSelectionOwner(display, selection.clipboard, None, CurrentTime);
             XSync(display, False);
@@ -2291,13 +2296,23 @@ int RunPaste(int argc, char **argv, const std::optional<WindowBinding> &binding)
     unsigned int unsupported_requests = 0;
     unsigned int failed_writes = 0;
     const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(2);
-    while (!consumed && !lost && !DeadlineExpired(deadline.value()) &&
+    auto last_target_request = std::chrono::steady_clock::now();
+    // Chromium/Electron can request more than one format after receiving the
+    // first text conversion. Keep servicing the same offer through a bounded
+    // quiet interval, rather than restoring during its remaining conversions.
+    constexpr auto kPasteQuiet = std::chrono::milliseconds(250);
+    while (!lost && !DeadlineExpired(deadline.value()) &&
            std::chrono::steady_clock::now() < until) {
+        if (consumed && std::chrono::steady_clock::now() - last_target_request >= kPasteQuiet) {
+            break;
+        }
         if (!FocusMatchesWindow(display, static_cast<unsigned long>(*pid), pid_atom, binding)) {
             restore();
             return fail("focus_owner_changed", "paste_delivery", true, kExitUnknownEffect);
         }
-        while (XPending(display) > 0 && !consumed && !DeadlineExpired(deadline.value())) {
+        unsigned batch_events = 0;
+        while (!lost && XPending(display) > 0 && !DeadlineExpired(deadline.value()) &&
+               std::chrono::steady_clock::now() < until && batch_events++ < 32) {
             XEvent event{};
             XNextEvent(display, &event);
             if (event.type == SelectionClear) {
@@ -2305,15 +2320,19 @@ int RunPaste(int argc, char **argv, const std::optional<WindowBinding> &binding)
             } else if (event.type == SelectionRequest) {
                 const auto &request = event.xselectionrequest;
                 ++selection_requests;
+                if (SameClient(display, request.requestor, pid_window, mask,
+                               static_cast<unsigned long>(*pid), pid_atom)) {
+                    last_target_request = std::chrono::steady_clock::now();
+                }
                 const PasteReply reply = ServePaste(
                     selection, request, offer, pid_window, mask,
                     static_cast<unsigned long>(pid.value()), pid_atom);
-                consumed = reply == PasteReply::Text;
+                consumed = consumed || reply == PasteReply::Text;
                 rejected_requests += reply == PasteReply::Rejected;
                 accepted_requests += reply != PasteReply::Rejected;
                 targets_requests += request.target == selection.targets;
                 metadata_requests += reply == PasteReply::Metadata;
-                text_requests += consumed || reply == PasteReply::WriteFailed;
+                text_requests += reply == PasteReply::Text || reply == PasteReply::WriteFailed;
                 unsupported_requests += reply == PasteReply::Unsupported;
                 failed_writes += reply == PasteReply::WriteFailed;
             }
@@ -2321,8 +2340,6 @@ int RunPaste(int argc, char **argv, const std::optional<WindowBinding> &binding)
         pollfd fds[1] = {{ConnectionNumber(display), POLLIN, 0}};
         poll(fds, 1, 10);
     }
-    // Let the target finish reading before the selection changes hands.
-    usleep(50'000);
     const std::string restored = restore();
     XDestroyWindow(display, selection.window);
     XCloseDisplay(display);
