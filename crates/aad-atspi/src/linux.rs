@@ -138,13 +138,15 @@ fn check_fcitx_text_input(session: &Connection) -> Result<(), AutomationError> {
     Ok(())
 }
 
+#[derive(Clone)]
 pub struct LinuxBackend {
     session_bus: Connection,
     connection: Connection,
-    recordings: Mutex<BTreeMap<String, LinuxRecorder>>,
-    input_helper_status: Mutex<Value>,
+    recordings: Arc<Mutex<BTreeMap<String, LinuxRecorder>>>,
+    input_helper_status: Arc<Mutex<Value>>,
     accessibility_address: String,
-    focus_discovery: Mutex<Option<FocusDiscovery>>,
+    focus_discovery: Arc<Mutex<Option<FocusDiscovery>>>,
+    cancellation: Option<super::CancellationToken>,
 }
 
 impl LinuxBackend {
@@ -169,13 +171,45 @@ impl LinuxBackend {
         let backend = Self {
             session_bus,
             connection,
-            recordings: Mutex::new(BTreeMap::new()),
-            input_helper_status: Mutex::new(json!({"ready": false, "code": "not_probed"})),
+            recordings: Arc::new(Mutex::new(BTreeMap::new())),
+            input_helper_status: Arc::new(Mutex::new(
+                json!({"ready": false, "code": "not_probed"}),
+            )),
             accessibility_address: bus,
-            focus_discovery: Mutex::new(None),
+            focus_discovery: Arc::new(Mutex::new(None)),
+            cancellation: None,
         };
         backend.children(&Self::root_ref(), Instant::now() + Duration::from_secs(3))?;
         Ok(backend)
+    }
+
+    fn check_cancelled(&self, dispatched: bool) -> Result<(), AutomationError> {
+        match &self.cancellation {
+            Some(token) => token.check().map_err(|error| {
+                error.with_effect(if dispatched { "unknown" } else { "not_applied" })
+            }),
+            None => Ok(()),
+        }
+    }
+
+    fn run_helper(
+        &self,
+        path: &Path,
+        args: &[String],
+        input: Option<&[u8]>,
+        deadline: Instant,
+        stdout_limit: usize,
+        stderr_limit: usize,
+    ) -> Result<HelperOutput, AutomationError> {
+        run_helper_cancellable(
+            path,
+            args,
+            input,
+            deadline,
+            stdout_limit,
+            stderr_limit,
+            self.cancellation.as_ref(),
+        )
     }
 
     fn root_ref() -> NativeRef {
@@ -393,7 +427,11 @@ impl LinuxBackend {
         process_id: u32,
         deadline: Instant,
     ) -> Result<Value, AutomationError> {
+        self.check_cancelled(false)?;
         let support = self.probe_input(deadline)?;
+        if self.cancellation.is_some() {
+            support.require("cooperative-cancel")?;
+        }
         support.require(args.first().map(String::as_str).unwrap_or(""))?;
         if args.iter().any(|arg| arg == "--modifiers") {
             support.require("pointer-modifiers")?;
@@ -442,15 +480,16 @@ impl LinuxBackend {
             "--deadline-monotonic-ns".into(),
             monotonic_deadline_ns(deadline)?.to_string(),
         ]);
-        let output = run_helper(
-            &path,
-            &args,
-            None,
-            deadline,
-            XTEST_OUTPUT_LIMIT,
-            XTEST_OUTPUT_LIMIT,
-        )
-        .map_err(input_error)?;
+        let output = self
+            .run_helper(
+                &path,
+                &args,
+                None,
+                deadline,
+                XTEST_OUTPUT_LIMIT,
+                XTEST_OUTPUT_LIMIT,
+            )
+            .map_err(input_error)?;
         let mut input = parse_input_helper(output, "input_dispatch", minimum_events, process_id)
             .map_err(input_error)?;
         if let Some(focus) = focus {
@@ -517,6 +556,14 @@ impl LinuxBackend {
     fn input_helper(&self, feature: &str, deadline: Instant) -> Result<PathBuf, AutomationError> {
         let support = self.probe_input(deadline)?;
         support.require(feature)?;
+        if self.cancellation.is_some()
+            && matches!(
+                feature,
+                "type-text" | "paste" | "pointer-click" | "window-action" | "global-key"
+            )
+        {
+            support.require("cooperative-cancel")?;
+        }
         Ok(support.path)
     }
 
@@ -824,6 +871,15 @@ impl LinuxBackend {
 }
 
 impl AtspiBackend for LinuxBackend {
+    fn cancellation_scope(
+        &self,
+        token: &super::CancellationToken,
+    ) -> Option<Arc<dyn AtspiBackend>> {
+        let mut scoped = self.clone();
+        scoped.cancellation = Some(token.clone());
+        Some(Arc::new(scoped))
+    }
+
     fn start_recording(
         &self,
         application: &Map<String, Value>,
@@ -940,9 +996,12 @@ impl AtspiBackend for LinuxBackend {
         window: Option<&WindowAnchor>,
         deadline: Instant,
     ) -> Result<Value, AutomationError> {
+        self.check_cancelled(false)?;
         remaining(deadline, false)?;
+        self.check_cancelled(false)?;
         let accepted = zbus::block_on(self.component_proxy(target)?.grab_focus())
             .map_err(|error| native_failure("Component.GrabFocus", target, error))?;
+        self.check_cancelled(true)?;
         if !accepted {
             let process_id = self.process_id(&target.bus_name).ok_or_else(|| {
                 driver_error(
@@ -966,6 +1025,7 @@ impl AtspiBackend for LinuxBackend {
     }
 
     fn invoke(&self, target: &NativeRef, deadline: Instant) -> Result<Value, AutomationError> {
+        self.check_cancelled(false)?;
         let actions = self.actions(target);
         let index = if actions.len() == 1 {
             0
@@ -981,8 +1041,10 @@ impl AtspiBackend for LinuxBackend {
                 })?
         };
         remaining(deadline, false)?;
+        self.check_cancelled(false)?;
         let accepted = zbus::block_on(self.action_proxy(target)?.do_action(index as i32))
             .map_err(|error| native_failure("Action.DoAction", target, error))?;
+        self.check_cancelled(true)?;
         if !accepted {
             return Err(driver_error(
                 "DRIVER.ACTION_FAILED",
@@ -1000,6 +1062,7 @@ impl AtspiBackend for LinuxBackend {
         text: &str,
         deadline: Instant,
     ) -> Result<Value, AutomationError> {
+        self.check_cancelled(false)?;
         remaining(deadline, false)?;
         let builder = EditableTextProxy::builder(self.connection.inner())
             .destination(target.bus_name.as_str())
@@ -1011,8 +1074,10 @@ impl AtspiBackend for LinuxBackend {
                 .build(),
         )
         .map_err(|error| native_failure("EditableText proxy", target, error))?;
+        self.check_cancelled(false)?;
         let accepted = zbus::block_on(proxy.set_text_contents(text))
             .map_err(|error| native_failure("EditableText.SetTextContents", target, error))?;
+        self.check_cancelled(true)?;
         if !accepted {
             return Err(driver_error(
                 "DRIVER.ACTION_FAILED",
@@ -1028,6 +1093,7 @@ impl AtspiBackend for LinuxBackend {
         text: &str,
         deadline: Instant,
     ) -> Result<Value, AutomationError> {
+        self.check_cancelled(false)?;
         // Recheck the exact accessible immediately before the native setter.
         // Never include D-Bus error text: an application could echo the secret.
         let unavailable = || {
@@ -1057,6 +1123,7 @@ impl AtspiBackend for LinuxBackend {
         )
         .map_err(|_| unavailable())?;
         remaining(deadline, false)?;
+        self.check_cancelled(false)?;
         let accepted = zbus::block_on(proxy.set_text_contents(text)).map_err(|_| {
             driver_error(
                 "DRIVER.UNKNOWN_EFFECT",
@@ -1064,6 +1131,7 @@ impl AtspiBackend for LinuxBackend {
             )
             .with_effect("unknown")
         })?;
+        self.check_cancelled(true)?;
         if !accepted {
             return Err(driver_error(
                 "DRIVER.UNKNOWN_EFFECT",
@@ -1080,6 +1148,7 @@ impl AtspiBackend for LinuxBackend {
         name: &str,
         deadline: Instant,
     ) -> Result<Value, AutomationError> {
+        self.check_cancelled(false)?;
         let actions = self.actions(target);
         let matches = actions
             .iter()
@@ -1093,8 +1162,10 @@ impl AtspiBackend for LinuxBackend {
             ));
         };
         remaining(deadline, false)?;
+        self.check_cancelled(false)?;
         let accepted = zbus::block_on(self.action_proxy(target)?.do_action(*index as i32))
             .map_err(|error| native_failure("Action.DoAction", target, error))?;
+        self.check_cancelled(true)?;
         if !accepted {
             return Err(driver_error(
                 "DRIVER.ACTION_FAILED",
@@ -1171,15 +1242,16 @@ impl AtspiBackend for LinuxBackend {
             monotonic_deadline_ns(deadline)?.to_string(),
         ];
         append_window_args(&mut args, window, Some(window_id));
-        let output = run_helper(
-            &path,
-            &args,
-            Some(text.as_bytes()),
-            deadline,
-            XTEST_OUTPUT_LIMIT,
-            XTEST_OUTPUT_LIMIT,
-        )
-        .map_err(after_focus)?;
+        let output = self
+            .run_helper(
+                &path,
+                &args,
+                Some(text.as_bytes()),
+                deadline,
+                XTEST_OUTPUT_LIMIT,
+                XTEST_OUTPUT_LIMIT,
+            )
+            .map_err(after_focus)?;
         let input =
             parse_input_helper(output, "keyboard_dispatch", 2, process_id).map_err(after_focus)?;
         Ok(
@@ -1206,7 +1278,7 @@ impl AtspiBackend for LinuxBackend {
             "--deadline-monotonic-ns".into(),
             monotonic_deadline_ns(deadline)?.to_string(),
         ];
-        let output = run_helper(
+        let output = self.run_helper(
             &path,
             &args,
             None,
@@ -1432,7 +1504,7 @@ impl AtspiBackend for LinuxBackend {
             "--deadline-monotonic-ns".into(),
             monotonic_deadline_ns(deadline)?.to_string(),
         ];
-        let output = run_helper(
+        let output = self.run_helper(
             &path,
             &args,
             None,
@@ -1499,7 +1571,7 @@ impl AtspiBackend for LinuxBackend {
             "--deadline-monotonic-ns".into(),
             monotonic_deadline_ns(deadline)?.to_string(),
         ]);
-        let output = run_helper(
+        let output = self.run_helper(
             &path,
             &args,
             None,
@@ -1553,7 +1625,7 @@ impl AtspiBackend for LinuxBackend {
             monotonic_deadline_ns(deadline)?.to_string(),
         ];
         append_window_args(&mut args, window, Some(window_id));
-        let output = run_helper(
+        let output = self.run_helper(
             &path,
             &args,
             Some(text.as_bytes()),
@@ -1589,7 +1661,7 @@ impl AtspiBackend for LinuxBackend {
             "--deadline-monotonic-ns".into(),
             monotonic_deadline_ns(deadline)?.to_string(),
         ];
-        let output = run_helper(
+        let output = self.run_helper(
             &path,
             &args,
             None,
@@ -1623,7 +1695,7 @@ impl AtspiBackend for LinuxBackend {
             "--deadline-monotonic-ns".into(),
             monotonic_deadline_ns(deadline)?.to_string(),
         ];
-        let output = run_helper(
+        let output = self.run_helper(
             &path,
             &args,
             None,
@@ -1718,6 +1790,7 @@ impl LinuxBackend {
         let mut truncated = false;
         let mut truncation_reasons = Vec::new();
         while let Some((target, parent, depth)) = queue.pop_front() {
+            self.check_cancelled(false)?;
             remaining(deadline, false)?;
             if nodes.len() >= max_nodes {
                 truncated = true;
@@ -1799,15 +1872,16 @@ impl LinuxBackend {
             "--deadline-monotonic-ns".into(),
             monotonic_deadline_ns(deadline).ok()?.to_string(),
         ]);
-        let output = run_helper(
-            path,
-            &args,
-            None,
-            deadline.min(Instant::now() + Duration::from_secs(2)),
-            XTEST_OUTPUT_LIMIT,
-            XTEST_OUTPUT_LIMIT,
-        )
-        .ok()?;
+        let output = self
+            .run_helper(
+                path,
+                &args,
+                None,
+                deadline.min(Instant::now() + Duration::from_secs(2)),
+                XTEST_OUTPUT_LIMIT,
+                XTEST_OUTPUT_LIMIT,
+            )
+            .ok()?;
         if !output.status.success() {
             return None;
         }
@@ -2024,6 +2098,30 @@ fn run_helper(
     stdout_limit: usize,
     stderr_limit: usize,
 ) -> Result<HelperOutput, AutomationError> {
+    run_helper_cancellable(
+        path,
+        args,
+        input,
+        deadline,
+        stdout_limit,
+        stderr_limit,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_helper_cancellable(
+    path: &Path,
+    args: &[String],
+    input: Option<&[u8]>,
+    deadline: Instant,
+    stdout_limit: usize,
+    stderr_limit: usize,
+    token: Option<&super::CancellationToken>,
+) -> Result<HelperOutput, AutomationError> {
+    if let Some(token) = token {
+        token.check()?;
+    }
     remaining(deadline, false)?;
     let mut command = Command::new(path);
     command
@@ -2053,14 +2151,16 @@ fn run_helper(
         )
         .with_detail("cause", json!(error.to_string()))
     })?;
-    if let Some(input) = input {
-        let mut stdin = child.stdin.take().expect("stdin is piped");
-        if let Err(error) = stdin.write_all(input) {
+    if let Some(stdin) = child.stdin.as_ref() {
+        use std::os::fd::AsRawFd;
+        let fd = stdin.as_raw_fd();
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
             terminate(&mut child);
-            return Err(
-                driver_error("DRIVER.ACTION_FAILED", "helper input could not be written")
-                    .with_detail("cause", json!(error.to_string())),
-            );
+            return Err(driver_error(
+                "DRIVER.UNAVAILABLE",
+                "helper input pipe could not be made cancellable",
+            ));
         }
     }
     let mut stdout = child.stdout.take().expect("stdout is piped");
@@ -2076,8 +2176,9 @@ fn run_helper(
     let mut stdout_result = None;
     let mut stderr_result = None;
     let mut status = None;
+    let mut input_offset = 0;
     loop {
-        match receiver.recv_timeout(Duration::from_millis(20)) {
+        match receiver.recv_timeout(Duration::from_millis(10)) {
             Ok(("stdout", Ok(bytes))) => stdout_result = Some(bytes),
             Ok(("stderr", Ok(bytes))) => stderr_result = Some(bytes),
             Ok((name, Err(error))) => {
@@ -2103,14 +2204,85 @@ fn run_helper(
                 .with_detail("cause", json!(error.to_string()))
             })?;
         }
+        if let Some(token) = token.filter(|token| token.is_cancelled()) {
+            // Let the helper's signal handler release owned input and restore
+            // the clipboard. Cleanup is independent of the cancelled token.
+            let clean_exit = terminate_with_grace(&mut child, Duration::from_secs(3));
+            let _ = stdout_thread.join();
+            let _ = stderr_thread.join();
+            while let Ok((name, result)) = receiver.try_recv() {
+                if name == "stdout" {
+                    stdout_result = result.ok();
+                }
+            }
+            let dispatched = stdout_result.as_deref().is_some_and(helper_dispatched);
+            return Err(token
+                .check()
+                .unwrap_err()
+                .with_effect(if dispatched || !clean_exit {
+                    "unknown"
+                } else {
+                    "not_applied"
+                })
+                .with_detail("dispatch_started", json!(dispatched))
+                .with_detail("helper_exited_before_kill", json!(clean_exit)));
+        }
         if status.is_some() && stdout_result.is_some() && stderr_result.is_some() {
             break;
         }
         if Instant::now() >= deadline {
-            terminate(&mut child);
+            let clean_exit = terminate_with_grace(&mut child, Duration::from_secs(3));
             let _ = stdout_thread.join();
             let _ = stderr_thread.join();
-            return Err(super::timeout_error(false));
+            while let Ok((name, result)) = receiver.try_recv() {
+                if name == "stdout" {
+                    stdout_result = result.ok();
+                }
+            }
+            let dispatched = stdout_result.as_deref().is_some_and(helper_dispatched);
+            return Err(super::timeout_error(dispatched || !clean_exit)
+                .with_detail("dispatch_started", json!(dispatched))
+                .with_detail("helper_exited_before_kill", json!(clean_exit)));
+        }
+        if let (Some(input), Some(stdin)) = (input, child.stdin.as_mut()) {
+            // A helper may stop consuming stdin. Never block cancellation or
+            // the deadline on a payload larger than the kernel pipe capacity.
+            let result = stdin.write(&input[input_offset..]);
+            match result {
+                Ok(written) => {
+                    input_offset += written;
+                    if input_offset == input.len() {
+                        child.stdin.take();
+                    }
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                    ) => {}
+                Err(_) => {
+                    let clean_exit = terminate_with_grace(&mut child, Duration::from_secs(3));
+                    let _ = stdout_thread.join();
+                    let _ = stderr_thread.join();
+                    while let Ok((name, result)) = receiver.try_recv() {
+                        if name == "stdout" {
+                            stdout_result = result.ok();
+                        }
+                    }
+                    let dispatched = stdout_result.as_deref().is_some_and(helper_dispatched);
+                    return Err(driver_error(
+                        "DRIVER.ACTION_FAILED",
+                        "helper input could not be written",
+                    )
+                    .with_effect(if dispatched || !clean_exit {
+                        "unknown"
+                    } else {
+                        "not_applied"
+                    })
+                    .with_detail("dispatch_started", json!(dispatched))
+                    .with_detail("helper_exited_before_kill", json!(clean_exit)));
+                }
+            }
         }
     }
     let _ = stdout_thread.join();
@@ -2120,6 +2292,13 @@ fn run_helper(
         stdout: stdout_result.unwrap_or_default(),
         stderr: stderr_result.unwrap_or_default(),
     })
+}
+
+fn helper_dispatched(bytes: &[u8]) -> bool {
+    bytes
+        .split(|byte| *byte == b'\n')
+        .filter_map(|line| serde_json::from_slice::<Value>(line).ok())
+        .any(|value| value["event"] == "dispatch_started" || value["dispatch_started"] == true)
 }
 
 fn read_bounded(reader: &mut impl Read, limit: usize) -> std::io::Result<Vec<u8>> {
@@ -2135,13 +2314,25 @@ fn read_bounded(reader: &mut impl Read, limit: usize) -> std::io::Result<Vec<u8>
 }
 
 fn terminate(child: &mut Child) {
+    terminate_with_grace(child, Duration::from_millis(200));
+}
+
+fn terminate_with_grace(child: &mut Child, grace: Duration) -> bool {
+    // A completed paste can leave its clipboard restorer in the process group.
+    // Never signal that group after its helper has already exited.
+    if child.try_wait().ok().flatten().is_some() {
+        return true;
+    }
     unsafe {
         libc::kill(-(child.id() as i32), libc::SIGTERM);
     }
-    let grace = Instant::now() + Duration::from_millis(200);
+    // Signal first, then EOF: a cooperative helper must not treat an unfinished
+    // text frame as an ordinary completed request before seeing cancellation.
+    child.stdin.take();
+    let grace = Instant::now() + grace;
     while Instant::now() < grace {
         if child.try_wait().ok().flatten().is_some() {
-            return;
+            return true;
         }
         std::thread::sleep(Duration::from_millis(20));
     }
@@ -2150,6 +2341,7 @@ fn terminate(child: &mut Child) {
     }
     let _ = child.kill();
     let _ = child.wait();
+    false
 }
 
 fn valid_focus_proof(proof: &Map<String, Value>, process_id: u32) -> bool {
@@ -2343,7 +2535,9 @@ fn map_helper_code(code: &str) -> Option<AutomationError> {
 }
 
 fn after_focus(error: AutomationError) -> AutomationError {
-    if error.code == "DRIVER.UNKNOWN_EFFECT" {
+    if error.code == "DRIVER.CANCELLED" {
+        error.with_effect("unknown")
+    } else if error.code == "DRIVER.UNKNOWN_EFFECT" {
         error
     } else {
         driver_error(
@@ -3040,6 +3234,186 @@ mod capture_tests {
         assert_eq!(error.details["required_feature"], "bounded-hold");
         assert!(!support.has("focus-info"));
         assert!(!support.has("window-focus"));
+    }
+
+    #[test]
+    fn cancellation_waits_for_helper_cleanup_and_preserves_dispatch_evidence() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("aad-helper-cancel-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let helper = dir.join("helper");
+        std::fs::write(
+            &helper,
+            concat!(
+                "#!/bin/sh\n",
+                "trap 'touch cleaned; exit 0' TERM\n",
+                "printf '%s\\n' '{\"event\":\"dispatch_started\"}'\n",
+                "touch ready\n",
+                "while :; do sleep 0.01; done\n",
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let token = super::super::CancellationToken::new();
+        let worker_token = token.clone();
+        let ready = dir.join("ready");
+        let canceller = std::thread::spawn(move || {
+            let until = Instant::now() + Duration::from_secs(3);
+            while !ready.exists() && Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            worker_token.cancel();
+        });
+        let error = run_helper_cancellable(
+            &helper,
+            &[],
+            None,
+            Instant::now() + Duration::from_secs(5),
+            4096,
+            4096,
+            Some(&token),
+        )
+        .err()
+        .expect("helper must observe cancellation");
+        canceller.join().unwrap();
+        assert_eq!(error.code, "DRIVER.CANCELLED");
+        assert_eq!(error.effect, "unknown");
+        assert_eq!(error.details["dispatch_started"], true);
+        assert_eq!(error.details["helper_exited_before_kill"], true);
+        assert!(dir.join("cleaned").exists());
+        std::fs::remove_file(dir.join("ready")).unwrap();
+        let error = run_helper_cancellable(
+            &helper,
+            &[],
+            None,
+            Instant::now() + Duration::from_secs(5),
+            4096,
+            4096,
+            Some(&token),
+        )
+        .err()
+        .expect("cancelled invocation must not start helper");
+        assert_eq!(error.effect, "not_applied");
+        assert!(!dir.join("ready").exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn cancellation_interrupts_a_large_payload_when_the_helper_never_reads_stdin() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("aad-helper-pipe-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let helper = dir.join("helper");
+        std::fs::write(
+            &helper,
+            concat!(
+                "#!/bin/sh\n",
+                "trap 'touch cleaned; exit 0' TERM\n",
+                "touch ready\n",
+                "while :; do sleep 0.01; done\n",
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let token = super::super::CancellationToken::new();
+        let worker_token = token.clone();
+        let ready = dir.join("ready");
+        let canceller = std::thread::spawn(move || {
+            let until = Instant::now() + Duration::from_secs(3);
+            while !ready.exists() && Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            // Give the writer time to fill the bounded kernel pipe first.
+            std::thread::sleep(Duration::from_millis(50));
+            worker_token.cancel();
+        });
+        let started = Instant::now();
+        let error = run_helper_cancellable(
+            &helper,
+            &[],
+            Some(&vec![b'a'; 4 * 1024 * 1024]),
+            Instant::now() + Duration::from_secs(5),
+            4096,
+            4096,
+            Some(&token),
+        )
+        .err()
+        .expect("blocked input must cancel");
+        canceller.join().unwrap();
+        assert_eq!(error.code, "DRIVER.CANCELLED");
+        assert_eq!(error.effect, "not_applied");
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(dir.join("cleaned").exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn forced_helper_termination_cannot_prove_non_dispatch_from_missing_output() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("aad-helper-forced-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let helper = dir.join("helper");
+        std::fs::write(
+            &helper,
+            "#!/bin/sh\ntrap '' TERM\ntouch ready\nwhile :; do sleep 0.01; done\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let token = super::super::CancellationToken::new();
+        let worker_token = token.clone();
+        let ready = dir.join("ready");
+        let canceller = std::thread::spawn(move || {
+            let until = Instant::now() + Duration::from_secs(3);
+            while !ready.exists() && Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            worker_token.cancel();
+        });
+        let error = run_helper_cancellable(
+            &helper,
+            &[],
+            Some(&vec![b'a'; 4 * 1024 * 1024]),
+            Instant::now() + Duration::from_secs(5),
+            4096,
+            4096,
+            Some(&token),
+        )
+        .err()
+        .expect("uncooperative helper must stop");
+        canceller.join().unwrap();
+        assert_eq!(error.code, "DRIVER.CANCELLED");
+        assert_eq!(error.effect, "unknown");
+        assert_eq!(error.details["dispatch_started"], false);
+        assert_eq!(error.details["helper_exited_before_kill"], false);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn nonblocking_helper_input_delivers_the_whole_frame_then_eof() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("aad-helper-frame-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let helper = dir.join("helper");
+        std::fs::write(
+            &helper,
+            "#!/bin/sh\ncat > received\nprintf '%s\\n' '{\"ok\":true}'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let payload = "synthetic-中文-frame".repeat(16_384).into_bytes();
+        let output = run_helper_cancellable(
+            &helper,
+            &[],
+            Some(&payload),
+            Instant::now() + Duration::from_secs(5),
+            4096,
+            4096,
+            Some(&super::super::CancellationToken::new()),
+        )
+        .unwrap_or_else(|error| panic!("helper delivery failed: {}", error.code));
+        assert!(output.status.success());
+        assert_eq!(std::fs::read(dir.join("received")).unwrap(), payload);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

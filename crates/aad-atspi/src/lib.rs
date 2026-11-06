@@ -6,7 +6,7 @@
 
 use aad_core::AutomationError;
 use aad_plugin::{manifest, CapabilityManifest};
-use aad_runtime::{ArtifactStore, Provider};
+use aad_runtime::{ArtifactStore, CancellationToken, Provider};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -142,6 +142,11 @@ impl Bounds {
 }
 
 pub trait AtspiBackend: Send + Sync {
+    /// Return an invocation-local view sharing persistent observation state.
+    /// The token must never replace a session policy or persist into later calls.
+    fn cancellation_scope(&self, _token: &CancellationToken) -> Option<Arc<dyn AtspiBackend>> {
+        None
+    }
     fn name(&self) -> &str;
     fn session_info(&self) -> Map<String, Value>;
     fn inspect_session(&self, _deadline: Instant) -> Map<String, Value> {
@@ -460,7 +465,7 @@ pub struct AtspiProvider {
     backend: Arc<dyn AtspiBackend>,
     manifest: CapabilityManifest,
     generation: String,
-    state: Mutex<DriverState>,
+    state: Arc<Mutex<DriverState>>,
 }
 
 impl AtspiProvider {
@@ -474,7 +479,7 @@ impl AtspiProvider {
                 )
             })?,
             generation: uuid::Uuid::new_v4().simple().to_string(),
-            state: Mutex::new(DriverState::default()),
+            state: Arc::new(Mutex::new(DriverState::default())),
         })
     }
 
@@ -1322,6 +1327,14 @@ impl AtspiProvider {
                     json!({"ok": true, "action": action, "resolved": target(&fresh, &fresh_id), "backend_result": backend_result}),
                 )
             }
+            Err(error) if error.code == "DRIVER.CANCELLED" && error.effect == "unknown" => {
+                if let Ok(mut state) = self.state.lock() {
+                    if let Some(record) = state.current.as_mut() {
+                        record.valid = false;
+                    }
+                }
+                Err(error)
+            }
             Err(error)
                 if dispatched
                     && error.details.get("dispatch_started") != Some(&Value::Bool(false))
@@ -1610,6 +1623,54 @@ impl Provider for AtspiProvider {
         self.call(action, args, Self::deadline(timeout)?, None)
     }
 
+    fn invoke_cancellable(
+        &self,
+        action: &str,
+        args: Value,
+        timeout: Option<Duration>,
+        token: &CancellationToken,
+    ) -> Result<Value, AutomationError> {
+        token.check()?;
+        let scoped = Self {
+            backend: self
+                .backend
+                .cancellation_scope(token)
+                .unwrap_or_else(|| self.backend.clone()),
+            manifest: self.manifest.clone(),
+            generation: self.generation.clone(),
+            state: self.state.clone(),
+        };
+        let result = scoped.call(action, args, Self::deadline(timeout)?, None);
+        if result
+            .as_ref()
+            .err()
+            .is_some_and(|error| error.code == "DRIVER.CANCELLED")
+        {
+            return result;
+        }
+        if token.is_cancelled() {
+            let short = action
+                .strip_prefix(PROVIDER_NAME)
+                .and_then(|value| value.strip_prefix('.'))
+                .and_then(|value| value.strip_suffix("@1"));
+            let written = short
+                .is_some_and(|action| WRITE_ACTIONS.contains(&action) || action == "global_key");
+            if written {
+                if let Ok(mut state) = self.state.lock() {
+                    if let Some(record) = state.current.as_mut() {
+                        record.valid = false;
+                    }
+                }
+            }
+            return Err(token.check().unwrap_err().with_effect(if written {
+                "unknown"
+            } else {
+                "not_applied"
+            }));
+        }
+        result
+    }
+
     fn invoke_with_artifacts(
         &self,
         action: &str,
@@ -1802,6 +1863,7 @@ fn redact_secret_error(error: AutomationError) -> AutomationError {
         | "DRIVER.ACTION_UNSUPPORTED"
         | "DRIVER.PROTECTED_ELEMENT"
         | "DRIVER.TIMEOUT"
+        | "DRIVER.CANCELLED"
         | "DRIVER.OUTPUT_TOO_LARGE"
         | "DRIVER.UNKNOWN_EFFECT" => error.code.as_str(),
         _ => "DRIVER.UNKNOWN_EFFECT",
@@ -2474,6 +2536,12 @@ fn error_contracts(write: bool, locator: bool, capture: bool) -> Vec<Value> {
         ),
         ("DRIVER.TIMEOUT", "请求截止时间已到。", true, "not_applied"),
         (
+            "DRIVER.CANCELLED",
+            "调用已取消；已派发输入的效果可能未知。",
+            false,
+            if write { "unknown" } else { "not_applied" },
+        ),
+        (
             "DRIVER.OUTPUT_TOO_LARGE",
             "规范化响应超过线路限制。",
             false,
@@ -2847,11 +2915,15 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    #[derive(Default)]
+    #[derive(Clone, Default)]
     struct FakeBackend {
-        captures: AtomicUsize,
-        scoped_captures: AtomicUsize,
-        writes: AtomicUsize,
+        captures: Arc<AtomicUsize>,
+        scoped_captures: Arc<AtomicUsize>,
+        writes: Arc<AtomicUsize>,
+        cancellation: Option<CancellationToken>,
+        cancel_in_capture: bool,
+        cancel_in_write: bool,
+        subscription_lifetime: Arc<()>,
         changed: bool,
         duplicate: bool,
         alias: bool,
@@ -2957,6 +3029,11 @@ mod tests {
     }
 
     impl AtspiBackend for FakeBackend {
+        fn cancellation_scope(&self, token: &CancellationToken) -> Option<Arc<dyn AtspiBackend>> {
+            let mut scoped = self.clone();
+            scoped.cancellation = Some(token.clone());
+            Some(Arc::new(scoped))
+        }
         fn name(&self) -> &str {
             "fake_atspi"
         }
@@ -2984,6 +3061,12 @@ mod tests {
             _deadline: Instant,
         ) -> Result<BackendSnapshot, AutomationError> {
             self.captures.fetch_add(1, Ordering::SeqCst);
+            if self.cancel_in_capture && self.captures.load(Ordering::SeqCst) == 2 {
+                if let Some(token) = &self.cancellation {
+                    token.cancel();
+                    token.check()?;
+                }
+            }
             let path = if self.replaced && self.captures.load(Ordering::SeqCst) > 1 {
                 "/org/a11y/replacement"
             } else {
@@ -3075,6 +3158,12 @@ mod tests {
             _deadline: Instant,
         ) -> Result<Value, AutomationError> {
             self.writes.fetch_add(1, Ordering::SeqCst);
+            if self.cancel_in_write {
+                if let Some(token) = &self.cancellation {
+                    token.cancel();
+                    return Err(token.check().unwrap_err().with_effect("unknown"));
+                }
+            }
             Ok(json!({"accepted": true}))
         }
         fn secret_input(
@@ -3889,6 +3978,76 @@ mod tests {
         assert_eq!(error.code, "DRIVER.ACTION_FAILED");
         assert_eq!(error.effect, "not_applied");
         assert_eq!(backend.writes.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn cancelled_invocation_keeps_record_and_subscription_state_without_leaking_its_token() {
+        let backend = Arc::new(FakeBackend {
+            cancel_in_capture: true,
+            ..Default::default()
+        });
+        let provider = AtspiProvider::new(backend.clone()).unwrap();
+        let initial = take_snapshot(&provider);
+        let args = json!({"target": {"snapshot_id": initial["snapshot_id"], "revision": initial["revision"], "node_id": "n0"}, "locator": locator()});
+        let cancelled = CancellationToken::new();
+        let error = provider
+            .invoke_cancellable(
+                "desktop.linux_atspi.focus@1",
+                args.clone(),
+                Some(Duration::from_secs(2)),
+                &cancelled,
+            )
+            .unwrap_err();
+        assert_eq!(error.code, "DRIVER.CANCELLED");
+        assert_eq!(error.effect, "not_applied");
+        assert_eq!(backend.writes.load(Ordering::SeqCst), 0);
+        assert_eq!(Arc::strong_count(&backend.subscription_lifetime), 1);
+        assert!(backend.cancellation.is_none());
+        // A fresh token shares the same original record and can finish the call.
+        provider
+            .invoke_cancellable(
+                "desktop.linux_atspi.focus@1",
+                args,
+                Some(Duration::from_secs(2)),
+                &CancellationToken::new(),
+            )
+            .unwrap();
+        assert_eq!(backend.writes.load(Ordering::SeqCst), 1);
+        assert_eq!(Arc::strong_count(&backend.subscription_lifetime), 1);
+        // The ordinary entry point also remains unaffected by the cancelled call.
+        take_snapshot(&provider);
+        assert!(backend.cancellation.is_none());
+        assert_eq!(Arc::strong_count(&backend.subscription_lifetime), 1);
+    }
+
+    #[test]
+    fn cancellation_after_native_dispatch_invalidates_the_observed_record() {
+        let backend = Arc::new(FakeBackend {
+            cancel_in_write: true,
+            ..Default::default()
+        });
+        let provider = AtspiProvider::new(backend.clone()).unwrap();
+        let initial = take_snapshot(&provider);
+        let args = json!({"target": {"snapshot_id": initial["snapshot_id"], "revision": initial["revision"], "node_id": "n0"}, "locator": locator()});
+        let error = provider
+            .invoke_cancellable(
+                "desktop.linux_atspi.invoke@1",
+                args.clone(),
+                Some(Duration::from_secs(2)),
+                &CancellationToken::new(),
+            )
+            .unwrap_err();
+        assert_eq!(error.code, "DRIVER.CANCELLED");
+        assert_eq!(error.effect, "unknown");
+        let stale = provider
+            .invoke(
+                "desktop.linux_atspi.invoke@1",
+                args,
+                Some(Duration::from_secs(2)),
+            )
+            .unwrap_err();
+        assert_eq!(stale.code, "DRIVER.STALE_SNAPSHOT");
+        assert_eq!(backend.writes.load(Ordering::SeqCst), 1);
     }
 
     #[test]

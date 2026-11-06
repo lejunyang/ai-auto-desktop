@@ -645,13 +645,21 @@ int RunGesture(Display *display, std::string_view command, const GestureRequest 
         }
     };
     for (const auto code : modifiers) {
+        if (DeadlineExpired(deadline_ns) || !FocusMatchesWindow(display, expected_pid, pid_atom, binding)) {
+            return finish_failure(DeadlineExpired(deadline_ns) ? "deadline_exceeded" : "focus_owner_changed", "input_dispatch", kExitUnknownEffect);
+        }
         pressed_modifiers.push_back(code);
         submit(XTestFakeKeyEvent(display, code, True, 1) != 0);
+        XSync(display, False);
     }
     if (command == "key-chord") {
         for (const KeyCode code : chord) {
+            if (DeadlineExpired(deadline_ns) || !FocusMatchesWindow(display, expected_pid, pid_atom, binding)) {
+                return finish_failure(DeadlineExpired(deadline_ns) ? "deadline_exceeded" : "focus_owner_changed", "input_dispatch", kExitUnknownEffect);
+            }
             pressed_chord.push_back(code);
             submit(XTestFakeKeyEvent(display, code, True, 1) != 0);
+            XSync(display, False);
         }
         if (const auto problem = hold(); !problem.empty()) {
             return finish_failure(problem, "input_hold", kExitUnknownEffect);
@@ -662,9 +670,15 @@ int RunGesture(Display *display, std::string_view command, const GestureRequest 
         XSync(display, False);
         if (submitted && !g_x_error) pressed_chord.clear();
     } else {
+        if (DeadlineExpired(deadline_ns)) {
+            return finish_failure("deadline_exceeded", "input_dispatch", kExitUnknownEffect);
+        }
         submit(XTestFakeMotionEvent(display, -1, request.x, request.y, 1) != 0);
         if (command == "drag") {
             XSync(display, False);
+            if (DeadlineExpired(deadline_ns)) {
+                return finish_failure("deadline_exceeded", "input_dispatch", kExitUnknownEffect);
+            }
             button_pressed = true;
             submit(XTestFakeButtonEvent(display, request.button, True, 1) != 0);
             XSync(display, False);
@@ -695,6 +709,9 @@ int RunGesture(Display *display, std::string_view command, const GestureRequest 
             if (submitted && !g_x_error) button_pressed = false;
         } else if (request.mode == "click") {
             for (unsigned click = 0; click < request.count; ++click) {
+                if (DeadlineExpired(deadline_ns)) {
+                    return finish_failure("deadline_exceeded", "input_dispatch", kExitUnknownEffect);
+                }
                 button_pressed = true;
                 submit(XTestFakeButtonEvent(display, request.button, True, 1) != 0);
                 if (const auto problem = hold(); !problem.empty()) {
@@ -706,8 +723,12 @@ int RunGesture(Display *display, std::string_view command, const GestureRequest 
             }
         } else if (request.mode == "wheel") {
             for (unsigned notch = 0; notch < request.notches; ++notch) {
+                if (DeadlineExpired(deadline_ns)) {
+                    return finish_failure("deadline_exceeded", "input_dispatch", kExitUnknownEffect);
+                }
                 submit(XTestFakeButtonEvent(display, request.button, True, 1) != 0);
                 submit(XTestFakeButtonEvent(display, request.button, False, 1) != 0);
+                XSync(display, False);
             }
         } else {
             XSync(display, False);
@@ -1479,6 +1500,7 @@ Display *OpenQualifiedDisplay(std::optional<std::uint64_t> pid, int *exit_code) 
 }
 
 int RunWindow(std::string_view command, int argc, char **argv) {
+    InputCancellation cancellation;
     const bool action = command == "window-action";
     const auto args = ParseWindowArgs(argc, argv, action);
     if (!args.has_value()) {
@@ -1964,6 +1986,11 @@ bool StartRestorer(const std::vector<Item> &saved, int inherited_display_fd) {
         if (fork() != 0) {
             _exit(0);  // the grandchild is reparented and never waited for
         }
+        // This new process owns only clipboard restoration, not the cancelled
+        // input operation. Its bounded server-timestamp wait must still run.
+        g_input_cancelled = 0;
+        std::signal(SIGTERM, SIG_DFL);
+        std::signal(SIGINT, SIG_DFL);
         // Never touch the parent's X connection; just let go of its socket.
         close(inherited_display_fd);
         const int null = open("/dev/null", O_RDWR);
@@ -2143,6 +2170,7 @@ Window FocusedPidWindow(Display *display, unsigned long pid, Atom pid_atom) {
 }
 
 int RunPaste(int argc, char **argv, const std::optional<WindowBinding> &binding) {
+    InputCancellation cancellation;
     std::uint64_t pid_value = 0;
     std::uint64_t deadline_value = 0;
     if (!ParseLimitAndDeadline(argc, argv, "expected-pid", static_cast<std::uint64_t>(INT_MAX),
@@ -2200,6 +2228,11 @@ int RunPaste(int argc, char **argv, const std::optional<WindowBinding> &binding)
             return fail(problem, "clipboard_preflight", false, kExitTooLarge);
         }
         saved = kept.value();
+    }
+    // A cancelled clipboard read can have returned only part of the original
+    // offer. Never replace its owner unless the entire preflight completed.
+    if (DeadlineExpired(deadline.value())) {
+        return fail("deadline_exceeded", "clipboard_preflight", false, kExitTimeoutBeforeDispatch);
     }
     const std::vector<Item> offer = {
         {selection.utf8, selection.utf8, 8, *text},
@@ -2264,7 +2297,7 @@ int RunPaste(int argc, char **argv, const std::optional<WindowBinding> &binding)
             restore();
             return fail("focus_owner_changed", "paste_delivery", true, kExitUnknownEffect);
         }
-        while (XPending(display) > 0 && !consumed) {
+        while (XPending(display) > 0 && !consumed && !DeadlineExpired(deadline.value())) {
             XEvent event{};
             XNextEvent(display, &event);
             if (event.type == SelectionClear) {
@@ -2313,6 +2346,7 @@ int RunPaste(int argc, char **argv, const std::optional<WindowBinding> &binding)
 }
 
 int RunGlobalKey(int argc, char **argv) {
+    InputCancellation cancellation;
     const auto pairs = ParsePairs(argc, argv, {"keys", "deadline-monotonic-ns"});
     if (!pairs.has_value() || pairs->size() != 2) {
         EmitError("invalid_arguments", "arguments", false);
@@ -2361,7 +2395,7 @@ int RunGlobalKey(int argc, char **argv) {
         return kExitTimeoutBeforeDispatch;
     }
     std::cout << "{\"event\":\"dispatch_started\"}" << std::endl;
-    const bool ok = PressChord(display, chord.value());
+    const bool ok = PressChord(display, chord.value(), [&] { return !DeadlineExpired(*deadline); });
     XCloseDisplay(display);
     if (!ok) {
         EmitError("x11_error", "keyboard_dispatch", true);
@@ -2386,7 +2420,7 @@ int main(int argc, char **argv) {
             return kExitInvalid;
         }
         // This protocol handshake does not open a display or touch input state.
-        std::cout << R"({"helper":"aad-linux-xtest","protocol":1,"features":["focus-info","type-text","pointer-click","pointer-gesture","drag","key-chord","window-info","window-action","paste","clipboard-read","global-key","record-input","pointer-modifiers","x11-desktop-independent","bounded-hold","window-focus"]})"
+        std::cout << R"({"helper":"aad-linux-xtest","protocol":1,"features":["focus-info","type-text","pointer-click","pointer-gesture","drag","key-chord","window-info","window-action","paste","clipboard-read","global-key","record-input","pointer-modifiers","x11-desktop-independent","bounded-hold","window-focus","cooperative-cancel"]})"
                   << std::endl;
         return 0;
     }
@@ -2420,6 +2454,8 @@ int main(int argc, char **argv) {
     if (command == "global-key") {
         return RunGlobalKey(argc, argv);
     }
+    std::optional<InputCancellation> cancellation;
+    if (command == "type-text" || command == "pointer-click") cancellation.emplace();
     std::optional<std::uint64_t> expected_pid;
     std::optional<std::uint64_t> deadline_ns;
     std::optional<int> click_x;

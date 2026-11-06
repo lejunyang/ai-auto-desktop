@@ -104,7 +104,7 @@ impl LinuxBackend {
             monotonic_deadline_ns(deadline)?.to_string(),
         ];
         append_window_args(&mut args, window, None);
-        let output = run_helper(
+        let output = self.run_helper(
             path,
             &args,
             None,
