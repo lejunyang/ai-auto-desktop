@@ -11,6 +11,10 @@
 #include <QWidget>
 
 // Only timings leave the fixture; no key codes, characters or input text.
+bool report_events = false;
+void report(const QString &event) {
+    if (report_events) QTextStream(stdout) << event << '\n' << Qt::flush;
+}
 void status(QLabel *label, const QString &value) {
     label->setText(value);
     label->setAccessibleName(value);
@@ -23,13 +27,14 @@ public:
     }
 protected:
     void keyPressEvent(QKeyEvent *event) override {
-        if (!event->isAutoRepeat() && !held_) { held_ = true; clock_.start(); }
+        if (!event->isAutoRepeat() && !held_) { held_ = true; clock_.start(); report("key down"); }
         event->accept();
     }
     void keyReleaseEvent(QKeyEvent *event) override {
         if (!event->isAutoRepeat() && held_) {
             held_ = false;
             status(label_, QString("Hold key released %1 ms").arg(clock_.elapsed()));
+            report(QString("key up %1").arg(clock_.elapsed()));
         }
         event->accept();
     }
@@ -47,10 +52,12 @@ public:
 protected:
     void mousePressEvent(QMouseEvent *event) override {
         clock_.start();
+        report("click down");
         QPushButton::mousePressEvent(event);
     }
     void mouseReleaseEvent(QMouseEvent *event) override {
         if (clock_.isValid()) status(label_, QString("Hold click released %1 ms").arg(clock_.elapsed()));
+        if (clock_.isValid()) report(QString("click up %1").arg(clock_.elapsed()));
         QPushButton::mouseReleaseEvent(event);
     }
 private:
@@ -67,6 +74,7 @@ public:
 protected:
     void mousePressEvent(QMouseEvent *event) override {
         clock_.start(); first_move_ms_ = -1; start_ = event->pos();
+        report("drag down");
         event->accept();
     }
     void mouseMoveEvent(QMouseEvent *event) override {
@@ -77,6 +85,7 @@ protected:
     }
     void mouseReleaseEvent(QMouseEvent *event) override {
         if (clock_.isValid()) status(label_, QString("Hold drag released %1 ms first move %2 ms").arg(clock_.elapsed()).arg(first_move_ms_));
+        if (clock_.isValid()) report(QString("drag up %1").arg(clock_.elapsed()));
         event->accept();
     }
 private:
@@ -88,6 +97,7 @@ private:
 
 int main(int argc, char **argv) {
     QApplication application(argc, argv);
+    report_events = application.arguments().contains("--report-events");
     QAccessible::setActive(true);
     application.setApplicationName("AAD Qt Hold Fixture");
     application.setOrganizationName("ai-auto-desktop");
