@@ -1581,6 +1581,279 @@ fn drag_to(session: &Session, main: &str, from: &str, (role, to): (&str, &str)) 
     )
 }
 
+fn surface_path(target: &Target, points: &[(f64, f64)], hold_ms: Option<u64>) -> Action {
+    Action::Drag {
+        to: target.clone(),
+        button: None,
+        modifiers: vec![PointerModifier::Ctrl],
+        hold_ms,
+        fraction: Some(Fraction { fx: 0.1, fy: 0.1 }),
+        to_fraction: Some(Fraction { fx: 0.9, fy: 0.1 }),
+        path: points
+            .iter()
+            .map(|&(fx, fy)| DragAnchor {
+                target: target.clone(),
+                fraction: Fraction { fx, fy },
+            })
+            .collect(),
+    }
+}
+
+#[test]
+#[ignore = "requires isolated Chromium with its sandbox enabled; CI runs it explicitly"]
+fn drag_paths_draw_the_requested_shape_on_canvas_and_closed_shadow_surfaces() {
+    use base64::Engine;
+    let _serial = serial();
+    let fixture = Fixture::new();
+    let (session, _) = session_for(&fixture);
+    let main = main_of(&session, &fixture.page_id);
+    assert!(wait_until(&session, &main, "Typed", WaitCondition::Appears)
+        .error
+        .is_none());
+    for closed in [false, true] {
+        assert_eq!(
+            page_value(
+                &fixture,
+                &format!(
+                    r#"(() => {{
+            document.body.innerHTML='';
+            const host=document.createElement({tag});host.setAttribute('aria-label','Path surface');
+            host.style='display:block;width:300px;height:200px';document.body.append(host);
+            const canvas={canvas};canvas.width=300;canvas.height=200;canvas.style='display:block';
+            window.pathEvents=[];const ink=canvas.getContext('2d');
+            for(const type of ['mousedown','mousemove','mouseup'])canvas.addEventListener(type,e=>{{
+                if(type==='mousemove'&&e.buttons!==1)return;
+                window.pathEvents.push([type,e.offsetX,e.offsetY,e.buttons,e.ctrlKey,e.isTrusted,performance.now()]);
+                if(type==='mousedown'){{ink.beginPath();ink.moveTo(e.offsetX,e.offsetY);}}
+                if(type==='mousemove'){{ink.strokeStyle='blue';ink.lineWidth=6;ink.lineTo(e.offsetX,e.offsetY);ink.stroke();}}
+            }});return true;
+        }})()"#,
+                    tag = if closed { "'x-path'" } else { "'canvas'" },
+                    canvas = if closed {
+                        "host.attachShadow({mode:'closed'}).appendChild(document.createElement('canvas'))"
+                    } else {
+                        "host"
+                    }
+                )
+            ),
+            true
+        );
+        let observed = observe(&session, &main);
+        let target: Target =
+            serde_json::from_value(node(&observed, "Path surface")["target"].clone()).unwrap();
+        let result = act(
+            &session,
+            target.clone(),
+            surface_path(&target, &[(0.1, 0.9), (0.9, 0.9)], Some(100)),
+        );
+        assert!(result.error.is_none(), "closed={closed}: {result:?}");
+        assert_eq!(result.data.unwrap()["backend_result"]["steps"], 3);
+        let events = page_value(&fixture, "window.pathEvents");
+        let events = events.as_array().unwrap();
+        assert_eq!(events.len(), 5, "{events:?}");
+        for (event, (kind, x, y, buttons)) in events.iter().zip([
+            ("mousedown", 30, 20, 1),
+            ("mousemove", 30, 180, 1),
+            ("mousemove", 270, 180, 1),
+            ("mousemove", 270, 20, 1),
+            ("mouseup", 270, 20, 0),
+        ]) {
+            assert_eq!(
+                &event.as_array().unwrap()[..6],
+                &[
+                    json!(kind),
+                    json!(x),
+                    json!(y),
+                    json!(buttons),
+                    json!(true),
+                    json!(true)
+                ]
+            );
+        }
+        assert!(events[1][6].as_f64().unwrap() - events[0][6].as_f64().unwrap() >= 100.0);
+        for index in 2..4 {
+            assert!(
+                events[index][6].as_f64().unwrap() - events[index - 1][6].as_f64().unwrap() >= 15.0
+            );
+        }
+        let observed = observe(&session, &main);
+        let target =
+            serde_json::from_value(node(&observed, "Path surface")["target"].clone()).unwrap();
+        let capture = call(&session, Operation::Capture { target });
+        assert!(capture.error.is_none(), "{capture:?}");
+        let capture = capture.data.unwrap();
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(capture["data"].as_str().unwrap())
+            .unwrap();
+        let image = image::load_from_memory(&bytes).unwrap().into_rgb8();
+        for (x, y) in [(30, 100), (150, 180), (270, 100)] {
+            assert_eq!(image.get_pixel(x, y).0, [0, 0, 255]);
+        }
+        assert_eq!(
+            image.get_pixel(150, 20).0,
+            [255, 255, 255],
+            "a direct line would paint the top edge"
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires isolated Chromium with its sandbox enabled; CI runs it explicitly"]
+fn drag_paths_preflight_every_anchor_and_release_after_mutation_timeout_or_cancel() {
+    let _serial = serial();
+    let fixture = Fixture::new();
+    let (session, _) = session_for(&fixture);
+    let session = Arc::new(session);
+    let main = main_of(&session, &fixture.page_id);
+    assert!(wait_until(&session, &main, "Typed", WaitCondition::Appears)
+        .error
+        .is_none());
+    assert_eq!(
+        page_value(
+            &fixture,
+            r#"document.body.innerHTML='<canvas aria-label="Path surface" width="300" height="200" style="display:block"></canvas>';
+        window.pathCanvas=document.querySelector('canvas');window.pathEvents=[];window.pathFailure='';
+        document.addEventListener('mousedown',e=>window.pathEvents.push(['down',e.buttons,e.isTrusted]));
+        document.addEventListener('mouseup',e=>window.pathEvents.push(['up',e.buttons,e.isTrusted]));
+        pathCanvas.addEventListener('mousemove',e=>{
+            if(e.buttons!==1)return;window.pathEvents.push(['move',e.buttons,e.isTrusted]);
+            if(window.pathEvents.filter(e=>e[0]==='move').length!==1)return;
+            if(window.pathFailure==='overlay'){const b=pathCanvas.getBoundingClientRect(),cover=document.createElement('div');cover.id='path-cover';cover.style=`position:fixed;left:${b.left+250}px;top:${b.top+160}px;width:40px;height:40px;background:white;z-index:999`;document.body.append(cover);}
+            if(window.pathFailure==='move')pathCanvas.style.marginLeft='20px';
+            if(window.pathFailure==='timeout'){const until=performance.now()+400;while(performance.now()<until){}}
+        });true"#
+        ),
+        true
+    );
+    let get_target = || {
+        let observed = observe(&session, &main);
+        serde_json::from_value::<Target>(node(&observed, "Path surface")["target"].clone()).unwrap()
+    };
+    let target = get_target();
+    let refused = call_within(
+        &session,
+        Operation::Act {
+            target: target.clone(),
+            action: surface_path(&target, &[(0.1, 0.9), (0.9, 0.9)], None),
+            verify: None,
+        },
+        100,
+    );
+    assert_eq!(refused.error.unwrap()["code"], "CONTROL.TIMEOUT");
+    assert_eq!(page_value(&fixture, "window.pathEvents"), json!([]));
+    assert_eq!(page_value(&fixture, "pathCanvas.draggable=true;true"), true);
+    let target = get_target();
+    let refused = act(
+        &session,
+        target.clone(),
+        surface_path(&target, &[(0.1, 0.9)], None),
+    );
+    assert_eq!(refused.error.unwrap()["code"], "CONTROL.ACTION_UNSUPPORTED");
+    assert_eq!(page_value(&fixture, "window.pathEvents"), json!([]));
+    assert_eq!(page_value(&fixture,"pathCanvas.draggable=false;const cover=document.createElement('div');cover.id='path-cover';cover.style='position:fixed;left:20px;top:170px;width:50px;height:40px;background:white;z-index:999';document.body.append(cover);true"),true);
+    let target = get_target();
+    let refused = act(
+        &session,
+        target.clone(),
+        surface_path(&target, &[(0.1, 0.9)], None),
+    );
+    assert_eq!(refused.error.unwrap()["code"], "CONTROL.OCCLUDED");
+    assert_eq!(page_value(&fixture, "window.pathEvents"), json!([]));
+    assert_eq!(
+        page_value(
+            &fixture,
+            "document.getElementById('path-cover').remove();true"
+        ),
+        true
+    );
+    for (mode, code) in [
+        ("overlay", "CONTROL.OCCLUDED"),
+        ("move", "CONTROL.STALE_TARGET"),
+        ("timeout", "BROWSER.CDP_ERROR"),
+    ] {
+        assert_eq!(
+            page_value(
+                &fixture,
+                &format!("window.pathEvents=[];window.pathFailure='{mode}';true")
+            ),
+            true
+        );
+        let target = get_target();
+        let result = call_within(
+            &session,
+            Operation::Act {
+                target: target.clone(),
+                action: surface_path(&target, &[(0.1, 0.9), (0.9, 0.9)], None),
+                verify: None,
+            },
+            if mode == "timeout" { 300 } else { 3000 },
+        );
+        assert_eq!(result.error.as_ref().unwrap()["code"], code, "{result:?}");
+        if mode == "timeout" {
+            assert!(
+                result.error.as_ref().unwrap()["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("deadline"),
+                "{result:?}"
+            );
+        }
+        assert_eq!(
+            result.error.unwrap()["details"]["pointer_button_released"],
+            true
+        );
+        assert_eq!(
+            page_value(&fixture, "window.pathEvents"),
+            json!([["down", 1, true], ["move", 1, true], ["up", 0, true]])
+        );
+        assert_eq!(page_value(&fixture,"document.getElementById('path-cover')?.remove();pathCanvas.style.marginLeft='0';true"),true);
+    }
+    assert_eq!(
+        page_value(&fixture, "window.pathEvents=[];window.pathFailure='';true"),
+        true
+    );
+    let target = get_target();
+    let points: Vec<_> = (0..32)
+        .map(|index| {
+            if index % 2 == 0 {
+                (0.1, 0.9)
+            } else {
+                (0.9, 0.9)
+            }
+        })
+        .collect();
+    let request = Request::new(
+        Some(session.id().into()),
+        Operation::Act {
+            target: target.clone(),
+            action: surface_path(&target, &points, None),
+            verify: None,
+        },
+    );
+    let request_id = request.request_id.clone();
+    let worker_session = session.clone();
+    let worker = std::thread::spawn(move || worker_session.execute(&request));
+    let until = Instant::now() + Duration::from_secs(3);
+    while page_value(&fixture, "window.pathEvents.some(e=>e[0]==='move')") != true {
+        assert!(Instant::now() < until, "path never started");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(session.cancel(&request_id));
+    let result = worker.join().unwrap();
+    assert_eq!(result.error.as_ref().unwrap()["code"], "CONTROL.CANCELLED");
+    assert_eq!(
+        result.error.unwrap()["details"]["pointer_button_released"],
+        true
+    );
+    let events = page_value(&fixture, "window.pathEvents");
+    let events = events.as_array().unwrap();
+    assert_eq!(events.last().unwrap(), &json!(["up", 0, true]));
+    assert!(
+        events.len() < 35,
+        "cancelled path should not finish all its moves"
+    );
+}
+
 #[test]
 #[ignore = "requires isolated Chromium with its sandbox enabled; CI runs it explicitly"]
 fn canvas_surfaces_take_trusted_clicks_wheels_and_drags_inside_the_same_element() {

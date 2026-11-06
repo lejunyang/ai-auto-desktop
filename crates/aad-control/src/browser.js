@@ -313,6 +313,23 @@
       const found=check(args); if(found.error) return found;
       return {ok:true};
     },
+    path_surface: args => {
+      const found=check(args); if(found.error)return found;
+      const el=found.el;
+      if(!surface(el))return {error:'CONTROL.ACTION_UNSUPPORTED'};
+      const point=globalThis.__aadControlV1.point({...args,noscroll:true});
+      if(point.error)return point;
+      let hit=document.elementFromPoint(point.x,point.y);
+      while(hit) {
+        const root=closedRoots.get(hit)||hit.shadowRoot;
+        if(!root)break;
+        const inner=root.elementFromPoint(point.x,point.y);
+        if(!inner||inner===hit)break;
+        hit=inner;
+      }
+      for(let n=hit;n;n=n.parentNode||n.host)if(n.draggable)return {error:'CONTROL.ACTION_UNSUPPORTED'};
+      return {ok:true};
+    },
     // The checked element itself, by reference, for a protocol call that needs the node.
     element: args => {
       const found=check(args); return found.error ? null : found.el;

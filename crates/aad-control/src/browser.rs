@@ -2306,11 +2306,12 @@ impl Backend for BrowserBackend {
             // elements of enclosing frames are brought into view first.
             let route=if trusted {Route::to(state,frame_id)?} else {Route::default()};
             if let Action::Drag {to,fraction,to_fraction,button,modifiers,hold_ms,path}=action {
-                if !path.is_empty() {return Err(error("CONTROL.ACTION_UNSUPPORTED","browser drag paths are not implemented"));}
+                if !path.is_empty() && node["tag"]!="canvas" && node["surface"]!="closed_shadow" {return Err(error("CONTROL.ACTION_UNSUPPORTED","browser drag paths require an observed canvas or closed-shadow surface"));}
                 let observed=|node_id:&str,fraction:&Option<crate::Fraction>,action:Value|{let mut args=json!({"document_token":snapshot["document_token"],"observation":snapshot["snapshot_id"],"node_id":node_id,"action":action,"frame_id":frame_id,"loader_id":meta["loader_id"]});if let Some(f)=fraction{args["fraction"]=json!({"fx":f.fx,"fy":f.fy});}args};
                 let from=observed(node["node_id"].as_str().unwrap_or_default(),fraction,json!("drag"));
                 let onto=observed(&to.node_id,to_fraction,Value::Null);
-                return drag(state,&context,&route,&from,&onto,*button,pointer_modifiers(modifiers),*hold_ms,action_context);
+                let path:Vec<_>=path.iter().map(|anchor|observed(&anchor.target.node_id,&Some(anchor.fraction),json!("drag"))).collect();
+                return drag(state,&context,&route,&from,&onto,*button,pointer_modifiers(modifiers),*hold_ms,&path,action_context);
             }
             let client=&mut state.client;
             let mut args=json!({"document_token":snapshot["document_token"],"observation":snapshot["snapshot_id"],"node_id":node["node_id"],"action":action.name(),"frame_id":frame_id,"loader_id":meta["loader_id"]});
@@ -3060,6 +3061,35 @@ fn arrive(
 const DRAG_STEPS: u32 = 12;
 /// How long an HTML5 drag may take to reach the browser after the last move.
 const DRAG_SETTLE: Duration = Duration::from_millis(150);
+const DRAG_PATH_INTERVAL_MS: u64 = 16;
+
+fn drag_path_preflight(
+    context: &crate::Context,
+    hold_ms: Option<u64>,
+    anchors: usize,
+) -> Result<()> {
+    if anchors > 0
+        && context.remaining()?
+            < Duration::from_millis(
+                hold_ms.unwrap_or(0) + (anchors as u64 + 1) * DRAG_PATH_INTERVAL_MS,
+            ) + INPUT_CLEANUP
+    {
+        return Err(error(
+            "CONTROL.TIMEOUT",
+            "request deadline does not cover the drag path and input release",
+        ));
+    }
+    Ok(())
+}
+
+fn path_surface(client: &mut Client, context: &Ctx, args: &Value) -> Result<()> {
+    checked(eval(
+        client,
+        context,
+        format!("globalThis.__aadControlV1.path_surface({args})"),
+    )?)?;
+    Ok(())
+}
 
 /// Press on one observed node, glide, release on another. Both ends are hit
 /// tested while both are in view. An HTML5 drag (draggable, dragstart/drop)
@@ -3075,9 +3105,11 @@ fn drag(
     button: Option<Button>,
     modifiers: u32,
     hold_ms: Option<u64>,
+    path: &[Value],
     action_context: &crate::Context,
 ) -> Result<Value> {
     hold_preflight(action_context, hold_ms)?;
+    drag_path_preflight(action_context, hold_ms, path.len())?;
     let deadline = Instant::now() + action_context.remaining()?;
     let client = &mut page.client;
     landing(client, context, from)?;
@@ -3103,6 +3135,14 @@ fn drag(
     let start = route.page_point(client, start)?;
     let end = landing(client, context, &still(onto))?;
     let end = route.page_point(client, end)?;
+    let mut waypoints = Vec::new();
+    if !path.is_empty() {
+        path_surface(client, context, from)?;
+        for args in path.iter().chain(std::iter::once(onto)) {
+            let point = landing(client, context, &still(args))?;
+            waypoints.push((args, route.page_point(client, point)?));
+        }
+    }
     let (name, mask) = match button {
         None | Some(Button::Left) => ("left", 1),
         Some(Button::Right) => ("right", 2),
@@ -3132,6 +3172,14 @@ fn drag(
             action_context,
         )?;
         hold_preflight(action_context, hold_ms)?;
+        drag_path_preflight(action_context, hold_ms, path.len())?;
+        if !path.is_empty() {
+            held_pointer(&mut page.client, context, route, from, start)?;
+            for (args, point) in &waypoints {
+                held_pointer(&mut page.client, context, route, args, *point)?;
+            }
+            path_surface(&mut page.client, context, from)?;
+        }
         held = true;
         mouse(
             &mut page.client,
@@ -3142,28 +3190,60 @@ fn drag(
             held_pointer(client, context, route, onto, end)
         })?;
         let mut intercepted = None;
-        for step in 1..=DRAG_STEPS {
-            let f = f64::from(step) / f64::from(DRAG_STEPS);
-            let (x, y) = (
-                start.0 + (end.0 - start.0) * f,
-                start.1 + (end.1 - start.1) * f,
-            );
-            last = (x, y);
-            mouse(
-                &mut page.client,
-                json!({"type": "mouseMoved", "x": x, "y": y, "button": name, "buttons": mask, "modifiers": modifiers}),
-            )?;
-            page.sync_dialog();
-            if let Some(data) = page.drag.take() {
-                intercepted = Some(data);
-                break;
+        if !path.is_empty() {
+            let mut prior = (from, start);
+            for (args, point) in &waypoints {
+                wait_hold(
+                    &mut page.client,
+                    Some(DRAG_PATH_INTERVAL_MS),
+                    action_context,
+                    |client| {
+                        path_surface(client, context, from)?;
+                        held_pointer(client, context, route, prior.0, prior.1)?;
+                        held_pointer(client, context, route, args, *point)
+                    },
+                )?;
+                last = *point;
+                mouse(
+                    &mut page.client,
+                    json!({"type":"mouseMoved","x":point.0,"y":point.1,"button":name,"buttons":mask,"modifiers":modifiers}),
+                )?;
+                page.sync_dialog();
+                if page.drag.take().is_some() {
+                    return Err(error(
+                        "CONTROL.ACTION_UNSUPPORTED",
+                        "HTML5 drag interception is unsupported for a surface path",
+                    )
+                    .with_effect("unknown"));
+                }
+                prior = (args, *point);
             }
-        }
-        let settle = Instant::now() + DRAG_SETTLE;
-        while intercepted.is_none() && name == "left" && Instant::now() < settle {
-            std::thread::sleep(Duration::from_millis(10));
-            page.sync_dialog();
-            intercepted = page.drag.take();
+            action_context.remaining()?;
+            held_pointer(&mut page.client, context, route, onto, end)?;
+        } else {
+            for step in 1..=DRAG_STEPS {
+                let f = f64::from(step) / f64::from(DRAG_STEPS);
+                let (x, y) = (
+                    start.0 + (end.0 - start.0) * f,
+                    start.1 + (end.1 - start.1) * f,
+                );
+                last = (x, y);
+                mouse(
+                    &mut page.client,
+                    json!({"type": "mouseMoved", "x": x, "y": y, "button": name, "buttons": mask, "modifiers": modifiers}),
+                )?;
+                page.sync_dialog();
+                if let Some(data) = page.drag.take() {
+                    intercepted = Some(data);
+                    break;
+                }
+            }
+            let settle = Instant::now() + DRAG_SETTLE;
+            while intercepted.is_none() && name == "left" && Instant::now() < settle {
+                std::thread::sleep(Duration::from_millis(10));
+                page.sync_dialog();
+                intercepted = page.drag.take();
+            }
         }
         let client = &mut page.client;
         let operation = match &intercepted {
@@ -3188,7 +3268,7 @@ fn drag(
         held = false;
         Ok(
             json!({"submitted": true, "native_operation": operation, "trusted_event": true,
-                "html5_drag": intercepted.is_some(), "steps": DRAG_STEPS}),
+                "html5_drag": intercepted.is_some(), "steps": if path.is_empty(){DRAG_STEPS as usize}else{waypoints.len()}}),
         )
     })();
     if result.is_err() {
@@ -3204,6 +3284,11 @@ fn drag(
     } else {
         true
     };
+    // Cancel even if the interception event has not reached this connection
+    // yet. Releasing the held pointer takes priority in the cleanup budget.
+    let cancelled = result.is_ok()
+        || path.is_empty()
+        || command(&mut page.client, "Input.cancelDragging", json!({})).is_ok();
     let disabled = command(
         &mut page.client,
         "Input.setInterceptDrags",
@@ -3220,6 +3305,7 @@ fn drag(
         .map_err(|e| {
             e.with_detail("pointer_button_released", json!(cleared))
                 .with_detail("drag_interception_cleared", json!(interception_cleared))
+                .with_detail("html5_drag_cancelled", json!(cancelled))
         })
 }
 
