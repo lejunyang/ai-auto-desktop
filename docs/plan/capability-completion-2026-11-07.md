@@ -56,6 +56,7 @@
 - `hold-kde/summary.json`：`verify-bounded-hold.ps1` 请求 200 ms，Qt 应用独立记录 F2 按下至释放 205 ms、按钮 201 ms、拖拽第一次移动 205 ms/释放 405 ms。此前可打印字母用例未收到计时状态，不能据此宣称 IME 长按已通过；改用 F2 隔离输入法影响。
 - `hold-helpers/validation.json`：私有 Xvfb 独立回读键鼠状态与时序；长按、截止时间、helper 终止、焦点/遮挡变化后的释放，以及不接管外部已按住的键鼠通过。helper 终止不等于 `control_cancel`，原生 provider 的即时取消传播仍待实现。
 - `browser-hold-targeted.log`、`browser-hold-full.log`：真实 Chromium 长按、拖拽起点停留、预算不足、焦点变化、遮挡和会话取消后的释放通过，功能提交前完整回归 24/24；日志同样位于 `artifacts/capability-audit-2026-11-07/`。
+- `electron-native/summary.json`：独立 profile 的 VS Code，414 节点截断观察缩小到 31 节点完整编辑框；点击被 `DRIVER.POINT_NOT_PROVEN` 拒绝，focus/key/paste 返回已派发但实际文本不符，未继续保存，不算编辑成功。初始树含 Welcome 模态界面，随后 X11 检查发现同 PID 另一活动原生对话框；需要先处理启动界面，并用同进程双窗口 fixture 独立验证键盘焦点边界。仅凭动作之后的活动窗口不能断定此前每次输入落点。
 - Windows 修饰键代码已用 pin 工具链实际 `x86_64-pc-windows-gnu` cfg 做 check/clippy；这只证明编译，不能当成 Windows SendInput 效果验收。**[待验证]** Windows 交互桌面、相应权限与 DPI/IME 测试环境。
 
 各功能的测试数字对应其提交时点；后续共享模型变化后仍需相应回归。未验证的平台与场景保持待办，不从 KDE/Chromium 的成功外推。
