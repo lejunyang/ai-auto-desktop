@@ -19,6 +19,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "aad-bidi"
+version = "0.0.6"
+dependencies = [
+ "aad-cdp",
+ "serde_json",
+]
+
+[[package]]
 name = "aad-cdp"
 version = "0.0.6"
 dependencies = [

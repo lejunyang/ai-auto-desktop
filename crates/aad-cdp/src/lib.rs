@@ -28,6 +28,14 @@ mod ws;
 pub use connection::EventBatch;
 pub use ws::CdpError;
 
+/// Protocol-neutral local WebSocket framing and JSON request/reply transport.
+/// This does not construct or send CDP commands. Other local browser protocols
+/// keep their own sessions, methods, capabilities and error interpretation.
+pub mod transport {
+    pub use crate::connection::{Connection, EventBatch};
+    pub use crate::ws::{CdpError as TransportError, WebSocket};
+}
+
 /// A page/frame target exposed at `/json/list`. The websocket field keeps the
 /// devtools protocol's camelCase name; it is an external contract.
 #[allow(non_snake_case)]

@@ -66,7 +66,7 @@ pub struct EventBatch {
     pub failure: Option<CdpError>,
 }
 
-pub(crate) struct Connection {
+pub struct Connection {
     socket: WebSocket,
     inbox: Arc<Mutex<Inbox>>,
     reader: Option<std::thread::JoinHandle<()>>,
@@ -143,6 +143,11 @@ impl Connection {
 
     pub fn set_cancellation(&mut self, cancel: Arc<std::sync::atomic::AtomicBool>) {
         self.cancel = Some(cancel);
+    }
+    /// Cleanup may release already-held input after the request was cancelled.
+    /// Its caller supplies a separate, short deadline and sends no new input.
+    pub fn clear_cancellation(&mut self) {
+        self.cancel = None;
     }
     fn receive(
         &self,

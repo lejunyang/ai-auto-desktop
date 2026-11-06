@@ -13,6 +13,7 @@ members = [
     "crates/aad-atspi",
     "crates/aad-macos-ax",
     "crates/aad-cdp",
+    "crates/aad-bidi",
     "crates/aad-control",
     "crates/aad-probe",
     "crates/aad-uia",
@@ -44,6 +45,7 @@ aad-ocr = { path = "crates/aad-ocr", version = "0.0.6" }
 aad-atspi = { path = "crates/aad-atspi", version = "0.0.6" }
 aad-macos-ax = { path = "crates/aad-macos-ax", version = "0.0.6" }
 aad-cdp = { path = "crates/aad-cdp", version = "0.0.6" }
+aad-bidi = { path = "crates/aad-bidi", version = "0.0.6" }
 aad-control = { path = "crates/aad-control", version = "0.0.6" }
 aad-probe = { path = "crates/aad-probe", version = "0.0.6" }
 aad-uia = { path = "crates/aad-uia", version = "0.0.6" }
