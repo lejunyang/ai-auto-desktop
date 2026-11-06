@@ -1038,9 +1038,6 @@ impl AtspiProvider {
                 &fresh,
                 deadline,
             )?;
-            if to_id == fresh_id {
-                return Err(invalid("drag needs a destination other than its source"));
-            }
             let to_point = point_in(
                 parse_bounds(to_node.get("bounds"))?,
                 parse_fraction(args.get("to_fraction"))?,
@@ -2613,6 +2610,7 @@ mod tests {
                     "invoke".into(),
                     "pointer_click".into(),
                     "pointer_gesture".into(),
+                    "drag".into(),
                     "key_chord".into(),
                     "minimize".into(),
                     "paste".into(),
@@ -2848,6 +2846,18 @@ mod tests {
         ) -> Result<Value, AutomationError> {
             self.writes.fetch_add(1, Ordering::SeqCst);
             Ok(json!({"keys": keys}))
+        }
+        fn drag(
+            &self,
+            _target: &NativeRef,
+            from: (i32, i32),
+            to: (i32, i32),
+            _button: u8,
+            _process_id: u32,
+            _deadline: Instant,
+        ) -> Result<Value, AutomationError> {
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            Ok(json!({"from": from, "to": to}))
         }
         fn start_recording(
             &self,
@@ -3168,6 +3178,35 @@ mod tests {
             result.unwrap();
             assert_eq!(backend.writes.load(Ordering::SeqCst), 1);
         }
+    }
+
+    #[test]
+    fn same_element_drag_revalidates_both_fractions_in_one_fresh_snapshot() {
+        let backend = Arc::new(FakeBackend {
+            hit_chain: 1,
+            ..Default::default()
+        });
+        let provider = AtspiProvider::new(backend.clone()).unwrap();
+        let observed = take_snapshot(&provider);
+        let target = json!({"snapshot_id": observed["snapshot_id"], "revision": observed["revision"], "node_id": "n0"});
+        let result = provider.invoke("desktop.linux_atspi.drag@1", json!({"target": target, "locator": locator(), "to": target, "to_locator": locator(), "fraction": {"fx": 0.1, "fy": 0.5}, "to_fraction": {"fx": 0.9, "fy": 0.5}}), Some(Duration::from_secs(2))).unwrap();
+        assert_ne!(
+            result["backend_result"]["from"],
+            result["backend_result"]["to"]
+        );
+        assert_eq!(backend.captures.load(Ordering::SeqCst), 2);
+        assert_eq!(backend.writes.load(Ordering::SeqCst), 1);
+        let observed = take_snapshot(&provider);
+        let target = json!({"snapshot_id": observed["snapshot_id"], "revision": observed["revision"], "node_id": "n0"});
+        let mut stale_end = target.clone();
+        stale_end["revision"] = json!(0);
+        let result = provider.invoke("desktop.linux_atspi.drag@1", json!({"target": target, "locator": locator(), "to": stale_end, "to_locator": locator(), "fraction": {"fx": 0.1, "fy": 0.5}, "to_fraction": {"fx": 0.9, "fy": 0.5}}), Some(Duration::from_secs(2))).unwrap_err();
+        assert_eq!(result.code, "DRIVER.STALE_SNAPSHOT");
+        assert_eq!(
+            backend.writes.load(Ordering::SeqCst),
+            1,
+            "stale destination must not dispatch another drag"
+        );
     }
 
     #[test]
