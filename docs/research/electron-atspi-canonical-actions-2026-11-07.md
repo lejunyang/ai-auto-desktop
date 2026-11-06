@@ -43,7 +43,7 @@ pwsh -NoProfile -File tests/linux/verify-canonical-invoke.ps1 `
   -InputHelper /absolute/path/to/x11_xtest_helper `
   -OutputDirectory /absolute/path/to/canonical-evidence
 
-dbus-run-session -- cargo test --locked -p aad-atspi `
+osdk exec -- dbus-run-session -- cargo test --locked -p aad-atspi `
   canonical_action_count_uses_exact_atspi_wire_property -- --ignored
 ```
 
