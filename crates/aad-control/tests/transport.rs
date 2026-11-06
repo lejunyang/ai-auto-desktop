@@ -80,8 +80,14 @@ impl Harness {
             .unwrap(),
         );
         let input = server.try_clone().unwrap();
+        let closer = server.try_clone().unwrap();
         let server = std::thread::spawn(move || {
             let _ = transport::serve(input, server, endpoint);
+            // `aad control serve` exits once serve returns, closing its pipes.
+            // Here serve's reader keeps a clone of the socket open, and a
+            // frame it read just before serve stopped would wait for an
+            // answer forever: close the socket as the exit would.
+            let _ = closer.shutdown(Shutdown::Both);
         });
         let reader = socket.try_clone().unwrap();
         let writer = socket.try_clone().unwrap();

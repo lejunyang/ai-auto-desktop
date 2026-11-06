@@ -424,28 +424,37 @@ pub fn perform(
     Ok(json!({"step": step.id, "element": public(&found["node"]), "result": result}))
 }
 
+/// Wait as the session's own wait does: several matches are a passing state
+/// (a tree mid-change can show an element twice), neither the one element
+/// that should be there nor its absence, so they are waited out.
 fn wait(session: &Session, step: &Step, check: &Check, deadline: Instant) -> Result<Value> {
     let until = Instant::now() + Duration::from_millis(check.within_ms);
     let deadline = deadline.min(until + Duration::from_secs(5));
     loop {
-        let seen = match resource(session, &step.app, deadline)? {
-            None => false,
+        let (seen, ambiguous) = match resource(session, &step.app, deadline)? {
+            None => (Some(false), None),
             Some(resource_id) => {
                 let observation = observe(session, resource_id, deadline)?;
-                find(
+                match find(
                     session,
                     &observation,
                     &step.locator,
                     Expect::Optional,
                     deadline,
-                )?["found"]
-                    == true
+                ) {
+                    Ok(found) => (Some(found["found"] == true), None),
+                    Err(e) if crate::is_ambiguous(&e.code) => (None, Some(e)),
+                    Err(e) => return Err(e),
+                }
             }
         };
-        if seen == check.present {
-            return Ok(json!({"step": step.id, "present": seen}));
+        if seen == Some(check.present) {
+            return Ok(json!({"step": step.id, "present": check.present}));
         }
         if Instant::now() >= until {
+            if let Some(ambiguous) = ambiguous {
+                return Err(ambiguous);
+            }
             return Err(error(
                 "STEP.CHECK_FAILED",
                 if check.present {

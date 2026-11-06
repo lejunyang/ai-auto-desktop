@@ -453,7 +453,24 @@ fn wait_never_counts_an_ambiguous_match_and_reports_a_timeout() {
     );
     request.timeout_ms = 600;
     let response = session.execute(&request);
-    assert_eq!(response.error.unwrap()["code"], "CONTROL.AMBIGUOUS");
+    let failure = response.error.unwrap();
+    assert_eq!(failure["code"], "CONTROL.AMBIGUOUS");
+    // The candidates can be narrowed in the observation they came from.
+    let observation_id = failure["details"]["observation_id"].as_str().unwrap();
+    let narrowed = call(
+        &session,
+        Operation::Find {
+            observation_id: observation_id.into(),
+            locator: Box::new(Locator {
+                node_id: failure["details"]["candidates"][0]["node_id"]
+                    .as_str()
+                    .map(str::to_string),
+                ..Default::default()
+            }),
+            expect: Expect::One,
+        },
+    );
+    assert!(narrowed.error.is_none(), "{narrowed:?}");
     // Two of them are still something present: they have not disappeared.
     let mut request = Request::new(
         Some(session.id().into()),

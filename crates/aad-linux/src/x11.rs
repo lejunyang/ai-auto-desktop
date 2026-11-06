@@ -20,7 +20,7 @@ use x11rb::protocol::damage::{ConnectionExt as _, ReportLevel};
 use x11rb::protocol::randr::ConnectionExt as _;
 use x11rb::protocol::xfixes::ConnectionExt as _;
 use x11rb::protocol::xproto::{
-    Atom, AtomEnum, ConnectionExt as _, CreateWindowAux, ImageFormat, Window, WindowClass,
+    Atom, AtomEnum, ConnectionExt as _, CreateWindowAux, ImageFormat, Mapping, Window, WindowClass,
 };
 use x11rb::protocol::xtest::ConnectionExt as _;
 use x11rb::protocol::Event;
@@ -58,9 +58,8 @@ pub struct X11 {
     crop: Crop,
     /// Where the shared part was at the last capture, and the whole screen.
     pub shown: (Bounds, Bounds),
-    /// A keycode with nothing on it, for characters the map lacks, and what
-    /// it held before.
-    spare_key: Option<(u8, Vec<u32>)>,
+    /// Keycodes with nothing on them, borrowed for characters the map lacks.
+    spare_keys: Vec<SpareKey>,
     keysyms_per_keycode: u8,
     min_keycode: u8,
     keymap: Vec<u32>,
@@ -155,7 +154,7 @@ impl X11 {
             part: Part::All,
             crop: Crop::default(),
             shown: (desktop, desktop),
-            spare_key: None,
+            spare_keys: Vec::new(),
             keysyms_per_keycode: mapping.keysyms_per_keycode,
             min_keycode,
             keymap: mapping.keysyms,
@@ -588,29 +587,80 @@ impl X11 {
     }
 
     /// A keycode for a keysym the map lacks: a spare one, remapped to it.
+    ///
+    /// A client reads the changed map only when it next decodes a key, which
+    /// can be well after the press was sent: a key's keysym must stay until
+    /// then. So each character gets a spare keycode of its own, kept until
+    /// the viewer lets go (`release`), and a spare is only reused once its
+    /// last press has had `SPARE_KEY_SETTLE` to be read.
     fn remapped(&mut self, keysym: u32) -> Result<u8> {
+        if let Some(spare) = self.spare_keys.iter().find(|s| s.keysym == keysym) {
+            return Ok(spare.code);
+        }
         let per = usize::from(self.keysyms_per_keycode.max(1));
-        let code = match &self.spare_key {
-            Some((code, _)) => *code,
+        let unused = if self.spare_keys.len() < MAX_SPARE_KEYS {
+            self.keymap
+                .chunks(per)
+                .enumerate()
+                .rev()
+                .filter(|(_, syms)| syms.iter().all(|s| *s == 0))
+                .map(|(index, _)| self.min_keycode + index as u8)
+                .find(|code| self.spare_keys.iter().all(|s| s.code != *code))
+        } else {
+            None
+        };
+        let index = match unused {
+            Some(code) => {
+                self.spare_keys.push(SpareKey {
+                    code,
+                    original: vec![0; per],
+                    keysym: 0,
+                    pressed: None,
+                });
+                self.spare_keys.len() - 1
+            }
             None => {
-                let index = self
-                    .keymap
-                    .chunks(per)
-                    .rposition(|syms| syms.iter().all(|s| *s == 0))
+                let index = (0..self.spare_keys.len())
+                    .min_by_key(|i| self.spare_keys[*i].pressed)
                     .ok_or("the keyboard map has no spare keycode to type this character")?;
-                let code = self.min_keycode + index as u8;
-                self.spare_key = Some((code, vec![0; per]));
-                code
+                settle(self.spare_keys[index].pressed);
+                index
             }
         };
-        let syms = vec![keysym; per];
+        let code = self.spare_keys[index].code;
         self.conn
-            .change_keyboard_mapping(1, code, per as u8, &syms)
+            .change_keyboard_mapping(1, code, per as u8, &vec![keysym; per])
             .map_err(|e| failed("keyboard")(&e))?;
         self.flush()?;
-        // Clients read the new map when they see the mapping change.
-        std::thread::sleep(Duration::from_millis(20));
+        self.spare_keys[index].keysym = keysym;
+        self.await_mapping_notify(code);
         Ok(code)
+    }
+
+    /// Wait until the server has announced a changed key. On a busy server
+    /// the announcement can reach clients after a key event sent 20 ms after
+    /// the change, and a client then reads that press with the old, empty
+    /// map. It goes to every client at once, so ours arriving means theirs
+    /// is on its way ahead of the press; then a moment for them to read it.
+    fn await_mapping_notify(&mut self, code: u8) {
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while Instant::now() < deadline {
+            match self.conn.poll_for_event() {
+                Ok(Some(Event::MappingNotify(notify)))
+                    if notify.request == Mapping::KEYBOARD
+                        && (u16::from(notify.first_keycode)
+                            ..u16::from(notify.first_keycode) + u16::from(notify.count))
+                            .contains(&u16::from(code)) =>
+                {
+                    break
+                }
+                // Nothing else here needs events (capture fetches damage).
+                Ok(Some(_)) => {}
+                Ok(None) => std::thread::sleep(Duration::from_millis(2)),
+                Err(_) => break,
+            }
+        }
+        std::thread::sleep(Duration::from_millis(20));
     }
 
     pub fn key(&mut self, key: keys::Key, down: bool) -> Result<()> {
@@ -652,20 +702,26 @@ impl X11 {
                 }
             }
             self.flush()?;
-        }
-        self.restore_spare()
-    }
-
-    fn restore_spare(&mut self) -> Result<()> {
-        if let Some((code, syms)) = self.spare_key.take() {
-            // Let the last remapped key be read before its keysym goes.
-            std::thread::sleep(Duration::from_millis(20));
-            self.conn
-                .change_keyboard_mapping(1, code, syms.len() as u8, &syms)
-                .map_err(|e| failed("keyboard")(&e))?;
-            self.flush()?;
+            if let Some(spare) = self.spare_keys.iter_mut().find(|s| s.code == code) {
+                spare.pressed = Some(Instant::now());
+            }
         }
         Ok(())
+    }
+
+    /// Give the borrowed keycodes back what they held, once their last
+    /// presses have had time to be read.
+    fn restore_spare_keys(&mut self) -> Result<()> {
+        if self.spare_keys.is_empty() {
+            return Ok(());
+        }
+        settle(self.spare_keys.iter().filter_map(|s| s.pressed).max());
+        for spare in std::mem::take(&mut self.spare_keys) {
+            self.conn
+                .change_keyboard_mapping(1, spare.code, spare.original.len() as u8, &spare.original)
+                .map_err(|e| failed("keyboard")(&e))?;
+        }
+        self.flush()
     }
 
     pub fn release(&mut self) {
@@ -676,6 +732,7 @@ impl X11 {
             let _ = self.fake(BUTTON_RELEASE, button, 0, 0);
         }
         let _ = self.flush();
+        let _ = self.restore_spare_keys();
     }
 
     /// A `cursor` message when the pointer moved or changed, at most 60 a
@@ -808,10 +865,31 @@ impl X11 {
     }
 }
 
+/// A keycode borrowed for a character the keyboard map lacks.
+struct SpareKey {
+    code: u8,
+    /// What it held before.
+    original: Vec<u32>,
+    /// The keysym it holds now.
+    keysym: u32,
+    pressed: Option<Instant>,
+}
+
+/// How many keycodes a viewer's text may borrow at once.
+const MAX_SPARE_KEYS: usize = 16;
+/// How long a borrowed key keeps its keysym after a press, for a client that
+/// reads the changed map only when it decodes that press.
+const SPARE_KEY_SETTLE: Duration = Duration::from_millis(250);
+
+fn settle(pressed: Option<Instant>) {
+    if let Some(wait) = pressed.and_then(|at| SPARE_KEY_SETTLE.checked_sub(at.elapsed())) {
+        std::thread::sleep(wait);
+    }
+}
+
 impl Drop for X11 {
     fn drop(&mut self) {
         self.release();
-        let _ = self.restore_spare();
         let _ = self.conn.destroy_window(self.window);
         let _ = self.conn.flush();
     }

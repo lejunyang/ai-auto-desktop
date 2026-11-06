@@ -241,7 +241,7 @@ driver 求值；浏览器页面求值 `value`、`states`、`match`（contains �
 `condition`（`appears` 恰好一个匹配；`disappears` 没有匹配；`state` 恰好一个匹配且其 `states` 等于给出的
 `states` 对象），每隔 `interval_ms`（50..5000，默认 250）观察一次，直到满足或 `timeout_ms` 用完
 （`CONTROL.WAIT_TIMEOUT`，`details` 带 `polls` 与最后一次是否存在）。多个匹配永远不算找到：一直歧义到超时返回
-最后一次的歧义码（浏览器和 macOS AX 为 `CONTROL.AMBIGUOUS`，Windows 为 `DRIVER.AMBIGUOUS_MATCH`，Linux AT-SPI 为 `DRIVER.AMBIGUOUS`）。满足时返回最后一次的 `observation_id`，`appears`/`state` 还带该节点的 `target`，这次观察仍是当前观察，
+最后一次的歧义码（浏览器和 macOS AX 为 `CONTROL.AMBIGUOUS`，Windows 为 `DRIVER.AMBIGUOUS_MATCH`，Linux AT-SPI 为 `DRIVER.AMBIGUOUS`），`details` 带那次观察的 `observation_id`，可以在其中用候选的 `node_id` 定位。录制工作流里的 check 步骤也这样等：多个匹配既不算出现也不算消失，一直如此到期限时报歧义码。满足时返回最后一次的 `observation_id`，`appears`/`state` 还带该节点的 `target`，这次观察仍是当前观察，
 可以直接 act。等待期间占用会话串行锁（单请求上限 30 秒），`cancel` 可以中止，结果为 `not_committed`。
 
 给人用的 `aad apps/describe/overview/snapshot/find/do` 也走这个会话：每条命令一个进程、一个会话，
@@ -274,7 +274,7 @@ MCP 工具为 `control_capabilities`, `control_targets`, `control_observe`, `con
 `control_wait`, `control_act`, `control_capture`, `control_read_text`, `control_cancel`, `control_close`，
 授权时另有 `desktop_launch`、`clipboard_read`、`control_global_key`；本机未限定授权时另有 `probe_environment`、四个工作流工具和浏览器工具（含只读的 `browser_downloads`、`browser_storage`、`browser_network`）。
 每次调用可带 `request_id` 与 `timeout_ms`。`control_cancel` 的被取消请求字段名为 `target_request_id`；
-MCP cancellation notification 也能取消仍在执行的统一操作。错误响应带 `hint`，说明可行的恢复方式。
+MCP 服务一次只处理一个调用，后面的排队；MCP cancellation notification 能取消正在执行的统一操作，排队中的调用被取消后不再执行，直接返回 `CONTROL.CANCELLED`（`not_applied`）。错误响应带 `hint`，说明可行的恢复方式。
 原先按动作拆开的 Windows MCP 工具（`list_apps`、`describe_window`、`find_element`、`invoke` 等）已移除，
 能力并入上述工具；`run_workflow` 与 `control_act` 共用会话的 driver、串行锁和输入租约。
 远程 MCP 或指定 provider/resource 时只暴露统一工具，避免绕过授权。

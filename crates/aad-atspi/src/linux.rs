@@ -816,6 +816,17 @@ impl AtspiBackend for LinuxBackend {
         }
     }
 
+    fn parent(
+        &self,
+        node: &NativeRef,
+        deadline: Instant,
+    ) -> Result<Option<NativeRef>, AutomationError> {
+        remaining(deadline, false)?;
+        let parent = zbus::block_on(self.accessible(node)?.parent())
+            .map_err(|error| native_failure("Accessible.Parent", node, error))?;
+        Ok((parent.path.as_str() != "/org/a11y/atspi/null").then(|| Self::native(parent)))
+    }
+
     fn type_text(
         &self,
         target: &NativeRef,

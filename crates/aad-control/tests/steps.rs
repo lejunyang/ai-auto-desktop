@@ -9,6 +9,9 @@ use std::time::Duration;
 /// Two windows of one editor and a browser page; a button appears once clicked.
 struct Fake {
     acted: Mutex<Vec<Action>>,
+    /// How many more observations show the "Saved" text twice, as an
+    /// accessibility tree can while it changes.
+    twins: Mutex<usize>,
 }
 fn resource(id: &str, name: &str, metadata: Value) -> BackendResource {
     BackendResource {
@@ -58,6 +61,12 @@ impl Backend for Fake {
         ];
         if clicked {
             nodes.push(json!({"node_id": "n4", "role": "text", "name": "Saved", "actions": []}));
+            let mut twins = self.twins.lock().unwrap();
+            if *twins > 0 {
+                *twins -= 1;
+                nodes
+                    .push(json!({"node_id": "n5", "role": "text", "name": "Saved", "actions": []}));
+            }
         }
         Ok(json!({"truncated": false, "nodes": nodes}))
     }
@@ -71,6 +80,7 @@ impl Backend for Fake {
 fn session() -> (Arc<Session>, Arc<Fake>) {
     let backend = Arc::new(Fake {
         acted: Mutex::new(Vec::new()),
+        twins: Mutex::new(0),
     });
     let session = Session::new(
         vec![backend.clone()],
@@ -237,6 +247,50 @@ fn a_check_waits_for_an_element_to_appear() {
         steps::perform(&session, &check, &Map::new(), Duration::from_secs(5)).unwrap()["present"],
         true
     );
+}
+
+#[test]
+fn a_check_waits_out_a_moment_of_two_matches() {
+    let (session, backend) = session();
+    let click = act(
+        "save",
+        Some("notes"),
+        named("button", "Save"),
+        json!({"type": "click"}),
+    );
+    steps::perform(&session, &click, &Map::new(), Duration::from_secs(5)).unwrap();
+    let check = |present: bool, within_ms: u64| Step {
+        id: "saved".into(),
+        app: app(Some("notes")),
+        locator: named("text", "Saved"),
+        action: None,
+        to: None,
+        check: Some(Check { present, within_ms }),
+        input: None,
+        note: None,
+    };
+    *backend.twins.lock().unwrap() = 2;
+    let passed = steps::perform(
+        &session,
+        &check(true, 3_000),
+        &Map::new(),
+        Duration::from_secs(5),
+    )
+    .unwrap();
+    assert_eq!(passed["present"], true);
+    assert_eq!(*backend.twins.lock().unwrap(), 0);
+    // Two that stay are reported as two, whether one or none was expected.
+    *backend.twins.lock().unwrap() = usize::MAX;
+    for present in [true, false] {
+        let refused = steps::perform(
+            &session,
+            &check(present, 600),
+            &Map::new(),
+            Duration::from_secs(5),
+        )
+        .unwrap_err();
+        assert_eq!(refused.code, "CONTROL.AMBIGUOUS");
+    }
 }
 
 #[test]
