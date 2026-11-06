@@ -35,11 +35,14 @@ const html=`<!doctype html><meta charset=utf-8><title>AAD Firefox fixture</title
 const closed=document.querySelector('x-closed').attachShadow({mode:'closed'});
 closed.innerHTML='<input type=password value=synthetic-closed-first><input type=password value=synthetic-closed-second>';
 let clicks=0,clickedTrusted=null,hovered=false,held=new Set(),keys=0,ups=0,lastCommand='',pointerButtons=[],doubles=0;
+let coverNext=false;const keyTimes=new Map(),keyDurations=[],mouseTimes=new Map(),mouseDurations=[],mouseHeld=new Set();
 document.querySelector('#save').onclick=e=>{clicks++;clickedTrusted=e.isTrusted};
 document.querySelector('#hover').onmouseenter=e=>hovered=e.isTrusted;
-document.querySelector('#pointer').onmousedown=e=>{pointerButtons.push([e.button,e.isTrusted]);if(e.button)e.preventDefault()};
+document.querySelector('#pointer').onmousedown=e=>{pointerButtons.push([e.button,e.isTrusted]);if(e.button)e.preventDefault();if(coverNext){coverNext=false;const r=e.currentTarget.getBoundingClientRect(),cover=document.createElement('div');cover.id='overlay';cover.style='position:fixed;z-index:10000;background:white;left:'+r.left+'px;top:'+r.top+'px;width:'+r.width+'px;height:'+r.height+'px';document.body.append(cover)}};
 document.querySelector('#pointer').oncontextmenu=e=>e.preventDefault();document.querySelector('#pointer').ondblclick=e=>{if(e.isTrusted)doubles++};
-document.addEventListener('keydown',e=>{held.add(e.key);keys++});document.addEventListener('keyup',e=>{held.delete(e.key);ups++});
+document.addEventListener('keydown',e=>{held.add(e.key);keys++;keyTimes.set(e.key,performance.now())});document.addEventListener('keyup',e=>{held.delete(e.key);ups++;keyDurations.push([e.key,performance.now()-keyTimes.get(e.key)])});
+document.addEventListener('mousedown',e=>{mouseHeld.add(e.button);mouseTimes.set(e.button,performance.now())},true);
+document.addEventListener('mouseup',e=>{mouseHeld.delete(e.button);mouseDurations.push([e.button,performance.now()-mouseTimes.get(e.button)])},true);
 async function tick(){try{
 const next=await(await fetch('/command')).text();
 if(next==='replace'){const old=document.querySelector('#editor');old.replaceWith(old.cloneNode(true))}
@@ -47,10 +50,13 @@ if(next==='cover'){const cover=document.createElement('div');cover.id='overlay';
 if(next==='reveal'){for(const el of [document.querySelector('#password'),...closed.querySelectorAll('input')]){el.type='text';document.body.append(el)}}
 if(next==='remove'){for(const el of [...document.querySelectorAll('input:not(#editor):not(#agree)'),...document.querySelectorAll('iframe,x-closed,#overlay')])el.remove()}
 if(next==='navigate'){location.href='/next';return}
+if(next==='focus-away')document.querySelector('#hover').focus();
+if(next==='cover-next')coverNext=true;
+if(next==='uncover')document.querySelector('#overlay')?.remove();
 if(next)lastCommand=next;
 const editor=document.querySelector('#editor');
 await fetch('/observed',{method:'POST',body:JSON.stringify({lastCommand,value:editor.value,start:editor.selectionStart,end:editor.selectionEnd,
-clicks,clickedTrusted,hovered,keys,ups,held:[...held],pointerButtons,doubles,size:document.querySelector('#size').value,
+clicks,clickedTrusted,hovered,keys,ups,held:[...held],pointerButtons,doubles,keyDurations,mouseDurations,mouseHeld:[...mouseHeld],size:document.querySelector('#size').value,
 checked:document.querySelector('#agree').checked,scroll:document.querySelector('#panel').scrollTop})});
 }catch{}setTimeout(tick,10)}tick();
 </script>`;
@@ -135,11 +141,11 @@ try{
   assert.equal((await send({method:'act',target:covered,action:{type:'click'}}).promise).error?.code,'CONTROL.OCCLUDED');
   record('replaced identity and occluded pointer rejected');
   o=await observe(rid);let editor=await findName(o,'Editor');
-  for(const action of [{type:'key',keys:['ctrl','s']},{type:'key',keys:['a'],hold_ms:20},{type:'click',modifiers:['ctrl']},{type:'click',count:2},{type:'type_text',text:'unsafe mode',mode:'unicode'},{type:'hover',ms:100}]){
+  for(const action of [{type:'key',keys:['ctrl','s']},{type:'click',modifiers:['ctrl']},{type:'click',count:2},{type:'type_text',text:'unsafe mode',mode:'unicode'},{type:'hover',ms:100}]){
     o=await observe(rid);editor=await findName(o,'Editor');
     const r=await send({method:'act',target:editor,action}).promise;assert.equal(r.error?.code,'CONTROL.ACTION_UNSUPPORTED');
   }
-  record('unsupported shortcuts, holds, pointer modifiers and text mode rejected');
+  record('unsupported shortcuts, pointer modifiers, double click and text mode rejected');
   await mutate('reveal');o=await observe(rid);
   for(const secret of ['synthetic-light-private','synthetic-closed-first','synthetic-closed-second'])assert.ok(!JSON.stringify(o).includes(secret));
   assert.equal((await send({method:'capture',target:await find(o,{role:'document'})}).promise).error?.code,'CONTROL.ACTION_UNSUPPORTED');
@@ -157,6 +163,33 @@ try{
   await wait(()=>browserState.held.length===0,'keys released');const length=browserState.value.length;await delay(200);assert.equal(browserState.value.length,length);assert.ok(length<512);
   await perform(rid,'Save',{type:'click'});await wait(()=>browserState.clicks===3,'input after cancel');
   record('in-flight cancellation stops typing, releases keys and permits next action');
+  await perform(rid,'Editor',{type:'key',keys:['ArrowRight'],hold_ms:200});
+  await wait(()=>browserState.keyDurations.some(([key,ms])=>key==='ArrowRight'&&ms>=180),'key held for requested duration');
+  await perform(rid,'Pointer',{type:'click',hold_ms:200});
+  await wait(()=>browserState.mouseDurations.at(-1)?.[1]>=180,'pointer held for requested duration');
+  assert.ok(browserState.mouseDurations.at(-1)[1]<2000);assert.deepEqual(browserState.held,[]);assert.deepEqual(browserState.mouseHeld,[]);
+  record('key and click hold durations independently measured by DOM events');
+  o=await observe(rid);editor=await findName(o,'Editor');let startKeys=browserState.keys;
+  const noBudget=await send({method:'act',target:editor,action:{type:'key',keys:['ArrowRight'],hold_ms:5000}},500).promise;
+  assert.equal(noBudget.error?.code,'CONTROL.TIMEOUT');await delay(100);assert.equal(browserState.keys,startKeys);
+  record('insufficient hold budget rejected before key down');
+  o=await observe(rid);editor=await findName(o,'Editor');
+  const focusHold=send({method:'act',target:editor,action:{type:'key',keys:['ArrowRight'],hold_ms:5000}});
+  await wait(()=>browserState.held.includes('ArrowRight'),'held key pressed');await mutate('focus-away');
+  const focusFailure=await focusHold.promise;assert.equal(focusFailure.error?.code,'CONTROL.FOCUS_FAILED');assert.equal(focusFailure.error.details.residual_state_cleared,true);
+  await wait(()=>browserState.held.length===0,'held key released after focus loss');
+  await mutate('cover-next');o=await observe(rid);let pointer=await findName(o,'Pointer');
+  const occluded=await send({method:'act',target:pointer,action:{type:'click',hold_ms:5000}}).promise;
+  assert.equal(occluded.error?.code,'CONTROL.OCCLUDED');assert.equal(occluded.error.details.residual_state_cleared,true);
+  await wait(()=>browserState.mouseHeld.length===0,'held mouse released after overlay');await mutate('uncover');
+  record('focus loss and pointer occlusion during hold stop and release input');
+  o=await observe(rid);pointer=await findName(o,'Pointer');
+  const mouseHold=send({method:'act',target:pointer,action:{type:'click',hold_ms:5000}});
+  await wait(()=>browserState.mouseHeld.includes(0),'held mouse pressed');await call({method:'cancel',request_id:mouseHold.request_id});
+  const mouseCancelled=await mouseHold.promise;assert.equal(mouseCancelled.error?.code,'CONTROL.CANCELLED');assert.equal(mouseCancelled.error.details.residual_state_cleared,true);
+  await wait(()=>browserState.mouseHeld.length===0,'held mouse released after cancel');assert.ok(browserState.mouseDurations.at(-1)[1]<4000);
+  await perform(rid,'Pointer',{type:'click'});
+  record('held pointer cancellation releases early and allows subsequent input');
   o=await observe(rid);const oldSave=await findName(o,'Save');command='navigate';await delay(300);
   assert.equal((await send({method:'act',target:oldSave,action:{type:'click'}}).promise).error?.code,'CONTROL.STALE_TARGET');
   record('new document cannot reuse old isolated realm or observation');
