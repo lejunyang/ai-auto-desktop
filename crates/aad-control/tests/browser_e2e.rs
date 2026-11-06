@@ -729,6 +729,117 @@ fn drag_to(session: &Session, main: &str, from: &str, (role, to): (&str, &str)) 
 
 #[test]
 #[ignore = "requires isolated Chromium with its sandbox enabled; CI runs it explicitly"]
+fn canvas_surfaces_take_trusted_clicks_wheels_and_drags_inside_the_same_element() {
+    let _serial = serial();
+    let fixture = Fixture::new();
+    let (session, _) = session_for(&fixture);
+    let main = main_of(&session, &fixture.page_id);
+    let loaded = wait_until(&session, &main, "Name", WaitCondition::Appears);
+    assert!(loaded.error.is_none(), "{loaded:?}");
+    page_value(
+        &fixture,
+        r#"document.body.innerHTML='<canvas aria-label="Drawing" width="300" height="150" style="border:1px solid"></canvas>';
+        window.surfaceEvents=[];
+        const surface=document.querySelector('canvas'), ink=surface.getContext('2d');
+        let drawing=false;
+        surface.addEventListener('pointerdown',e=>{
+            drawing=true;ink.fillStyle='red';ink.fillRect(e.offsetX-2,e.offsetY-2,4,4);
+            ink.beginPath();ink.moveTo(e.offsetX,e.offsetY);
+            window.surfaceEvents.push(['down',e.isTrusted]);
+        });
+        surface.addEventListener('pointermove',e=>{if(drawing){ink.strokeStyle='blue';ink.lineWidth=3;ink.lineTo(e.offsetX,e.offsetY);ink.stroke();window.surfaceEvents.push(['move',e.isTrusted]);}});
+        surface.addEventListener('pointerup',e=>{drawing=false;window.surfaceEvents.push(['up',e.isTrusted]);});
+        surface.addEventListener('wheel',e=>{e.preventDefault();window.surfaceEvents.push(['wheel',e.isTrusted,e.deltaY]);},{passive:false});
+        true"#,
+    );
+    let observed = observe(&session, &main);
+    let offered = actions(&observed, "Drawing");
+    for action in ["click", "hover", "scroll", "drag"] {
+        assert!(
+            offered.iter().any(|offered| offered == action),
+            "{offered:?}"
+        );
+    }
+    // Even the default click must reach pointer handlers, not only HTMLElement.click.
+    let canvas = find(&session, &observed, "canvas", "Drawing");
+    let clicked = act(&session, canvas, Action::click());
+    assert!(clicked.error.is_none(), "{clicked:?}");
+    assert_eq!(
+        clicked.data.unwrap()["backend_result"]["trusted_event"],
+        true
+    );
+    assert_eq!(
+        page_value(&fixture, "window.surfaceEvents"),
+        json!([["down", true], ["up", true]])
+    );
+    assert_eq!(
+        page_value(&fixture, "Array.from(document.querySelector('canvas').getContext('2d').getImageData(150,75,1,1).data)"),
+        json!([255, 0, 0, 255])
+    );
+
+    page_value(&fixture, "window.surfaceEvents=[];true");
+    let observed = observe(&session, &main);
+    let canvas = find(&session, &observed, "canvas", "Drawing");
+    let dragged = act(
+        &session,
+        canvas.clone(),
+        Action::Drag {
+            to: canvas,
+            button: None,
+            fraction: Some(Fraction { fx: 0.2, fy: 0.5 }),
+            to_fraction: Some(Fraction { fx: 0.8, fy: 0.5 }),
+        },
+    );
+    assert!(dragged.error.is_none(), "{dragged:?}");
+    let events = page_value(&fixture, "window.surfaceEvents");
+    let events = events.as_array().unwrap();
+    assert_eq!(events.first().unwrap(), &json!(["down", true]));
+    assert_eq!(events.last().unwrap(), &json!(["up", true]));
+    assert!(events.len() > 6, "{events:?}");
+    assert!(events.iter().all(|event| event[1] == true));
+    assert_eq!(
+        page_value(&fixture, "Array.from(document.querySelector('canvas').getContext('2d').getImageData(150,75,1,1).data)"),
+        json!([0, 0, 255, 255])
+    );
+
+    page_value(&fixture, "window.surfaceEvents=[];true");
+    let wheeled = act_on(
+        &session,
+        &main,
+        "canvas",
+        "Drawing",
+        Action::Scroll {
+            direction: Direction::Down,
+            notches: Some(1),
+            fraction: None,
+        },
+    );
+    assert!(wheeled.error.is_none(), "{wheeled:?}");
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let events = page_value(&fixture, "window.surfaceEvents");
+        if events.as_array().is_some_and(|events| !events.is_empty()) {
+            assert_eq!(events, json!([["wheel", true, 100]]));
+            break;
+        }
+        assert!(Instant::now() < deadline, "wheel was not delivered");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    // Adding surface capabilities must not bypass normal obstruction checks.
+    page_value(
+        &fixture,
+        "const cover=document.createElement('div');cover.style='position:fixed;inset:0;background:white;z-index:1000';document.body.append(cover);window.surfaceEvents=[];true",
+    );
+    let observed = observe(&session, &main);
+    let canvas = find(&session, &observed, "canvas", "Drawing");
+    let covered = act(&session, canvas, Action::click());
+    assert_eq!(covered.error.unwrap()["code"], "CONTROL.OCCLUDED");
+    assert_eq!(page_value(&fixture, "window.surfaceEvents"), json!([]));
+}
+
+#[test]
+#[ignore = "requires isolated Chromium with its sandbox enabled; CI runs it explicitly"]
 fn drags_move_pointer_sortables_and_html5_draggables() {
     let _serial = serial();
     let fixture = Fixture::new();

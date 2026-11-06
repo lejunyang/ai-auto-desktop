@@ -1166,12 +1166,9 @@ impl Session {
                             "drag destination must belong to the same observation",
                         ));
                     }
-                    if to.node_id == target.node_id {
-                        return Err(error(
-                            "CONTROL.INVALID_REQUEST",
-                            "drag destination must be a different node",
-                        ));
-                    }
+                    // A surface can contain both ends (for example a canvas
+                    // selection). Its fractions still undergo validation and
+                    // the provider revalidates the observed native element.
                     observed(&to.node_id)?;
                 }
                 let backend = &self.backends[&observation.provider];

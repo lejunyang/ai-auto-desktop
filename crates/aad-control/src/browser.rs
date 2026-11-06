@@ -1720,7 +1720,7 @@ impl Backend for BrowserBackend {
                             "parent_frame_id": entry.parent,
                             "out_of_process": entry.session.is_some(),
                             "opener_page_id": openers.get(&target.id),
-                            "click_semantics": "dom_activation; trusted cdp input with button, count or fraction",
+                            "click_semantics": "dom_activation; trusted cdp input on canvases or with button, count or fraction",
                             "fill_semantics": "dom_value_and_events",
                             "key_semantics": "cdp_input_to_the_focused_element",
                             "type_text_semantics": "cdp_insert_text_or_us_key_events",
@@ -1923,10 +1923,10 @@ impl Backend for BrowserBackend {
                 "node does not support this browser operation",
             ));
         }
-        // A plain click is DOM activation and works in any frame; a button, a
-        // count or a position needs trusted input, which addresses the page.
+        // A plain DOM click works in any frame. Canvas handlers usually need
+        // pointer down/up; those and explicit gestures use trusted input.
         let trusted = match action {
-            Action::Click { .. } => !action.plain_click(),
+            Action::Click { .. } => node["tag"] == "canvas" || !action.plain_click(),
             Action::Scroll { .. } | Action::Hover { .. } | Action::Drag { .. } => true,
             _ => false,
         };

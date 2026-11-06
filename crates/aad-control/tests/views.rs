@@ -254,10 +254,6 @@ fn drag_ends_share_one_observation_and_gestures_follow_node_capabilities() {
         )
     };
 
-    assert_eq!(
-        code(&act(from.clone(), drag(from.clone()))),
-        "CONTROL.INVALID_REQUEST"
-    );
     let mut foreign = to.clone();
     foreign.observation_id = "elsewhere".into();
     assert_eq!(
@@ -287,6 +283,67 @@ fn drag_ends_share_one_observation_and_gestures_follow_node_capabilities() {
         backend.acted.lock().unwrap().as_slice(),
         [Action::Drag { to, .. }] if to.node_id == "n4"
     ));
+}
+
+#[test]
+fn drag_moves_between_fractions_of_one_observed_surface() {
+    let (session, backend) = session();
+    let observation = observe(&session, View::default()).data.unwrap();
+    let surface = target(&observation, "n1");
+    let drag = |to: Target, destination: Fraction| Action::Drag {
+        to,
+        button: None,
+        fraction: Some(Fraction { fx: 0.2, fy: 0.3 }),
+        to_fraction: Some(destination),
+    };
+    let act = |action| {
+        call(
+            &session,
+            Operation::Act {
+                target: surface.clone(),
+                action,
+                verify: None,
+            },
+        )
+    };
+    let end = Fraction { fx: 0.8, fy: 0.7 };
+    for field in ["session", "resource", "observation", "node"] {
+        let mut foreign = surface.clone();
+        match field {
+            "session" => foreign.session_id = "elsewhere".into(),
+            "resource" => foreign.resource_id = "elsewhere".into(),
+            "observation" => foreign.observation_id = "elsewhere".into(),
+            "node" => foreign.node_id = "unobserved".into(),
+            _ => unreachable!(),
+        }
+        let response = act(drag(foreign, end));
+        assert_eq!(
+            code(&response),
+            if field == "node" {
+                "CONTROL.STALE_TARGET"
+            } else {
+                "CONTROL.INVALID_REQUEST"
+            },
+            "{field}"
+        );
+    }
+    assert_eq!(
+        code(&act(drag(surface.clone(), Fraction { fx: 1.1, fy: 0.7 }))),
+        "CONTROL.INVALID_REQUEST"
+    );
+    assert!(backend.acted.lock().unwrap().is_empty());
+    let action = drag(surface.clone(), end);
+    let response = act(action.clone());
+    assert!(response.error.is_none(), "{response:?}");
+    assert_eq!(
+        serde_json::to_value(&*backend.acted.lock().unwrap()).unwrap(),
+        json!([action])
+    );
+    // Dispatch consumes the observation even when both ends use one node.
+    assert_eq!(
+        code(&act(drag(surface.clone(), end))),
+        "CONTROL.STALE_TARGET"
+    );
 }
 
 #[test]

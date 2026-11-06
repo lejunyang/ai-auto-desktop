@@ -66,7 +66,8 @@ fn action_schema() -> Value {
     z-order.", json!({}), &[]),
         variant("click", "Click the element. A plain left click unless a button, a double \
     click or a position is given; those need a provider that offers gestures. In a browser a \
-    plain click is DOM activation (isTrusted false, works in frames); giving a position, a \
+    plain click is DOM activation (isTrusted false, works in frames), except canvas surfaces \
+    always receive trusted pointer input; giving a position, a \
     button or a count sends trusted pointer input instead, also inside frames (cross-origin \
     ones included), and is refused if something else covers the element or its frame.", json!({
             "button": button_schema(),
@@ -111,9 +112,10 @@ fn action_schema() -> Value {
             "ms": {"type": "integer", "minimum": 1, "maximum": 5000, "description": "How long to dwell. Defaults to 500."},
             "fraction": fraction_schema("Where inside the element to hover")
         }), &[]),
-        variant("drag", "Press on the element, glide, release on another element of the \
-    same observation. Use for reordering a list or moving an item between panes. In a browser \
-    it is trusted pointer input (offered on draggable elements, list items and grab cursors; \
+        variant("drag", "Press on the element, glide, release on an element of the \
+    same observation, including the same surface at a different fraction. Use for canvas \
+    selections, reordering a list or moving an item between panes. In a browser \
+    it is trusted pointer input (offered on canvas surfaces, draggable elements, list items and grab cursors; \
     the destination may be any observed element); both ends must be in view together and \
     unobstructed, and an HTML5 drag (draggable, dragstart/drop) is completed with drag \
     events carrying its data.", json!({

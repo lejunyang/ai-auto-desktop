@@ -30,6 +30,9 @@
   const protectedNode = el => el.tagName === 'INPUT' && ['password','hidden'].includes((el.type||'').toLowerCase());
   // A file input only ever takes files, through upload; often it is hidden behind a styled button.
   const fileInput = el => el.tagName === 'INPUT' && (el.type||'').toLowerCase() === 'file';
+  // Canvas exposes pixels rather than child controls. Its observed element
+  // remains the anchor; pointer input still rechecks identity and hit testing.
+  const canvas = el => el.tagName === 'CANVAS';
   const present = el => visible(el) || (fileInput(el) && el.isConnected && el.ownerDocument === document);
   const visible = el => el.isConnected && el.ownerDocument === document && el.getClientRects().length > 0 && getComputedStyle(el).visibility !== 'hidden';
   const enabled = el => !el.disabled && !el.closest('[inert]') && el.getAttribute('aria-disabled') !== 'true';
@@ -78,7 +81,7 @@
   };
   // What a person could pick up: HTML5 draggables, items of lists and grids,
   // and whatever shows a grab cursor.
-  const draggable = el => el!==document.body && (el.draggable || ['listitem','option','row','treeitem'].includes(roleOf(el)) || cursorMarks(el, /^(grab|grabbing|move)$/));
+  const draggable = el => el!==document.body && (canvas(el) || el.draggable || ['listitem','option','row','treeitem'].includes(roleOf(el)) || cursorMarks(el, /^(grab|grabbing|move)$/));
   // focus() exists on all HTMLElements, including divs that cannot take focus.
   // Explicit negative tabindex still permits programmatic focus.
   const focusable = el => typeof el.focus==='function' && (el.tabIndex>=0 || el.hasAttribute('tabindex') || el.isContentEditable || activeElement()===el);
@@ -90,11 +93,11 @@
     // Delegated listeners (including React) are invisible in our isolated world.
     // The rendered pointer affordance also identifies their clickable elements;
     // check() rechecks this capability and the observed identity before input.
-    if ((['BUTTON','A','INPUT','SELECT'].includes(el.tagName) || el.onclick || roleOf(el)==='button' || checkable(el) || cursorMarks(el, /^pointer$/)) && typeof el.click==='function') result.push('click','hover');
+    if ((canvas(el) || ['BUTTON','A','INPUT','SELECT'].includes(el.tagName) || el.onclick || roleOf(el)==='button' || checkable(el) || cursorMarks(el, /^pointer$/)) && typeof el.click==='function') result.push('click','hover');
     if (editable(el)) result.push('fill','type_text');
     if (el.tagName==='SELECT' && !el.multiple) result.push('select');
     if (checkable(el)) result.push('check');
-    if (scrollable(el)) result.push('scroll');
+    if (canvas(el) || scrollable(el)) result.push('scroll');
     if (draggable(el)) result.push('drag');
     if (el===document.body) result.push('navigate','back','forward','reload','open_tab','activate_page','close_page','emulate','clear_site_data');
     return result;
