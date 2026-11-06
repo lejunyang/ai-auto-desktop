@@ -67,6 +67,13 @@ Chromium/CDP drag：在可拖起的元素（`draggable`、列表/网格项、gra
 省略 path 保持原来的两端拖动。Chromium 已用公开截图 PNG 独立核对 Canvas/closed-shadow 内的折线，
 并回读可信事件顺序及超时、取消、遮挡和几何变化后的释放；不代表跨页面或跨资源拖拽已支持。
 
+Linux/X11 后端在 helper 声明 `anchored-drag-between` 时支持两个资源之间的普通 `drag`：
+先分别观察两端，再将源 target 与目标 `to` 提交；需要两端各自的授权、有效观察与输入租约。
+第一版仅接受不含自定义路径的直线，窗口须同时可见，途中其他应用/弹窗会使动作拒绝或停止并释放。
+两端在每阶段重新校验；本机 Qt 两进程的实际数据传递已验收，约需 4.8 秒。
+具体 4096 像素路线、窗口装饰与观察保留边界见 [Linux 驱动](architecture/linux-kde-x11-driver.md)。
+Windows/macOS 与浏览器跨资源拖拽仍未启用。
+
 Shadow DOM：观察深度优先进入每个开放 shadow root（先宿主的 shadow 树，再其 light 子节点——只有被 slot 的才会渲染），
 内部控件与普通节点一样有指纹、复核和动作；命中检查经 `shadowRoot.elementFromPoint` 穿过宿主，包含关系沿 host 向上。
 closed shadow 的内部节点仍不出现在公共观察里，但后端通过 CDP 私下确认 root 后，可将已观察的 host 标为

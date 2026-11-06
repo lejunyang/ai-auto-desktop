@@ -60,6 +60,19 @@ helper 和主循环仍独立检查取消与截止时间，先释放本次持有�
 窗口命中能力限制。逐段完整抓树也有开销：本机小 Qt fixture 的两中间点路径约 0.7 秒，
 surface scope 加完整窗口检查约 1.1 秒，不代表复杂应用或 32 点路径的性能。
 
+helper 声明 `anchored-drag-between` 时，Linux provider 另公开内部 `drag_between`；控制会话
+仍使用普通 `drag` 和两端各自观察得到的 target。provider 保留每个已解析应用最新一份观察，
+最多 16 份、300 秒，输入尝试后整组失效；读写调用串行，等待也受取消和期限约束。
+两端各自保持原 scope、身份、指纹、位置和完整观察，每次移动前都重新验证两端。
+源点移动后、按下前再查一次，避免悬停弹层绕过检查；窗口移动、遮挡或取消时释放本次持键。
+
+跨资源版本仅提供内部直线，最大轴距离不超过 4096 屏幕像素，不接受自定义 `path`。
+沿途逐像素检查 X11 窗口归属，只允许两端窗口、X 根窗口、已核实同用户的桌面窗口，
+以及经 WM 身份和 X 客户端归属核实的两端装饰边框（外扩不超过 64 像素）。其他应用、弹窗、
+未知无 PID 或 override-redirect 窗口均拒绝；按下和释放仍必须命中真实端点 client。
+无障碍树未暴露的同窗口覆盖层仍存在 toolkit 可见性限制。真实 Qt 两进程传递精确 MIME 数据
+并显示接收结果约需 4.8 秒，不代表文件管理器跨应用任务或所有 WM 装饰已验收。
+
 ## 验证
 
 CI 使用纯 Rust driver 和 [`qt_atspi_fixture.cpp`](../../tests/linux/qt_atspi_fixture.cpp)，
@@ -83,3 +96,8 @@ EOF、超时、取消、窗口移动、遮挡和已有按键的拒绝/释放；
 `pwsh -File tests/linux/verify-native-drag-path.ps1 -Aad target/debug/aad -InputHelper /absolute/path/to/x11_xtest_helper`
 使用新建 Qt 窗口，通过公开控制入口验证逐段锚点、完整窗口和窄 scope、真实 sibling overlay
 与取消释放，并输出独立事件、动作结果及耗时。
+
+`pwsh -File tests/linux/verify-x11-cross-drag.ps1` 的私有 Xvfb 15 项检查包含双 PID 实际轨迹、
+可信与伪造 frame、单像素外部窗口、悬停覆盖、取消/超时释放和等待校验时外部新持键；
+`pwsh -File tests/linux/verify-native-cross-drag.ps1 -Aad target/debug/aad -InputHelper /absolute/path/to/x11_xtest_helper`
+使用两个独立 Qt 进程，通过公开入口核对精确 MIME 数据、可见结果、取消/移动释放及悬停遮挡零按下。

@@ -80,7 +80,21 @@ fingerprint、状态、原始 bounds 及前后点，释放前再查终点。窄 
 helper 每段先发带请求唯一 nonce 和顺序号的验证请求，收到对应 ACK 后才移动，并独立复核
 X11 窗口/PID/几何/命中。Rust 只读 worker 不占主循环；AX 调用阻塞时取消和截止时间仍可
 触发 helper 释放，迟到结果不再 ACK。每个 backend 同时只保留一个此类 worker，尚未退出的
-只读请求会阻止新路径。空路径行为不变，跨资源拖拽尚未由 Linux provider 启用。
+只读请求会阻止新路径。空路径行为不变。
+
+兼容 helper 声明 `anchored-drag-between` 后，Linux provider 启用双观察 `drag_between`。
+控制层继续使用 `drag`，分别保留起终点的 snapshot/revision/locator、scope 授权与输入租约。
+provider 每个已解析应用仅保留最新观察，最多 16 份且 300 秒过期，输入尝试使整组失效；
+所有入口共用可取消、有期限的调用门禁，防止并行观察在输入期间重新发布有效目标。
+双端 fresh 校验使用独立只读状态，仍通过 nonce/序号 ACK 与 helper 连接；源点 hover 后、
+按下前，以及每段移动和释放前均复核两端身份、指纹、bounds、窗口与命中。
+等待期间只读系统调用即使阻塞，helper 仍独立执行 deadline/cancel 与自有键鼠释放。
+
+跨资源拖拽不接受非空 `path`；内部直线最大轴距离为 4096 屏幕像素，分 12 次移动。
+每段逐像素检查所经窗口，仅允许两端 client、X 根、已核实同用户桌面和两端可信 WM frame。
+frame 必须为端点的真实祖先、与 WM check 窗口属于同一 X 客户端，且每侧外扩不超过 64 像素；
+未知装饰、外部应用、弹窗和 override-redirect 覆盖均保守拒绝。down/up 只能发生在端点 client。
+带修饰键时保持源窗口键盘焦点要求；不隐式切换到目标窗口。已有或等待期间新按下的外部键鼠不接管。
 
 ## 截图、OCR、窗口、粘贴、剪贴板与全局快捷键
 
@@ -137,6 +151,13 @@ PID-only 判定的缺口，并验证新窗口绑定、子窗口焦点、长按�
 实际事件确认正向路径三次移动、坏锚点零 down、几何变化/遮挡/取消后 up。
 小 fixture 的两中间点整窗口路径约 734 ms，窄 scope 加窗口复核约 1114 ms；取消后的 up
 约 3 ms，窄 scope 遮挡后的 up 约 189 ms。这些是本次测试耗时，不能外推复杂应用或 32 点性能。
+
+`verify-x11-cross-drag.ps1` 私有 Xvfb 15 项通过，独立双 PID 窗口回读 12 次持键移动，
+验证可信/伪造 frame、单像素外部窗口、悬停覆盖、期限/取消、几何改变与外部持键保护。
+`verify-native-cross-drag.ps1` 本机 Qt 四项通过：两个独立进程实际传递精确 MIME 数据，
+目标可见标签变化；取消后 45 ms、窗口变化后 77 ms 内返回并已释放，悬停覆盖零 button-down。
+成功动作约 4840 ms；两端每阶段 fresh 带来的成本不能用私有 Xvfb 协议耗时代替。
+真实 Qt 用无装饰窗口；Xvfb 的可信 frame 是模拟 WM，其他 WM 装饰及文件管理器完整任务仍待验收。
 
 取消由每次调用显式传入的 `CancellationToken` 贯穿到 Linux backend。调用副本共享当前观察、
 焦点订阅与录制状态，取消 token 不写回共享 backend；下一次调用不会继承取消状态。
