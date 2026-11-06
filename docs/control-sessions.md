@@ -25,10 +25,14 @@ AT-SPI 中心点命中校验无法确认落在新鲜目标子树时返回 `DRIVE
 （`details.typed` 为已发字符数）停止：`mode: unicode`（默认）每字符一次 `Input.insertText`（有 input 事件，
 无按键事件）；`mode: keys` 发 keydown/keypress/keyup（带 key/code，`isTrusted=true`），只接受 US 布局可打出的字符，
 其他字符在发送前整体拒绝（`CONTROL.INVALID_REQUEST`，`details.character`）。`key` 接受针对焦点元素的编辑/导航键：
-Enter、Tab、Escape、方向键、Home/End、PageUp/PageDown、Backspace/Delete、单个字符、F2、ctrl+a/c/v/x/z/y/b/i、
-ctrl+shift+z、shift 或 ctrl+shift 加方向/Home/End；浏览器自己会处理的快捷键（ctrl+t/w/n/l/u、ctrl+tab、
-ctrl+PageUp/PageDown、其余 ctrl+shift 组合、所有 alt/meta 组合、F2 以外的功能键）以 `CONTROL.ACTION_UNSUPPORTED`
-拒绝——CDP 会把页面未消费的按键交回浏览器。
+Enter、Tab、Escape、方向键、Home/End、PageUp/PageDown、Backspace/Delete、单个字符、F2、Ctrl 或
+Ctrl+Shift 加字母，以及 Shift 或 Ctrl+Shift 加方向/Home/End。Ctrl+K/S 等可用于网页编辑器。
+这些按键通过 renderer 路径派发，不触发浏览器快捷键的预处理或未处理回退；因此 Ctrl+T/W 也仅是
+页面事件，标签页操作仍用专门的 open_tab/close_page 等动作。Ctrl+Tab/PageUp/PageDown、
+Alt/Meta 及 F2 以外的功能键仍以 `CONTROL.ACTION_UNSUPPORTED` 拒绝。
+按下或释放返回错误时，以独立的短清理预算尝试 keyUp，结果通过 `key_released` 标明。
+2026-11-07 本机有界面 Chromium 对有/无页面处理器共 18 组 Ctrl 组合完成真实检查：
+页面收到可信事件，原生编辑器焦点、窗口/对话框集合、网址和标签页不变；另有超时后释放验收。
 
 浏览器 drag：只在可拖起的元素上提供（`draggable`、列表/网格项、grab/move 光标），终点可以是同一观察里的任何节点。
 两端都滚进视口后在当前位置各自命中检查（不再滚动），被遮挡或无法同时可见则 `CONTROL.OCCLUDED` 且什么都不按下；

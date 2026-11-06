@@ -23,7 +23,7 @@
 | 手势表达 | 同元素不同位置拖动、修饰键点击/拖动、有界按住和路径、跨资源拖拽具有完整端点复核与释放保证；真实效果验收 | 浏览器同 surface drag `d350c7b`、原生同元素 `9274fee`、三端与浏览器修饰键 `e46829b` 已提交；Chromium 可信事件与像素、Dolphin Ctrl 多选和框选通过，随后普通点击恢复单选。按住/路径/跨资源待完成 |
 | 视觉与自绘恢复 | Canvas/自绘/closed shadow 等缺乏语义控件时，通过可校验 surface 完成视觉操作；保留保护区域与命中限制 | Canvas trusted click/hover/scroll/drag 已提交 `d350c7b`，像素与可信事件回读通过；原生非 Focusable 指针 `31cf35a` 已在 Dolphin 验证，显式激活 `76cd6e1` 通过。closed shadow 等待完成 |
 | 保密输入 | 显式授权的 protected 输入与保密读取分离；三端/browser 策略一致，日志与录制不泄漏值，合成密码框验收 | `008974d` 已提交即时 secret_ref 授权路径；Qt 密码数字角色、替换/清空与独立状态回读通过，Chromium 21 项含敏感 DOM 身份恢复通过。普通输入不能绕过，持久化入口拒绝专用动作，子进程不继承绑定环境变量。Windows/macOS 实际效果 **[待真机验收]**；系统凭据库与保密工作流未实现 |
-| 浏览器键盘与浏览器自身界面 | 页面编辑器快捷键与浏览器级动作分开；补明确授权的浏览器内部/本地页面操作路径，并明确非 Chromium 覆盖 | 待完成 |
+| 浏览器键盘与浏览器自身界面 | 页面编辑器快捷键与浏览器级动作分开；补明确授权的浏览器内部/本地页面操作路径，并明确非 Chromium 覆盖 | 页面快捷键隔离 `1a3bb77` 已提交；有界面 Chromium 18 组 Ctrl 组合只送页面、不误触浏览器 UI 的验收及异常 keyUp 通过，完整回归 23/23。内部/本地页面授权与非 Chromium 后端待完成 |
 | 输入租约 | 保留共享前台互斥，独立 headless 不受无关桌面会话阻断；占用可诊断、可正常释放 | `2fe2395`、`562dcf5`、`6966e4c` 已提交。可信 headless 按 browser UUID 隔离，同实例仍互斥，未知/有界面实例仍占桌面；Chromium 19 项及保存工作流在桌面租约被占用时的实际执行通过 |
 | macOS 拖拽 | 两端使用同一 fresh snapshot 复核；跨元素实际拖动验证 | 修复已提交 `8f92886`，25 项宿主逻辑测试及 clippy 通过；**[待验证]** macOS 真机 AX/TCC 与实际拖拽效果 |
 | 系统覆盖 | GNOME X11 / Wayland 路线、Windows/macOS、DPI/IME/权限弹窗的实现与实际验收矩阵；不将 KDE 成功外推 | 用户确认仅有本机 Linux/KDE。`bea9187` 移除 X11 的 KDE 品牌限制，Xvfb 正反例及 KDE 新产物点击/截图通过；GNOME/XFCE 真机 **[待验收]**。Windows/macOS 实际效果 **[待真机验收]**。Wayland 输入后端 **[待实现、待真机验收]**，路线及证据见平台矩阵 |
@@ -50,6 +50,8 @@
 - `helper-compatibility/summary.json`：同一 Qt 测试窗口比较旧新 XTest helper；旧版仅保留语义动作，invoke 后标签变化通过，未发送不支持的合成输入。
 - `secret-reproducible/summary.json`：`tests/linux/verify-secret-input.ps1` 从源码构建 Qt 密码测试窗口，默认拒绝、普通 fill 拒绝、专用替换和清空的独立标签回读、值脱敏和密码框截图拒绝全部通过。Qt 5 的文字角色为 text、数字角色为 PasswordText，已修正为先检查数字角色。
 - `browser-secret-targeted.log`、`browser-secret-full.log`：受保护输入实际替换、input/change 事件、默认拒绝、重新观察/重连后敏感身份保持、子 frame 元素删除/重挂/移除的截图保护及恢复通过；完整 Chromium 21/21。随后新增受保护节点不导入可能来自值的 AX name，针对性单测通过。
+- 浏览器原始日志位于 `artifacts/capability-audit-2026-11-07/`；页面键另有 `browser-page-keys-headed.log`、`browser-page-key-timeout.log`、`browser-page-keys-full.log`。有界面用例用 AT-SPI 独立回读焦点和窗口集合，不只验证 DOM 事件。
+- `dolphin/rename-component-probe.json`：重命名状态对已观察 cell 及其祖先，在文件图标/文字区域做只读 GetAccessibleAtPoint；仅返回现有 table 或 AT-SPI null，没有恢复出编辑控件，重命名仍未完成。
 - Windows 修饰键代码已用 pin 工具链实际 `x86_64-pc-windows-gnu` cfg 做 check/clippy；这只证明编译，不能当成 Windows SendInput 效果验收。**[待验证]** Windows 交互桌面、相应权限与 DPI/IME 测试环境。
 
 各功能的测试数字对应其提交时点；后续共享模型变化后仍需相应回归。未验证的平台与场景保持待办，不从 KDE/Chromium 的成功外推。
