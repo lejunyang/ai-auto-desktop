@@ -85,7 +85,7 @@ impl AtspiBackend for Tree {
             truncation_reasons: vec![],
         })
     }
-    fn focus(&self, _: &NativeRef, _: Instant) -> Result<Value> {
+    fn focus(&self, _: &NativeRef, _: Option<&aad_atspi::WindowAnchor>, _: Instant) -> Result<Value> {
         unreachable!()
     }
     fn invoke(&self, _: &NativeRef, _: Instant) -> Result<Value> {

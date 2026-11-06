@@ -77,6 +77,14 @@ pub struct NativeRef {
     pub object_path: String,
 }
 
+/// A top-level window from the same freshly captured tree as an input target.
+/// This is an internal anchor, never a caller-provided coordinate or window id.
+#[derive(Clone, Debug)]
+pub struct WindowAnchor {
+    pub native: NativeRef,
+    pub bounds: Bounds,
+}
+
 #[derive(Clone, Debug)]
 pub struct BackendNode {
     pub native: NativeRef,
@@ -172,7 +180,12 @@ pub trait AtspiBackend: Send + Sync {
             "scoped capture is unavailable",
         ))
     }
-    fn focus(&self, target: &NativeRef, deadline: Instant) -> Result<Value, AutomationError>;
+    fn focus(
+        &self,
+        target: &NativeRef,
+        _window: Option<&WindowAnchor>,
+        deadline: Instant,
+    ) -> Result<Value, AutomationError>;
     fn invoke(&self, target: &NativeRef, deadline: Instant) -> Result<Value, AutomationError>;
     fn set_text(
         &self,
@@ -202,6 +215,7 @@ pub trait AtspiBackend: Send + Sync {
     fn type_text(
         &self,
         _target: &NativeRef,
+        _window: Option<&WindowAnchor>,
         _text: &str,
         _process_id: u32,
         _deadline: Instant,
@@ -240,6 +254,7 @@ pub trait AtspiBackend: Send + Sync {
     fn pointer_gesture_modified(
         &self,
         target: &NativeRef,
+        _window: Option<&WindowAnchor>,
         point: (i32, i32),
         gesture: Gesture,
         modifiers: &[String],
@@ -274,6 +289,7 @@ pub trait AtspiBackend: Send + Sync {
     fn drag_modified(
         &self,
         target: &NativeRef,
+        _window: Option<&WindowAnchor>,
         from: (i32, i32),
         to: (i32, i32),
         button: u8,
@@ -293,6 +309,7 @@ pub trait AtspiBackend: Send + Sync {
     fn key_chord(
         &self,
         _target: &NativeRef,
+        _window: Option<&WindowAnchor>,
         _keys: &[String],
         _hold_ms: Option<u16>,
         _process_id: u32,
@@ -381,6 +398,7 @@ pub trait AtspiBackend: Send + Sync {
     fn paste(
         &self,
         _target: &NativeRef,
+        _window: Option<&WindowAnchor>,
         _text: &str,
         _process_id: u32,
         _deadline: Instant,
@@ -1198,11 +1216,12 @@ impl AtspiProvider {
             None
         };
         remaining(deadline, false)?;
+        let window = input_window(&fresh, &fresh_id);
         let mut dispatched = false;
         let result = (|| {
             dispatched = true;
             match action {
-                "focus" => self.backend.focus(&native, deadline),
+                "focus" => self.backend.focus(&native, window.as_ref(), deadline),
                 "invoke" => self.backend.invoke(&native, deadline),
                 "set_text" => {
                     let text = bounded_text(args.get("text"), false)?;
@@ -1211,7 +1230,8 @@ impl AtspiProvider {
                 "type_text" => {
                     let text = ordinary_text(args.get("text"))?;
                     let process = process_id(&node, &fresh)?;
-                    self.backend.type_text(&native, text, process, deadline)
+                    self.backend
+                        .type_text(&native, window.as_ref(), text, process, deadline)
                 }
                 "pointer_click" => {
                     let process = process_id(&node, &fresh)?;
@@ -1231,6 +1251,7 @@ impl AtspiProvider {
                     let process = process_id(&node, &fresh)?;
                     self.backend.pointer_gesture_modified(
                         &native,
+                        window.as_ref(),
                         pointer.expect("computed above"),
                         gesture.expect("parsed above"),
                         &modifiers,
@@ -1251,6 +1272,7 @@ impl AtspiProvider {
                     };
                     self.backend.drag_modified(
                         &native,
+                        window.as_ref(),
                         pointer.expect("computed above"),
                         destination.expect("computed above"),
                         button,
@@ -1264,6 +1286,7 @@ impl AtspiProvider {
                     let process = process_id(&node, &fresh)?;
                     self.backend.key_chord(
                         &native,
+                        window.as_ref(),
                         keys.as_deref().expect("parsed above"),
                         hold_ms,
                         process,
@@ -1273,7 +1296,8 @@ impl AtspiProvider {
                 "paste" => {
                     let text = paste_text(args.get("text"))?;
                     let process = process_id(&node, &fresh)?;
-                    self.backend.paste(&native, text, process, deadline)
+                    self.backend
+                        .paste(&native, window.as_ref(), text, process, deadline)
                 }
                 window if WINDOW_ACTIONS.contains(&window) => {
                     let process = process_id(&node, &fresh)?;
@@ -1674,7 +1698,12 @@ impl AtspiBackend for UnavailableBackend {
     ) -> Result<BackendSnapshot, AutomationError> {
         self.unavailable()
     }
-    fn focus(&self, _target: &NativeRef, _deadline: Instant) -> Result<Value, AutomationError> {
+    fn focus(
+        &self,
+        _target: &NativeRef,
+        _window: Option<&WindowAnchor>,
+        _deadline: Instant,
+    ) -> Result<Value, AutomationError> {
         self.unavailable()
     }
     fn invoke(&self, _target: &NativeRef, _deadline: Instant) -> Result<Value, AutomationError> {
@@ -2051,6 +2080,28 @@ fn resolve(
 
 fn target(record: &Record, node_id: &str) -> Value {
     json!({"snapshot_id": record.public["snapshot_id"], "revision": record.public["revision"], "node_id": node_id})
+}
+
+fn input_window(record: &Record, node_id: &str) -> Option<WindowAnchor> {
+    let nodes = record.public["nodes"].as_array()?;
+    // Follow the captured structure, including read-only context ancestors.
+    // Some virtualized Qt objects have an incomplete native Parent property.
+    for id in ancestor_chain(record, node_id) {
+        let node = nodes.iter().find(|node| node["node_id"] == id)?;
+        let parent = node["parent_id"].as_str()?;
+        let parent = nodes.iter().find(|node| node["node_id"] == parent)?;
+        if parent["role"] == "application" {
+            let bounds = parse_bounds(node.get("bounds")).ok()?;
+            if bounds.width <= 0 || bounds.height <= 0 {
+                return None;
+            }
+            return Some(WindowAnchor {
+                native: record.handles.get(&id)?.clone(),
+                bounds,
+            });
+        }
+    }
+    None
 }
 
 fn descendants(record: &Record, node_id: &str) -> BTreeSet<String> {
@@ -3009,7 +3060,12 @@ mod tests {
                 truncation_reasons: vec![],
             })
         }
-        fn focus(&self, _target: &NativeRef, _deadline: Instant) -> Result<Value, AutomationError> {
+        fn focus(
+            &self,
+            _target: &NativeRef,
+            _window: Option<&WindowAnchor>,
+            _deadline: Instant,
+        ) -> Result<Value, AutomationError> {
             self.writes.fetch_add(1, Ordering::SeqCst);
             Ok(json!({"accepted": true}))
         }
@@ -3088,6 +3144,7 @@ mod tests {
         fn key_chord(
             &self,
             _target: &NativeRef,
+            _window: Option<&WindowAnchor>,
             keys: &[String],
             hold_ms: Option<u16>,
             _process_id: u32,
@@ -3110,6 +3167,7 @@ mod tests {
         fn paste(
             &self,
             _target: &NativeRef,
+            _window: Option<&WindowAnchor>,
             text: &str,
             _process_id: u32,
             _deadline: Instant,
@@ -3140,6 +3198,7 @@ mod tests {
         fn pointer_gesture_modified(
             &self,
             target: &NativeRef,
+            _window: Option<&WindowAnchor>,
             point: (i32, i32),
             gesture: Gesture,
             modifiers: &[String],
@@ -3155,6 +3214,7 @@ mod tests {
         fn drag_modified(
             &self,
             target: &NativeRef,
+            _window: Option<&WindowAnchor>,
             from: (i32, i32),
             to: (i32, i32),
             button: u8,
@@ -3829,6 +3889,32 @@ mod tests {
         assert_eq!(error.code, "DRIVER.ACTION_FAILED");
         assert_eq!(error.effect, "not_applied");
         assert_eq!(backend.writes.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn keyboard_window_comes_from_observed_ancestry_including_read_only_context() {
+        let provider = AtspiProvider::new(Arc::new(FakeBackend {
+            depth: 2,
+            ..Default::default()
+        }))
+        .unwrap();
+        take_snapshot(&provider);
+        let mut record = provider.state.lock().unwrap().current.clone().unwrap();
+        record.public["nodes"][0]["role"] = json!("application");
+        record.public["nodes"][1]["role"] = json!("frame");
+        record.members.remove("n1");
+        record.public["nodes"][1]["provenance"]["scope_context"] = json!(true);
+        let window = input_window(&record, "n2").unwrap();
+        assert_eq!(window.native, record.handles["n1"]);
+        assert_eq!(
+            window.bounds,
+            parse_bounds(record.public["nodes"][1].get("bounds")).unwrap()
+        );
+        record.public["nodes"][2]["parent_id"] = json!("missing");
+        assert!(input_window(&record, "n2").is_none());
+        record.public["nodes"][2]["parent_id"] = json!("n1");
+        record.public["nodes"][1]["bounds"]["width"] = json!(0);
+        assert!(input_window(&record, "n2").is_none());
     }
 
     #[test]

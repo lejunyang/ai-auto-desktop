@@ -17,6 +17,7 @@
 #include <cstring>
 #include <iostream>
 #include <limits>
+#include <functional>
 #include <optional>
 #include <poll.h>
 #include <string>
@@ -212,6 +213,15 @@ bool PidBelongsToCurrentUser(unsigned long pid) {
     const std::string path = "/proc/" + std::to_string(pid);
     return stat(path.c_str(), &details) == 0 && details.st_uid == geteuid();
 }
+
+struct Geometry {
+    int x = 0, y = 0, width = 0, height = 0;
+};
+struct WindowBinding {
+    Window id = None;
+    Geometry bounds;
+};
+bool FocusMatchesWindow(Display *, unsigned long, Atom, const std::optional<WindowBinding> &);
 
 bool FocusBelongsToPid(Display *display, unsigned long expected_pid, Atom pid_atom) {
     Window focus = None;
@@ -490,7 +500,8 @@ void SleepUntilOrDeadline(unsigned milliseconds, std::uint64_t deadline_ns) {
 }
 
 int RunGesture(Display *display, std::string_view command, const GestureRequest &request,
-               std::uint64_t expected_pid, std::uint64_t deadline_ns, Atom pid_atom) {
+               std::uint64_t expected_pid, std::uint64_t deadline_ns, Atom pid_atom,
+               const std::optional<WindowBinding> &binding = std::nullopt) {
     InputCancellation cancellation;
     std::vector<KeyCode> chord;
     std::vector<KeyCode> modifiers;
@@ -581,7 +592,7 @@ int RunGesture(Display *display, std::string_view command, const GestureRequest 
     if (DeadlineExpired(deadline_ns)) {
         return finish_failure("deadline_exceeded", "pre_dispatch", kExitTimeoutBeforeDispatch);
     }
-    if ((command == "key-chord" || !modifiers.empty()) && !FocusBelongsToPid(display, expected_pid, pid_atom)) {
+    if ((command == "key-chord" || !modifiers.empty()) && !FocusMatchesWindow(display, expected_pid, pid_atom, binding)) {
         return finish_failure("focus_owner_changed", "target_preflight", kExitTargetMismatch);
     }
     if (command != "key-chord" &&
@@ -606,7 +617,7 @@ int RunGesture(Display *display, std::string_view command, const GestureRequest 
         if (!submitted || g_x_error) return "x11_error";
         if (!PidBelongsToCurrentUser(static_cast<unsigned long>(expected_pid))) return "untrusted_process";
         if ((command == "key-chord" || !modifiers.empty()) &&
-            !FocusBelongsToPid(display, expected_pid, pid_atom)) return "focus_owner_changed";
+            !FocusMatchesWindow(display, expected_pid, pid_atom, binding)) return "focus_owner_changed";
         if (command != "key-chord") {
             Window root = None, child = None;
             int rx = 0, ry = 0, wx = 0, wy = 0;
@@ -671,7 +682,7 @@ int RunGesture(Display *display, std::string_view command, const GestureRequest 
                 const int y = request.y + (request.to_y - request.y) * step / kSteps;
                 if (request.hold_ms != 0 &&
                     (!PidBelongsToCurrentUser(static_cast<unsigned long>(expected_pid)) ||
-                     (!modifiers.empty() && !FocusBelongsToPid(display, expected_pid, pid_atom)) ||
+                     (!modifiers.empty() && !FocusMatchesWindow(display, expected_pid, pid_atom, binding)) ||
                      !WindowAtPointBelongsToPid(display, x, y, expected_pid, pid_atom))) {
                     return finish_failure("target_changed", "input_dispatch", kExitUnknownEffect);
                 }
@@ -1203,9 +1214,6 @@ void CollectClients(Display *display, Window window, int depth, std::vector<Wind
     }
 }
 
-struct Geometry {
-    int x = 0, y = 0, width = 0, height = 0;
-};
 
 std::optional<Geometry> RootGeometry(Display *display, Window window) {
     XWindowAttributes attributes{};
@@ -1239,7 +1247,7 @@ bool Exists(Display *display, Window window) {
 // screen extents). With a single client window of that process its geometry
 // may be stale (e.g. while minimized), so it is accepted alone.
 std::optional<Window> FindClientWindow(const Ewmh &ewmh, unsigned long pid, const Geometry &want,
-                                       std::string *problem) {
+                                       std::string *problem, bool allow_single = true) {
     std::vector<Window> all;
     if (ewmh.present) {
         Atom actual_type = None;
@@ -1283,8 +1291,8 @@ std::optional<Window> FindClientWindow(const Ewmh &ewmh, unsigned long pid, cons
     std::vector<Window> exact;
     for (const Window window : owned) {
         const auto geometry = RootGeometry(ewmh.display, window);
-        if (geometry.has_value() && std::abs(geometry->x - want.x) <= 2 &&
-            std::abs(geometry->y - want.y) <= 2 && geometry->width == want.width &&
+        if (geometry.has_value() && std::abs(static_cast<long long>(geometry->x) - want.x) <= 2 &&
+            std::abs(static_cast<long long>(geometry->y) - want.y) <= 2 && geometry->width == want.width &&
             geometry->height == want.height) {
             exact.push_back(window);
         }
@@ -1292,11 +1300,74 @@ std::optional<Window> FindClientWindow(const Ewmh &ewmh, unsigned long pid, cons
     if (exact.size() == 1) {
         return exact[0];
     }
-    if (exact.empty() && owned.size() == 1) {
+    if (allow_single && exact.empty() && owned.size() == 1) {
         return owned[0];
     }
     *problem = owned.empty() ? "window_not_found" : "window_ambiguous";
     return std::nullopt;
+}
+
+// Keyboard ownership requires the precise observed client window and live
+// geometry. A child focus window is allowed; a same-process sibling is not.
+bool FocusMatchesWindow(Display *display, unsigned long pid, Atom pid_atom,
+                        const std::optional<WindowBinding> &binding) {
+    if (!FocusBelongsToPid(display, pid, pid_atom)) return false;
+    if (!binding.has_value()) return true; // legacy helper protocol only
+    if (binding->id == None || OwnPid(display, binding->id, pid_atom) != pid) return false;
+    const auto bounds = RootGeometry(display, binding->id);
+    XWindowAttributes attributes{};
+    if (!bounds.has_value() || !XGetWindowAttributes(display, binding->id, &attributes) ||
+        attributes.map_state != IsViewable ||
+        std::abs(static_cast<long long>(bounds->x) - binding->bounds.x) > 2 ||
+        std::abs(static_cast<long long>(bounds->y) - binding->bounds.y) > 2 ||
+        bounds->width != binding->bounds.width || bounds->height != binding->bounds.height) return false;
+    Window current = None; int revert = 0;
+    XGetInputFocus(display, &current, &revert); XSync(display, False);
+    for (int depth = 0; depth < 64 && current != None && current != PointerRoot; ++depth) {
+        if (current == binding->id) return true;
+        Window root = None, parent = None, *children = nullptr; unsigned count = 0;
+        g_x_error = false;
+        const Status found = XQueryTree(display, current, &root, &parent, &children, &count);
+        XSync(display, False);
+        if (children) XFree(children);
+        if (!found || g_x_error || current == root || current == parent) return false;
+        current = parent;
+    }
+    return false;
+}
+
+// Strip internal window binding options before the legacy command parsers.
+// All four bounds are required together; actual dispatch additionally needs id.
+bool ExtractWindowBinding(int *argc, char ***argv, std::vector<char *> *filtered,
+                          std::optional<WindowBinding> *binding) {
+    filtered->assign(*argv, *argv + std::min(*argc, 2));
+    WindowBinding parsed; unsigned seen = 0;
+    for (int i = 2; i < *argc; ++i) {
+        const std::string_view option((*argv)[i]);
+        unsigned bit = 0; int *destination = nullptr;
+        if (option == "--window-x") { bit = 1; destination = &parsed.bounds.x; }
+        if (option == "--window-y") { bit = 2; destination = &parsed.bounds.y; }
+        if (option == "--window-width") { bit = 4; destination = &parsed.bounds.width; }
+        if (option == "--window-height") { bit = 8; destination = &parsed.bounds.height; }
+        if (option == "--window-id") bit = 16;
+        if (bit == 0) { filtered->push_back((*argv)[i]); continue; }
+        if ((seen & bit) != 0 || ++i >= *argc) return false;
+        seen |= bit;
+        if (destination) {
+            if (!ParseInt((*argv)[i], destination)) return false;
+        } else {
+            const auto id = ParseUnsigned((*argv)[i]);
+            if (!id.has_value() || *id == 0 || *id > 0xffffffffUL) return false;
+            parsed.id = static_cast<Window>(*id);
+        }
+    }
+    if (seen) {
+        if ((seen & 15) != 15 || parsed.bounds.width <= 0 || parsed.bounds.height <= 0) return false;
+        *binding = parsed;
+    }
+    *argc = static_cast<int>(filtered->size());
+    filtered->push_back(nullptr); *argv = filtered->data();
+    return true;
 }
 
 struct WindowState {
@@ -1671,7 +1742,7 @@ bool ParseLimitAndDeadline(int argc, char **argv, std::string_view name, std::ui
 
 // A read-only proof for accessibility toolkits which report GrabFocus=false
 // even when their element already owns focus. Never emit or queue input here.
-int RunFocusInfo(int argc, char **argv) {
+int RunFocusInfo(int argc, char **argv, std::optional<WindowBinding> binding) {
     std::uint64_t pid = 0;
     std::uint64_t deadline = 0;
     if (!ParseLimitAndDeadline(argc, argv, "expected-pid", static_cast<std::uint64_t>(INT_MAX),
@@ -1689,15 +1760,23 @@ int RunFocusInfo(int argc, char **argv) {
         return exit_code;
     }
     const Atom pid_atom = XInternAtom(display, "_NET_WM_PID", True);
+    if (binding.has_value()) {
+        const auto ewmh = LoadEwmh(display);
+        std::string problem;
+        const auto window = FindClientWindow(ewmh, static_cast<unsigned long>(pid), binding->bounds, &problem, false);
+        binding->id = window.value_or(None);
+    }
     const bool focused = pid_atom != None &&
-                         FocusBelongsToPid(display, static_cast<unsigned long>(pid), pid_atom);
+                         FocusMatchesWindow(display, static_cast<unsigned long>(pid), pid_atom, binding);
     XCloseDisplay(display);
     if (DeadlineExpired(deadline)) {
         EmitError("deadline_exceeded", "focus_read", false);
         return kExitTimeoutBeforeDispatch;
     }
     std::cout << "{\"ok\":true,\"focused\":" << (focused ? "true" : "false")
-              << ",\"expected_pid\":" << pid << "}" << std::endl;
+              << ",\"expected_pid\":" << pid
+              << ",\"window_bound\":" << (binding.has_value() ? "true" : "false")
+              << ",\"window\":" << (binding.has_value() ? binding->id : None) << "}" << std::endl;
     return 0;
 }
 
@@ -1951,13 +2030,24 @@ std::optional<std::vector<KeyCode>> ChordCodes(Display *display,
     return chord;
 }
 
-bool PressChord(Display *display, const std::vector<KeyCode> &chord) {
+bool PressChord(Display *display, const std::vector<KeyCode> &chord,
+                const std::function<bool()> &allowed = [] { return true; }) {
     bool submitted = true;
+    std::vector<KeyCode> pressed;
+    char held[32]{};
+    XQueryKeymap(display, held);
+    for (const KeyCode code : chord) {
+        if ((held[code / 8] & (1 << (code % 8))) != 0) return false;
+    }
     g_x_error = false;
     for (const KeyCode code : chord) {
-        submitted = XTestFakeKeyEvent(display, code, True, 1) != 0 && submitted;
+        if (!allowed()) { submitted = false; break; }
+        if (!XTestFakeKeyEvent(display, code, True, 1)) { submitted = false; break; }
+        pressed.push_back(code);
+        XSync(display, False);
+        if (g_x_error) { submitted = false; break; }
     }
-    for (auto code = chord.rbegin(); code != chord.rend(); ++code) {
+    for (auto code = pressed.rbegin(); code != pressed.rend(); ++code) {
         submitted = XTestFakeKeyEvent(display, *code, False, 1) != 0 && submitted;
     }
     XSync(display, False);
@@ -2052,7 +2142,7 @@ Window FocusedPidWindow(Display *display, unsigned long pid, Atom pid_atom) {
     return None;
 }
 
-int RunPaste(int argc, char **argv) {
+int RunPaste(int argc, char **argv, const std::optional<WindowBinding> &binding) {
     std::uint64_t pid_value = 0;
     std::uint64_t deadline_value = 0;
     if (!ParseLimitAndDeadline(argc, argv, "expected-pid", static_cast<std::uint64_t>(INT_MAX),
@@ -2086,6 +2176,11 @@ int RunPaste(int argc, char **argv) {
         XCloseDisplay(display);
         EmitError("unsupported_key", "key_preflight", false);
         return kExitInvalid;
+    }
+    if (!FocusMatchesWindow(display, static_cast<unsigned long>(*pid), pid_atom, binding)) {
+        XCloseDisplay(display);
+        EmitError("focus_owner_mismatch", "target_preflight", false);
+        return kExitTargetMismatch;
     }
     const Selection selection = OpenSelection(display);
     auto fail = [&](std::string_view code, std::string_view phase, bool dispatched,
@@ -2130,13 +2225,13 @@ int RunPaste(int argc, char **argv) {
     };
     // The caller has just focused the element; give the focus change a moment.
     const auto focus_until = std::chrono::steady_clock::now() + std::chrono::seconds(1);
-    while (!FocusBelongsToPid(display, static_cast<unsigned long>(pid.value()), pid_atom) &&
+    while (!FocusMatchesWindow(display, static_cast<unsigned long>(pid.value()), pid_atom, binding) &&
            !DeadlineExpired(deadline.value()) &&
            std::chrono::steady_clock::now() < focus_until) {
         usleep(5000);
     }
     if (DeadlineExpired(deadline.value()) ||
-        !FocusBelongsToPid(display, static_cast<unsigned long>(pid.value()), pid_atom)) {
+        !FocusMatchesWindow(display, static_cast<unsigned long>(pid.value()), pid_atom, binding)) {
         restore();
         return fail("focus_owner_mismatch", "target_preflight", false, kExitTargetMismatch);
     }
@@ -2144,7 +2239,10 @@ int RunPaste(int argc, char **argv) {
         FocusedPidWindow(display, static_cast<unsigned long>(pid.value()), pid_atom);
     const auto mask = ResourceMask(display, selection.window);
     std::cout << "{\"event\":\"dispatch_started\"}" << std::endl;
-    if (!PressChord(display, {control, v})) {
+    if (!PressChord(display, {control, v}, [&] {
+            return !DeadlineExpired(*deadline) &&
+                   FocusMatchesWindow(display, static_cast<unsigned long>(*pid), pid_atom, binding);
+        })) {
         restore();
         return fail("x11_error", "keyboard_dispatch", true, kExitUnknownEffect);
     }
@@ -2162,6 +2260,10 @@ int RunPaste(int argc, char **argv) {
     const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(2);
     while (!consumed && !lost && !DeadlineExpired(deadline.value()) &&
            std::chrono::steady_clock::now() < until) {
+        if (!FocusMatchesWindow(display, static_cast<unsigned long>(*pid), pid_atom, binding)) {
+            restore();
+            return fail("focus_owner_changed", "paste_delivery", true, kExitUnknownEffect);
+        }
         while (XPending(display) > 0 && !consumed) {
             XEvent event{};
             XNextEvent(display, &event);
@@ -2284,9 +2386,21 @@ int main(int argc, char **argv) {
             return kExitInvalid;
         }
         // This protocol handshake does not open a display or touch input state.
-        std::cout << R"({"helper":"aad-linux-xtest","protocol":1,"features":["focus-info","type-text","pointer-click","pointer-gesture","drag","key-chord","window-info","window-action","paste","clipboard-read","global-key","record-input","pointer-modifiers","x11-desktop-independent","bounded-hold"]})"
+        std::cout << R"({"helper":"aad-linux-xtest","protocol":1,"features":["focus-info","type-text","pointer-click","pointer-gesture","drag","key-chord","window-info","window-action","paste","clipboard-read","global-key","record-input","pointer-modifiers","x11-desktop-independent","bounded-hold","window-focus"]})"
                   << std::endl;
         return 0;
+    }
+    std::optional<WindowBinding> binding;
+    std::vector<char *> filtered;
+    if (!ExtractWindowBinding(&argc, &argv, &filtered, &binding) ||
+        (binding.has_value() && command != "focus-info" && binding->id == None)) {
+        EmitError("invalid_window_binding", "arguments", false);
+        return kExitInvalid;
+    }
+    if (binding.has_value() && command != "focus-info" && command != "type-text" &&
+        command != "key-chord" && command != "paste" && command != "pointer-gesture" && command != "drag") {
+        EmitError("invalid_window_binding", "arguments", false);
+        return kExitInvalid;
     }
     if (command == "record-input") {
         return RunRecordInput(argc, argv);
@@ -2298,10 +2412,10 @@ int main(int argc, char **argv) {
         return RunClipboardRead(argc, argv);
     }
     if (command == "focus-info") {
-        return RunFocusInfo(argc, argv);
+        return RunFocusInfo(argc, argv, binding);
     }
     if (command == "paste") {
-        return RunPaste(argc, argv);
+        return RunPaste(argc, argv, binding);
     }
     if (command == "global-key") {
         return RunGlobalKey(argc, argv);
@@ -2410,7 +2524,7 @@ int main(int argc, char **argv) {
         return kExitTargetMismatch;
     }
     while ((command == "type-text" || command == "key-chord" || (gesture.has_value() && !gesture->modifiers.empty())) &&
-           !FocusBelongsToPid(display, expected_pid.value(), pid_atom)) {
+           !FocusMatchesWindow(display, expected_pid.value(), pid_atom, binding)) {
         if (DeadlineExpired(deadline_ns.value())) {
             XCloseDisplay(display);
             EmitError("focus_owner_mismatch", "target_preflight", false);
@@ -2420,7 +2534,7 @@ int main(int argc, char **argv) {
     }
     if (gesture.has_value()) {
         return RunGesture(display, command, gesture.value(), expected_pid.value(),
-                          deadline_ns.value(), pid_atom);
+                          deadline_ns.value(), pid_atom, binding);
     }
     if (command == "pointer-click") {
         if (!click_x.has_value() || !click_y.has_value() ||
@@ -2568,7 +2682,7 @@ int main(int argc, char **argv) {
             return finish_failure("deadline_exceeded", "keyboard_dispatch",
                                   kExitTimeoutBeforeDispatch);
         }
-        if (!FocusBelongsToPid(display, expected_pid.value(), pid_atom)) {
+        if (!FocusMatchesWindow(display, expected_pid.value(), pid_atom, binding)) {
             return finish_failure("focus_owner_changed", "keyboard_dispatch",
                                   kExitTargetMismatch);
         }

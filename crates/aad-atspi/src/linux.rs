@@ -1,6 +1,6 @@
 use super::{
     driver_error, remaining, AtspiBackend, AutomationError, BackendNode, BackendSnapshot, Bounds,
-    Gesture, Map, NativeRef, Value, MAX_FIELD_CHARS, MAX_NODES,
+    Gesture, Map, NativeRef, Value, WindowAnchor, MAX_FIELD_CHARS, MAX_NODES,
 };
 use atspi::proxy::accessible::AccessibleProxy;
 use atspi::proxy::action::ActionProxy;
@@ -22,6 +22,8 @@ use zbus::blocking::{connection, Connection, Proxy};
 
 mod focus_discovery;
 use focus_discovery::FocusDiscovery;
+mod window_focus;
+use window_focus::append_window_args;
 
 const REGISTRY_NAME: &str = "org.a11y.atspi.Registry";
 const REGISTRY_PATH: &str = "/org/a11y/atspi/accessible/root";
@@ -247,72 +249,6 @@ impl LinuxBackend {
             .ok()
     }
 
-    /// Independently prove both the accessible focus and the X11 input owner.
-    /// Some Qt widgets return false from GrabFocus when already focused.
-    fn verify_focused(
-        &self,
-        target: &NativeRef,
-        process_id: u32,
-        deadline: Instant,
-    ) -> Result<(), AutomationError> {
-        let path = self.input_helper("focus-info", deadline)?;
-        self.verify_focused_with_helper(target, process_id, deadline, &path)
-    }
-
-    fn verify_focused_with_helper(
-        &self,
-        target: &NativeRef,
-        process_id: u32,
-        deadline: Instant,
-        path: &Path,
-    ) -> Result<(), AutomationError> {
-        let focused = || -> Result<bool, AutomationError> {
-            remaining(deadline, false)?;
-            let states = zbus::block_on(self.accessible(target)?.get_state())
-                .map_err(|error| native_failure("Accessible.GetState", target, error))?;
-            Ok([
-                State::Focused,
-                State::Focusable,
-                State::Enabled,
-                State::Sensitive,
-            ]
-            .into_iter()
-            .all(|state| states.contains(state)))
-        };
-        if !focused()? {
-            return Err(driver_error(
-                "DRIVER.ACTION_UNSUPPORTED",
-                "accessible focus is not proven",
-            ));
-        }
-        let output = run_helper(
-            path,
-            &[
-                "focus-info".into(),
-                "--expected-pid".into(),
-                process_id.to_string(),
-                "--deadline-monotonic-ns".into(),
-                monotonic_deadline_ns(deadline)?.to_string(),
-            ],
-            None,
-            deadline,
-            XTEST_OUTPUT_LIMIT,
-            XTEST_OUTPUT_LIMIT,
-        )?;
-        let proof = parse_one_json_object(&output.stdout, "focus info")?;
-        if !output.status.success()
-            || !valid_focus_proof(&proof, process_id)
-            || self.process_id(&target.bus_name) != Some(process_id)
-            || !focused()?
-        {
-            return Err(driver_error(
-                "DRIVER.ACTION_UNSUPPORTED",
-                "native input focus is not proven for the accessible process",
-            ));
-        }
-        Ok(())
-    }
-
     fn application_info(
         &self,
         target: &NativeRef,
@@ -451,6 +387,7 @@ impl LinuxBackend {
     fn run_input(
         &self,
         target: &NativeRef,
+        window: Option<&WindowAnchor>,
         mut args: Vec<String>,
         minimum_events: u64,
         process_id: u32,
@@ -464,19 +401,36 @@ impl LinuxBackend {
         if args.iter().any(|arg| arg == "--hold-ms") {
             support.require("bounded-hold")?;
         }
-        if args.first().is_some_and(|command| command == "key-chord") {
+        if args.first().is_some_and(|command| command == "key-chord")
+            || args.iter().any(|arg| arg == "--modifiers")
+        {
             support.require("focus-info")?;
+            support.require("window-focus")?;
         }
         let path = support.path;
         let focus = if args.first().is_some_and(|command| command == "key-chord") {
-            let proof = self.focus(target, deadline)?;
+            let proof = self.focus(target, window, deadline)?;
             std::thread::sleep(Duration::from_millis(50).min(remaining(deadline, true)?));
-            self.verify_focused(target, process_id, deadline)
+            self.verify_focused(target, window, process_id, deadline)
                 .map_err(after_focus)?;
             Some(proof)
         } else {
             None
         };
+        if args.first().is_some_and(|command| command == "key-chord")
+            || args.iter().any(|arg| arg == "--modifiers")
+        {
+            let window = window.ok_or_else(|| {
+                driver_error(
+                    "DRIVER.ACTION_UNSUPPORTED",
+                    "input requires an observed top-level window",
+                )
+            })?;
+            // Feature checked before any focus request or keyboard dispatch.
+            let window_id =
+                self.verify_window_with_helper(target, window, process_id, deadline, &path)?;
+            append_window_args(&mut args, window, Some(window_id));
+        }
         let input_error = |error| {
             if focus.is_some() {
                 after_focus(error)
@@ -678,7 +632,8 @@ impl LinuxBackend {
         // Qt Quick can report hidden states for its actual focused text input.
         // Recover only keyboard actions, with independent live focus ownership;
         // input paths repeat the focus check after GrabFocus before dispatch.
-        let visibility_recovery = input.is_some_and(|support| support.has("focus-info"))
+        let visibility_recovery = input
+            .is_some_and(|support| support.has("focus-info") && support.has("window-focus"))
             && !fully_interactive
             && toolkit == Some("Qt")
             && states.is_some_and(|states| {
@@ -699,6 +654,7 @@ impl LinuxBackend {
             && process_id.is_some_and(|pid| {
                 self.verify_focused_with_helper(
                     &target,
+                    None,
                     pid as u32,
                     deadline,
                     &input.expect("feature checked").path,
@@ -713,7 +669,9 @@ impl LinuxBackend {
             && !protected
         {
             for (action, feature) in [("type_text", "type-text"), ("paste", "paste")] {
-                if input.is_some_and(|support| support.has(feature) && support.has("focus-info")) {
+                if input.is_some_and(|support| {
+                    support.has(feature) && support.has("focus-info") && support.has("window-focus")
+                }) {
                     actions.push(action.into());
                 }
             }
@@ -737,8 +695,11 @@ impl LinuxBackend {
                 }
             }
             if fully_interactive
-                && input
-                    .is_some_and(|support| support.has("key-chord") && support.has("focus-info"))
+                && input.is_some_and(|support| {
+                    support.has("key-chord")
+                        && support.has("focus-info")
+                        && support.has("window-focus")
+                })
             {
                 actions.push("key_chord".into());
             }
@@ -908,6 +869,7 @@ impl AtspiBackend for LinuxBackend {
         support.require(feature)?;
         if matches!(action, "type_text" | "key_chord" | "paste") {
             support.require("focus-info")?;
+            support.require("window-focus")?;
         }
         Ok(())
     }
@@ -972,7 +934,12 @@ impl AtspiBackend for LinuxBackend {
         )
     }
 
-    fn focus(&self, target: &NativeRef, deadline: Instant) -> Result<Value, AutomationError> {
+    fn focus(
+        &self,
+        target: &NativeRef,
+        window: Option<&WindowAnchor>,
+        deadline: Instant,
+    ) -> Result<Value, AutomationError> {
         remaining(deadline, false)?;
         let accepted = zbus::block_on(self.component_proxy(target)?.grab_focus())
             .map_err(|error| native_failure("Component.GrabFocus", target, error))?;
@@ -983,7 +950,7 @@ impl AtspiBackend for LinuxBackend {
                     "focus process ownership is unavailable",
                 )
             })?;
-            self.verify_focused(target, process_id, deadline)
+            self.verify_focused(target, window, process_id, deadline)
                 .map_err(|cause| {
                     driver_error(
                         "DRIVER.ACTION_FAILED",
@@ -1173,28 +1140,37 @@ impl AtspiBackend for LinuxBackend {
     fn type_text(
         &self,
         target: &NativeRef,
+        window: Option<&WindowAnchor>,
         text: &str,
         process_id: u32,
         deadline: Instant,
     ) -> Result<Value, AutomationError> {
         let path = self.input_helper("type-text", deadline)?;
-        self.input_helper("focus-info", deadline)?;
-        let focus = self.focus(target, deadline)?;
+        let window = window.ok_or_else(|| {
+            driver_error(
+                "DRIVER.ACTION_UNSUPPORTED",
+                "input requires an observed top-level window",
+            )
+        })?;
+        self.input_helper("window-focus", deadline)?;
+        let focus = self.focus(target, Some(window), deadline)?;
         std::thread::sleep(Duration::from_millis(50).min(remaining(deadline, true)?));
-        self.verify_focused(target, process_id, deadline)
+        let window_id = self
+            .verify_focused(target, Some(window), process_id, deadline)
             .map_err(after_focus)?;
         // The input method is per focused context. Query after grab_focus, before
         // any key or keyboard mapping is sent; XTest text can otherwise be
         // consumed as composition and still report a successful dispatch.
         self.check_text_input_method(deadline)
             .map_err(after_focus)?;
-        let args = [
+        let mut args = vec![
             "type-text".to_string(),
             "--expected-pid".into(),
             process_id.to_string(),
             "--deadline-monotonic-ns".into(),
             monotonic_deadline_ns(deadline)?.to_string(),
         ];
+        append_window_args(&mut args, window, Some(window_id));
         let output = run_helper(
             &path,
             &args,
@@ -1255,12 +1231,22 @@ impl AtspiBackend for LinuxBackend {
         process_id: u32,
         deadline: Instant,
     ) -> Result<Value, AutomationError> {
-        self.pointer_gesture_modified(target, point, gesture, &[], None, process_id, deadline)
+        self.pointer_gesture_modified(
+            target,
+            None,
+            point,
+            gesture,
+            &[],
+            None,
+            process_id,
+            deadline,
+        )
     }
 
     fn pointer_gesture_modified(
         &self,
         target: &NativeRef,
+        window: Option<&WindowAnchor>,
         point: (i32, i32),
         gesture: Gesture,
         modifiers: &[String],
@@ -1318,6 +1304,7 @@ impl AtspiBackend for LinuxBackend {
         }
         let input = self.run_input(
             target,
+            window,
             args,
             minimum + 2 * modifiers.len() as u64,
             process_id,
@@ -1337,12 +1324,23 @@ impl AtspiBackend for LinuxBackend {
         process_id: u32,
         deadline: Instant,
     ) -> Result<Value, AutomationError> {
-        self.drag_modified(target, from, to, button, &[], None, process_id, deadline)
+        self.drag_modified(
+            target,
+            None,
+            from,
+            to,
+            button,
+            &[],
+            None,
+            process_id,
+            deadline,
+        )
     }
 
     fn drag_modified(
         &self,
         target: &NativeRef,
+        window: Option<&WindowAnchor>,
         from: (i32, i32),
         to: (i32, i32),
         button: u8,
@@ -1374,6 +1372,7 @@ impl AtspiBackend for LinuxBackend {
         }
         let input = self.run_input(
             target,
+            window,
             args,
             3 + 2 * modifiers.len() as u64,
             process_id,
@@ -1387,6 +1386,7 @@ impl AtspiBackend for LinuxBackend {
     fn key_chord(
         &self,
         target: &NativeRef,
+        window: Option<&WindowAnchor>,
         keys: &[String],
         hold_ms: Option<u16>,
         process_id: u32,
@@ -1403,7 +1403,7 @@ impl AtspiBackend for LinuxBackend {
             args.extend(["--hold-ms".into(), ms.to_string()]);
         }
         let minimum = 2 * keys.len() as u64;
-        let input = self.run_input(target, args, minimum, process_id, deadline)?;
+        let input = self.run_input(target, window, args, minimum, process_id, deadline)?;
         Ok(
             json!({"native_interface": "Component.grab_focus -> XTEST", "input": input, "synthetic_input": true, "keys": keys}),
         )
@@ -1527,23 +1527,32 @@ impl AtspiBackend for LinuxBackend {
     fn paste(
         &self,
         target: &NativeRef,
+        window: Option<&WindowAnchor>,
         text: &str,
         process_id: u32,
         deadline: Instant,
     ) -> Result<Value, AutomationError> {
         let path = self.input_helper("paste", deadline)?;
-        self.input_helper("focus-info", deadline)?;
-        let focus = self.focus(target, deadline)?;
+        let window = window.ok_or_else(|| {
+            driver_error(
+                "DRIVER.ACTION_UNSUPPORTED",
+                "input requires an observed top-level window",
+            )
+        })?;
+        self.input_helper("window-focus", deadline)?;
+        let focus = self.focus(target, Some(window), deadline)?;
         std::thread::sleep(Duration::from_millis(50).min(remaining(deadline, true)?));
-        self.verify_focused(target, process_id, deadline)
+        let window_id = self
+            .verify_focused(target, Some(window), process_id, deadline)
             .map_err(after_focus)?;
-        let args = [
+        let mut args = vec![
             "paste".to_string(),
             "--expected-pid".into(),
             process_id.to_string(),
             "--deadline-monotonic-ns".into(),
             monotonic_deadline_ns(deadline)?.to_string(),
         ];
+        append_window_args(&mut args, window, Some(window_id));
         let output = run_helper(
             &path,
             &args,
@@ -2147,6 +2156,11 @@ fn valid_focus_proof(proof: &Map<String, Value>, process_id: u32) -> bool {
     proof.get("ok") == Some(&Value::Bool(true))
         && proof.get("focused") == Some(&Value::Bool(true))
         && proof.get("expected_pid").and_then(Value::as_u64) == Some(u64::from(process_id))
+        && proof.get("window_bound") == Some(&Value::Bool(true))
+        && proof
+            .get("window")
+            .and_then(Value::as_u64)
+            .is_some_and(|id| id > 0 && id <= u64::from(u32::MAX))
         && !proof.contains_key("dispatch_started")
 }
 
@@ -3025,6 +3039,7 @@ mod capture_tests {
         assert_eq!(error.code, "DRIVER.HELPER_INCOMPATIBLE");
         assert_eq!(error.details["required_feature"], "bounded-hold");
         assert!(!support.has("focus-info"));
+        assert!(!support.has("window-focus"));
     }
 
     #[test]
@@ -3079,11 +3094,23 @@ mod capture_tests {
     }
 
     #[test]
-    fn focus_proof_requires_the_expected_pid_without_input_dispatch() {
+    fn focus_proof_requires_a_bound_window_and_expected_pid_without_input_dispatch() {
         for (proof, expected) in [
             (
                 json!({"ok": true, "focused": true, "expected_pid": 42}),
+                false,
+            ),
+            (
+                json!({"ok": true, "focused": true, "expected_pid": 42, "window_bound": true, "window": 123}),
                 true,
+            ),
+            (
+                json!({"ok": true, "focused": true, "expected_pid": 42, "window_bound": true, "window": 0}),
+                false,
+            ),
+            (
+                json!({"ok": true, "focused": true, "expected_pid": 42, "window_bound": false, "window": 123}),
+                false,
             ),
             (
                 json!({"ok": true, "focused": false, "expected_pid": 42}),
