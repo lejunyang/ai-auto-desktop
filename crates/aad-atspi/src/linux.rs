@@ -229,6 +229,65 @@ impl LinuxBackend {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn type_text_mode(
+        &self,
+        target: &NativeRef,
+        window: Option<&WindowAnchor>,
+        text: &str,
+        keys: bool,
+        process_id: u32,
+        deadline: Instant,
+    ) -> Result<Value, AutomationError> {
+        let path =
+            self.input_helper(if keys { "type-text-keys" } else { "type-text" }, deadline)?;
+        let window = window.ok_or_else(|| {
+            driver_error(
+                "DRIVER.ACTION_UNSUPPORTED",
+                "input requires an observed top-level window",
+            )
+        })?;
+        self.input_helper("window-focus", deadline)?;
+        let focus = self.focus(target, Some(window), deadline)?;
+        std::thread::sleep(Duration::from_millis(50).min(remaining(deadline, true)?));
+        let window_id = self
+            .verify_focused(target, Some(window), process_id, deadline)
+            .map_err(after_focus)?;
+        // Unicode insertion cannot silently become IME composition. Explicit
+        // keys mode intentionally participates in the current input method.
+        if !keys {
+            self.check_text_input_method(deadline)
+                .map_err(after_focus)?;
+        }
+        let mut args = vec![
+            "type-text".to_string(),
+            "--expected-pid".into(),
+            process_id.to_string(),
+            "--deadline-monotonic-ns".into(),
+            monotonic_deadline_ns(deadline)?.to_string(),
+        ];
+        if keys {
+            args.extend(["--mode".into(), "keys".into()]);
+        }
+        append_window_args(&mut args, window, Some(window_id));
+        let output = self
+            .run_helper(
+                &path,
+                &args,
+                Some(text.as_bytes()),
+                deadline,
+                XTEST_OUTPUT_LIMIT,
+                XTEST_OUTPUT_LIMIT,
+            )
+            .map_err(after_focus)?;
+        let input =
+            parse_input_helper(output, "keyboard_dispatch", 2, process_id).map_err(after_focus)?;
+        Ok(
+            json!({"native_interface": "Component.grab_focus -> XTEST", "focus": focus,
+            "input": input, "synthetic_input": true, "mode": if keys { "keys" } else { "unicode" }}),
+        )
+    }
+
     fn native(reference: ObjectRef) -> NativeRef {
         NativeRef {
             bus_name: reference.name.as_str().to_string(),
@@ -1219,49 +1278,19 @@ impl AtspiBackend for LinuxBackend {
         process_id: u32,
         deadline: Instant,
     ) -> Result<Value, AutomationError> {
-        let path = self.input_helper("type-text", deadline)?;
-        let window = window.ok_or_else(|| {
-            driver_error(
-                "DRIVER.ACTION_UNSUPPORTED",
-                "input requires an observed top-level window",
-            )
-        })?;
-        self.input_helper("window-focus", deadline)?;
-        let focus = self.focus(target, Some(window), deadline)?;
-        std::thread::sleep(Duration::from_millis(50).min(remaining(deadline, true)?));
-        let window_id = self
-            .verify_focused(target, Some(window), process_id, deadline)
-            .map_err(after_focus)?;
-        // The input method is per focused context. Query after grab_focus, before
-        // any key or keyboard mapping is sent; XTest text can otherwise be
-        // consumed as composition and still report a successful dispatch.
-        self.check_text_input_method(deadline)
-            .map_err(after_focus)?;
-        let mut args = vec![
-            "type-text".to_string(),
-            "--expected-pid".into(),
-            process_id.to_string(),
-            "--deadline-monotonic-ns".into(),
-            monotonic_deadline_ns(deadline)?.to_string(),
-        ];
-        append_window_args(&mut args, window, Some(window_id));
-        let output = self
-            .run_helper(
-                &path,
-                &args,
-                Some(text.as_bytes()),
-                deadline,
-                XTEST_OUTPUT_LIMIT,
-                XTEST_OUTPUT_LIMIT,
-            )
-            .map_err(after_focus)?;
-        let input =
-            parse_input_helper(output, "keyboard_dispatch", 2, process_id).map_err(after_focus)?;
-        Ok(
-            json!({"native_interface": "Component.grab_focus -> XTEST", "focus": focus, "input": input, "synthetic_input": true}),
-        )
+        self.type_text_mode(target, window, text, false, process_id, deadline)
     }
 
+    fn type_text_keys(
+        &self,
+        target: &NativeRef,
+        window: Option<&WindowAnchor>,
+        text: &str,
+        process_id: u32,
+        deadline: Instant,
+    ) -> Result<Value, AutomationError> {
+        self.type_text_mode(target, window, text, true, process_id, deadline)
+    }
     fn pointer_click(
         &self,
         _target: &NativeRef,

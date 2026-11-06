@@ -730,15 +730,17 @@ impl Backend for NativeBackend {
             ),
             Action::TypeText { text, mode } => {
                 set("text", json!(text));
-                // Only UI Automation offers a choice; AT-SPI and AX always
-                // type Unicode and refuse a `mode` argument.
+                // UIA and AT-SPI explicitly distinguish Unicode insertion from
+                // layout keys; AX has no layout-aware key implementation yet.
                 match (self.flavor, mode) {
-                    (Flavor::Windows, _) => set("mode", serde_json::to_value(mode).unwrap()),
+                    (Flavor::Windows | Flavor::Linux, _) => {
+                        set("mode", serde_json::to_value(mode).unwrap())
+                    }
                     (_, Some(crate::model::TypeMode::Keys)) => {
                         return Err(error(
                             "CONTROL.ACTION_UNSUPPORTED",
-                            "layout-aware key typing is available on Windows only",
-                        ))
+                            "layout-aware key typing is unavailable on this native backend",
+                        ));
                     }
                     _ => {}
                 }

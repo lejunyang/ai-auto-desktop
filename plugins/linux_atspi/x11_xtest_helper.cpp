@@ -391,6 +391,156 @@ std::optional<KeyPlan> BuildKeyPlan(
     return plan;
 }
 
+struct PhysicalStroke {
+    KeyCode code = 0;
+    bool shift = false;
+    KeySym symbol = NoSymbol;
+};
+
+struct PhysicalMap {
+    XkbDescPtr value;
+    explicit PhysicalMap(Display *display)
+        : value(XkbGetMap(display, XkbAllClientInfoMask, XkbUseCoreKbd)) {}
+    ~PhysicalMap() { if (value) XkbFreeKeyboard(value, XkbAllComponentsMask, True); }
+    PhysicalMap(const PhysicalMap &) = delete;
+    PhysicalMap &operator=(const PhysicalMap &) = delete;
+};
+
+bool PhysicalSymbol(XkbDescPtr map, KeyCode code, unsigned group, unsigned modifiers,
+                    KeySym expected) {
+    unsigned consumed = 0;
+    KeySym actual = NoSymbol;
+    return map && map->map && map->map->modmap && code >= map->min_key_code && code <= map->max_key_code &&
+           map->map->modmap[code] == 0 &&
+           XkbTranslateKeyCode(map, code, XkbBuildCoreState(modifiers, group),
+                               &consumed, &actual) && actual == expected;
+}
+
+// Explicit physical typing lets the target's existing IME compose keystrokes.
+// It never installs Unicode mappings or changes the selected input method.
+int RunPhysicalText(Display *display, const std::vector<std::uint32_t> &codepoints,
+                    std::uint64_t expected_pid, std::uint64_t deadline_ns, Atom pid_atom,
+                    const std::optional<WindowBinding> &binding) {
+    bool dispatched = false;
+    std::vector<KeyCode> owned;
+    unsigned long events = 0;
+    auto release = [&]() {
+        for (auto it = owned.rbegin(); it != owned.rend(); ++it) {
+            XTestFakeKeyEvent(display, *it, False, 1);
+            ++events;
+        }
+        owned.clear();
+        XSync(display, False);
+    };
+    auto fail = [&](std::string_view code, int exit_code) {
+        release();
+        XCloseDisplay(display);
+        EmitError(code, dispatched ? "keyboard_dispatch" : "text_preflight", dispatched);
+        return dispatched ? kExitUnknownEffect : exit_code;
+    };
+    // Unlike the legacy low-level helper mode, this new entry requires the
+    // exact observed window even when called outside the Rust provider.
+    if (!binding || binding->id == None) return fail("invalid_window_binding", kExitInvalid);
+    XkbStateRec initial{};
+    PhysicalMap initial_map(display);
+    if (!initial_map.value || !initial_map.value->map || !initial_map.value->map->modmap ||
+        XkbGetState(display, XkbUseCoreKbd, &initial) != Success) {
+        return fail("keyboard_map_unavailable", kExitUnavailable);
+    }
+    if (initial.base_mods != 0 || initial.latched_mods != 0) {
+        return fail("input_already_held", kExitTargetMismatch);
+    }
+    KeyCode shift = 0;
+    for (int code = initial_map.value->min_key_code; code <= initial_map.value->max_key_code; ++code) {
+        if (initial_map.value->map->modmap[code] != ShiftMask) continue;
+        unsigned consumed = 0;
+        KeySym symbol = NoSymbol;
+        if (XkbTranslateKeyCode(initial_map.value, static_cast<KeyCode>(code),
+                               XkbBuildCoreState(initial.locked_mods, initial.group),
+                               &consumed, &symbol) &&
+            (symbol == XK_Shift_L || symbol == XK_Shift_R)) {
+            shift = static_cast<KeyCode>(code); break;
+        }
+    }
+    std::vector<PhysicalStroke> plan;
+    for (const auto cp : codepoints) {
+        const KeySym wanted = cp == '\n' ? XK_Return :
+            cp <= 0xff ? static_cast<KeySym>(cp) : static_cast<KeySym>(0x01000000U | cp);
+        bool found = false;
+        // Prefer an unshifted existing key. Never substitute an unmapped code.
+        for (int shifted = 0; shifted <= 1 && !found; ++shifted) {
+            if (shifted && shift == 0) continue;
+            for (int code = initial_map.value->min_key_code; code <= initial_map.value->max_key_code; ++code) {
+                if (PhysicalSymbol(initial_map.value, static_cast<KeyCode>(code), initial.group,
+                                   initial.locked_mods | (shifted ? ShiftMask : 0), wanted)) {
+                    plan.push_back({static_cast<KeyCode>(code), shifted != 0, wanted});
+                    found = true; break;
+                }
+            }
+        }
+        if (!found) return fail("unsupported_keyboard_mapping", kExitUnsupportedText);
+    }
+    auto verify = [&](const PhysicalStroke &stroke) -> std::string_view {
+        if (DeadlineExpired(deadline_ns)) return "deadline_exceeded";
+        if (!PidBelongsToCurrentUser(static_cast<unsigned long>(expected_pid))) return "untrusted_process";
+        if (!FocusMatchesWindow(display, expected_pid, pid_atom, binding)) return "focus_owner_changed";
+        XkbStateRec state{};
+        if (XkbGetState(display, XkbUseCoreKbd, &state) != Success) return "keyboard_map_unavailable";
+        const bool own_shift = std::find(owned.begin(), owned.end(), shift) != owned.end();
+        if (state.group != initial.group || state.locked_mods != initial.locked_mods ||
+            state.latched_mods != 0 || state.base_mods != (own_shift ? ShiftMask : 0)) {
+            return "keyboard_state_changed";
+        }
+        char down[32]{};
+        XQueryKeymap(display, down);
+        for (unsigned code = 0; code < 256; ++code) {
+            if ((static_cast<unsigned char>(down[code / 8]) & (1U << (code % 8))) != 0 &&
+                std::find(owned.begin(), owned.end(), static_cast<KeyCode>(code)) == owned.end()) {
+                return "input_already_held";
+            }
+        }
+        PhysicalMap current(display);
+        if (!PhysicalSymbol(current.value, stroke.code, state.group,
+                            state.locked_mods | (stroke.shift ? ShiftMask : 0), stroke.symbol)) {
+            return "keyboard_mapping_changed";
+        }
+        if (stroke.shift && (!current.value || !current.value->map ||
+                            current.value->map->modmap[shift] != ShiftMask)) {
+            return "keyboard_mapping_changed";
+        }
+        if (g_x_error) return "x11_error";
+        return {};
+    };
+    for (const auto &stroke : plan) {
+        if (const auto problem = verify(stroke); !problem.empty()) {
+            return fail(problem, problem == "deadline_exceeded" ? kExitTimeoutBeforeDispatch : kExitTargetMismatch);
+        }
+        auto press = [&](KeyCode code) -> bool {
+            if (!dispatched) {
+                std::cout << "{\"event\":\"dispatch_started\"}" << std::endl;
+                dispatched = true;
+            }
+            owned.push_back(code);
+            const bool ok = XTestFakeKeyEvent(display, code, True, 1) != 0;
+            ++events;
+            XSync(display, False);
+            return ok && !g_x_error;
+        };
+        if (stroke.shift) {
+            if (!press(shift)) return fail("x11_error", kExitUnknownEffect);
+            if (const auto problem = verify(stroke); !problem.empty()) return fail(problem, kExitUnknownEffect);
+        }
+        if (!press(stroke.code)) return fail("x11_error", kExitUnknownEffect);
+        if (const auto problem = verify(stroke); !problem.empty()) return fail(problem, kExitUnknownEffect);
+        release();
+        if (g_x_error) return fail("x11_error", kExitUnknownEffect);
+    }
+    XCloseDisplay(display);
+    std::cout << "{\"ok\":true,\"dispatch_started\":true,\"mode\":\"keys\",\"events\":"
+              << events << ",\"codepoints\":" << codepoints.size() << "}" << std::endl;
+    return 0;
+}
+
 // Gestures, drags and key chords. Each runs after the shared preflight in
 // main: the session qualifies, pointer hits belong to the target process, and
 // keyboard input (including pointer modifiers) also has same-process focus.
@@ -2556,7 +2706,7 @@ int main(int argc, char **argv) {
             return kExitInvalid;
         }
         // This protocol handshake does not open a display or touch input state.
-        std::cout << R"({"helper":"aad-linux-xtest","protocol":1,"features":["focus-info","type-text","pointer-click","pointer-gesture","drag","key-chord","window-info","window-action","paste","clipboard-read","global-key","record-input","pointer-modifiers","x11-desktop-independent","bounded-hold","window-focus","cooperative-cancel","anchored-drag-path"]})"
+        std::cout << R"({"helper":"aad-linux-xtest","protocol":1,"features":["focus-info","type-text","pointer-click","pointer-gesture","drag","key-chord","window-info","window-action","paste","clipboard-read","global-key","record-input","pointer-modifiers","x11-desktop-independent","bounded-hold","window-focus","cooperative-cancel","anchored-drag-path","type-text-keys"]})"
                   << std::endl;
         return 0;
     }
@@ -2597,6 +2747,7 @@ int main(int argc, char **argv) {
     std::optional<int> click_x;
     std::optional<int> click_y;
     std::optional<GestureRequest> gesture;
+    bool physical_keys = false;
     if (command == "pointer-gesture" || command == "drag" || command == "key-chord") {
         gesture = ParseGesture(command, argc, argv, &expected_pid, &deadline_ns);
         if (!gesture.has_value()) {
@@ -2604,13 +2755,15 @@ int main(int argc, char **argv) {
             return kExitInvalid;
         }
     } else if (command == "type-text") {
-        if (argc != 6 || std::string_view(argv[2]) != "--expected-pid" ||
-            std::string_view(argv[4]) != "--deadline-monotonic-ns") {
+        if ((argc != 6 && argc != 8) || std::string_view(argv[2]) != "--expected-pid" ||
+            std::string_view(argv[4]) != "--deadline-monotonic-ns" ||
+            (argc == 8 && (std::string_view(argv[6]) != "--mode" || std::string_view(argv[7]) != "keys"))) {
             EmitError("invalid_arguments", "arguments", false);
             return kExitInvalid;
         }
         expected_pid = ParseUnsigned(argv[3]);
         deadline_ns = ParseUnsigned(argv[5]);
+        physical_keys = argc == 8;
     } else if (command == "pointer-click") {
         if (argc != 10 || std::string_view(argv[2]) != "--expected-pid" ||
             std::string_view(argv[4]) != "--x" || std::string_view(argv[6]) != "--y" ||
@@ -2755,6 +2908,11 @@ int main(int argc, char **argv) {
                   << (dispatch_started ? "true" : "false")
                   << ",\"events\":" << event_count << "}" << std::endl;
         return 0;
+    }
+
+    if (physical_keys) {
+        return RunPhysicalText(display, codepoints.value(), expected_pid.value(),
+                               deadline_ns.value(), pid_atom, binding);
     }
 
     int minimum = 0;

@@ -57,6 +57,40 @@ impl Fixture {
 }
 
 #[test]
+fn explicit_layout_keys_reach_only_supported_native_providers() {
+    for (name, flavor) in [
+        ("desktop.windows_uia", Flavor::Windows),
+        ("desktop.linux_atspi", Flavor::Linux),
+        ("desktop.macos_ax", Flavor::MacOS),
+    ] {
+        let provider = Fixture::new(name, flavor);
+        let backend = NativeBackend::new(provider.clone(), flavor);
+        let node = json!({"node_id":"n", "role":"entry", "actions":["type_text"], "provenance":{"bus_name":":1.2","object_path":"/field"}});
+        let snapshot = json!({"snapshot_id":"s", "revision":1, "nodes":[node]});
+        let action =
+            serde_json::from_value(json!({"type":"type_text", "text":"nihao", "mode":"keys"}))
+                .unwrap();
+        let result = backend.act(
+            &snapshot,
+            &node,
+            &action,
+            &Context::new(Duration::from_secs(1), true),
+        );
+        let calls = provider.calls.lock().unwrap();
+        if matches!(flavor, Flavor::MacOS) {
+            assert_eq!(result.unwrap_err().code, "CONTROL.ACTION_UNSUPPORTED");
+            assert!(calls.is_empty());
+        } else {
+            result.unwrap();
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0].0, format!("{name}.type_text@1"));
+            assert_eq!(calls[0].1["mode"], "keys");
+            assert_eq!(calls[0].1["text"], "nihao");
+        }
+    }
+}
+
+#[test]
 fn cross_resource_native_drag_keeps_each_snapshot_and_locator_independent() {
     for (name, flavor) in [
         ("desktop.windows_uia", Flavor::Windows),

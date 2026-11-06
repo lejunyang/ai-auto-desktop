@@ -245,6 +245,21 @@ pub trait AtspiBackend: Send + Sync {
             "native type_text helper is unavailable",
         ))
     }
+    /// Send existing layout keys through the focused application's input method.
+    /// This does not promise that committed text equals the requested key string.
+    fn type_text_keys(
+        &self,
+        _target: &NativeRef,
+        _window: Option<&WindowAnchor>,
+        _text: &str,
+        _process_id: u32,
+        _deadline: Instant,
+    ) -> Result<Value, AutomationError> {
+        Err(driver_error(
+            "DRIVER.ACTION_UNSUPPORTED",
+            "layout-aware key typing is unavailable",
+        ))
+    }
     fn pointer_click(
         &self,
         _target: &NativeRef,
@@ -1108,6 +1123,7 @@ impl AtspiProvider {
             allowed.push("text");
         }
         match action {
+            "type_text" => allowed.push("mode"),
             "pointer_click" => allowed.extend(["button", "position"]),
             "pointer_gesture" => allowed.extend([
                 "button",
@@ -1132,6 +1148,16 @@ impl AtspiProvider {
             _ => {}
         }
         only_keys(args, &allowed)?;
+        let type_keys = if action == "type_text" {
+            match args.get("mode") {
+                None | Some(Value::Null) => false,
+                Some(Value::String(mode)) if mode == "unicode" => false,
+                Some(Value::String(mode)) if mode == "keys" => true,
+                _ => return Err(invalid("type_text mode must be unicode or keys")),
+            }
+        } else {
+            false
+        };
         let path = if action == "drag" {
             parse_drag_path(args)?
         } else {
@@ -1341,8 +1367,18 @@ impl AtspiProvider {
                 "type_text" => {
                     let text = ordinary_text(args.get("text"))?;
                     let process = process_id(&node, &fresh)?;
-                    self.backend
-                        .type_text(&native, window.as_ref(), text, process, deadline)
+                    if type_keys {
+                        self.backend.type_text_keys(
+                            &native,
+                            window.as_ref(),
+                            text,
+                            process,
+                            deadline,
+                        )
+                    } else {
+                        self.backend
+                            .type_text(&native, window.as_ref(), text, process, deadline)
+                    }
                 }
                 "pointer_click" => {
                     let process = process_id(&node, &fresh)?;
@@ -3029,6 +3065,12 @@ fn manifest_document() -> Value {
                 .as_object_mut()
                 .unwrap()
                 .remove("minLength");
+        } else {
+            actions[name]["input_schema"]["properties"]["mode"] =
+                json!({"type": ["string", "null"], "enum": ["unicode", "keys", null]});
+            actions[name]["description"] = json!(
+                "重新验证并聚焦目标后输入；unicode 为默认普通文本路径，keys 使用现有布局键位参与输入法组合，不保证提交文本等于键串。"
+            );
         }
     }
     actions.insert("secret_input".into(), contract(
@@ -3515,6 +3557,28 @@ mod tests {
             self.writes.fetch_add(1, Ordering::SeqCst);
             Ok(json!({"accepted": true}))
         }
+        fn type_text(
+            &self,
+            _target: &NativeRef,
+            _window: Option<&WindowAnchor>,
+            _text: &str,
+            _process_id: u32,
+            _deadline: Instant,
+        ) -> Result<Value, AutomationError> {
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            Ok(json!({"mode": "unicode"}))
+        }
+        fn type_text_keys(
+            &self,
+            _target: &NativeRef,
+            _window: Option<&WindowAnchor>,
+            _text: &str,
+            _process_id: u32,
+            _deadline: Instant,
+        ) -> Result<Value, AutomationError> {
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            Ok(json!({"mode": "keys"}))
+        }
         fn named_action(
             &self,
             _target: &NativeRef,
@@ -3904,6 +3968,46 @@ mod tests {
             assert!(secret_text(Some(&json!(text))).is_err());
         }
         assert_eq!(secret_text(Some(&json!(""))).unwrap(), "");
+    }
+
+    #[test]
+    fn explicit_keys_typing_selects_its_backend_and_refuses_invalid_modes_before_capture() {
+        for mode in [
+            None,
+            Some(json!(null)),
+            Some(json!("unicode")),
+            Some(json!("keys")),
+            Some(json!("auto")),
+            Some(json!(true)),
+        ] {
+            let backend = Arc::new(FakeBackend::default());
+            let provider = AtspiProvider::new(backend.clone()).unwrap();
+            let observed = take_snapshot(&provider);
+            let mut args = json!({"target":{"snapshot_id":observed["snapshot_id"],"revision":observed["revision"],"node_id":"n0"}, "locator":locator(), "text":"nihao"});
+            if let Some(mode) = &mode {
+                args["mode"] = mode.clone();
+            }
+            let result = provider.invoke(
+                "desktop.linux_atspi.type_text@1",
+                args,
+                Some(Duration::from_secs(1)),
+            );
+            if matches!(mode.as_ref(), Some(value) if value == "auto" || value == true) {
+                assert!(result.is_err());
+                assert_eq!(backend.captures.load(Ordering::SeqCst), 1);
+                assert_eq!(backend.writes.load(Ordering::SeqCst), 0);
+            } else {
+                assert_eq!(
+                    result.unwrap()["backend_result"]["mode"],
+                    if mode == Some(json!("keys")) {
+                        "keys"
+                    } else {
+                        "unicode"
+                    }
+                );
+                assert_eq!(backend.writes.load(Ordering::SeqCst), 1);
+            }
+        }
     }
 
     #[test]
