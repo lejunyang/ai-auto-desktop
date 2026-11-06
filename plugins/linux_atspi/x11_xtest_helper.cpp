@@ -1530,6 +1530,38 @@ bool ParseLimitAndDeadline(int argc, char **argv, std::string_view name, std::ui
     return true;
 }
 
+// A read-only proof for accessibility toolkits which report GrabFocus=false
+// even when their element already owns focus. Never emit or queue input here.
+int RunFocusInfo(int argc, char **argv) {
+    std::uint64_t pid = 0;
+    std::uint64_t deadline = 0;
+    if (!ParseLimitAndDeadline(argc, argv, "expected-pid", static_cast<std::uint64_t>(INT_MAX),
+                              &pid, &deadline)) {
+        EmitError("invalid_arguments", "arguments", false);
+        return kExitInvalid;
+    }
+    if (DeadlineExpired(deadline)) {
+        EmitError("deadline_exceeded", "focus_read", false);
+        return kExitTimeoutBeforeDispatch;
+    }
+    int exit_code = 0;
+    Display *display = OpenQualifiedDisplay(pid, &exit_code);
+    if (display == nullptr) {
+        return exit_code;
+    }
+    const Atom pid_atom = XInternAtom(display, "_NET_WM_PID", True);
+    const bool focused = pid_atom != None &&
+                         FocusBelongsToPid(display, static_cast<unsigned long>(pid), pid_atom);
+    XCloseDisplay(display);
+    if (DeadlineExpired(deadline)) {
+        EmitError("deadline_exceeded", "focus_read", false);
+        return kExitTimeoutBeforeDispatch;
+    }
+    std::cout << "{\"ok\":true,\"focused\":" << (focused ? "true" : "false")
+              << ",\"expected_pid\":" << pid << "}" << std::endl;
+    return 0;
+}
+
 int RunClipboardRead(int argc, char **argv) {
     std::uint64_t limit_value = 0;
     std::uint64_t deadline_value = 0;
@@ -2115,6 +2147,9 @@ int main(int argc, char **argv) {
     }
     if (command == "clipboard-read") {
         return RunClipboardRead(argc, argv);
+    }
+    if (command == "focus-info") {
+        return RunFocusInfo(argc, argv);
     }
     if (command == "paste") {
         return RunPaste(argc, argv);

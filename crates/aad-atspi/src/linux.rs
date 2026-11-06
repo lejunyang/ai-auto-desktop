@@ -206,6 +206,61 @@ impl LinuxBackend {
             .ok()
     }
 
+    /// Independently prove both the accessible focus and the X11 input owner.
+    /// Some Qt widgets return false from GrabFocus when already focused.
+    fn verify_focused(
+        &self,
+        target: &NativeRef,
+        process_id: u32,
+        deadline: Instant,
+    ) -> Result<(), AutomationError> {
+        let focused = || -> Result<bool, AutomationError> {
+            remaining(deadline, false)?;
+            let states = zbus::block_on(self.accessible(target)?.get_state())
+                .map_err(|error| native_failure("Accessible.GetState", target, error))?;
+            Ok([
+                State::Focused,
+                State::Focusable,
+                State::Enabled,
+                State::Sensitive,
+            ]
+            .into_iter()
+            .all(|state| states.contains(state)))
+        };
+        if !focused()? {
+            return Err(driver_error(
+                "DRIVER.ACTION_UNSUPPORTED",
+                "accessible focus is not proven",
+            ));
+        }
+        let output = run_helper(
+            &self.helper(HelperKind::Input)?,
+            &[
+                "focus-info".into(),
+                "--expected-pid".into(),
+                process_id.to_string(),
+                "--deadline-monotonic-ns".into(),
+                monotonic_deadline_ns(deadline)?.to_string(),
+            ],
+            None,
+            deadline,
+            XTEST_OUTPUT_LIMIT,
+            XTEST_OUTPUT_LIMIT,
+        )?;
+        let proof = parse_one_json_object(&output.stdout, "focus info")?;
+        if !output.status.success()
+            || !valid_focus_proof(&proof, process_id)
+            || self.process_id(&target.bus_name) != Some(process_id)
+            || !focused()?
+        {
+            return Err(driver_error(
+                "DRIVER.ACTION_UNSUPPORTED",
+                "native input focus is not proven for the accessible process",
+            ));
+        }
+        Ok(())
+    }
+
     fn application_info(
         &self,
         target: &NativeRef,
@@ -352,6 +407,8 @@ impl LinuxBackend {
         let path = self.helper(HelperKind::Input)?;
         let focus = self.focus(target, deadline)?;
         std::thread::sleep(Duration::from_millis(50).min(remaining(deadline, true)?));
+        self.verify_focused(target, process_id, deadline)
+            .map_err(after_focus)?;
         args.extend([
             "--deadline-monotonic-ns".into(),
             monotonic_deadline_ns(deadline)?.to_string(),
@@ -518,7 +575,29 @@ impl LinuxBackend {
             .into_iter()
             .all(|state| states.contains(state))
         });
-        if fully_interactive
+        // Qt Quick can report hidden states for its actual focused text input.
+        // Recover only keyboard actions, with independent live focus ownership;
+        // input paths repeat the focus check after GrabFocus before dispatch.
+        let visibility_recovery = !fully_interactive
+            && toolkit == Some("Qt")
+            && states.is_some_and(|states| {
+                [
+                    State::Enabled,
+                    State::Sensitive,
+                    State::Focusable,
+                    State::Focused,
+                    State::Editable,
+                ]
+                .into_iter()
+                .all(|state| states.contains(state))
+            })
+            && matches!(role.as_str(), "entry" | "text")
+            && interfaces.contains(Interface::Component)
+            && bounds.is_some_and(|bounds| bounds.width > 0 && bounds.height > 0)
+            && !protected
+            && process_id
+                .is_some_and(|pid| self.verify_focused(&target, pid as u32, deadline).is_ok());
+        if (fully_interactive || visibility_recovery)
             && states.is_some_and(|states| states.contains(State::Editable))
             && matches!(role.as_str(), "entry" | "text")
             && interfaces.contains(Interface::Component)
@@ -527,6 +606,9 @@ impl LinuxBackend {
         {
             actions.push("type_text".into());
             actions.push("paste".into());
+        }
+        if visibility_recovery {
+            actions.push("key_chord".into());
         }
         if fully_interactive
             && interfaces.contains(Interface::Component)
@@ -606,6 +688,14 @@ impl LinuxBackend {
                 bounds,
                 actions,
                 provenance: Map::from_iter([
+                    (
+                        "visibility_recovery".into(),
+                        if visibility_recovery {
+                            json!("focused_qt_keyboard")
+                        } else {
+                            Value::Null
+                        },
+                    ),
                     ("bus_name".into(), json!(target.bus_name)),
                     ("object_path".into(), json!(target.object_path)),
                     ("accessible_id".into(), optional_text(accessible_id)),
@@ -735,10 +825,23 @@ impl AtspiBackend for LinuxBackend {
         let accepted = zbus::block_on(self.component_proxy(target)?.grab_focus())
             .map_err(|error| native_failure("Component.GrabFocus", target, error))?;
         if !accepted {
-            return Err(driver_error(
-                "DRIVER.ACTION_FAILED",
-                "Component.GrabFocus did not accept the request",
-            ));
+            let process_id = self.process_id(&target.bus_name).ok_or_else(|| {
+                driver_error(
+                    "DRIVER.ACTION_FAILED",
+                    "focus process ownership is unavailable",
+                )
+            })?;
+            self.verify_focused(target, process_id, deadline)
+                .map_err(|cause| {
+                    driver_error(
+                        "DRIVER.ACTION_FAILED",
+                        "Component.GrabFocus did not accept the request",
+                    )
+                    .with_cause(cause)
+                })?;
+            return Ok(
+                json!({"native_interface": "Component.grab_focus", "accepted": false, "already_focused": true, "focus_verified": true}),
+            );
         }
         Ok(json!({"native_interface": "Component.grab_focus", "accepted": true}))
     }
@@ -873,6 +976,8 @@ impl AtspiBackend for LinuxBackend {
         let path = self.helper(HelperKind::Input)?;
         let focus = self.focus(target, deadline)?;
         std::thread::sleep(Duration::from_millis(50).min(remaining(deadline, true)?));
+        self.verify_focused(target, process_id, deadline)
+            .map_err(after_focus)?;
         // The input method is per focused context. Query after grab_focus, before
         // any key or keyboard mapping is sent; XTest text can otherwise be
         // consumed as composition and still report a successful dispatch.
@@ -1173,6 +1278,8 @@ impl AtspiBackend for LinuxBackend {
         let path = self.helper(HelperKind::Input)?;
         let focus = self.focus(target, deadline)?;
         std::thread::sleep(Duration::from_millis(50).min(remaining(deadline, true)?));
+        self.verify_focused(target, process_id, deadline)
+            .map_err(after_focus)?;
         let args = [
             "paste".to_string(),
             "--expected-pid".into(),
@@ -1636,6 +1743,13 @@ fn terminate(child: &mut Child) {
     }
     let _ = child.kill();
     let _ = child.wait();
+}
+
+fn valid_focus_proof(proof: &Map<String, Value>, process_id: u32) -> bool {
+    proof.get("ok") == Some(&Value::Bool(true))
+        && proof.get("focused") == Some(&Value::Bool(true))
+        && proof.get("expected_pid").and_then(Value::as_u64) == Some(u64::from(process_id))
+        && !proof.contains_key("dispatch_started")
 }
 
 fn parse_input_helper(
@@ -2340,6 +2454,34 @@ impl LinuxBackend {
 #[cfg(test)]
 mod capture_tests {
     use super::*;
+
+    #[test]
+    fn focus_proof_requires_the_expected_pid_without_input_dispatch() {
+        for (proof, expected) in [
+            (
+                json!({"ok": true, "focused": true, "expected_pid": 42}),
+                true,
+            ),
+            (
+                json!({"ok": true, "focused": false, "expected_pid": 42}),
+                false,
+            ),
+            (
+                json!({"ok": true, "focused": true, "expected_pid": 43}),
+                false,
+            ),
+            (
+                json!({"ok": false, "focused": true, "expected_pid": 42}),
+                false,
+            ),
+            (
+                json!({"ok": true, "focused": true, "expected_pid": 42, "dispatch_started": false}),
+                false,
+            ),
+        ] {
+            assert_eq!(valid_focus_proof(proof.as_object().unwrap(), 42), expected);
+        }
+    }
 
     #[test]
     fn null_children_do_not_become_unavailable_nodes_or_count_mismatches() {

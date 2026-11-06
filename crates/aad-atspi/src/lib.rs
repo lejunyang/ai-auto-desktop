@@ -2561,6 +2561,7 @@ mod tests {
         truncated: bool,
         scoped_truncated: bool,
         scope_context: bool,
+        visibility_recovery: bool,
         hit_chain: u8,
         /// Containers above the target, which is then `n{depth}`.
         depth: usize,
@@ -2615,6 +2616,14 @@ mod tests {
                     "paste".into(),
                 ],
                 provenance: Map::from_iter([
+                    (
+                        "visibility_recovery".into(),
+                        if self.visibility_recovery {
+                            json!("focused_qt_keyboard")
+                        } else {
+                            Value::Null
+                        },
+                    ),
                     ("bus_name".into(), json!(":1.42")),
                     ("object_path".into(), json!(object_path)),
                     (
@@ -3135,6 +3144,22 @@ mod tests {
         }
         assert_eq!(backend.writes.load(Ordering::SeqCst), 0);
         assert_eq!(backend.scoped_captures.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn focused_keyboard_recovery_does_not_require_pointer_hit_testing() {
+        for hit_chain in [1, 2] {
+            let backend = Arc::new(FakeBackend {
+                visibility_recovery: true,
+                hit_chain,
+                ..Default::default()
+            });
+            let provider = AtspiProvider::new(backend.clone()).unwrap();
+            let observed = take_snapshot(&provider);
+            let result = provider.invoke("desktop.linux_atspi.key_chord@1", json!({"target": {"snapshot_id": observed["snapshot_id"], "revision": observed["revision"], "node_id": "n0"}, "locator": locator(), "keys": ["ctrl", "a"]}), Some(Duration::from_secs(2)));
+            result.unwrap();
+            assert_eq!(backend.writes.load(Ordering::SeqCst), 1);
+        }
     }
 
     #[test]
