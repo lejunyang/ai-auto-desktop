@@ -226,7 +226,8 @@ pub enum Action {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         fraction: Option<Fraction>,
     },
-    /// Both ends are nodes of the same observation.
+    /// Both ends share an observation unless the provider explicitly supports
+    /// independently observed resources. Nonempty paths stay on one surface.
     Drag {
         to: Target,
         #[serde(default, skip_serializing_if = "Option::is_none")]

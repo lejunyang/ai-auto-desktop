@@ -44,6 +44,15 @@ pub struct BackendResource {
     pub selector: Value,
 }
 
+/// One independently observed endpoint passed to a cross-resource drag.
+/// Backends must freshly revalidate both endpoints before dispatching input.
+pub struct DragEndpoint<'a> {
+    pub snapshot: &'a Value,
+    pub node: &'a Value,
+}
+
+const MAX_RESOURCE_OBSERVATIONS: usize = 16;
+
 /// Implementations retain their native stale-target checks. The facade never
 /// turns an unsupported native operation into a coordinate or script fallback.
 pub trait Backend: Send + Sync {
@@ -65,6 +74,28 @@ pub trait Backend: Send + Sync {
         ))
     }
     fn capabilities(&self) -> Vec<String>;
+    /// Opt in only when native snapshots can remain valid independently for
+    /// multiple resources and `drag_between` revalidates both endpoints. This
+    /// also enables bounded, per-resource observation retention in the session.
+    fn supports_cross_resource_drag(&self) -> bool {
+        false
+    }
+    /// A single gesture between two observations of this provider. No default
+    /// fallback is safe: the usual `act` method only sees the source snapshot.
+    /// Implementations must prove both native identities and input-desktop
+    /// ownership afresh, honor cancellation/deadlines, and release owned input.
+    fn drag_between(
+        &self,
+        _source: DragEndpoint<'_>,
+        _destination: DragEndpoint<'_>,
+        _action: &Action,
+        _context: &Context,
+    ) -> Result<Value> {
+        Err(error(
+            "CONTROL.ACTION_UNSUPPORTED",
+            "this provider cannot drag between resources",
+        ))
+    }
     fn node_capabilities(&self, node: &Value) -> Vec<String> {
         let supported = self.capabilities();
         match node["actions"].as_array() {
@@ -1037,8 +1068,12 @@ impl Session {
                 "expires_in_ms": self.lifetime.saturating_sub(self.created.elapsed()).as_millis(),
                 "session_usable": !self.is_closed() && self.created.elapsed() < self.lifetime
                     && self.state.lock().unwrap().requests.len() < self.max_requests,
-                "allow_input": self.policy.allow_input,"allow_secret_input":self.policy.allow_secret_input,"secret_bindings":if self.policy.allow_secret_input { self.policy.secret_bindings.names() } else { Vec::new() },"upload_dirs": self.policy.upload_roots,"cookie_values": self.policy.allow_cookie_values,"observation_retention":"until_next_observation_or_input_attempt","observation_ttl_ms":self.observation_ttl.as_millis(),"max_requests":self.max_requests,"input_lease":"exclusive_cooperating_session","input_lease_scope":"os_user","providers": self.backends.values().filter(|b| self.allowed_provider(b.name()))
-                    .map(|b| json!({"provider": b.name(), "actions": b.capabilities(), "reads": b.reads()})).collect::<Vec<_>>(),
+                "allow_input": self.policy.allow_input,"allow_secret_input":self.policy.allow_secret_input,"secret_bindings":if self.policy.allow_secret_input { self.policy.secret_bindings.names() } else { Vec::new() },"upload_dirs": self.policy.upload_roots,"cookie_values": self.policy.allow_cookie_values,"observation_retention":if self.backends.values().any(|b| self.allowed_provider(b.name()) && b.supports_cross_resource_drag()) { "provider_declared" } else { "until_next_observation_or_input_attempt" },"observation_ttl_ms":self.observation_ttl.as_millis(),"max_requests":self.max_requests,"input_lease":"exclusive_cooperating_session","input_lease_scope":"os_user","providers": self.backends.values().filter(|b| self.allowed_provider(b.name()))
+                    .map(|b| json!({"provider": b.name(), "actions": b.capabilities(), "reads": b.reads(),
+                        "cross_resource_drag": b.supports_cross_resource_drag(),
+                        "observation_retention": if b.supports_cross_resource_drag() { "latest_per_resource_until_input_attempt" } else { "until_next_observation_or_input_attempt" },
+                        "max_retained_observations": if b.supports_cross_resource_drag() { MAX_RESOURCE_OBSERVATIONS } else { 1 }
+                    })).collect::<Vec<_>>(),
                 "unavailable": self.failures}),
             )),
             Operation::Targets {} => {
@@ -1253,22 +1288,71 @@ impl Session {
                     }
                     None
                 };
+                let backend = &self.backends[&observation.provider];
+                let mut drag_destination = None;
                 if let Action::Drag { to, path, .. } = action {
-                    // Both ends must come from the same view of the same resource,
-                    // so one live revalidation covers the whole gesture.
-                    if to.session_id != target.session_id
-                        || to.resource_id != target.resource_id
-                        || to.observation_id != target.observation_id
+                    if !backend.supports_cross_resource_drag()
+                        && (to.session_id != target.session_id
+                            || to.resource_id != target.resource_id
+                            || to.observation_id != target.observation_id)
                     {
                         return Err(error(
                             "CONTROL.INVALID_REQUEST",
                             "drag destination must belong to the same observation",
                         ));
                     }
+                    if to.session_id != target.session_id {
+                        return Err(error(
+                            "CONTROL.SESSION_MISMATCH",
+                            "drag destination belongs to another session",
+                        ));
+                    }
+                    if to.resource_id != target.resource_id {
+                        if !path.is_empty() {
+                            return Err(error(
+                                "CONTROL.INVALID_REQUEST",
+                                "a drag path must stay on the same observed surface as both endpoints",
+                            ));
+                        }
+                        let (destination, destination_node) = self.observed_node(to)?;
+                        if destination.provider != observation.provider {
+                            return Err(error(
+                                "CONTROL.ACTION_UNSUPPORTED",
+                                "drag endpoints must belong to the same provider",
+                            ));
+                        }
+                        if destination.raw["truncated"] == true {
+                            return Err(error(
+                                "CONTROL.OBSERVATION_TRUNCATED",
+                                "truncated destination observation cannot authorize input",
+                            ));
+                        }
+                        if node["provenance"]["scope_context"] == true
+                            || destination_node["provenance"]["scope_context"] == true
+                        {
+                            return Err(error(
+                                "CONTROL.STALE_TARGET",
+                                "drag endpoints must be inside their observed scopes",
+                            ));
+                        }
+                        if !backend.node_capabilities(&destination_node).iter().any(|name| name == "drag") {
+                            return Err(error(
+                                "CONTROL.ACTION_UNSUPPORTED",
+                                "observed destination does not expose drag",
+                            ));
+                        }
+                        drag_destination = Some((destination, destination_node));
+                    } else if to.observation_id != target.observation_id {
+                        return Err(error(
+                            "CONTROL.INVALID_REQUEST",
+                            "drag destination must belong to the same observation",
+                        ));
+                    } else {
+                        observed(&to.node_id)?;
+                    }
                     // A surface can contain both ends (for example a canvas
                     // selection). Its fractions still undergo validation and
                     // the provider revalidates the observed native element.
-                    observed(&to.node_id)?;
                     if !path.is_empty() {
                         if to != target || path.iter().any(|anchor| &anchor.target != target) {
                             return Err(error(
@@ -1281,7 +1365,6 @@ impl Session {
                         }
                     }
                 }
-                let backend = &self.backends[&observation.provider];
                 if !backend
                     .capabilities()
                     .iter()
@@ -1303,7 +1386,11 @@ impl Session {
                     ));
                 }
                 context.remaining()?;
-                let _lease = self.input_leases(&backend.lease_keys(&observation.raw)?)?;
+                let mut lease_keys = backend.lease_keys(&observation.raw)?;
+                if let Some((destination, _)) = &drag_destination {
+                    lease_keys.extend(backend.lease_keys(&destination.raw)?);
+                }
+                let _lease = self.input_leases(&lease_keys)?;
                 context.remaining()?;
                 let result = match secret {
                     Some(text) => backend
@@ -1316,7 +1403,15 @@ impl Session {
                                 .with_effect(if failure.effect == "not_applied" { "not_applied" } else { "unknown" })
                                 .with_retryable(failure.retryable)
                         }),
-                    None => backend.act(&observation.raw, node, action, context),
+                    None => match &drag_destination {
+                        Some((destination, destination_node)) => backend.drag_between(
+                            DragEndpoint { snapshot: &observation.raw, node },
+                            DragEndpoint { snapshot: &destination.raw, node: destination_node },
+                            action,
+                            context,
+                        ),
+                        None => backend.act(&observation.raw, node, action, context),
+                    },
                 };
                 self.state
                     .lock()
@@ -1616,8 +1711,8 @@ impl Session {
         json!({"page":page,"network":network})
     }
 
-    /// Capture a listed resource and retain it as this provider's only
-    /// current observation, with session targets on every node.
+    /// Capture a listed resource, retaining older resources only when the
+    /// provider explicitly supports independent cross-resource observations.
     fn observe_resource(
         &self,
         resource_id: &str,
@@ -1697,11 +1792,12 @@ impl Session {
                 Ok((observed.raw, node))
             })
             .transpose()?;
-        self.state
-            .lock()
-            .unwrap()
-            .observations
-            .retain(|_, old| old.provider != item.resource.provider);
+        let retain_resources = backend.supports_cross_resource_drag();
+        self.state.lock().unwrap().observations.retain(|_, old| {
+            old.created.elapsed() < self.observation_ttl
+                && (old.provider != item.resource.provider
+                    || (retain_resources && old.resource_id != resource_id))
+        });
         let raw = match (scope, anchored) {
             (_, Some((snapshot, node))) => {
                 backend.observe_target_scope(&snapshot, &node, max_nodes, context.remaining()?)?
@@ -1757,11 +1853,24 @@ impl Session {
             created: Instant::now(),
         };
         let mut state = self.state.lock().unwrap();
-        // Native providers have different snapshot retention rules. A new
-        // observation invalidates this provider's previous references.
-        state
+        // Each resource keeps at most its latest observation. Even an opt-in
+        // backend has a fixed memory/authority ceiling across its resources.
+        while state
             .observations
-            .retain(|_, old| old.provider != item.resource.provider);
+            .values()
+            .filter(|old| old.provider == item.resource.provider)
+            .count()
+            >= MAX_RESOURCE_OBSERVATIONS
+        {
+            let oldest = state
+                .observations
+                .iter()
+                .filter(|(_, old)| old.provider == item.resource.provider)
+                .min_by_key(|(_, old)| old.created)
+                .map(|(id, _)| id.clone())
+                .unwrap();
+            state.observations.remove(&oldest);
+        }
         state
             .observations
             .insert(observation_id.clone(), observation.clone());
