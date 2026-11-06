@@ -25,6 +25,23 @@ pub trait Provider: Send + Sync {
         timeout: Option<Duration>,
     ) -> Result<Value, AutomationError>;
 
+    /// Explicit per-invocation cancellation for native, multi-stage input.
+    ///
+    /// The compatible default checks only before invoking. It does not promise
+    /// to interrupt legacy or external providers. Cooperative implementations
+    /// override this, check before each dispatch, and complete owned-input
+    /// release before returning. No cancellation state is serialized into args.
+    fn invoke_cancellable(
+        &self,
+        action: &str,
+        args: Value,
+        timeout: Option<Duration>,
+        cancellation: &crate::CancellationToken,
+    ) -> Result<Value, AutomationError> {
+        cancellation.check()?;
+        self.invoke(action, args, timeout)
+    }
+
     fn invoke_with_artifacts(
         &self,
         action: &str,
@@ -246,6 +263,96 @@ mod tests {
     use super::testing::FakeProvider;
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn cancellation_preflight_refuses_legacy_provider_without_calling_it() {
+        let provider = FakeProvider::echo("fixture", &["write"]);
+        let token = crate::CancellationToken::new();
+        provider
+            .invoke_cancellable("fixture.write@1", json!({"value":1}), None, &token)
+            .unwrap();
+        assert_eq!(provider.call_count(), 1);
+        token.cancel();
+        let error = provider
+            .invoke_cancellable("fixture.write@1", json!({"value":2}), None, &token)
+            .unwrap_err();
+        assert_eq!(error.code, "DRIVER.CANCELLED");
+        assert_eq!(error.effect, "not_applied");
+        assert_eq!(provider.call_count(), 1);
+    }
+
+    #[test]
+    fn cooperative_override_can_clean_owned_input_after_dispatch_cancellation() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::Barrier;
+        use std::time::Instant;
+        struct Cooperative {
+            manifest: CapabilityManifest,
+            entered: Arc<Barrier>,
+            owned: Arc<AtomicBool>,
+            dispatches: AtomicUsize,
+        }
+        impl Provider for Cooperative {
+            fn manifest(&self) -> &CapabilityManifest {
+                &self.manifest
+            }
+            fn invoke(
+                &self,
+                _: &str,
+                _: Value,
+                _: Option<Duration>,
+            ) -> Result<Value, AutomationError> {
+                panic!("explicit cancellation must reach the override")
+            }
+            fn invoke_cancellable(
+                &self,
+                _: &str,
+                _: Value,
+                _: Option<Duration>,
+                token: &crate::CancellationToken,
+            ) -> Result<Value, AutomationError> {
+                token.check()?;
+                struct Release(Arc<AtomicBool>);
+                impl Drop for Release {
+                    fn drop(&mut self) {
+                        self.0.store(false, Ordering::SeqCst);
+                    }
+                }
+                self.owned.store(true, Ordering::SeqCst);
+                let _release = Release(self.owned.clone());
+                self.dispatches.fetch_add(1, Ordering::SeqCst);
+                self.entered.wait();
+                let deadline = Instant::now() + Duration::from_secs(2);
+                while !token.is_cancelled() && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                token
+                    .check()
+                    .map_err(|error| error.with_effect("unknown"))?;
+                self.dispatches.fetch_add(1, Ordering::SeqCst);
+                Ok(Value::Null)
+            }
+        }
+        let provider = Arc::new(Cooperative {
+            manifest: FakeProvider::echo("fixture", &["hold"]).manifest().clone(),
+            entered: Arc::new(Barrier::new(2)),
+            owned: Arc::new(AtomicBool::new(false)),
+            dispatches: AtomicUsize::new(0),
+        });
+        let token = crate::CancellationToken::new();
+        let worker_provider: Arc<dyn Provider> = provider.clone();
+        let worker_token = token.clone();
+        let worker = std::thread::spawn(move || {
+            worker_provider.invoke_cancellable("fixture.hold@1", json!({}), None, &worker_token)
+        });
+        provider.entered.wait();
+        assert!(provider.owned.load(Ordering::SeqCst));
+        token.cancel();
+        let error = worker.join().unwrap().unwrap_err();
+        assert_eq!(error.effect, "unknown");
+        assert!(!provider.owned.load(Ordering::SeqCst));
+        assert_eq!(provider.dispatches.load(Ordering::SeqCst), 1);
+    }
 
     #[test]
     fn resolve_finds_a_provider_by_its_dotted_capability_name() {

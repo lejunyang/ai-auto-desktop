@@ -6,6 +6,7 @@
 
 pub mod artifacts;
 pub mod assemble;
+pub mod cancellation;
 pub mod durable;
 pub mod durable_exec;
 pub mod engine;
@@ -17,6 +18,7 @@ pub mod template;
 pub mod version;
 
 pub use artifacts::{ArtifactRef, ArtifactStore};
+pub use cancellation::CancellationToken;
 pub use engine::{plan_digest, run, RunOptions, RUNTIME_VERSION};
 pub use journal::{EventSink, Journal, NdjsonSink, NullSink, RunEvent, RunResult, RunStatus};
 pub use provider::{register_process_plugin, PluginProvider, Provider, ProviderRegistry};
