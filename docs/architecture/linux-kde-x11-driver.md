@@ -72,6 +72,10 @@ selection 协议访问（见下文）。观察前通过无输入的 `describe` �
 | `launch` | 会话直接以 argv 启动白名单程序（`setsid`，不经 shell），按 AT-SPI 应用的 PID（或 `/proc/<pid>/exe` 的文件名）等待其出现 | shell、`xdg-open`、`gio` 等即使在白名单里也拒绝；不可执行文件拒绝 |
 
 restorer 恢复的是内容的拷贝：原 owner 的延迟格式此时已被取成数据，这会被剪贴板管理器视为一次新的变更。
+首次文字取数成功后，helper 继续响应同一已验证目标 client 的格式和元数据请求，直到
+250 ms 请求静默或总交付窗口达到 2 秒；每批最多处理 32 个事件，使焦点、取消和截止时间
+检查持续执行。这是有界协议策略，不保证任意延迟客户端都能完成取数。若期间出现新的
+CLIPBOARD owner，保留其后续复制，不用旧内容覆盖；正常恢复和取消恢复仍须独立回读验证。
 
 构建 helper：
 
@@ -94,7 +98,13 @@ plugins/linux_atspi/build_x11_capture_helper.sh
 位与无效果的 focus 动作；错误窗口的操作被拒绝，两个实际事件计数均为零。正确聚焦或激活后，
 对应窗口独立回报一次按下、一次释放。`verify-x11-window-focus.ps1` 在私有 Xvfb 复现旧
 PID-only 判定的缺口，并验证新窗口绑定、子窗口焦点、长按途中同 PID 焦点切换和窗口移动后的释放。
-这些测试不证明此前 VS Code 实验每一次输入的实际落点；Electron 编辑保存仍需独立验收。
+这些测试不证明此前 VS Code 实验每一次输入的实际落点。后续独立 VS Code profile 已通过
+`verify-code-paste.ps1`：所有输入走原生观察与操作入口，CDP 只读回选区、实际显示内容和截图，
+磁盘读取确认中文替换及 Ctrl+S 保存。重复 focus 未破坏该案例的 Ctrl+A 选区；旧 helper 的
+首次文字取数后过早恢复被私有协议回归复现，修复后真实 Code 不再在粘贴后挂起。
+`verify-x11-paste-sequence.ps1` 另验证延迟三种文字格式、明确拒绝不支持格式、后续 owner
+不被覆盖，以及连续请求仍在交付上限内结束。真实 Code 此次取数为 1 次文字和 18 次元数据，
+不能把私有三格式案例当成 Code 的实际请求序列。Code 原生指针命中仍需单独解决。
 
 取消由每次调用显式传入的 `CancellationToken` 贯穿到 Linux backend。调用副本共享当前观察、
 焦点订阅与录制状态，取消 token 不写回共享 backend；下一次调用不会继承取消状态。

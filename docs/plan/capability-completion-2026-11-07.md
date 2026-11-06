@@ -16,10 +16,10 @@
 
 | 项目 | 完成条件 | 状态与证据 |
 | --- | --- | --- |
-| 原生观察恢复 | 过滤规范 AT-SPI null 引用；输出具体截断原因；从已观察窗口/容器抓完整子树，动作复核也限定同一 scope；Dolphin/Electron 实测恢复合法操作 | null/截断诊断、局部观察已提交；Code/Codex 局部定位及刷新、Qt scoped click 通过。`e5f4f38` 以本应用焦点事件补充真实编辑框，Dolphin F2→中文重命名→磁盘回读通过；虚拟 table 父链不完整的 scope 仍拒绝。Electron 编辑/保存闭环待完成 |
+| 原生观察恢复 | 过滤规范 AT-SPI null 引用；输出具体截断原因；从已观察窗口/容器抓完整子树，动作复核也限定同一 scope；Dolphin/Electron 实测恢复合法操作 | null/截断诊断、局部观察已提交；Code/Codex 局部定位及刷新、Qt scoped click 通过。`e5f4f38` 以本应用焦点事件补充真实编辑框，Dolphin F2→中文重命名→磁盘回读通过；虚拟 table 父链不完整的 scope 仍拒绝。VS Code 中文编辑/保存经 DOM、磁盘和截图回读通过，原生指针命中仍待解决 |
 | 焦点与 QML 可见性 | KWrite 已聚焦而 GrabFocus=false 时仍可安全验证并输入；设置搜索框在可见性元数据不一致时有受控输入路径；编辑保存与设置搜索实际回读 | 已提交 `f2282a5`；KWrite 中文编辑保存后磁盘回读一致，设置搜索“快捷键”截图与值回读一致，并打开匹配页面 |
-| 同进程窗口焦点 | 键盘及带修饰键指针绑定 fresh 观察中的具体窗口；不能把另一同 PID 窗口当作目标，失焦及移动后释放自有输入 | `0af98e8`、测试 `b4d47a6` 已提交；私有 Xvfb 确认 PID-only 缺口并验证严格拒绝/释放，本机 Qt 双窗口真实事件计数及 Dolphin 中文重命名复测通过。第三方 Electron 编辑保存仍待验收 |
-| 原生粘贴与 IME | KDE 原生 paste 实际输入成功并恢复原剪贴板；明确输入法条件，补充可工作的中文输入路径与诊断 | 已提交 `8421506`、`51a72ca`；隔离 X11 协议回归、KDE Qt/KWrite/QML 中文粘贴成功且恢复剪贴板。helper 无内容诊断与派发前错误已正确传递；复杂 IME 覆盖待补齐 |
+| 同进程窗口焦点 | 键盘及带修饰键指针绑定 fresh 观察中的具体窗口；不能把另一同 PID 窗口当作目标，失焦及移动后释放自有输入 | `0af98e8`、测试 `b4d47a6` 已提交；私有 Xvfb 确认 PID-only 缺口并验证严格拒绝/释放，本机 Qt 双窗口真实事件计数及 Dolphin 中文重命名复测通过。严格窗口绑定后的独立 VS Code 中文编辑保存也已完成 |
+| 原生粘贴与 IME | KDE 原生 paste 实际输入成功并恢复原剪贴板；明确输入法条件，补充可工作的中文输入路径与诊断 | 已提交 `8421506`、`51a72ca`；隔离 X11 协议回归、KDE Qt/KWrite/QML 中文粘贴成功且恢复剪贴板。后续修复首次取数后过早恢复，VS Code 中文编辑保存通过；250 ms 请求静默/总 2 秒有界服务及后续 owner 保留由私有协议测试验证。helper 无内容诊断与派发前错误已正确传递；复杂 IME 覆盖待补齐 |
 | 浏览器局部观察 | 范围外无关 DOM 更新不误判 stale；范围内改动、身份替换、相关布局变化仍拒绝；大型页面可局部操作 | 已提交 `e8b8959`、`368177c`；Chromium 实测外部 ticker、相关 stale 拒绝、无 HTML id 的 scope_target、shadow root、scope token 刷新及 act.verify |
 | 手势表达 | 同元素不同位置拖动、修饰键点击/拖动、有界按住和路径、跨资源拖拽具有完整端点复核与释放保证；真实效果验收 | 浏览器同 surface drag `d350c7b`、原生同元素 `9274fee`、三端与浏览器修饰键 `e46829b`、有界按住 `d314931` 已提交；Qt/Chromium 与 Dolphin 选择手势实测通过。路径接口及 Windows/macOS 实现 `4b10562` 已提交，目标 cfg 检查通过，真机效果待验；浏览器路径 `846b6ba` 已用 Canvas/closed-shadow 折线 PNG 与事件回读验收。Linux 路径与跨资源待完成；Linux 会话取消已通过 Qt 实际释放与 Xvfb 剪贴板恢复验证 |
 | 视觉与自绘恢复 | Canvas/自绘/closed shadow 等缺乏语义控件时，通过可校验 surface 完成视觉操作；保留保护区域与命中限制 | Canvas trusted click/hover/scroll/drag 已提交 `d350c7b`，像素与可信事件回读通过；原生非 Focusable 指针 `31cf35a` 已在 Dolphin 验证，显式激活 `76cd6e1` 通过。closed shadow host 的视觉动作与保护 `3c7c2fc` 已通过 Chromium 27/27；内部语义节点仍不公开，其他原生自绘应用需逐项验收 |
@@ -67,6 +67,8 @@
 - `browser-inflight-targeted.log`、`browser-inflight-full.log`：当前 URL 与祖先授权失效时，8 条键鼠/逐字符输入链停止并释放，同一 loader 的独立事件日志证明后续输入未继续；history 未授权文件拒绝、about:blank/data/长 HTTP 正例通过。专项 3/3、完整 34/34、单测 21/21 及 clippy 通过。本机 Chromium 跨文件路径 pushState 返回 SecurityError，fragment 更新正常；文件授权失效用移除自有临时文件模拟，不宣称已复现浏览器绕过。准备阶段取消使用确定性边界单测；异步 scroll 事件不能精确代表取消发生在某条 CDP 查询内。两组浏览器日志均位于 `artifacts/capability-audit-2026-11-07/`。
 - `electron-native/summary.json`：独立 profile 的 VS Code，414 节点截断观察缩小到 31 节点完整编辑框；点击被 `DRIVER.POINT_NOT_PROVEN` 拒绝，focus/key/paste 返回已派发但实际文本不符，未继续保存，不算编辑成功。初始树含 Welcome 模态界面，随后 X11 检查发现同 PID 另一活动原生对话框；需要先处理启动界面，并用同进程双窗口 fixture 独立验证键盘焦点边界。仅凭动作之后的活动窗口不能断定此前每次输入落点。
 - `electron-native-v2/summary.json`：严格窗口绑定后的复测，通过 Welcome 内已观察 Close 按钮的 focus→Enter 关闭活动窗口启动界面，再将编辑框缩小到 31 节点。Ctrl+A 与 paste 返回派发、剪贴板消费和恢复成功，但 AT-SPI 文本回读仍为原文加换行，未保存，仍不算编辑闭环通过。Welcome 的指针点击也仍被命中检查拒绝；需要独立核对 Electron 文本模型、焦点和选区。测试自有 profile 进程已关闭。
+- `electron-native-v4/summary.json`：只读 CDP 确认 Ctrl+A 的实际选区，重复 focus 后选区保持；旧 helper 粘贴后 renderer 的 Runtime.evaluate 超过 15 秒，而 browser websocket 仍响应。该证据区分渲染进程无响应和 CDP 连接故障，不将重复 focus 误认作本次根因。
+- `paste-sequence-fixed/validation.json`、`code-paste-distributed/summary.json`：首次文字后继续有界服务请求，私有 Xvfb 三格式延迟、后续复制保留、持续请求期限及取消回归通过。分发脚本通过原生入口完成 VS Code Ctrl+A→中文 paste→Ctrl+S，DOM、磁盘及 `independent-editor.png` 一致。真实 Code 是 1 次文字与 18 次元数据请求，不等于私有三格式测试；250 ms 静默/总 2 秒是策略上限，不承诺任意延迟客户端。原生指针命中问题仍独立保留。
 - Windows 修饰键代码已用 pin 工具链实际 `x86_64-pc-windows-gnu` cfg 做 check/clippy；这只证明编译，不能当成 Windows SendInput 效果验收。**[待验证]** Windows 交互桌面、相应权限与 DPI/IME 测试环境。
 
 各功能的测试数字对应其提交时点；后续共享模型变化后仍需相应回归。未验证的平台与场景保持待办，不从 KDE/Chromium 的成功外推。
