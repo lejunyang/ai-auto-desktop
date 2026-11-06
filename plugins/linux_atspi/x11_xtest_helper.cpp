@@ -94,40 +94,13 @@ std::optional<std::uint64_t> ParseUnsigned(std::string_view value) {
     return parsed;
 }
 
-bool IsKdeDesktop(std::string_view value) {
-    std::size_t start = 0;
-    while (start <= value.size()) {
-        std::size_t end = value.find_first_of(":;", start);
-        if (end == std::string_view::npos) {
-            end = value.size();
-        }
-        std::string token(value.substr(start, end - start));
-        for (char &item : token) {
-            if (item >= 'a' && item <= 'z') {
-                item = static_cast<char>(item - 'a' + 'A');
-            }
-        }
-        if (token == "KDE") {
-            return true;
-        }
-        if (end == value.size()) {
-            break;
-        }
-        start = end + 1;
-    }
-    return false;
-}
-
 bool SessionIsQualified() {
     const char *session_type = std::getenv("XDG_SESSION_TYPE");
     const char *display = std::getenv("DISPLAY");
-    const char *desktop = std::getenv("XDG_CURRENT_DESKTOP");
-    if (desktop == nullptr || *desktop == '\0') {
-        desktop = std::getenv("DESKTOP_SESSION");
-    }
+    // XTest/root capture are X11 protocols, independent of desktop branding.
+    // XWayland under a Wayland session is not a qualified native desktop.
     return session_type != nullptr && std::strcmp(session_type, "x11") == 0 &&
-           display != nullptr && *display != '\0' && desktop != nullptr &&
-           IsKdeDesktop(desktop);
+           display != nullptr && *display != '\0';
 }
 
 std::optional<std::vector<std::uint32_t>> DecodeUtf8(const std::string &input) {
@@ -2221,7 +2194,7 @@ int main(int argc, char **argv) {
             return kExitInvalid;
         }
         // This protocol handshake does not open a display or touch input state.
-        std::cout << R"({"helper":"aad-linux-xtest","protocol":1,"features":["focus-info","type-text","pointer-click","pointer-gesture","drag","key-chord","window-info","window-action","paste","clipboard-read","global-key","record-input","pointer-modifiers"]})"
+        std::cout << R"({"helper":"aad-linux-xtest","protocol":1,"features":["focus-info","type-text","pointer-click","pointer-gesture","drag","key-chord","window-info","window-action","paste","clipboard-read","global-key","record-input","pointer-modifiers","x11-desktop-independent"]})"
                   << std::endl;
         return 0;
     }
