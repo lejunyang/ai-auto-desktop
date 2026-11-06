@@ -547,8 +547,14 @@ int RunGesture(Display *display, std::string_view command, const GestureRequest 
     if (DeadlineExpired(deadline_ns)) {
         return finish_failure("deadline_exceeded", "pre_dispatch", kExitTimeoutBeforeDispatch);
     }
-    if (!FocusBelongsToPid(display, expected_pid, pid_atom)) {
+    if (command == "key-chord" && !FocusBelongsToPid(display, expected_pid, pid_atom)) {
         return finish_failure("focus_owner_changed", "target_preflight", kExitTargetMismatch);
+    }
+    if (command != "key-chord" &&
+        (!WindowAtPointBelongsToPid(display, request.x, request.y, expected_pid, pid_atom) ||
+         (command == "drag" && !WindowAtPointBelongsToPid(display, request.to_x, request.to_y,
+                                                         expected_pid, pid_atom)))) {
+        return finish_failure("target_point_mismatch", "target_preflight", kExitTargetMismatch);
     }
     std::cout << "{\"event\":\"dispatch_started\"}" << std::endl;
     dispatch_started = true;
@@ -2260,7 +2266,8 @@ int main(int argc, char **argv) {
         EmitError("pid_property_unavailable", "target_preflight", false);
         return kExitTargetMismatch;
     }
-    while (!FocusBelongsToPid(display, expected_pid.value(), pid_atom)) {
+    while ((command == "type-text" || command == "key-chord") &&
+           !FocusBelongsToPid(display, expected_pid.value(), pid_atom)) {
         if (DeadlineExpired(deadline_ns.value())) {
             XCloseDisplay(display);
             EmitError("focus_owner_mismatch", "target_preflight", false);
@@ -2293,8 +2300,9 @@ int main(int argc, char **argv) {
             return finish_failure("deadline_exceeded", "pre_dispatch",
                                   kExitTimeoutBeforeDispatch);
         }
-        if (!FocusBelongsToPid(display, expected_pid.value(), pid_atom)) {
-            return finish_failure("focus_owner_changed", "target_preflight",
+        if (!WindowAtPointBelongsToPid(display, click_x.value(), click_y.value(),
+                                      expected_pid.value(), pid_atom)) {
+            return finish_failure("target_point_mismatch", "target_preflight",
                                   kExitTargetMismatch);
         }
         std::cout << "{\"event\":\"dispatch_started\"}" << std::endl;

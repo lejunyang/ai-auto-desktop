@@ -64,6 +64,19 @@ fn capture_issue(reasons: &mut Vec<Value>, issue: Value) {
     }
 }
 
+fn pointer_state_allows_input(states: Option<atspi::StateSet>) -> bool {
+    states.is_some_and(|states| {
+        [
+            State::Enabled,
+            State::Visible,
+            State::Showing,
+            State::Sensitive,
+        ]
+        .into_iter()
+        .all(|state| states.contains(state))
+    })
+}
+
 fn check_fcitx_text_input(session: &Connection) -> Result<(), AutomationError> {
     let query_error = |error: zbus::Error| {
         driver_error(
@@ -395,7 +408,7 @@ impl LinuxBackend {
             .unwrap_or_default()
     }
 
-    /// Focus the target, then run one XTest helper command against it.
+    /// Keyboard input needs focus; pointer input is proven by live hit tests.
     fn run_input(
         &self,
         target: &NativeRef,
@@ -405,10 +418,22 @@ impl LinuxBackend {
         deadline: Instant,
     ) -> Result<Value, AutomationError> {
         let path = self.helper(HelperKind::Input)?;
-        let focus = self.focus(target, deadline)?;
-        std::thread::sleep(Duration::from_millis(50).min(remaining(deadline, true)?));
-        self.verify_focused(target, process_id, deadline)
-            .map_err(after_focus)?;
+        let focus = if args.first().is_some_and(|command| command == "key-chord") {
+            let proof = self.focus(target, deadline)?;
+            std::thread::sleep(Duration::from_millis(50).min(remaining(deadline, true)?));
+            self.verify_focused(target, process_id, deadline)
+                .map_err(after_focus)?;
+            Some(proof)
+        } else {
+            None
+        };
+        let input_error = |error| {
+            if focus.is_some() {
+                after_focus(error)
+            } else {
+                error
+            }
+        };
         args.extend([
             "--deadline-monotonic-ns".into(),
             monotonic_deadline_ns(deadline)?.to_string(),
@@ -421,10 +446,12 @@ impl LinuxBackend {
             XTEST_OUTPUT_LIMIT,
             XTEST_OUTPUT_LIMIT,
         )
-        .map_err(after_focus)?;
+        .map_err(input_error)?;
         let mut input = parse_input_helper(output, "input_dispatch", minimum_events, process_id)
-            .map_err(after_focus)?;
-        input["focus"] = focus;
+            .map_err(input_error)?;
+        if let Some(focus) = focus {
+            input["focus"] = focus;
+        }
         Ok(input)
     }
 
@@ -564,17 +591,9 @@ impl LinuxBackend {
             .get("process_id")
             .and_then(Value::as_u64)
             .filter(|value| *value > 0 && *value <= u32::MAX as u64);
-        let fully_interactive = states.is_some_and(|states| {
-            [
-                State::Enabled,
-                State::Visible,
-                State::Showing,
-                State::Sensitive,
-                State::Focusable,
-            ]
-            .into_iter()
-            .all(|state| states.contains(state))
-        });
+        let pointer_interactive = pointer_state_allows_input(states);
+        let fully_interactive =
+            pointer_interactive && states.is_some_and(|states| states.contains(State::Focusable));
         // Qt Quick can report hidden states for its actual focused text input.
         // Recover only keyboard actions, with independent live focus ownership;
         // input paths repeat the focus check after GrabFocus before dispatch.
@@ -610,15 +629,16 @@ impl LinuxBackend {
         if visibility_recovery {
             actions.push("key_chord".into());
         }
-        if fully_interactive
+        if pointer_interactive
             && interfaces.contains(Interface::Component)
             && process_id.is_some()
             && bounds.is_some_and(|bounds| bounds.width > 0 && bounds.height > 0)
             && !protected
         {
-            actions.extend(
-                ["pointer_click", "pointer_gesture", "drag", "key_chord"].map(String::from),
-            );
+            actions.extend(["pointer_click", "pointer_gesture", "drag"].map(String::from));
+            if fully_interactive {
+                actions.push("key_chord".into());
+            }
         }
         let gtk3 = toolkit == Some("gtk") && toolkit_version.starts_with("3.");
         if gtk3
@@ -1008,14 +1028,12 @@ impl AtspiBackend for LinuxBackend {
 
     fn pointer_click(
         &self,
-        target: &NativeRef,
+        _target: &NativeRef,
         point: (i32, i32),
         process_id: u32,
         deadline: Instant,
     ) -> Result<Value, AutomationError> {
         let path = self.helper(HelperKind::Input)?;
-        let focus = self.focus(target, deadline)?;
-        std::thread::sleep(Duration::from_millis(50).min(remaining(deadline, true)?));
         let args = [
             "pointer-click".to_string(),
             "--expected-pid".into(),
@@ -1034,15 +1052,13 @@ impl AtspiBackend for LinuxBackend {
             deadline,
             XTEST_OUTPUT_LIMIT,
             XTEST_OUTPUT_LIMIT,
-        )
-        .map_err(after_focus)?;
-        let mut result =
-            parse_input_helper(output, "pointer_dispatch", 3, process_id).map_err(after_focus)?;
+        )?;
+        let mut result = parse_input_helper(output, "pointer_dispatch", 3, process_id)?;
         if let Some(object) = result.as_object_mut() {
             object.insert("click_point".into(), json!({"x": point.0, "y": point.1}));
         }
         Ok(
-            json!({"native_interface": "Component.grab_focus -> XTEST", "focus": focus, "input": result, "synthetic_input": true, "button": "left", "position": "center", "click_point": {"x": point.0, "y": point.1}}),
+            json!({"native_interface": "XTEST", "input": result, "synthetic_input": true, "button": "left", "position": "center", "click_point": {"x": point.0, "y": point.1}}),
         )
     }
 
@@ -1098,7 +1114,7 @@ impl AtspiBackend for LinuxBackend {
         };
         let input = self.run_input(target, args, minimum, process_id, deadline)?;
         Ok(
-            json!({"native_interface": "Component.grab_focus -> XTEST", "input": input, "synthetic_input": true, "point": {"x": point.0, "y": point.1}}),
+            json!({"native_interface": "XTEST", "input": input, "synthetic_input": true, "point": {"x": point.0, "y": point.1}}),
         )
     }
 
@@ -1128,7 +1144,7 @@ impl AtspiBackend for LinuxBackend {
         ];
         let input = self.run_input(target, args, 3, process_id, deadline)?;
         Ok(
-            json!({"native_interface": "Component.grab_focus -> XTEST", "input": input, "synthetic_input": true, "from": {"x": from.0, "y": from.1}, "to": {"x": to.0, "y": to.1}}),
+            json!({"native_interface": "XTEST", "input": input, "synthetic_input": true, "from": {"x": from.0, "y": from.1}, "to": {"x": to.0, "y": to.1}}),
         )
     }
 
@@ -2454,6 +2470,31 @@ impl LinuxBackend {
 #[cfg(test)]
 mod capture_tests {
     use super::*;
+
+    #[test]
+    fn pointer_state_requires_visibility_but_not_keyboard_focusability() {
+        let states = [
+            State::Enabled,
+            State::Visible,
+            State::Showing,
+            State::Sensitive,
+        ]
+        .into_iter()
+        .collect::<atspi::StateSet>();
+        assert!(!states.contains(State::Focusable));
+        assert!(pointer_state_allows_input(Some(states)));
+        assert!(!pointer_state_allows_input(None));
+        assert!(!pointer_state_allows_input(Some(
+            [
+                State::Enabled,
+                State::Showing,
+                State::Sensitive,
+                State::Focusable
+            ]
+            .into_iter()
+            .collect()
+        )));
+    }
 
     #[test]
     fn focus_proof_requires_the_expected_pid_without_input_dispatch() {
