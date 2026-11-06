@@ -20,6 +20,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use zbus::blocking::{connection, Connection, Proxy};
 
+mod coordinates;
 mod drag_between;
 mod drag_path;
 mod focus_discovery;
@@ -150,6 +151,9 @@ pub struct LinuxBackend {
     focus_discovery: Arc<Mutex<Option<FocusDiscovery>>>,
     cancellation: Option<super::CancellationToken>,
     path_validation_busy: Arc<AtomicBool>,
+    coordinate_maps: Arc<Mutex<VecDeque<coordinates::CoordinateMap>>>,
+    coordinate_qt_buses: Arc<Mutex<BTreeSet<String>>>,
+    geometry_read_busy: Arc<AtomicBool>,
 }
 
 impl LinuxBackend {
@@ -182,6 +186,9 @@ impl LinuxBackend {
             focus_discovery: Arc::new(Mutex::new(None)),
             cancellation: None,
             path_validation_busy: Arc::new(AtomicBool::new(false)),
+            coordinate_maps: Arc::new(Mutex::new(VecDeque::new())),
+            coordinate_qt_buses: Arc::new(Mutex::new(BTreeSet::new())),
+            geometry_read_busy: Arc::new(AtomicBool::new(false)),
         };
         backend.children(&Self::root_ref(), Instant::now() + Duration::from_secs(3))?;
         Ok(backend)
@@ -1260,6 +1267,7 @@ impl AtspiBackend for LinuxBackend {
         deadline: Instant,
     ) -> Result<Option<NativeRef>, AutomationError> {
         remaining(deadline, false)?;
+        let point = self.accessibility_point(root, point, deadline)?;
         let reference = zbus::block_on(self.component_proxy(root)?.get_accessible_at_point(
             point.0,
             point.1,
@@ -1537,11 +1545,12 @@ impl AtspiBackend for LinuxBackend {
 
     fn capture_target(
         &self,
-        _target: &NativeRef,
+        target: &NativeRef,
         bounds: Bounds,
         process_id: u32,
         deadline: Instant,
     ) -> Result<(Vec<u8>, Map<String, Value>), AutomationError> {
+        self.verify_coordinate_target(target, deadline)?;
         let path = self.helper(HelperKind::Capture)?;
         let args = [
             "capture-target".to_string(),
@@ -1606,12 +1615,13 @@ impl AtspiBackend for LinuxBackend {
 
     fn window_action(
         &self,
-        _target: &NativeRef,
+        target: &NativeRef,
         action: &str,
         bounds: Bounds,
         process_id: u32,
         deadline: Instant,
     ) -> Result<Value, AutomationError> {
+        self.verify_coordinate_target(target, deadline)?;
         let path = self.input_helper("window-action", deadline)?;
         let mut args = window_args("window-action", process_id, bounds);
         args.extend([
@@ -1807,6 +1817,7 @@ impl LinuxBackend {
             input.as_ref(),
             deadline,
         )?;
+        self.normalize_coordinates(&mut snapshot, deadline)?;
         let process_id = snapshot
             .application
             .get("process_id")
@@ -1961,6 +1972,9 @@ impl LinuxBackend {
             return;
         };
         for node in nodes.iter_mut() {
+            if node.provenance.get("coordinate_space") == Some(&json!("unproven_toolkit")) {
+                continue;
+            }
             // A direct child of the application is a top-level window: GTK and
             // Qt main windows say frame/dialog, a bare QWidget window filler.
             // The helper still proves an X11 client window of this process

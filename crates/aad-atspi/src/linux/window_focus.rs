@@ -45,14 +45,19 @@ impl LinuxBackend {
                 )
                 .map_err(|error| native_failure("window bounds", &current, error))?;
                 if width > 0 && height > 0 {
-                    return Ok(WindowAnchor {
-                        native: current,
-                        bounds: Bounds {
+                    let bounds = self.physical_window_bounds(
+                        &current,
+                        Bounds {
                             x,
                             y,
                             width,
                             height,
                         },
+                        deadline,
+                    )?;
+                    return Ok(WindowAnchor {
+                        native: current,
+                        bounds,
                     });
                 }
                 break;
@@ -87,13 +92,17 @@ impl LinuxBackend {
                 .get_extents(CoordType::Screen),
         )
         .map_err(|error| native_failure("window bounds", &window.native, error))?;
-        if (Bounds {
-            x,
-            y,
-            width,
-            height,
-        }) != window.bounds
-        {
+        let current_bounds = self.physical_window_bounds(
+            &window.native,
+            Bounds {
+                x,
+                y,
+                width,
+                height,
+            },
+            deadline,
+        )?;
+        if current_bounds != window.bounds {
             return Err(super::super::stale("target window geometry changed"));
         }
         let mut args = vec![

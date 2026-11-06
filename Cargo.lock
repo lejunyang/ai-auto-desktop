@@ -7,6 +7,7 @@ name = "aad-atspi"
 version = "0.0.6"
 dependencies = [
  "aad-core",
+ "aad-linux",
  "aad-plugin",
  "aad-runtime",
  "atspi",

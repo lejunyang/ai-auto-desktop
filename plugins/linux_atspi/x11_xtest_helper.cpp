@@ -1,5 +1,6 @@
 #include <X11/Xatom.h>
 #include <X11/Xlib.h>
+#include <X11/Xutil.h>
 #include <X11/keysym.h>
 #include <X11/XKBlib.h>
 #include <X11/Xproto.h>
@@ -12,6 +13,7 @@
 #include <chrono>
 #include <csignal>
 #include <climits>
+#include <clocale>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -1773,6 +1775,8 @@ Display *OpenQualifiedDisplay(std::optional<std::uint64_t> pid, int *exit_code) 
     return display;
 }
 
+#include "x11_window_title.hpp"
+
 int RunWindow(std::string_view command, int argc, char **argv) {
     InputCancellation cancellation;
     const bool action = command == "window-action";
@@ -1808,6 +1812,7 @@ int RunWindow(std::string_view command, int argc, char **argv) {
                   << ",\"maximize\":" << (maximize ? "true" : "false")
                   << ",\"activate\":" << (activate ? "true" : "false")
                   << ",\"close\":" << (close ? "true" : "false") << "}," << StateJson(before)
+                  << WindowTitleJson(display,window.value())
                   << "}" << std::endl;
         XCloseDisplay(display);
         return 0;
