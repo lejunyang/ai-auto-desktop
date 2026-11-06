@@ -1314,6 +1314,8 @@ int RunWindow(std::string_view command, int argc, char **argv) {
         XCloseDisplay(display);
         return 0;
     }
+    // EWMH source 2 includes clients representing explicit user actions.
+    // A desktop automation activate request is not an unsolicited app request.
     const std::string &name = args->action;
     const bool supported = ewmh.present && (name == "minimize" || (name == "maximize" && maximize) ||
                                             (name == "activate" && activate) ||
@@ -1342,7 +1344,7 @@ int RunWindow(std::string_view command, int argc, char **argv) {
         if (before.minimized) {
             restoring_minimized = true;
             if (activate) {
-                SendRootMessage(ewmh, target, ewmh.active, 1, CurrentTime, 0);
+                SendRootMessage(ewmh, target, ewmh.active, 2, CurrentTime, 0);
             } else {
                 XMapRaised(display, target);
             }
@@ -1353,7 +1355,7 @@ int RunWindow(std::string_view command, int argc, char **argv) {
     } else if (name == "close") {
         SendRootMessage(ewmh, target, ewmh.close, CurrentTime, 2, 0);
     } else {
-        SendRootMessage(ewmh, target, ewmh.active, 1, CurrentTime, 0);
+        SendRootMessage(ewmh, target, ewmh.active, 2, CurrentTime, 0);
     }
     XSync(display, False);
     const bool send_error = g_x_error;
