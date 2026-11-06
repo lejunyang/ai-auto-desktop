@@ -80,6 +80,7 @@ name = "aad-control"
 version = "0.0.6"
 dependencies = [
  "aad-atspi",
+ "aad-bidi",
  "aad-cdp",
  "aad-core",
  "aad-desktop",

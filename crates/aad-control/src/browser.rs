@@ -1683,7 +1683,7 @@ fn regions(nodes: &mut [Value]) {
 /// states, `match: contains` (case-insensitive, for name and value), `within`
 /// a container another locator names (an overview's region name works as its
 /// `name`), and `nth` counted top to bottom, then left to right.
-fn browser_find(
+pub(crate) fn browser_find(
     snapshot: &Value,
     locator: &crate::Locator,
     expect: crate::Expect,

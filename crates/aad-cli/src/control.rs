@@ -17,6 +17,9 @@ pub struct Grants {
     /// Enable CDP only on this loopback port. Never launches a real browser or copies logins.
     #[arg(long)]
     browser_port: Option<u16>,
+    /// Attach Firefox WebDriver BiDi on this loopback port, using its own session.
+    #[arg(long, conflicts_with = "browser_port")]
+    browser_bidi_port: Option<u16>,
     /// Let desktop_launch start this program: an absolute path or a bare
     /// name on PATH, started directly (never through a shell). Repeat for
     /// more. Shells, script hosts and association launchers are refused.
@@ -112,6 +115,13 @@ impl Grants {
     /// Launching and global keys are input: refuse them without the input grant
     /// rather than start a server that would refuse every such request.
     fn check(&self, allow_input: bool) -> std::io::Result<()> {
+        if self.browser_bidi_port == Some(0)
+            || (self.browser_bidi_port.is_some() && self.browser_port.is_some())
+        {
+            return Err(invalid(
+                "--browser-bidi-port must be nonzero and cannot be combined with --browser-port",
+            ));
+        }
         if !allow_input
             && (!self.allow_launch.is_empty() || self.allow_global_keys || self.allow_secret_input)
         {
@@ -129,6 +139,7 @@ impl Grants {
         !self.providers.is_empty()
             || !self.resources.is_empty()
             || self.browser_port.is_some()
+            || self.browser_bidi_port.is_some()
             || !self.allow_launch.is_empty()
             || self.allow_clipboard_read
             || self.allow_global_keys
@@ -270,10 +281,11 @@ pub fn mcp(args: &McpArgs) -> std::io::Result<()> {
         aad_mcp::Server::with_control(Arc::new(client))
     } else {
         args.grants.check(args.allow_input)?;
-        let server = aad_mcp::Server::with_options(
+        let server = aad_mcp::Server::local(Session::native_with_browsers(
             args.grants.policy(args.allow_input)?,
             args.grants.browser_port,
-        );
+            args.grants.browser_bidi_port,
+        ));
         if args.allow_profile_copy {
             server.allow_profile_copy()
         } else {
@@ -291,9 +303,10 @@ pub fn run(command_args: &ControlCommand) -> std::io::Result<()> {
         )),
         ControlCommand::Serve(args) => {
             args.grants.check(args.allow_input)?;
-            Arc::new(Session::native_with_browser(
+            Arc::new(Session::native_with_browsers(
                 args.grants.policy(args.allow_input)?,
                 args.grants.browser_port,
+                args.grants.browser_bidi_port,
             ))
         }
         ControlCommand::Connect(args) => {
@@ -306,6 +319,32 @@ pub fn run(command_args: &ControlCommand) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn firefox_attachment_is_explicit_and_distinct_from_cdp() {
+        #[derive(clap::Parser)]
+        struct Cli {
+            #[command(flatten)]
+            grants: Grants,
+        }
+        use clap::Parser;
+        let cli = Cli::try_parse_from(["aad", "--browser-bidi-port", "9223"]).unwrap();
+        assert_eq!(cli.grants.browser_bidi_port, Some(9223));
+        assert!(cli.grants.any());
+        assert!(cli.grants.check(false).is_ok());
+        assert!(Cli::try_parse_from([
+            "aad",
+            "--browser-bidi-port",
+            "9223",
+            "--browser-port",
+            "9222"
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from(["aad", "--browser-bidi-port", "0"])
+            .unwrap()
+            .grants
+            .check(false)
+            .is_err());
+    }
     #[test]
     fn input_only_grants_need_the_input_grant() {
         #[derive(clap::Parser)]

@@ -123,8 +123,8 @@ impl Client {
     /// End our automation session; this does not close the browser or its tabs.
     pub fn end(&mut self, deadline: Instant) -> Result<()> {
         if !self.ended {
-            self.ended = true;
             self.command("session.end", json!({}), deadline, None)?;
+            self.ended = true;
         }
         Ok(())
     }
@@ -179,6 +179,7 @@ mod tests {
         assert!(first
             .command("browsingContext.getTree", json!({}), until(), None)
             .is_ok());
+        assert!(first.end(Instant::now()).is_err());
         first.end(until()).unwrap();
         let second = Client::connect(port, until()).unwrap();
         assert_ne!(first.session_id(), second.session_id());

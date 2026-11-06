@@ -3,6 +3,7 @@
 
 pub mod browser;
 pub mod browser_access;
+pub mod browser_bidi;
 pub mod launch;
 pub mod lease;
 pub mod model;
@@ -573,6 +574,26 @@ impl Session {
             .insert(browser::PROVIDER.into(), browser.clone());
         session.browser = Some(browser);
         session.failures = failures;
+        session
+    }
+
+    /// Explicit Firefox BiDi attachment is separate from Chromium's CDP port.
+    /// Its unsupported capabilities never fall back to another provider.
+    pub fn native_with_browsers(
+        policy: Policy,
+        browser_port: Option<u16>,
+        bidi_port: Option<u16>,
+    ) -> Self {
+        let mut session = Self::native_with_browser(policy, browser_port);
+        if let Some(port) = bidi_port {
+            session.backends.insert(
+                browser_bidi::PROVIDER.into(),
+                Arc::new(browser_bidi::FirefoxBackend::new(
+                    port,
+                    session.policy.browser_access.clone(),
+                )),
+            );
+        }
         session
     }
 
