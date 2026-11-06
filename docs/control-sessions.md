@@ -180,7 +180,7 @@ MCP `browser_downloads`（只读，`--allow-input` 不需要）列出 `directory
 
 动作参数：`click` 可带 `button`（left/right/middle）、`count`（1/2）、`fraction`；`type_text` 可带
 `mode`（unicode/keys）；`scroll` 要 `direction`，可带 `notches`（1..30）、`fraction`；`hover` 可带
-`ms`（1..5000，默认 500）、`fraction`；`drag` 要 `to`（同一次观察里另一个节点的 target），可带
+`ms`（1..5000，默认 500）、`fraction`；`drag` 要 `to`（同一次观察中的目标节点，可为同一 surface），可带
 `button`、`fraction`、`to_fraction`；`select` 要 `option`（选项文字或值，观察节点的 `options` 列出文字）；
 `check` 要 `checked`；`navigate` 与 `open_tab` 要 `url`；`emulate` 要 `preset`（desktop/tablet/mobile/reset）或 `color_scheme`（light/dark/no_preference）或两者，只有预设名、没有尺寸或位置字段，效果持续到本会话与该页的连接断开；`clear_site_data` 用 `Storage.clearDataForOrigin` 清掉页面 origin 的 cookie、localStorage、IndexedDB、缓存与 service worker（不含 sessionStorage）；`accept` 可带 `text`（≤4096）；`paste` 要 `text`（1..4096）。`fraction` 是元素框内 0..1 的比例，不是屏幕坐标。
 `capabilities` 每个 provider 另列 `reads`（`capture`、`read_text`），并只在授权时列出 `launch`（允许启动的程序）、
@@ -222,10 +222,10 @@ invoke 是 DOM 激活；这些不承诺可信用户事件。`click` 始终使用
 这是有界等待与协议边界检查，不承诺阻塞的浏览器命令能立即中断。
 
 `capture` 只截取主文档中已观察、完全在视口内的节点，不自动滚动。
-后端私下遍历 light/open/closed shadow 中的保护字段，持续记住其身份；即使 password 改成 text
+后端私下遍历 light/open/closed shadow 中的保护字段，在本 BiDi 会话的同一隔离 realm 内持续记住其身份；即使 password 改成 text
 或移出 closed root，仍不导出值，且拒绝覆盖它的截图。私有协议响应可能含 HTML 属性，
 不会将其原样导出给调用者。截图范围与任何 frame 相交也暂时拒绝；相关元素移除后可以重新观察并恢复截图。
-扫描不完整则拒绝，不以未知状态放行；这不防止页面自己将秘密复制到其他普通内容区域。
+扫描不完整则拒绝，不以未知状态放行；身份记录不跨新 provider 会话迁移，也不防止页面自己将秘密复制到其他普通内容区域。
 
 `navigate`、`reload`、`open_tab`、`activate_page`、`close_page` 已提供，必须锚定新鲜主文档 body。
 导航目标使用同一服务器 BrowserAccess 授权，重定向后的当前 URL 也重新检查。
