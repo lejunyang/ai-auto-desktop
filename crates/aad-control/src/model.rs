@@ -253,7 +253,7 @@ pub enum Action {
     Check {
         checked: bool,
     },
-    /// Load an http(s) address in the observed page.
+    /// Load an http(s) address, or an operator-granted file/internal URL, in the observed page.
     Navigate {
         url: String,
     },
@@ -274,7 +274,7 @@ pub enum Action {
     Paste {
         text: String,
     },
-    /// Open an http(s) address in a new tab of the observed page's browser.
+    /// Open an http(s) or operator-granted file/internal URL in a new tab.
     OpenTab {
         url: String,
     },

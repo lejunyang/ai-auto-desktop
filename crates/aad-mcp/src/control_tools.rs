@@ -163,7 +163,7 @@ fn action_schema() -> Value {
     another one.", json!({
             "checked": {"type": "boolean"}
         }), &["checked"]),
-        variant("navigate", "Load an http or https address in the observed browser page. \
+        variant("navigate", "Load an http(s) address or an operator-granted file/internal URL in the observed browser page. \
     Offered on the page's document node of the main frame.", json!({
             "url": {"type": "string", "minLength": 8, "maxLength": 2048}
         }), &["url"]),
@@ -191,7 +191,7 @@ fn action_schema() -> Value {
         variant("activate", "Bring the observed desktop window to the foreground, restoring \
     it first if minimized. Refused with DRIVER.ACTIVATION_REFUSED when Windows will not let \
     this process take the foreground. Offered on its root node.", json!({}), &[]),
-        variant("open_tab", "Open an http or https address in a new tab of the observed \
+        variant("open_tab", "Open an http(s) address or an operator-granted file/internal URL in a new tab of the observed \
     page's browser. Offered on the page's document node. The answer names the new page_id; \
     call control_targets to observe it.", json!({
             "url": {"type": "string", "minLength": 8, "maxLength": 2048}

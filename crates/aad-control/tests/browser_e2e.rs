@@ -17,6 +17,9 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
+#[path = "browser_cases/access.rs"]
+mod access_cases;
+
 const PAGE: &str = r#"<!doctype html><html><body>
 <form onsubmit="event.preventDefault()"><input id="name" aria-label="Name" oninput="document.getElementById('status').value='fill:'+this.value" onkeydown="if(event.key==='Enter')document.getElementById('status').value='key:'+event.isTrusted">
 <button id="save" aria-label="Save" type="button" onclick="document.getElementById('status').value='clicked:'+event.isTrusted">Save</button></form>
@@ -4238,7 +4241,7 @@ fn browser_actions_are_observed_document_bound_and_have_real_page_effects() {
             url: "file:///etc/passwd".into(),
         },
     );
-    assert_eq!(refused.error.unwrap()["code"], "CONTROL.INVALID_REQUEST");
+    assert_eq!(refused.error.unwrap()["code"], "POLICY.DENIED");
     let observed = observe(&session, main);
     let body = document(&session, &observed);
     let url = format!("{}second", fixture.url);

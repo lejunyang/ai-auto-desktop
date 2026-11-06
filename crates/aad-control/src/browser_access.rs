@@ -77,7 +77,10 @@ impl BrowserAccess {
     /// Navigation is explicit; script/data/blob URLs are never accepted here.
     /// File aliases are resolved to their canonical file URL before dispatch.
     pub fn navigation_url(&self, raw: &str) -> Result<String> {
-        let mut url = parse(raw)?;
+        self.authorize_url(parse(raw)?)
+    }
+
+    fn authorize_url(&self, mut url: Url) -> Result<String> {
         match url.scheme() {
             "http" | "https" if url.host_str().is_some() => Ok(url.to_string()),
             "file" => {
@@ -120,15 +123,24 @@ impl BrowserAccess {
     /// Blank/srcdoc are inert document addresses; callers must also validate
     /// their embedding frame chain before exposing or operating on a child.
     pub fn check_document(&self, raw: &str) -> Result<()> {
-        let url = parse(raw)?;
+        // Current browser URLs can legitimately exceed the action-input limit
+        // (e.g. OAuth redirects and data frames). Do not revoke their origin.
+        let url = Url::parse(raw)
+            .map_err(|_| error("POLICY.DENIED", "browser document has no valid current URL"))?;
         if url.scheme() == "about"
             && matches!(url.path(), "blank" | "srcdoc")
             && url.query().is_none()
         {
             return Ok(());
         }
+        // Existing data documents carry no file/internal origin privileges.
+        // They remain observable; requesting data navigation is still refused.
+        if url.scheme() == "data" {
+            return Ok(());
+        }
         if url.scheme() == "blob" {
-            let inner = parse(url.path())?;
+            let inner = Url::parse(url.path())
+                .map_err(|_| error("POLICY.DENIED", "blob document has no verifiable origin"))?;
             if matches!(inner.scheme(), "http" | "https") && inner.host_str().is_some() {
                 return Ok(());
             }
@@ -137,7 +149,7 @@ impl BrowserAccess {
                 "opaque or privileged blob document origin cannot be authorized",
             ));
         }
-        self.navigation_url(raw).map(|_| ())
+        self.authorize_url(url).map(|_| ())
     }
 
     fn file(&self, url: &Url) -> Result<PathBuf> {
@@ -216,6 +228,12 @@ mod tests {
             .is_ok());
         assert!(policy.check_document("blob:null/id").is_err());
         assert!(policy.check_document("about:config").is_err());
+        let long_web = format!("https://example.test/?state={}", "a".repeat(4096));
+        assert!(policy.check_document(&long_web).is_ok());
+        assert!(policy.navigation_url(&long_web).is_err());
+        assert!(policy
+            .check_document(&format!("data:text/html,{}", "a".repeat(4096)))
+            .is_ok());
     }
 
     #[test]

@@ -230,6 +230,8 @@ pub struct Policy {
     pub upload_roots: Vec<std::path::PathBuf>,
     /// Whether browser_storage may show cookie values. Off: names and flags only.
     pub allow_cookie_values: bool,
+    /// Operator grants for local files and exact browser internal origins.
+    pub browser_access: browser_access::BrowserAccess,
 }
 
 #[derive(Clone)]
@@ -523,7 +525,10 @@ impl Session {
         let backends = natives.into_iter().map(|b| b as Arc<dyn Backend>).collect();
         let mut session = Self::new(backends, policy).with_providers(providers);
         // Always present, so a browser started later can be attached.
-        let browser = Arc::new(browser::BrowserBackend::new(browser_port.unwrap_or(0)));
+        let browser = Arc::new(browser::BrowserBackend::with_access(
+            browser_port.unwrap_or(0),
+            session.policy.browser_access.clone(),
+        ));
         session
             .backends
             .insert(browser::PROVIDER.into(), browser.clone());
@@ -1179,7 +1184,7 @@ impl Session {
                         "truncated observation cannot authorize input",
                     ));
                 }
-                validate_action(action)?;
+                validate_action(action, &self.policy.browser_access)?;
                 if let Some(ms) = action.hold_ms() {
                     if Duration::from_millis(ms) >= context.remaining()? {
                         return Err(error(
@@ -1192,6 +1197,18 @@ impl Session {
                 // no provider ever sees a path outside it.
                 let resolved;
                 let action = match action {
+                    Action::Navigate { url } => {
+                        resolved = Action::Navigate {
+                            url: self.policy.browser_access.navigation_url(url)?,
+                        };
+                        &resolved
+                    }
+                    Action::OpenTab { url } => {
+                        resolved = Action::OpenTab {
+                            url: self.policy.browser_access.navigation_url(url)?,
+                        };
+                        &resolved
+                    }
                     Action::Upload { files } => {
                         resolved = Action::Upload {
                             files: self.upload_files(files)?,
@@ -1355,7 +1372,10 @@ impl Session {
                         "global keys were not granted by the server operator",
                     ));
                 }
-                validate_action(&Action::Key { keys: keys.clone(), hold_ms: None })?;
+                validate_action(
+                    &Action::Key { keys: keys.clone(), hold_ms: None },
+                    &self.policy.browser_access,
+                )?;
                 let backend = self
                     .backends
                     .values()
@@ -2053,7 +2073,7 @@ fn text_answer(read: &Value, provider: &str) -> Value {
     })
 }
 
-fn validate_action(action: &Action) -> Result<()> {
+fn validate_action(action: &Action, access: &browser_access::BrowserAccess) -> Result<()> {
     if let Action::SecretInput { secret_ref } = action {
         if !valid_secret_ref(secret_ref) {
             return Err(error(
@@ -2071,18 +2091,7 @@ fn validate_action(action: &Action) -> Result<()> {
         _ => None,
     };
     if let Action::Navigate { url } | Action::OpenTab { url } = action {
-        let scheme = url
-            .split_once("://")
-            .map(|(scheme, _)| scheme.to_ascii_lowercase());
-        if url.len() > 2048
-            || url.chars().any(char::is_control)
-            || !matches!(scheme.as_deref(), Some("http" | "https"))
-        {
-            return Err(error(
-                "CONTROL.INVALID_REQUEST",
-                "navigate and open_tab take an http or https address of at most 2048 characters",
-            ));
-        }
+        access.navigation_url(url)?;
     }
     if text.is_some_and(|s| s.len() > 4096 || s.contains('\0')) {
         return Err(error(
@@ -2533,8 +2542,9 @@ mod admission_tests {
 
     #[test]
     fn new_tabs_open_only_web_addresses() {
+        let access = browser_access::BrowserAccess::default();
         for url in ["http://127.0.0.1/", "https://example.com/a?b"] {
-            assert!(validate_action(&Action::OpenTab { url: url.into() }).is_ok());
+            assert!(validate_action(&Action::OpenTab { url: url.into() }, &access).is_ok());
         }
         for url in [
             "javascript:alert(1)",
@@ -2542,9 +2552,9 @@ mod admission_tests {
             "chrome://settings",
             "https://example.com/\n",
         ] {
-            assert!(validate_action(&Action::OpenTab { url: url.into() }).is_err());
+            assert!(validate_action(&Action::OpenTab { url: url.into() }, &access).is_err());
         }
-        assert!(validate_action(&Action::ClosePage {}).is_ok());
+        assert!(validate_action(&Action::ClosePage {}, &access).is_ok());
     }
 
     #[test]

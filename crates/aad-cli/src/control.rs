@@ -37,6 +37,13 @@ pub struct Grants {
     /// Let browser_storage show cookie values. Without it names and flags only.
     #[arg(long)]
     allow_cookie_values: bool,
+    /// Let browser control open regular files under this directory. Repeatable.
+    /// This controls document access; it is not a browser filesystem sandbox.
+    #[arg(long = "allow-browser-file-dir", value_name = "DIR")]
+    browser_file_dirs: Vec<std::path::PathBuf>,
+    /// Allow one internal origin, e.g. chrome://settings. Repeatable; no wildcards.
+    #[arg(long = "allow-browser-internal-origin", value_name = "ORIGIN")]
+    browser_internal_origins: Vec<String>,
     /// Permit replacing protected fields with server-owned secret bindings.
     /// Also requires --allow-input. Ordinary fill/type/paste stay prohibited.
     #[arg(long)]
@@ -73,6 +80,11 @@ impl Grants {
             allow_global_keys: self.allow_global_keys,
             upload_roots: self.upload_dirs.clone(),
             allow_cookie_values: self.allow_cookie_values,
+            browser_access: aad_control::browser_access::BrowserAccess::new(
+                &self.browser_file_dirs,
+                &self.browser_internal_origins,
+            )
+            .map_err(|error| invalid(error.message))?,
         })
     }
     fn prepare_secrets(&mut self, allow_input: bool) -> std::io::Result<Vec<String>> {
@@ -122,6 +134,8 @@ impl Grants {
             || self.allow_global_keys
             || !self.upload_dirs.is_empty()
             || self.allow_cookie_values
+            || !self.browser_file_dirs.is_empty()
+            || !self.browser_internal_origins.is_empty()
             || self.allow_secret_input
             || !self.secret_env.is_empty()
     }
@@ -360,6 +374,50 @@ mod tests {
                 .unwrap()
                 .allow_cookie_values
         );
+    }
+    #[test]
+    fn browser_document_grants_are_server_owned_and_validate_at_startup() {
+        #[derive(clap::Parser)]
+        struct Cli {
+            #[command(flatten)]
+            grants: Grants,
+        }
+        use clap::Parser;
+        let granted = Cli::try_parse_from([
+            "aad",
+            "--allow-browser-internal-origin",
+            "chrome://settings",
+            "--allow-browser-internal-origin",
+            "edge://downloads",
+        ])
+        .unwrap();
+        assert!(
+            granted.grants.any(),
+            "remote clients must not silently accept local grants"
+        );
+        let policy = granted.grants.policy(false).unwrap();
+        assert!(
+            !policy.allow_input,
+            "read grants must not imply input permission"
+        );
+        assert!(policy
+            .browser_access
+            .check_document("chrome://settings/appearance")
+            .is_ok());
+        assert!(policy
+            .browser_access
+            .check_document("chrome://extensions/")
+            .is_err());
+        let bad =
+            Cli::try_parse_from(["aad", "--allow-browser-internal-origin", "chrome://*"]).unwrap();
+        assert!(bad.grants.policy(true).is_err());
+        let bad = Cli::try_parse_from([
+            "aad",
+            "--allow-browser-file-dir",
+            "/aad-nonexistent-fixture-directory",
+        ])
+        .unwrap();
+        assert!(bad.grants.policy(true).is_err());
     }
     #[test]
     fn transport_commands_are_argv_not_shell_fragments() {

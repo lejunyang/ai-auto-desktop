@@ -537,6 +537,7 @@ fn browser_input_keys(snapshot: &Value) -> Result<Vec<String>> {
 }
 
 pub struct BrowserBackend {
+    access: crate::browser_access::BrowserAccess,
     /// The loopback CDP port; 0 until a browser is attached.
     port: AtomicU16,
     pages: Mutex<BTreeMap<String, Page>>,
@@ -554,7 +555,12 @@ pub struct BrowserBackend {
 
 impl BrowserBackend {
     pub fn new(port: u16) -> Self {
+        Self::with_access(port, Default::default())
+    }
+
+    pub fn with_access(port: u16, access: crate::browser_access::BrowserAccess) -> Self {
         Self {
+            access,
             port: AtomicU16::new(port),
             pages: Mutex::new(BTreeMap::new()),
             histories: Mutex::new(BTreeMap::new()),
@@ -763,12 +769,31 @@ impl BrowserBackend {
             .iter()
             .find(|target| target.id == page_id)
             .ok_or_else(|| error("CONTROL.STALE_TARGET", "browser tab no longer exists"))?;
+        // /json/list may briefly publish an empty URL across navigation. The
+        // renderer's fresh main frame below is the authority in that case.
+        if !target.url.is_empty() {
+            self.access.check_document(&target.url)?;
+        }
         let mut pages = self.pages.lock().unwrap();
         if self.closed.load(Ordering::SeqCst) {
             return Err(error("CONTROL.SESSION_CLOSED", "browser session is closed"));
         }
         pages.retain(|id, _| targets.iter().any(|target| target.id == *id));
-        let result = f(self.page(&mut pages, target, deadline)?);
+        let page = self.page(&mut pages, target, deadline)?;
+        if let Some(dialog) = &page.dialog {
+            self.access
+                .check_document(dialog["url"].as_str().unwrap_or_default())?;
+        } else {
+            let frames = self.access_frames(page)?;
+            let (id, _) = frames
+                .iter()
+                .find(|(_, entry)| entry.main())
+                .ok_or_else(|| {
+                    error("CONTROL.STALE_TARGET", "browser main frame is unavailable")
+                })?;
+            self.check_frame_access(&frames, id)?;
+        }
+        let result = f(page);
         if self.closed.load(Ordering::SeqCst) {
             self.clear_context(&mut pages, Instant::now() + Duration::from_millis(100));
         }
@@ -785,6 +810,86 @@ impl BrowserBackend {
             }
         }
         result
+    }
+
+    /// The current frame and every embedding document must be in the server
+    /// grant. Re-read the frame tree rather than trusting a retained URL.
+    fn locate(&self, page: &mut Page, frame_id: &str) -> Result<FrameEntry> {
+        let frames = self.access_frames(page)?;
+        let entry = frames
+            .iter()
+            .find(|(id, _)| id == frame_id)
+            .map(|(_, entry)| entry.clone())
+            .ok_or_else(|| error("CONTROL.STALE_TARGET", "browser frame was detached"))?;
+        self.check_frame_access(&frames, frame_id)?;
+        Ok(entry)
+    }
+
+    fn access_frames(&self, page: &mut Page) -> Result<Vec<(String, FrameEntry)>> {
+        let until = Instant::now() + Duration::from_millis(200);
+        loop {
+            let frames = frame_map(page)?;
+            if frames.iter().any(|(_, entry)| {
+                entry.main()
+                    && entry.frame["url"]
+                        .as_str()
+                        .is_some_and(|url| !url.is_empty())
+            }) {
+                return Ok(frames);
+            }
+            if Instant::now() >= until {
+                return Err(error(
+                    "CONTROL.STALE_TARGET",
+                    "browser main document URL is not ready; observe again",
+                ));
+            }
+            // The CDP client's original request deadline still bounds each
+            // refresh. Never substitute the previously granted URL.
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn check_frame_access(&self, frames: &[(String, FrameEntry)], frame_id: &str) -> Result<()> {
+        let mut id = frame_id;
+        let mut seen = BTreeSet::new();
+        loop {
+            if !seen.insert(id) {
+                return Err(error(
+                    "CONTROL.STALE_TARGET",
+                    "browser frame ancestry is cyclic",
+                ));
+            }
+            let entry = frames
+                .iter()
+                .find(|(known, _)| known == id)
+                .map(|(_, entry)| entry)
+                .ok_or_else(|| {
+                    error(
+                        "CONTROL.STALE_TARGET",
+                        "browser frame ancestry is incomplete",
+                    )
+                })?;
+            self.access
+                .check_document(entry.frame["url"].as_str().unwrap_or_default())
+                .map_err(|error| {
+                    error
+                        .with_detail(
+                            "frame_url_missing",
+                            json!(entry.frame["url"].as_str().is_none_or(str::is_empty)),
+                        )
+                        .with_detail("main_frame", json!(entry.main()))
+                })?;
+            match entry.parent.as_deref() {
+                Some(parent) => id = parent,
+                None if entry.main() => return Ok(()),
+                None => {
+                    return Err(error(
+                        "CONTROL.STALE_TARGET",
+                        "browser frame has no verified main document",
+                    ))
+                }
+            }
+        }
     }
 
     /// Run commands on the browser-level connection, opening it when needed.
@@ -1151,14 +1256,6 @@ fn merge_frames(all: &mut Vec<(String, FrameEntry)>, own: Vec<(String, FrameEntr
             None => all.push((id, entry)),
         }
     }
-}
-
-fn locate(page: &mut Page, frame_id: &str) -> Result<FrameEntry> {
-    frame_map(page)?
-        .into_iter()
-        .find(|(id, _)| id == frame_id)
-        .map(|(_, entry)| entry)
-        .ok_or_else(|| error("CONTROL.STALE_TARGET", "browser frame was detached"))
 }
 
 /// Captures larger than this keep their heuristic roles and names: the
@@ -1817,7 +1914,7 @@ impl Backend for BrowserBackend {
         if snapshot["scope_id"].is_string() {
             let meta = &snapshot["metadata"];
             self.with_page_state(meta["page_id"].as_str().unwrap_or_default(), timeout, |page| {
-                let entry = locate(page, meta["frame_id"].as_str().unwrap_or_default())?;
+                let entry = self.locate(page, meta["frame_id"].as_str().unwrap_or_default())?;
                 let context = Ctx { session: entry.session.clone(), id: meta["context_id"].as_i64().unwrap_or_default() };
                 let args = json!({"document_token":snapshot["document_token"], "observation":snapshot["snapshot_id"]});
                 checked(eval(&mut page.client, &context, format!("globalThis.__aadControlV1.validate_scope({args})"))?)
@@ -1888,6 +1985,23 @@ impl Backend for BrowserBackend {
         pages.retain(|id, _| targets.iter().any(|target| target.id == *id));
         let mut resources = Vec::new();
         for target in targets.iter().take(64) {
+            if let Err(denied) = self.access.check_document(&target.url) {
+                let selector = json!({"page_id":target.id,"frame_id":target.id});
+                resources.push(BackendResource {
+                    resource: Resource {
+                        resource_id: resource_id(PROVIDER, &selector),
+                        provider: PROVIDER.into(),
+                        kind: "browser".into(),
+                        name: target.title.clone(),
+                        capabilities: Vec::new(),
+                        metadata: json!({"page_id":target.id,"frame_id":target.id,
+                            "main_frame":true,"url":target.url,
+                            "access_error":{"code":denied.code,"message":denied.message}}),
+                    },
+                    selector,
+                });
+                continue;
+            }
             let page = match self.page(&mut pages, target, deadline) {
                 Ok(page) => page,
                 Err(e) if e.code == "BROWSER.PAGE_UNRESPONSIVE" => {
@@ -1950,6 +2064,14 @@ impl Backend for BrowserBackend {
                 .map(|(id, _)| id.clone())
                 .ok_or_else(|| error("BROWSER.BAD_RESULT", "missing main frame"))?;
             page.main_frame = Some(root.clone());
+            let denied: BTreeMap<String, AutomationError> = map
+                .iter()
+                .filter_map(|(id, _)| {
+                    self.check_frame_access(&map, id)
+                        .err()
+                        .map(|error| (id.clone(), error))
+                })
+                .collect();
             for (id, entry) in map.into_iter().take(64) {
                 let selector = json!({"page_id": target.id, "frame_id": id});
                 let main = id == root;
@@ -1957,6 +2079,12 @@ impl Backend for BrowserBackend {
                 // Navigation and tabs address the page, not a frame.
                 if !main {
                     capabilities.retain(|s| !MAIN_FRAME_ONLY.contains(&s.as_str()));
+                }
+                let access_error = denied
+                    .get(&id)
+                    .map(|error| json!({"code":error.code,"message":error.message}));
+                if access_error.is_some() {
+                    capabilities.clear();
                 }
                 resources.push(BackendResource {
                     resource: Resource {
@@ -1967,6 +2095,7 @@ impl Backend for BrowserBackend {
                         capabilities,
                         metadata: json!({"page_id": target.id, "frame_id": id,
                             "url": entry.frame["url"], "main_frame": main,
+                            "access_error": access_error,
                             "parent_frame_id": entry.parent,
                             "out_of_process": entry.session.is_some(),
                             "opener_page_id": openers.get(&target.id),
@@ -2000,7 +2129,7 @@ impl Backend for BrowserBackend {
             if let Some(dialog) = &page.dialog {
                 return Err(dialog_open(dialog));
             }
-            let entry = locate(page, frame_id)?;
+            let entry = self.locate(page, frame_id)?;
             if entry.frame["loaderId"] != meta["loader_id"] {
                 return Err(error("CONTROL.STALE_TARGET", "browser document navigated"));
             }
@@ -2109,7 +2238,7 @@ impl Backend for BrowserBackend {
                 let main=page.main_frame.as_deref().is_none_or(|main|main==frame_id);
                 return Ok(dialog_snapshot(page_id,frame_id,main,dialog));
             }
-            let entry=locate(page,frame_id)?;
+            let entry=self.locate(page,frame_id)?;
             if selector["scope_backend_node_id"].is_i64() && entry.frame["loaderId"]!=selector["scope_loader_id"] {
                 return Err(error("CONTROL.STALE_TARGET","scope document navigated"));
             }
@@ -2207,7 +2336,7 @@ impl Backend for BrowserBackend {
             let frame_id = meta["frame_id"].as_str().unwrap_or_default();
             self.with_page_state(page_id,action_context.remaining()?,|page|{
                 if let Some(dialog)=&page.dialog{return Err(dialog_open(dialog));}
-                let entry=locate(page,frame_id)?;
+                let entry=self.locate(page,frame_id)?;
                 if entry.frame["loaderId"]!=meta["loader_id"] {return Err(error("CONTROL.STALE_TARGET","browser document navigated"));}
                 let context=Ctx{session:entry.session,id:meta["context_id"].as_i64().unwrap_or_default()};
                 let args=json!({"document_token":snapshot["document_token"],"observation":snapshot["snapshot_id"],"node_id":node["node_id"],"action":"secret_input"});
@@ -2252,6 +2381,9 @@ impl Backend for BrowserBackend {
         action: &Action,
         action_context: &crate::Context,
     ) -> Result<Value> {
+        if let Action::Navigate { url } | Action::OpenTab { url } = action {
+            self.access.navigation_url(url)?;
+        }
         let meta = &snapshot["metadata"];
         let input = self.browser_input(Instant::now() + action_context.remaining()?)?;
         if meta["browser_instance_id"] != input.instance {
@@ -2291,7 +2423,7 @@ impl Backend for BrowserBackend {
         let frame_id = meta["frame_id"].as_str().unwrap();
         let result = self.with_page_state(page_id,action_context.remaining()?,|state|{
             if let Some(dialog)=&state.dialog {return Err(dialog_open(dialog));}
-            let entry=locate(state,frame_id)?;
+            let entry=self.locate(state,frame_id)?;
             if entry.frame["loaderId"]!=meta["loader_id"] {return Err(error("CONTROL.STALE_TARGET","browser document navigated"));}
             let context=Ctx{session:entry.session.clone(),id:meta["context_id"].as_i64().unwrap_or_default()};
             let mut inspect=json!({"document_token":snapshot["document_token"],"observation":snapshot["snapshot_id"],"node_id":node["node_id"]});
@@ -2469,7 +2601,7 @@ impl BrowserBackend {
             if let Some(dialog) = &page.dialog {
                 return Err(dialog_open(dialog));
             }
-            let entry = locate(page, frame_id)?;
+            let entry = self.locate(page, frame_id)?;
             if entry.frame["loaderId"] != meta["loader_id"] {
                 return Err(error("CONTROL.STALE_TARGET", "browser document navigated"));
             }
@@ -2509,7 +2641,7 @@ impl BrowserBackend {
             if let Some(dialog) = &page.dialog {
                 return Err(dialog_open(dialog));
             }
-            let entry = locate(page, frame_id)?;
+            let entry = self.locate(page, frame_id)?;
             let url = entry.frame["url"].as_str().unwrap_or_default().to_string();
             let origin = entry.frame["securityOrigin"].as_str().unwrap_or_default().to_string();
             let client = &mut page.client;
@@ -2587,6 +2719,7 @@ impl BrowserBackend {
             if bodies && page.dialog.is_none() {
                 for request in requests.iter_mut().filter(|r| {
                     r["state"] == "finished"
+                        && self.access.check_document(r["url"].as_str().unwrap_or_default()).is_ok()
                         && r["mime_type"].as_str().is_some_and(|mime| {
                             mime.starts_with("text/")
                                 || mime.contains("json")
@@ -2727,7 +2860,7 @@ impl BrowserBackend {
                 .filter(|((known_page,known_frame),_)|known_page==page_id && known_frame!=frame_id)
                 .map(|(key,frame)|(key.clone(),frame.clone())).collect();
             for (key,secret) in marked {
-                let current=match locate(page,&key.1) {
+                let current=match self.locate(page,&key.1) {
                     Ok(entry)=>entry,
                     Err(e) if e.code=="CONTROL.STALE_TARGET"=>{
                         self.secret_frames.lock().unwrap().remove(&key);
@@ -2758,12 +2891,14 @@ impl BrowserBackend {
             // A main-frame capture can include any child frame, even when its
             // DOM was never in the caller's observation. Inspect protection in
             // each frame's own isolated world; unknown visibility fails closed.
-            for (child_id,entry) in frame_map(page)? {
+            let current_frames = frame_map(page)?;
+            for (child_id,entry) in &current_frames {
                 if child_id==frame_id {continue;}
+                self.check_frame_access(&current_frames,child_id)?;
                 let safe=(||->Result<bool> {
                     let created=run(&mut page.client,entry.session.as_deref(),"Page.createIsolatedWorld",json!({"frameId":child_id,"worldName":self.world,"grantUniveralAccess":false}))?;
                     let id=created["executionContextId"].as_i64().ok_or_else(||error("BROWSER.BAD_RESULT","no child context"))?;
-                    let context=Ctx{session:entry.session,id};
+                    let context=Ctx{session:entry.session.clone(),id};
                     let nonce=serde_json::to_string(&uuid::Uuid::new_v4().to_string()).unwrap();
                     eval(&mut page.client,&context,include_str!("browser.js").replace("/*AAD_NAMING*/",aad_cdp::NAMING).replace("NONCE",&nonce))?;
                     refresh_closed_roots(&mut page.client,&context,None,true)?;
@@ -3940,6 +4075,33 @@ fn keyboard(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn browser_document_grants_cover_embedding_frames_without_blocking_unrelated_siblings() {
+        let backend = BrowserBackend::new(0);
+        let frame = |id: &str, url: &str, parent: Option<&str>| (id.to_string(), FrameEntry {
+            session: None,
+            frame: json!({"id":id,"url":url}),
+            parent: parent.map(String::from),
+            root: parent.is_none(),
+        });
+        let mut frames = vec![
+            frame("main", "https://example.test/", None),
+            frame("permitted", "about:srcdoc", Some("main")),
+            frame("private", "file:///synthetic-ungranted.html", Some("main")),
+            frame("nested", "https://example.test/child", Some("private")),
+        ];
+        assert!(backend.check_frame_access(&frames, "permitted").is_ok());
+        assert_eq!(backend.check_frame_access(&frames, "private").unwrap_err().code, "POLICY.DENIED");
+        assert_eq!(backend.check_frame_access(&frames, "nested").unwrap_err().code, "POLICY.DENIED");
+        frames[0].1.frame["url"] = json!("chrome://settings/");
+        assert_eq!(backend.check_frame_access(&frames, "permitted").unwrap_err().code, "POLICY.DENIED");
+        frames[0].1.frame["url"] = json!("https://example.test/");
+        frames[1].1.parent = Some("missing".into());
+        assert_eq!(backend.check_frame_access(&frames, "permitted").unwrap_err().code, "CONTROL.STALE_TARGET");
+        frames[1].1.parent = Some("permitted".into());
+        assert_eq!(backend.check_frame_access(&frames, "permitted").unwrap_err().code, "CONTROL.STALE_TARGET");
+    }
 
     #[test]
     fn private_shadow_discovery_follows_nested_roots_and_fails_closed_at_its_bound() {
