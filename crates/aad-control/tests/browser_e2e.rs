@@ -1020,6 +1020,123 @@ fn locate(session: &Session, observation: &Value, locator: Value) -> Response {
 
 #[test]
 #[ignore = "requires isolated Chromium with its sandbox enabled; CI runs it explicitly"]
+fn observed_elements_scope_large_pages_without_html_ids_and_keep_their_identity() {
+    let _serial = serial();
+    let fixture = Fixture::new();
+    let (session, _) = session_for(&fixture);
+    let main = main_of(&session, &fixture.page_id);
+    let loaded = wait_until(&session, &main, "Name", WaitCondition::Appears);
+    assert!(loaded.error.is_none(), "{loaded:?}");
+    page_value(
+        &fixture,
+        r#"document.body.innerHTML='<section aria-label="Local form"><button onclick="this.nextElementSibling.textContent=\'Saved locally\'">Save locally</button><output></output></section>';
+        window.localForm=document.querySelector('section');
+        for(let i=0;i<2100;i++){const row=document.createElement('p');row.textContent='Outside '+i;document.body.append(row);}
+        true"#,
+    );
+    let whole = observe(&session, &main);
+    assert_eq!(whole["truncated"], true);
+    let root: Target =
+        serde_json::from_value(node(&whole, "Local form")["target"].clone()).unwrap();
+    let narrowed = observe_view(
+        &session,
+        &main,
+        View {
+            scope_target: Some(root),
+            ..Default::default()
+        },
+    );
+    assert!(narrowed.error.is_none(), "{narrowed:?}");
+    let observed = narrowed.data.unwrap();
+    assert_eq!(observed["truncated"], false);
+    assert_eq!(observed["nodes"].as_array().unwrap().len(), 3);
+    let scope = observed["scope"]["id"].as_str().unwrap().to_string();
+    assert!(scope.starts_with("aad:browser-scope:"));
+    assert_eq!(page_value(&fixture, "window.localForm.id"), "");
+    let target = find(&session, &observed, "button", "Save locally");
+    let saved = call(
+        &session,
+        Operation::Act {
+            target,
+            action: Action::click(),
+            verify: Some(Box::new(Locator {
+                name: Some("Saved locally".into()),
+                ..Default::default()
+            })),
+        },
+    );
+    assert!(saved.error.is_none(), "{saved:?}");
+    assert_eq!(
+        page_value(
+            &fixture,
+            "window.localForm.querySelector('output').textContent"
+        ),
+        "Saved locally"
+    );
+
+    // A page cannot redirect the opaque scope by creating a matching HTML id.
+    page_value(
+        &fixture,
+        &format!(
+            "const impostor=document.createElement('section');impostor.id={};impostor.innerHTML='<button>Impostor</button>';document.body.prepend(impostor);true",
+            serde_json::to_string(&scope).unwrap()
+        ),
+    );
+    let recaptured = observe_view(
+        &session,
+        &main,
+        View {
+            scope_id: Some(scope.clone()),
+            ..Default::default()
+        },
+    );
+    assert!(recaptured.error.is_none(), "{recaptured:?}");
+    let recaptured = recaptured.data.unwrap();
+    assert!(recaptured["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|node| node["name"] != "Impostor"));
+    find(&session, &recaptured, "button", "Save locally");
+
+    // Even an identical replacement cannot take over the original DOM identity.
+    page_value(
+        &fixture,
+        "window.localForm.replaceWith(window.localForm.cloneNode(true));true",
+    );
+    let replaced = observe_view(
+        &session,
+        &main,
+        View {
+            scope_id: Some(scope),
+            ..Default::default()
+        },
+    );
+    assert_eq!(replaced.error.unwrap()["code"], "CONTROL.STALE_TARGET");
+
+    // An observed element within an open shadow root needs no document id either.
+    page_value(
+        &fixture,
+        "document.body.innerHTML='<x-local></x-local>';document.querySelector('x-local').attachShadow({mode:'open'}).innerHTML='<section aria-label=\"Shadow form\"><button>Shadow save</button></section>';true",
+    );
+    let whole = observe(&session, &main);
+    let root = serde_json::from_value(node(&whole, "Shadow form")["target"].clone()).unwrap();
+    let shadow = observe_view(
+        &session,
+        &main,
+        View {
+            scope_target: Some(root),
+            ..Default::default()
+        },
+    );
+    assert!(shadow.error.is_none(), "{shadow:?}");
+    let shadow = shadow.data.unwrap();
+    assert_eq!(shadow["nodes"].as_array().unwrap().len(), 2);
+    find(&session, &shadow, "button", "Shadow save");
+}
+
+#[test]
+#[ignore = "requires isolated Chromium with its sandbox enabled; CI runs it explicitly"]
 fn scoped_observations_ignore_unrelated_updates_but_reject_related_changes() {
     let _serial = serial();
     let fixture = Fixture::new();

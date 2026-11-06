@@ -57,7 +57,7 @@
     const parents=parentsOf(scopeRoot);
     if (parents.length!==scopeParents.length || parents.some((parent,i)=>parent!==scopeParents[i])) return false;
     if (scopeNeedsValidation) {
-      const matches=document.querySelectorAll('[id="'+CSS.escape(scopeIdentity)+'"]');
+      const matches=scopeIdentity===null ? [scopeRoot] : document.querySelectorAll('[id="'+CSS.escape(scopeIdentity)+'"]');
       if (matches.length!==1 || matches[0]!==scopeRoot ||
           scopeElements.some(({el,state})=>scopeState(el)!==state)) {
         scopeInvalid=true;
@@ -116,14 +116,23 @@
         return {error:'CONTROL.STALE_TARGET'};
       return {valid:true};
     },
-    observe: (id,limit,scopeId=null) => {
+    // Read-only narrowing may start from an observed node of an incomplete
+    // capture. It still checks the retained identity before exporting it to CDP.
+    scope_element: args => {
+      if (args.document_token!==documentToken || args.observation!==observation ||
+          (scopeRoot && !scopeCurrent())) return null;
+      const found=nodes.get(args.node_id);
+      return found && present(found.el) && fingerprint(found.el)===found.fingerprint ? found.el : null;
+    },
+    observe: (id,limit,scopeId=null,elementRoot=null) => {
       observation=id; nodes=new Map();
       scopeObserver.disconnect(); scopeRoot=null; scopeInvalid=false; scopeNeedsValidation=false;
-      scopeParents=[]; scopeElements=[]; scopeIdentity=scopeId;
+      scopeParents=[]; scopeElements=[]; scopeIdentity=elementRoot===null?scopeId:null;
       if (scopeId !== null) {
-        const matches=document.querySelectorAll('[id="'+CSS.escape(scopeId)+'"]');
+        const matches=elementRoot===null ? document.querySelectorAll('[id="'+CSS.escape(scopeId)+'"]') : [elementRoot];
         if(matches.length!==1)return {error:matches.length?'CONTROL.AMBIGUOUS':'CONTROL.SCOPE_NOT_FOUND'};
         scopeRoot=matches[0];
+        if(!present(scopeRoot))return {error:'CONTROL.STALE_TARGET'};
         scopeParents=parentsOf(scopeRoot);
         scopeObserver.observe(document,{subtree:true,childList:true,attributes:true,characterData:true});
       }

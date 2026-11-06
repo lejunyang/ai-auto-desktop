@@ -6,7 +6,7 @@ use crate::{
 use aad_cdp::{Client, Target};
 use aad_core::AutomationError;
 use serde_json::{json, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -24,6 +24,9 @@ const DOWNLOAD_BEGIN: &str = "Browser.downloadWillBegin";
 const DOWNLOAD_PROGRESS: &str = "Browser.downloadProgress";
 /// Downloads remembered per session; the oldest are forgotten first.
 const MAX_DOWNLOADS: usize = 200;
+/// These tokens are never interpreted as HTML ids, including after expiry.
+const ELEMENT_SCOPE_PREFIX: &str = "aad:browser-scope:";
+const MAX_ELEMENT_SCOPES: usize = 64;
 
 /// Downloads go to a directory of this session's own, and are tracked from
 /// the browser's events -- only for a browser this server launched. A
@@ -467,6 +470,15 @@ fn dialog_snapshot(page_id: &str, frame_id: &str, main: bool, dialog: &Value) ->
         },
     })
 }
+#[derive(Clone)]
+struct ElementScope {
+    token: String,
+    page_id: String,
+    frame_id: String,
+    loader_id: Value,
+    backend_node_id: i64,
+}
+
 pub struct BrowserBackend {
     /// The loopback CDP port; 0 until a browser is attached.
     port: AtomicU16,
@@ -477,6 +489,7 @@ pub struct BrowserBackend {
     downloads: Mutex<Downloads>,
     world: String,
     last_context: Mutex<Option<(String, Ctx)>>,
+    element_scopes: Mutex<VecDeque<ElementScope>>,
     closed: AtomicBool,
 }
 
@@ -490,6 +503,7 @@ impl BrowserBackend {
             downloads: Mutex::new(Downloads::default()),
             world: format!("aad-control-{}", uuid::Uuid::new_v4()),
             last_context: Mutex::new(None),
+            element_scopes: Mutex::new(VecDeque::new()),
             closed: AtomicBool::new(false),
         }
     }
@@ -533,6 +547,7 @@ impl BrowserBackend {
         self.histories.lock().unwrap().clear();
         *self.browser.lock().unwrap() = None;
         *self.last_context.lock().unwrap() = None;
+        self.element_scopes.lock().unwrap().clear();
         self.port.store(port, Ordering::SeqCst);
     }
 
@@ -858,6 +873,10 @@ fn eval(client: &mut Client, context: &Ctx, expression: String) -> Result<Value>
         "Runtime.evaluate",
         json!({"expression":expression,"contextId":context.id,"returnByValue":true,"awaitPromise":false}),
     )?;
+    evaluated(raw)
+}
+
+fn evaluated(raw: Value) -> Result<Value> {
     if raw.get("exceptionDetails").is_some() {
         return Err(error(
             "CONTROL.STALE_TARGET",
@@ -1510,6 +1529,7 @@ impl Backend for BrowserBackend {
     fn close(&self) {
         self.closed.store(true, Ordering::SeqCst);
         self.port.store(0, Ordering::SeqCst);
+        self.element_scopes.lock().unwrap().clear();
         self.release_downloads();
         if let Ok(mut pages) = self.pages.try_lock() {
             self.clear_context(&mut pages, Instant::now() + Duration::from_millis(100));
@@ -1715,6 +1735,81 @@ impl Backend for BrowserBackend {
         }
         Ok(resources)
     }
+    fn observe_target_scope(
+        &self,
+        snapshot: &Value,
+        node: &Value,
+        max_nodes: usize,
+        timeout: Duration,
+    ) -> Result<Value> {
+        let deadline = Instant::now() + timeout;
+        let meta = &snapshot["metadata"];
+        let page_id = meta["page_id"].as_str().unwrap_or_default();
+        let frame_id = meta["frame_id"].as_str().unwrap_or_default();
+        let backend_node_id = self.with_page_state(page_id, timeout, |page| {
+            if let Some(dialog) = &page.dialog {
+                return Err(dialog_open(dialog));
+            }
+            let entry = locate(page, frame_id)?;
+            if entry.frame["loaderId"] != meta["loader_id"] {
+                return Err(error("CONTROL.STALE_TARGET", "browser document navigated"));
+            }
+            let context = Ctx {
+                session: entry.session,
+                id: meta["context_id"].as_i64().unwrap_or_default(),
+            };
+            let args = json!({"document_token":snapshot["document_token"],
+                "observation":snapshot["snapshot_id"], "node_id":node["node_id"]});
+            let element = run(
+                &mut page.client,
+                context.session.as_deref(),
+                "Runtime.evaluate",
+                json!({"expression":format!("globalThis.__aadControlV1.scope_element({args})"),
+                    "contextId":context.id, "returnByValue":false}),
+            )?;
+            let object = element["result"]["objectId"]
+                .as_str()
+                .filter(|_| element["result"]["subtype"] == "node")
+                .ok_or_else(|| {
+                    error("CONTROL.STALE_TARGET", "scope root was replaced or changed")
+                })?;
+            let described = run(
+                &mut page.client,
+                context.session.as_deref(),
+                "DOM.describeNode",
+                json!({"objectId":object}),
+            );
+            let _ = run(
+                &mut page.client,
+                context.session.as_deref(),
+                "Runtime.releaseObject",
+                json!({"objectId":object}),
+            );
+            described?["node"]["backendNodeId"]
+                .as_i64()
+                .ok_or_else(|| error("BROWSER.BAD_RESULT", "scope root has no DOM identity"))
+        })?;
+        let token = format!("{ELEMENT_SCOPE_PREFIX}{}", uuid::Uuid::new_v4());
+        {
+            let mut scopes = self.element_scopes.lock().unwrap();
+            scopes.push_back(ElementScope {
+                token: token.clone(),
+                page_id: page_id.into(),
+                frame_id: frame_id.into(),
+                loader_id: meta["loader_id"].clone(),
+                backend_node_id,
+            });
+            while scopes.len() > MAX_ELEMENT_SCOPES {
+                scopes.pop_front();
+            }
+        }
+        self.observe_scope(
+            &json!({"page_id":page_id, "frame_id":frame_id}),
+            &token,
+            max_nodes,
+            deadline.saturating_duration_since(Instant::now()),
+        )
+    }
     fn observe_scope(
         &self,
         selector: &Value,
@@ -1724,6 +1819,29 @@ impl Backend for BrowserBackend {
     ) -> Result<Value> {
         let mut selector = selector.clone();
         selector["scope_id"] = json!(scope);
+        if scope.starts_with(ELEMENT_SCOPE_PREFIX) {
+            let bound = self
+                .element_scopes
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|known| known.token == scope)
+                .cloned()
+                .ok_or_else(|| {
+                    error(
+                        "CONTROL.STALE_TARGET",
+                        "observed scope expired or is unknown",
+                    )
+                })?;
+            if selector["page_id"] != bound.page_id || selector["frame_id"] != bound.frame_id {
+                return Err(error(
+                    "CONTROL.STALE_TARGET",
+                    "scope belongs to another browser frame",
+                ));
+            }
+            selector["scope_backend_node_id"] = json!(bound.backend_node_id);
+            selector["scope_loader_id"] = bound.loader_id;
+        }
         self.observe(&selector, max_nodes, timeout)
     }
     fn observe(&self, selector: &Value, max_nodes: usize, timeout: Duration) -> Result<Value> {
@@ -1741,6 +1859,9 @@ impl Backend for BrowserBackend {
                 return Ok(dialog_snapshot(page_id,frame_id,main,dialog));
             }
             let entry=locate(page,frame_id)?;
+            if selector["scope_backend_node_id"].is_i64() && entry.frame["loaderId"]!=selector["scope_loader_id"] {
+                return Err(error("CONTROL.STALE_TARGET","scope document navigated"));
+            }
             let frame=entry.frame.clone();
             let session=entry.session.clone();
             let client=&mut page.client;
@@ -1751,7 +1872,19 @@ impl Backend for BrowserBackend {
             eval(client,&context,include_str!("browser.js").replace("/*AAD_NAMING*/",aad_cdp::NAMING).replace("NONCE",&nonce))?;
             let observation=uuid::Uuid::new_v4().to_string();
             *self.last_context.lock().unwrap()=Some((page_id.into(),context.clone()));
-            let mut result=eval(client,&context,format!("globalThis.__aadControlV1.observe({}, {}, {})",serde_json::to_string(&observation).unwrap(),max_nodes,selector["scope_id"]))?;
+            let mut result=if let Some(backend_node_id)=selector["scope_backend_node_id"].as_i64() {
+                let resolved=run(client,session.as_deref(),"DOM.resolveNode",json!({"backendNodeId":backend_node_id,"executionContextId":context.id}))
+                    .map_err(|e|error("CONTROL.STALE_TARGET","observed scope root is no longer available").with_cause(e))?;
+                let object=resolved["object"]["objectId"].as_str()
+                    .ok_or_else(||error("CONTROL.STALE_TARGET","observed scope root is no longer available"))?;
+                let captured=run(client,session.as_deref(),"Runtime.callFunctionOn",json!({"objectId":object,
+                    "functionDeclaration":"function(id,limit,scope){return globalThis.__aadControlV1.observe(id,limit,scope,this);}",
+                    "arguments":[{"value":observation},{"value":max_nodes},{"value":selector["scope_id"]}],"returnByValue":true}));
+                let _=run(client,session.as_deref(),"Runtime.releaseObject",json!({"objectId":object}));
+                evaluated(captured?)?
+            } else {
+                eval(client,&context,format!("globalThis.__aadControlV1.observe({}, {}, {})",serde_json::to_string(&observation).unwrap(),max_nodes,selector["scope_id"]))?
+            };
             if let Some(code) = result["error"].as_str() { return Err(error(code, "scope must identify one complete container in this frame")); }
             let main=entry.main();
             if !main {if let Some(nodes)=result["nodes"].as_array_mut(){for node in nodes {if let Some(actions)=node["actions"].as_array_mut(){actions.retain(|v|!MAIN_FRAME_ONLY.iter().any(|name|v==name));}}}}
@@ -3100,6 +3233,20 @@ fn keyboard(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn unknown_element_scope_tokens_never_fall_back_to_html_ids() {
+        let backend = BrowserBackend::new(0);
+        let failure = backend
+            .observe_scope(
+                &json!({"page_id":"page", "frame_id":"frame"}),
+                "aad:browser-scope:unknown",
+                100,
+                Duration::from_millis(50),
+            )
+            .unwrap_err();
+        assert_eq!(failure.code, "CONTROL.STALE_TARGET");
+    }
+
     #[test]
     fn close_revokes_port_while_page_connection_is_busy() {
         let backend = std::sync::Arc::new(BrowserBackend::new(9222));
