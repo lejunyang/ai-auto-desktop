@@ -176,6 +176,39 @@ Ctrl+V。目标真正来取时才算粘贴完成，之后恢复原剪贴板；1 
 实测（本机运行着 AutoHotkey、SnipDo、一个远程剪贴板同步和厂商 PC 管家）：Ctrl+V 只有约三分之一到达聚焦的 fixture Edit，
 `WM_PASTE` 每次都到；同步工具曾在恢复后把提供时的标记回写，现由回写检查修复。
 
+### 保密输入
+
+服务操作者通过 `--allow-input --allow-secret-input --secret-env login=APP_PASSWORD` 授予
+即时密码框写入，并将服务端环境变量绑定为公开名称 `login`。`aad mcp` 和 `aad control serve`
+使用同一组参数；远程客户端不能代替远端服务授予权限。不要把密码字面量写在命令行中。
+CLI 在启动线程与子进程之前一次性取出绑定，并移除对应环境变量，后续启动的应用、浏览器和
+helper 不继承它们。这不是进程初始环境内存的擦除，也不替代系统凭据库。
+
+先观察目标，在其 `states.protected` 为 true 且 `capabilities` 包含 `secret_input` 时，调用
+`act` / `control_act`，保留完整 target，action 为：
+
+```json
+{"type":"secret_input","secret_ref":"login"}
+```
+
+它替换整个字段，绑定值为空则清空。绑定名为 1–64 个 ASCII 字母、数字、下划线或连字符，
+以字母开头；值最多 1024 个 Unicode 字符，不允许 NUL 或换行，避免意外提交。
+动作仍需观察引用、fresh 状态检查及输入租约。默认未授权；普通 fill/type_text/paste/key
+不能写入受保护字段。输入本身不会按 Enter 提交表单。
+
+值只在服务端绑定及平台派发时使用，不进入客户端请求、正常结果、后端错误回传或剪贴板。
+成功结果仅确认已提交和已脱敏，不证明远端登录成功；调用者应观察非敏感状态来验收。
+`secret_input` 暂仅用于即时会话：Step、工作流、录制保存入口及原生 workflow provider
+均拒绝该动作，避免持久化明文或绕过绑定授权。系统凭据库和可恢复的保密工作流仍待实现。
+
+Linux 使用 AT-SPI EditableText，Windows 优先用 UIA ValuePattern、必要时使用经过焦点验证的
+键盘替换，macOS 使用可设置的安全 AXValue，Chromium 使用受保护表单字段的原生 value setter。
+不支持的控件会拒绝，不借助剪贴板或关闭系统保护。Windows/macOS 的实际效果 **[待真机验收]**；
+macOS 还需目标系统编译 Swift helper 并验证 AX/TCC 权限。
+
+网页收到值后仍可由自身脚本复制或发送它。已输入元素的后续观察和截图保护覆盖已知 DOM 身份，
+不等于能追踪页面任意派生文本；只应对用户信任的目标页面使用绑定。
+
 **启动程序。** 不经 shell、`start` 或文件/URL 关联：可执行文件以 argv 直接启动，标准流与服务（可能承载协议本身）分离，
 Windows 上控制台程序得到自己的控制台。只接受 `.exe`（`.bat/.cmd/.lnk` 等会经 cmd 或关联）；shell、脚本宿主和关联启动器
 （cmd、powershell、pwsh、explorer、rundll32、mshta、wscript、sh、bash、xdg-open、open……）即使在白名单里也拒绝，因为它们的参数
