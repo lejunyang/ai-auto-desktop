@@ -5,9 +5,9 @@
 //! accessibility D-Bus with pure-Rust `zbus`; no Python worker is involved.
 
 use aad_core::AutomationError;
-use aad_plugin::{manifest, CapabilityManifest};
+use aad_plugin::{CapabilityManifest, manifest};
 use aad_runtime::{ArtifactStore, CancellationToken, Provider};
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -84,6 +84,21 @@ pub struct WindowAnchor {
     pub native: NativeRef,
     pub bounds: Bounds,
 }
+
+/// Private native path: source, intermediate anchors, then destination. Every
+/// coordinate was derived from one revalidated observed surface's fractions.
+pub struct DragPathRequest<'a> {
+    pub target: &'a NativeRef,
+    pub window: Option<&'a WindowAnchor>,
+    pub points: &'a [(i32, i32)],
+    pub button: u8,
+    pub modifiers: &'a [String],
+    pub hold_ms: Option<u16>,
+    pub process_id: u32,
+    pub deadline: Instant,
+}
+
+pub type DragPathValidation = Arc<dyn Fn(usize) -> Result<(), AutomationError> + Send + Sync>;
 
 #[derive(Clone, Debug)]
 pub struct BackendNode {
@@ -310,6 +325,16 @@ pub trait AtspiBackend: Send + Sync {
             ));
         }
         self.drag(target, from, to, button, process_id, deadline)
+    }
+    fn drag_path(
+        &self,
+        _request: DragPathRequest<'_>,
+        _validate: DragPathValidation,
+    ) -> Result<Value, AutomationError> {
+        Err(driver_error(
+            "DRIVER.ACTION_UNSUPPORTED",
+            "anchored drag paths are unavailable",
+        ))
     }
     fn key_chord(
         &self,
@@ -1101,11 +1126,17 @@ impl AtspiProvider {
                 "to_fraction",
                 "modifiers",
                 "hold_ms",
+                "path",
             ]),
             "key_chord" => allowed.extend(["keys", "hold_ms"]),
             _ => {}
         }
         only_keys(args, &allowed)?;
+        let path = if action == "drag" {
+            parse_drag_path(args)?
+        } else {
+            Vec::new()
+        };
         let gesture = if action == "pointer_gesture" {
             Some(parse_gesture(args)?)
         } else {
@@ -1222,6 +1253,81 @@ impl AtspiProvider {
         };
         remaining(deadline, false)?;
         let window = input_window(&fresh, &fresh_id);
+        let path_plan = if path.is_empty() {
+            None
+        } else {
+            let bounds = parse_bounds(node.get("bounds"))?;
+            let mut points = vec![pointer.expect("drag source")];
+            for fraction in path {
+                let point = point_in(bounds, Some(fraction))?;
+                self.validate_point(&fresh, &fresh_id, point, deadline)?;
+                points.push(point);
+            }
+            points.push(destination.expect("drag destination"));
+            let original = drag_observation.clone().expect("drag observation");
+            let original_args = args.clone();
+            let expected_window = window.clone();
+            // A late, read-only capture must not publish a new current snapshot
+            // after the action returned or another observation was admitted.
+            let validator = Self {
+                backend: self.backend.clone(),
+                manifest: self.manifest.clone(),
+                generation: self.generation.clone(),
+                state: Arc::new(Mutex::new(DriverState::default())),
+            };
+            let validation_points = points.clone();
+            let validate: DragPathValidation = Arc::new(move |index| {
+                remaining(deadline, false)?;
+                let now = validator.capture_scoped(
+                    &original.application_selector,
+                    original.max_depth,
+                    original.max_nodes,
+                    original.scope.clone(),
+                    deadline,
+                )?;
+                let (id, node, _) =
+                    Self::revalidate_target(&original_args, &original, &now, deadline)?;
+                if parse_bounds(node.get("bounds"))? != bounds
+                    || node["states"]["protected"] == true
+                    || node["states"]["enabled"] == false
+                    || node["states"]["sensitive"] == false
+                    || !node["actions"]
+                        .as_array()
+                        .is_some_and(|actions| actions.iter().any(|a| a == "drag"))
+                {
+                    return Err(stale("drag surface geometry or input state changed"));
+                }
+                let current_window = input_window(&now, &id);
+                if expected_window.as_ref().map(|w| (&w.native, w.bounds))
+                    != current_window.as_ref().map(|w| (&w.native, w.bounds))
+                {
+                    return Err(stale("drag window identity or geometry changed"));
+                }
+                let checked = if index == 0 {
+                    validation_points.as_slice()
+                } else if index < validation_points.len() {
+                    &validation_points[index - 1..=index]
+                } else if index == validation_points.len() {
+                    &validation_points[index - 1..]
+                } else {
+                    return Err(invalid("unexpected drag validation segment"));
+                };
+                // A narrow action scope may omit a covering sibling widget.
+                // Read the containing window solely to disprove occlusion; it
+                // never replaces the action's authorized membership or state.
+                let expanded = validator.path_occlusion_record(&now, &id, deadline)?;
+                let (visibility, visibility_id) = expanded
+                    .as_ref()
+                    .map(|(record, id)| (record, id.as_str()))
+                    .unwrap_or((&now, id.as_str()));
+                for point in checked {
+                    validator.validate_path_point(visibility, visibility_id, *point, deadline)?;
+                }
+                remaining(deadline, false)?;
+                Ok(())
+            });
+            Some((points, validate))
+        };
         let mut dispatched = false;
         let result = (|| {
             dispatched = true;
@@ -1275,6 +1381,21 @@ impl AtspiProvider {
                             return Err(invalid("drag.button must be left, middle or right"));
                         }
                     };
+                    if let Some((points, validate)) = path_plan {
+                        return self.backend.drag_path(
+                            DragPathRequest {
+                                target: &native,
+                                window: window.as_ref(),
+                                points: &points,
+                                button,
+                                modifiers: &modifiers,
+                                hold_ms,
+                                process_id: process,
+                                deadline,
+                            },
+                            validate,
+                        );
+                    }
                     self.backend.drag_modified(
                         &native,
                         window.as_ref(),
@@ -1499,6 +1620,124 @@ impl AtspiProvider {
         provenance.insert("node_id".into(), json!(fresh_id));
         provenance.insert("application_process_id".into(), json!(process));
         Ok((png, provenance))
+    }
+
+    fn path_occlusion_record(
+        &self,
+        record: &Record,
+        node_id: &str,
+        deadline: Instant,
+    ) -> Result<Option<(Record, String)>, AutomationError> {
+        let Some(scope) = &record.scope else {
+            return Ok(None);
+        };
+        let window = input_window(record, node_id)
+            .ok_or_else(|| stale("scoped drag has no observed containing window"))?;
+        if scope.root == window.native {
+            return Ok(None);
+        }
+        let window_id = record
+            .handles
+            .iter()
+            .find_map(|(id, native)| (native == &window.native).then_some(id))
+            .ok_or_else(|| stale("drag window was not observed"))?;
+        let visibility = self.capture_scoped(
+            &record.application_selector,
+            MAX_DEPTH,
+            MAX_NODES,
+            Some(Scope {
+                id: uuid::Uuid::new_v4().simple().to_string(),
+                root: window.native.clone(),
+                fingerprint: record.fingerprints[window_id].clone(),
+                application: record.public["application"].clone(),
+            }),
+            deadline,
+        )?;
+        if visibility.public["truncated"] == true {
+            return Err(driver_error(
+                "DRIVER.SNAPSHOT_TRUNCATED",
+                "drag occlusion window capture is incomplete",
+            ));
+        }
+        let matching = visibility
+            .handles
+            .iter()
+            .filter_map(|(id, native)| (native == &record.handles[node_id]).then_some(id.clone()))
+            .collect::<Vec<_>>();
+        let [id] = matching.as_slice() else {
+            return Err(stale("drag surface identity changed during window capture"));
+        };
+        let node = visibility.public["nodes"]
+            .as_array()
+            .expect("normalized nodes")
+            .iter()
+            .find(|node| node["node_id"] == *id)
+            .expect("normalized handle");
+        let original_node = record.public["nodes"]
+            .as_array()
+            .expect("normalized nodes")
+            .iter()
+            .find(|node| node["node_id"] == node_id)
+            .expect("normalized handle");
+        let observed_window = input_window(&visibility, id);
+        if visibility.fingerprints[id] != record.fingerprints[node_id]
+            || parse_bounds(node.get("bounds"))? != parse_bounds(original_node.get("bounds"))?
+            || node["states"]["protected"] == true
+            || node["states"]["enabled"] == false
+            || node["states"]["sensitive"] == false
+            || !node["actions"]
+                .as_array()
+                .is_some_and(|actions| actions.iter().any(|a| a == "drag"))
+            || observed_window.as_ref().map(|w| (&w.native, w.bounds))
+                != Some((&window.native, window.bounds))
+        {
+            return Err(stale(
+                "drag surface or window changed during occlusion capture",
+            ));
+        }
+        Ok(Some((visibility, id.clone())))
+    }
+
+    fn validate_path_point(
+        &self,
+        record: &Record,
+        node_id: &str,
+        point: (i32, i32),
+        deadline: Instant,
+    ) -> Result<(), AutomationError> {
+        self.validate_point(record, node_id, point, deadline)?;
+        // Some toolkits keep reporting the mouse-grab owner after a sibling
+        // widget covers it. A fresh tree that exposes another visible branch
+        // at this point cannot establish unobstructed path input. Its stacking
+        // order is not assumed; this deliberately rejects uncertain overlaps.
+        let allowed = descendants(record, node_id);
+        let ancestors = ancestor_chain(record, node_id);
+        for candidate in record.public["nodes"].as_array().expect("normalized nodes") {
+            let id = candidate["node_id"].as_str().expect("normalized node id");
+            if allowed.contains(id)
+                || ancestors.iter().any(|ancestor| ancestor == id)
+                || candidate["states"]["visible"] == false
+                || candidate["states"]["showing"] == false
+            {
+                continue;
+            }
+            let Ok(bounds) = parse_bounds(candidate.get("bounds")) else {
+                continue;
+            };
+            let (x, y) = (i64::from(point.0), i64::from(point.1));
+            if x >= i64::from(bounds.x)
+                && y >= i64::from(bounds.y)
+                && x < i64::from(bounds.x) + i64::from(bounds.width)
+                && y < i64::from(bounds.y) + i64::from(bounds.height)
+            {
+                return Err(driver_error(
+                    "DRIVER.POINT_NOT_PROVEN",
+                    "drag path overlaps another visible branch",
+                )
+                .with_detail("overlapping_node_id", json!(id)));
+            }
+        }
+        Ok(())
     }
 
     fn validate_point(
@@ -2342,6 +2581,47 @@ fn parse_modifiers(value: Option<&Value>) -> Result<Vec<String>, AutomationError
     Ok(result)
 }
 
+fn parse_drag_path(args: &Map<String, Value>) -> Result<Vec<(f64, f64)>, AutomationError> {
+    let Some(value) = args.get("path") else {
+        return Ok(Vec::new());
+    };
+    let anchors = value
+        .as_array()
+        .ok_or_else(|| invalid("path must be an array"))?;
+    if anchors.len() > 32 {
+        return Err(invalid("path permits at most 32 anchors"));
+    }
+    if anchors.is_empty() {
+        return Ok(Vec::new());
+    }
+    if args.get("target") != args.get("to")
+        || parse_fraction(args.get("fraction"))?.is_none()
+        || parse_fraction(args.get("to_fraction"))?.is_none()
+    {
+        return Err(invalid(
+            "drag paths require one observed surface and explicit endpoint fractions",
+        ));
+    }
+    anchors
+        .iter()
+        .map(|anchor| {
+            let anchor = anchor
+                .as_object()
+                .ok_or_else(|| invalid("path anchor must be an object"))?;
+            only_keys(anchor, &["target", "locator", "fraction"])?;
+            if anchor.get("target") != args.get("target")
+                || anchor
+                    .get("locator")
+                    .is_some_and(|locator| Some(locator) != args.get("locator"))
+            {
+                return Err(invalid("path anchor must name the same observed surface"));
+            }
+            parse_fraction(anchor.get("fraction"))?
+                .ok_or_else(|| invalid("path anchor requires an explicit fraction"))
+        })
+        .collect()
+}
+
 fn parse_fraction(value: Option<&Value>) -> Result<Option<(f64, f64)>, AutomationError> {
     match value {
         None | Some(Value::Null) => Ok(None),
@@ -2778,6 +3058,12 @@ fn manifest_document() -> Value {
     for name in ["pointer_gesture", "drag"] {
         actions[name]["input_schema"]["properties"]["modifiers"] = json!({"type": "array", "maxItems": 4, "uniqueItems": true, "items": {"enum": ["ctrl", "shift", "alt", "meta"]}});
     }
+    actions["drag"]["input_schema"]["properties"]["path"] = json!({
+        "type": "array", "maxItems": 32,
+        "items": {"type": "object", "required": ["target", "fraction"],
+            "properties": {"target": target_schema(), "locator": locator_schema(), "fraction": fraction},
+            "additionalProperties": false}
+    });
     for name in ["pointer_gesture", "drag", "key_chord"] {
         actions[name]["input_schema"]["properties"]["hold_ms"] =
             json!({"type": "integer", "minimum": 1, "maximum": 5000});
@@ -2941,6 +3227,9 @@ mod tests {
         secret_loses_protection: bool,
         secret_failure: bool,
         hit_chain: u8,
+        path_supported: bool,
+        path_changed_after: usize,
+        path_window_visibility: u8,
         /// Containers above the target, which is then `n{depth}`.
         depth: usize,
     }
@@ -2987,7 +3276,13 @@ mod tests {
                     ("editable".into(), Some(self.secret_editable)),
                 ]),
                 bounds: Some(Bounds {
-                    x: 10,
+                    x: if self.path_changed_after > 0
+                        && self.captures.load(Ordering::SeqCst) >= self.path_changed_after
+                    {
+                        11
+                    } else {
+                        10
+                    },
                     y: 20,
                     width: 40,
                     height: 20,
@@ -3083,6 +3378,9 @@ mod tests {
                         node.bounds = None;
                     }
                     node.role = "filler".into();
+                    if self.path_window_visibility != 0 {
+                        node.role = if level == 0 { "application" } else { "frame" }.into();
+                    }
                     node.name = None;
                     node.description = None;
                     node.attributes.clear();
@@ -3123,6 +3421,20 @@ mod tests {
             _deadline: Instant,
         ) -> Result<BackendSnapshot, AutomationError> {
             self.scoped_captures.fetch_add(1, Ordering::SeqCst);
+            if self.path_window_visibility != 0 {
+                let mut snapshot = self.capture(_application, _max_depth, _max_nodes, _deadline)?;
+                if root.object_path == "/chain/1" {
+                    if self.path_window_visibility == 2 {
+                        let mut overlay = self.node("/window/overlay");
+                        overlay.name = Some("Disabled covering sibling".into());
+                        overlay.parent_index = Some(1);
+                        overlay.states.insert("enabled".into(), Some(false));
+                        snapshot.nodes.push(overlay);
+                    }
+                    snapshot.truncated = self.path_window_visibility == 3;
+                }
+                return Ok(snapshot);
+            }
             let mut node = self.node(&root.object_path);
             if self.changed {
                 node.name = Some("Changed".into());
@@ -3339,6 +3651,24 @@ mod tests {
         ) -> Result<Value, AutomationError> {
             self.writes.fetch_add(1, Ordering::SeqCst);
             Ok(json!({"from": from, "to": to}))
+        }
+        fn drag_path(
+            &self,
+            request: DragPathRequest<'_>,
+            validate: DragPathValidation,
+        ) -> Result<Value, AutomationError> {
+            if !self.path_supported {
+                return Err(driver_error(
+                    "DRIVER.ACTION_UNSUPPORTED",
+                    "path unavailable",
+                ));
+            }
+            validate(0)?;
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            for index in 1..=request.points.len() {
+                validate(index).map_err(|e| e.with_effect("unknown"))?;
+            }
+            Ok(json!({"points": request.points, "validated": request.points.len() + 1}))
         }
         fn start_recording(
             &self,
@@ -3800,6 +4130,161 @@ mod tests {
             1,
             "stale destination must not dispatch another drag"
         );
+    }
+
+    fn path_args(observed: &Value) -> Value {
+        let target = json!({"snapshot_id": observed["snapshot_id"], "revision": observed["revision"], "node_id": "n0"});
+        json!({"target": target, "locator": locator(), "to": target, "to_locator": locator(),
+            "fraction": {"fx": 0.1, "fy": 0.1}, "to_fraction": {"fx": 0.9, "fy": 0.9},
+            "path": [{"target": target, "fraction": {"fx": 0.8, "fy": 0.2}},
+                     {"target": target, "fraction": {"fx": 0.2, "fy": 0.8}}]})
+    }
+
+    #[test]
+    fn drag_path_freshly_captures_each_segment_without_publishing_worker_observations() {
+        let backend = Arc::new(FakeBackend {
+            path_supported: true,
+            ..Default::default()
+        });
+        let provider = AtspiProvider::new(backend.clone()).unwrap();
+        let observed = take_snapshot(&provider);
+        let result = provider
+            .invoke(
+                "desktop.linux_atspi.drag@1",
+                path_args(&observed),
+                Some(Duration::from_secs(2)),
+            )
+            .unwrap();
+        assert_eq!(
+            result["backend_result"]["points"],
+            json!([[14, 22], [42, 24], [18, 36], [46, 38]])
+        );
+        assert_eq!(result["backend_result"]["validated"], 5);
+        assert_eq!(backend.captures.load(Ordering::SeqCst), 7);
+        let state = provider.state.lock().unwrap();
+        assert_eq!(
+            state.revision, 2,
+            "worker captures must not replace the provider's current state"
+        );
+        assert!(!state.current.as_ref().unwrap().valid);
+    }
+
+    #[test]
+    fn drag_path_rejects_bad_anchors_before_capture_and_changed_geometry_before_next_motion() {
+        for variant in ["foreign", "missing_fraction", "overflow", "destination"] {
+            let backend = Arc::new(FakeBackend {
+                path_supported: true,
+                ..Default::default()
+            });
+            let provider = AtspiProvider::new(backend.clone()).unwrap();
+            let observed = take_snapshot(&provider);
+            let mut args = path_args(&observed);
+            match variant {
+                "foreign" => args["path"][0]["target"]["revision"] = json!(0),
+                "missing_fraction" => {
+                    args.as_object_mut().unwrap().remove("fraction");
+                }
+                "overflow" => args["path"] = json!(vec![args["path"][0].clone(); 33]),
+                _ => args["to"]["node_id"] = json!("n1"),
+            }
+            assert_eq!(
+                provider
+                    .invoke(
+                        "desktop.linux_atspi.drag@1",
+                        args,
+                        Some(Duration::from_secs(2))
+                    )
+                    .unwrap_err()
+                    .code,
+                "DRIVER.INVALID_REQUEST"
+            );
+            assert_eq!(backend.captures.load(Ordering::SeqCst), 1);
+            assert_eq!(backend.writes.load(Ordering::SeqCst), 0);
+        }
+        for (supported, changes_at, writes, code) in [
+            (false, 0, 0, "DRIVER.ACTION_UNSUPPORTED"),
+            (true, 3, 0, "DRIVER.STALE_SNAPSHOT"),
+            (true, 4, 1, "DRIVER.STALE_SNAPSHOT"),
+        ] {
+            let backend = Arc::new(FakeBackend {
+                path_supported: supported,
+                path_changed_after: changes_at,
+                ..Default::default()
+            });
+            let provider = AtspiProvider::new(backend.clone()).unwrap();
+            let observed = take_snapshot(&provider);
+            let error = provider
+                .invoke(
+                    "desktop.linux_atspi.drag@1",
+                    path_args(&observed),
+                    Some(Duration::from_secs(2)),
+                )
+                .unwrap_err();
+            assert_eq!(error.code, code);
+            assert_eq!(backend.writes.load(Ordering::SeqCst), writes);
+            assert_eq!(
+                error.effect,
+                if writes == 0 {
+                    "not_applied"
+                } else {
+                    "unknown"
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn scoped_drag_reads_the_complete_window_for_occlusion_without_expanding_authority() {
+        for mode in [1, 2, 3] {
+            let backend = Arc::new(FakeBackend {
+                depth: 2,
+                path_supported: true,
+                path_window_visibility: mode,
+                ..Default::default()
+            });
+            let provider = AtspiProvider::new(backend.clone()).unwrap();
+            let initial = take_snapshot(&provider);
+            let scoped = provider.invoke("desktop.linux_atspi.snapshot_scope@1", json!({
+                "target":{"snapshot_id":initial["snapshot_id"],"revision":initial["revision"],"node_id":"n2"},
+                "locator":locator()
+            }), Some(Duration::from_secs(2))).unwrap();
+            let mut args = path_args(&scoped);
+            args["target"]["node_id"] = json!("n2");
+            args["to"]["node_id"] = json!("n2");
+            for anchor in args["path"].as_array_mut().unwrap() {
+                anchor["target"]["node_id"] = json!("n2");
+            }
+            let result = provider.invoke(
+                "desktop.linux_atspi.drag@1",
+                args,
+                Some(Duration::from_secs(2)),
+            );
+            if mode == 1 {
+                result.unwrap();
+                assert_eq!(backend.writes.load(Ordering::SeqCst), 1);
+            } else {
+                let error = result.unwrap_err();
+                assert_eq!(
+                    error.code,
+                    if mode == 2 {
+                        "DRIVER.POINT_NOT_PROVEN"
+                    } else {
+                        "DRIVER.SNAPSHOT_TRUNCATED"
+                    }
+                );
+                assert_eq!(error.effect, "not_applied");
+                assert_eq!(backend.writes.load(Ordering::SeqCst), 0);
+            }
+            let state = provider.state.lock().unwrap();
+            let current = state.current.as_ref().unwrap();
+            assert_eq!(state.revision, 3, "window captures must remain private");
+            assert_eq!(
+                current.scope.as_ref().unwrap().root.object_path,
+                "/org/a11y/save"
+            );
+            assert_eq!(current.members, BTreeSet::from(["n2".to_string()]));
+            assert!(backend.scoped_captures.load(Ordering::SeqCst) >= 4);
+        }
     }
 
     #[test]

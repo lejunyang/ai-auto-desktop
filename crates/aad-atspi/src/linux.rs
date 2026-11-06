@@ -20,6 +20,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use zbus::blocking::{connection, Connection, Proxy};
 
+mod drag_path;
 mod focus_discovery;
 use focus_discovery::FocusDiscovery;
 mod window_focus;
@@ -147,6 +148,7 @@ pub struct LinuxBackend {
     accessibility_address: String,
     focus_discovery: Arc<Mutex<Option<FocusDiscovery>>>,
     cancellation: Option<super::CancellationToken>,
+    path_validation_busy: Arc<AtomicBool>,
 }
 
 impl LinuxBackend {
@@ -178,6 +180,7 @@ impl LinuxBackend {
             accessibility_address: bus,
             focus_discovery: Arc::new(Mutex::new(None)),
             cancellation: None,
+            path_validation_busy: Arc::new(AtomicBool::new(false)),
         };
         backend.children(&Self::root_ref(), Instant::now() + Duration::from_secs(3))?;
         Ok(backend)
@@ -1453,6 +1456,14 @@ impl AtspiBackend for LinuxBackend {
         Ok(
             json!({"native_interface": "XTEST", "input": input, "modifiers": modifiers, "synthetic_input": true, "from": {"x": from.0, "y": from.1}, "to": {"x": to.0, "y": to.1}}),
         )
+    }
+
+    fn drag_path(
+        &self,
+        request: super::DragPathRequest<'_>,
+        validate: super::DragPathValidation,
+    ) -> Result<Value, AutomationError> {
+        self.run_drag_path(request, validate)
     }
 
     fn key_chord(
