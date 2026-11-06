@@ -934,12 +934,17 @@ fn desktop_hold(
         return Ok(None);
     }
     let through_session = tools::steps_through_session(&json!({"name": arguments["name"]}))?;
+    if through_session {
+        // Saved control steps already serialize and acquire their own input
+        // resources through Session, including isolated headless instances.
+        return Ok(None);
+    }
     let lease = session
         .input_lease("desktop-input")
         .map_err(|error| serde_json::to_string(&error.to_json()).unwrap_or_default())?;
     Ok(Some(DesktopHold {
         _lease: lease,
-        gate: (!through_session).then(|| session.gate()),
+        gate: Some(session.gate()),
     }))
 }
 
@@ -1104,6 +1109,35 @@ mod tests {
         workflow["variables"] = json!({});
         workflow["outputs"] = json!({});
         workflow
+    }
+
+    #[test]
+    fn saved_control_steps_leave_lease_ownership_to_the_session() {
+        let store = ScratchStore::new("control-resource-leases");
+        let steps: Vec<aad_control::steps::Step> = serde_json::from_value(json!([{
+            "id":"check", "app":{"provider":"browser.cdp"},
+            "locator":{"name":"Save"}, "check":{"present":true,"within_ms":1000}
+        }]))
+        .unwrap();
+        store.save(
+            "control",
+            aad_control::steps::workflow("control", &steps).unwrap(),
+        );
+        store.save("native", action_workflow());
+        let session = stub_session();
+        session.close();
+        // A wrapper must not claim a resource on a Session's behalf. The
+        // actual control operation will apply its own closed-session checks.
+        let args = json!({"name":"control"});
+        let (_, descriptor) = tools::compiled_workflow(&args).unwrap();
+        assert!(desktop_hold(&session, &descriptor, &args)
+            .unwrap()
+            .is_none());
+        // Direct-driver workflows still require the wrapper's desktop lease.
+        let args = json!({"name":"native"});
+        let (_, descriptor) = tools::compiled_workflow(&args).unwrap();
+        let failure = desktop_hold(&session, &descriptor, &args).err().unwrap();
+        assert_eq!(parse(&failure)["code"], "CONTROL.SESSION_CLOSED");
     }
 
     #[test]
