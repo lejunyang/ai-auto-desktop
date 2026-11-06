@@ -18,6 +18,7 @@ await mkdir(out,{recursive:true});
 const profile=await mkdtemp(join(tmpdir(),'aad-bidi-e2e-'));
 let browserState={},command='',firefox,control,stderr='',aadStderr='',sequence=0,session;
 const pending=new Map(),transcript=[],results=[];
+const navigationStates=new Map();
 const html=`<!doctype html><meta charset=utf-8><title>AAD Firefox fixture</title>
 <input id=editor aria-label=Editor><button id=save aria-label=Save>Save</button>
 <button id=hover aria-label=Hover>Hover</button>
@@ -53,9 +54,14 @@ checked:document.querySelector('#agree').checked,scroll:document.querySelector('
 }catch{}setTimeout(tick,10)}tick();
 </script>`;
 const server=createServer(async(req,res)=>{
+  if(req.url==='/nav-state'){let bytes='';for await(const b of req)bytes+=b;const state=JSON.parse(bytes);navigationStates.set(state.path,state);res.end('ok');return}
   if(req.url==='/observed'){let bytes='';for await(const b of req)bytes+=b;browserState=JSON.parse(bytes);res.end('ok');return}
   if(req.url==='/command'){const next=command;command='';res.end(next);return}
   res.writeHead(200,{'Content-Type':'text/html; charset=utf-8'});
+  if(req.url.startsWith('/nav-')){res.end(`<!doctype html><title>Navigation fixture</title><button>Navigation</button><script>
+const token=crypto.randomUUID();async function report(){try{await fetch('/nav-state',{method:'POST',body:JSON.stringify({path:location.pathname,token,visibility:document.visibilityState,focused:document.hasFocus()})})}catch{}setTimeout(report,20)}report();
+if(location.pathname==='/nav-guard')document.addEventListener('visibilitychange',()=>{if(document.hidden){const body=document.createElement('body');body.innerHTML='<button>Replaced</button>';document.body.replaceWith(body)}});
+</script>`);return}
   res.end(req.url==='/frame'?'<title>child</title><input type=password value=synthetic-frame-private><button>Child</button>':req.url==='/next'?'<title>Next</title><button>Next</button>':html);
 });
 server.listen(0,'127.0.0.1');await once(server,'listening');
@@ -72,6 +78,7 @@ const observe=resource_id=>call({method:'observe',resource_id,max_nodes:500,view
 const find=(o,locator)=>call({method:'find',observation_id:o.observation_id,locator,expect:'one'}).then(r=>r.target);
 const findName=(o,name)=>find(o,{name});
 async function perform(rid,name,action){const o=await observe(rid),target=await findName(o,name);return call({method:'act',target,action})}
+async function pageAction(rid,action){const o=await observe(rid),target=await find(o,{role:'document'});return call({method:'act',target,action})}
 async function mutate(value){command=value;await wait(()=>browserState.lastCommand===value,value)}
 function record(name){results.push(name);console.log('PASS '+name)}
 try{
@@ -151,6 +158,44 @@ try{
   o=await observe(rid);const oldSave=await findName(o,'Save');command='navigate';await delay(300);
   assert.equal((await send({method:'act',target:oldSave,action:{type:'click'}}).promise).error?.code,'CONTROL.STALE_TARGET');
   record('new document cannot reuse old isolated realm or observation');
+  await pageAction(rid,{type:'navigate',url:url+'nav-first'});
+  await wait(()=>navigationStates.has('/nav-first'),'navigation destination independently loaded');
+  const beforeReload=navigationStates.get('/nav-first').token;
+  await pageAction(rid,{type:'reload'});
+  await wait(()=>navigationStates.get('/nav-first')?.token!==beforeReload,'reload created new document');
+  record('anchored navigation and reload independently report new document');
+  for(const action of [{type:'navigate',url:'file:///ungranted/aad-fixture.html'},{type:'open_tab',url:'file:///ungranted/aad-fixture.html'}]){
+    o=await observe(rid);const document=await find(o,{role:'document'});
+    assert.equal((await send({method:'act',target:document,action}).promise).error?.code,'POLICY.DENIED');
+  }
+  const unchanged=(await call({method:'targets'})).resources.filter(r=>r.metadata.main_frame);
+  assert.equal(unchanged.length,1);assert.equal(unchanged[0].metadata.url,url+'nav-first');
+  o=await observe(rid);const ordinaryButton=await find(o,{role:'button',name:'Navigation'});
+  assert.equal((await send({method:'act',target:ordinaryButton,action:{type:'reload'}}).promise).error?.code,'CONTROL.ACTION_UNSUPPORTED');
+  record('ungranted destinations and non-document navigation anchors rejected');
+  const opened=await pageAction(rid,{type:'open_tab',url:url+'nav-second'});
+  const openedId=opened.backend_result.page_id;
+  await wait(()=>navigationStates.has('/nav-second'),'new tab destination');
+  const tabs=(await call({method:'targets'})).resources;
+  const second=tabs.find(r=>r.metadata.context===openedId);assert.ok(second);assert.notEqual(second.resource_id,rid);
+  await wait(()=>navigationStates.get('/nav-first').visibility==='hidden'&&navigationStates.get('/nav-second').visibility==='visible','new tab foreground');
+  await pageAction(rid,{type:'activate_page'});
+  await wait(()=>navigationStates.get('/nav-first').visibility==='visible'&&navigationStates.get('/nav-second').visibility==='hidden','observed page activated');
+  record('new tab loaded and explicit activation verified through page visibility');
+  await pageAction(second.resource_id,{type:'close_page'});
+  assert.ok(!(await call({method:'targets'})).resources.some(r=>r.metadata.context===openedId));
+  assert.equal((await observe(rid)).metadata.url,url+'nav-first');
+  record('observed tab closed while source document remains available');
+  await pageAction(rid,{type:'navigate',url:url+'nav-guard'});
+  o=await observe(rid);const guard=await find(o,{role:'document'});
+  const interruptedOpen=await send({method:'act',target:guard,action:{type:'open_tab',url:url+'nav-must-not-load'}}).promise;
+  assert.equal(interruptedOpen.error?.code,'CONTROL.STALE_TARGET');
+  const createdId=interruptedOpen.error.details.created_page_id;assert.ok(createdId);
+  assert.ok(!navigationStates.has('/nav-must-not-load'));
+  const partial=(await call({method:'targets'})).resources.find(r=>r.metadata.context===createdId);
+  assert.ok(partial);assert.equal(partial.metadata.url,'about:blank');
+  await pageAction(partial.resource_id,{type:'close_page'});
+  record('tab creation rechecks changed source before destination navigation and reports partial effect');
 }catch(error){results.push({failure:String(error),browserState});console.error(error);process.exitCode=1}
 finally{
   if(control){try{await call({method:'close'})}catch{}control.stdin.end();await Promise.race([once(control,'exit'),delay(3000)]);if(control.exitCode===null)control.kill('SIGKILL')}
