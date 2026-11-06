@@ -416,6 +416,12 @@ bool PhysicalSymbol(XkbDescPtr map, KeyCode code, unsigned group, unsigned modif
                                &consumed, &actual) && actual == expected;
 }
 
+bool PhysicalShift(XkbDescPtr map, KeyCode code) {
+    return map && map->map && map->map->modmap &&
+           code >= map->min_key_code && code <= map->max_key_code &&
+           map->map->modmap[code] == ShiftMask;
+}
+
 // Explicit physical typing lets the target's existing IME compose keystrokes.
 // It never installs Unicode mappings or changes the selected input method.
 int RunPhysicalText(Display *display, const std::vector<std::uint32_t> &codepoints,
@@ -452,7 +458,7 @@ int RunPhysicalText(Display *display, const std::vector<std::uint32_t> &codepoin
     }
     KeyCode shift = 0;
     for (int code = initial_map.value->min_key_code; code <= initial_map.value->max_key_code; ++code) {
-        if (initial_map.value->map->modmap[code] != ShiftMask) continue;
+        if (!PhysicalShift(initial_map.value, static_cast<KeyCode>(code))) continue;
         unsigned consumed = 0;
         KeySym symbol = NoSymbol;
         if (XkbTranslateKeyCode(initial_map.value, static_cast<KeyCode>(code),
@@ -504,8 +510,7 @@ int RunPhysicalText(Display *display, const std::vector<std::uint32_t> &codepoin
                             state.locked_mods | (stroke.shift ? ShiftMask : 0), stroke.symbol)) {
             return "keyboard_mapping_changed";
         }
-        if (stroke.shift && (!current.value || !current.value->map ||
-                            current.value->map->modmap[shift] != ShiftMask)) {
+        if (stroke.shift && !PhysicalShift(current.value, shift)) {
             return "keyboard_mapping_changed";
         }
         if (g_x_error) return "x11_error";
