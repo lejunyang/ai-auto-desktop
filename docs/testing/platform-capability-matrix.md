@@ -11,7 +11,7 @@
 | Chromium | 真实独立浏览器回归覆盖 DOM、frames、scope、Canvas、修饰键、敏感输入与按实例输入租约 | 有界按住/路径、closed shadow、页面快捷键与浏览器自身界面；非 Chromium 不能套用这些结论 |
 | Windows | UIA、SendInput、修饰键与专用保密输入有实现；目标 Windows cfg check/clippy 通过 | **[待真机验收]** Windows 交互桌面，Win32/WPF/Chromium，各种 DPI 与多屏，中文 IME，取消或超时后的键鼠释放，密码字段实际替换/清空 |
 | macOS | AX 与 Swift helper 有实现；同一 fresh snapshot 复核拖拽两端；Rust macOS cfg check 及宿主逻辑测试通过 | **[待真机验收]** macOS SDK/Swift helper 构建、辅助功能与屏幕录制权限、原生/Chromium 应用、拖拽和输入效果、Secure Input 条件；Rust cfg 检查不代表 Swift 已编译 |
-| GNOME/X11、XFCE/X11 | X11 输入实现正在移除桌面品牌限制，保留真实会话和窗口身份检查 | **[待真机验收]** GNOME/XFCE 窗口管理器、GTK 控件、剪贴板管理器、焦点与窗口动作；Xvfb 下更换环境标签只验证门禁和协议兼容性 |
+| GNOME/X11、XFCE/X11 | `bea9187` 已移除桌面品牌限制，保留真实会话和窗口身份检查；私有 Xvfb 四种标签真实点击/截图与拒绝路径、本机 KDE 新 helper 验收通过 | **[待真机验收]** GNOME/XFCE 窗口管理器、GTK 控件、剪贴板管理器、焦点与窗口动作；Xvfb 下更换环境标签只验证门禁和协议兼容性 |
 | KDE/GNOME Wayland | 仅环境探测与 AT-SPI 语义层；XTest/根窗口截图没有 Wayland 实现 | **[待实现、待真机验收]** 获授权的 portal 输入/屏幕流、流坐标与观察元素映射、焦点和命中证明；不能把 XWayland 的 DISPLAY 当作完整 Wayland 支持 |
 
 ## 可以复现的本机检查

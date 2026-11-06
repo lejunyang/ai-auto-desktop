@@ -1,7 +1,7 @@
 # Linux KDE/X11 AT-SPI Rust 驱动
 
-> 当前实现：`crates/aad-atspi`。首个已验证 profile 是 Linux + KDE/X11；不能外推为任意
-> Linux 桌面、Wayland、XWayland 或所有 toolkit。
+> 当前实现：`crates/aad-atspi`。已在本机 KDE/X11 验证下述应用流程；X11 helper 不再按
+> 桌面品牌拒绝，但 GNOME/XFCE 真机仍待验收。不能外推为 Wayland、XWayland 或所有 toolkit。
 
 ## 能力与实现
 
@@ -21,11 +21,15 @@ registry 或平台 profile 不满足要求时返回 `DRIVER.UNAVAILABLE`。`insp
 应用按 PID/name/toolkit 等已声明字段精确选择；零匹配和多匹配都失败关闭。树抓取受
 `max_depth`、`max_nodes` 和单次 children fan-out 硬上限约束。节点保留 AT-SPI bus/object path
 identity、语义字段、状态、bounds、动作和 provenance；protected 值不读取。
+Qt 5 的密码控件可能返回文字角色 `text` 而数字角色为 `PasswordText`；因此先读取数字角色
+并据此标记保护，再决定是否读取文本。读取不到数字角色时不猜测它是普通字段。
 
 `find` 只接受未截断快照。写动作必须同时携带 target 与原 locator，driver 以原预算 fresh
 capture，重新唯一定位，并核对原生 identity、进程归属和语义 fingerprint。元素消失、变成
 多义、被替换或无法证明一致时不会派发。`toggle`、`expand`、`collapse` 只在状态与 canonical
 native action 同时满足受测映射时公开；Qt Widgets 按钮仅在唯一 `Press` 可用时公开 invoke。
+控制会话可用已观察节点建立 scope，fresh capture 和动作复核保持同一范围；规范的 AT-SPI
+null 子引用会被过滤，深度、节点预算和真实读取失败仍产生明确截断原因。
 
 ## X11 helper 与 Artifact
 
@@ -40,7 +44,9 @@ AT-SPI 语义调用在 Rust 进程内完成。显式键鼠输入与截图使用�
   遮挡按堆叠顺序判断：窗口管理器 frame 里位于 client 之下的装饰/背景窗口不算遮挡，之上的才算。
 
 helper 不调用 shell、`xdotool` 或 `uinput`；剪贴板只在 `paste` 与 `clipboard_read` 中经 X11
-selection 协议访问（见下文）。首次输入/指针事件后的失败按 `DRIVER.UNKNOWN_EFFECT` 处理；
+selection 协议访问（见下文）。观察前通过无输入的 `describe` 协商 XTest helper 协议和功能，
+旧 helper 会显示 `DRIVER.HELPER_INCOMPATIBLE` 并移除不支持的合成动作，语义调用仍可用。
+明确发生在派发前的拒绝保留 `not_applied`；首次输入/指针事件后的不确定失败按 `DRIVER.UNKNOWN_EFFECT` 处理；
 成功仍须 fresh snapshot 验证。截图不会自动触发 OCR。
 
 ## 截图、OCR、窗口、粘贴、剪贴板与全局快捷键
@@ -85,9 +91,13 @@ tests/linux/run-rust-atspi-fixture.sh
 tests/linux/run-linux-parity.sh
 ```
 
-实测（WSL2 Ubuntu 22.04、Xvfb、openbox 3.6、Qt 5.15、tesseract 4.1）全部通过。
-[待验证] KWin（真实 KDE Plasma X11 会话）下的窗口动作、截图遮挡判断与 Klipper 共存时的粘贴恢复；
-GTK 应用的 paste 取数窗口归属（需 GTK3/4 fixture）。
+历史隔离环境（WSL2 Ubuntu 22.04、Xvfb、openbox 3.6、Qt 5.15、tesseract 4.1）通过上述脚本。
+2026-11-07 本机 KDE/KWin 真机另通过 Qt 窗口动作和截图、与 Klipper 共存的中文粘贴及恢复、
+KWrite 编辑保存、系统设置搜索、Dolphin 选择手势、密码框替换和清空；范围及剩余失败见
+[能力补齐计划](../plan/capability-completion-2026-11-07.md)。
+`verify-x11-session.ps1` 在私有 Xvfb 中验证 KDE/GNOME/XFCE/无标签均能真实点击和截图，
+同时验证 PID、焦点和 Wayland 拒绝；更换标签不等于验证相应桌面的窗口管理器。
+**[待真机验收]** GNOME/XFCE 桌面、GTK3/4 paste、混合 DPI 多屏及复杂输入法场景。
 
 fake backend 单元测试继续覆盖状态映射、toggle/expand/collapse、stale/truncated、deadline、
 错误归一和 Artifact 边界。既有 KDE/KCalc 探索结果属于历史资格证据；当前自动门禁以仓库内
