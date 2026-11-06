@@ -212,6 +212,24 @@ pub trait AtspiBackend: Send + Sync {
         ))
     }
     #[allow(clippy::too_many_arguments)]
+    fn pointer_gesture_modified(
+        &self,
+        target: &NativeRef,
+        point: (i32, i32),
+        gesture: Gesture,
+        modifiers: &[String],
+        process_id: u32,
+        deadline: Instant,
+    ) -> Result<Value, AutomationError> {
+        if !modifiers.is_empty() {
+            return Err(driver_error(
+                "DRIVER.ACTION_UNSUPPORTED",
+                "pointer modifiers are unavailable",
+            ));
+        }
+        self.pointer_gesture(target, point, gesture, process_id, deadline)
+    }
+    #[allow(clippy::too_many_arguments)]
     fn drag(
         &self,
         _target: &NativeRef,
@@ -225,6 +243,25 @@ pub trait AtspiBackend: Send + Sync {
             "DRIVER.ACTION_UNSUPPORTED",
             "native drag helper is unavailable",
         ))
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn drag_modified(
+        &self,
+        target: &NativeRef,
+        from: (i32, i32),
+        to: (i32, i32),
+        button: u8,
+        modifiers: &[String],
+        process_id: u32,
+        deadline: Instant,
+    ) -> Result<Value, AutomationError> {
+        if !modifiers.is_empty() {
+            return Err(driver_error(
+                "DRIVER.ACTION_UNSUPPORTED",
+                "drag modifiers are unavailable",
+            ));
+        }
+        self.drag(target, from, to, button, process_id, deadline)
     }
     fn key_chord(
         &self,
@@ -955,10 +992,22 @@ impl AtspiProvider {
         }
         match action {
             "pointer_click" => allowed.extend(["button", "position"]),
-            "pointer_gesture" => {
-                allowed.extend(["button", "count", "fraction", "scroll", "hover_ms"])
-            }
-            "drag" => allowed.extend(["to", "to_locator", "button", "fraction", "to_fraction"]),
+            "pointer_gesture" => allowed.extend([
+                "button",
+                "count",
+                "fraction",
+                "scroll",
+                "hover_ms",
+                "modifiers",
+            ]),
+            "drag" => allowed.extend([
+                "to",
+                "to_locator",
+                "button",
+                "fraction",
+                "to_fraction",
+                "modifiers",
+            ]),
             "key_chord" => allowed.push("keys"),
             _ => {}
         }
@@ -968,6 +1017,12 @@ impl AtspiProvider {
         } else {
             None
         };
+        let modifiers = parse_modifiers(args.get("modifiers"))?;
+        if !modifiers.is_empty()
+            && matches!(gesture, Some(Gesture::Wheel { .. } | Gesture::Hover { .. }))
+        {
+            return Err(invalid("modifiers are supported only for clicks and drags"));
+        }
         if action == "pointer_click"
             && (args.get("button").is_some_and(|value| value != "left")
                 || args.get("position").is_some_and(|value| value != "center"))
@@ -1094,10 +1149,11 @@ impl AtspiProvider {
                 }
                 "pointer_gesture" => {
                     let process = process_id(&node, &fresh)?;
-                    self.backend.pointer_gesture(
+                    self.backend.pointer_gesture_modified(
                         &native,
                         pointer.expect("computed above"),
                         gesture.expect("parsed above"),
+                        &modifiers,
                         process,
                         deadline,
                     )
@@ -1112,11 +1168,12 @@ impl AtspiProvider {
                             return Err(invalid("drag.button must be left, middle or right"));
                         }
                     };
-                    self.backend.drag(
+                    self.backend.drag_modified(
                         &native,
                         pointer.expect("computed above"),
                         destination.expect("computed above"),
                         button,
+                        &modifiers,
                         process,
                         deadline,
                     )
@@ -2006,6 +2063,28 @@ fn parse_gesture(args: &Map<String, Value>) -> Result<Gesture, AutomationError> 
     Ok(Gesture::Click { button, count })
 }
 
+fn parse_modifiers(value: Option<&Value>) -> Result<Vec<String>, AutomationError> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    let values = value
+        .as_array()
+        .filter(|values| values.len() <= 4)
+        .ok_or_else(|| invalid("modifiers must be an array of at most four modifiers"))?;
+    let mut result = Vec::new();
+    for value in values {
+        let key = value
+            .as_str()
+            .filter(|key| matches!(*key, "ctrl" | "shift" | "alt" | "meta"))
+            .ok_or_else(|| invalid("modifiers support ctrl, shift, alt and meta"))?;
+        if result.iter().any(|item| item == key) {
+            return Err(invalid("modifiers must be unique"));
+        }
+        result.push(key.to_string());
+    }
+    Ok(result)
+}
+
 fn parse_fraction(value: Option<&Value>) -> Result<Option<(f64, f64)>, AutomationError> {
     match value {
         None | Some(Value::Null) => Ok(None),
@@ -2414,6 +2493,9 @@ fn manifest_document() -> Value {
     actions.insert("pointer_gesture".into(), contract("重新验证目标后，仅在明确的 KDE/X11 会话中，通过固定路径 XTest helper 在目标 bounds 内的比例位置执行右键/中键/双击、滚轮或悬停。", "non_idempotent", "modify", "high", &["desktop.observe", "desktop.input"], point_input(json!({"button": button, "count": {"enum": [1, 2]}, "fraction": fraction, "scroll": {"type": "object", "required": ["direction"], "properties": {"direction": {"enum": ["up", "down", "left", "right"]}, "notches": {"type": "integer", "minimum": 1, "maximum": 30}}, "additionalProperties": false}, "hover_ms": {"type": "integer", "minimum": 1, "maximum": 5000}}), &[]), write_output(), true, true));
     actions.insert("drag".into(), contract("分别重新验证起点与终点后，通过固定路径 XTest helper 按下、分步移动并在终点释放。", "non_idempotent", "modify", "high", &["desktop.observe", "desktop.input"], point_input(json!({"to": target_schema(), "to_locator": locator_schema(), "button": button, "fraction": fraction, "to_fraction": fraction}), &["to", "to_locator"]), write_output(), true, true));
     actions.insert("key_chord".into(), contract("重新验证并聚焦目标后，通过固定路径 XTest helper 按下修饰键加一个主键的组合。", "non_idempotent", "input", "high", &["desktop.observe", "desktop.input"], point_input(json!({"keys": {"type": "array", "minItems": 1, "maxItems": 6, "items": {"type": "string", "minLength": 1, "maxLength": 32}}}), &["keys"]), write_output(), true, true));
+    for name in ["pointer_gesture", "drag"] {
+        actions[name]["input_schema"]["properties"]["modifiers"] = json!({"type": "array", "maxItems": 4, "uniqueItems": true, "items": {"enum": ["ctrl", "shift", "alt", "meta"]}});
+    }
     for (name, description) in [
         (
             "minimize",
@@ -2847,6 +2929,33 @@ mod tests {
             self.writes.fetch_add(1, Ordering::SeqCst);
             Ok(json!({"keys": keys}))
         }
+        fn pointer_gesture_modified(
+            &self,
+            target: &NativeRef,
+            point: (i32, i32),
+            gesture: Gesture,
+            modifiers: &[String],
+            process_id: u32,
+            deadline: Instant,
+        ) -> Result<Value, AutomationError> {
+            let mut result = self.pointer_gesture(target, point, gesture, process_id, deadline)?;
+            result["modifiers"] = json!(modifiers);
+            Ok(result)
+        }
+        fn drag_modified(
+            &self,
+            target: &NativeRef,
+            from: (i32, i32),
+            to: (i32, i32),
+            button: u8,
+            modifiers: &[String],
+            process_id: u32,
+            deadline: Instant,
+        ) -> Result<Value, AutomationError> {
+            let mut result = self.drag(target, from, to, button, process_id, deadline)?;
+            result["modifiers"] = json!(modifiers);
+            Ok(result)
+        }
         fn drag(
             &self,
             _target: &NativeRef,
@@ -3207,6 +3316,61 @@ mod tests {
             1,
             "stale destination must not dispatch another drag"
         );
+    }
+
+    #[test]
+    fn pointer_modifiers_are_validated_before_refresh_and_forwarded() {
+        for modifiers in [
+            json!(["ctrl", "ctrl"]),
+            json!(["super"]),
+            json!([1]),
+            json!("ctrl"),
+        ] {
+            let backend = Arc::new(FakeBackend::default());
+            let provider = AtspiProvider::new(backend.clone()).unwrap();
+            let observed = take_snapshot(&provider);
+            let args = json!({"target": {"snapshot_id": observed["snapshot_id"], "revision": observed["revision"], "node_id": "n0"}, "locator": locator(), "modifiers": modifiers});
+            assert_eq!(
+                provider
+                    .invoke(
+                        "desktop.linux_atspi.pointer_gesture@1",
+                        args,
+                        Some(Duration::from_secs(2))
+                    )
+                    .unwrap_err()
+                    .code,
+                "DRIVER.INVALID_REQUEST"
+            );
+            assert_eq!(backend.captures.load(Ordering::SeqCst), 1);
+            assert_eq!(backend.writes.load(Ordering::SeqCst), 0);
+        }
+        for action in ["pointer_gesture", "drag"] {
+            let backend = Arc::new(FakeBackend {
+                hit_chain: 1,
+                ..Default::default()
+            });
+            let provider = AtspiProvider::new(backend.clone()).unwrap();
+            let observed = take_snapshot(&provider);
+            let target = json!({"snapshot_id": observed["snapshot_id"], "revision": observed["revision"], "node_id": "n0"});
+            let mut args =
+                json!({"target": target, "locator": locator(), "modifiers": ["ctrl", "shift"]});
+            if action == "drag" {
+                args["to"] = target;
+                args["to_locator"] = locator();
+            }
+            let result = provider
+                .invoke(
+                    &format!("desktop.linux_atspi.{action}@1"),
+                    args,
+                    Some(Duration::from_secs(2)),
+                )
+                .unwrap();
+            assert_eq!(
+                result["backend_result"]["modifiers"],
+                json!(["ctrl", "shift"])
+            );
+            assert_eq!(backend.writes.load(Ordering::SeqCst), 1);
+        }
     }
 
     #[test]

@@ -2014,6 +2014,16 @@ fn validate_action(action: &Action) -> Result<()> {
         }
     }
     let invalid = |message: &str| Err(error("CONTROL.INVALID_REQUEST", message.to_string()));
+    if let Action::Click { modifiers, .. } | Action::Drag { modifiers, .. } = action {
+        if modifiers.len() > 4
+            || modifiers
+                .iter()
+                .enumerate()
+                .any(|(index, modifier)| modifiers[..index].contains(modifier))
+        {
+            return invalid("pointer modifiers must be unique: ctrl, shift, alt or meta");
+        }
+    }
     let fractions: Vec<&Fraction> = match action {
         Action::Click { fraction, .. }
         | Action::Scroll { fraction, .. }

@@ -84,6 +84,7 @@ private struct HelperFailure: Error {
 private final class RequestProgress {
     private(set) var keyboardDispatchStarted = false
     private(set) var pointerDispatchStarted = false
+    private(set) var pointerReleaseSubmitted = false
     private(set) var focusChanged = false
 
     func markFocusChanged() {
@@ -98,6 +99,10 @@ private final class RequestProgress {
         pointerDispatchStarted = true
     }
 
+    func markPointerReleaseSubmitted() {
+        pointerReleaseSubmitted = true
+    }
+
     func keyboardMetadata(phase: String) -> [String: Any] {
         [
             "phase": phase,
@@ -110,6 +115,7 @@ private final class RequestProgress {
         [
             "phase": phase,
             "pointer_dispatch_started": pointerDispatchStarted,
+            "pointer_release_submitted": pointerReleaseSubmitted,
         ]
     }
 }
@@ -1091,6 +1097,63 @@ private final class AXService {
         }
     }
 
+    /// Pointer modifiers are event flags, not a separate keyboard chord. This
+    /// avoids changing global keyboard state or sending keys to another focus.
+    private func pointerModifiers(_ args: Arguments) throws -> CGEventFlags {
+        guard let value = args.values["modifiers"] else { return [] }
+        guard let names = value as? [String], names.count <= 4,
+              Set(names).count == names.count else {
+            throw HelperFailure("DRIVER.INVALID_REQUEST", "pointer modifiers must be unique names")
+        }
+        var flags: CGEventFlags = []
+        for name in names {
+            switch name {
+            case "ctrl": flags.insert(.maskControl)
+            case "shift": flags.insert(.maskShift)
+            case "alt": flags.insert(.maskAlternate)
+            case "meta": flags.insert(.maskCommand)
+            default:
+                throw HelperFailure("DRIVER.INVALID_REQUEST", "unknown pointer modifier")
+            }
+        }
+        return flags
+    }
+
+    /// All events, including the emergency mouse-up, are constructed before
+    /// dispatch. If focus or the deadline changes mid-gesture, release on the
+    /// original PID even though no further gesture input is allowed there.
+    private func postPointerEvents(
+        _ events: [CGEvent], pid: pid_t, flags: CGEventFlags,
+        release: CGEvent?, operation: String, deadlineMS: Double?,
+        requestID: String, progress: RequestProgress, paceDrag: Bool = false
+    ) throws {
+        var held = false
+        defer {
+            if held, let release {
+                release.flags = []
+                release.postToPid(pid)
+                progress.markPointerReleaseSubmitted()
+            }
+        }
+        for (index, event) in events.enumerated() {
+            try requireFrontmost(pid, operation: operation)
+            try checkDeadline(deadlineMS)
+            release?.location = event.location
+            switch event.type {
+            case .leftMouseDown, .rightMouseDown, .otherMouseDown: held = true
+            default: break
+            }
+            event.flags = flags
+            startPointerDispatch(requestID: requestID, progress: progress)
+            event.postToPid(pid)
+            switch event.type {
+            case .leftMouseUp, .rightMouseUp, .otherMouseUp: held = false
+            default: break
+            }
+            if paceDrag && index >= 1 { usleep(15_000) }
+        }
+    }
+
     /// Rest for a while, but never past the request's deadline.
     private func dwell(milliseconds: Int, deadlineMS: Double?) {
         var until = Date().addingTimeInterval(Double(milliseconds) / 1000)
@@ -1105,10 +1168,11 @@ private final class AXService {
         progress: RequestProgress
     ) throws -> [String: Any] {
         try args.only([
-            "native_token", "mode", "button", "count", "direction", "notches", "hover_ms", "fx", "fy",
+            "native_token", "mode", "button", "count", "direction", "notches", "hover_ms", "fx", "fy", "modifiers",
         ])
         try requireTrusted()
         let mode = try args.string("mode")!
+        let flags = try pointerModifiers(args)
         let target = try pointerTarget(
             token: try args.string("native_token")!,
             fx: try args.fraction("fx"), fy: try args.fraction("fy"),
@@ -1116,10 +1180,12 @@ private final class AXService {
         )
         var events = [try mouseEvent(.mouseMoved, at: target.point, button: .left)]
         var dwellMS = 0
+        var release: CGEvent?
         switch mode {
         case "click":
-            try args.only(["native_token", "mode", "button", "count", "fx", "fy"])
+            try args.only(["native_token", "mode", "button", "count", "fx", "fy", "modifiers"])
             let types = try mouseTypes(try args.string("button")!)
+            release = try mouseEvent(types.up, at: target.point, button: types.button)
             let count = try args.integer("count", minimum: 1, maximum: 2)
             for click in 1...count {
                 events.append(try mouseEvent(
@@ -1161,8 +1227,11 @@ private final class AXService {
         }
         try requireFrontmost(target.pid, operation: "pointer_gesture")
         try checkDeadline(deadlineMS)
-        startPointerDispatch(requestID: requestID, progress: progress)
-        for event in events { event.postToPid(target.pid) }
+        try postPointerEvents(
+            events, pid: target.pid, flags: flags, release: release,
+            operation: "pointer_gesture", deadlineMS: deadlineMS,
+            requestID: requestID, progress: progress
+        )
         if dwellMS > 0 { dwell(milliseconds: dwellMS, deadlineMS: deadlineMS) }
         return [
             "native_operation": "CGEventPointerGesture",
@@ -1176,8 +1245,9 @@ private final class AXService {
         args: Arguments, deadlineMS: Double?, requestID: String,
         progress: RequestProgress
     ) throws -> [String: Any] {
-        try args.only(["native_token", "to_token", "button", "fx", "fy", "to_fx", "to_fy"])
+        try args.only(["native_token", "to_token", "button", "fx", "fy", "to_fx", "to_fy", "modifiers"])
         try requireTrusted()
+        let flags = try pointerModifiers(args)
         let types = try mouseTypes(try args.string("button")!)
         let from = try pointerTarget(
             token: try args.string("native_token")!,
@@ -1208,13 +1278,14 @@ private final class AXService {
             events.append(try mouseEvent(types.dragged, at: point, button: types.button))
         }
         events.append(try mouseEvent(types.up, at: to.point, button: types.button))
+        let release = try mouseEvent(types.up, at: from.point, button: types.button)
         try requireFrontmost(from.pid, operation: "drag")
         try checkDeadline(deadlineMS)
-        startPointerDispatch(requestID: requestID, progress: progress)
-        for (index, event) in events.enumerated() {
-            event.postToPid(from.pid)
-            if index >= 1 { usleep(15_000) }
-        }
+        try postPointerEvents(
+            events, pid: from.pid, flags: flags, release: release,
+            operation: "drag", deadlineMS: deadlineMS,
+            requestID: requestID, progress: progress, paceDrag: true
+        )
         return [
             "native_operation": "CGEventDrag",
             "submitted": true,

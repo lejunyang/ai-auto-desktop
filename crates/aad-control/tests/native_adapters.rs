@@ -24,6 +24,8 @@ impl Fixture {
             "focus",
             "invoke",
             "pointer_click",
+            "pointer_gesture",
+            "drag",
             "set_value",
             "set_text",
             "type_text",
@@ -41,6 +43,58 @@ impl Fixture {
             calls: Mutex::new(Vec::new()),
             flavor,
         })
+    }
+}
+
+#[test]
+fn native_pointer_modifiers_route_to_gestures_without_losing_target_identity() {
+    for (name, flavor) in [
+        ("desktop.windows_uia", Flavor::Windows),
+        ("desktop.linux_atspi", Flavor::Linux),
+        ("desktop.macos_ax", Flavor::MacOS),
+    ] {
+        let provider = Fixture::new(name, flavor);
+        let backend = NativeBackend::new(provider.clone(), flavor);
+        let node = json!({"node_id":"n", "role":"canvas", "name":"Surface", "actions":["pointer_click","pointer_gesture","drag"],
+            "provenance":{"bus_name":":1.2","object_path":"/org/a11y/surface"}});
+        let snapshot = json!({"snapshot_id":"s", "revision":1, "nodes":[node]});
+        for kind in ["click", "drag"] {
+            let mut value = json!({"type":kind, "modifiers":["ctrl","shift"]});
+            if kind == "drag" {
+                value["to"] = json!({"session_id":"s", "resource_id":"r", "observation_id":"o", "node_id":"n"});
+            }
+            let action = serde_json::from_value(value).unwrap();
+            let result = backend.act(
+                &snapshot,
+                &node,
+                &action,
+                &Context::new(Duration::from_secs(1), true),
+            );
+            {
+                result.unwrap();
+                let calls = provider.calls.lock().unwrap();
+                let (called, args) = calls.last().unwrap();
+                assert_eq!(
+                    *called,
+                    format!(
+                        "{name}.{}@1",
+                        if kind == "click" {
+                            "pointer_gesture"
+                        } else {
+                            "drag"
+                        }
+                    )
+                );
+                assert_eq!(args["modifiers"], json!(["ctrl", "shift"]));
+                assert_eq!(
+                    args["target"],
+                    json!({"snapshot_id":"s", "revision":1, "node_id":"n"})
+                );
+                if matches!(flavor, Flavor::Linux) {
+                    assert_eq!(args["locator"]["object_path"], "/org/a11y/surface");
+                }
+            }
+        }
     }
 }
 
@@ -229,11 +283,13 @@ fn windows_gestures_views_and_rich_locators_route_to_the_driver() {
         button: Some(Button::Right),
         count: None,
         fraction: Some(Fraction { fx: 0.25, fy: 0.5 }),
+        modifiers: vec![PointerModifier::Ctrl, PointerModifier::Shift],
     };
     backend.act(&snapshot, &node, &right, &context()).unwrap();
     let (called, args) = last();
     assert_eq!(called, "desktop.windows_uia.pointer_gesture@1");
     assert_eq!(args["button"], "right");
+    assert_eq!(args["modifiers"], json!(["ctrl", "shift"]));
     assert_eq!(args["fraction"], json!({"fx":0.25,"fy":0.5}));
     assert!(args.get("count").is_none());
     let scroll = Action::Scroll {
@@ -253,10 +309,12 @@ fn windows_gestures_views_and_rich_locators_route_to_the_driver() {
         button: None,
         fraction: None,
         to_fraction: None,
+        modifiers: vec![PointerModifier::Alt],
     };
     backend.act(&snapshot, &node, &drag, &context()).unwrap();
     let (called, args) = last();
     assert_eq!(called, "desktop.windows_uia.drag@1");
+    assert_eq!(args["modifiers"], json!(["alt"]));
     assert_eq!(
         args["to"],
         json!({"snapshot_id":"s","revision":1,"node_id":"m"})

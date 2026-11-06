@@ -242,6 +242,7 @@ fn drag_ends_share_one_observation_and_gestures_follow_node_capabilities() {
         button: None,
         fraction: None,
         to_fraction: None,
+        modifiers: Vec::new(),
     };
     let act = |target: Target, action: Action| {
         call(
@@ -264,6 +265,7 @@ fn drag_ends_share_one_observation_and_gestures_follow_node_capabilities() {
         button: None,
         count: None,
         fraction: Some(Fraction { fx: 1.5, fy: 0.5 }),
+        modifiers: Vec::new(),
     };
     assert_eq!(code(&act(from.clone(), outside)), "CONTROL.INVALID_REQUEST");
     let scroll = Action::Scroll {
@@ -295,6 +297,7 @@ fn drag_moves_between_fractions_of_one_observed_surface() {
         button: None,
         fraction: Some(Fraction { fx: 0.2, fy: 0.3 }),
         to_fraction: Some(destination),
+        modifiers: Vec::new(),
     };
     let act = |action| {
         call(
@@ -347,12 +350,54 @@ fn drag_moves_between_fractions_of_one_observed_surface() {
 }
 
 #[test]
+fn pointer_modifiers_are_validated_before_dispatch() {
+    for kind in ["click", "drag"] {
+        let (session, backend) = session();
+        let observation = observe(&session, View::default()).data.unwrap();
+        let surface = target(&observation, "n1");
+        let mut value = json!({"type": kind, "modifiers": ["ctrl", "ctrl"]});
+        if kind == "drag" {
+            value["to"] = json!(surface);
+        }
+        let act = |value| {
+            call(
+                &session,
+                Operation::Act {
+                    target: surface.clone(),
+                    action: serde_json::from_value(value).unwrap(),
+                    verify: None,
+                },
+            )
+        };
+        assert_eq!(code(&act(value.clone())), "CONTROL.INVALID_REQUEST");
+        assert!(backend.acted.lock().unwrap().is_empty());
+        value["modifiers"] = json!(["ctrl", "shift", "alt", "meta"]);
+        let response = act(value.clone());
+        assert!(response.error.is_none(), "{response:?}");
+        assert_eq!(
+            serde_json::to_value(&backend.acted.lock().unwrap()[0]).unwrap(),
+            value
+        );
+    }
+}
+
+#[test]
 fn actions_round_trip_with_optional_fields_and_reject_unknown_ones() {
     let click: Action = serde_json::from_value(json!({"type": "click"})).unwrap();
     assert!(click.plain_click());
     let right: Action =
         serde_json::from_value(json!({"type": "click", "button": "right", "count": 2})).unwrap();
     assert!(!right.plain_click());
+    let modified: Action =
+        serde_json::from_value(json!({"type":"click", "modifiers":["shift"]})).unwrap();
+    assert!(!modified.plain_click());
+    assert!(
+        serde_json::from_value::<Action>(json!({"type":"click", "modifiers":["win"]})).is_err()
+    );
+    assert_eq!(
+        serde_json::to_value(click).unwrap(),
+        json!({"type":"click"})
+    );
     assert!(serde_json::from_value::<Action>(json!({"type": "click", "x": 3})).is_err());
     assert!(serde_json::from_value::<Action>(
         json!({"type": "hover", "fraction": {"fx": 0.1, "fy": 0.2, "x": 1}})

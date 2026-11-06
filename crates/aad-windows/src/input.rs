@@ -4,14 +4,15 @@
 //! with a careful account of what landed when it is refused.
 use aad_platform::{Error, PointerButton, ScrollDirection, ScrollSpec};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    MapVirtualKeyW, SendInput, VkKeyScanExW, HKL, INPUT, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT,
-    KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, MAPVK_VK_TO_VSC, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL,
-    MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP,
-    MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK,
-    MOUSEEVENTF_WHEEL, MOUSEINPUT, MOUSE_EVENT_FLAGS, VIRTUAL_KEY, VK_BACK, VK_CONTROL, VK_DELETE,
-    VK_DOWN, VK_END, VK_ESCAPE, VK_F1, VK_F10, VK_F11, VK_F12, VK_F2, VK_F3, VK_F4, VK_F5, VK_F6,
-    VK_F7, VK_F8, VK_F9, VK_HOME, VK_INSERT, VK_LEFT, VK_LWIN, VK_MENU, VK_NEXT, VK_PRIOR,
-    VK_RETURN, VK_RIGHT, VK_SHIFT, VK_SPACE, VK_TAB, VK_UP,
+    GetAsyncKeyState, MapVirtualKeyW, SendInput, VkKeyScanExW, HKL, INPUT, INPUT_KEYBOARD,
+    INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, MAPVK_VK_TO_VSC,
+    MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
+    MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN,
+    MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL, MOUSEINPUT, MOUSE_EVENT_FLAGS,
+    VIRTUAL_KEY, VK_BACK, VK_CONTROL, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_F1, VK_F10, VK_F11,
+    VK_F12, VK_F2, VK_F3, VK_F4, VK_F5, VK_F6, VK_F7, VK_F8, VK_F9, VK_HOME, VK_INSERT,
+    VK_LCONTROL, VK_LEFT, VK_LMENU, VK_LSHIFT, VK_LWIN, VK_MENU, VK_NEXT, VK_PRIOR, VK_RCONTROL,
+    VK_RETURN, VK_RIGHT, VK_RMENU, VK_RSHIFT, VK_RWIN, VK_SHIFT, VK_SPACE, VK_TAB, VK_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
@@ -456,34 +457,138 @@ pub fn deliver_with_safe_fallback(inputs: &[INPUT], what: &str) -> Result<()> {
     }
 }
 
-/// Deliver a drag, falling back to ordered events only after a clean refusal.
-pub fn deliver_drag(inputs: &[INPUT], end: (i32, i32), release: MOUSE_EVENT_FLAGS) -> Result<()> {
-    match deliver_atomically(inputs, "the drag") {
-        Ok(()) => Ok(()),
-        Err(error) if fallback_is_safe(&error) => {
-            for (index, event) in inputs.iter().enumerate() {
-                let sent = unsafe { SendInput(&[*event], std::mem::size_of::<INPUT>() as i32) };
-                if sent != 1 {
-                    let mut failure = input_rejected(index, inputs.len(), "the drag");
-                    if index > 1 {
-                        let released =
-                            deliver_atomically(&[mouse_event(end, release)], "the drag recovery")
-                                .is_ok();
-                        failure = failure
-                            .with_detail("residual_state_cleared", serde_json::json!(released));
-                    }
-                    return Err(failure);
+/// Wrap a click or drag in modifier presses and reverse-order releases.
+/// These are logical keys, so Ctrl/Alt/Shift/Meta keep their meaning across layouts.
+fn modified_pointer_inputs(inputs: &[INPUT], modifiers: &[String]) -> Result<Vec<INPUT>> {
+    let mut keys = Vec::new();
+    for name in modifiers {
+        let key = match name.as_str() {
+            "ctrl" => VK_CONTROL,
+            "shift" => VK_SHIFT,
+            "alt" => VK_MENU,
+            "meta" => VK_LWIN,
+            _ => return Err(Error::invalid("unknown pointer modifier")),
+        };
+        if keys.contains(&key) {
+            return Err(Error::invalid("pointer modifiers must not repeat"));
+        }
+        keys.push(key);
+    }
+    let mut combined = Vec::with_capacity(inputs.len() + keys.len() * 2);
+    combined.extend(keys.iter().map(|key| virtual_key_event(*key, false)));
+    combined.extend_from_slice(inputs);
+    combined.extend(keys.iter().rev().map(|key| virtual_key_event(*key, true)));
+    Ok(combined)
+}
+
+/// Releases for exactly the keys/buttons still down after the accepted prefix.
+/// Keep their press order so cleanup releases the mouse before its modifiers.
+fn pointer_recovery(inputs: &[INPUT], sent: usize) -> Vec<INPUT> {
+    let mut held: Vec<(u32, u32, INPUT)> = Vec::new();
+    for input in inputs.iter().take(sent) {
+        if input.r#type == INPUT_KEYBOARD {
+            let key = unsafe { input.Anonymous.ki };
+            let id = (INPUT_KEYBOARD.0, u32::from(key.wVk.0));
+            if let Some(index) = held.iter().position(|(kind, code, _)| (*kind, *code) == id) {
+                held.remove(index);
+            }
+            if !key.dwFlags.contains(KEYEVENTF_KEYUP) {
+                held.push((id.0, id.1, virtual_key_event(key.wVk, true)));
+            }
+        } else if input.r#type == INPUT_MOUSE {
+            let mouse = unsafe { input.Anonymous.mi };
+            for (down, up) in [
+                (MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP),
+                (MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP),
+                (MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP),
+            ] {
+                if !mouse.dwFlags.contains(down) && !mouse.dwFlags.contains(up) {
+                    continue;
+                }
+                let id = (INPUT_MOUSE.0, down.0);
+                if let Some(index) = held.iter().position(|(kind, code, _)| (*kind, *code) == id) {
+                    held.remove(index);
+                }
+                if mouse.dwFlags.contains(down) {
+                    held.push((id.0, id.1, mouse_event((mouse.dx, mouse.dy), up)));
                 }
             }
-            Ok(())
-        }
-        Err(mut error) => {
-            let released =
-                deliver_atomically(&[mouse_event(end, release)], "the drag recovery").is_ok();
-            error = error.with_detail("residual_state_cleared", serde_json::json!(released));
-            Err(error)
         }
     }
+    held.into_iter()
+        .rev()
+        .map(|(_, _, release)| release)
+        .collect()
+}
+
+fn deliver_pointer_using(
+    inputs: &[INPUT],
+    what: &str,
+    mut send: impl FnMut(&[INPUT]) -> usize,
+) -> Result<()> {
+    if inputs.is_empty() {
+        return Ok(());
+    }
+    let mut sent = send(inputs);
+    if sent == 0 {
+        // A clean refusal allows ordered pointer events. Modifier-only key
+        // events bracket the pointer; no text keystrokes are replayed here.
+        for input in inputs {
+            if send(&[*input]) != 1 {
+                break;
+            }
+            sent += 1;
+        }
+    }
+    if sent == inputs.len() {
+        return Ok(());
+    }
+    let mut error = input_rejected(sent, inputs.len(), what);
+    let mut released = true;
+    for release in pointer_recovery(inputs, sent) {
+        // Try every release even if another one was rejected.
+        released &= send(&[release]) == 1;
+    }
+    error = error.with_detail("residual_state_cleared", serde_json::json!(released));
+    Err(error)
+}
+
+/// Deliver a pointer gesture, retrying only a zero-event refusal and cleaning
+/// up a partial batch without replaying any click or drag movement.
+pub fn deliver_pointer(inputs: &[INPUT], modifiers: &[String], what: &str) -> Result<()> {
+    let combined = modified_pointer_inputs(inputs, modifiers)?;
+    ensure_pointer_modifiers_up(modifiers, |key| unsafe {
+        GetAsyncKeyState(i32::from(key.0)) as u16 & 0x8000 != 0
+    })?;
+    deliver_pointer_using(&combined, what, |events| unsafe {
+        SendInput(events, std::mem::size_of::<INPUT>() as i32) as usize
+    })
+}
+
+/// Only release keys this gesture owns. A pre-existing held modifier cannot
+/// be safely included in a synthetic down/up pair, including its side-specific
+/// variants (which applications and keyboard hooks may track independently).
+fn ensure_pointer_modifiers_up(
+    modifiers: &[String],
+    mut down: impl FnMut(VIRTUAL_KEY) -> bool,
+) -> Result<()> {
+    for name in modifiers {
+        let keys: &[VIRTUAL_KEY] = match name.as_str() {
+            "ctrl" => &[VK_CONTROL, VK_LCONTROL, VK_RCONTROL],
+            "shift" => &[VK_SHIFT, VK_LSHIFT, VK_RSHIFT],
+            "alt" => &[VK_MENU, VK_LMENU, VK_RMENU],
+            "meta" => &[VK_LWIN, VK_RWIN],
+            _ => return Err(Error::invalid("unknown pointer modifier")),
+        };
+        if keys.iter().any(|key| down(*key)) {
+            return Err(Error::new(
+                "DRIVER.INPUT_BLOCKED",
+                "a requested pointer modifier is already held; no input was sent",
+            )
+            .with_effect("not_applied"));
+        }
+    }
+    Ok(())
 }
 
 /// Deliver events one at a time, accepting the loss of atomicity.
@@ -560,6 +665,175 @@ pub fn input_rejected(sent: usize, expected: usize, what: &str) -> Error {
 mod tests {
     use super::*;
     use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyboardLayout, KEYEVENTF_UNICODE};
+
+    fn modified_click() -> Vec<INPUT> {
+        modified_pointer_inputs(
+            &[
+                mouse_event((100, 200), MOUSEEVENTF_MOVE),
+                mouse_event((100, 200), MOUSEEVENTF_LEFTDOWN),
+                mouse_event((100, 200), MOUSEEVENTF_LEFTUP),
+            ],
+            &["ctrl".into(), "shift".into()],
+        )
+        .unwrap()
+    }
+
+    fn input_label(input: &INPUT) -> String {
+        if input.r#type == INPUT_KEYBOARD {
+            let key = unsafe { input.Anonymous.ki };
+            format!(
+                "{}:{}",
+                vk_label(key.wVk),
+                if key.dwFlags.contains(KEYEVENTF_KEYUP) {
+                    "up"
+                } else {
+                    "down"
+                }
+            )
+        } else {
+            let mouse = unsafe { input.Anonymous.mi };
+            if mouse.dwFlags.contains(MOUSEEVENTF_LEFTDOWN) {
+                "left:down".into()
+            } else if mouse.dwFlags.contains(MOUSEEVENTF_LEFTUP) {
+                "left:up".into()
+            } else {
+                "move".into()
+            }
+        }
+    }
+
+    #[test]
+    fn pointer_partial_batch_releases_only_held_inputs_without_replay() {
+        let inputs = modified_click();
+        for (prefix, expected) in [
+            (1, vec!["ctrl:up"]),
+            (4, vec!["left:up", "shift:up", "ctrl:up"]),
+            (5, vec!["shift:up", "ctrl:up"]),
+            (6, vec!["ctrl:up"]),
+        ] {
+            let mut calls = 0;
+            let mut recovery = Vec::new();
+            let error = deliver_pointer_using(&inputs, "the click", |events| {
+                calls += 1;
+                if calls == 1 {
+                    return prefix;
+                }
+                assert_eq!(events.len(), 1);
+                recovery.push(input_label(&events[0]));
+                1
+            })
+            .unwrap_err();
+            assert_eq!(error.effect, "unknown");
+            assert_eq!(error.details["events_sent"], prefix);
+            assert_eq!(error.details["residual_state_cleared"], true);
+            assert_eq!(recovery, expected);
+        }
+    }
+
+    #[test]
+    fn pointer_clean_refusal_fallback_cleans_up_a_failed_button_release() {
+        let inputs = modified_click();
+        let mut calls = 0;
+        let mut delivered = Vec::new();
+        let error = deliver_pointer_using(&inputs, "the click", |events| {
+            calls += 1;
+            // Refuse the initial batch, then fail the first mouse-up. The
+            // fallback must stop, release the mouse, and unwind both keys.
+            if calls == 1 || calls == 6 {
+                return 0;
+            }
+            assert_eq!(events.len(), 1);
+            delivered.push(input_label(&events[0]));
+            1
+        })
+        .unwrap_err();
+        assert_eq!(error.effect, "unknown");
+        assert_eq!(error.details["events_sent"], 4);
+        assert_eq!(error.details["residual_state_cleared"], true);
+        assert_eq!(
+            delivered,
+            [
+                "ctrl:down",
+                "shift:down",
+                "move",
+                "left:down",
+                "left:up",
+                "shift:up",
+                "ctrl:up"
+            ]
+        );
+    }
+
+    #[test]
+    fn pointer_cleanup_reports_refusal_and_continues_releasing_other_keys() {
+        let inputs = modified_click();
+        let mut calls = 0;
+        let mut recovery = Vec::new();
+        let error = deliver_pointer_using(&inputs, "the click", |events| {
+            calls += 1;
+            if calls == 1 {
+                return 4;
+            }
+            recovery.push(input_label(&events[0]));
+            if calls == 2 {
+                0
+            } else {
+                1
+            }
+        })
+        .unwrap_err();
+        assert_eq!(error.effect, "unknown");
+        assert_eq!(error.details["residual_state_cleared"], false);
+        assert_eq!(recovery, ["left:up", "shift:up", "ctrl:up"]);
+    }
+
+    #[test]
+    fn pointer_success_has_one_batch_and_modifier_names_are_strict() {
+        let inputs = modified_click();
+        let mut calls = 0;
+        deliver_pointer_using(&inputs, "the click", |events| {
+            calls += 1;
+            assert_eq!(
+                events.iter().map(input_label).collect::<Vec<_>>(),
+                [
+                    "ctrl:down",
+                    "shift:down",
+                    "move",
+                    "left:down",
+                    "left:up",
+                    "shift:up",
+                    "ctrl:up"
+                ]
+            );
+            events.len()
+        })
+        .unwrap();
+        assert_eq!(calls, 1);
+        assert!(modified_pointer_inputs(&inputs, &["ctrl".into(), "ctrl".into()]).is_err());
+        assert!(modified_pointer_inputs(&inputs, &["win".into()]).is_err());
+    }
+
+    #[test]
+    fn pointer_modifiers_cannot_release_keys_that_were_already_held() {
+        for (name, keys) in [
+            ("ctrl", vec![VK_CONTROL, VK_LCONTROL, VK_RCONTROL]),
+            ("shift", vec![VK_SHIFT, VK_LSHIFT, VK_RSHIFT]),
+            ("alt", vec![VK_MENU, VK_LMENU, VK_RMENU]),
+            ("meta", vec![VK_LWIN, VK_RWIN]),
+        ] {
+            for held in keys {
+                let error =
+                    ensure_pointer_modifiers_up(&[name.into()], |key| key == held).unwrap_err();
+                assert_eq!(error.effect, "not_applied");
+                assert_eq!(error.code, "DRIVER.INPUT_BLOCKED");
+            }
+        }
+        ensure_pointer_modifiers_up(&["ctrl".into()], |_| false).unwrap();
+        ensure_pointer_modifiers_up(&[], |_| {
+            panic!("a plain pointer gesture must not query modifier state")
+        })
+        .unwrap();
+    }
 
     /// How Windows turns an absolute coordinate back into a virtual-screen pixel.
     fn denormalise(absolute: i32, origin: i32, extent: i32) -> i32 {

@@ -148,6 +148,16 @@ pub enum TypeMode {
     Keys,
 }
 
+/// Modifier state held throughout one pointer click or drag.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PointerModifier {
+    Ctrl,
+    Shift,
+    Alt,
+    Meta,
+}
+
 /// A position inside the observed element's box, never a screen coordinate.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -169,6 +179,8 @@ pub enum Action {
         count: Option<u8>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         fraction: Option<Fraction>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        modifiers: Vec<PointerModifier>,
     },
     Fill {
         value: String,
@@ -203,6 +215,8 @@ pub enum Action {
         fraction: Option<Fraction>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         to_fraction: Option<Fraction>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        modifiers: Vec<PointerModifier>,
     },
     /// Choose one option of a list box by its label or value.
     Select {
@@ -350,6 +364,7 @@ impl Action {
             button: None,
             count: None,
             fraction: None,
+            modifiers: Vec::new(),
         }
     }
     pub fn name(&self) -> &'static str {
@@ -393,7 +408,8 @@ impl Action {
                 button: None | Some(Button::Left),
                 count: None | Some(1),
                 fraction: None,
-            }
+                modifiers,
+            } if modifiers.is_empty()
         )
     }
 }

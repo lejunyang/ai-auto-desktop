@@ -748,10 +748,22 @@ impl MacOSAxProvider {
         }
         match action {
             "pointer_click" => allowed.extend(["button", "position"]),
-            "pointer_gesture" => {
-                allowed.extend(["button", "count", "fraction", "scroll", "hover_ms"])
-            }
-            "drag" => allowed.extend(["to", "to_locator", "button", "fraction", "to_fraction"]),
+            "pointer_gesture" => allowed.extend([
+                "button",
+                "count",
+                "fraction",
+                "scroll",
+                "hover_ms",
+                "modifiers",
+            ]),
+            "drag" => allowed.extend([
+                "to",
+                "to_locator",
+                "button",
+                "fraction",
+                "to_fraction",
+                "modifiers",
+            ]),
             "key_chord" => allowed.push("keys"),
             _ => {}
         }
@@ -1097,9 +1109,35 @@ fn button_name(value: Option<&Value>) -> Result<&'static str, AutomationError> {
     }
 }
 
+/// Only the four portable pointer modifier names, each at most once.
+fn pointer_modifiers(value: Option<&Value>) -> Result<Vec<&str>, AutomationError> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    let values = value
+        .as_array()
+        .ok_or_else(|| invalid("modifiers must be an array"))?;
+    let mut names = Vec::new();
+    for value in values {
+        let name = value
+            .as_str()
+            .filter(|name| matches!(*name, "ctrl" | "shift" | "alt" | "meta"))
+            .ok_or_else(|| invalid("pointer modifiers must be ctrl, shift, alt or meta"))?;
+        if names.contains(&name) {
+            return Err(invalid("pointer modifiers must not repeat"));
+        }
+        names.push(name);
+    }
+    Ok(names)
+}
+
 /// The Windows driver's request shape, normalised for the Swift helper.
 fn gesture_request(args: &Map<String, Value>) -> Result<Value, AutomationError> {
     let given = |name: &str| args.get(name).is_some_and(|value| !value.is_null());
+    let modifiers = pointer_modifiers(args.get("modifiers"))?;
+    if !modifiers.is_empty() && (given("scroll") || given("hover_ms")) {
+        return Err(invalid("modifiers are supported for clicks and drags only"));
+    }
     let (fx, fy) = fraction_pair(args.get("fraction"))?;
     let mut request = if let Some(scroll) = args.get("scroll").filter(|v| !v.is_null()) {
         if given("button") || given("count") || given("hover_ms") {
@@ -1143,15 +1181,21 @@ fn gesture_request(args: &Map<String, Value>) -> Result<Value, AutomationError> 
     };
     request["fx"] = json!(fx);
     request["fy"] = json!(fy);
+    if !modifiers.is_empty() {
+        request["modifiers"] = json!(modifiers);
+    }
     Ok(request)
 }
 
 fn drag_request(args: &Map<String, Value>) -> Result<Value, AutomationError> {
     let (fx, fy) = fraction_pair(args.get("fraction"))?;
     let (to_fx, to_fy) = fraction_pair(args.get("to_fraction"))?;
-    Ok(
-        json!({"button": button_name(args.get("button"))?, "fx": fx, "fy": fy, "to_fx": to_fx, "to_fy": to_fy}),
-    )
+    let mut request = json!({"button": button_name(args.get("button"))?, "fx": fx, "fy": fy, "to_fx": to_fx, "to_fy": to_fy});
+    let modifiers = pointer_modifiers(args.get("modifiers"))?;
+    if !modifiers.is_empty() {
+        request["modifiers"] = json!(modifiers);
+    }
+    Ok(request)
 }
 
 fn key_names(value: Option<&Value>) -> Result<Vec<String>, AutomationError> {
@@ -1677,8 +1721,9 @@ fn manifest_document() -> Value {
     };
     let fraction = json!({"type": "object", "required": ["fx", "fy"], "properties": {"fx": {"type": "number", "minimum": 0, "maximum": 1}, "fy": {"type": "number", "minimum": 0, "maximum": 1}}, "additionalProperties": false});
     let button = json!({"enum": ["left", "middle", "right"]});
-    actions.insert("pointer_gesture".into(), contract("重新验证目标后，在元素 bounds 内的比例位置、经 AX 命中检查后向前台应用派发右键/中键/双击、滚轮或悬停。", "non_idempotent", "modify", "high", &["desktop.observe", "desktop.input"], point_input(json!({"button": button, "count": {"enum": [1, 2]}, "fraction": fraction, "scroll": {"type": "object", "required": ["direction"], "properties": {"direction": {"enum": ["up", "down", "left", "right"]}, "notches": {"type": "integer", "minimum": 1, "maximum": 30}}, "additionalProperties": false}, "hover_ms": {"type": "integer", "minimum": 1, "maximum": 5000}}), &[]), write_output(), true, true));
-    actions.insert("drag".into(), contract("分别重新验证起点与终点并做 AX 命中检查后，在同一前台应用内按下、分步拖动并在终点释放。", "non_idempotent", "modify", "high", &["desktop.observe", "desktop.input"], point_input(json!({"to": target_schema(), "to_locator": locator_schema(), "button": button, "fraction": fraction, "to_fraction": fraction}), &["to", "to_locator"]), write_output(), true, true));
+    let modifiers = json!({"type":"array", "maxItems":4, "uniqueItems":true, "items":{"enum":["ctrl", "shift", "alt", "meta"]}});
+    actions.insert("pointer_gesture".into(), contract("重新验证目标后，在元素 bounds 内的比例位置、经 AX 命中检查后向前台应用派发右键/中键/双击、滚轮或悬停；click 可带 modifiers。", "non_idempotent", "modify", "high", &["desktop.observe", "desktop.input"], point_input(json!({"button": button, "count": {"enum": [1, 2]}, "fraction": fraction, "modifiers": modifiers, "scroll": {"type": "object", "required": ["direction"], "properties": {"direction": {"enum": ["up", "down", "left", "right"]}, "notches": {"type": "integer", "minimum": 1, "maximum": 30}}, "additionalProperties": false}, "hover_ms": {"type": "integer", "minimum": 1, "maximum": 5000}}), &[]), write_output(), true, true));
+    actions.insert("drag".into(), contract("分别重新验证起点与终点并做 AX 命中检查后，在同一前台应用内按下、分步拖动并在终点释放，可带 modifiers。", "non_idempotent", "modify", "high", &["desktop.observe", "desktop.input"], point_input(json!({"to": target_schema(), "to_locator": locator_schema(), "button": button, "fraction": fraction, "to_fraction": fraction, "modifiers": modifiers}), &["to", "to_locator"]), write_output(), true, true));
     actions.insert("key_chord".into(), contract("重新验证并聚焦非受保护目标后，按下修饰键（ctrl、shift、alt、cmd）加一个主键；名称按字面映射，不在平台间互换。", "non_idempotent", "input", "high", &["desktop.observe", "desktop.input"], point_input(json!({"keys": {"type": "array", "minItems": 1, "maxItems": 6, "items": {"type": "string", "minLength": 1, "maxLength": 32}}}), &["keys"]), write_output(), true, true));
     for (name, description) in [
         ("minimize", "重新验证 AXWindow 后设置 AXMinimized=true，等待（有上限）读回为 true。"),
@@ -2546,6 +2591,50 @@ mod tests {
             4,
             "nothing refused reached the helper"
         );
+    }
+
+    #[test]
+    fn pointer_modifiers_reach_the_helper_without_keyboard_dispatch() {
+        let backend = Arc::new(FakeBackend::default());
+        let provider = MacOSAxProvider::new(backend.clone()).unwrap();
+        for action in ["pointer_gesture", "drag"] {
+            let snapshot = take_snapshot(&provider);
+            let target = json!({"snapshot_id":snapshot["snapshot_id"], "revision":snapshot["revision"], "node_id":"n0"});
+            let mut args = json!({"target":target, "locator":locator(), "modifiers":["ctrl","shift","alt","meta"]});
+            if action == "drag" {
+                args["to"] = target;
+                args["to_locator"] = locator();
+            }
+            let result = provider
+                .invoke(
+                    &format!("desktop.macos_ax.{action}@1"),
+                    args,
+                    Some(Duration::from_secs(2)),
+                )
+                .unwrap();
+            assert_eq!(
+                result["backend_result"]["sent"]["modifiers"],
+                json!(["ctrl", "shift", "alt", "meta"])
+            );
+        }
+        assert_eq!(backend.writes.load(Ordering::SeqCst), 2);
+        for values in [
+            json!(null),
+            json!(["cmd"]),
+            json!(["ctrl", "ctrl"]),
+            json!([true]),
+        ] {
+            assert!(pointer_modifiers(Some(&values)).is_err(), "{values}");
+        }
+        for mode in [
+            json!({"hover_ms":100}),
+            json!({"scroll":{"direction":"down"}}),
+        ] {
+            let mut args = mode.as_object().unwrap().clone();
+            args.insert("modifiers".into(), json!(["shift"]));
+            assert!(gesture_request(&args).is_err());
+        }
+        assert_eq!(backend.writes.load(Ordering::SeqCst), 2);
     }
 
     #[test]

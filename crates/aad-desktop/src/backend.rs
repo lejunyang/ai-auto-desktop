@@ -146,6 +146,8 @@ pub struct PointerGesture {
     pub button: PointerButton,
     /// 1 for a single click, 2 for a double click.
     pub count: u8,
+    /// Modifier keys held for a click or drag: ctrl, shift, alt, meta.
+    pub modifiers: Vec<String>,
     /// Where inside the first (or only) element to act, as (fx, fy) each in
     /// 0.0..=1.0. `None` means the centre, matching a plain click.
     pub fraction: Option<(f64, f64)>,

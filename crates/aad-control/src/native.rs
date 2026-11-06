@@ -579,10 +579,14 @@ impl Backend for NativeBackend {
                 button,
                 count,
                 fraction: at,
+                modifiers,
             } if native == "pointer_gesture" => {
                 set("button", serde_json::to_value(button).unwrap());
                 set("count", serde_json::to_value(count).unwrap());
                 set("fraction", fraction(at));
+                if !modifiers.is_empty() {
+                    set("modifiers", json!(modifiers));
+                }
             }
             Action::Scroll {
                 direction,
@@ -605,6 +609,7 @@ impl Backend for NativeBackend {
                 button,
                 fraction: from_at,
                 to_fraction,
+                modifiers,
             } => {
                 set("to", target_of(&json!(to.node_id)));
                 if portable {
@@ -622,6 +627,9 @@ impl Backend for NativeBackend {
                 set("button", serde_json::to_value(button).unwrap());
                 set("fraction", fraction(from_at));
                 set("to_fraction", fraction(to_fraction));
+                if !modifiers.is_empty() {
+                    set("modifiers", json!(modifiers));
+                }
             }
             _ => {}
         }

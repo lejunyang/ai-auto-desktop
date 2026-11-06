@@ -45,6 +45,14 @@ fn button_schema() -> Value {
     json!({"enum": ["left", "right", "middle"], "description": "Which button. Defaults to left."})
 }
 
+fn pointer_modifiers_schema() -> Value {
+    json!({
+        "type": "array", "maxItems": 4, "uniqueItems": true,
+        "items": {"enum": ["ctrl", "shift", "alt", "meta"]},
+        "description": "Modifier state held throughout the click or drag. meta means Windows/Command. Omit for no modifiers. Unsupported providers refuse it."
+    })
+}
+
 fn action_schema() -> Value {
     let variant = |name: &str, description: &str, properties: Value, required: &[&str]| {
         let mut all = Map::from_iter([("type".to_string(), json!({"const": name}))]);
@@ -68,11 +76,12 @@ fn action_schema() -> Value {
     click or a position is given; those need a provider that offers gestures. In a browser a \
     plain click is DOM activation (isTrusted false, works in frames), except canvas surfaces \
     always receive trusted pointer input; giving a position, a \
-    button or a count sends trusted pointer input instead, also inside frames (cross-origin \
+    button, a count or modifiers sends trusted pointer input instead, also inside frames (cross-origin \
     ones included), and is refused if something else covers the element or its frame.", json!({
             "button": button_schema(),
             "count": {"type": "integer", "enum": [1, 2], "description": "1 for a single click, 2 for a double click."},
-            "fraction": fraction_schema("Where inside the element to click")
+            "fraction": fraction_schema("Where inside the element to click"),
+            "modifiers": pointer_modifiers_schema()
         }), &[]),
         variant("fill", "Replace the element's value directly. Prefer this over \
     type_text for text fields: it is atomic and does not depend on focus.", json!({
@@ -122,7 +131,8 @@ fn action_schema() -> Value {
             "to": target_schema(),
             "button": button_schema(),
             "fraction": fraction_schema("Where inside the source element to grab"),
-            "to_fraction": fraction_schema("Where inside the destination element to release")
+            "to_fraction": fraction_schema("Where inside the destination element to release"),
+            "modifiers": pointer_modifiers_schema()
         }), &["to"]),
         variant("select", "Choose one option of a list box (a browser <select>), by its \
     label as the observation lists it in `options`, or by its value.", json!({
@@ -240,7 +250,7 @@ fn view_schema() -> Value {
         "description": "How much of the observation to return. The whole capture is kept \
     either way, so any node of it can be found or acted on.",
         "properties": {
-            "scope_id": {"type":"string", "minLength":1, "maxLength":256, "description":"Browser: unique HTML id in the selected frame. Native: opaque id returned by an earlier scoped observation of this resource. Re-captures a complete subtree, not region view filtering. Cannot be combined with scope_target."},
+            "scope_id": {"type":"string", "minLength":1, "maxLength":256, "description":"Browser: unique HTML id in the selected frame, or an opaque scope id returned by a previous scoped observation. Native: opaque id returned by an earlier scoped observation of this resource. Re-captures a complete subtree, not region view filtering. Cannot be combined with scope_target."},
             "scope_target": target_schema(),
             "mode": {
                 "enum": ["outline", "overview", "text", "nodes"],
@@ -821,6 +831,29 @@ mod tests {
             }
             serde_json::from_value::<aad_control::Action>(sample)
                 .unwrap_or_else(|e| panic!("{name}: {e}"));
+        }
+    }
+
+    #[test]
+    fn click_and_drag_publish_bounded_unique_pointer_modifiers() {
+        for kind in ["click", "drag"] {
+            let schema = variant(kind);
+            let modifiers = &schema["properties"]["modifiers"];
+            assert_eq!(modifiers["maxItems"], 4);
+            assert_eq!(modifiers["uniqueItems"], true);
+            assert_eq!(
+                modifiers["items"]["enum"],
+                json!(["ctrl", "shift", "alt", "meta"])
+            );
+            let mut action = json!({"type":kind, "modifiers":["ctrl", "shift"]});
+            if kind == "drag" {
+                action["to"] = json!({"session_id":"s", "resource_id":"r", "observation_id":"o", "node_id":"n"});
+            }
+            let parsed: aad_control::Action = serde_json::from_value(action.clone()).unwrap();
+            assert_eq!(serde_json::to_value(parsed).unwrap(), action);
+        }
+        for kind in ["scroll", "hover"] {
+            assert!(variant(kind)["properties"].get("modifiers").is_none());
         }
     }
 

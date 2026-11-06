@@ -10,6 +10,7 @@
 #include <cctype>
 #include <cerrno>
 #include <chrono>
+#include <csignal>
 #include <climits>
 #include <cstdint>
 #include <cstdlib>
@@ -38,6 +39,23 @@ constexpr int kExitUnsupportedText = 74;
 constexpr int kExitTimeoutBeforeDispatch = 75;
 
 bool g_x_error = false;
+volatile std::sig_atomic_t g_input_cancelled = 0;
+
+void CancelInput(int) { g_input_cancelled = 1; }
+
+struct InputCancellation {
+    using Handler = void (*)(int);
+    Handler term;
+    Handler interrupt;
+    InputCancellation() : term(std::signal(SIGTERM, CancelInput)), interrupt(std::signal(SIGINT, CancelInput)) {
+        g_input_cancelled = 0;
+    }
+    ~InputCancellation() {
+        std::signal(SIGTERM, term);
+        std::signal(SIGINT, interrupt);
+        g_input_cancelled = 0;
+    }
+};
 
 int HandleXError(Display *, XErrorEvent *) {
     g_x_error = true;
@@ -55,7 +73,7 @@ bool DeadlineExpired(std::uint64_t deadline_ns) {
     const auto now = std::chrono::steady_clock::now().time_since_epoch();
     const auto now_ns =
         std::chrono::duration_cast<std::chrono::nanoseconds>(now).count();
-    return now_ns < 0 || static_cast<std::uint64_t>(now_ns) >= deadline_ns;
+    return g_input_cancelled != 0 || now_ns < 0 || static_cast<std::uint64_t>(now_ns) >= deadline_ns;
 }
 
 std::optional<std::uint64_t> ParseUnsigned(std::string_view value) {
@@ -390,8 +408,8 @@ std::optional<KeyPlan> BuildKeyPlan(
 }
 
 // Gestures, drags and key chords. Each runs after the shared preflight in
-// main: the session qualifies, focus belongs to the expected process and every
-// point lands on one of its windows.
+// main: the session qualifies, pointer hits belong to the target process, and
+// keyboard input (including pointer modifiers) also has same-process focus.
 struct GestureRequest {
     std::string mode;  // click, wheel or hover
     int x = 0;
@@ -403,6 +421,7 @@ struct GestureRequest {
     unsigned notches = 3;
     unsigned hover_ms = 500;
     std::vector<std::string> keys;
+    std::vector<std::string> modifiers;
 };
 
 // `--name value` pairs. Every name must be expected and appear once; the
@@ -498,7 +517,22 @@ void SleepUntilOrDeadline(unsigned milliseconds, std::uint64_t deadline_ns) {
 
 int RunGesture(Display *display, std::string_view command, const GestureRequest &request,
                std::uint64_t expected_pid, std::uint64_t deadline_ns, Atom pid_atom) {
+    InputCancellation cancellation;
     std::vector<KeyCode> chord;
+    std::vector<KeyCode> modifiers;
+    std::vector<KeyCode> pressed_modifiers;
+    char held_keys[32]{};
+    XQueryKeymap(display, held_keys);
+    for (const auto &name : request.modifiers) {
+        const KeySym symbol = name == "meta" ? XK_Super_L : KeyNamed(name);
+        const KeyCode code = symbol == NoSymbol ? 0 : XKeysymToKeycode(display, symbol);
+        if (code == 0 || (held_keys[code / 8] & (1 << (code % 8))) != 0) {
+            XCloseDisplay(display);
+            EmitError("modifier_unavailable_or_held", "key_preflight", false);
+            return kExitTargetMismatch;
+        }
+        modifiers.push_back(code);
+    }
     if (command == "key-chord") {
         // Modifiers first, then exactly one main key, as the protocol requires.
         bool seen_main = false;
@@ -538,6 +572,9 @@ int RunGesture(Display *display, std::string_view command, const GestureRequest 
             for (auto code_it = chord.rbegin(); code_it != chord.rend(); ++code_it) {
                 XTestFakeKeyEvent(display, *code_it, False, 1);
             }
+            for (auto code_it = pressed_modifiers.rbegin(); code_it != pressed_modifiers.rend(); ++code_it) {
+                XTestFakeKeyEvent(display, *code_it, False, 1);
+            }
         }
         XSync(display, False);
         XCloseDisplay(display);
@@ -547,7 +584,7 @@ int RunGesture(Display *display, std::string_view command, const GestureRequest 
     if (DeadlineExpired(deadline_ns)) {
         return finish_failure("deadline_exceeded", "pre_dispatch", kExitTimeoutBeforeDispatch);
     }
-    if (command == "key-chord" && !FocusBelongsToPid(display, expected_pid, pid_atom)) {
+    if ((command == "key-chord" || !modifiers.empty()) && !FocusBelongsToPid(display, expected_pid, pid_atom)) {
         return finish_failure("focus_owner_changed", "target_preflight", kExitTargetMismatch);
     }
     if (command != "key-chord" &&
@@ -565,6 +602,10 @@ int RunGesture(Display *display, std::string_view command, const GestureRequest 
         submitted = ok && submitted;
         ++event_count;
     };
+    for (const auto code : modifiers) {
+        pressed_modifiers.push_back(code);
+        submit(XTestFakeKeyEvent(display, code, True, 1) != 0);
+    }
     if (command == "key-chord") {
         for (const KeyCode code : chord) {
             submit(XTestFakeKeyEvent(display, code, True, 1) != 0);
@@ -582,6 +623,9 @@ int RunGesture(Display *display, std::string_view command, const GestureRequest 
             // pointer has moved a few pixels with the button held.
             constexpr int kSteps = 12;
             for (int step = 1; step <= kSteps; ++step) {
+                if (DeadlineExpired(deadline_ns)) {
+                    return finish_failure("deadline_exceeded", "input_dispatch", kExitUnknownEffect);
+                }
                 const int x = request.x + (request.to_x - request.x) * step / kSteps;
                 const int y = request.y + (request.to_y - request.y) * step / kSteps;
                 submit(XTestFakeMotionEvent(display, -1, x, y, 1) != 0);
@@ -604,7 +648,13 @@ int RunGesture(Display *display, std::string_view command, const GestureRequest 
             SleepUntilOrDeadline(request.hover_ms, deadline_ns);
         }
     }
+    for (auto code_it = pressed_modifiers.rbegin(); code_it != pressed_modifiers.rend(); ++code_it) {
+        submit(XTestFakeKeyEvent(display, *code_it, False, 1) != 0);
+    }
     XSync(display, False);
+    if (DeadlineExpired(deadline_ns)) {
+        return finish_failure("deadline_exceeded", "input_dispatch", kExitUnknownEffect);
+    }
     if (!submitted || g_x_error) {
         return finish_failure("x11_error", "input_dispatch", kExitUnknownEffect);
     }
@@ -621,8 +671,10 @@ std::optional<GestureRequest> ParseGesture(std::string_view command, int argc, c
     std::vector<std::string_view> allowed = {"expected-pid", "deadline-monotonic-ns"};
     if (command == "pointer-gesture") {
         allowed.insert(allowed.end(), {"mode", "x", "y", "button", "count", "notches", "hover-ms"});
+        allowed.push_back("modifiers");
     } else if (command == "drag") {
         allowed.insert(allowed.end(), {"x", "y", "to-x", "to-y", "button"});
+        allowed.push_back("modifiers");
     } else {
         allowed.push_back("keys");
     }
@@ -638,6 +690,21 @@ std::optional<GestureRequest> ParseGesture(std::string_view command, int argc, c
     *expected_pid = ParseUnsigned(*pid);
     *deadline_ns = ParseUnsigned(*deadline);
     GestureRequest request;
+    if (const auto modifiers = Pair(*pairs, "modifiers")) {
+        if (modifiers->empty() || modifiers->size() > 32) return std::nullopt;
+        std::size_t start = 0;
+        while (start <= modifiers->size()) {
+            const auto end = std::min(modifiers->find(',', start), modifiers->size());
+            const auto name = modifiers->substr(start, end - start);
+            if ((name != "ctrl" && name != "shift" && name != "alt" && name != "meta") ||
+                std::find(request.modifiers.begin(), request.modifiers.end(), name) != request.modifiers.end()) {
+                return std::nullopt;
+            }
+            request.modifiers.push_back(name);
+            start = end + 1;
+        }
+        if (request.modifiers.size() > 4) return std::nullopt;
+    }
     auto coordinate = [&](std::string_view name, int *out) {
         const auto value = Pair(*pairs, name);
         return value.has_value() && ParseInt(*value, out);
@@ -676,6 +743,7 @@ std::optional<GestureRequest> ParseGesture(std::string_view command, int argc, c
         return std::nullopt;
     }
     request.mode = *mode;
+    if (request.mode != "click" && !request.modifiers.empty()) return std::nullopt;
     if (request.mode == "click") {
         const auto parsed = BoundedUnsigned(button, 1, 3);
         const auto count = BoundedUnsigned(Pair(*pairs, "count"), 1, 2);
@@ -2268,7 +2336,7 @@ int main(int argc, char **argv) {
         EmitError("pid_property_unavailable", "target_preflight", false);
         return kExitTargetMismatch;
     }
-    while ((command == "type-text" || command == "key-chord") &&
+    while ((command == "type-text" || command == "key-chord" || (gesture.has_value() && !gesture->modifiers.empty())) &&
            !FocusBelongsToPid(display, expected_pid.value(), pid_atom)) {
         if (DeadlineExpired(deadline_ns.value())) {
             XCloseDisplay(display);

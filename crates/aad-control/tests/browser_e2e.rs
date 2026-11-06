@@ -719,6 +719,7 @@ fn drag_to(session: &Session, main: &str, from: &str, (role, to): (&str, &str)) 
         session,
         source,
         Action::Drag {
+            modifiers: Vec::new(),
             to,
             button: None,
             fraction: None,
@@ -784,6 +785,7 @@ fn canvas_surfaces_take_trusted_clicks_wheels_and_drags_inside_the_same_element(
         &session,
         canvas.clone(),
         Action::Drag {
+            modifiers: Vec::new(),
             to: canvas,
             button: None,
             fraction: Some(Fraction { fx: 0.2, fy: 0.5 }),
@@ -840,6 +842,131 @@ fn canvas_surfaces_take_trusted_clicks_wheels_and_drags_inside_the_same_element(
 
 #[test]
 #[ignore = "requires isolated Chromium with its sandbox enabled; CI runs it explicitly"]
+fn pointer_modifiers_reach_click_drag_and_drop_without_keyboard_state() {
+    let _serial = serial();
+    let fixture = Fixture::new();
+    let (session, _) = session_for(&fixture);
+    let main = main_of(&session, &fixture.page_id);
+    assert!(wait_until(&session, &main, "Name", WaitCondition::Appears)
+        .error
+        .is_none());
+    page_value(
+        &fixture,
+        r#"document.body.innerHTML='<canvas aria-label="Modified surface" tabindex="0" width="300" height="120"></canvas><div draggable="true" aria-label="Modified card" style="width:80px;height:40px">Card</div><div aria-label="Modified bin" style="width:120px;height:60px">Bin</div>';
+        window.gestureEvents=[];window.keyEvents=[];
+        const flags=e=>(e.altKey?1:0)|(e.ctrlKey?2:0)|(e.metaKey?4:0)|(e.shiftKey?8:0);
+        const surface=document.querySelector('canvas');surface.focus();
+        for(const kind of ['keydown','keyup'])document.addEventListener(kind,e=>window.keyEvents.push(kind));
+        for(const kind of ['pointerdown','pointermove','pointerup','click'])surface.addEventListener(kind,e=>window.gestureEvents.push([kind,flags(e),e.isTrusted,e.buttons]));
+        const card=document.querySelector('[draggable]'),bin=document.querySelector('[aria-label="Modified bin"]');
+        card.addEventListener('dragstart',e=>e.dataTransfer.setData('text/plain','modified-card'));
+        bin.addEventListener('dragover',e=>e.preventDefault());
+        bin.addEventListener('drop',e=>{e.preventDefault();window.dropped=[e.dataTransfer.getData('text/plain'),flags(e),e.isTrusted];});true"#,
+    );
+    for (modifiers, expected) in [
+        (vec![PointerModifier::Alt], 1),
+        (vec![PointerModifier::Ctrl], 2),
+        (vec![PointerModifier::Meta], 4),
+        (vec![PointerModifier::Shift], 8),
+        (vec![PointerModifier::Ctrl, PointerModifier::Shift], 10),
+        (vec![], 0),
+    ] {
+        page_value(&fixture, "window.gestureEvents=[];true");
+        let clicked = act_on(
+            &session,
+            &main,
+            "canvas",
+            "Modified surface",
+            Action::Click {
+                button: None,
+                count: None,
+                fraction: None,
+                modifiers,
+            },
+        );
+        assert!(clicked.error.is_none(), "{clicked:?}");
+        let events = page_value(
+            &fixture,
+            "window.gestureEvents.filter(e=>e[0]!=='pointermove')",
+        );
+        assert_eq!(
+            events,
+            json!([
+                ["pointerdown", expected, true, 1],
+                ["pointerup", expected, true, 0],
+                ["click", expected, true, 0]
+            ])
+        );
+    }
+    page_value(&fixture, "window.gestureEvents=[];true");
+    let observed = observe(&session, &main);
+    let surface = find(&session, &observed, "canvas", "Modified surface");
+    let dragged = act(
+        &session,
+        surface.clone(),
+        Action::Drag {
+            to: surface,
+            button: None,
+            fraction: Some(Fraction { fx: 0.2, fy: 0.5 }),
+            to_fraction: Some(Fraction { fx: 0.8, fy: 0.5 }),
+            modifiers: vec![PointerModifier::Ctrl, PointerModifier::Shift],
+        },
+    );
+    assert!(dragged.error.is_none(), "{dragged:?}");
+    let events = page_value(&fixture, "window.gestureEvents");
+    let events = events.as_array().unwrap();
+    assert!(events.len() > 6, "{events:?}");
+    assert!(
+        events.iter().all(|e| e[1] == 10 && e[2] == true),
+        "{events:?}"
+    );
+    assert!(events.iter().any(|e| e[0] == "pointermove" && e[3] == 1));
+    assert!(events.iter().any(|e| e[0] == "pointerup" && e[3] == 0));
+
+    let observed = observe(&session, &main);
+    let card: Target =
+        serde_json::from_value(node(&observed, "Modified card")["target"].clone()).unwrap();
+    let bin: Target =
+        serde_json::from_value(node(&observed, "Modified bin")["target"].clone()).unwrap();
+    let dropped = act(
+        &session,
+        card,
+        Action::Drag {
+            to: bin,
+            button: None,
+            fraction: None,
+            to_fraction: None,
+            modifiers: vec![PointerModifier::Alt, PointerModifier::Ctrl],
+        },
+    );
+    assert!(dropped.error.is_none(), "{dropped:?}");
+    assert_eq!(
+        page_value(&fixture, "window.dropped"),
+        json!(["modified-card", 3, true])
+    );
+    // An ordinary later event has no modifiers or held mouse button, and no
+    // keyboard events were sent to the independently focused element.
+    page_value(&fixture, "window.gestureEvents=[];true");
+    let hovered = act_on(
+        &session,
+        &main,
+        "canvas",
+        "Modified surface",
+        Action::Hover {
+            fraction: None,
+            ms: Some(1),
+        },
+    );
+    assert!(hovered.error.is_none(), "{hovered:?}");
+    assert_eq!(
+        page_value(&fixture, "window.gestureEvents"),
+        json!([["pointermove", 0, true, 0]])
+    );
+    assert_eq!(page_value(&fixture, "window.keyEvents"), json!([]));
+}
+
+#[test]
+#[ignore = "requires isolated Chromium with its sandbox enabled; CI runs it explicitly"]
 fn drags_move_pointer_sortables_and_html5_draggables() {
     let _serial = serial();
     let fixture = Fixture::new();
@@ -871,6 +998,7 @@ fn drags_move_pointer_sortables_and_html5_draggables() {
         &session,
         card,
         Action::Drag {
+            modifiers: Vec::new(),
             to: bin,
             button: None,
             fraction: None,
@@ -954,6 +1082,7 @@ fn controls_inside_open_shadow_roots_are_observed_and_operated() {
         "button",
         "Go",
         Action::Click {
+            modifiers: Vec::new(),
             button: None,
             count: None,
             fraction: Some(Fraction { fx: 0.5, fy: 0.5 }),
@@ -993,6 +1122,7 @@ fn frame_of(session: &Session, wanted: impl Fn(&Value) -> bool) -> Value {
 }
 fn trusted_click() -> Action {
     Action::Click {
+        modifiers: Vec::new(),
         button: None,
         count: None,
         fraction: Some(Fraction { fx: 0.5, fy: 0.5 }),
@@ -1039,6 +1169,7 @@ fn frames_in_and_out_of_process_take_trusted_pointer_and_keyboard_input() {
         "button",
         "CrossButton",
         Action::Click {
+            modifiers: Vec::new(),
             button: Some(Button::Right),
             count: None,
             fraction: None,
@@ -1833,6 +1964,7 @@ fn tabs_open_front_and_close_and_popups_name_their_opener() {
         &session,
         popup,
         Action::Click {
+            modifiers: Vec::new(),
             button: None,
             count: None,
             fraction: Some(Fraction { fx: 0.5, fy: 0.5 }),
@@ -2340,6 +2472,7 @@ fn browser_actions_are_observed_document_bound_and_have_real_page_effects() {
         &session,
         target,
         Action::Click {
+            modifiers: Vec::new(),
             button: Some(Button::Right),
             count: None,
             fraction: None,
@@ -2353,6 +2486,7 @@ fn browser_actions_are_observed_document_bound_and_have_real_page_effects() {
         &session,
         target,
         Action::Click {
+            modifiers: Vec::new(),
             button: None,
             count: Some(2),
             fraction: None
@@ -2424,6 +2558,7 @@ fn browser_actions_are_observed_document_bound_and_have_real_page_effects() {
         &session,
         target,
         Action::Click {
+            modifiers: Vec::new(),
             button: None,
             count: None,
             fraction: Some(Fraction { fx: 0.5, fy: 0.5 }),

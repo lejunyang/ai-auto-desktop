@@ -21,8 +21,8 @@ use aad_windows::capture::{crop, extended_frame, intersect, print_window};
 use aad_windows::clipboard::Paste;
 use aad_windows::com::ensure as ensure_com;
 use aad_windows::input::{
-    button_events, deliver_atomically, deliver_drag, deliver_scroll, deliver_with_safe_fallback,
-    mouse_event, release_pressed_prefix, to_absolute, Chord, KeyTextSequence,
+    button_events, deliver_atomically, deliver_pointer, deliver_scroll, mouse_event,
+    release_pressed_prefix, to_absolute, Chord, KeyTextSequence,
 };
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Sender};
@@ -641,7 +641,7 @@ impl Backend for WindowsUiaBackend {
         // if the atomic batch is refused, sending them individually is a
         // faithful fallback. Verified to work on a machine where the batch was
         // refused by an input hook.
-        Ok(deliver_with_safe_fallback(&inputs, "the click")?)
+        Ok(deliver_pointer(&inputs, &[], "the click")?)
     }
 
     fn pointer_gesture(
@@ -681,7 +681,12 @@ impl Backend for WindowsUiaBackend {
         // A click is a move plus ordered press/release pairs; if the atomic
         // batch is refused, sending the events in order is a faithful fallback,
         // as with pointer_click.
-        Ok(deliver_with_safe_fallback(&inputs, "the pointer gesture")?)
+        ensure_pointer_modifier_focus(handle, &gesture.modifiers)?;
+        Ok(deliver_pointer(
+            &inputs,
+            &gesture.modifiers,
+            "the pointer gesture",
+        )?)
     }
 
     fn drag(
@@ -723,7 +728,8 @@ impl Backend for WindowsUiaBackend {
         // multi-event batch before delivering anything, so a clean refusal may
         // degrade to ordered single events. Any partial failure triggers a
         // best-effort button release and remains effect=unknown.
-        Ok(deliver_drag(&inputs, end, up)?)
+        ensure_pointer_modifier_focus(handle, &gesture.modifiers)?;
+        Ok(deliver_pointer(&inputs, &gesture.modifiers, "the drag")?)
     }
 
     fn capture_pixels(&self, window_id: &str, node: &Node, whole_window: bool) -> Result<Pixels> {
@@ -1144,6 +1150,30 @@ fn describe_element(
         parent_id,
         children: Vec::new(),
     }
+}
+
+/// Modifier key events must reach the observed window too. A canvas need not
+/// itself accept keyboard focus, but focus must be inside that same window.
+fn ensure_pointer_modifier_focus(handle: HWND, modifiers: &[String]) -> Result<()> {
+    if modifiers.is_empty() {
+        return Ok(());
+    }
+    let foreground = unsafe { GetAncestor(GetForegroundWindow(), GA_ROOT) };
+    let thread = unsafe { GetWindowThreadProcessId(handle, None) };
+    let mut gui = GUITHREADINFO {
+        cbSize: std::mem::size_of::<GUITHREADINFO>() as u32,
+        ..Default::default()
+    };
+    let focused = unsafe { GetGUIThreadInfo(thread, &mut gui) }.is_ok()
+        && !gui.hwndFocus.is_invalid()
+        && unsafe { GetAncestor(gui.hwndFocus, GA_ROOT) } == handle;
+    if foreground != handle || !focused {
+        return Err(DriverError::new(
+            "DRIVER.FOCUS_LOST",
+            "pointer modifiers require keyboard focus in the observed window; no input was sent",
+        ));
+    }
+    Ok(())
 }
 
 /// Focus `element` for keystrokes and prove they would reach it.

@@ -1070,6 +1070,18 @@ impl AtspiBackend for LinuxBackend {
         process_id: u32,
         deadline: Instant,
     ) -> Result<Value, AutomationError> {
+        self.pointer_gesture_modified(target, point, gesture, &[], process_id, deadline)
+    }
+
+    fn pointer_gesture_modified(
+        &self,
+        target: &NativeRef,
+        point: (i32, i32),
+        gesture: Gesture,
+        modifiers: &[String],
+        process_id: u32,
+        deadline: Instant,
+    ) -> Result<Value, AutomationError> {
         let mut args = vec![
             "pointer-gesture".to_string(),
             "--expected-pid".into(),
@@ -1112,9 +1124,18 @@ impl AtspiBackend for LinuxBackend {
                 1
             }
         };
-        let input = self.run_input(target, args, minimum, process_id, deadline)?;
+        if !modifiers.is_empty() {
+            args.extend(["--modifiers".into(), modifiers.join(",")]);
+        }
+        let input = self.run_input(
+            target,
+            args,
+            minimum + 2 * modifiers.len() as u64,
+            process_id,
+            deadline,
+        )?;
         Ok(
-            json!({"native_interface": "XTEST", "input": input, "synthetic_input": true, "point": {"x": point.0, "y": point.1}}),
+            json!({"native_interface": "XTEST", "input": input, "modifiers": modifiers, "synthetic_input": true, "point": {"x": point.0, "y": point.1}}),
         )
     }
 
@@ -1127,7 +1148,20 @@ impl AtspiBackend for LinuxBackend {
         process_id: u32,
         deadline: Instant,
     ) -> Result<Value, AutomationError> {
-        let args = vec![
+        self.drag_modified(target, from, to, button, &[], process_id, deadline)
+    }
+
+    fn drag_modified(
+        &self,
+        target: &NativeRef,
+        from: (i32, i32),
+        to: (i32, i32),
+        button: u8,
+        modifiers: &[String],
+        process_id: u32,
+        deadline: Instant,
+    ) -> Result<Value, AutomationError> {
+        let mut args = vec![
             "drag".to_string(),
             "--expected-pid".into(),
             process_id.to_string(),
@@ -1142,9 +1176,18 @@ impl AtspiBackend for LinuxBackend {
             "--button".into(),
             button.to_string(),
         ];
-        let input = self.run_input(target, args, 3, process_id, deadline)?;
+        if !modifiers.is_empty() {
+            args.extend(["--modifiers".into(), modifiers.join(",")]);
+        }
+        let input = self.run_input(
+            target,
+            args,
+            3 + 2 * modifiers.len() as u64,
+            process_id,
+            deadline,
+        )?;
         Ok(
-            json!({"native_interface": "XTEST", "input": input, "synthetic_input": true, "from": {"x": from.0, "y": from.1}, "to": {"x": to.0, "y": to.1}}),
+            json!({"native_interface": "XTEST", "input": input, "modifiers": modifiers, "synthetic_input": true, "from": {"x": from.0, "y": from.1}, "to": {"x": to.0, "y": to.1}}),
         )
     }
 

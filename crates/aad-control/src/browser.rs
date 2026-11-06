@@ -1,7 +1,7 @@
 //! Explicit CDP page/frame resources. No arbitrary evaluation in the public API.
 use crate::{
-    error, native::resource_id, Action, Backend, BackendResource, Button, Direction, Resource,
-    Result, PAGE_ACTIONS, TAB_ACTIONS,
+    error, native::resource_id, Action, Backend, BackendResource, Button, Direction,
+    PointerModifier, Resource, Result, PAGE_ACTIONS, TAB_ACTIONS,
 };
 use aad_cdp::{Client, Target};
 use aad_core::AutomationError;
@@ -1947,11 +1947,11 @@ impl Backend for BrowserBackend {
             // Trusted pointer input is addressed to the page; the owner
             // elements of enclosing frames are brought into view first.
             let route=if trusted {Route::to(state,frame_id)?} else {Route::default()};
-            if let Action::Drag {to,fraction,to_fraction,button}=action {
+            if let Action::Drag {to,fraction,to_fraction,button,modifiers}=action {
                 let observed=|node_id:&str,fraction:&Option<crate::Fraction>,action:Value|{let mut args=json!({"document_token":snapshot["document_token"],"observation":snapshot["snapshot_id"],"node_id":node_id,"action":action});if let Some(f)=fraction{args["fraction"]=json!({"fx":f.fx,"fy":f.fy});}args};
                 let from=observed(node["node_id"].as_str().unwrap_or_default(),fraction,json!("drag"));
                 let onto=observed(&to.node_id,to_fraction,Value::Null);
-                return drag(state,&context,&route,&from,&onto,*button,action_context);
+                return drag(state,&context,&route,&from,&onto,*button,pointer_modifiers(modifiers),action_context);
             }
             let client=&mut state.client;
             let mut args=json!({"document_token":snapshot["document_token"],"observation":snapshot["snapshot_id"],"node_id":node["node_id"],"action":action.name()});
@@ -2399,6 +2399,19 @@ fn mouse(client: &mut Client, params: Value) -> Result<Value> {
     command(client, "Input.dispatchMouseEvent", params).map_err(|e| e.with_effect("unknown"))
 }
 
+/// CDP carries modifier state on each pointer event, so a gesture does not
+/// send keys to a different focused element or leave modifier keys pressed.
+fn pointer_modifiers(modifiers: &[PointerModifier]) -> u32 {
+    modifiers.iter().fold(0, |bits, modifier| {
+        bits | match modifier {
+            PointerModifier::Alt => ALT,
+            PointerModifier::Ctrl => CTRL,
+            PointerModifier::Meta => META,
+            PointerModifier::Shift => SHIFT,
+        }
+    })
+}
+
 /// Trusted pointer input at a point the page confirmed lands on the node.
 fn pointer(
     client: &mut Client,
@@ -2410,8 +2423,20 @@ fn pointer(
 ) -> Result<Value> {
     let point = landing(client, context, args)?;
     let (x, y) = route.page_point(client, point)?;
+    let modifiers = match action {
+        Action::Click { modifiers, .. } => pointer_modifiers(modifiers),
+        _ => 0,
+    };
     action_context.commit()?;
-    arrive(client, context, route, args, (x, y), action_context)?;
+    arrive(
+        client,
+        context,
+        route,
+        args,
+        (x, y),
+        modifiers,
+        action_context,
+    )?;
     match action {
         Action::Click { button, count, .. } => {
             let (name, mask) = match button {
@@ -2420,14 +2445,22 @@ fn pointer(
                 Some(Button::Middle) => ("middle", 4),
             };
             for click in 1..=count.unwrap_or(1) {
-                mouse(
+                let pressed = mouse(
                     client,
-                    json!({"type": "mousePressed", "x": x, "y": y, "button": name, "buttons": mask, "clickCount": click}),
-                )?;
-                mouse(
+                    json!({"type": "mousePressed", "x": x, "y": y, "button": name, "buttons": mask, "clickCount": click, "modifiers": modifiers}),
+                );
+                // Even an errored dispatch may already have pressed the button.
+                let released = mouse(
                     client,
-                    json!({"type": "mouseReleased", "x": x, "y": y, "button": name, "buttons": 0, "clickCount": click}),
-                )?;
+                    json!({"type": "mouseReleased", "x": x, "y": y, "button": name, "buttons": 0, "clickCount": click, "modifiers": modifiers}),
+                );
+                let cleared = released.is_ok() || mouse(
+                        client,
+                        json!({"type": "mouseReleased", "x": x, "y": y, "button": name, "buttons": 0, "modifiers": 0}),
+                    ).is_ok();
+                pressed
+                    .and(released)
+                    .map_err(|e| e.with_detail("pointer_button_released", json!(cleared)))?;
             }
         }
         Action::Scroll {
@@ -2476,15 +2509,20 @@ const ROUTING: Duration = Duration::from_millis(1500);
 /// by compositor hit-test data that lags behind scrolling, so the move is
 /// repeated until the frame itself reports the element under the pointer
 /// (`:hover`); only then may a button go down.
+#[allow(clippy::too_many_arguments)]
 fn arrive(
     client: &mut Client,
     context: &Ctx,
     route: &Route,
     args: &Value,
     (x, y): (f64, f64),
+    modifiers: u32,
     action_context: &crate::Context,
 ) -> Result<()> {
-    mouse(client, json!({"type": "mouseMoved", "x": x, "y": y}))?;
+    mouse(
+        client,
+        json!({"type": "mouseMoved", "x": x, "y": y, "modifiers": modifiers}),
+    )?;
     if route.levels.is_empty() {
         return Ok(());
     }
@@ -2508,8 +2546,14 @@ fn arrive(
         }
         std::thread::sleep(Duration::from_millis(25));
         // A move to the same point is not delivered again; nudge and return.
-        mouse(client, json!({"type": "mouseMoved", "x": x + 0.5, "y": y}))?;
-        mouse(client, json!({"type": "mouseMoved", "x": x, "y": y}))?;
+        mouse(
+            client,
+            json!({"type": "mouseMoved", "x": x + 0.5, "y": y, "modifiers": modifiers}),
+        )?;
+        mouse(
+            client,
+            json!({"type": "mouseMoved", "x": x, "y": y, "modifiers": modifiers}),
+        )?;
     }
 }
 
@@ -2530,6 +2574,7 @@ fn drag(
     from: &Value,
     onto: &Value,
     button: Option<Button>,
+    modifiers: u32,
     action_context: &crate::Context,
 ) -> Result<Value> {
     let client = &mut page.client;
@@ -2565,24 +2610,29 @@ fn drag(
     page.drag = None;
     action_context.commit()?;
     let client = &mut page.client;
-    command(
+    let enabled = command(
         client,
         "Input.setInterceptDrags",
         json!({"enabled": name == "left"}),
     )
-    .map_err(|e| e.with_effect("unknown"))?;
-    let mut result = || -> Result<Value> {
+    .map_err(|e| e.with_effect("unknown"));
+    let mut held = false;
+    let mut last = start;
+    let result = (|| -> Result<Value> {
+        enabled?;
         arrive(
             &mut page.client,
             context,
             route,
             from,
             start,
+            modifiers,
             action_context,
         )?;
+        held = true;
         mouse(
             &mut page.client,
-            json!({"type": "mousePressed", "x": start.0, "y": start.1, "button": name, "buttons": mask, "clickCount": 1}),
+            json!({"type": "mousePressed", "x": start.0, "y": start.1, "button": name, "buttons": mask, "clickCount": 1, "modifiers": modifiers}),
         )?;
         let mut intercepted = None;
         for step in 1..=DRAG_STEPS {
@@ -2591,9 +2641,10 @@ fn drag(
                 start.0 + (end.0 - start.0) * f,
                 start.1 + (end.1 - start.1) * f,
             );
+            last = (x, y);
             mouse(
                 &mut page.client,
-                json!({"type": "mouseMoved", "x": x, "y": y, "button": name, "buttons": mask}),
+                json!({"type": "mouseMoved", "x": x, "y": y, "button": name, "buttons": mask, "modifiers": modifiers}),
             )?;
             page.sync_dialog();
             if let Some(data) = page.drag.take() {
@@ -2614,7 +2665,7 @@ fn drag(
                     command(
                         client,
                         "Input.dispatchDragEvent",
-                        json!({"type": kind, "x": end.0, "y": end.1, "data": data}),
+                        json!({"type": kind, "x": end.0, "y": end.1, "data": data, "modifiers": modifiers}),
                     )
                     .map_err(|e| e.with_effect("unknown"))?;
                 }
@@ -2622,22 +2673,43 @@ fn drag(
             }
             None => "Input.dispatchMouseEvent",
         };
+        last = end;
         mouse(
             client,
-            json!({"type": "mouseReleased", "x": end.0, "y": end.1, "button": name, "buttons": 0, "clickCount": 1}),
+            json!({"type": "mouseReleased", "x": end.0, "y": end.1, "button": name, "buttons": 0, "clickCount": 1, "modifiers": modifiers}),
         )?;
+        held = false;
         Ok(
             json!({"submitted": true, "native_operation": operation, "trusted_event": true,
                 "html5_drag": intercepted.is_some(), "steps": DRAG_STEPS}),
         )
+    })();
+    let cleared = if held {
+        // Cleanup is best effort; preserve the original error and its unknown
+        // effect if the renderer or the connection can no longer answer.
+        mouse(
+            &mut page.client,
+            json!({"type": "mouseReleased", "x": last.0, "y": last.1, "button": name, "buttons": 0, "modifiers": 0}),
+        ).is_ok()
+    } else {
+        true
     };
-    let result = result();
-    let _ = command(
+    let disabled = command(
         &mut page.client,
         "Input.setInterceptDrags",
         json!({"enabled": false}),
     );
+    let interception_cleared = disabled.is_ok();
     result
+        .and_then(|value| {
+            disabled
+                .map(|_| value)
+                .map_err(|e| e.with_effect("unknown"))
+        })
+        .map_err(|e| {
+            e.with_detail("pointer_button_released", json!(cleared))
+                .with_detail("drag_interception_cleared", json!(interception_cleared))
+        })
 }
 
 /// Files into the observed file input. The session has already resolved the

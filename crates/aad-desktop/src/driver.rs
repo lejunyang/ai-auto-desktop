@@ -1004,8 +1004,32 @@ fn parse_button(args: &Value) -> Result<PointerButton> {
     }
 }
 
+fn parse_pointer_modifiers(args: &Value) -> Result<Vec<String>> {
+    let Some(value) = args.get("modifiers") else {
+        return Ok(Vec::new());
+    };
+    let values = value.as_array().ok_or_else(|| {
+        DriverError::invalid("modifiers must be an array of ctrl, shift, alt or meta")
+    })?;
+    let mut modifiers = Vec::new();
+    for value in values {
+        let name = value
+            .as_str()
+            .filter(|name| matches!(*name, "ctrl" | "shift" | "alt" | "meta"))
+            .ok_or_else(|| {
+                DriverError::invalid("unknown pointer modifier; use ctrl, shift, alt or meta")
+            })?;
+        if modifiers.iter().any(|existing| existing == name) {
+            return Err(DriverError::invalid("pointer modifiers must not repeat"));
+        }
+        modifiers.push(name.to_owned());
+    }
+    Ok(modifiers)
+}
+
 fn parse_pointer_gesture(args: &Value) -> Result<PointerGesture> {
     let button = parse_button(args)?;
+    let modifiers = parse_pointer_modifiers(args)?;
     let count = match args.get("count") {
         None => 1,
         Some(Value::Number(number)) if number.as_u64() == Some(1) => 1,
@@ -1087,10 +1111,16 @@ fn parse_pointer_gesture(args: &Value) -> Result<PointerGesture> {
             "a hover cannot also specify a pointer button or click count",
         ));
     }
+    if (scroll.is_some() || hover_ms.is_some()) && !modifiers.is_empty() {
+        return Err(DriverError::invalid(
+            "modifiers are supported for clicks and drags only",
+        ));
+    }
 
     Ok(PointerGesture {
         button,
         count,
+        modifiers,
         fraction: parse_fraction(args, "fraction")?,
         to_fraction: None,
         scroll,
@@ -1109,6 +1139,7 @@ fn parse_drag_gesture(args: &Value) -> Result<PointerGesture> {
     Ok(PointerGesture {
         button: parse_button(args)?,
         count: 1,
+        modifiers: parse_pointer_modifiers(args)?,
         fraction: parse_fraction(args, "fraction")?,
         to_fraction: parse_fraction(args, "to_fraction")?,
         scroll: None,
@@ -1590,6 +1621,34 @@ mod tests {
         assert_eq!(gesture.button, PointerButton::Right);
         assert_eq!(gesture.fraction, Some((0.1, 0.2)));
         assert_eq!(gesture.to_fraction, Some((0.8, 0.9)));
+    }
+
+    #[test]
+    fn pointer_modifiers_are_preserved_and_invalid_combinations_are_refused() {
+        for parse in [parse_pointer_gesture, parse_drag_gesture] {
+            let gesture = parse(&json!({"modifiers": ["ctrl", "shift", "alt", "meta"]})).unwrap();
+            assert_eq!(gesture.modifiers, ["ctrl", "shift", "alt", "meta"]);
+            assert!(parse(&json!({})).unwrap().modifiers.is_empty());
+            for value in [
+                json!(null),
+                json!("ctrl"),
+                json!(["ctrl", "ctrl"]),
+                json!(["win"]),
+                json!([1]),
+            ] {
+                let error = parse(&json!({"modifiers": value})).unwrap_err();
+                assert_eq!(error.code, "DRIVER.INVALID_REQUEST");
+            }
+        }
+        for args in [
+            json!({"modifiers": ["ctrl"], "scroll": {"direction": "down"}}),
+            json!({"modifiers": ["shift"], "hover_ms": 100}),
+        ] {
+            assert_eq!(
+                parse_pointer_gesture(&args).unwrap_err().code,
+                "DRIVER.INVALID_REQUEST"
+            );
+        }
     }
 
     #[test]
