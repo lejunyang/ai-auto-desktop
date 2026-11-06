@@ -314,13 +314,23 @@
       const el=found.el;
       if(!args.noscroll) el.scrollIntoView({block:'nearest',inline:'nearest'});
       const box=el.getBoundingClientRect();
-      // Only the part inside the viewport can receive input; the body of a long page is mostly outside it.
-      const left=Math.max(box.left,0), top=Math.max(box.top,0);
-      const width=Math.min(box.right,innerWidth)-left, height=Math.min(box.bottom,innerHeight)-top;
-      if(width<2 || height<2) return {error:'CONTROL.OCCLUDED'};
       const at=(start,size,f)=>Math.min(start+size-1,Math.max(start+1,start+size*f));
-      const fx=args.fraction?args.fraction.fx:0.5, fy=args.fraction?args.fraction.fy:0.5;
-      const x=at(left,width,fx), y=at(top,height,fy);
+      let x,y;
+      if(args.fraction) {
+        // A fraction describes the full observed element, including portions
+        // clipped by the viewport. Never retarget it to the visible fragment.
+        if(box.width<2 || box.height<2)return {error:'CONTROL.OCCLUDED'};
+        x=at(box.left,box.width,args.fraction.fx);
+        y=at(box.top,box.height,args.fraction.fy);
+        if(x<0 || y<0 || x>=innerWidth || y>=innerHeight)return {error:'CONTROL.OCCLUDED'};
+      } else {
+        // The default still chooses the visible center of a long page body
+        // or a partly clipped element, when no particular part was requested.
+        const left=Math.max(box.left,0), top=Math.max(box.top,0);
+        const width=Math.min(box.right,innerWidth)-left, height=Math.min(box.bottom,innerHeight)-top;
+        if(width<2 || height<2)return {error:'CONTROL.OCCLUDED'};
+        x=at(left,width,0.5); y=at(top,height,0.5);
+      }
       if(!inside(el,deepHit(x,y))) return {error:'CONTROL.OCCLUDED'};
       return {x,y};
     }

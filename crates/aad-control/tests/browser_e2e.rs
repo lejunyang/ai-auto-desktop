@@ -950,6 +950,83 @@ fn a_timed_out_page_key_still_releases_before_any_more_typing() {
 
 #[test]
 #[ignore = "requires isolated Chromium with its sandbox enabled; CI runs it explicitly"]
+fn fractions_stay_relative_to_the_full_element_when_the_viewport_clips_it() {
+    let _serial = serial();
+    let fixture = Fixture::new();
+    let (session, _) = session_for(&fixture);
+    let main = main_of(&session, &fixture.page_id);
+    assert!(wait_until(&session, &main, "Typed", WaitCondition::Appears)
+        .error
+        .is_none());
+    assert_eq!(
+        page_value(
+            &fixture,
+            r#"document.body.innerHTML='<canvas aria-label="Clipped surface" width="1200" height="120" style="position:fixed;left:-300px;top:30px"></canvas>';
+        window.fractionEvents=[];const surface=document.querySelector('canvas');
+        for(const kind of ['mousedown','mouseup'])surface.addEventListener(kind,e=>{
+            const box=surface.getBoundingClientRect();
+            window.fractionEvents.push([kind,Math.round(e.clientX-box.left),Math.round(e.clientY-box.top),e.isTrusted]);
+        });true"#
+        ),
+        true
+    );
+    let click = |fraction| Action::Click {
+        button: None,
+        count: None,
+        fraction,
+        modifiers: Vec::new(),
+        hold_ms: None,
+    };
+    let clicked = act_on(
+        &session,
+        &main,
+        "canvas",
+        "Clipped surface",
+        click(Some(Fraction { fx: 0.5, fy: 0.5 })),
+    );
+    assert!(clicked.error.is_none(), "{clicked:?}");
+    assert_eq!(
+        page_value(&fixture, "window.fractionEvents"),
+        json!([["mousedown", 600, 60, true], ["mouseup", 600, 60, true]])
+    );
+    assert_eq!(page_value(&fixture, "window.fractionEvents=[];true"), true);
+    let invisible = act_on(
+        &session,
+        &main,
+        "canvas",
+        "Clipped surface",
+        click(Some(Fraction { fx: 0.1, fy: 0.5 })),
+    );
+    assert_eq!(invisible.error.unwrap()["code"], "CONTROL.OCCLUDED");
+    assert_eq!(page_value(&fixture, "window.fractionEvents"), json!([]));
+    let observed = observe(&session, &main);
+    let surface = find(&session, &observed, "canvas", "Clipped surface");
+    let dragged = act(
+        &session,
+        surface.clone(),
+        Action::Drag {
+            to: surface,
+            button: None,
+            fraction: Some(Fraction { fx: 0.3, fy: 0.5 }),
+            to_fraction: Some(Fraction { fx: 0.8, fy: 0.5 }),
+            modifiers: Vec::new(),
+            hold_ms: None,
+        },
+    );
+    assert!(dragged.error.is_none(), "{dragged:?}");
+    assert_eq!(
+        page_value(&fixture, "window.fractionEvents"),
+        json!([["mousedown", 360, 60, true], ["mouseup", 960, 60, true]])
+    );
+    assert_eq!(page_value(&fixture, "window.fractionEvents=[];true"), true);
+    // No explicit fraction still picks a visible point.
+    let clicked = act_on(&session, &main, "canvas", "Clipped surface", click(None));
+    assert!(clicked.error.is_none(), "{clicked:?}");
+    assert_eq!(page_value(&fixture, "window.fractionEvents.length"), 2);
+}
+
+#[test]
+#[ignore = "requires isolated Chromium with its sandbox enabled; CI runs it explicitly"]
 fn bounded_holds_have_real_durations_and_release_on_focus_occlusion_and_cancel() {
     let _serial = serial();
     let fixture = Fixture::new();
