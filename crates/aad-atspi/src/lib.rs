@@ -5,9 +5,9 @@
 //! accessibility D-Bus with pure-Rust `zbus`; no Python worker is involved.
 
 use aad_core::AutomationError;
-use aad_plugin::{CapabilityManifest, manifest};
+use aad_plugin::{manifest, CapabilityManifest};
 use aad_runtime::{ArtifactStore, CancellationToken, Provider};
-use serde_json::{Map, Value, json};
+use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{Arc, Mutex, TryLockError};
@@ -4670,25 +4670,19 @@ mod tests {
         .unwrap();
         let first = cross_snapshot(&provider, 4242);
         let replaced = cross_snapshot(&provider, 4242);
-        assert!(
-            provider
-                .current_record(&first["snapshot_id"], &first["revision"])
-                .is_err()
-        );
-        assert!(
-            provider
-                .current_record(&replaced["snapshot_id"], &replaced["revision"])
-                .is_ok()
-        );
+        assert!(provider
+            .current_record(&first["snapshot_id"], &first["revision"])
+            .is_err());
+        assert!(provider
+            .current_record(&replaced["snapshot_id"], &replaced["revision"])
+            .is_ok());
         for pid in 4243..4259 {
             cross_snapshot(&provider, pid);
         }
         assert_eq!(provider.state.lock().unwrap().retained.len(), 16);
-        assert!(
-            provider
-                .current_record(&replaced["snapshot_id"], &replaced["revision"])
-                .is_err()
-        );
+        assert!(provider
+            .current_record(&replaced["snapshot_id"], &replaced["revision"])
+            .is_err());
         let latest = cross_snapshot(&provider, 4260);
         {
             let mut state = provider.state.lock().unwrap();
@@ -4696,11 +4690,9 @@ mod tests {
                 r.created -= Duration::from_secs(301);
             }
         }
-        assert!(
-            provider
-                .current_record(&latest["snapshot_id"], &latest["revision"])
-                .is_err()
-        );
+        assert!(provider
+            .current_record(&latest["snapshot_id"], &latest["revision"])
+            .is_err());
     }
 
     #[test]
@@ -4724,26 +4716,22 @@ mod tests {
                 }
                 _ => {}
             }
-            assert!(
-                provider
-                    .invoke(
-                        "desktop.linux_atspi.drag_between@1",
-                        args,
-                        Some(Duration::from_secs(2))
-                    )
-                    .is_err()
-            );
+            assert!(provider
+                .invoke(
+                    "desktop.linux_atspi.drag_between@1",
+                    args,
+                    Some(Duration::from_secs(2))
+                )
+                .is_err());
             assert_eq!(backend.writes.load(Ordering::SeqCst), 0);
             if variant != "unsupported" {
-                assert!(
-                    provider
-                        .state
-                        .lock()
-                        .unwrap()
-                        .retained
-                        .iter()
-                        .all(|r| !r.valid)
-                );
+                assert!(provider
+                    .state
+                    .lock()
+                    .unwrap()
+                    .retained
+                    .iter()
+                    .all(|r| !r.valid));
             }
         }
     }

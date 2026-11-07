@@ -3,10 +3,10 @@ use aad_atspi::{
 };
 use aad_core::AutomationError;
 use aad_runtime::Provider;
-use serde_json::{Map, Value, json};
+use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 #[derive(Default)]

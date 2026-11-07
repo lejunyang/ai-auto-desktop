@@ -691,7 +691,9 @@ impl LinuxBackend {
                     zbus::block_on(proxy.get_text(0, count.clamp(0, MAX_FIELD_CHARS as i32))).ok()
                 })
         };
-        let action_metadata = self.canonical_actions(&target, deadline).unwrap_or_default();
+        let action_metadata = self
+            .canonical_actions(&target, deadline)
+            .unwrap_or_default();
         let toolkit = application.get("toolkit_name").and_then(Value::as_str);
         let toolkit_version = application
             .get("toolkit_version")
@@ -1098,7 +1100,10 @@ impl AtspiBackend for LinuxBackend {
         self.check_cancelled(false)?;
         let actions = self.canonical_actions(target, deadline)?;
         let selected = actions::unique_activation(&actions).ok_or_else(|| {
-            driver_error("DRIVER.ACTION_UNSUPPORTED", "invoke has no unique qualified native action")
+            driver_error(
+                "DRIVER.ACTION_UNSUPPORTED",
+                "invoke has no unique qualified native action",
+            )
         })?;
         self.invoke_canonical(target, &selected.name, deadline)
     }
