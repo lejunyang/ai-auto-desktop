@@ -651,9 +651,8 @@ fn typing_sends_trusted_keystrokes_and_shortcuts_stay_on_the_focused_field() {
     let fixture = Fixture::new();
     let (session, _) = session_for(&fixture);
     let main = main_of(&session, &fixture.page_id);
-    assert!(wait_until(&session, &main, "Typed", WaitCondition::Appears)
-        .error
-        .is_none());
+    let ready = wait_until(&session, &main, "Typed", WaitCondition::Appears);
+    assert!(ready.error.is_none(), "{ready:?}");
     let observed = observe(&session, &main);
     assert!(actions(&observed, "Typed").contains(&"type_text".to_string()));
     assert!(!actions(&observed, "Save").contains(&"type_text".to_string()));
@@ -732,9 +731,8 @@ fn page_shortcuts_reach_editors_without_falling_back_to_browser_ui() {
     let fixture = Fixture::with_mode(false, headed);
     let (session, _) = session_for(&fixture);
     let main = main_of(&session, &fixture.page_id);
-    assert!(wait_until(&session, &main, "Typed", WaitCondition::Appears)
-        .error
-        .is_none());
+    let ready = wait_until(&session, &main, "Typed", WaitCondition::Appears);
+    assert!(ready.error.is_none(), "{ready:?}");
     assert_eq!(
         page_value(
             &fixture,
@@ -901,9 +899,8 @@ fn a_timed_out_page_key_still_releases_before_any_more_typing() {
     let fixture = Fixture::new();
     let (session, _) = session_for(&fixture);
     let main = main_of(&session, &fixture.page_id);
-    assert!(wait_until(&session, &main, "Typed", WaitCondition::Appears)
-        .error
-        .is_none());
+    let ready = wait_until(&session, &main, "Typed", WaitCondition::Appears);
+    assert!(ready.error.is_none(), "{ready:?}");
     assert_eq!(
         page_value(
             &fixture,
@@ -961,9 +958,8 @@ fn closed_shadow_hosts_are_observed_visual_surfaces_with_trusted_pointer_input()
     let fixture = Fixture::new();
     let (session, _) = session_for(&fixture);
     let main = main_of(&session, &fixture.page_id);
-    assert!(wait_until(&session, &main, "Typed", WaitCondition::Appears)
-        .error
-        .is_none());
+    let ready = wait_until(&session, &main, "Typed", WaitCondition::Appears);
+    assert!(ready.error.is_none(), "{ready:?}");
     assert_eq!(
         page_value(
             &fixture,
@@ -1158,9 +1154,8 @@ fn closed_shadow_passwords_block_surface_input_and_covering_captures() {
     let fixture = Fixture::new();
     let (session, _) = session_for(&fixture);
     let main = main_of(&session, &fixture.page_id);
-    assert!(wait_until(&session, &main, "Typed", WaitCondition::Appears)
-        .error
-        .is_none());
+    let ready = wait_until(&session, &main, "Typed", WaitCondition::Appears);
+    assert!(ready.error.is_none(), "{ready:?}");
     assert_eq!(
         page_value(
             &fixture,
@@ -1318,9 +1313,8 @@ fn fractions_stay_relative_to_the_full_element_when_the_viewport_clips_it() {
     let fixture = Fixture::new();
     let (session, _) = session_for(&fixture);
     let main = main_of(&session, &fixture.page_id);
-    assert!(wait_until(&session, &main, "Typed", WaitCondition::Appears)
-        .error
-        .is_none());
+    let ready = wait_until(&session, &main, "Typed", WaitCondition::Appears);
+    assert!(ready.error.is_none(), "{ready:?}");
     assert_eq!(
         page_value(
             &fixture,
@@ -1397,9 +1391,8 @@ fn bounded_holds_have_real_durations_and_release_on_focus_occlusion_and_cancel()
     let (session, _) = session_for(&fixture);
     let session = Arc::new(session);
     let main = main_of(&session, &fixture.page_id);
-    assert!(wait_until(&session, &main, "Typed", WaitCondition::Appears)
-        .error
-        .is_none());
+    let ready = wait_until(&session, &main, "Typed", WaitCondition::Appears);
+    assert!(ready.error.is_none(), "{ready:?}");
     assert_eq!(
         page_value(
             &fixture,
@@ -1612,9 +1605,8 @@ fn drag_paths_draw_the_requested_shape_on_canvas_and_closed_shadow_surfaces() {
     let fixture = Fixture::new();
     let (session, _) = session_for(&fixture);
     let main = main_of(&session, &fixture.page_id);
-    assert!(wait_until(&session, &main, "Typed", WaitCondition::Appears)
-        .error
-        .is_none());
+    let ready = wait_until(&session, &main, "Typed", WaitCondition::Appears);
+    assert!(ready.error.is_none(), "{ready:?}");
     for closed in [false, true] {
         assert_eq!(
             page_value(
@@ -1710,9 +1702,8 @@ fn drag_paths_preflight_every_anchor_and_release_after_mutation_timeout_or_cance
     let (session, _) = session_for(&fixture);
     let session = Arc::new(session);
     let main = main_of(&session, &fixture.page_id);
-    assert!(wait_until(&session, &main, "Typed", WaitCondition::Appears)
-        .error
-        .is_none());
+    let ready = wait_until(&session, &main, "Typed", WaitCondition::Appears);
+    assert!(ready.error.is_none(), "{ready:?}");
     assert_eq!(
         page_value(
             &fixture,
@@ -2107,9 +2098,8 @@ fn pointer_modifiers_reach_click_drag_and_drop_without_keyboard_state() {
     let fixture = Fixture::new();
     let (session, _) = session_for(&fixture);
     let main = main_of(&session, &fixture.page_id);
-    assert!(wait_until(&session, &main, "Name", WaitCondition::Appears)
-        .error
-        .is_none());
+    let ready = wait_until(&session, &main, "Name", WaitCondition::Appears);
+    assert!(ready.error.is_none(), "{ready:?}");
     page_value(
         &fixture,
         r#"document.body.innerHTML='<canvas aria-label="Modified surface" tabindex="0" width="300" height="120"></canvas><div draggable="true" aria-label="Modified card" style="width:80px;height:40px">Card</div><div aria-label="Modified bin" style="width:120px;height:60px">Bin</div>';
@@ -2237,9 +2227,8 @@ fn drags_move_pointer_sortables_and_html5_draggables() {
     let fixture = Fixture::new();
     let (session, _) = session_for(&fixture);
     let main = main_of(&session, &fixture.page_id);
-    assert!(wait_until(&session, &main, "Bin", WaitCondition::Appears)
-        .error
-        .is_none());
+    let ready = wait_until(&session, &main, "Bin", WaitCondition::Appears);
+    assert!(ready.error.is_none(), "{ready:?}");
     let observed = observe(&session, &main);
     for name in ["One", "Card"] {
         assert!(
@@ -3412,9 +3401,8 @@ fn tabs_open_front_and_close_and_popups_name_their_opener() {
     let fixture = Fixture::new();
     let (session, _) = session_for(&fixture);
     let main = main_of(&session, &fixture.page_id);
-    assert!(wait_until(&session, &main, "Name", WaitCondition::Appears)
-        .error
-        .is_none());
+    let ready = wait_until(&session, &main, "Name", WaitCondition::Appears);
+    assert!(ready.error.is_none(), "{ready:?}");
     let observed = observe(&session, &main);
     let offered = &observed["nodes"]
         .as_array()
@@ -3540,9 +3528,8 @@ fn uploads_reach_file_inputs_only_from_allowed_directories() {
         },
     );
     let main = main_of(&session, &fixture.page_id);
-    assert!(wait_until(&session, &main, "Name", WaitCondition::Appears)
-        .error
-        .is_none());
+    let ready = wait_until(&session, &main, "Name", WaitCondition::Appears);
+    assert!(ready.error.is_none(), "{ready:?}");
     let observed = observe(&session, &main);
     // A file input takes files and nothing else.
     assert_eq!(actions(&observed, "Attachment"), vec!["upload".to_string()]);
@@ -3651,9 +3638,8 @@ fn downloads_land_in_the_session_directory_and_are_listed() {
         },
     );
     let main = main_of(&session, &fixture.page_id);
-    assert!(wait_until(&session, &main, "Name", WaitCondition::Appears)
-        .error
-        .is_none());
+    let ready = wait_until(&session, &main, "Name", WaitCondition::Appears);
+    assert!(ready.error.is_none(), "{ready:?}");
     let before = backend.downloads(Duration::from_secs(5)).unwrap();
     assert_eq!(before["tracking"], true, "{before}");
     assert_eq!(before["downloads"], json!([]));
@@ -3708,9 +3694,8 @@ fn dialogs_block_the_page_until_accepted_or_dismissed() {
     let fixture = Fixture::new();
     let (session, _) = session_for(&fixture);
     let main = main_of(&session, &fixture.page_id);
-    assert!(wait_until(&session, &main, "Name", WaitCondition::Appears)
-        .error
-        .is_none());
+    let ready = wait_until(&session, &main, "Name", WaitCondition::Appears);
+    assert!(ready.error.is_none(), "{ready:?}");
 
     // A click that opens a prompt is delivered; the page then shows the prompt.
     let observed = observe(&session, &main);
