@@ -92,7 +92,8 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .args([
             format!("--remote-debugging-port={}", args.port),
             "--remote-debugging-address=127.0.0.1".into(),
-            format!("--user-data-dir={}", work.canonicalize()?.display()),
+            // Not `\\?\`: Chromium on Windows would not persist cookies.
+            format!("--user-data-dir={}", dunce::canonicalize(&work)?.display()),
             "--profile-directory=Default".into(),
             "--no-first-run".into(),
             "--no-default-browser-check".into(),

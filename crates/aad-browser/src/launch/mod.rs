@@ -76,7 +76,9 @@ impl Profile {
         } else {
             fs::create_dir_all(&path)?;
         }
-        let path = path.canonicalize()?;
+        // Chromium on Windows silently skips persisting cookies when its
+        // user-data-dir is a verbatim `\\?\` path, so keep the plain form.
+        let path = dunce::canonicalize(path)?;
         let profile = Self {
             path,
             temporary: options.profile_dir.is_none(),
