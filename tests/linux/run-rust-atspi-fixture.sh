@@ -8,12 +8,20 @@ if [ "${1:-}" = --inside-session ]; then
   unset NO_AT_BRIDGE AT_SPI_BUS_ADDRESS
   export QT_ACCESSIBILITY=1
   export QT_LINUX_ACCESSIBILITY_ALWAYS_ON=1
+  # Qt input actions are offered only once AT-SPI coordinates are calibrated
+  # against a uniquely bound EWMH client window, which needs a window manager.
+  openbox >"${TMPDIR:-/tmp}/aad-rust-atspi-openbox.out" 2>&1 &
+  openbox_pid=$!
+  for _ in $(seq 1 50); do
+    xprop -root _NET_SUPPORTING_WM_CHECK 2>/dev/null | grep -q 'window id' && break
+    sleep 0.1
+  done
   fixture_log=${TMPDIR:-/tmp}/aad-rust-atspi-fixture.out
   "$AAD_ATSPI_FIXTURE_BINARY" >"$fixture_log" 2>&1 &
   fixture_pid=$!
   finish_fixture() {
-    kill "$fixture_pid" 2>/dev/null || true
-    wait "$fixture_pid" 2>/dev/null || true
+    kill "$fixture_pid" "$openbox_pid" 2>/dev/null || true
+    wait "$fixture_pid" "$openbox_pid" 2>/dev/null || true
   }
   trap finish_fixture EXIT HUP INT TERM
   # Output is mostly sent to /dev/null or jq; say which step stopped the run.
