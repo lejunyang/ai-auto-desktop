@@ -238,6 +238,11 @@ impl Client {
         self.deadline = Some(deadline);
     }
 
+    /// The deadline that currently bounds every request, if any.
+    pub fn deadline(&self) -> Option<std::time::Instant> {
+        self.deadline
+    }
+
     pub fn clear_deadline(&mut self) {
         self.deadline = None;
     }

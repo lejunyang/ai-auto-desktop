@@ -826,7 +826,12 @@ impl BrowserBackend {
     }
 
     fn access_frames(&self, page: &mut Page) -> Result<Vec<(String, FrameEntry)>> {
-        let until = Instant::now() + Duration::from_millis(200);
+        // A freshly opened tab can take well over 200ms to publish its first
+        // main-frame URL on a cold browser; never outlast the request itself.
+        let mut until = Instant::now() + Duration::from_secs(2);
+        if let Some(deadline) = page.client.deadline() {
+            until = until.min(deadline);
+        }
         loop {
             let frames = frame_map(page)?;
             if frames.iter().any(|(_, entry)| {
@@ -838,10 +843,12 @@ impl BrowserBackend {
                 return Ok(frames);
             }
             if Instant::now() >= until {
+                // Waits poll through this; actions still stop and re-observe.
                 return Err(error(
                     "CONTROL.STALE_TARGET",
                     "browser main document URL is not ready; observe again",
-                ));
+                )
+                .with_detail("document_ready", json!(false)));
             }
             // The CDP client's original request deadline still bounds each
             // refresh. Never substitute the previously granted URL.

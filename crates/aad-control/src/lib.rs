@@ -1987,8 +1987,13 @@ impl Session {
             let (observation_id, observation) =
                 match self.observe_resource_scoped(resource_id, max_nodes, scope, None, context) {
                     Ok(observed) => observed,
-                    // The page was between documents: keep polling.
-                    Err(e) if e.code == "BROWSER.CONTEXT_LOST" => {
+                    // The page was between documents, or its new document has
+                    // no URL yet: keep polling.
+                    Err(e)
+                        if e.code == "BROWSER.CONTEXT_LOST"
+                            || (e.code == "CONTROL.STALE_TARGET"
+                                && e.details.get("document_ready") == Some(&json!(false))) =>
+                    {
                         let remaining = context.remaining()?;
                         if remaining < interval + Duration::from_millis(200) {
                             return Err(e.with_detail("polls", json!(polls)));
