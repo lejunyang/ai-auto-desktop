@@ -416,6 +416,20 @@ impl RemoteClient {
         let (tx, rx) = mpsc::sync_channel(1);
         {
             let mut pending = self.pending.lock().unwrap();
+            // Recheck under the lock: the reader marks the transport closed
+            // before it takes this lock to drop every pending sender, so a
+            // request either sees `closed` here or is woken by that clear.
+            // Checked only above, a request racing a terminal response could
+            // register after the reader exited and wait out its whole timeout.
+            if self.closed.load(Ordering::SeqCst) {
+                return failure(
+                    request,
+                    &self.id,
+                    "CONTROL.DISCONNECTED",
+                    "control transport is closed",
+                    false,
+                );
+            }
             if pending.len() >= MAX_IN_FLIGHT {
                 return failure(
                     request,
