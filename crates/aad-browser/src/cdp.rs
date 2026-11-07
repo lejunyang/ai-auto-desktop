@@ -402,7 +402,7 @@ fn http_get(port: u16, path: &str) -> Result<String, CdpError> {
 fn http_get_until(port: u16, path: &str, deadline: std::time::Instant) -> Result<String, CdpError> {
     http_get_cancellable(port, path, deadline, None)
 }
-fn http_get_cancellable(
+pub(crate) fn http_get_cancellable(
     port: u16,
     path: &str,
     deadline: std::time::Instant,
