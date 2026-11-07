@@ -4,7 +4,7 @@ version = 3
 
 [[package]]
 name = "aad-atspi"
-version = "0.0.6"
+version = "0.0.8"
 dependencies = [
  "aad-core",
  "aad-linux",
@@ -21,7 +21,7 @@ dependencies = [
 
 [[package]]
 name = "aad-bidi"
-version = "0.0.6"
+version = "0.0.8"
 dependencies = [
  "aad-cdp",
  "serde_json",
@@ -29,7 +29,7 @@ dependencies = [
 
 [[package]]
 name = "aad-cdp"
-version = "0.0.6"
+version = "0.0.8"
 dependencies = [
  "base64 0.22.1",
  "clap",
@@ -45,7 +45,7 @@ dependencies = [
 
 [[package]]
 name = "aad-cli"
-version = "0.0.6"
+version = "0.0.8"
 dependencies = [
  "aad-atspi",
  "aad-cdp",
@@ -78,7 +78,7 @@ dependencies = [
 
 [[package]]
 name = "aad-control"
-version = "0.0.6"
+version = "0.0.8"
 dependencies = [
  "aad-atspi",
  "aad-bidi",
@@ -106,7 +106,7 @@ dependencies = [
 
 [[package]]
 name = "aad-core"
-version = "0.0.6"
+version = "0.0.8"
 dependencies = [
  "indexmap 2.14.1",
  "serde",
@@ -117,7 +117,7 @@ dependencies = [
 
 [[package]]
 name = "aad-desktop"
-version = "0.0.6"
+version = "0.0.8"
 dependencies = [
  "aad-core",
  "aad-platform",
@@ -133,7 +133,7 @@ dependencies = [
 
 [[package]]
 name = "aad-gui"
-version = "0.0.6"
+version = "0.0.8"
 dependencies = [
  "aad-control",
  "aad-core",
@@ -147,7 +147,7 @@ dependencies = [
 
 [[package]]
 name = "aad-linux"
-version = "0.0.6"
+version = "0.0.8"
 dependencies = [
  "aad-platform",
  "base64 0.22.1",
@@ -162,7 +162,7 @@ dependencies = [
 
 [[package]]
 name = "aad-macos"
-version = "0.0.6"
+version = "0.0.8"
 dependencies = [
  "aad-platform",
  "base64 0.22.1",
@@ -180,7 +180,7 @@ dependencies = [
 
 [[package]]
 name = "aad-macos-ax"
-version = "0.0.6"
+version = "0.0.8"
 dependencies = [
  "aad-core",
  "aad-plugin",
@@ -196,7 +196,7 @@ dependencies = [
 
 [[package]]
 name = "aad-mcp"
-version = "0.0.6"
+version = "0.0.8"
 dependencies = [
  "aad-cdp",
  "aad-control",
@@ -213,7 +213,7 @@ dependencies = [
 
 [[package]]
 name = "aad-ocr"
-version = "0.0.6"
+version = "0.0.8"
 dependencies = [
  "aad-core",
  "aad-plugin",
@@ -228,14 +228,14 @@ dependencies = [
 
 [[package]]
 name = "aad-platform"
-version = "0.0.6"
+version = "0.0.8"
 dependencies = [
  "serde_json",
 ]
 
 [[package]]
 name = "aad-plugin"
-version = "0.0.6"
+version = "0.0.8"
 dependencies = [
  "aad-core",
  "serde",
@@ -247,7 +247,7 @@ dependencies = [
 
 [[package]]
 name = "aad-probe"
-version = "0.0.6"
+version = "0.0.8"
 dependencies = [
  "aad-linux",
  "aad-macos",
@@ -260,7 +260,7 @@ dependencies = [
 
 [[package]]
 name = "aad-runtime"
-version = "0.0.6"
+version = "0.0.8"
 dependencies = [
  "aad-core",
  "aad-plugin",
@@ -276,7 +276,7 @@ dependencies = [
 
 [[package]]
 name = "aad-uia"
-version = "0.0.6"
+version = "0.0.8"
 dependencies = [
  "aad-core",
  "aad-desktop",
@@ -293,7 +293,7 @@ dependencies = [
 
 [[package]]
 name = "aad-windows"
-version = "0.0.6"
+version = "0.0.8"
 dependencies = [
  "aad-platform",
  "base64 0.22.1",
