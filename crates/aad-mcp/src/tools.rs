@@ -1554,13 +1554,16 @@ pub(crate) mod tests {
         assert_eq!(step["properties"]["locator"]["additionalProperties"], false);
         // The actions are control_act's, so every provider's can be saved.
         let variants = step["properties"]["action"]["oneOf"].as_array().unwrap();
+        // Except secret_input: protected input is immediate-only and never saved.
         for action in aad_control::ACTION_NAMES {
-            assert!(
-                variants
-                    .iter()
-                    .any(|variant| variant["properties"]["type"]["const"] == *action),
-                "{action} must be savable"
-            );
+            let savable = variants
+                .iter()
+                .any(|variant| variant["properties"]["type"]["const"] == *action);
+            if action == "secret_input" {
+                assert!(!savable, "secret_input must never be savable");
+            } else {
+                assert!(savable, "{action} must be savable");
+            }
         }
         let drag = variants
             .iter()
