@@ -1573,8 +1573,20 @@ impl AtspiBackend for LinuxBackend {
         process_id: u32,
         deadline: Instant,
     ) -> Result<Value, AutomationError> {
-        self.verify_coordinate_target(target, deadline)?;
         let path = self.input_helper("window-action", deadline)?;
+        if let Err(unproven) = self.verify_coordinate_target(target, deadline) {
+            // A minimized window is unmapped, so it can never be calibrated.
+            // EWMH actions need no pointer coordinates: accept it only when
+            // the helper binds exactly these bounds to this process's
+            // minimized client, as the snapshot did when offering restore.
+            let minimized = unproven.code == "DRIVER.COORDINATE_UNPROVEN"
+                && self
+                    .window_info(process_id, bounds, &path, deadline)
+                    .is_some_and(|info| info["minimized"] == true);
+            if !minimized {
+                return Err(unproven);
+            }
+        }
         let mut args = window_args("window-action", process_id, bounds);
         args.extend([
             "--action".into(),
@@ -1924,9 +1936,11 @@ impl LinuxBackend {
             return;
         };
         for node in nodes.iter_mut() {
-            if node.provenance.get("coordinate_space") == Some(&json!("unproven_toolkit")) {
-                continue;
-            }
+            // Uncalibrated bounds stay toolkit-logical, so a mapped window is
+            // skipped. A minimized one is unmapped and can never be calibrated;
+            // the helper below still binds it by these exact bounds.
+            let unproven =
+                node.provenance.get("coordinate_space") == Some(&json!("unproven_toolkit"));
             // A direct child of the application is a top-level window: GTK and
             // Qt main windows say frame/dialog, a bare QWidget window filler.
             // The helper still proves an X11 client window of this process
@@ -1943,6 +1957,9 @@ impl LinuxBackend {
             };
             let supports = |name: &str| info["supports"][name] == true;
             let minimized = info["minimized"] == true;
+            if unproven && !minimized {
+                continue;
+            }
             let maximized = info["maximized"] == true;
             let mut offered = Vec::new();
             if !minimized {
