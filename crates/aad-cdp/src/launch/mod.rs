@@ -1,5 +1,6 @@
 //! Explicit browser startup shared with aad-browser. Recording owns only the
 //! process/profile it launches; attaching to an existing page stays separate.
+mod lease;
 mod occupancy;
 mod profile;
 pub use occupancy::ensure_available;
@@ -10,9 +11,10 @@ pub use profile::{
 
 use crate::{connection::Connection, ws::WebSocket, Client};
 use serde_json::json;
-use std::fs::{self, File, OpenOptions};
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::{mpsc::Sender, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 type Result<T> = crate::recording::Result<T>;
@@ -51,7 +53,7 @@ pub struct Options {
 struct Profile {
     path: PathBuf,
     temporary: bool,
-    lock: Option<File>,
+    lock: Arc<Mutex<Option<lease::Lease>>>,
 }
 
 impl Profile {
@@ -68,15 +70,17 @@ impl Profile {
                 options.kill_browser,
                 authority,
             )?;
+            // Keep the source unavailable to other AAD launches while copying.
+            let _source = lease::Lease::acquire(source)?;
             copy_selected_profile(source, &path, &options.profile_id)?;
         } else {
             fs::create_dir_all(&path)?;
         }
         let path = path.canonicalize()?;
-        let mut profile = Self {
+        let profile = Self {
             path,
             temporary: options.profile_dir.is_none(),
-            lock: None,
+            lock: Arc::new(Mutex::new(None)),
         };
         occupancy::ensure_available_guarded(
             &profile.path,
@@ -84,15 +88,7 @@ impl Profile {
             options.kill_browser,
             authority,
         )?;
-        profile.lock = Some(
-            OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(profile.path.join(".aad-recording.lock"))
-                .map_err(|e| {
-                    format!("profile already in use by AAD (or stale .aad-recording.lock): {e}")
-                })?,
-        );
+        *profile.lock.lock().unwrap() = Some(lease::Lease::acquire(&profile.path)?);
         // A new launch must write a fresh endpoint file. Never attach to a stale
         // port or assume that a pre-existing endpoint belongs to this process.
         let active = profile.path.join("DevToolsActivePort");
@@ -105,10 +101,7 @@ impl Profile {
 
 impl Drop for Profile {
     fn drop(&mut self) {
-        if let Some(lock) = self.lock.take() {
-            drop(lock);
-            let _ = fs::remove_file(self.path.join(".aad-recording.lock"));
-        }
+        self.lock.lock().unwrap().take();
         if self.temporary {
             for _ in 0..20 {
                 if fs::remove_dir_all(&self.path).is_ok() || !self.path.exists() {
@@ -128,7 +121,8 @@ impl Drop for Profile {
 /// profile directories persist; temporary profiles are removed after shutdown.
 pub struct Browser {
     client: Option<Client>,
-    child: Child,
+    child: Arc<Mutex<Child>>,
+    watcher: Option<Sender<()>>,
     profile: Profile,
     pub port: u16,
     pub page: String,
@@ -136,7 +130,7 @@ pub struct Browser {
 
 impl Browser {
     pub fn process_id(&self) -> u32 {
-        self.child.id()
+        self.child.lock().unwrap().id()
     }
 
     pub fn start(options: Options) -> Result<Self> {
@@ -184,7 +178,8 @@ impl Browser {
         let child = child.unwrap();
         let mut browser = Self {
             client: None,
-            child,
+            child: Arc::new(Mutex::new(child)),
+            watcher: None,
             profile,
             port: 0,
             page: String::new(),
@@ -203,6 +198,7 @@ impl Browser {
             .ok_or("missing newly created page ID")?
             .into();
         authority.check()?;
+        browser.watcher = Some(lease::watch_child(&browser.child, &browser.profile.lock));
         Ok(browser)
     }
 
@@ -210,7 +206,7 @@ impl Browser {
         let deadline = Instant::now() + Duration::from_secs(20);
         while Instant::now() < deadline {
             authority.check()?;
-            if let Some(status) = self.child.try_wait()? {
+            if let Some(status) = self.child.lock().unwrap().try_wait()? {
                 return Err(format!("browser exited before CDP startup ({status}); close any browser using this profile, or choose a new --profile-dir").into());
             }
             if let Ok(contents) = fs::read_to_string(self.profile.path.join("DevToolsActivePort")) {
@@ -277,12 +273,21 @@ impl Browser {
 
 impl Drop for Browser {
     fn drop(&mut self) {
+        self.watcher.take();
         if let Some(mut client) = self.client.take() {
             client.set_deadline(Instant::now() + Duration::from_secs(2));
             let _ = client.command("Browser.close", json!({}));
         }
         for _ in 0..30 {
-            if self.child.try_wait().ok().flatten().is_some() {
+            if self
+                .child
+                .lock()
+                .unwrap()
+                .try_wait()
+                .ok()
+                .flatten()
+                .is_some()
+            {
                 return;
             }
             std::thread::sleep(Duration::from_millis(100));
@@ -291,7 +296,7 @@ impl Drop for Browser {
         #[cfg(unix)]
         {
             let _ = Command::new("kill")
-                .args(["-KILL", "--", &format!("-{}", self.child.id())])
+                .args(["-KILL", "--", &format!("-{}", self.process_id())])
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .status();
@@ -299,12 +304,13 @@ impl Drop for Browser {
         #[cfg(windows)]
         {
             let _ = Command::new("taskkill")
-                .args(["/F", "/T", "/PID", &self.child.id().to_string()])
+                .args(["/F", "/T", "/PID", &self.process_id().to_string()])
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .status();
         }
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        let mut child = self.child.lock().unwrap();
+        let _ = child.kill();
+        let _ = child.wait();
     }
 }
