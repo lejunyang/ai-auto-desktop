@@ -131,7 +131,7 @@ jobs:
 
       - name: Install Linux native driver test dependencies
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends xvfb xauth dbus-x11 at-spi2-core g++ pkg-config qtbase5-dev libx11-dev libxtst-dev
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends xvfb xauth dbus-x11 at-spi2-core g++ pkg-config qtbase5-dev libx11-dev libxtst-dev openbox x11-utils
 
       - name: Build Linux native input and capture helpers
         if: runner.os == 'Linux'

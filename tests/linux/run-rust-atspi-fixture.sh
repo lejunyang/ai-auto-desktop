@@ -16,6 +16,13 @@ if [ "${1:-}" = --inside-session ]; then
     xprop -root _NET_SUPPORTING_WM_CHECK 2>/dev/null | grep -q 'window id' && break
     sleep 0.1
   done
+  # Without a window manager the input actions are withheld and the run fails
+  # much later at type-text with no reason given; say so here instead.
+  if ! xprop -root _NET_SUPPORTING_WM_CHECK 2>/dev/null | grep -q 'window id'; then
+    printf '%s\n' 'AT-SPI fixture: no EWMH window manager came up (are openbox and x11-utils installed?)' >&2
+    cat "${TMPDIR:-/tmp}/aad-rust-atspi-openbox.out" >&2 || true
+    exit 1
+  fi
   fixture_log=${TMPDIR:-/tmp}/aad-rust-atspi-fixture.out
   "$AAD_ATSPI_FIXTURE_BINARY" >"$fixture_log" 2>&1 &
   fixture_pid=$!
