@@ -1,11 +1,13 @@
 //! Cross-process input ownership for cooperating control servers.
 //! These files contain no credentials and are never removed while locking:
 //! unlinking an active lock would let another process lock a different inode.
+//! Owner metadata lives in a separate `.owner` file: Windows byte-range locks
+//! are mandatory, so a contender could never read it from the locked file.
 use crate::{error, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -27,8 +29,22 @@ fn valid_session_id(id: &str) -> bool {
 
 // Owner metadata is advisory: an older server may not write it, and the holder
 // can change between a failed lock and this read. Never use it to break a lock.
-fn owner_hint(file: &mut File) -> Option<serde_json::Value> {
-    file.seek(SeekFrom::Start(0)).ok()?;
+fn owner_hint(path: &Path) -> Option<serde_json::Value> {
+    if std::fs::symlink_metadata(path)
+        .ok()?
+        .file_type()
+        .is_symlink()
+    {
+        return None;
+    }
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    let file = options.open(path).ok()?;
     let mut data = Vec::new();
     file.take(1025).read_to_end(&mut data).ok()?;
     if data.len() > 1024 {
@@ -44,6 +60,39 @@ fn owner_hint(file: &mut File) -> Option<serde_json::Value> {
         return None;
     }
     serde_json::to_value(owner).ok()
+}
+
+fn lock_paths(directory: &Path, key: &str) -> (PathBuf, PathBuf) {
+    let stem = format!("{:x}", Sha256::digest(key.as_bytes()));
+    (
+        directory.join(format!("{stem}.lock")),
+        directory.join(format!("{stem}.owner")),
+    )
+}
+
+fn open_private(path: &Path, truncate: bool) -> Result<File> {
+    if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
+        return Err(error(
+            "CONTROL.LEASE_UNAVAILABLE",
+            "lease file must not be a symlink",
+        ));
+    }
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(truncate);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    options
+        .open(path)
+        .map_err(|e| error("CONTROL.LEASE_UNAVAILABLE", e.to_string()))
 }
 
 pub struct InputLease {
@@ -98,25 +147,8 @@ impl InputLease {
                 ));
             }
         }
-        let path = directory.join(format!("{:x}.lock", Sha256::digest(key.as_bytes())));
-        let mut options = OpenOptions::new();
-        options.read(true).write(true).create(true).truncate(false);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options
-                .mode(0o600)
-                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
-        }
-        if std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink()) {
-            return Err(error(
-                "CONTROL.LEASE_UNAVAILABLE",
-                "lease file must not be a symlink",
-            ));
-        }
-        let mut file = options
-            .open(path)
-            .map_err(|e| error("CONTROL.LEASE_UNAVAILABLE", e.to_string()))?;
+        let (path, owner_path) = lock_paths(directory, key);
+        let file = open_private(&path, false)?;
         if let Err(cause) = fs2::FileExt::try_lock_exclusive(&file) {
             if cause.raw_os_error() != fs2::lock_contended_error().raw_os_error() {
                 return Err(error("CONTROL.LEASE_UNAVAILABLE", cause.to_string()));
@@ -126,7 +158,7 @@ impl InputLease {
                 "another control session owns this input resource; close that session first",
             )
             .with_detail("owner_metadata_is_advisory", serde_json::json!(true));
-            if let Some(owner) = owner_hint(&mut file) {
+            if let Some(owner) = owner_hint(&owner_path) {
                 busy = busy.with_detail("owner", owner);
             }
             return Err(busy);
@@ -142,9 +174,8 @@ impl InputLease {
         };
         let data = serde_json::to_vec(&owner)
             .map_err(|e| error("CONTROL.LEASE_UNAVAILABLE", e.to_string()))?;
-        file.set_len(0)
-            .and_then(|_| file.seek(SeekFrom::Start(0)))
-            .and_then(|_| file.write_all(&data))
+        open_private(&owner_path, true)?
+            .write_all(&data)
             .map_err(|e| error("CONTROL.LEASE_UNAVAILABLE", e.to_string()))?;
         Ok(Self { _file: file })
     }
@@ -186,7 +217,8 @@ mod tests {
     #[test]
     fn unknown_or_corrupt_metadata_never_becomes_error_details() {
         let root = std::env::temp_dir().join(format!("aad-lease-test-{}", uuid::Uuid::new_v4()));
-        let mut holder = InputLease::in_directory(&root, "desktop").unwrap();
+        let holder = InputLease::in_directory(&root, "desktop").unwrap();
+        let (_, owner_path) = lock_paths(&root, "desktop");
         for bytes in [
             Vec::new(),
             vec![b'x'; 2000],
@@ -194,9 +226,7 @@ mod tests {
             br#"{"process_id":1,"session_id":"valid","acquired_at_ms":1,"secret":"hidden"}"#
                 .to_vec(),
         ] {
-            holder._file.set_len(0).unwrap();
-            holder._file.seek(SeekFrom::Start(0)).unwrap();
-            holder._file.write_all(&bytes).unwrap();
+            std::fs::write(&owner_path, &bytes).unwrap();
             let busy = InputLease::in_directory(&root, "desktop").err().unwrap();
             assert_eq!(busy.code, "CONTROL.RESOURCE_BUSY");
             assert!(!busy.details.contains_key("owner"));
