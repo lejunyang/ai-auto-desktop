@@ -1,0 +1,28 @@
+[package]
+name = "aad-browser"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Local browser protocol clients (Chromium CDP, Firefox WebDriver BiDi) and owned-browser lifecycle"
+
+[features]
+lifecycle-test-hooks = []
+
+[dependencies]
+socket2 = "0.6"
+serde = { workspace = true }
+serde_json = { workspace = true }
+clap = { workspace = true }
+sha1 = { version = "0.10", default-features = false }
+base64 = "0.22"
+uuid = { workspace = true }
+sha2 = { workspace = true }
+url = "2"
+sysinfo = { version = "0.33", default-features = false, features = ["system"] }
+fs2 = "0.4"
+dunce = "1"
+
+[lints]
+workspace = true

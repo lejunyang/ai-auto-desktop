@@ -481,9 +481,15 @@ fn run_in_memory(session: &Arc<aad_control::Session>, arguments: &Value) -> (Val
     };
     let gate = session.gate();
     let _serialized = (!through_session).then(|| gate.lock().unwrap());
-    let _lease = match session.input_lease("desktop-input") {
-        Ok(lease) => lease,
-        Err(error) => return (error.to_json(), true),
+    let _lease = if through_session {
+        // Each observed control action acquires its provider's resource set.
+        // Preclaiming the desktop here would defeat isolated headless input.
+        None
+    } else {
+        match session.input_lease("desktop-input") {
+            Ok(lease) => Some(lease),
+            Err(error) => return (error.to_json(), true),
+        }
     };
     match tools::run_workflow(session, arguments) {
         Ok(result) => (result, false),

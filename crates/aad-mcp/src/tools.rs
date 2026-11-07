@@ -396,6 +396,8 @@ pub(crate) fn failure(code: &str, message: &str, hint: Option<&str>) -> String {
 /// it, and the reason is harder to read from a run failure than from here.
 fn save_workflow(arguments: &Value) -> Result<Value, String> {
     use aad_control::steps::{self, Step};
+    aad_runtime::recordings::ensure_no_secret_input(arguments)
+        .map_err(|error| failure(error.code, &error.message, None))?;
     let name = arguments
         .get("name")
         .and_then(Value::as_str)
@@ -1552,13 +1554,16 @@ pub(crate) mod tests {
         assert_eq!(step["properties"]["locator"]["additionalProperties"], false);
         // The actions are control_act's, so every provider's can be saved.
         let variants = step["properties"]["action"]["oneOf"].as_array().unwrap();
+        // Except secret_input: protected input is immediate-only and never saved.
         for action in aad_control::ACTION_NAMES {
-            assert!(
-                variants
-                    .iter()
-                    .any(|variant| variant["properties"]["type"]["const"] == *action),
-                "{action} must be savable"
-            );
+            let savable = variants
+                .iter()
+                .any(|variant| variant["properties"]["type"]["const"] == *action);
+            if action == "secret_input" {
+                assert!(!savable, "secret_input must never be savable");
+            } else {
+                assert!(savable, "{action} must be savable");
+            }
         }
         let drag = variants
             .iter()
@@ -1894,6 +1899,22 @@ pub(crate) mod tests {
             Arc::new(StubBackend),
             aad_desktop::SnapshotStore::new(8, std::time::Duration::from_secs(60)),
         ))
+    }
+
+    #[test]
+    fn saving_secret_actions_refuses_before_serializing_or_echoing_input() {
+        let store = ScratchStore::new("secret-save-refusal");
+        for step in [
+            json!({"action":{"type":"secret_input","secret_ref":"password","text":"synthetic-fixture"}}),
+            json!({"uses":"desktop.macos_ax.secret_input@1","with":{"text":"synthetic-fixture"}}),
+        ] {
+            let error =
+                call_without_driver("save_workflow", &json!({"name":"blocked","steps":[step]}))
+                    .unwrap_err();
+            assert!(error.contains("STORE.SECRET_INPUT_UNSUPPORTED"));
+            assert!(!error.contains("synthetic-fixture"));
+        }
+        assert_eq!(std::fs::read_dir(&store.directory).unwrap().count(), 0);
     }
 
     #[test]

@@ -45,6 +45,19 @@ fn button_schema() -> Value {
     json!({"enum": ["left", "right", "middle"], "description": "Which button. Defaults to left."})
 }
 
+fn pointer_modifiers_schema() -> Value {
+    json!({
+        "type": "array", "maxItems": 4, "uniqueItems": true,
+        "items": {"enum": ["ctrl", "shift", "alt", "meta"]},
+        "description": "Modifier state held throughout the click or drag. meta means Windows/Command. Omit for no modifiers. Unsupported providers refuse it."
+    })
+}
+
+fn hold_schema(description: &str) -> Value {
+    json!({"type":"integer", "minimum":1, "maximum":5000,
+        "description":format!("{description} Within this request only; input is released on completion or failure. Providers refuse unsupported holds or insufficient deadlines.")})
+}
+
 fn action_schema() -> Value {
     let variant = |name: &str, description: &str, properties: Value, required: &[&str]| {
         let mut all = Map::from_iter([("type".to_string(), json!({"const": name}))]);
@@ -66,17 +79,23 @@ fn action_schema() -> Value {
     z-order.", json!({}), &[]),
         variant("click", "Click the element. A plain left click unless a button, a double \
     click or a position is given; those need a provider that offers gestures. In a browser a \
-    plain click is DOM activation (isTrusted false, works in frames); giving a position, a \
-    button or a count sends trusted pointer input instead, also inside frames (cross-origin \
+    plain click is DOM activation (isTrusted false, works in frames), except canvas surfaces \
+    always receive trusted pointer input; giving a position, a \
+    button, a count or modifiers sends trusted pointer input instead, also inside frames (cross-origin \
     ones included), and is refused if something else covers the element or its frame.", json!({
             "button": button_schema(),
             "count": {"type": "integer", "enum": [1, 2], "description": "1 for a single click, 2 for a double click."},
-            "fraction": fraction_schema("Where inside the element to click")
+            "fraction": fraction_schema("Where inside the element to click"),
+            "modifiers": pointer_modifiers_schema(),
+            "hold_ms": hold_schema("Keep the button down before release, in milliseconds. Only a single click (count 1) can be held.")
         }), &[]),
         variant("fill", "Replace the element's value directly. Prefer this over \
     type_text for text fields: it is atomic and does not depend on focus.", json!({
             "value": {"type": "string", "maxLength": 4096}
         }), &["value"]),
+        variant("secret_input", "Replace an observed protected, editable field from a server-owned secret binding. Requires the operator's separate secret-input grant. The text never passes through the clipboard or the public action; reads and captures remain protected. Not available in saved steps or workflows.", json!({
+            "secret_ref": {"type":"string", "minLength":1, "maxLength":64, "pattern":"^[A-Za-z][A-Za-z0-9_-]*$", "description":"An exact binding name listed by control_capabilities; never a secret value or an environment-variable expression."}
+        }), &["secret_ref"]),
         variant("type_text", "Type text as keystrokes after focusing the element. Use \
     only when fill is unsupported, since keystrokes go wherever focus lands.", json!({
             "text": {"type": "string", "maxLength": 1024},
@@ -95,10 +114,12 @@ fn action_schema() -> Value {
     shortcuts and keys no text can express, such as Ctrl+Z, F5, Tab or Escape. Modifiers \
     (ctrl, shift, alt, win) followed by exactly one main key. Browsers accept editing and \
     navigation keys for the focused element -- Enter, Tab, Escape, arrows, Home/End, \
-    Backspace, a single character, ctrl+a/c/v/x/z/y, ctrl+shift+z, shift or ctrl+shift with \
-    arrows -- and refuse browser-global shortcuts (ctrl+t/w/n/l, ctrl+tab, other \
-    ctrl+shift chords, alt chords, function keys but F2).", json!({
-            "keys": {"type": "array", "items": {"type": "string", "maxLength": 32}, "minItems": 1, "maxItems": 6}
+    Backspace, a single character, Ctrl or Ctrl+Shift with letters, shift or ctrl+shift with \
+    arrows. These are page renderer events and do not activate browser accelerators. \
+    Ctrl+Tab/PageUp/PageDown, Alt/Meta and function keys except F2 remain unsupported; use \
+    explicit page actions for browser tabs.", json!({
+            "keys": {"type": "array", "items": {"type": "string", "maxLength": 32}, "minItems": 1, "maxItems": 6},
+            "hold_ms": hold_schema("Keep the key combination down before release, in milliseconds.")
         }), &["keys"]),
         variant("scroll", "Scroll the wheel over the element. In a browser, offered on the \
     page body and on scrollable containers, in any frame.", json!({
@@ -111,16 +132,27 @@ fn action_schema() -> Value {
             "ms": {"type": "integer", "minimum": 1, "maximum": 5000, "description": "How long to dwell. Defaults to 500."},
             "fraction": fraction_schema("Where inside the element to hover")
         }), &[]),
-        variant("drag", "Press on the element, glide, release on another element of the \
-    same observation. Use for reordering a list or moving an item between panes. In a browser \
-    it is trusted pointer input (offered on draggable elements, list items and grab cursors; \
+        variant("drag", "Press on the element, glide, release on an element of the \
+    same observation, including the same surface at a different fraction. Use for canvas \
+    selections, reordering a list or moving an item between panes. In a browser \
+    it is trusted pointer input (offered on canvas surfaces, draggable elements, list items and grab cursors; \
     the destination may be any observed element); both ends must be in view together and \
     unobstructed, and an HTML5 drag (draggable, dragstart/drop) is completed with drag \
     events carrying its data.", json!({
             "to": target_schema(),
             "button": button_schema(),
             "fraction": fraction_schema("Where inside the source element to grab"),
-            "to_fraction": fraction_schema("Where inside the destination element to release")
+            "to_fraction": fraction_schema("Where inside the destination element to release"),
+            "modifiers": pointer_modifiers_schema(),
+            "hold_ms": hold_schema("Wait at the source with the button held, before the first drag movement, in milliseconds."),
+            "path": {
+                "type":"array", "maxItems":32,
+                "description":"Intermediate anchors to visit in order while holding the button. Every anchor and both endpoints must be the same observed surface, with explicit source and destination fractions. Only immediate actions; saved workflows do not accept these session-bound anchors. Unsupported providers refuse before input.",
+                "items": {"type":"object", "properties":{
+                    "target": target_schema(),
+                    "fraction": fraction_schema("Intermediate location inside the observed surface")
+                }, "required":["target","fraction"], "additionalProperties":false}
+            }
         }), &["to"]),
         variant("select", "Choose one option of a list box (a browser <select>), by its \
     label as the observation lists it in `options`, or by its value.", json!({
@@ -131,7 +163,7 @@ fn action_schema() -> Value {
     another one.", json!({
             "checked": {"type": "boolean"}
         }), &["checked"]),
-        variant("navigate", "Load an http or https address in the observed browser page. \
+        variant("navigate", "Load an http(s) address or an operator-granted file/internal URL in the observed browser page. \
     Offered on the page's document node of the main frame.", json!({
             "url": {"type": "string", "minLength": 8, "maxLength": 2048}
         }), &["url"]),
@@ -159,7 +191,7 @@ fn action_schema() -> Value {
         variant("activate", "Bring the observed desktop window to the foreground, restoring \
     it first if minimized. Refused with DRIVER.ACTIVATION_REFUSED when Windows will not let \
     this process take the foreground. Offered on its root node.", json!({}), &[]),
-        variant("open_tab", "Open an http or https address in a new tab of the observed \
+        variant("open_tab", "Open an http(s) address or an operator-granted file/internal URL in a new tab of the observed \
     page's browser. Offered on the page's document node. The answer names the new page_id; \
     call control_targets to observe it.", json!({
             "url": {"type": "string", "minLength": 8, "maxLength": 2048}
@@ -206,6 +238,9 @@ fn action_schema() -> Value {
 /// in the step's `to` locator instead of a session-bound target.
 pub(crate) fn saved_action_schema() -> Value {
     let mut schema = action_schema();
+    if let Some(variants) = schema["oneOf"].as_array_mut() {
+        variants.retain(|variant| variant["properties"]["type"]["const"] != "secret_input");
+    }
     for variant in schema["oneOf"].as_array_mut().into_iter().flatten() {
         // The text may come from the step's `input` instead.
         if matches!(
@@ -217,6 +252,7 @@ pub(crate) fn saved_action_schema() -> Value {
         if variant["properties"]["type"]["const"] == "drag" {
             if let Some(properties) = variant["properties"].as_object_mut() {
                 properties.remove("to");
+                properties.remove("path");
             }
             variant["required"] = json!(["type"]);
             variant["description"] = json!(
@@ -238,7 +274,8 @@ fn view_schema() -> Value {
         "description": "How much of the observation to return. The whole capture is kept \
     either way, so any node of it can be found or acted on.",
         "properties": {
-            "scope_id": {"type":"string", "minLength":1, "maxLength":256, "description":"Complete capture rooted at one unique HTML id in the selected frame. Native providers refuse this option. Distinct from region view filtering."},
+            "scope_id": {"type":"string", "minLength":1, "maxLength":256, "description":"Browser: unique HTML id in the selected frame, or an opaque scope id returned by a previous scoped observation. Native: opaque id returned by an earlier scoped observation of this resource. Re-captures a complete subtree, not region view filtering. Cannot be combined with scope_target."},
+            "scope_target": target_schema(),
             "mode": {
                 "enum": ["outline", "overview", "text", "nodes"],
                 "default": "outline",
@@ -803,7 +840,7 @@ mod tests {
                 let field = field.as_str().unwrap();
                 sample[field] = match field {
                     "type" => json!(name),
-                    "value" | "text" => json!("x"),
+                    "value" | "text" | "secret_ref" => json!("x"),
                     "keys" => json!(["enter"]),
                     "direction" => json!("down"),
                     "option" => json!("x"),
@@ -819,6 +856,63 @@ mod tests {
             serde_json::from_value::<aad_control::Action>(sample)
                 .unwrap_or_else(|e| panic!("{name}: {e}"));
         }
+    }
+
+    #[test]
+    fn secrets_expose_only_a_binding_name_and_cannot_be_saved() {
+        let schema = variant("secret_input");
+        assert_eq!(schema["required"], json!(["type", "secret_ref"]));
+        assert_eq!(schema["properties"].as_object().unwrap().len(), 2);
+        assert_eq!(schema["properties"]["secret_ref"]["maxLength"], 64);
+        assert!(!saved_action_schema()["oneOf"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["properties"]["type"]["const"] == "secret_input"));
+        assert!(serde_json::from_value::<aad_control::Action>(
+            json!({"type":"secret_input","secret_ref":"password","text":"synthetic-fixture"})
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn click_and_drag_publish_bounded_unique_pointer_modifiers() {
+        for kind in ["click", "drag"] {
+            let schema = variant(kind);
+            let modifiers = &schema["properties"]["modifiers"];
+            assert_eq!(modifiers["maxItems"], 4);
+            assert_eq!(modifiers["uniqueItems"], true);
+            assert_eq!(
+                modifiers["items"]["enum"],
+                json!(["ctrl", "shift", "alt", "meta"])
+            );
+            let mut action = json!({"type":kind, "modifiers":["ctrl", "shift"]});
+            if kind == "drag" {
+                action["to"] = json!({"session_id":"s", "resource_id":"r", "observation_id":"o", "node_id":"n"});
+            }
+            let parsed: aad_control::Action = serde_json::from_value(action.clone()).unwrap();
+            assert_eq!(serde_json::to_value(parsed).unwrap(), action);
+        }
+        for kind in ["scroll", "hover"] {
+            assert!(variant(kind)["properties"].get("modifiers").is_none());
+        }
+    }
+
+    #[test]
+    fn drag_paths_require_observed_targets_and_are_not_saved() {
+        let schema = variant("drag");
+        let path = &schema["properties"]["path"];
+        assert_eq!(path["maxItems"], 32);
+        assert_eq!(path["items"]["required"], json!(["target", "fraction"]));
+        assert_eq!(path["items"]["additionalProperties"], false);
+        let saved = saved_action_schema();
+        let drag = saved["oneOf"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|variant| variant["properties"]["type"]["const"] == "drag")
+            .unwrap();
+        assert!(drag["properties"].get("path").is_none());
     }
 
     #[test]

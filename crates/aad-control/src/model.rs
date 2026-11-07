@@ -98,9 +98,15 @@ pub enum ViewMode {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct View {
-    /// Observe only the container with this unique HTML id, in the selected frame.
+    /// Browser: a unique HTML id. Native: an opaque scope id returned by an
+    /// earlier scoped observation of this resource.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scope_id: Option<String>,
+    /// Capture a complete subtree rooted at an already observed element.
+    /// Its source observation may be truncated: this is a read, not input.
+    /// Mutually exclusive with scope_id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope_target: Option<Target>,
     #[serde(default)]
     pub mode: ViewMode,
     /// Outline or text: a region named by an overview.
@@ -142,6 +148,16 @@ pub enum TypeMode {
     Keys,
 }
 
+/// Modifier state held throughout one pointer click or drag.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PointerModifier {
+    Ctrl,
+    Shift,
+    Alt,
+    Meta,
+}
+
 /// A position inside the observed element's box, never a screen coordinate.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -149,6 +165,16 @@ pub struct Fraction {
     pub fx: f64,
     pub fy: f64,
 }
+
+/// An intermediate drag location, anchored to an observed surface.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct DragAnchor {
+    pub target: Target,
+    pub fraction: Fraction,
+}
+
+pub const MAX_DRAG_ANCHORS: usize = 32;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
@@ -163,9 +189,18 @@ pub enum Action {
         count: Option<u8>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         fraction: Option<Fraction>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        modifiers: Vec<PointerModifier>,
+        /// Keep the button down for this bounded duration before releasing.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        hold_ms: Option<u64>,
     },
     Fill {
         value: String,
+    },
+    /// Replace a protected field using a server-owned secret binding.
+    SecretInput {
+        secret_ref: String,
     },
     TypeText {
         text: String,
@@ -174,6 +209,9 @@ pub enum Action {
     },
     Key {
         keys: Vec<String>,
+        /// Keep the chord down within this single request, then release it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        hold_ms: Option<u64>,
     },
     Scroll {
         direction: Direction,
@@ -188,7 +226,8 @@ pub enum Action {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         fraction: Option<Fraction>,
     },
-    /// Both ends are nodes of the same observation.
+    /// Both ends share an observation unless the provider explicitly supports
+    /// independently observed resources. Nonempty paths stay on one surface.
     Drag {
         to: Target,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -197,6 +236,15 @@ pub enum Action {
         fraction: Option<Fraction>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         to_fraction: Option<Fraction>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        modifiers: Vec<PointerModifier>,
+        /// Wait at the source after button down and before the first move.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        hold_ms: Option<u64>,
+        /// Intermediate anchors on the same observed surface, in visit order.
+        /// Explicit source and destination fractions are required when nonempty.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        path: Vec<DragAnchor>,
     },
     /// Choose one option of a list box by its label or value.
     Select {
@@ -206,7 +254,7 @@ pub enum Action {
     Check {
         checked: bool,
     },
-    /// Load an http(s) address in the observed page.
+    /// Load an http(s) address, or an operator-granted file/internal URL, in the observed page.
     Navigate {
         url: String,
     },
@@ -227,7 +275,7 @@ pub enum Action {
     Paste {
         text: String,
     },
-    /// Open an http(s) address in a new tab of the observed page's browser.
+    /// Open an http(s) or operator-granted file/internal URL in a new tab.
     OpenTab {
         url: String,
     },
@@ -280,11 +328,12 @@ pub enum ColorScheme {
 
 pub const MAX_UPLOAD_FILES: usize = 32;
 
-pub const ACTION_NAMES: [&str; 29] = [
+pub const ACTION_NAMES: [&str; 30] = [
     "focus",
     "invoke",
     "click",
     "fill",
+    "secret_input",
     "type_text",
     "key",
     "scroll",
@@ -338,12 +387,24 @@ pub const WINDOW_ACTIONS: [&str; 5] = [
 ];
 
 impl Action {
+    /// A hold is contained in one action; no key/button state escapes it.
+    pub fn hold_ms(&self) -> Option<u64> {
+        match self {
+            Self::Key { hold_ms, .. }
+            | Self::Click { hold_ms, .. }
+            | Self::Drag { hold_ms, .. } => *hold_ms,
+            _ => None,
+        }
+    }
+
     /// A plain left click.
     pub fn click() -> Self {
         Self::Click {
             button: None,
             count: None,
             fraction: None,
+            modifiers: Vec::new(),
+            hold_ms: None,
         }
     }
     pub fn name(&self) -> &'static str {
@@ -352,6 +413,7 @@ impl Action {
             Self::Invoke {} => "invoke",
             Self::Click { .. } => "click",
             Self::Fill { .. } => "fill",
+            Self::SecretInput { .. } => "secret_input",
             Self::TypeText { .. } => "type_text",
             Self::Key { .. } => "key",
             Self::Scroll { .. } => "scroll",
@@ -387,7 +449,9 @@ impl Action {
                 button: None | Some(Button::Left),
                 count: None | Some(1),
                 fraction: None,
-            }
+                modifiers,
+                hold_ms: None,
+            } if modifiers.is_empty()
         )
     }
 }

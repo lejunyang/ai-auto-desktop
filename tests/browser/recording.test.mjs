@@ -168,7 +168,11 @@ test('cross-origin frame, related popup lifecycle, unrelated tab isolation and g
     await f.cdp.call('Runtime.evaluate',{expression:`(()=>{const el=document.getElementById('close');if(el?.textContent!=='Close popup')throw Error('stale fixture');el.click();})()`},popupSession.sessionId);
     await delay(800);
     assert.equal(recorder.child.exitCode,null,'closing a related popup must not kill the recorder');
-    recorder.child.kill('SIGINT');const result=await recorder.done;assert.equal(result.code,0,`${result.stdout}\n${result.stderr}`);
+    // Node cannot send Ctrl+C to a child on Windows (kill('SIGINT') terminates
+    // it), so stop there through the recorder's own graceful control channel.
+    if(process.platform==='win32'){const stop=await command(['browser-record','stop','--out',out]).done;assert.equal(stop.code,0,stop.stderr);}
+    else recorder.child.kill('SIGINT');
+    const result=await recorder.done;assert.equal(result.code,0,`${result.stdout}\n${result.stderr}`);
     const steps=await jsonl(join(out,'steps.jsonl'));
     for(const name of ['Cross frame','Open popup','Close popup'])assert.ok(steps.some(s=>s.action?.label===name),name);
     assert.ok(!JSON.stringify(steps).includes('unrelated sentinel'));

@@ -1842,7 +1842,7 @@ mod browser {
         fraction, keys, unknown, Codec, Frame, Pace, Picture, PixelFormat, Raw, Result, Source,
         Want,
     };
-    use aad_cdp::Client;
+    use aad_browser::cdp::Client;
     use serde_json::{json, Value};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
@@ -1875,7 +1875,7 @@ mod browser {
         refresh: bool,
     }
 
-    fn cdp(e: aad_cdp::CdpError) -> String {
+    fn cdp(e: aad_browser::cdp::CdpError) -> String {
         e.to_string()
     }
 

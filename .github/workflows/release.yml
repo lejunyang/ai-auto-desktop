@@ -351,7 +351,7 @@ jobs:
             Released from ${{ github.sha }}.
 
             **crates.io** — `aad-core`, `aad-plugin`, `aad-runtime`, `aad-ocr`,
-            `aad-atspi`, `aad-macos-ax`, `aad-probe`, `aad-uia`, `aad-cdp`,
+            `aad-atspi`, `aad-macos-ax`, `aad-probe`, `aad-uia`, `aad-browser`,
             `aad-control`, `aad-mcp`, `aad-cli` at `${{ needs.gate.outputs.version }}`.
 
             **CLI** — x64 and ARM64 archives for Linux, Windows and macOS.

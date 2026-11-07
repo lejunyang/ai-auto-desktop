@@ -8,8 +8,8 @@
 //! screenshots to a directory an agent reads afterwards; turning that into a
 //! skill is the agent's job, not this server's.
 use crate::tools::Tool;
-use aad_cdp::launch::{self, Browser};
-use aad_cdp::recording::{Options, Recorder};
+use aad_browser::launch::{self, Browser};
+use aad_browser::recording::{Options, Recorder};
 use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -671,18 +671,18 @@ impl Browsers {
             fn cancellation(&self) -> Option<Arc<AtomicBool>> {
                 Some(self.1.browser_cancellation())
             }
-            fn check(&self) -> aad_cdp::recording::Result<()> {
+            fn check(&self) -> aad_browser::recording::Result<()> {
                 self.1.remaining().map(|_| ()).map_err(|e| e.message.into())
             }
-            fn navigation(&self) -> aad_cdp::recording::Result<()> {
+            fn navigation(&self) -> aad_browser::recording::Result<()> {
                 self.0
                     .browser_navigation(self.1)
                     .map_err(|e| e.message.into())
             }
             fn effect(
                 &self,
-                action: &mut dyn FnMut() -> aad_cdp::recording::Result<()>,
-            ) -> aad_cdp::recording::Result<()> {
+                action: &mut dyn FnMut() -> aad_browser::recording::Result<()>,
+            ) -> aad_browser::recording::Result<()> {
                 self.0
                     .browser_effect(self.1, action)
                     .map_err(|e| e.message)?

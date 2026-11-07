@@ -32,6 +32,7 @@ const WRITE_ACTIONS: &[&str] = &[
     "drag",
     "key_chord",
     "set_value",
+    "secret_input",
     "type_text",
     "paste",
     "minimize",
@@ -101,7 +102,59 @@ impl Bounds {
     }
 }
 
+/// Validated native writes. Text is deliberately not Debug/Serialize.
+pub enum AxInput<'a> {
+    Focus,
+    Invoke,
+    PointerClick { button: &'a str, position: &'a str },
+    SetValue(&'a str),
+    TypeText(&'a str),
+    SecretInput(&'a str),
+    Paste(&'a str),
+    WindowAction(&'a str),
+}
+
 pub trait AxBackend: Send + Sync {
+    fn input_controlled(
+        &self,
+        token: &str,
+        input: AxInput<'_>,
+        deadline: Instant,
+        cancellation: &aad_runtime::CancellationToken,
+    ) -> Result<Value, AutomationError> {
+        cancellation.check()?;
+        let result = match input {
+            AxInput::Focus => self.focus(token, deadline),
+            AxInput::Invoke => self.invoke(token, deadline),
+            AxInput::PointerClick { button, position } => {
+                self.pointer_click(token, button, position, deadline)
+            }
+            AxInput::SetValue(text) => self.set_value(token, text, deadline),
+            AxInput::TypeText(text) => self.type_text(token, text, deadline),
+            AxInput::SecretInput(text) => self.secret_input(token, text, deadline),
+            AxInput::Paste(text) => self.paste(token, text, deadline),
+            AxInput::WindowAction(action) => self.window_action(token, action, deadline),
+        };
+        let result = result?;
+        cancellation
+            .check()
+            .map_err(|error| error.with_effect("unknown"))?;
+        Ok(result)
+    }
+    fn global_key_controlled(
+        &self,
+        keys: &[String],
+        deadline: Instant,
+        cancellation: &aad_runtime::CancellationToken,
+    ) -> Result<Value, AutomationError> {
+        cancellation.check()?;
+        let result = self.global_key(keys, deadline);
+        let result = result?;
+        cancellation
+            .check()
+            .map_err(|error| error.with_effect("unknown"))?;
+        Ok(result)
+    }
     fn name(&self) -> &str;
     fn security_info(&self) -> Option<Map<String, Value>> {
         None
@@ -144,6 +197,18 @@ pub trait AxBackend: Send + Sync {
         text: &str,
         deadline: Instant,
     ) -> Result<Value, AutomationError>;
+    /// Replace a freshly verified secure editable field without reading its value.
+    fn secret_input(
+        &self,
+        _token: &str,
+        _text: &str,
+        _deadline: Instant,
+    ) -> Result<Value, AutomationError> {
+        Err(driver_error(
+            "DRIVER.ACTION_UNSUPPORTED",
+            "this backend has no protected input replacement",
+        ))
+    }
     /// `gesture` is already validated: `mode` click, wheel or hover with its
     /// fields, plus `fx`/`fy` inside the element.
     fn pointer_gesture(
@@ -180,6 +245,56 @@ pub trait AxBackend: Send + Sync {
             "DRIVER.ACTION_UNSUPPORTED",
             "this backend has no key chords",
         ))
+    }
+    fn key_chord_held(
+        &self,
+        token: &str,
+        keys: &[String],
+        hold_ms: Option<u64>,
+        deadline: Instant,
+    ) -> Result<Value, AutomationError> {
+        if hold_ms.is_some() {
+            return Err(driver_error(
+                "DRIVER.ACTION_UNSUPPORTED",
+                "this backend has no bounded key holds",
+            ));
+        }
+        self.key_chord(token, keys, deadline)
+    }
+
+    /// Cooperative hooks default to a preflight check for third-party backends.
+    /// The native helper overrides these to interrupt and release held input.
+    fn key_chord_controlled(
+        &self,
+        token: &str,
+        keys: &[String],
+        hold_ms: Option<u64>,
+        deadline: Instant,
+        cancellation: &aad_runtime::CancellationToken,
+    ) -> Result<Value, AutomationError> {
+        cancellation.check()?;
+        self.key_chord_held(token, keys, hold_ms, deadline)
+    }
+    fn pointer_gesture_controlled(
+        &self,
+        token: &str,
+        gesture: &Value,
+        deadline: Instant,
+        cancellation: &aad_runtime::CancellationToken,
+    ) -> Result<Value, AutomationError> {
+        cancellation.check()?;
+        self.pointer_gesture(token, gesture, deadline)
+    }
+    fn drag_controlled(
+        &self,
+        token: &str,
+        to_token: &str,
+        request: &Value,
+        deadline: Instant,
+        cancellation: &aad_runtime::CancellationToken,
+    ) -> Result<Value, AutomationError> {
+        cancellation.check()?;
+        self.drag(token, to_token, request, deadline)
     }
     /// Start watching what a person does in the application with this process id.
     fn start_recording(
@@ -307,6 +422,22 @@ impl MacOSAxProvider {
     }
 
     fn call(&self, action: &str, args: Value, deadline: Instant) -> Result<Value, AutomationError> {
+        self.call_controlled(
+            action,
+            args,
+            deadline,
+            &aad_runtime::CancellationToken::new(),
+        )
+    }
+
+    fn call_controlled(
+        &self,
+        action: &str,
+        args: Value,
+        deadline: Instant,
+        cancellation: &aad_runtime::CancellationToken,
+    ) -> Result<Value, AutomationError> {
+        cancellation.check()?;
         remaining(deadline, false)?;
         let short = action
             .strip_prefix(PROVIDER_NAME)
@@ -353,7 +484,8 @@ impl MacOSAxProvider {
                 only_keys(args, &["keys"])?;
                 let keys = key_names(args.get("keys"))?;
                 refuse_reserved_chord(&keys)?;
-                self.backend.global_key(&keys, deadline)
+                self.backend
+                    .global_key_controlled(&keys, deadline, cancellation)
             }
             "watch" => {
                 only_keys(args, &["app"])?;
@@ -381,7 +513,9 @@ impl MacOSAxProvider {
                     Ok(json!({"released": true}))
                 }
             }
-            action if WRITE_ACTIONS.contains(&action) => self.write(action, args, deadline),
+            action if WRITE_ACTIONS.contains(&action) => {
+                self.write(action, args, deadline, cancellation)
+            }
             _ => Err(invalid("unknown macOS AX action")),
         }
     }
@@ -566,20 +700,35 @@ impl MacOSAxProvider {
         Ok(json!({"target": target(&record, id), "node": node}))
     }
 
-    fn fresh_target(
+    fn observed_record(&self, args: &Map<String, Value>) -> Result<Record, AutomationError> {
+        let target = args
+            .get("target")
+            .and_then(Value::as_object)
+            .ok_or_else(|| invalid("target must be an object"))?;
+        only_keys(target, &["snapshot_id", "revision", "node_id"])?;
+        self.current(
+            target.get("snapshot_id").unwrap_or(&Value::Null),
+            target.get("revision").unwrap_or(&Value::Null),
+        )
+    }
+
+    fn revalidate_target(
         &self,
         args: &Map<String, Value>,
+        record: &Record,
+        fresh: &Record,
         deadline: Instant,
-    ) -> Result<(Record, String, Value, String), AutomationError> {
+    ) -> Result<(String, Value, String), AutomationError> {
         let target_value = args
             .get("target")
             .and_then(Value::as_object)
             .ok_or_else(|| invalid("target must be an object"))?;
         only_keys(target_value, &["snapshot_id", "revision", "node_id"])?;
-        let record = self.current(
-            target_value.get("snapshot_id").unwrap_or(&Value::Null),
-            target_value.get("revision").unwrap_or(&Value::Null),
-        )?;
+        if target_value.get("snapshot_id") != record.public.get("snapshot_id")
+            || target_value.get("revision") != record.public.get("revision")
+        {
+            return Err(stale("target does not belong to the observed snapshot"));
+        }
         if record.public["truncated"] == true {
             return Err(driver_error(
                 "DRIVER.SNAPSHOT_TRUNCATED",
@@ -592,25 +741,19 @@ impl MacOSAxProvider {
         )?
         .to_string();
         let locator = parse_locator(args.get("locator"))?;
-        let expected = resolve(&record, &locator, deadline)?;
+        let expected = resolve(record, &locator, deadline)?;
         if expected["node_id"] != id || !record.handles.contains_key(&id) {
             return Err(stale("target does not match the snapshot locator result"));
         }
         let fingerprint = record.fingerprints[&id].clone();
         let old_token = record.handles[&id].clone();
-        let fresh = self.capture(
-            &record.app_selector,
-            record.max_depth,
-            record.max_nodes,
-            deadline,
-        )?;
         if fresh.public["truncated"] == true {
             return Err(driver_error(
                 "DRIVER.SNAPSHOT_TRUNCATED",
                 "fresh action snapshot is truncated",
             ));
         }
-        let node = resolve(&fresh, &locator, deadline).map_err(|error| {
+        let node = resolve(fresh, &locator, deadline).map_err(|error| {
             if matches!(error.code.as_str(), "DRIVER.NOT_FOUND" | "DRIVER.AMBIGUOUS") {
                 stale("locator no longer resolves to its original target").with_cause(error)
             } else {
@@ -631,6 +774,23 @@ impl MacOSAxProvider {
                 "locator resolved to a different native or semantic target",
             ));
         }
+        Ok((fresh_id, node, token))
+    }
+
+    fn fresh_target(
+        &self,
+        args: &Map<String, Value>,
+        deadline: Instant,
+    ) -> Result<(Record, String, Value, String), AutomationError> {
+        let record = self.observed_record(args)?;
+        self.revalidate_target(args, &record, &record, deadline)?;
+        let fresh = self.capture(
+            &record.app_selector,
+            record.max_depth,
+            record.max_nodes,
+            deadline,
+        )?;
+        let (fresh_id, node, token) = self.revalidate_target(args, &record, &fresh, deadline)?;
         Ok((fresh, fresh_id, node, token))
     }
 
@@ -712,29 +872,51 @@ impl MacOSAxProvider {
         action: &str,
         args: &Map<String, Value>,
         deadline: Instant,
+        cancellation: &aad_runtime::CancellationToken,
     ) -> Result<Value, AutomationError> {
         let mut allowed = vec!["target", "locator"];
         if action == "set_value" {
             allowed.push("value");
         }
-        if matches!(action, "type_text" | "paste") {
+        if matches!(action, "type_text" | "paste" | "secret_input") {
             allowed.push("text");
         }
         match action {
             "pointer_click" => allowed.extend(["button", "position"]),
-            "pointer_gesture" => {
-                allowed.extend(["button", "count", "fraction", "scroll", "hover_ms"])
-            }
-            "drag" => allowed.extend(["to", "to_locator", "button", "fraction", "to_fraction"]),
-            "key_chord" => allowed.push("keys"),
+            "pointer_gesture" => allowed.extend([
+                "button",
+                "count",
+                "fraction",
+                "scroll",
+                "hover_ms",
+                "modifiers",
+                "hold_ms",
+            ]),
+            "drag" => allowed.extend([
+                "to",
+                "to_locator",
+                "button",
+                "fraction",
+                "to_fraction",
+                "modifiers",
+                "hold_ms",
+                "path",
+            ]),
+            "key_chord" => allowed.extend(["keys", "hold_ms"]),
             _ => {}
         }
         only_keys(args, &allowed)?;
+        let hold_ms = hold_duration(args.get("hold_ms"))?;
         // Validated before anything is captured, so a malformed request costs nothing.
         let gesture = match action {
             "pointer_gesture" => Some(gesture_request(args)?),
             "drag" => Some(drag_request(args)?),
             _ => None,
+        };
+        let path = if action == "drag" {
+            drag_path_anchors(args)?
+        } else {
+            Vec::new()
         };
         let keys = if action == "key_chord" {
             Some(key_names(args.get("keys"))?)
@@ -749,6 +931,7 @@ impl MacOSAxProvider {
         let text = match action {
             "type_text" => Some(keyboard_text(args.get("text"))?),
             "paste" => Some(paste_text(args.get("text"))?),
+            "secret_input" => Some(secret_text(args.get("text"))?),
             _ => None,
         };
         let (button, position) = if action == "pointer_click" {
@@ -759,7 +942,25 @@ impl MacOSAxProvider {
         } else {
             ("left", "center")
         };
+        // A drag's endpoints must both be checked against one fresh tree. A
+        // second capture would spend the source observation and make the
+        // destination's original reference stale before it can be validated.
+        let drag_observation = if action == "drag" {
+            Some(self.observed_record(args)?)
+        } else {
+            None
+        };
         let (fresh, fresh_id, node, token) = self.fresh_target(args, deadline)?;
+        if action == "secret_input"
+            && (node["states"]["protected"] != true
+                || node["states"]["editable"] != true
+                || node["states"]["enabled"] == false)
+        {
+            return Err(driver_error(
+                "DRIVER.ACTION_UNSUPPORTED",
+                "secret input requires an enabled protected editable element",
+            ));
+        }
         if INPUT_ACTIONS.contains(&action) && node["states"]["protected"] == true {
             return Err(driver_error(
                 "DRIVER.PROTECTED_ELEMENT",
@@ -795,7 +996,8 @@ impl MacOSAxProvider {
                 format!("{action} requires positive-area bounds"),
             ));
         }
-        // The destination of a drag is re-verified exactly like the source.
+        // The destination uses the source's original and fresh observations,
+        // including both native identity and semantic fingerprint checks.
         let destination = if action == "drag" {
             let mut to_args = Map::new();
             to_args.insert(
@@ -806,10 +1008,12 @@ impl MacOSAxProvider {
                 "locator".into(),
                 args.get("to_locator").cloned().unwrap_or(Value::Null),
             );
-            let (_, to_id, to_node, to_token) = self.fresh_target(&to_args, deadline)?;
-            if to_id == fresh_id {
-                return Err(invalid("drag needs a destination other than its source"));
-            }
+            let (_, to_node, to_token) = self.revalidate_target(
+                &to_args,
+                drag_observation.as_ref().expect("drag observation saved"),
+                &fresh,
+                deadline,
+            )?;
             if to_node["states"]["protected"] == true
                 || parse_bounds(to_node.get("bounds")).is_err()
             {
@@ -822,6 +1026,19 @@ impl MacOSAxProvider {
         } else {
             None
         };
+        for anchor in &path {
+            let (_, _, intermediate) = self.revalidate_target(
+                anchor,
+                drag_observation.as_ref().expect("drag observation saved"),
+                &fresh,
+                deadline,
+            )?;
+            if !self.backend.same_element(&token, &intermediate, deadline)? {
+                return Err(stale(
+                    "drag path must remain on the observed source surface",
+                ));
+            }
+        }
         if !node["actions"]
             .as_array()
             .expect("actions")
@@ -833,45 +1050,71 @@ impl MacOSAxProvider {
                 format!("target does not support native {action}"),
             ));
         }
-        remaining(deadline, false)?;
+        cancellation.check()?;
+        let available = remaining(deadline, false)?;
+        if hold_ms.is_some_and(|ms| available <= Duration::from_millis(ms)) {
+            return Err(driver_error(
+                "DRIVER.TIMEOUT",
+                "hold exceeds the remaining input deadline",
+            ));
+        }
         let result = match action {
-            "focus" => self.backend.focus(&token, deadline),
-            "invoke" => self.backend.invoke(&token, deadline),
-            "pointer_click" => self
-                .backend
-                .pointer_click(&token, button, position, deadline),
-            "set_value" => {
-                self.backend
-                    .set_value(&token, value.expect("value validated"), deadline)
-            }
-            "type_text" => self
-                .backend
-                .type_text(&token, text.expect("text validated"), deadline),
-            "pointer_gesture" => self.backend.pointer_gesture(
+            "pointer_gesture" => self.backend.pointer_gesture_controlled(
                 &token,
                 gesture.as_ref().expect("gesture validated"),
                 deadline,
+                cancellation,
             ),
-            "drag" => self.backend.drag(
+            "drag" => self.backend.drag_controlled(
                 &token,
                 destination.as_deref().expect("destination verified"),
                 gesture.as_ref().expect("drag validated"),
                 deadline,
+                cancellation,
             ),
-            "key_chord" => {
+            "key_chord" => self.backend.key_chord_controlled(
+                &token,
+                keys.as_deref().expect("keys validated"),
+                hold_ms,
+                deadline,
+                cancellation,
+            ),
+            other => {
+                let input = match other {
+                    "focus" => AxInput::Focus,
+                    "invoke" => AxInput::Invoke,
+                    "pointer_click" => AxInput::PointerClick { button, position },
+                    "set_value" => AxInput::SetValue(value.expect("value validated")),
+                    "type_text" => AxInput::TypeText(text.expect("text validated")),
+                    "secret_input" => AxInput::SecretInput(text.expect("text validated")),
+                    "paste" => AxInput::Paste(text.expect("text validated")),
+                    window if WINDOW_ACTIONS.contains(&window) => AxInput::WindowAction(window),
+                    _ => unreachable!(),
+                };
                 self.backend
-                    .key_chord(&token, keys.as_deref().expect("keys validated"), deadline)
+                    .input_controlled(&token, input, deadline, cancellation)
             }
-            "paste" => self
-                .backend
-                .paste(&token, text.expect("text validated"), deadline),
-            window if WINDOW_ACTIONS.contains(&window) => {
-                self.backend.window_action(&token, window, deadline)
-            }
-            _ => unreachable!(),
         };
         let backend_result = match result {
+            Ok(_) if action == "secret_input" => {
+                cancellation
+                    .check()
+                    .map_err(|error| error.with_effect("unknown"))?;
+                remaining(deadline, true)?;
+                json!({"submitted": true, "redacted": true})
+            }
+            Err(error) if action == "secret_input" => {
+                return Err(driver_error(
+                    "DRIVER.SECRET_INPUT_FAILED",
+                    "protected input replacement failed",
+                )
+                .with_effect(&error.effect)
+                .with_retryable(error.retryable));
+            }
             Ok(value) => {
+                cancellation
+                    .check()
+                    .map_err(|error| error.with_effect("unknown"))?;
                 remaining(deadline, true)?;
                 value
             }
@@ -925,6 +1168,15 @@ impl Provider for MacOSAxProvider {
         timeout: Option<Duration>,
     ) -> Result<Value, AutomationError> {
         self.call(action, args, Self::deadline(timeout)?)
+    }
+    fn invoke_cancellable(
+        &self,
+        action: &str,
+        args: Value,
+        timeout: Option<Duration>,
+        cancellation: &aad_runtime::CancellationToken,
+    ) -> Result<Value, AutomationError> {
+        self.call_controlled(action, args, Self::deadline(timeout)?, cancellation)
     }
     fn close(&self) {
         self.backend.close();
@@ -1060,9 +1312,46 @@ fn button_name(value: Option<&Value>) -> Result<&'static str, AutomationError> {
     }
 }
 
+/// Only the four portable pointer modifier names, each at most once.
+fn pointer_modifiers(value: Option<&Value>) -> Result<Vec<&str>, AutomationError> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    let values = value
+        .as_array()
+        .ok_or_else(|| invalid("modifiers must be an array"))?;
+    let mut names = Vec::new();
+    for value in values {
+        let name = value
+            .as_str()
+            .filter(|name| matches!(*name, "ctrl" | "shift" | "alt" | "meta"))
+            .ok_or_else(|| invalid("pointer modifiers must be ctrl, shift, alt or meta"))?;
+        if names.contains(&name) {
+            return Err(invalid("pointer modifiers must not repeat"));
+        }
+        names.push(name);
+    }
+    Ok(names)
+}
+
 /// The Windows driver's request shape, normalised for the Swift helper.
+fn hold_duration(value: Option<&Value>) -> Result<Option<u64>, AutomationError> {
+    value
+        .map(|value| {
+            value
+                .as_u64()
+                .filter(|ms| (1..=5000).contains(ms))
+                .ok_or_else(|| invalid("hold_ms must be an integer between 1 and 5000"))
+        })
+        .transpose()
+}
+
 fn gesture_request(args: &Map<String, Value>) -> Result<Value, AutomationError> {
     let given = |name: &str| args.get(name).is_some_and(|value| !value.is_null());
+    let modifiers = pointer_modifiers(args.get("modifiers"))?;
+    if !modifiers.is_empty() && (given("scroll") || given("hover_ms")) {
+        return Err(invalid("modifiers are supported for clicks and drags only"));
+    }
     let (fx, fy) = fraction_pair(args.get("fraction"))?;
     let mut request = if let Some(scroll) = args.get("scroll").filter(|v| !v.is_null()) {
         if given("button") || given("count") || given("hover_ms") {
@@ -1106,15 +1395,87 @@ fn gesture_request(args: &Map<String, Value>) -> Result<Value, AutomationError> 
     };
     request["fx"] = json!(fx);
     request["fy"] = json!(fy);
+    if let Some(ms) = hold_duration(args.get("hold_ms"))? {
+        if request["mode"] != "click" || request["count"] != 1 {
+            return Err(invalid("hold_ms requires a single click"));
+        }
+        request["hold_ms"] = json!(ms);
+    }
+    if !modifiers.is_empty() {
+        request["modifiers"] = json!(modifiers);
+    }
     Ok(request)
 }
 
 fn drag_request(args: &Map<String, Value>) -> Result<Value, AutomationError> {
     let (fx, fy) = fraction_pair(args.get("fraction"))?;
     let (to_fx, to_fy) = fraction_pair(args.get("to_fraction"))?;
-    Ok(
-        json!({"button": button_name(args.get("button"))?, "fx": fx, "fy": fy, "to_fx": to_fx, "to_fy": to_fy}),
-    )
+    let mut request = json!({"button": button_name(args.get("button"))?, "fx": fx, "fy": fy, "to_fx": to_fx, "to_fy": to_fy});
+    if let Some(ms) = hold_duration(args.get("hold_ms"))? {
+        request["hold_ms"] = json!(ms);
+    }
+    let modifiers = pointer_modifiers(args.get("modifiers"))?;
+    if !modifiers.is_empty() {
+        request["modifiers"] = json!(modifiers);
+    }
+    let path = drag_path_anchors(args)?;
+    if !path.is_empty() {
+        request["path"] = Value::Array(
+            path.iter()
+                .map(|anchor| {
+                    let (fx, fy) =
+                        fraction_pair(anchor.get("fraction")).expect("validated path fraction");
+                    json!({"fx":fx,"fy":fy})
+                })
+                .collect(),
+        );
+    }
+    Ok(request)
+}
+
+fn drag_path_anchors(
+    args: &Map<String, Value>,
+) -> Result<Vec<Map<String, Value>>, AutomationError> {
+    let Some(path) = args.get("path") else {
+        return Ok(Vec::new());
+    };
+    let path = path
+        .as_array()
+        .ok_or_else(|| invalid("path must be an array"))?;
+    if path.len() > 32 {
+        return Err(invalid("path accepts at most 32 anchors"));
+    }
+    if path.is_empty() {
+        return Ok(Vec::new());
+    }
+    if args.get("target") != args.get("to")
+        || args.get("fraction").is_none_or(Value::is_null)
+        || args.get("to_fraction").is_none_or(Value::is_null)
+    {
+        return Err(invalid(
+            "path requires explicit endpoint fractions of the same observed surface",
+        ));
+    }
+    fraction_pair(args.get("fraction"))?;
+    fraction_pair(args.get("to_fraction"))?;
+    path.iter()
+        .map(|anchor| {
+            let anchor = anchor
+                .as_object()
+                .ok_or_else(|| invalid("path anchor must be an object"))?;
+            only_keys(anchor, &["target", "locator", "fraction"])?;
+            if anchor.get("target") != args.get("target")
+                || anchor.get("fraction").is_none_or(Value::is_null)
+            {
+                return Err(invalid(
+                    "each path anchor requires the source target and an explicit fraction",
+                ));
+            }
+            parse_locator(anchor.get("locator"))?;
+            fraction_pair(anchor.get("fraction"))?;
+            Ok(anchor.clone())
+        })
+        .collect()
 }
 
 fn key_names(value: Option<&Value>) -> Result<Vec<String>, AutomationError> {
@@ -1145,6 +1506,15 @@ fn paste_text(value: Option<&Value>) -> Result<&str, AutomationError> {
         return Err(invalid("paste text is 1..4096 characters"));
     }
     Ok(text)
+}
+
+fn secret_text(value: Option<&Value>) -> Result<&str, AutomationError> {
+    value
+        .and_then(Value::as_str)
+        .filter(|text| {
+            text.chars().count() <= MAX_TYPE_TEXT_CHARS && !text.contains(['\0', '\r', '\n'])
+        })
+        .ok_or_else(|| invalid("protected input is outside the supported bounds"))
 }
 
 /// Chords a global key never presses: the lock screen (Ctrl+Cmd+Q), log out
@@ -1640,8 +2010,10 @@ fn manifest_document() -> Value {
     };
     let fraction = json!({"type": "object", "required": ["fx", "fy"], "properties": {"fx": {"type": "number", "minimum": 0, "maximum": 1}, "fy": {"type": "number", "minimum": 0, "maximum": 1}}, "additionalProperties": false});
     let button = json!({"enum": ["left", "middle", "right"]});
-    actions.insert("pointer_gesture".into(), contract("重新验证目标后，在元素 bounds 内的比例位置、经 AX 命中检查后向前台应用派发右键/中键/双击、滚轮或悬停。", "non_idempotent", "modify", "high", &["desktop.observe", "desktop.input"], point_input(json!({"button": button, "count": {"enum": [1, 2]}, "fraction": fraction, "scroll": {"type": "object", "required": ["direction"], "properties": {"direction": {"enum": ["up", "down", "left", "right"]}, "notches": {"type": "integer", "minimum": 1, "maximum": 30}}, "additionalProperties": false}, "hover_ms": {"type": "integer", "minimum": 1, "maximum": 5000}}), &[]), write_output(), true, true));
-    actions.insert("drag".into(), contract("分别重新验证起点与终点并做 AX 命中检查后，在同一前台应用内按下、分步拖动并在终点释放。", "non_idempotent", "modify", "high", &["desktop.observe", "desktop.input"], point_input(json!({"to": target_schema(), "to_locator": locator_schema(), "button": button, "fraction": fraction, "to_fraction": fraction}), &["to", "to_locator"]), write_output(), true, true));
+    let modifiers = json!({"type":"array", "maxItems":4, "uniqueItems":true, "items":{"enum":["ctrl", "shift", "alt", "meta"]}});
+    let hold = json!({"type":"integer", "minimum":1, "maximum":5000});
+    actions.insert("pointer_gesture".into(), contract("重新验证目标后，在元素 bounds 内的比例位置、经 AX 命中检查后向前台应用派发右键/中键/双击、滚轮或悬停；click 可带 modifiers。", "non_idempotent", "modify", "high", &["desktop.observe", "desktop.input"], point_input(json!({"button": button, "count": {"enum": [1, 2]}, "fraction": fraction, "modifiers": modifiers, "scroll": {"type": "object", "required": ["direction"], "properties": {"direction": {"enum": ["up", "down", "left", "right"]}, "notches": {"type": "integer", "minimum": 1, "maximum": 30}}, "additionalProperties": false}, "hover_ms": {"type": "integer", "minimum": 1, "maximum": 5000}}), &[]), write_output(), true, true));
+    actions.insert("drag".into(), contract("分别重新验证起点与终点并做 AX 命中检查后，在同一前台应用内按下、分步拖动并在终点释放，可带 modifiers。", "non_idempotent", "modify", "high", &["desktop.observe", "desktop.input"], point_input(json!({"to": target_schema(), "to_locator": locator_schema(), "button": button, "fraction": fraction, "to_fraction": fraction, "modifiers": modifiers}), &["to", "to_locator"]), write_output(), true, true));
     actions.insert("key_chord".into(), contract("重新验证并聚焦非受保护目标后，按下修饰键（ctrl、shift、alt、cmd）加一个主键；名称按字面映射，不在平台间互换。", "non_idempotent", "input", "high", &["desktop.observe", "desktop.input"], point_input(json!({"keys": {"type": "array", "minItems": 1, "maxItems": 6, "items": {"type": "string", "minLength": 1, "maxLength": 32}}}), &["keys"]), write_output(), true, true));
     for (name, description) in [
         ("minimize", "重新验证 AXWindow 后设置 AXMinimized=true，等待（有上限）读回为 true。"),
@@ -1729,13 +2101,26 @@ fn manifest_document() -> Value {
             "text",
             "重新验证并聚焦非受保护文本目标后，显式发送有界 Unicode 键盘输入。",
         ),
+        (
+            "secret_input",
+            "text",
+            "仅供受授权的瞬时输入通道替换受保护 AXValue；不读回或使用剪贴板。",
+        ),
     ] {
-        let mut property = json!({"type": "string", "maxLength": if name == "type_text" { MAX_TYPE_TEXT_CHARS } else { MAX_FIELD_CHARS }});
+        let mut property = json!({"type": "string", "maxLength": if matches!(name, "type_text" | "secret_input") { MAX_TYPE_TEXT_CHARS } else { MAX_FIELD_CHARS }});
         if name == "type_text" {
             property["minLength"] = json!(1);
         }
         actions.insert(name.into(), contract(description, "contextual", "input", "high", &["desktop.observe", "desktop.input"], json!({"type": "object", "required": ["target", "locator", field], "properties": {"target": target_schema(), "locator": locator_schema(), field: property}, "additionalProperties": false}), write_output(), true, true));
     }
+    for action in ["pointer_gesture", "drag", "key_chord"] {
+        actions.get_mut(action).expect("gesture contract")["input_schema"]["properties"]
+            ["hold_ms"] = hold.clone();
+    }
+    actions.get_mut("drag").expect("drag contract")["input_schema"]["properties"]["path"] = json!({
+        "type":"array", "maxItems":32, "items":{"type":"object", "required":["target","locator","fraction"],
+        "properties":{"target":target_schema(),"locator":locator_schema(),"fraction":fraction},"additionalProperties":false}
+    });
     json!({"apiVersion": "ai-auto-desktop.dev/v1alpha1", "kind": "CapabilityManifest", "metadata": {"name": PROVIDER_NAME, "version": PROVIDER_VERSION, "description": "macOS 原生 Accessibility API 进程驱动（完整性校验的 Swift helper）。"}, "actions": actions, "runtime": {"kind": "builtin", "protocol": "rust-provider-v1", "platforms": ["macos"]}})
 }
 
@@ -1758,6 +2143,8 @@ mod tests {
         changed: bool,
         duplicate: bool,
         truncated: bool,
+        drag_destination: bool,
+        drag_change: Option<&'static str>,
     }
 
     impl FakeBackend {
@@ -1797,6 +2184,7 @@ mod tests {
                     "invoke".into(),
                     "pointer_click".into(),
                     "pointer_gesture".into(),
+                    "drag".into(),
                     "key_chord".into(),
                 ],
                 provenance: Map::from_iter([
@@ -1835,10 +2223,32 @@ mod tests {
             if self.duplicate {
                 nodes.push(self.node("save2"));
             }
+            let fresh = self.captures.load(Ordering::SeqCst) > 1;
+            if self.drag_destination {
+                let mut destination = self.node("drop");
+                destination.name = Some("Drop".into());
+                destination
+                    .provenance
+                    .insert("identifier".into(), json!("drop"));
+                if fresh {
+                    match self.drag_change {
+                        Some("native") => destination.native_token = "replacement".into(),
+                        Some("semantic") => destination.name = Some("Changed".into()),
+                        Some("protected") => {
+                            destination.states.insert("protected".into(), Some(true));
+                        }
+                        _ => {}
+                    }
+                }
+                nodes.push(destination);
+            }
+            if fresh && self.drag_change == Some("reordered") {
+                nodes.reverse();
+            }
             Ok(BackendSnapshot {
                 app: Self::app(),
                 nodes,
-                truncated: self.truncated,
+                truncated: self.truncated || (fresh && self.drag_change == Some("truncated")),
             })
         }
         fn same_element(
@@ -1904,6 +2314,29 @@ mod tests {
         ) -> Result<Value, AutomationError> {
             self.writes.fetch_add(1, Ordering::SeqCst);
             Ok(json!({"native_operation": "CGEventKeyChord", "submitted": true, "sent": keys}))
+        }
+        fn key_chord_held(
+            &self,
+            token: &str,
+            keys: &[String],
+            hold_ms: Option<u64>,
+            deadline: Instant,
+        ) -> Result<Value, AutomationError> {
+            let mut result = self.key_chord(token, keys, deadline)?;
+            if let Some(ms) = hold_ms {
+                result["hold_ms"] = json!(ms);
+            }
+            Ok(result)
+        }
+        fn drag(
+            &self,
+            token: &str,
+            to_token: &str,
+            request: &Value,
+            _deadline: Instant,
+        ) -> Result<Value, AutomationError> {
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            Ok(json!({"submitted": true, "from": token, "to": to_token, "sent": request}))
         }
         fn start_recording(
             &self,
@@ -2003,13 +2436,33 @@ mod tests {
             field.name = Some("Note".into());
             field.description = None;
             field.provenance.remove("identifier");
-            field.states.insert("editable".into(), Some(!self.secure));
+            field.states.insert("editable".into(), Some(true));
             field.states.insert("protected".into(), Some(self.secure));
-            field.actions = vec!["focus".into(), "set_value".into(), "paste".into()];
+            field.actions = vec![
+                "focus".into(),
+                "set_value".into(),
+                "paste".into(),
+                "secret_input".into(),
+            ];
             vec![window, field]
         }
     }
     impl AxBackend for WindowBackend {
+        fn secret_input(
+            &self,
+            _token: &str,
+            text: &str,
+            _deadline: Instant,
+        ) -> Result<Value, AutomationError> {
+            self.inner.writes.fetch_add(1, Ordering::SeqCst);
+            if text == "fixture-error" {
+                Err(driver_error("DRIVER.ACTION_FAILED", text)
+                    .with_effect("unknown")
+                    .with_detail("echo", json!(text)))
+            } else {
+                Ok(json!({"echo":text}))
+            }
+        }
         fn name(&self) -> &str {
             "fake_macos_ax"
         }
@@ -2089,6 +2542,57 @@ mod tests {
         ) -> Result<Value, AutomationError> {
             self.inner.capture_element(token, deadline)
         }
+    }
+
+    #[test]
+    fn protected_replacement_is_dedicated_and_never_returns_backend_text() {
+        let backend = Arc::new(WindowBackend {
+            inner: FakeBackend::default(),
+            secure: true,
+        });
+        let provider = MacOSAxProvider::new(backend.clone()).unwrap();
+        let args = |text: &str| {
+            let snapshot = take_snapshot(&provider);
+            assert_eq!(snapshot["nodes"][1]["value"], Value::Null);
+            assert!(snapshot["nodes"][1]["actions"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("secret_input")));
+            json!({"target":{"snapshot_id":snapshot["snapshot_id"],"revision":snapshot["revision"],"node_id":"n1"},"locator":{"role":"AXSecureTextField","name":"Note"},"text":text})
+        };
+        for text in ["synthetic-fixture", ""] {
+            let result = provider
+                .invoke("desktop.macos_ax.secret_input@1", args(text), None)
+                .unwrap();
+            assert_eq!(
+                result["backend_result"],
+                json!({"submitted":true,"redacted":true})
+            );
+        }
+        let error = provider
+            .invoke(
+                "desktop.macos_ax.secret_input@1",
+                args("fixture-error"),
+                None,
+            )
+            .unwrap_err();
+        assert_eq!(error.code, "DRIVER.SECRET_INPUT_FAILED");
+        assert_eq!(error.effect, "unknown");
+        assert!(!format!("{error:?}").contains("fixture-error"));
+        for text in ["bad\n", "bad\0", "bad\r", &"a".repeat(1025)] {
+            assert!(provider
+                .invoke("desktop.macos_ax.secret_input@1", args(text), None)
+                .is_err());
+        }
+        let mut stale = args("synthetic-fixture");
+        stale["target"]["revision"] = json!(0);
+        assert!(provider
+            .invoke("desktop.macos_ax.secret_input@1", stale, None)
+            .is_err());
+        assert!(provider
+            .invoke("desktop.macos_ax.paste@1", args("fixture"), None)
+            .is_err());
+        assert_eq!(backend.inner.writes.load(Ordering::SeqCst), 3);
     }
 
     #[test]
@@ -2300,6 +2804,217 @@ mod tests {
         assert_eq!(backend.writes.load(Ordering::SeqCst), 0);
     }
 
+    fn drag_args(snapshot: &Value, same_node: bool) -> Value {
+        json!({
+            "target": {"snapshot_id": snapshot["snapshot_id"], "revision": snapshot["revision"], "node_id": "n0"},
+            "locator": locator(),
+            "to": {"snapshot_id": snapshot["snapshot_id"], "revision": snapshot["revision"], "node_id": if same_node { "n0" } else { "n1" }},
+            "to_locator": if same_node { locator() } else { json!({"role": "AXButton", "name": "Drop", "identifier": "drop"}) },
+            "fraction": {"fx": 0.2, "fy": 0.3},
+            "to_fraction": {"fx": 0.8, "fy": 0.7},
+        })
+    }
+
+    #[test]
+    fn drag_revalidates_both_endpoints_in_one_fresh_snapshot() {
+        for change in [None, Some("reordered")] {
+            let backend = Arc::new(FakeBackend {
+                drag_destination: true,
+                drag_change: change,
+                ..Default::default()
+            });
+            let provider = MacOSAxProvider::new(backend.clone()).unwrap();
+            let snapshot = take_snapshot(&provider);
+            let result = provider
+                .invoke(
+                    "desktop.macos_ax.drag@1",
+                    drag_args(&snapshot, false),
+                    Some(Duration::from_secs(2)),
+                )
+                .unwrap();
+            assert_eq!(result["backend_result"]["from"], "save");
+            assert_eq!(result["backend_result"]["to"], "drop");
+            assert_eq!(backend.captures.load(Ordering::SeqCst), 2);
+            assert_eq!(backend.writes.load(Ordering::SeqCst), 1);
+            assert_eq!(result["resolved"]["revision"], 2);
+        }
+    }
+
+    #[test]
+    fn drag_can_move_between_fractions_of_one_observed_element() {
+        let backend = Arc::new(FakeBackend::default());
+        let provider = MacOSAxProvider::new(backend.clone()).unwrap();
+        let snapshot = take_snapshot(&provider);
+        let result = provider
+            .invoke(
+                "desktop.macos_ax.drag@1",
+                drag_args(&snapshot, true),
+                Some(Duration::from_secs(2)),
+            )
+            .unwrap();
+        assert_eq!(result["backend_result"]["from"], "save");
+        assert_eq!(result["backend_result"]["to"], "save");
+        assert_eq!(
+            result["backend_result"]["sent"],
+            json!({
+                "button": "left", "fx": 0.2, "fy": 0.3, "to_fx": 0.8, "to_fy": 0.7,
+            })
+        );
+        assert_eq!(backend.captures.load(Ordering::SeqCst), 2);
+        assert_eq!(backend.writes.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn drag_rejects_changed_or_protected_destination_before_dispatch() {
+        for (change, code) in [
+            ("native", "DRIVER.STALE_SNAPSHOT"),
+            ("semantic", "DRIVER.STALE_SNAPSHOT"),
+            ("protected", "DRIVER.ACTION_UNSUPPORTED"),
+            ("truncated", "DRIVER.SNAPSHOT_TRUNCATED"),
+        ] {
+            let backend = Arc::new(FakeBackend {
+                drag_destination: true,
+                drag_change: Some(change),
+                ..Default::default()
+            });
+            let provider = MacOSAxProvider::new(backend.clone()).unwrap();
+            let snapshot = take_snapshot(&provider);
+            let error = provider
+                .invoke(
+                    "desktop.macos_ax.drag@1",
+                    drag_args(&snapshot, false),
+                    Some(Duration::from_secs(2)),
+                )
+                .unwrap_err();
+            assert_eq!(error.code, code, "{change}");
+            assert_eq!(backend.writes.load(Ordering::SeqCst), 0, "{change}");
+        }
+    }
+
+    #[test]
+    fn drag_rejects_destination_from_another_observation() {
+        let backend = Arc::new(FakeBackend {
+            drag_destination: true,
+            ..Default::default()
+        });
+        let provider = MacOSAxProvider::new(backend.clone()).unwrap();
+        let snapshot = take_snapshot(&provider);
+        let mut args = drag_args(&snapshot, false);
+        args["to"]["snapshot_id"] = json!("different-observation");
+        let error = provider
+            .invoke(
+                "desktop.macos_ax.drag@1",
+                args,
+                Some(Duration::from_secs(2)),
+            )
+            .unwrap_err();
+        assert_eq!(error.code, "DRIVER.STALE_SNAPSHOT");
+        assert_eq!(backend.writes.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn drag_path_validates_all_anchors_against_one_fresh_surface() {
+        let backend = Arc::new(FakeBackend::default());
+        let provider = MacOSAxProvider::new(backend.clone()).unwrap();
+        let snapshot = take_snapshot(&provider);
+        let mut args = drag_args(&snapshot, true);
+        args["fraction"] = json!({"fx":0.1,"fy":0.2});
+        args["to_fraction"] = json!({"fx":0.9,"fy":0.8});
+        args["path"] = json!([
+            {"target":args["target"],"locator":args["locator"],"fraction":{"fx":0.3,"fy":0.7}},
+            {"target":args["target"],"locator":args["locator"],"fraction":{"fx":0.6,"fy":0.4}}]);
+        let result = provider
+            .invoke(
+                "desktop.macos_ax.drag@1",
+                args.clone(),
+                Some(Duration::from_secs(2)),
+            )
+            .unwrap();
+        assert_eq!(
+            result["backend_result"]["sent"]["path"],
+            json!([{"fx":0.3,"fy":0.7},{"fx":0.6,"fy":0.4}])
+        );
+        let mut bad = args.clone();
+        bad["path"][1]["target"]["revision"] = json!(999);
+        assert!(drag_path_anchors(bad.as_object().unwrap()).is_err());
+        let mut bad = args.clone();
+        bad["path"][1]["target"]["node_id"] = json!("n1");
+        assert!(drag_path_anchors(bad.as_object().unwrap()).is_err());
+        let mut bad = args.clone();
+        bad["path"][0]["fraction"] = Value::Null;
+        assert!(drag_path_anchors(bad.as_object().unwrap()).is_err());
+        let mut bad = args.clone();
+        bad.as_object_mut().unwrap().remove("fraction");
+        assert!(drag_path_anchors(bad.as_object().unwrap()).is_err());
+        let mut bad = args.clone();
+        bad["path"] = json!(vec![args["path"][0].clone(); 33]);
+        assert!(drag_path_anchors(bad.as_object().unwrap()).is_err());
+        assert_eq!(backend.writes.load(Ordering::SeqCst), 1);
+
+        // An anchor with the source handle but another locator must not get
+        // authority from its fraction alone, even on a valid original snapshot.
+        let snapshot = take_snapshot(&provider);
+        let mut bad = drag_args(&snapshot, true);
+        bad["fraction"] = json!({"fx":0.1,"fy":0.2});
+        bad["to_fraction"] = json!({"fx":0.9,"fy":0.8});
+        bad["path"] = json!([{"target":bad["target"],"locator":{"role":"AXButton","name":"Missing"},"fraction":{"fx":0.4,"fy":0.6}}]);
+        assert!(provider
+            .invoke("desktop.macos_ax.drag@1", bad, Some(Duration::from_secs(2)))
+            .is_err());
+        assert_eq!(backend.writes.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn bounded_holds_are_normalised_and_refused_before_dispatch_when_invalid() {
+        let backend = Arc::new(FakeBackend::default());
+        let provider = MacOSAxProvider::new(backend.clone()).unwrap();
+        let snapshot = take_snapshot(&provider);
+        let mut args = drag_args(&snapshot, true);
+        args["hold_ms"] = json!(23);
+        let result = provider
+            .invoke(
+                "desktop.macos_ax.drag@1",
+                args,
+                Some(Duration::from_secs(2)),
+            )
+            .unwrap();
+        assert_eq!(result["backend_result"]["sent"]["hold_ms"], 23);
+        let invoke = |extra: Value, timeout: Duration| {
+            let snapshot = take_snapshot(&provider);
+            let mut args = json!({"target": {"snapshot_id": snapshot["snapshot_id"], "revision": snapshot["revision"], "node_id": "n0"}, "locator": locator(), "keys":["a"]});
+            args.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            provider.invoke("desktop.macos_ax.key_chord@1", args, Some(timeout))
+        };
+        assert_eq!(
+            invoke(json!({"hold_ms":40}), Duration::from_secs(2)).unwrap()["backend_result"]
+                ["hold_ms"],
+            40
+        );
+        for bad in [json!(0), json!(5001), json!(null), json!(1.5)] {
+            assert!(invoke(json!({"hold_ms":bad}), Duration::from_secs(2)).is_err());
+        }
+        assert_eq!(
+            invoke(json!({"hold_ms":500}), Duration::from_millis(50))
+                .unwrap_err()
+                .code,
+            "DRIVER.TIMEOUT"
+        );
+        assert_eq!(backend.writes.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            gesture_request(json!({"hold_ms":50}).as_object().unwrap()).unwrap()["hold_ms"],
+            50
+        );
+        for invalid in [
+            json!({"hold_ms":10,"count":2}),
+            json!({"hold_ms":10,"hover_ms":10}),
+            json!({"hold_ms":10,"scroll":{"direction":"down"}}),
+        ] {
+            assert!(gesture_request(invalid.as_object().unwrap()).is_err());
+        }
+    }
+
     #[test]
     fn gestures_and_chords_are_normalised_for_the_helper() {
         let backend = Arc::new(FakeBackend::default());
@@ -2366,6 +3081,50 @@ mod tests {
             4,
             "nothing refused reached the helper"
         );
+    }
+
+    #[test]
+    fn pointer_modifiers_reach_the_helper_without_keyboard_dispatch() {
+        let backend = Arc::new(FakeBackend::default());
+        let provider = MacOSAxProvider::new(backend.clone()).unwrap();
+        for action in ["pointer_gesture", "drag"] {
+            let snapshot = take_snapshot(&provider);
+            let target = json!({"snapshot_id":snapshot["snapshot_id"], "revision":snapshot["revision"], "node_id":"n0"});
+            let mut args = json!({"target":target, "locator":locator(), "modifiers":["ctrl","shift","alt","meta"]});
+            if action == "drag" {
+                args["to"] = target;
+                args["to_locator"] = locator();
+            }
+            let result = provider
+                .invoke(
+                    &format!("desktop.macos_ax.{action}@1"),
+                    args,
+                    Some(Duration::from_secs(2)),
+                )
+                .unwrap();
+            assert_eq!(
+                result["backend_result"]["sent"]["modifiers"],
+                json!(["ctrl", "shift", "alt", "meta"])
+            );
+        }
+        assert_eq!(backend.writes.load(Ordering::SeqCst), 2);
+        for values in [
+            json!(null),
+            json!(["cmd"]),
+            json!(["ctrl", "ctrl"]),
+            json!([true]),
+        ] {
+            assert!(pointer_modifiers(Some(&values)).is_err(), "{values}");
+        }
+        for mode in [
+            json!({"hover_ms":100}),
+            json!({"scroll":{"direction":"down"}}),
+        ] {
+            let mut args = mode.as_object().unwrap().clone();
+            args.insert("modifiers".into(), json!(["shift"]));
+            assert!(gesture_request(&args).is_err());
+        }
+        assert_eq!(backend.writes.load(Ordering::SeqCst), 2);
     }
 
     #[test]

@@ -107,6 +107,22 @@ jobs:
           test -n "$AAD_TEST_CHROME"
           cargo test --locked -p aad-control --test browser_e2e -- --ignored
 
+      # The page scripts, recorder and owned-browser launch are exercised end to
+      # end through the CLI. The suite uses Node's built-in WebSocket (22+).
+      - uses: actions/setup-node@v4
+        if: runner.os == 'Linux'
+        with:
+          node-version: "22"
+      - name: Test browser recording and launch with headless Chromium
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          export AAD_TEST_CHROME="$(command -v google-chrome || command -v chromium)"
+          test -n "$AAD_TEST_CHROME"
+          cargo build --locked -p aad-cli -p aad-browser --bins
+          node --test --test-concurrency=1 tests/browser/*.test.mjs
+
       # Each system builds only its own platform code: aad depends on this
       # system's platform crate and accessibility backend, and on none of the
       # other systems'.

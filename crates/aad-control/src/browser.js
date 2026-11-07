@@ -3,15 +3,65 @@
   const documentToken = NONCE;
   let observation = null;
   let nodes = new Map();
-  let scopeRoot = null, scopeInvalid = false;
-  const scopeObserver = new MutationObserver(() => { scopeInvalid = true; });
+  let scopeRoot = null, scopeInvalid = false, scopeNeedsValidation = false;
+  let scopeParents = [], scopeElements = [], scopeIdentity = null;
+  const scopeChanges = records => {
+    if (!scopeRoot) return;
+    for (const record of records) {
+      // Changes inside the captured region, to its ancestors' attributes,
+      // or moving the region itself invalidate its complete observation.
+      if (inside(scopeRoot,record.target) ||
+          (record.type==='attributes' && inside(record.target,scopeRoot)) ||
+          (record.type==='childList' && [...record.addedNodes,...record.removedNodes].some(n=>inside(n,scopeRoot)))) {
+        scopeInvalid=true;
+      } else {
+        // A sibling timer is not a change to this region. It may still move
+        // it, reveal a previously hidden child through CSS, or rename it via
+        // an external label: check the captured region before accepting it.
+        scopeNeedsValidation=true;
+      }
+    }
+  };
+  const scopeObserver = new MutationObserver(scopeChanges);
   /*AAD_NAMING*/
   // Landmarks a page is divided into, as an overview names its regions.
   const LANDMARK_ROLES = ['banner','navigation','main','complementary','contentinfo','form','search','dialog','alertdialog','region'];
   const landmark = el => el!==document.body && (el.getAttribute('role') ? LANDMARK_ROLES.includes(el.getAttribute('role')) : (['HEADER','NAV','MAIN','ASIDE','FOOTER','FORM','DIALOG'].includes(el.tagName) || (el.tagName==='SECTION' && !!(el.getAttribute('aria-label')||el.getAttribute('aria-labelledby')))));
-  const protectedNode = el => el.tagName === 'INPUT' && ['password','hidden'].includes((el.type||'').toLowerCase());
+  // Retain protection for these elements even if the application reveals a
+  // password by changing its input type. No secret values are stored here.
+  const secretElements = new Set();
+  // This private identity set survives observation resets in this named
+  // isolated world. Detached fields no longer block screenshots.
+  const closedSecrets = globalThis.__aadClosedProtectedV1 || (globalThis.__aadClosedProtectedV1=new Set());
+  const password = el => el.tagName==='INPUT' && (el.type||'').toLowerCase()==='password';
+  const fieldProtected = el => secretElements.has(el) || closedSecrets.has(el) || (el.tagName === 'INPUT' && ['password','hidden'].includes((el.type||'').toLowerCase()));
+  const protectedNode = el => fieldProtected(el) || (closedRoots.has(el) && closedProtected(el));
   // A file input only ever takes files, through upload; often it is hidden behind a styled button.
   const fileInput = el => el.tagName === 'INPUT' && (el.type||'').toLowerCase() === 'file';
+  // Canvas exposes pixels rather than child controls. Its observed element
+  // remains the anchor; pointer input still rechecks identity and hit testing.
+  const canvas = el => el.tagName === 'CANVAS';
+  // Normal DOM traversal cannot enter a closed shadow root. CDP supplies a
+  // private root reference; only its observed host becomes a visual surface.
+  const closedRoots = new Map();
+  const surface = el => canvas(el) || closedRoots.has(el);
+  // Inspect protection flags, not field values, and recheck them synchronously
+  // with every action and screenshot request.
+  const closedProtected = host => {
+    const root=closedRoots.get(host);
+    if(!root || root.host!==host)return true;
+    const stack=[...root.children];
+    let scanned=0, protectedFound=false;
+    while(stack.length) {
+      if(++scanned>20000)return true;
+      const el=stack.pop();
+      if(fieldProtected(el)){closedSecrets.add(el);protectedFound=true;}
+      const inner=closedRoots.get(el)||el.shadowRoot;
+      if(inner)stack.push(...inner.children);
+      stack.push(...el.children);
+    }
+    return protectedFound;
+  };
   const present = el => visible(el) || (fileInput(el) && el.isConnected && el.ownerDocument === document);
   const visible = el => el.isConnected && el.ownerDocument === document && el.getClientRects().length > 0 && getComputedStyle(el).visibility !== 'hidden';
   const enabled = el => !el.disabled && !el.closest('[inert]') && el.getAttribute('aria-disabled') !== 'true';
@@ -26,6 +76,29 @@
   const deepHit = (x,y) => {let hit=document.elementFromPoint(x,y);while(hit && hit.shadowRoot){const inner=hit.shadowRoot.elementFromPoint(x,y);if(!inner||inner===hit)break;hit=inner;}return hit;};
   // Containment across shadow boundaries.
   const inside = (el,hit) => {for(let n=hit;n;n=n.parentNode||n.host){if(n===el)return true;}return false;};
+  const parentsOf = el => {const parents=[];for(let n=el.parentNode||el.host;n;n=n.parentNode||n.host)parents.push(n);return parents;};
+  const scopeState = el => {
+    const shown=present(el), box=el.getBoundingClientRect();
+    const labels=(el.getAttribute('aria-labelledby')||'').split(/\s+/).filter(Boolean).slice(0,8)
+      .map(id=>(document.getElementById(id)?.textContent||'').slice(0,256));
+    return JSON.stringify([shown,fingerprint(el),labels,box.left+scrollX,box.top+scrollY,box.width,box.height]);
+  };
+  const scopeCurrent = () => {
+    scopeChanges(scopeObserver.takeRecords());
+    if (scopeInvalid || !scopeRoot.isConnected) return false;
+    const parents=parentsOf(scopeRoot);
+    if (parents.length!==scopeParents.length || parents.some((parent,i)=>parent!==scopeParents[i])) return false;
+    if (scopeNeedsValidation) {
+      const matches=scopeIdentity===null ? [scopeRoot] : document.querySelectorAll('[id="'+CSS.escape(scopeIdentity)+'"]');
+      if (matches.length!==1 || matches[0]!==scopeRoot ||
+          scopeElements.some(({el,state})=>scopeState(el)!==state)) {
+        scopeInvalid=true;
+        return false;
+      }
+      scopeNeedsValidation=false;
+    }
+    return true;
+  };
   const scrollable = el => el===document.body || ((el.scrollHeight>el.clientHeight+1 || el.scrollWidth>el.clientWidth+1) && /(auto|scroll|overlay)/.test(getComputedStyle(el).overflow+getComputedStyle(el).overflowY+getComputedStyle(el).overflowX));
   // The cursor is inherited, so it marks the element where it starts and the
   // items someone picks inside it, not every icon and label within them.
@@ -37,33 +110,34 @@
   };
   // What a person could pick up: HTML5 draggables, items of lists and grids,
   // and whatever shows a grab cursor.
-  const draggable = el => el!==document.body && (el.draggable || ['listitem','option','row','treeitem'].includes(roleOf(el)) || cursorMarks(el, /^(grab|grabbing|move)$/));
+  const draggable = el => el!==document.body && (surface(el) || el.draggable || ['listitem','option','row','treeitem'].includes(roleOf(el)) || cursorMarks(el, /^(grab|grabbing|move)$/));
   // focus() exists on all HTMLElements, including divs that cannot take focus.
   // Explicit negative tabindex still permits programmatic focus.
   const focusable = el => typeof el.focus==='function' && (el.tabIndex>=0 || el.hasAttribute('tabindex') || el.isContentEditable || activeElement()===el);
   const actions = el => {
-    if (!enabled(el) || protectedNode(el)) return [];
+    if (!enabled(el)) return [];
+    if (protectedNode(el)) return password(el) && !el.readOnly ? ['secret_input'] : [];
     if (fileInput(el)) return ['upload'];
     const result=[];
     if (focusable(el)) result.push('focus','key');
     // Delegated listeners (including React) are invisible in our isolated world.
     // The rendered pointer affordance also identifies their clickable elements;
     // check() rechecks this capability and the observed identity before input.
-    if ((['BUTTON','A','INPUT','SELECT'].includes(el.tagName) || el.onclick || roleOf(el)==='button' || checkable(el) || cursorMarks(el, /^pointer$/)) && typeof el.click==='function') result.push('click','hover');
+    if ((surface(el) || ['BUTTON','A','INPUT','SELECT'].includes(el.tagName) || el.onclick || roleOf(el)==='button' || checkable(el) || cursorMarks(el, /^pointer$/)) && typeof el.click==='function') result.push('click','hover');
     if (editable(el)) result.push('fill','type_text');
     if (el.tagName==='SELECT' && !el.multiple) result.push('select');
     if (checkable(el)) result.push('check');
-    if (scrollable(el)) result.push('scroll');
+    if (surface(el) || scrollable(el)) result.push('scroll');
     if (draggable(el)) result.push('drag');
     if (el===document.body) result.push('navigate','back','forward','reload','open_tab','activate_page','close_page','emulate','clear_site_data');
     return result;
   };
   const check = args => {
-    if (scopeRoot && (scopeInvalid || scopeObserver.takeRecords().length || !scopeRoot.isConnected)) return {error:'CONTROL.STALE_TARGET'};
+    if (scopeRoot && !scopeCurrent()) return {error:'CONTROL.STALE_TARGET'};
     if (args.document_token!==documentToken || args.observation!==observation) return {error:'CONTROL.STALE_TARGET'};
     const found=nodes.get(args.node_id);
     if (!found || !present(found.el) || fingerprint(found.el)!==found.fingerprint) return {error:'CONTROL.STALE_TARGET'};
-    if (!enabled(found.el) || protectedNode(found.el)) return {error:'CONTROL.ACTION_UNSUPPORTED'};
+    if (!enabled(found.el) || (protectedNode(found.el) && args.action!=='secret_input')) return {error:'CONTROL.ACTION_UNSUPPORTED'};
     // A drag's destination is any observed element; everything else needs its action.
     if (args.action!==null && !actions(found.el).includes(args.action)) return {error:'CONTROL.ACTION_UNSUPPORTED'};
     return found;
@@ -71,17 +145,28 @@
   globalThis.__aadControlV1 = {
     validate_scope: args => {
       if(args.document_token!==documentToken || args.observation!==observation ||
-         !scopeRoot || !scopeRoot.isConnected || scopeInvalid || scopeObserver.takeRecords().length)
+         !scopeRoot || !scopeCurrent())
         return {error:'CONTROL.STALE_TARGET'};
       return {valid:true};
     },
-    observe: (id,limit,scopeId=null) => {
+    // Read-only narrowing may start from an observed node of an incomplete
+    // capture. It still checks the retained identity before exporting it to CDP.
+    scope_element: args => {
+      if (args.document_token!==documentToken || args.observation!==observation ||
+          (scopeRoot && !scopeCurrent())) return null;
+      const found=nodes.get(args.node_id);
+      return found && present(found.el) && fingerprint(found.el)===found.fingerprint ? found.el : null;
+    },
+    observe: (id,limit,scopeId=null,elementRoot=null) => {
       observation=id; nodes=new Map();
-      scopeObserver.disconnect(); scopeRoot=null; scopeInvalid=false;
+      scopeObserver.disconnect(); scopeRoot=null; scopeInvalid=false; scopeNeedsValidation=false;
+      scopeParents=[]; scopeElements=[]; scopeIdentity=elementRoot===null?scopeId:null;
       if (scopeId !== null) {
-        const matches=document.querySelectorAll('[id="'+CSS.escape(scopeId)+'"]');
+        const matches=elementRoot===null ? document.querySelectorAll('[id="'+CSS.escape(scopeId)+'"]') : [elementRoot];
         if(matches.length!==1)return {error:matches.length?'CONTROL.AMBIGUOUS':'CONTROL.SCOPE_NOT_FOUND'};
         scopeRoot=matches[0];
+        if(!present(scopeRoot))return {error:'CONTROL.STALE_TARGET'};
+        scopeParents=parentsOf(scopeRoot);
         scopeObserver.observe(document,{subtree:true,childList:true,attributes:true,characterData:true});
       }
       const items=[];
@@ -93,6 +178,7 @@
       let scanned=0;
       while(stack.length && items.length<=limit && scanned++<20000) {
         const el=stack.pop();
+        if(scopeRoot)scopeElements.push({el,state:scopeState(el)});
         if(scopeRoot && el.shadowRoot)scopeObserver.observe(el.shadowRoot,{subtree:true,childList:true,attributes:true,characterData:true});
         if(present(el))items.push(el);
         const children=el.shadowRoot?[...el.shadowRoot.children,...el.children]:el.children;
@@ -110,6 +196,7 @@
           value:protectedNode(el)?null:(('value' in el)?String(el.value).slice(0,4096):null),
           states:{enabled:enabled(el),protected:protectedNode(el),read_only:!!el.readOnly,focused:activeElement()===el},actions:actions(el),parent:parentOf(el)};
         if (landmark(el)) node.landmark=true;
+        if (closedRoots.has(el)) node.surface='closed_shadow';
         if (checkable(el)) node.states.checked=checkedOf(el);
         if (fileInput(el)) { node.states.hidden=!visible(el); node.files=Array.from(el.files||[]).slice(0,32).map(f=>f.name.slice(0,256)); node.multiple=!!el.multiple; }
         if (el.tagName==='SELECT') node.options=Array.from(el.options).slice(0,100).map(o=>o.label.trim().slice(0,256));
@@ -122,11 +209,33 @@
     },
     // The observed elements in node order, for the browser's accessibility tree.
     elements: () => Array.from(nodes.values()).map(found=>found.el),
+    reset_closed_roots: () => { closedRoots.clear(); return true; },
+    mark_closed_root: root => { if(!root || !root.host || root.host.ownerDocument!==document)return false; closedRoots.set(root.host,root); return true; },
+    record_closed_protection: () => { for(const host of closedRoots.keys())closedProtected(host); return true; },
+    closed_protected_visible: () => Array.from(closedSecrets).some(visible) || Array.from(closedRoots.keys()).some(host=>visible(host)&&closedProtected(host)),
+    surface_state: () => Array.from(nodes,([node_id,{el}])=>({node_id,surface:closedRoots.has(el)?'closed_shadow':null,protected:protectedNode(el),actions:actions(el)})),
+    // Rehydrate identities retained by the backend across observation resets
+    // and CDP reconnects. Neither identifiers nor this set contain values.
+    mark_secret: el => { if(el.ownerDocument===document)secretElements.add(el); return true; },
+    secrets_visible: () => Array.from(secretElements).some(visible),
+    // Only the dedicated server-owned binding path calls this method. Check
+    // identity and replace in one JS turn; no clipboard or keyboard is used.
+    secret_input: (args,value) => {
+      const found=check(args); if(found.error) return found;
+      const el=found.el;
+      if(!password(el) || el.readOnly || typeof value!=='string' ||
+         Array.from(value).length>1024 || /[\0\r\n]/.test(value)) return {error:'CONTROL.ACTION_UNSUPPORTED'};
+      secretElements.add(el);
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set.call(el,value);
+      el.dispatchEvent(new Event('input',{bubbles:true,composed:true}));
+      el.dispatchEvent(new Event('change',{bubbles:true,composed:true}));
+      return {submitted:true,redacted:true};
+    },
     // What the page, or one observed region of it, shows as text, with tables
     // as rows of cells. Each part stops at max_characters.
     text: args => {
       if (args.document_token!==documentToken || args.observation!==observation) return {error:'CONTROL.STALE_TARGET'};
-      if (scopeRoot && (scopeInvalid || scopeObserver.takeRecords().length || !scopeRoot.isConnected)) return {error:'CONTROL.STALE_TARGET'};
+      if (scopeRoot && !scopeCurrent()) return {error:'CONTROL.STALE_TARGET'};
       let root=scopeRoot||document.body;
       if (args.node_id) {
         const found=nodes.get(args.node_id);
@@ -204,6 +313,23 @@
       const found=check(args); if(found.error) return found;
       return {ok:true};
     },
+    path_surface: args => {
+      const found=check(args); if(found.error)return found;
+      const el=found.el;
+      if(!surface(el))return {error:'CONTROL.ACTION_UNSUPPORTED'};
+      const point=globalThis.__aadControlV1.point({...args,noscroll:true});
+      if(point.error)return point;
+      let hit=document.elementFromPoint(point.x,point.y);
+      while(hit) {
+        const root=closedRoots.get(hit)||hit.shadowRoot;
+        if(!root)break;
+        const inner=root.elementFromPoint(point.x,point.y);
+        if(!inner||inner===hit)break;
+        hit=inner;
+      }
+      for(let n=hit;n;n=n.parentNode||n.host)if(n.draggable)return {error:'CONTROL.ACTION_UNSUPPORTED'};
+      return {ok:true};
+    },
     // The checked element itself, by reference, for a protocol call that needs the node.
     element: args => {
       const found=check(args); return found.error ? null : found.el;
@@ -217,6 +343,23 @@
       found.el.scrollIntoView({block:'nearest',inline:'nearest'});
       const box=found.el.getBoundingClientRect();
       if (box.width<1 || box.height<1) return {error:'CONTROL.OCCLUDED'};
+      // A parent or overlapping element's screenshot could reveal a field
+      // whose type the page changed to text. Refuse the entire capture rather
+      // than racing a pixel mask against a later layout change.
+      for(const secret of [...secretElements,...closedSecrets]) {
+        if(!visible(secret))continue;
+        const privateBox=secret.getBoundingClientRect();
+        if(privateBox.left<box.right && privateBox.right>box.left &&
+           privateBox.top<box.bottom && privateBox.bottom>box.top)
+          return {error:'CONTROL.ACTION_UNSUPPORTED'};
+      }
+      for(const host of closedRoots.keys()) {
+        if(!visible(host) || !closedProtected(host))continue;
+        const privateBox=host.getBoundingClientRect();
+        if(privateBox.left<box.right && privateBox.right>box.left &&
+           privateBox.top<box.bottom && privateBox.bottom>box.top)
+          return {error:'CONTROL.ACTION_UNSUPPORTED'};
+      }
       return {x:box.left+scrollX,y:box.top+scrollY,width:box.width,height:box.height};
     },
     // Where trusted pointer input should land, in this frame's CSS pixels. The
@@ -226,14 +369,36 @@
       const el=found.el;
       if(!args.noscroll) el.scrollIntoView({block:'nearest',inline:'nearest'});
       const box=el.getBoundingClientRect();
-      // Only the part inside the viewport can receive input; the body of a long page is mostly outside it.
-      const left=Math.max(box.left,0), top=Math.max(box.top,0);
-      const width=Math.min(box.right,innerWidth)-left, height=Math.min(box.bottom,innerHeight)-top;
-      if(width<2 || height<2) return {error:'CONTROL.OCCLUDED'};
       const at=(start,size,f)=>Math.min(start+size-1,Math.max(start+1,start+size*f));
-      const fx=args.fraction?args.fraction.fx:0.5, fy=args.fraction?args.fraction.fy:0.5;
-      const x=at(left,width,fx), y=at(top,height,fy);
+      let x,y;
+      if(args.fraction) {
+        // A fraction describes the full observed element, including portions
+        // clipped by the viewport. Never retarget it to the visible fragment.
+        if(box.width<2 || box.height<2)return {error:'CONTROL.OCCLUDED'};
+        x=at(box.left,box.width,args.fraction.fx);
+        y=at(box.top,box.height,args.fraction.fy);
+        if(x<0 || y<0 || x>=innerWidth || y>=innerHeight)return {error:'CONTROL.OCCLUDED'};
+      } else {
+        // The default still chooses the visible center of a long page body
+        // or a partly clipped element, when no particular part was requested.
+        const left=Math.max(box.left,0), top=Math.max(box.top,0);
+        const width=Math.min(box.right,innerWidth)-left, height=Math.min(box.bottom,innerHeight)-top;
+        if(width<2 || height<2)return {error:'CONTROL.OCCLUDED'};
+        x=at(left,width,0.5); y=at(top,height,0.5);
+      }
       if(!inside(el,deepHit(x,y))) return {error:'CONTROL.OCCLUDED'};
+      for(const secret of [...secretElements,...closedSecrets]) {
+        if(!visible(secret))continue;
+        const privateBox=secret.getBoundingClientRect();
+        if(x>=privateBox.left && x<privateBox.right && y>=privateBox.top && y<privateBox.bottom)
+          return {error:'CONTROL.ACTION_UNSUPPORTED'};
+      }
+      for(const host of closedRoots.keys()) {
+        if(!visible(host) || !closedProtected(host))continue;
+        const privateBox=host.getBoundingClientRect();
+        if(x>=privateBox.left && x<privateBox.right && y>=privateBox.top && y<privateBox.bottom)
+          return {error:'CONTROL.ACTION_UNSUPPORTED'};
+      }
       return {x,y};
     }
   };

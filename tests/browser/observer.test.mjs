@@ -4,10 +4,16 @@ import {readFileSync} from 'node:fs';
 import vm from 'node:vm';
 import {fixture} from './fixture.mjs';
 
-const script=readFileSync(new URL('../../crates/aad-cdp/src/observer.js',import.meta.url),'utf8').replace('__AAD_BINDING__','');
+const source=name=>readFileSync(new URL(`../../crates/aad-browser/src/${name}`,import.meta.url),'utf8');
+// Assemble the page script exactly as `cdp::observer_script` does.
+const script=source('observer.js').replace('/*AAD_NAMING*/',source('naming.js')).replace('__AAD_BINDING__','');
+// The shared naming code reads an element's text through a TreeWalker; this
+// fake yields each element's textContent as its single text node.
+const NodeFilter={SHOW_ELEMENT:1,SHOW_TEXT:4};
+const createTreeWalker=root=>{let done=!root.textContent;return {nextNode:()=>done?null:(done=true,{nodeValue:root.textContent})};};
 test('preserve action order, repeated clicks and distinct unlabeled fields; bound the queue',()=>{
   const handlers=new Map();
-  const context={document:{addEventListener:(n,f)=>handlers.set(n,f),removeEventListener:()=>{}},location:{href:'fixture'},performance,Date,Math};
+  const context={document:{addEventListener:(n,f)=>handlers.set(n,f),removeEventListener:()=>{},createTreeWalker},NodeFilter,location:{href:'fixture'},performance,Date,Math};
   vm.runInNewContext(script,context);
   const input=value=>({tagName:'INPUT',type:'text',value,getAttribute:()=>null});
   const first=input('alice'), second=input('bob'), button={tagName:'BUTTON',textContent:'submit',getAttribute:()=>null};
@@ -16,6 +22,8 @@ test('preserve action order, repeated clicks and distinct unlabeled fields; boun
   const result=context.__aadCdp.takeReport();
   assert.equal(result.events.map(e=>e.kind).join(','),'input,click,input,click,click');
   assert.notEqual(result.events[0].node_id,result.events[2].node_id);
+  // Each step carries the role and name the control session replays it by.
+  assert.deepEqual(JSON.parse(JSON.stringify(result.events.slice(0,2).map(e=>e.control))),[{role:'textbox',name:''},{role:'button',name:'submit'}]);
   for(let i=0;i<2000;i++)event('input',first);
   assert.equal(context.__aadCdp.takeReport().events.length,1);
   for(let i=0;i<600;i++)event('click',button);

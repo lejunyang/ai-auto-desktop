@@ -201,7 +201,7 @@ fn page_of(url: &str) -> Option<String> {
     (page.starts_with("http://") || page.starts_with("https://")).then(|| page.to_string())
 }
 
-/// Steps for a browser recording's `steps.jsonl` (aad-cdp's recorder), oldest
+/// Steps for a browser recording's `steps.jsonl` (aad-browser's recorder), oldest
 /// first. Each action names its element by `control`, the role and name the
 /// control session finds it by; actions recorded without one (older
 /// recordings) are skipped. A form submission is skipped as well: the click

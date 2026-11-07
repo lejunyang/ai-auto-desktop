@@ -6,12 +6,15 @@
 
 use aad_core::AutomationError;
 use aad_plugin::{manifest, CapabilityManifest};
-use aad_runtime::{ArtifactStore, Provider};
+use aad_runtime::{ArtifactStore, CancellationToken, Provider};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, TryLockError};
 use std::time::{Duration, Instant};
+
+mod cross_resource;
+pub use cross_resource::{DragBetweenEndpoint, DragBetweenRequest};
 
 pub const PROVIDER_NAME: &str = "desktop.linux_atspi";
 pub const PROVIDER_VERSION: &str = "0.1.0";
@@ -39,6 +42,7 @@ const WRITE_ACTIONS: &[&str] = &[
     "pointer_gesture",
     "restore",
     "set_text",
+    "secret_input",
     "toggle",
     "type_text",
 ];
@@ -76,6 +80,29 @@ pub struct NativeRef {
     pub object_path: String,
 }
 
+/// A top-level window from the same freshly captured tree as an input target.
+/// This is an internal anchor, never a caller-provided coordinate or window id.
+#[derive(Clone, Debug)]
+pub struct WindowAnchor {
+    pub native: NativeRef,
+    pub bounds: Bounds,
+}
+
+/// Private native path: source, intermediate anchors, then destination. Every
+/// coordinate was derived from one revalidated observed surface's fractions.
+pub struct DragPathRequest<'a> {
+    pub target: &'a NativeRef,
+    pub window: Option<&'a WindowAnchor>,
+    pub points: &'a [(i32, i32)],
+    pub button: u8,
+    pub modifiers: &'a [String],
+    pub hold_ms: Option<u16>,
+    pub process_id: u32,
+    pub deadline: Instant,
+}
+
+pub type DragPathValidation = Arc<dyn Fn(usize) -> Result<(), AutomationError> + Send + Sync>;
+
 #[derive(Clone, Debug)]
 pub struct BackendNode {
     pub native: NativeRef,
@@ -96,6 +123,8 @@ pub struct BackendSnapshot {
     pub application: Map<String, Value>,
     pub nodes: Vec<BackendNode>,
     pub truncated: bool,
+    /// Bounded, content-free explanations for an incomplete capture.
+    pub truncation_reasons: Vec<Value>,
 }
 
 /// A pointer gesture, already validated, in X11's own button numbering.
@@ -131,8 +160,37 @@ impl Bounds {
 }
 
 pub trait AtspiBackend: Send + Sync {
+    fn supports_cross_resource_drag(&self) -> bool {
+        false
+    }
+    fn drag_between(
+        &self,
+        _request: DragBetweenRequest<'_>,
+        _validate: DragPathValidation,
+    ) -> Result<Value, AutomationError> {
+        Err(driver_error(
+            "DRIVER.ACTION_UNSUPPORTED",
+            "cross-resource drag is unavailable",
+        ))
+    }
+    /// Return an invocation-local view sharing persistent observation state.
+    /// The token must never replace a session policy or persist into later calls.
+    fn cancellation_scope(&self, _token: &CancellationToken) -> Option<Arc<dyn AtspiBackend>> {
+        None
+    }
     fn name(&self) -> &str;
     fn session_info(&self) -> Map<String, Value>;
+    fn inspect_session(&self, _deadline: Instant) -> Map<String, Value> {
+        self.session_info()
+    }
+    /// Explain a missing synthetic action without blocking semantic AT-SPI actions.
+    fn check_action_support(
+        &self,
+        _action: &str,
+        _deadline: Instant,
+    ) -> Result<(), AutomationError> {
+        Ok(())
+    }
     fn list_applications(
         &self,
         deadline: Instant,
@@ -144,14 +202,55 @@ pub trait AtspiBackend: Send + Sync {
         max_nodes: usize,
         deadline: Instant,
     ) -> Result<BackendSnapshot, AutomationError>;
-    fn focus(&self, target: &NativeRef, deadline: Instant) -> Result<Value, AutomationError>;
+    /// Capture a previously observed root, retaining ancestors needed for hit testing.
+    fn capture_scope(
+        &self,
+        _application: &Map<String, Value>,
+        _root: &NativeRef,
+        _max_depth: u32,
+        _max_nodes: usize,
+        _deadline: Instant,
+    ) -> Result<BackendSnapshot, AutomationError> {
+        Err(driver_error(
+            "DRIVER.ACTION_UNSUPPORTED",
+            "scoped capture is unavailable",
+        ))
+    }
+    fn focus(
+        &self,
+        target: &NativeRef,
+        _window: Option<&WindowAnchor>,
+        deadline: Instant,
+    ) -> Result<Value, AutomationError>;
     fn invoke(&self, target: &NativeRef, deadline: Instant) -> Result<Value, AutomationError>;
+    /// Invoke the exact canonical activation selected by the fresh observation.
+    fn invoke_named(
+        &self,
+        target: &NativeRef,
+        name: &str,
+        deadline: Instant,
+    ) -> Result<Value, AutomationError> {
+        self.named_action(target, name, deadline)
+    }
     fn set_text(
         &self,
         target: &NativeRef,
         text: &str,
         deadline: Instant,
     ) -> Result<Value, AutomationError>;
+    /// Trusted server-bound replacement for a fresh protected editable element.
+    /// Implementations must neither use the clipboard nor expose text or its length.
+    fn secret_input(
+        &self,
+        _target: &NativeRef,
+        _text: &str,
+        _deadline: Instant,
+    ) -> Result<Value, AutomationError> {
+        Err(driver_error(
+            "DRIVER.ACTION_UNSUPPORTED",
+            "secret replacement is unavailable",
+        ))
+    }
     fn named_action(
         &self,
         target: &NativeRef,
@@ -161,6 +260,7 @@ pub trait AtspiBackend: Send + Sync {
     fn type_text(
         &self,
         _target: &NativeRef,
+        _window: Option<&WindowAnchor>,
         _text: &str,
         _process_id: u32,
         _deadline: Instant,
@@ -168,6 +268,21 @@ pub trait AtspiBackend: Send + Sync {
         Err(driver_error(
             "DRIVER.ACTION_UNSUPPORTED",
             "native type_text helper is unavailable",
+        ))
+    }
+    /// Send existing layout keys through the focused application's input method.
+    /// This does not promise that committed text equals the requested key string.
+    fn type_text_keys(
+        &self,
+        _target: &NativeRef,
+        _window: Option<&WindowAnchor>,
+        _text: &str,
+        _process_id: u32,
+        _deadline: Instant,
+    ) -> Result<Value, AutomationError> {
+        Err(driver_error(
+            "DRIVER.ACTION_UNSUPPORTED",
+            "layout-aware key typing is unavailable",
         ))
     }
     fn pointer_click(
@@ -196,6 +311,26 @@ pub trait AtspiBackend: Send + Sync {
         ))
     }
     #[allow(clippy::too_many_arguments)]
+    fn pointer_gesture_modified(
+        &self,
+        target: &NativeRef,
+        _window: Option<&WindowAnchor>,
+        point: (i32, i32),
+        gesture: Gesture,
+        modifiers: &[String],
+        hold_ms: Option<u16>,
+        process_id: u32,
+        deadline: Instant,
+    ) -> Result<Value, AutomationError> {
+        if !modifiers.is_empty() || hold_ms.is_some() {
+            return Err(driver_error(
+                "DRIVER.ACTION_UNSUPPORTED",
+                "pointer modifiers or bounded hold are unavailable",
+            ));
+        }
+        self.pointer_gesture(target, point, gesture, process_id, deadline)
+    }
+    #[allow(clippy::too_many_arguments)]
     fn drag(
         &self,
         _target: &NativeRef,
@@ -210,10 +345,43 @@ pub trait AtspiBackend: Send + Sync {
             "native drag helper is unavailable",
         ))
     }
+    #[allow(clippy::too_many_arguments)]
+    fn drag_modified(
+        &self,
+        target: &NativeRef,
+        _window: Option<&WindowAnchor>,
+        from: (i32, i32),
+        to: (i32, i32),
+        button: u8,
+        modifiers: &[String],
+        hold_ms: Option<u16>,
+        process_id: u32,
+        deadline: Instant,
+    ) -> Result<Value, AutomationError> {
+        if !modifiers.is_empty() || hold_ms.is_some() {
+            return Err(driver_error(
+                "DRIVER.ACTION_UNSUPPORTED",
+                "drag modifiers or bounded hold are unavailable",
+            ));
+        }
+        self.drag(target, from, to, button, process_id, deadline)
+    }
+    fn drag_path(
+        &self,
+        _request: DragPathRequest<'_>,
+        _validate: DragPathValidation,
+    ) -> Result<Value, AutomationError> {
+        Err(driver_error(
+            "DRIVER.ACTION_UNSUPPORTED",
+            "anchored drag paths are unavailable",
+        ))
+    }
     fn key_chord(
         &self,
         _target: &NativeRef,
+        _window: Option<&WindowAnchor>,
         _keys: &[String],
+        _hold_ms: Option<u16>,
         _process_id: u32,
         _deadline: Instant,
     ) -> Result<Value, AutomationError> {
@@ -300,6 +468,7 @@ pub trait AtspiBackend: Send + Sync {
     fn paste(
         &self,
         _target: &NativeRef,
+        _window: Option<&WindowAnchor>,
         _text: &str,
         _process_id: u32,
         _deadline: Instant,
@@ -331,40 +500,65 @@ pub trait AtspiBackend: Send + Sync {
 }
 
 #[derive(Clone)]
+struct Scope {
+    id: String,
+    root: NativeRef,
+    fingerprint: String,
+    application: Value,
+}
+
+#[derive(Clone)]
 struct Record {
     public: Value,
     handles: BTreeMap<String, NativeRef>,
     fingerprints: BTreeMap<String, String>,
+    members: BTreeSet<String>,
     application_selector: Map<String, Value>,
     max_depth: u32,
     max_nodes: usize,
+    scope: Option<Scope>,
+    valid: bool,
+    created: Instant,
 }
 
 #[derive(Default)]
 struct DriverState {
     revision: u64,
     current: Option<Record>,
+    retained: VecDeque<Record>,
 }
 
 pub struct AtspiProvider {
     backend: Arc<dyn AtspiBackend>,
     manifest: CapabilityManifest,
     generation: String,
-    state: Mutex<DriverState>,
+    state: Arc<Mutex<DriverState>>,
+    retain_resources: bool,
+    invocation_gate: Arc<Mutex<()>>,
+    cancellation: Option<CancellationToken>,
 }
 
 impl AtspiProvider {
     pub fn new(backend: Arc<dyn AtspiBackend>) -> Result<Self, AutomationError> {
+        let retain_resources = backend.supports_cross_resource_drag();
+        let document = if retain_resources {
+            cross_resource::enabled_manifest()
+        } else {
+            manifest_document()
+        };
         Ok(Self {
             backend,
-            manifest: manifest::parse(&manifest_document()).map_err(|reason| {
+            manifest: manifest::parse(&document).map_err(|reason| {
                 driver_error(
                     "DRIVER.INTERNAL",
                     format!("built-in AT-SPI manifest is invalid: {reason}"),
                 )
             })?,
             generation: uuid::Uuid::new_v4().simple().to_string(),
-            state: Mutex::new(DriverState::default()),
+            state: Arc::new(Mutex::new(DriverState::default())),
+            retain_resources,
+            invocation_gate: Arc::new(Mutex::new(())),
+            cancellation: None,
         })
     }
 
@@ -383,6 +577,67 @@ impl AtspiProvider {
         deadline: Instant,
         artifacts: Option<&ArtifactStore>,
     ) -> Result<Value, AutomationError> {
+        let _guard = loop {
+            remaining(deadline, false)?;
+            if let Some(token) = &self.cancellation {
+                token.check()?;
+            }
+            match self.invocation_gate.try_lock() {
+                Ok(guard) => break guard,
+                Err(TryLockError::WouldBlock) => std::thread::sleep(Duration::from_millis(5)),
+                Err(TryLockError::Poisoned(_)) => {
+                    return Err(driver_error(
+                        "DRIVER.ACTION_FAILED",
+                        "provider invocation state is unavailable",
+                    ));
+                }
+            }
+        };
+        let short = action
+            .strip_prefix(PROVIDER_NAME)
+            .and_then(|a| a.strip_prefix('.'))
+            .and_then(|a| a.strip_suffix("@1"));
+        let written = short.is_some_and(|a| {
+            WRITE_ACTIONS.contains(&a) || matches!(a, "drag_between" | "global_key")
+        });
+        let result = self.call_unguarded(action, args, deadline, artifacts);
+        // Serializing publication with input prevents an overlapping read from
+        // silently re-authorizing records while another call owns native input.
+        if written && self.retain_resources {
+            if let Ok(mut state) = self.state.lock() {
+                state.invalidate_all();
+            }
+        }
+        if !result
+            .as_ref()
+            .err()
+            .is_some_and(|e| e.code == "DRIVER.CANCELLED")
+        {
+            if let Some(token) = &self.cancellation {
+                if token.is_cancelled() {
+                    if written {
+                        if let Ok(mut state) = self.state.lock() {
+                            state.invalidate_all();
+                        }
+                    }
+                    return Err(token.check().unwrap_err().with_effect(if written {
+                        "unknown"
+                    } else {
+                        "not_applied"
+                    }));
+                }
+            }
+        }
+        result
+    }
+
+    fn call_unguarded(
+        &self,
+        action: &str,
+        args: Value,
+        deadline: Instant,
+        artifacts: Option<&ArtifactStore>,
+    ) -> Result<Value, AutomationError> {
         remaining(deadline, false)?;
         let short = action
             .strip_prefix(PROVIDER_NAME)
@@ -395,11 +650,12 @@ impl AtspiProvider {
         match short {
             "inspect_session" => {
                 only_keys(args, &[])?;
-                let session = self.backend.session_info();
+                let session = self.backend.inspect_session(deadline);
                 Ok(json!({
                     "backend": self.backend.name(),
                     "session_type": bounded_optional_string(session.get("session_type")),
                     "desktop": bounded_optional_string(session.get("desktop")),
+                    "input_helper": session.get("input_helper").cloned().unwrap_or(Value::Null),
                 }))
             }
             "list_applications" => {
@@ -411,6 +667,8 @@ impl AtspiProvider {
                 }))
             }
             "snapshot" => self.snapshot(args, deadline),
+            "snapshot_scope" => self.snapshot_scope(args, deadline),
+            "drag_between" => self.drag_between(args, deadline),
             "find" => self.find(args, deadline),
             "capture_target" => self.capture_target(args, deadline, artifacts),
             "capture" => self.capture_inline(args, deadline),
@@ -464,6 +722,9 @@ impl AtspiProvider {
                     Ok(json!({"released": true}))
                 }
             }
+            "secret_input" => self
+                .secret_input(args, deadline)
+                .map_err(redact_secret_error),
             action if WRITE_ACTIONS.contains(&action) => self.write(action, args, deadline),
             _ => Err(invalid("unknown AT-SPI action")),
         }
@@ -501,9 +762,124 @@ impl AtspiProvider {
         max_nodes: usize,
         deadline: Instant,
     ) -> Result<Record, AutomationError> {
-        let raw = self
-            .backend
-            .capture(selector, max_depth, max_nodes, deadline)?;
+        self.capture_scoped(selector, max_depth, max_nodes, None, deadline)
+    }
+
+    fn snapshot_scope(
+        &self,
+        args: &Map<String, Value>,
+        deadline: Instant,
+    ) -> Result<Value, AutomationError> {
+        only_keys(
+            args,
+            &[
+                "target",
+                "locator",
+                "scope_id",
+                "application",
+                "max_depth",
+                "max_nodes",
+            ],
+        )?;
+        let max_depth = bounded_integer(
+            args.get("max_depth"),
+            DEFAULT_MAX_DEPTH as u64,
+            0,
+            MAX_DEPTH as u64,
+            "max_depth",
+        )? as u32;
+        let max_nodes = bounded_integer(
+            args.get("max_nodes"),
+            DEFAULT_MAX_NODES as u64,
+            1,
+            MAX_NODES as u64,
+            "max_nodes",
+        )? as usize;
+        let (record, scope) = if let Some(scope_id) = args.get("scope_id") {
+            if args.contains_key("target") || args.contains_key("locator") {
+                return Err(invalid(
+                    "scope_id and target/locator are mutually exclusive",
+                ));
+            }
+            let scope_id = required_string(scope_id, "scope_id")?;
+            let selector = application_selector(args.get("application"))?;
+            let state = self
+                .state
+                .lock()
+                .map_err(|_| driver_error("DRIVER.ACTION_FAILED", "driver state is unavailable"))?;
+            let record = state
+                .scope_record(scope_id, self.retain_resources)
+                .ok_or_else(|| stale("scope is no longer current"))?
+                .clone();
+            let scope = record
+                .scope
+                .as_ref()
+                .filter(|scope| scope.id == scope_id)
+                .ok_or_else(|| stale("scope is no longer current"))?
+                .clone();
+            if selector != record.application_selector {
+                return Err(stale("scope belongs to a different application selector"));
+            }
+            (record, scope)
+        } else {
+            if args.contains_key("application") {
+                return Err(invalid("target-based scope uses its observed application"));
+            }
+            let record = self.observed_record(args)?;
+            let node_id = required_string(&args["target"]["node_id"], "target.node_id")?;
+            let locator = parse_locator(args.get("locator"))?;
+            // This read-only narrowing operation may start from an incomplete
+            // tree, but can only select a native identity actually observed.
+            let resolved = resolve(&record, &locator, deadline)?;
+            let resolved_id = resolved["node_id"].as_str().expect("normalized node id");
+            let root = record
+                .handles
+                .get(node_id)
+                .ok_or_else(|| stale("scope root was not observed"))?;
+            if !record.members.contains(node_id) {
+                return Err(stale("context ancestors cannot expand the observed scope"));
+            }
+            if record.handles.get(resolved_id) != Some(root)
+                || record.fingerprints.get(resolved_id) != record.fingerprints.get(node_id)
+            {
+                return Err(stale("scope target does not match its observed locator"));
+            }
+            let scope = Scope {
+                id: uuid::Uuid::new_v4().simple().to_string(),
+                root: root.clone(),
+                fingerprint: record.fingerprints[node_id].clone(),
+                application: record.public["application"].clone(),
+            };
+            (record, scope)
+        };
+        Ok(self
+            .capture_scoped(
+                &record.application_selector,
+                max_depth,
+                max_nodes,
+                Some(scope),
+                deadline,
+            )?
+            .public)
+    }
+
+    fn capture_scoped(
+        &self,
+        selector: &Map<String, Value>,
+        max_depth: u32,
+        max_nodes: usize,
+        scope: Option<Scope>,
+        deadline: Instant,
+    ) -> Result<Record, AutomationError> {
+        let raw = match scope.as_ref() {
+            Some(scope) => {
+                self.backend
+                    .capture_scope(selector, &scope.root, max_depth, max_nodes, deadline)?
+            }
+            None => self
+                .backend
+                .capture(selector, max_depth, max_nodes, deadline)?,
+        };
         if raw.nodes.len() > max_nodes {
             return Err(driver_error(
                 "DRIVER.ACTION_FAILED",
@@ -520,6 +896,8 @@ impl AtspiProvider {
         let mut nodes = Vec::with_capacity(raw.nodes.len());
         let mut handles = BTreeMap::new();
         let mut fingerprints = BTreeMap::new();
+        let mut members = BTreeSet::new();
+        let mut structural_members = BTreeSet::new();
         for (index, item) in raw.nodes.into_iter().enumerate() {
             remaining(deadline, false)?;
             let parent_id = item
@@ -536,6 +914,19 @@ impl AtspiProvider {
                 })
                 .transpose()?;
             let node_id = format!("n{index}");
+            let in_scope = scope.as_ref().is_none_or(|scope| item.native == scope.root)
+                || parent_id
+                    .as_ref()
+                    .is_some_and(|parent| structural_members.contains(parent));
+            if in_scope {
+                structural_members.insert(node_id.clone());
+            }
+            // A recovered focus parent is context: its unenumerated siblings
+            // were not captured. Its verified editor child may still be used.
+            let member = in_scope && item.provenance.get("focus_context") != Some(&json!(true));
+            if member {
+                members.insert(node_id.clone());
+            }
             let role = normalize_role(&item.role);
             let mut states = Map::new();
             for name in STATE_NAMES {
@@ -551,6 +942,9 @@ impl AtspiProvider {
             }
             let mut provenance = item.provenance;
             provenance.insert("backend".into(), json!(self.backend.name()));
+            if !member {
+                provenance.insert("scope_context".into(), json!(true));
+            }
             let protected = states.get("protected") == Some(&Value::Bool(true))
                 || provenance.get("value_redacted") == Some(&Value::Bool(true))
                 || matches!(role.as_str(), "password_text" | "password");
@@ -561,6 +955,7 @@ impl AtspiProvider {
             let actions = item
                 .actions
                 .into_iter()
+                .filter(|_| member)
                 .filter(|action| WRITE_ACTIONS.contains(&action.as_str()))
                 .filter(|action| {
                     !protected
@@ -595,7 +990,7 @@ impl AtspiProvider {
             fingerprints.insert(node_id, fingerprint(&node));
             nodes.push(node);
         }
-        let public = json!({
+        let mut public = json!({
             "snapshot_id": snapshot_id,
             "revision": revision,
             "session": self.backend.session_info(),
@@ -603,16 +998,43 @@ impl AtspiProvider {
             "application": raw.application,
             "nodes": nodes,
             "truncated": raw.truncated,
+            "truncation_reasons": raw.truncation_reasons,
         });
+        public["metadata"] = json!({"input_helper": public["session"]["input_helper"]});
+        if let Some(scope) = &scope {
+            if ["bus_name", "object_path", "process_id"]
+                .iter()
+                .any(|key| public["application"][key] != scope.application[key])
+            {
+                return Err(stale("scoped application identity changed"));
+            }
+            let roots = handles
+                .iter()
+                .filter(|(_, native)| *native == &scope.root)
+                .collect::<Vec<_>>();
+            if roots.is_empty()
+                || roots
+                    .iter()
+                    .any(|(id, _)| fingerprints.get(*id) != Some(&scope.fingerprint))
+            {
+                return Err(stale("scope root is absent or its identity changed"));
+            }
+            public["scope_id"] = json!(scope.id);
+            public["scope_revision"] = json!(revision);
+        }
         let record = Record {
             public,
             handles,
             fingerprints,
+            members,
             application_selector: selector.clone(),
             max_depth,
             max_nodes,
+            scope,
+            valid: true,
+            created: Instant::now(),
         };
-        state.current = Some(record.clone());
+        state.publish(record.clone(), self.retain_resources);
         Ok(record)
     }
 
@@ -630,11 +1052,16 @@ impl AtspiProvider {
             .state
             .lock()
             .map_err(|_| driver_error("DRIVER.ACTION_FAILED", "driver state is unavailable"))?;
-        let record = state
-            .current
-            .as_ref()
-            .ok_or_else(|| stale("snapshot is not the current driver version"))?;
-        if record.public["snapshot_id"] != snapshot_id || record.public["revision"] != revision {
+        let record = if self.retain_resources {
+            state.retained_record(snapshot_id, revision)
+        } else {
+            state.current.as_ref()
+        }
+        .ok_or_else(|| stale("snapshot is not the current driver version"))?;
+        if !record.valid
+            || record.public["snapshot_id"] != snapshot_id
+            || record.public["revision"] != revision
+        {
             return Err(stale("snapshot is not the current driver version"));
         }
         Ok(record.clone())
@@ -702,7 +1129,8 @@ impl AtspiProvider {
         let locator = parse_locator(args.get("locator"))?;
         let expected = resolve(record, &locator, deadline)?;
         let expected_id = expected["node_id"].as_str().expect("normalized node id");
-        if !record.handles.contains_key(&node_id)
+        if !record.members.contains(&node_id)
+            || !record.handles.contains_key(&node_id)
             || record.handles.get(expected_id) != record.handles.get(&node_id)
             || record.fingerprints.get(expected_id) != record.fingerprints.get(&node_id)
         {
@@ -746,15 +1174,45 @@ impl AtspiProvider {
         // Reject invalid observed references before asking the backend for a
         // fresh tree. Both checks use the same identity/fingerprint rules.
         Self::revalidate_target(args, &record, &record, deadline)?;
-        let fresh = self.capture(
+        let fresh = self.capture_scoped(
             &record.application_selector,
             record.max_depth,
             record.max_nodes,
+            record.scope.clone(),
             deadline,
         )?;
         let (fresh_id, resolved, native) =
             Self::revalidate_target(args, &record, &fresh, deadline)?;
         Ok((fresh, fresh_id, resolved, native))
+    }
+
+    fn secret_input(
+        &self,
+        args: &Map<String, Value>,
+        deadline: Instant,
+    ) -> Result<Value, AutomationError> {
+        only_keys(args, &["target", "locator", "text"])?;
+        let text = secret_text(args.get("text"))?;
+        let observed = self.observed_record(args)?;
+        let (_, observed_node, _) = Self::revalidate_target(args, &observed, &observed, deadline)?;
+        check_secret_target(&observed_node)?;
+        let (fresh, fresh_id, node, native) = self.fresh_target(args, deadline)?;
+        check_secret_target(&node)?;
+        remaining(deadline, false)?;
+        let result = self.backend.secret_input(&native, text, deadline);
+        // The secret endpoint never exposes arbitrary native output, including
+        // errors, values, lengths or an echoed request from a broken toolkit.
+        if let Ok(mut state) = self.state.lock() {
+            if let Some(record) = state.current.as_mut() {
+                record.valid = false;
+            }
+        }
+        result?;
+        remaining(deadline, true)?;
+        Ok(json!({
+            "ok": true, "action": "secret_input", "resolved": target(&fresh, &fresh_id),
+            "backend_result": {"submitted": true, "redacted": true},
+        }))
     }
 
     fn write(
@@ -768,20 +1226,65 @@ impl AtspiProvider {
             allowed.push("text");
         }
         match action {
+            "type_text" => allowed.push("mode"),
             "pointer_click" => allowed.extend(["button", "position"]),
-            "pointer_gesture" => {
-                allowed.extend(["button", "count", "fraction", "scroll", "hover_ms"])
-            }
-            "drag" => allowed.extend(["to", "to_locator", "button", "fraction", "to_fraction"]),
-            "key_chord" => allowed.push("keys"),
+            "pointer_gesture" => allowed.extend([
+                "button",
+                "count",
+                "fraction",
+                "scroll",
+                "hover_ms",
+                "modifiers",
+                "hold_ms",
+            ]),
+            "drag" => allowed.extend([
+                "to",
+                "to_locator",
+                "button",
+                "fraction",
+                "to_fraction",
+                "modifiers",
+                "hold_ms",
+                "path",
+            ]),
+            "key_chord" => allowed.extend(["keys", "hold_ms"]),
             _ => {}
         }
         only_keys(args, &allowed)?;
+        let type_keys = if action == "type_text" {
+            match args.get("mode") {
+                None | Some(Value::Null) => false,
+                Some(Value::String(mode)) if mode == "unicode" => false,
+                Some(Value::String(mode)) if mode == "keys" => true,
+                _ => return Err(invalid("type_text mode must be unicode or keys")),
+            }
+        } else {
+            false
+        };
+        let path = if action == "drag" {
+            parse_drag_path(args)?
+        } else {
+            Vec::new()
+        };
         let gesture = if action == "pointer_gesture" {
             Some(parse_gesture(args)?)
         } else {
             None
         };
+        let modifiers = parse_modifiers(args.get("modifiers"))?;
+        let hold_ms = parse_hold_ms(args.get("hold_ms"))?;
+        if hold_ms.is_some()
+            && gesture.is_some_and(|gesture| !matches!(gesture, Gesture::Click { count: 1, .. }))
+        {
+            return Err(invalid(
+                "hold_ms supports a single click, key chord or drag",
+            ));
+        }
+        if !modifiers.is_empty()
+            && matches!(gesture, Some(Gesture::Wheel { .. } | Gesture::Hover { .. }))
+        {
+            return Err(invalid("modifiers are supported only for clicks and drags"));
+        }
         if action == "pointer_click"
             && (args.get("button").is_some_and(|value| value != "left")
                 || args.get("position").is_some_and(|value| value != "center"))
@@ -799,6 +1302,7 @@ impl AtspiProvider {
         let (fresh, fresh_id, node, native) = self.fresh_target(args, deadline)?;
         let available = node["actions"].as_array().expect("normalized action array");
         if !available.iter().any(|value| value == action) {
+            self.backend.check_action_support(action, deadline)?;
             return Err(driver_error(
                 "DRIVER.ACTION_UNSUPPORTED",
                 format!("target does not support native {action}"),
@@ -852,9 +1356,6 @@ impl AtspiProvider {
                 &fresh,
                 deadline,
             )?;
-            if to_id == fresh_id {
-                return Err(invalid("drag needs a destination other than its source"));
-            }
             let to_point = point_in(
                 parse_bounds(to_node.get("bounds"))?,
                 parse_fraction(args.get("to_fraction"))?,
@@ -880,12 +1381,86 @@ impl AtspiProvider {
             None
         };
         remaining(deadline, false)?;
+        let window = input_window(&fresh, &fresh_id);
+        let path_plan = if path.is_empty() {
+            None
+        } else {
+            let bounds = parse_bounds(node.get("bounds"))?;
+            let mut points = vec![pointer.expect("drag source")];
+            for fraction in path {
+                let point = point_in(bounds, Some(fraction))?;
+                self.validate_point(&fresh, &fresh_id, point, deadline)?;
+                points.push(point);
+            }
+            points.push(destination.expect("drag destination"));
+            let original = drag_observation.clone().expect("drag observation");
+            let original_args = args.clone();
+            let expected_window = window.clone();
+            // A late, read-only capture must not publish a new current snapshot
+            // after the action returned or another observation was admitted.
+            let validator = self.private_validator();
+            let validation_points = points.clone();
+            let validate: DragPathValidation = Arc::new(move |index| {
+                remaining(deadline, false)?;
+                let now = validator.capture_scoped(
+                    &original.application_selector,
+                    original.max_depth,
+                    original.max_nodes,
+                    original.scope.clone(),
+                    deadline,
+                )?;
+                let (id, node, _) =
+                    Self::revalidate_target(&original_args, &original, &now, deadline)?;
+                if parse_bounds(node.get("bounds"))? != bounds
+                    || node["states"]["protected"] == true
+                    || node["states"]["enabled"] == false
+                    || node["states"]["sensitive"] == false
+                    || !node["actions"]
+                        .as_array()
+                        .is_some_and(|actions| actions.iter().any(|a| a == "drag"))
+                {
+                    return Err(stale("drag surface geometry or input state changed"));
+                }
+                let current_window = input_window(&now, &id);
+                if expected_window.as_ref().map(|w| (&w.native, w.bounds))
+                    != current_window.as_ref().map(|w| (&w.native, w.bounds))
+                {
+                    return Err(stale("drag window identity or geometry changed"));
+                }
+                let checked = if index == 0 {
+                    validation_points.as_slice()
+                } else if index < validation_points.len() {
+                    &validation_points[index - 1..=index]
+                } else if index == validation_points.len() {
+                    &validation_points[index - 1..]
+                } else {
+                    return Err(invalid("unexpected drag validation segment"));
+                };
+                // A narrow action scope may omit a covering sibling widget.
+                // Read the containing window solely to disprove occlusion; it
+                // never replaces the action's authorized membership or state.
+                let expanded = validator.path_occlusion_record(&now, &id, deadline)?;
+                let (visibility, visibility_id) = expanded
+                    .as_ref()
+                    .map(|(record, id)| (record, id.as_str()))
+                    .unwrap_or((&now, id.as_str()));
+                for point in checked {
+                    validator.validate_path_point(visibility, visibility_id, *point, deadline)?;
+                }
+                remaining(deadline, false)?;
+                Ok(())
+            });
+            Some((points, validate))
+        };
         let mut dispatched = false;
         let result = (|| {
             dispatched = true;
             match action {
-                "focus" => self.backend.focus(&native, deadline),
-                "invoke" => self.backend.invoke(&native, deadline),
+                "focus" => self.backend.focus(&native, window.as_ref(), deadline),
+                "invoke" => match node["provenance"]["native_invoke_name"].as_str() {
+                    Some(name) => self.backend.invoke_named(&native, name, deadline),
+                    None => self.backend.invoke(&native, deadline),
+                },
                 "set_text" => {
                     let text = bounded_text(args.get("text"), false)?;
                     self.backend.set_text(&native, text, deadline)
@@ -893,7 +1468,18 @@ impl AtspiProvider {
                 "type_text" => {
                     let text = ordinary_text(args.get("text"))?;
                     let process = process_id(&node, &fresh)?;
-                    self.backend.type_text(&native, text, process, deadline)
+                    if type_keys {
+                        self.backend.type_text_keys(
+                            &native,
+                            window.as_ref(),
+                            text,
+                            process,
+                            deadline,
+                        )
+                    } else {
+                        self.backend
+                            .type_text(&native, window.as_ref(), text, process, deadline)
+                    }
                 }
                 "pointer_click" => {
                     let process = process_id(&node, &fresh)?;
@@ -911,10 +1497,13 @@ impl AtspiProvider {
                 }
                 "pointer_gesture" => {
                     let process = process_id(&node, &fresh)?;
-                    self.backend.pointer_gesture(
+                    self.backend.pointer_gesture_modified(
                         &native,
+                        window.as_ref(),
                         pointer.expect("computed above"),
                         gesture.expect("parsed above"),
+                        &modifiers,
+                        hold_ms,
                         process,
                         deadline,
                     )
@@ -926,14 +1515,32 @@ impl AtspiProvider {
                         Some("middle") => 2,
                         Some("right") => 3,
                         Some(_) => {
-                            return Err(invalid("drag.button must be left, middle or right"))
+                            return Err(invalid("drag.button must be left, middle or right"));
                         }
                     };
-                    self.backend.drag(
+                    if let Some((points, validate)) = path_plan {
+                        return self.backend.drag_path(
+                            DragPathRequest {
+                                target: &native,
+                                window: window.as_ref(),
+                                points: &points,
+                                button,
+                                modifiers: &modifiers,
+                                hold_ms,
+                                process_id: process,
+                                deadline,
+                            },
+                            validate,
+                        );
+                    }
+                    self.backend.drag_modified(
                         &native,
+                        window.as_ref(),
                         pointer.expect("computed above"),
                         destination.expect("computed above"),
                         button,
+                        &modifiers,
+                        hold_ms,
                         process,
                         deadline,
                     )
@@ -942,7 +1549,9 @@ impl AtspiProvider {
                     let process = process_id(&node, &fresh)?;
                     self.backend.key_chord(
                         &native,
+                        window.as_ref(),
                         keys.as_deref().expect("parsed above"),
+                        hold_ms,
                         process,
                         deadline,
                     )
@@ -950,7 +1559,8 @@ impl AtspiProvider {
                 "paste" => {
                     let text = paste_text(args.get("text"))?;
                     let process = process_id(&node, &fresh)?;
-                    self.backend.paste(&native, text, process, deadline)
+                    self.backend
+                        .paste(&native, window.as_ref(), text, process, deadline)
                 }
                 window if WINDOW_ACTIONS.contains(&window) => {
                     let process = process_id(&node, &fresh)?;
@@ -965,23 +1575,36 @@ impl AtspiProvider {
         })();
         match result {
             Ok(backend_result) => {
-                remaining(deadline, true)?;
                 if let Ok(mut state) = self.state.lock() {
-                    state.current = None;
+                    if let Some(record) = state.current.as_mut() {
+                        record.valid = false;
+                    }
                 }
+                remaining(deadline, true)?;
                 Ok(
                     json!({"ok": true, "action": action, "resolved": target(&fresh, &fresh_id), "backend_result": backend_result}),
                 )
             }
+            Err(error) if error.effect == "unknown" => {
+                if let Ok(mut state) = self.state.lock() {
+                    if let Some(record) = state.current.as_mut() {
+                        record.valid = false;
+                    }
+                }
+                Err(error)
+            }
             Err(error)
                 if dispatched
+                    && error.details.get("dispatch_started") != Some(&Value::Bool(false))
                     && matches!(
                         error.code.as_str(),
                         "DRIVER.ACTION_FAILED" | "DRIVER.TIMEOUT"
                     ) =>
             {
                 if let Ok(mut state) = self.state.lock() {
-                    state.current = None;
+                    if let Some(record) = state.current.as_mut() {
+                        record.valid = false;
+                    }
                 }
                 Err(driver_error(
                     "DRIVER.UNKNOWN_EFFECT",
@@ -1035,7 +1658,7 @@ impl AtspiProvider {
         let observed = self.observed_record(args)?;
         let captured = self.checked_capture(args, deadline);
         if let Ok(mut state) = self.state.lock() {
-            state.current = Some(observed);
+            state.publish(observed, self.retain_resources);
         }
         let (png, provenance) = captured?;
         let (width, height) = png_size(&png).ok_or_else(|| {
@@ -1063,6 +1686,17 @@ impl AtspiProvider {
         deadline: Instant,
     ) -> Result<(Vec<u8>, Map<String, Value>), AutomationError> {
         let (fresh, fresh_id, node, native) = self.fresh_target(args, deadline)?;
+        let expanded = self.private_window_record(&fresh, &fresh_id, "capture", deadline)?;
+        let (visibility, visibility_id) = expanded
+            .as_ref()
+            .map(|(record, id)| (record, id.as_str()))
+            .unwrap_or((&fresh, fresh_id.as_str()));
+        let node = visibility.public["nodes"]
+            .as_array()
+            .expect("normalized nodes")
+            .iter()
+            .find(|node| node["node_id"] == visibility_id)
+            .unwrap_or(&node);
         let states = node["states"].as_object().expect("normalized states");
         if !["visible", "showing"]
             .iter()
@@ -1073,28 +1707,6 @@ impl AtspiProvider {
                 "capture_target requires a visible, showing target",
             ));
         }
-        let descendants = descendants(&fresh, &fresh_id);
-        let unsafe_node = fresh.public["nodes"]
-            .as_array()
-            .expect("normalized nodes")
-            .iter()
-            .find(|candidate| {
-                candidate["node_id"]
-                    .as_str()
-                    .is_some_and(|id| descendants.contains(id))
-                    && (candidate["provenance"]["value_redacted"] != false
-                        || candidate["states"]["protected"] != false
-                        || matches!(
-                            candidate["role"].as_str(),
-                            Some("password_text" | "password")
-                        ))
-            });
-        if unsafe_node.is_some() {
-            return Err(driver_error(
-                "DRIVER.PROTECTED_ELEMENT",
-                "capture target is not proven free of protected content",
-            ));
-        }
         let bounds = parse_bounds(node.get("bounds"))?;
         if bounds.width <= 0 || bounds.height <= 0 {
             return Err(driver_error(
@@ -1102,15 +1714,54 @@ impl AtspiProvider {
                 "capture target has no positive-area bounds",
             ));
         }
+        let descendants = descendants(visibility, visibility_id);
+        let unsafe_node = visibility.public["nodes"]
+            .as_array()
+            .expect("normalized nodes")
+            .iter()
+            .find(|candidate| {
+                let protected = candidate["provenance"]["value_redacted"] != false
+                    || candidate["states"]["protected"] != false
+                    || matches!(
+                        candidate["role"].as_str(),
+                        Some("password_text" | "password")
+                    );
+                let within = candidate["node_id"]
+                    .as_str()
+                    .is_some_and(|id| descendants.contains(id));
+                // A protected sibling may be painted into the target rectangle.
+                // Qt can misreport visible/showing, so those flags cannot clear
+                // protection. Missing geometry cannot prove it lies outside.
+                protected
+                    && (within
+                        || parse_bounds(candidate.get("bounds"))
+                            .map(|candidate_bounds| {
+                                candidate_bounds.width <= 0
+                                    || candidate_bounds.height <= 0
+                                    || overlaps(bounds, candidate_bounds)
+                            })
+                            .unwrap_or(true))
+            });
+        if unsafe_node.is_some() {
+            return Err(driver_error(
+                "DRIVER.PROTECTED_ELEMENT",
+                "capture rectangle is not proven free of protected content in its window",
+            )
+            .with_detail("check", json!("capture_window_protection")));
+        }
         self.validate_point(
-            &fresh,
-            &fresh_id,
+            visibility,
+            visibility_id,
             (bounds.x + bounds.width / 2, bounds.y + bounds.height / 2),
             deadline,
         )?;
-        for candidate in fresh.public["nodes"].as_array().expect("normalized nodes") {
+        let ancestors = ancestors(visibility, visibility_id);
+        for candidate in visibility.public["nodes"]
+            .as_array()
+            .expect("normalized nodes")
+        {
             let id = candidate["node_id"].as_str().unwrap_or_default();
-            if descendants.contains(id) || ancestors(&fresh, &fresh_id).contains(id) {
+            if descendants.contains(id) || ancestors.contains(id) {
                 continue;
             }
             if let Ok(candidate_bounds) = parse_bounds(candidate.get("bounds")) {
@@ -1121,11 +1772,15 @@ impl AtspiProvider {
                         "DRIVER.ACTION_UNSUPPORTED",
                         "capture target overlaps a visible node outside its subtree",
                     )
-                    .with_detail("overlapping_node_id", json!(id)));
+                    .with_detail("check", json!("capture_window_occlusion")));
                 }
             }
         }
-        let process = process_id(&node, &fresh)?;
+        let process = process_id(node, &fresh)?;
+        remaining(deadline, false)?;
+        if let Some(token) = &self.cancellation {
+            token.check()?;
+        }
         let (png, mut provenance) = self
             .backend
             .capture_target(&native, bounds, process, deadline)?;
@@ -1133,7 +1788,164 @@ impl AtspiProvider {
         provenance.insert("revision".into(), fresh.public["revision"].clone());
         provenance.insert("node_id".into(), json!(fresh_id));
         provenance.insert("application_process_id".into(), json!(process));
+        provenance.insert("private_window_checked".into(), json!(expanded.is_some()));
         Ok((png, provenance))
+    }
+
+    fn path_occlusion_record(
+        &self,
+        record: &Record,
+        node_id: &str,
+        deadline: Instant,
+    ) -> Result<Option<(Record, String)>, AutomationError> {
+        let expanded = self.private_window_record(record, node_id, "drag", deadline)?;
+        if let Some((visibility, id)) = &expanded {
+            let node = visibility.public["nodes"]
+                .as_array()
+                .expect("normalized nodes")
+                .iter()
+                .find(|node| node["node_id"] == *id)
+                .expect("normalized handle");
+            if node["states"]["protected"] == true
+                || node["states"]["enabled"] == false
+                || node["states"]["sensitive"] == false
+                || !node["actions"]
+                    .as_array()
+                    .is_some_and(|actions| actions.iter().any(|a| a == "drag"))
+            {
+                return Err(stale(
+                    "drag surface input state changed during window capture",
+                ));
+            }
+        }
+        Ok(expanded)
+    }
+
+    /// Read the complete containing window without publishing nodes or granting
+    /// membership outside the observed scope. This only establishes visibility.
+    fn private_window_record(
+        &self,
+        record: &Record,
+        node_id: &str,
+        purpose: &str,
+        deadline: Instant,
+    ) -> Result<Option<(Record, String)>, AutomationError> {
+        remaining(deadline, false)?;
+        if let Some(token) = &self.cancellation {
+            token.check()?;
+        }
+        let Some(scope) = &record.scope else {
+            return Ok(None);
+        };
+        let window = input_window(record, node_id).ok_or_else(|| {
+            stale(format!(
+                "scoped {purpose} has no observed containing window"
+            ))
+        })?;
+        if scope.root == window.native {
+            return Ok(None);
+        }
+        let window_id = record
+            .handles
+            .iter()
+            .find_map(|(id, native)| (native == &window.native).then_some(id))
+            .ok_or_else(|| stale(format!("{purpose} window was not observed")))?;
+        let visibility = self.private_validator().capture_scoped(
+            &record.application_selector,
+            MAX_DEPTH,
+            MAX_NODES,
+            Some(Scope {
+                id: uuid::Uuid::new_v4().simple().to_string(),
+                root: window.native.clone(),
+                fingerprint: record.fingerprints[window_id].clone(),
+                application: record.public["application"].clone(),
+            }),
+            deadline,
+        )?;
+        if let Some(token) = &self.cancellation {
+            token.check()?;
+        }
+        if visibility.public["truncated"] == true {
+            return Err(driver_error(
+                "DRIVER.SNAPSHOT_TRUNCATED",
+                format!("{purpose} requires a complete containing-window observation for protection and occlusion checks"),
+            ).with_detail("check", json!("containing_window_completeness")));
+        }
+        let matching = visibility
+            .handles
+            .iter()
+            .filter_map(|(id, native)| (native == &record.handles[node_id]).then_some(id.clone()))
+            .collect::<Vec<_>>();
+        let [id] = matching.as_slice() else {
+            return Err(stale(format!(
+                "{purpose} target identity changed during window capture"
+            )));
+        };
+        let node = visibility.public["nodes"]
+            .as_array()
+            .expect("normalized nodes")
+            .iter()
+            .find(|node| node["node_id"] == *id)
+            .expect("normalized handle");
+        let original_node = record.public["nodes"]
+            .as_array()
+            .expect("normalized nodes")
+            .iter()
+            .find(|node| node["node_id"] == node_id)
+            .expect("normalized handle");
+        let observed_window = input_window(&visibility, id);
+        if visibility.fingerprints[id] != record.fingerprints[node_id]
+            || parse_bounds(node.get("bounds"))? != parse_bounds(original_node.get("bounds"))?
+            || observed_window.as_ref().map(|w| (&w.native, w.bounds))
+                != Some((&window.native, window.bounds))
+        {
+            return Err(stale(format!(
+                "{purpose} target or window changed during occlusion capture"
+            )));
+        }
+        Ok(Some((visibility, id.clone())))
+    }
+
+    fn validate_path_point(
+        &self,
+        record: &Record,
+        node_id: &str,
+        point: (i32, i32),
+        deadline: Instant,
+    ) -> Result<(), AutomationError> {
+        self.validate_point(record, node_id, point, deadline)?;
+        // Some toolkits keep reporting the mouse-grab owner after a sibling
+        // widget covers it. A fresh tree that exposes another visible branch
+        // at this point cannot establish unobstructed path input. Its stacking
+        // order is not assumed; this deliberately rejects uncertain overlaps.
+        let allowed = descendants(record, node_id);
+        let ancestors = ancestor_chain(record, node_id);
+        for candidate in record.public["nodes"].as_array().expect("normalized nodes") {
+            let id = candidate["node_id"].as_str().expect("normalized node id");
+            if allowed.contains(id)
+                || ancestors.iter().any(|ancestor| ancestor == id)
+                || candidate["states"]["visible"] == false
+                || candidate["states"]["showing"] == false
+            {
+                continue;
+            }
+            let Ok(bounds) = parse_bounds(candidate.get("bounds")) else {
+                continue;
+            };
+            let (x, y) = (i64::from(point.0), i64::from(point.1));
+            if x >= i64::from(bounds.x)
+                && y >= i64::from(bounds.y)
+                && x < i64::from(bounds.x) + i64::from(bounds.width)
+                && y < i64::from(bounds.y) + i64::from(bounds.height)
+            {
+                return Err(driver_error(
+                    "DRIVER.POINT_NOT_PROVEN",
+                    "drag path overlaps another visible branch",
+                )
+                .with_detail("overlapping_node_id", json!(id)));
+            }
+        }
+        Ok(())
     }
 
     fn validate_point(
@@ -1258,6 +2070,29 @@ impl Provider for AtspiProvider {
         self.call(action, args, Self::deadline(timeout)?, None)
     }
 
+    fn invoke_cancellable(
+        &self,
+        action: &str,
+        args: Value,
+        timeout: Option<Duration>,
+        token: &CancellationToken,
+    ) -> Result<Value, AutomationError> {
+        token.check()?;
+        let scoped = Self {
+            backend: self
+                .backend
+                .cancellation_scope(token)
+                .unwrap_or_else(|| self.backend.clone()),
+            manifest: self.manifest.clone(),
+            generation: self.generation.clone(),
+            state: self.state.clone(),
+            retain_resources: self.retain_resources,
+            invocation_gate: self.invocation_gate.clone(),
+            cancellation: Some(token.clone()),
+        };
+        scoped.call(action, args, Self::deadline(timeout)?, None)
+    }
+
     fn invoke_with_artifacts(
         &self,
         action: &str,
@@ -1346,7 +2181,12 @@ impl AtspiBackend for UnavailableBackend {
     ) -> Result<BackendSnapshot, AutomationError> {
         self.unavailable()
     }
-    fn focus(&self, _target: &NativeRef, _deadline: Instant) -> Result<Value, AutomationError> {
+    fn focus(
+        &self,
+        _target: &NativeRef,
+        _window: Option<&WindowAnchor>,
+        _deadline: Instant,
+    ) -> Result<Value, AutomationError> {
         self.unavailable()
     }
     fn invoke(&self, _target: &NativeRef, _deadline: Instant) -> Result<Value, AutomationError> {
@@ -1409,6 +2249,56 @@ fn bounded_text(value: Option<&Value>, non_empty: bool) -> Result<&str, Automati
         return Err(invalid("text is outside the allowed range"));
     }
     Ok(value)
+}
+
+fn check_secret_target(node: &Value) -> Result<(), AutomationError> {
+    if node["states"]["protected"] != true
+        || node["states"]["editable"] != true
+        || node["states"]["enabled"] != true
+        || node["states"]["sensitive"] != true
+        || !node["actions"]
+            .as_array()
+            .is_some_and(|actions| actions.iter().any(|action| action == "secret_input"))
+    {
+        return Err(driver_error(
+            "DRIVER.ACTION_UNSUPPORTED",
+            "secret replacement requires an observed and fresh protected editable target",
+        ));
+    }
+    Ok(())
+}
+
+fn secret_text(value: Option<&Value>) -> Result<&str, AutomationError> {
+    value
+        .and_then(Value::as_str)
+        .filter(|text| text.chars().count() <= 1024 && !text.contains(['\0', '\r', '\n']))
+        .ok_or_else(|| invalid("secret replacement is outside the allowed range"))
+}
+
+fn redact_secret_error(error: AutomationError) -> AutomationError {
+    let code = match error.code.as_str() {
+        "DRIVER.INVALID_REQUEST"
+        | "DRIVER.STALE_SNAPSHOT"
+        | "DRIVER.SNAPSHOT_TRUNCATED"
+        | "DRIVER.NOT_FOUND"
+        | "DRIVER.AMBIGUOUS"
+        | "DRIVER.ACTION_UNSUPPORTED"
+        | "DRIVER.PROTECTED_ELEMENT"
+        | "DRIVER.TIMEOUT"
+        | "DRIVER.CANCELLED"
+        | "DRIVER.OUTPUT_TOO_LARGE"
+        | "DRIVER.UNKNOWN_EFFECT" => error.code.as_str(),
+        _ => "DRIVER.UNKNOWN_EFFECT",
+    };
+    driver_error(code, "secret replacement was not confirmed")
+        .with_effect(
+            if error.effect == "unknown" || code == "DRIVER.UNKNOWN_EFFECT" {
+                "unknown"
+            } else {
+                "not_applied"
+            },
+        )
+        .with_detail("redacted", json!(true))
 }
 
 fn ordinary_text(value: Option<&Value>) -> Result<&str, AutomationError> {
@@ -1637,7 +2527,11 @@ fn resolve(
     let mut candidates = Vec::new();
     for node in record.public["nodes"].as_array().expect("normalized nodes") {
         remaining(deadline, false)?;
-        if node_matches(node, locator) {
+        if record
+            .members
+            .contains(node["node_id"].as_str().expect("normalized node id"))
+            && node_matches(node, locator)
+        {
             // Multiple tree paths can expose the same accessible. Collapse only
             // identical native identities with identical identity fingerprints.
             let id = node["node_id"].as_str().expect("normalized node id");
@@ -1670,6 +2564,28 @@ fn resolve(
 
 fn target(record: &Record, node_id: &str) -> Value {
     json!({"snapshot_id": record.public["snapshot_id"], "revision": record.public["revision"], "node_id": node_id})
+}
+
+fn input_window(record: &Record, node_id: &str) -> Option<WindowAnchor> {
+    let nodes = record.public["nodes"].as_array()?;
+    // Follow the captured structure, including read-only context ancestors.
+    // Some virtualized Qt objects have an incomplete native Parent property.
+    for id in ancestor_chain(record, node_id) {
+        let node = nodes.iter().find(|node| node["node_id"] == id)?;
+        let parent = node["parent_id"].as_str()?;
+        let parent = nodes.iter().find(|node| node["node_id"] == parent)?;
+        if parent["role"] == "application" {
+            let bounds = parse_bounds(node.get("bounds")).ok()?;
+            if bounds.width <= 0 || bounds.height <= 0 {
+                return None;
+            }
+            return Some(WindowAnchor {
+                native: record.handles.get(&id)?.clone(),
+                bounds,
+            });
+        }
+    }
+    None
 }
 
 fn descendants(record: &Record, node_id: &str) -> BTreeSet<String> {
@@ -1812,6 +2728,81 @@ fn parse_gesture(args: &Map<String, Value>) -> Result<Gesture, AutomationError> 
             .ok_or_else(|| invalid("count must be 1 or 2"))? as u8,
     };
     Ok(Gesture::Click { button, count })
+}
+
+fn parse_hold_ms(value: Option<&Value>) -> Result<Option<u16>, AutomationError> {
+    value
+        .map(|value| {
+            value
+                .as_u64()
+                .filter(|value| (1..=5000).contains(value))
+                .map(|value| value as u16)
+                .ok_or_else(|| invalid("hold_ms must be an integer from 1 to 5000"))
+        })
+        .transpose()
+}
+
+fn parse_modifiers(value: Option<&Value>) -> Result<Vec<String>, AutomationError> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    let values = value
+        .as_array()
+        .filter(|values| values.len() <= 4)
+        .ok_or_else(|| invalid("modifiers must be an array of at most four modifiers"))?;
+    let mut result = Vec::new();
+    for value in values {
+        let key = value
+            .as_str()
+            .filter(|key| matches!(*key, "ctrl" | "shift" | "alt" | "meta"))
+            .ok_or_else(|| invalid("modifiers support ctrl, shift, alt and meta"))?;
+        if result.iter().any(|item| item == key) {
+            return Err(invalid("modifiers must be unique"));
+        }
+        result.push(key.to_string());
+    }
+    Ok(result)
+}
+
+fn parse_drag_path(args: &Map<String, Value>) -> Result<Vec<(f64, f64)>, AutomationError> {
+    let Some(value) = args.get("path") else {
+        return Ok(Vec::new());
+    };
+    let anchors = value
+        .as_array()
+        .ok_or_else(|| invalid("path must be an array"))?;
+    if anchors.len() > 32 {
+        return Err(invalid("path permits at most 32 anchors"));
+    }
+    if anchors.is_empty() {
+        return Ok(Vec::new());
+    }
+    if args.get("target") != args.get("to")
+        || parse_fraction(args.get("fraction"))?.is_none()
+        || parse_fraction(args.get("to_fraction"))?.is_none()
+    {
+        return Err(invalid(
+            "drag paths require one observed surface and explicit endpoint fractions",
+        ));
+    }
+    anchors
+        .iter()
+        .map(|anchor| {
+            let anchor = anchor
+                .as_object()
+                .ok_or_else(|| invalid("path anchor must be an object"))?;
+            only_keys(anchor, &["target", "locator", "fraction"])?;
+            if anchor.get("target") != args.get("target")
+                || anchor
+                    .get("locator")
+                    .is_some_and(|locator| Some(locator) != args.get("locator"))
+            {
+                return Err(invalid("path anchor must name the same observed surface"));
+            }
+            parse_fraction(anchor.get("fraction"))?
+                .ok_or_else(|| invalid("path anchor requires an explicit fraction"))
+        })
+        .collect()
 }
 
 fn parse_fraction(value: Option<&Value>) -> Result<Option<(f64, f64)>, AutomationError> {
@@ -2008,6 +2999,12 @@ fn error_contracts(write: bool, locator: bool, capture: bool) -> Vec<Value> {
         ),
         ("DRIVER.TIMEOUT", "请求截止时间已到。", true, "not_applied"),
         (
+            "DRIVER.CANCELLED",
+            "调用已取消；已派发输入的效果可能未知。",
+            false,
+            if write { "unknown" } else { "not_applied" },
+        ),
+        (
             "DRIVER.OUTPUT_TOO_LARGE",
             "规范化响应超过线路限制。",
             false,
@@ -2066,6 +3063,14 @@ fn error_contracts(write: bool, locator: bool, capture: bool) -> Vec<Value> {
     }
     if write {
         values.push((
+            "DRIVER.HELPER_INCOMPATIBLE",
+            "Linux XTest helper 协议或所需能力不兼容；请从同一源码重新构建安装 helper。",
+            false,
+            "not_applied",
+        ));
+    }
+    if write {
+        values.push((
             "DRIVER.UNKNOWN_EFFECT",
             "原生动作可能已生效。",
             false,
@@ -2111,6 +3116,8 @@ fn manifest_document() -> Value {
     let write_output = || json!({"type": "object", "required": ["ok", "action", "resolved"], "properties": {"ok": {"const": true}, "action": {"enum": WRITE_ACTIONS}, "resolved": target_schema(), "backend_result": {}}, "additionalProperties": false});
     let mut actions = Map::new();
     actions.insert("inspect_session".into(), contract("返回不含应用内容的当前 AT-SPI backend 与桌面会话类型。", "read_only", "observe", "low", &["desktop.observe"], json!({"type": "object", "additionalProperties": false}), json!({"type": "object", "required": ["backend", "session_type", "desktop"], "properties": {"backend": {"type": "string", "maxLength": 128}, "session_type": {"type": ["string", "null"], "maxLength": 128}, "desktop": {"type": ["string", "null"], "maxLength": 256}}, "additionalProperties": false}), false, false));
+    actions["inspect_session"]["output_schema"]["properties"]["input_helper"] =
+        json!({"type": ["object", "null"]});
     actions["inspect_session"]["sensitivity"] =
         json!({"input": "public", "output": "public", "error": "public"});
     actions["inspect_session"]["durability"] = json!({"checkpoint_fields": {
@@ -2119,8 +3126,17 @@ fn manifest_document() -> Value {
         "desktop": {"pointer": "/desktop", "schema": {"type": ["string", "null"], "maxLength": 256}}
     }});
     actions.insert("list_applications".into(), contract("通过 AT-SPI desktop 根节点枚举当前会话的桌面应用。", "read_only", "observe", "low", &["desktop.observe"], json!({"type": "object", "additionalProperties": false}), json!({"type": "object", "required": ["session", "backend", "applications"], "properties": {"session": {"type": "object"}, "backend": {"type": "string"}, "applications": {"type": "array", "items": {"type": "object"}}}, "additionalProperties": false}), false, false));
-    let snapshot_output = json!({"type": "object", "required": ["snapshot_id", "revision", "session", "backend", "application", "nodes", "truncated"], "properties": {"snapshot_id": {"type": "string"}, "revision": {"type": "integer", "minimum": 1}, "session": {"type": "object"}, "backend": {"type": "string"}, "application": {"type": "object"}, "nodes": {"type": "array", "items": {"type": "object"}}, "truncated": {"type": "boolean"}}, "additionalProperties": false});
-    actions.insert("snapshot".into(), contract("抓取一个精确应用选择器对应的有界 AT-SPI 可访问性树。", "read_only", "observe", "low", &["desktop.observe"], json!({"type": "object", "required": ["application"], "properties": {"application": application_schema(), "max_depth": {"type": "integer", "minimum": 0, "maximum": MAX_DEPTH}, "max_nodes": {"type": "integer", "minimum": 1, "maximum": MAX_NODES}}, "additionalProperties": false}), snapshot_output, false, false));
+    let mut snapshot_output = json!({"type": "object", "required": ["snapshot_id", "revision", "session", "backend", "application", "nodes", "truncated", "truncation_reasons"], "properties": {"snapshot_id": {"type": "string"}, "revision": {"type": "integer", "minimum": 1}, "session": {"type": "object"}, "backend": {"type": "string"}, "application": {"type": "object"}, "nodes": {"type": "array", "items": {"type": "object"}}, "truncated": {"type": "boolean"}, "truncation_reasons": {"type": "array", "items": {"type": "object"}, "maxItems": 32}}, "additionalProperties": false});
+    snapshot_output["properties"]["metadata"] = json!({"type": "object", "properties": {"input_helper": {"type": ["object", "null"]}}, "additionalProperties": false});
+    actions.insert("snapshot".into(), contract("抓取一个精确应用选择器对应的有界 AT-SPI 可访问性树。", "read_only", "observe", "low", &["desktop.observe"], json!({"type": "object", "required": ["application"], "properties": {"application": application_schema(), "max_depth": {"type": "integer", "minimum": 0, "maximum": MAX_DEPTH}, "max_nodes": {"type": "integer", "minimum": 1, "maximum": MAX_NODES}}, "additionalProperties": false}), snapshot_output.clone(), false, false));
+    let mut scoped_output = snapshot_output;
+    scoped_output["properties"]["scope_id"] = json!({"type": "string", "minLength": 1});
+    scoped_output["properties"]["scope_revision"] = json!({"type": "integer", "minimum": 1});
+    scoped_output["required"]
+        .as_array_mut()
+        .unwrap()
+        .extend([json!("scope_id"), json!("scope_revision")]);
+    actions.insert("snapshot_scope".into(), contract("重新验证已观察目标并抓取其有界子树及命中校验所需祖先；可用当前 scope_id 刷新同一范围。", "read_only", "observe", "low", &["desktop.observe"], json!({"type": "object", "properties": {"target": target_schema(), "locator": locator_schema(), "scope_id": {"type": "string", "minLength": 1}, "application": application_schema(), "max_depth": {"type": "integer", "minimum": 0, "maximum": MAX_DEPTH}, "max_nodes": {"type": "integer", "minimum": 1, "maximum": MAX_NODES}}, "oneOf": [{"required": ["target", "locator"], "not": {"anyOf": [{"required": ["scope_id"]}, {"required": ["application"]}]}}, {"required": ["scope_id", "application"], "not": {"anyOf": [{"required": ["target"]}, {"required": ["locator"]}]}}], "additionalProperties": false}), scoped_output, false, true));
     actions["snapshot"]["errors"].as_array_mut().unwrap().extend([
         json!({"code": "DRIVER.NOT_FOUND", "description": "定位器没有匹配节点。", "retryable": false, "effect": "not_applied", "data_schema": {"type": "object"}}),
         json!({"code": "DRIVER.AMBIGUOUS", "description": "定位器匹配多个节点。", "retryable": false, "effect": "not_applied", "data_schema": {"type": "object"}}),
@@ -2196,8 +3212,22 @@ fn manifest_document() -> Value {
                 .as_object_mut()
                 .unwrap()
                 .remove("minLength");
+        } else {
+            actions[name]["input_schema"]["properties"]["mode"] =
+                json!({"type": ["string", "null"], "enum": ["unicode", "keys", null]});
+            actions[name]["description"] = json!(
+                "重新验证并聚焦目标后输入；unicode 为默认普通文本路径，keys 使用现有布局键位参与输入法组合，不保证提交文本等于键串。"
+            );
         }
     }
+    actions.insert("secret_input".into(), contract(
+        "仅供服务器绑定 secret 的专用入口；重新验证 protected editable 后替换，不使用剪贴板，不返回值或长度。",
+        "contextual", "input", "high", &["desktop.observe", "desktop.input"],
+        json!({"type": "object", "required": ["target", "locator", "text"], "properties": {"target": target_schema(), "locator": locator_schema(), "text": {"type": "string", "maxLength": 1024}}, "additionalProperties": false}),
+        write_output(), true, true,
+    ));
+    actions["secret_input"]["sensitivity"] =
+        json!({"input": "sensitive", "output": "public", "error": "public"});
     actions.insert("pointer_click".into(), contract("重新验证目标后，仅在明确的 KDE/X11 会话中，通过固定路径 XTest helper 按目标 bounds 中心点显式执行左键单击。", "non_idempotent", "modify", "high", &["desktop.observe", "desktop.input"], json!({"type": "object", "required": ["target", "locator"], "properties": {"target": target_schema(), "locator": locator_schema(), "button": {"enum": ["left"]}, "position": {"enum": ["center"]}}, "additionalProperties": false}), write_output(), true, true));
     let point_input = |extra: Value, required: &[&str]| {
         let mut properties = json!({"target": target_schema(), "locator": locator_schema()});
@@ -2214,18 +3244,50 @@ fn manifest_document() -> Value {
     actions.insert("pointer_gesture".into(), contract("重新验证目标后，仅在明确的 KDE/X11 会话中，通过固定路径 XTest helper 在目标 bounds 内的比例位置执行右键/中键/双击、滚轮或悬停。", "non_idempotent", "modify", "high", &["desktop.observe", "desktop.input"], point_input(json!({"button": button, "count": {"enum": [1, 2]}, "fraction": fraction, "scroll": {"type": "object", "required": ["direction"], "properties": {"direction": {"enum": ["up", "down", "left", "right"]}, "notches": {"type": "integer", "minimum": 1, "maximum": 30}}, "additionalProperties": false}, "hover_ms": {"type": "integer", "minimum": 1, "maximum": 5000}}), &[]), write_output(), true, true));
     actions.insert("drag".into(), contract("分别重新验证起点与终点后，通过固定路径 XTest helper 按下、分步移动并在终点释放。", "non_idempotent", "modify", "high", &["desktop.observe", "desktop.input"], point_input(json!({"to": target_schema(), "to_locator": locator_schema(), "button": button, "fraction": fraction, "to_fraction": fraction}), &["to", "to_locator"]), write_output(), true, true));
     actions.insert("key_chord".into(), contract("重新验证并聚焦目标后，通过固定路径 XTest helper 按下修饰键加一个主键的组合。", "non_idempotent", "input", "high", &["desktop.observe", "desktop.input"], point_input(json!({"keys": {"type": "array", "minItems": 1, "maxItems": 6, "items": {"type": "string", "minLength": 1, "maxLength": 32}}}), &["keys"]), write_output(), true, true));
+    for name in ["pointer_gesture", "drag"] {
+        actions[name]["input_schema"]["properties"]["modifiers"] = json!({"type": "array", "maxItems": 4, "uniqueItems": true, "items": {"enum": ["ctrl", "shift", "alt", "meta"]}});
+    }
+    actions["drag"]["input_schema"]["properties"]["path"] = json!({
+        "type": "array", "maxItems": 32,
+        "items": {"type": "object", "required": ["target", "fraction"],
+            "properties": {"target": target_schema(), "locator": locator_schema(), "fraction": fraction},
+            "additionalProperties": false}
+    });
+    for name in ["pointer_gesture", "drag", "key_chord"] {
+        actions[name]["input_schema"]["properties"]["hold_ms"] =
+            json!({"type": "integer", "minimum": 1, "maximum": 5000});
+    }
     for (name, description) in [
-        ("minimize", "重新验证顶层窗口 frame 后，经 X11 helper 向窗口管理器发 ICCCM WM_CHANGE_STATE（XIconifyWindow），等待（有上限）_NET_WM_STATE_HIDDEN / IconicState 真的出现。"),
-        ("maximize", "重新验证顶层窗口 frame 后，经 EWMH _NET_WM_STATE 请求最大化，等待两个 MAXIMIZED 状态出现。"),
-        ("restore", "最小化时经 _NET_ACTIVE_WINDOW 还原、最大化时移除 MAXIMIZED 状态，等待状态真的改变。"),
-        ("close_window", "经 EWMH _NET_CLOSE_WINDOW 请求窗口管理器关闭窗口（应用可能先询问），等待窗口消失。"),
-        ("activate", "经 EWMH _NET_ACTIVE_WINDOW 请求激活窗口，等待 _NET_ACTIVE_WINDOW 指向它。"),
+        (
+            "minimize",
+            "重新验证顶层窗口 frame 后，经 X11 helper 向窗口管理器发 ICCCM WM_CHANGE_STATE（XIconifyWindow），等待（有上限）_NET_WM_STATE_HIDDEN / IconicState 真的出现。",
+        ),
+        (
+            "maximize",
+            "重新验证顶层窗口 frame 后，经 EWMH _NET_WM_STATE 请求最大化，等待两个 MAXIMIZED 状态出现。",
+        ),
+        (
+            "restore",
+            "最小化时经 _NET_ACTIVE_WINDOW 还原、最大化时移除 MAXIMIZED 状态，等待状态真的改变。",
+        ),
+        (
+            "close_window",
+            "经 EWMH _NET_CLOSE_WINDOW 请求窗口管理器关闭窗口（应用可能先询问），等待窗口消失。",
+        ),
+        (
+            "activate",
+            "经 EWMH _NET_ACTIVE_WINDOW 请求激活窗口，等待 _NET_ACTIVE_WINDOW 指向它。",
+        ),
     ] {
         actions.insert(
             name.into(),
             contract(
                 description,
-                if name == "close_window" { "non_idempotent" } else { "idempotent" },
+                if name == "close_window" {
+                    "non_idempotent"
+                } else {
+                    "idempotent"
+                },
                 "modify",
                 "high",
                 &["desktop.observe", "desktop.input"],
@@ -2288,12 +3350,32 @@ fn manifest_document() -> Value {
         "root_size": {"type": "object", "required": ["width", "height"], "properties": {"width": {"type": "integer", "minimum": 1}, "height": {"type": "integer", "minimum": 1}}, "additionalProperties": false},
         "cursor_included": {"const": false}, "occlusion_checked": {"const": true}, "same_euid_verified": {"const": true}, "scene_stable": {"const": true}
     }, "additionalProperties": false});
-    let mut capture = contract("重新验证精确 AT-SPI 目标后，经固定 X11 helper 截取其 fresh screen bounds；仅输出 host 托管 PNG artifact 与可审计 provenance。", "read_only", "observe", "medium", &["desktop.observe", "desktop.capture"], json!({"type": "object", "required": ["target", "locator", "format"], "properties": {"target": target_schema(), "locator": locator_schema(), "format": {"const": "png"}}, "additionalProperties": false}), json!({"type": "object", "required": ["frame", "provenance"], "properties": {"frame": {"type": "object"}, "provenance": capture_provenance}, "additionalProperties": false}), false, true);
+    let mut capture = contract(
+        "重新验证精确 AT-SPI 目标后，经固定 X11 helper 截取其 fresh screen bounds；仅输出 host 托管 PNG artifact 与可审计 provenance。",
+        "read_only",
+        "observe",
+        "medium",
+        &["desktop.observe", "desktop.capture"],
+        json!({"type": "object", "required": ["target", "locator", "format"], "properties": {"target": target_schema(), "locator": locator_schema(), "format": {"const": "png"}}, "additionalProperties": false}),
+        json!({"type": "object", "required": ["frame", "provenance"], "properties": {"frame": {"type": "object"}, "provenance": capture_provenance}, "additionalProperties": false}),
+        false,
+        true,
+    );
     capture["artifacts"] = json!({"outputs": {"frame": {"pointer": "/frame", "media_types": ["image/png"], "max_size_bytes": 64 * 1024 * 1024}}});
     capture["errors"] = json!(error_contracts(false, true, true));
     capture["sensitivity"] = json!({"input": "public", "output": "sensitive", "error": "public"});
     actions.insert("capture_target".into(), capture);
-    let mut inline = contract("与 capture_target 相同的重新验证、保护与遮挡检查后，按 fresh screen bounds 截图，直接返回 base64 PNG（供控制会话 capture）。", "read_only", "observe", "medium", &["desktop.observe", "desktop.capture"], json!({"type": "object", "required": ["target", "locator"], "properties": {"target": target_schema(), "locator": locator_schema()}, "additionalProperties": false}), json!({"type": "object", "required": ["format", "data", "width", "height", "clipped", "node_id", "provenance"], "properties": {"format": {"const": "png"}, "data": {"type": "string"}, "width": {"type": "integer", "minimum": 1}, "height": {"type": "integer", "minimum": 1}, "clipped": {"type": "boolean"}, "node_id": {"type": "string"}, "provenance": {"type": "object"}}, "additionalProperties": false}), false, true);
+    let mut inline = contract(
+        "与 capture_target 相同的重新验证、保护与遮挡检查后，按 fresh screen bounds 截图，直接返回 base64 PNG（供控制会话 capture）。",
+        "read_only",
+        "observe",
+        "medium",
+        &["desktop.observe", "desktop.capture"],
+        json!({"type": "object", "required": ["target", "locator"], "properties": {"target": target_schema(), "locator": locator_schema()}, "additionalProperties": false}),
+        json!({"type": "object", "required": ["format", "data", "width", "height", "clipped", "node_id", "provenance"], "properties": {"format": {"const": "png"}, "data": {"type": "string"}, "width": {"type": "integer", "minimum": 1}, "height": {"type": "integer", "minimum": 1}, "clipped": {"type": "boolean"}, "node_id": {"type": "string"}, "provenance": {"type": "object"}}, "additionalProperties": false}),
+        false,
+        true,
+    );
     inline["errors"] = json!(error_contracts(false, true, true));
     inline["sensitivity"] = json!({"input": "public", "output": "sensitive", "error": "public"});
     actions.insert("capture".into(), inline);
@@ -2308,16 +3390,39 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    #[derive(Default)]
+    #[derive(Clone, Default)]
     struct FakeBackend {
-        captures: AtomicUsize,
-        writes: AtomicUsize,
+        captures: Arc<AtomicUsize>,
+        scoped_captures: Arc<AtomicUsize>,
+        pixel_captures: Arc<AtomicUsize>,
+        writes: Arc<AtomicUsize>,
+        cancellation: Option<CancellationToken>,
+        cancel_in_capture: bool,
+        cancel_in_write: bool,
+        late_write_success: bool,
+        uncertain_write_failure: bool,
+        subscription_lifetime: Arc<()>,
         changed: bool,
         duplicate: bool,
         alias: bool,
         replaced: bool,
         truncated: bool,
+        scoped_truncated: bool,
+        scope_context: bool,
+        focus_context: bool,
+        visibility_recovery: bool,
+        refused_input: bool,
+        secret_protected: bool,
+        secret_editable: bool,
+        secret_loses_protection: bool,
+        secret_failure: bool,
         hit_chain: u8,
+        path_supported: bool,
+        path_changed_after: usize,
+        path_window_visibility: u8,
+        capture_only_target: bool,
+        cancel_in_window_capture: bool,
+        cross_supported: bool,
         /// Containers above the target, which is then `n{depth}`.
         depth: usize,
     }
@@ -2353,10 +3458,24 @@ mod tests {
                     ("showing".into(), Some(true)),
                     ("focusable".into(), Some(true)),
                     ("sensitive".into(), Some(true)),
-                    ("protected".into(), Some(false)),
+                    (
+                        "protected".into(),
+                        Some(
+                            self.secret_protected
+                                && !(self.secret_loses_protection
+                                    && self.captures.load(Ordering::SeqCst) > 1),
+                        ),
+                    ),
+                    ("editable".into(), Some(self.secret_editable)),
                 ]),
                 bounds: Some(Bounds {
-                    x: 10,
+                    x: if self.path_changed_after > 0
+                        && self.captures.load(Ordering::SeqCst) >= self.path_changed_after
+                    {
+                        11
+                    } else {
+                        10
+                    },
                     y: 20,
                     width: 40,
                     height: 20,
@@ -2366,11 +3485,23 @@ mod tests {
                     "invoke".into(),
                     "pointer_click".into(),
                     "pointer_gesture".into(),
+                    "drag".into(),
                     "key_chord".into(),
                     "minimize".into(),
                     "paste".into(),
+                    "secret_input".into(),
+                    "set_text".into(),
+                    "type_text".into(),
                 ],
                 provenance: Map::from_iter([
+                    (
+                        "visibility_recovery".into(),
+                        if self.visibility_recovery {
+                            json!("focused_qt_keyboard")
+                        } else {
+                            Value::Null
+                        },
+                    ),
                     ("bus_name".into(), json!(":1.42")),
                     ("object_path".into(), json!(object_path)),
                     (
@@ -2388,6 +3519,28 @@ mod tests {
     }
 
     impl AtspiBackend for FakeBackend {
+        fn supports_cross_resource_drag(&self) -> bool {
+            self.cross_supported
+        }
+        fn drag_between(
+            &self,
+            request: DragBetweenRequest<'_>,
+            validate: DragPathValidation,
+        ) -> Result<Value, AutomationError> {
+            validate(0)?;
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            for index in 1..=cross_resource::CROSS_DRAG_SEGMENTS + 3 {
+                validate(index).map_err(|e| e.with_effect("unknown"))?;
+            }
+            Ok(
+                json!({"source_pid":request.source.process_id,"destination_pid":request.destination.process_id,"source_bus":request.source.target.bus_name,"destination_bus":request.destination.target.bus_name}),
+            )
+        }
+        fn cancellation_scope(&self, token: &CancellationToken) -> Option<Arc<dyn AtspiBackend>> {
+            let mut scoped = self.clone();
+            scoped.cancellation = Some(token.clone());
+            Some(Arc::new(scoped))
+        }
         fn name(&self) -> &str {
             "fake_atspi"
         }
@@ -2395,6 +3548,10 @@ mod tests {
             Map::from_iter([
                 ("session_type".into(), json!("x11")),
                 ("desktop".into(), json!("KDE")),
+                (
+                    "input_helper".into(),
+                    json!({"ready": false, "code": "DRIVER.HELPER_INCOMPATIBLE"}),
+                ),
             ])
         }
         fn list_applications(
@@ -2411,6 +3568,12 @@ mod tests {
             _deadline: Instant,
         ) -> Result<BackendSnapshot, AutomationError> {
             self.captures.fetch_add(1, Ordering::SeqCst);
+            if self.cancel_in_capture && self.captures.load(Ordering::SeqCst) == 2 {
+                if let Some(token) = &self.cancellation {
+                    token.cancel();
+                    token.check()?;
+                }
+            }
             let path = if self.replaced && self.captures.load(Ordering::SeqCst) > 1 {
                 "/org/a11y/replacement"
             } else {
@@ -2425,15 +3588,24 @@ mod tests {
                         node.bounds = None;
                     }
                     node.role = "filler".into();
+                    if self.path_window_visibility != 0 || self.cross_supported {
+                        node.role = if level == 0 { "application" } else { "frame" }.into();
+                    }
                     node.name = None;
                     node.description = None;
                     node.attributes.clear();
+                    if self.focus_context && level + 1 == self.depth {
+                        node.provenance.insert("focus_context".into(), json!(true));
+                    }
                     node.provenance
                         .insert("accessible_id".into(), json!(format!("chain-{level}")));
                     node
                 })
                 .collect::<Vec<_>>();
             let mut target = self.node(path);
+            if self.capture_only_target {
+                target.actions.clear();
+            }
             target.parent_index = self.depth.checked_sub(1);
             nodes.push(target);
             if self.alias {
@@ -2442,23 +3614,148 @@ mod tests {
             if self.duplicate {
                 nodes.push(self.node("/org/a11y/save-2"));
             }
+            let mut application = Self::application();
+            if self.cross_supported {
+                let pid = _application
+                    .get("process_id")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(4242);
+                let bus = format!(":1.{pid}");
+                application.insert("process_id".into(), json!(pid));
+                application.insert("bus_name".into(), json!(bus));
+                for node in &mut nodes {
+                    node.native.bus_name = bus.clone();
+                    node.provenance.insert("bus_name".into(), json!(bus));
+                    node.provenance.insert("process_id".into(), json!(pid));
+                }
+            }
+            Ok(BackendSnapshot {
+                application,
+                nodes,
+                truncated: self.truncated,
+                truncation_reasons: if self.truncated {
+                    vec![json!({"code": "max_nodes", "limit": 1000})]
+                } else {
+                    vec![]
+                },
+            })
+        }
+        fn capture_scope(
+            &self,
+            _application: &Map<String, Value>,
+            root: &NativeRef,
+            _max_depth: u32,
+            _max_nodes: usize,
+            _deadline: Instant,
+        ) -> Result<BackendSnapshot, AutomationError> {
+            self.scoped_captures.fetch_add(1, Ordering::SeqCst);
+            if self.path_window_visibility != 0 || self.cross_supported {
+                let mut snapshot = self.capture(_application, _max_depth, _max_nodes, _deadline)?;
+                if root.object_path == "/chain/1" {
+                    if self.cancel_in_window_capture {
+                        if let Some(token) = &self.cancellation {
+                            token.cancel();
+                            token.check()?;
+                        }
+                    }
+                    if matches!(self.path_window_visibility, 2 | 4 | 5 | 6) {
+                        let mut overlay = self.node("/window/overlay");
+                        overlay.name = Some("Disabled covering sibling".into());
+                        overlay.parent_index = Some(1);
+                        overlay.states.insert("enabled".into(), Some(false));
+                        if self.path_window_visibility >= 4 {
+                            overlay.role = "password text".into();
+                            overlay.states.insert("protected".into(), Some(true));
+                            // Qt can expose a visible QML control with false
+                            // visible/showing flags: they cannot unprotect it.
+                            overlay.states.insert("visible".into(), Some(false));
+                            overlay.states.insert("showing".into(), Some(false));
+                        }
+                        if self.path_window_visibility == 5 {
+                            overlay.bounds = None;
+                        }
+                        if self.path_window_visibility == 6 {
+                            overlay.bounds.as_mut().unwrap().x += 100;
+                        }
+                        snapshot.nodes.push(overlay);
+                    }
+                    if self.path_window_visibility == 7 {
+                        snapshot.nodes[2].bounds.as_mut().unwrap().x += 1;
+                    }
+                    snapshot.truncated = self.path_window_visibility == 3;
+                }
+                return Ok(snapshot);
+            }
+            let mut node = self.node(&root.object_path);
+            if self.changed {
+                node.name = Some("Changed".into());
+            }
+            if self.replaced {
+                node.native.object_path = "/replacement".into();
+            }
+            let mut nodes = Vec::new();
+            if self.scope_context {
+                let mut context = self.node("/context");
+                context.name = Some("Context".into());
+                nodes.push(context);
+                node.parent_index = Some(0);
+            }
+            nodes.push(node);
             Ok(BackendSnapshot {
                 application: Self::application(),
                 nodes,
-                truncated: self.truncated,
+                truncated: self.scoped_truncated,
+                truncation_reasons: vec![],
             })
         }
-        fn focus(&self, _target: &NativeRef, _deadline: Instant) -> Result<Value, AutomationError> {
-            self.writes.fetch_add(1, Ordering::SeqCst);
-            Ok(json!({"accepted": true}))
-        }
-        fn invoke(
+        fn focus(
             &self,
             _target: &NativeRef,
+            _window: Option<&WindowAnchor>,
             _deadline: Instant,
         ) -> Result<Value, AutomationError> {
             self.writes.fetch_add(1, Ordering::SeqCst);
             Ok(json!({"accepted": true}))
+        }
+        fn invoke(&self, _target: &NativeRef, deadline: Instant) -> Result<Value, AutomationError> {
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            if self.late_write_success {
+                std::thread::sleep(
+                    deadline.saturating_duration_since(Instant::now()) + Duration::from_millis(1),
+                );
+            }
+            if self.uncertain_write_failure {
+                return Err(driver_error(
+                    "DRIVER.INPUT_FAILED",
+                    "helper stopped with uncertain input state",
+                )
+                .with_effect("unknown")
+                .with_detail("dispatch_started", json!(false)));
+            }
+            if self.cancel_in_write {
+                if let Some(token) = &self.cancellation {
+                    token.cancel();
+                    return Err(token.check().unwrap_err().with_effect("unknown"));
+                }
+            }
+            Ok(json!({"accepted": true}))
+        }
+        fn secret_input(
+            &self,
+            _target: &NativeRef,
+            text: &str,
+            _deadline: Instant,
+        ) -> Result<Value, AutomationError> {
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            if self.secret_failure {
+                return Err(
+                    driver_error("DRIVER.ACTION_FAILED", format!("toolkit echoed {text}"))
+                        .with_detail("value", json!(text))
+                        .with_detail("length", json!(text.len())),
+                );
+            }
+            // Deliberately hostile metadata verifies the provider never forwards it.
+            Ok(json!({"submitted": true, "value": text, "length": text.len()}))
         }
         fn set_text(
             &self,
@@ -2468,6 +3765,28 @@ mod tests {
         ) -> Result<Value, AutomationError> {
             self.writes.fetch_add(1, Ordering::SeqCst);
             Ok(json!({"accepted": true}))
+        }
+        fn type_text(
+            &self,
+            _target: &NativeRef,
+            _window: Option<&WindowAnchor>,
+            _text: &str,
+            _process_id: u32,
+            _deadline: Instant,
+        ) -> Result<Value, AutomationError> {
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            Ok(json!({"mode": "unicode"}))
+        }
+        fn type_text_keys(
+            &self,
+            _target: &NativeRef,
+            _window: Option<&WindowAnchor>,
+            _text: &str,
+            _process_id: u32,
+            _deadline: Instant,
+        ) -> Result<Value, AutomationError> {
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            Ok(json!({"mode": "keys"}))
         }
         fn named_action(
             &self,
@@ -2498,18 +3817,26 @@ mod tests {
             _process_id: u32,
             _deadline: Instant,
         ) -> Result<Value, AutomationError> {
+            if self.refused_input {
+                return Err(
+                    driver_error("DRIVER.ACTION_FAILED", "helper refused before input")
+                        .with_detail("dispatch_started", json!(false)),
+                );
+            }
             self.writes.fetch_add(1, Ordering::SeqCst);
             Ok(json!({"point": {"x": point.0, "y": point.1}, "gesture": format!("{gesture:?}")}))
         }
         fn key_chord(
             &self,
             _target: &NativeRef,
+            _window: Option<&WindowAnchor>,
             keys: &[String],
+            hold_ms: Option<u16>,
             _process_id: u32,
             _deadline: Instant,
         ) -> Result<Value, AutomationError> {
             self.writes.fetch_add(1, Ordering::SeqCst);
-            Ok(json!({"keys": keys}))
+            Ok(json!({"keys": keys, "hold_ms": hold_ms}))
         }
         fn window_action(
             &self,
@@ -2525,6 +3852,7 @@ mod tests {
         fn paste(
             &self,
             _target: &NativeRef,
+            _window: Option<&WindowAnchor>,
             text: &str,
             _process_id: u32,
             _deadline: Instant,
@@ -2551,6 +3879,69 @@ mod tests {
         ) -> Result<Value, AutomationError> {
             self.writes.fetch_add(1, Ordering::SeqCst);
             Ok(json!({"keys": keys}))
+        }
+        fn pointer_gesture_modified(
+            &self,
+            target: &NativeRef,
+            _window: Option<&WindowAnchor>,
+            point: (i32, i32),
+            gesture: Gesture,
+            modifiers: &[String],
+            hold_ms: Option<u16>,
+            process_id: u32,
+            deadline: Instant,
+        ) -> Result<Value, AutomationError> {
+            let mut result = self.pointer_gesture(target, point, gesture, process_id, deadline)?;
+            result["modifiers"] = json!(modifiers);
+            result["hold_ms"] = json!(hold_ms);
+            Ok(result)
+        }
+        fn drag_modified(
+            &self,
+            target: &NativeRef,
+            _window: Option<&WindowAnchor>,
+            from: (i32, i32),
+            to: (i32, i32),
+            button: u8,
+            modifiers: &[String],
+            hold_ms: Option<u16>,
+            process_id: u32,
+            deadline: Instant,
+        ) -> Result<Value, AutomationError> {
+            let mut result = self.drag(target, from, to, button, process_id, deadline)?;
+            result["modifiers"] = json!(modifiers);
+            result["hold_ms"] = json!(hold_ms);
+            Ok(result)
+        }
+        fn drag(
+            &self,
+            _target: &NativeRef,
+            from: (i32, i32),
+            to: (i32, i32),
+            _button: u8,
+            _process_id: u32,
+            _deadline: Instant,
+        ) -> Result<Value, AutomationError> {
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            Ok(json!({"from": from, "to": to}))
+        }
+        fn drag_path(
+            &self,
+            request: DragPathRequest<'_>,
+            validate: DragPathValidation,
+        ) -> Result<Value, AutomationError> {
+            if !self.path_supported {
+                return Err(driver_error(
+                    "DRIVER.ACTION_UNSUPPORTED",
+                    "path unavailable",
+                ));
+            }
+            validate(0)?;
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            for index in 1..=request.points.len() {
+                validate(index).map_err(|e| e.with_effect("unknown"))?;
+            }
+            Ok(json!({"points": request.points, "validated": request.points.len() + 1}))
         }
         fn start_recording(
             &self,
@@ -2627,7 +4018,7 @@ mod tests {
                     return Err(driver_error(
                         "DRIVER.ACTION_UNSUPPORTED",
                         "this fixture has no parent here",
-                    ))
+                    ));
                 }
             };
             Ok(Some(NativeRef {
@@ -2642,6 +4033,7 @@ mod tests {
             process_id: u32,
             _deadline: Instant,
         ) -> Result<(Vec<u8>, Map<String, Value>), AutomationError> {
+            self.pixel_captures.fetch_add(1, Ordering::SeqCst);
             const PNG: &[u8] = &[
                 137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0,
                 1, 8, 4, 0, 0, 0, 181, 28, 12, 2, 0, 0, 0, 11, 73, 68, 65, 84, 120, 218, 99, 100,
@@ -2677,6 +4069,158 @@ mod tests {
     }
 
     #[test]
+    fn secret_replacement_and_clear_redact_backend_output_and_reject_ordinary_input() {
+        let backend = Arc::new(FakeBackend {
+            secret_protected: true,
+            secret_editable: true,
+            ..Default::default()
+        });
+        let provider = AtspiProvider::new(backend.clone()).unwrap();
+        for text in ["test-secret-私密", ""] {
+            let observed = take_snapshot(&provider);
+            assert!(observed["nodes"][0]["value"].is_null());
+            for forbidden in ["set_text", "type_text", "paste", "key_chord"] {
+                assert!(!observed["nodes"][0]["actions"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|action| action == forbidden));
+            }
+            let args = json!({"target": {"snapshot_id": observed["snapshot_id"], "revision": observed["revision"], "node_id": "n0"}, "locator": locator(), "text": text});
+            let result = provider
+                .invoke(
+                    "desktop.linux_atspi.secret_input@1",
+                    args,
+                    Some(Duration::from_secs(2)),
+                )
+                .unwrap();
+            assert_eq!(
+                result["backend_result"],
+                json!({"submitted": true, "redacted": true})
+            );
+            assert!(!result.to_string().contains("test-secret"));
+            assert!(!result.to_string().contains("length"));
+        }
+        assert_eq!(backend.writes.load(Ordering::SeqCst), 2);
+        let observed = take_snapshot(&provider);
+        let args = json!({"target": {"snapshot_id": observed["snapshot_id"], "revision": observed["revision"], "node_id": "n0"}, "locator": locator(), "text": "ordinary"});
+        assert!(provider
+            .invoke(
+                "desktop.linux_atspi.set_text@1",
+                args,
+                Some(Duration::from_secs(2))
+            )
+            .is_err());
+        assert_eq!(backend.writes.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn secret_replacement_rechecks_protection_and_editability_and_sanitizes_errors() {
+        for (protected, editable, lost) in [
+            (false, true, false),
+            (true, false, false),
+            (true, true, true),
+        ] {
+            let backend = Arc::new(FakeBackend {
+                secret_protected: protected,
+                secret_editable: editable,
+                secret_loses_protection: lost,
+                ..Default::default()
+            });
+            let provider = AtspiProvider::new(backend.clone()).unwrap();
+            let observed = take_snapshot(&provider);
+            let args = json!({"target": {"snapshot_id": observed["snapshot_id"], "revision": observed["revision"], "node_id": "n0"}, "locator": locator(), "text": "never-dispatched"});
+            assert!(provider
+                .invoke(
+                    "desktop.linux_atspi.secret_input@1",
+                    args,
+                    Some(Duration::from_secs(2))
+                )
+                .is_err());
+            assert_eq!(backend.writes.load(Ordering::SeqCst), 0);
+            if !protected || !editable {
+                assert_eq!(
+                    backend.captures.load(Ordering::SeqCst),
+                    1,
+                    "unobserved protected/editable status must be refused before refresh"
+                );
+            }
+        }
+        let backend = Arc::new(FakeBackend {
+            secret_protected: true,
+            secret_editable: true,
+            secret_failure: true,
+            ..Default::default()
+        });
+        let provider = AtspiProvider::new(backend).unwrap();
+        let observed = take_snapshot(&provider);
+        let args = json!({"target": {"snapshot_id": observed["snapshot_id"], "revision": observed["revision"], "node_id": "n0"}, "locator": locator(), "text": "dont-echo-me"});
+        let error = provider
+            .invoke(
+                "desktop.linux_atspi.secret_input@1",
+                args,
+                Some(Duration::from_secs(2)),
+            )
+            .unwrap_err();
+        assert_eq!(error.code, "DRIVER.UNKNOWN_EFFECT");
+        assert_eq!(
+            error.details,
+            json!({"redacted": true}).as_object().unwrap().clone()
+        );
+        assert!(!format!("{error:?}").contains("dont-echo-me"));
+        assert!(!format!("{error:?}").contains("length"));
+        for text in [
+            "bad\nvalue".to_string(),
+            "bad\rvalue".into(),
+            "bad\0value".into(),
+            "a".repeat(1025),
+        ] {
+            assert!(secret_text(Some(&json!(text))).is_err());
+        }
+        assert_eq!(secret_text(Some(&json!(""))).unwrap(), "");
+    }
+
+    #[test]
+    fn explicit_keys_typing_selects_its_backend_and_refuses_invalid_modes_before_capture() {
+        for mode in [
+            None,
+            Some(json!(null)),
+            Some(json!("unicode")),
+            Some(json!("keys")),
+            Some(json!("auto")),
+            Some(json!(true)),
+        ] {
+            let backend = Arc::new(FakeBackend::default());
+            let provider = AtspiProvider::new(backend.clone()).unwrap();
+            let observed = take_snapshot(&provider);
+            let mut args = json!({"target":{"snapshot_id":observed["snapshot_id"],"revision":observed["revision"],"node_id":"n0"}, "locator":locator(), "text":"nihao"});
+            if let Some(mode) = &mode {
+                args["mode"] = mode.clone();
+            }
+            let result = provider.invoke(
+                "desktop.linux_atspi.type_text@1",
+                args,
+                Some(Duration::from_secs(1)),
+            );
+            if matches!(mode.as_ref(), Some(value) if value == "auto" || value == true) {
+                assert!(result.is_err());
+                assert_eq!(backend.captures.load(Ordering::SeqCst), 1);
+                assert_eq!(backend.writes.load(Ordering::SeqCst), 0);
+            } else {
+                assert_eq!(
+                    result.unwrap()["backend_result"]["mode"],
+                    if mode == Some(json!("keys")) {
+                        "keys"
+                    } else {
+                        "unicode"
+                    }
+                );
+                assert_eq!(backend.writes.load(Ordering::SeqCst), 1);
+            }
+        }
+    }
+
+    #[test]
     fn manifest_keeps_the_complete_linux_action_surface() {
         let document = manifest_document();
         let parsed = manifest::parse(&document).unwrap();
@@ -2684,6 +4228,7 @@ mod tests {
             "inspect_session",
             "list_applications",
             "snapshot",
+            "snapshot_scope",
             "find",
             "capture_target",
             "capture",
@@ -2718,11 +4263,868 @@ mod tests {
     }
 
     #[test]
+    fn scoped_reads_recover_truncated_observations_and_keep_writes_scoped() {
+        let backend = Arc::new(FakeBackend {
+            truncated: true,
+            ..Default::default()
+        });
+        let provider = AtspiProvider::new(backend.clone()).unwrap();
+        let observed = take_snapshot(&provider);
+        let scoped = provider.invoke("desktop.linux_atspi.snapshot_scope@1", json!({"target": {"snapshot_id": observed["snapshot_id"], "revision": observed["revision"], "node_id": "n0"}, "locator": locator(), "max_nodes": 20}), Some(Duration::from_secs(2))).unwrap();
+        assert_eq!(scoped["truncated"], false);
+        assert_eq!(scoped["scope_revision"], scoped["revision"]);
+        let write_args = json!({"target": {"snapshot_id": scoped["snapshot_id"], "revision": scoped["revision"], "node_id": "n0"}, "locator": locator()});
+        provider
+            .invoke(
+                "desktop.linux_atspi.focus@1",
+                write_args.clone(),
+                Some(Duration::from_secs(2)),
+            )
+            .unwrap();
+        assert_eq!(
+            backend.captures.load(Ordering::SeqCst),
+            1,
+            "write refresh must not fall back to the full application"
+        );
+        assert_eq!(backend.scoped_captures.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            provider
+                .invoke(
+                    "desktop.linux_atspi.focus@1",
+                    write_args,
+                    Some(Duration::from_secs(2))
+                )
+                .unwrap_err()
+                .code,
+            "DRIVER.STALE_SNAPSHOT"
+        );
+        let refreshed = provider.invoke("desktop.linux_atspi.snapshot_scope@1", json!({"scope_id": scoped["scope_id"], "application": {"name": "Fixture"}, "max_nodes": 20}), Some(Duration::from_secs(2))).unwrap();
+        assert_eq!(refreshed["scope_id"], scoped["scope_id"]);
+        assert!(refreshed["revision"].as_u64() > scoped["revision"].as_u64());
+    }
+
+    #[test]
+    fn scoped_reads_reject_forged_mismatched_and_expired_roots() {
+        for (changed, replaced, node_id, name) in [
+            (false, false, "missing", "Save"),
+            (false, false, "n0", "Wrong"),
+            (true, false, "n0", "Save"),
+            (false, true, "n0", "Save"),
+        ] {
+            let backend = Arc::new(FakeBackend {
+                truncated: true,
+                changed,
+                replaced,
+                ..Default::default()
+            });
+            let provider = AtspiProvider::new(backend).unwrap();
+            let observed = take_snapshot(&provider);
+            assert!(provider.invoke("desktop.linux_atspi.snapshot_scope@1", json!({"target": {"snapshot_id": observed["snapshot_id"], "revision": observed["revision"], "node_id": node_id}, "locator": {"name": name}}), Some(Duration::from_secs(2))).is_err());
+        }
+        let provider = AtspiProvider::new(Arc::new(FakeBackend::default())).unwrap();
+        let observed = take_snapshot(&provider);
+        let scoped = provider.invoke("desktop.linux_atspi.snapshot_scope@1", json!({"target": {"snapshot_id": observed["snapshot_id"], "revision": observed["revision"], "node_id": "n0"}, "locator": locator()}), Some(Duration::from_secs(2))).unwrap();
+        let refresh = |id: Value, app: &str| json!({"scope_id": id, "application": {"name": app}});
+        for args in [
+            refresh(json!("invented"), "Fixture"),
+            refresh(scoped["scope_id"].clone(), "Other"),
+        ] {
+            assert_eq!(
+                provider
+                    .invoke(
+                        "desktop.linux_atspi.snapshot_scope@1",
+                        args,
+                        Some(Duration::from_secs(2))
+                    )
+                    .unwrap_err()
+                    .code,
+                "DRIVER.STALE_SNAPSHOT"
+            );
+        }
+        take_snapshot(&provider);
+        assert_eq!(
+            provider
+                .invoke(
+                    "desktop.linux_atspi.snapshot_scope@1",
+                    refresh(scoped["scope_id"].clone(), "Fixture"),
+                    Some(Duration::from_secs(2))
+                )
+                .unwrap_err()
+                .code,
+            "DRIVER.STALE_SNAPSHOT"
+        );
+    }
+
+    #[test]
+    fn truncated_scopes_still_cannot_authorize_writes() {
+        let backend = Arc::new(FakeBackend {
+            truncated: true,
+            scoped_truncated: true,
+            ..Default::default()
+        });
+        let provider = AtspiProvider::new(backend.clone()).unwrap();
+        let observed = take_snapshot(&provider);
+        let scoped = provider.invoke("desktop.linux_atspi.snapshot_scope@1", json!({"target": {"snapshot_id": observed["snapshot_id"], "revision": observed["revision"], "node_id": "n0"}, "locator": locator()}), Some(Duration::from_secs(2))).unwrap();
+        let result = provider.invoke("desktop.linux_atspi.focus@1", json!({"target": {"snapshot_id": scoped["snapshot_id"], "revision": scoped["revision"], "node_id": "n0"}, "locator": locator()}), Some(Duration::from_secs(2))).unwrap_err();
+        assert_eq!(result.code, "DRIVER.SNAPSHOT_TRUNCATED");
+        assert_eq!(backend.writes.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn scope_ancestors_are_context_and_cannot_authorize_broader_actions_or_captures() {
+        let backend = Arc::new(FakeBackend {
+            scope_context: true,
+            ..Default::default()
+        });
+        let provider = AtspiProvider::new(backend.clone()).unwrap();
+        let observed = take_snapshot(&provider);
+        let scoped = provider.invoke("desktop.linux_atspi.snapshot_scope@1", json!({"target": {"snapshot_id": observed["snapshot_id"], "revision": observed["revision"], "node_id": "n0"}, "locator": locator()}), Some(Duration::from_secs(2))).unwrap();
+        assert_eq!(scoped["nodes"][0]["provenance"]["scope_context"], true);
+        assert_eq!(scoped["nodes"][0]["actions"], json!([]));
+        assert_eq!(scoped["nodes"][1]["parent_id"], "n0");
+        let found = provider.invoke("desktop.linux_atspi.find@1", json!({"snapshot_id": scoped["snapshot_id"], "revision": scoped["revision"], "locator": {"role": "push_button"}}), Some(Duration::from_secs(2))).unwrap();
+        assert_eq!(
+            found["target"]["node_id"], "n1",
+            "context nodes must not make scoped locators ambiguous"
+        );
+        for action in ["focus", "capture", "snapshot_scope"] {
+            let args = json!({"target": {"snapshot_id": scoped["snapshot_id"], "revision": scoped["revision"], "node_id": "n0"}, "locator": {"name": "Context"}});
+            assert!(provider
+                .invoke(
+                    &format!("desktop.linux_atspi.{action}@1"),
+                    args,
+                    Some(Duration::from_secs(2))
+                )
+                .is_err());
+        }
+        assert_eq!(backend.writes.load(Ordering::SeqCst), 0);
+        assert_eq!(backend.scoped_captures.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn focused_keyboard_recovery_does_not_require_pointer_hit_testing() {
+        for hit_chain in [1, 2] {
+            let backend = Arc::new(FakeBackend {
+                visibility_recovery: true,
+                hit_chain,
+                ..Default::default()
+            });
+            let provider = AtspiProvider::new(backend.clone()).unwrap();
+            let observed = take_snapshot(&provider);
+            let result = provider.invoke("desktop.linux_atspi.key_chord@1", json!({"target": {"snapshot_id": observed["snapshot_id"], "revision": observed["revision"], "node_id": "n0"}, "locator": locator(), "keys": ["ctrl", "a"]}), Some(Duration::from_secs(2)));
+            result.unwrap();
+            assert_eq!(backend.writes.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[test]
+    fn same_element_drag_revalidates_both_fractions_in_one_fresh_snapshot() {
+        let backend = Arc::new(FakeBackend {
+            hit_chain: 1,
+            ..Default::default()
+        });
+        let provider = AtspiProvider::new(backend.clone()).unwrap();
+        let observed = take_snapshot(&provider);
+        let target = json!({"snapshot_id": observed["snapshot_id"], "revision": observed["revision"], "node_id": "n0"});
+        let result = provider.invoke("desktop.linux_atspi.drag@1", json!({"target": target, "locator": locator(), "to": target, "to_locator": locator(), "fraction": {"fx": 0.1, "fy": 0.5}, "to_fraction": {"fx": 0.9, "fy": 0.5}}), Some(Duration::from_secs(2))).unwrap();
+        assert_ne!(
+            result["backend_result"]["from"],
+            result["backend_result"]["to"]
+        );
+        assert_eq!(backend.captures.load(Ordering::SeqCst), 2);
+        assert_eq!(backend.writes.load(Ordering::SeqCst), 1);
+        let observed = take_snapshot(&provider);
+        let target = json!({"snapshot_id": observed["snapshot_id"], "revision": observed["revision"], "node_id": "n0"});
+        let mut stale_end = target.clone();
+        stale_end["revision"] = json!(0);
+        let result = provider.invoke("desktop.linux_atspi.drag@1", json!({"target": target, "locator": locator(), "to": stale_end, "to_locator": locator(), "fraction": {"fx": 0.1, "fy": 0.5}, "to_fraction": {"fx": 0.9, "fy": 0.5}}), Some(Duration::from_secs(2))).unwrap_err();
+        assert_eq!(result.code, "DRIVER.STALE_SNAPSHOT");
+        assert_eq!(
+            backend.writes.load(Ordering::SeqCst),
+            1,
+            "stale destination must not dispatch another drag"
+        );
+    }
+
+    fn path_args(observed: &Value) -> Value {
+        let target = json!({"snapshot_id": observed["snapshot_id"], "revision": observed["revision"], "node_id": "n0"});
+        json!({"target": target, "locator": locator(), "to": target, "to_locator": locator(),
+            "fraction": {"fx": 0.1, "fy": 0.1}, "to_fraction": {"fx": 0.9, "fy": 0.9},
+            "path": [{"target": target, "fraction": {"fx": 0.8, "fy": 0.2}},
+                     {"target": target, "fraction": {"fx": 0.2, "fy": 0.8}}]})
+    }
+
+    #[test]
+    fn drag_path_freshly_captures_each_segment_without_publishing_worker_observations() {
+        let backend = Arc::new(FakeBackend {
+            path_supported: true,
+            ..Default::default()
+        });
+        let provider = AtspiProvider::new(backend.clone()).unwrap();
+        let observed = take_snapshot(&provider);
+        let result = provider
+            .invoke(
+                "desktop.linux_atspi.drag@1",
+                path_args(&observed),
+                Some(Duration::from_secs(2)),
+            )
+            .unwrap();
+        assert_eq!(
+            result["backend_result"]["points"],
+            json!([[14, 22], [42, 24], [18, 36], [46, 38]])
+        );
+        assert_eq!(result["backend_result"]["validated"], 5);
+        assert_eq!(backend.captures.load(Ordering::SeqCst), 7);
+        let state = provider.state.lock().unwrap();
+        assert_eq!(
+            state.revision, 2,
+            "worker captures must not replace the provider's current state"
+        );
+        assert!(!state.current.as_ref().unwrap().valid);
+    }
+
+    #[test]
+    fn drag_path_rejects_bad_anchors_before_capture_and_changed_geometry_before_next_motion() {
+        for variant in ["foreign", "missing_fraction", "overflow", "destination"] {
+            let backend = Arc::new(FakeBackend {
+                path_supported: true,
+                ..Default::default()
+            });
+            let provider = AtspiProvider::new(backend.clone()).unwrap();
+            let observed = take_snapshot(&provider);
+            let mut args = path_args(&observed);
+            match variant {
+                "foreign" => args["path"][0]["target"]["revision"] = json!(0),
+                "missing_fraction" => {
+                    args.as_object_mut().unwrap().remove("fraction");
+                }
+                "overflow" => args["path"] = json!(vec![args["path"][0].clone(); 33]),
+                _ => args["to"]["node_id"] = json!("n1"),
+            }
+            assert_eq!(
+                provider
+                    .invoke(
+                        "desktop.linux_atspi.drag@1",
+                        args,
+                        Some(Duration::from_secs(2))
+                    )
+                    .unwrap_err()
+                    .code,
+                "DRIVER.INVALID_REQUEST"
+            );
+            assert_eq!(backend.captures.load(Ordering::SeqCst), 1);
+            assert_eq!(backend.writes.load(Ordering::SeqCst), 0);
+        }
+        for (supported, changes_at, writes, code) in [
+            (false, 0, 0, "DRIVER.ACTION_UNSUPPORTED"),
+            (true, 3, 0, "DRIVER.STALE_SNAPSHOT"),
+            (true, 4, 1, "DRIVER.STALE_SNAPSHOT"),
+        ] {
+            let backend = Arc::new(FakeBackend {
+                path_supported: supported,
+                path_changed_after: changes_at,
+                ..Default::default()
+            });
+            let provider = AtspiProvider::new(backend.clone()).unwrap();
+            let observed = take_snapshot(&provider);
+            let error = provider
+                .invoke(
+                    "desktop.linux_atspi.drag@1",
+                    path_args(&observed),
+                    Some(Duration::from_secs(2)),
+                )
+                .unwrap_err();
+            assert_eq!(error.code, code);
+            assert_eq!(backend.writes.load(Ordering::SeqCst), writes);
+            assert_eq!(
+                error.effect,
+                if writes == 0 {
+                    "not_applied"
+                } else {
+                    "unknown"
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn scoped_drag_reads_the_complete_window_for_occlusion_without_expanding_authority() {
+        for mode in [1, 2, 3] {
+            let backend = Arc::new(FakeBackend {
+                depth: 2,
+                path_supported: true,
+                path_window_visibility: mode,
+                ..Default::default()
+            });
+            let provider = AtspiProvider::new(backend.clone()).unwrap();
+            let initial = take_snapshot(&provider);
+            let scoped = provider.invoke("desktop.linux_atspi.snapshot_scope@1", json!({
+                "target":{"snapshot_id":initial["snapshot_id"],"revision":initial["revision"],"node_id":"n2"},
+                "locator":locator()
+            }), Some(Duration::from_secs(2))).unwrap();
+            let mut args = path_args(&scoped);
+            args["target"]["node_id"] = json!("n2");
+            args["to"]["node_id"] = json!("n2");
+            for anchor in args["path"].as_array_mut().unwrap() {
+                anchor["target"]["node_id"] = json!("n2");
+            }
+            let result = provider.invoke(
+                "desktop.linux_atspi.drag@1",
+                args,
+                Some(Duration::from_secs(2)),
+            );
+            if mode == 1 {
+                result.unwrap();
+                assert_eq!(backend.writes.load(Ordering::SeqCst), 1);
+            } else {
+                let error = result.unwrap_err();
+                assert_eq!(
+                    error.code,
+                    if mode == 2 {
+                        "DRIVER.POINT_NOT_PROVEN"
+                    } else {
+                        "DRIVER.SNAPSHOT_TRUNCATED"
+                    }
+                );
+                assert_eq!(error.effect, "not_applied");
+                assert_eq!(backend.writes.load(Ordering::SeqCst), 0);
+            }
+            let state = provider.state.lock().unwrap();
+            let current = state.current.as_ref().unwrap();
+            assert_eq!(state.revision, 3, "window captures must remain private");
+            assert_eq!(
+                current.scope.as_ref().unwrap().root.object_path,
+                "/org/a11y/save"
+            );
+            assert_eq!(current.members, BTreeSet::from(["n2".to_string()]));
+            assert!(backend.scoped_captures.load(Ordering::SeqCst) >= 4);
+        }
+    }
+
+    fn cross_snapshot(provider: &AtspiProvider, pid: u32) -> Value {
+        provider
+            .invoke(
+                "desktop.linux_atspi.snapshot@1",
+                json!({"application":{"process_id":pid}}),
+                Some(Duration::from_secs(2)),
+            )
+            .unwrap()
+    }
+
+    fn cross_args(source: &Value, destination: &Value) -> Value {
+        json!({"target":{"snapshot_id":source["snapshot_id"],"revision":source["revision"],"node_id":"n2"},
+            "locator":locator(), "to":{"snapshot_id":destination["snapshot_id"],"revision":destination["revision"],"node_id":"n2"},
+            "to_locator":locator(),"fraction":{"fx":0.1,"fy":0.2},"to_fraction":{"fx":0.9,"fy":0.8}})
+    }
+
+    #[test]
+    fn cross_drag_keeps_both_original_resources_and_invalidates_every_retained_record() {
+        let backend = Arc::new(FakeBackend {
+            cross_supported: true,
+            depth: 2,
+            ..Default::default()
+        });
+        let provider = AtspiProvider::new(backend.clone()).unwrap();
+        let source = cross_snapshot(&provider, 4242);
+        let destination = cross_snapshot(&provider, 4243);
+        let untouched = cross_snapshot(&provider, 4244);
+        let result = provider
+            .invoke(
+                "desktop.linux_atspi.drag_between@1",
+                cross_args(&source, &destination),
+                Some(Duration::from_secs(5)),
+            )
+            .unwrap();
+        assert_eq!(result["backend_result"]["source_pid"], 4242);
+        assert_eq!(result["backend_result"]["destination_pid"], 4243);
+        assert_eq!(result["backend_result"]["source_bus"], ":1.4242");
+        assert_eq!(result["backend_result"]["destination_bus"], ":1.4243");
+        assert_eq!(backend.writes.load(Ordering::SeqCst), 1);
+        let state = provider.state.lock().unwrap();
+        assert_eq!(
+            state.revision, 3,
+            "private endpoint refreshes cannot publish observations"
+        );
+        assert_eq!(state.retained.len(), 3);
+        assert!(state.retained.iter().all(|r| !r.valid));
+        drop(state);
+        for observed in [&source, &destination, &untouched] {
+            assert_eq!(
+                provider
+                    .current_record(&observed["snapshot_id"], &observed["revision"])
+                    .err()
+                    .unwrap()
+                    .code,
+                "DRIVER.STALE_SNAPSHOT"
+            );
+        }
+    }
+
+    #[test]
+    fn retained_resources_are_latest_per_identity_bounded_and_expiring() {
+        let provider = AtspiProvider::new(Arc::new(FakeBackend {
+            cross_supported: true,
+            depth: 2,
+            ..Default::default()
+        }))
+        .unwrap();
+        let first = cross_snapshot(&provider, 4242);
+        let replaced = cross_snapshot(&provider, 4242);
+        assert!(provider
+            .current_record(&first["snapshot_id"], &first["revision"])
+            .is_err());
+        assert!(provider
+            .current_record(&replaced["snapshot_id"], &replaced["revision"])
+            .is_ok());
+        for pid in 4243..4259 {
+            cross_snapshot(&provider, pid);
+        }
+        assert_eq!(provider.state.lock().unwrap().retained.len(), 16);
+        assert!(provider
+            .current_record(&replaced["snapshot_id"], &replaced["revision"])
+            .is_err());
+        let latest = cross_snapshot(&provider, 4260);
+        {
+            let mut state = provider.state.lock().unwrap();
+            for r in &mut state.retained {
+                r.created -= Duration::from_secs(301);
+            }
+        }
+        assert!(provider
+            .current_record(&latest["snapshot_id"], &latest["revision"])
+            .is_err());
+    }
+
+    #[test]
+    fn cross_drag_refuses_missing_stale_scope_path_and_unsupported_without_input() {
+        for variant in ["stale", "path", "scope", "unsupported"] {
+            let backend = Arc::new(FakeBackend {
+                cross_supported: variant != "unsupported",
+                depth: 2,
+                ..Default::default()
+            });
+            let provider = AtspiProvider::new(backend.clone()).unwrap();
+            let source = cross_snapshot(&provider, 4242);
+            let destination = cross_snapshot(&provider, 4243);
+            let mut args = cross_args(&source, &destination);
+            match variant {
+                "stale" => args["to"]["revision"] = json!(0),
+                "path" => args["path"] = json!([]),
+                "scope" => {
+                    let mut state = provider.state.lock().unwrap();
+                    state.retained.front_mut().unwrap().members.remove("n2");
+                }
+                _ => {}
+            }
+            assert!(provider
+                .invoke(
+                    "desktop.linux_atspi.drag_between@1",
+                    args,
+                    Some(Duration::from_secs(2))
+                )
+                .is_err());
+            assert_eq!(backend.writes.load(Ordering::SeqCst), 0);
+            if variant != "unsupported" {
+                assert!(provider
+                    .state
+                    .lock()
+                    .unwrap()
+                    .retained
+                    .iter()
+                    .all(|r| !r.valid));
+            }
+        }
+    }
+
+    #[test]
+    fn provider_invocation_gate_obeys_deadline_and_cancellation_without_publication() {
+        let backend = Arc::new(FakeBackend {
+            cross_supported: true,
+            depth: 2,
+            ..Default::default()
+        });
+        let provider = Arc::new(AtspiProvider::new(backend.clone()).unwrap());
+        cross_snapshot(&provider, 4242);
+        let guard = provider.invocation_gate.lock().unwrap();
+        let error = provider
+            .invoke(
+                "desktop.linux_atspi.snapshot@1",
+                json!({"application":{"process_id":4243}}),
+                Some(Duration::from_millis(20)),
+            )
+            .unwrap_err();
+        assert_eq!(error.code, "DRIVER.TIMEOUT");
+        let token = CancellationToken::new();
+        let sent = token.clone();
+        let p = provider.clone();
+        let pending = std::thread::spawn(move || {
+            p.invoke_cancellable(
+                "desktop.linux_atspi.snapshot@1",
+                json!({"application":{"process_id":4243}}),
+                Some(Duration::from_secs(2)),
+                &sent,
+            )
+        });
+        std::thread::sleep(Duration::from_millis(20));
+        token.cancel();
+        assert_eq!(
+            pending.join().unwrap().unwrap_err().code,
+            "DRIVER.CANCELLED"
+        );
+        assert_eq!(backend.captures.load(Ordering::SeqCst), 1);
+        assert_eq!(provider.state.lock().unwrap().retained.len(), 1);
+        drop(guard);
+        cross_snapshot(&provider, 4243);
+        assert_eq!(provider.state.lock().unwrap().retained.len(), 2);
+    }
+
+    #[test]
+    fn pointer_modifiers_are_validated_before_refresh_and_forwarded() {
+        for modifiers in [
+            json!(["ctrl", "ctrl"]),
+            json!(["super"]),
+            json!([1]),
+            json!("ctrl"),
+        ] {
+            let backend = Arc::new(FakeBackend::default());
+            let provider = AtspiProvider::new(backend.clone()).unwrap();
+            let observed = take_snapshot(&provider);
+            let args = json!({"target": {"snapshot_id": observed["snapshot_id"], "revision": observed["revision"], "node_id": "n0"}, "locator": locator(), "modifiers": modifiers});
+            assert_eq!(
+                provider
+                    .invoke(
+                        "desktop.linux_atspi.pointer_gesture@1",
+                        args,
+                        Some(Duration::from_secs(2))
+                    )
+                    .unwrap_err()
+                    .code,
+                "DRIVER.INVALID_REQUEST"
+            );
+            assert_eq!(backend.captures.load(Ordering::SeqCst), 1);
+            assert_eq!(backend.writes.load(Ordering::SeqCst), 0);
+        }
+        for action in ["pointer_gesture", "drag"] {
+            let backend = Arc::new(FakeBackend {
+                hit_chain: 1,
+                ..Default::default()
+            });
+            let provider = AtspiProvider::new(backend.clone()).unwrap();
+            let observed = take_snapshot(&provider);
+            let target = json!({"snapshot_id": observed["snapshot_id"], "revision": observed["revision"], "node_id": "n0"});
+            let mut args =
+                json!({"target": target, "locator": locator(), "modifiers": ["ctrl", "shift"]});
+            if action == "drag" {
+                args["to"] = target;
+                args["to_locator"] = locator();
+            }
+            let result = provider
+                .invoke(
+                    &format!("desktop.linux_atspi.{action}@1"),
+                    args,
+                    Some(Duration::from_secs(2)),
+                )
+                .unwrap();
+            assert_eq!(
+                result["backend_result"]["modifiers"],
+                json!(["ctrl", "shift"])
+            );
+            assert_eq!(backend.writes.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[test]
+    fn bounded_holds_validate_before_refresh_and_retain_observed_targets() {
+        for extra in [
+            json!({"hold_ms": 0}),
+            json!({"hold_ms": 5001}),
+            json!({"hold_ms": -1}),
+            json!({"hold_ms": 1.5}),
+            json!({"hold_ms": "100"}),
+            json!({"hold_ms": null}),
+            json!({"hold_ms": 100, "count": 2}),
+            json!({"hold_ms": 100, "hover_ms": 100}),
+            json!({"hold_ms": 100, "scroll": {"direction": "down"}}),
+        ] {
+            let backend = Arc::new(FakeBackend::default());
+            let provider = AtspiProvider::new(backend.clone()).unwrap();
+            let observed = take_snapshot(&provider);
+            let mut args = json!({"target": {"snapshot_id": observed["snapshot_id"], "revision": observed["revision"], "node_id": "n0"}, "locator": locator()});
+            args.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            assert_eq!(
+                provider
+                    .invoke(
+                        "desktop.linux_atspi.pointer_gesture@1",
+                        args,
+                        Some(Duration::from_secs(2))
+                    )
+                    .unwrap_err()
+                    .code,
+                "DRIVER.INVALID_REQUEST"
+            );
+            assert_eq!(backend.captures.load(Ordering::SeqCst), 1);
+            assert_eq!(backend.writes.load(Ordering::SeqCst), 0);
+        }
+        for action in ["pointer_gesture", "drag", "key_chord"] {
+            let backend = Arc::new(FakeBackend {
+                hit_chain: 1,
+                ..Default::default()
+            });
+            let provider = AtspiProvider::new(backend.clone()).unwrap();
+            let observed = take_snapshot(&provider);
+            let target = json!({"snapshot_id": observed["snapshot_id"], "revision": observed["revision"], "node_id": "n0"});
+            let mut args = json!({"target": target, "locator": locator(), "hold_ms": 250});
+            if action == "drag" {
+                args["to"] = target;
+                args["to_locator"] = locator();
+            } else if action == "key_chord" {
+                args["keys"] = json!(["ctrl", "a"]);
+            }
+            let result = provider
+                .invoke(
+                    &format!("desktop.linux_atspi.{action}@1"),
+                    args.clone(),
+                    Some(Duration::from_secs(2)),
+                )
+                .unwrap();
+            assert_eq!(result["backend_result"]["hold_ms"], 250);
+            assert_eq!(backend.captures.load(Ordering::SeqCst), 2);
+            assert_eq!(backend.writes.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                provider
+                    .invoke(
+                        &format!("desktop.linux_atspi.{action}@1"),
+                        args,
+                        Some(Duration::from_secs(2))
+                    )
+                    .unwrap_err()
+                    .code,
+                "DRIVER.STALE_SNAPSHOT"
+            );
+            assert_eq!(backend.writes.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[test]
+    fn recovered_focus_context_is_read_only_but_keeps_its_observed_child_usable() {
+        let backend = Arc::new(FakeBackend {
+            depth: 2,
+            focus_context: true,
+            ..Default::default()
+        });
+        let provider = AtspiProvider::new(backend.clone()).unwrap();
+        let observed = take_snapshot(&provider);
+        assert_eq!(observed["nodes"][1]["provenance"]["scope_context"], true);
+        assert_eq!(observed["nodes"][1]["actions"], json!([]));
+        assert!(!observed["nodes"][2]["actions"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        let context_target = json!({"snapshot_id": observed["snapshot_id"], "revision": observed["revision"], "node_id": "n1"});
+        let context_locator = json!({"bus_name": ":1.42", "object_path": "/chain/1"});
+        assert!(provider
+            .invoke(
+                "desktop.linux_atspi.snapshot_scope@1",
+                json!({"target": context_target, "locator": context_locator}),
+                Some(Duration::from_secs(2))
+            )
+            .is_err());
+        assert!(provider.invoke("desktop.linux_atspi.find@1", json!({"snapshot_id": observed["snapshot_id"], "revision": observed["revision"], "locator": context_locator}), Some(Duration::from_secs(2))).is_err());
+        assert!(provider
+            .invoke(
+                "desktop.linux_atspi.capture@1",
+                json!({"target": context_target, "locator": context_locator}),
+                Some(Duration::from_secs(2))
+            )
+            .is_err());
+        assert_eq!(backend.writes.load(Ordering::SeqCst), 0);
+        let observed = take_snapshot(&provider);
+        let target = json!({"snapshot_id": observed["snapshot_id"], "revision": observed["revision"], "node_id": "n2"});
+        provider
+            .invoke(
+                "desktop.linux_atspi.invoke@1",
+                json!({"target": target, "locator": locator()}),
+                Some(Duration::from_secs(2)),
+            )
+            .unwrap();
+        assert_eq!(backend.writes.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn proven_input_refusal_does_not_become_unknown_effect() {
+        let backend = Arc::new(FakeBackend {
+            hit_chain: 1,
+            refused_input: true,
+            ..Default::default()
+        });
+        let provider = AtspiProvider::new(backend.clone()).unwrap();
+        let observed = take_snapshot(&provider);
+        let error = provider.invoke("desktop.linux_atspi.pointer_gesture@1", json!({"target": {"snapshot_id": observed["snapshot_id"], "revision": observed["revision"], "node_id": "n0"}, "locator": locator()}), Some(Duration::from_secs(2))).unwrap_err();
+        assert_eq!(error.code, "DRIVER.ACTION_FAILED");
+        assert_eq!(error.effect, "not_applied");
+        assert_eq!(backend.writes.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn cancelled_invocation_keeps_record_and_subscription_state_without_leaking_its_token() {
+        let backend = Arc::new(FakeBackend {
+            cancel_in_capture: true,
+            ..Default::default()
+        });
+        let provider = AtspiProvider::new(backend.clone()).unwrap();
+        let initial = take_snapshot(&provider);
+        let args = json!({"target": {"snapshot_id": initial["snapshot_id"], "revision": initial["revision"], "node_id": "n0"}, "locator": locator()});
+        let cancelled = CancellationToken::new();
+        let error = provider
+            .invoke_cancellable(
+                "desktop.linux_atspi.focus@1",
+                args.clone(),
+                Some(Duration::from_secs(2)),
+                &cancelled,
+            )
+            .unwrap_err();
+        assert_eq!(error.code, "DRIVER.CANCELLED");
+        assert_eq!(error.effect, "not_applied");
+        assert_eq!(backend.writes.load(Ordering::SeqCst), 0);
+        assert_eq!(Arc::strong_count(&backend.subscription_lifetime), 1);
+        assert!(backend.cancellation.is_none());
+        // A fresh token shares the same original record and can finish the call.
+        provider
+            .invoke_cancellable(
+                "desktop.linux_atspi.focus@1",
+                args,
+                Some(Duration::from_secs(2)),
+                &CancellationToken::new(),
+            )
+            .unwrap();
+        assert_eq!(backend.writes.load(Ordering::SeqCst), 1);
+        assert_eq!(Arc::strong_count(&backend.subscription_lifetime), 1);
+        // The ordinary entry point also remains unaffected by the cancelled call.
+        take_snapshot(&provider);
+        assert!(backend.cancellation.is_none());
+        assert_eq!(Arc::strong_count(&backend.subscription_lifetime), 1);
+    }
+
+    #[test]
+    fn cancellation_after_native_dispatch_invalidates_the_observed_record() {
+        let backend = Arc::new(FakeBackend {
+            cancel_in_write: true,
+            ..Default::default()
+        });
+        let provider = AtspiProvider::new(backend.clone()).unwrap();
+        let initial = take_snapshot(&provider);
+        let args = json!({"target": {"snapshot_id": initial["snapshot_id"], "revision": initial["revision"], "node_id": "n0"}, "locator": locator()});
+        let error = provider
+            .invoke_cancellable(
+                "desktop.linux_atspi.invoke@1",
+                args.clone(),
+                Some(Duration::from_secs(2)),
+                &CancellationToken::new(),
+            )
+            .unwrap_err();
+        assert_eq!(error.code, "DRIVER.CANCELLED");
+        assert_eq!(error.effect, "unknown");
+        let stale = provider
+            .invoke(
+                "desktop.linux_atspi.invoke@1",
+                args,
+                Some(Duration::from_secs(2)),
+            )
+            .unwrap_err();
+        assert_eq!(stale.code, "DRIVER.STALE_SNAPSHOT");
+        assert_eq!(backend.writes.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn late_success_and_unknown_failure_invalidate_even_the_fresh_record() {
+        for late in [true, false] {
+            let backend = Arc::new(FakeBackend {
+                late_write_success: late,
+                uncertain_write_failure: !late,
+                ..Default::default()
+            });
+            let provider = AtspiProvider::new(backend.clone()).unwrap();
+            let initial = take_snapshot(&provider);
+            let args = json!({"target": {"snapshot_id": initial["snapshot_id"], "revision": initial["revision"], "node_id": "n0"}, "locator": locator()});
+            let error = provider
+                .invoke(
+                    "desktop.linux_atspi.invoke@1",
+                    args,
+                    Some(Duration::from_millis(50)),
+                )
+                .unwrap_err();
+            assert_eq!(
+                error.code,
+                if late {
+                    "DRIVER.TIMEOUT"
+                } else {
+                    "DRIVER.INPUT_FAILED"
+                }
+            );
+            assert_eq!(error.effect, "unknown");
+            if !late {
+                assert_eq!(error.details["dispatch_started"], false);
+            }
+            let fresh = provider.state.lock().unwrap().current.clone().unwrap();
+            assert!(!fresh.valid);
+            assert_ne!(fresh.public["revision"], initial["revision"]);
+            // Guessing the internally refreshed revision must not recover authority.
+            let guessed = json!({"target": {"snapshot_id": fresh.public["snapshot_id"], "revision": fresh.public["revision"], "node_id": "n0"}, "locator": locator()});
+            let stale = provider
+                .invoke(
+                    "desktop.linux_atspi.invoke@1",
+                    guessed,
+                    Some(Duration::from_secs(1)),
+                )
+                .unwrap_err();
+            assert_eq!(stale.code, "DRIVER.STALE_SNAPSHOT");
+            assert_eq!(backend.writes.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[test]
+    fn keyboard_window_comes_from_observed_ancestry_including_read_only_context() {
+        let provider = AtspiProvider::new(Arc::new(FakeBackend {
+            depth: 2,
+            ..Default::default()
+        }))
+        .unwrap();
+        take_snapshot(&provider);
+        let mut record = provider.state.lock().unwrap().current.clone().unwrap();
+        record.public["nodes"][0]["role"] = json!("application");
+        record.public["nodes"][1]["role"] = json!("frame");
+        record.members.remove("n1");
+        record.public["nodes"][1]["provenance"]["scope_context"] = json!(true);
+        let window = input_window(&record, "n2").unwrap();
+        assert_eq!(window.native, record.handles["n1"]);
+        assert_eq!(
+            window.bounds,
+            parse_bounds(record.public["nodes"][1].get("bounds")).unwrap()
+        );
+        record.public["nodes"][2]["parent_id"] = json!("missing");
+        assert!(input_window(&record, "n2").is_none());
+        record.public["nodes"][2]["parent_id"] = json!("n1");
+        record.public["nodes"][1]["bounds"]["width"] = json!(0);
+        assert!(input_window(&record, "n2").is_none());
+    }
+
+    #[test]
     fn snapshot_and_exact_find_preserve_the_contract() {
         let provider = AtspiProvider::new(Arc::new(FakeBackend::default())).unwrap();
         let snapshot = take_snapshot(&provider);
         assert_eq!(snapshot["backend"], "fake_atspi");
         assert_eq!(snapshot["nodes"][0]["role"], "push_button");
+        assert_eq!(snapshot["truncation_reasons"], json!([]));
+        assert_eq!(
+            snapshot["metadata"]["input_helper"],
+            snapshot["session"]["input_helper"]
+        );
+        assert_eq!(
+            snapshot["metadata"]["input_helper"]["code"],
+            "DRIVER.HELPER_INCOMPATIBLE"
+        );
         let found = provider.invoke("desktop.linux_atspi.find@1", json!({"snapshot_id": snapshot["snapshot_id"], "revision": snapshot["revision"], "locator": locator()}), Some(Duration::from_secs(2))).unwrap();
         assert_eq!(found["target"]["node_id"], "n0");
         assert_eq!(found["node"]["name"], "Save");
@@ -2795,6 +5197,10 @@ mod tests {
         }))
         .unwrap();
         let snapshot = take_snapshot(&provider);
+        assert_eq!(
+            snapshot["truncation_reasons"],
+            json!([{"code": "max_nodes", "limit": 1000}])
+        );
         let error = provider.invoke("desktop.linux_atspi.find@1", json!({"snapshot_id": snapshot["snapshot_id"], "revision": snapshot["revision"], "locator": locator()}), Some(Duration::from_secs(2))).unwrap_err();
         assert_eq!(error.code, "DRIVER.SNAPSHOT_TRUNCATED");
     }
@@ -2997,6 +5403,112 @@ mod tests {
         assert_eq!(result["frame"]["kind"], "ArtifactRef");
         assert!(result["frame"].get("path").is_none());
         assert!(!store.resolve(&result["frame"]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn scoped_capture_checks_private_window_before_reading_pixels() {
+        for mode in 1..=7 {
+            let backend = Arc::new(FakeBackend {
+                depth: 2,
+                path_window_visibility: mode,
+                capture_only_target: true,
+                ..Default::default()
+            });
+            let provider = AtspiProvider::new(backend.clone()).unwrap();
+            let initial = take_snapshot(&provider);
+            let scoped = provider.invoke("desktop.linux_atspi.snapshot_scope@1", json!({
+                "target":{"snapshot_id":initial["snapshot_id"],"revision":initial["revision"],"node_id":"n2"},
+                "locator":locator()
+            }), Some(Duration::from_secs(2))).unwrap();
+            let args = json!({"target":{"snapshot_id":scoped["snapshot_id"],"revision":scoped["revision"],"node_id":"n2"},"locator":locator()});
+            let result = provider.invoke(
+                "desktop.linux_atspi.capture@1",
+                args,
+                Some(Duration::from_secs(2)),
+            );
+            if matches!(mode, 1 | 6) {
+                result.unwrap();
+                assert_eq!(backend.pixel_captures.load(Ordering::SeqCst), 1);
+            } else {
+                let error = result.unwrap_err();
+                assert_eq!(
+                    error.code,
+                    match mode {
+                        2 => "DRIVER.ACTION_UNSUPPORTED",
+                        3 => "DRIVER.SNAPSHOT_TRUNCATED",
+                        4 | 5 => "DRIVER.PROTECTED_ELEMENT",
+                        _ => "DRIVER.STALE_SNAPSHOT",
+                    }
+                );
+                assert_eq!(
+                    backend.pixel_captures.load(Ordering::SeqCst),
+                    0,
+                    "mode {mode}: unsafe pixels must never reach the backend"
+                );
+            }
+            let state = provider.state.lock().unwrap();
+            assert_eq!(
+                state.revision, 3,
+                "private window observation must not publish"
+            );
+            let current = state.current.as_ref().unwrap();
+            assert_eq!(current.public["snapshot_id"], scoped["snapshot_id"]);
+            assert_eq!(current.members, BTreeSet::from(["n2".to_string()]));
+            assert_eq!(
+                current.scope.as_ref().unwrap().root.object_path,
+                "/org/a11y/save"
+            );
+        }
+    }
+
+    #[test]
+    fn scoped_capture_cancellation_is_private_and_does_not_poison_the_next_call() {
+        let backend = Arc::new(FakeBackend {
+            depth: 2,
+            path_window_visibility: 1,
+            cancel_in_window_capture: true,
+            ..Default::default()
+        });
+        let lifetime = Arc::strong_count(&backend.subscription_lifetime);
+        let provider = AtspiProvider::new(backend.clone()).unwrap();
+        let initial = take_snapshot(&provider);
+        let scoped = provider.invoke("desktop.linux_atspi.snapshot_scope@1", json!({
+            "target":{"snapshot_id":initial["snapshot_id"],"revision":initial["revision"],"node_id":"n2"},
+            "locator":locator()
+        }), Some(Duration::from_secs(2))).unwrap();
+        let args = json!({"target":{"snapshot_id":scoped["snapshot_id"],"revision":scoped["revision"],"node_id":"n2"},"locator":locator()});
+        let token = CancellationToken::new();
+        let result = provider
+            .invoke_cancellable(
+                "desktop.linux_atspi.capture@1",
+                args.clone(),
+                Some(Duration::from_secs(2)),
+                &token,
+            )
+            .unwrap_err();
+        assert_eq!(result.code, "DRIVER.CANCELLED");
+        assert_eq!(backend.pixel_captures.load(Ordering::SeqCst), 0);
+        assert!(backend.cancellation.is_none());
+        assert_eq!(Arc::strong_count(&backend.subscription_lifetime), lifetime);
+        provider
+            .invoke(
+                "desktop.linux_atspi.capture@1",
+                args,
+                Some(Duration::from_secs(2)),
+            )
+            .unwrap();
+        assert_eq!(backend.pixel_captures.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            provider
+                .state
+                .lock()
+                .unwrap()
+                .current
+                .as_ref()
+                .unwrap()
+                .public["snapshot_id"],
+            scoped["snapshot_id"]
+        );
     }
 
     #[test]

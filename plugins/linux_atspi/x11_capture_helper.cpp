@@ -335,51 +335,13 @@ bool DeadlineExpired(std::uint64_t deadline_ns) {
     return now_ns >= deadline_ns;
 }
 
-bool IsKdeDesktop(std::string_view value) {
-    std::size_t start = 0;
-    while (start <= value.size()) {
-        std::size_t end = value.find_first_of(":;", start);
-        if (end == std::string_view::npos) {
-            end = value.size();
-        }
-        std::string token(value.substr(start, end - start));
-        std::transform(token.begin(), token.end(), token.begin(), [](char item) {
-            if (item >= 'a' && item <= 'z') {
-                return static_cast<char>(item - 'a' + 'A');
-            }
-            return item;
-        });
-        if (token == "KDE") {
-            return true;
-        }
-        if (end == value.size()) {
-            break;
-        }
-        start = end + 1;
-    }
-    return false;
-}
-
 bool SessionIsQualified() {
     const char *session_type = std::getenv("XDG_SESSION_TYPE");
     const char *display = std::getenv("DISPLAY");
-    const char *desktop = std::getenv("XDG_CURRENT_DESKTOP");
-    if (desktop == nullptr || *desktop == '\0') {
-        desktop = std::getenv("DESKTOP_SESSION");
-    }
-    if (session_type == nullptr || display == nullptr || *display == '\0' ||
-        desktop == nullptr) {
-        return false;
-    }
-    std::string normalized_type(session_type);
-    std::transform(normalized_type.begin(), normalized_type.end(),
-                   normalized_type.begin(), [](char item) {
-                       if (item >= 'A' && item <= 'Z') {
-                           return static_cast<char>(item - 'A' + 'a');
-                       }
-                       return item;
-                   });
-    return normalized_type == "x11" && IsKdeDesktop(desktop);
+    // XTest/root capture are X11 protocols, independent of desktop branding.
+    // XWayland under a Wayland session is not a qualified native desktop.
+    return session_type != nullptr && std::strcmp(session_type, "x11") == 0 &&
+           display != nullptr && *display != '\0';
 }
 
 std::optional<ProcessIdentity> OpenTrustedProcess(unsigned long pid) {

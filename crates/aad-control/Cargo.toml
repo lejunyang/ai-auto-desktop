@@ -12,7 +12,7 @@ aad-core.workspace = true
 aad-runtime.workspace = true
 aad-plugin.workspace = true
 aad-desktop.workspace = true
-aad-cdp.workspace = true
+aad-browser.workspace = true
 aad-ocr.workspace = true
 base64 = "0.22"
 image.workspace = true
@@ -21,6 +21,7 @@ serde_json.workspace = true
 uuid.workspace = true
 sha2.workspace = true
 fs2 = "0.4"
+url = "2"
 libc.workspace = true
 rqrr = { version = "0.10.1", default-features = false }
 

@@ -3,6 +3,7 @@ use crate::{
     error, Action, Backend, BackendResource, Expect, Locator, Resource, Result, View, ViewMode,
     ACTION_NAMES,
 };
+use aad_plugin::CapabilityManifest;
 use aad_runtime::Provider;
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
@@ -22,18 +23,105 @@ pub struct NativeBackend {
     flavor: Flavor,
 }
 
+/// Workflows share the provider's snapshot store, but cannot bypass the
+/// session's server-owned secret bindings with an arbitrary `with.text`.
+struct WorkflowProvider {
+    inner: Arc<dyn Provider>,
+    manifest: CapabilityManifest,
+}
+
+/// Keep private, server-resolved secret input out of arbitrary workflow calls.
+pub fn workflow_provider(inner: Arc<dyn Provider>) -> Arc<dyn Provider> {
+    Arc::new(WorkflowProvider::new(inner))
+}
+
+impl WorkflowProvider {
+    fn new(inner: Arc<dyn Provider>) -> Self {
+        let mut manifest = inner.manifest().clone();
+        manifest.actions.remove("secret_input");
+        if let Some(actions) = manifest.raw["actions"].as_object_mut() {
+            actions.remove("secret_input");
+        }
+        Self { inner, manifest }
+    }
+
+    fn refuse_secret(action: &str) -> Result<()> {
+        let name = action
+            .split('@')
+            .next()
+            .unwrap_or(action)
+            .rsplit('.')
+            .next();
+        if name == Some("secret_input") {
+            return Err(error(
+                "CONTROL.SECRET_WORKFLOW_DENIED",
+                "secret input cannot run through a workflow",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl Provider for WorkflowProvider {
+    fn manifest(&self) -> &CapabilityManifest {
+        &self.manifest
+    }
+    fn invoke(&self, action: &str, args: Value, timeout: Option<Duration>) -> Result<Value> {
+        Self::refuse_secret(action)?;
+        self.inner.invoke(action, args, timeout)
+    }
+    fn invoke_cancellable(
+        &self,
+        action: &str,
+        args: Value,
+        timeout: Option<Duration>,
+        cancellation: &aad_runtime::CancellationToken,
+    ) -> Result<Value> {
+        Self::refuse_secret(action)?;
+        self.inner
+            .invoke_cancellable(action, args, timeout, cancellation)
+    }
+    fn invoke_with_artifacts(
+        &self,
+        action: &str,
+        args: Value,
+        timeout: Option<Duration>,
+        artifacts: &aad_runtime::ArtifactStore,
+    ) -> Result<Value> {
+        Self::refuse_secret(action)?;
+        self.inner
+            .invoke_with_artifacts(action, args, timeout, artifacts)
+    }
+    fn close(&self) {
+        self.inner.close();
+    }
+}
+
 impl NativeBackend {
     pub fn new(provider: Arc<dyn Provider>, flavor: Flavor) -> Self {
         Self { provider, flavor }
     }
-    /// The provider itself, for saved workflows that must drive the same
-    /// native instance and snapshot store as this session.
+    /// A workflow view sharing the native instance and snapshot store, with
+    /// ephemeral secret input removed from discovery and dispatch.
     pub fn provider(&self) -> Arc<dyn Provider> {
-        self.provider.clone()
+        workflow_provider(self.provider.clone())
     }
     fn invoke(&self, action: &str, args: Value, timeout: Duration) -> Result<Value> {
         self.provider
             .invoke(&format!("{}.{action}@1", self.name()), args, Some(timeout))
+    }
+    fn invoke_controlled(
+        &self,
+        action: &str,
+        args: Value,
+        context: &crate::Context,
+    ) -> Result<Value> {
+        self.provider.invoke_cancellable(
+            &format!("{}.{action}@1", self.name()),
+            args,
+            Some(context.commit()?),
+            context.cancellation(),
+        )
     }
     /// The native operation behind a typed capability name.
     fn native_name(&self, capability: &str) -> &'static str {
@@ -44,6 +132,7 @@ impl NativeBackend {
             "fill" if matches!(self.flavor, Flavor::Linux) => "set_text",
             "fill" => "set_value",
             "type_text" => "type_text",
+            "secret_input" => "secret_input",
             "key" => "key_chord",
             "scroll" | "hover" => "pointer_gesture",
             "drag" => "drag",
@@ -263,7 +352,7 @@ impl Backend for NativeBackend {
                 "this provider cannot press global keys",
             ));
         }
-        self.invoke("global_key", json!({"keys": keys}), context.commit()?)
+        self.invoke_controlled("global_key", json!({"keys": keys}), context)
     }
     fn clipboard_read(&self, max_characters: Option<usize>, timeout: Duration) -> Result<Value> {
         if !self.offers("clipboard_read") {
@@ -335,6 +424,81 @@ impl Backend for NativeBackend {
             .map(|name| name.to_string())
             .collect()
     }
+    fn supports_cross_resource_drag(&self) -> bool {
+        // Advertising this private operation promises independent snapshot
+        // retention and fresh validation of both native endpoints. Ordinary
+        // single-snapshot `drag` does not make that promise.
+        self.offers("drag_between")
+    }
+    fn drag_between(
+        &self,
+        source: crate::DragEndpoint<'_>,
+        destination: crate::DragEndpoint<'_>,
+        action: &Action,
+        context: &crate::Context,
+    ) -> Result<Value> {
+        if !self.supports_cross_resource_drag() {
+            return Err(error(
+                "CONTROL.ACTION_UNSUPPORTED",
+                "this native provider cannot drag between resources",
+            ));
+        }
+        let Action::Drag {
+            to,
+            button,
+            fraction: from_at,
+            to_fraction,
+            modifiers,
+            hold_ms,
+            path,
+        } = action
+        else {
+            return Err(error("CONTROL.INVALID_REQUEST", "expected a drag action"));
+        };
+        if !path.is_empty() {
+            return Err(error(
+                "CONTROL.INVALID_REQUEST",
+                "a drag path must stay on one observed surface",
+            ));
+        }
+        if destination.node["node_id"] != to.node_id {
+            return Err(error(
+                "CONTROL.STALE_TARGET",
+                "drag destination does not match the observed endpoint",
+            ));
+        }
+        for endpoint in [&source, &destination] {
+            if !self
+                .node_capabilities(endpoint.node)
+                .iter()
+                .any(|name| name == "drag")
+            {
+                return Err(error(
+                    "CONTROL.ACTION_UNSUPPORTED",
+                    "both observed endpoints must support native drag",
+                ));
+            }
+        }
+        let mut args = self.read_args(source.snapshot, source.node);
+        args["to"] = Self::target_of(destination.snapshot, &destination.node["node_id"]);
+        if self.portable() {
+            args["to_locator"] = self.locator_of(destination.node);
+        }
+        for (key, value) in [
+            ("button", json!(button)),
+            ("fraction", fraction(from_at)),
+            ("to_fraction", fraction(to_fraction)),
+            ("hold_ms", json!(hold_ms)),
+        ] {
+            if !value.is_null() {
+                args[key] = value;
+            }
+        }
+        if !modifiers.is_empty() {
+            args["modifiers"] = json!(modifiers);
+        }
+        self.invoke_controlled("drag_between", args, context)
+    }
     fn resources(&self, timeout: Duration) -> Result<Vec<BackendResource>> {
         let (action, collection) = match self.flavor {
             Flavor::Windows => ("list_windows", "windows"),
@@ -380,6 +544,41 @@ impl Backend for NativeBackend {
         let mut args = selector.clone();
         args["max_nodes"] = json!(max_nodes);
         self.invoke("snapshot", args, timeout)
+    }
+    fn observe_scope(
+        &self,
+        selector: &Value,
+        scope: &str,
+        max_nodes: usize,
+        timeout: Duration,
+    ) -> Result<Value> {
+        if !self.offers("snapshot_scope") {
+            return Err(error(
+                "CONTROL.SCOPE_UNSUPPORTED",
+                "native provider has no scoped capture",
+            ));
+        }
+        let mut args = selector.clone();
+        args["scope_id"] = json!(scope);
+        args["max_nodes"] = json!(max_nodes);
+        self.invoke("snapshot_scope", args, timeout)
+    }
+    fn observe_target_scope(
+        &self,
+        snapshot: &Value,
+        node: &Value,
+        max_nodes: usize,
+        timeout: Duration,
+    ) -> Result<Value> {
+        if !self.offers("snapshot_scope") {
+            return Err(error(
+                "CONTROL.SCOPE_UNSUPPORTED",
+                "native provider has no scoped capture",
+            ));
+        }
+        let mut args = self.read_args(snapshot, node);
+        args["max_nodes"] = json!(max_nodes);
+        self.invoke("snapshot_scope", args, timeout)
     }
     fn view(&self, snapshot: &Value, view: &View, timeout: Duration) -> Result<Option<Value>> {
         // Only the Windows driver computes regions; the others use the portable outline.
@@ -490,6 +689,12 @@ impl Backend for NativeBackend {
         action: &Action,
         context: &crate::Context,
     ) -> Result<Value> {
+        if matches!(action, Action::SecretInput { .. }) {
+            return Err(error(
+                "POLICY.DENIED",
+                "secret input requires a server-resolved binding",
+            ));
+        }
         let native = self.native_action(action);
         if !node["actions"]
             .as_array()
@@ -525,29 +730,40 @@ impl Backend for NativeBackend {
             ),
             Action::TypeText { text, mode } => {
                 set("text", json!(text));
-                // Only UI Automation offers a choice; AT-SPI and AX always
-                // type Unicode and refuse a `mode` argument.
+                // UIA and AT-SPI explicitly distinguish Unicode insertion from
+                // layout keys; AX has no layout-aware key implementation yet.
                 match (self.flavor, mode) {
-                    (Flavor::Windows, _) => set("mode", serde_json::to_value(mode).unwrap()),
+                    (Flavor::Windows | Flavor::Linux, _) => {
+                        set("mode", serde_json::to_value(mode).unwrap())
+                    }
                     (_, Some(crate::model::TypeMode::Keys)) => {
                         return Err(error(
                             "CONTROL.ACTION_UNSUPPORTED",
-                            "layout-aware key typing is available on Windows only",
-                        ))
+                            "layout-aware key typing is unavailable on this native backend",
+                        ));
                     }
                     _ => {}
                 }
             }
-            Action::Key { keys } => set("keys", json!(keys)),
+            Action::Key { keys, hold_ms } => {
+                set("keys", json!(keys));
+                set("hold_ms", json!(hold_ms));
+            }
             Action::Paste { text } => set("text", json!(text)),
             Action::Click {
                 button,
                 count,
                 fraction: at,
+                modifiers,
+                hold_ms,
             } if native == "pointer_gesture" => {
                 set("button", serde_json::to_value(button).unwrap());
                 set("count", serde_json::to_value(count).unwrap());
                 set("fraction", fraction(at));
+                set("hold_ms", json!(hold_ms));
+                if !modifiers.is_empty() {
+                    set("modifiers", json!(modifiers));
+                }
             }
             Action::Scroll {
                 direction,
@@ -570,6 +786,9 @@ impl Backend for NativeBackend {
                 button,
                 fraction: from_at,
                 to_fraction,
+                modifiers,
+                hold_ms,
+                path,
             } => {
                 set("to", target_of(&json!(to.node_id)));
                 if portable {
@@ -587,10 +806,54 @@ impl Backend for NativeBackend {
                 set("button", serde_json::to_value(button).unwrap());
                 set("fraction", fraction(from_at));
                 set("to_fraction", fraction(to_fraction));
+                set("hold_ms", json!(hold_ms));
+                if !path.is_empty() {
+                    let anchors = path
+                        .iter()
+                        .map(|anchor| {
+                            let mut value = json!({
+                                "target": target_of(&json!(anchor.target.node_id)),
+                                "fraction": anchor.fraction,
+                            });
+                            if portable {
+                                // Control validation requires the same observed
+                                // surface for every intermediate anchor.
+                                value["locator"] = locator_of(node);
+                            }
+                            value
+                        })
+                        .collect::<Vec<_>>();
+                    set("path", json!(anchors));
+                }
+                if !modifiers.is_empty() {
+                    set("modifiers", json!(modifiers));
+                }
             }
             _ => {}
         }
-        self.invoke(native, args, context.commit()?)
+        self.invoke_controlled(native, args, context)
+    }
+
+    fn secret_input(
+        &self,
+        snapshot: &Value,
+        node: &Value,
+        text: &str,
+        context: &crate::Context,
+    ) -> Result<Value> {
+        if node["states"]["protected"] != true
+            || !node["actions"]
+                .as_array()
+                .is_some_and(|actions| actions.iter().any(|action| action == "secret_input"))
+        {
+            return Err(error(
+                "CONTROL.ACTION_UNSUPPORTED",
+                "the observed element does not support secret input",
+            ));
+        }
+        let mut args = self.read_args(snapshot, node);
+        args["text"] = json!(text);
+        self.invoke_controlled("secret_input", args, context)
     }
 }
 

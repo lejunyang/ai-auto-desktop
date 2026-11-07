@@ -14,6 +14,15 @@ struct Fixture {
     flavor: Flavor,
 }
 impl Fixture {
+    fn with_cross_resource_drag(name: &str, flavor: Flavor) -> Arc<Self> {
+        let mut fixture = Self::new(name, flavor);
+        let fixture_mut = Arc::get_mut(&mut fixture).unwrap();
+        let mut raw = fixture_mut.manifest.raw.clone();
+        raw["actions"]["drag_between"] = json!({"contract_major":1});
+        fixture_mut.manifest = manifest::parse(&raw).unwrap();
+        fixture
+    }
+
     fn new(name: &str, flavor: Flavor) -> Arc<Self> {
         let mut actions = Map::new();
         for action in [
@@ -24,20 +33,423 @@ impl Fixture {
             "focus",
             "invoke",
             "pointer_click",
+            "pointer_gesture",
+            "drag",
             "set_value",
             "set_text",
             "type_text",
+            "secret_input",
         ] {
             actions.insert(action.into(), json!({"contract_major":1}));
         }
         if matches!(flavor, Flavor::Windows) {
             actions.insert("key_chord".into(), json!({"contract_major":1}));
         }
+        if matches!(flavor, Flavor::Linux) {
+            actions.insert("snapshot_scope".into(), json!({"contract_major":1}));
+        }
         Arc::new(Self {
             manifest: manifest::parse(&manifest::document(name, actions)).unwrap(),
             calls: Mutex::new(Vec::new()),
             flavor,
         })
+    }
+}
+
+#[test]
+fn explicit_layout_keys_reach_only_supported_native_providers() {
+    for (name, flavor) in [
+        ("desktop.windows_uia", Flavor::Windows),
+        ("desktop.linux_atspi", Flavor::Linux),
+        ("desktop.macos_ax", Flavor::MacOS),
+    ] {
+        let provider = Fixture::new(name, flavor);
+        let backend = NativeBackend::new(provider.clone(), flavor);
+        let node = json!({"node_id":"n", "role":"entry", "actions":["type_text"], "provenance":{"bus_name":":1.2","object_path":"/field"}});
+        let snapshot = json!({"snapshot_id":"s", "revision":1, "nodes":[node]});
+        let action =
+            serde_json::from_value(json!({"type":"type_text", "text":"nihao", "mode":"keys"}))
+                .unwrap();
+        let result = backend.act(
+            &snapshot,
+            &node,
+            &action,
+            &Context::new(Duration::from_secs(1), true),
+        );
+        let calls = provider.calls.lock().unwrap();
+        if matches!(flavor, Flavor::MacOS) {
+            assert_eq!(result.unwrap_err().code, "CONTROL.ACTION_UNSUPPORTED");
+            assert!(calls.is_empty());
+        } else {
+            result.unwrap();
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0].0, format!("{name}.type_text@1"));
+            assert_eq!(calls[0].1["mode"], "keys");
+            assert_eq!(calls[0].1["text"], "nihao");
+        }
+    }
+}
+
+#[test]
+fn cross_resource_native_drag_keeps_each_snapshot_and_locator_independent() {
+    for (name, flavor) in [
+        ("desktop.windows_uia", Flavor::Windows),
+        ("desktop.linux_atspi", Flavor::Linux),
+        ("desktop.macos_ax", Flavor::MacOS),
+    ] {
+        let provider = Fixture::with_cross_resource_drag(name, flavor);
+        let backend = NativeBackend::new(provider.clone(), flavor);
+        assert!(backend.supports_cross_resource_drag());
+        // Node ids are only unique within a snapshot. Both applications may
+        // legitimately call their surface n1; neither end may borrow the
+        // other's revision, native identity or descriptive locator.
+        let source = json!({"node_id":"n1","role":"canvas","name":"Source","actions":["drag"],
+            "provenance":{"bus_name":":1.10","object_path":"/a/source"}});
+        let destination = json!({"node_id":"n1","role":"canvas","name":"Destination","actions":["drag"],
+            "provenance":{"bus_name":":1.20","object_path":"/a/destination"}});
+        let source_snapshot = json!({"snapshot_id":"source:9","revision":9,"nodes":[source]});
+        let destination_snapshot =
+            json!({"snapshot_id":"destination:17","revision":17,"nodes":[destination]});
+        let action = serde_json::from_value(json!({"type":"drag",
+            "to":{"session_id":"session","resource_id":"destination","observation_id":"o17","node_id":"n1"},
+            "fraction":{"fx":0.2,"fy":0.3},"to_fraction":{"fx":0.7,"fy":0.8},
+            "button":"right","modifiers":["ctrl"],"hold_ms":150})).unwrap();
+        backend
+            .drag_between(
+                DragEndpoint {
+                    snapshot: &source_snapshot,
+                    node: &source,
+                },
+                DragEndpoint {
+                    snapshot: &destination_snapshot,
+                    node: &destination,
+                },
+                &action,
+                &Context::new(Duration::from_secs(1), true),
+            )
+            .unwrap();
+        let calls = provider.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, format!("{name}.drag_between@1"));
+        let args = &calls[0].1;
+        assert_eq!(
+            args["target"],
+            json!({"snapshot_id":"source:9","revision":9,"node_id":"n1"})
+        );
+        assert_eq!(
+            args["to"],
+            json!({"snapshot_id":"destination:17","revision":17,"node_id":"n1"})
+        );
+        assert_eq!(args["fraction"], json!({"fx":0.2,"fy":0.3}));
+        assert_eq!(args["to_fraction"], json!({"fx":0.7,"fy":0.8}));
+        assert_eq!(args["button"], "right");
+        assert_eq!(args["modifiers"], json!(["ctrl"]));
+        assert_eq!(args["hold_ms"], 150);
+        if matches!(flavor, Flavor::Windows) {
+            assert!(args.get("locator").is_none());
+            assert!(args.get("to_locator").is_none());
+        } else {
+            assert_eq!(args["locator"]["name"], "Source");
+            assert_eq!(args["to_locator"]["name"], "Destination");
+            if matches!(flavor, Flavor::Linux) {
+                assert_eq!(args["locator"]["bus_name"], ":1.10");
+                assert_eq!(args["to_locator"]["bus_name"], ":1.20");
+                assert_eq!(args["locator"]["object_path"], "/a/source");
+                assert_eq!(args["to_locator"]["object_path"], "/a/destination");
+            }
+        }
+    }
+}
+
+#[test]
+fn native_cross_resource_drag_refuses_unsupported_invalid_or_cancelled_calls() {
+    let plain = Fixture::new("desktop.linux_atspi", Flavor::Linux);
+    let unsupported = NativeBackend::new(plain.clone(), Flavor::Linux);
+    assert!(!unsupported.supports_cross_resource_drag());
+    let provider = Fixture::with_cross_resource_drag("desktop.linux_atspi", Flavor::Linux);
+    let backend = NativeBackend::new(provider.clone(), Flavor::Linux);
+    let source = json!({"node_id":"n1","actions":["drag"]});
+    let destination = json!({"node_id":"n2","actions":["drag"]});
+    let source_snapshot = json!({"snapshot_id":"s","revision":1});
+    let destination_snapshot = json!({"snapshot_id":"d","revision":2});
+    let original = json!({"type":"drag","to":{"session_id":"s","resource_id":"d","observation_id":"o2","node_id":"n2"}});
+    let call = |backend: &NativeBackend, value: Value, destination: &Value, context: &Context| {
+        backend
+            .drag_between(
+                DragEndpoint {
+                    snapshot: &source_snapshot,
+                    node: &source,
+                },
+                DragEndpoint {
+                    snapshot: &destination_snapshot,
+                    node: destination,
+                },
+                &serde_json::from_value(value).unwrap(),
+                context,
+            )
+            .unwrap_err()
+            .code
+    };
+    let context = Context::new(Duration::from_secs(1), true);
+    assert_eq!(
+        call(&unsupported, original.clone(), &destination, &context),
+        "CONTROL.ACTION_UNSUPPORTED"
+    );
+    assert_eq!(
+        call(&backend, json!({"type":"focus"}), &destination, &context),
+        "CONTROL.INVALID_REQUEST"
+    );
+    let mut changed = original.clone();
+    changed["to"]["node_id"] = json!("other");
+    assert_eq!(
+        call(&backend, changed, &destination, &context),
+        "CONTROL.STALE_TARGET"
+    );
+    let mut changed = original.clone();
+    changed["path"] = json!([{"target":original["to"],"fraction":{"fx":0.5,"fy":0.5}}]);
+    assert_eq!(
+        call(&backend, changed, &destination, &context),
+        "CONTROL.INVALID_REQUEST"
+    );
+    let mut read_only = destination.clone();
+    read_only["actions"] = json!([]);
+    assert_eq!(
+        call(&backend, original.clone(), &read_only, &context),
+        "CONTROL.ACTION_UNSUPPORTED"
+    );
+    context.cancel();
+    assert_eq!(
+        call(&backend, original, &destination, &context),
+        "CONTROL.CANCELLED"
+    );
+    assert!(provider.calls.lock().unwrap().is_empty());
+    assert!(plain.calls.lock().unwrap().is_empty());
+}
+
+#[test]
+fn secret_input_uses_only_the_dedicated_hook_and_cannot_enter_workflows() {
+    for (name, flavor) in [
+        ("desktop.windows_uia", Flavor::Windows),
+        ("desktop.linux_atspi", Flavor::Linux),
+        ("desktop.macos_ax", Flavor::MacOS),
+    ] {
+        let provider = Fixture::new(name, flavor);
+        let backend = NativeBackend::new(provider.clone(), flavor);
+        let node = json!({"node_id":"n", "role":"edit", "states":{"protected":true}, "actions":["secret_input"]});
+        let snapshot = json!({"snapshot_id":"s", "revision":1, "nodes":[node]});
+        backend
+            .secret_input(
+                &snapshot,
+                &node,
+                "synthetic-fixture",
+                &Context::new(Duration::from_secs(1), true),
+            )
+            .unwrap();
+        {
+            let calls = provider.calls.lock().unwrap();
+            assert_eq!(calls[0].0, format!("{name}.secret_input@1"));
+            assert_eq!(
+                calls[0].1["target"],
+                json!({"snapshot_id":"s","revision":1,"node_id":"n"})
+            );
+            assert_eq!(calls[0].1["text"], "synthetic-fixture");
+        }
+        assert!(backend
+            .act(
+                &snapshot,
+                &node,
+                &Action::SecretInput {
+                    secret_ref: "password".into()
+                },
+                &Context::new(Duration::from_secs(1), true)
+            )
+            .is_err());
+        let workflow_provider = backend.provider();
+        assert!(!workflow_provider
+            .manifest()
+            .actions
+            .contains_key("secret_input"));
+        assert!(workflow_provider.manifest().raw["actions"]
+            .get("secret_input")
+            .is_none());
+        let uses = format!("{name}.secret_input@1");
+        assert_eq!(
+            workflow_provider
+                .invoke(&uses, json!({"text":"synthetic-fixture"}), None)
+                .unwrap_err()
+                .code,
+            "CONTROL.SECRET_WORKFLOW_DENIED"
+        );
+        assert_eq!(
+            workflow_provider
+                .invoke_with_artifacts(
+                    &uses,
+                    json!({"text":"synthetic-fixture"}),
+                    None,
+                    &aad_runtime::ArtifactStore::default()
+                )
+                .unwrap_err()
+                .code,
+            "CONTROL.SECRET_WORKFLOW_DENIED"
+        );
+        let mut registry = aad_runtime::ProviderRegistry::new();
+        registry.insert(workflow_provider.clone());
+        assert!(
+            registry.resolve(&uses).is_none(),
+            "handwritten workflow action must not resolve"
+        );
+        // Hosts may register raw providers explicitly; the Session boundary
+        // must apply the same filter as NativeBackend::provider().
+        let session =
+            Session::new(Vec::new(), Policy::default()).with_providers(vec![provider.clone()]);
+        let registered = &session.providers()[0];
+        assert!(!registered.manifest().actions.contains_key("secret_input"));
+        assert_eq!(
+            registered
+                .invoke(&uses, json!({"text":"synthetic-fixture"}), None)
+                .unwrap_err()
+                .code,
+            "CONTROL.SECRET_WORKFLOW_DENIED"
+        );
+        assert_eq!(provider.calls.lock().unwrap().len(), 1);
+    }
+}
+
+#[test]
+fn native_pointer_modifiers_route_to_gestures_without_losing_target_identity() {
+    for (name, flavor) in [
+        ("desktop.windows_uia", Flavor::Windows),
+        ("desktop.linux_atspi", Flavor::Linux),
+        ("desktop.macos_ax", Flavor::MacOS),
+    ] {
+        let provider = Fixture::new(name, flavor);
+        let backend = NativeBackend::new(provider.clone(), flavor);
+        let node = json!({"node_id":"n", "role":"canvas", "name":"Surface", "actions":["pointer_click","pointer_gesture","drag"],
+            "provenance":{"bus_name":":1.2","object_path":"/org/a11y/surface"}});
+        let snapshot = json!({"snapshot_id":"s", "revision":1, "nodes":[node]});
+        for kind in ["click", "drag"] {
+            let mut value = json!({"type":kind, "modifiers":["ctrl","shift"]});
+            if kind == "drag" {
+                value["to"] = json!({"session_id":"s", "resource_id":"r", "observation_id":"o", "node_id":"n"});
+            }
+            let action = serde_json::from_value(value).unwrap();
+            let result = backend.act(
+                &snapshot,
+                &node,
+                &action,
+                &Context::new(Duration::from_secs(1), true),
+            );
+            {
+                result.unwrap();
+                let calls = provider.calls.lock().unwrap();
+                let (called, args) = calls.last().unwrap();
+                assert_eq!(
+                    *called,
+                    format!(
+                        "{name}.{}@1",
+                        if kind == "click" {
+                            "pointer_gesture"
+                        } else {
+                            "drag"
+                        }
+                    )
+                );
+                assert_eq!(args["modifiers"], json!(["ctrl", "shift"]));
+                assert_eq!(
+                    args["target"],
+                    json!({"snapshot_id":"s", "revision":1, "node_id":"n"})
+                );
+                if matches!(flavor, Flavor::Linux) {
+                    assert_eq!(args["locator"]["object_path"], "/org/a11y/surface");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn native_scope_keeps_the_observed_identity_and_resource_selector() {
+    let provider = Fixture::new("desktop.linux_atspi", Flavor::Linux);
+    let backend = NativeBackend::new(provider.clone(), Flavor::Linux);
+    let snapshot = json!({"snapshot_id":"generation:1","revision":1,"truncated":true});
+    let node = json!({"node_id":"n20","role":"pane","name":"Editor",
+        "provenance":{"bus_name":":1.2","object_path":"/org/a11y/editor"}});
+    backend
+        .observe_target_scope(&snapshot, &node, 300, Duration::from_secs(1))
+        .unwrap();
+    backend
+        .observe_scope(
+            &json!({"application":{"bus_name":":1.2"}}),
+            "opaque-scope",
+            300,
+            Duration::from_secs(1),
+        )
+        .unwrap();
+    let calls = provider.calls.lock().unwrap();
+    assert_eq!(calls[0].0, "desktop.linux_atspi.snapshot_scope@1");
+    assert_eq!(
+        calls[0].1["target"],
+        json!({"snapshot_id":"generation:1","revision":1,"node_id":"n20"})
+    );
+    assert_eq!(calls[0].1["locator"]["object_path"], "/org/a11y/editor");
+    assert_eq!(calls[0].1["max_nodes"], 300);
+    assert_eq!(calls[1].1["scope_id"], "opaque-scope");
+    assert_eq!(calls[1].1["application"], json!({"bus_name":":1.2"}));
+    let unsupported = NativeBackend::new(
+        Fixture::new("desktop.macos_ax", Flavor::MacOS),
+        Flavor::MacOS,
+    );
+    assert_eq!(
+        unsupported
+            .observe_target_scope(&snapshot, &node, 300, Duration::from_secs(1))
+            .unwrap_err()
+            .code,
+        "CONTROL.SCOPE_UNSUPPORTED"
+    );
+}
+
+#[test]
+fn held_input_preserves_duration_and_uses_physical_native_operations() {
+    for (name, flavor) in [
+        ("desktop.windows_uia", Flavor::Windows),
+        ("desktop.linux_atspi", Flavor::Linux),
+        ("desktop.macos_ax", Flavor::MacOS),
+    ] {
+        let provider = Fixture::new(name, flavor);
+        let backend = NativeBackend::new(provider.clone(), flavor);
+        let node = json!({"node_id":"n", "actions":["pointer_click","pointer_gesture","drag","key_chord"],
+            "provenance":{"bus_name":":1.2","object_path":"/org/a11y/surface"}});
+        let snapshot = json!({"snapshot_id":"s", "revision":1, "nodes":[node]});
+        for (kind, native) in [
+            ("click", "pointer_gesture"),
+            ("drag", "drag"),
+            ("key", "key_chord"),
+        ] {
+            let mut value = json!({"type":kind,"hold_ms":250});
+            if kind == "drag" {
+                value["to"] =
+                    json!({"session_id":"s","resource_id":"r","observation_id":"o","node_id":"n"});
+            } else if kind == "key" {
+                value["keys"] = json!(["a"]);
+            }
+            let action: Action = serde_json::from_value(value).unwrap();
+            backend
+                .act(
+                    &snapshot,
+                    &node,
+                    &action,
+                    &Context::new(Duration::from_secs(1), true),
+                )
+                .unwrap();
+            let calls = provider.calls.lock().unwrap();
+            let (called, args) = calls.last().unwrap();
+            assert_eq!(called, &format!("{name}.{native}@1"));
+            assert_eq!(args["hold_ms"], 250);
+            assert_eq!(
+                args["target"],
+                json!({"snapshot_id":"s","revision":1,"node_id":"n"})
+            );
+        }
     }
 }
 impl Provider for Fixture {
@@ -54,6 +466,58 @@ impl Provider for Fixture {
             });
         }
         Ok(json!({"ok":true}))
+    }
+}
+
+#[test]
+fn drag_path_adapters_preserve_each_observed_anchor() {
+    for (name, flavor) in [
+        ("desktop.windows_uia", Flavor::Windows),
+        ("desktop.linux_atspi", Flavor::Linux),
+        ("desktop.macos_ax", Flavor::MacOS),
+    ] {
+        let provider = Fixture::new(name, flavor);
+        let backend = NativeBackend::new(provider.clone(), flavor);
+        let node = json!({"node_id":"n","role":"pane","name":"surface","actions":["drag"],
+            "provenance":{"bus_name":":1.2","object_path":"/surface"}});
+        let snapshot = json!({"snapshot_id":"s","revision":1,"nodes":[node]});
+        let target = json!({"session_id":"s","resource_id":"r","observation_id":"o","node_id":"n"});
+        let action = serde_json::from_value(json!({"type":"drag","to":target,
+            "fraction":{"fx":0.1,"fy":0.2},"to_fraction":{"fx":0.9,"fy":0.8},
+            "path":[{"target":target,"fraction":{"fx":0.3,"fy":0.7}},
+                    {"target":target,"fraction":{"fx":0.6,"fy":0.1}}]}))
+        .unwrap();
+        backend
+            .act(
+                &snapshot,
+                &node,
+                &action,
+                &Context::new(Duration::from_secs(1), true),
+            )
+            .unwrap();
+        let calls = provider.calls.lock().unwrap();
+        let (called, args) = calls.last().unwrap();
+        assert_eq!(called, &format!("{name}.drag@1"));
+        assert_eq!(args["path"].as_array().unwrap().len(), 2);
+        for (anchor, fraction) in args["path"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .zip([json!({"fx":0.3,"fy":0.7}), json!({"fx":0.6,"fy":0.1})])
+        {
+            assert_eq!(
+                anchor["target"],
+                json!({"snapshot_id":"s","revision":1,"node_id":"n"})
+            );
+            assert_eq!(anchor["fraction"], fraction);
+            assert_eq!(
+                anchor.get("locator").is_some(),
+                !matches!(flavor, Flavor::Windows)
+            );
+            if matches!(flavor, Flavor::Linux) {
+                assert_eq!(anchor["locator"]["object_path"], "/surface");
+            }
+        }
     }
 }
 #[test]
@@ -185,11 +649,14 @@ fn windows_gestures_views_and_rich_locators_route_to_the_driver() {
         button: Some(Button::Right),
         count: None,
         fraction: Some(Fraction { fx: 0.25, fy: 0.5 }),
+        modifiers: vec![PointerModifier::Ctrl, PointerModifier::Shift],
+        hold_ms: None,
     };
     backend.act(&snapshot, &node, &right, &context()).unwrap();
     let (called, args) = last();
     assert_eq!(called, "desktop.windows_uia.pointer_gesture@1");
     assert_eq!(args["button"], "right");
+    assert_eq!(args["modifiers"], json!(["ctrl", "shift"]));
     assert_eq!(args["fraction"], json!({"fx":0.25,"fy":0.5}));
     assert!(args.get("count").is_none());
     let scroll = Action::Scroll {
@@ -200,6 +667,7 @@ fn windows_gestures_views_and_rich_locators_route_to_the_driver() {
     backend.act(&snapshot, &node, &scroll, &context()).unwrap();
     assert_eq!(last().1["scroll"], json!({"direction":"down","notches":5}));
     let drag = Action::Drag {
+        path: Vec::new(),
         to: Target {
             session_id: "x".into(),
             resource_id: "r".into(),
@@ -209,10 +677,13 @@ fn windows_gestures_views_and_rich_locators_route_to_the_driver() {
         button: None,
         fraction: None,
         to_fraction: None,
+        modifiers: vec![PointerModifier::Alt],
+        hold_ms: None,
     };
     backend.act(&snapshot, &node, &drag, &context()).unwrap();
     let (called, args) = last();
     assert_eq!(called, "desktop.windows_uia.drag@1");
+    assert_eq!(args["modifiers"], json!(["alt"]));
     assert_eq!(
         args["to"],
         json!({"snapshot_id":"s","revision":1,"node_id":"m"})

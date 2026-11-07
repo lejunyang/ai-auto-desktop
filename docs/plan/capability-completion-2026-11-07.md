@@ -1,0 +1,89 @@
+# Computer use / browser use 能力补齐
+
+依据：[2026-11-07 实测审计](../research/computer-browser-capability-audit-2026-11-07.md)。
+目标是修复真实应用中已发现的阻断，并补齐审计列出的动作、观察恢复和平台覆盖；不能用 fixture 成功代替实际应用成功。
+本文件记录完整待办与验收证据，未完成项不随某一轮提交结束而取消。
+
+## 不变量
+
+- 所有输入仍绑定已观察的节点并在派发前复核；键盘验证焦点，指针验证命中，拖拽验证两端。
+- MCP 不提供裸屏幕坐标；视觉操作采用已观察 surface 内的比例位置。
+- 真实桌面输入互斥；GUI 与浏览器效果测试串行调度，隔离浏览器只能按可信执行环境隔离租约。
+- 系统权限边界不得通过绕过授权解决。UAC/安全桌面、TCC、Wayland 授权应明确支持条件及交接方式。
+- 每项独立功能编译、相关测试与目标环境效果通过后立即本地提交。
+
+## 实施与验收矩阵
+
+| 项目 | 完成条件 | 状态与证据 |
+| --- | --- | --- |
+| 原生观察恢复 | 过滤规范 AT-SPI null 引用；输出具体截断原因；从已观察窗口/容器抓完整子树，动作复核也限定同一 scope；Dolphin/Electron 实测恢复合法操作 | null/截断诊断、局部观察已提交；Code/Codex 局部定位及刷新、Qt scoped click 通过。`e5f4f38` 以本应用焦点事件补充真实编辑框，Dolphin F2→中文重命名→磁盘回读通过；虚拟 table 父链不完整的 scope 仍拒绝。VS Code 中文编辑/保存经 DOM、磁盘和截图回读通过；精确 Close 指针目标仍会拒绝，现已实测规范 invoke 与显式窗口 surface 的恢复路径，见下两项 |
+| 原生规范动作 | 区分本地化名称与协议动作名；fresh 复核绑定具体动作，不能猜测 index；保留 GTK 指定动作语义 | `039352f` 已提交。改用 GetName 与精确 NActions 属性，通用 invoke 要求唯一 click/press/activate；派发前复核名称及槽位。Code 空本地化名的 press 实际关闭 Welcome，Qt Press 实际改变标签，2/2；GTK 指定 click/activate 的大小写及多动作共存回归通过。原生精确指针命中问题未被绕过 |
+| 焦点与 QML 可见性 | KWrite 已聚焦而 GrabFocus=false 时仍可安全验证并输入；设置搜索框在可见性元数据不一致时有受控输入路径；编辑保存与设置搜索实际回读 | 已提交 `f2282a5`；KWrite 中文编辑保存后磁盘回读一致，设置搜索“快捷键”截图与值回读一致，并打开匹配页面 |
+| 同进程窗口焦点 | 键盘及带修饰键指针绑定 fresh 观察中的具体窗口；不能把另一同 PID 窗口当作目标，失焦及移动后释放自有输入 | `0af98e8`、测试 `b4d47a6` 已提交；私有 Xvfb 确认 PID-only 缺口并验证严格拒绝/释放，本机 Qt 双窗口真实事件计数及 Dolphin 中文重命名复测通过。严格窗口绑定后的独立 VS Code 中文编辑保存也已完成 |
+| 原生粘贴与 IME | KDE 原生 paste 实际输入成功并恢复原剪贴板；明确输入法条件，补充可工作的中文输入路径与诊断 | 已提交 `8421506`、`51a72ca`、`aa50d62`；Qt/KWrite/QML/VS Code 中文粘贴与保存通过，250 ms 请求静默/总 2 秒有界服务及后续 owner 保留由私有协议测试验证。`213fa79` 增加显式 keys：本机 Fcitx5 微软双拼 `nihk`→“你好”候选→space→Qt/AT-SPI 提交回读通过，默认 Unicode 组合拒绝保持。其他 IME、候选翻页与复杂组合待验收 |
+| 浏览器局部观察 | 范围外无关 DOM 更新不误判 stale；范围内改动、身份替换、相关布局变化仍拒绝；大型页面可局部操作 | 已提交 `e8b8959`、`368177c`；Chromium 实测外部 ticker、相关 stale 拒绝、无 HTML id 的 scope_target、shadow root、scope token 刷新及 act.verify |
+| 手势表达 | 同元素不同位置拖动、修饰键点击/拖动、有界按住和路径、跨资源拖拽具有完整端点复核与释放保证；真实效果验收 | 浏览器同 surface drag `d350c7b`、原生同元素 `9274fee`、三端与浏览器修饰键 `e46829b`、有界按住 `d314931` 已提交；Qt/Chromium 与 Dolphin 选择手势实测通过。路径接口及 Windows/macOS 实现 `4b10562` 已提交，目标 cfg 检查通过，真机效果待验；浏览器路径 `846b6ba` 已用 Canvas/closed-shadow 折线 PNG 与事件回读验收。Linux 同 surface 路径 `fa4f0d0` 已提交：54 项单测、Xvfb 十项协议/实际轨迹检查与本机 Qt 七项公开入口检查通过，窄 scope 外 sibling overlay 拒绝、几何变化/取消均实际释放。Linux 跨资源 `5dde3ad` 已通过双进程 Qt 数据传递与取消/移动/悬停覆盖检查（4/4），私有 Xvfb 15/15；Windows/macOS/browser 跨资源仍未启用；Linux 会话取消已通过 Qt 实际释放与 Xvfb 剪贴板恢复验证 |
+| 视觉与自绘恢复 | Canvas/自绘/closed shadow 等缺乏语义控件时，通过可校验 surface 完成视觉操作；保留保护区域与命中限制 | Canvas trusted click/hover/scroll/drag 已提交 `d350c7b`，像素与可信事件回读通过；原生非 Focusable 指针 `31cf35a` 已在 Dolphin 验证，显式激活 `76cd6e1` 通过。closed shadow host 的视觉动作与保护 `3c7c2fc` 已通过 Chromium 27/27。最终 Code 产物的显式完整窗口 scope→公开 PNG 目视→fresh frame 比例点击实际关闭 Welcome，独立 CDP 和截图回读一致；不将 dialog scope 的只读祖先自动升级为输入目标。closed shadow 内部语义节点仍不公开，其他原生自绘应用需逐项验收 |
+| 局部截图的窗口保护 | 截图前私下检查完整所属窗口；窄 scope 不能遗漏覆盖截图区域的兄弟控件；保留调用者原 scope | `2e00547` 已提交。Qt 公开入口 4/4：无遮挡及非重叠密码框时 PNG 独立像素回读一致；角落 disabled sibling 和密码框覆盖均拒绝且无 PNG。保护字段误报隐藏、缺少几何、完整窗口截断、身份变化与取消由离线负例覆盖。私有检查不发布节点、不扩大输入范围，也不要求截图目标支持 drag |
+| 保密输入 | 显式授权的 protected 输入与保密读取分离；三端/browser 策略一致，日志与录制不泄漏值，合成密码框验收 | `008974d` 已提交即时 secret_ref 授权路径；Qt 密码数字角色、替换/清空与独立状态回读通过，Chromium 21 项含敏感 DOM 身份恢复通过。普通输入不能绕过，持久化入口拒绝专用动作，子进程不继承绑定环境变量。Windows/macOS 实际效果 **[待真机验收]**；系统凭据库与保密工作流未实现 |
+| 浏览器键盘与浏览器自身界面 | 页面编辑器快捷键与浏览器级动作分开；补明确授权的浏览器内部/本地页面操作路径，并明确非 Chromium 覆盖 | 页面快捷键隔离 `1a3bb77` 已提交；有界面 Chromium 18 组 Ctrl 组合只送页面、不误触浏览器 UI 的验收及异常 keyUp 通过。内部/本地页面授权 `527f5e4`、`ac4963b` 已提交，本地 HTML 点击、越界拒绝及 Chromium Settings 搜索输入回读通过。执行中祖先 URL/loader 复核与 history 授权 `d3f72eb` 已提交，3 项专项、完整 Chromium 34/34 和浏览器单测 21/21；Firefox 独立首版见下一行，尚无 Chromium 参数与动作的完整覆盖 |
+| Firefox BiDi | 独立协议与公开 provider，保留观察/fresh/命中/祖先授权/保护字段不变量；通过实际编辑、点击、截图闭环 | 传输 `61ff485`、provider `8c33a9d`、分发测试 `1dd14ca` 已提交；导航/标签页 `b3e29aa`、同源历史 `3a5d0a6` 已提交。有界 key/click 长按补齐后公开 CLI 累计 25 组，含中文 DOM fill、可信全选/按键/指针/滚轮、scope、PNG、closed password reveal 持续保护、截图恢复与取消释放，导航中途源文档变化拒绝与长 URL 历史。子 frame 只读；仅显式 keys 文本，单键及 Ctrl+A；双击因协议批次计数与逐次 fresh 约束仍拒绝，指针修饰键、跨域/不透明历史、drag、secret/upload/dialog 等待实现。有界面及 Windows/macOS Firefox **[待真机验收]** |
+| 输入租约 | 保留共享前台互斥，独立 headless 不受无关桌面会话阻断；占用可诊断、可正常释放 | `2fe2395`、`562dcf5`、`6966e4c` 已提交。Chromium 可信 headless 按 browser UUID 隔离，同实例仍互斥，未知/有界面实例仍占桌面；Chromium 19 项及保存工作流在桌面租约被占用时的实际执行通过。Firefox 首版输入保守占桌面，独立 headless 租约待实现 |
+| macOS 拖拽 | 两端使用同一 fresh snapshot 复核；跨元素实际拖动验证 | 修复已提交 `8f92886`，25 项宿主逻辑测试及 clippy 通过；**[待验证]** macOS 真机 AX/TCC 与实际拖拽效果 |
+| 跨资源拖拽准入 | 保留两个资源的有效观察，分别检查授权、范围与能力，获取两端输入租约；后端逐端 fresh 后执行 | `c343f69` 提供内部 opt-in/hook，保留每资源最新一份、每 provider 最多 16 份且受原 TTL 限制，输入尝试后整组失效。新增 9 项 fake 测试及 Session/views/native adapters 共 45/45 通过。`0b2ea22` 补充显式声明 `drag_between` 的原生 provider 接线，两端 snapshot/revision/locator 分别传递，9 项 adapter 测试及 clippy 通过。Linux 后端 `5dde3ad` 已启用，保留每已解析应用最新观察（16 份/300 秒），每阶段双端 fresh、串行调用门禁与整组失效。双进程 Qt 精确 MIME 传递、可见结果及取消/移动/悬停覆盖 4/4；私有 Xvfb 15/15（分发测试 `c4af0d4`）。仅内部直线，最大轴距离 4096 像素，外部窗口/未知装饰保守拒绝；Windows/macOS/browser 未启用 |
+| Qt/X11 坐标校准 | 每窗口逻辑/物理坐标绑定，准确身份与全应用唯一性，不靠全局缩放或标题模糊匹配；真实应用回归 | `597656c`、测试 `4c3e955` 已提交。Qt 1/1.5/2 倍应用缩放下真实点击、F2 和 PNG；歧义及窄 scope 拒绝、非 X11 拒绝，共 5 组通过。规范标题转换 8 项通过；Dolphin 中文目录重命名、KWrite 中文文件全选/粘贴/保存，经磁盘回读一致。混合 DPI 多显示器、旋转、热插拔及非 Qt 缩放仍待验证 |
+| 系统覆盖 | GNOME X11 / Wayland 路线、Windows/macOS、DPI/IME/权限弹窗的实现与实际验收矩阵；不将 KDE 成功外推 | 用户确认仅有本机 Linux/KDE。`bea9187` 移除 X11 的 KDE 品牌限制，Xvfb 正反例及 KDE 新产物点击/截图通过；GNOME/XFCE 真机 **[待验收]**。Windows/macOS 实际效果 **[待真机验收]**。Wayland 输入后端 **[待实现、待真机验收]**，路线及证据见平台矩阵 |
+| 配套产物一致性 | 发布/启动检测 helper 协议与能力，避免新 CLI 静默搭配旧 helper；构建和真实入口验证 | XTest 握手 `4d20ad6` 已提交；新 helper 正常提供动作，旧 helper 返回 `DRIVER.HELPER_INCOMPATIBLE` 并移除合成输入能力，语义 invoke 仍通过真实标签变化验证 |
+
+## 当前协作分工
+
+- 原生后端：null/截断诊断、scoped capture、焦点与可见性恢复。
+- 浏览器：scoped DOM、独立执行环境租约及浏览器特有恢复路径。
+- X11 helper：paste 根因、无内容诊断与修复。
+- 主任务：统一 API / MCP / CLI 接线、跨后端手势与策略、串行真机验收、逐项提交和证据维护。
+
+本机验收使用专用临时文件和测试窗口；保存失败必须报告失败，不能以动作返回成功代替文件内容回读。
+原始 GUI 记录保存在忽略目录 `artifacts/capability-completion/`，提交中只保留脱敏证据、测试及实现。
+
+## 验证记录与剩余失败
+
+- `null-children-summary.json`：Dolphin 476 节点完整，三个 Konsole 资源完整；Code/Codex 的深度 32 截断仍如实报告。
+- `native-scope/summary.json`：Code 1332 节点缩小为 5 节点、Codex 928 缩小为 6 节点；两者局部 find/token refresh 成功。该脚本因 hover 未通过而退出失败，不能记为全流程通过。
+- `native-scope/effect-summary.json`：专用 Qt 按钮的局部观察→点击→独立状态回读通过。
+- `focus/apps-summary.json`、`focus/settings-summary.json`：重新构建 CLI，分别使用专用 KWrite 文件和系统设置窗口；全选、中文粘贴、保存、搜索与分类导航通过。测试窗口已关闭，没有修改设置值。
+- `pointer/summary.json`、`pointer/fixture-summary.json`：修复后 Dolphin 的 EWMH 显式 activate 达到 active=true；可聚焦按钮及不可聚焦容器 hover 均用真实指针位置回读验证，键盘焦点保持。
+- `dolphin/gestures-summary.json`：Ctrl 多选、普通单选恢复、同 surface 框选通过；随后 F2 重命名未找到 AX 编辑框，因此脚本整体失败，不算重命名成功。`rename-missing-editor-main.png` 确认界面已经出现内联编辑框；仍需补观察路径。
+- `helper-compatibility/summary.json`：同一 Qt 测试窗口比较旧新 XTest helper；旧版仅保留语义动作，invoke 后标签变化通过，未发送不支持的合成输入。
+- `secret-reproducible/summary.json`：`tests/linux/verify-secret-input.ps1` 从源码构建 Qt 密码测试窗口，默认拒绝、普通 fill 拒绝、专用替换和清空的独立标签回读、值脱敏和密码框截图拒绝全部通过。Qt 5 的文字角色为 text、数字角色为 PasswordText，已修正为先检查数字角色。
+- `browser-secret-targeted.log`、`browser-secret-full.log`：受保护输入实际替换、input/change 事件、默认拒绝、重新观察/重连后敏感身份保持、子 frame 元素删除/重挂/移除的截图保护及恢复通过；完整 Chromium 21/21。随后新增受保护节点不导入可能来自值的 AX name，针对性单测通过。
+- 浏览器原始日志位于 `artifacts/capability-audit-2026-11-07/`；页面键另有 `browser-page-keys-headed.log`、`browser-page-key-timeout.log`、`browser-page-keys-full.log`。有界面用例用 AT-SPI 独立回读焦点和窗口集合，不只验证 DOM 事件。
+- `dolphin/rename-component-probe.json`：重命名状态对已观察 cell 及其祖先，在文件图标/文字区域做只读 GetAccessibleAtPoint；仅返回现有 table 或 AT-SPI null，没有恢复出编辑控件，重命名仍未完成。
+- `dolphin-focused-event/focused-event-summary.json`：仅订阅本次启动 Dolphin 的焦点事件，取得整树遗漏的真实 text/EditableText 控件；独立核对 PID、GetApplication、父链及尺寸通过。此时仅证明恢复路线，尚未算作重命名成功。
+- `dolphin-focus-recovery/summary.json`：恢复实现后的正式 CLI 实测发现 focused/editable Text，补入的一个父链 context 保持只读；fill 中文文件名再 Enter，磁盘新名存在、旧名消失且内容一致。另一个 table scope 因虚拟父链断开安全拒绝，不能称所有 Dolphin scope 都可用。
+- `window-focus-kde/summary.json`：Qt 双窗口故意保留主节点过期的 Focused 位；真实焦点在同 PID 副窗口时拒绝输入，两个窗口独立计数均为零，正确副窗口及激活后的主窗口各收到一次按下和释放。`window-focus-dolphin/summary.json`：严格窗口绑定后的中文重命名及磁盘回读仍通过。私有 Xvfb 协议测试另验证 type/key/paste/修饰键点击的同 PID 错窗拒绝、子窗口焦点允许、hold 途中失焦/移动的释放与严格几何匹配。
+- `hold-kde/summary.json`：`verify-bounded-hold.ps1` 请求 200 ms，Qt 应用独立记录 F2 按下至释放 205 ms、按钮 201 ms、拖拽第一次移动 205 ms/释放 405 ms。此前可打印字母用例未收到计时状态，不能据此宣称 IME 长按已通过；改用 F2 隔离输入法影响。
+- `hold-helpers/validation.json`：私有 Xvfb 独立回读键鼠状态与时序；长按、截止时间、helper 终止、焦点/遮挡变化后的释放，以及不接管外部已按住的键鼠通过。此批仅证明 helper 终止，正式 `control_cancel` 由下列后续用例验证。
+- `native-cancel-kde/summary.json`：Qt 独立回报实际 down 后，经正式控制入口取消 5 秒 key/click/drag 长按，最新一次取消至 up 分别为 13/6/5 ms；后续普通输入成功。`verify-x11-cancel.ps1` 另验证长文本停止剩余字符、全局测试组合键释放、粘贴预读取消保留原 owner、已派发粘贴取消后独立读取原剪贴板一致。真实不读 stdin 的子进程与 4 MiB 测试载荷验证非阻塞取消；强杀缺少派发证据按 unknown。同步 D-Bus 调用仍只在调用前后检查取消，不能称立即中断系统调用。
+- `browser-hold-targeted.log`、`browser-hold-full.log`：真实 Chromium 长按、拖拽起点停留、预算不足、焦点变化、遮挡和会话取消后的释放通过，功能提交前完整回归 24/24；日志同样位于 `artifacts/capability-audit-2026-11-07/`。
+- `browser-closed-shadow-targeted.log`、`browser-closed-shadow-full.log`：closed host 默认 trusted click 后独立 PNG 像素回读、局部 drag/wheel、遮挡和 stale 拒绝通过；双密码字段 reveal 后移到 light DOM 仍脱敏并拒绝截图，移除后恢复。专项 2/2，完整 27/27，日志位于 `artifacts/capability-audit-2026-11-07/`。
+- `browser-access-targeted.log`：服务器授权目录内本地 HTML 实际点击、未授权文件与内部来源拒绝、外部导航后重新检查通过；授权 `chrome://version` 可观察，`chrome://settings` 展开真实搜索 UI 后输入并独立遍历 DOM 回读通过。专项 2/2；祖先 frame 门禁单测、会话 19/19、CLI 6/6 及 control/CLI/MCP all-targets clippy 通过。`browser-access-capture.log` 与 `chromium-settings-search.png` 补验公开截图内存在输入值；截图仍在加载，未宣称搜索结果完成。上述文件位于 `artifacts/capability-completion/`。
+- `browser-drag-paths-targeted.log`、`browser-drag-paths-full.log`：Canvas 与 closed-shadow 的折线由公开 PNG 独立回读，可信事件、按住/段间时序和遮挡/变化/超时/取消后的释放通过。专项 2/2，提交时完整 31/31；不支持 HTML5 自定义路径或跨资源路径。
+- `browser-inflight-targeted.log`、`browser-inflight-full.log`：当前 URL 与祖先授权失效时，8 条键鼠/逐字符输入链停止并释放，同一 loader 的独立事件日志证明后续输入未继续；history 未授权文件拒绝、about:blank/data/长 HTTP 正例通过。专项 3/3、完整 34/34、单测 21/21 及 clippy 通过。本机 Chromium 跨文件路径 pushState 返回 SecurityError，fragment 更新正常；文件授权失效用移除自有临时文件模拟，不宣称已复现浏览器绕过。准备阶段取消使用确定性边界单测；异步 scroll 事件不能精确代表取消发生在某条 CDP 查询内。两组浏览器日志均位于 `artifacts/capability-audit-2026-11-07/`。
+- `firefox-bidi/provider/results.json`、`control.ndjson`、`save.png`、`after-removal.png`：`tests/browser/firefox_bidi_e2e.mjs` 使用独立 profile 和公开 CLI，13 组检查通过，实际值/选区/可信事件由页面独立 HTTP 状态回读；截图检查通过，未以成功返回代替效果。`firefox-bidi/transport-test.log` 另验证真实单 session 竞争、取消、超时 end 后可重试及重建 session。provider 单测 2/2、CLI 7/7 及 control/CLI/BiDi all-targets clippy 通过。BiDi 子 frame 写入、双击等缺项明确拒绝，不能将首版算作 Chromium 34 项等价覆盖；日志均在 `artifacts/capability-completion/`。
+- `firefox-bidi/navigation/results.json`、`control.ndjson`：公开 CLI 累计 18/18；新 5 组验证导航/刷新产生新文档 token、非法目的地和非 body 锚点拒绝、新标签页加载与前后台可见性、关闭后资源消失，以及 create 触发源 body 替换后停止 navigate、报告新空白页并可重新观察关闭。provider 单测与 control/CLI/BiDi all-targets clippy 通过；双击未放开，历史另行补齐，不代表完整 BiDi 等价覆盖。
+- `firefox-bidi/history/results.json`、`control.ndjson`：公开 CLI 累计 21/21；新增同源 back/forward 由目的文档独立 HTTP 回报确认，页面建立的超过 2048 字节 URL 可经历史返回，A→跨域→A 的边界拒绝且不会跳到更早的 A。按 Navigation API 的连续同源条目 id/key/URL 进行 fresh 比较，只支持可证明的 HTTP(S) 目的条目。provider 单测 2/2、CLI build 与 control/CLI/BiDi all-targets clippy 通过。
+- `firefox-bidi/hold/results.json`、`control.ndjson`：公开 CLI 累计 25/25；新增按键/单击请求 200 ms 的应用 down/up 计时检查、预算不足无 down、5 秒 hold 中失焦/遮挡/cancel 后提前释放和后续输入。hold 范围 1..5000 ms，逐段复核授权、身份、焦点或原落点，不提供自动重复。provider 单测 2/2、CLI build 与 control/CLI/BiDi all-targets clippy 通过。
+- `electron-native/summary.json`：独立 profile 的 VS Code，414 节点截断观察缩小到 31 节点完整编辑框；点击被 `DRIVER.POINT_NOT_PROVEN` 拒绝，focus/key/paste 返回已派发但实际文本不符，未继续保存，不算编辑成功。初始树含 Welcome 模态界面，随后 X11 检查发现同 PID 另一活动原生对话框；需要先处理启动界面，并用同进程双窗口 fixture 独立验证键盘焦点边界。仅凭动作之后的活动窗口不能断定此前每次输入落点。
+- `electron-native-v2/summary.json`：严格窗口绑定后的复测，通过 Welcome 内已观察 Close 按钮的 focus→Enter 关闭活动窗口启动界面，再将编辑框缩小到 31 节点。Ctrl+A 与 paste 返回派发、剪贴板消费和恢复成功，但 AT-SPI 文本回读仍为原文加换行，未保存，仍不算编辑闭环通过。Welcome 的指针点击也仍被命中检查拒绝；需要独立核对 Electron 文本模型、焦点和选区。测试自有 profile 进程已关闭。
+- `electron-native-v4/summary.json`：只读 CDP 确认 Ctrl+A 的实际选区，重复 focus 后选区保持；旧 helper 粘贴后 renderer 的 Runtime.evaluate 超过 15 秒，而 browser websocket 仍响应。该证据区分渲染进程无响应和 CDP 连接故障，不将重复 focus 误认作本次根因。
+- `paste-sequence-fixed/validation.json`、`code-paste-distributed/summary.json`：首次文字后继续有界服务请求，私有 Xvfb 三格式延迟、后续复制保留、持续请求期限及取消回归通过。分发脚本通过原生入口完成 VS Code Ctrl+A→中文 paste→Ctrl+S，DOM、磁盘及 `independent-editor.png` 一致。真实 Code 是 1 次文字与 18 次元数据请求，不等于私有三格式测试；250 ms 静默/总 2 秒是策略上限，不承诺任意延迟客户端。原生指针命中问题仍独立保留。
+- `physical-keys/qt-shuangpin/summary.json`、`candidate.png`：本机当前输入法列表为微软双拼/美式键盘，测试没有修改列表。默认 Unicode 输入拒绝后，显式 keys 产生真实 preedit 和“你好”候选，space 后应用独立回报一次 commit，fresh AT-SPI 一致；原方法恢复，自有窗口退出。私有 Xvfb 10 组验证当前键位与 Caps、无映射字符不部分派发、缺窗口锚点及同 PID 错窗口拒绝、外部持键不抢占，以及取消/焦点/锁定状态/键位变化后的停止和释放。
+- `linux-cross-drag/verification.json`、`qt-v3/summary.json`、`qt-v3/native-cross.ndjson`：60 项 AT-SPI 宿主测试与 clippy 通过，私有 Xvfb 15 项含真实双 PID 轨迹、可信/伪造 WM frame、单像素外部窗口及校验等待时新外部持键。公开 CLI 两独立 Qt 进程的精确 MIME 数据与可见接收结果、取消、窗口移动、悬停覆盖四项通过；成功约 4840 ms，取消/移动分别 45/77 ms 内返回并已释放，悬停覆盖零 down。真实 fixture 无窗口装饰，Xvfb 模拟可信 WM 不代表任意 WM 或文件管理器拖文件任务已验收。
+- `qt-scale-final/summary.json` 与 3 张 PNG：同一源码 CLI/helper 的公开入口 5/5，实际标签/F2 文本和像素尺寸回读；1.5/2 倍截图已目视核对。`dpi-title-tests` 的私有 Xvfb 8/8 拒绝/解码检查，`dpi-dolphin-chinese-title/summary.json` 与 `dpi-kwrite-regression/summary.json` 分别确认中文窗口身份下的重命名与编辑保存。`aad-linux` 标题单测、AT-SPI 60/60（含同期跨资源测试）及两 crate all-targets clippy 通过。仅改自建 Qt 进程的 QT_SCALE_FACTOR，没有修改系统显示设置；混合 DPI 多屏待真机。
+- `scoped-capture/summary.json`：Qt 独立窗口的 4/4 公开入口检查通过。无遮挡及非重叠密码框两张 PNG 都为 240×140，独立 QImage 回读绿色像素占 98.699%，并已目视核对；两种角落覆盖均在读取像素前拒绝。截图后仍能用原局部观察 find，私有完整窗口不成为新的授权范围。离线测试另检查保护字段误报隐藏、缺少 bounds、完整窗口截断及取消后的下一次调用。
+- `electron-canonical-invoke-v2/summary.json`：Code 1.131.0 和 Qt 5 的公开 invoke 2/2。独立 GetName 读取 Code 的 press/showContextMenu，GetActions 的本地化标签均为空；公开 invoke 关闭 Welcome，独立 CDP 回读消失，前后 PNG 已目视核对。Qt 的 Press/SetFocus 中选择 Press 后标签变为 invoked。67 项 AT-SPI 单测、1 项 provider 集成和精确 NActions 属性的私有 D-Bus 协议测试通过；该协议测试捕获了依赖库自动生成 Nactions 大小写错误的问题。
+- `electron-visual-surface-final/summary.json`：最终 binary 包含规范动作及局部截图修复，独立 Code profile 的完整 frame scope 返回 1200×800 公开 PNG；目视确认 Close 后，以同一 fresh frame 的 fx=0.875/fy=0.18125 点击，独立 CDP 确认 Welcome 消失，前后 PNG 均已查看。这是明确选择窗口 surface 后的视觉操作，不是精确按钮的命中修复，不能自动扩大调用者 scope。
+- `native-path-final/summary.json`：完整窗口检查提取后的真实 Qt 路径回归 7/7，覆盖普通/局部路径、无效参数零 down、窗口移动、scope 外遮挡和取消后的实际 up；取消至释放本次 7 ms。统一原生适配与定位 12/12 通过；最终 aad-atspi/control/cli/mcp 四 crate 的 all-targets clippy 通过。
+- Windows 修饰键代码已用 pin 工具链实际 `x86_64-pc-windows-gnu` cfg 做 check/clippy；这只证明编译，不能当成 Windows SendInput 效果验收。**[待验证]** Windows 交互桌面、相应权限与 DPI/IME 测试环境。
+
+各功能的测试数字对应其提交时点；后续共享模型变化后仍需相应回归。未验证的平台与场景保持待办，不从 KDE/Chromium 的成功外推。

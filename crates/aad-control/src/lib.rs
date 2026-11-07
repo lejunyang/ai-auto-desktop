@@ -2,15 +2,19 @@
 //! No network listener: remote sessions inherit an authenticated SSH stdio pipe.
 
 pub mod browser;
+pub mod browser_access;
+pub mod browser_bidi;
 pub mod launch;
 pub mod lease;
 pub mod model;
 pub mod native;
 pub mod qr;
 pub mod recording;
+pub mod secrets;
 pub mod steps;
 pub mod transport;
 pub use model::*;
+pub use secrets::{valid_secret_ref, SecretBindings};
 
 use aad_core::AutomationError;
 use serde_json::{json, Value};
@@ -41,12 +45,58 @@ pub struct BackendResource {
     pub selector: Value,
 }
 
+/// One independently observed endpoint passed to a cross-resource drag.
+/// Backends must freshly revalidate both endpoints before dispatching input.
+pub struct DragEndpoint<'a> {
+    pub snapshot: &'a Value,
+    pub node: &'a Value,
+}
+
+const MAX_RESOURCE_OBSERVATIONS: usize = 16;
+
 /// Implementations retain their native stale-target checks. The facade never
 /// turns an unsupported native operation into a coordinate or script fallback.
 pub trait Backend: Send + Sync {
     fn close(&self) {}
     fn name(&self) -> &str;
+    /// Replace an observed protected field from a server-owned binding. A
+    /// backend must revalidate protection, editability and target identity.
+    /// This is separate from ordinary text input and never uses the clipboard.
+    fn secret_input(
+        &self,
+        _snapshot: &Value,
+        _node: &Value,
+        _text: &str,
+        _context: &Context,
+    ) -> Result<Value> {
+        Err(error(
+            "CONTROL.ACTION_UNSUPPORTED",
+            "secret input is unavailable",
+        ))
+    }
     fn capabilities(&self) -> Vec<String>;
+    /// Opt in only when native snapshots can remain valid independently for
+    /// multiple resources and `drag_between` revalidates both endpoints. This
+    /// also enables bounded, per-resource observation retention in the session.
+    fn supports_cross_resource_drag(&self) -> bool {
+        false
+    }
+    /// A single gesture between two observations of this provider. No default
+    /// fallback is safe: the usual `act` method only sees the source snapshot.
+    /// Implementations must prove both native identities and input-desktop
+    /// ownership afresh, honor cancellation/deadlines, and release owned input.
+    fn drag_between(
+        &self,
+        _source: DragEndpoint<'_>,
+        _destination: DragEndpoint<'_>,
+        _action: &Action,
+        _context: &Context,
+    ) -> Result<Value> {
+        Err(error(
+            "CONTROL.ACTION_UNSUPPORTED",
+            "this provider cannot drag between resources",
+        ))
+    }
     fn node_capabilities(&self, node: &Value) -> Vec<String> {
         let supported = self.capabilities();
         match node["actions"].as_array() {
@@ -59,6 +109,11 @@ pub trait Backend: Send + Sync {
     }
     fn lease_key(&self, _snapshot: &Value) -> Option<String> {
         None
+    }
+    /// All cooperating input resources needed by this operation. A browser
+    /// always owns its instance, and may also need the physical desktop.
+    fn lease_keys(&self, snapshot: &Value) -> Result<Vec<String>> {
+        Ok(self.lease_key(snapshot).into_iter().collect())
     }
     /// Read-only operations beyond observe and find this provider offers,
     /// such as `capture`; listed by `capabilities` so none is guessed at.
@@ -140,6 +195,21 @@ pub trait Backend: Send + Sync {
             "provider does not support complete scoped observation",
         ))
     }
+    /// Recapture the subtree of an observed node. Implementations must verify
+    /// the root's native identity and retain that boundary for later input
+    /// revalidation; filtering an incomplete capture is not sufficient.
+    fn observe_target_scope(
+        &self,
+        _snapshot: &Value,
+        _node: &Value,
+        _max_nodes: usize,
+        _timeout: Duration,
+    ) -> Result<Value> {
+        Err(error(
+            "CONTROL.SCOPE_UNSUPPORTED",
+            "provider does not support observation rooted at an observed node",
+        ))
+    }
     /// Shape a retained snapshot for the caller. `None` uses the portable
     /// outline; a provider answers with `nodes` keyed by `node_id`, or `regions`.
     fn view(&self, _snapshot: &Value, _view: &View, _timeout: Duration) -> Result<Option<Value>> {
@@ -169,6 +239,10 @@ pub trait Backend: Send + Sync {
 pub struct Policy {
     /// Input is denied unless the trusted server operator explicitly grants it.
     pub allow_input: bool,
+    /// A separate server grant for writing protected fields using bindings.
+    pub allow_secret_input: bool,
+    /// Values stay server-side; protocol clients can only name a binding.
+    pub secret_bindings: SecretBindings,
     /// Empty means all installed providers in this OS account, never arbitrary plugins.
     pub providers: BTreeSet<String>,
     /// Optional server-owned allowlist; a client cannot extend it.
@@ -188,6 +262,8 @@ pub struct Policy {
     pub upload_roots: Vec<std::path::PathBuf>,
     /// Whether browser_storage may show cookie values. Off: names and flags only.
     pub allow_cookie_values: bool,
+    /// Operator grants for local files and exact browser internal origins.
+    pub browser_access: browser_access::BrowserAccess,
 }
 
 #[derive(Clone)]
@@ -212,6 +288,7 @@ struct State {
 
 pub struct Context {
     effect_gate: Mutex<()>,
+    cancellation: aad_runtime::CancellationToken,
     // 0=pending, 1=may have committed, 2=cancelled before, 3=cancelled after.
     phase: AtomicU8,
     browser_publication: AtomicU8,
@@ -268,6 +345,7 @@ impl Context {
     pub fn new(timeout: Duration, mutating: bool) -> Self {
         Self {
             effect_gate: Mutex::new(()),
+            cancellation: aad_runtime::CancellationToken::new(),
             browser_publication: AtomicU8::new(0),
             browser_cancelled: Arc::new(AtomicBool::new(false)),
             phase: AtomicU8::new(0),
@@ -302,6 +380,9 @@ impl Context {
     }
 
     pub fn cancel(&self) {
+        // Native release watchdogs must see cancellation even if a slow effect
+        // still owns the publication gate. The token never grants dispatch.
+        self.cancellation.cancel();
         let _effect = self.effect_gate.lock().unwrap();
         let mut phase = self.phase.load(Ordering::SeqCst);
         loop {
@@ -318,6 +399,9 @@ impl Context {
                 Err(actual) => phase = actual,
             }
         }
+    }
+    pub fn cancellation(&self) -> &aad_runtime::CancellationToken {
+        &self.cancellation
     }
     /// Atomically cross the may-commit boundary immediately before input. A
     /// cancellation that wins first prevents dispatch; later interruption is unknown.
@@ -342,7 +426,7 @@ impl Context {
             );
         }
         let phase = self.phase.load(Ordering::SeqCst);
-        let code = if matches!(phase, 2 | 3) {
+        let code = if self.cancellation.is_cancelled() || matches!(phase, 2 | 3) {
             Some("CONTROL.CANCELLED")
         } else if Instant::now() >= self.deadline {
             Some("CONTROL.TIMEOUT")
@@ -481,12 +565,35 @@ impl Session {
         let backends = natives.into_iter().map(|b| b as Arc<dyn Backend>).collect();
         let mut session = Self::new(backends, policy).with_providers(providers);
         // Always present, so a browser started later can be attached.
-        let browser = Arc::new(browser::BrowserBackend::new(browser_port.unwrap_or(0)));
+        let browser = Arc::new(browser::BrowserBackend::with_access(
+            browser_port.unwrap_or(0),
+            session.policy.browser_access.clone(),
+        ));
         session
             .backends
             .insert(browser::PROVIDER.into(), browser.clone());
         session.browser = Some(browser);
         session.failures = failures;
+        session
+    }
+
+    /// Explicit Firefox BiDi attachment is separate from Chromium's CDP port.
+    /// Its unsupported capabilities never fall back to another provider.
+    pub fn native_with_browsers(
+        policy: Policy,
+        browser_port: Option<u16>,
+        bidi_port: Option<u16>,
+    ) -> Self {
+        let mut session = Self::native_with_browser(policy, browser_port);
+        if let Some(port) = bidi_port {
+            session.backends.insert(
+                browser_bidi::PROVIDER.into(),
+                Arc::new(browser_bidi::FirefoxBackend::new(
+                    port,
+                    session.policy.browser_access.clone(),
+                )),
+            );
+        }
         session
     }
 
@@ -679,7 +786,10 @@ impl Session {
     }
 
     pub fn with_providers(mut self, providers: Vec<Arc<dyn aad_runtime::Provider>>) -> Self {
-        self.providers = providers;
+        self.providers = providers
+            .into_iter()
+            .map(native::workflow_provider)
+            .collect();
         self
     }
     pub fn providers(&self) -> &[Arc<dyn aad_runtime::Provider>] {
@@ -787,6 +897,12 @@ impl Session {
     }
 
     pub fn input_lease(&self, key: &str) -> Result<Arc<lease::InputLease>> {
+        Ok(self.input_leases(&[key.to_string()])?.pop().unwrap())
+    }
+
+    /// Acquire a sorted set atomically with respect to this session. Failed
+    /// acquisition drops only this call's new leases; existing ones survive.
+    pub fn input_leases(&self, keys: &[String]) -> Result<Vec<Arc<lease::InputLease>>> {
         if self.closed.load(Ordering::SeqCst) || self.created.elapsed() >= self.lifetime {
             return Err(error(
                 "CONTROL.SESSION_CLOSED",
@@ -797,12 +913,23 @@ impl Session {
         if self.closed.load(Ordering::SeqCst) {
             return Err(error("CONTROL.SESSION_CLOSED", "session is closed"));
         }
-        if let Some(lease) = leases.get(key) {
-            return Ok(lease.clone());
+        let ordered: BTreeSet<&str> = keys.iter().map(String::as_str).collect();
+        let mut acquired = Vec::new();
+        let mut result = Vec::new();
+        for key in ordered {
+            if let Some(lease) = leases.get(key) {
+                result.push(lease.clone());
+            } else {
+                let lease = Arc::new(lease::InputLease::acquire_for(key, &self.id)?);
+                acquired.push((key.to_string(), lease.clone()));
+                result.push(lease);
+            }
         }
-        let lease = Arc::new(lease::InputLease::acquire(key)?);
-        leases.insert(key.into(), lease.clone());
-        Ok(lease)
+        if self.closed.load(Ordering::SeqCst) {
+            return Err(error("CONTROL.SESSION_CLOSED", "session is closed"));
+        }
+        leases.extend(acquired);
+        Ok(result)
     }
 
     pub fn execute(&self, request: &Request) -> Response {
@@ -914,6 +1041,7 @@ impl Session {
             .remove(&request.request_id);
         let context = Arc::new(Context {
             effect_gate: Mutex::new(()),
+            cancellation: aad_runtime::CancellationToken::new(),
             browser_publication: AtomicU8::new(0),
             browser_cancelled: Arc::new(AtomicBool::new(false)),
             phase: AtomicU8::new(if cancelled { 2 } else { 0 }),
@@ -961,8 +1089,12 @@ impl Session {
                 "expires_in_ms": self.lifetime.saturating_sub(self.created.elapsed()).as_millis(),
                 "session_usable": !self.is_closed() && self.created.elapsed() < self.lifetime
                     && self.state.lock().unwrap().requests.len() < self.max_requests,
-                "allow_input": self.policy.allow_input,"upload_dirs": self.policy.upload_roots,"cookie_values": self.policy.allow_cookie_values,"observation_retention":"until_next_observation_or_input_attempt","observation_ttl_ms":self.observation_ttl.as_millis(),"max_requests":self.max_requests,"input_lease":"exclusive_cooperating_session","input_lease_scope":"os_user","providers": self.backends.values().filter(|b| self.allowed_provider(b.name()))
-                    .map(|b| json!({"provider": b.name(), "actions": b.capabilities(), "reads": b.reads()})).collect::<Vec<_>>(),
+                "allow_input": self.policy.allow_input,"allow_secret_input":self.policy.allow_secret_input,"secret_bindings":if self.policy.allow_secret_input { self.policy.secret_bindings.names() } else { Vec::new() },"upload_dirs": self.policy.upload_roots,"cookie_values": self.policy.allow_cookie_values,"observation_retention":if self.backends.values().any(|b| self.allowed_provider(b.name()) && b.supports_cross_resource_drag()) { "provider_declared" } else { "until_next_observation_or_input_attempt" },"observation_ttl_ms":self.observation_ttl.as_millis(),"max_requests":self.max_requests,"input_lease":"exclusive_cooperating_session","input_lease_scope":"os_user","providers": self.backends.values().filter(|b| self.allowed_provider(b.name()))
+                    .map(|b| json!({"provider": b.name(), "actions": b.capabilities(), "reads": b.reads(),
+                        "cross_resource_drag": b.supports_cross_resource_drag(),
+                        "observation_retention": if b.supports_cross_resource_drag() { "latest_per_resource_until_input_attempt" } else { "until_next_observation_or_input_attempt" },
+                        "max_retained_observations": if b.supports_cross_resource_drag() { MAX_RESOURCE_OBSERVATIONS } else { 1 }
+                    })).collect::<Vec<_>>(),
                 "unavailable": self.failures}),
             )),
             Operation::Targets {} => {
@@ -1007,10 +1139,13 @@ impl Session {
                 }
                 validate_view(view)?;
                 let (observation_id, observation) =
-                    self.observe_resource_scoped(resource_id, *max_nodes, view.scope_id.as_deref(), context)?;
+                    self.observe_resource_scoped(resource_id, *max_nodes, view.scope_id.as_deref(), view.scope_target.as_ref(), context)?;
                 let backend = &self.backends[&observation.provider];
                 let (raw, nodes) = (observation.raw, observation.nodes);
                 let mut answer = json!({"observation_id": observation_id, "resource_id": resource_id, "node_count": nodes.len(), "truncated": raw["truncated"] == true, "metadata": raw.get("metadata").cloned().unwrap_or(Value::Null)});
+                if let Some(reasons) = raw.get("truncation_reasons") {
+                    answer["truncation_reasons"] = reasons.clone();
+                }
                 if raw["scope_id"].is_string() {
                     answer["scope"] = json!({"id":raw["scope_id"], "revision":raw["scope_revision"], "complete":raw["truncated"] != true});
                 }
@@ -1114,11 +1249,31 @@ impl Session {
                         "truncated observation cannot authorize input",
                     ));
                 }
-                validate_action(action)?;
+                validate_action(action, &self.policy.browser_access)?;
+                if let Some(ms) = action.hold_ms() {
+                    if Duration::from_millis(ms) >= context.remaining()? {
+                        return Err(error(
+                            "CONTROL.TIMEOUT",
+                            "the requested hold exceeds the remaining action deadline",
+                        ));
+                    }
+                }
                 // Upload paths are resolved here, under the server's grant, so
                 // no provider ever sees a path outside it.
                 let resolved;
                 let action = match action {
+                    Action::Navigate { url } => {
+                        resolved = Action::Navigate {
+                            url: self.policy.browser_access.navigation_url(url)?,
+                        };
+                        &resolved
+                    }
+                    Action::OpenTab { url } => {
+                        resolved = Action::OpenTab {
+                            url: self.policy.browser_access.navigation_url(url)?,
+                        };
+                        &resolved
+                    }
                     Action::Upload { files } => {
                         resolved = Action::Upload {
                             files: self.upload_files(files)?,
@@ -1136,27 +1291,101 @@ impl Session {
                         .ok_or_else(|| error("CONTROL.STALE_TARGET", "node was not observed"))
                 };
                 let node = observed(&target.node_id)?;
-                if let Action::Drag { to, .. } = action {
-                    // Both ends must come from the same view of the same resource,
-                    // so one live revalidation covers the whole gesture.
-                    if to.session_id != target.session_id
-                        || to.resource_id != target.resource_id
-                        || to.observation_id != target.observation_id
+                let secret = if let Action::SecretInput { secret_ref } = action {
+                    if !self.policy.allow_secret_input {
+                        return Err(error("POLICY.DENIED", "secret input permission was not granted by the server operator"));
+                    }
+                    if node["states"]["protected"] != true {
+                        return Err(error("CONTROL.ACTION_UNSUPPORTED", "secret input requires an observed protected field"));
+                    }
+                    Some(self.policy.secret_bindings.resolve(secret_ref).ok_or_else(|| {
+                        error("CONTROL.SECRET_BINDING_MISSING", "the server has no such secret binding")
+                    })?)
+                } else {
+                    if node["states"]["protected"] == true
+                        && matches!(action, Action::Fill { .. } | Action::TypeText { .. } | Action::Paste { .. } | Action::Key { .. })
+                    {
+                        return Err(error("POLICY.DENIED", "protected fields require the dedicated secret input action"));
+                    }
+                    None
+                };
+                let backend = &self.backends[&observation.provider];
+                let mut drag_destination = None;
+                if let Action::Drag { to, path, .. } = action {
+                    if !backend.supports_cross_resource_drag()
+                        && (to.session_id != target.session_id
+                            || to.resource_id != target.resource_id
+                            || to.observation_id != target.observation_id)
                     {
                         return Err(error(
                             "CONTROL.INVALID_REQUEST",
                             "drag destination must belong to the same observation",
                         ));
                     }
-                    if to.node_id == target.node_id {
+                    if to.session_id != target.session_id {
                         return Err(error(
-                            "CONTROL.INVALID_REQUEST",
-                            "drag destination must be a different node",
+                            "CONTROL.SESSION_MISMATCH",
+                            "drag destination belongs to another session",
                         ));
                     }
-                    observed(&to.node_id)?;
+                    if to.resource_id != target.resource_id {
+                        if !path.is_empty() {
+                            return Err(error(
+                                "CONTROL.INVALID_REQUEST",
+                                "a drag path must stay on the same observed surface as both endpoints",
+                            ));
+                        }
+                        let (destination, destination_node) = self.observed_node(to)?;
+                        if destination.provider != observation.provider {
+                            return Err(error(
+                                "CONTROL.ACTION_UNSUPPORTED",
+                                "drag endpoints must belong to the same provider",
+                            ));
+                        }
+                        if destination.raw["truncated"] == true {
+                            return Err(error(
+                                "CONTROL.OBSERVATION_TRUNCATED",
+                                "truncated destination observation cannot authorize input",
+                            ));
+                        }
+                        if node["provenance"]["scope_context"] == true
+                            || destination_node["provenance"]["scope_context"] == true
+                        {
+                            return Err(error(
+                                "CONTROL.STALE_TARGET",
+                                "drag endpoints must be inside their observed scopes",
+                            ));
+                        }
+                        if !backend.node_capabilities(&destination_node).iter().any(|name| name == "drag") {
+                            return Err(error(
+                                "CONTROL.ACTION_UNSUPPORTED",
+                                "observed destination does not expose drag",
+                            ));
+                        }
+                        drag_destination = Some((destination, destination_node));
+                    } else if to.observation_id != target.observation_id {
+                        return Err(error(
+                            "CONTROL.INVALID_REQUEST",
+                            "drag destination must belong to the same observation",
+                        ));
+                    } else {
+                        observed(&to.node_id)?;
+                    }
+                    // A surface can contain both ends (for example a canvas
+                    // selection). Its fractions still undergo validation and
+                    // the provider revalidates the observed native element.
+                    if !path.is_empty() {
+                        if to != target || path.iter().any(|anchor| &anchor.target != target) {
+                            return Err(error(
+                                "CONTROL.INVALID_REQUEST",
+                                "a drag path must stay on the same observed surface as both endpoints",
+                            ));
+                        }
+                        for anchor in path {
+                            observed(&anchor.target.node_id)?;
+                        }
+                    }
                 }
-                let backend = &self.backends[&observation.provider];
                 if !backend
                     .capabilities()
                     .iter()
@@ -1178,12 +1407,33 @@ impl Session {
                     ));
                 }
                 context.remaining()?;
-                let _lease = backend
-                    .lease_key(&observation.raw)
-                    .map(|key| self.input_lease(&key))
-                    .transpose()?;
+                let mut lease_keys = backend.lease_keys(&observation.raw)?;
+                if let Some((destination, _)) = &drag_destination {
+                    lease_keys.extend(backend.lease_keys(&destination.raw)?);
+                }
+                let _lease = self.input_leases(&lease_keys)?;
                 context.remaining()?;
-                let result = backend.act(&observation.raw, node, action, context);
+                let result = match secret {
+                    Some(text) => backend
+                        .secret_input(&observation.raw, node, text, context)
+                        .map(|_| json!({"submitted": true, "redacted": true}))
+                        .map_err(|failure| {
+                            // Platform APIs may echo arguments even in errors.
+                            // No free-form backend value leaves this boundary.
+                            error("CONTROL.SECRET_INPUT_FAILED", "secret input failed; no secret values are included in this response")
+                                .with_effect(if failure.effect == "not_applied" { "not_applied" } else { "unknown" })
+                                .with_retryable(failure.retryable)
+                        }),
+                    None => match &drag_destination {
+                        Some((destination, destination_node)) => backend.drag_between(
+                            DragEndpoint { snapshot: &observation.raw, node },
+                            DragEndpoint { snapshot: &destination.raw, node: destination_node },
+                            action,
+                            context,
+                        ),
+                        None => backend.act(&observation.raw, node, action, context),
+                    },
+                };
                 self.state
                     .lock()
                     .unwrap()
@@ -1247,7 +1497,10 @@ impl Session {
                         "global keys were not granted by the server operator",
                     ));
                 }
-                validate_action(&Action::Key { keys: keys.clone() })?;
+                validate_action(
+                    &Action::Key { keys: keys.clone(), hold_ms: None },
+                    &self.policy.browser_access,
+                )?;
                 let backend = self
                     .backends
                     .values()
@@ -1479,15 +1732,15 @@ impl Session {
         json!({"page":page,"network":network})
     }
 
-    /// Capture a listed resource and retain it as this provider's only
-    /// current observation, with session targets on every node.
+    /// Capture a listed resource, retaining older resources only when the
+    /// provider explicitly supports independent cross-resource observations.
     fn observe_resource(
         &self,
         resource_id: &str,
         max_nodes: usize,
         context: &Context,
     ) -> Result<(String, Observation)> {
-        self.observe_resource_scoped(resource_id, max_nodes, None, context)
+        self.observe_resource_scoped(resource_id, max_nodes, None, None, context)
     }
 
     fn observe_resource_scoped(
@@ -1495,6 +1748,7 @@ impl Session {
         resource_id: &str,
         max_nodes: usize,
         scope: Option<&str>,
+        scope_target: Option<&Target>,
         context: &Context,
     ) -> Result<(String, Observation)> {
         if scope.is_some_and(|id| id.is_empty() || id.len() > 256) {
@@ -1523,16 +1777,56 @@ impl Session {
                 )
             })?;
         let backend = &self.backends[&item.resource.provider];
-        self.state
-            .lock()
-            .unwrap()
-            .observations
-            .retain(|_, old| old.provider != item.resource.provider);
-        let raw = match scope {
-            Some(scope) => {
+        // Read the anchor before expiring this provider's old observations.
+        // A truncated capture cannot authorize input, but an actually observed
+        // node can anchor a fresh, complete subtree capture.
+        let anchored = scope_target
+            .map(|target| {
+                if target.session_id != self.id {
+                    return Err(error(
+                        "CONTROL.SESSION_MISMATCH",
+                        "scope target belongs to another session",
+                    ));
+                }
+                let observed = self.observation(&target.observation_id)?;
+                if target.resource_id != resource_id
+                    || observed.resource_id != resource_id
+                    || observed.provider != item.resource.provider
+                    || !self.allowed_resource(resource_id)
+                {
+                    return Err(error(
+                        "POLICY.DENIED",
+                        "scope target is outside the resource grant",
+                    ));
+                }
+                let node = observed.raw["nodes"]
+                    .as_array()
+                    .and_then(|nodes| nodes.iter().find(|node| node["node_id"] == target.node_id))
+                    .cloned()
+                    .ok_or_else(|| error("CONTROL.STALE_TARGET", "scope node was not observed"))?;
+                if node["provenance"]["scope_context"] == true {
+                    return Err(error(
+                        "CONTROL.STALE_TARGET",
+                        "ancestor context is outside the observed scope",
+                    ));
+                }
+                Ok((observed.raw, node))
+            })
+            .transpose()?;
+        let retain_resources = backend.supports_cross_resource_drag();
+        self.state.lock().unwrap().observations.retain(|_, old| {
+            old.created.elapsed() < self.observation_ttl
+                && (old.provider != item.resource.provider
+                    || (retain_resources && old.resource_id != resource_id))
+        });
+        let raw = match (scope, anchored) {
+            (_, Some((snapshot, node))) => {
+                backend.observe_target_scope(&snapshot, &node, max_nodes, context.remaining()?)?
+            }
+            (Some(scope), None) => {
                 backend.observe_scope(&item.selector, scope, max_nodes, context.remaining()?)?
             }
-            None => backend.observe(&item.selector, max_nodes, context.remaining()?)?,
+            (None, None) => backend.observe(&item.selector, max_nodes, context.remaining()?)?,
         };
         context.remaining()?;
         let observation_id = uuid::Uuid::new_v4().to_string();
@@ -1547,7 +1841,17 @@ impl Session {
             ));
         }
         for node in &mut nodes {
-            node["capabilities"] = json!(backend.node_capabilities(node));
+            let mut capabilities = backend.node_capabilities(node);
+            if !self.policy.allow_secret_input {
+                capabilities.retain(|name| name != "secret_input");
+            }
+            if node["states"]["protected"] == true {
+                node["value"] = Value::Null;
+                capabilities.retain(|name| {
+                    !matches!(name.as_str(), "fill" | "type_text" | "paste" | "key")
+                });
+            }
+            node["capabilities"] = json!(capabilities);
             let node_id = node["node_id"]
                 .as_str()
                 .ok_or_else(|| error("CONTROL.BAD_PROVIDER_OUTPUT", "node omitted identity"))?
@@ -1561,7 +1865,7 @@ impl Session {
             .unwrap();
         }
         let observation = Observation {
-            scope: scope.map(str::to_owned),
+            scope: raw["scope_id"].as_str().or(scope).map(str::to_owned),
             max_nodes,
             provider: item.resource.provider.clone(),
             resource_id: resource_id.to_string(),
@@ -1570,11 +1874,24 @@ impl Session {
             created: Instant::now(),
         };
         let mut state = self.state.lock().unwrap();
-        // Native providers have different snapshot retention rules. A new
-        // observation invalidates this provider's previous references.
-        state
+        // Each resource keeps at most its latest observation. Even an opt-in
+        // backend has a fixed memory/authority ceiling across its resources.
+        while state
             .observations
-            .retain(|_, old| old.provider != item.resource.provider);
+            .values()
+            .filter(|old| old.provider == item.resource.provider)
+            .count()
+            >= MAX_RESOURCE_OBSERVATIONS
+        {
+            let oldest = state
+                .observations
+                .iter()
+                .filter(|(_, old)| old.provider == item.resource.provider)
+                .min_by_key(|(_, old)| old.created)
+                .map(|(id, _)| id.clone())
+                .unwrap();
+            state.observations.remove(&oldest);
+        }
         state
             .observations
             .insert(observation_id.clone(), observation.clone());
@@ -1668,10 +1985,15 @@ impl Session {
         loop {
             polls += 1;
             let (observation_id, observation) =
-                match self.observe_resource_scoped(resource_id, max_nodes, scope, context) {
+                match self.observe_resource_scoped(resource_id, max_nodes, scope, None, context) {
                     Ok(observed) => observed,
-                    // The page was between documents: keep polling.
-                    Err(e) if e.code == "BROWSER.CONTEXT_LOST" => {
+                    // The page was between documents, or its new document has
+                    // no URL yet: keep polling.
+                    Err(e)
+                        if e.code == "BROWSER.CONTEXT_LOST"
+                            || (e.code == "CONTROL.STALE_TARGET"
+                                && e.details.get("document_ready") == Some(&json!(false))) =>
+                    {
                         let remaining = context.remaining()?;
                         if remaining < interval + Duration::from_millis(200) {
                             return Err(e.with_detail("polls", json!(polls)));
@@ -1895,7 +2217,15 @@ fn text_answer(read: &Value, provider: &str) -> Value {
     })
 }
 
-fn validate_action(action: &Action) -> Result<()> {
+fn validate_action(action: &Action, access: &browser_access::BrowserAccess) -> Result<()> {
+    if let Action::SecretInput { secret_ref } = action {
+        if !valid_secret_ref(secret_ref) {
+            return Err(error(
+                "CONTROL.INVALID_REQUEST",
+                "invalid secret binding reference",
+            ));
+        }
+    }
     let text = match action {
         Action::Fill { value } => Some(value),
         Action::TypeText { text, .. } => Some(text),
@@ -1905,18 +2235,7 @@ fn validate_action(action: &Action) -> Result<()> {
         _ => None,
     };
     if let Action::Navigate { url } | Action::OpenTab { url } = action {
-        let scheme = url
-            .split_once("://")
-            .map(|(scheme, _)| scheme.to_ascii_lowercase());
-        if url.len() > 2048
-            || url.chars().any(char::is_control)
-            || !matches!(scheme.as_deref(), Some("http" | "https"))
-        {
-            return Err(error(
-                "CONTROL.INVALID_REQUEST",
-                "navigate and open_tab take an http or https address of at most 2048 characters",
-            ));
-        }
+        access.navigation_url(url)?;
     }
     if text.is_some_and(|s| s.len() > 4096 || s.contains('\0')) {
         return Err(error(
@@ -1950,7 +2269,7 @@ fn validate_action(action: &Action) -> Result<()> {
             "emulate needs a preset, a color_scheme or both",
         ));
     }
-    if let Action::Key { keys } = action {
+    if let Action::Key { keys, .. } = action {
         if keys.is_empty() || keys.len() > 6 || keys.iter().any(|s| s.is_empty() || s.len() > 32) {
             return Err(error(
                 "CONTROL.INVALID_REQUEST",
@@ -1959,6 +2278,47 @@ fn validate_action(action: &Action) -> Result<()> {
         }
     }
     let invalid = |message: &str| Err(error("CONTROL.INVALID_REQUEST", message.to_string()));
+    if let Action::Key {
+        hold_ms: Some(ms), ..
+    }
+    | Action::Click {
+        hold_ms: Some(ms), ..
+    }
+    | Action::Drag {
+        hold_ms: Some(ms), ..
+    } = action
+    {
+        if !(1..=5000).contains(ms) {
+            return invalid("hold_ms must be in 1..5000");
+        }
+        if matches!(action, Action::Click { count: Some(2), .. }) {
+            return invalid("a held click must have count 1");
+        }
+    }
+    if let Action::Click { modifiers, .. } | Action::Drag { modifiers, .. } = action {
+        if modifiers.len() > 4
+            || modifiers
+                .iter()
+                .enumerate()
+                .any(|(index, modifier)| modifiers[..index].contains(modifier))
+        {
+            return invalid("pointer modifiers must be unique: ctrl, shift, alt or meta");
+        }
+    }
+    if let Action::Drag {
+        path,
+        fraction,
+        to_fraction,
+        ..
+    } = action
+    {
+        if path.len() > MAX_DRAG_ANCHORS {
+            return invalid("a drag path contains at most 32 intermediate anchors");
+        }
+        if !path.is_empty() && (fraction.is_none() || to_fraction.is_none()) {
+            return invalid("a drag path requires explicit source and destination fractions");
+        }
+    }
     let fractions: Vec<&Fraction> = match action {
         Action::Click { fraction, .. }
         | Action::Scroll { fraction, .. }
@@ -1966,8 +2326,13 @@ fn validate_action(action: &Action) -> Result<()> {
         Action::Drag {
             fraction,
             to_fraction,
+            path,
             ..
-        } => fraction.iter().chain(to_fraction.iter()).collect(),
+        } => fraction
+            .iter()
+            .chain(to_fraction.iter())
+            .chain(path.iter().map(|anchor| &anchor.fraction))
+            .collect(),
         _ => Vec::new(),
     };
     if fractions
@@ -2004,6 +2369,12 @@ fn plain_path(path: &std::path::Path) -> String {
 }
 
 fn validate_view(view: &View) -> Result<()> {
+    if view.scope_id.is_some() && view.scope_target.is_some() {
+        return Err(error(
+            "CONTROL.INVALID_REQUEST",
+            "scope_id and scope_target are mutually exclusive",
+        ));
+    }
     if view
         .limit
         .is_some_and(|limit| limit == 0 || limit > MAX_OUTLINE_LIMIT)
@@ -2162,6 +2533,7 @@ fn portable_find(nodes: &[Value], locator: &Locator, expect: Expect) -> Result<V
     }
     let matching: Vec<_> = nodes
         .iter()
+        .filter(|node| node["provenance"]["scope_context"] != true)
         .filter(|n| {
             locator.name.as_ref().is_none_or(|v| n["name"] == *v)
                 && locator.role.as_ref().is_none_or(|v| n["role"] == *v)
@@ -2314,8 +2686,9 @@ mod admission_tests {
 
     #[test]
     fn new_tabs_open_only_web_addresses() {
+        let access = browser_access::BrowserAccess::default();
         for url in ["http://127.0.0.1/", "https://example.com/a?b"] {
-            assert!(validate_action(&Action::OpenTab { url: url.into() }).is_ok());
+            assert!(validate_action(&Action::OpenTab { url: url.into() }, &access).is_ok());
         }
         for url in [
             "javascript:alert(1)",
@@ -2323,9 +2696,9 @@ mod admission_tests {
             "chrome://settings",
             "https://example.com/\n",
         ] {
-            assert!(validate_action(&Action::OpenTab { url: url.into() }).is_err());
+            assert!(validate_action(&Action::OpenTab { url: url.into() }, &access).is_err());
         }
-        assert!(validate_action(&Action::ClosePage {}).is_ok());
+        assert!(validate_action(&Action::ClosePage {}, &access).is_ok());
     }
 
     #[test]
@@ -2432,6 +2805,44 @@ mod browser_request_tests {
 }
 
 #[cfg(test)]
+mod input_lease_set_tests {
+    use super::*;
+
+    #[test]
+    fn a_failed_lease_set_releases_only_new_locks() {
+        let id = uuid::Uuid::new_v4();
+        let fresh = format!("lease-test-{id}-a");
+        let retained = format!("lease-test-{id}-m");
+        let blocked = format!("lease-test-{id}-z");
+        let owner = Session::new(Vec::new(), Policy::default());
+        let contender = Session::new(Vec::new(), Policy::default());
+        let verifier = Session::new(Vec::new(), Policy::default());
+        owner.input_lease(&blocked).unwrap();
+        contender.input_lease(&retained).unwrap();
+        // Input order is intentionally reversed: sorted acquisition takes the
+        // new lock first, then the pre-existing one, then encounters conflict.
+        let failed = contender.input_leases(&[blocked.clone(), retained.clone(), fresh.clone()]);
+        assert_eq!(failed.err().unwrap().code, "CONTROL.RESOURCE_BUSY");
+        verifier
+            .input_lease(&fresh)
+            .expect("new lock was rolled back");
+        assert_eq!(
+            verifier.input_lease(&retained).err().unwrap().code,
+            "CONTROL.RESOURCE_BUSY"
+        );
+        owner.close();
+        contender
+            .input_leases(&[blocked.clone(), blocked, retained])
+            .unwrap();
+        assert_eq!(
+            contender.leases.lock().unwrap().len(),
+            2,
+            "duplicates are acquired once"
+        );
+    }
+}
+
+#[cfg(test)]
 mod browser_cancel_boundary_tests {
     use super::*;
     #[test]
@@ -2464,5 +2875,34 @@ mod browser_cancel_boundary_tests {
         context.browser_publication.store(2, Ordering::SeqCst);
         context.cancel_browser();
         assert!(context.remaining().is_ok());
+    }
+}
+
+#[cfg(test)]
+mod native_cancel_boundary_tests {
+    use super::*;
+
+    #[test]
+    fn native_release_token_is_published_before_waiting_for_effect_gate() {
+        let context = Arc::new(Context::new(Duration::from_secs(5), true));
+        context.commit().unwrap();
+        let effect = context.effect_gate.lock().unwrap();
+        let cancelling = context.clone();
+        let worker = std::thread::spawn(move || cancelling.cancel());
+        let limit = Instant::now() + Duration::from_secs(1);
+        while !context.cancellation().is_cancelled() && Instant::now() < limit {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let published = context.cancellation().is_cancelled();
+        let remaining = context.remaining();
+        drop(effect);
+        worker.join().unwrap();
+        assert!(
+            published,
+            "native watchdog must see cancellation while effect is blocked"
+        );
+        let error = remaining.unwrap_err();
+        assert_eq!(error.code, "CONTROL.CANCELLED");
+        assert_eq!(error.effect, "unknown");
     }
 }

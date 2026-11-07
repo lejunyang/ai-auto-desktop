@@ -11,7 +11,7 @@ ai-auto-desktop 让人和 AI 用同一套能力观察并操作桌面：**发现�
 | **GUI** | Tauri + Vue 桌面窗口 | 可视化查看界面、录制并编排步骤 |
 
 AI 只有一套入口：`aad control serve`（NDJSON）和 MCP 的 `control_*` 工具。Windows UIA、Linux AT-SPI、
-macOS AX 与显式启用的 Chromium CDP 共用会话、资源、观察引用和类型化动作。
+macOS AX 与显式启用的 Chromium CDP、Firefox BiDi 共用会话、资源、观察引用和类型化动作。
 `aad mcp` 与 `aad control serve` 默认都只读，输入由启动参数 `--allow-input` 授予；
 `aad mcp --connect` 可通过已有的认证 SSH 连接控制远程环境，授权由远端服务的启动参数决定。
 详见[统一控制与远程会话](docs/control-sessions.md)。
@@ -301,23 +301,37 @@ aad mcp --allow-input    # 由启动它的人授予输入
 
 - `control_targets` 列出窗口、应用和浏览器页面；`control_observe` 默认返回有上限的 outline（可操作或有名字的元素，
   按 `limit` 与 `max_characters` 截断，`stopped_by` 说明是哪个上限）。窗口很大时先用 `view.mode=overview`
-  看区域划分，再用 `view.region` 读其中一块。区域只在 Windows 上计算，其他平台用 outline。
+  看区域划分，再用 `view.region` 读其中一块。区域在 Windows 与 Chromium/CDP 上计算；其他 provider 用 outline，
+  支持局部观察时可用 `scope_target` 从已有元素缩小范围。
 - `control_find` 只返回唯一一个节点；匹配多个时报错并列出候选。定位器支持 role、name、node_id，
   Windows 上还支持 automation_id、class_name、value、states、`match: contains`、`within`、`near`、`nth`；
-  其他平台遇到这些字段会明确拒绝，不会忽略。`expect: optional` 用来问"这个东西没了吗"。
+  浏览器支持 value、states、`match`、`within`、`nth`；各 provider 对未支持字段明确拒绝，不会忽略。
+  `expect: optional` 用来问"这个东西没了吗"。
 - `control_wait` 反复观察一个目标，直到定位到的元素出现（`appears`）、消失（`disappears`）或达到给定 `states`（`state`），
   或 `timeout_ms` 用完（`CONTROL.WAIT_TIMEOUT`）；出现时直接返回可以 act 的 target。所有 provider 都有，多个匹配不算找到。
 - `control_act` 的动作：focus、invoke、click（可选 button、count、元素内 fraction）、fill、type_text（unicode/keys）、
-  key、scroll、hover、drag（终点必须是同一次观察里的另一个节点）、select（列表框选项）、check（复选框、开关、单选），
-  以及浏览器页面的 navigate（只限 http/https）、back、forward、reload，标签页的 open_tab、activate_page、close_page，
+  key、scroll、hover、drag、select（列表框选项）、check（复选框、开关、单选）。drag 默认锚定同一次观察里的两端，
+  支持的 surface 可用同一节点的不同 fraction；Linux AT-SPI 另支持声明了跨资源能力的双端观察。
+  浏览器页面还有 navigate（默认 http/https；本地文件目录与内部来源需服务器显式授权）、back、forward、reload，标签页的 open_tab、activate_page、close_page，
   JavaScript 对话框的 accept（prompt 可带 text）、dismiss，文件框的 upload（只能读启动时 `--allow-upload-dir` 给出的目录）。
   页面打开的弹窗在 `control_targets` 里带 `metadata.opener_page_id`。位置只能是元素内 0..1 的比例。
-  以观察结果里每个节点的 `capabilities` 为准。浏览器里普通 click 是 DOM 激活；带位置、按键或双击时改发可信的指针事件，
+  以观察结果里每个节点的 `capabilities` 为准。Chromium/CDP 普通 DOM 节点的无选项 click 是 DOM 激活；带位置、按键或双击时改发可信的指针事件，
   落点被别的元素盖住时拒绝（`CONTROL.OCCLUDED`），不会点到盖在上面的东西。
-- `control_capture` 给一个观察到的元素截 PNG（目前限浏览器页面，密码框拒绝），同时返回 `digest`：
+- `control_capture` 由支持 capture 的桌面或浏览器 provider 给已观察元素截 PNG；保护字段及截图范围按 provider 规则检查，同时返回 `digest`：
   隔一会儿再截一次比对 digest，就知道显示的内容变没变（例如登录二维码刷新了），不用每次看图。
 
-**浏览器**（需要 `--allow-input`，`browser_profiles` 只读）：`browser_open` 启动一个浏览器并把会话接到它上面，
+**Firefox BiDi**：连接操作者已启动的本机 BiDi 端口，使用独立 provider：
+
+```powershell
+aad control serve --allow-input --provider browser.firefox_bidi --browser-bidi-port 9223
+aad mcp --allow-input --provider browser.firefox_bidi --browser-bidi-port 9223
+```
+
+它与 `--browser-port` 互斥。首版支持主文档 DOM 编辑、可信单击/按键/滚轮、有界长按、安全局部截图、导航与标签页，
+历史仅限可证明目标的连续同源 HTTP(S) 条目；子 frame 只读。双击、指针修饰键、drag、保密输入、上传与对话框应答尚未实现。
+完整参数与实测边界见[Firefox BiDi 说明](docs/control-sessions.md#firefox-webdriver-bidi首版)；不能套用下面的 Chromium 工具范围。
+
+**Chromium 浏览器**（需要 `--allow-input`，`browser_profiles` 只读）：`browser_open` 启动一个浏览器并把会话接到它上面，
 之后 `control_targets` 就能列出它的页面。用户目录三选一：不给（临时目录，关掉即删）、`profile_dir`（工作目录，
 登录一次之后一直保留）、`copy_profile`（复制已有 profile 的登录文件，要启动服务时加 `--allow-profile-copy`；
 `browser_profiles` 列出可选的 profile）。占用中的浏览器只有传 `close_running` 才会被关掉。
@@ -636,15 +650,14 @@ npm run tauri build    # 打包
 界面结构里的普通输入框会照常显示它的值——判断表单填对没有、检索词对不对，都要看得见
 这个值，所以这里不做无谓的遮盖。密码框不一样，标记为 `protected`：
 
-- **读不到，而且不是我们挡的。** Windows 在 `ValuePattern` 层面就不给密码框的值（实测：
-  相邻的普通输入框返回 `"quarterly-report-2026"`，密码框返回 `null`）。之所以显式标记
-  出来，是为了把「这里没有值」和「这里的值不可读」分开——否则它看起来就像一次读取失败，
-  让人去查一个不存在的故障。
-- **仍然能写，自动登录照常可用。** 实测 `set_value` 能成功写入密码框（写入 19 字符后由
-  被测程序回显长度与校验和验证），因此不需要任何「解除保护」的开关。
-- **录进去的密码不落盘。** 密码框的输入会被提成 workflow input（`required` +
-  `sensitive`），运行时再传入。`.workflow.json` 和可再编辑的 `.recording.json`
-  **两个文件都不留字面量**——只清一个，等于把密码从一个文件挪到它旁边的另一个文件。
+- **观察不返回密码值。** `value` 为 `null`，并单独标记 `states.protected`；截图也执行保护区域检查。
+- **写入使用专门授权。** 服务启动时授予 `--allow-input --allow-secret-input`，再用
+  `--secret-env login=APP_PASSWORD` 绑定服务端环境变量。客户端只发送
+  `{"type":"secret_input","secret_ref":"login"}`，替换已观察且再次验证的密码框内容；
+  普通 `fill` / `type_text` / `paste` / `key` 不能代替这个授权。
+- **本次专用输入不进入录制或工作流。** 保存入口拒绝 `secret_input`，运行时也拒绝直接调用
+  原生 secret action；只有即时会话可解引用。服务端结果不返回值或长度。完整条件与平台验证范围见
+  [会话的保密输入说明](docs/control-sessions.md#保密输入)。
 
 > UIA 需要多线程 COM，而窗口框架要求主线程是单线程 COM，两者不可兼得。因此 driver 运行在
 > 独立线程上并通过 channel 通信；命令为 `async`，避免主线程等待自身窗口枚举而死锁。
@@ -693,6 +706,7 @@ crates/
   aad-atspi     Linux AT-SPI / X11 驱动（只在 Linux 上依赖）
   aad-macos-ax  macOS AX 的 Rust adapter 与 Swift helper 协议（只在 macOS 上依赖）
   aad-probe     只读能力探测（汇总报告；各系统的检查在对应平台 crate 里）
+  aad-browser   本地浏览器协议：Chromium CDP 与 Firefox WebDriver BiDi、浏览器启动与资料租约、页面录制
   aad-mcp       stdio 上的 MCP server
   aad-cli       aad 可执行文件
 gui/            Tauri + Vue 桌面窗口

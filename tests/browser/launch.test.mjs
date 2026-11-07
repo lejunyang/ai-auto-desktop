@@ -3,12 +3,16 @@ import assert from 'node:assert/strict';
 import {createServer} from 'node:http';
 import {spawn} from 'node:child_process';
 import {mkdtemp,readFile,rm,stat,lstat,writeFile,mkdir} from 'node:fs/promises';
-import {join,resolve,dirname} from 'node:path';
+import {join,resolve,dirname,basename} from 'node:path';
 import {tmpdir} from 'node:os';
 import {setTimeout as delay} from 'node:timers/promises';
 import {fixture} from './fixture.mjs';
 
 const aad=process.env.AAD_TEST_CLI || resolve('target/debug/aad');
+// Occupancy is checked per browser family (process name), so name the family
+// of the executable under test rather than assuming Edge.
+const exe=basename(process.env.AAD_TEST_CHROME||'').toLowerCase();
+const family=/msedge|microsoft-edge/.test(exe)?'edge':/brave/.test(exe)?'brave':'chrome';
 function command(args,executable=aad) {
   const child=spawn(executable,args,{stdio:['ignore','pipe','pipe']});let stdout='',stderr='';
   child.stdout.on('data',d=>stdout+=d);child.stderr.on('data',d=>stderr+=d);
@@ -38,7 +42,7 @@ test('launch records initial traffic, reuses profiles and cleans only owned brow
   });
   await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
   const url=`http://127.0.0.1:${server.address().port}/`;
-  const base=['browser-record','start','--browser','edge','--browser-executable',process.env.AAD_TEST_CHROME,'--headless','--url',url,'--seconds','15'];
+  const base=['browser-record','start','--browser',family,'--browser-executable',process.env.AAD_TEST_CHROME,'--headless','--url',url,'--seconds','15'];
   let running;
   async function record(name,extra=[],check) {
     const out=join(root,name);const requestStart=requests.length;
@@ -60,7 +64,11 @@ test('launch records initial traffic, reuses profiles and cleans only owned brow
       assert.ok(await exists(join(out,'walkthrough.md')));
       await assert.rejects(fetch(`http://127.0.0.1:${manifest.options.port}/json/version`),'owned browser must close');
       return {result,requests:requests.slice(requestStart)};
-    }catch(e){if(running){running.child.kill('SIGINT');await running.done;running=undefined;}throw e;}
+    }catch(e){
+      // Report why the recorder never got going, not just that it timed out.
+      if(running){running.child.kill('SIGINT');const {code,stdout,stderr}=await running.done;running=undefined;e.message+=`\nrecorder exited ${code}\n${stderr}\n${stdout}`;}
+      throw e;
+    }
   }
   try {
     const fresh=await record('fresh');
@@ -84,7 +92,7 @@ test('launch records initial traffic, reuses profiles and cleans only owned brow
     assert.ok(reused.requests.some(r=>r.url==='/state?previous=persisted'),'localStorage persists when reusing full profile');
     assert.ok(reused.requests.some(r=>r.url==='/'&&r.cookie?.includes('fixture=persisted-cookie')),'cookie persists across browser restart');
 
-    const listing=await command(['browser-record','profiles','--browser','edge','--profile-source',profile]).done;
+    const listing=await command(['browser-record','profiles','--browser',family,'--profile-source',profile]).done;
     assert.equal(listing.code,0,listing.stderr);
     assert.deepEqual(JSON.parse(listing.stdout).profiles.map(p=>p.id),['Default']);
     const copied=await record('login-copy',['--existing-profile','--profile-source',profile]);
@@ -110,7 +118,7 @@ test('occupied non-CDP profiles require opt-in termination and unrelated browser
   const root=await mkdtemp(join(tmpdir(),'aad-busy-profile-test-'));
   const profile=join(root,'source with spaces');
   const other=await fixture((req,res)=>res.end('<title>Unrelated browser</title>'));
-  const base=['browser-record','start','--browser','edge','--browser-executable',process.env.AAD_TEST_CHROME,'--headless','--seconds','1','--no-screenshots'];
+  const base=['browser-record','start','--browser',family,'--browser-executable',process.env.AAD_TEST_CHROME,'--headless','--seconds','1','--no-screenshots'];
   let owner;
   async function occupy() {
     owner=spawn(process.env.AAD_TEST_CHROME,['--headless=new',`--user-data-dir=${profile}`,'--no-first-run','--no-default-browser-check','about:blank'],{stdio:'ignore'});
@@ -132,7 +140,7 @@ test('occupied non-CDP profiles require opt-in termination and unrelated browser
     assert.notEqual(refused.code,0);assert.match(refused.stdout+refused.stderr,/--kill-browser/);
     await assertAlive();assert.equal(await exists(join(root,'blocked')),false);
     const helper=join(dirname(aad),process.platform==='win32'?'aad-browser.exe':'aad-browser');
-    const helperRefused=await command(['--browser','edge','--existing-profile','--profile-source',profile,'--port','19333'],helper).done;
+    const helperRefused=await command(['--browser',family,'--existing-profile','--profile-source',profile,'--port','19333'],helper).done;
     assert.notEqual(helperRefused.code,0);assert.match(helperRefused.stderr,/--kill-browser/);
     await assertAlive();
     const invalid=await command([...base,'--out',join(root,'invalid'),'--existing-profile','Missing','--profile-source',profile,'--kill-browser']).done;

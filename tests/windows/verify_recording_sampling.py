@@ -63,7 +63,7 @@ def main():
                 with urllib.request.urlopen(f"http://127.0.0.1:{opened['port']}/json/list") as response:
                     order_popup = next(t['id'] for t in json.load(response) if t.get('title') == 'Sampling popup')
                 evaluate(opened['port'], order_popup, "for(let i=0;i<2;i++){let f=document.createElement('iframe');f.srcdoc='<button>FRAME_'+i+'</button>';document.body.appendChild(f)}")
-                subprocess.run(['cargo','test','-p','aad-cdp','real_context_recreation_preserves_waiting_frame_order','--','--ignored'],
+                subprocess.run(['cargo','test','-p','aad-browser','real_context_recreation_preserves_waiting_frame_order','--','--ignored'],
                                env=dict(env,AAD_SAMPLING_PORT=str(proxy.server.server_port),AAD_SAMPLING_PAGE=page,AAD_SAMPLING_POPUP=order_popup),check=True,timeout=60)
                 assert proxy.held.is_set(), 'specialist recorder did not hit slow snapshot'
                 evaluate(opened['port'], order_popup, 'window.close()')

@@ -50,7 +50,7 @@ fn helper_exe() -> Option<PathBuf> {
 /// Returns true when a CDP endpoint should be available (either it already was
 /// listening, or a browser was started and confirmed ready).
 pub fn ensure_browser(port: u16, launch: &BrowserLaunch) -> bool {
-    if aad_cdp::Client::available(port) {
+    if aad_browser::cdp::Client::available(port) {
         if launch.existing_profile.is_some() || launch.profile_dir.is_some() || launch.kill_browser
         {
             eprintln!("warning: CDP port already in use; cannot apply profile selection to it. Use another --cdp-port or browser-record start");
@@ -97,7 +97,7 @@ pub fn ensure_browser(port: u16, launch: &BrowserLaunch) -> bool {
     }
 
     match command.status() {
-        Ok(status) if status.success() => aad_cdp::Client::available(port),
+        Ok(status) if status.success() => aad_browser::cdp::Client::available(port),
         Ok(status) => {
             eprintln!("warning: aad-browser exited with {status}; using UIA");
             false

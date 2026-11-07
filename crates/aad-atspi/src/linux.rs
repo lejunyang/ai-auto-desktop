@@ -1,6 +1,6 @@
 use super::{
     driver_error, remaining, AtspiBackend, AutomationError, BackendNode, BackendSnapshot, Bounds,
-    Gesture, Map, NativeRef, Value, MAX_FIELD_CHARS, MAX_NODES,
+    Gesture, Map, NativeRef, Value, WindowAnchor, MAX_FIELD_CHARS, MAX_NODES,
 };
 use atspi::proxy::accessible::AccessibleProxy;
 use atspi::proxy::action::ActionProxy;
@@ -10,7 +10,7 @@ use atspi::proxy::editable_text::EditableTextProxy;
 use atspi::proxy::text::TextProxy;
 use atspi::{CoordType, Interface, ObjectRef, State};
 use serde_json::json;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -19,6 +19,15 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use zbus::blocking::{connection, Connection, Proxy};
+
+mod actions;
+mod coordinates;
+mod drag_between;
+mod drag_path;
+mod focus_discovery;
+use focus_discovery::FocusDiscovery;
+mod window_focus;
+use window_focus::append_window_args;
 
 const REGISTRY_NAME: &str = "org.a11y.atspi.Registry";
 const REGISTRY_PATH: &str = "/org/a11y/atspi/accessible/root";
@@ -29,6 +38,72 @@ const XTEST_OUTPUT_LIMIT: usize = 64 * 1024;
 const CAPTURE_OUTPUT_LIMIT: usize = 64 * 1024 * 1024;
 const CAPTURE_METADATA_LIMIT: usize = 64 * 1024;
 type ApplicationEntry = (NativeRef, Map<String, Value>);
+
+/// AT-SPI toolkits may include a null object in GetChildren (for example a
+/// separator in a Qt menu). It is an absent child, not an inaccessible subtree.
+/// Keep the wire count for comparison with ChildCount before removing nulls.
+struct ChildReferences {
+    items: Vec<NativeRef>,
+    returned_count: usize,
+}
+
+impl ChildReferences {
+    fn new(references: Vec<NativeRef>) -> Self {
+        let returned_count = references.len();
+        let items = references
+            .into_iter()
+            .filter(|reference| {
+                !matches!(
+                    reference.object_path.as_str(),
+                    "/org/a11y/atspi/null" | "/org/a11y/atspi/accessible/null"
+                )
+            })
+            .collect();
+        Self {
+            items,
+            returned_count,
+        }
+    }
+}
+
+fn capture_issue(reasons: &mut Vec<Value>, issue: Value) {
+    // A broken application must not turn diagnostics into an unbounded output.
+    if reasons.len() < 32 {
+        reasons.push(issue);
+    }
+}
+
+fn pointer_state_allows_input(states: Option<atspi::StateSet>) -> bool {
+    states.is_some_and(|states| {
+        [
+            State::Enabled,
+            State::Visible,
+            State::Showing,
+            State::Sensitive,
+        ]
+        .into_iter()
+        .all(|state| states.contains(state))
+    })
+}
+
+fn canonical_role(native_role: atspi::Role, role_name: &str) -> String {
+    // Qt 5 GetRoleName reports the base EditableText role ("text") even when
+    // GetRole correctly returns PasswordText. The numeric protocol role is
+    // authoritative for protection; never infer it from labels or text values.
+    if native_role == atspi::Role::PasswordText {
+        "password_text".into()
+    } else {
+        super::normalize_role(role_name)
+    }
+}
+
+fn secret_editable(role: &str, editable_interface: bool, states: atspi::StateSet) -> bool {
+    matches!(role, "password_text" | "password")
+        && editable_interface
+        && [State::Editable, State::Enabled, State::Sensitive]
+            .into_iter()
+            .all(|state| states.contains(state))
+}
 
 fn check_fcitx_text_input(session: &Connection) -> Result<(), AutomationError> {
     let query_error = |error: zbus::Error| {
@@ -67,10 +142,19 @@ fn check_fcitx_text_input(session: &Connection) -> Result<(), AutomationError> {
     Ok(())
 }
 
+#[derive(Clone)]
 pub struct LinuxBackend {
     session_bus: Connection,
     connection: Connection,
-    recordings: Mutex<BTreeMap<String, LinuxRecorder>>,
+    recordings: Arc<Mutex<BTreeMap<String, LinuxRecorder>>>,
+    input_helper_status: Arc<Mutex<Value>>,
+    accessibility_address: String,
+    focus_discovery: Arc<Mutex<Option<FocusDiscovery>>>,
+    cancellation: Option<super::CancellationToken>,
+    path_validation_busy: Arc<AtomicBool>,
+    coordinate_maps: Arc<Mutex<VecDeque<coordinates::CoordinateMap>>>,
+    coordinate_qt_buses: Arc<Mutex<BTreeSet<String>>>,
+    geometry_read_busy: Arc<AtomicBool>,
 }
 
 impl LinuxBackend {
@@ -95,10 +179,49 @@ impl LinuxBackend {
         let backend = Self {
             session_bus,
             connection,
-            recordings: Mutex::new(BTreeMap::new()),
+            recordings: Arc::new(Mutex::new(BTreeMap::new())),
+            input_helper_status: Arc::new(Mutex::new(
+                json!({"ready": false, "code": "not_probed"}),
+            )),
+            accessibility_address: bus,
+            focus_discovery: Arc::new(Mutex::new(None)),
+            cancellation: None,
+            path_validation_busy: Arc::new(AtomicBool::new(false)),
+            coordinate_maps: Arc::new(Mutex::new(VecDeque::new())),
+            coordinate_qt_buses: Arc::new(Mutex::new(BTreeSet::new())),
+            geometry_read_busy: Arc::new(AtomicBool::new(false)),
         };
         backend.children(&Self::root_ref(), Instant::now() + Duration::from_secs(3))?;
         Ok(backend)
+    }
+
+    fn check_cancelled(&self, dispatched: bool) -> Result<(), AutomationError> {
+        match &self.cancellation {
+            Some(token) => token.check().map_err(|error| {
+                error.with_effect(if dispatched { "unknown" } else { "not_applied" })
+            }),
+            None => Ok(()),
+        }
+    }
+
+    fn run_helper(
+        &self,
+        path: &Path,
+        args: &[String],
+        input: Option<&[u8]>,
+        deadline: Instant,
+        stdout_limit: usize,
+        stderr_limit: usize,
+    ) -> Result<HelperOutput, AutomationError> {
+        run_helper_cancellable(
+            path,
+            args,
+            input,
+            deadline,
+            stdout_limit,
+            stderr_limit,
+            self.cancellation.as_ref(),
+        )
     }
 
     fn root_ref() -> NativeRef {
@@ -113,6 +236,65 @@ impl LinuxBackend {
         check_fcitx_text_input(&self.session_bus)?;
         remaining(deadline, false)?;
         Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn type_text_mode(
+        &self,
+        target: &NativeRef,
+        window: Option<&WindowAnchor>,
+        text: &str,
+        keys: bool,
+        process_id: u32,
+        deadline: Instant,
+    ) -> Result<Value, AutomationError> {
+        let path =
+            self.input_helper(if keys { "type-text-keys" } else { "type-text" }, deadline)?;
+        let window = window.ok_or_else(|| {
+            driver_error(
+                "DRIVER.ACTION_UNSUPPORTED",
+                "input requires an observed top-level window",
+            )
+        })?;
+        self.input_helper("window-focus", deadline)?;
+        let focus = self.focus(target, Some(window), deadline)?;
+        std::thread::sleep(Duration::from_millis(50).min(remaining(deadline, true)?));
+        let window_id = self
+            .verify_focused(target, Some(window), process_id, deadline)
+            .map_err(after_focus)?;
+        // Unicode insertion cannot silently become IME composition. Explicit
+        // keys mode intentionally participates in the current input method.
+        if !keys {
+            self.check_text_input_method(deadline)
+                .map_err(after_focus)?;
+        }
+        let mut args = vec![
+            "type-text".to_string(),
+            "--expected-pid".into(),
+            process_id.to_string(),
+            "--deadline-monotonic-ns".into(),
+            monotonic_deadline_ns(deadline)?.to_string(),
+        ];
+        if keys {
+            args.extend(["--mode".into(), "keys".into()]);
+        }
+        append_window_args(&mut args, window, Some(window_id));
+        let output = self
+            .run_helper(
+                &path,
+                &args,
+                Some(text.as_bytes()),
+                deadline,
+                XTEST_OUTPUT_LIMIT,
+                XTEST_OUTPUT_LIMIT,
+            )
+            .map_err(after_focus)?;
+        let input =
+            parse_input_helper(output, "keyboard_dispatch", 2, process_id).map_err(after_focus)?;
+        Ok(
+            json!({"native_interface": "Component.grab_focus -> XTEST", "focus": focus,
+            "input": input, "synthetic_input": true, "mode": if keys { "keys" } else { "unicode" }}),
+        )
     }
 
     fn native(reference: ObjectRef) -> NativeRef {
@@ -143,6 +325,14 @@ impl LinuxBackend {
         target: &NativeRef,
         deadline: Instant,
     ) -> Result<Vec<NativeRef>, AutomationError> {
+        Ok(self.child_references(target, deadline)?.items)
+    }
+
+    fn child_references(
+        &self,
+        target: &NativeRef,
+        deadline: Instant,
+    ) -> Result<ChildReferences, AutomationError> {
         remaining(deadline, false)?;
         let children = zbus::block_on(self.accessible(target)?.get_children())
             .map_err(|error| native_failure("Accessible.GetChildren", target, error))?;
@@ -153,7 +343,9 @@ impl LinuxBackend {
                 "Accessible.GetChildren exceeded the hard fan-out limit",
             ));
         }
-        Ok(children.into_iter().map(Self::native).collect())
+        Ok(ChildReferences::new(
+            children.into_iter().map(Self::native).collect(),
+        ))
     }
 
     fn process_id(&self, bus_name: &str) -> Option<u32> {
@@ -287,43 +479,84 @@ impl LinuxBackend {
         .map_err(|error| native_failure("Component proxy", target, error))
     }
 
-    fn actions(&self, target: &NativeRef) -> Vec<atspi::Action> {
-        self.action_proxy(target)
-            .and_then(|proxy| {
-                zbus::block_on(proxy.get_actions())
-                    .map_err(|error| native_failure("Action.GetActions", target, error))
-            })
-            .unwrap_or_default()
-    }
-
-    /// Focus the target, then run one XTest helper command against it.
+    /// Keyboard input needs focus; pointer input is proven by live hit tests.
     fn run_input(
         &self,
         target: &NativeRef,
+        window: Option<&WindowAnchor>,
         mut args: Vec<String>,
         minimum_events: u64,
         process_id: u32,
         deadline: Instant,
     ) -> Result<Value, AutomationError> {
-        let path = self.helper(HelperKind::Input)?;
-        let focus = self.focus(target, deadline)?;
-        std::thread::sleep(Duration::from_millis(50).min(remaining(deadline, true)?));
+        self.check_cancelled(false)?;
+        let support = self.probe_input(deadline)?;
+        if self.cancellation.is_some() {
+            support.require("cooperative-cancel")?;
+        }
+        support.require(args.first().map(String::as_str).unwrap_or(""))?;
+        if args.iter().any(|arg| arg == "--modifiers") {
+            support.require("pointer-modifiers")?;
+        }
+        if args.iter().any(|arg| arg == "--hold-ms") {
+            support.require("bounded-hold")?;
+        }
+        if args.first().is_some_and(|command| command == "key-chord")
+            || args.iter().any(|arg| arg == "--modifiers")
+        {
+            support.require("focus-info")?;
+            support.require("window-focus")?;
+        }
+        let path = support.path;
+        let focus = if args.first().is_some_and(|command| command == "key-chord") {
+            let proof = self.focus(target, window, deadline)?;
+            std::thread::sleep(Duration::from_millis(50).min(remaining(deadline, true)?));
+            self.verify_focused(target, window, process_id, deadline)
+                .map_err(after_focus)?;
+            Some(proof)
+        } else {
+            None
+        };
+        if args.first().is_some_and(|command| command == "key-chord")
+            || args.iter().any(|arg| arg == "--modifiers")
+        {
+            let window = window.ok_or_else(|| {
+                driver_error(
+                    "DRIVER.ACTION_UNSUPPORTED",
+                    "input requires an observed top-level window",
+                )
+            })?;
+            // Feature checked before any focus request or keyboard dispatch.
+            let window_id =
+                self.verify_window_with_helper(target, window, process_id, deadline, &path)?;
+            append_window_args(&mut args, window, Some(window_id));
+        }
+        let input_error = |error| {
+            if focus.is_some() {
+                after_focus(error)
+            } else {
+                error
+            }
+        };
         args.extend([
             "--deadline-monotonic-ns".into(),
             monotonic_deadline_ns(deadline)?.to_string(),
         ]);
-        let output = run_helper(
-            &path,
-            &args,
-            None,
-            deadline,
-            XTEST_OUTPUT_LIMIT,
-            XTEST_OUTPUT_LIMIT,
-        )
-        .map_err(after_focus)?;
+        let output = self
+            .run_helper(
+                &path,
+                &args,
+                None,
+                deadline,
+                XTEST_OUTPUT_LIMIT,
+                XTEST_OUTPUT_LIMIT,
+            )
+            .map_err(input_error)?;
         let mut input = parse_input_helper(output, "input_dispatch", minimum_events, process_id)
-            .map_err(after_focus)?;
-        input["focus"] = focus;
+            .map_err(input_error)?;
+        if let Some(focus) = focus {
+            input["focus"] = focus;
+        }
         Ok(input)
     }
 
@@ -369,18 +602,47 @@ impl LinuxBackend {
         Ok(path)
     }
 
+    fn probe_input(&self, deadline: Instant) -> Result<InputSupport, AutomationError> {
+        let result = self.helper(HelperKind::Input).and_then(|path| {
+            probe_input_helper(&path, deadline).map(|features| InputSupport { path, features })
+        });
+        *self.input_helper_status.lock().unwrap() = match &result {
+            Ok(support) => {
+                json!({"ready": true, "protocol": INPUT_HELPER_PROTOCOL, "features": support.features})
+            }
+            Err(error) => json!({"ready": false, "code": error.code, "message": error.message}),
+        };
+        result
+    }
+
+    fn input_helper(&self, feature: &str, deadline: Instant) -> Result<PathBuf, AutomationError> {
+        let support = self.probe_input(deadline)?;
+        support.require(feature)?;
+        if self.cancellation.is_some()
+            && matches!(
+                feature,
+                "type-text" | "paste" | "pointer-click" | "window-action" | "global-key"
+            )
+        {
+            support.require("cooperative-cancel")?;
+        }
+        Ok(support.path)
+    }
+
     fn read_node(
         &self,
         target: NativeRef,
         parent_index: Option<usize>,
         application: &Map<String, Value>,
+        input: Option<&InputSupport>,
         deadline: Instant,
     ) -> Result<(BackendNode, usize), AutomationError> {
         remaining(deadline, false)?;
         let accessible = self.accessible(&target)?;
-        let role = zbus::block_on(accessible.get_role_name())
-            .map(|role| super::normalize_role(&role))
-            .unwrap_or_else(|_| "unknown".into());
+        let native_role = zbus::block_on(accessible.get_role())
+            .map_err(|error| native_failure("Accessible.GetRole", &target, error))?;
+        let role_name = zbus::block_on(accessible.get_role_name()).unwrap_or_default();
+        let role = canonical_role(native_role, &role_name);
         let interfaces = zbus::block_on(accessible.get_interfaces()).unwrap_or_default();
         let states = zbus::block_on(accessible.get_state()).ok();
         let protected = matches!(role.as_str(), "password_text" | "password");
@@ -429,7 +691,9 @@ impl LinuxBackend {
                     zbus::block_on(proxy.get_text(0, count.clamp(0, MAX_FIELD_CHARS as i32))).ok()
                 })
         };
-        let action_metadata = self.actions(&target);
+        let action_metadata = self
+            .canonical_actions(&target, deadline)
+            .unwrap_or_default();
         let toolkit = application.get("toolkit_name").and_then(Value::as_str);
         let toolkit_version = application
             .get("toolkit_version")
@@ -445,54 +709,104 @@ impl LinuxBackend {
         {
             actions.push("focus".into());
         }
-        let qt_invoke = toolkit == Some("Qt")
-            && toolkit_version.starts_with("5.")
-            && role == "push_button"
-            && action_metadata
-                .iter()
-                .filter(|action| action.name == "Press")
-                .count()
-                == 1;
-        if qt_invoke || (actionable && toolkit != Some("Qt") && action_metadata.len() == 1) {
+        let invoke_action = actions::unique_activation(&action_metadata);
+        if actionable && invoke_action.is_some() {
             actions.push("invoke".into());
         }
         if actionable && interfaces.contains(Interface::EditableText) && !protected {
             actions.push("set_text".into());
         }
+        if protected
+            && interfaces.contains(Interface::EditableText)
+            && states.is_some_and(|states| {
+                [State::Editable, State::Enabled, State::Sensitive]
+                    .into_iter()
+                    .all(|state| states.contains(state))
+            })
+        {
+            actions.push("secret_input".into());
+        }
         let process_id = application
             .get("process_id")
             .and_then(Value::as_u64)
             .filter(|value| *value > 0 && *value <= u32::MAX as u64);
-        let fully_interactive = states.is_some_and(|states| {
-            [
-                State::Enabled,
-                State::Visible,
-                State::Showing,
-                State::Sensitive,
-                State::Focusable,
-            ]
-            .into_iter()
-            .all(|state| states.contains(state))
-        });
-        if fully_interactive
+        let pointer_interactive = pointer_state_allows_input(states);
+        let fully_interactive =
+            pointer_interactive && states.is_some_and(|states| states.contains(State::Focusable));
+        // Qt Quick can report hidden states for its actual focused text input.
+        // Recover only keyboard actions, with independent live focus ownership;
+        // input paths repeat the focus check after GrabFocus before dispatch.
+        let visibility_recovery = input
+            .is_some_and(|support| support.has("focus-info") && support.has("window-focus"))
+            && !fully_interactive
+            && toolkit == Some("Qt")
+            && states.is_some_and(|states| {
+                [
+                    State::Enabled,
+                    State::Sensitive,
+                    State::Focusable,
+                    State::Focused,
+                    State::Editable,
+                ]
+                .into_iter()
+                .all(|state| states.contains(state))
+            })
+            && matches!(role.as_str(), "entry" | "text")
+            && interfaces.contains(Interface::Component)
+            && bounds.is_some_and(|bounds| bounds.width > 0 && bounds.height > 0)
+            && !protected
+            && process_id.is_some_and(|pid| {
+                self.verify_focused_with_helper(
+                    &target,
+                    None,
+                    pid as u32,
+                    deadline,
+                    &input.expect("feature checked").path,
+                )
+                .is_ok()
+            });
+        if (fully_interactive || visibility_recovery)
             && states.is_some_and(|states| states.contains(State::Editable))
             && matches!(role.as_str(), "entry" | "text")
             && interfaces.contains(Interface::Component)
             && process_id.is_some()
             && !protected
         {
-            actions.push("type_text".into());
-            actions.push("paste".into());
+            for (action, feature) in [("type_text", "type-text"), ("paste", "paste")] {
+                if input.is_some_and(|support| {
+                    support.has(feature) && support.has("focus-info") && support.has("window-focus")
+                }) {
+                    actions.push(action.into());
+                }
+            }
         }
-        if fully_interactive
+        if visibility_recovery && input.is_some_and(|support| support.has("key-chord")) {
+            actions.push("key_chord".into());
+        }
+        if pointer_interactive
             && interfaces.contains(Interface::Component)
             && process_id.is_some()
             && bounds.is_some_and(|bounds| bounds.width > 0 && bounds.height > 0)
             && !protected
         {
-            actions.extend(
-                ["pointer_click", "pointer_gesture", "drag", "key_chord"].map(String::from),
-            );
+            for (action, feature) in [
+                ("pointer_click", "pointer-click"),
+                ("pointer_gesture", "pointer-gesture"),
+                ("drag", "drag"),
+            ] {
+                if input.is_some_and(|support| support.has(feature)) {
+                    actions.push(action.into());
+                }
+            }
+            if fully_interactive
+                && input.is_some_and(|support| {
+                    support.has("key-chord")
+                        && support.has("focus-info")
+                        && support.has("window-focus")
+                })
+            {
+                actions.push("key_chord".into());
+            }
         }
         let gtk3 = toolkit == Some("gtk") && toolkit_version.starts_with("3.");
         if gtk3
@@ -535,7 +849,7 @@ impl LinuxBackend {
         let native_actions = action_metadata
             .iter()
             .enumerate()
-            .map(|(index, action)| json!({"index": index, "name": action.name, "description": action.description, "key_binding": action.keybinding}))
+            .map(|(index, action)| json!({"index": index, "name": action.name, "localized_name": action.localized_name, "description": action.description, "key_binding": action.keybinding}))
             .collect::<Vec<_>>();
         let native_action_name = if actions.contains(&"toggle".to_string()) {
             Some("click")
@@ -543,10 +857,8 @@ impl LinuxBackend {
             || actions.contains(&"collapse".to_string())
         {
             Some("activate")
-        } else if qt_invoke {
-            Some("Press")
         } else {
-            None
+            invoke_action.map(|action| action.name.as_str())
         };
         remaining(deadline, false)?;
         Ok((
@@ -562,6 +874,14 @@ impl LinuxBackend {
                 bounds,
                 actions,
                 provenance: Map::from_iter([
+                    (
+                        "visibility_recovery".into(),
+                        if visibility_recovery {
+                            json!("focused_qt_keyboard")
+                        } else {
+                            Value::Null
+                        },
+                    ),
                     ("bus_name".into(), json!(target.bus_name)),
                     ("object_path".into(), json!(target.object_path)),
                     ("accessible_id".into(), optional_text(accessible_id)),
@@ -590,12 +910,17 @@ impl LinuxBackend {
                             .cloned()
                             .unwrap_or(Value::Null),
                     ),
+                    ("atspi_role".into(), json!(native_role as u32)),
                     ("value_redacted".into(), json!(protected)),
                     ("coordinate_space".into(), json!("screen")),
                     ("atspi_actions".into(), json!(native_actions)),
                     (
                         "native_action_name".into(),
                         native_action_name.map_or(Value::Null, |value| json!(value)),
+                    ),
+                    (
+                        "native_invoke_name".into(),
+                        invoke_action.map_or(Value::Null, |action| json!(action.name)),
                     ),
                 ]),
             },
@@ -605,6 +930,28 @@ impl LinuxBackend {
 }
 
 impl AtspiBackend for LinuxBackend {
+    fn supports_cross_resource_drag(&self) -> bool {
+        self.probe_input(Instant::now() + Duration::from_secs(1))
+            .is_ok_and(|support| support.require("anchored-drag-between").is_ok())
+    }
+
+    fn drag_between(
+        &self,
+        request: super::DragBetweenRequest<'_>,
+        validate: super::DragPathValidation,
+    ) -> Result<Value, AutomationError> {
+        self.run_drag_between(request, validate)
+    }
+
+    fn cancellation_scope(
+        &self,
+        token: &super::CancellationToken,
+    ) -> Option<Arc<dyn AtspiBackend>> {
+        let mut scoped = self.clone();
+        scoped.cancellation = Some(token.clone());
+        Some(Arc::new(scoped))
+    }
+
     fn start_recording(
         &self,
         application: &Map<String, Value>,
@@ -623,7 +970,36 @@ impl AtspiBackend for LinuxBackend {
     }
 
     fn session_info(&self) -> Map<String, Value> {
-        session_info()
+        let mut session = session_info();
+        session.insert(
+            "input_helper".into(),
+            self.input_helper_status.lock().unwrap().clone(),
+        );
+        session
+    }
+
+    fn inspect_session(&self, deadline: Instant) -> Map<String, Value> {
+        let _ = self.probe_input(deadline);
+        self.session_info()
+    }
+
+    fn check_action_support(&self, action: &str, deadline: Instant) -> Result<(), AutomationError> {
+        let feature = match action {
+            "type_text" => "type-text",
+            "pointer_click" => "pointer-click",
+            "pointer_gesture" => "pointer-gesture",
+            "key_chord" => "key-chord",
+            "drag" | "paste" => action,
+            "activate" | "minimize" | "maximize" | "restore" | "close_window" => "window-action",
+            _ => return Ok(()),
+        };
+        let support = self.probe_input(deadline)?;
+        support.require(feature)?;
+        if matches!(action, "type_text" | "key_chord" | "paste") {
+            support.require("focus-info")?;
+            support.require("window-focus")?;
+        }
+        Ok(())
     }
 
     fn list_applications(
@@ -645,95 +1021,100 @@ impl AtspiBackend for LinuxBackend {
         deadline: Instant,
     ) -> Result<BackendSnapshot, AutomationError> {
         let (root, info) = self.resolve_application(application, deadline)?;
-        let mut queue = VecDeque::from([(root, None, 0u32)]);
-        let mut nodes = Vec::new();
-        let mut truncated = false;
-        while let Some((target, parent, depth)) = queue.pop_front() {
-            remaining(deadline, false)?;
-            if nodes.len() >= max_nodes {
-                truncated = true;
-                break;
-            }
-            let (node, child_count) = self.read_node(target.clone(), parent, &info, deadline)?;
-            let current = nodes.len();
-            nodes.push(node);
-            if depth >= max_depth {
-                truncated |= child_count > 0;
-                continue;
-            }
-            match self.children(&target, deadline) {
-                Ok(children) => {
-                    truncated |= children.len() != child_count;
-                    for child in children {
-                        if nodes.len() + queue.len() >= max_nodes {
-                            truncated = true;
-                            break;
-                        }
-                        queue.push_back((child, Some(current), depth + 1));
-                    }
-                }
-                Err(error)
-                    if error.code == "DRIVER.TIMEOUT"
-                        || error.code == "DRIVER.OUTPUT_TOO_LARGE" =>
-                {
-                    return Err(error)
-                }
-                Err(_) => truncated = true,
-            }
-        }
-        let process_id = info
-            .get("process_id")
-            .and_then(Value::as_u64)
-            .and_then(|value| u32::try_from(value).ok())
-            .filter(|value| *value > 0);
-        self.add_window_actions(&mut nodes, process_id, deadline);
-        Ok(BackendSnapshot {
-            application: info,
-            nodes,
-            truncated,
-        })
+        self.capture_tree(root, info, Vec::new(), max_depth, max_nodes, deadline)
     }
 
-    fn focus(&self, target: &NativeRef, deadline: Instant) -> Result<Value, AutomationError> {
+    fn capture_scope(
+        &self,
+        application: &Map<String, Value>,
+        root: &NativeRef,
+        max_depth: u32,
+        max_nodes: usize,
+        deadline: Instant,
+    ) -> Result<BackendSnapshot, AutomationError> {
+        let (app, info) = self.resolve_application(application, deadline)?;
+        let mut current = root.clone();
+        let mut ancestors = Vec::new();
+        let mut visited = std::collections::BTreeSet::new();
+        while current != app {
+            remaining(deadline, false)?;
+            if current.bus_name != app.bus_name
+                || !visited.insert(current.object_path.clone())
+                || ancestors.len() >= super::MAX_DEPTH as usize
+            {
+                return Err(super::stale(
+                    "scope root is not proven to belong to its observed application",
+                ));
+            }
+            current = self.parent(&current, deadline)?.ok_or_else(|| {
+                super::stale("scope root is detached from its observed application")
+            })?;
+            ancestors.push(current.clone());
+        }
+        ancestors.reverse();
+        self.capture_tree(
+            root.clone(),
+            info,
+            ancestors,
+            max_depth,
+            max_nodes,
+            deadline,
+        )
+    }
+
+    fn focus(
+        &self,
+        target: &NativeRef,
+        window: Option<&WindowAnchor>,
+        deadline: Instant,
+    ) -> Result<Value, AutomationError> {
+        self.check_cancelled(false)?;
         remaining(deadline, false)?;
+        self.check_cancelled(false)?;
         let accepted = zbus::block_on(self.component_proxy(target)?.grab_focus())
             .map_err(|error| native_failure("Component.GrabFocus", target, error))?;
+        self.check_cancelled(true)?;
         if !accepted {
-            return Err(driver_error(
-                "DRIVER.ACTION_FAILED",
-                "Component.GrabFocus did not accept the request",
-            ));
+            let process_id = self.process_id(&target.bus_name).ok_or_else(|| {
+                driver_error(
+                    "DRIVER.ACTION_FAILED",
+                    "focus process ownership is unavailable",
+                )
+            })?;
+            self.verify_focused(target, window, process_id, deadline)
+                .map_err(|cause| {
+                    driver_error(
+                        "DRIVER.ACTION_FAILED",
+                        "Component.GrabFocus did not accept the request",
+                    )
+                    .with_cause(cause)
+                })?;
+            return Ok(
+                json!({"native_interface": "Component.grab_focus", "accepted": false, "already_focused": true, "focus_verified": true}),
+            );
         }
         Ok(json!({"native_interface": "Component.grab_focus", "accepted": true}))
     }
 
     fn invoke(&self, target: &NativeRef, deadline: Instant) -> Result<Value, AutomationError> {
-        let actions = self.actions(target);
-        let index = if actions.len() == 1 {
-            0
-        } else {
-            actions
-                .iter()
-                .position(|action| action.name == "Press")
-                .ok_or_else(|| {
-                    driver_error(
-                        "DRIVER.ACTION_UNSUPPORTED",
-                        "invoke has no unique qualified native action",
-                    )
-                })?
-        };
-        remaining(deadline, false)?;
-        let accepted = zbus::block_on(self.action_proxy(target)?.do_action(index as i32))
-            .map_err(|error| native_failure("Action.DoAction", target, error))?;
-        if !accepted {
-            return Err(driver_error(
-                "DRIVER.ACTION_FAILED",
-                "Action.DoAction did not accept the request",
-            ));
-        }
-        Ok(
-            json!({"native_interface": "Action.do_action", "accepted": true, "native_action_name": actions[index].name}),
-        )
+        self.check_cancelled(false)?;
+        let actions = self.canonical_actions(target, deadline)?;
+        let selected = actions::unique_activation(&actions).ok_or_else(|| {
+            driver_error(
+                "DRIVER.ACTION_UNSUPPORTED",
+                "invoke has no unique qualified native action",
+            )
+        })?;
+        self.invoke_canonical(target, &selected.name, deadline)
+    }
+
+    fn invoke_named(
+        &self,
+        target: &NativeRef,
+        name: &str,
+        deadline: Instant,
+    ) -> Result<Value, AutomationError> {
+        self.invoke_canonical(target, name, deadline)
     }
 
     fn set_text(
@@ -742,6 +1123,7 @@ impl AtspiBackend for LinuxBackend {
         text: &str,
         deadline: Instant,
     ) -> Result<Value, AutomationError> {
+        self.check_cancelled(false)?;
         remaining(deadline, false)?;
         let builder = EditableTextProxy::builder(self.connection.inner())
             .destination(target.bus_name.as_str())
@@ -753,8 +1135,10 @@ impl AtspiBackend for LinuxBackend {
                 .build(),
         )
         .map_err(|error| native_failure("EditableText proxy", target, error))?;
+        self.check_cancelled(false)?;
         let accepted = zbus::block_on(proxy.set_text_contents(text))
             .map_err(|error| native_failure("EditableText.SetTextContents", target, error))?;
+        self.check_cancelled(true)?;
         if !accepted {
             return Err(driver_error(
                 "DRIVER.ACTION_FAILED",
@@ -764,36 +1148,68 @@ impl AtspiBackend for LinuxBackend {
         Ok(json!({"native_interface": "EditableText.set_text_contents", "accepted": true}))
     }
 
+    fn secret_input(
+        &self,
+        target: &NativeRef,
+        text: &str,
+        deadline: Instant,
+    ) -> Result<Value, AutomationError> {
+        self.check_cancelled(false)?;
+        // Recheck the exact accessible immediately before the native setter.
+        // Never include D-Bus error text: an application could echo the secret.
+        let unavailable = || {
+            driver_error(
+                "DRIVER.ACTION_UNSUPPORTED",
+                "protected replacement could not be verified",
+            )
+        };
+        remaining(deadline, false)?;
+        let accessible = self.accessible(target).map_err(|_| unavailable())?;
+        let native_role = zbus::block_on(accessible.get_role()).map_err(|_| unavailable())?;
+        let role_name = zbus::block_on(accessible.get_role_name()).map_err(|_| unavailable())?;
+        let role = canonical_role(native_role, &role_name);
+        let interfaces = zbus::block_on(accessible.get_interfaces()).map_err(|_| unavailable())?;
+        let states = zbus::block_on(accessible.get_state()).map_err(|_| unavailable())?;
+        if !secret_editable(&role, interfaces.contains(Interface::EditableText), states) {
+            return Err(unavailable());
+        }
+        let builder = EditableTextProxy::builder(self.connection.inner())
+            .destination(target.bus_name.as_str())
+            .and_then(|builder| builder.path(target.object_path.as_str()))
+            .map_err(|_| unavailable())?;
+        let proxy = zbus::block_on(
+            builder
+                .cache_properties(zbus::proxy::CacheProperties::No)
+                .build(),
+        )
+        .map_err(|_| unavailable())?;
+        remaining(deadline, false)?;
+        self.check_cancelled(false)?;
+        let accepted = zbus::block_on(proxy.set_text_contents(text)).map_err(|_| {
+            driver_error(
+                "DRIVER.UNKNOWN_EFFECT",
+                "protected replacement was not confirmed",
+            )
+            .with_effect("unknown")
+        })?;
+        self.check_cancelled(true)?;
+        if !accepted {
+            return Err(driver_error(
+                "DRIVER.UNKNOWN_EFFECT",
+                "protected replacement was not confirmed",
+            )
+            .with_effect("unknown"));
+        }
+        Ok(json!({"submitted": true, "redacted": true}))
+    }
+
     fn named_action(
         &self,
         target: &NativeRef,
         name: &str,
         deadline: Instant,
     ) -> Result<Value, AutomationError> {
-        let actions = self.actions(target);
-        let matches = actions
-            .iter()
-            .enumerate()
-            .filter(|(_, action)| action.name.eq_ignore_ascii_case(name))
-            .collect::<Vec<_>>();
-        let [(index, action)] = matches.as_slice() else {
-            return Err(driver_error(
-                "DRIVER.ACTION_UNSUPPORTED",
-                format!("target has no unique native {name} action"),
-            ));
-        };
-        remaining(deadline, false)?;
-        let accepted = zbus::block_on(self.action_proxy(target)?.do_action(*index as i32))
-            .map_err(|error| native_failure("Action.DoAction", target, error))?;
-        if !accepted {
-            return Err(driver_error(
-                "DRIVER.ACTION_FAILED",
-                "Action.DoAction did not accept the request",
-            ));
-        }
-        Ok(
-            json!({"native_interface": "Action.do_action", "native_action_name": name, "native_action": {"index": index, "name": action.name, "description": action.description, "key_binding": action.keybinding}, "accepted": true, "dispatched": true, "no_op": false}),
-        )
+        self.dispatch_canonical_verb(target, name, deadline)
     }
 
     fn accessible_at_point(
@@ -803,6 +1219,7 @@ impl AtspiBackend for LinuxBackend {
         deadline: Instant,
     ) -> Result<Option<NativeRef>, AutomationError> {
         remaining(deadline, false)?;
+        let point = self.accessibility_point(root, point, deadline)?;
         let reference = zbus::block_on(self.component_proxy(root)?.get_accessible_at_point(
             point.0,
             point.1,
@@ -830,51 +1247,32 @@ impl AtspiBackend for LinuxBackend {
     fn type_text(
         &self,
         target: &NativeRef,
+        window: Option<&WindowAnchor>,
         text: &str,
         process_id: u32,
         deadline: Instant,
     ) -> Result<Value, AutomationError> {
-        let path = self.helper(HelperKind::Input)?;
-        let focus = self.focus(target, deadline)?;
-        std::thread::sleep(Duration::from_millis(50).min(remaining(deadline, true)?));
-        // The input method is per focused context. Query after grab_focus, before
-        // any key or keyboard mapping is sent; XTest text can otherwise be
-        // consumed as composition and still report a successful dispatch.
-        self.check_text_input_method(deadline)
-            .map_err(after_focus)?;
-        let args = [
-            "type-text".to_string(),
-            "--expected-pid".into(),
-            process_id.to_string(),
-            "--deadline-monotonic-ns".into(),
-            monotonic_deadline_ns(deadline)?.to_string(),
-        ];
-        let output = run_helper(
-            &path,
-            &args,
-            Some(text.as_bytes()),
-            deadline,
-            XTEST_OUTPUT_LIMIT,
-            XTEST_OUTPUT_LIMIT,
-        )
-        .map_err(after_focus)?;
-        let input =
-            parse_input_helper(output, "keyboard_dispatch", 2, process_id).map_err(after_focus)?;
-        Ok(
-            json!({"native_interface": "Component.grab_focus -> XTEST", "focus": focus, "input": input, "synthetic_input": true}),
-        )
+        self.type_text_mode(target, window, text, false, process_id, deadline)
     }
 
-    fn pointer_click(
+    fn type_text_keys(
         &self,
         target: &NativeRef,
+        window: Option<&WindowAnchor>,
+        text: &str,
+        process_id: u32,
+        deadline: Instant,
+    ) -> Result<Value, AutomationError> {
+        self.type_text_mode(target, window, text, true, process_id, deadline)
+    }
+    fn pointer_click(
+        &self,
+        _target: &NativeRef,
         point: (i32, i32),
         process_id: u32,
         deadline: Instant,
     ) -> Result<Value, AutomationError> {
-        let path = self.helper(HelperKind::Input)?;
-        let focus = self.focus(target, deadline)?;
-        std::thread::sleep(Duration::from_millis(50).min(remaining(deadline, true)?));
+        let path = self.input_helper("pointer-click", deadline)?;
         let args = [
             "pointer-click".to_string(),
             "--expected-pid".into(),
@@ -886,22 +1284,20 @@ impl AtspiBackend for LinuxBackend {
             "--deadline-monotonic-ns".into(),
             monotonic_deadline_ns(deadline)?.to_string(),
         ];
-        let output = run_helper(
+        let output = self.run_helper(
             &path,
             &args,
             None,
             deadline,
             XTEST_OUTPUT_LIMIT,
             XTEST_OUTPUT_LIMIT,
-        )
-        .map_err(after_focus)?;
-        let mut result =
-            parse_input_helper(output, "pointer_dispatch", 3, process_id).map_err(after_focus)?;
+        )?;
+        let mut result = parse_input_helper(output, "pointer_dispatch", 3, process_id)?;
         if let Some(object) = result.as_object_mut() {
             object.insert("click_point".into(), json!({"x": point.0, "y": point.1}));
         }
         Ok(
-            json!({"native_interface": "Component.grab_focus -> XTEST", "focus": focus, "input": result, "synthetic_input": true, "button": "left", "position": "center", "click_point": {"x": point.0, "y": point.1}}),
+            json!({"native_interface": "XTEST", "input": result, "synthetic_input": true, "button": "left", "position": "center", "click_point": {"x": point.0, "y": point.1}}),
         )
     }
 
@@ -910,6 +1306,29 @@ impl AtspiBackend for LinuxBackend {
         target: &NativeRef,
         point: (i32, i32),
         gesture: Gesture,
+        process_id: u32,
+        deadline: Instant,
+    ) -> Result<Value, AutomationError> {
+        self.pointer_gesture_modified(
+            target,
+            None,
+            point,
+            gesture,
+            &[],
+            None,
+            process_id,
+            deadline,
+        )
+    }
+
+    fn pointer_gesture_modified(
+        &self,
+        target: &NativeRef,
+        window: Option<&WindowAnchor>,
+        point: (i32, i32),
+        gesture: Gesture,
+        modifiers: &[String],
+        hold_ms: Option<u16>,
         process_id: u32,
         deadline: Instant,
     ) -> Result<Value, AutomationError> {
@@ -955,9 +1374,22 @@ impl AtspiBackend for LinuxBackend {
                 1
             }
         };
-        let input = self.run_input(target, args, minimum, process_id, deadline)?;
+        if !modifiers.is_empty() {
+            args.extend(["--modifiers".into(), modifiers.join(",")]);
+        }
+        if let Some(ms) = hold_ms {
+            args.extend(["--hold-ms".into(), ms.to_string()]);
+        }
+        let input = self.run_input(
+            target,
+            window,
+            args,
+            minimum + 2 * modifiers.len() as u64,
+            process_id,
+            deadline,
+        )?;
         Ok(
-            json!({"native_interface": "Component.grab_focus -> XTEST", "input": input, "synthetic_input": true, "point": {"x": point.0, "y": point.1}}),
+            json!({"native_interface": "XTEST", "input": input, "modifiers": modifiers, "synthetic_input": true, "point": {"x": point.0, "y": point.1}}),
         )
     }
 
@@ -970,7 +1402,32 @@ impl AtspiBackend for LinuxBackend {
         process_id: u32,
         deadline: Instant,
     ) -> Result<Value, AutomationError> {
-        let args = vec![
+        self.drag_modified(
+            target,
+            None,
+            from,
+            to,
+            button,
+            &[],
+            None,
+            process_id,
+            deadline,
+        )
+    }
+
+    fn drag_modified(
+        &self,
+        target: &NativeRef,
+        window: Option<&WindowAnchor>,
+        from: (i32, i32),
+        to: (i32, i32),
+        button: u8,
+        modifiers: &[String],
+        hold_ms: Option<u16>,
+        process_id: u32,
+        deadline: Instant,
+    ) -> Result<Value, AutomationError> {
+        let mut args = vec![
             "drag".to_string(),
             "--expected-pid".into(),
             process_id.to_string(),
@@ -985,28 +1442,54 @@ impl AtspiBackend for LinuxBackend {
             "--button".into(),
             button.to_string(),
         ];
-        let input = self.run_input(target, args, 3, process_id, deadline)?;
+        if !modifiers.is_empty() {
+            args.extend(["--modifiers".into(), modifiers.join(",")]);
+        }
+        if let Some(ms) = hold_ms {
+            args.extend(["--hold-ms".into(), ms.to_string()]);
+        }
+        let input = self.run_input(
+            target,
+            window,
+            args,
+            3 + 2 * modifiers.len() as u64,
+            process_id,
+            deadline,
+        )?;
         Ok(
-            json!({"native_interface": "Component.grab_focus -> XTEST", "input": input, "synthetic_input": true, "from": {"x": from.0, "y": from.1}, "to": {"x": to.0, "y": to.1}}),
+            json!({"native_interface": "XTEST", "input": input, "modifiers": modifiers, "synthetic_input": true, "from": {"x": from.0, "y": from.1}, "to": {"x": to.0, "y": to.1}}),
         )
+    }
+
+    fn drag_path(
+        &self,
+        request: super::DragPathRequest<'_>,
+        validate: super::DragPathValidation,
+    ) -> Result<Value, AutomationError> {
+        self.run_drag_path(request, validate)
     }
 
     fn key_chord(
         &self,
         target: &NativeRef,
+        window: Option<&WindowAnchor>,
         keys: &[String],
+        hold_ms: Option<u16>,
         process_id: u32,
         deadline: Instant,
     ) -> Result<Value, AutomationError> {
-        let args = vec![
+        let mut args = vec![
             "key-chord".to_string(),
             "--expected-pid".into(),
             process_id.to_string(),
             "--keys".into(),
             keys.join(","),
         ];
+        if let Some(ms) = hold_ms {
+            args.extend(["--hold-ms".into(), ms.to_string()]);
+        }
         let minimum = 2 * keys.len() as u64;
-        let input = self.run_input(target, args, minimum, process_id, deadline)?;
+        let input = self.run_input(target, window, args, minimum, process_id, deadline)?;
         Ok(
             json!({"native_interface": "Component.grab_focus -> XTEST", "input": input, "synthetic_input": true, "keys": keys}),
         )
@@ -1014,11 +1497,12 @@ impl AtspiBackend for LinuxBackend {
 
     fn capture_target(
         &self,
-        _target: &NativeRef,
+        target: &NativeRef,
         bounds: Bounds,
         process_id: u32,
         deadline: Instant,
     ) -> Result<(Vec<u8>, Map<String, Value>), AutomationError> {
+        self.verify_coordinate_target(target, deadline)?;
         let path = self.helper(HelperKind::Capture)?;
         let args = [
             "capture-target".to_string(),
@@ -1035,7 +1519,7 @@ impl AtspiBackend for LinuxBackend {
             "--deadline-monotonic-ns".into(),
             monotonic_deadline_ns(deadline)?.to_string(),
         ];
-        let output = run_helper(
+        let output = self.run_helper(
             &path,
             &args,
             None,
@@ -1083,13 +1567,26 @@ impl AtspiBackend for LinuxBackend {
 
     fn window_action(
         &self,
-        _target: &NativeRef,
+        target: &NativeRef,
         action: &str,
         bounds: Bounds,
         process_id: u32,
         deadline: Instant,
     ) -> Result<Value, AutomationError> {
-        let path = self.helper(HelperKind::Input)?;
+        let path = self.input_helper("window-action", deadline)?;
+        if let Err(unproven) = self.verify_coordinate_target(target, deadline) {
+            // A minimized window is unmapped, so it can never be calibrated.
+            // EWMH actions need no pointer coordinates: accept it only when
+            // the helper binds exactly these bounds to this process's
+            // minimized client, as the snapshot did when offering restore.
+            let minimized = unproven.code == "DRIVER.COORDINATE_UNPROVEN"
+                && self
+                    .window_info(process_id, bounds, &path, deadline)
+                    .is_some_and(|info| info["minimized"] == true);
+            if !minimized {
+                return Err(unproven);
+            }
+        }
         let mut args = window_args("window-action", process_id, bounds);
         args.extend([
             "--action".into(),
@@ -1102,7 +1599,7 @@ impl AtspiBackend for LinuxBackend {
             "--deadline-monotonic-ns".into(),
             monotonic_deadline_ns(deadline)?.to_string(),
         ]);
-        let output = run_helper(
+        let output = self.run_helper(
             &path,
             &args,
             None,
@@ -1130,21 +1627,33 @@ impl AtspiBackend for LinuxBackend {
     fn paste(
         &self,
         target: &NativeRef,
+        window: Option<&WindowAnchor>,
         text: &str,
         process_id: u32,
         deadline: Instant,
     ) -> Result<Value, AutomationError> {
-        let path = self.helper(HelperKind::Input)?;
-        let focus = self.focus(target, deadline)?;
+        let path = self.input_helper("paste", deadline)?;
+        let window = window.ok_or_else(|| {
+            driver_error(
+                "DRIVER.ACTION_UNSUPPORTED",
+                "input requires an observed top-level window",
+            )
+        })?;
+        self.input_helper("window-focus", deadline)?;
+        let focus = self.focus(target, Some(window), deadline)?;
         std::thread::sleep(Duration::from_millis(50).min(remaining(deadline, true)?));
-        let args = [
+        let window_id = self
+            .verify_focused(target, Some(window), process_id, deadline)
+            .map_err(after_focus)?;
+        let mut args = vec![
             "paste".to_string(),
             "--expected-pid".into(),
             process_id.to_string(),
             "--deadline-monotonic-ns".into(),
             monotonic_deadline_ns(deadline)?.to_string(),
         ];
-        let output = run_helper(
+        append_window_args(&mut args, window, Some(window_id));
+        let output = self.run_helper(
             &path,
             &args,
             Some(text.as_bytes()),
@@ -1156,10 +1665,11 @@ impl AtspiBackend for LinuxBackend {
         if input["consumed"] != true {
             return Err(driver_error(
                 "DRIVER.PASTE_NOT_CONSUMED",
-                "Ctrl+V reached the element but its process never asked for the text",
+                "paste text was not served to the target; inspect paste diagnostics",
             )
             .with_effect("unknown")
-            .with_detail("clipboard_restored", input["restored"].clone()));
+            .with_detail("clipboard_restored", input["restored"].clone())
+            .with_detail("paste_diagnostics", input["paste_diagnostics"].clone()));
         }
         Ok(
             json!({"native_interface": "Component.grab_focus -> X11 CLIPBOARD + XTEST Ctrl+V", "focus": focus, "input": input, "synthetic_input": true, "clipboard_restored": input["restored"]}),
@@ -1171,7 +1681,7 @@ impl AtspiBackend for LinuxBackend {
         max_bytes: usize,
         deadline: Instant,
     ) -> Result<Value, AutomationError> {
-        let path = self.helper(HelperKind::Input)?;
+        let path = self.input_helper("clipboard-read", deadline)?;
         let args = [
             "clipboard-read".to_string(),
             "--max-bytes".into(),
@@ -1179,7 +1689,7 @@ impl AtspiBackend for LinuxBackend {
             "--deadline-monotonic-ns".into(),
             monotonic_deadline_ns(deadline)?.to_string(),
         ];
-        let output = run_helper(
+        let output = self.run_helper(
             &path,
             &args,
             None,
@@ -1205,7 +1715,7 @@ impl AtspiBackend for LinuxBackend {
     }
 
     fn global_key(&self, keys: &[String], deadline: Instant) -> Result<Value, AutomationError> {
-        let path = self.helper(HelperKind::Input)?;
+        let path = self.input_helper("global-key", deadline)?;
         let args = [
             "global-key".to_string(),
             "--keys".into(),
@@ -1213,7 +1723,7 @@ impl AtspiBackend for LinuxBackend {
             "--deadline-monotonic-ns".into(),
             monotonic_deadline_ns(deadline)?.to_string(),
         ];
-        let output = run_helper(
+        let output = self.run_helper(
             &path,
             &args,
             None,
@@ -1243,24 +1753,164 @@ fn window_args(command: &str, process_id: u32, bounds: Bounds) -> Vec<String> {
 }
 
 impl LinuxBackend {
+    fn capture_tree(
+        &self,
+        root: NativeRef,
+        info: Map<String, Value>,
+        ancestors: Vec<NativeRef>,
+        max_depth: u32,
+        max_nodes: usize,
+        deadline: Instant,
+    ) -> Result<BackendSnapshot, AutomationError> {
+        self.ensure_focus_discovery(&info, deadline);
+        let input = self.probe_input(deadline).ok();
+        let mut snapshot = self.capture_tree_nodes(
+            root.clone(),
+            info,
+            ancestors,
+            max_depth,
+            max_nodes,
+            input.as_ref(),
+            deadline,
+        )?;
+        self.append_focused_branch(
+            &root,
+            &mut snapshot,
+            max_depth,
+            max_nodes,
+            input.as_ref(),
+            deadline,
+        )?;
+        self.normalize_coordinates(&mut snapshot, deadline)?;
+        let process_id = snapshot
+            .application
+            .get("process_id")
+            .and_then(Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok())
+            .filter(|value| *value > 0);
+        self.add_window_actions(&mut snapshot.nodes, process_id, input.as_ref(), deadline);
+        Ok(snapshot)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn capture_tree_nodes(
+        &self,
+        root: NativeRef,
+        info: Map<String, Value>,
+        ancestors: Vec<NativeRef>,
+        max_depth: u32,
+        max_nodes: usize,
+        input: Option<&InputSupport>,
+        deadline: Instant,
+    ) -> Result<BackendSnapshot, AutomationError> {
+        let mut nodes = Vec::new();
+        if ancestors.len() >= max_nodes {
+            return Err(driver_error(
+                "DRIVER.OUTPUT_TOO_LARGE",
+                "scope ancestors exceed the node budget",
+            ));
+        }
+        for ancestor in ancestors {
+            let parent = nodes.len().checked_sub(1);
+            nodes.push(self.read_node(ancestor, parent, &info, input, deadline)?.0);
+        }
+        let parent = nodes.len().checked_sub(1);
+        let mut queue = VecDeque::from([(root, parent, 0u32)]);
+        let mut truncated = false;
+        let mut truncation_reasons = Vec::new();
+        while let Some((target, parent, depth)) = queue.pop_front() {
+            self.check_cancelled(false)?;
+            remaining(deadline, false)?;
+            if nodes.len() >= max_nodes {
+                truncated = true;
+                capture_issue(
+                    &mut truncation_reasons,
+                    json!({"code": "max_nodes", "limit": max_nodes}),
+                );
+                break;
+            }
+            let (node, child_count) =
+                self.read_node(target.clone(), parent, &info, input, deadline)?;
+            let current = nodes.len();
+            nodes.push(node);
+            match self.child_references(&target, deadline) {
+                Ok(children) => {
+                    if children.returned_count != child_count {
+                        truncated = true;
+                        capture_issue(
+                            &mut truncation_reasons,
+                            json!({"code": "child_count_changed", "node_id": format!("n{current}"), "reported_children": child_count, "returned_children": children.returned_count}),
+                        );
+                    }
+                    if depth >= max_depth {
+                        if !children.items.is_empty() {
+                            truncated = true;
+                            capture_issue(
+                                &mut truncation_reasons,
+                                json!({"code": "max_depth", "node_id": format!("n{current}"), "limit": max_depth}),
+                            );
+                        }
+                        continue;
+                    }
+                    for child in children.items {
+                        if nodes.len() + queue.len() >= max_nodes {
+                            truncated = true;
+                            capture_issue(
+                                &mut truncation_reasons,
+                                json!({"code": "max_nodes", "node_id": format!("n{current}"), "limit": max_nodes}),
+                            );
+                            break;
+                        }
+                        queue.push_back((child, Some(current), depth + 1));
+                    }
+                }
+                Err(error)
+                    if error.code == "DRIVER.TIMEOUT"
+                        || error.code == "DRIVER.OUTPUT_TOO_LARGE" =>
+                {
+                    return Err(error);
+                }
+                Err(error) => {
+                    truncated = true;
+                    capture_issue(
+                        &mut truncation_reasons,
+                        json!({"code": "children_unavailable", "node_id": format!("n{current}"), "error_code": error.code}),
+                    );
+                }
+            }
+        }
+        Ok(BackendSnapshot {
+            application: info,
+            nodes,
+            truncated,
+            truncation_reasons,
+        })
+    }
+
     /// The window manager's view of a top-level frame, when the X11 helper
     /// and an EWMH window manager are there; `None` offers no window actions.
-    fn window_info(&self, process_id: u32, bounds: Bounds, deadline: Instant) -> Option<Value> {
-        let path = self.helper(HelperKind::Input).ok()?;
+    fn window_info(
+        &self,
+        process_id: u32,
+        bounds: Bounds,
+        path: &Path,
+        deadline: Instant,
+    ) -> Option<Value> {
         let mut args = window_args("window-info", process_id, bounds);
         args.extend([
             "--deadline-monotonic-ns".into(),
             monotonic_deadline_ns(deadline).ok()?.to_string(),
         ]);
-        let output = run_helper(
-            &path,
-            &args,
-            None,
-            deadline.min(Instant::now() + Duration::from_secs(2)),
-            XTEST_OUTPUT_LIMIT,
-            XTEST_OUTPUT_LIMIT,
-        )
-        .ok()?;
+        let output = self
+            .run_helper(
+                path,
+                &args,
+                None,
+                deadline.min(Instant::now() + Duration::from_secs(2)),
+                XTEST_OUTPUT_LIMIT,
+                XTEST_OUTPUT_LIMIT,
+            )
+            .ok()?;
         if !output.status.success() {
             return None;
         }
@@ -1274,12 +1924,23 @@ impl LinuxBackend {
         &self,
         nodes: &mut [BackendNode],
         process_id: Option<u32>,
+        input: Option<&InputSupport>,
         deadline: Instant,
     ) {
+        let Some(input) =
+            input.filter(|input| input.has("window-info") && input.has("window-action"))
+        else {
+            return;
+        };
         let Some(process_id) = process_id else {
             return;
         };
         for node in nodes.iter_mut() {
+            // Uncalibrated bounds stay toolkit-logical, so a mapped window is
+            // skipped. A minimized one is unmapped and can never be calibrated;
+            // the helper below still binds it by these exact bounds.
+            let unproven =
+                node.provenance.get("coordinate_space") == Some(&json!("unproven_toolkit"));
             // A direct child of the application is a top-level window: GTK and
             // Qt main windows say frame/dialog, a bare QWidget window filler.
             // The helper still proves an X11 client window of this process
@@ -1291,11 +1952,14 @@ impl LinuxBackend {
             if !top_level || remaining(deadline, false).is_err() {
                 continue;
             }
-            let Some(info) = self.window_info(process_id, bounds, deadline) else {
+            let Some(info) = self.window_info(process_id, bounds, &input.path, deadline) else {
                 continue;
             };
             let supports = |name: &str| info["supports"][name] == true;
             let minimized = info["minimized"] == true;
+            if unproven && !minimized {
+                continue;
+            }
             let maximized = info["maximized"] == true;
             let mut offered = Vec::new();
             if !minimized {
@@ -1320,6 +1984,100 @@ impl LinuxBackend {
             );
         }
     }
+}
+
+const INPUT_HELPER_PROTOCOL: u64 = 1;
+
+/// Capabilities describe the binary, not the user's display. Live display,
+/// focus, UID and hit checks still run for every actual operation.
+struct InputSupport {
+    path: PathBuf,
+    features: BTreeSet<String>,
+}
+
+impl InputSupport {
+    fn has(&self, feature: &str) -> bool {
+        self.features.contains(feature)
+    }
+
+    fn require(&self, feature: &str) -> Result<(), AutomationError> {
+        if self.has(feature) {
+            Ok(())
+        } else {
+            Err(
+                incompatible_helper("required helper feature is unavailable")
+                    .with_detail("required_feature", json!(feature)),
+            )
+        }
+    }
+}
+
+fn incompatible_helper(reason: &str) -> AutomationError {
+    driver_error(
+        "DRIVER.HELPER_INCOMPATIBLE",
+        format!("{reason}; rebuild and install the Linux XTest helper from the same source as aad"),
+    )
+    .with_detail("expected_protocol", json!(INPUT_HELPER_PROTOCOL))
+    .with_detail("dispatch_started", json!(false))
+}
+
+fn parse_helper_description(output: HelperOutput) -> Result<BTreeSet<String>, AutomationError> {
+    if !output.status.success() {
+        return Err(incompatible_helper(
+            "Linux XTest helper does not support the capability handshake",
+        ));
+    }
+    let description =
+        parse_one_json_object(&output.stdout, "input helper capabilities").map_err(|_| {
+            incompatible_helper("Linux XTest helper returned an invalid capability handshake")
+        })?;
+    if description.get("helper").and_then(Value::as_str) != Some("aad-linux-xtest")
+        || description.get("protocol").and_then(Value::as_u64) != Some(INPUT_HELPER_PROTOCOL)
+    {
+        return Err(incompatible_helper(
+            "Linux XTest helper protocol does not match this adapter",
+        ));
+    }
+    let features = description
+        .get("features")
+        .and_then(Value::as_array)
+        .filter(|items| items.len() <= 64)
+        .ok_or_else(|| incompatible_helper("Linux XTest helper feature list is invalid"))?;
+    let mut result = BTreeSet::new();
+    for feature in features {
+        let feature = feature
+            .as_str()
+            .filter(|feature| {
+                !feature.is_empty()
+                    && feature.len() <= 64
+                    && feature
+                        .bytes()
+                        .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == b'-')
+            })
+            .ok_or_else(|| incompatible_helper("Linux XTest helper feature name is invalid"))?;
+        if !result.insert(feature.to_string()) {
+            return Err(incompatible_helper(
+                "Linux XTest helper features contain duplicates",
+            ));
+        }
+    }
+    Ok(result)
+}
+
+fn probe_input_helper(path: &Path, deadline: Instant) -> Result<BTreeSet<String>, AutomationError> {
+    let output = run_helper(
+        path,
+        &["describe".into()],
+        None,
+        deadline.min(Instant::now() + Duration::from_millis(500)),
+        XTEST_OUTPUT_LIMIT,
+        XTEST_OUTPUT_LIMIT,
+    )
+    .map_err(|error| {
+        incompatible_helper("Linux XTest helper capability handshake failed")
+            .with_detail("cause_code", json!(error.code))
+    })?;
+    parse_helper_description(output)
 }
 
 #[derive(Clone, Copy)]
@@ -1377,6 +2135,30 @@ fn run_helper(
     stdout_limit: usize,
     stderr_limit: usize,
 ) -> Result<HelperOutput, AutomationError> {
+    run_helper_cancellable(
+        path,
+        args,
+        input,
+        deadline,
+        stdout_limit,
+        stderr_limit,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_helper_cancellable(
+    path: &Path,
+    args: &[String],
+    input: Option<&[u8]>,
+    deadline: Instant,
+    stdout_limit: usize,
+    stderr_limit: usize,
+    token: Option<&super::CancellationToken>,
+) -> Result<HelperOutput, AutomationError> {
+    if let Some(token) = token {
+        token.check()?;
+    }
     remaining(deadline, false)?;
     let mut command = Command::new(path);
     command
@@ -1406,14 +2188,16 @@ fn run_helper(
         )
         .with_detail("cause", json!(error.to_string()))
     })?;
-    if let Some(input) = input {
-        let mut stdin = child.stdin.take().expect("stdin is piped");
-        if let Err(error) = stdin.write_all(input) {
+    if let Some(stdin) = child.stdin.as_ref() {
+        use std::os::fd::AsRawFd;
+        let fd = stdin.as_raw_fd();
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
             terminate(&mut child);
-            return Err(
-                driver_error("DRIVER.ACTION_FAILED", "helper input could not be written")
-                    .with_detail("cause", json!(error.to_string())),
-            );
+            return Err(driver_error(
+                "DRIVER.UNAVAILABLE",
+                "helper input pipe could not be made cancellable",
+            ));
         }
     }
     let mut stdout = child.stdout.take().expect("stdout is piped");
@@ -1429,8 +2213,9 @@ fn run_helper(
     let mut stdout_result = None;
     let mut stderr_result = None;
     let mut status = None;
+    let mut input_offset = 0;
     loop {
-        match receiver.recv_timeout(Duration::from_millis(20)) {
+        match receiver.recv_timeout(Duration::from_millis(10)) {
             Ok(("stdout", Ok(bytes))) => stdout_result = Some(bytes),
             Ok(("stderr", Ok(bytes))) => stderr_result = Some(bytes),
             Ok((name, Err(error))) => {
@@ -1456,14 +2241,85 @@ fn run_helper(
                 .with_detail("cause", json!(error.to_string()))
             })?;
         }
+        if let Some(token) = token.filter(|token| token.is_cancelled()) {
+            // Let the helper's signal handler release owned input and restore
+            // the clipboard. Cleanup is independent of the cancelled token.
+            let clean_exit = terminate_with_grace(&mut child, Duration::from_secs(3));
+            let _ = stdout_thread.join();
+            let _ = stderr_thread.join();
+            while let Ok((name, result)) = receiver.try_recv() {
+                if name == "stdout" {
+                    stdout_result = result.ok();
+                }
+            }
+            let dispatched = stdout_result.as_deref().is_some_and(helper_dispatched);
+            return Err(token
+                .check()
+                .unwrap_err()
+                .with_effect(if dispatched || !clean_exit {
+                    "unknown"
+                } else {
+                    "not_applied"
+                })
+                .with_detail("dispatch_started", json!(dispatched))
+                .with_detail("helper_exited_before_kill", json!(clean_exit)));
+        }
         if status.is_some() && stdout_result.is_some() && stderr_result.is_some() {
             break;
         }
         if Instant::now() >= deadline {
-            terminate(&mut child);
+            let clean_exit = terminate_with_grace(&mut child, Duration::from_secs(3));
             let _ = stdout_thread.join();
             let _ = stderr_thread.join();
-            return Err(super::timeout_error(false));
+            while let Ok((name, result)) = receiver.try_recv() {
+                if name == "stdout" {
+                    stdout_result = result.ok();
+                }
+            }
+            let dispatched = stdout_result.as_deref().is_some_and(helper_dispatched);
+            return Err(super::timeout_error(dispatched || !clean_exit)
+                .with_detail("dispatch_started", json!(dispatched))
+                .with_detail("helper_exited_before_kill", json!(clean_exit)));
+        }
+        if let (Some(input), Some(stdin)) = (input, child.stdin.as_mut()) {
+            // A helper may stop consuming stdin. Never block cancellation or
+            // the deadline on a payload larger than the kernel pipe capacity.
+            let result = stdin.write(&input[input_offset..]);
+            match result {
+                Ok(written) => {
+                    input_offset += written;
+                    if input_offset == input.len() {
+                        child.stdin.take();
+                    }
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                    ) => {}
+                Err(_) => {
+                    let clean_exit = terminate_with_grace(&mut child, Duration::from_secs(3));
+                    let _ = stdout_thread.join();
+                    let _ = stderr_thread.join();
+                    while let Ok((name, result)) = receiver.try_recv() {
+                        if name == "stdout" {
+                            stdout_result = result.ok();
+                        }
+                    }
+                    let dispatched = stdout_result.as_deref().is_some_and(helper_dispatched);
+                    return Err(driver_error(
+                        "DRIVER.ACTION_FAILED",
+                        "helper input could not be written",
+                    )
+                    .with_effect(if dispatched || !clean_exit {
+                        "unknown"
+                    } else {
+                        "not_applied"
+                    })
+                    .with_detail("dispatch_started", json!(dispatched))
+                    .with_detail("helper_exited_before_kill", json!(clean_exit)));
+                }
+            }
         }
     }
     let _ = stdout_thread.join();
@@ -1473,6 +2329,13 @@ fn run_helper(
         stdout: stdout_result.unwrap_or_default(),
         stderr: stderr_result.unwrap_or_default(),
     })
+}
+
+fn helper_dispatched(bytes: &[u8]) -> bool {
+    bytes
+        .split(|byte| *byte == b'\n')
+        .filter_map(|line| serde_json::from_slice::<Value>(line).ok())
+        .any(|value| value["event"] == "dispatch_started" || value["dispatch_started"] == true)
 }
 
 fn read_bounded(reader: &mut impl Read, limit: usize) -> std::io::Result<Vec<u8>> {
@@ -1488,13 +2351,25 @@ fn read_bounded(reader: &mut impl Read, limit: usize) -> std::io::Result<Vec<u8>
 }
 
 fn terminate(child: &mut Child) {
+    terminate_with_grace(child, Duration::from_millis(200));
+}
+
+fn terminate_with_grace(child: &mut Child, grace: Duration) -> bool {
+    // A completed paste can leave its clipboard restorer in the process group.
+    // Never signal that group after its helper has already exited.
+    if child.try_wait().ok().flatten().is_some() {
+        return true;
+    }
     unsafe {
         libc::kill(-(child.id() as i32), libc::SIGTERM);
     }
-    let grace = Instant::now() + Duration::from_millis(200);
+    // Signal first, then EOF: a cooperative helper must not treat an unfinished
+    // text frame as an ordinary completed request before seeing cancellation.
+    child.stdin.take();
+    let grace = Instant::now() + grace;
     while Instant::now() < grace {
         if child.try_wait().ok().flatten().is_some() {
-            return;
+            return true;
         }
         std::thread::sleep(Duration::from_millis(20));
     }
@@ -1503,6 +2378,19 @@ fn terminate(child: &mut Child) {
     }
     let _ = child.kill();
     let _ = child.wait();
+    false
+}
+
+fn valid_focus_proof(proof: &Map<String, Value>, process_id: u32) -> bool {
+    proof.get("ok") == Some(&Value::Bool(true))
+        && proof.get("focused") == Some(&Value::Bool(true))
+        && proof.get("expected_pid").and_then(Value::as_u64) == Some(u64::from(process_id))
+        && proof.get("window_bound") == Some(&Value::Bool(true))
+        && proof
+            .get("window")
+            .and_then(Value::as_u64)
+            .is_some_and(|id| id > 0 && id <= u64::from(u32::MAX))
+        && !proof.contains_key("dispatch_started")
 }
 
 fn parse_input_helper(
@@ -1559,13 +2447,41 @@ fn parse_input_helper(
                 answer[key] = value.clone();
             }
         }
+        if let Some(diagnostics) = result.get("paste_diagnostics").and_then(Value::as_object) {
+            let mut safe = Map::new();
+            for key in [
+                "selection_requests",
+                "accepted_requests",
+                "rejected_requests",
+                "targets_requests",
+                "metadata_requests",
+                "text_requests",
+                "unsupported_requests",
+                "failed_writes",
+                "selection_lost",
+                "deadline_exceeded",
+                "target_window_found",
+                "resource_mask_available",
+            ] {
+                if let Some(value) = diagnostics
+                    .get(key)
+                    .filter(|value| value.is_u64() || value.is_boolean())
+                {
+                    safe.insert(key.into(), value.clone());
+                }
+            }
+            answer["paste_diagnostics"] = Value::Object(safe);
+        }
         return Ok(answer);
     }
     let code = output.status.code();
     let helper_code = helper_error_code(&output.stdout);
     if !dispatched {
         if let Some(mapped) = helper_code.as_deref().and_then(map_helper_code) {
-            return Err(mapped.with_detail("helper_code", json!(helper_code)));
+            return Err(mapped
+                .with_detail("helper_code", json!(helper_code))
+                .with_detail("helper_exit_code", json!(code))
+                .with_detail("dispatch_started", json!(false)));
         }
     }
     if dispatched || code == Some(70) {
@@ -1574,7 +2490,9 @@ fn parse_input_helper(
             "XTest helper failed after dispatch",
         )
         .with_effect("unknown")
-        .with_detail("phase", json!(phase)));
+        .with_detail("phase", json!(phase))
+        .with_detail("helper_code", json!(helper_code))
+        .with_detail("dispatch_started", json!(dispatched)));
     }
     let (error_code, message, retryable) = match code {
         Some(69) => ("DRIVER.UNAVAILABLE", "X11/XTest is unavailable", false),
@@ -1596,7 +2514,9 @@ fn parse_input_helper(
     };
     Err(driver_error(error_code, message)
         .with_retryable(retryable)
-        .with_detail("helper_exit_code", json!(code)))
+        .with_detail("helper_exit_code", json!(code))
+        .with_detail("helper_code", json!(helper_code))
+        .with_detail("dispatch_started", json!(false)))
 }
 
 /// The `code` of the helper's failure record, if it printed one.
@@ -1631,16 +2551,30 @@ fn map_helper_code(code: &str) -> Option<AutomationError> {
             "DRIVER.CLIPBOARD_BUSY",
             "another client kept the clipboard; nothing was pasted",
         ),
-        "focus_owner_mismatch" => driver_error(
+        "focus_owner_mismatch" | "focus_owner_changed" => driver_error(
             "DRIVER.FOCUS_LOST",
             "keyboard focus is not in the target's process; no key was sent",
+        ),
+        "target_point_mismatch" => driver_error(
+            "DRIVER.POINT_NOT_PROVEN",
+            "the pointer location is not on a target-process window; no input was sent",
+        ),
+        "modifier_unavailable_or_held" => driver_error(
+            "DRIVER.ACTION_UNSUPPORTED",
+            "a pointer modifier is unavailable or already held; no input was sent",
+        ),
+        "input_already_held" => driver_error(
+            "DRIVER.ACTION_UNSUPPORTED",
+            "external input is already held; no input was sent or released",
         ),
         _ => return None,
     })
 }
 
 fn after_focus(error: AutomationError) -> AutomationError {
-    if error.code == "DRIVER.UNKNOWN_EFFECT" {
+    if error.code == "DRIVER.CANCELLED" {
+        error.with_effect("unknown")
+    } else if error.code == "DRIVER.UNKNOWN_EFFECT" {
         error
     } else {
         driver_error(
@@ -1919,7 +2853,9 @@ impl LinuxBackend {
     /// An element as the watched events carry it.
     fn describe(&self, target: &NativeRef, info: &Map<String, Value>) -> Option<Value> {
         let deadline = Instant::now() + Duration::from_secs(2);
-        let (node, _) = self.read_node(target.clone(), None, info, deadline).ok()?;
+        let (node, _) = self
+            .read_node(target.clone(), None, info, None, deadline)
+            .ok()?;
         let protected = node.states.get("protected").copied().flatten() == Some(true);
         Some(json!({
             "role": node.role,
@@ -2124,7 +3060,7 @@ impl LinuxBackend {
                     "the application has no process id",
                 )
             })?;
-        let helper = self.helper(HelperKind::Input)?;
+        let helper = self.input_helper("record-input", deadline)?;
         let mut command = Command::new(&helper);
         helper_environment(&mut command);
         command
@@ -2201,6 +3137,449 @@ impl LinuxBackend {
         let _ = recorder.input.kill();
         let _ = recorder.input.wait();
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod capture_tests {
+    use super::*;
+    use std::os::unix::process::ExitStatusExt;
+
+    #[test]
+    fn numeric_password_role_overrides_qt_generic_text_role_name() {
+        assert_eq!(
+            canonical_role(atspi::Role::PasswordText, "text"),
+            "password_text"
+        );
+        assert_eq!(
+            canonical_role(atspi::Role::PasswordText, ""),
+            "password_text"
+        );
+        assert_eq!(canonical_role(atspi::Role::Text, "text"), "text");
+        assert_eq!(
+            canonical_role(atspi::Role::Text, "password text"),
+            "password_text"
+        );
+        let states = [State::Editable, State::Enabled, State::Sensitive]
+            .into_iter()
+            .collect();
+        assert!(secret_editable(
+            &canonical_role(atspi::Role::PasswordText, "text"),
+            true,
+            states
+        ));
+        assert!(!secret_editable(
+            &canonical_role(atspi::Role::Text, "text"),
+            true,
+            states
+        ));
+    }
+
+    #[test]
+    fn secret_native_guard_requires_password_editability_and_enabled_state() {
+        let states = [State::Editable, State::Enabled, State::Sensitive]
+            .into_iter()
+            .collect();
+        assert!(secret_editable("password_text", true, states));
+        assert!(!secret_editable("text", true, states));
+        assert!(!secret_editable("password_text", false, states));
+        assert!(!secret_editable(
+            "password_text",
+            true,
+            [State::Enabled, State::Sensitive].into_iter().collect()
+        ));
+        assert!(!secret_editable(
+            "password_text",
+            true,
+            [State::Editable, State::Sensitive].into_iter().collect()
+        ));
+    }
+
+    #[test]
+    fn helper_handshake_rejects_legacy_malformed_and_wrong_protocol_without_input() {
+        for (status, body) in [
+            (64, r#"{"ok":false,"code":"invalid_arguments"}"#),
+            (
+                0,
+                r#"{"helper":"aad-linux-xtest","protocol":0,"features":[]}"#,
+            ),
+            (
+                0,
+                r#"{"helper":"another-helper","protocol":1,"features":[]}"#,
+            ),
+            (
+                0,
+                r#"{"helper":"aad-linux-xtest","protocol":1,"features":["drag","drag"]}"#,
+            ),
+            (
+                0,
+                r#"{"helper":"aad-linux-xtest","protocol":1,"features":["arbitrary text"]}"#,
+            ),
+            (0, "not json"),
+        ] {
+            let error = parse_helper_description(HelperOutput {
+                status: ExitStatus::from_raw(status << 8),
+                stdout: body.as_bytes().to_vec(),
+                stderr: vec![],
+            })
+            .unwrap_err();
+            assert_eq!(error.code, "DRIVER.HELPER_INCOMPATIBLE");
+            assert_eq!(error.effect, "not_applied");
+            assert_eq!(error.details["dispatch_started"], false);
+        }
+    }
+
+    #[test]
+    fn capability_probe_executes_only_describe_and_never_requires_a_display() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("aad-helper-probe-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let helper = dir.join("helper");
+        // The fake helper rejects any command other than describe. This exercises
+        // the real subprocess boundary without touching an X server or user input.
+        std::fs::write(&helper, concat!(
+            "#!/bin/sh\n",
+            "test \"$#\" = 1 && test \"$1\" = describe || exit 91\n",
+            "printf '%s\\n' '{\"helper\":\"aad-linux-xtest\",\"protocol\":1,\"features\":[\"pointer-gesture\"]}'\n",
+        )).unwrap();
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let result = probe_input_helper(&helper, Instant::now() + Duration::from_secs(2));
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(
+            result.unwrap(),
+            BTreeSet::from(["pointer-gesture".to_string()])
+        );
+    }
+
+    #[test]
+    fn helper_features_are_individually_required_and_unknown_future_features_are_safe() {
+        let features = parse_helper_description(HelperOutput {
+            status: ExitStatus::from_raw(0),
+            stdout: br#"{"helper":"aad-linux-xtest","protocol":1,"features":["pointer-gesture","future-read-only"]}"#.to_vec(),
+            stderr: vec![],
+        }).unwrap();
+        let support = InputSupport {
+            path: "/unused".into(),
+            features,
+        };
+        assert!(support.require("pointer-gesture").is_ok());
+        let error = support.require("pointer-modifiers").unwrap_err();
+        assert_eq!(error.code, "DRIVER.HELPER_INCOMPATIBLE");
+        assert_eq!(error.details["required_feature"], "pointer-modifiers");
+        let error = support.require("bounded-hold").unwrap_err();
+        assert_eq!(error.code, "DRIVER.HELPER_INCOMPATIBLE");
+        assert_eq!(error.details["required_feature"], "bounded-hold");
+        assert!(!support.has("focus-info"));
+        assert!(!support.has("window-focus"));
+    }
+
+    #[test]
+    fn cancellation_waits_for_helper_cleanup_and_preserves_dispatch_evidence() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("aad-helper-cancel-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let helper = dir.join("helper");
+        std::fs::write(
+            &helper,
+            concat!(
+                "#!/bin/sh\n",
+                "trap 'touch cleaned; exit 0' TERM\n",
+                "printf '%s\\n' '{\"event\":\"dispatch_started\"}'\n",
+                "touch ready\n",
+                "while :; do sleep 0.01; done\n",
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let token = super::super::CancellationToken::new();
+        let worker_token = token.clone();
+        let ready = dir.join("ready");
+        let canceller = std::thread::spawn(move || {
+            let until = Instant::now() + Duration::from_secs(3);
+            while !ready.exists() && Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            worker_token.cancel();
+        });
+        let error = run_helper_cancellable(
+            &helper,
+            &[],
+            None,
+            Instant::now() + Duration::from_secs(5),
+            4096,
+            4096,
+            Some(&token),
+        )
+        .err()
+        .expect("helper must observe cancellation");
+        canceller.join().unwrap();
+        assert_eq!(error.code, "DRIVER.CANCELLED");
+        assert_eq!(error.effect, "unknown");
+        assert_eq!(error.details["dispatch_started"], true);
+        assert_eq!(error.details["helper_exited_before_kill"], true);
+        assert!(dir.join("cleaned").exists());
+        std::fs::remove_file(dir.join("ready")).unwrap();
+        let error = run_helper_cancellable(
+            &helper,
+            &[],
+            None,
+            Instant::now() + Duration::from_secs(5),
+            4096,
+            4096,
+            Some(&token),
+        )
+        .err()
+        .expect("cancelled invocation must not start helper");
+        assert_eq!(error.effect, "not_applied");
+        assert!(!dir.join("ready").exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn cancellation_interrupts_a_large_payload_when_the_helper_never_reads_stdin() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("aad-helper-pipe-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let helper = dir.join("helper");
+        std::fs::write(
+            &helper,
+            concat!(
+                "#!/bin/sh\n",
+                "trap 'touch cleaned; exit 0' TERM\n",
+                "touch ready\n",
+                "while :; do sleep 0.01; done\n",
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let token = super::super::CancellationToken::new();
+        let worker_token = token.clone();
+        let ready = dir.join("ready");
+        let canceller = std::thread::spawn(move || {
+            let until = Instant::now() + Duration::from_secs(3);
+            while !ready.exists() && Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            // Give the writer time to fill the bounded kernel pipe first.
+            std::thread::sleep(Duration::from_millis(50));
+            worker_token.cancel();
+        });
+        let started = Instant::now();
+        let error = run_helper_cancellable(
+            &helper,
+            &[],
+            Some(&vec![b'a'; 4 * 1024 * 1024]),
+            Instant::now() + Duration::from_secs(5),
+            4096,
+            4096,
+            Some(&token),
+        )
+        .err()
+        .expect("blocked input must cancel");
+        canceller.join().unwrap();
+        assert_eq!(error.code, "DRIVER.CANCELLED");
+        assert_eq!(error.effect, "not_applied");
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(dir.join("cleaned").exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn forced_helper_termination_cannot_prove_non_dispatch_from_missing_output() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("aad-helper-forced-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let helper = dir.join("helper");
+        std::fs::write(
+            &helper,
+            "#!/bin/sh\ntrap '' TERM\ntouch ready\nwhile :; do sleep 0.01; done\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let token = super::super::CancellationToken::new();
+        let worker_token = token.clone();
+        let ready = dir.join("ready");
+        let canceller = std::thread::spawn(move || {
+            let until = Instant::now() + Duration::from_secs(3);
+            while !ready.exists() && Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            worker_token.cancel();
+        });
+        let error = run_helper_cancellable(
+            &helper,
+            &[],
+            Some(&vec![b'a'; 4 * 1024 * 1024]),
+            Instant::now() + Duration::from_secs(5),
+            4096,
+            4096,
+            Some(&token),
+        )
+        .err()
+        .expect("uncooperative helper must stop");
+        canceller.join().unwrap();
+        assert_eq!(error.code, "DRIVER.CANCELLED");
+        assert_eq!(error.effect, "unknown");
+        assert_eq!(error.details["dispatch_started"], false);
+        assert_eq!(error.details["helper_exited_before_kill"], false);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn nonblocking_helper_input_delivers_the_whole_frame_then_eof() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("aad-helper-frame-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let helper = dir.join("helper");
+        std::fs::write(
+            &helper,
+            "#!/bin/sh\ncat > received\nprintf '%s\\n' '{\"ok\":true}'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let payload = "synthetic-中文-frame".repeat(16_384).into_bytes();
+        let output = run_helper_cancellable(
+            &helper,
+            &[],
+            Some(&payload),
+            Instant::now() + Duration::from_secs(5),
+            4096,
+            4096,
+            Some(&super::super::CancellationToken::new()),
+        )
+        .unwrap_or_else(|error| panic!("helper delivery failed: {}", error.code));
+        assert!(output.status.success());
+        assert_eq!(std::fs::read(dir.join("received")).unwrap(), payload);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn helper_refusals_preserve_proven_non_dispatch_and_specific_cause() {
+        let error = parse_input_helper(HelperOutput {
+            status: ExitStatus::from_raw(73 << 8),
+            stdout: b"{\"ok\":false,\"code\":\"target_point_mismatch\",\"dispatch_started\":false}\n".to_vec(),
+            stderr: vec![],
+        }, "pointer_dispatch", 1, 42).unwrap_err();
+        assert_eq!(error.code, "DRIVER.POINT_NOT_PROVEN");
+        assert_eq!(error.effect, "not_applied");
+        assert_eq!(error.details["helper_code"], "target_point_mismatch");
+        assert_eq!(error.details["dispatch_started"], false);
+    }
+
+    #[test]
+    fn paste_diagnostics_keep_counts_and_flags_without_payloads() {
+        let result = parse_input_helper(HelperOutput {
+            status: ExitStatus::from_raw(0),
+            stdout: b"{\"ok\":true,\"dispatch_started\":true,\"events\":4,\"consumed\":false,\"paste_diagnostics\":{\"selection_requests\":3,\"target_window_found\":true,\"text_requests\":\"secret\",\"clipboard_text\":\"secret\"}}\n".to_vec(),
+            stderr: vec![],
+        }, "keyboard_dispatch", 4, 42).unwrap();
+        assert_eq!(
+            result["paste_diagnostics"],
+            json!({"selection_requests": 3, "target_window_found": true})
+        );
+    }
+
+    #[test]
+    fn pointer_state_requires_visibility_but_not_keyboard_focusability() {
+        let states = [
+            State::Enabled,
+            State::Visible,
+            State::Showing,
+            State::Sensitive,
+        ]
+        .into_iter()
+        .collect::<atspi::StateSet>();
+        assert!(!states.contains(State::Focusable));
+        assert!(pointer_state_allows_input(Some(states)));
+        assert!(!pointer_state_allows_input(None));
+        assert!(!pointer_state_allows_input(Some(
+            [
+                State::Enabled,
+                State::Showing,
+                State::Sensitive,
+                State::Focusable
+            ]
+            .into_iter()
+            .collect()
+        )));
+    }
+
+    #[test]
+    fn focus_proof_requires_a_bound_window_and_expected_pid_without_input_dispatch() {
+        for (proof, expected) in [
+            (
+                json!({"ok": true, "focused": true, "expected_pid": 42}),
+                false,
+            ),
+            (
+                json!({"ok": true, "focused": true, "expected_pid": 42, "window_bound": true, "window": 123}),
+                true,
+            ),
+            (
+                json!({"ok": true, "focused": true, "expected_pid": 42, "window_bound": true, "window": 0}),
+                false,
+            ),
+            (
+                json!({"ok": true, "focused": true, "expected_pid": 42, "window_bound": false, "window": 123}),
+                false,
+            ),
+            (
+                json!({"ok": true, "focused": false, "expected_pid": 42}),
+                false,
+            ),
+            (
+                json!({"ok": true, "focused": true, "expected_pid": 43}),
+                false,
+            ),
+            (
+                json!({"ok": false, "focused": true, "expected_pid": 42}),
+                false,
+            ),
+            (
+                json!({"ok": true, "focused": true, "expected_pid": 42, "dispatch_started": false}),
+                false,
+            ),
+        ] {
+            assert_eq!(valid_focus_proof(proof.as_object().unwrap(), 42), expected);
+        }
+    }
+
+    #[test]
+    fn null_children_do_not_become_unavailable_nodes_or_count_mismatches() {
+        let native = |path: &str| NativeRef {
+            bus_name: ":1.42".into(),
+            object_path: path.into(),
+        };
+        let children = ChildReferences::new(vec![
+            native("/org/a11y/atspi/null"),
+            native("/org/a11y/atspi/accessible/null"),
+            native("/org/a11y/atspi/accessible/42"),
+            native("/org/a11y/atspi/accessible/nullish"),
+        ]);
+        assert_eq!(children.returned_count, 4);
+        assert_eq!(children.items.len(), 2);
+        assert_eq!(
+            children.items[0].object_path,
+            "/org/a11y/atspi/accessible/42"
+        );
+        assert_eq!(
+            children.items[1].object_path,
+            "/org/a11y/atspi/accessible/nullish"
+        );
+    }
+
+    #[test]
+    fn truncation_diagnostics_are_bounded() {
+        let mut reasons = Vec::new();
+        for i in 0..40 {
+            capture_issue(
+                &mut reasons,
+                json!({"code": "children_unavailable", "node_id": format!("n{i}"), "error_code": "DRIVER.UNAVAILABLE"}),
+            );
+        }
+        assert_eq!(reasons.len(), 32);
+        assert_eq!(reasons[0]["node_id"], "n0");
+        assert_eq!(reasons[31]["node_id"], "n31");
     }
 }
 

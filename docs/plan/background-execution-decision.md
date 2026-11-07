@@ -213,7 +213,7 @@ Linux 上"另开一个 display"是常规操作，**同时解决"完全隔离"与
 | **mutter --headless --virtual-monitor** | GNOME 无头 | 需 GNOME 语义；输入走 RemoteDesktop portal |
 | **cage** | 单应用 kiosk | 只跑一个程序时最简单 |
 
-输入通道随 display 走：X11 → XTEST（现有实现，最成熟）；wlroots → `zwp_virtual_keyboard_v1` + `zwlr_virtual_pointer_v1`（无提示）；GNOME/KDE Wayland → RemoteDesktop portal + libei（**每次弹窗、无持久授权，无人值守基本不可用**）；兜底 → uinput（需 root/input 组，发键码非符号，有布局问题）。
+输入通道随 display 走：X11 → XTEST（现有实现，最成熟）；wlroots → `zwp_virtual_keyboard_v1` + `zwlr_virtual_pointer_v1`（是否开放由 compositor 决定）；GNOME/KDE Wayland → RemoteDesktop portal + libei。RemoteDesktop v2 已有 `persist_mode` 与单次 `restore_token`，不应认定每次必弹窗；后端是否授予、恢复和撤销需实测。当前新增的是显式授权传输和生命周期库层，尚无 Wayland 输入闭环，详见 [Wayland 授权与输入边界](wayland-authorized-input.md)。兜底 uinput 需 root/input 组，发键码非符号，有布局问题，不能绕过本项目的元素身份与焦点检查。[RemoteDesktop 规范](https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.RemoteDesktop.html)
 
 **已有工程资产**：仓库已有 Xvfb + 私有 AT-SPI bus 实践（KCalc 22.12.3 隔离语义计算闭环），扩展为后台产品能力的增量不大。
 
@@ -223,7 +223,7 @@ Linux 上"另开一个 display"是常规操作，**同时解决"完全隔离"与
 |---|---|---|---|
 | L-1 | Xvfb + AT-SPI 下 agent 自开应用的语义动作 + XTEST 输入完整闭环 | 起应用→snapshot→动作→fresh snapshot 回读一致 | Linux X11 真机（KDE Plasma 5.27 基线） |
 | L-2 | sway headless + `zwlr_virtual_pointer` / `zwp_virtual_keyboard` 是否无提示可用 | compositor 广告该协议且注入无弹窗 | Linux + sway/wlroots |
-| L-3 | GNOME/KDE Wayland 的 RemoteDesktop portal 是否真无持久授权 | 每次 session 是否强制弹窗 | Linux + GNOME 48 / KDE Plasma |
+| L-3 | GNOME/KDE Wayland 后端对 RemoteDesktop v2 持久授权的实际支持 | 显式授权后 persist_mode/restore_token 的恢复、撤销及失效回退行为；不将协议支持等同实际授权 | Linux + 目标 GNOME/KDE Plasma Wayland 版本 |
 | L-4 | KDE Plasma 6.5 `pointer-warp-v1` 指针支持是否已落地 | 协议是否被广告、指针能否 warp | Linux + KDE Plasma 6.5 |
 | L-5 | headless display 下 GPU 加速应用（Chromium）渲染/截图是否正常 | 截图非黑屏、内容正确 | Linux 真机 + 目标应用 |
 

@@ -10,8 +10,8 @@ pub use aad_platform::{
     ImageBox, Pixels, PointerButton, Recognition, ScrollDirection, ScrollSpec, TextSpan,
 };
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// A structured driver failure.
@@ -96,6 +96,93 @@ impl From<aad_platform::Error> for DriverError {
 
 pub type Result<T> = std::result::Result<T, DriverError>;
 
+pub fn ensure_input_active(deadline: Instant, cancellation: Option<&AtomicBool>) -> Result<()> {
+    if cancellation.is_some_and(|flag| flag.load(Ordering::SeqCst)) {
+        return Err(DriverError::new("DRIVER.CANCELLED", "input was cancelled"));
+    }
+    ensure_input_deadline(deadline)
+}
+
+/// Internal execution control; never accepted from serialized action arguments.
+pub struct InputControl {
+    pub deadline: Instant,
+    pub cancellation: Option<Arc<AtomicBool>>,
+}
+impl InputControl {
+    pub fn check(&self) -> Result<()> {
+        ensure_input_active(self.deadline, self.cancellation.as_deref())
+    }
+}
+impl Default for InputControl {
+    fn default() -> Self {
+        Self {
+            deadline: Instant::now() + Duration::from_secs(30),
+            cancellation: None,
+        }
+    }
+}
+
+/// Already validated element operations, with borrowed text kept out of Debug.
+pub enum ElementInput<'a> {
+    Focus,
+    Invoke,
+    PointerClick,
+    SetValue(&'a str),
+    SecretInput(&'a str),
+    TypeText { text: &'a str, keys: bool },
+    Paste(&'a str),
+    WindowAction(&'a str),
+}
+
+pub fn ensure_input_deadline(deadline: Instant) -> Result<()> {
+    if Instant::now() >= deadline {
+        Err(DriverError::new(
+            "DRIVER.TIMEOUT",
+            "input deadline expired before dispatch",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+/// Validate the bounded dwell before any key or button goes down.
+pub fn ensure_hold_budget(hold_ms: u64, deadline: Instant) -> Result<()> {
+    if !(1..=5_000).contains(&hold_ms) {
+        return Err(DriverError::invalid("hold_ms must be between 1 and 5000"));
+    }
+    if deadline.saturating_duration_since(Instant::now()) <= Duration::from_millis(hold_ms) {
+        return Err(DriverError::new(
+            "DRIVER.TIMEOUT",
+            "hold exceeds the remaining input deadline",
+        ));
+    }
+    Ok(())
+}
+
+/// Synchronous dwell: callers retain their release guard until this returns.
+/// Verification never refocuses or activates a changed target.
+pub fn wait_input_hold(
+    hold_ms: u64,
+    deadline: Instant,
+    mut verify: impl FnMut() -> Result<()>,
+) -> Result<()> {
+    let end = Instant::now() + Duration::from_millis(hold_ms);
+    loop {
+        ensure_input_deadline(deadline)?;
+        verify()?;
+        ensure_input_deadline(deadline)?;
+        let now = Instant::now();
+        if now >= end {
+            return Ok(());
+        }
+        std::thread::sleep(
+            (end - now)
+                .min(deadline - now)
+                .min(Duration::from_millis(20)),
+        );
+    }
+}
+
 /// A window plus the element tree captured from it.
 #[derive(Clone, Debug)]
 pub struct CapturedTree {
@@ -142,16 +229,28 @@ impl CaptureLimits {
 /// what keeps the "observe first" rule intact for pointer actions too.
 #[derive(Clone, Debug, Default)]
 pub struct PointerGesture {
+    /// Internal cooperative cancellation. Never deserialized from action arguments.
+    pub cancellation: Option<Arc<AtomicBool>>,
+    /// Internal execution deadline, derived by the provider from its timeout.
+    /// This is never accepted as a caller-supplied pointer field.
+    pub deadline: Option<Instant>,
+    /// Dwell after button down, before release or the first drag movement.
+    pub hold_ms: Option<u64>,
     /// Which button. Defaults to the left button.
     pub button: PointerButton,
     /// 1 for a single click, 2 for a double click.
     pub count: u8,
+    /// Modifier keys held for a click or drag: ctrl, shift, alt, meta.
+    pub modifiers: Vec<String>,
     /// Where inside the first (or only) element to act, as (fx, fy) each in
     /// 0.0..=1.0. `None` means the centre, matching a plain click.
     pub fraction: Option<(f64, f64)>,
     /// Where inside the destination element to release a drag. `None` means its
     /// centre. Ignored by single-element gestures.
     pub to_fraction: Option<(f64, f64)>,
+    /// Intermediate fractions of the same observed surface. The provider has
+    /// checked every caller-supplied anchor against the source snapshot/node.
+    pub path: Vec<(f64, f64)>,
     /// When set, the gesture is a scroll rather than a click.
     pub scroll: Option<ScrollSpec>,
     /// When set, the gesture hovers: move to the point and dwell this long.
@@ -160,6 +259,67 @@ pub struct PointerGesture {
 
 /// The operations a platform backend must provide.
 pub trait Backend: Send + Sync {
+    /// Defaults only bracket synchronous operations. Native implementations
+    /// also check immediately before OS dispatch and inside bounded waits.
+    fn element_input_controlled(
+        &self,
+        window_id: &str,
+        node: &Node,
+        input: ElementInput<'_>,
+        control: &InputControl,
+    ) -> Result<serde_json::Value> {
+        control.check()?;
+        let result = match input {
+            ElementInput::Focus => self
+                .focus(window_id, node)
+                .map(|()| serde_json::Value::Null),
+            ElementInput::Invoke => self
+                .invoke(window_id, node)
+                .map(|()| serde_json::Value::Null),
+            ElementInput::PointerClick => self
+                .pointer_click(window_id, node)
+                .map(|()| serde_json::Value::Null),
+            ElementInput::SetValue(text) => self
+                .set_value(window_id, node, text)
+                .map(|()| serde_json::Value::Null),
+            ElementInput::SecretInput(text) => self
+                .secret_input(window_id, node, text)
+                .map(|()| serde_json::Value::Null),
+            ElementInput::TypeText { text, keys: true } => self
+                .type_text_keys(window_id, node, text)
+                .map(|()| serde_json::Value::Null),
+            ElementInput::TypeText { text, keys: false } => self
+                .type_text(window_id, node, text)
+                .map(|()| serde_json::Value::Null),
+            ElementInput::Paste(text) => self.paste(window_id, node, text),
+            ElementInput::WindowAction(action) => self.window_action(window_id, node, action),
+        };
+        let result = result?;
+        control
+            .check()
+            .map_err(|error| error.with_effect("unknown"))?;
+        Ok(result)
+    }
+    fn global_key_controlled(
+        &self,
+        keys: &[String],
+        control: &InputControl,
+    ) -> Result<serde_json::Value> {
+        control.check()?;
+        let result = self.global_key(keys);
+        let result = result?;
+        control
+            .check()
+            .map_err(|error| error.with_effect("unknown"))?;
+        Ok(result)
+    }
+    /// Replace an observed protected field without reading it or using the clipboard.
+    fn secret_input(&self, _window_id: &str, _node: &Node, _text: &str) -> Result<()> {
+        Err(DriverError::new(
+            "DRIVER.ACTION_UNSUPPORTED",
+            "secret input is not implemented on this platform",
+        ))
+    }
     /// Start recording a window's interactions. Where capture is not
     /// implemented this says so rather than starting a session that would
     /// never produce a step: a recorder that appears to work and records
@@ -234,6 +394,49 @@ pub trait Backend: Send + Sync {
             "DRIVER.ACTION_UNSUPPORTED",
             "sending key combinations is not implemented on this platform yet",
         ))
+    }
+
+    /// Timed dispatch hook. Backends with multi-step input must keep checking
+    /// this deadline and release their own input before returning on failure.
+    fn key_chord_with_deadline(
+        &self,
+        window_id: &str,
+        node: &Node,
+        keys: &[String],
+        deadline: Instant,
+    ) -> Result<()> {
+        ensure_input_deadline(deadline)?;
+        self.key_chord(window_id, node, keys)
+    }
+
+    fn key_chord_held(
+        &self,
+        window_id: &str,
+        node: &Node,
+        keys: &[String],
+        hold_ms: Option<u64>,
+        deadline: Instant,
+    ) -> Result<()> {
+        if hold_ms.is_some() {
+            return Err(DriverError::new(
+                "DRIVER.ACTION_UNSUPPORTED",
+                "bounded key holds are not implemented on this platform",
+            ));
+        }
+        self.key_chord_with_deadline(window_id, node, keys, deadline)
+    }
+
+    fn key_chord_controlled(
+        &self,
+        window_id: &str,
+        node: &Node,
+        keys: &[String],
+        hold_ms: Option<u64>,
+        deadline: Instant,
+        cancellation: Option<Arc<AtomicBool>>,
+    ) -> Result<()> {
+        ensure_input_active(deadline, cancellation.as_deref())?;
+        self.key_chord_held(window_id, node, keys, hold_ms, deadline)
     }
 
     /// Perform a pointer gesture on a single element: a right or middle click, a
@@ -712,6 +915,26 @@ mod tests {
         .clamp();
         assert_eq!(raised.max_depth, 1);
         assert_eq!(raised.max_nodes, 1);
+    }
+
+    #[test]
+    fn bounded_hold_refuses_insufficient_budget_and_stops_on_changed_target() {
+        assert!(ensure_hold_budget(0, Instant::now() + Duration::from_secs(1)).is_err());
+        assert!(ensure_hold_budget(5001, Instant::now() + Duration::from_secs(10)).is_err());
+        assert!(ensure_hold_budget(200, Instant::now() + Duration::from_millis(20)).is_err());
+        let started = Instant::now();
+        let mut checked = 0;
+        let error = wait_input_hold(500, started + Duration::from_secs(1), || {
+            checked += 1;
+            Err(DriverError::stale("target changed"))
+        })
+        .unwrap_err();
+        assert_eq!(checked, 1);
+        assert_eq!(error.code, "DRIVER.STALE_HANDLE");
+        assert!(started.elapsed() < Duration::from_millis(400));
+        let error = wait_input_hold(100, Instant::now() + Duration::from_millis(10), || Ok(()))
+            .unwrap_err();
+        assert_eq!(error.code, "DRIVER.TIMEOUT");
     }
 
     #[test]

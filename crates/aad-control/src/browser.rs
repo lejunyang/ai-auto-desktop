@@ -1,12 +1,12 @@
 //! Explicit CDP page/frame resources. No arbitrary evaluation in the public API.
 use crate::{
-    error, native::resource_id, Action, Backend, BackendResource, Button, Direction, Resource,
-    Result, PAGE_ACTIONS, TAB_ACTIONS,
+    error, native::resource_id, Action, Backend, BackendResource, Button, Direction,
+    PointerModifier, Resource, Result, PAGE_ACTIONS, TAB_ACTIONS,
 };
-use aad_cdp::{Client, Target};
+use aad_browser::cdp::{Client, Target};
 use aad_core::AutomationError;
 use serde_json::{json, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -24,6 +24,9 @@ const DOWNLOAD_BEGIN: &str = "Browser.downloadWillBegin";
 const DOWNLOAD_PROGRESS: &str = "Browser.downloadProgress";
 /// Downloads remembered per session; the oldest are forgotten first.
 const MAX_DOWNLOADS: usize = 200;
+/// These tokens are never interpreted as HTML ids, including after expiry.
+const ELEMENT_SCOPE_PREFIX: &str = "aad:browser-scope:";
+const MAX_ELEMENT_SCOPES: usize = 64;
 
 /// Downloads go to a directory of this session's own, and are tracked from
 /// the browser's events -- only for a browser this server launched. A
@@ -277,7 +280,7 @@ impl NetworkLog {
                 self.entries.push_back(json!({
                     "request_id": id,
                     "method": params["request"]["method"],
-                    "url": aad_cdp::recording::network::redact_url(url).chars().take(2048).collect::<String>(),
+                    "url": aad_browser::recording::network::redact_url(url).chars().take(2048).collect::<String>(),
                     "resource_type": params["type"],
                     "state": "pending",
                     "status": null,
@@ -375,7 +378,7 @@ impl Page {
                     .unwrap_or_default();
                 let mut details = json!({"url":url,"frame_id":params["frameId"].as_str().or_else(||params["frame"]["id"].as_str()),
                     "method":event["method"]});
-                aad_cdp::recording::network::redact(&mut details);
+                aad_browser::recording::network::redact(&mut details);
                 self.history.lock().unwrap().record("navigation", details);
             }
             if event.get("sessionId").is_none() && self.network.apply(&event) {
@@ -467,29 +470,107 @@ fn dialog_snapshot(page_id: &str, frame_id: &str, main: bool, dialog: &Value) ->
         },
     })
 }
+#[derive(Clone)]
+struct ElementScope {
+    token: String,
+    page_id: String,
+    frame_id: String,
+    loader_id: Value,
+    backend_node_id: i64,
+}
+
+#[derive(Clone)]
+struct BrowserInput {
+    instance: String,
+    headless: bool,
+}
+
+#[derive(Clone)]
+struct SecretFrame {
+    loader: Value,
+    nodes: BTreeSet<i64>,
+}
+
+/// Only the browser process's own command line establishes isolation; a
+/// page's user agent, launch request, or caller-supplied flag cannot do so.
+fn verified_headless(command_line: &Value) -> bool {
+    let Some(arguments) = command_line["arguments"].as_array() else {
+        return false;
+    };
+    let switches: Vec<&str> = arguments
+        .iter()
+        .skip(1)
+        .filter_map(Value::as_str)
+        .take_while(|argument| *argument != "--")
+        .filter(|argument| argument.starts_with("--headless"))
+        .collect();
+    !switches.is_empty()
+        && switches.iter().all(|argument| {
+            matches!(
+                *argument,
+                "--headless" | "--headless=new" | "--headless=old"
+            )
+        })
+}
+
+fn browser_input_keys(snapshot: &Value) -> Result<Vec<String>> {
+    let instance = snapshot["metadata"]["browser_instance_id"]
+        .as_str()
+        .filter(|id| {
+            !id.is_empty()
+                && id.len() <= 128
+                && id.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-')
+        })
+        .ok_or_else(|| {
+            error(
+                "CONTROL.STALE_TARGET",
+                "browser input identity is missing; observe again",
+            )
+        })?;
+    // Every attachment contends on the instance even when headless status is
+    // unknown. Otherwise a failed command-line query could select another lock.
+    let mut keys = vec![format!("browser-input:{instance}")];
+    if snapshot["metadata"]["headless_input"] != true {
+        keys.push("desktop-input".into());
+    }
+    Ok(keys)
+}
+
 pub struct BrowserBackend {
+    access: crate::browser_access::BrowserAccess,
     /// The loopback CDP port; 0 until a browser is attached.
     port: AtomicU16,
     pages: Mutex<BTreeMap<String, Page>>,
     histories: Mutex<BTreeMap<String, std::sync::Arc<Mutex<DiagnosticHistory>>>>,
     /// The browser-level connection, for tabs and downloads; opened when first needed.
     browser: Mutex<Option<Client>>,
+    input_identity: Mutex<Option<BrowserInput>>,
+    secret_frames: Mutex<BTreeMap<(String, String), SecretFrame>>,
     downloads: Mutex<Downloads>,
     world: String,
-    last_context: Mutex<Option<(String, Ctx)>>,
+    last_context: Mutex<Option<(String, Ctx<'static>)>>,
+    element_scopes: Mutex<VecDeque<ElementScope>>,
     closed: AtomicBool,
 }
 
 impl BrowserBackend {
     pub fn new(port: u16) -> Self {
+        Self::with_access(port, Default::default())
+    }
+
+    pub fn with_access(port: u16, access: crate::browser_access::BrowserAccess) -> Self {
         Self {
+            access,
             port: AtomicU16::new(port),
             pages: Mutex::new(BTreeMap::new()),
             histories: Mutex::new(BTreeMap::new()),
             browser: Mutex::new(None),
+            input_identity: Mutex::new(None),
+            secret_frames: Mutex::new(BTreeMap::new()),
             downloads: Mutex::new(Downloads::default()),
             world: format!("aad-control-{}", uuid::Uuid::new_v4()),
             last_context: Mutex::new(None),
+            element_scopes: Mutex::new(VecDeque::new()),
             closed: AtomicBool::new(false),
         }
     }
@@ -532,7 +613,10 @@ impl BrowserBackend {
         self.pages.lock().unwrap().clear();
         self.histories.lock().unwrap().clear();
         *self.browser.lock().unwrap() = None;
+        *self.input_identity.lock().unwrap() = None;
+        self.secret_frames.lock().unwrap().clear();
         *self.last_context.lock().unwrap() = None;
+        self.element_scopes.lock().unwrap().clear();
         self.port.store(port, Ordering::SeqCst);
     }
 
@@ -685,12 +769,31 @@ impl BrowserBackend {
             .iter()
             .find(|target| target.id == page_id)
             .ok_or_else(|| error("CONTROL.STALE_TARGET", "browser tab no longer exists"))?;
+        // /json/list may briefly publish an empty URL across navigation. The
+        // renderer's fresh main frame below is the authority in that case.
+        if !target.url.is_empty() {
+            self.access.check_document(&target.url)?;
+        }
         let mut pages = self.pages.lock().unwrap();
         if self.closed.load(Ordering::SeqCst) {
             return Err(error("CONTROL.SESSION_CLOSED", "browser session is closed"));
         }
         pages.retain(|id, _| targets.iter().any(|target| target.id == *id));
-        let result = f(self.page(&mut pages, target, deadline)?);
+        let page = self.page(&mut pages, target, deadline)?;
+        if let Some(dialog) = &page.dialog {
+            self.access
+                .check_document(dialog["url"].as_str().unwrap_or_default())?;
+        } else {
+            let frames = self.access_frames(page)?;
+            let (id, _) = frames
+                .iter()
+                .find(|(_, entry)| entry.main())
+                .ok_or_else(|| {
+                    error("CONTROL.STALE_TARGET", "browser main frame is unavailable")
+                })?;
+            self.check_frame_access(&frames, id)?;
+        }
+        let result = f(page);
         if self.closed.load(Ordering::SeqCst) {
             self.clear_context(&mut pages, Instant::now() + Duration::from_millis(100));
         }
@@ -709,17 +812,91 @@ impl BrowserBackend {
         result
     }
 
-    /// Work on a page that must not be blocked by a JavaScript dialog.
-    fn with_page<T>(
-        &self,
-        page_id: &str,
-        timeout: Duration,
-        f: impl FnOnce(&mut Client) -> Result<T>,
-    ) -> Result<T> {
-        self.with_page_state(page_id, timeout, |page| match &page.dialog {
-            Some(dialog) => Err(dialog_open(dialog)),
-            None => f(&mut page.client),
-        })
+    /// The current frame and every embedding document must be in the server
+    /// grant. Re-read the frame tree rather than trusting a retained URL.
+    fn locate(&self, page: &mut Page, frame_id: &str) -> Result<FrameEntry> {
+        let frames = self.access_frames(page)?;
+        let entry = frames
+            .iter()
+            .find(|(id, _)| id == frame_id)
+            .map(|(_, entry)| entry.clone())
+            .ok_or_else(|| error("CONTROL.STALE_TARGET", "browser frame was detached"))?;
+        self.check_frame_access(&frames, frame_id)?;
+        Ok(entry)
+    }
+
+    fn access_frames(&self, page: &mut Page) -> Result<Vec<(String, FrameEntry)>> {
+        // A freshly opened tab can take well over 200ms to publish its first
+        // main-frame URL on a cold browser; never outlast the request itself.
+        let mut until = Instant::now() + Duration::from_secs(2);
+        if let Some(deadline) = page.client.deadline() {
+            until = until.min(deadline);
+        }
+        loop {
+            let frames = frame_map(page)?;
+            if frames.iter().any(|(_, entry)| {
+                entry.main()
+                    && entry.frame["url"]
+                        .as_str()
+                        .is_some_and(|url| !url.is_empty())
+            }) {
+                return Ok(frames);
+            }
+            if Instant::now() >= until {
+                // Waits poll through this; actions still stop and re-observe.
+                return Err(error(
+                    "CONTROL.STALE_TARGET",
+                    "browser main document URL is not ready; observe again",
+                )
+                .with_detail("document_ready", json!(false)));
+            }
+            // The CDP client's original request deadline still bounds each
+            // refresh. Never substitute the previously granted URL.
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn check_frame_access(&self, frames: &[(String, FrameEntry)], frame_id: &str) -> Result<()> {
+        let mut id = frame_id;
+        let mut seen = BTreeSet::new();
+        loop {
+            if !seen.insert(id) {
+                return Err(error(
+                    "CONTROL.STALE_TARGET",
+                    "browser frame ancestry is cyclic",
+                ));
+            }
+            let entry = frames
+                .iter()
+                .find(|(known, _)| known == id)
+                .map(|(_, entry)| entry)
+                .ok_or_else(|| {
+                    error(
+                        "CONTROL.STALE_TARGET",
+                        "browser frame ancestry is incomplete",
+                    )
+                })?;
+            self.access
+                .check_document(entry.frame["url"].as_str().unwrap_or_default())
+                .map_err(|error| {
+                    error
+                        .with_detail(
+                            "frame_url_missing",
+                            json!(entry.frame["url"].as_str().is_none_or(str::is_empty)),
+                        )
+                        .with_detail("main_frame", json!(entry.main()))
+                })?;
+            match entry.parent.as_deref() {
+                Some(parent) => id = parent,
+                None if entry.main() => return Ok(()),
+                None => {
+                    return Err(error(
+                        "CONTROL.STALE_TARGET",
+                        "browser frame has no verified main document",
+                    ))
+                }
+            }
+        }
     }
 
     /// Run commands on the browser-level connection, opening it when needed.
@@ -732,7 +909,21 @@ impl BrowserBackend {
         let port = self.port()?;
         let mut slot = self.browser.lock().unwrap();
         if slot.is_none() {
-            let client = Client::browser_until(port, deadline).map_err(cdp_error)?;
+            let (mut client, instance) =
+                Client::browser_with_identity_until(port, deadline).map_err(cdp_error)?;
+            client.set_deadline(deadline);
+            let headless = client
+                .command("Browser.getBrowserCommandLine", json!({}))
+                .ok()
+                .is_some_and(|command_line| verified_headless(&command_line));
+            let mut known = self.input_identity.lock().unwrap();
+            // Process arguments are immutable. A transient query failure on
+            // reconnect cannot revoke already established isolation.
+            let headless = headless
+                || known
+                    .as_ref()
+                    .is_some_and(|old| old.instance == instance && old.headless);
+            *known = Some(BrowserInput { instance, headless });
             client.filter_events(&[DOWNLOAD_BEGIN, DOWNLOAD_PROGRESS], &[]);
             *slot = Some(client);
         }
@@ -748,6 +939,20 @@ impl BrowserBackend {
             *slot = None;
         }
         result
+    }
+
+    fn browser_input(&self, deadline: Instant) -> Result<BrowserInput> {
+        // Confirm that the browser connection is alive before binding a new
+        // observation to its identity (a debug port may have been reused).
+        self.with_browser(deadline, |client| {
+            command(client, "Browser.getVersion", json!({}))
+        })?;
+        self.input_identity.lock().unwrap().clone().ok_or_else(|| {
+            error(
+                "BROWSER.BAD_RESULT",
+                "browser input identity is unavailable",
+            )
+        })
     }
 
     /// What the browser downloaded since this session first connected to it:
@@ -823,9 +1028,75 @@ impl BrowserBackend {
             }
         }
     }
+
+    /// Observation resets discard the JS node map. Keep only DOM identities
+    /// in Rust so a revealed field remains protected in the next observation,
+    /// including after a CDP connection is replaced.
+    fn restore_secrets(
+        &self,
+        client: &mut Client,
+        context: &Ctx,
+        page_id: &str,
+        frame_id: &str,
+        loader: &Value,
+    ) -> Result<()> {
+        let key = (page_id.into(), frame_id.into());
+        let marked = self.secret_frames.lock().unwrap().get(&key).cloned();
+        let Some(marked) = marked else {
+            return Ok(());
+        };
+        if marked.loader != *loader {
+            self.secret_frames.lock().unwrap().remove(&key);
+            return Ok(());
+        }
+        for backend_node in marked.nodes {
+            let resolved = match run(
+                client,
+                context.session.as_deref(),
+                "DOM.resolveNode",
+                json!({"backendNodeId":backend_node,"executionContextId":context.id}),
+            ) {
+                Ok(resolved) => resolved,
+                // The renderer no longer owns this DOM identity. A different
+                // element can never inherit the same backend node identity.
+                Err(e) if e.message.contains("No node with given id found") => continue,
+                Err(_) => {
+                    return Err(error(
+                        "CONTROL.ACTION_UNSUPPORTED",
+                        "cannot confirm protected element identity",
+                    ))
+                }
+            };
+            let object = resolved["object"]["objectId"].as_str().ok_or_else(|| {
+                error(
+                    "CONTROL.ACTION_UNSUPPORTED",
+                    "cannot confirm protected element identity",
+                )
+            })?;
+            let marked = run(
+                client,
+                context.session.as_deref(),
+                "Runtime.callFunctionOn",
+                json!({"objectId":object,"functionDeclaration":"function(){return globalThis.__aadControlV1.mark_secret(this);}","returnByValue":true}),
+            );
+            let _ = run(
+                client,
+                context.session.as_deref(),
+                "Runtime.releaseObject",
+                json!({"objectId":object}),
+            );
+            if evaluated(marked?)? != true {
+                return Err(error(
+                    "CONTROL.ACTION_UNSUPPORTED",
+                    "cannot confirm protected element identity",
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
-fn cdp_error(e: aad_cdp::CdpError) -> AutomationError {
+fn cdp_error(e: aad_browser::cdp::CdpError) -> AutomationError {
     if e.interrupted_by() == Some(DIALOG_OPENING) {
         return error(
             "CONTROL.DIALOG_OPEN",
@@ -858,6 +1129,10 @@ fn eval(client: &mut Client, context: &Ctx, expression: String) -> Result<Value>
         "Runtime.evaluate",
         json!({"expression":expression,"contextId":context.id,"returnByValue":true,"awaitPromise":false}),
     )?;
+    evaluated(raw)
+}
+
+fn evaluated(raw: Value) -> Result<Value> {
     if raw.get("exceptionDetails").is_some() {
         return Err(error(
             "CONTROL.STALE_TARGET",
@@ -901,10 +1176,155 @@ fn run(client: &mut Client, session: Option<&str>, method: &str, params: Value) 
 
 /// An isolated world: the CDP session whose renderer runs the frame, and the
 /// world's execution context there.
-#[derive(Clone, Debug)]
-struct Ctx {
+#[derive(Clone)]
+struct Ctx<'a> {
     session: Option<String>,
     id: i64,
+    input: Option<InputAccess>,
+    action: Option<&'a crate::Context>,
+}
+
+impl<'a> Ctx<'a> {
+    fn new(session: Option<String>, id: i64) -> Self {
+        Self {
+            session,
+            id,
+            input: None,
+            action: None,
+        }
+    }
+
+    fn check_input(&self, client: &mut Client) -> Result<()> {
+        input_boundary(self.action, || {
+            if let Some(input) = &self.input {
+                input.check(client)?;
+            }
+            Ok(())
+        })
+    }
+
+    fn commit_input(&self, client: &mut Client) -> Result<()> {
+        self.check_input(client)?;
+        if let Some(action) = self.action {
+            action.commit()?;
+        }
+        Ok(())
+    }
+}
+
+/// A fresh CDP query may outlast the caller's cancellation/deadline. Reject
+/// both before starting it and after it returns, including before scrolling.
+fn input_boundary(
+    action: Option<&crate::Context>,
+    verify: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    if let Some(action) = action {
+        action.remaining()?;
+    }
+    verify()?;
+    if let Some(action) = action {
+        action.remaining()?;
+    }
+    Ok(())
+}
+
+/// A held input belongs to the observed document and all of its embedding
+/// documents. Same-document URL changes do not replace the loader, and file
+/// grants can cease to resolve, so retaining only loader ids is insufficient.
+#[derive(Clone, Debug)]
+struct InputAccess {
+    access: crate::browser_access::BrowserAccess,
+    chain: Vec<(String, FrameEntry)>,
+}
+
+impl InputAccess {
+    fn new(
+        access: crate::browser_access::BrowserAccess,
+        frames: &[(String, FrameEntry)],
+        frame_id: &str,
+    ) -> Result<Self> {
+        let mut chain = Vec::new();
+        let mut id = frame_id;
+        let mut seen = BTreeSet::new();
+        loop {
+            if !seen.insert(id) {
+                return Err(error(
+                    "CONTROL.STALE_TARGET",
+                    "browser input ancestry is cyclic",
+                ));
+            }
+            let entry = frames
+                .iter()
+                .find(|(known, _)| known == id)
+                .map(|(_, entry)| entry)
+                .ok_or_else(|| {
+                    error(
+                        "CONTROL.STALE_TARGET",
+                        "browser input ancestry is incomplete",
+                    )
+                })?;
+            access.check_document(entry.frame["url"].as_str().unwrap_or_default())?;
+            chain.push((id.to_string(), entry.clone()));
+            match entry.parent.as_deref() {
+                Some(parent) => id = parent,
+                None if entry.main() => return Ok(Self { access, chain }),
+                None => {
+                    return Err(error(
+                        "CONTROL.STALE_TARGET",
+                        "browser input has no verified main document",
+                    ))
+                }
+            }
+        }
+    }
+
+    fn check(&self, client: &mut Client) -> Result<()> {
+        let mut current = Vec::new();
+        let tree = run(client, None, "Page.getFrameTree", json!({}))?;
+        tree_entries(&tree["frameTree"], None, &mut current);
+        let mut seen = BTreeSet::new();
+        // Enclosing renderer trees can carry placeholders for deeper remote
+        // frames. Merge outer to inner so each frame's own renderer wins.
+        for session in self
+            .chain
+            .iter()
+            .rev()
+            .filter_map(|(_, entry)| entry.session.as_deref())
+        {
+            if !seen.insert(session) {
+                continue;
+            }
+            let tree = run(client, Some(session), "Page.getFrameTree", json!({}))?;
+            let mut own = Vec::new();
+            tree_entries(&tree["frameTree"], Some(session), &mut own);
+            merge_frames(&mut current, own);
+        }
+        self.validate(&current)
+    }
+
+    fn validate(&self, frames: &[(String, FrameEntry)]) -> Result<()> {
+        for (id, observed) in &self.chain {
+            let now = frames
+                .iter()
+                .find(|(known, _)| known == id)
+                .map(|(_, entry)| entry)
+                .ok_or_else(|| error("CONTROL.STALE_TARGET", "browser input frame was detached"))?;
+            // Report a revoked grant even when navigation also replaced the
+            // loader. Cleanup is allowed, ordinary input must stop.
+            self.access
+                .check_document(now.frame["url"].as_str().unwrap_or_default())?;
+            if now.session != observed.session
+                || now.parent != observed.parent
+                || now.frame["loaderId"] != observed.frame["loaderId"]
+            {
+                return Err(error(
+                    "CONTROL.STALE_TARGET",
+                    "browser input document or ancestry changed",
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Where a frame lives: the CDP session that runs it (`None`: the page's
@@ -990,19 +1410,116 @@ fn merge_frames(all: &mut Vec<(String, FrameEntry)>, own: Vec<(String, FrameEntr
     }
 }
 
-fn locate(page: &mut Page, frame_id: &str) -> Result<FrameEntry> {
-    frame_map(page)?
-        .into_iter()
-        .find(|(id, _)| id == frame_id)
-        .map(|(_, entry)| entry)
-        .ok_or_else(|| error("CONTROL.STALE_TARGET", "browser frame was detached"))
-}
-
 /// Captures larger than this keep their heuristic roles and names: the
 /// browser's accessibility tree is asked once per node.
 const MAX_ACCESSIBLE_NODES: usize = 2_000;
 /// Accessibility queries sent before their replies are awaited.
 const AX_PIPELINE: usize = 100;
+
+/// Discover private shadow root identities without exporting their descendants
+/// or inspecting value attributes. Inspection is bounded and fails closed.
+fn closed_root_ids(tree: &Value) -> Result<Vec<i64>> {
+    let mut roots = Vec::new();
+    let mut stack = vec![tree];
+    let mut scanned = 0;
+    while let Some(node) = stack.pop() {
+        scanned += 1;
+        if scanned > 20_000 {
+            return Err(error(
+                "CONTROL.ACTION_UNSUPPORTED",
+                "cannot confirm protected closed-shadow content within the inspection budget",
+            ));
+        }
+        if node["shadowRootType"] == "closed" {
+            roots.push(node["backendNodeId"].as_i64().ok_or_else(|| {
+                error("BROWSER.BAD_RESULT", "closed shadow root has no identity")
+            })?);
+        }
+        for field in ["children", "shadowRoots"] {
+            if let Some(children) = node[field].as_array() {
+                stack.extend(children);
+            }
+        }
+    }
+    Ok(roots)
+}
+
+fn refresh_closed_roots(
+    client: &mut Client,
+    context: &Ctx,
+    observed: Option<&Value>,
+    reset: bool,
+) -> Result<()> {
+    let session = context.session.as_deref();
+    const GROUP: &str = "aad-control-private-shadow-roots";
+    if reset {
+        eval(
+            client,
+            context,
+            "globalThis.__aadControlV1.reset_closed_roots()".into(),
+        )?;
+    }
+    let result = (|| -> Result<()> {
+        let expression = observed
+            .map(|args| format!("globalThis.__aadControlV1.scope_element({args})"))
+            .unwrap_or_else(|| "document.documentElement".into());
+        let body = run(
+            client,
+            session,
+            "Runtime.evaluate",
+            json!({"expression":expression,"contextId":context.id,"objectGroup":GROUP}),
+        )?;
+        let object = body["result"]["objectId"].as_str().ok_or_else(|| {
+            if observed.is_some() {
+                error("CONTROL.STALE_TARGET", "observed element no longer exists")
+            } else {
+                error("BROWSER.BAD_RESULT", "frame has no document root")
+            }
+        })?;
+        let described = run(
+            client,
+            session,
+            "DOM.describeNode",
+            json!({"objectId":object,"depth":-1,"pierce":true}),
+        )?;
+        for id in closed_root_ids(&described["node"])? {
+            let root = run(
+                client,
+                session,
+                "DOM.resolveNode",
+                json!({"backendNodeId":id,"executionContextId":context.id,"objectGroup":GROUP}),
+            )?;
+            let object = root["object"]["objectId"]
+                .as_str()
+                .ok_or_else(|| error("BROWSER.BAD_RESULT", "closed shadow root disappeared"))?;
+            let registered = run(
+                client,
+                session,
+                "Runtime.callFunctionOn",
+                json!({"objectId":object,"functionDeclaration":"function(){return globalThis.__aadControlV1.mark_closed_root(this);}","returnByValue":true}),
+            )?;
+            if evaluated(registered)? != true {
+                return Err(error(
+                    "CONTROL.ACTION_UNSUPPORTED",
+                    "cannot confirm protected closed-shadow content",
+                ));
+            }
+        }
+        eval(
+            client,
+            context,
+            "globalThis.__aadControlV1.record_closed_protection()".into(),
+        )?;
+        Ok(())
+    })();
+    let _ = run(
+        client,
+        session,
+        "Runtime.releaseObjectGroup",
+        json!({"objectGroup":GROUP}),
+    );
+    result
+}
 
 /// Roles and names as the browser's accessibility tree has them, for each
 /// observed element. An element the tree ignores, an internal role
@@ -1109,7 +1626,9 @@ fn apply_accessibility(node: &mut Value, ax: &Value) -> bool {
     if let Some(name) = ax["name"]["value"]
         .as_str()
         .map(str::trim)
-        .filter(|name| !name.is_empty())
+        // A revealed password changed to a submit/button input can acquire an
+        // AX name derived from its value. Keep its explicit DOM label instead.
+        .filter(|name| !name.is_empty() && node["states"]["protected"] != true)
     {
         let name: String = name.chars().take(256).collect();
         changed |= node["name"] != name.as_str();
@@ -1171,7 +1690,7 @@ fn regions(nodes: &mut [Value]) {
 /// states, `match: contains` (case-insensitive, for name and value), `within`
 /// a container another locator names (an overview's region name works as its
 /// `name`), and `nth` counted top to bottom, then left to right.
-fn browser_find(
+pub(crate) fn browser_find(
     snapshot: &Value,
     locator: &crate::Locator,
     expect: crate::Expect,
@@ -1388,7 +1907,7 @@ struct Route {
 impl Route {
     /// The owner elements between `frame_id` and the main frame, scrolled
     /// into view from the outermost in.
-    fn to(page: &mut Page, frame_id: &str) -> Result<Self> {
+    fn to(page: &mut Page, frame_id: &str, context: &Ctx) -> Result<Self> {
         let map = frame_map(page)?;
         let entry = |id: &str| {
             map.iter()
@@ -1440,6 +1959,7 @@ impl Route {
             });
         }
         for level in levels.iter().rev() {
+            context.commit_input(&mut page.client)?;
             run(
                 &mut page.client,
                 level.session.as_deref(),
@@ -1510,6 +2030,7 @@ impl Backend for BrowserBackend {
     fn close(&self) {
         self.closed.store(true, Ordering::SeqCst);
         self.port.store(0, Ordering::SeqCst);
+        self.element_scopes.lock().unwrap().clear();
         self.release_downloads();
         if let Ok(mut pages) = self.pages.try_lock() {
             self.clear_context(&mut pages, Instant::now() + Duration::from_millis(100));
@@ -1546,8 +2067,8 @@ impl Backend for BrowserBackend {
         if snapshot["scope_id"].is_string() {
             let meta = &snapshot["metadata"];
             self.with_page_state(meta["page_id"].as_str().unwrap_or_default(), timeout, |page| {
-                let entry = locate(page, meta["frame_id"].as_str().unwrap_or_default())?;
-                let context = Ctx { session: entry.session.clone(), id: meta["context_id"].as_i64().unwrap_or_default() };
+                let entry = self.locate(page, meta["frame_id"].as_str().unwrap_or_default())?;
+                let context = Ctx::new(entry.session.clone(), meta["context_id"].as_i64().unwrap_or_default());
                 let args = json!({"document_token":snapshot["document_token"], "observation":snapshot["snapshot_id"]});
                 checked(eval(&mut page.client, &context, format!("globalThis.__aadControlV1.validate_scope({args})"))?)
             })?;
@@ -1569,10 +2090,8 @@ impl Backend for BrowserBackend {
     fn reads(&self) -> Vec<String> {
         vec!["capture".into()]
     }
-    fn lease_key(&self, _snapshot: &Value) -> Option<String> {
-        // UIA/AX/AT-SPI can also operate a browser. Share one cooperating
-        // input owner rather than pretending these are disjoint devices.
-        Some("desktop-input".into())
+    fn lease_keys(&self, snapshot: &Value) -> Result<Vec<String>> {
+        browser_input_keys(snapshot)
     }
     fn name(&self) -> &str {
         PROVIDER
@@ -1583,6 +2102,7 @@ impl Backend for BrowserBackend {
             "click",
             "fill",
             "type_text",
+            "secret_input",
             "key",
             "scroll",
             "hover",
@@ -1618,6 +2138,23 @@ impl Backend for BrowserBackend {
         pages.retain(|id, _| targets.iter().any(|target| target.id == *id));
         let mut resources = Vec::new();
         for target in targets.iter().take(64) {
+            if let Err(denied) = self.access.check_document(&target.url) {
+                let selector = json!({"page_id":target.id,"frame_id":target.id});
+                resources.push(BackendResource {
+                    resource: Resource {
+                        resource_id: resource_id(PROVIDER, &selector),
+                        provider: PROVIDER.into(),
+                        kind: "browser".into(),
+                        name: target.title.clone(),
+                        capabilities: Vec::new(),
+                        metadata: json!({"page_id":target.id,"frame_id":target.id,
+                            "main_frame":true,"url":target.url,
+                            "access_error":{"code":denied.code,"message":denied.message}}),
+                    },
+                    selector,
+                });
+                continue;
+            }
             let page = match self.page(&mut pages, target, deadline) {
                 Ok(page) => page,
                 Err(e) if e.code == "BROWSER.PAGE_UNRESPONSIVE" => {
@@ -1680,6 +2217,14 @@ impl Backend for BrowserBackend {
                 .map(|(id, _)| id.clone())
                 .ok_or_else(|| error("BROWSER.BAD_RESULT", "missing main frame"))?;
             page.main_frame = Some(root.clone());
+            let denied: BTreeMap<String, AutomationError> = map
+                .iter()
+                .filter_map(|(id, _)| {
+                    self.check_frame_access(&map, id)
+                        .err()
+                        .map(|error| (id.clone(), error))
+                })
+                .collect();
             for (id, entry) in map.into_iter().take(64) {
                 let selector = json!({"page_id": target.id, "frame_id": id});
                 let main = id == root;
@@ -1687,6 +2232,12 @@ impl Backend for BrowserBackend {
                 // Navigation and tabs address the page, not a frame.
                 if !main {
                     capabilities.retain(|s| !MAIN_FRAME_ONLY.contains(&s.as_str()));
+                }
+                let access_error = denied
+                    .get(&id)
+                    .map(|error| json!({"code":error.code,"message":error.message}));
+                if access_error.is_some() {
+                    capabilities.clear();
                 }
                 resources.push(BackendResource {
                     resource: Resource {
@@ -1697,10 +2248,11 @@ impl Backend for BrowserBackend {
                         capabilities,
                         metadata: json!({"page_id": target.id, "frame_id": id,
                             "url": entry.frame["url"], "main_frame": main,
+                            "access_error": access_error,
                             "parent_frame_id": entry.parent,
                             "out_of_process": entry.session.is_some(),
                             "opener_page_id": openers.get(&target.id),
-                            "click_semantics": "dom_activation; trusted cdp input with button, count or fraction",
+                            "click_semantics": "dom_activation; trusted cdp input on canvases or with button, count or fraction",
                             "fill_semantics": "dom_value_and_events",
                             "key_semantics": "cdp_input_to_the_focused_element",
                             "type_text_semantics": "cdp_insert_text_or_us_key_events",
@@ -1715,6 +2267,81 @@ impl Backend for BrowserBackend {
         }
         Ok(resources)
     }
+    fn observe_target_scope(
+        &self,
+        snapshot: &Value,
+        node: &Value,
+        max_nodes: usize,
+        timeout: Duration,
+    ) -> Result<Value> {
+        let deadline = Instant::now() + timeout;
+        let meta = &snapshot["metadata"];
+        let page_id = meta["page_id"].as_str().unwrap_or_default();
+        let frame_id = meta["frame_id"].as_str().unwrap_or_default();
+        let backend_node_id = self.with_page_state(page_id, timeout, |page| {
+            if let Some(dialog) = &page.dialog {
+                return Err(dialog_open(dialog));
+            }
+            let entry = self.locate(page, frame_id)?;
+            if entry.frame["loaderId"] != meta["loader_id"] {
+                return Err(error("CONTROL.STALE_TARGET", "browser document navigated"));
+            }
+            let context = Ctx::new(
+                entry.session,
+                meta["context_id"].as_i64().unwrap_or_default(),
+            );
+            let args = json!({"document_token":snapshot["document_token"],
+                "observation":snapshot["snapshot_id"], "node_id":node["node_id"]});
+            let element = run(
+                &mut page.client,
+                context.session.as_deref(),
+                "Runtime.evaluate",
+                json!({"expression":format!("globalThis.__aadControlV1.scope_element({args})"),
+                    "contextId":context.id, "returnByValue":false}),
+            )?;
+            let object = element["result"]["objectId"]
+                .as_str()
+                .filter(|_| element["result"]["subtype"] == "node")
+                .ok_or_else(|| {
+                    error("CONTROL.STALE_TARGET", "scope root was replaced or changed")
+                })?;
+            let described = run(
+                &mut page.client,
+                context.session.as_deref(),
+                "DOM.describeNode",
+                json!({"objectId":object}),
+            );
+            let _ = run(
+                &mut page.client,
+                context.session.as_deref(),
+                "Runtime.releaseObject",
+                json!({"objectId":object}),
+            );
+            described?["node"]["backendNodeId"]
+                .as_i64()
+                .ok_or_else(|| error("BROWSER.BAD_RESULT", "scope root has no DOM identity"))
+        })?;
+        let token = format!("{ELEMENT_SCOPE_PREFIX}{}", uuid::Uuid::new_v4());
+        {
+            let mut scopes = self.element_scopes.lock().unwrap();
+            scopes.push_back(ElementScope {
+                token: token.clone(),
+                page_id: page_id.into(),
+                frame_id: frame_id.into(),
+                loader_id: meta["loader_id"].clone(),
+                backend_node_id,
+            });
+            while scopes.len() > MAX_ELEMENT_SCOPES {
+                scopes.pop_front();
+            }
+        }
+        self.observe_scope(
+            &json!({"page_id":page_id, "frame_id":frame_id}),
+            &token,
+            max_nodes,
+            deadline.saturating_duration_since(Instant::now()),
+        )
+    }
     fn observe_scope(
         &self,
         selector: &Value,
@@ -1724,10 +2351,34 @@ impl Backend for BrowserBackend {
     ) -> Result<Value> {
         let mut selector = selector.clone();
         selector["scope_id"] = json!(scope);
+        if scope.starts_with(ELEMENT_SCOPE_PREFIX) {
+            let bound = self
+                .element_scopes
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|known| known.token == scope)
+                .cloned()
+                .ok_or_else(|| {
+                    error(
+                        "CONTROL.STALE_TARGET",
+                        "observed scope expired or is unknown",
+                    )
+                })?;
+            if selector["page_id"] != bound.page_id || selector["frame_id"] != bound.frame_id {
+                return Err(error(
+                    "CONTROL.STALE_TARGET",
+                    "scope belongs to another browser frame",
+                ));
+            }
+            selector["scope_backend_node_id"] = json!(bound.backend_node_id);
+            selector["scope_loader_id"] = bound.loader_id;
+        }
         self.observe(&selector, max_nodes, timeout)
     }
     fn observe(&self, selector: &Value, max_nodes: usize, timeout: Duration) -> Result<Value> {
         let deadline = Instant::now() + timeout;
+        let input = self.browser_input(deadline)?;
         self.clear_context(
             &mut self.pages.lock().unwrap(),
             deadline.min(Instant::now() + Duration::from_millis(100)),
@@ -1740,19 +2391,49 @@ impl Backend for BrowserBackend {
                 let main=page.main_frame.as_deref().is_none_or(|main|main==frame_id);
                 return Ok(dialog_snapshot(page_id,frame_id,main,dialog));
             }
-            let entry=locate(page,frame_id)?;
+            let entry=self.locate(page,frame_id)?;
+            if selector["scope_backend_node_id"].is_i64() && entry.frame["loaderId"]!=selector["scope_loader_id"] {
+                return Err(error("CONTROL.STALE_TARGET","scope document navigated"));
+            }
             let frame=entry.frame.clone();
             let session=entry.session.clone();
             let client=&mut page.client;
             let context=run(client,session.as_deref(),"Page.createIsolatedWorld",json!({"frameId":frame_id,"worldName":self.world,"grantUniveralAccess":false}))?["executionContextId"].as_i64()
                 .ok_or_else(||error("BROWSER.BAD_RESULT","frame did not provide an isolated context"))?;
-            let context=Ctx{session:session.clone(),id:context};
+            let context=Ctx::new(session.clone(),context);
             let nonce=serde_json::to_string(&uuid::Uuid::new_v4().to_string()).unwrap();
-            eval(client,&context,include_str!("browser.js").replace("/*AAD_NAMING*/",aad_cdp::NAMING).replace("NONCE",&nonce))?;
+            eval(client,&context,include_str!("browser.js").replace("/*AAD_NAMING*/",aad_browser::cdp::NAMING).replace("NONCE",&nonce))?;
+            self.restore_secrets(client,&context,page_id,frame_id,&frame["loaderId"])?;
             let observation=uuid::Uuid::new_v4().to_string();
             *self.last_context.lock().unwrap()=Some((page_id.into(),context.clone()));
-            let mut result=eval(client,&context,format!("globalThis.__aadControlV1.observe({}, {}, {})",serde_json::to_string(&observation).unwrap(),max_nodes,selector["scope_id"]))?;
+            let mut result=if let Some(backend_node_id)=selector["scope_backend_node_id"].as_i64() {
+                let resolved=run(client,session.as_deref(),"DOM.resolveNode",json!({"backendNodeId":backend_node_id,"executionContextId":context.id}))
+                    .map_err(|e|error("CONTROL.STALE_TARGET","observed scope root is no longer available").with_cause(e))?;
+                let object=resolved["object"]["objectId"].as_str()
+                    .ok_or_else(||error("CONTROL.STALE_TARGET","observed scope root is no longer available"))?;
+                let captured=run(client,session.as_deref(),"Runtime.callFunctionOn",json!({"objectId":object,
+                    "functionDeclaration":"function(id,limit,scope){return globalThis.__aadControlV1.observe(id,limit,scope,this);}",
+                    "arguments":[{"value":observation},{"value":max_nodes},{"value":selector["scope_id"]}],"returnByValue":true}));
+                let _=run(client,session.as_deref(),"Runtime.releaseObject",json!({"objectId":object}));
+                evaluated(captured?)?
+            } else {
+                eval(client,&context,format!("globalThis.__aadControlV1.observe({}, {}, {})",serde_json::to_string(&observation).unwrap(),max_nodes,selector["scope_id"]))?
+            };
             if let Some(code) = result["error"].as_str() { return Err(error(code, "scope must identify one complete container in this frame")); }
+            let scope_inspect=selector["scope_id"].is_string().then(||json!({"document_token":result["document_token"],"observation":observation,"node_id":result["nodes"][0]["node_id"]}));
+            let shadow=match refresh_closed_roots(client,&context,scope_inspect.as_ref(),true) {
+                Ok(())=>json!({"complete":true}),
+                Err(e) if e.code=="CONTROL.ACTION_UNSUPPORTED"=>json!({"complete":false,"reason":e.message}),
+                Err(e)=>return Err(e),
+            };
+            let surfaces=eval(client,&context,"globalThis.__aadControlV1.surface_state()".into())?;
+            for (node,surface) in result["nodes"].as_array_mut().into_iter().flatten().zip(surfaces.as_array().into_iter().flatten()) {
+                if node["node_id"]!=surface["node_id"] {return Err(error("BROWSER.BAD_RESULT","private inspection lost the observed node identity"));}
+                node["actions"]=surface["actions"].clone();
+                node["states"]["protected"]=surface["protected"].clone();
+                if surface["protected"]==true {node["value"]=Value::Null;}
+                if !surface["surface"].is_null() {node["surface"]=surface["surface"].clone();}
+            }
             let main=entry.main();
             if !main {if let Some(nodes)=result["nodes"].as_array_mut(){for node in nodes {if let Some(actions)=node["actions"].as_array_mut(){actions.retain(|v|!MAIN_FRAME_ONLY.iter().any(|name|v==name));}}}}
             result["snapshot_id"]=json!(observation);
@@ -1762,16 +2443,92 @@ impl Backend for BrowserBackend {
             let accessible=accessibility(client,&context,&mut nodes).unwrap_or_else(|e|json!({"applied":false,"reason":e.message}));
             regions(&mut nodes);
             result["nodes"]=json!(nodes);
-            result["metadata"]=json!({"page_id":page_id,"frame_id":frame_id,"loader_id":frame["loaderId"],"context_id":context.id,"main_frame":main,"parent_frame_id":entry.parent,"out_of_process":session.is_some(),"accessibility":accessible});
+            result["metadata"]=json!({"page_id":page_id,"frame_id":frame_id,"loader_id":frame["loaderId"],"context_id":context.id,"main_frame":main,"parent_frame_id":entry.parent,"out_of_process":session.is_some(),"accessibility":accessible,"closed_shadow_inspection":shadow});
             Ok(result)
         })
         };
         // An isolated world destroyed under the observation (navigation,
         // context churn) is created again once, within the deadline.
-        match attempt() {
+        let mut result = match attempt() {
             Err(e) if e.code == "BROWSER.CONTEXT_LOST" && Instant::now() < deadline => attempt(),
             other => other,
-        }
+        }?;
+        result["metadata"]["browser_instance_id"] = json!(input.instance);
+        result["metadata"]["headless_input"] = json!(input.headless);
+        Ok(result)
+    }
+    fn secret_input(
+        &self,
+        snapshot: &Value,
+        node: &Value,
+        text: &str,
+        action_context: &crate::Context,
+    ) -> Result<Value> {
+        let perform = || -> Result<Value> {
+            if text.chars().count() > 1024
+                || text.chars().any(|ch| matches!(ch, '\0' | '\r' | '\n'))
+                || node["states"]["protected"] != true
+                || !node["actions"]
+                    .as_array()
+                    .is_some_and(|actions| actions.iter().any(|action| action == "secret_input"))
+            {
+                return Err(error(
+                    "CONTROL.ACTION_UNSUPPORTED",
+                    "secret input requires an editable password field and bounded single-line text",
+                ));
+            }
+            let meta = &snapshot["metadata"];
+            let input = self.browser_input(Instant::now() + action_context.remaining()?)?;
+            if meta["browser_instance_id"] != input.instance {
+                return Err(error(
+                    "CONTROL.STALE_TARGET",
+                    "browser input instance changed",
+                ));
+            }
+            let page_id = meta["page_id"].as_str().unwrap_or_default();
+            let frame_id = meta["frame_id"].as_str().unwrap_or_default();
+            self.with_page_state(page_id,action_context.remaining()?,|page|{
+                if let Some(dialog)=&page.dialog{return Err(dialog_open(dialog));}
+                let entry=self.locate(page,frame_id)?;
+                if entry.frame["loaderId"]!=meta["loader_id"] {return Err(error("CONTROL.STALE_TARGET","browser document navigated"));}
+                let mut context=Ctx::new(entry.session,meta["context_id"].as_i64().unwrap_or_default());
+                context.input=Some(InputAccess::new(self.access.clone(),&frame_map(page)?,frame_id)?);
+                context.action=Some(action_context);
+                let args=json!({"document_token":snapshot["document_token"],"observation":snapshot["snapshot_id"],"node_id":node["node_id"],"action":"secret_input"});
+                let value=serde_json::to_string(text).map_err(|_|error("CONTROL.INVALID_REQUEST","invalid secret binding"))?;
+                let element=run(&mut page.client,context.session.as_deref(),"Runtime.evaluate",json!({"expression":format!("globalThis.__aadControlV1.element({args})"),"contextId":context.id,"returnByValue":false}))?;
+                let object=element["result"]["objectId"].as_str().filter(|_|element["result"]["subtype"]=="node")
+                    .ok_or_else(||error("CONTROL.STALE_TARGET","password field no longer available"))?;
+                let described=run(&mut page.client,context.session.as_deref(),"DOM.describeNode",json!({"objectId":object}));
+                let _=run(&mut page.client,context.session.as_deref(),"Runtime.releaseObject",json!({"objectId":object}));
+                let backend_node=described?["node"]["backendNodeId"].as_i64()
+                    .ok_or_else(||error("BROWSER.BAD_RESULT","no password field identity"))?;
+                {
+                    let mut secrets=self.secret_frames.lock().unwrap();
+                    let marked=secrets.entry((page_id.into(),frame_id.into())).or_insert_with(||SecretFrame{loader:entry.frame["loaderId"].clone(),nodes:BTreeSet::new()});
+                    if marked.loader!=entry.frame["loaderId"] {
+                        marked.loader=entry.frame["loaderId"].clone();
+                        marked.nodes.clear();
+                    }
+                    marked.nodes.insert(backend_node);
+                }
+                context.check_input(&mut page.client)?;
+                action_context.commit()?;
+                checked(eval(&mut page.client,&context,format!("globalThis.__aadControlV1.secret_input({args},{value})")).map_err(|e|e.with_effect("unknown"))?)?;
+                Ok(json!({"submitted":true,"redacted":true}))
+            })
+        };
+        // CDP and page exceptions can carry arbitrary text. The dedicated
+        // boundary never returns them, even to callers using Backend directly.
+        perform().map_err(|failure| {
+            error("CONTROL.SECRET_INPUT_FAILED", "secret input failed").with_effect(
+                if failure.effect == "not_applied" {
+                    "not_applied"
+                } else {
+                    "unknown"
+                },
+            )
+        })
     }
     fn act(
         &self,
@@ -1780,7 +2537,17 @@ impl Backend for BrowserBackend {
         action: &Action,
         action_context: &crate::Context,
     ) -> Result<Value> {
+        if let Action::Navigate { url } | Action::OpenTab { url } = action {
+            self.access.navigation_url(url)?;
+        }
         let meta = &snapshot["metadata"];
+        let input = self.browser_input(Instant::now() + action_context.remaining()?)?;
+        if meta["browser_instance_id"] != input.instance {
+            return Err(error(
+                "CONTROL.STALE_TARGET",
+                "browser input instance changed; observe again",
+            ));
+        }
         if !node["actions"]
             .as_array()
             .is_some_and(|a| a.iter().any(|v| v == action.name()))
@@ -1790,10 +2557,14 @@ impl Backend for BrowserBackend {
                 "node does not support this browser operation",
             ));
         }
-        // A plain click is DOM activation and works in any frame; a button, a
-        // count or a position needs trusted input, which addresses the page.
+        // A plain DOM click works in any frame. Canvas handlers usually need
+        // pointer down/up; those and explicit gestures use trusted input.
         let trusted = match action {
-            Action::Click { .. } => !action.plain_click(),
+            Action::Click { .. } => {
+                node["tag"] == "canvas"
+                    || node["surface"] == "closed_shadow"
+                    || !action.plain_click()
+            }
             Action::Scroll { .. } | Action::Hover { .. } | Action::Drag { .. } => true,
             _ => false,
         };
@@ -1808,20 +2579,32 @@ impl Backend for BrowserBackend {
         let frame_id = meta["frame_id"].as_str().unwrap();
         let result = self.with_page_state(page_id,action_context.remaining()?,|state|{
             if let Some(dialog)=&state.dialog {return Err(dialog_open(dialog));}
-            let entry=locate(state,frame_id)?;
+            let entry=self.locate(state,frame_id)?;
             if entry.frame["loaderId"]!=meta["loader_id"] {return Err(error("CONTROL.STALE_TARGET","browser document navigated"));}
-            let context=Ctx{session:entry.session.clone(),id:meta["context_id"].as_i64().unwrap_or_default()};
+            let mut context=Ctx::new(entry.session.clone(),meta["context_id"].as_i64().unwrap_or_default());
+            context.input=Some(InputAccess::new(self.access.clone(),&frame_map(state)?,frame_id)?);
+            context.action=Some(action_context);
+            let mut inspect=json!({"document_token":snapshot["document_token"],"observation":snapshot["snapshot_id"],"node_id":node["node_id"]});
+            refresh_closed_roots(&mut state.client,&context,Some(&inspect),true)?;
+            if let Action::Drag{to,..}=action {
+                if to.node_id!=node["node_id"] {
+                    inspect["node_id"]=json!(to.node_id);
+                    refresh_closed_roots(&mut state.client,&context,Some(&inspect),false)?;
+                }
+            }
             // Trusted pointer input is addressed to the page; the owner
             // elements of enclosing frames are brought into view first.
-            let route=if trusted {Route::to(state,frame_id)?} else {Route::default()};
-            if let Action::Drag {to,fraction,to_fraction,button}=action {
-                let observed=|node_id:&str,fraction:&Option<crate::Fraction>,action:Value|{let mut args=json!({"document_token":snapshot["document_token"],"observation":snapshot["snapshot_id"],"node_id":node_id,"action":action});if let Some(f)=fraction{args["fraction"]=json!({"fx":f.fx,"fy":f.fy});}args};
+            let route=if trusted {Route::to(state,frame_id,&context)?} else {Route::default()};
+            if let Action::Drag {to,fraction,to_fraction,button,modifiers,hold_ms,path}=action {
+                if !path.is_empty() && node["tag"]!="canvas" && node["surface"]!="closed_shadow" {return Err(error("CONTROL.ACTION_UNSUPPORTED","browser drag paths require an observed canvas or closed-shadow surface"));}
+                let observed=|node_id:&str,fraction:&Option<crate::Fraction>,action:Value|{let mut args=json!({"document_token":snapshot["document_token"],"observation":snapshot["snapshot_id"],"node_id":node_id,"action":action,"frame_id":frame_id,"loader_id":meta["loader_id"]});if let Some(f)=fraction{args["fraction"]=json!({"fx":f.fx,"fy":f.fy});}args};
                 let from=observed(node["node_id"].as_str().unwrap_or_default(),fraction,json!("drag"));
                 let onto=observed(&to.node_id,to_fraction,Value::Null);
-                return drag(state,&context,&route,&from,&onto,*button,action_context);
+                let path:Vec<_>=path.iter().map(|anchor|observed(&anchor.target.node_id,&Some(anchor.fraction),json!("drag"))).collect();
+                return drag(state,&context,&route,&from,&onto,*button,pointer_modifiers(modifiers),*hold_ms,&path,action_context);
             }
             let client=&mut state.client;
-            let mut args=json!({"document_token":snapshot["document_token"],"observation":snapshot["snapshot_id"],"node_id":node["node_id"],"action":action.name()});
+            let mut args=json!({"document_token":snapshot["document_token"],"observation":snapshot["snapshot_id"],"node_id":node["node_id"],"action":action.name(),"frame_id":frame_id,"loader_id":meta["loader_id"]});
             match action {
                 Action::Fill {value}=>args["value"]=json!(value),
                 Action::Select {option}=>args["option"]=json!(option),
@@ -1838,6 +2621,7 @@ impl Backend for BrowserBackend {
             if TAB_ACTIONS.contains(&action.name()) {
                 // Anchored like navigation: the observed document must still be there.
                 checked(eval(client,&context,format!("globalThis.__aadControlV1.confirm({args})"))?)?;
+                context.check_input(client)?;
                 action_context.commit()?;
                 return self.tab(page_id,action,Instant::now()+action_context.remaining()?);
             }
@@ -1845,10 +2629,11 @@ impl Backend for BrowserBackend {
                 return page(client,&context,&args,action,action_context);
             }
             if matches!(action,Action::Key {..}|Action::TypeText {..}) {
-                keyboard(client,&context,&args,frame_id,&meta["loader_id"],action,action_context)
+                keyboard(client,&context,&args,action,action_context)
             } else {
                 // Verification and DOM activation/fill happen in one JS turn in
                 // the observed isolated world, preventing a navigation redirect.
+                context.check_input(client)?;
                 action_context.commit()?;
                 let result=eval(client,&context,format!("globalThis.__aadControlV1.act({args})")).map_err(|e|e.with_effect("unknown"))?;
                 checked(result)
@@ -1976,14 +2761,14 @@ impl BrowserBackend {
             if let Some(dialog) = &page.dialog {
                 return Err(dialog_open(dialog));
             }
-            let entry = locate(page, frame_id)?;
+            let entry = self.locate(page, frame_id)?;
             if entry.frame["loaderId"] != meta["loader_id"] {
                 return Err(error("CONTROL.STALE_TARGET", "browser document navigated"));
             }
-            let context = Ctx {
-                session: entry.session,
-                id: meta["context_id"].as_i64().unwrap_or_default(),
-            };
+            let context = Ctx::new(
+                entry.session,
+                meta["context_id"].as_i64().unwrap_or_default(),
+            );
             let args = json!({"document_token": snapshot["document_token"],
                 "observation": snapshot["snapshot_id"], "node_id": region, "max_characters": max});
             let mut answer = checked(eval(
@@ -2016,7 +2801,7 @@ impl BrowserBackend {
             if let Some(dialog) = &page.dialog {
                 return Err(dialog_open(dialog));
             }
-            let entry = locate(page, frame_id)?;
+            let entry = self.locate(page, frame_id)?;
             let url = entry.frame["url"].as_str().unwrap_or_default().to_string();
             let origin = entry.frame["securityOrigin"].as_str().unwrap_or_default().to_string();
             let client = &mut page.client;
@@ -2063,7 +2848,7 @@ impl BrowserBackend {
                 Value::Null
             };
             Ok(json!({
-                "url": aad_cdp::recording::network::redact_url(&url),
+                "url": aad_browser::recording::network::redact_url(&url),
                 "origin": origin,
                 "cookies": cookies,
                 "cookie_count": all.len(),
@@ -2094,6 +2879,7 @@ impl BrowserBackend {
             if bodies && page.dialog.is_none() {
                 for request in requests.iter_mut().filter(|r| {
                     r["state"] == "finished"
+                        && self.access.check_document(r["url"].as_str().unwrap_or_default()).is_ok()
                         && r["mime_type"].as_str().is_some_and(|mime| {
                             mime.starts_with("text/")
                                 || mime.contains("json")
@@ -2111,7 +2897,7 @@ impl BrowserBackend {
                             let text = body["body"].as_str().unwrap_or_default();
                             let mut shown = match serde_json::from_str::<Value>(text) {
                                 Ok(mut parsed) => {
-                                    aad_cdp::recording::network::redact(&mut parsed);
+                                    aad_browser::recording::network::redact(&mut parsed);
                                     parsed.to_string()
                                 }
                                 Err(_) => text.to_string(),
@@ -2223,14 +3009,66 @@ impl BrowserBackend {
         }
         let page_id = meta["page_id"].as_str().unwrap_or_default();
         let frame_id = meta["frame_id"].as_str().unwrap_or_default();
-        self.with_page(page_id, timeout, |client| {
-            if current_frame(client, None, frame_id)?["loaderId"] != meta["loader_id"] {
+        self.with_page_state(page_id, timeout, |page| {
+            if let Some(dialog) = &page.dialog {
+                return Err(dialog_open(dialog));
+            }
+            if current_frame(&mut page.client, None, frame_id)?["loaderId"] != meta["loader_id"] {
                 return Err(error("CONTROL.STALE_TARGET", "browser document navigated"));
             }
-            let context = Ctx {
-                session: None,
-                id: meta["context_id"].as_i64().unwrap_or_default(),
-            };
+            let marked:Vec<_>=self.secret_frames.lock().unwrap().iter()
+                .filter(|((known_page,known_frame),_)|known_page==page_id && known_frame!=frame_id)
+                .map(|(key,frame)|(key.clone(),frame.clone())).collect();
+            for (key,secret) in marked {
+                let current=match self.locate(page,&key.1) {
+                    Ok(entry)=>entry,
+                    Err(e) if e.code=="CONTROL.STALE_TARGET"=>{
+                        self.secret_frames.lock().unwrap().remove(&key);
+                        continue;
+                    }
+                    Err(_)=>return Err(error("CONTROL.ACTION_UNSUPPORTED","capture cannot confirm protected child-frame visibility")),
+                };
+                if current.frame["loaderId"]!=secret.loader {
+                    self.secret_frames.lock().unwrap().remove(&key);
+                    continue;
+                }
+                // Child sessions belong to a connection, so recover this
+                // backend's named world after reconnecting, too. An absent
+                // marker in an unchanged document is unknown, never safe.
+                let visible=(|| -> Result<Value> {
+                    let created=run(&mut page.client,current.session.as_deref(),"Page.createIsolatedWorld",json!({"frameId":key.1,"worldName":self.world,"grantUniveralAccess":false}))?;
+                    let id=created["executionContextId"].as_i64().ok_or_else(||error("BROWSER.BAD_RESULT","no protected frame context"))?;
+                    let context=Ctx::new(current.session,id);
+                    let nonce=serde_json::to_string(&uuid::Uuid::new_v4().to_string()).unwrap();
+                    eval(&mut page.client,&context,include_str!("browser.js").replace("/*AAD_NAMING*/",aad_browser::cdp::NAMING).replace("NONCE",&nonce))?;
+                    self.restore_secrets(&mut page.client,&context,page_id,&key.1,&current.frame["loaderId"])?;
+                    eval(&mut page.client,&context,"globalThis.__aadControlV1.secrets_visible()".into())
+                })().map_err(|_|error("CONTROL.ACTION_UNSUPPORTED","capture cannot confirm protected child-frame visibility"))?;
+                if visible!=false {
+                    return Err(error("CONTROL.ACTION_UNSUPPORTED","capture may include a protected child-frame element"));
+                }
+            }
+            // A main-frame capture can include any child frame, even when its
+            // DOM was never in the caller's observation. Inspect protection in
+            // each frame's own isolated world; unknown visibility fails closed.
+            let current_frames = frame_map(page)?;
+            for (child_id,entry) in &current_frames {
+                if child_id==frame_id {continue;}
+                self.check_frame_access(&current_frames,child_id)?;
+                let safe=(||->Result<bool> {
+                    let created=run(&mut page.client,entry.session.as_deref(),"Page.createIsolatedWorld",json!({"frameId":child_id,"worldName":self.world,"grantUniveralAccess":false}))?;
+                    let id=created["executionContextId"].as_i64().ok_or_else(||error("BROWSER.BAD_RESULT","no child context"))?;
+                    let context=Ctx::new(entry.session.clone(),id);
+                    let nonce=serde_json::to_string(&uuid::Uuid::new_v4().to_string()).unwrap();
+                    eval(&mut page.client,&context,include_str!("browser.js").replace("/*AAD_NAMING*/",aad_browser::cdp::NAMING).replace("NONCE",&nonce))?;
+                    refresh_closed_roots(&mut page.client,&context,None,true)?;
+                    Ok(eval(&mut page.client,&context,"globalThis.__aadControlV1.closed_protected_visible()".into())?==false)
+                })().unwrap_or(false);
+                if !safe {return Err(error("CONTROL.ACTION_UNSUPPORTED","capture may include protected closed-shadow content in a child frame"));}
+            }
+            let client=&mut page.client;
+            let context = Ctx::new(None, meta["context_id"].as_i64().unwrap_or_default());
+            refresh_closed_roots(client,&context,None,true)?;
             let args = json!({"document_token": snapshot["document_token"], "observation": snapshot["snapshot_id"], "node_id": node["node_id"]});
             let rect = checked(eval(
                 client,
@@ -2266,6 +3104,79 @@ fn mouse(client: &mut Client, params: Value) -> Result<Value> {
     command(client, "Input.dispatchMouseEvent", params).map_err(|e| e.with_effect("unknown"))
 }
 
+const INPUT_CLEANUP: Duration = Duration::from_millis(200);
+
+fn hold_preflight(context: &crate::Context, hold_ms: Option<u64>) -> Result<()> {
+    if let Some(ms) = hold_ms {
+        if !(1..=5000).contains(&ms) {
+            return Err(error(
+                "CONTROL.INVALID_REQUEST",
+                "hold_ms must be in 1..5000",
+            ));
+        }
+        if context.remaining()? < Duration::from_millis(ms) + INPUT_CLEANUP {
+            return Err(error(
+                "CONTROL.TIMEOUT",
+                "request deadline does not cover the hold and input release",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn wait_hold<T>(
+    client: &mut T,
+    hold_ms: Option<u64>,
+    context: &crate::Context,
+    verify: impl Fn(&mut T) -> Result<()>,
+) -> Result<()> {
+    let Some(ms) = hold_ms else {
+        return Ok(());
+    };
+    let until = Instant::now() + Duration::from_millis(ms);
+    loop {
+        context.remaining()?;
+        verify(client).map_err(|e| e.with_effect("unknown"))?;
+        context.remaining()?;
+        let remaining = until.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(());
+        }
+        std::thread::sleep(remaining.min(Duration::from_millis(25)));
+    }
+}
+
+fn held_pointer(
+    client: &mut Client,
+    context: &Ctx,
+    route: &Route,
+    args: &Value,
+    expected: (f64, f64),
+) -> Result<()> {
+    // landing rechecks the private frame/ancestor grant and loader chain.
+    let mut still = args.clone();
+    still["noscroll"] = json!(true);
+    let local = landing(client, context, &still)?;
+    let actual = route.page_point(client, local)?;
+    if (actual.0 - expected.0).abs() > 0.5 || (actual.1 - expected.1).abs() > 0.5 {
+        return Err(error("CONTROL.STALE_TARGET", "held pointer target moved"));
+    }
+    Ok(())
+}
+
+/// CDP carries modifier state on each pointer event, so a gesture does not
+/// send keys to a different focused element or leave modifier keys pressed.
+fn pointer_modifiers(modifiers: &[PointerModifier]) -> u32 {
+    modifiers.iter().fold(0, |bits, modifier| {
+        bits | match modifier {
+            PointerModifier::Alt => ALT,
+            PointerModifier::Ctrl => CTRL,
+            PointerModifier::Meta => META,
+            PointerModifier::Shift => SHIFT,
+        }
+    })
+}
+
 /// Trusted pointer input at a point the page confirmed lands on the node.
 fn pointer(
     client: &mut Client,
@@ -2275,31 +3186,74 @@ fn pointer(
     action: &Action,
     action_context: &crate::Context,
 ) -> Result<Value> {
+    if let Action::Click { hold_ms, .. } = action {
+        hold_preflight(action_context, *hold_ms)?;
+    }
     let point = landing(client, context, args)?;
     let (x, y) = route.page_point(client, point)?;
+    let modifiers = match action {
+        Action::Click { modifiers, .. } => pointer_modifiers(modifiers),
+        _ => 0,
+    };
     action_context.commit()?;
-    arrive(client, context, route, args, (x, y), action_context)?;
+    arrive(
+        client,
+        context,
+        route,
+        args,
+        (x, y),
+        modifiers,
+        action_context,
+    )?;
     match action {
-        Action::Click { button, count, .. } => {
+        Action::Click {
+            button,
+            count,
+            hold_ms,
+            ..
+        } => {
+            hold_preflight(action_context, *hold_ms)?;
             let (name, mask) = match button {
                 None | Some(Button::Left) => ("left", 1),
                 Some(Button::Right) => ("right", 2),
                 Some(Button::Middle) => ("middle", 4),
             };
             for click in 1..=count.unwrap_or(1) {
-                mouse(
+                held_pointer(client, context, route, args, (x, y))
+                    .map_err(|e| e.with_effect(if click > 1 { "unknown" } else { "contextual" }))?;
+                action_context.commit()?;
+                let deadline = Instant::now() + action_context.remaining()?;
+                let pressed = mouse(
                     client,
-                    json!({"type": "mousePressed", "x": x, "y": y, "button": name, "buttons": mask, "clickCount": click}),
-                )?;
-                mouse(
+                    json!({"type": "mousePressed", "x": x, "y": y, "button": name, "buttons": mask, "clickCount": click, "modifiers": modifiers}),
+                ).and_then(|_|wait_hold(client,*hold_ms,action_context,|client|held_pointer(client,context,route,args,(x,y))));
+                // Even an errored dispatch may already have pressed the button.
+                if pressed.is_err() {
+                    client.set_deadline(Instant::now() + INPUT_CLEANUP);
+                }
+                let released = mouse(
                     client,
-                    json!({"type": "mouseReleased", "x": x, "y": y, "button": name, "buttons": 0, "clickCount": click}),
-                )?;
+                    json!({"type": "mouseReleased", "x": x, "y": y, "button": name, "buttons": 0, "clickCount": click, "modifiers": modifiers}),
+                );
+                let cleared = released.is_ok()
+                    || if pressed.is_ok() {
+                        client.set_deadline(Instant::now() + INPUT_CLEANUP);
+                        mouse(client,json!({"type":"mouseReleased","x":x,"y":y,"button":name,"buttons":0,"modifiers":0})).is_ok()
+                    } else {
+                        false
+                    };
+                client.set_deadline(deadline);
+                pressed
+                    .and(released)
+                    .map_err(|e| e.with_detail("pointer_button_released", json!(cleared)))?;
             }
         }
         Action::Scroll {
             direction, notches, ..
         } => {
+            held_pointer(client, context, route, args, (x, y))
+                .map_err(|e| e.with_effect("contextual"))?;
+            action_context.commit()?;
             let distance = 100.0 * f64::from(notches.unwrap_or(3));
             let (dx, dy) = match direction {
                 Direction::Up => (0.0, -distance),
@@ -2313,8 +3267,12 @@ fn pointer(
             )?;
         }
         Action::Hover { ms, .. } => {
-            let dwell = Duration::from_millis(u64::from(ms.unwrap_or(500)));
-            std::thread::sleep(dwell.min(action_context.remaining()?));
+            wait_hold(
+                client,
+                Some(u64::from(ms.unwrap_or(500))),
+                action_context,
+                |client| held_pointer(client, context, route, args, (x, y)),
+            )?;
         }
         _ => unreachable!("only pointer actions are trusted"),
     }
@@ -2325,6 +3283,11 @@ fn pointer(
 
 /// Where the page confirmed pointer input lands on an observed node.
 fn landing(client: &mut Client, context: &Ctx, args: &Value) -> Result<(f64, f64)> {
+    if args["noscroll"] == true {
+        context.check_input(client)?;
+    } else {
+        context.commit_input(client)?;
+    }
     let point = checked(eval(
         client,
         context,
@@ -2343,15 +3306,22 @@ const ROUTING: Duration = Duration::from_millis(1500);
 /// by compositor hit-test data that lags behind scrolling, so the move is
 /// repeated until the frame itself reports the element under the pointer
 /// (`:hover`); only then may a button go down.
+#[allow(clippy::too_many_arguments)]
 fn arrive(
     client: &mut Client,
     context: &Ctx,
     route: &Route,
     args: &Value,
     (x, y): (f64, f64),
+    modifiers: u32,
     action_context: &crate::Context,
 ) -> Result<()> {
-    mouse(client, json!({"type": "mouseMoved", "x": x, "y": y}))?;
+    context.check_input(client)?;
+    action_context.commit()?;
+    mouse(
+        client,
+        json!({"type": "mouseMoved", "x": x, "y": y, "modifiers": modifiers}),
+    )?;
     if route.levels.is_empty() {
         return Ok(());
     }
@@ -2375,8 +3345,21 @@ fn arrive(
         }
         std::thread::sleep(Duration::from_millis(25));
         // A move to the same point is not delivered again; nudge and return.
-        mouse(client, json!({"type": "mouseMoved", "x": x + 0.5, "y": y}))?;
-        mouse(client, json!({"type": "mouseMoved", "x": x, "y": y}))?;
+        held_pointer(client, context, route, args, (x, y))
+            .map_err(|e| e.with_effect("contextual"))?;
+        action_context.commit()?;
+        mouse(
+            client,
+            json!({"type": "mouseMoved", "x": x + 0.5, "y": y, "modifiers": modifiers}),
+        )?;
+        context
+            .check_input(client)
+            .map_err(|e| e.with_effect("contextual"))?;
+        action_context.commit()?;
+        mouse(
+            client,
+            json!({"type": "mouseMoved", "x": x, "y": y, "modifiers": modifiers}),
+        )?;
     }
 }
 
@@ -2384,6 +3367,35 @@ fn arrive(
 const DRAG_STEPS: u32 = 12;
 /// How long an HTML5 drag may take to reach the browser after the last move.
 const DRAG_SETTLE: Duration = Duration::from_millis(150);
+const DRAG_PATH_INTERVAL_MS: u64 = 16;
+
+fn drag_path_preflight(
+    context: &crate::Context,
+    hold_ms: Option<u64>,
+    anchors: usize,
+) -> Result<()> {
+    if anchors > 0
+        && context.remaining()?
+            < Duration::from_millis(
+                hold_ms.unwrap_or(0) + (anchors as u64 + 1) * DRAG_PATH_INTERVAL_MS,
+            ) + INPUT_CLEANUP
+    {
+        return Err(error(
+            "CONTROL.TIMEOUT",
+            "request deadline does not cover the drag path and input release",
+        ));
+    }
+    Ok(())
+}
+
+fn path_surface(client: &mut Client, context: &Ctx, args: &Value) -> Result<()> {
+    checked(eval(
+        client,
+        context,
+        format!("globalThis.__aadControlV1.path_surface({args})"),
+    )?)?;
+    Ok(())
+}
 
 /// Press on one observed node, glide, release on another. Both ends are hit
 /// tested while both are in view. An HTML5 drag (draggable, dragstart/drop)
@@ -2397,8 +3409,14 @@ fn drag(
     from: &Value,
     onto: &Value,
     button: Option<Button>,
+    modifiers: u32,
+    hold_ms: Option<u64>,
+    path: &[Value],
     action_context: &crate::Context,
 ) -> Result<Value> {
+    hold_preflight(action_context, hold_ms)?;
+    drag_path_preflight(action_context, hold_ms, path.len())?;
+    let deadline = Instant::now() + action_context.remaining()?;
     let client = &mut page.client;
     landing(client, context, from)?;
     landing(client, context, onto)?;
@@ -2423,6 +3441,14 @@ fn drag(
     let start = route.page_point(client, start)?;
     let end = landing(client, context, &still(onto))?;
     let end = route.page_point(client, end)?;
+    let mut waypoints = Vec::new();
+    if !path.is_empty() {
+        path_surface(client, context, from)?;
+        for args in path.iter().chain(std::iter::once(onto)) {
+            let point = landing(client, context, &still(args))?;
+            waypoints.push((args, route.page_point(client, point)?));
+        }
+    }
     let (name, mask) = match button {
         None | Some(Button::Left) => ("left", 1),
         Some(Button::Right) => ("right", 2),
@@ -2432,56 +3458,122 @@ fn drag(
     page.drag = None;
     action_context.commit()?;
     let client = &mut page.client;
-    command(
+    let enabled = command(
         client,
         "Input.setInterceptDrags",
         json!({"enabled": name == "left"}),
     )
-    .map_err(|e| e.with_effect("unknown"))?;
-    let mut result = || -> Result<Value> {
+    .map_err(|e| e.with_effect("unknown"));
+    let mut held = false;
+    let mut last = start;
+    let result = (|| -> Result<Value> {
+        enabled?;
         arrive(
             &mut page.client,
             context,
             route,
             from,
             start,
+            modifiers,
             action_context,
         )?;
+        hold_preflight(action_context, hold_ms)?;
+        drag_path_preflight(action_context, hold_ms, path.len())?;
+        if !path.is_empty() {
+            held_pointer(&mut page.client, context, route, from, start)?;
+            for (args, point) in &waypoints {
+                held_pointer(&mut page.client, context, route, args, *point)?;
+            }
+            path_surface(&mut page.client, context, from)?;
+        }
+        context.check_input(&mut page.client)?;
+        action_context.commit()?;
+        held = true;
         mouse(
             &mut page.client,
-            json!({"type": "mousePressed", "x": start.0, "y": start.1, "button": name, "buttons": mask, "clickCount": 1}),
+            json!({"type": "mousePressed", "x": start.0, "y": start.1, "button": name, "buttons": mask, "clickCount": 1, "modifiers": modifiers}),
         )?;
+        wait_hold(&mut page.client, hold_ms, action_context, |client| {
+            held_pointer(client, context, route, from, start)?;
+            held_pointer(client, context, route, onto, end)
+        })?;
         let mut intercepted = None;
-        for step in 1..=DRAG_STEPS {
-            let f = f64::from(step) / f64::from(DRAG_STEPS);
-            let (x, y) = (
-                start.0 + (end.0 - start.0) * f,
-                start.1 + (end.1 - start.1) * f,
-            );
-            mouse(
-                &mut page.client,
-                json!({"type": "mouseMoved", "x": x, "y": y, "button": name, "buttons": mask}),
-            )?;
-            page.sync_dialog();
-            if let Some(data) = page.drag.take() {
-                intercepted = Some(data);
-                break;
+        if !path.is_empty() {
+            let mut prior = (from, start);
+            for (args, point) in &waypoints {
+                wait_hold(
+                    &mut page.client,
+                    Some(DRAG_PATH_INTERVAL_MS),
+                    action_context,
+                    |client| {
+                        path_surface(client, context, from)?;
+                        held_pointer(client, context, route, prior.0, prior.1)?;
+                        held_pointer(client, context, route, args, *point)
+                    },
+                )?;
+                action_context.commit()?;
+                last = *point;
+                mouse(
+                    &mut page.client,
+                    json!({"type":"mouseMoved","x":point.0,"y":point.1,"button":name,"buttons":mask,"modifiers":modifiers}),
+                )?;
+                page.sync_dialog();
+                if page.drag.take().is_some() {
+                    return Err(error(
+                        "CONTROL.ACTION_UNSUPPORTED",
+                        "HTML5 drag interception is unsupported for a surface path",
+                    )
+                    .with_effect("unknown"));
+                }
+                prior = (args, *point);
             }
-        }
-        let settle = Instant::now() + DRAG_SETTLE;
-        while intercepted.is_none() && name == "left" && Instant::now() < settle {
-            std::thread::sleep(Duration::from_millis(10));
-            page.sync_dialog();
-            intercepted = page.drag.take();
+            action_context.remaining()?;
+            held_pointer(&mut page.client, context, route, onto, end)?;
+        } else {
+            for step in 1..=DRAG_STEPS {
+                context
+                    .check_input(&mut page.client)
+                    .map_err(|e| e.with_effect("unknown"))?;
+                action_context.commit()?;
+                let f = f64::from(step) / f64::from(DRAG_STEPS);
+                let (x, y) = (
+                    start.0 + (end.0 - start.0) * f,
+                    start.1 + (end.1 - start.1) * f,
+                );
+                last = (x, y);
+                mouse(
+                    &mut page.client,
+                    json!({"type": "mouseMoved", "x": x, "y": y, "button": name, "buttons": mask, "modifiers": modifiers}),
+                )?;
+                page.sync_dialog();
+                if let Some(data) = page.drag.take() {
+                    intercepted = Some(data);
+                    break;
+                }
+            }
+            let settle = Instant::now() + DRAG_SETTLE;
+            while intercepted.is_none() && name == "left" && Instant::now() < settle {
+                std::thread::sleep(Duration::from_millis(10));
+                context
+                    .check_input(&mut page.client)
+                    .map_err(|e| e.with_effect("unknown"))?;
+                action_context.remaining()?;
+                page.sync_dialog();
+                intercepted = page.drag.take();
+            }
         }
         let client = &mut page.client;
         let operation = match &intercepted {
             Some(data) => {
                 for kind in ["dragEnter", "dragOver", "drop"] {
+                    context
+                        .check_input(client)
+                        .map_err(|e| e.with_effect("unknown"))?;
+                    action_context.commit()?;
                     command(
                         client,
                         "Input.dispatchDragEvent",
-                        json!({"type": kind, "x": end.0, "y": end.1, "data": data}),
+                        json!({"type": kind, "x": end.0, "y": end.1, "data": data, "modifiers": modifiers}),
                     )
                     .map_err(|e| e.with_effect("unknown"))?;
                 }
@@ -2489,22 +3581,52 @@ fn drag(
             }
             None => "Input.dispatchMouseEvent",
         };
+        last = end;
         mouse(
             client,
-            json!({"type": "mouseReleased", "x": end.0, "y": end.1, "button": name, "buttons": 0, "clickCount": 1}),
+            json!({"type": "mouseReleased", "x": end.0, "y": end.1, "button": name, "buttons": 0, "clickCount": 1, "modifiers": modifiers}),
         )?;
+        held = false;
         Ok(
             json!({"submitted": true, "native_operation": operation, "trusted_event": true,
-                "html5_drag": intercepted.is_some(), "steps": DRAG_STEPS}),
+                "html5_drag": intercepted.is_some(), "steps": if path.is_empty(){DRAG_STEPS as usize}else{waypoints.len()}}),
         )
+    })();
+    if result.is_err() {
+        page.client.set_deadline(Instant::now() + INPUT_CLEANUP);
+    }
+    let cleared = if held {
+        // Cleanup is best effort; preserve the original error and its unknown
+        // effect if the renderer or the connection can no longer answer.
+        mouse(
+            &mut page.client,
+            json!({"type": "mouseReleased", "x": last.0, "y": last.1, "button": name, "buttons": 0, "modifiers": 0}),
+        ).is_ok()
+    } else {
+        true
     };
-    let result = result();
-    let _ = command(
+    // Cancel even if the interception event has not reached this connection
+    // yet. Releasing the held pointer takes priority in the cleanup budget.
+    let cancelled =
+        result.is_ok() || command(&mut page.client, "Input.cancelDragging", json!({})).is_ok();
+    let disabled = command(
         &mut page.client,
         "Input.setInterceptDrags",
         json!({"enabled": false}),
     );
+    let interception_cleared = disabled.is_ok();
+    page.client.set_deadline(deadline);
     result
+        .and_then(|value| {
+            disabled
+                .map(|_| value)
+                .map_err(|e| e.with_effect("unknown"))
+        })
+        .map_err(|e| {
+            e.with_detail("pointer_button_released", json!(cleared))
+                .with_detail("drag_interception_cleared", json!(interception_cleared))
+                .with_detail("html5_drag_cancelled", json!(cancelled))
+        })
 }
 
 /// Files into the observed file input. The session has already resolved the
@@ -2541,14 +3663,17 @@ fn upload(
         .filter(|_| element["result"]["subtype"] == "node")
         .ok_or_else(|| error("CONTROL.STALE_TARGET", "the file input was replaced"))?
         .to_string();
-    action_context.commit()?;
-    let result = run(
-        client,
-        session,
-        "DOM.setFileInputFiles",
-        json!({"files": files, "objectId": object}),
-    )
-    .map_err(|e| e.with_effect("unknown"));
+    let result = (|| {
+        context.check_input(client)?;
+        action_context.commit()?;
+        run(
+            client,
+            session,
+            "DOM.setFileInputFiles",
+            json!({"files": files, "objectId": object}),
+        )
+        .map_err(|e| e.with_effect("unknown"))
+    })();
     let _ = run(
         client,
         session,
@@ -2595,6 +3720,11 @@ fn page(
         }
         None => None,
     };
+    if let (Some(input), Some(entry)) = (&context.input, &entry) {
+        input
+            .access
+            .check_document(entry["url"].as_str().unwrap_or_default())?;
+    }
     // Site data belongs to the page's origin; an opaque one has none to clear.
     let origin = match action {
         Action::ClearSiteData {} => {
@@ -2612,6 +3742,7 @@ fn page(
         }
         _ => None,
     };
+    context.check_input(client)?;
     action_context.commit()?;
     let unknown = |e: AutomationError| e.with_effect("unknown");
     let operation = match action {
@@ -2843,9 +3974,9 @@ fn typed_key(character: char) -> Option<KeyPress> {
     })
 }
 
-/// A chord for the focused element. Shortcuts the browser itself acts on --
-/// new or closed tabs and windows, history, devtools, find, reload, zoom --
-/// are refused: CDP hands keys the page does not consume back to the browser.
+/// A chord for the focused element. These are renderer events: page editors
+/// may use Ctrl+K/S and other letters without invoking browser accelerators.
+/// OS modifiers and function keys still use the bounded set supported here.
 fn key_chord(keys: &[String]) -> Result<KeyPress> {
     let mut modifiers: u32 = 0;
     let mut primary = None;
@@ -2895,8 +4026,8 @@ fn key_chord(keys: &[String]) -> Result<KeyPress> {
         Err(error(
             "CONTROL.ACTION_UNSUPPORTED",
             format!(
-                "{} is a browser-global shortcut or not an element-scoped key; only editing \
-                 and navigation keys for the focused element are sent",
+                "{} is not a supported element-scoped key; only supported editing, \
+                 page shortcuts and navigation keys are sent",
                 keys.join("+")
             ),
         ))
@@ -2910,20 +4041,17 @@ fn key_chord(keys: &[String]) -> Result<KeyPress> {
     );
     let allowed = match (modifiers & CTRL != 0, modifiers & SHIFT != 0) {
         (false, _) => named.is_some() || character.is_some(),
-        // Ctrl+Tab and Ctrl+PageUp/PageDown switch tabs.
+        // Tab switching has explicit page actions. Letter shortcuts also
+        // belong to page editors and are delivered without browser fallback.
         (true, false) => {
             navigation
                 || matches!(
                     named.map(|(k, _)| k),
                     Some("Enter" | "Backspace" | "Delete" | " ")
                 )
-                || matches!(
-                    lower.as_str(),
-                    "a" | "c" | "v" | "x" | "z" | "y" | "b" | "i"
-                )
+                || character.is_some_and(|c| c.is_ascii_alphabetic())
         }
-        // Ctrl+Shift opens windows, devtools and history; selection and redo stay.
-        (true, true) => navigation || lower == "z",
+        (true, true) => navigation || character.is_some_and(|c| c.is_ascii_alphabetic()),
     };
     if !allowed {
         return refuse();
@@ -2974,25 +4102,54 @@ fn key_chord(keys: &[String]) -> Result<KeyPress> {
     })
 }
 
-/// Press and release one key. The document must still be the observed one
-/// between the two halves.
-fn press(client: &mut Client, press: &KeyPress) -> Result<()> {
-    let mut down = json!({"type": if press.text.is_some() {"keyDown"} else {"rawKeyDown"},
+/// Native virtual key 0 makes Chromium set skip_if_unhandled. This bypasses
+/// browser accelerators both before renderer dispatch and after an unhandled
+/// renderer event, while preserving trusted DOM key/code/modifier fields.
+fn key_event(press: &KeyPress, release: bool) -> Value {
+    let mut event = json!({"type": if release {"keyUp"} else if press.text.is_some() {"keyDown"} else {"rawKeyDown"},
         "key": press.key, "code": press.code, "windowsVirtualKeyCode": press.virtual_key,
-        "nativeVirtualKeyCode": press.virtual_key, "modifiers": press.modifiers});
-    if let Some(text) = &press.text {
-        down["text"] = json!(text);
-        down["unmodifiedText"] = json!(text);
+        "nativeVirtualKeyCode": 0, "modifiers": press.modifiers});
+    if !release {
+        if let Some(text) = &press.text {
+            event["text"] = json!(text);
+            event["unmodifiedText"] = json!(text);
+        }
     }
-    command(client, "Input.dispatchKeyEvent", down).map_err(|e| e.with_effect("unknown"))?;
-    command(
-        client,
-        "Input.dispatchKeyEvent",
-        json!({"type": "keyUp", "key": press.key, "code": press.code,
-            "windowsVirtualKeyCode": press.virtual_key, "nativeVirtualKeyCode": press.virtual_key,
-            "modifiers": press.modifiers}),
-    )
-    .map_err(|e| e.with_effect("unknown"))?;
+    event
+}
+
+/// Even a timed-out dispatch may already have pressed a key. A short cleanup
+/// budget permits release after the request deadline; it never permits more
+/// typing, and the original deadline is restored afterwards.
+fn press(
+    client: &mut Client,
+    press: &KeyPress,
+    deadline: Instant,
+    hold_ms: Option<u64>,
+    context: &crate::Context,
+    verify: impl Fn(&mut Client) -> Result<()>,
+) -> Result<()> {
+    hold_preflight(context, hold_ms)?;
+    let pressed = command(client, "Input.dispatchKeyEvent", key_event(press, false))
+        .map_err(|e| e.with_effect("unknown"))
+        .and_then(|_| wait_hold(client, hold_ms, context, verify));
+    if pressed.is_err() {
+        client.set_deadline(Instant::now() + INPUT_CLEANUP);
+    }
+    let released = command(client, "Input.dispatchKeyEvent", key_event(press, true))
+        .map_err(|e| e.with_effect("unknown"));
+    let cleared = if released.is_ok() {
+        true
+    } else if pressed.is_ok() {
+        client.set_deadline(Instant::now() + INPUT_CLEANUP);
+        command(client, "Input.dispatchKeyEvent", key_event(press, true)).is_ok()
+    } else {
+        false
+    };
+    client.set_deadline(deadline);
+    pressed
+        .and(released)
+        .map_err(|e| e.with_detail("key_released", json!(cleared)))?;
     Ok(())
 }
 
@@ -3033,16 +4190,20 @@ fn keyboard(
     client: &mut Client,
     context: &Ctx,
     args: &Value,
-    frame_id: &str,
-    loader: &Value,
     action: &Action,
     action_context: &crate::Context,
 ) -> Result<Value> {
+    let hold_ms = match action {
+        Action::Key { hold_ms, .. } => *hold_ms,
+        _ => None,
+    };
+    hold_preflight(action_context, hold_ms)?;
     let strokes = match action {
-        Action::Key { keys } => Keystrokes::Presses(vec![key_chord(keys)?]),
+        Action::Key { keys, .. } => Keystrokes::Presses(vec![key_chord(keys)?]),
         Action::TypeText { text, mode } => keystrokes(text, *mode)?,
         _ => unreachable!("only keyboard actions reach here"),
     };
+    context.check_input(client)?;
     action_context.commit()?;
     checked(
         eval(
@@ -3053,17 +4214,16 @@ fn keyboard(
         .map_err(|e| e.with_effect("unknown"))?,
     )?;
     let focused = |client: &mut Client, effect: &str| -> Result<()> {
+        context
+            .check_input(client)
+            .map_err(|e| e.with_effect(effect))?;
         let verify = eval(
             client,
             context,
             format!("globalThis.__aadControlV1.verify({args})"),
         )
         .map_err(|e| e.with_effect(effect))?;
-        if verify["ok"] != true
-            || current_frame(client, context.session.as_deref(), frame_id)
-                .map_err(|e| e.with_effect(effect))?["loaderId"]
-                != *loader
-        {
+        if verify["ok"] != true {
             return Err(error(
                 "CONTROL.FOCUS_LOST",
                 "keyboard focus left the observed element, or its document changed",
@@ -3084,7 +4244,14 @@ fn keyboard(
         }
         action_context.commit()?;
         match &strokes {
-            Keystrokes::Presses(presses) => press(client, &presses[index])?,
+            Keystrokes::Presses(presses) => press(
+                client,
+                &presses[index],
+                Instant::now() + action_context.remaining()?,
+                hold_ms,
+                action_context,
+                |client| focused(client, "unknown"),
+            )?,
             Keystrokes::Text(chunks) => {
                 command(client, "Input.insertText", json!({"text": chunks[index]}))
                     .map_err(|e| e.with_effect("unknown"))?;
@@ -3100,6 +4267,260 @@ fn keyboard(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fresh_input_queries_cannot_outlive_their_dispatch_permission() {
+        let action = crate::Context::new(Duration::from_secs(1), true);
+        let result = input_boundary(Some(&action), || {
+            action.cancel();
+            Ok(())
+        });
+        assert_eq!(result.unwrap_err().code, "CONTROL.CANCELLED");
+        let result = input_boundary(Some(&action), || {
+            panic!("cancelled input must not even query")
+        });
+        assert_eq!(result.unwrap_err().code, "CONTROL.CANCELLED");
+        let action = crate::Context::new(Duration::from_millis(2), true);
+        let result = input_boundary(Some(&action), || {
+            std::thread::sleep(Duration::from_millis(4));
+            Ok(())
+        });
+        assert_eq!(result.unwrap_err().code, "CONTROL.TIMEOUT");
+    }
+
+    #[test]
+    fn input_grants_recheck_ancestor_urls_and_identity_between_events() {
+        let frame = |id: &str, url: &str, parent: Option<&str>| {
+            (
+                id.to_string(),
+                FrameEntry {
+                    session: None,
+                    frame: json!({"id":id,"url":url,"loaderId":format!("loader-{id}")}),
+                    parent: parent.map(String::from),
+                    root: parent.is_none(),
+                },
+            )
+        };
+        let frames = vec![
+            frame("main", "https://example.test/", None),
+            frame("child", "about:srcdoc", Some("main")),
+        ];
+        let guard = InputAccess::new(Default::default(), &frames, "child").unwrap();
+        let mut current = frames.clone();
+        current[0].1.frame["url"] = json!("https://example.test/another#state");
+        assert!(guard.validate(&current).is_ok());
+        current[0].1.frame["url"] = json!("chrome://settings/");
+        assert_eq!(guard.validate(&current).unwrap_err().code, "POLICY.DENIED");
+        current = frames.clone();
+        current[0].1.frame["loaderId"] = json!("replaced");
+        assert_eq!(
+            guard.validate(&current).unwrap_err().code,
+            "CONTROL.STALE_TARGET"
+        );
+        current = frames.clone();
+        current[1].1.parent = None;
+        assert_eq!(
+            guard.validate(&current).unwrap_err().code,
+            "CONTROL.STALE_TARGET"
+        );
+        current = frames.clone();
+        current[1].1.session = Some("replacement-renderer".into());
+        assert_eq!(
+            guard.validate(&current).unwrap_err().code,
+            "CONTROL.STALE_TARGET"
+        );
+        current.pop();
+        assert_eq!(
+            guard.validate(&current).unwrap_err().code,
+            "CONTROL.STALE_TARGET"
+        );
+    }
+
+    #[test]
+    fn a_slow_hold_verification_cannot_hide_cancellation_or_deadline() {
+        let context = crate::Context::new(Duration::from_secs(1), true);
+        let result = wait_hold(&mut (), Some(1), &context, |_| {
+            context.cancel();
+            std::thread::sleep(Duration::from_millis(2));
+            Ok(())
+        });
+        assert_eq!(result.unwrap_err().code, "CONTROL.CANCELLED");
+        let context = crate::Context::new(Duration::from_millis(2), true);
+        let result = wait_hold(&mut (), Some(1), &context, |_| {
+            std::thread::sleep(Duration::from_millis(4));
+            Ok(())
+        });
+        assert_eq!(result.unwrap_err().code, "CONTROL.TIMEOUT");
+    }
+
+    #[test]
+    fn browser_document_grants_cover_embedding_frames_without_blocking_unrelated_siblings() {
+        let backend = BrowserBackend::new(0);
+        let frame = |id: &str, url: &str, parent: Option<&str>| {
+            (
+                id.to_string(),
+                FrameEntry {
+                    session: None,
+                    frame: json!({"id":id,"url":url}),
+                    parent: parent.map(String::from),
+                    root: parent.is_none(),
+                },
+            )
+        };
+        let mut frames = vec![
+            frame("main", "https://example.test/", None),
+            frame("permitted", "about:srcdoc", Some("main")),
+            frame("private", "file:///synthetic-ungranted.html", Some("main")),
+            frame("nested", "https://example.test/child", Some("private")),
+        ];
+        assert!(backend.check_frame_access(&frames, "permitted").is_ok());
+        assert_eq!(
+            backend
+                .check_frame_access(&frames, "private")
+                .unwrap_err()
+                .code,
+            "POLICY.DENIED"
+        );
+        assert_eq!(
+            backend
+                .check_frame_access(&frames, "nested")
+                .unwrap_err()
+                .code,
+            "POLICY.DENIED"
+        );
+        frames[0].1.frame["url"] = json!("chrome://settings/");
+        assert_eq!(
+            backend
+                .check_frame_access(&frames, "permitted")
+                .unwrap_err()
+                .code,
+            "POLICY.DENIED"
+        );
+        frames[0].1.frame["url"] = json!("https://example.test/");
+        frames[1].1.parent = Some("missing".into());
+        assert_eq!(
+            backend
+                .check_frame_access(&frames, "permitted")
+                .unwrap_err()
+                .code,
+            "CONTROL.STALE_TARGET"
+        );
+        frames[1].1.parent = Some("permitted".into());
+        assert_eq!(
+            backend
+                .check_frame_access(&frames, "permitted")
+                .unwrap_err()
+                .code,
+            "CONTROL.STALE_TARGET"
+        );
+    }
+
+    #[test]
+    fn private_shadow_discovery_follows_nested_roots_and_fails_closed_at_its_bound() {
+        let tree = json!({"children":[{"shadowRoots":[
+            {"shadowRootType":"closed","backendNodeId":7,"children":[
+                {"shadowRoots":[{"shadowRootType":"closed","backendNodeId":9}]}
+            ]},
+            {"shadowRootType":"open","backendNodeId":11}
+        ]}],"contentDocument":{"shadowRoots":[{"shadowRootType":"closed","backendNodeId":13}]}});
+        assert_eq!(closed_root_ids(&tree).unwrap(), vec![7, 9]);
+        assert!(closed_root_ids(&json!({"shadowRootType":"closed"})).is_err());
+        assert_eq!(
+            closed_root_ids(&json!({"children":vec![json!({});20_000]}))
+                .unwrap_err()
+                .code,
+            "CONTROL.ACTION_UNSUPPORTED"
+        );
+    }
+
+    #[test]
+    fn isolation_requires_the_browser_command_line_not_a_page_claim() {
+        for switch in ["--headless", "--headless=new", "--headless=old"] {
+            assert!(verified_headless(
+                &json!({"arguments":["chromium",switch,"--enable-automation"]})
+            ));
+        }
+        for untrusted in [
+            json!({"userAgent":"HeadlessChrome", "headless":true}),
+            json!({"arguments":["--headless=new"]}),
+            json!({"arguments":["chromium","--","--headless=new"]}),
+            json!({"arguments":["chromium","--headless=false"]}),
+            json!({"arguments":["chromium","--headless=new","--headless=unknown"]}),
+            json!({"arguments":["chromium","--enable-automation"]}),
+        ] {
+            assert!(!verified_headless(&untrusted), "{untrusted}");
+        }
+        assert!(browser_input_keys(&json!({})).is_err());
+    }
+
+    #[test]
+    fn headless_and_unknown_attachments_share_an_instance_lock_and_fallback_owns_desktop() {
+        let id = uuid::Uuid::new_v4().to_string();
+        let another = uuid::Uuid::new_v4().to_string();
+        let desktop = format!("test-desktop-{id}");
+        let keys = |instance: &str, headless: bool| {
+            let mut keys = browser_input_keys(
+                &json!({"metadata":{"browser_instance_id":instance,"headless_input":headless}}),
+            )
+            .unwrap();
+            assert_eq!(keys.contains(&"desktop-input".to_string()), !headless);
+            // Real filesystem locks, in a unique desktop namespace so this
+            // non-GUI unit test cannot block someone else's foreground work.
+            for key in &mut keys {
+                if key == "desktop-input" {
+                    *key = desktop.clone();
+                }
+            }
+            keys
+        };
+        let session = || crate::Session::new(Vec::new(), crate::Policy::default());
+        let unknown = session();
+        let confirmed = session();
+        let independent = session();
+        unknown.input_leases(&keys(&id, false)).unwrap();
+        assert_eq!(
+            confirmed.input_leases(&keys(&id, true)).err().unwrap().code,
+            "CONTROL.RESOURCE_BUSY"
+        );
+        independent.input_leases(&keys(&another, true)).unwrap();
+        unknown.close();
+        confirmed.input_leases(&keys(&id, true)).unwrap();
+        let retried = session();
+        assert_eq!(
+            retried.input_leases(&keys(&id, false)).err().unwrap().code,
+            "CONTROL.RESOURCE_BUSY"
+        );
+
+        let native = session();
+        native.input_lease(&desktop).unwrap();
+        let fresh = uuid::Uuid::new_v4().to_string();
+        let fallback = session();
+        assert_eq!(
+            fallback
+                .input_leases(&keys(&fresh, false))
+                .err()
+                .unwrap()
+                .code,
+            "CONTROL.RESOURCE_BUSY"
+        );
+        // Losing desktop acquisition releases the newly taken instance lock.
+        let isolated = session();
+        isolated.input_leases(&keys(&fresh, true)).unwrap();
+    }
+    #[test]
+    fn unknown_element_scope_tokens_never_fall_back_to_html_ids() {
+        let backend = BrowserBackend::new(0);
+        let failure = backend
+            .observe_scope(
+                &json!({"page_id":"page", "frame_id":"frame"}),
+                "aad:browser-scope:unknown",
+                100,
+                Duration::from_millis(50),
+            )
+            .unwrap_err();
+        assert_eq!(failure.code, "CONTROL.STALE_TARGET");
+    }
+
     #[test]
     fn close_revokes_port_while_page_connection_is_busy() {
         let backend = std::sync::Arc::new(BrowserBackend::new(9222));
@@ -3188,10 +4609,13 @@ mod tests {
         assert_eq!(refused.effect, "not_applied");
         assert_eq!(refused.details["dialog"]["message"], "Your name?");
         assert_eq!(
-            cdp_error(aad_cdp::CdpError::Interrupted(DIALOG_OPENING.into())).code,
+            cdp_error(aad_browser::cdp::CdpError::Interrupted(
+                DIALOG_OPENING.into()
+            ))
+            .code,
             "CONTROL.DIALOG_OPEN"
         );
-        let lost = cdp_error(aad_cdp::CdpError::protocol(
+        let lost = cdp_error(aad_browser::cdp::CdpError::protocol(
             r#"{"code":-32000,"message":"Cannot find context with specified id"}"#,
         ));
         assert_eq!(
@@ -3222,6 +4646,12 @@ mod tests {
             &["ctrl", "x"],
             &["ctrl", "z"],
             &["ctrl", "shift", "z"],
+            &["ctrl", "k"],
+            &["ctrl", "s"],
+            &["ctrl", "t"],
+            &["ctrl", "w"],
+            &["ctrl", "shift", "n"],
+            &["ctrl", "shift", "i"],
             &["shift", "ArrowLeft"],
             &["ctrl", "shift", "End"],
             &["shift", "Tab"],
@@ -3235,17 +4665,10 @@ mod tests {
         assert_eq!((bang.key.as_str(), bang.text.as_deref()), ("!", Some("!")));
         let shifted = chord(&["shift", "a"]).unwrap();
         assert_eq!((shifted.key.as_str(), shifted.modifiers), ("A", SHIFT));
-        // Shortcuts the browser itself acts on are refused.
+        // OS modifiers and unsupported function keys are still refused.
         for keys in [
-            &["ctrl", "t"][..],
-            &["ctrl", "w"],
-            &["ctrl", "n"],
-            &["ctrl", "l"],
-            &["ctrl", "u"],
-            &["ctrl", "Tab"],
+            &["ctrl", "Tab"][..],
             &["ctrl", "PageDown"],
-            &["ctrl", "shift", "t"],
-            &["ctrl", "shift", "i"],
             &["F12"],
             &["F5"],
             &["alt", "F4"],
@@ -3254,10 +4677,24 @@ mod tests {
         ] {
             let refused = chord(keys).unwrap_err();
             assert_eq!(refused.code, "CONTROL.ACTION_UNSUPPORTED", "{keys:?}");
-            assert!(refused.message.contains("browser-global"), "{keys:?}");
+            assert!(refused.message.contains("element-scoped"), "{keys:?}");
         }
         assert!(chord(&["Enter", "Tab"]).is_err());
         assert!(chord(&["ctrl"]).is_err());
+    }
+
+    #[test]
+    fn page_keys_never_create_native_browser_accelerators() {
+        for keys in [["ctrl", "s"], ["ctrl", "k"], ["ctrl", "w"]] {
+            let press = key_chord(&keys.map(str::to_string)).unwrap();
+            for release in [false, true] {
+                let event = key_event(&press, release);
+                assert_eq!(event["nativeVirtualKeyCode"], 0);
+                assert_eq!(event["windowsVirtualKeyCode"], press.virtual_key);
+                assert_eq!(event["modifiers"], CTRL);
+                assert!(event.get("text").is_none());
+            }
+        }
     }
 
     #[test]
@@ -3314,6 +4751,23 @@ mod tests {
         let mut body = json!({"role": "document", "name": ""});
         apply_accessibility(&mut body, &json!({"role": {"value": "generic"}}));
         assert_eq!(body["role"], "document");
+    }
+
+    #[test]
+    fn protected_nodes_never_import_a_value_derived_accessible_name() {
+        let mut node = json!({"role":"textbox","name":"login","value":null,
+            "states":{"protected":true}});
+        assert!(apply_accessibility(
+            &mut node,
+            &json!({
+                "role":{"value":"button"},"name":{"value":"synthetic-private-value"},
+                "value":{"value":"synthetic-private-value"}
+            })
+        ));
+        assert_eq!(node["role"], "button");
+        assert_eq!(node["name"], "login");
+        assert!(node["value"].is_null());
+        assert!(!node.to_string().contains("synthetic-private-value"));
     }
 
     fn capture() -> Value {

@@ -162,7 +162,7 @@ aad browser-record steps --out ./login-recording --save 后台开权限  # 另�
 aad run 后台开权限 --permission desktop.input --permission desktop.observe
 ```
 
-每一步按页面地址（到路径为止，去掉查询和锚点）找页面，按控制会话自己的角色和名字找元素：录制脚本和控制会话用同一份命名规则（`aad-cdp/src/naming.js`），所以录下的名字回放时能找到同一个元素。页面和它里面的同站 iframe 地址前缀相同时，选地址完全一致的那个。连续输入合并成一次填写，点进输入框或勾选框的那一下并入它引起的修改，勾选框和单选框记成勾选，Enter 记成按键，表单提交不单独成步（引起它的点击或 Enter 已经是一步）；密码框的内容不保存，改成运行时输入。回放前浏览器要已经打开那个页面（例如 MCP 的 `browser_open`）。这个版本以前的录制没有控制会话的定位，转换时列在 `skipped` 里。
+每一步按页面地址（到路径为止，去掉查询和锚点）找页面，按控制会话自己的角色和名字找元素：录制脚本和控制会话用同一份命名规则（`aad-browser/src/naming.js`），所以录下的名字回放时能找到同一个元素。页面和它里面的同站 iframe 地址前缀相同时，选地址完全一致的那个。连续输入合并成一次填写，点进输入框或勾选框的那一下并入它引起的修改，勾选框和单选框记成勾选，Enter 记成按键，表单提交不单独成步（引起它的点击或 Enter 已经是一步）；密码框的内容不保存，改成运行时输入。回放前浏览器要已经打开那个页面（例如 MCP 的 `browser_open`）。这个版本以前的录制没有控制会话的定位，转换时列在 `skipped` 里。
 
 ## 完整性与当前边界
 
@@ -185,20 +185,23 @@ aad run 后台开权限 --permission desktop.input --permission desktop.observe
 - CLI 自动启动、首次 Document/XHR 请求捕获、自动分配端口和明确页面选择、临时 profile 清理、工作 profile 重启后的 Cookie/localStorage 保留、从已关闭的测试 profile 复制 Cookie、拒绝同 profile 并发使用且不关闭原浏览器。
 - 唯一 profile 自动选择、多 profile 列表与歧义拒绝、重复显示名称按目录 ID 区分、选择非 Default profile 的文件复制；无 CDP 的占用浏览器默认保留，显式 `--kill-browser` 后重启，错误 profile/复制目标不触发关闭，另一个资料目录的浏览器仍可正常读取。
 
-资料锁回归（`launch::lease::tests`）：确认活跃租约不能抢占、正常释放后立即重开、持有租约的子进程被强制结束后自动恢复、浏览器单独退出而宿主仍存活时自动释放、旧版空锁仅在无可能的持有者时回收。Linux 子进程验证和 `aad-cdp` 测试、Clippy 通过；Windows 的对应进程退出回归待验证。
+资料锁回归（`launch::lease::tests`）：确认活跃租约不能抢占、正常释放后立即重开、持有租约的子进程被强制结束后自动恢复、浏览器单独退出而宿主仍存活时自动释放、旧版空锁仅在无可能的持有者时回收。Linux 子进程验证和 `aad-browser` 测试、Clippy 通过；Windows 的对应进程退出回归待验证。
 
 一次该测试夹具的默认原值录制：7 步、4 张去重截图，`walkthrough.md` 为 3138 字节，全部产物约 80KiB。这是本地 fixture 的实测体积，不是实际网站的压缩率或容量保证。
 
 复现命令（按本机路径设置浏览器；GUI/浏览器实测串行）：
 
 ```powershell
-osdk exec --tool rust -- cargo build --locked -p aad-cli -p aad-cdp
-osdk exec --tool rust -- cargo test --locked -p aad-cdp -p aad-cli
-osdk exec --tool rust -- cargo clippy --locked -p aad-cdp -p aad-cli --all-targets -- -D warnings
-$env:AAD_TEST_CHROME = '/usr/bin/microsoft-edge'
-# Windows 需另外设置 AAD_TEST_CLI 指向 target/debug/aad.exe；当前 fixture 清理主要针对 Linux。
+osdk exec --tool rust -- cargo build --locked -p aad-cli -p aad-browser
+osdk exec --tool rust -- cargo test --locked -p aad-browser -p aad-cli
+osdk exec --tool rust -- cargo clippy --locked -p aad-browser -p aad-cli --all-targets -- -D warnings
+# 任一 Chromium 系浏览器均可：测试按可执行文件名推断 --browser（msedge→edge、brave→brave，其余→chrome）。
+$env:AAD_TEST_CHROME = '/usr/bin/google-chrome'
+# 默认使用 target/debug/aad；AAD_TEST_CLI 可改指其他构建。Linux CI 每次提交都会运行。
 node --test --test-concurrency=1 tests/browser/launch.test.mjs tests/browser/observer.test.mjs tests/browser/recording.test.mjs
 ```
+
+Windows 11 + Chrome 本机串行 7/7 通过（2026-11-07）。Windows 上 Node 无法向子进程发送 Ctrl+C，生命周期用例改用 `browser-record stop` 优雅停止。本机 Edge 以相同参数启动后在 CDP 就绪前即以退出码 0 退出（无相关组策略），原因未查，Edge 下的这组用例 **[待验证]**。
 
 `[待验证]` Windows/macOS 的目标浏览器、真人中文 IME/物理点击、真实站点 SSO/扫码、企业策略，以及至少 30 分钟的性能与容量基准。当前结果不代表这些环境均已通过。
 

@@ -20,6 +20,9 @@ impl Backend for Fake {
     fn capabilities(&self) -> Vec<String> {
         vec!["click".into()]
     }
+    fn lease_key(&self, _: &Value) -> Option<String> {
+        Some(format!("test-control-instance:{self:p}"))
+    }
     fn resources(&self, _: Duration) -> Result<Vec<BackendResource>> {
         Ok(vec![BackendResource {
             resource: Resource {
@@ -304,5 +307,84 @@ fn a_remote_connection_advertises_no_local_file_or_legacy_execution_tools() {
     assert_eq!(
         server.handle(&rpc(2, "save_workflow", json!({}))).unwrap()["error"]["code"],
         -32602
+    );
+}
+
+#[test]
+#[ignore = "takes the cooperating desktop input lease; run with desktop tests stopped"]
+fn saved_control_workflows_own_only_the_resources_their_steps_use() {
+    struct Recordings(std::path::PathBuf);
+    impl Drop for Recordings {
+        fn drop(&mut self) {
+            unsafe { std::env::remove_var("AAD_RECORDINGS_DIR") };
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let recordings = Recordings(
+        std::env::temp_dir().join(format!("aad-mcp-lease-test-{}", uuid::Uuid::new_v4())),
+    );
+    std::fs::create_dir(&recordings.0).unwrap();
+    // The other tests in this integration binary do not access recordings.
+    unsafe { std::env::set_var("AAD_RECORDINGS_DIR", &recordings.0) };
+    let desktop = Session::new(Vec::new(), Policy::default());
+    desktop.input_lease("desktop-input").unwrap();
+    let (controlled, fake) = session("browser.cdp", true);
+    let server = Server::local(controlled).with_run_store(recordings.0.join("runs.sqlite3"));
+    for (name, step) in [
+        (
+            "click",
+            json!({"app":{"provider":"browser.cdp"},"locator":{"name":"Save"},"action":{"type":"click"}}),
+        ),
+        (
+            "check",
+            json!({"app":{"provider":"browser.cdp"},"locator":{"name":"Save"},"check":{"present":true,"within_ms":1000}}),
+        ),
+    ] {
+        let saved = payload(
+            server
+                .handle(&rpc(
+                    1,
+                    "save_workflow",
+                    json!({"name":name,"steps":[step]}),
+                ))
+                .unwrap(),
+        );
+        assert_eq!(saved["executed_steps"], 1, "{saved}");
+    }
+    let ran = payload(
+        server
+            .handle(&rpc(2, "run_workflow", json!({"name":"click"})))
+            .unwrap(),
+    );
+    assert_eq!(ran["status"], "succeeded", "{ran}");
+    assert_eq!(fake.calls.load(Ordering::SeqCst), 1);
+    let checked = payload(
+        server
+            .handle(&rpc(3, "run_workflow", json!({"name":"check"})))
+            .unwrap(),
+    );
+    assert_eq!(checked["status"], "succeeded", "{checked}");
+
+    let rival = Server::local(Session::new(
+        vec![fake.clone()],
+        Policy {
+            allow_input: true,
+            ..Default::default()
+        },
+    ));
+    let refused = payload(
+        rival
+            .handle(&rpc(4, "run_workflow", json!({"name":"click"})))
+            .unwrap(),
+    );
+    assert_ne!(refused["status"], "succeeded", "{refused}");
+    assert!(
+        refused.to_string().contains("CONTROL.RESOURCE_BUSY"),
+        "{refused}"
+    );
+    assert_eq!(
+        fake.calls.load(Ordering::SeqCst),
+        1,
+        "the competing action did not reach the backend"
     );
 }

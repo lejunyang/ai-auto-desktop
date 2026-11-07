@@ -10,7 +10,7 @@ fmt-check = "cargo fmt --all --check"
 test = "cargo test --workspace --exclude aad-gui --locked"
 clippy = "cargo clippy --workspace --exclude aad-gui --locked --all-targets -- -D warnings"
 plugin-test = "cargo test --locked -p aad-plugin --features test-fixture --test process_plugin"
-control-test = "cargo test --locked -p aad-control -p aad-cdp -p aad-mcp -p aad-cli"
+control-test = "cargo test --locked -p aad-control -p aad-browser -p aad-mcp -p aad-cli"
 probe = "cargo run --locked -p aad-cli -- probe"
 
 [tasks.ci]

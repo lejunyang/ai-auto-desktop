@@ -350,7 +350,28 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         };
     }
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
+    let secret_variables = match &mut cli.command {
+        Command::Mcp(args) => args.prepare_secrets(),
+        Command::Control(command) => command.prepare_secrets(),
+        _ => Ok(Vec::new()),
+    };
+    let secret_variables = match secret_variables {
+        Ok(variables) => variables,
+        Err(error) => {
+            eprintln!("aad: {error}");
+            return ExitCode::from(EXIT_USAGE);
+        }
+    };
+    for variable in secret_variables {
+        // SAFETY: main has only parsed CLI arguments so far. No threads,
+        // platform services, logging workers or child processes have started.
+        // Keep this removal here; policy construction may run after startup.
+        // All bindings were copied first, including aliases of the same ENV.
+        unsafe {
+            std::env::remove_var(variable);
+        }
+    }
 
     // The MCP server owns stdout for the whole session: it is a protocol
     // stream, so printing anything else onto it would desynchronise the client.
@@ -1634,17 +1655,23 @@ fn durable_options(
     #[cfg(target_os = "linux")]
     if !providers.names().contains(&aad_atspi::PROVIDER_NAME) {
         if let Ok(provider) = aad_atspi::native_provider() {
-            providers.insert(std::sync::Arc::new(provider));
+            providers.insert(aad_control::native::workflow_provider(std::sync::Arc::new(
+                provider,
+            )));
         }
     }
     #[cfg(target_os = "macos")]
     if !providers.names().contains(&aad_macos_ax::PROVIDER_NAME) {
         if let Ok(provider) = aad_macos_ax::native_provider() {
-            providers.insert(std::sync::Arc::new(provider));
+            providers.insert(aad_control::native::workflow_provider(std::sync::Arc::new(
+                provider,
+            )));
         }
     }
     if let Ok(driver) = native_driver() {
-        providers.insert(std::sync::Arc::new(driver));
+        providers.insert(aad_control::native::workflow_provider(std::sync::Arc::new(
+            driver,
+        )));
     }
     let mode = match execution.durable_actions {
         DurableActions::Deny => aad_runtime::durable_exec::DurableActionMode::Deny,

@@ -13,7 +13,9 @@
 use std::sync::Arc;
 
 use crate::backend::{
-    Backend, CaptureLimits, CapturedTree, DriverError, Pixels, PointerGesture, Recognition, Result,
+    ensure_hold_budget, ensure_input_active, ensure_input_deadline, wait_input_hold, Backend,
+    CaptureLimits, CapturedTree, DriverError, ElementInput, InputControl, Pixels, PointerGesture,
+    Recognition, Result,
 };
 use crate::capture::{CapturedEvent, EventBuffer, EventKind};
 use crate::model::{Bounds, Node, States, WindowInfo};
@@ -21,8 +23,9 @@ use aad_windows::capture::{crop, extended_frame, intersect, print_window};
 use aad_windows::clipboard::Paste;
 use aad_windows::com::ensure as ensure_com;
 use aad_windows::input::{
-    button_events, deliver_atomically, deliver_drag, deliver_scroll, deliver_with_safe_fallback,
-    mouse_event, release_pressed_prefix, to_absolute, Chord, KeyTextSequence,
+    button_events, deliver_atomically, deliver_pointer, deliver_scroll, ensure_inputs_released,
+    ensure_modifiers_released, modified_pointer_inputs, mouse_event, to_absolute,
+    virtual_key_event, Chord, HeldInput, KeyTextSequence,
 };
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Sender};
@@ -128,7 +131,7 @@ use windows::Win32::UI::Input::Ime::ImmGetDefaultIMEWnd;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, GetKeyboardLayout, INPUT, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP,
     KEYEVENTF_UNICODE, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MOVE, VIRTUAL_KEY,
-    VK_CAPITAL, VK_CONTROL, VK_DELETE, VK_LWIN, VK_MENU,
+    VK_BACK, VK_CAPITAL, VK_CONTROL, VK_DELETE, VK_LWIN, VK_MENU,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     BringWindowToTop, DispatchMessageW, EnumWindows, GetAncestor, GetClassNameW,
@@ -284,6 +287,68 @@ fn rebuild_children(nodes: &mut [Node]) {
 }
 
 impl Backend for WindowsUiaBackend {
+    fn element_input_controlled(
+        &self,
+        window_id: &str,
+        node: &Node,
+        input: ElementInput<'_>,
+        control: &InputControl,
+    ) -> Result<serde_json::Value> {
+        control.check()?;
+        let result = match input {
+            ElementInput::Focus => self
+                .focus_input(window_id, node, control)
+                .map(|()| serde_json::Value::Null),
+            ElementInput::Invoke => self
+                .invoke_input(window_id, node, control)
+                .map(|()| serde_json::Value::Null),
+            ElementInput::SetValue(text) => self
+                .set_value_input(window_id, node, text, control)
+                .map(|()| serde_json::Value::Null),
+            ElementInput::SecretInput(text) => self
+                .secret_input_input(window_id, node, text, control)
+                .map(|()| serde_json::Value::Null),
+            ElementInput::TypeText { text, keys: true } => self
+                .type_text_keys_input(window_id, node, text, control)
+                .map(|()| serde_json::Value::Null),
+            ElementInput::TypeText { text, keys: false } => self
+                .type_text_input(window_id, node, text, control)
+                .map(|()| serde_json::Value::Null),
+            ElementInput::PointerClick => self
+                .pointer_gesture(
+                    window_id,
+                    node,
+                    &PointerGesture {
+                        deadline: Some(control.deadline),
+                        cancellation: control.cancellation.clone(),
+                        count: 1,
+                        ..PointerGesture::default()
+                    },
+                )
+                .map(|()| serde_json::Value::Null),
+            ElementInput::Paste(text) => self.paste_text(window_id, node, text, control),
+            ElementInput::WindowAction(action) => {
+                self.act_on_window(window_id, node, action, control)
+            }
+        };
+        let result = result?;
+        control
+            .check()
+            .map_err(|error| error.with_effect("unknown"))?;
+        Ok(result)
+    }
+    fn global_key_controlled(
+        &self,
+        keys: &[String],
+        control: &InputControl,
+    ) -> Result<serde_json::Value> {
+        let result = self.global_key_input(keys, control);
+        let result = result?;
+        control
+            .check()
+            .map_err(|error| error.with_effect("unknown"))?;
+        Ok(result)
+    }
     fn open_capture(
         &self,
         window_id: &str,
@@ -375,229 +440,45 @@ impl Backend for WindowsUiaBackend {
     }
 
     fn focus(&self, window_id: &str, node: &Node) -> Result<()> {
-        let element = self.require(window_id, node)?;
-        unsafe { element.SetFocus() }.map_err(|error| {
-            DriverError::new("DRIVER.ACTION_FAILED", format!("focus failed: {error}"))
-        })
+        self.focus_input(window_id, node, &InputControl::default())
     }
 
     fn invoke(&self, window_id: &str, node: &Node) -> Result<()> {
-        let element = self.require(window_id, node)?;
-
-        // Prefer a real control pattern: it is far more reliable than input
-        // synthesis and does not depend on the window being frontmost.
-        if let Ok(pattern) = unsafe {
-            element.GetCurrentPatternAs::<IUIAutomationInvokePattern>(UIA_InvokePatternId)
-        } {
-            return unsafe { pattern.Invoke() }.map_err(|error| {
-                DriverError::new("DRIVER.ACTION_FAILED", format!("invoke failed: {error}"))
-                    .with_effect("unknown")
-            });
-        }
-        if let Ok(pattern) = unsafe {
-            element.GetCurrentPatternAs::<IUIAutomationTogglePattern>(UIA_TogglePatternId)
-        } {
-            return unsafe { pattern.Toggle() }.map_err(|error| {
-                DriverError::new("DRIVER.ACTION_FAILED", format!("toggle failed: {error}"))
-                    .with_effect("unknown")
-            });
-        }
-        if let Ok(pattern) = unsafe {
-            element.GetCurrentPatternAs::<IUIAutomationLegacyIAccessiblePattern>(
-                UIA_LegacyIAccessiblePatternId,
-            )
-        } {
-            return unsafe { pattern.DoDefaultAction() }.map_err(|error| {
-                DriverError::new(
-                    "DRIVER.ACTION_FAILED",
-                    format!("default action failed: {error}"),
-                )
-                .with_effect("unknown")
-            });
-        }
-
-        Err(DriverError::new(
-            "DRIVER.ACTION_UNSUPPORTED",
-            "the element exposes no invokable pattern",
-        ))
+        self.invoke_input(window_id, node, &InputControl::default())
     }
 
     fn set_value(&self, window_id: &str, node: &Node, value: &str) -> Result<()> {
-        let element = self.require(window_id, node)?;
-        let pattern =
-            unsafe { element.GetCurrentPatternAs::<IUIAutomationValuePattern>(UIA_ValuePatternId) }
-                .map_err(|_| {
-                    DriverError::new(
-                        "DRIVER.ACTION_UNSUPPORTED",
-                        "the element does not expose a value pattern",
-                    )
-                })?;
+        self.set_value_input(window_id, node, value, &InputControl::default())
+    }
 
-        let before = unsafe { pattern.CurrentValue() }
-            .ok()
-            .map(|value| value.to_string());
-
-        unsafe { pattern.SetValue(&BSTR::from(value)) }.map_err(|error| {
-            DriverError::new("DRIVER.ACTION_FAILED", format!("set_value failed: {error}"))
-                .with_effect("unknown")
-        })?;
-
-        // SetValue returning S_OK is not evidence the value changed. Measured
-        // against an HTML <select> in a WebView: it succeeds and the control
-        // keeps its old value. Reporting that as applied is worse than an
-        // error, because an error can be handled and a false success cannot.
-        //
-        // The read-back has to wait, though. A control does not have to publish
-        // its new value synchronously: measured on this machine, a native Win32
-        // edit takes about 160 ms and a WebView input about 510 ms. Reading
-        // once, immediately, called every one of those writes a failure.
-        //
-        // Polling costs nothing when the write worked -- it returns as soon as
-        // the value moves -- and the full wait is only paid when the value
-        // really is stuck, which is the case worth being sure about.
-        // Assigned on the first iteration before it is read, so it needs no
-        // initial value of its own.
-        let mut after;
-        let deadline = Instant::now() + VALUE_SETTLE_TIMEOUT;
-        loop {
-            after = unsafe { pattern.CurrentValue() }
-                .ok()
-                .map(|value| value.to_string());
-            if settled(
-                before.as_deref(),
-                after.as_deref(),
-                Instant::now() >= deadline,
-            ) {
-                break;
-            }
-            std::thread::sleep(VALUE_POLL_INTERVAL);
-        }
-
-        if write_was_refused(before.as_deref(), after.as_deref(), value) {
-            return Err(DriverError::new(
-                "DRIVER.ACTION_FAILED",
-                "the element reported success but its value did not change",
-            )
-            // Nothing landed, so retrying is safe -- but repeating the same
-            // call will fail the same way; the caller needs another route.
-            .with_effect("not_applied")
-            .with_detail("requested", serde_json::json!(value))
-            .with_detail("value", serde_json::json!(after))
-            .with_detail(
-                "likely_cause",
-                serde_json::json!(
-                    "the control accepts the value pattern but ignores writes, \
-                     as a web <select> does"
-                ),
-            )
-            .with_detail(
-                "remedy",
-                serde_json::json!(
-                    "drive this control the way a person would: focus it and \
-                     invoke, or click the option"
-                ),
-            ));
-        }
-        Ok(())
+    fn secret_input(&self, window_id: &str, node: &Node, text: &str) -> Result<()> {
+        self.secret_input_input(window_id, node, text, &InputControl::default())
     }
 
     fn type_text(&self, window_id: &str, node: &Node, text: &str) -> Result<()> {
-        let element = self.require(window_id, node)?;
-        // Typing goes to whatever holds focus, so focus must be established --
-        // and proven, window in front and element focused -- or the keystrokes
-        // land in another application.
-        focus_for_keys(&self.automation, parse_window_id(window_id)?, &element)?;
-
-        let mut inputs: Vec<INPUT> = Vec::new();
-        for unit in text.encode_utf16() {
-            for flags in [KEYEVENTF_UNICODE, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP] {
-                inputs.push(INPUT {
-                    r#type: INPUT_KEYBOARD,
-                    Anonymous: windows::Win32::UI::Input::KeyboardAndMouse::INPUT_0 {
-                        ki: KEYBDINPUT {
-                            wVk: windows::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY(0),
-                            wScan: unit,
-                            dwFlags: flags,
-                            time: 0,
-                            dwExtraInfo: 0,
-                        },
-                    },
-                });
-            }
-        }
-        if inputs.is_empty() {
-            return Ok(());
-        }
-        // Keystrokes must arrive as one uninterrupted stream. If the batch is
-        // refused, splitting it corrupts the text (verified), so this fails
-        // rather than typing something the caller did not ask for. The error
-        // points at set_value, which writes the value without synthetic input.
-        Ok(deliver_atomically(&inputs, "keystrokes")?)
+        self.type_text_input(window_id, node, text, &InputControl::default())
     }
 
     fn type_text_keys(&self, window_id: &str, node: &Node, text: &str) -> Result<()> {
-        // Build the complete sequence before focusing or sending anything. An
-        // unsupported character therefore fails with effect=not_applied rather
-        // than leaving a valid prefix in the target.
-        let top_level = parse_window_id(window_id)?;
-        let element = self.require(window_id, node)?;
-        let input_window = unsafe { element.CurrentNativeWindowHandle() }
-            .ok()
-            .filter(|handle| !handle.0.is_null())
-            .unwrap_or(top_level);
-        let thread_id = unsafe { GetWindowThreadProcessId(input_window, None) };
-        if thread_id == 0 {
-            return Err(DriverError::unavailable(
-                "the target element has no owning input thread",
-            ));
-        }
-        let layout = unsafe { GetKeyboardLayout(thread_id) };
-        let caps_lock_on = unsafe { GetKeyState(VK_CAPITAL.0 as i32) } & 1 != 0;
-        let sequence = KeyTextSequence::parse(text, layout, caps_lock_on)?;
-        focus_for_keys(&self.automation, top_level, &element)?;
-
-        // UIA elements in hosted controls often report the top-level HWND, not
-        // the child that owns the caret. After SetFocus, GetGUIThreadInfo is the
-        // authoritative source for which HWND will receive keyboard input.
-        let mut gui = GUITHREADINFO {
-            cbSize: std::mem::size_of::<GUITHREADINFO>() as u32,
-            ..Default::default()
-        };
-        let focus_window = if unsafe { GetGUIThreadInfo(thread_id, &mut gui) }.is_ok()
-            && !gui.hwndFocus.0.is_null()
-        {
-            gui.hwndFocus
-        } else {
-            input_window
-        };
-        if ime_is_open(focus_window) {
-            return Err(DriverError::new(
-                "DRIVER.INPUT_METHOD_ACTIVE",
-                "keys mode cannot guarantee exact text while the target input method is open",
-            )
-            // Focus changed, but no key was sent.
-            .with_effect("contextual")
-            .with_detail(
-                "remedy",
-                serde_json::json!(
-                    "switch the target input method to direct/English mode, or use mode=unicode/set_value"
-                ),
-            ));
-        }
-
-        deliver_atomically(&sequence.inputs, "layout-aware keystrokes").map_err(|mut error| {
-            let sent = error
-                .details
-                .get("events_sent")
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or(0) as usize;
-            let released = release_pressed_prefix(&sequence.inputs, sent);
-            error = error.with_detail("residual_state_cleared", serde_json::json!(released));
-            DriverError::from(error)
-        })
+        self.type_text_keys_input(window_id, node, text, &InputControl::default())
     }
 
     fn key_chord(&self, window_id: &str, node: &Node, keys: &[String]) -> Result<()> {
+        self.key_chord_with_deadline(
+            window_id,
+            node,
+            keys,
+            Instant::now() + Duration::from_secs(30),
+        )
+    }
+
+    fn key_chord_with_deadline(
+        &self,
+        window_id: &str,
+        node: &Node,
+        keys: &[String],
+        deadline: Instant,
+    ) -> Result<()> {
         // A chord lands on whatever holds focus, exactly like typing, so the
         // element is focused first. Without this a shortcut meant for one field
         // would fire against wherever focus happened to be.
@@ -605,6 +486,7 @@ impl Backend for WindowsUiaBackend {
         let chord = Chord::parse(keys)?;
         focus_for_keys(&self.automation, parse_window_id(window_id)?, &element)?;
         let inputs = chord.to_inputs();
+        ensure_input_deadline(deadline)?;
 
         // Press-and-release must arrive as one stream: splitting it lets another
         // source slip between a modifier going down and the key it modifies. And
@@ -618,6 +500,71 @@ impl Backend for WindowsUiaBackend {
             error = error.with_detail("residual_state_cleared", serde_json::json!(released));
             DriverError::from(error)
         })
+    }
+
+    fn key_chord_held(
+        &self,
+        window_id: &str,
+        node: &Node,
+        keys: &[String],
+        hold_ms: Option<u64>,
+        deadline: Instant,
+    ) -> Result<()> {
+        self.key_chord_controlled(window_id, node, keys, hold_ms, deadline, None)
+    }
+
+    fn key_chord_controlled(
+        &self,
+        window_id: &str,
+        node: &Node,
+        keys: &[String],
+        hold_ms: Option<u64>,
+        deadline: Instant,
+        cancellation: Option<Arc<AtomicBool>>,
+    ) -> Result<()> {
+        ensure_input_active(deadline, cancellation.as_deref())?;
+        let Some(hold_ms) = hold_ms else {
+            let element = self.require(window_id, node)?;
+            let inputs = Chord::parse(keys)?.to_inputs();
+            focus_for_keys(&self.automation, parse_window_id(window_id)?, &element)?;
+            ensure_input_active(deadline, cancellation.as_deref())?;
+            let mut held = HeldInput::new_cancellable(deadline, cancellation)?;
+            let result = held
+                .send(&inputs, false, "the key combination")
+                .map_err(DriverError::from);
+            return finish_held_input(&mut held, result);
+        };
+        ensure_hold_budget(hold_ms, deadline)?;
+        let element = self.require_hold_target(window_id, node)?;
+        let handle = parse_window_id(window_id)?;
+        let chord = Chord::parse(keys)?;
+        let inputs = chord.to_inputs();
+        ensure_inputs_released(&inputs)?;
+        focus_for_keys(&self.automation, handle, &element)?;
+        self.require_hold_target(window_id, node)?;
+        self.ensure_held_key_target(&element)?;
+        let focus = input_focus_handle(handle)?;
+        ensure_hold_budget(hold_ms, deadline)?;
+        let mut held = HeldInput::new_cancellable(
+            deadline.min(Instant::now() + Duration::from_millis(hold_ms + 250)),
+            cancellation.clone(),
+        )?;
+        let result = (|| {
+            held.send(&inputs[..chord.modifiers.len() + 1], false, "held key down")?;
+            wait_input_hold(hold_ms, deadline, || {
+                ensure_input_active(deadline, cancellation.as_deref())?;
+                ensure_hold_focus(handle, Some(focus))?;
+                self.ensure_held_key_target(&element)
+            })?;
+            ensure_hold_focus(handle, Some(focus))?;
+            held.send(
+                &inputs[chord.modifiers.len() + 1..],
+                false,
+                "held key release",
+            )?;
+            Ok(())
+        })();
+        finish_held_input(&mut held, result)
     }
 
     fn pointer_click(&self, window_id: &str, node: &Node) -> Result<()> {
@@ -641,7 +588,7 @@ impl Backend for WindowsUiaBackend {
         // if the atomic batch is refused, sending them individually is a
         // faithful fallback. Verified to work on a machine where the batch was
         // refused by an input hook.
-        Ok(deliver_with_safe_fallback(&inputs, "the click")?)
+        Ok(deliver_pointer(&inputs, &[], "the click")?)
     }
 
     fn pointer_gesture(
@@ -650,6 +597,10 @@ impl Backend for WindowsUiaBackend {
         node: &Node,
         gesture: &PointerGesture,
     ) -> Result<()> {
+        let deadline = gesture
+            .deadline
+            .unwrap_or_else(|| Instant::now() + Duration::from_secs(30));
+        ensure_input_active(deadline, gesture.cancellation.as_deref())?;
         let (handle, _) = self.element_for(window_id)?;
         let point = element_point(node.bounds, gesture.fraction)?;
 
@@ -658,17 +609,27 @@ impl Backend for WindowsUiaBackend {
         bring_to_front(handle);
         self.ensure_hits(window_id, node, point)?;
         let absolute = to_absolute(point)?;
+        ensure_input_active(deadline, gesture.cancellation.as_deref())?;
 
         if let Some(scroll) = gesture.scroll {
             return Ok(deliver_scroll(absolute, scroll)?);
         }
         if let Some(dwell_ms) = gesture.hover_ms {
+            let dwell = Duration::from_millis(dwell_ms.min(MAX_HOVER_MS));
+            if deadline.saturating_duration_since(Instant::now()) < dwell {
+                return Err(DriverError::new(
+                    "DRIVER.TIMEOUT",
+                    "hover exceeds the remaining input deadline",
+                ));
+            }
             // Hover is a move and a wait: the point must be reached, then held
             // long enough for a tooltip or hover menu to appear.
             let move_to = [mouse_event(absolute, MOUSEEVENTF_MOVE)];
             deliver_atomically(&move_to, "the hover move")?;
-            std::thread::sleep(Duration::from_millis(dwell_ms.min(MAX_HOVER_MS)));
-            return Ok(());
+            return wait_input_hold(dwell.as_millis() as u64, deadline, || {
+                ensure_input_active(deadline, gesture.cancellation.as_deref())
+            })
+            .map_err(|error| error.with_effect("unknown"));
         }
 
         let (down, up) = button_events(gesture.button);
@@ -681,7 +642,15 @@ impl Backend for WindowsUiaBackend {
         // A click is a move plus ordered press/release pairs; if the atomic
         // batch is refused, sending the events in order is a faithful fallback,
         // as with pointer_click.
-        Ok(deliver_with_safe_fallback(&inputs, "the pointer gesture")?)
+        ensure_pointer_modifier_focus(handle, &gesture.modifiers)?;
+        ensure_input_active(deadline, gesture.cancellation.as_deref())?;
+        if let Some(hold_ms) = gesture.hold_ms {
+            if clicks != 1 {
+                return Err(DriverError::invalid("hold_ms requires a single click"));
+            }
+            return self.held_pointer(window_id, node, None, gesture, &inputs, hold_ms, deadline);
+        }
+        dispatch_pointer_controlled(&inputs, gesture, deadline, "the pointer gesture")
     }
 
     fn drag(
@@ -691,6 +660,13 @@ impl Backend for WindowsUiaBackend {
         to: &Node,
         gesture: &PointerGesture,
     ) -> Result<()> {
+        let deadline = gesture
+            .deadline
+            .unwrap_or_else(|| Instant::now() + Duration::from_secs(30));
+        ensure_input_active(deadline, gesture.cancellation.as_deref())?;
+        if !gesture.path.is_empty() {
+            return self.path_drag(window_id, from, to, gesture, deadline);
+        }
         let (handle, _) = self.element_for(window_id)?;
         let start_point = element_point(from.bounds, gesture.fraction)?;
         let end_point = element_point(to.bounds, gesture.to_fraction)?;
@@ -723,7 +699,20 @@ impl Backend for WindowsUiaBackend {
         // multi-event batch before delivering anything, so a clean refusal may
         // degrade to ordered single events. Any partial failure triggers a
         // best-effort button release and remains effect=unknown.
-        Ok(deliver_drag(&inputs, end, up)?)
+        ensure_pointer_modifier_focus(handle, &gesture.modifiers)?;
+        ensure_input_active(deadline, gesture.cancellation.as_deref())?;
+        if let Some(hold_ms) = gesture.hold_ms {
+            return self.held_pointer(
+                window_id,
+                from,
+                Some(to),
+                gesture,
+                &inputs,
+                hold_ms,
+                deadline,
+            );
+        }
+        dispatch_pointer_controlled(&inputs, gesture, deadline, "the drag")
     }
 
     fn capture_pixels(&self, window_id: &str, node: &Node, whole_window: bool) -> Result<Pixels> {
@@ -780,7 +769,7 @@ impl Backend for WindowsUiaBackend {
         node: &Node,
         action: &str,
     ) -> Result<serde_json::Value> {
-        self.act_on_window(window_id, node, action)
+        self.act_on_window(window_id, node, action, &InputControl::default())
     }
 
     fn recognize_text(&self, pixels: &Pixels, language: Option<&str>) -> Result<Recognition> {
@@ -792,34 +781,11 @@ impl Backend for WindowsUiaBackend {
     }
 
     fn global_key(&self, keys: &[String]) -> Result<serde_json::Value> {
-        let chord = Chord::parse(keys)?;
-        refuse_reserved_chord(&chord)?;
-        // UAC prompts and the lock screen run on the secure desktop, which
-        // synthetic input cannot and must not reach.
-        if !on_default_desktop() {
-            return Err(DriverError::new(
-                "DRIVER.SECURE_DESKTOP",
-                "the input desktop is not the user's desktop (a UAC prompt or the lock screen); nothing was sent",
-            ));
-        }
-        let foreground = unsafe { GetForegroundWindow() };
-        let mut process = 0u32;
-        unsafe { GetWindowThreadProcessId(foreground, Some(&mut process)) };
-        // The same atomic chord path and modifier-leak cleanup as `key`.
-        deliver_atomically(&chord.to_inputs(), "the global key combination").map_err(
-            |mut error| {
-                let released = chord.release_modifiers();
-                error = error.with_detail("residual_state_cleared", serde_json::json!(released));
-                error
-            },
-        )?;
-        Ok(serde_json::json!({
-            "foreground_process_id": process,
-        }))
+        self.global_key_input(keys, &InputControl::default())
     }
 
     fn paste(&self, window_id: &str, node: &Node, text: &str) -> Result<serde_json::Value> {
-        self.paste_text(window_id, node, text)
+        self.paste_text(window_id, node, text, &InputControl::default())
     }
 
     fn describe(&self) -> serde_json::Value {
@@ -927,6 +893,221 @@ fn element_point(
 }
 
 impl WindowsUiaBackend {
+    fn path_drag(
+        &self,
+        window_id: &str,
+        from: &Node,
+        to: &Node,
+        gesture: &PointerGesture,
+        deadline: Instant,
+    ) -> Result<()> {
+        if gesture.path.len() > 32
+            || from.node_id != to.node_id
+            || gesture.fraction.is_none()
+            || gesture.to_fraction.is_none()
+        {
+            return Err(DriverError::invalid(
+                "drag path requires one surface and explicit endpoint fractions",
+            ));
+        }
+        let mut fractions = vec![gesture.fraction.expect("explicit source")];
+        fractions.extend_from_slice(&gesture.path);
+        fractions.push(gesture.to_fraction.expect("explicit destination"));
+        let handle = parse_window_id(window_id)?;
+        bring_to_front(handle);
+        let original = self.require_hold_target(window_id, from)?;
+        let mut route = Vec::new();
+        for fraction in fractions {
+            let point = element_point(from.bounds, Some(fraction))?;
+            self.ensure_hits(window_id, from, point)?;
+            route.push((point, to_absolute(point)?));
+        }
+        let verify = |point| -> Result<()> {
+            ensure_input_active(deadline, gesture.cancellation.as_deref())?;
+            ensure_hold_focus(handle, None)?;
+            ensure_pointer_modifier_focus(handle, &gesture.modifiers)?;
+            let live = self.require_hold_target(window_id, from)?;
+            if !unsafe { self.automation.CompareElements(&original, &live) }
+                .is_ok_and(|same| same.as_bool())
+            {
+                return Err(DriverError::stale("drag path surface identity changed"));
+            }
+            self.ensure_hits(window_id, from, point)?;
+            ensure_input_active(deadline, gesture.cancellation.as_deref())
+        };
+        verify(route[0].0)?;
+        let dwell = gesture.hold_ms.unwrap_or(0);
+        if dwell > 0 {
+            ensure_hold_budget(dwell, deadline)?;
+        }
+        let budget = Duration::from_millis(dwell + (route.len() as u64) * 16 + 1000);
+        let mut held = HeldInput::new_cancellable(
+            deadline.min(Instant::now() + budget),
+            gesture.cancellation.clone(),
+        )?;
+        let (down, up) = button_events(gesture.button);
+        let start = route[0].1;
+        let prefix = modified_pointer_inputs(
+            &[
+                mouse_event(start, MOUSEEVENTF_MOVE),
+                mouse_event(start, down),
+            ],
+            &gesture.modifiers,
+        )?;
+        // Refuse externally held input before entering the path; send checks
+        // again under the watchdog lock immediately before each new down.
+        ensure_inputs_released(&prefix[..gesture.modifiers.len() + 2])?;
+        let result = (|| {
+            held.send(
+                &prefix[..gesture.modifiers.len() + 2],
+                true,
+                "drag path down",
+            )?;
+            if dwell > 0 {
+                wait_input_hold(dwell, deadline, || verify(route[0].0))?;
+            }
+            for (point, absolute) in route.iter().skip(1) {
+                verify(*point)?;
+                held.send(
+                    &[mouse_event(*absolute, MOUSEEVENTF_MOVE)],
+                    false,
+                    "drag path move",
+                )?;
+                wait_input_hold(16, deadline, || {
+                    ensure_input_active(deadline, gesture.cancellation.as_deref())?;
+                    ensure_hold_focus(handle, None)
+                })?;
+            }
+            verify(route.last().expect("path endpoint").0)?;
+            let suffix = modified_pointer_inputs(
+                &[mouse_event(route.last().expect("path endpoint").1, up)],
+                &gesture.modifiers,
+            )?;
+            held.send(
+                &suffix[gesture.modifiers.len()..],
+                true,
+                "drag path release",
+            )?;
+            Ok(())
+        })();
+        finish_held_input(&mut held, result)
+    }
+
+    fn ensure_held_key_target(&self, element: &IUIAutomationElement) -> Result<()> {
+        let focused = unsafe { self.automation.GetFocusedElement() }.map_err(|_| {
+            DriverError::new("DRIVER.FOCUS_LOST", "could not verify the held key element")
+        })?;
+        if !unsafe { self.automation.CompareElements(element, &focused) }
+            .is_ok_and(|same| same.as_bool())
+            || !unsafe { element.CurrentIsEnabled() }.is_ok_and(|enabled| enabled.as_bool())
+            || !unsafe { element.CurrentIsPassword() }.is_ok_and(|protected| !protected.as_bool())
+        {
+            return Err(DriverError::new(
+                "DRIVER.FOCUS_LOST",
+                "held key element lost focus or changed state",
+            ));
+        }
+        Ok(())
+    }
+
+    fn require_hold_target(&self, window_id: &str, node: &Node) -> Result<IUIAutomationElement> {
+        let element = self.require(window_id, node)?;
+        let current = describe_element(&element, &node.node_id, node.depth, node.parent_id.clone());
+        if current.role != node.role
+            || current.name != node.name
+            || current.automation_id != node.automation_id
+            || current.class_name != node.class_name
+            || current.bounds != node.bounds
+            || current.states.enabled == Some(false)
+            || current.states.protected == Some(true)
+        {
+            return Err(DriverError::stale(
+                "held input target changed identity, geometry or state",
+            ));
+        }
+        Ok(element)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn held_pointer(
+        &self,
+        window_id: &str,
+        from: &Node,
+        to: Option<&Node>,
+        gesture: &PointerGesture,
+        inputs: &[windows::Win32::UI::Input::KeyboardAndMouse::INPUT],
+        hold_ms: u64,
+        deadline: Instant,
+    ) -> Result<()> {
+        ensure_hold_budget(hold_ms, deadline)?;
+        let handle = parse_window_id(window_id)?;
+        let source = self.require_hold_target(window_id, from)?;
+        let destination = to
+            .map(|node| self.require_hold_target(window_id, node))
+            .transpose()?;
+        let start = element_point(from.bounds, gesture.fraction)?;
+        self.ensure_hits(window_id, from, start)?;
+        let focus = if gesture.modifiers.is_empty() {
+            None
+        } else {
+            Some(input_focus_handle(handle)?)
+        };
+        let mut rect = RECT::default();
+        unsafe { GetWindowRect(handle, &mut rect) }
+            .map_err(|_| DriverError::stale("held input window disappeared"))?;
+        let combined = modified_pointer_inputs(inputs, &gesture.modifiers)?;
+        ensure_inputs_released(&combined)?;
+        ensure_hold_budget(hold_ms, deadline)?;
+        // A stalled COM revalidation cannot prolong owned input indefinitely.
+        // No later movement/down can pass the same lock after watchdog release.
+        let mut held = HeldInput::new_cancellable(
+            deadline.min(Instant::now() + Duration::from_millis(hold_ms + 250)),
+            gesture.cancellation.clone(),
+        )?;
+        let split = gesture.modifiers.len() + 2;
+        let result = (|| {
+            held.send(&combined[..split], true, "held pointer down")?;
+            wait_input_hold(hold_ms, deadline, || {
+                ensure_input_active(deadline, gesture.cancellation.as_deref())?;
+                ensure_hold_focus(handle, focus)?;
+                let mut current = RECT::default();
+                unsafe { GetWindowRect(handle, &mut current) }
+                    .map_err(|_| DriverError::stale("held input window disappeared"))?;
+                if current != rect {
+                    return Err(DriverError::stale("held input window geometry changed"));
+                }
+                Ok(())
+            })?;
+            let current = self.require_hold_target(window_id, from)?;
+            if !unsafe { self.automation.CompareElements(&source, &current) }
+                .is_ok_and(|same| same.as_bool())
+            {
+                return Err(DriverError::stale("held pointer source identity changed"));
+            }
+            self.ensure_hits(window_id, from, start)?;
+            if let (Some(node), Some(original)) = (to, destination.as_ref()) {
+                let current = self.require_hold_target(window_id, node)?;
+                if !unsafe { self.automation.CompareElements(original, &current) }
+                    .is_ok_and(|same| same.as_bool())
+                {
+                    return Err(DriverError::stale(
+                        "held pointer destination identity changed",
+                    ));
+                }
+                self.ensure_hits(
+                    window_id,
+                    node,
+                    element_point(node.bounds, gesture.to_fraction)?,
+                )?;
+            }
+            ensure_hold_focus(handle, focus)?;
+            ensure_input_deadline(deadline)?;
+            held.send(&combined[split..], true, "held pointer completion")?;
+            Ok(())
+        })();
+        finish_held_input(&mut held, result)
+    }
+
     /// Find the live element corresponding to a captured node.
     fn locate(&self, window_id: &str, node: &Node) -> Result<Option<IUIAutomationElement>> {
         let (_, root) = self.element_for(window_id)?;
@@ -1059,12 +1240,16 @@ fn describe_element(
     // for a reason nobody would think to look for.
     let role = control_type_name(unsafe { element.CurrentControlType() }.unwrap_or_default());
 
-    let value =
+    let protected = flag(unsafe { element.CurrentIsPassword() });
+    let value = if protected == Some(true) {
+        None
+    } else {
         unsafe { element.GetCurrentPatternAs::<IUIAutomationValuePattern>(UIA_ValuePatternId) }
             .ok()
             .and_then(|pattern| unsafe { pattern.CurrentValue() }.ok())
             .map(|value| value.to_string())
-            .filter(|value| !value.is_empty());
+            .filter(|value| !value.is_empty())
+    };
 
     let read_only =
         unsafe { element.GetCurrentPatternAs::<IUIAutomationValuePattern>(UIA_ValuePatternId) }
@@ -1093,7 +1278,7 @@ fn describe_element(
         // Recorded so the absent value above is explained rather than looking
         // like a capture failure. UIA withholds a password field's text on its
         // own; this only reports that it did.
-        protected: flag(unsafe { element.CurrentIsPassword() }),
+        protected,
     };
 
     let mut actions = Vec::new();
@@ -1101,13 +1286,21 @@ fn describe_element(
         actions.push("focus".to_string());
         // A key combination goes to whatever holds focus, so anything focusable
         // can receive one -- the same gate as ocus itself.
-        actions.push("key_chord".to_string());
+        if states.protected != Some(true) {
+            actions.push("key_chord".to_string());
+        }
     }
     let has = |id| unsafe { element.GetCurrentPattern(id) }.is_ok();
     if has(UIA_InvokePatternId) || has(UIA_TogglePatternId) || has(UIA_LegacyIAccessiblePatternId) {
         actions.push("invoke".to_string());
     }
-    if has(UIA_ValuePatternId) && read_only != Some(true) {
+    if states.protected == Some(true)
+        && read_only != Some(true)
+        && (has(UIA_ValuePatternId) || (role == "edit" && states.focusable == Some(true)))
+    {
+        actions.push("secret_input".to_string());
+    }
+    if has(UIA_ValuePatternId) && read_only != Some(true) && states.protected != Some(true) {
         actions.push("set_value".to_string());
         actions.push("type_text".to_string());
         // Pasting passes the text through the clipboard: never a password's.
@@ -1146,12 +1339,121 @@ fn describe_element(
     }
 }
 
+/// Modifier key events must reach the observed window too. A canvas need not
+/// itself accept keyboard focus, but focus must be inside that same window.
+fn ensure_pointer_modifier_focus(handle: HWND, modifiers: &[String]) -> Result<()> {
+    if modifiers.is_empty() {
+        return Ok(());
+    }
+    let foreground = unsafe { GetAncestor(GetForegroundWindow(), GA_ROOT) };
+    let thread = unsafe { GetWindowThreadProcessId(handle, None) };
+    let mut gui = GUITHREADINFO {
+        cbSize: std::mem::size_of::<GUITHREADINFO>() as u32,
+        ..Default::default()
+    };
+    let focused = unsafe { GetGUIThreadInfo(thread, &mut gui) }.is_ok()
+        && !gui.hwndFocus.is_invalid()
+        && unsafe { GetAncestor(gui.hwndFocus, GA_ROOT) } == handle;
+    if foreground != handle || !focused {
+        return Err(DriverError::new(
+            "DRIVER.FOCUS_LOST",
+            "pointer modifiers require keyboard focus in the observed window; no input was sent",
+        ));
+    }
+    Ok(())
+}
+
 /// Focus `element` for keystrokes and prove they would reach it.
 ///
 /// SendInput keystrokes go to the foreground window's focus, whatever UIA's
 /// SetFocus did: if the foreground lock kept `handle` in the background, they
 /// would land in another application. So the window is brought forward, the
 /// element focused, and then both are checked before a single key is sent.
+fn input_focus_handle(handle: HWND) -> Result<HWND> {
+    let mut info = GUITHREADINFO {
+        cbSize: std::mem::size_of::<GUITHREADINFO>() as u32,
+        ..Default::default()
+    };
+    let thread = unsafe { GetWindowThreadProcessId(handle, None) };
+    unsafe { GetGUIThreadInfo(thread, &mut info) }
+        .map_err(|_| DriverError::new("DRIVER.FOCUS_LOST", "could not verify held input focus"))?;
+    if info.hwndFocus.is_invalid() {
+        return Err(DriverError::new(
+            "DRIVER.FOCUS_LOST",
+            "held input target has no native focus",
+        ));
+    }
+    Ok(info.hwndFocus)
+}
+
+fn ensure_hold_focus(handle: HWND, focus: Option<HWND>) -> Result<()> {
+    if unsafe { GetAncestor(GetForegroundWindow(), GA_ROOT) } != handle
+        || focus.is_some_and(|expected| input_focus_handle(handle).ok() != Some(expected))
+    {
+        return Err(DriverError::new(
+            "DRIVER.FOCUS_LOST",
+            "held input target lost foreground or keyboard focus",
+        ));
+    }
+    Ok(())
+}
+
+fn dispatch_pointer_controlled(
+    inputs: &[windows::Win32::UI::Input::KeyboardAndMouse::INPUT],
+    gesture: &PointerGesture,
+    deadline: Instant,
+    what: &str,
+) -> Result<()> {
+    if gesture.cancellation.is_none() {
+        return Ok(deliver_pointer(inputs, &gesture.modifiers, what)?);
+    }
+    let combined = modified_pointer_inputs(inputs, &gesture.modifiers)?;
+    let mut held = HeldInput::new_cancellable(deadline, gesture.cancellation.clone())?;
+    let result = held.send(&combined, true, what).map_err(DriverError::from);
+    finish_held_input(&mut held, result)
+}
+
+fn dispatch_keys_controlled(inputs: &[INPUT], control: &InputControl, what: &str) -> Result<()> {
+    control.check()?;
+    let mut held = HeldInput::new_cancellable(control.deadline, control.cancellation.clone())?;
+    let result = held.send(inputs, false, what).map_err(DriverError::from);
+    finish_held_input(&mut held, result)
+}
+
+fn finish_held_input(held: &mut HeldInput, result: Result<()>) -> Result<()> {
+    let submitted = held.submitted();
+    let expired = held.expired();
+    let cancelled = held.cancelled();
+    let released = held.release();
+    let result = result.and_then(|()| {
+        if cancelled {
+            Err(DriverError::new(
+                "DRIVER.CANCELLED",
+                "input watchdog released cancelled input",
+            ))
+        } else if expired {
+            Err(DriverError::new(
+                "DRIVER.TIMEOUT",
+                "input watchdog released an expired hold",
+            ))
+        } else if !released {
+            Err(DriverError::new(
+                "DRIVER.ACTION_FAILED",
+                "held input release was refused",
+            ))
+        } else {
+            Ok(())
+        }
+    });
+    result.map_err(|error| {
+        error
+            .with_effect(if submitted { "unknown" } else { "not_applied" })
+            .with_detail("residual_state_cleared", serde_json::json!(released))
+            .with_detail("hold_watchdog_expired", serde_json::json!(expired))
+            .with_detail("input_cancelled", serde_json::json!(cancelled))
+    })
+}
+
 fn focus_for_keys(
     automation: &IUIAutomation,
     handle: HWND,
@@ -1300,7 +1602,14 @@ impl WindowsUiaBackend {
     /// early restore would paste the user's old clipboard instead. Anyone but
     /// the target process asking for the text -- clipboard history, managers,
     /// sync tools -- is refused, so the text reaches only the target.
-    fn paste_text(&self, window_id: &str, node: &Node, text: &str) -> Result<serde_json::Value> {
+    fn paste_text(
+        &self,
+        window_id: &str,
+        node: &Node,
+        text: &str,
+        control: &InputControl,
+    ) -> Result<serde_json::Value> {
+        control.check()?;
         let element = self.require(window_id, node)?;
         if unsafe { element.CurrentIsPassword() }.is_ok_and(|value| value.as_bool()) {
             return Err(DriverError::new(
@@ -1312,12 +1621,14 @@ impl WindowsUiaBackend {
         let handle = parse_window_id(window_id)?;
         let mut target_process = 0u32;
         unsafe { GetWindowThreadProcessId(handle, Some(&mut target_process)) };
+        control.check()?;
         let paste = Paste::prepare(text, target_process)?;
         // From the moment the clipboard is emptied, every way out restores it.
         let restore_on_failure = |error: DriverError| {
             let restored = paste.abandon();
             error.with_detail("clipboard_restored", serde_json::json!(restored))
         };
+        control.check().map_err(restore_on_failure)?;
         if let Err(error) = paste.offer() {
             return Err(restore_on_failure(error.into()));
         }
@@ -1333,7 +1644,9 @@ impl WindowsUiaBackend {
             class == "edit" || class.starts_with("richedit")
         };
         let via = if classic {
+            control.check().map_err(restore_on_failure)?;
             let _ = unsafe { element.SetFocus() };
+            control.check().map_err(restore_on_failure)?;
             paste.asked();
             let mut result = 0usize;
             // While this waits, the edit's request for the text is answered:
@@ -1345,7 +1658,10 @@ impl WindowsUiaBackend {
                     WPARAM(0),
                     LPARAM(0),
                     SMTO_NORMAL,
-                    PASTE_CONSUME_TIMEOUT.as_millis() as u32,
+                    PASTE_CONSUME_TIMEOUT
+                        .min(control.deadline.saturating_duration_since(Instant::now()))
+                        .as_millis()
+                        .max(1) as u32,
                     Some(&mut result),
                 )
             };
@@ -1360,23 +1676,26 @@ impl WindowsUiaBackend {
             }
             "wm_paste"
         } else {
+            control.check().map_err(restore_on_failure)?;
             if let Err(error) = focus_for_keys(&self.automation, handle, &element) {
                 return Err(restore_on_failure(error));
             }
-            if let Err(error) = deliver_atomically(&chord.to_inputs(), "the paste shortcut") {
-                let released = chord.release_modifiers();
-                return Err(restore_on_failure(
-                    error
-                        .with_detail("residual_state_cleared", serde_json::json!(released))
-                        .into(),
-                ));
-            }
+            dispatch_keys_controlled(&chord.to_inputs(), control, "the paste shortcut")
+                .map_err(restore_on_failure)?;
             paste.asked();
             "ctrl_v"
         };
-        let consumed = paste.consumed(PASTE_CONSUME_TIMEOUT);
+        let consumed = paste.consumed_cancellable(
+            PASTE_CONSUME_TIMEOUT.min(control.deadline.saturating_duration_since(Instant::now())),
+            control.cancellation.as_deref(),
+        );
         let refused = paste.refused();
         let restored = paste.restore();
+        control.check().map_err(|error| {
+            error
+                .with_effect("unknown")
+                .with_detail("clipboard_restored", serde_json::json!(restored))
+        })?;
         if !consumed {
             return Err(DriverError::new(
                 "DRIVER.PASTE_NOT_CONSUMED",
@@ -1483,6 +1802,7 @@ impl WindowsUiaBackend {
         window_id: &str,
         node: &Node,
         action: &str,
+        control: &InputControl,
     ) -> Result<serde_json::Value> {
         let handle = parse_window_id(window_id)?;
         let element = self.require(window_id, node)?;
@@ -1503,6 +1823,7 @@ impl WindowsUiaBackend {
         // UIA's WindowPattern first, as the window's own accessibility
         // contract; Win32 on the anchored HWND for windows without one.
         let visual = |state: WindowVisualState, command: SHOW_WINDOW_CMD| -> Result<()> {
+            control.check()?;
             match &pattern {
                 Some(pattern) => unsafe { pattern.SetWindowVisualState(state) }
                     .map_err(|error| failed("changing the window state", error)),
@@ -1514,6 +1835,7 @@ impl WindowsUiaBackend {
                 }
             }
         };
+        control.check()?;
         let reached: Box<dyn Fn() -> bool> = match action {
             "minimize" => {
                 visual(WindowVisualState_Minimized, SW_MINIMIZE)?;
@@ -1538,6 +1860,9 @@ impl WindowsUiaBackend {
                 // application's answer, not a failure of the request.
                 let deadline = Instant::now() + WINDOW_SETTLE;
                 while unsafe { IsWindow(handle) }.as_bool() && Instant::now() < deadline {
+                    control
+                        .check()
+                        .map_err(|error| error.with_effect("unknown"))?;
                     std::thread::sleep(Duration::from_millis(25));
                 }
                 let closed = !unsafe { IsWindow(handle) }.as_bool();
@@ -1553,6 +1878,9 @@ impl WindowsUiaBackend {
                 if unsafe { IsIconic(handle) }.as_bool() {
                     visual(WindowVisualState_Normal, SW_RESTORE)?;
                 }
+                control
+                    .check()
+                    .map_err(|error| error.with_effect("unknown"))?;
                 if !bring_to_front(handle) {
                     return Err(DriverError::new(
                         "DRIVER.ACTIVATION_REFUSED",
@@ -1572,6 +1900,9 @@ impl WindowsUiaBackend {
         };
         let deadline = Instant::now() + WINDOW_SETTLE;
         while !reached() {
+            control
+                .check()
+                .map_err(|error| error.with_effect("unknown"))?;
             if Instant::now() >= deadline {
                 return Err(DriverError::new(
                     "DRIVER.ACTION_FAILED",
@@ -2108,6 +2439,353 @@ fn control_type_name(control_type: UIA_CONTROLTYPE_ID) -> String {
         _ => return format!("control_type_{}", control_type.0),
     };
     name.to_string()
+}
+
+// Controlled writes keep execution state explicit across every OS dispatch.
+impl WindowsUiaBackend {
+    fn focus_input(&self, window_id: &str, node: &Node, control: &InputControl) -> Result<()> {
+        control.check()?;
+        let element = self.require(window_id, node)?;
+        control.check()?;
+        unsafe { element.SetFocus() }.map_err(|error| {
+            DriverError::new("DRIVER.ACTION_FAILED", format!("focus failed: {error}"))
+        })
+    }
+
+    fn invoke_input(&self, window_id: &str, node: &Node, control: &InputControl) -> Result<()> {
+        control.check()?;
+        let element = self.require(window_id, node)?;
+
+        // Prefer a real control pattern: it is far more reliable than input
+        // synthesis and does not depend on the window being frontmost.
+        if let Ok(pattern) = unsafe {
+            element.GetCurrentPatternAs::<IUIAutomationInvokePattern>(UIA_InvokePatternId)
+        } {
+            control.check()?;
+            return unsafe { pattern.Invoke() }.map_err(|error| {
+                DriverError::new("DRIVER.ACTION_FAILED", format!("invoke failed: {error}"))
+                    .with_effect("unknown")
+            });
+        }
+        if let Ok(pattern) = unsafe {
+            element.GetCurrentPatternAs::<IUIAutomationTogglePattern>(UIA_TogglePatternId)
+        } {
+            control.check()?;
+            return unsafe { pattern.Toggle() }.map_err(|error| {
+                DriverError::new("DRIVER.ACTION_FAILED", format!("toggle failed: {error}"))
+                    .with_effect("unknown")
+            });
+        }
+        if let Ok(pattern) = unsafe {
+            element.GetCurrentPatternAs::<IUIAutomationLegacyIAccessiblePattern>(
+                UIA_LegacyIAccessiblePatternId,
+            )
+        } {
+            control.check()?;
+            return unsafe { pattern.DoDefaultAction() }.map_err(|error| {
+                DriverError::new(
+                    "DRIVER.ACTION_FAILED",
+                    format!("default action failed: {error}"),
+                )
+                .with_effect("unknown")
+            });
+        }
+
+        Err(DriverError::new(
+            "DRIVER.ACTION_UNSUPPORTED",
+            "the element exposes no invokable pattern",
+        ))
+    }
+
+    fn set_value_input(
+        &self,
+        window_id: &str,
+        node: &Node,
+        value: &str,
+        control: &InputControl,
+    ) -> Result<()> {
+        control.check()?;
+        let element = self.require(window_id, node)?;
+        let pattern =
+            unsafe { element.GetCurrentPatternAs::<IUIAutomationValuePattern>(UIA_ValuePatternId) }
+                .map_err(|_| {
+                    DriverError::new(
+                        "DRIVER.ACTION_UNSUPPORTED",
+                        "the element does not expose a value pattern",
+                    )
+                })?;
+
+        let before = unsafe { pattern.CurrentValue() }
+            .ok()
+            .map(|value| value.to_string());
+
+        control.check()?;
+        unsafe { pattern.SetValue(&BSTR::from(value)) }.map_err(|error| {
+            DriverError::new("DRIVER.ACTION_FAILED", format!("set_value failed: {error}"))
+                .with_effect("unknown")
+        })?;
+
+        // SetValue returning S_OK is not evidence the value changed. Measured
+        // against an HTML <select> in a WebView: it succeeds and the control
+        // keeps its old value. Reporting that as applied is worse than an
+        // error, because an error can be handled and a false success cannot.
+        //
+        // The read-back has to wait, though. A control does not have to publish
+        // its new value synchronously: measured on this machine, a native Win32
+        // edit takes about 160 ms and a WebView input about 510 ms. Reading
+        // once, immediately, called every one of those writes a failure.
+        //
+        // Polling costs nothing when the write worked -- it returns as soon as
+        // the value moves -- and the full wait is only paid when the value
+        // really is stuck, which is the case worth being sure about.
+        // Assigned on the first iteration before it is read, so it needs no
+        // initial value of its own.
+        let mut after;
+        let deadline = Instant::now() + VALUE_SETTLE_TIMEOUT;
+        loop {
+            control
+                .check()
+                .map_err(|error| error.with_effect("unknown"))?;
+            after = unsafe { pattern.CurrentValue() }
+                .ok()
+                .map(|value| value.to_string());
+            if settled(
+                before.as_deref(),
+                after.as_deref(),
+                Instant::now() >= deadline,
+            ) {
+                break;
+            }
+            std::thread::sleep(VALUE_POLL_INTERVAL);
+        }
+
+        if write_was_refused(before.as_deref(), after.as_deref(), value) {
+            return Err(DriverError::new(
+                "DRIVER.ACTION_FAILED",
+                "the element reported success but its value did not change",
+            )
+            // Nothing landed, so retrying is safe -- but repeating the same
+            // call will fail the same way; the caller needs another route.
+            .with_effect("not_applied")
+            .with_detail("requested", serde_json::json!(value))
+            .with_detail("value", serde_json::json!(after))
+            .with_detail(
+                "likely_cause",
+                serde_json::json!(
+                    "the control accepts the value pattern but ignores writes, \
+                     as a web <select> does"
+                ),
+            )
+            .with_detail(
+                "remedy",
+                serde_json::json!(
+                    "drive this control the way a person would: focus it and \
+                     invoke, or click the option"
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    fn secret_input_input(
+        &self,
+        window_id: &str,
+        node: &Node,
+        text: &str,
+        control: &InputControl,
+    ) -> Result<()> {
+        control.check()?;
+        let element = self.require(window_id, node)?;
+        if !unsafe { element.CurrentIsPassword() }.is_ok_and(|value| value.as_bool())
+            || !unsafe { element.CurrentIsEnabled() }.is_ok_and(|value| value.as_bool())
+        {
+            return Err(DriverError::new(
+                "DRIVER.PROTECTED_ELEMENT",
+                "secret input requires an enabled protected field",
+            ));
+        }
+        if let Ok(pattern) =
+            unsafe { element.GetCurrentPatternAs::<IUIAutomationValuePattern>(UIA_ValuePatternId) }
+        {
+            if !unsafe { pattern.CurrentIsReadOnly() }.is_ok_and(|value| !value.as_bool()) {
+                return Err(DriverError::new(
+                    "DRIVER.PROTECTED_ELEMENT",
+                    "secret field is not editable",
+                ));
+            }
+            // Never read CurrentValue or attach the requested value to errors.
+            control.check()?;
+            unsafe { pattern.SetValue(&BSTR::from(text)) }.map_err(|_| {
+                DriverError::new("DRIVER.SECRET_INPUT_FAILED", "secret input failed")
+                    .with_effect("unknown")
+            })?;
+            return Ok(());
+        }
+        if unsafe { element.CurrentControlType() }.ok() != Some(UIA_EditControlTypeId)
+            || !unsafe { element.CurrentIsKeyboardFocusable() }.is_ok_and(|value| value.as_bool())
+        {
+            return Err(DriverError::new(
+                "DRIVER.ACTION_UNSUPPORTED",
+                "protected field has no replacement input path",
+            ));
+        }
+        control.check()?;
+        focus_for_keys(&self.automation, parse_window_id(window_id)?, &element)?;
+        ensure_modifiers_released(&["ctrl".into(), "shift".into(), "alt".into(), "meta".into()])?;
+        let mut inputs = Chord::parse(&["ctrl".into(), "a".into()])?.to_inputs();
+        // Deleting the selection also gives empty secret text replace semantics.
+        inputs.push(virtual_key_event(VK_BACK, false));
+        inputs.push(virtual_key_event(VK_BACK, true));
+        for unit in text.encode_utf16() {
+            for flags in [KEYEVENTF_UNICODE, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP] {
+                inputs.push(INPUT {
+                    r#type: INPUT_KEYBOARD,
+                    Anonymous: windows::Win32::UI::Input::KeyboardAndMouse::INPUT_0 {
+                        ki: KEYBDINPUT {
+                            wVk: VIRTUAL_KEY(0),
+                            wScan: unit,
+                            dwFlags: flags,
+                            time: 0,
+                            dwExtraInfo: 0,
+                        },
+                    },
+                });
+            }
+        }
+        dispatch_keys_controlled(&inputs, control, "secret input").map_err(|error| {
+            DriverError::new("DRIVER.SECRET_INPUT_FAILED", "secret input failed")
+                .with_effect(&error.effect)
+        })
+    }
+
+    fn type_text_input(
+        &self,
+        window_id: &str,
+        node: &Node,
+        text: &str,
+        control: &InputControl,
+    ) -> Result<()> {
+        control.check()?;
+        let element = self.require(window_id, node)?;
+        // Typing goes to whatever holds focus, so focus must be established --
+        // and proven, window in front and element focused -- or the keystrokes
+        // land in another application.
+        control.check()?;
+        focus_for_keys(&self.automation, parse_window_id(window_id)?, &element)?;
+
+        let mut inputs: Vec<INPUT> = Vec::new();
+        for unit in text.encode_utf16() {
+            for flags in [KEYEVENTF_UNICODE, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP] {
+                inputs.push(INPUT {
+                    r#type: INPUT_KEYBOARD,
+                    Anonymous: windows::Win32::UI::Input::KeyboardAndMouse::INPUT_0 {
+                        ki: KEYBDINPUT {
+                            wVk: windows::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY(0),
+                            wScan: unit,
+                            dwFlags: flags,
+                            time: 0,
+                            dwExtraInfo: 0,
+                        },
+                    },
+                });
+            }
+        }
+        if inputs.is_empty() {
+            return Ok(());
+        }
+        // Keystrokes must arrive as one uninterrupted stream. If the batch is
+        // refused, splitting it corrupts the text (verified), so this fails
+        // rather than typing something the caller did not ask for. The error
+        // points at set_value, which writes the value without synthetic input.
+        dispatch_keys_controlled(&inputs, control, "keystrokes")
+    }
+
+    fn type_text_keys_input(
+        &self,
+        window_id: &str,
+        node: &Node,
+        text: &str,
+        control: &InputControl,
+    ) -> Result<()> {
+        control.check()?;
+        // Build the complete sequence before focusing or sending anything. An
+        // unsupported character therefore fails with effect=not_applied rather
+        // than leaving a valid prefix in the target.
+        let top_level = parse_window_id(window_id)?;
+        let element = self.require(window_id, node)?;
+        let input_window = unsafe { element.CurrentNativeWindowHandle() }
+            .ok()
+            .filter(|handle| !handle.0.is_null())
+            .unwrap_or(top_level);
+        let thread_id = unsafe { GetWindowThreadProcessId(input_window, None) };
+        if thread_id == 0 {
+            return Err(DriverError::unavailable(
+                "the target element has no owning input thread",
+            ));
+        }
+        let layout = unsafe { GetKeyboardLayout(thread_id) };
+        let caps_lock_on = unsafe { GetKeyState(VK_CAPITAL.0 as i32) } & 1 != 0;
+        let sequence = KeyTextSequence::parse(text, layout, caps_lock_on)?;
+        control.check()?;
+        focus_for_keys(&self.automation, top_level, &element)?;
+
+        // UIA elements in hosted controls often report the top-level HWND, not
+        // the child that owns the caret. After SetFocus, GetGUIThreadInfo is the
+        // authoritative source for which HWND will receive keyboard input.
+        let mut gui = GUITHREADINFO {
+            cbSize: std::mem::size_of::<GUITHREADINFO>() as u32,
+            ..Default::default()
+        };
+        let focus_window = if unsafe { GetGUIThreadInfo(thread_id, &mut gui) }.is_ok()
+            && !gui.hwndFocus.0.is_null()
+        {
+            gui.hwndFocus
+        } else {
+            input_window
+        };
+        if ime_is_open(focus_window) {
+            return Err(DriverError::new(
+                "DRIVER.INPUT_METHOD_ACTIVE",
+                "keys mode cannot guarantee exact text while the target input method is open",
+            )
+            // Focus changed, but no key was sent.
+            .with_effect("contextual")
+            .with_detail(
+                "remedy",
+                serde_json::json!(
+                    "switch the target input method to direct/English mode, or use mode=unicode/set_value"
+                ),
+            ));
+        }
+
+        dispatch_keys_controlled(&sequence.inputs, control, "layout-aware keystrokes")
+    }
+
+    fn global_key_input(
+        &self,
+        keys: &[String],
+        control: &InputControl,
+    ) -> Result<serde_json::Value> {
+        control.check()?;
+        let chord = Chord::parse(keys)?;
+        refuse_reserved_chord(&chord)?;
+        // UAC prompts and the lock screen run on the secure desktop, which
+        // synthetic input cannot and must not reach.
+        if !on_default_desktop() {
+            return Err(DriverError::new(
+                "DRIVER.SECURE_DESKTOP",
+                "the input desktop is not the user's desktop (a UAC prompt or the lock screen); nothing was sent",
+            ));
+        }
+        let foreground = unsafe { GetForegroundWindow() };
+        let mut process = 0u32;
+        unsafe { GetWindowThreadProcessId(foreground, Some(&mut process)) };
+        // The same atomic chord path and modifier-leak cleanup as `key`.
+        dispatch_keys_controlled(&chord.to_inputs(), control, "the global key combination")?;
+        Ok(serde_json::json!({
+            "foreground_process_id": process,
+        }))
+    }
 }
 
 #[cfg(test)]

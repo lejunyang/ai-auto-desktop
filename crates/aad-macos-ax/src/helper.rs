@@ -1,6 +1,6 @@
 use super::{
-    driver_error, remaining, AutomationError, AxBackend, BackendNode, BackendSnapshot, Bounds, Map,
-    Value,
+    driver_error, remaining, AutomationError, AxBackend, AxInput, BackendNode, BackendSnapshot,
+    Bounds, Map, Value,
 };
 use serde_json::json;
 use std::io::{Read, Write};
@@ -107,16 +107,42 @@ impl SwiftHelperBackend {
         deadline: Instant,
         track_dispatch: bool,
     ) -> Result<Value, AutomationError> {
+        self.rpc_controlled(operation, args, deadline, track_dispatch, None)
+    }
+
+    fn rpc_controlled(
+        &self,
+        operation: &str,
+        args: Value,
+        deadline: Instant,
+        track_dispatch: bool,
+        cancellation: Option<&aad_runtime::CancellationToken>,
+    ) -> Result<Value, AutomationError> {
+        if let Some(cancellation) = cancellation {
+            cancellation.check()?;
+        }
         remaining(deadline, false)?;
-        let mut state = self.state.lock().map_err(|_| {
-            channel_error(
-                "DRIVER.UNAVAILABLE",
-                "macOS AX helper state is unavailable",
-                false,
-                false,
-                false,
-            )
-        })?;
+        let mut state = loop {
+            if let Some(cancellation) = cancellation {
+                cancellation.check()?;
+            }
+            remaining(deadline, false)?;
+            match self.state.try_lock() {
+                Ok(state) => break state,
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    std::thread::sleep(Duration::from_millis(5))
+                }
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    return Err(channel_error(
+                        "DRIVER.UNAVAILABLE",
+                        "macOS AX helper state is unavailable",
+                        false,
+                        false,
+                        false,
+                    ))
+                }
+            }
+        };
         let state = state.as_mut().ok_or_else(|| {
             channel_error(
                 "DRIVER.UNAVAILABLE",
@@ -152,37 +178,43 @@ impl SwiftHelperBackend {
         if encoded.len() > MAX_REQUEST_BYTES {
             return Err(invalid("macOS AX helper request exceeds the frame limit"));
         }
-        state
-            .stdin
-            .write_all(&encoded)
-            .and_then(|()| state.stdin.flush())
-            .map_err(|error| {
-                channel_error(
-                    "DRIVER.UNAVAILABLE",
-                    &format!("macOS AX helper write failed: {error}"),
-                    false,
-                    false,
-                    false,
-                )
-            })?;
+        if let Some(cancellation) = cancellation {
+            cancellation.check()?;
+        }
+        write_request(state, &encoded, deadline, cancellation)?;
         let mut dispatch_started = false;
         let mut focus_changed = false;
         loop {
-            let line = read_line(state, deadline).map_err(|error| {
-                let effect = dispatch_started || focus_changed;
-                if effect {
-                    terminate_state(state, true);
-                }
-                channel_error(
+            let line = read_line(state, deadline, cancellation).map_err(|error| {
+                // SIGTERM gives the helper's independent release guard a
+                // bounded cleanup window. SIGKILL would bypass owned key-up.
+                // Even without progress, an in-flight request must be stopped.
+                // Paste can be unwinding a bounded AX call before restoring
+                // the clipboard. Its cleanup budget includes that 2 s call.
+                let grace = if operation == "paste" {
+                    Duration::from_millis(2500)
+                } else {
+                    Duration::from_millis(500)
+                };
+                terminate_state_with_grace(state, grace);
+                let failure = channel_error(
                     &error.code,
                     &error.message,
                     true,
                     dispatch_started,
                     focus_changed,
-                )
+                );
+                // Cancellation can race a helper progress frame. Preserve the
+                // observed progress flag, but do not infer absence of effects
+                // from a missing frame after a complete write crossed the pipe.
+                if error.code == "DRIVER.CANCELLED" {
+                    failure.with_effect("unknown")
+                } else {
+                    failure
+                }
             })?;
             let response: Value = serde_json::from_slice(&line).map_err(|_| {
-                terminate_state(state, true);
+                terminate_state(state);
                 channel_error(
                     "DRIVER.ACTION_FAILED",
                     "macOS AX helper returned invalid JSON",
@@ -201,7 +233,7 @@ impl SwiftHelperBackend {
                 )
             })?;
             if object.get("id") != Some(&json!(id)) {
-                terminate_state(state, true);
+                terminate_state(state);
                 return Err(channel_error(
                     "DRIVER.ACTION_FAILED",
                     "macOS AX helper response id mismatch",
@@ -217,6 +249,10 @@ impl SwiftHelperBackend {
                     == Some(true)
                     || progress
                         .get("pointer_dispatch_started")
+                        .and_then(Value::as_bool)
+                        == Some(true)
+                    || progress
+                        .get("native_dispatch_started")
                         .and_then(Value::as_bool)
                         == Some(true);
                 focus_changed |=
@@ -249,11 +285,15 @@ impl SwiftHelperBackend {
                     || details
                         .get("pointer_dispatch_started")
                         .and_then(Value::as_bool)
+                        == Some(true)
+                    || details
+                        .get("native_dispatch_started")
+                        .and_then(Value::as_bool)
                         == Some(true);
                 focus_changed |=
                     details.get("focus_changed").and_then(Value::as_bool) == Some(true);
                 if track_dispatch && dispatch_started {
-                    terminate_state(state, true);
+                    terminate_state(state);
                     return Err(driver_error(
                         "DRIVER.UNKNOWN_EFFECT",
                         "macOS input result is unknown after native dispatch",
@@ -288,9 +328,14 @@ impl SwiftHelperBackend {
                         result
                             .get("pointer_dispatch_started")
                             .and_then(Value::as_bool)
+                    })
+                    .or_else(|| {
+                        result
+                            .get("native_dispatch_started")
+                            .and_then(Value::as_bool)
                     });
                 if declared != Some(dispatch_started) {
-                    terminate_state(state, true);
+                    terminate_state(state);
                     return Err(channel_error(
                         "DRIVER.UNKNOWN_EFFECT",
                         "macOS AX helper dispatch state is inconsistent",
@@ -310,9 +355,20 @@ impl SwiftHelperBackend {
         args: Value,
         deadline: Instant,
     ) -> Result<Value, AutomationError> {
+        self.write_controlled(operation, args, deadline, None)
+    }
+
+    fn write_controlled(
+        &self,
+        operation: &str,
+        args: Value,
+        deadline: Instant,
+        cancellation: Option<&aad_runtime::CancellationToken>,
+    ) -> Result<Value, AutomationError> {
         let track = matches!(
             operation,
             "type_text"
+                | "secret_input"
                 | "pointer_click"
                 | "pointer_gesture"
                 | "drag"
@@ -320,7 +376,7 @@ impl SwiftHelperBackend {
                 | "paste"
                 | "global_key"
         );
-        let result = self.rpc(operation, args, deadline, track)?;
+        let result = self.rpc_controlled(operation, args, deadline, track, cancellation)?;
         let expected = if track { "submitted" } else { "accepted" };
         if result.get(expected) != Some(&Value::Bool(true))
             || !result.get("native_operation").is_some_and(Value::is_string)
@@ -341,7 +397,7 @@ impl Drop for SwiftHelperBackend {
     fn drop(&mut self) {
         if let Ok(mut state) = self.state.lock() {
             if let Some(state) = state.as_mut() {
-                terminate_state(state, false);
+                terminate_state(state);
             }
             *state = None;
         }
@@ -349,6 +405,73 @@ impl Drop for SwiftHelperBackend {
 }
 
 impl AxBackend for SwiftHelperBackend {
+    fn input_controlled(
+        &self,
+        token: &str,
+        input: AxInput<'_>,
+        deadline: Instant,
+        cancellation: &aad_runtime::CancellationToken,
+    ) -> Result<Value, AutomationError> {
+        let mut args = json!({"native_token": token});
+        let operation = match input {
+            AxInput::Focus => "focus",
+            AxInput::Invoke => "invoke",
+            AxInput::PointerClick { button, position } => {
+                args["button"] = json!(button);
+                args["position"] = json!(position);
+                "pointer_click"
+            }
+            AxInput::SetValue(text) => {
+                args["value"] = json!(text);
+                "set_value"
+            }
+            AxInput::TypeText(text) => {
+                args["text"] = json!(text);
+                "type_text"
+            }
+            AxInput::SecretInput(text) => {
+                args["text"] = json!(text);
+                "secret_input"
+            }
+            AxInput::Paste(text) => {
+                args["text"] = json!(text);
+                "paste"
+            }
+            AxInput::WindowAction(action) => {
+                args["action"] = json!(action);
+                "window_action"
+            }
+        };
+        let result = self.write_controlled(operation, args, deadline, Some(cancellation))?;
+        if operation == "paste" && result["consumed"] != true {
+            return Err(
+                driver_error("DRIVER.PASTE_NOT_CONSUMED", "paste input was not consumed")
+                    .with_effect("unknown")
+                    .with_detail("clipboard_restored", result["restored"].clone()),
+            );
+        }
+        if operation == "window_action" && result["verified"] != true {
+            return Err(
+                driver_error("DRIVER.UNKNOWN_EFFECT", "window state was not verified")
+                    .with_effect("unknown")
+                    .with_detail("observed_state", result["observed_state"].clone()),
+            );
+        }
+        Ok(result)
+    }
+    fn global_key_controlled(
+        &self,
+        keys: &[String],
+        deadline: Instant,
+        cancellation: &aad_runtime::CancellationToken,
+    ) -> Result<Value, AutomationError> {
+        self.write_controlled(
+            "global_key",
+            json!({"keys": keys}),
+            deadline,
+            Some(cancellation),
+        )
+    }
     fn name(&self) -> &str {
         "macos_ax_swift_helper"
     }
@@ -471,6 +594,18 @@ impl AxBackend for SwiftHelperBackend {
             deadline,
         )
     }
+    fn secret_input(
+        &self,
+        token: &str,
+        text: &str,
+        deadline: Instant,
+    ) -> Result<Value, AutomationError> {
+        self.write(
+            "secret_input",
+            json!({"native_token": token, "text": text}),
+            deadline,
+        )
+    }
     fn start_recording(
         &self,
         process_id: u32,
@@ -513,6 +648,17 @@ impl AxBackend for SwiftHelperBackend {
         args["native_token"] = json!(token);
         self.write("pointer_gesture", args, deadline)
     }
+    fn pointer_gesture_controlled(
+        &self,
+        token: &str,
+        gesture: &Value,
+        deadline: Instant,
+        cancellation: &aad_runtime::CancellationToken,
+    ) -> Result<Value, AutomationError> {
+        let mut args = gesture.clone();
+        args["native_token"] = json!(token);
+        self.write_controlled("pointer_gesture", args, deadline, Some(cancellation))
+    }
     fn drag(
         &self,
         token: &str,
@@ -525,6 +671,19 @@ impl AxBackend for SwiftHelperBackend {
         args["to_token"] = json!(to_token);
         self.write("drag", args, deadline)
     }
+    fn drag_controlled(
+        &self,
+        token: &str,
+        to_token: &str,
+        request: &Value,
+        deadline: Instant,
+        cancellation: &aad_runtime::CancellationToken,
+    ) -> Result<Value, AutomationError> {
+        let mut args = request.clone();
+        args["native_token"] = json!(token);
+        args["to_token"] = json!(to_token);
+        self.write_controlled("drag", args, deadline, Some(cancellation))
+    }
     fn key_chord(
         &self,
         token: &str,
@@ -536,6 +695,33 @@ impl AxBackend for SwiftHelperBackend {
             json!({"native_token": token, "keys": keys}),
             deadline,
         )
+    }
+    fn key_chord_held(
+        &self,
+        token: &str,
+        keys: &[String],
+        hold_ms: Option<u64>,
+        deadline: Instant,
+    ) -> Result<Value, AutomationError> {
+        let mut args = json!({"native_token": token, "keys": keys});
+        if let Some(ms) = hold_ms {
+            args["hold_ms"] = json!(ms);
+        }
+        self.write("key_chord", args, deadline)
+    }
+    fn key_chord_controlled(
+        &self,
+        token: &str,
+        keys: &[String],
+        hold_ms: Option<u64>,
+        deadline: Instant,
+        cancellation: &aad_runtime::CancellationToken,
+    ) -> Result<Value, AutomationError> {
+        let mut args = json!({"native_token": token, "keys": keys});
+        if let Some(ms) = hold_ms {
+            args["hold_ms"] = json!(ms);
+        }
+        self.write_controlled("key_chord", args, deadline, Some(cancellation))
     }
     fn window_action(
         &self,
@@ -595,7 +781,7 @@ impl AxBackend for SwiftHelperBackend {
     fn close(&self) {
         if let Ok(mut state) = self.state.lock() {
             if let Some(state) = state.as_mut() {
-                terminate_state(state, false);
+                terminate_state(state);
             }
             *state = None;
         }
@@ -679,8 +865,87 @@ fn parse_node(value: &Value) -> Result<BackendNode, AutomationError> {
     })
 }
 
-fn read_line(state: &mut HelperState, deadline: Instant) -> Result<Vec<u8>, AutomationError> {
+/// A stalled helper must not trap cancellation while the request pipe is full.
+/// Partial frames cannot be reused: terminate before another command is sent.
+fn write_request(
+    state: &mut HelperState,
+    bytes: &[u8],
+    deadline: Instant,
+    cancellation: Option<&aad_runtime::CancellationToken>,
+) -> Result<(), AutomationError> {
+    let fd = state.stdin.as_raw_fd();
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(driver_error(
+            "DRIVER.UNAVAILABLE",
+            "helper request pipe cannot be made nonblocking",
+        ));
+    }
+    let mut offset = 0;
+    let result = (|| {
+        while offset < bytes.len() {
+            if let Some(cancellation) = cancellation {
+                cancellation.check()?;
+            }
+            let timeout = remaining(deadline, false)?.min(Duration::from_millis(10));
+            let mut poll = libc::pollfd {
+                fd,
+                events: libc::POLLOUT,
+                revents: 0,
+            };
+            let ready = unsafe { libc::poll(&mut poll, 1, timeout.as_millis().max(1) as i32) };
+            if ready == 0 {
+                continue;
+            }
+            if ready < 0 {
+                if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(driver_error(
+                    "DRIVER.UNAVAILABLE",
+                    "helper request pipe poll failed",
+                ));
+            }
+            match state.stdin.write(&bytes[offset..]) {
+                Ok(0) => {
+                    return Err(driver_error(
+                        "DRIVER.UNAVAILABLE",
+                        "helper request pipe closed",
+                    ))
+                }
+                Ok(written) => offset += written,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                    ) => {}
+                Err(_) => {
+                    return Err(driver_error(
+                        "DRIVER.UNAVAILABLE",
+                        "helper request pipe write failed",
+                    ))
+                }
+            }
+        }
+        Ok(())
+    })();
+    result.map_err(|error: AutomationError| {
+        if offset > 0 {
+            terminate_state(state);
+        }
+        channel_error(&error.code, &error.message, offset > 0, false, false)
+    })
+}
+
+fn read_line(
+    state: &mut HelperState,
+    deadline: Instant,
+    cancellation: Option<&aad_runtime::CancellationToken>,
+) -> Result<Vec<u8>, AutomationError> {
     loop {
+        if let Some(cancellation) = cancellation {
+            cancellation.check()?;
+        }
         if state.buffer.len() > MAX_RESPONSE_BYTES {
             return Err(driver_error(
                 "DRIVER.OUTPUT_TOO_LARGE",
@@ -692,7 +957,10 @@ fn read_line(state: &mut HelperState, deadline: Instant) -> Result<Vec<u8>, Auto
             state.buffer.drain(..=index);
             return Ok(line);
         }
-        let timeout = remaining(deadline, false)?;
+        let mut timeout = remaining(deadline, false)?;
+        if cancellation.is_some() {
+            timeout = timeout.min(Duration::from_millis(10));
+        }
         let mut poll = libc::pollfd {
             fd: state.stdout.as_raw_fd(),
             events: libc::POLLIN,
@@ -701,6 +969,9 @@ fn read_line(state: &mut HelperState, deadline: Instant) -> Result<Vec<u8>, Auto
         let milliseconds = timeout.as_millis().clamp(1, i32::MAX as u128) as i32;
         let ready = unsafe { libc::poll(&mut poll, 1, milliseconds) };
         if ready == 0 {
+            if cancellation.is_some() {
+                continue;
+            }
             return Err(super::timeout_error(false));
         }
         if ready < 0 {
@@ -726,12 +997,17 @@ fn read_line(state: &mut HelperState, deadline: Instant) -> Result<Vec<u8>, Auto
     }
 }
 
-fn terminate_state(state: &mut HelperState, force: bool) {
-    let signal = if force { libc::SIGKILL } else { libc::SIGTERM };
+fn terminate_state(state: &mut HelperState) {
+    terminate_state_with_grace(state, Duration::from_millis(500));
+}
+
+fn terminate_state_with_grace(state: &mut HelperState, cleanup: Duration) {
+    // All shutdown paths first allow a held-input watchdog to release. The
+    // cleanup budget is independent of the expired request's timeout.
     unsafe {
-        libc::kill(-(state.child.id() as i32), signal);
+        libc::kill(-(state.child.id() as i32), libc::SIGTERM);
     }
-    let grace = Instant::now() + Duration::from_millis(200);
+    let grace = Instant::now() + cleanup;
     while Instant::now() < grace {
         if state.child.try_wait().ok().flatten().is_some() {
             return;
@@ -912,12 +1188,21 @@ mod tests {
     }
 
     fn backend(fixture: &Fixture) -> SwiftHelperBackend {
-        let mut child = Command::new("sh")
+        use std::os::unix::process::CommandExt;
+        let mut command = Command::new("sh");
+        command
             .arg(&fixture.executable)
             .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .spawn()
-            .unwrap();
+            .stdout(Stdio::piped());
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = command.spawn().unwrap();
         let stdin = child.stdin.take().unwrap();
         let stdout = child.stdout.take().unwrap();
         SwiftHelperBackend {
@@ -930,6 +1215,273 @@ mod tests {
             })),
             helper_source: "fixture".into(),
         }
+    }
+
+    #[test]
+    fn controlled_non_hold_writes_use_the_explicit_rpc_path() {
+        let fixture = Fixture::new(
+            r#"#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+  operation=$(printf '%s' "$line" | sed -n 's/.*"operation":"\([^"]*\)".*/\1/p')
+  printf '{"id":"%s","progress":{"native_dispatch_started":true}}\n' "$id"
+  printf '{"id":"%s","result":{"native_operation":"%s","native_dispatch_started":true,"submitted":true,"accepted":true,"verified":true,"consumed":true,"restored":true}}\n' "$id" "$operation"
+done
+"#,
+        );
+        let backend = backend(&fixture);
+        let cancellation = aad_runtime::CancellationToken::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        for (input, operation) in [
+            (AxInput::Focus, "focus"),
+            (AxInput::Invoke, "invoke"),
+            (AxInput::SetValue("fixture"), "set_value"),
+            (AxInput::TypeText("fixture"), "type_text"),
+            (AxInput::SecretInput("fixture"), "secret_input"),
+            (AxInput::Paste("fixture"), "paste"),
+            (AxInput::WindowAction("activate"), "window_action"),
+            (
+                AxInput::PointerClick {
+                    button: "left",
+                    position: "center",
+                },
+                "pointer_click",
+            ),
+        ] {
+            let value = backend
+                .input_controlled("fixture", input, deadline, &cancellation)
+                .unwrap();
+            assert_eq!(value["native_operation"], operation);
+        }
+        assert_eq!(
+            backend
+                .global_key_controlled(&["a".into()], deadline, &cancellation)
+                .unwrap()["native_operation"],
+            "global_key"
+        );
+    }
+
+    #[test]
+    fn cancelled_paste_keeps_cleanup_grace_for_a_bounded_ax_call() {
+        let fixture = Fixture::new(
+            r#"#!/bin/sh
+trap 'sleep 0.6; printf restored > "$0.restored"; exit 0' TERM
+IFS= read -r line
+printf offered > "$0.offered"
+while :; do sleep 0.01; done
+"#,
+        );
+        let backend = backend(&fixture);
+        let cancellation = aad_runtime::CancellationToken::new();
+        let cancelling = cancellation.clone();
+        let offered = PathBuf::from(format!("{}.offered", fixture.executable.display()));
+        let worker = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !offered.exists() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let ready = offered.exists();
+            cancelling.cancel();
+            assert!(ready);
+        });
+        let started = Instant::now();
+        let error = backend
+            .input_controlled(
+                "fixture",
+                AxInput::Paste("fixture"),
+                started + Duration::from_secs(5),
+                &cancellation,
+            )
+            .unwrap_err();
+        worker.join().unwrap();
+        assert_eq!(error.code, "DRIVER.CANCELLED");
+        assert_eq!(error.effect, "unknown");
+        assert!(started.elapsed() < Duration::from_secs(3));
+        assert_eq!(
+            std::fs::read_to_string(format!("{}.restored", fixture.executable.display())).unwrap(),
+            "restored"
+        );
+        assert!(backend
+            .state
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .child
+            .try_wait()
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn cancellation_interrupts_a_full_helper_request_pipe() {
+        let fixture = Fixture::new(
+            r#"#!/bin/sh
+trap 'exit 0' TERM
+dd bs=1 count=1 of=/dev/null 2>/dev/null
+printf blocked > "$0.partial"
+while :; do sleep 0.01; done
+"#,
+        );
+        let backend = backend(&fixture);
+        let cancellation = aad_runtime::CancellationToken::new();
+        let cancelling = cancellation.clone();
+        let partial = PathBuf::from(format!("{}.partial", fixture.executable.display()));
+        let worker = std::thread::spawn(move || {
+            let limit = Instant::now() + Duration::from_secs(2);
+            while !partial.exists() && Instant::now() < limit {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let dispatched = partial.exists();
+            cancelling.cancel();
+            assert!(
+                dispatched,
+                "fixture must consume a prefix before cancellation"
+            );
+        });
+        let started = Instant::now();
+        let error = backend
+            .rpc_controlled(
+                "type_text",
+                json!({"text":"a".repeat(256 * 1024)}),
+                started + Duration::from_secs(5),
+                true,
+                Some(&cancellation),
+            )
+            .unwrap_err();
+        worker.join().unwrap();
+        assert_eq!(error.code, "DRIVER.CANCELLED");
+        assert_eq!(
+            error.effect, "not_applied",
+            "an incomplete JSON frame cannot dispatch"
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(backend
+            .state
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .child
+            .try_wait()
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn cancellation_reaps_inflight_helper_only_after_cleanup_and_preserves_preflight() {
+        let fixture = Fixture::new(
+            r#"#!/bin/sh
+trap 'printf released > "$0.release"; exit 0' TERM
+IFS= read -r line
+id=$(printf '%s' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+printf held > "$0.held"
+printf '{"id":"%s","progress":{"keyboard_dispatch_started":true}}\n' "$id"
+while :; do sleep 0.01; done
+"#,
+        );
+        let backend = backend(&fixture);
+        let cancelled = aad_runtime::CancellationToken::new();
+        cancelled.cancel();
+        let error = backend
+            .key_chord_controlled(
+                "fixture",
+                &["a".into()],
+                Some(5000),
+                Instant::now() + Duration::from_secs(10),
+                &cancelled,
+            )
+            .unwrap_err();
+        assert_eq!(error.code, "DRIVER.CANCELLED");
+        assert_eq!(error.effect, "not_applied");
+        assert_eq!(
+            backend
+                .state
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .request_number,
+            0
+        );
+
+        let cancellation = aad_runtime::CancellationToken::new();
+        let cancelling = cancellation.clone();
+        let held_marker = PathBuf::from(format!("{}.held", fixture.executable.display()));
+        let worker = std::thread::spawn(move || {
+            let limit = Instant::now() + Duration::from_secs(2);
+            while !held_marker.exists() && Instant::now() < limit {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let held = held_marker.exists();
+            cancelling.cancel();
+            assert!(held, "fixture must receive the request before cancellation");
+            Instant::now()
+        });
+        let error = backend
+            .key_chord_controlled(
+                "fixture",
+                &["a".into()],
+                Some(5000),
+                Instant::now() + Duration::from_secs(10),
+                &cancellation,
+            )
+            .unwrap_err();
+        let cancelled_at = worker.join().unwrap();
+        assert!(cancelled_at.elapsed() < Duration::from_secs(1));
+        assert_eq!(error.code, "DRIVER.CANCELLED");
+        assert_eq!(error.effect, "unknown");
+        assert_eq!(
+            std::fs::read_to_string(format!("{}.release", fixture.executable.display())).unwrap(),
+            "released"
+        );
+        assert!(backend
+            .state
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .child
+            .try_wait()
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn expired_input_request_gets_cleanup_grace_before_process_exit() {
+        let fixture = Fixture::new(
+            r#"#!/bin/sh
+trap 'printf released > "$0.release"; exit 0' TERM
+IFS= read -r line
+id=$(printf '%s' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+printf '{"id":"%s","progress":{"keyboard_dispatch_started":true}}\n' "$id"
+while :; do sleep 0.01; done
+"#,
+        );
+        let backend = backend(&fixture);
+        let started = Instant::now();
+        let error = backend
+            .key_chord_held(
+                "fixture",
+                &["a".into()],
+                Some(20),
+                started + Duration::from_millis(100),
+            )
+            .unwrap_err();
+        assert_eq!(error.effect, "unknown");
+        assert!(started.elapsed() < Duration::from_secs(2));
+        let marker = PathBuf::from(format!("{}.release", fixture.executable.display()));
+        assert_eq!(std::fs::read_to_string(marker).unwrap(), "released");
+        assert!(backend
+            .state
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .child
+            .try_wait()
+            .unwrap()
+            .is_some());
     }
 
     #[test]
@@ -974,6 +1526,26 @@ done
             .unwrap_err();
         assert_eq!(error.code, "DRIVER.PROTECTED_ELEMENT");
         assert_eq!(error.effect, "not_applied");
+    }
+
+    #[test]
+    fn secret_native_write_progress_preserves_unknown_effect_on_channel_loss() {
+        let script = r#"#!/bin/sh
+IFS= read -r line
+id=$(printf '%s' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+printf '{"id":"%s","progress":{"native_dispatch_started":true}}\n' "$id"
+exit 0
+"#;
+        let fixture = Fixture::new(script);
+        let error = backend(&fixture)
+            .secret_input(
+                "n",
+                "synthetic-fixture",
+                Instant::now() + Duration::from_secs(2),
+            )
+            .unwrap_err();
+        assert_eq!(error.effect, "unknown");
+        assert!(!format!("{error:?}").contains("synthetic-fixture"));
     }
 
     /// A helper that answers every request with `result`, after a keyboard

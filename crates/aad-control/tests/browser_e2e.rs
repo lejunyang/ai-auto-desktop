@@ -17,6 +17,11 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
+#[path = "browser_cases/access.rs"]
+mod access_cases;
+#[path = "browser_cases/inflight.rs"]
+mod inflight_cases;
+
 const PAGE: &str = r#"<!doctype html><html><body>
 <form onsubmit="event.preventDefault()"><input id="name" aria-label="Name" oninput="document.getElementById('status').value='fill:'+this.value" onkeydown="if(event.key==='Enter')document.getElementById('status').value='key:'+event.isTrusted">
 <button id="save" aria-label="Save" type="button" onclick="document.getElementById('status').value='clicked:'+event.isTrusted">Save</button></form>
@@ -167,6 +172,12 @@ struct Fixture {
 }
 impl Fixture {
     fn new() -> Self {
+        Self::with_automation(false)
+    }
+    fn with_automation(automation: bool) -> Self {
+        Self::with_mode(automation, false)
+    }
+    fn with_mode(automation: bool, headed: bool) -> Self {
         let binary = std::env::var_os("AAD_TEST_CHROME")
             .expect("set AAD_TEST_CHROME to a sandbox-capable Chromium binary");
         let root = std::env::temp_dir().join(format!("aad-browser-e2e-{}", uuid::Uuid::new_v4()));
@@ -203,7 +214,6 @@ impl Fixture {
         let mut command = Command::new(binary);
         command
             .args([
-                "--headless=new",
                 "--remote-debugging-address=127.0.0.1",
                 "--remote-debugging-port=0",
                 "--no-first-run",
@@ -216,6 +226,14 @@ impl Fixture {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::inherit());
+        if automation {
+            command.arg("--enable-automation");
+        }
+        if headed {
+            command.args(["--force-renderer-accessibility", "--window-size=1000,700"]);
+        } else {
+            command.arg("--headless=new");
+        }
         // Reclaim only this fixture's own process group, never all Chrome processes.
         #[cfg(unix)]
         unsafe {
@@ -258,7 +276,7 @@ impl Fixture {
         // only for initial startup; navigation can temporarily publish an empty
         // URL and must never redirect this verifier to another page.
         loop {
-            if let Ok(targets) = aad_cdp::Client::list_targets(fixture.port) {
+            if let Ok(targets) = aad_browser::cdp::Client::list_targets(fixture.port) {
                 if let Some(target) = targets.iter().find(|t| t.url.starts_with(&fixture.url)) {
                     fixture.page_id = target.id.clone();
                     break;
@@ -269,13 +287,13 @@ impl Fixture {
         }
         fixture
     }
-    fn client(&self) -> aad_cdp::Client {
-        let target = aad_cdp::Client::list_targets(self.port)
+    fn client(&self) -> aad_browser::cdp::Client {
+        let target = aad_browser::cdp::Client::list_targets(self.port)
             .unwrap()
             .into_iter()
             .find(|t| t.id == self.page_id)
             .expect("the fixture's explicit page target disappeared");
-        aad_cdp::Client::attach(&target).unwrap()
+        aad_browser::cdp::Client::attach(&target).unwrap()
     }
 }
 impl Drop for Fixture {
@@ -460,6 +478,7 @@ fn act_on(session: &Session, main: &str, role: &str, name: &str, action: Action)
 }
 fn keys(keys: &[&str]) -> Action {
     Action::Key {
+        hold_ms: None,
         keys: keys.iter().map(|k| k.to_string()).collect(),
     }
 }
@@ -534,7 +553,7 @@ fn delegated_icons_click_without_advertising_unusable_keyboard_input() {
 #[test]
 #[ignore = "requires isolated Chromium with its sandbox enabled; CI runs it explicitly"]
 fn a_recorded_browser_task_replays_as_saved_steps() {
-    use aad_cdp::recording::{Options, Recorder};
+    use aad_browser::recording::{Options, Recorder};
     let _serial = serial();
     let fixture = Fixture::new();
     let (session, _) = session_for(&fixture);
@@ -632,9 +651,8 @@ fn typing_sends_trusted_keystrokes_and_shortcuts_stay_on_the_focused_field() {
     let fixture = Fixture::new();
     let (session, _) = session_for(&fixture);
     let main = main_of(&session, &fixture.page_id);
-    assert!(wait_until(&session, &main, "Typed", WaitCondition::Appears)
-        .error
-        .is_none());
+    let ready = wait_until(&session, &main, "Typed", WaitCondition::Appears);
+    assert!(ready.error.is_none(), "{ready:?}");
     let observed = observe(&session, &main);
     assert!(actions(&observed, "Typed").contains(&"type_text".to_string()));
     assert!(!actions(&observed, "Save").contains(&"type_text".to_string()));
@@ -685,14 +703,8 @@ fn typing_sends_trusted_keystrokes_and_shortcuts_stay_on_the_focused_field() {
     let undone = act_on(&session, &main, "textbox", "Typed", keys(&["ctrl", "z"]));
     assert!(undone.error.is_none(), "{undone:?}");
     assert_eq!(value(&observe(&session, &main), "Typed"), "Zé日");
-    // Shortcuts the browser itself would act on never reach the page.
-    for chord in [
-        &["ctrl", "t"][..],
-        &["ctrl", "w"],
-        &["F12"],
-        &["alt", "F4"],
-        &["ctrl", "shift", "n"],
-    ] {
+    // OS modifiers and function keys outside the supported set remain refused.
+    for chord in [&["F12"][..], &["alt", "F4"], &["ctrl", "Tab"]] {
         let refused = act_on(&session, &main, "textbox", "Typed", keys(chord));
         assert_eq!(refused.commit_state, CommitState::NotCommitted, "{chord:?}");
         assert_eq!(
@@ -711,6 +723,843 @@ fn typing_sends_trusted_keystrokes_and_shortcuts_stay_on_the_focused_field() {
     );
 }
 
+#[test]
+#[ignore = "requires isolated Chromium; set AAD_TEST_HEADED=1 to also verify native browser UI"]
+fn page_shortcuts_reach_editors_without_falling_back_to_browser_ui() {
+    let _serial = serial();
+    let headed = std::env::var("AAD_TEST_HEADED").as_deref() == Ok("1");
+    let fixture = Fixture::with_mode(false, headed);
+    let (session, _) = session_for(&fixture);
+    let main = main_of(&session, &fixture.page_id);
+    let ready = wait_until(&session, &main, "Typed", WaitCondition::Appears);
+    assert!(ready.error.is_none(), "{ready:?}");
+    assert_eq!(
+        page_value(
+            &fixture,
+            r#"document.title='AAD page shortcut fixture';
+        document.body.innerHTML='<textarea aria-label="Shortcut editor"></textarea><output aria-label="Shortcut effect">ready</output>';
+        window.keyEffects=[];window.editorHandlesKeys=false;
+        document.querySelector('textarea').addEventListener('keydown',e=>{
+            window.keyEffects.push(['down',e.key,e.ctrlKey,e.shiftKey,e.isTrusted]);
+            if(window.editorHandlesKeys){e.preventDefault();document.querySelector('output').value='handled:'+e.key;}
+        });
+        document.querySelector('textarea').addEventListener('keyup',e=>window.keyEffects.push(['up',e.key,e.ctrlKey,e.shiftKey,e.isTrusted]));true"#
+        ),
+        true
+    );
+    assert!(act_on(
+        &session,
+        &main,
+        "textbox",
+        "Shortcut editor",
+        Action::Focus {}
+    )
+    .error
+    .is_none());
+
+    // In headed validation a separate, read-only native provider checks the
+    // real Chrome application, including its toolbar and native dialogs.
+    let native = if headed {
+        let (backends, failures) = native::backends();
+        assert!(
+            failures.is_empty(),
+            "native UI verification unavailable: {failures:?}"
+        );
+        let backend = backends.into_iter().next().expect("native UI verifier");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let resource = loop {
+            let resources = backend.resources(Duration::from_secs(3)).unwrap();
+            if let Some(resource) = resources
+                .into_iter()
+                .find(|resource| resource.resource.metadata["process_id"] == fixture.child.id())
+            {
+                break resource;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "fixture browser never appeared in native accessibility"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        };
+        Some((backend, resource.selector))
+    } else {
+        None
+    };
+    let native_state = || -> Value {
+        let Some((backend, selector)) = &native else {
+            return Value::Null;
+        };
+        let observed = backend
+            .observe(selector, 2000, Duration::from_secs(5))
+            .unwrap();
+        assert_ne!(
+            observed["truncated"], true,
+            "native browser capture must be complete"
+        );
+        let nodes = observed["nodes"].as_array().unwrap();
+        assert!(
+            nodes
+                .iter()
+                .any(|node| node["name"] == "Shortcut editor" && node["states"]["focused"] == true),
+            "native focus left the fixture editor: {observed}"
+        );
+        json!(nodes
+            .iter()
+            .filter(|node| matches!(
+                node["role"].as_str(),
+                Some("window" | "frame" | "dialog" | "alert" | "alertdialog")
+            ))
+            .map(|node| json!([node["role"], node["name"]]))
+            .collect::<Vec<_>>())
+    };
+    let initial_native = native_state();
+    let initial_pages = targets(&session)
+        .iter()
+        .filter(|resource| resource["metadata"]["main_frame"] == true)
+        .count();
+    for handled in [true, false] {
+        assert_eq!(
+            page_value(
+                &fixture,
+                &format!("window.editorHandlesKeys={handled};true")
+            ),
+            true
+        );
+        for chord in [
+            &["ctrl", "k"][..],
+            &["ctrl", "s"],
+            &["ctrl", "f"],
+            &["ctrl", "p"],
+            &["ctrl", "l"],
+            &["ctrl", "t"],
+            &["ctrl", "w"],
+            &["ctrl", "shift", "n"],
+            &["ctrl", "shift", "i"],
+        ] {
+            assert_eq!(
+                page_value(
+                    &fixture,
+                    "window.keyEffects=[];document.querySelector('output').value='ready';true"
+                ),
+                true
+            );
+            let result = act_on(&session, &main, "textbox", "Shortcut editor", keys(chord));
+            assert!(
+                result.error.is_none(),
+                "{chord:?}, handler={handled}: {result:?}"
+            );
+            let shift = chord.contains(&"shift");
+            let letter = chord.last().unwrap();
+            let key = if shift {
+                letter.to_ascii_uppercase()
+            } else {
+                letter.to_string()
+            };
+            assert_eq!(
+                page_value(&fixture, "window.keyEffects"),
+                json!([
+                    ["down", key, true, shift, true],
+                    ["up", key, true, shift, true]
+                ])
+            );
+            assert_eq!(
+                page_value(&fixture, "document.querySelector('output').value"),
+                if handled {
+                    json!(format!("handled:{key}"))
+                } else {
+                    json!("ready")
+                }
+            );
+            assert_eq!(page_value(&fixture,"document.hasFocus() && document.activeElement===document.querySelector('textarea')"),true);
+            assert_eq!(page_value(&fixture, "location.href"), fixture.url);
+            assert_eq!(
+                targets(&session)
+                    .iter()
+                    .filter(|resource| resource["metadata"]["main_frame"] == true)
+                    .count(),
+                initial_pages
+            );
+            assert_eq!(
+                native_state(),
+                initial_native,
+                "browser window/dialog changed after {chord:?}"
+            );
+        }
+    }
+    eprintln!(
+        "page shortcut validation: headed={headed}, native_ui_checked={}",
+        native.is_some()
+    );
+}
+
+#[test]
+#[ignore = "requires isolated Chromium with its sandbox enabled; CI runs it explicitly"]
+fn a_timed_out_page_key_still_releases_before_any_more_typing() {
+    let _serial = serial();
+    let fixture = Fixture::new();
+    let (session, _) = session_for(&fixture);
+    let main = main_of(&session, &fixture.page_id);
+    let ready = wait_until(&session, &main, "Typed", WaitCondition::Appears);
+    assert!(ready.error.is_none(), "{ready:?}");
+    assert_eq!(
+        page_value(
+            &fixture,
+            r#"window.releaseProof=[];
+        const field=document.getElementById('typed');
+        field.addEventListener('keydown',e=>{window.releaseProof.push('down:'+e.key);if(e.ctrlKey&&e.key==='k'){const until=performance.now()+220;while(performance.now()<until){}}});
+        field.addEventListener('keyup',e=>window.releaseProof.push('up:'+e.key));true"#
+        ),
+        true
+    );
+    let observed = observe(&session, &main);
+    let target = find(&session, &observed, "textbox", "Typed");
+    let response = call_within(
+        &session,
+        Operation::Act {
+            target,
+            action: keys(&["ctrl", "k"]),
+            verify: None,
+        },
+        150,
+    );
+    assert!(
+        response.error.is_some(),
+        "busy renderer must exceed the request deadline"
+    );
+    assert_eq!(
+        response.error.as_ref().unwrap()["details"]["key_released"],
+        true,
+        "{response:?}"
+    );
+    assert_eq!(
+        page_value(&fixture, "window.releaseProof"),
+        json!(["down:k", "up:k"])
+    );
+    let typed = act_on(
+        &session,
+        &main,
+        "textbox",
+        "Typed",
+        type_text("z", Some(TypeMode::Keys)),
+    );
+    assert!(typed.error.is_none(), "{typed:?}");
+    assert_eq!(value(&observe(&session, &main), "Typed"), "z");
+    assert_eq!(
+        page_value(&fixture, "window.releaseProof"),
+        json!(["down:k", "up:k", "down:z", "up:z"])
+    );
+}
+
+#[test]
+#[ignore = "requires isolated Chromium with its sandbox enabled; CI runs it explicitly"]
+fn closed_shadow_hosts_are_observed_visual_surfaces_with_trusted_pointer_input() {
+    use base64::Engine;
+    let _serial = serial();
+    let fixture = Fixture::new();
+    let (session, _) = session_for(&fixture);
+    let main = main_of(&session, &fixture.page_id);
+    let ready = wait_until(&session, &main, "Typed", WaitCondition::Appears);
+    assert!(ready.error.is_none(), "{ready:?}");
+    assert_eq!(
+        page_value(
+            &fixture,
+            r#"document.body.innerHTML='<x-private aria-label="Private panel" style="display:block;width:300px;height:120px"></x-private><x-plain aria-label="Plain custom element" style="display:block;width:300px;height:30px"></x-plain>';
+        window.privateEvents=[];
+        const host=document.querySelector('x-private'),root=host.attachShadow({mode:'closed'});
+        root.innerHTML='<canvas aria-label="Internal drawing" width="300" height="120" style="display:block"></canvas>';
+        const canvas=root.querySelector('canvas'),ctx=canvas.getContext('2d');
+        window.privateCanvas=canvas;
+        canvas.addEventListener('mousedown',e=>{window.privateEvents.push(['down',e.isTrusted]);ctx.fillStyle='red';ctx.fillRect(0,0,300,120);});
+        canvas.addEventListener('mousemove',e=>{if(e.buttons===1){ctx.fillStyle='blue';ctx.fillRect(e.offsetX-4,e.offsetY-4,8,8);}});
+        canvas.addEventListener('mouseup',e=>window.privateEvents.push(['up',e.isTrusted]));
+        canvas.addEventListener('wheel',e=>{e.preventDefault();window.privateEvents.push(['wheel',e.deltaY,e.isTrusted]);},{passive:false});
+        host.shadowRoot===null"#
+        ),
+        true
+    );
+    let observed = observe(&session, &main);
+    assert!(!observed["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|n| n["name"] == "Internal drawing"));
+    assert_eq!(node(&observed, "Private panel")["surface"], "closed_shadow");
+    let capabilities = &node(&observed, "Private panel")["capabilities"];
+    for name in ["click", "hover", "scroll", "drag"] {
+        assert!(
+            capabilities.as_array().unwrap().contains(&json!(name)),
+            "{capabilities}"
+        );
+    }
+    assert!(!capabilities.as_array().unwrap().contains(&json!("fill")));
+    assert!(!capabilities
+        .as_array()
+        .unwrap()
+        .contains(&json!("type_text")));
+    assert!(actions(&observed, "Plain custom element").is_empty());
+    let target =
+        serde_json::from_value(node(&observed, "Private panel")["target"].clone()).unwrap();
+    let clicked = act(&session, target, Action::click());
+    assert!(clicked.error.is_none(), "{clicked:?}");
+    assert_eq!(
+        page_value(&fixture, "window.privateEvents"),
+        json!([["down", true], ["up", true]])
+    );
+
+    // Decode the public screenshot independently of DOM and event assertions.
+    let observed = observe(&session, &main);
+    let target =
+        serde_json::from_value(node(&observed, "Private panel")["target"].clone()).unwrap();
+    let captured = call(&session, Operation::Capture { target });
+    assert!(captured.error.is_none(), "{captured:?}");
+    let captured = captured.data.unwrap();
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(captured["data"].as_str().unwrap())
+        .unwrap();
+    let image = image::load_from_memory(&bytes).unwrap().into_rgb8();
+    assert_eq!(image.dimensions(), (300, 120));
+    assert_eq!(image.get_pixel(150, 60).0, [255, 0, 0]);
+
+    // Drilling into the observed host preserves its capability and anchor.
+    let observed = observe(&session, &main);
+    let target =
+        serde_json::from_value(node(&observed, "Private panel")["target"].clone()).unwrap();
+    let scoped = observe_view(
+        &session,
+        &main,
+        View {
+            scope_target: Some(target),
+            ..Default::default()
+        },
+    );
+    assert!(scoped.error.is_none(), "{scoped:?}");
+    let scoped = scoped.data.unwrap();
+    assert_eq!(scoped["nodes"].as_array().unwrap().len(), 1);
+    let target: Target =
+        serde_json::from_value(node(&scoped, "Private panel")["target"].clone()).unwrap();
+    let dragged = act(
+        &session,
+        target.clone(),
+        Action::Drag {
+            path: Vec::new(),
+            to: target,
+            button: None,
+            fraction: Some(Fraction { fx: 0.2, fy: 0.5 }),
+            to_fraction: Some(Fraction { fx: 0.8, fy: 0.5 }),
+            modifiers: Vec::new(),
+            hold_ms: None,
+        },
+    );
+    assert!(dragged.error.is_none(), "{dragged:?}");
+    assert_eq!(
+        page_value(
+            &fixture,
+            "Array.from(window.privateCanvas.getContext('2d').getImageData(150,60,1,1).data)"
+        ),
+        json!([0, 0, 255, 255])
+    );
+    assert_eq!(page_value(&fixture, "window.privateEvents=[];true"), true);
+    let observed = observe(&session, &main);
+    let target =
+        serde_json::from_value(node(&observed, "Private panel")["target"].clone()).unwrap();
+    let scrolled = act(
+        &session,
+        target,
+        Action::Scroll {
+            direction: Direction::Down,
+            notches: Some(1),
+            fraction: None,
+        },
+    );
+    assert!(scrolled.error.is_none(), "{scrolled:?}");
+    let until = Instant::now() + Duration::from_secs(2);
+    loop {
+        let events = page_value(&fixture, "window.privateEvents");
+        if events == json!([["wheel", 100, true]]) {
+            break;
+        }
+        assert!(Instant::now() < until, "{events}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    let observed = observe(&session, &main);
+    let target =
+        serde_json::from_value(node(&observed, "Private panel")["target"].clone()).unwrap();
+    assert_eq!(page_value(&fixture,"window.privateEvents=[];const cover=document.createElement('div');cover.id='cover';cover.style='position:fixed;inset:0;background:white;z-index:999';document.body.append(cover);true"),true);
+    assert_eq!(
+        act(&session, target, Action::click()).error.unwrap()["code"],
+        "CONTROL.OCCLUDED"
+    );
+    assert_eq!(page_value(&fixture, "window.privateEvents"), json!([]));
+    assert_eq!(
+        page_value(&fixture, "document.getElementById('cover').remove();true"),
+        true
+    );
+
+    // The marker belongs to this element identity, never its tag or name.
+    let observed = observe(&session, &main);
+    let target =
+        serde_json::from_value(node(&observed, "Private panel")["target"].clone()).unwrap();
+    assert_eq!(page_value(&fixture,"const old=document.querySelector('x-private');old.replaceWith(old.cloneNode(false));true"),true);
+    assert_eq!(
+        act(&session, target, Action::click()).error.unwrap()["code"],
+        "CONTROL.STALE_TARGET"
+    );
+    let replaced = observe(&session, &main);
+    assert!(node(&replaced, "Private panel")["surface"].is_null());
+    assert!(actions(&replaced, "Private panel").is_empty());
+    // Truncated observations must still identify hosts in their retained nodes.
+    assert_eq!(page_value(&fixture,"document.querySelector('x-private').attachShadow({mode:'closed'}).innerHTML='<button>Inside</button>';for(let i=0;i<2100;i++){const p=document.createElement('p');p.textContent='row';document.body.append(p);}true"),true);
+    let large = call(
+        &session,
+        Operation::Observe {
+            resource_id: main.clone(),
+            max_nodes: 2000,
+            view: Default::default(),
+        },
+    );
+    assert!(large.error.is_none(), "{large:?}");
+    let large = large.data.unwrap();
+    assert_eq!(large["nodes"].as_array().unwrap().len(), 2000);
+    assert_eq!(large["truncated"], true);
+    assert_eq!(node(&large, "Private panel")["surface"], "closed_shadow");
+    assert_eq!(page_value(&fixture,"for(let i=0;i<10000;i++){const p=document.createElement('p');p.textContent='row';document.body.append(p);}true"),true);
+    let large = observe(&session, &main);
+    assert_eq!(
+        large["metadata"]["closed_shadow_inspection"]["complete"],
+        false
+    );
+    let host = serde_json::from_value(node(&large, "Private panel")["target"].clone()).unwrap();
+    let scoped = observe_view(
+        &session,
+        &main,
+        View {
+            scope_target: Some(host),
+            ..Default::default()
+        },
+    );
+    assert!(scoped.error.is_none(), "{scoped:?}");
+    let scoped = scoped.data.unwrap();
+    assert_eq!(
+        scoped["metadata"]["closed_shadow_inspection"]["complete"],
+        true
+    );
+    assert_eq!(node(&scoped, "Private panel")["surface"], "closed_shadow");
+}
+
+#[test]
+#[ignore = "requires isolated Chromium with its sandbox enabled; CI runs it explicitly"]
+fn closed_shadow_passwords_block_surface_input_and_covering_captures() {
+    let _serial = serial();
+    let fixture = Fixture::new();
+    let (session, _) = session_for(&fixture);
+    let main = main_of(&session, &fixture.page_id);
+    let ready = wait_until(&session, &main, "Typed", WaitCondition::Appears);
+    assert!(ready.error.is_none(), "{ready:?}");
+    assert_eq!(
+        page_value(
+            &fixture,
+            r#"document.body.innerHTML='<div aria-label="Private login" tabindex="0" style="display:block;width:300px;height:120px"></div>';
+        window.privateHost=document.querySelector('div');window.privateRoot=privateHost.attachShadow({mode:'closed'});
+        privateRoot.innerHTML='<button>Login</button>';window.privateClicks=0;privateHost.addEventListener('click',()=>window.privateClicks++);true"#
+        ),
+        true
+    );
+    let target = |observed: &Value| {
+        serde_json::from_value::<Target>(node(observed, "Private login")["target"].clone()).unwrap()
+    };
+    let observed = observe(&session, &main);
+    let before = target(&observed);
+    assert_eq!(
+        page_value(
+            &fixture,
+            r#"window.privatePassword=document.createElement('input');privatePassword.type='password';privatePassword.value='closed-synthetic-private';privateRoot.append(privatePassword);true"#
+        ),
+        true
+    );
+    assert_eq!(
+        act(&session, before, Action::click()).error.unwrap()["code"],
+        "CONTROL.ACTION_UNSUPPORTED"
+    );
+    assert_eq!(page_value(&fixture, "window.privateClicks"), 0);
+    let observed = observe(&session, &main);
+    assert_eq!(
+        node(&observed, "Private login")["states"]["protected"],
+        true
+    );
+    assert_eq!(node(&observed, "Private login")["capabilities"], json!([]));
+    assert!(!observed.to_string().contains("closed-synthetic-private"));
+    assert_eq!(
+        act(&session, target(&observed), keys(&["a"]))
+            .error
+            .unwrap()["code"],
+        "POLICY.DENIED"
+    );
+    assert_eq!(
+        call(
+            &session,
+            Operation::Capture {
+                target: target(&observed)
+            }
+        )
+        .error
+        .unwrap()["code"],
+        "CONTROL.ACTION_UNSUPPORTED"
+    );
+    assert_eq!(
+        capture_document(&session, &main).error.unwrap()["code"],
+        "CONTROL.ACTION_UNSUPPORTED"
+    );
+
+    // A reveal toggle and a fresh observation must not erase known protection.
+    assert_eq!(
+        page_value(&fixture, "privatePassword.type='text';true"),
+        true
+    );
+    let revealed = observe(&session, &main);
+    assert_eq!(
+        node(&revealed, "Private login")["states"]["protected"],
+        true
+    );
+    assert_eq!(
+        capture_document(&session, &main).error.unwrap()["code"],
+        "CONTROL.ACTION_UNSUPPORTED"
+    );
+    // Moving the revealed field outside the host retains its identity too.
+    assert_eq!(page_value(&fixture,"privatePassword.setAttribute('aria-label','Moved private field');document.body.append(privatePassword);true"),true);
+    let moved = observe(&session, &main);
+    assert_eq!(node(&moved, "Moved private field")["value"], Value::Null);
+    assert_eq!(
+        capture_document(&session, &main).error.unwrap()["code"],
+        "CONTROL.ACTION_UNSUPPORTED"
+    );
+    assert_eq!(page_value(&fixture, "privatePassword.remove();true"), true);
+    assert!(capture_document(&session, &main).error.is_none());
+
+    // Every private field must be remembered, not just the first match.
+    assert_eq!(page_value(&fixture,"window.privatePair=['Private one','Private two'].map(name=>{const input=document.createElement('input');input.type='password';input.value='pair-private';input.setAttribute('aria-label',name);privateRoot.append(input);return input;});true"),true);
+    observe(&session, &main);
+    assert_eq!(
+        page_value(
+            &fixture,
+            "for(const input of privatePair){input.type='text';document.body.append(input);}true"
+        ),
+        true
+    );
+    let moved = observe(&session, &main);
+    for name in ["Private one", "Private two"] {
+        assert_eq!(node(&moved, name)["value"], Value::Null, "{name}");
+        assert_eq!(node(&moved, name)["states"]["protected"], true, "{name}");
+    }
+    assert!(!moved.to_string().contains("pair-private"));
+    assert_eq!(
+        capture_document(&session, &main).error.unwrap()["code"],
+        "CONTROL.ACTION_UNSUPPORTED"
+    );
+    assert_eq!(
+        page_value(
+            &fixture,
+            "for(const input of privatePair)input.remove();true"
+        ),
+        true
+    );
+    assert!(capture_document(&session, &main).error.is_none());
+
+    // A newly attached nested closed root is inspected before the next write.
+    let observed = observe(&session, &main);
+    let before = target(&observed);
+    assert_eq!(page_value(&fixture,"const nested=document.createElement('div');privateRoot.append(nested);nested.attachShadow({mode:'closed'}).innerHTML='<input type=password>';true"),true);
+    assert_eq!(
+        act(&session, before, Action::click()).error.unwrap()["code"],
+        "CONTROL.ACTION_UNSUPPORTED"
+    );
+    assert_eq!(
+        capture_document(&session, &main).error.unwrap()["code"],
+        "CONTROL.ACTION_UNSUPPORTED"
+    );
+    assert_eq!(
+        page_value(&fixture, "privateRoot.replaceChildren();true"),
+        true
+    );
+    assert!(capture_document(&session, &main).error.is_none());
+
+    // An unobserved child frame may still appear in a main-frame screenshot.
+    assert_eq!(page_value(&fixture,"window.privateFrame=document.createElement('iframe');privateFrame.src='/frame';document.body.append(privateFrame);true"),true);
+    let until = Instant::now() + Duration::from_secs(3);
+    loop {
+        if page_value(
+            &fixture,
+            "!!privateFrame.contentDocument.querySelector('input')",
+        ) == true
+        {
+            break;
+        }
+        assert!(Instant::now() < until, "child fixture did not load");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(page_value(&fixture,"const inner=privateFrame.contentDocument.createElement('div');inner.style='width:120px;height:40px';privateFrame.contentDocument.body.append(inner);inner.attachShadow({mode:'closed'}).innerHTML='<input type=password>';true"),true);
+    assert_eq!(
+        capture_document(&session, &main).error.unwrap()["code"],
+        "CONTROL.ACTION_UNSUPPORTED"
+    );
+    assert_eq!(page_value(&fixture, "privateFrame.remove();true"), true);
+    assert!(capture_document(&session, &main).error.is_none());
+}
+
+#[test]
+#[ignore = "requires isolated Chromium with its sandbox enabled; CI runs it explicitly"]
+fn fractions_stay_relative_to_the_full_element_when_the_viewport_clips_it() {
+    let _serial = serial();
+    let fixture = Fixture::new();
+    let (session, _) = session_for(&fixture);
+    let main = main_of(&session, &fixture.page_id);
+    let ready = wait_until(&session, &main, "Typed", WaitCondition::Appears);
+    assert!(ready.error.is_none(), "{ready:?}");
+    assert_eq!(
+        page_value(
+            &fixture,
+            r#"document.body.innerHTML='<canvas aria-label="Clipped surface" width="1200" height="120" style="position:fixed;left:-300px;top:30px"></canvas>';
+        window.fractionEvents=[];const surface=document.querySelector('canvas');
+        for(const kind of ['mousedown','mouseup'])surface.addEventListener(kind,e=>{
+            const box=surface.getBoundingClientRect();
+            window.fractionEvents.push([kind,Math.round(e.clientX-box.left),Math.round(e.clientY-box.top),e.isTrusted]);
+        });true"#
+        ),
+        true
+    );
+    let click = |fraction| Action::Click {
+        button: None,
+        count: None,
+        fraction,
+        modifiers: Vec::new(),
+        hold_ms: None,
+    };
+    let clicked = act_on(
+        &session,
+        &main,
+        "canvas",
+        "Clipped surface",
+        click(Some(Fraction { fx: 0.5, fy: 0.5 })),
+    );
+    assert!(clicked.error.is_none(), "{clicked:?}");
+    assert_eq!(
+        page_value(&fixture, "window.fractionEvents"),
+        json!([["mousedown", 600, 60, true], ["mouseup", 600, 60, true]])
+    );
+    assert_eq!(page_value(&fixture, "window.fractionEvents=[];true"), true);
+    let invisible = act_on(
+        &session,
+        &main,
+        "canvas",
+        "Clipped surface",
+        click(Some(Fraction { fx: 0.1, fy: 0.5 })),
+    );
+    assert_eq!(invisible.error.unwrap()["code"], "CONTROL.OCCLUDED");
+    assert_eq!(page_value(&fixture, "window.fractionEvents"), json!([]));
+    let observed = observe(&session, &main);
+    let surface = find(&session, &observed, "canvas", "Clipped surface");
+    let dragged = act(
+        &session,
+        surface.clone(),
+        Action::Drag {
+            path: Vec::new(),
+            to: surface,
+            button: None,
+            fraction: Some(Fraction { fx: 0.3, fy: 0.5 }),
+            to_fraction: Some(Fraction { fx: 0.8, fy: 0.5 }),
+            modifiers: Vec::new(),
+            hold_ms: None,
+        },
+    );
+    assert!(dragged.error.is_none(), "{dragged:?}");
+    assert_eq!(
+        page_value(&fixture, "window.fractionEvents"),
+        json!([["mousedown", 360, 60, true], ["mouseup", 960, 60, true]])
+    );
+    assert_eq!(page_value(&fixture, "window.fractionEvents=[];true"), true);
+    // No explicit fraction still picks a visible point.
+    let clicked = act_on(&session, &main, "canvas", "Clipped surface", click(None));
+    assert!(clicked.error.is_none(), "{clicked:?}");
+    assert_eq!(page_value(&fixture, "window.fractionEvents.length"), 2);
+}
+
+#[test]
+#[ignore = "requires isolated Chromium with its sandbox enabled; CI runs it explicitly"]
+fn bounded_holds_have_real_durations_and_release_on_focus_occlusion_and_cancel() {
+    let _serial = serial();
+    let fixture = Fixture::new();
+    let (session, _) = session_for(&fixture);
+    let session = Arc::new(session);
+    let main = main_of(&session, &fixture.page_id);
+    let ready = wait_until(&session, &main, "Typed", WaitCondition::Appears);
+    assert!(ready.error.is_none(), "{ready:?}");
+    assert_eq!(
+        page_value(
+            &fixture,
+            r#"document.body.innerHTML='<input aria-label="Hold editor"><input aria-label="Other"><canvas aria-label="Hold surface" width="300" height="100" style="display:block"></canvas>';
+        window.holdEvents=[];window.changeDuringHold='';
+        document.addEventListener('keydown',e=>{
+            window.holdEvents.push(['keyDown',performance.now(),e.isTrusted,e.repeat]);
+            if(window.changeDuringHold==='focus')setTimeout(()=>document.querySelectorAll('input')[1].focus(),50);
+        },true);
+        document.addEventListener('keyup',e=>window.holdEvents.push(['keyUp',performance.now(),e.isTrusted,e.repeat]),true);
+        document.addEventListener('mousedown',e=>{
+            window.holdEvents.push(['mouseDown',performance.now(),e.isTrusted,e.buttons]);
+            if(window.changeDuringHold==='overlay')setTimeout(()=>{
+                const cover=document.createElement('div');cover.id='cover';cover.style='position:fixed;inset:0;background:white;z-index:9999';document.body.appendChild(cover);
+            },50);
+        },true);
+        document.addEventListener('mousemove',e=>{if(e.buttons)window.holdEvents.push(['mouseMove',performance.now(),e.isTrusted,e.buttons]);},true);
+        document.addEventListener('mouseup',e=>window.holdEvents.push(['mouseUp',performance.now(),e.isTrusted,e.buttons]),true);true"#
+        ),
+        true
+    );
+    let held_key = || Action::Key {
+        keys: vec!["ctrl".into(), "k".into()],
+        hold_ms: Some(180),
+    };
+    let held_click = || Action::Click {
+        button: None,
+        count: None,
+        fraction: None,
+        modifiers: Vec::new(),
+        hold_ms: Some(180),
+    };
+    for (role, name, action, down, up) in [
+        ("textbox", "Hold editor", held_key(), "keyDown", "keyUp"),
+        (
+            "canvas",
+            "Hold surface",
+            held_click(),
+            "mouseDown",
+            "mouseUp",
+        ),
+    ] {
+        assert_eq!(page_value(&fixture, "window.holdEvents=[];true"), true);
+        let result = act_on(&session, &main, role, name, action);
+        assert!(result.error.is_none(), "{result:?}");
+        let proof = page_value(&fixture, "window.holdEvents");
+        let events = proof.as_array().unwrap();
+        assert_eq!(events.len(), 2, "{proof}");
+        assert_eq!(events[0][0], down);
+        assert_eq!(events[1][0], up);
+        assert!(
+            events[1][1].as_f64().unwrap() - events[0][1].as_f64().unwrap() >= 170.0,
+            "{proof}"
+        );
+        assert!(events.iter().all(|event| event[2] == true));
+    }
+    assert_eq!(page_value(&fixture, "window.holdEvents=[];true"), true);
+    let observed = observe(&session, &main);
+    let surface = find(&session, &observed, "canvas", "Hold surface");
+    let result = act(
+        &session,
+        surface.clone(),
+        Action::Drag {
+            path: Vec::new(),
+            to: surface,
+            button: None,
+            fraction: Some(Fraction { fx: 0.2, fy: 0.5 }),
+            to_fraction: Some(Fraction { fx: 0.8, fy: 0.5 }),
+            modifiers: Vec::new(),
+            hold_ms: Some(180),
+        },
+    );
+    assert!(result.error.is_none(), "{result:?}");
+    let proof = page_value(&fixture, "window.holdEvents");
+    let events = proof.as_array().unwrap();
+    assert_eq!(events[0][0], "mouseDown");
+    assert_eq!(events[1][0], "mouseMove");
+    assert!(
+        events[1][1].as_f64().unwrap() - events[0][1].as_f64().unwrap() >= 170.0,
+        "{proof}"
+    );
+    assert_eq!(events.last().unwrap()[0], "mouseUp");
+    assert_eq!(events.last().unwrap()[3], 0);
+
+    // The deadline includes room for release; refuse before any input.
+    assert_eq!(page_value(&fixture, "window.holdEvents=[];true"), true);
+    let observed = observe(&session, &main);
+    let response = call_within(
+        &session,
+        Operation::Act {
+            target: find(&session, &observed, "textbox", "Hold editor"),
+            action: held_key(),
+            verify: None,
+        },
+        250,
+    );
+    assert_eq!(response.error.unwrap()["code"], "CONTROL.TIMEOUT");
+    assert_eq!(page_value(&fixture, "window.holdEvents"), json!([]));
+
+    assert_eq!(
+        page_value(
+            &fixture,
+            "window.changeDuringHold='focus';window.holdEvents=[];true"
+        ),
+        true
+    );
+    let result = act_on(&session, &main, "textbox", "Hold editor", held_key());
+    assert_eq!(result.error.as_ref().unwrap()["code"], "CONTROL.FOCUS_LOST");
+    assert_eq!(result.error.unwrap()["details"]["key_released"], true);
+    assert_eq!(
+        page_value(&fixture, "window.holdEvents.map(e=>e[0])"),
+        json!(["keyDown", "keyUp"])
+    );
+
+    assert_eq!(
+        page_value(
+            &fixture,
+            "window.changeDuringHold='overlay';window.holdEvents=[];true"
+        ),
+        true
+    );
+    let result = act_on(&session, &main, "canvas", "Hold surface", held_click());
+    assert_eq!(result.error.as_ref().unwrap()["code"], "CONTROL.OCCLUDED");
+    assert_eq!(
+        result.error.unwrap()["details"]["pointer_button_released"],
+        true
+    );
+    assert_eq!(
+        page_value(&fixture, "window.holdEvents.map(e=>e[0])"),
+        json!(["mouseDown", "mouseUp"])
+    );
+    assert_eq!(page_value(&fixture,"document.getElementById('cover').remove();window.changeDuringHold='';window.holdEvents=[];true"),true);
+
+    // Cancelling during a hold must still produce the matching release.
+    let observed = observe(&session, &main);
+    let request = Request::new(
+        Some(session.id().into()),
+        Operation::Act {
+            target: find(&session, &observed, "textbox", "Hold editor"),
+            action: Action::Key {
+                keys: vec!["ctrl".into(), "k".into()],
+                hold_ms: Some(1500),
+            },
+            verify: None,
+        },
+    );
+    let request_id = request.request_id.clone();
+    let worker_session = session.clone();
+    let worker = std::thread::spawn(move || worker_session.execute(&request));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while page_value(&fixture, "window.holdEvents.length>0") != true {
+        assert!(Instant::now() < deadline, "held key was never pressed");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(session.cancel(&request_id));
+    let response = worker.join().unwrap();
+    assert_eq!(
+        response.error.as_ref().unwrap()["code"],
+        "CONTROL.CANCELLED"
+    );
+    assert_eq!(response.error.unwrap()["details"]["key_released"], true);
+    assert_eq!(
+        page_value(&fixture, "window.holdEvents.map(e=>e[0])"),
+        json!(["keyDown", "keyUp"])
+    );
+}
+
 fn drag_to(session: &Session, main: &str, from: &str, (role, to): (&str, &str)) -> Response {
     let observed = observe(session, main);
     let source = find(session, &observed, "listitem", from);
@@ -719,12 +1568,656 @@ fn drag_to(session: &Session, main: &str, from: &str, (role, to): (&str, &str)) 
         session,
         source,
         Action::Drag {
+            path: Vec::new(),
+            hold_ms: None,
+            modifiers: Vec::new(),
             to,
             button: None,
             fraction: None,
             to_fraction: Some(Fraction { fx: 0.5, fy: 0.8 }),
         },
     )
+}
+
+fn surface_path(target: &Target, points: &[(f64, f64)], hold_ms: Option<u64>) -> Action {
+    Action::Drag {
+        to: target.clone(),
+        button: None,
+        modifiers: vec![PointerModifier::Ctrl],
+        hold_ms,
+        fraction: Some(Fraction { fx: 0.1, fy: 0.1 }),
+        to_fraction: Some(Fraction { fx: 0.9, fy: 0.1 }),
+        path: points
+            .iter()
+            .map(|&(fx, fy)| DragAnchor {
+                target: target.clone(),
+                fraction: Fraction { fx, fy },
+            })
+            .collect(),
+    }
+}
+
+#[test]
+#[ignore = "requires isolated Chromium with its sandbox enabled; CI runs it explicitly"]
+fn drag_paths_draw_the_requested_shape_on_canvas_and_closed_shadow_surfaces() {
+    use base64::Engine;
+    let _serial = serial();
+    let fixture = Fixture::new();
+    let (session, _) = session_for(&fixture);
+    let main = main_of(&session, &fixture.page_id);
+    let ready = wait_until(&session, &main, "Typed", WaitCondition::Appears);
+    assert!(ready.error.is_none(), "{ready:?}");
+    for closed in [false, true] {
+        assert_eq!(
+            page_value(
+                &fixture,
+                &format!(
+                    r#"(() => {{
+            document.body.innerHTML='';
+            const host=document.createElement({tag});host.setAttribute('aria-label','Path surface');
+            host.style='display:block;width:300px;height:200px';document.body.append(host);
+            const canvas={canvas};canvas.width=300;canvas.height=200;canvas.style='display:block';
+            window.pathEvents=[];const ink=canvas.getContext('2d');
+            for(const type of ['mousedown','mousemove','mouseup'])canvas.addEventListener(type,e=>{{
+                if(type==='mousemove'&&e.buttons!==1)return;
+                window.pathEvents.push([type,e.offsetX,e.offsetY,e.buttons,e.ctrlKey,e.isTrusted,performance.now()]);
+                if(type==='mousedown'){{ink.beginPath();ink.moveTo(e.offsetX,e.offsetY);}}
+                if(type==='mousemove'){{ink.strokeStyle='blue';ink.lineWidth=6;ink.lineTo(e.offsetX,e.offsetY);ink.stroke();}}
+            }});return true;
+        }})()"#,
+                    tag = if closed { "'x-path'" } else { "'canvas'" },
+                    canvas = if closed {
+                        "host.attachShadow({mode:'closed'}).appendChild(document.createElement('canvas'))"
+                    } else {
+                        "host"
+                    }
+                )
+            ),
+            true
+        );
+        let observed = observe(&session, &main);
+        let target: Target =
+            serde_json::from_value(node(&observed, "Path surface")["target"].clone()).unwrap();
+        let result = act(
+            &session,
+            target.clone(),
+            surface_path(&target, &[(0.1, 0.9), (0.9, 0.9)], Some(100)),
+        );
+        assert!(result.error.is_none(), "closed={closed}: {result:?}");
+        assert_eq!(result.data.unwrap()["backend_result"]["steps"], 3);
+        let events = page_value(&fixture, "window.pathEvents");
+        let events = events.as_array().unwrap();
+        assert_eq!(events.len(), 5, "{events:?}");
+        for (event, (kind, x, y, buttons)) in events.iter().zip([
+            ("mousedown", 30, 20, 1),
+            ("mousemove", 30, 180, 1),
+            ("mousemove", 270, 180, 1),
+            ("mousemove", 270, 20, 1),
+            ("mouseup", 270, 20, 0),
+        ]) {
+            assert_eq!(
+                &event.as_array().unwrap()[..6],
+                &[
+                    json!(kind),
+                    json!(x),
+                    json!(y),
+                    json!(buttons),
+                    json!(true),
+                    json!(true)
+                ]
+            );
+        }
+        assert!(events[1][6].as_f64().unwrap() - events[0][6].as_f64().unwrap() >= 100.0);
+        for index in 2..4 {
+            assert!(
+                events[index][6].as_f64().unwrap() - events[index - 1][6].as_f64().unwrap() >= 15.0
+            );
+        }
+        let observed = observe(&session, &main);
+        let target =
+            serde_json::from_value(node(&observed, "Path surface")["target"].clone()).unwrap();
+        let capture = call(&session, Operation::Capture { target });
+        assert!(capture.error.is_none(), "{capture:?}");
+        let capture = capture.data.unwrap();
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(capture["data"].as_str().unwrap())
+            .unwrap();
+        let image = image::load_from_memory(&bytes).unwrap().into_rgb8();
+        for (x, y) in [(30, 100), (150, 180), (270, 100)] {
+            assert_eq!(image.get_pixel(x, y).0, [0, 0, 255]);
+        }
+        assert_eq!(
+            image.get_pixel(150, 20).0,
+            [255, 255, 255],
+            "a direct line would paint the top edge"
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires isolated Chromium with its sandbox enabled; CI runs it explicitly"]
+fn drag_paths_preflight_every_anchor_and_release_after_mutation_timeout_or_cancel() {
+    let _serial = serial();
+    let fixture = Fixture::new();
+    let (session, _) = session_for(&fixture);
+    let session = Arc::new(session);
+    let main = main_of(&session, &fixture.page_id);
+    let ready = wait_until(&session, &main, "Typed", WaitCondition::Appears);
+    assert!(ready.error.is_none(), "{ready:?}");
+    assert_eq!(
+        page_value(
+            &fixture,
+            r#"document.body.innerHTML='<canvas aria-label="Path surface" width="300" height="200" style="display:block"></canvas>';
+        window.pathCanvas=document.querySelector('canvas');window.pathEvents=[];window.pathFailure='';
+        document.addEventListener('mousedown',e=>window.pathEvents.push(['down',e.buttons,e.isTrusted]));
+        document.addEventListener('mouseup',e=>window.pathEvents.push(['up',e.buttons,e.isTrusted]));
+        pathCanvas.addEventListener('mousemove',e=>{
+            if(e.buttons!==1)return;window.pathEvents.push(['move',e.buttons,e.isTrusted]);
+            if(window.pathEvents.filter(e=>e[0]==='move').length!==1)return;
+            if(window.pathFailure==='overlay'){const b=pathCanvas.getBoundingClientRect(),cover=document.createElement('div');cover.id='path-cover';cover.style=`position:fixed;left:${b.left+250}px;top:${b.top+160}px;width:40px;height:40px;background:white;z-index:999`;document.body.append(cover);}
+            if(window.pathFailure==='move')pathCanvas.style.marginLeft='20px';
+            if(window.pathFailure==='timeout'){const until=performance.now()+400;while(performance.now()<until){}}
+        });true"#
+        ),
+        true
+    );
+    let get_target = || {
+        let observed = observe(&session, &main);
+        serde_json::from_value::<Target>(node(&observed, "Path surface")["target"].clone()).unwrap()
+    };
+    let target = get_target();
+    let refused = call_within(
+        &session,
+        Operation::Act {
+            target: target.clone(),
+            action: surface_path(&target, &[(0.1, 0.9), (0.9, 0.9)], None),
+            verify: None,
+        },
+        100,
+    );
+    assert_eq!(refused.error.unwrap()["code"], "CONTROL.TIMEOUT");
+    assert_eq!(page_value(&fixture, "window.pathEvents"), json!([]));
+    assert_eq!(page_value(&fixture, "pathCanvas.draggable=true;true"), true);
+    let target = get_target();
+    let refused = act(
+        &session,
+        target.clone(),
+        surface_path(&target, &[(0.1, 0.9)], None),
+    );
+    assert_eq!(refused.error.unwrap()["code"], "CONTROL.ACTION_UNSUPPORTED");
+    assert_eq!(page_value(&fixture, "window.pathEvents"), json!([]));
+    assert_eq!(page_value(&fixture,"pathCanvas.draggable=false;const cover=document.createElement('div');cover.id='path-cover';cover.style='position:fixed;left:20px;top:170px;width:50px;height:40px;background:white;z-index:999';document.body.append(cover);true"),true);
+    let target = get_target();
+    let refused = act(
+        &session,
+        target.clone(),
+        surface_path(&target, &[(0.1, 0.9)], None),
+    );
+    assert_eq!(refused.error.unwrap()["code"], "CONTROL.OCCLUDED");
+    assert_eq!(page_value(&fixture, "window.pathEvents"), json!([]));
+    assert_eq!(
+        page_value(
+            &fixture,
+            "document.getElementById('path-cover').remove();true"
+        ),
+        true
+    );
+    for (mode, code) in [
+        ("overlay", "CONTROL.OCCLUDED"),
+        ("move", "CONTROL.STALE_TARGET"),
+        ("timeout", "BROWSER.CDP_ERROR"),
+    ] {
+        assert_eq!(
+            page_value(
+                &fixture,
+                &format!("window.pathEvents=[];window.pathFailure='{mode}';true")
+            ),
+            true
+        );
+        let target = get_target();
+        let result = call_within(
+            &session,
+            Operation::Act {
+                target: target.clone(),
+                action: surface_path(&target, &[(0.1, 0.9), (0.9, 0.9)], None),
+                verify: None,
+            },
+            if mode == "timeout" { 300 } else { 3000 },
+        );
+        assert_eq!(result.error.as_ref().unwrap()["code"], code, "{result:?}");
+        if mode == "timeout" {
+            assert!(
+                result.error.as_ref().unwrap()["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("deadline"),
+                "{result:?}"
+            );
+        }
+        assert_eq!(
+            result.error.unwrap()["details"]["pointer_button_released"],
+            true
+        );
+        assert_eq!(
+            page_value(&fixture, "window.pathEvents"),
+            json!([["down", 1, true], ["move", 1, true], ["up", 0, true]])
+        );
+        assert_eq!(page_value(&fixture,"document.getElementById('path-cover')?.remove();pathCanvas.style.marginLeft='0';true"),true);
+    }
+    assert_eq!(
+        page_value(&fixture, "window.pathEvents=[];window.pathFailure='';true"),
+        true
+    );
+    let target = get_target();
+    let points: Vec<_> = (0..32)
+        .map(|index| {
+            if index % 2 == 0 {
+                (0.1, 0.9)
+            } else {
+                (0.9, 0.9)
+            }
+        })
+        .collect();
+    let request = Request::new(
+        Some(session.id().into()),
+        Operation::Act {
+            target: target.clone(),
+            action: surface_path(&target, &points, None),
+            verify: None,
+        },
+    );
+    let request_id = request.request_id.clone();
+    let worker_session = session.clone();
+    let worker = std::thread::spawn(move || worker_session.execute(&request));
+    let until = Instant::now() + Duration::from_secs(3);
+    while page_value(&fixture, "window.pathEvents.some(e=>e[0]==='move')") != true {
+        assert!(Instant::now() < until, "path never started");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(session.cancel(&request_id));
+    let result = worker.join().unwrap();
+    assert_eq!(result.error.as_ref().unwrap()["code"], "CONTROL.CANCELLED");
+    assert_eq!(
+        result.error.unwrap()["details"]["pointer_button_released"],
+        true
+    );
+    let events = page_value(&fixture, "window.pathEvents");
+    let events = events.as_array().unwrap();
+    assert_eq!(events.last().unwrap(), &json!(["up", 0, true]));
+    assert!(
+        events.len() < 35,
+        "cancelled path should not finish all its moves"
+    );
+}
+
+#[test]
+#[ignore = "requires isolated Chromium with its sandbox enabled; CI runs it explicitly"]
+fn canvas_surfaces_take_trusted_clicks_wheels_and_drags_inside_the_same_element() {
+    let _serial = serial();
+    let fixture = Fixture::new();
+    let (session, _) = session_for(&fixture);
+    let main = main_of(&session, &fixture.page_id);
+    let loaded = wait_until(&session, &main, "Name", WaitCondition::Appears);
+    assert!(loaded.error.is_none(), "{loaded:?}");
+    page_value(
+        &fixture,
+        r#"document.body.innerHTML='<canvas aria-label="Drawing" width="300" height="150" style="border:1px solid"></canvas>';
+        window.surfaceEvents=[];
+        const surface=document.querySelector('canvas'), ink=surface.getContext('2d');
+        let drawing=false;
+        surface.addEventListener('pointerdown',e=>{
+            drawing=true;ink.fillStyle='red';ink.fillRect(e.offsetX-2,e.offsetY-2,4,4);
+            ink.beginPath();ink.moveTo(e.offsetX,e.offsetY);
+            window.surfaceEvents.push(['down',e.isTrusted]);
+        });
+        surface.addEventListener('pointermove',e=>{if(drawing){ink.strokeStyle='blue';ink.lineWidth=3;ink.lineTo(e.offsetX,e.offsetY);ink.stroke();window.surfaceEvents.push(['move',e.isTrusted]);}});
+        surface.addEventListener('pointerup',e=>{drawing=false;window.surfaceEvents.push(['up',e.isTrusted]);});
+        surface.addEventListener('wheel',e=>{e.preventDefault();window.surfaceEvents.push(['wheel',e.isTrusted,e.deltaY]);},{passive:false});
+        true"#,
+    );
+    let observed = observe(&session, &main);
+    let offered = actions(&observed, "Drawing");
+    for action in ["click", "hover", "scroll", "drag"] {
+        assert!(
+            offered.iter().any(|offered| offered == action),
+            "{offered:?}"
+        );
+    }
+    // Even the default click must reach pointer handlers, not only HTMLElement.click.
+    let canvas = find(&session, &observed, "canvas", "Drawing");
+    let clicked = act(&session, canvas, Action::click());
+    assert!(clicked.error.is_none(), "{clicked:?}");
+    assert_eq!(
+        clicked.data.unwrap()["backend_result"]["trusted_event"],
+        true
+    );
+    assert_eq!(
+        page_value(&fixture, "window.surfaceEvents"),
+        json!([["down", true], ["up", true]])
+    );
+    assert_eq!(
+        page_value(&fixture, "Array.from(document.querySelector('canvas').getContext('2d').getImageData(150,75,1,1).data)"),
+        json!([255, 0, 0, 255])
+    );
+
+    page_value(&fixture, "window.surfaceEvents=[];true");
+    let observed = observe(&session, &main);
+    let canvas = find(&session, &observed, "canvas", "Drawing");
+    let dragged = act(
+        &session,
+        canvas.clone(),
+        Action::Drag {
+            path: Vec::new(),
+            hold_ms: None,
+            modifiers: Vec::new(),
+            to: canvas,
+            button: None,
+            fraction: Some(Fraction { fx: 0.2, fy: 0.5 }),
+            to_fraction: Some(Fraction { fx: 0.8, fy: 0.5 }),
+        },
+    );
+    assert!(dragged.error.is_none(), "{dragged:?}");
+    let events = page_value(&fixture, "window.surfaceEvents");
+    let events = events.as_array().unwrap();
+    assert_eq!(events.first().unwrap(), &json!(["down", true]));
+    assert_eq!(events.last().unwrap(), &json!(["up", true]));
+    assert!(events.len() > 6, "{events:?}");
+    assert!(events.iter().all(|event| event[1] == true));
+    assert_eq!(
+        page_value(&fixture, "Array.from(document.querySelector('canvas').getContext('2d').getImageData(150,75,1,1).data)"),
+        json!([0, 0, 255, 255])
+    );
+
+    page_value(&fixture, "window.surfaceEvents=[];true");
+    let wheeled = act_on(
+        &session,
+        &main,
+        "canvas",
+        "Drawing",
+        Action::Scroll {
+            direction: Direction::Down,
+            notches: Some(1),
+            fraction: None,
+        },
+    );
+    assert!(wheeled.error.is_none(), "{wheeled:?}");
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let events = page_value(&fixture, "window.surfaceEvents");
+        if events.as_array().is_some_and(|events| !events.is_empty()) {
+            assert_eq!(events, json!([["wheel", true, 100]]));
+            break;
+        }
+        assert!(Instant::now() < deadline, "wheel was not delivered");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    // Adding surface capabilities must not bypass normal obstruction checks.
+    page_value(
+        &fixture,
+        "const cover=document.createElement('div');cover.style='position:fixed;inset:0;background:white;z-index:1000';document.body.append(cover);window.surfaceEvents=[];true",
+    );
+    let observed = observe(&session, &main);
+    let canvas = find(&session, &observed, "canvas", "Drawing");
+    let covered = act(&session, canvas, Action::click());
+    assert_eq!(covered.error.unwrap()["code"], "CONTROL.OCCLUDED");
+    assert_eq!(page_value(&fixture, "window.surfaceEvents"), json!([]));
+}
+
+#[test]
+#[ignore = "requires isolated Chromium with its sandbox enabled; CI runs it explicitly"]
+fn verified_headless_instances_are_isolated_but_all_attachments_share_ownership() {
+    let _serial = serial();
+    let desktop = Session::new(Vec::new(), Policy::default());
+    desktop.input_lease("desktop-input").unwrap();
+    let first = Fixture::with_automation(true);
+    let backend = Arc::new(BrowserBackend::launched(first.port));
+    let owned = Session::new(
+        vec![backend],
+        Policy {
+            allow_input: true,
+            ..Default::default()
+        },
+    );
+    let owned_main = main_of(&owned, &first.page_id);
+    let loaded = wait_until(&owned, &owned_main, "Name", WaitCondition::Appears);
+    assert!(loaded.error.is_none(), "{loaded:?}");
+    page_value(
+        &first,
+        "window.saveCount=0;document.getElementById('save').onclick=()=>window.saveCount++;true",
+    );
+    let observed = observe(&owned, &owned_main);
+    assert_eq!(observed["metadata"]["headless_input"], true);
+    let instance = observed["metadata"]["browser_instance_id"].clone();
+    assert!(instance.as_str().is_some_and(|id| !id.is_empty()));
+    let clicked = act(
+        &owned,
+        find(&owned, &observed, "button", "Save"),
+        Action::click(),
+    );
+    assert!(clicked.error.is_none(), "{clicked:?}");
+    assert_eq!(page_value(&first, "window.saveCount"), 1);
+
+    let (attached, _) = session_for(&first);
+    let attached_main = main_of(&attached, &first.page_id);
+    let observed = observe(&attached, &attached_main);
+    assert_eq!(observed["metadata"]["browser_instance_id"], instance);
+    assert_eq!(observed["metadata"]["headless_input"], true);
+    let refused = act(
+        &attached,
+        find(&attached, &observed, "button", "Save"),
+        Action::click(),
+    );
+    assert_eq!(refused.error.unwrap()["code"], "CONTROL.RESOURCE_BUSY");
+    assert_eq!(page_value(&first, "window.saveCount"), 1);
+
+    // Exercise the actual shared launcher, including its automation switch,
+    // as well as an independently started browser attached only by port.
+    let second = aad_browser::launch::Browser::start(aad_browser::launch::Options {
+        browser: "chrome".into(),
+        executable: Some(std::env::var_os("AAD_TEST_CHROME").unwrap().into()),
+        profile_dir: None,
+        copy_from: None,
+        profile_id: "Default".into(),
+        kill_browser: false,
+        headless: true,
+    })
+    .unwrap();
+    let independent = Session::new(
+        vec![Arc::new(BrowserBackend::new(second.port))],
+        Policy {
+            allow_input: true,
+            ..Default::default()
+        },
+    );
+    let independent_main = main_of(&independent, &second.page);
+    let observed = observe(&independent, &independent_main);
+    let navigated = act(
+        &independent,
+        document(&independent, &observed),
+        Action::Navigate {
+            url: first.url.clone(),
+        },
+    );
+    assert!(navigated.error.is_none(), "{navigated:?}");
+    let loaded = wait_until(
+        &independent,
+        &independent_main,
+        "Name",
+        WaitCondition::Appears,
+    );
+    assert!(loaded.error.is_none(), "{loaded:?}");
+    assert_ne!(
+        observe(&independent, &independent_main)["metadata"]["browser_instance_id"],
+        instance
+    );
+    let clicked = act_on(
+        &independent,
+        &independent_main,
+        "button",
+        "Save",
+        Action::click(),
+    );
+    assert!(clicked.error.is_none(), "{clicked:?}");
+    assert_eq!(
+        status(&observe(&independent, &independent_main)),
+        "clicked:false"
+    );
+
+    // Without command-line verification, even an actually headless browser
+    // conservatively needs the physical desktop in addition to its instance.
+    let unknown = Fixture::new();
+    let (fallback, _) = session_for(&unknown);
+    let fallback_main = main_of(&fallback, &unknown.page_id);
+    assert!(
+        wait_until(&fallback, &fallback_main, "Name", WaitCondition::Appears)
+            .error
+            .is_none()
+    );
+    assert_eq!(
+        observe(&fallback, &fallback_main)["metadata"]["headless_input"],
+        false
+    );
+    let refused = act_on(&fallback, &fallback_main, "button", "Save", Action::click());
+    assert_eq!(refused.error.unwrap()["code"], "CONTROL.RESOURCE_BUSY");
+    assert_eq!(status(&observe(&fallback, &fallback_main)), "ready");
+    desktop.close();
+    let clicked = act_on(&fallback, &fallback_main, "button", "Save", Action::click());
+    assert!(clicked.error.is_none(), "{clicked:?}");
+    assert_eq!(status(&observe(&fallback, &fallback_main)), "clicked:false");
+    owned.close();
+    let clicked = act_on(&attached, &attached_main, "button", "Save", Action::click());
+    assert!(clicked.error.is_none(), "{clicked:?}");
+    assert_eq!(page_value(&first, "window.saveCount"), 2);
+}
+
+#[test]
+#[ignore = "requires isolated Chromium with its sandbox enabled; CI runs it explicitly"]
+fn pointer_modifiers_reach_click_drag_and_drop_without_keyboard_state() {
+    let _serial = serial();
+    let fixture = Fixture::new();
+    let (session, _) = session_for(&fixture);
+    let main = main_of(&session, &fixture.page_id);
+    let ready = wait_until(&session, &main, "Name", WaitCondition::Appears);
+    assert!(ready.error.is_none(), "{ready:?}");
+    page_value(
+        &fixture,
+        r#"document.body.innerHTML='<canvas aria-label="Modified surface" tabindex="0" width="300" height="120"></canvas><div draggable="true" aria-label="Modified card" style="width:80px;height:40px">Card</div><div aria-label="Modified bin" style="width:120px;height:60px">Bin</div>';
+        window.gestureEvents=[];window.keyEvents=[];
+        const flags=e=>(e.altKey?1:0)|(e.ctrlKey?2:0)|(e.metaKey?4:0)|(e.shiftKey?8:0);
+        const surface=document.querySelector('canvas');surface.focus();
+        for(const kind of ['keydown','keyup'])document.addEventListener(kind,e=>window.keyEvents.push(kind));
+        for(const kind of ['pointerdown','pointermove','pointerup','click'])surface.addEventListener(kind,e=>window.gestureEvents.push([kind,flags(e),e.isTrusted,e.buttons]));
+        const card=document.querySelector('[draggable]'),bin=document.querySelector('[aria-label="Modified bin"]');
+        card.addEventListener('dragstart',e=>e.dataTransfer.setData('text/plain','modified-card'));
+        bin.addEventListener('dragover',e=>e.preventDefault());
+        bin.addEventListener('drop',e=>{e.preventDefault();window.dropped=[e.dataTransfer.getData('text/plain'),flags(e),e.isTrusted];});true"#,
+    );
+    for (modifiers, expected) in [
+        (vec![PointerModifier::Alt], 1),
+        (vec![PointerModifier::Ctrl], 2),
+        (vec![PointerModifier::Meta], 4),
+        (vec![PointerModifier::Shift], 8),
+        (vec![PointerModifier::Ctrl, PointerModifier::Shift], 10),
+        (vec![], 0),
+    ] {
+        page_value(&fixture, "window.gestureEvents=[];true");
+        let clicked = act_on(
+            &session,
+            &main,
+            "canvas",
+            "Modified surface",
+            Action::Click {
+                hold_ms: None,
+                button: None,
+                count: None,
+                fraction: None,
+                modifiers,
+            },
+        );
+        assert!(clicked.error.is_none(), "{clicked:?}");
+        let events = page_value(
+            &fixture,
+            "window.gestureEvents.filter(e=>e[0]!=='pointermove')",
+        );
+        assert_eq!(
+            events,
+            json!([
+                ["pointerdown", expected, true, 1],
+                ["pointerup", expected, true, 0],
+                ["click", expected, true, 0]
+            ])
+        );
+    }
+    page_value(&fixture, "window.gestureEvents=[];true");
+    let observed = observe(&session, &main);
+    let surface = find(&session, &observed, "canvas", "Modified surface");
+    let dragged = act(
+        &session,
+        surface.clone(),
+        Action::Drag {
+            path: Vec::new(),
+            hold_ms: None,
+            to: surface,
+            button: None,
+            fraction: Some(Fraction { fx: 0.2, fy: 0.5 }),
+            to_fraction: Some(Fraction { fx: 0.8, fy: 0.5 }),
+            modifiers: vec![PointerModifier::Ctrl, PointerModifier::Shift],
+        },
+    );
+    assert!(dragged.error.is_none(), "{dragged:?}");
+    let events = page_value(&fixture, "window.gestureEvents");
+    let events = events.as_array().unwrap();
+    assert!(events.len() > 6, "{events:?}");
+    assert!(
+        events.iter().all(|e| e[1] == 10 && e[2] == true),
+        "{events:?}"
+    );
+    assert!(events.iter().any(|e| e[0] == "pointermove" && e[3] == 1));
+    assert!(events.iter().any(|e| e[0] == "pointerup" && e[3] == 0));
+
+    let observed = observe(&session, &main);
+    let card: Target =
+        serde_json::from_value(node(&observed, "Modified card")["target"].clone()).unwrap();
+    let bin: Target =
+        serde_json::from_value(node(&observed, "Modified bin")["target"].clone()).unwrap();
+    let dropped = act(
+        &session,
+        card,
+        Action::Drag {
+            path: Vec::new(),
+            hold_ms: None,
+            to: bin,
+            button: None,
+            fraction: None,
+            to_fraction: None,
+            modifiers: vec![PointerModifier::Alt, PointerModifier::Ctrl],
+        },
+    );
+    assert!(dropped.error.is_none(), "{dropped:?}");
+    assert_eq!(
+        page_value(&fixture, "window.dropped"),
+        json!(["modified-card", 3, true])
+    );
+    // An ordinary later event has no modifiers or held mouse button, and no
+    // keyboard events were sent to the independently focused element.
+    page_value(&fixture, "window.gestureEvents=[];true");
+    let hovered = act_on(
+        &session,
+        &main,
+        "canvas",
+        "Modified surface",
+        Action::Hover {
+            fraction: None,
+            ms: Some(1),
+        },
+    );
+    assert!(hovered.error.is_none(), "{hovered:?}");
+    assert_eq!(
+        page_value(&fixture, "window.gestureEvents"),
+        json!([["pointermove", 0, true, 0]])
+    );
+    assert_eq!(page_value(&fixture, "window.keyEvents"), json!([]));
 }
 
 #[test]
@@ -734,9 +2227,8 @@ fn drags_move_pointer_sortables_and_html5_draggables() {
     let fixture = Fixture::new();
     let (session, _) = session_for(&fixture);
     let main = main_of(&session, &fixture.page_id);
-    assert!(wait_until(&session, &main, "Bin", WaitCondition::Appears)
-        .error
-        .is_none());
+    let ready = wait_until(&session, &main, "Bin", WaitCondition::Appears);
+    assert!(ready.error.is_none(), "{ready:?}");
     let observed = observe(&session, &main);
     for name in ["One", "Card"] {
         assert!(
@@ -760,6 +2252,9 @@ fn drags_move_pointer_sortables_and_html5_draggables() {
         &session,
         card,
         Action::Drag {
+            path: Vec::new(),
+            hold_ms: None,
+            modifiers: Vec::new(),
             to: bin,
             button: None,
             fraction: None,
@@ -843,6 +2338,8 @@ fn controls_inside_open_shadow_roots_are_observed_and_operated() {
         "button",
         "Go",
         Action::Click {
+            hold_ms: None,
+            modifiers: Vec::new(),
             button: None,
             count: None,
             fraction: Some(Fraction { fx: 0.5, fy: 0.5 }),
@@ -882,6 +2379,8 @@ fn frame_of(session: &Session, wanted: impl Fn(&Value) -> bool) -> Value {
 }
 fn trusted_click() -> Action {
     Action::Click {
+        hold_ms: None,
+        modifiers: Vec::new(),
         button: None,
         count: None,
         fraction: Some(Fraction { fx: 0.5, fy: 0.5 }),
@@ -928,6 +2427,8 @@ fn frames_in_and_out_of_process_take_trusted_pointer_and_keyboard_input() {
         "button",
         "CrossButton",
         Action::Click {
+            hold_ms: None,
+            modifiers: Vec::new(),
             button: Some(Button::Right),
             count: None,
             fraction: None,
@@ -1016,6 +2517,206 @@ fn locate(session: &Session, observation: &Value, locator: Value) -> Response {
             expect: Default::default(),
         },
     )
+}
+
+#[test]
+#[ignore = "requires isolated Chromium with its sandbox enabled; CI runs it explicitly"]
+fn observed_elements_scope_large_pages_without_html_ids_and_keep_their_identity() {
+    let _serial = serial();
+    let fixture = Fixture::new();
+    let (session, _) = session_for(&fixture);
+    let main = main_of(&session, &fixture.page_id);
+    let loaded = wait_until(&session, &main, "Name", WaitCondition::Appears);
+    assert!(loaded.error.is_none(), "{loaded:?}");
+    page_value(
+        &fixture,
+        r#"document.body.innerHTML='<section aria-label="Local form"><button onclick="this.nextElementSibling.textContent=\'Saved locally\'">Save locally</button><output></output></section>';
+        window.localForm=document.querySelector('section');
+        for(let i=0;i<2100;i++){const row=document.createElement('p');row.textContent='Outside '+i;document.body.append(row);}
+        true"#,
+    );
+    let whole = observe(&session, &main);
+    assert_eq!(whole["truncated"], true);
+    let root: Target =
+        serde_json::from_value(node(&whole, "Local form")["target"].clone()).unwrap();
+    let narrowed = observe_view(
+        &session,
+        &main,
+        View {
+            scope_target: Some(root),
+            ..Default::default()
+        },
+    );
+    assert!(narrowed.error.is_none(), "{narrowed:?}");
+    let observed = narrowed.data.unwrap();
+    assert_eq!(observed["truncated"], false);
+    assert_eq!(observed["nodes"].as_array().unwrap().len(), 3);
+    let scope = observed["scope"]["id"].as_str().unwrap().to_string();
+    assert!(scope.starts_with("aad:browser-scope:"));
+    assert_eq!(page_value(&fixture, "window.localForm.id"), "");
+    let target = find(&session, &observed, "button", "Save locally");
+    let saved = call(
+        &session,
+        Operation::Act {
+            target,
+            action: Action::click(),
+            verify: Some(Box::new(Locator {
+                name: Some("Saved locally".into()),
+                ..Default::default()
+            })),
+        },
+    );
+    assert!(saved.error.is_none(), "{saved:?}");
+    assert_eq!(
+        page_value(
+            &fixture,
+            "window.localForm.querySelector('output').textContent"
+        ),
+        "Saved locally"
+    );
+
+    // A page cannot redirect the opaque scope by creating a matching HTML id.
+    page_value(
+        &fixture,
+        &format!(
+            "const impostor=document.createElement('section');impostor.id={};impostor.innerHTML='<button>Impostor</button>';document.body.prepend(impostor);true",
+            serde_json::to_string(&scope).unwrap()
+        ),
+    );
+    let recaptured = observe_view(
+        &session,
+        &main,
+        View {
+            scope_id: Some(scope.clone()),
+            ..Default::default()
+        },
+    );
+    assert!(recaptured.error.is_none(), "{recaptured:?}");
+    let recaptured = recaptured.data.unwrap();
+    assert!(recaptured["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|node| node["name"] != "Impostor"));
+    find(&session, &recaptured, "button", "Save locally");
+
+    // Even an identical replacement cannot take over the original DOM identity.
+    page_value(
+        &fixture,
+        "window.localForm.replaceWith(window.localForm.cloneNode(true));true",
+    );
+    let replaced = observe_view(
+        &session,
+        &main,
+        View {
+            scope_id: Some(scope),
+            ..Default::default()
+        },
+    );
+    assert_eq!(replaced.error.unwrap()["code"], "CONTROL.STALE_TARGET");
+
+    // An observed element within an open shadow root needs no document id either.
+    page_value(
+        &fixture,
+        "document.body.innerHTML='<x-local></x-local>';document.querySelector('x-local').attachShadow({mode:'open'}).innerHTML='<section aria-label=\"Shadow form\"><button>Shadow save</button></section>';true",
+    );
+    let whole = observe(&session, &main);
+    let root = serde_json::from_value(node(&whole, "Shadow form")["target"].clone()).unwrap();
+    let shadow = observe_view(
+        &session,
+        &main,
+        View {
+            scope_target: Some(root),
+            ..Default::default()
+        },
+    );
+    assert!(shadow.error.is_none(), "{shadow:?}");
+    let shadow = shadow.data.unwrap();
+    assert_eq!(shadow["nodes"].as_array().unwrap().len(), 2);
+    find(&session, &shadow, "button", "Shadow save");
+}
+
+#[test]
+#[ignore = "requires isolated Chromium with its sandbox enabled; CI runs it explicitly"]
+fn scoped_observations_ignore_unrelated_updates_but_reject_related_changes() {
+    let _serial = serial();
+    let fixture = Fixture::new();
+    let (session, _) = session_for(&fixture);
+    let main = main_of(&session, &fixture.page_id);
+    let loaded = wait_until(&session, &main, "Name", WaitCondition::Appears);
+    assert!(loaded.error.is_none(), "{loaded:?}");
+    let reset = || {
+        page_value(
+            &fixture,
+            r#"clearInterval(window.scopeTicker);
+            document.head.innerHTML='<style id="scope-style">.scope-hidden { display:none }</style>';
+            document.body.innerHTML='<div id="scope-parent"><section id="scope"><button aria-label="Scoped save" onclick="document.getElementById(\'scope-result\').textContent=\'saved\'">Save</button><button class="scope-hidden">Hidden</button></section></div><output id="scope-result"></output><span id="scope-ticker" style="position:fixed;right:0;bottom:0">0</span>';
+            true"#,
+        );
+    };
+    let scoped = || {
+        let result = observe_view(
+            &session,
+            &main,
+            View {
+                scope_id: Some("scope".into()),
+                ..Default::default()
+            },
+        );
+        assert!(result.error.is_none(), "{result:?}");
+        result.data.unwrap()
+    };
+
+    reset();
+    let observed = scoped();
+    page_value(
+        &fixture,
+        r#"window.scopeTicks=0; window.scopeTicker=setInterval(()=>{
+            const ticker=document.getElementById('scope-ticker');
+            ticker.textContent=String(++window.scopeTicks);
+            ticker.dataset.tick=String(window.scopeTicks);
+        },10); true"#,
+    );
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(page_value(&fixture, "window.scopeTicks").as_u64().unwrap() > 0);
+    // Both locator resolution and the write must survive unrelated DOM churn.
+    let target = find(&session, &observed, "button", "Scoped save");
+    let clicked = act(&session, target, trusted_click());
+    assert!(clicked.error.is_none(), "{clicked:?}");
+    assert_eq!(
+        page_value(
+            &fixture,
+            "document.getElementById('scope-result').textContent"
+        ),
+        "saved"
+    );
+
+    for mutation in [
+        "document.querySelector('#scope button').textContent='Changed'",
+        "document.getElementById('scope-parent').className='changed'",
+        "document.getElementById('scope').replaceWith(document.getElementById('scope').cloneNode(true))",
+        "document.body.append(document.getElementById('scope'))",
+        // These mutations are outside the subtree but change its layout or
+        // membership: they cannot be treated like the unrelated timer above.
+        "document.getElementById('scope-style').textContent='.scope-hidden { display:block }'",
+        "const banner=document.createElement('div');banner.style.height='100px';document.body.prepend(banner)",
+        // The scope selector must still denote exactly the original region.
+        "const duplicate=document.createElement('section');duplicate.id='scope';document.body.append(duplicate)",
+    ] {
+        reset();
+        let observed = scoped();
+        let target = find(&session, &observed, "button", "Scoped save");
+        page_value(&fixture, &format!("{mutation}; true"));
+        let found = locate(&session, &observed, json!({"name":"Scoped save"}));
+        assert_eq!(found.error.unwrap()["code"], "CONTROL.STALE_TARGET", "{mutation}");
+        let clicked = act(&session, target, trusted_click());
+        assert_eq!(clicked.error.unwrap()["code"], "CONTROL.STALE_TARGET", "{mutation}");
+        assert_eq!(
+            page_value(&fixture, "document.getElementById('scope-result').textContent"),
+            "",
+            "{mutation}"
+        );
+    }
 }
 
 #[test]
@@ -1204,6 +2905,261 @@ fn pages_read_as_regions_text_and_accessible_names_and_locators_narrow() {
 
 fn page_value(fixture: &Fixture, expression: &str) -> Value {
     fixture.client().eval(expression).unwrap()["result"]["value"].clone()
+}
+
+fn secret_session(fixture: &Fixture) -> Session {
+    Session::new(
+        vec![Arc::new(BrowserBackend::new(fixture.port))],
+        Policy {
+            allow_input: true,
+            allow_secret_input: true,
+            secret_bindings: SecretBindings::new([(
+                "login".into(),
+                "browser-synthetic-private-输入".into(),
+            )])
+            .unwrap(),
+            ..Default::default()
+        },
+    )
+}
+
+fn input_secret(session: &Session, resource: &str, name: &str) -> Response {
+    let observed = observe(session, resource);
+    act(
+        session,
+        find(session, &observed, "textbox", name),
+        Action::SecretInput {
+            secret_ref: "login".into(),
+        },
+    )
+}
+
+fn capture_document(session: &Session, resource: &str) -> Response {
+    let observed = observe(session, resource);
+    call(
+        session,
+        Operation::Capture {
+            target: document(session, &observed),
+        },
+    )
+}
+
+#[test]
+#[ignore = "requires isolated Chromium with its sandbox enabled; CI runs it explicitly"]
+fn secret_input_revalidates_passwords_and_keeps_revealed_fields_redacted() {
+    let _serial = serial();
+    let fixture = Fixture::new();
+    let (denied, _) = session_for(&fixture);
+    let main = main_of(&denied, &fixture.page_id);
+    assert!(
+        wait_until(&denied, &main, "Protected", WaitCondition::Appears)
+            .error
+            .is_none()
+    );
+    let observed = observe(&denied, &main);
+    assert_eq!(node(&observed, "Protected")["capabilities"], json!([]));
+    assert_eq!(
+        input_secret(&denied, &main, "Protected").error.unwrap()["code"],
+        "POLICY.DENIED"
+    );
+    drop(denied);
+
+    let session = secret_session(&fixture);
+    let main = main_of(&session, &fixture.page_id);
+    assert_eq!(
+        page_value(
+            &fixture,
+            r#"(() => {
+        const field=document.getElementById('protected');
+        window.secretEffect={input:false,change:false};
+        for(const event of ['input','change']) field.addEventListener(event,()=>{
+            window.secretEffect[event]=field.value==='browser-synthetic-private-输入';
+        });
+        return field.value!=='browser-synthetic-private-输入';
+    })()"#
+        ),
+        true
+    );
+    let observed = observe(&session, &main);
+    let protected = node(&observed, "Protected");
+    assert_eq!(protected["capabilities"], json!(["secret_input"]));
+    assert!(protected["value"].is_null());
+    for action in [
+        Action::Fill {
+            value: "ordinary".into(),
+        },
+        Action::TypeText {
+            text: "ordinary".into(),
+            mode: None,
+        },
+        Action::Paste {
+            text: "ordinary".into(),
+        },
+        Action::Key {
+            hold_ms: None,
+            keys: vec!["A".into()],
+        },
+    ] {
+        let observed = observe(&session, &main);
+        let result = act(
+            &session,
+            find(&session, &observed, "textbox", "Protected"),
+            action,
+        );
+        assert!(
+            result.error.is_some(),
+            "ordinary input must refuse a protected field"
+        );
+    }
+    let result = input_secret(&session, &main, "Protected");
+    assert!(result.error.is_none(), "{result:?}");
+    assert_eq!(
+        result.data.as_ref().unwrap()["backend_result"],
+        json!({"submitted":true,"redacted":true})
+    );
+    assert!(!serde_json::to_string(&result)
+        .unwrap()
+        .contains("browser-synthetic-private"));
+    assert_eq!(
+        page_value(
+            &fixture,
+            "window.secretEffect.input && window.secretEffect.change"
+        ),
+        true
+    );
+    assert_eq!(
+        capture_document(&session, &main).error.unwrap()["code"],
+        "CONTROL.ACTION_UNSUPPORTED"
+    );
+
+    // Showing a previously written field cannot turn it into a public value,
+    // an ordinary text-input target, or pixels in its parent's screenshot.
+    assert_eq!(
+        page_value(
+            &fixture,
+            "document.getElementById('protected').type='text'; true"
+        ),
+        true
+    );
+    let observed = observe(&session, &main);
+    let protected = node(&observed, "Protected");
+    assert_eq!(protected["states"]["protected"], true);
+    assert!(protected["value"].is_null());
+    assert_eq!(protected["capabilities"], json!([]));
+    assert!(!observed.to_string().contains("browser-synthetic-private"));
+    assert_eq!(
+        call(
+            &session,
+            Operation::Capture {
+                target: find(&session, &observed, "textbox", "Protected")
+            }
+        )
+        .error
+        .unwrap()["code"],
+        "CONTROL.ACTION_UNSUPPORTED"
+    );
+    assert_eq!(
+        capture_document(&session, &main).error.unwrap()["code"],
+        "CONTROL.ACTION_UNSUPPORTED"
+    );
+    assert!(input_secret(&session, &main, "Name").error.is_some());
+
+    // Each stale or no-longer-editable target must fail before changing it.
+    for mutation in [
+        "field.type='text'",
+        "field.readOnly=true",
+        "field.disabled=true",
+        "field.replaceWith(field.cloneNode(true))",
+    ] {
+        assert_eq!(page_value(&fixture, "{const field=document.getElementById('protected');field.type='password';field.readOnly=false;field.disabled=false;field.value='unchanged';} true"), true);
+        let observed = observe(&session, &main);
+        let target = find(&session, &observed, "textbox", "Protected");
+        assert_eq!(
+            page_value(
+                &fixture,
+                &format!("{{const field=document.getElementById('protected');{mutation};}} true")
+            ),
+            true
+        );
+        let result = act(
+            &session,
+            target,
+            Action::SecretInput {
+                secret_ref: "login".into(),
+            },
+        );
+        assert_eq!(
+            result.error.as_ref().unwrap()["code"],
+            "CONTROL.SECRET_INPUT_FAILED"
+        );
+        assert!(!serde_json::to_string(&result)
+            .unwrap()
+            .contains("browser-synthetic-private"));
+        assert_eq!(
+            page_value(
+                &fixture,
+                "document.getElementById('protected').value==='unchanged'"
+            ),
+            true
+        );
+    }
+    assert_eq!(
+        page_value(
+            &fixture,
+            "document.getElementById('protected').remove(); true"
+        ),
+        true
+    );
+    let captured = capture_document(&session, &main);
+    assert!(captured.error.is_none(), "{captured:?}");
+}
+
+#[test]
+#[ignore = "requires isolated Chromium with its sandbox enabled; CI runs it explicitly"]
+fn secret_child_fields_block_capture_only_while_they_remain_visible() {
+    let _serial = serial();
+    let fixture = Fixture::new();
+    let session = secret_session(&fixture);
+    let main = main_of(&session, &fixture.page_id);
+    let frame = frame_of(&session, |meta| {
+        meta["url"]
+            .as_str()
+            .is_some_and(|url| url.ends_with("/frame"))
+    });
+    let resource = frame["resource_id"].as_str().unwrap();
+    assert!(
+        wait_until(&session, resource, "FrameInput", WaitCondition::Appears)
+            .error
+            .is_none()
+    );
+    assert_eq!(page_value(&fixture, "document.querySelector('iframe').contentDocument.querySelector('input').type='password'; true"), true);
+    let result = input_secret(&session, resource, "FrameInput");
+    assert!(result.error.is_none(), "{result:?}");
+    assert_eq!(page_value(&fixture, "document.querySelector('iframe').contentDocument.querySelector('input').value==='browser-synthetic-private-输入'"), true);
+    assert_eq!(
+        capture_document(&session, &main).error.unwrap()["code"],
+        "CONTROL.ACTION_UNSUPPORTED"
+    );
+    assert_eq!(page_value(&fixture, "window.detachedSecret=document.querySelector('iframe').contentDocument.querySelector('input'); window.detachedSecret.type='text'; window.detachedSecret.remove(); true"), true);
+    let recovered = capture_document(&session, &main);
+    assert!(recovered.error.is_none(), "{recovered:?}");
+
+    // A temporary removal must not erase protection when the same field is
+    // reinserted, even after capture discarded and reattached its CDP client.
+    assert_eq!(page_value(&fixture, "document.querySelector('iframe').contentDocument.body.prepend(window.detachedSecret); true"), true);
+    let observed = observe(&session, resource);
+    assert!(node(&observed, "FrameInput")["value"].is_null());
+    assert_eq!(node(&observed, "FrameInput")["states"]["protected"], true);
+    assert_eq!(
+        capture_document(&session, &main).error.unwrap()["code"],
+        "CONTROL.ACTION_UNSUPPORTED"
+    );
+    assert_eq!(
+        page_value(&fixture, "document.querySelector('iframe').remove(); true"),
+        true
+    );
+    let recovered = capture_document(&session, &main);
+    assert!(recovered.error.is_none(), "{recovered:?}");
 }
 
 #[test]
@@ -1424,12 +3380,12 @@ fn wait_returns_an_element_that_appears_after_a_timer_ready_to_act_on() {
 }
 
 fn visibility(fixture: &Fixture, page_id: &str) -> String {
-    let target = aad_cdp::Client::list_targets(fixture.port)
+    let target = aad_browser::cdp::Client::list_targets(fixture.port)
         .unwrap()
         .into_iter()
         .find(|t| t.id == page_id)
         .expect("page is listed");
-    aad_cdp::Client::attach(&target)
+    aad_browser::cdp::Client::attach(&target)
         .unwrap()
         .eval("document.visibilityState")
         .unwrap()["result"]["value"]
@@ -1445,9 +3401,8 @@ fn tabs_open_front_and_close_and_popups_name_their_opener() {
     let fixture = Fixture::new();
     let (session, _) = session_for(&fixture);
     let main = main_of(&session, &fixture.page_id);
-    assert!(wait_until(&session, &main, "Name", WaitCondition::Appears)
-        .error
-        .is_none());
+    let ready = wait_until(&session, &main, "Name", WaitCondition::Appears);
+    assert!(ready.error.is_none(), "{ready:?}");
     let observed = observe(&session, &main);
     let offered = &observed["nodes"]
         .as_array()
@@ -1522,6 +3477,8 @@ fn tabs_open_front_and_close_and_popups_name_their_opener() {
         &session,
         popup,
         Action::Click {
+            hold_ms: None,
+            modifiers: Vec::new(),
             button: None,
             count: None,
             fraction: Some(Fraction { fx: 0.5, fy: 0.5 }),
@@ -1571,9 +3528,8 @@ fn uploads_reach_file_inputs_only_from_allowed_directories() {
         },
     );
     let main = main_of(&session, &fixture.page_id);
-    assert!(wait_until(&session, &main, "Name", WaitCondition::Appears)
-        .error
-        .is_none());
+    let ready = wait_until(&session, &main, "Name", WaitCondition::Appears);
+    assert!(ready.error.is_none(), "{ready:?}");
     let observed = observe(&session, &main);
     // A file input takes files and nothing else.
     assert_eq!(actions(&observed, "Attachment"), vec!["upload".to_string()]);
@@ -1682,9 +3638,8 @@ fn downloads_land_in_the_session_directory_and_are_listed() {
         },
     );
     let main = main_of(&session, &fixture.page_id);
-    assert!(wait_until(&session, &main, "Name", WaitCondition::Appears)
-        .error
-        .is_none());
+    let ready = wait_until(&session, &main, "Name", WaitCondition::Appears);
+    assert!(ready.error.is_none(), "{ready:?}");
     let before = backend.downloads(Duration::from_secs(5)).unwrap();
     assert_eq!(before["tracking"], true, "{before}");
     assert_eq!(before["downloads"], json!([]));
@@ -1739,9 +3694,8 @@ fn dialogs_block_the_page_until_accepted_or_dismissed() {
     let fixture = Fixture::new();
     let (session, _) = session_for(&fixture);
     let main = main_of(&session, &fixture.page_id);
-    assert!(wait_until(&session, &main, "Name", WaitCondition::Appears)
-        .error
-        .is_none());
+    let ready = wait_until(&session, &main, "Name", WaitCondition::Appears);
+    assert!(ready.error.is_none(), "{ready:?}");
 
     // A click that opens a prompt is delivered; the page then shows the prompt.
     let observed = observe(&session, &main);
@@ -1933,7 +3887,7 @@ fn browser_actions_are_observed_document_bound_and_have_real_page_effects() {
         .find(|n| n["name"] == "Protected")
         .unwrap();
     assert!(protected["value"].is_null());
-    assert_eq!(protected["actions"], json!([]));
+    assert_eq!(protected["capabilities"], json!([]));
     assert_eq!(
         call(
             &session,
@@ -1966,6 +3920,7 @@ fn browser_actions_are_observed_document_bound_and_have_real_page_effects() {
         &session,
         target,
         Action::Key {
+            hold_ms: None,
             keys: vec!["Enter".into()],
         },
     );
@@ -2029,6 +3984,8 @@ fn browser_actions_are_observed_document_bound_and_have_real_page_effects() {
         &session,
         target,
         Action::Click {
+            hold_ms: None,
+            modifiers: Vec::new(),
             button: Some(Button::Right),
             count: None,
             fraction: None,
@@ -2042,6 +3999,8 @@ fn browser_actions_are_observed_document_bound_and_have_real_page_effects() {
         &session,
         target,
         Action::Click {
+            hold_ms: None,
+            modifiers: Vec::new(),
             button: None,
             count: Some(2),
             fraction: None
@@ -2113,6 +4072,8 @@ fn browser_actions_are_observed_document_bound_and_have_real_page_effects() {
         &session,
         target,
         Action::Click {
+            hold_ms: None,
+            modifiers: Vec::new(),
             button: None,
             count: None,
             fraction: Some(Fraction { fx: 0.5, fy: 0.5 }),
@@ -2267,7 +4228,7 @@ fn browser_actions_are_observed_document_bound_and_have_real_page_effects() {
             url: "file:///etc/passwd".into(),
         },
     );
-    assert_eq!(refused.error.unwrap()["code"], "CONTROL.INVALID_REQUEST");
+    assert_eq!(refused.error.unwrap()["code"], "POLICY.DENIED");
     let observed = observe(&session, main);
     let body = document(&session, &observed);
     let url = format!("{}second", fixture.url);

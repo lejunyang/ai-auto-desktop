@@ -11,8 +11,8 @@
 //! occupies that position.
 
 use crate::backend::{
-    Backend, CaptureLimits, DriverError, Pixels, PointerButton, PointerGesture, Result,
-    ScrollDirection, ScrollSpec, SnapshotStore,
+    ensure_input_active, Backend, CaptureLimits, DriverError, ElementInput, InputControl, Pixels,
+    PointerButton, PointerGesture, Result, ScrollDirection, ScrollSpec, SnapshotStore,
 };
 use crate::capture::{self, CapturedEvent};
 use crate::model::{Locator, Node, Snapshot, Target, NODE_ACTIONS, OUTLINE_BUDGET};
@@ -24,7 +24,7 @@ use base64::Engine as _;
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub const PROVIDER_NAME: &str = "desktop.windows_uia";
 
@@ -34,6 +34,7 @@ pub const WRITE_ACTIONS: &[&str] = &[
     "invoke",
     "set_value",
     "type_text",
+    "secret_input",
     "pointer_click",
     "key_chord",
     "pointer_gesture",
@@ -107,6 +108,26 @@ impl UiaDriver {
 
     /// Dispatch one action by its short name.
     pub fn call(&self, action: &str, args: &Value) -> Result<Value> {
+        self.call_with_deadline(action, args, Instant::now() + Duration::from_secs(30))
+    }
+
+    fn call_with_deadline(&self, action: &str, args: &Value, deadline: Instant) -> Result<Value> {
+        self.call_controlled(
+            action,
+            args,
+            deadline,
+            &aad_runtime::CancellationToken::new(),
+        )
+    }
+
+    fn call_controlled(
+        &self,
+        action: &str,
+        args: &Value,
+        deadline: Instant,
+        cancellation: &aad_runtime::CancellationToken,
+    ) -> Result<Value> {
+        ensure_input_active(deadline, Some(&cancellation.shared_flag()))?;
         let args = match args {
             Value::Null => Value::Object(Map::new()),
             other => other.clone(),
@@ -137,12 +158,21 @@ impl UiaDriver {
                         "a key combination holds 1..{MAX_CHORD_KEYS} keys"
                     )));
                 }
-                let sent = self.backend.global_key(&keys)?;
+                ensure_input_active(deadline, Some(&cancellation.shared_flag()))?;
+                let sent = self.backend.global_key_controlled(
+                    &keys,
+                    &InputControl {
+                        deadline,
+                        cancellation: Some(cancellation.shared_flag()),
+                    },
+                )?;
                 Ok(json!({"applied": true, "action": "global_key", "keys": keys, "focus": sent}))
             }
             "focus" | "invoke" | "set_value" | "type_text" | "pointer_click" | "key_chord"
             | "pointer_gesture" | "drag" | "minimize" | "maximize" | "restore" | "close_window"
-            | "activate" | "paste" => self.act(action, &args),
+            | "activate" | "paste" | "secret_input" => {
+                self.act(action, &args, deadline, cancellation)
+            }
             "watch" => self.watch(&args),
             "collect" => self.collect(&args),
             "release" => self.release(&args),
@@ -511,6 +541,7 @@ impl UiaDriver {
             .ok_or_else(|| DriverError::invalid("target is required"))
             .and_then(|value| Target::from_value(value).map_err(DriverError::invalid))?;
         let (window_id, node) = self.resolve(&target)?;
+
         if node.states.protected == Some(true) {
             return Err(DriverError::new(
                 "DRIVER.PROTECTED_ELEMENT",
@@ -602,12 +633,28 @@ impl UiaDriver {
         }))
     }
 
-    fn act(&self, action: &str, args: &Value) -> Result<Value> {
+    fn act(
+        &self,
+        action: &str,
+        args: &Value,
+        deadline: Instant,
+        cancellation: &aad_runtime::CancellationToken,
+    ) -> Result<Value> {
         let target = args
             .get("target")
             .ok_or_else(|| DriverError::invalid("target is required"))
             .and_then(|value| Target::from_value(value).map_err(DriverError::invalid))?;
         let (window_id, node) = self.resolve(&target)?;
+        ensure_input_active(deadline, Some(&cancellation.shared_flag()))?;
+
+        if node.states.protected == Some(true)
+            && matches!(action, "set_value" | "type_text" | "key_chord" | "paste")
+        {
+            return Err(DriverError::new(
+                "DRIVER.PROTECTED_ELEMENT",
+                "protected input requires the dedicated secret action",
+            ));
+        }
 
         // Refuse an action the element does not actually support, rather than
         // letting the backend fail in a less legible way.
@@ -620,9 +667,44 @@ impl UiaDriver {
             .with_detail("supported", json!(node.actions)));
         }
 
+        let control = InputControl {
+            deadline,
+            cancellation: Some(cancellation.shared_flag()),
+        };
+        let input = |action| {
+            self.backend
+                .element_input_controlled(&window_id, &node, action, &control)
+        };
         match action {
-            "focus" => self.backend.focus(&window_id, &node)?,
-            "invoke" => self.backend.invoke(&window_id, &node)?,
+            "secret_input" => {
+                let text = args
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| DriverError::invalid("secret input requires text"))?;
+                if text.chars().count() > MAX_TYPE_TEXT_CHARS || text.contains(['\0', '\r', '\n']) {
+                    return Err(DriverError::invalid("invalid secret input"));
+                }
+                if node.states.protected != Some(true)
+                    || node.states.read_only == Some(true)
+                    || node.states.enabled == Some(false)
+                {
+                    return Err(DriverError::new(
+                        "DRIVER.PROTECTED_ELEMENT",
+                        "secret input requires an editable protected field",
+                    ));
+                }
+                input(ElementInput::SecretInput(text)).map_err(|error| {
+                    DriverError::new("DRIVER.SECRET_INPUT_FAILED", "secret input failed")
+                        .with_effect(&error.effect)
+                })?;
+                return Ok(json!({"submitted":true,"redacted":true}));
+            }
+            "focus" => {
+                input(ElementInput::Focus)?;
+            }
+            "invoke" => {
+                input(ElementInput::Invoke)?;
+            }
             "pointer_click" => {
                 if let Some(button) = args.get("button").and_then(Value::as_str) {
                     if button != "left" {
@@ -631,7 +713,7 @@ impl UiaDriver {
                         ));
                     }
                 }
-                self.backend.pointer_click(&window_id, &node)?
+                input(ElementInput::PointerClick)?;
             }
             "set_value" => {
                 let value = args
@@ -641,7 +723,7 @@ impl UiaDriver {
                 if node.states.read_only == Some(true) {
                     return Err(DriverError::invalid("the element is read-only"));
                 }
-                self.backend.set_value(&window_id, &node, value)?
+                input(ElementInput::SetValue(value))?;
             }
             "type_text" => {
                 let text = args
@@ -657,12 +739,14 @@ impl UiaDriver {
                     return Err(DriverError::invalid("the element is read-only"));
                 }
                 match args.get("mode") {
-                    None => self.backend.type_text(&window_id, &node, text)?,
+                    None => {
+                        input(ElementInput::TypeText { text, keys: false })?;
+                    }
                     Some(Value::String(mode)) if mode == "unicode" => {
-                        self.backend.type_text(&window_id, &node, text)?
+                        input(ElementInput::TypeText { text, keys: false })?;
                     }
                     Some(Value::String(mode)) if mode == "keys" => {
-                        self.backend.type_text_keys(&window_id, &node, text)?
+                        input(ElementInput::TypeText { text, keys: true })?;
                     }
                     Some(Value::String(mode)) => {
                         return Err(DriverError::invalid(format!(
@@ -693,10 +777,19 @@ impl UiaDriver {
                         "a key combination may hold at most {MAX_CHORD_KEYS} keys"
                     )));
                 }
-                self.backend.key_chord(&window_id, &node, &keys)?
+                self.backend.key_chord_controlled(
+                    &window_id,
+                    &node,
+                    &keys,
+                    parse_hold_ms(args)?,
+                    deadline,
+                    Some(cancellation.shared_flag()),
+                )?
             }
             "pointer_gesture" => {
-                let gesture = parse_pointer_gesture(args)?;
+                let mut gesture = parse_pointer_gesture(args)?;
+                gesture.deadline = Some(deadline);
+                gesture.cancellation = Some(cancellation.shared_flag());
                 self.backend.pointer_gesture(&window_id, &node, &gesture)?
             }
             "drag" => {
@@ -721,7 +814,11 @@ impl UiaDriver {
                     .with_detail("node_id", json!(to_node.node_id))
                     .with_detail("supported", json!(to_node.actions)));
                 }
-                let gesture = parse_drag_gesture(args)?;
+                let mut gesture = parse_drag_gesture(args)?;
+                gesture.path = parse_drag_path(args, &target, &to_target)?;
+                ensure_input_active(deadline, Some(&cancellation.shared_flag()))?;
+                gesture.deadline = Some(deadline);
+                gesture.cancellation = Some(cancellation.shared_flag());
                 self.backend.drag(&window_id, &node, &to_node, &gesture)?
             }
             "paste" => {
@@ -739,7 +836,7 @@ impl UiaDriver {
                         "the element is read-only or protected",
                     ));
                 }
-                let pasted = self.backend.paste(&window_id, &node, text)?;
+                let pasted = input(ElementInput::Paste(text))?;
                 return Ok(json!({
                     "applied": true,
                     "action": action,
@@ -757,7 +854,7 @@ impl UiaDriver {
                         "window actions apply to the observed window's own node",
                     ));
                 }
-                let state = self.backend.window_action(&window_id, &node, action)?;
+                let state = input(ElementInput::WindowAction(action))?;
                 return Ok(json!({
                     "applied": true,
                     "action": action,
@@ -1004,8 +1101,35 @@ fn parse_button(args: &Value) -> Result<PointerButton> {
     }
 }
 
+fn parse_pointer_modifiers(args: &Value) -> Result<Vec<String>> {
+    let Some(value) = args.get("modifiers") else {
+        return Ok(Vec::new());
+    };
+    let values = value.as_array().ok_or_else(|| {
+        DriverError::invalid("modifiers must be an array of ctrl, shift, alt or meta")
+    })?;
+    let mut modifiers = Vec::new();
+    for value in values {
+        let name = value
+            .as_str()
+            .filter(|name| matches!(*name, "ctrl" | "shift" | "alt" | "meta"))
+            .ok_or_else(|| {
+                DriverError::invalid("unknown pointer modifier; use ctrl, shift, alt or meta")
+            })?;
+        if modifiers.iter().any(|existing| existing == name) {
+            return Err(DriverError::invalid("pointer modifiers must not repeat"));
+        }
+        modifiers.push(name.to_owned());
+    }
+    Ok(modifiers)
+}
+
 fn parse_pointer_gesture(args: &Value) -> Result<PointerGesture> {
+    if args.get("path").is_some() {
+        return Err(DriverError::invalid("path is supported for drag only"));
+    }
     let button = parse_button(args)?;
+    let modifiers = parse_pointer_modifiers(args)?;
     let count = match args.get("count") {
         None => 1,
         Some(Value::Number(number)) if number.as_u64() == Some(1) => 1,
@@ -1087,15 +1211,42 @@ fn parse_pointer_gesture(args: &Value) -> Result<PointerGesture> {
             "a hover cannot also specify a pointer button or click count",
         ));
     }
+    if (scroll.is_some() || hover_ms.is_some()) && !modifiers.is_empty() {
+        return Err(DriverError::invalid(
+            "modifiers are supported for clicks and drags only",
+        ));
+    }
 
+    let hold_ms = parse_hold_ms(args)?;
+    if hold_ms.is_some() && (scroll.is_some() || hover_ms.is_some() || count != 1) {
+        return Err(DriverError::invalid("hold_ms requires a single click"));
+    }
     Ok(PointerGesture {
+        cancellation: None,
+        deadline: None,
+        hold_ms,
         button,
         count,
+        modifiers,
         fraction: parse_fraction(args, "fraction")?,
         to_fraction: None,
+        path: Vec::new(),
         scroll,
         hover_ms,
     })
+}
+
+fn parse_hold_ms(args: &Value) -> Result<Option<u64>> {
+    args.get("hold_ms")
+        .map(|value| {
+            value
+                .as_u64()
+                .filter(|value| (1..=5_000).contains(value))
+                .ok_or_else(|| {
+                    DriverError::invalid("hold_ms must be an integer between 1 and 5000")
+                })
+        })
+        .transpose()
 }
 
 fn parse_drag_gesture(args: &Value) -> Result<PointerGesture> {
@@ -1107,13 +1258,65 @@ fn parse_drag_gesture(args: &Value) -> Result<PointerGesture> {
         }
     }
     Ok(PointerGesture {
+        cancellation: None,
+        deadline: None,
+        hold_ms: parse_hold_ms(args)?,
         button: parse_button(args)?,
         count: 1,
+        modifiers: parse_pointer_modifiers(args)?,
         fraction: parse_fraction(args, "fraction")?,
         to_fraction: parse_fraction(args, "to_fraction")?,
+        path: Vec::new(),
         scroll: None,
         hover_ms: None,
     })
+}
+
+fn parse_drag_path(args: &Value, source: &Target, destination: &Target) -> Result<Vec<(f64, f64)>> {
+    let Some(path) = args.get("path") else {
+        return Ok(Vec::new());
+    };
+    let path = path
+        .as_array()
+        .ok_or_else(|| DriverError::invalid("drag path must be an array"))?;
+    if path.len() > 32 {
+        return Err(DriverError::invalid("drag path accepts at most 32 anchors"));
+    }
+    if path.is_empty() {
+        return Ok(Vec::new());
+    }
+    if source != destination
+        || parse_fraction(args, "fraction")?.is_none()
+        || parse_fraction(args, "to_fraction")?.is_none()
+    {
+        return Err(DriverError::invalid(
+            "drag path requires explicit endpoint fractions on the same observed surface",
+        ));
+    }
+    path.iter()
+        .map(|anchor| {
+            let object = anchor
+                .as_object()
+                .ok_or_else(|| DriverError::invalid("drag path anchor must be an object"))?;
+            if object
+                .keys()
+                .any(|name| !matches!(name.as_str(), "target" | "fraction"))
+            {
+                return Err(DriverError::invalid(
+                    "drag path anchor accepts target and fraction only",
+                ));
+            }
+            let target = Target::from_value(object.get("target").unwrap_or(&Value::Null))
+                .map_err(DriverError::invalid)?;
+            if target != *source {
+                return Err(DriverError::invalid(
+                    "drag path anchor must identify the source observation and surface",
+                ));
+            }
+            parse_fraction(anchor, "fraction")?
+                .ok_or_else(|| DriverError::invalid("drag path anchor requires a fraction"))
+        })
+        .collect()
 }
 
 fn action_contracts() -> Map<String, Value> {
@@ -1236,6 +1439,15 @@ fn action_contracts() -> Map<String, Value> {
         ),
     );
     actions.insert(
+        "secret_input".into(),
+        write(
+            "Replace a protected field without clipboard or value read-back.",
+            "input",
+            "high",
+            "non_idempotent",
+        ),
+    );
+    actions.insert(
         "key_chord".into(),
         write(
             "Press a key combination on the focused element, e.g. Ctrl+C or F5.",
@@ -1322,7 +1534,22 @@ impl Provider for UiaDriver {
         &self,
         action: &str,
         args: Value,
-        _timeout: Option<Duration>,
+        timeout: Option<Duration>,
+    ) -> std::result::Result<Value, aad_core::AutomationError> {
+        self.invoke_cancellable(
+            action,
+            args,
+            timeout,
+            &aad_runtime::CancellationToken::new(),
+        )
+    }
+
+    fn invoke_cancellable(
+        &self,
+        action: &str,
+        args: Value,
+        timeout: Option<Duration>,
+        cancellation: &aad_runtime::CancellationToken,
     ) -> std::result::Result<Value, aad_core::AutomationError> {
         // Accept the fully qualified id as well as the bare action name.
         let short = action
@@ -1330,7 +1557,12 @@ impl Provider for UiaDriver {
             .unwrap_or(action);
         let short = short.split_once('@').map(|(head, _)| head).unwrap_or(short);
 
-        self.call(short, &args)
+        let deadline = Instant::now()
+            .checked_add(timeout.unwrap_or(Duration::from_secs(30)))
+            .ok_or_else(|| {
+                DriverError::invalid("input timeout is too large").into_automation_error()
+            })?;
+        self.call_controlled(short, &args, deadline, cancellation)
             .map_err(DriverError::into_automation_error)
     }
 }
@@ -1367,6 +1599,10 @@ mod tests {
         nodes: Mutex<Vec<Node>>,
         performed: Mutex<Vec<String>>,
         verify_result: Mutex<bool>,
+        verify_delay: Mutex<Duration>,
+        cancel_on_verify: Mutex<Option<aad_runtime::CancellationToken>>,
+        received_deadlines: Mutex<Vec<Instant>>,
+        received_paths: Mutex<Vec<Vec<(f64, f64)>>>,
     }
 
     impl FakeBackend {
@@ -1375,6 +1611,10 @@ mod tests {
                 nodes: Mutex::new(nodes),
                 performed: Mutex::new(Vec::new()),
                 verify_result: Mutex::new(true),
+                verify_delay: Mutex::new(Duration::ZERO),
+                cancel_on_verify: Mutex::new(None),
+                received_deadlines: Mutex::new(Vec::new()),
+                received_paths: Mutex::new(Vec::new()),
             })
         }
 
@@ -1416,6 +1656,10 @@ mod tests {
         }
 
         fn verify(&self, _window_id: &str, _node: &Node) -> Result<bool> {
+            std::thread::sleep(*self.verify_delay.lock().unwrap());
+            if let Some(cancellation) = self.cancel_on_verify.lock().unwrap().as_ref() {
+                cancellation.cancel();
+            }
             Ok(*self.verify_result.lock().unwrap())
         }
 
@@ -1432,6 +1676,17 @@ mod tests {
         fn set_value(&self, _window_id: &str, node: &Node, value: &str) -> Result<()> {
             self.record(&format!("set_value:{}:{value}", node.node_id));
             Ok(())
+        }
+
+        fn secret_input(&self, _window_id: &str, _node: &Node, text: &str) -> Result<()> {
+            self.record("secret_input");
+            if text == "fixture-error" {
+                Err(DriverError::new("DRIVER.ACTION_FAILED", text)
+                    .with_detail("echo", json!(text))
+                    .with_effect("unknown"))
+            } else {
+                Ok(())
+            }
         }
 
         fn type_text(&self, _window_id: &str, node: &Node, text: &str) -> Result<()> {
@@ -1454,12 +1709,26 @@ mod tests {
             Ok(())
         }
 
+        fn key_chord_with_deadline(
+            &self,
+            window_id: &str,
+            node: &Node,
+            keys: &[String],
+            deadline: Instant,
+        ) -> Result<()> {
+            self.received_deadlines.lock().unwrap().push(deadline);
+            self.key_chord(window_id, node, keys)
+        }
+
         fn pointer_gesture(
             &self,
             _window_id: &str,
             node: &Node,
             gesture: &PointerGesture,
         ) -> Result<()> {
+            if let Some(deadline) = gesture.deadline {
+                self.received_deadlines.lock().unwrap().push(deadline);
+            }
             self.record(&format!(
                 "pointer_gesture:{}:{:?}x{}",
                 node.node_id, gesture.button, gesture.count
@@ -1472,8 +1741,12 @@ mod tests {
             _window_id: &str,
             from: &Node,
             to: &Node,
-            _gesture: &PointerGesture,
+            gesture: &PointerGesture,
         ) -> Result<()> {
+            self.received_paths
+                .lock()
+                .unwrap()
+                .push(gesture.path.clone());
             self.record(&format!("drag:{}->{}", from.node_id, to.node_id));
             Ok(())
         }
@@ -1536,6 +1809,78 @@ mod tests {
     }
 
     #[test]
+    fn cancellation_during_fresh_verification_prevents_element_input() {
+        for (action, extra) in [
+            ("invoke", json!({})),
+            ("type_text", json!({"text":"fixture"})),
+            ("key_chord", json!({"keys":["a"],"hold_ms":5000})),
+            ("pointer_gesture", json!({"hold_ms":5000})),
+            ("paste", json!({"text":"fixture"})),
+        ] {
+            let (driver, backend) = driver(vec![node("n1", "Edit", "Entry", &[action])]);
+            let found = driver
+                .call(
+                    "find",
+                    &json!({"window_id":"w1","locator":{"name":"Entry"}}),
+                )
+                .unwrap();
+            let cancellation = aad_runtime::CancellationToken::new();
+            *backend.cancel_on_verify.lock().unwrap() = Some(cancellation.clone());
+            let mut args = extra;
+            args["target"] = target_of(&found);
+            let error = driver
+                .invoke_cancellable(action, args, Some(Duration::from_secs(10)), &cancellation)
+                .unwrap_err();
+            assert_eq!(error.code, "DRIVER.CANCELLED");
+            assert_eq!(error.effect, "not_applied");
+            assert!(
+                backend.performed().is_empty(),
+                "{action} dispatched after cancellation"
+            );
+        }
+    }
+
+    #[test]
+    fn provider_deadlines_reach_gestures_and_expiry_during_revalidation_refuses_input() {
+        let (driver, backend) = driver(vec![node(
+            "n1",
+            "Edit",
+            "Field",
+            &["key_chord", "pointer_gesture"],
+        )]);
+        let found = driver
+            .call(
+                "find",
+                &json!({"window_id":"w1","locator":{"name":"Field"}}),
+            )
+            .unwrap();
+        let args = json!({"target":target_of(&found),"keys":["a"]});
+        let before = Instant::now();
+        driver
+            .invoke("key_chord", args.clone(), Some(Duration::from_millis(250)))
+            .unwrap();
+        driver
+            .invoke(
+                "pointer_gesture",
+                args.clone(),
+                Some(Duration::from_millis(250)),
+            )
+            .unwrap();
+        let deadlines = backend.received_deadlines.lock().unwrap();
+        assert_eq!(deadlines.len(), 2);
+        assert!(deadlines.iter().all(|deadline| *deadline >= before
+            && *deadline <= Instant::now() + Duration::from_millis(250)));
+        drop(deadlines);
+        *backend.verify_delay.lock().unwrap() = Duration::from_millis(20);
+        let failure = driver
+            .invoke("key_chord", args, Some(Duration::from_millis(5)))
+            .unwrap_err();
+        assert_eq!(failure.code, "DRIVER.TIMEOUT");
+        assert_eq!(failure.effect, "not_applied");
+        assert_eq!(backend.performed().len(), 2);
+    }
+
+    #[test]
     fn a_target_from_another_session_cannot_authorize_a_write() {
         let nodes = vec![node("n1", "Button", "Save", &["invoke"])];
         let (first, _) = driver(nodes.clone());
@@ -1566,6 +1911,95 @@ mod tests {
     }
 
     #[test]
+    fn drag_path_reaches_backend_only_after_anchor_validation() {
+        let (driver, backend) = driver(vec![node("n1", "Pane", "Surface", &["drag"])]);
+        let source = driver
+            .call(
+                "find",
+                &json!({"window_id":"w1","locator":{"name":"Surface"}}),
+            )
+            .unwrap();
+        let target = target_of(&source);
+        let args = json!({"target":target,"to":target,"fraction":{"fx":0.1,"fy":0.2},
+            "to_fraction":{"fx":0.8,"fy":0.9},"path":[{"target":target,"fraction":{"fx":0.3,"fy":0.6}}]});
+        driver.call("drag", &args).unwrap();
+        assert_eq!(
+            *backend.received_paths.lock().unwrap(),
+            vec![vec![(0.3, 0.6)]]
+        );
+        let mut bad = args.clone();
+        bad["path"][0]["target"]["snapshot_id"] = json!("other");
+        assert!(driver.call("drag", &bad).is_err());
+        assert_eq!(backend.performed().len(), 1);
+    }
+
+    #[test]
+    fn drag_path_preserves_every_anchor_and_refuses_cross_surface_or_implicit_endpoints() {
+        let target = Target {
+            snapshot_id: "s1".into(),
+            revision: 1,
+            node_id: "n1".into(),
+        };
+        let args = json!({"fraction":{"fx":0.1,"fy":0.2},"to_fraction":{"fx":0.9,"fy":0.8},
+            "path":[{"target":target,"fraction":{"fx":0.3,"fy":0.7}},
+                    {"target":target,"fraction":{"fx":0.6,"fy":0.4}}]});
+        assert_eq!(
+            parse_drag_path(&args, &target, &target).unwrap(),
+            vec![(0.3, 0.7), (0.6, 0.4)]
+        );
+        let mut bad = args.clone();
+        bad["path"][0]["target"]["revision"] = json!(2);
+        assert!(parse_drag_path(&bad, &target, &target).is_err());
+        let mut bad = args.clone();
+        bad["path"][0]["target"]["node_id"] = json!("n2");
+        assert!(parse_drag_path(&bad, &target, &target).is_err());
+        let mut bad = args.clone();
+        bad.as_object_mut().unwrap().remove("fraction");
+        assert!(parse_drag_path(&bad, &target, &target).is_err());
+        let mut bad = args.clone();
+        bad["path"][0]["fraction"]["fx"] = json!(1.1);
+        assert!(parse_drag_path(&bad, &target, &target).is_err());
+        let mut bad = args.clone();
+        bad["path"] = json!(vec![args["path"][0].clone(); 33]);
+        assert!(parse_drag_path(&bad, &target, &target).is_err());
+        let other = Target {
+            node_id: "n2".into(),
+            ..target.clone()
+        };
+        assert!(parse_drag_path(&args, &target, &other).is_err());
+        assert!(parse_drag_path(&json!({"path":[]}), &target, &other)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn bounded_hold_parser_is_explicit_and_does_not_accept_scroll_or_double_click() {
+        assert_eq!(
+            parse_pointer_gesture(&json!({"hold_ms": 123}))
+                .unwrap()
+                .hold_ms,
+            Some(123)
+        );
+        assert_eq!(
+            parse_drag_gesture(&json!({"hold_ms": 5000}))
+                .unwrap()
+                .hold_ms,
+            Some(5000)
+        );
+        for args in [
+            json!({"hold_ms":0}),
+            json!({"hold_ms":5001}),
+            json!({"hold_ms":null}),
+            json!({"hold_ms":1.5}),
+            json!({"hold_ms":10,"count":2}),
+            json!({"hold_ms":10,"hover_ms":50}),
+            json!({"hold_ms":10,"scroll":{"direction":"down"}}),
+        ] {
+            assert!(parse_pointer_gesture(&args).is_err(), "{args}");
+        }
+    }
+
+    #[test]
     fn pointer_gesture_rejects_values_it_cannot_honour() {
         for arguments in [
             json!({"count": "2"}),
@@ -1590,6 +2024,34 @@ mod tests {
         assert_eq!(gesture.button, PointerButton::Right);
         assert_eq!(gesture.fraction, Some((0.1, 0.2)));
         assert_eq!(gesture.to_fraction, Some((0.8, 0.9)));
+    }
+
+    #[test]
+    fn pointer_modifiers_are_preserved_and_invalid_combinations_are_refused() {
+        for parse in [parse_pointer_gesture, parse_drag_gesture] {
+            let gesture = parse(&json!({"modifiers": ["ctrl", "shift", "alt", "meta"]})).unwrap();
+            assert_eq!(gesture.modifiers, ["ctrl", "shift", "alt", "meta"]);
+            assert!(parse(&json!({})).unwrap().modifiers.is_empty());
+            for value in [
+                json!(null),
+                json!("ctrl"),
+                json!(["ctrl", "ctrl"]),
+                json!(["win"]),
+                json!([1]),
+            ] {
+                let error = parse(&json!({"modifiers": value})).unwrap_err();
+                assert_eq!(error.code, "DRIVER.INVALID_REQUEST");
+            }
+        }
+        for args in [
+            json!({"modifiers": ["ctrl"], "scroll": {"direction": "down"}}),
+            json!({"modifiers": ["shift"], "hover_ms": 100}),
+        ] {
+            assert_eq!(
+                parse_pointer_gesture(&args).unwrap_err().code,
+                "DRIVER.INVALID_REQUEST"
+            );
+        }
     }
 
     #[test]
@@ -1854,6 +2316,70 @@ mod tests {
             .unwrap();
 
         assert_eq!(backend.performed(), vec!["set_value:n1:Ada".to_string()]);
+    }
+
+    #[test]
+    fn secret_replacement_revalidates_and_redacts_without_opening_ordinary_input() {
+        let mut field = node(
+            "n1",
+            "Edit",
+            "Password",
+            &[
+                "secret_input",
+                "set_value",
+                "type_text",
+                "paste",
+                "key_chord",
+            ],
+        );
+        field.states.protected = Some(true);
+        let (driver, backend) = driver(vec![field]);
+        let found = driver
+            .call(
+                "find",
+                &json!({"window_id":"w1","locator":{"name":"Password"}}),
+            )
+            .unwrap();
+        let target = target_of(&found);
+        for text in ["synthetic-fixture", ""] {
+            assert_eq!(
+                driver
+                    .call("secret_input", &json!({"target":target,"text":text}))
+                    .unwrap(),
+                json!({"submitted":true,"redacted":true})
+            );
+        }
+        let error = driver
+            .call(
+                "secret_input",
+                &json!({"target":target,"text":"fixture-error"}),
+            )
+            .unwrap_err();
+        assert_eq!(error.code, "DRIVER.SECRET_INPUT_FAILED");
+        assert_eq!(error.effect, "unknown");
+        assert!(!format!("{error:?}").contains("fixture-error"));
+        for action in ["set_value", "type_text", "paste", "key_chord"] {
+            assert_eq!(
+                driver
+                    .call(
+                        action,
+                        &json!({"target":target,"value":"fixture","text":"fixture","keys":["A"]})
+                    )
+                    .unwrap_err()
+                    .code,
+                "DRIVER.PROTECTED_ELEMENT"
+            );
+        }
+        for text in ["bad\n", "bad\0", "bad\r", &"a".repeat(1025)] {
+            assert!(driver
+                .call("secret_input", &json!({"target":target,"text":text}))
+                .is_err());
+        }
+        backend.set_verify(false);
+        assert!(driver
+            .call("secret_input", &json!({"target":target,"text":"fixture"}))
+            .is_err());
+        assert_eq!(backend.performed(), vec!["secret_input"; 3]);
     }
 
     #[test]

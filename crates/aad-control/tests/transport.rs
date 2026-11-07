@@ -341,3 +341,26 @@ fn reconnect_never_replays_pending_input_or_accepts_old_targets() {
     assert_eq!(rejected.error.unwrap()["code"], "CONTROL.SESSION_MISMATCH");
     assert_eq!(new.backend.writes.load(Ordering::SeqCst), 0);
 }
+
+/// A request issued while the client reader is handling the terminal response
+/// must fail fast. It once could register after the reader had exited and then
+/// wait out its whole timeout (seen about once in a hundred runs).
+#[test]
+fn requests_racing_a_terminal_response_fail_fast() {
+    for i in 0..300 {
+        let h = Harness::with_budget(false, Duration::ZERO, false, 2);
+        assert!(h.call(Operation::Capabilities {}).error.is_none());
+        assert_eq!(
+            h.call(Operation::Capabilities {}).error.unwrap()["code"],
+            "CONTROL.SESSION_LIMIT"
+        );
+        let start = Instant::now();
+        let response = h.call(Operation::Capabilities {});
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "iteration {i}: {} after {:?}",
+            response.error.unwrap()["code"],
+            start.elapsed()
+        );
+    }
+}
