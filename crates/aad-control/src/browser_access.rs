@@ -278,7 +278,14 @@ mod tests {
         std::fs::write(&file, "synthetic fixture").unwrap();
         std::fs::write(&outside, "outside fixture").unwrap();
         let policy = BrowserAccess::new(&[root.join("allowed")], &[]).unwrap();
-        let url = Url::from_file_path(&file).unwrap();
+        // The temp directory itself may be an alias (/var -> /private/var on
+        // macOS, an 8.3 short name on Windows); dispatch uses the canonical file.
+        let url = Url::from_file_path(file.canonicalize().unwrap()).unwrap();
+        let aliased = Url::from_file_path(&file).unwrap();
+        assert_eq!(
+            policy.navigation_url(aliased.as_str()).unwrap(),
+            url.as_str()
+        );
         assert_eq!(policy.navigation_url(url.as_str()).unwrap(), url.as_str());
         assert!(policy.check_document(url.as_str()).is_ok());
         assert!(policy
