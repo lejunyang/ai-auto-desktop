@@ -195,10 +195,13 @@ aad run 后台开权限 --permission desktop.input --permission desktop.observe
 osdk exec --tool rust -- cargo build --locked -p aad-cli -p aad-browser
 osdk exec --tool rust -- cargo test --locked -p aad-browser -p aad-cli
 osdk exec --tool rust -- cargo clippy --locked -p aad-browser -p aad-cli --all-targets -- -D warnings
-$env:AAD_TEST_CHROME = '/usr/bin/microsoft-edge'
-# Windows 需另外设置 AAD_TEST_CLI 指向 target/debug/aad.exe；当前 fixture 清理主要针对 Linux。
+# 任一 Chromium 系浏览器均可：测试按可执行文件名推断 --browser（msedge→edge、brave→brave，其余→chrome）。
+$env:AAD_TEST_CHROME = '/usr/bin/google-chrome'
+# 默认使用 target/debug/aad；AAD_TEST_CLI 可改指其他构建。Linux CI 每次提交都会运行。
 node --test --test-concurrency=1 tests/browser/launch.test.mjs tests/browser/observer.test.mjs tests/browser/recording.test.mjs
 ```
+
+Windows 11 + Chrome 本机串行 7/7 通过（2026-11-07）。Windows 上 Node 无法向子进程发送 Ctrl+C，生命周期用例改用 `browser-record stop` 优雅停止。本机 Edge 以相同参数启动后在 CDP 就绪前即以退出码 0 退出（无相关组策略），原因未查，Edge 下的这组用例 **[待验证]**。
 
 `[待验证]` Windows/macOS 的目标浏览器、真人中文 IME/物理点击、真实站点 SSO/扫码、企业策略，以及至少 30 分钟的性能与容量基准。当前结果不代表这些环境均已通过。
 
