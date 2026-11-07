@@ -462,7 +462,13 @@ mod tests {
                 if cancelled {
                     flag.store(true, std::sync::atomic::Ordering::SeqCst);
                 }
-                std::thread::sleep(std::time::Duration::from_millis(300));
+                // Hold the rest of the handshake well past the cancellation, so
+                // only cancellation (not completion) can end the wait in time.
+                std::thread::sleep(std::time::Duration::from_millis(if cancelled {
+                    1500
+                } else {
+                    300
+                }));
                 let _ = stream.write_all(&response.as_bytes()[10..]);
             });
             let start = Instant::now();
@@ -473,7 +479,7 @@ mod tests {
             );
             if cancelled {
                 assert!(result.is_err());
-                assert!(start.elapsed() < std::time::Duration::from_millis(350));
+                assert!(start.elapsed() < std::time::Duration::from_millis(1000));
             } else {
                 assert!(result.is_ok());
             }
