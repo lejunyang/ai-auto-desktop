@@ -1,4 +1,4 @@
-//! Read-only Chrome DevTools Protocol (CDP) client.
+//! Chrome DevTools Protocol (CDP) client for Chromium pages.
 //!
 //! Purpose: for Chromium-based apps (Edge/Chrome browsers, and Electron apps
 //! started with a debug port), read the *rendered* page text and user
@@ -9,32 +9,21 @@
 //! - only connects to loopback; the ambient observer never opens the browser,
 //!   navigates or dispatches input. `aad-control` uses the trusted low-level
 //!   command primitive for separately authorized, observed-element actions;
-//! - attaching requires an existing debug endpoint; explicit [`launch`] callers
-//!   can start an owned browser and open a URL after recording is installed;
+//! - attaching requires an existing debug endpoint; explicit
+//!   [`crate::launch`] callers can start an owned browser and open a URL after
+//!   recording is installed;
 //! - the injected script only attaches passive listeners and queues events;
 //!   it is removed by a page reload/navigation and re-installed by
 //!   [`Client::ensure_installed`].
 
+use crate::connection::Connection;
+use crate::ws::WebSocket;
 use serde::Serialize;
 use std::io::{Read, Write};
 use std::time::Duration;
 
-mod connection;
-pub mod launch;
-pub mod recording;
-mod tcp;
-mod ws;
-
-pub use connection::EventBatch;
-pub use ws::CdpError;
-
-/// Protocol-neutral local WebSocket framing and JSON request/reply transport.
-/// This does not construct or send CDP commands. Other local browser protocols
-/// keep their own sessions, methods, capabilities and error interpretation.
-pub mod transport {
-    pub use crate::connection::{Connection, EventBatch};
-    pub use crate::ws::{CdpError as TransportError, WebSocket};
-}
+pub use crate::connection::EventBatch;
+pub use crate::ws::CdpError;
 
 /// A page/frame target exposed at `/json/list`. The websocket field keeps the
 /// devtools protocol's camelCase name; it is an external contract.
@@ -106,9 +95,9 @@ pub fn observer_script(binding: &str) -> String {
 
 /// A connected CDP page session.
 pub struct Client {
-    connection: connection::Connection,
-    next_id: u64,
-    deadline: Option<std::time::Instant>,
+    pub(crate) connection: Connection,
+    pub(crate) next_id: u64,
+    pub(crate) deadline: Option<std::time::Instant>,
 }
 
 impl Client {
@@ -171,13 +160,13 @@ impl Client {
         deadline: std::time::Instant,
         cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     ) -> Result<Self, CdpError> {
-        let ws = ws::WebSocket::connect_cancellable(
+        let ws = WebSocket::connect_cancellable(
             &target.webSocketDebuggerUrl,
             deadline,
             cancel.as_deref(),
         )?;
         let mut client = Client {
-            connection: connection::Connection::new(ws)?,
+            connection: Connection::new(ws)?,
             next_id: 0,
             deadline: Some(deadline),
         };
@@ -195,9 +184,9 @@ impl Client {
         target: &Target,
         deadline: std::time::Instant,
     ) -> Result<Self, CdpError> {
-        let ws = ws::WebSocket::connect_until(&target.webSocketDebuggerUrl, deadline)?;
+        let ws = WebSocket::connect_until(&target.webSocketDebuggerUrl, deadline)?;
         Ok(Client {
-            connection: connection::Connection::new(ws)?,
+            connection: Connection::new(ws)?,
             next_id: 0,
             deadline: None,
         })
@@ -221,10 +210,10 @@ impl Client {
             serde_json::from_str(&body).map_err(|error| CdpError::protocol(error.to_string()))?;
         let endpoint = browser_endpoint(port, value["webSocketDebuggerUrl"].as_str())?;
         let identity = endpoint.rsplit('/').next().unwrap().to_string();
-        let ws = ws::WebSocket::connect_until(&endpoint, deadline)?;
+        let ws = WebSocket::connect_until(&endpoint, deadline)?;
         Ok((
             Client {
-                connection: connection::Connection::new(ws)?,
+                connection: Connection::new(ws)?,
                 next_id: 0,
                 deadline: None,
             },
@@ -428,7 +417,7 @@ fn http_get_cancellable(
             .ok_or_else(|| CdpError::connect("HTTP deadline elapsed"))
     };
     let address = std::net::SocketAddr::from(([127, 0, 0, 1], port));
-    let mut stream = tcp::connect(address, deadline, cancel, "http")?;
+    let mut stream = crate::tcp::connect(address, deadline, cancel, "http")?;
     stream
         .set_write_timeout(Some(remaining()?))
         .map_err(CdpError::io)?;

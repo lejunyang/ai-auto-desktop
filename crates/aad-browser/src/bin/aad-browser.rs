@@ -1,5 +1,5 @@
 //! Standalone startup for legacy watch users, with explicit profile selection.
-use aad_cdp::launch::{
+use aad_browser::launch::{
     browser_exe, copy_selected_profile, ensure_available, list_profiles, real_user_data,
     select_profile,
 };
@@ -65,7 +65,7 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if args.port == 0 {
         return Err("aad-browser requires an explicit nonzero port; browser-record automatically allocates a port".into());
     }
-    if aad_cdp::Client::available(args.port) {
+    if aad_browser::cdp::Client::available(args.port) {
         return Err(
             "CDP port is already occupied; choose another port (no browser was closed)".into(),
         );
@@ -79,7 +79,7 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             source,
             args.existing_profile.as_ref().and_then(|id| id.as_deref()),
         )?;
-        aad_cdp::launch::validate_copy_destination(source, &work)?;
+        aad_browser::launch::validate_copy_destination(source, &work)?;
         ensure_available(source, &args.browser, args.kill_browser)?;
         copy_selected_profile(source, &work, &id)?;
         eprintln!("Using existing profile {id} via a working login copy.");
@@ -113,7 +113,7 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         if child.try_wait()?.is_some() {
             break;
         }
-        if aad_cdp::Client::available(args.port) {
+        if aad_browser::cdp::Client::available(args.port) {
             ready = true;
             break;
         }

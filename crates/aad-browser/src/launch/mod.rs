@@ -9,7 +9,7 @@ pub use profile::{
     select_profile, selected_profile, validate_copy_destination,
 };
 
-use crate::{connection::Connection, ws::WebSocket, Client};
+use crate::{cdp::Client, connection::Connection, ws::WebSocket};
 use serde_json::json;
 use std::fs;
 use std::path::{Path, PathBuf};

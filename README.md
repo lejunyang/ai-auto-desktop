@@ -706,6 +706,7 @@ crates/
   aad-atspi     Linux AT-SPI / X11 驱动（只在 Linux 上依赖）
   aad-macos-ax  macOS AX 的 Rust adapter 与 Swift helper 协议（只在 macOS 上依赖）
   aad-probe     只读能力探测（汇总报告；各系统的检查在对应平台 crate 里）
+  aad-browser   本地浏览器协议：Chromium CDP 与 Firefox WebDriver BiDi、浏览器启动与资料租约、页面录制
   aad-mcp       stdio 上的 MCP server
   aad-cli       aad 可执行文件
 gui/            Tauri + Vue 桌面窗口

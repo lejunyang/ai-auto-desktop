@@ -276,7 +276,7 @@ impl Fixture {
         // only for initial startup; navigation can temporarily publish an empty
         // URL and must never redirect this verifier to another page.
         loop {
-            if let Ok(targets) = aad_cdp::Client::list_targets(fixture.port) {
+            if let Ok(targets) = aad_browser::cdp::Client::list_targets(fixture.port) {
                 if let Some(target) = targets.iter().find(|t| t.url.starts_with(&fixture.url)) {
                     fixture.page_id = target.id.clone();
                     break;
@@ -287,13 +287,13 @@ impl Fixture {
         }
         fixture
     }
-    fn client(&self) -> aad_cdp::Client {
-        let target = aad_cdp::Client::list_targets(self.port)
+    fn client(&self) -> aad_browser::cdp::Client {
+        let target = aad_browser::cdp::Client::list_targets(self.port)
             .unwrap()
             .into_iter()
             .find(|t| t.id == self.page_id)
             .expect("the fixture's explicit page target disappeared");
-        aad_cdp::Client::attach(&target).unwrap()
+        aad_browser::cdp::Client::attach(&target).unwrap()
     }
 }
 impl Drop for Fixture {
@@ -553,7 +553,7 @@ fn delegated_icons_click_without_advertising_unusable_keyboard_input() {
 #[test]
 #[ignore = "requires isolated Chromium with its sandbox enabled; CI runs it explicitly"]
 fn a_recorded_browser_task_replays_as_saved_steps() {
-    use aad_cdp::recording::{Options, Recorder};
+    use aad_browser::recording::{Options, Recorder};
     let _serial = serial();
     let fixture = Fixture::new();
     let (session, _) = session_for(&fixture);
@@ -2013,7 +2013,7 @@ fn verified_headless_instances_are_isolated_but_all_attachments_share_ownership(
 
     // Exercise the actual shared launcher, including its automation switch,
     // as well as an independently started browser attached only by port.
-    let second = aad_cdp::launch::Browser::start(aad_cdp::launch::Options {
+    let second = aad_browser::launch::Browser::start(aad_browser::launch::Options {
         browser: "chrome".into(),
         executable: Some(std::env::var_os("AAD_TEST_CHROME").unwrap().into()),
         profile_dir: None,
@@ -3380,12 +3380,12 @@ fn wait_returns_an_element_that_appears_after_a_timer_ready_to_act_on() {
 }
 
 fn visibility(fixture: &Fixture, page_id: &str) -> String {
-    let target = aad_cdp::Client::list_targets(fixture.port)
+    let target = aad_browser::cdp::Client::list_targets(fixture.port)
         .unwrap()
         .into_iter()
         .find(|t| t.id == page_id)
         .expect("page is listed");
-    aad_cdp::Client::attach(&target)
+    aad_browser::cdp::Client::attach(&target)
         .unwrap()
         .eval("document.visibilityState")
         .unwrap()["result"]["value"]

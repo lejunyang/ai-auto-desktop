@@ -419,13 +419,13 @@ mod tests {
             flag.store(true, std::sync::atomic::Ordering::SeqCst);
             held.recv().unwrap();
         });
-        let target: crate::Target = serde_json::from_value(serde_json::json!({
+        let target: crate::cdp::Target = serde_json::from_value(serde_json::json!({
             "id":"test", "type":"page", "title":"", "url":"about:blank",
             "webSocketDebuggerUrl":format!("ws://{address}/test")
         }))
         .unwrap();
         let start = Instant::now();
-        assert!(crate::Client::attach_cancellable(
+        assert!(crate::cdp::Client::attach_cancellable(
             &target,
             start + std::time::Duration::from_secs(10),
             Some(cancel)

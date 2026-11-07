@@ -17,7 +17,7 @@ try {
     $target = (($compiler | Where-Object { $_ -like 'host: *' }) -replace '^host: ', '').Trim()
     if ($target -notmatch '^(x86_64|aarch64)-unknown-linux-gnu$') { throw "Unsupported native host: $target" }
     $targetDirectory = Join-Path $repository "target"
-    & osdk exec -- cargo build --release --locked -p aad-cli -p aad-cdp --bins --target $target --target-dir $targetDirectory
+    & osdk exec -- cargo build --release --locked -p aad-cli -p aad-browser --bins --target $target --target-dir $targetDirectory
     if ($LASTEXITCODE) { throw 'Rust build failed' }
     $env:AI_AUTO_DESKTOP_LINUX_ATSPI_BUILD_DIR = Join-Path $repository "plugins/linux_atspi/.build-$target"
     foreach ($helper in @('xtest', 'capture')) {

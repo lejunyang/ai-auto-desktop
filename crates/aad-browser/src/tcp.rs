@@ -1,4 +1,4 @@
-use crate::CdpError;
+use crate::ws::CdpError;
 use socket2::{Domain, Protocol, Socket, Type};
 use std::net::{SocketAddr, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -93,7 +93,7 @@ mod tests {
                         )
                         .map(|_| ())
                     } else {
-                        crate::http_get_cancellable(
+                        crate::cdp::http_get_cancellable(
                             address.port(),
                             "/json/list",
                             deadline,

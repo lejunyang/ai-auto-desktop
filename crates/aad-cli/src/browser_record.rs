@@ -1,4 +1,4 @@
-use aad_cdp::recording::{self, Options};
+use aad_browser::recording::{self, Options};
 use clap::{Args, Subcommand};
 use serde_json::{json, Value};
 use std::path::PathBuf;
@@ -120,11 +120,11 @@ pub fn run(command: &Command) -> recording::Result<Value> {
         } => {
             let root = source_root(browser, profile_source)?;
             Ok(
-                json!({"browser":browser,"profile_source":root,"profiles":aad_cdp::launch::list_profiles(&root)?}),
+                json!({"browser":browser,"profile_source":root,"profiles":aad_browser::launch::list_profiles(&root)?}),
             )
         }
         Command::Targets { cdp_port } => Ok(
-            json!({"pages":aad_cdp::Client::list_targets(*cdp_port)?.iter().map(|p|json!({"id":p.id,"title":p.title,"url":p.url})).collect::<Vec<_>>()}),
+            json!({"pages":aad_browser::cdp::Client::list_targets(*cdp_port)?.iter().map(|p|json!({"id":p.id,"title":p.title,"url":p.url})).collect::<Vec<_>>()}),
         ),
         Command::Start(args) => {
             if args.out.exists() {
@@ -143,7 +143,9 @@ pub fn run(command: &Command) -> recording::Result<Value> {
                     None
                 };
                 let profile_id = match (&source, &args.existing_profile) {
-                    (Some(root), Some(id)) => aad_cdp::launch::select_profile(root, id.as_deref())?,
+                    (Some(root), Some(id)) => {
+                        aad_browser::launch::select_profile(root, id.as_deref())?
+                    }
                     _ => "Default".into(),
                 };
                 if let Some(root) = &source {
@@ -152,15 +154,17 @@ pub fn run(command: &Command) -> recording::Result<Value> {
                         root.display()
                     );
                 }
-                Some(aad_cdp::launch::Browser::start(aad_cdp::launch::Options {
-                    browser: name.clone(),
-                    executable: args.browser_executable.clone(),
-                    profile_dir: args.profile_dir.clone(),
-                    copy_from: source,
-                    profile_id,
-                    kill_browser: args.kill_browser,
-                    headless: args.headless,
-                })?)
+                Some(aad_browser::launch::Browser::start(
+                    aad_browser::launch::Options {
+                        browser: name.clone(),
+                        executable: args.browser_executable.clone(),
+                        profile_dir: args.profile_dir.clone(),
+                        copy_from: source,
+                        profile_id,
+                        kill_browser: args.kill_browser,
+                        headless: args.headless,
+                    },
+                )?)
             } else {
                 None
             };
@@ -231,7 +235,7 @@ pub fn run(command: &Command) -> recording::Result<Value> {
 fn source_root(browser: &str, explicit: &Option<PathBuf>) -> recording::Result<PathBuf> {
     explicit
         .clone()
-        .or_else(|| aad_cdp::launch::real_user_data(browser))
+        .or_else(|| aad_browser::launch::real_user_data(browser))
         .ok_or_else(|| {
             "browser profile source not found; use --profile-source <user-data-dir>".into()
         })

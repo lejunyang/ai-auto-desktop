@@ -1,5 +1,5 @@
 //! Probe just the hand-rolled WebSocket against a live browser.
-use aad_cdp::Client;
+use aad_browser::cdp::Client;
 fn main() {
     let port: u16 = std::env::args()
         .nth(1)

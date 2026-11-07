@@ -1,9 +1,10 @@
 //! A persistent, explicitly attached Firefox WebDriver BiDi session.
 //!
-//! Only the local WebSocket framing/request multiplexer is shared with CDP.
+//! Only the local WebSocket framing/request multiplexer ([`crate::transport`])
+//! is shared with CDP.
 //! No CDP command, page attach, fallback or browser launch happens here.
 
-use aad_cdp::transport::{Connection, EventBatch, TransportError, WebSocket};
+use crate::transport::{Connection, EventBatch, TransportError, WebSocket};
 use serde_json::{json, Value};
 use std::sync::{atomic::AtomicBool, Arc};
 use std::time::{Duration, Instant};

@@ -4,7 +4,7 @@ use crate::{
     browser_access::BrowserAccess, error, native::resource_id, Action, Backend, BackendResource,
     Button, Context, Direction, Expect, Locator, Resource, Result, TypeMode,
 };
-use aad_bidi::Client;
+use aad_browser::bidi::Client;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{Mutex, MutexGuard, TryLockError};
@@ -53,7 +53,7 @@ fn unsupported() -> aad_core::AutomationError {
     )
 }
 
-fn protocol_error(_: aad_cdp::CdpError) -> aad_core::AutomationError {
+fn protocol_error(_: aad_browser::cdp::CdpError) -> aad_core::AutomationError {
     // Protocol exceptions may contain a page's text, arguments or script source.
     // Keep them private rather than copying an exception into a control result.
     error(

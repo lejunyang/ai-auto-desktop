@@ -1,11 +1,11 @@
 [package]
-name = "aad-cdp"
+name = "aad-browser"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Read-only Chrome DevTools Protocol client for observing Chromium page text and activity"
+description = "Local browser protocol clients (Chromium CDP, Firefox WebDriver BiDi) and owned-browser lifecycle"
 
 [features]
 lifecycle-test-hooks = []

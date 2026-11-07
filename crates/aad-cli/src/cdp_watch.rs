@@ -6,7 +6,7 @@
 //! browser or injects input; it only attaches to a port the user explicitly
 //! enabled with `--remote-debugging-port`.
 
-use aad_cdp::{Client, ObservedActivity, PageState, Target};
+use aad_browser::cdp::{Client, ObservedActivity, PageState, Target};
 use std::collections::HashMap;
 
 /// Tracks one attached CDP browser session across watch loops, keyed by the

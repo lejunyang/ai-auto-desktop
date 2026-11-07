@@ -6,7 +6,7 @@
 // prints rendered text plus observed click/input events. Usage:
 //   cdp_observe_probe [port]
 
-use aad_cdp::{Client, PageState};
+use aad_browser::cdp::{Client, PageState};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
@@ -151,7 +151,7 @@ fn run(port: u16) -> Result<(), Box<dyn std::error::Error>> {
     let events = client.drain_activity()?;
     println!("ACTIVITY events={}", events.len());
     for event in &events {
-        let aad_cdp::ObservedActivity {
+        let aad_browser::cdp::ObservedActivity {
             kind,
             label,
             tag,

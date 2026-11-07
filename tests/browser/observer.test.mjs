@@ -4,7 +4,7 @@ import {readFileSync} from 'node:fs';
 import vm from 'node:vm';
 import {fixture} from './fixture.mjs';
 
-const script=readFileSync(new URL('../../crates/aad-cdp/src/observer.js',import.meta.url),'utf8').replace('__AAD_BINDING__','');
+const script=readFileSync(new URL('../../crates/aad-browser/src/observer.js',import.meta.url),'utf8').replace('__AAD_BINDING__','');
 test('preserve action order, repeated clicks and distinct unlabeled fields; bound the queue',()=>{
   const handlers=new Map();
   const context={document:{addEventListener:(n,f)=>handlers.set(n,f),removeEventListener:()=>{}},location:{href:'fixture'},performance,Date,Math};

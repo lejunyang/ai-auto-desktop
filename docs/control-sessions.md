@@ -437,8 +437,8 @@ aad mcp --allow-input --allow-upload-dir D:\to-upload  # 浏览器 upload 只能
 ```
 
 会话总带一个浏览器 provider，没连接时没有页面；`Session::attach_browser(port)` 之后换成那个浏览器
-（旧的浏览器观察作废）。MCP 的 `browser_open` 用 `aad_cdp::launch` 启动浏览器后就这样接上，
-`browser_record_*` 复用 `aad_cdp::recording` 写到存储目录的 `browser/<时间>-<id>/`。
+（旧的浏览器观察作废）。MCP 的 `browser_open` 用 `aad_browser::launch` 启动浏览器后就这样接上，
+`browser_record_*` 复用 `aad_browser::recording` 写到存储目录的 `browser/<时间>-<id>/`。
 `Capture { target }` 是只读操作：Chromium/CDP 把元素滚进视口后用 `Page.captureScreenshot` 按元素框裁剪
 （最大 4096×8192，超出时 `clipped: true`），会话加上 PNG 的 sha256 作为 `digest`。只支持主框架；
 桌面窗口见上文（Windows、Linux、macOS）；不提供截图的 provider 返回 `CONTROL.ACTION_UNSUPPORTED`。

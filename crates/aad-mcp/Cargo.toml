@@ -8,12 +8,12 @@ repository.workspace = true
 description = "Model Context Protocol server exposing desktop discovery and automation"
 
 [features]
-lifecycle-test-hooks = ["aad-cdp/lifecycle-test-hooks"]
+lifecycle-test-hooks = ["aad-browser/lifecycle-test-hooks"]
 
 [dependencies]
 aad-core = { workspace = true }
 aad-control = { workspace = true }
-aad-cdp = { workspace = true }
+aad-browser = { workspace = true }
 aad-ocr = { workspace = true }
 aad-probe = { workspace = true }
 aad-runtime = { workspace = true }

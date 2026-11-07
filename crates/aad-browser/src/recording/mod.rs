@@ -3,7 +3,7 @@ pub mod network;
 mod storage;
 pub use storage::control;
 
-use crate::{observer_script, Client, Target};
+use crate::cdp::{observer_script, Client, Target};
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};

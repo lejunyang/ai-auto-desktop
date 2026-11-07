@@ -1,5 +1,5 @@
 //! One continuous socket reader; command replies never compete with observers.
-use crate::{ws::WebSocket, CdpError};
+use crate::ws::{CdpError, WebSocket};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{mpsc, Arc, Mutex};

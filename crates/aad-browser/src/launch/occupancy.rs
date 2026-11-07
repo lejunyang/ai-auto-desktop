@@ -263,7 +263,7 @@ pub(super) fn ensure_available_guarded(
             .lines()
             .next()
             .and_then(|s| s.parse().ok())
-            .is_some_and(crate::Client::available)
+            .is_some_and(crate::cdp::Client::available)
         {
             return Err("profile has an active CDP endpoint with no verified owner; attach with --page or close it manually".into());
         }

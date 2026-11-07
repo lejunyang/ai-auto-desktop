@@ -20,15 +20,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "aad-bidi"
-version = "0.0.8"
-dependencies = [
- "aad-cdp",
- "serde_json",
-]
-
-[[package]]
-name = "aad-cdp"
+name = "aad-browser"
 version = "0.0.8"
 dependencies = [
  "base64 0.22.1",
@@ -49,7 +41,7 @@ name = "aad-cli"
 version = "0.0.8"
 dependencies = [
  "aad-atspi",
- "aad-cdp",
+ "aad-browser",
  "aad-control",
  "aad-core",
  "aad-desktop",
@@ -82,8 +74,7 @@ name = "aad-control"
 version = "0.0.8"
 dependencies = [
  "aad-atspi",
- "aad-bidi",
- "aad-cdp",
+ "aad-browser",
  "aad-core",
  "aad-desktop",
  "aad-macos-ax",
@@ -199,7 +190,7 @@ dependencies = [
 name = "aad-mcp"
 version = "0.0.8"
 dependencies = [
- "aad-cdp",
+ "aad-browser",
  "aad-control",
  "aad-core",
  "aad-desktop",

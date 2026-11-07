@@ -3,7 +3,7 @@ use crate::{
     error, native::resource_id, Action, Backend, BackendResource, Button, Direction,
     PointerModifier, Resource, Result, PAGE_ACTIONS, TAB_ACTIONS,
 };
-use aad_cdp::{Client, Target};
+use aad_browser::cdp::{Client, Target};
 use aad_core::AutomationError;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -280,7 +280,7 @@ impl NetworkLog {
                 self.entries.push_back(json!({
                     "request_id": id,
                     "method": params["request"]["method"],
-                    "url": aad_cdp::recording::network::redact_url(url).chars().take(2048).collect::<String>(),
+                    "url": aad_browser::recording::network::redact_url(url).chars().take(2048).collect::<String>(),
                     "resource_type": params["type"],
                     "state": "pending",
                     "status": null,
@@ -378,7 +378,7 @@ impl Page {
                     .unwrap_or_default();
                 let mut details = json!({"url":url,"frame_id":params["frameId"].as_str().or_else(||params["frame"]["id"].as_str()),
                     "method":event["method"]});
-                aad_cdp::recording::network::redact(&mut details);
+                aad_browser::recording::network::redact(&mut details);
                 self.history.lock().unwrap().record("navigation", details);
             }
             if event.get("sessionId").is_none() && self.network.apply(&event) {
@@ -1096,7 +1096,7 @@ impl BrowserBackend {
     }
 }
 
-fn cdp_error(e: aad_cdp::CdpError) -> AutomationError {
+fn cdp_error(e: aad_browser::cdp::CdpError) -> AutomationError {
     if e.interrupted_by() == Some(DIALOG_OPENING) {
         return error(
             "CONTROL.DIALOG_OPEN",
@@ -2402,7 +2402,7 @@ impl Backend for BrowserBackend {
                 .ok_or_else(||error("BROWSER.BAD_RESULT","frame did not provide an isolated context"))?;
             let context=Ctx::new(session.clone(),context);
             let nonce=serde_json::to_string(&uuid::Uuid::new_v4().to_string()).unwrap();
-            eval(client,&context,include_str!("browser.js").replace("/*AAD_NAMING*/",aad_cdp::NAMING).replace("NONCE",&nonce))?;
+            eval(client,&context,include_str!("browser.js").replace("/*AAD_NAMING*/",aad_browser::cdp::NAMING).replace("NONCE",&nonce))?;
             self.restore_secrets(client,&context,page_id,frame_id,&frame["loaderId"])?;
             let observation=uuid::Uuid::new_v4().to_string();
             *self.last_context.lock().unwrap()=Some((page_id.into(),context.clone()));
@@ -2848,7 +2848,7 @@ impl BrowserBackend {
                 Value::Null
             };
             Ok(json!({
-                "url": aad_cdp::recording::network::redact_url(&url),
+                "url": aad_browser::recording::network::redact_url(&url),
                 "origin": origin,
                 "cookies": cookies,
                 "cookie_count": all.len(),
@@ -2897,7 +2897,7 @@ impl BrowserBackend {
                             let text = body["body"].as_str().unwrap_or_default();
                             let mut shown = match serde_json::from_str::<Value>(text) {
                                 Ok(mut parsed) => {
-                                    aad_cdp::recording::network::redact(&mut parsed);
+                                    aad_browser::recording::network::redact(&mut parsed);
                                     parsed.to_string()
                                 }
                                 Err(_) => text.to_string(),
@@ -3040,7 +3040,7 @@ impl BrowserBackend {
                     let id=created["executionContextId"].as_i64().ok_or_else(||error("BROWSER.BAD_RESULT","no protected frame context"))?;
                     let context=Ctx::new(current.session,id);
                     let nonce=serde_json::to_string(&uuid::Uuid::new_v4().to_string()).unwrap();
-                    eval(&mut page.client,&context,include_str!("browser.js").replace("/*AAD_NAMING*/",aad_cdp::NAMING).replace("NONCE",&nonce))?;
+                    eval(&mut page.client,&context,include_str!("browser.js").replace("/*AAD_NAMING*/",aad_browser::cdp::NAMING).replace("NONCE",&nonce))?;
                     self.restore_secrets(&mut page.client,&context,page_id,&key.1,&current.frame["loaderId"])?;
                     eval(&mut page.client,&context,"globalThis.__aadControlV1.secrets_visible()".into())
                 })().map_err(|_|error("CONTROL.ACTION_UNSUPPORTED","capture cannot confirm protected child-frame visibility"))?;
@@ -3060,7 +3060,7 @@ impl BrowserBackend {
                     let id=created["executionContextId"].as_i64().ok_or_else(||error("BROWSER.BAD_RESULT","no child context"))?;
                     let context=Ctx::new(entry.session.clone(),id);
                     let nonce=serde_json::to_string(&uuid::Uuid::new_v4().to_string()).unwrap();
-                    eval(&mut page.client,&context,include_str!("browser.js").replace("/*AAD_NAMING*/",aad_cdp::NAMING).replace("NONCE",&nonce))?;
+                    eval(&mut page.client,&context,include_str!("browser.js").replace("/*AAD_NAMING*/",aad_browser::cdp::NAMING).replace("NONCE",&nonce))?;
                     refresh_closed_roots(&mut page.client,&context,None,true)?;
                     Ok(eval(&mut page.client,&context,"globalThis.__aadControlV1.closed_protected_visible()".into())?==false)
                 })().unwrap_or(false);
@@ -4609,10 +4609,13 @@ mod tests {
         assert_eq!(refused.effect, "not_applied");
         assert_eq!(refused.details["dialog"]["message"], "Your name?");
         assert_eq!(
-            cdp_error(aad_cdp::CdpError::Interrupted(DIALOG_OPENING.into())).code,
+            cdp_error(aad_browser::cdp::CdpError::Interrupted(
+                DIALOG_OPENING.into()
+            ))
+            .code,
             "CONTROL.DIALOG_OPEN"
         );
-        let lost = cdp_error(aad_cdp::CdpError::protocol(
+        let lost = cdp_error(aad_browser::cdp::CdpError::protocol(
             r#"{"code":-32000,"message":"Cannot find context with specified id"}"#,
         ));
         assert_eq!(
