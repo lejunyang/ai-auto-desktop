@@ -83,7 +83,48 @@ fn profile_argument(process: &Process, args: &[String]) -> Result<Option<PathBuf
     Ok(None)
 }
 
-fn roots(system: &System, path: &Path, browser: &str) -> Result<Vec<Pid>> {
+/// One pass over the process table: the browsers proven to own `path`, or the
+/// first browser-family process whose profile/owner could not be read.
+enum Scan {
+    Owners(Vec<Pid>),
+    Unverified(Pid),
+}
+
+/// Browser processes that own `path`. A process caught while starting or
+/// exiting briefly exposes no command line, executable or owner (on Windows
+/// the system Edge and WebView2 hosts spawn and reap children constantly), so
+/// rescan for a short while before treating it as an unverifiable owner.
+fn roots(system: &mut System, path: &Path, browser: &str) -> Result<Vec<Pid>> {
+    settle(|| scan(system, path, browser), std::thread::sleep)
+}
+
+const SETTLE_STEP: Duration = Duration::from_millis(100);
+const SETTLE_STEPS: u32 = 20;
+
+/// Repeat `scan` while some browser process is unverifiable, up to
+/// `SETTLE_STEPS` waits. Only a process that stays unreadable that long is
+/// reported; any other scan error is returned at once.
+fn settle(
+    mut scan: impl FnMut() -> Result<Scan>,
+    mut wait: impl FnMut(Duration),
+) -> Result<Vec<Pid>> {
+    let mut waits = 0;
+    loop {
+        match scan()? {
+            Scan::Owners(owners) => return Ok(owners),
+            Scan::Unverified(pid) if waits >= SETTLE_STEPS => {
+                return Err(format!("cannot verify browser PID {pid}'s profile/owner; close it manually (even --kill-browser cannot select it safely)").into());
+            }
+            Scan::Unverified(_) => {
+                wait(SETTLE_STEP);
+                waits += 1;
+            }
+        }
+    }
+}
+
+fn scan(system: &mut System, path: &Path, browser: &str) -> Result<Scan> {
+    refresh(system);
     let uid = system
         .process(Pid::from_u32(std::process::id()))
         .and_then(Process::user_id)
@@ -113,14 +154,14 @@ fn roots(system: &System, path: &Path, browser: &str) -> Result<Vec<Pid>> {
             continue;
         }
         if process.cmd().is_empty() || process.exe().is_none() || process.user_id().is_none() {
-            return Err(format!("cannot verify browser PID {pid}'s profile/owner; close it manually (even --kill-browser cannot select it safely)").into());
+            return Ok(Scan::Unverified(*pid));
         }
         let directory = profile_argument(process, &args)?.or_else(|| default.clone());
         if directory.as_deref() == Some(path) {
             found.push(*pid);
         }
     }
-    Ok(found)
+    Ok(Scan::Owners(found))
 }
 
 #[derive(Clone)]
@@ -156,8 +197,7 @@ pub(super) fn ensure_available_guarded(
     }
     let path = path.canonicalize()?;
     let mut system = System::new();
-    refresh(&mut system);
-    let owners = roots(&system, &path, browser)?;
+    let owners = roots(&mut system, &path, browser)?;
     if !owners.is_empty() && !kill {
         return Err(format!("profile source/working directory {} is occupied by browser PID(s) {}; close it or add --kill-browser to close all browser windows sharing this user-data directory and start again", path.display(), owners.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ")).into());
     }
@@ -186,9 +226,9 @@ pub(super) fn ensure_available_guarded(
                 break;
             }
         }
-        // Refresh before sending signals to guard against exited/reused PIDs.
-        refresh(&mut system);
-        let confirmed = roots(&system, &path, browser)?;
+        // Rescan (which refreshes) before sending signals to guard against
+        // exited/reused PIDs.
+        let confirmed = roots(&mut system, &path, browser)?;
         for pid in &owners {
             if let Some(process) = system
                 .process(*pid)
@@ -228,7 +268,7 @@ pub(super) fn ensure_available_guarded(
             }
             std::thread::sleep(Duration::from_millis(100));
         }
-        if !roots(&system, &path, browser)?.is_empty() {
+        if !roots(&mut system, &path, browser)?.is_empty() {
             return Err("another browser acquired the profile during shutdown; retry".into());
         }
         // A forced exit can leave Chromium's PID symlink behind. Remove only
@@ -254,6 +294,19 @@ pub(super) fn ensure_available_guarded(
         }
     }
     super::lease::check(&path)?;
+    // Windows counterpart of SingletonLock: a running Chromium holds
+    // `lockfile` open sharing only reads, so a write open fails with a sharing
+    // violation. A stale file left by a crash opens; nothing is written.
+    #[cfg(windows)]
+    if let Err(error) = std::fs::OpenOptions::new()
+        .write(true)
+        .open(path.join("lockfile"))
+    {
+        const ERROR_SHARING_VIOLATION: i32 = 32;
+        if error.raw_os_error() == Some(ERROR_SHARING_VIOLATION) {
+            return Err("profile has a browser lock but its owner cannot be verified; close it manually. --kill-browser never kills an unverified process".into());
+        }
+    }
     #[cfg(unix)]
     if std::fs::symlink_metadata(path.join("SingletonLock")).is_ok() {
         return Err("profile has a browser lock but its owner cannot be verified; close it manually. --kill-browser never kills an unverified process".into());
@@ -269,4 +322,87 @@ pub(super) fn ensure_available_guarded(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+
+    #[test]
+    fn a_process_caught_starting_or_exiting_is_rescanned_not_reported() {
+        let scans = Cell::new(0);
+        let waits = Cell::new(0);
+        let owners = settle(
+            || {
+                scans.set(scans.get() + 1);
+                Ok(if scans.get() < 3 {
+                    Scan::Unverified(Pid::from_u32(7))
+                } else {
+                    Scan::Owners(vec![Pid::from_u32(42)])
+                })
+            },
+            |_| waits.set(waits.get() + 1),
+        )
+        .unwrap();
+        assert_eq!(owners, vec![Pid::from_u32(42)]);
+        assert_eq!((scans.get(), waits.get()), (3, 2));
+    }
+
+    #[test]
+    fn a_persistently_unreadable_process_still_blocks_the_profile() {
+        let waits = Cell::new(0);
+        let error = settle(
+            || Ok(Scan::Unverified(Pid::from_u32(7))),
+            |step| {
+                assert_eq!(step, SETTLE_STEP);
+                waits.set(waits.get() + 1);
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("cannot verify browser PID 7"), "{error}");
+        assert_eq!(waits.get(), SETTLE_STEPS);
+    }
+
+    /// Held exactly as Chromium holds it: write access, read sharing only.
+    #[cfg(windows)]
+    #[test]
+    fn a_held_windows_lockfile_blocks_the_profile_until_released() {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_SHARE_READ: u32 = 1;
+        let path = std::env::temp_dir().join(format!("aad-lockfile-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&path).unwrap();
+        let held = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .share_mode(FILE_SHARE_READ)
+            .open(path.join("lockfile"))
+            .unwrap();
+        let error = ensure_available(&path, "edge", true)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("browser lock"), "{error}");
+        drop(held);
+        // A stale lockfile, as a crashed browser leaves it, does not block.
+        ensure_available(&path, "edge", false).unwrap();
+        assert!(
+            path.join("lockfile").exists(),
+            "the check must not remove it"
+        );
+        std::fs::remove_dir_all(&path).unwrap();
+    }
+
+    #[test]
+    fn other_scan_errors_are_not_retried() {
+        let waits = Cell::new(0);
+        let error = settle(
+            || Err("cannot verify current process owner".into()),
+            |_| waits.set(waits.get() + 1),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("current process owner"));
+        assert_eq!(waits.get(), 0);
+    }
 }
