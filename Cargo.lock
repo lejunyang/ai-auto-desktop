@@ -33,6 +33,7 @@ version = "0.0.8"
 dependencies = [
  "base64 0.22.1",
  "clap",
+ "fs2",
  "serde",
  "serde_json",
  "sha1",
