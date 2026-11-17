@@ -60,6 +60,7 @@ dependencies = [
  "base64 0.22.1",
  "clap",
  "ctrlc",
+ "fs2",
  "image",
  "serde",
  "serde_json",

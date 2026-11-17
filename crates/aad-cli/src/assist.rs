@@ -76,6 +76,7 @@ use std::time::{Duration, Instant};
 
 mod scale;
 mod tiles;
+mod transfer;
 mod video;
 
 use aad_platform::{damage, keys, PixelFormat, Raw};
@@ -181,6 +182,11 @@ pub struct AssistArgs {
     /// shortcut, unless --view-only).
     #[arg(long)]
     no_clipboard: bool,
+    /// Most megabytes of files in one paste or one copy passed between the
+    /// viewer and this side; 0 passes text, rich text and pictures but no
+    /// files.
+    #[arg(long, value_name = "MB", default_value_t = 100)]
+    clipboard_max_mb: u64,
     /// Most viewers at once (1..32). The first to connect controls the
     /// screen and the others watch; any of them can take control.
     #[arg(long, default_value_t = 4)]
@@ -449,7 +455,26 @@ trait Source {
     fn clipboard(&mut self) -> Result<Value> {
         Err("this source has no clipboard to read".into())
     }
+    /// Whether [`Source::paste`] takes every format, files included.
+    fn transfers(&self) -> bool {
+        false
+    }
+    /// Pastes `clip` where the focus is. `press` has the paste key pressed
+    /// from a paste's own thread.
+    fn paste(&mut self, _clip: Clip, _press: Press) -> Started {
+        Started::Done(Err("this source cannot paste more than text".into()))
+    }
 }
+
+/// A paste begun by a source: finished already, or under way on a thread
+/// of its own (a desktop's clipboard must answer the program pasted into
+/// while the screen keeps streaming).
+enum Started {
+    Done(Result<Value>),
+    Thread(Pasting),
+}
+
+use aad_platform::clip::{Clip, Pasting, Press};
 
 /// Most clipboard text handed to a viewer at once.
 const CLIPBOARD_CHARACTERS: usize = 100_000;
@@ -469,6 +494,7 @@ struct Config {
     hide_cursor: bool,
     no_clipboard: bool,
     max_viewers: usize,
+    limits: transfer::Limits,
 }
 
 impl Config {
@@ -553,6 +579,7 @@ pub fn run(args: &AssistArgs) -> Result<Value> {
         hide_cursor: args.hide_cursor,
         no_clipboard: args.no_clipboard,
         max_viewers: args.max_viewers.clamp(1, 32),
+        limits: transfer::Limits::new(args.clipboard_max_mb),
     };
     let first = config.first();
     let mut source: Box<dyn Source> = match (args.browser_port, args.desktop) {
@@ -744,8 +771,10 @@ struct Viewer<'a> {
     stream: TcpStream,
     outbox: Outbox,
     writer: Option<std::thread::JoinHandle<()>>,
-    inbox: mpsc::Receiver<Value>,
+    inbox: mpsc::Receiver<Inbound>,
     closed: Arc<AtomicBool>,
+    /// Whether its input is passed on, for its reading thread.
+    controls: Arc<AtomicBool>,
     pipeline: Pipeline<'a>,
     started: Instant,
     /// The latest picture it could not take yet, with every change since the
@@ -844,6 +873,54 @@ const MODIFIERS: [(u32, &str, &str); 4] = [
 struct Held(u32);
 
 impl Held {
+    /// Presses and lets go of modifiers until those in `wanted` are held,
+    /// leaving alone those in `own`.
+    fn reach(&mut self, source: &mut dyn Source, wanted: u32, own: u32) -> Result<()> {
+        for (bit, name, code) in MODIFIERS {
+            let on = wanted & bit != 0;
+            if bit & own != 0 || on == (self.0 & bit != 0) {
+                continue;
+            }
+            source.input(
+                &json!({"type": "key", "action": if on { "down" } else { "up" },
+                "key": name, "code": code}),
+            )?;
+            self.0 ^= bit;
+        }
+        Ok(())
+    }
+
+    /// Presses `modifier`+`code` alone (a paste key), then puts the
+    /// modifiers back as the viewer held them. The keys go a moment apart:
+    /// measured on Windows, a V sent right after its Ctrl reached Word as a
+    /// typed "v" (a keyboard hook or input method in between), the same keys
+    /// 50 ms apart pasted.
+    fn chord(
+        &mut self,
+        source: &mut dyn Source,
+        modifier: &str,
+        key: &str,
+        code: &str,
+    ) -> Result<()> {
+        const APART: Duration = Duration::from_millis(30);
+        let before = self.0;
+        let bit = MODIFIERS
+            .iter()
+            .find(|(_, name, _)| *name == modifier)
+            .map_or(0, |(bit, _, _)| *bit);
+        self.reach(source, bit, 0)?;
+        std::thread::sleep(APART);
+        let pressed = source
+            .input(&json!({"type": "key", "action": "down", "key": key, "code": code}))
+            .and_then(|()| {
+                std::thread::sleep(APART);
+                source.input(&json!({"type": "key", "action": "up", "key": key, "code": code}))
+            });
+        std::thread::sleep(APART);
+        let back = self.reach(source, before, 0);
+        pressed.and(back)
+    }
+
     fn apply(&mut self, source: &mut dyn Source, event: &Value) -> Result<()> {
         // The modifier an event is itself the key of is pressed or let go by that event.
         let own = if event["type"] == "key" {
@@ -857,17 +934,7 @@ impl Held {
                 .filter_map(Value::as_str)
                 .filter_map(|name| MODIFIERS.iter().find(|(_, n, _)| *n == name))
                 .fold(0, |bits, (bit, _, _)| bits | bit);
-            for (bit, name, code) in MODIFIERS {
-                let on = wanted & bit != 0;
-                if bit & own != 0 || on == (self.0 & bit != 0) {
-                    continue;
-                }
-                source.input(
-                    &json!({"type": "key", "action": if on { "down" } else { "up" },
-                    "key": name, "code": code}),
-                )?;
-                self.0 ^= bit;
-            }
+            self.reach(source, wanted, own)?;
         }
         source.input(event)?;
         if own != 0 {
@@ -908,6 +975,19 @@ fn host(
     let mut next_id = 0u64;
     let mut rate = 0;
     let codecs: Vec<&str> = config.offered.iter().map(|c| c.name()).collect();
+    // Every format both ways, where the source can and the viewer may.
+    let transfers = source.transfers() && !config.no_clipboard && !config.view_only;
+    let scratch = if transfers {
+        Some(Arc::new(transfer::Scratch::create()?))
+    } else {
+        None
+    };
+    let clipboard = transfers.then(|| {
+        json!({"paste": true, "copy": false, "files": config.limits.files > 0,
+            "limits": config.limits.describe()})
+    });
+    let mut pastes = Pastes::default();
+    let (press_requests, presses) = mpsc::channel::<mpsc::Sender<Result<()>>>();
     let video: serde_json::Map<String, Value> = config
         .probe
         .chosen
@@ -972,32 +1052,66 @@ fn host(
                 continue;
             }
             let (outbox, writer) = Outbox::start(stream.try_clone().map_err(|e| e.to_string())?);
-            let (sender, inbox) = mpsc::channel::<Value>();
+            let (sender, inbox) = mpsc::channel::<Inbound>();
             let closed = Arc::new(AtomicBool::new(false));
+            let controls = Arc::new(AtomicBool::new(false));
             {
                 let (closed, outbox, mut reader) = (closed.clone(), outbox.clone(), reader);
+                let (controls, scratch, limits) =
+                    (controls.clone(), scratch.clone(), config.limits);
+                // A paste's text comes whole in one message.
+                let most = limits.text as u64 + 1024 * 1024;
                 std::thread::spawn(move || {
-                    while let Ok(Some((opcode, payload))) = read_frame(&mut reader) {
-                        match opcode {
-                            1 => {
-                                if let Ok(message) = serde_json::from_slice::<Value>(&payload) {
-                                    if sender.send(message).is_err() {
-                                        break;
+                    let mut uploads = transfer::Uploads::default();
+                    // Uploads are written here, so a large file never holds up the screen.
+                    let upload = |outcome: transfer::Outcome| {
+                        for reply in &outcome.replies {
+                            outbox.text(reply);
+                        }
+                        outcome
+                            .ready
+                            .is_none_or(|ready| sender.send(Inbound::Paste(ready)).is_ok())
+                    };
+                    let mut incoming = Incoming::new(&mut reader, most);
+                    while let Ok(Some((opcode, payload))) = incoming.next() {
+                        let carry_on = match opcode {
+                            1 => match serde_json::from_slice::<Value>(&payload) {
+                                Ok(message) if message["type"] == "paste" => upload(match &scratch {
+                                    Some(_) if !controls.load(Ordering::SeqCst) => {
+                                        transfer::Outcome::refused(&message, "another viewer has control")
                                     }
-                                }
-                            }
+                                    Some(scratch) => uploads.message(&message, &limits, scratch),
+                                    None => transfer::Outcome::refused(
+                                        &message,
+                                        "this server takes no pastes (--no-clipboard, --view-only, or a source that cannot)",
+                                    ),
+                                }),
+                                Ok(message) => sender.send(Inbound::Message(message)).is_ok(),
+                                Err(_) => true,
+                            },
+                            2 if scratch.is_some() => upload(uploads.chunk(&payload)),
                             8 => break,
-                            9 => outbox.control(10, payload),
-                            _ => {}
+                            9 => {
+                                outbox.control(10, payload);
+                                true
+                            }
+                            _ => true,
+                        };
+                        if !carry_on {
+                            break;
                         }
                     }
                     closed.store(true, Ordering::SeqCst);
                 });
             }
             let pipeline = Pipeline::new(config, config.first());
-            outbox.text(&json!({"type": "ready", "source": source.name(), "os": std::env::consts::OS, "view_only": config.view_only,
+            let mut ready = json!({"type": "ready", "source": source.name(), "os": std::env::consts::OS, "view_only": config.view_only,
                 "frames": {"header": "aad-frame/1", "codec": config.offered[0].name(), "codecs": codecs},
-                "mode": pipeline.mode.describe(), "video": video}));
+                "mode": pipeline.mode.describe(), "video": video});
+            if let Some(clipboard) = &clipboard {
+                ready["clipboard"] = clipboard.clone();
+            }
+            outbox.text(&ready);
             next_id += 1;
             if control.holder.is_none() && !config.view_only {
                 control.holder = Some(next_id);
@@ -1009,6 +1123,7 @@ fn host(
                 writer: Some(writer),
                 inbox,
                 closed,
+                controls,
                 pipeline,
                 started: Instant::now(),
                 waiting: None,
@@ -1016,9 +1131,26 @@ fn host(
             });
             changed = true;
         }
+        for viewer in &viewers {
+            let controls = !config.view_only && control.holder == Some(viewer.id);
+            viewer.controls.store(controls, Ordering::SeqCst);
+        }
         for viewer in &mut viewers {
-            while let Ok(event) = viewer.inbox.try_recv() {
+            while let Ok(inbound) = viewer.inbox.try_recv() {
                 let controls = !config.view_only && control.holder == Some(viewer.id);
+                let event = match inbound {
+                    Inbound::Message(event) => event,
+                    Inbound::Paste(ready) if controls => {
+                        pastes.queue.push_back((viewer.outbox.clone(), ready));
+                        continue;
+                    }
+                    Inbound::Paste(ready) => {
+                        viewer
+                            .outbox
+                            .text(&transfer::failed(&ready.id, "another viewer has control"));
+                        continue;
+                    }
+                };
                 match event["type"].as_str() {
                     Some("hello") => match event["accept"].as_array().map(|a| (choose(a, &config.offered), a)) {
                         None => {}
@@ -1061,6 +1193,11 @@ fn host(
                 }
             }
         }
+        // A paste's thread asks for the paste key once its formats are up.
+        while let Ok(reply) = presses.try_recv() {
+            let _ = reply.send(held.chord(source, PASTE_MODIFIER, "v", "KeyV"));
+        }
+        pastes.run(source, &press_requests, scratch.as_deref());
         if changed {
             control.tell(&viewers, config.view_only);
         }
@@ -1157,10 +1294,107 @@ fn host(
     if control.holder.is_some() {
         source.release();
     }
+    // The clipboard is put back before the scratch folder goes.
+    drop(press_requests);
+    drop(presses);
+    pastes.finish();
     for viewer in viewers {
         viewer.close();
     }
     Ok(())
+}
+
+/// What a viewer's reading thread passes to the host.
+enum Inbound {
+    Message(Value),
+    /// A paste whose content is all in.
+    Paste(transfer::Ready),
+}
+
+/// The key held with V to paste here.
+const PASTE_MODIFIER: &str = if cfg!(target_os = "macos") {
+    "Meta"
+} else {
+    "Control"
+};
+
+/// Pastes waiting their turn and the one under way: the clipboard is one,
+/// so they go one at a time.
+#[derive(Default)]
+struct Pastes {
+    queue: VecDeque<(Outbox, transfer::Ready)>,
+    running: Option<(Outbox, String, Pasting)>,
+}
+
+impl Pastes {
+    /// Tells the viewer about a paste that ended and starts the next.
+    fn run(
+        &mut self,
+        source: &mut dyn Source,
+        press_requests: &mpsc::Sender<mpsc::Sender<Result<()>>>,
+        scratch: Option<&transfer::Scratch>,
+    ) {
+        if self
+            .running
+            .as_ref()
+            .is_some_and(|(_, _, thread)| thread.is_finished())
+        {
+            if let Some((outbox, id, thread)) = self.running.take() {
+                let result = thread
+                    .join()
+                    .unwrap_or_else(|_| Err("the paste failed unexpectedly".into()));
+                outbox.text(&pasted(&id, result));
+            }
+        }
+        if self.running.is_some() {
+            return;
+        }
+        let Some((outbox, ready)) = self.queue.pop_front() else {
+            return;
+        };
+        if let Some(scratch) = scratch {
+            scratch.forget_older(Duration::from_secs(3600));
+        }
+        let requests = press_requests.clone();
+        let press: Press = Box::new(move || {
+            let (reply, answer) = mpsc::channel();
+            requests
+                .send(reply)
+                .map_err(|_| "the server is stopping".to_string())?;
+            answer
+                .recv_timeout(Duration::from_secs(5))
+                .map_err(|_| "the paste key was not pressed".to_string())?
+        });
+        match source.paste(ready.clip, press) {
+            Started::Done(result) => outbox.text(&pasted(&ready.id, result)),
+            Started::Thread(thread) => self.running = Some((outbox, ready.id, thread)),
+        }
+    }
+
+    /// Waits for the paste under way, so the clipboard is put back.
+    fn finish(&mut self) {
+        if let Some((_, _, thread)) = self.running.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// The viewer's answer about a paste that ended.
+fn pasted(id: &str, result: Result<Value>) -> Value {
+    match result {
+        Ok(report) if report["pasted"] == false => transfer::failed(
+            id,
+            "the program in front did not take the paste (is a text field or folder focused?)",
+        ),
+        Ok(report) => {
+            let mut message = json!({"type": "paste", "id": id, "state": "pasted"});
+            if let Some(formats) = report.get("formats") {
+                message["formats"] = formats.clone();
+            }
+            message
+        }
+        Err(error) => transfer::failed(id, error),
+    }
 }
 
 enum Output {
@@ -1777,12 +2011,65 @@ fn same(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
-/// One frame from the viewer, unmasked. `None` at end of stream.
-fn read_frame(reader: &mut impl Read) -> std::io::Result<Option<(u8, Vec<u8>)>> {
+/// The viewer's messages, each whole: a browser sends a large one (a piece
+/// of an uploaded file) as fragments, which are joined here. Control frames
+/// (ping, close) may come between fragments and are passed on at once.
+struct Incoming<R> {
+    reader: R,
+    /// The largest message taken.
+    most: u64,
+    /// A message whose last fragment has not come yet.
+    partial: Option<(u8, Vec<u8>)>,
+}
+
+impl<R: Read> Incoming<R> {
+    fn new(reader: R, most: u64) -> Self {
+        Self {
+            reader,
+            most,
+            partial: None,
+        }
+    }
+
+    /// The next message, `None` at end of stream.
+    fn next(&mut self) -> std::io::Result<Option<(u8, Vec<u8>)>> {
+        loop {
+            let Some((fin, opcode, payload)) = read_frame(&mut self.reader, self.most)? else {
+                return Ok(None);
+            };
+            if opcode >= 8 {
+                return Ok(Some((opcode, payload)));
+            }
+            let (kind, mut data) = match (opcode, self.partial.take()) {
+                (0, Some(partial)) => partial,
+                // A continuation of nothing.
+                (0, None) => continue,
+                (kind, _) => (kind, Vec::new()),
+            };
+            if (data.len() + payload.len()) as u64 > self.most {
+                return Err(std::io::Error::other("viewer message too large"));
+            }
+            if data.is_empty() {
+                data = payload;
+            } else {
+                data.extend_from_slice(&payload);
+            }
+            if fin {
+                return Ok(Some((kind, data)));
+            }
+            self.partial = Some((kind, data));
+        }
+    }
+}
+
+/// One frame from the viewer, unmasked: whether it ends its message, its
+/// opcode and payload. `None` at end of stream.
+fn read_frame(reader: &mut impl Read, most: u64) -> std::io::Result<Option<(bool, u8, Vec<u8>)>> {
     let mut head = [0u8; 2];
     if reader.read_exact(&mut head).is_err() {
         return Ok(None);
     }
+    let fin = head[0] & 0x80 != 0;
     let opcode = head[0] & 0x0f;
     let masked = head[1] & 0x80 != 0;
     let mut length = u64::from(head[1] & 0x7f);
@@ -1795,7 +2082,7 @@ fn read_frame(reader: &mut impl Read) -> std::io::Result<Option<(u8, Vec<u8>)>> 
         reader.read_exact(&mut ext)?;
         length = u64::from_be_bytes(ext);
     }
-    if length > 1024 * 1024 {
+    if length > most {
         return Err(std::io::Error::other("viewer message too large"));
     }
     let mut mask = [0u8; 4];
@@ -1809,7 +2096,7 @@ fn read_frame(reader: &mut impl Read) -> std::io::Result<Option<(u8, Vec<u8>)>> 
             *byte ^= mask[index % 4];
         }
     }
-    Ok(Some((opcode, payload)))
+    Ok(Some((fin, opcode, payload)))
 }
 
 fn write_frame(writer: &mut impl Write, opcode: u8, payload: &[u8]) -> std::io::Result<()> {
@@ -2263,7 +2550,8 @@ fn unknown(event: &Value) -> String {
 /// The desktop of this system, from its platform crate.
 mod desktop {
     use super::{
-        fraction, keys, unknown, Pace, Picture, Result, Source, Want, CLIPBOARD_CHARACTERS,
+        fraction, keys, unknown, Clip, Pace, Picture, Press, Result, Source, Started, Want,
+        CLIPBOARD_CHARACTERS,
     };
     pub use aad_platform::Area;
     use aad_platform::{Button, Input, MouseAction};
@@ -2389,6 +2677,17 @@ mod desktop {
         fn clipboard(&mut self) -> Result<Value> {
             self.desktop.clipboard(CLIPBOARD_CHARACTERS)
         }
+
+        fn transfers(&self) -> bool {
+            self.desktop.transfers()
+        }
+
+        fn paste(&mut self, clip: Clip, press: Press) -> Started {
+            match self.desktop.paste(clip, press) {
+                Ok(thread) => Started::Thread(thread),
+                Err(error) => Started::Done(Err(error)),
+            }
+        }
     }
 }
 
@@ -2471,6 +2770,40 @@ mod tests {
             source.0,
             ["down ShiftLeft", "down ArrowLeft", "up ShiftLeft", "mouse"]
         );
+    }
+
+    #[test]
+    fn fragmented_messages_are_joined_and_pings_pass_between() {
+        fn frame(fin: bool, opcode: u8, payload: &[u8]) -> Vec<u8> {
+            let mut bytes = vec![u8::from(fin) << 7 | opcode, 0x80 | payload.len() as u8];
+            bytes.extend_from_slice(&[1, 2, 3, 4]);
+            bytes.extend(
+                payload
+                    .iter()
+                    .enumerate()
+                    .map(|(i, b)| b ^ [1, 2, 3, 4][i % 4]),
+            );
+            bytes
+        }
+        let mut wire = frame(false, 2, b"AADP");
+        wire.extend(frame(true, 9, b"ping"));
+        wire.extend(frame(false, 0, b"-one-"));
+        wire.extend(frame(true, 0, b"two"));
+        wire.extend(frame(true, 1, b"{}"));
+        let mut incoming = Incoming::new(std::io::Cursor::new(wire), 64);
+        assert_eq!(incoming.next().unwrap(), Some((9, b"ping".to_vec())));
+        assert_eq!(
+            incoming.next().unwrap(),
+            Some((2, b"AADP-one-two".to_vec()))
+        );
+        assert_eq!(incoming.next().unwrap(), Some((1, b"{}".to_vec())));
+        assert_eq!(incoming.next().unwrap(), None);
+        // Fragments together may not pass the limit either.
+        let mut wire = frame(false, 2, &[0; 40]);
+        wire.extend(frame(true, 0, &[0; 40]));
+        assert!(Incoming::new(std::io::Cursor::new(wire), 64)
+            .next()
+            .is_err());
     }
 
     #[test]

@@ -13,12 +13,15 @@
 //! - Pointer gestures ([`PointerButton`], [`ScrollSpec`]), captured
 //!   [`Pixels`] and what text recognition read in them ([`Recognition`]),
 //!   as the desktop driver and the platform crates exchange them.
+//! - [`clip`]: clipboard content in every format, pasted and copied by
+//!   `aad assist`.
 //! - [`probe`]: what a probe of the system's prerequisites reports.
 //! - [`Error`]: a structured failure the callers map to their own errors.
 use serde_json::{Map, Value};
 use std::sync::Arc;
 
 pub mod buffer;
+pub mod clip;
 pub mod damage;
 pub mod keys;
 pub mod probe;
@@ -201,6 +204,21 @@ pub trait Desktop {
     fn release(&mut self);
     /// The clipboard's text, as the `clipboard` message sends it.
     fn clipboard(&mut self, max_characters: usize) -> Result<Value, String>;
+    /// Whether [`Desktop::paste`] and [`Desktop::copied`] work here.
+    fn transfers(&self) -> bool {
+        false
+    }
+    /// Starts a paste of every format in `clip` on a thread of its own: it
+    /// puts them on the clipboard for the program in front, calls `press`
+    /// to have the paste key pressed, waits for that program to take them
+    /// and puts back what the clipboard held.
+    fn paste(&mut self, _clip: clip::Clip, _press: clip::Press) -> Result<clip::Pasting, String> {
+        Err("pasting more than text is not supported on this desktop yet".into())
+    }
+    /// Everything the clipboard holds, in the formats [`clip::Copied`] knows.
+    fn copied(&mut self) -> Result<clip::Copied, String> {
+        Err("reading more than text from the clipboard is not supported on this desktop yet".into())
+    }
 }
 
 /// A structured failure: a stable code, what happened, whether trying again

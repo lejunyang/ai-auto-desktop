@@ -209,6 +209,22 @@ impl Desktop for Shared {
         }
     }
 
+    fn transfers(&self) -> bool {
+        true
+    }
+
+    fn paste(
+        &mut self,
+        clip: aad_platform::clip::Clip,
+        press: aad_platform::clip::Press,
+    ) -> Result<aad_platform::clip::Pasting> {
+        Ok(crate::clipboard::paste(clip, press))
+    }
+
+    fn copied(&mut self) -> Result<aad_platform::clip::Copied> {
+        crate::clipboard::copied().map_err(|e| e.to_string())
+    }
+
     fn clipboard(&mut self, max_characters: usize) -> Result<Value> {
         let (text, characters) =
             crate::clipboard::text(max_characters).map_err(|e| e.to_string())?;
