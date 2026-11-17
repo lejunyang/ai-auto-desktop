@@ -445,9 +445,9 @@ aad assist --desktop --window 0x3077a     # 只分享一个窗口（句柄，或
   "height":..,"hotspot":[x,y],"screen":[w,h]}}`：鼠标指针的位置（画面内比例）和样子（变了才带 `shape`，
   `screen` 是 `width`/`height` 所在的屏幕像素尺寸），指针不画进画面，由查看端叠加；`--hide-cursor` 关掉。
 - 控制消息是 JSON 文本：服务端发 `ready`（含 `frames.codecs`、`mode`、`video`）、`mode`、`stream`、`cursor`、
-  `clipboard` 和 `error`，查看端发
+  `clipboard`、`paste` 和 `error`，查看端发
   `hello`、`keyframe`、`mouse`（move/down/up/wheel，位置是画面内 0..1 的比例，`count` 是第几次连击）、
-  `key`（不出字的按键和快捷键，`code` 是物理键名，见下）、`text`（输入的文字）、`release` 和 `clipboard`；
+  `key`（不出字的按键和快捷键，`code` 是物理键名，见下）、`text`（输入的文字）、`release`、`clipboard` 和 `paste`（见“剪贴板互通”）；
   分享浏览器页面时还有 `viewport`（`{"type":"viewport","width":..,"height":..}`，CSS 像素，页面按这个大小排版，
   不是缩放进查看端）。`ready` 里的 `os` 是分享端的系统（`windows` / `linux` / `macos`）。
 - `key`、`mouse`、`text` 可以带 `"modifiers":["Control","Shift"]`：查看端此刻按着的修饰键。分享端还没按下的先补按、
@@ -465,8 +465,8 @@ aad assist --desktop --window 0x3077a     # 只分享一个窗口（句柄，或
 | 中文等输入法 | ✅ 查看页里组字，只发组好的字 | ✅ 同左 |
 | 快捷键 | ✅ 按物理键（`code`）映射：字母、数字、标点（Ctrl+/、Ctrl+=、Ctrl+[）、Ctrl+Space、F1–F24、小键盘、CapsLock、PrintScreen、菜单键等 | ✅ 同左，带扫描码，方向键/Home/End/Insert/Delete/右侧修饰键带扩展键标志 |
 | 断开或查看页失去焦点时松开所有按住的键和鼠标键 | ✅ | ✅ |
-| 把复制的文字带回查看端 | ✅ 查看端按 Ctrl+C/Ctrl+X 后取回页面选中的文字（输入框里的选区或页面选区，同源 iframe 里也算） | ✅ 查看端按 Ctrl+C/Ctrl+X 后自动取回（≤10 万字），密码管理器标记为不供读取的内容拒绝；`--no-clipboard` 关闭，`--view-only` 时不提供 |
-| 粘贴查看端的剪贴板 | ✅ 查看页让 Ctrl+V 走本机的粘贴，把文字作为 `text` 发出 | ✅ 同左 |
+| 把复制的内容带回查看端 | ✅ 文字、HTML、图片（见下文“剪贴板互通”） | ✅ 文字、HTML、图片、文件（见下文） |
+| 粘贴查看端的剪贴板 | ✅ 文字、HTML、RTF、图片、文件（见下文） | ✅ 同左 |
 | 页面按查看端的大小排版 | ✅ `viewport` → `Emulation.setDeviceMetricsOverride`（控制者的查看页打开和改变大小时发） | — |
 
 `key` 消息优先按 `code`（物理键）找键，没有 `code` 时按 `key` 的名字找；所以查看端是什么键盘布局，快捷键都落在
@@ -476,6 +476,63 @@ aad assist --desktop --window 0x3077a     # 只分享一个窗口（句柄，或
 查看页的文字按 `?lang=zh|en` 或浏览器语言显示中文或英文。按下鼠标后
 用指针捕获，拖到画面外再松开也会送达；查看页失去焦点或切到后台时发 `release`，对端把还按着的键和鼠标键全部松开，
 服务端在连接断开时也会这么做，不会留下按住的 Shift 或鼠标左键。
+
+### 剪贴板互通
+
+查看端复制什么，远程粘贴出来就是什么；远程复制的东西也能带回来。查看页在任何地址下都能完整地往远程粘贴
+（`paste` 事件里拿得到文字、HTML 和文件，不要求安全上下文）；带回来的时候，网页能往本机剪贴板写什么取决于
+地址是不是安全上下文（https、`localhost` / `127.0.0.1`）。设计和实测记录见
+[`docs/plan/clipboard-transfer.md`](docs/plan/clipboard-transfer.md)。
+
+| 方向 | 格式 | Windows 桌面 | Linux X11 桌面 | macOS 桌面 | 浏览器页面（CDP） |
+|---|---|---|---|---|---|
+| 查看端 → 远程 | 文字 | ✅ CF_UNICODETEXT | ✅ UTF8_STRING 等 | ✅ public.utf8-plain-text [待验证] | ✅ 真粘贴 |
+| | HTML | ✅ HTML Format | ✅ text/html | ✅ public.html [待验证] | ✅ 真粘贴 |
+| | RTF | ✅ Rich Text Format | ✅ text/rtf | ✅ public.rtf [待验证] | ✅ 合成的 paste 事件里带 text/rtf |
+| | 图片 | ✅ PNG + CF_DIBV5 + 文件 | ✅ image/png + 文件 | ✅ public.png + 文件 URL [待验证] | ✅ 真粘贴（单张） |
+| | 文件（≤100 个，合计 ≤`--clipboard-max-mb`） | ✅ CF_HDROP | ✅ gnome-copied-files、uri-list | ✅ 文件 URL [待验证] | ✅ 合成的 paste 事件里的 `File`（≤20 MB）；焦点在 `<input type=file>` 时直接设上 |
+| 远程 → 查看端 | 文字、HTML | ✅ | ✅ | ✅ [待验证] | ✅ 页面执行复制后读剪贴板 |
+| | 图片 | ✅ PNG，或位图转 PNG | ✅ image/png | ✅ PNG，或 TIFF 转 PNG [待验证] | ✅ |
+| | 文件、文件夹 | ✅ 下载（文件夹打 zip） | ✅ 同左 | ✅ 同左 [待验证] | — |
+
+粘贴时把这次的全部格式一起放进远程剪贴板，按一次粘贴键（Ctrl+V，macOS 是 ⌘V），目标程序挑自己认的格式：
+Word 拿 HTML/RTF/位图，资源管理器拿文件。之后远程剪贴板放回原来的内容。Windows 上用延迟渲染，只把数据交给
+前台窗口所在的进程，剪贴板历史（Win+V）和同步工具拿不到；X11 上只答复焦点窗口所属的客户端，其他客户端只看到
+`x-kde-passwordManagerHint`，粘贴后重新持有原来的内容；macOS 的剪贴板做不到只给一个进程，写入时带
+nspasteboard.org 的 concealed / transient 标记让剪贴板管理器不留存。图片同时作为位图和文件放进去（浏览器分不清
+“截图”和“复制的一个 png 文件”）。文件先传到分享端本次运行的临时目录（`<临时目录>/aad-assist-<pid>`，退出时删除，
+异常退出的由下次运行清掉）。
+
+带回来时：安全上下文用异步剪贴板 API 把文字、HTML 和图片一起写进本机剪贴板；不安全时用 `execCommand('copy')`
+写文字和 HTML，图片写不进，查看页右上角的“远程剪贴板”托盘里给缩略图和下载，并说明原因。文件永远是下载：托盘里
+逐个列出，文件夹和“全部下载”打成 zip，Chromium 上可以把一项直接拖到桌面或文件夹（`DownloadURL`），安全上下文的
+Chromium 另有“保存到…”。查看页顶上的“远程剪贴板”按钮随时打开托盘。
+
+```powershell
+aad assist --desktop --clipboard-max-mb 500   # 一次粘贴或一份清单里的文件合计上限，默认 100；0 只互通文字、富文本和图片
+aad assist --desktop --no-clipboard           # 两个方向都只剩文字键入，不读分享端的剪贴板
+```
+
+协议（在原有协议上加，老的查看端和老的 assist 互相照旧工作）：
+
+- `ready` 带 `"clipboard":{"paste":true,"copy":true,"files":true,"limits":{"text":8388608,"files":104857600,"count":100}}`；
+  没有这个字段的分享端只支持文字。
+- 查看端发 `{"type":"paste","id":"<随机>","formats":{"text/plain":..,"text/html":..,"text/rtf":..},
+  "files":[{"name":..,"type":..,"size":..}]}`，再把每个文件的内容用二进制帧发出：`"AADP"`、版本 u8 = 1、3 字节保留、
+  id 长度 u16 和 id、文件序号 u16、偏移 u64，后面是至多 256 KB 数据（大端）。服务端每收满 4 MB 回
+  `{"type":"paste","id":..,"ack":<已收字节>}`，查看端在途不超过 8 MB，上传时画面照常刷新、鼠标键盘照常送达；
+  `{"type":"paste","id":..,"cancel":true}` 取消并删掉已收的部分。服务端回 `state`：`received`、`pasted`、
+  `failed`（带 `message`）、`cancelled`。只有正在控制的查看端能粘贴。
+- 查看端发 `{"type":"clipboard"}`，服务端回清单：`text`、`characters`、`truncated`（含义同旧版）、`html`、
+  `image`（`id`、`width`、`height`、`size`）、`files`（`id`、`name`、`size`、`dir`，超过上限的标 `tooLarge` 不给 `id`）、
+  `all`（多项时打包下载的 id），密码管理器标记的内容回 `{"protected":true}`。内容走
+  `GET /clipboard/<id>?token=…`（和查看页同一个端口、同一个 token；文件带 `Content-Disposition: attachment`，
+  文件夹边读边打 zip）。id 是 128 位随机数，只对最近一份清单有效。
+
+验证：`tests/windows/verify_assist_clipboard.py`（Word 和资源管理器里的实际效果、剪贴板恢复、Win+V 历史、
+100 MB 上传时画面不停，`--copy` 测反向）、`tests/windows/verify_assist_viewer_clipboard.py --visible`（真 Chrome
+查看页，分别从 `127.0.0.1` 和局域网 IP 打开，`--copy` 测反向）、`tests/windows/verify_assist_page_clipboard.py`
+（浏览器页面）、`tests/linux/verify_assist_clipboard_x11.py`（自起的 Xvfb）。
 
 ### 只传变化的部分（tiles）与自适应
 

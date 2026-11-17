@@ -6,14 +6,28 @@
 @media (prefers-color-scheme:dark){:root{--bg:#161615;--fg:#ecece8;--muted:#9a9a93}}
 body{margin:0;background:var(--bg);color:var(--fg);font:14px system-ui,sans-serif;display:flex;flex-direction:column;height:100vh}
 header{padding:8px 16px;color:var(--muted);display:flex;gap:12px;align-items:center}
-#take{display:none;white-space:nowrap;font:inherit;padding:2px 10px;border-radius:6px;border:1px solid var(--muted);background:transparent;color:var(--fg);cursor:pointer}
+#take,#remote-clip{display:none;white-space:nowrap;font:inherit;padding:2px 10px;border-radius:6px;border:1px solid var(--muted);background:transparent;color:var(--fg);cursor:pointer}
 main{flex:1;display:flex;align-items:center;justify-content:center;min-height:0;padding:0 16px 16px;position:relative}
 #pointer{position:fixed;pointer-events:none;display:none;image-rendering:auto}
 #keys{position:fixed;left:0;top:0;width:2px;height:1.2em;opacity:0;border:0;padding:0;margin:0;resize:none;overflow:hidden;font-size:16px;pointer-events:none}
 canvas{max-width:100%;max-height:100%;outline:none;cursor:crosshair;box-shadow:0 1px 6px rgba(0,0,0,.25)}
+#transfer{position:absolute;right:24px;top:8px;max-width:min(420px,80%);background:var(--bg);color:var(--fg);border:1px solid var(--muted);border-radius:8px;padding:8px 12px;box-shadow:0 2px 10px rgba(0,0,0,.25);display:flex;gap:10px;align-items:center}
+#transfer[hidden],#tray[hidden]{display:none}
+#tray{position:absolute;right:24px;top:56px;width:min(380px,80%);max-height:70%;overflow:auto;background:var(--bg);color:var(--fg);border:1px solid var(--muted);border-radius:8px;padding:10px 12px;box-shadow:0 2px 10px rgba(0,0,0,.25);font-size:13px}
+#tray h2{font-size:14px;margin:0 0 8px;display:flex;justify-content:space-between;align-items:center}
+#tray .row{display:flex;gap:8px;align-items:center;justify-content:space-between;padding:4px 0;border-top:1px solid rgba(128,128,128,.25)}
+#tray .name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1}
+#tray .muted{color:var(--muted)}
+#tray img{max-width:100%;max-height:160px;display:block;margin:4px 0}
+#tray a,#tray button{font:inherit;color:inherit;white-space:nowrap}
+#tray button{padding:1px 8px;border-radius:6px;border:1px solid var(--muted);background:transparent;cursor:pointer}
+#transfer progress{width:120px}
+#transfer button{font:inherit;padding:1px 8px;border-radius:6px;border:1px solid var(--muted);background:transparent;color:var(--fg);cursor:pointer}
 </style></head><body>
-<header><span id="status"></span><button id="take" type="button"></button></header>
-<main><canvas id="screen" tabindex="0" width="1" height="1"></canvas><img id="pointer" alt=""></main>
+<header><span id="status"></span><button id="take" type="button"></button><button id="remote-clip" type="button"></button></header>
+<main><canvas id="screen" tabindex="0" width="1" height="1"></canvas><img id="pointer" alt="">
+<div id="tray" hidden></div>
+<div id="transfer" role="status" hidden><span id="transfer-text"></span><progress id="transfer-bar" max="1" hidden></progress><button id="transfer-cancel" type="button" hidden></button></div></main>
 <textarea id="keys" autocomplete="off" autocapitalize="off" spellcheck="false"></textarea>
 <script>
 // The viewer's language: ?lang=zh or en, else the browser's.
@@ -22,12 +36,32 @@ const TEXT={
     viewing:k=>`Viewing ${k}`,sharing:k=>`Sharing ${k}`,browser:'browser',desktop:'desktop',
     click:' — click the picture to control it',other:' — another viewer has control',
     decoding:'Video decoding failed: ',disconnected:'Disconnected',empty:'The shared clipboard holds no text',
-    copied:(n,cut)=>`Copied ${n} characters from the shared screen`+(cut?' (cut short)':''),notCopied:'Could not copy here: '},
+    copied:(n,cut)=>`Copied ${n} characters from the shared screen`+(cut?' (cut short)':''),notCopied:'Could not copy here: ',
+    cancel:'Cancel',sending:(n,size,pct)=>`Sending ${n} file${n===1?'':'s'}, ${size}, ${pct}%`,pasting:'Pasting…',pasted:'Pasted',
+    notPasted:'Not pasted: ',cancelled:'Paste cancelled',busy:'Another paste is still being sent',
+    noFiles:'This shared screen takes no files; text and pictures only',tooMany:n=>`At most ${n} files can be pasted at once`,
+    tooLarge:s=>`Larger than this shared screen takes (${s})`,folder:'Folders cannot be pasted; zip them first',
+    textCut:'The formatted text was too large; only the plain text was pasted',
+    remoteClip:'Remote clipboard',close:'Close',protectedClip:'The shared clipboard holds something protected (a password manager); it was not read',
+    copiedHere:'Copied to this computer',copyHere:'Copy the text here',picture:'Picture',download:'Download',downloadAll:'Download all (zip)',
+    saveAs:'Save to…',tooLargeItem:'too large',folder_:'folder, as zip',dragHint:'Drag an item onto your desktop or a folder to save it',
+    insecureImage:'This address is not https, so the browser does not let the page put pictures on the clipboard: download it instead',
+    imageNotCopied:'The picture could not go on the clipboard: download it instead',nothing:'The shared clipboard is empty'},
   zh:{connecting:'正在连接…',take:'接过控制',screen:'远程画面',keys:'远程画面的键盘',
     viewing:k=>`正在观看${k}`,sharing:k=>`正在共享${k}`,browser:'浏览器',desktop:'桌面',
     click:' · 点画面即可操作',other:' · 别人在操作',
     decoding:'视频解码失败：',disconnected:'已断开',empty:'远程剪贴板里没有文字',
-    copied:(n,cut)=>`已从远程复制 ${n} 个字`+(cut?'（截断了）':''),notCopied:'没能复制到这边：'}};
+    copied:(n,cut)=>`已从远程复制 ${n} 个字`+(cut?'（截断了）':''),notCopied:'没能复制到这边：',
+    cancel:'取消',sending:(n,size,pct)=>`正在传 ${n} 个文件，${size}，${pct}%`,pasting:'正在粘贴…',pasted:'已粘贴',
+    notPasted:'没有粘贴：',cancelled:'已取消粘贴',busy:'上一次粘贴还在传',
+    noFiles:'远程不收文件，只能粘贴文字和图片',tooMany:n=>`一次最多粘贴 ${n} 个文件`,
+    tooLarge:s=>`超过了远程能收的大小（${s}）`,folder:'文件夹不能直接粘贴，请打包后再复制',
+    textCut:'带格式的文字太大，只粘贴了纯文字',
+    remoteClip:'远程剪贴板',close:'关闭',protectedClip:'远程剪贴板里是受保护的内容（来自密码管理器），没有读取',
+    copiedHere:'已复制到本机',copyHere:'把文字复制到本机',picture:'图片',download:'下载',downloadAll:'全部下载（zip）',
+    saveAs:'保存到…',tooLargeItem:'太大',folder_:'文件夹，下载为 zip',dragHint:'把一项拖到桌面或文件夹即可保存',
+    insecureImage:'这个地址不是 https，浏览器不让网页把图片放进剪贴板，请下载',
+    imageNotCopied:'图片没能放进剪贴板，请下载',nothing:'远程剪贴板是空的'}};
 const lang=new URLSearchParams(location.search).get('lang')||navigator.language||'en';
 const t=TEXT[lang.toLowerCase().startsWith('zh')?'zh':'en'];
 document.documentElement.lang=t===TEXT.zh?'zh':'en';
@@ -35,6 +69,8 @@ document.getElementById('status').textContent=t.connecting;
 document.getElementById('take').textContent=t.take;
 document.getElementById('screen').setAttribute('aria-label',t.screen);
 document.getElementById('keys').setAttribute('aria-label',t.keys);
+document.getElementById('transfer-cancel').textContent=t.cancel;
+document.getElementById('remote-clip').textContent=t.remoteClip;
 const token=new URLSearchParams(location.search).get('token');
 // Next to this page, whatever path and scheme it was served under: a host can
 // proxy the viewer below a prefix and over https (wss).
@@ -47,6 +83,8 @@ const VIDEO={3:'h264',4:'vp9',5:'av1'}, TILES=6;
 // A representative stream of each codec; the exact one is checked again when it starts.
 const PROBE={h264:'avc1.42E01F',vp9:'vp09.00.41.08',av1:'av01.0.08M.08'};
 let decodable=[], refused=new Set(), video=null, source='', kind='', mode='', os='';
+// What the other side takes beyond typed text (ready.clipboard), when it does.
+let clip=null;
 const show=()=>status.textContent=mode;
 const size=(w,h)=>{if(screen.width!==w||screen.height!==h){screen.width=w;screen.height=h;}};
 // WebCodecs exists only in secure contexts: localhost, or a host serving this over https.
@@ -151,14 +189,16 @@ const take=document.getElementById('take');
 take.addEventListener('click',()=>send({type:'take'}));
 function label(){mode=[source,modeLabel,videoLabel].filter(Boolean).join(' · ')+hint;show();}
 function control(m){
-  if(m.type==='ready'){kind=m.view_only?'':m.source.kind;os=m.os||'';source=t[m.view_only?'viewing':'sharing'](t[m.source.kind]||m.source.kind);hint=m.view_only?'':t.click;label();fit();}
+  if(m.type==='ready'){kind=m.view_only?'':m.source.kind;os=m.os||'';clip=m.clipboard||null;source=t[m.view_only?'viewing':'sharing'](t[m.source.kind]||m.source.kind);hint=m.view_only?'':t.click;label();fit();}
   if(m.type==='mode'){modeLabel=m.mode.codec+(m.mode.video?' + '+m.mode.video:'');if(!m.mode.video&&m.mode.codec!=='tiles') videoLabel='';label();}
   if(m.type==='stream') return stream(m);
   if(m.type==='cursor') return moved(m);
   if(m.type==='control'&&kind){
     hint=m.you?t.click:t.other;if(m.you){fitted='';fit();}
-    take.style.display=m.you?'none':'inline-block';label();}
+    take.style.display=m.you?'none':'inline-block';
+    document.getElementById('remote-clip').style.display=m.you&&clip&&clip.copy?'inline-block':'none';label();}
   if(m.type==='clipboard') return copied(m);
+  if(m.type==='paste') return pasteState(m);
   if(m.type==='error') status.textContent=m.message;
 }
 // Messages are handled in order, so a stream's first frames wait for its decoder.
@@ -220,7 +260,89 @@ keys.addEventListener('keyup',e=>{if(!down.delete(e.code))return;e.preventDefaul
 // Text goes with no modifier held, so a paste with Ctrl down types, not shortcuts.
 keys.addEventListener('input',e=>{if(e.isComposing)return;if(keys.value)send({type:'text',text:keys.value,modifiers:[]});keys.value='';});
 keys.addEventListener('compositionend',e=>{if(e.data)send({type:'text',text:e.data,modifiers:[]});keys.value='';});
-keys.addEventListener('paste',e=>{e.preventDefault();const text=e.clipboardData.getData('text');if(text)send({type:'text',text,modifiers:[]});});
+keys.addEventListener('paste',e=>{e.preventDefault();pasteThere(e.clipboardData);});
+// A paste sends every format this side's clipboard has -- text, HTML, RTF,
+// pictures and files -- and the other side pastes them all at once, so what
+// arrives is what was copied. A side that takes only text has it typed.
+const box=document.getElementById('transfer'), boxText=document.getElementById('transfer-text');
+const bar=document.getElementById('transfer-bar'), cancel=document.getElementById('transfer-cancel');
+let upload=null, noteTimer=0;
+const CHUNK=256*1024, WINDOW=8*1024*1024;
+const mb=n=>(n/1048576).toFixed(n<10*1048576?1:0)+' MB';
+const bytes=s=>new Blob([s]).size;
+function note(text,ms){
+  clearTimeout(noteTimer);box.hidden=false;boxText.textContent=text;
+  bar.hidden=cancel.hidden=!upload||!upload.count||upload.received;
+  if(ms) noteTimer=setTimeout(()=>{if(!upload||!upload.count) box.hidden=true;},ms);
+}
+function progress(){
+  if(!upload||!upload.count) return;
+  if(upload.received){note(t.pasting);return;}
+  bar.value=upload.total?upload.sent/upload.total:1;
+  note(t.sending(upload.count,mb(upload.total),Math.floor(100*bar.value)));
+}
+function finished(text,ms){const shown=upload&&upload.count;upload=null;if(shown||ms>2000) note(text,ms);}
+cancel.addEventListener('click',()=>{if(!upload)return;send({type:'paste',id:upload.id,cancel:true});finished(t.cancelled,2000);});
+// An upload frame: AADP, version 1, 3 reserved bytes, the id's length and
+// the id, the file's index, the offset, then the bytes.
+const encoder=new TextEncoder();
+function piece(id,index,offset,data){
+  const name=encoder.encode(id), head=new ArrayBuffer(20+name.length), v=new DataView(head);
+  [65,65,68,80,1].forEach((b,i)=>v.setUint8(i,b));
+  v.setUint16(8,name.length);new Uint8Array(head,10,name.length).set(name);
+  v.setUint16(10+name.length,index);v.setBigUint64(12+name.length,BigInt(offset));
+  return new Blob([head,data]);
+}
+async function pasteThere(data){
+  const formats={};
+  for(const type of data.types){if(type==='Files')continue;const value=data.getData(type);if(value)formats[type]=value;}
+  const files=[...data.files];
+  if(!clip||!clip.paste){const text=formats['text/plain'];if(text)send({type:'text',text,modifiers:[]});return;}
+  if(!files.length&&!Object.keys(formats).length) return;
+  if(upload){note(t.busy,3000);return;}
+  if(bytes(JSON.stringify(formats))>clip.limits.text){
+    const plain=formats['text/plain'];
+    for(const type of Object.keys(formats)) delete formats[type];
+    if(plain&&bytes(plain)<=clip.limits.text){formats['text/plain']=plain;note(t.textCut,4000);}
+    else if(!files.length){note(t.tooLarge(mb(clip.limits.text)),5000);return;}
+  }
+  const total=files.reduce((sum,f)=>sum+f.size,0);
+  if(files.length){
+    if(!clip.files){note(t.noFiles,5000);return;}
+    if(files.length>clip.limits.count){note(t.tooMany(clip.limits.count),5000);return;}
+    if(total>clip.limits.files){note(t.tooLarge(mb(clip.limits.files)),5000);return;}
+    // A folder comes as an entry that cannot be read.
+    for(const f of files){try{await f.slice(0,1).arrayBuffer();}catch{note(t.folder,5000);return;}}
+  }
+  const id=[...crypto.getRandomValues(new Uint8Array(8))].map(b=>b.toString(16).padStart(2,'0')).join('');
+  upload={id,total,count:files.length,sent:0,acked:0,received:false,wake:null};
+  send({type:'paste',id,formats,files:files.map(f=>({name:f.name,type:f.type,size:f.size}))});
+  progress();
+  const current=()=>upload&&upload.id===id;
+  try{
+    for(let index=0;index<files.length;index++){
+      const file=files[index];
+      for(let at=0;at<file.size;){
+        // At most a few megabytes in flight: input and acknowledgements pass in between.
+        while(current()&&upload.sent-upload.acked>=WINDOW) await new Promise(wake=>{upload.wake=wake;});
+        if(!current()) return;
+        const chunk=await file.slice(at,at+CHUNK).arrayBuffer();
+        if(!current()) return;
+        if(socket.readyState!==1) throw new Error(t.disconnected);
+        socket.send(piece(id,index,at,chunk));
+        at+=chunk.byteLength;upload.sent+=chunk.byteLength;progress();
+      }
+    }
+  }catch(e){if(current()){send({type:'paste',id,cancel:true});finished(t.notPasted+(e.message||e),5000);}}
+}
+function pasteState(m){
+  if(!upload||m.id!==upload.id){if(m.state==='failed') note(t.notPasted+m.message,5000);return;}
+  if(m.ack!=null){upload.acked=m.ack;if(upload.wake){upload.wake();upload.wake=null;}return;}
+  if(m.state==='received'){upload.received=true;progress();}
+  else if(m.state==='pasted') finished(t.pasted,2000);
+  else if(m.state==='failed') finished(t.notPasted+m.message,6000);
+  else if(m.state==='cancelled') finished(t.cancelled,2000);
+}
 // A shared page is laid out at the room this viewer has for it, not scaled into it.
 const area=document.querySelector('main');
 let fitted='', fitting=0;
@@ -237,11 +359,105 @@ addEventListener('resize',()=>{clearTimeout(fitting);fitting=setTimeout(fit,250)
 function release(){down.clear();pressed.clear();send({type:'release'});}
 addEventListener('blur',release);
 document.addEventListener('visibilitychange',()=>{if(document.hidden)release();});
+// What the other side's clipboard holds, brought here. Text and HTML go on this
+// clipboard: by the asynchronous clipboard API where the page is a secure
+// context, else by execCommand('copy') while the copy shortcut still counts as
+// a person's action. A picture goes on it only in a secure context; files never
+// can, so they, and a picture that could not, are offered in a tray to
+// download or (Chromium) drag out.
+const tray=document.getElementById('tray');
+const secure=window.isSecureContext&&!!navigator.clipboard&&typeof ClipboardItem!=='undefined';
+let trayAsked=false;
+document.getElementById('remote-clip').addEventListener('click',()=>{trayAsked=true;send({type:'clipboard'});});
+document.addEventListener('pointerdown',e=>{if(!tray.hidden&&!tray.contains(e.target)&&e.target.id!=='remote-clip') tray.hidden=true;});
+const fileUrl=id=>new URL(`clipboard/${id}?token=${encodeURIComponent(token)}`,location.href).href;
+function copyCommand(text,html){
+  let done=false;
+  const on=e=>{if(text!=null)e.clipboardData.setData('text/plain',text);if(html)e.clipboardData.setData('text/html',html);e.preventDefault();done=true;};
+  document.addEventListener('copy',on,true);
+  try{document.execCommand('copy');}catch{}finally{document.removeEventListener('copy',on,true);}
+  return done;
+}
+// Text, HTML and (secure contexts only) the picture, at once; without the
+// picture when it is refused.
+async function writeHere(m,withImage){
+  const text=m.text, html=m.html||null;
+  if(!secure) return {text:(text!=null||html)?copyCommand(text,html):false,image:false};
+  const parts={};
+  if(text!=null) parts['text/plain']=new Blob([text],{type:'text/plain'});
+  if(html) parts['text/html']=new Blob([html],{type:'text/html'});
+  if(withImage&&m.image) parts['image/png']=fetch(fileUrl(m.image.id)).then(r=>r.blob());
+  if(!Object.keys(parts).length) return {text:false,image:false};
+  try{await navigator.clipboard.write([new ClipboardItem(parts)]);return {text:text!=null||!!html,image:!!parts['image/png']};}
+  catch(e){
+    if(!parts['image/png']) throw e;
+    delete parts['image/png'];
+    if(!Object.keys(parts).length) return {text:false,image:false};
+    await navigator.clipboard.write([new ClipboardItem(parts)]);
+    return {text:true,image:false};
+  }
+}
+const sized=n=>n==null?'':n<1024?`${n} B`:n<1048576?`${(n/1024).toFixed(0)} KB`:mb(n);
+function el(tag,props,...children){const e=Object.assign(document.createElement(tag),props||{});e.append(...children.filter(c=>c!=null));return e;}
+function downloadLink(id,name,type){
+  const a=el('a',{href:fileUrl(id),download:name,textContent:t.download,draggable:true});
+  // Chromium saves a dragged item where it is dropped.
+  a.addEventListener('dragstart',e=>e.dataTransfer.setData('DownloadURL',`${type||'application/octet-stream'}:${name}:${a.href}`));
+  return a;
+}
+function showTray(m,result){
+  tray.replaceChildren(el('h2',{},el('span',{textContent:t.remoteClip}),
+    el('button',{type:'button',textContent:'×',title:t.close,onclick:()=>{tray.hidden=true;}})));
+  if(m.text!=null||m.html){
+    const preview=el('div',{className:'name',textContent:(m.text||'').slice(0,200)||'(HTML)',title:(m.text||'').slice(0,2000)});
+    const action=result.text?el('span',{className:'muted',textContent:t.copiedHere})
+      :el('button',{type:'button',textContent:t.copyHere,onclick:async()=>{
+        try{const r=await writeHere(m,false);note(r.text?t.copiedHere:t.notCopied,2500);}catch(e){note(t.notCopied+e.message,4000);}}});
+    tray.append(el('div',{className:'row'},preview,action));
+  }
+  if(m.image){
+    const name='clipboard.png';
+    tray.append(el('div',{className:'row'},el('span',{className:'name',textContent:`${t.picture} ${m.image.width}×${m.image.height}, ${sized(m.image.size)}`}),
+      result.image?el('span',{className:'muted',textContent:t.copiedHere}):downloadLink(m.image.id,name,'image/png')));
+    tray.append(el('img',{src:fileUrl(m.image.id),alt:t.picture,draggable:false}));
+    if(!result.image) tray.append(el('div',{className:'muted',textContent:secure?t.imageNotCopied:t.insecureImage}));
+  }
+  for(const f of m.files||[]){
+    const name=f.dir?`${f.name}.zip`:f.name;
+    const label=el('span',{className:'name',textContent:f.name+(f.dir?'/':''),title:f.dir?t.folder_:f.name});
+    const size=el('span',{className:'muted',textContent:sized(f.size)});
+    const actions=[];
+    if(f.tooLarge||!f.id) actions.push(el('span',{className:'muted',textContent:t.tooLargeItem}));
+    else{
+      actions.push(downloadLink(f.id,name,f.dir?'application/zip':''));
+      if(window.showSaveFilePicker&&!f.dir) actions.push(el('button',{type:'button',textContent:t.saveAs,onclick:async()=>{
+        try{const handle=await showSaveFilePicker({suggestedName:f.name});
+          const response=await fetch(fileUrl(f.id));await response.body.pipeTo(await handle.createWritable());}
+        catch(e){if(e.name!=='AbortError') note(t.notCopied+e.message,4000);}}}));
+    }
+    tray.append(el('div',{className:'row'},label,size,...actions));
+  }
+  if(m.all){
+    const all=downloadLink(m.all,'clipboard.zip','application/zip');
+    all.textContent=t.downloadAll;
+    tray.append(el('div',{className:'row'},el('span',{className:'name'}),all));
+  }
+  if((m.files||[]).length&&/Chrome|Edg/.test(navigator.userAgent)) tray.append(el('div',{className:'muted',textContent:t.dragHint}));
+  tray.hidden=false;
+}
 async function copied(m){
-  if(m.text==null){status.textContent=t.empty;setTimeout(label,3000);return;}
-  try{await navigator.clipboard.writeText(m.text);
-    status.textContent=t.copied(m.characters,m.truncated);}
-  catch(e){status.textContent=t.notCopied+e.message;}
-  setTimeout(label,3000);
+  const asked=trayAsked;trayAsked=false;
+  if(m.protected){note(t.protectedClip,4000);return;}
+  const files=m.files||[];
+  if(m.text==null&&!m.html&&!m.image&&!files.length){
+    if(asked) note(t.nothing,3000); else{status.textContent=t.empty;setTimeout(label,3000);}
+    return;
+  }
+  let result={text:false,image:false}, error=null;
+  try{result=await writeHere(m,true);}catch(e){error=e;}
+  const left=files.length||(m.image&&!result.image)||((m.text!=null||m.html)&&!result.text);
+  if(left||asked){showTray(m,result);if(error&&!result.text&&(m.text!=null||m.html)) note(t.notCopied+(error.message||error),4000);return;}
+  if(m.html==null&&m.image==null&&!clip){status.textContent=t.copied(m.characters,m.truncated);setTimeout(label,3000);return;}
+  note(m.text!=null?t.copied(m.characters,m.truncated):t.copiedHere,2500);
 }
 </script></body></html>
