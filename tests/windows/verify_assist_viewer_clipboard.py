@@ -261,9 +261,206 @@ def run_origin(name, url, word, explorer_folder, explorer_hwnd, visible, report)
     report[name] = result
 
 
+def clipboard_state():
+    """Who last wrote this machine's clipboard (its process's image name), and which formats it holds."""
+    import struct
+    names = {13: "text", user32.RegisterClipboardFormatW("HTML Format"): "html",
+             user32.RegisterClipboardFormatW("PNG"): "png", 8: "dib", 17: "dibv5", 2: "bitmap"}
+    for _ in range(50):
+        if user32.OpenClipboard(None):
+            break
+        time.sleep(0.02)
+    try:
+        owner = user32.GetClipboardOwner()
+        formats, fmt = [], 0
+        while True:
+            fmt = user32.EnumClipboardFormats(fmt)
+            if not fmt:
+                break
+            formats.append(names.get(fmt, fmt))
+    finally:
+        user32.CloseClipboard()
+    pid = ctypes.c_ulong()
+    user32.GetWindowThreadProcessId(owner, ctypes.byref(pid))
+    image = ""
+    handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid.value)
+    if handle:
+        buffer = ctypes.create_unicode_buffer(512)
+        size = ctypes.c_ulong(512)
+        ctypes.windll.kernel32.QueryFullProcessImageNameW(handle, 0, buffer, ctypes.byref(size))
+        ctypes.windll.kernel32.CloseHandle(handle)
+        image = os.path.basename(buffer.value).lower()
+    return {"owner": image, "formats": [f for f in formats if isinstance(f, str)]}
+
+
+def bring_forward(process):
+    """The viewer's Chrome window to the front: the async clipboard API wants a focused page."""
+    import ctypes.wintypes as w
+    found = []
+
+    @ctypes.WINFUNCTYPE(w.BOOL, w.HWND, w.LPARAM)
+    def each(hwnd, _):
+        pid = ctypes.c_ulong()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        title = ctypes.create_unicode_buffer(256)
+        user32.GetWindowTextW(hwnd, title, 256)
+        if user32.IsWindowVisible(hwnd) and "Assist" in title.value:
+            found.append(hwnd)
+        return True
+    user32.EnumWindows(each, 0)
+    for hwnd in found[:1]:
+        user32.keybd_event(0x87, 0, 0, 0)
+        user32.keybd_event(0x87, 0, 2, 0)
+        user32.SetForegroundWindow(hwnd)
+        time.sleep(0.5)
+    return found[0] if found else None
+
+
+def click_element(call, selector):
+    """A click on an element of the page that counts as a person's action.
+    (Synthesised mouse events did not reach the visible window here.)"""
+    result = call("Runtime.evaluate", {"expression": f"(() => {{ const e = document.querySelector({json.dumps(selector)});"
+                                                     " if (!e) return false; e.click(); return true; })()",
+                                       "userGesture": True, "returnByValue": True})
+    return result.get("result", {}).get("value")
+
+
+def click_element_by_mouse(call, selector):
+    box = evaluate(call, f"(() => {{ const r = document.querySelector({json.dumps(selector)}).getBoundingClientRect();"
+                         " return [r.x + r.width / 2, r.y + r.height / 2]; })()")
+    if not box:
+        return False
+    for kind in ("mousePressed", "mouseReleased"):
+        call("Input.dispatchMouseEvent", {"type": kind, "x": box[0], "y": box[1], "button": "left", "clickCount": 1})
+    return True
+
+
+def drag_out(call, hwnd, selector, target_hwnd):
+    """Drags an element of the page onto a window with the real mouse."""
+    user32.SetProcessDPIAware()
+    rect = (ctypes.c_long * 4)()
+    point = (ctypes.c_long * 2)(0, 0)
+    user32.ClientToScreen(hwnd, point)
+    scale = evaluate(call, "window.devicePixelRatio") or 1
+    box = evaluate(call, f"(() => {{ const r = document.querySelector({json.dumps(selector)}).getBoundingClientRect();"
+                         " return [r.x + r.width / 2, r.y + r.height / 2, window.outerHeight - window.innerHeight]; })()")
+    if not box:
+        return False
+    # The page starts below the browser's own bar, at the bottom of the client area's top strip.
+    user32.GetClientRect(hwnd, rect)
+    top_bar = rect[3] - evaluate(call, "window.innerHeight") * scale
+    x, y = int(point[0] + box[0] * scale), int(point[1] + top_bar + box[1] * scale)
+    target = (ctypes.c_long * 4)()
+    user32.GetWindowRect(target_hwnd, target)
+    tx, ty = (target[0] + target[2]) // 2, int(target[1] + (target[3] - target[1]) * 0.7)
+    evaluate(call, "window.__drag = []; for (const t of ['dragstart', 'dragend']) document.addEventListener(t, e =>"
+                   " __drag.push(t + ':' + (e.target.download || e.target.tagName) + ':' + e.dataTransfer.dropEffect), true);"
+                   " window.__hover = null; document.addEventListener('mousemove', e => { __hover ="
+                   " (e.target.download || e.target.tagName); }, true); true")
+    width, height = user32.GetSystemMetrics(0), user32.GetSystemMetrics(1)
+
+    def move(px, py, flags=0):
+        user32.mouse_event(0x8001 | flags, int(px * 65535 / (width - 1)), int(py * 65535 / (height - 1)), 0, 0)
+    move(x, y)
+    time.sleep(0.3)
+    hover = evaluate(call, "__hover")
+    move(x, y, 0x0002)
+    for step in range(1, 31):
+        move(x + (tx - x) * step // 30, y + (ty - y) * step // 30)
+        time.sleep(0.04)
+    time.sleep(0.8)
+    move(tx, ty, 0x0004)
+    time.sleep(0.5)
+    return {"hover": hover, "events": evaluate(call, "__drag"), "from": [x, y], "to": [tx, ty]}
+
+
+def run_copy(name, url, explorer_folder, explorer_hwnd, report):
+    import struct
+    process, port, page = chrome(url, True)
+    client, call = cdp(port, page)
+    result = {}
+    downloads = tempfile.mkdtemp(prefix="aad-viewer-downloads-")
+    try:
+        for _ in range(50):
+            if evaluate(call, "typeof clip !== 'undefined' && clip !== null && document.getElementById('remote-clip').style.display !== 'none'"):
+                break
+            time.sleep(0.2)
+        call("Browser.setDownloadBehavior", {"behavior": "allow", "downloadPath": downloads})
+        result["secure_context"] = evaluate(call, "window.isSecureContext")
+        chrome_hwnd = bring_forward(process)
+
+        # Text, HTML and a picture on the remote clipboard.
+        html_format = user32.RegisterClipboardFormatW("HTML Format")
+        doc = "<html><body>\r\n<!--StartFragment--><b>远程</b> text<!--EndFragment-->\r\n</body></html>"
+        head = "Version:0.9\r\nStartHTML:{:010}\r\nEndHTML:{:010}\r\nStartFragment:{:010}\r\nEndFragment:{:010}\r\n"
+        size, raw = len(head.format(0, 0, 0, 0)), doc.encode()
+        start, end = size + raw.index(b"<!--StartFragment-->") + 20, size + raw.index(b"<!--EndFragment-->")
+        set_clipboard({CF_UNICODETEXT: utf16z("远程 text"),
+                       html_format: head.format(size, size + len(raw), start, end).encode() + raw + b"\0",
+                       user32.RegisterClipboardFormatW("PNG"): png(40, 30, 1)})
+        time.sleep(0.5)
+        click_element(call, "#remote-clip")
+        time.sleep(3)
+        result["text_html_picture"] = {"written": clipboard_state(),
+                                       "tray": evaluate(call, "document.getElementById('tray').hidden ? null : document.getElementById('tray').innerText"),
+                                       "note": evaluate(call, "document.getElementById('transfer-text').textContent")}
+
+        # Files and a folder.
+        source = tempfile.mkdtemp(prefix="aad-viewer-remote-files-")
+        one = os.path.join(source, "远程文件.txt")
+        with open(one, "wb") as fh:
+            fh.write("远程".encode() * 100)
+        sub = os.path.join(source, "夹")
+        os.makedirs(sub)
+        with open(os.path.join(sub, "x.bin"), "wb") as fh:
+            fh.write(os.urandom(5000))
+        dropfiles = struct.pack("<IiiII", 20, 0, 0, 0, 1) + b"".join(p.encode("utf-16-le") + b"\0\0" for p in (one, sub)) + b"\0\0"
+        set_clipboard({CF_HDROP: dropfiles})
+        time.sleep(0.5)
+        click_element(call, "#remote-clip")
+        time.sleep(2)
+        links = evaluate(call, "[...document.querySelectorAll('#tray a')].map(a => ({text: a.textContent, download: a.download}))")
+        click_element(call, "#tray a[download='远程文件.txt']")
+        click_element(call, "#tray a[download='clipboard.zip']")
+        landed = {}
+        for _ in range(40):
+            landed = {n: os.path.getsize(os.path.join(downloads, n)) for n in os.listdir(downloads) if not n.endswith(".crdownload")}
+            if len(landed) >= 2:
+                break
+            time.sleep(0.25)
+        result["files_download"] = {"links": links, "downloaded": landed,
+                                    "passed": landed.get("远程文件.txt") == 600 and "clipboard.zip" in landed}
+
+        # Dragging a file's link out onto an Explorer folder (Chromium's DownloadURL).
+        before = set(os.listdir(explorer_folder))
+        if chrome_hwnd:
+            # The folder beside the browser, above everything, where the drop lands.
+            user32.SetProcessDPIAware()
+            bring_forward(process)
+            browser = (ctypes.c_long * 4)()
+            user32.GetWindowRect(chrome_hwnd, browser)
+            user32.SetWindowPos(explorer_hwnd, -1, 0, 100, min(900, max(400, browser[0] - 20)), 700, 0x0040)
+            time.sleep(0.5)
+            result["drag_events"] = drag_out(call, chrome_hwnd, "#tray a[download='远程文件.txt']", explorer_hwnd)
+            for _ in range(20):
+                if set(os.listdir(explorer_folder)) - before:
+                    break
+                time.sleep(0.25)
+        landed = sorted(set(os.listdir(explorer_folder)) - before)
+        result["drag_out"] = {"landed": landed,
+                              "same": landed == ["远程文件.txt"] and open(os.path.join(explorer_folder, landed[0]), "rb").read() == "远程".encode() * 100}
+        user32.SetWindowPos(explorer_hwnd, -2, 0, 0, 0, 0, 0x0003)
+    finally:
+        client.close()
+        process.terminate()
+    report[name + "_copy"] = result
+
+
 def main():
     sys.stdout.reconfigure(encoding="utf-8")
     visible = "--visible" in sys.argv[1:]
+    if "--copy" in sys.argv[1:]:
+        return main_copy()
     report = {}
     original = f"ORIGINAL viewer {os.getpid()}"
     assist, announce = start_assist("--desktop", "--codecs", "webp", "--fps", "5", "--max-width", "800")
@@ -282,6 +479,31 @@ def main():
                 run_origin(name, url, word, folder, explorer_hwnd, visible, report)
         finally:
             word.quit()
+            user32.PostMessageW(explorer_hwnd, 0x0010, 0, 0)
+    finally:
+        assist.terminate()
+    set_clipboard({CF_UNICODETEXT: utf16z(original)})
+    print(json.dumps(report, ensure_ascii=False, indent=1, default=str))
+
+
+def main_copy():
+    report = {}
+    original = f"ORIGINAL viewer {os.getpid()}"
+    assist, announce = start_assist("--desktop", "--codecs", "webp", "--fps", "5", "--max-width", "800")
+    try:
+        port = int(announce["url"].split(":")[2].split("/")[0])
+        lan = lan_address()
+        lan_port = forward(lan, port)
+        folder = tempfile.mkdtemp(prefix="aad-viewer-dragged-")
+        subprocess.Popen(["explorer.exe", folder])
+        explorer_hwnd = find_window("CabinetWClass", os.path.basename(folder))
+        try:
+            for name, host in (("loopback", f"127.0.0.1:{port}"), ("lan", f"{lan}:{lan_port}")):
+                url = announce["url"].replace(f"127.0.0.1:{port}", host)
+                run_copy(name, url, folder, explorer_hwnd, report)
+                for n in os.listdir(folder):
+                    os.remove(os.path.join(folder, n))
+        finally:
             user32.PostMessageW(explorer_hwnd, 0x0010, 0, 0)
     finally:
         assist.terminate()
