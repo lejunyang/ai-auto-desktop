@@ -875,9 +875,6 @@ pub fn paste(
     })
 }
 
-/// Most text or HTML read for a viewer at once, in bytes.
-const MAX_COPIED_TEXT: usize = 8 * 1024 * 1024;
-
 /// Everything the clipboard holds that a viewer can take: text, HTML, a
 /// picture (PNG, else a bitmap turned into PNG) and files. Nothing is read
 /// when its source marked it as not for clipboard readers.
@@ -890,23 +887,11 @@ pub fn copied() -> Result<aad_platform::clip::Copied> {
         return Ok(copied);
     }
     if has(CF_UNICODETEXT) {
-        if let Some(bytes) = clipboard_bytes(CF_UNICODETEXT) {
-            let mut text = utf16_text(&bytes);
-            if text.len() > MAX_COPIED_TEXT {
-                let mut cut = MAX_COPIED_TEXT;
-                while !text.is_char_boundary(cut) {
-                    cut -= 1;
-                }
-                text.truncate(cut);
-            }
-            copied.text = Some(text);
-        }
+        copied.text = clipboard_bytes(CF_UNICODETEXT).map(|bytes| utf16_text(&bytes));
     }
     let html = clipboard_format(HTML_FORMAT);
     if has(html) {
-        copied.html = clipboard_bytes(html)
-            .and_then(|bytes| html_of_cf_html(&bytes))
-            .filter(|html| html.len() <= MAX_COPIED_TEXT);
+        copied.html = clipboard_bytes(html).and_then(|bytes| html_of_cf_html(&bytes));
     }
     let png = clipboard_format(PNG_FORMAT);
     if has(png) {

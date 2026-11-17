@@ -74,6 +74,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
+mod downloads;
 mod scale;
 mod tiles;
 mod transfer;
@@ -455,9 +456,14 @@ trait Source {
     fn clipboard(&mut self) -> Result<Value> {
         Err("this source has no clipboard to read".into())
     }
-    /// Whether [`Source::paste`] takes every format, files included.
+    /// Whether [`Source::paste`] takes every format, files included, and
+    /// [`Source::copied`] reads them.
     fn transfers(&self) -> bool {
         false
+    }
+    /// Everything the clipboard holds, for a viewer copying from this side.
+    fn copied(&mut self) -> Result<Copied> {
+        Err("this source cannot read more than text".into())
     }
     /// Pastes `clip` where the focus is. `press` has the paste key pressed
     /// from a paste's own thread.
@@ -474,7 +480,7 @@ enum Started {
     Thread(Pasting),
 }
 
-use aad_platform::clip::{Clip, Pasting, Press};
+use aad_platform::clip::{Clip, Copied, Pasting, Press};
 
 /// Most clipboard text handed to a viewer at once.
 const CLIPBOARD_CHARACTERS: usize = 100_000;
@@ -702,7 +708,11 @@ struct Connection {
 
 /// Reads one HTTP request: the viewer page, a WebSocket upgrade, or a
 /// refusal. Runs on its own thread, so a slow client holds up no one.
-fn handshake(mut stream: TcpStream, token: &str) -> Result<Option<Connection>> {
+fn handshake(
+    mut stream: TcpStream,
+    token: &str,
+    listing: &downloads::Listing,
+) -> Result<Option<Connection>> {
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
         .map_err(|e| e.to_string())?;
@@ -731,6 +741,12 @@ fn handshake(mut stream: TcpStream, token: &str) -> Result<Option<Connection>> {
     if !same(given.as_bytes(), token.as_bytes()) {
         let _ = stream
             .write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        return Ok(None);
+    }
+    if let Some(id) = path.strip_prefix("/clipboard/") {
+        // A download may take a while; it has this thread to itself.
+        let _ = stream.set_write_timeout(Some(Duration::from_secs(60)));
+        listing.serve(id, &mut stream);
         return Ok(None);
     }
     if path != "/ws" {
@@ -983,9 +999,11 @@ fn host(
         None
     };
     let clipboard = transfers.then(|| {
-        json!({"paste": true, "copy": false, "files": config.limits.files > 0,
+        json!({"paste": true, "copy": true, "files": config.limits.files > 0,
             "limits": config.limits.describe()})
     });
+    // What the latest `clipboard` answer offers for download.
+    let listing = downloads::Listing::default();
     let mut pastes = Pastes::default();
     let (press_requests, presses) = mpsc::channel::<mpsc::Sender<Result<()>>>();
     let video: serde_json::Map<String, Value> = config
@@ -1002,7 +1020,8 @@ fn host(
                 Ok((stream, _)) => {
                     let _ = stream.set_nonblocking(false);
                     let (arrived, token) = (arrived.clone(), token.to_string());
-                    std::thread::spawn(move || match handshake(stream, &token) {
+                    let listing = listing.clone();
+                    std::thread::spawn(move || match handshake(stream, &token, &listing) {
                         Ok(Some(connection)) => {
                             let _ = arrived.send(connection);
                         }
@@ -1181,7 +1200,13 @@ fn host(
                     }
                     Some("clipboard") if config.no_clipboard => viewer.outbox.text(&json!({"type": "error",
                         "message": "this server does not share its clipboard (--no-clipboard)"})),
-                    Some("clipboard") => match source.clipboard() {
+                    Some("clipboard") => match if transfers {
+                        source
+                            .copied()
+                            .map(|copied| listing.list(copied, &config.limits))
+                    } else {
+                        source.clipboard()
+                    } {
                         Ok(clipboard) => viewer.outbox.text(&clipboard),
                         Err(error) => viewer.outbox.text(&json!({"type": "error", "message": error})),
                     },
@@ -2550,7 +2575,7 @@ fn unknown(event: &Value) -> String {
 /// The desktop of this system, from its platform crate.
 mod desktop {
     use super::{
-        fraction, keys, unknown, Clip, Pace, Picture, Press, Result, Source, Started, Want,
+        fraction, keys, unknown, Clip, Copied, Pace, Picture, Press, Result, Source, Started, Want,
         CLIPBOARD_CHARACTERS,
     };
     pub use aad_platform::Area;
@@ -2687,6 +2712,10 @@ mod desktop {
                 Ok(thread) => Started::Thread(thread),
                 Err(error) => Started::Done(Err(error)),
             }
+        }
+
+        fn copied(&mut self) -> Result<Copied> {
+            self.desktop.copied()
         }
     }
 }

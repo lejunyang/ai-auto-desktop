@@ -59,6 +59,7 @@ dependencies = [
  "aad-windows",
  "base64 0.22.1",
  "clap",
+ "crc32fast",
  "ctrlc",
  "fs2",
  "image",
