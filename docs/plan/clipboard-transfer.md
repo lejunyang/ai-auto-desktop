@@ -1,6 +1,6 @@
 # assist 的剪贴板互通：富文本、图片和文件两个方向
 
-状态：设计（2026-11-18），未实现。范围是 `aad assist`（`crates/aad-cli/src/assist.rs`、`assist/viewer.html`）和各平台的剪贴板读写；MCP 的 `clipboard_read`、`paste` 动作不在这次的范围里。
+状态：已实现（2026-11-18）：Windows 桌面、浏览器页面（CDP）、Linux X11 桌面已在真机 / Xvfb 上验证，macOS 桌面写好未经真机验证；实测结果和与设计不同的地方见文末“实测”。范围是 `aad assist`（`crates/aad-cli/src/assist.rs`、`assist/viewer.html`）和各平台的剪贴板读写；MCP 的 `clipboard_read`、`paste` 动作不在这次的范围里。
 
 ## 现在是什么样
 
@@ -16,16 +16,18 @@
 
 ## 浏览器能做什么（决定了设计）
 
+（“实测”标注的格子是 2026-11-18 在 Windows 11 + Chrome 157（可见窗口）上量的，见文末；其余是设计时的判断。）
+
 | 能力 | 安全上下文（https、localhost / 127.0.0.1） | 不安全（http + IP 或域名） |
 | --- | --- | --- |
-| `paste` 事件里读 `clipboardData`：字符串类型（`text/plain`、`text/html`，有时 `text/rtf`、`text/uri-list`）和 `files` | 可以 | **也可以**：这是用户自己按的粘贴，不受安全上下文限制 |
-| 粘贴的是截图 / 位图 | `files` 里一个 `image/png`（Chrome 统一转成 PNG） | 同左 |
-| 粘贴的是资源管理器 / Finder 里复制的文件 | Chromium、Firefox 在 `files` 里给出每个文件（文件夹拿不到或是 0 字节的项）——**要实测** | 同左 |
+| `paste` 事件里读 `clipboardData`：字符串类型（`text/plain`、`text/html`，有时 `text/rtf`、`text/uri-list`）和 `files` | 可以（实测：`text/plain`、`text/html`） | **也可以**：这是用户自己按的粘贴，不受安全上下文限制（实测：和安全上下文完全一样） |
+| 粘贴的是截图 / 位图 | `files` 里一个 `image/png`，名字 `image.png`（Chrome 统一转成 PNG；实测：剪贴板里只有注册格式 `PNG` 没有 `CF_DIB` 时 Chrome 什么都不给，截图工具两种都放所以不受影响） | 同左（实测） |
+| 粘贴的是资源管理器 / Finder 里复制的文件 | Chrome（Windows）在 `files` 里给出每个文件，名字、类型、大小都对，`types` 是 `["Files"]`（实测）；文件夹会得到读不出的项，查看页读第一个字节试出来并提示“请打包”；Firefox、Finder 未测 | 同左（实测，Chrome） |
 | `navigator.clipboard.read/write`（异步剪贴板 API） | 可以；写支持 `text/plain`、`text/html`、`image/png`；iframe 要 `allow="clipboard-read; clipboard-write"`（omem 已加）；Chrome 要求页面有焦点，Safari / Firefox 要求在用户手势里 | **`navigator.clipboard` 是 undefined** |
 | 写文字 / HTML 的退路 | — | `document.execCommand('copy')` 加 `copy` 事件里 `clipboardData.setData('text/plain' / 'text/html', …)`：要在用户激活后约 5 秒内（Chrome 的 transient activation） |
 | 写图片 | 异步 API 的 `ClipboardItem({'image/png': blob})` | **做不到** |
 | 把文件放进操作系统剪贴板 | **网页做不到**（任何上下文都不行） | 同左 |
-| 把文件交给人 | 下载（`<a download>` 或服务端 `Content-Disposition: attachment`）；Chromium 可以把一项拖到桌面（`dataTransfer.setData('DownloadURL', 'mime:name:url')`）；`showSaveFilePicker` / `showDirectoryPicker` 只在安全上下文、只有 Chromium | 下载、拖出（`DownloadURL` 不要求安全上下文，要实测） |
+| 把文件交给人 | 下载（`<a download>` 或服务端 `Content-Disposition: attachment`；实测文件和 zip 都下载到了）；Chromium 可以把一项拖到桌面（`dataTransfer.setData('DownloadURL', 'mime:name:url')`；实测 `dragstart` 照常触发、`DownloadURL` 设上了，放到资源管理器里落没落地**没测成**，见文末）；`showSaveFilePicker` / `showDirectoryPicker` 只在安全上下文、只有 Chromium | 下载（实测）、拖出（实测 `dragstart` 同样触发；落地同样没测成） |
 
 结论：
 
@@ -124,6 +126,63 @@ viewer 现在只发文本帧，服务端读帧的循环要能收二进制帧（�
 - 100 MB 文件上传时画面帧照常刷新（帧率不掉到 0）；超上限的被拒绝并提示；取消后临时文件被删除。
 - 经 omem 转发打开（`/remote/<id>/`）再测一遍下载：omem 的 `proxyHttp` 会把 `Content-Disposition` 等响应头原样转回来，GET 不用改 omem。
 - 已有的 `tests/windows/verify_assist_input.py` 一类脚本加上粘贴和反向复制的检查。
+
+## 实测（2026-11-18）
+
+环境：这台 Windows 11（150% 缩放）、Chrome 157 可见窗口、Word（Microsoft 365）、资源管理器；查看页分别从
+`http://127.0.0.1:<port>`（安全上下文，`navigator.clipboard` 存在）和 `http://192.168.31.185:<port>`
+（经一个 TCP 转发，模拟 omem 用 IP 打开；`isSecureContext` 为 false，`navigator.clipboard` 是 undefined）打开。
+Linux 在 WSL Ubuntu 22.04 里自起 Xvfb + openbox。
+
+这边 → 远程（两个地址结果一样）：
+
+- Word：文字（制表符、换行、emoji、中文）原样；HTML 保留粗体；只给 RTF 时保留粗体；一张图片插成图片
+  （`InlineShape` 类型 3，图片而不是嵌入的文件对象）。
+- 资源管理器：资源管理器里复制的两个文件（含 2 MB 的）经查看页粘贴进另一个文件夹，逐字节相同；100 MB 的文件
+  经协议直接上传约 3.7 秒，期间画面照常（10 fps 下 38 帧，最长间隔 0.16 s），落地逐字节相同。
+- 每次粘贴后剪贴板仍是原来的内容；Win+V 历史里没有粘贴过的内容（用 WinRT 读历史核对）。
+- 浏览器页面（无头 Chrome）：授权 + `navigator.clipboard.write` + 带 `commands:["paste"]` 的 Ctrl+V **在无头下是通的**：
+  页面的 `paste` 事件是受信任的，带 `text/plain`、`text/html` 和 `image/png` 文件，contenteditable 插入了粗体。
+  PDF 走合成的 `paste` 事件（`isTrusted` 为 false），`files` 里是 `doc.pdf`；`<input type=file>` 拿到两个文件；
+  超过 20 MB 被拒绝。
+- X11：焦点窗口的 Xlib 程序收到全部 target（gnome-copied-files、uri-list、html、rtf、png、UTF8_STRING…），内容一致；
+  粘贴后 xclip 原来放的内容还在。
+
+远程 → 这边：
+
+- 安全上下文：Chrome 把文字、HTML 和 PNG 一起写进了本机剪贴板（剪贴板所有者是 chrome.exe，格式有
+  PNG、CF_DIBV5、HTML Format、CF_UNICODETEXT）。
+- 不安全：`execCommand('copy')` 退路写进了文字和 HTML；图片进托盘，有下载和“不是 https”的说明。
+- 文件、文件夹（zip）、“全部下载”（zip）从两个地址都下载到了，内容正确；`Content-Disposition` 带
+  `filename*=UTF-8''…`，中文文件名正确。
+- 浏览器页面：选区（含粗体）复制回来是文字 + 带内联样式的 HTML。X11：xclip 放的 HTML、PNG、文件都取回来了。
+
+与设计不同、被实测推翻或补上的地方：
+
+- **粘贴线程在按键期间必须继续答复渲染请求**（Windows）：按设计“放好格式 → 按键 → 等目标来取”，但按键要回到主循环
+  去按，粘贴线程在等的时候不处理消息；Word 收到 Ctrl+V 后立刻来取，请求得不到答复就拿到空数据，结果粘贴出
+  空白或纯文字。改成在另一个线程按键、粘贴线程一直处理消息之后 8/8 保留粗体。
+- **Ctrl 和 V 不能紧挨着发**：同一个 `SendInput` 序列里 Ctrl 按下后马上 V，Word 收到的是打出一个 “v”；间隔 50 ms
+  就是粘贴。粘贴键现在每步间隔 30 ms。（这也说明靠 `modifiers` 字段补按的快捷键在这台机器上可能有同样的问题，
+  不在这次范围。）
+- **浏览器把大的二进制消息分片发**：256 KB 的上传块被 Chrome 拆成多个 WebSocket 帧，服务端原来不拼接分片，
+  第二块起偏移对不上。服务端现在按 RFC 6455 拼接分片，分片之间的 ping 照常答复。
+- **X11 不在 `x11_xtest_helper.cpp` 里做**：assist 的 X11 桌面直接用 x11rb 说 X 协议，从不启动那个 helper，所以
+  选择所有者写在 `aad-linux` 里（自己的连接、自己的线程）；判断“目标进程”用焦点窗口和服务器的 resource-id 掩码。
+- Windows 剪贴板保持的时间：没有按设计给 HTML/图片更长的等待；修好上面第一条后 400 ms 足够，文件仍是 1.5 s。
+- 测试上的坑（不是产品问题）：两边是同一台机器时，测试刚往剪贴板放的 HTML 会触发 Word 自己的剪贴板监听，紧接着
+  粘贴有约三分之一的概率变成纯文字；真实使用中查看端的复制不会到达远程的 Word。Word 启动几秒后会弹出账户对话框抢
+  焦点，测试会先关掉它。无头 Chrome 的 `paste` 事件读不到系统剪贴板，查看页的测试必须用可见窗口。
+
+没有测到的：
+
+- 把托盘里的一项拖到资源管理器（`DownloadURL`）：两个地址都看到 `dragstart` 触发、`DownloadURL` 设上，但自动化没能
+  稳定地把放置目标摆在鼠标下，落地与否未确认。[待验证] 需要人手拖一次。
+- Firefox、Safari、Edge 的查看页；Finder 里复制的文件。
+- macOS 桌面的全部（JXA 读写 NSPasteboard）：只在这里交叉编译、过了 clippy。[待验证] 需要 macOS 13+ 真机，在
+  TextEdit / Pages 里粘贴 HTML、RTF、图片，在 Finder 里粘贴文件，并从它们复制回来。
+- 经 omem 转发（`/remote/<id>/`）下载：没有在 omem 里测；`GET` 走 omem 的 `proxyHttp`，按设计不需要改 omem。
+- 画图（新版画图是商店应用，这台机器上没有 `mspaint.exe`）、写字板（Windows 11 已移除）。
 
 ## omem 那边（aad 发版以后）
 

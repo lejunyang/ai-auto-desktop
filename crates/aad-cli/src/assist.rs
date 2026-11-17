@@ -52,7 +52,11 @@
 //!   viewer holds (also done when it leaves), and `{"type":"clipboard"}`,
 //!   answered with `{"type":"clipboard","text":..,"characters":..,
 //!   "truncated":..}` (the desktop's clipboard, a page's selected text; not
-//!   with --view-only or --no-clipboard). Key, mouse and text events may carry
+//!   with --view-only or --no-clipboard). Where `ready` carries `clipboard`,
+//!   that answer also lists HTML, a picture and files to fetch with
+//!   `GET /clipboard/<id>?token=` (see [`downloads`]), and the viewer may
+//!   send `{"type":"paste",..}` with every format and files in `AADP` binary
+//!   frames (see [`transfer`]). Key, mouse and text events may carry
 //!   `"modifiers":["Control","Shift"]`, the modifiers the viewer holds: any
 //!   not pressed here yet are pressed first, any let go are released. A
 //!   browser page also takes `{"type":"viewport","width":..,"height":..}`, in
