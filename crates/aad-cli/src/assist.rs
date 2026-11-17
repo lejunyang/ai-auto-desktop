@@ -75,6 +75,7 @@ use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 mod downloads;
+mod page_clip;
 mod scale;
 mod tiles;
 mod transfer;
@@ -2151,8 +2152,8 @@ fn fraction(event: &Value, key: &str) -> Result<f64> {
 
 mod browser {
     use super::{
-        fraction, keys, unknown, Codec, Frame, Pace, Picture, PixelFormat, Raw, Result, Source,
-        Want,
+        fraction, keys, page_clip, unknown, Clip, Codec, Copied, Frame, Pace, Picture, PixelFormat,
+        Press, Raw, Result, Source, Started, Want,
     };
     use aad_browser::cdp::Client;
     use serde_json::{json, Value};
@@ -2241,6 +2242,13 @@ mod browser {
 
         fn command(&mut self, method: &str, params: Value) -> Result<()> {
             self.call(method, params).map(|_| ())
+        }
+
+        /// A call that may carry a lot (a pasted file) or wait on the page.
+        fn long_call(&mut self, method: &str, params: Value) -> Result<Value> {
+            self.client
+                .set_deadline(Instant::now() + Duration::from_secs(30));
+            self.client.command(method, params).map_err(cdp)
         }
 
         fn screencast(&mut self, format: Option<&'static str>) -> Result<()> {
@@ -2538,6 +2546,35 @@ mod browser {
                 json!({"type": "clipboard", "text": text, "characters": characters,
                 "truncated": characters > super::CLIPBOARD_CHARACTERS}),
             )
+        }
+
+        fn transfers(&self) -> bool {
+            true
+        }
+
+        fn paste(&mut self, clip: Clip, _press: Press) -> Started {
+            let held = self.modifiers;
+            Started::Done(page_clip::paste(
+                &mut |method, params| self.long_call(method, params),
+                held,
+                &clip,
+            ))
+        }
+
+        /// The page copies what is selected, and the clipboard is read; where
+        /// the clipboard cannot be read, the selected text.
+        fn copied(&mut self) -> Result<Copied> {
+            let held = self.modifiers;
+            if let Some(copied) =
+                page_clip::copied(&mut |method, params| self.long_call(method, params), held)
+            {
+                return Ok(copied);
+            }
+            let selected = self.clipboard()?;
+            Ok(Copied {
+                text: selected["text"].as_str().map(str::to_string),
+                ..Copied::default()
+            })
         }
 
         fn release(&mut self) {
