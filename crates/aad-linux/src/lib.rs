@@ -9,6 +9,7 @@ pub mod probe;
 pub mod wayland_portal;
 pub mod window_geometry;
 mod x11;
+mod x11_clip;
 
 pub use desktop::{open, screens};
 

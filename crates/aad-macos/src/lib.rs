@@ -5,6 +5,7 @@
 
 mod desktop;
 mod macos;
+mod pasteboard;
 pub mod probe;
 mod sck;
 
