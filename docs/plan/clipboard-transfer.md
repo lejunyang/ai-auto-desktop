@@ -184,6 +184,51 @@ Linux 在 WSL Ubuntu 22.04 里自起 Xvfb + openbox。
 - 经 omem 转发（`/remote/<id>/`）下载：没有在 omem 里测；`GET` 走 omem 的 `proxyHttp`，按设计不需要改 omem。
 - 画图（新版画图是商店应用，这台机器上没有 `mspaint.exe`）、写字板（Windows 11 已移除）。
 
+## X11：别的程序抢剪贴板（2026-11-19）
+
+0.0.9 发版后在一台经 xrdp 连进去的 KDE Plasma 5（X11）上，从查看页往 Edge 地址栏粘贴纯文字也失败（“没有粘贴：…”），
+往回复制正常；同一台机器上浏览器页面（CDP）的粘贴是好的，所以问题在 X11 桌面这条路。那台机器上有 xrdp-chansrv（RDP
+剪贴板同步）和多半有 Klipper 在盯 CLIPBOARD，原来 Xvfb + openbox 的测试里都没有。
+
+复现：`tests/linux/verify_assist_paste_contention.py`，私有 Xvfb + openbox + Chrome for Testing 158（页面把文本框里
+落下的字写进窗口标题，用 xdotool 读），`tests/linux/x11_clipboard_grabber.c` 模拟抢剪贴板的程序：
+
+- `chansrv DELAY`：每次 CLIPBOARD 换主人就读新主人的 TARGETS，DELAY 毫秒后自己拿走（xrdp-chansrv 在 RDP 客户端宣布
+  它的剪贴板时就是这样）；`chansrv DELAY 1` 只拿一次。
+- `klipper`：换主人时读 TARGETS，没有文字就拿回自己的最后一条（Klipper 的“防止剪贴板为空”）；带
+  `x-kde-passwordManagerHint` 的不碰。
+
+0.0.9 的结果：没有抢的、`klipper` 都粘贴成功（只给 Klipper 标记，它不动）；`chansrv 0`（立刻抢）时 Chrome 粘贴进去
+的是抢的那个程序的内容，aad 却报“前台程序没有接受粘贴”；`chansrv 50`（50 ms 后抢）时 Chrome 收到了 `paste` 事件但
+没有字落下，aad 却报“已粘贴”；`chansrv 300` 成功。也就是说，**按键前后剪贴板被别的程序拿走**会让粘贴失败、粘贴
+错东西，报告还不对。Chrome 来要数据的窗口和 `_NET_ACTIVE_WINDOW` 同属一个 client，在 openbox 下没有出现“认错目标”。
+
+另一个会让粘贴卡住的地方：粘贴前先把原来的剪贴板逐个格式读出来（为了事后恢复），每个格式最多等 2 秒；xrdp 下原来的
+主人是 chansrv，它每个格式都要到 RDP 客户端去取，格式一多粘贴就要等很久，查看页一直显示“上一次粘贴还在传”。
+
+改成：
+
+- 读原来的剪贴板总共最多 1.5 秒，读不完的就不恢复。
+- 拿到 CLIPBOARD 后先**连续保持 150 ms 再按键**；期间被拿走就拿回来，最多 6 次。保持不住就不按键（按了会粘贴别人的
+  内容），报告 `reason: "contended"`。按键之后、目标读到之前被拿走，也拿回来（再最多 6 次）；保持不住报 `lost`，目标
+  一直没来要报 `not_asked`。报告里带 `takers`（谁拿走的：窗口和 WM_CLASS）、`asked`（谁来要了什么、给没给）和
+  `saved_ms`，也放进给查看页的答复的 `detail` 里，真机上看得出是哪一种。
+- 判断目标 client 除了 `_NET_ACTIVE_WINDOW` 也认输入焦点所在窗口的 client（窗口管理器把激活窗口和焦点放在不同 client
+  的窗口上时不至于把目标当外人）；两个都拿不到时谁来要都给。
+- **纯文字（没有图片、文件）剪贴板没粘上时改为直接输入**（0.0.9 之前的做法，走 `{"type":"text"}` 同一条输入路径），
+  最多 64 KB；答复 `state: "pasted"` 带 `typed: true` 和原因 `code`。带 HTML 的也会输入它的纯文字。
+- 失败答复带 `code`（`contended` / `lost` / `not_asked`），查看页按自己的语言说原因；英文 `message` 仍在。
+- 查看页：一次粘贴 20 秒（文件还在传时 60 秒）没收到任何确认或状态，就取消它、清掉并提示，不再挡住之后的粘贴；
+  连接断开时也清掉。
+
+改后同一套复现 12 种情况全部落字：不抢、`klipper`、`chansrv 300`、`chansrv 0 1`（只抢一次）走剪贴板，HTML 也是
+剪贴板给的；`chansrv 0`、`chansrv 50`（一直抢）改为直接输入。原来的 `verify_assist_clipboard_x11.py` 照常通过。
+查看页的超时和中英文原因在 Chrome 里用控制台造了一个卡住的粘贴核对过。
+
+[待验证] 真正的 xrdp-chansrv、Klipper 和 KWin（这里装不了 KDE，没有 root）：需要在那台 KDE Plasma + xrdp 机器上从查看页
+往 Edge 地址栏、Kate 里粘贴文字和带格式的文字，看答复里的 `takers` / `asked`；RDP 客户端是否会在 chansrv 宣布之后
+再宣布一次（一直抢还是只抢一次）决定了带格式的内容能不能保留。omem 自己画的查看页要跟着认 `code`、`typed` 和超时。
+
 ## omem 那边（aad 发版以后）
 
 - 远程页的“画面设置”：“在画面里复制的文字带回这边的剪贴板”改成“剪贴板互通（文字、富文本、图片和文件）”，另加“传文件上限（MB）”，对应 `--clipboard-max-mb`（`src/remote/settings.ts` 的 `viewerArgs`）。
