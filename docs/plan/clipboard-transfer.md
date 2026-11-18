@@ -221,8 +221,16 @@ Linux 在 WSL Ubuntu 22.04 里自起 Xvfb + openbox。
 - 查看页：一次粘贴 20 秒（文件还在传时 60 秒）没收到任何确认或状态，就取消它、清掉并提示，不再挡住之后的粘贴；
   连接断开时也清掉。
 
-改后同一套复现 12 种情况全部落字：不抢、`klipper`、`chansrv 300`、`chansrv 0 1`（只抢一次）走剪贴板，HTML 也是
-剪贴板给的；`chansrv 0`、`chansrv 50`（一直抢）改为直接输入。原来的 `verify_assist_clipboard_x11.py` 照常通过。
+那台机器上还开着 CrossPaste（跨设备剪贴板同步）。读了它的源码（`LinuxPasteboardService.kt`，2025-02 起的各版）：
+X11 下它只用 XFixes 看换主人、经 AWT 读，`lostOwnership` 只记一下，**丢了剪贴板不会抢回来**；2026-09-17（#5015）起认
+`x-kde-passwordManagerHint`。它写 CLIPBOARD 只在两种时候：用户在它的面板里选了一条，或者**别的设备同步过来一条**。
+如果查看端那台电脑也开着 CrossPaste，人在那边一复制，同样的内容就会被同步到这台 Linux 上、在不确定的时刻占一次
+CLIPBOARD，正好落在 aad 粘贴的过程中时 0.0.9 就报“没有粘贴”。所以复现里加了：在某个时刻只抢一次（100 ms：
+落在按键前的保持期里；250 ms：按键之后），以及 `retake DELAY`：从一开始就占着、每次丢了 DELAY 毫秒后抢回、不理会
+密码管理器标记的程序（比 CrossPaste 更凶的情况）。
+
+改后同一套复现 24 种情况全部落字：不抢、`klipper`、`chansrv 300`、只抢一次（立刻、100 ms、250 ms）、`retake 400`
+走剪贴板，HTML 也是剪贴板给的；`chansrv 0`、`chansrv 50`、`retake 0 / 20 / 100`（150 ms 内一直抢）改为直接输入。原来的 `verify_assist_clipboard_x11.py` 照常通过。
 查看页的超时和中英文原因在 Chrome 里用控制台造了一个卡住的粘贴核对过。
 
 [待验证] 真正的 xrdp-chansrv、Klipper 和 KWin（这里装不了 KDE，没有 root）：需要在那台 KDE Plasma + xrdp 机器上从查看页
