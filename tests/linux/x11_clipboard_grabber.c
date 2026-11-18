@@ -16,6 +16,12 @@
  *                                          saw (Klipper's "prevent empty
  *                                          clipboard"); a marked password
  *                                          manager clipboard is left alone
+ *   x11_clipboard_grabber retake DELAY_MS  owns CLIPBOARD from the start and
+ *                                          takes it back DELAY_MS after every
+ *                                          SelectionClear, whatever the new
+ *                                          owner offers (a clipboard manager
+ *                                          that will not let go, ignoring the
+ *                                          password manager marker)
  *
  * Every line it prints starts with "grabber:" and goes to stdout, flushed.
  * Build: cc -o grabber x11_clipboard_grabber.c -lX11 -lXfixes
@@ -115,6 +121,10 @@ int main(int argc, char **argv) {
     printf("grabber: %s ready window 0x%lx\n", mode, me);
     fflush(stdout);
     long take_at = 0;
+    if (!strcmp(mode, "retake")) {
+        snprintf(text, sizeof text, "retaken");
+        take();
+    }
     for (;;) {
         while (XPending(d)) {
             XEvent e;
@@ -157,6 +167,7 @@ int main(int argc, char **argv) {
             } else if (e.type == SelectionClear) {
                 printf("grabber: lost CLIPBOARD\n");
                 fflush(stdout);
+                if (!strcmp(mode, "retake")) take_at = ms() + delay;
             }
         }
         if (take_at && ms() >= take_at) {

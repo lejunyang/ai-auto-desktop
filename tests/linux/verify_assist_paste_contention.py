@@ -6,7 +6,9 @@ A real KDE Plasma desktop reached over xrdp has xrdp-chansrv and Klipper
 watching CLIPBOARD; they read every new owner's TARGETS and may take the
 selection themselves. This runs a private Xvfb with openbox, a Chrome window
 whose page shows what lands in its text box in the window title, and
-x11_clipboard_grabber.c in each of its modes, and pastes text and HTML.
+x11_clipboard_grabber.c in each of its modes (taking CLIPBOARD after every
+owner change, once at a given moment as a synced copy from another device
+would, back after every loss, or as Klipper does), and pastes text and HTML.
 
   CHROME  the Chrome (or Chromium / Edge) to run (default ~/cft/chrome-linux64/chrome)
   AAD     the aad binary (default target/debug/aad)
@@ -84,7 +86,16 @@ def main():
         # typing; one that takes it once, or late, does not.
         cases = [("none", [], False), ("klipper", ["klipper"], False),
                  ("chansrv now", ["chansrv", "0"], True), ("chansrv 50 ms", ["chansrv", "50"], True),
-                 ("chansrv 300 ms", ["chansrv", "300"], False), ("chansrv once", ["chansrv", "0", "1"], False)]
+                 ("chansrv 300 ms", ["chansrv", "300"], False), ("chansrv once", ["chansrv", "0", "1"], False),
+                 # One take at a moment of its own (a copy synced in from another
+                 # device, as CrossPaste writes it): while the paste settles, and
+                 # after the key.
+                 ("once at 100 ms", ["chansrv", "100", "1"], False),
+                 ("once at 250 ms", ["chansrv", "250", "1"], False),
+                 # A manager that takes it back after every SelectionClear and
+                 # ignores the password manager marker.
+                 ("retake now", ["retake", "0"], True), ("retake 20 ms", ["retake", "20"], True),
+                 ("retake 100 ms", ["retake", "100"], True), ("retake 400 ms", ["retake", "400"], False)]
         for name, grabber_args, typed in cases:
             for kind in ("text", "html"):
                 grabber = None
