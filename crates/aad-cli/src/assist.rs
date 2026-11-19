@@ -1353,7 +1353,16 @@ const PASTE_MODIFIER: &str = if cfg!(target_os = "macos") {
 #[derive(Default)]
 struct Pastes {
     queue: VecDeque<(Outbox, transfer::Ready)>,
-    running: Option<(Outbox, String, Pasting)>,
+    running: Option<Running>,
+}
+
+/// The paste under way: where to answer, its id, its thread, and the plain
+/// text to type if the clipboard does not carry it.
+struct Running {
+    outbox: Outbox,
+    id: String,
+    thread: Pasting,
+    fallback: Option<String>,
 }
 
 impl Pastes {
@@ -1367,13 +1376,15 @@ impl Pastes {
         if self
             .running
             .as_ref()
-            .is_some_and(|(_, _, thread)| thread.is_finished())
+            .is_some_and(|running| running.thread.is_finished())
         {
-            if let Some((outbox, id, thread)) = self.running.take() {
-                let result = thread
+            if let Some(running) = self.running.take() {
+                let result = running
+                    .thread
                     .join()
                     .unwrap_or_else(|_| Err("the paste failed unexpectedly".into()));
-                outbox.text(&pasted(&id, result));
+                let answer = finish_paste(source, &running.id, result, running.fallback.as_deref());
+                running.outbox.text(&answer);
             }
         }
         if self.running.is_some() {
@@ -1395,27 +1406,132 @@ impl Pastes {
                 .recv_timeout(Duration::from_secs(5))
                 .map_err(|_| "the paste key was not pressed".to_string())?
         });
+        let fallback = ready
+            .clip
+            .text
+            .clone()
+            .filter(|text| text.len() <= MOST_TYPED);
         match source.paste(ready.clip, press) {
-            Started::Done(result) => outbox.text(&pasted(&ready.id, result)),
-            Started::Thread(thread) => self.running = Some((outbox, ready.id, thread)),
+            Started::Done(result) => {
+                let answer = finish_paste(source, &ready.id, result, fallback.as_deref());
+                outbox.text(&answer);
+            }
+            Started::Thread(thread) => {
+                self.running = Some(Running {
+                    outbox,
+                    id: ready.id,
+                    thread,
+                    fallback,
+                });
+            }
         }
     }
 
     /// Waits for the paste under way, so the clipboard is put back.
     fn finish(&mut self) {
-        if let Some((_, _, thread)) = self.running.take() {
-            let _ = thread.join();
+        if let Some(running) = self.running.take() {
+            let _ = running.thread.join();
         }
     }
+}
+
+/// Why a paste did not go through, for the viewer: a code and an English
+/// message.
+fn not_pasted(report: &Value) -> (&'static str, &'static str) {
+    match report["reason"].as_str() {
+        Some("contended") => (
+            "contended",
+            "another program kept taking the clipboard (a clipboard manager or remote-desktop clipboard sync), so nothing was pasted",
+        ),
+        Some("lost") => (
+            "lost",
+            "another program took the clipboard before the program in front read it",
+        ),
+        _ => (
+            "not_asked",
+            "the program in front did not ask for the paste (is a text field or folder focused?)",
+        ),
+    }
+}
+
+/// The most text typed when the clipboard did not work; typing more would
+/// hold up everything else for long.
+const MOST_TYPED: usize = 64 * 1024;
+
+/// Types `text` in pieces the text input takes.
+fn type_text(source: &mut dyn Source, text: &str) -> Result<()> {
+    let mut rest = text;
+    while !rest.is_empty() {
+        let mut end = rest.len().min(4096);
+        while !rest.is_char_boundary(end) {
+            end -= 1;
+        }
+        source.input(&json!({"type": "text", "text": &rest[..end]}))?;
+        rest = &rest[end..];
+    }
+    Ok(())
+}
+
+/// The viewer's answer about a paste that ended; plain text the clipboard
+/// could not carry is typed (`fallback`).
+fn finish_paste(
+    source: &mut dyn Source,
+    id: &str,
+    result: Result<Value>,
+    fallback: Option<&str>,
+) -> Value {
+    let mut answer = typed_or_pasted(source, id, result.as_ref(), fallback)
+        .unwrap_or_else(|| pasted(id, result.clone()));
+    // What the platform saw (who asked for the clipboard, who took it away),
+    // so a failure on a real desktop can be told apart.
+    if let Ok(report) = &result {
+        let detail: serde_json::Map<String, Value> = ["takers", "asked", "takes", "saved_ms"]
+            .into_iter()
+            .filter_map(|key| {
+                report
+                    .get(key)
+                    .map(|value| (key.to_string(), value.clone()))
+            })
+            .collect();
+        if !detail.is_empty() {
+            answer["detail"] = Value::Object(detail);
+        }
+    }
+    answer
+}
+
+/// The answer when the clipboard did not carry plain text and it was typed
+/// instead (or typing it failed); `None` when there was nothing to type.
+fn typed_or_pasted(
+    source: &mut dyn Source,
+    id: &str,
+    result: std::result::Result<&Value, &String>,
+    fallback: Option<&str>,
+) -> Option<Value> {
+    if let (Ok(report), Some(text)) = (result, fallback) {
+        if report["pasted"] == false && report["type_instead"] == true {
+            let (code, message) = not_pasted(report);
+            return Some(match type_text(source, text) {
+                Ok(()) => json!({"type": "paste", "id": id, "state": "pasted",
+                    "formats": ["text"], "typed": true, "code": code}),
+                Err(error) => transfer::failed_because(
+                    id,
+                    code,
+                    format!("{message}; typing it failed: {error}"),
+                ),
+            });
+        }
+    }
+    None
 }
 
 /// The viewer's answer about a paste that ended.
 fn pasted(id: &str, result: Result<Value>) -> Value {
     match result {
-        Ok(report) if report["pasted"] == false => transfer::failed(
-            id,
-            "the program in front did not take the paste (is a text field or folder focused?)",
-        ),
+        Ok(report) if report["pasted"] == false => {
+            let (code, message) = not_pasted(&report);
+            transfer::failed_because(id, code, message)
+        }
         Ok(report) => {
             let mut message = json!({"type": "paste", "id": id, "state": "pasted"});
             if let Some(formats) = report.get("formats") {
@@ -2793,6 +2909,41 @@ mod tests {
             Ok(())
         }
         fn refresh(&mut self) {}
+    }
+
+    #[test]
+    fn plain_text_the_clipboard_could_not_carry_is_typed() {
+        let mut source = Keys::default();
+        let report = json!({"pasted": false, "reason": "contended", "type_instead": true});
+        let long = "长".repeat(3000);
+        let answer = finish_paste(&mut source, "p1", Ok(report.clone()), Some(&long));
+        assert_eq!(answer["state"], "pasted");
+        assert_eq!(answer["typed"], true);
+        assert_eq!(answer["code"], "contended");
+        // 9000 bytes go as three pieces of at most 4096, cut between characters.
+        assert_eq!(source.0, ["text", "text", "text"]);
+
+        // Not plain text (or too long to type): the viewer is told why.
+        let mut source = Keys::default();
+        let mut not_text = report;
+        not_text["type_instead"] = json!(false);
+        let answer = finish_paste(&mut source, "p2", Ok(not_text), Some("x"));
+        assert_eq!(answer["state"], "failed");
+        assert_eq!(answer["code"], "contended");
+        assert!(source.0.is_empty());
+        let answer = finish_paste(
+            &mut source,
+            "p3",
+            Ok(json!({"pasted": false, "reason": "lost", "type_instead": true})),
+            None,
+        );
+        assert_eq!(answer["code"], "lost");
+        // A platform that does not say why: the program in front did not ask.
+        let answer = pasted("p4", Ok(json!({"pasted": false})));
+        assert_eq!(answer["code"], "not_asked");
+        let answer = pasted("p5", Ok(json!({"pasted": true, "formats": ["text"]})));
+        assert_eq!(answer["state"], "pasted");
+        assert!(answer.get("typed").is_none());
     }
 
     #[test]

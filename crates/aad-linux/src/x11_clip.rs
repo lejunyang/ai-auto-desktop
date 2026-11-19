@@ -6,6 +6,12 @@
 //! Each runs on a connection of its own, so the shared screen's connection
 //! never waits on another client. A selection owner must answer requests
 //! while the paste key is pressed, so the key is pressed from another thread.
+//!
+//! Desktops often run programs that take CLIPBOARD as soon as anyone else
+//! owns it (xrdp-chansrv when the RDP client announces its own clipboard; a
+//! clipboard manager putting its last entry back). A paste takes it back,
+//! presses the key only once it has kept it for a moment, and when it cannot
+//! keep it says so, so text can be typed instead.
 use aad_platform::clip::{Clip, Copied, Pasting, Press};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -81,6 +87,30 @@ impl Side {
             .map_or(x11rb::NONE, |r| r.owner)
     }
 
+    /// A window for a person to recognise: its id, and its WM_CLASS when it
+    /// has one (the selection windows of clipboard programs often have none).
+    fn describe(&self, window: Window) -> String {
+        let class = self
+            .conn
+            .get_property(false, window, AtomEnum::WM_CLASS, AtomEnum::STRING, 0, 64)
+            .ok()
+            .and_then(|c| c.reply().ok())
+            .map(|r| {
+                r.value
+                    .split(|b| *b == 0)
+                    .filter(|part| !part.is_empty())
+                    .map(|part| String::from_utf8_lossy(part).into_owned())
+                    .collect::<Vec<_>>()
+                    .join(".")
+            })
+            .unwrap_or_default();
+        if class.is_empty() {
+            format!("0x{window:x}")
+        } else {
+            format!("0x{window:x} ({class})")
+        }
+    }
+
     /// A server timestamp (ICCCM forbids CurrentTime for ownership).
     fn now(&self) -> u32 {
         let stamp = self
@@ -104,6 +134,23 @@ impl Side {
     /// Asks the CLIPBOARD's owner for `target`; its type and bytes. Large
     /// answers that come in pieces (INCR) are joined, up to `most` bytes.
     fn convert(&self, clipboard: Atom, target: Atom, most: usize) -> Option<(Atom, Vec<u8>)> {
+        self.convert_by(
+            clipboard,
+            target,
+            most,
+            Instant::now() + Duration::from_secs(2),
+        )
+    }
+
+    /// [`Side::convert`], given up when no answer has come by `deadline`
+    /// (INCR pieces then get up to ten seconds more).
+    fn convert_by(
+        &self,
+        clipboard: Atom,
+        target: Atom,
+        most: usize,
+        deadline: Instant,
+    ) -> Option<(Atom, Vec<u8>)> {
         let property = self.atom("AAD_CLIPBOARD").ok()?;
         let incr = self.atom("INCR").ok()?;
         self.conn.delete_property(self.window, property).ok()?;
@@ -117,7 +164,6 @@ impl Side {
             )
             .ok()?;
         self.conn.flush().ok()?;
-        let deadline = Instant::now() + Duration::from_secs(2);
         loop {
             match self.conn.poll_for_event().ok()? {
                 Some(Event::SelectionNotify(n)) if n.requestor == self.window => {
@@ -154,7 +200,7 @@ impl Side {
         let _ = self.conn.flush();
         let mut bytes = Vec::new();
         let mut kind = x11rb::NONE;
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = deadline.max(Instant::now()) + Duration::from_secs(10);
         loop {
             match self.conn.poll_for_event().ok()? {
                 Some(Event::PropertyNotify(e))
@@ -181,10 +227,14 @@ impl Side {
     }
 
     fn targets(&self, clipboard: Atom) -> Vec<Atom> {
+        self.targets_by(clipboard, Instant::now() + Duration::from_secs(2))
+    }
+
+    fn targets_by(&self, clipboard: Atom, deadline: Instant) -> Vec<Atom> {
         let Ok(targets) = self.atom("TARGETS") else {
             return Vec::new();
         };
-        self.convert(clipboard, targets, 64 * 1024)
+        self.convert_by(clipboard, targets, 64 * 1024, deadline)
             .map(|(_, bytes)| {
                 bytes
                     .chunks_exact(4)
@@ -373,12 +423,18 @@ fn items_of(side: &Side, clip: &Clip) -> Result<Vec<Item>> {
     Ok(items)
 }
 
-/// What CLIPBOARD holds now, as items to own it with again later.
-fn save(side: &Side, clipboard: Atom) -> Vec<Item> {
+/// What CLIPBOARD holds now, as items to own it with again later, read for
+/// at most `budget`: its owner may fetch each format from far away (xrdp's
+/// from the RDP client), and a paste must not wait on that.
+fn save(side: &Side, clipboard: Atom, budget: Duration) -> Vec<Item> {
     let mut saved = Vec::new();
     let mut total = 0usize;
     let most = side.conn.maximum_request_bytes().saturating_sub(1024);
-    for target in side.targets(clipboard) {
+    let deadline = Instant::now() + budget;
+    for target in side.targets_by(clipboard, deadline) {
+        if Instant::now() >= deadline {
+            break;
+        }
         let name = side.name(target);
         if matches!(
             name.as_str(),
@@ -387,7 +443,7 @@ fn save(side: &Side, clipboard: Atom) -> Vec<Item> {
         {
             continue;
         }
-        if let Some((kind, bytes)) = side.convert(clipboard, target, most) {
+        if let Some((kind, bytes)) = side.convert_by(clipboard, target, most, deadline) {
             total += bytes.len();
             if total > 32 * 1024 * 1024 {
                 break;
@@ -404,19 +460,36 @@ fn save(side: &Side, clipboard: Atom) -> Vec<Item> {
     saved
 }
 
-/// The base of the client that owns the focused window: every window of
-/// one client shares the bits outside the server's resource mask.
-fn focused_client(side: &Side) -> Option<u32> {
-    let active = side.atom("_NET_ACTIVE_WINDOW").ok()?;
-    let reply = side
-        .conn
-        .get_property(false, side.root, active, AtomEnum::WINDOW, 0, 1)
-        .ok()?
-        .reply()
-        .ok()?;
-    let window = reply.value32()?.next()?;
+/// The bases of the clients the paste key may go to: the one owning the
+/// window the window manager calls active, and the one owning the window
+/// with the keyboard focus (they differ when the window manager keeps the
+/// focus on a frame or a toolkit on a helper window). Every window of one
+/// client shares the bits outside the server's resource mask.
+fn focused_clients(side: &Side) -> Vec<u32> {
     let mask = side.conn.setup().resource_id_mask;
-    (window != 0).then_some(window & !mask)
+    let active = side.atom("_NET_ACTIVE_WINDOW").ok().and_then(|active| {
+        side.conn
+            .get_property(false, side.root, active, AtomEnum::WINDOW, 0, 1)
+            .ok()?
+            .reply()
+            .ok()?
+            .value32()?
+            .next()
+    });
+    let focus = side
+        .conn
+        .get_input_focus()
+        .ok()
+        .and_then(|c| c.reply().ok())
+        .map(|r| r.focus);
+    let mut bases = Vec::new();
+    // 0 is None and 1 PointerRoot: neither names a client.
+    for window in [active, focus].into_iter().flatten() {
+        if window > 1 && window != side.root && !bases.contains(&(window & !mask)) {
+            bases.push(window & !mask);
+        }
+    }
+    bases
 }
 
 /// Owns CLIPBOARD with `saved` until another client takes it (or an hour
@@ -446,10 +519,124 @@ fn restore(saved: Vec<Item>) {
     });
 }
 
+/// How long a paste keeps CLIPBOARD before pressing the key: a program that
+/// takes it whenever someone else owns it has done so by then.
+const SETTLE: Duration = Duration::from_millis(150);
+/// How often a paste takes CLIPBOARD (back) before it gives up.
+const MOST_TAKES: u32 = 6;
+/// How long reading what CLIPBOARD held before may take.
+const SAVE_BUDGET: Duration = Duration::from_millis(1_500);
+
+/// CLIPBOARD owned for one paste: answers requests, and notes who asked
+/// and who took it away.
+struct Owner<'a> {
+    side: &'a Side,
+    clipboard: Atom,
+    targets: Atom,
+    items: &'a [Item],
+    /// What clients other than the target are given: only the marker that
+    /// tells clipboard managers to keep nothing.
+    marker: Vec<Item>,
+    clients: Vec<u32>,
+    mask: u32,
+    taken: Option<Instant>,
+    takes: u32,
+    refused: u32,
+    /// Who asked for what (the first few), for the report.
+    asked: Vec<String>,
+    /// Who took CLIPBOARD away, each time.
+    takers: Vec<String>,
+}
+
+impl Owner<'_> {
+    /// Owns CLIPBOARD (again); whether the server says it does.
+    fn take(&mut self) -> Result<bool> {
+        self.takes += 1;
+        let time = self.side.now();
+        self.side
+            .conn
+            .set_selection_owner(self.side.window, self.clipboard, time)
+            .map_err(|e| failed("owner")(&e))?;
+        self.side.conn.flush().map_err(|e| failed("owner")(&e))?;
+        Ok(self.side.owner(self.clipboard) == self.side.window)
+    }
+
+    /// Handles what came next; true when CLIPBOARD was taken away.
+    fn step(&mut self) -> Result<bool> {
+        match self.side.conn.poll_for_event() {
+            Ok(Some(Event::SelectionRequest(request))) => {
+                let from_target = self.clients.is_empty()
+                    || self.clients.contains(&(request.requestor & !self.mask));
+                if self.asked.len() < 16 {
+                    self.asked.push(format!(
+                        "{} {} {}",
+                        self.side.describe(request.requestor),
+                        self.side.name(request.target),
+                        if from_target { "served" } else { "refused" }
+                    ));
+                }
+                if from_target {
+                    if serve(self.side, &request, self.items, self.targets) {
+                        self.taken = Some(Instant::now());
+                    }
+                } else {
+                    self.refused += 1;
+                    serve(self.side, &request, &self.marker, self.targets);
+                }
+                Ok(false)
+            }
+            Ok(Some(Event::SelectionClear(_))) => {
+                let owner = self.side.owner(self.clipboard);
+                if self.takers.len() < 16 {
+                    self.takers.push(if owner == x11rb::NONE {
+                        "nobody".into()
+                    } else {
+                        self.side.describe(owner)
+                    });
+                }
+                Ok(true)
+            }
+            Ok(Some(_)) => Ok(false),
+            Ok(None) => {
+                std::thread::sleep(Duration::from_millis(2));
+                Ok(false)
+            }
+            Err(e) => Err(failed("events")(&e)),
+        }
+    }
+
+    /// Keeps CLIPBOARD for [`SETTLE`] in a row, taking it back each time
+    /// another program takes it, at most [`MOST_TAKES`] times; whether it
+    /// managed.
+    fn settle(&mut self) -> Result<bool> {
+        self.take()?;
+        let mut since = Instant::now();
+        loop {
+            if self.step()? {
+                if self.takes >= MOST_TAKES {
+                    return Ok(false);
+                }
+                self.take()?;
+                since = Instant::now();
+            }
+            if since.elapsed() >= SETTLE {
+                return Ok(self.side.owner(self.clipboard) == self.side.window);
+            }
+        }
+    }
+}
+
 /// Pastes every format of `clip` into the focused window: owns CLIPBOARD
 /// with them, has the paste key pressed, answers that window's client
 /// (anyone else gets only a marker clipboard managers skip), and owns it
 /// again with what it held before once the target has taken what it wants.
+///
+/// The report says whether it was `pasted`; when not, `reason` says why:
+/// `contended` (another program kept taking CLIPBOARD, so the key was not
+/// pressed: the program in front would have pasted what that one holds),
+/// `lost` (another program took it after the key, before the program in
+/// front read it) or `not_asked` (the program in front did not ask), and
+/// `type_instead` that the paste is plain text that can be typed instead.
 pub fn paste(clip: Clip, press: Press) -> Pasting {
     std::thread::spawn(move || {
         let side = Side::open()?;
@@ -457,66 +644,74 @@ pub fn paste(clip: Clip, press: Press) -> Pasting {
         let targets = side.atom("TARGETS")?;
         let hint = side.atom("x-kde-passwordManagerHint")?;
         let items = items_of(&side, &clip)?;
+        let files = clip.has_files();
+        let typeable =
+            clip.text.as_deref().is_some_and(|t| !t.is_empty()) && clip.image.is_none() && !files;
+        let names: Vec<&str> = [
+            ("text", clip.text.is_some()),
+            ("html", clip.html.is_some()),
+            ("rtf", clip.rtf.is_some()),
+            ("image", clip.image.is_some()),
+            ("files", files),
+        ]
+        .into_iter()
+        .filter_map(|(n, on)| on.then_some(n))
+        .collect();
+        let saving = Instant::now();
         let saved = if side.owner(clipboard) == x11rb::NONE {
             Vec::new()
         } else {
-            save(&side, clipboard)
+            save(&side, clipboard, SAVE_BUDGET)
         };
-        let target = focused_client(&side);
-        let mask = side.conn.setup().resource_id_mask;
-        let time = side.now();
-        side.conn
-            .set_selection_owner(side.window, clipboard, time)
-            .map_err(|e| failed("owner")(&e))?;
-        side.conn.flush().map_err(|e| failed("owner")(&e))?;
-        if side.owner(clipboard) != side.window {
-            return Err("another client kept the clipboard; nothing was pasted".into());
+        let saved_ms = u64::try_from(saving.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let mut owner = Owner {
+            side: &side,
+            clipboard,
+            targets,
+            items: &items,
+            marker: vec![Item {
+                target: hint,
+                kind: hint,
+                format: 8,
+                bytes: b"secret".to_vec(),
+            }],
+            clients: focused_clients(&side),
+            mask: side.conn.setup().resource_id_mask,
+            taken: None,
+            takes: 0,
+            refused: 0,
+            asked: Vec::new(),
+            takers: Vec::new(),
+        };
+        if !owner.settle()? {
+            return Ok(serde_json::json!({"pasted": false, "reason": "contended",
+                "type_instead": typeable, "formats": names, "takes": owner.takes,
+                "takers": owner.takers, "asked": owner.asked, "saved_ms": saved_ms}));
         }
-        // Clipboard managers asking are given only the marker that tells them
-        // to keep nothing.
-        let marker = vec![Item {
-            target: hint,
-            kind: hint,
-            format: 8,
-            bytes: b"secret".to_vec(),
-        }];
         let pressing = std::thread::spawn(press);
-        let files = clip.has_files();
-        let deadline = Instant::now() + Duration::from_secs(if files { 10 } else { 3 });
+        let deadline = Instant::now() + Duration::from_secs(if files { 10 } else { 5 });
         let quiet = Duration::from_millis(if files { 1_500 } else { 400 });
-        let mut taken: Option<Instant> = None;
-        let mut refused = 0u32;
         let mut lost = false;
         loop {
-            match side.conn.poll_for_event() {
-                Ok(Some(Event::SelectionRequest(request))) => {
-                    let from_target = target.is_none_or(|base| request.requestor & !mask == base);
-                    if from_target {
-                        if serve(&side, &request, &items, targets) {
-                            taken = Some(Instant::now());
-                        }
-                    } else {
-                        refused += 1;
-                        serve(&side, &request, &marker, targets);
-                    }
+            if owner.step()? {
+                // Taken away before the program in front read it: take it
+                // back while that program may still ask.
+                if owner.taken.is_none() && owner.takes < 2 * MOST_TAKES && owner.take()? {
+                    continue;
                 }
-                Ok(Some(Event::SelectionClear(_))) => {
-                    lost = true;
-                    break;
-                }
-                Ok(Some(_)) => {}
-                Ok(None) => std::thread::sleep(Duration::from_millis(5)),
-                Err(e) => return Err(failed("events")(&e)),
+                lost = true;
+                break;
             }
             let now = Instant::now();
-            if taken.is_some_and(|at| now - at >= quiet) || (taken.is_none() && now >= deadline) {
+            if owner.taken.is_some_and(|at| now - at >= quiet)
+                || (owner.taken.is_none() && now >= deadline)
+            {
                 break;
             }
         }
         let pressed = pressing
             .join()
             .unwrap_or_else(|_| Err("pressing the paste key failed".into()));
-        let restored = !lost;
         if !lost {
             if saved.is_empty() {
                 let _ = side
@@ -528,20 +723,15 @@ pub fn paste(clip: Clip, press: Press) -> Pasting {
             }
         }
         pressed?;
-        let names: Vec<&str> = [
-            ("text", clip.text.is_some()),
-            ("html", clip.html.is_some()),
-            ("rtf", clip.rtf.is_some()),
-            ("image", clip.image.is_some()),
-            ("files", files),
-        ]
-        .into_iter()
-        .filter_map(|(n, on)| on.then_some(n))
-        .collect();
-        Ok(
-            serde_json::json!({"pasted": taken.is_some(), "formats": names,
-            "restored": restored, "refused": refused}),
-        )
+        let pasted = owner.taken.is_some();
+        let mut report = serde_json::json!({"pasted": pasted, "formats": names,
+            "restored": !lost, "refused": owner.refused, "takes": owner.takes,
+            "takers": owner.takers, "asked": owner.asked, "saved_ms": saved_ms});
+        if !pasted {
+            report["reason"] = (if lost { "lost" } else { "not_asked" }).into();
+            report["type_instead"] = typeable.into();
+        }
+        Ok(report)
     })
 }
 

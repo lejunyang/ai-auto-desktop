@@ -11,6 +11,15 @@
 //! `{"type":"paste","id":..,"state":"received|pasted|failed|cancelled"}`.
 //! `{"type":"paste","id":..,"cancel":true}` stops an upload and deletes what
 //! came of it.
+//!
+//! A `failed` answer has a `message` in English and may have a `code` for
+//! the viewer to say in its own language: `contended` (another program kept
+//! taking the clipboard), `lost` (another program took it before the program
+//! in front read it), `not_asked` (the program in front did not ask for it).
+//! When the clipboard did not work and the paste was plain text, the text is
+//! typed instead: `pasted` then has `"typed":true` and the `code` of why.
+//! Where the platform says more (X11: who asked for the clipboard, who took
+//! it away), the answer carries it in `detail`, for telling failures apart.
 use aad_platform::clip::{safe_file_name, Clip};
 use serde_json::{json, Value};
 use std::fs::File;
@@ -265,6 +274,13 @@ impl Outcome {
 
 pub fn failed(id: &str, message: impl Into<String>) -> Value {
     json!({"type": "paste", "id": id, "state": "failed", "message": message.into()})
+}
+
+/// [`failed`] with a `code` a viewer can say in its own language.
+pub fn failed_because(id: &str, code: &str, message: impl Into<String>) -> Value {
+    let mut answer = failed(id, message);
+    answer["code"] = code.into();
+    answer
 }
 
 /// A paste id: what the viewer chose, if it is short and plain.
