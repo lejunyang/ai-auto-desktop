@@ -146,6 +146,38 @@ fn targets_are_session_bound_consumed_and_not_replayable() {
     );
     assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
 }
+
+#[test]
+fn batch_lookup_uses_one_read_only_observation_and_preserves_order() {
+    let (session, backend) = fixture(false, Duration::ZERO);
+    let target = observed(&session);
+    let lookup = |locators: Value, expect: &str| {
+        call(&session, serde_json::from_value(json!({
+        "method":"find_many", "observation_id":target.observation_id, "locators":locators, "expect":expect
+    })).unwrap())
+    };
+    let locators = json!([{"name":"Missing"}, {"name":"Save"}]);
+    let results = lookup(locators.clone(), "optional").data.unwrap();
+    assert_eq!(results["results"][0]["found"], false);
+    assert_eq!(results["results"][1]["target"], json!(target));
+    assert_eq!(
+        lookup(locators.clone(), "one").error.unwrap()["details"]["locator_index"],
+        0
+    );
+    for invalid in [
+        json!([]),
+        json!([{}]),
+        json!(vec![json!({"name":"Save"}); 33]),
+    ] {
+        assert_eq!(
+            lookup(invalid, "one").error.unwrap()["code"],
+            "CONTROL.INVALID_REQUEST"
+        );
+    }
+    observed(&session);
+    assert!(lookup(locators, "optional").error.is_some());
+    assert_eq!(backend.calls.load(Ordering::SeqCst), 0);
+}
 #[test]
 fn policy_and_unsupported_actions_do_not_dispatch() {
     let (session, backend) = fixture(false, Duration::ZERO);

@@ -327,6 +327,7 @@ pub enum ColorScheme {
 }
 
 pub const MAX_UPLOAD_FILES: usize = 32;
+pub const MAX_FIND_LOCATORS: usize = 32;
 
 pub const ACTION_NAMES: [&str; 30] = [
     "focus",
@@ -486,6 +487,12 @@ pub enum Operation {
     Find {
         observation_id: String,
         locator: Box<Locator>,
+        #[serde(default)]
+        expect: Expect,
+    },
+    FindMany {
+        observation_id: String,
+        locators: Vec<Locator>,
         #[serde(default)]
         expect: Expect,
     },

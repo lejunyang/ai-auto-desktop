@@ -1201,6 +1201,17 @@ impl Session {
                 let observation = self.observation(observation_id)?;
                 self.find_in(observation_id, &observation, locator, *expect, context)
             }
+            Operation::FindMany { observation_id, locators, expect } => {
+                if !(1..=model::MAX_FIND_LOCATORS).contains(&locators.len()) || locators.iter().any(Locator::is_empty) {
+                    return Err(error("CONTROL.INVALID_REQUEST", "find_many requires 1..32 non-empty locators"));
+                }
+                let observation = self.observation(observation_id)?;
+                let results = locators.iter().enumerate().map(|(index, locator)| {
+                    self.find_in(observation_id, &observation, locator, *expect, context)
+                        .map_err(|failure| failure.with_detail("locator_index", json!(index)))
+                }).collect::<Result<Vec<_>>>()?;
+                Ok(json!({"observation_id": observation_id, "results": results}))
+            }
             Operation::Wait {
                 resource_id,
                 locator,

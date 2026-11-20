@@ -388,6 +388,17 @@ the first one. To ask whether something has gone away, pass expect: optional and
             false,
         ),
         (
+            "control_find_many",
+            "Resolve 1..32 locators in order on one retained observation without refreshing it. Optional misses return found=false; an ambiguous or failing lookup stops the batch (zero-based locator_index). Targets are not a queue of future writes.",
+            json!({
+                "observation_id": {"type":"string"},
+                "locators": {"type":"array", "minItems":1, "maxItems":aad_control::MAX_FIND_LOCATORS, "items":locator_schema()},
+                "expect": {"enum":["one","optional"], "default":"one"}
+            }),
+            vec!["observation_id", "locators"],
+            false,
+        ),
+        (
             "control_wait",
             "Wait for something to happen on one resource from control_targets: observe it \
 again and again (every interval_ms) until the locator's element appears, disappears, or \
