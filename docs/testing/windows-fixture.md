@@ -6,7 +6,7 @@ Windows CI 的普通 matrix 会编译 `crates/aad-windows/tests/windows_native.r
 
 fixture 与测试 driver 在同一个 Rust 测试进程中运行：fixture thread 用 Win32 创建标题唯一
 的顶层窗口和真实 `EDIT`、`BUTTON`、`STATIC` 控件，并运行消息循环；测试 thread 通过
-`aad_uia::native_driver()` 访问系统 UIAutomationCore。
+`aad_windows::uia::native_driver()` 访问系统 UIAutomationCore。
 
 覆盖链路包括：
 
