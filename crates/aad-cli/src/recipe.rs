@@ -7,6 +7,11 @@ use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::PathBuf;
 
+mod program;
+mod scope;
+#[cfg(test)]
+mod tests;
+
 #[derive(Args)]
 pub struct Export {
     pub file: PathBuf,
@@ -38,6 +43,9 @@ fn compile(name: &str, steps: &[Step]) -> Result<Value, String> {
 }
 
 pub fn expand(raw: Value) -> Result<Value, String> {
+    if raw.get("format").is_some() {
+        return program::expand(raw);
+    }
     let recipe: Recipe = serde_json::from_value(raw).map_err(|err| err.to_string())?;
     if recipe.kind != "Recipe" || recipe.phases.is_empty() {
         return Err("expected a Recipe with at least one phase".into());
@@ -55,14 +63,7 @@ pub fn expand(raw: Value) -> Result<Value, String> {
             if raw.get("id").is_none() {
                 raw["id"] = json!(format!("s{}", steps.len() + 1));
             }
-            for key in ["locator", "to"] {
-                if let Some(alias) = raw[key].as_str() {
-                    raw[key] = json!(recipe
-                        .targets
-                        .get(alias)
-                        .ok_or_else(|| format!("unknown target {alias}"))?);
-                }
-            }
+            resolve_targets(&mut raw, &recipe.targets)?;
             steps.push(
                 serde_json::from_value(raw)
                     .map_err(|err| format!("step {}: {err}", steps.len() + 1))?,
@@ -70,6 +71,17 @@ pub fn expand(raw: Value) -> Result<Value, String> {
         }
     }
     compile(&recipe.name, &steps)
+}
+
+fn resolve_targets(raw: &mut Value, targets: &BTreeMap<String, Locator>) -> Result<(), String> {
+    for key in ["locator", "to"] {
+        if let Some(alias) = raw[key].as_str() {
+            raw[key] = json!(targets
+                .get(alias)
+                .ok_or_else(|| format!("unknown target {alias}"))?);
+        }
+    }
+    Ok(())
 }
 
 fn compact(document: &Value) -> Result<String, String> {
