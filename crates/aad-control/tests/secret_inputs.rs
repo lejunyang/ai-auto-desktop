@@ -75,7 +75,9 @@ fn setup(grant: bool, fail: bool, protected: bool) -> (Session, Arc<PasswordBack
             ..Default::default()
         },
     );
-    assert!(call(&session, Operation::Targets {}).error.is_none());
+    assert!(call(&session, Operation::Targets { provider: None })
+        .error
+        .is_none());
     let observed = call(
         &session,
         Operation::Observe {

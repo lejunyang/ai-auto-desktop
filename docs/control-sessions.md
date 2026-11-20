@@ -443,6 +443,8 @@ aad mcp --allow-input --allow-upload-dir D:\to-upload  # 浏览器 upload 只能
 （最大 4096×8192，超出时 `clipped: true`），会话加上 PNG 的 sha256 作为 `digest`。只支持主框架；
 桌面窗口见上文（Windows、Linux、macOS）；不提供截图的 provider 返回 `CONTROL.ACTION_UNSUPPORTED`。
 
+已知目标后端时，`control_targets({provider:"browser.cdp"})` 只列出该后端的资源，不轮询原生桌面，也不会清除其他后端的发现结果。省略 `provider` 仍列出所有获准后端。步骤带 `app.provider` 时，执行器自动使用这一路径；每步仍重新检查匹配的资源是否唯一。
+
 对同一观察查多个字段时，传 `control_find_many({observation_id, locators, expect: "optional"})`。1–32 个定位器共享快照与超时，结果按输入顺序；缺失可返回 `found:false`，歧义仍拒绝，错误中的 `locator_index` 从 0 数起。它不刷新观察，也不能预取多次写操作的授权；有输入后仍要重新观察。
 
 MCP 工具为 `control_capabilities`, `control_targets`, `control_observe`, `control_find`, `control_find_many`,

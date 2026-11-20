@@ -308,7 +308,13 @@ fn request(session: &Session, operation: Operation, deadline: Instant) -> Result
 
 /// The one resource a step's application names.
 fn resource(session: &Session, app: &App, deadline: Instant) -> Result<Option<String>> {
-    let listed = request(session, Operation::Targets {}, deadline)?;
+    let listed = request(
+        session,
+        Operation::Targets {
+            provider: app.provider.clone(),
+        },
+        deadline,
+    )?;
     let found: Vec<&Value> = listed["resources"]
         .as_array()
         .map(|all| all.iter().filter(|r| matches(app, r)).collect())

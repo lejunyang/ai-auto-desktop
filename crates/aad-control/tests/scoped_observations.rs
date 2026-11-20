@@ -99,7 +99,9 @@ fn setup(input: bool) -> (Session, Arc<Scoped>, Value) {
             ..Default::default()
         },
     );
-    assert!(call(&session, Operation::Targets {}).error.is_none());
+    assert!(call(&session, Operation::Targets { provider: None })
+        .error
+        .is_none());
     let initial = observe(&session, "first", View::default()).data.unwrap();
     (session, backend, initial)
 }

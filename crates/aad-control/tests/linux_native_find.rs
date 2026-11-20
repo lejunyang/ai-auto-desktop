@@ -119,7 +119,7 @@ fn session_find_uses_native_identity_and_preserves_optional_and_node_id() {
             Policy::default(),
         );
         let call = |op| session.execute(&Request::new(Some(session.id().into()), op));
-        let targets = call(Operation::Targets {}).data.unwrap();
+        let targets = call(Operation::Targets { provider: None }).data.unwrap();
         let resource = targets["resources"][0]["resource_id"].as_str().unwrap();
         let observation = call(Operation::Observe {
             resource_id: resource.into(),
@@ -186,7 +186,7 @@ fn session_wait_reobserves_native_ambiguity_until_unique_or_absent() {
         let targets = session
             .execute(&Request::new(
                 Some(session.id().into()),
-                Operation::Targets {},
+                Operation::Targets { provider: None },
             ))
             .data
             .unwrap();

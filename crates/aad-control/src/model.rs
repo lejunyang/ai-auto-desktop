@@ -476,7 +476,10 @@ pub enum Operation {
         previous: Option<String>,
     },
     Capabilities {},
-    Targets {},
+    Targets {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider: Option<String>,
+    },
     Observe {
         resource_id: String,
         #[serde(default = "default_nodes")]

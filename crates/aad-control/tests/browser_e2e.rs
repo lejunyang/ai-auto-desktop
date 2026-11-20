@@ -417,7 +417,7 @@ fn session_for(fixture: &Fixture) -> (Session, Arc<BrowserBackend>) {
 }
 /// The resources listed now, after control_targets.
 fn targets(session: &Session) -> Vec<Value> {
-    let response = call(session, Operation::Targets {});
+    let response = call(session, Operation::Targets { provider: None });
     assert!(response.error.is_none(), "{response:?}");
     let data = response.data.unwrap();
     // A failed listing is not an empty one: it would make a closed tab
@@ -3836,7 +3836,7 @@ fn browser_actions_are_observed_document_bound_and_have_real_page_effects() {
     );
     let deadline = Instant::now() + Duration::from_secs(10);
     let resources = loop {
-        let response = call(&session, Operation::Targets {});
+        let response = call(&session, Operation::Targets { provider: None });
         let data = response.data.unwrap();
         if data["resources"].as_array().unwrap().iter().any(|r| {
             r["metadata"]["main_frame"] == false
@@ -3878,7 +3878,7 @@ fn browser_actions_are_observed_document_bound_and_have_real_page_effects() {
         vec![Arc::new(BrowserBackend::new(fixture.port))],
         Policy::default(),
     );
-    call(&reader, Operation::Targets {});
+    call(&reader, Operation::Targets { provider: None });
     observe(&reader, main);
     let protected = first["nodes"]
         .as_array()

@@ -139,7 +139,7 @@ fn saved_steps_and_compiled_workflows_refuse_secret_input() {
 fn targets(session: &Session) -> Vec<Value> {
     let response = session.execute(&Request::new(
         Some(session.id().into()),
-        Operation::Targets {},
+        Operation::Targets { provider: None },
     ));
     response.data.unwrap()["resources"]
         .as_array()

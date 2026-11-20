@@ -347,8 +347,8 @@ server operator granted input. Unsupported capabilities are never synthesized.",
 session may observe. Resource IDs are chosen by the server, not given as OS handles or URLs. \
 Browser pages carry metadata.page_id; a tab or popup the page opened (window.open, \
 target=_blank, a sign-in popup) carries metadata.opener_page_id naming its opener. Call \
-this again after an action may have opened or closed a page.",
-            json!({}),
+this again after an action may have opened or closed a page. If the provider is known, list only its resources without polling unrelated desktops or browsers.",
+            json!({"provider":{"type":"string"}}),
             vec![],
             false,
         ),

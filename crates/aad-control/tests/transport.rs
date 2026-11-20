@@ -114,7 +114,10 @@ impl Harness {
         self.client.request(&Request::new(None, op))
     }
     fn target(&self) -> Target {
-        assert!(self.call(Operation::Targets {}).error.is_none());
+        assert!(self
+            .call(Operation::Targets { provider: None })
+            .error
+            .is_none());
         let observation = self
             .call(Operation::Observe {
                 resource_id: "fixture:one".into(),
@@ -291,7 +294,7 @@ fn disconnect_during_input_is_unknown_and_never_retried() {
 #[test]
 fn blocked_transport_writer_cannot_defeat_the_client_deadline() {
     let h = Harness::new(false, Duration::ZERO, true);
-    let mut request = Request::new(None, Operation::Targets {});
+    let mut request = Request::new(None, Operation::Targets { provider: None });
     request.timeout_ms = 20;
     let started = Instant::now();
     let response = h.client.request(&request);

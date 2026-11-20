@@ -314,7 +314,7 @@ impl Desk {
     }
 
     fn targets(&self) -> Outcome {
-        self.call(Operation::Targets {})
+        self.call(Operation::Targets { provider: None })
     }
 
     /// The resource a person named: its id, a unique prefix of its hash, or

@@ -21,7 +21,7 @@ fn main() {
         .parse::<u64>()
         .unwrap();
     let discovery = Session::native(Policy::default());
-    let resources = request(&discovery, Operation::Targets {});
+    let resources = request(&discovery, Operation::Targets { provider: None });
     let resource = resources["resources"]
         .as_array()
         .unwrap()
@@ -44,7 +44,7 @@ fn main() {
         id.into(),
     ];
     let endpoint = Arc::new(RemoteClient::spawn(&argv).unwrap());
-    let resources = request(endpoint.as_ref(), Operation::Targets {});
+    let resources = request(endpoint.as_ref(), Operation::Targets { provider: None });
     assert_eq!(
         resources["resources"].as_array().unwrap().len(),
         1,

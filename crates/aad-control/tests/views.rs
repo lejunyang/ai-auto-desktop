@@ -60,7 +60,9 @@ fn call(session: &Session, operation: Operation) -> Response {
     session.execute(&Request::new(Some(session.id().into()), operation))
 }
 fn observe(session: &Session, view: View) -> Response {
-    assert!(call(session, Operation::Targets {}).error.is_none());
+    assert!(call(session, Operation::Targets { provider: None })
+        .error
+        .is_none());
     call(
         session,
         Operation::Observe {
@@ -547,7 +549,9 @@ impl Backend for Regional {
 #[test]
 fn nodes_that_name_their_region_get_an_overview_and_region_outlines() {
     let session = Session::new(vec![Arc::new(Regional)], Policy::default());
-    assert!(call(&session, Operation::Targets {}).error.is_none());
+    assert!(call(&session, Operation::Targets { provider: None })
+        .error
+        .is_none());
     let view = |view: View| {
         call(
             &session,

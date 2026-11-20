@@ -1097,13 +1097,19 @@ impl Session {
                     })).collect::<Vec<_>>(),
                 "unavailable": self.failures}),
             )),
-            Operation::Targets {} => {
+            Operation::Targets { provider } => {
                 let mut resources = BTreeMap::new();
                 let mut unavailable = self.failures.clone();
+                if let Some(provider) = provider {
+                    if !self.allowed_provider(provider) {
+                        return Err(error("POLICY.DENIED", "target provider is outside this session's grant"));
+                    }
+                    unavailable.retain(|name, _| name == provider);
+                }
                 for backend in self
                     .backends
                     .values()
-                    .filter(|b| self.allowed_provider(b.name()))
+                    .filter(|b| self.allowed_provider(b.name()) && provider.as_deref().is_none_or(|name| name == b.name()))
                 {
                     match backend.resources(context.remaining()?) {
                         Ok(items) => {
@@ -1123,7 +1129,13 @@ impl Session {
                     .values()
                     .map(|item| item.resource.clone())
                     .collect::<Vec<_>>();
-                self.state.lock().unwrap().resources = resources;
+                let mut state = self.state.lock().unwrap();
+                if let Some(provider) = provider {
+                    state.resources.retain(|_, item| &item.resource.provider != provider);
+                    state.resources.extend(resources);
+                } else {
+                    state.resources = resources;
+                }
                 Ok(json!({"resources": public, "unavailable": unavailable}))
             }
             Operation::Observe {

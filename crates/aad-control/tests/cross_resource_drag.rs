@@ -141,7 +141,9 @@ fn fixture(enabled: bool, leases: bool) -> (Session, Arc<Fake>) {
             ..Default::default()
         },
     );
-    assert!(call(&session, Operation::Targets {}).error.is_none());
+    assert!(call(&session, Operation::Targets { provider: None })
+        .error
+        .is_none());
     (session, backend)
 }
 
@@ -337,7 +339,9 @@ fn opt_in_does_not_enable_different_providers_or_cross_surface_paths() {
             ..Default::default()
         },
     );
-    assert!(call(&session, Operation::Targets {}).error.is_none());
+    assert!(call(&session, Operation::Targets { provider: None })
+        .error
+        .is_none());
     let source = observe(&session, "first:0");
     let foreign = observe(&session, "second:0");
     assert_code(

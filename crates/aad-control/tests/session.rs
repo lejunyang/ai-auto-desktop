@@ -69,7 +69,9 @@ fn single_step_verification_never_replays_input() {
     }
 }
 fn observed(session: &Session) -> Target {
-    assert!(call(session, Operation::Targets {}).error.is_none());
+    assert!(call(session, Operation::Targets { provider: None })
+        .error
+        .is_none());
     let observed = call(
         session,
         Operation::Observe {
@@ -408,7 +410,9 @@ fn changing() -> (Arc<Session>, Arc<Changing>) {
             ..Default::default()
         },
     ));
-    assert!(call(&session, Operation::Targets {}).error.is_none());
+    assert!(call(&session, Operation::Targets { provider: None })
+        .error
+        .is_none());
     (session, backend)
 }
 fn wait_for(name: &str, condition: WaitCondition, states: Option<Value>) -> Operation {
@@ -618,7 +622,9 @@ fn uploads_name_only_existing_files_under_the_server_grant() {
                 ..Default::default()
             },
         );
-        assert!(call(&session, Operation::Targets {}).error.is_none());
+        assert!(call(&session, Operation::Targets { provider: None })
+            .error
+            .is_none());
         session
     };
     let upload = |session: &Session, files: Vec<String>| {
@@ -748,9 +754,93 @@ fn close_expiry_and_bounded_replay_guard_revoke_observations() {
         .unwrap();
     std::thread::sleep(Duration::from_millis(10));
     assert_eq!(
-        call(&session, Operation::Targets {}).error.unwrap()["code"],
+        call(&session, Operation::Targets { provider: None })
+            .error
+            .unwrap()["code"],
         "CONTROL.SESSION_CLOSED"
     );
+}
+
+#[test]
+fn scoped_discovery_polls_and_replaces_only_the_requested_provider() {
+    struct Inventory {
+        name: &'static str,
+        polls: AtomicUsize,
+    }
+    impl Backend for Inventory {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn capabilities(&self) -> Vec<String> {
+            Vec::new()
+        }
+        fn resources(&self, _: Duration) -> Result<Vec<BackendResource>> {
+            if self.polls.fetch_add(1, Ordering::SeqCst) > 0 {
+                return Ok(Vec::new());
+            }
+            Ok(vec![BackendResource {
+                resource: Resource {
+                    provider: self.name.into(),
+                    resource_id: format!("{}:window", self.name),
+                    kind: "desktop".into(),
+                    name: "window".into(),
+                    capabilities: self.capabilities(),
+                    metadata: json!({}),
+                },
+                selector: json!({}),
+            }])
+        }
+        fn observe(&self, _: &Value, _: usize, _: Duration) -> Result<Value> {
+            Ok(json!({"nodes": [], "truncated": false}))
+        }
+        fn act(&self, _: &Value, _: &Value, _: &Action, _: &Context) -> Result<Value> {
+            unreachable!()
+        }
+    }
+    let inventory = |name| {
+        Arc::new(Inventory {
+            name,
+            polls: AtomicUsize::new(0),
+        })
+    };
+    let browser = inventory("browser");
+    let desktop = inventory("desktop");
+    let session = Session::new(vec![desktop.clone(), browser.clone()], Policy::default());
+    let discover_browser = || Operation::Targets {
+        provider: Some("browser".into()),
+    };
+    let observe = |resource_id: &str| Operation::Observe {
+        resource_id: resource_id.into(),
+        max_nodes: 10,
+        view: Default::default(),
+    };
+    let initial: Operation = serde_json::from_value(json!({"method": "targets"})).unwrap();
+    assert_eq!(
+        call(&session, initial).data.unwrap()["resources"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(
+        call(&session, discover_browser()).data.unwrap()["resources"],
+        json!([])
+    );
+    assert!(call(&session, observe("browser:window")).error.is_some());
+    assert!(call(&session, observe("desktop:window")).error.is_none());
+    assert_eq!(desktop.polls.load(Ordering::SeqCst), 1);
+    let restricted = Session::new(
+        vec![browser.clone()],
+        Policy {
+            providers: ["desktop".into()].into_iter().collect(),
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        call(&restricted, discover_browser()).error.unwrap()["code"],
+        "POLICY.DENIED"
+    );
+    assert_eq!(browser.polls.load(Ordering::SeqCst), 2);
 }
 
 struct Reader;

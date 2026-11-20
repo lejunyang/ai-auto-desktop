@@ -208,7 +208,7 @@ impl Desk {
 
     /// Every window and page, each with the name a saved step would use.
     fn targets(&self) -> Reply {
-        let listed = self.call(Operation::Targets {})?;
+        let listed = self.call(Operation::Targets { provider: None })?;
         let all = listed["resources"].as_array().cloned().unwrap_or_default();
         let resources: Vec<Value> = all
             .iter()

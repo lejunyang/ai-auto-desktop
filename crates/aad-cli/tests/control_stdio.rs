@@ -36,7 +36,10 @@ fn session(proxy: bool) {
     assert_eq!(hello.protocol_version, PROTOCOL_VERSION);
     assert_eq!(hello.data.unwrap()["allow_input"], false);
     let id = hello.session_id;
-    let targets = call(Request::new(Some(id.clone()), Operation::Targets {}));
+    let targets = call(Request::new(
+        Some(id.clone()),
+        Operation::Targets { provider: None },
+    ));
     assert!(targets.error.is_none(), "{targets:?}");
     assert!(targets.data.unwrap()["resources"].is_array());
     let closed = call(Request::new(Some(id), Operation::Close {}));

@@ -228,7 +228,7 @@ fn a_launched_program_answers_its_window_which_can_be_observed_captured_and_clos
     );
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        let targets = data(run(&session, Operation::Targets {}, 10_000));
+        let targets = data(run(&session, Operation::Targets { provider: None }, 10_000));
         let still = targets["resources"]
             .as_array()
             .unwrap()
