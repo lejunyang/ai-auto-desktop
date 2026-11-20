@@ -122,4 +122,16 @@ test('typed batches re-observe after a write and stop on a missing element',
     assert.deepEqual(new Set(table.truncation_reasons),new Set(['rows_not_rendered','column_limit','cell_limit','character_budget']));
     assert.equal(table.rows[0][0].length,500);
     assert.equal(table.rows[0].length,41);
+    await page.cdp.eval(`document.body.innerHTML='<table aria-label="Orders" aria-rowcount="500"><tr><th>ID</th><th>Total</th></tr><tr><td>ORD-1</td><td>118.50</td></tr><tr><td hidden>internal</td><td>2.00</td></tr></table>';true`);
+    async function readTable(columns,expectError=false) {
+      const found=await tool('control_find',{observation_id:await observe(),locator:{role:'table',name:'Orders'}});
+      return tool('control_read_table',{target:found.data.target,columns},expectError);
+    }
+    const records=(await readTable(['Total','ID'])).data;
+    assert.deepEqual(records.records,[{Total:'118.50',ID:'ORD-1'},{Total:'2.00',ID:null}]);
+    assert.deepEqual(records.truncation_reasons,['rows_not_rendered']);
+    assert.equal(records.visible_data_rows,2);
+    await page.cdp.eval("document.querySelector('th').textContent='Total';true");
+    const duplicate=await readTable(['Total'],true);
+    assert.equal(duplicate.error.code,'CONTROL.TABLE_HEADER');
   });

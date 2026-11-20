@@ -295,6 +295,9 @@ says which providers and actions exist and whether input was granted; control_ta
 lists windows, applications and browser pages; control_observe returns an outline \
 (or, on a crowded window, an overview of its regions first) with a session-bound \
 target for each element; control_find resolves a locator to exactly one of them; \
+control_find_many locates several controls on the same observation. For data rather \
+than handles, control_read_fields returns named values in one call; control_read_table \
+returns requested columns of an observed Chromium HTML table. \
 control_act performs a typed action on such a target. Targets prove the element was \
 observed. Observe again after any input, and check the result yourself: submission \
 is not success. An input interrupted by cancellation or disconnect has unknown \

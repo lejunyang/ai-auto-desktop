@@ -1214,6 +1214,7 @@ impl Session {
                 let observation = self.observation(observation_id)?;
                 self.find_in(observation_id, &observation, locator, *expect, context)
             }
+            Operation::ReadTable { target, columns, max_characters } => self.read_table(target, columns, *max_characters, context),
             Operation::ReadFields { resource_id, fields } => {
                 fields::validate(fields)?;
                 let (id, observation) = self.observe_resource(resource_id, MAX_NODES, context)?;
@@ -1925,6 +1926,111 @@ impl Session {
             .observations
             .insert(observation_id.clone(), observation.clone());
         Ok((observation_id, observation))
+    }
+
+    fn read_table(
+        &self,
+        target: &Target,
+        columns: &[String],
+        budget: Option<usize>,
+        context: &Context,
+    ) -> Result<Value> {
+        if !(1..=32).contains(&columns.len())
+            || columns
+                .iter()
+                .any(|column| column.trim().is_empty() || column.len() > 256)
+            || columns.iter().collect::<BTreeSet<_>>().len() != columns.len()
+        {
+            return Err(error(
+                "CONTROL.INVALID_REQUEST",
+                "choose 1..32 distinct column names",
+            ));
+        }
+        let view = View {
+            mode: ViewMode::Text,
+            max_characters: budget,
+            ..Default::default()
+        };
+        validate_view(&view)?;
+        let (_, scoped) = self.observe_resource_scoped(
+            &target.resource_id,
+            MAX_NODES,
+            None,
+            Some(target),
+            context,
+        )?;
+        let root = scoped
+            .nodes
+            .first()
+            .ok_or_else(|| error("CONTROL.STALE_TARGET", "the observed table disappeared"))?;
+        if scoped.provider != browser::PROVIDER || root["tag"] != "table" {
+            return Err(error(
+                "CONTROL.ACTION_UNSUPPORTED",
+                "select an HTML table on a Chromium page",
+            ));
+        }
+        let backend = &self.backends[&scoped.provider];
+        let content = backend
+            .view(&scoped.raw, &view, context.remaining()?)?
+            .ok_or_else(|| {
+                error(
+                    "CONTROL.ACTION_UNSUPPORTED",
+                    "the provider cannot read this table",
+                )
+            })?;
+        let table = &content["tables"][0];
+        if table["node_id"] != root["node_id"] || table["simple_header"] != true {
+            return Err(error(
+                "CONTROL.TABLE_HEADER",
+                "expected a table with one visible header row and no spanning cells",
+            ));
+        }
+        let rows = table["rows"]
+            .as_array()
+            .ok_or_else(|| error("CONTROL.BAD_PROVIDER_OUTPUT", "missing table rows"))?;
+        let header = rows
+            .first()
+            .and_then(Value::as_array)
+            .ok_or_else(|| error("CONTROL.TABLE_HEADER", "missing table headers"))?;
+        let mut indexes = Vec::new();
+        for column in columns {
+            let matches: Vec<_> = header
+                .iter()
+                .enumerate()
+                .filter(|(_, cell)| cell.as_str() == Some(column))
+                .collect();
+            if matches.len() != 1 {
+                return Err(error(
+                    "CONTROL.TABLE_HEADER",
+                    format!(
+                        "column {column:?} occurs {} times in the returned header",
+                        matches.len()
+                    ),
+                ));
+            }
+            indexes.push(matches[0].0);
+        }
+        let records: Vec<_> = rows
+            .iter()
+            .skip(1)
+            .map(|row| {
+                columns
+                    .iter()
+                    .zip(&indexes)
+                    .map(|(name, index)| {
+                        (
+                            name.clone(),
+                            row.get(*index).cloned().unwrap_or(Value::Null),
+                        )
+                    })
+                    .collect::<serde_json::Map<_, _>>()
+            })
+            .collect();
+        context.remaining()?;
+        Ok(
+            json!({"scope":"rendered_rows","records":records,"visible_data_rows":table["row_count"].as_u64().unwrap_or(0).saturating_sub(1),
+            "truncated":table["truncated"],"truncation_reasons":table["truncation_reasons"]}),
+        )
     }
 
     /// Resolve a locator inside one retained observation.

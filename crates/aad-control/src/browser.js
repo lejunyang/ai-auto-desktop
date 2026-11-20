@@ -254,14 +254,18 @@
         if (budget<=0) {cut=true;break;}
         const rows=Array.from(table.rows).filter(visible);
         const shown=[], reasons=new Set();
+        const top=rows[0], simpleHeader=!!top && top.cells.length>0 && top.cells.length<=50 && Array.from(top.cells).every(cell=>cell.tagName==='TH'&&visible(cell)&&(cell.innerText||'').trim().length<=500) &&
+          Array.from(top.cells).reduce((total,cell)=>total+(cell.innerText||'').trim().length,0)<=budget &&
+          (!table.tHead||table.tHead.rows.length===1) && !table.querySelector('[colspan]:not([colspan="1"]),[rowspan]:not([rowspan="1"])');
         if(rows.length>200)reasons.add('row_limit');
         const declared=Number(table.getAttribute('aria-rowcount')||0);
         if(declared===-1||declared>rows.length)reasons.add('rows_not_rendered');
         for (const row of rows.slice(0,200)) {
           if(budget<=0){reasons.add('character_budget');break;}
-          const cells=Array.from(row.cells).filter(visible), values=[];
+          const cells=Array.from(row.cells), values=[];
           if(cells.length>50)reasons.add('column_limit');
           for(const cell of cells.slice(0,50)){
+            if(!visible(cell)){values.push(null);continue;}
             if(budget<=0){reasons.add('character_budget');break;}
             const text=(cell.innerText||'').trim(), limit=Math.min(500,budget);
             if(text.length>500)reasons.add('cell_limit');
@@ -272,7 +276,7 @@
         }
         if(reasons.size)cut=true;
         tables.push({node_id:ids.get(table)||null,name:(table.getAttribute('aria-label')||(table.caption?table.caption.innerText:'')||'').trim().slice(0,256),
-          scope:'rendered_rows',row_count:rows.length,rows:shown,truncated:reasons.size>0,truncation_reasons:[...reasons]});
+          scope:'rendered_rows',simple_header:simpleHeader,row_count:rows.length,rows:shown,truncated:reasons.size>0,truncation_reasons:[...reasons]});
       }
       return {text:full.slice(0,max),characters:full.length,text_truncated:full.length>max,tables,table_count:all.length,tables_truncated:cut||all.length>tables.length};
     },

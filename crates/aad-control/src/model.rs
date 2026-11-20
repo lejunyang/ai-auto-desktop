@@ -503,6 +503,12 @@ pub enum Operation {
         resource_id: String,
         fields: Vec<crate::fields::ReadField>,
     },
+    ReadTable {
+        target: Target,
+        columns: Vec<String>,
+        #[serde(default)]
+        max_characters: Option<usize>,
+    },
     Act {
         target: Target,
         action: Action,
