@@ -13,6 +13,7 @@ mod browser_record;
 mod cdp_watch;
 mod control;
 mod desk;
+mod recipe;
 
 use serde_json::{json, Value};
 use std::io::Write;
@@ -74,6 +75,8 @@ enum Command {
     Run(RunArgs),
     /// Record what someone does in a window, as steps that replay on any platform.
     Record(desk::RecordArgs),
+    /// Export an editable, runnable YAML recipe from a recording.
+    Recipe(recipe::Export),
     /// Continuously observe foreground app switches and in-app changes.
     ///
     /// Streams one JSON object per line (JSONL). Unlike `record`, it is not
@@ -455,6 +458,10 @@ fn dispatch(command: &Command) -> (Value, u8) {
             ),
         },
         Command::Record(args) => desk::record(args),
+        Command::Recipe(args) => match recipe::export(args) {
+            Ok(result) => (result, EXIT_OK),
+            Err(message) => (failure("CLI.RECIPE_INVALID", &message, None), EXIT_USAGE),
+        },
         Command::Watch(args) => run_watch(args),
         Command::BrowserRecord(command) => match browser_record::run(command) {
             Ok(value) => (value, EXIT_OK),
@@ -1112,6 +1119,10 @@ fn read_descriptor(path: &Path) -> Result<Value, Value> {
     // Checked here rather than at each of the three places that compile a
     // descriptor: missing one of them silently restores the old behaviour, which
     // is exactly what happened when this lived in `validate` alone.
+    if document["kind"] == "Recipe" {
+        return recipe::expand(document)
+            .map_err(|message| failure("CLI.RECIPE_INVALID", &message, None));
+    }
     if let Some(problem) = mistaken_for_a_workflow(&document) {
         return Err(problem);
     }
@@ -1473,10 +1484,29 @@ fn run_workflow(args: &RunArgs) -> (Value, u8) {
     // The native providers come from one control session, which also runs
     // saved control steps, so both kinds of workflow drive the same driver.
     // Input is still gated by the workflow's declared permissions.
-    let session = std::sync::Arc::new(aad_control::Session::native(aad_control::Policy {
-        allow_input: true,
-        ..Default::default()
-    }));
+    let browser_port = match std::env::var("AAD_CDP_PORT") {
+        Ok(value) => match value.parse::<u16>() {
+            Ok(port) if port > 0 => Some(port),
+            _ => {
+                return (
+                    failure(
+                        "CLI.INVALID_ARGUMENTS",
+                        "AAD_CDP_PORT must be 1..65535",
+                        None,
+                    ),
+                    EXIT_USAGE,
+                )
+            }
+        },
+        Err(_) => None,
+    };
+    let session = std::sync::Arc::new(aad_control::Session::native_with_browser(
+        aad_control::Policy {
+            allow_input: true,
+            ..Default::default()
+        },
+        browser_port,
+    ));
     for provider in session.providers() {
         if !providers
             .names()

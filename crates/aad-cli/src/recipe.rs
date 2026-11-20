@@ -1,0 +1,129 @@
+use aad_control::steps::{self, App, Step};
+use aad_control::Locator;
+use clap::Args;
+use serde::Deserialize;
+use serde_json::{json, Value};
+use std::collections::BTreeMap;
+use std::io::Write;
+use std::path::PathBuf;
+
+#[derive(Args)]
+pub struct Export {
+    pub file: PathBuf,
+    #[arg(long)]
+    pub out: PathBuf,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Recipe {
+    kind: String,
+    name: String,
+    #[serde(default)]
+    targets: BTreeMap<String, Locator>,
+    phases: Vec<Phase>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Phase {
+    app: App,
+    steps: Vec<Value>,
+}
+
+fn compile(name: &str, steps: &[Step]) -> Result<Value, String> {
+    let workflow = steps::workflow(name, steps).map_err(|err| err.message)?;
+    aad_core::compile_descriptor(workflow.clone(), None).map_err(|err| err.to_string())?;
+    Ok(workflow)
+}
+
+pub fn expand(raw: Value) -> Result<Value, String> {
+    let recipe: Recipe = serde_json::from_value(raw).map_err(|err| err.to_string())?;
+    if recipe.kind != "Recipe" || recipe.phases.is_empty() {
+        return Err("expected a Recipe with at least one phase".into());
+    }
+    let mut steps = Vec::new();
+    for phase in recipe.phases {
+        if phase.steps.is_empty() || phase.steps.len() > 500 - steps.len() {
+            return Err("each phase needs steps and the recipe can hold at most 500 steps".into());
+        }
+        for mut raw in phase.steps {
+            if !raw.is_object() || raw.get("app").is_some() {
+                return Err("each step uses the application of its phase".into());
+            }
+            raw["app"] = json!(phase.app);
+            if raw.get("id").is_none() {
+                raw["id"] = json!(format!("s{}", steps.len() + 1));
+            }
+            for key in ["locator", "to"] {
+                if let Some(alias) = raw[key].as_str() {
+                    raw[key] = json!(recipe
+                        .targets
+                        .get(alias)
+                        .ok_or_else(|| format!("unknown target {alias}"))?);
+                }
+            }
+            steps.push(
+                serde_json::from_value(raw)
+                    .map_err(|err| format!("step {}: {err}", steps.len() + 1))?,
+            );
+        }
+    }
+    compile(&recipe.name, &steps)
+}
+
+fn compact(document: &Value) -> Result<String, String> {
+    if document["kind"] != "Recording" {
+        return Err("expected a control-steps/1 recording".into());
+    }
+    let name = document["metadata"]["name"]
+        .as_str()
+        .ok_or("missing recording name")?;
+    let steps = steps::steps_of(document).map_err(|err| err.message)?;
+    let original = compile(name, &steps)?;
+    let mut targets = BTreeMap::new();
+    let mut names = BTreeMap::new();
+    let mut phases = String::new();
+    let mut app = None;
+    for step in &steps {
+        if app != Some(&step.app) {
+            phases.push_str(&format!("  - app: {}\n    steps:\n", json!(step.app)));
+            app = Some(&step.app);
+        }
+        let mut raw = json!(step);
+        raw.as_object_mut().unwrap().remove("app");
+        for key in ["locator", "to"] {
+            if let Some(locator) = raw.get(key).cloned() {
+                let next = format!("t{}", names.len() + 1);
+                let alias = names.entry(locator.to_string()).or_insert(next);
+                targets.insert(alias.clone(), locator);
+                raw[key] = json!(alias);
+            }
+        }
+        phases.push_str(&format!("      - {raw}\n"));
+    }
+    let yaml = format!(
+        "kind: Recipe\nname: {}\ntargets: {}\nphases:\n{phases}",
+        json!(name),
+        json!(targets)
+    );
+    if expand(serde_yaml::from_str(&yaml).map_err(|err| err.to_string())?)? != original {
+        return Err("recipe round-trip changed the workflow".into());
+    }
+    Ok(yaml)
+}
+
+pub fn export(args: &Export) -> Result<Value, String> {
+    let source = std::fs::read(&args.file).map_err(|err| err.to_string())?;
+    let document = serde_json::from_slice(&source).map_err(|err| err.to_string())?;
+    let yaml = compact(&document)?;
+    let mut output = std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&args.out)
+        .map_err(|err| err.to_string())?;
+    output
+        .write_all(yaml.as_bytes())
+        .map_err(|err| err.to_string())?;
+    Ok(json!({"file":args.out,"lines":yaml.lines().count(),"bytes":yaml.len()}))
+}
