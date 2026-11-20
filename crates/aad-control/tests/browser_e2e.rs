@@ -19,10 +19,10 @@ use std::time::{Duration, Instant};
 
 #[path = "browser_cases/access.rs"]
 mod access_cases;
-#[path = "browser_cases/table.rs"]
-mod table_cases;
 #[path = "browser_cases/inflight.rs"]
 mod inflight_cases;
+#[path = "browser_cases/table.rs"]
+mod table_cases;
 
 const PAGE: &str = r#"<!doctype html><html><body>
 <form onsubmit="event.preventDefault()"><input id="name" aria-label="Name" oninput="document.getElementById('status').value='fill:'+this.value" onkeydown="if(event.key==='Enter')document.getElementById('status').value='key:'+event.isTrusted">
