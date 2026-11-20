@@ -1,0 +1,81 @@
+# 收集表格、导出 CSV 和对账
+
+打开 Chromium 的账单页面，定位到第一页，把下面的 JSON 存为 `bills.json`。`table` 和翻页控件都要能在同一页面或 frame 内唯一定位。`row_key` 选用跨页稳定且唯一的业务列，例如账单号。保留前导零的编号可直接使用。
+
+```json
+{
+  "table": {"role": "table", "name": "Bills"},
+  "columns": ["ID", "Amount", "Note"],
+  "row_key": "ID",
+  "traversal": {"mode": "pagination", "next": {"role": "button", "name": "Next"}},
+  "expected_rows": 2
+}
+```
+
+在同一次调用中收集数据、生成实际账单 CSV，并对比预期账单。URL 要与一个已打开的主页面完全一致。同 URL 的多个标签页或子 frame，可用 `--resource-id` 指定 `control_targets` 返回的资源。
+
+```powershell
+aad table collect --url 'http://localhost:8080/bills' --browser-port 9222 --allow-input --spec ./bills.json --output ./actual.csv --compare-csv ./expected.csv --decimal Amount
+```
+
+`--output` 和 `--compare-csv` 均可省略。标准输出包含 `records`、`row_count`、`complete`、`stop_reason` 和实际提交的 `actions` 数量。对账时另有 `matches` 和 `comparison`。收集不完整会返回已有记录并以 1 退出，CSV 导出和对账都要求完整结果。完整但对账有差异时也以 1 退出，已请求的实际账单 CSV 仍会生成。
+
+## 翻页与虚拟滚动
+
+若分页器有“首页”按钮，可在 `traversal` 中加入 `"first": {"role": "button", "name": "First"}`。已禁用的 First 是首页证据；启用时，收集器对新观察中的 First 点击一次，等行数据更新、First 禁用后，从首页向后收集。`scope` 此时为 `pagination_from_first_page`。First 和 Next 的定位器要在按钮启用及禁用时均能识别它们。
+
+仅给出 Next 时，收集器从**当前页**开始，`scope` 为 `pagination_from_current_page`。到达禁用的 Next 仅证明到达末页。若没有首页证据，完整对账还需要业务总数 `expected_rows` 与收集数相符，否则返回 `start_unverified` 或 `row_count_mismatch`。Next 消失时也需要匹配的业务总数。分页表的 `aria-rowcount` 可能只统计当前页，因此分页模式只接受调用者提供的业务总数。每次点击都通过新的观察定位控件并走普通动作的权限和身份检查。
+
+虚拟表格需要从容器顶部开始。把 spec 的 `traversal` 换成下面的对象即可。在每次滚动后读取当前渲染的行，相邻窗口允许重叠。达到底部时还会核对唯一行数。总数来自调用者的 `expected_rows` 或表格的 `aria-rowcount`，后者包含一行表头。缺少总数时返回 `total_unverified`；数量不符返回 `row_count_mismatch`。
+
+```json
+{"mode":"virtual_scroll","container":{"role":"region","name":"Billing viewport"}}
+```
+
+输出按稳定键首次出现的顺序排列。同一窗口出现空键或重复键会报 `CONTROL.TABLE_KEY`。同一键再次出现时，各选中列必须与首次读到的值相同。运行期间应保持筛选、排序和数据集稳定，收集结束后浏览器停留在最后访问的位置。
+
+| 范围 | 行为 |
+|---|---|
+| HTML 表格 | 单行可见表头，按标题精确选择 1–32 个不同的列。合并单元格、重复的所选标题或缺失标题会报错。 |
+| 单次读取 | 观察最多 2,000 个节点。无法证明定位唯一时拒绝操作。每个窗口最多读取 200 行（含表头）、50 列，每格最多 500 个 UTF-16 单元，窗口字符预算为 200,000。达到裁切条件时返回不完整结果或表头错误。 |
+| 整次收集 | `max_pages` 默认 64、最多 256，包含初始窗口。`max_rows` 默认及上限为 10,000。记录的 JSON 字节预算为 2 MiB。达到上限时检查 `page_limit`、`row_limit` 或 `output_byte_limit`。 |
+| 动态更新 | 点击或滚动后最多等待约 2 秒获取更新。无进展返回 `no_progress`，不会自动再次点击同一页。CLI 收集请求的 `--timeout-ms` 默认及上限为 30,000。超时、取消或失效操作可能以错误结束。 |
+
+## CSV 文件与差异
+
+也可先保存完整的收集结果，再通过本地命令处理。两个命令的 `--input` 都读取包含 `columns`、`row_key`、`row_count`、`complete` 和 `records` 的收集对象。
+
+```powershell
+aad table collect --url 'http://localhost:8080/bills' --browser-port 9222 --allow-input --spec ./bills.json > ./collection.json
+aad table export --input ./collection.json --output ./actual.csv
+aad table compare --input ./collection.json --csv ./expected.csv --decimal Amount
+```
+
+导出使用 UTF-8、CRLF 记录分隔符和 spec 中的列顺序。逗号、双引号和多行文本使用 CSV 引号转义。CSV 要求所选单元格都有字符串值，空字符串可往返，缺失单元格的 JSON `null` 会报错。输入必须是至多 16 MiB 的普通文件；导出在目标目录写临时文件，完整写入后发布到一个新路径。
+
+对账按行键匹配，CSV 可以调整行、列顺序。文本字段逐值比较。可重复使用 `--decimal` 指定金额等十进制列；普通带符号十进制数最多支持 18 位小数，按精确值比较并汇总，超出整数运算范围会报错。带金额符号、千分位或指数记法的字符串需要先转换为普通十进制格式。结果包含 `missing`、`unexpected` 或逐单元格的 `changed`，按键排列。`difference_count` 是差异总数，最多展开 100 条，`totals` 分别列出实际和预期合计。
+
+## MCP 和工作流
+
+MCP 调用 `control_collect_table` 时，把 spec 的字段和 `resource_id` 放在同一参数对象中，服务端启动时授予 `--allow-input`。只读当前渲染窗口可使用 `control_read_table`。浏览器脚本可调用 `page.collect(spec)`。文件路径仅由本地 CLI 接收。
+
+在已有工作流的 `requires` 中声明 `control.session` 能力和 `desktop.input`、`desktop.observe` 权限。下例将整个收集结果命名为 `ledger`，后续步骤可检查 `steps.collect.output.complete` 再使用记录。
+
+```yaml
+steps:
+  - id: collect
+    type: action
+    uses: control.session.collect_table@1
+    effect: {class: non_idempotent}
+    risk: {category: modify, level: high}
+    with:
+      app: {provider: browser.cdp, url: 'http://localhost:8080/bills'}
+      table: {role: table, name: Bills}
+      columns: [ID, Amount, Note]
+      row_key: ID
+      traversal: {mode: pagination, next: {role: button, name: Next}}
+      expected_rows: 2
+outputs:
+  ledger:
+    value: "${{ steps.collect.output }}"
+```
