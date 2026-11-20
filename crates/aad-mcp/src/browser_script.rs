@@ -70,6 +70,9 @@ enum PageCall {
         locator: Locator,
         columns: Vec<String>,
     },
+    Collect {
+        spec: Box<aad_control::table::Collection>,
+    },
 }
 
 struct Page {
@@ -165,6 +168,15 @@ impl Page {
                 columns,
                 max_characters: None,
             }),
+            PageCall::Collect { spec } => {
+                let data = self.request(Operation::CollectTable {
+                    resource_id: self.resource_id.clone(),
+                    spec,
+                })?;
+                self.writes
+                    .set(self.writes.get() + data["actions"].as_u64().unwrap_or_default() as usize);
+                Ok(data)
+            }
             PageCall::Act { locator, action } => {
                 // These actions take all destinations from this one observation.
                 // Operations on other tabs, the clipboard and file system have

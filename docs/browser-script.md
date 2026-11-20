@@ -31,6 +31,7 @@ MCP 使用同名参数。在一次 `browser_script` 调用中传 `source`（上�
 | `page.present(locator)`、`page.read(locator, property)` | 判断元素是否存在，或读取 `value`（默认）、`name`、`checked`、`enabled`、`selected`。定位有歧义会报错。 |
 | `page.fields([{as, locator, property}, …])` | 在一次观察中读取多个字段，返回按名字取值的对象。 |
 | `page.table(locator, columns)` | 从 Chromium 已渲染的表格里按列取记录，返回完整性提示。 |
+| `page.collect({table, columns, row_key, traversal, expected_rows})` | 跨页或滚动收集同一张表。用 `traversal: {mode:"pagination", next:{name:"下一页"}}` 指定翻页按钮；虚拟列表使用 `mode:"virtual_scroll"` 和 `container` 定位器。结果包含 `records`、`complete` 和 `stop_reason`。 |
 | `page.wait(locator, condition, states)` | 等待 `appears`、`disappears` 或 `state`。最后一种传期望状态，例如 `{enabled:true}`。 |
 | `page.fill(locator, text)`、`page.click(locator)`、`page.key(locator, keys)`、`page.scroll(locator, direction, notches)` | 在脚本绑定的页面上重新观察、定位，然后通过驱动执行。 |
 | `page.act(locator, action)` | 同样的定位方式，可执行 `select`、`check`、`hover`、`navigate`、`back` 等动作。页面导航使用驱动提供的页面元素作为目标。 |

@@ -69,4 +69,14 @@ test('browser JavaScript uses one page for branching, input, readback and cancel
     send({method:'notifications/cancelled',params:{requestId:id}});
     assert.equal((await reply(true)).error.code,'CONTROL.CANCELLED');
     assert.equal(await page.cdp.eval('window.orders.length'),3);
+    await page.cdp.eval(`document.body.innerHTML='<table aria-label="Bills"><thead><tr><th>ID</th></tr></thead><tbody><tr><td>A</td></tr></tbody></table><button>Next</button>';
+        document.querySelector('button').onclick=e=>{document.querySelector('td').textContent='B';e.target.disabled=true}; true`);
+    start('const rows=page.collect(inputs); if(!rows.complete) throw new Error(rows.stop_reason); return rows.records.map(r=>r.ID);', {
+      inputs: {table:{role:'table',name:'Bills'},columns:['ID'],row_key:'ID',expected_rows:2,
+        traversal:{mode:'pagination',next:{name:'Next'}}}
+    });
+    const collected = await reply(false);
+    assert.deepEqual(collected.result,['A','B']);
+    assert.equal(collected.completed_actions,1);
+    assert.equal(await page.cdp.eval('document.querySelector("td").textContent'),'B');
 });

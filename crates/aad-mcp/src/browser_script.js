@@ -21,7 +21,8 @@
         key: (locator, keys) => act(locator, {type: "key", keys}),
         scroll: (locator, direction, notches = 1) => act(locator, {type: "scroll", direction, notches}),
         wait: (locator, condition = "appears", states) => call("wait", {locator, condition, states}),
-        table: (locator, columns) => call("table", {locator, columns})
+        table: (locator, columns) => call("table", {locator, columns}),
+        collect: spec => call("collect", {spec})
     });
     const execute = Function("page", "inputs", '"use strict";\n' + source);
     const value = execute(page, parse(parameters));
