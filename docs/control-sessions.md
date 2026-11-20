@@ -447,7 +447,7 @@ aad mcp --allow-input --allow-upload-dir D:\to-upload  # 浏览器 upload 只能
 
 对同一观察查多个字段时，传 `control_find_many({observation_id, locators, expect: "optional"})`。1–32 个定位器共享快照与超时，结果按输入顺序；缺失可返回 `found:false`，歧义仍拒绝，错误中的 `locator_index` 从 0 数起。它不刷新观察，也不能预取多次写操作的授权；有输入后仍要重新观察。
 
-MCP 工具为 `control_capabilities`, `control_targets`, `control_observe`, `control_find`, `control_find_many`,
+MCP 工具为 `control_capabilities`, `control_targets`, `control_observe`, `control_find`, `control_find_many`, `control_read_fields`,
 `control_wait`, `control_act`, `control_capture`, `control_read_text`, `control_cancel`, `control_close`，
 授权时另有 `desktop_launch`、`clipboard_read`、`control_global_key`；本机未限定授权时另有 `probe_environment`、工作流工具和浏览器工具（含只读的 `browser_downloads`、`browser_storage`、`browser_network`）。
 
@@ -461,6 +461,30 @@ MCP 服务一次只处理一个调用，后面的排队；MCP cancellation notif
 原先按动作拆开的 Windows MCP 工具（`list_apps`、`describe_window`、`find_element`、`invoke` 等）已移除，
 能力并入上述工具；`run_workflow` 与 `control_act` 共用会话的 driver、串行锁和输入租约。
 远程 MCP 或指定 provider/resource 时只暴露统一工具，避免绕过授权。
+
+### 一次读出订单号和金额
+
+只取数据时，先从 `control_targets` 拿到页面或窗口的 `resource_id`，然后调用 `control_read_fields`。比如传 `{"resource_id":"…","fields":[{"as":"amount","locator":{"name":"实付金额"},"property":"value"},{"as":"shipped","locator":{"name":"已发货"},"property":"present"}]}`，回复里的 `data.values` 就是 `{"amount":"118.50","shipped":false}`。同一份新观察一次读 1–32 个字段，只读连接也能用。
+
+要在流程里对账，就把字段放进 `read`，把期望值放进 `expect`。下面是一次 `run_steps` 的完整参数；也可以把同样的步骤交给 `save_workflow`。示例的按钮和输入框名称需要和实际页面一致。
+
+```json
+{
+  "steps": [
+    {"id":"quote","app":{"provider":"browser.cdp","title":"订单"},"read":[
+      {"as":"quoted","locator":{"name":"报价"},"property":"value"}]},
+    {"app":{"provider":"browser.cdp","title":"订单"},"locator":{"role":"button","name":"提交订单"},"action":{"type":"click"}},
+    {"id":"receipt","app":{"provider":"browser.cdp","title":"订单"},"read":[
+      {"as":"billed","locator":{"name":"实付金额"},"property":"value"},
+      {"as":"order_id","locator":{"name":"订单号"},"property":"value"}],
+     "expect":{"billed":"${{ steps.quote.output.values.quoted }}"},"within_ms":3000}
+  ]
+}
+```
+
+成功时看 `outputs`：例如 `{"quoted":"118.50","billed":"118.50","order_id":"ORD-42"}`。字段名在整段流程内唯一，以小写字母开头，可用数字和下划线。比较保留类型：文本 `"118.50"` 和数字 `118.5` 分开处理。省略 `within_ms` 就检查一次；指定后只重新读回执，最多等指定毫秒数，多个期望值必须在同一轮全部匹配。对不上时看 `error.stepId` 和出错字段，后续步骤停止。
+
+可读属性为 `name`（观察中的控件名称）、`value`（控件值）、`checked`、`enabled`、`selected` 和 `present`。只有 `present` 会把找不到当成 `false`。同名命中多个要收窄 locator；控件没提供的属性会报错，受保护输入框的值不能读取。若要查一个元素并继续操作它，用 `control_find` 或 `control_find_many`。
 
 ## 引用、期限与结果
 

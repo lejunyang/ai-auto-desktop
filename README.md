@@ -354,6 +354,8 @@ aad mcp --allow-input --provider browser.firefox_bidi --browser-bidi-port 9223
 
 **批量运行**：同一观察要查多个元素用 `control_find_many`；已知的一次性任务用 `run_steps`（1–32 个声明式步骤，不存盘），每步仍重新观察和校验。见[调用示例](docs/control-sessions.md)和[长流程实测、录制密度与竞品缺口](docs/research/browser-computer-recording-efficiency-2026-11-21.md)。
 
+只想拿数据时，`control_read_fields` 一次读取同一页或窗口的多个字段，只返回你给它们起的名字和值。也可以在流程里先读报价，再提交，最后对照回执金额并返回订单号；整段只调一次 `run_steps`。见[订单核对示例](docs/control-sessions.md#一次读出订单号和金额)。
+
 **保存与运行流程**（重复劳动）：`save_workflow`、`list_workflows`、`describe_workflow`、`run_workflow`。
 `save_workflow` 收的是和 `aad record`、GUI 相同的平台无关步骤（`control-steps/1`）：每步写应用（provider、进程名、
 标题里不变的部分或网址前缀）、`locator`（照抄 outline 里每个元素带的 `locator`）和 `control_act` 用过的动作（去掉 target，
