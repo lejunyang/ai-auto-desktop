@@ -102,3 +102,31 @@ aad recipe ./program.yaml --out (Join-Path $store 'submit-orders-v1.workflow.jso
 ```
 
 让 MCP 服务器使用相同的保存目录，执行页面操作时按现有流程开启 `--allow-input`。agent 先调用 `describe_workflow({"name":"submit-orders-v1"})` 查看输入和计划摘要，再通过 `run_workflow({"name":"submit-orders-v1","inputs":{"orders":[{"number":"ORD-1","selected":true}]}})` 执行。使用 `AAD_RECORDINGS_DIR` 可以为特定服务器设置独立目录。
+
+## 翻页读取表格，再逐行调用子配方
+
+`collect_table` 使用阶段的应用选择器，通过 `control.session.collect_table@1` 执行定位、翻页或虚拟滚动。执行需要 `desktop.observe` 和 `desktop.input` 权限。给步骤命名后，`orders.records` 是 JSON 行对象数组，`orders.complete` 表明完整性；`orders.stop_reason` 记录结束原因。下例把表格步骤和循环放在同一个阶段内。
+
+```yaml
+steps:
+  - id: orders
+    collect_table:
+      table: {role: table, name: Orders}
+      columns: [Order, Amount]
+      row_key: Order
+      expected_rows: 5
+      max_pages: 3
+      traversal: {mode: pagination, next: {role: button, name: Next}}
+  - if: "${{ orders.complete }}"
+    then:
+      - foreach: "${{ orders.records }}"
+        as: row
+        max_items: 5
+        steps:
+          - call: enter_order@1.2.0
+            with: {number: "${{ row.Order }}"}
+```
+
+表格选择器、列名、行键和预算均在编译时校验。`table`、翻页控件和滚动容器接受本文件 `targets` 中的定位器别名。虚拟滚动写成 `traversal: {mode: virtual_scroll, container: viewport}`，其中 `viewport` 是已声明别名。表格配置使用静态值，返回的记录可以传给循环、分支和子配方。
+
+[分页与收款实测](../tests/browser/recipe-table.test.mjs) 从三页读取五条记录，每行调用一次子配方，并通过独立 HTTP 请求核对实际入账内容和顺序。另一个用例把页数限制为一页，检查结果标记为部分数据且收款数为零。
