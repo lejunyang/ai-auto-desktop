@@ -235,6 +235,7 @@ impl<'a> Run<'a> {
             json!({"id": step.id, "type": step.step_type.as_str(), "path": step.path}),
         );
 
+        let started = Instant::now();
         let outcome = self.attempt_with_retry(step);
 
         // `finally` runs on every exit path, and its own failure is recorded
@@ -245,7 +246,7 @@ impl<'a> Run<'a> {
             Ok(flow) => {
                 self.journal.emit(
                     "step.finished",
-                    json!({"id": step.id, "status": "succeeded"}),
+                    json!({"id": step.id, "status": "succeeded", "elapsed_ms": started.elapsed().as_millis() as u64}),
                 );
                 Ok(flow)
             }
@@ -268,6 +269,7 @@ impl<'a> Run<'a> {
                             json!({
                                 "id": step.id,
                                 "status": "failed",
+                                "elapsed_ms": started.elapsed().as_millis() as u64,
                                 "error": error.to_json(),
                             }),
                         );

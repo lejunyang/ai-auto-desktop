@@ -220,7 +220,7 @@ what limits apply, such as a remote session or a non-elevated process.",
         },
         Tool {
             name: "run_steps",
-            description: "Run actions, checks and named field reads in one call. Read steps return their named values in outputs; expect can compare them with a literal or a previous read. Each step observes its own target. A failure stops later steps.",
+            description: "Run actions, checks and named field reads in one call. Read steps return their named values in outputs; expect can compare them with a literal or a previous read. Each step observes its own target. A failure stops later steps; inspect last_completed_step and next_unstarted_step before continuing.",
             schema: json!({"type":"object", "properties":{
                 "steps":steps_schema(MAX_INLINE_STEPS), "inputs":{"type":"object"}
             }, "required":["steps"], "additionalProperties":false}),
@@ -1287,7 +1287,21 @@ fn execute_compiled(
             .with_granted_permissions(WORKFLOW_PERMISSIONS),
     );
 
-    let progress = walk_through(&result);
+    let typed = descriptor.steps.iter().all(|step| {
+        step.get("uses")
+            .and_then(Value::as_str)
+            .is_some_and(|name| name.starts_with("control.session."))
+    });
+    let progress = if typed {
+        result
+            .events
+            .iter()
+            .filter(|event| event.event_type == "step.finished")
+            .map(|event| event.payload.clone())
+            .collect()
+    } else {
+        walk_through(&result)
+    };
 
     let mut payload = json!({
         "kind": "WorkflowRun",
@@ -1295,6 +1309,7 @@ fn execute_compiled(
         "status": result.status.as_str(),
         "outputs": result.outputs,
         "executed_steps": result.executed_steps,
+        "elapsed_ms": (result.duration_seconds * 1000.0).round() as u64,
         // What actually happened, step by step. `executed_steps` alone cannot tell
         // "all six succeeded" from "it reached the sixth and failed there", and
         // that difference decides whether retrying is safe: a workflow that wrote
@@ -1311,6 +1326,19 @@ fn execute_compiled(
             "effect": error.effect,
             "stepId": error.location.step_id,
         });
+        if typed {
+            let last = progress
+                .iter()
+                .rev()
+                .find(|step| step["status"] == "succeeded");
+            let next = descriptor
+                .steps
+                .iter()
+                .position(|step| Some(&step.id) == error.location.step_id.as_ref())
+                .and_then(|index| descriptor.steps.get(index + 1));
+            payload["last_completed_step"] = json!(last.map(|step| &step["id"]));
+            payload["next_unstarted_step"] = json!(next.map(|step| &step.id));
+        }
     }
 
     // Only when something actually failed. A successful run should not pay for a

@@ -92,6 +92,11 @@ test('typed batches re-observe after a write and stop on a missing element',
     const stopped = await tool('run_steps',{steps:[quote,mismatch,submit]},true);
     assert.equal(stopped.error.code,'STEP.CHECK_FAILED');
     assert.equal(stopped.error.stepId,'receipt');
+    assert.equal(stopped.last_completed_step,'quote');
+    assert.equal(stopped.next_unstarted_step,'s3');
+    assert.equal(stopped.steps.length,2);
+    assert.ok(stopped.steps[1].elapsed_ms>=100);
+    assert.ok(stopped.elapsed_ms>=stopped.steps[1].elapsed_ms);
     assert.match(stopped.error.message,/billed/);
     assert.equal(await page.cdp.eval('window.orders'),1);
     const invalid = await tool('run_steps',{steps:[submit,{...quote,expect:{typo:42}}]},true);
