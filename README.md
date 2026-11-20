@@ -358,6 +358,10 @@ aad mcp --allow-input --provider browser.firefox_bidi --browser-bidi-port 9223
 
 长流程可以把录制转成短 YAML：`aad recipe orders.recording.json --out orders.yaml`，用 `aad run` 直接执行。按列读取表格、看失败步骤、检查中断日志，以及 100/500 步的实测结果，见[长流程操作手册和缺口清单](docs/long-workflows.md)。
 
+需要根据页面上的值决定下一步时，可写 `recipe/2` 的循环和条件，或使用 JavaScript。Recipe 可以调用指定版本的子流程并接收它的结果。JavaScript 可以一次填多张表单、翻页、处理数据，再返回一份 JSON。命令行运行 `aad browser-script`，MCP 使用 `browser_script`。示例见[可编程 Recipe](docs/recipe-programs.md)和[浏览器 JavaScript](docs/browser-script.md)。
+
+整张账单可以用 `aad table collect` 翻页或滚动采集，导出 CSV，再按订单号和金额核对。涉及网页、文件管理器、表格软件的操作可用 `aad browser-record mixed start` 一起录制，每个桌面应用指定要录的窗口。见[收集表格与对账](docs/table-collection.md)和[跨应用录制](docs/mixed-recording.md)。
+
 **保存与运行流程**（重复劳动）：`save_workflow`、`list_workflows`、`describe_workflow`、`run_workflow`。
 `save_workflow` 收的是和 `aad record`、GUI 相同的平台无关步骤（`control-steps/1`）：每步写应用（provider、进程名、
 标题里不变的部分或网址前缀）、`locator`（照抄 outline 里每个元素带的 `locator`）和 `control_act` 用过的动作（去掉 target，
