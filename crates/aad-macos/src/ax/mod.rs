@@ -494,7 +494,8 @@ impl MacOSAxProvider {
                     .ok_or_else(|| invalid("watch.app needs a process_id"))?;
                 let started = self.backend.start_recording(process_id as u32, deadline)?;
                 Ok(
-                    json!({"capture_id": started["recording_id"], "pointer_watch": started["pointer_watch"]}),
+                    json!({"capture_id": started["recording_id"], "pointer_watch": started["pointer_watch"],
+                           "clock": started["clock"], "missing_notifications": started["missing_notifications"]}),
                 )
             }
             "collect" | "release" => {
@@ -1670,6 +1671,7 @@ fn parse_locator(value: Option<&Value>) -> Result<Map<String, Value>, Automation
             "states",
             "actions",
             "match",
+            "within",
         ],
     )?;
     if object.keys().all(|key| key == "match") {
@@ -1679,6 +1681,17 @@ fn parse_locator(value: Option<&Value>) -> Result<Map<String, Value>, Automation
         return Err(invalid("only exact locators are supported"));
     }
     let mut result = Map::from_iter([("match".into(), json!("exact"))]);
+    if let Some(within) = object.get("within") {
+        let window = within
+            .as_object()
+            .ok_or_else(|| invalid("within must name an AX window or sheet"))?;
+        only_keys(window, &["role", "name"])?;
+        if !matches!(within["role"].as_str(), Some("AXWindow" | "AXSheet")) {
+            return Err(invalid("within.role must be AXWindow or AXSheet"));
+        }
+        required_string(&within["name"], "within.name")?;
+        result.insert("within".into(), within.clone());
+    }
     for name in ["role", "identifier"] {
         if let Some(value) = object.get(name) {
             result.insert(
@@ -1771,9 +1784,41 @@ fn resolve(
     locator: &Map<String, Value>,
     deadline: Instant,
 ) -> Result<Value, AutomationError> {
+    let nodes = record.public["nodes"].as_array().expect("nodes");
+    let window = if let Some(within) = locator.get("within") {
+        let mut windows = nodes
+            .iter()
+            .filter(|n| n["role"] == within["role"] && n["name"] == within["name"]);
+        let only = windows
+            .next()
+            .ok_or_else(|| driver_error("DRIVER.NOT_FOUND", "recorded window is absent"))?;
+        if windows.next().is_some() {
+            return Err(driver_error(
+                "DRIVER.AMBIGUOUS",
+                "multiple windows match the recorded window",
+            ));
+        }
+        Some(&only["node_id"])
+    } else {
+        None
+    };
+    let mut inside = BTreeSet::new();
     let mut found = Vec::new();
-    for node in record.public["nodes"].as_array().expect("nodes") {
+    for node in nodes {
         remaining(deadline, false)?;
+        if let Some(id) = window {
+            // Capture validates that each parent precedes its children. A
+            // nested sheet is its own scope, even inside the selected window.
+            if &node["node_id"] != id
+                && (matches!(node["role"].as_str(), Some("AXWindow" | "AXSheet"))
+                    || !node["parent_id"]
+                        .as_str()
+                        .is_some_and(|p| inside.contains(p)))
+            {
+                continue;
+            }
+            inside.insert(node["node_id"].as_str().expect("node id"));
+        }
         if node_matches(node, locator) {
             found.push(node.clone());
         }
@@ -1852,7 +1897,7 @@ fn target_schema() -> Value {
     json!({"type": "object", "required": ["snapshot_id", "revision", "node_id"], "properties": {"snapshot_id": {"type": "string", "minLength": 1}, "revision": {"type": "integer", "minimum": 1}, "node_id": {"type": "string", "minLength": 1}}, "additionalProperties": false})
 }
 fn locator_schema() -> Value {
-    json!({"type": "object", "properties": {"role": {"type": "string", "maxLength": 256}, "subrole": {"type": ["string", "null"], "maxLength": 256}, "name": {"type": ["string", "null"], "maxLength": MAX_FIELD_CHARS}, "description": {"type": ["string", "null"], "maxLength": MAX_FIELD_CHARS}, "value": {"type": ["string", "null"], "maxLength": MAX_FIELD_CHARS}, "identifier": {"type": "string", "maxLength": MAX_FIELD_CHARS}, "states": {"type": "object", "minProperties": 1, "properties": STATE_NAMES.iter().map(|name| ((*name).into(), json!({"type": ["boolean", "null"]}))).collect::<Map<_,_>>(), "additionalProperties": false}, "actions": {"type": "array", "minItems": 1, "items": {"enum": WRITE_ACTIONS}, "uniqueItems": true}, "match": {"const": "exact"}}, "additionalProperties": false, "minProperties": 1})
+    json!({"type": "object", "properties": {"role": {"type": "string", "maxLength": 256}, "subrole": {"type": ["string", "null"], "maxLength": 256}, "name": {"type": ["string", "null"], "maxLength": MAX_FIELD_CHARS}, "description": {"type": ["string", "null"], "maxLength": MAX_FIELD_CHARS}, "value": {"type": ["string", "null"], "maxLength": MAX_FIELD_CHARS}, "identifier": {"type": "string", "maxLength": MAX_FIELD_CHARS}, "states": {"type": "object", "minProperties": 1, "properties": STATE_NAMES.iter().map(|name| ((*name).into(), json!({"type": ["boolean", "null"]}))).collect::<Map<_,_>>(), "additionalProperties": false}, "actions": {"type": "array", "minItems": 1, "items": {"enum": WRITE_ACTIONS}, "uniqueItems": true}, "match": {"const": "exact"}, "within": {"type":"object","required":["role","name"],"properties":{"role":{"enum":["AXWindow","AXSheet"]},"name":{"type":"string","minLength":1,"maxLength":MAX_FIELD_CHARS}},"additionalProperties":false}}, "additionalProperties": false, "minProperties": 1})
 }
 fn app_schema() -> Value {
     json!({"type": "object", "minProperties": 1, "properties": {"process_id": {"type": "integer", "minimum": 1}, "bundle_id": {"type": "string", "minLength": 1, "maxLength": MAX_FIELD_CHARS}, "name": {"type": "string", "minLength": 1, "maxLength": MAX_FIELD_CHARS}}, "additionalProperties": false})
@@ -2342,7 +2387,9 @@ mod tests {
             _deadline: Instant,
         ) -> Result<Value, AutomationError> {
             assert_eq!(process_id, 4242);
-            Ok(json!({"recording_id": "r1", "pointer_watch": false}))
+            Ok(json!({"recording_id": "r1", "pointer_watch": false,
+                      "clock":{"at_ms":100, "epoch_ms":1700000000100u64,"precision_ms":2},
+                      "missing_notifications":[]}))
         }
         fn collect_recording(
             &self,
@@ -3137,6 +3184,8 @@ mod tests {
         };
         let started = call("watch", json!({"app": {"process_id": 4242}})).unwrap();
         assert_eq!(started["capture_id"], "r1");
+        assert_eq!(started["clock"]["at_ms"], 100);
+        assert_eq!(started["missing_notifications"], json!([]));
         assert_eq!(
             started["pointer_watch"], false,
             "no Input Monitoring: say so"
@@ -3152,6 +3201,42 @@ mod tests {
         assert!(
             call("watch", json!({"app": {"name": "Notes"}})).is_err(),
             "a process id is required"
+        );
+    }
+
+    #[test]
+    fn exact_window_scopes_survive_revalidation_and_exclude_nested_sheets() {
+        let mut record = Record {
+            public: json!({"nodes":[
+                {"node_id":"w","role":"AXWindow","name":"Editor","actions":[]},
+                {"node_id":"b","parent_id":"w","role":"AXButton","name":"Save","actions":[]},
+                {"node_id":"s","parent_id":"w","role":"AXSheet","name":"Confirm","actions":[]},
+                {"node_id":"c","parent_id":"s","role":"AXButton","name":"Save","actions":[]}
+            ]}),
+            handles: BTreeMap::new(),
+            fingerprints: BTreeMap::new(),
+            app_selector: Map::new(),
+            max_depth: 10,
+            max_nodes: 20,
+        };
+        let locator = parse_locator(Some(&json!({"role":"AXButton","name":"Save",
+                         "within":{"role":"AXWindow","name":"Editor"}})))
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        assert_eq!(
+            resolve(&record, &locator, deadline).unwrap()["node_id"],
+            "b"
+        );
+        record.public["nodes"][1]["parent_id"] = json!("s");
+        assert_eq!(
+            resolve(&record, &locator, deadline).unwrap_err().code,
+            "DRIVER.NOT_FOUND"
+        );
+        record.public["nodes"][2]["role"] = json!("AXWindow");
+        record.public["nodes"][2]["name"] = json!("Editor");
+        assert_eq!(
+            resolve(&record, &locator, deadline).unwrap_err().code,
+            "DRIVER.AMBIGUOUS"
         );
     }
 

@@ -329,7 +329,8 @@ private final class Recorder {
     private let lock = NSLock()
     private var events: [[String: Any]] = []
     private var dropped = 0
-    private var focused: [String: Any]?
+    let clock: [String: UInt64]
+    private(set) var missingNotifications: [String] = []
     private var observer: AXObserver?
     private(set) var tap: CFMachPort?
     private var runLoop: CFRunLoop?
@@ -337,6 +338,11 @@ private final class Recorder {
     init(pid: pid_t, describe: @escaping (AXUIElement) -> [String: Any]) {
         self.pid = pid
         self.describeNode = describe
+        let before = DispatchTime.now().uptimeNanoseconds
+        let epoch = UInt64(Date().timeIntervalSince1970 * 1000)
+        let after = DispatchTime.now().uptimeNanoseconds
+        clock = ["at_ms": (before + (after - before) / 2) / 1_000_000, "epoch_ms": epoch,
+                 "precision_ms": (after - before) / 1_000_000 + 2]
     }
 
     private func describe(_ element: AXUIElement) -> [String: Any] {
@@ -351,7 +357,7 @@ private final class Recorder {
         return node
     }
 
-    private func now() -> UInt64 { UInt64(ProcessInfo.processInfo.systemUptime * 1000) }
+    private func now() -> UInt64 { DispatchTime.now().uptimeNanoseconds / 1_000_000 }
 
     private func push(_ event: [String: Any]) {
         lock.lock()
@@ -385,7 +391,9 @@ private final class Recorder {
         let application = AXUIElementCreateApplication(pid)
         let context = Unmanaged.passUnretained(self).toOpaque()
         for notification in [kAXValueChangedNotification, kAXFocusedUIElementChangedNotification] {
-            AXObserverAddNotification(created, application, notification as CFString, context)
+            if AXObserverAddNotification(created, application, notification as CFString, context) != .success {
+                missingNotifications.append(notification as String)
+            }
         }
         let mask = (1 << CGEventType.leftMouseDown.rawValue)
             | (1 << CGEventType.rightMouseDown.rawValue)
@@ -424,20 +432,20 @@ private final class Recorder {
     }
 
     func notified(element: AXUIElement, notification: String) {
+        // AX notifications have no originating timestamp. Take callback time
+        // before querying the element. Quartz events below carry their own time.
+        let at = now()
         let node = describe(element)
         if notification == kAXFocusedUIElementChangedNotification as String {
-            lock.lock()
-            focused = node
-            lock.unlock()
-            push(["kind": "focus_boundary", "at_ms": now(), "node": node])
+            push(["kind": "focus_boundary", "at_ms": at, "node": node])
             return
         }
         let role = node["role"] as? String ?? ""
         if role == "AXCheckBox" || role == "AXRadioButton" || role == "AXSwitch" {
             let value = (copyValue(element) as? NSNumber)?.intValue
-            push(["kind": "toggle", "checked": value == 1, "at_ms": now(), "node": node])
+            push(["kind": "toggle", "checked": value == 1, "at_ms": at, "node": node])
         } else if ["AXTextField", "AXTextArea", "AXComboBox", "AXSearchField", "AXSecureTextField"].contains(role) {
-            push(["kind": "text", "at_ms": now(), "node": node])
+            push(["kind": "text", "at_ms": at, "node": node])
         }
     }
 
@@ -476,14 +484,16 @@ private final class Recorder {
 
     func tapped(type: CGEventType, event: CGEvent) {
         if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
+            push(["kind": "tap_interrupted", "at_ms": now()])
             if let tap { CGEvent.tapEnable(tap: tap, enable: true) }
             return
         }
+        let at = event.timestamp / 1_000_000
         switch type {
         case .leftMouseDown, .rightMouseDown, .otherMouseDown:
             guard let element = element(at: event.location) else { return }
             let button = type == .leftMouseDown ? "left" : type == .rightMouseDown ? "right" : "middle"
-            push(["kind": "click", "button": button, "at_ms": now(), "node": describe(element)])
+            push(["kind": "click", "button": button, "at_ms": at, "node": describe(element)])
         case .scrollWheel:
             guard let element = element(at: event.location) else { return }
             let vertical = event.getIntegerValueField(.scrollWheelEventDeltaAxis1)
@@ -491,7 +501,7 @@ private final class Recorder {
             let direction = vertical > 0 ? "up" : vertical < 0 ? "down"
                 : horizontal > 0 ? "left" : horizontal < 0 ? "right" : ""
             guard !direction.isEmpty else { return }
-            push(["kind": "wheel", "direction": direction, "at_ms": now(), "node": describe(element)])
+            push(["kind": "wheel", "direction": direction, "at_ms": at, "node": describe(element)])
         case .keyDown:
             guard NSWorkspace.shared.frontmostApplication?.processIdentifier == pid else { return }
             let code = event.getIntegerValueField(.keyboardEventKeycode)
@@ -509,10 +519,14 @@ private final class Recorder {
             if flags.contains(.maskShift) { keys.append("shift") }
             if flags.contains(.maskAlternate) { keys.append("alt") }
             keys.append(key)
-            lock.lock()
-            let node = focused
-            lock.unlock()
-            push(["kind": "key", "keys": keys, "at_ms": now(), "node": node ?? NSNull()])
+            var focus: CFTypeRef?
+            let app = AXUIElementCreateApplication(pid)
+            var node: Any = NSNull()
+            if AXUIElementCopyAttributeValue(app, kAXFocusedUIElementAttribute as CFString, &focus) == .success,
+               let focus, CFGetTypeID(focus) == AXUIElementGetTypeID() {
+                node = describe(unsafeBitCast(focus, to: AXUIElement.self))
+            }
+            push(["kind": "key", "keys": keys, "at_ms": at, "node": node])
         default:
             return
         }
@@ -542,6 +556,30 @@ private final class AXService {
     private let tokens = TokenStore()
     private var recorders: [String: Recorder] = [:]
 
+    /// The nearest window or sheet at callback time. A dismissed dialog can
+    /// no longer be attributed by asking for the frontmost window at drain.
+    private func recordingWindow(_ element: AXUIElement, pid: pid_t) -> [String: Any]? {
+        var current: AXUIElement? = element
+        for _ in 0...maximumDepth {
+            guard let owner = current else { break }
+            let role = stringAttribute(owner, kAXRoleAttribute as CFString)
+            if role == "AXWindow" || role == "AXSheet" {
+                let windows = elementList(AXUIElementCreateApplication(pid), kAXWindowsAttribute as CFString)
+                let candidates = role == "AXWindow" ? windows : windows.flatMap {
+                    elementList($0, kAXChildrenAttribute as CFString)
+                }.filter { stringAttribute($0, kAXRoleAttribute as CFString) == "AXSheet" }
+                guard let title = stringAttribute(owner, kAXTitleAttribute as CFString), !title.isEmpty else {
+                    return nil
+                }
+                let matches = candidates.filter { stringAttribute($0, kAXTitleAttribute as CFString) == title }
+                return ["role": role!, "name": title,
+                        "unique": matches.count == 1 && CFEqual(matches[0], owner)]
+            }
+            current = elementAttribute(owner, kAXParentAttribute as CFString)
+        }
+        return nil
+    }
+
     /// An element as recorded events describe it, matching how a snapshot
     /// names it: the raw AX role, and the title or else the description.
     private func recordedNode(_ element: AXUIElement) -> [String: Any] {
@@ -553,8 +591,18 @@ private final class AXService {
         var node: [String: Any] = [
             "role": bounded(role), "name": name.map(bounded) ?? "", "protected": protected,
         ]
-        if !protected, let value = scalarStringAttribute(element, kAXValueAttribute as CFString) {
-            node["value"] = value
+        var pid = pid_t(0)
+        if AXUIElementGetPid(element, &pid) == .success {
+            node["process_id"] = Int(pid)
+            node["window"] = recordingWindow(element, pid: pid)
+        }
+        if !protected, let raw = copyAttribute(element, kAXValueAttribute as CFString) {
+            if let text = raw as? String {
+                node["value"] = bounded(text)
+                node["value_truncated"] = text.count > maximumFieldCharacters
+            } else if let number = raw as? NSNumber {
+                node["value"] = number.stringValue
+            }
         }
         return node
     }
@@ -622,7 +670,8 @@ private final class AXService {
             try recorder.start()
             let id = UUID().uuidString
             recorders[id] = recorder
-            return ["recording_id": id, "pointer_watch": recorder.tap != nil]
+            return ["recording_id": id, "pointer_watch": recorder.tap != nil, "clock": recorder.clock,
+                    "missing_notifications": recorder.missingNotifications]
         case "record_collect":
             return try recording(Arguments(values: args)).1.drain()
         case "record_stop":
