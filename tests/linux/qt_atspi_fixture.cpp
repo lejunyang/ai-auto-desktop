@@ -36,6 +36,11 @@ int main(int argc, char **argv) {
     entry->setAccessibleName(kEntryName);
     entry->setObjectName("qt-fixture-entry");
     layout->addWidget(entry);
+    if (qEnvironmentVariableIsSet("AAD_TEST_REPORT_EDITS")) {
+        QObject::connect(entry, &QLineEdit::textChanged, entry, [](const QString &value) {
+            QTextStream(stdout) << "EDIT:" << value << "\n" << Qt::flush;
+        });
+    }
 
     auto *typeEntry = new QLineEdit(&window);
     typeEntry->setText("");

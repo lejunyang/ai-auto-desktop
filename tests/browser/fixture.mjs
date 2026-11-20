@@ -38,7 +38,7 @@ export async function fixture(handler) {
   await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
   const url=`http://127.0.0.1:${server.address().port}/`;
   const browser=spawn(process.env.AAD_TEST_CHROME, ['--headless=new','--remote-debugging-address=127.0.0.1',
-    '--remote-debugging-port=0',`--user-data-dir=${root}`,'--no-first-run','--no-default-browser-check',url],
+    '--remote-debugging-port=0',`--user-data-dir=${root}`,'--no-first-run','--no-default-browser-check','--password-store=basic',url],
     {stdio:'ignore',detached:process.platform!=='win32'});
   let cdp;
   const close=async()=>{
