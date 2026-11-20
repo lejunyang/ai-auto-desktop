@@ -8,6 +8,7 @@
 //! it, and input is granted by whoever starts the server, never by the client.
 //! Saved workflows run on the same session's providers, gate and input lease.
 
+pub mod browser_script;
 pub mod browser_tools;
 pub mod control_tools;
 pub mod durable_tools;
@@ -152,6 +153,14 @@ impl Server {
     /// provider or resource grant cannot be enforced on a workflow that finds
     /// its own windows by name.
     fn offers(&self, name: &str) -> bool {
+        if name == browser_script::NAME {
+            return self.local.as_ref().is_some_and(|session| {
+                let providers = &session.policy().providers;
+                providers.is_empty()
+                    || providers.contains(aad_control::browser::PROVIDER)
+                    || providers.contains(aad_control::browser_bidi::PROVIDER)
+            });
+        }
         if control_tools::method(name).is_some() {
             // A remote session holds its own grants and refuses on its side.
             return self
@@ -394,8 +403,8 @@ notifications/cancelled to request cancellation of an in-flight JSON-RPC request
             .local
             .as_ref()
             .expect("local tools need a local session");
-        let batch =
-            (name == "run_steps" && self.allows_input()).then(aad_runtime::CancellationToken::new);
+        let batch = (name == browser_script::NAME || name == "run_steps" && self.allows_input())
+            .then(aad_runtime::CancellationToken::new);
         if !self.start(rpc_id, None, batch.as_ref()) {
             return Ok(content(&cancelled_before_start(), true));
         }
@@ -414,6 +423,16 @@ notifications/cancelled to request cancellation of an in-flight JSON-RPC request
             ));
         }
         if let Some(token) = batch {
+            if name == browser_script::NAME {
+                let run = serde_json::from_value(arguments)
+                    .map_err(|e| json!({"code":"BROWSER.SCRIPT_INVALID","message":e.to_string()}))
+                    .and_then(|script| browser_script::run(session.clone(), script, token));
+                self.calls.lock().unwrap().batch = None;
+                return Ok(match run {
+                    Ok(report) => content(&report, false),
+                    Err(error) => content(&error, true),
+                });
+            }
             let result = tools::run_inline(session, &arguments, &token);
             self.calls.lock().unwrap().batch = None;
             return Ok(match result {

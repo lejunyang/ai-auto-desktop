@@ -10,6 +10,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 mod assist;
 mod browser_launch;
 mod browser_record;
+mod browser_script;
 mod cdp_watch;
 mod control;
 mod desk;
@@ -89,6 +90,8 @@ enum Command {
     /// Record browser task evidence: actions, network, semantic changes and screenshots.
     #[command(subcommand)]
     BrowserRecord(browser_record::Command),
+    /// Run a JavaScript file against a browser page with the AAD page API.
+    BrowserScript(browser_script::Args),
     /// Share a browser page or the desktop with a person, who can use it remotely.
     ///
     /// Prints a loopback URL with a token, then streams the screen over a
@@ -461,6 +464,10 @@ fn dispatch(command: &Command) -> (Value, u8) {
             ),
         },
         Command::Record(args) => desk::record(args),
+        Command::BrowserScript(args) => match browser_script::run(args) {
+            Ok(value) => (value, EXIT_OK),
+            Err(value) => (value, EXIT_FAILED),
+        },
         Command::Review(args) => match run_review::review(&args.file) {
             Ok(result) => (result, EXIT_OK),
             Err(message) => (failure("CLI.JOURNAL_INVALID", &message, None), EXIT_USAGE),

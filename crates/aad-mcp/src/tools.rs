@@ -357,6 +357,7 @@ memory, unless fallback_in_memory is true.",
     tools.extend(crate::durable_tools::catalogue());
     tools.extend(crate::control_tools::catalogue());
     tools.extend(crate::browser_tools::catalogue());
+    tools.push(crate::browser_script::tool());
     tools
 }
 

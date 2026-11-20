@@ -22,6 +22,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }
 url = "2"
+rquickjs = "0.12"
 
 # Inherit the workspace's deliberate lint allowances (see the root Cargo.toml).
 [lints]

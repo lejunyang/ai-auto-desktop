@@ -945,7 +945,16 @@ impl Session {
     }
 
     pub fn execute(&self, request: &Request) -> Response {
-        let result = self.run(request);
+        self.execute_cancellable(request, aad_runtime::CancellationToken::new())
+    }
+
+    /// Use a caller's cancellation token throughout discovery, observation and dispatch.
+    pub fn execute_cancellable(
+        &self,
+        request: &Request,
+        cancellation: aad_runtime::CancellationToken,
+    ) -> Response {
+        let result = self.run(request, cancellation);
         let (data, failure, effect) = match result {
             Ok(value) => (
                 Some(value),
@@ -973,7 +982,11 @@ impl Session {
         }
     }
 
-    fn run(&self, request: &Request) -> Result<Value> {
+    fn run(
+        &self,
+        request: &Request,
+        cancellation: aad_runtime::CancellationToken,
+    ) -> Result<Value> {
         if request.request_id.is_empty()
             || request.request_id.len() > 128
             || request.timeout_ms == 0
@@ -1053,7 +1066,7 @@ impl Session {
             .remove(&request.request_id);
         let context = Arc::new(Context {
             effect_gate: Mutex::new(()),
-            cancellation: aad_runtime::CancellationToken::new(),
+            cancellation,
             browser_publication: AtomicU8::new(0),
             browser_cancelled: Arc::new(AtomicBool::new(false)),
             phase: AtomicU8::new(if cancelled { 2 } else { 0 }),
