@@ -12,7 +12,7 @@
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
 
@@ -282,6 +282,8 @@ impl EventBuffer {
 /// One interaction, described so it can be replayed later.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RecordedStep {
+    /// Monotonic callback time of the event retained for this step.
+    pub observed_at: Instant,
     /// The driver action to replay: `invoke`, `set_value`, `focus`.
     pub action: &'static str,
     /// How to find the element again. `None` when it could not be described,
@@ -316,7 +318,52 @@ impl RecordedStep {
 /// complete while silently missing an interaction, and someone would replay it
 /// expecting the steps they performed.
 pub fn to_steps(events: Vec<CapturedEvent>, nodes: &[Node]) -> Vec<RecordedStep> {
-    coalesce(recordable(events))
+    describe_events(coalesce(recordable(events)), nodes)
+}
+
+/// A browser action may have occurred between any two native edits.
+/// Preserve individual edits for consumers that merge multiple sources.
+pub(crate) fn mixed_steps(events: Vec<CapturedEvent>, nodes: &[Node]) -> Vec<RecordedStep> {
+    let mut steps = Vec::new();
+    for run in events
+        .chunk_by(|a, b| a.kind == EventKind::StateChanged && b.kind == EventKind::StateChanged)
+    {
+        steps.extend(to_steps(run.to_vec(), nodes));
+    }
+    steps
+}
+
+/// One wall/monotonic pair for the lifetime of a subscription. Draining a
+/// queue later must never move a callback forward on the browser timeline.
+pub(crate) struct CaptureClock {
+    mono: Instant,
+    wall: SystemTime,
+}
+
+impl CaptureClock {
+    pub(crate) fn sample() -> Self {
+        let before = Instant::now();
+        let wall = SystemTime::now();
+        let mono = before + before.elapsed() / 2;
+        Self { mono, wall }
+    }
+
+    pub(crate) fn epoch_ms(&self, at: Instant) -> Option<u64> {
+        let wall = if at >= self.mono {
+            self.wall.checked_add(at - self.mono)?
+        } else {
+            self.wall.checked_sub(self.mono - at)?
+        };
+        wall.duration_since(UNIX_EPOCH)
+            .ok()?
+            .as_millis()
+            .try_into()
+            .ok()
+    }
+}
+
+fn describe_events(events: Vec<CapturedEvent>, nodes: &[Node]) -> Vec<RecordedStep> {
+    events
         .into_iter()
         .filter_map(|event| {
             // `recordable` already dropped the events that describe context
@@ -347,6 +394,7 @@ pub fn to_steps(events: Vec<CapturedEvent>, nodes: &[Node]) -> Vec<RecordedStep>
             }
             Some(match &event.node {
                 None => RecordedStep {
+                    observed_at: event.observed_at,
                     action,
                     locator: None,
                     summary: format!("an unidentified element ({})", event.kind.as_str()),
@@ -355,14 +403,19 @@ pub fn to_steps(events: Vec<CapturedEvent>, nodes: &[Node]) -> Vec<RecordedStep>
                     // The interaction happened; we simply could not say to what.
                     unresolved: Some("the element could not be identified"),
                 },
-                Some(node) => describe_step(action, node, nodes),
+                Some(node) => describe_step(action, node, nodes, event.observed_at),
             })
         })
         .collect()
 }
 
 /// Build one step for an interaction with a known element.
-fn describe_step(action: &'static str, node: &Node, nodes: &[Node]) -> RecordedStep {
+fn describe_step(
+    action: &'static str,
+    node: &Node,
+    nodes: &[Node],
+    observed_at: Instant,
+) -> RecordedStep {
     let protected = node.states.protected == Some(true);
     // The text a write replays. A protected field's contents are deliberately
     // absent -- the platform withholds them -- so the step records that a value
@@ -396,6 +449,7 @@ fn describe_step(action: &'static str, node: &Node, nodes: &[Node]) -> RecordedS
     };
 
     RecordedStep {
+        observed_at,
         action,
         locator,
         summary: node.summary(),
@@ -901,6 +955,29 @@ mod tests {
             source: "test",
             observed_at: origin + after,
         }
+    }
+
+    #[test]
+    fn mixed_edits_keep_their_callback_times_across_a_delayed_drain() {
+        let first = event(0, EventKind::ValueChanged, "editor");
+        let last = event(1, EventKind::ValueChanged, "editor");
+        let baseline = [first.node.clone().unwrap()];
+        let clock = CaptureClock {
+            mono: first.observed_at + Duration::from_millis(10),
+            wall: UNIX_EPOCH + Duration::from_millis(10_010),
+        };
+        let events = vec![first, last];
+        let regular = to_steps(events.clone(), &baseline);
+        assert_eq!(regular.len(), 1);
+        assert_eq!(clock.epoch_ms(regular[0].observed_at), Some(10_500));
+        let mixed = mixed_steps(events, &baseline);
+        assert_eq!(
+            mixed
+                .iter()
+                .map(|s| clock.epoch_ms(s.observed_at))
+                .collect::<Vec<_>>(),
+            [Some(10_000), Some(10_500)]
+        );
     }
 
     #[test]

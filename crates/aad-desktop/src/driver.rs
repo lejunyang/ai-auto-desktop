@@ -903,6 +903,7 @@ impl UiaDriver {
 
 /// A recording session and the snapshot its locators are judged against.
 struct CaptureHandle {
+    clock: capture::CaptureClock,
     session: Box<dyn CaptureSource>,
     /// The window as it was when recording started.
     ///
@@ -932,14 +933,22 @@ impl UiaDriver {
         // id or a descriptive selector, exactly like every other action.
         let snapshot = self.capture(args)?;
         let window_id = snapshot.window.window_id.clone();
+        let clock = capture::CaptureClock::sample();
         let session = self.open_capture(&window_id, args)?;
         let sources = session.sources();
 
         let capture_id = uuid::Uuid::new_v4().simple().to_string();
         let baseline_nodes = snapshot.nodes.len();
+        let root = snapshot
+            .root_id
+            .as_deref()
+            .and_then(|id| snapshot.find(id))
+            .map(|n| json!({"role": n.role, "name": n.name}));
+        let started_epoch_ms = clock.epoch_ms(Instant::now());
         self.captures.lock().unwrap().insert(
             capture_id.clone(),
             CaptureHandle {
+                clock,
                 session,
                 baseline: snapshot.nodes,
                 window_id: window_id.clone(),
@@ -949,6 +958,10 @@ impl UiaDriver {
         Ok(json!({
             "capture_id": capture_id,
             "window_id": window_id,
+            "window": snapshot.window.to_json(),
+            "root_locator": root,
+            "truncated": snapshot.truncated,
+            "started_epoch_ms": started_epoch_ms,
             // Which mechanisms are listening. Partial coverage is worth having
             // but the caller has to know: a missing source means a whole class
             // of interaction will go unrecorded rather than merely be delayed.
@@ -981,12 +994,20 @@ impl UiaDriver {
 
         let (events, dropped) = handle.session.drain(max);
         let raw_events = events.len();
-        let steps = capture::to_steps(events, &handle.baseline);
+        let first_epoch_ms = events
+            .first()
+            .and_then(|event| handle.clock.epoch_ms(event.observed_at));
+        let steps = if args["individual_edits"] == true {
+            capture::mixed_steps(events, &handle.baseline)
+        } else {
+            capture::to_steps(events, &handle.baseline)
+        };
 
         Ok(json!({
             "capture_id": capture_id,
             "window_id": handle.window_id,
-            "steps": steps.iter().map(step_to_json).collect::<Vec<_>>(),
+            "steps": steps.iter().map(|step| step_to_json(step, &handle.clock)).collect::<Vec<_>>(),
+            "first_epoch_ms": first_epoch_ms,
             "count": steps.len(),
             // Reported rather than swallowed: a silently discarded event is
             // indistinguishable from the user having done nothing.
@@ -1015,8 +1036,9 @@ impl UiaDriver {
 }
 
 /// One recorded step, as JSON.
-fn step_to_json(step: &capture::RecordedStep) -> Value {
+fn step_to_json(step: &capture::RecordedStep, clock: &capture::CaptureClock) -> Value {
     json!({
+        "epoch_ms": clock.epoch_ms(step.observed_at),
         "action": step.action,
         "locator": step.locator.as_ref().map(Locator::to_json),
         "summary": step.summary,
@@ -1382,7 +1404,7 @@ fn action_contracts() -> Map<String, Value> {
     );
     actions.insert(
         "collect".into(),
-        read_only("Take the steps recorded so far by a watch session."),
+        read_only("Take timestamped steps from a watch. Set individual_edits to retain edits across other recording sources."),
     );
     actions.insert(
         "release".into(),
