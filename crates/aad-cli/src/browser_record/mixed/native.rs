@@ -1,6 +1,6 @@
 use super::{
     timeline::{Source, Timeline},
-    Result, Start,
+    Result,
 };
 use aad_control::Session;
 use aad_runtime::Provider;
@@ -87,13 +87,17 @@ pub struct Watch {
 }
 
 impl Watch {
-    pub fn start(session: &Session, resource: &Value, args: &Start) -> Result<Self> {
+    pub fn start(
+        session: &Session,
+        resource: &Value,
+        title: &str,
+        dialogs: &[String],
+    ) -> Result<Self> {
         let meta = &resource["metadata"];
-        if args.window.trim().is_empty()
-            || args
-                .dialog
+        if title.trim().is_empty()
+            || dialogs
                 .iter()
-                .any(|name| name.trim().is_empty() || name == &args.window)
+                .any(|name| name.trim().is_empty() || name == title)
         {
             return Err("give a nonempty window name and distinct dialog names".into());
         }
@@ -129,10 +133,10 @@ impl Watch {
                 .into(),
             main: Window {
                 role: String::new(),
-                name: args.window.clone(),
+                name: title.into(),
             },
             main_path: String::new(),
-            dialogs: args.dialog.clone(),
+            dialogs: dialogs.to_vec(),
         };
         let snapshot = watch.snapshot()?;
         if snapshot["session"]["session_type"] != "x11" {
@@ -142,7 +146,7 @@ impl Watch {
         let mut matching = tree
             .windows
             .iter()
-            .filter(|(window, _)| window.name == args.window);
+            .filter(|(window, _)| window.name == title);
         match (matching.next(), matching.next()) {
             (Some((window, paths)), None) if snapshot["truncated"] == false && paths.len() == 1 => {
                 watch.main = window.clone();
@@ -151,7 +155,7 @@ impl Watch {
             _ => {
                 return Err(format!(
                     "window {:?} must match exactly once in a complete observation",
-                    args.window
+                    title
                 )
                 .into())
             }
@@ -185,7 +189,7 @@ impl Watch {
         &self.provider.manifest().raw["actions"][action]
     }
 
-    pub fn collect(&self, timeline: &mut Timeline, offset: u64) -> Result<()> {
+    pub fn collect(&self, timeline: &mut Timeline, offset: u64, index: usize) -> Result<()> {
         let raw = self.call("collect", json!({"capture_id":self.capture}))?;
         let events = raw["events"]
             .as_array()
@@ -270,7 +274,7 @@ impl Watch {
                 timeline.gap(at, json!({"source":"native","reason":"unsupported_native_action","kind":event["kind"]}))?;
                 continue;
             }
-            timeline.push(at, Source::Native(window.clone()), event.clone())?;
+            timeline.push(at, Source::Native(index, window.clone()), event.clone())?;
         }
         Ok(())
     }

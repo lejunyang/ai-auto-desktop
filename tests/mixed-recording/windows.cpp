@@ -22,6 +22,15 @@ static QLineEdit *field(QWidget &window, const QString &name, int x) {
 
 int main(int argc, char **argv) {
     QApplication app(argc, argv);
+    if (app.arguments().contains("ledger")) {
+        app.setApplicationName("Mixed ledger fixture");
+        QAccessible::setActive(true);
+        QWidget ledger;
+        field(ledger, "Ledger", 870);
+        ledger.show();
+        QTextStream(stdout) << "READY" << Qt::endl;
+        return app.exec();
+    }
     app.setApplicationName("Mixed recording fixture");
     QAccessible::setActive(true);
     QWidget main, sibling;

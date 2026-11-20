@@ -33,6 +33,7 @@ try {
     $flags = (pkg-config --cflags --libs Qt5Widgets) -split '\s+' | Where-Object { $_ }
     & g++ -std=c++17 -fPIC -no-pie tests/mixed-recording/windows.cpp -o $env:AAD_MIXED_FIXTURE @flags
     if ($LASTEXITCODE) { exit $LASTEXITCODE }
+    $env:AAD_MIXED_COMPANION = $env:AAD_MIXED_FIXTURE
     & node --test tests/mixed-recording/live.test.mjs
     if ($LASTEXITCODE) { exit $LASTEXITCODE }
     $env:AAD_MIXED_FIXTURE = "$dir/mixed-gtk"

@@ -11,7 +11,7 @@ use std::path::Path;
 
 #[derive(Clone, PartialEq, Eq)]
 pub enum Source {
-    Native(Window),
+    Native(usize, Window),
     Browser(String, String), // frame, document
     Boundary,
 }
@@ -143,7 +143,7 @@ impl Timeline {
         start: u64,
         stop: u64,
         precision: u64,
-    ) -> Result<(Vec<Step>, Vec<Option<Window>>)> {
+    ) -> Result<(Vec<Step>, Vec<Option<(usize, Window)>>)> {
         self.events.retain(|e| (start..=stop).contains(&e.at));
         // Stable for each source, native before browser at an identical tick.
         self.events
@@ -152,10 +152,10 @@ impl Timeline {
         let mut windows = Vec::new();
         let mut next = 1;
         for pair in self.events.windows(2) {
-            if matches!(
-                (&pair[0].source, &pair[1].source),
-                (Source::Browser(..), Source::Native(_)) | (Source::Native(_), Source::Browser(..))
-            ) && pair[1].at - pair[0].at <= precision
+            if pair[0].source != pair[1].source
+                && !matches!(pair[0].source, Source::Boundary)
+                && !matches!(pair[1].source, Source::Boundary)
+                && pair[1].at - pair[0].at <= precision
             {
                 self.gaps.push(json!({"source":"mixed","reason":"order_within_clock_precision","at_ms":pair[1].at}));
             }
@@ -163,13 +163,16 @@ impl Timeline {
         for run in self.events.chunk_by(|a, b| a.source == b.source) {
             let (batch, window) = match &run[0].source {
                 Source::Boundary => continue,
-                Source::Native(window) => {
+                Source::Native(index, window) => {
                     let events: Vec<_> = run.iter().map(|e| e.value.clone()).collect();
                     let app = App {
                         provider: Some(super::native::PROVIDER.into()),
                         ..Default::default()
                     };
-                    (from_events(&app, &events, &mut next), Some(window.clone()))
+                    (
+                        from_events(&app, &events, &mut next),
+                        Some((*index, window.clone())),
+                    )
                 }
                 Source::Browser(..) => {
                     let mut rows = String::new();

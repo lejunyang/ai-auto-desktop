@@ -38,8 +38,8 @@ test('one live capture replays browser, main window and a late dialog', {timeout
     try {return JSON.parse((await exec(cli,['--compact',...args],{env,maxBuffer:4194304})).stdout);}
     catch (err) {throw Error([err.message,err.stdout,err.stderr].join('\n'));}
   };
-  async function native() {
-    const child=spawn(process.env.AAD_MIXED_FIXTURE,[],{stdio:['ignore','pipe','inherit'],env});
+  async function native(companion=false) {
+    const child=spawn(companion ? process.env.AAD_MIXED_COMPANION : process.env.AAD_MIXED_FIXTURE,companion ? ['ledger'] : [],{stdio:['ignore','pipe','inherit'],env});
     const lines=createInterface({input:child.stdout});
     t.after(()=>child.kill());
     lines.on('line',s=>{if(s!=='READY')effects.push(s);});
@@ -48,9 +48,11 @@ test('one live capture replays browser, main window and a late dialog', {timeout
     return {child,resource};
   }
   let {child,resource}=await native();
+  let ledger=await native(true);
   async function start(resource,dir) {
     const args=['browser-record','mixed','start','--native',resource.resource_id,'--window','Invoice',
       '--dialog','Approval','--page',page.target.id,'--cdp-port',String(page.port),'--out',dir];
+    args.push('--also-native',ledger.resource.resource_id,'Ledger');
     const recording=spawn(cli,args,{env,stdio:['ignore','pipe','pipe']});
     t.after(()=>recording.kill());
     let log='';
@@ -85,6 +87,7 @@ test('one live capture replays browser, main window and a late dialog', {timeout
   await web('W','W');
   await type('Unrelated','Z');
   await type('Invoice','N');
+  await type('Ledger','L');
   await web('X','WX');
   await type('Approval','D');
 
@@ -107,23 +110,27 @@ test('one live capture replays browser, main window and a late dialog', {timeout
   const point=await page.cdp.eval('(()=>{const r=document.querySelector("button").getBoundingClientRect();return {x:r.x+r.width/2,y:r.y+r.height/2}})()');
   for(const type of ['mousePressed','mouseReleased']) await page.cdp.call('Input.dispatchMouseEvent',{type,button:'left',clickCount:1,...point});
   await until(()=>effects.filter(e=>e==='finish').length===2,'trusted click effect');
-  assert.deepEqual(effects,['web=W','Unrelated=Z','Invoice=N','web=WX','Approval=D','web=OTHER','finish','finish']);
+  assert.deepEqual(effects,['web=W','Unrelated=Z','Invoice=N','Ledger=L','web=WX','Approval=D','web=OTHER','finish','finish']);
   const report=await stop();
   t.diagnostic(JSON.stringify(report));
   assert.equal(report.status,'complete');
   assert.ok(report.filtered.other_native_window>=1);
   assert.ok(report.filtered.untrusted_dom>=1);
-  assert.equal(report.actions,5);
+  assert.equal(report.actions,6);
+  assert.equal(report.native_sources.length,2);
 
   const closed=once(child,'exit');
   child.kill(); await closed;
+  const closedLedger=once(ledger.child,'exit');
+  ledger.child.kill(); await closedLedger;
   const fresh=await native();
+  ledger=await native(true);
   await page.cdp.call('Page.reload');
   await until(()=>page.cdp.eval('document.readyState==="complete" && document.querySelector("input")?.value===""'),'clean page');
   effects.length=0;
   const result=await run('run',report.workflow,'--permission','desktop.observe','--permission','desktop.input');
   await until(()=>effects.includes('finish'),'replayed browser click');
-  assert.deepEqual(effects,['web=W','Invoice=N','web=WX','Approval=D','finish']);
+  assert.deepEqual(effects,['web=W','Invoice=N','Ledger=L','web=WX','Approval=D','finish']);
   assert.equal(await page.cdp.eval('document.querySelector("input").value'),'WX');
   t.diagnostic(JSON.stringify({executed:result.executed_steps,replay:effects}));
 

@@ -2,6 +2,7 @@ use aad_browser::recording::{self, Result};
 use aad_control::{Operation, Policy, Request, Session};
 use clap::{Args, Subcommand};
 use serde_json::{json, Value};
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{
@@ -33,6 +34,9 @@ pub struct Start {
     /// Exact accessible name of the native top-level window.
     #[arg(long)]
     window: String,
+    /// Include another native application's main window. Repeat for more applications.
+    #[arg(long, num_args = 2, value_names = ["RESOURCE", "WINDOW"], action = clap::ArgAction::Append)]
+    also_native: Vec<String>,
     /// Also capture this named dialog of the same application when it appears. Repeatable.
     #[arg(long, value_name = "TITLE")]
     dialog: Vec<String>,
@@ -98,15 +102,9 @@ fn record(args: &Start) -> Result<Value> {
     let data = listed
         .data
         .ok_or_else(|| format!("cannot list native applications: {:?}", listed.error))?;
-    let resource = data["resources"]
+    let resources = data["resources"]
         .as_array()
-        .into_iter()
-        .flatten()
-        .find(|r| r["resource_id"] == args.native)
-        .ok_or("give the exact Linux AT-SPI resource_id from aad apps")?;
-    let pid = resource["metadata"]["process_id"]
-        .as_u64()
-        .ok_or("missing native process identity")?;
+        .ok_or("missing native resources")?;
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut browser = aad_browser::cdp::Client::browser_until(args.cdp_port, deadline)?;
     browser.set_deadline(deadline);
@@ -115,13 +113,37 @@ fn record(args: &Start) -> Result<Value> {
         .as_array()
         .filter(|p| !p.is_empty())
         .ok_or("missing browser process identities")?;
-    if processes.iter().any(|p| p["id"].as_u64() == Some(pid)) {
-        return Err(
-            "the selected browser owns the native target; select a separate native application"
-                .into(),
-        );
+    let selections = std::iter::once((&args.native, &args.window, args.dialog.as_slice())).chain(
+        args.also_native
+            .chunks_exact(2)
+            .map(|pair| (&pair[0], &pair[1], &[][..])),
+    );
+    let mut watches = Vec::new();
+    let mut selected = Vec::new();
+    let mut pids = HashSet::new();
+    for (id, window, dialogs) in selections {
+        let resource = resources
+            .iter()
+            .find(|r| r["resource_id"].as_str() == Some(id))
+            .ok_or_else(|| {
+                format!("unknown native resource {id}; use the exact ID from aad apps")
+            })?;
+        let pid = resource["metadata"]["process_id"]
+            .as_u64()
+            .filter(|pid| *pid != 0)
+            .ok_or("missing native process identity")?;
+        if processes.iter().any(|p| p["id"].as_u64() == Some(pid)) {
+            return Err(
+                "the selected browser owns the native target; select a separate native application"
+                    .into(),
+            );
+        }
+        if !pids.insert(pid) {
+            return Err(format!("native process {pid} was selected twice").into());
+        }
+        watches.push(native::Watch::start(&session, resource, window, dialogs)?);
+        selected.push(json!({"resource_id":id,"window":window,"dialogs":dialogs}));
     }
-    let mut watch = native::Watch::start(&session, resource, args)?;
     let browser_dir = args.out.join("browser");
     let mut recorder = recording::Recorder::start(recording::Options {
         port: args.cdp_port,
@@ -160,11 +182,15 @@ fn record(args: &Start) -> Result<Value> {
         if final_poll {
             stopped = wall_ms();
         }
-        watch.collect(&mut timeline, offset)?;
+        for (index, watch) in watches.iter_mut().enumerate() {
+            watch.collect(&mut timeline, offset, index)?;
+        }
         Ok(())
     })?;
-    watch.collect(&mut timeline, offset)?;
-    watch.release()?;
+    for (index, watch) in watches.iter_mut().enumerate() {
+        watch.collect(&mut timeline, offset, index)?;
+        watch.release()?;
+    }
     if wall_ms().abs_diff(started + elapsed.elapsed().as_millis() as u64) > precision.max(50) {
         return Err("wall clock changed during capture; cannot order both sources".into());
     }
@@ -175,10 +201,10 @@ fn record(args: &Start) -> Result<Value> {
         "status":if !timeline.gaps.is_empty() {"needs_review"} else if steps.is_empty() {"empty"} else {"complete"},
         "workflow":(!steps.is_empty()).then_some(&file),"actions":steps.len(),"gaps":timeline.gaps,"filtered":timeline.filtered,
         "started_ms":started,"stopped_ms":stopped,"clock_alignment_ms":precision,
-        "page":args.page,"native":args.native,"window":args.window,"dialogs":args.dialog,
+        "page":args.page,"native":args.native,"window":args.window,"dialogs":args.dialog,"native_sources":selected,
     });
     if !steps.is_empty() {
-        let mut workflow = workflow::compile(&watch, &steps, &windows)?;
+        let mut workflow = workflow::compile(&watches, &steps, &windows)?;
         // Keep the capture caveats with the replay file when it is copied elsewhere.
         workflow["metadata"]["annotations"]["capture"] = json!({
             "status":summary["status"], "gaps":timeline.gaps, "filtered":timeline.filtered,
