@@ -12,6 +12,8 @@ use std::sync::{
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 mod native;
+mod portable;
+mod sources;
 mod timeline;
 mod workflow;
 
@@ -28,7 +30,7 @@ pub enum Command {
 
 #[derive(Args)]
 pub struct Start {
-    /// Exact native application resource_id from aad apps (Linux AT-SPI/X11).
+    /// Exact native resource_id from aad apps (AT-SPI, UIA, or AX).
     #[arg(long)]
     native: String,
     /// Exact accessible name of the native top-level window.
@@ -93,10 +95,21 @@ fn record(args: &Start) -> Result<Value> {
     let signal = cancel.clone();
     ctrlc::set_handler(move || signal.store(true, Ordering::SeqCst))?;
     let session = Session::native(Policy::default());
+    let provider = session
+        .providers()
+        .iter()
+        .map(|p| p.manifest().name.as_str())
+        .find(|name| {
+            matches!(
+                *name,
+                native::PROVIDER | "desktop.windows_uia" | "desktop.macos_ax"
+            )
+        })
+        .ok_or("native desktop recording provider unavailable")?;
     let listed = session.execute(&Request::new(
         Some(session.id().to_string()),
         Operation::Targets {
-            provider: Some(native::PROVIDER.into()),
+            provider: Some(provider.into()),
         },
     ));
     let data = listed
@@ -141,7 +154,7 @@ fn record(args: &Start) -> Result<Value> {
         if !pids.insert(pid) {
             return Err(format!("native process {pid} was selected twice").into());
         }
-        watches.push(native::Watch::start(&session, resource, window, dialogs)?);
+        watches.push(sources::Watch::start(&session, resource, window, dialogs)?);
         selected.push(json!({"resource_id":id,"window":window,"dialogs":dialogs}));
     }
     let browser_dir = args.out.join("browser");
@@ -158,16 +171,19 @@ fn record(args: &Start) -> Result<Value> {
     })?;
     // On Linux Chromium TimeTicks and Watch both use CLOCK_MONOTONIC. Bracket
     // the sample to report the precision of alignment with DOM Date.now().
-    let before = wall_ms();
-    let ticks = recorder.monotonic_ms()?;
-    let after = wall_ms();
-    let precision = after
-        .checked_sub(before)
-        .ok_or("wall clock stepped during alignment")?
-        + 1;
-    let offset = (before + precision / 2)
-        .checked_sub(ticks)
-        .ok_or("incompatible native and browser clocks")?;
+    let (offset, browser_precision) = if provider == native::PROVIDER {
+        let before = wall_ms();
+        let ticks = recorder.monotonic_ms()?;
+        let interval = wall_ms()
+            .checked_sub(before)
+            .ok_or("wall clock stepped during alignment")?;
+        let offset = (before + interval / 2)
+            .checked_sub(ticks)
+            .ok_or("incompatible native and browser clocks")?;
+        (offset, interval + 1)
+    } else {
+        (0, 1)
+    };
     let started = wall_ms();
     let elapsed = Instant::now();
     let mut stopped = started;
@@ -191,6 +207,12 @@ fn record(args: &Start) -> Result<Value> {
         watch.collect(&mut timeline, offset, index)?;
         watch.release()?;
     }
+    // A dialog attached mid-capture can have a wider callback clock bracket.
+    // Two independently aligned native clocks can err in opposite directions.
+    let mut precision = vec![browser_precision];
+    precision.extend(watches.iter().map(sources::Watch::precision_ms));
+    precision.sort_unstable_by(|a, b| b.cmp(a));
+    let precision = precision[0].saturating_add(precision[1]);
     if wall_ms().abs_diff(started + elapsed.elapsed().as_millis() as u64) > precision.max(50) {
         return Err("wall clock changed during capture; cannot order both sources".into());
     }

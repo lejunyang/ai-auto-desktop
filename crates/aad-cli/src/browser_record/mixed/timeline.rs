@@ -12,8 +12,16 @@ use std::path::Path;
 #[derive(Clone, PartialEq, Eq)]
 pub enum Source {
     Native(usize, Window),
+    Portable(usize),
     Browser(String, String), // frame, document
     Boundary,
+}
+
+#[derive(Clone, serde::Serialize)]
+pub enum ReplaySource {
+    Browser,
+    Linux(usize, Window),
+    Portable(usize),
 }
 
 struct Event {
@@ -143,7 +151,7 @@ impl Timeline {
         start: u64,
         stop: u64,
         precision: u64,
-    ) -> Result<(Vec<Step>, Vec<Option<(usize, Window)>>)> {
+    ) -> Result<(Vec<Step>, Vec<ReplaySource>)> {
         self.events.retain(|e| (start..=stop).contains(&e.at));
         // Stable for each source, native before browser at an identical tick.
         self.events
@@ -151,18 +159,30 @@ impl Timeline {
         let mut steps = Vec::new();
         let mut windows = Vec::new();
         let mut next = 1;
-        for pair in self.events.windows(2) {
-            if pair[0].source != pair[1].source
-                && !matches!(pair[0].source, Source::Boundary)
-                && !matches!(pair[1].source, Source::Boundary)
-                && pair[1].at - pair[0].at <= precision
-            {
-                self.gaps.push(json!({"source":"mixed","reason":"order_within_clock_precision","at_ms":pair[1].at}));
+        let mut previous: Option<&Event> = None;
+        for event in self
+            .events
+            .iter()
+            .filter(|e| !matches!(e.source, Source::Boundary))
+        {
+            if previous.is_some_and(|p| p.source != event.source && event.at - p.at <= precision) {
+                self.gaps.push(json!({"source":"mixed","reason":"order_within_clock_precision","at_ms":event.at}));
             }
+            previous = Some(event);
         }
         for run in self.events.chunk_by(|a, b| a.source == b.source) {
             let (batch, window) = match &run[0].source {
                 Source::Boundary => continue,
+                Source::Portable(index) => {
+                    for event in run {
+                        let mut step: Step = serde_json::from_value(event.value.clone())?;
+                        step.id = format!("rec{next}");
+                        next += 1;
+                        windows.push(ReplaySource::Portable(*index));
+                        steps.push(step);
+                    }
+                    continue;
+                }
                 Source::Native(index, window) => {
                     let events: Vec<_> = run.iter().map(|e| e.value.clone()).collect();
                     let app = App {
@@ -171,7 +191,7 @@ impl Timeline {
                     };
                     (
                         from_events(&app, &events, &mut next),
-                        Some((*index, window.clone())),
+                        ReplaySource::Linux(*index, window.clone()),
                     )
                 }
                 Source::Browser(..) => {
@@ -195,11 +215,11 @@ impl Timeline {
                         rows.push('\n');
                         previous = Some(action);
                     }
-                    (from_browser_steps(&rows, &mut next), None)
+                    (from_browser_steps(&rows, &mut next), ReplaySource::Browser)
                 }
             };
             for skipped in batch.skipped {
-                self.gaps.push(json!({"source":if window.is_some() {"native"} else {"browser"},"at_ms":run[0].at,"skipped":skipped}));
+                self.gaps.push(json!({"source":if matches!(window, ReplaySource::Browser) {"browser"} else {"native"},"at_ms":run[0].at,"skipped":skipped}));
             }
             windows.extend(std::iter::repeat_n(window, batch.steps.len()));
             steps.extend(batch.steps);
