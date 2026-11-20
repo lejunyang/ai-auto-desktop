@@ -2860,6 +2860,7 @@ impl LinuxBackend {
         Some(json!({
             "role": node.role,
             "name": node.name.unwrap_or_default(),
+            "capture_identity": [target.bus_name, target.object_path],
             "protected": protected,
             "value": if protected { Value::Null } else { json!(node.value) },
         }))
@@ -2984,7 +2985,9 @@ impl LinuxBackend {
                 }
                 ("StateChanged", "focused") if detail == 1 => {
                     let node = self.describe(&target, &info);
-                    buffer.lock().unwrap().focused = node;
+                    let mut buffer = buffer.lock().unwrap();
+                    buffer.focused = node.clone();
+                    buffer.push(json!({"kind":"focus_boundary","at_ms":at_ms,"node":node}));
                 }
                 _ => {}
             }

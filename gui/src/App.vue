@@ -30,6 +30,7 @@ const loadingElements = ref(false);
 const busy = ref(false);
 const recording = ref(false);
 const skipped = ref(0);
+const dropped = ref(0);
 let poll: number | undefined;
 
 const notice = ref<{ kind: "error" | "ok"; text: string; hint?: string } | null>(null);
@@ -191,7 +192,7 @@ function runAll(): void {
   });
 }
 
-function append(batch: { steps: Step[]; skipped: unknown[] }): void {
+function append(batch: { steps: Step[]; skipped: unknown[]; dropped?: number }): void {
   const added: Step[] = [];
   for (const step of batch.steps) {
     const taken = [...steps.value, ...added];
@@ -199,6 +200,7 @@ function append(batch: { steps: Step[]; skipped: unknown[] }): void {
   }
   steps.value = [...steps.value, ...added];
   skipped.value += batch.skipped.length;
+  dropped.value += batch.dropped ?? 0;
 }
 
 async function startRecording(): Promise<void> {
@@ -207,6 +209,7 @@ async function startRecording(): Promise<void> {
     await api.startRecording(resource.value.resource_id);
     recording.value = true;
     skipped.value = 0;
+    dropped.value = 0;
     poll = window.setInterval(async () => {
       try {
         append(await api.collect());
@@ -227,7 +230,7 @@ async function stopRecording(): Promise<void> {
   recording.value = false;
   try {
     append(await api.stopRecording());
-    tell(skipped.value ? `录制结束，${skipped.value} 个动作无法回放，已略过` : "录制结束");
+    tell(skipped.value || dropped.value ? `录制有缺口：${skipped.value} 个动作无法回放，${dropped.value} 个事件未录到` : "录制结束");
   } catch (error) {
     fail(error);
   }

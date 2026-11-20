@@ -323,7 +323,9 @@ private final class TokenStore {
 /// listens, and nothing is posted.
 private final class Recorder {
     let pid: pid_t
-    let describe: (AXUIElement) -> [String: Any]
+    private let describeNode: (AXUIElement) -> [String: Any]
+    private var lastElement: AXUIElement?
+    private var captureIdentity = 0
     private let lock = NSLock()
     private var events: [[String: Any]] = []
     private var dropped = 0
@@ -334,7 +336,19 @@ private final class Recorder {
 
     init(pid: pid_t, describe: @escaping (AXUIElement) -> [String: Any]) {
         self.pid = pid
-        self.describe = describe
+        self.describeNode = describe
+    }
+
+    private func describe(_ element: AXUIElement) -> [String: Any] {
+        var node = describeNode(element)
+        lock.lock()
+        defer { lock.unlock() }
+        if lastElement.map({ CFEqual($0, element) }) != true {
+            captureIdentity += 1
+            lastElement = element
+        }
+        node["capture_identity"] = captureIdentity
+        return node
     }
 
     private func now() -> UInt64 { UInt64(ProcessInfo.processInfo.systemUptime * 1000) }
@@ -415,6 +429,7 @@ private final class Recorder {
             lock.lock()
             focused = node
             lock.unlock()
+            push(["kind": "focus_boundary", "at_ms": now(), "node": node])
             return
         }
         let role = node["role"] as? String ?? ""

@@ -52,7 +52,11 @@ impl Batch {
 }
 
 fn same(left: &Value, right: &Value) -> bool {
-    left["role"] == right["role"] && left["name"] == right["name"]
+    !left["capture_identity"].is_null()
+        && left["capture_identity"] == right["capture_identity"]
+        && left["protected"] == right["protected"]
+        && left["role"] == right["role"]
+        && left["name"] == right["name"]
 }
 
 fn locator(node: &Value) -> Locator {
@@ -80,6 +84,11 @@ pub fn from_events(app: &App, events: &[Value], next: &mut usize) -> Batch {
     for event in events {
         let mut event = event.clone();
         let kind = event["kind"].as_str().unwrap_or_default().to_string();
+        if kind == "focus_boundary" {
+            last_node = event["node"].is_object().then(|| event["node"].clone());
+            kept.push((event, 0));
+            continue;
+        }
         if kind == "key" && event["node"].is_null() {
             match &last_node {
                 Some(node) => event["node"] = node.clone(),
@@ -104,7 +113,7 @@ pub fn from_events(app: &App, events: &[Value], next: &mut usize) -> Batch {
             let on_same = same(&previous["node"], &node);
             match (previous["kind"].as_str().unwrap_or_default(), kind.as_str()) {
                 // Typing raises an event per keystroke: keep the final text.
-                ("text", "text") if on_same => {
+                ("text", "text") if on_same && close <= CAUSE_MS => {
                     *previous = event;
                     continue;
                 }
@@ -137,6 +146,9 @@ pub fn from_events(app: &App, events: &[Value], next: &mut usize) -> Batch {
         kept.push((event, 1));
     }
     for (event, count) in kept {
+        if event["kind"] == "focus_boundary" {
+            continue;
+        }
         let node = &event["node"];
         let id = format!("rec{next}");
         *next += 1;
@@ -240,7 +252,18 @@ pub fn from_browser_steps(steps_jsonl: &str, next: &mut usize) -> Batch {
                 .push(json!({"reason": "不在网页上的操作", "summary": kind}));
             continue;
         };
-        let mut node = json!({"role": control["role"], "name": control["name"]});
+        let mut node = json!({"role": control["role"], "name": control["name"],"protected":action["protected"] == true});
+        if let (Some(doc), Some(id)) = (action["document_id"].as_str(), action["node_id"].as_str())
+        {
+            node["capture_identity"] = json!([doc, id]);
+        }
+        if kind == "input" && action["truncated"] == true {
+            batch
+                .skipped
+                .push(json!({"reason":"输入内容未完整录下，请手工补齐","summary":"input"}));
+            runs.push((App::default(), Vec::new()));
+            continue;
+        }
         let at_ms = action["at_ms"].clone();
         let event = match kind {
             "click" => json!({"kind": "click", "button": "left", "node": node, "at_ms": at_ms}),
@@ -285,6 +308,54 @@ pub struct Recording {
     capture: String,
     app: App,
     next: usize,
+    tail: Option<Value>,
+}
+
+fn across_polls(
+    tail: &mut Option<Value>,
+    mut events: Vec<Value>,
+    gap: bool,
+    finish: bool,
+    app: &App,
+    next: &mut usize,
+) -> Batch {
+    let mut batch = Batch::default();
+    if let Some(previous) = tail.take() {
+        if gap {
+            batch = from_events(app, &[previous], next);
+        } else {
+            events.insert(0, previous);
+        }
+    }
+    if !finish
+        && events.last().is_some_and(|event| {
+            event["kind"] == "text" && !event["node"]["capture_identity"].is_null()
+        })
+    {
+        let last = events.last().unwrap();
+        let mut start = events.len() - 1;
+        while start > 0
+            && events[start - 1]["kind"] == "text"
+            && same(&events[start - 1]["node"], &last["node"])
+            && at(&events[start]).saturating_sub(at(&events[start - 1])) <= CAUSE_MS
+        {
+            start -= 1;
+        }
+        if start > 0
+            && events[start - 1]["kind"] == "click"
+            && events[start - 1]["button"] == "left"
+            && same(&events[start - 1]["node"], &last["node"])
+            && at(&events[start]).saturating_sub(at(&events[start - 1])) <= CAUSE_MS
+        {
+            start -= 1;
+        }
+        *tail = events.pop();
+        events.truncate(start);
+    }
+    let rest = from_events(app, &events, next);
+    batch.steps.extend(rest.steps);
+    batch.skipped.extend(rest.skipped);
+    batch
 }
 
 /// Whether the provider behind `resource` can watch a person work.
@@ -339,11 +410,16 @@ impl Recording {
             capture,
             app,
             next,
+            tail: None,
         })
     }
 
     /// The steps recorded since the last collection.
     pub fn collect(&mut self) -> Result<Batch> {
+        self.collect_inner(false)
+    }
+
+    fn collect_inner(&mut self, finish: bool) -> Result<Batch> {
         let raw = self.provider.invoke(
             &format!("{}.collect@1", self.name),
             json!({"capture_id": self.capture}),
@@ -365,7 +441,15 @@ impl Recording {
             batch
         } else {
             let events = raw["events"].as_array().cloned().unwrap_or_default();
-            from_events(&self.app, &events, &mut self.next)
+            let idle = events.is_empty();
+            across_polls(
+                &mut self.tail,
+                events,
+                dropped != 0,
+                finish || idle,
+                &self.app,
+                &mut self.next,
+            )
         };
         batch.dropped = dropped;
         Ok(batch)
@@ -373,7 +457,7 @@ impl Recording {
 
     /// Collect what is left and stop watching.
     pub fn stop(mut self) -> Result<Batch> {
-        let last = self.collect();
+        let last = self.collect_inner(true);
         let released = self.provider.invoke(
             &format!("{}.release@1", self.name),
             json!({"capture_id": self.capture}),
@@ -395,7 +479,28 @@ mod tests {
     use super::*;
 
     fn node(role: &str, name: &str) -> Value {
-        json!({"role": role, "name": name})
+        json!({"role": role, "name": name,"capture_identity":[role,name]})
+    }
+
+    #[test]
+    fn input_spans_polls_but_never_merges_distinct_rows_or_crosses_a_gap() {
+        let edit = |id, value| json!({"kind":"text","at_ms":20,"node":{"role":"text","name":"Qty","capture_identity":id,"value":value}});
+        let mut tail = None;
+        let mut next = 1;
+        let mut poll =
+            |events, gap, finish| across_polls(&mut tail, events, gap, finish, &app(), &mut next);
+        assert!(poll(vec![edit(1, "1")], false, false).steps.is_empty());
+        let first = poll(vec![edit(1, "12"), edit(2, "3")], false, false);
+        assert_eq!(actions(&first), vec![json!({"type":"fill","value":"12"})]);
+        let last = poll(vec![edit(2, "34")], true, true);
+        assert_eq!(
+            actions(&last),
+            vec![
+                json!({"type":"fill","value":"3"}),
+                json!({"type":"fill","value":"34"})
+            ]
+        );
+        assert!(!last.to_json().to_string().contains("capture_identity"));
     }
     fn event(kind: &str, at_ms: u64, node: Value, extra: Value) -> Value {
         let mut event = json!({"kind": kind, "at_ms": at_ms, "node": node});
