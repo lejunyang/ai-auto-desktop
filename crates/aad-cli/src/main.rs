@@ -16,6 +16,7 @@ mod control;
 mod desk;
 mod recipe;
 mod run_review;
+mod table_data;
 
 use serde_json::{json, Value};
 use std::io::Write;
@@ -92,6 +93,9 @@ enum Command {
     BrowserRecord(browser_record::Command),
     /// Run a JavaScript file against a browser page with the AAD page API.
     BrowserScript(browser_script::Args),
+    /// Export a collected table as CSV, or compare it with a CSV file.
+    #[command(subcommand)]
+    Table(table_data::TableCommand),
     /// Share a browser page or the desktop with a person, who can use it remotely.
     ///
     /// Prints a loopback URL with a token, then streams the screen over a
@@ -464,6 +468,11 @@ fn dispatch(command: &Command) -> (Value, u8) {
             ),
         },
         Command::Record(args) => desk::record(args),
+        Command::Table(args) => match table_data::run(args) {
+            Ok(value) if value.get("matches") == Some(&Value::Bool(false)) => (value, EXIT_FAILED),
+            Ok(value) => (value, EXIT_OK),
+            Err(message) => (failure("CLI.TABLE_ERROR", &message, None), EXIT_FAILED),
+        },
         Command::BrowserScript(args) => match browser_script::run(args) {
             Ok(value) => (value, EXIT_OK),
             Err(value) => (value, EXIT_FAILED),
