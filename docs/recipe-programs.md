@@ -52,7 +52,7 @@ aad run ./program.yaml --inputs '{"orders":[{"number":"ORD-1","selected":true}]}
 
 ## 按版本调用子配方
 
-把下面的文件保存为主程序目录下的 `lib/enter-order.yaml`。同一个文件可以在不同阶段和循环内多次调用。
+把下面的文件保存为主程序目录下的 `lib/enter_order/1.2.0.yaml`。同一个文件可以在不同阶段和循环内多次调用。
 
 ```yaml
 kind: Subrecipe
@@ -78,7 +78,7 @@ name: check-entry
 phases:
   - app: {provider: browser.cdp, title: Recipe orders}
     steps:
-      - call: {file: lib/enter-order.yaml, name: enter_order, version: "1.2.0"}
+      - call: enter_order@1.2.0
         with: {number: ORD-42}
         save: {value: entered}
 outputs: {entered: "${{ entered }}"}
@@ -86,7 +86,7 @@ outputs: {entered: "${{ entered }}"}
 
 实参在进入子配方时一次求值并保留 JSON 类型。每次调用有自己的参数、变量、步骤结果和定位器别名。子配方的所有 `results` 在正常结束时同时求值。调用方可省略 `save` 或只选部分结果。新接收的名字为只读，也可把结果存入之前用 `set` 声明的可写变量，例如跨循环保留最后一笔回执。
 
-`file` 相对当前调用文件解析，嵌套调用也遵循这个规则。规范化后的文件必须在主程序的目录树内。版本采用精确的 `MAJOR.MINOR.PATCH` 发布号，显式匹配 `name` 和 `version`。发布者如需区分文件内容，应随改动更新版本并保留旧版文件；版本号本身没有内容哈希。一次编译只读取同一子文件一次。
+`call: enter_order@1.2.0` 从根 Recipe 的目录查找 `lib/enter_order/1.2.0.yaml`，嵌套调用也从该根目录查找。自定义布局可写 `call: {file: helpers/entry.yaml, name: enter_order, version: "1.2.0"}`，其中 `file` 相对当前调用文件解析。规范化后的文件必须在根 Recipe 的目录树内。两种写法都核对文件内的名字和精确的 `MAJOR.MINOR.PATCH` 发布号。版本号没有内容哈希，发布者应随内容变更更新版本并保留旧版文件。一次编译只读取同一子文件一次。
 
 校验会展开所有调用，包括未进入的分支，检查版本、实参、返回值映射、循环调用和重复键。子程序与主程序共同使用步骤数、深度和执行预算。单份源码上限为 2 MiB，所有子文件按调用位置展开后的源码总量也以 2 MiB 为限。
 
