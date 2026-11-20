@@ -29,6 +29,8 @@
   });
   const emit = (kind, el, value = null, trusted = false) => {
     const target = element(el);
+    const container=el.parentElement?.closest('tr[aria-label], [role="row"][aria-label], form[aria-label], section[aria-label], dialog[aria-label], [role="group"][aria-label]');
+    if(container && labelOf(container)) target.control.within={role:roleOf(container),name:labelOf(container)};
     const event = {kind, ...target, tag:el.isContentEditable ? 'contenteditable' : target.tag, label:target.name, type:el.type || null,
       value, truncated: value != null && value.length > 500,
       url:location.href, document_id:documentId, sequence:++sequence,

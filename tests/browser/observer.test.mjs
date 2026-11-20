@@ -1,6 +1,10 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import {readFileSync} from 'node:fs';
+import {writeFile} from 'node:fs/promises';
+import {execFile} from 'node:child_process';
+import {promisify} from 'node:util';
+import {join,resolve} from 'node:path';
 import vm from 'node:vm';
 import {fixture} from './fixture.mjs';
 
@@ -46,6 +50,22 @@ test('real Chromium reports semantic changes and ordered actions', {skip:!proces
     const after=await f.cdp.eval('__aadCdp.snapshot()');
     assert.ok(after.nodes.some(n=>n.name==='扫码登录' && !n.enabled));
     assert.ok(after.nodes.some(n=>n.role==='canvas'));
+    await f.cdp.eval(`document.body.insertAdjacentHTML('beforeend','<table><tr aria-label="Order B"><td><button>Save</button></td></tr><tr aria-label="Order A"><td><button>Save</button></td></tr></table>');true`);
+    const labels=await f.cdp.eval("Array.from(document.querySelectorAll('tr')).map(row=>row.getAttribute('aria-label'))");
+    assert.deepEqual(labels,['Order B','Order A']);
+    await f.cdp.eval(`const save=document.querySelector('tr[aria-label="Order A"] button');if(save.textContent==='Save')save.click();true`);
+    const report2=await f.cdp.eval('__aadCdp.takeReport()');
+    assert.deepEqual(report2.events[0].control.within,{role:'row',name:'Order A'});
+    const cli=process.env.AAD_TEST_CLI || resolve('target/debug/aad');
+    const run=async args=>JSON.parse((await promisify(execFile)(cli,args,{env:{...process.env,
+      AAD_CDP_PORT:String(f.port),AAD_RECORDINGS_DIR:join(f.root,'store'),AAD_CONTROL_LEASE_DIR:join(f.root,'leases')}})).stdout);
+    await writeFile(join(f.root,'steps.jsonl'),JSON.stringify({kind:'action',action:report2.events[0]})+'\n');
+    const exported=await run(['browser-record','steps','--out',f.root,'--save','row-order']);
+    assert.deepEqual(exported.steps[0].locator.within,{role:'row',name:'Order A'});
+    await f.cdp.eval(`const rows=document.querySelectorAll('tr');rows[0].before(rows[1]);window.clicked=[];
+      for(const row of rows) row.querySelector('button').onclick=()=>clicked.push(row.getAttribute('aria-label'));true`);
+    assert.equal((await run(['run','row-order','--permission','desktop.input','--permission','desktop.observe'])).status,'succeeded');
+    assert.deepEqual(await f.cdp.eval('clicked'),['Order A']);
     await f.cdp.eval('__aadCdp.stop()');
     assert.equal(await f.cdp.eval('typeof __aadCdp'),'undefined');
   } finally {await f.close();}

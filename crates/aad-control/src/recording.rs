@@ -66,6 +66,7 @@ fn locator(node: &Value) -> Locator {
             .as_str()
             .filter(|n| !n.is_empty())
             .map(str::to_string),
+        within: node.get("captured_container").cloned(),
         ..Default::default()
     }
 }
@@ -253,6 +254,14 @@ pub fn from_browser_steps(steps_jsonl: &str, next: &mut usize) -> Batch {
             continue;
         };
         let mut node = json!({"role": control["role"], "name": control["name"],"protected":action["protected"] == true});
+        if let (Some(role), Some(name)) = (
+            control["within"]["role"].as_str(),
+            control["within"]["name"].as_str(),
+        ) {
+            if !role.is_empty() && !name.is_empty() {
+                node["captured_container"] = json!({"role":role,"name":name});
+            }
+        }
         if let (Some(doc), Some(id)) = (action["document_id"].as_str(), action["node_id"].as_str())
         {
             node["capture_identity"] = json!([doc, id]);
