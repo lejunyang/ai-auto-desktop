@@ -82,7 +82,8 @@ test('version-pinned nested subrecipes isolate arguments, reads and return slots
     const directory = join(page.root, 'library');
     await mkdir(directory);
     const pin = (file, name) => ({file, name, version: '1.2.0'});
-    const innerPin = pin('submit.json', 'submit');
+    const innerPin = pin('lib/submit/1.2.0.yaml', 'submit');
+    await mkdir(join(page.root, 'lib', 'submit'), {recursive: true});
     const outerPin = pin('library/pair.yaml', 'pair');
     const inner = {
       kind: 'Subrecipe', format: 'recipe/2', name: 'submit', version: '1.2.0', parameters: ['order'],
@@ -90,12 +91,12 @@ test('version-pinned nested subrecipes isolate arguments, reads and return slots
         {id: 'receipt', read: [{as: 'actual', locator: {name: 'Order'}, property: 'value'}]}]}],
       results: {number: '${{ receipt.values.actual }}'},
     };
-    await writeFile(join(directory, innerPin.file), JSON.stringify(inner));
+    await writeFile(join(page.root, innerPin.file), JSON.stringify(inner));
     const outer = {
       kind: 'Subrecipe', format: 'recipe/2', name: 'pair', version: '1.2.0', parameters: ['order'],
       phases: [{app: page.app, steps: [
-        {call: innerPin, with: {order: '${{ order }}'}, save: {number: 'receipt'}},
-        {call: innerPin, with: {order: '${{ receipt }}-copy'}, save: {number: 'copy'}},
+        {call: 'submit@1.2.0', with: {order: '${{ order }}'}, save: {number: 'receipt'}},
+        {call: {...innerPin, file: '../' + innerPin.file}, with: {order: '${{ receipt }}-copy'}, save: {number: 'copy'}},
       ]}], results: {pair: ['${{ receipt }}', '${{ copy }}']},
     };
     await writeFile(join(page.root, outerPin.file), JSON.stringify(outer));
@@ -131,6 +132,11 @@ test('version-pinned nested subrecipes isolate arguments, reads and return slots
     await invalid({...invoke, with: {}}, /arguments/);
     await invalid({...invoke, with: {order: 'X', extra: 1}}, /arguments/);
     await invalid({...invoke, save: {missing: 'capture'}}, /unknown subrecipe result/);
+    await invalid({...invoke, call: 'submit@latest'}, /exact release version/);
+    await invalid({...invoke, call: '../submit@1.2.0'}, /invalid recipe identifier/);
+    await writeFile(join(page.root, innerPin.file), JSON.stringify({...inner, version: '1.2.1'}));
+    await invalid(invoke, /version 1.2.0/);
+    await writeFile(join(page.root, innerPin.file), JSON.stringify(inner));
     outer.results = {bad: '${{ last }}'};
     await writeFile(join(page.root, outerPin.file), JSON.stringify(outer));
     await invalid(invoke, /unknown recipe name last/);

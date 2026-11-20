@@ -10,11 +10,18 @@ use std::rc::Rc;
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Call {
-    pub call: Pin,
+    pub call: Target,
     #[serde(default)]
     pub with: BTreeMap<String, Value>,
     #[serde(default)]
     pub save: BTreeMap<String, String>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+pub(super) enum Target {
+    Named(String),
+    File(Pin),
 }
 
 #[derive(Deserialize)]
@@ -73,28 +80,44 @@ impl Library {
         Ok(library)
     }
 
-    pub fn enter(&mut self, pin: &Pin) -> Result<Rc<Subrecipe>, String> {
+    pub fn enter(&mut self, target: Target) -> Result<Rc<Subrecipe>, String> {
+        let root = self
+            .stack
+            .first()
+            .and_then(|p| p.parent())
+            .ok_or("a subrecipe call requires a source file")?;
+        let (base, pin) = match target {
+            Target::Named(reference) => {
+                let (name, version) = reference
+                    .split_once('@')
+                    .ok_or("call requires name@MAJOR.MINOR.PATCH")?;
+                (
+                    root,
+                    Pin {
+                        file: Path::new("lib").join(name).join(format!("{version}.yaml")),
+                        name: name.into(),
+                        version: version.into(),
+                    },
+                )
+            }
+            Target::File(pin) => (
+                self.stack.last().and_then(|p| p.parent()).unwrap_or(root),
+                pin,
+            ),
+        };
         identifier(&pin.name)?;
         if !aad_runtime::version::parse(&pin.version).is_some_and(|v| v.prerelease.is_none())
             || pin.version.contains('+')
         {
             return Err("pin an exact release version MAJOR.MINOR.PATCH".into());
         }
-        let current = self
-            .stack
-            .last()
-            .and_then(|p| p.parent())
-            .ok_or("a subrecipe call requires a source file")?;
         if pin.file.is_absolute() {
             return Err("subrecipe file must be a relative path".into());
         }
-        let path = current
+        let path = base
             .join(&pin.file)
             .canonicalize()
             .map_err(|err| format!("{}: {err}", pin.file.display()))?;
-        let root = self.stack[0]
-            .parent()
-            .ok_or("recipe file needs a parent directory")?;
         if !path.starts_with(root) {
             return Err(format!(
                 "{} is outside the root recipe directory",

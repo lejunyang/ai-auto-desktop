@@ -320,7 +320,7 @@ impl Compiler {
     }
 
     fn call(&mut self, call: Call, id: &str, caller: &mut Scope, ctx: Context) -> Result<Value> {
-        let spec = self.library.enter(&call.call)?;
+        let spec = self.library.enter(call.call)?;
         let params: BTreeSet<_> = spec.parameters.iter().collect();
         if params.len() != spec.parameters.len() || params != call.with.keys().collect() {
             return Err(format!(
