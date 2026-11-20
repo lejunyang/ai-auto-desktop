@@ -27,14 +27,14 @@
     value_truncated: !protectedField(el) && String(el.value || '').length > 500,
     href: el.href || null, src: ['IMG','CANVAS'].includes(el.tagName) ? (el.currentSrc || el.src || null) : null
   });
-  const emit = (kind, el, value = null, trusted = false) => {
+  const emit = (kind, el, value = null, trusted = false, domEvent = kind) => {
     const target = element(el);
     const container=el.parentElement?.closest('tr[aria-label], [role="row"][aria-label], form[aria-label], section[aria-label], dialog[aria-label], [role="group"][aria-label]');
     if(container && labelOf(container)) target.control.within={role:roleOf(container),name:labelOf(container)};
     const event = {kind, ...target, tag:el.isContentEditable ? 'contenteditable' : target.tag, label:target.name, type:el.type || null,
       value, truncated: value != null && value.length > 500,
       url:location.href, document_id:documentId, sequence:++sequence,
-      at_ms:Date.now(), monotonic_ms:performance.now(), trusted};
+      at_ms:Date.now(), monotonic_ms:performance.now(), trusted, dom_event:domEvent};
     if (event.value != null) event.value = event.value.slice(0,500);
     if (binding && typeof globalThis[binding] === 'function') {
       globalThis[binding](JSON.stringify(event));
@@ -62,7 +62,7 @@
     const el = targetOf(event);
     if (!el?.tagName || (!['INPUT','TEXTAREA','SELECT'].includes(el.tagName) && !el.isContentEditable)) return;
     const value = protectedField(el) ? null : String(el.isContentEditable ? (el.innerText || el.textContent || '') : (el.value || ''));
-    emit('input', el, value, event.isTrusted);
+    emit('input', el, value, event.isTrusted, event.type);
   };
   listen('input', onInput); listen('change', onInput); listen('compositionend', onInput);
   // Enter without a form submit still establishes an ordering boundary.

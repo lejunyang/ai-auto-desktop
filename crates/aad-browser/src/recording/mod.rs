@@ -277,7 +277,32 @@ impl Recorder {
         Ok(())
     }
 
-    pub fn run(mut self, cancel: &AtomicBool) -> Result<Value> {
+    /// Sample Chromium's platform monotonic clock on the selected page.
+    pub fn monotonic_ms(&mut self) -> Result<u64> {
+        let client = &mut self.pages[0].client;
+        client.command("Performance.enable", json!({}))?;
+        let metrics = client.command("Performance.getMetrics", json!({}))?;
+        client.command("Performance.disable", json!({}))?;
+        let seconds = metrics["metrics"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|metric| metric["name"] == "Timestamp")
+            .and_then(|metric| metric["value"].as_f64())
+            .ok_or("Chromium did not report its monotonic timestamp")?;
+        Ok((seconds * 1000.0) as u64)
+    }
+
+    pub fn run(self, cancel: &AtomicBool) -> Result<Value> {
+        self.run_with_poll(cancel, |_| Ok(()))
+    }
+
+    /// Collect a companion Watch on the same lifecycle, including the final drain.
+    pub fn run_with_poll(
+        mut self,
+        cancel: &AtomicBool,
+        mut companion: impl FnMut(bool) -> Result<()>,
+    ) -> Result<Value> {
         let started = Instant::now();
         let mut discovery = Instant::now();
         let mut capture = Instant::now() - Duration::from_secs(1);
@@ -296,6 +321,7 @@ impl Recorder {
                 if self.commands()? {
                     break;
                 }
+                companion(false)?;
                 self.poll()?;
                 if capture.elapsed() >= Duration::from_millis(300) {
                     self.capture()?;
@@ -309,6 +335,7 @@ impl Recorder {
                 std::thread::sleep(Duration::from_millis(30));
             }
             // Drain already received final events and capture the visible final state.
+            companion(true)?;
             self.poll()?;
             self.capture()?;
             Ok(())

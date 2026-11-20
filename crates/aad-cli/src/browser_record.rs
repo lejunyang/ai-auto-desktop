@@ -7,8 +7,13 @@ use std::sync::{
     Arc,
 };
 
+mod mixed;
+
 #[derive(Subcommand)]
 pub enum Command {
+    /// Record a selected Chromium page together with a native AT-SPI/X11 window.
+    #[command(subcommand)]
+    Mixed(mixed::Command),
     /// List existing browser profile directory IDs and their display names.
     Profiles {
         #[arg(long, value_parser = ["edge", "chrome", "brave"])]
@@ -119,6 +124,7 @@ pub struct Start {
 
 pub fn run(command: &Command) -> recording::Result<Value> {
     match command {
+        Command::Mixed(command) => mixed::run(command),
         Command::Summary { out } => share_summary(out),
         Command::Profiles {
             browser,
