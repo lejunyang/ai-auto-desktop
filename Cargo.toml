@@ -10,12 +10,9 @@ members = [
     "crates/aad-plugin",
     "crates/aad-runtime",
     "crates/aad-ocr",
-    "crates/aad-atspi",
-    "crates/aad-macos-ax",
     "crates/aad-browser",
     "crates/aad-control",
     "crates/aad-probe",
-    "crates/aad-uia",
     "crates/aad-mcp",
     "crates/aad-cli",
     "gui/src-tauri",
@@ -41,12 +38,9 @@ aad-desktop = { path = "crates/aad-desktop", version = "0.0.9" }
 aad-plugin = { path = "crates/aad-plugin", version = "0.0.9" }
 aad-runtime = { path = "crates/aad-runtime", version = "0.0.9" }
 aad-ocr = { path = "crates/aad-ocr", version = "0.0.9" }
-aad-atspi = { path = "crates/aad-atspi", version = "0.0.9" }
-aad-macos-ax = { path = "crates/aad-macos-ax", version = "0.0.9" }
 aad-browser = { path = "crates/aad-browser", version = "0.0.9" }
 aad-control = { path = "crates/aad-control", version = "0.0.9" }
 aad-probe = { path = "crates/aad-probe", version = "0.0.9" }
-aad-uia = { path = "crates/aad-uia", version = "0.0.9" }
 aad-mcp = { path = "crates/aad-mcp", version = "0.0.9" }
 
 serde = { version = "1", features = ["derive"] }

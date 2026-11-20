@@ -755,13 +755,10 @@ crates/
   aad-runtime   工作流引擎、模板、journal、沙箱脚本
   aad-ocr       原生 Tesseract OCR 与图片输入校验
   aad-platform  各系统共同的词汇：共享屏幕与输入（Desktop）、画面与变化区域、按键表、探测结果、结构化错误
-  aad-windows   Windows 的系统能力：DXGI/GDI 截屏、PrintWindow、SendInput、剪贴板、OCR、探测（只在 Windows 上编译）
-  aad-linux     Linux 的系统能力：X11 截屏（DAMAGE）、XTest 输入、剪贴板、探测（只在 Linux 上编译）
-  aad-macos     macOS 的系统能力：ScreenCaptureKit 截屏、CGEvent 输入、剪贴板、探测（只在 macOS 上编译）
+  aad-windows   Windows 的系统能力：UI Automation、DXGI/GDI 截屏、PrintWindow、SendInput、剪贴板、OCR、探测（只在 Windows 上编译）
+  aad-linux     Linux 的系统能力：AT-SPI、X11 截屏（DAMAGE）、XTest 输入、剪贴板、探测（只在 Linux 上编译）
+  aad-macos     macOS 的系统能力：AX 与 Swift helper 协议、ScreenCaptureKit 截屏、CGEvent 输入、剪贴板、探测（只在 macOS 上编译）
   aad-desktop   与系统无关的桌面驱动：UI 模型、Backend 边界、动作分发、录制与观察
-  aad-uia       Windows UI Automation 后端（只在 Windows 上编译）
-  aad-atspi     Linux AT-SPI / X11 驱动（只在 Linux 上依赖）
-  aad-macos-ax  macOS AX 的 Rust adapter 与 Swift helper 协议（只在 macOS 上依赖）
   aad-probe     只读能力探测（汇总报告；各系统的检查在对应平台 crate 里）
   aad-browser   本地浏览器协议：Chromium CDP 与 Firefox WebDriver BiDi、浏览器启动与资料租约、页面录制
   aad-mcp       stdio 上的 MCP server

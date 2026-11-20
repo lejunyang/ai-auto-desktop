@@ -1,7 +1,7 @@
 //! The desktop driver, apart from any operating system.
 //!
 //! An operating system's accessibility backend (Windows UI Automation in
-//! `aad-uia`) implements [`Backend`]; everything above it lives here and is
+//! `aad-windows`) implements [`Backend`]; everything above it lives here and is
 //! tested everywhere:
 //!
 //! - [`model`] — the platform-independent UI vocabulary (windows, nodes,

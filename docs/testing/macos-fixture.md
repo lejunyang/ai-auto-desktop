@@ -93,7 +93,7 @@ source pins。
 收到 `macos-ax-test-result.tar.gz` 后，不要直接解压或据文件名人工判断。请在本仓库执行：
 
 ```sh
-cargo run --locked -q -p aad-macos-ax \
+cargo run --locked -q -p aad-macos \
   --bin aad-macos-result-verifier -- \
   /absolute/path/macos-ax-test-result.tar.gz
 ```
@@ -112,7 +112,7 @@ stdout 始终只有一个 JSON 文档。`archive_valid`（兼容别名 `verified
 若测试请求方已经通过与归档回传通道独立的可信渠道取得完整归档 SHA-256，可执行：
 
 ```sh
-cargo run --locked -q -p aad-macos-ax \
+cargo run --locked -q -p aad-macos \
   --bin aad-macos-result-verifier -- \
   --expected-archive-sha256 <independently-trusted-64-hex> \
   --expected-source-revision <independently-trusted-git-commit-sha> \

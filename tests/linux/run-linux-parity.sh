@@ -38,7 +38,7 @@ if [ "${1:-}" = --inside-session ]; then
   grep -q READY "$fixture_log"
   found=false
   for _ in $(seq 1 50); do
-    if cargo run --locked -q -p aad-atspi --example driver -- list \
+    if cargo run --locked -q -p aad-linux --example driver -- list \
       | jq -e --argjson pid "$fixture_pid" '.applications[] | select(.process_id == $pid)' >/dev/null; then
       found=true
       break

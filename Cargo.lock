@@ -3,23 +3,6 @@
 version = 3
 
 [[package]]
-name = "aad-atspi"
-version = "0.0.9"
-dependencies = [
- "aad-core",
- "aad-linux",
- "aad-plugin",
- "aad-runtime",
- "atspi",
- "base64 0.22.1",
- "libc",
- "serde_json",
- "sha2",
- "uuid",
- "zbus",
-]
-
-[[package]]
 name = "aad-browser"
 version = "0.0.9"
 dependencies = [
@@ -41,21 +24,18 @@ dependencies = [
 name = "aad-cli"
 version = "0.0.9"
 dependencies = [
- "aad-atspi",
  "aad-browser",
  "aad-control",
  "aad-core",
  "aad-desktop",
  "aad-linux",
  "aad-macos",
- "aad-macos-ax",
  "aad-mcp",
  "aad-ocr",
  "aad-platform",
  "aad-plugin",
  "aad-probe",
  "aad-runtime",
- "aad-uia",
  "aad-windows",
  "base64 0.22.1",
  "clap",
@@ -76,15 +56,15 @@ dependencies = [
 name = "aad-control"
 version = "0.0.9"
 dependencies = [
- "aad-atspi",
  "aad-browser",
  "aad-core",
  "aad-desktop",
- "aad-macos-ax",
+ "aad-linux",
+ "aad-macos",
  "aad-ocr",
  "aad-plugin",
  "aad-runtime",
- "aad-uia",
+ "aad-windows",
  "base64 0.22.1",
  "fs2",
  "image",
@@ -144,12 +124,17 @@ dependencies = [
 name = "aad-linux"
 version = "0.0.9"
 dependencies = [
+ "aad-core",
  "aad-platform",
+ "aad-plugin",
+ "aad-runtime",
+ "atspi",
  "base64 0.22.1",
  "futures-core",
  "image",
  "libc",
  "serde_json",
+ "sha2",
  "uuid",
  "x11rb",
  "zbus",
@@ -159,30 +144,23 @@ dependencies = [
 name = "aad-macos"
 version = "0.0.9"
 dependencies = [
+ "aad-core",
  "aad-platform",
+ "aad-plugin",
+ "aad-runtime",
  "base64 0.22.1",
  "block2",
+ "crc32fast",
  "dispatch2",
+ "flate2",
  "image",
+ "libc",
  "objc2",
  "objc2-core-foundation",
  "objc2-core-media",
  "objc2-core-video",
  "objc2-foundation",
  "objc2-screen-capture-kit",
- "serde_json",
-]
-
-[[package]]
-name = "aad-macos-ax"
-version = "0.0.9"
-dependencies = [
- "aad-core",
- "aad-plugin",
- "aad-runtime",
- "crc32fast",
- "flate2",
- "libc",
  "serde",
  "serde_json",
  "sha2",
@@ -270,31 +248,19 @@ dependencies = [
 ]
 
 [[package]]
-name = "aad-uia"
+name = "aad-windows"
 version = "0.0.9"
 dependencies = [
  "aad-core",
  "aad-desktop",
  "aad-platform",
  "aad-runtime",
- "aad-windows",
  "base64 0.22.1",
  "image",
  "serde_json",
  "uuid",
  "windows 0.58.0",
  "windows-core 0.58.0",
-]
-
-[[package]]
-name = "aad-windows"
-version = "0.0.9"
-dependencies = [
- "aad-platform",
- "base64 0.22.1",
- "image",
- "serde_json",
- "windows 0.58.0",
  "windows-sys 0.59.0",
 ]
 

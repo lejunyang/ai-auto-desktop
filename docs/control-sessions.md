@@ -572,7 +572,7 @@ Windows 上 `tests/windows/verify_*_effect.py` 用自建的隔离探针窗口，
 按键输入和保存的工作流，由 Raw Input 日志独立确认。所有 GUI fixture 串行执行。
 CI 和 release 工作流使用官方 one-sdk Action 最新正式版本，不依赖 pending one-sdk PR。
 
-Windows 真机（Windows 11、单显示器 3840×2400、250% 缩放）上，`cargo test -p aad-uia --test windows_native -- --ignored --test-threads=1`
+Windows 真机（Windows 11、单显示器 3840×2400、250% 缩放）上，`cargo test -p aad-windows --test windows_native -- --ignored --test-threads=1`
 用测试自建、自毁的窗口检查可观察效果：纯色色块截出恰好 120×80 个已知颜色像素，根节点截图包含未缩放的色块，
 DPI unaware 窗口的色块截成其 300×200 物理边界；被置顶窗口盖住的元素点击被拒绝且遮挡窗口没有收到点击；
 GDI 画出的 "Invoice 4217"（UIA 只看到窗口文字）被 OCR 读成一行两个词且位置正确；maximize/restore/minimize/activate/close_window

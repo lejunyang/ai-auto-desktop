@@ -861,16 +861,16 @@ pub fn backends() -> (Vec<Arc<NativeBackend>>, BTreeMap<String, Value>) {
     let mut backends = Vec::new();
     let mut failures = BTreeMap::new();
     #[cfg(windows)]
-    let native: Result<NativeBackend> = aad_uia::native_driver_with_store(
+    let native: Result<NativeBackend> = aad_windows::uia::native_driver_with_store(
         aad_desktop::SnapshotStore::new(32, Duration::from_secs(300)),
     )
     .map(|driver| NativeBackend::new(Arc::new(driver), Flavor::Windows))
     .map_err(|e| e.into_automation_error());
     #[cfg(target_os = "linux")]
-    let native: Result<NativeBackend> = aad_atspi::native_provider()
+    let native: Result<NativeBackend> = aad_linux::atspi::native_provider()
         .map(|provider| NativeBackend::new(Arc::new(provider), Flavor::Linux));
     #[cfg(target_os = "macos")]
-    let native: Result<NativeBackend> = aad_macos_ax::native_provider()
+    let native: Result<NativeBackend> = aad_macos::ax::native_provider()
         .map(|provider| NativeBackend::new(Arc::new(provider), Flavor::MacOS));
     #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
     let native: Result<NativeBackend> = Err(error(

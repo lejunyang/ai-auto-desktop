@@ -10,9 +10,9 @@
 | durable journal / resume | `aad-runtime` + SQLite | intent/finalization/lease/failure tests | read-only 安全重放；写 action/script 保守拒绝 |
 | ArtifactStore / process artifact protocol | `aad-runtime`、`aad-plugin` | Rust 单元与集成测试 | run-scoped、不可变、有配额 |
 | OCR | `aad-ocr` | fake Tesseract、解析/资源/超时测试 | Rust provider；引擎仍是外部 Tesseract |
-| Windows UIA | `aad-uia` | fake backend + Rust Win32 fixture | 每次 Windows CI 编译；交互式执行显式 opt-in |
-| Linux AT-SPI | `aad-atspi` + C++ X11 helpers | fake backend + 私有 Xvfb/Qt fixture | 当前 KDE/X11 profile 通过受控链路 |
-| macOS AX | `aad-macos-ax` + Swift helper | fake helper + macOS build/smoke + Swift testkit | adapter 已迁移；完整 TCC 写动作仍需单独真机资格 |
+| Windows UIA | `aad-windows` | fake backend + Rust Win32 fixture | 每次 Windows CI 编译；交互式执行显式 opt-in |
+| Linux AT-SPI | `aad-linux` + C++ X11 helpers | fake backend + 私有 Xvfb/Qt fixture | 当前 KDE/X11 profile 通过受控链路 |
+| macOS AX | `aad-macos` + Swift helper | fake helper + macOS build/smoke + Swift testkit | adapter 已迁移；完整 TCC 写动作仍需单独真机资格 |
 | CLI / MCP / GUI | `aad-cli`、`aad-mcp`、Tauri/Vue | Rust tests + front-end tests | 内置 provider 已接入 |
 | macOS 回传验真 | Rust `aad-macos-result-verifier` | synthetic archive tests + unsupported archive smoke | 保留来源/hash/结构 fail-closed 语义 |
 

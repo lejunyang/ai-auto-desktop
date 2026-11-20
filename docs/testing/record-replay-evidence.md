@@ -1,7 +1,7 @@
 2026-08-29，Windows 11 26200 / AMD64 / Python 3.13.13 / 250% 缩放 / medium integrity / Session 1。
 
 > 这是迁移前实验记录。Python/comtypes 与 `.cmd` 内容解释当时的测量环境，不是当前
-> 产品依赖；现行实现和持续回归位于 Rust `aad-uia`。
+> 产品依赖；现行实现和持续回归位于 Rust `aad-windows`。
 
 本文记录录制回放设计（`docs/spec/recording-session-v1alpha1.md`、`docs/architecture/record-replay.md`）所依据的实测数据。设计中每一处「实测」表述都对应本文的一项测量。记录目的是让结论可复核、可在其他环境重测，而不是让读者相信设计文档的断言。
 

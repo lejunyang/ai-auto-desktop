@@ -1,7 +1,7 @@
 # macOS AX 原生能力
 
 `desktop.macos_ax` 的 manifest、参数校验、snapshot/locator、stale target 和 effect
-语义由 [`aad-macos-ax`](../../crates/aad-macos-ax) 以 Rust 实现，并由 CLI/MCP 直接注册。
+语义由 [`aad-macos`](../../crates/aad-macos) 以 Rust 实现，并由 CLI/MCP 直接注册。
 仓库不再包含 Python adapter。
 
 Swift helper 仍然保留：macOS TCC 权限和 `AXUIElement` 对象必须归属于固定、可签名的

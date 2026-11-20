@@ -1,6 +1,6 @@
 # Windows UIA Rust 原生 fixture
 
-Windows CI 的普通 matrix 会编译 `crates/aad-uia/tests/windows_native.rs`。需要交互桌面的
+Windows CI 的普通 matrix 会编译 `crates/aad-windows/tests/windows_native.rs`。需要交互桌面的
 执行保持显式门禁：手动运行 CI 时选择 `run_windows_native=true`，或可信 push 的提交消息包含
 `[windows-native]`。该测试不需要 Python，也不使用 mock UIA。
 
@@ -21,13 +21,13 @@ fixture 与测试 driver 在同一个 Rust 测试进程中运行：fixture threa
 本地执行：
 
 ```powershell
-cargo test --locked -p aad-uia --test windows_native -- --ignored
+cargo test --locked -p aad-windows --test windows_native -- --ignored
 ```
 
 在非 Windows 主机上可交叉编译检查测试与 Win32 API 使用：
 
 ```sh
-cargo check --locked -p aad-uia --target x86_64-pc-windows-gnu --tests
+cargo check --locked -p aad-windows --target x86_64-pc-windows-gnu --tests
 ```
 
 测试必须运行在可交互用户桌面。它不验证 Wine、锁屏、安全桌面、跨完整性级别、RDP 会话

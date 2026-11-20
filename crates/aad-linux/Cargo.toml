@@ -5,9 +5,14 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "What Linux offers ai-auto-desktop: the X11 screen, input, clipboard; built on Linux only"
+description = "What Linux offers ai-auto-desktop including AT-SPI: the X11 screen, input, clipboard; built on Linux only"
 
 [target.'cfg(target_os = "linux")'.dependencies]
+aad-core = { workspace = true }
+aad-plugin = { workspace = true }
+aad-runtime = { workspace = true }
+sha2 = { workspace = true }
+atspi = { workspace = true }
 aad-platform = { workspace = true }
 base64 = "0.22"
 image = { workspace = true }

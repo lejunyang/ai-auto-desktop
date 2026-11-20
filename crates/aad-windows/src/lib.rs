@@ -13,6 +13,7 @@ pub mod input;
 pub mod ocr;
 pub mod probe;
 mod screen;
+pub mod uia;
 
 pub use desktop::{open, screens};
 pub use screen::dpi_aware;

@@ -158,7 +158,7 @@ jobs:
 
       - name: Smoke Rust adapter against the signed macOS AX helper
         if: runner.os == 'macOS'
-        run: cargo run --locked -q -p aad-macos-ax --example list_apps
+        run: cargo run --locked -q -p aad-macos --example list_apps
 
       - name: Reject a Cargo.lock that the manifests no longer agree with
         shell: bash
@@ -351,7 +351,7 @@ jobs:
             Released from ${{ github.sha }}.
 
             **crates.io** — `aad-core`, `aad-plugin`, `aad-runtime`, `aad-ocr`,
-            `aad-atspi`, `aad-macos-ax`, `aad-probe`, `aad-uia`, `aad-browser`,
+            `aad-linux`, `aad-macos`, `aad-probe`, `aad-windows`, `aad-browser`,
             `aad-control`, `aad-mcp`, `aad-cli` at `${{ needs.gate.outputs.version }}`.
 
             **CLI** — x64 and ARM64 archives for Linux, Windows and macOS.

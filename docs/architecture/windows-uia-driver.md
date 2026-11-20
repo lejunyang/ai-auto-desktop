@@ -1,6 +1,6 @@
 # Windows UI Automation（UIA）Rust 驱动
 
-> 当前实现：`crates/aad-uia`。Windows 上直接调用 UIAutomationCore/Win32；非 Windows
+> 当前实现：`crates/aad-windows`。Windows 上直接调用 UIAutomationCore/Win32；非 Windows
 > 构建保留平台无关模型和 fake-backend 测试，但 `native_driver()` 明确返回 unavailable。
 
 ## 能力与边界
@@ -55,12 +55,12 @@ API 返回成功但值保持原状，会报告 `DRIVER.ACTION_FAILED`，不会�
 ## 验证
 
 平台无关逻辑由 crate 单元测试覆盖。Windows CI 还运行
-`crates/aad-uia/tests/windows_native.rs`：测试在 Rust 中创建真实 Win32 控件，并用正式 driver
+`crates/aad-windows/tests/windows_native.rs`：测试在 Rust 中创建真实 Win32 控件，并用正式 driver
 验证窗口枚举、snapshot/find、歧义拒绝、ValuePattern、InvokePattern、Unicode SendInput 和
 中心点鼠标输入后的 fresh snapshot。
 
 ```powershell
-cargo test --locked -p aad-uia --test windows_native
+cargo test --locked -p aad-windows --test windows_native
 ```
 
 自有 fixture 通过不代表任意第三方 UI、提权边界、多显示器/DPI、IME 或焦点竞争均已完成

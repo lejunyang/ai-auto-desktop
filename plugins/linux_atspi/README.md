@@ -1,6 +1,6 @@
 # Linux AT-SPI 原生能力
 
-`desktop.linux_atspi` 已由 [`aad-atspi`](../../crates/aad-atspi) 内置到 Rust CLI 和 MCP
+`desktop.linux_atspi` 已由 [`aad-linux`](../../crates/aad-linux) 内置到 Rust CLI 和 MCP
 server，不再通过 Python/NDJSON worker 注册。Rust provider 使用 `atspi` 与 `zbus` 连接
 当前用户的 accessibility bus。
 

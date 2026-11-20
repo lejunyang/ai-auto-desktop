@@ -4,6 +4,7 @@
 //! empty.
 #![cfg(target_os = "linux")]
 
+pub mod atspi;
 mod desktop;
 pub mod probe;
 pub mod wayland_portal;

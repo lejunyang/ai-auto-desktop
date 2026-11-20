@@ -1,6 +1,6 @@
 # Linux KDE/X11 AT-SPI Rust 驱动
 
-> 当前实现：`crates/aad-atspi`。已在本机 KDE/X11 验证下述应用流程；X11 helper 不再按
+> 当前实现：`crates/aad-linux`。已在本机 KDE/X11 验证下述应用流程；X11 helper 不再按
 > 桌面品牌拒绝，但 GNOME/XFCE 真机仍待验收。不能外推为 Wayland、XWayland 或所有 toolkit。
 
 ## 能力与实现

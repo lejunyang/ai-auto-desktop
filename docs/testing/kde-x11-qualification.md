@@ -95,7 +95,7 @@ cleanup 证明以及零写动作。通过时输出 verifier schema
 当前 Rust provider 的确定性契约测试不启动 GUI：
 
 ```bash
-cargo test --locked -p aad-atspi
+cargo test --locked -p aad-linux
 ```
 
 ## 本机原生复测记录

@@ -361,7 +361,7 @@ fn the_two_steps_a_replay_depends_on_are_provider_actions_too() {
 /// The node actions the shell can put on a button.
 ///
 /// Duplicated deliberately rather than imported: aad-core must not depend on
-/// aad-uia, and a mismatch here should surface as a failure to review.
+/// aad-windows, and a mismatch here should surface as a failure to review.
 fn aad_uia_action_names() -> Vec<&'static str> {
     vec!["focus", "invoke", "set_value", "type_text", "pointer_click"]
 }

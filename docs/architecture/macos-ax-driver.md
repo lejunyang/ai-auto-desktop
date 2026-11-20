@@ -1,6 +1,6 @@
 # macOS Accessibility（AX）Rust 驱动
 
-> 当前实现：`crates/aad-macos-ax` + 代码签名 Swift helper。Rust 负责公开 provider 语义；
+> 当前实现：`crates/aad-macos` + 代码签名 Swift helper。Rust 负责公开 provider 语义；
 > Swift 只保留 TCC/AX/CGEvent 原生边界。
 
 ## 进程与信任边界
@@ -9,7 +9,7 @@
 Rust runtime / CLI / MCP
   │ in-process Provider calls
   ▼
-aad-macos-ax (manifest, validation, snapshots, locators, effects)
+aad-macos (manifest, validation, snapshots, locators, effects)
   │ private bounded NDJSON, opaque native tokens
   ▼
 MacOSAXHelper.app (AppKit / ApplicationServices / CGEvent / TCC identity)
@@ -66,7 +66,7 @@ contextual；marker 后的 timeout、EOF、协议错误、部分响应和无法�
 
 ```sh
 plugins/macos_ax/build.sh
-cargo run --locked -q -p aad-macos-ax --example list_apps
+cargo run --locked -q -p aad-macos --example list_apps
 ```
 
 macOS CI 构建并签名 helper，再通过 Rust adapter 做握手和应用枚举 smoke。Rust fake-helper

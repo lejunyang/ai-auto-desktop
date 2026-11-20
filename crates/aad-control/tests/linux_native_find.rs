@@ -1,9 +1,9 @@
 #![cfg(target_os = "linux")]
-use aad_atspi::{AtspiBackend, AtspiProvider, BackendNode, BackendSnapshot, NativeRef};
 use aad_control::{
     native::{Flavor, NativeBackend},
     *,
 };
+use aad_linux::atspi::{AtspiBackend, AtspiProvider, BackendNode, BackendSnapshot, NativeRef};
 use serde_json::{json, Map, Value};
 use std::{
     sync::{
@@ -88,7 +88,7 @@ impl AtspiBackend for Tree {
     fn focus(
         &self,
         _: &NativeRef,
-        _: Option<&aad_atspi::WindowAnchor>,
+        _: Option<&aad_linux::atspi::WindowAnchor>,
         _: Instant,
     ) -> Result<Value> {
         unreachable!()

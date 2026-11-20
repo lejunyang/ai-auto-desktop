@@ -70,7 +70,7 @@ jobs:
         run: plugins/macos_ax/build.sh
       - name: Smoke Rust adapter against the signed macOS AX helper
         if: runner.os == 'macOS'
-        run: cargo run --locked -q -p aad-macos-ax --example list_apps
+        run: cargo run --locked -q -p aad-macos --example list_apps
       - name: Exercise the Rust macOS result verifier
         if: runner.os == 'Linux'
         shell: bash
@@ -84,7 +84,7 @@ jobs:
           archive="$(find "$result_root" -type f -name macos-ax-test-result.tar.gz -print -quit)"
           [ -n "$archive" ]
           verify_status=0
-          cargo run --locked -q -p aad-macos-ax \
+          cargo run --locked -q -p aad-macos \
             --bin aad-macos-result-verifier -- "$archive" || verify_status=$?
           [ "$verify_status" -eq 1 ]
 
@@ -133,9 +133,9 @@ jobs:
           crates=" $(cargo tree --locked -p aad-cli -e normal --prefix none | grep -oE '^aad-[a-z-]+' | sort -u | tr '\n' ' ')"
           echo "aad depends on:$crates"
           case "$RUNNER_OS" in
-            Windows) own="aad-windows aad-uia"; others="aad-linux aad-atspi aad-macos aad-macos-ax" ;;
-            Linux) own="aad-linux aad-atspi"; others="aad-windows aad-uia aad-macos aad-macos-ax" ;;
-            macOS) own="aad-macos aad-macos-ax"; others="aad-windows aad-uia aad-linux aad-atspi" ;;
+            Windows) own="aad-windows"; others="aad-linux aad-macos" ;;
+            Linux) own="aad-linux"; others="aad-windows aad-macos" ;;
+            macOS) own="aad-macos"; others="aad-windows aad-linux" ;;
           esac
           for crate in $own; do
             [[ "$crates" == *" $crate "* ]] || { echo "aad lacks $crate" >&2; exit 1; }
@@ -398,14 +398,14 @@ jobs:
       # compile-checked where those APIs exist.
       - name: Check Windows-native UIA examples
         if: runner.os == 'Windows'
-        run: cargo check --locked -p aad-uia --examples --features windows-native-examples
+        run: cargo check --locked -p aad-windows --examples --features windows-native-examples
 
       - name: Run Rust Windows UIA fixture
         if: >-
           runner.os == 'Windows' &&
           ((github.event_name == 'workflow_dispatch' && inputs.run_windows_native == true) ||
            (github.event_name == 'push' && contains(github.event.head_commit.message, '[windows-native]')))
-        run: cargo test --locked -p aad-uia --test windows_native -- --ignored
+        run: cargo test --locked -p aad-windows --test windows_native -- --ignored
 
       # -D warnings, or clippy prints a warning and still exits 0, which makes
       # the step decorative.

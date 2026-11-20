@@ -3,6 +3,7 @@
 //! the clipboard. Built on macOS only; elsewhere this crate is empty.
 #![cfg(target_os = "macos")]
 
+pub mod ax;
 mod desktop;
 mod macos;
 mod pasteboard;

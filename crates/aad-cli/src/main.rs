@@ -471,7 +471,7 @@ fn dispatch(command: &Command) -> (Value, u8) {
 fn native_driver() -> Result<aad_desktop::UiaDriver, aad_desktop::DriverError> {
     #[cfg(windows)]
     {
-        aad_uia::native_driver()
+        aad_windows::uia::native_driver()
     }
     #[cfg(not(windows))]
     {
@@ -1653,16 +1653,16 @@ fn durable_options(
             .map_err(|error| (automation_failure(&error), EXIT_USAGE))?;
     }
     #[cfg(target_os = "linux")]
-    if !providers.names().contains(&aad_atspi::PROVIDER_NAME) {
-        if let Ok(provider) = aad_atspi::native_provider() {
+    if !providers.names().contains(&aad_linux::atspi::PROVIDER_NAME) {
+        if let Ok(provider) = aad_linux::atspi::native_provider() {
             providers.insert(aad_control::native::workflow_provider(std::sync::Arc::new(
                 provider,
             )));
         }
     }
     #[cfg(target_os = "macos")]
-    if !providers.names().contains(&aad_macos_ax::PROVIDER_NAME) {
-        if let Ok(provider) = aad_macos_ax::native_provider() {
+    if !providers.names().contains(&aad_macos::ax::PROVIDER_NAME) {
+        if let Ok(provider) = aad_macos::ax::native_provider() {
             providers.insert(aad_control::native::workflow_provider(std::sync::Arc::new(
                 provider,
             )));

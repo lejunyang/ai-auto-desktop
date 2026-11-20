@@ -26,13 +26,13 @@ libc.workspace = true
 rqrr = { version = "0.10.1", default-features = false }
 
 [target.'cfg(windows)'.dependencies]
-aad-uia.workspace = true
+aad-windows.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
-aad-atspi.workspace = true
+aad-linux.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
-aad-macos-ax.workspace = true
+aad-macos.workspace = true
 
 [dev-dependencies]
 qrcode = { version = "0.14.1", default-features = false }
