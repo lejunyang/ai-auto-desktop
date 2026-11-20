@@ -945,6 +945,7 @@ impl UiaDriver {
             .and_then(|id| snapshot.find(id))
             .map(|n| json!({"role": n.role, "name": n.name}));
         let started_epoch_ms = clock.epoch_ms(Instant::now());
+        let precision_ms = clock.precision_ms;
         self.captures.lock().unwrap().insert(
             capture_id.clone(),
             CaptureHandle {
@@ -962,6 +963,7 @@ impl UiaDriver {
             "root_locator": root,
             "truncated": snapshot.truncated,
             "started_epoch_ms": started_epoch_ms,
+            "precision_ms": precision_ms,
             // Which mechanisms are listening. Partial coverage is worth having
             // but the caller has to know: a missing source means a whole class
             // of interaction will go unrecorded rather than merely be delayed.

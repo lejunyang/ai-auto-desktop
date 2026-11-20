@@ -338,14 +338,20 @@ pub(crate) fn mixed_steps(events: Vec<CapturedEvent>, nodes: &[Node]) -> Vec<Rec
 pub(crate) struct CaptureClock {
     mono: Instant,
     wall: SystemTime,
+    pub(crate) precision_ms: u64,
 }
 
 impl CaptureClock {
     pub(crate) fn sample() -> Self {
         let before = Instant::now();
         let wall = SystemTime::now();
-        let mono = before + before.elapsed() / 2;
-        Self { mono, wall }
+        let interval = before.elapsed();
+        let mono = before + interval / 2;
+        Self {
+            mono,
+            wall,
+            precision_ms: (interval.as_millis() as u64) + 2,
+        }
     }
 
     pub(crate) fn epoch_ms(&self, at: Instant) -> Option<u64> {
@@ -965,6 +971,7 @@ mod tests {
         let clock = CaptureClock {
             mono: first.observed_at + Duration::from_millis(10),
             wall: UNIX_EPOCH + Duration::from_millis(10_010),
+            precision_ms: 2,
         };
         let events = vec![first, last];
         let regular = to_steps(events.clone(), &baseline);
