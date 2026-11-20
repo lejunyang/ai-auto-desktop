@@ -41,6 +41,11 @@ pub enum Command {
         #[arg(long)]
         out: PathBuf,
     },
+    /// Print a shareable counts-only summary of a finished recording.
+    Summary {
+        #[arg(long)]
+        out: PathBuf,
+    },
     /// Turn a completed recording into steps that replay with `aad run`.
     ///
     /// Each step names its page by address and its element by the role and
@@ -114,6 +119,7 @@ pub struct Start {
 
 pub fn run(command: &Command) -> recording::Result<Value> {
     match command {
+        Command::Summary { out } => share_summary(out),
         Command::Profiles {
             browser,
             profile_source,
@@ -230,6 +236,39 @@ pub fn run(command: &Command) -> recording::Result<Value> {
             Ok(answer)
         }
     }
+}
+
+fn share_summary(out: &std::path::Path) -> recording::Result<Value> {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    std::fs::File::open(out.join("manifest.json"))?
+        .take(256 * 1024 + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > 256 * 1024 {
+        return Err("recording manifest is too large".into());
+    }
+    let manifest: Value =
+        serde_json::from_slice(&bytes).map_err(|_| "unreadable recording manifest")?;
+    if manifest["kind"] != "BrowserRecording" || manifest["version"] != 1 {
+        return Err("expected a browser recording manifest".into());
+    }
+    let status = match manifest["status"].as_str() {
+        Some("complete") => "complete",
+        Some("incomplete") => "incomplete",
+        _ => return Err("finish recording before exporting its summary".into()),
+    };
+    let count = |key: &str| manifest[key].as_u64().ok_or("missing recording count");
+    let gaps = count("gaps")?;
+    let filtered = manifest["filtered_requests"]
+        .as_object()
+        .ok_or("missing filtered request counts")?
+        .values()
+        .try_fold(0u64, |sum, item| sum.checked_add(item.as_u64()?))
+        .ok_or("invalid filtered request count")?;
+    Ok(
+        json!({"kind":"RecordingSummary","status":status,"steps":count("steps")?,"gaps":gaps,
+        "needs_review":status=="incomplete" || gaps!=0,"filtered_requests":filtered}),
+    )
 }
 
 fn source_root(browser: &str, explicit: &Option<PathBuf>) -> recording::Result<PathBuf> {

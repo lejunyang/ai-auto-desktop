@@ -80,6 +80,10 @@ async function runCase(redacted) {
     const stop=await command(['browser-record','stop','--out',out]).done;assert.equal(stop.code,0,stop.stderr);
     const result=await recorder.done;assert.equal(result.code,0,`${result.stdout}\n${result.stderr}`);
     const manifest=await json(join(out,'manifest.json'));assert.equal(manifest.status,'complete');assert.equal(manifest.network_redaction,redacted?'enabled':'disabled');
+    const summary=await command(['browser-record','summary','--out',out]).done;
+    assert.equal(summary.code,0);
+    assert.deepEqual(JSON.parse(summary.stdout),{kind:'RecordingSummary',status:'complete',
+      steps:manifest.steps,gaps:manifest.gaps,needs_review:manifest.gaps!==0,filtered_requests:Object.values(manifest.filtered_requests).reduce((sum,count)=>sum+count,0)});
     for(const file of ['network.jsonl','network-extra.jsonl']){
       const text=await readFile(join(out,'evidence',file),'utf8');
       for(const secret of ['SYNTH_CODE','SYNTH_TICKET','SYNTH_RESPONSE','SYNTH_REFERER']){
