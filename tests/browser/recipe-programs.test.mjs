@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict';
-import {execFile} from 'node:child_process';
-import {mkdir, writeFile} from 'node:fs/promises';
+import {execFile, spawn} from 'node:child_process';
+import {mkdir, readFile, writeFile} from 'node:fs/promises';
 import {join, resolve} from 'node:path';
+import {createInterface} from 'node:readline';
 import {test} from 'node:test';
 import {promisify} from 'node:util';
 import {fixture} from './fixture.mjs';
@@ -138,4 +139,52 @@ test('version-pinned nested subrecipes isolate arguments, reads and return slots
     await invalid(invoke, /recursive subrecipe/);
     await writeFile(join(page.root, outerPin.file), '{"kind":"Subrecipe","kind":"Recipe"}');
     await invalid(invoke, /duplicate/);
+  });
+
+test('MCP runs the locally published recipe even after the callable source changes',
+  {skip: !process.env.AAD_TEST_CHROME, timeout: 60000}, async context => {
+    const page = await ordersPage(context);
+    const store = join(page.root, 'recordings');
+    await mkdir(store);
+    const name = 'approved-orders';
+    const file = join(page.root, 'approved.yaml');
+    const library = join(page.root, 'save.json');
+    const artifact = join(store, name + '.workflow.json');
+    const spec = {kind: 'Subrecipe', format: 'recipe/2', name: 'save', version: '1.0.0',
+      parameters: ['number'], phases: [{app: page.app, steps: [fill('${{ number }}'), save]}]};
+    await writeFile(library, JSON.stringify(spec));
+    await writeFile(file, JSON.stringify({kind: 'Recipe', format: 'recipe/2', name, inputs: ['number'],
+      phases: [{app: page.app, steps: [{call: {name: 'save', version: '1.0.0', file: 'save.json'},
+        with: {number: '${{ number }}'}}]}], outputs: {receipt: '${{ number }}'}}));
+    await page.command('recipe', file, '--out', artifact);
+    const published = await readFile(artifact, 'utf8');
+    assert.equal(JSON.parse(published).kind, 'Workflow');
+    await assert.rejects(page.command('recipe', file, '--out', artifact));
+    await writeFile(library, '{}');
+    await assert.rejects(page.command('recipe', file, '--out', join(store, 'bad.workflow.json')));
+    assert.equal(await readFile(artifact, 'utf8'), published);
+    await assert.rejects(readFile(join(store, 'bad.workflow.json')), {code: 'ENOENT'});
+    assert.deepEqual(await page.cdp.eval('orders'), []);
+
+    const child = spawn(cli, ['mcp', '--allow-input', '--browser-port', String(page.port)], {
+      stdio: ['pipe', 'pipe', 'inherit'],
+      env: {...process.env, AAD_RECORDINGS_DIR: store, AAD_CONTROL_LEASE_DIR: join(page.root, 'leases')},
+    });
+    context.after(() => { child.stdin.end(); child.kill(); });
+    const lines = createInterface({input: child.stdout})[Symbol.asyncIterator]();
+    let id = 0;
+    async function tool(name, args) {
+      child.stdin.write(JSON.stringify({jsonrpc: '2.0', id: ++id, method: 'tools/call', params: {name, arguments: args}}) + '\n');
+      const message = JSON.parse((await lines.next()).value);
+      assert.equal(message.id, id);
+      assert.equal(message.result.isError, false, JSON.stringify(message));
+      return JSON.parse(message.result.content[0].text);
+    }
+    const description = await tool('describe_workflow', {name});
+    assert.equal(description.runnable, true);
+    assert.equal(description.inputs.number.required, true);
+    const result = await tool('run_workflow', {name, inputs: {number: 'MCP-42'}});
+    assert.equal(result.status, 'succeeded');
+    assert.deepEqual(result.outputs, {receipt: 'MCP-42'});
+    assert.deepEqual(await page.cdp.eval('orders'), ['MCP-42']);
   });

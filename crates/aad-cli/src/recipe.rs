@@ -131,16 +131,37 @@ fn compact(document: &Value) -> Result<String, String> {
 }
 
 pub fn export(args: &Export) -> Result<Value, String> {
-    let source = std::fs::read(&args.file).map_err(|err| err.to_string())?;
-    let document = serde_json::from_slice(&source).map_err(|err| err.to_string())?;
-    let yaml = compact(&document)?;
-    let mut output = std::fs::OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(&args.out)
+    let source = std::fs::read_to_string(&args.file).map_err(|err| err.to_string())?;
+    let recording = serde_json::from_str::<Value>(&source)
+        .ok()
+        .filter(|doc| doc["kind"] == "Recording");
+    let text = if let Some(recording) = recording {
+        compact(&recording)?
+    } else {
+        let raw = library::parse(&source)?;
+        let workflow = if raw.get("format").is_some() {
+            program::expand(raw, Some(&args.file))?
+        } else {
+            expand_legacy(raw)?
+        };
+        aad_runtime::recordings::ensure_no_secret_input(&workflow).map_err(|err| err.message)?;
+        let text = serde_json::to_string_pretty(&workflow).map_err(|err| err.to_string())? + "\n";
+        if text.len() > aad_core::compiler::MAX_DESCRIPTOR_BYTES {
+            return Err("compiled workflow exceeds 2 MiB".into());
+        }
+        text
+    };
+    let parent = args
+        .out
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let mut output = tempfile::NamedTempFile::new_in(parent).map_err(|err| err.to_string())?;
+    output
+        .write_all(text.as_bytes())
         .map_err(|err| err.to_string())?;
     output
-        .write_all(yaml.as_bytes())
-        .map_err(|err| err.to_string())?;
-    Ok(json!({"file":args.out,"lines":yaml.lines().count(),"bytes":yaml.len()}))
+        .persist_noclobber(&args.out)
+        .map_err(|err| err.error.to_string())?;
+    Ok(json!({"file":args.out,"lines":text.lines().count(),"bytes":text.len()}))
 }
