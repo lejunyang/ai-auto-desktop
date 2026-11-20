@@ -306,7 +306,7 @@ lists windows, applications and browser pages; control_observe returns an outlin
 target for each element; control_find resolves a locator to exactly one of them; \
 control_find_many locates several controls on the same observation. For data rather \
 than handles, control_read_fields returns named values in one call; control_read_table \
-returns requested columns of an observed Chromium HTML table. \
+returns requested columns of an observed Chromium HTML table. control_collect_table traverses pages or a virtual scroll container with a stable row key and reports completeness. \
 control_act performs a typed action on such a target. Targets prove the element was \
 observed. Observe again after any input, and check the result yourself: submission \
 is not success. An input interrupted by cancellation or disconnect has unknown \

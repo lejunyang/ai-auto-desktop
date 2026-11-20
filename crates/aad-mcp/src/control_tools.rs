@@ -388,6 +388,23 @@ the first one. To ask whether something has gone away, pass expect: optional and
             false,
         ),
         (
+            "control_collect_table",
+            "Collect an HTML table from the current page forward using a stable selected column as row_key. Pagination clicks the freshly observed Next control. Virtual scrolling starts at the top and needs expected_rows or aria-rowcount to confirm completeness. Inspect complete and stop_reason. Requires input permission.",
+            json!({
+                "resource_id":{"type":"string"},"table":crate::tools::locator_schema(),
+                "columns":{"type":"array","minItems":1,"maxItems":32,"uniqueItems":true,"items":{"type":"string","minLength":1,"maxLength":256}},
+                "row_key":{"type":"string"},"traversal":{"oneOf":[
+                    {"type":"object","properties":{"mode":{"const":"pagination"},"next":crate::tools::locator_schema()},"required":["mode","next"],"additionalProperties":false},
+                    {"type":"object","properties":{"mode":{"const":"virtual_scroll"},"container":crate::tools::locator_schema()},"required":["mode","container"],"additionalProperties":false}
+                ]},
+                "expected_rows":{"type":"integer","minimum":0,"description":"Expected number of unique data rows, excluding the header."},
+                "max_pages":{"type":"integer","minimum":1,"maximum":256,"default":64},
+                "max_rows":{"type":"integer","minimum":1,"maximum":10000,"default":10000}
+            }),
+            vec!["resource_id","table","columns","row_key","traversal"],
+            true,
+        ),
+        (
             "control_read_table",
             "Read named columns of an observed Chromium HTML table into records. Select a table target with one header row. Returns the rendered page only, with truncation reasons and null for missing cells.",
             json!({"target":target_schema(),"columns":{"type":"array","minItems":1,"maxItems":32,"uniqueItems":true,"items":{"type":"string","minLength":1,"maxLength":256}},
@@ -1041,6 +1058,22 @@ mod tests {
             json!(["desktop", "tablet", "mobile", "reset"])
         );
         assert_eq!(variant("clear_site_data")["required"], json!(["type"]));
+    }
+
+    #[test]
+    fn collecting_tables_requires_input_and_rejects_file_arguments() {
+        assert!(tool("control_collect_table").mutating);
+        let session = aad_control::Session::new(Vec::new(), Default::default());
+        let mut args = json!({"resource_id":"r","table":{"name":"Ledger"},
+            "columns":["ID"],"row_key":"ID","traversal":{"mode":"pagination","next":{"name":"Next"}}});
+        let request = prepare("control_collect_table", &args, &session).unwrap();
+        assert!(request.mutating());
+        assert_eq!(
+            session.execute(&request).error.unwrap()["code"],
+            "POLICY.DENIED"
+        );
+        args["output"] = json!("ledger.csv");
+        assert!(prepare("control_collect_table", &args, &session).is_err());
     }
 
     #[test]
