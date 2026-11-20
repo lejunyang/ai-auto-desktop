@@ -101,6 +101,13 @@ pub(crate) fn locator_schema() -> Value {
     })
 }
 
+pub(crate) fn fields_schema() -> Value {
+    json!({"type":"array", "minItems":1, "maxItems":aad_control::MAX_FIND_LOCATORS,
+        "items":{"type":"object","required":["as","locator","property"],"additionalProperties":false,
+            "properties":{"as":{"type":"string","pattern":"^[a-z][a-z0-9_]{0,63}$"}, "locator":locator_schema(),
+                "property":{"enum":["name","value","present","checked","enabled","selected"]}}}})
+}
+
 fn steps_schema(max_steps: usize) -> Value {
     json!({
         "type": "array",

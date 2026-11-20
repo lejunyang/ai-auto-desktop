@@ -388,6 +388,13 @@ the first one. To ask whether something has gone away, pass expect: optional and
             false,
         ),
         (
+            "control_read_fields",
+            "Read 1..32 named fields from one fresh observation. Returns only values keyed by alias. Use present to test existence; other properties require one matching element.",
+            json!({"resource_id":{"type":"string"},"fields":crate::tools::fields_schema()}),
+            vec!["resource_id", "fields"],
+            false,
+        ),
+        (
             "control_find_many",
             "Resolve 1..32 locators in order on one retained observation without refreshing it. Optional misses return found=false; an ambiguous or failing lookup stops the batch (zero-based locator_index). Targets are not a queue of future writes.",
             json!({

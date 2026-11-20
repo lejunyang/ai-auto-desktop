@@ -108,6 +108,44 @@ fn app(title: Option<&str>) -> App {
     }
 }
 
+#[test]
+fn reads_named_fields_in_a_read_only_session() {
+    let (_, backend) = session();
+    let session = Session::new(vec![backend], Policy::default());
+    let request = |op| session.execute(&Request::new(Some(session.id().into()), op));
+    request(Operation::Targets { provider: None });
+    let read = |fields: Value| {
+        request(
+            serde_json::from_value(json!({
+                "method":"read_fields","resource_id":"fixture:a","fields":fields
+            }))
+            .unwrap(),
+        )
+    };
+    let label = json!({"as":"label","locator":{"name":"Save"},"property":"name"});
+    let absent = json!({"as":"saved","locator":{"name":"Saved"},"property":"present"});
+    assert_eq!(
+        read(json!([label, absent])).data.unwrap(),
+        json!({"values":{"label":"Save","saved":false}})
+    );
+    for fields in [
+        json!([]),
+        json!([label, label]),
+        json!(vec![label.clone(); 33]),
+    ] {
+        assert_eq!(
+            read(fields).error.unwrap()["code"],
+            "CONTROL.INVALID_REQUEST"
+        );
+    }
+    assert_eq!(
+        read(json!([{"as":"price","locator":{"name":"Save"},"property":"value"}]))
+            .error
+            .unwrap()["code"],
+        "CONTROL.FIELD_UNAVAILABLE"
+    );
+}
+
 fn act(id: &str, title: Option<&str>, locator: Locator, action: Value) -> Step {
     Step {
         id: id.into(),

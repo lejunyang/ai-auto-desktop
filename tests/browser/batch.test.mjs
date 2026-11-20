@@ -39,6 +39,10 @@ test('typed batches re-observe after a write and stop on a missing element',
     const observation_id = await observe();
     const found = await tool('control_find_many',{observation_id,locators:[locator,{name:'Absent'}],expect:'optional'});
     assert.deepEqual(found.data.results.map(result=>result.found),[true,false]);
+    const fields = [{as:'button', locator, property:'name'},
+      {as:'missing',locator:{name:'Absent'},property:'present'}];
+    const projected = (await tool('control_read_fields',{resource_id,fields})).data;
+    assert.deepEqual(projected,{values:{button:'Add',missing:false}});
     const measure = async (label, action) => {
       const beforeCalls=calls, beforeBytes=bytes, start=performance.now();
       await action();

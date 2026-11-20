@@ -499,6 +499,10 @@ pub enum Operation {
         #[serde(default)]
         expect: Expect,
     },
+    ReadFields {
+        resource_id: String,
+        fields: Vec<crate::fields::ReadField>,
+    },
     Act {
         target: Target,
         action: Action,

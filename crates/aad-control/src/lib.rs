@@ -4,6 +4,7 @@
 pub mod browser;
 pub mod browser_access;
 pub mod browser_bidi;
+pub mod fields;
 pub mod launch;
 pub mod lease;
 pub mod model;
@@ -1212,6 +1213,11 @@ impl Session {
                 }
                 let observation = self.observation(observation_id)?;
                 self.find_in(observation_id, &observation, locator, *expect, context)
+            }
+            Operation::ReadFields { resource_id, fields } => {
+                fields::validate(fields)?;
+                let (id, observation) = self.observe_resource(resource_id, MAX_NODES, context)?;
+                fields::project(self, &id, &observation, fields, context)
             }
             Operation::FindMany { observation_id, locators, expect } => {
                 if !(1..=model::MAX_FIND_LOCATORS).contains(&locators.len()) || locators.iter().any(Locator::is_empty) {
