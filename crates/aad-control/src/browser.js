@@ -244,6 +244,14 @@
         if (scopeRoot && !inside(scopeRoot,found.el)) return {error:'CONTROL.STALE_TARGET'};
         root=found.el;
       }
+      let viewport=null;
+      if (args.container) {
+        const found=nodes.get(args.container);
+        if (!found || !visible(found.el) || fingerprint(found.el)!==found.fingerprint) return {error:'CONTROL.STALE_TARGET'};
+        if (!inside(found.el,root)) return {error:'CONTROL.TABLE_CONTAINER'};
+        const box=found.el===document.body ? document.scrollingElement : found.el;
+        viewport={offset:box.scrollTop, at_top:box.scrollTop<=1, at_bottom:box.scrollTop+box.clientHeight>=box.scrollHeight-1};
+      }
       const max=args.max_characters;
       const full=root ? (root.innerText||'') : '';
       const ids=new Map(); nodes.forEach((found,id)=>ids.set(found.el,id));
@@ -276,9 +284,9 @@
         }
         if(reasons.size)cut=true;
         tables.push({node_id:ids.get(table)||null,name:(table.getAttribute('aria-label')||(table.caption?table.caption.innerText:'')||'').trim().slice(0,256),
-          scope:'rendered_rows',simple_header:simpleHeader,row_count:rows.length,rows:shown,truncated:reasons.size>0,truncation_reasons:[...reasons]});
+          scope:'rendered_rows',simple_header:simpleHeader,declared_data_rows:Number.isSafeInteger(declared)&&declared>0?declared-1:null,row_count:rows.length,rows:shown,truncated:reasons.size>0,truncation_reasons:[...reasons]});
       }
-      return {text:full.slice(0,max),characters:full.length,text_truncated:full.length>max,tables,table_count:all.length,tables_truncated:cut||all.length>tables.length};
+      return {viewport,text:full.slice(0,max),characters:full.length,text_truncated:full.length>max,tables,table_count:all.length,tables_truncated:cut||all.length>tables.length};
     },
     act: args => {
       const found=check(args); if(found.error) return found;

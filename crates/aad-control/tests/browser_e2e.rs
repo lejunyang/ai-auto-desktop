@@ -19,6 +19,8 @@ use std::time::{Duration, Instant};
 
 #[path = "browser_cases/access.rs"]
 mod access_cases;
+#[path = "browser_cases/table.rs"]
+mod table_cases;
 #[path = "browser_cases/inflight.rs"]
 mod inflight_cases;
 

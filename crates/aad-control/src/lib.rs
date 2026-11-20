@@ -13,6 +13,7 @@ pub mod qr;
 pub mod recording;
 pub mod secrets;
 pub mod steps;
+pub mod table;
 pub mod transport;
 pub use model::*;
 pub use secrets::{valid_secret_ref, SecretBindings};
@@ -215,6 +216,16 @@ pub trait Backend: Send + Sync {
     /// outline; a provider answers with `nodes` keyed by `node_id`, or `regions`.
     fn view(&self, _snapshot: &Value, _view: &View, _timeout: Duration) -> Result<Option<Value>> {
         Ok(None)
+    }
+    /// Read one observed HTML table and, if supplied, its enclosing scroll viewport.
+    fn table_content(
+        &self,
+        _snapshot: &Value,
+        _table_id: &str,
+        _container_id: Option<&str>,
+        _timeout: Duration,
+    ) -> Result<Value> {
+        Err(error("CONTROL.ACTION_UNSUPPORTED", "table traversal requires Chromium"))
     }
     /// Resolve a locator inside a retained snapshot, answering
     /// `{"found", "node_id", "match_count"}`. `None` uses the portable exact matcher.
@@ -1214,6 +1225,8 @@ impl Session {
                 let observation = self.observation(observation_id)?;
                 self.find_in(observation_id, &observation, locator, *expect, context)
             }
+            Operation::CollectTable {resource_id, spec} => self.collect_table(resource_id, spec, context)
+                .map_err(|failure| if context.phase.load(Ordering::SeqCst) == 1 && failure.effect == "not_applied" { failure.with_effect("unknown") } else { failure }),
             Operation::ReadTable { target, columns, max_characters } => self.read_table(target, columns, *max_characters, context),
             Operation::ReadFields { resource_id, fields } => {
                 fields::validate(fields)?;
@@ -1935,17 +1948,7 @@ impl Session {
         budget: Option<usize>,
         context: &Context,
     ) -> Result<Value> {
-        if !(1..=32).contains(&columns.len())
-            || columns
-                .iter()
-                .any(|column| column.trim().is_empty() || column.len() > 256)
-            || columns.iter().collect::<BTreeSet<_>>().len() != columns.len()
-        {
-            return Err(error(
-                "CONTROL.INVALID_REQUEST",
-                "choose 1..32 distinct column names",
-            ));
-        }
+        table::validate_columns(columns)?;
         let view = View {
             mode: ViewMode::Text,
             max_characters: budget,
@@ -1978,59 +1981,8 @@ impl Session {
                     "the provider cannot read this table",
                 )
             })?;
-        let table = &content["tables"][0];
-        if table["node_id"] != root["node_id"] || table["simple_header"] != true {
-            return Err(error(
-                "CONTROL.TABLE_HEADER",
-                "expected a table with one visible header row and no spanning cells",
-            ));
-        }
-        let rows = table["rows"]
-            .as_array()
-            .ok_or_else(|| error("CONTROL.BAD_PROVIDER_OUTPUT", "missing table rows"))?;
-        let header = rows
-            .first()
-            .and_then(Value::as_array)
-            .ok_or_else(|| error("CONTROL.TABLE_HEADER", "missing table headers"))?;
-        let mut indexes = Vec::new();
-        for column in columns {
-            let matches: Vec<_> = header
-                .iter()
-                .enumerate()
-                .filter(|(_, cell)| cell.as_str() == Some(column))
-                .collect();
-            if matches.len() != 1 {
-                return Err(error(
-                    "CONTROL.TABLE_HEADER",
-                    format!(
-                        "column {column:?} occurs {} times in the returned header",
-                        matches.len()
-                    ),
-                ));
-            }
-            indexes.push(matches[0].0);
-        }
-        let records: Vec<_> = rows
-            .iter()
-            .skip(1)
-            .map(|row| {
-                columns
-                    .iter()
-                    .zip(&indexes)
-                    .map(|(name, index)| {
-                        (
-                            name.clone(),
-                            row.get(*index).cloned().unwrap_or(Value::Null),
-                        )
-                    })
-                    .collect::<serde_json::Map<_, _>>()
-            })
-            .collect();
         context.remaining()?;
-        Ok(
-            json!({"scope":"rendered_rows","records":records,"visible_data_rows":table["row_count"].as_u64().unwrap_or(0).saturating_sub(1),
-            "truncated":table["truncated"],"truncation_reasons":table["truncation_reasons"]}),
-        )
+        table::project(&content, &root["node_id"], columns)
     }
 
     /// Resolve a locator inside one retained observation.

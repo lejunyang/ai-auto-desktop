@@ -2057,6 +2057,21 @@ impl Backend for BrowserBackend {
         }
         self.text(snapshot, view, timeout).map(Some)
     }
+    fn table_content(
+        &self,
+        snapshot: &Value,
+        table_id: &str,
+        container_id: Option<&str>,
+        timeout: Duration,
+    ) -> Result<Value> {
+        self.text_at(
+            snapshot,
+            json!(table_id),
+            container_id,
+            crate::MAX_OUTLINE_CHARACTERS,
+            timeout,
+        )
+    }
     fn find(
         &self,
         snapshot: &Value,
@@ -2728,9 +2743,6 @@ impl BrowserBackend {
 impl BrowserBackend {
     /// The observed page's or region's visible text, with its tables as rows.
     fn text(&self, snapshot: &Value, view: &crate::View, timeout: Duration) -> Result<Value> {
-        let meta = &snapshot["metadata"];
-        let page_id = meta["page_id"].as_str().unwrap_or_default();
-        let frame_id = meta["frame_id"].as_str().unwrap_or_default();
         let nodes = snapshot["nodes"]
             .as_array()
             .map(Vec::as_slice)
@@ -2757,6 +2769,24 @@ impl BrowserBackend {
         let max = view
             .max_characters
             .unwrap_or(crate::DEFAULT_OUTLINE_CHARACTERS);
+        let mut answer = self.text_at(snapshot, region, None, max, timeout)?;
+        if let Some(region) = &view.region {
+            answer["region"] = json!(region);
+        }
+        Ok(answer)
+    }
+
+    fn text_at(
+        &self,
+        snapshot: &Value,
+        node: Value,
+        container: Option<&str>,
+        max: usize,
+        timeout: Duration,
+    ) -> Result<Value> {
+        let meta = &snapshot["metadata"];
+        let page_id = meta["page_id"].as_str().unwrap_or_default();
+        let frame_id = meta["frame_id"].as_str().unwrap_or_default();
         self.with_page_state(page_id, timeout, |page| {
             if let Some(dialog) = &page.dialog {
                 return Err(dialog_open(dialog));
@@ -2770,16 +2800,12 @@ impl BrowserBackend {
                 meta["context_id"].as_i64().unwrap_or_default(),
             );
             let args = json!({"document_token": snapshot["document_token"],
-                "observation": snapshot["snapshot_id"], "node_id": region, "max_characters": max});
-            let mut answer = checked(eval(
+                "observation": snapshot["snapshot_id"], "node_id": node, "container":container, "max_characters": max});
+            checked(eval(
                 &mut page.client,
                 &context,
                 format!("globalThis.__aadControlV1.text({args})"),
-            )?)?;
-            if let Some(region) = &view.region {
-                answer["region"] = json!(region);
-            }
-            Ok(answer)
+            )?)
         })
     }
 }

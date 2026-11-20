@@ -503,6 +503,11 @@ pub enum Operation {
         resource_id: String,
         fields: Vec<crate::fields::ReadField>,
     },
+    CollectTable {
+        resource_id: String,
+        #[serde(flatten)]
+        spec: Box<crate::table::Collection>,
+    },
     ReadTable {
         target: Target,
         columns: Vec<String>,
@@ -618,7 +623,10 @@ impl Request {
     pub fn mutating(&self) -> bool {
         matches!(
             self.operation,
-            Operation::Act { .. } | Operation::Launch { .. } | Operation::GlobalKey { .. }
+            Operation::Act { .. }
+                | Operation::CollectTable { .. }
+                | Operation::Launch { .. }
+                | Operation::GlobalKey { .. }
         )
     }
 }
