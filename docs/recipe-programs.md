@@ -89,3 +89,16 @@ outputs: {entered: "${{ entered }}"}
 `file` 相对当前调用文件解析，嵌套调用也遵循这个规则。规范化后的文件必须在主程序的目录树内。版本采用精确的 `MAJOR.MINOR.PATCH` 发布号，显式匹配 `name` 和 `version`。发布者如需区分文件内容，应随改动更新版本并保留旧版文件；版本号本身没有内容哈希。一次编译只读取同一子文件一次。
 
 校验会展开所有调用，包括未进入的分支，检查版本、实参、返回值映射、循环调用和重复键。子程序与主程序共同使用步骤数、深度和执行预算。单份源码上限为 2 MiB，所有子文件按调用位置展开后的源码总量也以 2 MiB 为限。
+
+## 将审核过的程序交给 MCP
+
+在本机检查 Recipe 及其引用的子文件后，用 `aad recipe` 导出完整的 Workflow JSON。导出时展开调用、校验分支并固化版本和步骤；后续编辑源文件不影响已经发布的副本。输出文件必须是新文件。浏览可运行列表时，MCP 以文件名中 `.workflow.json` 之前的部分作为名称。
+
+```powershell
+$store = (aad workflows | ConvertFrom-Json).directory
+New-Item -ItemType Directory -Force $store | Out-Null
+aad validate ./program.yaml
+aad recipe ./program.yaml --out (Join-Path $store 'submit-orders-v1.workflow.json')
+```
+
+让 MCP 服务器使用相同的保存目录，执行页面操作时按现有流程开启 `--allow-input`。agent 先调用 `describe_workflow({"name":"submit-orders-v1"})` 查看输入和计划摘要，再通过 `run_workflow({"name":"submit-orders-v1","inputs":{"orders":[{"number":"ORD-1","selected":true}]}})` 执行。使用 `AAD_RECORDINGS_DIR` 可以为特定服务器设置独立目录。
