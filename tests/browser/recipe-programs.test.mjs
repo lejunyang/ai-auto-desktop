@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import {execFile} from 'node:child_process';
-import {writeFile} from 'node:fs/promises';
+import {mkdir, writeFile} from 'node:fs/promises';
 import {join, resolve} from 'node:path';
 import {test} from 'node:test';
 import {promisify} from 'node:util';
@@ -72,4 +72,70 @@ test('recipe loops, branches and lexical bindings drive an isolated order form',
     await writeFile(file, JSON.stringify(program));
     await assert.rejects(run, error => error.stdout.includes('LOOP.MAX_ITERATIONS_EXCEEDED'));
     assert.deepEqual(await page.cdp.eval('orders'), expected.concat('limit','limit'));
+  });
+
+test('version-pinned nested subrecipes isolate arguments, reads and return slots on every call',
+  {skip: !process.env.AAD_TEST_CHROME, timeout: 60000}, async context => {
+    const page = await ordersPage(context);
+    const file = join(page.root, 'orders.yaml');
+    const directory = join(page.root, 'library');
+    await mkdir(directory);
+    const pin = (file, name) => ({file, name, version: '1.2.0'});
+    const innerPin = pin('submit.json', 'submit');
+    const outerPin = pin('library/pair.yaml', 'pair');
+    const inner = {
+      kind: 'Subrecipe', format: 'recipe/2', name: 'submit', version: '1.2.0', parameters: ['order'],
+      phases: [{app: page.app, steps: [fill('${{ order }}'), save,
+        {id: 'receipt', read: [{as: 'actual', locator: {name: 'Order'}, property: 'value'}]}]}],
+      results: {number: '${{ receipt.values.actual }}'},
+    };
+    await writeFile(join(directory, innerPin.file), JSON.stringify(inner));
+    const outer = {
+      kind: 'Subrecipe', format: 'recipe/2', name: 'pair', version: '1.2.0', parameters: ['order'],
+      phases: [{app: page.app, steps: [
+        {call: innerPin, with: {order: '${{ order }}'}, save: {number: 'receipt'}},
+        {call: innerPin, with: {order: '${{ receipt }}-copy'}, save: {number: 'copy'}},
+      ]}], results: {pair: ['${{ receipt }}', '${{ copy }}']},
+    };
+    await writeFile(join(page.root, outerPin.file), JSON.stringify(outer));
+    const call = {call: outerPin, with: {order: '${{ order }}'}, save: {pair: 'last'}};
+    const root = {
+      kind: 'Recipe', format: 'recipe/2', name: 'caller',
+      phases: [{app: page.app, steps: [
+        {set: {last: [], receipt: 'caller', order: 'outside', pairs: []}},
+        {foreach: "${{ ['A','B','C'] }}", as: 'order', max_items: 3, steps: [
+          call, {set: {pairs: '${{ pairs + [last] }}'}},
+        ]},
+      ]}], outputs: {pairs: '${{ pairs }}', receipt: '${{ receipt }}', order: '${{ order }}'},
+    };
+    await writeFile(file, JSON.stringify(root));
+    await page.command('validate', file);
+    const run = () => page.command('run', file, ...permissions);
+    const result = await run();
+    const pairs = ['A','B','C'].map(order => [order, order + '-copy']);
+    assert.deepEqual(result.outputs, {pairs, receipt: 'caller', order: 'outside'});
+    assert.deepEqual(await page.cdp.eval('orders'), pairs.flat());
+
+    // Each mutation is behind a prior click and inside an untaken branch.
+    root.outputs = {};
+    const invoke = {call: outerPin, with: {order: 'X'}};
+    const invalid = async (statement, pattern) => {
+      root.phases[0].steps = [save, {if: '${{ False }}', then: [statement]}];
+      await writeFile(file, JSON.stringify(root));
+      await assert.rejects(run, error => error.stdout.includes('CLI.RECIPE_INVALID') && pattern.test(error.stdout));
+      assert.deepEqual(await page.cdp.eval('orders'), pairs.flat());
+    };
+    await invalid({...invoke, call: {...outerPin, version: '1.3.0'}}, /version 1.3.0/);
+    await invalid({...invoke, call: {...outerPin, name: 'other'}}, /named other/);
+    await invalid({...invoke, with: {}}, /arguments/);
+    await invalid({...invoke, with: {order: 'X', extra: 1}}, /arguments/);
+    await invalid({...invoke, save: {missing: 'capture'}}, /unknown subrecipe result/);
+    outer.results = {bad: '${{ last }}'};
+    await writeFile(join(page.root, outerPin.file), JSON.stringify(outer));
+    await invalid(invoke, /unknown recipe name last/);
+    outer.phases[0].steps = [{call: pin('pair.yaml', 'pair'), with: {order: 'X'}}];
+    await writeFile(join(page.root, outerPin.file), JSON.stringify(outer));
+    await invalid(invoke, /recursive subrecipe/);
+    await writeFile(join(page.root, outerPin.file), '{"kind":"Subrecipe","kind":"Recipe"}');
+    await invalid(invoke, /duplicate/);
   });

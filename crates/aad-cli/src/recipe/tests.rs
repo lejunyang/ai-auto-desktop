@@ -1,5 +1,12 @@
-use super::expand;
 use serde_json::{json, Value};
+
+fn expand(raw: Value) -> Result<Value, String> {
+    if raw.get("format").is_some() {
+        super::program::expand(raw, None)
+    } else {
+        super::expand_legacy(raw)
+    }
+}
 
 fn program(steps: Value) -> Value {
     json!({"kind":"Recipe","format":"recipe/2","name":"test","phases":[{"app":{"provider":"browser.cdp"},"steps":steps}]})

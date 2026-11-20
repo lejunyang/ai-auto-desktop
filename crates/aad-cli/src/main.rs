@@ -1134,7 +1134,7 @@ fn read_descriptor(path: &Path) -> Result<Value, Value> {
     // descriptor: missing one of them silently restores the old behaviour, which
     // is exactly what happened when this lived in `validate` alone.
     if document["kind"] == "Recipe" {
-        return recipe::expand(document)
+        return recipe::load(document, text, path)
             .map_err(|message| failure("CLI.RECIPE_INVALID", &message, None));
     }
     if let Some(problem) = mistaken_for_a_workflow(&document) {

@@ -5,8 +5,9 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
+mod library;
 mod program;
 mod scope;
 #[cfg(test)]
@@ -29,7 +30,7 @@ struct Recipe {
     phases: Vec<Phase>,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Phase {
     app: App,
@@ -42,10 +43,14 @@ fn compile(name: &str, steps: &[Step]) -> Result<Value, String> {
     Ok(workflow)
 }
 
-pub fn expand(raw: Value) -> Result<Value, String> {
+pub fn load(raw: Value, text: &str, source: &Path) -> Result<Value, String> {
     if raw.get("format").is_some() {
-        return program::expand(raw);
+        return program::expand(library::parse(text)?, Some(source));
     }
+    expand_legacy(raw)
+}
+
+fn expand_legacy(raw: Value) -> Result<Value, String> {
     let recipe: Recipe = serde_json::from_value(raw).map_err(|err| err.to_string())?;
     if recipe.kind != "Recipe" || recipe.phases.is_empty() {
         return Err("expected a Recipe with at least one phase".into());
@@ -119,7 +124,7 @@ fn compact(document: &Value) -> Result<String, String> {
         json!(name),
         json!(targets)
     );
-    if expand(serde_yaml::from_str(&yaml).map_err(|err| err.to_string())?)? != original {
+    if expand_legacy(serde_yaml::from_str(&yaml).map_err(|err| err.to_string())?)? != original {
         return Err("recipe round-trip changed the workflow".into());
     }
     Ok(yaml)

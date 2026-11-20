@@ -1,3 +1,4 @@
+use super::library::{Call, Library};
 use super::scope::{identifier, Scope};
 use super::{resolve_targets, App, Locator, Phase, Step};
 use aad_control::steps;
@@ -70,6 +71,7 @@ fn decode<T: DeserializeOwned>(raw: Value) -> Result<T> {
 
 #[derive(Default)]
 struct Compiler {
+    library: Library,
     nodes: usize,
     executions: u64,
     variables: Map<String, Value>,
@@ -85,12 +87,15 @@ struct Context<'a> {
     visits: u64,
 }
 
-pub(super) fn expand(raw: Value) -> Result<Value> {
+pub(super) fn expand(raw: Value, source: Option<&std::path::Path>) -> Result<Value> {
     let program: Program = decode(raw)?;
     if program.format != FORMAT || program.kind != "Recipe" {
         return Err(format!("expected kind Recipe and format {FORMAT}"));
     }
-    let mut compiler = Compiler::default();
+    let mut compiler = Compiler {
+        library: Library::new(source)?,
+        ..Default::default()
+    };
     let mut scope = Scope::default();
     let mut inputs = Map::new();
     for name in program.inputs {
@@ -222,6 +227,9 @@ impl Compiler {
             depth: ctx.depth + 1,
             ..ctx
         };
+        if raw.get("call").is_some() {
+            return self.call(decode(raw)?, id, scope, child);
+        }
         if raw.get("if").is_some() {
             let mut branch: Branch = decode(raw)?;
             scope.resolve(&mut branch.condition)?;
@@ -309,6 +317,70 @@ impl Compiler {
             scope.bind(name, format!("steps.{id}.output"), false)?;
         }
         Ok(doc["steps"][0].take())
+    }
+
+    fn call(&mut self, call: Call, id: &str, caller: &mut Scope, ctx: Context) -> Result<Value> {
+        let spec = self.library.enter(&call.call)?;
+        let params: BTreeSet<_> = spec.parameters.iter().collect();
+        if params.len() != spec.parameters.len() || params != call.with.keys().collect() {
+            return Err(format!(
+                "call arguments must match parameters {:?}",
+                spec.parameters
+            ));
+        }
+        let mut local = Scope::default();
+        let mut args = Map::new();
+        for (name, mut value) in call.with {
+            caller.resolve(&mut value)?;
+            let slot = self.slot();
+            local.bind(&name, slot.clone(), false)?;
+            args.insert(slot, value);
+        }
+        let mut body = Vec::new();
+        if !args.is_empty() {
+            let begin = self.id(Some("arguments"), ctx.visits)?;
+            body.push(json!({"id":begin,"type":"set","assign":args}));
+        }
+        body.extend(self.phases(
+            spec.phases.clone(),
+            &spec.targets,
+            &mut local,
+            ctx.depth,
+            ctx.visits,
+        )?);
+        let mut results = Map::new();
+        let mut destinations = BTreeSet::new();
+        for (key, name) in &call.save {
+            if !spec.results.contains_key(key) {
+                return Err(format!("unknown subrecipe result {key}"));
+            }
+            if !destinations.insert(name) {
+                return Err(format!("duplicate result destination {name}"));
+            }
+        }
+        for (key, mut value) in spec.results.clone() {
+            identifier(&key)?;
+            local.resolve(&mut value)?;
+            let slot = if let Some(name) = call.save.get(&key) {
+                match caller.assignment(name)? {
+                    Some(bound) => bound.to_owned(),
+                    None => {
+                        let slot = self.slot();
+                        caller.bind(name, slot.clone(), false)?;
+                        slot
+                    }
+                }
+            } else {
+                self.slot()
+            };
+            results.insert(slot, value);
+        }
+        if !results.is_empty() {
+            let end = self.id(Some("results"), ctx.visits)?;
+            body.push(json!({"id":end,"type":"set","assign":results}));
+        }
+        self.library.leave();
+        Ok(json!({"id":id,"type":"block","steps":body}))
     }
 }
 
