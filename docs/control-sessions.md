@@ -447,7 +447,13 @@ aad mcp --allow-input --allow-upload-dir D:\to-upload  # 浏览器 upload 只能
 
 MCP 工具为 `control_capabilities`, `control_targets`, `control_observe`, `control_find`, `control_find_many`,
 `control_wait`, `control_act`, `control_capture`, `control_read_text`, `control_cancel`, `control_close`，
-授权时另有 `desktop_launch`、`clipboard_read`、`control_global_key`；本机未限定授权时另有 `probe_environment`、四个工作流工具和浏览器工具（含只读的 `browser_downloads`、`browser_storage`、`browser_network`）。
+授权时另有 `desktop_launch`、`clipboard_read`、`control_global_key`；本机未限定授权时另有 `probe_environment`、工作流工具和浏览器工具（含只读的 `browser_downloads`、`browser_storage`、`browser_network`）。
+
+一次性确定流程用 MCP `run_steps`：与 `save_workflow` 相同的步骤和 `run_workflow` 相同的 `inputs`，但不取名字、不读写录制库。仅供本机、未限定 provider/resource 且 `--allow-input` 的连接执行；最多 32 步，整体执行预算 30 秒。每步重新选应用、观察、定位，不能把第一步的句柄交给第二步。失败即停；已执行的步骤不回滚，取消是协作式的（不撤销已提交输入）。适合在最后放一个能证明业务结果的 `check`，而不是把“按钮点过”视为成功。例如请求参数：
+
+```json
+{"steps":[{"app":{"provider":"browser.cdp","title":"批处理示例"},"locator":{"role":"button","name":"添加"},"action":{"type":"click"}},{"app":{"provider":"browser.cdp","title":"批处理示例"},"locator":{"name":"已添加"},"check":{"present":true,"within_ms":3000}}]}
+```
 每次调用可带 `request_id` 与 `timeout_ms`。`control_cancel` 的被取消请求字段名为 `target_request_id`；
 MCP 服务一次只处理一个调用，后面的排队；MCP cancellation notification 能取消正在执行的统一操作，排队中的调用被取消后不再执行，直接返回 `CONTROL.CANCELLED`（`not_applied`）。错误响应带 `hint`，说明可行的恢复方式。
 原先按动作拆开的 Windows MCP 工具（`list_apps`、`describe_window`、`find_element`、`invoke` 等）已移除，

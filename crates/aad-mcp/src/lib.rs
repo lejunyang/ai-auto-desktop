@@ -33,6 +33,7 @@ const LOCAL_TOOLS: &[&str] = &[
     "describe_workflow",
     "save_workflow",
     "run_workflow",
+    "run_steps",
 ];
 
 /// Handles MCP requests against one control session.
@@ -183,7 +184,12 @@ impl Server {
     /// Start answering a call, unless it was cancelled while it waited. A
     /// control call becomes the current one, which a cancellation reaches
     /// through the session.
-    fn start(&self, rpc_id: Option<&Value>, control_request: Option<&str>) -> bool {
+    fn start(
+        &self,
+        rpc_id: Option<&Value>,
+        control_request: Option<&str>,
+        batch: Option<&aad_runtime::CancellationToken>,
+    ) -> bool {
         let Some(id) = rpc_id else {
             return true;
         };
@@ -193,7 +199,10 @@ impl Server {
             return false;
         }
         if let Some(request_id) = control_request {
-            calls.current = Some((key, request_id.to_string()));
+            calls.current = Some((key.clone(), request_id.to_string()));
+        }
+        if let Some(token) = batch {
+            calls.batch = Some((key, token.clone()));
         }
         true
     }
@@ -205,6 +214,12 @@ impl Server {
             if let Some(cancelled) = calls.waiting.get_mut(&key) {
                 *cancelled = true;
                 return;
+            }
+            if let Some((at, token)) = &calls.batch {
+                if *at == key {
+                    token.cancel();
+                    return;
+                }
             }
             match &calls.current {
                 Some((at, request_id)) if *at == key => request_id.clone(),
@@ -289,7 +304,8 @@ effect; never retry it automatically.",
             instructions.push_str(
                 "\n\nFor work that has been recorded before, prefer a saved workflow: \
 list_workflows shows what exists, describe_workflow reports the inputs it takes without \
-running it, and run_workflow runs it. That is more reliable than rebuilding the same \
+running it, and run_workflow runs it. For a known one-off sequence, run_steps executes \
+typed steps in one call, without saving them. That is more reliable than rebuilding the same \
 sequence of actions each time. A long workflow can run with durable: true, which \
 journals it so it survives this server exiting; follow it with workflow_run_status and \
 workflow_run_events, and stop or continue it with workflow_run_pause, \
@@ -351,7 +367,7 @@ notifications/cancelled to request cancellation of an in-flight JSON-RPC request
         if control_tools::method(name).is_some() {
             let request = control_tools::prepare(name, &arguments, self.control.as_ref())
                 .map_err(|e| (protocol::INVALID_PARAMS, e))?;
-            if !self.start(rpc_id, Some(&request.request_id)) {
+            if !self.start(rpc_id, Some(&request.request_id), None) {
                 return Ok(content(
                     &control_tools::payload(self.not_started(&request)),
                     true,
@@ -375,10 +391,12 @@ notifications/cancelled to request cancellation of an in-flight JSON-RPC request
             .local
             .as_ref()
             .expect("local tools need a local session");
-        if !self.start(rpc_id, None) {
+        let batch =
+            (name == "run_steps" && self.allows_input()).then(aad_runtime::CancellationToken::new);
+        if !self.start(rpc_id, None, batch.as_ref()) {
             return Ok(content(&cancelled_before_start(), true));
         }
-        let writes = matches!(name, "save_workflow" | "run_workflow")
+        let writes = matches!(name, "save_workflow" | "run_workflow" | "run_steps")
             || durable_tools::MUTATING.contains(&name)
             || (browser_tools::NAMES.contains(&name) && !browser_tools::READ_ONLY.contains(&name));
         if writes && !self.allows_input() {
@@ -391,6 +409,14 @@ notifications/cancelled to request cancellation of an in-flight JSON-RPC request
                 }),
                 true,
             ));
+        }
+        if let Some(token) = batch {
+            let result = tools::run_inline(session, &arguments, &token);
+            self.calls.lock().unwrap().batch = None;
+            return Ok(match result {
+                Ok(payload) => content(&payload, payload["status"] != "succeeded"),
+                Err(payload) => content(&parse_payload(&payload), true),
+            });
         }
         if browser_tools::NAMES.contains(&name) {
             let id =
@@ -459,6 +485,7 @@ notifications/cancelled to request cancellation of an in-flight JSON-RPC request
 /// What a `notifications/cancelled` can reach.
 #[derive(Default)]
 struct Calls {
+    batch: Option<(String, aad_runtime::CancellationToken)>,
     /// JSON-RPC ids read ahead and not started yet, with whether a
     /// cancellation arrived while they waited.
     waiting: std::collections::HashMap<String, bool>,
@@ -772,6 +799,7 @@ mod tests {
         let server = Server::without_driver("no desktop");
         for (name, arguments) in [
             ("run_workflow", json!({"name": "anything"})),
+            ("run_steps", json!({"steps": []})),
             ("save_workflow", json!({"name": "anything", "steps": []})),
         ] {
             let response = server

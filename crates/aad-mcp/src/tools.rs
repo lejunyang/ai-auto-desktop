@@ -101,6 +101,98 @@ pub(crate) fn locator_schema() -> Value {
     })
 }
 
+fn steps_schema(max_steps: usize) -> Value {
+    json!({
+        "type": "array",
+        "minItems": 1,
+        "maxItems": max_steps,
+        "description": "The actions in the order they were performed.",
+        "items": {
+            "type": "object",
+            "description": "One action on an element, or one check. \
+    Give exactly one of action and check.",
+            "properties": {
+                "id": {
+                    "type": "string",
+                    "pattern": "^[A-Za-z0-9_-]{1,64}$",
+                    "description": "Optional. Steps are numbered s1, \
+    s2, ... when left out."
+                },
+                "app": {
+                    "type": "object",
+                    "description": "Which application or page, as \
+    control_targets lists it. Every field given must match, and exactly one target \
+    may match when it runs. Not a resource_id or window id: ids are assigned per \
+    session, so a workflow using one works once and then fails.",
+                    "properties": {
+                        "provider": {
+                            "type": "string",
+                            "description": "The target's provider, \
+    e.g. desktop.windows_uia or browser.cdp."
+                        },
+                        "process": {
+                            "type": "string",
+                            "description": "Process, application or \
+    bundle name, compared case-insensitively."
+                        },
+                        "title": {
+                            "type": "string",
+                            "description": "Text the window title \
+    contains. Choose a part that does not change as the application is used -- \
+    many titles carry the open document or a status that varies."
+                        },
+                        "url": {
+                            "type": "string",
+                            "description": "What a page's address \
+    starts with."
+                        }
+                    },
+                    "minProperties": 1,
+                    "additionalProperties": false
+                },
+                "locator": locator_schema(),
+                "action": crate::control_tools::saved_action_schema(),
+                "to": locator_schema(),
+                "check": {
+                    "type": "object",
+                    "description": "Instead of an action: wait until \
+    the element is there (present true) or gone (present false).",
+                    "properties": {
+                        "present": {"type": "boolean"},
+                        "within_ms": {
+                            "type": "integer", "minimum": 1, "maximum": 30000,
+                            "description": "How long to wait. Defaults \
+    to 5000."
+                        }
+                    },
+                    "required": ["present"],
+                    "additionalProperties": false
+                },
+                "input": {
+                    "type": "object",
+                    "description": "For fill and type_text: take the \
+    text from this workflow input when it runs instead of storing it. Use it for a \
+    credential or anything else that must not be written down; the text in the \
+    action is then dropped, and whoever runs the workflow supplies it.",
+                    "properties": {
+                        "name": {"type": "string", "pattern": "^[A-Za-z0-9_-]{1,64}$"},
+                        "sensitive": {
+                            "type": "boolean",
+                            "description": "True for a password or \
+    other secret, so it is never echoed."
+                        }
+                    },
+                    "required": ["name"],
+                    "additionalProperties": false
+                },
+                "note": {"type": "string", "maxLength": 500}
+            },
+            "required": ["app", "locator"],
+            "additionalProperties": false
+        }
+    })
+}
+
 /// Every tool this server publishes.
 pub fn catalogue() -> Vec<Tool> {
     let mut tools = vec![
@@ -111,6 +203,14 @@ pub fn catalogue() -> Vec<Tool> {
 what limits apply, such as a remote session or a non-elevated process.",
             schema: json!({"type": "object", "properties": {}, "additionalProperties": false}),
             mutating: false,
+        },
+        Tool {
+            name: "run_steps",
+            description: "Run a short sequence of typed actions and checks without saving a workflow. Each step re-observes and locates its own target. A failure stops the sequence but does not roll back earlier actions. Inspect the per-step outcomes before deciding what to do next.",
+            schema: json!({"type":"object", "properties":{
+                "steps":steps_schema(MAX_INLINE_STEPS), "inputs":{"type":"object"}
+            }, "required":["steps"], "additionalProperties":false}),
+            mutating: true,
         },
         Tool {
             name: "save_workflow",
@@ -135,95 +235,7 @@ written: a workflow that saves is a workflow that runs.",
             lower-case letters, digits and . _ -. run_workflow and describe_workflow take \
             this name."
                     },
-                    "steps": {
-                        "type": "array",
-                        "minItems": 1,
-                        "maxItems": 500,
-                        "description": "The actions in the order they were performed.",
-                        "items": {
-                            "type": "object",
-                            "description": "One action on an element, or one check. \
-            Give exactly one of action and check.",
-                            "properties": {
-                                "id": {
-                                    "type": "string",
-                                    "pattern": "^[A-Za-z0-9_-]{1,64}$",
-                                    "description": "Optional. Steps are numbered s1, \
-            s2, ... when left out."
-                                },
-                                "app": {
-                                    "type": "object",
-                                    "description": "Which application or page, as \
-            control_targets lists it. Every field given must match, and exactly one target \
-            may match when it runs. Not a resource_id or window id: ids are assigned per \
-            session, so a workflow using one works once and then fails.",
-                                    "properties": {
-                                        "provider": {
-                                            "type": "string",
-                                            "description": "The target's provider, \
-            e.g. desktop.windows_uia or browser.cdp."
-                                        },
-                                        "process": {
-                                            "type": "string",
-                                            "description": "Process, application or \
-            bundle name, compared case-insensitively."
-                                        },
-                                        "title": {
-                                            "type": "string",
-                                            "description": "Text the window title \
-            contains. Choose a part that does not change as the application is used -- \
-            many titles carry the open document or a status that varies."
-                                        },
-                                        "url": {
-                                            "type": "string",
-                                            "description": "What a page's address \
-            starts with."
-                                        }
-                                    },
-                                    "minProperties": 1,
-                                    "additionalProperties": false
-                                },
-                                "locator": locator_schema(),
-                                "action": crate::control_tools::saved_action_schema(),
-                                "to": locator_schema(),
-                                "check": {
-                                    "type": "object",
-                                    "description": "Instead of an action: wait until \
-            the element is there (present true) or gone (present false).",
-                                    "properties": {
-                                        "present": {"type": "boolean"},
-                                        "within_ms": {
-                                            "type": "integer", "minimum": 1, "maximum": 30000,
-                                            "description": "How long to wait. Defaults \
-            to 5000."
-                                        }
-                                    },
-                                    "required": ["present"],
-                                    "additionalProperties": false
-                                },
-                                "input": {
-                                    "type": "object",
-                                    "description": "For fill and type_text: take the \
-            text from this workflow input when it runs instead of storing it. Use it for a \
-            credential or anything else that must not be written down; the text in the \
-            action is then dropped, and whoever runs the workflow supplies it.",
-                                    "properties": {
-                                        "name": {"type": "string", "pattern": "^[A-Za-z0-9_-]{1,64}$"},
-                                        "sensitive": {
-                                            "type": "boolean",
-                                            "description": "True for a password or \
-            other secret, so it is never echoed."
-                                        }
-                                    },
-                                    "required": ["name"],
-                                    "additionalProperties": false
-                                },
-                                "note": {"type": "string", "maxLength": 500}
-                            },
-                            "required": ["app", "locator"],
-                            "additionalProperties": false
-                        }
-                    },
+                    "steps": steps_schema(500),
                     "overwrite": {
                         "type": "boolean",
                         "description": "Replace an existing workflow of the same \
@@ -395,17 +407,58 @@ pub(crate) fn failure(code: &str, message: &str, hint: Option<&str>) -> String {
 /// an agent believing it has a reusable workflow until the moment it tries to run
 /// it, and the reason is harder to read from a run failure than from here.
 fn save_workflow(arguments: &Value) -> Result<Value, String> {
-    use aad_control::steps::{self, Step};
-    aad_runtime::recordings::ensure_no_secret_input(arguments)
-        .map_err(|error| failure(error.code, &error.message, None))?;
+    use aad_control::steps;
     let name = arguments
         .get("name")
         .and_then(Value::as_str)
         .ok_or_else(|| failure("MCP.INVALID_ARGUMENT", "name is required", None))?;
+    let (saved, compiled) = compile_steps(name, arguments, 500)?;
+    let descriptor = &compiled.raw;
+    let existing = aad_runtime::recordings::workflow_path(name).ok();
+    let replacing = existing.as_ref().is_some_and(|path| path.exists());
+    let overwrite = arguments
+        .get("overwrite")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if replacing && !overwrite {
+        return Err(failure(
+            "WORKFLOW.NAME_IN_USE",
+            &format!("a workflow named {name:?} already exists"),
+            Some("Pass overwrite: true to replace it, or choose another name."),
+        ));
+    }
+    let recording = aad_runtime::recordings::save_recording(name, &steps::recording(name, &saved))
+        .map_err(|error| failure(error.code, &error.message, None))?;
+    let path = aad_runtime::recordings::save_workflow(name, descriptor)
+        .map_err(|error| failure(error.code, &error.message, None))?;
+    Ok(
+        json!({"kind":"WorkflowSaved", "name":name, "path":path.to_string_lossy(),
+        "recording_path":recording.to_string_lossy(), "executed_steps":saved.len(), "replaced":replacing,
+        "inputs_required":descriptor["inputs"].as_object().map(|inputs| inputs.keys().collect::<Vec<_>>()).unwrap_or_default()}),
+    )
+}
+
+const MAX_INLINE_STEPS: usize = 32;
+
+fn compile_steps(
+    name: &str,
+    arguments: &Value,
+    limit: usize,
+) -> Result<(Vec<aad_control::steps::Step>, aad_core::WorkflowDescriptor), String> {
+    use aad_control::steps::{self, Step};
+    aad_runtime::recordings::ensure_no_secret_input(arguments)
+        .map_err(|error| failure(error.code, &error.message, None))?;
     let given = arguments
         .get("steps")
         .and_then(Value::as_array)
         .ok_or_else(|| failure("MCP.INVALID_ARGUMENT", "steps is required", None))?;
+    if !(1..=limit).contains(&given.len()) {
+        return Err(failure(
+            "STEP.INVALID",
+            &format!("expected 1..{limit} steps"),
+            None,
+        ));
+    }
 
     let mut saved = Vec::new();
     for (index, given) in given.iter().enumerate() {
@@ -455,11 +508,7 @@ instead, narrowed with within, near or nth if several match.",
 
     // The same compiler `run_workflow` uses, so "it saved" and "it runs" are the
     // same claim rather than two hopes.
-    let compiled = aad_core::compiler::compile_descriptor(
-        descriptor.clone(),
-        Some(aad_runtime::recordings::recordings_dir()),
-    )
-    .map_err(|error| {
+    let compiled = aad_core::compiler::compile_descriptor(descriptor, None).map_err(|error| {
         let located: Vec<Value> = error
             .issues
             .iter()
@@ -493,48 +542,7 @@ you supplied. Report the steps you passed, and see `issues` for where it went wr
         serde_json::to_string(&payload).unwrap_or_else(|_| error.message.clone())
     })?;
 
-    let existing = aad_runtime::recordings::workflow_path(name).ok();
-    let replacing = existing.as_ref().is_some_and(|path| path.exists());
-    let overwrite = arguments
-        .get("overwrite")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    if replacing && !overwrite {
-        return Err(failure(
-            "WORKFLOW.NAME_IN_USE",
-            &format!("a workflow named {name:?} already exists"),
-            Some(
-                "Pass overwrite: true to replace it, or choose another name. \
-Replacing silently would let two different workflows collapse into one with \
-nothing to show it happened.",
-            ),
-        ));
-    }
-
-    // The recording beside it is what the desktop app opens to edit the steps.
-    let recording = aad_runtime::recordings::save_recording(name, &steps::recording(name, &saved))
-        .map_err(|error| failure(error.code, &error.message, None))?;
-    let path = aad_runtime::recordings::save_workflow(name, &descriptor)
-        .map_err(|error| failure(error.code, &error.message, None))?;
-
-    Ok(json!({
-        "kind": "WorkflowSaved",
-        "name": name,
-        "path": path.to_string_lossy(),
-        "recording_path": recording.to_string_lossy(),
-        "executed_steps": compiled
-            .raw
-            .get("steps")
-            .and_then(Value::as_array)
-            .map(Vec::len)
-            .unwrap_or(0),
-        "replaced": replacing,
-        "inputs_required": descriptor
-            .get("inputs")
-            .and_then(Value::as_object)
-            .map(|inputs| inputs.keys().cloned().collect::<Vec<String>>())
-            .unwrap_or_default(),
-    }))
+    Ok((saved, compiled))
 }
 
 /// Whether a locator, or any locator nested in it, names a session-bound node.
@@ -1219,13 +1227,43 @@ pub(crate) fn run_workflow(
     check_run_arguments(arguments, false)?;
     let (name, descriptor) = compiled_workflow(arguments)?;
     refuse_scripts(&name, &descriptor)?;
+    execute_compiled(
+        session,
+        descriptor,
+        arguments,
+        aad_runtime::RunOptions::default(),
+    )
+}
+
+pub(crate) fn run_inline(
+    session: &Arc<aad_control::Session>,
+    arguments: &Value,
+    cancel: &aad_runtime::CancellationToken,
+) -> Result<Value, String> {
+    check_arguments(arguments, &["steps", "inputs"])?;
+    let (_, descriptor) = compile_steps("inline", arguments, MAX_INLINE_STEPS)?;
+    let options = aad_runtime::RunOptions {
+        cancel: cancel.shared_flag(),
+        max_duration: Some(std::time::Duration::from_secs(30)),
+        ..Default::default()
+    };
+    execute_compiled(session, descriptor, arguments, options)
+}
+
+fn execute_compiled(
+    session: &Arc<aad_control::Session>,
+    descriptor: aad_core::WorkflowDescriptor,
+    arguments: &Value,
+    options: aad_runtime::RunOptions,
+) -> Result<Value, String> {
+    let name = &descriptor.name;
     let inputs = workflow_inputs(arguments)?;
     let providers = session_providers(session)?;
     let artifacts = Arc::new(aad_runtime::ArtifactStore::default());
 
     let result = aad_runtime::run(
         &descriptor,
-        aad_runtime::RunOptions::default()
+        options
             .with_inputs(inputs)
             .with_providers(providers)
             .with_artifacts(artifacts)
@@ -2364,5 +2402,31 @@ pub(crate) mod tests {
         // Running a workflow drives the desktop, so it must not be advertised
         // as safe to call speculatively.
         assert!(!read_only("run_workflow"));
+        assert!(!read_only("run_steps"));
+    }
+
+    #[test]
+    fn inline_steps_preflight_the_whole_batch_and_never_save_it() {
+        let store = ScratchStore::new("inline");
+        let session = stub_session();
+        let token = aad_runtime::CancellationToken::new();
+        let check = json!({"app":{"process":"missing"}, "locator":{"name":"field"},"check":{"present":false}});
+        for args in [
+            json!({"steps":[check, {"type":"script"}]}),
+            json!({"steps":vec![check.clone();33]}),
+            json!({"steps":[check],"durable":true}),
+        ] {
+            assert!(run_inline(&session, &args, &token).is_err());
+        }
+        let args = json!({"steps":[check,check]});
+        assert_eq!(
+            run_inline(&session, &args, &token).unwrap()["executed_steps"],
+            2
+        );
+        token.cancel();
+        let stopped = run_inline(&session, &args, &token).unwrap();
+        assert_eq!(stopped["executed_steps"], 0);
+        assert!(!store.directory.join("inline.workflow.json").exists());
+        assert!(!store.directory.join("inline.recording.json").exists());
     }
 }
