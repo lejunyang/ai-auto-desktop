@@ -78,6 +78,15 @@ fn at(event: &Value) -> u64 {
 /// Turn raw events, oldest first, into steps for `app`. `next` numbers the
 /// step ids and is advanced past every id used.
 pub fn from_events(app: &App, events: &[Value], next: &mut usize) -> Batch {
+    collect_events(app, events, next, false).0
+}
+
+fn collect_events(
+    app: &App,
+    events: &[Value],
+    next: &mut usize,
+    defer_final_edit: bool,
+) -> (Batch, Option<Value>) {
     let mut batch = Batch::default();
     // Each kept event, and how many clicks or notches it stands for.
     let mut kept: Vec<(Value, u64)> = Vec::new();
@@ -106,6 +115,8 @@ pub fn from_events(app: &App, events: &[Value], next: &mut usize) -> Batch {
             batch
                 .skipped
                 .push(json!({"reason": "无法识别操作的元素", "summary": kind}));
+            last_node = None;
+            kept.push((json!({"kind": "focus_boundary"}), 0));
             continue;
         }
         last_node = Some(node.clone());
@@ -146,6 +157,16 @@ pub fn from_events(app: &App, events: &[Value], next: &mut usize) -> Batch {
         }
         kept.push((event, 1));
     }
+    // Normalize clicks and edits before deciding what to hold for the next
+    // poll. A double-click preceding an edit is a separate recorded action.
+    let tail = if defer_final_edit
+        && kept.last().is_some_and(|(event, _)| {
+            event["kind"] == "text" && !event["node"]["capture_identity"].is_null()
+        }) {
+        kept.pop().map(|(event, _)| event)
+    } else {
+        None
+    };
     for (event, count) in kept {
         if event["kind"] == "focus_boundary" {
             continue;
@@ -203,7 +224,7 @@ pub fn from_events(app: &App, events: &[Value], next: &mut usize) -> Batch {
                 .push(json!({"reason": problem.message, "summary": event["kind"]})),
         }
     }
-    batch
+    (batch, tail)
 }
 
 const BROWSER: &str = "browser.cdp";
@@ -336,32 +357,8 @@ fn across_polls(
             events.insert(0, previous);
         }
     }
-    if !finish
-        && events.last().is_some_and(|event| {
-            event["kind"] == "text" && !event["node"]["capture_identity"].is_null()
-        })
-    {
-        let last = events.last().unwrap();
-        let mut start = events.len() - 1;
-        while start > 0
-            && events[start - 1]["kind"] == "text"
-            && same(&events[start - 1]["node"], &last["node"])
-            && at(&events[start]).saturating_sub(at(&events[start - 1])) <= CAUSE_MS
-        {
-            start -= 1;
-        }
-        if start > 0
-            && events[start - 1]["kind"] == "click"
-            && events[start - 1]["button"] == "left"
-            && same(&events[start - 1]["node"], &last["node"])
-            && at(&events[start]).saturating_sub(at(&events[start - 1])) <= CAUSE_MS
-        {
-            start -= 1;
-        }
-        *tail = events.pop();
-        events.truncate(start);
-    }
-    let rest = from_events(app, &events, next);
+    let (rest, pending) = collect_events(app, &events, next, !finish);
+    *tail = pending;
     batch.steps.extend(rest.steps);
     batch.skipped.extend(rest.skipped);
     batch
@@ -563,6 +560,42 @@ mod tests {
         );
         assert_eq!(batch.steps[0].id, "rec1");
         assert_eq!(next, 3);
+    }
+
+    #[test]
+    fn deferring_an_edit_preserves_double_clicks_and_unknown_target_boundaries() {
+        let field = node("text", "Note");
+        let click = |ms| event("click", ms, field.clone(), json!({"button":"left"}));
+        let edit = |ms, value: &str| {
+            let mut node = field.clone();
+            node["value"] = json!(value);
+            event("text", ms, node, json!({}))
+        };
+        let mut next = 1;
+        let mut tail = None;
+        let first = across_polls(
+            &mut tail,
+            vec![click(0), click(50), edit(75, "a")],
+            false,
+            false,
+            &app(),
+            &mut next,
+        );
+        assert_eq!(actions(&first), vec![json!({"type":"click","count":2})]);
+        let next_poll = vec![
+            event("click", 80, Value::Null, json!({})),
+            event("key", 85, Value::Null, json!({"keys":["enter"]})),
+            edit(95, "b"),
+        ];
+        let last = across_polls(&mut tail, next_poll, false, true, &app(), &mut next);
+        assert_eq!(
+            actions(&last),
+            vec![
+                json!({"type":"fill","value":"a"}),
+                json!({"type":"fill","value":"b"})
+            ]
+        );
+        assert_eq!(last.skipped.len(), 2);
     }
 
     #[test]
