@@ -93,7 +93,7 @@ enum Command {
     BrowserRecord(browser_record::Command),
     /// Run a JavaScript file against a browser page with the AAD page API.
     BrowserScript(browser_script::Args),
-    /// Export a collected table as CSV, or compare it with a CSV file.
+    /// Collect a Chromium table, export it as CSV, or reconcile it with a CSV file.
     #[command(subcommand)]
     Table(table_data::TableCommand),
     /// Share a browser page or the desktop with a person, who can use it remotely.
@@ -469,7 +469,9 @@ fn dispatch(command: &Command) -> (Value, u8) {
         },
         Command::Record(args) => desk::record(args),
         Command::Table(args) => match table_data::run(args) {
-            Ok(value) if value.get("matches") == Some(&Value::Bool(false)) => (value, EXIT_FAILED),
+            Ok(value) if value["complete"] == false || value["matches"] == false => {
+                (value, EXIT_FAILED)
+            }
             Ok(value) => (value, EXIT_OK),
             Err(message) => (failure("CLI.TABLE_ERROR", &message, None), EXIT_FAILED),
         },

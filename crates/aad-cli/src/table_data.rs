@@ -14,6 +14,8 @@ const MAX_DIFFERENCES: usize = 100;
 
 #[derive(Subcommand)]
 pub enum TableCommand {
+    /// Traverse one Chromium table, optionally export CSV and reconcile it in this run.
+    Collect(CollectArgs),
     /// Write a complete collection to a new UTF-8 CSV file.
     Export {
         #[arg(long)]
@@ -31,6 +33,36 @@ pub enum TableCommand {
         #[arg(long, value_name = "COLUMN")]
         decimal: Vec<String>,
     },
+}
+
+#[derive(clap::Args)]
+#[command(group(clap::ArgGroup::new("page").required(true).args(["resource_id","url"])))]
+pub struct CollectArgs {
+    /// JSON collection spec containing table, columns, row_key and traversal.
+    #[arg(long)]
+    spec: PathBuf,
+    /// Exact URL of one already open main frame.
+    #[arg(long)]
+    url: Option<String>,
+    /// Exact Chromium resource id (also supports frames).
+    #[arg(long)]
+    resource_id: Option<String>,
+    #[arg(long,default_value_t=9222,value_parser=clap::value_parser!(u16).range(1..))]
+    browser_port: u16,
+    /// Grant input for the observed Next button or scroll container.
+    #[arg(long)]
+    allow_input: bool,
+    /// New CSV file to create for a complete result.
+    #[arg(long)]
+    output: Option<PathBuf>,
+    /// Expected CSV file to reconcile against.
+    #[arg(long)]
+    compare_csv: Option<PathBuf>,
+    #[arg(long, requires = "compare_csv", value_name = "COLUMN")]
+    decimal: Vec<String>,
+    /// Collection deadline in milliseconds.
+    #[arg(long,default_value_t=30000,value_parser=clap::value_parser!(u64).range(1..=30000))]
+    timeout_ms: u64,
 }
 
 #[derive(Deserialize)]
@@ -76,6 +108,10 @@ impl Dataset {
         let bytes = read_local(path)?;
         let data: Self =
             serde_json::from_slice(&bytes).map_err(|e| format!("invalid collection: {e}"))?;
+        Self::validated(data)
+    }
+
+    fn validated(data: Self) -> Result<Self> {
         if !data.complete {
             return Err("collection is incomplete".into());
         }
@@ -241,7 +277,7 @@ fn total(rows: &[Record], column: &str) -> Result<String> {
         .map_err(|e| format!("column {column:?}: {e}"))
 }
 
-fn compare(data: &Dataset, csv: &Path, decimal: &[String]) -> Result<Value> {
+fn compare(data: &Dataset, expected_rows: &[Record], decimal: &[String]) -> Result<Value> {
     let numeric: BTreeSet<_> = decimal.iter().collect();
     if numeric.len() != decimal.len()
         || numeric.contains(&data.row_key)
@@ -249,14 +285,13 @@ fn compare(data: &Dataset, csv: &Path, decimal: &[String]) -> Result<Value> {
     {
         return Err("decimal columns must be distinct selected non-key columns".into());
     }
-    let expected_rows = read_csv(csv, &data.columns)?;
-    let expected = index(&expected_rows, &data.row_key)?;
+    let expected = index(expected_rows, &data.row_key)?;
     let actual = index(&data.records, &data.row_key)?;
     let mut totals = BTreeMap::new();
     for column in decimal {
         totals.insert(
             column,
-            json!({"actual":total(&data.records,column)?,"expected":total(&expected_rows,column)?}),
+            json!({"actual":total(&data.records,column)?,"expected":total(expected_rows,column)?}),
         );
     }
     let mut differences = Vec::new();
@@ -299,13 +334,105 @@ fn compare(data: &Dataset, csv: &Path, decimal: &[String]) -> Result<Value> {
     )
 }
 
+fn collect(args: &CollectArgs) -> Result<Value> {
+    use aad_control::{
+        browser::{BrowserBackend, PROVIDER},
+        table::Collection,
+        Operation, Policy, Request, Session,
+    };
+    if !args.allow_input {
+        return Err("table collection requires --allow-input".into());
+    }
+    let spec: Collection = serde_json::from_slice(&read_local(&args.spec)?)
+        .map_err(|e| format!("invalid table spec: {e}"))?;
+    let expected = args
+        .compare_csv
+        .as_deref()
+        .map(|file| read_csv(file, &spec.columns))
+        .transpose()?;
+    if let Some(output) = &args.output {
+        match output.symlink_metadata() {
+            Ok(_) => return Err(format!("output already exists: {}", output.display())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+    let session = Session::new(
+        vec![std::sync::Arc::new(BrowserBackend::new(args.browser_port))],
+        Policy {
+            allow_input: true,
+            ..Default::default()
+        },
+    );
+    let request = |operation| {
+        let mut req = Request::new(Some(session.id().into()), operation);
+        req.timeout_ms = args.timeout_ms;
+        let result = session.execute(&req);
+        result
+            .data
+            .ok_or_else(|| result.error.unwrap_or_default().to_string())
+    };
+    let listed = request(Operation::Targets {
+        provider: Some(PROVIDER.into()),
+    })?;
+    if let Some(failure) = listed["unavailable"].get(PROVIDER) {
+        return Err(format!("Chromium discovery failed: {failure}"));
+    }
+    let matches: Vec<_> = listed["resources"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|r| match &args.resource_id {
+            Some(id) => r["resource_id"].as_str() == Some(id),
+            None => {
+                r["metadata"]["main_frame"] == true
+                    && r["metadata"]["url"].as_str() == args.url.as_deref()
+            }
+        })
+        .collect();
+    let [page] = matches.as_slice() else {
+        return Err(format!(
+            "expected one Chromium resource, found {}",
+            matches.len()
+        ));
+    };
+    let resource_id = page["resource_id"]
+        .as_str()
+        .ok_or("resource id missing")?
+        .to_owned();
+    let mut result = request(Operation::CollectTable {
+        resource_id,
+        spec: Box::new(spec),
+    })?;
+    if result["complete"] != true || (args.output.is_none() && expected.is_none()) {
+        return Ok(result);
+    }
+    let data = Dataset::validated(
+        serde_json::from_value(result.clone())
+            .map_err(|e| format!("invalid collection for CSV: {e}"))?,
+    )?;
+    if let Some(expected) = expected {
+        let comparison = compare(&data, &expected, &args.decimal)?;
+        result["matches"] = comparison["matches"].clone();
+        result["comparison"] = comparison;
+    }
+    if let Some(path) = &args.output {
+        result["export"] = export(&data, path)?;
+    }
+    Ok(result)
+}
+
 pub fn run(command: &TableCommand) -> Result<Value> {
     match command {
+        TableCommand::Collect(args) => collect(args),
         TableCommand::Export { input, output } => export(&Dataset::load(input)?, output),
         TableCommand::Compare {
             input,
             csv,
             decimal,
-        } => compare(&Dataset::load(input)?, csv, decimal),
+        } => {
+            let data = Dataset::load(input)?;
+            compare(&data, &read_csv(csv, &data.columns)?, decimal)
+        }
     }
 }
