@@ -146,9 +146,46 @@ fn reads_named_fields_in_a_read_only_session() {
     );
 }
 
+#[test]
+fn read_steps_preserve_their_contract_when_saved() {
+    let read: Step = serde_json::from_value(json!({
+        "app":{"provider":"fixture"},"id":"receipt",
+        "read":[{"as":"amount","locator":{"name":"Total"},"property":"value"}],
+        "expect":{"amount":"20.00"}
+    }))
+    .unwrap();
+    let saved = steps::recording("receipt", std::slice::from_ref(&read));
+    assert!(saved["steps"][0].get("locator").is_none());
+    assert_eq!(steps::steps_of(&saved).unwrap()[0], read);
+    let document = steps::workflow("receipt", std::slice::from_ref(&read)).unwrap();
+    assert_eq!(document["steps"][0]["effect"]["class"], "read_only");
+    let mut duplicate = read.clone();
+    duplicate.id = "again".into();
+    assert!(steps::workflow("receipt", &[read.clone(), duplicate]).is_err());
+    for extra in [
+        json!({"action":{"type":"click"}}),
+        json!({"expect":{"typo":true}}),
+        json!({"within_ms":0}),
+        json!({"expect":{"amount":[]}}),
+        json!({"within_ms":5,"expect":null}),
+    ] {
+        let mut raw = serde_json::to_value(&read).unwrap();
+        raw.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        assert!(serde_json::from_value::<Step>(raw)
+            .unwrap()
+            .validate()
+            .is_err());
+    }
+}
+
 fn act(id: &str, title: Option<&str>, locator: Locator, action: Value) -> Step {
     Step {
         id: id.into(),
+        read: None,
+        expect: None,
+        within_ms: None,
         app: app(title),
         locator,
         action: Some(action),
@@ -300,6 +337,9 @@ fn a_saved_step_rejects_session_bound_path_anchors_before_replay() {
 fn a_check_waits_for_an_element_to_appear() {
     let (session, _) = session();
     let check = Step {
+        read: None,
+        expect: None,
+        within_ms: None,
         id: "saved".into(),
         app: app(Some("notes")),
         locator: named("text", "Saved"),
@@ -338,6 +378,9 @@ fn a_check_waits_out_a_moment_of_two_matches() {
     );
     steps::perform(&session, &click, &Map::new(), Duration::from_secs(5)).unwrap();
     let check = |present: bool, within_ms: u64| Step {
+        read: None,
+        expect: None,
+        within_ms: None,
         id: "saved".into(),
         app: app(Some("notes")),
         locator: named("text", "Saved"),
@@ -423,6 +466,9 @@ fn compiled_steps_run_through_the_engine() {
         ),
         Step {
             id: "saved".into(),
+            read: None,
+            expect: None,
+            within_ms: None,
             app: app(Some("notes")),
             locator: named("text", "Saved"),
             action: None,

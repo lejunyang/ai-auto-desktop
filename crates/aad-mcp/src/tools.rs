@@ -116,8 +116,7 @@ fn steps_schema(max_steps: usize) -> Value {
         "description": "The actions in the order they were performed.",
         "items": {
             "type": "object",
-            "description": "One action on an element, or one check. \
-    Give exactly one of action and check.",
+            "description": "Give exactly one of action, check, or read. Read names are workflow outputs.",
             "properties": {
                 "id": {
                     "type": "string",
@@ -158,6 +157,9 @@ fn steps_schema(max_steps: usize) -> Value {
                     "additionalProperties": false
                 },
                 "locator": locator_schema(),
+                "read": fields_schema(),
+                "expect":{"type":"object","minProperties":1,"maxProperties":32,"additionalProperties":{"type":["string","number","boolean"]},"description":"For read: compare named fields from the same observation to these values. A mismatch stops the workflow."},
+                "within_ms":{"type":"integer","minimum":1,"maximum":30000,"description":"For read with expect: retry the observation for up to this long. Omit for a single check."},
                 "action": crate::control_tools::saved_action_schema(),
                 "to": locator_schema(),
                 "check": {
@@ -194,7 +196,12 @@ fn steps_schema(max_steps: usize) -> Value {
                 },
                 "note": {"type": "string", "maxLength": 500}
             },
-            "required": ["app", "locator"],
+            "required": ["app"],
+            "oneOf":[
+                {"required":["locator","action"],"not":{"anyOf":[{"required":["read"]},{"required":["expect"]},{"required":["within_ms"]}]}},
+                {"required":["locator","check"],"not":{"anyOf":[{"required":["read"]},{"required":["expect"]},{"required":["within_ms"]}]}},
+                {"required":["read"],"not":{"anyOf":[{"required":["locator"]},{"required":["action"]},{"required":["check"]},{"required":["to"]},{"required":["input"]}]}}
+            ],
             "additionalProperties": false
         }
     })
@@ -213,7 +220,7 @@ what limits apply, such as a remote session or a non-elevated process.",
         },
         Tool {
             name: "run_steps",
-            description: "Run a short sequence of typed actions and checks without saving a workflow. Each step re-observes and locates its own target. A failure stops the sequence but does not roll back earlier actions. Inspect the per-step outcomes before deciding what to do next.",
+            description: "Run actions, checks and named field reads in one call. Read steps return their named values in outputs; expect can compare them with a literal or a previous read. Each step observes its own target. A failure stops later steps.",
             schema: json!({"type":"object", "properties":{
                 "steps":steps_schema(MAX_INLINE_STEPS), "inputs":{"type":"object"}
             }, "required":["steps"], "additionalProperties":false}),
@@ -483,7 +490,10 @@ fn compile_steps(
         }
         // A node_id names an element of one observation in one session; saved,
         // it would find nothing the next time.
-        if names_a_node(&step["locator"]) || names_a_node(&step["to"]) {
+        if names_a_node(&step["locator"])
+            || names_a_node(&step["to"])
+            || names_a_node(&step["read"])
+        {
             return Err(failure(
                 "STEP.INVALID",
                 &format!("step {ordinal} finds its element by node_id"),
@@ -1594,7 +1604,8 @@ pub(crate) mod tests {
         );
 
         let step = &saving.schema["properties"]["steps"]["items"];
-        assert_eq!(step["required"], json!(["app", "locator"]));
+        assert_eq!(step["required"], json!(["app"]));
+        assert_eq!(step["oneOf"][0]["required"], json!(["locator", "action"]));
         assert_eq!(step["additionalProperties"], false);
         assert_eq!(step["properties"]["locator"]["additionalProperties"], false);
         // The actions are control_act's, so every provider's can be saved.

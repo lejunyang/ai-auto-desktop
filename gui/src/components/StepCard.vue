@@ -32,9 +32,9 @@ function edit(): void {
   open.value = !open.value;
   if (!open.value) return;
   locator.value = { ...props.step.locator };
-  contains.value = props.step.locator.match === "contains";
-  within.value = props.step.locator.within?.name ?? "";
-  nth.value = props.step.locator.nth?.toString() ?? "";
+  contains.value = props.step.locator?.match === "contains";
+  within.value = props.step.locator?.within?.name ?? "";
+  nth.value = props.step.locator?.nth?.toString() ?? "";
   app.value = {
     process: props.step.app.process ?? "",
     title: props.step.app.title ?? "",
@@ -84,7 +84,7 @@ function triedText(): string {
       <span v-else-if="status === 'failed'" class="state bad">✕</span>
       <div class="tools">
         <button class="ghost" title="执行这一步" @click="emit('perform')">▶</button>
-        <button class="ghost" title="编辑" @click="edit">✎</button>
+        <button v-if="!step.read" class="ghost" title="编辑" @click="edit">✎</button>
         <button class="ghost" title="上移" :disabled="index === 0" @click="emit('move', -1)">↑</button>
         <button class="ghost" title="下移" :disabled="last" @click="emit('move', 1)">↓</button>
         <button class="ghost danger" title="删除" @click="emit('remove')">🗑</button>

@@ -73,4 +73,37 @@ test('typed batches re-observe after a write and stop on a missing element',
       assert.equal(JSON.parse(text).steps.length,100);
       context.diagnostic(`${file.slice(store.length+1)}: ${text.trimEnd().split('\n').length} lines, ${Buffer.byteLength(text)} bytes`);
     }
+    await page.cdp.eval(`document.body.innerHTML = '<input aria-label="Quoted total" value="118.50"><input aria-label="Billed total"><input aria-label="Order ID"><input aria-label="PIN" type="password" value="sample-private"><button>Place order</button>';
+      window.orders = 0;
+      document.querySelector('button').onclick = () => { ++window.orders; setTimeout(() => {
+        document.querySelector('[aria-label="Billed total"]').value = '118.50';
+        document.querySelector('[aria-label="Order ID"]').value = 'ORD-42';
+      }, 130); }; true`);
+    const field = (alias, name) => ({as:alias, locator:{name}, property:'value'});
+    const quote = {id:'quote',app,read:[field('quoted','Quoted total')]};
+    const submit = {app,locator:{name:'Place order',role:'button'},action:{type:'click'}};
+    const receipt = {id:'receipt',app,read:[field('billed','Billed total'),field('order_id','Order ID')],
+      expect:{billed:'${{ steps.quote.output.values.quoted }}',order_id:'ORD-42'},within_ms:3000};
+    const steps = [quote,submit,receipt];
+    const expected = {quoted:'118.50',billed:'118.50',order_id:'ORD-42'};
+    assert.deepEqual((await tool('run_steps',{steps})).outputs, expected);
+    assert.deepEqual(await page.cdp.eval('[window.orders, document.querySelector(\'[aria-label="Order ID"]\').value]'),[1,'ORD-42']);
+    const mismatch = {...receipt,expect:{billed:'120.00'},within_ms:150};
+    const stopped = await tool('run_steps',{steps:[quote,mismatch,submit]},true);
+    assert.equal(stopped.error.code,'STEP.CHECK_FAILED');
+    assert.equal(stopped.error.stepId,'receipt');
+    assert.match(stopped.error.message,/billed/);
+    assert.equal(await page.cdp.eval('window.orders'),1);
+    const invalid = await tool('run_steps',{steps:[submit,{...quote,expect:{typo:42}}]},true);
+    assert.equal(invalid.code,'STEP.INVALID');
+    assert.equal(await page.cdp.eval('window.orders'),1);
+    const secret = await tool('control_read_fields',{resource_id,fields:[field('pin','PIN')]},true);
+    assert.equal(secret.error.code,'POLICY.DENIED');
+    assert.ok(!JSON.stringify(secret).includes('sample-private'));
+    await tool('save_workflow',{name:'verify-receipt',steps});
+    assert.deepEqual((await tool('run_workflow',{name:'verify-receipt'})).outputs,expected);
+    assert.equal(await page.cdp.eval('window.orders'),2);
+    await page.cdp.eval(`document.querySelector('[aria-label="Order ID"]').value = 'x'.repeat(4100); true`);
+    const long = await tool('control_read_fields',{resource_id,fields:[field('order_id','Order ID')]},true);
+    assert.equal(long.error.code,'CONTROL.FIELD_TOO_LARGE');
   });

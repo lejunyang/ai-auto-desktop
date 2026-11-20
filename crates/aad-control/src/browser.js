@@ -195,6 +195,7 @@
         const node={node_id,role:roleOf(el),name:labelOf(el),tag:el.tagName.toLowerCase(),
           value:protectedNode(el)?null:(('value' in el)?String(el.value).slice(0,4096):null),
           states:{enabled:enabled(el),protected:protectedNode(el),read_only:!!el.readOnly,focused:activeElement()===el},actions:actions(el),parent:parentOf(el)};
+        if (!node.states.protected && typeof el.value==='string' && el.value.length>4096) node.value_truncated=true;
         if (landmark(el)) node.landmark=true;
         if (closedRoots.has(el)) node.surface='closed_shadow';
         if (checkable(el)) node.states.checked=checkedOf(el);

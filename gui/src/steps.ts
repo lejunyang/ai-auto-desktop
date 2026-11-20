@@ -170,7 +170,8 @@ const DIRECTIONS = { up: "向上", down: "向下", left: "向左", right: "向�
 
 /** One line saying what a step does. */
 export function title(step: Step): string {
-  const target = describeLocator(step.locator);
+  if (step.read) return `${step.expect ? "读取并核对" : "读取"} ${step.read.map(field => field.as).join("、")}`;
+  const target = describeLocator(step.locator ?? {});
   if (step.check) return `${step.check.present ? "等待出现" : "等待消失"} ${target}`;
   const action = step.action;
   if (!action) return target;

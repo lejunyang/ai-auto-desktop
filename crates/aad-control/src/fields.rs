@@ -85,6 +85,12 @@ pub(super) fn project(
                     format!("field {} is protected", field.alias),
                 ));
             }
+            Property::Value if node["value_truncated"] == true => {
+                return Err(error(
+                    "CONTROL.FIELD_TOO_LARGE",
+                    format!("field {} was truncated in the observation", field.alias),
+                ));
+            }
             Property::Value => &node["value"],
             Property::Checked => &node["states"]["checked"],
             Property::Enabled => &node["states"]["enabled"],

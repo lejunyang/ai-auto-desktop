@@ -54,6 +54,9 @@ describe("drafts become steps", () => {
 });
 
 describe("lists", () => {
+  it("names a receipt check without a step-level locator", () => {
+    expect(title({id:"receipt", app, read:[{as:"amount", locator:save, property:"value"}], expect:{amount:"20"}})).toBe("读取并核对 amount");
+  });
   it("numbers new steps past any already taken", () => {
     const steps = [{ id: "step2" }, { id: "rec1" }] as Step[];
     expect(nextId(steps)).toBe("step3");

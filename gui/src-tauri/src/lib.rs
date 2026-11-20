@@ -518,6 +518,9 @@ mod tests {
 
     fn step(id: &str) -> Step {
         Step {
+            read: None,
+            expect: None,
+            within_ms: None,
             id: id.into(),
             app: App {
                 process: Some("notepad.exe".into()),

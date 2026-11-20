@@ -72,7 +72,14 @@ fn default_within() -> u64 {
 pub struct Step {
     pub id: String,
     pub app: App,
+    #[serde(default, skip_serializing_if = "Locator::is_empty")]
     pub locator: Locator,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read: Option<Vec<crate::fields::ReadField>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expect: Option<BTreeMap<String, Value>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub within_ms: Option<u64>,
     /// A control action without its session-bound parts: a drag names its
     /// destination in `to` instead.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -111,11 +118,49 @@ impl Step {
                 self.id
             )));
         }
-        if self.locator.is_empty() {
-            return Err(invalid(format!("step {} has an empty locator", self.id)));
-        }
         if self.app == App::default() {
             return Err(invalid(format!("step {} names no application", self.id)));
+        }
+        if let Some(fields) = &self.read {
+            crate::fields::validate(fields)?;
+            if self.action.is_some()
+                || self.check.is_some()
+                || !self.locator.is_empty()
+                || self.input.is_some()
+                || self.to.is_some()
+            {
+                return Err(invalid(
+                    "a read step takes its locators from read fields only",
+                ));
+            }
+            if self
+                .within_ms
+                .is_some_and(|ms| !(1..=MAX_CHECK_MS).contains(&ms) || self.expect.is_none())
+            {
+                return Err(invalid("within_ms requires expect and must be 1..30000"));
+            }
+            if let Some(expected) = &self.expect {
+                if expected.is_empty()
+                    || expected.iter().any(|(alias, value)| {
+                        !fields.iter().any(|field| &field.alias == alias)
+                            || !matches!(
+                                value,
+                                Value::String(_) | Value::Bool(_) | Value::Number(_)
+                            )
+                    })
+                {
+                    return Err(invalid(
+                        "expect compares named read fields to strings, numbers or booleans",
+                    ));
+                }
+            }
+            return Ok(());
+        }
+        if self.locator.is_empty() || self.expect.is_some() || self.within_ms.is_some() {
+            return Err(invalid(format!(
+                "step {} needs a locator; expect and within_ms belong to read steps",
+                self.id
+            )));
         }
         match (&self.action, &self.check) {
             (Some(_), Some(_)) | (None, None) => {
@@ -403,6 +448,61 @@ pub fn perform(
     if let Some(check) = &step.check {
         return wait(session, step, check, deadline);
     }
+    if let Some(fields) = &step.read {
+        let until = step
+            .within_ms
+            .map(|ms| deadline.min(Instant::now() + Duration::from_millis(ms)));
+        let deadline = until.unwrap_or(deadline);
+        let resource_id = resource(session, &step.app, deadline)?.ok_or_else(|| {
+            error(
+                "STEP.APP_NOT_FOUND",
+                "no open window matches the step's application",
+            )
+        })?;
+        loop {
+            let attempt = request(
+                session,
+                Operation::ReadFields {
+                    resource_id: resource_id.clone(),
+                    fields: fields.clone(),
+                },
+                deadline,
+            );
+            let failure = match attempt {
+                Ok(result) => match step
+                    .expect
+                    .iter()
+                    .flatten()
+                    .find(|(alias, expected)| result["values"].get(*alias) != Some(*expected))
+                {
+                    None => return Ok(result),
+                    Some((alias, _)) => error(
+                        "STEP.CHECK_FAILED",
+                        format!("field {alias} did not match the expected value"),
+                    ),
+                },
+                Err(failure)
+                    if matches!(
+                        failure.code.as_str(),
+                        "CONTROL.NOT_FOUND" | "DRIVER.NOT_FOUND"
+                    ) =>
+                {
+                    failure
+                }
+                Err(failure) => return Err(failure),
+            };
+            let remaining = until
+                .map(|until| until.saturating_duration_since(Instant::now()))
+                .unwrap_or_default();
+            if remaining <= Duration::from_millis(1) {
+                return Err(failure);
+            }
+            std::thread::sleep(remaining.min(Duration::from_millis(100)));
+            if Instant::now() >= deadline {
+                return Err(failure);
+            }
+        }
+    }
     let value = match &step.input {
         Some(input) => Some(
             inputs
@@ -546,6 +646,9 @@ pub fn from_windows_capture(
     };
     Ok(Step {
         id: id.to_string(),
+        read: None,
+        expect: None,
+        within_ms: None,
         app: app.clone(),
         locator,
         action: Some(action),
@@ -585,6 +688,7 @@ pub fn workflow(name: &str, steps: &[Step]) -> Result<Value> {
     }
     let mut seen = std::collections::BTreeSet::new();
     let mut inputs = BTreeMap::new();
+    let mut outputs = BTreeMap::new();
     let mut compiled = Vec::new();
     for step in steps {
         step.validate()?;
@@ -599,9 +703,23 @@ pub fn workflow(name: &str, steps: &[Step]) -> Result<Value> {
             );
             with["inputs"] = json!({ &input.name: format!("${{{{ inputs.{} }}}}", input.name) });
         }
-        let (uses, effect, risk) = if step.check.is_some() {
+        if let Some(fields) = &step.read {
+            for field in fields {
+                let expression = format!(
+                    "${{{{ steps['{}'].output.values['{}'] }}}}",
+                    step.id, field.alias
+                );
+                if outputs
+                    .insert(field.alias.clone(), json!({"value":expression}))
+                    .is_some()
+                {
+                    return Err(invalid(format!("output {} is used twice", field.alias)));
+                }
+            }
+        }
+        let (uses, effect, risk) = if step.check.is_some() || step.read.is_some() {
             (
-                "check",
+                if step.read.is_some() { "read" } else { "check" },
                 "read_only",
                 json!({"category": "observe", "level": "low"}),
             )
@@ -634,6 +752,9 @@ pub fn workflow(name: &str, steps: &[Step]) -> Result<Value> {
     });
     if !inputs.is_empty() {
         document["inputs"] = json!(inputs);
+    }
+    if !outputs.is_empty() {
+        document["outputs"] = json!(outputs);
     }
     Ok(document)
 }
@@ -673,6 +794,15 @@ impl StepProvider {
                 "low",
             ),
         );
+        actions.insert(
+            "read".into(),
+            contract(
+                "Read named fields and check their observed values.",
+                "read_only",
+                "observe",
+                "low",
+            ),
+        );
         let mut document = manifest::document(PROVIDER, actions);
         document["metadata"]["version"] = json!("0.1.0");
         Self {
@@ -694,7 +824,14 @@ impl Provider for StepProvider {
             .unwrap_or(action);
         let step: Step = serde_json::from_value(args["step"].clone())
             .map_err(|e| invalid(format!("unreadable step: {e}")))?;
-        if (name == "check") != step.check.is_some() || !matches!(name, "act" | "check") {
+        let expected = if step.read.is_some() {
+            "read"
+        } else if step.check.is_some() {
+            "check"
+        } else {
+            "act"
+        };
+        if name != expected {
             return Err(invalid(format!("{action} does not run this step")));
         }
         let inputs = args["inputs"].as_object().cloned().unwrap_or_default();

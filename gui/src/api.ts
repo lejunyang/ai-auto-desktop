@@ -54,7 +54,10 @@ export type ActionType = Action["type"];
 export interface Step {
   id: string;
   app: App;
-  locator: Locator;
+  locator?: Locator;
+  read?: { as: string; locator: Locator; property: "name" | "value" | "present" | "checked" | "enabled" | "selected" }[];
+  expect?: Record<string, string | boolean | number>;
+  within_ms?: number;
   action?: Action;
   to?: Locator;
   check?: { present: boolean; within_ms: number };

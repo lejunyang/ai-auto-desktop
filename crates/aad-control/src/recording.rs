@@ -171,6 +171,9 @@ pub fn from_events(app: &App, events: &[Value], next: &mut usize) -> Batch {
             }
         };
         let step = Step {
+            read: None,
+            expect: None,
+            within_ms: None,
             id,
             app: app.clone(),
             locator: locator(node),
