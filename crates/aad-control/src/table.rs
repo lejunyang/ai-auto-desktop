@@ -153,6 +153,18 @@ struct Page {
     declared: Option<usize>,
 }
 
+impl Page {
+    fn same_window(&self, other: &Page) -> bool {
+        self.records == other.records
+            && self.viewport == other.viewport
+            && self.limits == other.limits
+            && self.declared == other.declared
+            && self.control["found"] == other.control["found"]
+            && self.control["node"]["states"]["enabled"]
+                == other.control["node"]["states"]["enabled"]
+    }
+}
+
 #[derive(Default)]
 struct Rows {
     records: Vec<Value>,
@@ -363,17 +375,48 @@ impl Session {
 
             // Wait for a changed row window (or a moved virtual viewport).
             // Never submit a second click to make a delayed first click "work".
-            let until = Instant::now() + Duration::from_secs(2);
+            let started = Instant::now();
+            let mut candidate: Option<Page> = None;
             loop {
                 std::thread::sleep(context.remaining()?.min(Duration::from_millis(80)));
-                let fresh = self.table_page(resource, spec, context)?;
-                if fresh.records != page.records || (scrolling && fresh.viewport != page.viewport) {
+                let elapsed = started.elapsed();
+                let fresh = match self.table_page(resource, spec, context) {
+                    Ok(fresh) => fresh,
+                    Err(e)
+                        if elapsed < Duration::from_secs(2)
+                            && matches!(
+                                e.code.as_str(),
+                                "CONTROL.STALE_TARGET"
+                                    | "CONTROL.NOT_FOUND"
+                                    | "CONTROL.TABLE_HEADER"
+                            ) =>
+                    {
+                        candidate = None;
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                };
+                // Applications may clear rows and disable Next while loading.
+                // A compositor scroll can likewise precede the recycled DOM.
+                let rows_changed = !fresh.records.is_empty() && fresh.records != page.records;
+                let moved = scrolling && fresh.viewport != page.viewport;
+                let settle = if fresh.viewport["at_bottom"] == true {
+                    Duration::from_secs(2)
+                } else {
+                    Duration::from_millis(500)
+                };
+                if (rows_changed || (moved && elapsed >= settle))
+                    && candidate
+                        .as_ref()
+                        .is_some_and(|last| fresh.same_window(last))
+                {
                     page = fresh;
                     break;
                 }
-                if Instant::now() >= until {
+                if elapsed >= Duration::from_secs(2) {
                     break 'collect (false, "no_progress".into());
                 }
+                candidate = Some(fresh);
             }
         };
         context.remaining()?;

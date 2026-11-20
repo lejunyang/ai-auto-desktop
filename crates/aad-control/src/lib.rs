@@ -225,7 +225,10 @@ pub trait Backend: Send + Sync {
         _container_id: Option<&str>,
         _timeout: Duration,
     ) -> Result<Value> {
-        Err(error("CONTROL.ACTION_UNSUPPORTED", "table traversal requires Chromium"))
+        Err(error(
+            "CONTROL.ACTION_UNSUPPORTED",
+            "table traversal requires Chromium",
+        ))
     }
     /// Resolve a locator inside a retained snapshot, answering
     /// `{"found", "node_id", "match_count"}`. `None` uses the portable exact matcher.
@@ -955,6 +958,12 @@ impl Session {
         cancellation: aad_runtime::CancellationToken,
     ) -> Response {
         let result = self.run(request, cancellation);
+        let applied = match request.operation {
+            Operation::CollectTable { .. } => result
+                .as_ref()
+                .is_ok_and(|v| v["actions"].as_u64().is_some_and(|n| n > 0)),
+            _ => request.mutating(),
+        };
         let (data, failure, effect) = match result {
             Ok(value) => (
                 Some(value),
@@ -963,7 +972,7 @@ impl Session {
                     // Delivered to whatever held focus: nothing anchors or
                     // verifies it, so the commit state stays unknown.
                     "dispatched".to_string()
-                } else if request.mutating() {
+                } else if applied {
                     "applied".to_string()
                 } else {
                     "not_applied".to_string()
@@ -1239,7 +1248,7 @@ impl Session {
                 self.find_in(observation_id, &observation, locator, *expect, context)
             }
             Operation::CollectTable {resource_id, spec} => self.collect_table(resource_id, spec, context)
-                .map_err(|failure| if context.phase.load(Ordering::SeqCst) == 1 && failure.effect == "not_applied" { failure.with_effect("unknown") } else { failure }),
+                .map_err(|failure| if matches!(context.phase.load(Ordering::SeqCst), 1 | 3) && failure.effect == "not_applied" { failure.with_effect("unknown") } else { failure }),
             Operation::ReadTable { target, columns, max_characters } => self.read_table(target, columns, *max_characters, context),
             Operation::ReadFields { resource_id, fields } => {
                 fields::validate(fields)?;
