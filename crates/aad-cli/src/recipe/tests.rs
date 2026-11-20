@@ -84,3 +84,25 @@ fn legacy_recipes_keep_ids_permissions_and_automatic_read_outputs() {
     doc["format"] = json!("recipe/999");
     assert!(expand(doc).is_err());
 }
+
+#[test]
+fn table_steps_use_the_validated_mutating_provider_contract() {
+    let mut source = program(json!([{"id":"orders","collect_table":{
+        "table":"ledger","columns":["Order"],"row_key":"Order","max_pages":4,
+        "traversal":{"mode":"pagination","next":"next"}
+    }}]));
+    source["targets"] = json!({"ledger":{"role":"table"},"next":{"name":"Next"}});
+    source["outputs"] = json!({"complete":"${{ orders.complete }}"});
+    let doc = expand(source.clone()).unwrap();
+    let step = &doc["steps"][0];
+    assert_eq!(step["uses"], "control.session.collect_table@1");
+    assert_eq!(step["effect"]["class"], "non_idempotent");
+    assert_eq!(step["with"]["app"]["provider"], "browser.cdp");
+    assert_eq!(step["with"]["traversal"]["next"], json!({"name":"Next"}));
+    assert_eq!(
+        doc["steps"][1]["assign"]["vars.v1"],
+        "${{ steps.r1_orders.output.complete }}"
+    );
+    source["phases"][0]["steps"][0]["collect_table"]["max_pages"] = json!(0);
+    assert!(expand(source).unwrap_err().contains("max_pages"));
+}

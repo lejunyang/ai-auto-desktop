@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 
 mod library;
 mod program;
+mod provider;
 mod scope;
 #[cfg(test)]
 mod tests;
@@ -80,11 +81,18 @@ fn expand_legacy(raw: Value) -> Result<Value, String> {
 
 fn resolve_targets(raw: &mut Value, targets: &BTreeMap<String, Locator>) -> Result<(), String> {
     for key in ["locator", "to"] {
-        if let Some(alias) = raw[key].as_str() {
-            raw[key] = json!(targets
-                .get(alias)
-                .ok_or_else(|| format!("unknown target {alias}"))?);
+        if let Some(value) = raw.get_mut(key) {
+            resolve_alias(value, targets)?;
         }
+    }
+    Ok(())
+}
+
+fn resolve_alias(value: &mut Value, targets: &BTreeMap<String, Locator>) -> Result<(), String> {
+    if let Some(name) = value.as_str() {
+        *value = json!(targets
+            .get(name)
+            .ok_or_else(|| format!("unknown target {name}"))?);
     }
     Ok(())
 }

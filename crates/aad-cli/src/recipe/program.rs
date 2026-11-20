@@ -217,7 +217,7 @@ impl Compiler {
 
     fn statement(
         &mut self,
-        mut raw: Value,
+        raw: Value,
         id: &str,
         label: Option<&str>,
         scope: &mut Scope,
@@ -296,6 +296,19 @@ impl Compiler {
             return Ok(json!({"type":"set","id":id,"assign":assign}));
         }
 
+        let step = if raw.get("collect_table").is_some() {
+            super::provider::collect_table(raw, id, ctx.app, ctx.targets, scope)?
+        } else {
+            Self::control_step(raw, id, ctx, scope)?
+        };
+        self.control = true;
+        if let Some(name) = label {
+            scope.bind(name, format!("steps.{id}.output"), false)?;
+        }
+        Ok(step)
+    }
+
+    fn control_step(mut raw: Value, id: &str, ctx: Context, scope: &Scope) -> Result<Value> {
         if raw.get("app").is_some() || raw.get("input").is_some() {
             return Err(
                 "use the phase app and reference declared recipe inputs in expressions".into(),
@@ -312,10 +325,6 @@ impl Compiler {
         scope.resolve(&mut raw)?;
         let step: Step = decode(raw)?;
         let mut doc = steps::workflow("recipe", &[step]).map_err(|err| err.message)?;
-        self.control = true;
-        if let Some(name) = label {
-            scope.bind(name, format!("steps.{id}.output"), false)?;
-        }
         Ok(doc["steps"][0].take())
     }
 
