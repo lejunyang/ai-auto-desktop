@@ -352,6 +352,8 @@ aad mcp --allow-input --provider browser.firefox_bidi --browser-bidi-port 9223
 `aad capture <页面> --role img --name 登录二维码 --out code.png` 把元素截图写到文件。
 - 失败以结构化错误返回，并附 `hint` 说明怎样恢复（例如界面变了要重新 observe，匹配多个要用 `within` 收窄）。
 
+**批量运行**：同一观察要查多个元素用 `control_find_many`；已知的一次性任务用 `run_steps`（1–32 个声明式步骤，不存盘），每步仍重新观察和校验。见[调用示例](docs/control-sessions.md)和[长流程实测、录制密度与竞品缺口](docs/research/browser-computer-recording-efficiency-2026-11-21.md)。
+
 **保存与运行流程**（重复劳动）：`save_workflow`、`list_workflows`、`describe_workflow`、`run_workflow`。
 `save_workflow` 收的是和 `aad record`、GUI 相同的平台无关步骤（`control-steps/1`）：每步写应用（provider、进程名、
 标题里不变的部分或网址前缀）、`locator`（照抄 outline 里每个元素带的 `locator`）和 `control_act` 用过的动作（去掉 target，
@@ -367,8 +369,7 @@ run_workflow(greeter, ...)  → {"status":"succeeded","outputs":{...}}
 
 几个刻意的边界：
 
-- **工作流只能按名字从 store 取**，不接受 AI 内联提交描述文件——否则 AI 就能自己编一份
-  工作流让本机执行，等于绕过整套「先观察后行动」的约束。
+- **`run_workflow` 只能按名字从 store 取**，不接受 AI 内联提交完整工作流。`run_steps` 只收受限的声明式控制步骤，不能提交脚本或绕开「先观察后行动」的约束。
 - **含 `script` 的工作流按名拒绝**（`MCP.SCRIPTS_REFUSED`），并指明「要跑请人来跑：
   `aad run <file> --allow-scripts`」。AI 决定运行某个流程，不等于有人决定信任其中的代码。
 - `describe_workflow` 会回报 `runnable`，所以这条限制**从只读调用就能发现**，不必靠一次
