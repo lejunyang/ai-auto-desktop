@@ -14,6 +14,7 @@ mod cdp_watch;
 mod control;
 mod desk;
 mod recipe;
+mod run_review;
 
 use serde_json::{json, Value};
 use std::io::Write;
@@ -77,6 +78,8 @@ enum Command {
     Record(desk::RecordArgs),
     /// Export an editable, runnable YAML recipe from a recording.
     Recipe(recipe::Export),
+    /// Inspect an execution journal after a failure, cancellation or disconnect.
+    Review(FileArgs),
     /// Continuously observe foreground app switches and in-app changes.
     ///
     /// Streams one JSON object per line (JSONL). Unlike `record`, it is not
@@ -458,6 +461,10 @@ fn dispatch(command: &Command) -> (Value, u8) {
             ),
         },
         Command::Record(args) => desk::record(args),
+        Command::Review(args) => match run_review::review(&args.file) {
+            Ok(result) => (result, EXIT_OK),
+            Err(message) => (failure("CLI.JOURNAL_INVALID", &message, None), EXIT_USAGE),
+        },
         Command::Recipe(args) => match recipe::export(args) {
             Ok(result) => (result, EXIT_OK),
             Err(message) => (failure("CLI.RECIPE_INVALID", &message, None), EXIT_USAGE),
