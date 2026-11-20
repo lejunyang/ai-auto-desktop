@@ -106,4 +106,15 @@ test('typed batches re-observe after a write and stop on a missing element',
     await page.cdp.eval(`document.querySelector('[aria-label="Order ID"]').value = 'x'.repeat(4100); true`);
     const long = await tool('control_read_fields',{resource_id,fields:[field('order_id','Order ID')]},true);
     assert.equal(long.error.code,'CONTROL.FIELD_TOO_LARGE');
+    await page.cdp.eval(`document.body.innerHTML='<table aria-label="Orders" aria-rowcount="1000"><tr></tr></table>';
+      const row=document.querySelector('tr');for(let column=0;column<51;column++)row.insertCell().innerText=column===0?'a'.repeat(501):'B';
+      const hidden=row.parentElement.insertRow();hidden.hidden=true;hidden.insertCell().innerText='hidden order';true`);
+    const view=(await tool('control_observe',{resource_id,view:{mode:'text',max_characters:540}})).data;
+    const table=view.tables[0];
+    assert.equal(view.tables_truncated,true);
+    assert.equal(table.scope,'rendered_rows');
+    assert.equal(table.row_count,1);
+    assert.deepEqual(new Set(table.truncation_reasons),new Set(['rows_not_rendered','column_limit','cell_limit','character_budget']));
+    assert.equal(table.rows[0][0].length,500);
+    assert.equal(table.rows[0].length,41);
   });

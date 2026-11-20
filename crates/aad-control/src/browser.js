@@ -248,16 +248,31 @@
       const full=root ? (root.innerText||'') : '';
       const ids=new Map(); nodes.forEach((found,id)=>ids.set(found.el,id));
       let budget=max, cut=false;
-      const cell=c=>{const text=(c.innerText||'').trim().slice(0,500);if(text.length>budget){cut=true;const part=text.slice(0,Math.max(budget,0));budget=0;return part;}budget-=text.length;return text;};
-      const all=root ? Array.from(root.querySelectorAll('table')).filter(visible) : [];
+      const all=root ? [...(root.matches('table')?[root]:[]),...root.querySelectorAll('table')].filter(visible) : [];
       const tables=[];
       for (const table of all.slice(0,20)) {
         if (budget<=0) {cut=true;break;}
-        const rows=Array.from(table.rows);
-        const shown=[];
-        for (const row of rows.slice(0,200)) {if(budget<=0){cut=true;break;}shown.push(Array.from(row.cells).slice(0,50).map(cell));}
+        const rows=Array.from(table.rows).filter(visible);
+        const shown=[], reasons=new Set();
+        if(rows.length>200)reasons.add('row_limit');
+        const declared=Number(table.getAttribute('aria-rowcount')||0);
+        if(declared===-1||declared>rows.length)reasons.add('rows_not_rendered');
+        for (const row of rows.slice(0,200)) {
+          if(budget<=0){reasons.add('character_budget');break;}
+          const cells=Array.from(row.cells).filter(visible), values=[];
+          if(cells.length>50)reasons.add('column_limit');
+          for(const cell of cells.slice(0,50)){
+            if(budget<=0){reasons.add('character_budget');break;}
+            const text=(cell.innerText||'').trim(), limit=Math.min(500,budget);
+            if(text.length>500)reasons.add('cell_limit');
+            if(Math.min(text.length,500)>budget)reasons.add('character_budget');
+            const value=text.slice(0,limit);values.push(value);budget-=value.length;
+          }
+          shown.push(values);
+        }
+        if(reasons.size)cut=true;
         tables.push({node_id:ids.get(table)||null,name:(table.getAttribute('aria-label')||(table.caption?table.caption.innerText:'')||'').trim().slice(0,256),
-          row_count:rows.length,rows:shown,truncated:shown.length<rows.length});
+          scope:'rendered_rows',row_count:rows.length,rows:shown,truncated:reasons.size>0,truncation_reasons:[...reasons]});
       }
       return {text:full.slice(0,max),characters:full.length,text_truncated:full.length>max,tables,table_count:all.length,tables_truncated:cut||all.length>tables.length};
     },
