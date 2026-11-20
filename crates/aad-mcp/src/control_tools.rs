@@ -389,12 +389,12 @@ the first one. To ask whether something has gone away, pass expect: optional and
         ),
         (
             "control_collect_table",
-            "Collect an HTML table from the current page forward using a stable selected column as row_key. Pagination clicks the freshly observed Next control. Virtual scrolling starts at the top and needs expected_rows or aria-rowcount to confirm completeness. Inspect complete and stop_reason. Requires input permission.",
+            "Collect an HTML table from the current page forward using a stable selected column as row_key. Pagination requires an observed First control or expected_rows to confirm the start, and advances using freshly observed Next controls. Virtual scrolling starts at the top and needs expected_rows or aria-rowcount to confirm completeness. Inspect complete and stop_reason. Requires input permission.",
             json!({
                 "resource_id":{"type":"string"},"table":crate::tools::locator_schema(),
                 "columns":{"type":"array","minItems":1,"maxItems":32,"uniqueItems":true,"items":{"type":"string","minLength":1,"maxLength":256}},
                 "row_key":{"type":"string"},"traversal":{"oneOf":[
-                    {"type":"object","properties":{"mode":{"const":"pagination"},"next":crate::tools::locator_schema()},"required":["mode","next"],"additionalProperties":false},
+                    {"type":"object","properties":{"mode":{"const":"pagination"},"next":crate::tools::locator_schema(),"first":crate::tools::locator_schema()},"required":["mode","next"],"additionalProperties":false},
                     {"type":"object","properties":{"mode":{"const":"virtual_scroll"},"container":crate::tools::locator_schema()},"required":["mode","container"],"additionalProperties":false}
                 ]},
                 "expected_rows":{"type":"integer","minimum":0,"description":"Expected number of unique data rows, excluding the header."},

@@ -45,6 +45,36 @@ test('one CLI invocation traverses Chromium, exports CSV and compares exact amou
       return error.code===1 && result.complete===false && result.stop_reason==='row_count_mismatch';
     });
     await assert.rejects(readFile(join(page.root,'partial.csv')), {code:'ENOENT'});
+    delete spec.expected_rows;
+    await writeFile(join(page.root,'spec.json'),JSON.stringify(spec));
+    await page.cdp.eval(`document.querySelector('table').setAttribute('aria-rowcount','2');
+      const next=document.querySelector('button');
+      const first=document.createElement('button');first.textContent='First';next.after(first);
+      window.firstClicks=0;
+      first.onclick=()=>{firstClicks++;setTimeout(()=>{
+        row.innerHTML='<td>B1</td><td>0.10</td><td>A, &quot;quote&quot;</td>';
+        first.disabled=true;next.disabled=false;
+      },180)};
+      next.addEventListener('click',()=>{first.disabled=false});
+      true`);
+    await assert.rejects(invoke(...compare,'--output','suffix.csv'),error=>{
+      const result=JSON.parse(error.stdout);
+      return error.code===1 && result.stop_reason==='start_unverified' && !result.complete &&
+        result.scope==='pagination_from_current_page' && result.records.length===1 && !result.comparison;
+    });
+    await assert.rejects(readFile(join(page.root,'suffix.csv')), {code:'ENOENT'});
+    spec.traversal.first={role:'button',name:'First'};
+    await writeFile(join(page.root,'spec.json'),JSON.stringify(spec));
+    const rewound=JSON.parse((await invoke(...compare,'--output','full.csv')).stdout);
+    assert.equal(rewound.complete,true);
+    assert.equal(rewound.scope,'pagination_from_first_page');
+    assert.equal(rewound.matches,true);
+    assert.equal(rewound.actions,2);
+    assert.equal(await page.cdp.eval('firstClicks'),1);
+    assert.deepEqual(await readFile(join(page.root,'full.csv')),await readFile(join(page.root,'actual.csv')));
+    delete spec.traversal.first;
+    spec.expected_rows=2;
+    await writeFile(join(page.root,'spec.json'),JSON.stringify(spec));
     await page.cdp.eval("location.reload(); true").catch(()=>{});
     for (let i=0;i<100 && await page.cdp.eval("document.querySelector('#row td')?.innerText").catch(()=>null)!=='B1';i++)
       await new Promise(resolve=>setTimeout(resolve,30));

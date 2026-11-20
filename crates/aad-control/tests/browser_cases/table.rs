@@ -42,7 +42,12 @@ fn collect_table_paginates_and_waits_for_replaced_controls() {
     let first = success(first);
     assert_eq!(first["stop_reason"], "page_limit");
     assert_eq!(first["actions"], 0);
-    let all = success(collect(&session, &main, traversal.clone(), json!({})));
+    let all = success(collect(
+        &session,
+        &main,
+        traversal.clone(),
+        json!({"expected_rows":3}),
+    ));
     assert_eq!(all["complete"], true);
     assert_eq!(all["actions"], 2);
     assert_eq!(
@@ -89,6 +94,7 @@ fn collect_table_scrolls_a_recycled_window_and_checks_total() {
         (0..18).map(|i| format!("K{i}")).collect::<Vec<_>>()
     );
     let partial = success(collect(&session, &main, traversal, json!({})));
+    assert_eq!(partial["scope"], "virtual_scroll_from_current_position");
     assert_eq!(partial["stop_reason"], "start_not_at_top");
     assert_eq!(partial["complete"], false);
 }

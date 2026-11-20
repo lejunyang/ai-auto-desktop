@@ -49,7 +49,7 @@ pub struct CollectArgs {
     resource_id: Option<String>,
     #[arg(long,default_value_t=9222,value_parser=clap::value_parser!(u16).range(1..))]
     browser_port: u16,
-    /// Grant input for the observed Next button or scroll container.
+    /// Grant input for the observed pagination buttons or scroll container.
     #[arg(long)]
     allow_input: bool,
     /// New CSV file to create for a complete result.
@@ -68,6 +68,7 @@ pub struct CollectArgs {
 #[derive(Deserialize)]
 struct Dataset {
     complete: bool,
+    scope: Option<String>,
     columns: Vec<String>,
     row_key: String,
     row_count: usize,
@@ -114,6 +115,13 @@ impl Dataset {
     fn validated(data: Self) -> Result<Self> {
         if !data.complete {
             return Err("collection is incomplete".into());
+        }
+        if data.scope.as_deref() == Some("pagination_from_current_page")
+            && data.expected_rows.is_none()
+        {
+            return Err(
+                "paginated collection has no first-page witness or expected row total".into(),
+            );
         }
         if data.row_count != data.records.len()
             || data.expected_rows.is_some_and(|n| n != data.row_count)

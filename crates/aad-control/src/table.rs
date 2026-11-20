@@ -97,15 +97,28 @@ fn default_rows() -> usize {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Traversal {
-    Pagination { next: Locator },
-    VirtualScroll { container: Locator },
+    Pagination {
+        next: Locator,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        first: Option<Box<Locator>>,
+    },
+    VirtualScroll {
+        container: Locator,
+    },
 }
 
 impl Collection {
     fn control(&self) -> &Locator {
         match &self.traversal {
-            Traversal::Pagination { next } => next,
+            Traversal::Pagination { next, .. } => next,
             Traversal::VirtualScroll { container } => container,
+        }
+    }
+
+    fn first(&self) -> Option<&Locator> {
+        match &self.traversal {
+            Traversal::Pagination { first, .. } => first.as_deref(),
+            Traversal::VirtualScroll { .. } => None,
         }
     }
 
@@ -124,7 +137,10 @@ impl Collection {
                 "max_pages must be 1..256 and max_rows 1..10000",
             ));
         }
-        for locator in [&self.table, self.control()] {
+        for locator in [&self.table, self.control()]
+            .into_iter()
+            .chain(self.first())
+        {
             if locator.is_empty() || contains_node_id(&serde_json::to_value(locator).unwrap()) {
                 return Err(error(
                     "CONTROL.INVALID_REQUEST",
@@ -146,10 +162,17 @@ fn contains_node_id(value: &Value) -> bool {
     }
 }
 
+enum TableMove {
+    First,
+    Next,
+    Scroll,
+}
+
 struct Page {
     records: Vec<Value>,
     limits: Vec<String>,
     control: Value,
+    first: Value,
     viewport: Value,
     declared: Option<usize>,
 }
@@ -160,6 +183,7 @@ impl Page {
             && self.viewport == other.viewport
             && self.limits == other.limits
             && self.declared == other.declared
+            && self.first["node"]["states"]["enabled"] == other.first["node"]["states"]["enabled"]
             && self.control["found"] == other.control["found"]
             && self.control["node"]["states"]["enabled"]
                 == other.control["node"]["states"]["enabled"]
@@ -238,6 +262,16 @@ impl Session {
             },
             context,
         )?;
+        let first = match spec.first() {
+            Some(locator) => self.find_in(&id, &observation, locator, Expect::Optional, context)?,
+            None => Value::Null,
+        };
+        if first["found"] == true && first["target"] == control["target"] {
+            return Err(error(
+                "CONTROL.INVALID_REQUEST",
+                "First and Next must identify distinct controls",
+            ));
+        }
         let table_id = &table["target"]["node_id"];
         let content = self.backends[&observation.provider].table_content(
             &observation.raw,
@@ -255,12 +289,97 @@ impl Session {
         Ok(Page {
             records: projected["records"].as_array().unwrap().clone(),
             limits,
+            first,
             control,
             viewport: content["viewport"].clone(),
             declared: content["tables"][0]["declared_data_rows"]
                 .as_u64()
                 .and_then(|n| usize::try_from(n).ok()),
         })
+    }
+
+    fn advance_table(
+        &self,
+        resource: &str,
+        spec: &Collection,
+        page: &Page,
+        movement: TableMove,
+        context: &Context,
+    ) -> Result<Option<Page>> {
+        let control = if matches!(movement, TableMove::First) {
+            &page.first
+        } else {
+            &page.control
+        };
+        let target = serde_json::from_value(control["target"].clone()).map_err(|_| {
+            error(
+                "CONTROL.BAD_PROVIDER_OUTPUT",
+                "invalid traversal control target",
+            )
+        })?;
+        let action = if matches!(movement, TableMove::Scroll) {
+            Action::Scroll {
+                direction: Direction::Down,
+                notches: Some(1),
+                fraction: None,
+            }
+        } else {
+            Action::click()
+        };
+        self.dispatch(
+            &Operation::Act {
+                target,
+                action,
+                verify: None,
+            },
+            context,
+        )?;
+
+        // Wait for a changed row window (or a moved virtual viewport).
+        // Never submit a second click to make a delayed first click "work".
+        let started = Instant::now();
+        let mut candidate: Option<Page> = None;
+        loop {
+            std::thread::sleep(context.remaining()?.min(Duration::from_millis(80)));
+            let elapsed = started.elapsed();
+            let fresh = match self.table_page(resource, spec, context) {
+                Ok(fresh) => fresh,
+                Err(e)
+                    if elapsed < Duration::from_secs(2)
+                        && matches!(
+                            e.code.as_str(),
+                            "CONTROL.STALE_TARGET" | "CONTROL.NOT_FOUND" | "CONTROL.TABLE_HEADER"
+                        ) =>
+                {
+                    candidate = None;
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
+            // Applications may clear rows and disable Next while loading.
+            // A compositor scroll can likewise precede the recycled DOM.
+            let rows_changed = !fresh.records.is_empty() && fresh.records != page.records;
+            let moved = matches!(movement, TableMove::Scroll) && fresh.viewport != page.viewport;
+            let settle = if fresh.viewport["at_bottom"] == true {
+                Duration::from_secs(2)
+            } else {
+                Duration::from_millis(500)
+            };
+            let first_ready = !matches!(movement, TableMove::First)
+                || fresh.first["node"]["states"]["enabled"] == false;
+            if first_ready
+                && (rows_changed || (moved && elapsed >= settle))
+                && candidate
+                    .as_ref()
+                    .is_some_and(|last| fresh.same_window(last))
+            {
+                return Ok(Some(fresh));
+            }
+            if elapsed >= Duration::from_secs(2) {
+                return Ok(None);
+            }
+            candidate = Some(fresh);
+        }
     }
 
     pub(crate) fn collect_table(
@@ -281,9 +400,29 @@ impl Session {
         let mut rows = Rows::default();
         let mut pages = 0;
         let mut actions = 0;
+        // A paginated site's aria-rowcount may describe just this HTML table
+        // on the last page. Only a caller-supplied business total proves the
+        // entire paginated dataset by count alone.
         let declared = page.declared;
-        let expected = spec.expected_rows.or(declared);
-        let (complete, reason) = 'collect: loop {
+        let expected = spec
+            .expected_rows
+            .or(if scrolling { declared } else { None });
+        let mut first_verified = page.first["node"]["states"]["enabled"] == false;
+        let mut seek_first = page.first["node"]["states"]["enabled"] == true;
+        let at_top = scrolling && page.viewport["at_top"] == true;
+        let mut unrendered = false;
+        let (complete, reason) = loop {
+            if seek_first {
+                actions += 1;
+                let Some(first) =
+                    self.advance_table(resource, spec, &page, TableMove::First, context)?
+                else {
+                    break (false, "first_unconfirmed".into());
+                };
+                page = first;
+                first_verified = true;
+                seek_first = false;
+            }
             pages += 1;
             if let Some(limit) = page
                 .limits
@@ -292,13 +431,18 @@ impl Session {
             {
                 break (false, limit.clone());
             }
-            if page.declared != declared
-                || (spec.expected_rows.is_some()
-                    && declared.is_some()
-                    && spec.expected_rows != declared)
+            if scrolling
+                && (page.declared != declared
+                    || (spec.expected_rows.is_some()
+                        && declared.is_some()
+                        && spec.expected_rows != declared))
             {
                 break (false, "row_count_changed".into());
             }
+            unrendered |= page
+                .limits
+                .iter()
+                .any(|reason| reason == "rows_not_rendered");
             let before = rows.records.len();
             if let Some(reason) = rows.merge(&page, spec)? {
                 break (false, reason.into());
@@ -306,7 +450,7 @@ impl Session {
             if expected.is_some_and(|n| rows.records.len() > n) {
                 break (false, "row_count_mismatch".into());
             }
-            if scrolling && pages == 1 && page.viewport["at_top"] != true {
+            if scrolling && pages == 1 && !at_top {
                 break (false, "start_not_at_top".into());
             }
             let terminal = if scrolling {
@@ -318,7 +462,10 @@ impl Session {
                 if expected.is_some_and(|n| rows.records.len() != n) {
                     break (false, "row_count_mismatch".into());
                 }
-                if expected.is_none() && (scrolling || !page.limits.is_empty()) {
+                if expected.is_none() && !scrolling && !first_verified {
+                    break (false, "start_unverified".into());
+                }
+                if expected.is_none() && (scrolling || unrendered) {
                     break (false, "total_unverified".into());
                 }
                 break (
@@ -349,80 +496,20 @@ impl Session {
             if pages == spec.max_pages {
                 break (false, "page_limit".into());
             }
-            let target = serde_json::from_value(page.control["target"].clone()).map_err(|_| {
-                error(
-                    "CONTROL.BAD_PROVIDER_OUTPUT",
-                    "invalid traversal control target",
-                )
-            })?;
-            let action = if scrolling {
-                Action::Scroll {
-                    direction: Direction::Down,
-                    notches: Some(1),
-                    fraction: None,
-                }
+            let movement = if scrolling {
+                TableMove::Scroll
             } else {
-                Action::click()
+                TableMove::Next
             };
-            self.dispatch(
-                &Operation::Act {
-                    target,
-                    action,
-                    verify: None,
-                },
-                context,
-            )?;
             actions += 1;
-
-            // Wait for a changed row window (or a moved virtual viewport).
-            // Never submit a second click to make a delayed first click "work".
-            let started = Instant::now();
-            let mut candidate: Option<Page> = None;
-            loop {
-                std::thread::sleep(context.remaining()?.min(Duration::from_millis(80)));
-                let elapsed = started.elapsed();
-                let fresh = match self.table_page(resource, spec, context) {
-                    Ok(fresh) => fresh,
-                    Err(e)
-                        if elapsed < Duration::from_secs(2)
-                            && matches!(
-                                e.code.as_str(),
-                                "CONTROL.STALE_TARGET"
-                                    | "CONTROL.NOT_FOUND"
-                                    | "CONTROL.TABLE_HEADER"
-                            ) =>
-                    {
-                        candidate = None;
-                        continue;
-                    }
-                    Err(e) => return Err(e),
-                };
-                // Applications may clear rows and disable Next while loading.
-                // A compositor scroll can likewise precede the recycled DOM.
-                let rows_changed = !fresh.records.is_empty() && fresh.records != page.records;
-                let moved = scrolling && fresh.viewport != page.viewport;
-                let settle = if fresh.viewport["at_bottom"] == true {
-                    Duration::from_secs(2)
-                } else {
-                    Duration::from_millis(500)
-                };
-                if (rows_changed || (moved && elapsed >= settle))
-                    && candidate
-                        .as_ref()
-                        .is_some_and(|last| fresh.same_window(last))
-                {
-                    page = fresh;
-                    break;
-                }
-                if elapsed >= Duration::from_secs(2) {
-                    break 'collect (false, "no_progress".into());
-                }
-                candidate = Some(fresh);
+            match self.advance_table(resource, spec, &page, movement, context)? {
+                Some(next) => page = next,
+                None => break (false, "no_progress".into()),
             }
         };
         context.remaining()?;
         Ok(json!({
-            "scope":if scrolling {"virtual_scroll_from_top"} else {"pagination_from_current_page"},
+            "scope":if at_top {"virtual_scroll_from_top"} else if scrolling {"virtual_scroll_from_current_position"} else if first_verified {"pagination_from_first_page"} else {"pagination_from_current_page"},
             "columns":spec.columns,"row_key":spec.row_key,"records":rows.records,
             "row_count":rows.records.len(),"expected_rows":expected,"pages":pages,"actions":actions,
             "complete":complete,"stop_reason":reason

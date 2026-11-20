@@ -72,6 +72,14 @@ fn cli_exports_csv_and_reconciles_keyed_data_and_exact_totals() {
     assert_eq!(different["differences"][2]["kind"], "missing");
     fs::write(&expected, "ID,Note,Amount\n001,a,1e-2\n").unwrap();
     assert!(table(dir, &check, 1).get("matches").is_none());
+    data["scope"] = json!("pagination_from_current_page");
+    save(&data);
+    table(
+        dir,
+        &["export", "--input", "input.json", "--output", "suffix.csv"],
+        1,
+    );
+    assert!(!dir.join("suffix.csv").exists());
     data["complete"] = json!(false);
     save(&data);
     table(
