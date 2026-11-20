@@ -325,13 +325,27 @@ pub fn locator_for(node: &Value) -> Locator {
 }
 
 fn request(session: &Session, operation: Operation, deadline: Instant) -> Result<Value> {
+    request_cancellable(
+        session,
+        operation,
+        deadline,
+        aad_runtime::CancellationToken::new(),
+    )
+}
+
+fn request_cancellable(
+    session: &Session,
+    operation: Operation,
+    deadline: Instant,
+    token: aad_runtime::CancellationToken,
+) -> Result<Value> {
     let remaining = deadline.saturating_duration_since(Instant::now());
     if remaining.is_zero() {
         return Err(error("STEP.TIMEOUT", "the step ran out of time"));
     }
     let mut request = Request::new(Some(session.id().to_string()), operation);
     request.timeout_ms = (remaining.as_millis() as u64).clamp(1, crate::MAX_TIMEOUT_MS);
-    let response = session.execute(&request);
+    let response = session.execute_cancellable(&request, token);
     match response.data {
         Some(data) => Ok(data),
         None => {
@@ -803,6 +817,15 @@ impl StepProvider {
                 "low",
             ),
         );
+        actions.insert(
+            "collect_table".into(),
+            contract(
+                "Collect keyed records through observed pagination or scrolling.",
+                "non_idempotent",
+                "modify",
+                "high",
+            ),
+        );
         let mut document = manifest::document(PROVIDER, actions);
         document["metadata"]["version"] = json!("0.1.0");
         Self {
@@ -817,11 +840,54 @@ impl Provider for StepProvider {
         &self.manifest
     }
     fn invoke(&self, action: &str, args: Value, timeout: Option<Duration>) -> Result<Value> {
+        self.invoke_cancellable(
+            action,
+            args,
+            timeout,
+            &aad_runtime::CancellationToken::new(),
+        )
+    }
+
+    fn invoke_cancellable(
+        &self,
+        action: &str,
+        args: Value,
+        timeout: Option<Duration>,
+        token: &aad_runtime::CancellationToken,
+    ) -> Result<Value> {
+        token.check()?;
         let name = action
             .strip_prefix(PROVIDER)
             .and_then(|rest| rest.strip_prefix('.'))
             .and_then(|rest| rest.split('@').next())
             .unwrap_or(action);
+        if name == "collect_table" {
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Args {
+                app: App,
+                #[serde(flatten)]
+                spec: Box<crate::table::Collection>,
+            }
+            let args: Args = serde_json::from_value(args)
+                .map_err(|e| invalid(format!("invalid table collection: {e}")))?;
+            if args.app == App::default() {
+                return Err(invalid("table collection requires an application selector"));
+            }
+            let deadline = Instant::now() + timeout.unwrap_or(Duration::from_secs(30));
+            let resource_id = resource(&self.session, &args.app, deadline)?.ok_or_else(|| {
+                error("STEP.APP_NOT_FOUND", "no open page matches the application")
+            })?;
+            return request_cancellable(
+                &self.session,
+                Operation::CollectTable {
+                    resource_id,
+                    spec: args.spec,
+                },
+                deadline,
+                token.clone(),
+            );
+        }
         let step: Step = serde_json::from_value(args["step"].clone())
             .map_err(|e| invalid(format!("unreadable step: {e}")))?;
         let expected = if step.read.is_some() {

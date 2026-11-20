@@ -95,3 +95,42 @@ fn collect_table_scrolls_a_recycled_window_and_checks_total() {
     assert_eq!(partial["stop_reason"], "start_not_at_top");
     assert_eq!(partial["complete"], false);
 }
+
+#[test]
+#[ignore = "requires an isolated sandboxed headless Chromium"]
+fn workflow_collect_table_exposes_named_collection_output() {
+    let _serial = serial();
+    let fixture = Fixture::new();
+    let (session, _) = session_for(&fixture);
+    let main = main_of(&session, &fixture.page_id);
+    assert!(wait_until(&session, &main, "Name", WaitCondition::Appears)
+        .error
+        .is_none());
+    let args = json!({"app":{"provider":browser::PROVIDER,"url":fixture.url},
+        "table":{"name":"Prices","role":"table"},"columns":["Item","Cost"],"row_key":"Item",
+        "expected_rows":2,"traversal":{"mode":"pagination","next":{"name":"Next","role":"button"}}});
+    let workflow = json!({
+        "apiVersion":"ai-auto-desktop.dev/v1alpha1","kind":"Workflow",
+        "metadata":{"name":"collect-prices","version":"0.1.0"},
+        "requires":{"capabilities":[{"name":"control.session","version":">=0.1.0"}],"permissions":["desktop.observe","desktop.input"]},
+        "budgets":{"max_duration":"1m","max_executed_steps":1},
+        "steps":[{"id":"collect","type":"action","uses":"control.session.collect_table@1",
+            "effect":{"class":"non_idempotent"},"risk":{"category":"modify","level":"high"},"with":args}],
+        "outputs":{"ledger":{"value":"${{ steps.collect.output }}"}}
+    });
+    let descriptor = aad_core::compile_descriptor(workflow, None).unwrap();
+    let mut providers = aad_runtime::ProviderRegistry::new();
+    providers.insert(Arc::new(steps::StepProvider::new(Arc::new(session))));
+    let result = aad_runtime::engine::run(
+        &descriptor,
+        aad_runtime::RunOptions::default()
+            .with_providers(providers)
+            .with_granted_permissions(["desktop.observe", "desktop.input"]),
+    );
+    assert_eq!(result.status.as_str(), "succeeded", "{:?}", result.error);
+    assert_eq!(
+        result.outputs["ledger"]["records"],
+        json!([{"Item":"Tea","Cost":"3"},{"Item":"Cake","Cost":"5"}])
+    );
+    assert_eq!(result.outputs["ledger"]["complete"], true);
+}
