@@ -109,7 +109,8 @@ impl Collection {
         }
     }
 
-    fn validate(&self) -> Result<()> {
+    /// Check the collection contract before a workflow performs any actions.
+    pub fn validate(&self) -> Result<()> {
         validate_columns(&self.columns)?;
         if !self.columns.contains(&self.row_key) {
             return Err(error(
