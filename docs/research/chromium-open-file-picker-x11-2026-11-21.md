@@ -1,23 +1,31 @@
 # Selecting a file in an already-open Chromium picker on X11
 
-`aad do choose-files` completed single- and multiple-file selections in an already-open, browser-owned GTK 3 dialog on Linux X11. The page received the file bytes and the native dialog closed.
+`aad do choose-files` completed file selection in three already-open X11 dialogs on Linux: Chromium's GTK 3 dialog, its GTK 4.8.3 dialog, and the GTK desktop portal. Headed tests independently read both files from the intended page in order and observed the original dialog close.
 
 ```sh
 aad do choose-files --cdp-port 9222 --page "$PAGE_ID" --allow-input \
   --allow-upload-dir "$UPLOAD_DIR" --file "$UPLOAD_DIR/one.txt" --file "$UPLOAD_DIR/two.txt"
 ```
 
-Use the exact page ID from `aad browser-record targets --cdp-port 9222`. The command observes the active native dialog. An optional `--window 0x…` additionally requires a particular XID. An upload grant covers regular files whose canonical paths are under that directory. A local file **page** separately requires `--allow-browser-file-dir`.
+Use the exact page ID from `aad browser pages --cdp-port 9222`. The command observes the active native dialog. An optional `--window 0x…` additionally requires a particular XID. An upload grant covers regular files whose canonical paths are under that directory. A local file **page** separately requires `--allow-browser-file-dir`.
 
 ### How the selection is bound
 
 1. On the selected page's main frame, the browser provider observes the unique file input with `states.picker_open=true` (Chromium's `:open`). The active element can be a different control. The input can be hidden.
-2. The native observation binds the mapped GTK dialog and its transient parent to the CDP browser PID using both X-Resource client ownership and the window PID. The parent must uniquely match the selected CDP window bounds. The active modal must have the GTK file-chooser window role and an accepted Open title. Ambiguous chooser windows are refused.
+2. The native observation pins the active modal XID, its transient parent, their process identities from X-Resource and their window PID properties. The parent must belong to the CDP browser and uniquely match the selected window bounds. An accepted Open title and the additional backend identity below are both required.
 3. The normal session upload action rechecks the observed input identity and picker state, validates the path grant, and assigns the files. The CLI then revalidates the native window, sends `WM_DELETE_WINDOW` to that XID, and verifies its unmap or destruction. The session holds the browser and desktop input leases throughout. A dismissal failure after successful assignment reports `files_submitted=true` and an applied effect.
 
 The headed regression read both selected files through the page's File API in the requested order. The hidden file input received a trusted change event, its sibling received zero files, and the page saw no cancel event. The wrong tab, wrong XID, and an escaping symlink all left the original picker open. A real Save As dialog remained open after refusal. [Regression test](../../tests/browser/open-native-picker.test.mjs)
 
-The verified configuration used Chrome for Testing 156, a private Xvfb display, xfwm4, and GTK 3. The command accepts the titles `Open File`, `Open Files`, and `打开文件`. It requires a unique match for the native parent in X11 pixel bounds. The tested GTK 4.8.3 dialog lacked the required X11 `WM_WINDOW_ROLE`. Desktop-portal dialogs owned by a separate process also fail the native binding.
+| Backend | Additional native identity |
+| --- | --- |
+| Browser-owned GTK 3 | The dialog belongs to the browser PID and publishes the X11 role `GtkFileChooserDialog`. |
+| Browser-owned GTK 4 | The dialog lacks the X11 role. Its two `WM_CLASS` strings match the browser PID's registered GTK 4 application name. The sole visible GTK modal has the same title, a `GtkFileChooserWidget` and one Open response button outside the widget. The same AT-SPI objects must survive reobservation. |
+| GTK desktop portal | The dialog belongs to the D-Bus owner of `org.freedesktop.impl.portal.desktop.gtk` and has that backend's X11 class and file-chooser role. Frontend and backend must export the same sole live request. Its sender's D-Bus PID must equal Chromium's browser PID. Both service connections and the request path are pinned. [Portal request identity](https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.Request.html) |
+
+The verified configuration used Chrome for Testing 156, private Xvfb, xfwm4 and a private session bus. The X11 title allowlist is `Open File`, `Open Files`, and `打开文件`. GTK 4 additionally requires the English Open response name. Its real Save As dialog was refused even after the fixture changed its X11 title to `Open File`. With two real Chromium processes each opening a GTK portal picker, both commands refused and both file inputs stayed empty. The portal route requires a unique request across the two services and a visible X11 transient parent. Other portal implementations and native Wayland require separate verification.
+
+To run the headed regression, set `AAD_TEST_PICKER_X11=1`, `AAD_TEST_CHROME` and `AAD_TEST_CLI` inside the private X11 session and run `node --test tests/browser/open-native-picker.test.mjs`. For a direct GTK dialog, use a private bus without an activatable desktop portal and set `AAD_TEST_PICKER_GTK=3` or `4` (GTK 4 used `GTK_A11Y=atspi` and an English locale). For the portal variant, enable the GTK portal in that bus, query `org.freedesktop.portal.FileChooser.version` before launching Chromium, and set `AAD_TEST_PICKER_PORTAL=1`. The fixture checks the actual X11 role and PID to distinguish the exercised routes.
 
 ## Native-widget experiment
 
