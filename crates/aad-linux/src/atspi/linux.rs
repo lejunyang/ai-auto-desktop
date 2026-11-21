@@ -29,6 +29,7 @@ mod focus_discovery;
 pub(super) mod gtk4_picker;
 pub(super) mod kde_picker;
 mod table;
+mod wayland_input;
 use focus_discovery::FocusDiscovery;
 mod window_focus;
 use window_focus::append_window_args;
@@ -607,6 +608,12 @@ impl LinuxBackend {
     }
 
     fn probe_input(&self, deadline: Instant) -> Result<InputSupport, AutomationError> {
+        if crate::wayland_portal::is_wayland_session() {
+            return Err(driver_error(
+                "DRIVER.ACTION_UNSUPPORTED",
+                "X11 input requires an X11 session",
+            ));
+        }
         let result = self.helper(HelperKind::Input).and_then(|path| {
             probe_input_helper(&path, deadline).map(|features| InputSupport { path, features })
         });
@@ -1022,6 +1029,14 @@ impl AtspiBackend for LinuxBackend {
     }
 
     fn check_action_support(&self, action: &str, deadline: Instant) -> Result<(), AutomationError> {
+        if crate::wayland_portal::is_wayland_session()
+            && matches!(action, "key_chord" | "pointer_click")
+        {
+            return Err(driver_error(
+                "DRIVER.ACTION_UNSUPPORTED",
+                "target has no qualified Wayland widget input binding",
+            ));
+        }
         let feature = match action {
             "type_text" => "type-text",
             "pointer_click" => "pointer-click",
@@ -1257,7 +1272,11 @@ impl AtspiBackend for LinuxBackend {
         deadline: Instant,
     ) -> Result<Option<NativeRef>, AutomationError> {
         remaining(deadline, false)?;
-        let point = self.accessibility_point(root, point, deadline)?;
+        let point = if crate::wayland_portal::is_wayland_session() {
+            point
+        } else {
+            self.accessibility_point(root, point, deadline)?
+        };
         let reference = zbus::block_on(self.component_proxy(root)?.get_accessible_at_point(
             point.0,
             point.1,
@@ -1303,6 +1322,26 @@ impl AtspiBackend for LinuxBackend {
     ) -> Result<Value, AutomationError> {
         self.type_text_mode(target, window, text, true, process_id, deadline)
     }
+    fn pointer_click_in_window(
+        &self,
+        target: &NativeRef,
+        window: Option<&WindowAnchor>,
+        point: (i32, i32),
+        process_id: u32,
+        deadline: Instant,
+    ) -> Result<Value, AutomationError> {
+        if crate::wayland_portal::is_wayland_session() {
+            return self.wayland_input(
+                target,
+                window,
+                process_id,
+                wayland_input::Event::Click(point),
+                deadline,
+            );
+        }
+        self.pointer_click(target, point, process_id, deadline)
+    }
+
     fn pointer_click(
         &self,
         _target: &NativeRef,
@@ -1516,6 +1555,21 @@ impl AtspiBackend for LinuxBackend {
         process_id: u32,
         deadline: Instant,
     ) -> Result<Value, AutomationError> {
+        if crate::wayland_portal::is_wayland_session() {
+            if hold_ms.is_some() {
+                return Err(driver_error(
+                    "DRIVER.ACTION_UNSUPPORTED",
+                    "Wayland widget keys do not support a hold duration",
+                ));
+            }
+            return self.wayland_input(
+                target,
+                window,
+                process_id,
+                wayland_input::Event::Key(keys),
+                deadline,
+            );
+        }
         let mut args = vec![
             "key-chord".to_string(),
             "--expected-pid".into(),

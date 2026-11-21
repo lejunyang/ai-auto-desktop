@@ -265,6 +265,9 @@ impl LinuxBackend {
             }
             known.insert(bus.to_string());
         }
+        if crate::wayland_portal::is_wayland_session() {
+            return self.qualify_wayland_widgets(snapshot, deadline);
+        }
         let process = snapshot
             .application
             .get("process_id")

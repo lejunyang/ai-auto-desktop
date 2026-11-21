@@ -322,6 +322,16 @@ pub trait AtspiBackend: Send + Sync {
             "native pointer_gesture helper is unavailable",
         ))
     }
+    fn pointer_click_in_window(
+        &self,
+        target: &NativeRef,
+        _window: Option<&WindowAnchor>,
+        point: (i32, i32),
+        process_id: u32,
+        deadline: Instant,
+    ) -> Result<Value, AutomationError> {
+        self.pointer_click(target, point, process_id, deadline)
+    }
     #[allow(clippy::too_many_arguments)]
     fn pointer_gesture_modified(
         &self,
@@ -1209,6 +1219,12 @@ impl AtspiProvider {
                 "locator resolved to a different native or semantic target",
             ));
         }
+        if resolved["provenance"]["wayland_input_window"].is_string()
+            && input_window(record, &node_id).map(|w| w.native)
+                != input_window(fresh, &fresh_id).map(|w| w.native)
+        {
+            return Err(stale("target moved to another Wayland window"));
+        }
         Ok((fresh_id, resolved, fresh_native))
     }
 
@@ -1537,10 +1553,24 @@ impl AtspiProvider {
                             "target has no positive-area bounds",
                         ));
                     }
-                    let point = (bounds.x + bounds.width / 2, bounds.y + bounds.height / 2);
+                    let point = (
+                        bounds
+                            .x
+                            .checked_add(bounds.width / 2)
+                            .ok_or_else(|| invalid("center overflow"))?,
+                        bounds
+                            .y
+                            .checked_add(bounds.height / 2)
+                            .ok_or_else(|| invalid("center overflow"))?,
+                    );
                     self.validate_point(&fresh, &fresh_id, point, deadline)?;
-                    self.backend
-                        .pointer_click(&native, point, process, deadline)
+                    self.backend.pointer_click_in_window(
+                        &native,
+                        window.as_ref(),
+                        point,
+                        process,
+                        deadline,
+                    )
                 }
                 "pointer_gesture" => {
                     let process = process_id(&node, &fresh)?;
@@ -2014,7 +2044,24 @@ impl AtspiProvider {
             .filter_map(|node| node["node_id"].as_str())
             .collect::<BTreeSet<_>>();
         let mut hit = None;
-        for ancestor in ancestor_chain(record, node_id).into_iter().rev() {
+        // A window-addressed Qt point belongs to the pinned window's logical
+        // space. Different Wayland windows may report identical logical origins.
+        let window_path = record.public["nodes"].as_array().and_then(|nodes| {
+            nodes.iter().find(|n| n["node_id"] == node_id)?["provenance"]["wayland_input_window"]
+                .as_str()
+        });
+        for ancestor in ancestor_chain(record, node_id)
+            .into_iter()
+            .rev()
+            .skip_while(|id| {
+                window_path.is_some_and(|path| {
+                    !record
+                        .handles
+                        .get(id)
+                        .is_some_and(|r| r.object_path == path)
+                })
+            })
+        {
             if !positioned.contains(ancestor.as_str()) {
                 continue;
             }
@@ -3288,7 +3335,7 @@ fn manifest_document() -> Value {
     ));
     actions["secret_input"]["sensitivity"] =
         json!({"input": "sensitive", "output": "public", "error": "public"});
-    actions.insert("pointer_click".into(), contract("重新验证目标后，仅在明确的 KDE/X11 会话中，通过固定路径 XTest helper 按目标 bounds 中心点显式执行左键单击。", "non_idempotent", "modify", "high", &["desktop.observe", "desktop.input"], json!({"type": "object", "required": ["target", "locator"], "properties": {"target": target_schema(), "locator": locator_schema(), "button": {"enum": ["left"]}, "position": {"enum": ["center"]}}, "additionalProperties": false}), write_output(), true, true));
+    actions.insert("pointer_click".into(), contract("重新验证目标与中心点命中后执行左键单击；支持 KDE/X11 XTest 和显式启用窗口定向输入的 Wayland Qt Widgets。", "non_idempotent", "modify", "high", &["desktop.observe", "desktop.input"], json!({"type": "object", "required": ["target", "locator"], "properties": {"target": target_schema(), "locator": locator_schema(), "button": {"enum": ["left"]}, "position": {"enum": ["center"]}}, "additionalProperties": false}), write_output(), true, true));
     let point_input = |extra: Value, required: &[&str]| {
         let mut properties = json!({"target": target_schema(), "locator": locator_schema()});
         properties
@@ -3303,7 +3350,7 @@ fn manifest_document() -> Value {
     let button = json!({"enum": ["left", "middle", "right"]});
     actions.insert("pointer_gesture".into(), contract("重新验证目标后，仅在明确的 KDE/X11 会话中，通过固定路径 XTest helper 在目标 bounds 内的比例位置执行右键/中键/双击、滚轮或悬停。", "non_idempotent", "modify", "high", &["desktop.observe", "desktop.input"], point_input(json!({"button": button, "count": {"enum": [1, 2]}, "fraction": fraction, "scroll": {"type": "object", "required": ["direction"], "properties": {"direction": {"enum": ["up", "down", "left", "right"]}, "notches": {"type": "integer", "minimum": 1, "maximum": 30}}, "additionalProperties": false}, "hover_ms": {"type": "integer", "minimum": 1, "maximum": 5000}}), &[]), write_output(), true, true));
     actions.insert("drag".into(), contract("分别重新验证起点与终点后，通过固定路径 XTest helper 按下、分步移动并在终点释放。", "non_idempotent", "modify", "high", &["desktop.observe", "desktop.input"], point_input(json!({"to": target_schema(), "to_locator": locator_schema(), "button": button, "fraction": fraction, "to_fraction": fraction}), &["to", "to_locator"]), write_output(), true, true));
-    actions.insert("key_chord".into(), contract("重新验证并聚焦目标后，通过固定路径 XTest helper 按下修饰键加一个主键的组合。", "non_idempotent", "input", "high", &["desktop.observe", "desktop.input"], point_input(json!({"keys": {"type": "array", "minItems": 1, "maxItems": 6, "items": {"type": "string", "minLength": 1, "maxLength": 32}}}), &["keys"]), write_output(), true, true));
+    actions.insert("key_chord".into(), contract("重新验证元素后向其发送组合键；KDE/X11 验证原生焦点，Wayland Qt Widgets 需要已聚焦的元素和显式启用的窗口定向输入。", "non_idempotent", "input", "high", &["desktop.observe", "desktop.input"], point_input(json!({"keys": {"type": "array", "minItems": 1, "maxItems": 6, "items": {"type": "string", "minLength": 1, "maxLength": 32}}}), &["keys"]), write_output(), true, true));
     for name in ["pointer_gesture", "drag"] {
         actions[name]["input_schema"]["properties"]["modifiers"] = json!({"type": "array", "maxItems": 4, "uniqueItems": true, "items": {"enum": ["ctrl", "shift", "alt", "meta"]}});
     }
