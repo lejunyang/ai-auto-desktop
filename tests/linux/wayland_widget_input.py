@@ -2,6 +2,7 @@
 import json
 import os
 from pathlib import Path
+import select
 import subprocess
 import sys
 import tempfile
@@ -41,11 +42,32 @@ def application(receipt):
     events = []
     clicks = []
     gestures = []
+    mouse = []
+    class MouseSurface(QWidget):
+        def event(self, event):
+            names = {QEvent.MouseButtonPress: "press", QEvent.MouseButtonRelease: "release",
+                     QEvent.MouseButtonDblClick: "double", QEvent.MouseMove: "move"}
+            if event.type() in names:
+                mouse.append(dict(phase=names[event.type()], button=int(event.button()),
+                                  held=int(event.buttons()), modifiers=int(event.modifiers()),
+                                  pos=[event.pos().x(), event.pos().y()], size=[self.width(), self.height()]))
+                save()
+                event.accept()
+                return True
+            return super().event(event)
+
+    surface = MouseSurface()
+    surface.setAccessibleName("Mouse pad")
+    surface.setMinimumSize(240, 48)
+    box.addWidget(surface)
+    pad_cover = QLabel("Blocked", surface)
+    pad_cover.setGeometry(0, 0, 36, 48)
     def save():
         tmp = receipt.with_suffix(".tmp")
         tmp.write_text(json.dumps(dict(events=events, clicks=clicks, text=field.text(),
                                       selection=field.selectedText(), sibling=sibling.text(),
-                                      platform=app.platformName(), gestures=gestures, scroll_value=bar.value())))
+                                      platform=app.platformName(), gestures=gestures, scroll_value=bar.value(),
+                                      mouse=mouse)))
         tmp.replace(receipt)
 
     class Monitor(QObject):
@@ -67,7 +89,7 @@ def application(receipt):
             return False
 
     monitor = Monitor()
-    for widget in (sibling, field, button, covered, cover, secret, bar, edge_cover):
+    for widget in (sibling, field, button, covered, cover, secret, bar, edge_cover, pad_cover):
         widget.installEventFilter(monitor)
     button.clicked.connect(lambda: (clicks.append("submit"), save()))
     covered.clicked.connect(lambda: (clicks.append("covered"), save()))
@@ -105,6 +127,38 @@ def verify(aad, plugin_root):
     def wait_key(resource):
         return wait_for(lambda: next((n for n in call("snapshot", resource)["nodes"]
                                      if "key" in n["capabilities"]), None), "focused Qt key target")
+
+    def control_pointer(resource, name, action):
+        with subprocess.Popen([aad, "control", "serve", "--allow-input"], stdin=subprocess.PIPE,
+                              stdout=subprocess.PIPE, text=True) as server:
+            sid = None
+            sequence = 0
+            def request(method, **fields):
+                nonlocal sid, sequence
+                sequence += 1
+                message = dict(request_id=str(sequence), session_id=sid, timeout_ms=10000,
+                               operation=dict(method=method, **fields))
+                server.stdin.write(json.dumps(message) + "\n")
+                server.stdin.flush()
+                if not select.select([server.stdout], [], [], 12)[0]:
+                    raise RuntimeError("control response deadline")
+                response = json.loads(server.stdout.readline())
+                sid = response["session_id"]
+                assert not response.get("error"), response
+                return response["data"]
+            try:
+                request("capabilities")
+                request("targets")
+                nodes = request("observe", resource_id=resource, view={"mode": "nodes"})["nodes"]
+                def target(label):
+                    matches = [n["target"] for n in nodes if n.get("name") == label]
+                    assert len(matches) == 1, matches
+                    return matches[0]
+                return request("act", target=target(name), action=action)
+            finally:
+                server.stdin.close()
+                if server.poll() is None:
+                    server.terminate()
 
     def run_app(root, enabled):
         receipt = root / "events.json"
@@ -144,7 +198,18 @@ def verify(aad, plugin_root):
                     check_gesture("scroll", "wheel", delta, 0.78, 0.5, "--direction", direction, "--notches", "2")
                     assert snapshot()["scroll_value"] != previous, snapshot()
                 check_gesture("hover", "hover", True, 1, 1, "--ms", "120")
+                control_pointer(resource, "Mouse pad", {"type": "click", "button": "right", "count": 2,
+                                "modifiers": ["ctrl", "shift"], "fraction": {"fx": 1, "fy": 0}})
+                trace = snapshot()["mouse"]
+                assert [e["phase"] for e in trace] == ["press", "release", "double", "release"], trace
+                assert all(e["button"] == 2 and e["modifiers"] == 0x06000000
+                           and e["pos"] == [e["size"][0] - 2, 1] for e in trace), trace
+                assert [e["held"] for e in trace] == [2, 0, 2, 0], trace
+                call("do", "click", resource, "--name", "Mouse pad", "--button", "middle", "--fx", ".7", "--fy", ".5")
+                assert [e["button"] for e in snapshot()["mouse"][4:]] == [4, 4], snapshot()
             before_denied = snapshot()
+            call("do", "click", resource, "--name", "Mouse pad", "--button", "right", "--fx", "0",
+                 "--fy", "0.5", success=False)
             for action, args in (("scroll", ["--direction", "down"]), ("hover", ["--ms", "1"])):
                 # Center is visible. The requested endpoint hits a covering child.
                 call("do", action, resource, "--name", "Invoice scroll", "--fx", "0", "--fy", "0.5",

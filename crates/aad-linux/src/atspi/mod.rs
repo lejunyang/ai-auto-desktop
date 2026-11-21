@@ -1372,6 +1372,22 @@ impl AtspiProvider {
             ));
         }
         let states = node["states"].as_object().expect("normalized states");
+        if let (Some(gesture), Some(modes)) = (
+            gesture,
+            node["provenance"]["wayland_pointer_modes"].as_array(),
+        ) {
+            let mode = match gesture {
+                Gesture::Wheel { .. } => "wheel",
+                Gesture::Click { .. } => "click",
+                Gesture::Hover { .. } => "hover",
+            };
+            if !modes.iter().any(|value| value == mode) {
+                return Err(driver_error(
+                    "DRIVER.ACTION_UNSUPPORTED",
+                    "Qt plugin does not offer the requested pointer gesture",
+                ));
+            }
+        }
         if node["provenance"]["value_redacted"] == true
             || states.get("protected") == Some(&Value::Bool(true))
         {

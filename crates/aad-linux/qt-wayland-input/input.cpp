@@ -70,9 +70,8 @@ struct Chord {
     QString text;
 };
 
-bool parseChord(QStringList keys, Chord &chord) {
-    if (keys.isEmpty() || keys.size() > 5) return false;
-    const QString main = keys.takeLast().toLower();
+bool parseModifiers(const QStringList &keys, Qt::KeyboardModifiers &modifiers) {
+    if (keys.size() > 4) return false;
     for (const QString &key : keys) {
         const auto name = key.toLower();
         Qt::KeyboardModifier modifier;
@@ -81,9 +80,16 @@ bool parseChord(QStringList keys, Chord &chord) {
         else if (name == "alt") modifier = Qt::AltModifier;
         else if (name == "meta" || name == "super" || name == "win") modifier = Qt::MetaModifier;
         else return false;
-        if (chord.modifiers.testFlag(modifier)) return false;
-        chord.modifiers |= modifier;
+        if (modifiers.testFlag(modifier)) return false;
+        modifiers |= modifier;
     }
+    return true;
+}
+
+bool parseChord(QStringList keys, Chord &chord) {
+    if (keys.isEmpty()) return false;
+    const QString main = keys.takeLast().toLower();
+    if (!parseModifiers(keys, chord.modifiers)) return false;
     static const QMap<QString, int> named{
         {"backspace", Qt::Key_Backspace}, {"delete", Qt::Key_Delete}, {"enter", Qt::Key_Return},
         {"return", Qt::Key_Return}, {"esc", Qt::Key_Escape}, {"escape", Qt::Key_Escape},
@@ -125,7 +131,7 @@ public:
     }
 public slots:
     QStringList PointerModes() const {
-        return {"wheel", "hover"};
+        return {"wheel", "hover", "click"};
     }
 
     bool PointMatches(const QString &target, const QString &window, int px, int py) const {
@@ -192,19 +198,30 @@ public slots:
     }
 
     int Click(const QString &target, const QString &window, int px, int py, qulonglong deadline) {
-        if (delivering) return 0;
+        return MouseClick(target, window, px, py, 1, 1, {}, deadline);
+    }
+
+    int MouseClick(const QString &target, const QString &window, int px, int py,
+                   int button, int count, const QStringList &modifierNames, qulonglong deadline) {
+        Qt::KeyboardModifiers modifiers;
+        if (delivering || button < 1 || button > 3 || (count != 1 && count != 2) ||
+            !parseModifiers(modifierNames, modifiers)) return 0;
+        const auto which = button == 1 ? Qt::LeftButton : button == 2 ? Qt::MiddleButton : Qt::RightButton;
         QScopedValueRollback<bool> guard(delivering, true);
         QPointer<QWidget> widget = boundWidget(target, window);
         const QPoint point(px, py);
-        if (!widget || !hits(widget, point) || !inTime(deadline)) return 0;
-        auto send = [&](QEvent::Type type, Qt::MouseButtons buttons) {
+        for (int phase = 0; phase < 2 * count; ++phase) {
+            const bool release = phase % 2 != 0;
+            // A handler can synchronously move/delete the receiver or open a popup.
+            // After a press, release only to the same live widget at the proven hit.
+            if (!widget || widget != boundWidget(target, window) || !hits(widget, point) ||
+                (!release && !inTime(deadline))) return phase == 0 ? 0 : 1;
+            const auto type = release ? QEvent::MouseButtonRelease :
+                              phase == 0 ? QEvent::MouseButtonPress : QEvent::MouseButtonDblClick;
             QMouseEvent event(type, widget->mapFromGlobal(point), widget->window()->mapFromGlobal(point),
-                              point, Qt::LeftButton, buttons, Qt::NoModifier);
+                              point, which, release ? Qt::NoButton : which, modifiers);
             QCoreApplication::sendEvent(widget, &event);
-        };
-        send(QEvent::MouseButtonPress, Qt::LeftButton);
-        if (!widget || widget != boundWidget(target, window) || !hits(widget, point)) return 1;
-        send(QEvent::MouseButtonRelease, Qt::NoButton);
+        }
         return 2;
     }
 };

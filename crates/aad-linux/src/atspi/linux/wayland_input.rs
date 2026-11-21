@@ -140,6 +140,22 @@ impl LinuxBackend {
         let reply: zbus::Result<i32> = match event {
             Event::Click((x, y)) => proxy.call("Click", &(object, top, x, y, until)),
             Event::Key(keys) => proxy.call("Key", &(object, top, keys, until)),
+            Event::Gesture((x, y), Gesture::Click { button, count }, modifiers) => {
+                events = 2 * i32::from(count);
+                proxy.call(
+                    "MouseClick",
+                    &(
+                        object,
+                        top,
+                        x,
+                        y,
+                        i32::from(button),
+                        i32::from(count),
+                        modifiers,
+                        until,
+                    ),
+                )
+            }
             Event::Gesture((x, y), Gesture::Wheel { button, notches }, []) => {
                 events = 1;
                 proxy.call(
