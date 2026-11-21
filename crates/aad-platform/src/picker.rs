@@ -4,6 +4,16 @@
 pub enum Kind {
     Open,
     Save,
+    Directory,
+}
+
+/// Chromium's operation-specific File System Access prompt. A generic Open
+/// button is also present in file dialogs and cannot identify a directory grant.
+pub fn directory_title(title: &str) -> bool {
+    matches!(
+        title,
+        "Select a folder this site can view" | "选择允许此网站查看的文件夹"
+    )
 }
 
 use std::io;

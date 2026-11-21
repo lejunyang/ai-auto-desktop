@@ -201,6 +201,19 @@ impl Controls {
             // Search and address edits elsewhere in the dialog also support Value.
             let host = unique(&dialog, &id("FileNameControlHost")?)?;
             let field = unique(&host, &role(UIA_EditControlTypeId)?)?;
+            if kind == Kind::Directory {
+                let label = field
+                    .CurrentName()?
+                    .to_string()
+                    .replace('&', "")
+                    .to_lowercase();
+                if !matches!(
+                    label.trim_end_matches([':', '：', ' ']),
+                    "folder" | "folder name" | "文件夹" | "文件夹(f)" | "資料夾"
+                ) {
+                    return Err("expected a folder field in the directory picker".into());
+                }
+            }
             if kind == Kind::Open {
                 // Folder mode can reuse the same shell edit control. Require
                 // positive evidence of the filename field and file-type selector.
@@ -270,6 +283,15 @@ impl Controls {
 // A Save As dialog can change its primary button to Open when a folder is selected.
 fn matches_kind(kind: Kind, title: &str, button: &str) -> bool {
     match kind {
+        Kind::Directory => {
+            matches!(
+                title,
+                "select a folder this site can view" | "选择允许此网站查看的文件夹"
+            ) && matches!(
+                button,
+                "select folder" | "选择文件夹" | "选择文件夹(s)" | "選擇資料夾"
+            )
+        }
         Kind::Open => {
             matches!(
                 title,

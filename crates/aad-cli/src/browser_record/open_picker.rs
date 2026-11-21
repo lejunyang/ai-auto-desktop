@@ -60,6 +60,36 @@ pub struct SaveArgs {
     file: PathBuf,
 }
 
+#[derive(clap::Args)]
+pub struct DirectoryArgs {
+    #[command(flatten)]
+    page: PageArgs,
+    /// Permit selection of a directory at or below this root.
+    #[arg(long = "allow-directory", value_name = "ROOT")]
+    root: PathBuf,
+    /// Absolute path of the existing directory to give the page.
+    #[arg(long, value_name = "PATH")]
+    directory: PathBuf,
+}
+
+pub fn choose_directory(args: &DirectoryArgs) -> (Value, u8) {
+    let path = &args.directory;
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|c| c == std::path::Component::ParentDir)
+    {
+        return usage("--directory requires an absolute path without '..'");
+    }
+    let (Ok(root), Ok(path)) = (args.root.canonicalize(), path.canonicalize()) else {
+        return usage("the grant root and selected directory must exist");
+    };
+    if !path.starts_with(&root) || !path.is_dir() || !root.is_dir() {
+        return usage("the selected directory must be within --allow-directory");
+    }
+    finish(run(&args.page, Selection::Directory(&path)))
+}
+
 fn xid(text: &str) -> Result<u64, String> {
     let id = match text.strip_prefix("0x") {
         Some(hex) => u64::from_str_radix(hex, 16),
@@ -129,12 +159,14 @@ pub fn save(args: &SaveArgs) -> (Value, u8) {
 enum Selection<'a> {
     Open(&'a Args),
     Save(&'a NewFile),
+    Directory(&'a std::path::Path),
 }
 
 fn run(args: &PageArgs, selection: Selection<'_>) -> Outcome {
     let (kind, upload_dirs) = match selection {
         Selection::Open(open) => (Kind::Open, open.upload_dirs.as_slice()),
         Selection::Save(_) => (Kind::Save, &[][..]),
+        Selection::Directory(_) => (Kind::Directory, &[][..]),
     };
     let roots = upload_dirs
         .iter()
@@ -231,6 +263,13 @@ fn run(args: &PageArgs, selection: Selection<'_>) -> Outcome {
             let mut result =
                 json!({"window":dialog,"browser_pid":pid,"page":args.page,"picker_closed":true});
             match selection {
+                Selection::Directory(path) => {
+                    picker
+                        .choose_directory(path, deadline)
+                        .map_err(|err| uncertain("CLI.DIRECTORY_PICKER", err))?;
+                    result["directory_selected"] = json!(true);
+                    result["path"] = json!(path);
+                }
                 Selection::Save(destination) => {
                     destination.revalidate().map_err(refused)?;
                     picker

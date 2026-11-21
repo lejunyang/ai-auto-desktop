@@ -12,10 +12,21 @@ struct Identity {
     title: String,
     input: NativeRef,
     combo: NativeRef,
-    label: NativeRef,
-    filter: NativeRef,
+    layout: Layout,
     accept: NativeRef,
     cancel: NativeRef,
+}
+
+#[derive(PartialEq)]
+enum Layout {
+    File {
+        label: NativeRef,
+        filter: NativeRef,
+    },
+    Directory {
+        tree: NativeRef,
+        shell: Option<NativeRef>,
+    },
 }
 
 pub(crate) struct KdeDialog {
@@ -111,7 +122,8 @@ impl KdeDialog {
                 return Err("foreign KDE window".into());
             }
             if shown(zbus::block_on(self.backend.accessible(&top)?.get_state())?) {
-                if top != self.identity.window {
+                let shell = matches!(&self.identity.layout, Layout::Directory { shell: Some(id), .. } if id == &top);
+                if top != self.identity.window && !shell {
                     return Err("another KDE window or confirmation appeared".into());
                 }
                 present = true;
@@ -133,6 +145,7 @@ fn identify(b: &LinuxBackend, pid: u32, kind: Kind, deadline: Instant) -> Result
     }
     let app = single(apps, "expected the KDE portal's Qt application")?;
     let mut dialogs = Vec::new();
+    let mut shell = None;
     for top in b.children(&app, deadline)? {
         if top.bus_name != app.bus_name {
             return Err("foreign KDE window".into());
@@ -141,6 +154,17 @@ fn identify(b: &LinuxBackend, pid: u32, kind: Kind, deadline: Instant) -> Result
         let states = zbus::block_on(proxy.get_state())?;
         if shown(states) {
             let role = zbus::block_on(proxy.get_role())?;
+            if kind == Kind::Directory
+                && role == Role::Dialog
+                && !states.contains(State::Active)
+                && aad_platform::picker::directory_title(&zbus::block_on(proxy.name())?)
+                && b.children(&top, deadline)?.is_empty()
+            {
+                if shell.replace(top).is_some() {
+                    return Err("ambiguous KDE directory shells".into());
+                }
+                continue;
+            }
             if role != Role::Dialog || !enabled(states) || !states.contains(State::Active) {
                 return Err(format!(
                     "expected a focused KDE dialog, observed {role:?} with {states:?}"
@@ -152,6 +176,9 @@ fn identify(b: &LinuxBackend, pid: u32, kind: Kind, deadline: Instant) -> Result
         }
     }
     let (window, title) = single(dialogs, "expected one active KDE file dialog")?;
+    if kind == Kind::Directory {
+        return directory_controls(b, app, window, title, shell, deadline);
+    }
     if title.is_empty()
         || (kind == Kind::Open
             && !matches!(
@@ -262,9 +289,90 @@ fn identify(b: &LinuxBackend, pid: u32, kind: Kind, deadline: Instant) -> Result
         title,
         input,
         combo,
-        label,
-        filter: single(filters, "expected one KDE file filter")?,
+        layout: Layout::File {
+            label,
+            filter: single(filters, "expected one KDE file filter")?,
+        },
         accept: single(accept, "ambiguous KDE response")?,
         cancel: single(cancel, "ambiguous KDE Cancel response")?,
+    })
+}
+
+fn directory_controls(
+    b: &LinuxBackend,
+    app: NativeRef,
+    window: NativeRef,
+    title: String,
+    shell: Option<NativeRef>,
+    deadline: Instant,
+) -> Result<Identity> {
+    if !aad_platform::picker::directory_title(&title) {
+        return Err("expected a Chromium directory selection dialog".into());
+    }
+    // KDirSelectDialog has a directory tree and a single path combo in its
+    // frame. Do not enumerate tree rows or select a folder by basename.
+    let children = |node: &NativeRef| -> Result<Vec<NativeRef>> {
+        let children = b.children(node, deadline)?;
+        if children.len() > 32 || children.iter().any(|c| c.bus_name != app.bus_name) {
+            return Err("unexpected KDE directory dialog hierarchy".into());
+        }
+        Ok(children)
+    };
+    let (mut paths, mut trees, mut accepts, mut cancels) = (vec![], vec![], vec![], vec![]);
+    for group in children(&window)? {
+        let group_proxy = b.accessible(&group)?;
+        let group_role = zbus::block_on(group_proxy.get_role())?;
+        if !shown(zbus::block_on(group_proxy.get_state())?) {
+            continue;
+        }
+        for control in children(&group)? {
+            let proxy = b.accessible(&control)?;
+            let state = zbus::block_on(proxy.get_state())?;
+            if !shown(state) || !enabled(state) {
+                continue;
+            }
+            match (group_role, zbus::block_on(proxy.get_role())?) {
+                (Role::Frame, Role::Tree) => trees.push(control),
+                (Role::Frame, Role::ComboBox) => {
+                    let mut entries = Vec::new();
+                    for child in children(&control)? {
+                        let entry = b.accessible(&child)?;
+                        let state = zbus::block_on(entry.get_state())?;
+                        if zbus::block_on(entry.get_role())? == Role::Text
+                            && shown(state)
+                            && enabled(state)
+                            && state.contains(State::Editable)
+                        {
+                            entries.push(child);
+                        }
+                    }
+                    paths.push((
+                        control,
+                        single(entries, "expected one editable KDE directory path")?,
+                    ));
+                }
+                (Role::Panel, Role::Button) => match zbus::block_on(proxy.name())?.as_str() {
+                    "OK" | "确定" if state.contains(State::IsDefault) => accepts.push(control),
+                    "Cancel" | "取消" => cancels.push(control),
+                    "New Folder..." | "新建文件夹..." | "新建文件夹…" => (),
+                    _ => return Err("unexpected KDE directory response".into()),
+                },
+                _ => (),
+            }
+        }
+    }
+    let (combo, input) = single(paths, "expected a unique KDE directory field")?;
+    Ok(Identity {
+        app,
+        window,
+        title,
+        combo,
+        input,
+        layout: Layout::Directory {
+            tree: single(trees, "expected a directory tree")?,
+            shell,
+        },
+        accept: single(accepts, "expected a default directory confirmation")?,
+        cancel: single(cancels, "expected a directory cancel button")?,
     })
 }

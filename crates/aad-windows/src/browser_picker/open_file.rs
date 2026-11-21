@@ -7,7 +7,8 @@ use std::time::Instant;
 use windows::core::HSTRING;
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Storage::FileSystem::{
-    FileIdInfo, GetFileInformationByHandleEx, FILE_ID_INFO, FILE_SHARE_READ,
+    FileIdInfo, GetFileInformationByHandleEx, FILE_FLAG_BACKUP_SEMANTICS, FILE_ID_INFO,
+    FILE_SHARE_READ,
 };
 use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::System::SystemServices::{SFGAO_FILESYSTEM, SFGAO_FOLDER, SFGAO_LINK};
@@ -27,12 +28,17 @@ fn identity(file: &File) -> Result<(u64, [u8; 16])> {
 }
 
 // A filesystem file may still be a shortcut or a browsable Shell folder (e.g. a ZIP).
-fn regular_shell_file(ordinary: &str) -> Result<()> {
+fn regular_shell_item(ordinary: &str, directory: bool) -> Result<()> {
     unsafe {
         let item: IShellItem = SHCreateItemFromParsingName(&HSTRING::from(ordinary), None)?;
         let attrs = item.GetAttributes(SFGAO_FILESYSTEM | SFGAO_FOLDER | SFGAO_LINK)?;
-        if attrs != SFGAO_FILESYSTEM {
-            return Err("file dialog requires a regular filesystem item".into());
+        let expected = if directory {
+            SFGAO_FILESYSTEM | SFGAO_FOLDER
+        } else {
+            SFGAO_FILESYSTEM
+        };
+        if attrs != expected {
+            return Err("unexpected Shell item type for the selected path".into());
         }
         let name = item.GetDisplayName(SIGDN_FILESYSPATH)?;
         let same = name.as_wide().iter().copied().eq(ordinary.encode_utf16());
@@ -45,6 +51,35 @@ fn regular_shell_file(ordinary: &str) -> Result<()> {
 }
 
 impl FilePicker {
+    pub fn choose_directory(&self, path: &Path, deadline: Instant) -> Result<()> {
+        if self.kind != Kind::Directory {
+            return Err("expected an observed directory dialog".into());
+        }
+        remaining(deadline)?;
+        let canonical = path.canonicalize()?;
+        let name = ordinary_path(path, &canonical)?;
+        let open = || {
+            OpenOptions::new()
+                .read(true)
+                .share_mode(FILE_SHARE_READ.0)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS.0)
+                .open(&canonical)
+        };
+        let held = open()?;
+        if !held.metadata()?.is_dir() {
+            return Err("expected an existing directory".into());
+        }
+        let original = identity(&held)?;
+        let verify = || -> Result<()> {
+            remaining(deadline)?;
+            if path.canonicalize()? != canonical || identity(&open()?)? != original {
+                return Err("the granted directory changed".into());
+            }
+            regular_shell_item(name, true)
+        };
+        verify()?;
+        self.choose_path(name, deadline, verify)
+    }
     /// Submit one already-granted local file through an observed native Open dialog.
     pub fn open_file(&self, path: &Path, deadline: Instant) -> Result<()> {
         if self.kind != Kind::Open {
@@ -80,7 +115,7 @@ impl FilePicker {
             if path.canonicalize()? != canonical || identity(&File::open(name)?)? != original {
                 return Err("the granted file changed before selection".into());
             }
-            regular_shell_file(name)
+            regular_shell_item(name, false)
         };
         verify()?;
         self.choose_path(name, deadline, verify)

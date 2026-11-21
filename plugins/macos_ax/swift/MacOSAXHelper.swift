@@ -623,7 +623,7 @@ private final class AXService {
     ) throws -> Any {
         try checkDeadline(deadlineMS)
         switch operation {
-        case "picker_observe", "picker_revalidate", "picker_dismiss", "picker_save_new", "picker_open_file":
+        case "picker_observe", "picker_revalidate", "picker_dismiss", "picker_save_new", "picker_open_file", "picker_directory":
             return try filePicker(operation, Arguments(values: args), deadlineMS, requestID)
         case "status":
             try Arguments(values: args).only([])
@@ -2633,7 +2633,7 @@ private struct BrowserPicker {
     let token: String
     let pid: pid_t
     let bounds: [Int]
-    let saving: Bool
+    let kind: String
     let window: AXUIElement
     let sheet: AXUIElement
     let controls: PanelControls
@@ -2725,7 +2725,10 @@ private extension AXService {
         return labels.compactMap { $0?.trimmingCharacters(in: CharacterSet(charactersIn: ":： ")).lowercased() }
     }
 
-    func panelControls(_ sheet: AXUIElement, saving: Bool, _ deadline: Double?) throws -> PanelControls {
+    func panelControls(_ sheet: AXUIElement, kind: String, _ deadline: Double?) throws -> PanelControls {
+        let saving = kind == "save"
+        let directoryPrompts = ["select a folder this site can view", "选择允许此网站查看的文件夹"]
+        var directoryPrompt = !Set(panelLabels(sheet)).isDisjoint(with: directoryPrompts)
         var nodes = try panelChildren(sheet, deadline)
         var seen = 0
         var buttons: [AXUIElement] = [], names: [AXUIElement] = [], locations: [AXUIElement] = []
@@ -2740,6 +2743,9 @@ private extension AXService {
             let identifier = stringAttribute(element, kAXIdentifierAttribute as CFString) ?? ""
             if identifier.hasPrefix("NSNav") || identifier == "saveAsNameTextField" { appKitControl = true }
             switch role {
+            case "AXStaticText":
+                if let value = stringAttribute(element, kAXValueAttribute as CFString),
+                   directoryPrompts.contains(value.lowercased()) { directoryPrompt = true }
             case "AXSheet", "AXWindow", "AXDialog", "AXAlert", "AXWebArea":
                 throw pickerError("nested prompt or web content in the file panel")
             case "AXButton":
@@ -2770,7 +2776,15 @@ private extension AXService {
             default: break
             }
         }
-        let acceptLabels = saving ? ["save", "保存", "存储", "儲存"] : ["open", "打开", "開啟", "開く", "upload", "上传"]
+        guard (kind == "directory") == directoryPrompt else {
+            throw pickerError("the observed file panel operation differs from the request")
+        }
+        let acceptLabels: [String]
+        switch kind {
+        case "save": acceptLabels = ["save", "保存", "存储", "儲存"]
+        case "directory": acceptLabels = ["choose", "select", "open", "选择", "打开", "選擇"]
+        default: acceptLabels = ["open", "打开", "開啟", "開く", "upload", "上传"]
+        }
         func button(_ labels: [String], _ attribute: CFString) throws -> AXUIElement {
             let matches = buttons.filter { !Set(panelLabels($0)).isDisjoint(with: labels) }
             guard matches.count == 1, copyActionNames(matches[0]).contains("AXPress") else {
@@ -2808,7 +2822,7 @@ private extension AXService {
         guard CFEqual(window, held.window), sheets.count == 1, CFEqual(sheets[0], held.sheet) else {
             throw pickerError("the observed browser window or file panel changed")
         }
-        let current = try panelControls(sheets[0], saving: held.saving, deadline)
+        let current = try panelControls(sheets[0], kind: held.kind, deadline)
         guard CFEqual(current.accept, held.controls.accept), CFEqual(current.cancel, held.controls.cancel),
               samePanelElement(current.filename, held.controls.filename),
               samePanelElement(current.location, held.controls.location) else {
@@ -2905,11 +2919,11 @@ private extension AXService {
     }
 
     func prepareOpen(_ held: BrowserPicker, _ path: String, _ deadline: Double?, _ requestID: String) throws {
-        let original = try checkedFile(path, directory: false)
+        let original = try checkedFile(path, directory: held.kind == "directory")
         let observed = try exactRow(checkPanel(held, deadline), path: path, deadline)
         func revalidate() throws {
             let current = try exactRow(checkPanel(held, deadline), path: path, deadline)
-            let info = try checkedFile(path, directory: false)
+            let info = try checkedFile(path, directory: held.kind == "directory")
             guard CFEqual(current.row, observed.row), CFEqual(current.list, observed.list),
                   original.st_dev == info.st_dev, original.st_ino == info.st_ino else {
                 throw pickerError("the observed file or its native row changed")
@@ -2980,19 +2994,19 @@ private extension AXService {
             try args.only(["process_id", "bounds", "kind"])
             let pid = pid_t(try args.integer("process_id", minimum: 1, maximum: Int(Int32.max)))
             guard browserPicker == nil, let bounds = args.values["bounds"] as? [Int], bounds.count == 4,
-                  bounds[2] > 0, bounds[3] > 0, let kind = try args.string("kind"), ["open", "save"].contains(kind) else {
+                  bounds[2] > 0, bounds[3] > 0, let kind = try args.string("kind"), ["open", "save", "directory"].contains(kind) else {
                 throw pickerError("invalid native file panel observation")
             }
             let window = try panelWindow(pid, bounds, deadline)
             let sheets = try attachedSheets(window, deadline)
             guard sheets.count == 1 else { throw pickerError("expected one native sheet attached to the browser window") }
-            let controls = try panelControls(sheets[0], saving: kind == "save", deadline)
+            let controls = try panelControls(sheets[0], kind: kind, deadline)
             let token = UUID().uuidString
-            browserPicker = BrowserPicker(token: token, pid: pid, bounds: bounds, saving: kind == "save",
+            browserPicker = BrowserPicker(token: token, pid: pid, bounds: bounds, kind: kind,
                                           window: window, sheet: sheets[0], controls: controls)
             return ["token": token]
         }
-        try args.only(["picker_save_new", "picker_open_file"].contains(op) ? ["token", "path"] : ["token"])
+        try args.only(["picker_save_new", "picker_open_file", "picker_directory"].contains(op) ? ["token", "path"] : ["token"])
         guard let held = browserPicker, held.token == (try args.string("token")) else {
             throw pickerError("expired native file panel lease")
         }
@@ -3000,7 +3014,7 @@ private extension AXService {
         if op == "picker_revalidate" { return ["verified": true] }
         let target: AXUIElement
         if op == "picker_save_new" {
-            guard held.saving, let field = held.controls.filename, let path = try args.string("path") else {
+            guard held.kind == "save", let field = held.controls.filename, let path = try args.string("path") else {
                 throw pickerError("expected an observed Save panel")
             }
             let name = try verifyNewPath(path)
@@ -3022,12 +3036,14 @@ private extension AXService {
                   actual.utf8.elementsEqual(name.utf8) else { throw pickerError("Save As name did not match exactly") }
             _ = try verifyNewPath(path, in: held)
             target = held.controls.accept
-        } else if op == "picker_open_file" {
-            guard !held.saving, let path = try args.string("path") else { throw pickerError("expected an Open panel") }
+        } else if op == "picker_open_file" || op == "picker_directory" {
+            guard held.kind == (op == "picker_directory" ? "directory" : "open"), let path = try args.string("path") else {
+                throw pickerError("selection differs from the observed panel operation")
+            }
             try prepareOpen(held, path, deadline, requestID)
             target = held.controls.accept
         } else {
-            guard op == "picker_dismiss", !held.saving else { throw pickerError("expected an observed Open panel") }
+            guard op == "picker_dismiss", held.kind == "open" else { throw pickerError("expected an observed Open panel") }
             target = held.controls.cancel
         }
         try configureTimeout(target, deadlineMS: deadline)

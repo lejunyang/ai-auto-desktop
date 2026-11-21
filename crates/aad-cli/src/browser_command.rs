@@ -8,6 +8,8 @@ mod read;
 pub enum Command {
     /// Select local files in a Chromium file chooser that is already open.
     ChooseFiles(crate::desk::open_picker::Args),
+    /// Select an existing directory in the page's open system directory chooser.
+    ChooseDirectory(crate::desk::open_picker::DirectoryArgs),
     /// Choose a new destination in a Chromium Save As dialog that is already open.
     SaveAs(crate::desk::open_picker::SaveArgs),
     /// Read a page's text, outline, or several named fields in one observation.
@@ -31,6 +33,7 @@ pub enum Command {
 pub fn run(command: &Command) -> (Value, u8) {
     match command {
         Command::ChooseFiles(args) => crate::desk::open_picker::choose(args),
+        Command::ChooseDirectory(args) => crate::desk::open_picker::choose_directory(args),
         Command::SaveAs(args) => crate::desk::open_picker::save(args),
         Command::Read(args) => match read::run(args) {
             Ok(value) => (value, EXIT_OK),

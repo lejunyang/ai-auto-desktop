@@ -31,6 +31,7 @@ impl FilePicker {
         let operation = match kind {
             Kind::Open => "open",
             Kind::Save => "save",
+            Kind::Directory => "directory",
         };
         let observed = helper.rpc(
             "picker_observe",
@@ -67,6 +68,20 @@ impl FilePicker {
             return Err("only an observed Open panel can be dismissed after upload".into());
         }
         self.check("picker_dismiss", json!({"token": self.token}), deadline)
+    }
+
+    pub fn choose_directory(&self, path: &Path, deadline: Instant) -> Result<()> {
+        if self.kind != Kind::Directory
+            || path.canonicalize()?.as_os_str() != path.as_os_str()
+            || !path.symlink_metadata()?.is_dir()
+        {
+            return Err("expected the granted directory and an observed directory panel".into());
+        }
+        self.check(
+            "picker_directory",
+            json!({"token": self.token, "path": path.to_str().ok_or("directory is not UTF-8")?}),
+            deadline,
+        )
     }
 
     /// Select one file in an AppKit list view. AX must expose the visible

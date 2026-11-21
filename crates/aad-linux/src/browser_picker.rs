@@ -60,7 +60,7 @@ impl FilePicker {
                         Some(GtkFileDialog::observe(portal.picker_pid, kind, deadline)?)
                     }
                     (_, Kind::Save) => Some(GtkFileDialog::observe(pid, kind, deadline)?),
-                    (_, Kind::Open) => None,
+                    (_, Kind::Open | Kind::Directory) => None,
                 };
                 (Surface::X11(Box::new(window)), controls)
             }
@@ -184,14 +184,30 @@ impl FilePicker {
         if self.kind != Kind::Open {
             return Err("expected the observed Open picker".into());
         }
+        self.select_existing(path, deadline)
+    }
+
+    pub fn choose_directory(&self, path: &Path, deadline: Instant) -> Result<()> {
+        if self.kind != Kind::Directory {
+            return Err("expected the observed directory picker".into());
+        }
+        self.select_existing(path, deadline)
+    }
+
+    fn select_existing(&self, path: &Path, deadline: Instant) -> Result<()> {
         let text = path.to_str().ok_or("file path is not UTF-8")?;
         if text.chars().any(char::is_control) {
             return Err("invalid characters in native file path".into());
         }
         let identity = || -> Result<_> {
             let meta = path.symlink_metadata()?;
-            if !meta.is_file() || path.canonicalize()?.as_os_str() != path.as_os_str() {
-                return Err("expected a canonical existing regular file".into());
+            let expected = if self.kind == Kind::Directory {
+                meta.is_dir()
+            } else {
+                meta.is_file()
+            };
+            if !expected || path.canonicalize()?.as_os_str() != path.as_os_str() {
+                return Err("the path or its filesystem type changed".into());
             }
             Ok((meta.dev(), meta.ino()))
         };
@@ -215,7 +231,7 @@ impl FilePicker {
                         Chooser::Portal(portal) => portal.picker_pid,
                         _ => window.pid,
                     };
-                    local = GtkFileDialog::observe(owner, Kind::Open, deadline)?;
+                    local = GtkFileDialog::observe(owner, self.kind, deadline)?;
                     &local
                 }
             }
@@ -450,6 +466,7 @@ impl OpenPicker {
                 .ok_or("missing GTK window class")?;
             let class = std::str::from_utf8(name)?.to_owned();
             observed.chooser = match kind {
+                Kind::Directory => return Err("this GTK 4 dialog does not expose a verified directory entry; use the desktop file portal".into()),
                 Kind::Save => Chooser::Gtk4Save(class),
                 Kind::Open => Chooser::Gtk4(Box::new(Gtk4Picker::observe(
                     pid,
