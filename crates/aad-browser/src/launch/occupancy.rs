@@ -56,7 +56,13 @@ fn switches(process: &Process) -> Vec<String> {
         .collect()
 }
 
-fn profile_argument(process: &Process, args: &[String]) -> Result<Option<PathBuf>> {
+enum ProfileArgument {
+    Default,
+    Directory(PathBuf),
+    MissingPath,
+}
+
+fn profile_argument(cwd: Option<&Path>, args: &[String]) -> Result<ProfileArgument> {
     for (index, arg) in args.iter().enumerate() {
         let value = if let Some(value) = arg.strip_prefix("--user-data-dir=") {
             Some(value.to_string())
@@ -72,15 +78,20 @@ fn profile_argument(process: &Process, args: &[String]) -> Result<Option<PathBuf
         if let Some(value) = value {
             let mut path = PathBuf::from(value.trim_matches('"'));
             if path.is_relative() {
-                path = process
-                    .cwd()
+                path = cwd
                     .ok_or("cannot resolve browser's relative profile directory")?
                     .join(path);
             }
-            return Ok(Some(path.canonicalize()?));
+            return match path.canonicalize() {
+                Ok(path) => Ok(ProfileArgument::Directory(path)),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    Ok(ProfileArgument::MissingPath)
+                }
+                Err(err) => Err(err.into()),
+            };
         }
     }
-    Ok(None)
+    Ok(ProfileArgument::Default)
 }
 
 /// One pass over the process table: the browsers proven to own `path`, or the
@@ -156,7 +167,13 @@ fn scan(system: &mut System, path: &Path, browser: &str) -> Result<Scan> {
         if process.cmd().is_empty() || process.exe().is_none() || process.user_id().is_none() {
             return Ok(Scan::Unverified(*pid));
         }
-        let directory = profile_argument(process, &args)?.or_else(|| default.clone());
+        let directory = match profile_argument(process.cwd(), &args)? {
+            ProfileArgument::Directory(path) => Some(path),
+            ProfileArgument::Default => default.clone(),
+            // A different launch can remove its profile after refresh(). Its PID
+            // must disappear or resolve on a fresh scan before choosing owners.
+            ProfileArgument::MissingPath => return Ok(Scan::Unverified(*pid)),
+        };
         if directory.as_deref() == Some(path) {
             found.push(*pid);
         }
@@ -328,6 +345,25 @@ pub(super) fn ensure_available_guarded(
 mod tests {
     use super::*;
     use std::cell::Cell;
+
+    #[test]
+    fn a_removed_explicit_profile_is_distinct_from_the_default() {
+        let path = std::env::temp_dir().join(format!("aad-profile-test-{}", uuid::Uuid::new_v4()));
+        let args = [format!("--user-data-dir={}", path.display())];
+        std::fs::create_dir(&path).unwrap();
+        let canonical = path.canonicalize().unwrap();
+        let before = profile_argument(None, &args).unwrap();
+        std::fs::remove_dir(&path).unwrap();
+        assert!(matches!(before, ProfileArgument::Directory(p) if p == canonical));
+        assert!(matches!(
+            profile_argument(None, &args).unwrap(),
+            ProfileArgument::MissingPath
+        ));
+        assert!(matches!(
+            profile_argument(None, &[]).unwrap(),
+            ProfileArgument::Default
+        ));
+    }
 
     #[test]
     fn a_process_caught_starting_or_exiting_is_rescanned_not_reported() {
