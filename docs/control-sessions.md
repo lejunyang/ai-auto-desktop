@@ -463,6 +463,21 @@ MCP 服务一次只处理一个调用，后面的排队；MCP cancellation notif
 能力并入上述工具；`run_workflow` 与 `control_act` 共用会话的 driver、串行锁和输入租约。
 远程 MCP 或指定 provider/resource 时只暴露统一工具，避免绕过授权。
 
+### 查看批量步骤耗时
+
+MCP 的 `run_steps` 和全部由 `control.session` 步骤组成的非持久化 `run_workflow` 在结果顶层返回 `phase_timings`。它汇总本次运行实际发出的控制请求，成功和失败都会计入。每类固定返回三个整数：`calls` 是返回的请求数，`failed_calls` 是其中返回错误的请求数，`elapsed_us` 是各次请求从调用会话执行器到返回的单调时钟耗时之和，每次向下取整到微秒。未执行的类目为零。运行开始前就被拒绝的参数或编译错误沿用原错误响应。
+
+| 字段 | 计入的请求 |
+|---|---|
+| `targets` | 枚举会话允许的目标 |
+| `observe` | 显式观察目标并取得快照 |
+| `find` | 在观察中定位元素，包括拖拽终点和轮询检查 |
+| `act` | 执行动作，包括请求内部的租约、复核和驱动等待 |
+| `read_fields` | 一次读取一组字段，包括内部观察、定位和字段投影 |
+| `collect_table` | 工作流发起的整表采集，包括内部翻页、滚动和等待 |
+
+每个请求只计入一类。比如 `read_fields.calls = 3` 表示实际读了三次；三次都成功但值始终不符合 `expect`，步骤仍然可能失败。轮询之间的休眠、步骤校验、期望值比较、本地应用筛选和引擎调度不计入六类耗时。查看整次引擎运行耗时用 `elapsed_ms`。客户端往返、MCP 编解码和失败后的额外诊断也不计入阶段统计。统计只含计数和耗时，不含页面数据。
+
 ### 一次读出订单号和金额
 
 只取数据时，先从 `control_targets` 拿到页面或窗口的 `resource_id`，然后调用 `control_read_fields`。比如传 `{"resource_id":"…","fields":[{"as":"amount","locator":{"name":"实付金额"},"property":"value"},{"as":"shipped","locator":{"name":"已发货"},"property":"present"}]}`，回复里的 `data.values` 就是 `{"amount":"118.50","shipped":false}`。同一份新观察一次读 1–32 个字段，只读连接也能用。
