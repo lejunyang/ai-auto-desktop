@@ -2,6 +2,7 @@
 //! Only the two IPC handshake nonces and a port go in the private discovery file.
 //! The owner receives gate credentials after mutual authentication.
 use super::{Gate, Local};
+use crate::request_gate::ConfigSource;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
@@ -161,9 +162,11 @@ impl Peer {
                     .arg(port.to_string())
                     .stdin(Stdio::null())
                     .stdout(Stdio::piped())
-                    .stderr(Stdio::null())
+                    .stderr(Stdio::piped())
                     .spawn()?;
                 let output = child.stdout.take().unwrap();
+                let mut diagnostics = child.stderr.take().unwrap();
+                thread::spawn(move || io::copy(&mut diagnostics, &mut io::stderr()));
                 thread::spawn(move || child.wait());
                 let address: Address = read(&mut BufReader::new(output), 512)?;
                 let stream = authenticate(&address)?;
@@ -171,8 +174,7 @@ impl Peer {
                 stream
             }
         };
-        let (url, token) = gate.credentials();
-        send(&mut stream, &json!([url, token]))?;
+        send(&mut stream, &gate.credentials())?;
         if !read::<bool>(&mut stream, 16)? {
             return Err(io::ErrorKind::ConnectionAborted.into());
         }
@@ -201,7 +203,7 @@ fn authenticate(address: &Address) -> io::Result<TcpStream> {
 }
 struct State {
     local: Local,
-    credentials: (String, String),
+    credentials: (String, String, ConfigSource),
 }
 fn serve_peer(
     mut s: TcpStream,
@@ -216,12 +218,12 @@ fn serve_peer(
         return Ok(());
     }
     send(&mut s, &address.server)?;
-    let credentials: Option<(String, String)> = read(&mut s, 64 * 1024)?;
+    let credentials: Option<(String, String, ConfigSource)> = read(&mut s, 64 * 1024)?;
     {
         let mut slot = state.lock().unwrap();
         if let Some(credentials) = credentials {
-            let gate =
-                Gate::new(&credentials.0, credentials.1.clone()).map_err(io::Error::other)?;
+            let gate = Gate::configured(&credentials.0, credentials.1.clone(), credentials.2)
+                .map_err(io::Error::other)?;
             if let Some(owner) = slot.as_mut() {
                 if !owner.local.healthy() {
                     return Err(io::ErrorKind::ConnectionAborted.into());

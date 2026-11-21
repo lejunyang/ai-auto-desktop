@@ -1,6 +1,6 @@
 //! Operator-owned HTTP policy service. Credentials never enter a browser request.
-use reqwest::blocking::{Client, RequestBuilder};
-use serde::Deserialize;
+use reqwest::blocking::{Client, RequestBuilder, Response};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{io::Read, time::Duration};
 use url::{Host, Url};
@@ -11,6 +11,41 @@ pub struct Gate {
     endpoint: Url,
     configured_url: String,
     token: String,
+    source: ConfigSource,
+}
+
+#[derive(Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+pub(super) enum ConfigSource {
+    Explicit,
+    Automatic,
+}
+
+pub(super) enum ScopeRead {
+    Policy(Scope),
+    Unsupported(u16),
+}
+
+impl ScopeRead {
+    pub fn diagnose(scope: &Result<Self, &'static str>) {
+        if let Ok(Self::Unsupported(status)) = scope {
+            use std::io::Write;
+            let _ = writeln!(std::io::stderr().lock(), "automatic request gate scope GET returned {status}; interception disabled until scope is available");
+        }
+    }
+
+    pub fn rules(&self) -> &[Watch] {
+        match self {
+            Self::Policy(scope) => &scope.watch,
+            Self::Unsupported(_) => &[],
+        }
+    }
+
+    pub fn revision(&self) -> Option<&str> {
+        match self {
+            Self::Policy(scope) => Some(&scope.revision),
+            Self::Unsupported(_) => None,
+        }
+    }
 }
 
 #[derive(Clone, Deserialize)]
@@ -72,19 +107,27 @@ impl Gate {
                     (
                         format!("{}/api/operation-gate/http", base.trim_end_matches('/')),
                         token,
+                        ConfigSource::Automatic,
                     )
                 }),
-            (Some(endpoint), Some(token)) => Some((endpoint, token)),
+            (Some(endpoint), Some(token)) => Some((endpoint, token, ConfigSource::Explicit)),
             _ => return Err("incomplete request gate configuration"),
         };
-        pair.map(|(endpoint, token)| Self::new(&endpoint, token))
+        pair.map(|(endpoint, token, source)| Self::configured(&endpoint, token, source))
             .transpose()
     }
 
-    pub(super) fn credentials(&self) -> (&str, &str) {
-        (&self.configured_url, &self.token)
+    pub(super) fn credentials(&self) -> (&str, &str, ConfigSource) {
+        (&self.configured_url, &self.token, self.source)
     }
     pub fn new(endpoint: &str, token: String) -> Result<Self, &'static str> {
+        Self::configured(endpoint, token, ConfigSource::Explicit)
+    }
+    pub(super) fn configured(
+        endpoint: &str,
+        token: String,
+        source: ConfigSource,
+    ) -> Result<Self, &'static str> {
         let invalid = "invalid loopback request gate configuration";
         let configured_url = endpoint.to_owned();
         let mut endpoint = Url::parse(endpoint).map_err(|_| invalid)?;
@@ -114,19 +157,22 @@ impl Gate {
         Ok(Self {
             client,
             configured_url,
+            source,
             endpoint,
             token,
         })
     }
 
-    fn call<T: serde::de::DeserializeOwned>(&self, req: RequestBuilder) -> Result<T, &'static str> {
-        let response = req.bearer_auth(&self.token).send().map_err(|e| {
+    fn send(&self, req: RequestBuilder) -> Result<Response, &'static str> {
+        req.bearer_auth(&self.token).send().map_err(|e| {
             if e.is_timeout() {
                 "request gate timed out"
             } else {
                 "request gate unavailable"
             }
-        })?;
+        })
+    }
+    fn decode<T: serde::de::DeserializeOwned>(response: Response) -> Result<T, &'static str> {
         if response.status().as_u16() == 401 {
             return Err("request gate token expired");
         }
@@ -143,19 +189,32 @@ impl Gate {
         }
         serde_json::from_slice(&bytes).map_err(|_| "invalid request gate response")
     }
-    pub fn scope(&self) -> Result<Scope, &'static str> {
-        self.call(
+    pub(super) fn read_scope(&self) -> Result<ScopeRead, &'static str> {
+        let response = self.scope_response()?;
+        let status = response.status().as_u16();
+        if self.source == ConfigSource::Automatic && matches!(status, 404 | 405) {
+            return Ok(ScopeRead::Unsupported(status));
+        }
+        Self::decode(response).map(ScopeRead::Policy)
+    }
+    fn scope_response(&self) -> Result<Response, &'static str> {
+        self.send(
             self.client
                 .get(self.endpoint.clone())
                 .timeout(Duration::from_secs(3)),
         )
     }
+    pub fn scope(&self) -> Result<Scope, &'static str> {
+        Self::decode(self.scope_response()?)
+    }
     pub fn decide(&self, payload: &Value) -> Result<Decision, &'static str> {
-        self.call(
-            self.client
-                .post(self.endpoint.clone())
-                .timeout(Duration::from_secs(125))
-                .json(payload),
+        Self::decode(
+            self.send(
+                self.client
+                    .post(self.endpoint.clone())
+                    .timeout(Duration::from_secs(125))
+                    .json(payload),
+            )?,
         )
     }
     pub fn redact(&self, text: &str) -> String {

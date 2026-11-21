@@ -3,7 +3,7 @@
 use crate::{
     cdp::Client,
     recording::network::redact_url,
-    request_gate::{payload, Decision, Gate, Scope},
+    request_gate::{payload, Decision, Gate, ScopeRead},
 };
 use serde_json::{json, Value};
 use std::{
@@ -149,7 +149,8 @@ struct Local {
 }
 impl Local {
     fn update(&self, gate: Gate) -> Result<(), &'static str> {
-        let scope = gate.scope();
+        let scope = gate.read_scope();
+        ScopeRead::diagnose(&scope);
         let (tx, rx) = mpsc::channel();
         self.replies
             .send(Reply::Configure(gate, scope, tx))
@@ -157,7 +158,8 @@ impl Local {
         rx.recv().map_err(|_| "request gate disconnected")?
     }
     pub fn start(port: u16, gate: Gate) -> Result<Self, &'static str> {
-        let scope = gate.scope();
+        let scope = gate.read_scope();
+        ScopeRead::diagnose(&scope);
         let (client, identity) =
             Client::browser_with_identity_until(port, Instant::now() + Duration::from_secs(5))
                 .map_err(|_| "request gate could not attach")?;
@@ -270,7 +272,7 @@ struct Driver {
     events: mpsc::Receiver<Value>,
     client: Client,
     gate: Gate,
-    scope: Result<Scope, &'static str>,
+    scope: Result<ScopeRead, &'static str>,
     pages: HashMap<String, Target>,
     history: Arc<Mutex<History>>,
     identity: String,
@@ -278,21 +280,21 @@ struct Driver {
 enum Reply {
     Configure(
         Gate,
-        Result<Scope, &'static str>,
+        Result<ScopeRead, &'static str>,
         mpsc::Sender<Result<(), &'static str>>,
     ),
-    Scope(u64, Result<Scope, &'static str>),
+    Scope(u64, Result<ScopeRead, &'static str>),
     Verdict(Key, Option<Value>),
 }
 
 fn attach() -> Value {
     json!({"autoAttach":true,"flatten":true,"waitForDebuggerOnStart":true,"filter":[{"type":"browser","exclude":true},{"type":"tab","exclude":true},{}]})
 }
-fn patterns(scope: Option<&Scope>) -> Value {
+fn patterns(scope: Option<&ScopeRead>) -> Value {
     let mut patterns = std::collections::BTreeSet::new();
     for host in scope
         .into_iter()
-        .flat_map(|s| &s.watch)
+        .flat_map(ScopeRead::rules)
         .map(|w| w.host.as_deref())
         .chain(scope.is_none().then_some(None))
     {
@@ -375,7 +377,7 @@ impl Driver {
                     let info = &p["targetInfo"];
                     if info["type"] == "page"
                         && info["url"] == ""
-                        && !self.scope.as_ref().is_ok_and(|s| s.watch.is_empty())
+                        && !self.scope.as_ref().is_ok_and(|s| s.rules().is_empty())
                     {
                         if let (Some(id), Some(opener)) =
                             (info["targetId"].as_str(), info["openerId"].as_str())
@@ -538,11 +540,12 @@ impl Driver {
         let target = self.pages.get(sid).ok_or("unknown request gate target")?;
         let main_document =
             p["resourceType"] == "Document" && p["frameId"] == target.info["targetId"];
-        if self
-            .scope
-            .as_ref()
-            .is_ok_and(|s| url::Url::parse(raw).is_ok_and(|u| !s.matches(&u, method)))
-        {
+        if self.scope.as_ref().is_ok_and(|s| {
+            url::Url::parse(raw).is_ok_and(|u| match s {
+                ScopeRead::Unsupported(_) => true,
+                ScopeRead::Policy(scope) => !scope.matches(&u, method),
+            })
+        }) {
             if main_document {
                 self.history.lock().unwrap().opening.remove(&target.page);
             }
@@ -643,7 +646,7 @@ impl Driver {
     }
     fn reconfigure(&mut self) -> Result<(), &'static str> {
         for sid in self.pages.keys().cloned().collect::<Vec<_>>() {
-            if self.scope.as_ref().is_ok_and(|s| s.watch.is_empty())
+            if self.scope.as_ref().is_ok_and(|s| s.rules().is_empty())
                 && self
                     .history
                     .lock()
@@ -690,18 +693,18 @@ impl Driver {
                             continue;
                         }
                         refresh = Some(Instant::now() + REFRESH);
-                        if let Ok(scope) = scope {
-                            if self
-                                .scope
-                                .as_ref()
-                                .is_ok_and(|s| s.revision == scope.revision)
-                            {
-                                continue;
+                        match (&self.scope, &scope) {
+                            (Ok(previous), Ok(next)) if previous.revision() == next.revision() => {
+                                continue
                             }
-                            self.scope = Ok(scope);
-                            if self.reconfigure().is_err() {
-                                break 'drive;
-                            }
+                            // Refresh failures retain a previously supplied policy.
+                            (Ok(ScopeRead::Policy(_)) | Err(_), Err(_)) => continue,
+                            _ => {}
+                        }
+                        ScopeRead::diagnose(&scope);
+                        self.scope = scope;
+                        if self.reconfigure().is_err() {
+                            break 'drive;
                         }
                     }
                     Reply::Verdict(key, record) => {
@@ -721,7 +724,7 @@ impl Driver {
                             }
                             h.blocked.push_back((origin, record));
                         }
-                        let disable = self.scope.as_ref().is_ok_and(|s| s.watch.is_empty())
+                        let disable = self.scope.as_ref().is_ok_and(|s| s.rules().is_empty())
                             && !h.pending.keys().any(|(s, _)| s == &key.0);
                         drop(h);
                         let _ = self.resolve(&key, allow);
@@ -736,7 +739,7 @@ impl Driver {
                 let gate = self.gate.clone();
                 let tx = tx.clone();
                 thread::spawn(move || {
-                    let _ = tx.send(Reply::Scope(generation, gate.scope()));
+                    let _ = tx.send(Reply::Scope(generation, gate.read_scope()));
                 });
             }
         }
