@@ -100,13 +100,16 @@ enum Command {
     /// Work with browser pages, scripts, recordings, and structured page data.
     #[command(subcommand)]
     Browser(browser_command::Command),
-    /// Write or compare CSV files from a saved collection.
+    /// Export a collection or workbook range to CSV, or compare a collection with a CSV.
     #[command(subcommand)]
     Csv(table_data::CsvCommand),
+    /// Record browser evidence. Also available as `aad browser record`.
     #[command(subcommand, hide = true)]
     BrowserRecord(browser_record::Command),
+    /// Run a browser script. Also available as `aad browser script`.
     #[command(hide = true)]
     BrowserScript(browser_script::Args),
+    /// Collect a webpage table or process a saved collection. See `aad browser` and `aad csv`.
     #[command(subcommand, hide = true)]
     Table(table_data::TableCommand),
     /// Share a browser page or the desktop with a person, who can use it remotely.
@@ -2319,7 +2322,8 @@ mod tests {
 
         for expected in [
             "apps", "describe", "snapshot", "find", "do", "probe", "validate", "run", "mcp",
-            "tools", "start", "resume", "status", "pause", "cancel", "list", "events",
+            "tools", "start", "resume", "status", "pause", "cancel", "list", "events", "browser",
+            "csv",
         ] {
             assert!(names.contains(&expected), "missing command {expected}");
         }
