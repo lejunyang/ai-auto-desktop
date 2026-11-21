@@ -12,6 +12,12 @@ pub struct Args {
     /// JSON task, download trigger and expected-file specification.
     #[arg(long)]
     spec: PathBuf,
+    /// Reconcile the verified download as CSV against this complete expected collection JSON.
+    #[arg(long, value_name = "FILE")]
+    compare_collection: Option<PathBuf>,
+    /// Compare and total this non-key column as an exact decimal. Repeatable.
+    #[arg(long, requires = "compare_collection", value_name = "COLUMN")]
+    decimal: Vec<String>,
     /// Grant the single verified download-trigger click.
     #[arg(long)]
     allow_input: bool,
@@ -30,6 +36,38 @@ pub struct Args {
 }
 
 pub fn run(args: &Args) -> Result<Value, Value> {
+    let mut report = download(args)?;
+    let Some(collection) = &args.compare_collection else {
+        return Ok(report);
+    };
+    let comparison = report["result"]["file"]["path"]
+        .as_str()
+        .filter(|_| report["result"]["verified"] == true)
+        .ok_or_else(|| "missing verified download path".to_owned())
+        .and_then(|path| {
+            crate::table_data::compare_download(
+                collection,
+                std::path::Path::new(path),
+                &args.decimal,
+            )
+        });
+    match comparison {
+        Ok(comparison) => {
+            let matches = comparison["matches"] == true;
+            report["result"]["comparison"] = comparison;
+            if matches {
+                return Ok(report);
+            }
+            report["error"] = json!({"code":"BROWSER.EXPORT_CONTENT_MISMATCH","message":"downloaded CSV differs from the expected collection"});
+        }
+        Err(message) => {
+            report["error"] = json!({"code":"BROWSER.EXPORT_COMPARISON_FAILED","message":message});
+        }
+    }
+    Err(report)
+}
+
+fn download(args: &Args) -> Result<Value, Value> {
     if !args.allow_input {
         return Err(
             json!({"code":"POLICY.DENIED","message":"download-export requires --allow-input to click the observed task control"}),

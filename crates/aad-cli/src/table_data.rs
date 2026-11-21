@@ -314,21 +314,28 @@ fn total(rows: &[Record], column: &str) -> Result<String> {
         .map_err(|e| format!("column {column:?}: {e}"))
 }
 
-fn compare(data: &Dataset, expected_rows: &[Record], decimal: &[String]) -> Result<Value> {
+fn compare(
+    columns: &[String],
+    row_key: &str,
+    expected_rows: &[Record],
+    actual_rows: &[Record],
+    decimal: &[String],
+) -> Result<Value> {
     let numeric: BTreeSet<_> = decimal.iter().collect();
     if numeric.len() != decimal.len()
-        || numeric.contains(&data.row_key)
-        || decimal.iter().any(|c| !data.columns.contains(c))
+        || decimal
+            .iter()
+            .any(|column| column == row_key || !columns.contains(column))
     {
         return Err("decimal columns must be distinct selected non-key columns".into());
     }
-    let expected = index(expected_rows, &data.row_key)?;
-    let actual = index(&data.records, &data.row_key)?;
+    let expected = index(expected_rows, row_key)?;
+    let actual = index(actual_rows, row_key)?;
     let mut totals = BTreeMap::new();
     for column in decimal {
         totals.insert(
             column,
-            json!({"actual":total(&data.records,column)?,"expected":total(expected_rows,column)?}),
+            json!({"actual":total(actual_rows,column)?,"expected":total(expected_rows,column)?}),
         );
     }
     let mut differences = Vec::new();
@@ -349,7 +356,7 @@ fn compare(data: &Dataset, expected_rows: &[Record], decimal: &[String]) -> Resu
             (Some(row), None) => report(json!({"kind":"unexpected","key":key,"actual":row})),
             (None, Some(row)) => report(json!({"kind":"missing","key":key,"expected":row})),
             (Some(a), Some(b)) => {
-                for column in &data.columns {
+                for column in columns {
                     let equal = if numeric.contains(column) {
                         Decimal::parse(&a[column])? == Decimal::parse(&b[column])?
                     } else {
@@ -366,8 +373,20 @@ fn compare(data: &Dataset, expected_rows: &[Record], decimal: &[String]) -> Resu
         }
     }
     Ok(
-        json!({"matches":difference_count==0,"row_key":data.row_key,"actual_rows":actual.len(),"expected_rows":expected.len(),
+        json!({"matches":difference_count==0,"row_key":row_key,"actual_rows":actual.len(),"expected_rows":expected.len(),
         "difference_count":difference_count,"differences":differences,"differences_truncated":difference_count>differences.len(),"totals":totals}),
+    )
+}
+
+pub(crate) fn compare_download(collection: &Path, csv: &Path, decimal: &[String]) -> Result<Value> {
+    let expected = Dataset::load(collection)?;
+    let actual = read_csv(csv, &expected.columns)?;
+    compare(
+        &expected.columns,
+        &expected.row_key,
+        &expected.records,
+        &actual,
+        decimal,
     )
 }
 
@@ -449,7 +468,13 @@ pub fn collect(args: &CollectArgs) -> Result<Value> {
             .map_err(|e| format!("invalid collection for CSV: {e}"))?,
     )?;
     if let Some(expected) = expected {
-        let comparison = compare(&data, &expected, &args.decimal)?;
+        let comparison = compare(
+            &data.columns,
+            &data.row_key,
+            &expected,
+            &data.records,
+            &args.decimal,
+        )?;
         result["matches"] = comparison["matches"].clone();
         result["comparison"] = comparison;
     }
@@ -480,7 +505,14 @@ pub fn csv(command: &CsvCommand) -> Result<Value> {
             decimal,
         } => {
             let data = Dataset::load(input)?;
-            compare(&data, &read_csv(csv, &data.columns)?, decimal)
+            let expected = read_csv(csv, &data.columns)?;
+            compare(
+                &data.columns,
+                &data.row_key,
+                &expected,
+                &data.records,
+                decimal,
+            )
         }
     }
 }
