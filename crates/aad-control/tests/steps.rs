@@ -17,6 +17,7 @@ struct Fake {
 }
 enum ObservationReply {
     Snapshot,
+    Cancel(aad_runtime::CancellationToken),
     Fail(&'static str),
     FailAtDeadline(&'static str),
 }
@@ -62,6 +63,7 @@ impl Backend for Fake {
     fn observe(&self, _: &Value, _: usize, timeout: Duration) -> Result<Value> {
         let reply = self.observations.lock().unwrap().pop_front();
         match reply {
+            Some(ObservationReply::Cancel(token)) => token.cancel(),
             Some(ObservationReply::FailAtDeadline(code)) => {
                 std::thread::sleep(timeout);
                 return Err(error(code, "fixture observation failed"));
@@ -125,6 +127,32 @@ fn app(title: Option<&str>) -> App {
         title: title.map(str::to_string),
         ..Default::default()
     }
+}
+
+#[test]
+fn cancelling_after_observation_stops_a_saved_click_before_dispatch() {
+    let (session, backend) = session();
+    let token = aad_runtime::CancellationToken::new();
+    backend
+        .observations
+        .lock()
+        .unwrap()
+        .push_back(ObservationReply::Cancel(token.clone()));
+    let provider = steps::StepProvider::new(session);
+    let failure = provider
+        .invoke_cancellable(
+            "act",
+            json!({"step":{
+                "id":"save","app":{"title":"notes.txt"},"locator":{"name":"Save"},
+                "action":{"type":"click"}
+            }}),
+            Some(Duration::from_secs(2)),
+            &token,
+        )
+        .unwrap_err();
+    assert!(failure.code.ends_with(".CANCELLED"), "{failure:?}");
+    assert_eq!(failure.effect, "not_applied");
+    assert!(backend.acted.lock().unwrap().is_empty());
 }
 
 #[test]

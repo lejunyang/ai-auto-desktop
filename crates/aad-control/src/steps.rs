@@ -9,7 +9,7 @@
 use crate::{error, Action, Expect, Locator, Operation, Request, Session, View, ACTION_NAMES};
 use aad_core::AutomationError;
 use aad_plugin::{manifest, CapabilityManifest};
-use aad_runtime::Provider;
+use aad_runtime::{CancellationToken, Provider};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
@@ -332,28 +332,20 @@ pub fn locator_for(node: &Value) -> Locator {
     }
 }
 
-fn request(session: &Session, operation: Operation, deadline: Instant) -> Result<Value> {
-    request_cancellable(
-        session,
-        operation,
-        deadline,
-        aad_runtime::CancellationToken::new(),
-    )
+struct StepSession<'a> {
+    session: &'a Session,
+    token: &'a CancellationToken,
 }
 
-fn request_cancellable(
-    session: &Session,
-    operation: Operation,
-    deadline: Instant,
-    token: aad_runtime::CancellationToken,
-) -> Result<Value> {
+fn request(run: &StepSession<'_>, operation: Operation, deadline: Instant) -> Result<Value> {
+    run.token.check()?;
     let remaining = deadline.saturating_duration_since(Instant::now());
     if remaining.is_zero() {
         return Err(error("STEP.TIMEOUT", "the step ran out of time"));
     }
-    let mut request = Request::new(Some(session.id().to_string()), operation);
+    let mut request = Request::new(Some(run.session.id().to_string()), operation);
     request.timeout_ms = (remaining.as_millis() as u64).clamp(1, crate::MAX_TIMEOUT_MS);
-    let response = session.execute_cancellable(&request, token);
+    let response = run.session.execute_cancellable(&request, run.token.clone());
     match response.data {
         Some(data) => Ok(data),
         None => {
@@ -374,7 +366,7 @@ fn request_cancellable(
 }
 
 /// The one resource a step's application names.
-fn resource(session: &Session, app: &App, deadline: Instant) -> Result<Option<String>> {
+fn resource(session: &StepSession<'_>, app: &App, deadline: Instant) -> Result<Option<String>> {
     let listed = request(
         session,
         Operation::Targets {
@@ -425,7 +417,7 @@ fn closest<'a>(app: &App, found: Vec<&'a Value>) -> Vec<&'a Value> {
     }
 }
 
-fn observe(session: &Session, resource_id: String, deadline: Instant) -> Result<Value> {
+fn observe(session: &StepSession<'_>, resource_id: String, deadline: Instant) -> Result<Value> {
     request(
         session,
         Operation::Observe {
@@ -438,7 +430,7 @@ fn observe(session: &Session, resource_id: String, deadline: Instant) -> Result<
 }
 
 fn find(
-    session: &Session,
+    session: &StepSession<'_>,
     observation: &Value,
     locator: &Locator,
     expect: Expect,
@@ -461,6 +453,24 @@ fn find(
 /// Run one step now. `inputs` supplies values for steps that take one.
 pub fn perform(
     session: &Session,
+    step: &Step,
+    inputs: &Map<String, Value>,
+    timeout: Duration,
+) -> Result<Value> {
+    let token = CancellationToken::new();
+    perform_step(
+        &StepSession {
+            session,
+            token: &token,
+        },
+        step,
+        inputs,
+        timeout,
+    )
+}
+
+fn perform_step(
+    session: &StepSession<'_>,
     step: &Step,
     inputs: &Map<String, Value>,
     timeout: Duration,
@@ -588,7 +598,7 @@ pub fn perform(
 /// Wait as the session's own wait does: several matches are a passing state
 /// (a tree mid-change can show an element twice), neither the one element
 /// that should be there nor its absence, so they are waited out.
-fn wait(session: &Session, step: &Step, check: &Check, deadline: Instant) -> Result<Value> {
+fn wait(session: &StepSession<'_>, step: &Step, check: &Check, deadline: Instant) -> Result<Value> {
     let until = Instant::now() + Duration::from_millis(check.within_ms);
     let deadline = deadline.min(until + Duration::from_secs(5));
     loop {
@@ -625,7 +635,9 @@ fn wait(session: &Session, step: &Step, check: &Check, deadline: Instant) -> Res
                 },
             ));
         }
-        std::thread::sleep(Duration::from_millis(250));
+        std::thread::sleep(
+            Duration::from_millis(250).min(until.saturating_duration_since(Instant::now())),
+        );
     }
 }
 
@@ -900,6 +912,10 @@ impl Provider for StepProvider {
         token: &aad_runtime::CancellationToken,
     ) -> Result<Value> {
         token.check()?;
+        let run = StepSession {
+            session: &self.session,
+            token,
+        };
         let name = action
             .strip_prefix(PROVIDER)
             .and_then(|rest| rest.strip_prefix('.'))
@@ -919,17 +935,16 @@ impl Provider for StepProvider {
                 return Err(invalid("table collection requires an application selector"));
             }
             let deadline = Instant::now() + timeout.unwrap_or(Duration::from_secs(30));
-            let resource_id = resource(&self.session, &args.app, deadline)?.ok_or_else(|| {
+            let resource_id = resource(&run, &args.app, deadline)?.ok_or_else(|| {
                 error("STEP.APP_NOT_FOUND", "no open page matches the application")
             })?;
-            return request_cancellable(
-                &self.session,
+            return request(
+                &run,
                 Operation::CollectTable {
                     resource_id,
                     spec: args.spec,
                 },
                 deadline,
-                token.clone(),
             );
         }
         let step: Step = serde_json::from_value(args["step"].clone())
@@ -945,8 +960,8 @@ impl Provider for StepProvider {
             return Err(invalid(format!("{action} does not run this step")));
         }
         let inputs = args["inputs"].as_object().cloned().unwrap_or_default();
-        perform(
-            &self.session,
+        perform_step(
+            &run,
             &step,
             &inputs,
             timeout.unwrap_or(Duration::from_secs(30)),
