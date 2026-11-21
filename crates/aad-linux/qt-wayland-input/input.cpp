@@ -124,6 +124,44 @@ public:
         timer->start(250);
     }
 public slots:
+    QStringList PointerModes() const {
+        return {"wheel", "hover"};
+    }
+
+    bool PointMatches(const QString &target, const QString &window, int px, int py) const {
+        auto *widget = boundWidget(target, window);
+        return widget && hits(widget, QPoint(px, py));
+    }
+
+    int Wheel(const QString &target, const QString &window, int px, int py,
+              int direction, int notches, qulonglong deadline) {
+        if (delivering || direction < 4 || direction > 7 || notches < 1 || notches > 30) return 0;
+        QScopedValueRollback<bool> guard(delivering, true);
+        auto *widget = boundWidget(target, window);
+        const QPoint point(px, py);
+        if (!widget || !hits(widget, point) || !inTime(deadline)) return 0;
+        // A physical wheel detent is 120 eighths of a degree. Qt uses
+        // positive components for up and left in the AT-SPI button mapping.
+        const int delta = (direction == 4 || direction == 6 ? 120 : -120) * notches;
+        const QPoint angle = direction < 6 ? QPoint(0, delta) : QPoint(delta, 0);
+        QWheelEvent event(widget->mapFromGlobal(point), point, {}, angle, Qt::NoButton,
+                          Qt::NoModifier, Qt::NoScrollPhase, false, Qt::MouseEventSynthesizedByApplication);
+        QCoreApplication::sendEvent(widget, &event);
+        return 2;
+    }
+
+    int Hover(const QString &target, const QString &window, int px, int py, qulonglong deadline) {
+        if (delivering) return 0;
+        QScopedValueRollback<bool> guard(delivering, true);
+        auto *widget = boundWidget(target, window);
+        const QPoint point(px, py);
+        if (!widget || !hits(widget, point) || !inTime(deadline)) return 0;
+        const QPoint local = widget->mapFromGlobal(point);
+        QHoverEvent event(QEvent::HoverMove, local, local);
+        QCoreApplication::sendEvent(widget, &event);
+        return 2;
+    }
+
     QByteArray Capabilities(const QStringList &targets, const QStringList &windows) {
         if (targets.size() != windows.size() || targets.size() > 5000) return {};
         QByteArray flags(targets.size(), 0);

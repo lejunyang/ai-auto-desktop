@@ -11,7 +11,7 @@ from wayland_form import wait_for
 
 def application(receipt):
     from PyQt5.QtCore import QEvent, QObject, Qt, QTimer
-    from PyQt5.QtWidgets import QApplication, QLabel, QLineEdit, QPushButton, QVBoxLayout, QWidget
+    from PyQt5.QtWidgets import QApplication, QLabel, QLineEdit, QPushButton, QScrollBar, QVBoxLayout, QWidget
 
     app = QApplication(sys.argv[:1])
     assert app.platformName().startswith("wayland"), app.platformName()
@@ -25,23 +25,40 @@ def application(receipt):
     covered = QPushButton("Covered action")
     cover = QLabel("Cover", covered)
     secret = QLineEdit()
+    bar = QScrollBar(Qt.Horizontal)
+    bar.setAccessibleName("Invoice scroll")
+    bar.setRange(0, 1000)
+    bar.setValue(500)
+    bar.setMinimumSize(240, 32)
+    edge_cover = QLabel("Blocked", bar)
+    edge_cover.setGeometry(0, 0, 40, 32)
     secret.setEchoMode(QLineEdit.Password)
     for widget, name in [(field, "Invoice number"), (sibling, "Other invoice"), (secret, "PIN")]:
         widget.setAccessibleName(name)
     other_box.addWidget(sibling)
-    for widget in (field, button, covered, secret):
+    for widget in (field, button, covered, secret, bar):
         box.addWidget(widget)
     events = []
     clicks = []
+    gestures = []
     def save():
         tmp = receipt.with_suffix(".tmp")
         tmp.write_text(json.dumps(dict(events=events, clicks=clicks, text=field.text(),
                                       selection=field.selectedText(), sibling=sibling.text(),
-                                      platform=app.platformName())))
+                                      platform=app.platformName(), gestures=gestures, scroll_value=bar.value())))
         tmp.replace(receipt)
 
     class Monitor(QObject):
         def eventFilter(self, obj, event):
+            if not event.spontaneous() and event.type() in (QEvent.Wheel, QEvent.HoverMove):
+                entry = dict(widget=obj.accessibleName() or obj.objectName(), pos=[event.pos().x(), event.pos().y()],
+                             size=[obj.width(), obj.height()])
+                if event.type() == QEvent.Wheel:
+                    entry["wheel"] = [event.angleDelta().x(), event.angleDelta().y()]
+                else:
+                    entry["hover"] = True
+                gestures.append(entry)
+                QTimer.singleShot(0, save)
             kind = {QEvent.KeyPress: "key-down", QEvent.KeyRelease: "key-up",
                     QEvent.MouseButtonPress: "mouse-down", QEvent.MouseButtonRelease: "mouse-up"}
             if event.type() in kind:
@@ -50,7 +67,7 @@ def application(receipt):
             return False
 
     monitor = Monitor()
-    for widget in (sibling, field, button, covered, secret):
+    for widget in (sibling, field, button, covered, cover, secret, bar, edge_cover):
         widget.installEventFilter(monitor)
     button.clicked.connect(lambda: (clicks.append("submit"), save()))
     covered.clicked.connect(lambda: (clicks.append("covered"), save()))
@@ -109,6 +126,31 @@ def verify(aad, plugin_root):
             call("do", "click", resource, "--name", "Submit invoice", success=enabled)
             if enabled:
                 wait_for(lambda: snapshot()["clicks"] == ["submit"], "submit callback")
+                def check_gesture(action, marker, expected, fx, fy, *args):
+                    before = len(snapshot()["gestures"])
+                    call("do", action, resource, "--name", "Invoice scroll",
+                         "--fx", str(fx), "--fy", str(fy), *args)
+                    wait_for(lambda: len(snapshot()["gestures"]) > before, action + " receipt")
+                    entries = snapshot()["gestures"][before:]
+                    assert len(entries) == 1 and entries[0].get(marker) == expected, entries
+                    entry = entries[0]
+                    assert entry["widget"] == "Invoice scroll", entry
+                    for observed, size, fraction in zip(entry["pos"], entry["size"], (fx, fy)):
+                        assert abs(observed - max(1, min(size - 2, size * fraction))) <= 1, entry
+
+                for direction, delta in (("down", [0, -240]), ("up", [0, 240]),
+                                         ("left", [240, 0]), ("right", [-240, 0])):
+                    previous = snapshot()["scroll_value"]
+                    check_gesture("scroll", "wheel", delta, 0.78, 0.5, "--direction", direction, "--notches", "2")
+                    assert snapshot()["scroll_value"] != previous, snapshot()
+                check_gesture("hover", "hover", True, 1, 1, "--ms", "120")
+            before_denied = snapshot()
+            for action, args in (("scroll", ["--direction", "down"]), ("hover", ["--ms", "1"])):
+                # Center is visible. The requested endpoint hits a covering child.
+                call("do", action, resource, "--name", "Invoice scroll", "--fx", "0", "--fy", "0.5",
+                     *args, success=False)
+                call("do", action, resource, "--name", "Other invoice", *args, success=False)
+            assert snapshot() == before_denied, snapshot()
             state = snapshot()
             for name in ("Other invoice", "PIN"):
                 call("do", "key", resource, "--name", name, "--keys", "q", success=False)
