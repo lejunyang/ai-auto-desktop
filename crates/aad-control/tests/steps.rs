@@ -303,6 +303,10 @@ fn an_input_supplies_text_that_is_never_stored() {
     assert!(!workflow.to_string().contains("hunter2"));
     assert_eq!(workflow["inputs"]["password"]["sensitive"], true);
     assert_eq!(
+        workflow["inputs"]["password"]["schema"],
+        json!({"type":"string"})
+    );
+    assert_eq!(
         workflow["steps"][0]["with"]["inputs"]["password"],
         "${{ inputs.password }}"
     );
@@ -412,6 +416,63 @@ fn a_check_waits_out_a_moment_of_two_matches() {
         .unwrap_err();
         assert_eq!(refused.code, "CONTROL.AMBIGUOUS");
     }
+}
+
+#[test]
+fn a_recorded_file_selection_requires_paths_from_the_run() {
+    let (session, backend) = session();
+    let mut step = act(
+        "rec1",
+        None,
+        named("button", "Attachments"),
+        json!({"type":"upload"}),
+    );
+    step.input = Some(Input {
+        name: "rec1_files".into(),
+        sensitive: false,
+    });
+    let recorded = steps::recording("attach", std::slice::from_ref(&step));
+    let restored = steps::steps_of(&recorded).unwrap();
+    let document = steps::workflow("attach", &restored).unwrap();
+    assert_eq!(
+        document["inputs"]["rec1_files"],
+        json!({"schema":{"type":"array","items":{"type":"string"}},"sensitive":false,"required":true})
+    );
+    assert_eq!(
+        document["steps"][0]["with"]["inputs"]["rec1_files"],
+        "${{ inputs.rec1_files }}"
+    );
+    assert_eq!(
+        document["steps"][0]["with"]["step"]["action"],
+        json!({"type":"upload"})
+    );
+    for inputs in [
+        json!({}),
+        json!({"rec1_files":null}),
+        json!({"rec1_files":"file.txt"}),
+        json!({"rec1_files":[]}),
+        json!({"rec1_files":[""]}),
+        json!({"rec1_files":["ok", 2]}),
+    ] {
+        let error = steps::perform(
+            &session,
+            &step,
+            inputs.as_object().unwrap(),
+            Duration::from_secs(1),
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "STEP.INVALID");
+        assert!(error.message.contains("rec1_files"));
+    }
+    assert!(backend.acted.lock().unwrap().is_empty());
+    let mut text = step.clone();
+    text.id = "other".into();
+    text.action = Some(json!({"type":"paste"}));
+    assert!(steps::workflow("attach", &[step.clone(), text]).is_err());
+    step.action = Some(json!({"type":"upload","files":["recorded.txt"]}));
+    assert!(step.validate().is_err());
+    step.input = None;
+    step.validate().expect("legacy literal upload still works");
 }
 
 #[test]

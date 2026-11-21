@@ -44,7 +44,7 @@ pub struct App {
     pub url: Option<String>,
 }
 
-/// Where a step's text comes from when it must not be stored.
+/// The workflow input that supplies a step's text or file paths at run time.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Input {
@@ -88,7 +88,7 @@ pub struct Step {
     pub to: Option<Locator>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub check: Option<Check>,
-    /// For fill, type_text and paste: take the text from this workflow input.
+    /// Bind text or a list of file paths, according to the action type.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input: Option<Input>,
     /// What a person wrote about the step.
@@ -110,6 +110,15 @@ fn valid_id(id: &str) -> bool {
 }
 
 impl Step {
+    fn input_field(&self) -> Option<&'static str> {
+        match self.action.as_ref()?["type"].as_str()? {
+            "upload" | "choose_files" => Some("files"),
+            "fill" => Some("value"),
+            "type_text" | "paste" => Some("text"),
+            _ => None,
+        }
+    }
+
     /// Everything that can be checked without a desktop.
     pub fn validate(&self) -> Result<()> {
         if !valid_id(&self.id) {
@@ -201,9 +210,15 @@ impl Step {
                     self.id
                 )));
             }
-            if self.input.is_some() && !matches!(name, "fill" | "type_text" | "paste") {
+            if self.input.is_some() && self.input_field().is_none() {
+                return Err(invalid(format!("step {} cannot take an input", self.id)));
+            }
+            if self.input.is_some()
+                && self.input_field() == Some("files")
+                && action.get("files").is_some()
+            {
                 return Err(invalid(format!(
-                    "step {}: only fill, type_text and paste take an input",
+                    "step {}: omit files when binding an input",
                     self.id
                 )));
             }
@@ -218,23 +233,16 @@ impl Step {
     }
 
     /// The action, with the input's value and the drag destination filled in.
-    fn typed(&self, value: Option<&str>, to: Option<&Value>) -> Result<Action> {
+    fn typed(&self, value: Option<&Value>, to: Option<&Value>) -> Result<Action> {
         let mut action = self.action.clone().unwrap_or(Value::Null);
-        if let Some(value) = value {
-            let field = if action["type"] == "fill" {
-                "value"
-            } else {
-                "text"
-            };
-            action[field] = json!(value);
-        } else if self.input.is_some() {
-            // Placeholder so the shape can be checked before the value exists.
-            let field = if action["type"] == "fill" {
-                "value"
-            } else {
-                "text"
-            };
-            action[field] = json!("");
+        if let (Some(_), Some(field)) = (&self.input, self.input_field()) {
+            action[field] = value.cloned().unwrap_or_else(|| {
+                if field == "files" {
+                    json!([])
+                } else {
+                    json!("")
+                }
+            });
         }
         if self.to.is_some() {
             action["to"] = to.cloned().unwrap_or_else(|| {
@@ -518,13 +526,27 @@ pub fn perform(
         }
     }
     let value = match &step.input {
-        Some(input) => Some(
-            inputs
+        Some(input) => {
+            let value = inputs
                 .get(&input.name)
-                .and_then(Value::as_str)
-                .ok_or_else(|| invalid(format!("input {} is required", input.name)))?
-                .to_string(),
-        ),
+                .ok_or_else(|| invalid(format!("input {} is required", input.name)))?;
+            if step.input_field() == Some("files") {
+                if !value.as_array().is_some_and(|files| {
+                    !files.is_empty()
+                        && files
+                            .iter()
+                            .all(|file| file.as_str().is_some_and(|path| !path.is_empty()))
+                }) {
+                    return Err(invalid(format!(
+                        "input {} must be a nonempty array of file paths",
+                        input.name
+                    )));
+                }
+            } else if !value.is_string() {
+                return Err(invalid(format!("input {} must be a string", input.name)));
+            }
+            Some(value)
+        }
         None => None,
     };
     let resource_id = resource(session, &step.app, deadline)?.ok_or_else(|| {
@@ -539,7 +561,7 @@ pub fn perform(
         Some(to) => Some(find(session, &observation, to, Expect::One, deadline)?["target"].clone()),
         None => None,
     };
-    let action = step.typed(value.as_deref(), to.as_ref())?;
+    let action = step.typed(value, to.as_ref())?;
     let target = serde_json::from_value(found["target"].clone())
         .map_err(|e| error("STEP.BAD_TARGET", e.to_string()))?;
     let result = request(
@@ -711,10 +733,23 @@ pub fn workflow(name: &str, steps: &[Step]) -> Result<Value> {
         }
         let mut with = json!({"step": step});
         if let Some(input) = &step.input {
-            inputs.insert(
-                input.name.clone(),
-                json!({"schema": {"type": "string"}, "required": true, "sensitive": input.sensitive}),
+            let schema = if step.input_field() == Some("files") {
+                json!({"type": "array", "items": {"type": "string"}})
+            } else {
+                json!({"type": "string"})
+            };
+            let definition = inputs.entry(input.name.clone()).or_insert_with(
+                || json!({"schema": schema, "required": true, "sensitive": input.sensitive}),
             );
+            if definition["schema"] != schema {
+                return Err(invalid(format!(
+                    "input {} cannot supply both text and files",
+                    input.name
+                )));
+            }
+            if input.sensitive {
+                definition["sensitive"] = json!(true);
+            }
             with["inputs"] = json!({ &input.name: format!("${{{{ inputs.{} }}}}", input.name) });
         }
         if let Some(fields) = &step.read {
