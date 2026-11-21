@@ -1,8 +1,25 @@
 # Selecting a file in an already-open Chromium picker on X11
 
-The current Linux provider cannot produce a writable filename entry and Open button on either of the two Chromium picker configurations tested. Window ownership could be established in both. This limits what an `aad do choose-files` command could implement using the existing provider.
+`aad do choose-files` completed single- and multiple-file selections in an already-open, browser-owned GTK 3 dialog on Linux X11. The page received the file bytes and the native dialog closed.
 
-## Headed reproduction
+```sh
+aad do choose-files --cdp-port 9222 --page "$PAGE_ID" --allow-input \
+  --allow-upload-dir "$UPLOAD_DIR" --file "$UPLOAD_DIR/one.txt" --file "$UPLOAD_DIR/two.txt"
+```
+
+Use the exact page ID from `aad browser-record targets --cdp-port 9222`. The command observes the active native dialog. An optional `--window 0x…` additionally requires a particular XID. An upload grant covers regular files whose canonical paths are under that directory. A local file **page** separately requires `--allow-browser-file-dir`.
+
+### How the selection is bound
+
+1. On the selected page's main frame, the browser provider observes the unique file input with `states.picker_open=true` (Chromium's `:open`). The active element can be a different control. The input can be hidden.
+2. The native observation binds the mapped GTK dialog and its transient parent to the CDP browser PID using both X-Resource client ownership and the window PID. The parent must uniquely match the selected CDP window bounds. The active modal must have the GTK file-chooser window role and an accepted Open title. Ambiguous chooser windows are refused.
+3. The normal session upload action rechecks the observed input identity and picker state, validates the path grant, and assigns the files. The CLI then revalidates the native window, sends `WM_DELETE_WINDOW` to that XID, and verifies its unmap or destruction. The session holds the browser and desktop input leases throughout. A dismissal failure after successful assignment reports `files_submitted=true` and an applied effect.
+
+The headed regression read both selected files through the page's File API in the requested order. The hidden file input received a trusted change event, its sibling received zero files, and the page saw no cancel event. The wrong tab, wrong XID, and an escaping symlink all left the original picker open. A real Save As dialog remained open after refusal. [Regression test](../../tests/browser/open-native-picker.test.mjs)
+
+The verified configuration used Chrome for Testing 156, a private Xvfb display, xfwm4, and GTK 3. The command accepts the titles `Open File`, `Open Files`, and `打开文件`. It requires a unique match for the native parent in X11 pixel bounds. The tested GTK 4.8.3 dialog lacked the required X11 `WM_WINDOW_ROLE`. Desktop-portal dialogs owned by a separate process also fail the native binding.
+
+## Native-widget experiment
 
 Google Chrome for Testing 156.0.8078.4 ran on a private Xvfb display with xfwm4, a private session bus, and a temporary browser profile. The fixture page contained a file input with ID `f` and a sibling text input with ID `s` and value `sibling`. A page CDP session called `f.click()` with `userGesture: true`. File chooser interception was off. The native control tests started after X11 mapped the dialog.
 
@@ -25,8 +42,4 @@ On GTK 3 a diagnostic AT-SPI listener saw the location field receive focus. Its 
 
 On GTK 4 the entry and Open button reported `visible=true`, `sensitive=true`, `enabled=false`, and `showing=false`. The button published a native click action. The Linux provider requires enabled and sensitive to offer semantic input. The entry and button therefore remain observable through the CLI without a dispatchable action.
 
-## Platform work needed
-
-GTK 3 would need native discovery of the detached chooser **after** it opens, plus a way to retain and revalidate its controls in the same X11 window. GTK 4 would need toolkit-specific proof of control state and window identity before the provider could offer actions. A successful implementation must independently verify the granted file on the page and reject a different active window, ambiguous controls, and Save As dialogs.
-
-[待验证] Multi-file behavior requires a writable, revalidated native picker and a page with `<input type="file" multiple>` on a headed X11 browser.
+These measurements concern direct editing and activation of the GTK widgets. The working CLI path uses the observed DOM input for file assignment and the observed X11 dialog for dismissal.
