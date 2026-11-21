@@ -4,6 +4,16 @@
 
 Chromium exposes click, hover, scroll and drag on an observed canvas surface. You can drag between two places on the same canvas or supply a path to draw a polyline. Each point is a fraction inside its observed element. In the browser fixture, trusted input events and the pixels in the resulting PNG independently verify the drawing. Choosing a diagram node by its business name still requires the page to expose that object or the caller to locate it visually. [Pointer actions and paths](../control-sessions.md) · [Chromium canvas tests](../../crates/aad-control/tests/browser_e2e.rs)
 
+## Read labels without a grid
+
+Read the words painted on a visible Chromium canvas by providing its locator. Tesseract searches for text at arbitrary positions. It returns line and word boxes as fractions of the canvas, with confidence scores. The optional language requires the corresponding Tesseract language pack.
+
+```powershell
+aad browser read --browser-port 9222 --url 'http://localhost:8080/diagram' --canvas-text '{"name":"Diagram"}' --language en-US
+```
+
+Scripts can use `page.readText({name:"Diagram"}, "en-US")`. MCP clients can use `control_read_text` on the observed canvas. When the diagram stays still, the centre of a unique word gives a location for an ordinary canvas click. Read again after a pan, zoom or redraw. An empty canvas returns an empty list. OCR reads printed labels, and shapes or connecting lines without text require visual interpretation. [Example with an independently verified click](../../tests/browser/canvas-text.test.mjs)
+
 ## Read regular cells
 
 `aad browser read --canvas-grid` reads single-line labels and numbers from one visible Chromium canvas. Supply the layout that the page paints. For example, if the canvas named `Ledger` contains three rows of data and three equal-width columns, run this in PowerShell 7 with the ledger page already open.
@@ -39,7 +49,7 @@ With Tesseract and `prlimit` installed, set `AAD_TEST_CHROME` to a Chrome for Te
 
 ```powershell
 cargo build --locked -p aad-cli
-node --test tests/browser/canvas-grid.test.mjs
+node --test --test-concurrency=1 tests/browser/canvas-grid.test.mjs tests/browser/canvas-text.test.mjs
 ```
 
 The headless fixture compares the returned text and cell bounds with the expected ledger, including an unreadable cell. It also checks ambiguity, offscreen placement, pointer-transparent occlusion, a password overlap, bitmap transparency, a cross-origin image, and truncation at 64 cells. [Browser fixture](../../tests/browser/canvas-grid.test.mjs)
