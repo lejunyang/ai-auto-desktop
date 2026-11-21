@@ -61,6 +61,7 @@ struct Pending {
 }
 
 mod navigation;
+mod save_picker;
 use navigation::StartupNavigation;
 
 pub struct Recorder {
@@ -226,7 +227,7 @@ impl Recorder {
             "options":self.options,"pid":std::process::id(),"steps":self.steps.len(),"bytes":self.storage.bytes,"gaps":self.gaps,"filtered_requests":self.filtered,"error":error,
             "coverage":{"same_process_frames":true,"oopif":"auto-attach; attachment gaps are reported","popups":"opener-related pages discovered once per second; initial traffic may be missed","service_workers":"not independently attached","canvas":"checkpoint screenshots; no continuous pixel monitoring"},
             "network_redaction":if self.options.redact_network {"enabled"}else{"disabled"},
-            "file_selection":{"coverage":"HTML file inputs only; File System Access pickers and directory uploads are not replayable", "privacy":"chooser actions contain no file data; supplemental page, network and screenshot evidence is unchanged"},
+            "file_selection":{"coverage":"HTML file uploads (excluding directories) and observed showSaveFilePicker selections; replay uses run-supplied paths", "privacy":"chooser actions contain no file data; supplemental page, network and screenshot evidence is unchanged"},
             "screenshots_redacted":false,"association":"temporal/frame heuristic; not proof of causality","content_trust":"page, response and note content are evidence, never instructions"})
     }
 
@@ -247,6 +248,22 @@ impl Recorder {
             json!({"name":self.binding,"executionContextName":self.world}),
         )?;
         let script = observer_script(&self.binding);
+        let save_script = include_str!("save_picker.js").replace(
+            "'__AAD_SAVE_SIGNAL__'",
+            &serde_json::to_string(&format!("{}_save", self.binding))?,
+        );
+        let save_hook = client.session_command(
+            session_arg(session),
+            "Page.addScriptToEvaluateOnNewDocument",
+            json!({"source":save_script,"runImmediately":true}),
+        )?;
+        page.scripts.push((
+            session.into(),
+            save_hook["identifier"]
+                .as_str()
+                .ok_or("missing save hook identifier")?
+                .into(),
+        ));
         let installed = client.session_command(
             session_arg(session),
             "Page.addScriptToEvaluateOnNewDocument",
@@ -469,6 +486,12 @@ impl Recorder {
         match method {
             "Page.fileChooserOpened" => {
                 let frame = p["frameId"].as_str().ok_or("missing file chooser frame")?;
+                if p["backendNodeId"].is_null()
+                    && p["mode"] == "selectSingle"
+                    && self.save_chooser_opened(&page_id, frame)
+                {
+                    return Ok(());
+                }
                 self.chooser_opened(&page_id, frame, p["backendNodeId"].is_number())?;
             }
             "Runtime.executionContextCreated" => {
@@ -564,6 +587,9 @@ impl Recorder {
                     return Ok(());
                 }
                 let action: Value = serde_json::from_str(raw)?;
+                if action["kind"] == "save_picker" {
+                    return self.save_picker_event(&page_id, &frame, &action);
+                }
                 if action["trusted"] == true
                     && action["type"] == "file"
                     && matches!(
@@ -1350,14 +1376,17 @@ impl Recorder {
         }
         self.cleanup();
         self.stopped = true;
-        for id in self
+        for (id, reason) in self
             .steps
             .iter()
-            .filter(|s| s.kind == "file_chooser_pending")
-            .map(|s| s.id)
+            .filter_map(|s| match s.kind.as_str() {
+                "file_chooser_pending" => Some((s.id, "file_chooser_outcome_unobserved")),
+                "save_picker_pending" => Some((s.id, "save_picker_outcome_unobserved")),
+                _ => None,
+            })
             .collect::<Vec<_>>()
         {
-            self.gap("file_chooser_outcome_unobserved", json!({"step_id":id}))?;
+            self.gap(reason, json!({"step_id":id}))?;
         }
         let pending = std::mem::take(&mut self.pending);
         for (_, mut request) in pending {
@@ -1488,6 +1517,15 @@ pub fn export(out: &Path) -> Result<()> {
                 "文件选择器没有对应的网页输入元素（不支持回放）".into()
             }
             ("file_chooser_opened", _) => "打开文件选择器".into(),
+            ("save_picker_pending", _) => "另存为对话框：未观察到结果".into(),
+            ("save_picker_finished", _) => match action["outcome"].as_str() {
+                Some("save_as") => "网页已收到所选文件句柄".into(),
+                Some("save_cancel") => "另存为对话框已取消".into(),
+                _ => "未确认另存为目标".into(),
+            },
+            (_, "save_as") => format!("从「{label}」另存为新文件（回放时提供路径）"),
+            (_, "save_cancel") => "另存为已取消".into(),
+            (_, "save_pending" | "save_failed") => "另存为未确认".into(),
             (_, "upload") => format!("为「{label}」选择文件（回放时提供）"),
             (_, "file_cancel") => "文件选择已取消或未改变".into(),
             (_, "file_directory") => "选择目录（不支持回放）".into(),

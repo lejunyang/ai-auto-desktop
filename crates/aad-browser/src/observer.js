@@ -60,6 +60,13 @@
   const fileTargets = new WeakMap();
   const usedFileTargets = new WeakSet();
   let activation, enter;
+  if (binding) listen(binding + '_save', event => {
+    const match = /^(start|selected|cancel|failed):([1-9][0-9]{0,14})$/.exec(event.detail);
+    if (!match) return;
+    globalThis[binding](JSON.stringify({kind:'save_picker',phase:match[1],call:match[2],
+      document_id:documentId,trigger_sequence:activation?.event.isTrusted && activation.event.eventPhase
+        ? activation.sequence : null}));
+  });
   const describeFile = el => {
     const hidden = !el.getClientRects().length || getComputedStyle(el).visibility === 'hidden';
     if (!el.files?.length && !usedFileTargets.has(el)) fileTargets.set(el, describe(el));
@@ -136,7 +143,7 @@
     version:3, installed:true, snapshot, isDirty:()=>dirty,
     take:()=>queue.splice(0),
     takeReport:()=>{ const report={events:queue.splice(0),dropped}; dropped=0; return report; },
-    stop:()=>{ for (const [name,fn] of listeners) document.removeEventListener(name,fn,true); observer?.disconnect(); queue.length=0; delete globalThis.__aadCdp; }
+    stop:()=>{ if (binding) document.dispatchEvent(new Event(binding + '_save_stop')); for (const [name,fn] of listeners) document.removeEventListener(name,fn,true); observer?.disconnect(); queue.length=0; delete globalThis.__aadCdp; }
   };
   return true;
 })()

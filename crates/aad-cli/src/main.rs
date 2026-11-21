@@ -355,6 +355,9 @@ struct RunArgs {
     /// Allow selecting files under DIR. Repeat for more roots; requires --permission desktop.input.
     #[arg(long = "allow-upload-dir", value_name = "DIR")]
     upload_dirs: Vec<PathBuf>,
+    /// Allow recorded Save As steps to select new files under DIR. Repeatable.
+    #[arg(long = "allow-save-dir", value_name = "DIR")]
+    save_dirs: Vec<PathBuf>,
     /// Report what would run without executing anything.
     #[arg(long)]
     dry_run: bool,
@@ -1471,11 +1474,11 @@ fn run_workflow(args: &RunArgs) -> (Value, u8) {
         .permissions
         .iter()
         .any(|permission| permission == "desktop.input");
-    if !args.upload_dirs.is_empty() && !allow_input {
+    if (!args.upload_dirs.is_empty() || !args.save_dirs.is_empty()) && !allow_input {
         return (
             failure(
                 "POLICY.DENIED",
-                "--allow-upload-dir requires --permission desktop.input",
+                "file grants require --permission desktop.input",
                 None,
             ),
             EXIT_USAGE,
@@ -1581,6 +1584,7 @@ fn run_workflow(args: &RunArgs) -> (Value, u8) {
         aad_control::Policy {
             allow_input,
             upload_roots: args.upload_dirs.clone(),
+            save_roots: args.save_dirs.clone(),
             ..Default::default()
         },
         browser_port,
@@ -2162,6 +2166,7 @@ mod tests {
             inputs: None,
             journal: None,
             upload_dirs: Vec::new(),
+            save_dirs: Vec::new(),
             dry_run: true,
             allow_scripts: false,
             plugins: Vec::new(),
@@ -2467,6 +2472,7 @@ mod tests {
             inputs: None,
             journal: None,
             upload_dirs: Vec::new(),
+            save_dirs: Vec::new(),
             dry_run: true,
             allow_scripts: false,
             plugins: Vec::new(),
@@ -2498,6 +2504,7 @@ mod tests {
             inputs: Some(r#"{"who":"agent"}"#.to_string()),
             journal: None,
             upload_dirs: Vec::new(),
+            save_dirs: Vec::new(),
             dry_run: false,
             allow_scripts: false,
             plugins: Vec::new(),
@@ -2528,6 +2535,7 @@ mod tests {
                 inputs: Some(bad.to_string()),
                 journal: None,
                 upload_dirs: Vec::new(),
+                save_dirs: Vec::new(),
                 dry_run: false,
                 allow_scripts: false,
                 plugins: Vec::new(),
@@ -2558,6 +2566,7 @@ mod tests {
             inputs: None,
             journal: Some(journal.clone()),
             upload_dirs: Vec::new(),
+            save_dirs: Vec::new(),
             dry_run: false,
             allow_scripts: false,
             plugins: Vec::new(),
@@ -2594,6 +2603,7 @@ mod tests {
             journal: None,
             dry_run: false,
             upload_dirs: Vec::new(),
+            save_dirs: Vec::new(),
             allow_scripts: false,
             plugins: Vec::new(),
             permissions: Vec::new(),

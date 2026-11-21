@@ -37,6 +37,9 @@ pub struct Grants {
     /// Without it every upload is refused.
     #[arg(long = "allow-upload-dir", value_name = "DIR")]
     upload_dirs: Vec<std::path::PathBuf>,
+    /// Let saved browser steps select new destinations below this directory.
+    #[arg(long = "allow-save-dir", value_name = "DIR")]
+    save_dirs: Vec<std::path::PathBuf>,
     /// Let browser_storage show cookie values. Without it names and flags only.
     #[arg(long)]
     allow_cookie_values: bool,
@@ -82,6 +85,7 @@ impl Grants {
             allow_clipboard_read: self.allow_clipboard_read,
             allow_global_keys: self.allow_global_keys,
             upload_roots: self.upload_dirs.clone(),
+            save_roots: self.save_dirs.clone(),
             allow_cookie_values: self.allow_cookie_values,
             browser_access: aad_control::browser_access::BrowserAccess::new(
                 &self.browser_file_dirs,
@@ -115,6 +119,9 @@ impl Grants {
     /// Launching and global keys are input: refuse them without the input grant
     /// rather than start a server that would refuse every such request.
     fn check(&self, allow_input: bool) -> std::io::Result<()> {
+        if !allow_input && !self.save_dirs.is_empty() {
+            return Err(invalid("--allow-save-dir needs --allow-input"));
+        }
         if self.browser_bidi_port == Some(0)
             || (self.browser_bidi_port.is_some() && self.browser_port.is_some())
         {
@@ -144,6 +151,7 @@ impl Grants {
             || self.allow_clipboard_read
             || self.allow_global_keys
             || !self.upload_dirs.is_empty()
+            || !self.save_dirs.is_empty()
             || self.allow_cookie_values
             || !self.browser_file_dirs.is_empty()
             || !self.browser_internal_origins.is_empty()

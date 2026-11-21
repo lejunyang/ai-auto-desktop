@@ -302,6 +302,8 @@ pub struct Policy {
     /// Directories whose files an `upload` may hand to a page. Empty refuses
     /// every upload; a client can neither extend nor see past them.
     pub upload_roots: Vec<std::path::PathBuf>,
+    /// Directories in which a recorded Save As may select a new file.
+    pub save_roots: Vec<std::path::PathBuf>,
     /// Whether browser_storage may show cookie values. Off: names and flags only.
     pub allow_cookie_values: bool,
     /// Operator grants for local files and exact browser internal origins.
@@ -1265,7 +1267,7 @@ impl Session {
                 "expires_in_ms": self.lifetime.saturating_sub(self.created.elapsed()).as_millis(),
                 "session_usable": !self.is_closed() && self.created.elapsed() < self.lifetime
                     && self.state.lock().unwrap().requests.len() < self.max_requests,
-                "allow_input": self.policy.allow_input,"allow_secret_input":self.policy.allow_secret_input,"secret_bindings":if self.policy.allow_secret_input { self.policy.secret_bindings.names() } else { Vec::new() },"upload_dirs": self.policy.upload_roots,"cookie_values": self.policy.allow_cookie_values,"observation_retention":if self.backends.values().any(|b| self.allowed_provider(b.name()) && b.supports_cross_resource_drag()) { "provider_declared" } else { "until_next_observation_or_input_attempt" },"observation_ttl_ms":self.observation_ttl.as_millis(),"max_requests":self.max_requests,"input_lease":"exclusive_cooperating_session","input_lease_scope":"os_user","providers": self.backends.values().filter(|b| self.allowed_provider(b.name()))
+                "allow_input": self.policy.allow_input,"allow_secret_input":self.policy.allow_secret_input,"secret_bindings":if self.policy.allow_secret_input { self.policy.secret_bindings.names() } else { Vec::new() },"upload_dirs": self.policy.upload_roots,"save_dirs":self.policy.save_roots,"cookie_values": self.policy.allow_cookie_values,"observation_retention":if self.backends.values().any(|b| self.allowed_provider(b.name()) && b.supports_cross_resource_drag()) { "provider_declared" } else { "until_next_observation_or_input_attempt" },"observation_ttl_ms":self.observation_ttl.as_millis(),"max_requests":self.max_requests,"input_lease":"exclusive_cooperating_session","input_lease_scope":"os_user","providers": self.backends.values().filter(|b| self.allowed_provider(b.name()))
                     .map(|b| json!({"provider": b.name(), "actions": b.capabilities(), "reads": b.reads(),
                         "cross_resource_drag": b.supports_cross_resource_drag(),
                         "observation_retention": if b.supports_cross_resource_drag() { "latest_per_resource_until_input_attempt" } else { "until_next_observation_or_input_attempt" },

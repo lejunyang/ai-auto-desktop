@@ -16,6 +16,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+mod save_as;
 mod timings;
 pub use timings::StepTimings;
 
@@ -116,6 +117,7 @@ impl Step {
     fn input_field(&self) -> Option<&'static str> {
         match self.action.as_ref()?["type"].as_str()? {
             "upload" | "choose_files" => Some("files"),
+            "save_as" => Some("destination"),
             "fill" => Some("value"),
             "type_text" | "paste" => Some("text"),
             _ => None,
@@ -201,7 +203,15 @@ impl Step {
             {
                 return Err(invalid("drag paths contain session-bound anchors and are available only as immediate actions"));
             }
-            if !ACTION_NAMES.contains(&name) {
+            if name == "save_as" {
+                if self.app.provider.as_deref() != Some(crate::browser::PROVIDER)
+                    || self.input.is_none()
+                    || action.as_object().is_none_or(|fields| fields.len() != 2)
+                    || !matches!(action["trigger"].as_str(), Some("click" | "enter"))
+                {
+                    return Err(invalid("save_as requires a browser.cdp trigger (click or enter) and a run-supplied destination input"));
+                }
+            } else if !ACTION_NAMES.contains(&name) {
                 return Err(invalid(format!(
                     "step {} has no known action type",
                     self.id
@@ -238,6 +248,23 @@ impl Step {
     /// The action, with the input's value and the drag destination filled in.
     fn typed(&self, value: Option<&Value>, to: Option<&Value>) -> Result<Action> {
         let mut action = self.action.clone().unwrap_or(Value::Null);
+        if action["type"] == "save_as" {
+            return Ok(if action["trigger"] == "enter" {
+                Action::Key {
+                    keys: vec!["enter".into()],
+                    hold_ms: None,
+                }
+            } else {
+                // A trusted pointer click supplies transient user activation.
+                Action::Click {
+                    button: None,
+                    count: None,
+                    fraction: Some(crate::Fraction { fx: 0.5, fy: 0.5 }),
+                    modifiers: vec![],
+                    hold_ms: None,
+                }
+            });
+        }
         if let (Some(_), Some(field)) = (&self.input, self.input_field()) {
             action[field] = value.cloned().unwrap_or_else(|| {
                 if field == "files" {
@@ -577,6 +604,14 @@ fn perform_step(
         }
         None => None,
     };
+    let destination = if step.input_field() == Some("destination") {
+        Some(save_as::destination(
+            session.session,
+            value.and_then(Value::as_str).unwrap_or_default(),
+        )?)
+    } else {
+        None
+    };
     let resource_id = resource(session, &step.app, deadline)?.ok_or_else(|| {
         error(
             "STEP.APP_NOT_FOUND",
@@ -590,6 +625,11 @@ fn perform_step(
         None => None,
     };
     let action = step.typed(value, to.as_ref())?;
+    let picker_deadline = deadline.min(Instant::now() + Duration::from_secs(30));
+    let picker = destination
+        .as_ref()
+        .map(|_| save_as::Picker::watch(session.session, &observation["metadata"], picker_deadline))
+        .transpose()?;
     let target = serde_json::from_value(found["target"].clone())
         .map_err(|e| error("STEP.BAD_TARGET", e.to_string()))?;
     let result = request(
@@ -601,6 +641,14 @@ fn perform_step(
         },
         deadline,
     )?;
+    if let (Some(mut picker), Some(destination)) = (picker, destination) {
+        picker
+            .select(session.token, &destination, picker_deadline)
+            .map_err(|failure| failure.with_effect("unknown"))?;
+        return Ok(
+            json!({"step":step.id,"element":public(&found["node"]),"result":{"destination_selected":true,"picker_closed":true}}),
+        );
+    }
     Ok(json!({"step": step.id, "element": public(&found["node"]), "result": result}))
 }
 

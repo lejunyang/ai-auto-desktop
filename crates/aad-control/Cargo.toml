@@ -11,6 +11,7 @@ description = "Session-scoped desktop and browser control with authenticated std
 aad-core.workspace = true
 aad-runtime.workspace = true
 aad-plugin.workspace = true
+aad-platform.workspace = true
 aad-desktop.workspace = true
 aad-browser.workspace = true
 aad-ocr.workspace = true

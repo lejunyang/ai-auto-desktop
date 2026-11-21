@@ -241,6 +241,11 @@ pub(crate) fn saved_action_schema() -> Value {
     let mut schema = action_schema();
     if let Some(variants) = schema["oneOf"].as_array_mut() {
         variants.retain(|variant| variant["properties"]["type"]["const"] != "secret_input");
+        variants.push(json!({
+            "type":"object","description":"Open Chromium Save As from the observed element. Bind a new absolute destination with the step's input, under a server-granted save directory.",
+            "properties":{"type":{"const":"save_as"},"trigger":{"enum":["click","enter"]}},
+            "required":["type","trigger"],"additionalProperties":false
+        }));
     }
     for variant in schema["oneOf"].as_array_mut().into_iter().flatten() {
         if matches!(
@@ -262,7 +267,7 @@ pub(crate) fn saved_action_schema() -> Value {
         }
     }
     schema["description"] = json!(
-        "The control_act action you performed, without its target. When using an input, \
+        "The operation on the element identified by the step's locator. When using an input, \
     omit the text or file paths it supplies."
     );
     schema

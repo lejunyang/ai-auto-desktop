@@ -68,6 +68,31 @@ impl Timeline {
             let row: Value = serde_json::from_str(&line?)?;
             let id = row["id"].as_u64().ok_or("missing browser checkpoint id")?;
             let frame = match row["kind"].as_str() {
+                Some("save_picker_pending" | "save_picker_finished") => {
+                    if row["page_id"] != page {
+                        return Err("unexpected browser chooser page".into());
+                    }
+                    if let Some(index) = row["action"]["enter_id"]
+                        .as_u64()
+                        .and_then(|id| triggers.remove(&id))
+                    {
+                        self.events[index].value["kind"] = json!("file_trigger");
+                    }
+                    if let Some(index) = row["action"]["trigger_id"]
+                        .as_u64()
+                        .and_then(|id| triggers.get(&id))
+                    {
+                        let action = &mut self.events[*index].value;
+                        action["trigger"] = row["action"]["trigger"].clone();
+                        action["kind"] = match row["action"]["outcome"].as_str() {
+                            Some("save_as") => json!("save_as"),
+                            Some("save_cancel") => json!("save_cancel"),
+                            Some("save_failed") => json!("save_failed"),
+                            _ => json!("save_pending"),
+                        };
+                    }
+                    continue;
+                }
                 Some("file_chooser_pending" | "file_chooser_without_dom_input") => {
                     if row["page_id"] != page {
                         return Err("unexpected browser chooser page".into());
@@ -254,6 +279,10 @@ impl Timeline {
                 }
             };
             for skipped in batch.skipped {
+                if skipped["reason"] == "save_picker_cancelled" && skipped["noop"] == true {
+                    *self.filtered.entry("save_picker_cancelled").or_default() += 1;
+                    continue;
+                }
                 self.gaps.push(json!({"source":if matches!(window, ReplaySource::Browser) {"browser"} else {"native"},"at_ms":run[0].at,"skipped":skipped}));
             }
             windows.extend(std::iter::repeat_n(window, batch.steps.len()));
@@ -266,6 +295,38 @@ impl Timeline {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_save_outcomes_replace_the_original_browser_gesture() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("evidence")).unwrap();
+        let mut rows = Vec::new();
+        for (trigger, outcome) in [(1, "save_cancel"), (3, "save_as")] {
+            rows.push(json!({"kind":"action","page_id":"page","frame_id":"frame","id":trigger,
+                "action":{"kind":"click","document_id":"doc","sequence":trigger,"at_ms":trigger,
+                "trusted":true,"url":"https://example.test/","control":{"role":"button","name":"Export"}}}));
+            for state in ["save_picker_pending", "save_picker_finished"] {
+                rows.push(json!({"kind":state,"page_id":"page","frame_id":"frame","id":trigger+1,
+                    "action":{"trigger_id":trigger,"trigger":"click","outcome":if state=="save_picker_finished" {Some(outcome)} else {None}}}));
+            }
+        }
+        let data = rows
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(dir.path().join("evidence/actions.jsonl"), data).unwrap();
+        let mut timeline = Timeline::default();
+        timeline.read_browser(dir.path(), "page").unwrap();
+        let (steps, _) = timeline.steps(0, 10, 0).unwrap();
+        assert!(timeline.gaps.is_empty());
+        assert_eq!(timeline.filtered["save_picker_cancelled"], 1);
+        assert_eq!(steps.len(), 1);
+        assert_eq!(
+            steps[0].action,
+            Some(json!({"type":"save_as","trigger":"click"}))
+        );
+    }
 
     #[test]
     fn only_trusted_file_outcomes_replay_and_chooser_openers_do_not_survive_boundaries() {

@@ -181,7 +181,8 @@ fn steps_schema(max_steps: usize) -> Value {
                     "type": "object",
                     "description": "Take the value from this workflow input instead of storing it. \
     For fill, type_text or paste, supply a string (for example a credential). For upload or \
-    choose_files, supply an array of absolute paths under the server's allowed upload directories.",
+    choose_files, supply an array of absolute paths under the server's allowed upload directories. \
+    For save_as, supply a new absolute filename under an allowed save directory.",
                     "properties": {
                         "name": {"type": "string", "pattern": "^[A-Za-z0-9_-]{1,64}$"},
                         "sensitive": {

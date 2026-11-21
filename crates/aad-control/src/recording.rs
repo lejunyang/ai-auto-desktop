@@ -195,6 +195,13 @@ fn collect_events(
             "wheel" => json!({"type": "scroll", "direction": event["direction"], "notches": count}),
             "key" => json!({"type": "key", "keys": event["keys"]}),
             "toggle" => json!({"type": "check", "checked": event["checked"] == true}),
+            "save_as" if app.provider.as_deref() == Some(BROWSER) => {
+                input = Some(Input {
+                    name: format!("{id}_destination"),
+                    sensitive: false,
+                });
+                json!({"type":"save_as","trigger":event["trigger"]})
+            }
             "upload" if app.provider.as_deref() == Some(BROWSER) => {
                 input = Some(Input {
                     name: format!("{id}_files"),
@@ -280,6 +287,15 @@ pub fn from_browser_steps(steps_jsonl: &str, next: &mut usize) -> Batch {
                 .skipped
                 .push(json!({"reason":"file_chooser_without_dom_input"}));
         }
+        if matches!(
+            step["kind"].as_str(),
+            Some("save_picker_pending" | "save_picker_finished")
+        ) && step["action"]["trigger_id"].is_null()
+        {
+            batch
+                .skipped
+                .push(json!({"reason":"save_picker_trigger_unobserved"}));
+        }
         if step["kind"] != "action" {
             continue;
         }
@@ -290,6 +306,15 @@ pub fn from_browser_steps(steps_jsonl: &str, next: &mut usize) -> Batch {
             continue;
         }
         let file_reason = match kind {
+            "save_pending" => Some("save_picker_outcome_unobserved"),
+            "save_cancel" => Some("save_picker_cancelled"),
+            "save_failed" => Some("save_picker_selection_unconfirmed"),
+            "save_as"
+                if action["trusted"] != true
+                    || !matches!(action["trigger"].as_str(), Some("click" | "enter")) =>
+            {
+                Some("save_picker_trigger_unobserved")
+            }
             "file_cancel"
                 if !(action["trusted"] == true
                     && action["dom_event"] == "cancel"
@@ -318,7 +343,10 @@ pub fn from_browser_steps(steps_jsonl: &str, next: &mut usize) -> Batch {
         };
         if let Some(reason) = file_reason {
             let mut skipped = json!({"reason":reason});
-            if reason == "file_selection_cancelled_or_unchanged" {
+            if matches!(
+                reason,
+                "file_selection_cancelled_or_unchanged" | "save_picker_cancelled"
+            ) {
                 skipped["noop"] = json!(true);
             }
             batch.skipped.push(skipped);
@@ -364,6 +392,9 @@ pub fn from_browser_steps(steps_jsonl: &str, next: &mut usize) -> Batch {
         }
         let at_ms = action["at_ms"].clone();
         let mut event = match kind {
+            "save_as" => {
+                json!({"kind":"save_as","trigger":action["trigger"],"node":node,"at_ms":at_ms})
+            }
             "upload" => {
                 node["file_hidden"] = action["hidden"].clone();
                 json!({"kind":"upload","node":node,"at_ms":at_ms})
