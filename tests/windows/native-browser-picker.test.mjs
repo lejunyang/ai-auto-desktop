@@ -30,6 +30,18 @@ const html = `<!doctype html><meta charset=utf-8><title>Native picker fixture</t
   };
 </script>`;
 
+const nativeHtml = `<!doctype html><meta charset=utf-8><title>Native file API</title>
+<button id=read>Read one file</button><button id=folder>Choose a folder</button>
+<script>
+  read.onclick = async () => {
+    try {
+      const [handle] = await showOpenFilePicker({multiple:false});
+      window.nativeContents = await (await handle.getFile()).text();
+    } catch (e) { window.nativeError = String(e); }
+  };
+  folder.onclick = async () => { await showDirectoryPicker(); };
+</script>`;
+
 // Observe the HWND independently. A hidden helper console leaves the dialog in front.
 async function foregroundDialog() {
   const script = `
@@ -66,17 +78,19 @@ async function waitFor(read, expected) {
 }
 
 test('bind the Windows Open and Save dialogs and verify the selected bytes', {
-  skip:process.platform !== 'win32' || !process.env.AAD_TEST_CHROME, timeout:150000
+  skip:process.platform !== 'win32' || !process.env.AAD_TEST_CHROME, timeout:220000
 }, async t => {
   const root = await mkdtemp(join(tmpdir(), 'aad picker '));
   t.after(() => rm(root, {recursive:true, force:true, maxRetries:10, retryDelay:100}));
-  const page = await fixture((_, res) => res.end(html), ['--lang=en-US'], {headed:true});
+  const page = await fixture((req, res) => res.end(req.url === '/native' ? nativeHtml : html),
+    ['--lang=en-US'], {headed:true});
   t.after(() => page.close());
   const cli = process.env.AAD_TEST_CLI || resolve('target/debug/aad.exe');
-  function select(kind, id, path) {
+  function select(kind, id, path, ...flags) {
     const grant = kind === 'choose-files' ? '--allow-upload-dir' : '--allow-save-dir';
     return run(cli, ['browser', kind, '--cdp-port', String(page.port), '--page', page.target.id,
-      '--allow-input', '--window', id, grant, root, '--file', path], {windowsHide:true, timeout:35000});
+      '--allow-input', '--window', id, grant, root, '--file', path, ...flags],
+      {windowsHide:true, timeout:35000});
   }
   async function click(id) {
     const result = await page.cdp.call('Runtime.evaluate',
@@ -106,4 +120,25 @@ test('bind the Windows Open and Save dialogs and verify the selected bytes', {
   assert.equal(saved.destination_selected, true);
   await waitFor(() => page.cdp.eval('window.saved || window.saveError'), 'new 收据.txt');
   assert.equal(await readFile(destination, 'utf8'), 'receipt from the web page\r\n');
+
+  await page.cdp.call('Page.navigate', {url:page.url+'native'});
+  await waitFor(() => page.cdp.eval('document.title'), 'Native file API');
+  assert.equal(await page.cdp.eval('document.querySelectorAll("input,iframe").length'), 0);
+  const openNative = await click('read');
+  const expanded = join(root, '%USERNAME%.txt');
+  await writeFile(expanded, 'literal percent filename');
+  const shortcut = join(root, 'shortcut.url');
+  await writeFile(shortcut, '[InternetShortcut]\r\nURL=https://example.invalid/\r\n');
+  await assert.rejects(select('choose-files', openNative, source)); // DOM upload needs an input
+  await assert.rejects(select('choose-files', openNative, expanded, '--native-file'));
+  await assert.rejects(select('choose-files', openNative, shortcut, '--native-file'));
+  await assert.rejects(select('choose-files', openNative, root, '--native-file'));
+  assert.equal(await foregroundDialog(), openNative);
+  assert.equal(await page.cdp.eval('window.nativeContents ?? null'), null);
+  const picked = JSON.parse((await select('choose-files', openNative, source, '--native-file')).stdout);
+  assert.equal(picked.picker_closed, true);
+  await waitFor(() => page.cdp.eval('window.nativeContents || window.nativeError'), 'independent upload bytes');
+  const folder = await click('folder');
+  await assert.rejects(select('choose-files', folder, source, '--native-file'));
+  assert.equal(await foregroundDialog(), folder);
 });

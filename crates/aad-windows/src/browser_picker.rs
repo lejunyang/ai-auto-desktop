@@ -13,6 +13,8 @@ use windows::Win32::UI::HiDpi::{
 use windows::Win32::UI::Input::KeyboardAndMouse::IsWindowEnabled;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
+mod open_file;
+
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 fn remaining(deadline: Instant) -> Result<Duration> {
@@ -199,6 +201,39 @@ impl Controls {
             // Search and address edits elsewhere in the dialog also support Value.
             let host = unique(&dialog, &id("FileNameControlHost")?)?;
             let field = unique(&host, &role(UIA_EditControlTypeId)?)?;
+            if kind == Kind::Open {
+                // Folder mode can reuse the same shell edit control. Require
+                // positive evidence of the filename field and file-type selector.
+                let field_label = field
+                    .CurrentName()?
+                    .to_string()
+                    .replace('&', "")
+                    .to_lowercase();
+                if !matches!(
+                    field_label.trim_end_matches([':', '：', ' ']),
+                    "file name"
+                        | "文件名"
+                        | "文件名(n)"
+                        | "檔案名稱"
+                        | "檔案名稱(n)"
+                        | "ファイル名"
+                        | "ファイル名(n)"
+                ) {
+                    return Err("expected a file name field, not a folder selector".into());
+                }
+                let types = unique(
+                    &dialog,
+                    &ui.CreateAndCondition(
+                        &id("FileTypeControlHost")?,
+                        &role(UIA_ComboBoxControlTypeId)?,
+                    )?,
+                )?;
+                if types.CurrentIsOffscreen()?.as_bool()
+                    || types.CurrentProcessId()? as u32 != pid(hwnd)
+                {
+                    return Err("file-type selector is unavailable".into());
+                }
+            }
             for element in [&field, &accept, &cancel] {
                 if element.CurrentProcessId()? as u32 != pid(hwnd)
                     || element.CurrentIsOffscreen()?.as_bool()
@@ -238,7 +273,13 @@ fn matches_kind(kind: Kind, title: &str, button: &str) -> bool {
         Kind::Open => {
             matches!(
                 title,
-                "open" | "choose file to upload" | "打开" | "開啟" | "開く"
+                "open"
+                    | "choose file to upload"
+                    | "select a file this site can read"
+                    | "select files this site can read"
+                    | "打开"
+                    | "開啟"
+                    | "開く"
             ) && matches!(
                 button,
                 "open" | "打开" | "打开(o)" | "開啟" | "開啟(o)" | "開く" | "開く(o)"
@@ -258,6 +299,28 @@ fn matches_kind(kind: Kind, title: &str, button: &str) -> bool {
             )
         }
     }
+}
+
+fn ordinary_path<'a>(requested: &Path, canonical: &'a Path) -> Result<&'a str> {
+    let text = canonical.to_str().ok_or("invalid file path text")?;
+    let ordinary = text
+        .strip_prefix(r"\\?\")
+        .ok_or("expected a canonical local drive path")?;
+    let input = requested.to_str().ok_or("invalid file path text")?;
+    let bytes = ordinary.as_bytes();
+    if bytes.len() < 4
+        || !bytes[0].is_ascii_alphabetic()
+        || &bytes[1..3] != b":\\"
+        || input.strip_prefix(r"\\?\").unwrap_or(input) != ordinary
+        || ordinary.chars().any(char::is_control)
+        || ordinary[3..].contains(['%', '<', '>', ':', '"', '/', '|', '?', '*'])
+        || ordinary[3..]
+            .split('\\')
+            .any(|part| part.is_empty() || part.ends_with([' ', '.']))
+    {
+        return Err("use an exact ordinary local drive path without shell expansion".into());
+    }
+    Ok(ordinary)
 }
 
 pub struct FilePicker {
@@ -398,21 +461,19 @@ impl FilePicker {
         }
         remaining(deadline)?;
         let dest = NewFile::under(path.parent().ok_or("missing destination parent")?, path)?;
-        let canonical = dest.path().to_str().ok_or("invalid destination text")?;
-        let ordinary = canonical
-            .strip_prefix(r"\\?\")
-            .ok_or("expected a canonical local drive path")?;
-        let requested = path.to_str().ok_or("invalid destination text")?;
-        if requested.strip_prefix(r"\\?\").unwrap_or(requested) != ordinary
-            || ordinary.contains('%')
-            || ordinary.chars().any(char::is_control)
-            || ordinary.split('\\').any(|part| part.ends_with([' ', '.']))
-            || path.extension().is_none()
-        {
-            return Err(
-                "use an exact local path with an explicit extension and no shell expansion".into(),
-            );
+        let ordinary = ordinary_path(path, dest.path())?;
+        if path.extension().is_none() {
+            return Err("use an explicit extension for the save destination".into());
         }
+        self.choose_path(ordinary, deadline, || Ok(dest.revalidate()?))
+    }
+
+    fn choose_path(
+        &self,
+        ordinary: &str,
+        deadline: Instant,
+        recheck: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
         self.revalidate(deadline)?;
         let value = unsafe {
             self.controls
@@ -425,7 +486,7 @@ impl FilePicker {
         remaining(deadline)?;
         unsafe { value.SetValue(&BSTR::from(ordinary)) }?;
         self.invoke_and_wait(&self.controls.accept, deadline, || {
-            dest.revalidate()?;
+            recheck()?;
             if !unsafe { value.CurrentValue() }?
                 .as_wide()
                 .iter()
@@ -436,5 +497,43 @@ impl FilePicker {
             }
             Ok(())
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dialog_path_only_removes_the_verbatim_local_drive_prefix() {
+        let canonical = Path::new(r"\\?\C:\收据\one file.txt");
+        let ordinary = r"C:\收据\one file.txt";
+        assert_eq!(ordinary_path(canonical, canonical).unwrap(), ordinary);
+        assert_eq!(
+            ordinary_path(Path::new(ordinary), canonical).unwrap(),
+            ordinary
+        );
+        for path in [
+            r"\\?\UNC\server\share\one",
+            r"\\?\C:\%TEMP%\one",
+            r"\\?\C:\dir.\one",
+            r"\\?\C:\one.txt:stream",
+            r"\\?\C:\a*.txt",
+        ] {
+            assert!(ordinary_path(Path::new(path), Path::new(path)).is_err());
+        }
+        assert!(ordinary_path(Path::new(r"C:\different.txt"), canonical).is_err());
+    }
+
+    #[test]
+    fn a_folder_or_a_save_dialog_browsing_folders_is_not_an_open_file_dialog() {
+        assert!(matches_kind(
+            Kind::Open,
+            "select a file this site can read",
+            "open"
+        ));
+        assert!(!matches_kind(Kind::Open, "select folder", "open"));
+        assert!(!matches_kind(Kind::Open, "save as", "open"));
+        assert!(!matches_kind(Kind::Save, "save as", "open"));
     }
 }
