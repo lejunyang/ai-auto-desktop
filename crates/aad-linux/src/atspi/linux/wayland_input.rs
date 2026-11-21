@@ -8,6 +8,12 @@ pub(super) enum Event<'a> {
     Click((i32, i32)),
     Key(&'a [String]),
     Gesture((i32, i32), Gesture, &'a [String]),
+    Drag {
+        from: (i32, i32),
+        to: (i32, i32),
+        button: u8,
+        modifiers: &'a [String],
+    },
 }
 
 impl LinuxBackend {
@@ -97,6 +103,9 @@ impl LinuxBackend {
                     node.provenance
                         .insert("wayland_pointer_modes".into(), json!(modes));
                 }
+                if modes.iter().any(|mode| mode == "drag_same_widget") {
+                    node.actions.push("drag".into());
+                }
             }
             node.provenance
                 .insert("coordinate_space".into(), json!("qt_wayland_logical"));
@@ -138,6 +147,28 @@ impl LinuxBackend {
         let mut events = 2;
         let mut dwell = None;
         let reply: zbus::Result<i32> = match event {
+            Event::Drag {
+                from: (x, y),
+                to: (end_x, end_y),
+                button,
+                modifiers,
+            } => {
+                events = 3;
+                proxy.call(
+                    "Drag",
+                    &(
+                        object,
+                        top,
+                        x,
+                        y,
+                        end_x,
+                        end_y,
+                        i32::from(button),
+                        modifiers,
+                        until,
+                    ),
+                )
+            }
             Event::Click((x, y)) => proxy.call("Click", &(object, top, x, y, until)),
             Event::Key(keys) => proxy.call("Key", &(object, top, keys, until)),
             Event::Gesture((x, y), Gesture::Click { button, count }, modifiers) => {

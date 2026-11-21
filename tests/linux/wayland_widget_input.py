@@ -62,12 +62,17 @@ def application(receipt):
     box.addWidget(surface)
     pad_cover = QLabel("Blocked", surface)
     pad_cover.setGeometry(0, 0, 36, 48)
+    obstacle = QLabel("barrier", surface)
+    obstacle.setGeometry(100, 20, 10, 24)
+    drag_field = QLineEdit("Select this invoice")
+    drag_field.setAccessibleName("Drag selection")
+    box.addWidget(drag_field)
     def save():
         tmp = receipt.with_suffix(".tmp")
         tmp.write_text(json.dumps(dict(events=events, clicks=clicks, text=field.text(),
                                       selection=field.selectedText(), sibling=sibling.text(),
                                       platform=app.platformName(), gestures=gestures, scroll_value=bar.value(),
-                                      mouse=mouse)))
+                                      mouse=mouse, drag_selection=drag_field.selectedText())))
         tmp.replace(receipt)
 
     class Monitor(QObject):
@@ -89,7 +94,8 @@ def application(receipt):
             return False
 
     monitor = Monitor()
-    for widget in (sibling, field, button, covered, cover, secret, bar, edge_cover, pad_cover):
+    drag_field.selectionChanged.connect(save)
+    for widget in (sibling, field, button, covered, cover, secret, bar, edge_cover, pad_cover, obstacle):
         widget.installEventFilter(monitor)
     button.clicked.connect(lambda: (clicks.append("submit"), save()))
     covered.clicked.connect(lambda: (clicks.append("covered"), save()))
@@ -128,7 +134,7 @@ def verify(aad, plugin_root):
         return wait_for(lambda: next((n for n in call("snapshot", resource)["nodes"]
                                      if "key" in n["capabilities"]), None), "focused Qt key target")
 
-    def control_pointer(resource, name, action):
+    def control_pointer(resource, name, action, destination=None):
         with subprocess.Popen([aad, "control", "serve", "--allow-input"], stdin=subprocess.PIPE,
                               stdout=subprocess.PIPE, text=True) as server:
             sid = None
@@ -154,6 +160,8 @@ def verify(aad, plugin_root):
                     matches = [n["target"] for n in nodes if n.get("name") == label]
                     assert len(matches) == 1, matches
                     return matches[0]
+                if destination:
+                    action = dict(action, to=target(destination))
                 return request("act", target=target(name), action=action)
             finally:
                 server.stdin.close()
@@ -207,7 +215,24 @@ def verify(aad, plugin_root):
                 assert [e["held"] for e in trace] == [2, 0, 2, 0], trace
                 call("do", "click", resource, "--name", "Mouse pad", "--button", "middle", "--fx", ".7", "--fy", ".5")
                 assert [e["button"] for e in snapshot()["mouse"][4:]] == [4, 4], snapshot()
+                control_pointer(resource, "Mouse pad", {"type": "drag", "button": "left",
+                                "modifiers": ["alt"], "fraction": {"fx": .25, "fy": 0},
+                                "to_fraction": {"fx": 1, "fy": 0}}, destination="Mouse pad")
+                drag = snapshot()["mouse"][6:]
+                assert [e["phase"] for e in drag] == ["press", "move", "release"], drag
+                assert [e["held"] for e in drag] == [1, 1, 0], drag
+                assert all(e["modifiers"] == 0x08000000 for e in drag), drag
+                assert abs(drag[0]["pos"][0] - drag[0]["size"][0] * .25) <= 1, drag
+                assert drag[0]["pos"][1] == 1 and drag[1]["pos"] == drag[2]["pos"], drag
+                assert drag[2]["pos"] == [drag[2]["size"][0] - 2, 1], drag
+                call("do", "drag", resource, "--name", "Drag selection", "--to-name", "Drag selection",
+                     "--fx", "0", "--fy", ".5", "--to-fx", "1", "--to-fy", ".5")
+                wait_for(lambda: snapshot()["drag_selection"] == "Select this invoice", "native QLineEdit selection")
             before_denied = snapshot()
+            # Both endpoints are clear but the middle of this straight segment is covered.
+            call("do", "drag", resource, "--name", "Mouse pad", "--to-name", "Mouse pad",
+                 "--fx", ".2", "--fy", ".6", "--to-fx", ".85", "--to-fy", ".6", success=False)
+            call("do", "drag", resource, "--name", "Mouse pad", "--to-name", "Other invoice", success=False)
             call("do", "click", resource, "--name", "Mouse pad", "--button", "right", "--fx", "0",
                  "--fy", "0.5", success=False)
             for action, args in (("scroll", ["--direction", "down"]), ("hover", ["--ms", "1"])):

@@ -58,6 +58,36 @@ bool hits(QWidget *widget, QPoint point) {
     return (hit ? hit : top) == widget;
 }
 
+// Check every logical pixel on this bounded segment before the press, and
+// again after any application code that can change geometry or cover the path.
+bool lineHits(QWidget *widget, QPoint start, QPoint end) {
+    const qint64 dx = qint64(end.x()) - start.x(), dy = qint64(end.y()) - start.y();
+    const qint64 steps = qMax(qAbs(dx), qAbs(dy));
+    if (!steps || steps > 8192) return false;
+    for (qint64 i = 0; i <= steps; ++i) {
+        QPoint point(start.x() + qRound64(double(dx * i) / steps),
+                     start.y() + qRound64(double(dy * i) / steps));
+        if (!hits(widget, point)) return false;
+    }
+    return true;
+}
+
+Qt::MouseButton mouseButton(int button) {
+    switch (button) {
+    case 1: return Qt::LeftButton;
+    case 2: return Qt::MiddleButton;
+    case 3: return Qt::RightButton;
+    default: return Qt::NoButton;
+    }
+}
+
+void sendMouse(QWidget *widget, QPoint point, QEvent::Type type, Qt::MouseButton button,
+               Qt::MouseButtons held, Qt::KeyboardModifiers modifiers) {
+    QMouseEvent event(type, widget->mapFromGlobal(point), widget->window()->mapFromGlobal(point),
+                      point, button, held, modifiers);
+    QCoreApplication::sendEvent(widget, &event);
+}
+
 bool inTime(qulonglong deadline) {
     timespec now{};
     return clock_gettime(CLOCK_MONOTONIC, &now) == 0 &&
@@ -131,7 +161,7 @@ public:
     }
 public slots:
     QStringList PointerModes() const {
-        return {"wheel", "hover", "click"};
+        return {"wheel", "hover", "click", "drag_same_widget"};
     }
 
     bool PointMatches(const QString &target, const QString &window, int px, int py) const {
@@ -204,9 +234,9 @@ public slots:
     int MouseClick(const QString &target, const QString &window, int px, int py,
                    int button, int count, const QStringList &modifierNames, qulonglong deadline) {
         Qt::KeyboardModifiers modifiers;
-        if (delivering || button < 1 || button > 3 || (count != 1 && count != 2) ||
+        const auto which = mouseButton(button);
+        if (delivering || which == Qt::NoButton || (count != 1 && count != 2) ||
             !parseModifiers(modifierNames, modifiers)) return 0;
-        const auto which = button == 1 ? Qt::LeftButton : button == 2 ? Qt::MiddleButton : Qt::RightButton;
         QScopedValueRollback<bool> guard(delivering, true);
         QPointer<QWidget> widget = boundWidget(target, window);
         const QPoint point(px, py);
@@ -218,10 +248,26 @@ public slots:
                 (!release && !inTime(deadline))) return phase == 0 ? 0 : 1;
             const auto type = release ? QEvent::MouseButtonRelease :
                               phase == 0 ? QEvent::MouseButtonPress : QEvent::MouseButtonDblClick;
-            QMouseEvent event(type, widget->mapFromGlobal(point), widget->window()->mapFromGlobal(point),
-                              point, which, release ? Qt::NoButton : which, modifiers);
-            QCoreApplication::sendEvent(widget, &event);
+            sendMouse(widget, point, type, which, release ? Qt::NoButton : which, modifiers);
         }
+        return 2;
+    }
+
+    int Drag(const QString &target, const QString &window, int px, int py, int endX, int endY,
+             int button, const QStringList &modifierNames, qulonglong deadline) {
+        Qt::KeyboardModifiers modifiers;
+        const auto which = mouseButton(button);
+        if (delivering || which == Qt::NoButton || !parseModifiers(modifierNames, modifiers)) return 0;
+        QScopedValueRollback<bool> guard(delivering, true);
+        QPointer<QWidget> widget = boundWidget(target, window);
+        const QPoint start(px, py), end(endX, endY);
+        if (!widget || !lineHits(widget, start, end) || !inTime(deadline)) return 0;
+        sendMouse(widget, start, QEvent::MouseButtonPress, which, which, modifiers);
+        if (!widget || widget != boundWidget(target, window) ||
+            !lineHits(widget, start, end) || !inTime(deadline)) return 1;
+        sendMouse(widget, end, QEvent::MouseMove, Qt::NoButton, which, modifiers);
+        if (!widget || widget != boundWidget(target, window) || !hits(widget, end)) return 1;
+        sendMouse(widget, end, QEvent::MouseButtonRelease, which, Qt::NoButton, modifiers);
         return 2;
     }
 };

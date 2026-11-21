@@ -1429,12 +1429,18 @@ impl AtspiProvider {
                 "locator".into(),
                 args.get("to_locator").cloned().unwrap_or(Value::Null),
             );
-            let (to_id, to_node, _) = Self::revalidate_target(
+            let (to_id, to_node, to_native) = Self::revalidate_target(
                 &to_args,
                 drag_observation.as_ref().expect("captured for drag"),
                 &fresh,
                 deadline,
             )?;
+            if node["provenance"]["wayland_input_window"].is_string()
+                && (to_native != native || !path.is_empty() || hold_ms.is_some())
+            {
+                return Err(driver_error("DRIVER.ACTION_UNSUPPORTED",
+                    "Qt Wayland drag requires two endpoints on the same widget, without waypoints or hold"));
+            }
             let to_point = point_in(
                 parse_bounds(to_node.get("bounds"))?,
                 parse_fraction(args.get("to_fraction"))?,

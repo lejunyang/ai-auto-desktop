@@ -1030,7 +1030,10 @@ impl AtspiBackend for LinuxBackend {
 
     fn check_action_support(&self, action: &str, deadline: Instant) -> Result<(), AutomationError> {
         if crate::wayland_portal::is_wayland_session()
-            && matches!(action, "key_chord" | "pointer_click" | "pointer_gesture")
+            && matches!(
+                action,
+                "key_chord" | "pointer_click" | "pointer_gesture" | "drag"
+            )
         {
             return Err(driver_error(
                 "DRIVER.ACTION_UNSUPPORTED",
@@ -1519,6 +1522,26 @@ impl AtspiBackend for LinuxBackend {
         process_id: u32,
         deadline: Instant,
     ) -> Result<Value, AutomationError> {
+        if crate::wayland_portal::is_wayland_session() {
+            if hold_ms.is_some() {
+                return Err(driver_error(
+                    "DRIVER.ACTION_UNSUPPORTED",
+                    "Qt widget pointer holds are unavailable",
+                ));
+            }
+            return self.wayland_input(
+                target,
+                window,
+                process_id,
+                wayland_input::Event::Drag {
+                    from,
+                    to,
+                    button,
+                    modifiers,
+                },
+                deadline,
+            );
+        }
         let mut args = vec![
             "drag".to_string(),
             "--expected-pid".into(),
