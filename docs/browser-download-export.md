@@ -40,3 +40,29 @@ CLI 成功退出并返回 `result.verified: true`、`task_id`、实际匹配的 
 点击前确认浏览器无进行中的下载并记下序号，仅接收之后任务 frame 的新 GUID；保存副本后再查一次，拒绝其他 frame 或竞争下载、事件丢失、取消、名称或字节/摘要不符。只读取 Chromium 完成事件明确报告的会话专用目录直接子文件，不扫描用户“下载”目录，不猜测缺失路径，不跟随文件软链接。单文件限 1 字节至 256 MiB。请在同一浏览器中串行下载：页面任务条件、时序和文件证据不是对网站内部任务协议的证明。页面或文件本身不可信时，请提供独立的预期摘要。
 
 CLI 失败时非零退出。脚本报告的 `completed_actions` 是本次脚本内已完成的动作数；独立 CLI 调用中若为 1，说明已经点过下载，但验收失败，不要将目录里看到的其他文件当成成功，也不要自动重建任务。
+
+## 核对 CSV 账单内容
+
+CLI 可在**同一次下载**后做业务核对。把独立取得的、预期正确的完整收集 JSON 传给 `--compare-collection`；下载结果中的 `result.file.path` 是实际 CSV，不需要再点击或手工找文件。例如：
+
+```powershell
+aad browser download-export --url 'https://billing.example/exports' --spec ./bill-task.json --allow-input --headless --profile-dir ./billing-work --timeout-ms 900000 --compare-collection ./expected.json --decimal 金额 --decimal 税额
+```
+
+`expected.json` 可以是 `aad browser collect-table` 的完整结果，也可以按同一格式提供：
+
+```json
+{
+  "complete": true,
+  "columns": ["单号", "日期", "金额", "税额"],
+  "row_key": "单号",
+  "row_count": 1,
+  "records": [{"单号":"A1", "日期":"2026-11-19", "金额":"7.00", "税额":"0.10"}]
+}
+```
+
+CSV 表头须与 `columns` 一一对应，列和行的顺序可以不同。按唯一、非空的行键对齐；日期等普通列逐字符串比较，不猜日期格式或币种。`--decimal` 可重复指定非键列，按十进制比较并分别求和（如 `7` 等于 `7.00`）。两份输入各限 16 MiB、10,000 行。
+
+查看 **`result.comparison.matches`** 判断业务是否相符；`result.verified` 只表示下载文件已核验。差异与 `totals` 中的 `expected` 来自收集 JSON，`actual` 来自下载文件。`missing` 是 CSV 缺少的预期行，`unexpected` 是 CSV 多出的行，`changed` 给出对应行和列的新旧值。报告包含两侧行数、全部差异数，最多展示 100 条明细。
+
+内容不符以非零状态退出（`BROWSER.EXPORT_CONTENT_MISMATCH`），保留完整下载回执、文件和比较结果。预期集合不完整、CSV 表头错误、行键重复或金额不可解析等情况同样非零退出（`BROWSER.EXPORT_COMPARISON_FAILED`）；此时没有有效的比较结果，已验证文件仍可通过 `result.file.path` 读取。
