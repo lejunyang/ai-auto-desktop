@@ -47,6 +47,8 @@ aad review ./draft-run-001.ndjson
 
 每次运行给日志取一个新名字。比如第 53 步是检查回执：如检查失败，先看业务订单，再决定是否继续。如果进程在提交期间被杀，`review` 给出 `unconfirmed_action` 和 `effect: unknown`。先用订单号查清楚，别直接从头再跑。有 `run.finished` 时查看最终状态；没有时 `no_final_event` 也可能是流程仍在运行。未写完的最后一行会单独标出；中间丢行、混入其他运行的日志会报错。
 
+想知道长任务慢在哪一步，查看 `aad review` 的 `slowest_steps`。它从这份运行日志挑出耗时最长的五次已结束步骤，给出步骤名、毫秒数、成功或失败状态和日志事件号。同一个步骤在循环里运行多次时，可按事件号找到那一次。
+
 ## 本机实测
 
 计时覆盖本地测试应用的执行和结果核对，模型推理时间另计。浏览器使用独立的 headless Edge 配置，桌面使用隔离 X11 会话里的真实 Qt 应用。
@@ -76,7 +78,7 @@ aad review ./draft-run-001.ndjson
 | 审阅与维护 | 短 YAML、循环和分支、本地版本化子流程、运行日志；桌面编辑器可以对照录制截图和当前元素、修改定位并从选中步骤试跑 | 跨应用混合录制的完整图文时间轴、跨团队发布目录、自动提出定位修复建议。 |
 | 恢复 | 持久只读运行可暂停/恢复。写流程可在开始时启用恢复日志，中断后凭业务回执继续 | 需要业务方提供可靠回执。跨运行的全局去重和跨账号恢复仍需业务系统配合。 |
 | 浏览器覆盖 | Chromium 脚本可逐层进入授权弹窗，再逐层返回。Firefox 同源子页面支持已定位控件上的按键、指针和滚轮。WebKitGTK 可以打开指定 URL 并读取正文、标题、链接和按钮。 | Firefox 跨域或变形子页面的物理输入、WebKit 的写操作和脚本，以及自由布局画布里的控件操作。[Firefox 子页面条件](testing/firefox-frame-input.md) |
-| 原生系统 | Linux X11 真应用回读。原生 KWin Wayland 已实测 GTK 表单填写和保存。Windows 目标通过交叉检查 | **[待验证]** Windows 交互桌面、多屏 DPI、中文 IME；macOS AX/TCC、Secure Input 和本轮 Swift 录制。Wayland 物理键鼠、屏幕共享仍需接入授权的 portal。 |
+| 原生系统 | Linux X11 和原生 KWin Wayland 上已验证 GTK 表单和文件窗口。Wayland 可用 `aad assist --desktop --view-only`，在系统选择器中选一块显示器共享。[屏幕共享](../README.md) | Wayland 桌面物理键鼠仍需定位输入接收窗口和控件。**[待验证]** 真实用户同意后的完整 Wayland 共享链路、Windows 交互桌面、多屏 DPI、中文 IME 和 macOS 辅助功能权限。 |
 | 部署与脚本 | 本地/SSH 控制、输入租约、声明式步骤。CLI 和 MCP 都支持 JavaScript 通过 `page` 操作选定的标签页。工作流中的 Python 计算步骤由 `aad run --allow-scripts` 启用。 | 无人值守机器池、账号和会话调度、按次业务审批。 |
 
 原始竞品依据见[23 项逐项对比](research/browser-computer-recording-efficiency-2026-11-21.md)；本页记录后续代码与验收进展。
