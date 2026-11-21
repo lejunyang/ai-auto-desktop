@@ -1,11 +1,14 @@
 param(
     [string]$Aad = (Join-Path $PSScriptRoot '../../target/debug/aad'),
+    [string]$QtInputPluginRoot,
     [switch]$InsideSession
 )
 $ErrorActionPreference = 'Stop'
 $binary = (Resolve-Path $Aad).Path
 if (!$InsideSession) {
-    & dbus-run-session -- pwsh -NoProfile -File $PSCommandPath -Aad $binary -InsideSession
+    $extra = @()
+    if ($QtInputPluginRoot) { $extra = @('-QtInputPluginRoot', (Resolve-Path $QtInputPluginRoot).Path) }
+    & dbus-run-session -- (Get-Process -Id $PID).Path -NoProfile -File $PSCommandPath -Aad $binary @extra -InsideSession
     exit $LASTEXITCODE
 }
 
@@ -30,7 +33,11 @@ try {
         Start-Sleep -Milliseconds 100
     }
     if (!(Test-Path $socket)) { throw 'KWin did not create the private Wayland socket' }
-    & /usr/bin/python3 (Join-Path $PSScriptRoot 'wayland_form.py') $binary
+    if ($QtInputPluginRoot) {
+        & /usr/bin/python3 (Join-Path $PSScriptRoot 'wayland_widget_input.py') $binary $QtInputPluginRoot
+    } else {
+        & /usr/bin/python3 (Join-Path $PSScriptRoot 'wayland_form.py') $binary
+    }
     $result = $LASTEXITCODE
 } finally {
     if (!$server.HasExited) { $server.Kill(); $server.WaitForExit() }
