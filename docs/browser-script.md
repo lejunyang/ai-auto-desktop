@@ -60,6 +60,29 @@ aad browser script ./attach.js --url 'http://localhost:8080/expenses' --allow-in
 
 文件放在运行浏览器的机器上。使用 MCP 时，在启动 `aad mcp` 时传 `--allow-input --allow-upload-dir <目录>`，调用 `browser_script` 时只传脚本、页面和业务输入。需要从多个目录选文件，可以重复传 `--allow-upload-dir`。
 
+### 选择整个目录（Chromium，Linux）
+
+对普通 HTML `<input type="file" webkitdirectory>`，仍用 `page.upload`，但列表只能包含**一个明确授权的目录本身**。例如把下面的脚本存为 `folder.js`：
+
+```javascript
+return page.upload({name: "项目目录"}, [inputs.tree]);
+```
+
+```powershell
+$tree = '/home/alice/projects/invoice-bundle'
+$stage = '/home/alice/private/invoice-snapshot-001'   # 父目录已存在，此路径不能已存在
+$inputs = @{tree = $tree} | ConvertTo-Json -Compress
+aad browser script ./folder.js --url 'http://localhost:8080/import' --allow-input --allow-upload-tree $tree --upload-tree-stage $stage --inputs $inputs
+```
+
+- `--allow-upload-dir` **不授予递归读取权限**；`--allow-upload-tree` 也不授权选择任意单文件、子目录或相邻目录。当前目录授权只在 `aad browser script` 的 Chromium 模式提供，不用于 Firefox、MCP 或已打开的系统目录选择器。
+- 源目录和快照位置都用无软链接的绝对路径。快照要放在源树外、仅由自己和受信任管理员管理的目录中。源树包含软链接（即使指向树内）、多硬链接文件、特殊文件或下级挂载点时，整次选择拒绝，不跳过后继续。只选择可公开给该页面的目录，包括其中的隐藏文件。
+- 需要 Linux `openat2` 和 `/proc/self/fd`。授权时固定源根目录；复制时，每个条目都从该根禁止跟随链接、禁止跨挂载地打开，再从已固定的普通文件读取。不把原始目录路径交给浏览器枚举。不支持所需系统能力时拒绝，没有不安全的路径遍历回退。上限为 512 个文件、2048 个条目、16 层目录、总计 64 MiB；空目录树不提交。
+- 快照根权限为 `0700`。提交前重新校验观察到的元素及其目录模式；提交后比较浏览器实际 `FileList` 的全部 `webkitRelativePath` 和大小。已派发但不能确认时，不要自动再上传，先核对业务端。
+- **等页面真正上传完毕再删除快照**，即便脚本已经退出。成功或派发后结果不明时均保留快照；再次选择请换新路径。不要编辑快照或让不受信任的进程写入它。确认上传后可运行 `Remove-Item -LiteralPath $stage -Recurse`。
+
+实测 Linux Headless Chromium 156：原生 CDP 目录选择能保留嵌套相对路径，但移除底层文件后再读会报 `NotFoundError`。因此这里只传私有副本，而不依赖 Chromium 怎样处理源树中的链接。真实 CLI 回归在脚本退出后改写源文件，再通过页面读取内容并提交原生 `FormData`；两个不同层级的同名文件在 HTTP 请求中保留了各自路径和原始内容。命令：设置 `AAD_TEST_CHROME` 后运行 `node --test tests/browser/directory-upload.test.mjs`。
+
 ## 在新标签页确认授权
 
 把以下代码存为 `consent.js`。一次调用先点击业务页的授权按钮，在授权页上确认，再读取原页回执。不要提前调用 `page.click`：`openPopup` 本身负责点击，并在点击前记录已有标签页。
