@@ -31,7 +31,10 @@ impl NewFile {
             .file_name()
             .and_then(|s| s.to_str())
             .ok_or_else(|| invalid("missing UTF-8 filename"))?;
-        if name.chars().any(char::is_control)
+        if parent
+            .to_str()
+            .is_none_or(|s| s.chars().any(char::is_control))
+            || name.chars().any(char::is_control)
             || !parent.starts_with(&root)
             || !root.is_dir()
             || !parent.is_dir()
@@ -132,6 +135,9 @@ mod tests {
         assert_eq!(std::fs::read(path).unwrap(), b"keep");
         #[cfg(unix)]
         {
+            let multiline = root.join("line\nbreak");
+            std::fs::create_dir(&multiline).unwrap();
+            assert!(NewFile::under(&root, &multiline.join("new.txt")).is_err());
             let link = root.join("dangling");
             std::os::unix::fs::symlink(temp.path().join("missing"), &link).unwrap();
             assert!(NewFile::under(&root, &link).is_err());
