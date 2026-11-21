@@ -213,7 +213,7 @@ aad browser save-as --cdp-port 9222 --page $page --allow-input --allow-save-dir 
 | Windows | 接管 Chromium 所属的前台标准“打开／另存为”窗口，可通过 `--window` 指定 HWND。使用本地盘的普通文件，另存为时带完整扩展名。**[待验证]** 需要交互式 Windows 桌面。[Windows 浏览器用例](../tests/windows/native-browser-picker.test.mjs) |
 | macOS | 接管挂在浏览器窗口上的 AppKit 文件面板。原生打开模式需要在列表中看到带完整路径的文件行。保存支持当前目录，或面板能识别并直接打开的可见目录，保留建议扩展名。**[待验证]** 需要已授予辅助功能权限的 Mac。[AppKit 用例](../crates/aad-macos/tests/browser_picker.rs) |
 
-原生文件句柄和另存为都需要能唯一确定发起者。请将页面放在单标签窗口内，使用没有子 frame 的页面。调试会话中存在跨进程 iframe 时也会提示无法确认归属。HTML 附件模式通过网页上已弹出选择器的文件控件确定目标。来自 `file://` 的网页还需要用 `--allow-browser-file-dir` 单独授权页面所在目录。[Linux 浏览器用例](../tests/browser/native-portal-picker.test.mjs)
+原生文件句柄和另存为都需要能唯一确定发起者。请将页面放在单标签窗口内，使用没有子 frame 的页面。Windows、macOS 和 X11 通过浏览器窗口区分发起者，其他独立窗口可以打开带跨站 iframe 的页面。Wayland 的 portal 通过浏览器进程区分发起者，需要使用单页面浏览器实例。HTML 附件模式通过网页上已弹出选择器的文件控件确定目标。来自 `file://` 的网页还需要用 `--allow-browser-file-dir` 单独授权页面所在目录。[Linux 浏览器用例](../tests/browser/native-portal-picker.test.mjs)
 
 ## 完整性与当前边界
 
