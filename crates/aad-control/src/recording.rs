@@ -67,6 +67,9 @@ fn locator(node: &Value) -> Locator {
             .filter(|n| !n.is_empty())
             .map(str::to_string),
         within: node.get("captured_container").cloned(),
+        states: node
+            .get("file_hidden")
+            .map(|hidden| json!({"hidden":hidden})),
         ..Default::default()
     }
 }
@@ -189,6 +192,13 @@ fn collect_events(
             "wheel" => json!({"type": "scroll", "direction": event["direction"], "notches": count}),
             "key" => json!({"type": "key", "keys": event["keys"]}),
             "toggle" => json!({"type": "check", "checked": event["checked"] == true}),
+            "upload" if app.provider.as_deref() == Some(BROWSER) => {
+                input = Some(Input {
+                    name: format!("{id}_files"),
+                    sensitive: false,
+                });
+                json!({"type":"upload"})
+            }
             "text" if node["protected"] == true => {
                 input = Some(Input {
                     name: format!("{id}_text"),
@@ -252,11 +262,61 @@ pub fn from_browser_steps(steps_jsonl: &str, next: &mut usize) -> Batch {
             batch.skipped.push(json!({"reason": "无法读取的记录行"}));
             continue;
         };
+        if step["kind"] == "file_chooser_pending" {
+            batch
+                .skipped
+                .push(json!({"reason":"file_chooser_outcome_unobserved"}));
+        }
+        if step["kind"] == "file_chooser_without_dom_input" {
+            batch
+                .skipped
+                .push(json!({"reason":"file_chooser_without_dom_input"}));
+        }
         if step["kind"] != "action" {
             continue;
         }
         let action = &step["action"];
         let kind = action["kind"].as_str().unwrap_or_default();
+        if matches!(kind, "file_activation" | "file_trigger") {
+            runs.push((App::default(), Vec::new()));
+            continue;
+        }
+        let file_reason = match kind {
+            "file_cancel"
+                if !(action["trusted"] == true
+                    && action["dom_event"] == "cancel"
+                    && action["type"] == "file"
+                    && action["tag"] == "input") =>
+            {
+                Some("unverified_file_selection")
+            }
+            "file_cancel" => Some("file_selection_cancelled_or_unchanged"),
+            "file_empty" => Some("file_selection_cleared"),
+            "file_directory" => Some("directory_upload_unsupported"),
+            "file_trigger_uncertain" => Some("custom_file_chooser_trigger_unresolved"),
+            "file_target_unobserved" => Some("file_input_locator_unobserved"),
+            "upload"
+                if !(action["tag"] == "input"
+                    && action["type"] == "file"
+                    && action["trusted"] == true
+                    && action["dom_event"] == "input"
+                    && action["hidden"].is_boolean()) =>
+            {
+                Some("unverified_file_selection")
+            }
+            "upload" => None,
+            _ if action["type"] == "file" => Some("file_selection_outcome_unknown"),
+            _ => None,
+        };
+        if let Some(reason) = file_reason {
+            let mut skipped = json!({"reason":reason});
+            if reason == "file_selection_cancelled_or_unchanged" {
+                skipped["noop"] = json!(true);
+            }
+            batch.skipped.push(skipped);
+            runs.push((App::default(), Vec::new()));
+            continue;
+        }
         if kind == "submit" {
             continue;
         }
@@ -296,6 +356,10 @@ pub fn from_browser_steps(steps_jsonl: &str, next: &mut usize) -> Batch {
         }
         let at_ms = action["at_ms"].clone();
         let event = match kind {
+            "upload" => {
+                node["file_hidden"] = action["hidden"].clone();
+                json!({"kind":"upload","node":node,"at_ms":at_ms})
+            }
             "click" => json!({"kind": "click", "button": "left", "node": node, "at_ms": at_ms}),
             "enter" => json!({"kind": "key", "keys": ["enter"], "node": node, "at_ms": at_ms}),
             "input" if matches!(action["type"].as_str(), Some("checkbox" | "radio")) => json!({
@@ -483,6 +547,51 @@ impl Recording {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn file_selection_never_imports_a_filename_or_an_unverified_outcome() {
+        let mut action = json!({"kind":"upload","url":"https://example.test/form?transient=1","control":{"role":"button","name":"Attachments","within":{"role":"form","name":"Invoice"}},"tag":"input","type":"file","hidden":true,"trusted":true,"dom_event":"input","value":"C:\\fakepath\\private.txt","files":["private.txt"]});
+        let import = |action: &Value| {
+            from_browser_steps(
+                &json!({"kind":"action","action":action}).to_string(),
+                &mut 3,
+            )
+        };
+        let valid = import(&action);
+        assert!(valid.skipped.is_empty());
+        let step = serde_json::to_value(&valid.steps[0]).unwrap();
+        assert_eq!(step["action"], json!({"type":"upload"}));
+        assert_eq!(
+            step["input"],
+            json!({"name":"rec3_files","sensitive":false})
+        );
+        assert_eq!(
+            step["locator"],
+            json!({"name":"Attachments","role":"button","within":{"role":"form","name":"Invoice"},"states":{"hidden":true}})
+        );
+        assert!(!step.to_string().contains("private.txt"));
+        action["trusted"] = json!(false);
+        assert_eq!(
+            import(&action).skipped[0]["reason"],
+            "unverified_file_selection"
+        );
+        for (kind, reason) in [
+            ("file_directory", "directory_upload_unsupported"),
+            ("input", "file_selection_outcome_unknown"),
+            ("file_empty", "file_selection_cleared"),
+            ("file_cancel", "file_selection_cancelled_or_unchanged"),
+        ] {
+            action["trusted"] = json!(true);
+            action["kind"] = json!(kind);
+            if kind == "file_cancel" {
+                action["dom_event"] = json!("cancel");
+            }
+            let batch = import(&action);
+            assert!(batch.steps.is_empty());
+            assert_eq!(batch.skipped[0]["reason"], reason);
+            assert_eq!(batch.skipped[0]["noop"] == true, kind == "file_cancel");
+        }
+    }
 
     fn node(role: &str, name: &str) -> Value {
         json!({"role": role, "name": name,"capture_identity":[role,name]})

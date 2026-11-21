@@ -1,5 +1,5 @@
 (() => {
-  if (globalThis.__aadCdp?.version === 2) return true;
+  if (globalThis.__aadCdp?.version === 3) return true;
   globalThis.__aadCdp?.stop?.();
   const binding = '__AAD_BINDING__';
   const documentId = globalThis.crypto?.randomUUID?.() || String(Date.now()) + Math.random();
@@ -27,10 +27,13 @@
     value_truncated: !protectedField(el) && String(el.value || '').length > 500,
     href: el.href || null, src: ['IMG','CANVAS'].includes(el.tagName) ? (el.currentSrc || el.src || null) : null
   });
-  const emit = (kind, el, value = null, trusted = false, domEvent = kind) => {
+  const describe = el => {
     const target = element(el);
     const container=el.parentElement?.closest('tr[aria-label], [role="row"][aria-label], form[aria-label], section[aria-label], dialog[aria-label], [role="group"][aria-label]');
     if(container && labelOf(container)) target.control.within={role:roleOf(container),name:labelOf(container)};
+    return target;
+  };
+  const emit = (kind, el, value = null, trusted = false, domEvent = kind, target = describe(el)) => {
     const event = {kind, ...target, tag:el.isContentEditable ? 'contenteditable' : target.tag, label:target.name, type:el.type || null,
       value, truncated: value != null && value.length > 500,
       url:location.href, document_id:documentId, sequence:++sequence,
@@ -49,24 +52,60 @@
       }
     }
     dirty = true;
+    return event.sequence;
   };
   const listen = (name, handler) => { document.addEventListener(name, handler, true); listeners.push([name,handler]); };
   const targetOf = event => (event.composedPath?.()[0] || event.target);
+  const isFile = el => el?.tagName === 'INPUT' && el.type === 'file';
+  const fileTargets = new WeakMap();
+  const usedFileTargets = new WeakSet();
+  let activation, enter;
+  const describeFile = el => {
+    const hidden = !el.getClientRects().length || getComputedStyle(el).visibility === 'hidden';
+    if (!el.files?.length && !usedFileTargets.has(el)) fileTargets.set(el, describe(el));
+    return {...(fileTargets.get(el) || {node_id:id(el),tag:'input',control:{},protected:true}),hidden};
+  };
   listen('click', event => {
     const origin = targetOf(event);
     const el = origin?.closest?.('button,a,input,select,[role="button"],[role="tab"],[tabindex]') || origin;
-    if (el?.tagName) emit('click', el, null, event.isTrusted);
+    const label = origin?.closest?.('label');
+    const field = isFile(origin) ? origin : (!origin?.closest?.('button,a,input,select,textarea') && label?.control);
+    if (isFile(field)) {
+      const target = describeFile(field);
+      const trigger = activation?.event.eventPhase ? activation.sequence : null;
+      emit('file_activation', field, null, event.isTrusted, 'click', {...target,trigger_sequence:trigger});
+    } else if (el?.tagName) {
+      const enter_sequence = event.isTrusted && event.detail === 0 && enter?.element === el ? enter.sequence : undefined;
+      activation = {event, sequence:emit('click', el, null, event.isTrusted, 'click', {...describe(el),enter_sequence})};
+    }
   });
   listen('submit', event => { if (event.target?.tagName) emit('submit', event.target, null, event.isTrusted); });
   const onInput = event => {
     const el = targetOf(event);
     if (!el?.tagName || (!['INPUT','TEXTAREA','SELECT'].includes(el.tagName) && !el.isContentEditable)) return;
+    if (isFile(el)) {
+      if (!event.isTrusted || !['input','cancel'].includes(event.type)) return;
+      if (el.files?.length) usedFileTargets.add(el);
+      const target = describeFile(el);
+      const kind = event.type === 'cancel' ? 'file_cancel' : el.webkitdirectory ? 'file_directory' : !el.files?.length ? 'file_empty' : target.control.role ? 'upload' : 'file_target_unobserved';
+      emit(kind, el, null, true, event.type, target);
+      return;
+    }
     const value = protectedField(el) ? null : String(el.isContentEditable ? (el.innerText || el.textContent || '') : (el.value || ''));
     emit('input', el, value, event.isTrusted, event.type);
   };
   listen('input', onInput); listen('change', onInput); listen('compositionend', onInput);
+  listen('cancel', event => { if (isFile(targetOf(event))) onInput(event); });
   // Enter without a form submit still establishes an ordering boundary.
-  listen('keydown', event => { if (event.key === 'Enter' && !event.isComposing && targetOf(event)?.tagName) emit('enter', targetOf(event), null, event.isTrusted); });
+  listen('keydown', event => {
+    const el = targetOf(event);
+    enter = null;
+    if (event.key === 'Enter' && !event.isComposing && el?.tagName && !isFile(el)) {
+      activation = {event, sequence:emit('enter', el, null, event.isTrusted)};
+      if (event.isTrusted) enter = {element:el,sequence:activation.sequence};
+    }
+  });
+  listen('keyup', event => { if (event.key === 'Enter') enter = null; });
   const observer = typeof MutationObserver === 'function' ? new MutationObserver(() => { dirty = true; }) : null;
   if (binding) observer?.observe(document, {subtree:true,childList:true,attributes:true,characterData:true});
   const snapshot = () => {
@@ -81,11 +120,12 @@
         const semantic=el.matches('button,a,input,textarea,select,[role],[aria-live],dialog,output,h1,h2,h3,img,canvas,td,th,dt,dd,label,p,[data-testid]');
         const leaf=!el.children.length && !['SCRIPT','STYLE','NOSCRIPT','OPTION'].includes(el.tagName) && (el.textContent || '').trim();
         if (!semantic && !leaf) continue;
-        if (!el.getClientRects().length || getComputedStyle(el).visibility === 'hidden') continue;
+        const file = isFile(el) ? describeFile(el) : null;
+        if (file ? file.hidden : !el.getClientRects().length || getComputedStyle(el).visibility === 'hidden') continue;
         const rect=el.getBoundingClientRect();
         if (rect.bottom<0 || rect.right<0 || rect.top>innerHeight || rect.left>innerWidth) continue;
         if (nodes.length >= 100) { truncated=true; break; }
-        nodes.push(element(el));
+        nodes.push(file || element(el));
       }
       if (truncated) break;
     }
@@ -93,7 +133,7 @@
     return {document_id:documentId,url:location.href,title:document.title,nodes,truncated};
   };
   globalThis.__aadCdp = {
-    version:2, installed:true, snapshot, isDirty:()=>dirty,
+    version:3, installed:true, snapshot, isDirty:()=>dirty,
     take:()=>queue.splice(0),
     takeReport:()=>{ const report={events:queue.splice(0),dropped}; dropped=0; return report; },
     stop:()=>{ for (const [name,fn] of listeners) document.removeEventListener(name,fn,true); observer?.disconnect(); queue.length=0; delete globalThis.__aadCdp; }

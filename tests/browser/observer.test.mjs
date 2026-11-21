@@ -36,6 +36,25 @@ test('preserve action order, repeated clicks and distinct unlabeled fields; boun
   context.__aadCdp.stop();assert.equal(context.__aadCdp,undefined);
 });
 
+test('file outcomes never inspect file data or use post-selection names',()=>{
+  const handlers=new Map();
+  const context={document:{addEventListener:(n,f)=>handlers.set(n,f),createTreeWalker},NodeFilter,location:{href:'fixture'},performance};
+  vm.runInNewContext(script,context);
+  let label='Attachment';
+  const files={length:0,get 0(){throw Error('inspected selected file');}};
+  const field={tagName:'INPUT',type:'file',get value(){throw Error('read file control value');},files,
+    getClientRects:()=>[],getAttribute:key=>key==='aria-label'?label:null};
+  const emit=(type,target=field,isTrusted=true)=>handlers.get(type)({target,type,isTrusted});
+  emit('click'); files.length=1; label='private.txt';
+  emit('input',field,false); emit('change'); emit('input'); emit('click'); emit('cancel');
+  field.webkitdirectory=true; emit('input');
+  emit('input',{tagName:'INPUT',type:'file',files,getClientRects:()=>[],getAttribute:()=>{throw Error('read unobserved label');}});
+  const events=context.__aadCdp.takeReport().events;
+  assert.deepEqual(Array.from(events,event=>event.kind),['file_activation','upload','file_activation','file_cancel','file_directory','file_target_unobserved']);
+  assert.equal(events[1].control.name,'Attachment');
+  assert.ok(!JSON.stringify(events).includes('private.txt'));
+});
+
 test('real Chromium reports semantic changes and ordered actions', {skip:!process.env.AAD_TEST_CHROME}, async()=>{
   const f=await fixture((req,res)=>{res.setHeader('Content-Type','text/html; charset=utf-8');res.end('<input id="first"><input id="second"><button id="open" onclick="document.getElementById(\'qr\').hidden=false;this.disabled=true">扫码登录</button><dialog id="qr" open hidden>请使用手机扫码<canvas></canvas></dialog>');});
   try {

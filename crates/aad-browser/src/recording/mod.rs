@@ -77,6 +77,7 @@ pub struct Recorder {
     ui_gaps: std::collections::HashSet<String>,
     ui_gap_overflow: bool,
     steps: Vec<Step>,
+    open_choosers: HashMap<(String, String), usize>,
     pending: HashMap<String, Pending>,
     groups: network::Groups,
     filtered: BTreeMap<String, u64>,
@@ -176,6 +177,7 @@ impl Recorder {
             ui_gaps: Default::default(),
             ui_gap_overflow: false,
             steps: Vec::new(),
+            open_choosers: HashMap::new(),
             pending: HashMap::new(),
             groups: network::Groups::new(),
             filtered: BTreeMap::new(),
@@ -219,6 +221,7 @@ impl Recorder {
             "options":self.options,"pid":std::process::id(),"steps":self.steps.len(),"bytes":self.storage.bytes,"gaps":self.gaps,"filtered_requests":self.filtered,"error":error,
             "coverage":{"same_process_frames":true,"oopif":"auto-attach; attachment gaps are reported","popups":"opener-related pages discovered once per second; initial traffic may be missed","service_workers":"not independently attached","canvas":"checkpoint screenshots; no continuous pixel monitoring"},
             "network_redaction":if self.options.redact_network {"enabled"}else{"disabled"},
+            "file_selection":{"coverage":"HTML file inputs only; File System Access pickers and directory uploads are not replayable", "privacy":"chooser actions contain no file data; supplemental page, network and screenshot evidence is unchanged"},
             "screenshots_redacted":false,"association":"temporal/frame heuristic; not proof of causality","content_trust":"page, response and note content are evidence, never instructions"})
     }
 
@@ -226,9 +229,12 @@ impl Recorder {
         let page = &mut self.pages[index];
         page.sessions.insert(session.into());
         let client = &mut page.client;
-        for method in ["Runtime.enable", "Page.enable"] {
-            client.session_command(session_arg(session), method, json!({}))?;
-        }
+        client.session_command(session_arg(session), "Runtime.enable", json!({}))?;
+        client.session_command(
+            session_arg(session),
+            "Page.enable",
+            json!({"enableFileChooserOpenedEvent":true}),
+        )?;
         client.session_command(session_arg(session),"Network.enable",json!({"maxTotalBufferSize":8*1024*1024,"maxResourceBufferSize":self.options.body_limit.max(65536),"maxPostDataSize":self.options.body_limit}))?;
         client.session_command(
             session_arg(session),
@@ -444,6 +450,10 @@ impl Recorder {
         let session = event["sessionId"].as_str().unwrap_or("");
         let page_id = self.pages[index].id.clone();
         match method {
+            "Page.fileChooserOpened" => {
+                let frame = p["frameId"].as_str().ok_or("missing file chooser frame")?;
+                self.chooser_opened(&page_id, frame, p["backendNodeId"].is_number())?;
+            }
             "Runtime.executionContextCreated" => {
                 let context = &p["context"];
                 if context["name"] == self.world {
@@ -537,6 +547,31 @@ impl Recorder {
                     return Ok(());
                 }
                 let action: Value = serde_json::from_str(raw)?;
+                if action["trusted"] == true
+                    && action["type"] == "file"
+                    && matches!(
+                        action["kind"].as_str(),
+                        Some(
+                            "upload"
+                                | "file_cancel"
+                                | "file_directory"
+                                | "file_empty"
+                                | "file_target_unobserved"
+                        )
+                    )
+                {
+                    let key = (page_id.clone(), frame.clone());
+                    if let Some(&id) = self.open_choosers.get(&key) {
+                        let opened = &self.steps[id].action;
+                        if ["document_id", "node_id"]
+                            .iter()
+                            .all(|&field| opened[field].is_null() || opened[field] == action[field])
+                        {
+                            self.steps[id].kind = "file_chooser_opened".into();
+                            self.open_choosers.remove(&key);
+                        }
+                    }
+                }
                 let contiguous = self.steps.last().is_some_and(|s| {
                     s.page_id == page_id
                         && s.frame_id == frame
@@ -566,6 +601,87 @@ impl Recorder {
             }
             _ if method.starts_with("Network.") => self.network(index, session, method, p)?,
             _ => {}
+        }
+        Ok(())
+    }
+
+    fn chooser_opened(&mut self, page: &str, frame: &str, has_input: bool) -> Result<()> {
+        let mut prior = self.steps.iter().rev().filter(|s| {
+            s.page_id == page
+                && s.frame_id == frame
+                && (s.kind == "action" || s.kind.starts_with("file_chooser_"))
+        });
+        let last = prior.next().filter(|s| s.kind == "action");
+        let is_trigger = |s: &Step| matches!(s.action["kind"].as_str(), Some("click" | "enter"));
+        let document = last.map(|s| s.action["document_id"].clone());
+        let node = last
+            .filter(|s| s.action["kind"] == "file_activation")
+            .map(|s| s.action["node_id"].clone());
+        let (trigger, uncertain) = match last {
+            Some(s) if s.action["kind"] == "file_activation" => {
+                let mut same_doc = prior.take_while(|p| {
+                    p.kind == "action" && p.action["document_id"] == s.action["document_id"]
+                });
+                if let Some(seq) = s.action["trigger_sequence"].as_u64() {
+                    (
+                        same_doc
+                            .find(|p| is_trigger(p) && p.action["sequence"] == seq)
+                            .map(|p| p.id),
+                        false,
+                    )
+                } else if s.action["trusted"] == false {
+                    (
+                        same_doc.next().filter(|p| is_trigger(p)).map(|p| p.id),
+                        true,
+                    )
+                } else {
+                    (None, false)
+                }
+            }
+            Some(s) if is_trigger(s) => (Some(s.id), true),
+            _ => (None, false),
+        };
+        let enter = trigger.and_then(|id| {
+            let click = &self.steps[id].action;
+            let seq = click["enter_sequence"].as_u64()?;
+            self.steps[..id]
+                .iter()
+                .rev()
+                .find(|p| {
+                    p.page_id == page
+                        && p.frame_id == frame
+                        && p.action["kind"] == "enter"
+                        && p.action["document_id"] == click["document_id"]
+                        && p.action["node_id"] == click["node_id"]
+                        && p.action["sequence"] == seq
+                })
+                .map(|p| p.id)
+        });
+        if let Some(id) = enter {
+            self.steps[id].action["kind"] = json!("file_trigger");
+        }
+        if let Some(id) = trigger {
+            self.steps[id].action["kind"] = json!(if uncertain {
+                "file_trigger_uncertain"
+            } else {
+                "file_trigger"
+            });
+        }
+        let id = self.new_step(
+            page,
+            frame,
+            if has_input {
+                "file_chooser_pending"
+            } else {
+                "file_chooser_without_dom_input"
+            },
+            json!({"trigger_id":trigger,"enter_id":enter,"uncertain":uncertain,"document_id":document,"node_id":node}),
+        )?;
+        if has_input {
+            self.open_choosers.insert((page.into(), frame.into()), id);
+        } else {
+            self.open_choosers.remove(&(page.into(), frame.into()));
+            self.gap("file_chooser_without_dom_input", json!({"step_id":id}))?;
         }
         Ok(())
     }
@@ -1157,10 +1273,10 @@ impl Recorder {
                 }
                 received |= !batch.events.is_empty();
                 for event in batch.events {
-                    if event["method"]
-                        .as_str()
-                        .is_some_and(|m| m.starts_with("Network."))
-                    {
+                    if event["method"].as_str().is_some_and(|m| {
+                        m.starts_with("Network.")
+                            || matches!(m, "Page.fileChooserOpened" | "Runtime.bindingCalled")
+                    }) {
                         self.event(index, event)?;
                     }
                 }
@@ -1184,6 +1300,15 @@ impl Recorder {
         }
         self.cleanup();
         self.stopped = true;
+        for id in self
+            .steps
+            .iter()
+            .filter(|s| s.kind == "file_chooser_pending")
+            .map(|s| s.id)
+            .collect::<Vec<_>>()
+        {
+            self.gap("file_chooser_outcome_unobserved", json!({"step_id":id}))?;
+        }
         let pending = std::mem::take(&mut self.pending);
         for (_, mut request) in pending {
             request.record["body_status"] = json!("session_ended_before_completion");
@@ -1308,6 +1433,20 @@ pub fn export(out: &Path) -> Result<()> {
             ("popup", _) => format!("打开关联页面：{}", action["title"].as_str().unwrap_or("")),
             ("mark", _) => format!("备注：{}", action["note"].as_str().unwrap_or("")),
             ("system_transition", _) => "界面自动变化".into(),
+            ("file_chooser_pending", _) => "文件选择器：没有观察到选择结果".into(),
+            ("file_chooser_without_dom_input", _) => {
+                "文件选择器没有对应的网页输入元素（不支持回放）".into()
+            }
+            ("file_chooser_opened", _) => "打开文件选择器".into(),
+            (_, "upload") => format!("为「{label}」选择文件（回放时提供）"),
+            (_, "file_cancel") => "文件选择已取消或未改变".into(),
+            (_, "file_directory") => "选择目录（不支持回放）".into(),
+            (_, "file_empty") => "清空文件选择（不支持回放）".into(),
+            (_, "file_trigger_uncertain") => {
+                "自定义文件选择器触发操作（关联不确定，不回放）".into()
+            }
+            (_, "file_trigger" | "file_activation") => "文件选择触发操作（不单独回放）".into(),
+            (_, "file_target_unobserved") => "文件已选择，但没有可安全回放的已观察控件".into(),
             (_, "input") => format!(
                 "填写「{label}」：{}",
                 action["value"].as_str().unwrap_or("[受保护字段]")
