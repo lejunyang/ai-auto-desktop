@@ -439,13 +439,13 @@ Agent 遇到自己做不了的事（扫码之外的登录、验证码、需要�
 ```powershell
 aad assist --browser-port 9222            # 分享一个浏览器页面（CDP screencast）
 aad assist --desktop                      # 分享整个桌面（Windows；Linux 的 X11；macOS 的主显示器）
-aad assist --desktop --view-only          # 只给看，不接收鼠标键盘
+aad assist --desktop --view-only          # 只读分享，在 Wayland 上由本机用户在系统弹窗中选一块显示器
 aad assist --list-screens                 # 列出可分享的显示器和窗口
 aad assist --desktop --monitor 1          # 只分享第 1 块显示器
 aad assist --desktop --window 0x3077a     # 只分享一个窗口（句柄，或标题的一部分）
 ```
 
-`--monitor` 和 `--window` 只分享桌面的一部分：截屏照常用 DXGI，再裁出这块区域（裁剪缓冲同样两份轮换，只补变化的区域），
+在 Windows 上，`--monitor` 和 `--window` 只分享桌面的一部分：截屏照常用 DXGI，再裁出这块区域（裁剪缓冲同样两份轮换，只补变化的区域），
 鼠标位置和光标都换算到这块区域里，区域外的光标不显示。窗口按 DWM 的可见边框跟随：移动后输入跟着走，大小改变后画面
 按新尺寸从关键帧重新开始，最小化时停在最后一帧，窗口关闭时报错。分享的是窗口在屏幕上占的那块区域，盖在它上面的
 东西也会被看到。
@@ -473,7 +473,7 @@ aad assist --desktop --window 0x3077a     # 只分享一个窗口（句柄，或
   `{"type":"stream","codec":"h264","webcodecs":"avc1.64001f","encoder":"h264_nvenc","width":..,"height":..}`，
   紧接着是关键帧；`webcodecs` 可直接作 WebCodecs `VideoDecoder.configure` 的 `codec`。解码出错时查看端发
   `{"type":"keyframe"}`，服务端重开编码器，从当前画面的关键帧重新开始。
-- 分享桌面时服务端另发 `{"type":"cursor","x":..,"y":..,"visible":true,"shape":{"png":"<base64>","width":..,
+- 在支持独立光标的桌面上，服务端另发 `{"type":"cursor","x":..,"y":..,"visible":true,"shape":{"png":"<base64>","width":..,
   "height":..,"hotspot":[x,y],"screen":[w,h]}}`：鼠标指针的位置（画面内比例）和样子（变了才带 `shape`，
   `screen` 是 `width`/`height` 所在的屏幕像素尺寸），指针不画进画面，由查看端叠加；`--hide-cursor` 关掉。
 - 控制消息是 JSON 文本：服务端发 `ready`（含 `frames.codecs`、`mode`、`video`）、`mode`、`stream`、`cursor`、
@@ -701,14 +701,27 @@ Cmd+C 有时不生效，查看端按真人节奏（键间约 50 ms）发送时�
 逐块比较（`source.capture` 为 `x11` 而不是 `x11-damage`）。输入走 XTest：按键按物理键对应的 keysym 在服务器键盘映射里
 找键码，映射里没有的字符（如中文）临时映射到一个空闲键码再按，用完恢复，和 xdotool 的做法相同。XFixes 给出指针位置和
 图像（预乘 ARGB 转成 PNG），RandR 给出显示器，`_NET_CLIENT_LIST` 给出窗口，`--monitor`、`--window`、`--list-screens`
-和 Windows 一样可用；剪贴板向 CLIPBOARD 的所有者要 UTF8_STRING。只支持 24/32 位色深的屏幕；Wayland 会话里的
-原生窗口看不到（XWayland 的可以）。
+和 Windows 一样可用；剪贴板向 CLIPBOARD 的所有者要 UTF8_STRING。X11 截屏支持 24/32 位色深。
 
 `tests/linux/verify_assist_desktop.py`（需要 Xvfb、openbox、xev、xdotool、xsetroot、xclip，自起一个 X server，
 不碰用户桌面）检查：画面像素就是 xsetroot 设置的颜色、画面静止 3 秒 0 帧、移动一个窗口只发出屏幕 22.8% 的补丁、
 补丁拼出的画面和关键帧逐块一致、指针精确落在查看端指的位置（xdotool 读回）、点击、Ctrl、滚轮和输入的“aZ;中”
 （“中”走临时键码）都作为 X 事件到达 xev 窗口、查看端按着 Shift 断开后 Shift 被松开、光标消息带可解码的形状、
 剪贴板取回 xclip 放进去的文字、`--list-screens` 列出显示器和窗口、`--window` 的画面正好是该窗口大小。
+
+### Linux（Wayland，只读分享）
+
+运行 `aad assist --desktop --view-only`，在系统的屏幕共享弹窗中选一块显示器并确认。显示器由本机用户选择，请省略
+`--monitor` 和 `--window`。收到该显示器的第一帧后，命令才会打印查看地址，`source.capture` 为
+`wayland-portal-monitor`。取消选择会以非零状态退出。分享期间撤销授权会关闭会话，即使当前没有查看者。
+
+此模式只请求 ScreenCast 权限，查看端不能操作鼠标、键盘或剪贴板。分享端需要支持 ScreenCast v3 或更高版本的
+XDG Desktop Portal、PipeWire 和 GStreamer（`gst-launch-1.0`、`pipewiresrc`、`videorate`、`videoconvert`、`pnmenc` 和 `fdsink`）。
+捕获使用 portal 返回的 PipeWire 文件描述符和显示器节点。私有 portal 的端到端测试从两个不同节点读回各自的颜色，
+并核对撤销授权后读取节点已释放。[验证脚本](tests/linux/verify_assist_wayland.py)
+
+在嵌套的 KWin Wayland 会话中，真实 KDE 弹窗的“取消”返回响应码 1，`aad` 报告 `portal Denied`。
+`[待验证]` 仍需操作员在 KDE 弹窗中选中显示器并点击“共享”，再从查看端核对该显示器的画面。
 
 ## 桌面窗口（GUI）
 
