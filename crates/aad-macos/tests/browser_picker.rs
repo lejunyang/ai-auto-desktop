@@ -1,4 +1,5 @@
-//! Run on a signed-in Mac with the built AX helper granted Accessibility.
+//! Run on a signed-in Mac with the signed AX helper granted Accessibility.
+//! Use a native file panel in list view with visible filename extensions.
 #![cfg(target_os = "macos")]
 
 use aad_macos::browser_picker::FilePicker;
@@ -84,9 +85,13 @@ fn inspect_and_operate_real_appkit_file_panels() {
         .unwrap()
         .success());
 
-    for mode in ["open", "save", "replace"] {
+    for mode in ["open", "save", "replace", "select"] {
         let dir = root.0.join(mode);
         fs::create_dir(&dir).unwrap();
+        let file = dir.join("native selection.txt");
+        if mode == "select" {
+            fs::write(&file, b"the caller granted this file").unwrap();
+        }
         let app = Fixture(Command::new(&fixture).arg(mode).arg(&dir).spawn().unwrap());
         let pid = app.0.id();
         let bounds: [i32; 4] = serde_json::from_value(report(&dir.join("ready"))).unwrap();
@@ -114,8 +119,31 @@ fn inspect_and_operate_real_appkit_file_panels() {
                 let occupied = dir.join("kept.txt");
                 fs::write(&occupied, b"keep").unwrap();
                 assert!(picker.save_new(&occupied, deadline()).is_err());
-                let dest = dir.join("selected name.txt");
-                picker.save_new(&dest, deadline()).unwrap();
+                let out_of_view = root.0.join("open").join("selected name.txt");
+                assert!(picker.save_new(&out_of_view, deadline()).is_err());
+                assert!(!out_of_view.exists());
+                let wrong_ext = dir.join("changed.pdf");
+                assert!(picker.save_new(&wrong_ext, deadline()).is_err());
+                picker.revalidate(deadline()).unwrap();
+                let child = dir.join("child");
+                fs::create_dir(&child).unwrap();
+                let mut dest = child.join("selected name.txt");
+                if let Err(error) = picker.save_new(&dest, deadline()) {
+                    // Some AppKit views expose the current directory but offer
+                    // no addressable folder rows or native row-open action.
+                    let message = error.to_string();
+                    assert!(
+                        message.contains("offers no verified AXOpen")
+                            || message.contains("expected a single native file list")
+                            || message.contains("no unique visible file row")
+                            || message.contains("could not inspect visible native file rows"),
+                        "{message}"
+                    );
+                    assert!(!dest.exists());
+                    picker.revalidate(deadline()).unwrap();
+                    dest = dir.join("selected name.txt");
+                    picker.save_new(&dest, deadline()).unwrap();
+                }
                 assert_eq!(
                     report(&dir.join("result"))["selected"],
                     dest.to_str().unwrap()
@@ -128,12 +156,19 @@ fn inspect_and_operate_real_appkit_file_panels() {
             }
             "replace" => {
                 fs::write(dir.join("replace-now"), b"").unwrap();
-                let until = deadline();
-                while picker.revalidate(deadline()).is_ok() {
-                    assert!(Instant::now() < until, "previous panel was still valid");
-                }
+                assert_eq!(report(&dir.join("replaced"))["attached"], true);
                 assert!(picker.dismiss(deadline()).is_err());
                 assert!(!dir.join("prompt-result").exists());
+            }
+            "select" => {
+                let other = root.0.join(file.file_name().unwrap());
+                fs::write(&other, b"wrong directory").unwrap();
+                assert!(picker.open_file(&other, deadline()).is_err());
+                picker.revalidate(deadline()).unwrap();
+                picker.open_file(&file, deadline()).unwrap();
+                let result = report(&dir.join("result"));
+                assert_eq!(result["selected"], serde_json::json!([file]));
+                assert_eq!(result["contents"], "the caller granted this file");
             }
             _ => {
                 picker.dismiss(deadline()).unwrap();

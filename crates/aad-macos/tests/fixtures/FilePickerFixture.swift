@@ -38,6 +38,7 @@ DispatchQueue.main.async {
     panel.beginSheetModal(for: window) { result in
         if mode == "replace" {
             alert.beginSheetModal(for: window) { _ in report("prompt-result", ["pressed": true]) }
+            report("replaced", ["attached": window.attachedSheet === alert.window])
             return
         }
         guard result == .OK, let url = panel.url else {
@@ -45,6 +46,10 @@ DispatchQueue.main.async {
             return
         }
         do {
+            if let open = panel as? NSOpenPanel {
+                report("result", ["selected": open.urls.map(\.path), "contents": try String(contentsOf: url, encoding: .utf8)])
+                return
+            }
             try Data("native fixture wrote this file\n".utf8).write(to: url, options: .withoutOverwriting)
             report("result", ["selected": url.path])
         } catch {

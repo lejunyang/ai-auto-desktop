@@ -69,6 +69,30 @@ impl FilePicker {
         self.check("picker_dismiss", json!({"token": self.token}), deadline)
     }
 
+    /// Select one file in an AppKit list view. AX must expose the visible
+    /// row's absolute local URL or filename, and report the sole selected row.
+    /// The caller supplies the resolved regular file within its upload grant.
+    pub fn open_file(&self, path: &Path, deadline: Instant) -> Result<()> {
+        if self.kind != Kind::Open {
+            return Err("expected an observed native Open panel".into());
+        }
+        if !path.is_absolute()
+            || path.canonicalize()?.as_os_str() != path.as_os_str()
+            || !path.symlink_metadata()?.is_file()
+        {
+            return Err("expected a resolved absolute path to a regular file".into());
+        }
+        self.check(
+            "picker_open_file",
+            json!({"token": self.token, "path": path.to_str().ok_or("open path is not UTF-8")?}),
+            deadline,
+        )
+    }
+
+    /// Save under the visible suggested extension in a directory whose full
+    /// location the panel exposes. To navigate, the exact destination folder
+    /// must be a visible row offering AXOpen. Otherwise select the directory
+    /// in the panel before calling this method.
     pub fn save_new(&self, path: &Path, deadline: Instant) -> Result<()> {
         if self.kind != Kind::Save {
             return Err("the observed panel is not a Save panel".into());
