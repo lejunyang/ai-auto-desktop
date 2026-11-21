@@ -17,8 +17,8 @@ pub mod gate_session;
 pub mod launch;
 pub mod recording;
 pub mod request_gate;
-pub mod webkit;
 mod tcp;
+pub mod webkit;
 mod ws;
 
 /// Protocol-neutral local WebSocket framing and JSON request/reply transport.
