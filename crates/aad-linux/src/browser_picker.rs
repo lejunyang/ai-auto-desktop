@@ -24,6 +24,7 @@ use portal::GtkPortal;
 enum Chooser {
     Gtk3,
     Gtk4(Box<Gtk4Picker>),
+    Gtk4Save(String),
     Portal(GtkPortal),
 }
 
@@ -50,14 +51,15 @@ impl FilePicker {
             Ok("x11") => {
                 let expected = expected.map(u32::try_from).transpose()?;
                 let window = OpenPicker::observe_kind(pid, expected, bounds, kind, deadline)?;
-                let controls = if kind == Kind::Save {
-                    let owner = match &window.chooser {
-                        Chooser::Portal(portal) => portal.picker_pid,
-                        _ => pid,
-                    };
-                    Some(GtkFileDialog::observe(owner, kind, deadline)?)
-                } else {
-                    None
+                let controls = match (&window.chooser, kind) {
+                    (Chooser::Gtk4Save(class), Kind::Save) => Some(
+                        GtkFileDialog::observe_x11_gtk4_save(pid, class.clone(), deadline)?,
+                    ),
+                    (Chooser::Portal(portal), Kind::Save) => {
+                        Some(GtkFileDialog::observe(portal.picker_pid, kind, deadline)?)
+                    }
+                    (_, Kind::Save) => Some(GtkFileDialog::observe(pid, kind, deadline)?),
+                    (_, Kind::Open) => None,
                 };
                 (Surface::X11(Box::new(window)), controls)
             }
@@ -371,12 +373,6 @@ impl OpenPicker {
                 observed.open_controls = Some(Box::new(gtk));
             }
         } else if role.is_empty() {
-            if kind == Kind::Save {
-                return Err(
-                    "browser-owned GTK 4 Save requires identifiable filename and response controls"
-                        .into(),
-                );
-            }
             let class =
                 observed.bytes(picker, AtomEnum::WM_CLASS.into(), AtomEnum::STRING.into())?;
             let name = class
@@ -384,13 +380,16 @@ impl OpenPicker {
                 .next()
                 .filter(|s| !s.is_empty())
                 .ok_or("missing GTK window class")?;
-            let title = observed.title()?;
-            observed.chooser = Chooser::Gtk4(Box::new(Gtk4Picker::observe(
-                pid,
-                std::str::from_utf8(name)?.into(),
-                String::from_utf8(title)?,
-                deadline,
-            )?));
+            let class = std::str::from_utf8(name)?.to_owned();
+            observed.chooser = match kind {
+                Kind::Save => Chooser::Gtk4Save(class),
+                Kind::Open => Chooser::Gtk4(Box::new(Gtk4Picker::observe(
+                    pid,
+                    class,
+                    String::from_utf8(observed.title()?)?,
+                    deadline,
+                )?)),
+            };
         }
         observed.revalidate(deadline)?;
         Ok(observed)
@@ -479,6 +478,14 @@ impl OpenPicker {
         let title = self.title()?;
         let role = self.bytes(self.picker, a.WM_WINDOW_ROLE, AtomEnum::STRING.into())?;
         let chooser = match &self.chooser {
+            Chooser::Gtk4Save(class) => {
+                role.is_empty()
+                    && self.bytes(
+                        self.picker,
+                        AtomEnum::WM_CLASS.into(),
+                        AtomEnum::STRING.into(),
+                    )? == format!("{class}\0{class}\0").as_bytes()
+            }
             Chooser::Gtk4(gtk) => {
                 role.is_empty()
                     && gtk.matches_window(
@@ -565,7 +572,7 @@ impl OpenPicker {
             }
         }
         match &self.chooser {
-            Chooser::Gtk3 => (),
+            Chooser::Gtk3 | Chooser::Gtk4Save(_) => (),
             Chooser::Gtk4(gtk) => gtk.revalidate(deadline)?,
             Chooser::Portal(portal) => portal.revalidate(deadline)?,
         }

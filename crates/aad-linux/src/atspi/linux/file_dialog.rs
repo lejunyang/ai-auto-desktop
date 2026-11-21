@@ -20,7 +20,30 @@ pub(crate) struct GtkFileDialog {
     backend: LinuxBackend,
     pid: u32,
     kind: Kind,
+    toolkit: Toolkit,
     controls: Controls,
+}
+
+enum Toolkit {
+    Gtk3,
+    X11Gtk4(String),
+}
+
+impl Toolkit {
+    fn shows(&self, states: StateSet) -> bool {
+        match self {
+            Self::Gtk3 => shown(states),
+            // GTK 4.8 reports Visible and Sensitive. The X11 provider checks
+            // active XID, viewability, modality and transient owner separately.
+            Self::X11Gtk4(_) => states.contains(State::Visible),
+        }
+    }
+    fn enables(&self, states: StateSet) -> bool {
+        match self {
+            Self::Gtk3 => enabled(states),
+            Self::X11Gtk4(_) => states.contains(State::Sensitive),
+        }
+    }
 }
 
 #[derive(PartialEq)]
@@ -42,12 +65,23 @@ fn unique<T>(items: Vec<T>, message: &'static str) -> Result<T> {
 
 impl GtkFileDialog {
     pub(crate) fn observe(pid: u32, kind: Kind, deadline: Instant) -> Result<Self> {
+        Self::bind(pid, kind, Toolkit::Gtk3, deadline)
+    }
+    pub(crate) fn observe_x11_gtk4_save(
+        pid: u32,
+        class: String,
+        deadline: Instant,
+    ) -> Result<Self> {
+        Self::bind(pid, Kind::Save, Toolkit::X11Gtk4(class), deadline)
+    }
+    fn bind(pid: u32, kind: Kind, toolkit: Toolkit, deadline: Instant) -> Result<Self> {
         let backend = LinuxBackend::new()?;
-        let controls = identify(&backend, pid, kind, deadline)?;
+        let controls = identify(&backend, pid, kind, &toolkit, deadline)?;
         Ok(Self {
             backend,
             pid,
             kind,
+            toolkit,
             controls,
         })
     }
@@ -55,7 +89,7 @@ impl GtkFileDialog {
         &self.controls.title
     }
     pub(crate) fn revalidate(&self, deadline: Instant) -> Result<()> {
-        if identify(&self.backend, self.pid, self.kind, deadline)? != self.controls {
+        if identify(&self.backend, self.pid, self.kind, &self.toolkit, deadline)? != self.controls {
             return Err("the observed file chooser or its controls changed".into());
         }
         Ok(())
@@ -72,7 +106,7 @@ impl GtkFileDialog {
             }
             let proxy = self.backend.accessible(&top)?;
             let states = zbus::block_on(proxy.get_state())?;
-            if !shown(states) {
+            if !self.toolkit.shows(states) {
                 continue;
             }
             if top == c.window {
@@ -223,18 +257,29 @@ impl GtkFileDialog {
     }
 }
 
-fn identify(backend: &LinuxBackend, pid: u32, kind: Kind, deadline: Instant) -> Result<Controls> {
+fn identify(
+    backend: &LinuxBackend,
+    pid: u32,
+    kind: Kind,
+    toolkit: &Toolkit,
+    deadline: Instant,
+) -> Result<Controls> {
     let mut windows = Vec::new();
     for app in backend.children(&LinuxBackend::root_ref(), deadline)? {
         if backend.process_id(&app.bus_name) != Some(pid) {
             continue;
         }
         let info = backend.application_info(&app, deadline)?;
-        if info["toolkit_name"] != "gtk"
-            || !info["toolkit_version"]
-                .as_str()
-                .is_some_and(|v| v.starts_with("3."))
-        {
+        let version = info["toolkit_version"].as_str().unwrap_or("");
+        let app_matches = match toolkit {
+            Toolkit::Gtk3 => info["toolkit_name"] == "gtk" && version.starts_with("3."),
+            Toolkit::X11Gtk4(class) => {
+                info["toolkit_name"] == "GTK"
+                    && version.starts_with("4.")
+                    && info["name"].as_str() == Some(class)
+            }
+        };
+        if !app_matches {
             continue;
         }
         for top in backend.children(&app, deadline)? {
@@ -243,13 +288,15 @@ fn identify(backend: &LinuxBackend, pid: u32, kind: Kind, deadline: Instant) -> 
             }
             let proxy = backend.accessible(&top)?;
             let states = zbus::block_on(proxy.get_state())?;
-            if !shown(states) || !states.contains(State::Modal) {
+            if !toolkit.shows(states) || !states.contains(State::Modal) {
                 continue;
             }
-            if !enabled(states)
-                || !states.contains(State::Active)
-                || zbus::block_on(proxy.get_role())? != Role::FileChooser
-            {
+            let role = zbus::block_on(proxy.get_role())?;
+            let dialog = match toolkit {
+                Toolkit::Gtk3 => role == Role::FileChooser && states.contains(State::Active),
+                Toolkit::X11Gtk4(_) => role == Role::Dialog,
+            };
+            if !toolkit.enables(states) || !dialog {
                 return Err("another modal or confirmation belongs to the application".into());
             }
             windows.push((app.clone(), top.clone(), zbus::block_on(proxy.name())?));
@@ -283,12 +330,18 @@ fn identify(backend: &LinuxBackend, pid: u32, kind: Kind, deadline: Instant) -> 
             }
             let proxy = backend.accessible(&child)?;
             let states = zbus::block_on(proxy.get_state())?;
-            if !shown(states) {
+            if !toolkit.shows(states) {
                 continue;
             }
-            match zbus::block_on(proxy.get_role())? {
-                Role::Panel | Role::Filler => panels.push((child, inside_chooser)),
-                Role::FileChooser if !inside_chooser => {
+            let role = zbus::block_on(proxy.get_role())?;
+            let widget = match toolkit {
+                Toolkit::Gtk3 => role == Role::FileChooser,
+                Toolkit::X11Gtk4(_) => {
+                    role == Role::Filler && zbus::block_on(proxy.name())? == "GtkFileChooserWidget"
+                }
+            };
+            match role {
+                _ if widget && !inside_chooser => {
                     widgets.push(child.clone());
                     // With a traditional action area the filename entry is
                     // inside the chooser. Header-bar dialogs place it outside.
@@ -296,27 +349,35 @@ fn identify(backend: &LinuxBackend, pid: u32, kind: Kind, deadline: Instant) -> 
                         panels.push((child, true));
                     }
                 }
+                Role::Panel | Role::Filler => panels.push((child, inside_chooser)),
                 Role::Button if !inside_chooser => {
                     let name = zbus::block_on(proxy.name())?;
                     match name.as_str() {
-                        "Cancel" | "取消" if enabled(states) => cancel.push(child),
-                        "Save" | "保存" if kind == Kind::Save && enabled(states) => {
+                        "_Cancel Cancel" | "Cancel" | "取消" if toolkit.enables(states) => {
+                            cancel.push(child)
+                        }
+                        "_Save Save" | "Save" | "保存"
+                            if kind == Kind::Save && toolkit.enables(states) =>
+                        {
                             accept.push(child)
                         }
                         "Select" | "Open" | "选择" | "打开" if kind == Kind::Open => {
                             accept.push(child)
                         }
-                        "Save" | "保存" | "Select" | "Open" | "选择" | "打开" => {
+                        "_Save Save" | "_Open Open" | "Save" | "保存" | "Select" | "Open"
+                        | "选择" | "打开" => {
                             return Err("unexpected chooser response button".into())
                         }
                         _ => (),
                     }
                 }
-                Role::Text if states.contains(State::Editable) => {
+                Role::Text
+                    if states.contains(State::Editable) && states.contains(State::Focused) =>
+                {
                     if kind != Kind::Save
-                        || !enabled(states)
-                        || !states.contains(State::Focused)
-                        || !states.contains(State::SingleLine)
+                        || !toolkit.enables(states)
+                        || states.contains(State::MultiLine)
+                        || (matches!(toolkit, Toolkit::Gtk3) && !states.contains(State::SingleLine))
                     {
                         return Err("unexpected or unfocused chooser entry".into());
                     }
