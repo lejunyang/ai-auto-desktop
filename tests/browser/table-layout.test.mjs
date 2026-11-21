@@ -13,6 +13,7 @@ async function openTable(t, html, role = 'table') {
     res.setHeader('Content-Type','text/html;charset=utf-8');
     res.end(html);
   });
+
   t.after(() => page.close());
   const child = spawn(cli, ['mcp', '--browser-port', String(page.port)], {stdio:['pipe','pipe','inherit']});
   t.after(() => { child.stdin.end(); child.kill(); });
@@ -81,4 +82,43 @@ test('HTML table spans preserve header paths and CSV order within the output bud
     assert.ok(partial.truncation_reasons.includes('column_limit'));
     assert.equal(partial.records[0]['/literal'].length, 500-'/literalData'.length);
     assert.equal(partial.records[0].Data, null);
+  });
+
+test('a DOM-owned ARIA grid keeps row and column indexes aligned through collection',
+  {skip:!process.env.AAD_TEST_CHROME}, async t => {
+    const {page, read, collect} = await openTable(t, `
+      <div role="grid" aria-label="Ledger" aria-colcount="3" aria-rowcount="4" id="ledger">
+        <div role="rowgroup">
+          <div role="row" aria-rowindex="1"><b role="columnheader" aria-rowspan="2">ID</b>
+            <b role="columnheader" aria-colspan="2">Revenue</b></div>
+          <div role="row" aria-rowindex="2"><b role="columnheader" aria-colindex="2">Net</b>
+            <b role="columnheader" aria-colindex="3">Tax</b></div></div>
+        <div role="rowgroup"><div role="presentation">
+          <div role="row" aria-rowindex="3"><span role="rowheader">A</span>
+            <span role="gridcell" aria-colindex="2" aria-rowspan="2">10</span><span role="gridcell">2</span></div>
+          <div role="row" aria-rowindex="4" id="last"><span role="rowheader">B</span>
+            <span role="gridcell" aria-colindex="3">3</span></div></div></div>
+        <div role="grid" aria-label="Other"><div role="row"><span role="columnheader">Other</span></div></div>
+        <div aria-hidden="true"><div role="row"><span role="cell">hidden</span></div></div>
+      </div>`, 'grid');
+    const columns = ['/Revenue/Tax','ID','/Revenue/Net'];
+    const expected = [
+      {'/Revenue/Tax':'2', ID:'A', '/Revenue/Net':'10'},
+      {'/Revenue/Tax':'3', ID:'B', '/Revenue/Net':'10'}
+    ];
+    const result = await read(columns);
+    assert.equal(result.truncated, false);
+    assert.equal(result.visible_data_rows, 2);
+    assert.deepEqual(result.records, expected);
+    const all = await collect(columns, 2);
+    assert.deepEqual(all.records, expected);
+    assert.equal(all.csv, '/Revenue/Tax,ID,/Revenue/Net\r\n2,A,10\r\n3,B,10\r\n');
+    await page.cdp.eval("ledger.setAttribute('aria-owns','remote')");
+    await read(columns, 'CONTROL.TABLE_HEADER');
+    await page.cdp.eval("ledger.removeAttribute('aria-owns'); last.lastElementChild.setAttribute('aria-colindex','2')");
+    await read(columns, 'CONTROL.TABLE_HEADER');
+    await page.cdp.eval("last.lastElementChild.setAttribute('aria-colindex','3'); ledger.setAttribute('aria-rowcount','8'); last.setAttribute('aria-rowindex','8'); last.lastElementChild.setAttribute('aria-colindex','2')");
+    const sparse = await read(columns);
+    assert.ok(sparse.truncation_reasons.includes('rows_not_rendered'));
+    assert.deepEqual(sparse.records[1], {'/Revenue/Tax':null, ID:'B', '/Revenue/Net':'3'});
   });
