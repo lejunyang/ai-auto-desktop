@@ -190,6 +190,21 @@ fn directory() -> PathBuf {
     let suffix = "user".to_string();
     std::env::temp_dir().join(format!("aad-control-leases-{suffix}"))
 }
+/// Tests run in parallel and some spawn processes, so a forked child may
+/// briefly share a dropped lease's lock; it is released when it execs.
+#[cfg(test)]
+pub(crate) fn once_released<T>(mut acquire: impl FnMut() -> Result<T>) -> Result<T> {
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        match acquire() {
+            Err(e) if e.code == "CONTROL.RESOURCE_BUSY" && std::time::Instant::now() < until => {
+                std::thread::sleep(std::time::Duration::from_millis(10))
+            }
+            done => return done,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -253,20 +268,5 @@ mod tests {
         let b = InputLease::in_directory(&root, "page-b").unwrap();
         drop((a, b));
         std::fs::remove_dir_all(root).unwrap();
-    }
-}
-
-/// Tests run in parallel and some spawn processes, so a forked child may
-/// briefly share a dropped lease's lock; it is released when it execs.
-#[cfg(test)]
-pub(crate) fn once_released<T>(mut acquire: impl FnMut() -> Result<T>) -> Result<T> {
-    let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    loop {
-        match acquire() {
-            Err(e) if e.code == "CONTROL.RESOURCE_BUSY" && std::time::Instant::now() < until => {
-                std::thread::sleep(std::time::Duration::from_millis(10))
-            }
-            done => return done,
-        }
     }
 }
