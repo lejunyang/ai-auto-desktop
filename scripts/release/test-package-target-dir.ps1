@@ -4,6 +4,8 @@ $fixture = Join-Path ([IO.Path]::GetTempPath()) ([guid]::NewGuid().ToString('N')
 $previous = $env:CARGO_TARGET_DIR
 New-Item -ItemType Directory "$fixture/scripts/release", "$fixture/src/bin" -Force | Out-Null
 Copy-Item "$PSScriptRoot/package-cli.ps1" "$fixture/scripts/release"
+New-Item -ItemType Directory "$fixture/crates/aad-linux" -Force | Out-Null
+Copy-Item "$PSScriptRoot/../../crates/aad-linux/qt-wayland-input" "$fixture/crates/aad-linux" -Recurse
 Copy-Item "$PSScriptRoot/../../osdk.toml", "$PSScriptRoot/../../osdk.lock" $fixture
 Push-Location $fixture
 try {

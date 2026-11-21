@@ -1,4 +1,4 @@
-param([string]$OutputDirectory = 'dist')
+param([string]$OutputDirectory = 'dist', [switch]$BuildQtWaylandPlugin)
 
 # Native GNU Linux build. All generated files stay in the checkout.
 $ErrorActionPreference = 'Stop'
@@ -27,7 +27,7 @@ try {
     $versionOutput = & (Join-Path $targetDirectory "$target/release/aad") --version
     if ($LASTEXITCODE -or $versionOutput -notmatch '^aad (\S+)$') { throw 'CLI version check failed' }
     $version = $Matches[1]
-    & "$PSScriptRoot/package-cli.ps1" -Target $target -Version $version -TargetDirectory $targetDirectory -OutputDirectory $OutputDirectory
+    & "$PSScriptRoot/package-cli.ps1" -Target $target -Version $version -TargetDirectory $targetDirectory -OutputDirectory $OutputDirectory -BuildQtWaylandPlugin:$BuildQtWaylandPlugin
     $archive = Join-Path $OutputDirectory "aad-$version-$target.tar.gz"
     $manifest = [ordered]@{
         commit = $commit

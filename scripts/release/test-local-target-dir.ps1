@@ -5,6 +5,8 @@ $previous = $env:CARGO_TARGET_DIR
 try {
     New-Item -ItemType Directory "$fixture/scripts/release" -Force | Out-Null
     Copy-Item "$PSScriptRoot/build-local-linux.ps1", "$PSScriptRoot/package-cli.ps1" "$fixture/scripts/release"
+    New-Item -ItemType Directory "$fixture/crates/aad-linux" -Force | Out-Null
+    Copy-Item "$PSScriptRoot/../../crates/aad-linux/qt-wayland-input" "$fixture/crates/aad-linux" -Recurse
     Set-Content "$fixture/README.md" 'fixture'
     function global:git {
         if ($args[0] -eq 'rev-parse') { 'fixture-commit' }

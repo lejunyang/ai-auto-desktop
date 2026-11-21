@@ -79,6 +79,10 @@ jobs:
           if ($LASTEXITCODE) { throw 'apt update failed' }
           sudo apt-get install -y --no-install-recommends g++ pkg-config libx11-dev libxtst-dev musl-tools bubblewrap
           if ($LASTEXITCODE) { throw 'Linux build dependency installation failed' }
+          if ('${{ matrix.target }}'.EndsWith('-linux-gnu')) {
+            sudo apt-get install -y --no-install-recommends qtbase5-dev qt5-qmake
+            if ($LASTEXITCODE) { throw 'Qt 5 development package installation failed' }
+          }
 
       - name: Build the CLI with the osdk-selected Rust toolchain
         run: |
@@ -119,7 +123,8 @@ jobs:
         run: |
           $version = '${{ steps.version.outputs.version }}'
           $target = '${{ matrix.target }}'
-          $archive = ./scripts/release/package-cli.ps1 -Target $target -Version $version -TargetDirectory (Join-Path $pwd target)
+          $bundleQt = $target.EndsWith('-linux-gnu')
+          $archive = ./scripts/release/package-cli.ps1 -Target $target -Version $version -TargetDirectory (Join-Path $pwd target) -BuildQtWaylandPlugin:$bundleQt
           if ($IsLinux) {
             ./tests/linux/verify-release.ps1 -Archive $archive -Version $version -Target $target
           }

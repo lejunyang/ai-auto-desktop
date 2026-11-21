@@ -20,7 +20,15 @@ try {
     & tar -xzf $archivePath -C $scratch
     if ($LASTEXITCODE -ne 0) { throw 'Cannot extract the release archive' }
     $root = Join-Path $scratch "aad-$Version-$Target"
-    foreach ($name in @('aad', 'aad-browser', 'aad-linux-xtest-helper', 'aad-linux-capture-helper')) {
+    foreach ($source in @('input.pro', 'input.cpp', 'input.json', 'build.ps1', 'README.md')) {
+        if (!(Test-Path -LiteralPath (Join-Path $root "qt-wayland-input/$source") -PathType Leaf)) {
+            throw "Missing Qt Wayland input source kit file $source"
+        }
+    }
+    $binaries = @('aad', 'aad-browser', 'aad-linux-xtest-helper', 'aad-linux-capture-helper')
+    $qtPlugin = 'qt5-plugins/generic/libaadwaylandinput.so'
+    if (Test-Path -LiteralPath (Join-Path $root $qtPlugin) -PathType Leaf) { $binaries += $qtPlugin }
+    foreach ($name in $binaries) {
         $binary = Join-Path $root $name
         if (-not (Test-Path -LiteralPath $binary -PathType Leaf)) { throw "Missing $name" }
         & test -x $binary
