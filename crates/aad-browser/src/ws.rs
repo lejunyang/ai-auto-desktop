@@ -16,6 +16,10 @@ use std::time::Instant;
 pub enum CdpError {
     Connect(String),
     Protocol(String),
+    /// The local deadline expired while awaiting a command reply.
+    CommandTimeout,
+    /// The local deadline expired during connection or transport.
+    TransportTimeout(&'static str),
     Io(String),
     BadUrl,
     /// A command was abandoned because this event arrived while it waited,
@@ -50,6 +54,8 @@ impl std::fmt::Display for CdpError {
         match self {
             CdpError::Connect(message) => write!(formatter, "cdp connect: {message}"),
             CdpError::Protocol(message) => write!(formatter, "cdp protocol: {message}"),
+            CdpError::CommandTimeout => write!(formatter, "cdp: command deadline elapsed"),
+            CdpError::TransportTimeout(message) => write!(formatter, "cdp: {message}"),
             CdpError::Io(message) => write!(formatter, "cdp io: {message}"),
             CdpError::BadUrl => write!(formatter, "cdp: unsupported websocket url"),
             CdpError::Interrupted(method) => write!(formatter, "cdp: interrupted by {method}"),
@@ -129,7 +135,7 @@ impl WebSocket {
                 .set_read_timeout(Some(
                     deadline
                         .checked_duration_since(Instant::now())
-                        .ok_or_else(|| CdpError::connect("handshake timed out"))?
+                        .ok_or(CdpError::TransportTimeout("handshake timed out"))?
                         .min(std::time::Duration::from_millis(50)),
                 ))
                 .map_err(CdpError::io)?;
@@ -211,7 +217,7 @@ impl WebSocket {
             .set_write_timeout(Some(
                 deadline
                     .checked_duration_since(Instant::now())
-                    .ok_or_else(|| CdpError::connect("deadline elapsed"))?,
+                    .ok_or(CdpError::TransportTimeout("write deadline elapsed"))?,
             ))
             .map_err(CdpError::io)
     }
@@ -252,7 +258,7 @@ impl WebSocket {
         loop {
             let remaining = deadline
                 .checked_duration_since(Instant::now())
-                .ok_or_else(|| CdpError::connect("cdp read timed out"))?;
+                .ok_or(CdpError::TransportTimeout("cdp read timed out"))?;
             self.stream
                 .set_read_timeout(Some(remaining))
                 .map_err(CdpError::io)?;
@@ -308,7 +314,7 @@ impl WebSocket {
         while !bytes.is_empty() {
             let remaining = deadline
                 .checked_duration_since(Instant::now())
-                .ok_or_else(|| CdpError::connect("cdp read timed out"))?;
+                .ok_or(CdpError::TransportTimeout("cdp read timed out"))?;
             self.stream
                 .set_read_timeout(Some(remaining))
                 .map_err(CdpError::io)?;

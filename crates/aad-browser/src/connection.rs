@@ -169,7 +169,7 @@ impl Connection {
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
-                return Err(CdpError::protocol("command deadline elapsed"));
+                return Err(CdpError::CommandTimeout);
             }
             match recv.recv_timeout(remaining.min(Duration::from_millis(10))) {
                 Ok(value) => return value,

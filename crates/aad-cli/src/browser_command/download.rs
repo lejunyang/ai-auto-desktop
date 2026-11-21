@@ -122,8 +122,10 @@ fn download(args: &Args) -> Result<Value, Value> {
     let pending_navigation = match browser.open_url(&args.url) {
         Ok(()) => None,
         Err(err)
-            if matches!(err.downcast_ref::<aad_browser::cdp::CdpError>(),
-            Some(aad_browser::cdp::CdpError::Protocol(message)) if message == "command deadline elapsed") =>
+            if matches!(
+                err.downcast_ref::<aad_browser::cdp::CdpError>(),
+                Some(aad_browser::cdp::CdpError::CommandTimeout)
+            ) =>
         {
             Some(err)
         }

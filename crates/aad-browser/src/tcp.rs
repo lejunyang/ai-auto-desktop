@@ -31,7 +31,7 @@ pub(crate) fn connect(
         }
         deadline
             .checked_duration_since(Instant::now())
-            .ok_or_else(|| CdpError::connect("TCP deadline elapsed"))
+            .ok_or(CdpError::TransportTimeout("TCP deadline elapsed"))
     };
     check()?;
     let socket = Socket::new(

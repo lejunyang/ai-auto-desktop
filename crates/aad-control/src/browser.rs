@@ -1147,6 +1147,10 @@ impl BrowserBackend {
 }
 
 fn cdp_error(e: aad_browser::cdp::CdpError) -> AutomationError {
+    use aad_browser::cdp::CdpError;
+    if matches!(e, CdpError::CommandTimeout | CdpError::TransportTimeout(_)) {
+        return error("CONTROL.TIMEOUT", e.to_string());
+    }
     if e.interrupted_by() == Some(DIALOG_OPENING) {
         return error(
             "CONTROL.DIALOG_OPEN",
@@ -4914,6 +4918,20 @@ mod tests {
         assert_eq!(
             (lost.code.as_str(), lost.retryable),
             ("BROWSER.CONTEXT_LOST", true)
+        );
+    }
+    #[test]
+    fn local_cdp_deadlines_are_control_timeouts() {
+        use aad_browser::cdp::CdpError;
+        for deadline in [
+            CdpError::CommandTimeout,
+            CdpError::TransportTimeout("TCP deadline elapsed"),
+        ] {
+            assert_eq!(cdp_error(deadline).code, "CONTROL.TIMEOUT");
+        }
+        assert_eq!(
+            cdp_error(CdpError::protocol("command deadline elapsed")).code,
+            "BROWSER.CDP_ERROR"
         );
     }
     #[test]

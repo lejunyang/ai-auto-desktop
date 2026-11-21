@@ -466,21 +466,21 @@ pub fn perform(
     timeout: Duration,
 ) -> Result<Value> {
     step.validate()?;
-    let deadline = Instant::now() + timeout;
+    let start = Instant::now();
+    let deadline = start + timeout;
     if let Some(check) = &step.check {
         return wait(session, step, check, deadline);
     }
     if let Some(fields) = &step.read {
-        let until = step
-            .within_ms
-            .map(|ms| deadline.min(Instant::now() + Duration::from_millis(ms)));
-        let deadline = until.unwrap_or(deadline);
+        let within = step.within_ms.map(Duration::from_millis);
+        let deadline = start + within.unwrap_or(timeout).min(timeout);
         let resource_id = resource(session, &step.app, deadline)?.ok_or_else(|| {
             error(
                 "STEP.APP_NOT_FOUND",
                 "no open window matches the step's application",
             )
         })?;
+        let mut last_observation_error = None;
         loop {
             let attempt = request(
                 session,
@@ -490,6 +490,11 @@ pub fn perform(
                 },
                 deadline,
             );
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            // Requests round down to whole milliseconds, so a read can time
+            // out just before the expectation deadline.
+            let check_expired = within.is_some_and(|within| within <= timeout)
+                && remaining <= Duration::from_millis(1);
             let failure = match attempt {
                 Ok(result) => match step
                     .expect
@@ -511,18 +516,22 @@ pub fn perform(
                 {
                     failure
                 }
+                Err(failure)
+                    if check_expired
+                        && matches!(failure.code.as_str(), "CONTROL.TIMEOUT" | "STEP.TIMEOUT") =>
+                {
+                    return Err(last_observation_error.unwrap_or(failure));
+                }
                 Err(failure) => return Err(failure),
             };
-            let remaining = until
-                .map(|until| until.saturating_duration_since(Instant::now()))
-                .unwrap_or_default();
-            if remaining <= Duration::from_millis(1) {
+            if within.is_none() || remaining <= Duration::from_millis(1) {
                 return Err(failure);
             }
             std::thread::sleep(remaining.min(Duration::from_millis(100)));
             if Instant::now() >= deadline {
                 return Err(failure);
             }
+            last_observation_error = Some(failure);
         }
     }
     let value = match &step.input {

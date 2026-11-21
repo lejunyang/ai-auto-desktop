@@ -88,14 +88,15 @@ test('typed batches re-observe after a write and stop on a missing element',
     const expected = {quoted:'118.50',billed:'118.50',order_id:'ORD-42'};
     assert.deepEqual((await tool('run_steps',{steps})).outputs, expected);
     assert.deepEqual(await page.cdp.eval('[window.orders, document.querySelector(\'[aria-label="Order ID"]\').value]'),[1,'ORD-42']);
-    const mismatch = {...receipt,expect:{billed:'120.00'},within_ms:150};
+    // A busy renderer needs time to complete at least one receipt read.
+    const mismatch = {...receipt,expect:{billed:'120.00'},within_ms:1000};
     const stopped = await tool('run_steps',{steps:[quote,mismatch,submit]},true);
-    assert.equal(stopped.error.code,'STEP.CHECK_FAILED');
+    assert.equal(stopped.error.code,'STEP.CHECK_FAILED',JSON.stringify(stopped.error));
     assert.equal(stopped.error.stepId,'receipt');
     assert.equal(stopped.last_completed_step,'quote');
     assert.equal(stopped.next_unstarted_step,'s3');
     assert.equal(stopped.steps.length,2);
-    assert.ok(stopped.steps[1].elapsed_ms>=100);
+    assert.ok(stopped.steps[1].elapsed_ms>=mismatch.within_ms-2);
     assert.ok(stopped.elapsed_ms>=stopped.steps[1].elapsed_ms);
     assert.match(stopped.error.message,/billed/);
     assert.equal(await page.cdp.eval('window.orders'),1);

@@ -3,6 +3,7 @@ use aad_control::steps::{self, App, Check, Input, Step};
 use aad_control::*;
 use aad_runtime::Provider;
 use serde_json::{json, Map, Value};
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -12,6 +13,12 @@ struct Fake {
     /// How many more observations show the "Saved" text twice, as an
     /// accessibility tree can while it changes.
     twins: Mutex<usize>,
+    observations: Mutex<VecDeque<ObservationReply>>,
+}
+enum ObservationReply {
+    Snapshot,
+    Fail(&'static str),
+    FailAtDeadline(&'static str),
 }
 fn resource(id: &str, name: &str, metadata: Value) -> BackendResource {
     BackendResource {
@@ -52,7 +59,18 @@ impl Backend for Fake {
             ),
         ])
     }
-    fn observe(&self, _: &Value, _: usize, _: Duration) -> Result<Value> {
+    fn observe(&self, _: &Value, _: usize, timeout: Duration) -> Result<Value> {
+        let reply = self.observations.lock().unwrap().pop_front();
+        match reply {
+            Some(ObservationReply::FailAtDeadline(code)) => {
+                std::thread::sleep(timeout);
+                return Err(error(code, "fixture observation failed"));
+            }
+            Some(ObservationReply::Fail(code)) => {
+                return Err(error(code, "fixture observation failed"))
+            }
+            _ => {}
+        }
         let clicked = !self.acted.lock().unwrap().is_empty();
         let mut nodes = vec![
             json!({"node_id": "n1", "role": "button", "name": "Save", "actions": ["click", "drag"]}),
@@ -81,6 +99,7 @@ fn session() -> (Arc<Session>, Arc<Fake>) {
     let backend = Arc::new(Fake {
         acted: Mutex::new(Vec::new()),
         twins: Mutex::new(0),
+        observations: Mutex::default(),
     });
     let session = Session::new(
         vec![backend.clone()],
@@ -143,6 +162,49 @@ fn reads_named_fields_in_a_read_only_session() {
             .error
             .unwrap()["code"],
         "CONTROL.FIELD_UNAVAILABLE"
+    );
+}
+
+#[test]
+fn read_deadline_preserves_the_last_observed_mismatch() {
+    use ObservationReply::*;
+
+    let step: Step = serde_json::from_value(json!({
+        "id":"receipt","app":{"provider":"fixture","title":"notes.txt"},
+        "read":[{"as":"billed","locator":{"name":"Save"},"property":"name"}],
+        "expect":{"billed":"expected"},"within_ms":300
+    }))
+    .unwrap();
+    let run = |replies: Vec<ObservationReply>, timeout| {
+        let (session, backend) = session();
+        *backend.observations.lock().unwrap() = replies.into();
+        let err = steps::perform(&session, &step, &Map::new(), timeout).unwrap_err();
+        assert!(backend.observations.lock().unwrap().is_empty());
+        err
+    };
+    let timeout = Duration::from_secs(2);
+    let mismatch = run(vec![Snapshot, FailAtDeadline("CONTROL.TIMEOUT")], timeout);
+    assert_eq!(mismatch.code, "STEP.CHECK_FAILED");
+    assert!(mismatch.message.contains("billed"));
+    assert_eq!(
+        run(vec![FailAtDeadline("CONTROL.TIMEOUT")], timeout).code,
+        "CONTROL.TIMEOUT"
+    );
+    assert_eq!(
+        run(vec![Snapshot, Fail("CONTROL.TIMEOUT")], timeout).code,
+        "CONTROL.TIMEOUT"
+    );
+    assert_eq!(
+        run(vec![Snapshot, FailAtDeadline("BROWSER.CDP_ERROR")], timeout).code,
+        "BROWSER.CDP_ERROR"
+    );
+    assert_eq!(
+        run(
+            vec![Snapshot, FailAtDeadline("CONTROL.TIMEOUT")],
+            Duration::from_millis(225)
+        )
+        .code,
+        "CONTROL.TIMEOUT"
     );
 }
 

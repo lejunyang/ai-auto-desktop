@@ -434,7 +434,7 @@ pub(crate) fn http_get_cancellable(
         }
         deadline
             .checked_duration_since(std::time::Instant::now())
-            .ok_or_else(|| CdpError::connect("HTTP deadline elapsed"))
+            .ok_or(CdpError::TransportTimeout("HTTP deadline elapsed"))
     };
     let address = std::net::SocketAddr::from(([127, 0, 0, 1], port));
     let mut stream = crate::tcp::connect(address, deadline, cancel, "http")?;
