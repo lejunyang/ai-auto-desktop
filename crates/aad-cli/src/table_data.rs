@@ -7,6 +7,8 @@ use std::fs::OpenOptions;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
+mod workbook;
+
 type Result<T> = std::result::Result<T, String>;
 type Record = BTreeMap<String, String>;
 const MAX_FILE: u64 = 16 * 1024 * 1024;
@@ -22,10 +24,20 @@ pub enum TableCommand {
 
 #[derive(Subcommand)]
 pub enum CsvCommand {
-    /// Write a complete collection to a new UTF-8 CSV file.
+    /// Write a complete collection or a rectangular XLSX range to a new UTF-8 CSV file.
     Export {
-        #[arg(long)]
-        input: PathBuf,
+        #[arg(
+            long,
+            required_unless_present = "workbook",
+            conflicts_with = "workbook"
+        )]
+        input: Option<PathBuf>,
+        #[arg(long, requires_all = ["sheet","range"])]
+        workbook: Option<PathBuf>,
+        #[arg(long, requires = "workbook")]
+        sheet: Option<String>,
+        #[arg(long, requires = "workbook")]
+        range: Option<String>,
         #[arg(long)]
         output: PathBuf,
     },
@@ -169,7 +181,10 @@ fn index<'a>(rows: &'a [Record], key: &str) -> Result<BTreeMap<&'a str, &'a Reco
     Ok(keyed)
 }
 
-fn export(data: &Dataset, path: &Path) -> Result<Value> {
+fn write_csv(
+    path: &Path,
+    rows: impl FnOnce(&mut csv::Writer<&mut std::fs::File>) -> Result<()>,
+) -> Result<()> {
     let parent = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -179,6 +194,16 @@ fn export(data: &Dataset, path: &Path) -> Result<Value> {
         let mut writer = csv::WriterBuilder::new()
             .terminator(csv::Terminator::CRLF)
             .from_writer(tmp.as_file_mut());
+        rows(&mut writer)?;
+        writer.flush().map_err(|e| e.to_string())?;
+    }
+    tmp.persist_noclobber(path)
+        .map_err(|e| format!("cannot create {}: {e}", path.display()))?;
+    Ok(())
+}
+
+fn export(data: &Dataset, path: &Path) -> Result<Value> {
+    write_csv(path, |writer| {
         writer
             .write_record(&data.columns)
             .map_err(|e| e.to_string())?;
@@ -187,10 +212,8 @@ fn export(data: &Dataset, path: &Path) -> Result<Value> {
                 .write_record(data.columns.iter().map(|c| &row[c]))
                 .map_err(|e| e.to_string())?;
         }
-        writer.flush().map_err(|e| e.to_string())?;
-    }
-    tmp.persist_noclobber(path)
-        .map_err(|e| format!("cannot create {}: {e}", path.display()))?;
+        Ok(())
+    })?;
     Ok(json!({"output":path,"rows":data.row_count,"columns":data.columns}))
 }
 
@@ -438,7 +461,19 @@ pub fn collect(args: &CollectArgs) -> Result<Value> {
 
 pub fn csv(command: &CsvCommand) -> Result<Value> {
     match command {
-        CsvCommand::Export { input, output } => export(&Dataset::load(input)?, output),
+        CsvCommand::Export {
+            input,
+            workbook,
+            sheet,
+            range,
+            output,
+        } => match (input, workbook, sheet, range) {
+            (Some(input), None, None, None) => export(&Dataset::load(input)?, output),
+            (None, Some(book), Some(sheet), Some(range)) => {
+                workbook::export(book, sheet, range, output)
+            }
+            _ => Err("provide --input or --workbook with --sheet and --range".into()),
+        },
         CsvCommand::Compare {
             input,
             csv,

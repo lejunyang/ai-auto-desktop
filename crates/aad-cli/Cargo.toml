@@ -25,6 +25,9 @@ aad-platform = { workspace = true }
 clap = { workspace = true }
 shlex = { workspace = true }
 csv = "1.4"
+calamine = "0.38"
+quick-xml = "0.42"
+zip = { version = "9", default-features = false, features = ["deflate"] }
 tempfile = "3"
 serde = { workspace = true }
 serde_json = { workspace = true }
