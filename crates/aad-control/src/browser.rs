@@ -176,7 +176,7 @@ const MAX_CHILD_FRAMES: usize = 64;
 struct Page {
     connection_failed: bool,
     client: Client,
-    websocket: String,
+    target: Target,
     /// The JavaScript dialog blocking this page, as the browser announced it.
     dialog: Option<Value>,
     /// The main frame id the last frame tree reported.
@@ -669,7 +669,7 @@ impl BrowserBackend {
     ) -> Result<&'a mut Page> {
         if pages
             .get(&target.id)
-            .is_some_and(|page| page.websocket != target.webSocketDebuggerUrl)
+            .is_some_and(|page| page.target.webSocketDebuggerUrl != target.webSocketDebuggerUrl)
         {
             pages.remove(&target.id);
         }
@@ -760,7 +760,7 @@ impl BrowserBackend {
                 Page {
                     connection_failed: false,
                     client,
-                    websocket: target.webSocketDebuggerUrl.clone(),
+                    target: target.clone(),
                     dialog: None,
                     main_frame: None,
                     drag: None,
@@ -2161,6 +2161,7 @@ impl Backend for BrowserBackend {
             "accept",
             "dismiss",
             "upload",
+            "choose_files",
             "emulate",
             "clear_site_data",
         ]
@@ -2660,6 +2661,15 @@ impl Backend for BrowserBackend {
             if let Action::Upload {files}=action {
                 return upload(client,&context,&args,node,files,action_context);
             }
+            if let Action::ChooseFiles {files}=action {
+                args["file_count"]=json!(files.len());
+                if node["actions"].as_array().is_some_and(|actions|actions.iter().any(|name|name=="upload")) {
+                    return upload(client,&context,&args,node,files,action_context);
+                }
+                let child=context.session.as_ref().map(|id|state.children.get(id).map(String::as_str)
+                    .ok_or_else(||error("CONTROL.STALE_TARGET","picker target detached"))).transpose()?;
+                return choose_files(client,&state.target,child,&context,&args,files,action_context);
+            }
             if TAB_ACTIONS.contains(&action.name()) {
                 // Anchored like navigation: the observed document must still be there.
                 checked(eval(client,&context,format!("globalThis.__aadControlV1.confirm({args})"))?)?;
@@ -2684,9 +2694,15 @@ impl Backend for BrowserBackend {
         match result {
             // The input was delivered and the page answered it with a dialog,
             // which now blocks it: the next observation shows the dialog.
-            Err(e) if e.code == "CONTROL.DIALOG_OPEN" && e.effect != "not_applied" => Ok(
-                json!({"submitted": true, "native_operation": action.name(), "dialog_opened": true}),
-            ),
+            Err(e)
+                if e.code == "CONTROL.DIALOG_OPEN"
+                    && e.effect != "not_applied"
+                    && !matches!(action, Action::ChooseFiles { .. }) =>
+            {
+                Ok(
+                    json!({"submitted": true, "native_operation": action.name(), "dialog_opened": true}),
+                )
+            }
             other => other,
         }
     }
@@ -3689,6 +3705,152 @@ fn drag(
         })
 }
 
+fn choose_files(
+    client: &mut Client,
+    target: &Target,
+    child: Option<&str>,
+    context: &Ctx,
+    args: &Value,
+    files: &[String],
+    action: &crate::Context,
+) -> Result<Value> {
+    const INTERCEPT: &str = "Page.setInterceptFileChooserDialog";
+    const OPENED: &str = "Page.fileChooserOpened";
+    let refused = || {
+        error(
+            "CONTROL.STALE_TARGET",
+            "could not attribute one current file input to the observed trigger",
+        )
+    };
+    checked(eval(
+        client,
+        context,
+        format!("globalThis.__aadControlV1.confirm({args})"),
+    )?)?;
+    let deadline = Instant::now() + action.remaining()?;
+    let mut watch = Client::attach_bare_until(target, deadline).map_err(cdp_error)?;
+    watch.set_deadline(deadline);
+    watch.filter_events(
+        &[
+            OPENED,
+            "Page.frameNavigated",
+            "Page.navigatedWithinDocument",
+            "Page.frameRequestedNavigation",
+            "Page.frameStartedNavigating",
+            "Page.frameDetached",
+            "Page.documentOpened",
+        ],
+        &[],
+    );
+    let session = context.session.as_deref();
+    let watch_session = if let Some(child) = child {
+        Some(
+            command(
+                &mut watch,
+                "Target.attachToTarget",
+                json!({"targetId":child,"flatten":true}),
+            )?["sessionId"]
+                .as_str()
+                .ok_or_else(refused)?
+                .to_owned(),
+        )
+    } else {
+        None
+    };
+    let watcher = watch_session.as_deref();
+    run(&mut watch, watcher, "Page.enable", json!({}))?;
+    run(
+        &mut watch,
+        watcher,
+        INTERCEPT,
+        json!({"enabled":true,"cancel":true}),
+    )?;
+    let group = uuid::Uuid::new_v4().to_string();
+    let result = (|| {
+        let click = (|| {
+            context.commit_input(client)?;
+            run(
+                client,
+                session,
+                "Runtime.evaluate",
+                json!({"expression":format!("globalThis.__aadControlV1.begin_picker({args})"),
+                "contextId":context.id,"userGesture":true,"objectGroup":group}),
+            )
+        })();
+        watch.set_deadline(Instant::now() + Duration::from_millis(500));
+        let disarmed = run(&mut watch, watcher, INTERCEPT, json!({"enabled":false}));
+        let click = click?;
+        disarmed?;
+        let witness = click["result"]["objectId"]
+            .as_str()
+            .filter(|_| click["result"]["type"] == "function")
+            .ok_or_else(refused)?;
+        let batch = watch.drain_events();
+        let [event] = batch.events.as_slice() else {
+            return Err(refused());
+        };
+        if batch.failure.is_some()
+            || batch.dropped != 0
+            || event["method"] != OPENED
+            || event["sessionId"].as_str() != watcher
+            || event["params"]["frameId"] != args["frame_id"]
+        {
+            return Err(refused());
+        }
+        let backend_id = event["params"]["backendNodeId"]
+            .as_i64()
+            .ok_or_else(refused)?;
+        let multiple = match event["params"]["mode"].as_str() {
+            Some("selectMultiple") => true,
+            Some("selectSingle") if files.len() == 1 => false,
+            Some("selectSingle") => {
+                return Err(error(
+                    "CONTROL.INVALID_REQUEST",
+                    "this file chooser takes one file",
+                ))
+            }
+            _ => return Err(refused()),
+        };
+        let resolved = run(
+            client,
+            session,
+            "DOM.resolveNode",
+            json!({"backendNodeId":backend_id,"executionContextId":context.id,"objectGroup":group}),
+        )?;
+        let opened = resolved["object"]["objectId"]
+            .as_str()
+            .filter(|_| resolved["object"]["subtype"] == "node")
+            .ok_or_else(refused)?;
+        context.check_input(client)?;
+        let verified = run(
+            client,
+            session,
+            "Runtime.callFunctionOn",
+            json!({"objectId":witness,
+            "functionDeclaration":"function(input, mode) { return this(input, mode); }",
+            "arguments":[{"objectId":opened},{"value":multiple}], "returnByValue":true}),
+        )?;
+        if evaluated(verified)? != true {
+            return Err(refused());
+        }
+        let late = watch.drain_events();
+        if late.failure.is_some() || late.dropped != 0 || !late.events.is_empty() {
+            return Err(refused());
+        }
+        action.remaining()?;
+        set_file_input(client, session, opened, files)
+    })();
+    client.set_deadline(Instant::now() + Duration::from_millis(500));
+    let _ = run(
+        client,
+        session,
+        "Runtime.releaseObjectGroup",
+        json!({"objectGroup":group}),
+    );
+    client.set_deadline(deadline);
+    result
+}
+
 /// Files into the observed file input. The session has already resolved the
 /// paths under the server's upload grant; the page never names a path.
 fn upload(
@@ -3726,13 +3888,7 @@ fn upload(
     let result = (|| {
         context.check_input(client)?;
         action_context.commit()?;
-        run(
-            client,
-            session,
-            "DOM.setFileInputFiles",
-            json!({"files": files, "objectId": object}),
-        )
-        .map_err(|e| e.with_effect("unknown"))
+        set_file_input(client, session, &object, files)
     })();
     let _ = run(
         client,
@@ -3740,7 +3896,22 @@ fn upload(
         "Runtime.releaseObject",
         json!({"objectId": object}),
     );
-    result?;
+    result
+}
+
+fn set_file_input(
+    client: &mut Client,
+    session: Option<&str>,
+    object: &str,
+    files: &[String],
+) -> Result<Value> {
+    run(
+        client,
+        session,
+        "DOM.setFileInputFiles",
+        json!({"files": files, "objectId": object}),
+    )
+    .map_err(|e| e.with_effect("unknown"))?;
     Ok(
         json!({"submitted": true, "native_operation": "DOM.setFileInputFiles", "files": files.len()}),
     )

@@ -295,6 +295,9 @@ pub enum Action {
     Upload {
         files: Vec<String>,
     },
+    ChooseFiles {
+        files: Vec<String>,
+    },
     /// Emulate a device class and/or colour scheme on the observed page, for
     /// as long as this session's connection to it lasts.
     Emulate {
@@ -329,7 +332,7 @@ pub enum ColorScheme {
 pub const MAX_UPLOAD_FILES: usize = 32;
 pub const MAX_FIND_LOCATORS: usize = 32;
 
-pub const ACTION_NAMES: [&str; 30] = [
+pub const ACTION_NAMES: [&str; 31] = [
     "focus",
     "invoke",
     "click",
@@ -358,6 +361,7 @@ pub const ACTION_NAMES: [&str; 30] = [
     "accept",
     "dismiss",
     "upload",
+    "choose_files",
     "emulate",
     "clear_site_data",
 ];
@@ -438,6 +442,7 @@ impl Action {
             Self::Accept { .. } => "accept",
             Self::Dismiss {} => "dismiss",
             Self::Upload { .. } => "upload",
+            Self::ChooseFiles { .. } => "choose_files",
             Self::Emulate { .. } => "emulate",
             Self::ClearSiteData {} => "clear_site_data",
         }

@@ -2,6 +2,7 @@
   if (globalThis.__aadControlV1) return true;
   const documentToken = NONCE;
   let observation = null;
+  let observedUrl = null;
   let nodes = new Map();
   let scopeRoot = null, scopeInvalid = false, scopeNeedsValidation = false;
   let scopeParents = [], scopeElements = [], scopeIdentity = null;
@@ -114,16 +115,20 @@
   // focus() exists on all HTMLElements, including divs that cannot take focus.
   // Explicit negative tabindex still permits programmatic focus.
   const focusable = el => typeof el.focus==='function' && (el.tabIndex>=0 || el.hasAttribute('tabindex') || el.isContentEditable || activeElement()===el);
+  const pickerInput = el => el instanceof HTMLInputElement && fileInput(el) && el.isConnected &&
+    el.ownerDocument===document && enabled(el) && !el.matches(':disabled') && !protectedNode(el) &&
+    !el.webkitdirectory && !el.hasAttribute('directory') && (!scopeRoot || inside(scopeRoot,el));
   const actions = el => {
     if (!enabled(el)) return [];
     if (protectedNode(el)) return password(el) && !el.readOnly ? ['secret_input'] : [];
-    if (fileInput(el)) return ['upload'];
+    if (fileInput(el)) return pickerInput(el) ? ['upload','choose_files'] : ['upload'];
     const result=[];
     if (focusable(el)) result.push('focus','key');
     // Delegated listeners (including React) are invisible in our isolated world.
     // The rendered pointer affordance also identifies their clickable elements;
     // check() rechecks this capability and the observed identity before input.
     if ((surface(el) || ['BUTTON','A','INPUT','SELECT'].includes(el.tagName) || el.onclick || roleOf(el)==='button' || checkable(el) || cursorMarks(el, /^pointer$/)) && typeof el.click==='function') result.push('click','hover');
+    if (result.includes('click') && !surface(el)) result.push('choose_files');
     if (editable(el)) result.push('fill','type_text');
     if (el.tagName==='SELECT' && !el.multiple) result.push('select');
     if (checkable(el)) result.push('check');
@@ -158,7 +163,7 @@
       return found && present(found.el) && fingerprint(found.el)===found.fingerprint ? found.el : null;
     },
     observe: (id,limit,scopeId=null,elementRoot=null) => {
-      observation=id; nodes=new Map();
+      observation=id; observedUrl=location.href; nodes=new Map();
       scopeObserver.disconnect(); scopeRoot=null; scopeInvalid=false; scopeNeedsValidation=false;
       scopeParents=[]; scopeElements=[]; scopeIdentity=elementRoot===null?scopeId:null;
       if (scopeId !== null) {
@@ -360,7 +365,29 @@
     },
     // The checked element itself, by reference, for a protocol call that needs the node.
     element: args => {
-      const found=check(args); return found.error ? null : found.el;
+      const found=check(args); if(found.error)return null;
+      if(args.action==='choose_files' && (location.href!==observedUrl || !pickerInput(found.el) ||
+         (args.file_count>1 && !found.el.multiple)))return null;
+      return found.el;
+    },
+    begin_picker: args => {
+      const found=check(args);
+      if(found.error || found.el.ownerDocument!==document || location.href!==observedUrl || fileInput(found.el))return null;
+      let clicks=0, input, activation, identity, multiple;
+      const witness=event=>{
+        const target=event.composedPath()[0];
+        if(!(target instanceof HTMLInputElement) || !fileInput(target))return;
+        clicks++;
+        if(pickerInput(target)) {
+          input=target; activation=event; identity=fingerprint(input); multiple=input.multiple;
+        }
+      };
+      window.addEventListener('click',witness,true);
+      try { found.el.click(); } finally { window.removeEventListener('click',witness,true); }
+      if(clicks!==1 || !input || activation.defaultPrevented)return null;
+      return (opened,mode)=>opened===input && !check(args).error && found.el.ownerDocument===document && location.href===observedUrl &&
+        pickerInput(input) && fingerprint(input)===identity && input.multiple===multiple &&
+        multiple===mode && (multiple || args.file_count===1);
     },
     // The element's box in page CSS pixels, scrolled into view, for a screenshot.
     rect: args => {

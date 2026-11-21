@@ -573,7 +573,7 @@ impl Backend for Uploader {
         "uploader"
     }
     fn capabilities(&self) -> Vec<String> {
-        vec!["upload".into()]
+        vec!["upload".into(), "choose_files".into()]
     }
     fn resources(&self, _: Duration) -> Result<Vec<BackendResource>> {
         Ok(vec![BackendResource {
@@ -590,12 +590,12 @@ impl Backend for Uploader {
     }
     fn observe(&self, _: &Value, _: usize, _: Duration) -> Result<Value> {
         Ok(
-            json!({"nodes": [{"node_id":"file", "role":"button", "name":"Attach", "actions":["upload"]}], "truncated": false}),
+            json!({"nodes": [{"node_id":"file", "role":"button", "name":"Attach", "actions":self.capabilities()}], "truncated": false}),
         )
     }
     fn act(&self, _: &Value, _: &Value, action: &Action, context: &Context) -> Result<Value> {
         context.commit()?;
-        if let Action::Upload { files } = action {
+        if let Action::Upload { files } | Action::ChooseFiles { files } = action {
             self.files.lock().unwrap().push(files.clone());
         }
         Ok(json!({}))
@@ -604,6 +604,15 @@ impl Backend for Uploader {
 
 #[test]
 fn uploads_name_only_existing_files_under_the_server_grant() {
+    check_file_grant(|files| Action::Upload { files });
+}
+
+#[test]
+fn choose_files_uses_the_same_server_grant() {
+    check_file_grant(|files| Action::ChooseFiles { files });
+}
+
+fn check_file_grant(make_action: fn(Vec<String>) -> Action) {
     let allowed = std::env::temp_dir().join(format!("aad-grant-{}", uuid::Uuid::new_v4()));
     let outside = std::env::temp_dir().join(format!("aad-outside-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(allowed.join("sub")).unwrap();
@@ -645,7 +654,7 @@ fn uploads_name_only_existing_files_under_the_server_grant() {
             Operation::Act {
                 verify: None,
                 target,
-                action: Action::Upload { files },
+                action: make_action(files),
             },
         )
     };
@@ -677,12 +686,25 @@ fn uploads_name_only_existing_files_under_the_server_grant() {
             "CONTROL.FILE_NOT_FOUND",
         ),
         (vec![], "CONTROL.INVALID_REQUEST"),
+        (
+            vec![inside.clone(); MAX_UPLOAD_FILES + 1],
+            "CONTROL.INVALID_REQUEST",
+        ),
+        (vec!["bad\npath".into()], "CONTROL.INVALID_REQUEST"),
     ] {
         let response = upload(&granted, files);
         assert_eq!(response.commit_state, CommitState::NotCommitted);
         assert_eq!(response.error.unwrap()["code"], code);
     }
     assert!(backend.files.lock().unwrap().is_empty());
+    #[cfg(unix)]
+    {
+        let link = allowed.join("outside-link");
+        std::os::unix::fs::symlink(outside.join("b.txt"), &link).unwrap();
+        let escaped = upload(&granted, vec![link.display().to_string()]);
+        assert_eq!(escaped.error.unwrap()["code"], "POLICY.DENIED");
+        assert!(backend.files.lock().unwrap().is_empty());
+    }
     assert!(upload(&granted, vec![inside]).error.is_none());
     let handed = backend.files.lock().unwrap()[0][0].clone();
     // The provider gets the resolved path, in a form a browser accepts.

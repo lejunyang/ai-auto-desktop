@@ -21,6 +21,8 @@ use std::time::{Duration, Instant};
 mod access_cases;
 #[path = "browser_cases/inflight.rs"]
 mod inflight_cases;
+#[path = "browser_cases/picker.rs"]
+mod picker_cases;
 #[path = "browser_cases/table.rs"]
 mod table_cases;
 
@@ -3534,7 +3536,7 @@ fn uploads_reach_file_inputs_only_from_allowed_directories() {
     assert!(ready.error.is_none(), "{ready:?}");
     let observed = observe(&session, &main);
     // A file input takes files and nothing else.
-    assert_eq!(actions(&observed, "Attachment"), vec!["upload".to_string()]);
+    assert_eq!(actions(&observed, "Attachment"), ["upload", "choose_files"]);
     assert_eq!(node(&observed, "Hidden upload")["states"]["hidden"], true);
     let input = find(&session, &observed, "button", "Attachment");
     let fill = act(

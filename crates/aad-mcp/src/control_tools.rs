@@ -59,6 +59,8 @@ fn hold_schema(description: &str) -> Value {
 }
 
 fn action_schema() -> Value {
+    let files = json!({"files": {"type": "array", "minItems": 1, "maxItems": 32,
+        "items": {"type": "string", "minLength": 1, "maxLength": 4096}}});
     let variant = |name: &str, description: &str, properties: Value, required: &[&str]| {
         let mut all = Map::from_iter([("type".to_string(), json!({"const": name}))]);
         all.extend(properties.as_object().unwrap().clone());
@@ -212,12 +214,11 @@ fn action_schema() -> Value {
     offered even when the page hides it behind a styled button), firing its change event; no \
     file chooser opens. Absolute paths of existing files under a directory the server \
     operator allowed (control_capabilities lists them as upload_dirs); anything else is \
-    refused. Several files only where the input takes several.", json!({
-            "files": {
-                "type": "array", "minItems": 1, "maxItems": 32,
-                "items": {"type": "string", "minLength": 1, "maxLength": 4096}
-            }
-        }), &["files"]),
+    refused. Several files only where the input takes several.", files.clone(), &["files"]),
+        variant("choose_files", "Select granted local files on an observed Chromium file input \
+    (including hidden inputs), or click an observed trigger that synchronously activates one \
+    connected file input in the same frame. Absolute file paths under upload_dirs only; \
+    multiple files require a multiple input. Directory pickers are not supported.", files, &["files"]),
         variant("emulate", "Emulate a device class and/or colour scheme on the observed \
     browser page, offered on its document node of the main frame. Lasts while this session's \
     connection to the page does; reset returns to the browser's own window.", json!({

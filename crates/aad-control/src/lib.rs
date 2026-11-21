@@ -1385,6 +1385,12 @@ impl Session {
                         };
                         &resolved
                     }
+                    Action::ChooseFiles { files } => {
+                        resolved = Action::ChooseFiles {
+                            files: self.upload_files(files)?,
+                        };
+                        &resolved
+                    }
                     other => other,
                 };
                 let observed = |id: &str| {
@@ -2398,7 +2404,7 @@ fn validate_action(action: &Action, access: &browser_access::BrowserAccess) -> R
     if matches!(action, Action::Paste { text } if text.is_empty()) {
         return Err(error("CONTROL.INVALID_REQUEST", "paste needs some text"));
     }
-    if let Action::Upload { files } = action {
+    if let Action::Upload { files } | Action::ChooseFiles { files } = action {
         if files.is_empty()
             || files.len() > MAX_UPLOAD_FILES
             || files
