@@ -87,7 +87,7 @@ aad review ./draft-run-001.ndjson
 
 | 任务 | 现在能做什么 | 卡在哪里 |
 |---|---|---|
-| 浏览器已经弹出“打开文件”或“另存为” | `aad browser choose-files` 选择普通附件，附加 `--native-file` 可选一个文件交给网页的文件句柄 API。`aad browser save-as` 选择新文件路径。三个流程已在 X11 和原生 KWin Wayland 的 GTK portal 读回内容。X11 的浏览器自带 GTK 4 窗口也已写出新文件。[平台条件与用法](browser-recording.md#在已经打开的文件选择器里选文件) | Windows 标准对话框和 macOS AppKit 面板已接入，**[待验证]** 需要相应系统的交互桌面。系统目录选择器的接管、录制时自动生成另存为步骤仍有缺口。 |
+| 浏览器已经弹出“打开文件”或“另存为” | `aad browser choose-files` 选择普通附件，附加 `--native-file` 可选一个文件交给网页的文件句柄 API。`aad browser save-as` 选择新文件路径。三个流程已在 X11 的 GTK portal 和 KWin Wayland 的 GTK、KDE portal 读回内容。X11 的浏览器自带 GTK 4 窗口也已写出新文件。[平台条件与用法](browser-recording.md#在已经打开的文件选择器里选文件) | Windows 标准对话框和 macOS AppKit 面板已接入，**[待验证]** 需要相应系统的交互桌面。系统目录选择器的接管、录制时自动生成另存为步骤仍有缺口。 |
 | 从后台导出昨天的账单，交给下一步处理 | 在页面创建任务并读任务号，按号等待完成，下载并验证到手的文件。CSV 可以和预期账单逐笔比日期、金额，再把文件路径交给下游。[导出账单](browser-download-export.md) | 每个网站需要提供任务行、就绪状态和下载控件的定位。 |
 | 第 80 单提交后断网，第二天接着处理 | 从第一次运行用 `--recovery-log`，中断后[按业务键或显式回执续跑](workflow-recovery.md)，不再派发已确认动作 | 需要业务端独立回执；普通 NDJSON 日志只能复查，查不到订单不能当作未提交。 |
 | 从复杂报表或本地工作簿取数 | Chromium 可读多层表头、语义网格，以及给出行列布局的可见等宽等高画布网格。后者逐格返回 OCR 文本和置信度。CSV 导出可读已保存的 XLSX，也可指定运行中的 Windows Excel 窗口、工作表和区域。Linux 可读运行中的 GTK 表格。[画布网格](testing/canvas-grid-ocr.md) · [XLSX 区域](workbook-csv.md) · [Excel 未保存数据](live-excel-csv.md) · [GTK](linux-atspi-table.md) | 自由布局画布、需要滚动取全的纯画布和低置信度单元格仍需人工判断。**[待验证]** Windows 桌面 Excel 的实际导出，以及 Qt 和 LibreOffice Calc 的原生表格。 |

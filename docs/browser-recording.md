@@ -208,12 +208,14 @@ aad browser save-as --cdp-port 9222 --page $page --allow-input --allow-save-dir 
 
 | 平台 | 窗口与使用条件 |
 |---|---|
-| Linux Wayland | 已在 KWin 上跑通 Chromium 和 GTK 桌面 portal 的附件、原生文件句柄和另存为。请给该任务单独开一个浏览器实例，只留一个标签页。GTK portal 通过 D-Bus 提供请求归属，通常没有可传给 `--window` 的数字 ID。 |
+| Linux Wayland | 已在 KWin 上分别用 GTK 和 KDE 文件窗口跑通附件、原生文件句柄和另存为。请给任务单独开一个浏览器实例，只留一个标签页。桌面 portal 通过 D-Bus 标识请求和浏览器进程，调用时省略 `--window`。 |
 | Linux X11 | 附件覆盖 GTK 3、GTK 4 和 GTK portal。GTK portal 已验证原生文件句柄，以及网页实际写出新文件。可通过 `--window` 额外指定 XID。 |
 | Windows | 接管 Chromium 所属的前台标准“打开／另存为”窗口，可通过 `--window` 指定 HWND。使用本地盘的普通文件，另存为时带完整扩展名。**[待验证]** 需要交互式 Windows 桌面。[Windows 浏览器用例](../tests/windows/native-browser-picker.test.mjs) |
 | macOS | 接管挂在浏览器窗口上的 AppKit 文件面板。原生打开模式需要在列表中看到带完整路径的文件行。保存支持当前目录，或面板能识别并直接打开的可见目录，保留建议扩展名。**[待验证]** 需要已授予辅助功能权限的 Mac。[AppKit 用例](../crates/aad-macos/tests/browser_picker.rs) |
 
 原生文件句柄和另存为都需要能唯一确定发起者。请将页面放在单标签窗口内，使用没有子 frame 的页面。Windows、macOS 和 X11 通过浏览器窗口区分发起者，其他独立窗口可以打开带跨站 iframe 的页面。Wayland 的 portal 通过浏览器进程区分发起者，需要使用单页面浏览器实例。HTML 附件模式通过网页上已弹出选择器的文件控件确定目标。来自 `file://` 的网页还需要用 `--allow-browser-file-dir` 单独授权页面所在目录。[Linux 浏览器用例](../tests/browser/native-portal-picker.test.mjs)
+
+KDE 文件窗口须在前台，焦点在“名称”框内。原生打开和另存为支持路径分量中的中英文字母、数字、点、下划线、短横线和内嵌空格。另存为时若窗口勾选了自动扩展名，请先取消勾选，再传入带目标扩展名的文件名。可用 `tests/linux/verify-browser-file-portal.ps1 -Desktop wayland -Backend kde` 在独立的 KWin 会话复现三个流程。[KDE 浏览器用例](../tests/browser/native-kde-picker.test.mjs)
 
 ## 完整性与当前边界
 
