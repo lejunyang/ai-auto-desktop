@@ -463,6 +463,8 @@ impl Context {
 
 pub struct Session {
     id: String,
+    #[cfg(target_os = "linux")]
+    upload_tree: Option<(std::path::PathBuf, aad_linux::upload_tree::Grant)>,
     policy: Policy,
     backends: BTreeMap<String, Arc<dyn Backend>>,
     failures: BTreeMap<String, Value>,
@@ -488,6 +490,8 @@ impl Session {
     pub fn new(backends: Vec<Arc<dyn Backend>>, policy: Policy) -> Self {
         Self {
             id: uuid::Uuid::new_v4().to_string(),
+            #[cfg(target_os = "linux")]
+            upload_tree: None,
             policy,
             backends: backends
                 .into_iter()
@@ -572,6 +576,53 @@ impl Session {
 
     pub fn native(policy: Policy) -> Self {
         Self::native_with_browser(policy, None)
+    }
+
+    /// Operator-only, one-shot Chromium folder selection, independent of ordinary file grants.
+    pub fn with_upload_tree(
+        self,
+        source: &std::path::Path,
+        stage: &std::path::Path,
+    ) -> Result<Self> {
+        if !self.policy.allow_input {
+            return Err(error(
+                "POLICY.DENIED",
+                "directory selection requires input permission",
+            ));
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let grant = aad_linux::upload_tree::Grant::new(source, stage)
+                .map_err(|err| error("POLICY.DENIED", format!("upload tree grant: {err}")))?;
+            let mut session = self;
+            session.upload_tree = Some((source.to_owned(), grant));
+            Ok(session)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (source, stage);
+            Err(error(
+                "CONTROL.ACTION_UNSUPPORTED",
+                "safe upload tree snapshots require Linux openat2",
+            ))
+        }
+    }
+
+    fn directory_selection(&self, files: &[String]) -> Result<(Vec<String>, Value)> {
+        #[cfg(target_os = "linux")]
+        if let (Some((source, grant)), [requested]) = (&self.upload_tree, files) {
+            if source == std::path::Path::new(requested) {
+                let (snapshot, manifest) = grant.snapshot().map_err(|err| {
+                    error("POLICY.DENIED", format!("upload tree snapshot: {err}"))
+                })?;
+                return Ok((vec![plain_path(&snapshot)], json!(manifest)));
+            }
+        }
+        let _ = files;
+        Err(error(
+            "POLICY.DENIED",
+            "select exactly the operator-granted upload tree",
+        ))
     }
 
     pub fn native_with_browser(policy: Policy, browser_port: Option<u16>) -> Self {
@@ -1365,6 +1416,16 @@ impl Session {
                 }
                 // Upload paths are resolved here, under the server's grant, so
                 // no provider ever sees a path outside it.
+                let observed = |id: &str| {
+                    observation.raw["nodes"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .find(|n| n["node_id"] == id)
+                        .ok_or_else(|| error("CONTROL.STALE_TARGET", "node was not observed"))
+                };
+                let mut node = observed(&target.node_id)?;
+                let mut folder_node;
                 let resolved;
                 let action = match action {
                     Action::Navigate { url } => {
@@ -1381,7 +1442,15 @@ impl Session {
                     }
                     Action::Upload { files } => {
                         resolved = Action::Upload {
-                            files: self.upload_files(files)?,
+                            files: if observation.provider == browser::PROVIDER && node["directory"] == true {
+                                let (paths,manifest)=self.directory_selection(files)?;
+                                folder_node=node.clone();
+                                folder_node["directory_manifest"]=manifest;
+                                node=&folder_node;
+                                paths
+                            } else {
+                                self.upload_files(files)?
+                            },
                         };
                         &resolved
                     }
@@ -1393,15 +1462,6 @@ impl Session {
                     }
                     other => other,
                 };
-                let observed = |id: &str| {
-                    observation.raw["nodes"]
-                        .as_array()
-                        .unwrap()
-                        .iter()
-                        .find(|n| n["node_id"] == id)
-                        .ok_or_else(|| error("CONTROL.STALE_TARGET", "node was not observed"))
-                };
-                let node = observed(&target.node_id)?;
                 let secret = if let Action::SecretInput { secret_ref } = action {
                     if !self.policy.allow_secret_input {
                         return Err(error("POLICY.DENIED", "secret input permission was not granted by the server operator"));

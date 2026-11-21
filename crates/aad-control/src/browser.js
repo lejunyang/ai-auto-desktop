@@ -240,7 +240,7 @@
   }
   const enabled = el => !el.disabled && !el.closest('[inert]') && el.getAttribute('aria-disabled') !== 'true';
   const editable = el => (['INPUT','TEXTAREA'].includes(el.tagName) || el.isContentEditable) && !el.readOnly && !protectedNode(el) && !fileInput(el);
-  const fingerprint = el => JSON.stringify([el.tagName,el.id,el.type||'',roleOf(el),labelOf(el),el.getAttribute('name'),el.getAttribute('href'),!!el.isContentEditable]);
+  const fingerprint = el => JSON.stringify([el.tagName,el.id,el.type||'',roleOf(el),labelOf(el),el.getAttribute('name'),el.getAttribute('href'),!!el.isContentEditable,fileInput(el) && el.webkitdirectory]);
   const checkable = el => (el.tagName==='INPUT' && ['checkbox','radio'].includes((el.type||'').toLowerCase())) || ['checkbox','switch','radio'].includes(el.getAttribute('role'));
   const checkedOf = el => el.tagName==='INPUT' ? !!el.checked : el.getAttribute('aria-checked')==='true';
   const radio = el => (el.type||'').toLowerCase()==='radio' || el.getAttribute('role')==='radio';
@@ -380,7 +380,7 @@
         if (closedRoots.has(el)) node.surface='closed_shadow';
         if (checkable(el)) node.states.checked=checkedOf(el);
         if (pickerOpen!==null) node.states.picker_open=pickerOpen;
-        if (fileInput(el)) { node.states.hidden=!visible(el); node.files=Array.from(el.files||[]).slice(0,32).map(f=>f.name.slice(0,256)); node.multiple=!!el.multiple; }
+        if (fileInput(el)) { node.states.hidden=!visible(el); node.files=Array.from(el.files||[]).slice(0,32).map(f=>f.name.slice(0,256)); node.multiple=!!el.multiple; if(el.webkitdirectory)node.directory=true; }
         if (el.tagName==='SELECT') node.options=Array.from(el.options).slice(0,100).map(o=>o.label.trim().slice(0,256));
         return node;
       });
@@ -521,9 +521,21 @@
     // The checked element itself, by reference, for a protocol call that needs the node.
     element: args => {
       const found=check(args); if(found.error)return null;
+      if(args.action==='upload' && found.el.webkitdirectory)found.previousFiles=found.el.files;
       if(args.action==='choose_files' && (location.href!==observedUrl || !pickerInput(found.el) ||
          (args.file_count>1 && !found.el.multiple)))return null;
       return found.el;
+    },
+    directory_result: args => {
+      if(args.document_token!==documentToken || args.observation!==observation)return {error:'CONTROL.STALE_TARGET'};
+      const found=nodes.get(args.node_id);
+      if(!found || !found.el.webkitdirectory)return {error:'CONTROL.STALE_TARGET'};
+      const files=found.el.files;
+      if(files===found.previousFiles || !files.length)return {ready:false};
+      if(files.length>512)return {error:'BROWSER.DIRECTORY_MISMATCH'};
+      const manifest=Object.fromEntries(Array.from(files,file=>[file.webkitRelativePath,file.size]));
+      if(Object.keys(manifest).length!==files.length)return {error:'BROWSER.DIRECTORY_MISMATCH'};
+      return {ready:true,files:files.length,manifest};
     },
     begin_picker: args => {
       const found=check(args);

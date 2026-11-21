@@ -3883,6 +3883,12 @@ fn upload(
     files: &[String],
     action_context: &crate::Context,
 ) -> Result<Value> {
+    if node["directory"] == true && (!node["directory_manifest"].is_object() || files.len() != 1) {
+        return Err(error(
+            "POLICY.DENIED",
+            "directory selection requires a verified snapshot",
+        ));
+    }
     if files.len() > 1 && node["multiple"] != true {
         return Err(error(
             "CONTROL.INVALID_REQUEST",
@@ -3910,7 +3916,41 @@ fn upload(
     let result = (|| {
         context.check_input(client)?;
         action_context.commit()?;
-        set_file_input(client, session, &object, files)
+        let result = set_file_input(client, session, &object, files)?;
+        if node["directory"] != true {
+            return Ok(result);
+        }
+        let deadline = Instant::now() + action_context.remaining()?.min(Duration::from_secs(5));
+        loop {
+            let state = eval(
+                client,
+                context,
+                format!("globalThis.__aadControlV1.directory_result({args})"),
+            )
+            .and_then(checked)
+            .map_err(|err| err.with_effect("unknown"))?;
+            if state["ready"] == true {
+                if state["manifest"] != node["directory_manifest"] {
+                    return Err(error(
+                        "BROWSER.DIRECTORY_MISMATCH",
+                        "the selected paths and sizes do not match the granted snapshot",
+                    )
+                    .with_effect("unknown"));
+                }
+                return Ok(
+                    json!({"submitted":true,"native_operation":"DOM.setFileInputFiles","directory":true,"files":state["files"]}),
+                );
+            }
+            action_context.remaining()?;
+            if Instant::now() >= deadline {
+                return Err(error(
+                    "BROWSER.DIRECTORY_UNCONFIRMED",
+                    "directory selection was dispatched but its FileList could not be confirmed",
+                )
+                .with_effect("unknown"));
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
     })();
     let _ = run(
         client,

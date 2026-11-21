@@ -28,6 +28,12 @@ pub struct Args {
     /// Permit selection of existing files under this directory. Repeatable.
     #[arg(long = "allow-upload-dir", value_name = "DIR")]
     upload_dirs: Vec<PathBuf>,
+    /// Allow this exact directory for one Chromium webkitdirectory upload (Linux).
+    #[arg(long, value_name="DIR", requires_all=["allow_input","upload_tree_stage"], conflicts_with="browser_bidi_port")]
+    allow_upload_tree: Option<PathBuf>,
+    /// Create a private snapshot here. Keep it until the page finishes reading; then remove it.
+    #[arg(long, value_name = "NEW_DIR", requires = "allow_upload_tree")]
+    upload_tree_stage: Option<PathBuf>,
     /// A JSON value available to the script as inputs.
     #[arg(long)]
     inputs: Option<String>,
@@ -69,6 +75,12 @@ pub fn run(args: &Args) -> Result<Value, Value> {
         cdp,
         args.browser_bidi_port,
     );
+    let session = match (&args.allow_upload_tree, &args.upload_tree_stage) {
+        (Some(source), Some(stage)) => session
+            .with_upload_tree(source, stage)
+            .map_err(|err| err.to_json())?,
+        _ => session,
+    };
     aad_mcp::browser_script::run(
         Arc::new(session),
         Script {
