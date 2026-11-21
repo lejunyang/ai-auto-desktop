@@ -75,7 +75,7 @@ aad review ./draft-run-001.ndjson
 | 录制质量 | 网页和指定桌面应用共用时间线，HTML 文件框的附件可在回放时更换；浏览器步骤可以查看对应的原始截图 | 录制目录选择和另存为、没有无障碍语义的自绘控件、原生同名行的稳定定位。 |
 | 审阅与维护 | 短 YAML、循环和分支、本地版本化子流程、运行日志；桌面编辑器可以对照录制截图和当前元素、修改定位并从选中步骤试跑 | 跨应用混合录制的完整图文时间轴、跨团队发布目录、自动提出定位修复建议。 |
 | 恢复 | 持久只读运行可暂停/恢复。写流程可在开始时启用恢复日志，中断后凭业务回执继续 | 需要业务方提供可靠回执。跨运行的全局去重和跨账号恢复仍需业务系统配合。 |
-| 浏览器覆盖 | Chromium 脚本可操作新打开的关联标签页并返回。Firefox 子 frame 支持聚焦、填值、触发按钮、勾选和选择列表 | Firefox 子 frame 的物理输入，WebKit 驱动，无语义的画布内部目标。 |
+| 浏览器覆盖 | Chromium 脚本可逐层进入授权弹窗，再逐层返回。Firefox 同源子页面支持已定位控件上的按键、指针和滚轮。WebKitGTK 可以打开指定 URL 并读取正文、标题、链接和按钮。 | Firefox 跨域或变形子页面的物理输入、WebKit 的写操作和脚本，以及自由布局画布里的控件操作。[Firefox 子页面条件](testing/firefox-frame-input.md) |
 | 原生系统 | Linux X11 真应用回读。原生 KWin Wayland 已实测 GTK 表单填写和保存。Windows 目标通过交叉检查 | **[待验证]** Windows 交互桌面、多屏 DPI、中文 IME；macOS AX/TCC、Secure Input 和本轮 Swift 录制。Wayland 物理键鼠、屏幕共享仍需接入授权的 portal。 |
 | 部署与脚本 | 本地/SSH 控制、输入租约、声明式步骤。CLI 和 MCP 都支持 JavaScript 通过 `page` 操作选定的标签页。工作流中的 Python 计算步骤由 `aad run --allow-scripts` 启用。 | 无人值守机器池、账号和会话调度、按次业务审批。 |
 
@@ -85,9 +85,9 @@ aad review ./draft-run-001.ndjson
 
 | 任务 | 现在能做什么 | 卡在哪里 |
 |---|---|---|
-| 浏览器已经弹出“打开文件”，中途接手续选附件 | Linux X11 的 Chromium 主页面支持 GTK 3、GTK 4 和 GTK 桌面 portal 的文件选择。Linux Chromium 脚本还可给 HTML 目录框选择一棵明确授权的目录树。[选文件与回放](browser-recording.md) · [目录用法](browser-script.md) | Windows、macOS、原生 Wayland 的已开窗口，以及另存为、File System Access API 需要各自支持。 |
+| 浏览器已经弹出“打开文件”或“另存为” | `aad browser choose-files` 选择普通附件，附加 `--native-file` 可选一个文件交给网页的文件句柄 API。`aad browser save-as` 选择新文件路径。三个流程已在 X11 和原生 KWin Wayland 的 GTK portal 读回内容。X11 的浏览器自带 GTK 4 窗口也已写出新文件。[平台条件与用法](browser-recording.md#在已经打开的文件选择器里选文件) | Windows 标准对话框和 macOS AppKit 面板已接入，**[待验证]** 需要相应系统的交互桌面。系统目录选择器的接管、录制时自动生成另存为步骤仍有缺口。 |
 | 从后台导出昨天的账单，交给下一步处理 | 在页面创建任务并读任务号，按号等待完成，下载并验证到手的文件。CSV 可以和预期账单逐笔比日期、金额，再把文件路径交给下游。[导出账单](browser-download-export.md) | 每个网站需要提供任务行、就绪状态和下载控件的定位。 |
 | 第 80 单提交后断网，第二天接着处理 | 从第一次运行用 `--recovery-log`，中断后[按业务键或显式回执续跑](workflow-recovery.md)，不再派发已确认动作 | 需要业务端独立回执；普通 NDJSON 日志只能复查，查不到订单不能当作未提交。 |
-| 从复杂报表或本地工作簿取数 | Chromium 能读多层合并表头和语义网格。已保存的 XLSX 可以指定工作表和区域导出 CSV。Linux 可以从运行中的 GTK 表格读取尚未保存的单元格。[网页表头路径](structured-table-headers.md) · [工作簿区域](workbook-csv.md) · [Linux 应用内表格](linux-atspi-table.md) | 纯画布网格和 Windows Excel 未保存的工作簿仍需专门支持。Linux 原生表格目前已在 GTK 3 验证，Qt 和 LibreOffice Calc 待验证。 |
+| 从复杂报表或本地工作簿取数 | Chromium 可读多层表头、语义网格，以及给出行列布局的可见等宽等高画布网格。后者逐格返回 OCR 文本和置信度。CSV 导出可读已保存的 XLSX，也可指定运行中的 Windows Excel 窗口、工作表和区域。Linux 可读运行中的 GTK 表格。[画布网格](testing/canvas-grid-ocr.md) · [XLSX 区域](workbook-csv.md) · [Excel 未保存数据](live-excel-csv.md) · [GTK](linux-atspi-table.md) | 自由布局画布、需要滚动取全的纯画布和低置信度单元格仍需人工判断。**[待验证]** Windows 桌面 Excel 的实际导出，以及 Qt 和 LibreOffice Calc 的原生表格。 |
 | 网站改版后维护一段录制 | 在桌面编辑器导入浏览器录制目录，对照旧页面截图和当前元素，替换后直接试跑剩余步骤。[修复步骤](browser-recording.md#网站改版后修复一个步骤) | 当前录制需要有该步截图才能显示旧画面。编辑器由操作者挑选替代控件。 |
-| 在新页完成授权后回主站 | Chromium 脚本用 `page.openPopup` 获取当前控件新开的页面，处理后用 `page.returnToOpener()` 返回。[跨页脚本](browser-script.md) | 没有 opener 关系的页面、嵌套弹窗和 Firefox 脚本切页仍需支持。 |
+| 在新页完成授权后回主站 | Chromium 脚本可以从业务页进入授权页、再进入身份验证页，最后逐层返回，在原业务页读取回执。[跨页脚本](browser-script.md) | 需要浏览器能确认弹窗的来源，孤立的标签页需要单独指定资源。 |

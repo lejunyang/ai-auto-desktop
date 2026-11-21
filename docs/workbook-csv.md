@@ -1,6 +1,6 @@
 # 将磁盘工作簿的指定区域导出为 CSV
 
-`aad csv export` 可以只读方式打开已经保存或下载到本机的 `.xlsx` 文件。它不连接正在运行的 Excel，不读取未保存的修改，也不执行宏或重算公式。原有的 `--input collection.json` 用法不变，不能与 `--workbook` 同时使用。
+`aad csv export --workbook` 以只读方式打开已保存或下载到本机的 `.xlsx` 文件。公式取工作簿内的缓存结果。采集结果 JSON 使用 `--input collection.json`。Windows 桌面 Excel 中尚未保存的数据有[按窗口读取的方法](live-excel-csv.md)。
 
 ```powershell
 aad csv export --workbook ./月账单.xlsx --sheet '账单' --range 'B2:E101' --output ./expected.csv
