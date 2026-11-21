@@ -1007,7 +1007,7 @@ impl BrowserBackend {
     }
 
     /// Which page opened each page, by target id, as the browser reports it.
-    fn openers(&self, deadline: Instant) -> BTreeMap<String, String> {
+    fn openers(&self, deadline: Instant) -> BTreeMap<String, (String, Option<String>)> {
         self.with_browser(deadline, |client| {
             command(client, "Target.getTargets", json!({}))
         })
@@ -1019,7 +1019,13 @@ impl BrowserBackend {
                 .filter_map(|info| {
                     Some((
                         info["targetId"].as_str()?.to_string(),
-                        info["openerId"].as_str()?.to_string(),
+                        (
+                            info["openerId"].as_str()?.to_string(),
+                            info["openerFrameId"]
+                                .as_str()
+                                .filter(|_| info["canAccessOpener"] == true)
+                                .map(str::to_owned),
+                        ),
                     ))
                 })
                 .collect()
@@ -2199,6 +2205,7 @@ impl Backend for BrowserBackend {
         pages.retain(|id, _| targets.iter().any(|target| target.id == *id));
         let mut resources = Vec::new();
         for target in targets.iter().take(64) {
+            let opener = openers.get(&target.id);
             if let Err(denied) = self.access.check_document(&target.url) {
                 let selector = json!({"page_id":target.id,"frame_id":target.id});
                 resources.push(BackendResource {
@@ -2230,7 +2237,7 @@ impl Backend for BrowserBackend {
                             capabilities: Vec::new(),
                             metadata: json!({"page_id": target.id, "frame_id": target.id,
                                 "url": target.url, "main_frame": true, "responsive": false,
-                                "opener_page_id": openers.get(&target.id)}),
+                                "opener_page_id": opener.map(|pair| &pair.0)}),
                         },
                         selector,
                     });
@@ -2257,7 +2264,7 @@ impl Backend for BrowserBackend {
                         name: target.title.clone(),
                         capabilities: vec!["accept".into(), "dismiss".into()],
                         metadata: json!({"page_id": target.id, "frame_id": frame_id, "url": target.url,
-                            "main_frame": true, "opener_page_id": openers.get(&target.id),
+                            "main_frame": true, "opener_page_id": opener.map(|pair| &pair.0),
                             "dialog": {"type": dialog["type"], "message": dialog["message"]}}),
                     },
                     selector,
@@ -2312,7 +2319,9 @@ impl Backend for BrowserBackend {
                             "access_error": access_error,
                             "parent_frame_id": entry.parent,
                             "out_of_process": entry.session.is_some(),
-                            "opener_page_id": openers.get(&target.id),
+                            "opener_page_id": opener.map(|pair| &pair.0),
+                            "opener_frame_id": opener.and_then(|pair| pair.1.as_ref()),
+                            "page_list_complete":targets.len()<=64,
                             "click_semantics": "dom_activation; trusted cdp input on canvases or with button, count or fraction",
                             "fill_semantics": "dom_value_and_events",
                             "key_semantics": "cdp_input_to_the_focused_element",

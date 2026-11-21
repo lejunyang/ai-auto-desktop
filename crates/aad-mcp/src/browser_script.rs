@@ -1,11 +1,14 @@
 //! Run ordinary JavaScript with synchronous, page-scoped browser operations.
 use crate::tools::Tool;
-use aad_control::{Action, Expect, Locator, Operation, Request, Session, Target, View, ViewMode};
+use aad_control::{
+    Action, Expect, Fraction, Locator, Operation, Request, Session, Target, View, ViewMode,
+};
 use aad_runtime::CancellationToken;
 use rquickjs::{CatchResultExt, Context, Function, Runtime};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
+use std::collections::BTreeSet;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -33,7 +36,7 @@ pub struct Script {
 pub fn tool() -> Tool {
     Tool {
         name: NAME,
-        description: "Run a synchronous JavaScript function body on one observed page, selected by resource_id or exact url. Use page.observe, present, read, fields, table, collect, wait, click, fill, key, scroll and act. page.chooseFiles(locator, files) selects files through an upload button. page.upload(locator, files) sets a file input directly. Pass JSON in inputs and return JSON. Writes need the server's input grant, file selection also needs an allowed upload directory.",
+        description: "Run synchronous JavaScript starting on one observed resource selected by resource_id or exact url. Use page.observe, present, read, fields, table, collect, wait, click, fill, key, scroll and act. In Chromium, page.openPopup(locator, exactUrl?) clicks and binds to one new popup opened by the bound frame; page.returnToOpener() restores that frame. Popup switching is unavailable with explicit resource grants. page.chooseFiles(locator, files) selects files through an upload button; page.upload sets a file input directly. Pass JSON in inputs and return JSON. Writes need the server's input grant; file selection also needs an allowed upload directory.",
         schema: json!({"type":"object","additionalProperties":false,"required":["source"],
             "oneOf":[{"required":["resource_id"]},{"required":["url"]}],
             "properties":{"source":{"type":"string","maxLength":SOURCE_LIMIT},
@@ -61,6 +64,11 @@ enum PageCall {
         locator: Locator,
         action: Action,
     },
+    OpenPopup {
+        locator: Locator,
+        url: Option<String>,
+    },
+    ReturnToOpener {},
     Wait {
         locator: Locator,
         condition: aad_control::WaitCondition,
@@ -78,14 +86,146 @@ enum PageCall {
 struct Page {
     session: Arc<Session>,
     resource_id: String,
+    chromium: bool,
+    opener: Option<String>,
     stop: CancellationToken,
     deadline: Instant,
-    calls: Cell<usize>,
-    writes: Cell<usize>,
-    error: RefCell<Option<Value>>,
+    calls: usize,
+    writes: usize,
+    error: Option<Value>,
 }
 
 impl Page {
+    fn pages(&self) -> Result<Vec<Value>> {
+        let listing = self.request(Operation::Targets {
+            provider: Some(CDP.into()),
+        })?;
+        if let Some(error) = listing["unavailable"].get(CDP) {
+            return Err(error.clone());
+        }
+        listing["resources"]
+            .as_array()
+            .cloned()
+            .ok_or_else(|| failure("BROWSER.SCRIPT_ERROR", "invalid resource discovery result"))
+    }
+
+    fn open_popup(&mut self, locator: Locator, url: Option<String>) -> Result<Value> {
+        if !self.chromium || self.opener.is_some() {
+            return Err(failure(
+                "BROWSER.SCRIPT_INVALID",
+                "openPopup requires a Chromium opener; nested popup switching is not supported",
+            ));
+        }
+        if self.session.policy().resources.is_some() {
+            return Err(failure(
+                "POLICY.DENIED",
+                "a new popup is not covered by an explicit resource grant",
+            ));
+        }
+        if url
+            .as_ref()
+            .is_some_and(|url| url.is_empty() || url.len() > 4096)
+        {
+            return Err(failure(
+                "BROWSER.SCRIPT_INVALID",
+                "popup URL must be a nonempty exact URL up to 4096 bytes",
+            ));
+        }
+        let before = self.pages()?;
+        let origin = before
+            .iter()
+            .find(|item| item["resource_id"] == self.resource_id)
+            .ok_or_else(|| {
+                failure(
+                    "BROWSER.PAGE_NOT_FOUND",
+                    "the opener is no longer available",
+                )
+            })?;
+        let meta = &origin["metadata"];
+        if meta["page_list_complete"] != true
+            || !meta["page_id"].is_string()
+            || !meta["frame_id"].is_string()
+        {
+            return Err(failure(
+                "BROWSER.SCRIPT_INVALID",
+                "cannot establish a complete baseline for this opener",
+            ));
+        }
+        let existing: BTreeSet<_> = before
+            .iter()
+            .filter_map(|item| item["metadata"]["page_id"].as_str())
+            .collect();
+        let target = self.target(locator)?;
+        self.request(Operation::Act {
+            target,
+            action: Action::Click {
+                fraction: Some(Fraction { fx: 0.5, fy: 0.5 }),
+                button: None,
+                count: None,
+                hold_ms: None,
+                modifiers: Vec::new(),
+            },
+            verify: None,
+        })?;
+        self.writes += 1;
+        let mut candidate = None;
+        loop {
+            let available = self.pages()?;
+            let mut matches = available.iter().filter(|item| {
+                let child = &item["metadata"];
+                child["main_frame"] == true
+                    && child["access_error"].is_null()
+                    && child["opener_page_id"] == meta["page_id"]
+                    && child["opener_frame_id"] == meta["frame_id"]
+                    && child["page_id"]
+                        .as_str()
+                        .is_some_and(|id| !existing.contains(id))
+                    && url.as_ref().is_none_or(|url| child["url"] == *url)
+            });
+            if let Some(child) = matches.next() {
+                if matches.next().is_some() || child["metadata"]["page_list_complete"] != true {
+                    return Err(failure(
+                        "BROWSER.PAGE_AMBIGUOUS",
+                        "cannot identify exactly one new matching popup",
+                    ));
+                }
+                let id = child["resource_id"].as_str().ok_or_else(|| {
+                    failure("BROWSER.SCRIPT_ERROR", "popup has no resource identity")
+                })?;
+                if candidate.as_deref() == Some(id) {
+                    self.opener = Some(std::mem::replace(&mut self.resource_id, id.to_owned()));
+                    return Ok(Value::Null);
+                }
+                candidate = Some(id.to_owned());
+            } else {
+                candidate = None;
+            }
+            std::thread::sleep(
+                Duration::from_millis(75)
+                    .min(self.deadline.saturating_duration_since(Instant::now())),
+            );
+        }
+    }
+
+    fn return_to_opener(&mut self) -> Result<Value> {
+        let origin = self.opener.as_ref().ok_or_else(|| {
+            failure(
+                "BROWSER.SCRIPT_INVALID",
+                "no opener was saved by this invocation",
+            )
+        })?;
+        let available = self.pages()?;
+        if !available.iter().any(|item| {
+            item["resource_id"] == *origin && item["metadata"]["access_error"].is_null()
+        }) {
+            return Err(failure(
+                "BROWSER.PAGE_NOT_FOUND",
+                "the original resource is no longer available",
+            ));
+        }
+        self.resource_id = self.opener.take().unwrap();
+        Ok(Value::Null)
+    }
     fn request(&self, operation: Operation) -> Result<Value> {
         let ms = self
             .deadline
@@ -135,17 +275,19 @@ impl Page {
             .map_err(|err| failure("BROWSER.SCRIPT_ERROR", err))
     }
 
-    fn call(&self, raw: &str) -> Result<Value> {
-        if raw.len() > SOURCE_LIMIT || self.calls.get() >= MAX_CALLS {
+    fn call(&mut self, raw: &str) -> Result<Value> {
+        if raw.len() > SOURCE_LIMIT || self.calls >= MAX_CALLS {
             return Err(failure(
                 "BROWSER.SCRIPT_LIMIT",
                 "page call count or argument size exceeded",
             ));
         }
-        self.calls.set(self.calls.get() + 1);
+        self.calls += 1;
         let call =
             serde_json::from_str(raw).map_err(|err| failure("BROWSER.SCRIPT_INVALID", err))?;
         match call {
+            PageCall::OpenPopup { locator, url } => self.open_popup(locator, url),
+            PageCall::ReturnToOpener {} => self.return_to_opener(),
             PageCall::Observe { mode } => self.observe(mode),
             PageCall::Fields { fields } => self.request(Operation::ReadFields {
                 resource_id: self.resource_id.clone(),
@@ -173,8 +315,7 @@ impl Page {
                     resource_id: self.resource_id.clone(),
                     spec,
                 })?;
-                self.writes
-                    .set(self.writes.get() + data["actions"].as_u64().unwrap_or_default() as usize);
+                self.writes += data["actions"].as_u64().unwrap_or_default() as usize;
                 Ok(data)
             }
             PageCall::Act { locator, action } => {
@@ -208,20 +349,20 @@ impl Page {
                     action,
                     verify: None,
                 })?;
-                self.writes.set(self.writes.get() + 1);
+                self.writes += 1;
                 Ok(result)
             }
         }
     }
 
-    fn dispatch(&self, raw: String) -> String {
-        if let Some(error) = self.error.borrow().as_ref() {
+    fn dispatch(&mut self, raw: String) -> String {
+        if let Some(error) = &self.error {
             return json!({"error":error}).to_string();
         }
         match self.call(&raw) {
             Ok(value) => json!({"data":value}).to_string(),
             Err(error) => {
-                *self.error.borrow_mut() = Some(error.clone());
+                self.error = Some(error.clone());
                 json!({"error":error}).to_string()
             }
         }
@@ -253,11 +394,13 @@ pub fn run(session: Arc<Session>, script: Script, stop: CancellationToken) -> Re
     let mut page = Page {
         session,
         resource_id: String::new(),
+        chromium: provider == CDP,
+        opener: None,
         stop: stop.clone(),
         deadline,
-        calls: Cell::new(0),
-        writes: Cell::new(0),
-        error: RefCell::new(None),
+        calls: 0,
+        writes: 0,
+        error: None,
     };
     let targets = page.request(Operation::Targets {
         provider: Some(provider.to_owned()),
@@ -286,7 +429,7 @@ pub fn run(session: Arc<Session>, script: Script, stop: CancellationToken) -> Re
         ));
     }
     page.resource_id = id.to_owned();
-    let page = Rc::new(page);
+    let page = Rc::new(RefCell::new(page));
     let vm_failure = |err| failure("BROWSER.SCRIPT_ERROR", err);
     let vm = Runtime::new().map_err(vm_failure)?;
     vm.set_memory_limit(24 * 1024 * 1024);
@@ -298,7 +441,9 @@ pub fn run(session: Arc<Session>, script: Script, stop: CancellationToken) -> Re
     let ctx = Context::full(&vm).map_err(vm_failure)?;
     let result = ctx.with(|ctx| -> rquickjs::Result<String> {
         let bound = page.clone();
-        let bridge = Function::new(ctx.clone(), move |raw: String| bound.dispatch(raw))?;
+        let bridge = Function::new(ctx.clone(), move |raw: String| {
+            bound.borrow_mut().dispatch(raw)
+        })?;
         let execute: Function = ctx.eval(include_str!("browser_script.js"))?;
         execute
             .call((script.source, script.inputs.to_string(), bridge))
@@ -311,6 +456,7 @@ pub fn run(session: Arc<Session>, script: Script, stop: CancellationToken) -> Re
                 )
             })
     });
+    let mut page = page.borrow_mut();
     let result = if let Some(error) = page.error.take() {
         Err(error)
     } else if stop.is_cancelled() || Instant::now() >= deadline {
@@ -327,7 +473,7 @@ pub fn run(session: Arc<Session>, script: Script, stop: CancellationToken) -> Re
                 .map_err(|err| failure("BROWSER.SCRIPT_INVALID", err))
         })
     };
-    let mut report = json!({"page_calls":page.calls.get(),"completed_actions":page.writes.get(),
+    let mut report = json!({"page_calls":page.calls,"completed_actions":page.writes,
         "elapsed_ms": start.elapsed().as_millis() as u64});
     match result {
         Ok(value) => {

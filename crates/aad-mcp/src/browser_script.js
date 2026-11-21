@@ -18,6 +18,8 @@
         present: locator => read(locator, "present"),
         click: locator => act(locator, {type: "click"}),
         fill: (locator, value) => act(locator, {type: "fill", value}),
+        openPopup: (locator, url) => call("open_popup", {locator, url}),
+        returnToOpener: () => call("return_to_opener", {}),
         upload: (locator, files) => act(locator, {type: "upload", files}),
         chooseFiles: (locator, files) => act(locator, {type: "choose_files", files}),
         key: (locator, keys) => act(locator, {type: "key", keys}),
