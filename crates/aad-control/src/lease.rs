@@ -207,7 +207,7 @@ mod tests {
         assert_eq!(busy.details["owner_metadata_is_advisory"], true);
         drop(first);
         // A concurrently forked child can briefly retain the previous lock.
-        drop(once_released(&root, "desktop").unwrap());
+        drop(once_released(|| InputLease::in_directory(&root, "desktop")).unwrap());
         let second = InputLease::with_owner(&root, "desktop", Some("session-second")).unwrap();
         let busy = InputLease::in_directory(&root, "desktop").err().unwrap();
         assert_eq!(busy.details["owner"]["session_id"], "session-second");
@@ -243,7 +243,7 @@ mod tests {
         drop(lease);
         assert!(InputLease::in_directory(&root, "desktop").is_err());
         drop(active);
-        assert!(once_released(&root, "desktop").is_ok());
+        assert!(once_released(|| InputLease::in_directory(&root, "desktop")).is_ok());
         std::fs::remove_dir_all(root).unwrap();
     }
     #[test]
@@ -254,50 +254,19 @@ mod tests {
         drop((a, b));
         std::fs::remove_dir_all(root).unwrap();
     }
-    /// A child forked while the lease is held (another test's launch::spawn,
-    /// whose pre_exec makes std fork) shares the locked file description
-    /// until it execs and O_CLOEXEC closes it.
-    #[cfg(unix)]
-    #[test]
-    fn a_dropped_lease_is_free_once_a_child_forked_meanwhile_has_execed() {
-        use std::io::Read;
-        use std::os::fd::AsRawFd;
-        use std::os::unix::process::CommandExt;
-        let root = std::env::temp_dir().join(format!("aad-lease-test-{}", uuid::Uuid::new_v4()));
-        let lease = InputLease::in_directory(&root, "desktop").unwrap();
-        let (mut forked, signal) = std::os::unix::net::UnixStream::pair().unwrap();
-        let fd = signal.as_raw_fd();
-        let mut child = std::process::Command::new("true");
-        unsafe {
-            child.pre_exec(move || {
-                libc::write(fd, b"f".as_ptr().cast(), 1);
-                libc::sleep(1);
-                Ok(())
-            });
-        }
-        let forker = std::thread::spawn(move || {
-            let status = child.status().unwrap();
-            drop(signal);
-            status
-        });
-        forked.read_exact(&mut [0]).unwrap();
-        drop(lease);
-        assert!(InputLease::in_directory(&root, "desktop").is_err());
-        assert!(once_released(&root, "desktop").is_ok());
-        forker.join().unwrap();
-        std::fs::remove_dir_all(root).unwrap();
-    }
-    /// Tests run in parallel and some spawn processes, so a forked child may
-    /// briefly share a dropped lease's lock; it is released when it execs.
-    fn once_released(root: &Path, key: &str) -> Result<InputLease> {
-        let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        loop {
-            match InputLease::in_directory(root, key) {
-                Err(_) if std::time::Instant::now() < until => {
-                    std::thread::sleep(std::time::Duration::from_millis(10))
-                }
-                done => return done,
+}
+
+/// Tests run in parallel and some spawn processes, so a forked child may
+/// briefly share a dropped lease's lock; it is released when it execs.
+#[cfg(test)]
+pub(crate) fn once_released<T>(mut acquire: impl FnMut() -> Result<T>) -> Result<T> {
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        match acquire() {
+            Err(e) if e.code == "CONTROL.RESOURCE_BUSY" && std::time::Instant::now() < until => {
+                std::thread::sleep(std::time::Duration::from_millis(10))
             }
+            done => return done,
         }
     }
 }

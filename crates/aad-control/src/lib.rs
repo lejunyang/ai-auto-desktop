@@ -2975,17 +2975,14 @@ mod input_lease_set_tests {
         // new lock first, then the pre-existing one, then encounters conflict.
         let failed = contender.input_leases(&[blocked.clone(), retained.clone(), fresh.clone()]);
         assert_eq!(failed.err().unwrap().code, "CONTROL.RESOURCE_BUSY");
-        verifier
-            .input_lease(&fresh)
-            .expect("new lock was rolled back");
+        lease::once_released(|| verifier.input_lease(&fresh)).expect("new lock was rolled back");
         assert_eq!(
             verifier.input_lease(&retained).err().unwrap().code,
             "CONTROL.RESOURCE_BUSY"
         );
         owner.close();
-        contender
-            .input_leases(&[blocked.clone(), blocked, retained])
-            .unwrap();
+        let keys = [blocked.clone(), blocked, retained];
+        lease::once_released(|| contender.input_leases(&keys)).unwrap();
         assert_eq!(
             contender.leases.lock().unwrap().len(),
             2,

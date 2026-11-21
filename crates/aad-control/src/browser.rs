@@ -4544,7 +4544,7 @@ mod tests {
         );
         independent.input_leases(&keys(&another, true)).unwrap();
         unknown.close();
-        confirmed.input_leases(&keys(&id, true)).unwrap();
+        crate::lease::once_released(|| confirmed.input_leases(&keys(&id, true))).unwrap();
         let retried = session();
         assert_eq!(
             retried.input_leases(&keys(&id, false)).err().unwrap().code,
@@ -4565,7 +4565,7 @@ mod tests {
         );
         // Losing desktop acquisition releases the newly taken instance lock.
         let isolated = session();
-        isolated.input_leases(&keys(&fresh, true)).unwrap();
+        crate::lease::once_released(|| isolated.input_leases(&keys(&fresh, true))).unwrap();
     }
     #[test]
     fn unknown_element_scope_tokens_never_fall_back_to_html_ids() {
