@@ -25,6 +25,9 @@ pub struct Args {
     /// Allow actions such as clicking or filling controls.
     #[arg(long)]
     allow_input: bool,
+    /// Permit selection of existing files under this directory. Repeatable.
+    #[arg(long = "allow-upload-dir", value_name = "DIR")]
+    upload_dirs: Vec<PathBuf>,
     /// A JSON value available to the script as inputs.
     #[arg(long)]
     inputs: Option<String>,
@@ -59,6 +62,7 @@ pub fn run(args: &Args) -> Result<Value, Value> {
     let session = Session::native_with_browsers(
         Policy {
             allow_input: args.allow_input,
+            upload_roots: args.upload_dirs.clone(),
             providers: [provider.to_owned()].into(),
             ..Policy::default()
         },

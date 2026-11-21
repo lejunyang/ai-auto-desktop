@@ -179,14 +179,14 @@ impl Page {
             }
             PageCall::Act { locator, action } => {
                 // These actions take all destinations from this one observation.
-                // Operations on other tabs, the clipboard and file system have
-                // separate entry points and grants in the control protocol.
+                // Upload paths additionally go through the session's directory grant.
                 if !matches!(
                     action,
                     Action::Click { .. }
                         | Action::Focus {}
                         | Action::Invoke {}
                         | Action::Fill { .. }
+                        | Action::Upload { .. }
                         | Action::TypeText { .. }
                         | Action::Key { .. }
                         | Action::Scroll { .. }
