@@ -262,6 +262,23 @@ impl Client {
         self.connection.command(self.next_id, &message, deadline)
     }
 
+    /// A renderer can defer its reply until a paused navigation proceeds. Let the
+    /// Fetch event loop service that request while the command is outstanding.
+    pub(crate) fn begin_session_command(
+        &mut self,
+        session: &str,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<std::sync::mpsc::Receiver<Result<serde_json::Value, CdpError>>, CdpError> {
+        self.next_id += 1;
+        let message = serde_json::json!({"id":self.next_id,"sessionId":session,"method":method,"params":params});
+        let deadline = self
+            .deadline
+            .unwrap_or_else(|| std::time::Instant::now() + Duration::from_secs(8));
+        self.connection
+            .begin_command(self.next_id, &message, deadline)
+    }
+
     /// Trusted internal primitive: several commands on one (child) session,
     /// all sent before any reply is awaited. Replies are in command order.
     pub fn session_pipeline(

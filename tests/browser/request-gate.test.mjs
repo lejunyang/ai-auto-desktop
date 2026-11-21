@@ -355,6 +355,12 @@ async function scriptActors(t, page, decide) {
   t.after(() => child.kill());
   const lines = createInterface({input:child.stdout})[Symbol.asyncIterator]();
   let id = 0;
+  async function tool(name, args) {
+    child.stdin.write(JSON.stringify({jsonrpc:'2.0',id:++id,method:'tools/call',params:{name,arguments:args}})+'\n');
+    const reply = JSON.parse((await lines.next()).value);
+    assert.equal(reply.id, id);
+    return reply.result;
+  }
   return {
     async cli(source) {
       const file = join(page.root, 'action.js');
@@ -370,12 +376,10 @@ async function scriptActors(t, page, decide) {
       }
     },
     async mcp(source) {
-      const params = {name:'browser_script', arguments:{source,url:page.url}};
-      child.stdin.write(JSON.stringify({jsonrpc:'2.0',id:++id,method:'tools/call',params})+'\n');
-      const reply = JSON.parse((await lines.next()).value);
-      assert.equal(reply.id, id);
-      return JSON.parse(reply.result.content[0].text);
-    }
+      const reply = await tool('browser_script', {source,url:page.url});
+      return JSON.parse(reply.content[0].text);
+    },
+    tool
   };
 }
 
@@ -431,4 +435,83 @@ test('actions report policy decisions on later redirect hops', {
       assert.match(block.hint, verdict === 'pending' ? /approval/ : /Do not try another route/);
     }
   }
+});
+
+test('a form opening a new page reports its decision to the submitting action', {
+  skip: !process.env.AAD_TEST_CHROME, timeout:30000
+}, async t => {
+  const arrivals = [], queries = [];
+  const ready = new Set();
+  let listenersReady;
+  const listening = new Promise(resolve => { listenersReady = resolve; });
+  const page = await fixture(async (req, res) => {
+    if (req.method === 'POST') {
+      let body = '';
+      for await (const chunk of req) body += chunk;
+      arrivals.push([req.url,body]);
+    }
+    res.setHeader('Content-Type','text/html');
+    if (['/old','/other'].includes(req.url)) {
+      const id = JSON.stringify(req.url.slice(1));
+      res.end('<script>const id='+id+'; const channel=new BroadcastChannel("submit"); channel.onmessage=()=>fetch("/probe-"+id,{method:"POST"}).catch(()=>{}); fetch("/ready-"+id)</script>');
+      return;
+    }
+    if (req.url.startsWith('/ready-')) {
+      ready.add(req.url);
+      if (ready.size === 2) listenersReady();
+    }
+    res.end('<title>Form</title><form method="POST" action="/submit" target="_blank"><input type="hidden" name="case" value="form"><button>Submit</button></form><script>const channel=new BroadcastChannel("submit");document.forms[0].onsubmit=()=>channel.postMessage("probe")</script>');
+  }, ['--disable-popup-blocking']);
+  t.after(() => page.close());
+  let decision = 'pending';
+  const actors = await scriptActors(t, page, async request => {
+    queries.push(request.url);
+    return {decision:request.url.endsWith('/submit') ? decision : 'deny',message:'Form policy',askId:'form-approval'};
+  });
+  const click = 'page.click({role:"button",name:"Submit"}); return true;';
+  await page.cdp.call('Target.setDiscoverTargets',{discover:true});
+  await page.cdp.eval('open("/old");true');
+  await page.cdp.call('Target.createTarget',{url:page.url+'other',background:true});
+  await listening;
+  const cli = await actors.cli(click);
+  assert.equal(cli.error?.code, 'BROWSER.REQUEST_BLOCKED', JSON.stringify({cli,queries,arrivals}));
+  assert.equal(cli.error.details.blocked_requests.length, 1);
+  const [pending] = cli.error.details.blocked_requests;
+  const childTarget = page.cdp.events.find(e => e.method === 'Target.targetCreated' && e.params.targetInfo.targetId === pending.page_id);
+  assert.equal(childTarget?.params.targetInfo.openerId, page.target.id);
+  assert.equal(pending.decision, 'pending');
+  assert.equal(pending.askId, 'form-approval');
+  assert.equal(pending.message, 'Form policy');
+  assert.match(pending.hint, /approval/);
+  assert.deepEqual(arrivals, []);
+
+  async function data(name, args) {
+    const result = await actors.tool(name, args);
+    assert.equal(result.isError, false, JSON.stringify(result));
+    return JSON.parse(result.content[0].text).data;
+  }
+  async function submit() {
+    const {resources} = await data('control_targets', {});
+    const {resource_id} = resources.find(r => r.metadata?.page_id === page.target.id);
+    const {observation_id} = await data('control_observe',{resource_id});
+    const {target} = await data('control_find',{observation_id,locator:{role:'button',name:'Submit'}});
+    return actors.tool('control_act',{target,action:{type:'click'}});
+  }
+  decision = 'deny';
+  const denied = await submit();
+  assert.equal(denied.isError,true);
+  const {error} = JSON.parse(denied.content[0].text);
+  assert.equal(error.code,'BROWSER.REQUEST_BLOCKED');
+  assert.equal(error.details.blocked_requests.length, 1);
+  const [block] = error.details.blocked_requests;
+  assert.equal(block.method,'POST');
+  assert.equal(block.url,page.url+'submit');
+  assert.equal(block.decision,'deny');
+  assert.equal(block.message,'Form policy');
+  assert.match(block.hint,/Do not try another route/);
+  assert.deepEqual(arrivals, []);
+  decision = 'allow';
+  assert.equal((await submit()).isError, false);
+  assert.deepEqual(arrivals,[['/submit','case=form']]);
+  assert.deepEqual(queries.sort(), Array(3).fill(['submit','probe-old','probe-other']).flat().map(path=>page.url+path).sort());
 });

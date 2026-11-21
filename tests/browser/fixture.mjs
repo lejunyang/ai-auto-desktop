@@ -32,13 +32,13 @@ export async function connect(url) {
   };
 }
 
-export async function fixture(handler) {
+export async function fixture(handler, flags = []) {
   const root=await mkdtemp(join(tmpdir(),'aad-observation-test-'));
   const server=createServer(handler);
   await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
   const url=`http://127.0.0.1:${server.address().port}/`;
   const browser=spawn(process.env.AAD_TEST_CHROME, ['--headless=new','--remote-debugging-address=127.0.0.1',
-    '--remote-debugging-port=0',`--user-data-dir=${root}`,'--no-first-run','--no-default-browser-check','--password-store=basic',url],
+    '--remote-debugging-port=0',`--user-data-dir=${root}`,'--no-first-run','--no-default-browser-check','--password-store=basic',...flags,url],
     {stdio:'ignore',detached:process.platform!=='win32'});
   let cdp;
   const close=async()=>{

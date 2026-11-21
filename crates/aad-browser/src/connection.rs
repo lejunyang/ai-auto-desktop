@@ -185,6 +185,18 @@ impl Connection {
         message: &Value,
         deadline: Instant,
     ) -> Result<Value, CdpError> {
+        let recv = self.begin_command(id, message, deadline)?;
+        let result = self.receive(&recv, deadline);
+        self.inbox.lock().unwrap().pending.remove(&id);
+        result
+    }
+
+    pub(crate) fn begin_command(
+        &mut self,
+        id: u64,
+        message: &Value,
+        deadline: Instant,
+    ) -> Result<mpsc::Receiver<Result<Value, CdpError>>, CdpError> {
         let (send, recv) = mpsc::sync_channel(1);
         {
             let mut state = self.inbox.lock().unwrap();
@@ -193,13 +205,15 @@ impl Connection {
             }
             state.pending.insert(id, send);
         }
-        let result = (|| {
-            self.socket.set_write_deadline(deadline)?;
-            self.socket.send_text(&message.to_string())?;
-            self.receive(&recv, deadline)
-        })();
-        self.inbox.lock().unwrap().pending.remove(&id);
-        result
+        if let Err(e) = self
+            .socket
+            .set_write_deadline(deadline)
+            .and_then(|()| self.socket.send_text(&message.to_string()))
+        {
+            self.inbox.lock().unwrap().pending.remove(&id);
+            return Err(e);
+        }
+        Ok(recv)
     }
 
     /// Send several commands before waiting for any reply, so a run of

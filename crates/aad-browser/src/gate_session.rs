@@ -22,6 +22,7 @@ const ATTACH: &str = "Target.setAutoAttach";
 struct Origin {
     sequence: u64,
     page: String,
+    opener: Option<(u64, String)>,
 }
 
 #[derive(Default)]
@@ -30,6 +31,8 @@ struct History {
     pending: HashMap<Key, (Origin, Value)>,
     // Network keeps the same id across redirect hops; Fetch assigns one per pause.
     chains: HashMap<Key, Origin>,
+    // New pages keep the opener action pending until their first navigation is classified.
+    opening: HashMap<String, (u64, String)>,
     blocked: VecDeque<(Origin, Value)>,
 }
 
@@ -118,7 +121,11 @@ impl GateSession {
         }
     }
     pub fn records(&self, page: &str, from: u64) -> Vec<Value> {
-        self.window(page, from, u64::MAX).1
+        self.window(page, from, u64::MAX)
+            .1
+            .into_iter()
+            .filter(|r| r["page_id"] == page)
+            .collect()
     }
     fn window(&self, page: &str, from: u64, end: u64) -> (bool, Vec<Value>) {
         match &self.0 {
@@ -155,6 +162,8 @@ impl Local {
             Client::browser_with_identity_until(port, Instant::now() + Duration::from_secs(5))
                 .map_err(|_| "request gate could not attach")?;
         let events = client.connection.subscribe(&[
+            "Target.targetCreated",
+            "Target.targetDestroyed",
             "Target.attachedToTarget",
             "Target.detachedFromTarget",
             "Target.targetInfoChanged",
@@ -198,10 +207,17 @@ impl Local {
     }
     fn window(&self, page: &str, from: u64, end: u64) -> (bool, Vec<Value>) {
         let h = self.history.lock().unwrap();
-        let selected =
-            |origin: &Origin| (from..end).contains(&origin.sequence) && origin.page == page;
+        let in_window = |sequence: u64, id: &str| (from..end).contains(&sequence) && page == id;
+        let selected = |origin: &Origin| {
+            in_window(origin.sequence, &origin.page)
+                || origin
+                    .opener
+                    .as_ref()
+                    .is_some_and(|(seq, id)| in_window(*seq, id))
+        };
         let pending = h.pending.values().any(|(origin, _)| selected(origin))
-            || h.chains.values().any(selected);
+            || h.chains.values().any(selected)
+            || h.opening.values().any(|(seq, id)| in_window(*seq, id));
         let records = h
             .blocked
             .iter()
@@ -248,6 +264,7 @@ struct Target {
     info: Value,
     page: String,
     fetch: bool,
+    network_setup: Option<mpsc::Receiver<Result<Value, crate::ws::CdpError>>>,
 }
 struct Driver {
     events: mpsc::Receiver<Value>,
@@ -333,9 +350,11 @@ impl Driver {
                 return Err("request gate interception failed");
             }
             if !target.fetch {
-                self.client
-                    .session_command(Some(sid), "Network.enable", json!({}))
-                    .map_err(|_| "request gate network tracking failed")?;
+                target.network_setup = Some(
+                    self.client
+                        .begin_session_command(sid, "Network.enable", json!({}))
+                        .map_err(|_| "request gate network tracking failed")?,
+                );
             }
             target.fetch = true;
         }
@@ -352,6 +371,27 @@ impl Driver {
             let p = &e["params"];
             let sid = p["sessionId"].as_str().unwrap_or_default();
             match e["method"].as_str() {
+                Some("Target.targetCreated") => {
+                    let info = &p["targetInfo"];
+                    if info["type"] == "page"
+                        && info["url"] == ""
+                        && !self.scope.as_ref().is_ok_and(|s| s.watch.is_empty())
+                    {
+                        if let (Some(id), Some(opener)) =
+                            (info["targetId"].as_str(), info["openerId"].as_str())
+                        {
+                            let mut h = self.history.lock().unwrap();
+                            let seq = h.next;
+                            h.next += 1;
+                            h.opening.insert(id.into(), (seq, opener.into()));
+                        }
+                    }
+                }
+                Some("Target.targetDestroyed") => {
+                    if let Some(id) = p["targetId"].as_str() {
+                        self.history.lock().unwrap().opening.remove(id);
+                    }
+                }
                 Some("Target.attachedToTarget") => {
                     let info = &p["targetInfo"];
                     if matches!(
@@ -386,6 +426,7 @@ impl Driver {
                                 info: info.clone(),
                                 page,
                                 fetch: false,
+                                network_setup: None,
                             },
                         );
                         if let Err(failure) = self.configure(sid) {
@@ -401,13 +442,13 @@ impl Driver {
                             return Err(failure);
                         }
                         self.client
-                            .session_command(Some(sid), ATTACH, attach())
+                            .begin_session_command(sid, ATTACH, attach())
                             .ok();
                     }
                     if p["waitingForDebugger"] == true {
                         self.client
-                            .session_command(
-                                Some(sid),
+                            .begin_session_command(
+                                sid,
                                 "Runtime.runIfWaitingForDebugger",
                                 json!({}),
                             )
@@ -416,6 +457,11 @@ impl Driver {
                 }
                 Some("Target.targetInfoChanged") => {
                     let info = &p["targetInfo"];
+                    if info["url"].as_str().is_some_and(|url| !url.is_empty()) {
+                        if let Some(id) = info["targetId"].as_str() {
+                            self.history.lock().unwrap().opening.remove(id);
+                        }
+                    }
                     for t in self
                         .pages
                         .values_mut()
@@ -451,6 +497,15 @@ impl Driver {
                 _ => {}
             }
         }
+        for target in self.pages.values_mut() {
+            if let Some(reply) = &target.network_setup {
+                match reply.try_recv() {
+                    Ok(Ok(_)) => target.network_setup = None,
+                    Err(mpsc::TryRecvError::Empty) => {}
+                    _ => return Err("request gate network tracking failed"),
+                }
+            }
+        }
         Ok(observed)
     }
     fn resolve(&mut self, key: &Key, allow: bool) -> Result<(), &'static str> {
@@ -480,17 +535,22 @@ impl Driver {
             sid.to_string(),
             p["requestId"].as_str().unwrap_or_default().to_string(),
         );
+        let target = self.pages.get(sid).ok_or("unknown request gate target")?;
+        let main_document =
+            p["resourceType"] == "Document" && p["frameId"] == target.info["targetId"];
         if self
             .scope
             .as_ref()
             .is_ok_and(|s| url::Url::parse(raw).is_ok_and(|u| !s.matches(&u, method)))
         {
+            if main_document {
+                self.history.lock().unwrap().opening.remove(&target.page);
+            }
             // Cancellation or tab closure can invalidate this interception id.
             // Other targets continue on their independent sessions.
             let _ = self.resolve(&key, true);
             return Ok(());
         }
-        let target = self.pages.get(sid).ok_or("unknown request gate target")?;
         let page = self
             .pages
             .values()
@@ -501,12 +561,17 @@ impl Driver {
             json!({"title":page.info["title"],"url":page.info["url"]}),
             &self.identity,
         );
-        let mut record = json!({"method":method,"url":crate::recording::network::truncate(&self.gate.redact(&redact_url(raw)),2048).0,"request_id":p["networkId"]});
+        let mut record = json!({"page_id":target.page,"method":method,"url":crate::recording::network::truncate(&self.gate.redact(&redact_url(raw)),2048).0,"request_id":p["networkId"]});
         let mut h = self.history.lock().unwrap();
         if h.pending.contains_key(&key) {
             return Ok(());
         }
         let origin = Origin {
+            opener: if main_document {
+                h.opening.remove(&target.page)
+            } else {
+                None
+            },
             sequence: h.next,
             page: target.page.clone(),
         };
@@ -679,6 +744,7 @@ impl Driver {
     }
     fn abort_pending(&mut self, message: &str) {
         let mut h = self.history.lock().unwrap();
+        h.opening.clear();
         h.chains.clear();
         let pending = std::mem::take(&mut h.pending);
         let keys = pending
