@@ -6,7 +6,7 @@ import {join, resolve} from 'node:path';
 import {test} from 'node:test';
 import {setTimeout as delay} from 'node:timers/promises';
 import {promisify} from 'node:util';
-import {fixture} from './fixture.mjs';
+import {clickPickerButton, fixture} from './fixture.mjs';
 
 const exec = promisify(execFile);
 const desktop = process.env.XDG_SESSION_TYPE;
@@ -46,20 +46,6 @@ test(`an already-open GTK portal supports Open and new-file Save on ${desktop}`,
     '--cdp-port',String(page.port),'--allow-input',command==='save-as'?'--allow-save-dir':'--allow-upload-dir',
     grant,'--file',file,...(native?['--native-file']:[])],{env:{...process.env,AAD_CONTROL_LEASE_DIR:join(root,'leases')}});
   const gesture=expression=>page.cdp.call('Runtime.evaluate',{expression,userGesture:true});
-  // Dispatch a trusted click to a visible test button. Changing focus after
-  // the previous modal closes can invalidate a synthesized userGesture.
-  async function clickButton(id, handler) {
-    await page.cdp.call('Page.bringToFront');
-    const point=await page.cdp.eval(`(()=>{
-      const b=document.createElement('button'); b.id=${JSON.stringify(id)}; b.textContent=b.id;
-      b.onclick=()=>{ ${handler} }; document.body.prepend(b);
-      const r=b.getBoundingClientRect(), x=r.left+r.width/2, y=r.top+r.height/2;
-      if(document.elementFromPoint(x,y)!==b) throw Error('fixture button is covered');
-      return {x,y};
-    })()`);
-    for(const type of ['mousePressed','mouseReleased'])
-      await page.cdp.call('Input.dispatchMouseEvent',{type,button:'left',clickCount:1,...point});
-  }
   await gesture('f.oncancel=()=>window.cancelled=true; f.click()');
   await waitFor(async()=>(await requests()).length===1 && await page.cdp.eval('f.matches(":open")'));
   const open=await requests();
@@ -89,7 +75,7 @@ test(`an already-open GTK portal supports Open and new-file Save on ${desktop}`,
     await waitFor(async()=>(await page.cdp.call('Target.getTargets')).targetInfos.some(target=>
       target.type==='iframe' && target.url.endsWith('/foreign-elsewhere')));
   }
-  await clickButton('open-native',`void showOpenFilePicker({multiple:true}).then(async handles=>{
+  await clickPickerButton(page,'open-native',`void showOpenFilePicker({multiple:true}).then(async handles=>{
     window.handles=await Promise.all(handles.map(async h=>[h.name,await (await h.getFile()).text()]));
   }).catch(e=>window.openError=String(e))`);
   await waitFor(async()=>{
@@ -145,7 +131,7 @@ test(`an already-open GTK portal supports Open and new-file Save on ${desktop}`,
   await page.cdp.eval(`for(let i=0;i<2100;i++){
     const b=document.createElement('button'); b.textContent='row '+i; document.body.appendChild(b);
   }`);
-  await clickButton('save-native',`void showSaveFilePicker({suggestedName:'proposed.txt'}).then(async handle=>{
+  await clickPickerButton(page,'save-native',`void showSaveFilePicker({suggestedName:'proposed.txt'}).then(async handle=>{
     window.chosen=handle.name;
     const output=await handle.createWritable(); await output.write('bytes written by the page'); await output.close();
     window.saved=true;
@@ -167,7 +153,7 @@ test(`an already-open GTK portal supports Open and new-file Save on ${desktop}`,
     ['new 文 件.txt',true,null,'untouched']);
   assert.equal(await readFile(dest,'utf8'),'bytes written by the page');
 
-  await clickButton('select-folder','void showDirectoryPicker().catch(()=>{})');
+  await clickPickerButton(page,'select-folder','void showDirectoryPicker().catch(()=>{})');
   await waitFor(async()=>(await requests()).length===1);
   const folderRequest=await requests();
   await assert.rejects(run('choose-files',nativeSource,{native:true}));

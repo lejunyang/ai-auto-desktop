@@ -71,3 +71,21 @@ export async function fixture(handler, flags = [], {headed = false} = {}) {
     throw new Error('Browser startup timed out');
   } catch(error) {await close();throw error;}
 }
+// A real click preserves user activation when a preceding native dialog has
+// just returned focus. Only click the visible button created by the fixture.
+export async function clickPickerButton(page, id, handler) {
+  await page.cdp.call('Page.bringToFront');
+  const point = await page.cdp.eval(`(() => {
+    const button = document.createElement('button');
+    button.textContent = button.id = ${JSON.stringify(id)};
+    button.onclick = () => { ${handler} };
+    document.body.prepend(button);
+    const rect = button.getBoundingClientRect();
+    const x = rect.left + rect.width / 2, y = rect.top + rect.height / 2;
+    if (document.elementFromPoint(x, y) !== button) throw Error('fixture button is covered');
+    return {x, y};
+  })()`);
+  for (const type of ['mousePressed', 'mouseReleased']) {
+    await page.cdp.call('Input.dispatchMouseEvent', {type, button: 'left', clickCount: 1, ...point});
+  }
+}
