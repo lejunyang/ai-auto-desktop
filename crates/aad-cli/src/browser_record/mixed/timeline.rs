@@ -63,10 +63,34 @@ impl Timeline {
         let mut frames = HashMap::new();
         let mut seen = HashSet::new();
         let mut pending_changes = HashMap::new();
+        let mut triggers: HashMap<u64, usize> = HashMap::new();
         for line in BufReader::new(File::open(dir.join("evidence/actions.jsonl"))?).lines() {
             let row: Value = serde_json::from_str(&line?)?;
             let id = row["id"].as_u64().ok_or("missing browser checkpoint id")?;
             let frame = match row["kind"].as_str() {
+                Some("file_chooser_pending" | "file_chooser_without_dom_input") => {
+                    if row["page_id"] != page {
+                        return Err("unexpected browser chooser page".into());
+                    }
+                    if let Some(index) = row["action"]["enter_id"]
+                        .as_u64()
+                        .and_then(|id| triggers.remove(&id))
+                    {
+                        self.events[index].value["kind"] = json!("file_trigger");
+                    }
+                    if let Some(index) = row["action"]["trigger_id"]
+                        .as_u64()
+                        .and_then(|id| triggers.remove(&id))
+                    {
+                        self.events[index].value["kind"] =
+                            json!(if row["action"]["uncertain"] == true {
+                                "file_trigger_uncertain"
+                            } else {
+                                "file_trigger"
+                            });
+                    }
+                    continue;
+                }
                 Some("action") => {
                     if row["page_id"] != page {
                         return Err("unexpected browser page in evidence".into());
@@ -122,9 +146,20 @@ impl Timeline {
                     _ => (),
                 }
             }
-            if action["type"] == "file" || action["tag"] == "select" || action["type"] == "hidden" {
+            if action["kind"] == "file_cancel"
+                && action["type"] == "file"
+                && action["tag"] == "input"
+                && action["dom_event"] == "cancel"
+            {
+                self.filter(at, "file_selection_cancelled_or_unchanged")?;
+                continue;
+            }
+            if action["tag"] == "select" || action["type"] == "hidden" {
                 self.gap(at, json!({"source":"browser","reason":"unsupported_input_type","type":action["type"]}))?;
                 continue;
+            }
+            if matches!(action["kind"].as_str(), Some("click" | "enter")) {
+                triggers.insert(id, self.events.len());
             }
             self.push(at, Source::Browser(frame, doc.into()), action.clone())?;
         }
@@ -225,5 +260,45 @@ impl Timeline {
             steps.extend(batch.steps);
         }
         Ok((steps, windows))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_trusted_file_outcomes_replay_and_chooser_openers_do_not_survive_boundaries() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("evidence")).unwrap();
+        let row = |id, kind, trusted| json!({"id":id,"kind":"action","page_id":"page","frame_id":"frame","action":{"kind":kind,"type":if matches!(kind,"click"|"enter") {"button"} else {"file"},"at_ms":id,"sequence":id,"node_id":"a","document_id":"doc","trusted":trusted,"dom_event":if kind=="file_cancel" {"cancel"} else {"input"},"url":"https://example.test/","tag":"input","hidden":true,"control":{"role":"button","name":"Attachment"}}});
+        let rows = [
+            row(0, "enter", true),
+            row(1, "click", true),
+            row(2, "file_activation", false),
+            json!({"id":3,"kind":"file_chooser_pending","page_id":"page","frame_id":"frame","action":{"trigger_id":1,"enter_id":0,"uncertain":false}}),
+            row(4, "upload", false),
+            row(5, "upload", true),
+            row(6, "file_cancel", true),
+        ];
+        let data = rows
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(dir.path().join("evidence/actions.jsonl"), data).unwrap();
+        let mut timeline = Timeline::default();
+        timeline.read_browser(dir.path(), "page").unwrap();
+        let (steps, sources) = timeline.steps(0, 10, 0).unwrap();
+        assert!(timeline.gaps.is_empty());
+        assert_eq!(timeline.filtered["untrusted_dom"], 2);
+        assert_eq!(
+            timeline.filtered["file_selection_cancelled_or_unchanged"],
+            1
+        );
+        assert_eq!(sources.len(), 1);
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0].action, Some(json!({"type":"upload"})));
+        assert_eq!(steps[0].input.as_ref().unwrap().name, "rec1_files");
     }
 }
