@@ -141,6 +141,19 @@ fn wal_mode_is_actually_active_on_disk() {
     assert_eq!(mode.to_lowercase(), "wal");
 }
 
+#[test]
+fn open_a_current_journal_while_another_connection_is_writing() {
+    let journal = TempJournal::open();
+    seed(&journal, "run-1");
+    let writer = journal.raw();
+    writer
+        .execute_batch("BEGIN IMMEDIATE")
+        .expect("take the writer lock");
+
+    let reader = JournalStore::open_with_timeout(journal.path(), 0).expect("open without writing");
+    assert_eq!(reader.list_events("run-1", 0, 10).unwrap().len(), 1);
+}
+
 // ---------------------------------------------------------------- create & read
 
 #[test]

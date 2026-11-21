@@ -479,6 +479,14 @@ impl JournalStore {
     /// Create the schema, re-checking the version under the writer lock so that
     /// several processes racing to open a new journal is safe.
     fn migrate(&self) -> Result<()> {
+        // Opening an existing journal to read progress can share a WAL snapshot
+        // with a running writer. Only migrations require the writer lock.
+        let version: i64 = self
+            .connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        if version == SCHEMA_VERSION {
+            return Ok(());
+        }
         let transaction = self.begin()?;
         let current: i64 = transaction.query_row("PRAGMA user_version", [], |row| row.get(0))?;
         if current > SCHEMA_VERSION {
