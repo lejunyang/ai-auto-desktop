@@ -1,8 +1,9 @@
 import assert from 'node:assert/strict';
-import {execFile} from 'node:child_process';
+import {execFile, spawn} from 'node:child_process';
 import {mkdir, writeFile} from 'node:fs/promises';
 import {join, resolve} from 'node:path';
 import {test} from 'node:test';
+import {createInterface} from 'node:readline';
 import {setTimeout as delay} from 'node:timers/promises';
 import {promisify} from 'node:util';
 import {fixture} from './fixture.mjs';
@@ -63,4 +64,47 @@ test('browser scripts select only granted files and the page receives their cont
   assert.equal(await page.cdp.eval('window.opens'), 1);
   for (let i=0; i<100 && !await page.cdp.eval('Array.isArray(window.invoices)'); i++) await delay(20);
   assert.deepEqual(await page.cdp.eval('window.invoices'), [['2.txt', 'two'], ['1.txt', 'one']]);
+});
+
+test('closing the native picker invalidates a previously observed open file input', {
+  skip: !process.env.AAD_TEST_CHROME || !process.env.AAD_TEST_PICKER_X11, timeout: 90000
+}, async t => {
+  const page = await fixture((_req, res) => {
+    res.setHeader('Content-Type', 'text/html');
+    res.end('<title>Open picker fixture</title><input type="file" id="invoice"><input type="file" id="other">');
+  }, ['--ozone-platform=x11'], {headed:true});
+  t.after(() => page.close());
+  const file = join(page.root, 'invoice.txt');
+  await writeFile(file, 'invoice payload');
+  const cli = process.env.AAD_TEST_CLI || resolve('target/debug/aad');
+  const child = spawn(cli, ['mcp', '--browser-port', String(page.port), '--provider', 'browser.cdp',
+    '--allow-input', '--allow-upload-dir', page.root], {
+    stdio: ['pipe','pipe','inherit'], env:{...process.env,AAD_CONTROL_LEASE_DIR:join(page.root,'leases')}
+  });
+  t.after(() => { child.stdin.end(); child.kill(); });
+  const lines = createInterface({input:child.stdout})[Symbol.asyncIterator]();
+  let id=0;
+  const tool = async (name, args, expectError=false) => {
+    child.stdin.write(JSON.stringify({jsonrpc:'2.0',id:++id,method:'tools/call',params:{name,arguments:args}})+'\n');
+    const reply=JSON.parse((await lines.next()).value).result;
+    assert.equal(reply.isError, expectError, JSON.stringify(reply));
+    return JSON.parse(reply.content[0].text);
+  };
+  const resources = (await tool('control_targets', {})).data.resources;
+  const resource_id = resources.find(r=>r.metadata.url === page.url).resource_id;
+  await page.cdp.call('Runtime.evaluate', {expression:'invoice.click()',userGesture:true});
+  for (let i=0; i<600; i++) {
+    const xid=(await exec('xdotool',['getactivewindow'])).stdout.trim();
+    if ((await exec('xprop',['-id',xid,'_NET_WM_WINDOW_TYPE'])).stdout.includes('_NET_WM_WINDOW_TYPE_DIALOG')) break;
+    if (i===599) assert.fail('native picker did not appear');
+    await delay(50);
+  }
+  const {observation_id}=(await tool('control_observe',{resource_id})).data;
+  const {target}=(await tool('control_find',{observation_id,locator:{states:{picker_open:true}}})).data;
+  await exec('xdotool',['key','Escape']);
+  for (let i=0; i<100 && await page.cdp.eval('invoice.matches(":open")'); i++) await delay(30);
+  assert.equal(await page.cdp.eval('invoice.matches(":open")'), false);
+  const refused=await tool('control_act',{target,action:{type:'upload',files:[file]}},true);
+  assert.equal(refused.error.code,'CONTROL.STALE_TARGET');
+  assert.deepEqual(await page.cdp.eval('[invoice.files.length,other.files.length]'),[0,0]);
 });

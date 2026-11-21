@@ -64,6 +64,8 @@
     return protectedFound;
   };
   const present = el => visible(el) || (fileInput(el) && el.isConnected && el.ownerDocument === document);
+  const recognizesOpenPicker = CSS.supports('selector(input:open)');
+  const openPicker = el => fileInput(el) && recognizesOpenPicker ? el.matches(':open') : null;
   const visible = el => el.isConnected && el.ownerDocument === document && el.getClientRects().length > 0 && getComputedStyle(el).visibility !== 'hidden';
   const enabled = el => !el.disabled && !el.closest('[inert]') && el.getAttribute('aria-disabled') !== 'true';
   const editable = el => (['INPUT','TEXTAREA'].includes(el.tagName) || el.isContentEditable) && !el.readOnly && !protectedNode(el) && !fileInput(el);
@@ -142,6 +144,7 @@
     if (args.document_token!==documentToken || args.observation!==observation) return {error:'CONTROL.STALE_TARGET'};
     const found=nodes.get(args.node_id);
     if (!found || !present(found.el) || fingerprint(found.el)!==found.fingerprint) return {error:'CONTROL.STALE_TARGET'};
+    if (found.pickerOpen !== openPicker(found.el)) return {error:'CONTROL.STALE_TARGET'};
     if (!enabled(found.el) || (protectedNode(found.el) && args.action!=='secret_input')) return {error:'CONTROL.ACTION_UNSUPPORTED'};
     // A drag's destination is any observed element; everything else needs its action.
     if (args.action!==null && !actions(found.el).includes(args.action)) return {error:'CONTROL.ACTION_UNSUPPORTED'};
@@ -196,7 +199,8 @@
       const parentOf=el=>{for(let n=el.parentNode||el.host;n;n=n.parentNode||n.host){if(ids.has(n))return ids.get(n);}return null;};
       const result=kept.map((el,index)=>{
         const node_id='n'+index;
-        nodes.set(node_id,{el,fingerprint:fingerprint(el)});
+        const pickerOpen=openPicker(el);
+        nodes.set(node_id,{el,fingerprint:fingerprint(el),pickerOpen});
         const node={node_id,role:roleOf(el),name:labelOf(el),tag:el.tagName.toLowerCase(),
           value:protectedNode(el)?null:(('value' in el)?String(el.value).slice(0,4096):null),
           states:{enabled:enabled(el),protected:protectedNode(el),read_only:!!el.readOnly,focused:activeElement()===el},actions:actions(el),parent:parentOf(el)};
@@ -204,6 +208,7 @@
         if (landmark(el)) node.landmark=true;
         if (closedRoots.has(el)) node.surface='closed_shadow';
         if (checkable(el)) node.states.checked=checkedOf(el);
+        if (pickerOpen!==null) node.states.picker_open=pickerOpen;
         if (fileInput(el)) { node.states.hidden=!visible(el); node.files=Array.from(el.files||[]).slice(0,32).map(f=>f.name.slice(0,256)); node.multiple=!!el.multiple; }
         if (el.tagName==='SELECT') node.options=Array.from(el.options).slice(0,100).map(o=>o.label.trim().slice(0,256));
         return node;
