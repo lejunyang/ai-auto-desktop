@@ -515,3 +515,75 @@ test('a form opening a new page reports its decision to the submitting action', 
   assert.deepEqual(arrivals,[['/submit','case=form']]);
   assert.deepEqual(queries.sort(), Array(3).fill(['submit','probe-old','probe-other']).flat().map(path=>page.url+path).sort());
 });
+
+for (const [source, status] of [['automatic',404], ['automatic',405], ['automatic',500], ['explicit',404]]) {
+  test(`${source} scope GET returning ${status}`, {
+    skip: !process.env.AAD_TEST_CHROME, timeout: 30000
+  }, async t => {
+    const arrivals = [], decisions = [];
+    const page = await fixture((req, res) => {
+      arrivals.push([req.method, req.url]);
+      res.setHeader('Content-Type','text/html');
+      res.end('<title>Scope fixture</title>');
+    });
+    t.after(() => page.close());
+
+    const token = 'scope-fixture-token';
+    const path = '/api/operation-gate/http';
+    let recover = false, reads = 0;
+    const policy = createServer(async (req, res) => {
+      assert.equal(req.headers.authorization, 'Bearer '+token);
+      assert.equal(req.url, path);
+      if (req.method === 'GET') {
+        reads++;
+        if (!recover) return res.writeHead(status).end();
+        return res.end(JSON.stringify({revision:'', watch:[{host:'127.0.0.1', methods:['POST']}]}));
+      }
+      let body = '';
+      for await (const chunk of req) body += chunk;
+      decisions.push(JSON.parse(body).url);
+      res.end(JSON.stringify({decision:'deny', message:'scope restored'}));
+    });
+    await new Promise(resolve => policy.listen(0, '127.0.0.1', resolve));
+    t.after(() => policy.close());
+    const base = 'http://127.0.0.1:'+policy.address().port;
+    const env = {...process.env, HOME:page.root, LOCALAPPDATA:page.root, OMEM_URL:base,
+      OMEM_TOKEN:token, AAD_CONTROL_LEASE_DIR:join(page.root,'leases')};
+    delete env.AAD_REQUEST_GATE_URL;
+    delete env.AAD_REQUEST_GATE_TOKEN;
+    if (source === 'explicit') Object.assign(env, {AAD_REQUEST_GATE_URL:base+path, AAD_REQUEST_GATE_TOKEN:token});
+    const cli = process.env.AAD_TEST_CLI || resolve('target/debug/aad');
+    const child = spawn(cli, ['mcp','--browser-port',String(page.port),'--allow-input'], {env});
+    t.after(() => child.kill());
+    let diagnostics = '';
+    child.stderr.on('data', chunk => { diagnostics += chunk; });
+    const lines = createInterface({input:child.stdout})[Symbol.asyncIterator]();
+    child.stdin.write(JSON.stringify({jsonrpc:'2.0',id:1,method:'tools/call',
+      params:{name:'control_targets',arguments:{}}})+'\n');
+    const reply = JSON.parse((await lines.next()).value);
+    assert.equal(reply.result.isError, false);
+    assert.ok(reads > 0);
+    const fetchPath = (path, method) => page.cdp.eval(
+      `fetch(${JSON.stringify(path)}, {method:${JSON.stringify(method)}}).then(r=>r.ok,()=>false)`
+    );
+    const legacy = source === 'automatic' && [404,405].includes(status);
+    for (const method of ['GET','POST']) {
+      assert.equal(await fetchPath('/initial', method), legacy);
+      assert.equal(arrivals.some(([m,u]) => m === method && u === '/initial'), legacy);
+    }
+    assert.deepEqual(decisions, []);
+    if (!legacy) return;
+    assert.match(diagnostics, new RegExp('scope GET returned '+status));
+    for (const secret of [base,token]) assert.ok(!diagnostics.includes(secret));
+    const initialReads = reads;
+    recover = true;
+    for (let i=0; i<160 && reads === initialReads; i++) await delay(100);
+    assert.ok(reads > initialReads, 'expected a scheduled refresh');
+    for (let i=0; i<100 && await fetchPath('/probe','POST'); i++) await delay(20);
+    assert.equal(await fetchPath('/after','POST'), false);
+    assert.ok(decisions.includes(page.url+'after'));
+    assert.ok(!arrivals.some(([,u]) => u === '/after'));
+    assert.equal(await fetchPath('/read','GET'), true);
+    assert.ok(arrivals.some(([m,u]) => m === 'GET' && u === '/read'));
+  });
+}
