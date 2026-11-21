@@ -266,21 +266,25 @@ impl Desk {
 
     /// What a locator selects in a window right now. A locator that matches
     /// nothing is a state to show while it is being edited, not an error.
-    fn try_locator(&self, resource_id: &str, locator: Locator) -> Reply {
+    fn find(&self, resource_id: &str, locator: Locator, expect: Expect) -> Reply {
         self.resource(resource_id)?;
         let observed = self.call(Operation::Observe {
             resource_id: resource_id.into(),
             max_nodes: aad_control::MAX_NODES,
             view: View::default(),
         })?;
-        let mut found = self.call(Operation::Find {
+        self.call(Operation::Find {
             observation_id: observed["observation_id"]
                 .as_str()
                 .unwrap_or_default()
                 .into(),
             locator: Box::new(locator),
-            expect: Expect::Optional,
-        })?;
+            expect,
+        })
+    }
+
+    fn try_locator(&self, resource_id: &str, locator: Locator) -> Reply {
+        let mut found = self.find(resource_id, locator, Expect::Optional)?;
         if let Some(node) = found.get_mut("node").and_then(Value::as_object_mut) {
             node.remove("target");
         }
@@ -289,6 +293,13 @@ impl Desk {
             object.remove("observation_id");
         }
         Ok(found)
+    }
+
+    fn capture_element(&self, resource_id: &str, locator: Locator) -> Reply {
+        let found = self.find(resource_id, locator, Expect::One)?;
+        let target = serde_json::from_value(found["target"].clone())
+            .map_err(|_| invalid("没有可截图的目标"))?;
+        self.call(Operation::Capture { target })
     }
 
     fn start_capture(&mut self, resource_id: &str) -> Reply {
@@ -409,6 +420,25 @@ async fn observe(shell: tauri::State<'_, Shell>, resource_id: String, view: Valu
 }
 
 #[tauri::command]
+async fn import_browser_steps(rows: String) -> Reply {
+    if rows.len() > 16 * 1024 * 1024 {
+        return Err(invalid("录制步骤超过 16 MiB"));
+    }
+    let batch = recording::from_browser_steps(&rows, &mut 1);
+    Ok(json!({"steps":batch.steps, "source_rows":batch.source_rows, "skipped":batch.skipped}))
+}
+
+#[tauri::command]
+async fn capture_element(
+    shell: tauri::State<'_, Shell>,
+    resource_id: String,
+    locator: Value,
+) -> Reply {
+    let locator = serde_json::from_value(locator).map_err(|e| invalid(format!("{e}")))?;
+    shell.run(move |desk| desk.capture_element(&resource_id, locator))
+}
+
+#[tauri::command]
 async fn try_locator(shell: tauri::State<'_, Shell>, resource_id: String, locator: Value) -> Reply {
     let locator: Locator =
         serde_json::from_value(locator).map_err(|e| invalid(format!("定位条件无法读取：{e}")))?;
@@ -496,6 +526,8 @@ pub fn run() {
             list_targets,
             observe,
             try_locator,
+            import_browser_steps,
+            capture_element,
             perform_step,
             run_steps,
             start_recording,

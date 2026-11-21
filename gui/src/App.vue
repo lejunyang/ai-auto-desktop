@@ -5,6 +5,8 @@ import ElementList from "./components/ElementList.vue";
 import StepComposer from "./components/StepComposer.vue";
 import StepCard, { type Status } from "./components/StepCard.vue";
 import Modal from "./components/Modal.vue";
+import RepairStep from "./components/RepairStep.vue";
+import { readEvidence } from "./recordingEvidence";
 import {
   api, asFailure, type ElementNode, type Failure, type Found, type Locator, type Observation,
   type Region, type Resource, type SavedRecording, type Step, type Targets,
@@ -24,6 +26,10 @@ const name = ref("新录制");
 const steps = ref<Step[]>([]);
 const statuses = ref<Record<string, { status: Status; error?: Failure | null }>>({});
 const tried = ref<Record<string, Found | Failure | null>>({});
+const repairing = ref<string | null>(null);
+const evidence = shallowRef<Record<string, File[]>>({});
+const folder = ref<HTMLInputElement | null>(null);
+const fromIndex = ref<number | null>(null);
 
 const loadingTargets = ref(false);
 const loadingElements = ref(false);
@@ -32,6 +38,7 @@ const recording = ref(false);
 const skipped = ref(0);
 const dropped = ref(0);
 let poll: number | undefined;
+let readVersion = 0;
 
 const notice = ref<{ kind: "error" | "ok"; text: string; hint?: string } | null>(null);
 const asking = ref<{ inputs: ReturnType<typeof inputsNeeded>; then: (values: Record<string, string>) => void } | null>(null);
@@ -72,6 +79,7 @@ async function connect(port: number | null): Promise<void> {
 
 async function select(next: Resource): Promise<void> {
   resource.value = next;
+  observation.value = null;
   region.value = null;
   regions.value = [];
   node.value = null;
@@ -79,24 +87,28 @@ async function select(next: Resource): Promise<void> {
   await read();
   if (next.provider === "desktop.windows_uia") {
     api.observe(next.resource_id, { mode: "overview" })
-      .then((overview) => (regions.value = overview.regions ?? []))
-      .catch(() => (regions.value = []));
+      .then((overview) => { if (resource.value?.resource_id === next.resource_id) regions.value = overview.regions ?? []; })
+      .catch(() => {});
   }
 }
 
 async function read(): Promise<void> {
   if (!resource.value) return;
+  const version = ++readVersion;
+  node.value = null;
   loadingElements.value = true;
   try {
-    observation.value = await api.observe(resource.value.resource_id, {
+    const observed = await api.observe(resource.value.resource_id, {
       mode: "outline", limit: 500, max_characters: 200000,
       ...(region.value ? { region: region.value } : {}),
     });
+    if (version === readVersion) observation.value = observed;
   } catch (error) {
+    if (version !== readVersion) return;
     observation.value = null;
     fail(error);
   } finally {
-    loadingElements.value = false;
+    if (version === readVersion) loadingElements.value = false;
   }
 }
 
@@ -152,38 +164,48 @@ function update(index: number, step: Step): void {
   const next = [...steps.value];
   next[index] = step;
   steps.value = next;
+  delete statuses.value[step.id];
+  delete tried.value[step.id];
 }
 
 function remove(index: number): void {
+  const id = steps.value[index].id;
+  if (repairing.value === id) repairing.value = null;
+  delete evidence.value[id];
   steps.value = steps.value.filter((_, i) => i !== index);
 }
 
 async function test(step: Step, locator: Locator): Promise<void> {
-  const window = targets.value?.resources.find((r) => appMatches(step.app, r)) ?? resource.value;
-  if (!window) return fail({ code: "STEP.APP_NOT_FOUND", message: "找不到这个步骤的窗口" });
+  const matches = targets.value?.resources.filter((r) => appMatches(step.app, r)) ?? [];
+  if (matches.length !== 1) return fail({ code: "STEP.APP_SELECTION", message: `步骤匹配到 ${matches.length} 个窗口，请检查应用、标题或网址` });
   try {
-    tried.value = { ...tried.value, [step.id]: await api.tryLocator(window.resource_id, locator) };
+    tried.value = { ...tried.value, [step.id]: await api.tryLocator(matches[0].resource_id, locator) };
   } catch (error) {
     tried.value = { ...tried.value, [step.id]: asFailure(error) };
   }
 }
 
-function runAll(): void {
-  withInputs(steps.value, async (inputs) => {
+function runFrom(index = 0): void {
+  if (busy.value || recording.value) return;
+  const selected = steps.value.slice(index);
+  if (!selected.length) return;
+  fromIndex.value = null;
+  withInputs(selected, async (inputs) => {
     busy.value = true;
-    statuses.value = Object.fromEntries(steps.value.map((s) => [s.id, { status: "running" as Status }]));
+    const previous = Object.fromEntries(steps.value.slice(0, index).map(s => [s.id, statuses.value[s.id]]).filter(([, value]) => value));
+    statuses.value = { ...previous, ...Object.fromEntries(selected.map((s) => [s.id, { status: "running" as Status }])) };
     try {
-      const result = await api.run(name.value || "录制", steps.value, inputs);
-      const next: typeof statuses.value = {};
-      for (const step of steps.value) next[step.id] = { status: "skipped" };
+      const result = await api.run(name.value || "录制", selected, inputs);
+      const next: typeof statuses.value = { ...previous };
+      for (const step of selected) next[step.id] = { status: "skipped" };
       for (const outcome of result.steps) {
         next[outcome.id] = { status: outcome.status === "succeeded" ? "succeeded" : "failed", error: outcome.error };
       }
       statuses.value = next;
-      if (result.status === "succeeded") tell(`全部 ${steps.value.length} 步已完成`);
+      if (result.status === "succeeded") tell(`已完成 ${selected.length} 步`);
       else if (result.error) fail(result.error);
     } catch (error) {
-      statuses.value = {};
+      statuses.value = previous;
       fail(error);
     } finally {
       busy.value = false;
@@ -262,15 +284,44 @@ async function openSaved(path: string): Promise<void> {
     name.value = opened.name;
     steps.value = opened.steps;
     statuses.value = {};
+    tried.value = {};
+    repairing.value = null;
+    evidence.value = {};
     browsing.value = null;
   } catch (error) {
     fail(error);
   }
 }
 
+async function openEvidence(event: Event) {
+  const input = event.target as HTMLInputElement;
+  const files = Array.from(input.files ?? []);
+  input.value = "";
+  if (!files.length) return;
+  busy.value = true;
+  try {
+    const archive = await readEvidence(files);
+    const imported = await api.importBrowserSteps(archive.text);
+    if (!imported.steps.length) throw new Error("没有可回放的步骤");
+    name.value = archive.name;
+    steps.value = imported.steps;
+    evidence.value = Object.fromEntries(Object.entries(imported.source_rows)
+      .map(([id, source]) => [id, archive.screenshots.get(source) ?? []]));
+    statuses.value = {};
+    tried.value = {};
+    repairing.value = null;
+    browsing.value = null;
+    tell(`已导入 ${imported.steps.length} 步，跳过 ${imported.skipped.length} 项`);
+  } catch (error) { fail(error); }
+  finally { busy.value = false; }
+}
+
 function startOver(): void {
   steps.value = [];
   statuses.value = {};
+  tried.value = {};
+  evidence.value = {};
+  repairing.value = null;
   name.value = "新录制";
 }
 
@@ -295,10 +346,10 @@ onBeforeUnmount(() => window.clearInterval(poll));
         <span class="dot" /> 录制
       </button>
       <button v-else class="record live" @click="stopRecording"><span class="dot" /> 停止录制</button>
-      <button class="primary" :disabled="!steps.length || busy || recording" @click="runAll">▶ 运行全部</button>
+      <button class="primary" :disabled="!steps.length || busy || recording" @click="runFrom()">▶ 运行全部</button>
       <button :disabled="!steps.length || busy || !name.trim()" @click="save">保存</button>
-      <button @click="browse">打开…</button>
-      <button class="ghost" :disabled="!steps.length" title="清空步骤" @click="startOver">新建</button>
+      <button :disabled="busy || recording" @click="browse">打开…</button>
+      <button class="ghost" :disabled="!steps.length || busy || recording" title="清空步骤" @click="startOver">新建</button>
     </header>
 
     <div v-if="notice" class="notice" :class="notice.kind">
@@ -334,7 +385,7 @@ onBeforeUnmount(() => window.clearInterval(poll));
           <span v-if="recording" class="chip live-chip">● 录制中</span>
         </header>
         <StepComposer
-          v-if="node"
+          v-if="node && !repairing"
           :node="node"
           :destination="destination"
           :busy="busy"
@@ -347,10 +398,10 @@ onBeforeUnmount(() => window.clearInterval(poll));
             <p>还没有步骤。</p>
             <p class="muted">在中间选一个元素来添加步骤{{ targets?.recording_supported ? "，或点“录制”后直接操作窗口" : "" }}。</p>
           </div>
+          <template v-for="(step, index) in steps" :key="step.id">
           <StepCard
-            v-for="(step, index) in steps"
-            :key="step.id"
             :step="step"
+            :busy="busy || recording"
             :index="index"
             :last="index === steps.length - 1"
             :status="statuses[step.id]?.status"
@@ -360,8 +411,14 @@ onBeforeUnmount(() => window.clearInterval(poll));
             @remove="remove(index)"
             @move="(by) => (steps = move(steps, index, by))"
             @update="(next) => update(index, next)"
+            @repair="repairing = step.id; node = null; picking = false"
+            @run-from="fromIndex = index"
             @test="(locator) => test(step, locator)"
           />
+          <RepairStep v-if="repairing === step.id" :step="step" :shots="evidence[step.id] ?? []"
+            :node="node" :resource="resource" :busy="busy || recording"
+            @close="repairing = null" @replace="next => { update(index, next); repairing = null; }" />
+          </template>
         </div>
       </section>
     </main>
@@ -379,6 +436,8 @@ onBeforeUnmount(() => window.clearInterval(poll));
     </Modal>
 
     <Modal v-if="browsing" title="打开录制" @close="browsing = null">
+      <button :disabled="busy" @click="folder?.click()">选择浏览器录制目录…</button>
+      <input ref="folder" type="file" webkitdirectory multiple hidden @change="openEvidence" />
       <p class="muted mono">{{ browsing.directory }}</p>
       <div v-if="!browsing.recordings.length" class="empty">还没有保存过录制</div>
       <button
@@ -390,6 +449,13 @@ onBeforeUnmount(() => window.clearInterval(poll));
         <span class="grow ellipsis">{{ saved.name }}</span>
         <span class="muted">{{ saved.modified ?? "" }}</span>
       </button>
+    </Modal>
+    <Modal v-if="fromIndex !== null" title="从这一步试跑" @close="fromIndex = null">
+      <p>将执行第 {{ fromIndex + 1 }} 至 {{ steps.length }} 步。先把页面或窗口放到第 {{ fromIndex + 1 }} 步需要的状态。</p>
+      <template #actions>
+        <button @click="fromIndex = null">取消</button>
+        <button class="primary" @click="runFrom(fromIndex!)">运行这 {{ steps.length - fromIndex }} 步</button>
+      </template>
     </Modal>
   </div>
 </template>

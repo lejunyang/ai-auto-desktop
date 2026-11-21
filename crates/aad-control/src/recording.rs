@@ -20,6 +20,7 @@ use crate::{error, Locator, Session};
 use aad_core::AutomationError;
 use aad_runtime::Provider;
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -39,6 +40,8 @@ type Result<T> = std::result::Result<T, AutomationError>;
 #[derive(Debug, Default)]
 pub struct Batch {
     pub steps: Vec<Step>,
+    /// Raw browser recording row kept for each normalized replay step.
+    pub source_rows: BTreeMap<String, u64>,
     /// Interactions that cannot become a replayable step, with the reason.
     pub skipped: Vec<Value>,
     /// Events the provider had to drop because nobody collected in time.
@@ -228,7 +231,12 @@ fn collect_events(
             note: None,
         };
         match step.validate() {
-            Ok(()) => batch.steps.push(step),
+            Ok(()) => {
+                if let Some(row) = event["source_row"].as_u64() {
+                    batch.source_rows.insert(step.id.clone(), row);
+                }
+                batch.steps.push(step);
+            }
             Err(problem) => batch
                 .skipped
                 .push(json!({"reason": problem.message, "summary": event["kind"]})),
@@ -355,7 +363,7 @@ pub fn from_browser_steps(steps_jsonl: &str, next: &mut usize) -> Batch {
             continue;
         }
         let at_ms = action["at_ms"].clone();
-        let event = match kind {
+        let mut event = match kind {
             "upload" => {
                 node["file_hidden"] = action["hidden"].clone();
                 json!({"kind":"upload","node":node,"at_ms":at_ms})
@@ -377,6 +385,7 @@ pub fn from_browser_steps(steps_jsonl: &str, next: &mut usize) -> Batch {
                 continue;
             }
         };
+        event["source_row"] = step["id"].clone();
         let app = App {
             provider: Some(BROWSER.into()),
             url: Some(page),
@@ -390,6 +399,7 @@ pub fn from_browser_steps(steps_jsonl: &str, next: &mut usize) -> Batch {
     for (app, events) in runs {
         let part = from_events(&app, &events, next);
         batch.steps.extend(part.steps);
+        batch.source_rows.extend(part.source_rows);
         batch.skipped.extend(part.skipped);
     }
     batch
@@ -547,6 +557,28 @@ impl Recording {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn normalized_browser_steps_keep_their_actual_evidence_rows() {
+        let row = |id, kind, value| {
+            json!({"id":id,"kind":"action","action":{
+                "kind":kind,"value":value,"control":{"role":"textbox","name":"Order"},
+                "url":"https://example.test/new","document_id":"main","node_id":"5","at_ms":id
+            }})
+            .to_string()
+        };
+        let rows = [
+            row(4, "click", ""),
+            row(7, "input", "a"),
+            row(9, "input", "ab"),
+            row(18, "enter", ""),
+        ]
+        .join("\n");
+        let batch = from_browser_steps(&rows, &mut 1);
+        assert_eq!(batch.steps.len(), 2);
+        assert_eq!(batch.source_rows["rec1"], 9);
+        assert_eq!(batch.source_rows["rec2"], 18);
+    }
 
     #[test]
     fn file_selection_never_imports_a_filename_or_an_unverified_outcome() {

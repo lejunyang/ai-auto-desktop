@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref } from "vue";
+import { ref, watch } from "vue";
 import type { Failure, Found, Locator, Step } from "../api";
 import { cleanLocator, describeApp, title } from "../steps";
 
@@ -9,6 +9,7 @@ const props = defineProps<{
   step: Step;
   index: number;
   last: boolean;
+  busy: boolean;
   status?: Status;
   error?: Failure | null;
   tried?: Found | Failure | null;
@@ -19,6 +20,8 @@ const emit = defineEmits<{
   move: [by: -1 | 1];
   update: [step: Step];
   test: [locator: Locator];
+  repair: [];
+  runFrom: [];
 }>();
 
 const open = ref(false);
@@ -27,6 +30,7 @@ const app = ref({ process: "", title: "", url: "" });
 const contains = ref(false);
 const within = ref("");
 const nth = ref("");
+watch(() => props.step, () => { open.value = false; });
 
 function edit(): void {
   open.value = !open.value;
@@ -82,17 +86,22 @@ function triedText(): string {
       <span v-if="status === 'running'" class="state">…</span>
       <span v-else-if="status === 'succeeded'" class="state ok">✓</span>
       <span v-else-if="status === 'failed'" class="state bad">✕</span>
-      <div class="tools">
+      <fieldset class="tools" :disabled="busy">
         <button class="ghost" title="执行这一步" @click="emit('perform')">▶</button>
         <button v-if="!step.read" class="ghost" title="编辑" @click="edit">✎</button>
         <button class="ghost" title="上移" :disabled="index === 0" @click="emit('move', -1)">↑</button>
         <button class="ghost" title="下移" :disabled="last" @click="emit('move', 1)">↓</button>
         <button class="ghost danger" title="删除" @click="emit('remove')">🗑</button>
-      </div>
+      </fieldset>
     </div>
     <div v-if="error && status === 'failed'" class="error">
       {{ error.message }}<span v-if="error.hint"> · {{ error.hint }}</span>
     </div>
+    <div v-if="open || status === 'failed'" class="repair-tools">
+      <button v-if="!step.read" :disabled="busy" @click="emit('repair')">对照并替换元素</button>
+      <button :disabled="busy" @click="emit('runFrom')">从这一步试跑</button>
+    </div>
+    <button v-else-if="step.read" class="ghost" :disabled="busy" @click="emit('runFrom')">从这一步试跑</button>
 
     <div v-if="open" class="editor">
       <div class="grid">
@@ -169,9 +178,13 @@ function triedText(): string {
   color: var(--danger);
 }
 .tools {
+  padding: 0;
+  margin: 0;
+  border: 0;
   display: flex;
   opacity: 0.35;
 }
+.repair-tools { display: flex; gap: 8px; margin: 8px 0 0 32px; }
 .card:hover .tools {
   opacity: 1;
 }

@@ -171,6 +171,10 @@ export function useTransport(transport: Caller): void {
 }
 
 export const api = {
+  importBrowserSteps: (rows: string) =>
+    call<{ steps: Step[]; source_rows: Record<string, number>; skipped: unknown[] }>("import_browser_steps", { rows }),
+  capture: (resourceId: string, locator: Locator) =>
+    call<{ data: string }>("capture_element", { resourceId, locator }),
   targets: () => call<Targets>("list_targets"),
   observe: (resourceId: string, view: Record<string, unknown>) =>
     call<Observation>("observe", { resourceId, view }),
