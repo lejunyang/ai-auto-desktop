@@ -6,6 +6,26 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 use url::Url;
 
+impl crate::Session {
+    /// Resolve the single regular file a native Open dialog may receive under
+    /// this session's upload grants, using the same checks as a DOM upload.
+    pub fn native_upload_path(&self, file: &str) -> Result<PathBuf> {
+        let files = self.upload_files(&[file.to_owned()])?;
+        let path = PathBuf::from(&files[0]);
+        let original = std::path::Path::new(file).canonicalize().ok();
+        if original.is_none()
+            || path.canonicalize().ok() != original
+            || files[0].chars().any(char::is_control)
+        {
+            return Err(error(
+                "CONTROL.INVALID_REQUEST",
+                "native picker requires an unambiguous file path on one line",
+            ));
+        }
+        Ok(path)
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct BrowserAccess {
     file_roots: Vec<PathBuf>,

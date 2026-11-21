@@ -6,6 +6,10 @@ mod read;
 
 #[derive(Subcommand)]
 pub enum Command {
+    /// Select local files in a Chromium file chooser that is already open.
+    ChooseFiles(crate::desk::open_picker::Args),
+    /// Choose a new destination in a Chromium Save As dialog that is already open.
+    SaveAs(crate::desk::open_picker::SaveArgs),
     /// Read a page's text, outline, or several named fields in one observation.
     Read(read::Args),
     /// Download and verify the ready file from one identified task in a session-owned browser.
@@ -26,6 +30,8 @@ pub enum Command {
 
 pub fn run(command: &Command) -> (Value, u8) {
     match command {
+        Command::ChooseFiles(args) => crate::desk::open_picker::choose(args),
+        Command::SaveAs(args) => crate::desk::open_picker::save(args),
         Command::Read(args) => match read::run(args) {
             Ok(value) => (value, EXIT_OK),
             Err(error) => (error, EXIT_FAILED),

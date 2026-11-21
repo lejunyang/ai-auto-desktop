@@ -12,9 +12,8 @@ use std::path::PathBuf;
 
 use crate::{failure, EXIT_FAILED, EXIT_OK, EXIT_USAGE};
 
-#[cfg(target_os = "linux")]
 #[path = "browser_record/open_picker.rs"]
-mod open_picker;
+pub(crate) mod open_picker;
 
 /// Observation can be slow on a large window; the protocol allows up to 30 s.
 const TIMEOUT_MS: u64 = 30_000;
@@ -248,8 +247,7 @@ pub struct DragArgs {
 
 #[derive(Subcommand)]
 pub enum DoCommand {
-    /// Select granted files in an already-open, browser-owned X11 file picker.
-    #[cfg(target_os = "linux")]
+    /// Select granted files in an already-open Chromium file chooser.
     ChooseFiles(open_picker::Args),
     /// Give an element keyboard focus.
     Focus(Pick),
@@ -692,7 +690,6 @@ fn decode_base64(text: &str) -> Option<Vec<u8>> {
 /// The action and the element it applies to, still to be resolved.
 fn plan(command: &DoCommand) -> Result<(&Pick, Value, Option<Locator>), (Value, u8)> {
     let (pick, mut action, to) = match command {
-        #[cfg(target_os = "linux")]
         DoCommand::ChooseFiles(_) => unreachable!("choose-files has a native dialog target"),
         DoCommand::Focus(pick) => (pick, json!({"type": "focus"}), None),
         DoCommand::Invoke(pick) => (pick, json!({"type": "invoke"}), None),
@@ -770,9 +767,8 @@ fn plan(command: &DoCommand) -> Result<(&Pick, Value, Option<Locator>), (Value, 
 }
 
 pub fn act(command: &DoCommand) -> (Value, u8) {
-    #[cfg(target_os = "linux")]
     if let DoCommand::ChooseFiles(args) = command {
-        return finish(open_picker::run(args));
+        return open_picker::choose(args);
     }
     let (pick, mut action, to) = match plan(command) {
         Ok(planned) => planned,
