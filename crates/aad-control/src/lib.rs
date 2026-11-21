@@ -2037,10 +2037,10 @@ impl Session {
             .nodes
             .first()
             .ok_or_else(|| error("CONTROL.STALE_TARGET", "the observed table disappeared"))?;
-        if scoped.provider != browser::PROVIDER || root["tag"] != "table" {
+        if scoped.provider != browser::PROVIDER || !table::supported_node(root) {
             return Err(error(
                 "CONTROL.ACTION_UNSUPPORTED",
-                "select an HTML table on a Chromium page",
+                "select a table or grid on a Chromium page",
             ));
         }
         let backend = &self.backends[&scoped.provider];

@@ -389,7 +389,7 @@ the first one. To ask whether something has gone away, pass expect: optional and
         ),
         (
             "control_collect_table",
-            "Collect an HTML table from the current page forward using a stable selected column as row_key. Pagination requires an observed First control or expected_rows to confirm the start, and advances using freshly observed Next controls. Virtual scrolling starts at the top and needs expected_rows or aria-rowcount to confirm completeness. Inspect complete and stop_reason. Requires input permission.",
+            "Collect an HTML table or DOM-owned ARIA grid/table from the current page forward using a stable selected column as row_key. Pagination requires an observed First control or expected_rows to confirm the start, and advances using freshly observed Next controls. Virtual scrolling starts at the top and needs expected_rows or aria-rowcount to confirm completeness. Inspect complete and stop_reason. Requires input permission.",
             json!({
                 "resource_id":{"type":"string"},"table":crate::tools::locator_schema(),
                 "columns":{"type":"array","minItems":1,"maxItems":32,"uniqueItems":true,"items":{"type":"string","minLength":1,"maxLength":256}},
@@ -406,7 +406,7 @@ the first one. To ask whether something has gone away, pass expect: optional and
         ),
         (
             "control_read_table",
-            "Read named columns of an observed Chromium HTML table into records. Use literal names for single-level headers and /Group/Leaf paths for grouped columns (escape ~ as ~0 and / as ~1 within a label). Returns rendered rows, truncation reasons and null for missing cells.",
+            "Read named columns of an observed Chromium HTML table or DOM-owned ARIA grid/table into records. Use literal names for single-level headers and /Group/Leaf paths for grouped columns (escape ~ as ~0 and / as ~1 within a label). Returns rendered rows, truncation reasons and null for missing cells.",
             json!({"target":target_schema(),"columns":{"type":"array","minItems":1,"maxItems":32,"uniqueItems":true,"items":{"type":"string","minLength":1,"maxLength":256}},
                 "max_characters":{"type":"integer","minimum":aad_control::MIN_OUTLINE_CHARACTERS,"maximum":aad_control::MAX_OUTLINE_CHARACTERS}}),
             vec!["target","columns"],

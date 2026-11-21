@@ -67,16 +67,60 @@
   const recognizesOpenPicker = CSS.supports('selector(input:open)');
   const openPicker = el => fileInput(el) && recognizesOpenPicker ? el.matches(':open') : null;
   const visible = el => el.isConnected && el.ownerDocument === document && el.getClientRects().length > 0 && getComputedStyle(el).visibility !== 'hidden';
+  const tableSelector = 'table,[role="grid"],[role="table"]';
+  const gridCellSelector = '[role="columnheader"],[role="rowheader"],[role="cell"],[role="gridcell"]';
+  // Read DOM-owned roles, including presentation wrappers. An embedded grid
+  // owns its own rows and a cell's contents are never structure of its parent.
+  function ariaRows(table, reasons) {
+    const cells = new Map();
+    let valid = !table.hasAttribute('aria-owns'), scanned = 0;
+    const walker = document.createTreeWalker(table, NodeFilter.SHOW_ELEMENT, {
+      acceptNode(el) {
+        if (el.matches(tableSelector + ',[role="treegrid"],[aria-hidden="true"]') ||
+            el.parentElement.matches(gridCellSelector)) return NodeFilter.FILTER_REJECT;
+        return NodeFilter.FILTER_ACCEPT;
+      }
+    });
+    for (let el = walker.nextNode(); el; el = walker.nextNode()) {
+      if (++scanned > 100000) { reasons.add('node_scan_limit'); valid = false; break; }
+      if (el.hasAttribute('aria-owns')) valid = false;
+      if (el.matches('[role="row"]')) {
+        if (cells.size === 2000) { reasons.add('row_scan_limit'); break; }
+        if (el.parentElement.closest('[role="row"]')?.closest(tableSelector) === table) valid = false;
+        cells.set(el, []);
+      } else if (el.matches(gridCellSelector)) {
+        const row = cells.get(el.closest('[role="row"]'));
+        if (!row) valid = false;
+        else if (row.length <= 50) row.push(el); // Keep one extra to detect overflow.
+      }
+    }
+    return {cells, valid};
+  }
+  function ariaInteger(el, name, fallback) {
+    const text = el.getAttribute(name);
+    if (text === null) return fallback;
+    const value = Number(text);
+    return /^-?\d+$/.test(text) && Number.isSafeInteger(value) ? value : NaN;
+  }
   function readTable(table, nodeId, budget) {
     const reasons = new Set(), rows = [], headers = [];
+    const grid = table.tagName === 'TABLE' ? null : ariaRows(table, reasons);
+    const cellsOf = row => grid ? grid.cells.get(row) : row.cells;
     // Hidden rows still affect rowspan. Bound their scan separately from the
     // 200 rendered rows and 50 logical columns in the response.
-    const physical = Array.prototype.slice.call(table.rows, 0, 2000);
-    if (physical.length < table.rows.length) reasons.add('row_scan_limit');
+    const physical = grid ? Array.from(grid.cells.keys()).filter(visible) : Array.prototype.slice.call(table.rows, 0, 2000);
+    if (!grid && physical.length < table.rows.length) reasons.add('row_scan_limit');
     const rendered = physical.filter(visible);
-    const isHeader = cell => cell.tagName === 'TH' && !['row','rowgroup'].includes(cell.scope);
+    const isHeader = cell => grid ? cell.getAttribute('role') === 'columnheader' :
+      cell.tagName === 'TH' && !['row','rowgroup'].includes(cell.scope);
     let headerCount = 0;
-    if (table.tHead) {
+    if (grid) {
+      for (const row of rendered) {
+        const cells = cellsOf(row);
+        if (!cells.length || !cells.every(isHeader)) break;
+        headerCount++;
+      }
+    } else if (table.tHead) {
       headerCount = rendered.filter(row => row.parentElement === table.tHead).length;
     } else if (rendered.length) {
       // Without a thead, retain the historical first-row convention. A spanning
@@ -92,10 +136,14 @@
       }
     }
     const declared = Number(table.getAttribute('aria-rowcount') || 0);
+    const declaredCols = ariaInteger(table, 'aria-colcount', null);
     if (rendered.length > 200) reasons.add('row_limit');
     if (declared === -1 || declared > rendered.length) reasons.add('rows_not_rendered');
 
-    let group, slots = [], valid = headerCount > 0, columnKeys;
+    let group, slots = [], valid = headerCount > 0 && (!grid || grid.valid), columnKeys;
+    let logicalRow = 0;
+    if (grid && table.hasAttribute('aria-rowcount') && !(ariaInteger(table,'aria-rowcount',0) > 0 || declared === -1)) valid = false;
+    if (grid && declaredCols !== null && !(declaredCols > 0 || declaredCols === -1)) valid = false;
     const samples = new WeakMap();
     function sample(cell) {
       if (!samples.has(cell)) {
@@ -108,17 +156,32 @@
     for (let y = 0; y < physical.length && rows.length < 200; y++) {
       const row = physical[y], inHeader = rows.length < headerCount;
       if (budget.left <= 0) { reasons.add('character_budget'); break; }
-      if (group !== row.parentElement) { group = row.parentElement; slots = []; }
-      slots = slots.map(slot => slot && slot.end > y ? slot : null);
+      const nextGroup = grid ? row.closest('[role="rowgroup"]') || table : row.parentElement;
+      if (group !== nextGroup) { group = nextGroup; slots = []; }
+      const index = grid ? ariaInteger(row, 'aria-rowindex', logicalRow + 1) : y + 1;
+      if (!(index > logicalRow) || (grid && declared > 0 && index > declared)) valid = false;
+      if (index > logicalRow + 1) {
+        reasons.add('rows_not_rendered');
+        if (inHeader) valid = false;
+      }
+      logicalRow = index;
+      slots = slots.map(slot => slot && slot.end > index ? slot : null);
       let x = 0;
-      for (const cell of row.cells) {
+      const rowCells = cellsOf(row);
+      for (const cell of rowCells) {
         while (slots[x]) x++;
-        const right = x + cell.colSpan;
+        const colSpan = grid ? ariaInteger(cell, 'aria-colspan', 1) : cell.colSpan;
+        const rowSpan = grid ? ariaInteger(cell, 'aria-rowspan', 1) : cell.rowSpan;
+        if (!(colSpan >= 1 && rowSpan >= 0)) { valid = false; break; }
+        if (grid && (ariaInteger(cell,'aria-colindex',x+1) !== x+1 ||
+            ariaInteger(cell,'aria-rowindex',index) !== index ||
+            (cell === rowCells[0] && ariaInteger(row,'aria-colindex',x+1) !== x+1))) valid = false;
+        const right = x + colSpan;
         if (right > 50) {
           reasons.add('column_limit');
           if (inHeader) valid = false;
         }
-        const slot = {cell, end: cell.rowSpan === 0 ? Infinity : y + cell.rowSpan};
+        const slot = {cell, end: rowSpan === 0 ? Infinity : index + rowSpan};
         for (; x < Math.min(right, 50); x++) {
           if (slots[x]) valid = false; // Overlap is an HTML table-model error.
           slots[x] = slot;
@@ -128,6 +191,10 @@
       if (!visible(row)) continue;
       // Discard expired trailing slots, keeping interior holes as missing cells.
       while (slots.length && !slots[slots.length - 1]) slots.pop();
+      if (grid && declaredCols !== null) {
+        if (declaredCols === -1 || declaredCols > slots.length) reasons.add('columns_not_rendered');
+        else if (declaredCols < slots.length) valid = false;
+      }
       const values = [];
       for (const slot of slots) {
         if (budget.left <= 0) { reasons.add('character_budget'); break; }
@@ -143,7 +210,7 @@
       rows.push(values);
       if (!inHeader) continue;
       const tier = slots.map(slot => slot?.cell);
-      if (!tier.length || tier.length !== values.length || tier.some(c => !c || c.tagName !== 'TH' || sample(c) === null ||
+      if (!tier.length || tier.length !== values.length || tier.some(c => !c || !(grid ? isHeader(c) : c.tagName === 'TH') || sample(c) === null ||
         (headerCount > 1 && (!isHeader(c) || !sample(c))))) valid = false;
       if (headers.length) {
         const parent = headers[headers.length-1];
@@ -371,7 +438,7 @@
       const ids=new Map(); nodes.forEach((found,id)=>ids.set(found.el,id));
       const budget={left:max};
       let cut=false;
-      const all=root ? [...(root.matches('table')?[root]:[]),...root.querySelectorAll('table')].filter(visible) : [];
+      const all=root ? [...(root.matches(tableSelector)?[root]:[]),...root.querySelectorAll(tableSelector)].filter(visible) : [];
       const tables=[];
       for (const table of all.slice(0,20)) {
         if (budget.left <= 0) { cut=true; break; }

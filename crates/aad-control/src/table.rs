@@ -1,6 +1,10 @@
-//! Bounded traversal of a single observed HTML table.
+//! Bounded traversal of one observed browser table or grid.
 use super::*;
 use serde::{Deserialize, Serialize};
+
+pub(crate) fn supported_node(node: &Value) -> bool {
+    node["tag"] == "table" || matches!(node["role"].as_str(), Some("table" | "grid"))
+}
 
 pub(crate) fn validate_columns(columns: &[String]) -> Result<()> {
     if !(1..=32).contains(&columns.len())
@@ -252,10 +256,10 @@ impl Session {
             ));
         }
         let table = self.find_in(&id, &observation, &spec.table, Expect::One, context)?;
-        if table["node"]["tag"] != "table" {
+        if !supported_node(&table["node"]) {
             return Err(error(
                 "CONTROL.TABLE_HEADER",
-                "table locator must identify an HTML table",
+                "table locator must identify a table or grid",
             ));
         }
         let scrolling = matches!(spec.traversal, Traversal::VirtualScroll { .. });
