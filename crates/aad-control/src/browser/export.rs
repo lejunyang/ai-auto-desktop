@@ -3,7 +3,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::fs::OpenOptions;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -89,7 +89,7 @@ impl Session {
                     "Chromium did not report the completed file path; not using a filename guess",
                 )
             })?;
-        let (bytes, sha256) =
+        let (bytes, sha256, path) =
             verify_file(&cursor.directory, Path::new(path), expected, item, check)?;
         Ok(Some(
             json!({"guid":item["guid"], "frame_id":frame, "filename":expected.filename, "path":path, "bytes":bytes, "sha256":sha256,
@@ -159,7 +159,7 @@ fn verify_file(
     expected: &ExpectedFile,
     item: &Value,
     check: impl Fn() -> Result<()>,
-) -> Result<(u64, String)> {
+) -> Result<(u64, String, PathBuf)> {
     let unsafe_path = || {
         error(
             "BROWSER.EXPORT_UNSAFE_PATH",
@@ -214,31 +214,57 @@ fn verify_file(
     {
         return Err(mismatch());
     }
-    let mut hash = Sha256::new();
-    let mut read = 0;
-    let mut buf = [0u8; 32768];
-    loop {
-        check()?;
-        let count = file.read(&mut buf).map_err(|_| unsafe_path())?;
-        if count == 0 {
-            break;
+    let output_error = || {
+        error(
+            "BROWSER.EXPORT_SAVE_FAILED",
+            "could not preserve a verified copy in the private session directory",
+        )
+    };
+    let artifact_dir = directory.join(format!("verified-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&artifact_dir).map_err(|_| output_error())?;
+    let suffix = Path::new(&expected.filename)
+        .extension()
+        .and_then(|s| s.to_str())
+        .filter(|s| s.len() <= 16 && s.bytes().all(|b| b.is_ascii_alphanumeric()))
+        .unwrap_or("bin");
+    let artifact = artifact_dir.join(format!("export.{suffix}"));
+    let result = (|| {
+        let mut output = std::fs::File::create_new(&artifact).map_err(|_| output_error())?;
+        let mut hash = Sha256::new();
+        let mut read = 0;
+        let mut buf = [0u8; 32768];
+        loop {
+            check()?;
+            let count = file.read(&mut buf).map_err(|_| unsafe_path())?;
+            if count == 0 {
+                break;
+            }
+            read += count as u64;
+            if read > size {
+                return Err(mismatch());
+            }
+            hash.update(&buf[..count]);
+            output
+                .write_all(&buf[..count])
+                .map_err(|_| output_error())?;
         }
-        read += count as u64;
-        if read > size {
+        let digest = format!("{:x}", hash.finalize());
+        if read != size
+            || expected
+                .sha256
+                .as_ref()
+                .is_some_and(|want| !digest.eq_ignore_ascii_case(want))
+        {
             return Err(mismatch());
         }
-        hash.update(&buf[..count]);
+        output.sync_all().map_err(|_| output_error())?;
+        Ok((size, digest, artifact.clone()))
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(artifact);
+        let _ = std::fs::remove_dir(artifact_dir);
     }
-    let digest = format!("{:x}", hash.finalize());
-    if read != size
-        || expected
-            .sha256
-            .as_ref()
-            .is_some_and(|want| !digest.eq_ignore_ascii_case(want))
-    {
-        return Err(mismatch());
-    }
-    Ok((size, digest))
+    result
 }
 
 #[cfg(test)]
@@ -314,8 +340,10 @@ mod tests {
         fs::write(&path, "abc").unwrap();
         let item = json!({"received_bytes":3.0,"total_bytes":3.0});
         let verify = |file: &Path| verify_file(&dir, file, &expected(), &item, || Ok(()));
-        assert_eq!(verify(&path).unwrap().0, 3);
+        let (bytes, _, artifact) = verify(&path).unwrap();
+        assert_eq!(bytes, 3);
         fs::write(&path, "bad").unwrap();
+        assert_eq!(fs::read(artifact).unwrap(), b"abc");
         assert_eq!(verify(&path).unwrap_err().code, "BROWSER.EXPORT_MISMATCH");
         assert!(verify(&dir).is_err());
         #[cfg(unix)]
