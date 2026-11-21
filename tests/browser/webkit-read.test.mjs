@@ -16,6 +16,10 @@ test('WebKit reads rendered text and named controls, and closes the session afte
       return;
     }
     res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    if (req.url === '/long') {
+      res.end('<button aria-label="'+'A'.repeat(300)+'"></button>');
+      return;
+    }
     res.end(`<h1>账单</h1><span hidden>hidden-marker</span><p>账单号 12345</p>
       <textarea>private-draft</textarea><input type=password value="private-password">
       <a href="/bill">详情</a><button aria-label="打印账单">打印</button>`);
@@ -54,4 +58,7 @@ test('WebKit reads rendered text and named controls, and closes the session afte
   assert.deepEqual(outline.nodes, [
     {role:'heading',name:'账单'}, {role:'link',name:'详情'}, {role:'button',name:'打印账单'},
   ]);
+  const long = await read(url+'long', '--view','outline');
+  assert.equal(long.truncated, true);
+  assert.equal(long.nodes[0].name, 'A'.repeat(256));
 });

@@ -24,7 +24,9 @@ while (stack.length) {
             else if (node.matches('button')) role = 'button';
             if (role) {
                 if (nodes.length === 200) { output.truncated = true; break; }
-                const name = (node.getAttribute('aria-label') || '').slice(0, 256).trim();
+                const full = node.getAttribute('aria-label') || '';
+                if (full.length > 256) output.truncated = true;
+                const name = full.slice(0, 256).trim();
                 const entry = {role, name};
                 nodes.push(entry);
                 label = name ? null : entry;
@@ -36,7 +38,8 @@ while (stack.length) {
         const range = document.createRange();
         range.selectNodeContents(node);
         if (range.getBoundingClientRect().width) {
-            const remaining = outline ? 256 - label.name.length : 20000 - characters;
+            const separator = outline && label.name.length ? 1 : 0;
+            const remaining = outline ? Math.max(0, 256 - label.name.length - separator) : 20000 - characters;
             const text = node.substringData(0, remaining).replace(/\s+/g, ' ').trim();
             if (outline) {
                 if (text) label.name = (label.name + ' ' + text).trim().slice(0, 256);
