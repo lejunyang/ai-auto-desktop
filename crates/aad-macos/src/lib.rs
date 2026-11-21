@@ -4,6 +4,7 @@
 #![cfg(target_os = "macos")]
 
 pub mod ax;
+pub mod browser_picker;
 mod desktop;
 mod macos;
 mod pasteboard;

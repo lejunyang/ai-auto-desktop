@@ -554,6 +554,7 @@ private func recorderTapCallback(
 
 private final class AXService {
     private let tokens = TokenStore()
+    private var browserPicker: BrowserPicker?
     private var recorders: [String: Recorder] = [:]
 
     /// The nearest window or sheet at callback time. A dismissed dialog can
@@ -622,6 +623,8 @@ private final class AXService {
     ) throws -> Any {
         try checkDeadline(deadlineMS)
         switch operation {
+        case "picker_observe", "picker_revalidate", "picker_dismiss", "picker_save_new":
+            return try filePicker(operation, Arguments(values: args), deadlineMS, requestID)
         case "status":
             try Arguments(values: args).only([])
             return [
@@ -2615,6 +2618,320 @@ private final class AXService {
             "width": max(0, finiteInt(size.width)),
             "height": max(0, finiteInt(size.height)),
         ]
+    }
+}
+
+private struct PanelControls {
+    let accept: AXUIElement
+    let cancel: AXUIElement
+    let filename: AXUIElement?
+    let location: AXUIElement?
+}
+
+private struct BrowserPicker {
+    let token: String
+    let pid: pid_t
+    let bounds: [Int]
+    let saving: Bool
+    let window: AXUIElement
+    let sheet: AXUIElement
+    let controls: PanelControls
+}
+
+private extension AXService {
+    func pickerError(_ reason: String) -> HelperFailure {
+        HelperFailure("DRIVER.ACTION_UNSUPPORTED", reason)
+    }
+
+    // Never infer that a sheet closed from a failed AX read.
+    func panelChildren(_ element: AXUIElement, _ deadline: Double?) throws -> [AXUIElement] {
+        let result = try children(element, limit: 256, deadlineMS: deadline)
+        guard !result.truncated else { throw pickerError("incomplete native panel tree") }
+        return result.children
+    }
+
+    func panelRole(_ element: AXUIElement) throws -> String {
+        guard let role = stringAttribute(element, kAXRoleAttribute as CFString) else {
+            throw pickerError("unreadable native panel element")
+        }
+        return role
+    }
+
+    func panelWindow(_ pid: pid_t, _ bounds: [Int], _ deadline: Double?) throws -> AXUIElement {
+        let app = AXUIElementCreateApplication(pid)
+        try configureTimeout(app, deadlineMS: deadline)
+        guard let raw = copyAttribute(app, kAXWindowsAttribute as CFString),
+              let windows = raw as? [AXUIElement], !windows.isEmpty, windows.count <= 128 else {
+            throw pickerError("could not enumerate the browser's AX windows")
+        }
+        var matches: [AXUIElement] = []
+        for window in windows {
+            try configureTimeout(window, deadlineMS: deadline)
+            let role = try panelRole(window)
+            if role == "AXSheet" { continue }
+            guard role == "AXWindow",
+                  let frame = copyBounds(window) else { throw pickerError("unreadable browser window") }
+            if boolAttribute(window, kAXModalAttribute as CFString) == true
+                || ["AXDialog", "AXSystemDialog"].contains(stringAttribute(window, kAXSubroleAttribute as CFString) ?? "") {
+                throw pickerError("an additional modal window is open")
+            }
+            if frame["x"] == bounds[0], frame["y"] == bounds[1],
+               frame["width"] == bounds[2], frame["height"] == bounds[3] {
+                matches.append(window)
+            }
+        }
+        var owner = pid_t(0)
+        guard matches.count == 1, AXUIElementGetPid(matches[0], &owner) == .success, owner == pid else {
+            throw pickerError("no unique browser window matches the CDP bounds and process")
+        }
+        guard let focused = elementAttribute(app, kAXFocusedWindowAttribute as CFString) else {
+            throw pickerError("could not identify the focused browser window")
+        }
+        if !CFEqual(focused, matches[0]) {
+            let sheets = try attachedSheets(matches[0], deadline)
+            guard sheets.count == 1, CFEqual(sheets[0], focused) else {
+                throw pickerError("the observed browser window does not own the focused dialog")
+            }
+        }
+        return matches[0]
+    }
+
+    func attachedSheets(_ window: AXUIElement, _ deadline: Double?) throws -> [AXUIElement] {
+        let nodes = try panelChildren(window, deadline)
+        if try panelRole(window) == "AXWindow", nodes.isEmpty {
+            throw pickerError("could not read the surviving browser window's contents")
+        }
+        return try nodes.filter {
+            let role = try panelRole($0)
+            if role == "AXWindow" || role == "AXDialog" || role == "AXAlert" {
+                throw pickerError("unexpected dialog attached to the browser window")
+            }
+            return role == "AXSheet"
+        }
+    }
+
+    func panelLabels(_ element: AXUIElement) -> [String] {
+        var labels = [stringAttribute(element, kAXTitleAttribute as CFString),
+                      stringAttribute(element, kAXDescriptionAttribute as CFString)]
+        if let label = elementAttribute(element, kAXTitleUIElementAttribute as CFString) {
+            labels.append(stringAttribute(label, kAXValueAttribute as CFString))
+            labels.append(stringAttribute(label, kAXTitleAttribute as CFString))
+        }
+        return labels.compactMap { $0?.trimmingCharacters(in: CharacterSet(charactersIn: ":： ")).lowercased() }
+    }
+
+    func panelControls(_ sheet: AXUIElement, saving: Bool, _ deadline: Double?) throws -> PanelControls {
+        var nodes = try panelChildren(sheet, deadline)
+        var seen = 0
+        var buttons: [AXUIElement] = [], names: [AXUIElement] = [], locations: [AXUIElement] = []
+        var fileView = false
+        var appKitControl = false
+        while let element = nodes.popLast() {
+            seen += 1
+            guard seen <= 384 else { throw pickerError("native panel controls exceed inspection limit") }
+            try configureTimeout(element, deadlineMS: deadline)
+            let role = try panelRole(element)
+            let identifier = stringAttribute(element, kAXIdentifierAttribute as CFString) ?? ""
+            if identifier.hasPrefix("NSNav") || identifier == "saveAsNameTextField" { appKitControl = true }
+            switch role {
+            case "AXSheet", "AXWindow", "AXDialog", "AXAlert", "AXWebArea":
+                throw pickerError("nested prompt or web content in the file panel")
+            case "AXButton":
+                buttons.append(element)
+            case "AXTextField":
+                if identifier == "saveAsNameTextField"
+                    || !Set(panelLabels(element)).isDisjoint(with: ["save as", "存储为", "另存为", "名前"]) {
+                    names.append(element)
+                }
+            case "AXPopUpButton", "AXPathControl":
+                if role == "AXPathControl" || ["wherePopUpButton", "NSNavPopupButton", "pathPopup"].contains(identifier)
+                    || !Set(panelLabels(element)).isDisjoint(with: ["where", "location", "位置", "場所"]) {
+                    locations.append(element)
+                }
+            case "AXBrowser", "AXOutline", "AXTable", "AXGrid", "AXList":
+                // The contents of a file listing or sidebar are never action targets.
+                fileView = true
+            case "AXCheckBox":
+                if saving && !Set(panelLabels(element)).isDisjoint(with: ["hide extension", "隐藏扩展名", "拡張子を隠す"])
+                    && scalarStringAttribute(element, kAXValueAttribute as CFString) != "0" {
+                    throw pickerError("the save panel hides the filename extension")
+                }
+            case "AXGroup", "AXSplitGroup", "AXScrollArea", "AXLayoutArea", "AXUnknown":
+                nodes += try panelChildren(element, deadline)
+            default: break
+            }
+        }
+        let acceptLabels = saving ? ["save", "保存", "存储", "儲存"] : ["open", "打开", "開啟", "開く", "upload", "上传"]
+        func button(_ labels: [String], _ attribute: CFString) throws -> AXUIElement {
+            let matches = buttons.filter { !Set(panelLabels($0)).isDisjoint(with: labels) }
+            guard matches.count == 1, copyActionNames(matches[0]).contains("AXPress") else {
+                throw pickerError("missing or ambiguous native panel button")
+            }
+            if let semantic = elementAttribute(sheet, attribute), !CFEqual(matches[0], semantic) {
+                throw pickerError("panel button disagrees with its native role")
+            }
+            return matches[0]
+        }
+        let accept = try button(acceptLabels, kAXDefaultButtonAttribute as CFString)
+        var owner = pid_t(0)
+        let service = AXUIElementGetPid(accept, &owner) == .success ? NSRunningApplication(processIdentifier: owner) : nil
+        let systemPanel = service?.bundleIdentifier?.lowercased() == "com.apple.appkit.xpc.openandsavepanelservice"
+            && service?.bundleURL?.path.hasPrefix("/System/Library/Frameworks/AppKit.framework/") == true
+        guard systemPanel || appKitControl, names.count == (saving ? 1 : 0), fileView || !locations.isEmpty,
+              names.first.map({ isSettable($0, kAXValueAttribute as CFString) }) != false else {
+            throw pickerError("the native sheet lacks identifiable file picker controls")
+        }
+        return PanelControls(accept: accept,
+                             cancel: try button(["cancel", "取消", "キャンセル"], kAXCancelButtonAttribute as CFString),
+                             filename: names.first, location: locations.count == 1 ? locations[0] : nil)
+    }
+
+    func samePanelElement(_ a: AXUIElement?, _ b: AXUIElement?) -> Bool {
+        if let a, let b { return CFEqual(a, b) }
+        return a == nil && b == nil
+    }
+
+    func checkPanel(_ held: BrowserPicker, _ deadline: Double?) throws {
+        let window = try panelWindow(held.pid, held.bounds, deadline)
+        let sheets = try attachedSheets(window, deadline)
+        guard CFEqual(window, held.window), sheets.count == 1, CFEqual(sheets[0], held.sheet) else {
+            throw pickerError("the observed browser window or file panel changed")
+        }
+        let current = try panelControls(sheets[0], saving: held.saving, deadline)
+        guard CFEqual(current.accept, held.controls.accept), CFEqual(current.cancel, held.controls.cancel),
+              samePanelElement(current.filename, held.controls.filename),
+              samePanelElement(current.location, held.controls.location) else {
+            throw pickerError("the observed file panel controls changed")
+        }
+    }
+
+    // Read only the panel's represented directory or its native current-folder
+    // control. A URL on a sidebar item, a selected file or a search result
+    // says nothing about the directory in which Save will create a file.
+    func saveDirectory(_ held: BrowserPicker) throws -> String {
+        var sources: [(AXUIElement, [String])] = [(held.sheet, ["AXDocument", "AXURL"])]
+        if let location = held.controls.location {
+            sources.append((location, ["AXURL", "AXFilename", "AXValue", "AXHelp"]))
+        }
+        var paths = Set<String>()
+        for (node, attributes) in sources {
+            for attr in attributes {
+                guard let value = copyAttribute(node, attr as CFString) else { continue }
+                let url: URL?
+                if let fileURL = value as? URL { url = fileURL }
+                else if let text = value as? String, text.hasPrefix("/") { url = URL(fileURLWithPath: text) }
+                else if let text = value as? String, text.hasPrefix("file:") { url = URL(string: text) }
+                else { continue }
+                guard let url, url.isFileURL, url.host == nil || url.host == "" || url.host == "localhost",
+                      url.path.hasPrefix("/") else { throw pickerError("non-local file panel location") }
+                var isDir: ObjCBool = false
+                guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir), isDir.boolValue else {
+                    throw pickerError("file panel location is not an existing directory")
+                }
+                paths.insert(url.resolvingSymlinksInPath().standardizedFileURL.path)
+            }
+        }
+        guard paths.count == 1, let path = paths.first else {
+            throw pickerError("the file panel does not expose one absolute current directory")
+        }
+        return path
+    }
+
+    func verifyNewPath(_ path: String, _ held: BrowserPicker) throws -> String {
+        let url = URL(fileURLWithPath: path)
+        let parent = url.deletingLastPathComponent()
+        let name = url.lastPathComponent
+        guard path.hasPrefix("/"), !name.isEmpty, !name.contains(":"),
+              !path.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) }),
+              parent.appendingPathComponent(name).path.utf8.elementsEqual(path.utf8),
+              parent.resolvingSymlinksInPath().standardizedFileURL.path.utf8.elementsEqual(parent.path.utf8),
+              try saveDirectory(held).utf8.elementsEqual(parent.path.utf8) else {
+            throw pickerError("the observed save directory does not match the resolved destination")
+        }
+        var entry = stat()
+        guard lstat(path, &entry) == -1, errno == ENOENT else { throw pickerError("save destination is occupied or unreadable") }
+        return name
+    }
+
+    func filePicker(_ op: String, _ args: Arguments, _ deadline: Double?, _ requestID: String) throws -> [String: Any] {
+        try requireTrusted()
+        if op == "picker_observe" {
+            try args.only(["process_id", "bounds", "kind"])
+            let pid = pid_t(try args.integer("process_id", minimum: 1, maximum: Int(Int32.max)))
+            guard browserPicker == nil, let bounds = args.values["bounds"] as? [Int], bounds.count == 4,
+                  bounds[2] > 0, bounds[3] > 0, let kind = try args.string("kind"), ["open", "save"].contains(kind) else {
+                throw pickerError("invalid native file panel observation")
+            }
+            let window = try panelWindow(pid, bounds, deadline)
+            let sheets = try attachedSheets(window, deadline)
+            guard sheets.count == 1 else { throw pickerError("expected one native sheet attached to the browser window") }
+            let controls = try panelControls(sheets[0], saving: kind == "save", deadline)
+            let token = UUID().uuidString
+            browserPicker = BrowserPicker(token: token, pid: pid, bounds: bounds, saving: kind == "save",
+                                          window: window, sheet: sheets[0], controls: controls)
+            return ["token": token]
+        }
+        try args.only(op == "picker_save_new" ? ["token", "path"] : ["token"])
+        guard let held = browserPicker, held.token == (try args.string("token")) else {
+            throw pickerError("expired native file panel lease")
+        }
+        try checkPanel(held, deadline)
+        if op == "picker_revalidate" { return ["verified": true] }
+        let target: AXUIElement
+        if op == "picker_save_new" {
+            guard held.saving, let field = held.controls.filename, let path = try args.string("path") else {
+                throw pickerError("expected an observed Save panel")
+            }
+            let name = try verifyNewPath(path, held)
+            // AppKit may append the document type's extension automatically.
+            // Require the full suggested extension to remain visible and unchanged.
+            let ext = (name as NSString).pathExtension
+            guard !ext.isEmpty, let initial = copyAttribute(field, kAXValueAttribute as CFString) as? String,
+                  (initial as NSString).pathExtension.utf8.elementsEqual(ext.utf8) else {
+                throw pickerError("the full suggested filename extension must remain unchanged")
+            }
+            try configureTimeout(field, deadlineMS: deadline)
+            emit(["id": requestID, "progress": ["native_dispatch_started": true]])
+            try requireSuccess(AXUIElementSetAttributeValue(field, kAXValueAttribute as CFString, name as CFString),
+                               operation: "set Save As name")
+            try checkPanel(held, deadline)
+            guard let actual = copyAttribute(field, kAXValueAttribute as CFString) as? String,
+                  actual.utf8.elementsEqual(name.utf8) else { throw pickerError("Save As name did not match exactly") }
+            _ = try verifyNewPath(path, held)
+            target = held.controls.accept
+        } else {
+            guard op == "picker_dismiss", !held.saving else { throw pickerError("expected an observed Open panel") }
+            target = held.controls.cancel
+        }
+        try configureTimeout(target, deadlineMS: deadline)
+        guard boolAttribute(target, kAXEnabledAttribute as CFString) == true else {
+            throw pickerError("observed file panel button is disabled")
+        }
+        try checkDeadline(deadline)
+        browserPicker = nil
+        emit(["id": requestID, "progress": ["native_dispatch_started": true]])
+        try requireSuccess(AXUIElementPerformAction(target, kAXPressAction as CFString), operation: "press file panel button")
+        // An overwrite/extension prompt may replace the sheet or appear inside it.
+        // Never press a second button. Require two observations of the surviving
+        // window after it has lost the sheet, including the end of its animation.
+        var absentSince: TimeInterval?
+        while true {
+            let window = try panelWindow(held.pid, held.bounds, deadline)
+            guard CFEqual(window, held.window) else { throw pickerError("browser window changed after panel action") }
+            let sheets = try attachedSheets(window, deadline)
+            if sheets.isEmpty {
+                let now = ProcessInfo.processInfo.systemUptime
+                if let start = absentSince, now - start >= 0.2 { return ["verified": true] }
+                if absentSince == nil { absentSince = now }
+            } else {
+                guard sheets.count == 1, CFEqual(sheets[0], held.sheet),
+                      try attachedSheets(sheets[0], deadline).isEmpty else {
+                    throw pickerError("the file panel opened an additional prompt")
+                }
+                absentSince = nil
+            }
+            RunLoop.current.run(until: Date().addingTimeInterval(0.05))
+        }
     }
 }
 

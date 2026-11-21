@@ -33,6 +33,11 @@ pub struct SwiftHelperBackend {
 
 impl SwiftHelperBackend {
     pub fn new() -> Result<Self, AutomationError> {
+        Self::new_until(Instant::now() + Duration::from_secs(5))
+    }
+
+    pub(crate) fn new_until(deadline: Instant) -> Result<Self, AutomationError> {
+        remaining(deadline, false)?;
         let configured = std::env::var_os("AI_AUTO_DESKTOP_MACOS_AX_HELPER").map(PathBuf::from);
         let helper_source = if configured.is_some() {
             "custom_untrusted"
@@ -85,7 +90,7 @@ impl SwiftHelperBackend {
         let status = backend.rpc(
             "status",
             json!({}),
-            Instant::now() + Duration::from_secs(5),
+            deadline.min(Instant::now() + Duration::from_secs(5)),
             false,
         )?;
         if status["protocol_version"] != HELPER_PROTOCOL_VERSION
@@ -100,7 +105,7 @@ impl SwiftHelperBackend {
         Ok(backend)
     }
 
-    fn rpc(
+    pub(crate) fn rpc(
         &self,
         operation: &str,
         args: Value,

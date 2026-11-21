@@ -2172,7 +2172,7 @@ fn manifest_document() -> Value {
 // provide AX. Only `native_provider` constructs it on macOS.
 #[cfg(unix)]
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-mod helper;
+pub(crate) mod helper;
 
 #[cfg(test)]
 mod tests {
