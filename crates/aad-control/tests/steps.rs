@@ -138,7 +138,8 @@ fn cancelling_after_observation_stops_a_saved_click_before_dispatch() {
         .lock()
         .unwrap()
         .push_back(ObservationReply::Cancel(token.clone()));
-    let provider = steps::StepProvider::new(session);
+    let timings = Arc::new(steps::StepTimings::default());
+    let provider = steps::StepProvider::new(session).with_timings(timings.clone());
     let failure = provider
         .invoke_cancellable(
             "act",
@@ -153,6 +154,10 @@ fn cancelling_after_observation_stops_a_saved_click_before_dispatch() {
     assert!(failure.code.ends_with(".CANCELLED"), "{failure:?}");
     assert_eq!(failure.effect, "not_applied");
     assert!(backend.acted.lock().unwrap().is_empty());
+    let totals = timings.snapshot();
+    assert_eq!(totals["targets"]["calls"], 1);
+    assert_eq!(totals["observe"]["calls"], 1);
+    assert_eq!(totals["act"]["calls"], 0);
 }
 
 #[test]

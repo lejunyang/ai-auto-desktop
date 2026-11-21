@@ -16,6 +16,9 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+mod timings;
+pub use timings::StepTimings;
+
 pub const PROVIDER: &str = "control.session";
 /// The `format` a saved recording of these steps carries.
 pub const FORMAT: &str = "control-steps/1";
@@ -335,6 +338,7 @@ pub fn locator_for(node: &Value) -> Locator {
 struct StepSession<'a> {
     session: &'a Session,
     token: &'a CancellationToken,
+    timings: Option<&'a StepTimings>,
 }
 
 fn request(run: &StepSession<'_>, operation: Operation, deadline: Instant) -> Result<Value> {
@@ -345,7 +349,11 @@ fn request(run: &StepSession<'_>, operation: Operation, deadline: Instant) -> Re
     }
     let mut request = Request::new(Some(run.session.id().to_string()), operation);
     request.timeout_ms = (remaining.as_millis() as u64).clamp(1, crate::MAX_TIMEOUT_MS);
+    let timed = run.timings.map(|timings| (timings, Instant::now()));
     let response = run.session.execute_cancellable(&request, run.token.clone());
+    if let Some((timings, start)) = timed {
+        timings.record(&request.operation, start.elapsed(), response.data.is_none());
+    }
     match response.data {
         Some(data) => Ok(data),
         None => {
@@ -462,6 +470,7 @@ pub fn perform(
         &StepSession {
             session,
             token: &token,
+            timings: None,
         },
         step,
         inputs,
@@ -833,6 +842,7 @@ pub fn workflow(name: &str, steps: &[Step]) -> Result<Value> {
 pub struct StepProvider {
     session: Arc<Session>,
     manifest: CapabilityManifest,
+    timings: Option<Arc<StepTimings>>,
 }
 
 impl StepProvider {
@@ -887,7 +897,13 @@ impl StepProvider {
         Self {
             session,
             manifest: manifest::parse(&document).expect("the built-in manifest is valid"),
+            timings: None,
         }
+    }
+
+    pub fn with_timings(mut self, timings: Arc<StepTimings>) -> Self {
+        self.timings = Some(timings);
+        self
     }
 }
 
@@ -915,6 +931,7 @@ impl Provider for StepProvider {
         let run = StepSession {
             session: &self.session,
             token,
+            timings: self.timings.as_deref(),
         };
         let name = action
             .strip_prefix(PROVIDER)

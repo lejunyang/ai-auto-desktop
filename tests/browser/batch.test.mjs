@@ -33,6 +33,20 @@ test('typed batches re-observe after a write and stop on a missing element',
     const app = {provider:'browser.cdp', url:page.url};
     const locator = {role:'button',name:'Add'};
     const click = {app,locator,action:{type:'click'}};
+    function timings(run) {
+      const phases = run.phase_timings;
+      assert.deepEqual(Object.keys(phases).sort(), ['act','collect_table','find','observe','read_fields','targets']);
+      let totalUs = 0;
+      for (const phase of Object.values(phases)) {
+        assert.deepEqual(Object.keys(phase).sort(), ['calls','elapsed_us','failed_calls']);
+        for (const value of Object.values(phase)) assert.ok(Number.isSafeInteger(value) && value >= 0);
+        assert.ok(phase.failed_calls <= phase.calls);
+        if (!phase.calls) assert.equal(phase.elapsed_us, 0);
+        totalUs += phase.elapsed_us;
+      }
+      assert.ok(totalUs > 0 && totalUs <= (run.elapsed_ms + 1) * 1000);
+      return phases;
+    }
     const targets = (await tool('control_targets',{})).data.resources;
     const resource_id = targets.find(resource => resource.metadata.url === page.url).resource_id;
     const observe = async () => (await tool('control_observe',{resource_id})).data.observation_id;
@@ -59,12 +73,22 @@ test('typed batches re-observe after a write and stop on a missing element',
       const result=await tool('run_steps',{steps:Array(10).fill(click)});
       assert.equal(result.status,'succeeded');
       assert.equal(result.executed_steps,10);
+      const phases = timings(result);
+      for (const name of ['targets','observe','find','act']) {
+        assert.equal(phases[name].calls,10);
+        assert.equal(phases[name].failed_calls,0);
+      }
+      context.diagnostic(JSON.stringify(phases));
     });
     assert.equal(await page.cdp.eval('window.count'),20);
     await tool('run_steps',{steps:[click,{...click,action:{type:'script'}}]},true);
     assert.equal(await page.cdp.eval('window.count'),20);
     const failed=await tool('run_steps',{steps:[click,{...click,locator:{name:'Absent'}},click]},true);
     assert.equal(failed.error.stepId,'s2');
+    const partial = timings(failed);
+    assert.equal(partial.find.calls,2);
+    assert.equal(partial.find.failed_calls,1);
+    assert.equal(partial.act.calls,1);
     assert.equal(await page.cdp.eval('window.count'),21);
     assert.deepEqual(await readdir(store).catch(error => { if(error.code==='ENOENT') return []; throw error; }),[]);
     const saved=await tool('save_workflow',{name:'hundred-clicks',steps:Array(100).fill(click)});
@@ -98,6 +122,11 @@ test('typed batches re-observe after a write and stop on a missing element',
     assert.equal(stopped.steps.length,2);
     assert.ok(stopped.steps[1].elapsed_ms>=mismatch.within_ms-2);
     assert.ok(stopped.elapsed_ms>=stopped.steps[1].elapsed_ms);
+    const checked = timings(stopped);
+    assert.equal(checked.targets.calls,2);
+    assert.ok(checked.read_fields.calls >= 2);
+    assert.equal(checked.observe.calls,0);
+    assert.equal(checked.act.calls,0);
     assert.match(stopped.error.message,/billed/);
     assert.equal(await page.cdp.eval('window.orders'),1);
     const invalid = await tool('run_steps',{steps:[submit,{...quote,expect:{typo:42}}]},true);
@@ -107,7 +136,9 @@ test('typed batches re-observe after a write and stop on a missing element',
     assert.equal(secret.error.code,'POLICY.DENIED');
     assert.ok(!JSON.stringify(secret).includes('sample-private'));
     await tool('save_workflow',{name:'verify-receipt',steps});
-    assert.deepEqual((await tool('run_workflow',{name:'verify-receipt'})).outputs,expected);
+    const replay = await tool('run_workflow',{name:'verify-receipt'});
+    assert.deepEqual(replay.outputs,expected);
+    assert.equal(timings(replay).act.calls,1);
     assert.equal(await page.cdp.eval('window.orders'),2);
     await page.cdp.eval(`document.querySelector('[aria-label="Order ID"]').value = 'x'.repeat(4100); true`);
     const long = await tool('control_read_fields',{resource_id,fields:[field('order_id','Order ID')]},true);

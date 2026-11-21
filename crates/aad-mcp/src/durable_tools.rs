@@ -356,7 +356,7 @@ impl Runs {
             )));
         }
 
-        let providers = tools::session_providers(session).map_err(Failed)?;
+        let providers = tools::session_providers(session, None).map_err(Failed)?;
         let options = DurableOptions::default()
             .with_inputs(inputs)
             .with_owner_id(owner_id())
@@ -427,7 +427,7 @@ a new run if the work still needs doing."
             return Err(serde_json::to_string(&payload).unwrap_or_default());
         }
 
-        let providers = tools::session_providers(session)?;
+        let providers = tools::session_providers(session, None)?;
         // No inputs: they were persisted when the run was created, and the
         // second half of a run must not execute against different values.
         let options = DurableOptions::default()

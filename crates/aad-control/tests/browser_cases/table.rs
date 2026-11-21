@@ -123,7 +123,10 @@ fn workflow_collect_table_exposes_named_collection_output() {
     });
     let descriptor = aad_core::compile_descriptor(workflow, None).unwrap();
     let mut providers = aad_runtime::ProviderRegistry::new();
-    providers.insert(Arc::new(steps::StepProvider::new(Arc::new(session))));
+    let timings = Arc::new(steps::StepTimings::default());
+    providers.insert(Arc::new(
+        steps::StepProvider::new(Arc::new(session)).with_timings(timings.clone()),
+    ));
     let result = aad_runtime::engine::run(
         &descriptor,
         aad_runtime::RunOptions::default()
@@ -136,4 +139,9 @@ fn workflow_collect_table_exposes_named_collection_output() {
         json!([{"Item":"Tea","Cost":"3"},{"Item":"Cake","Cost":"5"}])
     );
     assert_eq!(result.outputs["ledger"]["complete"], true);
+    let totals = timings.snapshot();
+    assert_eq!(totals["targets"]["calls"], 1);
+    assert_eq!(totals["collect_table"]["calls"], 1);
+    assert!(totals["collect_table"]["elapsed_us"].as_u64().unwrap() > 0);
+    assert_eq!(totals["act"]["calls"], 0); // pagination is inside the collection call
 }

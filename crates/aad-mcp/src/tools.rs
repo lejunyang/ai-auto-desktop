@@ -219,7 +219,7 @@ what limits apply, such as a remote session or a non-elevated process.",
         },
         Tool {
             name: "run_steps",
-            description: "Run actions, checks and named field reads in one call. Read steps return their named values in outputs; expect can compare them with a literal or a previous read. Each step observes its own target. A failure stops later steps; inspect last_completed_step and next_unstarted_step before continuing.",
+            description: "Run actions, checks and named field reads in one call. Read steps return their named values in outputs; expect can compare them with a literal or a previous read. Each step observes its own target. A failure stops later steps; inspect last_completed_step and next_unstarted_step before continuing. phase_timings reports calls, failed_calls and elapsed_us per control operation.",
             schema: json!({"type":"object", "properties":{
                 "steps":steps_schema(MAX_INLINE_STEPS), "inputs":{"type":"object"}
             }, "required":["steps"], "additionalProperties":false}),
@@ -1228,6 +1228,7 @@ pub(crate) fn workflow_inputs(arguments: &Value) -> Result<serde_json::Map<Strin
 /// whether a person ran it or an agent did.
 pub(crate) fn session_providers(
     session: &Arc<aad_control::Session>,
+    timings: Option<Arc<aad_control::steps::StepTimings>>,
 ) -> Result<aad_runtime::ProviderRegistry, String> {
     let mut providers = aad_runtime::ProviderRegistry::new();
     // The session's own native instances, so a workflow shares the snapshot
@@ -1235,9 +1236,11 @@ pub(crate) fn session_providers(
     for provider in session.providers() {
         providers.insert(provider.clone());
     }
-    providers.insert(Arc::new(aad_control::steps::StepProvider::new(
-        session.clone(),
-    )));
+    let mut steps = aad_control::steps::StepProvider::new(session.clone());
+    if let Some(timings) = timings {
+        steps = steps.with_timings(timings);
+    }
+    providers.insert(Arc::new(steps));
     aad_ocr::register(&mut providers)
         .map_err(|error| failure(&error.code, &error.message, None))?;
     Ok(providers)
@@ -1281,7 +1284,13 @@ fn execute_compiled(
 ) -> Result<Value, String> {
     let name = &descriptor.name;
     let inputs = workflow_inputs(arguments)?;
-    let providers = session_providers(session)?;
+    let typed = descriptor.steps.iter().all(|step| {
+        step.get("uses")
+            .and_then(Value::as_str)
+            .is_some_and(|name| name.starts_with("control.session."))
+    });
+    let timings = typed.then(|| Arc::new(aad_control::steps::StepTimings::default()));
+    let providers = session_providers(session, timings.clone())?;
     let artifacts = Arc::new(aad_runtime::ArtifactStore::default());
 
     let result = aad_runtime::run(
@@ -1293,11 +1302,6 @@ fn execute_compiled(
             .with_granted_permissions(WORKFLOW_PERMISSIONS),
     );
 
-    let typed = descriptor.steps.iter().all(|step| {
-        step.get("uses")
-            .and_then(Value::as_str)
-            .is_some_and(|name| name.starts_with("control.session."))
-    });
     let progress = if typed {
         result
             .events
@@ -1322,6 +1326,9 @@ fn execute_compiled(
         // a value and failed to submit will write it twice.
         "steps": progress,
     });
+    if let Some(timings) = timings {
+        payload["phase_timings"] = timings.snapshot();
+    }
     if let Some(error) = &result.error {
         // Carry the effect through verbatim. Whether a failed step already
         // changed the desktop is the one thing the agent cannot re-derive, and
