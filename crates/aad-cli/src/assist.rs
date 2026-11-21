@@ -96,8 +96,8 @@ pub struct AssistArgs {
     /// first page when left out.
     #[arg(long, requires = "browser_port")]
     page: Option<String>,
-    /// Stream the whole desktop instead (Windows, Linux on X11, and the main
-    /// display on macOS).
+    /// Stream the desktop. On Wayland, use --view-only and choose a monitor
+    /// in the system screen-sharing dialog.
     #[arg(long)]
     desktop: bool,
     /// Share one display, by its number from --list-screens.
@@ -440,6 +440,9 @@ enum Picture {
 
 /// Where frames come from and where input goes.
 trait Source {
+    fn check(&mut self) -> Result<()> {
+        Ok(())
+    }
     fn name(&self) -> Value;
     /// The screen, if it changed since the last capture. A source may answer
     /// [`Want::Picture`] with raw pixels, which are then encoded here.
@@ -595,6 +598,11 @@ pub fn run(args: &AssistArgs) -> Result<Value> {
     let _request_gate =
         aad_browser::gate_session::GateParticipant::join(args.browser_port.unwrap_or_default())?;
     let first = config.first();
+    let stop = Arc::new(AtomicBool::new(false));
+    {
+        let stop = stop.clone();
+        let _ = ctrlc::set_handler(move || stop.store(true, Ordering::SeqCst));
+    }
     let mut source: Box<dyn Source> = match (args.browser_port, args.desktop) {
         (Some(port), false) => Box::new(browser::Page::start(
             port,
@@ -609,6 +617,20 @@ pub fn run(args: &AssistArgs) -> Result<Value> {
                 (None, Some(window)) => desktop::Area::Window(window.clone()),
                 (None, None) => desktop::Area::All,
             };
+            #[cfg(target_os = "linux")]
+            if aad_linux::wayland_portal::is_wayland_session() {
+                if !args.view_only || area != desktop::Area::All {
+                    return Err("Wayland sharing requires --desktop --view-only; select one monitor in the system dialog".into());
+                }
+                Box::new(desktop::Wayland::start(
+                    config.fps(first),
+                    args.fps.unwrap_or(30),
+                    &stop,
+                )?)
+            } else {
+                desktop::open(config.fps(first), &area)?
+            }
+            #[cfg(not(target_os = "linux"))]
             desktop::open(config.fps(first), &area)?
         }
         _ => return Err("pass --browser-port PORT or --desktop".into()),
@@ -628,11 +650,6 @@ pub fn run(args: &AssistArgs) -> Result<Value> {
     println!("{announce}");
     let _ = std::io::stdout().flush();
 
-    let stop = Arc::new(AtomicBool::new(false));
-    {
-        let stop = stop.clone();
-        let _ = ctrlc::set_handler(move || stop.store(true, Ordering::SeqCst));
-    }
     host(listener, &token, source.as_mut(), &config, &stop)?;
     Ok(json!({"status": "stopped"}))
 }
@@ -1021,6 +1038,7 @@ fn host(
         .map(|(codec, name)| (codec.name().to_string(), json!(name)))
         .collect();
     while !stop.load(Ordering::SeqCst) {
+        source.check()?;
         // New connections are read on threads of their own.
         loop {
             match listener.accept() {
@@ -2778,6 +2796,45 @@ mod desktop {
     struct Desktop {
         pace: Pace,
         desktop: Box<dyn aad_platform::Desktop>,
+    }
+
+    #[cfg(target_os = "linux")]
+    pub struct Wayland(Pace, aad_linux::wayland_portal::MonitorCapture);
+
+    #[cfg(target_os = "linux")]
+    impl Wayland {
+        pub fn start(fps: u32, max_fps: u32, stop: &super::AtomicBool) -> Result<Self> {
+            Ok(Self(
+                Pace::new(fps),
+                aad_linux::wayland_portal::MonitorCapture::start(max_fps, stop)?,
+            ))
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Source for Wayland {
+        fn check(&mut self) -> Result<()> {
+            self.1.check()
+        }
+        fn name(&self) -> Value {
+            json!({"kind":"desktop", "capture":"wayland-portal-monitor"})
+        }
+        fn rate(&mut self, fps: u32) {
+            self.0.rate(fps);
+        }
+        fn capture(&mut self, _: Want) -> Result<Option<Picture>> {
+            if self.0.due() {
+                Ok(self.1.capture()?.map(Picture::Raw))
+            } else {
+                Ok(None)
+            }
+        }
+        fn refresh(&mut self) {
+            self.1.refresh();
+        }
+        fn input(&mut self, _: &Value) -> Result<()> {
+            Err("the Wayland screencast is read-only".into())
+        }
     }
 
     /// A viewer's input message, checked.

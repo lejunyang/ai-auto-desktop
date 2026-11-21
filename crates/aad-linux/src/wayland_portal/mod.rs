@@ -2,9 +2,11 @@
 //! Portal device permission does not prove a target application's identity or
 //! keyboard focus. No input events are exposed by this module.
 mod mapping;
+mod screencast;
 mod transport;
 
 pub use mapping::{EiRegion, FrameGeometry, StreamMapping};
+pub use screencast::MonitorCapture;
 use std::collections::HashMap;
 pub use transport::{AuthorizedSession, PortalClient};
 use zbus::zvariant::{OwnedValue, Value};
@@ -35,6 +37,14 @@ impl std::error::Error for PortalError {}
 /// Intentionally has no Default: a caller must explicitly request the dialog.
 pub enum AuthorizationIntent {
     UserRequested,
+}
+
+pub fn is_wayland_session() -> bool {
+    match std::env::var("XDG_SESSION_TYPE").as_deref() {
+        Ok("wayland") => true,
+        Ok("x11") => false,
+        _ => std::env::var_os("WAYLAND_DISPLAY").is_some_and(|s| !s.is_empty()),
+    }
 }
 
 /// The first implementation asks for a monitor stream, keyboard and pointer.

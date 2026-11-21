@@ -291,14 +291,46 @@ impl PortalClient {
         deadline: Instant,
         cancel: &AtomicBool,
     ) -> Result<AuthorizedSession> {
+        self.authorize_session(options, REMOTE, deadline, cancel)
+    }
+
+    pub(super) fn authorize_monitor(
+        self,
+        _intent: AuthorizationIntent,
+        deadline: Instant,
+        cancel: &AtomicBool,
+    ) -> Result<(AuthorizedSession, AuthorizedStream, OwnedFd)> {
+        let mut session =
+            self.authorize_session(AuthorizationOptions::unparented(), SCREEN, deadline, cancel)?;
+        let [monitor] = session.streams()? else {
+            return Err(PortalError::InvalidResponse);
+        };
+        if monitor.source_type != 1 || monitor.node_id == u32::MAX {
+            return Err(PortalError::InvalidResponse);
+        }
+        let monitor = monitor.clone();
+        let fd = session.open_fd(SCREEN, "OpenPipeWireRemote", deadline, cancel)?;
+        Ok((session, monitor, fd))
+    }
+
+    fn authorize_session(
+        self,
+        options: AuthorizationOptions,
+        interface: &str,
+        deadline: Instant,
+        cancel: &AtomicBool,
+    ) -> Result<AuthorizedSession> {
         if options.parent_window.len() > 512
             || options.parent_window.contains('\0')
             || (!options.parent_window.is_empty() && !options.parent_window.starts_with("wayland:"))
         {
             return Err(PortalError::Unsupported);
         }
-        if self.property(REMOTE, "version", deadline, cancel)? < 2
-            || self.property(REMOTE, "AvailableDeviceTypes", deadline, cancel)? & DEVICES != DEVICES
+        if interface == REMOTE
+            && (self.property(REMOTE, "version", deadline, cancel)? < 2
+                || self.property(REMOTE, "AvailableDeviceTypes", deadline, cancel)? & DEVICES
+                    != DEVICES)
+            || interface == SCREEN && self.property(SCREEN, "version", deadline, cancel)? < 3
             || self.property(SCREEN, "AvailableSourceTypes", deadline, cancel)? & 1 == 0
         {
             return Err(PortalError::Unsupported);
@@ -313,7 +345,7 @@ impl PortalClient {
             let create =
                 HashMap::from([("session_handle_token".into(), owned(Value::from(token))?)]);
             let mut created = self.request(
-                (REMOTE, "CreateSession"),
+                (interface, "CreateSession"),
                 &session,
                 "",
                 create,
@@ -327,18 +359,20 @@ impl PortalClient {
             if handle != session.as_str() {
                 return Err(PortalError::InvalidResponse);
             }
-            let devices = HashMap::from([
-                ("types".into(), OwnedValue::from(DEVICES)),
-                ("persist_mode".into(), OwnedValue::from(0u32)),
-            ]);
-            self.request(
-                (REMOTE, "SelectDevices"),
-                &session,
-                "",
-                devices,
-                deadline,
-                cancel,
-            )?;
+            if interface == REMOTE {
+                let devices = HashMap::from([
+                    ("types".into(), OwnedValue::from(DEVICES)),
+                    ("persist_mode".into(), OwnedValue::from(0u32)),
+                ]);
+                self.request(
+                    (REMOTE, "SelectDevices"),
+                    &session,
+                    "",
+                    devices,
+                    deadline,
+                    cancel,
+                )?;
+            }
             let sources = HashMap::from([
                 ("types".into(), OwnedValue::from(1u32)),
                 ("multiple".into(), OwnedValue::from(false)),
@@ -352,13 +386,20 @@ impl PortalClient {
                 cancel,
             )?;
             let mut started = self.request(
-                (REMOTE, "Start"),
+                (interface, "Start"),
                 &session,
                 &options.parent_window,
                 Dict::new(),
                 deadline,
                 cancel,
             )?;
+            let streams = super::streams(&mut started)?;
+            if interface == SCREEN {
+                if started.contains_key("devices") {
+                    return Err(PortalError::InvalidResponse);
+                }
+                return Ok((0, streams));
+            }
             let granted = started
                 .remove("devices")
                 .ok_or(PortalError::InvalidResponse)?;
@@ -366,7 +407,6 @@ impl PortalClient {
             if granted == 0 || granted & !DEVICES != 0 {
                 return Err(PortalError::InvalidResponse);
             }
-            let streams = super::streams(&mut started)?;
             Ok((granted, streams))
         })();
         match result {
@@ -451,7 +491,7 @@ impl AuthorizedSession {
     }
     pub fn connect_eis(&mut self, deadline: Instant, cancel: &AtomicBool) -> Result<()> {
         self.refresh()?;
-        if self.eis.is_some() {
+        if self.devices == 0 || self.eis.is_some() {
             return Err(PortalError::InvalidState);
         }
         let fd = self.open_fd(REMOTE, "ConnectToEIS", deadline, cancel)?;
