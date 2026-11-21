@@ -26,6 +26,7 @@ mod drag_between;
 mod drag_path;
 mod focus_discovery;
 pub(super) mod gtk4_picker;
+mod table;
 use focus_discovery::FocusDiscovery;
 mod window_focus;
 use window_focus::append_window_args;
@@ -650,10 +651,28 @@ impl LinuxBackend {
             .is_none_or(|set| set.contains(Interface::Action));
         let interfaces = reported.unwrap_or_default();
         let states = zbus::block_on(accessible.get_state()).ok();
-        let protected = matches!(role.as_str(), "password_text" | "password");
-        let name = zbus::block_on(accessible.name()).ok();
-        let description = zbus::block_on(accessible.description()).ok();
-        let attributes = zbus::block_on(accessible.get_attributes()).unwrap_or_default();
+        let attributes = zbus::block_on(accessible.get_attributes());
+        let grid_object = matches!(
+            native_role,
+            atspi::Role::Table
+                | atspi::Role::TreeTable
+                | atspi::Role::TableCell
+                | atspi::Role::TableColumnHeader
+                | atspi::Role::ColumnHeader
+        ) || interfaces.contains(Interface::TableCell);
+        let redact_grid = grid_object
+            && (matches!(native_role, atspi::Role::PasswordText)
+                || attributes
+                    .as_ref()
+                    .map_or(true, table::protected_attributes));
+        let protected = redact_grid || matches!(role.as_str(), "password_text" | "password");
+        let name = (!redact_grid)
+            .then(|| zbus::block_on(accessible.name()).ok())
+            .flatten();
+        let description = (!redact_grid)
+            .then(|| zbus::block_on(accessible.description()).ok())
+            .flatten();
+        let attributes = attributes.unwrap_or_default();
         let accessible_id = zbus::block_on(accessible.accessible_id()).ok();
         let child_count = zbus::block_on(accessible.child_count()).unwrap_or(-1);
         let bounds = if interfaces.contains(Interface::Component) {
@@ -938,6 +957,15 @@ impl LinuxBackend {
 }
 
 impl AtspiBackend for LinuxBackend {
+    fn read_table(
+        &self,
+        target: &NativeRef,
+        columns: &[String],
+        budget: usize,
+        deadline: Instant,
+    ) -> Result<Value, AutomationError> {
+        self.table_records(target, columns, budget, deadline)
+    }
     fn supports_cross_resource_drag(&self) -> bool {
         self.probe_input(Instant::now() + Duration::from_secs(1))
             .is_ok_and(|support| support.require("anchored-drag-between").is_ok())

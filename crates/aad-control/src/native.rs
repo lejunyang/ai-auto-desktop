@@ -312,8 +312,35 @@ pub fn tesseract_language(tag: &str) -> Option<&'static str> {
 }
 
 impl Backend for NativeBackend {
+    fn read_grid(
+        &self,
+        snapshot: &Value,
+        node: &Value,
+        columns: &[String],
+        budget: usize,
+        context: &crate::Context,
+    ) -> Result<Value> {
+        if !matches!(self.flavor, Flavor::Linux) || !self.offers("read_table") {
+            return Err(error(
+                "CONTROL.ACTION_UNSUPPORTED",
+                "native table reading is unavailable",
+            ));
+        }
+        let mut args = self.read_args(snapshot, node);
+        args["columns"] = json!(columns);
+        args["max_characters"] = json!(budget);
+        self.provider.invoke_cancellable(
+            &format!("{}.read_table@1", self.name()),
+            args,
+            Some(context.remaining()?),
+            context.cancellation(),
+        )
+    }
     fn reads(&self) -> Vec<String> {
         let mut reads = Vec::new();
+        if self.offers("read_table") {
+            reads.push("read_table".into());
+        }
         if self.offers("capture") {
             reads.push("capture".to_string());
         }

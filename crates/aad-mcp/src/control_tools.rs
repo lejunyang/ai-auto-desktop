@@ -406,7 +406,7 @@ the first one. To ask whether something has gone away, pass expect: optional and
         ),
         (
             "control_read_table",
-            "Read named columns of an observed Chromium HTML table or DOM-owned ARIA grid/table into records. Use literal names for single-level headers and /Group/Leaf paths for grouped columns (escape ~ as ~0 and / as ~1 within a label). Returns rendered rows, truncation reasons and null for missing cells.",
+            "Read selected columns of an observed Chromium HTML/ARIA table or Linux AT-SPI Table into records. Linux requires unique named column headers and unprotected plain-text leaf cells, and reads the running application's accessible rows. Check truncated and truncation_reasons. Chromium supports /Group/Leaf header paths (escape ~ as ~0 and / as ~1) and returns rendered rows with null for missing cells.",
             json!({"target":target_schema(),"columns":{"type":"array","minItems":1,"maxItems":32,"uniqueItems":true,"items":{"type":"string","minLength":1,"maxLength":256}},
                 "max_characters":{"type":"integer","minimum":aad_control::MIN_OUTLINE_CHARACTERS,"maximum":aad_control::MAX_OUTLINE_CHARACTERS}}),
             vec!["target","columns"],

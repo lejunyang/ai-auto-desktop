@@ -217,6 +217,20 @@ pub trait Backend: Send + Sync {
     fn view(&self, _snapshot: &Value, _view: &View, _timeout: Duration) -> Result<Option<Value>> {
         Ok(None)
     }
+    fn read_grid(
+        &self,
+        _snapshot: &Value,
+        _node: &Value,
+        _columns: &[String],
+        _budget: usize,
+        _context: &Context,
+    ) -> Result<Value> {
+        Err(error(
+            "CONTROL.ACTION_UNSUPPORTED",
+            "this provider cannot read native table cells",
+        ))
+    }
+
     /// Read one observed HTML table and, if supplied, its enclosing scroll viewport.
     fn table_content(
         &self,
@@ -2086,6 +2100,26 @@ impl Session {
             ..Default::default()
         };
         validate_view(&view)?;
+        let (observation, node) = self.observed_node(target)?;
+        if observation.provider != browser::PROVIDER {
+            if !self.allowed_provider(&observation.provider)
+                || node["provenance"]["scope_context"] == true
+            {
+                return Err(error(
+                    "POLICY.DENIED",
+                    "table is outside the observation scope",
+                ));
+            }
+            let result = self.backends[&observation.provider].read_grid(
+                &observation.raw,
+                &node,
+                columns,
+                budget.unwrap_or(DEFAULT_OUTLINE_CHARACTERS),
+                context,
+            )?;
+            context.remaining()?;
+            return Ok(result);
+        }
         let (_, scoped) = self.observe_resource_scoped(
             &target.resource_id,
             MAX_NODES,

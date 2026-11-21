@@ -160,6 +160,18 @@ impl Bounds {
 }
 
 pub trait AtspiBackend: Send + Sync {
+    fn read_table(
+        &self,
+        _target: &NativeRef,
+        _columns: &[String],
+        _budget: usize,
+        _deadline: Instant,
+    ) -> Result<Value, AutomationError> {
+        Err(driver_error(
+            "DRIVER.ACTION_UNSUPPORTED",
+            "no AT-SPI Table reader",
+        ))
+    }
     fn supports_cross_resource_drag(&self) -> bool {
         false
     }
@@ -668,6 +680,41 @@ impl AtspiProvider {
             }
             "snapshot" => self.snapshot(args, deadline),
             "snapshot_scope" => self.snapshot_scope(args, deadline),
+            "read_table" => {
+                only_keys(args, &["target", "locator", "columns", "max_characters"])?;
+                let columns: Vec<String> =
+                    serde_json::from_value(args.get("columns").cloned().unwrap_or(Value::Null))
+                        .map_err(|_| invalid("expected table columns"))?;
+                if !(1..=32).contains(&columns.len())
+                    || columns
+                        .iter()
+                        .any(|name| name.trim().is_empty() || name.len() > 256)
+                    || columns
+                        .iter()
+                        .collect::<std::collections::BTreeSet<_>>()
+                        .len()
+                        != columns.len()
+                {
+                    return Err(invalid("invalid selected columns"));
+                }
+                let budget = bounded_integer(
+                    args.get("max_characters"),
+                    20000,
+                    500,
+                    200000,
+                    "max_characters",
+                )? as usize;
+                let (_, _, node, native) = self.fresh_target(args, deadline)?;
+                if node["states"]["protected"] != false
+                    || node["provenance"]["scope_context"] == true
+                {
+                    return Err(driver_error(
+                        "DRIVER.ACTION_UNSUPPORTED",
+                        "table identity or protection is incomplete",
+                    ));
+                }
+                self.backend.read_table(&native, &columns, budget, deadline)
+            }
             "drag_between" => self.drag_between(args, deadline),
             "find" => self.find(args, deadline),
             "capture_target" => self.capture_target(args, deadline, artifacts),
@@ -3115,6 +3162,19 @@ fn manifest_document() -> Value {
     let common_write = || json!({"type": "object", "required": ["target", "locator"], "properties": {"target": target_schema(), "locator": locator_schema()}, "additionalProperties": false});
     let write_output = || json!({"type": "object", "required": ["ok", "action", "resolved"], "properties": {"ok": {"const": true}, "action": {"enum": WRITE_ACTIONS}, "resolved": target_schema(), "backend_result": {}}, "additionalProperties": false});
     let mut actions = Map::new();
+    actions.insert("read_table".into(), contract(
+        "读取已观察且再次验证的 AT-SPI Table 中指定列。",
+        "read_only", "observe", "low", &["desktop.observe"],
+        json!({"type":"object","additionalProperties":false,"required":["target","locator","columns"],
+            "properties":{"target":target_schema(),"locator":locator_schema(),
+                "columns":{"type":"array","items":{"type":"string","minLength":1,"maxLength":256},"minItems":1,"maxItems":32,"uniqueItems":true},
+                "max_characters":{"type":"integer","minimum":500,"maximum":200000}}}),
+        json!({"type":"object","additionalProperties":false,"required":["scope","records","row_count","truncated","truncation_reasons"],
+            "properties":{"scope":{"const":"atspi_table_rows"},"row_count":{"type":"integer","minimum":0},
+                "records":{"type":"array","maxItems":500,"items":{"type":"object","additionalProperties":{"type":"string"}}},
+                "truncated":{"type":"boolean"},"truncation_reasons":{"type":"array","items":{"type":"string"}}}}),
+        false, true,
+    ));
     actions.insert("inspect_session".into(), contract("返回不含应用内容的当前 AT-SPI backend 与桌面会话类型。", "read_only", "observe", "low", &["desktop.observe"], json!({"type": "object", "additionalProperties": false}), json!({"type": "object", "required": ["backend", "session_type", "desktop"], "properties": {"backend": {"type": "string", "maxLength": 128}, "session_type": {"type": ["string", "null"], "maxLength": 128}, "desktop": {"type": ["string", "null"], "maxLength": 256}}, "additionalProperties": false}), false, false));
     actions["inspect_session"]["output_schema"]["properties"]["input_helper"] =
         json!({"type": ["object", "null"]});
