@@ -15,6 +15,7 @@ pub mod cdp;
 mod connection;
 pub mod launch;
 pub mod recording;
+pub mod request_gate;
 mod tcp;
 mod ws;
 

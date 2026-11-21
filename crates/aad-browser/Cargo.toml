@@ -11,6 +11,7 @@ description = "Local browser protocol clients (Chromium CDP, Firefox WebDriver B
 lifecycle-test-hooks = []
 
 [dependencies]
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "json"] }
 socket2 = "0.6"
 serde = { workspace = true }
 serde_json = { workspace = true }
