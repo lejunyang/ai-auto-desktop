@@ -16,7 +16,7 @@ use portal::GtkPortal;
 
 enum Chooser {
     Gtk3,
-    Gtk4(Gtk4Picker),
+    Gtk4(Box<Gtk4Picker>),
     Portal(GtkPortal),
 }
 
@@ -124,12 +124,12 @@ impl OpenPicker {
                 .filter(|s| !s.is_empty())
                 .ok_or("missing GTK window class")?;
             let title = observed.open_title()?;
-            observed.chooser = Chooser::Gtk4(Gtk4Picker::observe(
+            observed.chooser = Chooser::Gtk4(Box::new(Gtk4Picker::observe(
                 pid,
                 std::str::from_utf8(name)?.into(),
                 String::from_utf8(title)?,
                 deadline,
-            )?);
+            )?));
         }
         observed.revalidate(deadline)?;
         Ok(observed)
