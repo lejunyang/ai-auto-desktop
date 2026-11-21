@@ -58,9 +58,9 @@ impl Downloads {
         self.failure = (|| {
                 if self.directory.is_none() {
                     let directory = std::env::temp_dir().canonicalize().map_err(|err| err.to_string())?.join(format!("aad-downloads-{}", uuid::Uuid::new_v4()));
-                    let mut builder = std::fs::DirBuilder::new();
+                    let builder = &mut std::fs::DirBuilder::new();
                     #[cfg(unix)]
-                    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+                    std::os::unix::fs::DirBuilderExt::mode(builder, 0o700);
                     builder.create(&directory).map_err(|err| err.to_string())?;
                     self.directory = Some(directory);
                 }
