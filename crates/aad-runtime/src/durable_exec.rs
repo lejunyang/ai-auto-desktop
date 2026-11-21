@@ -26,7 +26,7 @@ use aad_core::{AutomationError, WorkflowDescriptor};
 use serde_json::{json, Map, Value};
 
 use crate::durable::{
-    self, DesiredState, JournalError, JournalStore, OwnerLease, RunRecord, RunStatus,
+    self, DesiredState, JournalError, JournalStore, LeaseTime, OwnerLease, RunRecord, RunStatus,
 };
 use crate::engine::{self, FinalizationIntent, RunOptions, Segment, SegmentState, Segmented};
 use crate::journal::RunStatus as EngineStatus;
@@ -280,7 +280,7 @@ impl DurableExecutor {
             )
             .map_err(journal_error)?;
 
-        let lease = self.claim(&run_id, &options)?;
+        let (lease, _) = self.claim(&run_id, &options, Some(RunStatus::Pending))?;
         let inputs = options.inputs.clone();
         self.launch(descriptor, &digest, &run_id, lease, inputs, options)
     }
@@ -320,7 +320,7 @@ impl DurableExecutor {
             .with_detail("actual", json!(digest)));
         }
 
-        let lease = self.claim(run_id, &options)?;
+        let (lease, run) = self.claim(run_id, &options, Some(RunStatus::Pending))?;
 
         let inputs = as_map(&run.inputs);
         self.launch(descriptor, &digest, run_id, lease, inputs, options)
@@ -361,7 +361,7 @@ impl DurableExecutor {
                 None,
                 None,
                 None,
-                durable::now_seconds(),
+                LeaseTime::Current,
             )
             .map_err(journal_error)?;
         self.journal
@@ -372,7 +372,7 @@ impl DurableExecutor {
                 &encode_checkpoint(digest, Phase::BetweenSteps, deadline, &segmented.snapshot()),
                 Some(RunStatus::Running),
                 None,
-                durable::now_seconds(),
+                LeaseTime::Current,
             )
             .map_err(journal_error)?;
 
@@ -429,9 +429,7 @@ impl DurableExecutor {
         // else is actively executing must be told the run is owned, not given a
         // verdict about a checkpoint it has no business reading yet. It also
         // stops two runners from both deciding what to do with the same run.
-        let lease = self.claim(run_id, &options)?;
-
-        let run = self.journal.get_run(run_id).map_err(journal_error)?;
+        let (lease, run) = self.claim(run_id, &options, None)?;
 
         // Record the takeover before deciding anything, so the audit trail names
         // the new owner even when the decision is "this cannot be continued".
@@ -444,7 +442,7 @@ impl DurableExecutor {
                     &lease,
                     "run.reclaimed",
                     &json!({"ownerId": options.owner_id, "previousStatus": run.status.as_str()}),
-                    durable::now_seconds(),
+                    LeaseTime::Current,
                 )
                 .map_err(journal_error)?;
         }
@@ -499,7 +497,7 @@ impl DurableExecutor {
         // one fenced transition. An intervening cancel remains absorbing.
         let running = self
             .journal
-            .with_owner(&lease, durable::now_seconds(), |owned| {
+            .with_owner(&lease, LeaseTime::Current, |owned| {
                 let current = owned.record()?;
                 if current.desired_state == DesiredState::Pause {
                     owned.clear_pause()?;
@@ -562,13 +560,19 @@ impl DurableExecutor {
         self.drive(&digest, running, lease, &mut segmented, deadline, &options)
     }
 
-    fn claim(&self, run_id: &str, options: &DurableOptions) -> Result<OwnerLease, AutomationError> {
+    fn claim(
+        &self,
+        run_id: &str,
+        options: &DurableOptions,
+        expected: Option<RunStatus>,
+    ) -> Result<(OwnerLease, RunRecord), AutomationError> {
         self.journal
-            .claim_owner(
+            .claim_run(
                 run_id,
                 &options.owner_id,
                 options.lease_ttl_seconds,
-                durable::now_seconds(),
+                LeaseTime::Current,
+                expected,
             )
             .map_err(journal_error)
     }
@@ -702,7 +706,7 @@ impl DurableExecutor {
                     ),
                     Some(RunStatus::Running),
                     None,
-                    durable::now_seconds(),
+                    LeaseTime::Current,
                 )
                 .map_err(journal_error)?;
 
@@ -724,7 +728,7 @@ impl DurableExecutor {
         ttl_seconds: f64,
     ) -> Result<Dispatch, AutomationError> {
         self.journal
-            .with_owner(lease, durable::now_seconds(), |owned| {
+            .with_owner(lease, LeaseTime::Current, |owned| {
                 match owned.expect(Some(RunStatus::Running), None)? {
                     DesiredState::Run => {
                         owned.heartbeat(ttl_seconds)?;
@@ -843,7 +847,7 @@ impl DurableExecutor {
         let result = self.invoke_with_lease_heartbeat(segmented, &prepared, &lease, options);
         lease = self
             .journal
-            .heartbeat_owner(&lease, options.lease_ttl_seconds, durable::now_seconds())
+            .heartbeat_owner(&lease, options.lease_ttl_seconds, LeaseTime::Current)
             .map_err(|_| {
                 AutomationError::new(
                     "DURABLE.LEASE_HEARTBEAT_FAILED",
@@ -871,7 +875,7 @@ impl DurableExecutor {
                 &boundary,
                 Some(RunStatus::Running),
                 None,
-                durable::now_seconds(),
+                LeaseTime::Current,
             )
             .map_err(journal_error)?;
         let intent = self.journal.get_run(&run.run_id).map_err(journal_error)?;
@@ -911,7 +915,7 @@ impl DurableExecutor {
                     return Err(error);
                 }
             };
-            if let Err(error) = journal.heartbeat_owner(&held, ttl, durable::now_seconds()) {
+            if let Err(error) = journal.heartbeat_owner(&held, ttl, LeaseTime::Current) {
                 let _ = ready_sender.send(false);
                 return Err(error);
             }
@@ -921,7 +925,7 @@ impl DurableExecutor {
                 match stop_receiver.recv_timeout(interval) {
                     Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
                     Err(mpsc::RecvTimeoutError::Timeout) => {
-                        journal.heartbeat_owner(&held, ttl, durable::now_seconds())?;
+                        journal.heartbeat_owner(&held, ttl, LeaseTime::Current)?;
                     }
                 }
             }
@@ -954,7 +958,7 @@ impl DurableExecutor {
                 lease,
                 "run.lease_heartbeat_failed",
                 &json!({"recovered": true}),
-                durable::now_seconds(),
+                LeaseTime::Current,
             );
         }
         result
@@ -1013,7 +1017,7 @@ impl DurableExecutor {
                 &encode_checkpoint(digest, Phase::BetweenSteps, deadline, &segmented.snapshot()),
                 Some(RunStatus::Running),
                 None,
-                durable::now_seconds(),
+                LeaseTime::Current,
             )
             .map_err(journal_error)?;
 
@@ -1032,7 +1036,7 @@ impl DurableExecutor {
                 None,
                 None,
                 None,
-                durable::now_seconds(),
+                LeaseTime::Current,
             )
             .map_err(journal_error)?;
         Ok(DurableOutcome {
@@ -1079,7 +1083,7 @@ impl DurableExecutor {
                 &intent_checkpoint,
                 Some(RunStatus::Running),
                 None,
-                durable::now_seconds(),
+                LeaseTime::Current,
             )
             .map_err(journal_error)?;
         let started_checkpoint = encode_finalization_intent(
@@ -1097,7 +1101,7 @@ impl DurableExecutor {
                 &started_checkpoint,
                 Some(RunStatus::Running),
                 None,
-                durable::now_seconds(),
+                LeaseTime::Current,
             )
             .map_err(journal_error)?;
 
@@ -1115,7 +1119,7 @@ impl DurableExecutor {
                 &result_checkpoint,
                 Some(RunStatus::Running),
                 None,
-                durable::now_seconds(),
+                LeaseTime::Current,
             )
             .map_err(journal_error)?;
         self.commit_finalized(lease, finalized)
@@ -1127,7 +1131,7 @@ impl DurableExecutor {
         finalized: FinalizedRun,
     ) -> Result<DurableOutcome, AutomationError> {
         self.journal
-            .with_owner(&lease, durable::now_seconds(), |owned| {
+            .with_owner(&lease, LeaseTime::Current, |owned| {
                 let current = owned.record()?;
                 let (status, output, error, event_type, payload) = if current.desired_state
                     == DesiredState::Cancel
@@ -1269,7 +1273,7 @@ impl DurableExecutor {
                 None,
                 Some(&error),
                 None,
-                durable::now_seconds(),
+                LeaseTime::Current,
             )
             .map_err(journal_error)?;
         Ok(DurableOutcome {

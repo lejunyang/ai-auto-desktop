@@ -876,8 +876,15 @@ fn a_new_claim_issues_a_different_token_so_the_old_one_is_useless() {
         .store
         .claim_owner("run-1", "runner", 10.0, 1_000.0)
         .expect("claim");
-    let second = journal
-        .store
+    let other = JournalStore::open(journal.path()).unwrap();
+    assert_eq!(
+        other
+            .claim_owner("run-1", "runner", 10.0, 1_009.0)
+            .unwrap_err()
+            .code(),
+        "JOURNAL.LEASE_CONFLICT"
+    );
+    let second = other
         .claim_owner("run-1", "runner", 10.0, 1_020.0)
         .expect("reclaim");
     assert_ne!(
@@ -885,6 +892,88 @@ fn a_new_claim_issues_a_different_token_so_the_old_one_is_useless() {
         second.token(),
         "re-claiming must not reissue the same secret"
     );
+    // Even a timestamp within the first generation cannot authorize the old
+    // bearer once the same owner name has acquired a new token.
+    for error in [
+        journal
+            .store
+            .heartbeat_owner(&first, 60.0, 1_005.0)
+            .unwrap_err(),
+        journal.store.release_owner(&first, 1_005.0).unwrap_err(),
+        journal
+            .store
+            .append_event_with_checkpoint(
+                &first,
+                "stale.write",
+                &json!({}),
+                &json!({"stale": true}),
+                None,
+                None,
+                1_005.0,
+            )
+            .unwrap_err(),
+        journal
+            .store
+            .set_status(
+                &first,
+                RunStatus::Pending,
+                RunStatus::Running,
+                Some(("stale.start", &json!({}))),
+                None,
+                None,
+                None,
+                1_005.0,
+            )
+            .unwrap_err(),
+    ] {
+        assert_eq!(error.code(), "JOURNAL.LEASE_LOST");
+    }
+    let run = other.ensure_live_lease(&second, 1_021.0).unwrap();
+    assert!(run.checkpoint.is_none());
+    assert_eq!(run.status, RunStatus::Pending);
+    assert_eq!(
+        other
+            .append_event(&second, "current.write", &json!({}), 1_021.0)
+            .unwrap()
+            .seq,
+        2
+    );
+}
+
+#[test]
+fn a_heartbeat_waiting_for_a_writer_cannot_resurrect_an_expired_lease() {
+    let journal = TempJournal::open();
+    seed(&journal, "run-1");
+    let worker = JournalStore::open(journal.path()).unwrap();
+    let lease = journal
+        .store
+        .claim_owner("run-1", "runner", 0.2, LeaseTime::Current)
+        .unwrap();
+    let locker = journal.raw();
+    locker.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let (starting, ready) = std::sync::mpsc::channel();
+    let expiry = lease.expires_at;
+    let heartbeat = std::thread::spawn(move || {
+        starting.send(()).unwrap();
+        worker.heartbeat_owner(&lease, 60.0, LeaseTime::Current)
+    });
+    ready.recv().unwrap();
+    std::thread::sleep(std::time::Duration::from_secs_f64(
+        (expiry - now_seconds()).max(0.0) + 0.025,
+    ));
+    locker.execute_batch("ROLLBACK").unwrap();
+    assert_eq!(
+        heartbeat.join().unwrap().unwrap_err().code(),
+        "JOURNAL.LEASE_LOST"
+    );
+    assert_eq!(
+        journal.store.get_run("run-1").unwrap().lease_expires_at,
+        Some(expiry)
+    );
+    journal
+        .store
+        .claim_owner("run-1", "runner", 10.0, LeaseTime::Current)
+        .unwrap();
 }
 
 #[test]

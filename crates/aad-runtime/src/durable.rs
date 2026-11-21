@@ -339,6 +339,30 @@ impl EventRecord {
     }
 }
 
+/// When a lease predicate is evaluated. Live callers sample the clock only
+/// after acquiring the SQLite writer lock. An explicit timestamp lets callers
+/// with their own clock evaluate an operation at a fixed instant.
+#[derive(Clone, Copy, Debug)]
+pub enum LeaseTime {
+    Current,
+    At(f64),
+}
+
+impl From<f64> for LeaseTime {
+    fn from(seconds: f64) -> Self {
+        Self::At(seconds)
+    }
+}
+
+impl LeaseTime {
+    fn seconds(self) -> f64 {
+        match self {
+            Self::Current => now_seconds(),
+            Self::At(seconds) => seconds,
+        }
+    }
+}
+
 /// Proof that this process owns a run.
 ///
 /// The token is a bearer secret: whoever holds it can write to the run. It is
@@ -741,21 +765,30 @@ impl JournalStore {
         run_id: &str,
         owner_id: &str,
         ttl_seconds: f64,
-        now: f64,
+        now: impl Into<LeaseTime>,
     ) -> Result<OwnerLease> {
+        self.claim_run(run_id, owner_id, ttl_seconds, now, None)
+            .map(|(lease, _)| lease)
+    }
+
+    pub(crate) fn claim_run(
+        &self,
+        run_id: &str,
+        owner_id: &str,
+        ttl_seconds: f64,
+        now: impl Into<LeaseTime>,
+        expected: Option<RunStatus>,
+    ) -> Result<(OwnerLease, RunRecord)> {
         bounded(owner_id, "owner_id", 256)?;
         if !(ttl_seconds.is_finite() && ttl_seconds > 0.0) {
             return Err(JournalError::invalid(
                 "ttl_seconds must be a positive finite number",
             ));
         }
-        let expires_at = now + ttl_seconds;
-        if !expires_at.is_finite() {
-            return Err(JournalError::invalid("lease expiry must be finite"));
-        }
         let token = new_token();
-
         self.write(|transaction| {
+            let now = now.into().seconds();
+            let expires_at = lease_expiry(now, ttl_seconds)?;
             let claimed = transaction.execute(
                 &format!(
                     "UPDATE runs
@@ -788,12 +821,25 @@ impl JournalStore {
                     ))
                 });
             }
-            Ok(OwnerLease {
-                run_id: run_id.to_string(),
-                owner_id: owner_id.to_string(),
-                token,
-                expires_at,
-            })
+            let run = read_run(transaction, run_id)?;
+            if let Some(status) = expected {
+                if run.status != status {
+                    return Err(JournalError::Conflict(format!(
+                        "run status changed concurrently: expected {}, found {}",
+                        status.as_str(),
+                        run.status.as_str()
+                    )));
+                }
+            }
+            Ok((
+                OwnerLease {
+                    run_id: run_id.to_string(),
+                    owner_id: owner_id.to_string(),
+                    token,
+                    expires_at,
+                },
+                run,
+            ))
         })
     }
 
@@ -802,14 +848,19 @@ impl JournalStore {
         &self,
         lease: &OwnerLease,
         ttl_seconds: f64,
-        now: f64,
+        now: impl Into<LeaseTime>,
     ) -> Result<OwnerLease> {
         self.with_owner(lease, now, |owned| owned.heartbeat(ttl_seconds))
     }
 
     /// Give up a lease so another runner can claim the run immediately.
-    pub fn release_owner(&self, lease: &OwnerLease, now: f64) -> Result<RunRecord> {
+    pub fn release_owner(
+        &self,
+        lease: &OwnerLease,
+        now: impl Into<LeaseTime>,
+    ) -> Result<RunRecord> {
         self.write(|transaction| {
+            let now = now.into().seconds();
             let released = transaction.execute(
                 "UPDATE runs
              SET owner_id = NULL, lease_token_hash = NULL, lease_expires_at = NULL,
@@ -837,12 +888,11 @@ impl JournalStore {
         lease: &OwnerLease,
         event_type: &str,
         payload: &Value,
-        now: f64,
+        now: impl Into<LeaseTime>,
     ) -> Result<EventRecord> {
         self.write(|transaction| {
-            require_live_lease(transaction, lease, now)?;
-            let event = append_event(transaction, &lease.run_id, event_type, payload)?;
-            Ok(event)
+            require_live_lease(transaction, lease, now.into().seconds())?;
+            append_event(transaction, &lease.run_id, event_type, payload)
         })
     }
 
@@ -862,7 +912,7 @@ impl JournalStore {
         checkpoint: &Value,
         expected_status: Option<RunStatus>,
         expected_desired_state: Option<DesiredState>,
-        now: f64,
+        now: impl Into<LeaseTime>,
     ) -> Result<EventRecord> {
         self.with_owner(lease, now, |owned| {
             owned.expect(expected_status, expected_desired_state)?;
@@ -873,10 +923,11 @@ impl JournalStore {
     pub(crate) fn with_owner<T>(
         &self,
         lease: &OwnerLease,
-        now: f64,
+        now: impl Into<LeaseTime>,
         body: impl FnOnce(&OwnedRun<'_>) -> Result<T>,
     ) -> Result<T> {
         self.write(|transaction| {
+            let now = now.into().seconds();
             require_live_lease(transaction, lease, now)?;
             body(&OwnedRun {
                 transaction,
@@ -902,7 +953,7 @@ impl JournalStore {
         output: Option<&Value>,
         error: Option<&Value>,
         expected_desired_state: Option<DesiredState>,
-        now: f64,
+        now: impl Into<LeaseTime>,
     ) -> Result<RunRecord> {
         validate_status_transition(expected, status, output, error)?;
         self.with_owner(lease, now, |owned| {
@@ -980,8 +1031,13 @@ impl JournalStore {
     }
 
     /// Confirm a lease is still live, for use at a safe point before continuing.
-    pub fn ensure_live_lease(&self, lease: &OwnerLease, now: f64) -> Result<RunRecord> {
+    pub fn ensure_live_lease(
+        &self,
+        lease: &OwnerLease,
+        now: impl Into<LeaseTime>,
+    ) -> Result<RunRecord> {
         self.write(|transaction| {
+            let now = now.into().seconds();
             require_live_lease(transaction, lease, now)?;
             read_run(transaction, &lease.run_id)
         })
@@ -1007,7 +1063,7 @@ impl OwnedRun<'_> {
                 "ttl_seconds must be a positive finite number",
             ));
         }
-        let expires_at = now + ttl_seconds;
+        let expires_at = lease_expiry(now, ttl_seconds)?;
         let extended = transaction.execute(
             &format!(
                 "UPDATE runs SET lease_expires_at = ?1, updated_at = ?2
@@ -1167,6 +1223,16 @@ impl OwnedRun<'_> {
         }
         read_run(transaction, &lease.run_id)
     }
+}
+
+fn lease_expiry(now: f64, ttl: f64) -> Result<f64> {
+    let expires_at = now + ttl;
+    if !expires_at.is_finite() || expires_at <= now {
+        return Err(JournalError::invalid(
+            "lease expiry must be finite and after now",
+        ));
+    }
+    Ok(expires_at)
 }
 
 /// The schema, with the lifecycle enforced by the database itself.
