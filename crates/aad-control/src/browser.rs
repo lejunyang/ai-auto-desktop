@@ -12,6 +12,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 pub const PROVIDER: &str = "browser.cdp";
+pub mod export;
 
 /// CDP `Input` and page navigation address the page, not a frame, so they are
 /// offered only where the observed frame is the main one.
@@ -43,6 +44,8 @@ struct Downloads {
     /// Why downloads could not be routed to the directory, if they could not.
     failure: Option<String>,
     items: Vec<Value>,
+    sequence: u64,
+    lost: u64,
 }
 
 impl Downloads {
@@ -52,20 +55,23 @@ impl Downloads {
         if !self.launched || self.released {
             return;
         }
-        let directory = self.directory.get_or_insert_with(|| {
-            std::env::temp_dir().join(format!("aad-downloads-{}", uuid::Uuid::new_v4()))
-        });
-        self.failure = std::fs::create_dir_all(&*directory)
-            .map_err(|e| e.to_string())
-            .and_then(|()| {
+        self.failure = (|| {
+                if self.directory.is_none() {
+                    let directory = std::env::temp_dir().canonicalize().map_err(|err| err.to_string())?.join(format!("aad-downloads-{}", uuid::Uuid::new_v4()));
+                    let mut builder = std::fs::DirBuilder::new();
+                    #[cfg(unix)]
+                    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+                    builder.create(&directory).map_err(|err| err.to_string())?;
+                    self.directory = Some(directory);
+                }
                 client
                     .command(
                         "Browser.setDownloadBehavior",
-                        json!({"behavior": "allow", "downloadPath": directory, "eventsEnabled": true}),
+                        json!({"behavior": "allow", "downloadPath": self.directory, "eventsEnabled": true}),
                     )
                     .map(|_| ())
                     .map_err(|e| e.to_string())
-            })
+            })()
             .err();
         self.routed = self.failure.is_none();
     }
@@ -85,7 +91,9 @@ impl Downloads {
     }
 
     fn track(&mut self, client: &Client) {
-        for event in client.drain_events().events {
+        let batch = client.drain_events();
+        self.lost += batch.dropped;
+        for event in batch.events {
             self.apply(&event);
         }
     }
@@ -97,11 +105,14 @@ impl Downloads {
         };
         match event["method"].as_str() {
             Some(DOWNLOAD_BEGIN) => {
+                self.sequence += 1;
                 if self.items.len() >= MAX_DOWNLOADS {
                     self.items.remove(0);
                 }
                 self.items.push(json!({
                     "guid": guid,
+                    "sequence": self.sequence,
+                    "frame_id": params["frameId"],
                     "url": params["url"],
                     "suggested_filename": params["suggestedFilename"],
                     "state": "in_progress",
@@ -128,14 +139,18 @@ impl Downloads {
                     _ => "in_progress",
                 });
                 if params["state"] == "completed" {
+                    item["path_reported"] = json!(params["filePath"].is_string());
                     // Newer browsers say where; otherwise the suggested name
                     // in the directory, when that file is there.
                     let path = params["filePath"]
                         .as_str()
                         .map(std::path::PathBuf::from)
                         .or_else(|| {
-                            Some(directory?.join(item["suggested_filename"].as_str()?))
-                                .filter(|path| path.is_file())
+                            let filename = item["suggested_filename"].as_str()?;
+                            if !export::safe_filename(filename) {
+                                return None;
+                            }
+                            Some(directory?.join(filename)).filter(|path| path.is_file())
                         });
                     item["path"] = json!(path);
                 }
@@ -157,6 +172,8 @@ impl Downloads {
             "tracking": self.launched && self.routed && !self.released,
             "reason": reason,
             "downloads": self.items,
+            "sequence": self.sequence,
+            "lost": self.lost,
         })
     }
 }
@@ -951,6 +968,7 @@ impl BrowserBackend {
                     .is_some_and(|old| old.instance == instance && old.headless);
             *known = Some(BrowserInput { instance, headless });
             client.filter_events(&[DOWNLOAD_BEGIN, DOWNLOAD_PROGRESS], &[]);
+            self.downloads.lock().unwrap().lost += 1;
             *slot = Some(client);
         }
         let client = slot.as_mut().unwrap();
