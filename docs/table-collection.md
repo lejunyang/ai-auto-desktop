@@ -2,12 +2,14 @@
 
 这里处理 Chromium 网页上有表头的 HTML 表格。根据你要拿到的结果选入口即可。
 
+运行 `aad browser --help` 可以找到页面列表、脚本、录制和网页表格采集。本地 CSV 文件处理归在 `aad csv`。已有的 `aad table collect/export/compare` 脚本仍可运行。
+
 | 你在做什么 | 怎么调用 |
 |---|---|
 | 看当前页的几列 | 在浏览器脚本中写 `page.table({role:"table", name:"Bills"}, ["ID","Amount"])`。 |
 | 在已有脚本里收完整张表，再用结果继续操作 | 写 `const bills = page.collect(spec)`，检查 `bills.complete` 后遍历 `bills.records`。 |
 | 在 YAML 或 MCP 里收整表 | Recipe 步骤使用 `collect_table`。MCP 调用 `control_collect_table`，传入同一组字段及页面的 `resource_id`。 |
-| 临时导出 CSV，或和本地账单对账 | 在终端运行 `aad table collect`，同时传 CSV 文件路径。 |
+| 临时导出 CSV，或和本地账单对账 | 在终端运行 `aad browser collect-table`，同时传 CSV 文件路径。 |
 
 下面是一份采集参数。脚本可以直接传这个对象，使用 CLI 时把它存为 `bills.json`。`table` 指定哪张表，`columns` 列出要读的表头，`row_key` 选其中一个跨页唯一的业务列，例如账单号，`traversal` 指定如何翻页或滚动。示例中的 `expected_rows: 2` 表示账单应有两行。知道总数可以传入它；有首页按钮的分页表也可以通过观察首页和末页确认完整性。
 
@@ -24,7 +26,7 @@
 在同一次调用中收集数据、生成实际账单 CSV，并对比预期账单。URL 要与一个已打开的主页面完全一致。同 URL 的多个标签页或子 frame，可用 `--resource-id` 指定 `control_targets` 返回的资源。
 
 ```powershell
-aad table collect --url 'http://localhost:8080/bills' --browser-port 9222 --allow-input --spec ./bills.json --output ./actual.csv --compare-csv ./expected.csv --decimal Amount
+aad browser collect-table --url 'http://localhost:8080/bills' --browser-port 9222 --allow-input --spec ./bills.json --output ./actual.csv --compare-csv ./expected.csv --decimal Amount
 ```
 
 `--output` 和 `--compare-csv` 均可省略。标准输出包含 `records`、`row_count`、`complete`、`stop_reason` 和实际提交的 `actions` 数量。对账时另有 `matches` 和 `comparison`。收集不完整会返回已有记录并以 1 退出，CSV 导出和对账都要求完整结果。完整但对账有差异时也以 1 退出，已请求的实际账单 CSV 仍会生成。
@@ -55,9 +57,9 @@ aad table collect --url 'http://localhost:8080/bills' --browser-port 9222 --allo
 也可先保存完整的收集结果，再通过本地命令处理。两个命令的 `--input` 都读取包含 `columns`、`row_key`、`row_count`、`complete` 和 `records` 的收集对象。
 
 ```powershell
-aad table collect --url 'http://localhost:8080/bills' --browser-port 9222 --allow-input --spec ./bills.json > ./collection.json
-aad table export --input ./collection.json --output ./actual.csv
-aad table compare --input ./collection.json --csv ./expected.csv --decimal Amount
+aad browser collect-table --url 'http://localhost:8080/bills' --browser-port 9222 --allow-input --spec ./bills.json > ./collection.json
+aad csv export --input ./collection.json --output ./actual.csv
+aad csv compare --input ./collection.json --csv ./expected.csv --decimal Amount
 ```
 
 导出使用 UTF-8、CRLF 记录分隔符和 spec 中的列顺序。逗号、双引号和多行文本使用 CSV 引号转义。CSV 要求所选单元格都有字符串值，空字符串可往返，缺失单元格的 JSON `null` 会报错。输入必须是至多 16 MiB 的普通文件；导出在目标目录写临时文件，完整写入后发布到一个新路径。

@@ -4,15 +4,15 @@ Open the Chromium page and the native application. Use a browser with a local CD
 
 ```powershell
 aad apps
-aad browser-record targets --cdp-port 9222
+aad browser pages --cdp-port 9222
 aad describe '<native resource_id>'
-aad browser-record mixed start --native '<invoice resource_id>' --window 'Invoice' --dialog 'Approval' --also-native '<ledger resource_id>' 'Ledger' --page '<page id>' --cdp-port 9222 --out ./invoice-session
+aad browser record mixed start --native '<invoice resource_id>' --window 'Invoice' --dialog 'Approval' --also-native '<ledger resource_id>' 'Ledger' --page '<page id>' --cdp-port 9222 --out ./invoice-session
 ```
 
 Give the full native resource ID, the main window's exact accessible name, and the exact browser page ID. Repeat `--dialog` for other named dialogs of the primary application, and `--also-native RESOURCE WINDOW` for windows in additional applications. Open all selected main windows before starting. Dialogs can open later. After **Mixed recording ready**, perform the task across the selected applications. Press Ctrl+C or run this in another terminal and wait for the start process to finish.
 
 ```powershell
-aad browser-record mixed stop --out ./invoice-session
+aad browser record mixed stop --out ./invoice-session
 ```
 
 The result names **workflow.json**, a self-contained workflow with capture gaps in its metadata. **capture.json** contains the action count, filters, gap details and final status. The browser recorder also keeps its own evidence in the `browser` subdirectory. Reset the applications to their starting state and replay the workflow through the normal CLI.

@@ -10,22 +10,22 @@
 
 ```powershell
 # 新 profile：适合从未登录状态记录完整登录流程。
-aad browser-record start --browser edge --url 'https://example.com/login' --out ./login-recording
+aad browser record start --browser edge --url 'https://example.com/login' --out ./login-recording
 
 # 可复用的工作 profile：第一次创建，以后使用相同目录保留登录状态。
-aad browser-record start --browser chrome --profile-dir ./browser-profile `
+aad browser record start --browser chrome --profile-dir ./browser-profile `
   --url 'https://example.com' --out ./task-recording
 
 # 只有一个已有 profile 时，不必填写 ID。
-aad browser-record start --browser edge --existing-profile --url 'https://example.com' --out ./login-copy-recording
+aad browser record start --browser edge --existing-profile --url 'https://example.com' --out ./login-copy-recording
 
 # 查看多个已有 profile 的目录 ID 和显示名称，再明确选择。
-aad browser-record profiles --browser edge
-aad browser-record start --browser edge --existing-profile 'Profile 1' `
+aad browser record profiles --browser edge
+aad browser record start --browser edge --existing-profile 'Profile 1' `
   --url 'https://example.com' --out ./work-recording
 
 # 被占用时默认报错。确认需要关闭占用浏览器并重新启动，再显式加此参数。
-aad browser-record start --browser edge --existing-profile 'Profile 1' --kill-browser `
+aad browser record start --browser edge --existing-profile 'Profile 1' --kill-browser `
   --url 'https://example.com' --out ./restart-recording
 ```
 
@@ -55,17 +55,17 @@ osdk exec --tool rust -- cargo build --locked -p aad-cli
 
 ```powershell
 # 先列出标签。复制目标页面的 id；不按标题猜测，也不会取第一个标签。
-aad browser-record targets --cdp-port 9222
+aad browser pages --cdp-port 9222
 
 # login-recording 必须是一个尚不存在的目录。
-aad browser-record start --cdp-port 9222 --page '<page-id>' --out ./login-recording
+aad browser record start --cdp-port 9222 --page '<page-id>' --out ./login-recording
 ```
 
 开始后正常操作网站。可以在另一个终端标记关键结果或停止：
 
 ```powershell
-aad browser-record mark --out ./login-recording --note '点击这里出现二维码；扫码后个人菜单可见'
-aad browser-record stop --out ./login-recording
+aad browser record mark --out ./login-recording --note '点击这里出现二维码；扫码后个人菜单可见'
+aad browser record stop --out ./login-recording
 ```
 
 原终端按 Ctrl+C 同样会正常收尾、移除监听并生成步骤说明。`stop`/`mark` 返回的是请求已写入；以录制进程退出及 `manifest.json` 的最终状态为准。也可以使用 `--seconds 120` 定时结束。
@@ -95,7 +95,7 @@ aad browser-record stop --out ./login-recording
 例如需要网络脱敏时：
 
 ```powershell
-aad browser-record start --page '<page-id>' --out ./login-filtered --redact-network
+aad browser record start --page '<page-id>' --out ./login-filtered --redact-network
 ```
 
 脱敏是按常见字段名进行的可选过滤，不是任意站点的通用秘密识别器；它只影响网络证据。截图、页面文字、用户备注采用各自的记录行为，截图当前没有自动遮蔽。密码输入框值不通过页面事件读取，此规则不改变网络默认保留原值的行为。
@@ -149,7 +149,7 @@ login-recording/
 需要重新生成说明时：
 
 ```powershell
-aad browser-record export --out ./login-recording
+aad browser record export --out ./login-recording
 ```
 
 ## 回放
@@ -157,8 +157,8 @@ aad browser-record export --out ./login-recording
 录到的操作可以转成和 `aad record` 一样的平台无关步骤（`control-steps/1`），用 `aad run` 重放：
 
 ```powershell
-aad browser-record steps --out ./login-recording                    # 只看转出的步骤和跳过的操作
-aad browser-record steps --out ./login-recording --save 后台开权限  # 另存为录制和工作流
+aad browser record steps --out ./login-recording                    # 只看转出的步骤和跳过的操作
+aad browser record steps --out ./login-recording --save 后台开权限  # 另存为录制和工作流
 aad run 后台开权限 --permission desktop.input --permission desktop.observe
 ```
 
@@ -166,7 +166,7 @@ aad run 后台开权限 --permission desktop.input --permission desktop.observe
 
 ### 回放时换一份附件
 
-网页通过 HTML 文件输入框打开选择器时，可以手动选择文件。录制器将确认的选择导出为一个 `upload` 步骤，回放时再指定这一批要用的文件。用 `aad browser-record steps` 查看该步的 `input.name`。例如录到的名字是 `rec1_files`，可这样换一份附件再运行：
+网页通过 HTML 文件输入框打开选择器时，可以手动选择文件。录制器将确认的选择导出为一个 `upload` 步骤，回放时再指定这一批要用的文件。用 `aad browser record steps` 查看该步的 `input.name`。例如录到的名字是 `rec1_files`，可这样换一份附件再运行：
 
 ```powershell
 $dir = (Resolve-Path ./invoices).Path
@@ -178,10 +178,10 @@ aad run 报销附件 --permission desktop.observe --permission desktop.input --a
 
 ### 在已经打开的文件选择器里选文件
 
-Linux X11 下，如果 Chromium 自己的 GTK 3 文件选择器已经显示在前台，且由主页面的 HTML 文件框打开，可以直接选文件。先用 `aad browser-record targets` 找到打开选择器的页面 ID。
+Linux X11 下，如果 Chromium 自己的 GTK 3 文件选择器已经显示在前台，且由主页面的 HTML 文件框打开，可以直接选文件。先用 `aad browser pages` 找到打开选择器的页面 ID。
 
 ```powershell
-aad browser-record targets --cdp-port 9222
+aad browser pages --cdp-port 9222
 $dir = (Resolve-Path ./invoices).Path
 aad do choose-files --cdp-port 9222 --page '<页面 ID>' --allow-input --allow-upload-dir $dir --file (Join-Path $dir '发票.pdf')
 ```

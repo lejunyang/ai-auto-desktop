@@ -22,7 +22,7 @@ GUI 也走同一个会话，三个平台都能查看界面、搭建、录制和�
 产出同一种平台无关的步骤；`aad watch` 仍只在 Windows 上。
 录制、回放和事件观察的限制见[控制能力审视](docs/research/control-audit-2026-10-17.md)。
 
-浏览器任务观测使用 `aad browser-record`：记录操作、关键元素变化、网络请求和截图，生成给 AI 编写 skill 的步骤说明。`aad browser-record start --browser edge --url 'https://example.com' --out ./recording` 自动启动并录制，可用 `--profile-dir` 复用工作 profile，或用 `--existing-profile [ID]` 选择日常已有 profile（只有一个时无需填 ID）。占用时默认提示，显式 `--kill-browser` 才结束占用浏览器并启动。**网络默认保留原值，`--redact-network` 才开启脱敏**。录完可以用 `aad browser-record steps --out ./recording --save 名字` 转成可回放的步骤，再 `aad run 名字`。详见[浏览器任务录制](docs/browser-recording.md)。
+浏览器任务观测使用 `aad browser-record`：记录操作、关键元素变化、网络请求和截图，生成给 AI 编写 skill 的步骤说明。`aad browser record start --browser edge --url 'https://example.com' --out ./recording` 自动启动并录制，可用 `--profile-dir` 复用工作 profile，或用 `--existing-profile [ID]` 选择日常已有 profile（只有一个时无需填 ID）。占用时默认提示，显式 `--kill-browser` 才结束占用浏览器并启动。**网络默认保留原值，`--redact-network` 才开启脱敏**。录完可以用 `aad browser record steps --out ./recording --save 名字` 转成可回放的步骤，再 `aad run 名字`。详见[浏览器任务录制](docs/browser-recording.md)。
 
 ## 安全模型：先观察，才能操作
 
@@ -348,7 +348,7 @@ aad mcp --allow-input --provider browser.firefox_bidi --browser-bidi-port 9223
 `tests/windows/verify_mcp_browser_session.py` 用本机的假站点在真实 Chrome 里走完这一遍。
 
 命令行同样能操作浏览器：设置 `AAD_CDP_PORT=<端口>` 后，`aad apps`、`aad describe`、`aad do`、`aad capture`
-都会把这个调试端口上的浏览器页面算进来，例如 `aad browser-record start --browser chrome` 启动时打印的端口。
+都会把这个调试端口上的浏览器页面算进来，例如 `aad browser record start --browser chrome` 启动时打印的端口。
 `aad capture <页面> --role img --name 登录二维码 --out code.png` 把元素截图写到文件。
 - 失败以结构化错误返回，并附 `hint` 说明怎样恢复（例如界面变了要重新 observe，匹配多个要用 `within` 收窄）。
 
@@ -358,7 +358,7 @@ aad mcp --allow-input --provider browser.firefox_bidi --browser-bidi-port 9223
 
 长流程可以把录制转成短 YAML：`aad recipe orders.recording.json --out orders.yaml`，用 `aad run` 直接执行。按列读取表格、看失败步骤、检查中断日志，以及 100/500 步的实测结果，见[长流程操作手册和缺口清单](docs/long-workflows.md)。
 
-需要根据页面上的值决定下一步时，可写 `recipe/2` 的循环和条件，或使用 JavaScript。Recipe 可以调用指定版本的子流程并接收它的结果。JavaScript 可以一次填多张表单、翻页、处理数据，再返回一份 JSON。命令行运行 `aad browser-script`，MCP 使用 `browser_script`。示例见[可编程 Recipe](docs/recipe-programs.md)和[浏览器 JavaScript](docs/browser-script.md)。
+需要根据页面上的值决定下一步时，可写 `recipe/2` 的循环和条件，或使用 JavaScript。Recipe 可以调用指定版本的子流程并接收它的结果。JavaScript 可以一次填多张表单、翻页、处理数据，再返回一份 JSON。命令行运行 `aad browser script`，MCP 使用 `browser_script`。示例见[可编程 Recipe](docs/recipe-programs.md)和[浏览器 JavaScript](docs/browser-script.md)。
 
 ### 请求闸门
 
@@ -381,7 +381,7 @@ aad mcp --browser-port 9222 --allow-input \
 - **边界**　拦截覆盖 CDP 提供 Fetch 的页面、弹窗、跨进程 iframe 和 worker 目标。部分 Chromium 的专用 worker 没有 Fetch 域。Firefox BiDi、浏览器以外的请求、已经建立的 WebSocket 消息和完全由页面缓存满足的操作均在范围之外。动作结果按页面和动作时间窗口关联。命中的请求重定向后，后续裁决仍归到原动作。表单提交到新窗口时，浏览器提供 opener 的首个导航也归到提交动作，记录中的 `page_id` 指向实际发出请求的页面。同页并发的后台请求也可能出现在结果里。附加到已有浏览器前已经发出的请求无法追回。脱离动作时间窗口、稍后由定时器发起的请求可在网络诊断中查询。
 
 
-整张账单可以用 `aad table collect` 翻页或滚动采集，导出 CSV，再按订单号和金额核对。涉及网页、文件管理器、表格软件的操作可用 `aad browser-record mixed start` 一起录制，每个桌面应用指定要录的窗口。见[收集表格与对账](docs/table-collection.md)和[跨应用录制](docs/mixed-recording.md)。
+整张账单可以用 `aad browser collect-table` 翻页或滚动采集，导出 CSV，再按订单号和金额核对。涉及网页、文件管理器、表格软件的操作可用 `aad browser record mixed start` 一起录制，每个桌面应用指定要录的窗口。见[收集表格与对账](docs/table-collection.md)和[跨应用录制](docs/mixed-recording.md)。
 
 **保存与运行流程**（重复劳动）：`save_workflow`、`list_workflows`、`describe_workflow`、`run_workflow`。
 `save_workflow` 收的是和 `aad record`、GUI 相同的平台无关步骤（`control-steps/1`）：每步写应用（provider、进程名、

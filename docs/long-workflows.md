@@ -11,13 +11,13 @@
 | 审阅和修改长流程 | `aad recipe orders.recording.json --out orders.yaml` | 同一应用只在阶段开头写一次，重复的定位器用别名，动作各占一行。导出时会读回 YAML，检查展开后的工作流是否与原始录制一致。已有输出文件不会被覆盖。 |
 | 执行、定位断点 | `aad validate orders.yaml`，然后 `aad run`；传 `--journal`，运行中或事后可用 `aad review` | 查看最后完成的步骤、最后动作错误、已开始但未收到结果的动作。只读日志，不发送输入；日志没有结尾时会明确标出。 |
 | 避免录错同名按钮 | 浏览器录制自动保留显式命名的行、表单等父容器；Linux、macOS 原生录制按捕获到的控件身份归并 | 两个订单行都叫“保存”，重排后按行名回放；没有可区分的标签时，定位有歧义就停。原生文本跨相邻轮询合并，焦点切换、跳过的事件或缓冲区溢出需要特别审阅。 |
-| 给同事汇报录制情况 | `aad browser-record summary --out <录制目录>` | 给出是否正常结束、步骤数、缺口数、过滤的请求数。只读最终 manifest 白名单字段；不复制原始证据、网址、截图、备注、表单值或网络正文。原始录制仍单独保管。 |
+| 给同事汇报录制情况 | `aad browser record summary --out <录制目录>` | 给出是否正常结束、步骤数、缺口数、过滤的请求数。只读最终 manifest 白名单字段；不复制原始证据、网址、截图、备注、表单值或网络正文。原始录制仍单独保管。 |
 
 ## 写一个短流程
 
 需要循环、分支和可复用子流程时，使用 `format: recipe/2`。如果已有 JavaScript 数据处理逻辑，可直接用浏览器脚本中的 `page` 读取界面、操作控件和返回结构化结果。[Recipe 循环与子流程](recipe-programs.md) · [浏览器脚本 API](browser-script.md)
 
-账单跨页时，`aad table collect` 可将完整记录导出 CSV，按行键核对金额并列出差异。任务横跨浏览器和多个桌面应用时，用 `aad browser-record mixed start` 选择网页和窗口，录下的 `workflow.json` 可直接回放。[表格采集与对账](table-collection.md) · [跨应用录制](mixed-recording.md)
+账单跨页时，`aad browser collect-table` 可将完整记录导出 CSV，按行键核对金额并列出差异。任务横跨浏览器和多个桌面应用时，用 `aad browser record mixed start` 选择网页和窗口，录下的 `workflow.json` 可直接回放。[表格采集与对账](table-collection.md) · [跨应用录制](mixed-recording.md)
 
 以下为可执行格式。分阶段写 `app`，步骤沿用原有动作、字段读取和断言。省略步骤 ID 时依次编号；跨步骤引用时明确命名。一个 Recipe 最多 500 步。也可用它表达浏览器和原生窗口交替的操作。
 
