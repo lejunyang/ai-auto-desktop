@@ -61,6 +61,7 @@ struct Pending {
 }
 
 pub struct Recorder {
+    request_gate: Option<std::sync::Arc<crate::gate_session::GateSession>>,
     #[cfg(test)]
     snapshot_changes: Vec<Value>,
     stop_reason: Option<std::sync::Arc<std::sync::Mutex<Option<String>>>>,
@@ -159,6 +160,7 @@ impl Recorder {
         let storage = storage::Storage::new(&options)?;
         let session_id = uuid::Uuid::new_v4().simple().to_string();
         let mut recorder = Self {
+            request_gate: crate::gate_session::GateSession::configured(options.port)?,
             #[cfg(test)]
             snapshot_changes: Vec::new(),
             stop_reason: None,
@@ -820,6 +822,14 @@ impl Recorder {
                     let status = pending.record["response"]["status"].as_u64().unwrap_or(0);
                     if method == "Network.loadingFailed" {
                         pending.record["error"] = p["errorText"].clone();
+                        if let Some(record) = self.request_gate.as_ref().and_then(|g| {
+                            g.records(&page, 0)
+                                .into_iter()
+                                .rev()
+                                .find(|r| r["request_id"] == request)
+                        }) {
+                            pending.record["request_gate"] = record;
+                        }
                     }
                     let kind = pending.record["type"].as_str().unwrap_or("Other");
                     let url = pending.record["request"]["url"].as_str().unwrap_or("");
@@ -954,10 +964,11 @@ impl Recorder {
         Ok(())
     }
     fn expire(&mut self) -> Result<()> {
+        let lifetime = Duration::from_secs(if self.request_gate.is_some() { 135 } else { 60 });
         let keys: Vec<_> = self
             .pending
             .iter()
-            .filter(|(_, p)| p.started.elapsed() > Duration::from_secs(60))
+            .filter(|(_, p)| p.started.elapsed() > lifetime)
             .map(|(k, _)| k.clone())
             .collect();
         for key in keys {

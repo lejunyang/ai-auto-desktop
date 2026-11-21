@@ -12,6 +12,7 @@ const MAX_BYTES: usize = 8 * 1024 * 1024;
 struct Inbox {
     pending: HashMap<u64, mpsc::SyncSender<Result<Value, CdpError>>>,
     events: VecDeque<(Value, usize)>,
+    subscriber: Option<mpsc::Sender<Value>>,
     bytes: usize,
     dropped: u64,
     failure: Option<CdpError>,
@@ -39,7 +40,11 @@ impl Inbox {
             }
         }
         if self.keep.as_ref().is_none_or(|keep| keep.contains(&method)) {
-            self.event(value, bytes);
+            if let Some(subscriber) = &self.subscriber {
+                let _ = subscriber.send(value);
+            } else {
+                self.event(value, bytes);
+            }
         }
     }
     fn event(&mut self, value: Value, bytes: usize) {
@@ -242,6 +247,16 @@ impl Connection {
     /// commands when an `interrupt` event arrives.
     pub fn filter(&self, keep: Option<&[&str]>, interrupt: &[&str]) {
         self.inbox.lock().unwrap().filter(keep, interrupt);
+    }
+
+    /// Protocol events requiring an acknowledgement must not be evicted by the
+    /// bounded diagnostic history. Register before enabling the event domain.
+    pub(crate) fn subscribe(&self, methods: &[&str]) -> mpsc::Receiver<Value> {
+        let (tx, rx) = mpsc::channel();
+        let mut inbox = self.inbox.lock().unwrap();
+        inbox.filter(Some(methods), &[]);
+        inbox.subscriber = Some(tx);
+        rx
     }
 
     pub fn drain(&self) -> EventBatch {

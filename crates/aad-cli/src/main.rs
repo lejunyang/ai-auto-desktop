@@ -41,6 +41,13 @@ struct Cli {
     #[command(subcommand)]
     command: Command,
 
+    /// Loopback HTTP policy endpoint for CDP requests (AAD_REQUEST_GATE_URL).
+    #[arg(long, global = true)]
+    request_gate_url: Option<String>,
+    /// Environment variable containing its bearer token (default AAD_REQUEST_GATE_TOKEN).
+    #[arg(long, global = true)]
+    request_gate_token_env: Option<String>,
+
     /// Print compact JSON instead of indented JSON.
     #[arg(long, global = true)]
     compact: bool,
@@ -352,6 +359,21 @@ struct RunArgs {
 }
 
 fn main() -> ExitCode {
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|arg| arg == "--aad-request-gate-owner")
+    {
+        return if std::env::args()
+            .nth(2)
+            .and_then(|v| v.parse().ok())
+            .is_some_and(|port| aad_browser::gate_session::serve_owner(port).is_ok())
+        {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::FAILURE
+        };
+    }
+    aad_browser::gate_session::enable_shared_owner();
     if std::env::args_os().len() == 2
         && std::env::args_os()
             .nth(1)
@@ -364,6 +386,17 @@ fn main() -> ExitCode {
         };
     }
     let mut cli = Cli::parse();
+    // SAFETY: startup is single threaded, before service or browser workers.
+    if let Some(url) = cli.request_gate_url.take() {
+        unsafe { std::env::set_var("AAD_REQUEST_GATE_URL", url) }
+    }
+    if let Some(name) = cli.request_gate_token_env.take() {
+        let Ok(token) = std::env::var(name) else {
+            eprintln!("request gate token variable unavailable");
+            return ExitCode::from(EXIT_USAGE);
+        };
+        unsafe { std::env::set_var("AAD_REQUEST_GATE_TOKEN", token) }
+    }
     let secret_variables = match &mut cli.command {
         Command::Mcp(args) => args.prepare_secrets(),
         Command::Control(command) => command.prepare_secrets(),

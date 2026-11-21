@@ -467,7 +467,7 @@ narrow the locator. control_cancel stops a wait.",
             "Perform a typed action on an observed, freshly revalidated target. Every \
 attempt consumes that provider's observation, so observe again before the next one. \
 Submission is not proof the task succeeded: observe again and check. Never retry an \
-unknown-effect write automatically.",
+unknown-effect write automatically. A CDP session started with --request-gate-url or AAD_REQUEST_GATE_URL reports policy decisions in error.details.blocked_requests. Follow the returned hint.",
             json!({"target": target_schema(), "action": action_schema(), "verify": locator_schema()}),
             vec!["target", "action"],
             true,

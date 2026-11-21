@@ -705,6 +705,10 @@ impl Browsers {
                 Some("If the profile is in use, close that browser or pass close_running with the person's agreement."),
             )
         })?;
+        // Install the policy on the blank candidate before its first navigation.
+        // Publication acquires the same owner while this reference is alive.
+        let request_gate =
+            aad_browser::gate_session::GateSession::configured(started.port).map_err(failed)?;
         let mut answer = json!({
             "browser": browser,
             "port": started.port,
@@ -746,7 +750,20 @@ impl Browsers {
             }
         }
         if let Some(url) = url {
-            if let Err(error) = started.open_url_guarded(url, &Guard(session, context)) {
+            let tracker = request_gate.as_ref().map(|g| g.tracker());
+            let navigation = started.open_url_guarded(url, &Guard(session, context));
+            if let Some(tracker) = tracker {
+                let end = tracker.end();
+                let records =
+                    tracker.finish(&started.page, end, || context.cancellation().is_cancelled());
+                if !records.is_empty() {
+                    let _ = self.stop_recording();
+                    return Err(
+                        json!({"code":"BROWSER.REQUEST_BLOCKED","message":"Request gate blocked startup navigation","effect":"unknown","details":{"blocked_requests":records}}),
+                    );
+                }
+            }
+            if let Err(error) = navigation {
                 let _ = self.stop_recording();
                 if let Err(cancelled) = context.remaining() {
                     return Err(cancelled.to_json());

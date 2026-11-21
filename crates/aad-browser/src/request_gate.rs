@@ -9,6 +9,7 @@ use url::{Host, Url};
 pub struct Gate {
     client: Client,
     endpoint: Url,
+    configured_url: String,
     token: String,
 }
 
@@ -29,12 +30,13 @@ impl Scope {
         let Some(host) = url.host_str() else {
             return false;
         };
+        let host = host.trim_end_matches('.');
         self.watch.iter().any(|rule| {
             rule.methods
                 .as_ref()
                 .is_none_or(|ms| ms.iter().any(|m| m == method))
                 && rule.host.as_ref().is_none_or(|pattern| {
-                    let pattern = pattern.to_ascii_lowercase();
+                    let pattern = pattern.trim_end_matches('.').to_ascii_lowercase();
                     match pattern.strip_prefix("*.") {
                         Some(suffix) => host
                             .strip_suffix(suffix)
@@ -79,8 +81,12 @@ impl Gate {
             .transpose()
     }
 
+    pub(super) fn credentials(&self) -> (&str, &str) {
+        (&self.configured_url, &self.token)
+    }
     pub fn new(endpoint: &str, token: String) -> Result<Self, &'static str> {
         let invalid = "invalid loopback request gate configuration";
+        let configured_url = endpoint.to_owned();
         let mut endpoint = Url::parse(endpoint).map_err(|_| invalid)?;
         if endpoint.scheme() != "http"
             || !endpoint.username().is_empty()
@@ -107,6 +113,7 @@ impl Gate {
             .map_err(|_| invalid)?;
         Ok(Self {
             client,
+            configured_url,
             endpoint,
             token,
         })
@@ -152,7 +159,9 @@ impl Gate {
         )
     }
     pub fn redact(&self, text: &str) -> String {
-        text.replace(self.endpoint.as_str(), "[redacted]")
+        text.replace(&self.configured_url, "[redacted]")
+            .replace(self.endpoint.as_str(), "[redacted]")
+            .replace(&self.endpoint.origin().ascii_serialization(), "[redacted]")
             .replace(&self.token, "[redacted]")
     }
 }
@@ -181,7 +190,7 @@ pub fn payload(request: &Value, page: Value, session: &str) -> Value {
             || mime == "application/x-www-form-urlencoded"
         {
             if let Some(text) = request["postData"].as_str() {
-                let limit = text.floor_char_boundary(65536);
+                let limit = crate::recording::network::truncate(text, 65536).0.len();
                 value["body"] = json!(&text[..limit]);
                 if limit < text.len() {
                     value["bodyTruncated"] = json!(true)
@@ -232,16 +241,33 @@ mod tests {
         )
         .unwrap();
         std::thread::scope(|scope| {
-            scope.spawn(||for (verb,status,body) in [("GET","200 OK",r#"{"revision":"a","watch":[]}"#),("POST","200 OK",r#"{"decision":"pending","message":"review","askId":"one"}"#),("POST","401 Unauthorized","")]{
-        let(mut stream,_)=listener.accept().unwrap();
-        let mut input=BufReader::new(&stream);
-        let mut headers=String::new();
-        loop{let mut line=String::new();input.read_line(&mut line).unwrap();if line=="\r\n"{break}headers.push_str(&line);}
-        assert!(headers.starts_with(&format!("{verb} /policy ")));
-        assert!(headers.to_lowercase().contains("authorization: bearer sample-token"));
-        if verb=="POST"{let mut buf=[0;2];input.read_exact(&mut buf).unwrap();assert_eq!(&buf,b"{}");}
-        write!(stream,"HTTP/1.1 {status}\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}",body.len()).unwrap();
-       });
+            scope.spawn(|| {
+                let replies = [
+                    ("GET","200 OK",r#"{"revision":"a","watch":[]}"#),
+                    ("POST","200 OK",r#"{"decision":"pending","message":"review","askId":"one"}"#),
+                    ("POST","401 Unauthorized","")
+                ];
+                for (verb,status,body) in replies {
+                    let (mut stream,_) = listener.accept().unwrap();
+                    stream.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+                    let mut input=BufReader::new(&stream);
+                    let mut headers=String::new();
+                    loop {
+                        let mut line=String::new();
+                        assert_ne!(input.read_line(&mut line).unwrap(),0);
+                        if line=="\r\n"{break}
+                        headers.push_str(&line);
+                    }
+                    assert!(headers.starts_with(&format!("{verb} /policy ")));
+                    assert!(headers.to_lowercase().contains("authorization: bearer sample-token"));
+                    if verb=="POST"{
+                        let mut buf=[0;2];
+                        input.read_exact(&mut buf).unwrap();
+                        assert_eq!(&buf,b"{}");
+                    }
+                    write!(stream,"HTTP/1.1 {status}\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}",body.len()).unwrap();
+                }
+            });
             assert!(gate.scope().unwrap().watch.is_empty());
             assert!(matches!(
                 gate.decide(&json!({})),

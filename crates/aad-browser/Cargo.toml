@@ -25,5 +25,8 @@ sysinfo = { version = "0.33", default-features = false, features = ["system"] }
 fs2 = "0.4"
 dunce = "1"
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [lints]
 workspace = true

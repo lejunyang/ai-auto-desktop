@@ -1084,15 +1084,55 @@ impl Session {
         });
         active.insert(request.request_id.clone(), context.clone());
         drop(active);
-        let result = {
+        let (mut result, tracked) = {
             let _gate = self.gate.lock().unwrap();
-            context.remaining().and_then(|_| {
+            let resource_id = match &request.operation {
+                Operation::Act { target, .. } => Some(&target.resource_id),
+                Operation::CollectTable { resource_id, .. } => Some(resource_id),
+                _ => None,
+            };
+            let track = resource_id.and_then(|id| {
+                let browser = self.browser.as_ref()?;
+                let state = self.state.lock().unwrap();
+                let resource = state.resources.get(id)?;
+                if resource.resource.provider != browser::PROVIDER {
+                    return None;
+                }
+                let page = resource.selector["page_id"].as_str()?.to_owned();
+                drop(state);
+                Some((browser.gate_tracker()?, page))
+            });
+            let result = context.remaining().and_then(|_| {
                 if self.closed.load(Ordering::SeqCst) {
                     return Err(error("CONTROL.SESSION_CLOSED", "session is closed"));
                 }
                 self.dispatch(&request.operation, &context)
-            })
+            });
+            let tracked = track
+                .filter(|_| context.phase.load(Ordering::SeqCst) == 1)
+                .map(|(tracker, page)| {
+                    // Target.createTarget navigates the newly created page.
+                    let tab = result.as_ref().ok().map(|r| &r["backend_result"]);
+                    let page = tab
+                        .filter(|v| v["native_operation"] == "Target.createTarget")
+                        .and_then(|v| v["page_id"].as_str())
+                        .map(str::to_owned)
+                        .unwrap_or(page);
+                    let end = tracker.end();
+                    (tracker, page, end)
+                });
+            (result, tracked)
         };
+        if let Some((tracker, page, end)) = tracked {
+            let records = tracker.finish(&page, end, || context.cancellation().is_cancelled());
+            if !records.is_empty() {
+                let mut failure=error("BROWSER.REQUEST_BLOCKED","The request gate blocked a browser request. See blocked_requests for the decision and next step.").with_effect("unknown");
+                failure
+                    .details
+                    .insert("blocked_requests".into(), json!(records));
+                result = Err(failure);
+            }
+        }
         self.active.lock().unwrap().remove(&request.request_id);
         result
     }
@@ -1629,6 +1669,9 @@ impl Session {
     /// only when granted, so a client never learns of a refused ability by
     /// seeing it listed.
     fn with_grants(&self, mut answer: Value) -> Value {
+        if self.browser.as_ref().is_some_and(|b| b.gate_configured()) {
+            answer["request_gate"] = json!(true);
+        }
         if self.policy.allow_input && !self.policy.launch.is_empty() {
             answer["launch"] = json!(self.policy.launch);
         }

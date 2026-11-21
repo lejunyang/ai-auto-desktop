@@ -220,6 +220,7 @@ struct Packet {
 }
 
 pub struct RemoteClient {
+    request_gate: bool,
     id: String,
     writer: mpsc::SyncSender<Packet>,
     pending: Pending,
@@ -319,6 +320,7 @@ impl RemoteClient {
             waiting.lock().unwrap().clear();
         });
         let mut client = Self {
+            request_gate: false,
             id: String::new(),
             writer,
             pending,
@@ -344,6 +346,10 @@ impl RemoteClient {
                 "remote session handshake mismatch",
             ));
         }
+        client.request_gate = response
+            .data
+            .as_ref()
+            .is_some_and(|data| data["request_gate"] == true);
         client.id = response.session_id;
         let (heartbeat, closed, id) = (
             client.writer.clone(),
@@ -465,9 +471,14 @@ impl RemoteClient {
                 false,
             );
         }
+        let transport_slack =
+            if self.request_gate && matches!(request.operation, Operation::Act { .. }) {
+                Duration::from_secs(127)
+            } else {
+                Duration::from_millis(250)
+            };
         match rx.recv_timeout(
-            Duration::from_millis(request.timeout_ms.min(crate::MAX_TIMEOUT_MS))
-                .saturating_add(Duration::from_millis(250)),
+            Duration::from_millis(request.timeout_ms.min(crate::MAX_TIMEOUT_MS)) + transport_slack,
         ) {
             Ok(response) => {
                 if !self.id.is_empty() && response.session_id != self.id {

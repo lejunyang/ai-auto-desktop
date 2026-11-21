@@ -182,7 +182,8 @@ pub fn fingerprint(record: &Value) -> String {
         record["response"]["status"],
         headers,
         record["body"],
-        record["error"]
+        record["error"],
+        record["request_gate"]
     ]);
     format!("{:x}", Sha256::digest(semantic.to_string().as_bytes()))
 }

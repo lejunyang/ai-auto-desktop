@@ -13,6 +13,7 @@
 pub mod bidi;
 pub mod cdp;
 mod connection;
+pub mod gate_session;
 pub mod launch;
 pub mod recording;
 pub mod request_gate;
