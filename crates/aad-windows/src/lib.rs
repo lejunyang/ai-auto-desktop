@@ -5,6 +5,7 @@
 //! this crate is empty.
 #![cfg(windows)]
 
+pub mod browser_picker;
 pub mod capture;
 pub mod clipboard;
 pub mod com;
