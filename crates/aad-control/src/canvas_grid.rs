@@ -55,7 +55,7 @@ impl Session {
             )
         })?;
         let timeout = context.remaining()?;
-        let image = crate::capture_cancellable(context, move || {
+        let (image, _) = crate::capture_cancellable(context, move || {
             browser.visible_canvas(&observation.raw, &node, timeout)
         })?;
         context.remaining()?;

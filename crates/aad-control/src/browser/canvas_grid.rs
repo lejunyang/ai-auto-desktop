@@ -29,7 +29,7 @@ impl BrowserBackend {
         snapshot: &Value,
         node: &Value,
         timeout: Duration,
-    ) -> Result<RgbaImage> {
+    ) -> Result<(RgbaImage, Value)> {
         if node["tag"] != "canvas" || node["states"]["protected"] == true {
             return Err(error(
                 "CONTROL.ACTION_UNSUPPORTED",
@@ -48,7 +48,7 @@ impl BrowserBackend {
             {
                 return Err(unproven());
             }
-            let shot = command(
+            let mut shot = command(
                 client,
                 "Page.captureScreenshot",
                 json!({"format":"png","captureBeyondViewport":false,
@@ -79,7 +79,11 @@ impl BrowserBackend {
             if proof["sha256"] != format!("{:x}", Sha256::digest(image.as_raw())) {
                 return Err(unproven());
             }
-            Ok(image)
+            shot["format"] = json!("png");
+            shot["width"] = json!(width);
+            shot["height"] = json!(height);
+            shot["clipped"] = json!(false);
+            Ok((image, shot))
         })
     }
 }

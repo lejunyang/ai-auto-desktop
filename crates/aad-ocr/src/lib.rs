@@ -67,6 +67,13 @@ pub struct OcrProvider {
     version: Mutex<Option<String>>,
 }
 
+#[derive(Clone, Copy)]
+pub enum TextLayout {
+    Auto,
+    SingleLine,
+    Sparse,
+}
+
 impl OcrProvider {
     pub fn new() -> Result<Self, AutomationError> {
         let engine = engine_command()?;
@@ -337,7 +344,7 @@ impl OcrProvider {
         languages: &[String],
         timeout: Duration,
     ) -> Result<Value, AutomationError> {
-        self.recognize_png_layout(png, languages, timeout, false)
+        self.recognize_png_layout(png, languages, timeout, TextLayout::Auto)
     }
 
     /// A pre-segmented cell containing one line of text or a number.
@@ -346,15 +353,15 @@ impl OcrProvider {
         png: &[u8],
         timeout: Duration,
     ) -> Result<Value, AutomationError> {
-        self.recognize_png_layout(png, &[], timeout, true)
+        self.recognize_png_layout(png, &[], timeout, TextLayout::SingleLine)
     }
 
-    fn recognize_png_layout(
+    pub fn recognize_png_layout(
         &self,
         png: &[u8],
         languages: &[String],
         timeout: Duration,
-        single_line: bool,
+        layout: TextLayout,
     ) -> Result<Value, AutomationError> {
         if timeout <= RESPONSE_BUDGET {
             return Err(ocr_error(
@@ -385,8 +392,10 @@ impl OcrProvider {
         let version = self.engine_version(deadline)?;
         let mut command = self.engine.clone();
         command.extend([temporary.path().display().to_string(), "stdout".into()]);
-        if single_line {
-            command.extend(["--psm".into(), "7".into()]);
+        match layout {
+            TextLayout::Auto => {}
+            TextLayout::SingleLine => command.extend(["--psm".into(), "7".into()]),
+            TextLayout::Sparse => command.extend(["--psm".into(), "11".into()]),
         }
         if !languages.is_empty() {
             command.extend(["-l".into(), languages.join("+")]);

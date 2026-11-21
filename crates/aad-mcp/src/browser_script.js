@@ -14,6 +14,7 @@
     const read = (locator, property = "value") => fields([{as: "value", locator, property}]).value;
     const page = Object.freeze({
         observe: (mode = "outline") => call("observe", {mode}),
+        readText: (locator, language) => call("read_text", {locator, language}),
         read, fields, act,
         downloadExport: spec => call("download_export", {spec}),
         present: locator => read(locator, "present"),

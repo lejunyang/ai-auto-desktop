@@ -211,105 +211,9 @@ impl NativeBackend {
         }
         args
     }
-    /// OCR off Windows: Tesseract over the capture's pixels, through the
-    /// resource-limited `aad-ocr` engine runner.
-    fn read_text_with_tesseract(
-        &self,
-        snapshot: &Value,
-        node: &Value,
-        language: Option<&str>,
-        timeout: Duration,
-    ) -> Result<Value> {
-        use base64::Engine as _;
-        let until = std::time::Instant::now() + timeout;
-        let left = || {
-            until
-                .checked_duration_since(std::time::Instant::now())
-                .filter(|left| !left.is_zero())
-                .ok_or_else(|| error("CONTROL.TIMEOUT", "request deadline elapsed"))
-        };
-        let engine = tesseract()?;
-        let languages = match language {
-            None => Vec::new(),
-            Some(tag) => {
-                let wanted = tesseract_language(tag);
-                let available = engine.languages(left()?).map_err(ocr_unavailable)?;
-                match wanted.filter(|code| available.iter().any(|have| have == code)) {
-                    Some(code) => vec![code.to_string()],
-                    None => {
-                        return Err(error(
-                            "DRIVER.OCR_UNAVAILABLE",
-                            format!("no installed Tesseract language data reads {tag}"),
-                        )
-                        .with_detail("available_languages", json!(available)))
-                    }
-                }
-            }
-        };
-        let shot = self.capture(snapshot, node, left()?)?;
-        let png = shot["data"]
-            .as_str()
-            .and_then(|data| base64::engine::general_purpose::STANDARD.decode(data).ok())
-            .ok_or_else(|| error("CONTROL.BAD_PROVIDER_OUTPUT", "capture returned no PNG"))?;
-        let mut read = engine
-            .recognize_png(&png, &languages, left()?)
-            .map_err(ocr_unavailable)?;
-        for key in ["format", "data", "width", "height", "clipped"] {
-            read[key] = shot[key].clone();
-        }
-        Ok(read)
-    }
 }
 
-fn tesseract() -> Result<aad_ocr::OcrProvider> {
-    let engine = aad_ocr::OcrProvider::new().map_err(ocr_unavailable)?;
-    engine.engine_ready().map_err(ocr_unavailable)?;
-    Ok(engine)
-}
-
-/// An engine that is missing or cannot be sandboxed is "no OCR here", the
-/// same answer Windows gives for a missing language pack.
-fn ocr_unavailable(cause: aad_core::AutomationError) -> aad_core::AutomationError {
-    match cause.code.as_str() {
-        "OCR.ENGINE_UNAVAILABLE" | "OCR.ENGINE_ISOLATION_UNAVAILABLE" => error(
-            "DRIVER.OCR_UNAVAILABLE",
-            "Tesseract OCR is not available on this host",
-        )
-        .with_detail("reason", json!(cause.message))
-        .with_detail("engine", json!("tesseract")),
-        "OCR.TIMEOUT" => error("CONTROL.TIMEOUT", cause.message.clone()).with_cause(cause),
-        _ => error("DRIVER.OCR_FAILED", "Tesseract could not read the image").with_cause(cause),
-    }
-}
-
-/// A BCP-47 tag to the Tesseract traineddata that reads it.
-pub fn tesseract_language(tag: &str) -> Option<&'static str> {
-    let lower = tag.to_ascii_lowercase();
-    let primary = lower.split('-').next().unwrap_or_default();
-    Some(match primary {
-        "en" => "eng",
-        "de" => "deu",
-        "fr" => "fra",
-        "es" => "spa",
-        "it" => "ita",
-        "pt" => "por",
-        "nl" => "nld",
-        "ru" => "rus",
-        "uk" => "ukr",
-        "pl" => "pol",
-        "tr" => "tur",
-        "ja" => "jpn",
-        "ko" => "kor",
-        "ar" => "ara",
-        "he" => "heb",
-        "hi" => "hin",
-        "zh" if lower.contains("hant") || lower.ends_with("-tw") || lower.ends_with("-hk") => {
-            "chi_tra"
-        }
-        "zh" => "chi_sim",
-        _ => return None,
-    })
-}
+pub use crate::pixel_text::tesseract_language;
 
 impl Backend for NativeBackend {
     fn read_grid(
@@ -348,7 +252,7 @@ impl Backend for NativeBackend {
         // capture, so text is offered only where both exist on this host.
         let read_text = match self.flavor {
             Flavor::Windows => self.offers("read_text"),
-            _ => self.offers("capture") && tesseract().is_ok(),
+            _ => self.offers("capture") && crate::pixel_text::tesseract().is_ok(),
         };
         if read_text {
             reads.push("read_text".to_string());
@@ -408,7 +312,12 @@ impl Backend for NativeBackend {
                     "this provider cannot read text from pixels",
                 ));
             }
-            return self.read_text_with_tesseract(snapshot, node, language, timeout);
+            return crate::pixel_text::read_capture(
+                language,
+                timeout,
+                aad_ocr::TextLayout::Auto,
+                |left| self.capture(snapshot, node, left),
+            );
         }
         if !self.offers("read_text") {
             return Err(error(

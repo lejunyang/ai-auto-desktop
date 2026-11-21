@@ -2094,6 +2094,18 @@ impl Backend for BrowserBackend {
     fn capture(&self, snapshot: &Value, node: &Value, timeout: Duration) -> Result<Value> {
         self.capture_node(snapshot, node, timeout)
     }
+    fn read_text(
+        &self,
+        snapshot: &Value,
+        node: &Value,
+        language: Option<&str>,
+        timeout: Duration,
+    ) -> Result<Value> {
+        crate::pixel_text::read_capture(language, timeout, aad_ocr::TextLayout::Sparse, |left| {
+            self.visible_canvas(snapshot, node, left)
+                .map(|(_, shot)| shot)
+        })
+    }
     fn view(
         &self,
         snapshot: &Value,
@@ -2158,7 +2170,11 @@ impl Backend for BrowserBackend {
         self.read_network(selector, limit, bodies, timeout)
     }
     fn reads(&self) -> Vec<String> {
-        vec!["capture".into()]
+        let mut reads = vec!["capture".into()];
+        if crate::pixel_text::tesseract().is_ok() {
+            reads.push("read_text".into());
+        }
+        reads
     }
     fn lease_keys(&self, snapshot: &Value) -> Result<Vec<String>> {
         browser_input_keys(snapshot)

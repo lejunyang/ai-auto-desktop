@@ -500,8 +500,8 @@ with `words`, every one with a `box` of fx/fy/fw/fh: fractions of the element's 
 screen positions. The lines are not targets: to act on a word, click the element it was \
 read from with `fraction` at the word's centre (fx + fw/2, fy + fh/2), which is anchored \
 and revalidated on that element -- read again first if the content may have moved. \
-`digest` equals control_capture's for the same pixels. Desktop providers listing \
-`read_text` under `reads`: Windows OCR on Windows, Tesseract elsewhere when it is installed; \
+`digest` identifies the screenshot. Chromium reads sparse labels in one fully visible canvas. \
+Desktop providers use Windows OCR on Windows and Tesseract elsewhere when installed; \
 OCR can misread characters such as I and l.",
             json!({
                 "target": target_schema(),

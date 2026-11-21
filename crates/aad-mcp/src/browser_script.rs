@@ -64,6 +64,10 @@ enum PageCall {
     Fields {
         fields: Vec<aad_control::fields::ReadField>,
     },
+    ReadText {
+        locator: Locator,
+        language: Option<String>,
+    },
     Act {
         locator: Locator,
         action: Action,
@@ -293,6 +297,13 @@ impl Page {
             .map_err(|err| failure("BROWSER.SCRIPT_ERROR", err))
     }
 
+    fn read_text(&self, locator: Locator, language: Option<String>) -> Result<Value> {
+        self.request(Operation::ReadText {
+            target: self.target(locator)?,
+            language,
+        })
+    }
+
     fn call(&mut self, raw: &str) -> Result<Value> {
         if raw.len() > SOURCE_LIMIT || self.calls >= MAX_CALLS {
             return Err(failure(
@@ -307,6 +318,7 @@ impl Page {
             PageCall::OpenPopup { locator, url } => self.open_popup(locator, url),
             PageCall::ReturnToOpener {} => self.return_to_opener(),
             PageCall::Observe { mode } => self.observe(mode),
+            PageCall::ReadText { locator, language } => self.read_text(locator, language),
             PageCall::DownloadExport { spec } => self.download_export(*spec),
             PageCall::Fields { fields } => self.request(Operation::ReadFields {
                 resource_id: self.resource_id.clone(),
@@ -426,6 +438,10 @@ pub enum PageRead {
     View(ViewMode),
     Fields(Vec<aad_control::fields::ReadField>),
     CanvasGrid(Box<aad_control::canvas_grid::Spec>),
+    CanvasText {
+        locator: Box<Locator>,
+        language: Option<String>,
+    },
 }
 
 /// One read through the same resource selection and observation as a browser script.
@@ -445,6 +461,7 @@ pub fn read_page(
         Instant::now() + Duration::from_secs(30),
     )?;
     match read {
+        PageRead::CanvasText { locator, language } => page.read_text(*locator, language),
         PageRead::CanvasGrid(spec) => page.request(Operation::ReadCanvasGrid {
             resource_id: page.resource_id.clone(),
             spec,

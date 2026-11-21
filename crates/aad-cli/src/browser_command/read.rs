@@ -21,6 +21,12 @@ pub struct Args {
     /// Read an equal-cell canvas grid. JSON contains locator, rows, and ordered columns.
     #[arg(long, value_name = "SPEC", conflicts_with_all=["view","fields","webkit_port","browser_bidi_port"])]
     canvas_grid: Option<String>,
+    /// Read painted words and their locations in a visible Chromium canvas. Takes a JSON locator.
+    #[arg(long, value_name = "LOCATOR", conflicts_with_all=["view","fields","canvas_grid","webkit_port","browser_bidi_port"])]
+    canvas_text: Option<String>,
+    /// OCR language such as en-US or zh-Hans. Requires its installed language pack.
+    #[arg(long, requires = "canvas_text")]
+    language: Option<String>,
 }
 
 pub fn run(args: &Args) -> Result<Value, Value> {
@@ -42,15 +48,23 @@ pub fn run(args: &Args) -> Result<Value, Value> {
         .map_err(|err| json!({"code":"BROWSER.WEBKIT_READ_FAILED","message":err.to_string()}));
     }
     let (provider, session) = args.page.session(Policy::default());
-    let read = match (&args.canvas_grid, &args.fields) {
-        (Some(spec), _) => {
+    let read = match (&args.canvas_text, &args.canvas_grid, &args.fields) {
+        (Some(locator), _, _) => {
+            if locator.len() > 16_384 {
+                return Err(json!({"code":"BROWSER.READ_INVALID","message":"canvas locator exceeds 16 KiB"}));
+            }
+            PageRead::CanvasText { locator: serde_json::from_str(locator)
+                .map_err(|err| json!({"code":"BROWSER.READ_INVALID","message":format!("invalid --canvas-text: {err}")}))?,
+                language:args.language.clone() }
+        }
+        (_, Some(spec), _) => {
             if spec.len() > 16_384 {
                 return Err(json!({"code":"BROWSER.READ_INVALID","message":"canvas grid spec exceeds 16 KiB"}));
             }
             PageRead::CanvasGrid(serde_json::from_str(spec)
                 .map_err(|err| json!({"code":"BROWSER.READ_INVALID","message":format!("invalid --canvas-grid: {err}")}))?)
         }
-        (_, Some(raw)) => PageRead::Fields(serde_json::from_str(raw)
+        (_, _, Some(raw)) => PageRead::Fields(serde_json::from_str(raw)
             .map_err(|err| json!({"code":"BROWSER.READ_INVALID","message":format!("invalid --fields: {err}")}))?),
         _ => PageRead::View(match args.view.as_deref() {
             Some("outline") => ViewMode::Outline,

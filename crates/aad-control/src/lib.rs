@@ -10,6 +10,7 @@ pub mod launch;
 pub mod lease;
 pub mod model;
 pub mod native;
+mod pixel_text;
 pub mod qr;
 pub mod recording;
 pub mod secrets;
@@ -2482,7 +2483,7 @@ fn text_answer(read: &Value, provider: &str) -> Value {
     let round = |value: f64| (value.clamp(0.0, 1.0) * 10_000.0).round() / 10_000.0;
     let shape = |span: &Value| {
         let number = |key: &str| span["bounds"][key].as_f64().unwrap_or_default();
-        json!({
+        let mut result = json!({
             "text": span["text"],
             "box": {
                 "fx": round(number("x") / width),
@@ -2490,7 +2491,11 @@ fn text_answer(read: &Value, provider: &str) -> Value {
                 "fw": round(number("width") / width),
                 "fh": round(number("height") / height),
             },
-        })
+        });
+        if let Some(score) = span["confidence"].as_f64() {
+            result["confidence"] = json!(score);
+        }
+        result
     };
     let lines: Vec<Value> = read["lines"]
         .as_array()
