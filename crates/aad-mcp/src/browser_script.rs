@@ -408,25 +408,50 @@ pub fn run_download_export(
     )
 }
 
-fn run_with_limit(
+pub enum PageRead {
+    View(ViewMode),
+    Fields(Vec<aad_control::fields::ReadField>),
+}
+
+/// One read through the same resource selection and observation as a browser script.
+pub fn read_page(
     session: Arc<Session>,
-    script: Script,
-    stop: CancellationToken,
-    max_timeout_ms: u64,
+    provider: &str,
+    resource_id: Option<&str>,
+    url: Option<&str>,
+    read: PageRead,
 ) -> Result<Value> {
-    let timeout = script.timeout_ms.unwrap_or(30_000);
-    let provider = script.provider.as_deref().unwrap_or(CDP);
-    if script.source.is_empty()
-        || script.source.len() > SOURCE_LIMIT
-        || script.inputs.to_string().len() > SOURCE_LIMIT
-        || !(1..=max_timeout_ms).contains(&timeout)
-        || !matches!(provider, CDP | BIDI)
-        || script.url.is_some() == script.resource_id.is_some()
-    {
-        return Err(failure("BROWSER.SCRIPT_INVALID", format!("provide one page (resource_id or exact url), a script up to 65536 bytes, and timeout_ms in 1..{max_timeout_ms}")));
+    let page = bind_page(
+        session,
+        provider,
+        resource_id,
+        url,
+        &CancellationToken::new(),
+        Instant::now() + Duration::from_secs(30),
+    )?;
+    match read {
+        PageRead::View(mode) => page.observe(mode),
+        PageRead::Fields(fields) => page.request(Operation::ReadFields {
+            resource_id: page.resource_id.clone(),
+            fields,
+        }),
     }
-    let start = Instant::now();
-    let deadline = start + Duration::from_millis(timeout);
+}
+
+fn bind_page(
+    session: Arc<Session>,
+    provider: &str,
+    resource_id: Option<&str>,
+    url: Option<&str>,
+    stop: &CancellationToken,
+    deadline: Instant,
+) -> Result<Page> {
+    if resource_id.is_some() == url.is_some() || !matches!(provider, CDP | BIDI) {
+        return Err(failure(
+            "BROWSER.PAGE_INVALID",
+            "select one granted resource by id or exact URL",
+        ));
+    }
     let mut page = Page {
         session,
         resource_id: String::new(),
@@ -447,9 +472,9 @@ fn run_with_limit(
         .flatten()
         .filter(|r| {
             r["provider"] == provider
-                && match &script.resource_id {
+                && match resource_id {
                     Some(id) => r["resource_id"].as_str() == Some(id),
-                    None => r["metadata"]["url"].as_str() == script.url.as_deref(),
+                    None => r["metadata"]["url"].as_str() == url,
                 }
         });
     let Some(id) = matches.next().and_then(|r| r["resource_id"].as_str()) else {
@@ -465,6 +490,34 @@ fn run_with_limit(
         ));
     }
     page.resource_id = id.to_owned();
+    Ok(page)
+}
+
+fn run_with_limit(
+    session: Arc<Session>,
+    script: Script,
+    stop: CancellationToken,
+    max_timeout_ms: u64,
+) -> Result<Value> {
+    let timeout = script.timeout_ms.unwrap_or(30_000);
+    let provider = script.provider.as_deref().unwrap_or(CDP);
+    if script.source.is_empty()
+        || script.source.len() > SOURCE_LIMIT
+        || script.inputs.to_string().len() > SOURCE_LIMIT
+        || !(1..=max_timeout_ms).contains(&timeout)
+    {
+        return Err(failure("BROWSER.SCRIPT_INVALID", format!("provide one page (resource_id or exact url), a script up to 65536 bytes, and timeout_ms in 1..{max_timeout_ms}")));
+    }
+    let start = Instant::now();
+    let deadline = start + Duration::from_millis(timeout);
+    let page = bind_page(
+        session,
+        provider,
+        script.resource_id.as_deref(),
+        script.url.as_deref(),
+        &stop,
+        deadline,
+    )?;
     let page = Rc::new(RefCell::new(page));
     let vm_failure = |err| failure("BROWSER.SCRIPT_ERROR", err);
     let vm = Runtime::new().map_err(vm_failure)?;

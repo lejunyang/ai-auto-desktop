@@ -2,9 +2,12 @@ use crate::{browser_record, browser_script, failure, table_data, EXIT_FAILED, EX
 use clap::Subcommand;
 use serde_json::Value;
 mod download;
+mod read;
 
 #[derive(Subcommand)]
 pub enum Command {
+    /// Read a page's text, outline, or several named fields in one observation.
+    Read(read::Args),
     /// Download and verify the ready file from one identified task in a session-owned browser.
     DownloadExport(download::Args),
     /// List open Chromium pages and their page IDs.
@@ -23,6 +26,10 @@ pub enum Command {
 
 pub fn run(command: &Command) -> (Value, u8) {
     match command {
+        Command::Read(args) => match read::run(args) {
+            Ok(value) => (value, EXIT_OK),
+            Err(error) => (error, EXIT_FAILED),
+        },
         Command::DownloadExport(args) => match download::run(args) {
             Ok(report) => (report, EXIT_OK),
             Err(error) => (error, EXIT_FAILED),

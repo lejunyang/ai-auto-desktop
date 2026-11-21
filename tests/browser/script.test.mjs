@@ -29,6 +29,17 @@ test('browser JavaScript uses one page for branching, input, readback and cancel
     t.after(() => page.close());
     const cli = process.env.AAD_TEST_CLI || resolve('target/debug/aad');
     const env = {...process.env, AAD_CONTROL_LEASE_DIR: join(page.root,'leases')};
+    const readArgs = ['browser', 'read', '--url', page.url, '--browser-port', String(page.port)];
+    const fields = [
+      {as: 'draft', locator: {name: 'Draft'}, property: 'value'},
+      {as: 'ready', locator: {role: 'button', name: 'Save'}, property: 'enabled'},
+      {as: 'missing', locator: {name: 'Does not exist'}, property: 'present'},
+    ];
+    const read = await promisify(execFile)(cli, [...readArgs, '--fields', JSON.stringify(fields)], {env});
+    assert.deepEqual(JSON.parse(read.stdout).values, {draft: '', ready: true, missing: false});
+    const outline = await promisify(execFile)(cli, [...readArgs, '--view', 'outline'], {env});
+    assert.ok(JSON.parse(outline.stdout).nodes.some(n => n.name === 'Save'));
+    assert.deepEqual(await page.cdp.eval('window.orders'), []);
     const file = join(page.root, 'orders.js');
     await writeFile(file, script);
     const args = ['browser-script', file, '--url', page.url, '--browser-port', String(page.port),
