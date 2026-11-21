@@ -114,6 +114,75 @@ test('launch records initial traffic, reuses profiles and cleans only owned brow
   }
 });
 
+test('fresh recording services marks during navigation and finishes an observed response after stop',
+  {skip:!process.env.AAD_TEST_CHROME, timeout:30000}, async()=>{
+    const root=await mkdtemp(join(tmpdir(),'aad-startup-drain-'));
+    let document, body;
+    const server=createServer((req,res)=>{
+      if(req.url==='/start') {res.writeHead(302,{Location:'/page'});res.end();}
+      else if(req.url==='/page') document=res;
+      else if(req.url==='/data') {body=res;res.writeHead(200,{'Content-Type':'application/json'});res.write(' ');}
+      else res.end();
+    });
+    await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
+    const out=join(root,'recording'), url=`http://127.0.0.1:${server.address().port}`;
+    const recording=command(['browser-record','start','--browser',family,'--browser-executable',
+      process.env.AAD_TEST_CHROME,'--headless','--no-screenshots','--url',url+'/start','--out',out]);
+    try {
+      await until(()=>document);
+      assert.equal((await command(['browser-record','mark','--out',out,'--note','waiting']).done).code,0);
+      await until(async()=>(await readFile(join(out,'evidence/actions.jsonl'),'utf8')).includes('waiting'));
+      document.writeHead(200,{'Content-Type':'text/html'});
+      document.end('<title>Redirect target</title><script>fetch("/data").then(r=>r.text())</script>');
+      await until(()=>body);
+      assert.equal((await command(['browser-record','stop','--out',out]).done).code,0);
+      await delay(300);
+      body.end('{"after_stop":42}');
+      const result=await recording.done;
+      assert.equal(result.code,0,result.stderr+result.stdout);
+      assert.equal((await json(join(out,'manifest.json'))).status,'complete');
+      const records=(await readFile(join(out,'evidence/network.jsonl'),'utf8')).trim().split('\n').map(JSON.parse);
+      assert.ok(records.some(r=>r.request.url===url+'/start' && r.response.status===302));
+      assert.deepEqual(JSON.parse(records.find(r=>r.request.url===url+'/data').body),{after_stop:42});
+    } finally {
+      document?.end();body?.end();recording.child.kill('SIGINT');await recording.done;
+      await new Promise(resolve=>server.close(resolve));
+      await rm(root,{recursive:true,force:true,maxRetries:10,retryDelay:100});
+    }
+  });
+
+test('an unconfirmed or failed startup navigation finalizes an incomplete recording',
+  {skip:!process.env.AAD_TEST_CHROME, timeout:45000}, async()=>{
+    const root=await mkdtemp(join(tmpdir(),'aad-startup-stop-'));
+    const requests=new Set();
+    const server=createServer((req,res)=>{
+      requests.add(req.url);
+      if(req.url==='/error') res.destroy();
+      // The other documents never send headers, so cannot commit.
+    });
+    await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
+    try {
+      for(const name of ['stop','timer','error']) {
+        const out=join(root,name), url=`http://127.0.0.1:${server.address().port}/${name}`;
+        const recording=command(['browser-record','start','--browser',family,'--browser-executable',
+          process.env.AAD_TEST_CHROME,'--headless','--no-screenshots','--url',url,'--out',out,
+          '--seconds',name==='timer'?'1':'12']);
+        try {
+          await until(()=>requests.has('/'+name));
+          if(name==='stop') assert.equal((await command(['browser-record','stop','--out',out]).done).code,0);
+          const result=await recording.done;
+          assert.notEqual(result.code,0,result.stdout);
+          const manifest=await json(join(out,'manifest.json'));
+          assert.equal(manifest.status,'incomplete');
+          assert.match(manifest.error,name==='error'?/could not open URL: net::ERR_/:/stopped before startup navigation was confirmed/);
+        } finally {recording.child.kill('SIGINT');await recording.done;}
+      }
+    } finally {
+      await new Promise(resolve=>server.close(resolve));
+      await rm(root,{recursive:true,force:true,maxRetries:10,retryDelay:100});
+    }
+  });
+
 test('occupied non-CDP profiles require opt-in termination and unrelated browsers survive', {skip:!process.env.AAD_TEST_CHROME,timeout:90000},async()=>{
   const root=await mkdtemp(join(tmpdir(),'aad-busy-profile-test-'));
   const profile=join(root,'source with spaces');
