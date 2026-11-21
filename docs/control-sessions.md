@@ -9,10 +9,10 @@
 | provider | 类型化动作 | 实际语义 / 限制 |
 | --- | --- | --- |
 | `desktop.windows_uia` | focus, invoke, click, fill, type_text, key, scroll, hover, drag, paste, minimize, maximize, restore, close_window, activate | UIA + 原生输入；click 带 button/count/fraction 时走原生手势；节点必须暴露对应能力。指针动作先对落点做 UIA 命中检查，键盘动作先证明窗口在前台、焦点在元素内（见下文）。另有只读的 capture / read_text，以及需单独授权的 launch、clipboard_read、global_key |
-| `desktop.linux_atspi` | focus, invoke, click, fill, type_text, key, scroll, hover, drag, paste, minimize, maximize, restore, close_window, activate | AT-SPI；指针/键盘经 X11 XTest helper，本机 KDE/X11 已验收，GNOME/XFCE X11 待真机验收，Wayland 输入尚未实现；派发前核对焦点、PID 与落点，drag 起止两点都核对；窗口动作只在顶层窗口节点上、需要 EWMH 窗口管理器。另有只读 capture / read_text（Tesseract），以及需单独授权的 launch、clipboard_read、global_key（见下文“其他平台”） |
+| `desktop.linux_atspi` | focus, invoke, click, fill, type_text, key, scroll, hover, drag, paste, minimize, maximize, restore, close_window, activate | AT-SPI；指针/键盘经 X11 XTest helper，本机 KDE/X11 已验收，GNOME/XFCE X11 待真机验收，原生 Wayland 的 GTK 表单已验证 AT-SPI 填写和触发按钮，物理键鼠仍需 portal 支持；派发前核对焦点、PID 与落点，drag 起止两点都核对；窗口动作只在顶层窗口节点上、需要 EWMH 窗口管理器。另有只读 capture / read_text（Tesseract），以及需单独授权的 launch、clipboard_read、global_key（见下文“其他平台”） |
 | `desktop.macos_ax` | focus, invoke, click, fill, type_text, key, scroll, hover, drag, paste, minimize, maximize, restore, close_window, activate | AX helper；需要同一登录用户的辅助功能权限；指针动作要求目标应用在前台并经 AX 命中检查，事件只投递给目标进程；key 名称按字面（`ctrl` 是 Control，`cmd` 是 Command）；窗口动作只在 AXWindow 节点上，maximize 即全屏。另有 capture（需屏幕录制权限）、read_text、launch、clipboard_read、global_key。[待验证] 全部新增项需 macOS 真机 |
 | `browser.cdp` | focus, click, fill, type_text, key, scroll, hover, drag, select, check, navigate, back, forward, reload, open_tab, activate_page, close_page, accept, dismiss, upload, choose_files, emulate, clear_site_data | 普通 click 为 `HTMLElement.click()` 的 DOM 激活；带 button/count/fraction 的 click、scroll、hover、drag 为可信 CDP Input（任何 frame，含跨进程 OOPIF），落点先在页面里命中检查；fill/select 为 DOM 值及 input/change 事件；check 已是目标状态时不点击；type_text/key 为发给焦点元素的可信 CDP 键盘输入；navigate/back/forward/reload、标签页动作 open_tab/activate_page/close_page 以及 emulate/clear_site_data 在 body 节点上，只限主 frame；accept/dismiss 只在 JavaScript 对话框节点上；upload 用于文件框，choose_files 可操作上传按钮，两者的文件路径受 `--allow-upload-dir` 限制 |
-| `browser.firefox_bidi` | focus, invoke, fill, click, hover, scroll, key, type_text, select, check, navigate, back, forward, reload, open_tab, activate_page, close_page | Firefox WebDriver BiDi；主文档写操作，子 frame 只读；click/hover/scroll/key/keys 文本使用可信输入，invoke/fill/check/select 使用 DOM 语义。key/单击支持有界长按。支持安全局部 capture 和锚定 body 的导航/标签页操作；历史只支持可证明目标的连续同源 HTTP(S) 片段。双击、指针修饰键尚未实现，参数范围见下文 Firefox 专节 |
+| `browser.firefox_bidi` | focus, invoke, fill, click, hover, scroll, key, type_text, select, check, navigate, back, forward, reload, open_tab, activate_page, close_page | Firefox WebDriver BiDi；主文档支持下列动作，子 frame 支持 focus、invoke、fill、check、select；click/hover/scroll/key/keys 文本使用可信输入，invoke/fill/check/select 使用 DOM 语义。key/单击支持有界长按。支持安全局部 capture 和锚定 body 的导航/标签页操作；历史只支持可证明目标的连续同源 HTTP(S) 片段。双击、指针修饰键尚未实现，参数范围见下文 Firefox 专节 |
 
 以 `capabilities` 和观察节点的 `capabilities` 为准。可列出 provider 不表示当前 OS 已授予
 桌面权限。启动失败或不可用原因在 `unavailable` 中返回。
@@ -205,7 +205,7 @@ aad mcp --allow-input --provider browser.firefox_bidi --browser-bidi-port 9223
 观察、find、wait、HTML id scope 和从已观察元素派生的 `scope_target` 可用。
 观察基于有界 DOM 语义与独立 sandbox realm，不能视为 Firefox 原生无障碍树；
 身份 token、节点指纹、当前 realm、文档及祖先 URL 授权在操作前重新检查。
-子 frame 可单独观察，但动作能力为空，首版不向子 frame 写入。
+通过 control_targets 选择子 frame 的 resource_id，可以在该文档内聚焦、填写、触发按钮、勾选和选择下拉项。子 frame 重新加载后需要重新观察。物理指针、按键、截图和标签页操作目前限于主文档。
 
 主文档支持 DOM `focus`、`fill`、`invoke`、`check`、`select`。fill 是替换值并派发 input/change，
 invoke 是 DOM 激活；这些不承诺可信用户事件。`click` 始终使用可信指针，支持左/中/右键及元素内比例，
