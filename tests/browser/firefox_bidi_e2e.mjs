@@ -1,7 +1,8 @@
 // Linux acceptance: node >=22, AAD_TEST_FIREFOX and AAD_TEST_AAD absolute paths.
 // All input uses the public control CLI. A private HTTP fixture reports actual
 // DOM/event state independently of the provider's helper and snapshots.
-import {spawn} from 'node:child_process';
+import {execFile,spawn} from 'node:child_process';
+import {promisify} from 'node:util';
 import {mkdtemp,rm,mkdir,writeFile} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join,resolve} from 'node:path';
@@ -105,6 +106,9 @@ try{
   firefox.stderr.on('data',b=>stderr+=b);
   await wait(()=>/WebDriver BiDi listening on ws:\/\/127\.0\.0\.1:\d+/.test(stderr),'Firefox start',30000);
   const port=stderr.match(/WebDriver BiDi listening on ws:\/\/127\.0\.0\.1:(\d+)/)[1];
+  await wait(()=>typeof browserState.clicks==='number','first Firefox page');
+  const reading=await promisify(execFile)(aadPath,['browser','read','--browser-bidi-port',port,'--url',url]);
+  assert.ok(JSON.parse(reading.stdout).nodes.some(n=>n.name==='Save'));
   control=spawn(aadPath,['control','serve','--allow-input','--provider','browser.firefox_bidi','--browser-bidi-port',port],{stdio:['pipe','pipe','pipe']});
   control.stderr.on('data',b=>aadStderr+=b);
   createInterface({input:control.stdout}).on('line',line=>{const r=JSON.parse(line);session=r.session_id;const logged=structuredClone(r);if(logged.data?.data)logged.data.data='<image omitted>';transcript.push({response:logged});const p=pending.get(r.request_id);if(p){pending.delete(r.request_id);p.ok(r)}});

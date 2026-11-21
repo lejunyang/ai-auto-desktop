@@ -8,7 +8,7 @@ use std::sync::Arc;
 pub struct Args {
     #[command(flatten)]
     page: PageArgs,
-    /// Page view (defaults to text).
+    /// Page view. Chromium defaults to text, Firefox to outline.
     #[arg(long, value_parser=["text","outline","nodes","overview"], conflicts_with="fields")]
     view: Option<String>,
     /// One JSON array of {as, locator, property} fields, all read from the same observation.
@@ -17,6 +17,7 @@ pub struct Args {
 }
 
 pub fn run(args: &Args) -> Result<Value, Value> {
+    let (provider, session) = args.page.session(Policy::default());
     let read = match &args.fields {
         Some(raw) => PageRead::Fields(serde_json::from_str(raw)
             .map_err(|err| json!({"code":"BROWSER.READ_INVALID","message":format!("invalid --fields: {err}")}))?),
@@ -24,10 +25,10 @@ pub fn run(args: &Args) -> Result<Value, Value> {
             Some("outline") => ViewMode::Outline,
             Some("nodes") => ViewMode::Nodes,
             Some("overview") => ViewMode::Overview,
+            None if provider == aad_control::browser_bidi::PROVIDER => ViewMode::Outline,
             _ => ViewMode::Text,
         }),
     };
-    let (provider, session) = args.page.session(Policy::default());
     read_page(
         Arc::new(session),
         provider,
