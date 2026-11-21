@@ -27,6 +27,7 @@ mod drag_path;
 pub(super) mod file_dialog;
 mod focus_discovery;
 pub(super) mod gtk4_picker;
+pub(super) mod kde_picker;
 mod table;
 use focus_discovery::FocusDiscovery;
 mod window_focus;

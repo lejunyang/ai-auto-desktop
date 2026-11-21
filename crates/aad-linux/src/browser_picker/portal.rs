@@ -4,6 +4,7 @@ use zbus::blocking::{connection, Connection, Proxy};
 
 const DESKTOP: &str = "org.freedesktop.portal.Desktop";
 const GTK: &str = "org.freedesktop.impl.portal.desktop.gtk";
+const KDE: &str = "org.freedesktop.impl.portal.desktop.kde";
 const ROOT: &str = "/org/freedesktop/portal/desktop/request";
 
 #[derive(PartialEq)]
@@ -13,21 +14,30 @@ struct Request {
     path: String,
 }
 
-pub(super) struct GtkPortal {
+pub(super) struct FilePortal {
     bus: Connection,
     browser_pid: u32,
     pub(super) picker_pid: u32,
     request: Request,
+    service: &'static str,
 }
 
-impl GtkPortal {
+impl FilePortal {
     pub(super) fn for_browser(browser_pid: u32, deadline: Instant) -> Result<Self> {
-        Self::bind(browser_pid, None, deadline)
+        Self::bind(browser_pid, None, GTK, deadline)
+    }
+    pub(super) fn kde(browser_pid: u32, deadline: Instant) -> Result<Self> {
+        Self::bind(browser_pid, None, KDE, deadline)
     }
     pub(super) fn observe(browser_pid: u32, picker_pid: u32, deadline: Instant) -> Result<Self> {
-        Self::bind(browser_pid, Some(picker_pid), deadline)
+        Self::bind(browser_pid, Some(picker_pid), GTK, deadline)
     }
-    fn bind(browser_pid: u32, expected_pid: Option<u32>, deadline: Instant) -> Result<Self> {
+    fn bind(
+        browser_pid: u32,
+        expected_pid: Option<u32>,
+        service: &'static str,
+        deadline: Instant,
+    ) -> Result<Self> {
         let bus = connection::Builder::session()?
             .method_timeout(Duration::from_secs(2))
             .build()?;
@@ -37,21 +47,29 @@ impl GtkPortal {
             "/org/freedesktop/DBus",
             "org.freedesktop.DBus",
         )?;
-        let picker_pid: u32 = dbus.call("GetConnectionUnixProcessID", &(GTK,))?;
+        let picker_pid: u32 = dbus.call("GetConnectionUnixProcessID", &(service,))?;
         if expected_pid.is_some_and(|pid| pid != picker_pid) {
             return Err("unexpected GTK portal window owner".into());
         }
-        let request = identify(&bus, browser_pid, picker_pid, deadline)?;
+        let request = identify(&bus, browser_pid, picker_pid, service, deadline)?;
         Ok(Self {
             bus,
             browser_pid,
             picker_pid,
             request,
+            service,
         })
     }
 
     pub(super) fn revalidate(&self, deadline: Instant) -> Result<()> {
-        if identify(&self.bus, self.browser_pid, self.picker_pid, deadline)? != self.request {
+        if identify(
+            &self.bus,
+            self.browser_pid,
+            self.picker_pid,
+            self.service,
+            deadline,
+        )? != self.request
+        {
             return Err("the active desktop portal request changed".into());
         }
         Ok(())
@@ -64,6 +82,27 @@ impl GtkPortal {
             (&self.request.frontend, "org.freedesktop.portal.Request"),
             (&self.request.backend, "org.freedesktop.impl.portal.Request"),
         ] {
+            if owner == &self.request.backend && self.service == KDE {
+                // Qt's virtual Request object does not answer Introspect. Its
+                // parent publishes the exact request until the response.
+                let (parent, token) = self
+                    .request
+                    .path
+                    .rsplit_once('/')
+                    .ok_or("invalid request")?;
+                return match inspect(&self.bus, owner, parent, deadline) {
+                    Ok(node) => Ok(!node.nodes().iter().any(|n| n.name() == Some(token))),
+                    // Qt also removes a sender's parent after its last request.
+                    Err(e)
+                        if matches!(e.downcast_ref::<zbus::Error>(),
+                        Some(zbus::Error::MethodError(name, ..))
+                            if name.as_str() == "org.freedesktop.DBus.Error.UnknownObject") =>
+                    {
+                        Ok(true)
+                    }
+                    Err(e) => Err(e),
+                };
+            }
             if inspect(&self.bus, owner, &self.request.path, deadline)?
                 .interfaces()
                 .iter()
@@ -113,6 +152,7 @@ fn identify(
     bus: &Connection,
     browser_pid: u32,
     picker_pid: u32,
+    service: &str,
     deadline: Instant,
 ) -> Result<Request> {
     let dbus = Proxy::new(
@@ -122,10 +162,10 @@ fn identify(
         "org.freedesktop.DBus",
     )?;
     let frontend: String = dbus.call("GetNameOwner", &(DESKTOP,))?;
-    let backend: String = dbus.call("GetNameOwner", &(GTK,))?;
+    let backend: String = dbus.call("GetNameOwner", &(service,))?;
     let owner_pid: u32 = dbus.call("GetConnectionUnixProcessID", &(&backend,))?;
     if owner_pid != picker_pid {
-        return Err("the dialog is not owned by the GTK file portal".into());
+        return Err("the file portal process changed".into());
     }
     let sender = only_child(bus, &backend, ROOT, deadline)?;
     let serial = sender
@@ -148,6 +188,10 @@ fn identify(
         (&frontend, "org.freedesktop.portal.Request"),
         (&backend, "org.freedesktop.impl.portal.Request"),
     ] {
+        if dest == &backend && service == KDE {
+            // only_child above resolved this exact handle from the KDE owner.
+            continue;
+        }
         if !inspect(bus, dest, &path, deadline)?
             .interfaces()
             .iter()

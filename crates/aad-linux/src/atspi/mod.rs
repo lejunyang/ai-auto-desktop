@@ -3448,6 +3448,8 @@ mod linux;
 pub(crate) use linux::file_dialog::GtkFileDialog;
 #[cfg(target_os = "linux")]
 pub(crate) use linux::gtk4_picker::Gtk4Picker;
+#[cfg(target_os = "linux")]
+pub(crate) use linux::kde_picker::KdeDialog;
 
 #[cfg(test)]
 mod tests {

@@ -1,6 +1,6 @@
-//! Observe and revalidate a local GTK file dialog and its browser owner.
+//! Observe and revalidate a local file dialog and its browser owner.
 use crate::{
-    atspi::{Gtk4Picker, GtkFileDialog},
+    atspi::{Gtk4Picker, GtkFileDialog, KdeDialog},
     window_geometry,
 };
 use aad_platform::picker::{Kind, NewFile};
@@ -19,18 +19,19 @@ use x11rb::rust_connection::RustConnection;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 mod portal;
-use portal::GtkPortal;
+use portal::FilePortal;
 
 enum Chooser {
     Gtk3,
     Gtk4(Box<Gtk4Picker>),
     Gtk4Save(String),
-    Portal(GtkPortal),
+    Portal(FilePortal),
 }
 
 enum Surface {
     X11(Box<OpenPicker>),
-    Wayland(GtkPortal),
+    Wayland(FilePortal),
+    WaylandKde(FilePortal, Box<KdeDialog>),
 }
 
 pub struct FilePicker {
@@ -67,9 +68,18 @@ impl FilePicker {
                 if expected.is_some_and(|id| id != 0) {
                     return Err("Wayland file portals have no numeric XID".into());
                 }
-                let portal = GtkPortal::for_browser(pid, deadline)?;
-                let controls = GtkFileDialog::observe(portal.picker_pid, kind, deadline)?;
-                (Surface::Wayland(portal), Some(controls))
+                match FilePortal::for_browser(pid, deadline) {
+                    Ok(portal) => {
+                        let controls = GtkFileDialog::observe(portal.picker_pid, kind, deadline)?;
+                        (Surface::Wayland(portal), Some(controls))
+                    }
+                    Err(gtk_error) => {
+                        let portal = FilePortal::kde(pid, deadline).map_err(|kde_error|
+                            format!("could not bind the Chromium request to GTK ({gtk_error}) or KDE ({kde_error})"))?;
+                        let dialog = KdeDialog::observe(portal.picker_pid, kind, deadline)?;
+                        (Surface::WaylandKde(portal, Box::new(dialog)), None)
+                    }
+                }
             }
             _ => return Err("expected a local X11 or Wayland session".into()),
         };
@@ -84,14 +94,14 @@ impl FilePicker {
 
     pub fn id(&self) -> u64 {
         match &self.surface {
-            Surface::Wayland(_) => 0,
+            Surface::Wayland(_) | Surface::WaylandKde(..) => 0,
             Surface::X11(window) => window.xid().into(),
         }
     }
 
     /// Wayland portals identify the browser process but expose no transient XID.
     pub fn process_only(&self) -> bool {
-        matches!(self.surface, Surface::Wayland(_))
+        !matches!(self.surface, Surface::X11(_))
     }
 
     pub fn revalidate(&self, deadline: Instant) -> Result<()> {
@@ -105,6 +115,10 @@ impl FilePicker {
                 }
             }
             Surface::Wayland(portal) => portal.revalidate(deadline)?,
+            Surface::WaylandKde(portal, dialog) => {
+                portal.revalidate(deadline)?;
+                dialog.revalidate(deadline)?;
+            }
         }
         if let Some(gtk) = &self.controls {
             gtk.revalidate(deadline)?;
@@ -118,6 +132,13 @@ impl FilePicker {
         }
         if let Surface::X11(window) = &self.surface {
             return window.dismiss(deadline);
+        }
+        if let Surface::WaylandKde(portal, dialog) = &self.surface {
+            if !dialog.gone(deadline)? {
+                self.revalidate(deadline)?;
+                dialog.respond(false, deadline)?;
+            }
+            return wait_kde(portal, dialog, deadline);
         }
         let gtk = self
             .controls
@@ -140,6 +161,11 @@ impl FilePicker {
             return Err("expected a fully resolved save destination".into());
         }
         let text = path.to_str().ok_or("filename is not UTF-8")?;
+        if let Surface::WaylandKde(portal, dialog) = &self.surface {
+            return self.select_kde(portal, dialog, text, deadline, || {
+                Ok(destination.revalidate()?)
+            });
+        }
         let gtk = self
             .controls
             .as_ref()
@@ -170,6 +196,14 @@ impl FilePicker {
             Ok((meta.dev(), meta.ino()))
         };
         let observed_file = identity()?;
+        if let Surface::WaylandKde(portal, dialog) = &self.surface {
+            return self.select_kde(portal, dialog, text, deadline, || {
+                if identity()? != observed_file {
+                    return Err("the granted file changed".into());
+                }
+                Ok(())
+            });
+        }
         let local;
         let gtk = match (&self.surface, &self.controls) {
             (_, Some(gtk)) => gtk,
@@ -233,6 +267,7 @@ impl FilePicker {
         }
         match &self.surface {
             Surface::Wayland(portal) => portal.finished(deadline),
+            Surface::WaylandKde(..) => Err("expected GTK controls".into()),
             Surface::X11(window) => {
                 if !window.ended()? {
                     return Ok(false);
@@ -244,6 +279,29 @@ impl FilePicker {
             }
         }
     }
+    fn select_kde(
+        &self,
+        portal: &FilePortal,
+        dialog: &KdeDialog,
+        text: &str,
+        deadline: Instant,
+        check_path: impl Fn() -> Result<()>,
+    ) -> Result<()> {
+        self.revalidate(deadline)
+            .map_err(|e| format!("KDE dialog before entry: {e}"))?;
+        check_path()?;
+        dialog
+            .fill(text, deadline)
+            .map_err(|e| format!("KDE filename entry: {e}"))?;
+        self.revalidate(deadline)
+            .map_err(|e| format!("KDE dialog after entry: {e}"))?;
+        dialog.verify(text)?;
+        check_path()?;
+        dialog
+            .respond(true, deadline)
+            .map_err(|e| format!("KDE file confirmation: {e}"))?;
+        wait_kde(portal, dialog, deadline).map_err(|e| format!("KDE dialog closure: {e}").into())
+    }
     fn wait_closed(&self, gtk: &GtkFileDialog, deadline: Instant) -> Result<()> {
         while Instant::now() < deadline {
             if self.closed(gtk, deadline)? {
@@ -253,6 +311,16 @@ impl FilePicker {
         }
         Err("the observed chooser did not disappear after its response".into())
     }
+}
+
+fn wait_kde(portal: &FilePortal, dialog: &KdeDialog, deadline: Instant) -> Result<()> {
+    while Instant::now() < deadline {
+        if portal.finished(deadline)? && dialog.gone(deadline)? {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    Err("the KDE chooser and request did not disappear".into())
 }
 
 x11rb::atom_manager! {
@@ -363,7 +431,7 @@ impl OpenPicker {
             if role != b"GtkFileChooserDialog" {
                 return Err("unexpected external dialog role".into());
             }
-            observed.chooser = Chooser::Portal(GtkPortal::observe(pid, *picker_pid, deadline)?);
+            observed.chooser = Chooser::Portal(FilePortal::observe(pid, *picker_pid, deadline)?);
             let title = observed.bytes(picker, atoms._NET_WM_NAME, atoms.UTF8_STRING)?;
             if kind == Kind::Open && !standard_open_title(&title) {
                 let gtk = GtkFileDialog::observe(*picker_pid, kind, deadline)?;
