@@ -21,7 +21,24 @@ def application():
     grid.get_accessible().set_name("Unsaved grid")
     for index, label in enumerate(["ID", "Amount", "Notes"]):
         grid.append_column(Gtk.TreeViewColumn(label, Gtk.CellRendererText(), text=index))
-    window.add(grid)
+    # A second provider-backed grid deliberately reports a merged cell through
+    # the Table interface. The first grid keeps GTK's standard accessible class.
+    class MergedAccessible(Gtk.TreeViewAccessible, Atk.Table):
+        def do_get_column_extent_at(self, row, column):
+            return 2 if (row, column) == (0, 0) else 0
+
+    class MergedGrid(Gtk.TreeView):
+        pass
+
+    MergedGrid.set_accessible_type(MergedAccessible)
+    merged = MergedGrid(model=model)
+    merged.get_accessible().set_name("Merged grid")
+    for index, label in enumerate(["ID", "Amount"]):
+        merged.append_column(Gtk.TreeViewColumn(label, Gtk.CellRendererText(), text=index))
+    layout = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+    layout.add(grid)
+    layout.add(merged)
+    window.add(layout)
     window.show_all()
     protected_cell = grid.get_accessible().ref_at(1, 2)
 
@@ -60,10 +77,10 @@ def verify(aad):
         assert response["isError"] == expect_error, answer
         return answer if expect_error else answer["data"]
 
-    def observe():
+    def observe(name="Unsaved grid"):
         observed = call("control_observe", {"resource_id":resource, "view":{"mode":"nodes"}})
         return call("control_find", {"observation_id":observed["observation_id"],
-            "locator":{"name":"Unsaved grid"}})["target"]
+            "locator":{"name":name}})["target"]
 
     ids = iter(range(1, 1000))
     try:
@@ -79,6 +96,9 @@ def verify(aad):
         expected = exchange(app, "change")
         answer = call("control_read_table", {"target":target, "columns":["Amount","ID"]})
         assert answer["records"] == expected and not answer["truncated"], answer
+        assert answer["scope"] == "atspi_table_rows" and answer["row_count"] == len(expected)
+        merged = call("control_read_table", {"target":observe("Merged grid"), "columns":["ID"]}, True)
+        assert "merged" in merged["error"]["message"] and "data" not in merged, merged
         limited = call("control_read_table", {"target":observe(), "columns":["Amount", "Notes"],"max_characters":500})
         assert limited["truncation_reasons"] == ["max_characters"] and limited["truncated"], limited
         assert limited["records"] == [{"Amount":"73.25", "Notes":"unrequested"}], limited
