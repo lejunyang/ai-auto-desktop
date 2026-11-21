@@ -341,6 +341,9 @@ struct RunArgs {
     /// Write the run journal here as NDJSON.
     #[arg(long, value_name = "PATH")]
     journal: Option<PathBuf>,
+    /// Allow selecting files under DIR. Repeat for more roots; requires --permission desktop.input.
+    #[arg(long = "allow-upload-dir", value_name = "DIR")]
+    upload_dirs: Vec<PathBuf>,
     /// Report what would run without executing anything.
     #[arg(long)]
     dry_run: bool,
@@ -1461,6 +1464,20 @@ fn validate(path: &Path) -> (Value, u8) {
 }
 
 fn run_workflow(args: &RunArgs) -> (Value, u8) {
+    let allow_input = args
+        .permissions
+        .iter()
+        .any(|permission| permission == "desktop.input");
+    if !args.upload_dirs.is_empty() && !allow_input {
+        return (
+            failure(
+                "POLICY.DENIED",
+                "--allow-upload-dir requires --permission desktop.input",
+                None,
+            ),
+            EXIT_USAGE,
+        );
+    }
     let document = match read_descriptor(&args.file) {
         Ok(document) => document,
         Err(payload) => return (payload, EXIT_USAGE),
@@ -1541,7 +1558,6 @@ fn run_workflow(args: &RunArgs) -> (Value, u8) {
     }
     // The native providers come from one control session, which also runs
     // saved control steps, so both kinds of workflow drive the same driver.
-    // Input is still gated by the workflow's declared permissions.
     let browser_port = match std::env::var("AAD_CDP_PORT") {
         Ok(value) => match value.parse::<u16>() {
             Ok(port) if port > 0 => Some(port),
@@ -1560,7 +1576,8 @@ fn run_workflow(args: &RunArgs) -> (Value, u8) {
     };
     let session = std::sync::Arc::new(aad_control::Session::native_with_browser(
         aad_control::Policy {
-            allow_input: true,
+            allow_input,
+            upload_roots: args.upload_dirs.clone(),
             ..Default::default()
         },
         browser_port,
@@ -2137,6 +2154,7 @@ mod tests {
             file: path.clone(),
             inputs: None,
             journal: None,
+            upload_dirs: Vec::new(),
             dry_run: true,
             allow_scripts: false,
             plugins: Vec::new(),
@@ -2439,6 +2457,7 @@ mod tests {
             file: path.clone(),
             inputs: None,
             journal: None,
+            upload_dirs: Vec::new(),
             dry_run: true,
             allow_scripts: false,
             plugins: Vec::new(),
@@ -2468,6 +2487,7 @@ mod tests {
             file: path.clone(),
             inputs: Some(r#"{"who":"agent"}"#.to_string()),
             journal: None,
+            upload_dirs: Vec::new(),
             dry_run: false,
             allow_scripts: false,
             plugins: Vec::new(),
@@ -2496,6 +2516,7 @@ mod tests {
                 file: path.clone(),
                 inputs: Some(bad.to_string()),
                 journal: None,
+                upload_dirs: Vec::new(),
                 dry_run: false,
                 allow_scripts: false,
                 plugins: Vec::new(),
@@ -2524,6 +2545,7 @@ mod tests {
             file: path.clone(),
             inputs: None,
             journal: Some(journal.clone()),
+            upload_dirs: Vec::new(),
             dry_run: false,
             allow_scripts: false,
             plugins: Vec::new(),
@@ -2558,6 +2580,7 @@ mod tests {
             inputs: None,
             journal: None,
             dry_run: false,
+            upload_dirs: Vec::new(),
             allow_scripts: false,
             plugins: Vec::new(),
             permissions: Vec::new(),
