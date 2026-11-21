@@ -67,6 +67,110 @@
   const recognizesOpenPicker = CSS.supports('selector(input:open)');
   const openPicker = el => fileInput(el) && recognizesOpenPicker ? el.matches(':open') : null;
   const visible = el => el.isConnected && el.ownerDocument === document && el.getClientRects().length > 0 && getComputedStyle(el).visibility !== 'hidden';
+  function readTable(table, nodeId, budget) {
+    const reasons = new Set(), rows = [], headers = [];
+    // Hidden rows still affect rowspan. Bound their scan separately from the
+    // 200 rendered rows and 50 logical columns in the response.
+    const physical = Array.prototype.slice.call(table.rows, 0, 2000);
+    if (physical.length < table.rows.length) reasons.add('row_scan_limit');
+    const rendered = physical.filter(visible);
+    const isHeader = cell => cell.tagName === 'TH' && !['row','rowgroup'].includes(cell.scope);
+    let headerCount = 0;
+    if (table.tHead) {
+      headerCount = rendered.filter(row => row.parentElement === table.tHead).length;
+    } else if (rendered.length) {
+      // Without a thead, retain the historical first-row convention. A spanning
+      // first header can introduce further all-th tiers in the same row group.
+      headerCount = 1;
+      const first = rendered[0];
+      if (first.cells.length <= 50 && Array.from(first.cells).some(c => isHeader(c) && (c.colSpan > 1 || c.rowSpan !== 1))) {
+        while (headerCount < rendered.length && headerCount <= 200) {
+          const next = rendered[headerCount];
+          if (next.parentElement !== first.parentElement || next.cells.length > 50 || !Array.from(next.cells).every(isHeader)) break;
+          headerCount++;
+        }
+      }
+    }
+    const declared = Number(table.getAttribute('aria-rowcount') || 0);
+    if (rendered.length > 200) reasons.add('row_limit');
+    if (declared === -1 || declared > rendered.length) reasons.add('rows_not_rendered');
+
+    let group, slots = [], valid = headerCount > 0, columnKeys;
+    const samples = new WeakMap();
+    function sample(cell) {
+      if (!samples.has(cell)) {
+        samples.set(cell, visible(cell) ? (cell.innerText || '').trim().slice(0, 501) : null);
+      }
+      return samples.get(cell);
+    }
+    // Slots hold references to their source cells. A rowspan covers physical
+    // rows, including hidden rows, and ends at its own row-group boundary.
+    for (let y = 0; y < physical.length && rows.length < 200; y++) {
+      const row = physical[y], inHeader = rows.length < headerCount;
+      if (budget.left <= 0) { reasons.add('character_budget'); break; }
+      if (group !== row.parentElement) { group = row.parentElement; slots = []; }
+      slots = slots.map(slot => slot && slot.end > y ? slot : null);
+      let x = 0;
+      for (const cell of row.cells) {
+        while (slots[x]) x++;
+        const right = x + cell.colSpan;
+        if (right > 50) {
+          reasons.add('column_limit');
+          if (inHeader) valid = false;
+        }
+        const slot = {cell, end: cell.rowSpan === 0 ? Infinity : y + cell.rowSpan};
+        for (; x < Math.min(right, 50); x++) {
+          if (slots[x]) valid = false; // Overlap is an HTML table-model error.
+          slots[x] = slot;
+        }
+        if (right > 50) break;
+      }
+      if (!visible(row)) continue;
+      // Discard expired trailing slots, keeping interior holes as missing cells.
+      while (slots.length && !slots[slots.length - 1]) slots.pop();
+      const values = [];
+      for (const slot of slots) {
+        if (budget.left <= 0) { reasons.add('character_budget'); break; }
+        const text = slot ? sample(slot.cell) : null;
+        if (text === null) { values.push(null); continue; }
+        if (text.length > 500) reasons.add('cell_limit');
+        if (Math.min(text.length, 500) > budget.left) reasons.add('character_budget');
+        const value = text.slice(0, Math.min(500, budget.left));
+        if (inHeader && value.length !== text.length) valid = false;
+        values.push(value);
+        budget.left -= value.length;
+      }
+      rows.push(values);
+      if (!inHeader) continue;
+      const tier = slots.map(slot => slot?.cell);
+      if (!tier.length || tier.length !== values.length || tier.some(c => !c || c.tagName !== 'TH' || sample(c) === null ||
+        (headerCount > 1 && (!isHeader(c) || !sample(c))))) valid = false;
+      if (headers.length) {
+        const parent = headers[headers.length-1];
+        if (parent.length !== tier.length || tier.some((c,i) => i && c === tier[i-1] && parent[i] !== parent[i-1])) valid = false;
+      }
+      headers.push(tier);
+      if (valid && headers.length === headerCount && headerCount > 1) {
+        // Distinguish a repeated label on two real tiers from a rowspan of one
+        // header. Escape path segments as JSON Pointer tokens, including a
+        // singleton whose literal name starts with the reserved slash.
+        columnKeys = tier.map((_, col) => {
+          const path = headers.map(h => h[col]).filter((c,i) => !i || c !== headers[i-1][col]).map(sample);
+          const key = path.length === 1 && !path[0].startsWith('/') ? path[0] :
+            '/' + path.map(s => s.replaceAll('~','~0').replaceAll('/','~1')).join('/');
+          if (key.length > budget.left) { reasons.add('character_budget'); valid = false; return null; }
+          budget.left -= key.length;
+          return key;
+        });
+      }
+    }
+    valid &&= headers.length === headerCount;
+    return {node_id:nodeId, name:(table.getAttribute('aria-label') || table.caption?.innerText || '').trim().slice(0,256),
+      scope:'rendered_rows', simple_header:valid && headerCount === 1, header_rows:headerCount,
+      ...(valid && columnKeys ? {column_keys:columnKeys} : {}),
+      declared_data_rows:Number.isSafeInteger(declared) && declared >= headerCount && declared > 0 ? declared-headerCount : null,
+      row_count:rendered.length, rows, truncated:reasons.size > 0, truncation_reasons:[...reasons]};
+  }
   const enabled = el => !el.disabled && !el.closest('[inert]') && el.getAttribute('aria-disabled') !== 'true';
   const editable = el => (['INPUT','TEXTAREA'].includes(el.tagName) || el.isContentEditable) && !el.readOnly && !protectedNode(el) && !fileInput(el);
   const fingerprint = el => JSON.stringify([el.tagName,el.id,el.type||'',roleOf(el),labelOf(el),el.getAttribute('name'),el.getAttribute('href'),!!el.isContentEditable]);
@@ -265,36 +369,15 @@
       const max=args.max_characters;
       const full=root ? (root.innerText||'') : '';
       const ids=new Map(); nodes.forEach((found,id)=>ids.set(found.el,id));
-      let budget=max, cut=false;
+      const budget={left:max};
+      let cut=false;
       const all=root ? [...(root.matches('table')?[root]:[]),...root.querySelectorAll('table')].filter(visible) : [];
       const tables=[];
       for (const table of all.slice(0,20)) {
-        if (budget<=0) {cut=true;break;}
-        const rows=Array.from(table.rows).filter(visible);
-        const shown=[], reasons=new Set();
-        const top=rows[0], simpleHeader=!!top && top.cells.length>0 && top.cells.length<=50 && Array.from(top.cells).every(cell=>cell.tagName==='TH'&&visible(cell)&&(cell.innerText||'').trim().length<=500) &&
-          Array.from(top.cells).reduce((total,cell)=>total+(cell.innerText||'').trim().length,0)<=budget &&
-          (!table.tHead||table.tHead.rows.length===1) && !table.querySelector('[colspan]:not([colspan="1"]),[rowspan]:not([rowspan="1"])');
-        if(rows.length>200)reasons.add('row_limit');
-        const declared=Number(table.getAttribute('aria-rowcount')||0);
-        if(declared===-1||declared>rows.length)reasons.add('rows_not_rendered');
-        for (const row of rows.slice(0,200)) {
-          if(budget<=0){reasons.add('character_budget');break;}
-          const cells=Array.from(row.cells), values=[];
-          if(cells.length>50)reasons.add('column_limit');
-          for(const cell of cells.slice(0,50)){
-            if(!visible(cell)){values.push(null);continue;}
-            if(budget<=0){reasons.add('character_budget');break;}
-            const text=(cell.innerText||'').trim(), limit=Math.min(500,budget);
-            if(text.length>500)reasons.add('cell_limit');
-            if(Math.min(text.length,500)>budget)reasons.add('character_budget');
-            const value=text.slice(0,limit);values.push(value);budget-=value.length;
-          }
-          shown.push(values);
-        }
-        if(reasons.size)cut=true;
-        tables.push({node_id:ids.get(table)||null,name:(table.getAttribute('aria-label')||(table.caption?table.caption.innerText:'')||'').trim().slice(0,256),
-          scope:'rendered_rows',simple_header:simpleHeader,declared_data_rows:Number.isSafeInteger(declared)&&declared>0?declared-1:null,row_count:rows.length,rows:shown,truncated:reasons.size>0,truncation_reasons:[...reasons]});
+        if (budget.left <= 0) { cut=true; break; }
+        const result=readTable(table, ids.get(table)||null, budget);
+        tables.push(result);
+        if (result.truncated) cut=true;
       }
       return {viewport,text:full.slice(0,max),characters:full.length,text_truncated:full.length>max,tables,table_count:all.length,tables_truncated:cut||all.length>tables.length};
     },

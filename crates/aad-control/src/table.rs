@@ -19,19 +19,27 @@ pub(crate) fn validate_columns(columns: &[String]) -> Result<()> {
 
 pub(crate) fn project(content: &Value, node_id: &Value, columns: &[String]) -> Result<Value> {
     let table = &content["tables"][0];
-    if &table["node_id"] != node_id || table["simple_header"] != true {
+    if &table["node_id"] != node_id {
         return Err(error(
             "CONTROL.TABLE_HEADER",
-            "expected a table with one visible header row and no spanning cells",
+            "the returned table does not match the observed target",
         ));
     }
     let rows = table["rows"]
         .as_array()
         .ok_or_else(|| error("CONTROL.BAD_PROVIDER_OUTPUT", "missing table rows"))?;
-    let header = rows
-        .first()
-        .and_then(Value::as_array)
-        .ok_or_else(|| error("CONTROL.TABLE_HEADER", "missing table headers"))?;
+    let header_rows = table["header_rows"].as_u64().unwrap_or(1) as usize;
+    let header = if table["simple_header"] == true {
+        rows.first().and_then(Value::as_array)
+    } else {
+        table["column_keys"].as_array()
+    }
+    .ok_or_else(|| {
+        error(
+            "CONTROL.TABLE_HEADER",
+            "missing, incomplete or overlapping column headers",
+        )
+    })?;
     let mut indexes = Vec::new();
     for column in columns {
         let matches: Vec<_> = header
@@ -52,7 +60,7 @@ pub(crate) fn project(content: &Value, node_id: &Value, columns: &[String]) -> R
     }
     let records: Vec<_> = rows
         .iter()
-        .skip(1)
+        .skip(header_rows)
         .map(|row| {
             columns
                 .iter()
@@ -67,7 +75,7 @@ pub(crate) fn project(content: &Value, node_id: &Value, columns: &[String]) -> R
         })
         .collect();
     Ok(
-        json!({"scope":"rendered_rows","records":records,"visible_data_rows":table["row_count"].as_u64().unwrap_or(0).saturating_sub(1),
+        json!({"scope":"rendered_rows","records":records,"visible_data_rows":table["row_count"].as_u64().unwrap_or(0).saturating_sub(header_rows as u64),
             "truncated":table["truncated"],"truncation_reasons":table["truncation_reasons"]}),
     )
 }
