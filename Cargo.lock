@@ -146,6 +146,7 @@ dependencies = [
  "uuid",
  "x11rb",
  "zbus",
+ "zbus_xml",
 ]
 
 [[package]]

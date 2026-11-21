@@ -20,6 +20,7 @@ libc = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }
 zbus = { workspace = true }
+zbus_xml = "5"
 futures-core = "0.3"
 # The X11 desktop, spoken to directly: damage tells what changed, XTest
 # injects input, XFixes gives the pointer, RandR the displays.

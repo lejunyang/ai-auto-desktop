@@ -11,6 +11,14 @@ use x11rb::protocol::Event;
 use x11rb::rust_connection::RustConnection;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
+mod portal;
+use portal::GtkPortal;
+
+enum Chooser {
+    Gtk3,
+    Gtk4(Gtk4Picker),
+    Portal(GtkPortal),
+}
 
 x11rb::atom_manager! {
     Atoms: AtomCookies {
@@ -28,7 +36,7 @@ pub struct OpenPicker {
     owner: Window,
     pid: u32,
     bounds: [i32; 4],
-    gtk4: Option<Gtk4Picker>,
+    chooser: Chooser,
 }
 
 impl OpenPicker {
@@ -93,13 +101,21 @@ impl OpenPicker {
             owner,
             pid,
             bounds,
-            gtk4: None,
+            chooser: Chooser::Gtk3,
         };
-        if observed
-            .bytes(picker, atoms.WM_WINDOW_ROLE, AtomEnum::STRING.into())?
-            .is_empty()
-        {
-            observed.check_window(picker, atoms._NET_WM_WINDOW_TYPE_DIALOG)?;
+        let pids = observed.words(picker, atoms._NET_WM_PID, AtomEnum::CARDINAL)?;
+        let [picker_pid] = pids.as_slice() else {
+            return Err("missing picker PID".into());
+        };
+        observed.check_window(picker, atoms._NET_WM_WINDOW_TYPE_DIALOG, *picker_pid)?;
+        let role = observed.bytes(picker, atoms.WM_WINDOW_ROLE, AtomEnum::STRING.into())?;
+        observed.open_title()?;
+        if *picker_pid != pid {
+            if role != b"GtkFileChooserDialog" {
+                return Err("unexpected external dialog role".into());
+            }
+            observed.chooser = Chooser::Portal(GtkPortal::observe(pid, *picker_pid, deadline)?);
+        } else if role.is_empty() {
             let class =
                 observed.bytes(picker, AtomEnum::WM_CLASS.into(), AtomEnum::STRING.into())?;
             let name = class
@@ -108,7 +124,7 @@ impl OpenPicker {
                 .filter(|s| !s.is_empty())
                 .ok_or("missing GTK window class")?;
             let title = observed.open_title()?;
-            observed.gtk4 = Some(Gtk4Picker::observe(
+            observed.chooser = Chooser::Gtk4(Gtk4Picker::observe(
                 pid,
                 std::str::from_utf8(name)?.into(),
                 String::from_utf8(title)?,
@@ -149,7 +165,7 @@ impl OpenPicker {
         Ok(p.value)
     }
 
-    fn check_window(&self, id: Window, kind: Atom) -> Result<()> {
+    fn check_window(&self, id: Window, kind: Atom, pid: u32) -> Result<()> {
         let ids = self
             .conn
             .res_query_client_ids(&[ClientIdSpec {
@@ -159,8 +175,8 @@ impl OpenPicker {
             .reply()?
             .ids;
         if ids.len() != 1
-            || ids[0].value != [self.pid]
-            || self.words(id, self.atoms._NET_WM_PID, AtomEnum::CARDINAL)? != [self.pid]
+            || ids[0].value != [pid]
+            || self.words(id, self.atoms._NET_WM_PID, AtomEnum::CARDINAL)? != [pid]
             || self
                 .words(id, self.atoms._NET_WM_WINDOW_TYPE, AtomEnum::ATOM)?
                 .first()
@@ -187,13 +203,17 @@ impl OpenPicker {
 
     fn check_pinned(&self) -> Result<()> {
         let a = &self.atoms;
-        self.check_window(self.picker, a._NET_WM_WINDOW_TYPE_DIALOG)?;
-        self.check_window(self.owner, a._NET_WM_WINDOW_TYPE_NORMAL)?;
+        let picker_pid = match &self.chooser {
+            Chooser::Portal(p) => p.picker_pid,
+            _ => self.pid,
+        };
+        self.check_window(self.picker, a._NET_WM_WINDOW_TYPE_DIALOG, picker_pid)?;
+        self.check_window(self.owner, a._NET_WM_WINDOW_TYPE_NORMAL, self.pid)?;
         let active = self.words(self.root, a._NET_ACTIVE_WINDOW, AtomEnum::WINDOW)?;
         let title = self.open_title()?;
         let role = self.bytes(self.picker, a.WM_WINDOW_ROLE, AtomEnum::STRING.into())?;
-        let chooser = match &self.gtk4 {
-            Some(gtk) => {
+        let chooser = match &self.chooser {
+            Chooser::Gtk4(gtk) => {
                 role.is_empty()
                     && gtk.matches_window(
                         &self.bytes(
@@ -204,7 +224,15 @@ impl OpenPicker {
                         &title,
                     )
             }
-            None => role == b"GtkFileChooserDialog",
+            Chooser::Gtk3 => role == b"GtkFileChooserDialog",
+            Chooser::Portal(_) => {
+                role == b"GtkFileChooserDialog"
+                    && self.bytes(
+                        self.picker,
+                        AtomEnum::WM_CLASS.into(),
+                        AtomEnum::STRING.into(),
+                    )? == b"xdg-desktop-portal-gtk\0Xdg-desktop-portal-gtk\0"
+            }
         };
         if active.first() != Some(&self.picker)
             || active.iter().skip(1).any(|&w| w != 0)
@@ -242,12 +270,15 @@ impl OpenPicker {
     }
 
     pub fn revalidate(&self, deadline: Instant) -> Result<()> {
-        let windows = window_geometry::clients(self.pid, deadline)?;
+        let mut windows = window_geometry::clients(self.pid, deadline)?;
         let mut owners = windows
             .iter()
             .filter(|w| [w.x, w.y, w.width, w.height] == self.bounds);
         if owners.next().map(|w| w.id) != Some(self.owner) || owners.next().is_some() {
             return Err("CDP page bounds do not identify a unique transient owner on X11".into());
+        }
+        if let Chooser::Portal(portal) = &self.chooser {
+            windows.extend(window_geometry::clients(portal.picker_pid, deadline)?);
         }
         for window in windows.iter().filter(|w| w.id != self.picker) {
             if self.bytes(
@@ -255,7 +286,7 @@ impl OpenPicker {
                 self.atoms.WM_WINDOW_ROLE,
                 AtomEnum::STRING.into(),
             )? == b"GtkFileChooserDialog"
-                || (self.gtk4.is_some()
+                || (!matches!(self.chooser, Chooser::Gtk3)
                     && self
                         .words(window.id, self.atoms._NET_WM_WINDOW_TYPE, AtomEnum::ATOM)?
                         .contains(&self.atoms._NET_WM_WINDOW_TYPE_DIALOG))
@@ -263,8 +294,10 @@ impl OpenPicker {
                 return Err("multiple native file choosers belong to this browser".into());
             }
         }
-        if let Some(gtk) = &self.gtk4 {
-            gtk.revalidate(deadline)?;
+        match &self.chooser {
+            Chooser::Gtk3 => (),
+            Chooser::Gtk4(gtk) => gtk.revalidate(deadline)?,
+            Chooser::Portal(portal) => portal.revalidate(deadline)?,
         }
         self.check_pinned()?;
         if self.ended()? {
