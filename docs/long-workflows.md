@@ -74,11 +74,12 @@ aad review ./draft-run-001.ndjson
 |---|---|---|
 | 效率 | 同屏多查、字段投影、按后端发现、批量操作。一次 `run_steps` 可以完成 10 次点击，逐条调用对照需要 30 次往返。短批结果按查窗口、观察、定位、执行、字段读取和表格采集分别汇总调用次数、失败次数和耗时。[结果字段](control-sessions.md) | 后端单次调用内的细分耗时、远程连接和多站点的 P95 延迟。 |
 | 数据与结果 | 命名字段、分组表头和 ARIA 网格、跨页采集、按任务号验收导出文件、CSV 逐行对账、读取指定 XLSX 区域 | 直接对接业务系统的订单、回执和对账接口需要相应系统的适配。 |
-| 录制质量 | 网页和指定桌面应用共用时间线，HTML 文件框的附件可在回放时更换；浏览器步骤可以查看对应的原始截图 | 录制目录选择和另存为、没有无障碍语义的自绘控件、原生同名行的稳定定位。 |
+| 录制质量 | 网页和指定桌面应用共用时间线。HTML 附件可在回放时更换。网页用 `showSaveFilePicker()` 成功选定新文件后，可自动生成带目的地参数的另存为步骤。[录制另存为](browser-recording.md#录下网页的另存为) | 录制目录选择、浏览器菜单保存网页、系统下载询问保存位置、识别自绘对象和稳定区分原生列表中的同名行。 |
 | 审阅与维护 | 短 YAML、循环和分支、本地版本化子流程、运行日志；桌面编辑器可以对照录制截图和当前元素、修改定位并从选中步骤试跑 | 跨应用混合录制的完整图文时间轴、跨团队发布目录、自动提出定位修复建议。 |
 | 恢复 | 持久只读运行可暂停/恢复。写流程可在开始时启用恢复日志，中断后凭业务回执继续 | 需要业务方提供可靠回执。跨运行的全局去重和跨账号恢复仍需业务系统配合。 |
-| 浏览器覆盖 | Chromium 和 Firefox 脚本可逐层进入授权弹窗，再逐层返回。Firefox 同源子页面支持已定位控件上的按键、指针和滚轮。WebKitGTK 可以打开指定 URL 并读取正文、标题、链接和按钮。 | Firefox 跨域或变形子页面的物理输入、WebKit 的写操作和脚本，以及自由布局画布里的控件操作。[Firefox 子页面条件](testing/firefox-frame-input.md) |
-| 原生系统 | Linux X11 和原生 KWin Wayland 上已验证 GTK 表单和文件窗口。Wayland 可用 `aad assist --desktop --view-only`，在系统选择器中选一块显示器共享。[屏幕共享](../README.md) | Wayland 桌面物理键鼠仍需定位输入接收窗口和控件。**[待验证]** 真实用户同意后的完整 Wayland 共享链路、Windows 交互桌面、多屏 DPI、中文 IME 和 macOS 辅助功能权限。 |
+| 浏览器覆盖 | Chromium 和 Firefox 脚本可逐层进入授权弹窗，再逐层返回。Firefox 同源子页面支持已定位控件上的按键、指针和滚轮。WebKitGTK 可以打开指定 URL 并读取正文、标题、链接和按钮。 | Firefox 跨域或变形子页面的物理输入，WebKit 的写操作和脚本。[Firefox 子页面条件](testing/firefox-frame-input.md) |
+| 画布与自绘 | Chromium 能在已观察的 Canvas 上点击、悬停、滚动、拖动和画折线，可用截图检查落点。规则网格可按行列读文字和置信度。[画布操作与读取](testing/canvas-grid-ocr.md) | 在自由布局的图中按对象名定位、识别遮挡对象、跨滚屏拼接整张画布，以及布局变化后修复录制时的落点。 |
+| 原生系统 | Linux X11 和 KWin Wayland 已验证原生表单和文件窗口。Wayland 上加载输入插件的 Qt 5 Widgets 应用可对已确认的窗口和控件发送按键和指针动作。[Qt 应用启动与操作](../crates/aad-linux/qt-wayland-input/README.md) | Wayland 其他工具包的定向键鼠、跨窗口拖放。**[待验证]** 用户同意屏幕共享后的完整链路、Windows 和 Mac 的交互桌面、混合 DPI 多屏。 |
 | 部署与脚本 | 本地/SSH 控制、输入租约、声明式步骤。CLI 和 MCP 都支持 JavaScript 通过 `page` 操作选定的标签页。工作流中的 Python 计算步骤由 `aad run --allow-scripts` 启用。 | 无人值守机器池、账号和会话调度、按次业务审批。 |
 
 原始竞品依据见[23 项逐项对比](research/browser-computer-recording-efficiency-2026-11-21.md)；本页记录后续代码与验收进展。
@@ -87,7 +88,7 @@ aad review ./draft-run-001.ndjson
 
 | 任务 | 现在能做什么 | 卡在哪里 |
 |---|---|---|
-| 浏览器已经弹出“打开文件”或“另存为” | `aad browser choose-files` 选择普通附件，附加 `--native-file` 可选一个文件交给网页的文件句柄 API。`aad browser save-as` 选择新文件路径。三个流程已在 X11 的 GTK portal 和 KWin Wayland 的 GTK、KDE portal 读回内容。X11 的浏览器自带 GTK 4 窗口也已写出新文件。[平台条件与用法](browser-recording.md#在已经打开的文件选择器里选文件) | Windows 标准对话框和 macOS AppKit 面板已接入，**[待验证]** 需要相应系统的交互桌面。系统目录选择器的接管、录制时自动生成另存为步骤仍有缺口。 |
+| 浏览器已经弹出系统文件窗口 | `aad browser choose-files` 选择普通附件或原生文件句柄，`choose-directory` 选择已有目录，`save-as` 选择新文件路径。已在 X11 的 GTK portal 和 KWin Wayland 的 GTK、KDE portal 核对文件内容或返回的目录 URI。[平台条件与用法](browser-recording.md#在已经打开的文件选择器里选文件) | Windows 标准对话框和 macOS AppKit 面板已接入，交互桌面 **[待验证]**。原生目录句柄需要单标签、单 frame 的明确发起者。 |
 | 从后台导出昨天的账单，交给下一步处理 | 在页面创建任务并读任务号，按号等待完成，下载并验证到手的文件。CSV 可以和预期账单逐笔比日期、金额，再把文件路径交给下游。[导出账单](browser-download-export.md) | 每个网站需要提供任务行、就绪状态和下载控件的定位。 |
 | 第 80 单提交后断网，第二天接着处理 | 从第一次运行用 `--recovery-log`，中断后[按业务键或显式回执续跑](workflow-recovery.md)，不再派发已确认动作 | 需要业务端独立回执；普通 NDJSON 日志只能复查，查不到订单不能当作未提交。 |
 | 从复杂报表或本地工作簿取数 | Chromium 可读多层表头、语义网格，以及给出行列布局的可见等宽等高画布网格。后者逐格返回 OCR 文本和置信度。CSV 导出可读已保存的 XLSX，也可指定运行中的 Windows Excel 窗口、工作表和区域。Linux 可读运行中的 GTK 表格。[画布网格](testing/canvas-grid-ocr.md) · [XLSX 区域](workbook-csv.md) · [Excel 未保存数据](live-excel-csv.md) · [GTK](linux-atspi-table.md) | 自由布局画布、需要滚动取全的纯画布和低置信度单元格仍需人工判断。**[待验证]** Windows 桌面 Excel 的实际导出，以及 Qt 和 LibreOffice Calc 的原生表格。 |

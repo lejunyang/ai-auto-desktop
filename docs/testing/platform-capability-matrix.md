@@ -17,8 +17,8 @@ Electron 的两条恢复路径见 [规范动作与窗口 surface 验证](../rese
 | 本机 Qt/X11 应用缩放 | `597656c` 按准确窗口身份校准逻辑/物理坐标；单显示器 Qt 1/1.5/2 倍应用缩放下的实际点击、F2 与局部 PNG；歧义和 scope 拒绝；8 项标题编码检查；Dolphin 中文目录重命名与 KWrite 中文文件保存经磁盘回读通过 | **[待真机验收]** 混合 DPI 多屏、旋转与热插拔；非 Qt 缩放不在此次校准范围；不证明 Wayland 支持 |
 | 本机 Qt/X11 局部截图 | `2e00547` 私下检查完整所属窗口；4/4 公开入口检查，无覆盖及非重叠密码框时 PNG 像素与尺寸正确，scope 外普通/密码控件覆盖时拒绝；原 scope 继续有效 | 未把私有检查升级为外部节点操作授权；无法完整观察所属窗口时仍拒绝截图；不代表所有第三方自绘界面都能证明无遮挡 |
 | 原生 KWin Wayland 与 GTK 3 | 独立 compositor、关闭 X11 显示连接，经公开 CLI 枚举应用、填写发票号、触发保存。应用回执同时记录了发票号和 GdkWaylandDisplay。[复现入口](../../tests/linux/verify-wayland-form.ps1) | 其他应用的控件语义、物理键鼠、多屏和授权撤销行为需分别验收。 |
-| KWin Wayland 文件窗口 | 选择网页附件、读取原生文件句柄、另存为新文件。GTK 和 KDE 均通过 Chromium 页面或磁盘读回了实际内容。[命令与窗口条件](../browser-recording.md#在已经打开的文件选择器里选文件) | 选择目录、更多桌面和本地化窗口。 |
-| Wayland 屏幕共享与输入 | `aad assist --desktop --view-only` 可请求共享一块显示器。已验证 PipeWire 流选择、撤销，以及真实 KWin 共享窗口中的取消。[查看端用法](../../README.md) | **[待验证]** 操作员在真实共享窗口同意后，从查看端核对画面。桌面物理键鼠还需要确认输入窗口、焦点和命中控件。[授权输入路线](../plan/wayland-authorized-input.md) |
+| KWin Wayland 文件窗口 | 选择网页附件、读取原生文件句柄、另存为新文件、选择已有目录。GTK 和 KDE 均核对了实际内容或系统返回的目录 URI。[命令与窗口条件](../browser-recording.md#在已经打开的文件选择器里选文件) | 更多桌面和本地化窗口。 |
+| Wayland 屏幕共享与输入 | `aad assist --desktop --view-only` 可请求共享一块显示器。已验证 PipeWire 流选择、撤销和真实 KWin 共享窗口的取消。Qt 5 Widgets 应用可在启动时加载插件，向观察到的前台控件发按键和指针事件。[插件用法与范围](../../crates/aad-linux/qt-wayland-input/README.md) | **[待验证]** 操作员在真实共享窗口同意后，从查看端核对画面。其他工具包的通用键鼠输入、跨窗口手势和 compositor 级命中校验。[授权输入路线](../plan/wayland-authorized-input.md) |
 
 ## 可以复现的本机检查
 
