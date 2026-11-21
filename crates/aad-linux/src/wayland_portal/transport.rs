@@ -83,8 +83,32 @@ pub struct PortalClient {
 }
 impl PortalClient {
     pub fn connect(deadline: Instant, cancel: &AtomicBool) -> Result<Self> {
+        Self::open(false, deadline, cancel)
+    }
+
+    pub(super) fn connect_for_screencast(deadline: Instant, cancel: &AtomicBool) -> Result<Self> {
+        Self::open(true, deadline, cancel)
+    }
+
+    fn open(activate: bool, deadline: Instant, cancel: &AtomicBool) -> Result<Self> {
         let connection =
             wait(Connection::session(), deadline, cancel)?.map_err(|_| PortalError::Transport)?;
+        if activate {
+            // GetNameOwner alone cannot start a D-Bus-activatable portal on
+            // its first use. Only explicit sharing takes this path.
+            wait(
+                connection.call_method(
+                    Some("org.freedesktop.DBus"),
+                    "/org/freedesktop/DBus",
+                    Some("org.freedesktop.DBus"),
+                    "StartServiceByName",
+                    &(NAME, 0u32),
+                ),
+                deadline,
+                cancel,
+            )?
+            .map_err(|_| PortalError::Transport)?;
+        }
         let owner_reply = wait(
             connection.call_method(
                 Some("org.freedesktop.DBus"),

@@ -24,7 +24,7 @@ pub struct MonitorCapture {
 impl MonitorCapture {
     pub fn start(max_fps: u32, cancel: &AtomicBool) -> Result<Self> {
         let deadline = Instant::now() + Duration::from_secs(120);
-        let (session, monitor, fd) = PortalClient::connect(deadline, cancel)
+        let (session, monitor, fd) = PortalClient::connect_for_screencast(deadline, cancel)
             .and_then(|p| p.authorize_monitor(AuthorizationIntent::UserRequested, deadline, cancel))
             .map_err(|e| format!("Wayland ScreenCast authorization: {e}"))?;
         let mut child = pipeline(fd, &monitor, max_fps)?;

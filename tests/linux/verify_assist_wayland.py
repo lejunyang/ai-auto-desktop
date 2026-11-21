@@ -11,6 +11,7 @@ import json
 import os
 from pathlib import Path
 import select
+import shlex
 import signal
 import socket
 import subprocess
@@ -36,7 +37,7 @@ NAME = "org.freedesktop.portal.Desktop"
 
 
 def portal(runtime):
-    assert os.environ["DBUS_SESSION_BUS_ADDRESS"] == f"unix:path={runtime}/bus"
+    assert os.environ["DBUS_SESSION_BUS_ADDRESS"].split(",")[0] == f"unix:path={runtime}/bus"
     DBusGMainLoop(set_as_default=True)
     bus = dbus.SessionBus(private=True)
     name = dbus.service.BusName(NAME, bus=bus, do_not_queue=True)
@@ -66,6 +67,10 @@ def portal(runtime):
             log("Session.Close")
 
     class Portal(dbus.service.Object):
+        @dbus.service.method("dev.aad.PrivateScreenCastFixture")
+        def Revoke(self):
+            objects[sessions[-1]].Closed(dbus.Dictionary({}, signature="sv"))
+
         @dbus.service.method("org.freedesktop.DBus.Properties", in_signature="ss", out_signature="v")
         def Get(self, interface, key):
             log(f"Get {interface}.{key}")
@@ -115,12 +120,9 @@ def portal(runtime):
                 return dbus.types.UnixFd(endpoint.fileno())
 
     instance = Portal(name, BASE)
-    def revoke():
-        objects[sessions[-1]].Closed(dbus.Dictionary({}, signature="sv"))
-        return True
-    GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGUSR1, revoke)
-    (runtime / "serving").touch()
-    GLib.MainLoop().run()
+    loop = GLib.MainLoop()
+    bus.call_on_disconnection(lambda _: loop.quit())
+    loop.run()
 
 
 def wait_for(label, test):
@@ -155,12 +157,27 @@ def main(runtime):
             stack.callback(stop)
             return child
 
+        def graph():
+            return json.loads(subprocess.check_output(["pw-dump"], env=env, timeout=3))
         def nodes():
-            entries = json.loads(subprocess.check_output(["pw-dump"], env=env, timeout=3))
             return {e["info"]["props"].get("node.name"): (e["id"], e["info"]["props"]["object.serial"])
-                    for e in entries if e["type"] == "PipeWire:Interface:Node"}
+                    for e in graph() if e["type"] == "PipeWire:Interface:Node"}
 
-        start(["dbus-daemon", "--session", "--nofork", "--nopidfile", f"--address=unix:path={runtime}/bus"])
+        # Only this test's portal can be activated on the private bus.
+        import xml.etree.ElementTree as ET
+        services = runtime / "services"
+        services.mkdir()
+        command = shlex.join([sys.executable, str(Path(__file__).resolve()), "--serve", str(runtime)])
+        (services / f"{NAME}.service").write_text(f"[D-BUS Service]\nName={NAME}\nExec={command}\n")
+        config = ET.Element("busconfig")
+        ET.SubElement(config, "type").text = "session"
+        ET.SubElement(config, "listen").text = env["DBUS_SESSION_BUS_ADDRESS"]
+        ET.SubElement(config, "servicedir").text = str(services)
+        policy = ET.SubElement(config, "policy", context="default")
+        for attr in ["own", "send_destination", "receive_sender"]:
+            ET.SubElement(policy, "allow", {attr: "*"})
+        ET.ElementTree(config).write(runtime / "bus.conf")
+        start(["dbus-daemon", f"--config-file={runtime / 'bus.conf'}", "--nofork", "--nopidfile"])
         wait_for("private D-Bus", (runtime / "bus").exists)
         start(["pipewire"])
         wait_for("private PipeWire", (runtime / "pipewire-0").exists)
@@ -174,8 +191,8 @@ def main(runtime):
             available = nodes()
             return available if {"aad-red", "aad-blue"} <= available.keys() else None
         available = wait_for("two private video nodes", producers)
-        service = start([sys.executable, __file__, "--serve", str(runtime)])
-        wait_for("private ScreenCast", (runtime / "serving").exists)
+        bus = dbus.bus.BusConnection(env["DBUS_SESSION_BUS_ADDRESS"])
+        assert not bus.name_has_owner(NAME), "the CLI must activate its portal on first use"
         binary = os.environ.get("AAD", str(ROOT / "target/debug/aad"))
         consumer = dict(env, PIPEWIRE_REMOTE="aad-no-ambient-remote")
         def assist():
@@ -191,6 +208,9 @@ def main(runtime):
             assert select.select([child.stdout], [], [], 22)[0], "assist startup timeout"
             announce = json.loads(child.stdout.readline())
             assert announce.get("view_only") is True and announce["source"]["capture"] == "wayland-portal-monitor", announce
+            links = [e["info"] for e in graph() if e["type"] == "PipeWire:Interface:Link"]
+            assert len(links) == 1 and links[0]["output-node-id"] == node, links
+            receiver = links[0]["input-node-id"]
             viewer = Viewer(announce["websocket"])
             try:
                 viewer.send({"type": "take"})
@@ -202,10 +222,12 @@ def main(runtime):
             finally:
                 viewer.close()
             if revoke:
-                service.send_signal(signal.SIGUSR1)
+                bus.get_object(NAME, BASE).Revoke(dbus_interface="dev.aad.PrivateScreenCastFixture")
             else:
                 child.send_signal(signal.SIGINT)
             assert (child.wait(timeout=4) != 0) == revoke
+            wait_for("reader node release", lambda: not any(
+                e["type"] == "PipeWire:Interface:Node" and e["id"] == receiver for e in graph()))
         for case in [{"deny": 1, "type": 1}, {"type": 2}, {"type": 1, "node": 4294967295}]:
             before = (runtime / "calls").read_text().count("OpenPipeWireRemote")
             select_file.write_text(json.dumps({"node": available["aad-red"][0], **case}))
