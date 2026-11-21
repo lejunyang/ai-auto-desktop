@@ -644,7 +644,11 @@ impl LinuxBackend {
             .map_err(|error| native_failure("Accessible.GetRole", &target, error))?;
         let role_name = zbus::block_on(accessible.get_role_name()).unwrap_or_default();
         let role = canonical_role(native_role, &role_name);
-        let interfaces = zbus::block_on(accessible.get_interfaces()).unwrap_or_default();
+        let reported = zbus::block_on(accessible.get_interfaces()).ok();
+        let can_query_actions = reported
+            .as_ref()
+            .is_none_or(|set| set.contains(Interface::Action));
+        let interfaces = reported.unwrap_or_default();
         let states = zbus::block_on(accessible.get_state()).ok();
         let protected = matches!(role.as_str(), "password_text" | "password");
         let name = zbus::block_on(accessible.name()).ok();
@@ -692,9 +696,12 @@ impl LinuxBackend {
                     zbus::block_on(proxy.get_text(0, count.clamp(0, MAX_FIELD_CHARS as i32))).ok()
                 })
         };
-        let action_metadata = self
-            .canonical_actions(&target, deadline)
-            .unwrap_or_default();
+        let action_metadata = if can_query_actions {
+            self.canonical_actions(&target, deadline)
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         let toolkit = application.get("toolkit_name").and_then(Value::as_str);
         let toolkit_version = application
             .get("toolkit_version")
